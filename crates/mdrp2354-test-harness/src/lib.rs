@@ -64,6 +64,9 @@ pub const EMU_TEST_STACK: u32 = 0x2004_0000;
 /// Emulator: scratch SRAM.
 pub const EMU_TEST_SCRATCH: u32 = 0x2000_0200;
 
+/// Scratch area size in bytes. Covers LDRD/STRD max offset (imm8×4 = 1020).
+pub const SCRATCH_SIZE: u32 = 1024;
+
 // ============================================================================
 // GDB register indices (stable across QEMU >= 7.0)
 // ============================================================================
@@ -87,6 +90,10 @@ pub const MASK_ALL_FLAGS: u32 = 0xF800_0000;
 pub const MASK_NZ_ONLY: u32 = 0xC000_0000;
 /// No flags — for MOV/ADD (high register) which don't update flags.
 pub const MASK_NO_FLAGS: u32 = 0x0000_0000;
+/// N, Z, C, V, Q + GE[3:0] — for DSP parallel add/sub and SEL.
+pub const MASK_ALL_FLAGS_GE: u32 = 0xF80F_0000;
+/// Q flag only — for saturation instructions (SSAT, USAT, QADD, etc.).
+pub const MASK_Q_ONLY: u32 = 0x0800_0000;
 
 // ============================================================================
 // Test case model
@@ -114,6 +121,11 @@ pub struct TestCase {
     pub mem_check: Vec<u32>,
     /// xPSR flag mask for comparison. Default: MASK_ALL_FLAGS.
     pub xpsr_mask: u32,
+    /// Second halfword for Thumb-32 instructions. None = Thumb-16.
+    pub hw1: Option<u16>,
+    /// BL sets LR to a per-side absolute return address.
+    /// When true, compare LR as delta from test slot.
+    pub modifies_lr: bool,
 }
 
 impl Default for TestCase {
@@ -128,6 +140,8 @@ impl Default for TestCase {
             mem_pre: Vec::new(),
             mem_check: Vec::new(),
             xpsr_mask: MASK_ALL_FLAGS,
+            hw1: None,
+            modifies_lr: false,
         }
     }
 }
@@ -4094,6 +4108,9 @@ pub struct RunState {
     pub xpsr: u32,
     /// Bytes at mem_check offsets (in order of tc.mem_check).
     pub mem: Vec<u8>,
+    /// Cycle count from execution. DWT CYCCNT for probe, execute_one return
+    /// value for emulator, 0 for QEMU (which doesn't report cycles).
+    pub cycles: u32,
 }
 
 // ============================================================================
@@ -4121,6 +4138,11 @@ pub fn setup_reg(reg: u8, val: u32, tc: &TestCase, scratch_base: u32) -> u32 {
 /// Uses the provided `shared_bus` for memory-accessing instructions (reused
 /// across tests to avoid repeated 552KB allocations).
 pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
+    debug_assert!(
+        tc.hw1.is_none() || tc.opcode >= 0xE800,
+        "Thumb-32 test has hw1 but opcode {:#06x} < 0xE800", tc.opcode
+    );
+
     let mut core = CortexM33::new();
 
     // Set defaults: R0-R12 = 0, SP = stack, LR = sentinel, PC = slot
@@ -4140,17 +4162,25 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
 
     // Execute
     if tc.needs_bus {
-        // Zero scratch region (256 bytes), then write preconditions
-        for i in 0..256u32 {
+        for i in 0..SCRATCH_SIZE {
             shared_bus.write8(EMU_TEST_SCRATCH + i, 0);
         }
         for &(offset, val) in &tc.mem_pre {
             shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
         }
-        core.execute_one_with_bus(tc.opcode, shared_bus);
-    } else {
-        core.execute_one(tc.opcode);
     }
+    let cycles = match tc.hw1 {
+        None => if tc.needs_bus {
+            core.execute_one_with_bus(tc.opcode, shared_bus)
+        } else {
+            core.execute_one(tc.opcode)
+        },
+        Some(hw1) => if tc.needs_bus {
+            core.execute_one_wide_with_bus(tc.opcode, hw1, shared_bus)
+        } else {
+            core.execute_one_wide(tc.opcode, hw1)
+        },
+    };
 
     // Collect post-state
     let mut regs = [0u32; 16];
@@ -4164,7 +4194,7 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
         .collect();
 
-    RunState { regs, xpsr, mem }
+    RunState { regs, xpsr, mem, cycles }
 }
 
 // ============================================================================
@@ -4209,9 +4239,20 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
         ));
     }
 
-    // LR (R14): absolute comparison for Phase A (no BL instruction).
-    // Phase B will need relative delta comparison for BL's return address.
-    if qemu.regs[14] != emu.regs[14] {
+    // LR (R14): delta comparison for BL (different return addresses per side),
+    // absolute comparison for everything else.
+    if tc.modifies_lr {
+        let qemu_lr = qemu.regs[14] & !1u32;
+        let emu_lr = emu.regs[14] & !1u32;
+        let qemu_delta = qemu_lr.wrapping_sub(QEMU_TEST_SLOT);
+        let emu_delta = emu_lr.wrapping_sub(EMU_TEST_SLOT);
+        if qemu_delta != emu_delta {
+            diffs.push(format!(
+                "LR delta: QEMU={:#x} EMU={:#x}",
+                qemu_delta, emu_delta
+            ));
+        }
+    } else if qemu.regs[14] != emu.regs[14] {
         diffs.push(format!(
             "LR: QEMU={:#010x} EMU={:#010x}",
             qemu.regs[14], emu.regs[14]
@@ -4246,6 +4287,83 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
             diffs.push(format!(
                 "MEM[+{offset:#x}]: QEMU={:#04x} EMU={:#04x}",
                 qemu_val, emu_val
+            ));
+        }
+    }
+
+    if diffs.is_empty() {
+        Ok(())
+    } else {
+        Err(diffs.join(", "))
+    }
+}
+
+// ============================================================================
+// Probe comparison logic (same address space — no translation)
+// ============================================================================
+
+/// Compare probe (real hardware) and emulator post-execution states.
+///
+/// Simpler than `compare()` because both sides use the same address space
+/// (RP2354 SRAM at 0x20000000). All register values are compared as absolute
+/// values — no addr_regs skipping, no delta computation.
+///
+/// The xPSR mask includes the T bit (bit 24) because real hardware reports
+/// EPSR.T via SWD, unlike QEMU which strips it.
+pub fn compare_probe(tc: &TestCase, hw: &RunState, emu: &RunState) -> Result<(), String> {
+    let mut diffs = Vec::new();
+
+    // R0-R12: absolute comparison (same address space, no skipping)
+    for i in 0..=12 {
+        if hw.regs[i] != emu.regs[i] {
+            diffs.push(format!(
+                "R{i}: HW={:#010x} EMU={:#010x}",
+                hw.regs[i], emu.regs[i]
+            ));
+        }
+    }
+
+    // SP (R13): absolute
+    if hw.regs[13] != emu.regs[13] {
+        diffs.push(format!(
+            "SP: HW={:#010x} EMU={:#010x}",
+            hw.regs[13], emu.regs[13]
+        ));
+    }
+
+    // LR (R14): absolute
+    if hw.regs[14] != emu.regs[14] {
+        diffs.push(format!(
+            "LR: HW={:#010x} EMU={:#010x}",
+            hw.regs[14], emu.regs[14]
+        ));
+    }
+
+    // PC (R15): absolute
+    if hw.regs[15] != emu.regs[15] {
+        diffs.push(format!(
+            "PC: HW={:#010x} EMU={:#010x}",
+            hw.regs[15], emu.regs[15]
+        ));
+    }
+
+    // xPSR: include T bit (bit 24) — real hardware reports it via SWD
+    let probe_mask = tc.xpsr_mask | 0x0100_0000;
+    let hw_flags = hw.xpsr & probe_mask;
+    let emu_flags = emu.xpsr & probe_mask;
+    if hw_flags != emu_flags {
+        diffs.push(format!(
+            "xPSR: HW={:#010x} EMU={:#010x}",
+            hw.xpsr, emu.xpsr
+        ));
+    }
+
+    // Memory: byte-by-byte at mem_check offsets
+    for (idx, &offset) in tc.mem_check.iter().enumerate() {
+        if hw.mem[idx] != emu.mem[idx] {
+            diffs.push(format!(
+                "MEM[+{offset:#x}]: HW={:#04x} EMU={:#04x}",
+                hw.mem[idx], emu.mem[idx]
             ));
         }
     }
@@ -4413,13 +4531,21 @@ mod tests {
     }
 
     #[test]
-    fn non_bus_opcodes_are_valid_thumb16() {
-        // Opcodes >= 0xE800 are the start of the 32-bit instruction space.
+    fn opcode_width_matches_encoding() {
+        // Thumb-16 opcodes must have bits[15:11] < 0b11101 (< 0xE800).
+        // Thumb-32 opcodes (hw1.is_some()) must have bits[15:11] >= 0b11101 (>= 0xE800).
         for tc in &generate_all() {
-            if !tc.needs_bus {
+            if tc.hw1.is_none() {
                 assert!(
                     tc.opcode < 0xE800,
-                    "test '{}' has opcode {:#06x} >= 0xE800 (Thumb-32 space)",
+                    "Thumb-16 test '{}' has opcode {:#06x} >= 0xE800 (looks like Thumb-32)",
+                    tc.name,
+                    tc.opcode
+                );
+            } else {
+                assert!(
+                    tc.opcode >= 0xE800,
+                    "Thumb-32 test '{}' has opcode {:#06x} < 0xE800 (looks like Thumb-16)",
                     tc.name,
                     tc.opcode
                 );
@@ -4687,7 +4813,7 @@ mod tests {
     // -- compare tests --
 
     fn make_state(regs: [u32; 16], xpsr: u32, mem: Vec<u8>) -> RunState {
-        RunState { regs, xpsr, mem }
+        RunState { regs, xpsr, mem, cycles: 0 }
     }
 
     fn base_regs_qemu() -> [u32; 16] {
@@ -5039,5 +5165,156 @@ mod tests {
                 tc.name, tc.xpsr_pre
             );
         }
+    }
+
+    // -- RunState.cycles --
+
+    #[test]
+    fn runstate_cycles_default_is_zero() {
+        let state = make_state([0; 16], 0, vec![]);
+        assert_eq!(state.cycles, 0);
+    }
+
+    // -- run_one_emu captures cycles --
+
+    #[test]
+    fn run_one_emu_captures_cycles() {
+        // MOVS R0, #42 (encoding T1: 0x202A) — should take 1 cycle
+        let tc = TestCase {
+            opcode: 0x202A,
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu(&tc, &mut bus);
+        assert_eq!(state.regs[0], 42);
+        assert_eq!(state.cycles, 1, "MOVS R0, #42 should be 1 cycle");
+    }
+
+    // -- compare_probe tests --
+
+    fn base_regs_probe() -> [u32; 16] {
+        let mut r = [0u32; 16];
+        r[13] = EMU_TEST_STACK;
+        r[14] = 0xFFFF_FFFF;
+        r[15] = EMU_TEST_SLOT + 2; // PC after one 16-bit instruction
+        r
+    }
+
+    #[test]
+    fn compare_probe_identical_states_ok() {
+        let tc = TestCase::default();
+        let hw = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        let emu = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        assert!(compare_probe(&tc, &hw, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_probe_register_mismatch() {
+        let tc = TestCase::default();
+        let mut hw_regs = base_regs_probe();
+        hw_regs[3] = 0xDEAD_BEEF;
+        let hw = make_state(hw_regs, 0x0100_0000, vec![]);
+        let emu = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("R3"), "should report R3 mismatch: {err}");
+    }
+
+    #[test]
+    fn compare_probe_xpsr_t_bit_mismatch() {
+        let tc = TestCase::default();
+        // HW has T bit set, emu does not
+        let hw = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        let emu = make_state(base_regs_probe(), 0x0000_0000, vec![]);
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("xPSR"), "should report xPSR mismatch: {err}");
+    }
+
+    #[test]
+    fn compare_probe_no_addr_regs_skipping() {
+        // In the QEMU compare(), addr_regs causes registers to be skipped.
+        // compare_probe() must NOT skip them — it compares all regs.
+        let tc = TestCase {
+            addr_regs: vec![2],
+            ..TestCase::default()
+        };
+        let mut hw_regs = base_regs_probe();
+        hw_regs[2] = 0x1111;
+        let mut emu_regs = base_regs_probe();
+        emu_regs[2] = 0x2222;
+        let hw = make_state(hw_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("R2"), "should detect R2 diff even with addr_regs: {err}");
+    }
+
+    #[test]
+    fn compare_probe_sp_absolute() {
+        let tc = TestCase::default();
+        let mut hw_regs = base_regs_probe();
+        hw_regs[13] = EMU_TEST_STACK - 4;
+        let hw = make_state(hw_regs, 0x0100_0000, vec![]);
+        let emu = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("SP"), "should detect SP diff: {err}");
+    }
+
+    #[test]
+    fn compare_probe_lr_absolute() {
+        let tc = TestCase::default();
+        let mut hw_regs = base_regs_probe();
+        hw_regs[14] = 0x2000_0102;
+        let hw = make_state(hw_regs, 0x0100_0000, vec![]);
+        let emu = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("LR"), "should detect LR diff: {err}");
+    }
+
+    #[test]
+    fn compare_probe_pc_absolute() {
+        let tc = TestCase::default();
+        let mut hw_regs = base_regs_probe();
+        hw_regs[15] = EMU_TEST_SLOT + 4;
+        let hw = make_state(hw_regs, 0x0100_0000, vec![]);
+        let emu = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("PC"), "should detect PC diff: {err}");
+    }
+
+    #[test]
+    fn compare_probe_memory_mismatch() {
+        let tc = TestCase {
+            mem_check: vec![0, 4],
+            ..TestCase::default()
+        };
+        let hw = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![0xAA, 0xBB],
+            cycles: 0,
+        };
+        let emu = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![0xAA, 0xCC],
+            cycles: 0,
+        };
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("MEM"), "should detect memory diff: {err}");
+        assert!(!err.contains("+0x0"), "offset 0 should match");
+        assert!(err.contains("+0x4"), "offset 4 should mismatch: {err}");
+    }
+
+    #[test]
+    fn compare_probe_xpsr_mask_applies() {
+        // Flags that are outside the mask should not cause a mismatch
+        let tc = TestCase {
+            xpsr_mask: 0x8000_0000, // only N flag
+            ..TestCase::default()
+        };
+        // Both have T bit set, both have N=0, but differ in Z (bit 30)
+        let hw = make_state(base_regs_probe(), 0x4100_0000, vec![]);
+        let emu = make_state(base_regs_probe(), 0x0100_0000, vec![]);
+        // Z bit differs but is outside mask — should be Ok
+        assert!(compare_probe(&tc, &hw, &emu).is_ok());
     }
 }

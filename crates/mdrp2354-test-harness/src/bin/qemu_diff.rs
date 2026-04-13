@@ -180,8 +180,8 @@ fn run_fuzz(
             Err(diff) => {
                 fail += 1;
                 eprintln!(
-                    "[FAIL] {}\n  opcode: {:#06x}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
-                    tc.name, tc.opcode, tc.xpsr_pre, tc.reg_pre, diff
+                    "[FAIL] {}\n  opcode: {:#06x}  hw1: {:?}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
+                    tc.name, tc.opcode, tc.hw1, tc.xpsr_pre, tc.reg_pre, diff
                 );
             }
         }
@@ -202,8 +202,8 @@ fn run_fuzz(
             Err(diff) => {
                 fail += 1;
                 eprintln!(
-                    "[FAIL] {}\n  opcode: {:#06x}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
-                    tc.name, tc.opcode, tc.xpsr_pre, tc.reg_pre, diff
+                    "[FAIL] {}\n  opcode: {:#06x}  hw1: {:?}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
+                    tc.name, tc.opcode, tc.hw1, tc.xpsr_pre, tc.reg_pre, diff
                 );
             }
         }
@@ -303,10 +303,17 @@ fn run_qemu_side(
     gdb: &mut GdbClient,
     tc: &TestCase,
 ) -> std::io::Result<RunState> {
-    // Write instruction + BKPT to test slot
-    let instr_bytes = tc.opcode.to_le_bytes();
-    gdb.write_mem(QEMU_TEST_SLOT, &instr_bytes)?;
-    gdb.write_mem(QEMU_TEST_SLOT + 2, &BKPT_BYTES)?;
+    // Write instruction to test slot, then BKPT sentinel after it.
+    gdb.write_mem(QEMU_TEST_SLOT, &tc.opcode.to_le_bytes())?;
+    match tc.hw1 {
+        None => {
+            gdb.write_mem(QEMU_TEST_SLOT + 2, &BKPT_BYTES)?;
+        }
+        Some(hw1) => {
+            gdb.write_mem(QEMU_TEST_SLOT + 2, &hw1.to_le_bytes())?;
+            gdb.write_mem(QEMU_TEST_SLOT + 4, &BKPT_BYTES)?;
+        }
+    }
 
     // Set register defaults
     for i in 0..=12u8 {
@@ -325,7 +332,7 @@ fn run_qemu_side(
 
     // Zero scratch + write memory preconditions
     if tc.needs_bus {
-        gdb.write_mem(QEMU_TEST_SCRATCH, &[0u8; 256])?;
+        gdb.write_mem(QEMU_TEST_SCRATCH, &[0u8; SCRATCH_SIZE as usize])?;
         for &(offset, val) in &tc.mem_pre {
             gdb.write_mem(QEMU_TEST_SCRATCH + offset, &[val])?;
         }
@@ -351,5 +358,5 @@ fn run_qemu_side(
         })
         .collect::<std::io::Result<Vec<u8>>>()?;
 
-    Ok(RunState { regs, xpsr, mem })
+    Ok(RunState { regs, xpsr, mem, cycles: 0 })
 }
