@@ -265,7 +265,11 @@ fn run_one_test(
     tc: &TestCase,
 ) -> Result<(), String> {
     let qemu_state = run_qemu_side(gdb, tc).map_err(|e| format!("QEMU error: {e}"))?;
-    let emu_state = run_one_emu(tc, shared_bus);
+    let emu_state = if tc.opcode2.is_some() {
+        run_one_emu_multistep(tc, shared_bus)
+    } else {
+        run_one_emu(tc, shared_bus)
+    };
     compare(tc, &qemu_state, &emu_state)
 }
 
@@ -318,17 +322,28 @@ fn run_qemu_side(
     gdb: &mut GdbClient,
     tc: &TestCase,
 ) -> std::io::Result<RunState> {
-    // Write instruction to test slot, then BKPT sentinel after it.
+    // Write instruction(s) to test slot, then BKPT sentinel after.
+    //
+    // Layout:
+    //   opcode  [+ hw1]   [+ opcode2]  [+ hw1_2]   BKPT
+    // The Thumb-32 `hw1` halfword (if set) immediately follows `opcode`.
+    // Multi-step tests (IT blocks) add a body instruction `opcode2` (+ `hw1_2`
+    // for Thumb-32 bodies) after that, and the BKPT sentinel goes at the end.
     gdb.write_mem(QEMU_TEST_SLOT, &tc.opcode.to_le_bytes())?;
-    match tc.hw1 {
-        None => {
-            gdb.write_mem(QEMU_TEST_SLOT + 2, &BKPT_BYTES)?;
-        }
-        Some(hw1) => {
-            gdb.write_mem(QEMU_TEST_SLOT + 2, &hw1.to_le_bytes())?;
-            gdb.write_mem(QEMU_TEST_SLOT + 4, &BKPT_BYTES)?;
+    let mut next: u32 = QEMU_TEST_SLOT + 2;
+    if let Some(hw1) = tc.hw1 {
+        gdb.write_mem(next, &hw1.to_le_bytes())?;
+        next += 2;
+    }
+    if let Some(op2) = tc.opcode2 {
+        gdb.write_mem(next, &op2.to_le_bytes())?;
+        next += 2;
+        if let Some(hw1_2) = tc.hw1_2 {
+            gdb.write_mem(next, &hw1_2.to_le_bytes())?;
+            next += 2;
         }
     }
+    gdb.write_mem(next, &BKPT_BYTES)?;
 
     // Set register defaults
     for i in 0..=12u8 {
@@ -353,8 +368,12 @@ fn run_qemu_side(
         }
     }
 
-    // Single-step
+    // Step once per instruction in the sequence. For multi-step tests
+    // (`opcode2.is_some()`) we step twice — QEMU honours ITSTATE natively.
     gdb.step()?;
+    if tc.opcode2.is_some() {
+        gdb.step()?;
+    }
 
     // Read post-state
     let mut regs = [0u32; 16];

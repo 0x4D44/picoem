@@ -180,10 +180,17 @@ fn run_one_probe(
     core: &mut Core,
     tc: &TestCase,
 ) -> Result<RunState, probe_rs::Error> {
-    // 1. Write instruction + BKPT sentinel to test slot
+    // 1. Write instruction(s) + BKPT sentinel to test slot.
+    // Layout: opcode [+ hw1] [+ opcode2] [+ hw1_2] BKPT
     let mut code = tc.opcode.to_le_bytes().to_vec();
     if let Some(hw1) = tc.hw1 {
         code.extend_from_slice(&hw1.to_le_bytes());
+    }
+    if let Some(op2) = tc.opcode2 {
+        code.extend_from_slice(&op2.to_le_bytes());
+        if let Some(hw1_2) = tc.hw1_2 {
+            code.extend_from_slice(&hw1_2.to_le_bytes());
+        }
     }
     code.extend_from_slice(&BKPT.to_le_bytes());
     core.write_8(EMU_TEST_SLOT as u64, &code)?;
@@ -215,9 +222,12 @@ fn run_one_probe(
         }
     }
 
-    // 5. Reset CYCCNT, single-step
+    // 5. Reset CYCCNT, single-step (twice for multi-step IT-block tests).
     reset_cyccnt(core)?;
     core.step()?;
+    if tc.opcode2.is_some() {
+        core.step()?;
+    }
 
     // 6. Read post-state
     let mut regs = [0u32; 16];
@@ -428,14 +438,19 @@ fn run_one_diff(
     let hw_state = run_one_probe(core, tc).map_err(DiffError::ProbeError)?;
 
     // Emulator side
-    let emu_state = run_one_emu(tc, shared_bus);
+    let emu_state = if tc.opcode2.is_some() {
+        run_one_emu_multistep(tc, shared_bus)
+    } else {
+        run_one_emu(tc, shared_bus)
+    };
 
     // Semantic comparison
     compare_probe(tc, &hw_state, &emu_state).map_err(DiffError::Mismatch)?;
 
-    // Cycle comparison (if enabled)
+    // Cycle comparison (if enabled, and only for single-step tests —
+    // multi-step tests intentionally return cycles=0 on the emulator side).
     let mut cycle_ok = true;
-    if args.cycles {
+    if args.cycles && tc.opcode2.is_none() {
         // Net cycles = measured - baseline + 1 (NOP is 1 cycle, baseline is NOP's raw count)
         let hw_cycles = hw_state.cycles.saturating_sub(baseline) + 1;
         let emu_cycles = emu_state.cycles;

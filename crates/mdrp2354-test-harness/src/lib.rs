@@ -132,6 +132,11 @@ pub struct TestCase {
     /// addresses (e.g., ADR, ADD Rd,SP, POP {PC}) where QEMU and the emulator
     /// use different memory maps.
     pub probe_only: bool,
+    /// Second instruction (placed at TEST_SLOT + 2). Set for IT-block tests.
+    /// When present, runners use the multi-step execution path.
+    pub opcode2: Option<u16>,
+    /// Second halfword of opcode2 (Thumb-32 body instruction inside an IT block).
+    pub hw1_2: Option<u16>,
 }
 
 impl Default for TestCase {
@@ -149,6 +154,8 @@ impl Default for TestCase {
             hw1: None,
             modifies_lr: false,
             probe_only: false,
+            opcode2: None,
+            hw1_2: None,
         }
     }
 }
@@ -3623,6 +3630,219 @@ fn gen_branch_uncond() -> Vec<TestCase> {
     t
 }
 
+/// Encode an IT instruction.
+///
+/// Layout: `1011_1111_firstcond[3:0]_mask[3:0]` = `0xBF00 | (firstcond << 4) | mask`.
+/// For a single-instruction IT block (just one Then entry), `mask` = `0b1000`.
+fn enc_it(firstcond: u16, mask: u16) -> u16 {
+    0xBF00 | ((firstcond & 0xF) << 4) | (mask & 0xF)
+}
+
+/// Condition name lookup for test names.
+fn cond_name(cond: u16) -> &'static str {
+    match cond & 0xF {
+        0 => "EQ",
+        1 => "NE",
+        2 => "CS",
+        3 => "CC",
+        4 => "MI",
+        5 => "PL",
+        6 => "VS",
+        7 => "VC",
+        8 => "HI",
+        9 => "LS",
+        10 => "GE",
+        11 => "LT",
+        12 => "GT",
+        13 => "LE",
+        14 => "AL",
+        _ => "??",
+    }
+}
+
+/// xPSR flag presets where each ARM condition is `TRUE`.
+/// All values include the Thumb bit (0x0100_0000).
+fn flags_condition_true(cond: u16) -> u32 {
+    let tb = 0x0100_0000u32;
+    let n = 1u32 << 31;
+    let z = 1u32 << 30;
+    let c = 1u32 << 29;
+    let v = 1u32 << 28;
+    match cond & 0xF {
+        0  => tb | z,                 // EQ: Z=1
+        1  => tb,                     // NE: Z=0
+        2  => tb | c,                 // CS: C=1
+        3  => tb,                     // CC: C=0
+        4  => tb | n,                 // MI: N=1
+        5  => tb,                     // PL: N=0
+        6  => tb | v,                 // VS: V=1
+        7  => tb,                     // VC: V=0
+        8  => tb | c,                 // HI: C=1 & Z=0
+        9  => tb | z,                 // LS: C=0 | Z=1
+        10 => tb,                     // GE: N==V (both 0)
+        11 => tb | n,                 // LT: N!=V (N=1, V=0)
+        12 => tb,                     // GT: Z=0 & N==V (both 0)
+        13 => tb | z,                 // LE: Z=1 OR N!=V
+        _  => tb,
+    }
+}
+
+/// xPSR flag presets where each ARM condition is `FALSE`.
+fn flags_condition_false(cond: u16) -> u32 {
+    let tb = 0x0100_0000u32;
+    let n = 1u32 << 31;
+    let z = 1u32 << 30;
+    let c = 1u32 << 29;
+    let v = 1u32 << 28;
+    match cond & 0xF {
+        0  => tb,                     // EQ false: Z=0
+        1  => tb | z,                 // NE false: Z=1
+        2  => tb,                     // CS false: C=0
+        3  => tb | c,                 // CC false: C=1
+        4  => tb,                     // MI false: N=0
+        5  => tb | n,                 // PL false: N=1
+        6  => tb,                     // VS false: V=0
+        7  => tb | v,                 // VC false: V=1
+        8  => tb | z,                 // HI false: Z=1
+        9  => tb | c,                 // LS false: C=1 & Z=0
+        10 => tb | n,                 // GE false: N!=V (N=1, V=0)
+        11 => tb,                     // LT false: N==V (both 0)
+        12 => tb | z,                 // GT false: Z=1
+        13 => tb,                     // LE false: Z=0 & N==V
+        _  => tb,
+    }
+}
+
+/// Evaluate an ARM condition code against an xPSR value. Used by fuzz tests to
+/// decide whether the IT-block body should have executed.
+fn cond_passes(cond: u16, xpsr: u32) -> bool {
+    let n = (xpsr >> 31) & 1 != 0;
+    let z = (xpsr >> 30) & 1 != 0;
+    let c = (xpsr >> 29) & 1 != 0;
+    let v = (xpsr >> 28) & 1 != 0;
+    match cond & 0xF {
+        0  => z,
+        1  => !z,
+        2  => c,
+        3  => !c,
+        4  => n,
+        5  => !n,
+        6  => v,
+        7  => !v,
+        8  => c && !z,
+        9  => !c || z,
+        10 => n == v,
+        11 => n != v,
+        12 => !z && (n == v),
+        13 => z || (n != v),
+        _  => true,
+    }
+}
+
+/// Hand-crafted IT-block tests: IT + one body instruction.
+///
+/// Covers condition taken/skipped for all 14 ARM conditions, flag suppression
+/// (ADDS inside IT does NOT set flags; CMP inside IT DOES set flags), and a
+/// Thumb-32 body (ADDS.W) inside an IT block. Uses the multi-step runner on
+/// the emulator side (`opcode2.is_some()`).
+fn gen_it_block() -> Vec<TestCase> {
+    let mut t = Vec::new();
+
+    // ADDS.W R0, R1, R2 with S=1, LSL #0 — a Thumb-32 body used below.
+    let (addsw_hw0, addsw_hw1) =
+        thumb32_gen::enc_t32_dp_shift_reg(thumb32_gen::DP_ADD, true, 1, 0, 2, 0, 0);
+
+    // --- Condition taken / skipped for each condition EQ..LE ---
+    for cond in 0u16..=13 {
+        let cname = cond_name(cond);
+
+        // Body: MOVS R0, #42 (T16). Observable effect: R0 = 42 when executed.
+        let body = enc_movs_imm(0, 42);
+
+        // Condition passes → body executes → R0 = 42.
+        t.push(TestCase {
+            name: format!("IT {cname}; MOVS R0,#42 (taken)"),
+            opcode: enc_it(cond, 0b1000),
+            opcode2: Some(body),
+            xpsr_pre: flags_condition_true(cond),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+
+        // Condition fails → body skipped → R0 = 0 (unchanged).
+        t.push(TestCase {
+            name: format!("IT {cname}; MOVS R0,#42 (skipped)"),
+            opcode: enc_it(cond, 0b1000),
+            opcode2: Some(body),
+            xpsr_pre: flags_condition_false(cond),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Flag suppression: IT EQ + ADDS Rd, Rn, Rm ---
+    //
+    // ADDS R0, R1, R2 = 0x1888. Inside an IT block, ADDS must NOT update
+    // NZCV flags even though S=1 in the encoding.
+    let adds_r0_r1_r2 = enc_adds_reg(0, 1, 2);
+    let xpsr_with_zc = flags_condition_true(0) | (1 << 29); // T|Z|C
+    t.push(TestCase {
+        name: "IT EQ; ADDS R0,R1,R2 (flags preserved)".into(),
+        opcode: enc_it(0, 0b1000),
+        opcode2: Some(adds_r0_r1_r2),
+        reg_pre: vec![(1, 5), (2, 10)],
+        // Set Z=1 so EQ is true, and also set C=1. Both should survive ADDS.
+        xpsr_pre: xpsr_with_zc,
+        // Compare all NZCV flags — they must be identical to xpsr_pre on both sides.
+        xpsr_mask: MASK_ALL_FLAGS,
+        ..TestCase::default()
+    });
+
+    // --- Flag-only instruction: IT EQ + CMP R0, R1 ---
+    //
+    // CMP updates flags even when inside an IT block (it's flag-only and
+    // has no Rd output). CMP R0, R1 = 0x4288.
+    t.push(TestCase {
+        name: "IT EQ; CMP R0,R1 (flags updated)".into(),
+        opcode: enc_it(0, 0b1000),
+        opcode2: Some(0x4288),
+        reg_pre: vec![(0, 10), (1, 5)],
+        xpsr_pre: flags_condition_true(0), // Z=1 so EQ is true
+        xpsr_mask: MASK_ALL_FLAGS,
+        ..TestCase::default()
+    });
+
+    // --- Thumb-32 body inside IT: IT EQ + ADDS.W R0, R1, R2 ---
+    //
+    // Validates that a 32-bit instruction works as an IT-block body. The
+    // condition passes so the body executes; flag updates are suppressed by
+    // IT semantics.
+    t.push(TestCase {
+        name: "IT EQ; ADDS.W R0,R1,R2 (T32 body, taken)".into(),
+        opcode: enc_it(0, 0b1000),
+        opcode2: Some(addsw_hw0),
+        hw1_2: Some(addsw_hw1),
+        reg_pre: vec![(1, 100), (2, 50)],
+        xpsr_pre: flags_condition_true(0),
+        xpsr_mask: MASK_ALL_FLAGS,
+        ..TestCase::default()
+    });
+
+    // Same T32 body, condition fails → body skipped → R0 unchanged.
+    t.push(TestCase {
+        name: "IT EQ; ADDS.W R0,R1,R2 (T32 body, skipped)".into(),
+        opcode: enc_it(0, 0b1000),
+        opcode2: Some(addsw_hw0),
+        hw1_2: Some(addsw_hw1),
+        reg_pre: vec![(1, 100), (2, 50)],
+        xpsr_pre: flags_condition_false(0),
+        xpsr_mask: MASK_NO_FLAGS,
+        ..TestCase::default()
+    });
+
+    t
+}
+
 /// Generate all Thumb-16 test cases.
 pub fn generate_all() -> Vec<TestCase> {
     let mut all = Vec::new();
@@ -3640,6 +3860,7 @@ pub fn generate_all() -> Vec<TestCase> {
     all.extend(gen_stm_ldm());
     all.extend(gen_branch_cond());
     all.extend(gen_branch_uncond());
+    all.extend(gen_it_block());
     // Thumb-32 generators — Priority 1
     all.extend(thumb32_gen::gen_t32_dp_mod_imm());
     all.extend(thumb32_gen::gen_t32_load_store_single());
@@ -3856,6 +4077,90 @@ fn generate_fuzz_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             name: format!("FUZZ:BUNCOND:{i} off={offset_bytes}"),
             opcode,
             xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- IT blocks (one body instruction) ---
+    //
+    // Multi-step tests: IT + body. Uses `run_one_emu_multistep` on the
+    // emulator side, step()-twice on QEMU / probe sides. Each test picks a
+    // random condition (0-13), random xPSR flags (so the condition passes
+    // about half the time), and a random body drawn from a small alphabet
+    // of well-understood instructions.
+    for i in 0..count {
+        let cond: u16 = rng.range(0..14u16);
+        let xpsr_pre = rand_flags(rng);
+
+        // Pick a body instruction. Keep the alphabet small so failure modes
+        // are easy to diagnose.
+        let variant = rng.range(0..4u8);
+        let (body_desc, body, reg_pre, mask) = match variant {
+            0 => {
+                // MOVS Rd, #imm8 — flag-updating, but suppressed inside IT.
+                let rd: u16 = rng.range(0..8);
+                let imm8: u16 = rng.range(0..256);
+                (
+                    format!("MOVS R{rd},#{imm8}"),
+                    enc_movs_imm(rd, imm8),
+                    rand_low_regs(rng),
+                    MASK_ALL_FLAGS,
+                )
+            }
+            1 => {
+                // ADDS Rd, Rn, Rm — flag-updating, suppressed inside IT.
+                let rd: u16 = rng.range(0..8);
+                let rn: u16 = rng.range(0..8);
+                let rm: u16 = rng.range(0..8);
+                (
+                    format!("ADDS R{rd},R{rn},R{rm}"),
+                    enc_adds_reg(rd, rn, rm),
+                    rand_low_regs(rng),
+                    MASK_ALL_FLAGS,
+                )
+            }
+            2 => {
+                // MOV Rd, Rm (high register form) — never updates flags,
+                // stays within GP regs only (avoid SP/LR/PC).
+                let rd: u16 = rng.range(0..12);
+                let rm: u16 = rng.range(0..12);
+                let regs: Vec<(u8, u32)> =
+                    (0..=12).map(|r| (r, rng.random())).collect();
+                (
+                    format!("MOV R{rd},R{rm}"),
+                    enc_mov_high(rd, rm),
+                    regs,
+                    MASK_ALL_FLAGS,
+                )
+            }
+            _ => {
+                // CMP Rn, Rm — flag-only instruction, NOT suppressed by IT.
+                // Encoding: data processing op=10 (0b1010).
+                let rn: u16 = rng.range(0..8);
+                let rm: u16 = rng.range(0..8);
+                (
+                    format!("CMP R{rn},R{rm}"),
+                    enc_data_proc(10, rm, rn),
+                    rand_low_regs(rng),
+                    MASK_ALL_FLAGS,
+                )
+            }
+        };
+
+        // Name includes the observable condition outcome for triage.
+        let passes = cond_passes(cond, xpsr_pre);
+        let taken = if passes { "taken" } else { "skipped" };
+
+        t.push(TestCase {
+            name: format!(
+                "FUZZ:IT:{i} cond={} body={body_desc} ({taken})",
+                cond_name(cond)
+            ),
+            opcode: enc_it(cond, 0b1000),
+            opcode2: Some(body),
+            reg_pre,
+            xpsr_pre,
+            xpsr_mask: mask,
             ..TestCase::default()
         });
     }
@@ -4365,6 +4670,101 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         .collect();
 
     RunState { regs, xpsr, mem, cycles }
+}
+
+/// Run a multi-step test case on the emulator (IT blocks, FPU prelude/epilogue).
+///
+/// Unlike `run_one_emu`, this writes the full instruction sequence into the bus
+/// at `EMU_TEST_SLOT` and drives execution through `core.step()`, which routes
+/// through `decode_execute()`. This is required for IT blocks: the body
+/// instruction must see the `it_state` set by the IT instruction, which only
+/// happens on the `decode_execute` path.
+///
+/// Cycle comparison is intentionally skipped for multi-step tests (cycles = 0
+/// in the returned `RunState`) — these tests validate semantic correctness,
+/// not exact cycle accounting across multi-instruction sequences.
+pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
+    let mut core = CortexM33::new();
+
+    // Set defaults: R0-R12 = 0, SP = stack, LR = sentinel, PC = slot
+    for i in 0..=12 {
+        core.set_reg(i, 0);
+    }
+    core.set_reg(13, EMU_TEST_STACK);
+    core.set_reg(14, 0xFFFF_FFFF);
+    core.regs.set_pc(EMU_TEST_SLOT);
+    core.regs.xpsr = tc.xpsr_pre;
+
+    // Apply register preconditions with address translation
+    for &(reg, val) in &tc.reg_pre {
+        let val = setup_reg(reg, val, tc, EMU_TEST_SCRATCH);
+        core.set_reg(reg as usize, val);
+    }
+
+    // Memory setup (if needed)
+    if tc.needs_bus {
+        for i in 0..SCRATCH_SIZE {
+            shared_bus.write8(EMU_TEST_SCRATCH + i, 0);
+        }
+        for &(offset, val) in &tc.mem_pre {
+            shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
+        }
+    }
+
+    // Write the first instruction (e.g., IT) at the test slot.
+    shared_bus.write16(EMU_TEST_SLOT, tc.opcode);
+    // If the first instruction is Thumb-32, its second halfword goes next.
+    let body_offset: u32 = match tc.hw1 {
+        Some(hw1) => {
+            shared_bus.write16(EMU_TEST_SLOT + 2, hw1);
+            4
+        }
+        None => 2,
+    };
+    // Write the body instruction (the instruction under test inside IT).
+    let op2 = tc.opcode2.expect("run_one_emu_multistep requires tc.opcode2");
+    shared_bus.write16(EMU_TEST_SLOT + body_offset, op2);
+    if let Some(hw1_2) = tc.hw1_2 {
+        shared_bus.write16(EMU_TEST_SLOT + body_offset + 2, hw1_2);
+    }
+
+    // Reset bus wait-state accumulator (mirrors decode_execute path).
+    shared_bus.reset_extra_wait_states();
+
+    // Step 1: the IT (or prelude) instruction. Drain any pre-existing stall
+    // cycles first, then execute exactly one instruction.
+    while core.stall_cycles() > 0 {
+        core.step(shared_bus);
+    }
+    core.step(shared_bus);
+
+    // Step 2: the body instruction. Drain the stall cycles left over from
+    // step 1, then execute exactly one more instruction.
+    while core.stall_cycles() > 0 {
+        core.step(shared_bus);
+    }
+    core.step(shared_bus);
+
+    // Drain any residual stall cycles so the core is at rest and PC points
+    // past the body instruction.
+    while core.stall_cycles() > 0 {
+        core.step(shared_bus);
+    }
+
+    // Collect post-state
+    let mut regs = [0u32; 16];
+    for i in 0..16 {
+        regs[i] = core.reg(i);
+    }
+    let xpsr = core.regs.xpsr;
+    let mem: Vec<u8> = tc
+        .mem_check
+        .iter()
+        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
+        .collect();
+
+    // Cycle counting is intentionally skipped for multi-step tests.
+    RunState { regs, xpsr, mem, cycles: 0 }
 }
 
 // ============================================================================
@@ -5388,7 +5788,8 @@ mod tests {
     #[test]
     fn fuzz_generates_expected_count() {
         let (alu, mem) = generate_fuzz(10, 0);
-        // T16 ALU: shift, addsub, imm8, dproc, special, misc, bcond, buncond = 8 classes
+        // T16 ALU: shift, addsub, imm8, dproc, special, misc, bcond, buncond,
+        //          it_block = 9 classes
         // T32 ALU: dp_imm, dp_sreg, mul, div, lmul, smulxy, smlaxy,
         //          smm_family, dual_halfword, word_x_half, long_halfword, dsp_special,
         //          qsat, paradd, sat, bcond = 16 classes
@@ -5397,7 +5798,7 @@ mod tests {
         //   variants (2 PUSH slots + 1 POP + 1 POP_PC). The class still emits
         //   `count` tests per call, so the class count stays at 5.
         // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
-        assert_eq!(alu.len(), (8 + 16) * 10, "ALU count: (8 T16 + 16 T32) * 10");
+        assert_eq!(alu.len(), (9 + 16) * 10, "ALU count: (9 T16 + 16 T32) * 10");
         assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
     }
 
@@ -5450,6 +5851,77 @@ mod tests {
         let state = run_one_emu(&tc, &mut bus);
         assert_eq!(state.regs[0], 42);
         assert_eq!(state.cycles, 1, "MOVS R0, #42 should be 1 cycle");
+    }
+
+    // -- run_one_emu_multistep tests (IT block path) --
+
+    #[test]
+    fn run_one_emu_multistep_it_eq_taken() {
+        // IT EQ; MOVS R0, #42 — condition true (Z=1) so body executes.
+        let tc = TestCase {
+            name: "test".into(),
+            opcode: enc_it(0, 0b1000),
+            opcode2: Some(enc_movs_imm(0, 42)),
+            xpsr_pre: 0x0100_0000 | (1 << 30), // T + Z
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu_multistep(&tc, &mut bus);
+        assert_eq!(state.regs[0], 42, "R0 should be 42 after taken MOVS");
+        assert_eq!(state.cycles, 0, "multistep cycles should be 0");
+    }
+
+    #[test]
+    fn run_one_emu_multistep_it_eq_skipped() {
+        // IT EQ; MOVS R0, #42 — condition false (Z=0) so body is skipped.
+        let tc = TestCase {
+            name: "test".into(),
+            opcode: enc_it(0, 0b1000),
+            opcode2: Some(enc_movs_imm(0, 42)),
+            xpsr_pre: 0x0100_0000, // T only, no Z
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu_multistep(&tc, &mut bus);
+        assert_eq!(state.regs[0], 0, "R0 should be untouched when skipped");
+    }
+
+    #[test]
+    fn run_one_emu_multistep_it_adds_flags_suppressed() {
+        // IT EQ; ADDS R0, R1, R2 — flags preserved (Z and C must both stay set).
+        let tc = TestCase {
+            name: "test".into(),
+            opcode: enc_it(0, 0b1000),
+            opcode2: Some(enc_adds_reg(0, 1, 2)),
+            reg_pre: vec![(1, 5), (2, 10)],
+            xpsr_pre: 0x0100_0000 | (1 << 30) | (1 << 29), // T+Z+C
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu_multistep(&tc, &mut bus);
+        assert_eq!(state.regs[0], 15, "5 + 10 = 15");
+        assert_ne!(state.xpsr & (1 << 30), 0, "Z must be preserved");
+        assert_ne!(state.xpsr & (1 << 29), 0, "C must be preserved");
+    }
+
+    #[test]
+    fn run_one_emu_multistep_it_t32_body() {
+        // IT EQ; ADDS.W R0, R1, R2 — Thumb-32 body inside IT block.
+        let (hw0, hw1) = thumb32_gen::enc_t32_dp_shift_reg(
+            thumb32_gen::DP_ADD, true, 1, 0, 2, 0, 0,
+        );
+        let tc = TestCase {
+            name: "test".into(),
+            opcode: enc_it(0, 0b1000),
+            opcode2: Some(hw0),
+            hw1_2: Some(hw1),
+            reg_pre: vec![(1, 100), (2, 50)],
+            xpsr_pre: 0x0100_0000 | (1 << 30), // T + Z (EQ true)
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu_multistep(&tc, &mut bus);
+        assert_eq!(state.regs[0], 150, "100 + 50 = 150");
     }
 
     // -- compare_probe tests --
