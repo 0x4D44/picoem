@@ -32,6 +32,14 @@ pub struct Registers {
     pub msplim: u32,
     /// Process Stack Pointer Limit (Armv8-M).
     pub psplim: u32,
+    /// Non-secure stack pointer limits (TrustZone stubs).
+    pub msplim_ns: u32,
+    pub psplim_ns: u32,
+    /// Non-secure special registers (TrustZone stubs).
+    pub primask_ns: u32,
+    pub basepri_ns: u32,
+    pub faultmask_ns: u32,
+    pub control_ns: u32,
     /// FPU single-precision registers S0-S31.
     pub s: [f32; 32],
     /// FP status/control register.
@@ -54,6 +62,12 @@ impl Registers {
             psp_ns: 0,
             msplim: 0,
             psplim: 0,
+            msplim_ns: 0,
+            psplim_ns: 0,
+            primask_ns: 0,
+            basepri_ns: 0,
+            faultmask_ns: 0,
+            control_ns: 0,
             s: [0.0; 32],
             fpscr: 0,
         };
