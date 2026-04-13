@@ -15,6 +15,11 @@ pub struct Ppb {
     pub cpacr: u32,     // Coprocessor Access Control (0xE000ED88)
     pub icsr: u32,      // Interrupt Control/State (0xE000ED04)
 
+    // MPU (0xE000ED94-0xE000EDA0)
+    pub mpu_ctrl: u32,                 // MPU Control (0xE000ED94)
+    pub mpu_rnr: u32,                  // MPU Region Number (0xE000ED98)
+    pub mpu_regions: [(u32, u32); 16], // 16 regions: (RBAR, RLAR) pairs
+
     // SAU (0xE000EDD0-0xE000EDE0)
     pub sau_ctrl: u32,                // SAU Control (bit 0 = enable, bit 1 = ALLNS)
     pub sau_rnr: u32,                 // Region Number Register (selects active region)
@@ -36,6 +41,9 @@ impl Default for Ppb {
             bfar: 0,
             cpacr: 0x00F0_0000, // CP10/11 (FPU) full access
             icsr: 0,
+            mpu_ctrl: 0,
+            mpu_rnr: 0,
+            mpu_regions: [(0, 0); 16],
             sau_ctrl: 0,
             sau_rnr: 0,
             sau_regions: [(0, 0); 8],
@@ -119,6 +127,23 @@ impl Ppb {
             // CPACR
             0xED88 => self.cpacr,
 
+            // MPU_TYPE: 16 regions on RP2350 Cortex-M33
+            0xED90 => 0x0000_1000, // DREGION=16, IREGION=0, SEPARATE=0
+            // MPU_CTRL
+            0xED94 => self.mpu_ctrl,
+            // MPU_RNR
+            0xED98 => self.mpu_rnr,
+            // MPU_RBAR
+            0xED9C => {
+                let idx = (self.mpu_rnr & 0xF) as usize;
+                self.mpu_regions[idx].0
+            }
+            // MPU_RLAR
+            0xEDA0 => {
+                let idx = (self.mpu_rnr & 0xF) as usize;
+                self.mpu_regions[idx].1
+            }
+
             // SAU_CTRL
             0xEDD0 => self.sau_ctrl,
             // SAU_TYPE: 8 regions (RP2350 has 8)
@@ -193,6 +218,23 @@ impl Ppb {
 
             // CPACR
             0xED88 => self.cpacr = val,
+
+            // MPU_TYPE: read-only
+            0xED90 => {}
+            // MPU_CTRL
+            0xED94 => self.mpu_ctrl = val,
+            // MPU_RNR
+            0xED98 => self.mpu_rnr = val & 0xF,
+            // MPU_RBAR
+            0xED9C => {
+                let idx = (self.mpu_rnr & 0xF) as usize;
+                self.mpu_regions[idx].0 = val;
+            }
+            // MPU_RLAR
+            0xEDA0 => {
+                let idx = (self.mpu_rnr & 0xF) as usize;
+                self.mpu_regions[idx].1 = val;
+            }
 
             // SAU_CTRL
             0xEDD0 => self.sau_ctrl = val,

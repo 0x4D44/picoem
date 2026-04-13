@@ -39,6 +39,13 @@ pub struct Bus {
     /// (STM/LDM/PUSH/POP). The SRAM controller handles sequential word
     /// accesses without per-word bank penalties.
     burst_mode: bool,
+    /// 4 KB boot RAM at 0xEFFF_F000..0xF000_0000.
+    /// RP2350 maps this as the secure boot stack (USB DPRAM secure alias).
+    /// Initial SP = 0xF000_0000 (top of this region).
+    boot_ram: Box<[u8; 4096]>,
+    /// 16 KB XIP SRAM at 0x1C00_0000..0x1C00_3FFF.
+    /// RP2350 XIP cache memory accessible as SRAM.
+    xip_sram: Box<[u8; 16384]>,
 }
 
 impl Bus {
@@ -56,7 +63,90 @@ impl Bus {
             bus_fault_addr: 0,
             flash_loaded: false,
             burst_mode: false,
+            boot_ram: Box::new([0u8; 4096]),
+            xip_sram: Box::new([0u8; 16384]),
         }
+    }
+
+    // --- XIP SRAM helpers (0x1C00_0000..0x1C00_3FFF) ---
+
+    fn is_xip_sram(addr: u32) -> bool {
+        addr >= 0x1C00_0000 && addr < 0x1C00_4000
+    }
+
+    fn xip_sram_read8(&self, addr: u32) -> u8 {
+        self.xip_sram[(addr - 0x1C00_0000) as usize]
+    }
+
+    fn xip_sram_write8(&mut self, addr: u32, val: u8) {
+        self.xip_sram[(addr - 0x1C00_0000) as usize] = val;
+    }
+
+    fn xip_sram_read16(&self, addr: u32) -> u16 {
+        let off = (addr - 0x1C00_0000) as usize;
+        u16::from_le_bytes([self.xip_sram[off], self.xip_sram[off + 1]])
+    }
+
+    fn xip_sram_write16(&mut self, addr: u32, val: u16) {
+        let off = (addr - 0x1C00_0000) as usize;
+        self.xip_sram[off..off + 2].copy_from_slice(&val.to_le_bytes());
+    }
+
+    fn xip_sram_read32(&self, addr: u32) -> u32 {
+        let off = (addr - 0x1C00_0000) as usize;
+        u32::from_le_bytes([
+            self.xip_sram[off], self.xip_sram[off + 1],
+            self.xip_sram[off + 2], self.xip_sram[off + 3],
+        ])
+    }
+
+    fn xip_sram_write32(&mut self, addr: u32, val: u32) {
+        let off = (addr - 0x1C00_0000) as usize;
+        self.xip_sram[off..off + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    // --- Boot RAM helpers (0xEFFF_F000..0xF000_0000) ---
+
+    /// Check if address is in the 4KB boot RAM region.
+    pub fn is_boot_ram(addr: u32) -> bool {
+        addr >= 0xEFFF_F000 && addr < 0xF000_0000
+    }
+
+    fn boot_ram_read8(&self, addr: u32) -> u8 {
+        let off = (addr - 0xEFFF_F000) as usize;
+        self.boot_ram[off]
+    }
+
+    fn boot_ram_write8(&mut self, addr: u32, val: u8) {
+        let off = (addr - 0xEFFF_F000) as usize;
+        self.boot_ram[off] = val;
+    }
+
+    pub fn boot_ram_read32(&self, addr: u32) -> u32 {
+        let off = (addr - 0xEFFF_F000) as usize;
+        u32::from_le_bytes([
+            self.boot_ram[off],
+            self.boot_ram[off + 1],
+            self.boot_ram[off + 2],
+            self.boot_ram[off + 3],
+        ])
+    }
+
+    pub fn boot_ram_write32(&mut self, addr: u32, val: u32) {
+        let off = (addr - 0xEFFF_F000) as usize;
+        let bytes = val.to_le_bytes();
+        self.boot_ram[off..off + 4].copy_from_slice(&bytes);
+    }
+
+    fn boot_ram_read16(&self, addr: u32) -> u16 {
+        let off = (addr - 0xEFFF_F000) as usize;
+        u16::from_le_bytes([self.boot_ram[off], self.boot_ram[off + 1]])
+    }
+
+    fn boot_ram_write16(&mut self, addr: u32, val: u16) {
+        let off = (addr - 0xEFFF_F000) as usize;
+        let bytes = val.to_le_bytes();
+        self.boot_ram[off..off + 2].copy_from_slice(&bytes);
     }
 
     // --- Bus arbitration ---
@@ -242,6 +332,7 @@ impl Bus {
         };
         match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
+            0x1 if Self::is_xip_sram(addr) => self.xip_sram_read8(addr),
             0x1 => {
                 if !self.flash_loaded {
                     self.bus_fault = true;
@@ -266,12 +357,15 @@ impl Bus {
                     0x4001_0000 => self.clocks_read(offset),
                     0x4004_8000 => self.xosc_read(offset),
                     0x4005_0000 => self.pll_sys_read(offset),
+                    0x4005_8000 => self.pll_usb_read(offset),
+                    0x400D_0000 => self.qmi_read(offset),
                     _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
                 };
                 let byte_idx = (canonical & 3) as usize;
                 word.to_le_bytes()[byte_idx]
             }
             0xD => 0, // SIO (stub)
+            0xE if Self::is_boot_ram(addr) => self.boot_ram_read8(addr),
             0xE => 0, // PPB (stub)
             _ => {
                 self.bus_fault = true;
@@ -298,6 +392,7 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
+            0x1 if Self::is_xip_sram(addr) => self.xip_sram_write8(addr, val),
             0x2 if offset < SRAM_SIZE as u32 => {
                 let sram_alias = (addr >> 24) & 0x3;
                 if sram_alias == 0 {
@@ -318,7 +413,7 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 => {
+                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 | 0x400D_0000 => {
                         // SYSINFO (read-only), CLOCKS, XOSC, PLL: ignore writes
                     }
                     0x4002_0000 => {
@@ -341,6 +436,7 @@ impl Bus {
                     }
                 }
             }
+            0xE if Self::is_boot_ram(addr) => self.boot_ram_write8(addr, val),
             _ => {} // ROM read-only, others unmapped/stub
         }
     }
@@ -361,6 +457,7 @@ impl Bus {
         };
         match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
+            0x1 if Self::is_xip_sram(addr) => self.xip_sram_read16(addr),
             0x1 => {
                 if !self.flash_loaded {
                     self.bus_fault = true;
@@ -385,6 +482,8 @@ impl Bus {
                     0x4001_0000 => self.clocks_read(offset),
                     0x4004_8000 => self.xosc_read(offset),
                     0x4005_0000 => self.pll_sys_read(offset),
+                    0x4005_8000 => self.pll_usb_read(offset),
+                    0x400D_0000 => self.qmi_read(offset),
                     _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
                 };
                 let half_idx = ((canonical >> 1) & 1) as usize;
@@ -392,6 +491,7 @@ impl Bus {
                 halves[half_idx]
             }
             0xD => 0, // SIO (stub)
+            0xE if Self::is_boot_ram(addr) => self.boot_ram_read16(addr),
             0xE => {
                 // PPB: extract halfword from 32-bit register read
                 let word = self.ppb[self.active_core()].read32(addr & !3);
@@ -423,6 +523,7 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
+            0x1 if Self::is_xip_sram(addr) => self.xip_sram_write16(addr, val),
             0x2 if (offset + 1) < SRAM_SIZE as u32 => {
                 let sram_alias = (addr >> 24) & 0x3;
                 if sram_alias == 0 {
@@ -443,7 +544,7 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 => {
+                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 | 0x400D_0000 => {
                         // SYSINFO (read-only), CLOCKS, XOSC, PLL: ignore writes
                     }
                     0x4002_0000 => {
@@ -467,6 +568,7 @@ impl Bus {
                     }
                 }
             }
+            0xE if Self::is_boot_ram(addr) => self.boot_ram_write16(addr, val),
             _ => {}
         }
     }
@@ -487,6 +589,7 @@ impl Bus {
         };
         match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
+            0x1 if Self::is_xip_sram(addr) => self.xip_sram_read32(addr),
             0x1 => {
                 if !self.flash_loaded {
                     self.bus_fault = true;
@@ -510,10 +613,13 @@ impl Bus {
                     0x4001_0000 => self.clocks_read(offset),
                     0x4004_8000 => self.xosc_read(offset),
                     0x4005_0000 => self.pll_sys_read(offset),
+                    0x4005_8000 => self.pll_usb_read(offset),
+                    0x400D_0000 => self.qmi_read(offset),
                     _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
                 }
             }
             0xD => 0, // SIO (stub)
+            0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
             0xE => self.ppb[self.active_core()].read32(addr),
             _ => {
                 self.bus_fault = true;
@@ -540,6 +646,7 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
+            0x1 if Self::is_xip_sram(addr) => self.xip_sram_write32(addr, val),
             0x2 if (offset + 3) < SRAM_SIZE as u32 => {
                 let sram_alias = (addr >> 24) & 0x3;
                 if sram_alias == 0 {
@@ -562,7 +669,7 @@ impl Bus {
                 let offset = canonical & 0x0000_0FFF;
                 match base {
                     0x4002_0000 => self.resets_write(offset, val, alias),
-                    0x4001_0000 | 0x4004_8000 | 0x4005_0000 => {
+                    0x4001_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 | 0x400D_0000 => {
                         // CLOCKS, XOSC, PLL: accept writes, ignore
                     }
                     // SYSINFO (0x4000_0000): read-only, ignore writes
@@ -581,6 +688,7 @@ impl Bus {
                     }
                 }
             }
+            0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),
             0xE => {
                 let core = self.active_core();
                 self.ppb[core].write32(addr, val);

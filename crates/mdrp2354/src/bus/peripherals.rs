@@ -50,10 +50,27 @@ impl Bus {
         }
     }
 
-    // --- PLL_SYS (0x40050000) ---
+    // --- PLL_SYS (0x40050000) / PLL_USB (0x40058000) ---
+    // Both PLLs share the same register layout; report locked immediately.
     pub(crate) fn pll_sys_read(&self, offset: u32) -> u32 {
         match offset {
             0x000 => 1 << 31, // CS: LOCK bit set
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn pll_usb_read(&self, offset: u32) -> u32 {
+        match offset {
+            0x000 => 1 << 31, // CS: LOCK bit set
+            _ => 0,
+        }
+    }
+
+    // --- QMI (0x400D0000) --- QSPI memory interface
+    pub(crate) fn qmi_read(&self, offset: u32) -> u32 {
+        match offset {
+            // DIRECT_CSR: TXEMPTY=1 (bit 16), RXEMPTY=1 (bit 17), BUSY=0 (bit 1)
+            0x000 => (1 << 16) | (1 << 17),
             _ => 0,
         }
     }

@@ -4748,17 +4748,15 @@ fn tt_sau_disabled_returns_secure() {
     // When SAU is disabled, TT should return Secure with full access
     let (mut c, mut bus) = core_and_bus();
     // SAU disabled by default (sau_ctrl = 0)
-    c.set_reg(5, 0x2000_0000); // address to test
+    c.set_reg(5, 0x2000_0000); // address to test (SRAM, IDAU-secure)
     // TT R2, R5: hw0=0xE845, hw1=0xF200
     c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
     let result = c.reg(2);
-    // S=1, NSRW=1, NSR=1, RW=1, R=1, SRVALID=0
+    // S=1, RW=1, R=1, SRVALID=0; IDAU bits may be set
     assert_ne!(result & (1 << 22), 0, "S bit should be set");
-    assert_ne!(result & (1 << 21), 0, "NSRW bit should be set");
-    assert_ne!(result & (1 << 20), 0, "NSR bit should be set");
     assert_ne!(result & (1 << 19), 0, "RW bit should be set");
     assert_ne!(result & (1 << 18), 0, "R bit should be set");
-    assert_eq!(result & (1 << 16), 0, "SRVALID should be clear");
+    assert_eq!(result & (1 << 17), 0, "SRVALID should be clear");
 }
 
 #[test]
@@ -4771,18 +4769,18 @@ fn tt_sau_region_match() {
     bus.ppb[0].sau_rnr = 3;
     bus.ppb[0].sau_regions[3] = (0x4787, 0x7FE1);
 
-    c.set_reg(5, 0x7FE1); // address in range
+    c.set_reg(5, 0x7FE1); // address in range (secure ROM range, IDAU-secure)
     // TT R2, R5: hw0=0xE845, hw1=0xF200
     c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
     let result = c.reg(2);
 
-    // SREGION = 3
-    assert_eq!(result & 0xFF, 3, "SREGION should be 3");
-    // SRVALID = 1
-    assert_ne!(result & (1 << 16), 0, "SRVALID should be set");
+    // SREGION = 3 at bits [15:8]
+    assert_eq!((result >> 8) & 0xFF, 3, "SREGION should be 3");
+    // SRVALID = bit 17
+    assert_ne!(result & (1 << 17), 0, "SRVALID should be set");
     // S = 1 (Secure, NSC=0)
     assert_ne!(result & (1 << 22), 0, "S bit should be set");
-    // All access bits set
+    // Access bits
     assert_ne!(result & (1 << 18), 0, "R bit should be set");
     assert_ne!(result & (1 << 19), 0, "RW bit should be set");
 }
@@ -4796,15 +4794,20 @@ fn tt_sau_region_nsc() {
     // RBAR = 0x1000, RLAR = 0x1FE0 | 0x3 (NSC=1, enable=1)
     bus.ppb[0].sau_regions[0] = (0x1000, 0x1FE3);
 
-    c.set_reg(1, 0x1500); // address in range
+    c.set_reg(1, 0x1500); // address in range (secure ROM range)
     // TT R0, R1: hw0=0xE841, hw1=0xF000
     c.execute_one_wide_with_bus(0xE841, 0xF000, &mut bus);
     let result = c.reg(0);
 
-    assert_eq!(result & 0xFF, 0, "SREGION should be 0");
-    assert_ne!(result & (1 << 16), 0, "SRVALID should be set");
-    // NSC region: S should be 0
+    // SREGION = 0 at bits [15:8]
+    assert_eq!((result >> 8) & 0xFF, 0, "SREGION should be 0");
+    // SRVALID = bit 17
+    assert_ne!(result & (1 << 17), 0, "SRVALID should be set");
+    // NSC region: S should be 0 (non-secure callable)
     assert_eq!(result & (1 << 22), 0, "S bit should be clear for NSC");
+    // NSR and NSRW should be set for NSC region
+    assert_ne!(result & (1 << 20), 0, "NSR bit should be set for NSC");
+    assert_ne!(result & (1 << 21), 0, "NSRW bit should be set for NSC");
 }
 
 #[test]
@@ -4818,7 +4821,7 @@ fn tt_sau_no_match_allns_clear() {
     c.execute_one_wide_with_bus(0xE843, 0xF000, &mut bus);
     let result = c.reg(0);
 
-    assert_eq!(result & (1 << 16), 0, "SRVALID should be clear");
+    assert_eq!(result & (1 << 17), 0, "SRVALID should be clear");
     assert_ne!(result & (1 << 22), 0, "S bit should be set (ALLNS=0)");
 }
 
@@ -4833,7 +4836,7 @@ fn tt_sau_no_match_allns_set() {
     c.execute_one_wide_with_bus(0xE843, 0xF000, &mut bus);
     let result = c.reg(0);
 
-    assert_eq!(result & (1 << 16), 0, "SRVALID should be clear");
+    assert_eq!(result & (1 << 17), 0, "SRVALID should be clear");
     assert_eq!(result & (1 << 22), 0, "S bit should be clear (ALLNS=1)");
     assert_ne!(result & (1 << 18), 0, "R bit should be set");
 }
@@ -4852,17 +4855,18 @@ fn tt_bootrom_scenario() {
     c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
     let result = c.reg(2);
 
-    // Bootrom checks: result >> 16 != 0 (i.e., at least SRVALID or S must be set above bit 16)
-    assert_ne!(result >> 16, 0, "TT result upper half must be nonzero");
-    // SRVALID must be set
-    assert_ne!(result & (1 << 16), 0, "SRVALID");
-    // S must be set (Secure region, NSC=0)
+    // Bootrom expects exactly 0x02CE0700 for this scenario
+    assert_eq!(result, 0x02CE0700, "TT result should match bootrom expected value");
+    // Verify key fields:
+    // SREGION = 7 at bits [15:8]
+    assert_eq!((result >> 8) & 0xFF, 7, "SREGION should be 7");
+    // SRVALID = bit 17
+    assert_ne!(result & (1 << 17), 0, "SRVALID");
+    // S = 1
     assert_ne!(result & (1 << 22), 0, "S");
-    // SREGION = 7
-    assert_eq!(result & 0xFF, 7);
-    // Bootrom also checks LSL #6 sets bit 31 (i.e., bit 25 of result must be set)
-    // That's the R/RW/NSR/NSRW cluster — verify at least one bit in [22:18] is set
-    assert_ne!(result & 0x007C_0000, 0, "access permission bits");
+    // IDAU bits: bit 23 (IRVALID) and bit 25 (RP2350 exempt)
+    assert_ne!(result & (1 << 23), 0, "IRVALID (IDAU region valid)");
+    assert_ne!(result & (1 << 25), 0, "RP2350 IDAU exempt bit");
 }
 
 #[test]
@@ -4916,4 +4920,110 @@ fn msplim_alignment() {
     c.execute_one_wide(0xF380, 0x880A);
     // Should be rounded down to 8-byte boundary
     assert_eq!(c.regs.msplim, 0x2000_1000);
+}
+
+// ============================================================================
+// Bootrom diagnostic run
+// ============================================================================
+
+#[test]
+fn bootrom_diagnostic_run() {
+    let rom_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../roms/bootrom-combined.bin");
+    let rom_data = std::fs::read(&rom_path)
+        .expect("bootrom binary not found — download from github.com/raspberrypi/pico-bootrom-rp2350");
+
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&rom_data);
+    emu.reset();
+
+    let mut last_pc = 0u32;
+    let mut stuck_count = 0u32;
+    let mut max_pc = 0u32;
+    let mut fault_reported = false;
+
+    for cycle in 0..1_000_000 {
+        emu.step();
+        let pc = emu.cores[0].regs.pc();
+
+        if pc > max_pc && pc < 0x8000 {
+            max_pc = pc;
+        }
+
+        // Report when we first enter a fault handler
+        let ipsr = emu.cores[0].regs.ipsr();
+        if ipsr >= 2 && ipsr <= 6 && !fault_reported {
+            fault_reported = true;
+            let exc_name = match ipsr {
+                2 => "NMI",
+                3 => "HardFault",
+                4 => "MemManage",
+                5 => "BusFault",
+                6 => "UsageFault",
+                _ => "Unknown",
+            };
+            eprintln!("*** {} entered at cycle {} ***", exc_name, cycle);
+            eprintln!("  PC={:#010x} LR={:#010x}", pc, emu.cores[0].regs.lr());
+            eprintln!("  CFSR={:#010x} HFSR={:#010x}", emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
+            eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.bus.ppb[0].bfar, emu.bus.ppb[0].mmfar);
+            eprintln!("  R0-R3: {:#010x} {:#010x} {:#010x} {:#010x}",
+                emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
+                emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
+            eprintln!("  SP={:#010x} MSP={:#010x}", emu.cores[0].regs.sp(), emu.cores[0].regs.msp);
+            eprintln!("  Max bootrom PC so far={:#010x}", max_pc);
+            // Read exception frame from stack
+            let sp = emu.cores[0].regs.msp;
+            let r0 = emu.peek(sp);
+            let r1 = emu.peek(sp + 4);
+            let r2 = emu.peek(sp + 8);
+            let r3 = emu.peek(sp + 12);
+            let lr = emu.peek(sp + 20);
+            let ret_pc = emu.peek(sp + 24);
+            let xpsr = emu.peek(sp + 28);
+            eprintln!("  Exception frame at SP={:#010x}:", sp);
+            eprintln!("    Stacked R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
+                r0, r1, r2, r3);
+            eprintln!("    Stacked LR={:#010x} PC={:#010x} xPSR={:#010x}",
+                lr, ret_pc, xpsr);
+        }
+
+        if pc == last_pc {
+            stuck_count += 1;
+            if stuck_count > 100 {
+                eprintln!("Stuck at PC={:#010x} after {} cycles", pc, cycle);
+                eprintln!("  IPSR={}, LR={:#010x}", emu.cores[0].regs.ipsr(), emu.cores[0].regs.lr());
+                eprintln!("  CFSR={:#010x}, HFSR={:#010x}", emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
+                eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
+                    emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
+                    emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
+                eprintln!("  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
+                    emu.cores[0].regs.r[4], emu.cores[0].regs.r[5],
+                    emu.cores[0].regs.r[6], emu.cores[0].regs.r[7]);
+                eprintln!("  SP={:#010x} MSP={:#010x}", emu.cores[0].regs.sp(), emu.cores[0].regs.msp);
+                eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.bus.ppb[0].bfar, emu.bus.ppb[0].mmfar);
+                eprintln!("  Max bootrom PC reached={:#010x}", max_pc);
+                // Try to read stacked PC from exception frame
+                let sp = emu.cores[0].regs.msp;
+                if sp >= 0x2000_0000 && sp < 0x2008_0000 {
+                    let stacked_pc = emu.peek(sp + 24);
+                    let stacked_lr = emu.peek(sp + 20);
+                    let stacked_xpsr = emu.peek(sp + 28);
+                    eprintln!("  Stacked: PC={:#010x} LR={:#010x} xPSR={:#010x}",
+                        stacked_pc, stacked_lr, stacked_xpsr);
+                } else {
+                    eprintln!("  SP not in SRAM, cannot read exception frame (SP={:#010x})", sp);
+                }
+                break;
+            }
+        } else {
+            stuck_count = 0;
+        }
+        last_pc = pc;
+    }
+
+    // For now: just print where we ended up
+    let final_pc = emu.cores[0].regs.pc();
+    eprintln!("Final PC={:#010x}, cycles run", final_pc);
+    eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
+        emu.cores[0].regs.ipsr(), emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
 }

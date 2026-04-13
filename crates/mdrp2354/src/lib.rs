@@ -163,12 +163,20 @@ impl Emulator {
 
     /// Direct memory read (bypasses bus timing).
     pub fn peek(&self, addr: u32) -> u32 {
-        self.bus.memory.peek32(addr)
+        if Bus::is_boot_ram(addr) {
+            self.bus.boot_ram_read32(addr)
+        } else {
+            self.bus.memory.peek32(addr)
+        }
     }
 
     /// Direct memory write (bypasses bus timing).
     pub fn poke(&mut self, addr: u32, value: u32) {
-        self.bus.memory.poke32(addr, value);
+        if Bus::is_boot_ram(addr) {
+            self.bus.boot_ram_write32(addr, value);
+        } else {
+            self.bus.memory.poke32(addr, value);
+        }
     }
 
     /// Current master cycle count.

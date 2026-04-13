@@ -191,27 +191,34 @@ impl CortexM33 {
 
     // --- TT (Test Target) instruction -----------------------------------------
 
-    /// Execute a TT instruction: look up SAU region attributes for an address.
+    /// Execute a TT instruction: look up SAU/IDAU region attributes for an address.
     /// Returns the TT result register value per ARMv8-M Architecture Reference.
     ///
-    /// Result bits:
-    ///   [7:0]   SREGION — SAU region number (valid when SRVALID=1)
-    ///   [15:8]  IREGION — MPU region number (valid when IRVALID=1)
-    ///   [16]    SRVALID — SAU region match found
-    ///   [17]    reserved
+    /// Result bits (per ARM DDI 0553):
+    ///   [7:0]   MREGION — MPU region number (valid when MRVALID=1)
+    ///   [15:8]  SREGION — SAU region number (valid when SRVALID=1)
+    ///   [16]    MRVALID — MPU region match
+    ///   [17]    SRVALID — SAU region match
     ///   [18]    R  — readable from current security state
     ///   [19]    RW — read-write from current security state
     ///   [20]    NSR  — NS readable
     ///   [21]    NSRW — NS read-write
     ///   [22]    S  — Secure
-    ///   [24]    IRVALID — MPU region valid (stub: 0, no MPU lookup)
+    ///   [23]    IRVALID — IDAU region valid
+    ///   [25]    RP2350 IDAU exempt flag
     pub(crate) fn execute_tt(addr: u32, bus: &Bus) -> u32 {
         let ppb = &bus.ppb[bus.active_core()];
 
+        // RP2350 IDAU: built-in security attribution for the address space.
+        // Secure regions: ROM (0x0000_0000..0x0000_7FFF),
+        //   secure SRAM/peripheral aliases, etc.
+        let idau_result = Self::rp2350_idau(addr);
+
         // If SAU is disabled, everything is Secure with full access
         if ppb.sau_ctrl & 1 == 0 {
-            // S=1, NSRW=1, NSR=1, RW=1, R=1, no region match
-            return (1 << 22) | (1 << 21) | (1 << 20) | (1 << 19) | (1 << 18);
+            // S=1, RW=1, R=1, no SAU region match; include IDAU bits
+            return idau_result
+                 | (1 << 22) | (1 << 19) | (1 << 18);
         }
 
         // Look up address in SAU regions
@@ -230,13 +237,18 @@ impl CortexM33 {
                 let secure = nsc == 0;
                 let region_num = i as u32;
 
-                return (region_num & 0xFF)                       // SREGION
-                     | (1 << 16)                                  // SRVALID
-                     | (if secure { 1 << 22 } else { 0 })        // S
-                     | (1 << 21)                                  // NSRW
-                     | (1 << 20)                                  // NSR
-                     | (1 << 19)                                  // RW
-                     | (1 << 18);                                 // R
+                let mut result = idau_result;
+                result |= (region_num & 0xFF) << 8;              // SREGION [15:8]
+                result |= 1 << 17;                                // SRVALID
+                result |= 1 << 18;                                // R (readable)
+                result |= 1 << 19;                                // RW (read-write)
+                if secure {
+                    result |= 1 << 22;                            // S
+                } else {
+                    // Non-secure region: NS code can also access
+                    result |= (1 << 20) | (1 << 21);             // NSR, NSRW
+                }
+                return result;
             }
         }
 
@@ -244,10 +256,46 @@ impl CortexM33 {
         let allns = (ppb.sau_ctrl >> 1) & 1;
         if allns != 0 {
             // ALLNS=1: unmatched addresses are Non-Secure
-            (1 << 21) | (1 << 20) | (1 << 19) | (1 << 18)
+            idau_result | (1 << 20) | (1 << 21) | (1 << 19) | (1 << 18)
         } else {
             // ALLNS=0: unmatched addresses are Secure
-            (1 << 22) | (1 << 21) | (1 << 20) | (1 << 19) | (1 << 18)
+            idau_result | (1 << 22) | (1 << 19) | (1 << 18)
+        }
+    }
+
+    /// RP2350 Implementation-Defined Attribution Unit (IDAU).
+    /// Returns the IDAU contribution to TT result bits.
+    /// The RP2350 IDAU marks certain address ranges as secure/non-secure.
+    fn rp2350_idau(addr: u32) -> u32 {
+        // RP2350 address map (from datasheet):
+        //   0x0000_0000..0x0000_7FFF: Secure ROM
+        //   0x0000_8000..0x0000_FFFF: ROM (NS alias)
+        //   0x1000_0000..0x1FFF_FFFF: XIP (secure)
+        //   0x2000_0000..0x2007_FFFF: SRAM (secure)
+        //   0x4000_0000..0x4FFF_FFFF: Peripherals (secure)
+        //   0xD000_0000..0xD000_0FFF: SIO (secure)
+        //   0xE000_0000..0xE00F_FFFF: PPB (secure, always)
+        //
+        // The IDAU on RP2350 provides a region number and secure/exempt flags.
+        // For addresses the IDAU recognizes, it sets IRVALID (bit 23) and
+        // the RP2350-specific exempt bit (bit 25).
+        let idau_secure = match addr >> 28 {
+            0x0 => addr < 0x0000_8000, // ROM: lower 32K is secure
+            0x1 => true,                // XIP: secure
+            0x2 => true,                // SRAM: secure
+            0x3 => true,                // SRAM alias
+            0x4 => true,                // APB peripherals: secure
+            0x5 => true,                // AHB peripherals: secure
+            0xD => true,                // SIO: secure
+            0xE => true,                // PPB: always secure
+            _ => false,
+        };
+
+        // IRVALID = 1, RP2350 exempt bit 25 = 1 for recognized secure regions
+        if idau_secure {
+            (1 << 23) | (1 << 25)
+        } else {
+            0
         }
     }
 }
