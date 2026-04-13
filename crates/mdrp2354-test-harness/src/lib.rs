@@ -39,7 +39,8 @@ pub const REG_R0: u8 = 0;
 pub const REG_SP: u8 = 13;
 pub const REG_LR: u8 = 14;
 pub const REG_PC: u8 = 15;
-/// Indices 16-24 are legacy FPA (unused). xPSR is at index 25.
+/// Indices 16-24 are legacy FPA (return E14 on QEMU 10.2). xPSR is at index 25.
+/// Note: QEMU's M-profile GDB stub omits EPSR.T (bit 24) from xPSR reads.
 pub const REG_XPSR: u8 = 25;
 
 // ============================================================================
@@ -2911,10 +2912,12 @@ fn gen_stm_ldm() -> Vec<TestCase> {
         ..TestCase::default()
     });
 
-    // STM R3!, {R0-R7}
+    // STM R3!, {R0-R2, R4-R7} — omit R3 from register list because STM
+    // with Rn in the list stores the translated base address, which differs
+    // between QEMU and emulator address spaces.
     t.push(TestCase {
-        name: "STM R3!, {R0-R7}".into(),
-        opcode: enc_stm(3, 0xFF),
+        name: "STM R3!, {R0-R2, R4-R7}".into(),
+        opcode: enc_stm(3, 0xF7), // bits 0-2 + 4-7 = 0b1111_0111
         reg_pre: vec![
             (3, 0), (0, 0x00), (1, 0x11), (2, 0x22),
             (4, 0x44), (5, 0x55), (6, 0x66), (7, 0x77),
@@ -2923,7 +2926,8 @@ fn gen_stm_ldm() -> Vec<TestCase> {
         needs_bus: true,
         mem_check: {
             let mut c = Vec::new();
-            for i in 0..8u32 {
+            // 7 registers * 4 bytes each
+            for i in 0..7u32 {
                 c.extend(mem_check_u32(i * 4));
             }
             c
@@ -3568,8 +3572,13 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
 pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), String> {
     let mut diffs = Vec::new();
 
-    // R0-R12: absolute comparison
+    // R0-R12: absolute comparison.
+    // Skip registers in addr_regs — they were intentionally set to different
+    // absolute values per side (QEMU_SCRATCH vs EMU_SCRATCH).
     for i in 0..=12 {
+        if tc.addr_regs.contains(&(i as u8)) {
+            continue;
+        }
         if qemu.regs[i] != emu.regs[i] {
             diffs.push(format!(
                 "R{i}: QEMU={:#010x} EMU={:#010x}",
@@ -3578,10 +3587,15 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
         }
     }
 
-    // SP (R13): relative delta from each side's stack base.
-    // Both sides start SP at their respective TEST_STACK; compare the offset.
-    let qemu_sp_delta = qemu.regs[13].wrapping_sub(QEMU_TEST_STACK);
-    let emu_sp_delta = emu.regs[13].wrapping_sub(EMU_TEST_STACK);
+    // SP (R13): relative delta comparison.
+    // Base depends on whether SP was set via addr_regs (scratch) or default (stack).
+    let (qemu_sp_base, emu_sp_base) = if tc.addr_regs.contains(&13) {
+        (QEMU_TEST_SCRATCH, EMU_TEST_SCRATCH)
+    } else {
+        (QEMU_TEST_STACK, EMU_TEST_STACK)
+    };
+    let qemu_sp_delta = qemu.regs[13].wrapping_sub(qemu_sp_base);
+    let emu_sp_delta = emu.regs[13].wrapping_sub(emu_sp_base);
     if qemu_sp_delta != emu_sp_delta {
         diffs.push(format!(
             "SP delta: QEMU={:#x} EMU={:#x}",

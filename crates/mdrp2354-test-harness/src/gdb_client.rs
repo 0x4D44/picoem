@@ -3,7 +3,11 @@
 // Minimal GDB Remote Serial Protocol client implementing 5 packet types:
 //   p/P (read/write register), m/M (read/write memory), s (single-step).
 //
-// Tested with QEMU >= 7.0, MPS2-AN505 machine, Cortex-M33 CPU.
+// Tested with QEMU 7.0–10.2, MPS2-AN505 machine, Cortex-M33 CPU.
+//
+// Note: QEMU's M-profile GDB stub omits EPSR.T (bit 24) from xPSR reads.
+// The Thumb bit is implicit — Cortex-M always runs in Thumb mode.
+// Indices 16-24 (legacy FPA) return E14 (unsupported) on QEMU 10.2.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -26,30 +30,49 @@ impl QemuProcess {
     /// halted at reset (`-S`), GDB server on port 3333.
     ///
     /// Returns an error with a clear message if `qemu-system-arm` is not found.
+    /// Standard Windows install path (winget / qemu.org installer).
+    const WINDOWS_QEMU_PATH: &'static str =
+        r"C:\Program Files\qemu\qemu-system-arm.exe";
+
     pub fn spawn() -> io::Result<Self> {
-        // Try to spawn directly — the error type tells us if the binary is missing.
+        let args = [
+            "-machine",
+            "mps2-an505",
+            "-cpu",
+            "cortex-m33",
+            "-nographic",
+            "-S",
+            "-gdb",
+            "tcp::3333",
+        ];
+
+        // Try PATH first, then the standard Windows install location.
         let child = Command::new("qemu-system-arm")
-            .args([
-                "-machine",
-                "mps2-an505",
-                "-cpu",
-                "cortex-m33",
-                "-nographic",
-                "-S",
-                "-gdb",
-                "tcp::3333",
-            ])
+            .args(&args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .spawn()
+            .or_else(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    Command::new(Self::WINDOWS_QEMU_PATH)
+                        .args(&args)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .stdin(Stdio::null())
+                        .spawn()
+                } else {
+                    Err(e)
+                }
+            })
             .map_err(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
                     io::Error::new(
                         io::ErrorKind::NotFound,
-                        "qemu-system-arm not found on PATH. \
-                         Install QEMU >= 7.0 (e.g., via MSYS2: \
-                         pacman -S mingw-w64-x86_64-qemu, or from qemu.org).",
+                        "qemu-system-arm not found on PATH or at \
+                         C:\\Program Files\\qemu\\. \
+                         Install QEMU >= 7.0 (winget install \
+                         SoftwareFreedomConservancy.QEMU).",
                     )
                 } else {
                     io::Error::new(
@@ -344,22 +367,49 @@ impl GdbClient {
 // Sanity check
 // ============================================================================
 
-/// Verify GDB register indices are correct by reading xPSR and checking
-/// the Thumb bit (bit 24). QEMU's Cortex-M33 always starts in Thumb mode.
+/// Verify GDB register indices are correct.
 ///
-/// This catches register-index mismatches immediately if QEMU changes its
-/// GDB target description layout.
+/// Writes a known value to R0, reads it back, then confirms that the xPSR
+/// register index returns a plausible status register value.
+///
+/// Note: QEMU's M-profile GDB stub omits EPSR.T (bit 24) from the xPSR
+/// read — the Thumb bit is implicit (always 1 on Cortex-M). We cannot
+/// check it here, so we verify the index is valid and no unexpected bits
+/// are set in the reset-halt state.
 pub fn sanity_check(gdb: &mut GdbClient) -> io::Result<()> {
-    let xpsr = gdb.read_reg(REG_XPSR)?;
-    if xpsr & 0x0100_0000 == 0 {
+    // 1. Round-trip a GP register to confirm the index mapping works.
+    let probe: u32 = 0xDEAD_BEEF;
+    gdb.write_reg(0, probe)?;
+    let readback = gdb.read_reg(0)?;
+    gdb.write_reg(0, 0)?; // restore
+    if readback != probe {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "xPSR T bit (bit 24) not set — got {xpsr:#010x}. \
-                 Register index {REG_XPSR} may be wrong. Check QEMU version (need >= 7.0)."
+                "R0 round-trip failed: wrote {probe:#010x}, read {readback:#010x}. \
+                 GDB register encoding may be wrong."
             ),
         ));
     }
+
+    // 2. Read xPSR and verify the index is valid (returns 8 hex chars).
+    //    At reset-halt, only condition flags (bits 31:27) may be set.
+    //    QEMU omits EPSR.T from this read, so we don't check bit 24.
+    let xpsr = gdb.read_reg(REG_XPSR)?;
+
+    // Bits 26:25 (ICI/IT), bits 15:10 (ICI/IT), bits 8:0 (exception number)
+    // should all be zero at reset. If they're not, the index is probably wrong.
+    let unexpected = xpsr & 0x0600_FC1F;
+    if unexpected != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "xPSR has unexpected bits set at reset: {xpsr:#010x} \
+                 (unexpected={unexpected:#010x}). Register index {REG_XPSR} may be wrong."
+            ),
+        ));
+    }
+
     Ok(())
 }
 
