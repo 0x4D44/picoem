@@ -15,3 +15,7 @@ path = "src/bin/qemu_diff.rs"
 [[bin]]
 name = "probe_verify"
 path = "src/bin/probe_verify.rs"
+
+[[bin]]
+name = "probe_diff"
+path = "src/bin/probe_diff.rs"
