@@ -3532,6 +3532,11 @@ pub fn generate_all() -> Vec<TestCase> {
     all.extend(thumb32_gen::gen_t32_ldm_stm());
     all.extend(thumb32_gen::gen_t32_ldrd_strd());
     all.extend(thumb32_gen::gen_t32_tbb_tbh());
+    // Thumb-32 generators — Priority 3
+    all.extend(thumb32_gen::gen_t32_dp_plain_imm());
+    all.extend(thumb32_gen::gen_t32_dsp());
+    all.extend(thumb32_gen::gen_t32_dp_register());
+    all.extend(thumb32_gen::gen_t32_misc_control());
     all
 }
 
@@ -4523,8 +4528,8 @@ mod tests {
         let tests = generate_all();
         let count = tests.len();
         assert!(
-            (380..=800).contains(&count),
-            "expected 380-800 tests, got {count}"
+            (380..=1000).contains(&count),
+            "expected 380-1000 tests, got {count}"
         );
     }
 
