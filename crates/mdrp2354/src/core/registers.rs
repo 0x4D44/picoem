@@ -83,6 +83,25 @@ impl Registers {
         self.xpsr & XPSR_Q != 0
     }
 
+    /// Set the Q (saturation) flag. Q is sticky — once set it stays set
+    /// until explicitly cleared via MSR.
+    #[inline(always)]
+    pub fn set_flag_q(&mut self) {
+        self.xpsr |= XPSR_Q;
+    }
+
+    /// Read GE[3:0] flags from xPSR[19:16].
+    #[inline(always)]
+    pub fn ge_flags(&self) -> u32 {
+        (self.xpsr >> 16) & 0xF
+    }
+
+    /// Write GE[3:0] flags into xPSR[19:16].
+    #[inline(always)]
+    pub fn set_ge_flags(&mut self, ge: u32) {
+        self.xpsr = (self.xpsr & !0x000F_0000) | ((ge & 0xF) << 16);
+    }
+
     #[inline(always)]
     pub fn set_flag_n(&mut self, v: bool) {
         if v {

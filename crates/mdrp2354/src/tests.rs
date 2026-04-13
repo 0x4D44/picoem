@@ -3068,3 +3068,896 @@ fn it_state_cleared_after_block() {
     assert_eq!(c.reg(1), 3);  // executed unconditionally
     assert_eq!(c.it_state(), 0);
 }
+
+// ============================================================================
+// FPU (VFP single-precision) — encoding helpers
+// ============================================================================
+//
+// VFP data-processing instructions (CDP-like):
+//   hw0 = 0xEE00 | (op_hi << 7) | (D << 6) | (op_lo << 4) | Vn
+//   hw1 = (Vd << 12) | 0x0A00 | (N << 7) | (op2_lo << 6) | (M << 5) | Vm
+//
+// where:
+//   Sd = (Vd << 1) | D, Sn = (Vn << 1) | N, Sm = (Vm << 1) | M
+
+/// Encode a VFP data-processing instruction for single-precision.
+/// `op_hi` = opc1[3], `op_lo` = opc1[1:0], `op2_lo` = opc2[0].
+fn vfp_dp(op_hi: u16, op_lo: u16, op2_lo: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xEE00 | (op_hi << 7) | (d << 6) | (op_lo << 4) | vn;
+    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (op2_lo << 6) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// Encode VADD.F32 Sd, Sn, Sm.
+fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 0, sd, sn, sm) }
+
+/// Encode VSUB.F32 Sd, Sn, Sm.
+fn enc_vsub(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 1, sd, sn, sm) }
+
+/// Encode VMUL.F32 Sd, Sn, Sm.
+fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 0, sd, sn, sm) }
+
+/// Encode VNMUL.F32 Sd, Sn, Sm.
+fn enc_vnmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 1, sd, sn, sm) }
+
+/// Encode VDIV.F32 Sd, Sn, Sm.
+fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b00, 0, sd, sn, sm) }
+
+/// Encode VMLA.F32 Sd, Sn, Sm.
+fn enc_vmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 0, sd, sn, sm) }
+
+/// Encode VMLS.F32 Sd, Sn, Sm.
+fn enc_vmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 1, sd, sn, sm) }
+
+/// Encode VNMLA.F32 Sd, Sn, Sm.
+fn enc_vnmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 1, sd, sn, sm) }
+
+/// Encode VNMLS.F32 Sd, Sn, Sm.
+fn enc_vnmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 0, sd, sn, sm) }
+
+/// Encode VFMA.F32 Sd, Sn, Sm.
+fn enc_vfma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 0, sd, sn, sm) }
+
+/// Encode VFMS.F32 Sd, Sn, Sm.
+fn enc_vfms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 1, sd, sn, sm) }
+
+/// Encode VFNMA.F32 Sd, Sn, Sm.
+fn enc_vfnma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 1, sd, sn, sm) }
+
+/// Encode VFNMS.F32 Sd, Sn, Sm.
+fn enc_vfnms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 0, sd, sn, sm) }
+
+/// Encode a VFP unary instruction.
+/// All unary: hw0[7:4]=1D11 (op_hi=1, op_lo=11), hw1[6]=1.
+/// `opc3` = hw0[3:0] (repurposed Vn), `t` = hw1[7].
+fn vfp_unary(opc3: u16, t: u16, sd: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xEE00 | (1 << 7) | (d << 6) | (0b11 << 4) | opc3;
+    let hw1 = (vd << 12) | 0x0A00 | (t << 7) | (1 << 6) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// VMOV.F32 Sd, Sm (register copy).
+fn enc_vmov_reg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 0, sd, sm) }
+
+/// VABS.F32 Sd, Sm.
+fn enc_vabs(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 1, sd, sm) }
+
+/// VNEG.F32 Sd, Sm.
+fn enc_vneg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 0, sd, sm) }
+
+/// VSQRT.F32 Sd, Sm.
+fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 1, sd, sm) }
+
+/// VCMP.F32 Sd, Sm (quiet).
+fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0100, 0, sd, sm) }
+
+/// VCMP.F32 Sd, #0.0.
+fn enc_vcmp_zero(sd: u16) -> (u16, u16) { vfp_unary(0b0101, 0, sd, 0) }
+
+/// VCVT.F32.S32 Sd, Sm (signed int → float).
+fn enc_vcvt_f32_s32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 1, sd, sm) }
+
+/// VCVT.F32.U32 Sd, Sm (unsigned int → float).
+fn enc_vcvt_f32_u32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 0, sd, sm) }
+
+/// VCVT.S32.F32 Sd, Sm (float → signed int, round toward zero).
+fn enc_vcvt_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 1, sd, sm) }
+
+/// VCVT.U32.F32 Sd, Sm (float → unsigned int, round toward zero).
+fn enc_vcvt_u32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1100, 1, sd, sm) }
+
+/// VCVTR.S32.F32 Sd, Sm (float → signed int, round per FPSCR).
+fn enc_vcvtr_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 0, sd, sm) }
+
+/// Encode VMOV Sn, Rt (ARM → FPU). MCR format, L=0.
+fn enc_vmov_to_fpu(sn: u16, rt: u16) -> (u16, u16) {
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let hw0 = 0xEE00 | vn;
+    let hw1 = (rt << 12) | 0x0A10 | (n << 7);
+    (hw0, hw1)
+}
+
+/// Encode VMOV Rt, Sn (FPU → ARM). MRC format, L=1.
+fn enc_vmov_to_arm(rt: u16, sn: u16) -> (u16, u16) {
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let hw0 = 0xEE10 | vn;
+    let hw1 = (rt << 12) | 0x0A10 | (n << 7);
+    (hw0, hw1)
+}
+
+/// Encode VMRS Rt, FPSCR (Rt=15 → APSR_nzcv).
+fn enc_vmrs(rt: u16) -> (u16, u16) {
+    let hw0 = 0xEEF1u16;
+    let hw1 = (rt << 12) | 0x0A10;
+    (hw0, hw1)
+}
+
+/// Encode VMSR FPSCR, Rt.
+fn enc_vmsr(rt: u16) -> (u16, u16) {
+    let hw0 = 0xEEE1u16;
+    let hw1 = (rt << 12) | 0x0A10;
+    (hw0, hw1)
+}
+
+/// Encode VLDR.32 Sd, [Rn, #±offset]. offset is in bytes, must be multiple of 4.
+fn enc_vldr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
+    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    // hw0: 1110_110P_UD_W_L_Rn, P=1, W=0, L=1 → bits = 1101_U_D_01
+    let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | (1 << 4) | rn;
+    let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
+    (hw0, hw1)
+}
+
+/// Encode VSTR.32 Sd, [Rn, #±offset]. offset is in bytes, must be multiple of 4.
+fn enc_vstr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
+    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    // P=1, W=0, L=0 → bits = 1101_U_D_00
+    let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | rn;
+    let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
+    (hw0, hw1)
+}
+
+/// Encode VPUSH {Sd..Sd+count-1} — VSTMDB SP!, {list}.
+/// P=1, U=0, D, W=1, L=0, Rn=13(SP)
+fn enc_vpush(sd: u16, count: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let hw0 = 0xED00 | (d << 6) | (1 << 5) | 13; // P=1,U=0,D,W=1,L=0,Rn=SP
+    let hw1 = (vd << 12) | 0x0A00 | (count & 0xFF);
+    (hw0, hw1)
+}
+
+/// Encode VPOP {Sd..Sd+count-1} — VLDMIA SP!, {list}.
+/// P=0, U=1, D, W=1, L=1, Rn=13(SP)
+fn enc_vpop(sd: u16, count: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let hw0 = 0xEC00 | (1 << 7) | (d << 6) | (1 << 5) | (1 << 4) | 13;
+    let hw1 = (vd << 12) | 0x0A00 | (count & 0xFF);
+    (hw0, hw1)
+}
+
+// ============================================================================
+// FPU tests
+// ============================================================================
+
+#[test]
+fn fpu_vadd_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.5;
+    c.regs.s[4] = 2.5;
+    let (hw0, hw1) = enc_vadd(0, 2, 4); // VADD.F32 S0, S2, S4
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 4.0);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn fpu_vsub_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 10.0;
+    c.regs.s[4] = 3.5;
+    let (hw0, hw1) = enc_vsub(0, 2, 4); // VSUB.F32 S0, S2, S4
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 6.5);
+}
+
+#[test]
+fn fpu_vmul_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 3.0;
+    c.regs.s[4] = 4.0;
+    let (hw0, hw1) = enc_vmul(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 12.0);
+}
+
+#[test]
+fn fpu_vdiv_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 10.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vdiv(0, 2, 4);
+    let cy = c.execute_one_wide(hw0, hw1);
+    let expected = 10.0f32 / 3.0;
+    assert_eq!(c.regs.s[0], expected);
+    assert_eq!(cy, 14);
+}
+
+#[test]
+fn fpu_vneg_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 5.0;
+    let (hw0, hw1) = enc_vneg(0, 2); // VNEG.F32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], -5.0);
+}
+
+#[test]
+fn fpu_vabs_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = -7.5;
+    let (hw0, hw1) = enc_vabs(0, 2); // VABS.F32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 7.5);
+}
+
+#[test]
+fn fpu_vsqrt_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 4.0;
+    let (hw0, hw1) = enc_vsqrt(0, 2); // VSQRT.F32 S0, S2
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 2.0);
+    assert_eq!(cy, 14);
+}
+
+#[test]
+fn fpu_vcmp_f32_equal() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 3.0;
+    c.regs.s[2] = 3.0;
+    let (hw0, hw1) = enc_vcmp(0, 2); // VCMP.F32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+    // Equal: N=0, Z=1, C=1, V=0
+    assert_eq!(c.regs.fpscr & 0xF000_0000, 0x6000_0000);
+}
+
+#[test]
+fn fpu_vcmp_f32_less() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 1.0;
+    c.regs.s[2] = 3.0;
+    let (hw0, hw1) = enc_vcmp(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Less: N=1, Z=0, C=0, V=0
+    assert_eq!(c.regs.fpscr & 0xF000_0000, 0x8000_0000);
+}
+
+#[test]
+fn fpu_vcmp_f32_greater() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 5.0;
+    c.regs.s[2] = 2.0;
+    let (hw0, hw1) = enc_vcmp(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Greater: N=0, Z=0, C=1, V=0
+    assert_eq!(c.regs.fpscr & 0xF000_0000, 0x2000_0000);
+}
+
+#[test]
+fn fpu_vcmp_f32_nan() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = f32::NAN;
+    c.regs.s[2] = 1.0;
+    let (hw0, hw1) = enc_vcmp(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Unordered: N=0, Z=0, C=1, V=1
+    assert_eq!(c.regs.fpscr & 0xF000_0000, 0x3000_0000);
+}
+
+#[test]
+fn fpu_vcmp_f32_zero() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 0.0;
+    let (hw0, hw1) = enc_vcmp_zero(0); // VCMP.F32 S0, #0.0
+    c.execute_one_wide(hw0, hw1);
+    // Equal to zero: Z=1, C=1
+    assert_eq!(c.regs.fpscr & 0xF000_0000, 0x6000_0000);
+}
+
+#[test]
+fn fpu_vcvt_f32_s32() {
+    let mut c = CortexM33::new();
+    // Store -42 as raw bits in S2
+    c.regs.s[2] = f32::from_bits((-42i32) as u32);
+    let (hw0, hw1) = enc_vcvt_f32_s32(0, 2); // VCVT.F32.S32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], -42.0);
+}
+
+#[test]
+fn fpu_vcvt_f32_u32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(100u32);
+    let (hw0, hw1) = enc_vcvt_f32_u32(0, 2); // VCVT.F32.U32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 100.0);
+}
+
+#[test]
+fn fpu_vcvt_s32_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = -3.7;
+    let (hw0, hw1) = enc_vcvt_s32_f32(0, 2); // VCVT.S32.F32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+    // Result stored as raw bits: -3 as i32 = 0xFFFF_FFFD
+    assert_eq!(c.regs.s[0].to_bits(), (-3i32) as u32);
+}
+
+#[test]
+fn fpu_vcvt_u32_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 7.9;
+    let (hw0, hw1) = enc_vcvt_u32_f32(0, 2); // VCVT.U32.F32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 7u32);
+}
+
+#[test]
+fn fpu_vmov_arm_to_fpu() {
+    let mut c = CortexM33::new();
+    c.set_reg(3, 0x4048_0000); // 3.125f32.to_bits()
+    let (hw0, hw1) = enc_vmov_to_fpu(0, 3); // VMOV S0, R3
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], f32::from_bits(0x4048_0000));
+}
+
+#[test]
+fn fpu_vmov_fpu_to_arm() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 3.125;
+    let (hw0, hw1) = enc_vmov_to_arm(3, 0); // VMOV R3, S0
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(3), 3.125f32.to_bits());
+}
+
+#[test]
+fn fpu_vmrs_fpscr_to_apsr() {
+    let mut c = CortexM33::new();
+    // Set up: compare S0 < S2 → FPSCR.N=1
+    c.regs.s[0] = 1.0;
+    c.regs.s[2] = 5.0;
+    let (hw0, hw1) = enc_vcmp(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.fpscr & 0x8000_0000 != 0); // FPSCR.N set
+
+    // VMRS APSR_nzcv, FPSCR (Rt=15)
+    let (hw0, hw1) = enc_vmrs(15);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.flag_n()); // APSR.N should be set
+}
+
+#[test]
+fn fpu_vmsr_fpscr() {
+    let mut c = CortexM33::new();
+    c.set_reg(2, 0x0040_0000); // Set FPSCR.RMode = 01 (round toward +inf)
+    let (hw0, hw1) = enc_vmsr(2); // VMSR FPSCR, R2
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.fpscr, 0x0040_0000);
+}
+
+#[test]
+fn fpu_vldr_vstr() {
+    let (mut c, mut bus) = core_and_bus();
+    let addr = 0x2000_0100u32;
+    c.set_reg(0, addr);
+
+    // Store 2.5 to memory via VSTR
+    c.regs.s[4] = 2.5;
+    let (hw0, hw1) = enc_vstr(4, 0, 0); // VSTR.32 S4, [R0, #0]
+    c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(bus.read32(addr), 2.5f32.to_bits());
+
+    // Load it back via VLDR
+    c.regs.s[6] = 0.0;
+    let (hw0, hw1) = enc_vldr(6, 0, 0); // VLDR.32 S6, [R0, #0]
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.regs.s[6], 2.5);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn fpu_vldr_positive_offset() {
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0100u32;
+    c.set_reg(0, base);
+    bus.write32(base + 16, 7.0f32.to_bits());
+    let (hw0, hw1) = enc_vldr(0, 0, 16); // VLDR.32 S0, [R0, #+16]
+    c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.regs.s[0], 7.0);
+}
+
+#[test]
+fn fpu_vldr_negative_offset() {
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0110u32;
+    c.set_reg(0, base);
+    bus.write32(base - 8, 9.0f32.to_bits());
+    let (hw0, hw1) = enc_vldr(0, 0, -8); // VLDR.32 S0, [R0, #-8]
+    c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.regs.s[0], 9.0);
+}
+
+#[test]
+fn fpu_vpush_vpop() {
+    let (mut c, mut bus) = core_and_bus();
+    let sp = 0x2000_1000u32;
+    c.set_reg(13, sp);
+
+    // Load values into S0, S1, S2
+    c.regs.s[0] = 1.0;
+    c.regs.s[1] = 2.0;
+    c.regs.s[2] = 3.0;
+
+    // VPUSH {S0-S2} (3 registers)
+    let (hw0, hw1) = enc_vpush(0, 3);
+    c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(13), sp - 12); // SP decremented by 3*4
+
+    // Verify memory
+    assert_eq!(f32::from_bits(bus.read32(sp - 12)), 1.0);
+    assert_eq!(f32::from_bits(bus.read32(sp - 8)), 2.0);
+    assert_eq!(f32::from_bits(bus.read32(sp - 4)), 3.0);
+
+    // Clear S0-S2
+    c.regs.s[0] = 0.0;
+    c.regs.s[1] = 0.0;
+    c.regs.s[2] = 0.0;
+
+    // VPOP {S0-S2}
+    let (hw0, hw1) = enc_vpop(0, 3);
+    c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(13), sp); // SP restored
+    assert_eq!(c.regs.s[0], 1.0);
+    assert_eq!(c.regs.s[1], 2.0);
+    assert_eq!(c.regs.s[2], 3.0);
+}
+
+#[test]
+fn fpu_vmla_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 10.0; // accumulator
+    c.regs.s[2] = 3.0;
+    c.regs.s[4] = 4.0;
+    let (hw0, hw1) = enc_vmla(0, 2, 4); // VMLA.F32 S0, S2, S4 → S0 = 10 + 3*4 = 22
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 22.0);
+    assert_eq!(cy, 3);
+}
+
+#[test]
+fn fpu_vmls_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 10.0;
+    c.regs.s[2] = 3.0;
+    c.regs.s[4] = 2.0;
+    let (hw0, hw1) = enc_vmls(0, 2, 4); // VMLS.F32 S0, S2, S4 → S0 = 10 - 3*2 = 4
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 4.0);
+}
+
+#[test]
+fn fpu_vnmul_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 3.0;
+    c.regs.s[4] = 5.0;
+    let (hw0, hw1) = enc_vnmul(0, 2, 4); // VNMUL.F32 S0, S2, S4 → S0 = -(3*5) = -15
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], -15.0);
+}
+
+#[test]
+fn fpu_vnmla_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 1.0;
+    c.regs.s[2] = 2.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vnmla(0, 2, 4); // VNMLA → S0 = -(2*3 + 1) = -7
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], -7.0);
+}
+
+#[test]
+fn fpu_vnmls_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 1.0;
+    c.regs.s[2] = 2.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vnmls(0, 2, 4); // VNMLS → S0 = 2*3 - 1 = 5
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 5.0);
+}
+
+#[test]
+fn fpu_vfma_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 1.0;
+    c.regs.s[2] = 2.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vfma(0, 2, 4); // VFMA → S0 = S0 + S2*S4 = 1 + 6 = 7
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 7.0);
+    assert_eq!(cy, 3);
+}
+
+#[test]
+fn fpu_vfms_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 10.0;
+    c.regs.s[2] = 2.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vfms(0, 2, 4); // VFMS → S0 = S0 - S2*S4 = 10 - 6 = 4
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 4.0);
+}
+
+#[test]
+fn fpu_vfnma_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 1.0;
+    c.regs.s[2] = 2.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vfnma(0, 2, 4); // VFNMA → S0 = -S2*S4 - S0 = -6 - 1 = -7
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], -7.0);
+}
+
+#[test]
+fn fpu_vfnms_f32() {
+    let mut c = CortexM33::new();
+    c.regs.s[0] = 1.0;
+    c.regs.s[2] = 2.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vfnms(0, 2, 4); // VFNMS → S0 = S2*S4 - S0 = 6 - 1 = 5
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 5.0);
+}
+
+#[test]
+fn fpu_vmov_f32_reg() {
+    let mut c = CortexM33::new();
+    c.regs.s[4] = 42.0;
+    let (hw0, hw1) = enc_vmov_reg(0, 4); // VMOV.F32 S0, S4
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 42.0);
+}
+
+#[test]
+fn fpu_vmrs_to_register() {
+    let mut c = CortexM33::new();
+    c.regs.fpscr = 0x1234_5678;
+    let (hw0, hw1) = enc_vmrs(3); // VMRS R3, FPSCR
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(3), 0x1234_5678);
+}
+
+#[test]
+fn fpu_vcvtr_s32_f32_round_nearest() {
+    let mut c = CortexM33::new();
+    c.regs.fpscr = 0; // RMode=00 → round to nearest
+    c.regs.s[2] = 2.5;
+    let (hw0, hw1) = enc_vcvtr_s32_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // 2.5 rounds to 2 (ties to even)
+    assert_eq!(c.regs.s[0].to_bits() as i32, 2);
+}
+
+#[test]
+fn fpu_high_register_encoding() {
+    // Test that high register indices (S16-S31) are correctly encoded/decoded.
+    let mut c = CortexM33::new();
+    c.regs.s[16] = 100.0;
+    c.regs.s[20] = 200.0;
+    let (hw0, hw1) = enc_vadd(24, 16, 20); // VADD.F32 S24, S16, S20
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[24], 300.0);
+}
+
+#[test]
+fn fpu_vcvt_negative_float_to_unsigned() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = -5.0;
+    let (hw0, hw1) = enc_vcvt_u32_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Negative float → unsigned should saturate to 0
+    assert_eq!(c.regs.s[0].to_bits(), 0);
+}
+
+#[test]
+fn fpu_vcvt_nan_to_int() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::NAN;
+    let (hw0, hw1) = enc_vcvt_s32_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits() as i32, 0);
+}
+
+#[test]
+fn fpu_vmov_odd_register() {
+    // Test VMOV with an odd-numbered S register (S1) to exercise the N/D bit encoding.
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0xDEAD_BEEF);
+    let (hw0, hw1) = enc_vmov_to_fpu(1, 0); // VMOV S1, R0
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[1].to_bits(), 0xDEAD_BEEF);
+
+    // Read back: VMOV R1, S1
+    let (hw0, hw1) = enc_vmov_to_arm(1, 1);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(1), 0xDEAD_BEEF);
+}
+
+// ============================================================================
+// DSP Extension Instructions
+// ============================================================================
+
+#[test]
+fn ssat_basic() {
+    // SSAT R0, #8, R1 — saturate R1 to signed 8-bit range [-128, 127]
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100); // within range
+    // hw0 = 0xF301 (op=0b10000, sh=0, Rn=1)
+    // hw1 = 0x0007 (imm3=0, Rd=0, imm2=0, sat_imm=7 → sat_bit=8)
+    c.execute_one_wide(0xF301, 0x0007);
+    assert_eq!(c.reg(0), 100); // no clamping
+    assert!(!c.regs.flag_q());
+}
+
+#[test]
+fn usat_basic() {
+    // USAT R0, #8, R1 — saturate R1 to unsigned 8-bit range [0, 255]
+    let mut c = CortexM33::new();
+    c.set_reg(1, 300); // above 255
+    // hw0 = 0xF381 (op=0b11000, sh=0, Rn=1)
+    // hw1 = 0x0008 (sat_bit=8)
+    c.execute_one_wide(0xF381, 0x0008);
+    assert_eq!(c.reg(0), 255); // clamped
+    assert!(c.regs.flag_q());
+}
+
+#[test]
+fn ssat_q_flag() {
+    // SSAT R0, #8, R1 with value > 127 should set Q and clamp
+    let mut c = CortexM33::new();
+    c.set_reg(1, 200); // 200 > 127
+    c.execute_one_wide(0xF301, 0x0007);
+    assert_eq!(c.reg(0), 127);
+    assert!(c.regs.flag_q());
+
+    // Negative clamping: R1 = -200 (0xFFFFFF38)
+    let mut c2 = CortexM33::new();
+    c2.set_reg(1, (-200i32) as u32);
+    c2.execute_one_wide(0xF301, 0x0007);
+    assert_eq!(c2.reg(0) as i32, -128);
+    assert!(c2.regs.flag_q());
+}
+
+#[test]
+fn smulbb() {
+    // SMULBB R0, R1, R2 — bottom halfword multiply, no accumulate
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0003_0005); // bottom = 5
+    c.set_reg(2, 0x0007_0006); // bottom = 6
+    // hw0 = 0xFB11 (op1=001, Rn=R1)
+    // hw1 = 0xF002 (Ra=15, Rd=0, op2=00, Rm=R2)
+    c.execute_one_wide(0xFB11, 0xF002);
+    assert_eq!(c.reg(0), 30); // 5 * 6 = 30
+
+    // Signed: bottom of R1 = -3 (0xFFFD), bottom of R2 = 4
+    let mut c2 = CortexM33::new();
+    c2.set_reg(1, 0x0000_FFFD); // -3 as i16
+    c2.set_reg(2, 0x0000_0004);
+    c2.execute_one_wide(0xFB11, 0xF002);
+    assert_eq!(c2.reg(0) as i32, -12); // -3 * 4 = -12
+}
+
+#[test]
+fn smlabb() {
+    // SMLABB R0, R1, R2, R3 — halfword multiply-accumulate
+    let mut c = CortexM33::new();
+    c.set_reg(1, 5);     // bottom = 5
+    c.set_reg(2, 6);     // bottom = 6
+    c.set_reg(3, 100);   // accumulator
+    // hw0 = 0xFB11, hw1 = 0x3002 (Ra=3, Rd=0, op2=00, Rm=2)
+    c.execute_one_wide(0xFB11, 0x3002);
+    assert_eq!(c.reg(0), 130); // 5*6 + 100 = 130
+    assert!(!c.regs.flag_q());
+}
+
+#[test]
+fn smuad() {
+    // SMUAD R0, R1, R2 — dual multiply add (no accumulate, Ra=15)
+    let mut c = CortexM33::new();
+    // R1 = packed(hi=3, lo=2), R2 = packed(hi=5, lo=4)
+    c.set_reg(1, 0x0003_0002);
+    c.set_reg(2, 0x0005_0004);
+    // hw0 = 0xFB21 (op1=010, Rn=R1), hw1 = 0xF002 (Ra=15, Rd=0, op2=00, Rm=R2)
+    c.execute_one_wide(0xFB21, 0xF002);
+    // Result = lo*lo + hi*hi = 2*4 + 3*5 = 8 + 15 = 23
+    assert_eq!(c.reg(0), 23);
+}
+
+#[test]
+fn smmul() {
+    // SMMUL R0, R1, R2 — most significant word multiply (Ra=15)
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x4000_0000); // 2^30 = 1073741824
+    c.set_reg(2, 0x4000_0000); // 2^30
+    // hw0 = 0xFB51 (op1=101, Rn=R1), hw1 = 0xF002
+    c.execute_one_wide(0xFB51, 0xF002);
+    // Product = 2^60, high 32 bits = 2^60 >> 32 = 2^28 = 0x10000000
+    assert_eq!(c.reg(0), 0x1000_0000);
+}
+
+#[test]
+fn usad8() {
+    // USAD8 R0, R1, R2 — sum of absolute byte differences (Ra=15)
+    let mut c = CortexM33::new();
+    // R1 = bytes [10, 20, 30, 40]
+    c.set_reg(1, 0x2814_0A28u32.swap_bytes()); // little-endian: [40,30,20,10]
+    c.set_reg(1, (10) | (20 << 8) | (30 << 16) | (40 << 24));
+    // R2 = bytes [15, 15, 15, 15]
+    c.set_reg(2, 0x0F0F_0F0F);
+    // hw0 = 0xFB71 (op1=111, Rn=R1), hw1 = 0xF002 (Ra=15)
+    c.execute_one_wide(0xFB71, 0xF002);
+    // |10-15| + |20-15| + |30-15| + |40-15| = 5 + 5 + 15 + 25 = 50
+    assert_eq!(c.reg(0), 50);
+}
+
+#[test]
+fn sadd16() {
+    // SADD16 R0, R1, R2 — parallel signed 16-bit add
+    let mut c = CortexM33::new();
+    // R1 = packed(hi=100, lo=200)
+    c.set_reg(1, (200u32) | (100u32 << 16));
+    // R2 = packed(hi=50, lo=55)
+    c.set_reg(2, (55u32) | (50u32 << 16));
+    // SADD16: hw0 = 0xFA91, hw1 = 0xF002
+    c.execute_one_wide(0xFA91, 0xF002);
+    let result = c.reg(0);
+    let lo = result & 0xFFFF;
+    let hi = result >> 16;
+    assert_eq!(lo, 255);  // 200 + 55
+    assert_eq!(hi, 150);  // 100 + 50
+    // Both results >= 0, so GE[3:0] should have bits set
+    assert_eq!(c.regs.ge_flags() & 0x3, 0x3); // lo result >= 0
+    assert_eq!(c.regs.ge_flags() & 0xC, 0xC); // hi result >= 0
+}
+
+#[test]
+fn uadd8() {
+    // UADD8 R0, R1, R2 — parallel unsigned 8-bit add
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x01_02_03_04);
+    c.set_reg(2, 0x05_06_07_08);
+    // UADD8: par_op1=100, par_op2=000
+    // hw0 = 0xFAC1 (hw0[6:4]=100, Rn=R1), hw1 = 0xF002 (hw1[6:4]=000, Rm=R2)
+    c.execute_one_wide(0xFAC1, 0xF002);
+    // byte0: 4+8=12, byte1: 3+7=10, byte2: 2+6=8, byte3: 1+5=6
+    assert_eq!(c.reg(0), 0x06_08_0A_0C);
+    // All sums < 256, so no carries → GE = 0
+    assert_eq!(c.regs.ge_flags(), 0);
+
+    // Test with overflow: 0xFF + 0x01 = 0x100 → carry, GE bit set
+    let mut c2 = CortexM33::new();
+    c2.set_reg(1, 0x00_00_00_FF);
+    c2.set_reg(2, 0x00_00_00_01);
+    c2.execute_one_wide(0xFAC1, 0xF002);
+    assert_eq!(c2.reg(0) & 0xFF, 0x00); // wraps to 0
+    assert!(c2.regs.ge_flags() & 1 != 0); // GE[0] set (carry)
+}
+
+#[test]
+fn qadd() {
+    // QADD R0, R1, R2 — saturating signed add
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x7FFF_FFF0); // near max positive
+    c.set_reg(2, 0x0000_0010);
+    // QADD: hw0 = 0xFA81 (hw0[7:4]=1000, Rn=R1), hw1 = 0xF082 (hw1[7]=1, Rm=R2)
+    c.execute_one_wide(0xFA81, 0xF082);
+    assert_eq!(c.reg(0), 0x8000_0000); // overflows (wraps), Q flag set
+    assert!(c.regs.flag_q());
+
+    // Non-overflowing case
+    let mut c2 = CortexM33::new();
+    c2.set_reg(1, 100);
+    c2.set_reg(2, 200);
+    c2.execute_one_wide(0xFA81, 0xF082);
+    assert_eq!(c2.reg(0), 300);
+    assert!(!c2.regs.flag_q());
+}
+
+#[test]
+fn sel_basic() {
+    // SEL R0, R1, R2 — select bytes based on GE flags
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xAA_BB_CC_DD);
+    c.set_reg(2, 0x11_22_33_44);
+    // GE = 0b1010: byte 3 from R1, byte 2 from R2, byte 1 from R1, byte 0 from R2
+    c.regs.set_ge_flags(0b1010);
+    // SEL: hw0 = 0xFAA1 (op1_65=01, hw0[4]=0, Rn=R1), hw1 = 0xF082 (Rm=R2)
+    c.execute_one_wide(0xFAA1, 0xF082);
+    // byte 0: GE[0]=0 → from R2: 0x44
+    // byte 1: GE[1]=1 → from R1: 0xCC
+    // byte 2: GE[2]=0 → from R2: 0x22
+    // byte 3: GE[3]=1 → from R1: 0xAA
+    assert_eq!(c.reg(0), 0xAA_22_CC_44);
+}
+
+#[test]
+fn sxtb16() {
+    // SXTB16 R0, R1 — sign-extend bytes 0 and 2 to packed halfwords
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x00_80_00_FE); // byte0=0xFE(-2), byte2=0x80(-128)
+    // SXTB16: hw0 = 0xFA2F (ext=010, Rn=15), hw1 = 0xF081 (Rd=0, rot=0, Rm=1)
+    c.execute_one_wide(0xFA2F, 0xF081);
+    // low halfword: sign_extend(0xFE) = 0xFFFE (-2)
+    // high halfword: sign_extend(0x80) = 0xFF80 (-128)
+    assert_eq!(c.reg(0), 0xFF80_FFFE);
+}
+
+#[test]
+fn smlald() {
+    // SMLALD RdLo=R4, RdHi=R5, Rn=R1, Rm=R2
+    let mut c = CortexM33::new();
+    // R1 = packed(hi=3, lo=2), R2 = packed(hi=5, lo=4)
+    c.set_reg(1, 0x0003_0002);
+    c.set_reg(2, 0x0005_0004);
+    // Accumulator: R5:R4 = 1000
+    c.set_reg(4, 1000);
+    c.set_reg(5, 0);
+    // SMLALD: op1=100, op2=1100
+    // hw0 = 0xFBC1 (op1=100, Rn=R1)
+    // hw1 = 0x45C2 (RdLo=4, RdHi=5, op2=1100, Rm=R2)
+    c.execute_one_wide(0xFBC1, 0x45C2);
+    // Products: lo*lo = 2*4 = 8, hi*hi = 3*5 = 15
+    // Result = 1000 + 8 + 15 = 1023
+    let result = (c.reg(5) as u64) << 32 | c.reg(4) as u64;
+    assert_eq!(result, 1023);
+}
+
+#[test]
+fn umaal() {
+    // UMAAL RdLo=R4, RdHi=R5, Rn=R1, Rm=R2
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    c.set_reg(2, 200);
+    c.set_reg(4, 50);  // RdLo addend
+    c.set_reg(5, 30);  // RdHi addend
+    // UMAAL: op1=110, op2=0110
+    // hw0 = 0xFBE1 (op1=110, Rn=R1)
+    // hw1 = 0x4562 (RdLo=4, RdHi=5, op2=0110, Rm=R2)
+    c.execute_one_wide(0xFBE1, 0x4562);
+    // Result = 100*200 + 50 + 30 = 20000 + 80 = 20080
+    let result = (c.reg(5) as u64) << 32 | c.reg(4) as u64;
+    assert_eq!(result, 20080);
+}

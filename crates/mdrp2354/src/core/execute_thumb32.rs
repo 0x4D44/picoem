@@ -292,8 +292,28 @@ impl CortexM33 {
                 self.regs.r[rd] = (self.regs.r[rd] & 0xFFFF) | (imm16 << 16);
                 1
             }
-            // SSAT — stub
-            0b10000 => self.thumb32_undefined(hw0, hw1),
+            // SSAT — signed saturate (LSL: op=0b10000, ASR: op=0b10010)
+            0b10000 | 0b10010 => {
+                let sat_bit = ((hw1 & 0x1F) + 1) as u32;
+                let sh = (op >> 1) & 1; // 0=LSL, 1=ASR
+                let shift_type = if sh != 0 { 0b10u8 } else { 0b00u8 };
+                let shift_n = ((((hw1 >> 12) & 0x7) << 2) | ((hw1 >> 6) & 0x3)) as u32;
+                let shifted = barrel_shift(self.regs.r[rn], shift_type, shift_n, false).0;
+                let signed_val = shifted as i32;
+                let max = (1i32 << (sat_bit - 1)) - 1;
+                let min = -(1i32 << (sat_bit - 1));
+                let result = if signed_val > max {
+                    self.regs.set_flag_q();
+                    max as u32
+                } else if signed_val < min {
+                    self.regs.set_flag_q();
+                    min as u32
+                } else {
+                    shifted
+                };
+                self.regs.r[rd] = result;
+                1
+            }
             // SBFX
             0b10100 => {
                 let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
@@ -319,8 +339,27 @@ impl CortexM33 {
                 }
                 1
             }
-            // USAT — stub
-            0b11000 => self.thumb32_undefined(hw0, hw1),
+            // USAT — unsigned saturate (LSL: op=0b11000, ASR: op=0b11010)
+            0b11000 | 0b11010 => {
+                let sat_bit = (hw1 & 0x1F) as u32;
+                let sh = (op >> 1) & 1;
+                let shift_type = if sh != 0 { 0b10u8 } else { 0b00u8 };
+                let shift_n = ((((hw1 >> 12) & 0x7) << 2) | ((hw1 >> 6) & 0x3)) as u32;
+                let shifted = barrel_shift(self.regs.r[rn], shift_type, shift_n, false).0;
+                let signed_val = shifted as i32;
+                let max = if sat_bit < 32 { (1i64 << sat_bit) - 1 } else { i64::from(i32::MAX) };
+                let result = if signed_val < 0 {
+                    self.regs.set_flag_q();
+                    0u32
+                } else if (signed_val as i64) > max {
+                    self.regs.set_flag_q();
+                    max as u32
+                } else {
+                    shifted
+                };
+                self.regs.r[rd] = result;
+                1
+            }
             // UBFX
             0b11100 => {
                 let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
@@ -809,7 +848,9 @@ impl CortexM33 {
                 if mask & 2 != 0 {
                     self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | (val & 0xF800_0000);
                 }
-                // GE bits (mask[0]) not implemented for Phase 1
+                if mask & 1 != 0 {
+                    self.regs.set_ge_flags((val >> 16) & 0xF);
+                }
             }
             // IPSR (5), EPSR (6), IEPSR (7) — read-only, ignore writes
             5 | 6 | 7 => {}
@@ -866,7 +907,7 @@ impl CortexM33 {
 
         self.regs.r[rd] = match sysm {
             // APSR / IAPSR / EAPSR / XPSR / combined variants — NZCVQ flags
-            0 | 1 | 2 | 3 | 4 => self.regs.xpsr & 0xF800_0000,
+            0 | 1 | 2 | 3 | 4 => self.regs.xpsr & 0xF80F_0000,
             // IPSR — exception number
             5 => self.regs.xpsr & 0x1FF,
             // EPSR — execution state not readable
@@ -916,6 +957,145 @@ impl CortexM33 {
                 // MLS
                 let product = self.regs.r[rn].wrapping_mul(self.regs.r[rm]);
                 self.regs.r[rd] = self.regs.r[ra].wrapping_sub(product);
+            }
+            // Halfword multiply: SMLABB/BT/TB/TT (Ra!=15) / SMULBB/BT/TB/TT (Ra=15)
+            (0b001, _) => {
+                let bottom_n = op2 & 0x2 == 0;
+                let bottom_m = op2 & 0x1 == 0;
+                let rn_half = if bottom_n {
+                    self.regs.r[rn] as i16 as i32
+                } else {
+                    (self.regs.r[rn] >> 16) as i16 as i32
+                };
+                let rm_half = if bottom_m {
+                    self.regs.r[rm] as i16 as i32
+                } else {
+                    (self.regs.r[rm] >> 16) as i16 as i32
+                };
+                let product = rn_half.wrapping_mul(rm_half);
+                if ra == 15 {
+                    self.regs.r[rd] = product as u32;
+                } else {
+                    let acc = self.regs.r[ra] as i32;
+                    let (result, overflow) = product.overflowing_add(acc);
+                    self.regs.r[rd] = result as u32;
+                    if overflow { self.regs.set_flag_q(); }
+                }
+            }
+            // Dual multiply add: SMLAD/SMLADX (Ra!=15) / SMUAD/SMUADX (Ra=15)
+            (0b010, _) => {
+                let cross = op2 & 0x1 != 0;
+                let rn_lo = self.regs.r[rn] as i16 as i32;
+                let rn_hi = (self.regs.r[rn] >> 16) as i16 as i32;
+                let (rm_lo, rm_hi) = if cross {
+                    ((self.regs.r[rm] >> 16) as i16 as i32, self.regs.r[rm] as i16 as i32)
+                } else {
+                    (self.regs.r[rm] as i16 as i32, (self.regs.r[rm] >> 16) as i16 as i32)
+                };
+                let p1 = rn_lo.wrapping_mul(rm_lo);
+                let p2 = rn_hi.wrapping_mul(rm_hi);
+                let (sum, ov1) = p1.overflowing_add(p2);
+                if ra == 15 {
+                    self.regs.r[rd] = sum as u32;
+                    if ov1 { self.regs.set_flag_q(); }
+                } else {
+                    let acc = self.regs.r[ra] as i32;
+                    let (result, ov2) = sum.overflowing_add(acc);
+                    self.regs.r[rd] = result as u32;
+                    if ov1 || ov2 { self.regs.set_flag_q(); }
+                }
+            }
+            // Word x halfword: SMLAWB/SMLAWT (Ra!=15) / SMULWB/SMULWT (Ra=15)
+            (0b011, _) => {
+                let bottom_m = op2 & 0x1 == 0;
+                let rm_half = if bottom_m {
+                    self.regs.r[rm] as i16 as i32
+                } else {
+                    (self.regs.r[rm] >> 16) as i16 as i32
+                };
+                let product = (self.regs.r[rn] as i32 as i64) * (rm_half as i64);
+                let product_hi = (product >> 16) as i32;
+                if ra == 15 {
+                    self.regs.r[rd] = product_hi as u32;
+                } else {
+                    let acc = self.regs.r[ra] as i32;
+                    let (result, overflow) = product_hi.overflowing_add(acc);
+                    self.regs.r[rd] = result as u32;
+                    if overflow { self.regs.set_flag_q(); }
+                }
+            }
+            // Dual multiply subtract: SMLSD/SMLSDX (Ra!=15) / SMUSD/SMUSDX (Ra=15)
+            (0b100, _) => {
+                let cross = op2 & 0x1 != 0;
+                let rn_lo = self.regs.r[rn] as i16 as i32;
+                let rn_hi = (self.regs.r[rn] >> 16) as i16 as i32;
+                let (rm_lo, rm_hi) = if cross {
+                    ((self.regs.r[rm] >> 16) as i16 as i32, self.regs.r[rm] as i16 as i32)
+                } else {
+                    (self.regs.r[rm] as i16 as i32, (self.regs.r[rm] >> 16) as i16 as i32)
+                };
+                let p1 = rn_lo.wrapping_mul(rm_lo);
+                let p2 = rn_hi.wrapping_mul(rm_hi);
+                let diff = p1.wrapping_sub(p2);
+                if ra == 15 {
+                    self.regs.r[rd] = diff as u32;
+                } else {
+                    let acc = self.regs.r[ra] as i32;
+                    let (result, overflow) = diff.overflowing_add(acc);
+                    self.regs.r[rd] = result as u32;
+                    if overflow { self.regs.set_flag_q(); }
+                }
+            }
+            // Most significant word multiply: SMMLA/SMMLAR / SMMUL/SMMULR
+            (0b101, _) => {
+                let round = op2 & 0x1 != 0;
+                let product = (self.regs.r[rn] as i32 as i64) * (self.regs.r[rm] as i32 as i64);
+                if ra == 15 {
+                    let result = if round {
+                        (product.wrapping_add(0x8000_0000) >> 32) as i32
+                    } else {
+                        (product >> 32) as i32
+                    };
+                    self.regs.r[rd] = result as u32;
+                } else {
+                    let acc = (self.regs.r[ra] as i32 as i64) << 32;
+                    let sum = product.wrapping_add(acc);
+                    let result = if round {
+                        (sum.wrapping_add(0x8000_0000) >> 32) as i32
+                    } else {
+                        (sum >> 32) as i32
+                    };
+                    self.regs.r[rd] = result as u32;
+                }
+            }
+            // Most significant word multiply-subtract: SMMLS/SMMLSR
+            (0b110, _) => {
+                let round = op2 & 0x1 != 0;
+                let product = (self.regs.r[rn] as i32 as i64) * (self.regs.r[rm] as i32 as i64);
+                let acc = (self.regs.r[ra] as i32 as i64) << 32;
+                let diff = acc.wrapping_sub(product);
+                let result = if round {
+                    (diff.wrapping_add(0x8000_0000) >> 32) as i32
+                } else {
+                    (diff >> 32) as i32
+                };
+                self.regs.r[rd] = result as u32;
+            }
+            // Sum of absolute differences: USADA8 (Ra!=15) / USAD8 (Ra=15)
+            (0b111, _) => {
+                let a = self.regs.r[rn];
+                let b = self.regs.r[rm];
+                let mut sum = 0u32;
+                for i in 0..4 {
+                    let a_byte = ((a >> (i * 8)) & 0xFF) as i32;
+                    let b_byte = ((b >> (i * 8)) & 0xFF) as i32;
+                    sum += (a_byte - b_byte).unsigned_abs();
+                }
+                if ra == 15 {
+                    self.regs.r[rd] = sum;
+                } else {
+                    self.regs.r[rd] = sum.wrapping_add(self.regs.r[ra]);
+                }
             }
             _ => return self.thumb32_undefined(hw0, hw1),
         }
@@ -979,6 +1159,73 @@ impl CortexM33 {
                 self.regs.r[rd_lo] = if b == 0 { 0 } else { a / b };
                 4 // placeholder
             }
+            // SMLALBB/BT/TB/TT: op1=100, op2=10xx
+            (0b100, 0b1000..=0b1011) => {
+                let bottom_n = op2 & 0x2 == 0;
+                let bottom_m = op2 & 0x1 == 0;
+                let rn_half = if bottom_n {
+                    self.regs.r[rn] as i16 as i64
+                } else {
+                    (self.regs.r[rn] >> 16) as i16 as i64
+                };
+                let rm_half = if bottom_m {
+                    self.regs.r[rm] as i16 as i64
+                } else {
+                    (self.regs.r[rm] >> 16) as i16 as i64
+                };
+                let product = rn_half * rm_half;
+                let acc = ((self.regs.r[rd_hi] as u64) << 32) | self.regs.r[rd_lo] as u64;
+                let result = (acc as i64).wrapping_add(product);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
+            // SMLALD/SMLALDX: op1=100, op2=1100/1101
+            (0b100, 0b1100 | 0b1101) => {
+                let cross = op2 & 0x1 != 0;
+                let rn_lo = self.regs.r[rn] as i16 as i64;
+                let rn_hi = (self.regs.r[rn] >> 16) as i16 as i64;
+                let (rm_lo, rm_hi) = if cross {
+                    ((self.regs.r[rm] >> 16) as i16 as i64, self.regs.r[rm] as i16 as i64)
+                } else {
+                    (self.regs.r[rm] as i16 as i64, (self.regs.r[rm] >> 16) as i16 as i64)
+                };
+                let p1 = rn_lo * rm_lo;
+                let p2 = rn_hi * rm_hi;
+                let acc = ((self.regs.r[rd_hi] as u64) << 32) | self.regs.r[rd_lo] as u64;
+                let result = (acc as i64).wrapping_add(p1).wrapping_add(p2);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
+            // SMLSLD/SMLSLDX: op1=101, op2=1100/1101
+            (0b101, 0b1100 | 0b1101) => {
+                let cross = op2 & 0x1 != 0;
+                let rn_lo = self.regs.r[rn] as i16 as i64;
+                let rn_hi = (self.regs.r[rn] >> 16) as i16 as i64;
+                let (rm_lo, rm_hi) = if cross {
+                    ((self.regs.r[rm] >> 16) as i16 as i64, self.regs.r[rm] as i16 as i64)
+                } else {
+                    (self.regs.r[rm] as i16 as i64, (self.regs.r[rm] >> 16) as i16 as i64)
+                };
+                let p1 = rn_lo * rm_lo;
+                let p2 = rn_hi * rm_hi;
+                let acc = ((self.regs.r[rd_hi] as u64) << 32) | self.regs.r[rd_lo] as u64;
+                let result = (acc as i64).wrapping_add(p1).wrapping_sub(p2);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
+            // UMAAL: op1=110, op2=0110
+            (0b110, 0b0110) => {
+                let product = (self.regs.r[rn] as u64) * (self.regs.r[rm] as u64);
+                let result = product
+                    .wrapping_add(self.regs.r[rd_lo] as u64)
+                    .wrapping_add(self.regs.r[rd_hi] as u64);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
             _ => return self.thumb32_undefined(hw0, hw1),
         }
     }
@@ -990,43 +1237,112 @@ impl CortexM33 {
         let rm = (hw1 & 0xF) as usize;
 
         if hw0 & 0x80 != 0 {
-            // -- Misc single-register ops (hw0[7]=1) ----------------------------
-            // hw0 = 1111_1010_1xxx_Rm, hw1 = 1111_Rd_1xxx_Rm
-            let op1_lo = (hw0 >> 5) & 0x3;  // hw0[6:5]
-            let op2_lo = (hw1 >> 4) & 0x3;  // hw1[5:4]
-            let val = self.regs.r[rm];
-
-            match (op1_lo, op2_lo) {
-                (0b00, 0b00) => {
-                    // REV.W — byte reverse word
-                    self.regs.r[rd] = val.swap_bytes();
-                    1
+            // hw0[7]=1: misc ops, parallel add/sub, saturating, SEL
+            if hw1 & 0x80 == 0 {
+                // hw1[7]=0: Parallel add/subtract
+                let rn = (hw0 & 0xF) as usize;
+                let par_op1 = ((hw0 >> 4) & 0x7) as u8;
+                let par_op2 = ((hw1 >> 4) & 0x7) as u8;
+                return self.thumb32_parallel_add_sub(rd, rn, rm, par_op1, par_op2);
+            }
+            // hw1[7]=1: misc (REV/CLZ) or saturating (QADD/SEL)
+            if hw0 & 0x10 != 0 {
+                // hw0[4]=1: REV/CLZ family
+                let op1_lo = (hw0 >> 5) & 0x3;
+                let op2_lo = (hw1 >> 4) & 0x3;
+                let val = self.regs.r[rm];
+                match (op1_lo, op2_lo) {
+                    (0b00, 0b00) => {
+                        self.regs.r[rd] = val.swap_bytes();
+                        1
+                    }
+                    (0b00, 0b01) => {
+                        let lo = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8);
+                        let hi = ((val & 0x00FF_0000) << 8) | ((val & 0xFF00_0000) >> 8);
+                        self.regs.r[rd] = hi | lo;
+                        1
+                    }
+                    (0b00, 0b10) => {
+                        self.regs.r[rd] = val.reverse_bits();
+                        1
+                    }
+                    (0b00, 0b11) => {
+                        let lo_hw = val as u16;
+                        let swapped = ((lo_hw & 0xFF) << 8) | ((lo_hw >> 8) & 0xFF);
+                        self.regs.r[rd] = swapped as i16 as i32 as u32;
+                        1
+                    }
+                    (0b01, 0b00) => {
+                        self.regs.r[rd] = val.leading_zeros();
+                        1
+                    }
+                    _ => self.thumb32_undefined(hw0, hw1),
                 }
-                (0b00, 0b01) => {
-                    // REV16.W — byte reverse packed halfwords
-                    let lo = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8);
-                    let hi = ((val & 0x00FF_0000) << 8) | ((val & 0xFF00_0000) >> 8);
-                    self.regs.r[rd] = hi | lo;
-                    1
+            } else {
+                // hw0[4]=0: QADD/QSUB/QDADD/QDSUB/SEL
+                let rn = (hw0 & 0xF) as usize;
+                let op1_65 = ((hw0 >> 5) & 0x3) as u8;
+                let op2_54 = ((hw1 >> 4) & 0x3) as u8;
+                match (op1_65, op2_54) {
+                    (0b00, 0b00) => {
+                        // QADD: Rd = saturate(Rn + Rm)
+                        let a = self.regs.r[rn] as i32;
+                        let b = self.regs.r[rm] as i32;
+                        let (result, overflow) = a.overflowing_add(b);
+                        if overflow { self.regs.set_flag_q(); }
+                        self.regs.r[rd] = result as u32;
+                        1
+                    }
+                    (0b00, 0b01) => {
+                        // QDADD: Rd = saturate(Rn + saturate(2*Rm))
+                        let rn_val = self.regs.r[rn] as i32;
+                        let rm_val = self.regs.r[rm] as i32;
+                        let (doubled, ov1) = rm_val.overflowing_add(rm_val);
+                        if ov1 { self.regs.set_flag_q(); }
+                        let (result, ov2) = rn_val.overflowing_add(doubled);
+                        if ov2 { self.regs.set_flag_q(); }
+                        self.regs.r[rd] = result as u32;
+                        1
+                    }
+                    (0b00, 0b10) => {
+                        // QSUB: Rd = saturate(Rn - Rm)
+                        let a = self.regs.r[rn] as i32;
+                        let b = self.regs.r[rm] as i32;
+                        let (result, overflow) = a.overflowing_sub(b);
+                        if overflow { self.regs.set_flag_q(); }
+                        self.regs.r[rd] = result as u32;
+                        1
+                    }
+                    (0b00, 0b11) => {
+                        // QDSUB: Rd = saturate(Rn - saturate(2*Rm))
+                        let rn_val = self.regs.r[rn] as i32;
+                        let rm_val = self.regs.r[rm] as i32;
+                        let (doubled, ov1) = rm_val.overflowing_add(rm_val);
+                        if ov1 { self.regs.set_flag_q(); }
+                        let (result, ov2) = rn_val.overflowing_sub(doubled);
+                        if ov2 { self.regs.set_flag_q(); }
+                        self.regs.r[rd] = result as u32;
+                        1
+                    }
+                    (0b01, 0b00) => {
+                        // SEL: select bytes based on GE flags
+                        let ge = self.regs.ge_flags();
+                        let a = self.regs.r[rn];
+                        let b = self.regs.r[rm];
+                        let mut result = 0u32;
+                        for i in 0..4u32 {
+                            let byte_mask = 0xFFu32 << (i * 8);
+                            if ge & (1 << i) != 0 {
+                                result |= a & byte_mask;
+                            } else {
+                                result |= b & byte_mask;
+                            }
+                        }
+                        self.regs.r[rd] = result;
+                        1
+                    }
+                    _ => self.thumb32_undefined(hw0, hw1),
                 }
-                (0b00, 0b10) => {
-                    // RBIT — reverse bits
-                    self.regs.r[rd] = val.reverse_bits();
-                    1
-                }
-                (0b00, 0b11) => {
-                    // REVSH.W — byte reverse signed halfword
-                    let lo_hw = val as u16;
-                    let swapped = ((lo_hw & 0xFF) << 8) | ((lo_hw >> 8) & 0xFF);
-                    self.regs.r[rd] = swapped as i16 as i32 as u32;
-                    1
-                }
-                (0b01, 0b00) => {
-                    // CLZ — count leading zeros
-                    self.regs.r[rd] = val.leading_zeros();
-                    1
-                }
-                _ => self.thumb32_undefined(hw0, hw1),
             }
         } else if hw1 & 0x80 != 0 {
             // -- Extend ops (hw0[7]=0, hw1[7]=1) --------------------------------
@@ -1041,9 +1357,19 @@ impl CortexM33 {
                 let result = match ext {
                     0b000 => (rotated as i16) as i32 as u32,          // SXTH
                     0b001 => rotated & 0xFFFF,                        // UXTH
+                    0b010 => {
+                        // SXTB16: sign-extend bytes 0 and 2 to halfwords
+                        let b0 = (rotated & 0xFF) as i8 as i16 as u16 as u32;
+                        let b2 = ((rotated >> 16) & 0xFF) as i8 as i16 as u16 as u32;
+                        b0 | (b2 << 16)
+                    }
+                    0b011 => {
+                        // UXTB16: zero-extend bytes 0 and 2 to halfwords
+                        (rotated & 0xFF) | (((rotated >> 16) & 0xFF) << 16)
+                    }
                     0b100 => (rotated as i8) as i32 as u32,           // SXTB
                     0b101 => rotated & 0xFF,                          // UXTB
-                    _ => return self.thumb32_undefined(hw0, hw1),     // SXTB16/UXTB16: DSP, skip
+                    _ => return self.thumb32_undefined(hw0, hw1),
                 };
                 self.regs.r[rd] = result;
             } else {
@@ -1052,6 +1378,22 @@ impl CortexM33 {
                 let result = match ext {
                     0b000 => addend.wrapping_add((rotated as i16) as i32 as u32), // SXTAH
                     0b001 => addend.wrapping_add(rotated & 0xFFFF),               // UXTAH
+                    0b010 => {
+                        // SXTAB16: packed halfword add with sign-extended bytes
+                        let b0 = (rotated & 0xFF) as i8 as i16 as u16 as u32;
+                        let b2 = ((rotated >> 16) & 0xFF) as i8 as i16 as u16 as u32;
+                        let lo = (addend & 0xFFFF).wrapping_add(b0) & 0xFFFF;
+                        let hi = ((addend >> 16) & 0xFFFF).wrapping_add(b2) & 0xFFFF;
+                        lo | (hi << 16)
+                    }
+                    0b011 => {
+                        // UXTAB16: packed halfword add with zero-extended bytes
+                        let b0 = rotated & 0xFF;
+                        let b2 = (rotated >> 16) & 0xFF;
+                        let lo = (addend & 0xFFFF).wrapping_add(b0) & 0xFFFF;
+                        let hi = ((addend >> 16) & 0xFFFF).wrapping_add(b2) & 0xFFFF;
+                        lo | (hi << 16)
+                    }
                     0b100 => addend.wrapping_add((rotated as i8) as i32 as u32),  // SXTAB
                     0b101 => addend.wrapping_add(rotated & 0xFF),                 // UXTAB
                     _ => return self.thumb32_undefined(hw0, hw1),
@@ -1129,17 +1471,150 @@ impl CortexM33 {
         }
     }
 
+    // -- Parallel add/subtract ------------------------------------------------
+
+    fn thumb32_parallel_add_sub(
+        &mut self, rd: usize, rn: usize, rm: usize, par_op1: u8, par_op2: u8,
+    ) -> u32 {
+        let a = self.regs.r[rn];
+        let b = self.regs.r[rm];
+        match par_op1 {
+            0b001 => self.parallel_signed_16(rd, a, b, par_op2, false, false),
+            0b010 => self.parallel_signed_16(rd, a, b, par_op2, true, false),
+            0b110 => self.parallel_signed_16(rd, a, b, par_op2, false, true),
+            0b101 => self.parallel_unsigned_16(rd, a, b, par_op2, false, false),
+            0b011 => self.parallel_unsigned_16(rd, a, b, par_op2, true, false),
+            0b111 => self.parallel_unsigned_16(rd, a, b, par_op2, false, true),
+            0b000 => self.parallel_signed_8(rd, a, b, par_op2),
+            0b100 => self.parallel_unsigned_8(rd, a, b, par_op2),
+            _ => 1,
+        }
+    }
+
+    fn parallel_signed_16(
+        &mut self, rd: usize, a: u32, b: u32, op: u8, sat: bool, halving: bool,
+    ) -> u32 {
+        let a_lo = a as i16 as i32;
+        let a_hi = (a >> 16) as i16 as i32;
+        let b_lo = b as i16 as i32;
+        let b_hi = (b >> 16) as i16 as i32;
+        let (r_lo, r_hi) = match op {
+            0b000 => (a_lo + b_lo, a_hi + b_hi),
+            0b001 => (a_lo - b_hi, a_hi + b_lo),
+            0b010 => (a_lo + b_hi, a_hi - b_lo),
+            0b011 => (a_lo - b_lo, a_hi - b_hi),
+            _ => return 1,
+        };
+        let (lo, hi) = if sat {
+            (r_lo.clamp(-32768, 32767), r_hi.clamp(-32768, 32767))
+        } else if halving {
+            (r_lo >> 1, r_hi >> 1)
+        } else {
+            let mut ge = self.regs.ge_flags();
+            if r_lo >= 0 { ge |= 0x3; } else { ge &= !0x3; }
+            if r_hi >= 0 { ge |= 0xC; } else { ge &= !0xC; }
+            self.regs.set_ge_flags(ge);
+            (r_lo, r_hi)
+        };
+        self.regs.r[rd] = (lo as u16 as u32) | ((hi as u16 as u32) << 16);
+        1
+    }
+
+    fn parallel_unsigned_16(
+        &mut self, rd: usize, a: u32, b: u32, op: u8, sat: bool, halving: bool,
+    ) -> u32 {
+        let a_lo = (a & 0xFFFF) as u32;
+        let a_hi = (a >> 16) as u32;
+        let b_lo = (b & 0xFFFF) as u32;
+        let b_hi = (b >> 16) as u32;
+        // Use i32 for subtraction results to handle borrow
+        let (r_lo_i, r_hi_i): (i32, i32) = match op {
+            0b000 => (a_lo as i32 + b_lo as i32, a_hi as i32 + b_hi as i32),
+            0b001 => (a_lo as i32 - b_hi as i32, a_hi as i32 + b_lo as i32),
+            0b010 => (a_lo as i32 + b_hi as i32, a_hi as i32 - b_lo as i32),
+            0b011 => (a_lo as i32 - b_lo as i32, a_hi as i32 - b_hi as i32),
+            _ => return 1,
+        };
+        let (lo, hi) = if sat {
+            (
+                (r_lo_i as u32).min(0xFFFF),
+                (r_hi_i as u32).min(0xFFFF),
+            )
+        } else if halving {
+            ((r_lo_i as u32) >> 1, (r_hi_i as u32) >> 1)
+        } else {
+            let mut ge = self.regs.ge_flags();
+            // GE set if no borrow (result >= 0x10000 for add, >= 0 for sub)
+            match op {
+                0b000 => {
+                    if r_lo_i >= 0x10000 { ge |= 0x3; } else { ge &= !0x3; }
+                    if r_hi_i >= 0x10000 { ge |= 0xC; } else { ge &= !0xC; }
+                }
+                _ => {
+                    if r_lo_i >= 0 { ge |= 0x3; } else { ge &= !0x3; }
+                    if r_hi_i >= 0 { ge |= 0xC; } else { ge &= !0xC; }
+                }
+            }
+            self.regs.set_ge_flags(ge);
+            (r_lo_i as u32, r_hi_i as u32)
+        };
+        self.regs.r[rd] = (lo as u16 as u32) | ((hi as u16 as u32) << 16);
+        1
+    }
+
+    fn parallel_signed_8(&mut self, rd: usize, a: u32, b: u32, op: u8) -> u32 {
+        let mut result = 0u32;
+        let mut ge = 0u32;
+        for i in 0..4u32 {
+            let a_byte = ((a >> (i * 8)) & 0xFF) as i8 as i32;
+            let b_byte = ((b >> (i * 8)) & 0xFF) as i8 as i32;
+            let r = match op {
+                0b000 => a_byte + b_byte,
+                0b100 => a_byte - b_byte,
+                _ => return 1,
+            };
+            if r >= 0 { ge |= 1 << i; }
+            result |= ((r as u8) as u32) << (i * 8);
+        }
+        self.regs.set_ge_flags(ge);
+        self.regs.r[rd] = result;
+        1
+    }
+
+    fn parallel_unsigned_8(&mut self, rd: usize, a: u32, b: u32, op: u8) -> u32 {
+        let mut result = 0u32;
+        let mut ge = 0u32;
+        for i in 0..4u32 {
+            let a_byte = ((a >> (i * 8)) & 0xFF) as u32;
+            let b_byte = ((b >> (i * 8)) & 0xFF) as u32;
+            let r: i32 = match op {
+                0b000 => (a_byte + b_byte) as i32,
+                0b100 => a_byte as i32 - b_byte as i32,
+                _ => return 1,
+            };
+            match op {
+                0b000 => { if r >= 0x100 { ge |= 1 << i; } }
+                _ => { if r >= 0 { ge |= 1 << i; } }
+            }
+            result |= ((r as u32) & 0xFF) << (i * 8);
+        }
+        self.regs.set_ge_flags(ge);
+        self.regs.r[rd] = result;
+        1
+    }
+
     // -- Coprocessor ---------------------------------------------------------
 
-    pub(crate) fn thumb32_coprocessor(&mut self, hw0: u16, hw1: u16, _bus: &mut Bus) -> u32 {
-        let _coproc = ((hw1 >> 8) & 0xF) as u8;
-        // Phase 1: all coprocessor instructions are undefined stubs.
-        // Future phases will dispatch on _coproc:
-        //   0       → GPIO coprocessor
-        //   4 | 5   → DCP (double-precision coprocessor)
-        //   7       → RCP (runtime check coprocessor)
-        //   10 | 11 → FPU
-        self.thumb32_undefined(hw0, hw1)
+    pub(crate) fn thumb32_coprocessor(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        let coproc = ((hw1 >> 8) & 0xF) as u8;
+        match coproc {
+            10 | 11 => self.fpu_execute(hw0, hw1, bus),
+            // Future phases:
+            //   0       → GPIO coprocessor
+            //   4 | 5   → DCP (double-precision coprocessor)
+            //   7       → RCP (runtime check coprocessor)
+            _ => self.thumb32_undefined(hw0, hw1),
+        }
     }
 
     // -- BL (branch with link) -----------------------------------------------
