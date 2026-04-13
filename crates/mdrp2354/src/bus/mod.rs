@@ -392,7 +392,12 @@ impl Bus {
                 halves[half_idx]
             }
             0xD => 0, // SIO (stub)
-            0xE => 0, // PPB (stub)
+            0xE => {
+                // PPB: extract halfword from 32-bit register read
+                let word = self.ppb[self.active_core()].read32(addr & !3);
+                let half_idx = ((addr >> 1) & 1) as usize;
+                [word as u16, (word >> 16) as u16][half_idx]
+            }
             _ => {
                 self.bus_fault = true;
                 self.bus_fault_addr = addr;

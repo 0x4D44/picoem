@@ -139,6 +139,7 @@ impl CortexM33 {
     /// Advances PC by 2 before execution, matching decode_execute behaviour.
     /// Returns cycle count.
     pub fn execute_one(&mut self, opcode: u16) -> u32 {
+        self.pending_fault = None;
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         self.regs.set_pc(pc.wrapping_add(2));
@@ -148,6 +149,7 @@ impl CortexM33 {
 
     /// Execute a single 16-bit instruction with a provided bus.
     pub fn execute_one_with_bus(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+        self.pending_fault = None;
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         self.regs.set_pc(pc.wrapping_add(2));
@@ -157,6 +159,7 @@ impl CortexM33 {
     /// Execute a single 32-bit Thumb-2 instruction directly.
     /// Advances PC by 4 before execution.
     pub fn execute_one_wide(&mut self, hw0: u16, hw1: u16) -> u32 {
+        self.pending_fault = None;
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         self.regs.set_pc(pc.wrapping_add(4));
@@ -166,6 +169,7 @@ impl CortexM33 {
 
     /// Execute a single 32-bit Thumb-2 instruction with a provided bus.
     pub fn execute_one_wide_with_bus(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        self.pending_fault = None;
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         self.regs.set_pc(pc.wrapping_add(4));
