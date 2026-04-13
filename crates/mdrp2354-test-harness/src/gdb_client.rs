@@ -1,0 +1,541 @@
+// GDB RSP client and QEMU process manager for differential testing.
+//
+// Minimal GDB Remote Serial Protocol client implementing 5 packet types:
+//   p/P (read/write register), m/M (read/write memory), s (single-step).
+//
+// Tested with QEMU >= 7.0, MPS2-AN505 machine, Cortex-M33 CPU.
+
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use crate::REG_XPSR;
+
+// ============================================================================
+// QemuProcess — manages the QEMU child process lifetime
+// ============================================================================
+
+/// Owns a QEMU child process. Kills it on drop.
+pub struct QemuProcess {
+    child: Child,
+}
+
+impl QemuProcess {
+    /// Spawn `qemu-system-arm` with MPS2-AN505 machine, Cortex-M33 CPU,
+    /// halted at reset (`-S`), GDB server on port 3333.
+    ///
+    /// Returns an error with a clear message if `qemu-system-arm` is not found.
+    pub fn spawn() -> io::Result<Self> {
+        // Try to spawn directly — the error type tells us if the binary is missing.
+        let child = Command::new("qemu-system-arm")
+            .args([
+                "-machine",
+                "mps2-an505",
+                "-cpu",
+                "cortex-m33",
+                "-nographic",
+                "-S",
+                "-gdb",
+                "tcp::3333",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "qemu-system-arm not found on PATH. \
+                         Install QEMU >= 7.0 (e.g., via MSYS2: \
+                         pacman -S mingw-w64-x86_64-qemu, or from qemu.org).",
+                    )
+                } else {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to spawn qemu-system-arm: {e}"),
+                    )
+                }
+            })?;
+
+        Ok(Self { child })
+    }
+}
+
+impl Drop for QemuProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// ============================================================================
+// GdbClient — minimal GDB RSP client over TCP
+// ============================================================================
+
+/// Minimal GDB Remote Serial Protocol client.
+///
+/// Implements per-register read/write (`p`/`P`), memory read/write (`m`/`M`),
+/// and single-step (`s`). Uses the ACK protocol (send `+` after receiving,
+/// expect `+` after sending).
+pub struct GdbClient {
+    stream: TcpStream,
+    buf: Vec<u8>,
+}
+
+impl GdbClient {
+    /// Connect to a GDB server with retry loop.
+    ///
+    /// Retries every 100ms until `timeout` elapses. Sets `TCP_NODELAY`
+    /// (critical on Windows to avoid Nagle delays) and a 10-second read
+    /// timeout to catch QEMU hangs.
+    pub fn connect(addr: &str, timeout: Duration) -> io::Result<Self> {
+        let deadline = Instant::now() + timeout;
+        let mut last_err = io::Error::new(io::ErrorKind::TimedOut, "connect timeout");
+
+        while Instant::now() < deadline {
+            match TcpStream::connect(addr) {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                    return Ok(Self {
+                        stream,
+                        buf: Vec::with_capacity(1024),
+                    });
+                }
+                Err(e) => {
+                    last_err = e;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            last_err.kind(),
+            format!("failed to connect to GDB server at {addr}: {last_err}"),
+        ))
+    }
+
+    /// Query halt reason (`?` packet). Verifies QEMU is stopped.
+    ///
+    /// Expects a `T` (signal with info) or `S` (signal) stop reply.
+    pub fn handshake(&mut self) -> io::Result<()> {
+        let reply = self.send_recv("?")?;
+        if reply.starts_with('T') || reply.starts_with('S') {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected handshake reply: expected T or S stop reply, got '{reply}'"
+                ),
+            ))
+        }
+    }
+
+    /// Read one 32-bit register via `p` packet.
+    ///
+    /// `index` is the GDB register index (0-12 for R0-R12, 13=SP, 14=LR,
+    /// 15=PC, 25=xPSR).
+    pub fn read_reg(&mut self, index: u8) -> io::Result<u32> {
+        let payload = format!("p{:x}", index);
+        let reply = self.send_recv(&payload)?;
+
+        if reply.len() != 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "read_reg({index}): expected 8 hex chars, got {} ('{reply}')",
+                    reply.len()
+                ),
+            ));
+        }
+
+        decode_le_hex32(&reply).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("read_reg({index}): invalid hex in response '{reply}'"),
+            )
+        })
+    }
+
+    /// Write one 32-bit register via `P` packet.
+    ///
+    /// Value is encoded as little-endian hex (target byte order for ARM).
+    pub fn write_reg(&mut self, index: u8, value: u32) -> io::Result<()> {
+        let payload = format!("P{:x}={}", index, encode_le_hex32(value));
+        let reply = self.send_recv(&payload)?;
+
+        if reply != "OK" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("write_reg({index}, {value:#010x}): expected OK, got '{reply}'"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read memory via `m` packet. Returns raw bytes.
+    pub fn read_mem(&mut self, addr: u32, len: usize) -> io::Result<Vec<u8>> {
+        let payload = format!("m{:x},{:x}", addr, len);
+        let reply = self.send_recv(&payload)?;
+
+        if reply.len() != len * 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "read_mem({addr:#010x}, {len}): expected {} hex chars, got {} ('{reply}')",
+                    len * 2,
+                    reply.len()
+                ),
+            ));
+        }
+
+        decode_hex_bytes(&reply).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("read_mem({addr:#010x}, {len}): invalid hex in response '{reply}'"),
+            )
+        })
+    }
+
+    /// Write memory via `M` packet.
+    pub fn write_mem(&mut self, addr: u32, data: &[u8]) -> io::Result<()> {
+        let hex_data = encode_hex_bytes(data);
+        let payload = format!("M{:x},{:x}:{}", addr, data.len(), hex_data);
+        let reply = self.send_recv(&payload)?;
+
+        if reply != "OK" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "write_mem({addr:#010x}, {} bytes): expected OK, got '{reply}'",
+                    data.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Single-step via `s` packet. Blocks until QEMU stops.
+    pub fn step(&mut self) -> io::Result<()> {
+        let reply = self.send_recv("s")?;
+        if reply.starts_with('T') || reply.starts_with('S') {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("step: expected stop reply (T/S), got '{reply}'"),
+            ))
+        }
+    }
+
+    /// Send kill packet. Best-effort — errors are ignored.
+    pub fn kill(&mut self) {
+        let _ = self.send_packet("k");
+    }
+
+    // ========================================================================
+    // Internal packet framing
+    // ========================================================================
+
+    /// Send a GDB RSP packet: `$payload#XX` where XX is the checksum.
+    fn send_packet(&mut self, payload: &str) -> io::Result<()> {
+        let checksum = gdb_checksum(payload.as_bytes());
+        // Format: $payload#XX
+        write!(self.stream, "${}#{:02x}", payload, checksum)?;
+        self.stream.flush()
+    }
+
+    /// Receive a GDB RSP packet. Reads the ACK (`+`), then `$response#XX`,
+    /// verifies checksum, and sends ACK back.
+    ///
+    /// Returns the response payload (without framing).
+    fn recv_packet(&mut self) -> io::Result<String> {
+        // Read bytes until we get the full packet. The stream might deliver
+        // data in chunks, so we accumulate in self.buf.
+        self.buf.clear();
+        let mut one = [0u8; 1];
+
+        // Skip any leading `+` ACK bytes (response to our previous send).
+        loop {
+            self.stream.read_exact(&mut one)?;
+            if one[0] != b'+' {
+                self.buf.push(one[0]);
+                break;
+            }
+        }
+
+        // We should now have `$` as the first byte.
+        if self.buf[0] != b'$' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected '$' packet start, got {:#04x} ('{}')",
+                    self.buf[0], self.buf[0] as char
+                ),
+            ));
+        }
+
+        // Read until `#XX` (hash + 2 hex digits).
+        let mut found_hash = false;
+        let mut checksum_chars = 0u8;
+
+        loop {
+            self.stream.read_exact(&mut one)?;
+            self.buf.push(one[0]);
+
+            if found_hash {
+                checksum_chars += 1;
+                if checksum_chars == 2 {
+                    break;
+                }
+            } else if one[0] == b'#' {
+                found_hash = true;
+            }
+        }
+
+        // Parse: $payload#XX
+        // buf[0] = '$', payload is buf[1..hash_pos], checksum is buf[hash_pos+1..hash_pos+3]
+        let hash_pos = self.buf.iter().rposition(|&b| b == b'#').unwrap();
+        let payload = &self.buf[1..hash_pos];
+        let cksum_str = std::str::from_utf8(&self.buf[hash_pos + 1..])
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "checksum is not valid UTF-8")
+            })?;
+
+        let received_cksum = u8::from_str_radix(cksum_str, 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid checksum hex: '{cksum_str}'"),
+            )
+        })?;
+
+        let expected_cksum = gdb_checksum(payload);
+        if received_cksum != expected_cksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "checksum mismatch: expected {expected_cksum:02x}, got {received_cksum:02x}"
+                ),
+            ));
+        }
+
+        let result = String::from_utf8(payload.to_vec()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "response payload is not valid UTF-8")
+        })?;
+
+        // Send ACK.
+        self.stream.write_all(b"+")?;
+        self.stream.flush()?;
+
+        Ok(result)
+    }
+
+    /// Send a packet and receive the response.
+    fn send_recv(&mut self, payload: &str) -> io::Result<String> {
+        self.send_packet(payload)?;
+        self.recv_packet()
+    }
+}
+
+// ============================================================================
+// Sanity check
+// ============================================================================
+
+/// Verify GDB register indices are correct by reading xPSR and checking
+/// the Thumb bit (bit 24). QEMU's Cortex-M33 always starts in Thumb mode.
+///
+/// This catches register-index mismatches immediately if QEMU changes its
+/// GDB target description layout.
+pub fn sanity_check(gdb: &mut GdbClient) -> io::Result<()> {
+    let xpsr = gdb.read_reg(REG_XPSR)?;
+    if xpsr & 0x0100_0000 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "xPSR T bit (bit 24) not set — got {xpsr:#010x}. \
+                 Register index {REG_XPSR} may be wrong. Check QEMU version (need >= 7.0)."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Helpers — checksum, hex encoding/decoding
+// ============================================================================
+
+/// GDB RSP checksum: sum of all bytes modulo 256.
+fn gdb_checksum(data: &[u8]) -> u8 {
+    data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
+}
+
+/// Encode a u32 as 8 little-endian hex characters.
+///
+/// Example: `0x12345678` -> `"78563412"` (LE byte order: 0x78, 0x56, 0x34, 0x12).
+fn encode_le_hex32(value: u32) -> String {
+    let bytes = value.to_le_bytes();
+    format!("{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3])
+}
+
+/// Decode 8 little-endian hex characters to a u32.
+///
+/// Example: `"78563412"` -> `Some(0x12345678)`.
+fn decode_le_hex32(hex: &str) -> Option<u32> {
+    if hex.len() != 8 {
+        return None;
+    }
+    let b0 = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let b1 = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b2 = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    let b3 = u8::from_str_radix(&hex[6..8], 16).ok()?;
+    Some(u32::from_le_bytes([b0, b1, b2, b3]))
+}
+
+/// Encode a byte slice as hex string (2 chars per byte).
+fn encode_hex_bytes(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for &b in data {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Decode a hex string to bytes (2 hex chars per byte).
+fn decode_hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&hex[i..i + 2], 16).ok()?);
+    }
+    Some(bytes)
+}
+
+// ============================================================================
+// Unit tests — helpers only (GDB client requires a running QEMU instance)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- gdb_checksum --
+
+    #[test]
+    fn checksum_empty() {
+        assert_eq!(gdb_checksum(b""), 0);
+    }
+
+    #[test]
+    fn checksum_question_mark() {
+        // '?' = 0x3F
+        assert_eq!(gdb_checksum(b"?"), 0x3F);
+    }
+
+    #[test]
+    fn checksum_known_value() {
+        // "g" = 0x67
+        assert_eq!(gdb_checksum(b"g"), 0x67);
+    }
+
+    #[test]
+    fn checksum_wraps_at_256() {
+        // Two bytes that sum > 255: 0xFF + 0x01 = 0x100 -> wraps to 0x00
+        assert_eq!(gdb_checksum(&[0xFF, 0x01]), 0x00);
+    }
+
+    #[test]
+    fn checksum_multi_byte() {
+        // "p0" = 0x70 + 0x30 = 0xA0
+        assert_eq!(gdb_checksum(b"p0"), 0xA0);
+    }
+
+    // -- encode_le_hex32 / decode_le_hex32 --
+
+    #[test]
+    fn roundtrip_zero() {
+        let hex = encode_le_hex32(0);
+        assert_eq!(hex, "00000000");
+        assert_eq!(decode_le_hex32(&hex), Some(0));
+    }
+
+    #[test]
+    fn roundtrip_one() {
+        let hex = encode_le_hex32(1);
+        assert_eq!(hex, "01000000");
+        assert_eq!(decode_le_hex32(&hex), Some(1));
+    }
+
+    #[test]
+    fn roundtrip_max() {
+        let hex = encode_le_hex32(0xFFFF_FFFF);
+        assert_eq!(hex, "ffffffff");
+        assert_eq!(decode_le_hex32(&hex), Some(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn roundtrip_thumb_bit() {
+        // xPSR with T bit set: 0x01000000
+        let hex = encode_le_hex32(0x0100_0000);
+        assert_eq!(hex, "00000001");
+        assert_eq!(decode_le_hex32(&hex), Some(0x0100_0000));
+    }
+
+    #[test]
+    fn roundtrip_mixed() {
+        let hex = encode_le_hex32(0x12345678);
+        assert_eq!(hex, "78563412");
+        assert_eq!(decode_le_hex32(&hex), Some(0x12345678));
+    }
+
+    #[test]
+    fn decode_wrong_length() {
+        assert_eq!(decode_le_hex32("1234"), None);
+        assert_eq!(decode_le_hex32("123456789"), None);
+    }
+
+    #[test]
+    fn decode_invalid_hex() {
+        assert_eq!(decode_le_hex32("ZZZZZZZZ"), None);
+    }
+
+    // -- encode_hex_bytes / decode_hex_bytes --
+
+    #[test]
+    fn hex_bytes_empty() {
+        assert_eq!(encode_hex_bytes(&[]), "");
+        assert_eq!(decode_hex_bytes(""), Some(vec![]));
+    }
+
+    #[test]
+    fn hex_bytes_roundtrip() {
+        let data = vec![0x00, 0xFF, 0xAB, 0x12];
+        let hex = encode_hex_bytes(&data);
+        assert_eq!(hex, "00ffab12");
+        assert_eq!(decode_hex_bytes(&hex), Some(data));
+    }
+
+    #[test]
+    fn hex_bytes_odd_length_fails() {
+        assert_eq!(decode_hex_bytes("abc"), None);
+    }
+
+    #[test]
+    fn hex_bytes_invalid_chars_fails() {
+        assert_eq!(decode_hex_bytes("zz"), None);
+    }
+
+    // -- encode_le_hex32 byte order --
+
+    #[test]
+    fn le_hex_byte_order() {
+        // 0xDEADBEEF in LE bytes: EF, BE, AD, DE
+        let hex = encode_le_hex32(0xDEAD_BEEF);
+        assert_eq!(hex, "efbeadde");
+    }
+}

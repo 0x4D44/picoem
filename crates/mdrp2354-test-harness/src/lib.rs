@@ -3,6 +3,8 @@
 // Validates Thumb-2 instruction semantics by executing identical instructions
 // in both QEMU (Cortex-M33 model) and our emulator, then diffing state.
 
+pub mod gdb_client;
+
 // Re-export emulator types the harness needs.
 pub use mdrp2354::{Bus, CortexM33};
 
