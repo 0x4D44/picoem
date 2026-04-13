@@ -14,6 +14,11 @@ pub struct Ppb {
     pub bfar: u32,      // Bus Fault Address (0xE000ED38)
     pub cpacr: u32,     // Coprocessor Access Control (0xE000ED88)
     pub icsr: u32,      // Interrupt Control/State (0xE000ED04)
+
+    // SAU (0xE000EDD0-0xE000EDE0)
+    pub sau_ctrl: u32,                // SAU Control (bit 0 = enable, bit 1 = ALLNS)
+    pub sau_rnr: u32,                 // Region Number Register (selects active region)
+    pub sau_regions: [(u32, u32); 8], // 8 regions: (RBAR, RLAR) pairs
 }
 
 impl Default for Ppb {
@@ -31,6 +36,9 @@ impl Default for Ppb {
             bfar: 0,
             cpacr: 0x00F0_0000, // CP10/11 (FPU) full access
             icsr: 0,
+            sau_ctrl: 0,
+            sau_rnr: 0,
+            sau_regions: [(0, 0); 8],
         }
     }
 }
@@ -111,6 +119,23 @@ impl Ppb {
             // CPACR
             0xED88 => self.cpacr,
 
+            // SAU_CTRL
+            0xEDD0 => self.sau_ctrl,
+            // SAU_TYPE: 8 regions (RP2350 has 8)
+            0xEDD4 => 8,
+            // SAU_RNR
+            0xEDD8 => self.sau_rnr,
+            // SAU_RBAR: bits [4:0] are RES0
+            0xEDDC => {
+                let idx = (self.sau_rnr & 0x7) as usize;
+                self.sau_regions[idx].0 & !0x1F
+            }
+            // SAU_RLAR
+            0xEDE0 => {
+                let idx = (self.sau_rnr & 0x7) as usize;
+                self.sau_regions[idx].1
+            }
+
             // Unknown PPB register
             _ => 0,
         }
@@ -168,6 +193,23 @@ impl Ppb {
 
             // CPACR
             0xED88 => self.cpacr = val,
+
+            // SAU_CTRL
+            0xEDD0 => self.sau_ctrl = val,
+            // SAU_TYPE: read-only, ignore writes
+            0xEDD4 => {}
+            // SAU_RNR
+            0xEDD8 => self.sau_rnr = val & 0x7,
+            // SAU_RBAR
+            0xEDDC => {
+                let idx = (self.sau_rnr & 0x7) as usize;
+                self.sau_regions[idx].0 = val;
+            }
+            // SAU_RLAR
+            0xEDE0 => {
+                let idx = (self.sau_rnr & 0x7) as usize;
+                self.sau_regions[idx].1 = val;
+            }
 
             // Unknown PPB register — ignore
             _ => {}
@@ -262,5 +304,64 @@ mod tests {
         let ppb = Ppb::default();
         // SYST_CSR at 0xE000E010
         assert_eq!(ppb.read32(0xE000_E010), 0);
+    }
+
+    #[test]
+    fn test_sau_type_returns_8() {
+        let ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_EDD4), 8);
+    }
+
+    #[test]
+    fn test_sau_ctrl_roundtrip() {
+        let mut ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_EDD0), 0);
+        ppb.write32(0xE000_EDD0, 1);
+        assert_eq!(ppb.read32(0xE000_EDD0), 1);
+    }
+
+    #[test]
+    fn test_sau_rnr_masks_to_3_bits() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EDD8, 0xFF);
+        assert_eq!(ppb.read32(0xE000_EDD8), 7);
+    }
+
+    #[test]
+    fn test_sau_region_roundtrip() {
+        let mut ppb = Ppb::default();
+        // Select region 3
+        ppb.write32(0xE000_EDD8, 3);
+        // Write RBAR and RLAR
+        ppb.write32(0xE000_EDDC, 0x1000_4787);
+        ppb.write32(0xE000_EDE0, 0x0000_7FE1);
+        // Read back: RBAR has low 5 bits masked
+        assert_eq!(ppb.read32(0xE000_EDDC), 0x1000_4780);
+        assert_eq!(ppb.read32(0xE000_EDE0), 0x0000_7FE1);
+        // Other regions remain zero
+        ppb.write32(0xE000_EDD8, 0);
+        assert_eq!(ppb.read32(0xE000_EDDC), 0);
+        assert_eq!(ppb.read32(0xE000_EDE0), 0);
+    }
+
+    #[test]
+    fn test_sau_type_write_ignored() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EDD4, 0xDEAD);
+        assert_eq!(ppb.read32(0xE000_EDD4), 8);
+    }
+
+    #[test]
+    fn test_sau_bootrom_region7_setup() {
+        // Reproduces the bootrom's SAU setup: region 7 with
+        // RBAR=0x4787, RLAR=0x7FE1 (Secure, enabled)
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EDD0, 1);  // SAU_CTRL = enable
+        ppb.write32(0xE000_EDD8, 7);  // SAU_RNR = region 7
+        ppb.write32(0xE000_EDDC, 0x4787); // SAU_RBAR
+        ppb.write32(0xE000_EDE0, 0x7FE1); // SAU_RLAR
+        // Verify readback
+        assert_eq!(ppb.read32(0xE000_EDDC), 0x4780); // RBAR low 5 bits masked
+        assert_eq!(ppb.read32(0xE000_EDE0), 0x7FE1);
     }
 }

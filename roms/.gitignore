@@ -1,0 +1,5 @@
+# Binary ROM files - download via gh release download from raspberrypi/pico-bootrom-rp2350
+*.bin
+*.elf
+*.dis
+*.map

@@ -28,6 +28,10 @@ pub struct Registers {
     pub msp_ns: u32,
     /// Non-secure PSP (TrustZone — stub in v1).
     pub psp_ns: u32,
+    /// Main Stack Pointer Limit (Armv8-M).
+    pub msplim: u32,
+    /// Process Stack Pointer Limit (Armv8-M).
+    pub psplim: u32,
     /// FPU single-precision registers S0-S31.
     pub s: [f32; 32],
     /// FP status/control register.
@@ -48,6 +52,8 @@ impl Registers {
             psp: 0,
             msp_ns: 0,
             psp_ns: 0,
+            msplim: 0,
+            psplim: 0,
             s: [0.0; 32],
             fpscr: 0,
         };

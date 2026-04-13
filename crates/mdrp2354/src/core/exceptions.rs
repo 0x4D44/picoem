@@ -188,4 +188,66 @@ impl CortexM33 {
             }
         }
     }
+
+    // --- TT (Test Target) instruction -----------------------------------------
+
+    /// Execute a TT instruction: look up SAU region attributes for an address.
+    /// Returns the TT result register value per ARMv8-M Architecture Reference.
+    ///
+    /// Result bits:
+    ///   [7:0]   SREGION — SAU region number (valid when SRVALID=1)
+    ///   [15:8]  IREGION — MPU region number (valid when IRVALID=1)
+    ///   [16]    SRVALID — SAU region match found
+    ///   [17]    reserved
+    ///   [18]    R  — readable from current security state
+    ///   [19]    RW — read-write from current security state
+    ///   [20]    NSR  — NS readable
+    ///   [21]    NSRW — NS read-write
+    ///   [22]    S  — Secure
+    ///   [24]    IRVALID — MPU region valid (stub: 0, no MPU lookup)
+    pub(crate) fn execute_tt(addr: u32, bus: &Bus) -> u32 {
+        let ppb = &bus.ppb[bus.active_core()];
+
+        // If SAU is disabled, everything is Secure with full access
+        if ppb.sau_ctrl & 1 == 0 {
+            // S=1, NSRW=1, NSR=1, RW=1, R=1, no region match
+            return (1 << 22) | (1 << 21) | (1 << 20) | (1 << 19) | (1 << 18);
+        }
+
+        // Look up address in SAU regions
+        for i in 0..8 {
+            let (rbar, rlar) = ppb.sau_regions[i];
+            let enabled = rlar & 1 != 0;
+            if !enabled {
+                continue;
+            }
+
+            let base = rbar & !0x1F; // bits [31:5]
+            let limit = rlar | 0x1F; // bits [31:5] filled to 32-byte boundary
+            let nsc = (rlar >> 1) & 1; // Non-Secure Callable
+
+            if addr >= base && addr <= limit {
+                let secure = nsc == 0;
+                let region_num = i as u32;
+
+                return (region_num & 0xFF)                       // SREGION
+                     | (1 << 16)                                  // SRVALID
+                     | (if secure { 1 << 22 } else { 0 })        // S
+                     | (1 << 21)                                  // NSRW
+                     | (1 << 20)                                  // NSR
+                     | (1 << 19)                                  // RW
+                     | (1 << 18);                                 // R
+            }
+        }
+
+        // Address not in any SAU region
+        let allns = (ppb.sau_ctrl >> 1) & 1;
+        if allns != 0 {
+            // ALLNS=1: unmatched addresses are Non-Secure
+            (1 << 21) | (1 << 20) | (1 << 19) | (1 << 18)
+        } else {
+            // ALLNS=0: unmatched addresses are Secure
+            (1 << 22) | (1 << 21) | (1 << 20) | (1 << 19) | (1 << 18)
+        }
+    }
 }

@@ -695,6 +695,14 @@ impl CortexM33 {
             return 2;
         }
         if hw0 & 0xFFF0 == 0xE840 {
+            // TT family: hw1[15:12]=0xF, hw1[7:0]=0x00
+            if (hw1 >> 12) & 0xF == 0xF && hw1 & 0xFF == 0x00 {
+                let rn = (hw0 & 0xF) as usize;
+                let rd = ((hw1 >> 8) & 0xF) as usize;
+                let addr = self.regs.r[rn];
+                self.regs.r[rd] = Self::execute_tt(addr, bus);
+                return 1;
+            }
             // STREX (treat as normal STR for Phase 1, Rd gets 0 = success)
             let rn = (hw0 & 0xF) as usize;
             let rt = ((hw1 >> 12) & 0xF) as usize;
@@ -883,6 +891,10 @@ impl CortexM33 {
                     self.regs.r[13] = val;
                 }
             }
+            // MSPLIM
+            10 => self.regs.msplim = val & !0x7, // 8-byte aligned
+            // PSPLIM
+            11 => self.regs.psplim = val & !0x7, // 8-byte aligned
             // PRIMASK
             16 => {
                 self.regs.primask = val & 1;
@@ -933,6 +945,10 @@ impl CortexM33 {
             8 => self.regs.msp,
             // PSP
             9 => self.regs.psp,
+            // MSPLIM
+            10 => self.regs.msplim,
+            // PSPLIM
+            11 => self.regs.psplim,
             // PRIMASK
             16 => self.regs.primask & 1,
             // BASEPRI
@@ -1164,14 +1180,14 @@ impl CortexM33 {
                 // SDIV
                 let a = self.regs.r[rn] as i32;
                 let b = self.regs.r[rm] as i32;
-                self.regs.r[rd_lo] = if b == 0 { 0 } else { a.wrapping_div(b) as u32 };
+                self.regs.r[rd_hi] = if b == 0 { 0 } else { a.wrapping_div(b) as u32 };
                 4 // placeholder
             }
             (0b011, 0b1111) => {
                 // UDIV
                 let a = self.regs.r[rn];
                 let b = self.regs.r[rm];
-                self.regs.r[rd_lo] = if b == 0 { 0 } else { a / b };
+                self.regs.r[rd_hi] = if b == 0 { 0 } else { a / b };
                 4 // placeholder
             }
             // SMLALBB/BT/TB/TT: op1=100, op2=10xx
@@ -1298,6 +1314,12 @@ impl CortexM33 {
                 let rn = (hw0 & 0xF) as usize;
                 let op1_65 = ((hw0 >> 5) & 0x3) as u8;
                 let op2_54 = ((hw1 >> 4) & 0x3) as u8;
+                // Saturate on overflow: if the wrapping result is negative,
+                // positive overflow occurred (clamp to i32::MAX); if non-negative,
+                // negative overflow occurred (clamp to i32::MIN).
+                let saturate = |val: i32, ov: bool| -> i32 {
+                    if ov { if val < 0 { i32::MAX } else { i32::MIN } } else { val }
+                };
                 match (op1_65, op2_54) {
                     (0b00, 0b00) => {
                         // QADD: Rd = saturate(Rn + Rm)
@@ -1305,38 +1327,40 @@ impl CortexM33 {
                         let b = self.regs.r[rm] as i32;
                         let (result, overflow) = a.overflowing_add(b);
                         if overflow { self.regs.set_flag_q(); }
-                        self.regs.r[rd] = result as u32;
+                        self.regs.r[rd] = saturate(result, overflow) as u32;
                         1
                     }
                     (0b00, 0b01) => {
-                        // QDADD: Rd = saturate(Rn + saturate(2*Rm))
+                        // QDADD: Rd = saturate(Rm + saturate(2*Rn))
                         let rn_val = self.regs.r[rn] as i32;
                         let rm_val = self.regs.r[rm] as i32;
-                        let (doubled, ov1) = rm_val.overflowing_add(rm_val);
+                        let (doubled, ov1) = rn_val.overflowing_add(rn_val);
                         if ov1 { self.regs.set_flag_q(); }
-                        let (result, ov2) = rn_val.overflowing_add(doubled);
+                        let doubled = saturate(doubled, ov1);
+                        let (result, ov2) = rm_val.overflowing_add(doubled);
                         if ov2 { self.regs.set_flag_q(); }
-                        self.regs.r[rd] = result as u32;
+                        self.regs.r[rd] = saturate(result, ov2) as u32;
                         1
                     }
                     (0b00, 0b10) => {
-                        // QSUB: Rd = saturate(Rn - Rm)
-                        let a = self.regs.r[rn] as i32;
-                        let b = self.regs.r[rm] as i32;
+                        // QSUB: Rd = saturate(Rm - Rn)
+                        let a = self.regs.r[rm] as i32;
+                        let b = self.regs.r[rn] as i32;
                         let (result, overflow) = a.overflowing_sub(b);
                         if overflow { self.regs.set_flag_q(); }
-                        self.regs.r[rd] = result as u32;
+                        self.regs.r[rd] = saturate(result, overflow) as u32;
                         1
                     }
                     (0b00, 0b11) => {
-                        // QDSUB: Rd = saturate(Rn - saturate(2*Rm))
+                        // QDSUB: Rd = saturate(Rm - saturate(2*Rn))
                         let rn_val = self.regs.r[rn] as i32;
                         let rm_val = self.regs.r[rm] as i32;
-                        let (doubled, ov1) = rm_val.overflowing_add(rm_val);
+                        let (doubled, ov1) = rn_val.overflowing_add(rn_val);
                         if ov1 { self.regs.set_flag_q(); }
-                        let (result, ov2) = rn_val.overflowing_sub(doubled);
+                        let doubled = saturate(doubled, ov1);
+                        let (result, ov2) = rm_val.overflowing_sub(doubled);
                         if ov2 { self.regs.set_flag_q(); }
-                        self.regs.r[rd] = result as u32;
+                        self.regs.r[rd] = saturate(result, ov2) as u32;
                         1
                     }
                     (0b01, 0b00) => {
@@ -1491,17 +1515,31 @@ impl CortexM33 {
     fn thumb32_parallel_add_sub(
         &mut self, rd: usize, rn: usize, rm: usize, par_op1: u8, par_op2: u8,
     ) -> u32 {
+        // par_op1 = hw0[6:4] = base operation (ADD8/ADD16/ASX/SAX/SUB8/SUB16)
+        // par_op2 = hw1[6:4] = modifier (signed/Q/halving/unsigned/UQ/UH)
         let a = self.regs.r[rn];
         let b = self.regs.r[rm];
-        match par_op1 {
-            0b001 => self.parallel_signed_16(rd, a, b, par_op2, false, false),
-            0b010 => self.parallel_signed_16(rd, a, b, par_op2, true, false),
-            0b110 => self.parallel_signed_16(rd, a, b, par_op2, false, true),
-            0b101 => self.parallel_unsigned_16(rd, a, b, par_op2, false, false),
-            0b011 => self.parallel_unsigned_16(rd, a, b, par_op2, true, false),
-            0b111 => self.parallel_unsigned_16(rd, a, b, par_op2, false, true),
-            0b000 => self.parallel_signed_8(rd, a, b, par_op2),
-            0b100 => self.parallel_unsigned_8(rd, a, b, par_op2),
+        match par_op2 {
+            // Signed variants
+            0b000 => match par_op1 {
+                0b001 | 0b010 | 0b011 | 0b101 => self.parallel_signed_16(rd, a, b, par_op1, false, false),
+                0b000 | 0b100 => self.parallel_signed_8(rd, a, b, par_op1),
+                _ => 1,
+            },
+            // Q-saturating signed (16-bit only)
+            0b001 => self.parallel_signed_16(rd, a, b, par_op1, true, false),
+            // Halving signed (16-bit only)
+            0b010 => self.parallel_signed_16(rd, a, b, par_op1, false, true),
+            // Unsigned variants
+            0b100 => match par_op1 {
+                0b001 | 0b010 | 0b011 | 0b101 => self.parallel_unsigned_16(rd, a, b, par_op1, false, false),
+                0b000 | 0b100 => self.parallel_unsigned_8(rd, a, b, par_op1),
+                _ => 1,
+            },
+            // Q-saturating unsigned (16-bit only)
+            0b101 => self.parallel_unsigned_16(rd, a, b, par_op1, true, false),
+            // Halving unsigned (16-bit only)
+            0b110 => self.parallel_unsigned_16(rd, a, b, par_op1, false, true),
             _ => 1,
         }
     }
@@ -1514,10 +1552,10 @@ impl CortexM33 {
         let b_lo = b as i16 as i32;
         let b_hi = (b >> 16) as i16 as i32;
         let (r_lo, r_hi) = match op {
-            0b000 => (a_lo + b_lo, a_hi + b_hi),
-            0b001 => (a_lo - b_hi, a_hi + b_lo),
-            0b010 => (a_lo + b_hi, a_hi - b_lo),
-            0b011 => (a_lo - b_lo, a_hi - b_hi),
+            0b001 => (a_lo + b_lo, a_hi + b_hi),       // ADD16
+            0b010 => (a_lo - b_hi, a_hi + b_lo),       // ASX
+            0b011 => (a_lo + b_hi, a_hi - b_lo),       // SAX
+            0b101 => (a_lo - b_lo, a_hi - b_hi),       // SUB16
             _ => return 1,
         };
         let (lo, hi) = if sat {
@@ -1544,10 +1582,10 @@ impl CortexM33 {
         let b_hi = (b >> 16) as u32;
         // Use i32 for subtraction results to handle borrow
         let (r_lo_i, r_hi_i): (i32, i32) = match op {
-            0b000 => (a_lo as i32 + b_lo as i32, a_hi as i32 + b_hi as i32),
-            0b001 => (a_lo as i32 - b_hi as i32, a_hi as i32 + b_lo as i32),
-            0b010 => (a_lo as i32 + b_hi as i32, a_hi as i32 - b_lo as i32),
-            0b011 => (a_lo as i32 - b_lo as i32, a_hi as i32 - b_hi as i32),
+            0b001 => (a_lo as i32 + b_lo as i32, a_hi as i32 + b_hi as i32),  // ADD16
+            0b010 => (a_lo as i32 - b_hi as i32, a_hi as i32 + b_lo as i32),  // ASX
+            0b011 => (a_lo as i32 + b_hi as i32, a_hi as i32 - b_lo as i32),  // SAX
+            0b101 => (a_lo as i32 - b_lo as i32, a_hi as i32 - b_hi as i32),  // SUB16
             _ => return 1,
         };
         let (lo, hi) = if sat {
@@ -1561,7 +1599,7 @@ impl CortexM33 {
             let mut ge = self.regs.ge_flags();
             // GE set if no borrow (result >= 0x10000 for add, >= 0 for sub)
             match op {
-                0b000 => {
+                0b001 => {
                     if r_lo_i >= 0x10000 { ge |= 0x3; } else { ge &= !0x3; }
                     if r_hi_i >= 0x10000 { ge |= 0xC; } else { ge &= !0xC; }
                 }

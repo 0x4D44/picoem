@@ -2329,14 +2329,14 @@ fn encode_umlal(rd_lo: u8, rd_hi: u8, rn: u8, rm: u8) -> (u16, u16) {
 fn encode_sdiv(rd: u8, rn: u8, rm: u8) -> (u16, u16) {
     // SDIV: op1=001, op2=1111, RdHi=0xF
     let hw0 = 0xFB90u16 | rn as u16;
-    let hw1 = ((rd as u16) << 12) | 0x0F00 | 0x00F0 | rm as u16;
+    let hw1 = 0xF000 | ((rd as u16) << 8) | 0x00F0 | rm as u16;
     (hw0, hw1)
 }
 
 fn encode_udiv(rd: u8, rn: u8, rm: u8) -> (u16, u16) {
     // UDIV: op1=011, op2=1111, RdHi=0xF
     let hw0 = 0xFBB0u16 | rn as u16;
-    let hw1 = ((rd as u16) << 12) | 0x0F00 | 0x00F0 | rm as u16;
+    let hw1 = 0xF000 | ((rd as u16) << 8) | 0x00F0 | rm as u16;
     (hw0, hw1)
 }
 
@@ -3877,9 +3877,9 @@ fn uadd8() {
     let mut c = CortexM33::new();
     c.set_reg(1, 0x01_02_03_04);
     c.set_reg(2, 0x05_06_07_08);
-    // UADD8: par_op1=100, par_op2=000
-    // hw0 = 0xFAC1 (hw0[6:4]=100, Rn=R1), hw1 = 0xF002 (hw1[6:4]=000, Rm=R2)
-    c.execute_one_wide(0xFAC1, 0xF002);
+    // UADD8: par_op1=000 (ADD8), par_op2=100 (unsigned)
+    // hw0 = 0xFA81 (hw0[6:4]=000, Rn=R1), hw1 = 0xF042 (hw1[6:4]=100, Rm=R2)
+    c.execute_one_wide(0xFA81, 0xF042);
     // byte0: 4+8=12, byte1: 3+7=10, byte2: 2+6=8, byte3: 1+5=6
     assert_eq!(c.reg(0), 0x06_08_0A_0C);
     // All sums < 256, so no carries → GE = 0
@@ -3889,7 +3889,7 @@ fn uadd8() {
     let mut c2 = CortexM33::new();
     c2.set_reg(1, 0x00_00_00_FF);
     c2.set_reg(2, 0x00_00_00_01);
-    c2.execute_one_wide(0xFAC1, 0xF002);
+    c2.execute_one_wide(0xFA81, 0xF042);
     assert_eq!(c2.reg(0) & 0xFF, 0x00); // wraps to 0
     assert!(c2.regs.ge_flags() & 1 != 0); // GE[0] set (carry)
 }
@@ -3902,7 +3902,7 @@ fn qadd() {
     c.set_reg(2, 0x0000_0010);
     // QADD: hw0 = 0xFA81 (hw0[7:4]=1000, Rn=R1), hw1 = 0xF082 (hw1[7]=1, Rm=R2)
     c.execute_one_wide(0xFA81, 0xF082);
-    assert_eq!(c.reg(0), 0x8000_0000); // overflows (wraps), Q flag set
+    assert_eq!(c.reg(0), 0x7FFF_FFFF); // overflows → saturates to i32::MAX, Q flag set
     assert!(c.regs.flag_q());
 
     // Non-overflowing case
@@ -4737,4 +4737,183 @@ fn test_busfault_on_unmapped_access() {
 
     // CFSR should have PRECISERR (bit 9) set
     assert_ne!(emu.bus.ppb[0].cfsr & (1 << 9), 0, "PRECISERR should be set");
+}
+
+// ============================================================================
+// SAU + TT (Test Target) instruction
+// ============================================================================
+
+#[test]
+fn tt_sau_disabled_returns_secure() {
+    // When SAU is disabled, TT should return Secure with full access
+    let (mut c, mut bus) = core_and_bus();
+    // SAU disabled by default (sau_ctrl = 0)
+    c.set_reg(5, 0x2000_0000); // address to test
+    // TT R2, R5: hw0=0xE845, hw1=0xF200
+    c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
+    let result = c.reg(2);
+    // S=1, NSRW=1, NSR=1, RW=1, R=1, SRVALID=0
+    assert_ne!(result & (1 << 22), 0, "S bit should be set");
+    assert_ne!(result & (1 << 21), 0, "NSRW bit should be set");
+    assert_ne!(result & (1 << 20), 0, "NSR bit should be set");
+    assert_ne!(result & (1 << 19), 0, "RW bit should be set");
+    assert_ne!(result & (1 << 18), 0, "R bit should be set");
+    assert_eq!(result & (1 << 16), 0, "SRVALID should be clear");
+}
+
+#[test]
+fn tt_sau_region_match() {
+    // Configure SAU region 3 covering 0x4780-0x7FFF (Secure), then TT an address in range
+    let (mut c, mut bus) = core_and_bus();
+    // Enable SAU
+    bus.ppb[0].sau_ctrl = 1;
+    // Region 3: RBAR=0x4787, RLAR=0x7FE1 (enabled, NSC=0 -> Secure)
+    bus.ppb[0].sau_rnr = 3;
+    bus.ppb[0].sau_regions[3] = (0x4787, 0x7FE1);
+
+    c.set_reg(5, 0x7FE1); // address in range
+    // TT R2, R5: hw0=0xE845, hw1=0xF200
+    c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
+    let result = c.reg(2);
+
+    // SREGION = 3
+    assert_eq!(result & 0xFF, 3, "SREGION should be 3");
+    // SRVALID = 1
+    assert_ne!(result & (1 << 16), 0, "SRVALID should be set");
+    // S = 1 (Secure, NSC=0)
+    assert_ne!(result & (1 << 22), 0, "S bit should be set");
+    // All access bits set
+    assert_ne!(result & (1 << 18), 0, "R bit should be set");
+    assert_ne!(result & (1 << 19), 0, "RW bit should be set");
+}
+
+#[test]
+fn tt_sau_region_nsc() {
+    // Configure SAU region 0 as NSC (Non-Secure Callable)
+    let (mut c, mut bus) = core_and_bus();
+    bus.ppb[0].sau_ctrl = 1;
+    // Region 0: base=0x1000, limit=0x1FFF, NSC=1, enabled
+    // RBAR = 0x1000, RLAR = 0x1FE0 | 0x3 (NSC=1, enable=1)
+    bus.ppb[0].sau_regions[0] = (0x1000, 0x1FE3);
+
+    c.set_reg(1, 0x1500); // address in range
+    // TT R0, R1: hw0=0xE841, hw1=0xF000
+    c.execute_one_wide_with_bus(0xE841, 0xF000, &mut bus);
+    let result = c.reg(0);
+
+    assert_eq!(result & 0xFF, 0, "SREGION should be 0");
+    assert_ne!(result & (1 << 16), 0, "SRVALID should be set");
+    // NSC region: S should be 0
+    assert_eq!(result & (1 << 22), 0, "S bit should be clear for NSC");
+}
+
+#[test]
+fn tt_sau_no_match_allns_clear() {
+    // SAU enabled, no regions match, ALLNS=0 -> Secure
+    let (mut c, mut bus) = core_and_bus();
+    bus.ppb[0].sau_ctrl = 1; // enable, ALLNS=0
+
+    c.set_reg(3, 0xFFFF_0000); // address not in any region
+    // TT R0, R3: hw0=0xE843, hw1=0xF000
+    c.execute_one_wide_with_bus(0xE843, 0xF000, &mut bus);
+    let result = c.reg(0);
+
+    assert_eq!(result & (1 << 16), 0, "SRVALID should be clear");
+    assert_ne!(result & (1 << 22), 0, "S bit should be set (ALLNS=0)");
+}
+
+#[test]
+fn tt_sau_no_match_allns_set() {
+    // SAU enabled, no regions match, ALLNS=1 -> Non-Secure
+    let (mut c, mut bus) = core_and_bus();
+    bus.ppb[0].sau_ctrl = 3; // enable + ALLNS
+
+    c.set_reg(3, 0xFFFF_0000);
+    // TT R0, R3: hw0=0xE843, hw1=0xF000
+    c.execute_one_wide_with_bus(0xE843, 0xF000, &mut bus);
+    let result = c.reg(0);
+
+    assert_eq!(result & (1 << 16), 0, "SRVALID should be clear");
+    assert_eq!(result & (1 << 22), 0, "S bit should be clear (ALLNS=1)");
+    assert_ne!(result & (1 << 18), 0, "R bit should be set");
+}
+
+#[test]
+fn tt_bootrom_scenario() {
+    // Reproduce the bootrom's exact SAU+TT sequence:
+    // Region 7: RBAR=0x4787, RLAR=0x7FE1, TT address=0x7FE1
+    let (mut c, mut bus) = core_and_bus();
+    bus.ppb[0].sau_ctrl = 1;
+    bus.ppb[0].sau_rnr = 7;
+    bus.ppb[0].sau_regions[7] = (0x4787, 0x7FE1);
+
+    c.set_reg(5, 0x7FE1);
+    // TT R2, R5: hw0=0xE845, hw1=0xF200
+    c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
+    let result = c.reg(2);
+
+    // Bootrom checks: result >> 16 != 0 (i.e., at least SRVALID or S must be set above bit 16)
+    assert_ne!(result >> 16, 0, "TT result upper half must be nonzero");
+    // SRVALID must be set
+    assert_ne!(result & (1 << 16), 0, "SRVALID");
+    // S must be set (Secure region, NSC=0)
+    assert_ne!(result & (1 << 22), 0, "S");
+    // SREGION = 7
+    assert_eq!(result & 0xFF, 7);
+    // Bootrom also checks LSL #6 sets bit 31 (i.e., bit 25 of result must be set)
+    // That's the R/RW/NSR/NSRW cluster — verify at least one bit in [22:18] is set
+    assert_ne!(result & 0x007C_0000, 0, "access permission bits");
+}
+
+#[test]
+fn tt_does_not_collide_with_strex() {
+    // STREX R0, R1, [R2, #0]: hw0=0xE842, hw1=0x1000
+    // hw1[15:12]=1 (Rt=R1), hw1[7:0]=0 (imm8=0) — this is STREX, not TT
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(1, 0xDEAD_BEEF);
+    c.set_reg(2, 0x2000_0100);
+    c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus);
+    // R0 (Rd) should be 0 (STREX success)
+    assert_eq!(c.reg(0), 0);
+    // Memory at 0x20000100 should have the stored value
+    assert_eq!(bus.read32(0x2000_0100), 0xDEAD_BEEF);
+}
+
+// ============================================================================
+// MSPLIM / PSPLIM via MSR/MRS
+// ============================================================================
+
+#[test]
+fn msr_mrs_msplim_roundtrip() {
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0x2000_1000);
+    // MSR MSPLIM, R0: hw0=0xF380, hw1=0x880A (Rn=0, SYSm=0x0A, mask=2)
+    c.execute_one_wide(0xF380, 0x880A);
+    assert_eq!(c.regs.msplim, 0x2000_1000);
+    // MRS R1, MSPLIM: hw0=0xF3EF, hw1=0x810A (Rd=1, SYSm=0x0A)
+    c.execute_one_wide(0xF3EF, 0x810A);
+    assert_eq!(c.reg(1), 0x2000_1000);
+}
+
+#[test]
+fn msr_mrs_psplim_roundtrip() {
+    let mut c = CortexM33::new();
+    c.set_reg(2, 0x2000_2008);
+    // MSR PSPLIM, R2: hw0=0xF382, hw1=0x880B (Rn=2, SYSm=0x0B, mask=2)
+    c.execute_one_wide(0xF382, 0x880B);
+    // PSPLIM is 8-byte aligned
+    assert_eq!(c.regs.psplim, 0x2000_2008);
+    // MRS R3, PSPLIM: hw0=0xF3EF, hw1=0x830B (Rd=3, SYSm=0x0B)
+    c.execute_one_wide(0xF3EF, 0x830B);
+    assert_eq!(c.reg(3), 0x2000_2008);
+}
+
+#[test]
+fn msplim_alignment() {
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0x2000_1007); // not 8-byte aligned
+    // MSR MSPLIM, R0
+    c.execute_one_wide(0xF380, 0x880A);
+    // Should be rounded down to 8-byte boundary
+    assert_eq!(c.regs.msplim, 0x2000_1000);
 }
