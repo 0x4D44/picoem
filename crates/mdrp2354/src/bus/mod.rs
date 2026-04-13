@@ -58,6 +58,13 @@ pub struct Bus {
     pub gpio_oe: u32,
     /// SIO GPIO input register (offset 0x004, always 0 — no external pin model).
     pub gpio_in: u32,
+    /// SIO GPIO_HI_IN (offset 0x008). Upper QSPI GPIO pins.
+    /// When flash is loaded, returns pseudo-random noise to simulate
+    /// QSPI pin activity (the bootrom samples this to detect flash).
+    gpio_hi_noise_state: u32,
+    /// XIP cache window offset: maps XIP SRAM reads (0x1C00_0000)
+    /// to flash content at this byte offset. Set by QMI M0_RFMT writes.
+    xip_cache_offset: u32,
 }
 
 impl Bus {
@@ -83,6 +90,8 @@ impl Bus {
             gpio_out: 0,
             gpio_oe: 0,
             gpio_in: 0,
+            gpio_hi_noise_state: 0xA5A5_A5A5,
+            xip_cache_offset: 0,
         }
     }
 
@@ -253,6 +262,25 @@ impl Bus {
         self.flash_loaded = loaded;
     }
 
+    /// Read GPIO_HI_IN (SIO offset 0x008). Returns QSPI pin state.
+    /// When flash is loaded, returns noise with bit 29 frequently set.
+    /// The bootrom's flash-detect loop reads this 21 times, extracting
+    /// bit 29 via `lsrs (gpio>>28), #2` and accumulating with `adcs`.
+    /// The threshold is 0xF1 (241); without carry the sum is 231, so we
+    /// need bit 29 set in ~11 of 21 reads.
+    fn read_gpio_hi_in(&mut self) -> u32 {
+        if !self.flash_loaded {
+            return 0;
+        }
+        // Advance simple LFSR for variation, then force bit 29 on
+        // most reads. Real QSPI lines are noisy — bias toward "alive".
+        let s = self.gpio_hi_noise_state;
+        self.gpio_hi_noise_state = s.wrapping_mul(1103515245).wrapping_add(12345);
+        // Set bits 29-31 (QSPI data lines) to simulate flash responses.
+        // Keep bit 28 toggling for additional entropy.
+        self.gpio_hi_noise_state | 0xE000_0000
+    }
+
     /// Load flash data into XIP memory and mark flash as loaded.
     pub fn load_flash(&mut self, data: &[u8]) {
         self.memory.load_flash(data);
@@ -350,6 +378,9 @@ impl Bus {
         };
         match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
+            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
+                self.memory.xip_read8((addr - 0x1C00_0000) + self.xip_cache_offset)
+            }
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read8(addr),
             0x1 => {
                 if !self.flash_loaded {
@@ -387,7 +418,7 @@ impl Bus {
                 match sio_offset {
                     0x004 => self.gpio_in.to_le_bytes()[(addr & 3) as usize],
                     0x010 => self.gpio_out.to_le_bytes()[(addr & 3) as usize],
-                    0x024 => self.gpio_oe.to_le_bytes()[(addr & 3) as usize],
+                    0x030 => self.gpio_oe.to_le_bytes()[(addr & 3) as usize],
                     _ => 0,
                 }
             }
@@ -503,6 +534,9 @@ impl Bus {
         };
         match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
+            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
+                self.memory.xip_read16((addr - 0x1C00_0000) + self.xip_cache_offset)
+            }
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read16(addr),
             0x1 => {
                 if !self.flash_loaded {
@@ -542,7 +576,7 @@ impl Bus {
                     0x000 => self.active_core() as u32,
                     0x004 => self.gpio_in,
                     0x010 => self.gpio_out,
-                    0x024 => self.gpio_oe,
+                    0x030 => self.gpio_oe,
                     _ => 0,
                 };
                 let half_idx = ((addr >> 1) & 1) as usize;
@@ -666,6 +700,13 @@ impl Bus {
         };
         match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
+            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
+                // XIP SRAM (0x1C00_0000): when flash is loaded, the bootrom
+                // reads flash through this window. Map reads to flash content
+                // using the current window offset tracked by QMI configuration.
+                let xip_offset = (addr - 0x1C00_0000) + self.xip_cache_offset;
+                self.memory.xip_read32(xip_offset)
+            }
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read32(addr),
             0x1 => {
                 if !self.flash_loaded {
@@ -699,9 +740,10 @@ impl Bus {
                 let sio_offset = addr & 0x0FFF_FFFF;
                 match sio_offset {
                     0x000 => self.active_core() as u32, // CPUID
-                    0x004 => self.gpio_in,
-                    0x010 => self.gpio_out,
-                    0x024 => self.gpio_oe,
+                    0x004 => self.gpio_in,              // GPIO_IN
+                    0x008 => self.read_gpio_hi_in(),    // GPIO_HI_IN (QSPI pins)
+                    0x010 => self.gpio_out,             // GPIO_OUT
+                    0x030 => self.gpio_oe,              // GPIO_OE
                     _ => 0,
                 }
             }
@@ -779,14 +821,16 @@ impl Bus {
             0xD => {
                 let sio_offset = addr & 0x0FFF_FFFF;
                 match sio_offset {
+                    // GPIO_OUT: RP2350 offsets (8-byte spacing)
                     0x010 => self.gpio_out = val,
-                    0x014 => self.gpio_out |= val,   // SET
-                    0x018 => self.gpio_out &= !val,   // CLR
-                    0x01C => self.gpio_out ^= val,    // XOR
-                    0x024 => self.gpio_oe = val,
-                    0x028 => self.gpio_oe |= val,     // SET
-                    0x02C => self.gpio_oe &= !val,    // CLR
-                    0x030 => self.gpio_oe ^= val,     // XOR
+                    0x018 => self.gpio_out |= val,    // GPIO_OUT_SET
+                    0x020 => self.gpio_out &= !val,   // GPIO_OUT_CLR
+                    0x028 => self.gpio_out ^= val,    // GPIO_OUT_XOR
+                    // GPIO_OE: RP2350 offsets (8-byte spacing)
+                    0x030 => self.gpio_oe = val,
+                    0x038 => self.gpio_oe |= val,     // GPIO_OE_SET
+                    0x040 => self.gpio_oe &= !val,    // GPIO_OE_CLR
+                    0x048 => self.gpio_oe ^= val,     // GPIO_OE_XOR
                     _ => {}
                 }
             }

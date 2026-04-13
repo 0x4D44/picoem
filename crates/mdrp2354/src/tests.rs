@@ -5329,7 +5329,7 @@ fn test_flash_boot_blinky() {
         last_pc = pc;
     }
 
-    let gpio_out = emu.bus.gpio_out;
+    let _gpio_out = emu.bus.gpio_out;
     let gpio_oe = emu.bus.gpio_oe;
     let pc = emu.cores[0].regs.pc();
 
