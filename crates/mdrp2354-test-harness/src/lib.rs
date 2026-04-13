@@ -127,6 +127,11 @@ pub struct TestCase {
     /// BL sets LR to a per-side absolute return address.
     /// When true, compare LR as delta from test slot.
     pub modifies_lr: bool,
+    /// If true, this test is only run by `probe_diff` (hardware). `qemu_diff`
+    /// filters these out. Used for tests whose correctness depends on absolute
+    /// addresses (e.g., ADR, ADD Rd,SP, POP {PC}) where QEMU and the emulator
+    /// use different memory maps.
+    pub probe_only: bool,
 }
 
 impl Default for TestCase {
@@ -143,6 +148,7 @@ impl Default for TestCase {
             xpsr_mask: MASK_ALL_FLAGS,
             hw1: None,
             modifies_lr: false,
+            probe_only: false,
         }
     }
 }
@@ -277,13 +283,11 @@ fn enc_ldr_sp(rt: u16, imm8: u16) -> u16 {
 }
 
 /// Encode ADR Rd, #imm8*4: 10100_Rd_imm8
-#[allow(dead_code)] // Differential tests skipped (address-space-dependent), but encoder is correct.
 fn enc_adr(rd: u16, imm8: u16) -> u16 {
     (0b10100 << 11) | (rd << 8) | (imm8 & 0xFF)
 }
 
 /// Encode ADD Rd, SP, #imm8*4: 10101_Rd_imm8
-#[allow(dead_code)] // Differential tests skipped (address-space-dependent), but encoder is correct.
 fn enc_add_sp_imm(rd: u16, imm8: u16) -> u16 {
     (0b10101 << 11) | (rd << 8) | (imm8 & 0xFF)
 }
@@ -2452,23 +2456,124 @@ fn gen_load_store_sp() -> Vec<TestCase> {
     t
 }
 
-/// ADR, ADD Rd, SP, #imm. Encoding: 1010x. ~10 tests.
+/// ADR, ADD Rd, SP, #imm. Encoding: 1010x. ~17 tests.
+///
+/// All tests are `probe_only`: they produce address-space-dependent results
+/// (ADR uses current PC, ADD Rd,SP uses current SP) so QEMU and the emulator
+/// disagree on the absolute value written to Rd. Hardware differential
+/// testing via `probe_diff` shares the emulator's address space and can
+/// validate these directly.
 fn gen_adr_add_sp() -> Vec<TestCase> {
-    // Skipped: produces address-space-dependent result (see LLD Section 8.3)
-    //
-    // ADR Rd, #imm computes Align(PC,4) + imm into Rd. Since QEMU and
-    // our emulator run at different PC addresses (0x100 vs 0x2000_0100),
-    // the result in Rd differs and the absolute R0-R12 comparison fails.
-    //
-    // ADD Rd, SP, #imm computes SP + imm*4 into Rd. Without an explicit
-    // SP precondition, SP defaults to TEST_STACK which differs per side
-    // (0x0004_0000 vs 0x2004_0000), so the result in Rd differs.
-    //
-    // These instructions are still validated by the emulator's own unit
-    // tests; they just can't be compared cross-environment via absolute
-    // register values.
+    let mut t = Vec::new();
 
-    Vec::new()
+    // --- ADR Rd, #imm (imm = imm8 * 4, range 0..=1020) ---
+    // ADR writes Align(PC, 4) + imm to Rd, where PC = current instr + 4.
+    t.push(TestCase {
+        name: "ADR R0, #0".into(),
+        opcode: enc_adr(0, 0),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADR R0, #4".into(),
+        opcode: enc_adr(0, 1),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADR R3, #12".into(),
+        opcode: enc_adr(3, 3),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADR R1, #124".into(),
+        opcode: enc_adr(1, 31),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADR R5, #252".into(),
+        opcode: enc_adr(5, 63),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADR R2, #508".into(),
+        opcode: enc_adr(2, 127),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADR R7, #1020 (max)".into(),
+        opcode: enc_adr(7, 255),
+        probe_only: true,
+        ..TestCase::default()
+    });
+
+    // --- ADD Rd, SP, #imm (imm = imm8 * 4, range 0..=1020) ---
+    t.push(TestCase {
+        name: "ADD R0, SP, #0".into(),
+        opcode: enc_add_sp_imm(0, 0),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R0, SP, #4".into(),
+        opcode: enc_add_sp_imm(0, 1),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R1, SP, #8".into(),
+        opcode: enc_add_sp_imm(1, 2),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R2, SP, #16".into(),
+        opcode: enc_add_sp_imm(2, 4),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R3, SP, #64".into(),
+        opcode: enc_add_sp_imm(3, 16),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R4, SP, #128".into(),
+        opcode: enc_add_sp_imm(4, 32),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R5, SP, #256".into(),
+        opcode: enc_add_sp_imm(5, 64),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R6, SP, #512".into(),
+        opcode: enc_add_sp_imm(6, 128),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R7, SP, #1020 (max)".into(),
+        opcode: enc_add_sp_imm(7, 255),
+        probe_only: true,
+        ..TestCase::default()
+    });
+    t.push(TestCase {
+        name: "ADD R0, SP, #1016".into(),
+        opcode: enc_add_sp_imm(0, 254),
+        probe_only: true,
+        ..TestCase::default()
+    });
+
+    t
 }
 
 /// ADD/SUB SP, SXTH, SXTB, UXTH, UXTB, REV, REV16, REVSH. Encoding: 1011xxxx. ~20 tests.
@@ -2778,12 +2883,25 @@ fn gen_push_pop() -> Vec<TestCase> {
         ..TestCase::default()
     });
 
-    // Skipped: produces address-space-dependent result (see LLD Section 8.3)
+    // POP {PC}: loads an absolute address from memory into PC.
+    // This is probe_only — QEMU and the emulator use different memory maps,
+    // so a stored absolute address cannot round-trip. On hardware the target
+    // matches the emulator's address space, so probe_diff can validate it.
     //
-    // POP {PC} loads an absolute address from memory into PC. The stored
-    // value (mem_pre) is raw bytes, not translated via addr_regs, so both
-    // sides pop the same absolute address. But PC delta comparison uses
-    // each side's TEST_SLOT as base, producing different deltas.
+    // The loaded PC must be a thumb-valid SRAM address (Thumb bit set).
+    // We use EMU_TEST_SLOT + 4 | 1: an address inside the instruction slot.
+    // We only compare post-state after a single-step, so we never actually
+    // execute at the loaded address.
+    t.push(TestCase {
+        name: "POP {PC}".into(),
+        opcode: enc_pop(0x00, true),
+        reg_pre: vec![(13, 0)],
+        addr_regs: vec![13],
+        needs_bus: true,
+        mem_pre: mem_pre_u32(0, EMU_TEST_SLOT + 4 + 1),
+        probe_only: true,
+        ..TestCase::default()
+    });
 
     // PUSH {R0-R7}
     t.push(TestCase {
@@ -3916,11 +4034,14 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     }
 
     // --- Push/Pop ---
+    // Weighted distribution: 50% PUSH, 25% POP (no PC), 25% POP with PC.
+    // POP with PC is probe_only (filtered by qemu_diff) — keeping PUSH at
+    // half the slots preserves the pre-Stage-D PUSH coverage rate.
     for i in 0..count {
-        let variant = rng.range(0..2u8);
+        let variant = rng.range(0..4u8);
         match variant {
-            0 => {
-                // PUSH: random register list (at least 1 bit set)
+            0 | 1 => {
+                // PUSH — 50%: random register list (at least 1 bit set)
                 let reglist8: u16 = rng.range(1..256);
                 let lr = rng.coin(0.3);
                 let opcode = enc_push(reglist8, lr);
@@ -3953,8 +4074,8 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                     ..TestCase::default()
                 });
             }
-            _ => {
-                // POP: random register list (at least 1 bit set), no PC (address-space-dependent)
+            2 => {
+                // POP without PC — 25%: random register list (at least 1 bit set)
                 let reglist8: u16 = rng.range(1..256);
                 let opcode = enc_pop(reglist8, false);
 
@@ -3973,6 +4094,33 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                     needs_bus: true,
                     mem_pre,
                     xpsr_pre: rand_flags(rng),
+                    ..TestCase::default()
+                });
+            }
+            _ => {
+                // POP with PC — 25% (probe_only: loads absolute PC address).
+                // PC is the final word in the loaded list; must be a
+                // thumb-valid SRAM address. Use EMU_TEST_SLOT + 4 | 1.
+                let reglist8: u16 = rng.range(0..256);
+                let opcode = enc_pop(reglist8, true);
+
+                let low_count = reglist8.count_ones();
+                let mut mem_pre = Vec::new();
+                for word in 0..low_count {
+                    mem_pre.extend(mem_pre_u32(word * 4, rng.random()));
+                }
+                // PC is the last word loaded.
+                mem_pre.extend(mem_pre_u32(low_count * 4, EMU_TEST_SLOT + 4 + 1));
+
+                t.push(TestCase {
+                    name: format!("FUZZ:POP_PC:{i} list={reglist8:#05x}"),
+                    opcode,
+                    reg_pre: vec![(13, 0)],
+                    addr_regs: vec![13],
+                    needs_bus: true,
+                    mem_pre,
+                    xpsr_pre: rand_flags(rng),
+                    probe_only: true,
                     ..TestCase::default()
                 });
             }
@@ -5245,6 +5393,9 @@ mod tests {
         //          smm_family, dual_halfword, word_x_half, long_halfword, dsp_special,
         //          qsat, paradd, sat, bcond = 16 classes
         // T16 MEM: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 classes
+        //   Note: push/pop is a SINGLE class whose inner loop fans out to 4
+        //   variants (2 PUSH slots + 1 POP + 1 POP_PC). The class still emits
+        //   `count` tests per call, so the class count stays at 5.
         // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
         assert_eq!(alu.len(), (8 + 16) * 10, "ALU count: (8 T16 + 16 T32) * 10");
         assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
@@ -5260,6 +5411,22 @@ mod tests {
                 tc.name, tc.xpsr_pre
             );
         }
+    }
+
+    /// Guard against regressions in the probe_only producers:
+    /// both the T16 POP_PC slot and the new T32 LDM+PC slot must
+    /// occasionally emit probe_only cases over a representative sample.
+    #[test]
+    fn fuzz_produces_both_probe_only_classes() {
+        let (_, mem) = generate_fuzz(1000, 42);
+        let pop_pc = mem.iter()
+            .filter(|tc| tc.name.starts_with("FUZZ:POP_PC:"))
+            .count();
+        let t32_ldm_pc = mem.iter()
+            .filter(|tc| tc.probe_only && tc.name.starts_with("FUZZ:T32_LDM:"))
+            .count();
+        assert!(pop_pc > 0, "expected at least one FUZZ:POP_PC probe_only test");
+        assert!(t32_ldm_pc > 0, "expected at least one T32 LDM+PC probe_only test");
     }
 
     // -- RunState.cycles --

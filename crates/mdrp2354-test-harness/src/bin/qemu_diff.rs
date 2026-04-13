@@ -120,7 +120,13 @@ fn run_targeted(
     gdb: &mut GdbClient,
     qemu: &mut QemuProcess,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let tests = generate_all();
+    let all_tests = generate_all();
+    let total_before = all_tests.len();
+    let tests: Vec<TestCase> = all_tests.into_iter().filter(|tc| !tc.probe_only).collect();
+    let filtered = total_before - tests.len();
+    if filtered > 0 {
+        println!("Filtered {filtered} probe-only tests (run via probe_diff)");
+    }
     let mut shared_bus = Bus::new();
     let mut pass = 0usize;
     let mut fail = 0usize;
@@ -153,7 +159,14 @@ fn run_fuzz(
     println!("(reproduce with: qemu_diff --fuzz {count_per_class} --seed {seed})");
 
     let (alu_tests, mem_tests) = generate_fuzz(count_per_class, seed);
+    let raw_total = alu_tests.len() + mem_tests.len();
+    let alu_tests: Vec<TestCase> = alu_tests.into_iter().filter(|tc| !tc.probe_only).collect();
+    let mem_tests: Vec<TestCase> = mem_tests.into_iter().filter(|tc| !tc.probe_only).collect();
     let total = alu_tests.len() + mem_tests.len();
+    let filtered = raw_total - total;
+    if filtered > 0 {
+        println!("Filtered {filtered} probe-only tests (run via probe_diff)");
+    }
     println!(
         "Generated {} tests ({} ALU + {} memory)",
         total,

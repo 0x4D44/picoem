@@ -5107,7 +5107,7 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 
 /// Generate `count` random Thumb-32 memory fuzz tests per instruction class.
 pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
-    use crate::SCRATCH_SIZE;
+    use crate::{EMU_TEST_SLOT, SCRATCH_SIZE};
     let mut t = Vec::new();
 
     // --- Load/store single (imm12) ---
@@ -5333,6 +5333,15 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             }
         }
 
+        // Occasionally add PC (bit 15) to an IA LDM (probe_only). DB mode
+        // is skipped because its memory layout gets complicated when PC
+        // must come last in the natural register ordering. STMs never
+        // include PC — M33 LDM.W is the only relevant case for probe_diff.
+        let include_pc = is_load && !db && rng.coin(0.25);
+        if include_pc {
+            reglist |= 1 << 15;
+        }
+
         let w = !is_load || (reglist & (1 << rn)) == 0; // writeback safe if rn not in list
         let reg_count = reglist.count_ones();
 
@@ -5354,13 +5363,23 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             let mut mp = Vec::new();
             // For DB: data at [base - N*4 .. base - 4]
             // For IA: data at [base .. base + (N-1)*4]
+            // When PC is in the list (IA only), it's the highest-numbered
+            // register and therefore the last word loaded. Write a
+            // thumb-valid SRAM address at that slot so the post-state PC
+            // points somewhere well-defined (we only single-step, so we
+            // never actually fetch from the loaded address).
             for word in 0..reg_count {
                 let off = if db {
                     base_offset - (reg_count - word) * 4
                 } else {
                     base_offset + word * 4
                 };
-                mp.extend(mem_pre_u32(off, rand_val(rng)));
+                let val = if include_pc && word == reg_count - 1 {
+                    EMU_TEST_SLOT + 4 + 1
+                } else {
+                    rand_val(rng)
+                };
+                mp.extend(mem_pre_u32(off, val));
             }
             (mp, Vec::new())
         } else {
@@ -5389,6 +5408,7 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             mem_check,
             xpsr_pre: rand_flags(rng),
             xpsr_mask: MASK_NO_FLAGS,
+            probe_only: include_pc,
             ..TestCase::default()
         });
     }
