@@ -3961,3 +3961,411 @@ fn umaal() {
     let result = (c.reg(5) as u64) << 32 | c.reg(4) as u64;
     assert_eq!(result, 20080);
 }
+
+// ============================================================================
+// Phase 2: Bus Fabric + Memory Map — TDD Red Phase
+// ============================================================================
+//
+// Tests for RP2350 bus fabric: address decode routing, SRAM banking,
+// bus latency accounting, atomic access aliases, and bus arbitration.
+//
+// Tests marked "Phase 2 API" require new methods/structs that don't exist yet.
+// They are #[ignore]d so the test suite compiles but clearly shows gaps.
+
+use crate::memory::Memory;
+
+// ============================================================================
+// 2.1 Address Decode Routing
+// ============================================================================
+
+#[test]
+fn bus_rom_read_returns_loaded_data() {
+    let (_, mut bus) = core_and_bus();
+    let rom_data: Vec<u8> = (0..32u8).collect();
+    bus.memory.load_rom(&rom_data);
+    // Read through bus at ROM address 0x00000000
+    assert_eq!(bus.read8(0x0000_0000), 0);
+    assert_eq!(bus.read8(0x0000_0001), 1);
+    assert_eq!(bus.read8(0x0000_001F), 31);
+    assert_eq!(bus.read32(0x0000_0000), 0x03020100);
+}
+
+#[test]
+fn bus_sram_write_then_read_roundtrip() {
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x2000_0000, 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2000_0000), 0xDEAD_BEEF);
+    bus.write16(0x2000_0004, 0xCAFE);
+    assert_eq!(bus.read16(0x2000_0004), 0xCAFE);
+    bus.write8(0x2000_0006, 0x42);
+    assert_eq!(bus.read8(0x2000_0006), 0x42);
+}
+
+#[test]
+fn bus_xip_read_returns_loaded_flash_data() {
+    let (_, mut bus) = core_and_bus();
+    let flash = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+    bus.memory.load_flash(&flash);
+    assert_eq!(bus.read8(0x1000_0000), 0xAA);
+    assert_eq!(bus.read32(0x1000_0000), 0xDDCCBBAA);
+    assert_eq!(bus.read32(0x1000_0004), 0x44332211);
+}
+
+#[test]
+fn bus_sram_boundary_last_valid_byte() {
+    // SRAM is 520 KB = 0x82000 bytes. Last valid address: 0x20081FFF.
+    let (_, mut bus) = core_and_bus();
+    bus.write8(0x2008_1FFF, 0x77);
+    assert_eq!(bus.read8(0x2008_1FFF), 0x77);
+}
+
+#[test]
+fn bus_sram_boundary_out_of_range_returns_zero() {
+    // Address 0x20082000 is beyond the 520 KB SRAM region.
+    let (_, mut bus) = core_and_bus();
+    bus.write8(0x2008_2000, 0xFF); // should be silently ignored
+    assert_eq!(bus.read8(0x2008_2000), 0); // out-of-range → 0
+}
+
+#[test]
+fn bus_rom_boundary_32kb() {
+    // ROM is 32 KB = 0x8000 bytes. Address 0x00007FFF is the last valid byte.
+    let (_, mut bus) = core_and_bus();
+    let mut rom_data = vec![0u8; 32 * 1024];
+    rom_data[0x7FFF] = 0xEE;
+    bus.memory.load_rom(&rom_data);
+    assert_eq!(bus.read8(0x0000_7FFF), 0xEE); // last byte of 32 KB ROM
+    assert_eq!(bus.read8(0x0000_8000), 0);     // beyond ROM → 0
+    assert_eq!(bus.read8(0x0000_FFFF), 0);     // well beyond ROM → 0
+}
+
+#[test]
+fn bus_writes_to_rom_are_silently_ignored() {
+    let (_, mut bus) = core_and_bus();
+    let rom_data = vec![0x42; 16];
+    bus.memory.load_rom(&rom_data);
+    // Attempt to write to ROM address — should be ignored
+    bus.write8(0x0000_0000, 0xFF);
+    bus.write32(0x0000_0004, 0xFFFF_FFFF);
+    // Original data preserved
+    assert_eq!(bus.read8(0x0000_0000), 0x42);
+    assert_eq!(bus.read32(0x0000_0004), 0x42424242);
+}
+
+#[test]
+fn bus_unmapped_region_reads_zero() {
+    // Regions 0x3, 0x6..0xC, 0xF are unmapped — should read as 0.
+    let (_, bus) = core_and_bus();
+    assert_eq!(bus.read32(0x3000_0000), 0);
+    assert_eq!(bus.read32(0x6000_0000), 0);
+    assert_eq!(bus.read32(0xF000_0000), 0);
+}
+
+// ============================================================================
+// 2.2 SRAM Banking
+// ============================================================================
+//
+// RP2350 SRAM: SRAM0-7 are 64 KB each (512 KB total), word-striped.
+// SRAM8 is 4 KB at offset 0x80000, SRAM9 is 4 KB at offset 0x81000.
+// Stripe formula: bank = (word_offset) % 8, where word_offset = (addr - base) / 4.
+
+#[test]
+fn sram_bank0_write_read() {
+    // Word at SRAM base + 0x00 → bank 0 (word_offset 0 % 8 = 0)
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x2000_0000, 0x1111_1111);
+    assert_eq!(bus.read32(0x2000_0000), 0x1111_1111);
+}
+
+#[test]
+fn sram8_write_read() {
+    // SRAM8: 4 KB at 0x20080000 (non-striped)
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x2008_0000, 0xAAAA_BBBB);
+    assert_eq!(bus.read32(0x2008_0000), 0xAAAA_BBBB);
+    // Last word of SRAM8: 0x20080FFC
+    bus.write32(0x2008_0FFC, 0xCCCC_DDDD);
+    assert_eq!(bus.read32(0x2008_0FFC), 0xCCCC_DDDD);
+}
+
+#[test]
+fn sram9_write_read() {
+    // SRAM9: 4 KB at 0x20081000 (non-striped)
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x2008_1000, 0x1234_5678);
+    assert_eq!(bus.read32(0x2008_1000), 0x1234_5678);
+    // Last word of SRAM9: 0x20081FFC
+    bus.write32(0x2008_1FFC, 0x9ABC_DEF0);
+    assert_eq!(bus.read32(0x2008_1FFC), 0x9ABC_DEF0);
+}
+
+#[test]
+fn sram_striped_access_consecutive_words_go_to_consecutive_banks() {
+    // Consecutive 32-bit words go to consecutive banks:
+    //   0x20000000 → bank 0 (word 0 % 8)
+    //   0x20000004 → bank 1 (word 1 % 8)
+    //   0x20000008 → bank 2 (word 2 % 8)
+    //   ...
+    //   0x2000001C → bank 7 (word 7 % 8)
+    //   0x20000020 → bank 0 (word 8 % 8) — wraps
+    let (_, mut bus) = core_and_bus();
+    for i in 0u32..9 {
+        let addr = 0x2000_0000 + i * 4;
+        let val = 0xA000_0000 | i;
+        bus.write32(addr, val);
+    }
+    for i in 0u32..9 {
+        let addr = 0x2000_0000 + i * 4;
+        let expected = 0xA000_0000 | i;
+        assert_eq!(bus.read32(addr), expected, "word {} at 0x{:08X}", i, addr);
+    }
+}
+
+#[test]
+fn bank_for_address_striped_region() {
+    // Memory::bank_for_address(addr) → bank index (0..9)
+    // Striped region: bank = (word_offset) % 8
+    assert_eq!(Memory::bank_for_address(0x2000_0000), Some(0)); // word 0 → bank 0
+    assert_eq!(Memory::bank_for_address(0x2000_0004), Some(1)); // word 1 → bank 1
+    assert_eq!(Memory::bank_for_address(0x2000_0008), Some(2)); // word 2 → bank 2
+    assert_eq!(Memory::bank_for_address(0x2000_000C), Some(3)); // word 3 → bank 3
+    assert_eq!(Memory::bank_for_address(0x2000_001C), Some(7)); // word 7 → bank 7
+    assert_eq!(Memory::bank_for_address(0x2000_0020), Some(0)); // word 8 → wraps to bank 0
+}
+
+#[test]
+fn bank_for_address_non_striped_region() {
+    // Non-striped banks:
+    //   SRAM8 (0x20080000..0x20080FFF) → always bank 8
+    //   SRAM9 (0x20081000..0x20081FFF) → always bank 9
+    assert_eq!(Memory::bank_for_address(0x2008_0000), Some(8));
+    assert_eq!(Memory::bank_for_address(0x2008_0500), Some(8));
+    assert_eq!(Memory::bank_for_address(0x2008_0FFF), Some(8));
+    assert_eq!(Memory::bank_for_address(0x2008_1000), Some(9));
+    assert_eq!(Memory::bank_for_address(0x2008_1500), Some(9));
+    assert_eq!(Memory::bank_for_address(0x2008_1FFF), Some(9));
+}
+
+#[test]
+fn bank_for_address_rejects_non_sram() {
+    // ROM address — not SRAM
+    assert_eq!(Memory::bank_for_address(0x0000_1000), None);
+    // XIP address — not SRAM
+    assert_eq!(Memory::bank_for_address(0x1000_0004), None);
+    // Beyond SRAM9
+    assert_eq!(Memory::bank_for_address(0x2008_2000), None);
+    // Unmapped region
+    assert_eq!(Memory::bank_for_address(0x3000_0000), None);
+}
+
+// ============================================================================
+// 2.3 Bus Latency
+// ============================================================================
+//
+// Phase 2 API — tests assume Bus will gain a method like
+// bus.last_access_cycles() -> u32 that reports the cycle cost of the
+// most recent read or write. These tests won't compile until that API exists.
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus refactor
+fn bus_latency_sram_read_1_cycle() {
+    // SRAM is AHB-attached: 1-cycle read, zero wait state.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // bus.read32(0x2000_0000);
+    // assert_eq!(bus.last_access_cycles(), 1);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus refactor
+fn bus_latency_sram_write_1_cycle() {
+    // SRAM is AHB-attached: 1-cycle write.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // bus.write32(0x2000_0000, 0x42);
+    // assert_eq!(bus.last_access_cycles(), 1);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus refactor
+fn bus_latency_rom_read_1_cycle() {
+    // ROM is AHB-attached: 1-cycle read.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, bus) = core_and_bus();
+    // bus.read32(0x0000_0000);
+    // assert_eq!(bus.last_access_cycles(), 1);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus refactor
+fn bus_latency_apb_peripheral_read_3_cycles() {
+    // APB peripherals at 0x40000000: 3-cycle read latency.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, bus) = core_and_bus();
+    // bus.read32(0x4000_0000);
+    // assert_eq!(bus.last_access_cycles(), 3);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus refactor
+fn bus_latency_apb_peripheral_write_4_cycles() {
+    // APB peripherals at 0x40000000: 4-cycle write latency.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // bus.write32(0x4000_0000, 0x1);
+    // assert_eq!(bus.last_access_cycles(), 4);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus refactor
+fn bus_latency_sio_access_1_cycle() {
+    // SIO at 0xD0000000: single-cycle access.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, bus) = core_and_bus();
+    // bus.read32(0xD000_0000);
+    // assert_eq!(bus.last_access_cycles(), 1);
+}
+
+// ============================================================================
+// 2.4 Atomic Access Aliases
+// ============================================================================
+//
+// RP2350 provides +0x0000 normal, +0x1000 XOR, +0x2000 SET, +0x3000 CLR
+// aliases for peripheral registers. The alias is encoded in bits [13:12]
+// of the address within each 4 KB peripheral page.
+//
+// Phase 2 API — atomic aliases apply to APB/AHB peripheral writes.
+// These tests use SRAM as a stand-in until peripheral stubs exist,
+// or may target a known peripheral base address.
+
+#[test]
+#[ignore] // Phase 2 API — will compile after atomic alias support is added
+fn atomic_alias_normal_write() {
+    // Base+0x0000: normal write replaces the value.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // let base = 0x4000_0000; // APB peripheral base (stub)
+    // bus.write32(base + 0x0000, 0xFF00_FF00);
+    // assert_eq!(bus.read32(base), 0xFF00_FF00);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after atomic alias support is added
+fn atomic_alias_xor_write() {
+    // Base+0x1000: XOR — new_val = old_val ^ written_val.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // let base = 0x4000_0000;
+    // bus.write32(base + 0x0000, 0xFF00_FF00); // seed value
+    // bus.write32(base + 0x1000, 0x0F0F_0F0F); // XOR alias
+    // assert_eq!(bus.read32(base), 0xF00F_F00F);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after atomic alias support is added
+fn atomic_alias_set_write() {
+    // Base+0x2000: SET — new_val = old_val | written_val.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // let base = 0x4000_0000;
+    // bus.write32(base + 0x0000, 0x0000_00FF); // seed value
+    // bus.write32(base + 0x2000, 0x0000_FF00); // SET alias
+    // assert_eq!(bus.read32(base), 0x0000_FFFF);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after atomic alias support is added
+fn atomic_alias_clr_write() {
+    // Base+0x3000: CLR — new_val = old_val & ~written_val.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // let base = 0x4000_0000;
+    // bus.write32(base + 0x0000, 0xFFFF_FFFF); // seed value
+    // bus.write32(base + 0x3000, 0x00FF_00FF); // CLR alias
+    // assert_eq!(bus.read32(base), 0xFF00_FF00);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after atomic alias support is added
+fn atomic_alias_read_ignores_alias_bits() {
+    // Reads from any alias offset return the same canonical value.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let (_, mut bus) = core_and_bus();
+    // let base = 0x4000_0000;
+    // bus.write32(base, 0xBEEF_CAFE);
+    // assert_eq!(bus.read32(base + 0x0000), 0xBEEF_CAFE);
+    // assert_eq!(bus.read32(base + 0x1000), 0xBEEF_CAFE); // XOR alias read
+    // assert_eq!(bus.read32(base + 0x2000), 0xBEEF_CAFE); // SET alias read
+    // assert_eq!(bus.read32(base + 0x3000), 0xBEEF_CAFE); // CLR alias read
+}
+
+// ============================================================================
+// 2.5 Bus Arbitration
+// ============================================================================
+//
+// RP2350 AHB5 bus fabric: two upstream ports (core 0, core 1) share
+// downstream targets. If both access the same downstream port in the
+// same cycle, one proceeds and the other stalls 1 cycle.
+//
+// Phase 2 API — these may require a BusFabric struct or a
+// bus.arbitrate(port0_req, port1_req) method.
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus arbitration is implemented
+fn arbitration_single_core_no_contention() {
+    // A single core accessing a bus target incurs no stall.
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let mut emu = EmulatorBuilder::new(Config::default()).build();
+    // emu.bus.write32(0x2000_0000, 0x42);
+    // // Core 0 reads SRAM — no contention, zero extra stall cycles
+    // let stall = emu.bus.arbitrate_stall(/*core=*/0, /*addr=*/0x2000_0000);
+    // assert_eq!(stall, 0);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus arbitration is implemented
+fn arbitration_two_cores_different_banks_no_contention() {
+    // Two cores accessing different SRAM banks: no contention.
+    // Core 0 → bank 0 (0x20000000), Core 1 → bank 1 (0x20000004)
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let mut emu = EmulatorBuilder::new(Config::default()).build();
+    // // Simulate both cores requesting in same cycle
+    // let (stall0, stall1) = emu.bus.arbitrate_pair(
+    //     /*core0_addr=*/0x2000_0000, // bank 0
+    //     /*core1_addr=*/0x2000_0004, // bank 1
+    // );
+    // assert_eq!(stall0, 0);
+    // assert_eq!(stall1, 0);
+}
+
+#[test]
+#[ignore] // Phase 2 API — will compile after bus arbitration is implemented
+fn arbitration_two_cores_same_bank_one_stalls() {
+    // Two cores accessing the same SRAM bank: one stalls 1 cycle.
+    // Core 0 → bank 0 (0x20000000), Core 1 → bank 0 (0x20000020)
+    // Both map to bank 0 (word offsets 0 and 8, both % 8 = 0).
+    // Phase 2 API — will compile after bus refactor
+    //
+    // let mut emu = EmulatorBuilder::new(Config::default()).build();
+    // let (stall0, stall1) = emu.bus.arbitrate_pair(
+    //     /*core0_addr=*/0x2000_0000, // bank 0 (word 0)
+    //     /*core1_addr=*/0x2000_0020, // bank 0 (word 8)
+    // );
+    // // One of them stalls, the other doesn't
+    // assert_eq!(stall0 + stall1, 1, "exactly one core should stall 1 cycle");
+    // assert!(stall0 == 0 || stall0 == 1);
+    // assert!(stall1 == 0 || stall1 == 1);
+}
