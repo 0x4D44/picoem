@@ -5704,3 +5704,45 @@ fn test_core1_boot_reaches_wfe() {
         "Core 1 PC should be in bootrom range (PC={:#010x})",
         emu.cores[1].regs.pc());
 }
+
+// ============================================================================
+// Phase 5 C4: Dual-core integration — Core 0 launches Core 1 via FIFO
+// ============================================================================
+
+#[test]
+fn test_dualcore_launch() {
+    use crate::{Emulator, Config};
+
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../roms");
+    let bootrom = std::fs::read(base.join("bootrom-combined.bin"))
+        .expect("bootrom-combined.bin not found");
+    let flash = std::fs::read(base.join("dualcore.bin"))
+        .expect("dualcore.bin not found — run: python roms/gen_dualcore.py roms/dualcore.bin");
+
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&bootrom);
+    emu.load_flash(&flash);
+    emu.reset();
+
+    // Run for up to 10M cycles
+    for _ in 0..10_000_000u64 {
+        emu.step();
+        // Early exit if both GPIO pins set
+        if emu.bus.sio.gpio_out & (1 << 25) != 0 && emu.bus.sio.gpio_out & 1 != 0 {
+            break;
+        }
+    }
+
+    // Core 0 set GPIO 25
+    assert!(emu.bus.sio.gpio_out & (1 << 25) != 0,
+        "Core 0 should set GPIO 25 (gpio_out={:#010x})", emu.bus.sio.gpio_out);
+    // Core 1 set GPIO 0
+    assert!(emu.bus.sio.gpio_out & 1 != 0,
+        "Core 1 should set GPIO 0 (gpio_out={:#010x})", emu.bus.sio.gpio_out);
+    // Core 1 should be running app code (PC >= 0x10000000)
+    assert!(emu.cores[1].regs.pc() >= 0x1000_0000,
+        "Core 1 should be in flash, PC={:#010x}", emu.cores[1].regs.pc());
+    // Core 1 should not be WFE-waiting
+    assert!(!emu.cores[1].is_wfe_waiting(),
+        "Core 1 should not be WFE-waiting");
+}
