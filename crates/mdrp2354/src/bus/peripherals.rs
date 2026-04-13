@@ -52,6 +52,14 @@ impl Bus {
         }
     }
 
+    // --- ROSC (0x400E8000) ---
+    pub(crate) fn rosc_read(&self, offset: u32) -> u32 {
+        match offset {
+            0x018 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
+            _ => 0,
+        }
+    }
+
     // --- XOSC (0x40048000) ---
     pub(crate) fn xosc_read(&self, offset: u32) -> u32 {
         match offset {

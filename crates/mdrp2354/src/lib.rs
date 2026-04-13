@@ -4,6 +4,7 @@ pub mod memory;
 pub mod sio;
 pub mod clock;
 pub mod pacer;
+pub mod pio;
 
 pub use self::core::CortexM33;
 pub use self::bus::Bus;
@@ -23,20 +24,6 @@ pub trait Peripheral {
     fn step(&mut self) -> bool;
 }
 
-/// Trait for PIO blocks. Implemented by `mdrp2354-pio`.
-pub trait PioInterface {
-    /// Advance by one system clock. Returns GPIO output changes if any.
-    fn step(&mut self, gpio_in: u64) -> Option<GpioChange>;
-    fn read32(&mut self, offset: u32) -> u32;
-    fn write32(&mut self, offset: u32, value: u32);
-}
-
-/// Describes a GPIO pin state change from a PIO block.
-pub struct GpioChange {
-    pub pin: u8,
-    pub value: bool,
-}
-
 /// Stop reason when running until a condition.
 pub enum StopReason {
     CycleLimit,
@@ -45,16 +32,20 @@ pub enum StopReason {
     Fault,
 }
 
+/// ROSC nominal frequency (~6.5 MHz). The RP2350 boots on ROSC;
+/// PLL configuration (if any) happens later in firmware.
+pub const ROSC_FREQ_HZ: u32 = 6_500_000;
+
 /// Emulator configuration.
 pub struct Config {
-    /// System clock frequency in Hz. Default 150 MHz.
+    /// System clock frequency in Hz. Default: ROSC (~6.5 MHz).
     pub sys_clk_hz: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            sys_clk_hz: 150_000_000,
+            sys_clk_hz: ROSC_FREQ_HZ,
         }
     }
 }
@@ -97,6 +88,10 @@ impl Emulator {
         self.bus.rcp_salt = [0; 2];
         self.bus.rcp_salt_valid = [false; 2];
         self.bus.sio.reset();
+        for pio in &mut self.bus.pio {
+            pio.reset();
+        }
+        self.bus.gpio_in = 0;
 
         // Reset clock
         self.clock = Clock {
@@ -161,17 +156,17 @@ impl Emulator {
         self.clock.cycles
     }
 
-    /// Read a GPIO pin (stub — always false for Phase 1).
-    pub fn gpio_read(&self, _pin: u8) -> bool {
-        false
+    /// Read a GPIO pin from the merged pin state.
+    pub fn gpio_read(&self, pin: u8) -> bool {
+        (self.bus.gpio_in >> pin) & 1 != 0
     }
 
     /// Write a GPIO pin (stub for Phase 1).
     pub fn gpio_write(&mut self, _pin: u8, _value: bool) {}
 
-    /// Read all 48 GPIO pins as a bitmask (stub).
+    /// Read all GPIO pins as a bitmask (lower 32 bits).
     pub fn gpio_read_all(&self) -> u64 {
-        0
+        self.bus.gpio_in as u64
     }
 
     /// Access core state.

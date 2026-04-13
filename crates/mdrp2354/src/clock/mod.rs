@@ -12,7 +12,7 @@ impl Clock {
     pub fn new() -> Self {
         Self {
             cycles: 0,
-            sys_clk_hz: 150_000_000,
+            sys_clk_hz: 6_500_000,
         }
     }
 

@@ -5746,3 +5746,22 @@ fn test_dualcore_launch() {
     assert!(!emu.cores[1].is_wfe_waiting(),
         "Core 1 should not be WFE-waiting");
 }
+
+// ============================================================================
+// Clock Tree V1: ROSC boot-clock fix
+// ============================================================================
+
+#[test]
+fn test_rosc_status_returns_stable_enabled() {
+    let (_, mut bus) = core_and_bus();
+    let status = bus.read32(0x400E_8018);
+    assert_eq!(status, (1 << 31) | (1 << 12),
+        "ROSC STATUS should report STABLE | ENABLED");
+}
+
+#[test]
+fn test_config_default_uses_rosc_frequency() {
+    use crate::Config;
+    assert_eq!(Config::default().sys_clk_hz, 6_500_000,
+        "Config::default() should use ROSC frequency (~6.5 MHz)");
+}

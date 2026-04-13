@@ -4,6 +4,7 @@ pub mod ppb;
 use std::collections::HashMap;
 
 use crate::memory::{Memory, SRAM_SIZE};
+use crate::pio::PioBlock;
 use crate::sio::Sio;
 
 /// Bus fabric — address decode and cycle accounting.
@@ -740,6 +741,7 @@ impl Bus {
                     0x4002_0000 => self.resets_read(offset),
                     0x4001_0000 => self.clocks_read(offset),
                     0x4004_8000 => self.xosc_read(offset),
+                    0x400E_8000 => self.rosc_read(offset),
                     0x4005_0000 => self.pll_sys_read(offset),
                     0x4005_8000 => self.pll_usb_read(offset),
                     0x400D_0000 => self.qmi_read(offset),
@@ -807,8 +809,8 @@ impl Bus {
                     0x4002_0000 => self.resets_write(offset, val, alias),
                     0x400D_0000 => self.qmi_write(offset, val),
                     0x4001_0000 => self.clocks_write(offset, val),
-                    0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
-                        // XOSC, PLL: accept writes, ignore
+                    0x400E_8000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
+                        // ROSC, XOSC, PLL: accept writes, ignore
                     }
                     // SYSINFO (0x4000_0000): read-only, ignore writes
                     0x4000_0000 => {}
