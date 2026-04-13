@@ -784,3 +784,196 @@ fn run_small_program() {
     // R0 should be 1+2+3+4+5 = 15
     assert_eq!(c.reg(0), 15);
 }
+
+// ============================================================================
+// ThumbExpandImm
+// ============================================================================
+
+use crate::core::execute_thumb32::{thumb_expand_imm_c, thumb_expand_imm, extract_imm12};
+
+#[test]
+fn thumb_expand_imm_pattern_00() {
+    // imm12 = 0b00_00_01000010 = 0x042 → pattern 00, imm8 = 0x42
+    let (val, carry) = thumb_expand_imm_c(0x042, false);
+    assert_eq!(val, 0x0000_0042);
+    assert!(!carry); // carry_in unchanged
+
+    let (val2, carry2) = thumb_expand_imm_c(0x042, true);
+    assert_eq!(val2, 0x0000_0042);
+    assert!(carry2); // carry_in unchanged
+}
+
+#[test]
+fn thumb_expand_imm_pattern_01() {
+    // imm12 = 0b00_01_10101011 = 0x1AB → pattern 01, imm8 = 0xAB
+    let (val, carry) = thumb_expand_imm_c(0x1AB, false);
+    assert_eq!(val, 0x00AB_00AB);
+    assert!(!carry);
+}
+
+#[test]
+fn thumb_expand_imm_pattern_10() {
+    // imm12 = 0b00_10_11001101 = 0x2CD → pattern 10, imm8 = 0xCD
+    let (val, carry) = thumb_expand_imm_c(0x2CD, true);
+    assert_eq!(val, 0xCD00_CD00);
+    assert!(carry); // carry_in unchanged
+}
+
+#[test]
+fn thumb_expand_imm_pattern_11() {
+    // imm12 = 0b00_11_11101111 = 0x3EF → pattern 11, imm8 = 0xEF
+    let (val, carry) = thumb_expand_imm_c(0x3EF, false);
+    assert_eq!(val, 0xEFEF_EFEF);
+    assert!(!carry);
+}
+
+#[test]
+fn thumb_expand_imm_rotation_no_carry() {
+    // Rotation path: imm12[11:10] != 00.
+    // imm12 = 0xF80 = 0b1111_1000_0000
+    //   unrotated = 0x80 | (0xF80 & 0x7F) = 0x80 | 0x00 = 0x80
+    //   rotation = (0xF80 >> 7) & 0x1F = 0x1F = 31
+    //   val = 0x80.rotate_right(31) = 0x00000100
+    //   carry = val >> 31 = 0
+    let (val, carry) = thumb_expand_imm_c(0xF80, false);
+    assert_eq!(val, 0x0000_0100);
+    assert!(!carry);
+}
+
+#[test]
+fn thumb_expand_imm_rotation_with_carry() {
+    // Rotation path producing MSB=1.
+    // imm12 = 0x480 = 0b0100_1000_0000
+    //   unrotated = 0x80 | (0x480 & 0x7F) = 0x80 | 0x00 = 0x80
+    //   rotation = (0x480 >> 7) & 0x1F = 0x09
+    //   val = 0x80.rotate_right(9) = 0x80 >> 9 | 0x80 << 23 = 0x40000000
+    //   carry = val >> 31 = 0 ... need MSB=1.
+    // Let's use rotation=1: imm12 must have bits[11:7] = 00001 and bits[11:10] != 00.
+    // imm12 = 0b0100_0000_0000 = 0x400
+    //   unrotated = 0x80 | 0 = 0x80
+    //   rotation = (0x400 >> 7) & 0x1F = 0x08
+    //   val = 0x80.rotate_right(8) = 0x80000000
+    //   carry = 1
+    let (val, carry) = thumb_expand_imm_c(0x400, false);
+    assert_eq!(val, 0x8000_0000);
+    assert!(carry);
+}
+
+#[test]
+fn thumb_expand_imm_convenience() {
+    // thumb_expand_imm discards carry
+    assert_eq!(thumb_expand_imm(0x042), 0x0000_0042);
+    assert_eq!(thumb_expand_imm(0x1AB), 0x00AB_00AB);
+    assert_eq!(thumb_expand_imm(0x400), 0x8000_0000);
+}
+
+#[test]
+fn extract_imm12_basic() {
+    // hw0[10] = i, hw1[14:12] = imm3, hw1[7:0] = imm8
+    // Test: i=1, imm3=0b101, imm8=0x42
+    // imm12 = (1 << 11) | (0b101 << 8) | 0x42 = 0x800 | 0x500 | 0x42 = 0xD42
+    let hw0: u16 = 1 << 10; // i=1
+    let hw1: u16 = (0b101 << 12) | 0x42;
+    assert_eq!(extract_imm12(hw0, hw1), 0xD42);
+}
+
+// ============================================================================
+// CBZ / CBNZ
+// ============================================================================
+
+#[test]
+fn cbz_taken() {
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    c.set_reg(0, 0); // R0 = 0 → CBZ should branch
+
+    // CBZ R0, +8: opcode = 1011_0_0_0_1_00100_000
+    // bit 11=0 (CBZ), i=0, imm5=4 (offset = 4<<1 = 8)
+    // 10110_0_0_1_00100_000 = 0xB100 | (4 << 3) = 0xB120
+    // Actually: 1011_n_0_i_1_imm5_Rn where n=bit11, i=bit9
+    // CBZ: 1011_0_0_0_1_imm5_Rn
+    // imm5=00100=4, Rn=000 → 10110001_00100_000 = 0xB120
+    let cy = c.execute_one(0xB120);
+    // read_pc() = 0x1000 + 4 = 0x1004, target = 0x1004 + 8 = 0x100C
+    assert_eq!(c.regs.pc(), 0x100C);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn cbz_not_taken() {
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    c.set_reg(0, 1); // R0 = 1 → CBZ should NOT branch
+
+    let cy = c.execute_one(0xB120); // CBZ R0, +8
+    // PC not changed (beyond the +2 from execute_one setup)
+    assert_eq!(c.regs.pc(), 0x1002);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn cbnz_not_taken() {
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    c.set_reg(0, 0); // R0 = 0 → CBNZ should NOT branch
+
+    // CBNZ R0, +8: bit11=1
+    // 1011_1_0_0_1_00100_000 = 0xB920
+    let cy = c.execute_one(0xB920);
+    assert_eq!(c.regs.pc(), 0x1002);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn cbnz_taken() {
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    c.set_reg(0, 5); // R0 = 5 → CBNZ should branch
+
+    let cy = c.execute_one(0xB920); // CBNZ R0, +8
+    assert_eq!(c.regs.pc(), 0x100C);
+    assert_eq!(cy, 2);
+}
+
+// ============================================================================
+// Thumb-32 decode tree routing
+// ============================================================================
+
+#[test]
+fn thumb32_movw_routes_to_stub() {
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+
+    // MOVW R0, #0x0000: hw0=0xF240, hw1=0x0000
+    // op1 = (0xF240 >> 11) & 0x3 = 0b10
+    // op2 = (0xF240 >> 4) & 0x7F = 0x24 = 0b0100100
+    // op  = (0x0000 >> 15) & 1 = 0
+    // → op1=10, op=0, op2 & 0x20 = 0x20 → dp_plain_imm (stub → undefined → 1)
+    let cy = c.execute_one_wide(0xF240, 0x0000);
+    assert_eq!(cy, 1); // stub returns 1
+}
+
+#[test]
+fn thumb32_bl_routes_through_branch_misc() {
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+
+    // BL +100: same encoding as the existing bl_forward test
+    let cy = c.execute_one_wide(0xF000, 0xF832);
+    assert_eq!(c.regs.lr(), 0x1005);
+    assert_eq!(c.regs.pc(), 0x1068);
+    assert_eq!(cy, 4);
+}
+
+#[test]
+fn thumb32_ldr_w_routes_to_stub() {
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+
+    // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000
+    // op1 = (0xF8D1 >> 11) & 0x3 = 0b11
+    // op2 = (0xF8D1 >> 4) & 0x7F = 0x0D = 0b0001101
+    // op2 & 0x40 = 0, op2 & 0x20 = 0 → load_store_single (stub → 1)
+    let cy = c.execute_one_wide(0xF8D1, 0x0000);
+    assert_eq!(cy, 1);
+}

@@ -1,6 +1,7 @@
 pub mod registers;
 mod decode;
 mod execute;
+pub(crate) mod execute_thumb32;
 
 use crate::bus::Bus;
 pub use registers::Registers;

@@ -82,18 +82,43 @@ impl CortexM33 {
         }
     }
 
-    /// Top-level Thumb-32 dispatch. Phase 1: only BL is implemented.
+    /// Top-level Thumb-32 dispatch.
     pub(crate) fn execute_thumb32(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let op1 = (hw0 >> 11) & 0x3;
-        let op2 = (hw1 >> 12) & 0x7;
+        let op2 = ((hw0 >> 4) & 0x7F) as u32;
+        let op  = (hw1 >> 15) & 0x1;
 
-        match (op1, op2) {
-            // BL: 11110 S imm10 / 11 J1 1 J2 imm11
-            (0b10, op2) if op2 & 0b101 == 0b101 => self.thumb32_bl(hw0, hw1),
-            _ => {
-                let _ = bus;
-                self.thumb32_undefined(hw0, hw1)
-            }
+        match op1 {
+            0b01 => match op2 >> 5 {
+                0b00 => if op2 & 0x04 == 0 {
+                    self.thumb32_ldm_stm(hw0, hw1, bus)
+                } else {
+                    self.thumb32_load_store_dual(hw0, hw1, bus)
+                },
+                0b01 => self.thumb32_dp_shifted_reg(hw0, hw1),
+                _    => self.thumb32_coprocessor(hw0, hw1, bus),
+            },
+            0b10 => if op == 0 {
+                if op2 & 0x20 == 0 {
+                    self.thumb32_dp_modified_imm(hw0, hw1)
+                } else {
+                    self.thumb32_dp_plain_imm(hw0, hw1)
+                }
+            } else {
+                self.thumb32_branch_misc(hw0, hw1, bus)
+            },
+            0b11 => if op2 & 0x40 != 0 {
+                self.thumb32_coprocessor(hw0, hw1, bus)
+            } else if op2 & 0x20 == 0 {
+                self.thumb32_load_store_single(hw0, hw1, bus)
+            } else if op2 & 0x10 == 0 {
+                self.thumb32_dp_register(hw0, hw1)
+            } else if op2 & 0x08 == 0 {
+                self.thumb32_multiply(hw0, hw1)
+            } else {
+                self.thumb32_long_multiply(hw0, hw1)
+            },
+            _ => self.thumb32_undefined(hw0, hw1),
         }
     }
 }

@@ -18,7 +18,7 @@ pub(crate) fn add_with_carry(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool
 
 /// Sign-extend a value from `bits` width to 32 bits.
 #[inline(always)]
-fn sign_extend(val: u32, bits: u32) -> u32 {
+pub(crate) fn sign_extend(val: u32, bits: u32) -> u32 {
     let shift = 32 - bits;
     ((val << shift) as i32 >> shift) as u32
 }
@@ -693,6 +693,22 @@ impl CortexM33 {
                 // All are NOPs for Phase 1
                 1
             }
+            // CBZ/CBNZ: bits[11:8] matches x0x1 pattern
+            op if op & 0x5 == 0x1 => {
+                let rn = (opcode & 0x7) as usize;
+                let i = ((opcode >> 9) & 1) as u32;
+                let imm5 = ((opcode >> 3) & 0x1F) as u32;
+                let offset = (i << 6) | (imm5 << 1);
+                let nonzero = opcode & (1 << 11) != 0;
+                let rn_val = self.regs.r[rn];
+                if (nonzero && rn_val != 0) || (!nonzero && rn_val == 0) {
+                    let target = self.read_pc().wrapping_add(offset);
+                    self.regs.set_pc(target);
+                    2
+                } else {
+                    1
+                }
+            }
             _ => 1, // Other misc encodings — NOP
         }
     }
@@ -790,42 +806,6 @@ impl CortexM33 {
 
     /// Undefined instruction — UsageFault in Phase 3, NOP for now.
     pub(crate) fn thumb16_undefined(&mut self, _opcode: u16) -> u32 {
-        // TODO: raise UsageFault (Phase 3)
-        1
-    }
-
-    // ========================================================================
-    // Thumb-32: BL (branch with link)
-    // ========================================================================
-
-    /// BL label — 32-bit encoding (11110_S_imm10 / 11_J1_1_J2_imm11).
-    pub(crate) fn thumb32_bl(&mut self, hw0: u16, hw1: u16) -> u32 {
-        let s = ((hw0 >> 10) & 1) as u32;
-        let imm10 = (hw0 & 0x3FF) as u32;
-        let j1 = ((hw1 >> 13) & 1) as u32;
-        let j2 = ((hw1 >> 11) & 1) as u32;
-        let imm11 = (hw1 & 0x7FF) as u32;
-
-        // I1 = NOT(J1 XOR S), I2 = NOT(J2 XOR S)
-        let i1 = (j1 ^ s) ^ 1;
-        let i2 = (j2 ^ s) ^ 1;
-
-        // imm32 = SignExtend(S:I1:I2:imm10:imm11:0, 25)
-        let imm25 = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
-        let offset = sign_extend(imm25, 25);
-
-        // LR = address of next instruction | 1 (Thumb bit)
-        let next_instr = self.regs.pc() | 1;
-        self.regs.set_lr(next_instr);
-
-        // PC = PC + offset (PC here is the read_pc value = instr_addr + 4)
-        let target = self.read_pc().wrapping_add(offset);
-        self.regs.set_pc(target);
-        4 // BL: fetch + decode + link + flush
-    }
-
-    /// Undefined 32-bit instruction.
-    pub(crate) fn thumb32_undefined(&mut self, _hw0: u16, _hw1: u16) -> u32 {
         // TODO: raise UsageFault (Phase 3)
         1
     }
