@@ -127,7 +127,7 @@ impl CortexM33 {
             0b11000 => self.thumb16_stm(opcode, bus),
             0b11001 => self.thumb16_ldm(opcode, bus),
             // Conditional branch + SVC
-            0b11010 | 0b11011 => self.thumb16_cond_branch_svc(opcode),
+            0b11010 | 0b11011 => self.thumb16_cond_branch_svc(opcode, bus),
             // Unconditional branch
             0b11100 => self.thumb16_branch(opcode),
             // 32-bit prefix (should not reach here via this path)

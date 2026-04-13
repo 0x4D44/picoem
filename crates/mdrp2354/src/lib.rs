@@ -84,7 +84,7 @@ impl Emulator {
 
     /// Load flash image (appears at XIP address 0x10000000).
     pub fn load_flash(&mut self, data: &[u8]) {
-        self.bus.memory.load_flash(data);
+        self.bus.load_flash(data);
     }
 
     /// Step the entire system by one clock cycle.

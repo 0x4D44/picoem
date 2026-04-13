@@ -598,6 +598,9 @@ impl CortexM33 {
                 if load {
                     let val = bus.read32(addr);
                     if rt == 15 {
+                        if Self::is_exc_return(val) {
+                            return self.exit_exception(val, bus);
+                        }
                         self.regs.set_pc(val & !1);
                         return 5; // load + pipeline flush
                     }
@@ -633,6 +636,9 @@ impl CortexM33 {
                 if load {
                     let val = bus.read32(addr);
                     if i == 15 {
+                        if Self::is_exc_return(val) {
+                            return self.exit_exception(val, bus);
+                        }
                         self.regs.set_pc(val & !1);
                     } else {
                         self.regs.r[i] = val;
@@ -1655,8 +1661,9 @@ impl CortexM33 {
 
     // -- Undefined 32-bit instruction ----------------------------------------
 
+    /// Undefined 32-bit instruction — raises UsageFault.
     pub(crate) fn thumb32_undefined(&mut self, _hw0: u16, _hw1: u16) -> u32 {
-        // TODO: raise UsageFault (Phase 3)
-        1
+        self.pending_fault = Some(super::Fault::UsageFault);
+        0
     }
 }

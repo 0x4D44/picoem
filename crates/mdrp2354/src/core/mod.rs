@@ -3,9 +3,17 @@ mod decode;
 mod execute;
 pub(crate) mod execute_thumb32;
 mod execute_fpu;
+pub(crate) mod exceptions;
 
 use crate::bus::Bus;
 pub use registers::Registers;
+
+/// Synchronous faults raised during instruction execution.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Fault {
+    UsageFault,
+    // BusFault is delivered via bus.bus_fault() flag, not this enum
+}
 
 /// Cortex-M33 CPU core.
 pub struct CortexM33 {
@@ -20,6 +28,8 @@ pub struct CortexM33 {
     current_instr_addr: u32,
     /// IT block state. Format: cond[7:4]:mask[3:0]. mask=0 means not in IT block.
     it_state: u8,
+    /// Pending synchronous fault from the most recent instruction.
+    pub(crate) pending_fault: Option<Fault>,
 }
 
 impl CortexM33 {
@@ -34,6 +44,7 @@ impl CortexM33 {
             core_id,
             current_instr_addr: 0,
             it_state: 0,
+            pending_fault: None,
         }
     }
 
@@ -43,7 +54,35 @@ impl CortexM33 {
             self.stall_cycles -= 1;
             return;
         }
-        let cycles = self.decode_execute(bus);
+        let mut cycles = self.decode_execute(bus);
+
+        // Synchronous bus fault
+        let mut fault_handled = false;
+        if bus.bus_fault() {
+            fault_handled = true;
+            let core = bus.active_core();
+            let busfault_ena = bus.ppb[core].shcsr & (1 << 17) != 0;
+            bus.ppb[core].cfsr |= (1 << 9) | (1 << 15); // PRECISERR + BFARVALID
+            bus.ppb[core].bfar = bus.bus_fault_addr();
+            bus.clear_bus_fault();
+            if busfault_ena {
+                cycles = self.enter_exception(5, bus);
+            } else {
+                bus.ppb[bus.active_core()].hfsr |= 1 << 30;
+                cycles = self.enter_exception(3, bus);
+            }
+        }
+
+        // Synchronous instruction fault (skip if bus fault already handled —
+        // taking both would double-stack; Phase 3 takes only the first)
+        if !fault_handled {
+            if let Some(fault) = self.pending_fault.take() {
+                cycles = self.deliver_fault(fault, bus);
+            }
+        } else {
+            self.pending_fault = None;
+        }
+
         self.stall_cycles = cycles.saturating_sub(1);
     }
 
