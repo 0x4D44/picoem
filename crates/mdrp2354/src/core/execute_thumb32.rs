@@ -48,6 +48,55 @@ pub(crate) fn extract_imm12(hw0: u16, hw1: u16) -> u32 {
 }
 
 // ============================================================================
+// Barrel shift helper (for shifted-register instructions)
+// ============================================================================
+
+/// Apply an immediate-specified barrel shift to a value.
+/// shift_type: 00=LSL, 01=LSR, 10=ASR, 11=ROR (with amount=0 meaning RRX).
+/// Returns (shifted_value, carry_out).
+#[inline(always)]
+pub(crate) fn barrel_shift(val: u32, shift_type: u8, amount: u32, carry_in: bool) -> (u32, bool) {
+    match shift_type {
+        0b00 => {
+            // LSL
+            if amount == 0 {
+                (val, carry_in)
+            } else {
+                (val << amount, (val >> (32 - amount)) & 1 != 0)
+            }
+        }
+        0b01 => {
+            // LSR: amount=0 encodes LSR #32
+            if amount == 0 {
+                (0, val >> 31 != 0)
+            } else {
+                (val >> amount, (val >> (amount - 1)) & 1 != 0)
+            }
+        }
+        0b10 => {
+            // ASR: amount=0 encodes ASR #32
+            let sv = val as i32;
+            if amount == 0 {
+                ((sv >> 31) as u32, sv < 0)
+            } else {
+                ((sv >> amount) as u32, (sv >> (amount as i32 - 1)) & 1 != 0)
+            }
+        }
+        _ => {
+            // ROR: amount=0 encodes RRX (rotate right through carry by 1)
+            if amount == 0 {
+                // RRX: (carry_in << 31) | (val >> 1), carry_out = bit[0]
+                let result = ((carry_in as u32) << 31) | (val >> 1);
+                (result, val & 1 != 0)
+            } else {
+                let result = val.rotate_right(amount);
+                (result, (val >> (amount - 1)) & 1 != 0)
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Thumb-32 instruction handlers
 // ============================================================================
 
@@ -288,7 +337,143 @@ impl CortexM33 {
     // -- Data processing (shifted register) ----------------------------------
 
     pub(crate) fn thumb32_dp_shifted_reg(&mut self, hw0: u16, hw1: u16) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+        let op = ((hw0 >> 5) & 0xF) as u8;
+        let s = (hw0 >> 4) & 1 != 0;
+        let rn = (hw0 & 0xF) as usize;
+        let rd = ((hw1 >> 8) & 0xF) as usize;
+        let rm = (hw1 & 0xF) as usize;
+        let shift_type = ((hw1 >> 4) & 0x3) as u8;
+        let shift_n = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
+
+        let (shifted, shift_carry) =
+            barrel_shift(self.regs.r[rm], shift_type, shift_n, self.regs.flag_c());
+
+        match op {
+            // AND / TST
+            0b0000 => {
+                let result = self.regs.r[rn] & shifted;
+                if s && rd == 15 {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(shift_carry);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nz(result);
+                        self.regs.set_flag_c(shift_carry);
+                    }
+                }
+                1
+            }
+            // BIC
+            0b0001 => {
+                let result = self.regs.r[rn] & !shifted;
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(shift_carry);
+                }
+                1
+            }
+            // ORR / MOV (Rn=15)
+            0b0010 => {
+                let result = if rn == 15 {
+                    shifted // MOV.W / shift-by-immediate
+                } else {
+                    self.regs.r[rn] | shifted
+                };
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(shift_carry);
+                }
+                1
+            }
+            // ORN / MVN (Rn=15)
+            0b0011 => {
+                let result = if rn == 15 {
+                    !shifted
+                } else {
+                    self.regs.r[rn] | !shifted
+                };
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(shift_carry);
+                }
+                1
+            }
+            // EOR / TEQ
+            0b0100 => {
+                let result = self.regs.r[rn] ^ shifted;
+                if s && rd == 15 {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(shift_carry);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nz(result);
+                        self.regs.set_flag_c(shift_carry);
+                    }
+                }
+                1
+            }
+            // ADD / CMN
+            0b1000 => {
+                let (result, carry, overflow) = add_with_carry(self.regs.r[rn], shifted, false);
+                if s && rd == 15 {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    }
+                }
+                1
+            }
+            // ADC
+            0b1010 => {
+                let (result, carry, overflow) =
+                    add_with_carry(self.regs.r[rn], shifted, self.regs.flag_c());
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                }
+                1
+            }
+            // SBC
+            0b1011 => {
+                let (result, carry, overflow) =
+                    add_with_carry(self.regs.r[rn], !shifted, self.regs.flag_c());
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                }
+                1
+            }
+            // SUB / CMP
+            0b1101 => {
+                let (result, carry, overflow) = add_with_carry(self.regs.r[rn], !shifted, true);
+                if s && rd == 15 {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    }
+                }
+                1
+            }
+            // RSB
+            0b1110 => {
+                let (result, carry, overflow) = add_with_carry(!self.regs.r[rn], shifted, true);
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                }
+                1
+            }
+            _ => self.thumb32_undefined(hw0, hw1),
+        }
     }
 
     // -- Load/store single ---------------------------------------------------
@@ -427,8 +612,78 @@ impl CortexM33 {
 
     // -- Load/store dual, exclusive, table branch ----------------------------
 
-    pub(crate) fn thumb32_load_store_dual(&mut self, hw0: u16, hw1: u16, _bus: &mut Bus) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+    pub(crate) fn thumb32_load_store_dual(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        // TBB/TBH: hw0 = 1110_1000_1101_Rn (hw0[7:4]=1101), hw1[15:12]=1111, hw1[7:5]=000
+        if hw0 & 0xFFF0 == 0xE8D0 && (hw1 >> 12) & 0xF == 0xF && (hw1 >> 5) & 0x7 == 0 {
+            let rn = (hw0 & 0xF) as usize;
+            let rm = (hw1 & 0xF) as usize;
+            let h = (hw1 >> 4) & 1 != 0;
+            let base = self.regs.r[rn];
+            if h {
+                let halfword = bus.read16(base.wrapping_add(self.regs.r[rm] << 1));
+                self.regs.set_pc(self.read_pc().wrapping_add((halfword as u32) << 1));
+            } else {
+                let byte = bus.read8(base.wrapping_add(self.regs.r[rm]));
+                self.regs.set_pc(self.read_pc().wrapping_add((byte as u32) << 1));
+            }
+            return 4;
+        }
+
+        // LDREX: hw0 = 1110_1000_0101_Rn (0xE85x)
+        // STREX: hw0 = 1110_1000_0100_Rn (0xE84x)
+        if hw0 & 0xFFF0 == 0xE850 {
+            // LDREX (treat as normal LDR for Phase 1)
+            let rn = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let imm8 = (hw1 & 0xFF) as u32;
+            let addr = self.regs.r[rn].wrapping_add(imm8 << 2);
+            self.regs.r[rt] = bus.read32(addr);
+            return 2;
+        }
+        if hw0 & 0xFFF0 == 0xE840 {
+            // STREX (treat as normal STR for Phase 1, Rd gets 0 = success)
+            let rn = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let rd = ((hw1 >> 8) & 0xF) as usize;
+            let imm8 = (hw1 & 0xFF) as u32;
+            let addr = self.regs.r[rn].wrapping_add(imm8 << 2);
+            bus.write32(addr, self.regs.r[rt]);
+            self.regs.r[rd] = 0; // success
+            return 2;
+        }
+
+        // LDREXB/LDREXH/STREXB/STREXH: hw0 = 0xE8Cx or 0xE8Dx patterns
+        // Phase 1: treat as normal load/store variants
+        // (Falls through to LDRD/STRD for any other unrecognized pattern)
+
+        // LDRD/STRD (immediate): default path
+        let p = (hw0 >> 8) & 1 != 0;
+        let u = (hw0 >> 7) & 1 != 0;
+        let w = (hw0 >> 5) & 1 != 0;
+        let load = (hw0 >> 4) & 1 != 0;
+        let rn = (hw0 & 0xF) as usize;
+        let rt = ((hw1 >> 12) & 0xF) as usize;
+        let rt2 = ((hw1 >> 8) & 0xF) as usize;
+        let imm8 = (hw1 & 0xFF) as u32;
+        let offset = imm8 << 2;
+
+        let base = if rn == 15 { self.read_pc() & !3 } else { self.regs.r[rn] };
+        let offset_addr = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
+        let addr = if p { offset_addr } else { base };
+
+        if load {
+            self.regs.r[rt] = bus.read32(addr);
+            self.regs.r[rt2] = bus.read32(addr.wrapping_add(4));
+        } else {
+            bus.write32(addr, self.regs.r[rt]);
+            bus.write32(addr.wrapping_add(4), self.regs.r[rt2]);
+        }
+
+        if w && rn != 15 {
+            self.regs.r[rn] = offset_addr;
+        }
+
+        3 // 1+2 for both load and store
     }
 
     // -- Branches and miscellaneous control ----------------------------------
@@ -782,6 +1037,13 @@ impl CortexM33 {
     // -- Coprocessor ---------------------------------------------------------
 
     pub(crate) fn thumb32_coprocessor(&mut self, hw0: u16, hw1: u16, _bus: &mut Bus) -> u32 {
+        let _coproc = ((hw1 >> 8) & 0xF) as u8;
+        // Phase 1: all coprocessor instructions are undefined stubs.
+        // Future phases will dispatch on _coproc:
+        //   0       → GPIO coprocessor
+        //   4 | 5   → DCP (double-precision coprocessor)
+        //   7       → RCP (runtime check coprocessor)
+        //   10 | 11 → FPU
         self.thumb32_undefined(hw0, hw1)
     }
 

@@ -2496,3 +2496,255 @@ fn umlal_basic() {
     assert_eq!(c.reg(1), 0);
     assert_eq!(cy, 1);
 }
+
+// ============================================================================
+// Thumb-32: Data Processing (Shifted Register)
+// ============================================================================
+
+/// Encode a data-processing (shifted register) instruction.
+/// Format: 11101_01_op[3:0]_S_Rn  0_imm3_Rd_imm2_tt_Rm
+fn encode_dp_shifted_reg(
+    op: u8, s: bool, rn: u8, rd: u8, rm: u8, shift_type: u8, shift_n: u8,
+) -> (u16, u16) {
+    // hw0 = 11101_01_op[3:0]_S_Rn[3:0]
+    let hw0: u16 = 0xEA00
+        | ((op as u16 & 0xF) << 5)
+        | ((s as u16) << 4)
+        | (rn as u16 & 0xF);
+    // hw1 = 0_imm3_Rd_imm2_tt_Rm
+    // shift_n[4:2] = imm3, shift_n[1:0] = imm2
+    let imm3 = ((shift_n >> 2) & 0x7) as u16;
+    let imm2 = (shift_n & 0x3) as u16;
+    let hw1: u16 = (imm3 << 12)
+        | ((rd as u16 & 0xF) << 8)
+        | (imm2 << 6)
+        | ((shift_type as u16 & 0x3) << 4)
+        | (rm as u16 & 0xF);
+    (hw0, hw1)
+}
+
+#[test]
+fn add_w_shifted_reg() {
+    // ADD.W R0, R1, R2, LSL #2 → R0 = R1 + (R2 << 2) = 10 + (3 << 2) = 22
+    let mut c = CortexM33::new();
+    c.set_reg(1, 10);
+    c.set_reg(2, 3);
+    let (hw0, hw1) = encode_dp_shifted_reg(0b1000, false, 1, 0, 2, 0b00, 2);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 22);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn sub_w_shifted_reg() {
+    // SUB.W R0, R1, R2, LSR #1 → R0 = R1 - (R2 >> 1) = 100 - (20 >> 1) = 90
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    c.set_reg(2, 20);
+    let (hw0, hw1) = encode_dp_shifted_reg(0b1101, false, 1, 0, 2, 0b01, 1);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 90);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn and_w_shifted_reg() {
+    // AND.W R0, R1, R2 (no shift, LSL #0)
+    // R0 = R1 & R2 = 0xFF00_FF00 & 0x00FF_00FF = 0x0000_0000
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xFF00_FF00);
+    c.set_reg(2, 0x00FF_00FF);
+    let (hw0, hw1) = encode_dp_shifted_reg(0b0000, false, 1, 0, 2, 0b00, 0);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn cmp_w_shifted_reg() {
+    // CMP.W R1, R2, ASR #3 (S=1, Rd=15 → flags only, no write)
+    // R1=100, R2=0x80 (128). ASR #3 = 128 >> 3 = 16.
+    // 100 - 16 = 84 → positive, no borrow, no overflow.
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    c.set_reg(2, 128);
+    let (hw0, hw1) = encode_dp_shifted_reg(0b1101, true, 1, 15, 2, 0b10, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert!(!c.flag_n());
+    assert!(!c.flag_z());
+    assert!(c.flag_c());   // no borrow → C=1
+    assert!(!c.flag_v());
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn mov_w_shift_imm() {
+    // LSL.W R0, R1, #4 — encoded as MOV variant: op=0010, Rn=15
+    // R0 = R1 << 4 = 0xA << 4 = 0xA0
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xA);
+    let (hw0, hw1) = encode_dp_shifted_reg(0b0010, false, 15, 0, 1, 0b00, 4);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xA0);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn rrx_w() {
+    // RRX R0, R1 — shift_type=11, amount=0 → rotate right through carry
+    // R1 = 0x0000_0003, carry_in = 1
+    // RRX: result = (1 << 31) | (3 >> 1) = 0x8000_0001, carry_out = bit[0] of 3 = 1
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_0003);
+    c.regs.set_flag_c(true);
+    // MOV variant: op=0010, Rn=15, S=1 to see carry_out
+    let (hw0, hw1) = encode_dp_shifted_reg(0b0010, true, 15, 0, 1, 0b11, 0);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x8000_0001);
+    assert!(c.flag_n());   // bit 31 set
+    assert!(!c.flag_z());
+    assert!(c.flag_c());   // carry_out from RRX = bit[0] of input
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn orr_w_shifted() {
+    // ORR.W R0, R1, R2, ROR #8
+    // R1 = 0xFF00_0000, R2 = 0x0000_00AB
+    // R2 ROR 8 = 0xAB00_0000
+    // R0 = 0xFF00_0000 | 0xAB00_0000 = 0xFF00_0000
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xFF00_0000);
+    c.set_reg(2, 0x0000_00AB);
+    let (hw0, hw1) = encode_dp_shifted_reg(0b0010, false, 1, 0, 2, 0b11, 8);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xFF00_0000 | 0xAB00_0000);
+    assert_eq!(cy, 1);
+}
+
+// ============================================================================
+// Thumb-32: Load/Store Dual (LDRD / STRD)
+// ============================================================================
+
+/// Encode LDRD/STRD immediate.
+/// Format: 1110_100_P_U_1_W_L_Rn  Rt_Rt2_imm8
+fn encode_ldrd_strd(
+    p: bool, u: bool, w: bool, load: bool, rn: u8, rt: u8, rt2: u8, imm8: u8,
+) -> (u16, u16) {
+    let hw0: u16 = 0xE800
+        | ((p as u16) << 8)
+        | ((u as u16) << 7)
+        | (1u16 << 6) // bit 6 always 1 for LDRD/STRD
+        | ((w as u16) << 5)
+        | ((load as u16) << 4)
+        | (rn as u16 & 0xF);
+    let hw1: u16 = ((rt as u16 & 0xF) << 12)
+        | ((rt2 as u16 & 0xF) << 8)
+        | (imm8 as u16);
+    (hw0, hw1)
+}
+
+#[test]
+fn ldrd_basic() {
+    // LDRD R0, R1, [R2, #8]: P=1, U=1, W=0, load=1
+    // offset = 8 >> 2 = imm8=2, actual offset = 2 << 2 = 8
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(2, 0x2000_0000);
+    bus.write32(0x2000_0008, 0xAAAA_BBBB);
+    bus.write32(0x2000_000C, 0xCCCC_DDDD);
+    let (hw0, hw1) = encode_ldrd_strd(true, true, false, true, 2, 0, 1, 2);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0xAAAA_BBBB);
+    assert_eq!(c.reg(1), 0xCCCC_DDDD);
+    assert_eq!(c.reg(2), 0x2000_0000); // no writeback
+    assert_eq!(cy, 3);
+}
+
+#[test]
+fn strd_basic() {
+    // STRD R0, R1, [R2, #8]: P=1, U=1, W=0, load=0
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(0, 0x1111_2222);
+    c.set_reg(1, 0x3333_4444);
+    c.set_reg(2, 0x2000_0000);
+    let (hw0, hw1) = encode_ldrd_strd(true, true, false, false, 2, 0, 1, 2);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(bus.read32(0x2000_0008), 0x1111_2222);
+    assert_eq!(bus.read32(0x2000_000C), 0x3333_4444);
+    assert_eq!(cy, 3);
+}
+
+#[test]
+fn strd_ldrd_roundtrip() {
+    // Store two words, then load them back into different registers
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(0, 0xDEAD_BEEF);
+    c.set_reg(1, 0xCAFE_BABE);
+    c.set_reg(4, 0x2000_0100);
+
+    // STRD R0, R1, [R4, #16]
+    let (hw0, hw1) = encode_ldrd_strd(true, true, false, false, 4, 0, 1, 4); // imm8=4 → offset=16
+    c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(bus.read32(0x2000_0110), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2000_0114), 0xCAFE_BABE);
+
+    // LDRD R2, R3, [R4, #16]
+    let (hw0, hw1) = encode_ldrd_strd(true, true, false, true, 4, 2, 3, 4);
+    c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(2), 0xDEAD_BEEF);
+    assert_eq!(c.reg(3), 0xCAFE_BABE);
+}
+
+#[test]
+fn ldrd_literal() {
+    // LDRD with Rn=15 (PC-relative). PC must be in SRAM so literal addr is writable.
+    // PC at 0x2000_1000, read_pc = 0x2000_1004, aligned = 0x2000_1004
+    // offset = 4 (imm8=1, offset = 1<<2 = 4), U=1 → addr = 0x2000_1008
+    let (mut c, mut bus) = core_and_bus();
+    c.regs.set_pc(0x2000_1000);
+    bus.write32(0x2000_1008, 0x1234_5678);
+    bus.write32(0x2000_100C, 0x9ABC_DEF0);
+    let (hw0, hw1) = encode_ldrd_strd(true, true, false, true, 15, 0, 1, 1);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0x1234_5678);
+    assert_eq!(c.reg(1), 0x9ABC_DEF0);
+    assert_eq!(cy, 3);
+}
+
+// ============================================================================
+// Thumb-32: TBB / TBH (Table Branch)
+// ============================================================================
+
+#[test]
+fn tbb_basic() {
+    // TBB [R0, R1]: read byte at R0+R1, branch PC += 2*byte
+    // hw0 = 1110_1000_1101_Rn = 0xE8D0 | Rn
+    // hw1 = 1111_0000_0000_Rm = 0xF000 | Rm
+    let (mut c, mut bus) = core_and_bus();
+    c.regs.set_pc(0x1000);
+    c.set_reg(0, 0x2000_0000);   // base
+    c.set_reg(1, 3);              // index
+    bus.write8(0x2000_0003, 10);  // table[3] = 10
+    // read_pc = 0x1004, target = 0x1004 + 10*2 = 0x1018
+    let hw0: u16 = 0xE8D0; // Rn=0
+    let hw1: u16 = 0xF001; // Rm=1, H=0
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.regs.pc(), 0x1018);
+    assert_eq!(cy, 4);
+}
+
+#[test]
+fn tbh_basic() {
+    // TBH [R0, R1]: read halfword at R0 + R1*2, branch PC += 2*halfword
+    let (mut c, mut bus) = core_and_bus();
+    c.regs.set_pc(0x1000);
+    c.set_reg(0, 0x2000_0000);   // base
+    c.set_reg(1, 2);              // index
+    bus.write16(0x2000_0004, 20); // table[2] = 20 (at base + 2*2 = base+4)
+    // read_pc = 0x1004, target = 0x1004 + 20*2 = 0x102C
+    let hw0: u16 = 0xE8D0; // Rn=0
+    let hw1: u16 = 0xF011; // Rm=1, H=1 (bit 4 set)
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.regs.pc(), 0x102C);
+    assert_eq!(cy, 4);
+}
