@@ -12,6 +12,10 @@ pub struct PacerStats {
     spin_ns: AtomicU64,
     /// Number of quanta where emulation couldn't keep up with real-time.
     behind_count: AtomicU64,
+    /// Cumulative wall-clock nanoseconds since first begin_quantum().
+    /// This is set (not added) to absolute elapsed time, unlike the
+    /// other counters.
+    wall_ns: AtomicU64,
     /// Whether pacing is currently active. Caller-managed — the Pacer does
     /// not set this automatically. Monitoring consumers can check this to
     /// know if data is flowing.
@@ -25,6 +29,7 @@ impl PacerStats {
             emulation_ns: AtomicU64::new(0),
             spin_ns: AtomicU64::new(0),
             behind_count: AtomicU64::new(0),
+            wall_ns: AtomicU64::new(0),
             running: AtomicBool::new(false),
         }
     }
@@ -36,6 +41,7 @@ impl PacerStats {
             emulation_ns: self.emulation_ns.load(Ordering::Relaxed),
             spin_ns: self.spin_ns.load(Ordering::Relaxed),
             behind_count: self.behind_count.load(Ordering::Relaxed),
+            wall_ns: self.wall_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -53,6 +59,10 @@ impl PacerStats {
 
     pub(crate) fn increment_behind(&self) {
         self.behind_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_wall_ns(&self, ns: u64) {
+        self.wall_ns.store(ns, Ordering::Relaxed);
     }
 
     pub fn set_running(&self, val: bool) {
@@ -78,30 +88,34 @@ impl Default for PacerStats {
 /// so a snapshot may see cycles from quantum N but spin_ns from quantum N-1.
 /// For monitoring/dashboard purposes this is fine — all values are monotonically
 /// increasing and converge quickly.
+///
+/// Preemption caveat: `wall_ns` is derived from TSC at quantum boundaries, so any
+/// OS preemption that lands *during* an in-budget quantum's emulation phase is
+/// folded into `emulation_ns` (we only timestamp at begin/end). `utilization()`
+/// is therefore an upper bound on actual emulation-work fraction — real
+/// utilization is lower by the preemption fraction.
 #[derive(Debug)]
 pub struct PacerSnapshot {
     pub emulated_cycles: u64,
     pub emulation_ns: u64,
     pub spin_ns: u64,
     pub behind_count: u64,
+    pub wall_ns: u64,
 }
 
 impl PacerSnapshot {
-    /// Total host nanoseconds (emulation + spin).
-    pub fn total_ns(&self) -> u64 {
-        self.emulation_ns + self.spin_ns
-    }
-
-    /// Fraction of time spent emulating (0.0..=1.0).
+    /// Upper bound on fraction of wall time spent emulating. Note: any OS
+    /// preemption that lands during an in-budget quantum's emulation phase
+    /// is counted as emulation time (we only timestamp at quantum boundaries).
+    /// Real utilization is lower by the preemption fraction.
     pub fn utilization(&self) -> f64 {
-        let total = self.total_ns();
-        if total == 0 {
+        if self.wall_ns == 0 {
             return 0.0;
         }
-        self.emulation_ns as f64 / total as f64
+        self.emulation_ns as f64 / self.wall_ns as f64
     }
 
-    /// Fraction of time spent spinning (1.0 - utilization).
+    /// Fraction of wall time not spent emulating (1.0 - utilization).
     pub fn headroom(&self) -> f64 {
         1.0 - self.utilization()
     }
@@ -109,11 +123,10 @@ impl PacerSnapshot {
     /// Effective emulated clock rate in MHz.
     /// Formula: cycles/ns = GHz; multiply by 10^3 to convert to MHz.
     pub fn emulated_mhz(&self) -> f64 {
-        let total = self.total_ns();
-        if total == 0 {
+        if self.wall_ns == 0 {
             return 0.0;
         }
-        self.emulated_cycles as f64 / total as f64 * 1000.0
+        self.emulated_cycles as f64 / self.wall_ns as f64 * 1000.0
     }
 }
 
@@ -164,6 +177,59 @@ fn calibrate_tsc() -> u64 {
     (tsc1 - tsc0) * 1_000_000_000 / elapsed_ns
 }
 
+/// Measure per-quantum overhead empirically. Runs 5 batches of 2000 no-op
+/// quanta each and returns the minimum measured overhead (least disturbed
+/// by OS preemption). Clamps to nominal/4 maximum to survive pathological
+/// calibration runs.
+#[cfg(target_arch = "x86_64")]
+fn calibrate_overhead(nominal_quantum_tsc: u64) -> u64 {
+    const BATCHES: usize = 5;
+    const PER_BATCH: u64 = 2000;
+
+    // Throwaway stats to exercise the same atomic updates production does.
+    let stats = PacerStats::new();
+
+    let mut min_overhead = u64::MAX;
+    for _ in 0..BATCHES {
+        let first = rdtscp();
+        let mut quantum_start = first;
+        for _ in 0..PER_BATCH {
+            // Mimic end_quantum: measurement + spin + stats updates.
+            let emu_end = rdtscp();
+            let emulation_tsc = emu_end - quantum_start;
+            if emulation_tsc < nominal_quantum_tsc {
+                let target = quantum_start + nominal_quantum_tsc;
+                let mut now = emu_end;
+                while now < target {
+                    std::hint::spin_loop();
+                    now = rdtsc();
+                }
+                stats.add_emulation_ns(0);
+                stats.add_spin_ns(0);
+            } else {
+                stats.add_emulation_ns(0);
+                stats.increment_behind();
+            }
+            stats.add_emulated_cycles(150);
+            stats.set_wall_ns(0);
+
+            // Mimic next begin_quantum.
+            quantum_start = rdtscp();
+        }
+        let elapsed = quantum_start - first;
+        let per_quantum = elapsed / PER_BATCH;
+        let overhead = per_quantum.saturating_sub(nominal_quantum_tsc);
+        if overhead < min_overhead {
+            min_overhead = overhead;
+        }
+    }
+
+    // Safety clamp: if calibration is catastrophically wrong, cap the
+    // correction at 25% of nominal rather than panicking on zero ticks.
+    let max_overhead = nominal_quantum_tsc / 4;
+    min_overhead.min(max_overhead)
+}
+
 /// Real-time pacer that spin-waits to keep emulation at the target clock rate.
 ///
 /// Usage:
@@ -185,6 +251,9 @@ pub struct Pacer {
     quantum_tsc_ticks: u64,
     /// rdtsc value at start of current quantum.
     quantum_start_tsc: u64,
+    /// rdtsc value at the first begin_quantum() call (0 until set).
+    /// Used as the origin for cumulative wall-clock accounting.
+    first_begin_tsc: u64,
     /// Calibrated TSC frequency in Hz.
     tsc_freq_hz: u64,
     /// Emulator system clock in Hz (e.g. 150_000_000).
@@ -196,12 +265,15 @@ pub struct Pacer {
 #[cfg(target_arch = "x86_64")]
 impl Pacer {
     /// Create a new pacer for the given emulator clock frequency.
-    /// Calibrates the TSC at construction time (~50 ms one-time cost).
+    /// Calibrates the TSC at construction time (~50 ms) then runs overhead
+    /// calibration (~10 ms) to pre-compensate the quantum budget.
     pub fn new(sys_clk_hz: u32) -> Self {
         let tsc_freq_hz = calibrate_tsc();
         let quantum_cycles: u64 = 150;
-        let quantum_tsc_ticks =
+        let nominal =
             (tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
+        let overhead = calibrate_overhead(nominal);
+        let quantum_tsc_ticks = nominal.saturating_sub(overhead);
         assert!(quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero — quantum too small for TSC resolution");
 
         Self {
@@ -209,6 +281,7 @@ impl Pacer {
             quantum_cycles,
             quantum_tsc_ticks,
             quantum_start_tsc: 0,
+            first_begin_tsc: 0,
             tsc_freq_hz,
             sys_clk_hz: sys_clk_hz as u64,
         }
@@ -219,8 +292,10 @@ impl Pacer {
         assert!(quantum_cycles > 0, "quantum_cycles must be non-zero");
         let mut pacer = Self::new(sys_clk_hz);
         pacer.quantum_cycles = quantum_cycles;
-        pacer.quantum_tsc_ticks =
+        let nominal =
             (pacer.tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
+        let overhead = calibrate_overhead(nominal);
+        pacer.quantum_tsc_ticks = nominal.saturating_sub(overhead);
         assert!(pacer.quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero — quantum too small for TSC resolution");
         pacer
     }
@@ -243,7 +318,11 @@ impl Pacer {
     /// Mark the start of a quantum. Call before stepping the emulator.
     #[inline(always)]
     pub fn begin_quantum(&mut self) {
-        self.quantum_start_tsc = rdtscp();
+        let tsc = rdtscp();
+        if self.first_begin_tsc == 0 {
+            self.first_begin_tsc = tsc;
+        }
+        self.quantum_start_tsc = tsc;
     }
 
     /// End a quantum. Spin-waits if we're ahead of real-time, updates stats.
@@ -255,13 +334,14 @@ impl Pacer {
         // TSC wraparound: at 5 GHz, u64 wraps after ~117 years. If it does wrap
         // (or a VM offsets the TSC), unsigned subtraction produces a large value
         // and we take the "behind" path — safe degradation.
-        let emulation_tsc = rdtscp() - self.quantum_start_tsc;
+        let emu_end = rdtscp();
+        let emulation_tsc = emu_end - self.quantum_start_tsc;
 
-        if emulation_tsc < self.quantum_tsc_ticks {
+        let final_tsc = if emulation_tsc < self.quantum_tsc_ticks {
             // Ahead of real-time — spin wait.
             // Capture exit TSC inside the loop to avoid post-loop measurement skew.
             let target_tsc = self.quantum_start_tsc + self.quantum_tsc_ticks;
-            let mut now = rdtsc();
+            let mut now = emu_end;
             while now < target_tsc {
                 std::hint::spin_loop();
                 now = rdtsc();
@@ -271,13 +351,19 @@ impl Pacer {
 
             self.stats.add_emulation_ns(self.tsc_to_ns(emulation_tsc));
             self.stats.add_spin_ns(self.tsc_to_ns(spin_tsc));
+            now
         } else {
             // Behind real-time — skip spin, record it
             self.stats.add_emulation_ns(self.tsc_to_ns(emulation_tsc));
             self.stats.increment_behind();
-        }
+            emu_end
+        };
 
         self.stats.add_emulated_cycles(self.quantum_cycles);
+
+        // Update cumulative wall time since first begin_quantum.
+        let wall_tsc = final_tsc - self.first_begin_tsc;
+        self.stats.set_wall_ns(self.tsc_to_ns(wall_tsc));
     }
 
     /// Convert TSC ticks to nanoseconds.
@@ -299,6 +385,7 @@ mod tests {
         assert_eq!(snap.emulation_ns, 0);
         assert_eq!(snap.spin_ns, 0);
         assert_eq!(snap.behind_count, 0);
+        assert_eq!(snap.wall_ns, 0);
         assert!(!stats.is_running());
     }
 
@@ -324,6 +411,8 @@ mod tests {
         assert_eq!(snap.emulation_ns, 500);
         assert_eq!(snap.spin_ns, 300);
         assert_eq!(snap.behind_count, 2);
+        // set_wall_ns hasn't been called, so wall_ns remains 0.
+        assert_eq!(snap.wall_ns, 0);
     }
 
     #[test]
@@ -343,6 +432,7 @@ mod tests {
             emulation_ns: 0,
             spin_ns: 0,
             behind_count: 0,
+            wall_ns: 0,
         };
         assert_eq!(snap.utilization(), 0.0);
     }
@@ -354,6 +444,7 @@ mod tests {
             emulation_ns: 500,
             spin_ns: 500,
             behind_count: 0,
+            wall_ns: 1000,
         };
         assert!((snap.utilization() - 0.5).abs() < f64::EPSILON);
     }
@@ -365,6 +456,7 @@ mod tests {
             emulation_ns: 1000,
             spin_ns: 0,
             behind_count: 0,
+            wall_ns: 1000,
         };
         assert!((snap.utilization() - 1.0).abs() < f64::EPSILON);
     }
@@ -376,6 +468,7 @@ mod tests {
             emulation_ns: 300,
             spin_ns: 700,
             behind_count: 0,
+            wall_ns: 1000,
         };
         assert!((snap.headroom() - 0.7).abs() < f64::EPSILON);
     }
@@ -387,6 +480,7 @@ mod tests {
             emulation_ns: 500_000,
             spin_ns: 500_000,
             behind_count: 0,
+            wall_ns: 1_000_000,
         };
         assert!((snap.emulated_mhz() - 150.0).abs() < f64::EPSILON);
     }
@@ -398,6 +492,7 @@ mod tests {
             emulation_ns: 0,
             spin_ns: 0,
             behind_count: 0,
+            wall_ns: 0,
         };
         assert_eq!(snap.emulated_mhz(), 0.0);
     }
@@ -484,5 +579,15 @@ mod tests {
         let total = snap.emulation_ns + snap.spin_ns;
         assert!(total > 0, "total ns should be non-zero after a quantum");
         assert!(total < 1_000_000_000, "a single quantum should take < 1 second");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_pacer_wall_ns_after_quantum() {
+        let mut pacer = Pacer::new(150_000_000);
+        pacer.begin_quantum();
+        pacer.end_quantum();
+        let snap = pacer.stats().snapshot();
+        assert!(snap.wall_ns > 0, "wall_ns should be non-zero after a quantum");
     }
 }

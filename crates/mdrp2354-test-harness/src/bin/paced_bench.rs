@@ -72,10 +72,19 @@ fn main() {
     println!("Avg util:       {:.1}%", snap.utilization() * 100.0);
     println!("Behind count:   {}", snap.behind_count);
 
-    if snap.behind_count == 0 && snap.utilization() < 1.0 {
-        println!("Verdict:        REAL-TIME OK ({:.1}% headroom)", snap.headroom() * 100.0);
+    let total_quanta = snap.emulated_cycles / quantum as u64;
+    let behind_rate = snap.behind_count as f64 / total_quanta.max(1) as f64;
+    let mhz_ratio = snap.emulated_mhz() / clock_mhz as f64;
+
+    if mhz_ratio >= 0.99 && behind_rate < 0.001 {
+        println!("Verdict:        REAL-TIME OK ({:.1}% of target, {:.2}% headroom, {:.3}% behind)",
+                 mhz_ratio * 100.0, snap.headroom() * 100.0, behind_rate * 100.0);
+    } else if mhz_ratio >= 0.95 && behind_rate < 0.01 {
+        println!("Verdict:        REAL-TIME MARGINAL ({:.1}% of target, {:.2}% behind)",
+                 mhz_ratio * 100.0, behind_rate * 100.0);
     } else {
-        println!("Verdict:        CANNOT SUSTAIN REAL-TIME");
+        println!("Verdict:        CANNOT SUSTAIN REAL-TIME ({:.1}% of target, {:.2}% behind)",
+                 mhz_ratio * 100.0, behind_rate * 100.0);
     }
 }
 
