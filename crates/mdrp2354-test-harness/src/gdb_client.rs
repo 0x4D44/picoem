@@ -397,9 +397,10 @@ pub fn sanity_check(gdb: &mut GdbClient) -> io::Result<()> {
     //    QEMU omits EPSR.T from this read, so we don't check bit 24.
     let xpsr = gdb.read_reg(REG_XPSR)?;
 
-    // Bits 26:25 (ICI/IT), bits 15:10 (ICI/IT), bits 8:0 (exception number)
-    // should all be zero at reset. If they're not, the index is probably wrong.
-    let unexpected = xpsr & 0x0600_FC1F;
+    // Bits 26:25 (ICI/IT) and bits 15:10 (ICI/IT) should be zero at reset.
+    // Exception number bits [8:0] are excluded: QEMU may boot into HardFault
+    // if the vector table wasn't present during the reset sequence.
+    let unexpected = xpsr & 0x0600_FC00;
     if unexpected != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

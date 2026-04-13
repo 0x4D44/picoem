@@ -772,10 +772,10 @@ pub fn enc_t32_qdsub(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
 //   hw1 = 1111_Rd_0_op2[2:0]_Rm        (par_op2 = hw1[6:4])
 
 /// Parameterised parallel add/sub encoder.
-/// `prefix` = par_op1 (3 bits), `op` = par_op2 (3 bits).
-pub fn enc_t32_parallel(prefix: u16, op: u16, rn: u16, rd: u16, rm: u16) -> (u16, u16) {
-    let hw0 = 0xFA80 | ((prefix & 0x7) << 4) | (rn & 0xF);
-    let hw1 = 0xF000 | ((rd & 0xF) << 8) | ((op & 0x7) << 4) | (rm & 0xF);
+/// `operation` = par_op1/hw0[6:4] (3 bits), `modifier` = par_op2/hw1[6:4] (3 bits).
+pub fn enc_t32_parallel(operation: u16, modifier: u16, rn: u16, rd: u16, rm: u16) -> (u16, u16) {
+    let hw0 = 0xFA80 | ((operation & 0x7) << 4) | (rn & 0xF);
+    let hw1 = 0xF000 | ((rd & 0xF) << 8) | ((modifier & 0x7) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
@@ -3644,7 +3644,7 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
     // ----------------------------------------------------------------
     // Parallel add/subtract — SADD16, SSUB16, UADD8, USUB8
     // ----------------------------------------------------------------
-    // SADD16: prefix=0b001, op=0b000
+    // SADD16: operation=ADD16=0b001, modifier=signed=0b000
     {
         let (hw0, hw1) = enc_t32_parallel(0b001, 0b000, 1, 0, 2);
         t.push(TestCase {
@@ -3667,9 +3667,9 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
             ..TestCase::default()
         });
     }
-    // SSUB16: prefix=0b001, op=0b011
+    // SSUB16: operation=SUB16=0b101, modifier=signed=0b000
     {
-        let (hw0, hw1) = enc_t32_parallel(0b001, 0b011, 1, 0, 2);
+        let (hw0, hw1) = enc_t32_parallel(0b101, 0b000, 1, 0, 2);
         t.push(TestCase {
             name: "SSUB16 R0,R1,R2 (packed 16-bit sub)".into(),
             opcode: hw0, hw1: Some(hw1),
@@ -3679,9 +3679,9 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         });
     }
 
-    // UADD8: prefix=0b100, op=0b000 (unsigned 8-bit lanes)
+    // UADD8: operation=ADD8=0b000, modifier=unsigned=0b100
     {
-        let (hw0, hw1) = enc_t32_parallel(0b100, 0b000, 1, 0, 2);
+        let (hw0, hw1) = enc_t32_parallel(0b000, 0b100, 1, 0, 2);
         t.push(TestCase {
             name: "UADD8 R0,R1,R2 (packed 8-bit add)".into(),
             opcode: hw0, hw1: Some(hw1),
@@ -3691,7 +3691,7 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
             ..TestCase::default()
         });
     }
-    // USUB8: prefix=0b100, op=0b100
+    // USUB8: operation=SUB8=0b100, modifier=unsigned=0b100
     {
         let (hw0, hw1) = enc_t32_parallel(0b100, 0b100, 1, 0, 2);
         t.push(TestCase {
@@ -3703,7 +3703,7 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         });
     }
 
-    // SADD8: prefix=0b000, op=0b000
+    // SADD8: operation=ADD8=0b000, modifier=signed=0b000
     {
         let (hw0, hw1) = enc_t32_parallel(0b000, 0b000, 1, 0, 2);
         t.push(TestCase {
@@ -3764,10 +3764,10 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
     }
 
     // ----------------------------------------------------------------
-    // Saturating add/sub with parallel: QADD16 (prefix=0b010, op=0b000)
+    // Saturating add/sub with parallel: QADD16 (operation=ADD16=0b001, modifier=Q-signed=0b001)
     // ----------------------------------------------------------------
     {
-        let (hw0, hw1) = enc_t32_parallel(0b010, 0b000, 1, 0, 2);
+        let (hw0, hw1) = enc_t32_parallel(0b001, 0b001, 1, 0, 2);
         t.push(TestCase {
             name: "QADD16 R0,R1,R2 (saturating 16-bit add)".into(),
             opcode: hw0, hw1: Some(hw1),
@@ -3777,10 +3777,9 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
             ..TestCase::default()
         });
     }
-    // UQADD8 (prefix=0b011, op=0b000 for unsigned saturating — wait, prefix 011 = unsigned halving 16.
-    // Actually: prefix=0b111 = unsigned halving 16. Let me use UADD16 (prefix=0b101, op=0b000)
+    // UADD16: operation=ADD16=0b001, modifier=unsigned=0b100
     {
-        let (hw0, hw1) = enc_t32_parallel(0b101, 0b000, 1, 0, 2);
+        let (hw0, hw1) = enc_t32_parallel(0b001, 0b100, 1, 0, 2);
         t.push(TestCase {
             name: "UADD16 R0,R1,R2 (unsigned 16-bit add)".into(),
             opcode: hw0, hw1: Some(hw1),

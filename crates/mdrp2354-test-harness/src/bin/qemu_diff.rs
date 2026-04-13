@@ -94,10 +94,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Connect GDB with retry
     let mut gdb = GdbClient::connect("localhost:3333", Duration::from_secs(5))?;
     gdb.handshake()?;
-    sanity_check(&mut gdb)?;
 
-    // 3. Write minimal vector table to secure alias
+    // 3. Write minimal vector table so QEMU isn't stuck in HardFault
     setup_vector_table(&mut gdb)?;
+
+    // 4. Sanity-check register round-trips (must follow vector table setup)
+    sanity_check(&mut gdb)?;
 
     match args.fuzz_count {
         None => run_targeted(&mut gdb, &mut qemu),
