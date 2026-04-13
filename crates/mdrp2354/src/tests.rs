@@ -5354,3 +5354,262 @@ fn test_flash_boot_blinky() {
     // Phase 4 Core 1 health gate: Core 1 should never enter handler mode
     assert_eq!(core1_max_ipsr, 0, "Core 1 should never enter handler mode");
 }
+
+// ============================================================================
+// Phase 5 Stage A2: FIFO unit tests
+// ============================================================================
+
+/// Helper: SIO base address for register access.
+const SIO_BASE: u32 = 0xD000_0000;
+const FIFO_ST: u32 = SIO_BASE + 0x050;
+const FIFO_WR: u32 = SIO_BASE + 0x054;
+const FIFO_RD: u32 = SIO_BASE + 0x058;
+const SPINLOCK_ST: u32 = SIO_BASE + 0x05C;
+
+fn spinlock_addr(n: u32) -> u32 {
+    SIO_BASE + 0x100 + 4 * n
+}
+
+/// Switch Bus to Core 1's perspective (contention_check_active = true).
+fn set_core1(bus: &mut Bus) {
+    bus.begin_contention_check();
+}
+
+/// Switch Bus back to Core 0's perspective.
+fn set_core0(bus: &mut Bus) {
+    bus.clear_contention_state();
+}
+
+#[test]
+fn fifo_push_pop_basic_roundtrip() {
+    let mut bus = Bus::new();
+    // Core 0 writes 3 values to Core 1's RX FIFO
+    bus.write32(FIFO_WR, 0xAAAA_BBBB);
+    bus.write32(FIFO_WR, 0xCCCC_DDDD);
+    bus.write32(FIFO_WR, 0x1234_5678);
+
+    // Core 1 reads them back in FIFO order
+    set_core1(&mut bus);
+    assert_eq!(bus.read32(FIFO_RD), 0xAAAA_BBBB);
+    assert_eq!(bus.read32(FIFO_RD), 0xCCCC_DDDD);
+    assert_eq!(bus.read32(FIFO_RD), 0x1234_5678);
+}
+
+#[test]
+fn fifo_empty_read_returns_zero_and_sets_roe() {
+    let mut bus = Bus::new();
+    // Core 0 reads from empty RX FIFO
+    let val = bus.read32(FIFO_RD);
+    assert_eq!(val, 0, "Empty FIFO read should return 0");
+
+    // FIFO_ST should show ROE (bit 3) set for Core 0
+    let st = bus.read32(FIFO_ST);
+    assert!(st & 0x8 != 0, "ROE bit should be set after empty read, FIFO_ST={:#x}", st);
+}
+
+#[test]
+fn fifo_full_write_drops_data_and_sets_wof() {
+    let mut bus = Bus::new();
+    // Fill Core 1's RX FIFO (8 entries) from Core 0
+    for i in 0..8u32 {
+        bus.write32(FIFO_WR, i);
+    }
+    // 9th write should overflow
+    bus.write32(FIFO_WR, 0xDEAD);
+
+    // Core 0's FIFO_ST should show WOF (bit 2) set
+    let st = bus.read32(FIFO_ST);
+    assert!(st & 0x4 != 0, "WOF bit should be set after overflow, FIFO_ST={:#x}", st);
+
+    // Core 1 should read the original 8 values, not the dropped 0xDEAD
+    set_core1(&mut bus);
+    for i in 0..8u32 {
+        assert_eq!(bus.read32(FIFO_RD), i);
+    }
+    // Next read is empty
+    assert_eq!(bus.read32(FIFO_RD), 0);
+}
+
+#[test]
+fn fifo_st_reflects_vld_and_rdy() {
+    let mut bus = Bus::new();
+    // Initially: Core 0 RX is empty (VLD=0), Core 1 RX has space (RDY=1)
+    let st = bus.read32(FIFO_ST);
+    assert_eq!(st & 0x1, 0, "VLD should be 0 when RX is empty");
+    assert_eq!(st & 0x2, 0x2, "RDY should be 1 when TX has space");
+
+    // Core 1 writes to Core 0's RX FIFO
+    set_core1(&mut bus);
+    bus.write32(FIFO_WR, 42);
+    set_core0(&mut bus);
+
+    // Now Core 0's RX has data
+    let st = bus.read32(FIFO_ST);
+    assert_eq!(st & 0x1, 0x1, "VLD should be 1 after data written to our RX");
+
+    // Fill Core 1's RX from Core 0 (8 entries)
+    for i in 0..8u32 {
+        bus.write32(FIFO_WR, i);
+    }
+    // RDY should be 0 (Core 1's RX is full)
+    let st = bus.read32(FIFO_ST);
+    assert_eq!(st & 0x2, 0, "RDY should be 0 when other core's RX is full");
+}
+
+#[test]
+fn fifo_st_w1c_clears_wof_and_roe() {
+    let mut bus = Bus::new();
+    // Trigger ROE by reading empty FIFO
+    bus.read32(FIFO_RD);
+    let st = bus.read32(FIFO_ST);
+    assert!(st & 0x8 != 0, "ROE should be set");
+
+    // Fill FIFO then overflow to trigger WOF
+    for _ in 0..9 {
+        bus.write32(FIFO_WR, 0);
+    }
+    let st = bus.read32(FIFO_ST);
+    assert!(st & 0x4 != 0, "WOF should be set");
+    assert!(st & 0x8 != 0, "ROE should still be set");
+
+    // W1C: clear WOF only
+    bus.write32(FIFO_ST, 0x4);
+    let st = bus.read32(FIFO_ST);
+    assert_eq!(st & 0x4, 0, "WOF should be cleared");
+    assert!(st & 0x8 != 0, "ROE should still be set (not cleared)");
+
+    // W1C: clear ROE
+    bus.write32(FIFO_ST, 0x8);
+    let st = bus.read32(FIFO_ST);
+    assert_eq!(st & 0x8, 0, "ROE should be cleared");
+
+    // W1C: writing 0xFFFFFFFF clears both
+    bus.read32(FIFO_RD); // trigger ROE again
+    for _ in 0..9 {
+        bus.write32(FIFO_WR, 0);
+    }
+    bus.write32(FIFO_ST, 0xFFFF_FFFF);
+    let st = bus.read32(FIFO_ST);
+    assert_eq!(st & 0xC, 0, "Both WOF and ROE should be cleared");
+}
+
+#[test]
+fn fifo_write_sets_event_flag_on_receiver() {
+    let mut bus = Bus::new();
+    // Event flags start clear
+    assert!(!bus.event_flag[0]);
+    assert!(!bus.event_flag[1]);
+
+    // Core 0 writes FIFO_WR -> should set event_flag[1] (receiver = Core 1)
+    bus.write32(FIFO_WR, 0x42);
+    assert!(bus.event_flag[1], "event_flag[1] should be set after Core 0 FIFO write");
+    assert!(!bus.event_flag[0], "event_flag[0] should NOT be set");
+
+    // Clear event flags
+    bus.event_flag = [false; 2];
+
+    // Core 1 writes FIFO_WR -> should set event_flag[0] (receiver = Core 0)
+    set_core1(&mut bus);
+    bus.write32(FIFO_WR, 0x43);
+    set_core0(&mut bus);
+    assert!(bus.event_flag[0], "event_flag[0] should be set after Core 1 FIFO write");
+}
+
+#[test]
+fn fifo_overflow_does_not_set_event_flag() {
+    let mut bus = Bus::new();
+    // Fill Core 1's RX FIFO
+    for i in 0..8u32 {
+        bus.write32(FIFO_WR, i);
+    }
+    // Clear event flags
+    bus.event_flag = [false; 2];
+
+    // Overflow write should NOT set event flag
+    bus.write32(FIFO_WR, 0xDEAD);
+    assert!(!bus.event_flag[1], "event_flag should NOT be set on overflow write");
+}
+
+// ============================================================================
+// Phase 5 Stage A2: Spinlock unit tests
+// ============================================================================
+
+#[test]
+fn spinlock_claim_returns_bit_mask() {
+    let mut bus = Bus::new();
+    // Claim spinlock 5 from Core 0
+    let result = bus.read32(spinlock_addr(5));
+    assert_eq!(result, 1 << 5, "Claiming lock 5 should return 1<<5");
+
+    // SPINLOCK_ST should reflect the claimed lock
+    let st = bus.read32(SPINLOCK_ST);
+    assert_eq!(st & (1 << 5), 1 << 5, "SPINLOCK_ST should show lock 5 claimed");
+}
+
+#[test]
+fn spinlock_already_claimed_returns_zero() {
+    let mut bus = Bus::new();
+    // Claim lock 10
+    let first = bus.read32(spinlock_addr(10));
+    assert_eq!(first, 1 << 10);
+
+    // Second claim returns 0
+    let second = bus.read32(spinlock_addr(10));
+    assert_eq!(second, 0, "Already-claimed lock should return 0");
+}
+
+#[test]
+fn spinlock_release_via_write() {
+    let mut bus = Bus::new();
+    // Claim lock 7
+    bus.read32(spinlock_addr(7));
+    assert_eq!(bus.read32(SPINLOCK_ST) & (1 << 7), 1 << 7);
+
+    // Release via write (any value)
+    bus.write32(spinlock_addr(7), 0);
+    assert_eq!(bus.read32(SPINLOCK_ST) & (1 << 7), 0, "Lock 7 should be released");
+
+    // Re-claim should succeed
+    let result = bus.read32(spinlock_addr(7));
+    assert_eq!(result, 1 << 7, "Re-claiming released lock should succeed");
+}
+
+#[test]
+fn spinlock_contention_core0_claims_core1_sees_zero() {
+    let mut bus = Bus::new();
+    // Core 0 claims lock 15
+    let c0 = bus.read32(spinlock_addr(15));
+    assert_eq!(c0, 1 << 15);
+
+    // Core 1 tries to claim same lock -> gets 0
+    set_core1(&mut bus);
+    let c1 = bus.read32(spinlock_addr(15));
+    assert_eq!(c1, 0, "Core 1 should fail to claim lock already held by Core 0");
+
+    // Core 1 can release it though (any write clears)
+    bus.write32(spinlock_addr(15), 1);
+    set_core0(&mut bus);
+
+    // Lock is now free, Core 0 can reclaim
+    let c0_again = bus.read32(spinlock_addr(15));
+    assert_eq!(c0_again, 1 << 15);
+}
+
+#[test]
+fn spinlock_st_bitmask_reflects_state() {
+    let mut bus = Bus::new();
+    // Claim locks 0, 3, 31
+    bus.read32(spinlock_addr(0));
+    bus.read32(spinlock_addr(3));
+    bus.read32(spinlock_addr(31));
+
+    let st = bus.read32(SPINLOCK_ST);
+    assert_eq!(st, (1 << 0) | (1 << 3) | (1 << 31),
+        "SPINLOCK_ST should reflect exactly the claimed locks, got {:#010x}", st);
+
+    // Release lock 3
+    bus.write32(spinlock_addr(3), 0);
+    let st = bus.read32(SPINLOCK_ST);
+    assert_eq!(st, (1 << 0) | (1 << 31),
+        "SPINLOCK_ST should reflect lock 3 released, got {:#010x}", st);
+}

@@ -134,6 +134,7 @@ impl Emulator {
         self.cores[0].step(&mut self.bus);
         self.bus.begin_contention_check();
         self.cores[1].step(&mut self.bus);
+        self.bus.sio.tick_mtime();
         self.clock.cycles
     }
 
