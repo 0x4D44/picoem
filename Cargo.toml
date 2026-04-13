@@ -1,6 +1,26 @@
-[package]
-name = "mdrp2354"
-version = "0.1.0"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
 edition = "2024"
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+panic = "abort"
+
+[profile.release.package.mdrp2354]
+codegen-units = 1
+
+[package]
+name = "mdrp2354-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "mdrp2354"
+path = "src/main.rs"
+
 [dependencies]
+mdrp2354 = { path = "crates/mdrp2354" }

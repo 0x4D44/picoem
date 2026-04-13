@@ -1,0 +1,99 @@
+use crate::bus::Bus;
+use super::CortexM33;
+
+/// Returns true if the first halfword indicates a 32-bit Thumb-2 instruction.
+/// Bits [15:11] of 0b11101, 0b11110, or 0b11111 → 32-bit.
+#[inline(always)]
+fn is_wide(hw0: u16) -> bool {
+    hw0 >= 0xE800
+}
+
+impl CortexM33 {
+    /// Fetch, decode, and execute one instruction. Returns cycle count.
+    pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
+        let pc = self.regs.pc();
+        self.current_instr_addr = pc;
+        let hw0 = bus.read16(pc);
+
+        if is_wide(hw0) {
+            let hw1 = bus.read16(pc.wrapping_add(2));
+            self.regs.set_pc(pc.wrapping_add(4));
+            self.execute_thumb32(hw0, hw1, bus)
+        } else {
+            self.regs.set_pc(pc.wrapping_add(2));
+            self.execute_thumb16(hw0, bus)
+        }
+    }
+
+    /// Top-level Thumb-16 dispatch. Routes to instruction group handlers
+    /// in execute.rs based on bits [15:11].
+    pub(crate) fn execute_thumb16(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+        match opcode >> 11 {
+            // Shift (immediate)
+            0b00000 => self.thumb16_lsl_imm(opcode),
+            0b00001 => self.thumb16_lsr_imm(opcode),
+            0b00010 => self.thumb16_asr_imm(opcode),
+            // Add/sub register and 3-bit immediate
+            0b00011 => self.thumb16_add_sub(opcode),
+            // Move/compare/add/sub 8-bit immediate
+            0b00100 => self.thumb16_mov_imm(opcode),
+            0b00101 => self.thumb16_cmp_imm(opcode),
+            0b00110 => self.thumb16_add_imm8(opcode),
+            0b00111 => self.thumb16_sub_imm8(opcode),
+            // Data processing + special data + BX
+            // bits[15:10] = 010000 → data processing
+            // bits[15:10] = 010001 → special data / BX / BLX
+            0b01000 => {
+                if opcode & (1 << 10) == 0 {
+                    self.thumb16_data_processing(opcode)
+                } else {
+                    self.thumb16_special_data_bx(opcode, bus)
+                }
+            }
+            0b01001 => self.thumb16_ldr_literal(opcode, bus),
+            // Load/store register offset
+            0b01010 | 0b01011 => self.thumb16_load_store_reg(opcode, bus),
+            // Load/store word immediate offset
+            0b01100 => self.thumb16_str_imm(opcode, bus),
+            0b01101 => self.thumb16_ldr_imm(opcode, bus),
+            // Load/store byte immediate offset
+            0b01110 => self.thumb16_strb_imm(opcode, bus),
+            0b01111 => self.thumb16_ldrb_imm(opcode, bus),
+            // Load/store halfword immediate offset
+            0b10000 => self.thumb16_strh_imm(opcode, bus),
+            0b10001 => self.thumb16_ldrh_imm(opcode, bus),
+            // SP-relative load/store
+            0b10010 => self.thumb16_str_sp(opcode, bus),
+            0b10011 => self.thumb16_ldr_sp(opcode, bus),
+            // ADR (PC-relative) and ADD SP+imm
+            0b10100 => self.thumb16_adr(opcode),
+            0b10101 => self.thumb16_add_sp_imm(opcode),
+            // Miscellaneous
+            0b10110 | 0b10111 => self.thumb16_misc(opcode, bus),
+            // Store/Load multiple
+            0b11000 => self.thumb16_stm(opcode, bus),
+            0b11001 => self.thumb16_ldm(opcode, bus),
+            // Conditional branch + SVC
+            0b11010 | 0b11011 => self.thumb16_cond_branch_svc(opcode),
+            // Unconditional branch
+            0b11100 => self.thumb16_branch(opcode),
+            // 32-bit prefix (should not reach here via this path)
+            _ => self.thumb16_undefined(opcode),
+        }
+    }
+
+    /// Top-level Thumb-32 dispatch. Phase 1: only BL is implemented.
+    pub(crate) fn execute_thumb32(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        let op1 = (hw0 >> 11) & 0x3;
+        let op2 = (hw1 >> 12) & 0x7;
+
+        match (op1, op2) {
+            // BL: 11110 S imm10 / 11 J1 1 J2 imm11
+            (0b10, op2) if op2 & 0b101 == 0b101 => self.thumb32_bl(hw0, hw1),
+            _ => {
+                let _ = bus;
+                self.thumb32_undefined(hw0, hw1)
+            }
+        }
+    }
+}
