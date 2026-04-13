@@ -380,8 +380,49 @@ impl CortexM33 {
 
     // -- Load/store multiple -------------------------------------------------
 
-    pub(crate) fn thumb32_ldm_stm(&mut self, hw0: u16, hw1: u16, _bus: &mut Bus) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+    pub(crate) fn thumb32_ldm_stm(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        let w = (hw0 >> 5) & 1 != 0;
+        let load = (hw0 >> 4) & 1 != 0;
+        let rn = (hw0 & 0xF) as usize;
+        let reglist = hw1 as u32;
+        let count = reglist.count_ones();
+
+        // Direction: IA (01) or DB (10)
+        let op = (hw0 >> 7) & 0x3;
+        let mut addr = match op {
+            0b01 => self.regs.r[rn],                                // IA: start at Rn
+            0b10 => self.regs.r[rn].wrapping_sub(count * 4),       // DB: start at Rn - 4*count
+            _ => return self.thumb32_undefined(hw0, hw1),
+        };
+
+        for i in 0..16 {
+            if reglist & (1 << i) != 0 {
+                if load {
+                    let val = bus.read32(addr);
+                    if i == 15 {
+                        self.regs.set_pc(val & !1);
+                    } else {
+                        self.regs.r[i] = val;
+                    }
+                } else {
+                    bus.write32(addr, self.regs.r[i]);
+                }
+                addr = addr.wrapping_add(4);
+            }
+        }
+
+        // Writeback: if W set AND (for loads) Rn is NOT in reglist
+        if w && (!load || reglist & (1 << rn) == 0) {
+            self.regs.r[rn] = match op {
+                0b01 => self.regs.r[rn].wrapping_add(count * 4),   // IA: Rn + 4*count
+                0b10 => self.regs.r[rn].wrapping_sub(count * 4),   // DB: Rn - 4*count
+                _ => unreachable!(),
+            };
+        }
+
+        // Cost: 1 + count, plus 3 extra if PC was loaded
+        let pc_loaded = load && reglist & (1 << 15) != 0;
+        1 + count + if pc_loaded { 3 } else { 0 }
     }
 
     // -- Load/store dual, exclusive, table branch ----------------------------
@@ -503,19 +544,239 @@ impl CortexM33 {
     // -- Multiply (32-bit result) --------------------------------------------
 
     pub(crate) fn thumb32_multiply(&mut self, hw0: u16, hw1: u16) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+        let op1 = ((hw0 >> 4) & 0x7) as u8;
+        let rn = (hw0 & 0xF) as usize;
+        let ra = ((hw1 >> 12) & 0xF) as usize;
+        let rd = ((hw1 >> 8) & 0xF) as usize;
+        let op2 = ((hw1 >> 4) & 0x3) as u8;
+        let rm = (hw1 & 0xF) as usize;
+
+        match (op1, op2) {
+            (0b000, 0b00) => {
+                let result = self.regs.r[rn].wrapping_mul(self.regs.r[rm]);
+                if ra == 15 {
+                    // MUL
+                    self.regs.r[rd] = result;
+                } else {
+                    // MLA
+                    self.regs.r[rd] = result.wrapping_add(self.regs.r[ra]);
+                }
+            }
+            (0b000, 0b01) => {
+                // MLS
+                let product = self.regs.r[rn].wrapping_mul(self.regs.r[rm]);
+                self.regs.r[rd] = self.regs.r[ra].wrapping_sub(product);
+            }
+            _ => return self.thumb32_undefined(hw0, hw1),
+        }
+        1 // all 1 cycle
     }
 
     // -- Long multiply / divide (64-bit result) ------------------------------
 
     pub(crate) fn thumb32_long_multiply(&mut self, hw0: u16, hw1: u16) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+        let op1 = ((hw0 >> 4) & 0x7) as u8;
+        let rn = (hw0 & 0xF) as usize;
+        let rd_lo = ((hw1 >> 12) & 0xF) as usize;
+        let rd_hi = ((hw1 >> 8) & 0xF) as usize;
+        let op2 = ((hw1 >> 4) & 0xF) as u8;
+        let rm = (hw1 & 0xF) as usize;
+
+        match (op1, op2) {
+            (0b000, 0b0000) => {
+                // SMULL
+                let result = (self.regs.r[rn] as i32 as i64) * (self.regs.r[rm] as i32 as i64);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
+            (0b010, 0b0000) => {
+                // UMULL
+                let result = (self.regs.r[rn] as u64) * (self.regs.r[rm] as u64);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
+            (0b100, 0b0000) => {
+                // SMLAL
+                let acc = ((self.regs.r[rd_hi] as u64) << 32) | self.regs.r[rd_lo] as u64;
+                let product = (self.regs.r[rn] as i32 as i64) * (self.regs.r[rm] as i32 as i64);
+                let result = (acc as i64).wrapping_add(product);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
+            (0b110, 0b0000) => {
+                // UMLAL
+                let acc = ((self.regs.r[rd_hi] as u64) << 32) | self.regs.r[rd_lo] as u64;
+                let product = (self.regs.r[rn] as u64) * (self.regs.r[rm] as u64);
+                let result = acc.wrapping_add(product);
+                self.regs.r[rd_lo] = result as u32;
+                self.regs.r[rd_hi] = (result >> 32) as u32;
+                1
+            }
+            (0b001, 0b1111) => {
+                // SDIV
+                let a = self.regs.r[rn] as i32;
+                let b = self.regs.r[rm] as i32;
+                self.regs.r[rd_lo] = if b == 0 { 0 } else { a.wrapping_div(b) as u32 };
+                4 // placeholder
+            }
+            (0b011, 0b1111) => {
+                // UDIV
+                let a = self.regs.r[rn];
+                let b = self.regs.r[rm];
+                self.regs.r[rd_lo] = if b == 0 { 0 } else { a / b };
+                4 // placeholder
+            }
+            _ => return self.thumb32_undefined(hw0, hw1),
+        }
     }
 
     // -- Data processing (register) ------------------------------------------
 
     pub(crate) fn thumb32_dp_register(&mut self, hw0: u16, hw1: u16) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+        let rd = ((hw1 >> 8) & 0xF) as usize;
+        let rm = (hw1 & 0xF) as usize;
+
+        if hw0 & 0x80 != 0 {
+            // -- Misc single-register ops (hw0[7]=1) ----------------------------
+            // hw0 = 1111_1010_1xxx_Rm, hw1 = 1111_Rd_1xxx_Rm
+            let op1_lo = (hw0 >> 5) & 0x3;  // hw0[6:5]
+            let op2_lo = (hw1 >> 4) & 0x3;  // hw1[5:4]
+            let val = self.regs.r[rm];
+
+            match (op1_lo, op2_lo) {
+                (0b00, 0b00) => {
+                    // REV.W — byte reverse word
+                    self.regs.r[rd] = val.swap_bytes();
+                    1
+                }
+                (0b00, 0b01) => {
+                    // REV16.W — byte reverse packed halfwords
+                    let lo = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8);
+                    let hi = ((val & 0x00FF_0000) << 8) | ((val & 0xFF00_0000) >> 8);
+                    self.regs.r[rd] = hi | lo;
+                    1
+                }
+                (0b00, 0b10) => {
+                    // RBIT — reverse bits
+                    self.regs.r[rd] = val.reverse_bits();
+                    1
+                }
+                (0b00, 0b11) => {
+                    // REVSH.W — byte reverse signed halfword
+                    let lo_hw = val as u16;
+                    let swapped = ((lo_hw & 0xFF) << 8) | ((lo_hw >> 8) & 0xFF);
+                    self.regs.r[rd] = swapped as i16 as i32 as u32;
+                    1
+                }
+                (0b01, 0b00) => {
+                    // CLZ — count leading zeros
+                    self.regs.r[rd] = val.leading_zeros();
+                    1
+                }
+                _ => self.thumb32_undefined(hw0, hw1),
+            }
+        } else if hw1 & 0x80 != 0 {
+            // -- Extend ops (hw0[7]=0, hw1[7]=1) --------------------------------
+            // hw0 = 1111_1010_0_ext_Rn, hw1 = 1111_Rd_10_rot_Rm
+            let rn = (hw0 & 0xF) as usize;
+            let ext = ((hw0 >> 4) & 0x7) as u8;  // hw0[6:4]
+            let rot = ((hw1 >> 4) & 0x3) * 8;    // rotation in bits: 0, 8, 16, 24
+            let rotated = self.regs.r[rm].rotate_right(rot as u32);
+
+            if rn == 15 {
+                // Plain extend (no add)
+                let result = match ext {
+                    0b000 => (rotated as i16) as i32 as u32,          // SXTH
+                    0b001 => rotated & 0xFFFF,                        // UXTH
+                    0b100 => (rotated as i8) as i32 as u32,           // SXTB
+                    0b101 => rotated & 0xFF,                          // UXTB
+                    _ => return self.thumb32_undefined(hw0, hw1),     // SXTB16/UXTB16: DSP, skip
+                };
+                self.regs.r[rd] = result;
+            } else {
+                // Extend-and-add (SXTAH, UXTAH, SXTAB, UXTAB)
+                let addend = self.regs.r[rn];
+                let result = match ext {
+                    0b000 => addend.wrapping_add((rotated as i16) as i32 as u32), // SXTAH
+                    0b001 => addend.wrapping_add(rotated & 0xFFFF),               // UXTAH
+                    0b100 => addend.wrapping_add((rotated as i8) as i32 as u32),  // SXTAB
+                    0b101 => addend.wrapping_add(rotated & 0xFF),                 // UXTAB
+                    _ => return self.thumb32_undefined(hw0, hw1),
+                };
+                self.regs.r[rd] = result;
+            }
+            1
+        } else {
+            // -- Wide shifts by register (hw0[7]=0, hw1[7:4]=0000) --------------
+            // hw0 = 1111_1010_0_stype_S_Rn, hw1 = 1111_Rd_0000_Rm
+            let rn = (hw0 & 0xF) as usize;
+            let stype = ((hw0 >> 5) & 0x3) as u8;  // hw0[6:5]
+            let s = hw0 & (1 << 4) != 0;           // hw0[4] = S bit
+            let shift = self.regs.r[rm] & 0xFF;
+            let value = self.regs.r[rn];
+
+            let (result, carry) = match stype {
+                0b00 => {
+                    // LSL.W
+                    if shift == 0 {
+                        (value, self.regs.flag_c())
+                    } else if shift < 32 {
+                        (value << shift, (value >> (32 - shift)) & 1 != 0)
+                    } else if shift == 32 {
+                        (0, value & 1 != 0)
+                    } else {
+                        (0, false)
+                    }
+                }
+                0b01 => {
+                    // LSR.W
+                    if shift == 0 {
+                        (value, self.regs.flag_c())
+                    } else if shift < 32 {
+                        (value >> shift, (value >> (shift - 1)) & 1 != 0)
+                    } else if shift == 32 {
+                        (0, value >> 31 != 0)
+                    } else {
+                        (0, false)
+                    }
+                }
+                0b10 => {
+                    // ASR.W
+                    let sv = value as i32;
+                    if shift == 0 {
+                        (value, self.regs.flag_c())
+                    } else if shift < 32 {
+                        ((sv >> shift) as u32, (sv >> (shift as i32 - 1)) & 1 != 0)
+                    } else {
+                        ((sv >> 31) as u32, sv < 0)
+                    }
+                }
+                _ => {
+                    // ROR.W (stype=11)
+                    if shift == 0 {
+                        (value, self.regs.flag_c())
+                    } else {
+                        let eff = shift & 31;
+                        if eff == 0 {
+                            (value, value >> 31 != 0)
+                        } else {
+                            let r = value.rotate_right(eff);
+                            (r, r >> 31 != 0)
+                        }
+                    }
+                }
+            };
+
+            self.regs.r[rd] = result;
+            if s {
+                self.regs.set_nz(result);
+                self.regs.set_flag_c(carry);
+            }
+            1
+        }
     }
 
     // -- Coprocessor ---------------------------------------------------------

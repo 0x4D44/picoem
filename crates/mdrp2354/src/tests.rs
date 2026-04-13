@@ -1910,3 +1910,589 @@ fn dsb_dmb_isb() {
     let cy = c.execute_one_wide(0xF3BF, 0x8F6F);
     assert_eq!(cy, 1);
 }
+
+// ============================================================================
+// Tests: Thumb-32 load/store multiple (LDM.W, STM.W, PUSH.W, POP.W)
+// ============================================================================
+
+// Encoding helpers for Thumb-32 LDM/STM
+fn encode_stmia_w(rn: u8, w: bool, reglist: u16) -> (u16, u16) {
+    let hw0 = 0xE880 | ((w as u16) << 5) | rn as u16;
+    (hw0, reglist)
+}
+
+fn encode_ldmia_w(rn: u8, w: bool, reglist: u16) -> (u16, u16) {
+    let hw0 = 0xE890 | ((w as u16) << 5) | rn as u16;
+    (hw0, reglist)
+}
+
+fn encode_stmdb_w(rn: u8, w: bool, reglist: u16) -> (u16, u16) {
+    let hw0 = 0xE900 | ((w as u16) << 5) | rn as u16;
+    (hw0, reglist)
+}
+
+#[allow(dead_code)] // Available for future LDMDB tests
+fn encode_ldmdb_w(rn: u8, w: bool, reglist: u16) -> (u16, u16) {
+    let hw0 = 0xE910 | ((w as u16) << 5) | rn as u16;
+    (hw0, reglist)
+}
+
+#[test]
+fn stm_w_ia() {
+    // STMIA.W R4!, {R0-R3} — store 4 regs starting at R4, writeback
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(0, 0xAAAA_0000);
+    c.set_reg(1, 0xBBBB_1111);
+    c.set_reg(2, 0xCCCC_2222);
+    c.set_reg(3, 0xDDDD_3333);
+    c.set_reg(4, 0x2000_0100); // base address
+    c.regs.set_pc(0x1000);
+
+    let (hw0, hw1) = encode_stmia_w(4, true, 0x000F); // {R0-R3}
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+
+    // Verify memory contents
+    assert_eq!(bus.read32(0x2000_0100), 0xAAAA_0000); // R0
+    assert_eq!(bus.read32(0x2000_0104), 0xBBBB_1111); // R1
+    assert_eq!(bus.read32(0x2000_0108), 0xCCCC_2222); // R2
+    assert_eq!(bus.read32(0x2000_010C), 0xDDDD_3333); // R3
+    // Writeback: R4 = 0x2000_0100 + 4*4 = 0x2000_0110
+    assert_eq!(c.reg(4), 0x2000_0110);
+    // Cost: 1 + 4 = 5
+    assert_eq!(cy, 5);
+}
+
+#[test]
+fn ldm_w_ia() {
+    // LDMIA.W R4!, {R0-R3} — load 4 regs from R4, writeback
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0200;
+    bus.write32(base, 0x1111_1111);
+    bus.write32(base + 4, 0x2222_2222);
+    bus.write32(base + 8, 0x3333_3333);
+    bus.write32(base + 12, 0x4444_4444);
+    c.set_reg(4, base);
+    c.regs.set_pc(0x1000);
+
+    let (hw0, hw1) = encode_ldmia_w(4, true, 0x000F); // {R0-R3}
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+
+    assert_eq!(c.reg(0), 0x1111_1111);
+    assert_eq!(c.reg(1), 0x2222_2222);
+    assert_eq!(c.reg(2), 0x3333_3333);
+    assert_eq!(c.reg(3), 0x4444_4444);
+    // Writeback: R4 = base + 16
+    assert_eq!(c.reg(4), base + 16);
+    // Cost: 1 + 4 = 5
+    assert_eq!(cy, 5);
+}
+
+#[test]
+fn stm_w_db() {
+    // STMDB.W R13!, {R4-R7, LR} — push pattern (5 regs)
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(4, 0x4444_4444);
+    c.set_reg(5, 0x5555_5555);
+    c.set_reg(6, 0x6666_6666);
+    c.set_reg(7, 0x7777_7777);
+    c.set_reg(14, 0xEEEE_EEEE); // LR
+    let sp = 0x2000_1000;
+    c.set_reg(13, sp);
+    c.regs.set_pc(0x1000);
+
+    // reglist = R4|R5|R6|R7|LR = bits 4,5,6,7,14 = 0x40F0
+    let (hw0, hw1) = encode_stmdb_w(13, true, 0x40F0);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+
+    // DB: start addr = SP - 5*4 = 0x2000_0FEC
+    let start = sp - 20;
+    assert_eq!(bus.read32(start),      0x4444_4444); // R4
+    assert_eq!(bus.read32(start + 4),  0x5555_5555); // R5
+    assert_eq!(bus.read32(start + 8),  0x6666_6666); // R6
+    assert_eq!(bus.read32(start + 12), 0x7777_7777); // R7
+    assert_eq!(bus.read32(start + 16), 0xEEEE_EEEE); // LR
+    // Writeback: SP = SP - 5*4 = 0x2000_0FEC
+    assert_eq!(c.reg(13), start);
+    // Cost: 1 + 5 = 6
+    assert_eq!(cy, 6);
+}
+
+#[test]
+fn ldm_w_db_with_pc() {
+    // LDMIA.W R13!, {R4-R7, PC} — pop with PC (5 regs including PC)
+    let (mut c, mut bus) = core_and_bus();
+    let sp = 0x2000_0FEC;
+    bus.write32(sp,      0x4444_4444); // R4
+    bus.write32(sp + 4,  0x5555_5555); // R5
+    bus.write32(sp + 8,  0x6666_6666); // R6
+    bus.write32(sp + 12, 0x7777_7777); // R7
+    bus.write32(sp + 16, 0x0800_0101); // PC value (Thumb bit set)
+    c.set_reg(13, sp);
+    c.regs.set_pc(0x1000);
+
+    // reglist = R4|R5|R6|R7|PC = bits 4,5,6,7,15 = 0x80F0
+    let (hw0, hw1) = encode_ldmia_w(13, true, 0x80F0);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+
+    assert_eq!(c.reg(4), 0x4444_4444);
+    assert_eq!(c.reg(5), 0x5555_5555);
+    assert_eq!(c.reg(6), 0x6666_6666);
+    assert_eq!(c.reg(7), 0x7777_7777);
+    // PC loaded: value & !1 = 0x0800_0100
+    assert_eq!(c.regs.pc(), 0x0800_0100);
+    // Writeback: SP = SP + 5*4 = 0x2000_1000
+    assert_eq!(c.reg(13), sp + 20);
+    // Cost: 1 + 5 + 3 (PC flush) = 9
+    assert_eq!(cy, 9);
+}
+
+#[test]
+fn push_w_pop_w_roundtrip() {
+    // STMDB SP!, {R8-R11} then LDMIA SP!, {R8-R11} — high register roundtrip
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(8, 0xAAAA_BBBB);
+    c.set_reg(9, 0xCCCC_DDDD);
+    c.set_reg(10, 0xEEEE_FF00);
+    c.set_reg(11, 0x1234_5678);
+    let sp = 0x2000_2000;
+    c.set_reg(13, sp);
+    c.regs.set_pc(0x1000);
+
+    // Push: STMDB SP!, {R8-R11} — reglist bits 8,9,10,11 = 0x0F00
+    let (hw0, hw1) = encode_stmdb_w(13, true, 0x0F00);
+    let cy_push = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(cy_push, 5); // 1 + 4
+    assert_eq!(c.reg(13), sp - 16);
+
+    // Clobber registers
+    c.set_reg(8, 0);
+    c.set_reg(9, 0);
+    c.set_reg(10, 0);
+    c.set_reg(11, 0);
+    c.regs.set_pc(0x1004);
+
+    // Pop: LDMIA SP!, {R8-R11}
+    let (hw0, hw1) = encode_ldmia_w(13, true, 0x0F00);
+    let cy_pop = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(cy_pop, 5); // 1 + 4
+    assert_eq!(c.reg(13), sp); // SP restored
+
+    // Verify values roundtripped correctly
+    assert_eq!(c.reg(8), 0xAAAA_BBBB);
+    assert_eq!(c.reg(9), 0xCCCC_DDDD);
+    assert_eq!(c.reg(10), 0xEEEE_FF00);
+    assert_eq!(c.reg(11), 0x1234_5678);
+}
+
+// ============================================================================
+// Tests: Thumb-32 data processing (register) — shifts, extends, misc
+// ============================================================================
+
+#[test]
+fn lsl_w_reg() {
+    // LSL.W R0, R1, R2: hw0=0xFA01, hw1=0xF002
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_0003);
+    c.set_reg(2, 4);
+    let cy = c.execute_one_wide(0xFA01, 0xF002);
+    assert_eq!(c.reg(0), 0x0000_0030);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn lsr_w_reg() {
+    // LSR.W R0, R1, R2: hw0=0xFA21, hw1=0xF002
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_FF00);
+    c.set_reg(2, 8);
+    let cy = c.execute_one_wide(0xFA21, 0xF002);
+    assert_eq!(c.reg(0), 0x0000_00FF);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn asr_w_reg() {
+    // ASR.W R0, R1, R2: hw0=0xFA41, hw1=0xF002
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x8000_0000); // negative value
+    c.set_reg(2, 4);
+    let cy = c.execute_one_wide(0xFA41, 0xF002);
+    assert_eq!(c.reg(0), 0xF800_0000); // sign-extended
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn ror_w_reg() {
+    // ROR.W R0, R1, R2: hw0=0xFA61, hw1=0xF002
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_00FF);
+    c.set_reg(2, 4);
+    let cy = c.execute_one_wide(0xFA61, 0xF002);
+    assert_eq!(c.reg(0), 0xF000_000F); // low 4 bits rotated to top
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn lsls_w_reg_flags() {
+    // LSLS.W R0, R1, R2 (S=1): hw0=0xFA11, hw1=0xF002
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x8000_0001); // bit 31 set
+    c.set_reg(2, 1);           // shift left by 1
+    let cy = c.execute_one_wide(0xFA11, 0xF002);
+    assert_eq!(c.reg(0), 0x0000_0002);
+    assert!(!c.flag_n());    // result bit 31 = 0
+    assert!(!c.flag_z());    // result != 0
+    assert!(c.flag_c());     // bit 31 shifted out → carry = 1
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn sxth_w() {
+    // SXTH R0, R1: hw0=0xFA0F, hw1=0xF081
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_FF80); // halfword 0xFF80 = -128 as i16
+    let cy = c.execute_one_wide(0xFA0F, 0xF081);
+    assert_eq!(c.reg(0), 0xFFFF_FF80); // sign-extended to 32 bits
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn sxtb_w() {
+    // SXTB R0, R1: hw0=0xFA4F, hw1=0xF081
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_0090); // byte 0x90 = -112 as i8
+    let cy = c.execute_one_wide(0xFA4F, 0xF081);
+    assert_eq!(c.reg(0), 0xFFFF_FF90); // sign-extended
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn uxth_w() {
+    // UXTH R0, R1: hw0=0xFA1F, hw1=0xF081
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xDEAD_BEEF);
+    let cy = c.execute_one_wide(0xFA1F, 0xF081);
+    assert_eq!(c.reg(0), 0x0000_BEEF); // zero-extended halfword
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn uxtb_w() {
+    // UXTB R0, R1: hw0=0xFA5F, hw1=0xF081
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xDEAD_BEEF);
+    let cy = c.execute_one_wide(0xFA5F, 0xF081);
+    assert_eq!(c.reg(0), 0x0000_00EF); // zero-extended byte
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn rev_w() {
+    // REV.W R0, R1: hw0=0xFA91, hw1=0xF081
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x12345678);
+    let cy = c.execute_one_wide(0xFA91, 0xF081);
+    assert_eq!(c.reg(0), 0x78563412);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn rev16_w() {
+    // REV16.W R0, R1: hw0=0xFA91, hw1=0xF091
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xAABB_CCDD);
+    let cy = c.execute_one_wide(0xFA91, 0xF091);
+    assert_eq!(c.reg(0), 0xBBAA_DDCC);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn revsh_w() {
+    // REVSH.W R0, R1: hw0=0xFA91, hw1=0xF0B1
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_01FF); // low halfword 0x01FF, byte-swapped = 0xFF01 = -255 as i16
+    let cy = c.execute_one_wide(0xFA91, 0xF0B1);
+    assert_eq!(c.reg(0), 0xFFFF_FF01); // sign-extended to 32 bits
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn rbit_w() {
+    // RBIT R0, R1: hw0=0xFA91, hw1=0xF0A1
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x8000_0000); // only bit 31 set
+    let cy = c.execute_one_wide(0xFA91, 0xF0A1);
+    assert_eq!(c.reg(0), 0x0000_0001); // reversed → only bit 0 set
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn clz_w() {
+    // CLZ R0, R1: hw0=0xFAB1, hw1=0xF081
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0010_0000); // bit 20 set → 11 leading zeros
+    let cy = c.execute_one_wide(0xFAB1, 0xF081);
+    assert_eq!(c.reg(0), 11);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn clz_zero() {
+    // CLZ of 0 → 32
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0);
+    let cy = c.execute_one_wide(0xFAB1, 0xF081);
+    assert_eq!(c.reg(0), 32);
+    assert_eq!(cy, 1);
+}
+
+// ============================================================================
+// Tests: Multiply, multiply-accumulate, and divide (Thumb-32)
+// ============================================================================
+
+// Encoding helpers for 32-bit result multiply: 1111_1011_0_op1_Rn | Ra_Rd_op2_Rm
+fn encode_mul_w(rd: u8, rn: u8, rm: u8) -> (u16, u16) {
+    // MUL: op1=000, op2=00, Ra=0xF
+    let hw0 = 0xFB00u16 | rn as u16;
+    let hw1 = 0xF000u16 | ((rd as u16) << 8) | rm as u16;
+    (hw0, hw1)
+}
+
+fn encode_mla(rd: u8, rn: u8, rm: u8, ra: u8) -> (u16, u16) {
+    // MLA: op1=000, op2=00, Ra!=0xF
+    let hw0 = 0xFB00u16 | rn as u16;
+    let hw1 = ((ra as u16) << 12) | ((rd as u16) << 8) | rm as u16;
+    (hw0, hw1)
+}
+
+fn encode_mls(rd: u8, rn: u8, rm: u8, ra: u8) -> (u16, u16) {
+    // MLS: op1=000, op2=01
+    let hw0 = 0xFB00u16 | rn as u16;
+    let hw1 = ((ra as u16) << 12) | ((rd as u16) << 8) | 0x0010 | rm as u16;
+    (hw0, hw1)
+}
+
+// Encoding helpers for long multiply/divide: 1111_1011_1_op1_Rn | RdLo_RdHi_op2_Rm
+fn encode_smull(rd_lo: u8, rd_hi: u8, rn: u8, rm: u8) -> (u16, u16) {
+    // SMULL: op1=000, op2=0000
+    let hw0 = 0xFB80u16 | rn as u16;
+    let hw1 = ((rd_lo as u16) << 12) | ((rd_hi as u16) << 8) | rm as u16;
+    (hw0, hw1)
+}
+
+fn encode_umull(rd_lo: u8, rd_hi: u8, rn: u8, rm: u8) -> (u16, u16) {
+    // UMULL: op1=010, op2=0000
+    let hw0 = 0xFBA0u16 | rn as u16;
+    let hw1 = ((rd_lo as u16) << 12) | ((rd_hi as u16) << 8) | rm as u16;
+    (hw0, hw1)
+}
+
+fn encode_smlal(rd_lo: u8, rd_hi: u8, rn: u8, rm: u8) -> (u16, u16) {
+    // SMLAL: op1=100, op2=0000
+    let hw0 = 0xFBC0u16 | rn as u16;
+    let hw1 = ((rd_lo as u16) << 12) | ((rd_hi as u16) << 8) | rm as u16;
+    (hw0, hw1)
+}
+
+fn encode_umlal(rd_lo: u8, rd_hi: u8, rn: u8, rm: u8) -> (u16, u16) {
+    // UMLAL: op1=110, op2=0000
+    let hw0 = 0xFBE0u16 | rn as u16;
+    let hw1 = ((rd_lo as u16) << 12) | ((rd_hi as u16) << 8) | rm as u16;
+    (hw0, hw1)
+}
+
+fn encode_sdiv(rd: u8, rn: u8, rm: u8) -> (u16, u16) {
+    // SDIV: op1=001, op2=1111, RdHi=0xF
+    let hw0 = 0xFB90u16 | rn as u16;
+    let hw1 = ((rd as u16) << 12) | 0x0F00 | 0x00F0 | rm as u16;
+    (hw0, hw1)
+}
+
+fn encode_udiv(rd: u8, rn: u8, rm: u8) -> (u16, u16) {
+    // UDIV: op1=011, op2=1111, RdHi=0xF
+    let hw0 = 0xFBB0u16 | rn as u16;
+    let hw1 = ((rd as u16) << 12) | 0x0F00 | 0x00F0 | rm as u16;
+    (hw0, hw1)
+}
+
+#[test]
+fn mul_w() {
+    // MUL R0, R1, R2: 7 * 6 = 42
+    let mut c = CortexM33::new();
+    c.set_reg(1, 7);
+    c.set_reg(2, 6);
+    let (hw0, hw1) = encode_mul_w(0, 1, 2);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 42);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn mla_w() {
+    // MLA R0, R1, R2, R3: 3 * 4 + 5 = 17
+    let mut c = CortexM33::new();
+    c.set_reg(1, 3);
+    c.set_reg(2, 4);
+    c.set_reg(3, 5);
+    let (hw0, hw1) = encode_mla(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 17);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn mls_w() {
+    // MLS R0, R1, R2, R3: 100 - 7 * 6 = 58
+    let mut c = CortexM33::new();
+    c.set_reg(1, 7);
+    c.set_reg(2, 6);
+    c.set_reg(3, 100);
+    let (hw0, hw1) = encode_mls(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 58);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn smull_basic() {
+    // SMULL R0, R1, R2, R3: 100_000 * 200 = 20_000_000
+    let mut c = CortexM33::new();
+    c.set_reg(2, 100_000);
+    c.set_reg(3, 200);
+    let (hw0, hw1) = encode_smull(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 20_000_000); // lo
+    assert_eq!(c.reg(1), 0);          // hi = 0
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn smull_negative() {
+    // SMULL R0, R1, R2, R3: (-3) * 7 = -21
+    let mut c = CortexM33::new();
+    c.set_reg(2, (-3i32) as u32);
+    c.set_reg(3, 7);
+    let (hw0, hw1) = encode_smull(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    let result = ((c.reg(1) as u64) << 32) | c.reg(0) as u64;
+    assert_eq!(result as i64, -21);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn umull_basic() {
+    // UMULL R0, R1, R2, R3: 1000 * 2000 = 2_000_000
+    let mut c = CortexM33::new();
+    c.set_reg(2, 1000);
+    c.set_reg(3, 2000);
+    let (hw0, hw1) = encode_umull(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 2_000_000);
+    assert_eq!(c.reg(1), 0);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn umull_large() {
+    // UMULL R0, R1, R2, R3: 0xFFFF_FFFF * 2 = 0x1_FFFF_FFFE
+    let mut c = CortexM33::new();
+    c.set_reg(2, 0xFFFF_FFFF);
+    c.set_reg(3, 2);
+    let (hw0, hw1) = encode_umull(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xFFFF_FFFE); // lo
+    assert_eq!(c.reg(1), 1);            // hi
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn sdiv_basic() {
+    // SDIV R0, R1, R2: 100 / 7 = 14
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    c.set_reg(2, 7);
+    let (hw0, hw1) = encode_sdiv(0, 1, 2);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 14);
+    assert_eq!(cy, 4);
+}
+
+#[test]
+fn sdiv_negative() {
+    // SDIV R0, R1, R2: -100 / 7 = -14
+    let mut c = CortexM33::new();
+    c.set_reg(1, (-100i32) as u32);
+    c.set_reg(2, 7);
+    let (hw0, hw1) = encode_sdiv(0, 1, 2);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0) as i32, -14);
+    assert_eq!(cy, 4);
+}
+
+#[test]
+fn sdiv_by_zero() {
+    // SDIV R0, R1, R2: 42 / 0 = 0
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0xDEAD_BEEF); // should be overwritten
+    c.set_reg(1, 42);
+    c.set_reg(2, 0);
+    let (hw0, hw1) = encode_sdiv(0, 1, 2);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0);
+    assert_eq!(cy, 4);
+}
+
+#[test]
+fn udiv_basic() {
+    // UDIV R0, R1, R2: 100 / 7 = 14
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    c.set_reg(2, 7);
+    let (hw0, hw1) = encode_udiv(0, 1, 2);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 14);
+    assert_eq!(cy, 4);
+}
+
+#[test]
+fn udiv_by_zero() {
+    // UDIV R0, R1, R2: 42 / 0 = 0
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0xDEAD_BEEF);
+    c.set_reg(1, 42);
+    c.set_reg(2, 0);
+    let (hw0, hw1) = encode_udiv(0, 1, 2);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0);
+    assert_eq!(cy, 4);
+}
+
+#[test]
+fn smlal_basic() {
+    // SMLAL R0, R1, R2, R3: accumulator=1000, product=3*7=21, result=1021
+    let mut c = CortexM33::new();
+    c.set_reg(0, 1000); // rd_lo (accumulator low)
+    c.set_reg(1, 0);    // rd_hi (accumulator high)
+    c.set_reg(2, 3);    // rn
+    c.set_reg(3, 7);    // rm
+    let (hw0, hw1) = encode_smlal(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 1021); // lo
+    assert_eq!(c.reg(1), 0);    // hi
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn umlal_basic() {
+    // UMLAL R0, R1, R2, R3: accumulator=500, product=100*200=20000, result=20500
+    let mut c = CortexM33::new();
+    c.set_reg(0, 500);  // rd_lo
+    c.set_reg(1, 0);    // rd_hi
+    c.set_reg(2, 100);  // rn
+    c.set_reg(3, 200);  // rm
+    let (hw0, hw1) = encode_umlal(0, 1, 2, 3);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 20500);
+    assert_eq!(c.reg(1), 0);
+    assert_eq!(cy, 1);
+}
