@@ -38,6 +38,12 @@ pub fn run(
     let mut lcd = LcdDecoder::new();
     let mut bench = BenchmarkPoller::new();
 
+    // Windowed MHz measurement: update every ~500ms for a responsive reading
+    // that reflects current throughput rather than a lifetime cumulative average.
+    let mut mhz_prev_cycles = 0u64;
+    let mut mhz_prev_time = start;
+    let mut effective_mhz = 0.0f64;
+
     while !shutdown.load(Ordering::Relaxed) {
         pacer.begin_quantum();
         emu.run(qc);
@@ -51,12 +57,15 @@ pub fn run(
         let cycles = emu.cycles();
         bench.poll(&emu, elapsed);
 
-        let secs = elapsed.as_secs_f64();
-        let effective_mhz = if secs > 0.0 {
-            (cycles as f64) / secs / 1e6
-        } else {
-            0.0
-        };
+        let now = Instant::now();
+        let dt = now.duration_since(mhz_prev_time);
+        if dt.as_millis() >= 500 {
+            let dc = cycles - mhz_prev_cycles;
+            let secs = dt.as_secs_f64();
+            effective_mhz = (dc as f64) / secs / 1e6;
+            mhz_prev_cycles = cycles;
+            mhz_prev_time = now;
+        }
 
         let mut s = snapshot.write().unwrap_or_else(|e| e.into_inner());
         s.cycles = cycles;
