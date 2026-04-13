@@ -3571,6 +3571,171 @@ pub fn generate_all() -> Vec<TestCase> {
 }
 
 // ============================================================================
+// Run state — snapshot of CPU + memory after execution
+// ============================================================================
+
+/// Post-execution state snapshot for comparison between QEMU and emulator.
+pub struct RunState {
+    /// R0-R15 register values.
+    pub regs: [u32; 16],
+    /// xPSR value.
+    pub xpsr: u32,
+    /// Bytes at mem_check offsets (in order of tc.mem_check).
+    pub mem: Vec<u8>,
+}
+
+// ============================================================================
+// Address translation
+// ============================================================================
+
+/// Translate a register value if it's an address register.
+///
+/// Registers listed in `tc.addr_regs` contain offsets from the scratch area.
+/// This adds the per-side scratch base to make them absolute addresses.
+pub fn setup_reg(reg: u8, val: u32, tc: &TestCase, scratch_base: u32) -> u32 {
+    if tc.addr_regs.contains(&reg) {
+        scratch_base.wrapping_add(val)
+    } else {
+        val
+    }
+}
+
+// ============================================================================
+// Emulator-side execution
+// ============================================================================
+
+/// Run a single test case on the emulator. Returns post-execution state.
+///
+/// Uses the provided `shared_bus` for memory-accessing instructions (reused
+/// across tests to avoid repeated 552KB allocations).
+pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
+    let mut core = CortexM33::new();
+
+    // Set defaults: R0-R12 = 0, SP = stack, LR = sentinel, PC = slot
+    for i in 0..=12 {
+        core.set_reg(i, 0);
+    }
+    core.set_reg(13, EMU_TEST_STACK);
+    core.set_reg(14, 0xFFFF_FFFF);
+    core.regs.set_pc(EMU_TEST_SLOT);
+    core.regs.xpsr = tc.xpsr_pre;
+
+    // Apply register preconditions with address translation
+    for &(reg, val) in &tc.reg_pre {
+        let val = setup_reg(reg, val, tc, EMU_TEST_SCRATCH);
+        core.set_reg(reg as usize, val);
+    }
+
+    // Execute
+    if tc.needs_bus {
+        // Zero scratch region (256 bytes), then write preconditions
+        for i in 0..256u32 {
+            shared_bus.write8(EMU_TEST_SCRATCH + i, 0);
+        }
+        for &(offset, val) in &tc.mem_pre {
+            shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
+        }
+        core.execute_one_with_bus(tc.opcode, shared_bus);
+    } else {
+        core.execute_one(tc.opcode);
+    }
+
+    // Collect post-state
+    let mut regs = [0u32; 16];
+    for i in 0..16 {
+        regs[i] = core.reg(i);
+    }
+    let xpsr = core.regs.xpsr;
+    let mem: Vec<u8> = tc
+        .mem_check
+        .iter()
+        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
+        .collect();
+
+    RunState { regs, xpsr, mem }
+}
+
+// ============================================================================
+// Comparison logic
+// ============================================================================
+
+/// Compare QEMU and emulator post-execution states.
+///
+/// Returns `Ok(())` if they match, or `Err(description)` listing all
+/// mismatches. This is a pure function — all I/O is done before calling it.
+pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), String> {
+    let mut diffs = Vec::new();
+
+    // R0-R12: absolute comparison
+    for i in 0..=12 {
+        if qemu.regs[i] != emu.regs[i] {
+            diffs.push(format!(
+                "R{i}: QEMU={:#010x} EMU={:#010x}",
+                qemu.regs[i], emu.regs[i]
+            ));
+        }
+    }
+
+    // SP (R13): relative delta from each side's stack base.
+    // Both sides start SP at their respective TEST_STACK; compare the offset.
+    let qemu_sp_delta = qemu.regs[13].wrapping_sub(QEMU_TEST_STACK);
+    let emu_sp_delta = emu.regs[13].wrapping_sub(EMU_TEST_STACK);
+    if qemu_sp_delta != emu_sp_delta {
+        diffs.push(format!(
+            "SP delta: QEMU={:#x} EMU={:#x}",
+            qemu_sp_delta, emu_sp_delta
+        ));
+    }
+
+    // LR (R14): absolute comparison for Phase A (no BL instruction).
+    // Phase B will need relative delta comparison for BL's return address.
+    if qemu.regs[14] != emu.regs[14] {
+        diffs.push(format!(
+            "LR: QEMU={:#010x} EMU={:#010x}",
+            qemu.regs[14], emu.regs[14]
+        ));
+    }
+
+    // PC (R15): relative delta comparison (different address spaces)
+    let qemu_pc_delta = qemu.regs[15].wrapping_sub(QEMU_TEST_SLOT);
+    let emu_pc_delta = emu.regs[15].wrapping_sub(EMU_TEST_SLOT);
+    if qemu_pc_delta != emu_pc_delta {
+        diffs.push(format!(
+            "PC delta: QEMU={:#x} EMU={:#x}",
+            qemu_pc_delta, emu_pc_delta
+        ));
+    }
+
+    // xPSR flags: masked comparison
+    let qemu_flags = qemu.xpsr & tc.xpsr_mask;
+    let emu_flags = emu.xpsr & tc.xpsr_mask;
+    if qemu_flags != emu_flags {
+        diffs.push(format!(
+            "xPSR: QEMU={:#010x} EMU={:#010x} (mask={:#010x})",
+            qemu.xpsr, emu.xpsr, tc.xpsr_mask
+        ));
+    }
+
+    // Memory: byte-by-byte at mem_check offsets
+    for (idx, &offset) in tc.mem_check.iter().enumerate() {
+        let qemu_val = qemu.mem[idx];
+        let emu_val = emu.mem[idx];
+        if qemu_val != emu_val {
+            diffs.push(format!(
+                "MEM[+{offset:#x}]: QEMU={:#04x} EMU={:#04x}",
+                qemu_val, emu_val
+            ));
+        }
+    }
+
+    if diffs.is_empty() {
+        Ok(())
+    } else {
+        Err(diffs.join(", "))
+    }
+}
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 
@@ -3938,5 +4103,288 @@ mod tests {
             "gen_branch_cond: expected 15-35, got {}",
             tests.len()
         );
+    }
+
+    // -- setup_reg tests --
+
+    #[test]
+    fn setup_reg_non_addr_returns_literal() {
+        let tc = TestCase {
+            addr_regs: vec![1], // only R1 is an address reg
+            ..TestCase::default()
+        };
+        // R0 is not in addr_regs, so value passes through unchanged
+        assert_eq!(setup_reg(0, 0x42, &tc, EMU_TEST_SCRATCH), 0x42);
+    }
+
+    #[test]
+    fn setup_reg_addr_reg_adds_base() {
+        let tc = TestCase {
+            addr_regs: vec![1],
+            ..TestCase::default()
+        };
+        // R1 is an address reg: offset 0x10 + scratch base
+        assert_eq!(
+            setup_reg(1, 0x10, &tc, EMU_TEST_SCRATCH),
+            EMU_TEST_SCRATCH + 0x10
+        );
+    }
+
+    #[test]
+    fn setup_reg_qemu_base() {
+        let tc = TestCase {
+            addr_regs: vec![3],
+            ..TestCase::default()
+        };
+        assert_eq!(
+            setup_reg(3, 0x20, &tc, QEMU_TEST_SCRATCH),
+            QEMU_TEST_SCRATCH + 0x20
+        );
+    }
+
+    #[test]
+    fn setup_reg_empty_addr_regs() {
+        let tc = TestCase::default();
+        // No addr_regs — all values are literal
+        assert_eq!(setup_reg(5, 0xDEAD, &tc, EMU_TEST_SCRATCH), 0xDEAD);
+    }
+
+    #[test]
+    fn setup_reg_wrapping_add() {
+        let tc = TestCase {
+            addr_regs: vec![0],
+            ..TestCase::default()
+        };
+        // Large offset that wraps around
+        assert_eq!(
+            setup_reg(0, 0xFFFF_FF00, &tc, EMU_TEST_SCRATCH),
+            EMU_TEST_SCRATCH.wrapping_add(0xFFFF_FF00)
+        );
+    }
+
+    // -- compare tests --
+
+    fn make_state(regs: [u32; 16], xpsr: u32, mem: Vec<u8>) -> RunState {
+        RunState { regs, xpsr, mem }
+    }
+
+    fn base_regs_qemu() -> [u32; 16] {
+        let mut r = [0u32; 16];
+        r[13] = QEMU_TEST_STACK;
+        r[14] = 0xFFFF_FFFF;
+        r[15] = QEMU_TEST_SLOT + 2; // PC after one 16-bit instruction
+        r
+    }
+
+    fn base_regs_emu() -> [u32; 16] {
+        let mut r = [0u32; 16];
+        r[13] = EMU_TEST_STACK;
+        r[14] = 0xFFFF_FFFF;
+        r[15] = EMU_TEST_SLOT + 2; // PC after one 16-bit instruction
+        r
+    }
+
+    #[test]
+    fn compare_identical_states_ok() {
+        let tc = TestCase::default();
+        let qemu = make_state(base_regs_qemu(), 0x0100_0000, vec![]);
+        let emu = make_state(base_regs_emu(), 0x0100_0000, vec![]);
+        assert!(compare(&tc, &qemu, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_register_mismatch() {
+        let tc = TestCase::default();
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        qemu_regs[3] = 42;
+        emu_regs[3] = 99;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("R3"), "expected R3 in error: {err}");
+    }
+
+    #[test]
+    fn compare_sp_delta_mismatch() {
+        let tc = TestCase::default();
+        let mut qemu_regs = base_regs_qemu();
+        let emu_regs = base_regs_emu();
+        // QEMU's SP moved down by 4, emulator's didn't
+        qemu_regs[13] = QEMU_TEST_STACK - 4;
+        // emu_regs[13] = EMU_TEST_STACK (delta=0 vs delta=-4)
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("SP delta"), "expected SP delta in error: {err}");
+    }
+
+    #[test]
+    fn compare_flag_mismatch() {
+        let tc = TestCase::default(); // xpsr_mask = MASK_ALL_FLAGS
+        let qemu = make_state(base_regs_qemu(), 0xC100_0000, vec![]); // N+Z set
+        let emu = make_state(base_regs_emu(), 0x0100_0000, vec![]); // flags clear
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("xPSR"), "expected xPSR in error: {err}");
+    }
+
+    #[test]
+    fn compare_flags_ignored_when_masked() {
+        let tc = TestCase {
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        };
+        // Flags differ but mask is zero — should pass
+        let qemu = make_state(base_regs_qemu(), 0xF100_0000, vec![]);
+        let emu = make_state(base_regs_emu(), 0x0100_0000, vec![]);
+        assert!(compare(&tc, &qemu, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_pc_delta_mismatch() {
+        let tc = TestCase::default();
+        let mut qemu_regs = base_regs_qemu();
+        let emu_regs = base_regs_emu();
+        // QEMU branched further than emulator
+        qemu_regs[15] = QEMU_TEST_SLOT + 10;
+        // emu_regs[15] = EMU_TEST_SLOT + 2 (default)
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("PC delta"), "expected PC delta in error: {err}");
+    }
+
+    #[test]
+    fn compare_pc_same_delta_ok() {
+        let tc = TestCase::default();
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        // Both branched +10 from their respective slot
+        qemu_regs[15] = QEMU_TEST_SLOT + 10;
+        emu_regs[15] = EMU_TEST_SLOT + 10;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        assert!(compare(&tc, &qemu, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_lr_mismatch() {
+        let tc = TestCase::default();
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        // LR set to different absolute values
+        qemu_regs[14] = 0xAAAA_AAAA;
+        emu_regs[14] = 0xBBBB_BBBB;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("LR"), "expected LR in error: {err}");
+    }
+
+    #[test]
+    fn compare_memory_mismatch() {
+        let tc = TestCase {
+            needs_bus: true,
+            addr_regs: vec![0],
+            mem_check: vec![0, 1, 2, 3],
+            ..TestCase::default()
+        };
+        let qemu = make_state(base_regs_qemu(), 0x0100_0000, vec![0xAB, 0xCD, 0xEF, 0x01]);
+        let emu = make_state(base_regs_emu(), 0x0100_0000, vec![0xAB, 0xCD, 0x00, 0x01]);
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("MEM"), "expected MEM in error: {err}");
+        assert!(err.contains("+0x2"), "expected offset +0x2 in error: {err}");
+    }
+
+    #[test]
+    fn compare_memory_match_ok() {
+        let tc = TestCase {
+            needs_bus: true,
+            addr_regs: vec![0],
+            mem_check: vec![0, 1],
+            ..TestCase::default()
+        };
+        let qemu = make_state(base_regs_qemu(), 0x0100_0000, vec![0xAB, 0xCD]);
+        let emu = make_state(base_regs_emu(), 0x0100_0000, vec![0xAB, 0xCD]);
+        assert!(compare(&tc, &qemu, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_multiple_diffs_joined() {
+        let tc = TestCase::default();
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        qemu_regs[0] = 1;
+        emu_regs[0] = 2;
+        qemu_regs[1] = 3;
+        emu_regs[1] = 4;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("R0"), "expected R0: {err}");
+        assert!(err.contains("R1"), "expected R1: {err}");
+        assert!(err.contains(", "), "expected comma-separated: {err}");
+    }
+
+    // -- run_one_emu tests --
+
+    #[test]
+    fn run_one_emu_movs_r0_42() {
+        // MOVS R0, #42 = 0x202A
+        let tc = TestCase {
+            name: "MOVS R0, #42".into(),
+            opcode: enc_movs_imm(0, 42),
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu(&tc, &mut bus);
+        assert_eq!(state.regs[0], 42, "R0 should be 42");
+    }
+
+    #[test]
+    fn run_one_emu_sets_defaults() {
+        // NOP = MOVS R0, #0 (opcode 0x2000) — leaves everything at defaults
+        let tc = TestCase {
+            name: "MOVS R0, #0 (verify defaults)".into(),
+            opcode: enc_movs_imm(0, 0),
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu(&tc, &mut bus);
+        // SP should be EMU_TEST_STACK
+        assert_eq!(state.regs[13], EMU_TEST_STACK);
+        // LR should be sentinel
+        assert_eq!(state.regs[14], 0xFFFF_FFFF);
+        // PC should have advanced by 2 from EMU_TEST_SLOT
+        assert_eq!(state.regs[15], EMU_TEST_SLOT + 2);
+    }
+
+    #[test]
+    fn run_one_emu_with_reg_pre() {
+        // ADDS R0, R1, R2 with R1=100, R2=200
+        let tc = TestCase {
+            name: "ADDS R0, R1, R2".into(),
+            opcode: enc_adds_reg(0, 1, 2),
+            reg_pre: vec![(1, 100), (2, 200)],
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu(&tc, &mut bus);
+        assert_eq!(state.regs[0], 300, "R0 should be 300");
+    }
+
+    #[test]
+    fn run_one_emu_xpsr_pre_applied() {
+        // CMP R0, #0 with Z flag already set — verify xpsr_pre is honored
+        let tc = TestCase {
+            name: "MOVS R0, #1 (C flag pre-set)".into(),
+            opcode: enc_movs_imm(0, 1),
+            xpsr_pre: 0x2100_0000, // T bit + C flag set
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu(&tc, &mut bus);
+        // MOVS sets N,Z but preserves C — so C should still be set
+        assert_ne!(state.xpsr & 0x2000_0000, 0, "C flag should be preserved");
     }
 }
