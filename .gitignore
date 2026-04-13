@@ -1,0 +1,9 @@
+target/
+target_ci/
+bin/
+obj/
+venv/
+.venv/
+env/
+*.tmp
+*.log
