@@ -4512,6 +4512,27 @@ fn rand_gp_regs(rng: &mut StdRng) -> Vec<(u8, u32)> {
     (0..13).map(|i| (i, rand_val(rng))).collect()
 }
 
+/// Biased f32 bit pattern: 10% NaN, 10% ±Inf, 10% denormal, 10% ±zero, 60% normal.
+fn biased_f32(rng: &mut StdRng) -> u32 {
+    let r: f64 = rng.range(0.0..1.0);
+    if r < 0.1 {
+        // NaN: exponent=0xFF, fraction!=0
+        0x7F80_0000 | rng.range(1u32..0x0080_0000)
+    } else if r < 0.2 {
+        // Inf: +/- Inf
+        if rng.coin(0.5) { 0x7F80_0000 } else { 0xFF80_0000 }
+    } else if r < 0.3 {
+        // Denormal: exponent=0, fraction!=0
+        rng.range(1u32..0x0080_0000)
+    } else if r < 0.4 {
+        // Zero: +/- 0
+        if rng.coin(0.5) { 0x0000_0000 } else { 0x8000_0000 }
+    } else {
+        // Normal
+        rng.random()
+    }
+}
+
 /// Generate `count` random Thumb-32 ALU fuzz tests per instruction class.
 pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     let mut t = Vec::new();
@@ -4654,14 +4675,8 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             let r = rand_reg(rng);
             if r != rdlo { break r; }
         };
-        let rn = loop {
-            let r = rand_reg(rng);
-            if r != rdlo && r != rdhi { break r; }
-        };
-        let rm = loop {
-            let r = rand_reg(rng);
-            if r != rdlo && r != rdhi && r != rn { break r; }
-        };
+        let rn = rand_reg(rng);
+        let rm = rand_reg(rng);
         let regs = rand_gp_regs(rng);
         let (tag, hw0, hw1) = match variant {
             0 => { let (h0, h1) = enc_t32_smull(rdlo, rdhi, rn, rm); ("SMULL", h0, h1) }
@@ -5411,6 +5426,630 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             probe_only: include_pc,
             ..TestCase::default()
         });
+    }
+
+    t
+}
+
+// ============================================================================
+// FPU test generators
+// ============================================================================
+
+/// Helper: build an FPU binary-op test case (VADD, VSUB, VMUL, VDIV, etc.).
+fn fpu_binop_tc(
+    name: &str,
+    enc_fn: fn(u16, u16, u16) -> (u16, u16),
+    sd: u16, sn: u16, sm: u16,
+    val_n: u32, val_m: u32,
+) -> TestCase {
+    let (hw0, hw1) = enc_fn(sd, sn, sm);
+    TestCase {
+        name: name.into(),
+        opcode: hw0,
+        hw1: Some(hw1),
+        fpu_pre: vec![(sn as u8, val_n), (sm as u8, val_m)],
+        fpu_check: vec![sd as u8],
+        addr_regs: vec![12],
+        xpsr_mask: MASK_NO_FLAGS,
+        ..TestCase::default()
+    }
+}
+
+/// Helper: build an FPU multiply-accumulate test (VMLA, VFMA, etc.).
+/// The accumulator Sd is both input and output.
+fn fpu_mac_tc(
+    name: &str,
+    enc_fn: fn(u16, u16, u16) -> (u16, u16),
+    sd: u16, sn: u16, sm: u16,
+    val_d: u32, val_n: u32, val_m: u32,
+) -> TestCase {
+    let (hw0, hw1) = enc_fn(sd, sn, sm);
+    TestCase {
+        name: name.into(),
+        opcode: hw0,
+        hw1: Some(hw1),
+        fpu_pre: vec![(sd as u8, val_d), (sn as u8, val_n), (sm as u8, val_m)],
+        fpu_check: vec![sd as u8],
+        addr_regs: vec![12],
+        xpsr_mask: MASK_NO_FLAGS,
+        ..TestCase::default()
+    }
+}
+
+/// Helper: build an FPU unary test (VMOV, VABS, VNEG, VSQRT).
+fn fpu_unary_tc(
+    name: &str,
+    enc_fn: fn(u16, u16) -> (u16, u16),
+    sd: u16, sm: u16,
+    val_m: u32,
+) -> TestCase {
+    let (hw0, hw1) = enc_fn(sd, sm);
+    TestCase {
+        name: name.into(),
+        opcode: hw0,
+        hw1: Some(hw1),
+        fpu_pre: vec![(sm as u8, val_m)],
+        fpu_check: vec![sd as u8],
+        addr_regs: vec![12],
+        xpsr_mask: MASK_NO_FLAGS,
+        ..TestCase::default()
+    }
+}
+
+/// Well-known f32 bit patterns for targeted tests.
+const F32_POS_ZERO: u32 = 0x0000_0000;
+const F32_NEG_ZERO: u32 = 0x8000_0000;
+const F32_POS_INF: u32 = 0x7F80_0000;
+const F32_NEG_INF: u32 = 0xFF80_0000;
+const F32_QNAN: u32 = 0x7FC0_0000;
+const F32_SNAN: u32 = 0x7F80_0001;
+const F32_DENORM: u32 = 0x0000_0001; // smallest positive denormal
+const F32_ONE: u32 = 0x3F80_0000;
+const F32_NEG_ONE: u32 = 0xBF80_0000;
+const F32_TWO: u32 = 0x4000_0000;
+const F32_THREE: u32 = 0x4040_0000;
+const F32_FOUR: u32 = 0x4080_0000;
+const F32_HALF: u32 = 0x3F00_0000;
+
+/// Generate ~60 targeted FPU test cases.
+pub fn gen_t32_fpu() -> Vec<TestCase> {
+    use crate::{
+        enc_vadd, enc_vsub, enc_vmul, enc_vnmul, enc_vdiv,
+        enc_vmla, enc_vmls, enc_vnmla, enc_vnmls,
+        enc_vfma, enc_vfms, enc_vfnma, enc_vfnms,
+        enc_vmov_reg, enc_vabs, enc_vneg, enc_vsqrt,
+        enc_vcmp, enc_vcmp_zero, enc_vmrs,
+        enc_vcvt_f32_s32, enc_vcvt_f32_u32,
+        enc_vcvt_s32_f32, enc_vcvt_u32_f32, enc_vcvtr_s32_f32,
+        enc_vmov_to_fpu, enc_vmov_to_arm,
+        MASK_NO_FLAGS,
+    };
+
+    let mut t = Vec::new();
+
+    // --- Arithmetic: VADD ---
+    t.push(fpu_binop_tc("VADD 1.0+2.0", enc_vadd, 0, 1, 2, F32_ONE, F32_TWO));
+    t.push(fpu_binop_tc("VADD +0+-0", enc_vadd, 0, 1, 2, F32_POS_ZERO, F32_NEG_ZERO));
+    t.push(fpu_binop_tc("VADD +Inf+1", enc_vadd, 0, 1, 2, F32_POS_INF, F32_ONE));
+    t.push(fpu_binop_tc("VADD +Inf+-Inf", enc_vadd, 0, 1, 2, F32_POS_INF, F32_NEG_INF));
+    t.push(fpu_binop_tc("VADD NaN+1", enc_vadd, 0, 1, 2, F32_QNAN, F32_ONE));
+    t.push(fpu_binop_tc("VADD denorm+denorm", enc_vadd, 0, 1, 2, F32_DENORM, F32_DENORM));
+
+    // --- Arithmetic: VSUB ---
+    t.push(fpu_binop_tc("VSUB 3.0-1.0", enc_vsub, 4, 5, 6, F32_THREE, F32_ONE));
+    t.push(fpu_binop_tc("VSUB +0-+0", enc_vsub, 4, 5, 6, F32_POS_ZERO, F32_POS_ZERO));
+    t.push(fpu_binop_tc("VSUB NaN-1", enc_vsub, 4, 5, 6, F32_QNAN, F32_ONE));
+
+    // --- Arithmetic: VMUL ---
+    t.push(fpu_binop_tc("VMUL 2.0*3.0", enc_vmul, 0, 1, 2, F32_TWO, F32_THREE));
+    t.push(fpu_binop_tc("VMUL +Inf*0", enc_vmul, 0, 1, 2, F32_POS_INF, F32_POS_ZERO));
+    t.push(fpu_binop_tc("VMUL -1*-1", enc_vmul, 0, 1, 2, F32_NEG_ONE, F32_NEG_ONE));
+
+    // --- Arithmetic: VNMUL ---
+    t.push(fpu_binop_tc("VNMUL 2.0*3.0", enc_vnmul, 0, 1, 2, F32_TWO, F32_THREE));
+
+    // --- Arithmetic: VDIV ---
+    t.push(fpu_binop_tc("VDIV 4.0/2.0", enc_vdiv, 0, 1, 2, F32_FOUR, F32_TWO));
+    t.push(fpu_binop_tc("VDIV 1.0/0.0", enc_vdiv, 0, 1, 2, F32_ONE, F32_POS_ZERO));
+    t.push(fpu_binop_tc("VDIV 0.0/0.0", enc_vdiv, 0, 1, 2, F32_POS_ZERO, F32_POS_ZERO));
+
+    // --- Multiply-accumulate: VMLA (Sd = Sd + Sn*Sm) ---
+    t.push(fpu_mac_tc("VMLA 1+2*3", enc_vmla, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+    t.push(fpu_mac_tc("VMLA 0+Inf*0", enc_vmla, 0, 1, 2, F32_POS_ZERO, F32_POS_INF, F32_POS_ZERO));
+
+    // --- Multiply-accumulate: VMLS (Sd = Sd - Sn*Sm) ---
+    t.push(fpu_mac_tc("VMLS 4-2*1", enc_vmls, 0, 1, 2, F32_FOUR, F32_TWO, F32_ONE));
+
+    // --- VNMLA (Sd = -(Sd + Sn*Sm)) ---
+    t.push(fpu_mac_tc("VNMLA 1+2*3", enc_vnmla, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+
+    // --- VNMLS (Sd = -Sd + Sn*Sm) ---
+    t.push(fpu_mac_tc("VNMLS 1+2*3", enc_vnmls, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+
+    // --- VFMA (fused) ---
+    t.push(fpu_mac_tc("VFMA 1+2*3", enc_vfma, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+    t.push(fpu_mac_tc("VFMA NaN+1*1", enc_vfma, 0, 1, 2, F32_QNAN, F32_ONE, F32_ONE));
+
+    // --- VFMS (fused) ---
+    t.push(fpu_mac_tc("VFMS 4-2*1", enc_vfms, 0, 1, 2, F32_FOUR, F32_TWO, F32_ONE));
+
+    // --- VFNMA ---
+    t.push(fpu_mac_tc("VFNMA 1+2*3", enc_vfnma, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+
+    // --- VFNMS ---
+    t.push(fpu_mac_tc("VFNMS 1+2*3", enc_vfnms, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+
+    // --- Unary: VMOV.F32 ---
+    t.push(fpu_unary_tc("VMOV.F32 S0,S1 (3.0)", enc_vmov_reg, 0, 1, F32_THREE));
+    t.push(fpu_unary_tc("VMOV.F32 S0,S1 (NaN)", enc_vmov_reg, 0, 1, F32_QNAN));
+
+    // --- Unary: VABS ---
+    t.push(fpu_unary_tc("VABS -1.0", enc_vabs, 0, 1, F32_NEG_ONE));
+    t.push(fpu_unary_tc("VABS +1.0", enc_vabs, 0, 1, F32_ONE));
+    t.push(fpu_unary_tc("VABS -0.0", enc_vabs, 0, 1, F32_NEG_ZERO));
+
+    // --- Unary: VNEG ---
+    t.push(fpu_unary_tc("VNEG 1.0", enc_vneg, 0, 1, F32_ONE));
+    t.push(fpu_unary_tc("VNEG -1.0", enc_vneg, 0, 1, F32_NEG_ONE));
+    t.push(fpu_unary_tc("VNEG +0", enc_vneg, 0, 1, F32_POS_ZERO));
+
+    // --- Unary: VSQRT ---
+    t.push(fpu_unary_tc("VSQRT 4.0", enc_vsqrt, 0, 1, F32_FOUR));
+    t.push(fpu_unary_tc("VSQRT 1.0", enc_vsqrt, 0, 1, F32_ONE));
+    t.push(fpu_unary_tc("VSQRT -1.0", enc_vsqrt, 0, 1, F32_NEG_ONE));
+    t.push(fpu_unary_tc("VSQRT +0", enc_vsqrt, 0, 1, F32_POS_ZERO));
+
+    // --- Compare: VCMP with FPSCR flag check ---
+    // VCMP sets FPSCR NZCV flags. We emit: VCMP Sd,Sm + VMRS APSR,FPSCR is NOT
+    // needed here — the epilogue reads FPSCR directly via VMRS R11,FPSCR.
+    {
+        // Equal: 1.0 == 1.0 → Z=1, C=1
+        let (hw0, hw1) = enc_vcmp(0, 1);
+        t.push(TestCase {
+            name: "VCMP 1.0==1.0".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(0, F32_ONE), (1, F32_ONE)],
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // Less: 1.0 < 2.0 → N=1
+        let (hw0, hw1) = enc_vcmp(0, 1);
+        t.push(TestCase {
+            name: "VCMP 1.0<2.0".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(0, F32_ONE), (1, F32_TWO)],
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // Greater: 2.0 > 1.0 → C=1
+        let (hw0, hw1) = enc_vcmp(0, 1);
+        t.push(TestCase {
+            name: "VCMP 2.0>1.0".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(0, F32_TWO), (1, F32_ONE)],
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // Unordered: NaN vs 1.0 → C=1,V=1
+        let (hw0, hw1) = enc_vcmp(0, 1);
+        t.push(TestCase {
+            name: "VCMP NaN vs 1.0".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(0, F32_QNAN), (1, F32_ONE)],
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- VCMP against zero ---
+    {
+        let (hw0, hw1) = enc_vcmp_zero(0);
+        t.push(TestCase {
+            name: "VCMP 0.0 vs #0.0".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(0, F32_POS_ZERO)],
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_vcmp_zero(0);
+        t.push(TestCase {
+            name: "VCMP -0.0 vs #0.0".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(0, F32_NEG_ZERO)],
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Convert: VCVT int -> float ---
+    {
+        // VCVT.F32.S32: signed 42 -> 42.0
+        let (hw0, hw1) = enc_vcvt_f32_s32(0, 1);
+        t.push(TestCase {
+            name: "VCVT.F32.S32 42".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, 42u32)],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // VCVT.F32.S32: -1 (0xFFFFFFFF) -> -1.0
+        let (hw0, hw1) = enc_vcvt_f32_s32(0, 1);
+        t.push(TestCase {
+            name: "VCVT.F32.S32 -1".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, 0xFFFF_FFFF)],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // VCVT.F32.U32: unsigned 42 -> 42.0
+        let (hw0, hw1) = enc_vcvt_f32_u32(0, 1);
+        t.push(TestCase {
+            name: "VCVT.F32.U32 42".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, 42u32)],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Convert: float -> int ---
+    {
+        // VCVT.S32.F32: 3.7 -> 3 (round toward zero)
+        let (hw0, hw1) = enc_vcvt_s32_f32(0, 1);
+        t.push(TestCase {
+            name: "VCVT.S32.F32 3.7".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, 3.7f32.to_bits())],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // VCVT.S32.F32: NaN -> 0
+        let (hw0, hw1) = enc_vcvt_s32_f32(0, 1);
+        t.push(TestCase {
+            name: "VCVT.S32.F32 NaN".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, F32_QNAN)],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // VCVT.U32.F32: -1.0 -> 0 (negative to unsigned saturates to 0)
+        let (hw0, hw1) = enc_vcvt_u32_f32(0, 1);
+        t.push(TestCase {
+            name: "VCVT.U32.F32 -1.0".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, F32_NEG_ONE)],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // VCVTR.S32.F32: 3.7 -> 4 (round per FPSCR, default = round-nearest)
+        let (hw0, hw1) = enc_vcvtr_s32_f32(0, 1);
+        t.push(TestCase {
+            name: "VCVTR.S32.F32 3.7".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, 3.7f32.to_bits())],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Transfer: VMOV arm -> fpu ---
+    {
+        // VMOV S0, R3 — put 0xDEAD_BEEF in R3, read S0
+        let (hw0, hw1) = enc_vmov_to_fpu(0, 3);
+        t.push(TestCase {
+            name: "VMOV S0,R3".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(3, 0xDEAD_BEEF)],
+            fpu_pre: vec![],
+            fpu_check: vec![0],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Transfer: VMOV fpu -> arm ---
+    {
+        // VMOV R3, S1 — put 0xCAFE_BABE in S1, read R3
+        let (hw0, hw1) = enc_vmov_to_arm(3, 1);
+        t.push(TestCase {
+            name: "VMOV R3,S1".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(1, 0xCAFE_BABE)],
+            fpu_check: vec![],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- VMRS R0, FPSCR ---
+    {
+        let (hw0, hw1) = enc_vmrs(0);
+        t.push(TestCase {
+            name: "VMRS R0,FPSCR".into(),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![],
+            fpu_check: vec![],
+            // VMRS reads FPSCR into an ARM register.
+            // With default FPSCR=0, R0 should be 0.
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- High S-register test: VADD S31, S30, S29 ---
+    t.push(fpu_binop_tc("VADD S31,S30,S29", enc_vadd, 31, 30, 29, F32_ONE, F32_TWO));
+
+    // --- VSUB with denormals ---
+    t.push(fpu_binop_tc("VSUB denorm-denorm", enc_vsub, 0, 1, 2, F32_DENORM, F32_DENORM));
+
+    // --- VMUL with Inf ---
+    t.push(fpu_binop_tc("VMUL +Inf*1", enc_vmul, 0, 1, 2, F32_POS_INF, F32_ONE));
+
+    // --- VDIV NaN ---
+    t.push(fpu_binop_tc("VDIV NaN/1", enc_vdiv, 0, 1, 2, F32_QNAN, F32_ONE));
+
+    // --- VADD with signalling NaN ---
+    t.push(fpu_binop_tc("VADD sNaN+1", enc_vadd, 0, 1, 2, F32_SNAN, F32_ONE));
+
+    // --- VMUL with 0.5 ---
+    t.push(fpu_binop_tc("VMUL 0.5*2.0", enc_vmul, 0, 1, 2, F32_HALF, F32_TWO));
+
+    t
+}
+
+/// Generate `count` random FPU fuzz tests per sub-class.
+///
+/// 6 sub-classes: arithmetic, multiply-accumulate, unary, convert, compare, vmov transfer.
+/// Returns tests. FPU tests use the multi-step path (prelude/epilogue).
+pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
+    use crate::{
+        enc_vadd, enc_vsub, enc_vmul, enc_vdiv,
+        enc_vmla, enc_vfma,
+        enc_vmov_reg, enc_vabs, enc_vneg, enc_vsqrt,
+        enc_vcmp,
+        enc_vcvt_f32_s32, enc_vcvt_f32_u32,
+        enc_vcvt_s32_f32, enc_vcvt_u32_f32,
+        enc_vmov_to_fpu, enc_vmov_to_arm,
+        MASK_NO_FLAGS,
+    };
+
+    let mut t = Vec::new();
+
+    // Random S-register 0-31
+    let rand_sreg = |rng: &mut StdRng| -> u16 { rng.range(0..32) };
+
+    // --- Arithmetic (VADD, VSUB, VMUL, VDIV) ---
+    let arith_ops: [fn(u16, u16, u16) -> (u16, u16); 4] =
+        [enc_vadd, enc_vsub, enc_vmul, enc_vdiv];
+    let arith_names = ["VADD", "VSUB", "VMUL", "VDIV"];
+
+    for i in 0..count {
+        let op_idx = rng.range(0..4usize);
+        let sd = rand_sreg(rng);
+        let sn = rand_sreg(rng);
+        let sm = rand_sreg(rng);
+        let val_n = biased_f32(rng);
+        let val_m = biased_f32(rng);
+        let (hw0, hw1) = arith_ops[op_idx](sd, sn, sm);
+
+        // Build fpu_pre, handling the case where sn == sm
+        let mut fpu_pre = vec![(sn as u8, val_n)];
+        if sm != sn {
+            fpu_pre.push((sm as u8, val_m));
+        }
+
+        t.push(TestCase {
+            name: format!("FUZZ:FPU_ARITH:{i} {} S{sd},S{sn},S{sm}", arith_names[op_idx]),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre,
+            fpu_check: vec![sd as u8],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Multiply-accumulate (VMLA, VFMA) ---
+    let mac_ops: [fn(u16, u16, u16) -> (u16, u16); 2] = [enc_vmla, enc_vfma];
+    let mac_names = ["VMLA", "VFMA"];
+
+    for i in 0..count {
+        let op_idx = rng.range(0..2usize);
+        let sd = rand_sreg(rng);
+        let sn = rand_sreg(rng);
+        let sm = rand_sreg(rng);
+        let val_d = biased_f32(rng);
+        let val_n = biased_f32(rng);
+        let val_m = biased_f32(rng);
+        let (hw0, hw1) = mac_ops[op_idx](sd, sn, sm);
+
+        // Build fpu_pre — sd is also an input
+        let mut fpu_pre = vec![(sd as u8, val_d)];
+        if sn != sd { fpu_pre.push((sn as u8, val_n)); }
+        if sm != sd && sm != sn { fpu_pre.push((sm as u8, val_m)); }
+
+        t.push(TestCase {
+            name: format!("FUZZ:FPU_MAC:{i} {} S{sd},S{sn},S{sm}", mac_names[op_idx]),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre,
+            fpu_check: vec![sd as u8],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Unary (VMOV.F32, VABS, VNEG, VSQRT) ---
+    let unary_ops: [fn(u16, u16) -> (u16, u16); 4] =
+        [enc_vmov_reg, enc_vabs, enc_vneg, enc_vsqrt];
+    let unary_names = ["VMOV", "VABS", "VNEG", "VSQRT"];
+
+    for i in 0..count {
+        let op_idx = rng.range(0..4usize);
+        let sd = rand_sreg(rng);
+        let sm = rand_sreg(rng);
+        let val_m = biased_f32(rng);
+        let (hw0, hw1) = unary_ops[op_idx](sd, sm);
+        t.push(TestCase {
+            name: format!("FUZZ:FPU_UNARY:{i} {} S{sd},S{sm}", unary_names[op_idx]),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre: vec![(sm as u8, val_m)],
+            fpu_check: vec![sd as u8],
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Convert (int<->float) ---
+    let cvt_to_float: [fn(u16, u16) -> (u16, u16); 2] = [enc_vcvt_f32_s32, enc_vcvt_f32_u32];
+    let cvt_from_float: [fn(u16, u16) -> (u16, u16); 2] = [enc_vcvt_s32_f32, enc_vcvt_u32_f32];
+    let cvt_to_names = ["VCVT.F32.S32", "VCVT.F32.U32"];
+    let cvt_from_names = ["VCVT.S32.F32", "VCVT.U32.F32"];
+
+    for i in 0..count {
+        let sd = rand_sreg(rng);
+        let sm = rand_sreg(rng);
+
+        if rng.coin(0.5) {
+            // int -> float: input is a random integer bit pattern
+            let op_idx = rng.range(0..2usize);
+            let val: u32 = rng.random();
+            let (hw0, hw1) = cvt_to_float[op_idx](sd, sm);
+            t.push(TestCase {
+                name: format!("FUZZ:FPU_CVT:{i} {} S{sd},S{sm}", cvt_to_names[op_idx]),
+                opcode: hw0, hw1: Some(hw1),
+                fpu_pre: vec![(sm as u8, val)],
+                fpu_check: vec![sd as u8],
+                addr_regs: vec![12],
+                xpsr_mask: MASK_NO_FLAGS,
+                ..TestCase::default()
+            });
+        } else {
+            // float -> int: use biased float patterns
+            let op_idx = rng.range(0..2usize);
+            let val = biased_f32(rng);
+            let (hw0, hw1) = cvt_from_float[op_idx](sd, sm);
+            t.push(TestCase {
+                name: format!("FUZZ:FPU_CVT:{i} {} S{sd},S{sm}", cvt_from_names[op_idx]),
+                opcode: hw0, hw1: Some(hw1),
+                fpu_pre: vec![(sm as u8, val)],
+                fpu_check: vec![sd as u8],
+                addr_regs: vec![12],
+                xpsr_mask: MASK_NO_FLAGS,
+                ..TestCase::default()
+            });
+        }
+    }
+
+    // --- Compare (VCMP) — check FPSCR flags ---
+    for i in 0..count {
+        let s0 = rand_sreg(rng);
+        let s1 = rand_sreg(rng);
+        let val0 = biased_f32(rng);
+        let val1 = biased_f32(rng);
+        let (hw0, hw1) = enc_vcmp(s0, s1);
+
+        let mut fpu_pre = vec![(s0 as u8, val0)];
+        if s1 != s0 { fpu_pre.push((s1 as u8, val1)); }
+
+        t.push(TestCase {
+            name: format!("FUZZ:FPU_CMP:{i} VCMP S{s0},S{s1}"),
+            opcode: hw0, hw1: Some(hw1),
+            fpu_pre,
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            addr_regs: vec![12],
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- VMOV arm↔fpu transfers ---
+    for i in 0..count {
+        let sn = rand_sreg(rng);
+        let rt: u16 = rng.range(0..11); // R0-R10, exclude R11/R12
+
+        if rng.coin(0.5) {
+            // ARM → FPU: VMOV Sn, Rt
+            let val: u32 = rng.random();
+            let (hw0, hw1) = enc_vmov_to_fpu(sn, rt);
+            t.push(TestCase {
+                name: format!("FUZZ:FPU_VMOV:{i} VMOV S{sn},R{rt}"),
+                opcode: hw0, hw1: Some(hw1),
+                reg_pre: vec![(rt as u8, val)],
+                fpu_check: vec![sn as u8],
+                addr_regs: vec![12],
+                xpsr_mask: MASK_NO_FLAGS,
+                fpscr_mask: 0,
+                ..TestCase::default()
+            });
+        } else {
+            // FPU → ARM: VMOV Rt, Sn
+            let val: u32 = rng.random();
+            let (hw0, hw1) = enc_vmov_to_arm(rt, sn);
+            t.push(TestCase {
+                name: format!("FUZZ:FPU_VMOV:{i} VMOV R{rt},S{sn}"),
+                opcode: hw0, hw1: Some(hw1),
+                fpu_pre: vec![(sn as u8, val)],
+                addr_regs: vec![12],
+                xpsr_mask: MASK_NO_FLAGS,
+                fpscr_mask: 0,
+                ..TestCase::default()
+            });
+        }
     }
 
     t

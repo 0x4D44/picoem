@@ -6333,13 +6333,13 @@ mod tests {
         // T32 ALU: dp_imm, dp_sreg, mul, div, lmul, smulxy, smlaxy,
         //          smm_family, dual_halfword, word_x_half, long_halfword, dsp_special,
         //          qsat, paradd, sat, bcond = 16 classes
-        // FPU: arith, mac, unary, convert, compare = 5 classes
+        // FPU: arith, mac, unary, convert, compare, vmov = 6 classes
         // T16 MEM: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 classes
         //   Note: push/pop is a SINGLE class whose inner loop fans out to 4
         //   variants (2 PUSH slots + 1 POP + 1 POP_PC). The class still emits
         //   `count` tests per call, so the class count stays at 5.
         // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
-        assert_eq!(alu.len(), (9 + 16 + 5) * 10, "ALU count: (9 T16 + 16 T32 + 5 FPU) * 10");
+        assert_eq!(alu.len(), (9 + 16 + 6) * 10, "ALU count: (9 T16 + 16 T32 + 6 FPU) * 10");
         assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
     }
 
