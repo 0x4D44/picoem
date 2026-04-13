@@ -29,7 +29,7 @@ impl Default for Ppb {
             hfsr: 0,
             mmfar: 0,
             bfar: 0,
-            cpacr: 0,
+            cpacr: 0x00F0_0000, // CP10/11 (FPU) full access
             icsr: 0,
         }
     }

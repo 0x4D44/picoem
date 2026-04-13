@@ -1,3 +1,4 @@
+pub mod peripherals;
 pub mod ppb;
 
 use std::collections::HashMap;
@@ -25,6 +26,9 @@ pub struct Bus {
     contention_check_active: bool,
     /// Per-core PPB register files (NVIC, SCB, SysTick stubs).
     pub ppb: [ppb::Ppb; 2],
+    /// RESETS peripheral state: bits set = peripheral in reset.
+    /// Default 0x1FFF_FFFF — all peripherals held in reset at boot.
+    pub resets_state: u32,
     /// Bus fault detected on last access.
     bus_fault: bool,
     /// Address that caused the most recent bus fault.
@@ -44,6 +48,7 @@ impl Bus {
             last_access_cycles: 0,
             extra_wait_states: 0,
             peripheral_regs: HashMap::new(),
+            resets_state: 0x1FFF_FFFF,
             core0_port: None,
             contention_check_active: false,
             ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
@@ -252,8 +257,17 @@ impl Bus {
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
+                let base = canonical & 0xFFFF_F000;
                 let word_addr = canonical & !3;
-                let word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
+                let offset = word_addr & 0x0000_0FFF;
+                let word = match base {
+                    0x4000_0000 => self.sysinfo_read(offset),
+                    0x4002_0000 => self.resets_read(offset),
+                    0x4001_0000 => self.clocks_read(offset),
+                    0x4004_8000 => self.xosc_read(offset),
+                    0x4005_0000 => self.pll_sys_read(offset),
+                    _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                };
                 let byte_idx = (canonical & 3) as usize;
                 word.to_le_bytes()[byte_idx]
             }
@@ -302,19 +316,30 @@ impl Bus {
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
-                let word_addr = canonical & !3;
-                let byte_idx = (canonical & 3) as usize;
-                let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
-                let mut bytes = old_word.to_le_bytes();
-                let old_byte = bytes[byte_idx];
-                bytes[byte_idx] = match alias {
-                    0 => val,
-                    1 => old_byte ^ val,
-                    2 => old_byte | val,
-                    3 => old_byte & !val,
-                    _ => unreachable!(),
-                };
-                self.peripheral_regs.insert(word_addr, u32::from_le_bytes(bytes));
+                let base = canonical & 0xFFFF_F000;
+                match base {
+                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 => {
+                        // SYSINFO (read-only), CLOCKS, XOSC, PLL: ignore writes
+                    }
+                    0x4002_0000 => {
+                        // RESETS: only word-aligned writes meaningful, ignore byte
+                    }
+                    _ => {
+                        let word_addr = canonical & !3;
+                        let byte_idx = (canonical & 3) as usize;
+                        let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
+                        let mut bytes = old_word.to_le_bytes();
+                        let old_byte = bytes[byte_idx];
+                        bytes[byte_idx] = match alias {
+                            0 => val,
+                            1 => old_byte ^ val,
+                            2 => old_byte | val,
+                            3 => old_byte & !val,
+                            _ => unreachable!(),
+                        };
+                        self.peripheral_regs.insert(word_addr, u32::from_le_bytes(bytes));
+                    }
+                }
             }
             _ => {} // ROM read-only, others unmapped/stub
         }
@@ -351,8 +376,17 @@ impl Bus {
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
+                let base = canonical & 0xFFFF_F000;
                 let word_addr = canonical & !3;
-                let word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
+                let offset = word_addr & 0x0000_0FFF;
+                let word = match base {
+                    0x4000_0000 => self.sysinfo_read(offset),
+                    0x4002_0000 => self.resets_read(offset),
+                    0x4001_0000 => self.clocks_read(offset),
+                    0x4004_8000 => self.xosc_read(offset),
+                    0x4005_0000 => self.pll_sys_read(offset),
+                    _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                };
                 let half_idx = ((canonical >> 1) & 1) as usize;
                 let halves: [u16; 2] = [word as u16, (word >> 16) as u16];
                 halves[half_idx]
@@ -402,20 +436,31 @@ impl Bus {
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
-                let word_addr = canonical & !3;
-                let half_idx = ((canonical >> 1) & 1) as usize;
-                let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
-                let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
-                let old_half = halves[half_idx];
-                halves[half_idx] = match alias {
-                    0 => val,
-                    1 => old_half ^ val,
-                    2 => old_half | val,
-                    3 => old_half & !val,
-                    _ => unreachable!(),
-                };
-                let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
-                self.peripheral_regs.insert(word_addr, new_word);
+                let base = canonical & 0xFFFF_F000;
+                match base {
+                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 => {
+                        // SYSINFO (read-only), CLOCKS, XOSC, PLL: ignore writes
+                    }
+                    0x4002_0000 => {
+                        // RESETS: only word-aligned writes meaningful, ignore halfword
+                    }
+                    _ => {
+                        let word_addr = canonical & !3;
+                        let half_idx = ((canonical >> 1) & 1) as usize;
+                        let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
+                        let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
+                        let old_half = halves[half_idx];
+                        halves[half_idx] = match alias {
+                            0 => val,
+                            1 => old_half ^ val,
+                            2 => old_half | val,
+                            3 => old_half & !val,
+                            _ => unreachable!(),
+                        };
+                        let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
+                        self.peripheral_regs.insert(word_addr, new_word);
+                    }
+                }
             }
             _ => {}
         }
@@ -452,7 +497,16 @@ impl Bus {
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
-                *self.peripheral_regs.get(&canonical).unwrap_or(&0)
+                let base = canonical & 0xFFFF_F000;
+                let offset = canonical & 0x0000_0FFF;
+                match base {
+                    0x4000_0000 => self.sysinfo_read(offset),
+                    0x4002_0000 => self.resets_read(offset),
+                    0x4001_0000 => self.clocks_read(offset),
+                    0x4004_8000 => self.xosc_read(offset),
+                    0x4005_0000 => self.pll_sys_read(offset),
+                    _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
+                }
             }
             0xD => 0, // SIO (stub)
             0xE => self.ppb[self.active_core()].read32(addr),
@@ -499,15 +553,28 @@ impl Bus {
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
-                let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
-                let new_val = match alias {
-                    0 => val,
-                    1 => old ^ val,
-                    2 => old | val,
-                    3 => old & !val,
-                    _ => unreachable!(),
-                };
-                self.peripheral_regs.insert(canonical, new_val);
+                let base = canonical & 0xFFFF_F000;
+                let offset = canonical & 0x0000_0FFF;
+                match base {
+                    0x4002_0000 => self.resets_write(offset, val, alias),
+                    0x4001_0000 | 0x4004_8000 | 0x4005_0000 => {
+                        // CLOCKS, XOSC, PLL: accept writes, ignore
+                    }
+                    // SYSINFO (0x4000_0000): read-only, ignore writes
+                    0x4000_0000 => {}
+                    _ => {
+                        // Existing HashMap path with alias logic
+                        let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
+                        let new_val = match alias {
+                            0 => val,
+                            1 => old ^ val,
+                            2 => old | val,
+                            3 => old & !val,
+                            _ => unreachable!(),
+                        };
+                        self.peripheral_regs.insert(canonical, new_val);
+                    }
+                }
             }
             0xE => {
                 let core = self.active_core();

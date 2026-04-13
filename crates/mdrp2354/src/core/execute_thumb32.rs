@@ -1618,20 +1618,6 @@ impl CortexM33 {
         1
     }
 
-    // -- Coprocessor ---------------------------------------------------------
-
-    pub(crate) fn thumb32_coprocessor(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
-        let coproc = ((hw1 >> 8) & 0xF) as u8;
-        match coproc {
-            10 | 11 => self.fpu_execute(hw0, hw1, bus),
-            // Future phases:
-            //   0       → GPIO coprocessor
-            //   4 | 5   → DCP (double-precision coprocessor)
-            //   7       → RCP (runtime check coprocessor)
-            _ => self.thumb32_undefined(hw0, hw1),
-        }
-    }
-
     // -- BL (branch with link) -----------------------------------------------
 
     pub(crate) fn thumb32_bl(&mut self, hw0: u16, hw1: u16) -> u32 {

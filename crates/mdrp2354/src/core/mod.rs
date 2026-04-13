@@ -4,6 +4,7 @@ mod execute;
 pub(crate) mod execute_thumb32;
 mod execute_fpu;
 pub(crate) mod exceptions;
+pub(crate) mod coprocessor;
 
 use crate::bus::Bus;
 pub use registers::Registers;
@@ -30,6 +31,10 @@ pub struct CortexM33 {
     it_state: u8,
     /// Pending synchronous fault from the most recent instruction.
     pub(crate) pending_fault: Option<Fault>,
+    /// RCP (CP7) salt value.
+    pub(crate) rcp_salt: u32,
+    /// DCP (CP4/5) transfer registers.
+    pub(crate) dcp_data: [u32; 2],
 }
 
 impl CortexM33 {
@@ -45,6 +50,8 @@ impl CortexM33 {
             current_instr_addr: 0,
             it_state: 0,
             pending_fault: None,
+            rcp_salt: 0,
+            dcp_data: [0; 2],
         }
     }
 
