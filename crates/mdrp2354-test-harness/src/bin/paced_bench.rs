@@ -4,16 +4,68 @@ use mdrp2354::{Config, Emulator, Pacer, PacerStats};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+#[allow(non_camel_case_types)]
+mod win {
+    use std::os::raw::c_void;
+
+    type HANDLE = *mut c_void;
+    type DWORD = u32;
+    type BOOL = i32;
+    type DWORD_PTR = usize;
+
+    const HIGH_PRIORITY_CLASS: DWORD = 0x0000_0080;
+    const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> HANDLE;
+        fn GetCurrentThread() -> HANDLE;
+        fn SetPriorityClass(hProcess: HANDLE, dwPriorityClass: DWORD) -> BOOL;
+        fn SetThreadPriority(hThread: HANDLE, nPriority: i32) -> BOOL;
+        fn SetThreadAffinityMask(hThread: HANDLE, dwThreadAffinityMask: DWORD_PTR) -> DWORD_PTR;
+    }
+
+    /// Raise process to HIGH_PRIORITY_CLASS, raise current thread to
+    /// TIME_CRITICAL, and pin to the given core. Uses HIGH rather than
+    /// REALTIME to avoid blocking kernel threads on Windows.
+    pub fn boost_and_pin(core: usize) -> Result<(), &'static str> {
+        unsafe {
+            if SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) == 0 {
+                return Err("SetPriorityClass failed");
+            }
+            if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) == 0 {
+                return Err("SetThreadPriority failed");
+            }
+            let mask: DWORD_PTR = 1 << core;
+            if SetThreadAffinityMask(GetCurrentThread(), mask) == 0 {
+                return Err("SetThreadAffinityMask failed");
+            }
+        }
+        Ok(())
+    }
+}
+
 fn main() {
     let seconds = parse_arg("--seconds").unwrap_or(5);
     let quantum = parse_arg("--quantum").unwrap_or(150);
     let clock_mhz = parse_arg("--clock-mhz").unwrap_or(150);
     let sys_clk_hz = clock_mhz * 1_000_000;
+    let core = parse_arg("--core").unwrap_or(2) as usize;
 
     if seconds == 0 || clock_mhz == 0 {
         eprintln!("error: --seconds and --clock-mhz must be > 0");
         std::process::exit(1);
     }
+
+    // Raise priority and pin to a specific core to minimise OS preemption.
+    // Uses HIGH_PRIORITY_CLASS (not REALTIME) to stay safe — won't block kernel threads.
+    #[cfg(target_os = "windows")]
+    match win::boost_and_pin(core) {
+        Ok(()) => println!("Pinned to core {} at HIGH priority / TIME_CRITICAL", core),
+        Err(e) => eprintln!("warning: failed to boost priority: {} (continuing with default)", e),
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = core;
 
     // --- Set up emulator with a tight SRAM loop ---
     let mut emu = Emulator::new(Config {
