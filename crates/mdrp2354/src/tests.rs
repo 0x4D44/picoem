@@ -4621,3 +4621,120 @@ fn sram_bank89_no_extra_wait() {
     let _ = bus.read32(0x2008_0000);
     assert_eq!(bus.extra_wait_states(), 0, "SRAM8 read should have no extra wait state");
 }
+
+// ============================================================================
+// Integration: Reset + Bootrom
+// ============================================================================
+
+use crate::{Emulator, Config};
+
+#[test]
+fn test_reset_loads_sp_and_pc_from_rom() {
+    let mut emu = Emulator::new(Config::default());
+
+    // Build a minimal ROM: word 0 = initial SP, word 1 = reset vector
+    let mut rom = vec![0u8; 512];
+    // SP = 0x2008_0000 (top of SRAM)
+    rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes());
+    // Reset vector = 0x0000_0101 (thumb bit set)
+    rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
+    // Put a NOP (MOVS R0, R0 = 0x0000) at address 0x100
+    // followed by an infinite loop (B . = 0xE7FE)
+    rom[0x100] = 0x00; rom[0x101] = 0x00; // NOP (MOVS R0, R0)
+    rom[0x102] = 0xFE; rom[0x103] = 0xE7; // B .
+
+    emu.load_bootrom(&rom);
+    emu.reset();
+
+    // Verify initial state
+    assert_eq!(emu.cores[0].regs.msp, 0x2008_0000);
+    assert_eq!(emu.cores[0].regs.r[13], 0x2008_0000);
+    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0100); // bit 0 cleared
+    assert_eq!(emu.cores[0].regs.xpsr & (1 << 24), 1 << 24); // Thumb bit
+
+    // Core 1 should be halted
+    assert_eq!(emu.cores[1].stall_cycles(), u32::MAX);
+
+    // Run a few cycles - should execute the NOP then hit the infinite loop
+    for _ in 0..10 {
+        emu.step();
+    }
+
+    // Should be stuck at the infinite loop (0x102)
+    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0102);
+}
+
+#[test]
+fn test_svc_exception_round_trip() {
+    let mut emu = Emulator::new(Config::default());
+
+    // Build ROM with vector table and code
+    let mut rom = vec![0u8; 1024];
+
+    // Vector table
+    rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes()); // SP
+    rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes()); // Reset vector -> 0x100
+    // SVC handler vector (exception 11) at offset 11*4 = 44 = 0x2C
+    rom[0x2C..0x30].copy_from_slice(&0x0000_0201u32.to_le_bytes()); // -> 0x200
+
+    // Code at 0x100: SVC #0
+    rom[0x100] = 0x00; rom[0x101] = 0xDF; // SVC #0 = 0xDF00
+    // Code at 0x102: infinite loop after SVC returns
+    rom[0x102] = 0xFE; rom[0x103] = 0xE7; // B .
+
+    // SVC handler at 0x200: BX LR (return from exception)
+    rom[0x200] = 0x70; rom[0x201] = 0x47; // BX LR = 0x4770
+
+    emu.load_bootrom(&rom);
+    emu.reset();
+
+    // Run enough cycles for: SVC entry (~12) + BX LR return (~12) + settling
+    for _ in 0..50 {
+        emu.step();
+    }
+
+    // After SVC -> handler -> return, should be in the infinite loop at 0x102
+    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0102);
+    // Should be back in thread mode (IPSR = 0)
+    assert_eq!(emu.cores[0].regs.ipsr(), 0);
+}
+
+#[test]
+fn test_busfault_on_unmapped_access() {
+    let mut emu = Emulator::new(Config::default());
+
+    let mut rom = vec![0u8; 1024];
+    // Vector table
+    rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes()); // SP
+    rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes()); // Reset -> 0x100
+    // BusFault handler (exception 5) at offset 5*4 = 20 = 0x14
+    rom[0x14..0x18].copy_from_slice(&0x0000_0301u32.to_le_bytes()); // -> 0x300
+    // HardFault handler (exception 3) at offset 3*4 = 12 = 0x0C
+    rom[0x0C..0x10].copy_from_slice(&0x0000_0381u32.to_le_bytes()); // -> 0x380
+
+    // Code at 0x100: LDR R0, [R1, #0] where R1 will be 0x60000000 (unmapped)
+    rom[0x100] = 0x08; rom[0x101] = 0x68; // LDR R0, [R1, #0] = 0x6808
+    rom[0x102] = 0xFE; rom[0x103] = 0xE7; // B . (shouldn't reach if fault works)
+
+    // BusFault handler at 0x300: BX LR (return from exception)
+    rom[0x300] = 0x70; rom[0x301] = 0x47; // BX LR
+
+    // HardFault handler at 0x380: infinite loop
+    rom[0x380] = 0xFE; rom[0x381] = 0xE7; // B .
+
+    emu.load_bootrom(&rom);
+    emu.reset();
+
+    // Pre-set: R1 = 0x60000000 (unmapped address)
+    emu.cores[0].regs.r[1] = 0x6000_0000;
+    // Enable BusFault handler in SHCSR (bit 17)
+    emu.bus.ppb[0].shcsr |= 1 << 17;
+
+    // Run
+    for _ in 0..50 {
+        emu.step();
+    }
+
+    // CFSR should have PRECISERR (bit 9) set
+    assert_ne!(emu.bus.ppb[0].cfsr & (1 << 9), 0, "PRECISERR should be set");
+}

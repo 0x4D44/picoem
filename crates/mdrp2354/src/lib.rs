@@ -65,6 +65,40 @@ pub struct Emulator {
 }
 
 impl Emulator {
+    /// Create a new emulator with the given configuration.
+    pub fn new(config: Config) -> Self {
+        EmulatorBuilder::new(config).build()
+    }
+
+    /// Reset the emulator: load SP from ROM word 0, PC from ROM word 1.
+    /// Core 0 starts executing; Core 1 is held.
+    pub fn reset(&mut self) {
+        let initial_sp = self.bus.memory.rom_read32(0);
+        let reset_vector = self.bus.memory.rom_read32(4);
+
+        // Core 0: execute from reset vector
+        self.cores[0] = CortexM33::with_id(0);
+        self.cores[0].regs.msp = initial_sp;
+        self.cores[0].regs.r[13] = initial_sp;
+        self.cores[0].regs.set_pc(reset_vector & !1);
+        self.cores[0].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
+
+        // Core 1: halted
+        self.cores[1] = CortexM33::with_id(1);
+        self.cores[1].halt();
+
+        // Clear bus state
+        self.bus.clear_bus_fault();
+        self.bus.ppb = [Default::default(), Default::default()];
+        self.bus.resets_state = 0x1FFF_FFFF;
+
+        // Reset clock
+        self.clock = Clock {
+            cycles: 0,
+            sys_clk_hz: self.clock.sys_clk_hz,
+        };
+    }
+
     /// Load a raw binary at the given address.
     pub fn load_image(&mut self, addr: u32, data: &[u8]) {
         for (i, &byte) in data.iter().enumerate() {

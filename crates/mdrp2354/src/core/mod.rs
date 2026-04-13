@@ -103,6 +103,12 @@ impl CortexM33 {
         self.stall_cycles
     }
 
+    /// Halt the core indefinitely (stall for u32::MAX cycles).
+    /// Used to hold Core 1 during reset.
+    pub fn halt(&mut self) {
+        self.stall_cycles = u32::MAX;
+    }
+
     // --- Test / debug accessors ---
 
     pub fn reg(&self, n: usize) -> u32 {
