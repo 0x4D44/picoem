@@ -22,6 +22,55 @@ impl Bus {
         }
     }
 
+    // --- Bus arbitration ---
+
+    /// Determine the downstream port ID for an address.
+    /// Two addresses that return the same port ID will contend.
+    /// Returns None for core-local ports (SIO, PPB) that never contend.
+    pub fn downstream_port(addr: u32) -> Option<u8> {
+        match addr >> 28 {
+            0x0 => Some(0),  // ROM — single port
+            0x1 => Some(1),  // XIP — single port
+            0x2 => {
+                // SRAM — per-bank ports
+                match Memory::bank_for_address(addr) {
+                    Some(bank) => Some(2 + bank), // ports 2-11
+                    None => Some(2),              // out-of-range SRAM, treat as bank 0
+                }
+            }
+            0x4 => Some(12), // APB bridge — single port
+            0x5 => Some(13), // AHB peripherals — single port
+            0xD => None,     // SIO — core-local, no contention
+            0xE => None,     // PPB — core-local, no contention
+            _ => Some(14),   // unmapped — treat as single port
+        }
+    }
+
+    /// Check if a single core's access has any stall from contention.
+    /// With only one core accessing, there's never contention.
+    pub fn arbitrate_stall(&self, _core: u8, _addr: u32) -> u32 {
+        0 // single core never stalls
+    }
+
+    /// Given two simultaneous accesses (core 0 and core 1), determine stall
+    /// cycles for each. Core 0 has higher priority (wins ties).
+    /// Returns (core0_stall, core1_stall).
+    pub fn arbitrate_pair(&self, core0_addr: u32, core1_addr: u32) -> (u32, u32) {
+        let port0 = Self::downstream_port(core0_addr);
+        let port1 = Self::downstream_port(core1_addr);
+
+        match (port0, port1) {
+            (Some(p0), Some(p1)) if p0 == p1 => {
+                // Same downstream port — core 1 stalls (core 0 wins)
+                (0, 1)
+            }
+            _ => {
+                // Different ports, or one/both are core-local — no contention
+                (0, 0)
+            }
+        }
+    }
+
     // --- Latency accounting ---
 
     /// Returns the cycle cost of the most recent bus access.

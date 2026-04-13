@@ -4304,50 +4304,69 @@ fn atomic_alias_read_ignores_alias_bits() {
 // bus.arbitrate(port0_req, port1_req) method.
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus arbitration is implemented
 fn arbitration_single_core_no_contention() {
     // A single core accessing a bus target incurs no stall.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let mut emu = EmulatorBuilder::new(Config::default()).build();
-    // emu.bus.write32(0x2000_0000, 0x42);
-    // // Core 0 reads SRAM — no contention, zero extra stall cycles
-    // let stall = emu.bus.arbitrate_stall(/*core=*/0, /*addr=*/0x2000_0000);
-    // assert_eq!(stall, 0);
+    let bus = Bus::new();
+    let stall = bus.arbitrate_stall(/*core=*/0, /*addr=*/0x2000_0000);
+    assert_eq!(stall, 0);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus arbitration is implemented
 fn arbitration_two_cores_different_banks_no_contention() {
     // Two cores accessing different SRAM banks: no contention.
     // Core 0 → bank 0 (0x20000000), Core 1 → bank 1 (0x20000004)
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let mut emu = EmulatorBuilder::new(Config::default()).build();
-    // // Simulate both cores requesting in same cycle
-    // let (stall0, stall1) = emu.bus.arbitrate_pair(
-    //     /*core0_addr=*/0x2000_0000, // bank 0
-    //     /*core1_addr=*/0x2000_0004, // bank 1
-    // );
-    // assert_eq!(stall0, 0);
-    // assert_eq!(stall1, 0);
+    let bus = Bus::new();
+    let (stall0, stall1) = bus.arbitrate_pair(
+        /*core0_addr=*/0x2000_0000, // bank 0
+        /*core1_addr=*/0x2000_0004, // bank 1
+    );
+    assert_eq!(stall0, 0);
+    assert_eq!(stall1, 0);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus arbitration is implemented
 fn arbitration_two_cores_same_bank_one_stalls() {
     // Two cores accessing the same SRAM bank: one stalls 1 cycle.
     // Core 0 → bank 0 (0x20000000), Core 1 → bank 0 (0x20000020)
     // Both map to bank 0 (word offsets 0 and 8, both % 8 = 0).
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let mut emu = EmulatorBuilder::new(Config::default()).build();
-    // let (stall0, stall1) = emu.bus.arbitrate_pair(
-    //     /*core0_addr=*/0x2000_0000, // bank 0 (word 0)
-    //     /*core1_addr=*/0x2000_0020, // bank 0 (word 8)
-    // );
-    // // One of them stalls, the other doesn't
-    // assert_eq!(stall0 + stall1, 1, "exactly one core should stall 1 cycle");
-    // assert!(stall0 == 0 || stall0 == 1);
-    // assert!(stall1 == 0 || stall1 == 1);
+    let bus = Bus::new();
+    let (stall0, stall1) = bus.arbitrate_pair(
+        /*core0_addr=*/0x2000_0000, // bank 0 (word 0)
+        /*core1_addr=*/0x2000_0020, // bank 0 (word 8)
+    );
+    assert_eq!(stall0, 0, "core 0 should win (higher priority)");
+    assert_eq!(stall1, 1, "core 1 should stall");
+}
+
+#[test]
+fn arbitration_two_cores_same_non_sram_port() {
+    // Both cores reading ROM — same downstream port (ROM is single-port).
+    let bus = Bus::new();
+    let (stall0, stall1) = bus.arbitrate_pair(0x0000_0000, 0x0000_0100);
+    assert_eq!(stall0, 0, "core 0 wins");
+    assert_eq!(stall1, 1, "core 1 stalls");
+
+    // Both cores accessing APB — same downstream port (APB bridge is single-port).
+    let (stall0, stall1) = bus.arbitrate_pair(0x4007_0000, 0x4008_0000);
+    assert_eq!(stall0, 0);
+    assert_eq!(stall1, 1);
+}
+
+#[test]
+fn arbitration_core_local_never_contends() {
+    // Both cores accessing SIO — core-local, no contention possible.
+    let bus = Bus::new();
+    let (stall0, stall1) = bus.arbitrate_pair(0xD000_0000, 0xD000_0004);
+    assert_eq!(stall0, 0);
+    assert_eq!(stall1, 0);
+
+    // Both cores accessing PPB — also core-local.
+    let (stall0, stall1) = bus.arbitrate_pair(0xE000_0000, 0xE000_0004);
+    assert_eq!(stall0, 0);
+    assert_eq!(stall1, 0);
+
+    // One core SIO, other core SRAM — different ports, no contention.
+    let (stall0, stall1) = bus.arbitrate_pair(0xD000_0000, 0x2000_0000);
+    assert_eq!(stall0, 0);
+    assert_eq!(stall1, 0);
 }
