@@ -55,8 +55,7 @@ impl PacerStats {
         self.behind_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_running(&self, val: bool) {
+    pub fn set_running(&self, val: bool) {
         self.running.store(val, Ordering::Relaxed);
     }
 

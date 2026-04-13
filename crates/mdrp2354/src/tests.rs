@@ -4732,7 +4732,7 @@ fn test_reset_loads_sp_and_pc_from_rom() {
     assert_eq!(emu.cores[0].regs.xpsr & (1 << 24), 1 << 24); // Thumb bit
 
     // Core 1 should be halted
-    assert_eq!(emu.cores[1].stall_cycles(), u32::MAX);
+    assert!(emu.cores[1].is_halted());
 
     // Run a few cycles - should execute the NOP then hit the infinite loop
     for _ in 0..10 {

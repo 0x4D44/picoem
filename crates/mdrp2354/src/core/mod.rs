@@ -37,6 +37,8 @@ pub struct CortexM33 {
     pub(crate) dcp_data: [u32; 2],
     /// ARM security state. `true` = Secure, `false` = Non-Secure.
     pub(crate) secure: bool,
+    /// Core is halted — will not execute until explicitly woken.
+    halted: bool,
 }
 
 impl CortexM33 {
@@ -55,11 +57,15 @@ impl CortexM33 {
             rcp_salt: 0,
             dcp_data: [0; 2],
             secure: true,
+            halted: false,
         }
     }
 
     /// Advance the core by one system clock cycle.
     pub fn step(&mut self, bus: &mut Bus) {
+        if self.halted {
+            return;
+        }
         if self.stall_cycles > 0 {
             self.stall_cycles -= 1;
             return;
@@ -136,10 +142,21 @@ impl CortexM33 {
         self.swap_security_banks();
     }
 
-    /// Halt the core indefinitely (stall for u32::MAX cycles).
+    /// Halt the core indefinitely — will not execute until explicitly woken.
     /// Used to hold Core 1 during reset.
     pub fn halt(&mut self) {
-        self.stall_cycles = u32::MAX;
+        self.halted = true;
+        self.stall_cycles = 0;
+    }
+
+    /// Wake a halted core so it resumes execution.
+    pub fn wake(&mut self) {
+        self.halted = false;
+    }
+
+    /// Returns `true` if the core is halted.
+    pub fn is_halted(&self) -> bool {
+        self.halted
     }
 
     // --- Test / debug accessors ---
