@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 /// Extension trait to call Rng::gen() without hitting the `gen` keyword reservation.
-trait RngExt {
+pub(crate) trait RngExt {
     fn random<T>(&mut self) -> T
     where
         rand::distributions::Standard: rand::distributions::Distribution<T>;
@@ -4107,8 +4107,10 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 /// Returns (alu_tests, mem_tests) so the runner can prioritize differently.
 pub fn generate_fuzz(count_per_class: usize, seed: u64) -> (Vec<TestCase>, Vec<TestCase>) {
     let mut rng = StdRng::seed_from_u64(seed);
-    let alu = generate_fuzz_alu(count_per_class, &mut rng);
-    let mem = generate_fuzz_mem(count_per_class, &mut rng);
+    let mut alu = generate_fuzz_alu(count_per_class, &mut rng);
+    alu.extend(thumb32_gen::generate_fuzz_t32_alu(count_per_class, &mut rng));
+    let mut mem = generate_fuzz_mem(count_per_class, &mut rng);
+    mem.extend(thumb32_gen::generate_fuzz_t32_mem(count_per_class, &mut rng));
     (alu, mem)
 }
 
@@ -5134,26 +5136,44 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_alu_opcodes_are_valid_thumb16() {
+    fn fuzz_alu_opcodes_are_valid() {
         let (alu, _) = generate_fuzz(20, 123);
         for tc in &alu {
-            assert!(
-                tc.opcode < 0xE800,
-                "fuzz test '{}' has opcode {:#06x} >= 0xE800",
-                tc.name, tc.opcode
-            );
+            if tc.hw1.is_some() {
+                // Thumb-32: first halfword must be in the 0xE800..=0xFFFF range
+                assert!(
+                    tc.opcode >= 0xE800,
+                    "T32 fuzz test '{}' has opcode {:#06x} < 0xE800",
+                    tc.name, tc.opcode
+                );
+            } else {
+                // Thumb-16: opcode must be below 0xE800
+                assert!(
+                    tc.opcode < 0xE800,
+                    "T16 fuzz test '{}' has opcode {:#06x} >= 0xE800",
+                    tc.name, tc.opcode
+                );
+            }
         }
     }
 
     #[test]
-    fn fuzz_mem_opcodes_are_valid_thumb16() {
+    fn fuzz_mem_opcodes_are_valid() {
         let (_, mem) = generate_fuzz(20, 456);
         for tc in &mem {
-            assert!(
-                tc.opcode < 0xE800,
-                "fuzz test '{}' has opcode {:#06x} >= 0xE800",
-                tc.name, tc.opcode
-            );
+            if tc.hw1.is_some() {
+                assert!(
+                    tc.opcode >= 0xE800,
+                    "T32 fuzz test '{}' has opcode {:#06x} < 0xE800",
+                    tc.name, tc.opcode
+                );
+            } else {
+                assert!(
+                    tc.opcode < 0xE800,
+                    "T16 fuzz test '{}' has opcode {:#06x} >= 0xE800",
+                    tc.name, tc.opcode
+                );
+            }
         }
     }
 
@@ -5216,11 +5236,12 @@ mod tests {
     #[test]
     fn fuzz_generates_expected_count() {
         let (alu, mem) = generate_fuzz(10, 0);
-        // ALU: 9 classes * 10 = 90 (shift, addsub, imm8, dproc, special, misc, bcond, buncond)
-        // Wait — let me count: shift, addsub, imm8, dproc, special, misc, bcond, buncond = 8 loops
-        // Mem: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 loops
-        assert_eq!(alu.len(), 8 * 10, "ALU count: 8 classes * 10");
-        assert_eq!(mem.len(), 5 * 10, "MEM count: 5 classes * 10");
+        // T16 ALU: shift, addsub, imm8, dproc, special, misc, bcond, buncond = 8 classes
+        // T32 ALU: dp_imm, dp_sreg, mul, div, bcond = 5 classes
+        // T16 MEM: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 classes
+        // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
+        assert_eq!(alu.len(), (8 + 5) * 10, "ALU count: (8 T16 + 5 T32) * 10");
+        assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
     }
 
     #[test]

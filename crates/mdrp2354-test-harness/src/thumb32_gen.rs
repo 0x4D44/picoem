@@ -4130,6 +4130,480 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
 }
 
 // ============================================================================
+// Fuzz test generators
+// ============================================================================
+
+use crate::RngExt;
+use rand::rngs::StdRng;
+
+/// All valid DP op constants (not contiguous: 0-4, 8, 10-11, 13-14).
+const DP_OPS: [u16; 10] = [
+    DP_AND, DP_BIC, DP_ORR, DP_ORN, DP_EOR,
+    DP_ADD, DP_ADC, DP_SBC, DP_SUB, DP_RSB,
+];
+
+/// Random register R0-R12 (avoids SP=13 and PC=15).
+fn rand_reg(rng: &mut StdRng) -> u16 { rng.range(0..13) }
+
+/// Random 32-bit value.
+fn rand_val(rng: &mut StdRng) -> u32 { rng.random() }
+
+/// Random xPSR flags (N, Z, C, V in bits 31:28) with T bit set.
+fn rand_flags(rng: &mut StdRng) -> u32 {
+    let flags: u32 = rng.range(0..16);
+    0x0100_0000 | (flags << 28)
+}
+
+/// All GP registers R0-R12 set to random values.
+fn rand_gp_regs(rng: &mut StdRng) -> Vec<(u8, u32)> {
+    (0..13).map(|i| (i, rand_val(rng))).collect()
+}
+
+/// Generate `count` random Thumb-32 ALU fuzz tests per instruction class.
+pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
+    let mut t = Vec::new();
+
+    // --- DP modified immediate ---
+    for i in 0..count {
+        let op = DP_OPS[rng.range(0..DP_OPS.len())];
+        let rn = rand_reg(rng);
+        let rd = rand_reg(rng);
+        let imm12: u16 = rng.range(0..0x1000);
+        let (hw0, hw1) = enc_t32_dp_mod_imm(op, true, rn, rd, imm12);
+        let mut regs = rand_gp_regs(rng);
+        // Ensure Rn has the random value already in the list
+        regs.retain(|&(r, _)| r != rn as u8);
+        regs.push((rn as u8, rand_val(rng)));
+        t.push(TestCase {
+            name: format!("FUZZ:T32_DP_IMM:{i} op={op} R{rd},R{rn},#{imm12:#05x}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- DP shifted register ---
+    for i in 0..count {
+        let op = DP_OPS[rng.range(0..DP_OPS.len())];
+        let rn = rand_reg(rng);
+        let rd = rand_reg(rng);
+        let rm = rand_reg(rng);
+        let stype: u16 = rng.range(0..4);
+        let samount: u16 = rng.range(0..32);
+        let (hw0, hw1) = enc_t32_dp_shift_reg(op, true, rn, rd, rm, stype, samount);
+        let mut regs = rand_gp_regs(rng);
+        // Ensure Rn and Rm have explicit random values
+        regs.retain(|&(r, _)| r != rn as u8 && r != rm as u8);
+        regs.push((rn as u8, rand_val(rng)));
+        regs.push((rm as u8, rand_val(rng)));
+        t.push(TestCase {
+            name: format!("FUZZ:T32_DP_SREG:{i} op={op} R{rd},R{rn},R{rm},sh={stype}#{samount}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Multiply (MUL/MLA/MLS) ---
+    for i in 0..count {
+        let variant: u8 = rng.range(0..3);
+        let rd = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rd { break r; }
+        };
+        let rm = loop {
+            let r = rand_reg(rng);
+            if r != rd && r != rn { break r; }
+        };
+        let mut regs = rand_gp_regs(rng);
+        let (name_tag, hw0, hw1) = match variant {
+            0 => {
+                let (h0, h1) = enc_t32_mul(rd, rn, rm);
+                ("MUL", h0, h1)
+            }
+            1 => {
+                let ra = loop {
+                    let r = rand_reg(rng);
+                    if r != rd && r != rn && r != rm { break r; }
+                };
+                regs.retain(|&(r, _)| r != ra as u8);
+                regs.push((ra as u8, rand_val(rng)));
+                let (h0, h1) = enc_t32_mla(rd, rn, rm, ra);
+                ("MLA", h0, h1)
+            }
+            _ => {
+                let ra = loop {
+                    let r = rand_reg(rng);
+                    if r != rd && r != rn && r != rm { break r; }
+                };
+                regs.retain(|&(r, _)| r != ra as u8);
+                regs.push((ra as u8, rand_val(rng)));
+                let (h0, h1) = enc_t32_mls(rd, rn, rm, ra);
+                ("MLS", h0, h1)
+            }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_MUL:{i} {name_tag} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Division (SDIV/UDIV) ---
+    for i in 0..count {
+        let signed = rng.coin(0.5);
+        let rd = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rd { break r; }
+        };
+        let rm = loop {
+            let r = rand_reg(rng);
+            if r != rd && r != rn { break r; }
+        };
+        let mut regs = rand_gp_regs(rng);
+        // Occasionally test division by zero
+        let divisor: u32 = if rng.coin(0.1) { 0 } else { rand_val(rng) };
+        regs.retain(|&(r, _)| r != rm as u8 && r != rn as u8);
+        regs.push((rn as u8, rand_val(rng)));
+        regs.push((rm as u8, divisor));
+        let (hw0, hw1) = if signed {
+            enc_t32_sdiv(rd, rn, rm)
+        } else {
+            enc_t32_udiv(rd, rn, rm)
+        };
+        let tag = if signed { "SDIV" } else { "UDIV" };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_DIV:{i} {tag} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Conditional branch B<cond>.W ---
+    for i in 0..count {
+        let cond: u16 = rng.range(0..14); // 0-13, excluding 14/15
+        // Safe offset: -1048576..+1048574, must be even. Keep small to stay safe.
+        let half: i32 = rng.range(-512..512);
+        let offset: i32 = half * 2;
+        let (hw0, hw1) = enc_t32_b_cond(cond, offset);
+        t.push(TestCase {
+            name: format!("FUZZ:T32_BCOND:{i} cond={cond} off={offset}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    t
+}
+
+/// Generate `count` random Thumb-32 memory fuzz tests per instruction class.
+pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
+    use crate::SCRATCH_SIZE;
+    let mut t = Vec::new();
+
+    // --- Load/store single (imm12) ---
+    for i in 0..count {
+        // size: 0=byte, 1=half, 2=word
+        let size_sel: u8 = rng.range(0..3);
+        let is_load = rng.coin(0.5);
+        let (size, align, max_off) = match size_sel {
+            0 => (0u16, 1u32, SCRATCH_SIZE - 1),  // byte
+            1 => (1u16, 2u32, SCRATCH_SIZE - 2),   // half
+            _ => (2u16, 4u32, SCRATCH_SIZE - 4),   // word
+        };
+        let rt = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rt { break r; }
+        };
+        let imm12 = (rng.range(0..max_off / align) * align) as u16;
+        let offset = imm12 as u32;
+        let (hw0, hw1) = enc_t32_ls_imm12(size, is_load, false, rn, rt, imm12);
+
+        let mut reg_pre: Vec<(u8, u32)> = rand_gp_regs(rng);
+        reg_pre.retain(|&(r, _)| r != rn as u8);
+        reg_pre.push((rn as u8, 0)); // base at scratch start
+
+        let (mem_pre, mem_check) = if is_load {
+            let data: u32 = rand_val(rng);
+            let mp = match size_sel {
+                0 => vec![(offset, data as u8)],
+                1 => mem_pre_u16(offset, data as u16),
+                _ => mem_pre_u32(offset, data),
+            };
+            (mp, Vec::new())
+        } else {
+            let data: u32 = rand_val(rng);
+            reg_pre.retain(|&(r, _)| r != rt as u8);
+            reg_pre.push((rt as u8, data));
+            let mc = match size_sel {
+                0 => vec![offset],
+                1 => mem_check_u16(offset),
+                _ => mem_check_u32(offset),
+            };
+            (Vec::new(), mc)
+        };
+
+        let tag = if is_load { "LDR" } else { "STR" };
+        let sz = ["B", "H", ""][size_sel as usize];
+        t.push(TestCase {
+            name: format!("FUZZ:T32_LS12:{i} {tag}{sz} R{rt},[R{rn},#{imm12}]"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre,
+            addr_regs: vec![rn as u8],
+            needs_bus: true,
+            mem_pre,
+            mem_check,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Load/store single (imm8 P/U/W) ---
+    for i in 0..count {
+        let size_sel: u8 = rng.range(0..3);
+        let is_load = rng.coin(0.5);
+        let (size, align) = match size_sel {
+            0 => (0u16, 1u32),
+            1 => (1u16, 2u32),
+            _ => (2u16, 4u32),
+        };
+
+        let rt = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rt { break r; }
+        };
+
+        // P/U/W: avoid P=0,U=0,W=0 (undefined). For W=1, keep base in middle of scratch.
+        let p = rng.coin(0.7);
+        let u = rng.coin(0.5);
+        let w = if p { rng.coin(0.3) } else { true }; // post-index requires W=1
+        let max_imm8 = if w { 32u16 } else { 64 }; // small offsets for writeback safety
+        let imm8: u16 = (rng.range(0..max_imm8) / align as u16) * align as u16;
+
+        // Base offset: place base in middle of scratch so +/- offsets stay in range
+        let base_offset: u32 = SCRATCH_SIZE / 2;
+        let effective_offset = if u {
+            base_offset + imm8 as u32
+        } else {
+            base_offset - imm8 as u32
+        };
+
+        let (hw0, hw1) = enc_t32_ls_imm8(size, is_load, false, rn, rt, p, u, w, imm8);
+
+        let mut reg_pre: Vec<(u8, u32)> = rand_gp_regs(rng);
+        reg_pre.retain(|&(r, _)| r != rn as u8);
+        reg_pre.push((rn as u8, base_offset));
+
+        let (mem_pre, mem_check) = if is_load {
+            let data: u32 = rand_val(rng);
+            let mp = match size_sel {
+                0 => vec![(effective_offset, data as u8)],
+                1 => mem_pre_u16(effective_offset, data as u16),
+                _ => mem_pre_u32(effective_offset, data),
+            };
+            (mp, Vec::new())
+        } else {
+            let data: u32 = rand_val(rng);
+            reg_pre.retain(|&(r, _)| r != rt as u8);
+            reg_pre.push((rt as u8, data));
+            let mc = match size_sel {
+                0 => vec![effective_offset],
+                1 => mem_check_u16(effective_offset),
+                _ => mem_check_u32(effective_offset),
+            };
+            (Vec::new(), mc)
+        };
+
+        let tag = if is_load { "LDR" } else { "STR" };
+        let sz = ["B", "H", ""][size_sel as usize];
+        t.push(TestCase {
+            name: format!("FUZZ:T32_LS8:{i} {tag}{sz} R{rt},[R{rn},#±{imm8}] P={p} U={u} W={w}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre,
+            addr_regs: vec![rn as u8],
+            needs_bus: true,
+            mem_pre,
+            mem_check,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- LDRD/STRD ---
+    for i in 0..count {
+        let is_load = rng.coin(0.5);
+        let rt = rand_reg(rng);
+        let rt2 = loop {
+            let r = rand_reg(rng);
+            if r != rt { break r; }
+        };
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rt && r != rt2 { break r; }
+        };
+
+        let p = rng.coin(0.7);
+        let u = rng.coin(0.5);
+        let w = if p { rng.coin(0.3) } else { true };
+        // imm8 is in words (offset = imm8 * 4), keep small for scratch safety
+        let imm8: u16 = rng.range(0..32);
+        let byte_offset = imm8 as u32 * 4;
+
+        // Place base in middle of scratch
+        let base_offset: u32 = SCRATCH_SIZE / 2;
+        let effective_offset = if u {
+            base_offset + byte_offset
+        } else {
+            base_offset - byte_offset
+        };
+
+        let (hw0, hw1) = if is_load {
+            enc_t32_ldrd(rt, rt2, rn, p, u, w, imm8)
+        } else {
+            enc_t32_strd(rt, rt2, rn, p, u, w, imm8)
+        };
+
+        let mut reg_pre: Vec<(u8, u32)> = rand_gp_regs(rng);
+        reg_pre.retain(|&(r, _)| r != rn as u8);
+        reg_pre.push((rn as u8, base_offset));
+
+        let (mem_pre, mem_check) = if is_load {
+            let d0: u32 = rand_val(rng);
+            let d1: u32 = rand_val(rng);
+            let mut mp = mem_pre_u32(effective_offset, d0);
+            mp.extend(mem_pre_u32(effective_offset + 4, d1));
+            (mp, Vec::new())
+        } else {
+            let d0: u32 = rand_val(rng);
+            let d1: u32 = rand_val(rng);
+            reg_pre.retain(|&(r, _)| r != rt as u8 && r != rt2 as u8);
+            reg_pre.push((rt as u8, d0));
+            reg_pre.push((rt2 as u8, d1));
+            let mut mc = mem_check_u32(effective_offset);
+            mc.extend(mem_check_u32(effective_offset + 4));
+            (Vec::new(), mc)
+        };
+
+        let tag = if is_load { "LDRD" } else { "STRD" };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_DRD:{i} {tag} R{rt},R{rt2},[R{rn},#±{byte_offset}]"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre,
+            addr_regs: vec![rn as u8],
+            needs_bus: true,
+            mem_pre,
+            mem_check,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- LDM/STM.W ---
+    for i in 0..count {
+        let is_load = rng.coin(0.5);
+        let db = rng.coin(0.3); // LDMDB/STMDB vs LDMIA/STMIA
+        let rn: u16 = rng.range(0..13);
+
+        // Build reglist: 2-5 low registers, exclude rn to avoid conflicts
+        let num_regs: usize = rng.range(2..6);
+        let mut reglist: u16 = 0;
+        let mut picked = 0;
+        while picked < num_regs {
+            let r: u16 = rng.range(0..13);
+            if r != rn && (reglist & (1 << r)) == 0 {
+                reglist |= 1 << r;
+                picked += 1;
+            }
+        }
+
+        let w = !is_load || (reglist & (1 << rn)) == 0; // writeback safe if rn not in list
+        let reg_count = reglist.count_ones();
+
+        let (hw0, hw1) = if is_load {
+            enc_t32_ldm(rn, w, db, reglist)
+        } else {
+            enc_t32_stm(rn, w, db, reglist)
+        };
+
+        // For DB mode, base must be high enough to decrement.
+        // For IA mode, base at 0 is fine.
+        let base_offset: u32 = if db { reg_count * 4 } else { 0 };
+
+        let mut reg_pre: Vec<(u8, u32)> = rand_gp_regs(rng);
+        reg_pre.retain(|&(r, _)| r != rn as u8);
+        reg_pre.push((rn as u8, base_offset));
+
+        let (mem_pre, mem_check) = if is_load {
+            let mut mp = Vec::new();
+            // For DB: data at [base - N*4 .. base - 4]
+            // For IA: data at [base .. base + (N-1)*4]
+            for word in 0..reg_count {
+                let off = if db {
+                    base_offset - (reg_count - word) * 4
+                } else {
+                    base_offset + word * 4
+                };
+                mp.extend(mem_pre_u32(off, rand_val(rng)));
+            }
+            (mp, Vec::new())
+        } else {
+            let mut mc = Vec::new();
+            for word in 0..reg_count {
+                let off = if db {
+                    base_offset - (reg_count - word) * 4
+                } else {
+                    base_offset + word * 4
+                };
+                mc.extend(mem_check_u32(off));
+            }
+            (Vec::new(), mc)
+        };
+
+        let tag = if is_load { "LDM" } else { "STM" };
+        let dir = if db { "DB" } else { "IA" };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_LDM:{i} {tag}{dir} R{rn}! list={reglist:#06x}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre,
+            addr_regs: vec![rn as u8],
+            needs_bus: true,
+            mem_pre,
+            mem_check,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    t
+}
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 
