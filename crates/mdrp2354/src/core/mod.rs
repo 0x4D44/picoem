@@ -17,6 +17,8 @@ pub struct CortexM33 {
     /// Address of the currently executing instruction. Used to compute
     /// "read PC" value (instr_addr + 4) per ARM architecture definition.
     current_instr_addr: u32,
+    /// IT block state. Format: cond[7:4]:mask[3:0]. mask=0 means not in IT block.
+    it_state: u8,
 }
 
 impl CortexM33 {
@@ -30,6 +32,7 @@ impl CortexM33 {
             stall_cycles: 0,
             core_id,
             current_instr_addr: 0,
+            it_state: 0,
         }
     }
 
@@ -121,6 +124,21 @@ impl CortexM33 {
     #[inline(always)]
     fn read_pc(&self) -> u32 {
         self.current_instr_addr.wrapping_add(4)
+    }
+
+    /// Advance IT block state after executing one instruction inside an IT block.
+    /// Shifts the mask left; clears it_state entirely when the last instruction completes.
+    fn advance_it_state(&mut self) {
+        if self.it_state & 0x7 == 0 {
+            self.it_state = 0; // last instruction in block
+        } else {
+            self.it_state = (self.it_state & 0xE0) | ((self.it_state << 1) & 0x1F);
+        }
+    }
+
+    /// Returns current IT block state (for testing).
+    pub fn it_state(&self) -> u8 {
+        self.it_state
     }
 }
 

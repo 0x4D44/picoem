@@ -2748,3 +2748,316 @@ fn tbh_basic() {
     assert_eq!(c.regs.pc(), 0x102C);
     assert_eq!(cy, 4);
 }
+
+// ============================================================================
+// MSR / MRS (Stage 10)
+// ============================================================================
+
+#[test]
+fn msr_primask() {
+    // MSR PRIMASK, R0 — write 1 to PRIMASK, then MRS R1, PRIMASK to read back
+    let mut c = CortexM33::new();
+    c.set_reg(0, 1);
+    // MSR PRIMASK, R0: hw0=0xF380 (Rn=0), hw1=0x8010 (SYSm=16)
+    let cy = c.execute_one_wide(0xF380, 0x8010);
+    assert_eq!(c.regs.primask, 1);
+    assert_eq!(cy, 2);
+
+    // MRS R1, PRIMASK: hw0=0xF3EF, hw1=0x8110 (Rd=1, SYSm=16)
+    let cy = c.execute_one_wide(0xF3EF, 0x8110);
+    assert_eq!(c.reg(1), 1);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn msr_basepri() {
+    // MSR BASEPRI, R0 — write 0x40 to BASEPRI
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0x40);
+    // MSR BASEPRI, R0: hw0=0xF380, hw1=0x8011 (SYSm=17)
+    c.execute_one_wide(0xF380, 0x8011);
+    assert_eq!(c.regs.basepri, 0x40);
+
+    // MRS R1, BASEPRI: hw0=0xF3EF, hw1=0x8111 (Rd=1, SYSm=17)
+    c.execute_one_wide(0xF3EF, 0x8111);
+    assert_eq!(c.reg(1), 0x40);
+}
+
+#[test]
+fn mrs_apsr_flags() {
+    // Set NZCV flags, then MRS R0, APSR to read them back
+    let mut c = CortexM33::new();
+    c.regs.set_nzcv(true, false, true, false); // N=1, Z=0, C=1, V=0
+    // MRS R0, APSR: hw0=0xF3EF, hw1=0x8000 (Rd=0, SYSm=0)
+    let cy = c.execute_one_wide(0xF3EF, 0x8000);
+    // N=bit31, C=bit29 => 0xA000_0000
+    assert_eq!(c.reg(0), 0xA000_0000);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn msr_msp() {
+    // MSR MSP, R0 — write to MSP, verify R13 changes (default uses MSP)
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0x2000_1000);
+    // MSR MSP, R0: hw0=0xF380, hw1=0x8008 (SYSm=8)
+    c.execute_one_wide(0xF380, 0x8008);
+    assert_eq!(c.regs.msp, 0x2000_1000);
+    // In thread mode with SPSEL=0, R13 should mirror MSP
+    assert_eq!(c.regs.r[13], 0x2000_1000);
+}
+
+#[test]
+fn msr_psp() {
+    // MSR PSP, R0 — write to PSP (R13 shouldn't change since SPSEL=0)
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0x2000_2000);
+    // MSR PSP, R0: hw0=0xF380, hw1=0x8009 (SYSm=9)
+    c.execute_one_wide(0xF380, 0x8009);
+    assert_eq!(c.regs.psp, 0x2000_2000);
+    // SPSEL=0 so R13 should still be MSP (unchanged from reset = 0)
+    assert_eq!(c.regs.r[13], 0);
+}
+
+#[test]
+fn msr_control_spsel() {
+    // Write CONTROL.SPSEL=1 to switch from MSP to PSP, verify SP switches
+    let mut c = CortexM33::new();
+
+    // Set up MSP and PSP values
+    c.regs.msp = 0x2000_1000;
+    c.regs.psp = 0x2000_2000;
+    c.regs.r[13] = 0x2000_1000; // R13 = MSP initially
+
+    // MSR CONTROL, R0 with SPSEL=1 (bit 1): switch to PSP
+    c.set_reg(0, 0x2); // SPSEL=1
+    // MSR CONTROL, R0: hw0=0xF380, hw1=0x8014 (SYSm=20)
+    c.execute_one_wide(0xF380, 0x8014);
+
+    assert_eq!(c.regs.control & 0x2, 0x2); // SPSEL bit set
+    // sync_sp_to_banked saved old R13 (MSP=0x2000_1000) to msp
+    assert_eq!(c.regs.msp, 0x2000_1000);
+    // sync_sp_from_banked loaded PSP into R13
+    assert_eq!(c.regs.r[13], 0x2000_2000);
+
+    // Switch back to MSP: write CONTROL with SPSEL=0
+    c.set_reg(0, 0x0);
+    c.execute_one_wide(0xF380, 0x8014);
+
+    assert_eq!(c.regs.control & 0x2, 0x0);
+    // R13 should now be MSP again
+    assert_eq!(c.regs.r[13], 0x2000_1000);
+    // PSP should have been saved from the previous R13
+    assert_eq!(c.regs.psp, 0x2000_2000);
+}
+
+#[test]
+fn mrs_ipsr() {
+    // MRS R0, IPSR — should be 0 in thread mode (no exception active)
+    let mut c = CortexM33::new();
+    // MRS R0, IPSR: hw0=0xF3EF, hw1=0x8005 (Rd=0, SYSm=5)
+    c.execute_one_wide(0xF3EF, 0x8005);
+    assert_eq!(c.reg(0), 0);
+}
+
+// ============================================================================
+// IT (If-Then) Blocks (Stage 11)
+// ============================================================================
+
+/// Helper: step the core past any stall cycles so the next step fetches.
+fn step_one(c: &mut CortexM33, bus: &mut Bus) {
+    // Drain stall cycles first, then execute one instruction.
+    while c.stall_cycles() > 0 {
+        c.step(bus);
+    }
+    c.step(bus);
+}
+
+#[test]
+fn it_eq_taken() {
+    // IT EQ; MOVS R0, #42 — condition true (Z=1), should execute
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    bus.write16(base, 0xBF08);       // IT EQ (firstcond=0000, mask=1000)
+    bus.write16(base + 2, 0x202A);   // MOVS R0, #42
+    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.regs.set_flag_z(true); // EQ condition true
+
+    step_one(&mut c, &mut bus); // execute IT
+    assert_eq!(c.it_state(), 0x08);
+
+    step_one(&mut c, &mut bus); // execute MOVS R0, #42 (conditionally)
+    assert_eq!(c.reg(0), 42);
+    assert_eq!(c.it_state(), 0); // IT block done
+}
+
+#[test]
+fn it_eq_skipped() {
+    // IT EQ; MOVS R0, #42 — condition false (Z=0), should skip
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    bus.write16(base, 0xBF08);       // IT EQ
+    bus.write16(base + 2, 0x202A);   // MOVS R0, #42
+    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.regs.set_flag_z(false); // EQ condition false
+
+    step_one(&mut c, &mut bus); // execute IT
+    step_one(&mut c, &mut bus); // MOVS R0, #42 — skipped
+
+    assert_eq!(c.reg(0), 0); // R0 unchanged
+    assert_eq!(c.it_state(), 0); // IT block done
+}
+
+#[test]
+fn it_flag_suppression() {
+    // IT EQ; ADDS R0, R1, R2 inside IT should NOT update flags
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    // ADDS R0, R1, R2 = 0x1888
+    bus.write16(base, 0xBF08);       // IT EQ
+    bus.write16(base + 2, 0x1888);   // ADDS R0, R1, R2
+    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.set_reg(1, 5);
+    c.set_reg(2, 10);
+    c.regs.set_flag_z(true);  // EQ true, and Z=1 should be preserved
+    c.regs.set_flag_c(true);  // C=1 should be preserved
+
+    step_one(&mut c, &mut bus); // IT
+    step_one(&mut c, &mut bus); // ADDS R0, R1, R2
+
+    assert_eq!(c.reg(0), 15); // 5 + 10 = 15
+    // Flags should be unchanged (suppressed by IT block)
+    assert!(c.flag_z(), "Z flag should be preserved (suppressed)");
+    assert!(c.flag_c(), "C flag should be preserved (suppressed)");
+}
+
+#[test]
+fn it_cmp_always_sets_flags() {
+    // IT EQ; CMP R0, R1 inside IT SHOULD update flags (flag-only instruction)
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    // CMP R0, R1 (data processing) = 0x4288
+    bus.write16(base, 0xBF08);       // IT EQ
+    bus.write16(base + 2, 0x4288);   // CMP R0, R1
+    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.set_reg(0, 10);
+    c.set_reg(1, 5);
+    c.regs.set_flag_z(true);  // EQ true (so CMP executes), Z=1 initially
+
+    step_one(&mut c, &mut bus); // IT
+    step_one(&mut c, &mut bus); // CMP R0, R1 (10 - 5 = 5, not zero)
+
+    // CMP should have updated flags despite being in IT block
+    assert!(!c.flag_z(), "Z should be cleared: 10 != 5");
+    assert!(!c.flag_n(), "N should be cleared: result is positive");
+    assert!(c.flag_c(), "C should be set: no borrow");
+}
+
+#[test]
+fn it_cmp_imm_always_sets_flags() {
+    // IT EQ; CMP R0, #5 inside IT SHOULD update flags
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    // CMP R0, #5 = 0x2805 (bits[15:11]=00101, Rn=000, imm8=0x05)
+    bus.write16(base, 0xBF08);       // IT EQ
+    bus.write16(base + 2, 0x2805);   // CMP R0, #5
+    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.set_reg(0, 10);
+    c.regs.set_flag_z(true);  // EQ true
+
+    step_one(&mut c, &mut bus); // IT
+    step_one(&mut c, &mut bus); // CMP R0, #5
+
+    // 10 - 5 = 5 → Z=0, N=0, C=1 (no borrow)
+    assert!(!c.flag_z(), "Z should be cleared: 10 != 5");
+    assert!(c.flag_c(), "C should be set: no borrow");
+}
+
+#[test]
+fn ite_then_else_taken() {
+    // ITE EQ; MOVS R0, #1; MOVS R0, #2 — with Z=1: R0=1 (Then taken, Else skipped)
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    // ITE EQ: firstcond=0000, mask=0100 with E-bit set → mask=1100 = 0x0C
+    bus.write16(base, 0xBF0C);       // ITE EQ
+    bus.write16(base + 2, 0x2001);   // MOVS R0, #1 (Then)
+    bus.write16(base + 4, 0x2002);   // MOVS R0, #2 (Else)
+    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.regs.set_flag_z(true); // EQ true → Then
+
+    step_one(&mut c, &mut bus); // ITE
+    step_one(&mut c, &mut bus); // MOVS R0, #1 (executed: condition EQ, Z=1)
+    step_one(&mut c, &mut bus); // MOVS R0, #2 (skipped: condition NE, Z=1)
+
+    assert_eq!(c.reg(0), 1);
+    assert_eq!(c.it_state(), 0);
+}
+
+#[test]
+fn ite_then_else_not_taken() {
+    // ITE EQ; MOVS R0, #1; MOVS R0, #2 — with Z=0: R0=2 (Then skipped, Else taken)
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    bus.write16(base, 0xBF0C);       // ITE EQ
+    bus.write16(base + 2, 0x2001);   // MOVS R0, #1 (Then — skipped)
+    bus.write16(base + 4, 0x2002);   // MOVS R0, #2 (Else — executed)
+    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.regs.set_flag_z(false); // EQ false → Else
+
+    step_one(&mut c, &mut bus); // ITE
+    step_one(&mut c, &mut bus); // MOVS R0, #1 (skipped)
+    step_one(&mut c, &mut bus); // MOVS R0, #2 (executed)
+
+    assert_eq!(c.reg(0), 2);
+    assert_eq!(c.it_state(), 0);
+}
+
+#[test]
+fn itt_eq_both_taken() {
+    // ITT EQ; MOVS R0, #1; MOVS R1, #2 — with Z=1: both execute
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    // ITT EQ: firstcond=0000, mask=0100 (two Then, no Else)
+    bus.write16(base, 0xBF04);       // ITT EQ
+    bus.write16(base + 2, 0x2001);   // MOVS R0, #1
+    bus.write16(base + 4, 0x2102);   // MOVS R1, #2
+    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.regs.set_flag_z(true);
+
+    step_one(&mut c, &mut bus); // ITT
+    step_one(&mut c, &mut bus); // MOVS R0, #1
+    step_one(&mut c, &mut bus); // MOVS R1, #2
+
+    assert_eq!(c.reg(0), 1);
+    assert_eq!(c.reg(1), 2);
+    assert_eq!(c.it_state(), 0);
+}
+
+#[test]
+fn it_state_cleared_after_block() {
+    // After IT block completes, the next instruction should execute unconditionally
+    let (mut c, mut bus) = core_and_bus();
+    let base = 0x2000_0000u32;
+    bus.write16(base, 0xBF08);       // IT EQ
+    bus.write16(base + 2, 0x202A);   // MOVS R0, #42 (in IT block)
+    bus.write16(base + 4, 0x2103);   // MOVS R1, #3 (outside IT block)
+    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    c.regs.set_pc(base);
+    c.regs.set_flag_z(false); // EQ false → IT body skipped
+
+    step_one(&mut c, &mut bus); // IT
+    step_one(&mut c, &mut bus); // MOVS R0, #42 — skipped
+    step_one(&mut c, &mut bus); // MOVS R1, #3 — unconditional, should execute
+
+    assert_eq!(c.reg(0), 0);  // skipped
+    assert_eq!(c.reg(1), 3);  // executed unconditionally
+    assert_eq!(c.it_state(), 0);
+}

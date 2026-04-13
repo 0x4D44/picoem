@@ -8,6 +8,25 @@ fn is_wide(hw0: u16) -> bool {
     hw0 >= 0xE800
 }
 
+/// Returns true if a Thumb-16 opcode is a flag-only instruction (CMP, CMN, TST).
+/// These always set flags, even inside IT blocks.
+fn is_thumb16_flag_only(opcode: u16) -> bool {
+    match opcode >> 11 {
+        0b00101 => true, // CMP Rn, #imm8
+        0b01000 => {
+            if opcode & (1 << 10) == 0 {
+                // Data processing: TST (0x8), CMP (0xA), CMN (0xB)
+                let dp_op = (opcode >> 6) & 0xF;
+                matches!(dp_op, 0x8 | 0xA | 0xB)
+            } else {
+                // Special data: CMP Rn, Rm (high register)
+                ((opcode >> 8) & 0x3) == 0b01
+            }
+        }
+        _ => false,
+    }
+}
+
 impl CortexM33 {
     /// Fetch, decode, and execute one instruction. Returns cycle count.
     pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
@@ -15,13 +34,46 @@ impl CortexM33 {
         self.current_instr_addr = pc;
         let hw0 = bus.read16(pc);
 
+        // IT block condition check
+        let in_it = self.it_state & 0xF != 0;
+        let cond = if in_it {
+            (self.it_state >> 4) & 0xF
+        } else {
+            0xE // AL (always)
+        };
+        let cond_passed = self.regs.condition_passed(cond);
+
         if is_wide(hw0) {
             let hw1 = bus.read16(pc.wrapping_add(2));
             self.regs.set_pc(pc.wrapping_add(4));
-            self.execute_thumb32(hw0, hw1, bus)
+            let cycles = if cond_passed {
+                self.execute_thumb32(hw0, hw1, bus)
+            } else {
+                1 // skipped instruction costs 1 cycle
+            };
+            if in_it { self.advance_it_state(); }
+            cycles
         } else {
             self.regs.set_pc(pc.wrapping_add(2));
-            self.execute_thumb16(hw0, bus)
+
+            // Flag suppression for Thumb-16 in IT blocks:
+            // Save flags before execution, restore after if needed.
+            let saved_flags = if in_it { self.regs.xpsr & 0xF800_0000 } else { 0 };
+
+            let cycles = if cond_passed {
+                self.execute_thumb16(hw0, bus)
+            } else {
+                1
+            };
+
+            // Suppress flag changes for Thumb-16 instructions inside IT blocks,
+            // EXCEPT for flag-only instructions (CMP, CMN, TST) which always set flags.
+            if in_it && cond_passed && !is_thumb16_flag_only(hw0) {
+                self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
+            }
+
+            if in_it { self.advance_it_state(); }
+            cycles
         }
     }
 

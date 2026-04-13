@@ -689,9 +689,16 @@ impl CortexM33 {
                 1
             }
             0b1111 => {
-                // Hints: NOP, YIELD, WFE, WFI, SEV
-                // All are NOPs for Phase 1
-                1
+                let mask = opcode & 0xF;
+                if mask != 0 {
+                    // IT instruction: firstcond = bits[7:4], mask = bits[3:0]
+                    self.it_state = (opcode & 0xFF) as u8;
+                    1
+                } else {
+                    // Hints: NOP, YIELD, WFE, WFI, SEV
+                    // All are NOPs for Phase 1
+                    1
+                }
             }
             // CBZ/CBNZ: bits[11:8] matches x0x1 pattern
             op if op & 0x5 == 0x1 => {

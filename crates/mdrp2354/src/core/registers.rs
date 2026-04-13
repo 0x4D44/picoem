@@ -189,6 +189,28 @@ impl Registers {
         self.ipsr() != 0
     }
 
+    // --- SP banking helpers ---
+
+    /// Returns true if the active SP is PSP (Thread mode + SPSEL=1).
+    /// Handler mode always uses MSP regardless of SPSEL.
+    pub fn active_sp_is_psp(&self) -> bool {
+        !self.in_handler_mode() && self.control & 2 != 0
+    }
+
+    /// Sync R13 to the appropriate banked SP before switching.
+    pub fn sync_sp_to_banked(&mut self) {
+        if self.active_sp_is_psp() {
+            self.psp = self.r[13];
+        } else {
+            self.msp = self.r[13];
+        }
+    }
+
+    /// Sync R13 from the appropriate banked SP after switching.
+    pub fn sync_sp_from_banked(&mut self) {
+        self.r[13] = if self.active_sp_is_psp() { self.psp } else { self.msp };
+    }
+
     /// Evaluate an ARM condition code against current flags.
     pub fn condition_passed(&self, cond: u8) -> bool {
         match cond & 0xF {

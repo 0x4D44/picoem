@@ -783,17 +783,111 @@ impl CortexM33 {
         // MSR: hw0[10:4] = 0b0111000 or 0b0111001
         let op_field = (hw0 >> 4) & 0x7F;
         if op_field == 0b0111000 || op_field == 0b0111001 {
-            // MSR -- stub for Stage 10
-            return 1;
+            return self.thumb32_msr(hw0, hw1);
         }
 
         // MRS: hw0[10:4] = 0b0111110 or 0b0111111
         if op_field == 0b0111110 || op_field == 0b0111111 {
-            // MRS -- stub for Stage 10
-            return 1;
+            return self.thumb32_mrs(hw1);
         }
 
         self.thumb32_undefined(hw0, hw1)
+    }
+
+    /// MSR — write a general-purpose register to a special system register.
+    /// Encoding: 11110_0111_00_R_Rn  10_00_mask_00_SYSm
+    fn thumb32_msr(&mut self, hw0: u16, hw1: u16) -> u32 {
+        let rn = (hw0 & 0xF) as usize;
+        let sysm = (hw1 & 0xFF) as u8;
+        let mask = ((hw1 >> 10) & 0x3) as u8;
+        let val = self.regs.r[rn];
+
+        match sysm {
+            // APSR — write NZCVQ flags (mask[1] controls NZCVQ group)
+            0 | 1 | 2 | 3 | 4 => {
+                if mask & 2 != 0 {
+                    self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | (val & 0xF800_0000);
+                }
+                // GE bits (mask[0]) not implemented for Phase 1
+            }
+            // IPSR (5), EPSR (6), IEPSR (7) — read-only, ignore writes
+            5 | 6 | 7 => {}
+            // MSP
+            8 => {
+                self.regs.msp = val;
+                if !self.regs.active_sp_is_psp() {
+                    self.regs.r[13] = val;
+                }
+            }
+            // PSP
+            9 => {
+                self.regs.psp = val;
+                if self.regs.active_sp_is_psp() {
+                    self.regs.r[13] = val;
+                }
+            }
+            // PRIMASK
+            16 => {
+                self.regs.primask = val & 1;
+            }
+            // BASEPRI
+            17 => {
+                self.regs.basepri = val & 0xFF;
+            }
+            // BASEPRI_MAX — only lowers (numerically) the priority ceiling
+            18 => {
+                if val & 0xFF != 0
+                    && ((val & 0xFF) < self.regs.basepri || self.regs.basepri == 0)
+                {
+                    self.regs.basepri = val & 0xFF;
+                }
+            }
+            // FAULTMASK
+            19 => {
+                self.regs.faultmask = val & 1;
+            }
+            // CONTROL — nPRIV, SPSEL, FPCA; must sync SP around the switch
+            20 => {
+                self.regs.sync_sp_to_banked();
+                self.regs.control = val & 0x7;
+                self.regs.sync_sp_from_banked();
+            }
+            _ => {} // reserved — ignore
+        }
+        2
+    }
+
+    /// MRS — read a special system register into a general-purpose register.
+    /// Encoding: 11110_0111_11_R_1111  10_00_Rd_SYSm
+    fn thumb32_mrs(&mut self, hw1: u16) -> u32 {
+        let rd = ((hw1 >> 8) & 0xF) as usize;
+        let sysm = (hw1 & 0xFF) as u8;
+
+        self.regs.r[rd] = match sysm {
+            // APSR / IAPSR / EAPSR / XPSR / combined variants — NZCVQ flags
+            0 | 1 | 2 | 3 | 4 => self.regs.xpsr & 0xF800_0000,
+            // IPSR — exception number
+            5 => self.regs.xpsr & 0x1FF,
+            // EPSR — execution state not readable
+            6 => 0,
+            // IEPSR — IPSR bits (IT/ICI masked)
+            7 => self.regs.xpsr & 0x0700_01FF,
+            // MSP
+            8 => self.regs.msp,
+            // PSP
+            9 => self.regs.psp,
+            // PRIMASK
+            16 => self.regs.primask & 1,
+            // BASEPRI
+            17 => self.regs.basepri & 0xFF,
+            // FAULTMASK
+            19 => self.regs.faultmask & 1,
+            // CONTROL
+            20 => self.regs.control & 0x7,
+            // Reserved
+            _ => 0,
+        };
+        2
     }
 
     // -- Multiply (32-bit result) --------------------------------------------
