@@ -149,6 +149,7 @@ impl Emulator {
         for pio in &mut self.bus.pio {
             pio.step(gpio_in);
         }
+        self.update_gpio();
 
         self.bus.sio.tick_mtime();
         self.clock.cycles
@@ -160,6 +161,17 @@ impl Emulator {
             self.step();
         }
         self.clock.cycles
+    }
+
+    /// Merge SIO and PIO GPIO outputs into bus.gpio_in.
+    /// PIO output-enable overrides SIO: if a PIO block drives a pin, its value wins.
+    pub(crate) fn update_gpio(&mut self) {
+        let mut out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        for pio in &self.bus.pio {
+            let pio_mask = pio.pad_oe;
+            out = (out & !pio_mask) | (pio.pad_out & pio_mask);
+        }
+        self.bus.gpio_in = out;
     }
 
     /// Read a GPIO pin from the merged pin state.

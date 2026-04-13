@@ -57,6 +57,53 @@ impl PioBlock {
                 self.sm[i].execute_cycle(&self.instr_mem, &mut self.irq_flags, gpio_in);
             }
         }
+        self.merge_pin_outputs();
+    }
+
+    /// Merge all SM pin outputs into pad_out/pad_oe. SM0 lowest priority, SM3 highest.
+    fn merge_pin_outputs(&mut self) {
+        let mut out: u32 = 0;
+        let mut oe: u32 = 0;
+        for sm in &self.sm {
+            if !sm.enabled {
+                continue;
+            }
+
+            // Pin values and directions from OUT/SET/MOV (shared latch)
+            let sm_oe = sm.pin_dirs;
+            out = (out & !sm_oe) | (sm.pin_values & sm_oe);
+            oe |= sm_oe;
+
+            // Side-set pins (separate base/count from PINCTRL)
+            let ss_count = ((sm.pinctrl >> 29) & 7) as u8;
+            let side_en = (sm.execctrl >> 30) & 1 != 0;
+            let actual_ss_pins = if side_en {
+                ss_count.saturating_sub(1)
+            } else {
+                ss_count
+            };
+            if actual_ss_pins > 0 {
+                let ss_base = ((sm.pinctrl >> 10) & 0x1F) as u32;
+                let ss_mask = if actual_ss_pins >= 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << actual_ss_pins) - 1
+                };
+                let positioned_mask = ss_mask.rotate_left(ss_base);
+
+                let side_pindir = (sm.execctrl >> 29) & 1 != 0;
+                if side_pindir {
+                    // Side-set controls pin directions
+                    oe = (oe & !positioned_mask) | (sm.sideset_dirs & positioned_mask);
+                } else {
+                    // Side-set controls pin values (normal mode)
+                    out = (out & !positioned_mask) | (sm.sideset_pins & positioned_mask);
+                    oe |= positioned_mask; // side-set pins are always output-enabled
+                }
+            }
+        }
+        self.pad_out = out;
+        self.pad_oe = oe;
     }
 
     /// Compute FSTAT register from current SM FIFO states.
@@ -1009,7 +1056,7 @@ mod tests {
         step_n(&mut pio, 1, 0); // PULL => osr = 0x0000_000F
         step_n(&mut pio, 1, 0); // OUT PINS, 4 => shifts 4 LSBs out
         // With shift-right, bottom 4 bits of OSR = 0xF
-        assert_eq!(pio.sm[0].out_pins & 0xF, 0xF, "bottom 4 pins set to 1");
+        assert_eq!(pio.sm[0].pin_values & 0xF, 0xF, "bottom 4 pins set to 1");
     }
 
     #[test]
@@ -1148,5 +1195,254 @@ mod tests {
         // Side-set=1 at sideset_base=3: pin 3 should be set
         assert_eq!(pio.sm[0].sideset_pins & (1 << 3), 1 << 3,
             "side-set applied even on stalling instruction");
+    }
+
+    // ---- Stage C: Autopush tests ----
+
+    #[test]
+    fn test_autopush_threshold_32() {
+        // Enable autopush (bit 16), threshold=0 (meaning 32).
+        // IN X, 8 four times => 32 bits shifted in => autopush fires.
+        // SET X, 15: 0xE02F
+        // IN X, 8: opcode=010, src=001(X), bit_count=01000 => 0x4028
+        let mut pio = make_pio_with_program(&[0xE02F, 0x4028, 0x4028, 0x4028, 0x4028]);
+        // Enable autopush (bit 16), thresholds stay at 0 (=32)
+        pio.sm[0].shiftctrl |= 1 << 16;
+        // Set IN_SHIFTDIR=0 (left) for simple accumulation
+        pio.sm[0].shiftctrl &= !(1 << 18);
+
+        step_n(&mut pio, 1, 0); // SET X, 15
+        assert_eq!(pio.sm[0].x, 15);
+
+        // Four IN X,8 => 32 bits total
+        step_n(&mut pio, 1, 0); // IN X, 8 (8 bits) — no autopush yet
+        assert_eq!(pio.sm[0].isr_count, 8);
+        assert!(pio.sm[0].rx_fifo.is_empty(), "no push at 8 bits");
+
+        step_n(&mut pio, 1, 0); // IN X, 8 (16 bits)
+        assert_eq!(pio.sm[0].isr_count, 16);
+        assert!(pio.sm[0].rx_fifo.is_empty(), "no push at 16 bits");
+
+        step_n(&mut pio, 1, 0); // IN X, 8 (24 bits)
+        assert_eq!(pio.sm[0].isr_count, 24);
+        assert!(pio.sm[0].rx_fifo.is_empty(), "no push at 24 bits");
+
+        step_n(&mut pio, 1, 0); // IN X, 8 (32 bits) — autopush fires!
+        assert_eq!(pio.sm[0].isr_count, 0, "ISR count cleared by autopush");
+        assert_eq!(pio.sm[0].isr, 0, "ISR cleared by autopush");
+        assert!(!pio.sm[0].rx_fifo.is_empty(), "value pushed to RX FIFO");
+        let val = pio.sm[0].rx_fifo.pop().unwrap();
+        // ISR was shifted left: (((15 << 8 | 15) << 8 | 15) << 8 | 15) = 0x0F0F0F0F
+        assert_eq!(val, 0x0F0F_0F0F);
+    }
+
+    #[test]
+    fn test_autopush_threshold_16() {
+        // Set push_threshold=16 (bits[24:20]=10000=16).
+        // IN X, 8 twice => autopush at 16 bits.
+        let mut pio = make_pio_with_program(&[0xE02F, 0x4028, 0x4028]);
+        // Enable autopush (bit 16), set push threshold to 16 (bits [24:20])
+        let shiftctrl = pio.sm[0].shiftctrl | (1 << 16); // autopush on
+        let shiftctrl = (shiftctrl & !(0x1F << 20)) | (16u32 << 20); // push_threshold=16
+        pio.sm[0].shiftctrl = shiftctrl;
+        // Set IN_SHIFTDIR=0 (left)
+        pio.sm[0].shiftctrl &= !(1 << 18);
+
+        step_n(&mut pio, 1, 0); // SET X, 15
+        step_n(&mut pio, 1, 0); // IN X, 8 (8 bits)
+        assert_eq!(pio.sm[0].isr_count, 8);
+        assert!(pio.sm[0].rx_fifo.is_empty(), "no push at 8 bits");
+
+        step_n(&mut pio, 1, 0); // IN X, 8 (16 bits) — autopush fires!
+        assert_eq!(pio.sm[0].isr_count, 0, "ISR cleared after autopush at 16");
+        assert!(!pio.sm[0].rx_fifo.is_empty());
+        let val = pio.sm[0].rx_fifo.pop().unwrap();
+        // Left-shift: (15 << 8) | 15 = 0x0F0F
+        assert_eq!(val, 0x0F0F);
+    }
+
+    #[test]
+    fn test_autopush_default_shiftctrl() {
+        // Default SHIFTCTRL = 0x000C_0000: autopush disabled.
+        // Even after 32 bits shifted in, no auto-push.
+        let mut pio = make_pio_with_program(&[0xE02F, 0x4028, 0x4028, 0x4028, 0x4028]);
+        // Verify autopush is disabled by default
+        assert_eq!(pio.sm[0].shiftctrl & (1 << 16), 0, "autopush disabled by default");
+        // Set IN_SHIFTDIR=0 (left)
+        pio.sm[0].shiftctrl &= !(1 << 18);
+
+        step_n(&mut pio, 1, 0); // SET X, 15
+        for _ in 0..4 {
+            step_n(&mut pio, 1, 0); // IN X, 8
+        }
+        // isr_count saturates at 32
+        assert_eq!(pio.sm[0].isr_count, 32);
+        assert!(pio.sm[0].rx_fifo.is_empty(), "no autopush with default shiftctrl");
+    }
+
+    // ---- Stage C: Autopull tests ----
+
+    #[test]
+    fn test_autopull_basic() {
+        // Enable autopull, threshold=32 (default). Push 0xABCD to TX FIFO.
+        // Set osr_count=32 (exhausted). Execute OUT PINS,8.
+        // Verify OSR was refilled from FIFO before the OUT shifted.
+        // OUT PINS, 8: opcode=011, dest=000(PINS), bit_count=01000 => 0x6008
+        let mut pio = make_pio_with_program(&[0x6008]);
+        // Enable autopull (bit 17)
+        pio.sm[0].shiftctrl |= 1 << 17;
+        // Set out_count=8, out_base=0 in pinctrl
+        pio.sm[0].pinctrl = 8u32 << 20; // out_count=8, out_base=0
+        // Exhaust OSR
+        pio.sm[0].osr_count = 32;
+        // Push value to TX FIFO
+        pio.sm[0].tx_fifo.push(0x0000_ABCD);
+
+        step_n(&mut pio, 1, 0); // OUT PINS, 8 — autopull fires first, refills OSR
+        assert!(!pio.sm[0].stalled, "should not stall — FIFO had data");
+        // Autopull loaded 0x0000_ABCD into OSR, then OUT shifted 8 bits out.
+        // Default shiftctrl bit 19 = 1 (shift right), so bottom 8 bits = 0xCD shifted out.
+        assert_eq!(pio.sm[0].osr_count, 8, "8 bits shifted out after autopull refill");
+        // The remaining OSR should be 0x0000_ABCD >> 8 = 0x0000_00AB
+        assert_eq!(pio.sm[0].osr, 0x0000_00AB);
+        // out_pins bottom 8 bits should be 0xCD
+        assert_eq!(pio.sm[0].pin_values & 0xFF, 0xCD);
+    }
+
+    #[test]
+    fn test_autopull_stall_on_empty() {
+        // Enable autopull, osr_count=32, TX FIFO empty.
+        // Execute OUT — SM should stall.
+        // Push value, step again — SM should unstall and OUT completes.
+        // OUT NULL, 8: opcode=011, dest=011(NULL), bit_count=01000 => 0x6068
+        let mut pio = make_pio_with_program(&[0x6068, 0xE025]);
+        // Enable autopull (bit 17)
+        pio.sm[0].shiftctrl |= 1 << 17;
+        // Exhaust OSR
+        pio.sm[0].osr_count = 32;
+
+        step_n(&mut pio, 1, 0); // OUT NULL, 8 — autopull fires, FIFO empty => stall
+        assert!(pio.sm[0].stalled, "SM stalls when autopull finds empty FIFO");
+        assert_eq!(pio.sm[0].pc, 0, "PC should not advance while stalled");
+
+        step_n(&mut pio, 1, 0); // Still stalled
+        assert!(pio.sm[0].stalled);
+
+        // Push value to TX FIFO
+        pio.sm[0].tx_fifo.push(0x1234_5678);
+        step_n(&mut pio, 1, 0); // Re-evaluate: FIFO not empty => unstall, re-execute OUT
+        assert!(!pio.sm[0].stalled, "SM unstalls when TX FIFO gets data");
+        // The instruction at pc=0 (OUT NULL, 8) should have completed.
+        // Autopull loaded 0x1234_5678, then OUT NULL shifted 8 bits (discarded).
+        assert_eq!(pio.sm[0].osr_count, 8);
+        assert_eq!(pio.sm[0].pc, 1, "PC advanced after unstall");
+
+        step_n(&mut pio, 1, 0); // SET X, 5
+        assert_eq!(pio.sm[0].x, 5);
+    }
+
+    // ---- Stage C: GPIO integration tests ----
+
+    #[test]
+    fn test_gpio_merge_pio_overrides_sio() {
+        // SIO drives pin 5 = 1. PIO0 drives pin 5 = 0 (with OE).
+        // Verify bus.gpio_in bit 5 = 0 (PIO wins).
+        let mut emu = crate::Emulator::new(crate::Config::default());
+        // SIO: set pin 5 high with OE
+        emu.bus.sio.gpio_out = 1 << 5;
+        emu.bus.sio.gpio_oe = 1 << 5;
+        // PIO0 pad_out: pin 5 = 0, pad_oe: pin 5 driven
+        emu.bus.pio[0].pad_oe = 1 << 5;
+        emu.bus.pio[0].pad_out = 0; // pin 5 = 0
+
+        emu.update_gpio();
+        assert_eq!(emu.bus.gpio_in & (1 << 5), 0, "PIO overrides SIO on pin 5");
+    }
+
+    #[test]
+    fn test_gpio_merge_independent_pins() {
+        // PIO drives pin 5, SIO drives pin 10. Both should appear in gpio_in.
+        let mut emu = crate::Emulator::new(crate::Config::default());
+        // SIO drives pin 10
+        emu.bus.sio.gpio_out = 1 << 10;
+        emu.bus.sio.gpio_oe = 1 << 10;
+        // PIO0 drives pin 5
+        emu.bus.pio[0].pad_oe = 1 << 5;
+        emu.bus.pio[0].pad_out = 1 << 5;
+
+        emu.update_gpio();
+        assert_ne!(emu.bus.gpio_in & (1 << 5), 0, "PIO pin 5 appears");
+        assert_ne!(emu.bus.gpio_in & (1 << 10), 0, "SIO pin 10 appears");
+    }
+
+    #[test]
+    fn test_pin_mapping_out() {
+        // Configure out_base=5, execute OUT PINS,4 with known value.
+        // Verify out_pins has correct bits at positions [8:5].
+        // PULL block: 0x80A0
+        // OUT PINS, 4: 0x6004
+        let mut pio = make_pio_with_program(&[0x80A0, 0x6004]);
+        // out_base=5, out_count=4
+        pio.sm[0].pinctrl = (4u32 << 20) | 5u32; // out_count=4, out_base=5
+        pio.sm[0].tx_fifo.push(0x0000_000F); // bottom 4 bits = 1111
+
+        step_n(&mut pio, 1, 0); // PULL
+        step_n(&mut pio, 1, 0); // OUT PINS, 4
+        // Default shiftctrl: shift right, so bottom 4 bits (0xF) are shifted out.
+        // out_base=5 means bits should appear at positions 5,6,7,8.
+        let expected_mask = 0xF << 5;
+        assert_eq!(pio.sm[0].pin_values & expected_mask, expected_mask,
+            "OUT PINS with out_base=5 should set pins [8:5]");
+        // Other pins should be 0
+        assert_eq!(pio.sm[0].pin_values & !expected_mask, 0,
+            "only pins [8:5] should be set");
+    }
+
+    #[test]
+    fn test_pin_mapping_wrap() {
+        // Configure out_base=30, execute OUT PINS,4. Verify wrap: bits at [31:30] and [1:0].
+        // PULL block: 0x80A0
+        // OUT PINS, 4: 0x6004
+        let mut pio = make_pio_with_program(&[0x80A0, 0x6004]);
+        // out_base=30, out_count=4
+        pio.sm[0].pinctrl = (4u32 << 20) | 30u32; // out_count=4, out_base=30
+        pio.sm[0].tx_fifo.push(0x0000_000F); // bottom 4 bits = 1111
+
+        step_n(&mut pio, 1, 0); // PULL
+        step_n(&mut pio, 1, 0); // OUT PINS, 4
+        // Pins should wrap: bits 30,31,0,1 all set
+        let expected = (3u32 << 30) | 3u32; // bits 30,31 and bits 0,1
+        assert_eq!(pio.sm[0].pin_values, expected,
+            "OUT PINS with out_base=30 should wrap to bits [31:30] and [1:0]");
+    }
+
+    #[test]
+    fn test_sideset_persists_during_delay() {
+        // Side-set with delay=3: verify sideset_pins stays set across all delay cycles.
+        // Use sideset_count=1, no SIDE_EN, sideset_base=7.
+        // SET X, 1 with sideset=1, delay=3:
+        // sideset_count=1 => delay_bits=4
+        // delay/ss = [1_0011] = 0b10011 = 19 (ss=1, delay=3)
+        // SET X, 1: opcode=111, dest=001, data=00001
+        // insn = 0b111_10011_001_00001 = 0xF321
+        let pinctrl = (1u32 << 29) | (7u32 << 10); // sideset_count=1, sideset_base=7
+        let mut pio = make_pio_with_program(&[0xF321, 0xE022]);
+        pio.sm[0].pinctrl = pinctrl;
+
+        step_n(&mut pio, 1, 0); // Execute SET X, 1 [side 1] [delay 3]
+        assert_eq!(pio.sm[0].x, 1);
+        assert_eq!(pio.sm[0].sideset_pins & (1 << 7), 1 << 7,
+            "sideset pin 7 set on execution");
+
+        // Check through all 3 delay cycles
+        for cycle in 0..3 {
+            assert_eq!(pio.sm[0].sideset_pins & (1 << 7), 1 << 7,
+                "sideset pin 7 persists during delay cycle {}", cycle);
+            step_n(&mut pio, 1, 0);
+        }
+        // After delay completes, sideset_pins should still hold its value
+        // (it's only overwritten by the next instruction's sideset)
+        assert_eq!(pio.sm[0].sideset_pins & (1 << 7), 1 << 7,
+            "sideset pin 7 still set after delay completes");
     }
 }

@@ -38,12 +38,10 @@ pub struct StateMachine {
     pub(crate) rx_fifo: PioFifo,
 
     // Pin output (per-SM, merged into PioBlock.pad_out/pad_oe)
-    pub(crate) out_pins: u32,
-    pub(crate) out_pindirs: u32,
-    pub(crate) set_pins: u32,
-    pub(crate) set_pindirs: u32,
-    pub(crate) sideset_pins: u32,
-    pub(crate) sideset_pindirs: u32,
+    pub(crate) pin_values: u32,     // Shared output latch: OUT PINS, SET PINS, MOV PINS
+    pub(crate) pin_dirs: u32,       // Shared direction latch: OUT PINDIRS, SET PINDIRS
+    pub(crate) sideset_pins: u32,   // Side-set pin values (separate base/count)
+    pub(crate) sideset_dirs: u32,   // Side-set pin directions (SIDE_PINDIR mode)
 }
 
 /// Tracks what kind of stall we're in, so re-evaluation knows what to check.
@@ -82,12 +80,10 @@ impl StateMachine {
             pinctrl: 0x1400_0000,
             tx_fifo: PioFifo::new(4),
             rx_fifo: PioFifo::new(4),
-            out_pins: 0,
-            out_pindirs: 0,
-            set_pins: 0,
-            set_pindirs: 0,
+            pin_values: 0,
+            pin_dirs: 0,
             sideset_pins: 0,
-            sideset_pindirs: 0,
+            sideset_dirs: 0,
         }
     }
 
@@ -261,9 +257,9 @@ impl StateMachine {
             let sideset_base = ((self.pinctrl >> 10) & 0x1F) as u8;
             let side_pindir = (self.execctrl >> 29) & 1 != 0;
             if side_pindir {
-                let mut pd = self.sideset_pindirs;
+                let mut pd = self.sideset_dirs;
                 Self::write_pin_field(&mut pd, ss_val as u32, sideset_base, actual_pins);
-                self.sideset_pindirs = pd;
+                self.sideset_dirs = pd;
             } else {
                 let mut sp = self.sideset_pins;
                 Self::write_pin_field(&mut sp, ss_val as u32, sideset_base, actual_pins);
@@ -299,8 +295,17 @@ impl StateMachine {
         if t == 0 { 32 } else { t }
     }
 
-    /// Get the push threshold from SHIFTCTRL. 0 means 32. (Used by autopush in Stage C.)
-    #[allow(dead_code)]
+    /// Check if autopull is enabled (SHIFTCTRL bit 17).
+    fn is_autopull_enabled(&self) -> bool {
+        (self.shiftctrl >> 17) & 1 != 0
+    }
+
+    /// Check if autopush is enabled (SHIFTCTRL bit 16).
+    fn is_autopush_enabled(&self) -> bool {
+        (self.shiftctrl >> 16) & 1 != 0
+    }
+
+    /// Get the push threshold from SHIFTCTRL. 0 means 32.
     fn push_threshold(&self) -> u8 {
         let t = ((self.shiftctrl >> 20) & 0x1F) as u8;
         if t == 0 { 32 } else { t }
@@ -467,10 +472,39 @@ impl StateMachine {
         }
 
         self.isr_count = (self.isr_count + bit_count).min(32);
+
+        // Autopush: push ISR to RX FIFO when threshold reached
+        if self.is_autopush_enabled() {
+            let threshold = self.push_threshold();
+            if self.isr_count >= threshold {
+                if !self.rx_fifo.is_full() {
+                    self.rx_fifo.push(self.isr);
+                    self.isr = 0;
+                    self.isr_count = 0;
+                }
+                // If RX FIFO is full, ISR retains its value (no stall for autopush)
+            }
+        }
     }
 
     /// OUT instruction. Returns true if destination is PC (PC was set).
     fn exec_out(&mut self, destination: u8, bit_count: u8) -> bool {
+        // Autopull: refill OSR from TX FIFO before OUT reads it
+        if self.is_autopull_enabled() {
+            let threshold = self.pull_threshold();
+            if self.osr_count >= threshold {
+                if let Some(val) = self.tx_fifo.pop() {
+                    self.osr = val;
+                    self.osr_count = 0;
+                } else {
+                    // TX FIFO empty — stall (same as blocking PULL)
+                    self.stalled = true;
+                    self.stall_kind = StallKind::Pull;
+                    return false;
+                }
+            }
+        }
+
         let out_shiftdir_right = (self.shiftctrl >> 19) & 1 != 0;
         let bc = bit_count as u32;
 
@@ -493,25 +527,25 @@ impl StateMachine {
         let pc_set = destination == 5;
         match destination {
             0 => {
-                // PINS (out_base-relative)
+                // PINS (out_base-relative) — writes shared output latch
                 let out_base = (self.pinctrl & 0x1F) as u8;
                 let out_count = ((self.pinctrl >> 20) & 0x3F) as u8;
                 let count = out_count.min(bit_count);
-                let mut op = self.out_pins;
-                Self::write_pin_field(&mut op, data, out_base, count);
-                self.out_pins = op;
+                let mut pv = self.pin_values;
+                Self::write_pin_field(&mut pv, data, out_base, count);
+                self.pin_values = pv;
             }
             1 => self.x = data,           // X
             2 => self.y = data,           // Y
             3 => {}                        // NULL (discard)
             4 => {
-                // PINDIRS
+                // PINDIRS — writes shared direction latch
                 let out_base = (self.pinctrl & 0x1F) as u8;
                 let out_count = ((self.pinctrl >> 20) & 0x3F) as u8;
                 let count = out_count.min(bit_count);
-                let mut pd = self.out_pindirs;
+                let mut pd = self.pin_dirs;
                 Self::write_pin_field(&mut pd, data, out_base, count);
-                self.out_pindirs = pd;
+                self.pin_dirs = pd;
             }
             5 => {
                 // PC — set directly
@@ -609,12 +643,12 @@ impl StateMachine {
         let pc_set = destination == 5;
         match destination {
             0 => {
-                // PINS (out_base-relative)
+                // PINS (out_base-relative) — writes shared output latch
                 let out_base = (self.pinctrl & 0x1F) as u8;
                 let out_count = ((self.pinctrl >> 20) & 0x3F) as u8;
-                let mut op = self.out_pins;
-                Self::write_pin_field(&mut op, val, out_base, out_count);
-                self.out_pins = op;
+                let mut pv = self.pin_values;
+                Self::write_pin_field(&mut pv, val, out_base, out_count);
+                self.pin_values = pv;
             }
             1 => self.x = val,
             2 => self.y = val,
@@ -653,22 +687,22 @@ impl StateMachine {
     fn exec_set(&mut self, destination: u8, data: u8) {
         match destination {
             0 => {
-                // PINS (set_base-relative, up to SET_COUNT)
+                // PINS (set_base-relative, up to SET_COUNT) — writes shared output latch
                 let set_base = ((self.pinctrl >> 5) & 0x1F) as u8;
                 let set_count = ((self.pinctrl >> 26) & 0x7) as u8;
-                let mut sp = self.set_pins;
-                Self::write_pin_field(&mut sp, data as u32, set_base, set_count);
-                self.set_pins = sp;
+                let mut pv = self.pin_values;
+                Self::write_pin_field(&mut pv, data as u32, set_base, set_count);
+                self.pin_values = pv;
             }
             1 => self.x = data as u32,           // X (zero-extend)
             2 => self.y = data as u32,           // Y (zero-extend)
             4 => {
-                // PINDIRS (set_base-relative, up to SET_COUNT)
+                // PINDIRS (set_base-relative, up to SET_COUNT) — writes shared direction latch
                 let set_base = ((self.pinctrl >> 5) & 0x1F) as u8;
                 let set_count = ((self.pinctrl >> 26) & 0x7) as u8;
-                let mut pd = self.set_pindirs;
+                let mut pd = self.pin_dirs;
                 Self::write_pin_field(&mut pd, data as u32, set_base, set_count);
-                self.set_pindirs = pd;
+                self.pin_dirs = pd;
             }
             _ => {}
         }
