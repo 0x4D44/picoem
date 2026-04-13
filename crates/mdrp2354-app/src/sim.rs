@@ -43,8 +43,8 @@ pub fn run(
         emu.run(qc);
         pacer.end_quantum();
 
-        let gpio_out = emu.bus.gpio_out;
-        let gpio_oe = emu.bus.gpio_oe;
+        let gpio_out = emu.bus.sio.gpio_out;
+        let gpio_oe = emu.bus.sio.gpio_oe;
         lcd.sample(gpio_out);
 
         let elapsed = start.elapsed();

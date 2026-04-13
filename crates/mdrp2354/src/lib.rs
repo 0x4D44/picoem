@@ -60,11 +60,11 @@ impl Default for Config {
 }
 
 /// Top-level RP2354 emulator. Owns dual Cortex-M33 cores, bus fabric,
-/// memory, SIO, and clock. Peripherals and PIO are injected via builder.
+/// memory, and clock. SIO is owned by Bus. Peripherals and PIO are
+/// injected via builder.
 pub struct Emulator {
     pub cores: [CortexM33; 2],
     pub bus: Bus,
-    pub sio: Sio,
     pub clock: Clock,
 }
 
@@ -75,26 +75,28 @@ impl Emulator {
     }
 
     /// Reset the emulator: load SP from ROM word 0, PC from ROM word 1.
-    /// Core 0 starts executing; Core 1 is held.
+    /// Both cores boot from the reset vector.
     pub fn reset(&mut self) {
         let initial_sp = self.bus.memory.rom_read32(0);
         let reset_vector = self.bus.memory.rom_read32(4);
 
-        // Core 0: execute from reset vector
-        self.cores[0] = CortexM33::with_id(0);
-        self.cores[0].regs.msp = initial_sp;
-        self.cores[0].regs.r[13] = initial_sp;
-        self.cores[0].regs.set_pc(reset_vector & !1);
-        self.cores[0].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
-
-        // Core 1: halted
-        self.cores[1] = CortexM33::with_id(1);
-        self.cores[1].halt();
+        // Boot both cores from reset vector
+        for i in 0..2 {
+            self.cores[i] = CortexM33::with_id(i as u8);
+            self.cores[i].regs.msp = initial_sp;
+            self.cores[i].regs.r[13] = initial_sp;
+            self.cores[i].regs.set_pc(reset_vector & !1);
+            self.cores[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
+        }
 
         // Clear bus state
         self.bus.clear_bus_fault();
         self.bus.ppb = [Default::default(), Default::default()];
         self.bus.resets_state = 0x1FFF_FFFF;
+        self.bus.event_flag = [false; 2];
+        self.bus.rcp_salt = [0; 2];
+        self.bus.rcp_salt_valid = [false; 2];
+        self.bus.sio.reset();
 
         // Reset clock
         self.clock = Clock {
@@ -207,7 +209,6 @@ impl EmulatorBuilder {
         Emulator {
             cores: [CortexM33::with_id(0), CortexM33::with_id(1)],
             bus: Bus::new(),
-            sio: Sio::new(),
             clock,
         }
     }

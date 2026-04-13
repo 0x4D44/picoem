@@ -4731,8 +4731,8 @@ fn test_reset_loads_sp_and_pc_from_rom() {
     assert_eq!(emu.cores[0].regs.pc(), 0x0000_0100); // bit 0 cleared
     assert_eq!(emu.cores[0].regs.xpsr & (1 << 24), 1 << 24); // Thumb bit
 
-    // Core 1 should be halted
-    assert!(emu.cores[1].is_halted());
+    // Core 1 should be at reset vector (same as Core 0 — both boot)
+    assert_eq!(emu.cores[1].regs.pc(), 0x0000_0100);
 
     // Run a few cycles - should execute the NOP then hit the infinite loop
     for _ in 0..10 {
@@ -5300,10 +5300,12 @@ fn test_flash_boot_blinky() {
     let mut stuck_count = 0u32;
     let mut gpio_out_ever = 0u32;
     let mut entered_flash = false;
+    let mut core1_max_ipsr = 0u32;
 
     for cycle in 0..10_000_000u64 {
         emu.step();
-        gpio_out_ever |= emu.bus.gpio_out;
+        gpio_out_ever |= emu.bus.sio.gpio_out;
+        core1_max_ipsr = core1_max_ipsr.max(emu.cores[1].regs.ipsr());
         let pc = emu.cores[0].regs.pc();
 
         // Detect when execution enters flash
@@ -5317,7 +5319,7 @@ fn test_flash_boot_blinky() {
             stuck_count += 1;
             if stuck_count > 1000 {
                 eprintln!("Stuck at PC={:#010x} after {} cycles, GPIO_OUT={:#010x}",
-                    pc, cycle, emu.bus.gpio_out);
+                    pc, cycle, emu.bus.sio.gpio_out);
                 eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
                     emu.cores[0].regs.ipsr(),
                     emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
@@ -5329,8 +5331,8 @@ fn test_flash_boot_blinky() {
         last_pc = pc;
     }
 
-    let _gpio_out = emu.bus.gpio_out;
-    let gpio_oe = emu.bus.gpio_oe;
+    let _gpio_out = emu.bus.sio.gpio_out;
+    let gpio_oe = emu.bus.sio.gpio_oe;
     let pc = emu.cores[0].regs.pc();
 
     // Must have entered flash (bootrom found and jumped to blinky)
@@ -5348,4 +5350,7 @@ fn test_flash_boot_blinky() {
     // OE must be set (the blinky always enables output)
     assert!(gpio_oe & (1 << 25) != 0,
         "GPIO OE 25 should be set (gpio_oe={:#010x})", gpio_oe);
+
+    // Phase 4 Core 1 health gate: Core 1 should never enter handler mode
+    assert_eq!(core1_max_ipsr, 0, "Core 1 should never enter handler mode");
 }

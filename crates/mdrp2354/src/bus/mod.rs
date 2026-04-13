@@ -4,6 +4,7 @@ pub mod ppb;
 use std::collections::HashMap;
 
 use crate::memory::{Memory, SRAM_SIZE};
+use crate::sio::Sio;
 
 /// Bus fabric — address decode and cycle accounting.
 ///
@@ -52,12 +53,6 @@ pub struct Bus {
     clk_ref_ctrl: u32,
     /// CLK_SYS_CTRL register (CLOCKS offset 0x060).
     clk_sys_ctrl: u32,
-    /// SIO GPIO output register (offset 0x010).
-    pub gpio_out: u32,
-    /// SIO GPIO output enable register (offset 0x024).
-    pub gpio_oe: u32,
-    /// SIO GPIO input register (offset 0x004, always 0 — no external pin model).
-    pub gpio_in: u32,
     /// SIO GPIO_HI_IN (offset 0x008). Upper QSPI GPIO pins.
     /// When flash is loaded, returns pseudo-random noise to simulate
     /// QSPI pin activity (the bootrom samples this to detect flash).
@@ -65,6 +60,14 @@ pub struct Bus {
     /// XIP cache window offset: maps XIP SRAM reads (0x1C00_0000)
     /// to flash content at this byte offset. Set by QMI M0_RFMT writes.
     xip_cache_offset: u32,
+    /// Single-cycle IO block (GPIO, CPUID, spinlocks, FIFO, divider, etc.).
+    pub sio: Sio,
+    /// Per-core event flag for WFE/SEV protocol.
+    pub event_flag: [bool; 2],
+    /// Per-core RCP salt value (shared state for cross-core writes).
+    pub rcp_salt: [u32; 2],
+    /// Per-core RCP salt validity flag.
+    pub rcp_salt_valid: [bool; 2],
 }
 
 impl Bus {
@@ -87,11 +90,12 @@ impl Bus {
             qmi_regs: [0u32; 28],
             clk_ref_ctrl: 0,
             clk_sys_ctrl: 0,
-            gpio_out: 0,
-            gpio_oe: 0,
-            gpio_in: 0,
             gpio_hi_noise_state: 0xA5A5_A5A5,
             xip_cache_offset: 0,
+            sio: Sio::new(),
+            event_flag: [false; 2],
+            rcp_salt: [0; 2],
+            rcp_salt_valid: [false; 2],
         }
     }
 
@@ -262,6 +266,12 @@ impl Bus {
         self.flash_loaded = loaded;
     }
 
+    /// Signal an SEV event to both cores.
+    pub fn signal_sev(&mut self) {
+        self.event_flag[0] = true;
+        self.event_flag[1] = true;
+    }
+
     /// Read GPIO_HI_IN (SIO offset 0x008). Returns QSPI pin state.
     /// When flash is loaded, returns noise with bit 29 frequently set.
     /// The bootrom's flash-detect loop reads this 21 times, extracting
@@ -414,13 +424,14 @@ impl Bus {
                 word.to_le_bytes()[byte_idx]
             }
             0xD => {
-                let sio_offset = addr & 0x0FFF_FFFF;
-                match sio_offset {
-                    0x004 => self.gpio_in.to_le_bytes()[(addr & 3) as usize],
-                    0x010 => self.gpio_out.to_le_bytes()[(addr & 3) as usize],
-                    0x030 => self.gpio_oe.to_le_bytes()[(addr & 3) as usize],
-                    _ => 0,
-                }
+                let reg_offset = addr & 0xFFF;
+                let word = if reg_offset & !3 == 0x008 {
+                    self.read_gpio_hi_in()
+                } else {
+                    let core = self.active_core();
+                    self.sio.read32(reg_offset & !3, core)
+                };
+                word.to_le_bytes()[(addr & 3) as usize]
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read8(addr),
             0xE => 0, // PPB (stub)
@@ -571,13 +582,12 @@ impl Bus {
                 halves[half_idx]
             }
             0xD => {
-                let sio_offset = addr & 0x0FFF_FFFF;
-                let word = match sio_offset & !3 {
-                    0x000 => self.active_core() as u32,
-                    0x004 => self.gpio_in,
-                    0x010 => self.gpio_out,
-                    0x030 => self.gpio_oe,
-                    _ => 0,
+                let reg_offset = addr & 0xFFF;
+                let word = if reg_offset & !3 == 0x008 {
+                    self.read_gpio_hi_in()
+                } else {
+                    let core = self.active_core();
+                    self.sio.read32(reg_offset & !3, core)
                 };
                 let half_idx = ((addr >> 1) & 1) as usize;
                 [word as u16, (word >> 16) as u16][half_idx]
@@ -737,14 +747,12 @@ impl Bus {
                 }
             }
             0xD => {
-                let sio_offset = addr & 0x0FFF_FFFF;
-                match sio_offset {
-                    0x000 => self.active_core() as u32, // CPUID
-                    0x004 => self.gpio_in,              // GPIO_IN
-                    0x008 => self.read_gpio_hi_in(),    // GPIO_HI_IN (QSPI pins)
-                    0x010 => self.gpio_out,             // GPIO_OUT
-                    0x030 => self.gpio_oe,              // GPIO_OE
-                    _ => 0,
+                let reg_offset = addr & 0xFFF;
+                if reg_offset == 0x008 {
+                    self.read_gpio_hi_in()
+                } else {
+                    let core = self.active_core();
+                    self.sio.read32(reg_offset, core)
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
@@ -819,20 +827,9 @@ impl Bus {
                 }
             }
             0xD => {
-                let sio_offset = addr & 0x0FFF_FFFF;
-                match sio_offset {
-                    // GPIO_OUT: RP2350 offsets (8-byte spacing)
-                    0x010 => self.gpio_out = val,
-                    0x018 => self.gpio_out |= val,    // GPIO_OUT_SET
-                    0x020 => self.gpio_out &= !val,   // GPIO_OUT_CLR
-                    0x028 => self.gpio_out ^= val,    // GPIO_OUT_XOR
-                    // GPIO_OE: RP2350 offsets (8-byte spacing)
-                    0x030 => self.gpio_oe = val,
-                    0x038 => self.gpio_oe |= val,     // GPIO_OE_SET
-                    0x040 => self.gpio_oe &= !val,    // GPIO_OE_CLR
-                    0x048 => self.gpio_oe ^= val,     // GPIO_OE_XOR
-                    _ => {}
-                }
+                let reg_offset = addr & 0xFFF;
+                let core = self.active_core();
+                self.sio.write32(reg_offset, val, core);
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),
             0xE => {
