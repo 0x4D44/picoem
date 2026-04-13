@@ -6,6 +6,7 @@
 
 # Tracked demo firmware and bootrom — whitelisted so integration tests
 # work out of a fresh clone without extra downloads.
+!benchmark.bin
 !blinky.bin
 !bootrom-combined.bin
 !lcd_demo.bin
