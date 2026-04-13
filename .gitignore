@@ -7,4 +7,6 @@ venv/
 env/
 *.tmp
 *.log
-roms/
+# roms/: tracked binaries (blinky.bin, bootrom-combined.bin, lcd_demo.bin)
+# are whitelisted by roms/.gitignore. Other build artefacts under roms/
+# are still ignored by that file's rules.

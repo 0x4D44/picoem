@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders};
 use ratatui::{Frame, Terminal};
 
 use crate::panels::gpio::draw_gpio;
+use crate::panels::lcd::draw_lcd;
 use crate::panels::status::draw_status;
 use crate::snapshot::Snapshot;
 
@@ -63,6 +64,7 @@ fn draw_dashboard(f: &mut Frame, snap: &Snapshot) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -75,8 +77,9 @@ fn draw_dashboard(f: &mut Frame, snap: &Snapshot) {
 
     draw_status(top[0], f, snap);
     draw_gpio(top[1], f, snap);
+    draw_lcd(rows[1], f, snap);
 
-    draw_help(rows[2], f);
+    draw_help(rows[3], f);
 }
 
 fn draw_help(area: Rect, f: &mut Frame) {
