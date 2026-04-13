@@ -4,6 +4,7 @@
 // in both QEMU (Cortex-M33 model) and our emulator, then diffing state.
 
 pub mod gdb_client;
+pub mod thumb32_gen;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
