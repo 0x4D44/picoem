@@ -4387,3 +4387,170 @@ fn arbitration_core_local_never_contends() {
     assert_eq!(stall0, 0);
     assert_eq!(stall1, 0);
 }
+
+// ---------- Bus contention integration tests ----------
+
+#[test]
+fn contention_same_sram_bank_adds_stall() {
+    // Both cores executing from the same SRAM bank should cause core 1 to stall.
+    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
+
+    // Place MOV R0, R0 (0x4600) — 1-cycle NOP-like instruction
+    let nop: u16 = 0x4600;
+    let bytes = nop.to_le_bytes();
+    // Bank 0: addr 0x20000000
+    emu.bus.memory.sram_write8(0, bytes[0]);
+    emu.bus.memory.sram_write8(1, bytes[1]);
+    // Same bank (bank 0): addr 0x20000020
+    emu.bus.memory.sram_write8(0x20, bytes[0]);
+    emu.bus.memory.sram_write8(0x21, bytes[1]);
+
+    // Point both cores at these addresses
+    emu.cores[0].set_reg(15, 0x20000000);
+    emu.cores[1].set_reg(15, 0x20000020);
+
+    // Step once — both cores fetch from bank 0
+    emu.step();
+
+    // Core 1 should have a contention stall (1 extra cycle)
+    assert_eq!(emu.cores[0].stall_cycles(), 0);
+    assert_eq!(emu.cores[1].stall_cycles(), 1);
+}
+
+#[test]
+fn contention_different_banks_no_stall() {
+    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
+
+    let nop: u16 = 0x4600;
+    let bytes = nop.to_le_bytes();
+    // Bank 0: offset 0
+    emu.bus.memory.sram_write8(0, bytes[0]);
+    emu.bus.memory.sram_write8(1, bytes[1]);
+    // Bank 1: offset 4 (next word = next bank)
+    emu.bus.memory.sram_write8(4, bytes[0]);
+    emu.bus.memory.sram_write8(5, bytes[1]);
+
+    emu.cores[0].set_reg(15, 0x20000000); // bank 0
+    emu.cores[1].set_reg(15, 0x20000004); // bank 1
+
+    emu.step();
+
+    // No contention — different banks
+    assert_eq!(emu.cores[0].stall_cycles(), 0);
+    assert_eq!(emu.cores[1].stall_cycles(), 0);
+}
+
+#[test]
+fn contention_core1_sio_never_contends() {
+    // SIO is core-local — never contends regardless of core 0's target
+    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
+
+    // Set up core 0 SRAM bank 0 access
+    let nop: u16 = 0x4600;
+    let bytes = nop.to_le_bytes();
+    emu.bus.memory.sram_write8(0, bytes[0]);
+    emu.bus.memory.sram_write8(1, bytes[1]);
+    emu.cores[0].set_reg(15, 0x20000000);
+
+    // Verify the contention check directly:
+    emu.bus.clear_contention_state();
+    emu.bus.read32(0x20000000); // core 0 reads SRAM bank 0
+    emu.bus.begin_contention_check();
+    emu.bus.reset_extra_wait_states();
+    emu.bus.read32(0xD0000000); // core 1 reads SIO — core-local
+    assert_eq!(emu.bus.extra_wait_states(), 0, "SIO should never contend");
+}
+
+// ============================================================================
+// 2.7 SRAM Atomic Aliases
+// ============================================================================
+
+#[test]
+fn sram_atomic_xor() {
+    let mut bus = Bus::new();
+    bus.write32(0x2000_0000, 0xAAAA_5555); // seed via normal write
+    bus.write32(0x2100_0000, 0xFFFF_FFFF); // XOR alias
+    assert_eq!(bus.read32(0x2000_0000), 0x5555_AAAA);
+}
+
+#[test]
+fn sram_atomic_set() {
+    let mut bus = Bus::new();
+    bus.write32(0x2000_0000, 0x0000_00FF);
+    bus.write32(0x2200_0000, 0x0000_FF00); // SET alias
+    assert_eq!(bus.read32(0x2000_0000), 0x0000_FFFF);
+}
+
+#[test]
+fn sram_atomic_clr() {
+    let mut bus = Bus::new();
+    bus.write32(0x2000_0000, 0xFFFF_FFFF);
+    bus.write32(0x2300_0000, 0x00FF_00FF); // CLR alias
+    assert_eq!(bus.read32(0x2000_0000), 0xFF00_FF00);
+}
+
+#[test]
+fn sram_atomic_read_returns_canonical() {
+    let mut bus = Bus::new();
+    bus.write32(0x2000_0010, 0xDEAD_BEEF);
+    // All alias reads return the same canonical value
+    assert_eq!(bus.read32(0x2000_0010), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2100_0010), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2200_0010), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2300_0010), 0xDEAD_BEEF);
+}
+
+#[test]
+fn sram_atomic_8bit_xor_doesnt_affect_neighbors() {
+    let mut bus = Bus::new();
+    bus.write32(0x2000_0000, 0xAABB_CCDD);
+    bus.write8(0x2100_0001, 0xFF); // XOR byte at offset 1 only
+    // Byte 0: 0xDD unchanged, Byte 1: 0xCC ^ 0xFF = 0x33, Byte 2-3: unchanged
+    assert_eq!(bus.read32(0x2000_0000), 0xAABB_33DD);
+}
+
+#[test]
+fn sram_atomic_no_extra_latency() {
+    let mut bus = Bus::new();
+    bus.write32(0x2200_0000, 0xFF); // SET alias write
+    assert_eq!(bus.last_access_cycles(), 1); // same as normal SRAM
+}
+
+#[test]
+fn sram_alias_bank_for_address_resolves_correctly() {
+    use crate::memory::Memory;
+    // Alias addresses should resolve to same bank as canonical
+    assert_eq!(Memory::bank_for_address(0x2000_0004), Memory::bank_for_address(0x2100_0004));
+    assert_eq!(Memory::bank_for_address(0x2000_0004), Memory::bank_for_address(0x2200_0004));
+    assert_eq!(Memory::bank_for_address(0x2000_0004), Memory::bank_for_address(0x2300_0004));
+}
+
+// ============================================================================
+// 2.8 Dual-Core Accumulator Safety
+// ============================================================================
+
+#[test]
+fn dual_core_extra_wait_states_no_pollution() {
+    // Regression test: verify that core 0's bus accesses don't pollute
+    // core 1's cycle count. reset_extra_wait_states() at the start of
+    // decode_execute() ensures each core starts clean.
+    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
+
+    // Place NOP (MOV R0, R0 = 0x4600) at two SRAM addresses in different banks
+    let nop: u16 = 0x4600;
+    let bytes = nop.to_le_bytes();
+    emu.bus.memory.sram_write8(0, bytes[0]);
+    emu.bus.memory.sram_write8(1, bytes[1]);
+    emu.bus.memory.sram_write8(4, bytes[0]);
+    emu.bus.memory.sram_write8(5, bytes[1]);
+
+    emu.cores[0].set_reg(15, 0x20000000); // bank 0
+    emu.cores[1].set_reg(15, 0x20000004); // bank 1
+
+    // Step — both cores execute from SRAM (1 cycle, 0 extra wait states)
+    emu.step();
+
+    // Both should have 0 stall cycles — no pollution, no contention (different banks)
+    assert_eq!(emu.cores[0].stall_cycles(), 0, "core 0 should have no stall");
+    assert_eq!(emu.cores[1].stall_cycles(), 0, "core 1 should have no stall (no pollution)");
+}

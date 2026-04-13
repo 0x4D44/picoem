@@ -90,7 +90,9 @@ impl Emulator {
     /// Step the entire system by one clock cycle.
     pub fn step(&mut self) -> u64 {
         self.clock.tick();
+        self.bus.clear_contention_state();
         self.cores[0].step(&mut self.bus);
+        self.bus.begin_contention_check();
         self.cores[1].step(&mut self.bus);
         self.clock.cycles
     }

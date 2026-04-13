@@ -151,10 +151,11 @@ impl Memory {
     /// SRAM9: offset 0x81000-0x81FFF (4KB)
     /// Returns None if the offset is outside SRAM range.
     ///
-    /// Accepts a full address (0x2000_xxxx); strips the SRAM base internally.
+    /// Accepts a full address (0x20xx_xxxx through 0x23xx_xxxx); strips alias
+    /// and base bits internally. Alias addresses resolve to the same bank.
     pub fn bank_for_address(addr: u32) -> Option<u8> {
         if (addr >> 28) != 0x2 { return None; }
-        let offset = addr & 0x0FFF_FFFF;
+        let offset = addr & 0x00FF_FFFF; // strip alias bits [27:24]
         if offset < 0x8_0000 {
             // Striped region: 0x00000-0x7FFFF (512KB)
             Some(((offset >> 2) & 7) as u8)
@@ -175,14 +176,14 @@ impl Memory {
         match addr >> 28 {
             0x0 => self.rom_read8(addr & 0x0FFF_FFFF),
             0x1 => self.xip_read8(addr & 0x0FFF_FFFF),
-            0x2 => self.sram_read8(addr & 0x0FFF_FFFF),
+            0x2 => self.sram_read8(addr & 0x00FF_FFFF), // strip SRAM alias bits
             _ => 0,
         }
     }
 
     pub fn poke8(&mut self, addr: u32, val: u8) {
         match addr >> 28 {
-            0x2 => self.sram_write8(addr & 0x0FFF_FFFF, val),
+            0x2 => self.sram_write8(addr & 0x00FF_FFFF, val),
             _ => {} // ROM and XIP are read-only, others unmapped
         }
     }
@@ -191,14 +192,14 @@ impl Memory {
         match addr >> 28 {
             0x0 => self.rom_read32(addr & 0x0FFF_FFFF),
             0x1 => self.xip_read32(addr & 0x0FFF_FFFF),
-            0x2 => self.sram_read32(addr & 0x0FFF_FFFF),
+            0x2 => self.sram_read32(addr & 0x00FF_FFFF), // strip SRAM alias bits
             _ => 0,
         }
     }
 
     pub fn poke32(&mut self, addr: u32, val: u32) {
         match addr >> 28 {
-            0x2 => self.sram_write32(addr & 0x0FFF_FFFF, val),
+            0x2 => self.sram_write32(addr & 0x00FF_FFFF, val),
             _ => {} // ROM and XIP are read-only, others unmapped
         }
     }

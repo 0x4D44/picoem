@@ -17,6 +17,10 @@ pub struct Bus {
     /// Keyed by canonical address (alias bits stripped).
     /// TODO: Replace with direct Peripheral trait dispatch when real peripherals are added.
     peripheral_regs: HashMap<u32, u32>,
+    /// Downstream port core 0 last accessed this cycle (for contention detection).
+    core0_port: Option<u8>,
+    /// Whether to check contention on bus accesses (active during core 1's step).
+    contention_check_active: bool,
 }
 
 impl Bus {
@@ -26,6 +30,8 @@ impl Bus {
             last_access_cycles: 0,
             extra_wait_states: 0,
             peripheral_regs: HashMap::new(),
+            core0_port: None,
+            contention_check_active: false,
         }
     }
 
@@ -76,6 +82,37 @@ impl Bus {
                 (0, 0)
             }
         }
+    }
+
+    /// Clear contention tracking state. Called at start of each tick.
+    pub fn clear_contention_state(&mut self) {
+        self.core0_port = None;
+        self.contention_check_active = false;
+    }
+
+    /// Begin checking contention against core 0's recorded port.
+    /// Called between core 0 and core 1 steps.
+    pub fn begin_contention_check(&mut self) {
+        self.contention_check_active = true;
+    }
+
+    /// Check if this access contends with core 0. Returns extra stall cycles.
+    /// Called internally by each read/write method.
+    #[inline(always)]
+    fn check_contention(&mut self, addr: u32) -> u32 {
+        let port = Self::downstream_port(addr);
+        if self.contention_check_active {
+            // Core 1's access — check against core 0's port
+            if let (Some(p0), Some(p1)) = (self.core0_port, port) {
+                if p0 == p1 {
+                    return 1;
+                }
+            }
+        } else {
+            // Core 0's access — record the port
+            self.core0_port = port;
+        }
+        0
     }
 
     // --- Latency accounting ---
@@ -130,8 +167,13 @@ impl Bus {
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
+        let contention = self.check_contention(addr);
+        self.extra_wait_states += contention;
 
-        let offset = addr & 0x0FFF_FFFF;
+        let offset = match region {
+            0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
+            _   => addr & 0x0FFF_FFFF,
+        };
         match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
             0x1 => self.memory.xip_read8(offset),
@@ -155,6 +197,8 @@ impl Bus {
         let (cycles, extra) = Self::write_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
+        let contention = self.check_contention(addr);
+        self.extra_wait_states += contention;
 
         // Interposed atomics: APB XOR/SET/CLR writes cost +2 cycles
         if region == 0x4 && alias != 0 {
@@ -162,9 +206,23 @@ impl Bus {
             self.extra_wait_states += 2;
         }
 
-        let offset = addr & 0x0FFF_FFFF;
+        let offset = addr & 0x00FF_FFFF;
         match region {
-            0x2 if offset < SRAM_SIZE as u32 => self.memory.sram_write8(offset, val),
+            0x2 if offset < SRAM_SIZE as u32 => {
+                let sram_alias = (addr >> 24) & 0x3;
+                if sram_alias == 0 {
+                    self.memory.sram_write8(offset, val);
+                } else {
+                    let old = self.memory.sram_read8(offset);
+                    let new_val = match sram_alias {
+                        1 => old ^ val,
+                        2 => old | val,
+                        3 => old & !val,
+                        _ => unreachable!(),
+                    };
+                    self.memory.sram_write8(offset, new_val);
+                }
+            }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let word_addr = canonical & !3;
@@ -192,8 +250,13 @@ impl Bus {
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
+        let contention = self.check_contention(addr);
+        self.extra_wait_states += contention;
 
-        let offset = addr & 0x0FFF_FFFF;
+        let offset = match region {
+            0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
+            _   => addr & 0x0FFF_FFFF,
+        };
         match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
             0x1 => self.memory.xip_read16(offset),
@@ -218,6 +281,8 @@ impl Bus {
         let (cycles, extra) = Self::write_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
+        let contention = self.check_contention(addr);
+        self.extra_wait_states += contention;
 
         // Interposed atomics: APB XOR/SET/CLR writes cost +2 cycles
         if region == 0x4 && alias != 0 {
@@ -225,9 +290,23 @@ impl Bus {
             self.extra_wait_states += 2;
         }
 
-        let offset = addr & 0x0FFF_FFFF;
+        let offset = addr & 0x00FF_FFFF;
         match region {
-            0x2 if (offset + 1) < SRAM_SIZE as u32 => self.memory.sram_write16(offset, val),
+            0x2 if (offset + 1) < SRAM_SIZE as u32 => {
+                let sram_alias = (addr >> 24) & 0x3;
+                if sram_alias == 0 {
+                    self.memory.sram_write16(offset, val);
+                } else {
+                    let old = self.memory.sram_read16(offset);
+                    let new_val = match sram_alias {
+                        1 => old ^ val,
+                        2 => old | val,
+                        3 => old & !val,
+                        _ => unreachable!(),
+                    };
+                    self.memory.sram_write16(offset, new_val);
+                }
+            }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let word_addr = canonical & !3;
@@ -256,8 +335,13 @@ impl Bus {
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
+        let contention = self.check_contention(addr);
+        self.extra_wait_states += contention;
 
-        let offset = addr & 0x0FFF_FFFF;
+        let offset = match region {
+            0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
+            _   => addr & 0x0FFF_FFFF,
+        };
         match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
             0x1 => self.memory.xip_read32(offset),
@@ -279,6 +363,8 @@ impl Bus {
         let (cycles, extra) = Self::write_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
+        let contention = self.check_contention(addr);
+        self.extra_wait_states += contention;
 
         // Interposed atomics: APB XOR/SET/CLR writes cost +2 cycles
         if region == 0x4 && alias != 0 {
@@ -286,12 +372,23 @@ impl Bus {
             self.extra_wait_states += 2;
         }
 
-        // NOTE: SRAM atomic aliases (0x2100_0000 XOR, 0x2200_0000 SET, 0x2300_0000 CLR)
-        // are not yet implemented — they use different address offsets and are deferred
-        // to a later phase.
-        let offset = addr & 0x0FFF_FFFF;
+        let offset = addr & 0x00FF_FFFF;
         match region {
-            0x2 if (offset + 3) < SRAM_SIZE as u32 => self.memory.sram_write32(offset, val),
+            0x2 if (offset + 3) < SRAM_SIZE as u32 => {
+                let sram_alias = (addr >> 24) & 0x3;
+                if sram_alias == 0 {
+                    self.memory.sram_write32(offset, val);
+                } else {
+                    let old = self.memory.sram_read32(offset);
+                    let new_val = match sram_alias {
+                        1 => old ^ val,
+                        2 => old | val,
+                        3 => old & !val,
+                        _ => unreachable!(),
+                    };
+                    self.memory.sram_write32(offset, new_val);
+                }
+            }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
