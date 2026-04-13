@@ -5,8 +5,13 @@ edition.workspace = true
 
 [dependencies]
 mdrp2354 = { path = "../mdrp2354" }
+probe-rs = "0.31"
 rand = "0.8"
 
 [[bin]]
 name = "qemu_diff"
 path = "src/bin/qemu_diff.rs"
+
+[[bin]]
+name = "probe_verify"
+path = "src/bin/probe_verify.rs"
