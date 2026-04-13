@@ -389,8 +389,9 @@ impl CortexM33 {
         let (shifted, shift_carry) =
             barrel_shift(self.regs.r[rm], shift_type, shift_n, self.regs.flag_c());
 
-        // M33 measured: 1 cycle for LSL #0/#1, 2 cycles for other shifts
-        let cy = if shift_type == 0 && shift_n <= 1 { 1 } else { 2 };
+        // MOV.W/MVN.W (Rn=15): shift is primary operation, always 1 cycle
+        // Otherwise: LSL #0..#2 = 1 cycle (barrel shifter fast path), other shifts = 2 cycles
+        let cy = if rn == 15 { 1 } else if shift_type == 0 && shift_n <= 2 { 1 } else { 2 };
 
         match op {
             // AND / TST

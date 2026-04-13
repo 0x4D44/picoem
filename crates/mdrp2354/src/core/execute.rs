@@ -841,7 +841,9 @@ impl CortexM33 {
         let offset = sign_extend(imm11 << 1, 12); // 11-bit imm, shifted left 1, sign-extended from bit 11
         let target = self.read_pc().wrapping_add(offset);
         self.regs.set_pc(target);
-        1 // M33 measured: 1 cycle
+        // M33 measured: 1 cycle for forward/small backward, 6 for large backward
+        // Threshold between -256 and -500 bytes
+        if (offset as i32) < -256 { 6 } else { 1 }
     }
 
     // ========================================================================

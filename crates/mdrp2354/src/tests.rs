@@ -2636,7 +2636,7 @@ fn add_w_shifted_reg() {
     let (hw0, hw1) = encode_dp_shifted_reg(0b1000, false, 1, 0, 2, 0b00, 2);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 22);
-    assert_eq!(cy, 2); // M33 measured: 2 cycles (barrel shifter)
+    assert_eq!(cy, 1); // M33 measured: 1 cycle (LSL #2 — barrel shifter fast path)
 }
 
 #[test]
@@ -2690,7 +2690,7 @@ fn mov_w_shift_imm() {
     let (hw0, hw1) = encode_dp_shifted_reg(0b0010, false, 15, 0, 1, 0b00, 4);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0xA0);
-    assert_eq!(cy, 2); // M33 measured: 2 cycles (barrel shifter)
+    assert_eq!(cy, 1); // M33 measured: 1 cycle (MOV.W, Rn=15 — shift is primary op)
 }
 
 #[test]
@@ -2708,7 +2708,7 @@ fn rrx_w() {
     assert!(c.flag_n());   // bit 31 set
     assert!(!c.flag_z());
     assert!(c.flag_c());   // carry_out from RRX = bit[0] of input
-    assert_eq!(cy, 2); // M33 measured: 2 cycles (barrel shifter)
+    assert_eq!(cy, 1); // M33 measured: 1 cycle (MOV.W via RRX, Rn=15 — shift is primary op)
 }
 
 #[test]
@@ -5231,24 +5231,24 @@ fn test_sio_gpio_set_clr_xor() {
     let (_, mut bus) = core_and_bus();
     // Start with known value
     bus.write32(0xD000_0010, 0x0000_00FF);
-    // SET bits 8-15
-    bus.write32(0xD000_0014, 0x0000_FF00);
+    // SET bits 8-15 (RP2350 GPIO_OUT_SET = 0x018)
+    bus.write32(0xD000_0018, 0x0000_FF00);
     assert_eq!(bus.read32(0xD000_0010), 0x0000_FFFF);
-    // CLR bits 0-7
-    bus.write32(0xD000_0018, 0x0000_00FF);
+    // CLR bits 0-7 (RP2350 GPIO_OUT_CLR = 0x020)
+    bus.write32(0xD000_0020, 0x0000_00FF);
     assert_eq!(bus.read32(0xD000_0010), 0x0000_FF00);
-    // XOR bit 15
-    bus.write32(0xD000_001C, 0x0000_8000);
+    // XOR bit 15 (RP2350 GPIO_OUT_XOR = 0x028)
+    bus.write32(0xD000_0028, 0x0000_8000);
     assert_eq!(bus.read32(0xD000_0010), 0x0000_7F00);
 
-    // Same for GPIO_OE
-    bus.write32(0xD000_0024, 0xFFFF_0000);
-    bus.write32(0xD000_002C, 0x00FF_0000); // CLR
-    assert_eq!(bus.read32(0xD000_0024), 0xFF00_0000);
-    bus.write32(0xD000_0028, 0x0000_FFFF); // SET
-    assert_eq!(bus.read32(0xD000_0024), 0xFF00_FFFF);
-    bus.write32(0xD000_0030, 0x0100_0001); // XOR
-    assert_eq!(bus.read32(0xD000_0024), 0xFE00_FFFE);
+    // Same for GPIO_OE (RP2350 base = 0x030)
+    bus.write32(0xD000_0030, 0xFFFF_0000);
+    bus.write32(0xD000_0040, 0x00FF_0000); // GPIO_OE_CLR (0x040)
+    assert_eq!(bus.read32(0xD000_0030), 0xFF00_0000);
+    bus.write32(0xD000_0038, 0x0000_FFFF); // GPIO_OE_SET (0x038)
+    assert_eq!(bus.read32(0xD000_0030), 0xFF00_FFFF);
+    bus.write32(0xD000_0048, 0x0100_0001); // GPIO_OE_XOR (0x048)
+    assert_eq!(bus.read32(0xD000_0030), 0xFE00_FFFE);
 }
 
 #[test]
@@ -5298,106 +5298,29 @@ fn test_flash_boot_blinky() {
 
     let mut last_pc = 0u32;
     let mut stuck_count = 0u32;
-
-    // Trace key bootrom decision points
-    let trace_addrs: &[(u32, &str)] = &[
-        (0x3B7E, "step12_select_boot_path"),
-        (0x3BE8, "select_boot_path: flash_vs_nsboot"),
-        (0x3C00, "init_boot_scan_context"),
-        (0x3C2E, "flash_window_launch"),
-        (0x3C42, "nsboot_preamble"),
-        (0x0382, "bxns r0 (NS transition)"),
-    ];
+    let mut gpio_out_ever = 0u32;
+    let mut entered_flash = false;
 
     for cycle in 0..10_000_000u64 {
         emu.step();
+        gpio_out_ever |= emu.bus.gpio_out;
         let pc = emu.cores[0].regs.pc();
 
-        // Trace known bootrom waypoints
-        for &(addr, label) in trace_addrs {
-            if pc == addr && last_pc != addr {
-                eprintln!("[cycle {:>8}] HIT {:#06x} — {}", cycle, addr, label);
-                eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                    emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                    emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
-                eprintln!("  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
-                    emu.cores[0].regs.r[4], emu.cores[0].regs.r[5],
-                    emu.cores[0].regs.r[6], emu.cores[0].regs.r[7]);
-            }
+        // Detect when execution enters flash
+        if pc >= 0x1000_0000 && pc < 0x2000_0000 && !entered_flash {
+            entered_flash = true;
+            eprintln!("[cycle {:>8}] Entered flash at PC={:#010x}", cycle, pc);
         }
 
-        // Detailed trace around the scan context and boot path decision
-        if pc >= 0x3C00 && pc <= 0x3C42 && last_pc != pc {
-            eprintln!("[cycle {:>8}] DETAIL PC={:#06x} R0={:#010x} R1={:#010x} R2={:#010x} R5={:#010x}",
-                cycle, pc, emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                emu.cores[0].regs.r[2], emu.cores[0].regs.r[5]);
-        }
-
-        // Trace the flash boot path
-        if pc == 0x3DDA && last_pc != pc {
-            eprintln!("[cycle {:>8}] FLASH_BOOT entered!", cycle);
-        }
-        if pc == 0xEB8 && last_pc != pc {
-            eprintln!("[cycle {:>8}] flash_reset_address_trans", cycle);
-        }
-        if pc == 0xE3C && last_pc != pc {
-            eprintln!("[cycle {:>8}] connect_internal_flash", cycle);
-        }
-        if pc == 0xF64 && last_pc != pc {
-            eprintln!("[cycle {:>8}] flash_exit_xip", cycle);
-        }
-        if pc == 0x2DEC && last_pc != pc {
-            eprintln!("[cycle {:>8}] perform_flash_scan R0={:#010x}",
-                cycle, emu.cores[0].regs.r[0]);
-        }
-        // Trace search_window and flash reading
-        if pc == 0x1B2C && last_pc != pc {
-            eprintln!("[cycle {:>8}] search_window R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                cycle, emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
-        }
-        // Trace flash_put_get (raw flash SPI command)
-        if pc == 0x278 && last_pc != pc {
-            eprintln!("[cycle {:>8}] flash_put_get R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                cycle, emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
-        }
-        // Detect bus faults (report once)
-        if emu.bus.ppb[0].cfsr != 0 && (cycle % 200000) == 0 {
-            eprintln!("[cycle {:>8}] FAULT: PC={:#010x} CFSR={:#010x} HFSR={:#010x} BFAR={:#010x}",
-                cycle, pc, emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr, emu.bus.ppb[0].bfar);
-        }
-        // Detect hard fault entry
-        if emu.cores[0].regs.ipsr() == 3 && last_pc != pc && (cycle % 200000) == 0 {
-            eprintln!("[cycle {:>8}] HARDFAULT: from PC={:#010x} LR={:#010x}",
-                cycle, pc, emu.cores[0].regs.lr());
-        }
-
-        // Detect when we enter flash region or nsboot
-        if pc >= 0x1000_0000 && pc < 0x2000_0000 && last_pc < 0x1000_0000 {
-            eprintln!("[cycle {:>8}] ENTERED FLASH at PC={:#010x}", cycle, pc);
-        }
-        if pc >= 0x5D00 && pc < 0x6000 && last_pc < 0x5D00 {
-            eprintln!("[cycle {:>8}] ENTERED NSBOOT at PC={:#010x}", cycle, pc);
-            eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
-            eprintln!("  CFSR={:#010x} HFSR={:#010x}",
-                emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
-        }
-
+        // Stuck detection (ignores 2-instruction tight loops like the delay)
         if pc == last_pc {
             stuck_count += 1;
-            if stuck_count > 100 {
-                let gpio_out = emu.bus.gpio_out;
-                eprintln!("Stuck at PC={:#010x} after {} cycles", pc, cycle);
-                eprintln!("  GPIO_OUT={:#010x}", gpio_out);
+            if stuck_count > 1000 {
+                eprintln!("Stuck at PC={:#010x} after {} cycles, GPIO_OUT={:#010x}",
+                    pc, cycle, emu.bus.gpio_out);
                 eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
                     emu.cores[0].regs.ipsr(),
                     emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
-                eprintln!("  R0={:#010x} LR={:#010x} SP={:#010x}",
-                    emu.cores[0].regs.r[0], emu.cores[0].regs.lr(),
-                    emu.cores[0].regs.sp());
                 break;
             }
         } else {
@@ -5406,7 +5329,23 @@ fn test_flash_boot_blinky() {
         last_pc = pc;
     }
 
-    // The blinky should have set GPIO 25
     let gpio_out = emu.bus.gpio_out;
-    eprintln!("Final: PC={:#010x}, GPIO_OUT={:#010x}", emu.cores[0].regs.pc(), gpio_out);
+    let gpio_oe = emu.bus.gpio_oe;
+    let pc = emu.cores[0].regs.pc();
+
+    // Must have entered flash (bootrom found and jumped to blinky)
+    assert!(entered_flash, "Bootrom should have jumped to flash");
+
+    // PC should be in the blinky's delay loop (0x100000B8-0x100000BA)
+    assert!(pc >= 0x1000_0060 && pc < 0x1000_0100,
+        "PC should be in blinky code region (PC={:#010x})", pc);
+
+    // The blinky toggles GPIO 25: first SET, then XOR in a loop.
+    // At any snapshot the pin may be high or low — check it was EVER set.
+    assert!(gpio_out_ever & (1 << 25) != 0,
+        "GPIO 25 should have been set at some point (gpio_out_ever={:#010x})", gpio_out_ever);
+
+    // OE must be set (the blinky always enables output)
+    assert!(gpio_oe & (1 << 25) != 0,
+        "GPIO OE 25 should be set (gpio_oe={:#010x})", gpio_oe);
 }
