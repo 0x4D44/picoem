@@ -51,6 +51,7 @@ fn main() {
     let clock_mhz = parse_arg("--clock-mhz").unwrap_or(150);
     let sys_clk_hz = clock_mhz * 1_000_000;
     let core = parse_arg("--core").unwrap_or(2) as usize;
+    let unpaced = std::env::args().any(|a| a == "--unpaced");
 
     if seconds == 0 || clock_mhz == 0 {
         eprintln!("error: --seconds and --clock-mhz must be > 0");
@@ -100,25 +101,47 @@ fn main() {
     let mon_stats = Arc::clone(&stats);
     let monitor = std::thread::spawn(move || monitor_loop(mon_stats));
 
-    // --- Paced execution ---
+    // --- Execution ---
     let start = Instant::now();
     let duration = Duration::from_secs(seconds.into());
     let qc = pacer.quantum_cycles();
 
-    while start.elapsed() < duration {
-        pacer.begin_quantum();
-        emu.run(qc);
-        pacer.end_quantum();
-    }
+    let unpaced_cycles: u64 = if unpaced {
+        // Unpaced: run emulator as fast as possible. For profiling
+        // (flamegraph) — isolates the emulator hot path from the pacer.
+        println!("(unpaced mode — running flat-out, no real-time pacing)");
+        let mut n: u64 = 0;
+        while start.elapsed() < duration {
+            emu.run(qc);
+            n += qc;
+        }
+        n
+    } else {
+        while start.elapsed() < duration {
+            pacer.begin_quantum();
+            emu.run(qc);
+            pacer.end_quantum();
+        }
+        0 // unused
+    };
 
     stats.set_running(false);
     monitor.join().unwrap();
 
     // --- Summary ---
-    let snap = stats.snapshot();
     let wall_secs = start.elapsed().as_secs_f64();
     println!("\n--- summary ---");
     println!("Duration:       {:.1} s", wall_secs);
+
+    if unpaced {
+        let mhz = unpaced_cycles as f64 / wall_secs / 1_000_000.0;
+        println!("Total cycles:   {}", unpaced_cycles);
+        println!("Avg MHz:        {:.1}", mhz);
+        println!("Verdict:        UNPACED (profiling mode)");
+        return;
+    }
+
+    let snap = stats.snapshot();
     println!("Total cycles:   {}", snap.emulated_cycles);
     println!("Avg MHz:        {:.1}", snap.emulated_mhz());
     println!("Avg util:       {:.1}%", snap.utilization() * 100.0);
