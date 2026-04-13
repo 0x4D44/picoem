@@ -28,7 +28,7 @@ pub fn decode(insn: u16, pinctrl: u32, execctrl: u32) -> DecodedInsn {
     let operand = (insn & 0xFF) as u8;
 
     // Side-set / delay split
-    let sideset_count = ((pinctrl >> 29) & 7) as u8;
+    let sideset_count = (((pinctrl >> 29) & 7) as u8).min(5);
     let delay_bits = 5 - sideset_count;
     let side_en = (execctrl >> 30) & 1 != 0;
 

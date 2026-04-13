@@ -2,7 +2,7 @@ pub mod decode;
 pub mod fifo;
 pub mod sm;
 
-use sm::StateMachine;
+use sm::{StallKind, StateMachine};
 
 /// One PIO block (RP2350 has three: PIO0, PIO1, PIO2).
 pub struct PioBlock {
@@ -384,6 +384,8 @@ impl PioBlock {
                 self.sm[i].osr_count = 0;
                 self.sm[i].delay_count = 0;
                 self.sm[i].stalled = false;
+                self.sm[i].pending_exec = None;
+                self.sm[i].stall_kind = StallKind::None;
             }
         }
 
@@ -399,6 +401,15 @@ impl PioBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_illegal_sideset_count_no_panic() {
+        // PINCTRL with SIDESET_COUNT=7 (illegal) — should not panic
+        let pinctrl = 0xE000_0000; // bits [31:29] = 111 = 7
+        let insn = 0xE001; // SET PINS, 1
+        let _decoded = crate::pio::decode::decode(insn, pinctrl, 0);
+        // If we got here without panic, the test passes
+    }
 
     #[test]
     fn test_sm_reset_values() {

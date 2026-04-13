@@ -21,7 +21,7 @@ pub struct StateMachine {
     pub(crate) sm_id: u8,
 
     // Stall context (for re-evaluating stall conditions)
-    stall_kind: StallKind,
+    pub(crate) stall_kind: StallKind,
 
     // Clock divider (16.8 fractional)
     pub(crate) clkdiv_int: u16,
@@ -45,7 +45,7 @@ pub struct StateMachine {
 }
 
 /// Tracks what kind of stall we're in, so re-evaluation knows what to check.
-enum StallKind {
+pub(crate) enum StallKind {
     None,
     WaitGpio { polarity: bool, index: u8 },
     WaitPin { polarity: bool, index: u8 },
