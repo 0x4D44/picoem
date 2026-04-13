@@ -406,6 +406,82 @@ fn bx_reg() {
     assert_eq!(c.regs.pc(), 0x2000_0000);
 }
 
+#[test]
+fn bxns_from_secure() {
+    let mut c = CortexM33::new();
+    assert!(c.secure);
+    c.regs.msp_ns = 0x2000_4000;
+    c.set_reg(1, 0x1000_0001); // target with Thumb bit
+    // BXNS R1: 0100_0111_0_0001_100 = 0x470C
+    c.execute_one(0x470C);
+    assert!(!c.secure);
+    assert_eq!(c.regs.pc(), 0x1000_0000);
+    assert_eq!(c.regs.r[13], 0x2000_4000);
+    assert_eq!(c.regs.msp, 0x2000_4000);
+    assert_eq!(c.regs.msp_ns, 0); // old Secure MSP preserved
+}
+
+#[test]
+fn bxns_from_nonsecure() {
+    let mut c = CortexM33::new();
+    c.secure = false;
+    c.set_reg(2, 0x2000_0001); // target with Thumb bit
+    let orig_msp = c.regs.msp;
+    let orig_msp_ns = c.regs.msp_ns;
+    // BXNS R2: 0100_0111_0_0010_100 = 0x4714
+    c.execute_one(0x4714);
+    assert!(!c.secure);
+    assert_eq!(c.regs.pc(), 0x2000_0000);
+    assert_eq!(c.regs.msp, orig_msp);
+    assert_eq!(c.regs.msp_ns, orig_msp_ns);
+}
+
+#[test]
+fn bxns_msp_ns_setup_pattern() {
+    let mut c = CortexM33::new();
+    c.regs.msp = 0x2000_8000;
+    c.regs.r[13] = c.regs.msp;
+    c.regs.msp_ns = 0x2000_1000;
+    c.regs.msplim_ns = 0x2000_0800;
+    c.set_reg(0, 0x1000_0101); // target with Thumb bit
+    // BXNS R0: 0100_0111_0_0000_100 = 0x4704
+    c.execute_one(0x4704);
+    assert!(!c.secure);
+    assert_eq!(c.regs.pc(), 0x1000_0100);
+    assert_eq!(c.regs.msp, 0x2000_1000);
+    assert_eq!(c.regs.msp_ns, 0x2000_8000);
+    assert_eq!(c.regs.msplim, 0x2000_0800);
+    assert_eq!(c.regs.r[13], 0x2000_1000);
+}
+
+#[test]
+fn bxns_with_psp_active() {
+    let mut c = CortexM33::new();
+    // Secure state using PSP (SPSEL=1)
+    c.regs.control = 2; // SPSEL=1
+    c.regs.psp = 0x2000_A000;
+    c.regs.r[13] = c.regs.psp; // R13 mirrors PSP when SPSEL=1
+    c.regs.msp = 0x2000_8000;
+    // NS state: SPSEL=0 (using MSP)
+    c.regs.control_ns = 0;
+    c.regs.msp_ns = 0x2000_2000;
+    c.regs.psp_ns = 0x2000_3000;
+    c.set_reg(3, 0x1000_0001); // target with Thumb bit
+    // BXNS R3: 0100_0111_0_0011_100 = 0x471C
+    c.execute_one(0x471C);
+    assert!(!c.secure);
+    assert_eq!(c.regs.pc(), 0x1000_0000);
+    // After swap: NS CONTROL (SPSEL=0) is now active, so R13 = MSP
+    assert_eq!(c.regs.control, 0); // was control_ns
+    assert_eq!(c.regs.msp, 0x2000_2000); // was msp_ns
+    assert_eq!(c.regs.psp, 0x2000_3000); // was psp_ns
+    assert_eq!(c.regs.r[13], 0x2000_2000); // loaded from new MSP (SPSEL=0)
+    // Secure state preserved in _ns slots
+    assert_eq!(c.regs.control_ns, 2); // was control (SPSEL=1)
+    assert_eq!(c.regs.msp_ns, 0x2000_8000); // was msp
+    assert_eq!(c.regs.psp_ns, 0x2000_A000); // was psp
+}
+
 // ============================================================================
 // Load/store (register offset)
 // ============================================================================

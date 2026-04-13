@@ -35,6 +35,8 @@ pub struct CortexM33 {
     pub(crate) rcp_salt: u32,
     /// DCP (CP4/5) transfer registers.
     pub(crate) dcp_data: [u32; 2],
+    /// ARM security state. `true` = Secure, `false` = Non-Secure.
+    pub(crate) secure: bool,
 }
 
 impl CortexM33 {
@@ -52,6 +54,7 @@ impl CortexM33 {
             pending_fault: None,
             rcp_salt: 0,
             dcp_data: [0; 2],
+            secure: true,
         }
     }
 
@@ -101,6 +104,29 @@ impl CortexM33 {
     /// Returns remaining stall cycles (for testing/debugging).
     pub fn stall_cycles(&self) -> u32 {
         self.stall_cycles
+    }
+
+    /// Transition from Secure to Non-Secure state.
+    /// Swaps all banked register pairs so the active set reflects NS state.
+    pub(crate) fn transition_to_nonsecure(&mut self) {
+        debug_assert!(self.secure);
+        self.secure = false;
+
+        // Flush R13 to the correct banked SP before swapping.
+        self.regs.sync_sp_to_banked();
+
+        // Swap all banked pairs.
+        std::mem::swap(&mut self.regs.msp, &mut self.regs.msp_ns);
+        std::mem::swap(&mut self.regs.psp, &mut self.regs.psp_ns);
+        std::mem::swap(&mut self.regs.msplim, &mut self.regs.msplim_ns);
+        std::mem::swap(&mut self.regs.psplim, &mut self.regs.psplim_ns);
+        std::mem::swap(&mut self.regs.primask, &mut self.regs.primask_ns);
+        std::mem::swap(&mut self.regs.basepri, &mut self.regs.basepri_ns);
+        std::mem::swap(&mut self.regs.faultmask, &mut self.regs.faultmask_ns);
+        std::mem::swap(&mut self.regs.control, &mut self.regs.control_ns);
+
+        // Load R13 from the now-active SP.
+        self.regs.sync_sp_from_banked();
     }
 
     /// Halt the core indefinitely (stall for u32::MAX cycles).

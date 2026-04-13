@@ -73,6 +73,7 @@ impl CortexM33 {
             self.regs.msp = frame_sp;
         }
 
+        // FIXME(trustzone): these values don't encode the S bit — NS exceptions will claim Secure return
         // Set LR to EXC_RETURN (Armv8-M, non-secure, no FP frame)
         self.regs.r[14] = if self.regs.in_handler_mode() {
             0xFFFF_FFF1 // return to Handler, MSP

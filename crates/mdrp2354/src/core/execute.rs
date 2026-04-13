@@ -409,6 +409,10 @@ impl CortexM33 {
                 }
                 // Bit 0 of target encodes Thumb state. Must be 1 for M33.
                 self.regs.set_pc(target & !1);
+                // BXNS: bit 2 set, not a link (BLX) variant, currently Secure
+                if opcode & 0x4 != 0 && !link && self.secure {
+                    self.transition_to_nonsecure();
+                }
                 1 // M33 measured: 1 cycle
             }
         }
