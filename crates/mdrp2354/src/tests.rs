@@ -1911,6 +1911,13 @@ fn dsb_dmb_isb() {
     assert_eq!(cy, 1);
 }
 
+#[test]
+fn clrex_is_nop() {
+    let mut c = CortexM33::new();
+    let cy = c.execute_one_wide(0xF3BF, 0x8F2F);
+    assert_eq!(cy, 1);
+}
+
 // ============================================================================
 // Tests: Thumb-32 load/store multiple (LDM.W, STM.W, PUSH.W, POP.W)
 // ============================================================================

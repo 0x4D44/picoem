@@ -773,6 +773,7 @@ impl CortexM33 {
         if hw0 == 0xF3BF {
             let barrier_op = (hw1 >> 4) & 0xF;
             return match barrier_op {
+                0x2 => 1, // CLREX
                 0x4 => 1, // DSB
                 0x5 => 1, // DMB
                 0x6 => 1, // ISB
