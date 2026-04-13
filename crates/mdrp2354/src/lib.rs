@@ -130,10 +130,16 @@ impl Emulator {
     /// Step the entire system by one clock cycle.
     pub fn step(&mut self) -> u64 {
         self.clock.tick();
-        self.bus.clear_contention_state();
-        self.cores[0].step(&mut self.bus);
-        self.bus.begin_contention_check();
-        self.cores[1].step(&mut self.bus);
+        if self.cores[1].is_halted() {
+            // Core 1 halted: skip contention tracking entirely, step core 0 only
+            self.cores[0].step(&mut self.bus);
+        } else {
+            // Both cores active: full contention-tracked dual-core step
+            self.bus.clear_contention_state();
+            self.cores[0].step(&mut self.bus);
+            self.bus.begin_contention_check();
+            self.cores[1].step(&mut self.bus);
+        }
 
         // WFE/SEV wake check
         for i in 0..2 {

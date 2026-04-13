@@ -251,7 +251,9 @@ impl Registers {
     }
 
     /// Evaluate an ARM condition code against current flags.
+    #[inline(always)]
     pub fn condition_passed(&self, cond: u8) -> bool {
+        if cond >= 0xE { return true; }
         match cond & 0xF {
             0x0 => self.flag_z(),                                     // EQ
             0x1 => !self.flag_z(),                                    // NE
