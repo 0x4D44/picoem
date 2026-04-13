@@ -432,6 +432,32 @@ pub fn enc_t32_udiv(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
     (hw0, hw1)
 }
 
+// -- DSP halfword multiply (SMULBB/BT/TB/TT, SMLABB/BT/TB/TT) ---------------
+// Decoder: thumb32_multiply, op1=001
+//   hw0 = 1111_1011_0001_Rn   (0xFB10 | Rn)
+//   hw1 = Ra_Rd_N_M_Rm        (Ra=15 → SMULXY, Ra!=15 → SMLABB etc.)
+//
+// op2 bits: bit1=N_high (Rn halfword), bit0=M_high (Rm halfword)
+//   BB=00, BT=01, TB=10, TT=11
+
+/// SMULXY Rd, Rn, Rm — halfword multiply (Ra=15, no accumulate).
+/// `n_high`/`m_high` select top (true) or bottom (false) halfword.
+pub fn enc_t32_smulxy(rd: u16, rn: u16, rm: u16, n_high: bool, m_high: bool) -> (u16, u16) {
+    let hw0 = 0xFB10 | (rn & 0xF);
+    let op2 = ((n_high as u16) << 1) | (m_high as u16);
+    let hw1 = (0xF << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMLABB/BT/TB/TT Rd, Rn, Rm, Ra — halfword multiply-accumulate.
+/// `n_high`/`m_high` select top (true) or bottom (false) halfword.
+pub fn enc_t32_smlabb(rd: u16, rn: u16, rm: u16, ra: u16, n_high: bool, m_high: bool) -> (u16, u16) {
+    let hw0 = 0xFB10 | (rn & 0xF);
+    let op2 = ((n_high as u16) << 1) | (m_high as u16);
+    let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
 // ============================================================================
 // 7. Branches
 // ============================================================================
@@ -663,6 +689,41 @@ pub fn enc_t32_sxth_w(rd: u16, rm: u16, rot: u16) -> (u16, u16) {
 /// UXTH.W Rd, Rm, {ROR #rot}
 pub fn enc_t32_uxth_w(rd: u16, rm: u16, rot: u16) -> (u16, u16) {
     let hw0 = 0xFA1F;  // ext=001, Rn=15
+    let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+// -- Extend-and-add instructions -----------------------------------------------
+// Same encoding as plain extends but with Rn != 15 (Rn supplies the addend).
+//   hw0 = 1111_1010_0_ext[2:0]_Rn
+//   hw1 = 1111_Rd_1_0_rot[1:0]_Rm
+//
+// ext: 000=SXTAH, 001=UXTAH, 100=SXTAB, 101=UXTAB
+
+/// SXTAB Rd, Rn, Rm, {ROR #rot}  (sign-extend byte, add to Rn)
+pub fn enc_t32_sxtab(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
+    let hw0 = 0xFA40 | (rn & 0xF);  // ext=100, Rn!=15
+    let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// UXTAB Rd, Rn, Rm, {ROR #rot}  (zero-extend byte, add to Rn)
+pub fn enc_t32_uxtab(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
+    let hw0 = 0xFA50 | (rn & 0xF);  // ext=101, Rn!=15
+    let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SXTAH Rd, Rn, Rm, {ROR #rot}  (sign-extend halfword, add to Rn)
+pub fn enc_t32_sxtah(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
+    let hw0 = 0xFA00 | (rn & 0xF);  // ext=000, Rn!=15
+    let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// UXTAH Rd, Rn, Rm, {ROR #rot}  (zero-extend halfword, add to Rn)
+pub fn enc_t32_uxtah(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
+    let hw0 = 0xFA10 | (rn & 0xF);  // ext=001, Rn!=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
@@ -3459,6 +3520,12 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
     // QADD / QSUB / QDADD / QDSUB
     // ----------------------------------------------------------------
 
+    // NOTE: The emulator's QADD/QSUB/QDADD/QDSUB implementation currently
+    // wraps on overflow instead of clamping to INT32_MAX/INT32_MIN as the ARM
+    // spec requires. These saturation tests will fail against QEMU until the
+    // emulator is fixed. The tests are correct — the failures validate that
+    // the differential harness catches this class of bug.
+
     // QADD: normal (no saturation)
     {
         let (hw0, hw1) = enc_t32_qadd(0, 1, 2);
@@ -3723,6 +3790,78 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         });
     }
 
+    // ----------------------------------------------------------------
+    // DSP halfword multiply (SMULBB/BT/TB/TT, SMLABB/BT/TB/TT)
+    // ----------------------------------------------------------------
+
+    // SMULBB: bottom×bottom, 3 × 4 = 12
+    {
+        let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, false);
+        t.push(TestCase {
+            name: "SMULBB R0,R1,R2 (3*4=12)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0xAAAA_0003), (2, 0xBBBB_0004)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    // SMULTT: top×top, 5 × 6 = 30
+    {
+        let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, true, true);
+        t.push(TestCase {
+            name: "SMULTT R0,R1,R2 (5*6=30)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x0005_CCCC), (2, 0x0006_DDDD)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    // SMULBT: bottom(Rn)×top(Rm), 7 × (-1) = -7
+    {
+        let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, true);
+        t.push(TestCase {
+            name: "SMULBT R0,R1,R2 (7*(-1)=-7)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x0000_0007), (2, 0xFFFF_0000)], // top=0xFFFF=-1
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    // SMLABB: multiply-accumulate, 3*4+100=112
+    {
+        let (hw0, hw1) = enc_t32_smlabb(0, 1, 2, 3, false, false);
+        t.push(TestCase {
+            name: "SMLABB R0,R1,R2,R3 (3*4+100=112)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 3), (2, 4), (3, 100)],
+            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            ..TestCase::default()
+        });
+    }
+    // SMULBB edge: 0x7FFF × 0x7FFF = 0x3FFF0001 (max positive × max positive)
+    {
+        let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, false);
+        t.push(TestCase {
+            name: "SMULBB R0,R1,R2 (0x7FFF*0x7FFF)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x0000_7FFF), (2, 0x0000_7FFF)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    // SMULBB edge: 0x8000 × 0x8000 = 0x40000000 (min negative × min negative)
+    // -32768 × -32768 = 1073741824 = 0x40000000
+    {
+        let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, false);
+        t.push(TestCase {
+            name: "SMULBB R0,R1,R2 (0x8000*0x8000)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x0000_8000), (2, 0x0000_8000)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
     t
 }
 
@@ -3953,6 +4092,67 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_uxtb_w(0, 1, 16);
         t.push(mk("UXTB.W R0,R1,ROR#16 (rot then zero-ext)", hw0, hw1,
                    vec![(1, 0x00AB_0000)])); // ROR 16 → 0x0000_00AB, byte=0xAB
+    }
+
+    // ----------------------------------------------------------------
+    // Extend-and-add instructions (SXTAB, UXTAB, SXTAH, UXTAH)
+    // ----------------------------------------------------------------
+
+    // SXTAB: sign-extend byte from Rm, add to Rn
+    // Rm=0x80 → sign-extends to 0xFFFFFF80 (-128), Rn=256 → 256+(-128) = 128
+    {
+        let (hw0, hw1) = enc_t32_sxtab(0, 1, 2, 0);
+        t.push(mk("SXTAB R0,R1,R2 (0x80 sign-ext + 256 = 128)", hw0, hw1,
+                   vec![(1, 256), (2, 0x0000_0080)]));
+    }
+    // UXTAB: zero-extend byte from Rm, add to Rn
+    // Rm=0xFF80 → byte=0x80, zero-extends to 128, Rn=100 → 228
+    {
+        let (hw0, hw1) = enc_t32_uxtab(0, 1, 2, 0);
+        t.push(mk("UXTAB R0,R1,R2 (0x80 zero-ext + 100 = 228)", hw0, hw1,
+                   vec![(1, 100), (2, 0x0000_FF80)]));
+    }
+    // SXTAH: sign-extend halfword from Rm, add to Rn
+    // Rm=0x8000 → sign-extends to 0xFFFF8000 (-32768), Rn=0x10000 → 0x10000-0x8000 = 0x8000
+    {
+        let (hw0, hw1) = enc_t32_sxtah(0, 1, 2, 0);
+        t.push(mk("SXTAH R0,R1,R2 (0x8000 sign-ext + 0x10000)", hw0, hw1,
+                   vec![(1, 0x0001_0000), (2, 0x0000_8000)]));
+    }
+    // UXTAH: zero-extend halfword from Rm, add to Rn
+    // Rm=0xFFFF8000 → halfword=0x8000, zero-extends to 0x8000, Rn=0x100 → 0x8100
+    {
+        let (hw0, hw1) = enc_t32_uxtah(0, 1, 2, 0);
+        t.push(mk("UXTAH R0,R1,R2 (0x8000 zero-ext + 0x100)", hw0, hw1,
+                   vec![(1, 0x0000_0100), (2, 0xFFFF_8000)]));
+    }
+    // SXTAB with rotation: rot=1 (ROR #8), Rm=0x0000_FF80
+    // After ROR 8: 0x800000FF, byte = 0xFF → sign-extends to -1, Rn=10 → 9
+    {
+        let (hw0, hw1) = enc_t32_sxtab(0, 1, 2, 8);
+        t.push(mk("SXTAB R0,R1,R2,ROR#8 (rot then sign-ext+add)", hw0, hw1,
+                   vec![(1, 10), (2, 0x0000_FF00)])); // ROR 8 → 0x000000FF, byte=0xFF→-1, 10-1=9
+    }
+    // UXTAB with rotation: rot=2 (ROR #16), Rm=0x00AB_0000
+    // After ROR 16: 0x0000_00AB, byte = 0xAB → zero-extends to 0xAB, Rn=5 → 5+0xAB=0xB0
+    {
+        let (hw0, hw1) = enc_t32_uxtab(0, 1, 2, 16);
+        t.push(mk("UXTAB R0,R1,R2,ROR#16 (rot then zero-ext+add)", hw0, hw1,
+                   vec![(1, 5), (2, 0x00AB_0000)])); // ROR 16 → 0x0000_00AB, 5+0xAB=0xB0
+    }
+    // SXTAH with rotation: rot=1 (ROR #8), Rm=0x0080_FF00
+    // After ROR 8: 0x000080FF, halfword = 0x80FF → sign-extends to 0xFFFF80FF (-32513), Rn=0x10000
+    {
+        let (hw0, hw1) = enc_t32_sxtah(0, 1, 2, 8);
+        t.push(mk("SXTAH R0,R1,R2,ROR#8 (rot then sign-ext hw+add)", hw0, hw1,
+                   vec![(1, 0x0001_0000), (2, 0x0080_FF00)]));
+    }
+    // UXTAH with rotation: rot=1 (ROR #8), Rm=0x0080_FF00
+    // After ROR 8: 0x000080FF, halfword = 0x80FF → zero-extends to 0x80FF, Rn=1 → 0x8100
+    {
+        let (hw0, hw1) = enc_t32_uxtah(0, 1, 2, 8);
+        t.push(mk("UXTAH R0,R1,R2,ROR#8 (rot then zero-ext hw+add)", hw0, hw1,
+                   vec![(1, 1), (2, 0x0080_FF00)]));
     }
 
     t
