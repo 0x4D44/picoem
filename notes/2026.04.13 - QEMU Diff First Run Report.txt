@@ -1,0 +1,194 @@
+QEMU Differential Test - First Run Report
+==========================================
+Date: 2026-04-13
+QEMU: v10.2.0, MPS2-AN505, Cortex-M33
+Commands:
+  Targeted: cargo run -p mdrp2354-test-harness --release --bin qemu_diff
+  Fuzz:     cargo run -p mdrp2354-test-harness --release --bin qemu_diff -- --fuzz 50 --seed 42
+
+=== TARGETED TEST RESULTS ===
+
+Total: 746 tests
+Passed: 719 (96.4%)
+Failed: 27
+Skipped: 0
+
+=== FUZZ TEST RESULTS ===
+
+Failed at startup: "xPSR has unexpected bits set at reset: 0x01000003 (unexpected=0x00000003)"
+(Infrastructure issue — see Category 7 below)
+
+=== FAILURE LOG ===
+
+[FAIL] LDM R0!, {R0, R1} (Rn in list): R0 addr delta: QEMU=0xfffffeaa EMU=0xdffffeaa
+[FAIL] SDIV R0, R1, R2 (21/7=3): R0: QEMU=0x00000003 EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff03
+[FAIL] SDIV R0, R1, R2 (-21/7=-3): R0: QEMU=0xfffffffd EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdffffefd
+[FAIL] SDIV R0, R1, R2 (-21/-7=3): R0: QEMU=0x00000003 EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff03
+[FAIL] SDIV R0, R1, R2 (div by zero = 0): PC delta: QEMU=0x4 EMU=0xdfffff00
+[FAIL] SDIV R0, R1, R2 (INT32_MIN/-1 = INT32_MIN): R0: QEMU=0x80000000 EMU=0x00000000, PC delta: QEMU=0x4 EMU=0x5fffff00
+[FAIL] SDIV R0, R1, R2 (7/2=3, round-toward-zero): R0: QEMU=0x00000003 EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff03
+[FAIL] SDIV R0, R1, R2 (-7/2=-3, round-toward-zero): R0: QEMU=0xfffffffd EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdffffefd
+[FAIL] SDIV R3, R4, R5 (field extract): R3: QEMU=0x0000000a EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff0a
+[FAIL] UDIV R0, R1, R2 (100/10=10): R0: QEMU=0x0000000a EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff0a
+[FAIL] UDIV R0, R1, R2 (div by zero = 0): PC delta: QEMU=0x4 EMU=0xdfffff00
+[FAIL] UDIV R0, R1, R2 (7/2=3, truncated): R0: QEMU=0x00000003 EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff03
+[FAIL] UDIV R0, R1, R2 (MAX/1=MAX): R0: QEMU=0xffffffff EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdffffeff
+[FAIL] UDIV R0, R1, R2 (1/1=1): R0: QEMU=0x00000001 EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff01
+[FAIL] UDIV R6, R7, R8 (field extract): R6: QEMU=0x00000033 EMU=0x00000000, PC delta: QEMU=0x4 EMU=0xdfffff33
+[FAIL] QADD R0,R1,R2 (saturating, MAX+1): R0: QEMU=0x7fffffff EMU=0x80000000
+[FAIL] QADD R0,R1,R2 (saturating, MIN-1): R0: QEMU=0x80000000 EMU=0x7fffffff
+[FAIL] QSUB R0,R1,R2 (normal, 30-10): R0: QEMU=0xffffffec EMU=0x00000014
+[FAIL] QDADD R0,R1,R2 (normal, 10+2*5): R0: QEMU=0x00000019 EMU=0x00000014
+[FAIL] QDADD R0,R1,R2 (double saturates, 2*MAX): R0: QEMU=0x7fffffff EMU=0xfffffffe, xPSR: QEMU=0x01000000 EMU=0x09000000 (mask=0x08000000)
+[FAIL] QDSUB R0,R1,R2 (normal, 20-2*3): R0: QEMU=0xffffffdb EMU=0x0000000e
+[FAIL] QDSUB R0,R1,R2 (double saturates, 2*MIN): R0: QEMU=0x80000000 EMU=0x00000000, xPSR: QEMU=0x01000000 EMU=0x09000000 (mask=0x08000000)
+[FAIL] SSUB16 R0,R1,R2 (packed 16-bit sub): R0: QEMU=0x00000000 EMU=0x00040008, SP delta: QEMU=0xffffffe0 EMU=0x0, LR: QEMU=0xfffffff9 EMU=0xffffffff, PC delta: QEMU=0xffffff00 EMU=0x4, xPSR: QEMU=0x00000003 EMU=0x010f0000 (mask=0xf80f0000)
+[FAIL] UADD8 R0,R1,R2 (packed 8-bit add): R0: QEMU=0xfe00f0ff EMU=0x00003003, xPSR: QEMU=0x01040003 EMU=0x010c0000 (mask=0xf80f0000)
+[FAIL] QADD16 R0,R1,R2 (saturating 16-bit add): R0: QEMU=0x80000000 EMU=0x7fff0002
+[FAIL] UADD16 R0,R1,R2 (unsigned 16-bit add): R0: QEMU=0xff00fe00 EMU=0x03000000, xPSR: QEMU=0x01000003 EMU=0x01030000 (mask=0xf80f0000)
+[FAIL] MRS R1,BASEPRI (sysm=17): R1: QEMU=0x00000040 EMU=0x00000000
+
+=== FAILURE CATEGORIZATION ===
+
+--- Category 1: Emulator Bug — SDIV/UDIV wrong destination register (15 failures) ---
+
+Root cause: thumb32_long_multiply() writes result to regs[rd_lo] (hw1[15:12] = 0xF
+for SDIV/UDIV encoding), which is R15/PC. The actual Rd register is in hw1[11:8]
+(the rd_hi field). So the quotient is written to PC, corrupting execution flow.
+R0 stays 0 (never written).
+
+Fix: In SDIV/UDIV match arms, use rd_hi instead of rd_lo.
+File: crates/mdrp2354/src/core/execute_thumb32.rs:1157-1170
+
+Severity: HIGH — SDIV/UDIV completely broken, result written to PC.
+
+--- Category 2: Known Emulator Bug — QADD saturation wraps (2 failures) ---
+
+QADD uses overflowing_add() to detect overflow and sets Q flag, but stores the
+wrapping result instead of clamping to INT32_MAX/INT32_MIN.
+
+File: crates/mdrp2354/src/core/execute_thumb32.rs:1297-1303
+Severity: MEDIUM — known issue per task description.
+
+--- Category 3: Emulator Bug — QSUB/QDADD/QDSUB operand order (5 failures) ---
+
+ARM spec (A8.8.126):
+  QSUB:  Rd = sat(Rm - Rn)
+  QDADD: Rd = sat(Rm + sat(2*Rn))
+  QDSUB: Rd = sat(Rm - sat(2*Rn))
+
+Emulator implements:
+  QSUB:  Rd = sat(Rn - Rm)       ← subtraction operands swapped
+  QDADD: Rd = sat(Rn + sat(2*Rm)) ← doubling wrong operand, primary op swapped
+  QDSUB: Rd = sat(Rn - sat(2*Rm)) ← same as QDADD
+
+Verified: QSUB "30-10" test has R1(Rn)=30, R2(Rm)=10.
+  QEMU=0xFFFFFFEC (Rm-Rn = 10-30 = -20) ← correct
+  EMU=0x00000014  (Rn-Rm = 30-10 = +20) ← wrong
+
+Fix: Swap Rn/Rm in the subtraction/doubling expressions.
+File: crates/mdrp2354/src/core/execute_thumb32.rs:1316-1334
+Severity: HIGH — all QSUB/QDADD/QDSUB produce wrong results.
+
+--- Category 4: Emulator + Test Encoding Bug — Parallel op1/op2 axes inverted (4 failures) ---
+
+ARM Thumb-32 parallel add/sub encoding:
+  hw0[6:4] = op1: base operation (add8/add16/asx/sax/sub8/sub16)
+  hw1[6:4] = op2: modifier (signed=000, Q=001, halving=010, unsigned=100, UQ=101, UH=110)
+
+Emulator decoder has these roles REVERSED:
+  hw0[6:4] = "group" (signed-16, unsigned-8, sat-16, etc.)
+  hw1[6:4] = "operation" (add/sub/asx/sax)
+
+Test generator (enc_t32_parallel) follows emulator convention, producing wrong opcodes.
+
+Confirmed by Capstone disassembly:
+  Test "SSUB16" (op1=001,op2=011) → UNDEFINED (no valid ARM instruction!)
+  Test "UADD8"  (op1=100,op2=000) → SSUB8   (not UADD8)
+  Test "QADD16" (op1=010,op2=000) → SASX    (not QADD16)
+  Test "UADD16" (op1=101,op2=000) → SSUB16  (not UADD16)
+
+Correct ARM encodings (also confirmed by Capstone):
+  SSUB16: op1=101, op2=000  (hw0=0xFAD1, hw1=0xF002)
+  UADD8:  op1=000, op2=100  (hw0=0xFA81, hw1=0xF042)
+  QADD16: op1=001, op2=001  (hw0=0xFA91, hw1=0xF012)
+  UADD16: op1=001, op2=100  (hw0=0xFA91, hw1=0xF042)
+
+Passing tests work by accident (SADD16: op1=001,op2=000; SADD8: op1=000,op2=000;
+USUB8: op1=100,op2=100) — the values happen to be the same under either convention.
+
+Fix: Remap the emulator's thumb32_parallel_add_sub() dispatcher AND the parallel
+sub-functions to use ARM-spec axis assignment. Update enc_t32_parallel() and all
+test call sites.
+Files: crates/mdrp2354/src/core/execute_thumb32.rs:1491-1506 (dispatcher),
+       crates/mdrp2354/src/core/execute_thumb32.rs:1509-1614 (parallel functions),
+       crates/mdrp2354-test-harness/src/thumb32_gen.rs:776 (encoder),
+       crates/mdrp2354-test-harness/src/thumb32_gen.rs:3660-3791 (test call sites)
+Severity: HIGH — decoder fundamentally wrong, all non-accidental parallel ops broken.
+
+--- Category 5: Test Setup Bug — MRS BASEPRI (1 failure) ---
+
+Test reads BASEPRI via MRS but never sets it. Emulator initialises BASEPRI=0,
+QEMU hardware returns 0x40 (maybe default or leftover from previous test).
+The TestCase struct has no mechanism for setting special registers as preconditions.
+
+Fix: Either remove this test (can't properly set preconditions) or extend TestCase
+to support system register preconditions.
+File: crates/mdrp2354-test-harness/src/thumb32_gen.rs:4234-4243
+Severity: LOW — test gap, not an emulator bug.
+
+--- Category 6: Test Setup Bug — LDM Rn in list (1 failure) ---
+
+LDM R0!, {R0, R1}: R0 is both base register and in the load list.
+When LDM loads R0, the loaded value contains the absolute address (from memory),
+which differs between QEMU (0x0000_0200-based) and EMU (0x2000_0200-based).
+The addr_delta comparison catches the 0x20000000 difference.
+
+The emulator's LDM implementation may be correct; the issue is that the loaded
+value into R0 includes the address-space-dependent base, which the delta comparison
+can't normalise.
+
+Fix: Skip Rn-in-list tests for addr_regs, or normalise the loaded value.
+File: crates/mdrp2354-test-harness/src/lib.rs:3025-3038
+Severity: LOW — test infrastructure, not emulator bug.
+
+--- Category 7: Infrastructure Bug — Fuzz xPSR reset (blocks fuzz run) ---
+
+Fuzz runner dies at startup: "xPSR has unexpected bits set at reset: 0x01000003
+(unexpected=0x00000003)". Bits [1:0] = 3 → HardFault exception number in IPSR.
+
+Likely cause: sanity_check() runs before setup_vector_table(), so QEMU may be in
+fault state from booting without valid vectors. Also, QEMU's GDB stub may not
+allow writing IPSR bits through xPSR writes, so exception state from a previous
+run could persist.
+
+Fix: Move setup_vector_table() before sanity_check(), or reset the CPU via GDB
+'system_reset' command before sanity_check, or mask off IPSR bits in the check.
+File: crates/mdrp2354-test-harness/src/bin/qemu_diff.rs:97-100
+      crates/mdrp2354-test-harness/src/gdb_client.rs:379-414
+Severity: HIGH — blocks all fuzz testing.
+
+=== RECOMMENDED FIX LIST (ordered by severity) ===
+
+1. [HIGH] Fix SDIV/UDIV destination register: use rd_hi not rd_lo
+   (execute_thumb32.rs:1157-1170)
+
+2. [HIGH] Fix parallel add/sub op1/op2 axis: remap dispatcher to ARM spec
+   convention where hw0[6:4]=operation and hw1[6:4]=modifier
+   (execute_thumb32.rs:1491-1614, thumb32_gen.rs:776+3660-3791)
+
+3. [HIGH] Fix QSUB/QDADD/QDSUB operand order: swap Rn↔Rm
+   (execute_thumb32.rs:1316-1334)
+
+4. [HIGH] Fix fuzz xPSR check: move vector table setup before sanity_check,
+   or add CPU reset, or mask IPSR bits
+   (qemu_diff.rs:97-100)
+
+5. [MEDIUM] Fix QADD/QSUB saturation: clamp instead of wrap
+   (execute_thumb32.rs:1297-1303)
+
+6. [LOW] Fix MRS BASEPRI test: extend TestCase or remove test
+   (thumb32_gen.rs:4234-4243)
+
+7. [LOW] Fix LDM Rn-in-list test: skip or normalise addr comparison
+   (lib.rs:3025-3038)
