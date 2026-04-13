@@ -293,8 +293,89 @@ impl CortexM33 {
 
     // -- Load/store single ---------------------------------------------------
 
-    pub(crate) fn thumb32_load_store_single(&mut self, hw0: u16, hw1: u16, _bus: &mut Bus) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+    pub(crate) fn thumb32_load_store_single(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        let size = ((hw0 >> 5) & 0x3) as u8;    // hw0[6:5]: 00=byte, 01=half, 10=word
+        let load = (hw0 >> 4) & 1 != 0;         // hw0[4]: 1=load, 0=store
+        let sign = (hw0 >> 8) & 1 != 0;         // hw0[8]: 1=signed load
+        let rn = (hw0 & 0xF) as usize;          // hw0[3:0], 15=PC-relative
+        let rt = ((hw1 >> 12) & 0xF) as usize;  // hw1[15:12]
+
+        // GUARD: load with Rt=15 is PLD/PLI (preload hint), NOT a load to PC.
+        if load && rt == 15 {
+            return 1;
+        }
+
+        // Compute effective address
+        let addr = if rn == 15 {
+            // PC-relative literal load
+            let base = self.read_pc() & !3; // word-aligned PC
+            let u = (hw0 >> 7) & 1 != 0;
+            let imm12 = (hw1 & 0xFFF) as u32;
+            if u { base.wrapping_add(imm12) } else { base.wrapping_sub(imm12) }
+        } else if (hw0 >> 7) & 1 != 0 {
+            // Immediate 12-bit unsigned offset
+            let imm12 = (hw1 & 0xFFF) as u32;
+            self.regs.r[rn].wrapping_add(imm12)
+        } else if hw1 & 0x800 != 0 {
+            // 8-bit immediate with P/U/W
+            let p = (hw1 >> 10) & 1 != 0;
+            let u = (hw1 >> 9) & 1 != 0;
+            let w = (hw1 >> 8) & 1 != 0;
+            let imm8 = (hw1 & 0xFF) as u32;
+            let offset = if u { imm8 } else { 0u32.wrapping_sub(imm8) };
+            let base = self.regs.r[rn];
+            let addr = if p { base.wrapping_add(offset) } else { base };
+
+            // Perform the memory access before writeback
+            let cycles = self.thumb32_ls_single_access(size, sign, load, rt, addr, bus);
+
+            // Writeback: pre-index (p=true, w=true) or post-index (p=false)
+            if w || !p {
+                self.regs.r[rn] = base.wrapping_add(offset);
+            }
+            return cycles;
+        } else {
+            // Register offset with LSL
+            let shift = ((hw1 >> 4) & 0x3) as u32;
+            let rm = (hw1 & 0xF) as usize;
+            let offset = self.regs.r[rm] << shift;
+            self.regs.r[rn].wrapping_add(offset)
+        };
+
+        self.thumb32_ls_single_access(size, sign, load, rt, addr, bus)
+    }
+
+    /// Perform a single load/store memory access by size and sign.
+    /// Returns cycle count: load=2, store=1, undefined=1.
+    #[inline(always)]
+    fn thumb32_ls_single_access(
+        &mut self, size: u8, sign: bool, load: bool,
+        rt: usize, addr: u32, bus: &mut Bus,
+    ) -> u32 {
+        match (size, sign) {
+            (0b00, false) => {
+                if load { self.regs.r[rt] = bus.read8(addr) as u32; }
+                else { bus.write8(addr, self.regs.r[rt] as u8); }
+            }
+            (0b00, true) => {
+                // LDRSB (load only; signed stores don't exist)
+                self.regs.r[rt] = bus.read8(addr) as i8 as i32 as u32;
+            }
+            (0b01, false) => {
+                if load { self.regs.r[rt] = bus.read16(addr) as u32; }
+                else { bus.write16(addr, self.regs.r[rt] as u16); }
+            }
+            (0b01, true) => {
+                // LDRSH (load only)
+                self.regs.r[rt] = bus.read16(addr) as i16 as i32 as u32;
+            }
+            (0b10, false) => {
+                if load { self.regs.r[rt] = bus.read32(addr); }
+                else { bus.write32(addr, self.regs.r[rt]); }
+            }
+            _ => return 1, // undefined: signed word or size=11
+        }
+        if load { 2 } else { 1 }
     }
 
     // -- Load/store multiple -------------------------------------------------
@@ -318,18 +399,105 @@ impl CortexM33 {
             self.thumb32_bl(hw0, hw1)
         } else if hw1 & (1 << 12) != 0 {
             // hw1[14] = 0, hw1[12] = 1 -> B.W T4 (unconditional)
-            self.thumb32_undefined(hw0, hw1)
+            self.thumb32_b_w_uncond(hw0, hw1)
         } else {
             // hw1[14] = 0, hw1[12] = 0
             let misc_op = (hw0 >> 6) & 0xF;
             if misc_op & 0xE != 0xE {
                 // hw0[9:6] != 0b111x -> B.W T3 (conditional)
-                self.thumb32_undefined(hw0, hw1)
+                self.thumb32_b_w_cond(hw0, hw1)
             } else {
-                // hw0[9:6] == 0b111x -> miscellaneous control (MSR, MRS, hints, barriers)
-                self.thumb32_undefined(hw0, hw1)
+                // hw0[9:6] == 0b111x -> miscellaneous control
+                self.thumb32_misc_control(hw0, hw1)
             }
         }
+    }
+
+    // -- B.W conditional (T3) ---------------------------------------------------
+
+    fn thumb32_b_w_cond(&mut self, hw0: u16, hw1: u16) -> u32 {
+        let s = ((hw0 >> 10) & 1) as u32;
+        let cond = ((hw0 >> 6) & 0xF) as u8;
+        let imm6 = (hw0 & 0x3F) as u32;
+        let j1 = ((hw1 >> 13) & 1) as u32;
+        let j2 = ((hw1 >> 11) & 1) as u32;
+        let imm11 = (hw1 & 0x7FF) as u32;
+
+        // J1/J2 used directly (no XOR trick for T3)
+        let imm21 = (s << 20) | (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1);
+        let offset = sign_extend(imm21, 21);
+
+        if self.regs.condition_passed(cond) {
+            let target = self.read_pc().wrapping_add(offset);
+            self.regs.set_pc(target);
+            2
+        } else {
+            1
+        }
+    }
+
+    // -- B.W unconditional (T4) -------------------------------------------------
+
+    fn thumb32_b_w_uncond(&mut self, hw0: u16, hw1: u16) -> u32 {
+        let s = ((hw0 >> 10) & 1) as u32;
+        let imm10 = (hw0 & 0x3FF) as u32;
+        let j1 = ((hw1 >> 13) & 1) as u32;
+        let j2 = ((hw1 >> 11) & 1) as u32;
+        let imm11 = (hw1 & 0x7FF) as u32;
+
+        // XOR trick for extended range
+        let i1 = (j1 ^ s) ^ 1;
+        let i2 = (j2 ^ s) ^ 1;
+
+        let imm25 = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+        let offset = sign_extend(imm25, 25);
+
+        let target = self.read_pc().wrapping_add(offset);
+        self.regs.set_pc(target);
+        2
+    }
+
+    // -- Miscellaneous control (MSR, MRS, hints, barriers) ----------------------
+
+    fn thumb32_misc_control(&mut self, hw0: u16, hw1: u16) -> u32 {
+        // Hints: hw0 = 0xF3AF
+        if hw0 == 0xF3AF {
+            let hint = hw1 & 0xFF;
+            return match hint {
+                0x00 => 1, // NOP.W
+                0x01 => 1, // YIELD.W
+                0x02 => 1, // WFE.W
+                0x03 => 1, // WFI.W
+                0x04 => 1, // SEV.W
+                _ => self.thumb32_undefined(hw0, hw1),
+            };
+        }
+
+        // Barriers: hw0 = 0xF3BF
+        if hw0 == 0xF3BF {
+            let barrier_op = (hw1 >> 4) & 0xF;
+            return match barrier_op {
+                0x4 => 1, // DSB
+                0x5 => 1, // DMB
+                0x6 => 1, // ISB
+                _ => self.thumb32_undefined(hw0, hw1),
+            };
+        }
+
+        // MSR: hw0[10:4] = 0b0111000 or 0b0111001
+        let op_field = (hw0 >> 4) & 0x7F;
+        if op_field == 0b0111000 || op_field == 0b0111001 {
+            // MSR -- stub for Stage 10
+            return 1;
+        }
+
+        // MRS: hw0[10:4] = 0b0111110 or 0b0111111
+        if op_field == 0b0111110 || op_field == 0b0111111 {
+            // MRS -- stub for Stage 10
+            return 1;
+        }
+
+        self.thumb32_undefined(hw0, hw1)
     }
 
     // -- Multiply (32-bit result) --------------------------------------------

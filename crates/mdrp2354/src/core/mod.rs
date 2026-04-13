@@ -108,6 +108,14 @@ impl CortexM33 {
         self.execute_thumb32(hw0, hw1, &mut bus)
     }
 
+    /// Execute a single 32-bit Thumb-2 instruction with a provided bus.
+    pub fn execute_one_wide_with_bus(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        let pc = self.regs.pc();
+        self.current_instr_addr = pc;
+        self.regs.set_pc(pc.wrapping_add(4));
+        self.execute_thumb32(hw0, hw1, bus)
+    }
+
     /// The ARM-defined "read PC" value during instruction execution:
     /// current instruction address + 4.
     #[inline(always)]

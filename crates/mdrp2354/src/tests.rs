@@ -966,16 +966,16 @@ fn thumb32_bl_routes_through_branch_misc() {
 }
 
 #[test]
-fn thumb32_ldr_w_routes_to_stub() {
+fn thumb32_ldr_w_routes_to_load_store_single() {
     let mut c = CortexM33::new();
     c.regs.set_pc(0x1000);
 
     // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000
     // op1 = (0xF8D1 >> 11) & 0x3 = 0b11
     // op2 = (0xF8D1 >> 4) & 0x7F = 0x0D = 0b0001101
-    // op2 & 0x40 = 0, op2 & 0x20 = 0 → load_store_single (stub → 1)
+    // op2 & 0x40 = 0, op2 & 0x20 = 0 → load_store_single → load costs 2
     let cy = c.execute_one_wide(0xF8D1, 0x0000);
-    assert_eq!(cy, 1);
+    assert_eq!(cy, 2);
 }
 
 // ============================================================================
@@ -1475,5 +1475,438 @@ fn sbfx_negative() {
     let cy = c.execute_one_wide(hw0, hw1);
     // sign_extend(0xF5, 8) = 0xFFFF_FFF5
     assert_eq!(c.reg(0), 0xFFFF_FFF5);
+    assert_eq!(cy, 1);
+}
+
+// ============================================================================
+// Thumb-32: Load/Store Single — encoding helpers
+// ============================================================================
+
+// hw0 format for load_store_single (imm12):
+//   hw0[15:9] = 1111100, hw0[8] = sign, hw0[7] = 1 (imm12),
+//   hw0[6:5] = size, hw0[4] = load, hw0[3:0] = Rn
+//   hw1[15:12] = Rt, hw1[11:0] = imm12
+
+/// Encode LDR.W Rt, [Rn, #imm12] — word load, unsigned 12-bit offset.
+fn encode_ldr_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=10, load=1, sign=0, hw0[7]=1
+    let hw0 = 0xF8D0 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode STR.W Rt, [Rn, #imm12] — word store, unsigned 12-bit offset.
+fn encode_str_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=10, load=0, sign=0, hw0[7]=1
+    let hw0 = 0xF8C0 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode LDR.W Rt, [Rn, Rm, LSL #shift] — word load, register offset.
+fn encode_ldr_w_reg(rt: u8, rn: u8, rm: u8, shift: u8) -> (u16, u16) {
+    // size=10, load=1, sign=0, hw0[7]=0
+    let hw0 = 0xF850 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | ((shift as u16 & 0x3) << 4) | (rm as u16 & 0xF);
+    (hw0, hw1)
+}
+
+/// Encode LDRB.W Rt, [Rn, #imm12] — unsigned byte load.
+fn encode_ldrb_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=00, load=1, sign=0, hw0[7]=1
+    let hw0 = 0xF890 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode STRB.W Rt, [Rn, #imm12] — byte store.
+fn encode_strb_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=00, load=0, sign=0, hw0[7]=1
+    let hw0 = 0xF880 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode LDRH.W Rt, [Rn, #imm12] — unsigned halfword load.
+fn encode_ldrh_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=01, load=1, sign=0, hw0[7]=1
+    let hw0 = 0xF8B0 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode STRH.W Rt, [Rn, #imm12] — halfword store.
+fn encode_strh_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=01, load=0, sign=0, hw0[7]=1
+    let hw0 = 0xF8A0 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode LDRSB.W Rt, [Rn, #imm12] — signed byte load.
+fn encode_ldrsb_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=00, load=1, sign=1, hw0[7]=1
+    let hw0 = 0xF990 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode LDRSH.W Rt, [Rn, #imm12] — signed halfword load.
+fn encode_ldrsh_w_imm12(rt: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    // size=01, load=1, sign=1, hw0[7]=1
+    let hw0 = 0xF9B0 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+/// Encode LDR.W Rt, [Rn, #imm8] with P/U/W bits (pre/post-index).
+/// p=true, u=direction, w=writeback for pre-index; p=false for post-index.
+fn encode_ldr_w_imm8_puw(rt: u8, rn: u8, imm8: u8, p: bool, u: bool, w: bool) -> (u16, u16) {
+    // size=10, load=1, sign=0, hw0[7]=0
+    let hw0 = 0xF850 | (rn as u16 & 0xF);
+    let hw1 = ((rt as u16 & 0xF) << 12)
+        | 0x800 // hw1[11]=1 selects imm8 mode
+        | if p { 0x400 } else { 0 }
+        | if u { 0x200 } else { 0 }
+        | if w { 0x100 } else { 0 }
+        | (imm8 as u16);
+    (hw0, hw1)
+}
+
+// ============================================================================
+// Thumb-32: Load/Store Single — tests
+// ============================================================================
+
+#[test]
+fn ldr_w_imm12() {
+    // LDR.W R0, [R1, #100]
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0064, 0xDEAD_BEEF);
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_ldr_w_imm12(0, 1, 100);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0xDEAD_BEEF);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn str_w_imm12() {
+    // STR.W R0, [R1, #100] then verify with read
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(0, 0xCAFE_BABE);
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_str_w_imm12(0, 1, 100);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(bus.read32(0x2000_0064), 0xCAFE_BABE);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn ldr_w_reg() {
+    // LDR.W R0, [R1, R2, LSL #2] — array indexing pattern
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0010, 0x1234_5678); // array[4] at base + 4*4
+    c.set_reg(1, 0x2000_0000); // base
+    c.set_reg(2, 4);           // index
+    let (hw0, hw1) = encode_ldr_w_reg(0, 1, 2, 2); // LSL #2
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0x1234_5678);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn ldrb_w_imm12() {
+    // LDRB.W R0, [R1, #10] — unsigned byte load
+    let (mut c, mut bus) = core_and_bus();
+    bus.write8(0x2000_000A, 0xAB);
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_ldrb_w_imm12(0, 1, 10);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0xAB); // zero-extended
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn ldrh_w_imm12() {
+    // LDRH.W R0, [R1, #6] — unsigned halfword load
+    let (mut c, mut bus) = core_and_bus();
+    bus.write16(0x2000_0006, 0xBEEF);
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_ldrh_w_imm12(0, 1, 6);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0xBEEF); // zero-extended
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn ldrsb_w_imm12() {
+    // LDRSB.W R0, [R1, #0] — signed byte, negative value
+    let (mut c, mut bus) = core_and_bus();
+    bus.write8(0x2000_0000, 0x80); // -128 signed
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_ldrsb_w_imm12(0, 1, 0);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0xFFFF_FF80); // sign-extended
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn ldrsh_w_imm12() {
+    // LDRSH.W R0, [R1, #2] — signed halfword, negative value
+    let (mut c, mut bus) = core_and_bus();
+    bus.write16(0x2000_0002, 0x8001); // -32767 signed
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_ldrsh_w_imm12(0, 1, 2);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0xFFFF_8001); // sign-extended
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn strb_w_imm12() {
+    // STRB.W R0, [R1, #5] — byte store
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(0, 0xFFFF_FF42); // only low byte stored
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_strb_w_imm12(0, 1, 5);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(bus.read8(0x2000_0005), 0x42);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn strh_w_imm12() {
+    // STRH.W R0, [R1, #8] — halfword store
+    let (mut c, mut bus) = core_and_bus();
+    c.set_reg(0, 0xFFFF_BEEF); // only low halfword stored
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_strh_w_imm12(0, 1, 8);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(bus.read16(0x2000_0008), 0xBEEF);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn ldr_w_literal() {
+    // LDR.W R0, [PC, #imm12] — PC-relative literal load (Rn=15)
+    // PC must be in SRAM so the literal address is also in SRAM (writable).
+    let (mut c, mut bus) = core_and_bus();
+    c.regs.set_pc(0x2000_1000);
+    // read_pc() = instr_addr + 4 = 0x2000_1000 + 4 = 0x2000_1004, aligned = 0x2000_1004
+    // With imm12=8, addr = 0x2000_1004 + 8 = 0x2000_100C
+    bus.write32(0x2000_100C, 0xAAAA_BBBB);
+    // Rn=15 with U=1 (hw0[7]=1): LDR.W R0, [PC, #+imm12]
+    let hw0: u16 = 0xF8DF; // sign=0, hw0[7]=1, size=10, load=1, Rn=1111
+    let hw1: u16 = 0x0008; // Rt=R0, imm12=8
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0xAAAA_BBBB);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn ldr_w_pre_index() {
+    // LDR.W R0, [R1, #4]! — pre-index with writeback
+    // P=1, U=1, W=1, imm8=4
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0004, 0x1111_2222);
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_ldr_w_imm8_puw(0, 1, 4, true, true, true);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0x1111_2222);      // loaded from base+4
+    assert_eq!(c.reg(1), 0x2000_0004);      // R1 updated (writeback)
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn ldr_w_post_index() {
+    // LDR.W R0, [R1], #4 — post-index
+    // P=0, U=1, W=1 (post-index: p=false implies writeback)
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0000, 0x3333_4444);
+    c.set_reg(1, 0x2000_0000);
+    let (hw0, hw1) = encode_ldr_w_imm8_puw(0, 1, 4, false, true, true);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    assert_eq!(c.reg(0), 0x3333_4444);      // loaded from original base
+    assert_eq!(c.reg(1), 0x2000_0004);      // R1 updated after load
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn pld_rt15_is_nop() {
+    // Load with Rt=15 is PLD/PLI (preload hint), treated as NOP.
+    let (mut c, mut bus) = core_and_bus();
+    c.regs.set_pc(0x1000);
+    c.set_reg(1, 0x2000_0000);
+    bus.write32(0x2000_0000, 0xDEAD_BEEF);
+    // LDR.W R15, [R1, #0] → Rt=15 → PLD, returns 1
+    let (hw0, _) = encode_ldr_w_imm12(15, 1, 0);
+    let hw1: u16 = (15u16 << 12) | 0; // Rt=15, imm12=0
+    let pc_before = c.regs.pc();
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    // PC should be at pc_before+4 (normal advance), not modified by load
+    assert_eq!(c.regs.pc(), pc_before + 4);
+    assert_eq!(cy, 1); // NOP cost
+}
+
+// ============================================================================
+// Encoding helpers: wide branches
+// ============================================================================
+
+/// Encode B.W conditional (T3).
+/// offset is a signed value in bytes (must be even, 21-bit signed range).
+/// Format: hw0 = 11110_S_cond_imm6, hw1 = 10_J1_0_J2_imm11
+fn encode_b_w_cond(cond: u8, offset: i32) -> (u16, u16) {
+    let uoffset = offset as u32;
+    let s = (uoffset >> 20) & 1;
+    let j2 = (uoffset >> 19) & 1;
+    let j1 = (uoffset >> 18) & 1;
+    let imm6 = (uoffset >> 12) & 0x3F;
+    let imm11 = (uoffset >> 1) & 0x7FF;
+
+    let hw0 = 0xF000u16 | ((s as u16) << 10) | ((cond as u16) << 6) | imm6 as u16;
+    let hw1 = 0x8000u16 | ((j1 as u16) << 13) | ((j2 as u16) << 11) | imm11 as u16;
+    (hw0, hw1)
+}
+
+/// Encode B.W unconditional (T4).
+/// offset is a signed value in bytes (must be even, 25-bit signed range).
+/// Format: hw0 = 11110_S_imm10, hw1 = 10_J1_1_J2_imm11
+/// Uses XOR trick: I1=NOT(J1^S), I2=NOT(J2^S), so J1=NOT(I1^S), J2=NOT(I2^S).
+fn encode_b_w_uncond(offset: i32) -> (u16, u16) {
+    let uoffset = offset as u32;
+    let s = (uoffset >> 24) & 1;
+    let i1 = (uoffset >> 23) & 1;
+    let i2 = (uoffset >> 22) & 1;
+    let imm10 = (uoffset >> 12) & 0x3FF;
+    let imm11 = (uoffset >> 1) & 0x7FF;
+
+    // Reverse the XOR trick: J1 = NOT(I1 XOR S), J2 = NOT(I2 XOR S)
+    let j1 = (i1 ^ s) ^ 1;
+    let j2 = (i2 ^ s) ^ 1;
+
+    let hw0 = 0xF000u16 | ((s as u16) << 10) | imm10 as u16;
+    let hw1 = 0x9000u16 | ((j1 as u16) << 13) | ((j2 as u16) << 11) | imm11 as u16;
+    (hw0, hw1)
+}
+
+// ============================================================================
+// Tests: B.W conditional (T3)
+// ============================================================================
+
+#[test]
+fn b_w_cond_taken() {
+    // BEQ.W +100 with Z=1 -> branch taken
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    c.regs.set_flag_z(true); // EQ condition met
+    let (hw0, hw1) = encode_b_w_cond(0x0, 100); // cond=0 (EQ), offset=+100
+    let cy = c.execute_one_wide(hw0, hw1);
+    // read_pc = 0x1000 + 4 = 0x1004, target = 0x1004 + 100 = 0x1068
+    assert_eq!(c.regs.pc(), 0x1068);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn b_w_cond_not_taken() {
+    // BEQ.W +100 with Z=0 -> not taken
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    c.regs.set_flag_z(false); // EQ condition not met
+    let (hw0, hw1) = encode_b_w_cond(0x0, 100); // cond=0 (EQ), offset=+100
+    let cy = c.execute_one_wide(hw0, hw1);
+    // Not taken: PC stays at 0x1000 + 4 = 0x1004
+    assert_eq!(c.regs.pc(), 0x1004);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn b_w_cond_backward() {
+    // BNE.W -50 with Z=0 (NE condition met) -> backward branch taken
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x2000);
+    c.regs.set_flag_z(false); // NE condition met
+    let (hw0, hw1) = encode_b_w_cond(0x1, -50); // cond=1 (NE), offset=-50
+    let cy = c.execute_one_wide(hw0, hw1);
+    // read_pc = 0x2000 + 4 = 0x2004, target = 0x2004 + (-50) = 0x1FD2
+    assert_eq!(c.regs.pc(), 0x1FD2);
+    assert_eq!(cy, 2);
+}
+
+// ============================================================================
+// Tests: B.W unconditional (T4)
+// ============================================================================
+
+#[test]
+fn b_w_uncond_forward() {
+    // B.W +1000 (unconditional forward)
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    let (hw0, hw1) = encode_b_w_uncond(1000);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // read_pc = 0x1000 + 4 = 0x1004, target = 0x1004 + 1000 = 0x13EC
+    assert_eq!(c.regs.pc(), 0x13EC);
+    assert_eq!(cy, 2);
+}
+
+#[test]
+fn b_w_uncond_backward() {
+    // B.W -100 (unconditional backward)
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x2000);
+    let (hw0, hw1) = encode_b_w_uncond(-100);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // read_pc = 0x2000 + 4 = 0x2004, target = 0x2004 + (-100) = 0x1FA0
+    assert_eq!(c.regs.pc(), 0x1FA0);
+    assert_eq!(cy, 2);
+}
+
+// ============================================================================
+// Tests: BL through branch_misc dispatch
+// ============================================================================
+
+#[test]
+fn bl_still_works() {
+    // Verify existing BL functionality routes through the new dispatch
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    // BL +100: same encoding as the existing bl_forward test
+    let cy = c.execute_one_wide(0xF000, 0xF832);
+    assert_eq!(c.regs.lr(), 0x1005);
+    assert_eq!(c.regs.pc(), 0x1068);
+    assert_eq!(cy, 4);
+}
+
+// ============================================================================
+// Tests: Miscellaneous control (hints, barriers)
+// ============================================================================
+
+#[test]
+fn nop_w() {
+    // NOP.W: hw0=0xF3AF, hw1=0x8000
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    let cy = c.execute_one_wide(0xF3AF, 0x8000);
+    // PC should advance normally (set by execute_one_wide to 0x1004)
+    assert_eq!(c.regs.pc(), 0x1004);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn dsb_dmb_isb() {
+    let mut c = CortexM33::new();
+
+    // DSB: hw0=0xF3BF, hw1=0x8F4F (option=0xF, barrier_op=4)
+    c.regs.set_pc(0x1000);
+    let cy = c.execute_one_wide(0xF3BF, 0x8F4F);
+    assert_eq!(cy, 1);
+
+    // DMB: hw0=0xF3BF, hw1=0x8F5F (barrier_op=5)
+    c.regs.set_pc(0x2000);
+    let cy = c.execute_one_wide(0xF3BF, 0x8F5F);
+    assert_eq!(cy, 1);
+
+    // ISB: hw0=0xF3BF, hw1=0x8F6F (barrier_op=6)
+    c.regs.set_pc(0x3000);
+    let cy = c.execute_one_wide(0xF3BF, 0x8F6F);
     assert_eq!(cy, 1);
 }
