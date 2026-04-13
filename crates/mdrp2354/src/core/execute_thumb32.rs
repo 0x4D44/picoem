@@ -198,7 +198,91 @@ impl CortexM33 {
     // -- Data processing (plain binary immediate) ----------------------------
 
     pub(crate) fn thumb32_dp_plain_imm(&mut self, hw0: u16, hw1: u16) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+        let op = ((hw0 >> 4) & 0x1F) as u8;
+        let rn = (hw0 & 0xF) as usize;
+        let rd = ((hw1 >> 8) & 0xF) as usize;
+
+        match op {
+            // ADDW / ADR (add variant)
+            0b00000 => {
+                let imm12 = extract_imm12(hw0, hw1);
+                if rn == 15 {
+                    // ADR: Rd = Align(PC, 4) + imm12
+                    self.regs.r[rd] = (self.read_pc() & !3).wrapping_add(imm12);
+                } else {
+                    self.regs.r[rd] = self.regs.r[rn].wrapping_add(imm12);
+                }
+                1
+            }
+            // MOVW
+            0b00100 => {
+                let imm16 = ((hw0 as u32 & 0xF) << 12)
+                    | (((hw0 >> 10) as u32 & 1) << 11)
+                    | (((hw1 >> 12) as u32 & 0x7) << 8)
+                    | (hw1 as u32 & 0xFF);
+                self.regs.r[rd] = imm16;
+                1
+            }
+            // SUBW / ADR (sub variant)
+            0b01010 => {
+                let imm12 = extract_imm12(hw0, hw1);
+                if rn == 15 {
+                    // ADR: Rd = Align(PC, 4) - imm12
+                    self.regs.r[rd] = (self.read_pc() & !3).wrapping_sub(imm12);
+                } else {
+                    self.regs.r[rd] = self.regs.r[rn].wrapping_sub(imm12);
+                }
+                1
+            }
+            // MOVT
+            0b01100 => {
+                let imm16 = ((hw0 as u32 & 0xF) << 12)
+                    | (((hw0 >> 10) as u32 & 1) << 11)
+                    | (((hw1 >> 12) as u32 & 0x7) << 8)
+                    | (hw1 as u32 & 0xFF);
+                self.regs.r[rd] = (self.regs.r[rd] & 0xFFFF) | (imm16 << 16);
+                1
+            }
+            // SSAT — stub
+            0b10000 => self.thumb32_undefined(hw0, hw1),
+            // SBFX
+            0b10100 => {
+                let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
+                let widthm1 = (hw1 & 0x1F) as u32;
+                let width = widthm1 + 1;
+                let val = (self.regs.r[rn] >> lsb) & ((1u32 << width) - 1);
+                self.regs.r[rd] = sign_extend(val, width);
+                1
+            }
+            // BFI / BFC
+            0b10110 => {
+                let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
+                let msb = (hw1 & 0x1F) as u32;
+                let width = msb - lsb + 1;
+                let mask = ((1u32 << width) - 1) << lsb;
+                if rn == 15 {
+                    // BFC: clear bits
+                    self.regs.r[rd] = self.regs.r[rd] & !mask;
+                } else {
+                    // BFI: insert bits from Rn
+                    self.regs.r[rd] = (self.regs.r[rd] & !mask)
+                        | ((self.regs.r[rn] << lsb) & mask);
+                }
+                1
+            }
+            // USAT — stub
+            0b11000 => self.thumb32_undefined(hw0, hw1),
+            // UBFX
+            0b11100 => {
+                let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
+                let widthm1 = (hw1 & 0x1F) as u32;
+                let width = widthm1 + 1;
+                self.regs.r[rd] = (self.regs.r[rn] >> lsb) & ((1u32 << width) - 1);
+                1
+            }
+            // Undefined
+            _ => self.thumb32_undefined(hw0, hw1),
+        }
     }
 
     // -- Data processing (shifted register) ----------------------------------

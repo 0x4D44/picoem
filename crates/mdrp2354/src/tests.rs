@@ -1237,3 +1237,243 @@ fn orn_w_imm() {
     assert_eq!(c.reg(0), 0xFFFF_FF42);
     assert_eq!(cy, 1);
 }
+
+// ============================================================================
+// Thumb-32: Data Processing (Plain Binary Immediate)
+// ============================================================================
+
+/// Encode MOVW Rd, #imm16.
+/// Format: 11110_i_10_0100_0_imm4  0_imm3_Rd_imm8
+/// imm16 = imm4:i:imm3:imm8
+fn encode_movw(rd: u8, imm16: u16) -> (u16, u16) {
+    let imm4 = (imm16 >> 12) & 0xF;
+    let i = (imm16 >> 11) & 1;
+    let imm3 = (imm16 >> 8) & 0x7;
+    let imm8 = imm16 & 0xFF;
+    let hw0: u16 = 0xF200 | ((0b00100u16) << 4) | (i << 10) | imm4;
+    let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | imm8;
+    (hw0, hw1)
+}
+
+/// Encode MOVT Rd, #imm16.
+/// Format: 11110_i_10_1100_0_imm4  0_imm3_Rd_imm8
+fn encode_movt(rd: u8, imm16: u16) -> (u16, u16) {
+    let imm4 = (imm16 >> 12) & 0xF;
+    let i = (imm16 >> 11) & 1;
+    let imm3 = (imm16 >> 8) & 0x7;
+    let imm8 = imm16 & 0xFF;
+    let hw0: u16 = 0xF200 | ((0b01100u16) << 4) | (i << 10) | imm4;
+    let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | imm8;
+    (hw0, hw1)
+}
+
+/// Encode ADDW Rd, Rn, #imm12 (or ADR when Rn=15).
+/// Format: 11110_i_10_0000_0_Rn  0_imm3_Rd_imm8
+fn encode_addw(rd: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    let i = (imm12 >> 11) & 1;
+    let imm3 = (imm12 >> 8) & 0x7;
+    let imm8 = imm12 & 0xFF;
+    let hw0: u16 = 0xF200 | ((0b00000u16) << 4) | (i << 10) | (rn as u16);
+    let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | imm8;
+    (hw0, hw1)
+}
+
+/// Encode SUBW Rd, Rn, #imm12 (or ADR when Rn=15).
+/// Format: 11110_i_10_1010_0_Rn  0_imm3_Rd_imm8
+fn encode_subw(rd: u8, rn: u8, imm12: u16) -> (u16, u16) {
+    let i = (imm12 >> 11) & 1;
+    let imm3 = (imm12 >> 8) & 0x7;
+    let imm8 = imm12 & 0xFF;
+    let hw0: u16 = 0xF200 | ((0b01010u16) << 4) | (i << 10) | (rn as u16);
+    let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | imm8;
+    (hw0, hw1)
+}
+
+/// Encode BFI Rd, Rn, #lsb, #width (or BFC when Rn=15).
+/// Format: 11110_0_11_0110_0_Rn  0_imm3_Rd_imm2_0_msb[4:0]
+/// op=0b10110, lsb = imm3:imm2, msb = lsb + width - 1
+fn encode_bfi(rd: u8, rn: u8, lsb: u8, width: u8) -> (u16, u16) {
+    let msb = lsb + width - 1;
+    let imm3 = ((lsb >> 2) & 0x7) as u16;
+    let imm2 = (lsb & 0x3) as u16;
+    let hw0: u16 = 0xF200 | ((0b10110u16) << 4) | (rn as u16);
+    let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | (imm2 << 6) | (msb as u16);
+    (hw0, hw1)
+}
+
+/// Encode UBFX Rd, Rn, #lsb, #width.
+/// Format: 11110_0_11_1100_0_Rn  0_imm3_Rd_imm2_0_widthm1[4:0]
+fn encode_ubfx(rd: u8, rn: u8, lsb: u8, width: u8) -> (u16, u16) {
+    let widthm1 = width - 1;
+    let imm3 = ((lsb >> 2) & 0x7) as u16;
+    let imm2 = (lsb & 0x3) as u16;
+    let hw0: u16 = 0xF200 | ((0b11100u16) << 4) | (rn as u16);
+    let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | (imm2 << 6) | (widthm1 as u16);
+    (hw0, hw1)
+}
+
+/// Encode SBFX Rd, Rn, #lsb, #width.
+/// Format: 11110_0_11_0100_0_Rn  0_imm3_Rd_imm2_0_widthm1[4:0]
+fn encode_sbfx(rd: u8, rn: u8, lsb: u8, width: u8) -> (u16, u16) {
+    let widthm1 = width - 1;
+    let imm3 = ((lsb >> 2) & 0x7) as u16;
+    let imm2 = (lsb & 0x3) as u16;
+    let hw0: u16 = 0xF200 | ((0b10100u16) << 4) | (rn as u16);
+    let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | (imm2 << 6) | (widthm1 as u16);
+    (hw0, hw1)
+}
+
+#[test]
+fn movw_basic() {
+    // MOVW R0, #0x1234
+    let mut c = CortexM33::new();
+    let (hw0, hw1) = encode_movw(0, 0x1234);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x1234);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn movw_all_bits() {
+    // MOVW R0, #0xFFFF — all 16 bits set
+    let mut c = CortexM33::new();
+    let (hw0, hw1) = encode_movw(0, 0xFFFF);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x0000_FFFF);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn movt_basic() {
+    // MOVT R0, #0xABCD — set top half, preserve bottom half
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0x0000_5678);
+    let (hw0, hw1) = encode_movt(0, 0xABCD);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xABCD_5678);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn movw_movt_pair() {
+    // Load 0xDEADBEEF via MOVW + MOVT
+    let mut c = CortexM33::new();
+    let (hw0, hw1) = encode_movw(0, 0xBEEF);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x0000_BEEF);
+
+    let (hw0, hw1) = encode_movt(0, 0xDEAD);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xDEAD_BEEF);
+}
+
+#[test]
+fn addw_basic() {
+    // ADDW R0, R1, #4000
+    let mut c = CortexM33::new();
+    c.set_reg(1, 1000);
+    let (hw0, hw1) = encode_addw(0, 1, 4000);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 5000);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn subw_basic() {
+    // SUBW R0, R1, #2000
+    let mut c = CortexM33::new();
+    c.set_reg(1, 5000);
+    let (hw0, hw1) = encode_subw(0, 1, 2000);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 3000);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn adr_add() {
+    // ADR R0, [PC, #100] — ADDW with Rn=15
+    // PC=0x1000, read_pc = 0x1000 + 4 = 0x1004, Align(0x1004, 4) = 0x1004
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    let (hw0, hw1) = encode_addw(0, 15, 100);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // read_pc = current_instr_addr + 4 = 0x1000 + 4 = 0x1004
+    // Align(0x1004, 4) = 0x1004, result = 0x1004 + 100 = 0x1068
+    assert_eq!(c.reg(0), 0x1068);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn adr_sub() {
+    // ADR R0, [PC, #-100] — SUBW with Rn=15
+    let mut c = CortexM33::new();
+    c.regs.set_pc(0x1000);
+    let (hw0, hw1) = encode_subw(0, 15, 100);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // read_pc = 0x1004, Align = 0x1004, result = 0x1004 - 100 = 0x0FA0
+    assert_eq!(c.reg(0), 0x0FA0);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn bfi_basic() {
+    // BFI R0, R1, #4, #8 — insert bits [11:4] from R1 into R0
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0xFFFF_FFFF);
+    c.set_reg(1, 0xAB);       // low 8 bits = 0xAB
+    let (hw0, hw1) = encode_bfi(0, 1, 4, 8);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // mask = 0xFF << 4 = 0xFF0
+    // result = (0xFFFFFFFF & !0xFF0) | ((0xAB << 4) & 0xFF0)
+    //        = 0xFFFFF00F | 0xAB0 = 0xFFFFFABF
+    assert_eq!(c.reg(0), 0xFFFF_FABF);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn bfc_basic() {
+    // BFC R0, #8, #4 — clear bits [11:8] (Rn=15)
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0xFFFF_FFFF);
+    let (hw0, hw1) = encode_bfi(0, 15, 8, 4);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // mask = 0xF << 8 = 0xF00
+    // result = 0xFFFFFFFF & !0xF00 = 0xFFFFF0FF
+    assert_eq!(c.reg(0), 0xFFFF_F0FF);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn ubfx_basic() {
+    // UBFX R0, R1, #4, #8 — extract bits [11:4] unsigned
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xDEAD_BEEF);
+    let (hw0, hw1) = encode_ubfx(0, 1, 4, 8);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // (0xDEADBEEF >> 4) & 0xFF = 0x0DEADBEE & 0xFF = 0xEE
+    assert_eq!(c.reg(0), 0xEE);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn sbfx_positive() {
+    // SBFX R0, R1, #4, #8 — extract bits [11:4] signed, positive value
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_0750); // bits [11:4] = 0x75 = 0b0111_0101 (positive)
+    let (hw0, hw1) = encode_sbfx(0, 1, 4, 8);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x75);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn sbfx_negative() {
+    // SBFX R0, R1, #4, #8 — extract bits [11:4] signed, negative value
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_0F50); // bits [11:4] = 0xF5 = 0b1111_0101 (negative in 8-bit)
+    let (hw0, hw1) = encode_sbfx(0, 1, 4, 8);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // sign_extend(0xF5, 8) = 0xFFFF_FFF5
+    assert_eq!(c.reg(0), 0xFFFF_FFF5);
+    assert_eq!(cy, 1);
+}
