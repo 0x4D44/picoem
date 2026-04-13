@@ -5007,17 +5007,17 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 
     // --- Parallel add/subtract (SADD16, UADD8, QSAX, UHSUB16, ...) ---
     // Valid modifier (par_op2): signed=0b000, Q=0b001, H=0b010, unsigned=0b100, UQ=0b101, UH=0b110.
-    // Valid operation (par_op1): ADD8=0b000, ADD16=0b001, ASX=0b010, SAX=0b011, SUB8=0b100, SUB16=0b101.
-    // Sat/halving modifiers are 16-bit only — par_op1 must then be one of {001,010,011,101}.
+    // Valid operation (par_op1): ADD8=0b000, ADD16=0b001, ASX=0b010, SUB8=0b100, SUB16=0b101, SAX=0b110.
+    // Sat/halving modifiers are 16-bit only — par_op1 must then be one of {001,010,101,110}.
     for i in 0..count {
         let modifiers = [0b000u16, 0b001, 0b010, 0b100, 0b101, 0b110];
         let modifier = modifiers[rng.range(0..modifiers.len())];
         let sixteen_only = matches!(modifier, 0b001 | 0b010 | 0b101 | 0b110);
         let operation: u16 = if sixteen_only {
-            let ops16 = [0b001u16, 0b010, 0b011, 0b101];
+            let ops16 = [0b001u16, 0b010, 0b110, 0b101];
             ops16[rng.range(0..ops16.len())]
         } else {
-            let ops_any = [0b000u16, 0b001, 0b010, 0b011, 0b100, 0b101];
+            let ops_any = [0b000u16, 0b001, 0b010, 0b110, 0b100, 0b101];
             ops_any[rng.range(0..ops_any.len())]
         };
         let rd = rand_reg(rng);
@@ -5417,7 +5417,7 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             opcode: hw0,
             hw1: Some(hw1),
             reg_pre,
-            addr_regs: vec![rn as u8],
+            addr_regs: if reglist & (1 << rn) == 0 { vec![rn as u8] } else { vec![] },
             needs_bus: true,
             mem_pre,
             mem_check,

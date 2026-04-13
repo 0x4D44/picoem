@@ -1582,7 +1582,7 @@ impl CortexM33 {
         match par_op2 {
             // Signed variants
             0b000 => match par_op1 {
-                0b001 | 0b010 | 0b011 | 0b101 => self.parallel_signed_16(rd, a, b, par_op1, false, false),
+                0b001 | 0b010 | 0b110 | 0b101 => self.parallel_signed_16(rd, a, b, par_op1, false, false),
                 0b000 | 0b100 => self.parallel_signed_8(rd, a, b, par_op1),
                 _ => 1,
             },
@@ -1592,7 +1592,7 @@ impl CortexM33 {
             0b010 => self.parallel_signed_16(rd, a, b, par_op1, false, true),
             // Unsigned variants
             0b100 => match par_op1 {
-                0b001 | 0b010 | 0b011 | 0b101 => self.parallel_unsigned_16(rd, a, b, par_op1, false, false),
+                0b001 | 0b010 | 0b110 | 0b101 => self.parallel_unsigned_16(rd, a, b, par_op1, false, false),
                 0b000 | 0b100 => self.parallel_unsigned_8(rd, a, b, par_op1),
                 _ => 1,
             },
@@ -1614,7 +1614,7 @@ impl CortexM33 {
         let (r_lo, r_hi) = match op {
             0b001 => (a_lo + b_lo, a_hi + b_hi),       // ADD16
             0b010 => (a_lo - b_hi, a_hi + b_lo),       // ASX
-            0b011 => (a_lo + b_hi, a_hi - b_lo),       // SAX
+            0b110 => (a_lo + b_hi, a_hi - b_lo),       // SAX
             0b101 => (a_lo - b_lo, a_hi - b_hi),       // SUB16
             _ => return 1,
         };
@@ -1644,26 +1644,38 @@ impl CortexM33 {
         let (r_lo_i, r_hi_i): (i32, i32) = match op {
             0b001 => (a_lo as i32 + b_lo as i32, a_hi as i32 + b_hi as i32),  // ADD16
             0b010 => (a_lo as i32 - b_hi as i32, a_hi as i32 + b_lo as i32),  // ASX
-            0b011 => (a_lo as i32 + b_hi as i32, a_hi as i32 - b_lo as i32),  // SAX
+            0b110 => (a_lo as i32 + b_hi as i32, a_hi as i32 - b_lo as i32),  // SAX
             0b101 => (a_lo as i32 - b_lo as i32, a_hi as i32 - b_hi as i32),  // SUB16
             _ => return 1,
         };
         let (lo, hi) = if sat {
             (
-                (r_lo_i as u32).min(0xFFFF),
-                (r_hi_i as u32).min(0xFFFF),
+                r_lo_i.clamp(0, 0xFFFF) as u32,
+                r_hi_i.clamp(0, 0xFFFF) as u32,
             )
         } else if halving {
             ((r_lo_i as u32) >> 1, (r_hi_i as u32) >> 1)
         } else {
             let mut ge = self.regs.ge_flags();
-            // GE set if no borrow (result >= 0x10000 for add, >= 0 for sub)
+            // GE set if carry (add lane: >= 0x10000) or no borrow (sub lane: >= 0)
             match op {
                 0b001 => {
+                    // ADD16: both lanes are addition
                     if r_lo_i >= 0x10000 { ge |= 0x3; } else { ge &= !0x3; }
                     if r_hi_i >= 0x10000 { ge |= 0xC; } else { ge &= !0xC; }
                 }
+                0b010 => {
+                    // ASX: lo = sub (a_lo - b_hi), hi = add (a_hi + b_lo)
+                    if r_lo_i >= 0 { ge |= 0x3; } else { ge &= !0x3; }
+                    if r_hi_i >= 0x10000 { ge |= 0xC; } else { ge &= !0xC; }
+                }
+                0b110 => {
+                    // SAX: lo = add (a_lo + b_hi), hi = sub (a_hi - b_lo)
+                    if r_lo_i >= 0x10000 { ge |= 0x3; } else { ge &= !0x3; }
+                    if r_hi_i >= 0 { ge |= 0xC; } else { ge &= !0xC; }
+                }
                 _ => {
+                    // SUB16: both lanes are subtraction
                     if r_lo_i >= 0 { ge |= 0x3; } else { ge &= !0x3; }
                     if r_hi_i >= 0 { ge |= 0xC; } else { ge &= !0xC; }
                 }

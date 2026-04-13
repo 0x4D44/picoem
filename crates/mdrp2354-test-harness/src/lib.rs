@@ -4518,7 +4518,7 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                     name: format!("FUZZ:LDM:{i} R{rn}! list={reglist8:#05x}"),
                     opcode,
                     reg_pre: vec![(rn as u8, 0)],
-                    addr_regs: vec![rn as u8],
+                    addr_regs: if reglist8 & (1 << rn) == 0 { vec![rn as u8] } else { vec![] },
                     needs_bus: true,
                     mem_pre,
                     xpsr_pre: rand_flags(rng),
@@ -6293,6 +6293,13 @@ mod tests {
     fn fuzz_mem_tests_have_addr_regs() {
         let (_, mem) = generate_fuzz(20, 555);
         for tc in &mem {
+            // LDM with Rn in the register list intentionally has empty addr_regs
+            // because the load overwrites Rn with a memory word, not a
+            // scratch-relative address.
+            let is_ldm = tc.name.contains("LDM");
+            if is_ldm && tc.addr_regs.is_empty() {
+                continue;
+            }
             assert!(
                 !tc.addr_regs.is_empty(),
                 "fuzz mem test '{}' has empty addr_regs",

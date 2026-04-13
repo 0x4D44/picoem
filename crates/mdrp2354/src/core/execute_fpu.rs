@@ -123,6 +123,66 @@ fn f32_to_u32_rmode(val: f32, rmode: u32) -> u32 {
 }
 
 // ============================================================================
+// NaN canonicalization (ARM FPv5 default NaN rules)
+// ============================================================================
+
+/// ARM default NaN for single precision: positive quiet NaN.
+const ARM_DEFAULT_NAN: u32 = 0x7FC0_0000;
+
+/// Canonicalize NaN result per ARM FPv5 rules.
+/// If the result is NaN:
+///   - If either input was NaN, propagate the first NaN (with quiet bit set)
+///   - Otherwise, return the ARM default NaN (0x7FC00000)
+/// If the result is not NaN, return it unchanged.
+#[inline]
+fn canonicalize_nan(result: f32, a: f32, b: f32) -> f32 {
+    if result.is_nan() {
+        if a.is_nan() {
+            f32::from_bits(a.to_bits() | 0x0040_0000)
+        } else if b.is_nan() {
+            f32::from_bits(b.to_bits() | 0x0040_0000)
+        } else {
+            f32::from_bits(ARM_DEFAULT_NAN)
+        }
+    } else {
+        result
+    }
+}
+
+/// Unary variant for VSQRT and similar single-operand instructions.
+#[inline]
+fn canonicalize_nan_unary(result: f32, a: f32) -> f32 {
+    if result.is_nan() {
+        if a.is_nan() {
+            f32::from_bits(a.to_bits() | 0x0040_0000)
+        } else {
+            f32::from_bits(ARM_DEFAULT_NAN)
+        }
+    } else {
+        result
+    }
+}
+
+/// Ternary variant for MAC operations (VMLA, VMLS, VNMLA, VNMLS, VFMA, etc.)
+/// which have three float inputs: accumulator, Sn, Sm.
+#[inline]
+fn canonicalize_nan3(result: f32, a: f32, b: f32, c: f32) -> f32 {
+    if result.is_nan() {
+        if a.is_nan() {
+            f32::from_bits(a.to_bits() | 0x0040_0000)
+        } else if b.is_nan() {
+            f32::from_bits(b.to_bits() | 0x0040_0000)
+        } else if c.is_nan() {
+            f32::from_bits(c.to_bits() | 0x0040_0000)
+        } else {
+            f32::from_bits(ARM_DEFAULT_NAN)
+        }
+    } else {
+        result
+    }
+}
+
+// ============================================================================
 // Implementation
 // ============================================================================
 
@@ -183,75 +243,88 @@ impl CortexM33 {
         match (op_hi, op_lo, op2_lo) {
             (0, 0b00, 0) => {
                 // VMLA.F32 Sd, Sn, Sm — Sd += Sn*Sm
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = d + self.regs.s[sn] * self.regs.s[sm];
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = d + sn_val * sm_val;
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (0, 0b00, 1) => {
                 // VMLS.F32 Sd, Sn, Sm — Sd -= Sn*Sm
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = d - self.regs.s[sn] * self.regs.s[sm];
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = d - sn_val * sm_val;
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (0, 0b01, 0) => {
                 // VNMLS.F32 Sd, Sn, Sm — Sd = Sn*Sm - Sd
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = self.regs.s[sn] * self.regs.s[sm] - d;
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = sn_val * sm_val - d;
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (0, 0b01, 1) => {
                 // VNMLA.F32 Sd, Sn, Sm — Sd = -(Sn*Sm + Sd)
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = -(self.regs.s[sn] * self.regs.s[sm] + d);
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = -(sn_val * sm_val + d);
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (0, 0b10, 0) => {
                 // VMUL.F32 Sd, Sn, Sm
-                self.regs.s[sd] = self.regs.s[sn] * self.regs.s[sm];
+                let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
+                self.regs.s[sd] = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
                 1
             }
             (0, 0b10, 1) => {
                 // VNMUL.F32 Sd, Sn, Sm — Sd = -(Sn * Sm)
-                self.regs.s[sd] = -(self.regs.s[sn] * self.regs.s[sm]);
+                let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
+                self.regs.s[sd] = canonicalize_nan(-(sn_val * sm_val), sn_val, sm_val);
                 1
             }
             (0, 0b11, 0) => {
                 // VADD.F32 Sd, Sn, Sm
-                self.regs.s[sd] = self.regs.s[sn] + self.regs.s[sm];
+                let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
+                self.regs.s[sd] = canonicalize_nan(sn_val + sm_val, sn_val, sm_val);
                 1
             }
             (0, 0b11, 1) => {
                 // VSUB.F32 Sd, Sn, Sm
-                self.regs.s[sd] = self.regs.s[sn] - self.regs.s[sm];
+                let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
+                self.regs.s[sd] = canonicalize_nan(sn_val - sm_val, sn_val, sm_val);
                 1
             }
             (1, 0b00, 0) => {
                 // VDIV.F32 Sd, Sn, Sm
-                self.regs.s[sd] = self.regs.s[sn] / self.regs.s[sm];
+                let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
+                self.regs.s[sd] = canonicalize_nan(sn_val / sm_val, sn_val, sm_val);
                 14
             }
             (1, 0b01, 0) => {
                 // VFNMS.F32 Sd, Sn, Sm — Sd = Sn*Sm - Sd (fused)
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = self.regs.s[sn].mul_add(self.regs.s[sm], -d);
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = sn_val.mul_add(sm_val, -d);
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b01, 1) => {
                 // VFNMA.F32 Sd, Sn, Sm — Sd = -(Sn*Sm + Sd) (fused)
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = (-self.regs.s[sn]).mul_add(self.regs.s[sm], -d);
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = (-sn_val).mul_add(sm_val, -d);
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b10, 0) => {
                 // VFMA.F32 Sd, Sn, Sm — Sd = Sd + Sn*Sm (fused)
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = self.regs.s[sn].mul_add(self.regs.s[sm], d);
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = sn_val.mul_add(sm_val, d);
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b10, 1) => {
                 // VFMS.F32 Sd, Sn, Sm — Sd = Sd - Sn*Sm (fused)
-                let d = self.regs.s[sd];
-                self.regs.s[sd] = (-self.regs.s[sn]).mul_add(self.regs.s[sm], d);
+                let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
+                let result = (-sn_val).mul_add(sm_val, d);
+                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b11, 0) => {
@@ -300,7 +373,8 @@ impl CortexM33 {
             }
             (0b0001, 1) => {
                 // VSQRT.F32 Sd, Sm
-                self.regs.s[sd] = self.regs.s[sm].sqrt();
+                let sm_val = self.regs.s[sm];
+                self.regs.s[sd] = canonicalize_nan_unary(sm_val.sqrt(), sm_val);
                 14
             }
             (0b0010, 0) => {
