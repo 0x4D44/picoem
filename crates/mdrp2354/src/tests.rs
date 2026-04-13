@@ -5613,3 +5613,94 @@ fn spinlock_st_bitmask_reflects_state() {
     assert_eq!(st, (1 << 0) | (1 << 31),
         "SPINLOCK_ST should reflect lock 3 released, got {:#010x}", st);
 }
+
+// ============================================================================
+// WFE / SEV instruction dispatch
+// ============================================================================
+
+#[test]
+fn wfe_with_event_pending_consumes_and_continues() {
+    let (mut cpu, mut bus) = core_and_bus();
+    bus.event_flag[0] = true;
+    // WFE Thumb-16 encoding: 0xBF20 (hint op = 0x2, mask = 0)
+    cpu.execute_one_with_bus(0xBF20, &mut bus);
+    assert!(!bus.event_flag[0], "event_flag should be consumed");
+    assert!(!cpu.is_wfe_waiting(), "core should NOT be sleeping — event was pending");
+}
+
+#[test]
+fn wfe_without_event_enters_sleep() {
+    let (mut cpu, mut bus) = core_and_bus();
+    assert!(!bus.event_flag[0]);
+    cpu.execute_one_with_bus(0xBF20, &mut bus);
+    assert!(cpu.is_wfe_waiting(), "core should be sleeping — no event was pending");
+}
+
+#[test]
+fn sev_sets_both_event_flags() {
+    let (mut cpu, mut bus) = core_and_bus();
+    assert!(!bus.event_flag[0]);
+    assert!(!bus.event_flag[1]);
+    // SEV Thumb-16 encoding: 0xBF40 (hint op = 0x4, mask = 0)
+    cpu.execute_one_with_bus(0xBF40, &mut bus);
+    assert!(bus.event_flag[0], "event_flag[0] should be set after SEV");
+    assert!(bus.event_flag[1], "event_flag[1] should be set after SEV");
+}
+
+#[test]
+fn wake_check_clears_wfe_on_event() {
+    let mut emu = Emulator::new(Config::default());
+
+    // Build a minimal ROM so reset() doesn't read garbage
+    let mut rom = vec![0u8; 512];
+    rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes());
+    rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
+    // Infinite loop at 0x100
+    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    emu.load_bootrom(&rom);
+    emu.reset();
+
+    // Manually put core 0 into WFE sleep and set its event flag
+    emu.cores[0].wfe_waiting = true;
+    emu.bus.event_flag[0] = true;
+
+    emu.step();
+
+    assert!(!emu.cores[0].wfe_waiting, "core should have been woken by event_flag");
+    assert!(!emu.bus.event_flag[0], "event_flag should have been consumed");
+}
+
+// ============================================================================
+// Phase 5 B2: Core 1 boot reaches WFE
+// ============================================================================
+
+#[test]
+fn test_core1_boot_reaches_wfe() {
+    use crate::{Emulator, Config};
+
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../roms");
+    let rom = std::fs::read(base.join("bootrom-combined.bin"))
+        .expect("bootrom-combined.bin not found");
+
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&rom);
+    emu.reset();
+
+    for _ in 0..1_000_000 {
+        emu.step();
+        // Early exit once Core 1 enters WFE sleep
+        if emu.cores[1].is_wfe_waiting() {
+            break;
+        }
+    }
+
+    assert!(emu.cores[1].is_wfe_waiting(),
+        "Core 1 should be sleeping in WFE after bootrom init (PC={:#010x})",
+        emu.cores[1].regs.pc());
+    assert_eq!(emu.cores[1].regs.ipsr(), 0,
+        "Core 1 should not be in an exception handler (IPSR={})",
+        emu.cores[1].regs.ipsr());
+    assert!(emu.cores[1].regs.pc() < 0x8000,
+        "Core 1 PC should be in bootrom range (PC={:#010x})",
+        emu.cores[1].regs.pc());
+}

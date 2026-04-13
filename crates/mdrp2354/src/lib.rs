@@ -134,6 +134,15 @@ impl Emulator {
         self.cores[0].step(&mut self.bus);
         self.bus.begin_contention_check();
         self.cores[1].step(&mut self.bus);
+
+        // WFE/SEV wake check
+        for i in 0..2 {
+            if self.cores[i].wfe_waiting && self.bus.event_flag[i] {
+                self.bus.event_flag[i] = false;
+                self.cores[i].wfe_waiting = false;
+            }
+        }
+
         self.bus.sio.tick_mtime();
         self.clock.cycles
     }

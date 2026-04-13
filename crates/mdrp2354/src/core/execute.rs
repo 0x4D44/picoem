@@ -729,8 +729,14 @@ impl CortexM33 {
                     1
                 } else {
                     // Hints: NOP, YIELD, WFE, WFI, SEV
-                    // All are NOPs for Phase 1
-                    1
+                    let hint_op = (opcode >> 4) & 0xF;
+                    match hint_op {
+                        0x0 | 0x1 => 1,                       // NOP, YIELD
+                        0x2 => self.wfe(bus),                  // WFE
+                        0x3 => 1,                              // WFI (NOP)
+                        0x4 => { bus.signal_sev(); 1 },        // SEV
+                        _ => 1,                                // Reserved
+                    }
                 }
             }
             // CBZ/CBNZ: bits[11:8] matches x0x1 pattern

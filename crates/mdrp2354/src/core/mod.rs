@@ -37,6 +37,8 @@ pub struct CortexM33 {
     pub(crate) secure: bool,
     /// Core is halted — will not execute until explicitly woken.
     halted: bool,
+    /// Core is sleeping on WFE — will resume when event_flag is set.
+    pub(crate) wfe_waiting: bool,
 }
 
 impl CortexM33 {
@@ -55,11 +57,15 @@ impl CortexM33 {
             dcp_data: [0; 2],
             secure: true,
             halted: false,
+            wfe_waiting: false,
         }
     }
 
     /// Advance the core by one system clock cycle.
     pub fn step(&mut self, bus: &mut Bus) {
+        if self.wfe_waiting {
+            return;
+        }
         if self.halted {
             return;
         }
@@ -156,6 +162,24 @@ impl CortexM33 {
     /// Returns `true` if the core is halted.
     pub fn is_halted(&self) -> bool {
         self.halted
+    }
+
+    /// Returns `true` if the core is sleeping on WFE.
+    pub fn is_wfe_waiting(&self) -> bool {
+        self.wfe_waiting
+    }
+
+    /// Execute WFE hint. If event_flag is pending, consume it and continue.
+    /// Otherwise, enter WFE sleep.
+    pub(crate) fn wfe(&mut self, bus: &mut Bus) -> u32 {
+        let core = bus.active_core();
+        if bus.event_flag[core] {
+            bus.event_flag[core] = false;
+            1 // event was pending, consume it, no sleep
+        } else {
+            self.wfe_waiting = true;
+            1
+        }
     }
 
     // --- Test / debug accessors ---

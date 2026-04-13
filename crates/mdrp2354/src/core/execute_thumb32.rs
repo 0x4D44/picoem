@@ -775,7 +775,7 @@ impl CortexM33 {
 
     // -- Branches and miscellaneous control ----------------------------------
 
-    pub(crate) fn thumb32_branch_misc(&mut self, hw0: u16, hw1: u16, _bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_branch_misc(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         // Sub-dispatch per LLD Section 5.7
         if hw1 & (1 << 14) != 0 {
             // hw1[14] = 1 -> BL
@@ -791,7 +791,7 @@ impl CortexM33 {
                 self.thumb32_b_w_cond(hw0, hw1)
             } else {
                 // hw0[9:6] == 0b111x -> miscellaneous control
-                self.thumb32_misc_control(hw0, hw1)
+                self.thumb32_misc_control(hw0, hw1, bus)
             }
         }
     }
@@ -842,16 +842,16 @@ impl CortexM33 {
 
     // -- Miscellaneous control (MSR, MRS, hints, barriers) ----------------------
 
-    fn thumb32_misc_control(&mut self, hw0: u16, hw1: u16) -> u32 {
+    fn thumb32_misc_control(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         // Hints: hw0 = 0xF3AF
         if hw0 == 0xF3AF {
             let hint = hw1 & 0xFF;
             return match hint {
-                0x00 => 1, // NOP.W
-                0x01 => 1, // YIELD.W
-                0x02 => 1, // WFE.W
-                0x03 => 1, // WFI.W
-                0x04 => 1, // SEV.W
+                0x00 => 1,                              // NOP.W
+                0x01 => 1,                              // YIELD.W
+                0x02 => self.wfe(bus),                   // WFE.W
+                0x03 => 1,                              // WFI.W
+                0x04 => { bus.signal_sev(); 1 },         // SEV.W
                 _ => self.thumb32_undefined(hw0, hw1),
             };
         }
