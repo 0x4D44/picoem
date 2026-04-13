@@ -106,16 +106,9 @@ impl CortexM33 {
         self.stall_cycles
     }
 
-    /// Transition from Secure to Non-Secure state.
-    /// Swaps all banked register pairs so the active set reflects NS state.
-    pub(crate) fn transition_to_nonsecure(&mut self) {
-        debug_assert!(self.secure);
-        self.secure = false;
-
-        // Flush R13 to the correct banked SP before swapping.
+    /// Swap all banked register pairs between Secure and Non-Secure.
+    fn swap_security_banks(&mut self) {
         self.regs.sync_sp_to_banked();
-
-        // Swap all banked pairs.
         std::mem::swap(&mut self.regs.msp, &mut self.regs.msp_ns);
         std::mem::swap(&mut self.regs.psp, &mut self.regs.psp_ns);
         std::mem::swap(&mut self.regs.msplim, &mut self.regs.msplim_ns);
@@ -124,9 +117,23 @@ impl CortexM33 {
         std::mem::swap(&mut self.regs.basepri, &mut self.regs.basepri_ns);
         std::mem::swap(&mut self.regs.faultmask, &mut self.regs.faultmask_ns);
         std::mem::swap(&mut self.regs.control, &mut self.regs.control_ns);
-
-        // Load R13 from the now-active SP.
         self.regs.sync_sp_from_banked();
+    }
+
+    /// Transition from Secure to Non-Secure state.
+    /// Swaps all banked register pairs so the active set reflects NS state.
+    pub(crate) fn transition_to_nonsecure(&mut self) {
+        debug_assert!(self.secure);
+        self.secure = false;
+        self.swap_security_banks();
+    }
+
+    /// Transition from Non-Secure to Secure state (SG instruction).
+    /// Swaps all banked register pairs so the active set reflects S state.
+    pub(crate) fn transition_to_secure(&mut self) {
+        debug_assert!(!self.secure);
+        self.secure = true;
+        self.swap_security_banks();
     }
 
     /// Halt the core indefinitely (stall for u32::MAX cycles).

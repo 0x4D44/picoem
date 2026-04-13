@@ -46,6 +46,18 @@ pub struct Bus {
     /// 16 KB XIP SRAM at 0x1C00_0000..0x1C00_3FFF.
     /// RP2350 XIP cache memory accessible as SRAM.
     xip_sram: Box<[u8; 16384]>,
+    /// QMI register backing store (offsets 0x000..0x06C, 28 words).
+    qmi_regs: [u32; 28],
+    /// CLK_REF_CTRL register (CLOCKS offset 0x030).
+    clk_ref_ctrl: u32,
+    /// CLK_SYS_CTRL register (CLOCKS offset 0x060).
+    clk_sys_ctrl: u32,
+    /// SIO GPIO output register (offset 0x010).
+    pub gpio_out: u32,
+    /// SIO GPIO output enable register (offset 0x024).
+    pub gpio_oe: u32,
+    /// SIO GPIO input register (offset 0x004, always 0 — no external pin model).
+    pub gpio_in: u32,
 }
 
 impl Bus {
@@ -65,6 +77,12 @@ impl Bus {
             burst_mode: false,
             boot_ram: Box::new([0u8; 4096]),
             xip_sram: Box::new([0u8; 16384]),
+            qmi_regs: [0u32; 28],
+            clk_ref_ctrl: 0,
+            clk_sys_ctrl: 0,
+            gpio_out: 0,
+            gpio_oe: 0,
+            gpio_in: 0,
         }
     }
 
@@ -364,7 +382,15 @@ impl Bus {
                 let byte_idx = (canonical & 3) as usize;
                 word.to_le_bytes()[byte_idx]
             }
-            0xD => 0, // SIO (stub)
+            0xD => {
+                let sio_offset = addr & 0x0FFF_FFFF;
+                match sio_offset {
+                    0x004 => self.gpio_in.to_le_bytes()[(addr & 3) as usize],
+                    0x010 => self.gpio_out.to_le_bytes()[(addr & 3) as usize],
+                    0x024 => self.gpio_oe.to_le_bytes()[(addr & 3) as usize],
+                    _ => 0,
+                }
+            }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read8(addr),
             0xE => 0, // PPB (stub)
             _ => {
@@ -413,8 +439,28 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 | 0x400D_0000 => {
-                        // SYSINFO (read-only), CLOCKS, XOSC, PLL: ignore writes
+                    0x4000_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
+                        // SYSINFO (read-only), XOSC, PLL: ignore byte writes
+                    }
+                    0x400D_0000 => {
+                        // QMI: do RMW on the word
+                        let word_addr = canonical & !3;
+                        let byte_idx = (canonical & 3) as usize;
+                        let reg_offset = word_addr & 0x0000_0FFF;
+                        let old_word = self.qmi_read(reg_offset);
+                        let mut bytes = old_word.to_le_bytes();
+                        bytes[byte_idx] = val;
+                        self.qmi_write(reg_offset, u32::from_le_bytes(bytes));
+                    }
+                    0x4001_0000 => {
+                        // CLOCKS: do RMW on the word
+                        let word_addr = canonical & !3;
+                        let byte_idx = (canonical & 3) as usize;
+                        let reg_offset = word_addr & 0x0000_0FFF;
+                        let old_word = self.clocks_read(reg_offset);
+                        let mut bytes = old_word.to_le_bytes();
+                        bytes[byte_idx] = val;
+                        self.clocks_write(reg_offset, u32::from_le_bytes(bytes));
                     }
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore byte
@@ -490,7 +536,18 @@ impl Bus {
                 let halves: [u16; 2] = [word as u16, (word >> 16) as u16];
                 halves[half_idx]
             }
-            0xD => 0, // SIO (stub)
+            0xD => {
+                let sio_offset = addr & 0x0FFF_FFFF;
+                let word = match sio_offset & !3 {
+                    0x000 => self.active_core() as u32,
+                    0x004 => self.gpio_in,
+                    0x010 => self.gpio_out,
+                    0x024 => self.gpio_oe,
+                    _ => 0,
+                };
+                let half_idx = ((addr >> 1) & 1) as usize;
+                [word as u16, (word >> 16) as u16][half_idx]
+            }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read16(addr),
             0xE => {
                 // PPB: extract halfword from 32-bit register read
@@ -544,8 +601,28 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4001_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 | 0x400D_0000 => {
-                        // SYSINFO (read-only), CLOCKS, XOSC, PLL: ignore writes
+                    0x4000_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
+                        // SYSINFO (read-only), XOSC, PLL: ignore halfword writes
+                    }
+                    0x400D_0000 => {
+                        // QMI: do RMW on the word
+                        let word_addr = canonical & !3;
+                        let half_idx = ((canonical >> 1) & 1) as usize;
+                        let reg_offset = word_addr & 0x0000_0FFF;
+                        let old_word = self.qmi_read(reg_offset);
+                        let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
+                        halves[half_idx] = val;
+                        self.qmi_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
+                    }
+                    0x4001_0000 => {
+                        // CLOCKS: do RMW on the word
+                        let word_addr = canonical & !3;
+                        let half_idx = ((canonical >> 1) & 1) as usize;
+                        let reg_offset = word_addr & 0x0000_0FFF;
+                        let old_word = self.clocks_read(reg_offset);
+                        let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
+                        halves[half_idx] = val;
+                        self.clocks_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
                     }
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore halfword
@@ -618,7 +695,16 @@ impl Bus {
                     _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
                 }
             }
-            0xD => 0, // SIO (stub)
+            0xD => {
+                let sio_offset = addr & 0x0FFF_FFFF;
+                match sio_offset {
+                    0x000 => self.active_core() as u32, // CPUID
+                    0x004 => self.gpio_in,
+                    0x010 => self.gpio_out,
+                    0x024 => self.gpio_oe,
+                    _ => 0,
+                }
+            }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
             0xE => self.ppb[self.active_core()].read32(addr),
             _ => {
@@ -669,8 +755,10 @@ impl Bus {
                 let offset = canonical & 0x0000_0FFF;
                 match base {
                     0x4002_0000 => self.resets_write(offset, val, alias),
-                    0x4001_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 | 0x400D_0000 => {
-                        // CLOCKS, XOSC, PLL: accept writes, ignore
+                    0x400D_0000 => self.qmi_write(offset, val),
+                    0x4001_0000 => self.clocks_write(offset, val),
+                    0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
+                        // XOSC, PLL: accept writes, ignore
                     }
                     // SYSINFO (0x4000_0000): read-only, ignore writes
                     0x4000_0000 => {}
@@ -686,6 +774,20 @@ impl Bus {
                         };
                         self.peripheral_regs.insert(canonical, new_val);
                     }
+                }
+            }
+            0xD => {
+                let sio_offset = addr & 0x0FFF_FFFF;
+                match sio_offset {
+                    0x010 => self.gpio_out = val,
+                    0x014 => self.gpio_out |= val,   // SET
+                    0x018 => self.gpio_out &= !val,   // CLR
+                    0x01C => self.gpio_out ^= val,    // XOR
+                    0x024 => self.gpio_oe = val,
+                    0x028 => self.gpio_oe |= val,     // SET
+                    0x02C => self.gpio_oe &= !val,    // CLR
+                    0x030 => self.gpio_oe ^= val,     // XOR
+                    _ => {}
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),

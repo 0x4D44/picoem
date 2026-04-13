@@ -11,6 +11,8 @@ pub use self::memory::Memory;
 pub use self::clock::Clock;
 pub use self::sio::Sio;
 pub use self::pacer::{PacerStats, PacerSnapshot};
+#[cfg(target_arch = "x86_64")]
+pub use self::pacer::Pacer;
 
 /// Trait for memory-mapped peripherals. Implemented by crates like
 /// `mdrp2354-periph`. The core crate defines the interface only.

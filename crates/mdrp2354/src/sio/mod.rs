@@ -1,5 +1,6 @@
-/// Single-cycle IO block — stub for Phase 1.
+/// Single-cycle IO block.
 ///
+/// GPIO output/OE/input registers are on Bus (region 0xD dispatch).
 /// Phase 5 adds spinlocks, FIFOs, doorbells, divider, interpolators.
 pub struct Sio {
     /// 32 hardware spinlocks.

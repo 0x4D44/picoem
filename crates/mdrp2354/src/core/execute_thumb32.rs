@@ -261,7 +261,7 @@ impl CortexM33 {
                 } else {
                     self.regs.r[rd] = self.regs.r[rn].wrapping_add(imm12);
                 }
-                1
+                1 // M33 measured: 1 cycle
             }
             // MOVW
             0b00100 => {
@@ -270,7 +270,7 @@ impl CortexM33 {
                     | (((hw1 >> 12) as u32 & 0x7) << 8)
                     | (hw1 as u32 & 0xFF);
                 self.regs.r[rd] = imm16;
-                1
+                1 // M33 measured: 1 cycle
             }
             // SUBW / ADR (sub variant)
             0b01010 => {
@@ -281,7 +281,7 @@ impl CortexM33 {
                 } else {
                     self.regs.r[rd] = self.regs.r[rn].wrapping_sub(imm12);
                 }
-                1
+                1 // M33 measured: 1 cycle
             }
             // MOVT
             0b01100 => {
@@ -290,7 +290,7 @@ impl CortexM33 {
                     | (((hw1 >> 12) as u32 & 0x7) << 8)
                     | (hw1 as u32 & 0xFF);
                 self.regs.r[rd] = (self.regs.r[rd] & 0xFFFF) | (imm16 << 16);
-                1
+                1 // M33 measured: 1 cycle
             }
             // SSAT — signed saturate (LSL: op=0b10000, ASR: op=0b10010)
             0b10000 | 0b10010 => {
@@ -312,7 +312,7 @@ impl CortexM33 {
                     shifted
                 };
                 self.regs.r[rd] = result;
-                1
+                1 // M33 measured: 1 cycle
             }
             // SBFX
             0b10100 => {
@@ -321,7 +321,7 @@ impl CortexM33 {
                 let width = widthm1 + 1;
                 let val = (self.regs.r[rn] >> lsb) & ((1u32 << width) - 1);
                 self.regs.r[rd] = sign_extend(val, width);
-                1
+                1 // M33 measured: 1 cycle
             }
             // BFI / BFC
             0b10110 => {
@@ -337,7 +337,7 @@ impl CortexM33 {
                     self.regs.r[rd] = (self.regs.r[rd] & !mask)
                         | ((self.regs.r[rn] << lsb) & mask);
                 }
-                1
+                1 // M33 measured: 1 cycle
             }
             // USAT — unsigned saturate (LSL: op=0b11000, ASR: op=0b11010)
             0b11000 | 0b11010 => {
@@ -358,7 +358,7 @@ impl CortexM33 {
                     shifted
                 };
                 self.regs.r[rd] = result;
-                1
+                1 // M33 measured: 1 cycle
             }
             // UBFX
             0b11100 => {
@@ -366,7 +366,7 @@ impl CortexM33 {
                 let widthm1 = (hw1 & 0x1F) as u32;
                 let width = widthm1 + 1;
                 self.regs.r[rd] = (self.regs.r[rn] >> lsb) & ((1u32 << width) - 1);
-                1
+                1 // M33 measured: 1 cycle
             }
             // Undefined
             _ => self.thumb32_undefined(hw0, hw1),
@@ -401,7 +401,7 @@ impl CortexM33 {
                         self.regs.set_flag_c(shift_carry);
                     }
                 }
-                1
+                1 // M33: 1 cycle
             }
             // BIC
             0b0001 => {
@@ -411,7 +411,7 @@ impl CortexM33 {
                     self.regs.set_nz(result);
                     self.regs.set_flag_c(shift_carry);
                 }
-                1
+                1 // M33: 1 cycle
             }
             // ORR / MOV (Rn=15)
             0b0010 => {
@@ -425,7 +425,7 @@ impl CortexM33 {
                     self.regs.set_nz(result);
                     self.regs.set_flag_c(shift_carry);
                 }
-                1
+                1 // M33: 1 cycle
             }
             // ORN / MVN (Rn=15)
             0b0011 => {
@@ -439,7 +439,7 @@ impl CortexM33 {
                     self.regs.set_nz(result);
                     self.regs.set_flag_c(shift_carry);
                 }
-                1
+                1 // M33: 1 cycle
             }
             // EOR / TEQ
             0b0100 => {
@@ -454,7 +454,7 @@ impl CortexM33 {
                         self.regs.set_flag_c(shift_carry);
                     }
                 }
-                1
+                1 // M33: 1 cycle
             }
             // ADD / CMN
             0b1000 => {
@@ -467,7 +467,7 @@ impl CortexM33 {
                         self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                     }
                 }
-                1
+                1 // M33: 1 cycle
             }
             // ADC
             0b1010 => {
@@ -477,7 +477,7 @@ impl CortexM33 {
                 if s {
                     self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
-                1
+                1 // M33: 1 cycle
             }
             // SBC
             0b1011 => {
@@ -487,7 +487,7 @@ impl CortexM33 {
                 if s {
                     self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
-                1
+                1 // M33: 1 cycle
             }
             // SUB / CMP
             0b1101 => {
@@ -500,7 +500,7 @@ impl CortexM33 {
                         self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                     }
                 }
-                1
+                1 // M33: 1 cycle
             }
             // RSB
             0b1110 => {
@@ -509,7 +509,7 @@ impl CortexM33 {
                 if s {
                     self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
-                1
+                1 // M33: 1 cycle
             }
             _ => self.thumb32_undefined(hw0, hw1),
         }
@@ -571,7 +571,7 @@ impl CortexM33 {
     }
 
     /// Perform a single load/store memory access by size and sign.
-    /// Returns cycle count: load=3, store=2, undefined=1 (M33 measured).
+    /// Returns cycle count: load=2, store=2, undefined=1 (M33 measured).
     #[inline(always)]
     fn thumb32_ls_single_access(
         &mut self, size: u8, sign: bool, load: bool,
@@ -611,7 +611,7 @@ impl CortexM33 {
             }
             _ => return 1, // undefined: signed word or size=11
         }
-        if load { 3 } else { 2 } // M33 measured: load=3, store=2 cycles
+        if load { 2 } else { 2 } // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
     // -- Load/store multiple -------------------------------------------------
@@ -631,12 +631,14 @@ impl CortexM33 {
             _ => return self.thumb32_undefined(hw0, hw1),
         };
 
+        bus.set_burst_mode();
         for i in 0..16 {
             if reglist & (1 << i) != 0 {
                 if load {
                     let val = bus.read32(addr);
                     if i == 15 {
                         if Self::is_exc_return(val) {
+                            bus.clear_burst_mode();
                             return self.exit_exception(val, bus);
                         }
                         self.regs.set_pc(val & !1);
@@ -649,6 +651,7 @@ impl CortexM33 {
                 addr = addr.wrapping_add(4);
             }
         }
+        bus.clear_burst_mode();
 
         // Writeback: if W set AND (for loads) Rn is NOT in reglist
         if w && (!load || reglist & (1 << rn) == 0) {
@@ -659,7 +662,7 @@ impl CortexM33 {
             };
         }
 
-        // Cost: 1 + count, plus 3 extra if PC was loaded
+        // Cost: 1 + N, plus 3 extra if PC was loaded
         let pc_loaded = load && reglist & (1 << 15) != 0;
         1 + count + if pc_loaded { 3 } else { 0 }
     }
@@ -667,6 +670,20 @@ impl CortexM33 {
     // -- Load/store dual, exclusive, table branch ----------------------------
 
     pub(crate) fn thumb32_load_store_dual(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        // SG (Secure Gateway): encoding 0xE97F_E97F.
+        // When executed from Non-Secure state, transitions to Secure and clears
+        // LR bit 0 to mark the return address as Non-Secure.
+        if hw0 == 0xE97F && hw1 == 0xE97F {
+            if !self.secure {
+                self.transition_to_secure();
+                // Clear bit 0 of LR to mark return address as NS.
+                let lr = self.regs.lr() & !1;
+                self.regs.set_lr(lr);
+            }
+            // In Secure state, SG is a NOP.
+            return 1;
+        }
+
         // TBB/TBH: hw0 = 1110_1000_1101_Rn (hw0[7:4]=1101), hw1[15:12]=1111, hw1[7:5]=000
         if hw0 & 0xFFF0 == 0xE8D0 && (hw1 >> 12) & 0xF == 0xF && (hw1 >> 5) & 0x7 == 0 {
             let rn = (hw0 & 0xF) as usize;
@@ -745,7 +762,7 @@ impl CortexM33 {
             self.regs.r[rn] = offset_addr;
         }
 
-        3 // 1+2 for both load and store
+        4 // M33 measured: 4 cycles (two word transfers)
     }
 
     // -- Branches and miscellaneous control ----------------------------------
@@ -788,7 +805,7 @@ impl CortexM33 {
         if self.regs.condition_passed(cond) {
             let target = self.read_pc().wrapping_add(offset);
             self.regs.set_pc(target);
-            2
+            1 // M33 measured: 1 cycle
         } else {
             1
         }
@@ -812,7 +829,7 @@ impl CortexM33 {
 
         let target = self.read_pc().wrapping_add(offset);
         self.regs.set_pc(target);
-        2
+        1 // M33 measured: 1 cycle
     }
 
     // -- Miscellaneous control (MSR, MRS, hints, barriers) ----------------------
@@ -921,9 +938,19 @@ impl CortexM33 {
                 self.regs.control = val & 0x7;
                 self.regs.sync_sp_from_banked();
             }
+            // --- Non-Secure banked registers (ARMv8-M, SYSm bit 7 = NS) ---
+            // Accessible from Secure state; we treat everything as Secure.
+            0x88 => self.regs.msp_ns = val,            // MSP_NS
+            0x89 => self.regs.psp_ns = val,            // PSP_NS
+            0x8A => self.regs.msplim_ns = val & !0x7,  // MSPLIM_NS
+            0x8B => self.regs.psplim_ns = val & !0x7,  // PSPLIM_NS
+            0x90 => self.regs.primask_ns = val & 1,     // PRIMASK_NS
+            0x91 => self.regs.basepri_ns = val & 0xFF,  // BASEPRI_NS
+            0x93 => self.regs.faultmask_ns = val & 1,   // FAULTMASK_NS
+            0x94 => self.regs.control_ns = val & 0x7,   // CONTROL_NS
             _ => {} // reserved — ignore
         }
-        2
+        1 // M33 measured: 1 cycle
     }
 
     /// MRS — read a special system register into a general-purpose register.
@@ -957,10 +984,19 @@ impl CortexM33 {
             19 => self.regs.faultmask & 1,
             // CONTROL
             20 => self.regs.control & 0x7,
+            // --- Non-Secure banked registers (ARMv8-M, SYSm bit 7 = NS) ---
+            0x88 => self.regs.msp_ns,
+            0x89 => self.regs.psp_ns,
+            0x8A => self.regs.msplim_ns,
+            0x8B => self.regs.psplim_ns,
+            0x90 => self.regs.primask_ns & 1,
+            0x91 => self.regs.basepri_ns & 0xFF,
+            0x93 => self.regs.faultmask_ns & 1,
+            0x94 => self.regs.control_ns & 0x7,
             // Reserved
             _ => 0,
         };
-        2
+        1 // M33 measured: 1 cycle
     }
 
     // -- Multiply (32-bit result) --------------------------------------------
@@ -1130,7 +1166,7 @@ impl CortexM33 {
             }
             _ => return self.thumb32_undefined(hw0, hw1),
         }
-        1 // all 1 cycle
+        1 // M33: 1 cycle
     }
 
     // -- Long multiply / divide (64-bit result) ------------------------------
@@ -1149,14 +1185,14 @@ impl CortexM33 {
                 let result = (self.regs.r[rn] as i32 as i64) * (self.regs.r[rm] as i32 as i64);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             (0b010, 0b0000) => {
                 // UMULL
                 let result = (self.regs.r[rn] as u64) * (self.regs.r[rm] as u64);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             (0b100, 0b0000) => {
                 // SMLAL
@@ -1165,7 +1201,7 @@ impl CortexM33 {
                 let result = (acc as i64).wrapping_add(product);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             (0b110, 0b0000) => {
                 // UMLAL
@@ -1174,21 +1210,21 @@ impl CortexM33 {
                 let result = acc.wrapping_add(product);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             (0b001, 0b1111) => {
                 // SDIV
                 let a = self.regs.r[rn] as i32;
                 let b = self.regs.r[rm] as i32;
                 self.regs.r[rd_hi] = if b == 0 { 0 } else { a.wrapping_div(b) as u32 };
-                4 // placeholder
+                5 // M33 measured: 1-12 cycles (data-dependent), using 5 as average
             }
             (0b011, 0b1111) => {
                 // UDIV
                 let a = self.regs.r[rn];
                 let b = self.regs.r[rm];
                 self.regs.r[rd_hi] = if b == 0 { 0 } else { a / b };
-                4 // placeholder
+                5 // M33 measured: 1-12 cycles (data-dependent), using 5 as average
             }
             // SMLALBB/BT/TB/TT: op1=100, op2=10xx
             (0b100, 0b1000..=0b1011) => {
@@ -1209,7 +1245,7 @@ impl CortexM33 {
                 let result = (acc as i64).wrapping_add(product);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             // SMLALD/SMLALDX: op1=100, op2=1100/1101
             (0b100, 0b1100 | 0b1101) => {
@@ -1227,7 +1263,7 @@ impl CortexM33 {
                 let result = (acc as i64).wrapping_add(p1).wrapping_add(p2);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             // SMLSLD/SMLSLDX: op1=101, op2=1100/1101
             (0b101, 0b1100 | 0b1101) => {
@@ -1245,7 +1281,7 @@ impl CortexM33 {
                 let result = (acc as i64).wrapping_add(p1).wrapping_sub(p2);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             // UMAAL: op1=110, op2=0110
             (0b110, 0b0110) => {
@@ -1255,7 +1291,7 @@ impl CortexM33 {
                     .wrapping_add(self.regs.r[rd_hi] as u64);
                 self.regs.r[rd_lo] = result as u32;
                 self.regs.r[rd_hi] = (result >> 32) as u32;
-                1
+                1 // M33: 1 cycle
             }
             _ => return self.thumb32_undefined(hw0, hw1),
         }
@@ -1285,27 +1321,27 @@ impl CortexM33 {
                 match (op1_lo, op2_lo) {
                     (0b00, 0b00) => {
                         self.regs.r[rd] = val.swap_bytes();
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b00, 0b01) => {
                         let lo = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8);
                         let hi = ((val & 0x00FF_0000) << 8) | ((val & 0xFF00_0000) >> 8);
                         self.regs.r[rd] = hi | lo;
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b00, 0b10) => {
                         self.regs.r[rd] = val.reverse_bits();
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b00, 0b11) => {
                         let lo_hw = val as u16;
                         let swapped = ((lo_hw & 0xFF) << 8) | ((lo_hw >> 8) & 0xFF);
                         self.regs.r[rd] = swapped as i16 as i32 as u32;
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b01, 0b00) => {
                         self.regs.r[rd] = val.leading_zeros();
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     _ => self.thumb32_undefined(hw0, hw1),
                 }
@@ -1328,7 +1364,7 @@ impl CortexM33 {
                         let (result, overflow) = a.overflowing_add(b);
                         if overflow { self.regs.set_flag_q(); }
                         self.regs.r[rd] = saturate(result, overflow) as u32;
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b00, 0b01) => {
                         // QDADD: Rd = saturate(Rm + saturate(2*Rn))
@@ -1340,7 +1376,7 @@ impl CortexM33 {
                         let (result, ov2) = rm_val.overflowing_add(doubled);
                         if ov2 { self.regs.set_flag_q(); }
                         self.regs.r[rd] = saturate(result, ov2) as u32;
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b00, 0b10) => {
                         // QSUB: Rd = saturate(Rm - Rn)
@@ -1349,7 +1385,7 @@ impl CortexM33 {
                         let (result, overflow) = a.overflowing_sub(b);
                         if overflow { self.regs.set_flag_q(); }
                         self.regs.r[rd] = saturate(result, overflow) as u32;
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b00, 0b11) => {
                         // QDSUB: Rd = saturate(Rm - saturate(2*Rn))
@@ -1361,7 +1397,7 @@ impl CortexM33 {
                         let (result, ov2) = rm_val.overflowing_sub(doubled);
                         if ov2 { self.regs.set_flag_q(); }
                         self.regs.r[rd] = saturate(result, ov2) as u32;
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     (0b01, 0b00) => {
                         // SEL: select bytes based on GE flags
@@ -1378,7 +1414,7 @@ impl CortexM33 {
                             }
                         }
                         self.regs.r[rd] = result;
-                        1
+                        1 // M33 measured: 1 cycle
                     }
                     _ => self.thumb32_undefined(hw0, hw1),
                 }
@@ -1439,7 +1475,7 @@ impl CortexM33 {
                 };
                 self.regs.r[rd] = result;
             }
-            1
+            1 // M33 measured: 1 cycle
         } else {
             // -- Wide shifts by register (hw0[7]=0, hw1[7:4]=0000) --------------
             // hw0 = 1111_1010_0_stype_S_Rn, hw1 = 1111_Rd_0000_Rm
@@ -1506,7 +1542,7 @@ impl CortexM33 {
                 self.regs.set_nz(result);
                 self.regs.set_flag_c(carry);
             }
-            1
+            1 // M33 measured: 1 cycle
         }
     }
 
@@ -1570,7 +1606,7 @@ impl CortexM33 {
             (r_lo, r_hi)
         };
         self.regs.r[rd] = (lo as u16 as u32) | ((hi as u16 as u32) << 16);
-        1
+        1 // M33 measured: 1 cycle
     }
 
     fn parallel_unsigned_16(
@@ -1612,7 +1648,7 @@ impl CortexM33 {
             (r_lo_i as u32, r_hi_i as u32)
         };
         self.regs.r[rd] = (lo as u16 as u32) | ((hi as u16 as u32) << 16);
-        1
+        1 // M33 measured: 1 cycle
     }
 
     fn parallel_signed_8(&mut self, rd: usize, a: u32, b: u32, op: u8) -> u32 {
@@ -1631,7 +1667,7 @@ impl CortexM33 {
         }
         self.regs.set_ge_flags(ge);
         self.regs.r[rd] = result;
-        1
+        1 // M33 measured: 1 cycle
     }
 
     fn parallel_unsigned_8(&mut self, rd: usize, a: u32, b: u32, op: u8) -> u32 {
@@ -1653,7 +1689,7 @@ impl CortexM33 {
         }
         self.regs.set_ge_flags(ge);
         self.regs.r[rd] = result;
-        1
+        1 // M33 measured: 1 cycle
     }
 
     // -- BL (branch with link) -----------------------------------------------
@@ -1680,7 +1716,7 @@ impl CortexM33 {
         // PC = PC + offset (PC here is the read_pc value = instr_addr + 4)
         let target = self.read_pc().wrapping_add(offset);
         self.regs.set_pc(target);
-        4
+        1 // M33 measured: 1 cycle
     }
 
     // -- Undefined 32-bit instruction ----------------------------------------

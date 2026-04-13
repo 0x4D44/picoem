@@ -36,9 +36,19 @@ impl Bus {
     // --- CLOCKS (0x40010000) ---
     pub(crate) fn clocks_read(&self, offset: u32) -> u32 {
         match offset {
-            0x038 => 0x1, // CLK_REF_SELECTED
-            0x068 => 0x1, // CLK_SYS_SELECTED
+            0x030 => self.clk_ref_ctrl,
+            0x038 => 1 << (self.clk_ref_ctrl & 0x3), // CLK_REF_SELECTED
+            0x060 => self.clk_sys_ctrl,
+            0x068 => 1 << (self.clk_sys_ctrl & 0x1), // CLK_SYS_SELECTED
             _ => 0,
+        }
+    }
+
+    pub(crate) fn clocks_write(&mut self, offset: u32, val: u32) {
+        match offset {
+            0x030 => self.clk_ref_ctrl = val,
+            0x060 => self.clk_sys_ctrl = val,
+            _ => {}
         }
     }
 
@@ -69,9 +79,19 @@ impl Bus {
     // --- QMI (0x400D0000) --- QSPI memory interface
     pub(crate) fn qmi_read(&self, offset: u32) -> u32 {
         match offset {
-            // DIRECT_CSR: TXEMPTY=1 (bit 16), RXEMPTY=1 (bit 17), BUSY=0 (bit 1)
-            0x000 => (1 << 16) | (1 << 17),
-            _ => 0,
+            // DIRECT_CSR: force TXEMPTY (bit 16) + RXEMPTY (bit 17) always set
+            0x000 => self.qmi_regs.get(0).copied().unwrap_or(0) | (1 << 16) | (1 << 17),
+            _ => {
+                let idx = (offset >> 2) as usize;
+                self.qmi_regs.get(idx).copied().unwrap_or(0)
+            }
+        }
+    }
+
+    pub(crate) fn qmi_write(&mut self, offset: u32, val: u32) {
+        let idx = (offset >> 2) as usize;
+        if idx < self.qmi_regs.len() {
+            self.qmi_regs[idx] = val;
         }
     }
 }

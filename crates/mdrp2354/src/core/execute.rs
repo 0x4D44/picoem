@@ -650,7 +650,8 @@ impl CortexM33 {
                     }
                 }
                 bus.clear_burst_mode();
-                1 + count // M33 measured: 1 + N cycles (N = register count)
+                // M33 measured: 2*N for N<=2, 1+N for N>2
+                if count <= 2 { 2 * count } else { 1 + count }
             }
             0b0110 => {
                 // CPS: CPSIE/CPSID — affects PRIMASK/FAULTMASK
