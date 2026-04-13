@@ -12,7 +12,9 @@ pub struct PacerStats {
     spin_ns: AtomicU64,
     /// Number of quanta where emulation couldn't keep up with real-time.
     behind_count: AtomicU64,
-    /// Whether pacing is currently active.
+    /// Whether pacing is currently active. Caller-managed — the Pacer does
+    /// not set this automatically. Monitoring consumers can check this to
+    /// know if data is flowing.
     running: AtomicBool,
 }
 
@@ -37,23 +39,24 @@ impl PacerStats {
         }
     }
 
-    pub fn add_emulated_cycles(&self, n: u64) {
+    pub(crate) fn add_emulated_cycles(&self, n: u64) {
         self.emulated_cycles.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn add_emulation_ns(&self, n: u64) {
+    pub(crate) fn add_emulation_ns(&self, n: u64) {
         self.emulation_ns.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn add_spin_ns(&self, n: u64) {
+    pub(crate) fn add_spin_ns(&self, n: u64) {
         self.spin_ns.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn increment_behind(&self) {
+    pub(crate) fn increment_behind(&self) {
         self.behind_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn set_running(&self, val: bool) {
+    #[allow(dead_code)]
+    pub(crate) fn set_running(&self, val: bool) {
         self.running.store(val, Ordering::Relaxed);
     }
 
@@ -71,6 +74,12 @@ impl Default for PacerStats {
 /// Point-in-time snapshot of pacer stats. All values are plain integers
 /// copied from the atomic counters. Derived metrics are computed here
 /// to keep the hot path (atomic updates) minimal.
+///
+/// Snapshots are approximate: individual fields are read with Relaxed ordering,
+/// so a snapshot may see cycles from quantum N but spin_ns from quantum N-1.
+/// For monitoring/dashboard purposes this is fine — all values are monotonically
+/// increasing and converge quickly.
+#[derive(Debug)]
 pub struct PacerSnapshot {
     pub emulated_cycles: u64,
     pub emulation_ns: u64,
@@ -99,6 +108,7 @@ impl PacerSnapshot {
     }
 
     /// Effective emulated clock rate in MHz.
+    /// Formula: cycles/ns = GHz; multiply by 10^3 to convert to MHz.
     pub fn emulated_mhz(&self) -> f64 {
         let total = self.total_ns();
         if total == 0 {
@@ -112,19 +122,45 @@ impl PacerSnapshot {
 // Pacer — real-time pacing via rdtsc spin-wait
 // ---------------------------------------------------------------------------
 
+/// Non-serializing timestamp read. Lower overhead, used only inside
+/// spin-wait polling loops where convergence handles any reordering.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc() -> u64 {
     unsafe { std::arch::x86_64::_rdtsc() }
 }
 
+/// Serializing timestamp read. Waits for prior instructions to retire
+/// before reading TSC. Used for measurement points where accuracy matters.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rdtscp() -> u64 {
+    let mut _aux = 0u32;
+    unsafe { std::arch::x86_64::__rdtscp(&mut _aux) }
+}
+
+/// Verify the CPU supports invariant TSC (constant_tsc). Panics with a
+/// clear message if not. All modern x86_64 CPUs (since ~2008) support this.
+#[cfg(target_arch = "x86_64")]
+fn require_constant_tsc() {
+    let result = std::arch::x86_64::__cpuid(0x80000007);
+    let has_invariant_tsc = (result.edx >> 8) & 1 != 0;
+    assert!(
+        has_invariant_tsc,
+        "CPU does not support invariant TSC (constant_tsc). \
+         Required for rdtsc-based real-time pacing."
+    );
+}
+
 /// Calibrate the TSC frequency by measuring rdtsc ticks over a short sleep.
+/// Assumes invariant TSC (verified by `require_constant_tsc`).
 #[cfg(target_arch = "x86_64")]
 fn calibrate_tsc() -> u64 {
+    require_constant_tsc();
     let t0 = std::time::Instant::now();
-    let tsc0 = rdtsc();
+    let tsc0 = rdtscp();
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let tsc1 = rdtsc();
+    let tsc1 = rdtscp();
     let elapsed_ns = t0.elapsed().as_nanos() as u64;
     (tsc1 - tsc0) * 1_000_000_000 / elapsed_ns
 }
@@ -167,6 +203,7 @@ impl Pacer {
         let quantum_cycles: u64 = 150;
         let quantum_tsc_ticks =
             (tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
+        assert!(quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero — quantum too small for TSC resolution");
 
         Self {
             stats: Arc::new(PacerStats::new()),
@@ -180,10 +217,12 @@ impl Pacer {
 
     /// Create a pacer with a custom quantum size.
     pub fn with_quantum(sys_clk_hz: u32, quantum_cycles: u64) -> Self {
+        assert!(quantum_cycles > 0, "quantum_cycles must be non-zero");
         let mut pacer = Self::new(sys_clk_hz);
         pacer.quantum_cycles = quantum_cycles;
         pacer.quantum_tsc_ticks =
             (pacer.tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
+        assert!(pacer.quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero — quantum too small for TSC resolution");
         pacer
     }
 
@@ -205,28 +244,36 @@ impl Pacer {
     /// Mark the start of a quantum. Call before stepping the emulator.
     #[inline(always)]
     pub fn begin_quantum(&mut self) {
-        self.quantum_start_tsc = rdtsc();
+        self.quantum_start_tsc = rdtscp();
     }
 
     /// End a quantum. Spin-waits if we're ahead of real-time, updates stats.
     /// Call after stepping the emulator for `quantum_cycles()` cycles.
     #[inline(always)]
     pub fn end_quantum(&mut self) {
-        let emulation_tsc = rdtsc() - self.quantum_start_tsc;
+        debug_assert!(self.quantum_start_tsc != 0, "begin_quantum() must be called before end_quantum()");
+
+        // TSC wraparound: at 5 GHz, u64 wraps after ~117 years. If it does wrap
+        // (or a VM offsets the TSC), unsigned subtraction produces a large value
+        // and we take the "behind" path — safe degradation.
+        let emulation_tsc = rdtscp() - self.quantum_start_tsc;
 
         if emulation_tsc < self.quantum_tsc_ticks {
-            // Ahead of real-time — spin wait
+            // Ahead of real-time — spin wait.
+            // Capture exit TSC inside the loop to avoid post-loop measurement skew.
             let target_tsc = self.quantum_start_tsc + self.quantum_tsc_ticks;
-            while rdtsc() < target_tsc {
+            let mut now = rdtsc();
+            while now < target_tsc {
                 std::hint::spin_loop();
+                now = rdtsc();
             }
-            let total_tsc = rdtsc() - self.quantum_start_tsc;
+            let total_tsc = now - self.quantum_start_tsc;
             let spin_tsc = total_tsc - emulation_tsc;
 
             self.stats.add_emulation_ns(self.tsc_to_ns(emulation_tsc));
             self.stats.add_spin_ns(self.tsc_to_ns(spin_tsc));
         } else {
-            // Behind real-time — skip spin, log it
+            // Behind real-time — skip spin, record it
             self.stats.add_emulation_ns(self.tsc_to_ns(emulation_tsc));
             self.stats.increment_behind();
         }
