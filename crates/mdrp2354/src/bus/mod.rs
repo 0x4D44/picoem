@@ -69,6 +69,10 @@ pub struct Bus {
     pub rcp_salt: [u32; 2],
     /// Per-core RCP salt validity flag.
     pub rcp_salt_valid: [bool; 2],
+    /// Three PIO blocks (PIO0, PIO1, PIO2).
+    pub pio: [PioBlock; 3],
+    /// Combined GPIO pin state (readable by SIO and PIO).
+    pub gpio_in: u32,
 }
 
 impl Bus {
@@ -97,6 +101,8 @@ impl Bus {
             event_flag: [false; 2],
             rcp_salt: [0; 2],
             rcp_salt_valid: [false; 2],
+            pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
+            gpio_in: 0,
         }
     }
 
@@ -419,6 +425,9 @@ impl Bus {
                     0x4005_0000 => self.pll_sys_read(offset),
                     0x4005_8000 => self.pll_usb_read(offset),
                     0x400D_0000 => self.qmi_read(offset),
+                    0x5020_0000 => self.pio[0].read32(offset),
+                    0x5030_0000 => self.pio[1].read32(offset),
+                    0x5040_0000 => self.pio[2].read32(offset),
                     _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
                 };
                 let byte_idx = (canonical & 3) as usize;
@@ -426,11 +435,14 @@ impl Bus {
             }
             0xD => {
                 let reg_offset = addr & 0xFFF;
-                let word = if reg_offset & !3 == 0x008 {
-                    self.read_gpio_hi_in()
-                } else {
-                    let core = self.active_core();
-                    self.sio.read32(reg_offset & !3, core)
+                let word_offset = reg_offset & !3;
+                let word = match word_offset {
+                    0x004 => self.gpio_in,
+                    0x008 => self.read_gpio_hi_in(),
+                    _ => {
+                        let core = self.active_core();
+                        self.sio.read32(word_offset, core)
+                    }
                 };
                 word.to_le_bytes()[(addr & 3) as usize]
             }
@@ -508,6 +520,7 @@ impl Bus {
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore byte
                     }
+                    0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
                     _ => {
                         let word_addr = canonical & !3;
                         let byte_idx = (canonical & 3) as usize;
@@ -576,6 +589,9 @@ impl Bus {
                     0x4005_0000 => self.pll_sys_read(offset),
                     0x4005_8000 => self.pll_usb_read(offset),
                     0x400D_0000 => self.qmi_read(offset),
+                    0x5020_0000 => self.pio[0].read32(offset),
+                    0x5030_0000 => self.pio[1].read32(offset),
+                    0x5040_0000 => self.pio[2].read32(offset),
                     _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
                 };
                 let half_idx = ((canonical >> 1) & 1) as usize;
@@ -584,11 +600,14 @@ impl Bus {
             }
             0xD => {
                 let reg_offset = addr & 0xFFF;
-                let word = if reg_offset & !3 == 0x008 {
-                    self.read_gpio_hi_in()
-                } else {
-                    let core = self.active_core();
-                    self.sio.read32(reg_offset & !3, core)
+                let word_offset = reg_offset & !3;
+                let word = match word_offset {
+                    0x004 => self.gpio_in,
+                    0x008 => self.read_gpio_hi_in(),
+                    _ => {
+                        let core = self.active_core();
+                        self.sio.read32(word_offset, core)
+                    }
                 };
                 let half_idx = ((addr >> 1) & 1) as usize;
                 [word as u16, (word >> 16) as u16][half_idx]
@@ -672,6 +691,7 @@ impl Bus {
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore halfword
                     }
+                    0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
                     _ => {
                         let word_addr = canonical & !3;
                         let half_idx = ((canonical >> 1) & 1) as usize;
@@ -745,16 +765,21 @@ impl Bus {
                     0x4005_0000 => self.pll_sys_read(offset),
                     0x4005_8000 => self.pll_usb_read(offset),
                     0x400D_0000 => self.qmi_read(offset),
+                    0x5020_0000 => self.pio[0].read32(offset),
+                    0x5030_0000 => self.pio[1].read32(offset),
+                    0x5040_0000 => self.pio[2].read32(offset),
                     _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
                 }
             }
             0xD => {
                 let reg_offset = addr & 0xFFF;
-                if reg_offset == 0x008 {
-                    self.read_gpio_hi_in()
-                } else {
-                    let core = self.active_core();
-                    self.sio.read32(reg_offset, core)
+                match reg_offset {
+                    0x004 => self.gpio_in,
+                    0x008 => self.read_gpio_hi_in(),
+                    _ => {
+                        let core = self.active_core();
+                        self.sio.read32(reg_offset, core)
+                    }
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
@@ -814,6 +839,9 @@ impl Bus {
                     }
                     // SYSINFO (0x4000_0000): read-only, ignore writes
                     0x4000_0000 => {}
+                    0x5020_0000 => self.pio[0].write32(offset, val, alias),
+                    0x5030_0000 => self.pio[1].write32(offset, val, alias),
+                    0x5040_0000 => self.pio[2].write32(offset, val, alias),
                     _ => {
                         // Existing HashMap path with alias logic
                         let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);

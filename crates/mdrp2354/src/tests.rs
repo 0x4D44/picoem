@@ -4377,14 +4377,17 @@ fn atomic_alias_read_ignores_alias_bits() {
 #[test]
 fn atomic_alias_ahb_peripheral() {
     // AHB peripherals (0x5xxxxxxx) also support atomic aliases.
+    // PIO0 CTRL: SM_ENABLE [3:0] with SET/CLR/XOR alias support.
     let mut bus = Bus::new();
-    let base = 0x5020_0000; // PIO0 base
-    bus.write32(base, 0xAAAA_0000); // seed
-    bus.write32(base + 0x2000, 0x0000_5555); // SET alias
-    assert_eq!(bus.read32(base), 0xAAAA_5555);
+    let base = 0x5020_0000; // PIO0 CTRL
+    bus.write32(base, 0x5); // enable SM0 + SM2
+    assert_eq!(bus.read32(base), 0x5);
+    bus.write32(base + 0x2000, 0xA); // SET alias: enable SM1 + SM3
+    assert_eq!(bus.read32(base), 0xF); // all 4 SMs enabled
     // AHB atomics have no extra latency cost (unlike APB interposed)
-    bus.write32(base + 0x1000, 0x0000_000F); // XOR alias
+    bus.write32(base + 0x1000, 0x3); // XOR alias: toggle SM0 + SM1
     assert_eq!(bus.last_access_cycles(), 1); // no extra cost
+    assert_eq!(bus.read32(base), 0xC); // SM2 + SM3 remain enabled
 }
 
 #[test]

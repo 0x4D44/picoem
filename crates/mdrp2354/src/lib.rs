@@ -144,6 +144,12 @@ impl Emulator {
             }
         }
 
+        // Step PIO blocks
+        let gpio_in = self.bus.gpio_in;
+        for pio in &mut self.bus.pio {
+            pio.step(gpio_in);
+        }
+
         self.bus.sio.tick_mtime();
         self.clock.cycles
     }

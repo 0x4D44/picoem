@@ -73,8 +73,6 @@ pub struct Sio {
     pub gpio_out: u32,
     /// SIO GPIO output enable register (offset 0x030).
     pub gpio_oe: u32,
-    /// SIO GPIO input register (offset 0x004, always 0 — no external pin model).
-    pub gpio_in: u32,
     /// Inter-processor FIFO: Core 0 writes -> Core 1 reads.
     fifo_to_core1: Fifo,
     /// Inter-processor FIFO: Core 1 writes -> Core 0 reads.
@@ -111,7 +109,6 @@ impl Sio {
         Self {
             gpio_out: 0,
             gpio_oe: 0,
-            gpio_in: 0,
             fifo_to_core1: Fifo::new(),
             fifo_to_core0: Fifo::new(),
             fifo_wof: [false; 2],
@@ -132,7 +129,6 @@ impl Sio {
     pub fn reset(&mut self) {
         self.gpio_out = 0;
         self.gpio_oe = 0;
-        self.gpio_in = 0;
         self.fifo_to_core1 = Fifo::new();
         self.fifo_to_core0 = Fifo::new();
         self.fifo_wof = [false; 2];
@@ -149,11 +145,10 @@ impl Sio {
     }
 
     /// 32-bit register read. `offset` is already masked to 12 bits by Bus.
-    /// GPIO_HI_IN (0x008) is handled by Bus before calling this.
+    /// GPIO_IN (0x004) and GPIO_HI_IN (0x008) are handled by Bus before calling this.
     pub fn read32(&mut self, offset: u32, core: usize) -> u32 {
         match offset {
             0x000 => core as u32,   // CPUID
-            0x004 => self.gpio_in,  // GPIO_IN
             0x010 => self.gpio_out, // GPIO_OUT
             0x030 => self.gpio_oe,  // GPIO_OE
             // FIFO
