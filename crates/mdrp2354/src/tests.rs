@@ -4227,69 +4227,86 @@ fn bus_latency_sio_access_1_cycle() {
 // or may target a known peripheral base address.
 
 #[test]
-#[ignore] // Phase 2 API — will compile after atomic alias support is added
 fn atomic_alias_normal_write() {
     // Base+0x0000: normal write replaces the value.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // let base = 0x4000_0000; // APB peripheral base (stub)
-    // bus.write32(base + 0x0000, 0xFF00_FF00);
-    // assert_eq!(bus.read32(base), 0xFF00_FF00);
+    let (_, mut bus) = core_and_bus();
+    let base = 0x4000_0000; // APB peripheral base (stub)
+    bus.write32(base + 0x0000, 0xFF00_FF00);
+    assert_eq!(bus.read32(base), 0xFF00_FF00);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after atomic alias support is added
 fn atomic_alias_xor_write() {
     // Base+0x1000: XOR — new_val = old_val ^ written_val.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // let base = 0x4000_0000;
-    // bus.write32(base + 0x0000, 0xFF00_FF00); // seed value
-    // bus.write32(base + 0x1000, 0x0F0F_0F0F); // XOR alias
-    // assert_eq!(bus.read32(base), 0xF00F_F00F);
+    let (_, mut bus) = core_and_bus();
+    let base = 0x4000_0000;
+    bus.write32(base + 0x0000, 0xFF00_FF00); // seed value
+    bus.write32(base + 0x1000, 0x0F0F_0F0F); // XOR alias
+    assert_eq!(bus.read32(base), 0xF00F_F00F);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after atomic alias support is added
 fn atomic_alias_set_write() {
     // Base+0x2000: SET — new_val = old_val | written_val.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // let base = 0x4000_0000;
-    // bus.write32(base + 0x0000, 0x0000_00FF); // seed value
-    // bus.write32(base + 0x2000, 0x0000_FF00); // SET alias
-    // assert_eq!(bus.read32(base), 0x0000_FFFF);
+    let (_, mut bus) = core_and_bus();
+    let base = 0x4000_0000;
+    bus.write32(base + 0x0000, 0x0000_00FF); // seed value
+    bus.write32(base + 0x2000, 0x0000_FF00); // SET alias
+    assert_eq!(bus.read32(base), 0x0000_FFFF);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after atomic alias support is added
 fn atomic_alias_clr_write() {
     // Base+0x3000: CLR — new_val = old_val & ~written_val.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // let base = 0x4000_0000;
-    // bus.write32(base + 0x0000, 0xFFFF_FFFF); // seed value
-    // bus.write32(base + 0x3000, 0x00FF_00FF); // CLR alias
-    // assert_eq!(bus.read32(base), 0xFF00_FF00);
+    let (_, mut bus) = core_and_bus();
+    let base = 0x4000_0000;
+    bus.write32(base + 0x0000, 0xFFFF_FFFF); // seed value
+    bus.write32(base + 0x3000, 0x00FF_00FF); // CLR alias
+    assert_eq!(bus.read32(base), 0xFF00_FF00);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after atomic alias support is added
 fn atomic_alias_read_ignores_alias_bits() {
     // Reads from any alias offset return the same canonical value.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // let base = 0x4000_0000;
-    // bus.write32(base, 0xBEEF_CAFE);
-    // assert_eq!(bus.read32(base + 0x0000), 0xBEEF_CAFE);
-    // assert_eq!(bus.read32(base + 0x1000), 0xBEEF_CAFE); // XOR alias read
-    // assert_eq!(bus.read32(base + 0x2000), 0xBEEF_CAFE); // SET alias read
-    // assert_eq!(bus.read32(base + 0x3000), 0xBEEF_CAFE); // CLR alias read
+    let (_, mut bus) = core_and_bus();
+    let base = 0x4000_0000;
+    bus.write32(base, 0xBEEF_CAFE);
+    assert_eq!(bus.read32(base + 0x0000), 0xBEEF_CAFE);
+    assert_eq!(bus.read32(base + 0x1000), 0xBEEF_CAFE); // XOR alias read
+    assert_eq!(bus.read32(base + 0x2000), 0xBEEF_CAFE); // SET alias read
+    assert_eq!(bus.read32(base + 0x3000), 0xBEEF_CAFE); // CLR alias read
+}
+
+#[test]
+fn atomic_alias_ahb_peripheral() {
+    // AHB peripherals (0x5xxxxxxx) also support atomic aliases.
+    let mut bus = Bus::new();
+    let base = 0x5020_0000; // PIO0 base
+    bus.write32(base, 0xAAAA_0000); // seed
+    bus.write32(base + 0x2000, 0x0000_5555); // SET alias
+    assert_eq!(bus.read32(base), 0xAAAA_5555);
+    // AHB atomics have no extra latency cost (unlike APB interposed)
+    bus.write32(base + 0x1000, 0x0000_000F); // XOR alias
+    assert_eq!(bus.last_access_cycles(), 1); // no extra cost
+}
+
+#[test]
+fn atomic_alias_apb_interposed_latency() {
+    // APB atomic writes (XOR/SET/CLR) cost +2 extra cycles (interposed).
+    let mut bus = Bus::new();
+    let base = 0x4007_0000; // UART0
+    // Normal APB write: 4 cycles
+    bus.write32(base, 0x1234);
+    assert_eq!(bus.last_access_cycles(), 4);
+    // XOR alias APB write: 6 cycles (4 + 2 interposed)
+    bus.write32(base + 0x1000, 0x00FF);
+    assert_eq!(bus.last_access_cycles(), 6);
+    // SET alias: also 6 cycles
+    bus.write32(base + 0x2000, 0x00FF);
+    assert_eq!(bus.last_access_cycles(), 6);
+    // CLR alias: also 6 cycles
+    bus.write32(base + 0x3000, 0x00FF);
+    assert_eq!(bus.last_access_cycles(), 6);
 }
 
 // ============================================================================
