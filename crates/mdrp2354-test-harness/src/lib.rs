@@ -5,6 +5,40 @@
 
 pub mod gdb_client;
 
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+
+/// Extension trait to call Rng::gen() without hitting the `gen` keyword reservation.
+trait RngExt {
+    fn random<T>(&mut self) -> T
+    where
+        rand::distributions::Standard: rand::distributions::Distribution<T>;
+    fn range<T, R>(&mut self, range: R) -> T
+    where
+        T: rand::distributions::uniform::SampleUniform,
+        R: rand::distributions::uniform::SampleRange<T>;
+    fn coin(&mut self, p: f64) -> bool;
+}
+
+impl RngExt for StdRng {
+    fn random<T>(&mut self) -> T
+    where
+        rand::distributions::Standard: rand::distributions::Distribution<T>,
+    {
+        <Self as rand::Rng>::r#gen(self)
+    }
+    fn range<T, R>(&mut self, range: R) -> T
+    where
+        T: rand::distributions::uniform::SampleUniform,
+        R: rand::distributions::uniform::SampleRange<T>,
+    {
+        <Self as rand::Rng>::gen_range(self, range)
+    }
+    fn coin(&mut self, p: f64) -> bool {
+        <Self as rand::Rng>::gen_bool(self, p)
+    }
+}
+
 // Re-export emulator types the harness needs.
 pub use mdrp2354::{Bus, CortexM33};
 
@@ -3477,6 +3511,578 @@ pub fn generate_all() -> Vec<TestCase> {
 }
 
 // ============================================================================
+// Fuzz test generators — random inputs for each instruction class
+// ============================================================================
+
+/// Generate random ALU (non-bus) fuzz tests. Fast — no memory setup needed.
+fn generate_fuzz_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
+    let mut t = Vec::new();
+    let tb = 0x0100_0000u32; // T bit
+
+    // Helper: random xPSR flags (N, Z, C, V in bits 31:28) with T bit
+    let rand_flags = |rng: &mut StdRng| -> u32 {
+        let flags: u32 = rng.range(0..16);
+        tb | (flags << 28)
+    };
+
+    // Helper: random register values for all 8 low registers
+    let rand_low_regs = |rng: &mut StdRng| -> Vec<(u8, u32)> {
+        (0..8).map(|i| (i, rng.random())).collect()
+    };
+
+    // --- Shifts (LSL/LSR/ASR immediate) ---
+    for i in 0..count {
+        let rd: u16 = rng.range(0..8);
+        let rm: u16 = rng.range(0..8);
+        let variant = rng.range(0..3u8);
+        let (name_prefix, opcode, imm_desc) = match variant {
+            0 => {
+                let imm5: u16 = rng.range(0..32);
+                ("LSL", enc_lsl_imm(rd, rm, imm5), imm5)
+            }
+            1 => {
+                // LSR: imm5=0 encodes shift-by-32, valid range 0-31 in encoding
+                let imm5: u16 = rng.range(0..32);
+                ("LSR", enc_lsr_imm(rd, rm, imm5), imm5)
+            }
+            _ => {
+                let imm5: u16 = rng.range(0..32);
+                ("ASR", enc_asr_imm(rd, rm, imm5), imm5)
+            }
+        };
+        let mut regs = rand_low_regs(rng);
+        // Ensure rm has a random value (already covered by rand_low_regs)
+        t.push(TestCase {
+            name: format!("FUZZ:SHIFT:{i} {name_prefix} R{rd},R{rm},#{imm_desc}"),
+            opcode,
+            reg_pre: regs.drain(..).collect(),
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Add/Sub register + 3-bit immediate ---
+    for i in 0..count {
+        let rd: u16 = rng.range(0..8);
+        let rn: u16 = rng.range(0..8);
+        let variant = rng.range(0..4u8);
+        let (name_prefix, opcode) = match variant {
+            0 => {
+                let rm: u16 = rng.range(0..8);
+                ("ADDS_R", enc_adds_reg(rd, rn, rm))
+            }
+            1 => {
+                let rm: u16 = rng.range(0..8);
+                ("SUBS_R", enc_subs_reg(rd, rn, rm))
+            }
+            2 => {
+                let imm3: u16 = rng.range(0..8);
+                ("ADDS_I3", enc_adds_imm3(rd, rn, imm3))
+            }
+            _ => {
+                let imm3: u16 = rng.range(0..8);
+                ("SUBS_I3", enc_subs_imm3(rd, rn, imm3))
+            }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:ADDSUB:{i} {name_prefix}"),
+            opcode,
+            reg_pre: rand_low_regs(rng),
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Mov/Cmp/Add/Sub 8-bit immediate ---
+    for i in 0..count {
+        let rd: u16 = rng.range(0..8);
+        let imm8: u16 = rng.range(0..256);
+        let variant = rng.range(0..4u8);
+        let (name_prefix, opcode) = match variant {
+            0 => ("MOVS_I8", enc_movs_imm(rd, imm8)),
+            1 => ("CMP_I8", enc_cmp_imm(rd, imm8)),
+            2 => ("ADDS_I8", enc_adds_imm8(rd, imm8)),
+            _ => ("SUBS_I8", enc_subs_imm8(rd, imm8)),
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:IMM8:{i} {name_prefix}"),
+            opcode,
+            reg_pre: rand_low_regs(rng),
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Data processing (register) ---
+    for i in 0..count {
+        let rdn: u16 = rng.range(0..8);
+        let rm: u16 = rng.range(0..8);
+        let op: u16 = rng.range(0..16);
+        let opcode = enc_data_proc(op, rm, rdn);
+        // MUL (op=13): C and V are UNPREDICTABLE
+        let xpsr_mask = if op == 13 { MASK_NZ_ONLY } else { MASK_ALL_FLAGS };
+        t.push(TestCase {
+            name: format!("FUZZ:DPROC:{i} op={op}"),
+            opcode,
+            reg_pre: rand_low_regs(rng),
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Special data (MOV/ADD high registers) ---
+    for i in 0..count {
+        let rd: u16 = rng.range(0..12); // avoid SP(13), LR(14), PC(15)
+        let rm: u16 = rng.range(0..12);
+        let variant = rng.range(0..2u8);
+        let (name_prefix, opcode) = match variant {
+            0 => ("MOV_HI", enc_mov_high(rd, rm)),
+            _ => ("ADD_HI", enc_add_high(rd, rm)),
+        };
+        // Set all GP regs (0-12) to random values to catch clobbering
+        let regs: Vec<(u8, u32)> = (0..=12).map(|r| (r, rng.random())).collect();
+        t.push(TestCase {
+            name: format!("FUZZ:SPECIAL:{i} {name_prefix} R{rd},R{rm}"),
+            opcode,
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Misc (SXTH/SXTB/UXTH/UXTB/REV/REV16/REVSH, ADD/SUB SP) ---
+    for i in 0..count {
+        let rd: u16 = rng.range(0..8);
+        let rm: u16 = rng.range(0..8);
+        let variant = rng.range(0..9u8);
+        let (name_prefix, opcode, regs) = match variant {
+            0 => ("SXTH", enc_sxth(rd, rm), rand_low_regs(rng)),
+            1 => ("SXTB", enc_sxtb(rd, rm), rand_low_regs(rng)),
+            2 => ("UXTH", enc_uxth(rd, rm), rand_low_regs(rng)),
+            3 => ("UXTB", enc_uxtb(rd, rm), rand_low_regs(rng)),
+            4 => ("REV", enc_rev(rd, rm), rand_low_regs(rng)),
+            5 => ("REV16", enc_rev16(rd, rm), rand_low_regs(rng)),
+            6 => ("REVSH", enc_revsh(rd, rm), rand_low_regs(rng)),
+            7 => {
+                let imm7: u16 = rng.range(0..128);
+                ("ADD_SP", enc_add_sp_sp(imm7), Vec::new())
+            }
+            _ => {
+                let imm7: u16 = rng.range(0..128);
+                ("SUB_SP", enc_sub_sp_sp(imm7), Vec::new())
+            }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:MISC:{i} {name_prefix}"),
+            opcode,
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Conditional branches ---
+    for i in 0..count {
+        let cond: u16 = rng.range(0..14); // 0-13, excluding 14 (UND) and 15 (SVC)
+        // Safe offset range: -128..+126, must be even
+        let half: i16 = rng.range(-64..64);
+        let offset_bytes: i16 = half * 2; // always even
+        let opcode = enc_branch_cond(cond, offset_bytes);
+        t.push(TestCase {
+            name: format!("FUZZ:BCOND:{i} cond={cond} off={offset_bytes}"),
+            opcode,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Unconditional branches ---
+    for i in 0..count {
+        // Safe offset range: -2048..+2046, must be even
+        let half: i32 = rng.range(-1024..1024);
+        let offset_bytes: i32 = half * 2; // always even
+        let opcode = enc_branch_uncond(offset_bytes);
+        t.push(TestCase {
+            name: format!("FUZZ:BUNCOND:{i} off={offset_bytes}"),
+            opcode,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    t
+}
+
+/// Generate random memory (bus) fuzz tests. Slower — needs memory setup.
+fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
+    let mut t = Vec::new();
+    let tb = 0x0100_0000u32;
+
+    let rand_flags = |rng: &mut StdRng| -> u32 {
+        let flags: u32 = rng.range(0..16);
+        tb | (flags << 28)
+    };
+
+    // --- Load/store register offset ---
+    for i in 0..count {
+        // Ensure rt, rn, rm are all distinct to avoid register aliasing
+        // (e.g., STR R4, [R1, R4] would clobber the offset with data).
+        let rt: u16 = rng.range(0..8);
+        let rn: u16 = loop {
+            let r = rng.range(0..8);
+            if r != rt { break r; }
+        };
+        let rm: u16 = loop {
+            let r = rng.range(0..8);
+            if r != rn && r != rt { break r; }
+        };
+        // Offset must be word-aligned for word ops, half-aligned for half ops.
+        // Use small offset to stay in scratch area (256 bytes).
+        let opc: u16 = rng.range(0..7); // 0-6: STR, STRH, STRB, LDRSB, LDR, LDRH, LDRSH
+        let (offset, data_val): (u32, u32) = match opc {
+            0 | 4 => {
+                // Word: 4-byte aligned, max offset ~240
+                let off = (rng.range(0..60u32)) * 4;
+                (off, rng.random())
+            }
+            1 | 5 | 6 => {
+                // Half: 2-byte aligned
+                let off = (rng.range(0..120u32)) * 2;
+                (off, rng.random::<u32>() & 0xFFFF)
+            }
+            _ => {
+                // Byte
+                let off = rng.range(0..240u32);
+                (off, rng.random::<u32>() & 0xFF)
+            }
+        };
+
+        let is_store = matches!(opc, 0 | 1 | 2);
+        let mut reg_pre: Vec<(u8, u32)> = Vec::new();
+        // Set all low regs to random values
+        for r in 0..8u8 {
+            reg_pre.push((r, rng.random()));
+        }
+        // Override base and offset regs
+        let rn8 = rn as u8;
+        let rm8 = rm as u8;
+        reg_pre.retain(|&(r, _)| r != rn8 && r != rm8);
+        reg_pre.push((rn8, 0)); // base = 0 (addr_regs translates to scratch)
+        reg_pre.push((rm8, offset));
+        if is_store {
+            // Override rt with data to store
+            reg_pre.retain(|&(r, _)| r != rt as u8);
+            reg_pre.push((rt as u8, data_val));
+        }
+
+        let mut mem_pre = Vec::new();
+        let mut mem_check = Vec::new();
+        if is_store {
+            match opc {
+                0 => mem_check = mem_check_u32(offset),
+                1 => mem_check = mem_check_u16(offset),
+                2 => mem_check = vec![offset],
+                _ => {}
+            }
+        } else {
+            match opc {
+                4 => mem_pre = mem_pre_u32(offset, data_val),
+                5 | 6 => mem_pre = mem_pre_u16(offset, data_val as u16),
+                3 => mem_pre = vec![(offset, data_val as u8)], // LDRSB
+                _ => {}
+            }
+        }
+
+        t.push(TestCase {
+            name: format!("FUZZ:LSREG:{i} opc={opc}"),
+            opcode: enc_ls_reg(opc, rm, rn, rt),
+            reg_pre,
+            addr_regs: vec![rn as u8],
+            needs_bus: true,
+            mem_pre,
+            mem_check,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Load/store immediate offset ---
+    for i in 0..count {
+        let rt: u16 = rng.range(0..8);
+        // Ensure rt != rn so store data doesn't clobber base address
+        let rn: u16 = loop {
+            let r = rng.range(0..8);
+            if r != rt { break r; }
+        };
+        let variant = rng.range(0..6u8);
+        let data_val: u32 = rng.random();
+
+        let (name_prefix, opcode, mem_pre, mem_check, imm_offset) = match variant {
+            0 => {
+                // STR [Rn, #imm5*4]: offset = imm5*4, max imm5=31 -> 124
+                // But keep within 240 bytes of scratch
+                let imm5: u16 = rng.range(0..32);
+                let off = imm5 as u32 * 4;
+                ("STR_I", enc_str_imm(rt, rn, imm5), Vec::new(), mem_check_u32(off), off)
+            }
+            1 => {
+                // LDR [Rn, #imm5*4]
+                let imm5: u16 = rng.range(0..32);
+                let off = imm5 as u32 * 4;
+                ("LDR_I", enc_ldr_imm(rt, rn, imm5), mem_pre_u32(off, data_val), Vec::new(), off)
+            }
+            2 => {
+                // STRB [Rn, #imm5]: offset = imm5
+                let imm5: u16 = rng.range(0..32);
+                let off = imm5 as u32;
+                ("STRB_I", enc_strb_imm(rt, rn, imm5), Vec::new(), vec![off], off)
+            }
+            3 => {
+                // LDRB [Rn, #imm5]
+                let imm5: u16 = rng.range(0..32);
+                let off = imm5 as u32;
+                ("LDRB_I", enc_ldrb_imm(rt, rn, imm5), vec![(off, data_val as u8)], Vec::new(), off)
+            }
+            4 => {
+                // STRH [Rn, #imm5*2]: offset = imm5*2
+                let imm5: u16 = rng.range(0..32);
+                let off = imm5 as u32 * 2;
+                ("STRH_I", enc_strh_imm(rt, rn, imm5), Vec::new(), mem_check_u16(off), off)
+            }
+            _ => {
+                // LDRH [Rn, #imm5*2]
+                let imm5: u16 = rng.range(0..32);
+                let off = imm5 as u32 * 2;
+                ("LDRH_I", enc_ldrh_imm(rt, rn, imm5), mem_pre_u16(off, data_val as u16), Vec::new(), off)
+            }
+        };
+
+        let is_store = matches!(variant, 0 | 2 | 4);
+        let mut reg_pre: Vec<(u8, u32)> = Vec::new();
+        for r in 0..8u8 {
+            reg_pre.push((r, rng.random()));
+        }
+        reg_pre.retain(|&(r, _)| r != rn as u8);
+        reg_pre.push((rn as u8, 0)); // base at scratch start
+        if is_store {
+            reg_pre.retain(|&(r, _)| r != rt as u8);
+            reg_pre.push((rt as u8, data_val));
+        }
+
+        let _ = imm_offset; // used in offset calculation above
+        t.push(TestCase {
+            name: format!("FUZZ:LSIMM:{i} {name_prefix}"),
+            opcode,
+            reg_pre,
+            addr_regs: vec![rn as u8],
+            needs_bus: true,
+            mem_pre,
+            mem_check,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    // --- Push/Pop ---
+    for i in 0..count {
+        let variant = rng.range(0..2u8);
+        match variant {
+            0 => {
+                // PUSH: random register list (at least 1 bit set)
+                let reglist8: u16 = rng.range(1..256);
+                let lr = rng.coin(0.3);
+                let opcode = enc_push(reglist8, lr);
+
+                let reg_count = reglist8.count_ones() + if lr { 1 } else { 0 };
+                let sp_start = reg_count * 4; // SP starts high enough to push down
+                let mut reg_pre: Vec<(u8, u32)> = Vec::new();
+                for r in 0..8u8 {
+                    reg_pre.push((r, rng.random()));
+                }
+                if lr {
+                    reg_pre.push((14, rng.random()));
+                }
+                reg_pre.push((13, sp_start));
+
+                // After push, check memory starting at scratch+0 (SP decremented)
+                let mut mem_check = Vec::new();
+                for word in 0..reg_count {
+                    mem_check.extend(mem_check_u32(word * 4));
+                }
+
+                t.push(TestCase {
+                    name: format!("FUZZ:PUSH:{i} list={reglist8:#05x} lr={lr}"),
+                    opcode,
+                    reg_pre,
+                    addr_regs: vec![13],
+                    needs_bus: true,
+                    mem_check,
+                    xpsr_pre: rand_flags(rng),
+                    ..TestCase::default()
+                });
+            }
+            _ => {
+                // POP: random register list (at least 1 bit set), no PC (address-space-dependent)
+                let reglist8: u16 = rng.range(1..256);
+                let opcode = enc_pop(reglist8, false);
+
+                let reg_count = reglist8.count_ones();
+                // Set up memory with random values at scratch+0..
+                let mut mem_pre = Vec::new();
+                for word in 0..reg_count {
+                    mem_pre.extend(mem_pre_u32(word * 4, rng.random()));
+                }
+
+                t.push(TestCase {
+                    name: format!("FUZZ:POP:{i} list={reglist8:#05x}"),
+                    opcode,
+                    reg_pre: vec![(13, 0)], // SP at scratch base
+                    addr_regs: vec![13],
+                    needs_bus: true,
+                    mem_pre,
+                    xpsr_pre: rand_flags(rng),
+                    ..TestCase::default()
+                });
+            }
+        }
+    }
+
+    // --- STM/LDM ---
+    for i in 0..count {
+        let variant = rng.range(0..2u8);
+        // Use a base register that's NOT in reglist to avoid address-space issues.
+        // We'll use register rn for the base, and only include other regs in the list.
+        match variant {
+            0 => {
+                // STM Rn!, {reglist}
+                let rn: u16 = rng.range(0..8);
+                // Build reglist excluding rn (to avoid storing the address-translated value)
+                let mut reglist8: u16 = rng.range(1..256);
+                reglist8 &= !(1 << rn); // clear rn from list
+                if reglist8 == 0 { reglist8 = 1 << ((rn + 1) % 8); } // ensure at least 1
+
+                let opcode = enc_stm(rn, reglist8);
+                let reg_count = reglist8.count_ones();
+
+                let mut reg_pre: Vec<(u8, u32)> = Vec::new();
+                for r in 0..8u8 {
+                    if r == rn as u8 {
+                        reg_pre.push((r, 0)); // base at scratch start
+                    } else {
+                        reg_pre.push((r, rng.random()));
+                    }
+                }
+
+                let mut mem_check = Vec::new();
+                for word in 0..reg_count {
+                    mem_check.extend(mem_check_u32(word * 4));
+                }
+
+                t.push(TestCase {
+                    name: format!("FUZZ:STM:{i} R{rn}! list={reglist8:#05x}"),
+                    opcode,
+                    reg_pre,
+                    addr_regs: vec![rn as u8],
+                    needs_bus: true,
+                    mem_check,
+                    xpsr_pre: rand_flags(rng),
+                    ..TestCase::default()
+                });
+            }
+            _ => {
+                // LDM Rn!, {reglist}
+                let rn: u16 = rng.range(0..8);
+                let mut reglist8: u16 = rng.range(1..256);
+                // Keep rn in list sometimes (no writeback) for variety
+                if rng.coin(0.5) {
+                    reglist8 &= !(1 << rn);
+                    if reglist8 == 0 { reglist8 = 1 << ((rn + 1) % 8); }
+                }
+
+                let opcode = enc_ldm(rn, reglist8);
+                let reg_count = reglist8.count_ones();
+
+                let mut mem_pre = Vec::new();
+                for word in 0..reg_count {
+                    mem_pre.extend(mem_pre_u32(word * 4, rng.random()));
+                }
+
+                t.push(TestCase {
+                    name: format!("FUZZ:LDM:{i} R{rn}! list={reglist8:#05x}"),
+                    opcode,
+                    reg_pre: vec![(rn as u8, 0)],
+                    addr_regs: vec![rn as u8],
+                    needs_bus: true,
+                    mem_pre,
+                    xpsr_pre: rand_flags(rng),
+                    ..TestCase::default()
+                });
+            }
+        }
+    }
+
+    // --- Load/store SP-relative ---
+    for i in 0..count {
+        let rt: u16 = rng.range(0..8);
+        // Keep imm8 small so offset stays within 256-byte scratch
+        let imm8: u16 = rng.range(0..16); // offset = imm8 * 4, max 60
+        let variant = rng.range(0..2u8);
+        let data_val: u32 = rng.random();
+
+        let (name_prefix, opcode, mem_pre, mem_check) = match variant {
+            0 => {
+                let off = imm8 as u32 * 4;
+                ("STR_SP", enc_str_sp(rt, imm8), Vec::new(), mem_check_u32(off))
+            }
+            _ => {
+                let off = imm8 as u32 * 4;
+                ("LDR_SP", enc_ldr_sp(rt, imm8), mem_pre_u32(off, data_val), Vec::new())
+            }
+        };
+
+        let is_store = variant == 0;
+        let mut reg_pre: Vec<(u8, u32)> = Vec::new();
+        for r in 0..8u8 {
+            reg_pre.push((r, rng.random()));
+        }
+        reg_pre.push((13, 0)); // SP at scratch base
+        if is_store {
+            reg_pre.retain(|&(r, _)| r != rt as u8);
+            reg_pre.push((rt as u8, data_val));
+        }
+
+        t.push(TestCase {
+            name: format!("FUZZ:LSSP:{i} {name_prefix}"),
+            opcode,
+            reg_pre,
+            addr_regs: vec![13],
+            needs_bus: true,
+            mem_pre,
+            mem_check,
+            xpsr_pre: rand_flags(rng),
+            ..TestCase::default()
+        });
+    }
+
+    t
+}
+
+/// Generate fuzz tests: random register values, random encodings.
+///
+/// `count_per_class` tests are generated for each instruction class.
+/// `seed` makes the output reproducible.
+///
+/// Returns (alu_tests, mem_tests) so the runner can prioritize differently.
+pub fn generate_fuzz(count_per_class: usize, seed: u64) -> (Vec<TestCase>, Vec<TestCase>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let alu = generate_fuzz_alu(count_per_class, &mut rng);
+    let mem = generate_fuzz_mem(count_per_class, &mut rng);
+    (alu, mem)
+}
+
+// ============================================================================
 // Run state — snapshot of CPU + memory after execution
 // ============================================================================
 
@@ -4302,5 +4908,136 @@ mod tests {
         let state = run_one_emu(&tc, &mut bus);
         // MOVS sets N,Z but preserves C — so C should still be set
         assert_ne!(state.xpsr & 0x2000_0000, 0, "C flag should be preserved");
+    }
+
+    // -- Fuzz generator tests --
+
+    #[test]
+    fn fuzz_deterministic_with_fixed_seed() {
+        let (alu1, mem1) = generate_fuzz(5, 42);
+        let (alu2, mem2) = generate_fuzz(5, 42);
+        assert_eq!(alu1.len(), alu2.len());
+        assert_eq!(mem1.len(), mem2.len());
+        for (a, b) in alu1.iter().zip(alu2.iter()) {
+            assert_eq!(a.name, b.name, "names must match for same seed");
+            assert_eq!(a.opcode, b.opcode, "opcodes must match for same seed");
+            assert_eq!(a.xpsr_pre, b.xpsr_pre, "xpsr_pre must match for same seed");
+            assert_eq!(a.reg_pre, b.reg_pre, "reg_pre must match for same seed");
+        }
+        for (a, b) in mem1.iter().zip(mem2.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.opcode, b.opcode);
+        }
+    }
+
+    #[test]
+    fn fuzz_different_seeds_differ() {
+        let (alu1, _) = generate_fuzz(10, 1);
+        let (alu2, _) = generate_fuzz(10, 2);
+        // With different seeds, at least some opcodes should differ
+        let differs = alu1.iter().zip(alu2.iter()).any(|(a, b)| a.opcode != b.opcode);
+        assert!(differs, "different seeds should produce different tests");
+    }
+
+    #[test]
+    fn fuzz_alu_opcodes_are_valid_thumb16() {
+        let (alu, _) = generate_fuzz(20, 123);
+        for tc in &alu {
+            assert!(
+                tc.opcode < 0xE800,
+                "fuzz test '{}' has opcode {:#06x} >= 0xE800",
+                tc.name, tc.opcode
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_mem_opcodes_are_valid_thumb16() {
+        let (_, mem) = generate_fuzz(20, 456);
+        for tc in &mem {
+            assert!(
+                tc.opcode < 0xE800,
+                "fuzz test '{}' has opcode {:#06x} >= 0xE800",
+                tc.name, tc.opcode
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_all_names_nonempty() {
+        let (alu, mem) = generate_fuzz(10, 789);
+        for tc in alu.iter().chain(mem.iter()) {
+            assert!(!tc.name.is_empty(), "found fuzz test with empty name");
+        }
+    }
+
+    #[test]
+    fn fuzz_all_names_have_fuzz_prefix() {
+        let (alu, mem) = generate_fuzz(5, 999);
+        for tc in alu.iter().chain(mem.iter()) {
+            assert!(
+                tc.name.starts_with("FUZZ:"),
+                "fuzz test name '{}' missing FUZZ: prefix",
+                tc.name
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_mem_tests_have_addr_regs() {
+        let (_, mem) = generate_fuzz(20, 555);
+        for tc in &mem {
+            assert!(
+                !tc.addr_regs.is_empty(),
+                "fuzz mem test '{}' has empty addr_regs",
+                tc.name
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_mem_tests_have_needs_bus() {
+        let (_, mem) = generate_fuzz(20, 666);
+        for tc in &mem {
+            assert!(
+                tc.needs_bus,
+                "fuzz mem test '{}' has needs_bus=false",
+                tc.name
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_alu_tests_no_bus() {
+        let (alu, _) = generate_fuzz(20, 777);
+        for tc in &alu {
+            assert!(
+                !tc.needs_bus,
+                "fuzz ALU test '{}' has needs_bus=true",
+                tc.name
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_generates_expected_count() {
+        let (alu, mem) = generate_fuzz(10, 0);
+        // ALU: 9 classes * 10 = 90 (shift, addsub, imm8, dproc, special, misc, bcond, buncond)
+        // Wait — let me count: shift, addsub, imm8, dproc, special, misc, bcond, buncond = 8 loops
+        // Mem: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 loops
+        assert_eq!(alu.len(), 8 * 10, "ALU count: 8 classes * 10");
+        assert_eq!(mem.len(), 5 * 10, "MEM count: 5 classes * 10");
+    }
+
+    #[test]
+    fn fuzz_xpsr_always_has_thumb_bit() {
+        let (alu, mem) = generate_fuzz(20, 111);
+        for tc in alu.iter().chain(mem.iter()) {
+            assert_ne!(
+                tc.xpsr_pre & 0x0100_0000, 0,
+                "fuzz test '{}' missing T bit in xpsr_pre: {:#010x}",
+                tc.name, tc.xpsr_pre
+            );
+        }
     }
 }

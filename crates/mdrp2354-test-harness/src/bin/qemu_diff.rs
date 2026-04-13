@@ -2,6 +2,11 @@
 //
 // Orchestrates: spawn QEMU, connect GDB, generate tests, run each test
 // in both QEMU and our emulator, compare results, report.
+//
+// Usage:
+//   qemu_diff                    Run targeted edge-case tests (default)
+//   qemu_diff --fuzz N           Run N random tests per instruction class
+//   qemu_diff --fuzz N --seed S  Reproducible fuzz run with seed S
 
 use std::time::Duration;
 
@@ -21,9 +26,70 @@ fn main() {
     }
 }
 
+// ============================================================================
+// Argument parsing
+// ============================================================================
+
+struct Args {
+    fuzz_count: Option<usize>,
+    seed: Option<u64>,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut fuzz_count = None;
+    let mut seed = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--fuzz" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--fuzz requires a count argument".into());
+                }
+                fuzz_count = Some(args[i].parse::<usize>().map_err(|e| {
+                    format!("invalid fuzz count '{}': {e}", args[i])
+                })?);
+            }
+            "--seed" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--seed requires a value argument".into());
+                }
+                seed = Some(args[i].parse::<u64>().map_err(|e| {
+                    format!("invalid seed '{}': {e}", args[i])
+                })?);
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument '{other}'\n\
+                     Usage:\n  \
+                     qemu_diff                    Run targeted edge-case tests (default)\n  \
+                     qemu_diff --fuzz N           Run N random tests per instruction class\n  \
+                     qemu_diff --fuzz N --seed S  Reproducible fuzz run with seed S"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    if seed.is_some() && fuzz_count.is_none() {
+        return Err("--seed requires --fuzz".into());
+    }
+
+    Ok(Args { fuzz_count, seed })
+}
+
+// ============================================================================
+// Main runner
+// ============================================================================
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_args()?;
+
     // 1. Spawn QEMU
-    let _qemu = QemuProcess::spawn()?;
+    let mut qemu = QemuProcess::spawn()?;
 
     // 2. Connect GDB with retry
     let mut gdb = GdbClient::connect("localhost:3333", Duration::from_secs(5))?;
@@ -33,15 +99,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Write minimal vector table to secure alias
     setup_vector_table(&mut gdb)?;
 
-    // 4. Generate tests
+    match args.fuzz_count {
+        None => run_targeted(&mut gdb, &mut qemu),
+        Some(count) => {
+            let seed = args.seed.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64
+            });
+            run_fuzz(&mut gdb, &mut qemu, count, seed)
+        }
+    }
+}
+
+/// Run the targeted edge-case test suite (original behavior).
+fn run_targeted(
+    gdb: &mut GdbClient,
+    qemu: &mut QemuProcess,
+) -> Result<(), Box<dyn std::error::Error>> {
     let tests = generate_all();
-    let mut shared_bus = Bus::new(); // reused across bus-tests
+    let mut shared_bus = Bus::new();
     let mut pass = 0usize;
     let mut fail = 0usize;
 
-    // 5. Run each test
     for tc in &tests {
-        match run_one_test(&mut gdb, &mut shared_bus, tc) {
+        match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
             Ok(()) => pass += 1,
             Err(diff) => {
                 fail += 1;
@@ -50,13 +133,101 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 6. Report
     println!("{pass}/{} passed", pass + fail);
     if fail > 0 {
         std::process::exit(1);
     }
     Ok(())
 }
+
+/// Run fuzz tests with progress reporting and recovery.
+fn run_fuzz(
+    gdb: &mut GdbClient,
+    qemu: &mut QemuProcess,
+    count_per_class: usize,
+    seed: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Fuzz mode: {count_per_class} tests/class, seed={seed}");
+    println!("(reproduce with: qemu_diff --fuzz {count_per_class} --seed {seed})");
+
+    let (alu_tests, mem_tests) = generate_fuzz(count_per_class, seed);
+    let total = alu_tests.len() + mem_tests.len();
+    println!(
+        "Generated {} tests ({} ALU + {} memory)",
+        total,
+        alu_tests.len(),
+        mem_tests.len()
+    );
+
+    let mut shared_bus = Bus::new();
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut skip = 0usize;
+    let mut done = 0usize;
+
+    // Run ALU tests first (fast, no memory setup)
+    for tc in &alu_tests {
+        done += 1;
+        if done % 1000 == 0 {
+            eprintln!("[{done}/{total}] {fail} failures...");
+        }
+        match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
+            Ok(()) => pass += 1,
+            Err(diff) if diff.starts_with("SKIPPED") => {
+                skip += 1;
+                eprintln!("[SKIP] {}: {}", tc.name, diff);
+            }
+            Err(diff) => {
+                fail += 1;
+                eprintln!(
+                    "[FAIL] {}\n  opcode: {:#06x}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
+                    tc.name, tc.opcode, tc.xpsr_pre, tc.reg_pre, diff
+                );
+            }
+        }
+    }
+
+    // Run memory tests (slower)
+    for tc in &mem_tests {
+        done += 1;
+        if done % 1000 == 0 {
+            eprintln!("[{done}/{total}] {fail} failures...");
+        }
+        match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
+            Ok(()) => pass += 1,
+            Err(diff) if diff.starts_with("SKIPPED") => {
+                skip += 1;
+                eprintln!("[SKIP] {}: {}", tc.name, diff);
+            }
+            Err(diff) => {
+                fail += 1;
+                eprintln!(
+                    "[FAIL] {}\n  opcode: {:#06x}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
+                    tc.name, tc.opcode, tc.xpsr_pre, tc.reg_pre, diff
+                );
+            }
+        }
+    }
+
+    // Summary
+    println!();
+    println!("=== Fuzz summary ===");
+    println!("Seed:    {seed}");
+    println!("Total:   {total}");
+    println!("Passed:  {pass}");
+    println!("Failed:  {fail}");
+    println!("Skipped: {skip}");
+
+    if fail > 0 {
+        println!("\nReproduce: qemu_diff --fuzz {count_per_class} --seed {seed}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Test execution
+// ============================================================================
 
 /// Write minimal vector table to 0x10000000.
 ///
@@ -78,10 +249,53 @@ fn run_one_test(
     shared_bus: &mut Bus,
     tc: &TestCase,
 ) -> Result<(), String> {
-    // Map io::Error to String for the comparison result type
     let qemu_state = run_qemu_side(gdb, tc).map_err(|e| format!("QEMU error: {e}"))?;
     let emu_state = run_one_emu(tc, shared_bus);
     compare(tc, &qemu_state, &emu_state)
+}
+
+/// Run a test with GDB error recovery. If GDB fails, respawn QEMU and reconnect.
+fn run_with_recovery(
+    gdb: &mut GdbClient,
+    qemu: &mut QemuProcess,
+    bus: &mut Bus,
+    tc: &TestCase,
+) -> Result<(), String> {
+    match run_one_test(gdb, bus, tc) {
+        Ok(()) => Ok(()),
+        Err(e) if is_gdb_error(&e) => {
+            eprintln!(
+                "[RECOVER] GDB error on {}: {}, respawning QEMU...",
+                tc.name, e
+            );
+            // Kill old QEMU (drop does this) and spawn fresh
+            match respawn_qemu(qemu, gdb) {
+                Ok(()) => Err(format!("SKIPPED (recovery): {e}")),
+                Err(re) => Err(format!("RECOVERY FAILED: {re} (original: {e})")),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Check if an error string indicates a GDB/IO problem rather than a test diff.
+fn is_gdb_error(e: &str) -> bool {
+    e.starts_with("QEMU error:")
+}
+
+/// Kill the old QEMU process, spawn a new one, and reconnect GDB.
+fn respawn_qemu(
+    qemu: &mut QemuProcess,
+    gdb: &mut GdbClient,
+) -> Result<(), String> {
+    // Drop old QEMU (kill on drop), spawn new
+    *qemu = QemuProcess::spawn().map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_millis(500));
+    *gdb = GdbClient::connect("localhost:3333", Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    gdb.handshake().map_err(|e| e.to_string())?;
+    setup_vector_table(gdb).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Execute the test on QEMU via GDB and read back post-state.
