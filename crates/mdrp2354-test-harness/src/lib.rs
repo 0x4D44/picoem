@@ -4187,7 +4187,9 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
             shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
         }
     }
-    let cycles = match tc.hw1 {
+    // Reset bus wait-state accumulator before execution (mirrors decode_execute).
+    shared_bus.reset_extra_wait_states();
+    let base_cycles = match tc.hw1 {
         None => if tc.needs_bus {
             core.execute_one_with_bus(tc.opcode, shared_bus)
         } else {
@@ -4199,6 +4201,8 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
             core.execute_one_wide(tc.opcode, hw1)
         },
     };
+    // Add bus extra wait states (e.g., SRAM bank 2/6 penalty, APB latency).
+    let cycles = base_cycles + shared_bus.extra_wait_states();
 
     // Collect post-state
     let mut regs = [0u32; 16];

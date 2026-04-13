@@ -4023,7 +4023,7 @@ fn bus_sram_write_then_read_roundtrip() {
 fn bus_xip_read_returns_loaded_flash_data() {
     let (_, mut bus) = core_and_bus();
     let flash = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
-    bus.memory.load_flash(&flash);
+    bus.load_flash(&flash);
     assert_eq!(bus.read8(0x1000_0000), 0xAA);
     assert_eq!(bus.read32(0x1000_0000), 0xDDCCBBAA);
     assert_eq!(bus.read32(0x1000_0004), 0x44332211);

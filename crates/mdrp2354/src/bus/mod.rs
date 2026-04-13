@@ -1,3 +1,5 @@
+pub mod ppb;
+
 use std::collections::HashMap;
 
 use crate::memory::{Memory, SRAM_SIZE};
@@ -21,6 +23,18 @@ pub struct Bus {
     core0_port: Option<u8>,
     /// Whether to check contention on bus accesses (active during core 1's step).
     contention_check_active: bool,
+    /// Per-core PPB register files (NVIC, SCB, SysTick stubs).
+    pub ppb: [ppb::Ppb; 2],
+    /// Bus fault detected on last access.
+    bus_fault: bool,
+    /// Address that caused the most recent bus fault.
+    bus_fault_addr: u32,
+    /// Whether flash (XIP) content has been loaded.
+    flash_loaded: bool,
+    /// Suppress per-word SRAM bank wait states during burst transfers
+    /// (STM/LDM/PUSH/POP). The SRAM controller handles sequential word
+    /// accesses without per-word bank penalties.
+    burst_mode: bool,
 }
 
 impl Bus {
@@ -32,6 +46,11 @@ impl Bus {
             peripheral_regs: HashMap::new(),
             core0_port: None,
             contention_check_active: false,
+            ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
+            bus_fault: false,
+            bus_fault_addr: 0,
+            flash_loaded: false,
+            burst_mode: false,
         }
     }
 
@@ -96,6 +115,37 @@ impl Bus {
         self.contention_check_active = true;
     }
 
+    /// Returns the active core index: 0 during core 0's step, 1 during core 1's.
+    pub fn active_core(&self) -> usize {
+        if self.contention_check_active { 1 } else { 0 }
+    }
+
+    /// Returns true if a bus fault was detected on the last access.
+    pub fn bus_fault(&self) -> bool {
+        self.bus_fault
+    }
+
+    /// Returns the address that caused the most recent bus fault.
+    pub fn bus_fault_addr(&self) -> u32 {
+        self.bus_fault_addr
+    }
+
+    /// Clear the bus fault flag.
+    pub fn clear_bus_fault(&mut self) {
+        self.bus_fault = false;
+    }
+
+    /// Set whether flash (XIP) content has been loaded.
+    pub fn set_flash_loaded(&mut self, loaded: bool) {
+        self.flash_loaded = loaded;
+    }
+
+    /// Load flash data into XIP memory and mark flash as loaded.
+    pub fn load_flash(&mut self, data: &[u8]) {
+        self.memory.load_flash(data);
+        self.flash_loaded = true;
+    }
+
     /// Check if this access contends with core 0. Returns extra stall cycles.
     /// Called internally by each read/write method.
     #[inline(always)]
@@ -130,6 +180,17 @@ impl Bus {
     /// Reset extra wait state accumulator. Called at start of each instruction.
     pub fn reset_extra_wait_states(&mut self) {
         self.extra_wait_states = 0;
+    }
+
+    /// Enable burst mode — suppresses per-word SRAM bank wait states.
+    /// Used by multi-word instructions (STM/LDM/PUSH/POP).
+    pub fn set_burst_mode(&mut self) {
+        self.burst_mode = true;
+    }
+
+    /// Disable burst mode after multi-word transfer completes.
+    pub fn clear_burst_mode(&mut self) {
+        self.burst_mode = false;
     }
 
     /// Compute read latency for an address region.
@@ -176,10 +237,17 @@ impl Bus {
         };
         match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
-            0x1 => self.memory.xip_read8(offset),
+            0x1 => {
+                if !self.flash_loaded {
+                    self.bus_fault = true;
+                    self.bus_fault_addr = addr;
+                    return 0;
+                }
+                self.memory.xip_read8(offset)
+            }
             0x2 if offset < SRAM_SIZE as u32 => {
                 let val = self.memory.sram_read8(offset);
-                self.extra_wait_states += sram_bank_wait(addr);
+                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
                 val
             }
             0x4 | 0x5 => {
@@ -191,7 +259,11 @@ impl Bus {
             }
             0xD => 0, // SIO (stub)
             0xE => 0, // PPB (stub)
-            _ => 0,   // unmapped
+            _ => {
+                self.bus_fault = true;
+                self.bus_fault_addr = addr;
+                0
+            }
         }
     }
 
@@ -226,7 +298,7 @@ impl Bus {
                     };
                     self.memory.sram_write8(offset, new_val);
                 }
-                self.extra_wait_states += sram_bank_wait(addr);
+                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -264,10 +336,17 @@ impl Bus {
         };
         match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
-            0x1 => self.memory.xip_read16(offset),
+            0x1 => {
+                if !self.flash_loaded {
+                    self.bus_fault = true;
+                    self.bus_fault_addr = addr;
+                    return 0;
+                }
+                self.memory.xip_read16(offset)
+            }
             0x2 if (offset + 1) < SRAM_SIZE as u32 => {
                 let val = self.memory.sram_read16(offset);
-                self.extra_wait_states += sram_bank_wait(addr);
+                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
                 val
             }
             0x4 | 0x5 => {
@@ -280,7 +359,11 @@ impl Bus {
             }
             0xD => 0, // SIO (stub)
             0xE => 0, // PPB (stub)
-            _ => 0,
+            _ => {
+                self.bus_fault = true;
+                self.bus_fault_addr = addr;
+                0
+            }
         }
     }
 
@@ -315,7 +398,7 @@ impl Bus {
                     };
                     self.memory.sram_write16(offset, new_val);
                 }
-                self.extra_wait_states += sram_bank_wait(addr);
+                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -354,10 +437,17 @@ impl Bus {
         };
         match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
-            0x1 => self.memory.xip_read32(offset),
+            0x1 => {
+                if !self.flash_loaded {
+                    self.bus_fault = true;
+                    self.bus_fault_addr = addr;
+                    return 0;
+                }
+                self.memory.xip_read32(offset)
+            }
             0x2 if (offset + 3) < SRAM_SIZE as u32 => {
                 let val = self.memory.sram_read32(offset);
-                self.extra_wait_states += sram_bank_wait(addr);
+                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
                 val
             }
             0x4 | 0x5 => {
@@ -365,9 +455,12 @@ impl Bus {
                 *self.peripheral_regs.get(&canonical).unwrap_or(&0)
             }
             0xD => 0, // SIO (stub)
-            0xE => 0, // PPB (stub)
-            // Unmapped or gap addresses return 0. BusFault is a Phase 3 feature.
-            _ => 0,
+            0xE => self.ppb[self.active_core()].read32(addr),
+            _ => {
+                self.bus_fault = true;
+                self.bus_fault_addr = addr;
+                0
+            }
         }
     }
 
@@ -402,7 +495,7 @@ impl Bus {
                     };
                     self.memory.sram_write32(offset, new_val);
                 }
-                self.extra_wait_states += sram_bank_wait(addr);
+                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -416,6 +509,10 @@ impl Bus {
                 };
                 self.peripheral_regs.insert(canonical, new_val);
             }
+            0xE => {
+                let core = self.active_core();
+                self.ppb[core].write32(addr, val);
+            }
             _ => {}
         }
     }
@@ -423,7 +520,12 @@ impl Bus {
 
 /// Extra wait-state for SRAM bank access.
 /// Banks 2 and 6 have +1 cycle on RP2350 (measured on silicon via DWT CYCCNT).
-fn sram_bank_wait(addr: u32) -> u32 {
+/// Returns 0 during burst mode (STM/LDM/PUSH/POP) — the SRAM controller
+/// handles sequential accesses without per-word bank penalties.
+fn sram_bank_wait(addr: u32, burst: bool) -> u32 {
+    if burst {
+        return 0;
+    }
     let offset = addr & 0x000F_FFFF;
     if offset < 0x8_0000 {
         // Striped SRAM0-7

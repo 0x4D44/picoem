@@ -348,7 +348,7 @@ impl CortexM33 {
     // ========================================================================
 
     /// High-register ADD/CMP/MOV and BX/BLX.
-    pub(crate) fn thumb16_special_data_bx(&mut self, opcode: u16, _bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_special_data_bx(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
         let op = (opcode >> 8) & 0x3;
         match op {
             0b00 => {
@@ -381,6 +381,9 @@ impl CortexM33 {
                 let rm = ((opcode >> 3) & 0xF) as usize;
                 let val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
                 if d == 15 {
+                    if Self::is_exc_return(val) {
+                        return self.exit_exception(val, bus);
+                    }
                     self.regs.set_pc(val & !1);
                     return 3; // pipeline flush
                 }
@@ -396,9 +399,15 @@ impl CortexM33 {
                     // BLX Rm: LR = address of next instruction | 1
                     let next = self.regs.pc() | 1;
                     self.regs.set_lr(next);
+                    if Self::is_exc_return(target) {
+                        return self.exit_exception(target, bus);
+                    }
+                } else {
+                    if Self::is_exc_return(target) {
+                        return self.exit_exception(target, bus);
+                    }
                 }
                 // Bit 0 of target encodes Thumb state. Must be 1 for M33.
-                // For Phase 1: accept and mask off.
                 self.regs.set_pc(target & !1);
                 1 // M33 measured: 1 cycle
             }
@@ -629,16 +638,27 @@ impl CortexM33 {
                 let count = reglist.count_ones();
                 let mut addr = self.regs.sp().wrapping_sub(count * 4);
                 self.regs.set_sp(addr);
+                bus.set_burst_mode(); // suppress per-word bank wait states
                 for i in 0..15 {
                     if reglist & (1 << i) != 0 {
                         bus.write32(addr, self.regs.r[i]);
                         addr = addr.wrapping_add(4);
                     }
                 }
+                bus.clear_burst_mode();
                 1 + count // M33 measured: 1 + N cycles (N = register count)
             }
             0b0110 => {
-                // CPS — stub for Phase 1 (affects PRIMASK/FAULTMASK)
+                // CPS: CPSIE/CPSID — affects PRIMASK/FAULTMASK
+                let im = ((opcode >> 4) & 1) as u32;
+                let affect_i = opcode & (1 << 0) != 0; // bit 0 = I (PRIMASK)
+                let affect_f = opcode & (1 << 1) != 0; // bit 1 = F (FAULTMASK)
+                if affect_i {
+                    self.regs.primask = im;
+                }
+                if affect_f {
+                    self.regs.faultmask = im;
+                }
                 1
             }
             0b1010 => {
@@ -670,11 +690,17 @@ impl CortexM33 {
                 }
                 let count = reglist.count_ones();
                 let mut addr = self.regs.sp();
+                bus.set_burst_mode(); // suppress per-word bank wait states
                 for i in 0..16 {
                     if reglist & (1 << i) != 0 {
                         let val = bus.read32(addr);
                         if i == 15 {
-                            // Loading PC: bit 0 → T bit (must be 1), clear for addr
+                            if Self::is_exc_return(val) {
+                                self.regs.set_sp(addr.wrapping_add(4));
+                                bus.clear_burst_mode();
+                                return self.exit_exception(val, bus);
+                            }
+                            // Loading PC: bit 0 -> T bit (must be 1), clear for addr
                             self.regs.set_pc(val & !1);
                         } else {
                             self.regs.r[i] = val;
@@ -682,6 +708,7 @@ impl CortexM33 {
                         addr = addr.wrapping_add(4);
                     }
                 }
+                bus.clear_burst_mode();
                 self.regs.set_sp(addr);
                 if pop_pc { 1 + count + 3 } else { 1 + count }
             }
@@ -732,12 +759,14 @@ impl CortexM33 {
         let count = reglist.count_ones();
         let mut addr = self.regs.r[rn];
 
+        bus.set_burst_mode();
         for i in 0..8 {
             if reglist & (1 << i) != 0 {
                 bus.write32(addr, self.regs.r[i]);
                 addr = addr.wrapping_add(4);
             }
         }
+        bus.clear_burst_mode();
         // Writeback
         self.regs.r[rn] = addr;
         1 + count
@@ -751,12 +780,14 @@ impl CortexM33 {
         let count = reglist.count_ones();
         let mut addr = self.regs.r[rn];
 
+        bus.set_burst_mode();
         for i in 0..8 {
             if reglist & (1 << i) != 0 {
                 self.regs.r[i] = bus.read32(addr);
                 addr = addr.wrapping_add(4);
             }
         }
+        bus.clear_burst_mode();
         // Writeback if Rn not in reglist
         if reglist & (1 << rn) == 0 {
             self.regs.r[rn] = addr;
@@ -769,7 +800,7 @@ impl CortexM33 {
     // ========================================================================
 
     /// B.cond and SVC (1101_cond_imm8).
-    pub(crate) fn thumb16_cond_branch_svc(&mut self, opcode: u16) -> u32 {
+    pub(crate) fn thumb16_cond_branch_svc(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
         let cond = ((opcode >> 8) & 0xF) as u8;
         match cond {
             0xE => {
@@ -777,8 +808,8 @@ impl CortexM33 {
                 self.thumb16_undefined(opcode)
             }
             0xF => {
-                // SVC — stub for Phase 1
-                1
+                // SVC — enter exception 11
+                self.enter_exception(11, bus)
             }
             _ => {
                 // Conditional branch
@@ -812,9 +843,9 @@ impl CortexM33 {
     // Thumb-16: Undefined
     // ========================================================================
 
-    /// Undefined instruction — UsageFault in Phase 3, NOP for now.
+    /// Undefined instruction — raises UsageFault.
     pub(crate) fn thumb16_undefined(&mut self, _opcode: u16) -> u32 {
-        // TODO: raise UsageFault (Phase 3)
-        1
+        self.pending_fault = Some(super::Fault::UsageFault);
+        0
     }
 }
