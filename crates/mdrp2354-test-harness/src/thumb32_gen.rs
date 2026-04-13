@@ -458,6 +458,160 @@ pub fn enc_t32_smlabb(rd: u16, rn: u16, rm: u16, ra: u16, n_high: bool, m_high: 
     (hw0, hw1)
 }
 
+// -- Dual halfword multiply (SMUAD/SMUADX, SMLAD/SMLADX, SMUSD/SMUSDX, SMLSD/SMLSDX)
+// Decoder: thumb32_multiply, op1=010 for add / op1=100 for sub.
+// hw0 = 0xFB20 (add) / 0xFB40 (sub)  | Rn
+// hw1 = Ra_Rd_0_X_Rm   (Ra=15 → no-accumulate SMU*, Ra!=15 → SML*)
+
+/// SMUAD / SMUADX Rd, Rn, Rm — dual halfword multiply-add (no accumulate).
+/// `cross` swaps Rm halfwords before the two products (the X suffix).
+pub fn enc_t32_smuad(rd: u16, rn: u16, rm: u16, cross: bool) -> (u16, u16) {
+    let hw0 = 0xFB20 | (rn & 0xF);
+    let op2 = cross as u16;
+    let hw1 = (0xF << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMLAD / SMLADX Rd, Rn, Rm, Ra — dual halfword multiply-add-accumulate.
+pub fn enc_t32_smlad(rd: u16, rn: u16, rm: u16, ra: u16, cross: bool) -> (u16, u16) {
+    let hw0 = 0xFB20 | (rn & 0xF);
+    let op2 = cross as u16;
+    let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMUSD / SMUSDX Rd, Rn, Rm — dual halfword multiply-subtract (no accumulate).
+pub fn enc_t32_smusd(rd: u16, rn: u16, rm: u16, cross: bool) -> (u16, u16) {
+    let hw0 = 0xFB40 | (rn & 0xF);
+    let op2 = cross as u16;
+    let hw1 = (0xF << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMLSD / SMLSDX Rd, Rn, Rm, Ra — dual halfword multiply-subtract-accumulate.
+pub fn enc_t32_smlsd(rd: u16, rn: u16, rm: u16, ra: u16, cross: bool) -> (u16, u16) {
+    let hw0 = 0xFB40 | (rn & 0xF);
+    let op2 = cross as u16;
+    let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+// -- Word x halfword (SMULWB/SMULWT, SMLAWB/SMLAWT)
+// Decoder: thumb32_multiply, op1=011
+// hw0 = 0xFB30 | Rn
+// hw1 = Ra_Rd_0_M_Rm   (M=1 → top halfword of Rm; Ra=15 → SMULW)
+
+/// SMULWB / SMULWT Rd, Rn, Rm — word times halfword (no accumulate).
+pub fn enc_t32_smulw(rd: u16, rn: u16, rm: u16, m_high: bool) -> (u16, u16) {
+    let hw0 = 0xFB30 | (rn & 0xF);
+    let op2 = m_high as u16;
+    let hw1 = (0xF << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMLAWB / SMLAWT Rd, Rn, Rm, Ra — word times halfword multiply-accumulate.
+pub fn enc_t32_smlaw(rd: u16, rn: u16, rm: u16, ra: u16, m_high: bool) -> (u16, u16) {
+    let hw0 = 0xFB30 | (rn & 0xF);
+    let op2 = m_high as u16;
+    let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+// -- Most significant word multiply (SMMUL/SMMULR, SMMLA/SMMLAR, SMMLS/SMMLSR)
+// Decoder: thumb32_multiply, op1=101 (mul/MLA) / op1=110 (MLS)
+// hw0 = 0xFB50 (MUL/MLA) / 0xFB60 (MLS)  | Rn
+// hw1 = Ra_Rd_0_R_Rm   (R=1 → rounding variant; Ra=15 → SMMUL)
+
+/// SMMUL / SMMULR Rd, Rn, Rm — most significant word multiply.
+/// `round` selects the rounding variant (R suffix).
+pub fn enc_t32_smmul(rd: u16, rn: u16, rm: u16, round: bool) -> (u16, u16) {
+    let hw0 = 0xFB50 | (rn & 0xF);
+    let op2 = round as u16;
+    let hw1 = (0xF << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMMLA / SMMLAR Rd, Rn, Rm, Ra — most significant word multiply-accumulate.
+pub fn enc_t32_smmla(rd: u16, rn: u16, rm: u16, ra: u16, round: bool) -> (u16, u16) {
+    let hw0 = 0xFB50 | (rn & 0xF);
+    let op2 = round as u16;
+    let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMMLS / SMMLSR Rd, Rn, Rm, Ra — most significant word multiply-subtract.
+pub fn enc_t32_smmls(rd: u16, rn: u16, rm: u16, ra: u16, round: bool) -> (u16, u16) {
+    let hw0 = 0xFB60 | (rn & 0xF);
+    let op2 = round as u16;
+    let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+// -- Sum of absolute differences (USAD8, USADA8)
+// Decoder: thumb32_multiply, op1=111
+// hw0 = 0xFB70 | Rn
+// hw1 = Ra_Rd_0000_Rm  (Ra=15 → USAD8, else USADA8)
+
+/// USAD8 Rd, Rn, Rm — sum of absolute differences (no accumulate).
+pub fn enc_t32_usad8(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
+    let hw0 = 0xFB70 | (rn & 0xF);
+    let hw1 = (0xF << 12) | ((rd & 0xF) << 8) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// USADA8 Rd, Rn, Rm, Ra — sum of absolute differences, accumulate.
+pub fn enc_t32_usada8(rd: u16, rn: u16, rm: u16, ra: u16) -> (u16, u16) {
+    let hw0 = 0xFB70 | (rn & 0xF);
+    let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+// -- Long halfword multiply-accumulate (SMLAL<x><y>)
+// Decoder: thumb32_long_multiply, op1=100, op2=1000..1011
+// hw0 = 0xFBC0 | Rn
+// hw1 = RdLo_RdHi_10_N_M_Rm   (N=high Rn, M=high Rm)
+
+/// SMLALBB/BT/TB/TT RdLo, RdHi, Rn, Rm — signed 64-bit halfword MAC.
+pub fn enc_t32_smlalxy(rdlo: u16, rdhi: u16, rn: u16, rm: u16, n_high: bool, m_high: bool) -> (u16, u16) {
+    let hw0 = 0xFBC0 | (rn & 0xF);
+    let op2 = 0b1000 | ((n_high as u16) << 1) | (m_high as u16);
+    let hw1 = ((rdlo & 0xF) << 12) | ((rdhi & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+// -- Long dual halfword multiply-add/subtract (SMLALD/SMLALDX, SMLSLD/SMLSLDX)
+// Decoder: thumb32_long_multiply, op1=100 (add) / op1=101 (sub), op2=1100/1101
+// hw0 = 0xFBC0 (add) / 0xFBD0 (sub)  | Rn
+// hw1 = RdLo_RdHi_110_X_Rm
+
+/// SMLALD / SMLALDX RdLo, RdHi, Rn, Rm — signed 64-bit dual halfword MAC.
+pub fn enc_t32_smlald(rdlo: u16, rdhi: u16, rn: u16, rm: u16, cross: bool) -> (u16, u16) {
+    let hw0 = 0xFBC0 | (rn & 0xF);
+    let op2 = 0b1100 | (cross as u16);
+    let hw1 = ((rdlo & 0xF) << 12) | ((rdhi & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+/// SMLSLD / SMLSLDX RdLo, RdHi, Rn, Rm — signed 64-bit dual halfword multiply-subtract.
+pub fn enc_t32_smlsld(rdlo: u16, rdhi: u16, rn: u16, rm: u16, cross: bool) -> (u16, u16) {
+    let hw0 = 0xFBD0 | (rn & 0xF);
+    let op2 = 0b1100 | (cross as u16);
+    let hw1 = ((rdlo & 0xF) << 12) | ((rdhi & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
+// -- Unsigned 64-bit multiply-accumulate-accumulate (UMAAL)
+// Decoder: thumb32_long_multiply, op1=110, op2=0110
+// hw0 = 0xFBE0 | Rn
+// hw1 = RdLo_RdHi_0110_Rm
+
+/// UMAAL RdLo, RdHi, Rn, Rm — unsigned 64-bit multiply plus two 32-bit accumulates.
+pub fn enc_t32_umaal(rdlo: u16, rdhi: u16, rn: u16, rm: u16) -> (u16, u16) {
+    let hw0 = 0xFBE0 | (rn & 0xF);
+    let hw1 = ((rdlo & 0xF) << 12) | ((rdhi & 0xF) << 8) | (0b0110 << 4) | (rm & 0xF);
+    (hw0, hw1)
+}
+
 // ============================================================================
 // 7. Branches
 // ============================================================================
@@ -4488,6 +4642,446 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             reg_pre: regs,
             xpsr_pre: rand_flags(rng),
             xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Long multiply (SMULL/UMULL/SMLAL/UMLAL) ---
+    for i in 0..count {
+        let variant: u8 = rng.range(0..4);
+        let rdlo = rand_reg(rng);
+        let rdhi = loop {
+            let r = rand_reg(rng);
+            if r != rdlo { break r; }
+        };
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rdlo && r != rdhi { break r; }
+        };
+        let rm = loop {
+            let r = rand_reg(rng);
+            if r != rdlo && r != rdhi && r != rn { break r; }
+        };
+        let regs = rand_gp_regs(rng);
+        let (tag, hw0, hw1) = match variant {
+            0 => { let (h0, h1) = enc_t32_smull(rdlo, rdhi, rn, rm); ("SMULL", h0, h1) }
+            1 => { let (h0, h1) = enc_t32_umull(rdlo, rdhi, rn, rm); ("UMULL", h0, h1) }
+            2 => { let (h0, h1) = enc_t32_smlal(rdlo, rdhi, rn, rm); ("SMLAL", h0, h1) }
+            _ => { let (h0, h1) = enc_t32_umlal(rdlo, rdhi, rn, rm); ("UMLAL", h0, h1) }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_LMUL:{i} {tag} R{rdlo},R{rdhi},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Halfword multiply (SMUL<x><y>) ---
+    for i in 0..count {
+        let n_high = rng.coin(0.5);
+        let m_high = rng.coin(0.5);
+        let rd = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rd { break r; }
+        };
+        let rm = loop {
+            let r = rand_reg(rng);
+            if r != rd && r != rn { break r; }
+        };
+        let regs = rand_gp_regs(rng);
+        let (hw0, hw1) = enc_t32_smulxy(rd, rn, rm, n_high, m_high);
+        let nt = if n_high { 'T' } else { 'B' };
+        let mt = if m_high { 'T' } else { 'B' };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_SMULxy:{i} SMUL{nt}{mt} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Halfword multiply-accumulate (SMLA<x><y>) ---
+    for i in 0..count {
+        let n_high = rng.coin(0.5);
+        let m_high = rng.coin(0.5);
+        let rd = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rd { break r; }
+        };
+        let rm = loop {
+            let r = rand_reg(rng);
+            if r != rd && r != rn { break r; }
+        };
+        let ra = loop {
+            let r = rand_reg(rng);
+            if r != rd && r != rn && r != rm { break r; }
+        };
+        let regs = rand_gp_regs(rng);
+        let (hw0, hw1) = enc_t32_smlabb(rd, rn, rm, ra, n_high, m_high);
+        let nt = if n_high { 'T' } else { 'B' };
+        let mt = if m_high { 'T' } else { 'B' };
+        // SMLA<x><y> writes Q on overflow of the 32-bit accumulate
+        t.push(TestCase {
+            name: format!("FUZZ:T32_SMLAxy:{i} SMLA{nt}{mt} R{rd},R{rn},R{rm},R{ra}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_Q_ONLY,
+            ..TestCase::default()
+        });
+    }
+
+    // --- SMMUL family (SMMUL/SMMULR, SMMLA/SMMLAR, SMMLS/SMMLSR) ---
+    // None of these write flags — the top 32 bits of a 64-bit product cannot
+    // overflow a signed 32-bit accumulate in any way that Arm's spec cares
+    // about, so no Q bit is ever set here.
+    for i in 0..count {
+        let variant: u8 = rng.range(0..3);
+        let round = rng.coin(0.5);
+        let rd = rand_reg(rng);
+        let rn = rand_reg(rng);
+        let rm = rand_reg(rng);
+        let regs = rand_gp_regs(rng);
+        let (tag, hw0, hw1) = match variant {
+            0 => {
+                let (h0, h1) = enc_t32_smmul(rd, rn, rm, round);
+                (if round { "SMMULR" } else { "SMMUL" }, h0, h1)
+            }
+            1 => {
+                let ra = rand_reg(rng);
+                let (h0, h1) = enc_t32_smmla(rd, rn, rm, ra, round);
+                (if round { "SMMLAR" } else { "SMMLA" }, h0, h1)
+            }
+            _ => {
+                let ra = rand_reg(rng);
+                let (h0, h1) = enc_t32_smmls(rd, rn, rm, ra, round);
+                (if round { "SMMLSR" } else { "SMMLS" }, h0, h1)
+            }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_SMM:{i} {tag} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Dual halfword (SMUAD/SMUADX/SMLAD/SMLADX/SMUSD/SMUSDX/SMLSD/SMLSDX) ---
+    // SMLAD/SMLSD can set Q on overflow of the 32-bit accumulate. SMUAD can
+    // also set Q when the two halfword products overflow the intermediate
+    // 32-bit sum. Use MASK_Q_ONLY across the class.
+    for i in 0..count {
+        let variant: u8 = rng.range(0..4);
+        let cross = rng.coin(0.5);
+        let rd = rand_reg(rng);
+        let rn = rand_reg(rng);
+        let rm = rand_reg(rng);
+        let regs = rand_gp_regs(rng);
+        let (tag, hw0, hw1) = match variant {
+            0 => {
+                let (h0, h1) = enc_t32_smuad(rd, rn, rm, cross);
+                (if cross { "SMUADX" } else { "SMUAD" }, h0, h1)
+            }
+            1 => {
+                let ra = rand_reg(rng);
+                let (h0, h1) = enc_t32_smlad(rd, rn, rm, ra, cross);
+                (if cross { "SMLADX" } else { "SMLAD" }, h0, h1)
+            }
+            2 => {
+                let (h0, h1) = enc_t32_smusd(rd, rn, rm, cross);
+                (if cross { "SMUSDX" } else { "SMUSD" }, h0, h1)
+            }
+            _ => {
+                let ra = rand_reg(rng);
+                let (h0, h1) = enc_t32_smlsd(rd, rn, rm, ra, cross);
+                (if cross { "SMLSDX" } else { "SMLSD" }, h0, h1)
+            }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_DUALH:{i} {tag} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_Q_ONLY,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Word x halfword (SMULWB/SMULWT, SMLAWB/SMLAWT) ---
+    // SMLAW can set Q on overflow of the 32-bit accumulate.
+    for i in 0..count {
+        let variant: u8 = rng.range(0..2);
+        let m_high = rng.coin(0.5);
+        let rd = rand_reg(rng);
+        let rn = rand_reg(rng);
+        let rm = rand_reg(rng);
+        let regs = rand_gp_regs(rng);
+        let mt = if m_high { 'T' } else { 'B' };
+        let (tag, hw0, hw1) = if variant == 0 {
+            let (h0, h1) = enc_t32_smulw(rd, rn, rm, m_high);
+            (format!("SMULW{mt}"), h0, h1)
+        } else {
+            let ra = rand_reg(rng);
+            let (h0, h1) = enc_t32_smlaw(rd, rn, rm, ra, m_high);
+            (format!("SMLAW{mt}"), h0, h1)
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_SMULW:{i} {tag} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_Q_ONLY,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Long halfword (SMLAL<x><y>, SMLALD/SMLALDX, SMLSLD/SMLSLDX) ---
+    // All three write the RdLo:RdHi pair and never touch flags.
+    for i in 0..count {
+        let variant: u8 = rng.range(0..3);
+        let rdlo = rand_reg(rng);
+        let rdhi = loop {
+            let r = rand_reg(rng);
+            if r != rdlo { break r; }
+        };
+        let rn = rand_reg(rng);
+        let rm = rand_reg(rng);
+        let regs = rand_gp_regs(rng);
+        let (tag, hw0, hw1) = match variant {
+            0 => {
+                let n_high = rng.coin(0.5);
+                let m_high = rng.coin(0.5);
+                let nt = if n_high { 'T' } else { 'B' };
+                let mt = if m_high { 'T' } else { 'B' };
+                let (h0, h1) = enc_t32_smlalxy(rdlo, rdhi, rn, rm, n_high, m_high);
+                (format!("SMLAL{nt}{mt}"), h0, h1)
+            }
+            1 => {
+                let cross = rng.coin(0.5);
+                let (h0, h1) = enc_t32_smlald(rdlo, rdhi, rn, rm, cross);
+                (if cross { "SMLALDX".to_string() } else { "SMLALD".to_string() }, h0, h1)
+            }
+            _ => {
+                let cross = rng.coin(0.5);
+                let (h0, h1) = enc_t32_smlsld(rdlo, rdhi, rn, rm, cross);
+                (if cross { "SMLSLDX".to_string() } else { "SMLSLD".to_string() }, h0, h1)
+            }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_LMULH:{i} {tag} R{rdlo},R{rdhi},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Special DSP (UMAAL, USAD8, USADA8) ---
+    // None of these write flags.
+    for i in 0..count {
+        let variant: u8 = rng.range(0..3);
+        let regs = rand_gp_regs(rng);
+        let (tag, hw0, hw1) = match variant {
+            0 => {
+                let rdlo = rand_reg(rng);
+                let rdhi = loop {
+                    let r = rand_reg(rng);
+                    if r != rdlo { break r; }
+                };
+                let rn = rand_reg(rng);
+                let rm = rand_reg(rng);
+                let (h0, h1) = enc_t32_umaal(rdlo, rdhi, rn, rm);
+                (format!("UMAAL R{rdlo},R{rdhi},R{rn},R{rm}"), h0, h1)
+            }
+            1 => {
+                let rd = rand_reg(rng);
+                let rn = rand_reg(rng);
+                let rm = rand_reg(rng);
+                let (h0, h1) = enc_t32_usad8(rd, rn, rm);
+                (format!("USAD8 R{rd},R{rn},R{rm}"), h0, h1)
+            }
+            _ => {
+                let rd = rand_reg(rng);
+                let rn = rand_reg(rng);
+                let rm = rand_reg(rng);
+                let ra = rand_reg(rng);
+                let (h0, h1) = enc_t32_usada8(rd, rn, rm, ra);
+                (format!("USADA8 R{rd},R{rn},R{rm},R{ra}"), h0, h1)
+            }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_DSPSP:{i} {tag}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Saturating arithmetic (QADD/QSUB/QDADD/QDSUB) ---
+    for i in 0..count {
+        let variant: u8 = rng.range(0..4);
+        let rd = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rd { break r; }
+        };
+        let rm = loop {
+            let r = rand_reg(rng);
+            if r != rd && r != rn { break r; }
+        };
+        let mut regs = rand_gp_regs(rng);
+        // Bias ~20% of operand values toward saturation edges. The outer four
+        // hit the QADD/QSUB boundary; the inner four hit the 2*Rn doubling
+        // boundary that QDADD/QDSUB saturate on.
+        let edge_val = |rng: &mut StdRng| -> u32 {
+            if rng.coin(0.2) {
+                let pick: u8 = rng.range(0..8);
+                match pick {
+                    0 => 0x7FFF_FFFF,
+                    1 => 0x8000_0000,
+                    2 => 0x7FFF_FFFE,
+                    3 => 0x8000_0001,
+                    4 => 0x4000_0000,
+                    5 => 0x3FFF_FFFF,
+                    6 => 0xC000_0000,
+                    _ => 0xBFFF_FFFF,
+                }
+            } else {
+                rand_val(rng)
+            }
+        };
+        regs.retain(|&(r, _)| r != rn as u8 && r != rm as u8);
+        regs.push((rn as u8, edge_val(rng)));
+        regs.push((rm as u8, edge_val(rng)));
+        let (tag, hw0, hw1) = match variant {
+            0 => { let (h0, h1) = enc_t32_qadd(rd, rn, rm); ("QADD", h0, h1) }
+            1 => { let (h0, h1) = enc_t32_qsub(rd, rn, rm); ("QSUB", h0, h1) }
+            2 => { let (h0, h1) = enc_t32_qdadd(rd, rn, rm); ("QDADD", h0, h1) }
+            _ => { let (h0, h1) = enc_t32_qdsub(rd, rn, rm); ("QDSUB", h0, h1) }
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_QSAT:{i} {tag} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_Q_ONLY,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Parallel add/subtract (SADD16, UADD8, QSAX, UHSUB16, ...) ---
+    // Valid modifier (par_op2): signed=0b000, Q=0b001, H=0b010, unsigned=0b100, UQ=0b101, UH=0b110.
+    // Valid operation (par_op1): ADD8=0b000, ADD16=0b001, ASX=0b010, SAX=0b011, SUB8=0b100, SUB16=0b101.
+    // Sat/halving modifiers are 16-bit only — par_op1 must then be one of {001,010,011,101}.
+    for i in 0..count {
+        let modifiers = [0b000u16, 0b001, 0b010, 0b100, 0b101, 0b110];
+        let modifier = modifiers[rng.range(0..modifiers.len())];
+        let sixteen_only = matches!(modifier, 0b001 | 0b010 | 0b101 | 0b110);
+        let operation: u16 = if sixteen_only {
+            let ops16 = [0b001u16, 0b010, 0b011, 0b101];
+            ops16[rng.range(0..ops16.len())]
+        } else {
+            let ops_any = [0b000u16, 0b001, 0b010, 0b011, 0b100, 0b101];
+            ops_any[rng.range(0..ops_any.len())]
+        };
+        let rd = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rd { break r; }
+        };
+        let rm = loop {
+            let r = rand_reg(rng);
+            if r != rd && r != rn { break r; }
+        };
+        let regs = rand_gp_regs(rng);
+        let (hw0, hw1) = enc_t32_parallel(operation, modifier, rn, rd, rm);
+        // Plain signed/unsigned variants set GE flags; sat and halving do not.
+        let mask = if modifier == 0b000 || modifier == 0b100 {
+            MASK_ALL_FLAGS_GE
+        } else {
+            MASK_NO_FLAGS
+        };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_PARADD:{i} op={operation:03b} mod={modifier:03b} R{rd},R{rn},R{rm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: mask,
+            ..TestCase::default()
+        });
+    }
+
+    // --- Signed/unsigned saturate (SSAT / USAT) ---
+    for i in 0..count {
+        let is_signed = rng.coin(0.5);
+        let rd = rand_reg(rng);
+        let rn = loop {
+            let r = rand_reg(rng);
+            if r != rd { break r; }
+        };
+        // Randomise shift type/amount. ASR#0 is UNPREDICTABLE; keep ASR in 1..=31.
+        let use_asr = rng.coin(0.5);
+        let (stype, samount) = if use_asr {
+            (SHIFT_ASR, rng.range(1..32))
+        } else {
+            (SHIFT_LSL, rng.range(0..32))
+        };
+        // Bias 30% toward values close to signed saturation bounds.
+        let mut regs = rand_gp_regs(rng);
+        let val: u32 = if rng.coin(0.3) {
+            let pick: u8 = rng.range(0..4);
+            match pick {
+                0 => 0x7FFF_FFFF,
+                1 => 0x8000_0000,
+                2 => rand_val(rng) & 0x0000_FFFF,
+                _ => (rand_val(rng) | 0xFFFF_0000) ^ 0x8000_0000,
+            }
+        } else {
+            rand_val(rng)
+        };
+        regs.retain(|&(r, _)| r != rn as u8);
+        regs.push((rn as u8, val));
+        let (tag, sat, hw0, hw1) = if is_signed {
+            // SSAT encodes (sat-1) into 5 bits → valid sat is 1..=32.
+            let sat: u16 = rng.range(1..33);
+            let (h0, h1) = enc_t32_ssat(rd, rn, sat, stype, samount);
+            ("SSAT", sat, h0, h1)
+        } else {
+            // USAT encodes sat into 5 bits → valid sat is 0..=31.
+            let sat: u16 = rng.range(0..32);
+            let (h0, h1) = enc_t32_usat(rd, rn, sat, stype, samount);
+            ("USAT", sat, h0, h1)
+        };
+        let sh = if stype == SHIFT_ASR { "ASR" } else { "LSL" };
+        t.push(TestCase {
+            name: format!("FUZZ:T32_SAT:{i} {tag} R{rd},#{sat},R{rn},{sh}#{samount}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }

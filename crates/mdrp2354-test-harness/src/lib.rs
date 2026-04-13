@@ -5241,10 +5241,12 @@ mod tests {
     fn fuzz_generates_expected_count() {
         let (alu, mem) = generate_fuzz(10, 0);
         // T16 ALU: shift, addsub, imm8, dproc, special, misc, bcond, buncond = 8 classes
-        // T32 ALU: dp_imm, dp_sreg, mul, div, bcond = 5 classes
+        // T32 ALU: dp_imm, dp_sreg, mul, div, lmul, smulxy, smlaxy,
+        //          smm_family, dual_halfword, word_x_half, long_halfword, dsp_special,
+        //          qsat, paradd, sat, bcond = 16 classes
         // T16 MEM: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 classes
         // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
-        assert_eq!(alu.len(), (8 + 5) * 10, "ALU count: (8 T16 + 5 T32) * 10");
+        assert_eq!(alu.len(), (8 + 16) * 10, "ALU count: (8 T16 + 16 T32) * 10");
         assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
     }
 
