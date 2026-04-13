@@ -19,3 +19,7 @@ path = "src/bin/probe_verify.rs"
 [[bin]]
 name = "probe_diff"
 path = "src/bin/probe_diff.rs"
+
+[[bin]]
+name = "bank_conflict_test"
+path = "src/bin/bank_conflict_test.rs"

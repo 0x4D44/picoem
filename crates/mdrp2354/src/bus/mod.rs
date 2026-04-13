@@ -177,7 +177,11 @@ impl Bus {
         match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
             0x1 => self.memory.xip_read8(offset),
-            0x2 if offset < SRAM_SIZE as u32 => self.memory.sram_read8(offset),
+            0x2 if offset < SRAM_SIZE as u32 => {
+                let val = self.memory.sram_read8(offset);
+                self.extra_wait_states += sram_bank_wait(addr);
+                val
+            }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let word_addr = canonical & !3;
@@ -222,6 +226,7 @@ impl Bus {
                     };
                     self.memory.sram_write8(offset, new_val);
                 }
+                self.extra_wait_states += sram_bank_wait(addr);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -260,7 +265,11 @@ impl Bus {
         match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
             0x1 => self.memory.xip_read16(offset),
-            0x2 if (offset + 1) < SRAM_SIZE as u32 => self.memory.sram_read16(offset),
+            0x2 if (offset + 1) < SRAM_SIZE as u32 => {
+                let val = self.memory.sram_read16(offset);
+                self.extra_wait_states += sram_bank_wait(addr);
+                val
+            }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let word_addr = canonical & !3;
@@ -306,6 +315,7 @@ impl Bus {
                     };
                     self.memory.sram_write16(offset, new_val);
                 }
+                self.extra_wait_states += sram_bank_wait(addr);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -345,7 +355,11 @@ impl Bus {
         match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
             0x1 => self.memory.xip_read32(offset),
-            0x2 if (offset + 3) < SRAM_SIZE as u32 => self.memory.sram_read32(offset),
+            0x2 if (offset + 3) < SRAM_SIZE as u32 => {
+                let val = self.memory.sram_read32(offset);
+                self.extra_wait_states += sram_bank_wait(addr);
+                val
+            }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 *self.peripheral_regs.get(&canonical).unwrap_or(&0)
@@ -388,6 +402,7 @@ impl Bus {
                     };
                     self.memory.sram_write32(offset, new_val);
                 }
+                self.extra_wait_states += sram_bank_wait(addr);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -403,6 +418,23 @@ impl Bus {
             }
             _ => {}
         }
+    }
+}
+
+/// Extra wait-state for SRAM bank access.
+/// Banks 2 and 6 have +1 cycle on RP2350 (measured on silicon via DWT CYCCNT).
+fn sram_bank_wait(addr: u32) -> u32 {
+    let offset = addr & 0x000F_FFFF;
+    if offset < 0x8_0000 {
+        // Striped SRAM0-7
+        let bank = (offset >> 2) & 7;
+        if bank == 2 || bank == 6 {
+            1
+        } else {
+            0
+        }
+    } else {
+        0 // SRAM8-9 non-striped: no extra wait
     }
 }
 

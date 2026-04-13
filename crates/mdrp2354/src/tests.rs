@@ -1733,19 +1733,37 @@ fn ldr_w_post_index() {
 
 #[test]
 fn pld_rt15_is_nop() {
-    // Load with Rt=15 is PLD/PLI (preload hint), treated as NOP.
+    // Byte load with Rt=15 is PLD (preload hint), treated as NOP.
     let (mut c, mut bus) = core_and_bus();
     c.regs.set_pc(0x1000);
     c.set_reg(1, 0x2000_0000);
     bus.write32(0x2000_0000, 0xDEAD_BEEF);
-    // LDR.W R15, [R1, #0] → Rt=15 → PLD, returns 1
-    let (hw0, _) = encode_ldr_w_imm12(15, 1, 0);
-    let hw1: u16 = (15u16 << 12) | 0; // Rt=15, imm12=0
+    // LDRB.W R15, [R1, #0] → Rt=15, size=byte → PLD, returns 1
+    let (hw0, hw1) = encode_ldrb_w_imm12(15, 1, 0);
     let pc_before = c.regs.pc();
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     // PC should be at pc_before+4 (normal advance), not modified by load
     assert_eq!(c.regs.pc(), pc_before + 4);
     assert_eq!(cy, 1); // NOP cost
+}
+
+#[test]
+fn ldr_w_rt15_loads_pc() {
+    // Word load with Rt=15 is LDR PC (real load), not a preload hint.
+    let (mut c, mut bus) = core_and_bus();
+    c.regs.set_pc(0x1000);
+    c.set_reg(1, 0x2000_0000);
+    bus.write32(0x2000_0000, 0x0000_1001); // target addr with thumb bit
+    // LDR.W R15, [R1, #0] → Rt=15, size=word → loads PC
+    let (hw0, hw1) = encode_ldr_w_imm12(15, 1, 0);
+    eprintln!("hw0={:#06x} hw1={:#06x}", hw0, hw1);
+    let sz = (hw0 >> 5) & 3; let ld = (hw0 >> 4) & 1;
+    eprintln!("size={} load={} rn={} rt={}", sz, ld, hw0 & 0xF, (hw1 >> 12) & 0xF);
+    let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    eprintln!("cy={} pc={:#x} r15={:#x}", cy, c.regs.pc(), c.regs.r[15]);
+    // PC set to loaded value with bit[0] cleared
+    assert_eq!(c.regs.pc(), 0x0000_1000);
+    assert_eq!(cy, 5); // load + pipeline flush
 }
 
 // ============================================================================
@@ -4553,4 +4571,53 @@ fn dual_core_extra_wait_states_no_pollution() {
     // Both should have 0 stall cycles — no pollution, no contention (different banks)
     assert_eq!(emu.cores[0].stall_cycles(), 0, "core 0 should have no stall");
     assert_eq!(emu.cores[1].stall_cycles(), 0, "core 1 should have no stall (no pollution)");
+}
+
+// ============================================================================
+// 2.9 SRAM Per-Bank Extra Wait States
+// ============================================================================
+
+#[test]
+fn sram_bank2_read_extra_wait() {
+    let mut bus = crate::bus::Bus::new();
+    bus.reset_extra_wait_states();
+    // 0x20000008: offset 0x8, bank = (0x8 >> 2) & 7 = 2
+    let _ = bus.read32(0x2000_0008);
+    assert_eq!(bus.extra_wait_states(), 1, "bank 2 read should add +1 wait state");
+}
+
+#[test]
+fn sram_bank6_read_extra_wait() {
+    let mut bus = crate::bus::Bus::new();
+    bus.reset_extra_wait_states();
+    // 0x20000018: offset 0x18, bank = (0x18 >> 2) & 7 = 6
+    let _ = bus.read32(0x2000_0018);
+    assert_eq!(bus.extra_wait_states(), 1, "bank 6 read should add +1 wait state");
+}
+
+#[test]
+fn sram_bank0_no_extra_wait() {
+    let mut bus = crate::bus::Bus::new();
+    bus.reset_extra_wait_states();
+    // 0x20000000: offset 0x0, bank = (0x0 >> 2) & 7 = 0
+    let _ = bus.read32(0x2000_0000);
+    assert_eq!(bus.extra_wait_states(), 0, "bank 0 read should have no extra wait state");
+}
+
+#[test]
+fn sram_bank2_write_extra_wait() {
+    let mut bus = crate::bus::Bus::new();
+    bus.reset_extra_wait_states();
+    // 0x20000008: offset 0x8, bank = (0x8 >> 2) & 7 = 2
+    bus.write32(0x2000_0008, 0xDEAD_BEEF);
+    assert_eq!(bus.extra_wait_states(), 1, "bank 2 write should add +1 wait state");
+}
+
+#[test]
+fn sram_bank89_no_extra_wait() {
+    let mut bus = crate::bus::Bus::new();
+    bus.reset_extra_wait_states();
+    // 0x20080000: offset 0x80000, non-striped SRAM8
+    let _ = bus.read32(0x2008_0000);
+    assert_eq!(bus.extra_wait_states(), 0, "SRAM8 read should have no extra wait state");
 }

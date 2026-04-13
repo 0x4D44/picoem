@@ -524,8 +524,9 @@ impl CortexM33 {
         let rn = (hw0 & 0xF) as usize;          // hw0[3:0], 15=PC-relative
         let rt = ((hw1 >> 12) & 0xF) as usize;  // hw1[15:12]
 
-        // GUARD: load with Rt=15 is PLD/PLI (preload hint), NOT a load to PC.
-        if load && rt == 15 {
+        // PLD/PLI: byte or halfword load with Rt=15 is a preload hint, not a real load.
+        // Word-size loads with Rt=15 are real PC loads (LDR.W PC, [...]).
+        if load && rt == 15 && size != 0b10 {
             return 1;
         }
 
@@ -594,8 +595,16 @@ impl CortexM33 {
                 self.regs.r[rt] = bus.read16(addr) as i16 as i32 as u32;
             }
             (0b10, false) => {
-                if load { self.regs.r[rt] = bus.read32(addr); }
-                else { bus.write32(addr, self.regs.r[rt]); }
+                if load {
+                    let val = bus.read32(addr);
+                    if rt == 15 {
+                        self.regs.set_pc(val & !1);
+                        return 5; // load + pipeline flush
+                    }
+                    self.regs.r[rt] = val;
+                } else {
+                    bus.write32(addr, self.regs.r[rt]);
+                }
             }
             _ => return 1, // undefined: signed word or size=11
         }
