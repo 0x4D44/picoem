@@ -325,6 +325,7 @@ impl CortexM33 {
                 self.regs.r[rdn] = result;
                 self.regs.set_nz(result);
                 // Note: C and V flags are UNPREDICTABLE for M33 MUL
+                return 2; // M33 measured: 2 cycles
             }
             0xE => {
                 // BICS Rdn, Rm — Rd = Rd AND NOT(Rm)
@@ -399,7 +400,7 @@ impl CortexM33 {
                 // Bit 0 of target encodes Thumb state. Must be 1 for M33.
                 // For Phase 1: accept and mask off.
                 self.regs.set_pc(target & !1);
-                3 // pipeline flush
+                1 // M33 measured: 1 cycle
             }
         }
     }
@@ -416,7 +417,7 @@ impl CortexM33 {
         let base = self.read_pc() & !3;
         let addr = base.wrapping_add(imm8 << 2);
         self.regs.r[rt] = bus.read32(addr);
-        2 // 1 (addr calc) + 1 (memory)
+        2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
     // ========================================================================
@@ -436,44 +437,44 @@ impl CortexM33 {
             0b000 => {
                 // STR Rt, [Rn, Rm]
                 bus.write32(addr, self.regs.r[rt]);
-                1
+                2 // M33 measured: 2 cycles
             }
             0b001 => {
                 // STRH Rt, [Rn, Rm]
                 bus.write16(addr, self.regs.r[rt] as u16);
-                1
+                2 // M33 measured: 2 cycles
             }
             0b010 => {
                 // STRB Rt, [Rn, Rm]
                 bus.write8(addr, self.regs.r[rt] as u8);
-                1
+                2 // M33 measured: 2 cycles
             }
             0b011 => {
                 // LDRSB Rt, [Rn, Rm]
                 let val = bus.read8(addr) as i8 as i32 as u32;
                 self.regs.r[rt] = val;
-                2
+                2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             0b100 => {
                 // LDR Rt, [Rn, Rm]
                 self.regs.r[rt] = bus.read32(addr);
-                2
+                2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             0b101 => {
                 // LDRH Rt, [Rn, Rm]
                 self.regs.r[rt] = bus.read16(addr) as u32;
-                2
+                2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             0b110 => {
                 // LDRB Rt, [Rn, Rm]
                 self.regs.r[rt] = bus.read8(addr) as u32;
-                2
+                2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             _ => {
                 // 0b111: LDRSH Rt, [Rn, Rm]
                 let val = bus.read16(addr) as i16 as i32 as u32;
                 self.regs.r[rt] = val;
-                2
+                2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
         }
     }
@@ -489,7 +490,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 2);
         bus.write32(addr, self.regs.r[rt]);
-        1
+        2 // M33 measured: 2 cycles
     }
 
     /// LDR Rt, [Rn, #imm5*4] (01101_imm5_Rn_Rt).
@@ -499,7 +500,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 2);
         self.regs.r[rt] = bus.read32(addr);
-        2
+        2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
     /// STRB Rt, [Rn, #imm5] (01110_imm5_Rn_Rt).
@@ -509,7 +510,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5);
         bus.write8(addr, self.regs.r[rt] as u8);
-        1
+        2 // M33 measured: 2 cycles
     }
 
     /// LDRB Rt, [Rn, #imm5] (01111_imm5_Rn_Rt).
@@ -519,7 +520,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5);
         self.regs.r[rt] = bus.read8(addr) as u32;
-        2
+        2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
     /// STRH Rt, [Rn, #imm5*2] (10000_imm5_Rn_Rt).
@@ -529,7 +530,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 1);
         bus.write16(addr, self.regs.r[rt] as u16);
-        1
+        2 // M33 measured: 2 cycles
     }
 
     /// LDRH Rt, [Rn, #imm5*2] (10001_imm5_Rn_Rt).
@@ -539,7 +540,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 1);
         self.regs.r[rt] = bus.read16(addr) as u32;
-        2
+        2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
     // ========================================================================
@@ -552,7 +553,7 @@ impl CortexM33 {
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
         bus.write32(addr, self.regs.r[rt]);
-        1
+        2 // M33 measured: 2 cycles
     }
 
     /// LDR Rt, [SP, #imm8*4] (10011_Rt_imm8).
@@ -561,7 +562,7 @@ impl CortexM33 {
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
         self.regs.r[rt] = bus.read32(addr);
-        2
+        2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
     // ========================================================================
@@ -634,7 +635,7 @@ impl CortexM33 {
                         addr = addr.wrapping_add(4);
                     }
                 }
-                1 + count
+                1 + count // M33 measured: 1 + N cycles (N = register count)
             }
             0b0110 => {
                 // CPS — stub for Phase 1 (affects PRIMASK/FAULTMASK)
@@ -786,7 +787,7 @@ impl CortexM33 {
                     let offset = sign_extend(imm8 << 1, 9); // 8-bit imm, shifted left 1, sign-extended from bit 8
                     let target = self.read_pc().wrapping_add(offset);
                     self.regs.set_pc(target);
-                    2 // branch taken
+                    1 // M33 measured: 1 cycle (taken)
                 } else {
                     1 // not taken
                 }
@@ -804,7 +805,7 @@ impl CortexM33 {
         let offset = sign_extend(imm11 << 1, 12); // 11-bit imm, shifted left 1, sign-extended from bit 11
         let target = self.read_pc().wrapping_add(offset);
         self.regs.set_pc(target);
-        2
+        1 // M33 measured: 1 cycle
     }
 
     // ========================================================================

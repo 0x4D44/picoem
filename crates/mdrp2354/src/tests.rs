@@ -689,7 +689,7 @@ fn branch_cond_taken() {
     // 1101_0000_00000011 = 0xD003
     let cy = c.execute_one(0xD003);
     assert_eq!(c.regs.pc(), 0x100A); // read_pc()=0x1004, +6=0x100A
-    assert_eq!(cy, 2); // taken
+    assert_eq!(cy, 1); // taken — M33 measured: 1 cycle
 }
 
 #[test]
@@ -973,9 +973,9 @@ fn thumb32_ldr_w_routes_to_load_store_single() {
     // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000
     // op1 = (0xF8D1 >> 11) & 0x3 = 0b11
     // op2 = (0xF8D1 >> 4) & 0x7F = 0x0D = 0b0001101
-    // op2 & 0x40 = 0, op2 & 0x20 = 0 → load_store_single → load costs 2
+    // op2 & 0x40 = 0, op2 & 0x20 = 0 → load_store_single → load costs 3
     let cy = c.execute_one_wide(0xF8D1, 0x0000);
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 // ============================================================================
@@ -1586,7 +1586,7 @@ fn ldr_w_imm12() {
     let (hw0, hw1) = encode_ldr_w_imm12(0, 1, 100);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0xDEAD_BEEF);
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1598,7 +1598,7 @@ fn str_w_imm12() {
     let (hw0, hw1) = encode_str_w_imm12(0, 1, 100);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(bus.read32(0x2000_0064), 0xCAFE_BABE);
-    assert_eq!(cy, 1);
+    assert_eq!(cy, 2); // M33 measured: 2 cycles
 }
 
 #[test]
@@ -1611,7 +1611,7 @@ fn ldr_w_reg() {
     let (hw0, hw1) = encode_ldr_w_reg(0, 1, 2, 2); // LSL #2
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0x1234_5678);
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1623,7 +1623,7 @@ fn ldrb_w_imm12() {
     let (hw0, hw1) = encode_ldrb_w_imm12(0, 1, 10);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0xAB); // zero-extended
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1635,7 +1635,7 @@ fn ldrh_w_imm12() {
     let (hw0, hw1) = encode_ldrh_w_imm12(0, 1, 6);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0xBEEF); // zero-extended
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1647,7 +1647,7 @@ fn ldrsb_w_imm12() {
     let (hw0, hw1) = encode_ldrsb_w_imm12(0, 1, 0);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0xFFFF_FF80); // sign-extended
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1659,7 +1659,7 @@ fn ldrsh_w_imm12() {
     let (hw0, hw1) = encode_ldrsh_w_imm12(0, 1, 2);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0xFFFF_8001); // sign-extended
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1671,7 +1671,7 @@ fn strb_w_imm12() {
     let (hw0, hw1) = encode_strb_w_imm12(0, 1, 5);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(bus.read8(0x2000_0005), 0x42);
-    assert_eq!(cy, 1);
+    assert_eq!(cy, 2); // M33 measured: 2 cycles
 }
 
 #[test]
@@ -1683,7 +1683,7 @@ fn strh_w_imm12() {
     let (hw0, hw1) = encode_strh_w_imm12(0, 1, 8);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(bus.read16(0x2000_0008), 0xBEEF);
-    assert_eq!(cy, 1);
+    assert_eq!(cy, 2); // M33 measured: 2 cycles
 }
 
 #[test]
@@ -1700,7 +1700,7 @@ fn ldr_w_literal() {
     let hw1: u16 = 0x0008; // Rt=R0, imm12=8
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0xAAAA_BBBB);
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1714,7 +1714,7 @@ fn ldr_w_pre_index() {
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0x1111_2222);      // loaded from base+4
     assert_eq!(c.reg(1), 0x2000_0004);      // R1 updated (writeback)
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]
@@ -1728,7 +1728,7 @@ fn ldr_w_post_index() {
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0x3333_4444);      // loaded from original base
     assert_eq!(c.reg(1), 0x2000_0004);      // R1 updated after load
-    assert_eq!(cy, 2);
+    assert_eq!(cy, 3); // M33 measured: 3 cycles
 }
 
 #[test]

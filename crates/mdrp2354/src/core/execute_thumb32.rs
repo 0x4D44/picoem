@@ -570,7 +570,7 @@ impl CortexM33 {
     }
 
     /// Perform a single load/store memory access by size and sign.
-    /// Returns cycle count: load=2, store=1, undefined=1.
+    /// Returns cycle count: load=3, store=2, undefined=1 (M33 measured).
     #[inline(always)]
     fn thumb32_ls_single_access(
         &mut self, size: u8, sign: bool, load: bool,
@@ -599,7 +599,7 @@ impl CortexM33 {
             }
             _ => return 1, // undefined: signed word or size=11
         }
-        if load { 2 } else { 1 }
+        if load { 3 } else { 2 } // M33 measured: load=3, store=2 cycles
     }
 
     // -- Load/store multiple -------------------------------------------------

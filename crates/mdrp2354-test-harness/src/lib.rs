@@ -368,7 +368,7 @@ fn enc_branch_uncond(offset_bytes: i32) -> u16 {
 }
 
 /// Write a u32 value as 4 little-endian bytes into mem_pre entries.
-fn mem_pre_u32(offset: u32, val: u32) -> Vec<(u32, u8)> {
+pub fn mem_pre_u32(offset: u32, val: u32) -> Vec<(u32, u8)> {
     vec![
         (offset, (val & 0xFF) as u8),
         (offset + 1, ((val >> 8) & 0xFF) as u8),
@@ -378,7 +378,7 @@ fn mem_pre_u32(offset: u32, val: u32) -> Vec<(u32, u8)> {
 }
 
 /// Write a u16 value as 2 little-endian bytes into mem_pre entries.
-fn mem_pre_u16(offset: u32, val: u16) -> Vec<(u32, u8)> {
+pub fn mem_pre_u16(offset: u32, val: u16) -> Vec<(u32, u8)> {
     vec![
         (offset, (val & 0xFF) as u8),
         (offset + 1, ((val >> 8) & 0xFF) as u8),
@@ -386,12 +386,12 @@ fn mem_pre_u16(offset: u32, val: u16) -> Vec<(u32, u8)> {
 }
 
 /// Byte offsets for a 32-bit word check.
-fn mem_check_u32(offset: u32) -> Vec<u32> {
+pub fn mem_check_u32(offset: u32) -> Vec<u32> {
     vec![offset, offset + 1, offset + 2, offset + 3]
 }
 
 /// Byte offsets for a 16-bit halfword check.
-fn mem_check_u16(offset: u32) -> Vec<u32> {
+pub fn mem_check_u16(offset: u32) -> Vec<u32> {
     vec![offset, offset + 1]
 }
 
@@ -3522,6 +3522,10 @@ pub fn generate_all() -> Vec<TestCase> {
     all.extend(gen_stm_ldm());
     all.extend(gen_branch_cond());
     all.extend(gen_branch_uncond());
+    // Thumb-32 generators (uncomment as implementations land)
+    // all.extend(thumb32_gen::gen_t32_dp_mod_imm());
+    // all.extend(thumb32_gen::gen_t32_load_store_single());
+    // all.extend(thumb32_gen::gen_t32_multiply_divide());
     all
 }
 
@@ -4506,8 +4510,8 @@ mod tests {
         let tests = generate_all();
         let count = tests.len();
         assert!(
-            (380..=600).contains(&count),
-            "expected 380-600 tests, got {count}"
+            (380..=800).contains(&count),
+            "expected 380-800 tests, got {count}"
         );
     }
 
@@ -4581,18 +4585,20 @@ mod tests {
     }
 
     #[test]
-    fn all_opcodes_are_thumb16() {
-        // All Phase A opcodes must be valid 16-bit Thumb.
+    fn all_thumb16_opcodes_valid() {
+        // All Thumb-16 tests (hw1 is None) must have opcodes < 0xE800.
         // Opcodes >= 0xE800 that are NOT unconditional branches
         // would be 32-bit. Our unconditional branch encoding is
         // 11100_xxxxxxxxxxx which is < 0xE800.
         for tc in &generate_all() {
-            assert!(
-                tc.opcode < 0xE800,
-                "test '{}' has opcode {:#06x} in Thumb-32 space",
-                tc.name,
-                tc.opcode
-            );
+            if tc.hw1.is_none() {
+                assert!(
+                    tc.opcode < 0xE800,
+                    "Thumb-16 test '{}' has opcode {:#06x} in Thumb-32 space",
+                    tc.name,
+                    tc.opcode
+                );
+            }
         }
     }
 
