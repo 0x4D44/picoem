@@ -29,3 +29,7 @@ path = "src/bin/bank_conflict_test.rs"
 name = "full_test"
 path = "src/bin/full_test.rs"
 test = false
+
+[[bin]]
+name = "paced_bench"
+path = "src/bin/paced_bench.rs"
