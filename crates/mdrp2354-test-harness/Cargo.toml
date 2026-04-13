@@ -7,6 +7,7 @@ edition.workspace = true
 mdrp2354 = { path = "../mdrp2354" }
 probe-rs = "0.31"
 rand = "0.8"
+chrono = "0.4"
 
 [[bin]]
 name = "qemu_diff"
@@ -23,3 +24,8 @@ path = "src/bin/probe_diff.rs"
 [[bin]]
 name = "bank_conflict_test"
 path = "src/bin/bank_conflict_test.rs"
+
+[[bin]]
+name = "full_test"
+path = "src/bin/full_test.rs"
+test = false
