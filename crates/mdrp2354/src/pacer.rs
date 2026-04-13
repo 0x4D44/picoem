@@ -182,9 +182,13 @@ fn calibrate_tsc() -> u64 {
 /// by OS preemption). Clamps to nominal/4 maximum to survive pathological
 /// calibration runs.
 #[cfg(target_arch = "x86_64")]
-fn calibrate_overhead(nominal_quantum_tsc: u64) -> u64 {
+fn calibrate_overhead(nominal_quantum_tsc: u64, tsc_freq_hz: u64) -> u64 {
     const BATCHES: usize = 5;
     const PER_BATCH: u64 = 2000;
+
+    let tsc_to_ns = |ticks: u64| -> u64 {
+        (ticks as u128 * 1_000_000_000 / tsc_freq_hz as u128) as u64
+    };
 
     // Throwaway stats to exercise the same atomic updates production does.
     let stats = PacerStats::new();
@@ -197,21 +201,26 @@ fn calibrate_overhead(nominal_quantum_tsc: u64) -> u64 {
             // Mimic end_quantum: measurement + spin + stats updates.
             let emu_end = rdtscp();
             let emulation_tsc = emu_end - quantum_start;
-            if emulation_tsc < nominal_quantum_tsc {
+            let final_tsc = if emulation_tsc < nominal_quantum_tsc {
                 let target = quantum_start + nominal_quantum_tsc;
                 let mut now = emu_end;
                 while now < target {
                     std::hint::spin_loop();
                     now = rdtsc();
                 }
-                stats.add_emulation_ns(0);
-                stats.add_spin_ns(0);
+                let total_tsc = now - quantum_start;
+                let spin_tsc = total_tsc - emulation_tsc;
+                stats.add_emulation_ns(tsc_to_ns(emulation_tsc));
+                stats.add_spin_ns(tsc_to_ns(spin_tsc));
+                now
             } else {
-                stats.add_emulation_ns(0);
+                stats.add_emulation_ns(tsc_to_ns(emulation_tsc));
                 stats.increment_behind();
-            }
+                emu_end
+            };
             stats.add_emulated_cycles(150);
-            stats.set_wall_ns(0);
+            let wall_tsc = final_tsc - first;
+            stats.set_wall_ns(tsc_to_ns(wall_tsc));
 
             // Mimic next begin_quantum.
             quantum_start = rdtscp();
@@ -251,9 +260,8 @@ pub struct Pacer {
     quantum_tsc_ticks: u64,
     /// rdtsc value at start of current quantum.
     quantum_start_tsc: u64,
-    /// rdtsc value at the first begin_quantum() call (0 until set).
-    /// Used as the origin for cumulative wall-clock accounting.
-    first_begin_tsc: u64,
+    /// TSC at first begin_quantum call. Set once on the first call.
+    first_begin_tsc: Option<u64>,
     /// Calibrated TSC frequency in Hz.
     tsc_freq_hz: u64,
     /// Emulator system clock in Hz (e.g. 150_000_000).
@@ -265,39 +273,34 @@ pub struct Pacer {
 #[cfg(target_arch = "x86_64")]
 impl Pacer {
     /// Create a new pacer for the given emulator clock frequency.
-    /// Calibrates the TSC at construction time (~50 ms) then runs overhead
-    /// calibration (~10 ms) to pre-compensate the quantum budget.
+    /// Calibrates TSC and measures per-quantum overhead (~60 ms one-time cost).
     pub fn new(sys_clk_hz: u32) -> Self {
+        Self::with_quantum(sys_clk_hz, 150)
+    }
+
+    /// Create a pacer with a custom quantum size.
+    pub fn with_quantum(sys_clk_hz: u32, quantum_cycles: u64) -> Self {
+        assert!(quantum_cycles > 0, "quantum_cycles must be non-zero");
         let tsc_freq_hz = calibrate_tsc();
-        let quantum_cycles: u64 = 150;
-        let nominal =
-            (tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
-        let overhead = calibrate_overhead(nominal);
+        let nominal = (tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
+        assert!(
+            nominal >= 100,
+            "quantum too small for TSC resolution (nominal = {} ticks)",
+            nominal
+        );
+        let overhead = calibrate_overhead(nominal, tsc_freq_hz);
         let quantum_tsc_ticks = nominal.saturating_sub(overhead);
-        assert!(quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero — quantum too small for TSC resolution");
+        assert!(quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero");
 
         Self {
             stats: Arc::new(PacerStats::new()),
             quantum_cycles,
             quantum_tsc_ticks,
             quantum_start_tsc: 0,
-            first_begin_tsc: 0,
+            first_begin_tsc: None,
             tsc_freq_hz,
             sys_clk_hz: sys_clk_hz as u64,
         }
-    }
-
-    /// Create a pacer with a custom quantum size.
-    pub fn with_quantum(sys_clk_hz: u32, quantum_cycles: u64) -> Self {
-        assert!(quantum_cycles > 0, "quantum_cycles must be non-zero");
-        let mut pacer = Self::new(sys_clk_hz);
-        pacer.quantum_cycles = quantum_cycles;
-        let nominal =
-            (pacer.tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
-        let overhead = calibrate_overhead(nominal);
-        pacer.quantum_tsc_ticks = nominal.saturating_sub(overhead);
-        assert!(pacer.quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero — quantum too small for TSC resolution");
-        pacer
     }
 
     /// Get a shared handle to the monitoring stats.
@@ -319,9 +322,7 @@ impl Pacer {
     #[inline(always)]
     pub fn begin_quantum(&mut self) {
         let tsc = rdtscp();
-        if self.first_begin_tsc == 0 {
-            self.first_begin_tsc = tsc;
-        }
+        self.first_begin_tsc.get_or_insert(tsc);
         self.quantum_start_tsc = tsc;
     }
 
@@ -359,11 +360,13 @@ impl Pacer {
             emu_end
         };
 
-        self.stats.add_emulated_cycles(self.quantum_cycles);
-
         // Update cumulative wall time since first begin_quantum.
-        let wall_tsc = final_tsc - self.first_begin_tsc;
+        // Set wall_ns BEFORE cycles so snapshots see wall slightly ahead of
+        // cycles (biases MHz low, bounded) rather than the reverse.
+        let first = self.first_begin_tsc.expect("begin_quantum() must be called before end_quantum()");
+        let wall_tsc = final_tsc - first;
         self.stats.set_wall_ns(self.tsc_to_ns(wall_tsc));
+        self.stats.add_emulated_cycles(self.quantum_cycles);
     }
 
     /// Convert TSC ticks to nanoseconds.
@@ -589,5 +592,39 @@ mod tests {
         pacer.end_quantum();
         let snap = pacer.stats().snapshot();
         assert!(snap.wall_ns > 0, "wall_ns should be non-zero after a quantum");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_pacer_wall_ns_monotonic() {
+        let mut pacer = Pacer::new(150_000_000);
+        let mut last = 0u64;
+        for _ in 0..5 {
+            pacer.begin_quantum();
+            pacer.end_quantum();
+            let wall = pacer.stats().snapshot().wall_ns;
+            assert!(wall > last, "wall_ns should grow each quantum: {} > {}", wall, last);
+            last = wall;
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_calibrate_overhead_clamped_tiny_nominal() {
+        // With nominal = 200 ticks (~65ns on 3 GHz TSC), real overhead will
+        // vastly exceed nominal/4 = 50, so the clamp kicks in and we return 50.
+        let overhead = calibrate_overhead(200, 3_000_000_000);
+        assert!(overhead <= 50, "clamp should limit overhead to nominal/4");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_calibrate_overhead_reasonable() {
+        // At nominal = 3000 ticks (~1µs on 3 GHz), overhead should be
+        // measurable (>0) but well below nominal.
+        let overhead = calibrate_overhead(3000, 3_000_000_000);
+        assert!(overhead < 3000, "overhead should be below nominal");
+        // Lower bound is hard to guarantee on all machines; just check clamp.
+        assert!(overhead <= 750, "overhead should be clamped to nominal/4");
     }
 }
