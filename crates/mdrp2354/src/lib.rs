@@ -127,12 +127,12 @@ impl Emulator {
 
     /// Direct memory read (bypasses bus timing).
     pub fn peek(&self, addr: u32) -> u32 {
-        self.bus.read32(addr)
+        self.bus.memory.peek32(addr)
     }
 
     /// Direct memory write (bypasses bus timing).
     pub fn poke(&mut self, addr: u32, value: u32) {
-        self.bus.write32(addr, value);
+        self.bus.memory.poke32(addr, value);
     }
 
     /// Current master cycle count.

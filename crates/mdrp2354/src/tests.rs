@@ -4055,7 +4055,7 @@ fn bus_writes_to_rom_are_silently_ignored() {
 #[test]
 fn bus_unmapped_region_reads_zero() {
     // Regions 0x3, 0x6..0xC, 0xF are unmapped — should read as 0.
-    let (_, bus) = core_and_bus();
+    let (_, mut bus) = core_and_bus();
     assert_eq!(bus.read32(0x3000_0000), 0);
     assert_eq!(bus.read32(0x6000_0000), 0);
     assert_eq!(bus.read32(0xF000_0000), 0);
@@ -4167,69 +4167,51 @@ fn bank_for_address_rejects_non_sram() {
 // most recent read or write. These tests won't compile until that API exists.
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus refactor
 fn bus_latency_sram_read_1_cycle() {
     // SRAM is AHB-attached: 1-cycle read, zero wait state.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // bus.read32(0x2000_0000);
-    // assert_eq!(bus.last_access_cycles(), 1);
+    let (_, mut bus) = core_and_bus();
+    bus.read32(0x2000_0000);
+    assert_eq!(bus.last_access_cycles(), 1);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus refactor
 fn bus_latency_sram_write_1_cycle() {
     // SRAM is AHB-attached: 1-cycle write.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // bus.write32(0x2000_0000, 0x42);
-    // assert_eq!(bus.last_access_cycles(), 1);
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x2000_0000, 0x42);
+    assert_eq!(bus.last_access_cycles(), 1);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus refactor
 fn bus_latency_rom_read_1_cycle() {
     // ROM is AHB-attached: 1-cycle read.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, bus) = core_and_bus();
-    // bus.read32(0x0000_0000);
-    // assert_eq!(bus.last_access_cycles(), 1);
+    let (_, mut bus) = core_and_bus();
+    bus.read32(0x0000_0000);
+    assert_eq!(bus.last_access_cycles(), 1);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus refactor
 fn bus_latency_apb_peripheral_read_3_cycles() {
     // APB peripherals at 0x40000000: 3-cycle read latency.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, bus) = core_and_bus();
-    // bus.read32(0x4000_0000);
-    // assert_eq!(bus.last_access_cycles(), 3);
+    let (_, mut bus) = core_and_bus();
+    bus.read32(0x4000_0000);
+    assert_eq!(bus.last_access_cycles(), 3);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus refactor
 fn bus_latency_apb_peripheral_write_4_cycles() {
     // APB peripherals at 0x40000000: 4-cycle write latency.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, mut bus) = core_and_bus();
-    // bus.write32(0x4000_0000, 0x1);
-    // assert_eq!(bus.last_access_cycles(), 4);
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x4000_0000, 0x1);
+    assert_eq!(bus.last_access_cycles(), 4);
 }
 
 #[test]
-#[ignore] // Phase 2 API — will compile after bus refactor
 fn bus_latency_sio_access_1_cycle() {
     // SIO at 0xD0000000: single-cycle access.
-    // Phase 2 API — will compile after bus refactor
-    //
-    // let (_, bus) = core_and_bus();
-    // bus.read32(0xD000_0000);
-    // assert_eq!(bus.last_access_cycles(), 1);
+    let (_, mut bus) = core_and_bus();
+    bus.read32(0xD000_0000);
+    assert_eq!(bus.last_access_cycles(), 1);
 }
 
 // ============================================================================

@@ -30,6 +30,7 @@ fn is_thumb16_flag_only(opcode: u16) -> bool {
 impl CortexM33 {
     /// Fetch, decode, and execute one instruction. Returns cycle count.
     pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
+        bus.reset_extra_wait_states();
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         let hw0 = bus.read16(pc);
@@ -52,7 +53,7 @@ impl CortexM33 {
                 1 // skipped instruction costs 1 cycle
             };
             if in_it { self.advance_it_state(); }
-            cycles
+            cycles + bus.extra_wait_states()
         } else {
             self.regs.set_pc(pc.wrapping_add(2));
 
@@ -73,7 +74,7 @@ impl CortexM33 {
             }
 
             if in_it { self.advance_it_state(); }
-            cycles
+            cycles + bus.extra_wait_states()
         }
     }
 

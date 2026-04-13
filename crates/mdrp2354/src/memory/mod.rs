@@ -186,6 +186,22 @@ impl Memory {
             _ => {} // ROM and XIP are read-only, others unmapped
         }
     }
+
+    pub fn peek32(&self, addr: u32) -> u32 {
+        match addr >> 28 {
+            0x0 => self.rom_read32(addr & 0x0FFF_FFFF),
+            0x1 => self.xip_read32(addr & 0x0FFF_FFFF),
+            0x2 => self.sram_read32(addr & 0x0FFF_FFFF),
+            _ => 0,
+        }
+    }
+
+    pub fn poke32(&mut self, addr: u32, val: u32) {
+        match addr >> 28 {
+            0x2 => self.sram_write32(addr & 0x0FFF_FFFF, val),
+            _ => {} // ROM and XIP are read-only, others unmapped
+        }
+    }
 }
 
 impl Default for Memory {
