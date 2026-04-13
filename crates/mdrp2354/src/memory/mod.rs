@@ -27,12 +27,10 @@ impl Memory {
         self.rom[..len].copy_from_slice(&data[..len]);
     }
 
-    #[inline(always)]
     pub fn rom_read8(&self, offset: u32) -> u8 {
         self.rom.get(offset as usize).copied().unwrap_or(0)
     }
 
-    #[inline(always)]
     pub fn rom_read16(&self, offset: u32) -> u16 {
         let off = offset as usize;
         if off + 1 < self.rom.len() {
@@ -42,7 +40,6 @@ impl Memory {
         }
     }
 
-    #[inline(always)]
     pub fn rom_read32(&self, offset: u32) -> u32 {
         let off = offset as usize;
         if off + 3 < self.rom.len() {
@@ -59,12 +56,10 @@ impl Memory {
 
     // --- SRAM ---
 
-    #[inline(always)]
     pub fn sram_read8(&self, offset: u32) -> u8 {
         self.sram.get(offset as usize).copied().unwrap_or(0)
     }
 
-    #[inline(always)]
     pub fn sram_read16(&self, offset: u32) -> u16 {
         let off = offset as usize;
         if off + 1 < self.sram.len() {
@@ -74,7 +69,6 @@ impl Memory {
         }
     }
 
-    #[inline(always)]
     pub fn sram_read32(&self, offset: u32) -> u32 {
         let off = offset as usize;
         if off + 3 < self.sram.len() {
@@ -89,7 +83,6 @@ impl Memory {
         }
     }
 
-    #[inline(always)]
     pub fn sram_write8(&mut self, offset: u32, val: u8) {
         let off = offset as usize;
         if off < self.sram.len() {
@@ -97,7 +90,6 @@ impl Memory {
         }
     }
 
-    #[inline(always)]
     pub fn sram_write16(&mut self, offset: u32, val: u16) {
         let off = offset as usize;
         if off + 1 < self.sram.len() {
@@ -107,7 +99,6 @@ impl Memory {
         }
     }
 
-    #[inline(always)]
     pub fn sram_write32(&mut self, offset: u32, val: u32) {
         let off = offset as usize;
         if off + 3 < self.sram.len() {
@@ -125,12 +116,10 @@ impl Memory {
         self.xip = data.to_vec();
     }
 
-    #[inline(always)]
     pub fn xip_read8(&self, offset: u32) -> u8 {
         self.xip.get(offset as usize).copied().unwrap_or(0)
     }
 
-    #[inline(always)]
     pub fn xip_read16(&self, offset: u32) -> u16 {
         let off = offset as usize;
         if off + 1 < self.xip.len() {
@@ -140,7 +129,6 @@ impl Memory {
         }
     }
 
-    #[inline(always)]
     pub fn xip_read32(&self, offset: u32) -> u32 {
         let off = offset as usize;
         if off + 3 < self.xip.len() {
@@ -165,7 +153,6 @@ impl Memory {
     ///
     /// Accepts a full address (0x20xx_xxxx through 0x23xx_xxxx); strips alias
     /// and base bits internally. Alias addresses resolve to the same bank.
-    #[inline(always)]
     pub fn bank_for_address(addr: u32) -> Option<u8> {
         if (addr >> 28) != 0x2 { return None; }
         let offset = addr & 0x00FF_FFFF; // strip alias bits [27:24]

@@ -185,7 +185,6 @@ impl Bus {
     /// Determine the downstream port ID for an address.
     /// Two addresses that return the same port ID will contend.
     /// Returns None for core-local ports (SIO, PPB) that never contend.
-    #[inline(always)]
     pub fn downstream_port(addr: u32) -> Option<u8> {
         match addr >> 28 {
             0x0 => Some(0),  // ROM — single port
@@ -850,7 +849,6 @@ impl Bus {
 /// Banks 2 and 6 have +1 cycle on RP2350 (measured on silicon via DWT CYCCNT).
 /// Returns 0 during burst mode (STM/LDM/PUSH/POP) — the SRAM controller
 /// handles sequential accesses without per-word bank penalties.
-#[inline(always)]
 fn sram_bank_wait(addr: u32, burst: bool) -> u32 {
     if burst {
         return 0;
