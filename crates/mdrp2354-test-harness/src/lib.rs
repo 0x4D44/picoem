@@ -3522,10 +3522,16 @@ pub fn generate_all() -> Vec<TestCase> {
     all.extend(gen_stm_ldm());
     all.extend(gen_branch_cond());
     all.extend(gen_branch_uncond());
-    // Thumb-32 generators
+    // Thumb-32 generators — Priority 1
     all.extend(thumb32_gen::gen_t32_dp_mod_imm());
     all.extend(thumb32_gen::gen_t32_load_store_single());
     all.extend(thumb32_gen::gen_t32_multiply_divide());
+    // Thumb-32 generators — Priority 2
+    all.extend(thumb32_gen::gen_t32_branch());
+    all.extend(thumb32_gen::gen_t32_dp_shift_reg());
+    all.extend(thumb32_gen::gen_t32_ldm_stm());
+    all.extend(thumb32_gen::gen_t32_ldrd_strd());
+    all.extend(thumb32_gen::gen_t32_tbb_tbh());
     all
 }
 
