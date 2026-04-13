@@ -4942,9 +4942,46 @@ fn bootrom_diagnostic_run() {
     let mut max_pc = 0u32;
     let mut fault_reported = false;
 
+    // Trace addresses for RP2350 bootrom (pico-bootrom-rp2350).
+    // If the ROM binary changes, these addresses will silently go stale.
+    let trace_addrs: &[(u32, &str)] = &[
+        (0x0194, "core0_boot_path_prolog jump"),
+        (0x038A, "enter_image_thunk BXNS"),
+        (0x03E6, "native_wait_rescue"),
+        (0x38A6, "s_varm_crit_core0_boot_path_entry_p2"),
+        (0x38C0, "___step1_check_rescue"),
+        (0x38F8, "___step2_enable_clock_gates"),
+        (0x3934, "___step3_get_boot_random"),
+        (0x3B7E, "___step12_select_boot_path"),
+        (0x3BE8, "select_boot_path: blt nsboot_preamble check"),
+        (0x3C00, "s_varm_crit_init_boot_scan_context call"),
+        (0x3C2E, "flash window launch path"),
+        (0x3C42, "___stepx_nsboot_preamble"),
+        (0x3CDE, "core0_boot_path_cant_boot"),
+        (0x3DDA, "___stepx_flash_boot"),
+        (0x3E8C, "s_varm_crit_nsboot_start"),
+        (0x7E56, "sg_table_entry"),
+        (0x7EA4, "bxns lr (return_to_ns)"),
+    ];
+
     for cycle in 0..1_000_000 {
         emu.step();
         let pc = emu.cores[0].regs.pc();
+
+        // Trace key bootrom addresses
+        for &(addr, label) in trace_addrs {
+            if pc == addr {
+                eprintln!("[cycle {:>7}] Reached {:#010x}: {}", cycle, addr, label);
+                eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
+                    emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
+                    emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
+                eprintln!("  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
+                    emu.cores[0].regs.r[4], emu.cores[0].regs.r[5],
+                    emu.cores[0].regs.r[6], emu.cores[0].regs.r[7]);
+                eprintln!("  LR={:#010x} SP={:#010x}", emu.cores[0].regs.lr(), emu.cores[0].regs.sp());
+                break;
+            }
+        }
 
         if pc > max_pc && pc < 0x8000 {
             max_pc = pc;

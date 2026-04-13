@@ -146,6 +146,7 @@ impl CortexM33 {
     // --- Priority evaluation ---
 
     /// Effective execution priority (lower = higher priority).
+    #[allow(dead_code)]
     pub(crate) fn execution_priority(&self, bus: &Bus) -> i16 {
         let mut prio: i16 = 256;
         if self.regs.faultmask & 1 != 0 {
@@ -164,6 +165,7 @@ impl CortexM33 {
         prio
     }
 
+    #[allow(dead_code)]
     pub(crate) fn can_preempt(&self, exc_num: u16, bus: &Bus) -> bool {
         let exc_prio = bus.ppb[bus.active_core()].exception_priority(exc_num);
         exc_prio < self.execution_priority(bus)
