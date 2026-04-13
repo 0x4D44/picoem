@@ -68,6 +68,12 @@ pub const EMU_TEST_SCRATCH: u32 = 0x2000_0200;
 /// Scratch area size in bytes. Covers LDRD/STRD max offset (imm8×4 = 1020).
 pub const SCRATCH_SIZE: u32 = 1024;
 
+/// FPU scratch area — immediately after the regular scratch area.
+/// Used by FPU prelude (VLDR) and epilogue (VSTR) sequences.
+/// Layout: S-register data at offsets [0..128), FPSCR at offset 128.
+pub const EMU_FPU_SCRATCH: u32 = EMU_TEST_SCRATCH + SCRATCH_SIZE;
+pub const QEMU_FPU_SCRATCH: u32 = QEMU_TEST_SCRATCH + SCRATCH_SIZE;
+
 // ============================================================================
 // GDB register indices (stable across QEMU >= 7.0)
 // ============================================================================
@@ -137,6 +143,16 @@ pub struct TestCase {
     pub opcode2: Option<u16>,
     /// Second halfword of opcode2 (Thumb-32 body instruction inside an IT block).
     pub hw1_2: Option<u16>,
+    /// FPU register preconditions: (Sn index 0-31, bit-pattern as u32).
+    /// Values are raw bit patterns (f32::to_bits), not interpreted as floats.
+    pub fpu_pre: Vec<(u8, u32)>,
+    /// FPU registers to read back after execution (list of Sn indices).
+    pub fpu_check: Vec<u8>,
+    /// FPSCR precondition (0 = default).
+    pub fpscr_pre: u32,
+    /// FPSCR mask for comparison. 0 = don't compare FPSCR.
+    /// 0xF000_0000 = compare N/Z/C/V only (VCMP tests).
+    pub fpscr_mask: u32,
 }
 
 impl Default for TestCase {
@@ -156,6 +172,10 @@ impl Default for TestCase {
             probe_only: false,
             opcode2: None,
             hw1_2: None,
+            fpu_pre: Vec::new(),
+            fpu_check: Vec::new(),
+            fpscr_pre: 0,
+            fpscr_mask: 0,
         }
     }
 }
@@ -3876,6 +3896,8 @@ pub fn generate_all() -> Vec<TestCase> {
     all.extend(thumb32_gen::gen_t32_dsp());
     all.extend(thumb32_gen::gen_t32_dp_register());
     all.extend(thumb32_gen::gen_t32_misc_control());
+    // FPU generators
+    all.extend(thumb32_gen::gen_t32_fpu());
     all
 }
 
@@ -4562,6 +4584,7 @@ pub fn generate_fuzz(count_per_class: usize, seed: u64) -> (Vec<TestCase>, Vec<T
     let mut rng = StdRng::seed_from_u64(seed);
     let mut alu = generate_fuzz_alu(count_per_class, &mut rng);
     alu.extend(thumb32_gen::generate_fuzz_t32_alu(count_per_class, &mut rng));
+    alu.extend(thumb32_gen::generate_fuzz_fpu(count_per_class, &mut rng));
     let mut mem = generate_fuzz_mem(count_per_class, &mut rng);
     mem.extend(thumb32_gen::generate_fuzz_t32_mem(count_per_class, &mut rng));
     (alu, mem)
@@ -4582,6 +4605,11 @@ pub struct RunState {
     /// Cycle count from execution. DWT CYCCNT for probe, execute_one return
     /// value for emulator, 0 for QEMU (which doesn't report cycles).
     pub cycles: u32,
+    /// FPU register values at checked indices (bit patterns, same order as
+    /// TestCase::fpu_check).
+    pub fpu: Vec<u32>,
+    /// FPSCR after execution.
+    pub fpscr: u32,
 }
 
 // ============================================================================
@@ -4669,7 +4697,7 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
         .collect();
 
-    RunState { regs, xpsr, mem, cycles }
+    RunState { regs, xpsr, mem, cycles, fpu: Vec::new(), fpscr: 0 }
 }
 
 /// Run a multi-step test case on the emulator (IT blocks, FPU prelude/epilogue).
@@ -4764,7 +4792,475 @@ pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         .collect();
 
     // Cycle counting is intentionally skipped for multi-step tests.
-    RunState { regs, xpsr, mem, cycles: 0 }
+    RunState { regs, xpsr, mem, cycles: 0, fpu: Vec::new(), fpscr: 0 }
+}
+
+// ============================================================================
+// FPU encoding helpers (pub(crate) for use by harness tests & generators)
+// ============================================================================
+
+/// Encode VLDR.32 Sd, [Rn, #±offset]. offset is in bytes, must be multiple of 4.
+pub(crate) fn enc_vldr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
+    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | (1 << 4) | rn;
+    let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
+    (hw0, hw1)
+}
+
+/// Encode VSTR.32 Sd, [Rn, #±offset]. offset is in bytes, must be multiple of 4.
+pub(crate) fn enc_vstr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
+    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | rn;
+    let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
+    (hw0, hw1)
+}
+
+/// Encode a VFP data-processing instruction for single-precision.
+pub(crate) fn vfp_dp(op_hi: u16, op_lo: u16, op2_lo: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xEE00 | (op_hi << 7) | (d << 6) | (op_lo << 4) | vn;
+    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (op2_lo << 6) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// Encode VADD.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 0, sd, sn, sm) }
+
+/// Encode VSUB.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vsub(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 1, sd, sn, sm) }
+
+/// Encode VMUL.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 0, sd, sn, sm) }
+
+/// Encode VNMUL.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vnmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 1, sd, sn, sm) }
+
+/// Encode VDIV.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b00, 0, sd, sn, sm) }
+
+/// Encode VMLA.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 0, sd, sn, sm) }
+
+/// Encode VMLS.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 1, sd, sn, sm) }
+
+/// Encode VNMLA.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vnmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 1, sd, sn, sm) }
+
+/// Encode VNMLS.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vnmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 0, sd, sn, sm) }
+
+/// Encode VFMA.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vfma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 0, sd, sn, sm) }
+
+/// Encode VFMS.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vfms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 1, sd, sn, sm) }
+
+/// Encode VFNMA.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vfnma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 1, sd, sn, sm) }
+
+/// Encode VFNMS.F32 Sd, Sn, Sm.
+pub(crate) fn enc_vfnms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 0, sd, sn, sm) }
+
+/// Encode a VFP unary instruction.
+/// All unary: hw0[7:4]=1D11 (op_hi=1, op_lo=11), hw1[6]=1.
+/// `opc3` = hw0[3:0] (repurposed Vn), `t` = hw1[7].
+pub(crate) fn vfp_unary(opc3: u16, t: u16, sd: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xEE00 | (1 << 7) | (d << 6) | (0b11 << 4) | opc3;
+    let hw1 = (vd << 12) | 0x0A00 | (t << 7) | (1 << 6) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// VMOV.F32 Sd, Sm (register copy).
+pub(crate) fn enc_vmov_reg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 0, sd, sm) }
+
+/// VABS.F32 Sd, Sm.
+pub(crate) fn enc_vabs(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 1, sd, sm) }
+
+/// VNEG.F32 Sd, Sm.
+pub(crate) fn enc_vneg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 0, sd, sm) }
+
+/// VSQRT.F32 Sd, Sm.
+pub(crate) fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 1, sd, sm) }
+
+/// VCMP.F32 Sd, Sm (quiet).
+pub(crate) fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0100, 0, sd, sm) }
+
+/// VCMP.F32 Sd, #0.0.
+pub(crate) fn enc_vcmp_zero(sd: u16) -> (u16, u16) { vfp_unary(0b0101, 0, sd, 0) }
+
+/// VCVT.F32.S32 Sd, Sm (signed int -> float).
+pub(crate) fn enc_vcvt_f32_s32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 1, sd, sm) }
+
+/// VCVT.F32.U32 Sd, Sm (unsigned int -> float).
+pub(crate) fn enc_vcvt_f32_u32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 0, sd, sm) }
+
+/// VCVT.S32.F32 Sd, Sm (float -> signed int, round toward zero).
+pub(crate) fn enc_vcvt_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 1, sd, sm) }
+
+/// VCVT.U32.F32 Sd, Sm (float -> unsigned int, round toward zero).
+pub(crate) fn enc_vcvt_u32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1100, 1, sd, sm) }
+
+/// VCVTR.S32.F32 Sd, Sm (float -> signed int, round per FPSCR).
+pub(crate) fn enc_vcvtr_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 0, sd, sm) }
+
+/// Encode VMOV Sn, Rt (ARM -> FPU). MCR format, L=0.
+pub(crate) fn enc_vmov_to_fpu(sn: u16, rt: u16) -> (u16, u16) {
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let hw0 = 0xEE00 | vn;
+    let hw1 = (rt << 12) | 0x0A10 | (n << 7);
+    (hw0, hw1)
+}
+
+/// Encode VMOV Rt, Sn (FPU -> ARM). MRC format, L=1.
+pub(crate) fn enc_vmov_to_arm(rt: u16, sn: u16) -> (u16, u16) {
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let hw0 = 0xEE10 | vn;
+    let hw1 = (rt << 12) | 0x0A10 | (n << 7);
+    (hw0, hw1)
+}
+
+/// Encode VMRS Rt, FPSCR (Rt=15 -> APSR_nzcv).
+pub(crate) fn enc_vmrs(rt: u16) -> (u16, u16) {
+    let hw0 = 0xEEF1u16;
+    let hw1 = (rt << 12) | 0x0A10;
+    (hw0, hw1)
+}
+
+/// Encode VMSR FPSCR, Rt.
+pub(crate) fn enc_vmsr(rt: u16) -> (u16, u16) {
+    let hw0 = 0xEEE1u16;
+    let hw1 = (rt << 12) | 0x0A10;
+    (hw0, hw1)
+}
+
+/// Encode STR.W Rt, [Rn, #imm12] (Thumb-32 word store, positive offset).
+pub(crate) fn enc_str_w_imm12(rt: u16, rn: u16, imm12: u16) -> (u16, u16) {
+    // T3 encoding: hw0 = 1111_1000_1100_Rn, hw1 = Rt_imm12
+    let hw0 = 0xF8C0 | (rn & 0xF);
+    let hw1 = ((rt & 0xF) << 12) | (imm12 & 0xFFF);
+    (hw0, hw1)
+}
+
+// ============================================================================
+// FPU test sequence builder
+// ============================================================================
+
+/// Build the full instruction sequence for an FPU test.
+///
+/// Returns `(halfwords, instruction_count)` where halfwords is the sequence
+/// to write at the test slot, and instruction_count is the number of
+/// single-steps needed.
+///
+/// Sequence layout:
+///   1. Prelude: VMSR FPSCR, R11 (always — clears sticky bits), then VLDR for each fpu_pre entry
+///   2. Test instruction: tc.opcode [+ tc.hw1]
+///   3. Epilogue: VSTR for each fpu_check entry, then VMRS R11,FPSCR + STR R11,[R12,#offset] (if fpscr_mask != 0)
+pub fn build_fpu_test_sequence(tc: &TestCase) -> (Vec<u16>, usize) {
+    let mut hw: Vec<u16> = Vec::new();
+    let mut n_insn = 0usize;
+
+    // --- Prelude ---
+
+    // Always set FPSCR from R11 to clear sticky exception bits from previous
+    // tests. R11 = tc.fpscr_pre (usually 0) is set by the runner before
+    // stepping.
+    {
+        let (h0, h1) = enc_vmsr(11);
+        hw.push(h0);
+        hw.push(h1);
+        n_insn += 1;
+    }
+
+    // VLDR each precondition S register from FPU_SCRATCH.
+    // The data is laid out at FPU_SCRATCH + sn*4.
+    for &(sn, _) in &tc.fpu_pre {
+        let offset = (sn as i16) * 4;
+        let (h0, h1) = enc_vldr(sn as u16, 12, offset);
+        hw.push(h0);
+        hw.push(h1);
+        n_insn += 1;
+    }
+
+    // --- Test instruction ---
+    hw.push(tc.opcode);
+    if let Some(h1) = tc.hw1 {
+        hw.push(h1);
+    }
+    n_insn += 1;
+
+    // --- Epilogue ---
+
+    // VSTR each checked S register back to FPU_SCRATCH.
+    for &sn in &tc.fpu_check {
+        let offset = (sn as i16) * 4;
+        let (h0, h1) = enc_vstr(sn as u16, 12, offset);
+        hw.push(h0);
+        hw.push(h1);
+        n_insn += 1;
+    }
+
+    // If checking FPSCR, emit VMRS R11, FPSCR + STR.W R11, [R12, #128].
+    if tc.fpscr_mask != 0 {
+        let (h0, h1) = enc_vmrs(11);
+        hw.push(h0);
+        hw.push(h1);
+        n_insn += 1;
+
+        let (h0, h1) = enc_str_w_imm12(11, 12, 128);
+        hw.push(h0);
+        hw.push(h1);
+        n_insn += 1;
+    }
+
+    (hw, n_insn)
+}
+
+/// Test whether a TestCase is an FPU test (uses the FPU prelude/epilogue path).
+pub fn is_fpu_test(tc: &TestCase) -> bool {
+    !tc.fpu_pre.is_empty() || !tc.fpu_check.is_empty()
+}
+
+/// Run an FPU test case on the emulator using the prelude/epilogue mechanism.
+///
+/// Writes float preconditions to FPU_SCRATCH memory, builds the instruction
+/// sequence (prelude VLDRs + test + epilogue VSTRs), steps through all
+/// instructions, then reads results from FPU_SCRATCH.
+pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
+    let mut core = CortexM33::new();
+
+    // Set defaults: R0-R12 = 0, SP = stack, LR = sentinel, PC = slot
+    for i in 0..=12 {
+        core.set_reg(i, 0);
+    }
+    core.set_reg(13, EMU_TEST_STACK);
+    core.set_reg(14, 0xFFFF_FFFF);
+    core.regs.set_pc(EMU_TEST_SLOT);
+    core.regs.xpsr = tc.xpsr_pre;
+
+    // Apply register preconditions with address translation
+    for &(reg, val) in &tc.reg_pre {
+        let val = setup_reg(reg, val, tc, EMU_TEST_SCRATCH);
+        core.set_reg(reg as usize, val);
+    }
+
+    // Set R12 = FPU scratch base, R11 = FPSCR precondition value.
+    // R11 is always set (even when fpscr_pre=0) because the prelude always
+    // executes VMSR FPSCR, R11 to clear sticky exception bits.
+    core.set_reg(12, EMU_FPU_SCRATCH);
+    core.set_reg(11, tc.fpscr_pre);
+
+    // Memory setup — clear regular scratch and FPU scratch
+    if tc.needs_bus {
+        for i in 0..SCRATCH_SIZE {
+            shared_bus.write8(EMU_TEST_SCRATCH + i, 0);
+        }
+        for &(offset, val) in &tc.mem_pre {
+            shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
+        }
+    }
+    // Clear FPU scratch (S0-S31 data + FPSCR slot = 132 bytes)
+    for i in 0..136u32 {
+        shared_bus.write8(EMU_FPU_SCRATCH + i, 0);
+    }
+    // Write fpu_pre bit patterns to FPU scratch memory
+    for &(sn, bits) in &tc.fpu_pre {
+        let base = EMU_FPU_SCRATCH + (sn as u32) * 4;
+        let bytes = bits.to_le_bytes();
+        for (j, &b) in bytes.iter().enumerate() {
+            shared_bus.write8(base + j as u32, b);
+        }
+    }
+
+    // Build instruction sequence and write to bus
+    let (halfwords, n_insn) = build_fpu_test_sequence(tc);
+    let mut addr = EMU_TEST_SLOT;
+    for &hw in &halfwords {
+        shared_bus.write16(addr, hw);
+        addr += 2;
+    }
+
+    // Reset bus wait-state accumulator
+    shared_bus.reset_extra_wait_states();
+
+    // Step through all instructions
+    for _ in 0..n_insn {
+        while core.stall_cycles() > 0 {
+            core.step(shared_bus);
+        }
+        core.step(shared_bus);
+        while core.stall_cycles() > 0 {
+            core.step(shared_bus);
+        }
+    }
+
+    // Collect integer post-state
+    let mut regs = [0u32; 16];
+    for i in 0..16 {
+        regs[i] = core.reg(i);
+    }
+    let xpsr = core.regs.xpsr;
+    let mem: Vec<u8> = tc
+        .mem_check
+        .iter()
+        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
+        .collect();
+
+    // Read FPU results from FPU scratch memory
+    let fpu: Vec<u32> = tc
+        .fpu_check
+        .iter()
+        .map(|&sn| {
+            let base = EMU_FPU_SCRATCH + (sn as u32) * 4;
+            let mut bytes = [0u8; 4];
+            for i in 0..4 {
+                bytes[i] = shared_bus.read8(base + i as u32);
+            }
+            u32::from_le_bytes(bytes)
+        })
+        .collect();
+
+    // Read FPSCR from FPU scratch offset 128
+    let fpscr = if tc.fpscr_mask != 0 {
+        let mut bytes = [0u8; 4];
+        for i in 0..4 {
+            bytes[i] = shared_bus.read8(EMU_FPU_SCRATCH + 128 + i as u32);
+        }
+        u32::from_le_bytes(bytes)
+    } else {
+        0
+    };
+
+    RunState { regs, xpsr, mem, cycles: 0, fpu, fpscr }
+}
+
+// ============================================================================
+// FPU smoke test — standalone end-to-end validation
+// ============================================================================
+
+/// Run a single hand-crafted FPU test: VLDR + VLDR + VADD + VSTR.
+///
+/// Validates the prelude/test/epilogue mechanism by loading two known floats
+/// into S0 and S1, adding them into S2, storing the result to memory, and
+/// reading it back. Returns `Ok(())` if the result matches the expected sum
+/// (4.0 = 1.5 + 2.5), or `Err` with a diagnostic message.
+pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
+    let mut core = CortexM33::new();
+
+    // Use a scratch area for float data. R12 = base pointer.
+    let scratch = EMU_TEST_SCRATCH;
+    core.set_reg(12, scratch);
+    core.regs.set_pc(EMU_TEST_SLOT);
+    // T bit must be set for Thumb mode.
+    core.regs.xpsr = 0x0100_0000;
+
+    // Enable FPU in CPACR (CP10/11 full access). The emulator defaults this,
+    // but be explicit so this test validates the mechanism for future use.
+    shared_bus.write32(0xE000_ED88, 0x00F0_0000);
+
+    // Write float preconditions to scratch memory:
+    //   scratch+0: 1.5f32
+    //   scratch+4: 2.5f32
+    //   scratch+8: zero (will be overwritten by VSTR)
+    let val_1_5 = 1.5f32.to_bits().to_le_bytes();
+    let val_2_5 = 2.5f32.to_bits().to_le_bytes();
+    for (i, &b) in val_1_5.iter().enumerate() {
+        shared_bus.write8(scratch + i as u32, b);
+    }
+    for (i, &b) in val_2_5.iter().enumerate() {
+        shared_bus.write8(scratch + 4 + i as u32, b);
+    }
+    for i in 0..4u32 {
+        shared_bus.write8(scratch + 8 + i, 0);
+    }
+
+    // Write the 4-instruction sequence to the bus at EMU_TEST_SLOT.
+    // Each is a Thumb-32 (two halfwords).
+    let mut addr = EMU_TEST_SLOT;
+
+    // Instruction 1: VLDR S0, [R12, #0]
+    let (hw0, hw1) = enc_vldr(0, 12, 0);
+    shared_bus.write16(addr, hw0);
+    shared_bus.write16(addr + 2, hw1);
+    addr += 4;
+
+    // Instruction 2: VLDR S1, [R12, #4]
+    let (hw0, hw1) = enc_vldr(1, 12, 4);
+    shared_bus.write16(addr, hw0);
+    shared_bus.write16(addr + 2, hw1);
+    addr += 4;
+
+    // Instruction 3: VADD.F32 S2, S0, S1
+    let (hw0, hw1) = enc_vadd(2, 0, 1);
+    shared_bus.write16(addr, hw0);
+    shared_bus.write16(addr + 2, hw1);
+    addr += 4;
+
+    // Instruction 4: VSTR S2, [R12, #8]
+    let (hw0, hw1) = enc_vstr(2, 12, 8);
+    shared_bus.write16(addr, hw0);
+    shared_bus.write16(addr + 2, hw1);
+
+    // Reset bus wait-state accumulator.
+    shared_bus.reset_extra_wait_states();
+
+    // Step through all 4 instructions using the drain-then-step pattern.
+    for i in 0..4 {
+        while core.stall_cycles() > 0 {
+            core.step(shared_bus);
+        }
+        core.step(shared_bus);
+        // Drain residual stall cycles from this instruction.
+        while core.stall_cycles() > 0 {
+            core.step(shared_bus);
+        }
+
+        // Sanity: PC should advance by 4 each time (each instruction is 32-bit).
+        let expected_pc = EMU_TEST_SLOT + (i + 1) * 4;
+        let actual_pc = core.reg(15);
+        if actual_pc != expected_pc {
+            return Err(format!(
+                "After instruction {}: PC={:#010x}, expected {:#010x}",
+                i + 1, actual_pc, expected_pc
+            ));
+        }
+    }
+
+    // Read scratch+8..+12 from the bus, interpret as f32.
+    let mut result_bytes = [0u8; 4];
+    for i in 0..4 {
+        result_bytes[i] = shared_bus.read8(scratch + 8 + i as u32);
+    }
+    let result_bits = u32::from_le_bytes(result_bytes);
+    let expected_bits = 4.0f32.to_bits();
+
+    if result_bits != expected_bits {
+        let result_f32 = f32::from_bits(result_bits);
+        Err(format!(
+            "FPU smoke test failed: scratch[8..12] = {:#010x} ({result_f32}), \
+             expected {:#010x} (4.0)",
+            result_bits, expected_bits
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -4780,7 +5276,10 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
 
     // R0-R12: absolute comparison for non-address registers,
     // delta-from-scratch comparison for address registers (catches writeback).
+    // Skip R11 for FPU tests — it's used internally by the prelude/epilogue.
+    let is_fpu = is_fpu_test(tc);
     for i in 0..=12 {
+        if is_fpu && i == 11 { continue; }
         if tc.addr_regs.contains(&(i as u8)) {
             // Address registers have per-side absolute values.
             // Compare as delta from scratch base to catch writeback updates.
@@ -4868,10 +5367,44 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
         }
     }
 
+    // FPU comparison (bit-exact)
+    compare_fpu_into(tc, qemu, emu, "QEMU", "EMU", &mut diffs);
+
     if diffs.is_empty() {
         Ok(())
     } else {
         Err(diffs.join(", "))
+    }
+}
+
+/// Bit-exact FPU register comparison and masked FPSCR comparison.
+/// Appends any mismatches to `diffs`.
+fn compare_fpu_into(
+    tc: &TestCase,
+    a: &RunState,
+    b: &RunState,
+    a_name: &str,
+    b_name: &str,
+    diffs: &mut Vec<String>,
+) {
+    for (i, &sn) in tc.fpu_check.iter().enumerate() {
+        if i < a.fpu.len() && i < b.fpu.len() && a.fpu[i] != b.fpu[i] {
+            diffs.push(format!(
+                "S{sn}: {a_name}={:#010x} {b_name}={:#010x}",
+                a.fpu[i], b.fpu[i]
+            ));
+        }
+    }
+
+    if tc.fpscr_mask != 0 {
+        let a_masked = a.fpscr & tc.fpscr_mask;
+        let b_masked = b.fpscr & tc.fpscr_mask;
+        if a_masked != b_masked {
+            diffs.push(format!(
+                "FPSCR: {a_name}={:#010x} {b_name}={:#010x} (mask={:#010x})",
+                a.fpscr, b.fpscr, tc.fpscr_mask
+            ));
+        }
     }
 }
 
@@ -4890,8 +5423,12 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
 pub fn compare_probe(tc: &TestCase, hw: &RunState, emu: &RunState) -> Result<(), String> {
     let mut diffs = Vec::new();
 
-    // R0-R12: absolute comparison (same address space, no skipping)
+    // R0-R12: absolute comparison (same address space, no skipping).
+    // Skip R11 and R12 for FPU tests — they're used internally by the
+    // prelude/epilogue mechanism.
+    let is_fpu = is_fpu_test(tc);
     for i in 0..=12 {
+        if is_fpu && (i == 11 || i == 12) { continue; }
         if hw.regs[i] != emu.regs[i] {
             diffs.push(format!(
                 "R{i}: HW={:#010x} EMU={:#010x}",
@@ -4944,6 +5481,9 @@ pub fn compare_probe(tc: &TestCase, hw: &RunState, emu: &RunState) -> Result<(),
             ));
         }
     }
+
+    // FPU comparison (bit-exact)
+    compare_fpu_into(tc, hw, emu, "HW", "EMU", &mut diffs);
 
     if diffs.is_empty() {
         Ok(())
@@ -5392,7 +5932,7 @@ mod tests {
     // -- compare tests --
 
     fn make_state(regs: [u32; 16], xpsr: u32, mem: Vec<u8>) -> RunState {
-        RunState { regs, xpsr, mem, cycles: 0 }
+        RunState { regs, xpsr, mem, cycles: 0, fpu: Vec::new(), fpscr: 0 }
     }
 
     fn base_regs_qemu() -> [u32; 16] {
@@ -5793,12 +6333,13 @@ mod tests {
         // T32 ALU: dp_imm, dp_sreg, mul, div, lmul, smulxy, smlaxy,
         //          smm_family, dual_halfword, word_x_half, long_halfword, dsp_special,
         //          qsat, paradd, sat, bcond = 16 classes
+        // FPU: arith, mac, unary, convert, compare = 5 classes
         // T16 MEM: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 classes
         //   Note: push/pop is a SINGLE class whose inner loop fans out to 4
         //   variants (2 PUSH slots + 1 POP + 1 POP_PC). The class still emits
         //   `count` tests per call, so the class count stays at 5.
         // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
-        assert_eq!(alu.len(), (9 + 16) * 10, "ALU count: (9 T16 + 16 T32) * 10");
+        assert_eq!(alu.len(), (9 + 16 + 5) * 10, "ALU count: (9 T16 + 16 T32 + 5 FPU) * 10");
         assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
     }
 
@@ -6025,12 +6566,16 @@ mod tests {
             xpsr: 0x0100_0000,
             mem: vec![0xAA, 0xBB],
             cycles: 0,
+            fpu: Vec::new(),
+            fpscr: 0,
         };
         let emu = RunState {
             regs: base_regs_probe(),
             xpsr: 0x0100_0000,
             mem: vec![0xAA, 0xCC],
             cycles: 0,
+            fpu: Vec::new(),
+            fpscr: 0,
         };
         let err = compare_probe(&tc, &hw, &emu).unwrap_err();
         assert!(err.contains("MEM"), "should detect memory diff: {err}");
@@ -6050,5 +6595,13 @@ mod tests {
         let emu = make_state(base_regs_probe(), 0x0100_0000, vec![]);
         // Z bit differs but is outside mask — should be Ok
         assert!(compare_probe(&tc, &hw, &emu).is_ok());
+    }
+
+    // -- FPU smoke test --
+
+    #[test]
+    fn fpu_smoke_test_vadd() {
+        let mut bus = Bus::new();
+        run_fpu_smoke_test(&mut bus).unwrap();
     }
 }

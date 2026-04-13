@@ -180,20 +180,35 @@ fn run_one_probe(
     core: &mut Core,
     tc: &TestCase,
 ) -> Result<RunState, probe_rs::Error> {
-    // 1. Write instruction(s) + BKPT sentinel to test slot.
-    // Layout: opcode [+ hw1] [+ opcode2] [+ hw1_2] BKPT
-    let mut code = tc.opcode.to_le_bytes().to_vec();
-    if let Some(hw1) = tc.hw1 {
-        code.extend_from_slice(&hw1.to_le_bytes());
-    }
-    if let Some(op2) = tc.opcode2 {
-        code.extend_from_slice(&op2.to_le_bytes());
-        if let Some(hw1_2) = tc.hw1_2 {
-            code.extend_from_slice(&hw1_2.to_le_bytes());
+    let is_fpu = is_fpu_test(tc);
+    let n_steps: usize;
+
+    // 1. Write instruction sequence + BKPT sentinel to test slot.
+    if is_fpu {
+        let (halfwords, n_insn) = build_fpu_test_sequence(tc);
+        n_steps = n_insn;
+        let mut code: Vec<u8> = Vec::new();
+        for &hw in &halfwords {
+            code.extend_from_slice(&hw.to_le_bytes());
         }
+        code.extend_from_slice(&BKPT.to_le_bytes());
+        core.write_8(EMU_TEST_SLOT as u64, &code)?;
+    } else {
+        // Standard path: opcode [+ hw1] [+ opcode2 [+ hw1_2]] BKPT
+        let mut code = tc.opcode.to_le_bytes().to_vec();
+        if let Some(hw1) = tc.hw1 {
+            code.extend_from_slice(&hw1.to_le_bytes());
+        }
+        if let Some(op2) = tc.opcode2 {
+            code.extend_from_slice(&op2.to_le_bytes());
+            if let Some(hw1_2) = tc.hw1_2 {
+                code.extend_from_slice(&hw1_2.to_le_bytes());
+            }
+        }
+        code.extend_from_slice(&BKPT.to_le_bytes());
+        core.write_8(EMU_TEST_SLOT as u64, &code)?;
+        n_steps = if tc.opcode2.is_some() { 2 } else { 1 };
     }
-    code.extend_from_slice(&BKPT.to_le_bytes());
-    core.write_8(EMU_TEST_SLOT as u64, &code)?;
 
     // 2. Set register defaults: R0-R12 = 0
     for i in 0..=12u16 {
@@ -205,11 +220,8 @@ fn run_one_probe(
     core.write_core_reg(PC, EMU_TEST_SLOT)?;
     core.write_core_reg(XPSR, tc.xpsr_pre)?;
 
-    // 3. Apply register preconditions (no address translation — same address space)
+    // 3. Apply register preconditions (same address space — EMU addresses)
     for &(reg, val) in &tc.reg_pre {
-        // For probe, addr_regs values are already EMU_ addresses from setup_reg
-        // in the emulator. But here we apply the same translation the emulator
-        // does — addr_regs contain offsets, we add EMU_TEST_SCRATCH.
         let val = setup_reg(reg, val, tc, EMU_TEST_SCRATCH);
         core.write_core_reg(RegisterId(reg as u16), val)?;
     }
@@ -222,10 +234,25 @@ fn run_one_probe(
         }
     }
 
-    // 5. Reset CYCCNT, single-step (twice for multi-step IT-block tests).
+    // 4b. FPU preconditions
+    if is_fpu {
+        core.write_core_reg(RegisterId(12), EMU_FPU_SCRATCH)?;
+        // Always set R11 (even when fpscr_pre=0): the prelude always
+        // executes VMSR FPSCR, R11 to clear sticky exception bits.
+        core.write_core_reg(RegisterId(11), tc.fpscr_pre)?;
+        // Clear FPU scratch (136 bytes)
+        core.write_8(EMU_FPU_SCRATCH as u64, &[0u8; 136])?;
+        for &(sn, bits) in &tc.fpu_pre {
+            core.write_8(
+                (EMU_FPU_SCRATCH + (sn as u32) * 4) as u64,
+                &bits.to_le_bytes(),
+            )?;
+        }
+    }
+
+    // 5. Reset CYCCNT, single-step through all instructions.
     reset_cyccnt(core)?;
-    core.step()?;
-    if tc.opcode2.is_some() {
+    for _ in 0..n_steps {
         core.step()?;
     }
 
@@ -245,11 +272,32 @@ fn run_one_probe(
         mem.push(byte[0]);
     }
 
+    // 8. Read FPU results from FPU scratch memory
+    let mut fpu = Vec::new();
+    let mut fpscr = 0u32;
+    if is_fpu {
+        for &sn in &tc.fpu_check {
+            let mut bytes = [0u8; 4];
+            core.read_8(
+                (EMU_FPU_SCRATCH + (sn as u32) * 4) as u64,
+                &mut bytes,
+            )?;
+            fpu.push(u32::from_le_bytes(bytes));
+        }
+        if tc.fpscr_mask != 0 {
+            let mut bytes = [0u8; 4];
+            core.read_8((EMU_FPU_SCRATCH + 128) as u64, &mut bytes)?;
+            fpscr = u32::from_le_bytes(bytes);
+        }
+    }
+
     Ok(RunState {
         regs,
         xpsr,
         mem,
         cycles,
+        fpu,
+        fpscr,
     })
 }
 
@@ -271,8 +319,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Reset and halt
     core.reset_and_halt(Duration::from_millis(500))?;
 
-    // 3. Enable DWT cycle counter
+    // 3. Enable DWT cycle counter + FPU
     enable_cyccnt(&mut core)?;
+    // Enable FPU: CPACR CP10/CP11 full access
+    core.write_word_32(0xE000_ED88, 0x00F0_0000)?;
 
     // 4. Calibrate cycle counter
     let baseline = calibrate_cycles(&mut core)?;
@@ -438,7 +488,9 @@ fn run_one_diff(
     let hw_state = run_one_probe(core, tc).map_err(DiffError::ProbeError)?;
 
     // Emulator side
-    let emu_state = if tc.opcode2.is_some() {
+    let emu_state = if is_fpu_test(tc) {
+        run_one_emu_fpu(tc, shared_bus)
+    } else if tc.opcode2.is_some() {
         run_one_emu_multistep(tc, shared_bus)
     } else {
         run_one_emu(tc, shared_bus)
@@ -448,9 +500,9 @@ fn run_one_diff(
     compare_probe(tc, &hw_state, &emu_state).map_err(DiffError::Mismatch)?;
 
     // Cycle comparison (if enabled, and only for single-step tests —
-    // multi-step tests intentionally return cycles=0 on the emulator side).
+    // multi-step and FPU tests intentionally return cycles=0 on the emulator side).
     let mut cycle_ok = true;
-    if args.cycles && tc.opcode2.is_none() {
+    if args.cycles && tc.opcode2.is_none() && !is_fpu_test(tc) {
         // Net cycles = measured - baseline + 1 (NOP is 1 cycle, baseline is NOP's raw count)
         let hw_cycles = hw_state.cycles.saturating_sub(baseline) + 1;
         let emu_cycles = emu_state.cycles;

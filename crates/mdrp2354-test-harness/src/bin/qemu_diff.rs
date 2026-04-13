@@ -255,6 +255,8 @@ fn setup_vector_table(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Err
     table[0..4].copy_from_slice(&sp_bytes);
     table[4..8].copy_from_slice(&reset_vector);
     gdb.write_mem(VECTOR_TABLE_BASE, &table)?;
+    // Enable FPU: CPACR CP10/CP11 full access
+    gdb.write_mem(0xE000_ED88, &0x00F0_0000u32.to_le_bytes())?;
     Ok(())
 }
 
@@ -265,7 +267,9 @@ fn run_one_test(
     tc: &TestCase,
 ) -> Result<(), String> {
     let qemu_state = run_qemu_side(gdb, tc).map_err(|e| format!("QEMU error: {e}"))?;
-    let emu_state = if tc.opcode2.is_some() {
+    let emu_state = if is_fpu_test(tc) {
+        run_one_emu_fpu(tc, shared_bus)
+    } else if tc.opcode2.is_some() {
         run_one_emu_multistep(tc, shared_bus)
     } else {
         run_one_emu(tc, shared_bus)
@@ -322,28 +326,40 @@ fn run_qemu_side(
     gdb: &mut GdbClient,
     tc: &TestCase,
 ) -> std::io::Result<RunState> {
-    // Write instruction(s) to test slot, then BKPT sentinel after.
-    //
-    // Layout:
-    //   opcode  [+ hw1]   [+ opcode2]  [+ hw1_2]   BKPT
-    // The Thumb-32 `hw1` halfword (if set) immediately follows `opcode`.
-    // Multi-step tests (IT blocks) add a body instruction `opcode2` (+ `hw1_2`
-    // for Thumb-32 bodies) after that, and the BKPT sentinel goes at the end.
-    gdb.write_mem(QEMU_TEST_SLOT, &tc.opcode.to_le_bytes())?;
-    let mut next: u32 = QEMU_TEST_SLOT + 2;
-    if let Some(hw1) = tc.hw1 {
-        gdb.write_mem(next, &hw1.to_le_bytes())?;
-        next += 2;
-    }
-    if let Some(op2) = tc.opcode2 {
-        gdb.write_mem(next, &op2.to_le_bytes())?;
-        next += 2;
-        if let Some(hw1_2) = tc.hw1_2 {
-            gdb.write_mem(next, &hw1_2.to_le_bytes())?;
+    let is_fpu = is_fpu_test(tc);
+
+    // Determine the number of single-steps and write instruction sequence.
+    let n_steps: usize;
+
+    if is_fpu {
+        // FPU test: build the full prelude/test/epilogue sequence.
+        let (halfwords, n_insn) = build_fpu_test_sequence(tc);
+        n_steps = n_insn;
+        let mut addr = QEMU_TEST_SLOT;
+        for &hw in &halfwords {
+            gdb.write_mem(addr, &hw.to_le_bytes())?;
+            addr += 2;
+        }
+        gdb.write_mem(addr, &BKPT_BYTES)?;
+    } else {
+        // Standard (non-FPU) path: write opcode [+ hw1] [+ opcode2 [+ hw1_2]] + BKPT.
+        gdb.write_mem(QEMU_TEST_SLOT, &tc.opcode.to_le_bytes())?;
+        let mut next: u32 = QEMU_TEST_SLOT + 2;
+        if let Some(hw1) = tc.hw1 {
+            gdb.write_mem(next, &hw1.to_le_bytes())?;
             next += 2;
         }
+        if let Some(op2) = tc.opcode2 {
+            gdb.write_mem(next, &op2.to_le_bytes())?;
+            next += 2;
+            if let Some(hw1_2) = tc.hw1_2 {
+                gdb.write_mem(next, &hw1_2.to_le_bytes())?;
+                next += 2;
+            }
+        }
+        gdb.write_mem(next, &BKPT_BYTES)?;
+        n_steps = if tc.opcode2.is_some() { 2 } else { 1 };
     }
-    gdb.write_mem(next, &BKPT_BYTES)?;
 
     // Set register defaults
     for i in 0..=12u8 {
@@ -368,10 +384,22 @@ fn run_qemu_side(
         }
     }
 
-    // Step once per instruction in the sequence. For multi-step tests
-    // (`opcode2.is_some()`) we step twice — QEMU honours ITSTATE natively.
-    gdb.step()?;
-    if tc.opcode2.is_some() {
+    // FPU preconditions: set R12 = QEMU_FPU_SCRATCH, R11 = fpscr_pre,
+    // write fpu_pre bit patterns to QEMU_FPU_SCRATCH memory.
+    if is_fpu {
+        gdb.write_reg(12, QEMU_FPU_SCRATCH)?;
+        // Always set R11 (even when fpscr_pre=0): the prelude always
+        // executes VMSR FPSCR, R11 to clear sticky exception bits.
+        gdb.write_reg(11, tc.fpscr_pre)?;
+        // Clear FPU scratch (136 bytes: 32 S-regs * 4 + FPSCR at offset 128)
+        gdb.write_mem(QEMU_FPU_SCRATCH, &[0u8; 136])?;
+        for &(sn, bits) in &tc.fpu_pre {
+            gdb.write_mem(QEMU_FPU_SCRATCH + (sn as u32) * 4, &bits.to_le_bytes())?;
+        }
+    }
+
+    // Step through the instruction sequence
+    for _ in 0..n_steps {
         gdb.step()?;
     }
 
@@ -392,5 +420,19 @@ fn run_qemu_side(
         })
         .collect::<std::io::Result<Vec<u8>>>()?;
 
-    Ok(RunState { regs, xpsr, mem, cycles: 0 })
+    // Read FPU results from QEMU_FPU_SCRATCH
+    let mut fpu = Vec::new();
+    let mut fpscr = 0u32;
+    if is_fpu {
+        for &sn in &tc.fpu_check {
+            let bytes = gdb.read_mem(QEMU_FPU_SCRATCH + (sn as u32) * 4, 4)?;
+            fpu.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        if tc.fpscr_mask != 0 {
+            let bytes = gdb.read_mem(QEMU_FPU_SCRATCH + 128, 4)?;
+            fpscr = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+    }
+
+    Ok(RunState { regs, xpsr, mem, cycles: 0, fpu, fpscr })
 }
