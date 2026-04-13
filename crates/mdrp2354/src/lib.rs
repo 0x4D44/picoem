@@ -3,12 +3,14 @@ pub mod bus;
 pub mod memory;
 pub mod sio;
 pub mod clock;
+pub mod pacer;
 
 pub use self::core::CortexM33;
 pub use self::bus::Bus;
 pub use self::memory::Memory;
 pub use self::clock::Clock;
 pub use self::sio::Sio;
+pub use self::pacer::{PacerStats, PacerSnapshot};
 
 /// Trait for memory-mapped peripherals. Implemented by crates like
 /// `mdrp2354-periph`. The core crate defines the interface only.
