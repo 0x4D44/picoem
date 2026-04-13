@@ -3522,10 +3522,10 @@ pub fn generate_all() -> Vec<TestCase> {
     all.extend(gen_stm_ldm());
     all.extend(gen_branch_cond());
     all.extend(gen_branch_uncond());
-    // Thumb-32 generators (uncomment as implementations land)
-    // all.extend(thumb32_gen::gen_t32_dp_mod_imm());
-    // all.extend(thumb32_gen::gen_t32_load_store_single());
-    // all.extend(thumb32_gen::gen_t32_multiply_divide());
+    // Thumb-32 generators
+    all.extend(thumb32_gen::gen_t32_dp_mod_imm());
+    all.extend(thumb32_gen::gen_t32_load_store_single());
+    all.extend(thumb32_gen::gen_t32_multiply_divide());
     all
 }
 
@@ -4213,14 +4213,21 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
 pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), String> {
     let mut diffs = Vec::new();
 
-    // R0-R12: absolute comparison.
-    // Skip registers in addr_regs — they were intentionally set to different
-    // absolute values per side (QEMU_SCRATCH vs EMU_SCRATCH).
+    // R0-R12: absolute comparison for non-address registers,
+    // delta-from-scratch comparison for address registers (catches writeback).
     for i in 0..=12 {
         if tc.addr_regs.contains(&(i as u8)) {
-            continue;
-        }
-        if qemu.regs[i] != emu.regs[i] {
+            // Address registers have per-side absolute values.
+            // Compare as delta from scratch base to catch writeback updates.
+            let qemu_delta = qemu.regs[i].wrapping_sub(QEMU_TEST_SCRATCH);
+            let emu_delta = emu.regs[i].wrapping_sub(EMU_TEST_SCRATCH);
+            if qemu_delta != emu_delta {
+                diffs.push(format!(
+                    "R{i} addr delta: QEMU={:#x} EMU={:#x}",
+                    qemu_delta, emu_delta
+                ));
+            }
+        } else if qemu.regs[i] != emu.regs[i] {
             diffs.push(format!(
                 "R{i}: QEMU={:#010x} EMU={:#010x}",
                 qemu.regs[i], emu.regs[i]
@@ -4944,8 +4951,12 @@ mod tests {
             mem_check: vec![0, 1, 2, 3],
             ..TestCase::default()
         };
-        let qemu = make_state(base_regs_qemu(), 0x0100_0000, vec![0xAB, 0xCD, 0xEF, 0x01]);
-        let emu = make_state(base_regs_emu(), 0x0100_0000, vec![0xAB, 0xCD, 0x00, 0x01]);
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        qemu_regs[0] = QEMU_TEST_SCRATCH;
+        emu_regs[0] = EMU_TEST_SCRATCH;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![0xAB, 0xCD, 0xEF, 0x01]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![0xAB, 0xCD, 0x00, 0x01]);
         let err = compare(&tc, &qemu, &emu).unwrap_err();
         assert!(err.contains("MEM"), "expected MEM in error: {err}");
         assert!(err.contains("+0x2"), "expected offset +0x2 in error: {err}");
@@ -4959,9 +4970,48 @@ mod tests {
             mem_check: vec![0, 1],
             ..TestCase::default()
         };
-        let qemu = make_state(base_regs_qemu(), 0x0100_0000, vec![0xAB, 0xCD]);
-        let emu = make_state(base_regs_emu(), 0x0100_0000, vec![0xAB, 0xCD]);
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        qemu_regs[0] = QEMU_TEST_SCRATCH;
+        emu_regs[0] = EMU_TEST_SCRATCH;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![0xAB, 0xCD]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![0xAB, 0xCD]);
         assert!(compare(&tc, &qemu, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_addr_reg_delta_same_ok() {
+        // addr_regs delta-compare: same writeback offset → OK
+        let tc = TestCase {
+            addr_regs: vec![2],
+            ..TestCase::default()
+        };
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        // Both advanced by +4 from their respective scratch bases
+        qemu_regs[2] = QEMU_TEST_SCRATCH + 4;
+        emu_regs[2] = EMU_TEST_SCRATCH + 4;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        assert!(compare(&tc, &qemu, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_addr_reg_delta_mismatch() {
+        // addr_regs delta-compare: different writeback offset → error
+        let tc = TestCase {
+            addr_regs: vec![2],
+            ..TestCase::default()
+        };
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        // QEMU advanced by +4, EMU by +8 — writeback mismatch
+        qemu_regs[2] = QEMU_TEST_SCRATCH + 4;
+        emu_regs[2] = EMU_TEST_SCRATCH + 8;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        assert!(err.contains("R2 addr delta"), "expected addr delta diff: {err}");
     }
 
     #[test]
@@ -5238,8 +5288,8 @@ mod tests {
 
     #[test]
     fn compare_probe_no_addr_regs_skipping() {
-        // In the QEMU compare(), addr_regs causes registers to be skipped.
-        // compare_probe() must NOT skip them — it compares all regs.
+        // In the QEMU compare(), addr_regs are delta-compared from scratch bases.
+        // compare_probe() must NOT do that — it compares all regs absolutely.
         let tc = TestCase {
             addr_regs: vec![2],
             ..TestCase::default()

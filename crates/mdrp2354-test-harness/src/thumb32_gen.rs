@@ -719,6 +719,1376 @@ pub fn enc_t32_parallel(prefix: u16, op: u16, rn: u16, rd: u16, rm: u16) -> (u16
 }
 
 // ============================================================================
+// Test generators — Priority 1
+// ============================================================================
+
+use crate::{
+    mem_check_u16, mem_check_u32, mem_pre_u16, mem_pre_u32,
+    TestCase, MASK_ALL_FLAGS, MASK_NO_FLAGS,
+};
+
+// ---------------------------------------------------------------------------
+// Generator 1: Data processing — modified immediate  (~80 tests)
+// ---------------------------------------------------------------------------
+
+/// Test data processing with modified (ThumbExpandImm) immediates.
+///
+/// Covers all five imm12 sub-modes, every ALU op with S=1, flag-only
+/// variants (Rd=15), no-source variants (Rn=15), and carry-out from
+/// rotation.
+pub fn gen_t32_dp_mod_imm() -> Vec<TestCase> {
+    let mut t = Vec::new();
+    let tb = 0x0100_0000u32; // T bit
+    let tb_c = tb | (1 << 29); // T bit + C flag set
+
+    // -- Helper: make a TestCase for S=1 (flag-updating) ALU op --
+    let mk = |name: &str, op: u16, rn: u16, rd: u16, imm12: u16,
+              regs: Vec<(u8, u32)>, xpsr: u32| -> TestCase
+    {
+        let (hw0, hw1) = enc_t32_dp_mod_imm(op, true, rn, rd, imm12);
+        TestCase {
+            name: name.into(),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: xpsr,
+            xpsr_mask: MASK_ALL_FLAGS,
+            ..TestCase::default()
+        }
+    };
+
+    // ----------------------------------------------------------------
+    // ThumbExpandImm sub-modes (verify immediate decoding)
+    // ----------------------------------------------------------------
+
+    // Mode 0: imm12[11:10]=00, [9:8]=00 → plain byte 0x000000ii
+    t.push(mk("ADDS.W R3,R5,#0x1F (plain byte)", DP_ADD, 5, 3, 0x01F,
+              vec![(5, 0)], tb));
+    t.push(mk("ADDS.W R0,R1,#0x00 (plain byte zero)", DP_ADD, 1, 0, 0x000,
+              vec![(1, 0)], tb));
+    t.push(mk("ADDS.W R0,R1,#0xFF (plain byte max)", DP_ADD, 1, 0, 0x0FF,
+              vec![(1, 0)], tb));
+
+    // Mode 1: imm12[11:10]=00, [9:8]=01 → 0x00ii00ii
+    // imm12 = 0b00_01_iiiiiiii = 0x100 | imm8
+    t.push(mk("ADDS.W R0,R1,#0x00420042 (rep x2)", DP_ADD, 1, 0, 0x142,
+              vec![(1, 0)], tb));
+    t.push(mk("ORRS.W R2,R3,#0x00FF00FF (rep x2 max)", DP_ORR, 3, 2, 0x1FF,
+              vec![(3, 0)], tb));
+
+    // Mode 2: imm12[11:10]=00, [9:8]=10 → 0xii00ii00
+    // imm12 = 0b00_10_iiiiiiii = 0x200 | imm8
+    t.push(mk("ADDS.W R0,R1,#0x42004200 (rep x2 shifted)", DP_ADD, 1, 0, 0x242,
+              vec![(1, 0)], tb));
+    t.push(mk("EORS.W R4,R5,#0xAB00AB00 (rep x2 shifted)", DP_EOR, 5, 4, 0x2AB,
+              vec![(5, 0xAB00AB00)], tb));
+
+    // Mode 3: imm12[11:10]=00, [9:8]=11 → 0xiiiiiiii
+    // imm12 = 0b00_11_iiiiiiii = 0x300 | imm8
+    t.push(mk("ADDS.W R0,R1,#0xABABABAB (rep x4)", DP_ADD, 1, 0, 0x3AB,
+              vec![(1, 0)], tb));
+    t.push(mk("ANDS.W R2,R3,#0xFFFFFFFF (rep x4 max)", DP_AND, 3, 2, 0x3FF,
+              vec![(3, 0x12345678)], tb));
+
+    // Mode 4: imm12[11:10]!=00 → rotated (0x80|imm7) ROR amount
+    // imm12 = 0b01_00000_ii = 0x400 | imm7:  (0x80|0) ROR 8  = 0x80000000
+    t.push(mk("ADDS.W R0,R1,#0x80000000 (rotated)", DP_ADD, 1, 0, 0x400,
+              vec![(1, 0)], tb));
+    // imm12 = 0b10_00000_00 = 0x800: (0x80|0) ROR 16 = 0x00008000
+    t.push(mk("ADDS.W R0,R1,#0x00008000 (rotated)", DP_ADD, 1, 0, 0x800,
+              vec![(1, 0)], tb));
+    // imm12 = 0b01_00001_01 = 0x405: (0x80|5) ROR 8 = 0x85000000
+    t.push(mk("ADDS.W R0,R1,#rotated(0x85 ROR 8)", DP_ADD, 1, 0, 0x405,
+              vec![(1, 0)], tb));
+
+    // ----------------------------------------------------------------
+    // ALU operations with S=1 — verify flag behavior
+    // ----------------------------------------------------------------
+
+    // ADDS.W: zero result (Z)
+    t.push(mk("ADDS.W R0,R1,#0 (Z flag, zero+zero)", DP_ADD, 1, 0, 0x000,
+              vec![(1, 0)], tb));
+    // ADDS.W: negative result (N)
+    t.push(mk("ADDS.W R0,R1,#1 (N flag)", DP_ADD, 1, 0, 0x001,
+              vec![(1, 0xFFFF_FFFE)], tb));
+    // ADDS.W: carry (C)
+    t.push(mk("ADDS.W R0,R1,#1 (C flag, wrap)", DP_ADD, 1, 0, 0x001,
+              vec![(1, 0xFFFF_FFFF)], tb));
+    // ADDS.W: overflow (V)
+    t.push(mk("ADDS.W R0,R1,#1 (V flag, pos overflow)", DP_ADD, 1, 0, 0x001,
+              vec![(1, 0x7FFF_FFFF)], tb));
+
+    // SUBS.W
+    t.push(mk("SUBS.W R0,R1,#1 (borrow)", DP_SUB, 1, 0, 0x001,
+              vec![(1, 0)], tb));
+    t.push(mk("SUBS.W R0,R1,#0 (no borrow)", DP_SUB, 1, 0, 0x000,
+              vec![(1, 5)], tb));
+    t.push(mk("SUBS.W R0,R1,#5 (equal)", DP_SUB, 1, 0, 0x005,
+              vec![(1, 5)], tb));
+
+    // CMP.W (SUB with Rd=15, flag-only)
+    t.push(mk("CMP.W R1,#0 (Rd=15, equal)", DP_SUB, 1, 15, 0x000,
+              vec![(1, 0)], tb));
+    t.push(mk("CMP.W R2,#1 (Rd=15, less)", DP_SUB, 2, 15, 0x001,
+              vec![(2, 0)], tb));
+    t.push(mk("CMP.W R3,#1 (Rd=15, greater)", DP_SUB, 3, 15, 0x001,
+              vec![(3, 5)], tb));
+
+    // ANDS.W
+    t.push(mk("ANDS.W R0,R1,#0xFF (non-zero)", DP_AND, 1, 0, 0x0FF,
+              vec![(1, 0x1234_5678)], tb));
+    t.push(mk("ANDS.W R0,R1,#0xFF (zero result)", DP_AND, 1, 0, 0x0FF,
+              vec![(1, 0x1234_5600)], tb));
+
+    // TST.W (AND with Rd=15, flag-only)
+    t.push(mk("TST.W R1,#0xFF (Rd=15, non-zero)", DP_AND, 1, 15, 0x0FF,
+              vec![(1, 0x42)], tb));
+    t.push(mk("TST.W R2,#0xFF (Rd=15, zero)", DP_AND, 2, 15, 0x0FF,
+              vec![(2, 0x100)], tb));
+
+    // ORRS.W
+    t.push(mk("ORRS.W R0,R1,#0xFF", DP_ORR, 1, 0, 0x0FF,
+              vec![(1, 0x1234_5600)], tb));
+    t.push(mk("ORRS.W R0,R1,#0 (N flag)", DP_ORR, 1, 0, 0x000,
+              vec![(1, 0x8000_0000)], tb));
+
+    // EORS.W
+    t.push(mk("EORS.W R0,R1,#0xFF (non-zero)", DP_EOR, 1, 0, 0x0FF,
+              vec![(1, 0xFF)], tb));
+    t.push(mk("EORS.W R0,R1,#0xFF (zero result)", DP_EOR, 1, 0, 0x0FF,
+              vec![(1, 0xFF)], tb));
+
+    // TEQ.W (EOR with Rd=15, flag-only)
+    t.push(mk("TEQ.W R1,#0xFF (Rd=15, zero)", DP_EOR, 1, 15, 0x0FF,
+              vec![(1, 0xFF)], tb));
+    t.push(mk("TEQ.W R2,#0xFF (Rd=15, non-zero)", DP_EOR, 2, 15, 0x0FF,
+              vec![(2, 0x100)], tb));
+
+    // BICS.W
+    t.push(mk("BICS.W R0,R1,#0xFF (clear low byte)", DP_BIC, 1, 0, 0x0FF,
+              vec![(1, 0x1234_56FF)], tb));
+    t.push(mk("BICS.W R0,R1,#0xFF (zero result)", DP_BIC, 1, 0, 0x0FF,
+              vec![(1, 0xFF)], tb));
+
+    // ORNS.W
+    t.push(mk("ORNS.W R0,R1,#0xFF (ORN = Rn | ~imm)", DP_ORN, 1, 0, 0x0FF,
+              vec![(1, 0)], tb));
+    t.push(mk("ORNS.W R0,R1,#0 (ORN with imm=0)", DP_ORN, 1, 0, 0x000,
+              vec![(1, 0)], tb));
+
+    // CMN.W (ADD with Rd=15, flag-only)
+    t.push(mk("CMN.W R1,#0 (Rd=15, zero)", DP_ADD, 1, 15, 0x000,
+              vec![(1, 0)], tb));
+    t.push(mk("CMN.W R2,#1 (Rd=15, wrap)", DP_ADD, 2, 15, 0x001,
+              vec![(2, 0xFFFF_FFFF)], tb));
+
+    // ----------------------------------------------------------------
+    // ADCS.W / SBCS.W / RSBS.W — carry-in sensitive
+    // ----------------------------------------------------------------
+
+    // ADCS.W with C=0
+    t.push(mk("ADCS.W R0,R1,#1 (C_in=0)", DP_ADC, 1, 0, 0x001,
+              vec![(1, 10)], tb));
+    // ADCS.W with C=1
+    t.push(mk("ADCS.W R0,R1,#1 (C_in=1)", DP_ADC, 1, 0, 0x001,
+              vec![(1, 10)], tb_c));
+    // ADCS.W producing carry
+    t.push(mk("ADCS.W R0,R1,#1 (C_in=1, wrap)", DP_ADC, 1, 0, 0x001,
+              vec![(1, 0xFFFF_FFFE)], tb_c));
+
+    // SBCS.W with C=1 (no borrow) — SBC subtracts (imm + !C), C=1 means no extra borrow
+    t.push(mk("SBCS.W R0,R1,#1 (C_in=1, no borrow)", DP_SBC, 1, 0, 0x001,
+              vec![(1, 10)], tb_c));
+    // SBCS.W with C=0 (borrow)
+    t.push(mk("SBCS.W R0,R1,#1 (C_in=0, borrow)", DP_SBC, 1, 0, 0x001,
+              vec![(1, 10)], tb));
+    // SBCS.W zero result
+    t.push(mk("SBCS.W R0,R1,#5 (C_in=1, zero result)", DP_SBC, 1, 0, 0x005,
+              vec![(1, 5)], tb_c));
+
+    // RSBS.W (reverse subtract: imm - Rn)
+    t.push(mk("RSBS.W R0,R1,#0 (negate)", DP_RSB, 1, 0, 0x000,
+              vec![(1, 1)], tb));
+    t.push(mk("RSBS.W R0,R1,#0xFF (positive result)", DP_RSB, 1, 0, 0x0FF,
+              vec![(1, 0)], tb));
+    t.push(mk("RSBS.W R0,R1,#0 (negate zero)", DP_RSB, 1, 0, 0x000,
+              vec![(1, 0)], tb));
+
+    // ----------------------------------------------------------------
+    // No-source variants (Rn=15)
+    // ----------------------------------------------------------------
+
+    // MOV.W (ORR with Rn=15 → result = 0 | imm = imm)
+    t.push(mk("MOV.W R0,#42 (Rn=15, ORR)", DP_ORR, 15, 0, 0x02A,
+              vec![], tb));
+    t.push(mk("MOV.W R5,#0 (Rn=15, zero)", DP_ORR, 15, 5, 0x000,
+              vec![], tb));
+    t.push(mk("MOV.W R3,#0xFF (Rn=15, 0xFF)", DP_ORR, 15, 3, 0x0FF,
+              vec![], tb));
+
+    // MVN.W (ORN with Rn=15 → result = 0xFFFFFFFF | ~imm... wait: ORN = Rn | ~imm,
+    // but Rn=15 → ORN reads as 0, so result = ~imm)
+    t.push(mk("MVN.W R0,#0 (Rn=15, ~0 = 0xFFFFFFFF)", DP_ORN, 15, 0, 0x000,
+              vec![], tb));
+    t.push(mk("MVN.W R0,#0xFF (Rn=15, ~0xFF)", DP_ORN, 15, 0, 0x0FF,
+              vec![], tb));
+
+    // ----------------------------------------------------------------
+    // Carry-out from ThumbExpandImm rotation (S=1)
+    // ----------------------------------------------------------------
+
+    // Rotated mode with S=1: the MSB of the rotated constant is the carry-out.
+    // imm12 = 0b01_00000_00 = 0x400 → 0x80 ROR 8 = 0x80000000 → C=1 (bit 31)
+    t.push(mk("ANDS.W R0,R1,#0x80000000 (rotation C=1)", DP_AND, 1, 0, 0x400,
+              vec![(1, 0xFFFF_FFFF)], tb));
+    // imm12 = 0b10_00000_00 = 0x800 → 0x80 ROR 16 = 0x00008000 → C=0 (bit 31=0)
+    t.push(mk("ANDS.W R0,R1,#0x00008000 (rotation C=0)", DP_AND, 1, 0, 0x800,
+              vec![(1, 0xFFFF_FFFF)], tb));
+    // imm12 = 0b01_11111_11 = 0x7FF → (0x80|0x7F=0xFF) ROR 8 = 0xFF000000 → C=1
+    t.push(mk("ORRS.W R0,R1,#0xFF000000 (rotation C=1)", DP_ORR, 1, 0, 0x47F,
+              vec![(1, 0)], tb));
+
+    // Verify rotation carry-out OVERWRITES incoming C flag (not preserves it).
+    // Rotated mode: imm12=0x201 → [11:7]=0b00100=4, [6:0]=1
+    // Constant = (0x80|0x01) ROR 4 = 0x81 ROR 4 = 0x1000_0008, bit 31=0 → C_out=0
+    // Incoming C=1 should be cleared by rotation carry_out=0.
+    {
+        let (hw0, hw1) = enc_t32_dp_mod_imm(DP_AND, true, 0, 0, 0x201);
+        t.push(TestCase {
+            name: "ANDS.W R0,R0,#(rot) C_out=0 clears incoming C=1".into(),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: vec![(0, 0xFFFF_FFFF)],
+            xpsr_pre: tb | (1 << 29), // C=1 incoming, should be cleared by rotation C_out=0
+            xpsr_mask: MASK_ALL_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // Register field extraction (different rd/rn combos)
+    // ----------------------------------------------------------------
+    t.push(mk("ADDS.W R7,R8,#1 (high Rn)", DP_ADD, 8, 7, 0x001,
+              vec![(8, 100)], tb));
+    t.push(mk("ADDS.W R10,R2,#1 (high Rd)", DP_ADD, 2, 10, 0x001,
+              vec![(2, 50)], tb));
+    t.push(mk("ADDS.W R12,R11,#0 (both high)", DP_ADD, 11, 12, 0x000,
+              vec![(11, 0xDEAD_BEEF)], tb));
+
+    // -- Ensure we didn't have the EOR zero-result test wrong; fix it:
+    // EORS 0xFF ^ 0x00 = 0xFF (not zero), move the actual zero-result test
+    t.push(mk("EORS.W R0,R1,#0x42 (zero: 0x42^0x42=0)", DP_EOR, 1, 0, 0x042,
+              vec![(1, 0x42)], tb));
+
+    t
+}
+
+// ---------------------------------------------------------------------------
+// Generator 2: Load/store single (~60 tests)
+// ---------------------------------------------------------------------------
+
+/// Test Thumb-32 load/store single with all three addressing modes:
+/// imm12 positive offset, imm8 with P/U/W, and register offset with shift.
+pub fn gen_t32_load_store_single() -> Vec<TestCase> {
+    let mut t = Vec::new();
+    let tb = 0x0100_0000u32;
+
+    // ----------------------------------------------------------------
+    // imm12 positive offset mode
+    // ----------------------------------------------------------------
+
+    // LDR.W — word loads
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,#0] (word, zero offset)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(0, 0xDEAD_BEEF),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 1, 0, 4);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,#4]".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(4, 0xCAFE_BABE),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 2, 3, 100);
+        t.push(TestCase {
+            name: "LDR.W R3,[R2,#100] (field extract)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(2, 0x00)],
+            addr_regs: vec![2],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(100, 0x1234_5678),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRB.W — byte load, zero extension
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, false, 1, 0, 8);
+        t.push(TestCase {
+            name: "LDRB.W R0,[R1,#8] (zero-extend)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(8, 0xAB)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, false, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDRB.W R0,[R1,#0] (0xFF, stays 0xFF)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(0, 0xFF)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRH.W — halfword load, zero extension
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, false, 1, 0, 4);
+        t.push(TestCase {
+            name: "LDRH.W R0,[R1,#4] (zero-extend)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(4, 0xBEEF),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSB.W — signed byte, sign extension
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 16);
+        t.push(TestCase {
+            name: "LDRSB.W R0,[R1,#16] (0x80 -> 0xFFFFFF80)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(16, 0x80)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDRSB.W R0,[R1,#0] (0x7F positive)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(0, 0x7F)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSH.W — signed halfword, sign extension
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 4);
+        t.push(TestCase {
+            name: "LDRSH.W R0,[R1,#4] (0x8000 -> 0xFFFF8000)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(4, 0x8000),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDRSH.W R0,[R1,#0] (0x7FFF positive)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(0, 0x7FFF),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STR.W — word stores
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 1, 0, 0);
+        t.push(TestCase {
+            name: "STR.W R0,[R1,#0]".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xDEAD_BEEF), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u32(0),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 2, 3, 8);
+        t.push(TestCase {
+            name: "STR.W R3,[R2,#8] (field extract)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(3, 0x1234_5678), (2, 0x00)],
+            addr_regs: vec![2],
+            needs_bus: true,
+            mem_check: mem_check_u32(8),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STRB.W
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b00, false, false, 1, 0, 4);
+        t.push(TestCase {
+            name: "STRB.W R0,[R1,#4]".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xAB), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: vec![4],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STRH.W
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b01, false, false, 1, 0, 4);
+        t.push(TestCase {
+            name: "STRH.W R0,[R1,#4]".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xBEEF), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u16(4),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // imm8 with P/U/W (pre-index, post-index, negative offset)
+    // ----------------------------------------------------------------
+
+    // Positive offset, no writeback: P=1, U=1, W=0
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, true, false, 8);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,#8] (imm8 P=1,U=1,W=0)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(8, 0xAAAA_BBBB),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Negative offset: P=1, U=0, W=0 — load from base-offset
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, false, false, 8);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,#-8] (negative offset)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 16)], // base=16, effective=16-8=8
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(8, 0x1111_2222),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Pre-index with writeback: P=1, U=1, W=1 — base updated to base+offset
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, true, true, 4);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,#4]! (pre-index writeback)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(4, 0xFACE_CAFE),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Post-index: P=0, U=1, W=1 — access at base, then base updated to base+offset
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, false, true, true, 4);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1],#4 (post-index)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(0, 0xBEEF_DEAD),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Pre-index negative: P=1, U=0, W=1
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, false, true, 8);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,#-8]! (pre-index neg writeback)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 16)], // effective addr = 16-8 = 8
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(8, 0x3333_4444),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Post-index negative: P=0, U=0, W=1
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, false, false, true, 4);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1],#-4 (post-index neg)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 8)], // load from addr 8, then base = 8-4 = 4
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(8, 0x5555_6666),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Store with pre-index writeback
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, false, false, 1, 0, true, true, true, 4);
+        t.push(TestCase {
+            name: "STR.W R0,[R1,#4]! (pre-index writeback store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0x7777_8888), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u32(4),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Store with post-index
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b10, false, false, 1, 0, false, true, true, 4);
+        t.push(TestCase {
+            name: "STR.W R0,[R1],#4 (post-index store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0x9999_AAAA), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u32(0),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRB.W with negative offset
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b00, true, false, 1, 0, true, false, false, 4);
+        t.push(TestCase {
+            name: "LDRB.W R0,[R1,#-4] (neg offset byte)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 8)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(4, 0xCD)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRH.W with pre-index writeback
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b01, true, false, 1, 0, true, true, true, 4);
+        t.push(TestCase {
+            name: "LDRH.W R0,[R1,#4]! (pre-index half)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(4, 0xABCD),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STRB.W with post-index
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b00, false, false, 1, 0, false, true, true, 4);
+        t.push(TestCase {
+            name: "STRB.W R0,[R1],#4 (post-index byte store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0x42), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: vec![0],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STRH.W with negative offset
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b01, false, false, 1, 0, true, false, false, 4);
+        t.push(TestCase {
+            name: "STRH.W R0,[R1,#-4] (neg offset half store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xFACE), (1, 8)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u16(4),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSB.W with pre-index
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b00, true, true, 1, 0, true, true, true, 4);
+        t.push(TestCase {
+            name: "LDRSB.W R0,[R1,#4]! (pre-index signed byte)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(4, 0x80)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSH.W with post-index
+    {
+        let (hw0, hw1) = enc_t32_ls_imm8(0b01, true, true, 1, 0, false, true, true, 4);
+        t.push(TestCase {
+            name: "LDRSH.W R0,[R1],#4 (post-index signed half)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(0, 0x8000),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // Register offset mode
+    // ----------------------------------------------------------------
+
+    // LDR.W Rt,[Rn,Rm,LSL #0]
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b10, true, false, 1, 0, 2, 0);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,R2] (reg offset, shift=0)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00), (2, 8)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(8, 0xAAAA_BBBB),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDR.W Rt,[Rn,Rm,LSL #2]
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b10, true, false, 1, 0, 2, 2);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,R2,LSL #2] (shift=2)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00), (2, 4)], // effective = 0 + 4<<2 = 16
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(16, 0x1111_2222),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STR.W with register offset
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b10, false, false, 1, 0, 2, 0);
+        t.push(TestCase {
+            name: "STR.W R0,[R1,R2] (reg offset store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xCAFE_BABE), (1, 0x00), (2, 4)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u32(4),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRB.W with register offset
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b00, true, false, 1, 0, 2, 0);
+        t.push(TestCase {
+            name: "LDRB.W R0,[R1,R2] (reg offset byte)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00), (2, 3)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(3, 0xEF)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRH.W with register offset, shift=1
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b01, true, false, 1, 0, 2, 1);
+        t.push(TestCase {
+            name: "LDRH.W R0,[R1,R2,LSL #1] (shift=1)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00), (2, 4)], // effective = 0 + 4<<1 = 8
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(8, 0xDEAD),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STRB.W with register offset
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b00, false, false, 1, 0, 2, 0);
+        t.push(TestCase {
+            name: "STRB.W R0,[R1,R2] (reg offset byte store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xAB), (1, 0x00), (2, 5)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: vec![5],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STRH.W with register offset, shift=1
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b01, false, false, 1, 0, 2, 1);
+        t.push(TestCase {
+            name: "STRH.W R0,[R1,R2,LSL #1] (reg offset half store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xBEEF), (1, 0x00), (2, 2)], // effective = 0 + 2<<1 = 4
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u16(4),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSB.W with register offset
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b00, true, true, 1, 0, 2, 0);
+        t.push(TestCase {
+            name: "LDRSB.W R0,[R1,R2] (reg, sign extend 0x80)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00), (2, 0)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(0, 0x80)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSH.W with register offset
+    {
+        let (hw0, hw1) = enc_t32_ls_reg(0b01, true, true, 1, 0, 2, 0);
+        t.push(TestCase {
+            name: "LDRSH.W R0,[R1,R2] (reg, sign extend 0xFFFF)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00), (2, 4)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(4, 0xFFFF),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // Additional edge cases: max-ish imm12 within scratch, zero data
+    // ----------------------------------------------------------------
+
+    // LDR.W with larger offset (within SCRATCH_SIZE)
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 1, 0, 252);
+        t.push(TestCase {
+            name: "LDR.W R0,[R1,#252] (near scratch limit)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(252, 0x9876_5432),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STR.W then verify with zero value
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 1, 0, 0);
+        t.push(TestCase {
+            name: "STR.W R0,[R1,#0] (zero value)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u32(0),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // STR.W with max value
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 1, 0, 0);
+        t.push(TestCase {
+            name: "STR.W R0,[R1,#0] (0xFFFFFFFF)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xFFFF_FFFF), (1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u32(0),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // Field extraction: different Rn/Rt combos
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 8, 9, 0);
+        t.push(TestCase {
+            name: "LDR.W R9,[R8,#0] (high regs)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(8, 0x00)],
+            addr_regs: vec![8],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(0, 0x1234_ABCD),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 10, 11, 4);
+        t.push(TestCase {
+            name: "STR.W R11,[R10,#4] (high regs store)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(11, 0xFEDC_BA98), (10, 0x00)],
+            addr_regs: vec![10],
+            needs_bus: true,
+            mem_check: mem_check_u32(4),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSB zero value → no sign extension
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDRSB.W R0,[R1,#0] (0x00 zero)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(0, 0x00)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSH zero value
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDRSH.W R0,[R1,#0] (0x0000 zero)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(0, 0x0000),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSB 0xFF → -1
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDRSB.W R0,[R1,#0] (0xFF -> -1)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: vec![(0, 0xFF)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // LDRSH 0xFFFF → -1
+    {
+        let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 0);
+        t.push(TestCase {
+            name: "LDRSH.W R0,[R1,#0] (0xFFFF -> -1)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x00)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u16(0, 0xFFFF),
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    t
+}
+
+// ---------------------------------------------------------------------------
+// Generator 3: Multiply / divide (~40 tests)
+// ---------------------------------------------------------------------------
+
+/// Test 32-bit multiply, 64-bit multiply, and integer division instructions.
+pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
+    let mut t = Vec::new();
+    let tb = 0x0100_0000u32;
+
+    // ----------------------------------------------------------------
+    // MUL — 32-bit multiply (lower 32 bits of product)
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_mul(0, 1, 2);
+        t.push(TestCase {
+            name: "MUL R0, R1, R2 (3*7=21)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 3), (2, 7)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_mul(3, 4, 5);
+        t.push(TestCase {
+            name: "MUL R3, R4, R5 (field extract)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(4, 100), (5, 200)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_mul(0, 1, 2);
+        t.push(TestCase {
+            name: "MUL R0, R1, R2 (by zero)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x1234_5678), (2, 0)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_mul(0, 1, 2);
+        t.push(TestCase {
+            name: "MUL R0, R1, R2 (by one)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0xDEAD_BEEF), (2, 1)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_mul(0, 1, 2);
+        t.push(TestCase {
+            name: "MUL R0, R1, R2 (large, truncated)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x0001_0000), (2, 0x0001_0000)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // MLA — multiply-accumulate: Rd = Rn*Rm + Ra
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_mla(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "MLA R0, R1, R2, R3 (3*7+10=31)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 3), (2, 7), (3, 10)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_mla(4, 5, 6, 7);
+        t.push(TestCase {
+            name: "MLA R4, R5, R6, R7 (field extract)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(5, 2), (6, 3), (7, 100)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_mla(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "MLA R0, R1, R2, R3 (accum only, 0*x+Ra)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0), (2, 42), (3, 99)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // MLS — multiply-subtract: Rd = Ra - Rn*Rm
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_mls(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "MLS R0, R1, R2, R3 (100-3*7=79)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 3), (2, 7), (3, 100)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_mls(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "MLS R0, R1, R2, R3 (0-3*7, wraps)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 3), (2, 7), (3, 0)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // SMULL — signed 64-bit multiply
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_smull(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "SMULL R0,R1, R2,R3 (0x10000*0x10000)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(2, 0x0001_0000), (3, 0x0001_0000)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // RdLo=0, RdHi=1
+    }
+    {
+        let (hw0, hw1) = enc_t32_smull(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "SMULL R0,R1, R2,R3 (small: 3*7)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(2, 3), (3, 7)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // RdLo=21, RdHi=0
+    }
+    {
+        let (hw0, hw1) = enc_t32_smull(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "SMULL R0,R1, R2,R3 (neg: -1 * 2)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(2, 0xFFFF_FFFF), (3, 2)], // -1 * 2 = -2
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // RdLo=0xFFFFFFFE, RdHi=0xFFFFFFFF
+    }
+    {
+        let (hw0, hw1) = enc_t32_smull(4, 5, 6, 7);
+        t.push(TestCase {
+            name: "SMULL R4,R5, R6,R7 (field extract, 0*x)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(6, 0), (7, 0x1234_5678)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // UMULL — unsigned 64-bit multiply
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_umull(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "UMULL R0,R1, R2,R3 (0x10000*0x10000)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(2, 0x0001_0000), (3, 0x0001_0000)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_umull(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "UMULL R0,R1, R2,R3 (MAX*2)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(2, 0xFFFF_FFFF), (3, 2)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // 0xFFFFFFFF*2 = 0x1_FFFFFFFE
+    }
+
+    // ----------------------------------------------------------------
+    // SMLAL — signed 64-bit multiply-accumulate
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_smlal(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "SMLAL R0,R1, R2,R3 (accum 3*7+100)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 100), (1, 0), (2, 3), (3, 7)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // 64-bit accum: (0:100) + 21 = 121
+    }
+    {
+        let (hw0, hw1) = enc_t32_smlal(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "SMLAL R0,R1, R2,R3 (neg product)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 100), (1, 0), (2, 0xFFFF_FFFF), (3, 2)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // accum + (-1*2) = 100 + (-2) = 98
+    }
+
+    // ----------------------------------------------------------------
+    // UMLAL — unsigned 64-bit multiply-accumulate
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_umlal(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "UMLAL R0,R1, R2,R3 (accum 5*6+1000)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 1000), (1, 0), (2, 5), (3, 6)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // 1000 + 30 = 1030
+    }
+    {
+        let (hw0, hw1) = enc_t32_umlal(0, 1, 2, 3);
+        t.push(TestCase {
+            name: "UMLAL R0,R1, R2,R3 (carry into hi)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(0, 0xFFFF_FFFF), (1, 0), (2, 1), (3, 2)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        }); // (0:0xFFFFFFFF) + 2 = (1:0x00000001)
+    }
+
+    // ----------------------------------------------------------------
+    // SDIV — signed division
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
+        t.push(TestCase {
+            name: "SDIV R0, R1, R2 (21/7=3)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 21), (2, 7)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
+        t.push(TestCase {
+            name: "SDIV R0, R1, R2 (-21/7=-3)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, (-21i32) as u32), (2, 7)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
+        t.push(TestCase {
+            name: "SDIV R0, R1, R2 (-21/-7=3)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, (-21i32) as u32), (2, (-7i32) as u32)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
+        t.push(TestCase {
+            name: "SDIV R0, R1, R2 (div by zero = 0)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 42), (2, 0)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // INT32_MIN / -1 should return INT32_MIN (overflow wraps)
+        let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
+        t.push(TestCase {
+            name: "SDIV R0, R1, R2 (INT32_MIN/-1 = INT32_MIN)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0x8000_0000), (2, (-1i32) as u32)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // Round toward zero: 7/2 = 3 (not 4)
+        let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
+        t.push(TestCase {
+            name: "SDIV R0, R1, R2 (7/2=3, round-toward-zero)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 7), (2, 2)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        // Round toward zero negative: -7/2 = -3 (not -4)
+        let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
+        t.push(TestCase {
+            name: "SDIV R0, R1, R2 (-7/2=-3, round-toward-zero)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, (-7i32) as u32), (2, 2)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_sdiv(3, 4, 5);
+        t.push(TestCase {
+            name: "SDIV R3, R4, R5 (field extract)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(4, 100), (5, 10)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // UDIV — unsigned division
+    // ----------------------------------------------------------------
+
+    {
+        let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
+        t.push(TestCase {
+            name: "UDIV R0, R1, R2 (100/10=10)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 100), (2, 10)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
+        t.push(TestCase {
+            name: "UDIV R0, R1, R2 (div by zero = 0)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0xFFFF_FFFF), (2, 0)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
+        t.push(TestCase {
+            name: "UDIV R0, R1, R2 (7/2=3, truncated)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 7), (2, 2)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
+        t.push(TestCase {
+            name: "UDIV R0, R1, R2 (MAX/1=MAX)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 0xFFFF_FFFF), (2, 1)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
+        t.push(TestCase {
+            name: "UDIV R0, R1, R2 (1/1=1)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(1, 1), (2, 1)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+    {
+        let (hw0, hw1) = enc_t32_udiv(6, 7, 8);
+        t.push(TestCase {
+            name: "UDIV R6, R7, R8 (field extract)".into(),
+            opcode: hw0, hw1: Some(hw1),
+            reg_pre: vec![(7, 255), (8, 5)],
+            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    t
+}
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 
