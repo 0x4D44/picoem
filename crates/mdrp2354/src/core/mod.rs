@@ -147,9 +147,11 @@ impl CortexM33 {
     pub fn halt(&mut self) {
         self.halted = true;
         self.stall_cycles = 0;
+        self.pending_fault = None;
     }
 
-    /// Wake a halted core so it resumes execution.
+    /// Resume a halted core. The caller must set PC, SP, and xpsr before
+    /// calling this — wake() only clears the halted flag.
     pub fn wake(&mut self) {
         self.halted = false;
     }

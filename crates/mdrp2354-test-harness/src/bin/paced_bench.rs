@@ -10,13 +10,18 @@ fn main() {
     let clock_mhz = parse_arg("--clock-mhz").unwrap_or(150);
     let sys_clk_hz = clock_mhz * 1_000_000;
 
+    if seconds == 0 || clock_mhz == 0 {
+        eprintln!("error: --seconds and --clock-mhz must be > 0");
+        std::process::exit(1);
+    }
+
     // --- Set up emulator with a tight SRAM loop ---
     let mut emu = Emulator::new(Config {
         sys_clk_hz,
         ..Default::default()
     });
 
-    // Write workload: MOVS R0,#0 | ADDS R0,R0,#1 then B .-4
+    // Write workload: MOVS R0,#1 | ADDS R0,R0,#1 then B .-2 (back to ADDS)
     emu.poke(0x20000000, 0x1C40_2001);
     emu.poke(0x20000004, 0x0000_E7FD);
 
