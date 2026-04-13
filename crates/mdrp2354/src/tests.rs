@@ -977,3 +977,263 @@ fn thumb32_ldr_w_routes_to_stub() {
     let cy = c.execute_one_wide(0xF8D1, 0x0000);
     assert_eq!(cy, 1);
 }
+
+// ============================================================================
+// Thumb-32: Data Processing (Modified Immediate)
+// ============================================================================
+
+/// Encode a data-processing (modified immediate) instruction.
+/// Format: 11110_i_0_op[3:0]_S_Rn  0_imm3_Rd_imm8
+fn encode_dp_mod_imm(op: u8, s: bool, rn: u8, rd: u8, imm12: u32) -> (u16, u16) {
+    let i = ((imm12 >> 11) & 1) as u16;
+    let imm3 = ((imm12 >> 8) & 0x7) as u16;
+    let imm8 = (imm12 & 0xFF) as u16;
+    let hw0 = 0xF000 | (i << 10) | ((op as u16) << 5) | ((s as u16) << 4) | (rn as u16);
+    let hw1 = (imm3 << 12) | ((rd as u16) << 8) | imm8;
+    (hw0, hw1)
+}
+
+#[test]
+fn adds_w_imm() {
+    // ADDS.W R0, R1, #256
+    // imm12 for 256: byte-replication mode 00, imm8=0 won't work.
+    // 256 = 0x100 → imm12 = 0x100 (mode 01: 0x00ii00ii with imm8=0 is 0,
+    // that's wrong). Use rotation: 0x80 rotated right by 24 → 0x100.
+    // rotation=24, imm12[11:7]=24=0b11000, imm12[6:0]=0 (unrotated=0x80).
+    // imm12 = 0b110_0000_0000_0 = 0xC00. Wait, let me recalculate.
+    // For rotation path: imm12[11:10] != 00, unrotated = 0x80 | imm12[6:0],
+    // rotation = imm12[11:7].
+    // We want unrotated = 0x80 (imm12[6:0] = 0), rotation = 24.
+    // imm12 = (24 << 7) | 0 = 0xC00. But imm12 is 12 bits (0..0xFFF).
+    // 24 << 7 = 0xC00, yes that fits. Check: imm12[11:10] = 0b11 != 00 → rotation path.
+    // unrotated = 0x80, rotation = (0xC00 >> 7) & 0x1F = 24.
+    // 0x80.rotate_right(24) = 0x80 << 8 = 0x8000. That's not 256.
+    //
+    // Actually: 256 = 0x100. Let's just use imm12 = 0x100 directly.
+    // imm12 = 0x100: imm12[11:10] = 0b00 → byte replication.
+    // (imm12 >> 8) & 0x3 = 1 → mode 01: val = (imm8 << 16) | imm8.
+    // imm8 = 0 → val = 0. That's wrong.
+    //
+    // OK, simplest: use a small constant. #42 = imm12 = 0x2A (mode 00: val=0x2A).
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    let (hw0, hw1) = encode_dp_mod_imm(0b1000, true, 1, 0, 0x2A); // ADDS.W R0, R1, #42
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 142);
+    assert!(!c.flag_n());
+    assert!(!c.flag_z());
+    assert!(!c.flag_c());
+    assert!(!c.flag_v());
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn subs_w_imm() {
+    // SUBS.W R0, R1, #100
+    let mut c = CortexM33::new();
+    c.set_reg(1, 150);
+    let (hw0, hw1) = encode_dp_mod_imm(0b1101, true, 1, 0, 100); // SUBS.W R0, R1, #100
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 50);
+    assert!(!c.flag_n());
+    assert!(!c.flag_z());
+    assert!(c.flag_c()); // no borrow → carry set
+    assert!(!c.flag_v());
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn and_w_imm_no_flags() {
+    // AND.W R0, R1, #0xFF (S=0, no flag update)
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x1234_5678);
+    c.regs.set_flag_n(true); // pre-set flags to verify they don't change
+    c.regs.set_flag_z(true);
+    let (hw0, hw1) = encode_dp_mod_imm(0b0000, false, 1, 0, 0xFF);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x78);
+    assert!(c.flag_n()); // unchanged
+    assert!(c.flag_z()); // unchanged
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn ands_w_imm_carry() {
+    // ANDS.W with rotation immediate to test carry from ThumbExpandImm.
+    // Use imm12 = 0xC00: rotation path. unrotated=0x80, rotation=24.
+    // val = 0x80.rotate_right(24) = 0x8000. carry = val >> 31 = 0.
+    // Actually: 0x80 rotated right by 24 = 0x80 << (32-24) = 0x80 << 8 = 0x8000.
+    // val = 0x8000, carry = (0x8000 >> 31) = 0 → false.
+    //
+    // Let's use rotation=1: imm12[11:7]=1, imm12[6:0]=0.
+    // imm12 = (1 << 7) = 0x80. Check bits [11:10]: (0x80 >> 10) = 0 → that's 00,
+    // byte replication path. Need imm12[11:10] != 00.
+    //
+    // rotation=8: imm12 = (8 << 7) | 0 = 0x400. bits[11:10] = 0b01 → rotation path.
+    // unrotated = 0x80, rotation = 8. val = 0x80.rotate_right(8) = 0x80000000.
+    // carry = val >> 31 = 1 → true.
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xFFFF_FFFF);
+    let (hw0, hw1) = encode_dp_mod_imm(0b0000, true, 1, 0, 0x400);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // imm32 = 0x8000_0000
+    assert_eq!(c.reg(0), 0x8000_0000); // 0xFFFFFFFF & 0x80000000
+    assert!(c.flag_n());  // bit 31 set
+    assert!(!c.flag_z());
+    assert!(c.flag_c());  // carry from ThumbExpandImm rotation
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn mov_w_imm() {
+    // MOV.W R0, #imm via ORR with Rn=15, S=0
+    // Use imm12 = 0x34 → imm32 = 0x34
+    let mut c = CortexM33::new();
+    let (hw0, hw1) = encode_dp_mod_imm(0b0010, false, 15, 0, 0x34);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x34);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn mvn_w_imm() {
+    // MVN.W R0, #0 → R0 = 0xFFFFFFFF (via ORN with Rn=15, S=0)
+    let mut c = CortexM33::new();
+    let (hw0, hw1) = encode_dp_mod_imm(0b0011, false, 15, 0, 0x00);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xFFFF_FFFF);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn cmp_w_imm() {
+    // CMP.W R0, #50 → SUB with S=1, Rd=15 (discard result, flags only)
+    let mut c = CortexM33::new();
+    c.set_reg(0, 50);
+    let (hw0, hw1) = encode_dp_mod_imm(0b1101, true, 0, 15, 50);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // 50 - 50 = 0 → Z=1, C=1 (no borrow), N=0, V=0
+    assert!(!c.flag_n());
+    assert!(c.flag_z());
+    assert!(c.flag_c());
+    assert!(!c.flag_v());
+    // Rd=15, so R15 should NOT have been changed to the result (0).
+    // R15 was set by execute_one_wide to pc+4. Verify it's still there.
+    assert_ne!(c.reg(15), 0);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn tst_w_imm() {
+    // TST.W R0, #0xFF → AND with S=1, Rd=15 (discard result, flags only)
+    let mut c = CortexM33::new();
+    c.set_reg(0, 0x100); // bit 8 set, low byte = 0
+    let (hw0, hw1) = encode_dp_mod_imm(0b0000, true, 0, 15, 0xFF);
+    let cy = c.execute_one_wide(hw0, hw1);
+    // 0x100 & 0xFF = 0 → Z=1, N=0
+    assert!(!c.flag_n());
+    assert!(c.flag_z());
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn orr_w_imm() {
+    // ORR.W R0, R1, #0xFF00
+    // 0xFF00 = 0xFF << 8. Using byte-replication mode 10: (imm8 << 24) | (imm8 << 8).
+    // mode 10: imm12[9:8] = 0b10, imm8 = 0xFF → val = (0xFF << 24) | (0xFF << 8) = 0xFF00FF00.
+    // That's not 0xFF00. Let me use rotation instead.
+    // 0xFF00 = 0xFF shifted left by 8 = 0x80|0x7F rotated right by 24.
+    // unrotated = 0xFF (0x80 | 0x7F), rotation = 24.
+    // imm12 = (24 << 7) | 0x7F = 0xC7F. Check bits: 0xC7F >> 10 = 3 → != 00 → rotation path.
+    // rotation = (0xC7F >> 7) & 0x1F = 24. unrotated = 0x80 | 0x7F = 0xFF.
+    // val = 0xFF.rotate_right(24) = 0xFF << 8 = 0xFF00. Correct!
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x1234_0000);
+    let (hw0, hw1) = encode_dp_mod_imm(0b0010, false, 1, 0, 0xC7F);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0x1234_FF00);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn bic_w_imm() {
+    // BIC.W R0, R1, #0x0F → R0 = R1 & ~0x0F (clear low nibble)
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xABCD_EF9A);
+    let (hw0, hw1) = encode_dp_mod_imm(0b0001, false, 1, 0, 0x0F);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xABCD_EF90);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn adc_w_imm() {
+    // ADCS.W R0, R1, #10 with carry-in = 1
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    c.regs.set_flag_c(true); // carry-in
+    let (hw0, hw1) = encode_dp_mod_imm(0b1010, true, 1, 0, 10);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 111); // 100 + 10 + 1
+    assert!(!c.flag_n());
+    assert!(!c.flag_z());
+    assert!(!c.flag_c());
+    assert!(!c.flag_v());
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn sbc_w_imm() {
+    // SBCS.W R0, R1, #10 with carry-in = 1 (no borrow)
+    // SBC: Rd = Rn + ~imm32 + C
+    // 100 + ~10 + 1 = 100 + 0xFFFFFFF5 + 1 = 100 - 10 = 90
+    let mut c = CortexM33::new();
+    c.set_reg(1, 100);
+    c.regs.set_flag_c(true);
+    let (hw0, hw1) = encode_dp_mod_imm(0b1011, true, 1, 0, 10);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 90);
+    assert!(!c.flag_n());
+    assert!(!c.flag_z());
+    assert!(c.flag_c()); // no borrow
+    assert!(!c.flag_v());
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn rsb_w_imm() {
+    // RSBS.W R0, R1, #100 → R0 = 100 - R1 = 100 - 30 = 70
+    // RSB: Rd = ~Rn + imm32 + 1
+    let mut c = CortexM33::new();
+    c.set_reg(1, 30);
+    let (hw0, hw1) = encode_dp_mod_imm(0b1110, true, 1, 0, 100);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 70);
+    assert!(!c.flag_n());
+    assert!(!c.flag_z());
+    assert!(c.flag_c()); // no borrow
+    assert!(!c.flag_v());
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn eor_w_imm() {
+    // EOR.W R0, R1, #0xFF (S=0)
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0xAA);
+    let (hw0, hw1) = encode_dp_mod_imm(0b0100, false, 1, 0, 0xFF);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xAA ^ 0xFF); // 0x55
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn orn_w_imm() {
+    // ORN.W R0, R1, #0xFF → R0 = R1 | ~0xFF = R1 | 0xFFFFFF00
+    let mut c = CortexM33::new();
+    c.set_reg(1, 0x0000_0042);
+    let (hw0, hw1) = encode_dp_mod_imm(0b0011, false, 1, 0, 0xFF);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.reg(0), 0xFFFF_FF42);
+    assert_eq!(cy, 1);
+}

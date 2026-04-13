@@ -3,7 +3,7 @@
 
 use crate::bus::Bus;
 use super::CortexM33;
-use super::execute::sign_extend;
+use super::execute::{sign_extend, add_with_carry};
 
 // ============================================================================
 // ThumbExpandImm helpers
@@ -55,7 +55,144 @@ impl CortexM33 {
     // -- Data processing (modified immediate) --------------------------------
 
     pub(crate) fn thumb32_dp_modified_imm(&mut self, hw0: u16, hw1: u16) -> u32 {
-        self.thumb32_undefined(hw0, hw1)
+        let op = ((hw0 >> 5) & 0xF) as u8;
+        let s = (hw0 >> 4) & 1 != 0;
+        let rn = (hw0 & 0xF) as usize;
+        let rd = ((hw1 >> 8) & 0xF) as usize;
+        let imm12 = extract_imm12(hw0, hw1);
+        let (imm32, te_carry) = thumb_expand_imm_c(imm12, self.regs.flag_c());
+
+        match op {
+            // AND / TST / ANDS
+            0b0000 => {
+                let result = self.regs.r[rn] & imm32;
+                if s && rd == 15 {
+                    // TST — discard result, update flags only
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(te_carry);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nz(result);
+                        self.regs.set_flag_c(te_carry);
+                    }
+                }
+                1
+            }
+            // BIC / BICS
+            0b0001 => {
+                let result = self.regs.r[rn] & !imm32;
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(te_carry);
+                }
+                1
+            }
+            // ORR / MOV / ORRS / MOVS
+            0b0010 => {
+                let result = if rn == 15 {
+                    imm32 // MOV / MOVS
+                } else {
+                    self.regs.r[rn] | imm32
+                };
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(te_carry);
+                }
+                1
+            }
+            // ORN / MVN / ORNS / MVNS
+            0b0011 => {
+                let result = if rn == 15 {
+                    !imm32 // MVN / MVNS
+                } else {
+                    self.regs.r[rn] | !imm32
+                };
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(te_carry);
+                }
+                1
+            }
+            // EOR / TEQ / EORS
+            0b0100 => {
+                let result = self.regs.r[rn] ^ imm32;
+                if s && rd == 15 {
+                    // TEQ — discard result, update flags only
+                    self.regs.set_nz(result);
+                    self.regs.set_flag_c(te_carry);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nz(result);
+                        self.regs.set_flag_c(te_carry);
+                    }
+                }
+                1
+            }
+            // ADD / CMN / ADDS
+            0b1000 => {
+                let (result, carry, overflow) = add_with_carry(self.regs.r[rn], imm32, false);
+                if s && rd == 15 {
+                    // CMN — discard result, update flags only
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    }
+                }
+                1
+            }
+            // ADC / ADCS
+            0b1010 => {
+                let (result, carry, overflow) =
+                    add_with_carry(self.regs.r[rn], imm32, self.regs.flag_c());
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                }
+                1
+            }
+            // SBC / SBCS
+            0b1011 => {
+                let (result, carry, overflow) =
+                    add_with_carry(self.regs.r[rn], !imm32, self.regs.flag_c());
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                }
+                1
+            }
+            // SUB / CMP / SUBS
+            0b1101 => {
+                let (result, carry, overflow) = add_with_carry(self.regs.r[rn], !imm32, true);
+                if s && rd == 15 {
+                    // CMP — discard result, update flags only
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                } else {
+                    self.regs.r[rd] = result;
+                    if s {
+                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    }
+                }
+                1
+            }
+            // RSB / RSBS
+            0b1110 => {
+                let (result, carry, overflow) = add_with_carry(!self.regs.r[rn], imm32, true);
+                self.regs.r[rd] = result;
+                if s {
+                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                }
+                1
+            }
+            // Undefined op values
+            _ => self.thumb32_undefined(hw0, hw1),
+        }
     }
 
     // -- Data processing (plain binary immediate) ----------------------------
