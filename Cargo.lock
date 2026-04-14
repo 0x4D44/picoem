@@ -1264,6 +1264,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdpicoem-common"
+version = "0.1.0"
+
+[[package]]
 name = "mdpicoem-debug"
 version = "0.1.0"
 dependencies = [
@@ -1282,7 +1286,10 @@ dependencies = [
 
 [[package]]
 name = "mdrp2350"
-version = "0.2.0"
+version = "0.3.0"
+dependencies = [
+ "mdpicoem-common",
+]
 
 [[package]]
 name = "mdrp2350app"

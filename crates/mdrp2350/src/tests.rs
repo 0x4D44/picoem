@@ -5113,14 +5113,14 @@ fn sram_striped_access_consecutive_words_go_to_consecutive_banks() {
 
 #[test]
 fn bank_for_address_striped_region() {
-    // Memory::bank_for_address(addr) → bank index (0..9)
+    // crate::memory::bank_for_address(addr) → bank index (0..9)
     // Striped region: bank = (word_offset) % 8
-    assert_eq!(Memory::bank_for_address(0x2000_0000), Some(0)); // word 0 → bank 0
-    assert_eq!(Memory::bank_for_address(0x2000_0004), Some(1)); // word 1 → bank 1
-    assert_eq!(Memory::bank_for_address(0x2000_0008), Some(2)); // word 2 → bank 2
-    assert_eq!(Memory::bank_for_address(0x2000_000C), Some(3)); // word 3 → bank 3
-    assert_eq!(Memory::bank_for_address(0x2000_001C), Some(7)); // word 7 → bank 7
-    assert_eq!(Memory::bank_for_address(0x2000_0020), Some(0)); // word 8 → wraps to bank 0
+    assert_eq!(crate::memory::bank_for_address(0x2000_0000), Some(0)); // word 0 → bank 0
+    assert_eq!(crate::memory::bank_for_address(0x2000_0004), Some(1)); // word 1 → bank 1
+    assert_eq!(crate::memory::bank_for_address(0x2000_0008), Some(2)); // word 2 → bank 2
+    assert_eq!(crate::memory::bank_for_address(0x2000_000C), Some(3)); // word 3 → bank 3
+    assert_eq!(crate::memory::bank_for_address(0x2000_001C), Some(7)); // word 7 → bank 7
+    assert_eq!(crate::memory::bank_for_address(0x2000_0020), Some(0)); // word 8 → wraps to bank 0
 }
 
 #[test]
@@ -5128,24 +5128,24 @@ fn bank_for_address_non_striped_region() {
     // Non-striped banks:
     //   SRAM8 (0x20080000..0x20080FFF) → always bank 8
     //   SRAM9 (0x20081000..0x20081FFF) → always bank 9
-    assert_eq!(Memory::bank_for_address(0x2008_0000), Some(8));
-    assert_eq!(Memory::bank_for_address(0x2008_0500), Some(8));
-    assert_eq!(Memory::bank_for_address(0x2008_0FFF), Some(8));
-    assert_eq!(Memory::bank_for_address(0x2008_1000), Some(9));
-    assert_eq!(Memory::bank_for_address(0x2008_1500), Some(9));
-    assert_eq!(Memory::bank_for_address(0x2008_1FFF), Some(9));
+    assert_eq!(crate::memory::bank_for_address(0x2008_0000), Some(8));
+    assert_eq!(crate::memory::bank_for_address(0x2008_0500), Some(8));
+    assert_eq!(crate::memory::bank_for_address(0x2008_0FFF), Some(8));
+    assert_eq!(crate::memory::bank_for_address(0x2008_1000), Some(9));
+    assert_eq!(crate::memory::bank_for_address(0x2008_1500), Some(9));
+    assert_eq!(crate::memory::bank_for_address(0x2008_1FFF), Some(9));
 }
 
 #[test]
 fn bank_for_address_rejects_non_sram() {
     // ROM address — not SRAM
-    assert_eq!(Memory::bank_for_address(0x0000_1000), None);
+    assert_eq!(crate::memory::bank_for_address(0x0000_1000), None);
     // XIP address — not SRAM
-    assert_eq!(Memory::bank_for_address(0x1000_0004), None);
+    assert_eq!(crate::memory::bank_for_address(0x1000_0004), None);
     // Beyond SRAM9
-    assert_eq!(Memory::bank_for_address(0x2008_2000), None);
+    assert_eq!(crate::memory::bank_for_address(0x2008_2000), None);
     // Unmapped region
-    assert_eq!(Memory::bank_for_address(0x3000_0000), None);
+    assert_eq!(crate::memory::bank_for_address(0x3000_0000), None);
 }
 
 // ============================================================================
@@ -5438,11 +5438,10 @@ fn sram_atomic_no_extra_latency() {
 
 #[test]
 fn sram_alias_bank_for_address_resolves_correctly() {
-    use crate::memory::Memory;
     // Alias addresses should resolve to same bank as canonical
-    assert_eq!(Memory::bank_for_address(0x2000_0004), Memory::bank_for_address(0x2100_0004));
-    assert_eq!(Memory::bank_for_address(0x2000_0004), Memory::bank_for_address(0x2200_0004));
-    assert_eq!(Memory::bank_for_address(0x2000_0004), Memory::bank_for_address(0x2300_0004));
+    assert_eq!(crate::memory::bank_for_address(0x2000_0004), crate::memory::bank_for_address(0x2100_0004));
+    assert_eq!(crate::memory::bank_for_address(0x2000_0004), crate::memory::bank_for_address(0x2200_0004));
+    assert_eq!(crate::memory::bank_for_address(0x2000_0004), crate::memory::bank_for_address(0x2300_0004));
 }
 
 // ============================================================================

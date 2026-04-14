@@ -5,7 +5,7 @@ pub mod ppb;
 use std::collections::HashMap;
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
-use crate::memory::{Memory, SRAM_SIZE};
+use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
 
@@ -311,7 +311,7 @@ impl Bus {
             0x1 => Some(1),  // XIP — single port
             0x2 => {
                 // SRAM — per-bank ports
-                match Memory::bank_for_address(addr) {
+                match bank_for_address(addr) {
                     Some(bank) => Some(2 + bank), // ports 2-11
                     None => Some(2),              // out-of-range SRAM, treat as bank 0
                 }

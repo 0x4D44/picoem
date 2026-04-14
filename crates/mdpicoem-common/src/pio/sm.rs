@@ -1,3 +1,25 @@
+//! PIO state machine primitive.
+//!
+//! # Field-level invariants
+//!
+//! `StateMachine` fields are `pub(crate)` intentionally — several carry
+//! invariants that must not be bypassed by external writes. Do **not**
+//! promote these to `pub` without understanding each invariant:
+//!
+//! - `pc` is masked `& 0x1F` on every advance; external writes that skip
+//!   the mask can read past `instr_mem[31]` and fetch garbage.
+//! - `isr_count` / `osr_count` are clamped `.min(32)` after every IN/OUT;
+//!   unclamped values desync autopush/autopull threshold checks.
+//! - `stalled` and `stall_kind` are paired; clearing one without the other
+//!   breaks `check_stall` re-evaluation.
+//! - `pc`, `stalled`, `stall_kind`, `delay_count`, and `pending_exec` form
+//!   the SM's control-flow state and must transition together (see
+//!   `force_execute` for the guarded path).
+//!
+//! Expose chip-side read access via small accessor methods (e.g.
+//! [`StateMachine::enabled`]). Writes from outside the crate are not
+//! supported — reprogram via the PIO register bus instead.
+
 use super::decode::{decode, DecodedInsn, PioOp};
 use super::fifo::PioFifo;
 
@@ -92,6 +114,15 @@ impl StateMachine {
         let id = self.sm_id;
         *self = Self::new();
         self.sm_id = id;
+    }
+
+    /// Returns whether this SM is currently enabled (CTRL.SM_ENABLE bit).
+    ///
+    /// Chip-side code (bus tests, debug UIs) only needs a read view; writes
+    /// happen through the PIO CTRL register. See module docs for the full
+    /// invariant set.
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Read the CLKDIV register value (int[31:16], frac[15:8]).

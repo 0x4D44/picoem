@@ -2,27 +2,19 @@ pub mod core;
 pub mod bus;
 pub mod memory;
 pub mod sio;
-pub mod clock;
-pub mod pacer;
 pub mod pio;
+
+#[cfg(test)]
+mod pio_tests;
 
 pub use self::core::CortexM33;
 pub use self::bus::Bus;
 pub use self::memory::Memory;
-pub use self::clock::Clock;
 pub use self::sio::Sio;
-pub use self::pacer::{PacerStats, PacerSnapshot};
-#[cfg(target_arch = "x86_64")]
-pub use self::pacer::Pacer;
 
-/// Trait for memory-mapped peripherals. Implemented by crates like
-/// `mdpicoem-common`. The core crate defines the interface only.
-pub trait Peripheral {
-    fn read32(&mut self, offset: u32) -> u32;
-    fn write32(&mut self, offset: u32, value: u32);
-    /// Called once per system clock. Return true if interrupt asserted.
-    fn step(&mut self) -> bool;
-}
+pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats, Peripheral};
+#[cfg(target_arch = "x86_64")]
+pub use mdpicoem_common::Pacer;
 
 /// Stop reason when running until a condition.
 pub enum StopReason {
