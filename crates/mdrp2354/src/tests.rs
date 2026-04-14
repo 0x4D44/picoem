@@ -4461,6 +4461,230 @@ fn fpu_vcvtb_f16_f32_negative_zero_roundtrip() {
     assert_eq!(c.regs.s[4].to_bits(), 0x8000_0000, "round-trip must preserve -0 sign");
 }
 
+// ----- VRINT* (R / X / Z) -- DN / IOC / IDC / IXC --------------------------
+//
+// VRINT family per ARM DDI0553 FPRoundInt:
+//   - SNaN input raises IOC; result is the input quietened (DN=0) or the
+//     ARM default NaN (DN=1).
+//   - Denormal input raises IDC; under FZ=1 it flushes to ±0.
+//   - VRINTX raises IXC when the rounded value differs from the input.
+//   - VRINTR/VRINTZ never raise IXC.
+
+// (Re-uses FPSCR_* constants defined further up in this file alongside the
+// existing FPU exception-flag tests.)
+
+fn enc_vrintr(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0110, 0, sd, sm) }
+fn enc_vrintz(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0110, 1, sd, sm) }
+fn enc_vrintx(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0111, 0, sd, sm) }
+
+#[test]
+fn fpu_vrintx_inexact_sets_ixc() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 2.5;
+    let (hw0, hw1) = enc_vrintx(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 2.0); // round-to-even
+    assert!(c.regs.fpscr & FPSCR_IXC != 0, "VRINTX must raise IXC on inexact");
+}
+
+#[test]
+fn fpu_vrintr_inexact_no_ixc() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 2.5;
+    let (hw0, hw1) = enc_vrintr(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 2.0);
+    assert!(c.regs.fpscr & FPSCR_IXC == 0, "VRINTR must NOT raise IXC");
+}
+
+#[test]
+fn fpu_vrintz_inexact_no_ixc() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 2.7;
+    let (hw0, hw1) = enc_vrintz(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 2.0); // round-toward-zero
+    assert!(c.regs.fpscr & FPSCR_IXC == 0, "VRINTZ must NOT raise IXC");
+}
+
+#[test]
+fn fpu_vrintx_snan_sets_ioc_dn_canonicalizes() {
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_DN;
+    c.regs.s[2] = f32::from_bits(0x7F80_0001); // SNaN
+    let (hw0, hw1) = enc_vrintx(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 0x7FC0_0000, "DN=1 must canonicalize NaN");
+    assert!(c.regs.fpscr & FPSCR_IOC != 0, "SNaN must raise IOC");
+}
+
+#[test]
+fn fpu_vrintr_qnan_dn_off_quietens_payload() {
+    // QNaN input under DN=0: output preserves payload (already quiet).
+    // No IOC because input was already quiet.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(0x7FCD_EAD0);
+    let (hw0, hw1) = enc_vrintr(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 0x7FCD_EAD0);
+    assert!(c.regs.fpscr & FPSCR_IOC == 0, "QNaN must NOT raise IOC");
+}
+
+#[test]
+fn fpu_vrintx_snan_dn_off_quietens_input() {
+    // Under DN=0, VRINTX on an SNaN must (a) raise IOC and (b) return the
+    // input with the quiet bit forced — this is the "quieten payload" path
+    // we explicitly pinned to avoid relying on host rounding intrinsics.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(0x7F80_1234); // SNaN with payload
+    let (hw0, hw1) = enc_vrintx(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Quietened: bit 22 forced on, rest of payload preserved.
+    assert_eq!(c.regs.s[0].to_bits(), 0x7FC0_1234);
+    assert!(c.regs.fpscr & FPSCR_IOC != 0, "SNaN must raise IOC");
+}
+
+#[test]
+fn fpu_vrintx_denormal_input_sets_idc() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(0x0000_0001); // smallest subnormal
+    let (hw0, hw1) = enc_vrintx(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.fpscr & FPSCR_IDC != 0, "Denormal input must raise IDC");
+    // Under FZ=0 the denormal is preserved through ftz_input; rounding to
+    // integer of a tiny denormal gives 0, and VRINTX raises IXC.
+    assert_eq!(c.regs.s[0], 0.0);
+    assert!(c.regs.fpscr & FPSCR_IXC != 0);
+}
+
+#[test]
+fn fpu_vrintx_denormal_fz_flushes_to_zero_no_ixc() {
+    // Under FZ=1, denormal input flushes to ±0 with IDC. The rounded result
+    // (still 0) is exact w.r.t. the flushed input, so no IXC.
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_FZ;
+    c.regs.s[2] = f32::from_bits(0x0000_0001);
+    let (hw0, hw1) = enc_vrintx(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 0.0);
+    assert!(c.regs.fpscr & FPSCR_IDC != 0);
+    assert!(c.regs.fpscr & FPSCR_IXC == 0, "Flushed input is exact zero — no IXC");
+}
+
+#[test]
+fn fpu_vrintr_inf_passthrough() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::INFINITY;
+    let (hw0, hw1) = enc_vrintr(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.s[0].is_infinite() && c.regs.s[0].is_sign_positive());
+    assert_eq!(c.regs.fpscr & 0xFF, 0, "no flags on infinity input");
+}
+
+#[test]
+fn fpu_vrintr_rmode_sweep() {
+    // Verify the dispatcher actually reads FPSCR.RMode (bits 23:22).
+    // Input 1.5 differentiates all four rounding modes:
+    //   RN(00) → 2.0 (round-to-even)
+    //   RP(01) → 2.0 (ceiling)
+    //   RM(10) → 1.0 (floor)
+    //   RZ(11) → 1.0 (toward zero)
+    for (rmode, expected) in [(0u32, 2.0f32), (1, 2.0), (2, 1.0), (3, 1.0)] {
+        let mut c = CortexM33::new();
+        c.regs.fpscr = rmode << 22;
+        c.regs.s[2] = 1.5;
+        let (hw0, hw1) = enc_vrintr(0, 2);
+        c.execute_one_wide(hw0, hw1);
+        assert_eq!(
+            c.regs.s[0], expected,
+            "VRINTR(1.5) with rmode={rmode} expected {expected}, got {}",
+            c.regs.s[0]
+        );
+    }
+}
+
+// ----- VCVT.F16 ↔ F32 -- DN / IOC / IDC ------------------------------------
+
+#[test]
+fn fpu_vcvtb_f16_f32_snan_sets_ioc_dn_canonicalizes() {
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_DN;
+    c.regs.s[2] = f32::from_bits(0x7F80_1234); // SNaN
+    c.regs.s[0] = 0.0;
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // DN=1 → f16 default NaN (0x7E00) in bottom half.
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x7E00);
+    assert!(c.regs.fpscr & FPSCR_IOC != 0, "SNaN must raise IOC");
+}
+
+#[test]
+fn fpu_vcvtb_f16_f32_qnan_dn_off_preserves_payload() {
+    // QNaN input under DN=0: payload preserved (top 9 bits), no IOC.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(0x7FCD_EAD0); // QNaN with payload
+    c.regs.s[0] = 0.0;
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Top 9 payload bits of f32 frac (0x4DEAD0 >> 13 = 0x26F) → bottom 9 bits of f16 frac
+    let payload = (0x4DEAD0_u32 >> 13) as u16 & 0x1FF;
+    let expected = 0x7E00 | payload; // sign=0, exp=11111, quiet=1, payload
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, expected as u32);
+    assert!(c.regs.fpscr & FPSCR_IOC == 0, "QNaN must NOT raise IOC");
+}
+
+#[test]
+fn fpu_vcvtb_f16_f32_denormal_input_sets_idc() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(0x0000_0001); // f32 denormal
+    c.regs.s[0] = 0.0;
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x0000, "denormal flushes to f16 +0");
+    assert!(c.regs.fpscr & FPSCR_IDC != 0, "f32 denormal must raise IDC");
+}
+
+#[test]
+fn fpu_vcvtb_f32_f16_snan_sets_ioc_dn_canonicalizes() {
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_DN;
+    // f16 SNaN: exp=11111, frac non-zero, quiet bit (bit 9) clear.
+    c.regs.s[2] = f32::from_bits(0x7C01); // bottom half = SNaN
+    let (hw0, hw1) = enc_vcvtb_f32_f16(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 0x7FC0_0000, "DN=1 must canonicalize");
+    assert!(c.regs.fpscr & FPSCR_IOC != 0, "SNaN must raise IOC");
+}
+
+#[test]
+fn fpu_vcvtb_f32_f16_qnan_dn_off_preserves_payload() {
+    // f16 QNaN with payload, DN=0: f32 result has the payload shifted left
+    // by 13 bits with the quiet bit forced. No IOC.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(0x7E55); // bottom half = QNaN with payload
+    let (hw0, hw1) = enc_vcvtb_f32_f16(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Expected: sign=0, exp=11111111, quiet=1, payload shifted from f16
+    let expected = 0x7F80_0000 | (0x255_u32 << 13) | 0x0040_0000;
+    assert_eq!(c.regs.s[0].to_bits(), expected);
+    assert!(c.regs.fpscr & FPSCR_IOC == 0);
+}
+
+#[test]
+fn fpu_vcvtt_f16_f32_snan_dn_canonicalizes_in_top_half() {
+    // VCVTT writes to the TOP half of Sd; verify the DN canonicalization
+    // path is wired identically for the top variant.
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_DN;
+    c.regs.s[2] = f32::from_bits(0x7F80_0001); // SNaN
+    c.regs.s[0] = f32::from_bits(0x0000_BEEF); // top half is target
+    let (hw0, hw1) = enc_vcvtt_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // Top half should be the f16 default NaN (0x7E00), bottom half preserved.
+    assert_eq!(c.regs.s[0].to_bits(), (0x7E00 << 16) | 0x0000_BEEF);
+    assert!(c.regs.fpscr & FPSCR_IOC != 0);
+}
+
 // ----- VSEL with D=1 -------------------------------------------------------
 //
 // Regression test for the D-bit decode: the Armv8-M 0xFE encodings put the D

@@ -827,6 +827,154 @@ mod tests {
         assert!(f & IOC != 0);
         assert!(f & IDC != 0);
     }
+
+    // ------------------------------------------------------------------------
+    // VRINT
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn ref_vrint_integer_input_no_flags() {
+        // Round-to-nearest of an exact integer leaves it alone, no flags.
+        let (r, f) = ref_vrint(3.0, 0b00, 0, true);
+        assert_eq!(r, 3.0);
+        assert_eq!(f, 0);
+    }
+
+    #[test]
+    fn ref_vrint_inexact_sets_ixc_only_when_exact() {
+        let (r1, f1) = ref_vrint(2.5, 0b00, 0, true); // VRINTX
+        assert_eq!(r1, 2.0); // round-to-even
+        assert!(f1 & IXC != 0, "VRINTX should raise IXC on inexact");
+        let (r2, f2) = ref_vrint(2.5, 0b00, 0, false); // VRINTR
+        assert_eq!(r2, 2.0);
+        assert!(f2 & IXC == 0, "VRINTR must not raise IXC");
+    }
+
+    #[test]
+    fn ref_vrint_snan_sets_ioc_and_dn_canonicalizes() {
+        let snan = f32::from_bits(0x7F80_0001);
+        let (r, f) = ref_vrint(snan, 0b00, DN, false);
+        assert_eq!(r.to_bits(), 0x7FC0_0000);
+        assert!(f & IOC != 0);
+    }
+
+    #[test]
+    fn ref_vrint_qnan_dn_off_no_ioc() {
+        // QNaN input is not signaling — no IOC. Under DN=0 the oracle emits
+        // *a* QNaN (payload-collapse is intentional; the diff harness treats
+        // NaN-vs-NaN as equal under DN=0, see ieee754_ref::apply_dn).
+        let qnan = f32::from_bits(0x7FCD_EAD0);
+        let (r, f) = ref_vrint(qnan, 0b00, 0, true);
+        assert!(r.is_nan());
+        assert!(f & IOC == 0);
+    }
+
+    #[test]
+    fn ref_vrint_denormal_input_sets_idc_fz_flushes() {
+        let denorm = f32::from_bits(0x0000_0001);
+        let (_, f) = ref_vrint(denorm, 0b00, 0, true);
+        assert!(f & IDC != 0);
+        let (r, f) = ref_vrint(denorm, 0b00, FZ, true);
+        assert_eq!(r, 0.0);
+        assert!(f & IDC != 0);
+        // Flushed input is exact zero → no IXC, even with `exact = true`.
+        assert!(f & IXC == 0);
+    }
+
+    #[test]
+    fn ref_vrint_rmode_dispatch() {
+        // 1.5 with each rmode.
+        assert_eq!(ref_vrint(1.5, 0b00, 0, false).0, 2.0); // RN: round-to-even
+        assert_eq!(ref_vrint(1.5, 0b01, 0, false).0, 2.0); // RP: ceil
+        assert_eq!(ref_vrint(1.5, 0b10, 0, false).0, 1.0); // RM: floor
+        assert_eq!(ref_vrint(1.5, 0b11, 0, false).0, 1.0); // RZ: trunc
+    }
+
+    // ------------------------------------------------------------------------
+    // VCVT.F32.F16 / VCVT.F16.F32
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn ref_vcvt_f32_from_f16_basic_values() {
+        // ±0
+        assert_eq!(ref_vcvt_f32_from_f16(0x0000, 0).0, 0.0);
+        assert_eq!(ref_vcvt_f32_from_f16(0x8000, 0).0.to_bits(), 0x8000_0000);
+        // 1.0 in f16 = 0x3C00 → 1.0 in f32
+        assert_eq!(ref_vcvt_f32_from_f16(0x3C00, 0).0, 1.0);
+        // ±inf
+        assert!(ref_vcvt_f32_from_f16(0x7C00, 0).0.is_infinite());
+        assert!(ref_vcvt_f32_from_f16(0xFC00, 0).0.is_infinite());
+    }
+
+    #[test]
+    fn ref_vcvt_f32_from_f16_subnormal_smallest() {
+        // f16 0x0001 = smallest subnormal = 2^-24 = 0x33800000 in f32.
+        let (r, f) = ref_vcvt_f32_from_f16(0x0001, 0);
+        assert_eq!(r.to_bits(), 0x3380_0000);
+        assert_eq!(f, 0);
+    }
+
+    #[test]
+    fn ref_vcvt_f32_from_f16_subnormal_largest() {
+        // f16 0x03FF = largest subnormal = (1023/1024) * 2^-14
+        // = 0.999... * 2^-14 = (1 + 1022/1024) * 2^-15 ≈ 6.097e-5
+        // f32 encoding: exp=112, frac=0x7FC000 → 0x387FC000.
+        let (r, _) = ref_vcvt_f32_from_f16(0x03FF, 0);
+        assert_eq!(r.to_bits(), 0x387F_C000);
+    }
+
+    #[test]
+    fn ref_vcvt_f32_from_f16_snan_sets_ioc_dn_canonicalizes() {
+        // f16 SNaN: exp=0x1F, frac non-zero, quiet bit (bit 9) clear.
+        let snan = 0x7C01_u16; // exp=11111, frac=0000000001
+        let (_, f) = ref_vcvt_f32_from_f16(snan, 0);
+        assert!(f & IOC != 0);
+        let (r, _) = ref_vcvt_f32_from_f16(snan, DN);
+        assert_eq!(r.to_bits(), 0x7FC0_0000);
+    }
+
+    #[test]
+    fn ref_vcvt_f16_from_f32_basic_values() {
+        assert_eq!(ref_vcvt_f16_from_f32(0.0, 0).0, 0x0000);
+        assert_eq!(ref_vcvt_f16_from_f32(-0.0, 0).0, 0x8000);
+        assert_eq!(ref_vcvt_f16_from_f32(1.0, 0).0, 0x3C00);
+        assert_eq!(ref_vcvt_f16_from_f32(f32::INFINITY, 0).0, 0x7C00);
+        assert_eq!(ref_vcvt_f16_from_f32(f32::NEG_INFINITY, 0).0, 0xFC00);
+    }
+
+    #[test]
+    fn ref_vcvt_f16_from_f32_overflow_to_inf() {
+        // 2^16 overflows half-precision (max normal exp = 15).
+        let big = f32::from_bits(0x4780_0000); // 65536.0
+        assert_eq!(ref_vcvt_f16_from_f32(big, 0).0, 0x7C00);
+    }
+
+    #[test]
+    fn ref_vcvt_f16_from_f32_denormal_input_sets_idc_flushes() {
+        let denorm = f32::from_bits(0x0000_0001);
+        let (h, f) = ref_vcvt_f16_from_f32(denorm, 0);
+        assert_eq!(h, 0x0000);
+        assert!(f & IDC != 0);
+    }
+
+    #[test]
+    fn ref_vcvt_f16_from_f32_snan_sets_ioc_dn_canonicalizes() {
+        let snan = f32::from_bits(0x7F80_0001);
+        let (_, f) = ref_vcvt_f16_from_f32(snan, 0);
+        assert!(f & IOC != 0);
+        let (h, _) = ref_vcvt_f16_from_f32(snan, DN);
+        assert_eq!(h, 0x7E00);
+    }
+
+    #[test]
+    fn ref_vcvt_f16_from_f32_round_trip_subnormals() {
+        // For every f16 subnormal, f16 → f32 → f16 must be the identity.
+        for h in 0x0001u16..=0x03FF {
+            let (val, _) = ref_vcvt_f32_from_f16(h, 0);
+            let (back, _) = ref_vcvt_f16_from_f32(val, 0);
+            assert_eq!(back, h, "round trip failed for f16 0x{:04X}", h);
+        }
+    }
 }
 
 // ============================================================================
