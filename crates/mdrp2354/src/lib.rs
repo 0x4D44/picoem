@@ -149,6 +149,7 @@ impl Emulator {
     /// averages 1:1. A halted core never contributes `cycles`, so the
     /// `while` predicate never fires and the core is skipped cheaply.
     pub fn step(&mut self) -> u64 {
+        debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
         let target = self.clock.cycles + self.step_quantum as u64;
 
         // Core 0 first, then core 1. `bus.active_core` must be set so that
@@ -298,6 +299,7 @@ impl EmulatorBuilder {
     /// Useful for benches sweeping quantum size, or tests wanting tighter
     /// peripheral-latency observation.
     pub fn step_quantum(mut self, n: u32) -> Self {
+        debug_assert!(n > 0, "step_quantum must be >= 1");
         self.step_quantum = n;
         self
     }
