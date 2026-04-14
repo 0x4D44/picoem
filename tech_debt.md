@@ -98,6 +98,18 @@ These are testable via probe_diff (same address space) but not via
 qemu_diff. Could be restored with address-aware comparison logic in
 the QEMU harness if needed.
 
+## Core Correctness
+
+### CPS bit-swap in mdrp2350 (matches obsolete LLD docs)
+
+`crates/mdrp2350/src/core/execute.rs` implements the CPS encoding with bit 0 = I and bit 1 = F. ARMv6-M/v7-M ARM A6.7.38 specifies the reverse (bit 1 = I, bit 0 = F). Canonical assembler output (`CPSIE i` = 0xB662, `CPSID i` = 0xB672) is currently silent on PRIMASK. The LLD docs under `wrk_docs/` that claim the bits are swapped are wrong — they inherit the same error.
+
+Fix: swap the bit check; update tests that used the wrong canonical encoding. Trace references:
+- `crates/mdrp2350/src/core/execute.rs` — CPS decode site.
+- `wrk_docs/` — any LLD section mentioning CPS bit ordering. Correct to match ARM ARM.
+
+mdrp2040 Phase 4.A fixed the bug in its own code (2026-04-14).
+
 ## Thumb-32 Test Generators
 
 Three Thumb-32 generator functions are stubbed out in lib.rs

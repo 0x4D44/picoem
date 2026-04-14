@@ -52,6 +52,43 @@ impl Bus {
     pub fn load_flash(&mut self, data: &[u8]) {
         self.memory.load_flash(data);
     }
+
+    // --- Phase 4.A bus read/write stubs ----------------------------------
+    //
+    // The AHB-Lite fabric, address decode, cycle accounting, bus-fault
+    // reporting, contention model, and peripheral routing all land in
+    // Phase 5. Phase 4.A only needs somewhere to send CPU load/store
+    // traffic during unit tests — so these methods route straight to the
+    // common `Memory` backing store with no timing and no decode beyond
+    // what `Memory::peek*/poke*` already does.
+
+    pub fn read8(&mut self, addr: u32) -> u8 {
+        self.memory.peek8(addr)
+    }
+
+    pub fn read16(&mut self, addr: u32) -> u16 {
+        let lo = self.memory.peek8(addr) as u16;
+        let hi = self.memory.peek8(addr.wrapping_add(1)) as u16;
+        lo | (hi << 8)
+    }
+
+    pub fn read32(&mut self, addr: u32) -> u32 {
+        self.memory.peek32(addr)
+    }
+
+    pub fn write8(&mut self, addr: u32, val: u8) {
+        self.memory.poke8(addr, val);
+    }
+
+    pub fn write16(&mut self, addr: u32, val: u16) {
+        let bytes = val.to_le_bytes();
+        self.memory.poke8(addr, bytes[0]);
+        self.memory.poke8(addr.wrapping_add(1), bytes[1]);
+    }
+
+    pub fn write32(&mut self, addr: u32, val: u32) {
+        self.memory.poke32(addr, val);
+    }
 }
 
 impl Default for Bus {

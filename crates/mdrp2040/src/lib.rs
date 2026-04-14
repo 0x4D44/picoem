@@ -8,6 +8,9 @@
 pub mod bus;
 pub mod core;
 
+#[cfg(test)]
+mod tests;
+
 pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
 
