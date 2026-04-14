@@ -297,7 +297,7 @@ def build_reset_handler():
     code += emit_cmd_set_cursor(0, 0)
     code += emit_cmd_write("Hello from")
     code += emit_cmd_set_cursor(0, 1)
-    code += emit_cmd_write("mdrp2354!")
+    code += emit_cmd_write("mdpicoem!")
 
     # 4. Long pause between refresh cycles: emit several delays.
     for _ in range(8):

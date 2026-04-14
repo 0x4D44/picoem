@@ -202,7 +202,7 @@ fn benchmark_trace_phase_transitions() {
 
 #[test]
 #[ignore = "bootrom rcp_iequal cascade — see file-top comment"]
-fn lcd_demo_writes_hello_from_mdrp2354_within_2s() {
+fn lcd_demo_writes_hello_from_mdpicoem_within_2s() {
     let fw = load_firmware("lcd_demo.bin");
 
     let snapshot = Arc::new(RwLock::new(Snapshot::default()));
@@ -217,7 +217,7 @@ fn lcd_demo_writes_hello_from_mdrp2354_within_2s() {
     while Instant::now() < deadline {
         let snap = snapshot.read().unwrap().clone();
         let has_hello = snap.lcd.rows[0].starts_with(b"Hello from");
-        let has_mdrp = snap.lcd.rows[1].starts_with(b"mdrp2354!");
+        let has_mdrp = snap.lcd.rows[1].starts_with(b"mdpicoem!");
         if has_hello && has_mdrp {
             populated = true;
             break;
@@ -236,7 +236,7 @@ fn lcd_demo_writes_hello_from_mdrp2354_within_2s() {
     assert!(final_snapshot.cycles > 0, "emulator ran");
     assert!(
         populated,
-        "LCD should show 'Hello from' on row 0 and 'mdrp2354!' on row 1 within 2 s \
+        "LCD should show 'Hello from' on row 0 and 'mdpicoem!' on row 1 within 2 s \
          (row 0 = {:?}, row 1 = {:?})",
         String::from_utf8_lossy(&final_snapshot.lcd.rows[0]),
         String::from_utf8_lossy(&final_snapshot.lcd.rows[1]),
