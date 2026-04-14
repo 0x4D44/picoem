@@ -173,11 +173,14 @@ impl Emulator {
     ///
     /// Once `clock.cycles >= target` (or core 0 halts), advance both PIO
     /// blocks by the quantum's total consumed cycles, merge GPIO
-    /// outputs, and run wake checks. Mirrors `mdrp2350::Emulator::step`.
+    /// outputs, and run wake checks. Mirrors `mdrp2350::Emulator::step`'s
+    /// quantum-end peripheral model; differs in per-iteration core
+    /// interleaving, which is required here to preserve bank-contention
+    /// timing on core 1.
     pub fn step(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
         let start = self.clock.cycles;
-        let target = start + self.step_quantum as u64;
+        let target = start.wrapping_add(self.step_quantum as u64);
 
         while self.clock.cycles < target && !self.cores[0].is_halted() {
             self.bus.set_active_core(0);
@@ -223,7 +226,9 @@ impl Emulator {
     }
 
     /// Run for at least `cycles` virtual cycles. Returns the number of
-    /// cycles actually executed (may overshoot by at most one instruction).
+    /// cycles actually executed. May overshoot by up to `step_quantum - 1`
+    /// cycles (one quantum's worth), matching the documented overshoot
+    /// behaviour of [`Self::step`].
     pub fn run(&mut self, cycles: u64) -> u64 {
         let start = self.clock.cycles;
         while self.clock.cycles.wrapping_sub(start) < cycles {

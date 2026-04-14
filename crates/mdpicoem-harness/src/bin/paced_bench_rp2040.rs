@@ -160,8 +160,8 @@ fn main() {
             } else if start.elapsed() >= duration {
                 break;
             }
-            emu.run(qc);
-            n += qc;
+            let consumed = emu.run(qc);
+            n += consumed;
         }
         n
     } else {
