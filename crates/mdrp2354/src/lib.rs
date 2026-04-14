@@ -89,6 +89,7 @@ impl Emulator {
         self.bus.event_flag = [false; 2];
         self.bus.rcp_salt = [0; 2];
         self.bus.rcp_salt_valid = [false; 2];
+        self.bus.rcp_count = 0;
         self.bus.sio.reset();
         for pio in &mut self.bus.pio {
             pio.reset();

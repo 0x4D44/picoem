@@ -242,27 +242,128 @@ impl CortexM33 {
         }
     }
 
+    /// CP7 MCR/MRC/CDP family dispatch (Phase 7 Stage E).
+    ///
+    /// Discriminates on bit 4 of hw1 (1 = MCR/MRC, 0 = CDP), L bit of hw0
+    /// (0 = to-coproc / MCR, 1 = from-coproc / MRC), and then (opc1, opc2)
+    /// to reach the specific RCP instruction. Encoding table at the test
+    /// module's top — all patterns marked "bootrom" are verified against
+    /// `roms/arm-bootrom.dis`.
+    ///
+    /// On assertion failure: `self.pending_fault = Some(Fault::Nmi)`.
+    /// The existing `step()`/`deliver_fault` path turns that into an NMI
+    /// exception (`enter_exception(2, bus)`).
     fn cp7_mcr_mrc_family(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let is_cdp = hw1 & (1 << 4) == 0;
         if is_cdp {
-            return 1; // CDP / CDP2: accept silently (rcp_panic etc.)
+            return self.cp7_cdp(hw0, hw1);
         }
         let is_mrc = (hw0 >> 4) & 1 != 0; // L bit
+        let opc1 = ((hw0 >> 5) & 0x7) as u8;
+        let crn = (hw0 & 0xF) as u8;
+        let opc2 = ((hw1 >> 5) & 0x7) as u8;
         let rt = ((hw1 >> 12) & 0xF) as usize;
+        let crm = (hw1 & 0xF) as u8;
         let core = bus.active_core();
 
         if is_mrc {
-            if rt == 15 {
-                // rcp_canary_status pc: write NZCV to APSR.
-                // N = salt_valid[core]; Z=0, C=0, V=0.
-                let n = if bus.rcp_salt_valid[core] { 1u32 << 31 } else { 0 };
-                self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | n;
-            } else {
-                // rcp_canary_get: return salt XOR deadbeef
-                self.regs.r[rt] = bus.rcp_salt[core] ^ 0xDEAD_BEEF;
+            match (opc1, opc2) {
+                (0, 1) => {
+                    // rcp_canary_get Rt, imm — returns salt ^ 0xDEADBEEF.
+                    // The immediate (CRn<<4)|CRm is a "tag" for SDK
+                    // bookkeeping; we ignore it (bootrom pairs get/check
+                    // with the same tag and relies only on consistency).
+                    self.regs.r[rt] = bus.rcp_salt[core] ^ 0xDEAD_BEEF;
+                }
+                (1, 0) if rt == 15 => {
+                    // rcp_canary_status pc: write NZCV to APSR.
+                    // N = salt_valid[core]; Z=0, C=0, V=0.
+                    let n = if bus.rcp_salt_valid[core] { 1u32 << 31 } else { 0 };
+                    self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | n;
+                }
+                _ => {} // unrecognized MRC: silent NOP
+            }
+            return 1;
+        }
+
+        // MCR path — assertions (may raise Fault::Nmi).
+        match (opc1, opc2) {
+            (0, 1) => {
+                // rcp_canary_check Rt, imm — assert Rt == salt ^ 0xDEADBEEF.
+                //
+                // Salt-invalid divergence from silicon (HLD §8.4 skip list):
+                // when `rcp_salt_valid[core] == false`, both sides of the
+                // comparison compute `0 ^ 0xDEADBEEF` and the check passes.
+                // Real silicon raises NMI on any canary op while salt is
+                // unseeded. We preserve the divergence so the bootrom can
+                // execute its own salt-seeding path — which contains
+                // canary_get/check pairs that would otherwise trip before
+                // the salt is written — and continue to boot through.
+                let expected = bus.rcp_salt[core] ^ 0xDEAD_BEEF;
+                if self.regs.r[rt] != expected {
+                    self.pending_fault = Some(Fault::Nmi);
+                }
+            }
+            (1, 0) => {
+                // rcp_bvalid Rt — assert Rt ∈ {0, 1}.
+                let v = self.regs.r[rt];
+                if v > 1 {
+                    self.pending_fault = Some(Fault::Nmi);
+                }
+            }
+            (2, 0) => {
+                // rcp_btrue Rt — assert Rt == 1.
+                if self.regs.r[rt] != 1 {
+                    self.pending_fault = Some(Fault::Nmi);
+                }
+            }
+            (3, 1) => {
+                // rcp_bfalse Rt — assert Rt == 0.
+                if self.regs.r[rt] != 0 {
+                    self.pending_fault = Some(Fault::Nmi);
+                }
+            }
+            (4, 0) => {
+                // rcp_count_init imm — set the redundancy counter to imm.
+                bus.rcp_count = ((crn as u32) << 4) | (crm as u32);
+            }
+            (5, 1) => {
+                // rcp_count_check imm — assert counter == imm, then increment.
+                let expected = ((crn as u32) << 4) | (crm as u32);
+                if bus.rcp_count != expected {
+                    self.pending_fault = Some(Fault::Nmi);
+                } else {
+                    bus.rcp_count = bus.rcp_count.wrapping_add(1);
+                }
+            }
+            _ => {
+                // Unrecognized MCR encoding — silent NOP (HLD §8.4).
+                // Notably `rcp_ifgte` (opc1=6, opc2=0) and `rcp_iflte`
+                // (opc1=6, opc2=1) are *NOT implemented — silent NOP*; no
+                // caller has materialized in the bootrom disassembly and we
+                // refuse to speculate the encoding.
             }
         }
-        // MCR/MCR2: rcp_canary_check assertion — accept silently
+        1
+    }
+
+    /// CP7 CDP / CDP2 dispatch. One mnemonic currently handled:
+    ///   - `rcp_panic` (opc1=0, opc2=1): unconditional NMI.
+    ///
+    /// Other CDP encodings — notably the speculative `rcp_switch`
+    /// (opc1=0, opc2=2) — are *NOT implemented — silent NOP*. They do not
+    /// appear in the bootrom disassembly; per HLD §8.4 we refuse to commit
+    /// to an encoding until a real caller demands it.
+    fn cp7_cdp(&mut self, hw0: u16, hw1: u16) -> u32 {
+        let opc1 = ((hw0 >> 4) & 0xF) as u8;
+        let opc2 = ((hw1 >> 5) & 0x7) as u8;
+        match (opc1, opc2) {
+            (0, 1) => {
+                // rcp_panic — unconditional NMI (bootrom encoding 0xEE00_0720).
+                self.pending_fault = Some(Fault::Nmi);
+            }
+            _ => {} // unrecognized CDP: silent NOP (HLD §8.4)
+        }
         1
     }
 
@@ -272,24 +373,39 @@ impl CortexM33 {
             return 1; // MRRC2 from CP7: not used by bootrom
         }
 
-        // MCRR2 dispatch: discriminator is (opc1, CRm) from hw1.
+        // MCRR2 dispatch: discriminator is opc1 in hw1[7:4]; CRm in hw1[3:0].
+        // Rt in hw1[15:12], Rt2 in hw0[3:0].
         let opc1 = ((hw1 >> 4) & 0xF) as u8;
         let crm = (hw1 & 0xF) as u8;
         let rt = ((hw1 >> 12) & 0xF) as usize;
+        let rt2 = (hw0 & 0xF) as usize;
 
-        match (opc1, crm) {
-            (8, 0) => {
-                // rcp_salt_core0
-                bus.rcp_salt[0] = self.regs.r[rt];
-                bus.rcp_salt_valid[0] = true;
+        match opc1 {
+            7 => {
+                // rcp_iequal Rt, Rt2 — assert Rt == Rt2 (bootrom 0xFC4x_x770).
+                if self.regs.r[rt] != self.regs.r[rt2] {
+                    self.pending_fault = Some(Fault::Nmi);
+                }
             }
-            (8, 1) => {
-                // rcp_salt_core1
-                bus.rcp_salt[1] = self.regs.r[rt];
-                bus.rcp_salt_valid[1] = true;
+            8 => {
+                match crm {
+                    0 => {
+                        // rcp_salt_core0
+                        bus.rcp_salt[0] = self.regs.r[rt];
+                        bus.rcp_salt_valid[0] = true;
+                    }
+                    1 => {
+                        // rcp_salt_core1
+                        bus.rcp_salt[1] = self.regs.r[rt];
+                        bus.rcp_salt_valid[1] = true;
+                    }
+                    _ => {} // unrecognized salt CRm: silent NOP
+                }
             }
             _ => {
-                // rcp_iequal, rcp_bvalid, rcp_count_*, etc.: silent NOP
+                // rcp_b2valid, rcp_bxortrue, rcp_bxorfalse, rcp_ivalid:
+                // bootrom uses these sparingly; silent NOP matches existing
+                // stub behavior (HLD §8.4 skip list).
             }
         }
         1
@@ -362,8 +478,9 @@ mod tests {
         // Poke salt directly into bus (rcp_salt lives on Bus now)
         bus.rcp_salt[0] = 42;
 
-        // MRC: read canary into R1
-        let (hw0, hw1) = encode_mrc(7, 1, 0);
+        // rcp_canary_get Rt=1, imm=0 — Phase 7 Stage E encoding
+        // (MRC2 cp7, opc1=0, opc2=1, CRn=0, CRm=0).
+        let (hw0, hw1) = encode_mrc2_full(7, 0, 0, 1, 1, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
 
         assert_eq!(cpu.regs.r[1], 42 ^ 0xDEAD_BEEF);
@@ -774,5 +891,420 @@ mod tests {
             "lo_out_get (opc1=0, CRn=0, CRm=0) must read the full 30-bit bank"
         );
         assert!(cpu.pending_fault.is_none());
+    }
+
+    // ============================================================
+    // Phase 7 Stage E — CP7 RCP assertions (NMI on mismatch)
+    // ============================================================
+    //
+    // Encoding lookup table — derived from the RP2350 ARM bootrom disassembly
+    // (`roms/arm-bootrom.dis`) wherever a real instance was observed, and
+    // chosen for internal consistency for the few mnemonics the bootrom does
+    // not exercise (rcp_ifgte, rcp_iflte, rcp_switch).
+    //
+    // | Mnemonic           | Form  | opc1 | opc2 | CRn          | CRm          | Notes |
+    // |--------------------|-------|------|------|--------------|--------------|-------|
+    // | rcp_canary_get     | MRC2  | 0    | 1    | imm[7:4]     | imm[3:0]     | bootrom |
+    // | rcp_canary_check   | MCR2  | 0    | 1    | imm[7:4]     | imm[3:0]     | bootrom |
+    // | rcp_canary_status  | MRC2  | 1    | 0    | 0            | 0            | bootrom (Rt=15) |
+    // | rcp_bvalid         | MCR2  | 1    | 0    | 0            | 0            | bootrom |
+    // | rcp_btrue          | MCR2  | 2    | 0    | 0            | 0            | bootrom |
+    // | rcp_bfalse         | MCR2  | 3    | 1    | 0            | 0            | bootrom |
+    // | rcp_count_init     | MCR2  | 4    | 0    | imm[7:4]     | imm[3:0]     | bootrom (`count_set`) |
+    // | rcp_count_check    | MCR2  | 5    | 1    | imm[7:4]     | imm[3:0]     | bootrom |
+    // | rcp_ifgte          | MCR2  | 6    | 0    | 0            | 0            | *NOT implemented — silent NOP* |
+    // | rcp_iflte          | MCR2  | 6    | 1    | 0            | 0            | *NOT implemented — silent NOP* |
+    // | rcp_panic          | CDP   | 0    | 1    | 0            | 0            | bootrom |
+    // | rcp_switch         | CDP   | 0    | 2    | 0            | 0            | *NOT implemented — silent NOP* |
+    // | rcp_iequal         | MCRR2 | 7    | —    | (Rt2 in hw0) | 0            | bootrom |
+    // | rcp_salt_core0/1   | MCRR2 | 8    | —    | (Rt2 in hw0) | 0/1          | bootrom (existing) |
+
+    /// MCR2 encoder (L=0). hw0 prefix 0xFE.. distinguishes from MCR (0xEE..).
+    /// hw0 = `1111_1110_opc1[3]_L_CRn[4]`; hw1 = `Rt[4]_coproc[4]_opc2[3]_1_CRm[4]`.
+    fn encode_mcr2_full(coproc: u8, opc1: u8, crn: u8, rt: u8, op2: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xFE00 | ((opc1 as u16 & 0x7) << 5) | (crn as u16 & 0xF);
+        let hw1: u16 = ((rt as u16) << 12)
+            | ((coproc as u16) << 8)
+            | ((op2 as u16 & 0x7) << 5)
+            | 0x10
+            | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    /// MRC2 encoder (L=1).
+    fn encode_mrc2_full(coproc: u8, opc1: u8, crn: u8, rt: u8, op2: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xFE00 | ((opc1 as u16 & 0x7) << 5) | 0x10 | (crn as u16 & 0xF);
+        let hw1: u16 = ((rt as u16) << 12)
+            | ((coproc as u16) << 8)
+            | ((op2 as u16 & 0x7) << 5)
+            | 0x10
+            | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    /// MCRR2 encoder. hw0 = `1111_1100_0100_Rt2[4]`;
+    /// hw1 = `Rt[4]_coproc[4]_opc1[4]_CRm[4]`.
+    fn encode_mcrr2(coproc: u8, opc1: u8, rt2: u8, rt: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xFC40 | (rt2 as u16 & 0xF);
+        let hw1: u16 = ((rt as u16) << 12)
+            | ((coproc as u16) << 8)
+            | ((opc1 as u16 & 0xF) << 4)
+            | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    /// CDP2 encoder. hw0 = `1111_1110_opc1[4]_CRn[4]`;
+    /// hw1 = `CRd[4]_coproc[4]_opc2[3]_0_CRm[4]`.
+    fn encode_cdp2(coproc: u8, opc1: u8, crn: u8, crd: u8, op2: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xFE00 | ((opc1 as u16 & 0xF) << 4) | (crn as u16 & 0xF);
+        let hw1: u16 = ((crd as u16) << 12)
+            | ((coproc as u16) << 8)
+            | ((op2 as u16 & 0x7) << 5)
+            | (crm as u16 & 0xF); // bit 4 = 0 → CDP
+        (hw0, hw1)
+    }
+
+    /// CDP (non-2 variant). hw0 prefix 0xEE..
+    fn encode_cdp(coproc: u8, opc1: u8, crn: u8, crd: u8, op2: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xEE00 | ((opc1 as u16 & 0xF) << 4) | (crn as u16 & 0xF);
+        let hw1: u16 = ((crd as u16) << 12)
+            | ((coproc as u16) << 8)
+            | ((op2 as u16 & 0x7) << 5)
+            | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    fn split_imm8(imm: u8) -> (u8, u8) {
+        ((imm >> 4) & 0xF, imm & 0xF)
+    }
+
+    /// Convenience: prepare a CPU + Bus with CP7 enabled, salt set, salt valid.
+    fn rcp_setup() -> (CortexM33, Bus) {
+        let cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 7);
+        bus.rcp_salt[0] = 0x1234_5678;
+        bus.rcp_salt_valid[0] = true;
+        (cpu, bus)
+    }
+
+    // ---------- rcp_canary_check (MCR2 form) ----------
+
+    #[test]
+    fn test_rcp_canary_check_pass() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[2] = 0x1234_5678 ^ 0xDEAD_BEEF;
+        let (crn, crm) = split_imm8(0x6c);
+        let (hw0, hw1) = encode_mcr2_full(7, 0, crn, 2, 1, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none(), "matching canary must not raise fault");
+    }
+
+    #[test]
+    fn test_rcp_canary_check_fail_raises_nmi() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[2] = 0xBADD_CAFE; // not equal to salt^0xDEADBEEF
+        let (crn, crm) = split_imm8(0x6c);
+        let (hw0, hw1) = encode_mcr2_full(7, 0, crn, 2, 1, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    // ---------- rcp_btrue / rcp_bfalse ----------
+
+    #[test]
+    fn test_rcp_btrue_pass() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[0] = 1;
+        let (hw0, hw1) = encode_mcr2_full(7, 2, 0, 0, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn test_rcp_btrue_fail_raises_nmi() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[0] = 0;
+        let (hw0, hw1) = encode_mcr2_full(7, 2, 0, 0, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    #[test]
+    fn test_rcp_bfalse_pass() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[3] = 0;
+        let (hw0, hw1) = encode_mcr2_full(7, 3, 0, 3, 1, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn test_rcp_bfalse_fail_raises_nmi() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[3] = 1;
+        let (hw0, hw1) = encode_mcr2_full(7, 3, 0, 3, 1, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    // ---------- rcp_bvalid ----------
+
+    #[test]
+    fn test_rcp_bvalid_pass_zero() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[5] = 0;
+        let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn test_rcp_bvalid_pass_one() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[5] = 1;
+        let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn test_rcp_bvalid_fail_raises_nmi() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[5] = 2;
+        let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    // ---------- rcp_count_init / rcp_count_check ----------
+
+    #[test]
+    fn test_rcp_count_init_then_check_pass() {
+        let (mut cpu, mut bus) = rcp_setup();
+        // count_init 0xc0
+        let (crn, crm) = split_imm8(0xc0);
+        let (hw0, hw1) = encode_mcr2_full(7, 4, crn, 0, 0, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(bus.rcp_count, 0xc0);
+        assert!(cpu.pending_fault.is_none());
+
+        // count_check 0xc0 -> pass, increments to 0xc1
+        let (hw0, hw1) = encode_mcr2_full(7, 5, crn, 0, 1, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(bus.rcp_count, 0xc1);
+
+        // count_check 0xc1 -> pass, increments to 0xc2
+        let (crn, crm) = split_imm8(0xc1);
+        let (hw0, hw1) = encode_mcr2_full(7, 5, crn, 0, 1, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(bus.rcp_count, 0xc2);
+    }
+
+    #[test]
+    fn test_rcp_count_check_fail_raises_nmi() {
+        let (mut cpu, mut bus) = rcp_setup();
+        let (crn, crm) = split_imm8(0x40);
+        let (hw0, hw1) = encode_mcr2_full(7, 4, crn, 0, 0, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+
+        // count_check 0x99 — wrong, must NMI
+        let (crn, crm) = split_imm8(0x99);
+        let (hw0, hw1) = encode_mcr2_full(7, 5, crn, 0, 1, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    // ---------- rcp_panic (CDP form) ----------
+
+    #[test]
+    fn test_rcp_panic_raises_nmi() {
+        let (mut cpu, mut bus) = rcp_setup();
+        // CDP cp7, opc1=0, opc2=1, all others zero — the bootrom encoding
+        // (verified: 0xEE00_0720).
+        let (hw0, hw1) = encode_cdp(7, 0, 0, 0, 1, 0);
+        assert_eq!((hw0, hw1), (0xEE00, 0x0720), "encoding must match bootrom rcp_panic");
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    // ---------- rcp_iequal (MCRR2 form) ----------
+
+    #[test]
+    fn test_rcp_iequal_pass() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[2] = 0xCAFE_BABE;
+        cpu.regs.r[3] = 0xCAFE_BABE;
+        let (hw0, hw1) = encode_mcrr2(7, 7, 3, 2, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn test_rcp_iequal_fail_raises_nmi() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[2] = 0xCAFE_BABE;
+        cpu.regs.r[3] = 0xDEAD_BEEF;
+        let (hw0, hw1) = encode_mcrr2(7, 7, 3, 2, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    // ---------- Unimplemented encodings: silent NOP (HLD §8.4) ----------
+
+    /// Lock in the "no speculative encodings" policy (HLD §2, CLAUDE.md
+    /// "don't predict the future"): `rcp_ifgte`, `rcp_iflte`, and
+    /// `rcp_switch` do NOT appear in the bootrom disassembly and have no
+    /// real callers. They must silent-NOP — no fault raised, no state
+    /// change — so that if a real caller ever materializes the failure is
+    /// loud and points at this test rather than at mysteriously-passing
+    /// speculative semantics.
+    #[test]
+    fn test_rcp_unimplemented_ops_silent_nop() {
+        // Canonical set of encodings we explicitly chose NOT to implement.
+        // If a real caller ever shows up, delete the relevant entry here
+        // and implement the op against a verified encoding.
+        let cases: &[(&str, (u16, u16))] = &[
+            // rcp_ifgte — previously opc1=6, opc2=0 MCR2.
+            ("rcp_ifgte (MCR2 opc1=6 opc2=0)", encode_mcr2_full(7, 6, 0, 1, 0, 2)),
+            // rcp_iflte — previously opc1=6, opc2=1 MCR2.
+            ("rcp_iflte (MCR2 opc1=6 opc2=1)", encode_mcr2_full(7, 6, 0, 1, 1, 2)),
+            // rcp_switch — previously opc1=0, opc2=2 CDP (and CDP2).
+            ("rcp_switch (CDP  opc1=0 opc2=2)", encode_cdp(7, 0, 0, 0, 2, 0)),
+            ("rcp_switch (CDP2 opc1=0 opc2=2)", encode_cdp2(7, 0, 0, 0, 2, 0)),
+        ];
+
+        for (label, (hw0, hw1)) in cases {
+            let (mut cpu, mut bus) = rcp_setup();
+            // Pre-load registers with values that the *old* speculative
+            // semantics would treat as a FAIL (NMI) — so that if the code
+            // ever regresses to the old behavior, this test flips loudly.
+            //   ifgte: R1 < R2 would have been a FAIL.
+            //   iflte: R1 > R2 would have been a FAIL.
+            //   switch: R0 != R1 would have been a FAIL.
+            cpu.regs.r[0] = 0x42;
+            cpu.regs.r[1] = 10;
+            cpu.regs.r[2] = 50;
+            let r_before = cpu.regs.r;
+            cpu.thumb32_coprocessor(*hw0, *hw1, &mut bus);
+            assert!(
+                cpu.pending_fault.is_none(),
+                "{label}: must not raise any fault (silent NOP expected)"
+            );
+            assert_eq!(
+                cpu.regs.r, r_before,
+                "{label}: register file must not change"
+            );
+        }
+    }
+
+    // ---------- Sanity: existing canary_get / status / salt path still works ----------
+
+    #[test]
+    fn test_rcp_canary_status_n_flag_when_salt_valid() {
+        let (mut cpu, mut bus) = rcp_setup();
+        let (hw0, hw1) = encode_mrc2_full(7, 1, 0, 15, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.regs.flag_n(), "N flag must be set when salt is valid");
+    }
+
+    #[test]
+    fn test_rcp_canary_status_n_flag_clear_when_salt_invalid() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 7);
+        // salt_valid defaults false
+        let (hw0, hw1) = encode_mrc2_full(7, 1, 0, 15, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(!cpu.regs.flag_n(), "N flag must be clear when salt is invalid");
+    }
+
+    /// Encodings observed in the bootrom must round-trip through our encoder
+    /// so future encoder changes can't silently lose dispatch.
+    #[test]
+    fn test_rcp_bootrom_encoding_lockin() {
+        // Pairs derived from `roms/arm-bootrom.dis`.
+        // (encoded hw0, encoded hw1, expected fault outcome with appropriate setup)
+        let cases: &[(u16, u16, &str)] = &[
+            (0xFE16, 0x373C, "rcp_canary_get r3, 0x6C"),
+            (0xFE06, 0x273C, "rcp_canary_check r2, 0x6C"),
+            (0xFE30, 0xF710, "rcp_canary_status pc"),
+            (0xFE40, 0x0710, "rcp_btrue r0"),
+            (0xFE60, 0x4730, "rcp_bfalse r4"),
+            (0xFE20, 0xC710, "rcp_bvalid r12"),
+            (0xFE84, 0x0718, "rcp_count_init 0x48"),
+            (0xFEA4, 0x0738, "rcp_count_check 0x48"),
+            (0xEE00, 0x0720, "rcp_panic"),
+            (0xFC43, 0x2770, "rcp_iequal r2, r3"),
+        ];
+        // Just assert the encoder helpers reproduce them.
+        let (h0, h1) = encode_mrc2_full(7, 0, 6, 3, 1, 0xC);
+        assert_eq!((h0, h1), (cases[0].0, cases[0].1), "{}", cases[0].2);
+        let (h0, h1) = encode_mcr2_full(7, 0, 6, 2, 1, 0xC);
+        assert_eq!((h0, h1), (cases[1].0, cases[1].1), "{}", cases[1].2);
+        let (h0, h1) = encode_mrc2_full(7, 1, 0, 15, 0, 0);
+        assert_eq!((h0, h1), (cases[2].0, cases[2].1), "{}", cases[2].2);
+        let (h0, h1) = encode_mcr2_full(7, 2, 0, 0, 0, 0);
+        assert_eq!((h0, h1), (cases[3].0, cases[3].1), "{}", cases[3].2);
+        let (h0, h1) = encode_mcr2_full(7, 3, 0, 4, 1, 0);
+        assert_eq!((h0, h1), (cases[4].0, cases[4].1), "{}", cases[4].2);
+        let (h0, h1) = encode_mcr2_full(7, 1, 0, 12, 0, 0);
+        assert_eq!((h0, h1), (cases[5].0, cases[5].1), "{}", cases[5].2);
+        let (h0, h1) = encode_mcr2_full(7, 4, 4, 0, 0, 8);
+        assert_eq!((h0, h1), (cases[6].0, cases[6].1), "{}", cases[6].2);
+        let (h0, h1) = encode_mcr2_full(7, 5, 4, 0, 1, 8);
+        assert_eq!((h0, h1), (cases[7].0, cases[7].1), "{}", cases[7].2);
+        let (h0, h1) = encode_cdp(7, 0, 0, 0, 1, 0);
+        assert_eq!((h0, h1), (cases[8].0, cases[8].1), "{}", cases[8].2);
+        let (h0, h1) = encode_mcrr2(7, 7, 3, 2, 0);
+        assert_eq!((h0, h1), (cases[9].0, cases[9].1), "{}", cases[9].2);
+    }
+
+    /// Bootrom-style flow: set salt, canary_get into a register, then later
+    /// canary_check with that same register — must always pass. Locks in the
+    /// "consistent get/check pair regardless of salt value" property the
+    /// bootrom relies on.
+    #[test]
+    fn test_rcp_canary_get_check_roundtrip_with_zero_salt() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 7);
+        // salt is 0, salt_valid is false — bootrom early state.
+
+        // canary_get r3, 0x6C
+        let (crn, crm) = split_imm8(0x6c);
+        let (hw0, hw1) = encode_mrc2_full(7, 0, crn, 3, 1, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        // Stash through r2 (mimic bootrom push/pop).
+        cpu.regs.r[2] = cpu.regs.r[3];
+
+        // canary_check r2, 0x6C
+        let (hw0, hw1) = encode_mcr2_full(7, 0, crn, 2, 1, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none(), "get/check pair must roundtrip even with zero salt");
+    }
+
+    /// CDP2 `rcp_panic` via 0xFE00 prefix — same bit pattern but with the
+    /// "2" prefix. Treated identically.
+    #[test]
+    fn test_rcp_panic_cdp2_form_also_nmis() {
+        let (mut cpu, mut bus) = rcp_setup();
+        let (hw0, hw1) = encode_cdp2(7, 0, 0, 0, 1, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    /// Unrecognized CP7 encodings remain silent NOPs (per HLD §8.4 — not all
+    /// future encodings need to be enumerated; bootrom doesn't use them).
+    #[test]
+    fn test_rcp_unrecognized_mcr2_silent_nop() {
+        let (mut cpu, mut bus) = rcp_setup();
+        // opc1=7, opc2=7 — not assigned by us.
+        let (hw0, hw1) = encode_mcr2_full(7, 7, 0, 0, 7, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none(), "unknown CP7 encoding must be silent NOP");
     }
 }

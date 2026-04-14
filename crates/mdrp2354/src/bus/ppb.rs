@@ -143,6 +143,20 @@ impl Ppb {
                 let idx = (self.mpu_rnr & 0xF) as usize;
                 self.mpu_regions[idx].1
             }
+            // MPU_RBAR_A1 / RLAR_A1 / ... A3 (ARMv8-M §B11.2.5-8):
+            // alias registers access region `(RNR & !3) | n` for n ∈ {1,2,3}.
+            // Surfaced by the bootrom's MPU readback self-test which writes
+            // all four (base, alias1, alias2, alias3) pairs in a single stmia.
+            0xEDA4 | 0xEDAC | 0xEDB4 => {
+                let n = ((addr as usize) - 0xEDA4) / 8 + 1;
+                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
+                self.mpu_regions[idx & 0xF].0
+            }
+            0xEDA8 | 0xEDB0 | 0xEDB8 => {
+                let n = ((addr as usize) - 0xEDA8) / 8 + 1;
+                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
+                self.mpu_regions[idx & 0xF].1
+            }
 
             // SAU_CTRL
             0xEDD0 => self.sau_ctrl,
@@ -225,15 +239,29 @@ impl Ppb {
             0xED94 => self.mpu_ctrl = val,
             // MPU_RNR
             0xED98 => self.mpu_rnr = val & 0xF,
-            // MPU_RBAR
+            // MPU_RBAR (ARMv8-M §B11.2.5): [31:5] BASE, [4:3] SH,
+            // [2:1] AP, [0] XN — all bits carry meaning.
             0xED9C => {
                 let idx = (self.mpu_rnr & 0xF) as usize;
                 self.mpu_regions[idx].0 = val;
             }
-            // MPU_RLAR
+            // MPU_RLAR (ARMv8-M §B11.2.8): [31:5] LIMIT, [4] RES0,
+            // [3:1] AttrIndx, [0] EN. Mask bit [4] so it reads back as 0
+            // (the bootrom's readback self-test depends on this).
             0xEDA0 => {
                 let idx = (self.mpu_rnr & 0xF) as usize;
-                self.mpu_regions[idx].1 = val;
+                self.mpu_regions[idx].1 = val & !0x10;
+            }
+            // MPU_RBAR_An / RLAR_An aliases — see read path for definition.
+            0xEDA4 | 0xEDAC | 0xEDB4 => {
+                let n = ((addr as usize) - 0xEDA4) / 8 + 1;
+                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
+                self.mpu_regions[idx & 0xF].0 = val;
+            }
+            0xEDA8 | 0xEDB0 | 0xEDB8 => {
+                let n = ((addr as usize) - 0xEDA8) / 8 + 1;
+                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
+                self.mpu_regions[idx & 0xF].1 = val & !0x10;
             }
 
             // SAU_CTRL

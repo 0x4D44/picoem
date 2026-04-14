@@ -13,9 +13,16 @@ pub use registers::Registers;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Fault {
     UsageFault,
-    #[allow(dead_code)] // constructed by Phase 7 Stage E (MPU lazy-FP flush)
+    // Constructed by:
+    //   * Phase 7 Stage B — lazy-FP flush fault when the FP frame's
+    //     destination page is unmapped by the MPU.
+    //   * Phase 7 Stage E — MPU TT path and any other MPU-sourced
+    //     data-access fault.
+    #[allow(dead_code)]
     MemManage,
-    #[allow(dead_code)] // constructed by Phase 7 Stage B (RCP assertion)
+    /// Raised by CP7 RCP assertion failure (Phase 7 Stage E) — delivered
+    /// as exception #2 (NMI). Not masked by PRIMASK; FAULTMASK is honored
+    /// by the upstream step() path (no delivery-site re-check).
     Nmi,
     // BusFault is delivered via bus.bus_fault() flag, not this enum
 }

@@ -102,6 +102,11 @@ pub struct Bus {
     pub rcp_salt: [u32; 2],
     /// Per-core RCP salt validity flag.
     pub rcp_salt_valid: [bool; 2],
+    /// RCP redundancy counter (Phase 7 Stage E).
+    /// Single shared counter — `rcp_count_set X` initializes; `rcp_count_check Y`
+    /// asserts counter == Y then increments. The bootrom uses a single counter
+    /// across both cores' boot paths, so a single per-chip value suffices.
+    pub rcp_count: u32,
     /// Three PIO blocks (PIO0, PIO1, PIO2).
     pub pio: [PioBlock; 3],
     /// Combined GPIO pin state (readable by SIO and PIO).
@@ -140,6 +145,7 @@ impl Bus {
             event_flag: [false; 2],
             rcp_salt: [0; 2],
             rcp_salt_valid: [false; 2],
+            rcp_count: 0,
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
             gpio_in: 0,
         }
