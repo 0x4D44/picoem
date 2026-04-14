@@ -142,6 +142,16 @@ These surfaced during Phase 5.A code review. The emulator compiles and Phase 5.A
 
 `crates/mdrp2040/src/bus/sio.rs` clears the divider `dirty` flag after exactly two result reads. Real hardware clears `dirty` on any result read (per-register). The two-read heuristic happens to match the canonical `__aeabi_idivmod` pattern (quotient + remainder read in pairs), but misbehaves for firmware that reads only one result (e.g., modulo-only code paths leave `dirty` set until the next write). Low priority — fix by clearing on each read of `QUOTIENT`/`REMAINDER`.
 
+### PIO not gated on RESETS bit
+
+Both mdrp2350 and mdrp2040 tick their PIO blocks unconditionally each
+step, regardless of the RESETS register state. Real hardware holds the
+PIO block inert while its RESETS bit is asserted. In practice an SM
+disabled before RESETS is de-asserted stays disabled anyway, so this is
+a safe simplification — but firmware that expects a mid-execution SM to
+freeze on RESETS assert will diverge. mdrp2350 carries the same
+behaviour.
+
 ## Thumb-32 Test Generators
 
 Three Thumb-32 generator functions are stubbed out in lib.rs

@@ -7,8 +7,10 @@
 //! (core 0 runs; core 1 stays halted until woken via the SIO FIFO
 //! protocol).
 //!
-//! PIO blocks are reserved on the Bus struct but not wired up — that's
-//! Phase 5.B.
+//! Phase 5.B wires the two PIO blocks (`bus.pio[0]`, `bus.pio[1]`) into
+//! AHB at `0x5020_0000` / `0x5030_0000`, steps them once per emulator
+//! step, and merges their pad outputs into `bus.gpio_in` (PIO OE
+//! overrides SIO on a per-pin basis, mirroring `mdrp2350::Emulator`).
 //!
 //! See `wrk_docs/2026.04.14 - HLD - mdpicoem Workspace Restructure.md`.
 
@@ -18,6 +20,9 @@ pub mod memory;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod pio_tests;
 
 pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
@@ -96,6 +101,9 @@ impl Emulator {
         self.bus.clock_tree = Default::default();
         self.bus.io_bank0.reset();
         self.bus.pads_bank0.reset();
+        for pio in &mut self.bus.pio {
+            pio.reset();
+        }
         self.bus.clear_bus_fault();
         self.bus.ppb = [Default::default(), Default::default()];
         self.bus.event_flag = [false; 2];
@@ -155,7 +163,10 @@ impl Emulator {
     /// 1. Step core 0 — fetch/decode/execute one instruction.
     /// 2. If core 1 is not halted, step it with `contention_check_active`
     ///    so same-bank SRAM accesses incur +1 cycle.
-    /// 3. Merge GPIO outputs and run wake checks.
+    /// 3. Advance both PIO blocks by core 0's cycle cost (one PIO tick
+    ///    per system-clock cycle — mirrors `mdrp2350::Emulator::step`
+    ///    but per-instruction rather than per-quantum).
+    /// 4. Merge GPIO outputs and run wake checks.
     ///
     /// The return value is the *master-clock* delta — Phase 5.A uses
     /// core 0's cycle cost (core 1 runs concurrently on real silicon).
@@ -179,9 +190,26 @@ impl Emulator {
         }
 
         self.clock.cycles = self.clock.cycles.wrapping_add(c0);
+        self.tick_pio(c0 as u32);
         self.update_gpio();
         self.wake_checks();
         c0
+    }
+
+    /// Advance both PIO blocks by `cycles` system-clock cycles.
+    ///
+    /// PIO reads `bus.gpio_in` as its view of external pin state — feed it
+    /// the pre-step merge so programs sampling GPIO (e.g. IN PINS) see the
+    /// value SIO / the previous PIO step wrote last. The post-step
+    /// `update_gpio()` then refreshes `bus.gpio_in` from `pad_out`/`pad_oe`.
+    fn tick_pio(&mut self, cycles: u32) {
+        if cycles == 0 {
+            return;
+        }
+        let gpio_in = self.bus.gpio_in;
+        for pio in &mut self.bus.pio {
+            pio.step_n(cycles, gpio_in);
+        }
     }
 
     /// Run for at least `cycles` virtual cycles. Returns the number of
@@ -197,12 +225,20 @@ impl Emulator {
         self.clock.cycles.wrapping_sub(start)
     }
 
-    /// Merge SIO and PIO GPIO outputs into `bus.gpio_in`. Phase 5.A:
-    /// SIO output gated by OE is the only live source; PIO pads read
-    /// zero until Phase 5.B wires PIO in.
-    fn update_gpio(&mut self) {
-        let sio_out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
-        self.bus.gpio_in = sio_out & 0x3FFF_FFFF;
+    /// Merge SIO and PIO GPIO outputs into `bus.gpio_in`.
+    ///
+    /// SIO `gpio_out & gpio_oe` is the base; each PIO block's
+    /// `pad_out & pad_oe` overrides SIO on the pins it drives (PIO wins
+    /// wherever `pad_oe` has a bit set — mirrors `mdrp2350::Emulator::
+    /// update_gpio`). The result is masked to the RP2040 30-pin range
+    /// (GPIO0..GPIO29).
+    pub(crate) fn update_gpio(&mut self) {
+        let mut out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        for pio in &self.bus.pio {
+            let pio_mask = pio.pad_oe;
+            out = (out & !pio_mask) | (pio.pad_out & pio_mask);
+        }
+        self.bus.gpio_in = out & 0x3FFF_FFFF;
     }
 
     /// WFE/SEV wake check. Phase 5.A doesn't yet model WFE on M0+;

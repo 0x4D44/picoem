@@ -7,8 +7,15 @@
 //! bank contention is modelled simply (+1 cycle on SRAM access when
 //! the companion core has already touched SRAM this quantum).
 //!
-//! PIO blocks are reserved as Phase 5.B (`pio: [PioBlock; 2]` field is
-//! present and read back as zero so the Bus struct shape settles now).
+//! Phase 5.B: PIO0 / PIO1 wired into the AHB decode at `0x5020_0000` and
+//! `0x5030_0000`. Register access goes through `PioBlock::read32` /
+//! `write32` (mirrors `mdrp2350::Bus`). Sub-word writes to PIO ranges are
+//! ignored — several PIO registers have side-effects on read (RXF pop) or
+//! write (TXF push, CTRL bit flags) that would behave incorrectly under a
+//! synthetic read-modify-write. Sub-word reads still go through `read32`
+//! (matching mdrp2350) and so observe those same side-effects on the
+//! enclosing word — firmware that only touches PIO with word-sized
+//! accesses (the supported path in the datasheet) is unaffected.
 
 pub mod clocks;
 pub mod io_bank0;
@@ -53,6 +60,10 @@ pub const SSI_BASE: u32 = 0x1800_0000;
 pub const XIP_SRAM_BASE: u32 = 0x1500_0000;
 pub const XIP_SRAM_END: u32 = 0x1500_4000; // 16 KB
 
+// PIO AHB windows (RP2040 datasheet §3 — two PIO blocks).
+pub const PIO0_BASE: u32 = 0x5020_0000;
+pub const PIO1_BASE: u32 = 0x5030_0000;
+
 /// XIP SRAM size (16 KB on RP2040 — the cache RAM exposed as scratch).
 pub const XIP_SRAM_SIZE: usize = 16 * 1024;
 
@@ -95,9 +106,9 @@ pub struct Bus {
     /// UART / SPI / I2C / ADC / PWM / TIMER / WATCHDOG / RTC / VREG / TBMAN).
     /// Keyed by canonical word address (alias bits stripped).
     peripheral_regs: HashMap<u32, u32>,
-    /// PIO0 / PIO1 (Phase 5.B wires these in; Phase 5.A keeps the struct
-    /// shape stable by reserving the field).
-    #[allow(dead_code)]
+    /// PIO0 / PIO1. Wired into the AHB decode at `0x5020_0000` /
+    /// `0x5030_0000` (see [`PIO0_BASE`] / [`PIO1_BASE`]); output pins are
+    /// merged into [`Self::gpio_in`] by [`crate::Emulator::update_gpio`].
     pub pio: [PioBlock; 2],
     /// Per-core event flag for WFE/SEV / FIFO event protocol.
     pub event_flag: [bool; 2],
@@ -377,6 +388,8 @@ impl Bus {
             ROSC_BASE => self.rosc_regs.read32(offset),
             IO_BANK0_BASE => self.io_bank0.read32(offset),
             PADS_BANK0_BASE => self.pads_bank0.read32(offset),
+            PIO0_BASE => self.pio[0].read32(offset),
+            PIO1_BASE => self.pio[1].read32(offset),
             _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
         }
     }
@@ -407,6 +420,8 @@ impl Bus {
             ROSC_BASE => self.rosc_regs.write32(offset, val, alias),
             IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
             PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
+            PIO0_BASE => self.pio[0].write32(offset, val, alias),
+            PIO1_BASE => self.pio[1].write32(offset, val, alias),
             _ => {
                 // Catch-all: store with alias semantics so firmware round-trips.
                 let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
@@ -595,9 +610,16 @@ impl Bus {
                 }
             }
             0x4 | 0x5 => {
+                let canonical = addr & !0x3000;
+                let base = canonical & 0xFFFF_F000;
+                if base == PIO0_BASE || base == PIO1_BASE {
+                    // PIO is 32-bit access only (matches mdrp2350) — byte
+                    // writes would trigger spurious RXF pops via the RMW
+                    // read. Silently ignore.
+                    return;
+                }
                 let alias = (addr >> 12) & 3;
                 // Byte-level RMW into the word, preserving alias semantics.
-                let canonical = addr & !0x3000;
                 let word_addr = canonical & !3;
                 let byte_idx = (canonical & 3) as usize;
                 let old = self.peripheral_read32(word_addr);
@@ -659,8 +681,13 @@ impl Bus {
                 }
             }
             0x4 | 0x5 => {
-                let alias = (addr >> 12) & 3;
                 let canonical = addr & !0x3000;
+                let base = canonical & 0xFFFF_F000;
+                if base == PIO0_BASE || base == PIO1_BASE {
+                    // PIO is 32-bit access only (matches mdrp2350).
+                    return;
+                }
+                let alias = (addr >> 12) & 3;
                 let word_addr = canonical & !3;
                 let half_idx = ((canonical >> 1) & 1) as usize;
                 let old = self.peripheral_read32(word_addr);
