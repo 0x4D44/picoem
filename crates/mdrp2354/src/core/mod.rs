@@ -30,9 +30,12 @@ pub(crate) enum Fault {
 /// Cortex-M33 CPU core.
 pub struct CortexM33 {
     pub regs: Registers,
-    /// Cycles remaining on current multi-cycle operation.
-    /// When > 0, step() decrements instead of fetching.
-    stall_cycles: u32,
+    /// Monotonically increasing per-core cycle count.
+    /// Each call to `step()` advances this by the executed instruction's
+    /// cycle cost (including any exception-entry cost). Used by the
+    /// quantum scheduler to decide when a core has caught up to the
+    /// quantum's target cycle, and by DWT CYCCNT reads (Stage 2).
+    pub(crate) cycles: u64,
     /// Core ID (0 or 1).
     core_id: u8,
     /// Address of the currently executing instruction. Used to compute
@@ -70,7 +73,7 @@ impl CortexM33 {
     pub fn with_id(core_id: u8) -> Self {
         Self {
             regs: Registers::new(),
-            stall_cycles: 0,
+            cycles: 0,
             core_id,
             current_instr_addr: 0,
             it_state: 0,
@@ -83,16 +86,14 @@ impl CortexM33 {
         }
     }
 
-    /// Advance the core by one system clock cycle.
+    /// Execute one instruction atomically, advancing the core's own cycle
+    /// count by the instruction's cycle cost (including any exception-entry
+    /// cost if a synchronous fault is taken).
     pub fn step(&mut self, bus: &mut Bus) {
         if self.wfe_waiting {
             return;
         }
         if self.halted {
-            return;
-        }
-        if self.stall_cycles > 0 {
-            self.stall_cycles -= 1;
             return;
         }
         let mut cycles = self.decode_execute(bus);
@@ -124,7 +125,7 @@ impl CortexM33 {
             self.pending_fault = None;
         }
 
-        self.stall_cycles = cycles.saturating_sub(1);
+        self.cycles = self.cycles.wrapping_add(cycles as u64);
     }
 
     /// Returns the core ID (0 or 1).
@@ -132,9 +133,10 @@ impl CortexM33 {
         self.core_id
     }
 
-    /// Returns remaining stall cycles (for testing/debugging).
-    pub fn stall_cycles(&self) -> u32 {
-        self.stall_cycles
+    /// Returns the per-core cycle count. Monotonically increasing; used by
+    /// the quantum scheduler and by DWT CYCCNT (Stage 2).
+    pub fn cycles(&self) -> u64 {
+        self.cycles
     }
 
     /// Swap all banked register pairs between Secure and Non-Secure.
@@ -171,7 +173,6 @@ impl CortexM33 {
     /// Used to hold Core 1 during reset.
     pub fn halt(&mut self) {
         self.halted = true;
-        self.stall_cycles = 0;
         self.pending_fault = None;
     }
 

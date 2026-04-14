@@ -60,6 +60,17 @@ impl PioBlock {
         self.merge_pin_outputs();
     }
 
+    /// Advance PIO block by `n` system clocks. Quantum-end variant of
+    /// [`Self::step`]. Initial implementation is a naive loop — preserves all
+    /// cross-cycle state (SM clock divider accumulators, FIFO pressure,
+    /// pin-output merging). A bulk-advance optimisation is future work if
+    /// PIO appears hot in a flamegraph.
+    pub fn step_n(&mut self, n: u32, gpio_in: u32) {
+        for _ in 0..n {
+            self.step(gpio_in);
+        }
+    }
+
     /// Merge all SM pin outputs into pad_out/pad_oe. SM0 lowest priority, SM3 highest.
     fn merge_pin_outputs(&mut self) {
         let mut out: u32 = 0;
@@ -1472,8 +1483,15 @@ mod tests {
     }
 
     /// Create an emulator configured for PIO integration tests.
+    ///
+    /// Uses `step_quantum=1` so each `emu.step()` advances by exactly
+    /// one cycle — these tests read PIO pin state on a per-cycle basis,
+    /// which the quantum execution model would otherwise smear across up
+    /// to `DEFAULT_STEP_QUANTUM` cycles.
     fn pio_test_emulator() -> crate::Emulator {
-        crate::Emulator::new(crate::Config::default())
+        crate::EmulatorBuilder::new(crate::Config::default())
+            .step_quantum(1)
+            .build()
     }
 
     /// Load a PIO program into instruction memory via bus writes.

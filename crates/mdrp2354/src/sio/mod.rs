@@ -550,6 +550,28 @@ impl Sio {
             }
         }
     }
+
+    /// Bulk-advance MTIME by `n` cycles. Quantum-end variant of
+    /// [`Self::tick_mtime`]. Match-asserted flags are updated once against
+    /// the final post-advance value — interrupt edges that land mid-quantum
+    /// are still observed, but with up-to-one-quantum latency, consistent
+    /// with the quantum execution model.
+    pub fn tick_mtime_n(&mut self, n: u32) {
+        if n == 0 || self.mtime_ctrl & 1 == 0 {
+            return;
+        }
+        let new_mtime = self.mtime.wrapping_add(n as u64);
+        self.mtime = new_mtime;
+        for core in 0..2 {
+            let match_now = new_mtime >= self.mtimecmp[core];
+            if match_now && !self.mtime_match_asserted[core] {
+                self.mtime_match_asserted[core] = true;
+            }
+            if !match_now {
+                self.mtime_match_asserted[core] = false;
+            }
+        }
+    }
 }
 
 impl Default for Sio {

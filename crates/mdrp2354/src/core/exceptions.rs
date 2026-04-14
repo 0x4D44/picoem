@@ -654,11 +654,6 @@ mod tests {
 
         // 2. Deliver another NMI while IPSR==2.
         cpu.pending_fault = Some(Fault::Nmi);
-        // Burn any residual stall from the first entry so step() delivers
-        // the fault rather than decrementing the stall counter.
-        while cpu.stall_cycles() > 0 {
-            cpu.step(&mut bus);
-        }
         cpu.step(&mut bus);
 
         // 3. Should have escalated to HardFault with FORCED set; NOT halted.

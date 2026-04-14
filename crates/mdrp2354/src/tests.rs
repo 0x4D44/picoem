@@ -838,23 +838,21 @@ fn run_small_program() {
     // Set PC to program start
     c.regs.set_pc(base);
 
-    // Run until we hit the infinite loop (PC stable across two non-stall steps)
+    // Run until we hit the infinite loop (PC stable across two steps)
     let mut stable_count = 0u32;
     let mut prev_pc = !0u32;
     for _ in 0..500 {
         c.step(&mut bus);
-        if c.stall_cycles() == 0 {
-            let pc = c.regs.pc();
-            if pc == prev_pc {
-                stable_count += 1;
-                if stable_count >= 2 {
-                    break;
-                }
-            } else {
-                stable_count = 0;
+        let pc = c.regs.pc();
+        if pc == prev_pc {
+            stable_count += 1;
+            if stable_count >= 2 {
+                break;
             }
-            prev_pc = pc;
+        } else {
+            stable_count = 0;
         }
+        prev_pc = pc;
     }
 
     // R0 should be 1+2+3+4+5 = 15
@@ -2968,12 +2966,11 @@ fn mrs_ipsr() {
 // IT (If-Then) Blocks (Stage 11)
 // ============================================================================
 
-/// Helper: step the core past any stall cycles so the next step fetches.
+/// Helper: execute exactly one instruction.
+/// In the quantum execution model `core.step()` is already atomic
+/// (one instruction per call), so this is just a thin alias preserved
+/// to avoid churning every call site in the IT-block tests below.
 fn step_one(c: &mut CortexM33, bus: &mut Bus) {
-    // Drain stall cycles first, then execute one instruction.
-    while c.stall_cycles() > 0 {
-        c.step(bus);
-    }
     c.step(bus);
 }
 
@@ -5384,79 +5381,6 @@ fn arbitration_core_local_never_contends() {
     assert_eq!(stall1, 0);
 }
 
-// ---------- Bus contention integration tests ----------
-
-#[test]
-fn contention_same_sram_bank_adds_stall() {
-    // Both cores executing from the same SRAM bank should cause core 1 to stall.
-    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
-
-    // Place MOV R0, R0 (0x4600) — 1-cycle NOP-like instruction
-    let nop: u16 = 0x4600;
-    let bytes = nop.to_le_bytes();
-    // Bank 0: addr 0x20000000
-    emu.bus.memory.sram_write8(0, bytes[0]);
-    emu.bus.memory.sram_write8(1, bytes[1]);
-    // Same bank (bank 0): addr 0x20000020
-    emu.bus.memory.sram_write8(0x20, bytes[0]);
-    emu.bus.memory.sram_write8(0x21, bytes[1]);
-
-    // Point both cores at these addresses
-    emu.cores[0].set_reg(15, 0x20000000);
-    emu.cores[1].set_reg(15, 0x20000020);
-
-    // Step once — both cores fetch from bank 0
-    emu.step();
-
-    // Core 1 should have a contention stall (1 extra cycle)
-    assert_eq!(emu.cores[0].stall_cycles(), 0);
-    assert_eq!(emu.cores[1].stall_cycles(), 1);
-}
-
-#[test]
-fn contention_different_banks_no_stall() {
-    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
-
-    let nop: u16 = 0x4600;
-    let bytes = nop.to_le_bytes();
-    // Bank 0: offset 0
-    emu.bus.memory.sram_write8(0, bytes[0]);
-    emu.bus.memory.sram_write8(1, bytes[1]);
-    // Bank 1: offset 4 (next word = next bank)
-    emu.bus.memory.sram_write8(4, bytes[0]);
-    emu.bus.memory.sram_write8(5, bytes[1]);
-
-    emu.cores[0].set_reg(15, 0x20000000); // bank 0
-    emu.cores[1].set_reg(15, 0x20000004); // bank 1
-
-    emu.step();
-
-    // No contention — different banks
-    assert_eq!(emu.cores[0].stall_cycles(), 0);
-    assert_eq!(emu.cores[1].stall_cycles(), 0);
-}
-
-#[test]
-fn contention_core1_sio_never_contends() {
-    // SIO is core-local — never contends regardless of core 0's target
-    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
-
-    // Set up core 0 SRAM bank 0 access
-    let nop: u16 = 0x4600;
-    let bytes = nop.to_le_bytes();
-    emu.bus.memory.sram_write8(0, bytes[0]);
-    emu.bus.memory.sram_write8(1, bytes[1]);
-    emu.cores[0].set_reg(15, 0x20000000);
-
-    // Verify the contention check directly:
-    emu.bus.clear_contention_state();
-    emu.bus.read32(0x20000000); // core 0 reads SRAM bank 0
-    emu.bus.begin_contention_check();
-    emu.bus.reset_extra_wait_states();
-    emu.bus.read32(0xD0000000); // core 1 reads SIO — core-local
-    assert_eq!(emu.bus.extra_wait_states(), 0, "SIO should never contend");
-}
-
 // ============================================================================
 // 2.7 SRAM Atomic Aliases
 // ============================================================================
@@ -5527,28 +5451,50 @@ fn sram_alias_bank_for_address_resolves_correctly() {
 
 #[test]
 fn dual_core_extra_wait_states_no_pollution() {
-    // Regression test: verify that core 0's bus accesses don't pollute
-    // core 1's cycle count. reset_extra_wait_states() at the start of
-    // decode_execute() ensures each core starts clean.
-    let mut emu = crate::EmulatorBuilder::new(crate::Config::default()).build();
+    // Regression test: verify that the per-instruction extra-wait-state
+    // accumulator doesn't leak between cores. `reset_extra_wait_states()`
+    // at the start of `decode_execute()` must scrub the accumulator so
+    // that wait states racked up by one core's instruction don't inflate
+    // the other core's cycle count when it next executes.
+    //
+    // Drive each core through `step()` so we exercise the real decode
+    // path (which owns the accumulator reset), and probe the bus right
+    // after each core's single step.
+    let mut bus = crate::bus::Bus::new();
+    let mut core0 = crate::core::CortexM33::with_id(0);
+    let mut core1 = crate::core::CortexM33::with_id(1);
 
-    // Place NOP (MOV R0, R0 = 0x4600) at two SRAM addresses in different banks
+    // NOP (MOV R0, R0 = 0x4600) at two SRAM addresses in different banks.
     let nop: u16 = 0x4600;
     let bytes = nop.to_le_bytes();
-    emu.bus.memory.sram_write8(0, bytes[0]);
-    emu.bus.memory.sram_write8(1, bytes[1]);
-    emu.bus.memory.sram_write8(4, bytes[0]);
-    emu.bus.memory.sram_write8(5, bytes[1]);
+    bus.memory.sram_write8(0, bytes[0]);
+    bus.memory.sram_write8(1, bytes[1]);
+    bus.memory.sram_write8(4, bytes[0]);
+    bus.memory.sram_write8(5, bytes[1]);
 
-    emu.cores[0].set_reg(15, 0x20000000); // bank 0
-    emu.cores[1].set_reg(15, 0x20000004); // bank 1
+    core0.regs.set_pc(0x2000_0000); // SRAM bank 0
+    core1.regs.set_pc(0x2000_0004); // SRAM bank 1
 
-    // Step — both cores execute from SRAM (1 cycle, 0 extra wait states)
-    emu.step();
+    // Artificially pollute the accumulator to prove the reset kills it.
+    bus.reset_extra_wait_states();
+    let _ = bus.read32(0x2000_0008); // SRAM bank 2 read adds +1 wait state
+    assert_eq!(bus.extra_wait_states(), 1, "precondition: bank-2 read adds wait");
 
-    // Both should have 0 stall cycles — no pollution, no contention (different banks)
-    assert_eq!(emu.cores[0].stall_cycles(), 0, "core 0 should have no stall");
-    assert_eq!(emu.cores[1].stall_cycles(), 0, "core 1 should have no stall (no pollution)");
+    // Core 0 executes one NOP — decode_execute must reset the accumulator
+    // before the fetch, so the observed value reflects only this fetch.
+    bus.set_active_core(0);
+    core0.step(&mut bus);
+    let c0_waits = bus.extra_wait_states();
+
+    // Core 1 executes one NOP — again, decode_execute must reset cleanly.
+    bus.set_active_core(1);
+    core1.step(&mut bus);
+    let c1_waits = bus.extra_wait_states();
+
+    // NOPs from SRAM banks 0 and 1 add no extra waits. If the polluted
+    // "+1" from the bank-2 probe had leaked through, we'd see ≥ 1 here.
+    assert_eq!(c0_waits, 0, "core 0 NOP from bank 0 should have no extra waits");
+    assert_eq!(c1_waits, 0, "core 1 NOP from bank 1 should have no extra waits");
 }
 
 // ============================================================================
@@ -6153,7 +6099,7 @@ fn test_sio_gpio_set_clr_xor() {
 #[test]
 fn test_sio_cpuid() {
     let (_, mut bus) = core_and_bus();
-    // Default is core 0 (contention_check_active = false)
+    // Default active_core is 0
     assert_eq!(bus.read32(0xD000_0000), 0);
 }
 
@@ -6283,14 +6229,14 @@ fn spinlock_addr(n: u32) -> u32 {
     SIO_BASE + 0x100 + 4 * n
 }
 
-/// Switch Bus to Core 1's perspective (contention_check_active = true).
+/// Switch Bus to Core 1's perspective — routes PPB access to `ppb[1]`.
 fn set_core1(bus: &mut Bus) {
-    bus.begin_contention_check();
+    bus.set_active_core(1);
 }
 
-/// Switch Bus back to Core 0's perspective.
+/// Switch Bus back to Core 0's perspective — routes PPB access to `ppb[0]`.
 fn set_core0(bus: &mut Bus) {
-    bus.clear_contention_state();
+    bus.set_active_core(0);
 }
 
 #[test]

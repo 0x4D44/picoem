@@ -24,10 +24,12 @@ pub struct Bus {
     /// Keyed by canonical address (alias bits stripped).
     /// TODO: Replace with direct Peripheral trait dispatch when real peripherals are added.
     peripheral_regs: HashMap<u32, u32>,
-    /// Downstream port core 0 last accessed this cycle (for contention detection).
-    core0_port: Option<u8>,
-    /// Whether to check contention on bus accesses (active during core 1's step).
-    contention_check_active: bool,
+    /// Which core is currently executing. Set explicitly by
+    /// `Emulator::step` before each core's quantum so that
+    /// `bus.ppb[active_core]` routing lands on the right per-core PPB
+    /// (NVIC, SCB, SysTick, FPCCR, MPU, fault state). 35+ sites across
+    /// the core crate depend on this being accurate.
+    active_core: usize,
     /// Per-core PPB register files (NVIC, SCB, SysTick stubs).
     pub ppb: [ppb::Ppb; 2],
     /// RESETS peripheral state: bits set = peripheral in reset.
@@ -121,8 +123,7 @@ impl Bus {
             extra_wait_states: 0,
             peripheral_regs: HashMap::new(),
             resets_state: 0x1FFF_FFFF,
-            core0_port: None,
-            contention_check_active: false,
+            active_core: 0,
             ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
             bus_fault: false,
             bus_fault_addr: 0,
@@ -348,21 +349,17 @@ impl Bus {
         }
     }
 
-    /// Clear contention tracking state. Called at start of each tick.
-    pub fn clear_contention_state(&mut self) {
-        self.core0_port = None;
-        self.contention_check_active = false;
+    /// Select which core is currently executing. Must be called by the
+    /// scheduler before a core runs so that every `bus.ppb[bus.active_core()]`
+    /// access (NVIC, SCB, SysTick, FPCCR, MPU, fault state) lands on the
+    /// right per-core register file.
+    pub fn set_active_core(&mut self, id: usize) {
+        self.active_core = id;
     }
 
-    /// Begin checking contention against core 0's recorded port.
-    /// Called between core 0 and core 1 steps.
-    pub fn begin_contention_check(&mut self) {
-        self.contention_check_active = true;
-    }
-
-    /// Returns the active core index: 0 during core 0's step, 1 during core 1's.
+    /// Returns the currently executing core index (0 or 1).
     pub fn active_core(&self) -> usize {
-        if self.contention_check_active { 1 } else { 0 }
+        self.active_core
     }
 
     /// Returns true if a bus fault was detected on the last access.
@@ -414,25 +411,6 @@ impl Bus {
     pub fn load_flash(&mut self, data: &[u8]) {
         self.memory.load_flash(data);
         self.flash_loaded = true;
-    }
-
-    /// Check if this access contends with core 0. Returns extra stall cycles.
-    /// Called internally by each read/write method.
-    #[inline(always)]
-    fn check_contention(&mut self, addr: u32) -> u32 {
-        let port = Self::downstream_port(addr);
-        if self.contention_check_active {
-            // Core 1's access — check against core 0's port
-            if let (Some(p0), Some(p1)) = (self.core0_port, port) {
-                if p0 == p1 {
-                    return 1;
-                }
-            }
-        } else {
-            // Core 0's access — record the port
-            self.core0_port = port;
-        }
-        0
     }
 
     // --- Latency accounting ---
@@ -498,8 +476,6 @@ impl Bus {
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
-        let contention = self.check_contention(addr);
-        self.extra_wait_states += contention;
 
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
@@ -575,8 +551,6 @@ impl Bus {
         let (cycles, extra) = Self::write_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
-        let contention = self.check_contention(addr);
-        self.extra_wait_states += contention;
 
         // Interposed atomics: APB XOR/SET/CLR writes cost +2 cycles
         if region == 0x4 && alias != 0 {
@@ -691,8 +665,6 @@ impl Bus {
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
-        let contention = self.check_contention(addr);
-        self.extra_wait_states += contention;
 
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
@@ -775,8 +747,6 @@ impl Bus {
         let (cycles, extra) = Self::write_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
-        let contention = self.check_contention(addr);
-        self.extra_wait_states += contention;
 
         // Interposed atomics: APB XOR/SET/CLR writes cost +2 cycles
         if region == 0x4 && alias != 0 {
@@ -888,8 +858,6 @@ impl Bus {
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
-        let contention = self.check_contention(addr);
-        self.extra_wait_states += contention;
 
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
@@ -964,8 +932,6 @@ impl Bus {
         let (cycles, extra) = Self::write_latency(region);
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
-        let contention = self.check_contention(addr);
-        self.extra_wait_states += contention;
 
         // Interposed atomics: APB XOR/SET/CLR writes cost +2 cycles
         if region == 0x4 && alias != 0 {

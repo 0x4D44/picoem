@@ -52,6 +52,13 @@ impl Default for Config {
     }
 }
 
+/// Default quantum size in cycles. Each `Emulator::step()` advances the
+/// system by exactly this many virtual cycles; both cores run atomically
+/// (instruction-at-a-time) until their per-core cycle count catches up
+/// with the target. 64 cycles @ 150 MHz is ~430 ns — well below any
+/// firmware-observable timing the emulator currently models.
+pub const DEFAULT_STEP_QUANTUM: u32 = 64;
+
 /// Top-level RP2354 emulator. Owns dual Cortex-M33 cores, bus fabric,
 /// memory, and clock. SIO is owned by Bus. Peripherals and PIO are
 /// injected via builder.
@@ -59,6 +66,10 @@ pub struct Emulator {
     pub cores: [CortexM33; 2],
     pub bus: Bus,
     pub clock: Clock,
+    /// Cycles advanced per call to [`Self::step`]. See
+    /// [`DEFAULT_STEP_QUANTUM`]. Distinct from `Pacer::quantum_cycles`
+    /// which drives wall-clock pacing.
+    pub step_quantum: u32,
 }
 
 impl Emulator {
@@ -73,7 +84,9 @@ impl Emulator {
         let initial_sp = self.bus.memory.rom_read32(0);
         let reset_vector = self.bus.memory.rom_read32(4);
 
-        // Boot both cores from reset vector
+        // Boot both cores from reset vector. `with_id` already sets
+        // cycles = 0, so cycle counters start fresh for a clean quantum
+        // alignment with the reset clock.
         for i in 0..2 {
             self.cores[i] = CortexM33::with_id(i as u8);
             self.cores[i].regs.msp = initial_sp;
@@ -123,45 +136,80 @@ impl Emulator {
         self.bus.load_flash(data);
     }
 
-    /// Step the entire system by one clock cycle.
+    /// Advance the system by one quantum. Each core runs atomically —
+    /// instruction-at-a-time — until its per-core cycle count catches up
+    /// with the quantum's target. Peripherals tick the full quantum at
+    /// the boundary. Returns the post-quantum master cycle count.
+    ///
+    /// **Overshoot:** a multi-cycle instruction straddling the boundary
+    /// leaves `core.cycles > clock.cycles` by up to one instruction's
+    /// worth. The next quantum's `while` predicate consumes that overshoot
+    /// — the core executes proportionally fewer instructions until its
+    /// `cycles` realigns with `clock.cycles`. Over many quanta the rate
+    /// averages 1:1. A halted core never contributes `cycles`, so the
+    /// `while` predicate never fires and the core is skipped cheaply.
     pub fn step(&mut self) -> u64 {
-        self.clock.tick();
-        if self.cores[1].is_halted() {
-            // Core 1 halted: skip contention tracking entirely, step core 0 only
-            self.cores[0].step(&mut self.bus);
-        } else {
-            // Both cores active: full contention-tracked dual-core step
-            self.bus.clear_contention_state();
-            self.cores[0].step(&mut self.bus);
-            self.bus.begin_contention_check();
-            self.cores[1].step(&mut self.bus);
+        let target = self.clock.cycles + self.step_quantum as u64;
+
+        // Core 0 first, then core 1. `bus.active_core` must be set so that
+        // every `bus.ppb[bus.active_core()]` access (NVIC, SCB, SysTick,
+        // FPCCR, MPU, fault state) lands on the right per-core PPB.
+        for core_id in 0..2 {
+            self.bus.set_active_core(core_id);
+            while !self.cores[core_id].is_halted()
+                && !self.cores[core_id].is_wfe_waiting()
+                && self.cores[core_id].cycles < target
+            {
+                self.cores[core_id].step(&mut self.bus);
+            }
         }
 
-        // WFE/SEV wake check
+        self.clock.advance(self.step_quantum as u64);
+        self.tick_peripherals(self.step_quantum);
+        self.tick_systick();
+        self.wake_checks();
+        self.clock.cycles
+    }
+
+    /// Run for at least `cycles` virtual cycles. Returns the final
+    /// master cycle count. May overshoot by up to `step_quantum - 1`
+    /// cycles (one quantum's worth), matching the documented overshoot
+    /// behaviour of [`Self::step`].
+    pub fn run(&mut self, cycles: u64) -> u64 {
+        let target = self.clock.cycles + cycles;
+        while self.clock.cycles < target {
+            self.step();
+        }
+        self.clock.cycles
+    }
+
+    /// Advance peripherals by `cycles` virtual cycles. Called once at the
+    /// end of each quantum.
+    fn tick_peripherals(&mut self, cycles: u32) {
+        let gpio_in = self.bus.gpio_in;
+        for pio in &mut self.bus.pio {
+            pio.step_n(cycles, gpio_in);
+        }
+        self.update_gpio();
+        self.bus.sio.tick_mtime_n(cycles);
+    }
+
+    /// Quantum-end SysTick advance. Stage 2 wiring — no-op for now;
+    /// DWT CYCCNT and SysTick CVR continue to return hardcoded 0
+    /// from `Ppb::read32` until the SysTick/DWT work lands.
+    fn tick_systick(&mut self) {
+        // Intentionally empty — Stage 2.
+    }
+
+    /// WFE/SEV wake check. If a core is WFE-waiting and its event_flag
+    /// is set, consume the event and wake the core.
+    fn wake_checks(&mut self) {
         for i in 0..2 {
             if self.cores[i].wfe_waiting && self.bus.event_flag[i] {
                 self.bus.event_flag[i] = false;
                 self.cores[i].wfe_waiting = false;
             }
         }
-
-        // Step PIO blocks
-        let gpio_in = self.bus.gpio_in;
-        for pio in &mut self.bus.pio {
-            pio.step(gpio_in);
-        }
-        self.update_gpio();
-
-        self.bus.sio.tick_mtime();
-        self.clock.cycles
-    }
-
-    /// Run for N cycles. Returns actual cycles executed.
-    pub fn run(&mut self, cycles: u64) -> u64 {
-        for _ in 0..cycles {
-            self.step();
-        }
-        self.clock.cycles
     }
 
     /// Merge SIO and PIO GPIO outputs into bus.gpio_in.
@@ -224,11 +272,23 @@ impl Emulator {
 /// Builder for assembling the emulator with optional peripherals.
 pub struct EmulatorBuilder {
     config: Config,
+    step_quantum: u32,
 }
 
 impl EmulatorBuilder {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            step_quantum: DEFAULT_STEP_QUANTUM,
+        }
+    }
+
+    /// Override the per-step quantum (default [`DEFAULT_STEP_QUANTUM`]).
+    /// Useful for benches sweeping quantum size, or tests wanting tighter
+    /// peripheral-latency observation.
+    pub fn step_quantum(mut self, n: u32) -> Self {
+        self.step_quantum = n;
+        self
     }
 
     pub fn build(self) -> Emulator {
@@ -241,6 +301,7 @@ impl EmulatorBuilder {
             cores: [CortexM33::with_id(0), CortexM33::with_id(1)],
             bus,
             clock: Clock { cycles: 0 },
+            step_quantum: self.step_quantum,
         }
     }
 }

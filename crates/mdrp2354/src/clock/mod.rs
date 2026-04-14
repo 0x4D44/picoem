@@ -16,11 +16,6 @@ impl Clock {
     }
 
     #[inline(always)]
-    pub fn tick(&mut self) {
-        self.cycles += 1;
-    }
-
-    #[inline(always)]
     pub fn advance(&mut self, n: u64) {
         self.cycles += n;
     }

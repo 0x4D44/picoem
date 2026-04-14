@@ -558,7 +558,7 @@ fn core1_fpu_entry_exit_isolated_from_core0() {
     bus.ppb[1].shcsr |= (1 << 16) | (1 << 17) | (1 << 18);
 
     // Switch the bus to Core 1's perspective for the FP work.
-    bus.begin_contention_check();
+    bus.set_active_core(1);
     assert_eq!(bus.active_core(), 1);
 
     // Core 1 executes VADD — sets FPCA on Core 1, leaves Core 0 untouched.
