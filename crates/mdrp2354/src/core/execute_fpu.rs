@@ -129,15 +129,24 @@ fn f32_to_u32_rmode(val: f32, rmode: u32) -> u32 {
 /// ARM default NaN for single precision: positive quiet NaN.
 const ARM_DEFAULT_NAN: u32 = 0x7FC0_0000;
 
+/// Returns true if the value is a signaling NaN (quiet bit = 0).
+#[inline(always)]
+fn is_snan(v: f32) -> bool {
+    let bits = v.to_bits();
+    (bits & 0x7FC0_0000) == 0x7F80_0000 && (bits & 0x003F_FFFF) != 0
+}
+
 /// Canonicalize NaN result per ARM FPv5 rules.
-/// If the result is NaN:
-///   - If either input was NaN, propagate the first NaN (with quiet bit set)
-///   - Otherwise, return the ARM default NaN (0x7FC00000)
-/// If the result is not NaN, return it unchanged.
+/// Priority: SNaN (either operand) > QNaN (either operand) > default NaN.
+/// Among same NaN type, first operand wins.
 #[inline]
 fn canonicalize_nan(result: f32, a: f32, b: f32) -> f32 {
     if result.is_nan() {
-        if a.is_nan() {
+        if is_snan(a) {
+            f32::from_bits(a.to_bits() | 0x0040_0000)
+        } else if is_snan(b) {
+            f32::from_bits(b.to_bits() | 0x0040_0000)
+        } else if a.is_nan() {
             f32::from_bits(a.to_bits() | 0x0040_0000)
         } else if b.is_nan() {
             f32::from_bits(b.to_bits() | 0x0040_0000)
@@ -163,17 +172,31 @@ fn canonicalize_nan_unary(result: f32, a: f32) -> f32 {
     }
 }
 
-/// Ternary variant for MAC operations (VMLA, VMLS, VNMLA, VNMLS, VFMA, etc.)
-/// which have three float inputs: accumulator, Sn, Sm.
+/// Returns true if a * b would produce an Invalid Operation (inf * 0 or 0 * inf).
+#[inline(always)]
+fn is_mul_inf_zero(a: f32, b: f32) -> bool {
+    (a.is_infinite() && b == 0.0) || (a == 0.0 && b.is_infinite())
+}
+
+/// Fused multiply-add NaN canonicalization per ARM FPMulAdd pseudocode.
+/// Priority: SNaN(addend,op1,op2) > inf*0 invalid > QNaN(addend,op1,op2) > default.
 #[inline]
-fn canonicalize_nan3(result: f32, a: f32, b: f32, c: f32) -> f32 {
+fn canonicalize_nan_fma(result: f32, addend: f32, op1: f32, op2: f32) -> f32 {
     if result.is_nan() {
-        if a.is_nan() {
-            f32::from_bits(a.to_bits() | 0x0040_0000)
-        } else if b.is_nan() {
-            f32::from_bits(b.to_bits() | 0x0040_0000)
-        } else if c.is_nan() {
-            f32::from_bits(c.to_bits() | 0x0040_0000)
+        if is_snan(addend) {
+            f32::from_bits(addend.to_bits() | 0x0040_0000)
+        } else if is_snan(op1) {
+            f32::from_bits(op1.to_bits() | 0x0040_0000)
+        } else if is_snan(op2) {
+            f32::from_bits(op2.to_bits() | 0x0040_0000)
+        } else if is_mul_inf_zero(op1, op2) {
+            f32::from_bits(ARM_DEFAULT_NAN)
+        } else if addend.is_nan() {
+            f32::from_bits(addend.to_bits() | 0x0040_0000)
+        } else if op1.is_nan() {
+            f32::from_bits(op1.to_bits() | 0x0040_0000)
+        } else if op2.is_nan() {
+            f32::from_bits(op2.to_bits() | 0x0040_0000)
         } else {
             f32::from_bits(ARM_DEFAULT_NAN)
         }
@@ -242,31 +265,31 @@ impl CortexM33 {
 
         match (op_hi, op_lo, op2_lo) {
             (0, 0b00, 0) => {
-                // VMLA.F32 Sd, Sn, Sm — Sd += Sn*Sm
+                // VMLA.F32 Sd, Sn, Sm — Sd += Sn*Sm (non-fused: two sequential ops)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = d + sn_val * sm_val;
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan(d + mul, d, mul);
                 3
             }
             (0, 0b00, 1) => {
-                // VMLS.F32 Sd, Sn, Sm — Sd -= Sn*Sm
+                // VMLS.F32 Sd, Sn, Sm — Sd -= Sn*Sm (non-fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = d - sn_val * sm_val;
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan(d - mul, d, mul);
                 3
             }
             (0, 0b01, 0) => {
-                // VNMLS.F32 Sd, Sn, Sm — Sd = Sn*Sm - Sd
+                // VNMLS.F32 Sd, Sn, Sm — Sd = Sn*Sm - Sd (non-fused, product first)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = sn_val * sm_val - d;
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan(mul - d, mul, d);
                 3
             }
             (0, 0b01, 1) => {
-                // VNMLA.F32 Sd, Sn, Sm — Sd = -(Sn*Sm + Sd)
+                // VNMLA.F32 Sd, Sn, Sm — Sd = -(Sn*Sm + Sd) (non-fused, product first)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = -(sn_val * sm_val + d);
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan(-(mul + d), mul, d);
                 3
             }
             (0, 0b10, 0) => {
@@ -303,28 +326,28 @@ impl CortexM33 {
                 // VFNMS.F32 Sd, Sn, Sm — Sd = Sn*Sm - Sd (fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
                 let result = sn_val.mul_add(sm_val, -d);
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b01, 1) => {
                 // VFNMA.F32 Sd, Sn, Sm — Sd = -(Sn*Sm + Sd) (fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
                 let result = (-sn_val).mul_add(sm_val, -d);
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b10, 0) => {
                 // VFMA.F32 Sd, Sn, Sm — Sd = Sd + Sn*Sm (fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
                 let result = sn_val.mul_add(sm_val, d);
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b10, 1) => {
                 // VFMS.F32 Sd, Sn, Sm — Sd = Sd - Sn*Sm (fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
                 let result = (-sn_val).mul_add(sm_val, d);
-                self.regs.s[sd] = canonicalize_nan3(result, d, sn_val, sm_val);
+                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
                 3
             }
             (1, 0b11, 0) => {

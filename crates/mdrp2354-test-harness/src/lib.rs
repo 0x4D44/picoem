@@ -4500,11 +4500,8 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                 // LDM Rn!, {reglist}
                 let rn: u16 = rng.range(0..8);
                 let mut reglist8: u16 = rng.range(1..256);
-                // Keep rn in list sometimes (no writeback) for variety
-                if rng.coin(0.5) {
-                    reglist8 &= !(1 << rn);
-                    if reglist8 == 0 { reglist8 = 1 << ((rn + 1) % 8); }
-                }
+                reglist8 &= !(1 << rn); // exclude rn: avoids address-space mismatch between oracles
+                if reglist8 == 0 { reglist8 = 1 << ((rn + 1) % 8); }
 
                 let opcode = enc_ldm(rn, reglist8);
                 let reg_count = reglist8.count_ones();
@@ -4518,7 +4515,7 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                     name: format!("FUZZ:LDM:{i} R{rn}! list={reglist8:#05x}"),
                     opcode,
                     reg_pre: vec![(rn as u8, 0)],
-                    addr_regs: if reglist8 & (1 << rn) == 0 { vec![rn as u8] } else { vec![] },
+                    addr_regs: vec![rn as u8],
                     needs_bus: true,
                     mem_pre,
                     xpsr_pre: rand_flags(rng),
