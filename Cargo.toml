@@ -15,6 +15,9 @@ panic = "abort"
 [profile.release.package.mdrp2350]
 codegen-units = 1
 
+[profile.release.package.mdrp2040]
+codegen-units = 1
+
 # Release build with line-tables for profiling (samply, perf, VTune).
 # Inherits all release optimizations. Full debug info ("debug = true")
 # would inhibit inlining; line-tables-only keeps profiler symbols without

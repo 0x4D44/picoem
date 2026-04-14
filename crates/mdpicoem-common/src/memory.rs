@@ -20,6 +20,18 @@ impl Memory {
         }
     }
 
+    /// Construct a `Memory` with chip-specific ROM and SRAM sizes.
+    /// Used by `mdrp2040` (16 KB ROM, 264 KB SRAM) and any future chip
+    /// crate that differs from the RP2350 defaults baked into `new()`.
+    /// XIP starts empty; populate via `load_flash`.
+    pub fn with_sizes(rom_size: usize, sram_size: usize) -> Self {
+        Self {
+            rom: vec![0u8; rom_size],
+            sram: vec![0u8; sram_size],
+            xip: Vec::new(),
+        }
+    }
+
     // --- ROM ---
 
     pub fn load_rom(&mut self, data: &[u8]) {
