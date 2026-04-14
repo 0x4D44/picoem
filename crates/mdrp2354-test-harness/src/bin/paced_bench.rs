@@ -52,6 +52,7 @@ fn main() {
     let sys_clk_hz = clock_mhz * 1_000_000;
     let core = parse_arg("--core").unwrap_or(2) as usize;
     let unpaced = std::env::args().any(|a| a == "--unpaced");
+    let dual_core = std::env::args().any(|a| a == "--dual-core");
 
     if seconds == 0 || clock_mhz == 0 {
         eprintln!("error: --seconds and --clock-mhz must be > 0");
@@ -84,14 +85,26 @@ fn main() {
     emu.core_mut(0).regs.msp = 0x2008_0000;
     emu.core_mut(0).regs.r[13] = 0x2008_0000;
 
-    // Core 1: halted
-    emu.core_mut(1).halt();
+    if dual_core {
+        // Core 1: running its own loop at a different SRAM address
+        // (different bank to avoid confounding bus contention with perf measurement)
+        emu.poke(0x20001000, 0x1C49_2101); // MOVS R1, #1 | ADDS R1, R1, #1
+        emu.poke(0x20001004, 0x0000_E7FD); // B .-2 (back to ADDS)
+        emu.core_mut(1).regs.set_pc(0x20001000);
+        emu.core_mut(1).regs.xpsr = 1 << 24;
+        emu.core_mut(1).regs.msp = 0x2007_0000;
+        emu.core_mut(1).regs.r[13] = 0x2007_0000;
+    } else {
+        // Core 1: halted
+        emu.core_mut(1).halt();
+    }
 
     // --- Set up pacer ---
     let mut pacer = Pacer::with_quantum(sys_clk_hz, quantum.into());
     let stats = pacer.stats();
 
-    println!("mdrp2354 paced benchmark — target {} MHz, quantum {} cycles", clock_mhz, quantum);
+    let core_mode = if dual_core { "dual-core" } else { "single-core" };
+    println!("mdrp2354 paced benchmark — target {} MHz, quantum {} cycles, {}", clock_mhz, quantum, core_mode);
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
     println!("{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
         "time", "emu_cycles", "emu_MHz", "util%", "headroom%", "behind");
