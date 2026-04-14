@@ -264,10 +264,17 @@ pub struct Pacer {
     first_begin_tsc: Option<u64>,
     /// Calibrated TSC frequency in Hz.
     tsc_freq_hz: u64,
-    /// Emulator system clock in Hz (e.g. 150_000_000).
-    /// Retained for potential runtime quantum reconfiguration.
-    #[allow(dead_code)]
+    /// Emulator system clock in Hz (e.g. 150_000_000). Mutable via
+    /// [`Pacer::update_sys_clk_hz`] so pacing follows firmware clock
+    /// reconfiguration — see LLD V2 §4.7.
     sys_clk_hz: u64,
+    /// Per-quantum measurement/spin overhead in TSC ticks. Subtracted
+    /// from the nominal quantum length so spin targets compensate for
+    /// the fixed cost of `end_quantum`'s bookkeeping. Computed once in
+    /// [`Pacer::with_quantum`] via [`calibrate_overhead`] and stored so
+    /// [`Pacer::update_sys_clk_hz`] can reuse it when the system clock
+    /// changes without re-running the 50 ms calibration sweep.
+    overhead: u64,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -300,6 +307,7 @@ impl Pacer {
             first_begin_tsc: None,
             tsc_freq_hz,
             sys_clk_hz: sys_clk_hz as u64,
+            overhead,
         }
     }
 
@@ -316,6 +324,42 @@ impl Pacer {
     /// Calibrated TSC frequency.
     pub fn tsc_freq_hz(&self) -> u64 {
         self.tsc_freq_hz
+    }
+
+    /// Host rdtsc ticks per quantum after overhead compensation. Exposed
+    /// `pub(crate)` for unit tests that exercise [`Self::update_sys_clk_hz`];
+    /// not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn quantum_tsc_ticks(&self) -> u64 {
+        self.quantum_tsc_ticks
+    }
+
+    /// Update the effective emulator system clock and recompute
+    /// `quantum_tsc_ticks` so spin-wait targets track the new frequency.
+    ///
+    /// Called by the sim thread after each quantum — see LLD V2 §4.7.
+    /// Zero-cost when the frequency is unchanged (the fast path is a
+    /// single compare + early return).
+    ///
+    /// `new_hz == 0` is a guard path: if firmware misconfigures CLK_SYS
+    /// to point at an unconfigured PLL (which now honestly reports 0 Hz),
+    /// keep the previous quantum rather than divide-by-zero and crash.
+    /// The emulator keeps running at the last known pace until firmware
+    /// reconfigures the clock.
+    #[inline]
+    pub fn update_sys_clk_hz(&mut self, new_hz: u32) {
+        if new_hz == 0 {
+            return;
+        }
+        let new = new_hz as u64;
+        if new == self.sys_clk_hz {
+            return;
+        }
+        self.sys_clk_hz = new;
+        let nominal = (self.tsc_freq_hz as u128
+            * self.quantum_cycles as u128
+            / new as u128) as u64;
+        self.quantum_tsc_ticks = nominal.saturating_sub(self.overhead);
     }
 
     /// Mark the start of a quantum. Call before stepping the emulator.
@@ -626,5 +670,75 @@ mod tests {
         assert!(overhead < 3000, "overhead should be below nominal");
         // Lower bound is hard to guarantee on all machines; just check clamp.
         assert!(overhead <= 750, "overhead should be clamped to nominal/4");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase C: dynamic sys_clk_hz updates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_update_sys_clk_hz_zero_keeps_previous() {
+        // If firmware misconfigures CLK_SYS to an unconfigured PLL (0 Hz),
+        // the Pacer must keep the previous quantum rather than divide-by-zero.
+        let mut pacer = Pacer::new(6_500_000);
+        let before = pacer.quantum_tsc_ticks();
+        pacer.update_sys_clk_hz(0);
+        assert_eq!(
+            pacer.quantum_tsc_ticks(),
+            before,
+            "zero-Hz update must preserve previous quantum_tsc_ticks"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_update_sys_clk_hz_changes_quantum() {
+        // Jumping from ROSC (6.5 MHz) to a 150 MHz PLL is a ~23× speedup,
+        // so the host-tick budget per quantum should shrink by ~23×. We
+        // allow a generous tolerance because the stored overhead is
+        // subtracted from both (which biases the ratio) and calibration
+        // noise is environment-dependent.
+        let mut pacer = Pacer::new(6_500_000);
+        let old_ticks = pacer.quantum_tsc_ticks();
+        assert!(old_ticks > 0, "baseline quantum must be non-zero");
+
+        pacer.update_sys_clk_hz(150_000_000);
+        let new_ticks = pacer.quantum_tsc_ticks();
+        assert!(new_ticks > 0, "new quantum must be non-zero");
+        assert!(
+            new_ticks < old_ticks,
+            "150 MHz quantum should be smaller than 6.5 MHz quantum (old={}, new={})",
+            old_ticks,
+            new_ticks
+        );
+
+        // Expected ratio ≈ 150M / 6.5M ≈ 23.08. Allow 15×..35× to absorb
+        // overhead-subtraction bias and TSC calibration jitter.
+        let ratio = old_ticks as f64 / new_ticks as f64;
+        assert!(
+            (15.0..=35.0).contains(&ratio),
+            "ratio should be ~23x, got {:.2} (old={}, new={})",
+            ratio,
+            old_ticks,
+            new_ticks
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_update_sys_clk_hz_noop_when_same() {
+        // Calling update with the current frequency is the expected
+        // per-quantum hot path when firmware hasn't touched the clock
+        // tree. It must be a no-op: quantum_tsc_ticks unchanged.
+        let mut pacer = Pacer::new(6_500_000);
+        let before = pacer.quantum_tsc_ticks();
+        pacer.update_sys_clk_hz(6_500_000);
+        pacer.update_sys_clk_hz(6_500_000);
+        assert_eq!(
+            pacer.quantum_tsc_ticks(),
+            before,
+            "same-frequency update must be a no-op"
+        );
     }
 }

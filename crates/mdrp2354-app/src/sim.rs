@@ -23,7 +23,6 @@ pub fn run(
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let config = Config::default();
-    let sys_clk_hz = config.sys_clk_hz;
     let mut emu = Emulator::new(config);
 
     emu.load_bootrom(&fw.bootrom);
@@ -31,7 +30,12 @@ pub fn run(
     emu.reset();
     emu.core_mut(1).halt();
 
-    let mut pacer = Pacer::with_quantum(sys_clk_hz, 150);
+    // Initialise the pacer from the Bus clock tree — this is the single
+    // source of truth for the emulator's current system clock once
+    // firmware starts poking PLL/CLOCKS registers. At reset the tree
+    // reports ROSC (6.5 MHz); firmware that configures a PLL will speed
+    // the emulator up via the per-quantum update below.
+    let mut pacer = Pacer::with_quantum(emu.bus.sys_clk_hz(), 150);
     let qc = pacer.quantum_cycles();
     let start = Instant::now();
 
@@ -48,6 +52,11 @@ pub fn run(
         pacer.begin_quantum();
         emu.run(qc);
         pacer.end_quantum();
+
+        // Follow firmware clock reconfiguration (PLL bring-up, mux
+        // switches). Zero-cost when sys_clk_hz is unchanged — see
+        // LLD V2 §4.7.
+        pacer.update_sys_clk_hz(emu.bus.sys_clk_hz());
 
         let gpio_out = emu.bus.sio.gpio_out;
         let gpio_oe = emu.bus.sio.gpio_oe;
