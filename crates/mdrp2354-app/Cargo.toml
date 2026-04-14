@@ -3,6 +3,7 @@ name = "mdrp2354-app"
 version = "0.1.0"
 edition.workspace = true
 rust-version = "1.88"
+license.workspace = true
 
 [dependencies]
 mdrp2354 = { path = "../mdrp2354" }
