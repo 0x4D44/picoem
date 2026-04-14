@@ -150,10 +150,23 @@ impl Bus {
     /// Current effective system clock frequency in Hz.
     ///
     /// Derived from CLK_SYS_CTRL / CLK_REF_CTRL / CLK_SYS_DIV and the
-    /// PLL registers (PLLs return 0 Hz until Phase B lands). The Pacer
-    /// reads this after each quantum to follow firmware clock changes.
+    /// PLL registers. The Pacer reads this after each quantum to follow
+    /// firmware clock changes.
     pub fn sys_clk_hz(&self) -> u32 {
         self.clock_tree.sys_clk_hz
+    }
+
+    /// Seed the clock-tree frequencies (both `sys_clk_hz` and
+    /// `ref_clk_hz`) without writing to any register. The first
+    /// subsequent call to [`Self::recompute_clock_tree`] — triggered
+    /// by any write to a CLOCKS or PLL register — overwrites the seed
+    /// with the register-derived value.
+    ///
+    /// Used by `EmulatorBuilder::build` to forward `Config::sys_clk_hz`
+    /// into the Bus as the vestigial seed (LLD V2 §4.9).
+    pub fn seed_sys_clk_hz(&mut self, hz: u32) {
+        self.clock_tree.sys_clk_hz = hz;
+        self.clock_tree.ref_clk_hz = hz;
     }
 
     /// Current effective reference clock frequency in Hz.

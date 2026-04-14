@@ -95,11 +95,9 @@ impl Emulator {
         }
         self.bus.gpio_in = 0;
 
-        // Reset clock
-        self.clock = Clock {
-            cycles: 0,
-            sys_clk_hz: self.clock.sys_clk_hz,
-        };
+        // Reset clock. The authoritative sys_clk_hz lives on Bus's
+        // clock tree (see bus/clocks.rs), so nothing to preserve here.
+        self.clock = Clock { cycles: 0 };
     }
 
     /// Load a raw binary at the given address.
@@ -233,14 +231,15 @@ impl EmulatorBuilder {
     }
 
     pub fn build(self) -> Emulator {
-        let clock = Clock {
-            cycles: 0,
-            sys_clk_hz: self.config.sys_clk_hz,
-        };
+        // Seed Bus's clock tree from Config::sys_clk_hz (vestigial
+        // seed per LLD V2 §4.9). First write to any CLOCKS/PLL
+        // register replaces the seed with the derived value.
+        let mut bus = Bus::new();
+        bus.seed_sys_clk_hz(self.config.sys_clk_hz);
         Emulator {
             cores: [CortexM33::with_id(0), CortexM33::with_id(1)],
-            bus: Bus::new(),
-            clock,
+            bus,
+            clock: Clock { cycles: 0 },
         }
     }
 }

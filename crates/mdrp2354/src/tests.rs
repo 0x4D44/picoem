@@ -5973,3 +5973,30 @@ fn test_rosc_ctrl_alias_set() {
     assert_eq!(bus.read32(0x400E_8000), 0x0000_0003,
         "SET alias on ROSC CTRL should OR bits, not overwrite");
 }
+
+// ============================================================================
+// Clock Tree V2 Phase E: Config::sys_clk_hz as vestigial seed
+// ============================================================================
+
+#[test]
+fn test_config_sys_clk_hz_seeds_bus() {
+    use crate::bus::clocks::ROSC_FREQ_HZ;
+    use crate::{Config, Emulator};
+
+    // Construct an emulator with a non-default Config::sys_clk_hz.
+    // Before any register writes, the Bus should report the seed value.
+    let emu = Emulator::new(Config {
+        sys_clk_hz: 12_345_678,
+        ..Default::default()
+    });
+    assert_eq!(emu.bus.sys_clk_hz(), 12_345_678,
+        "Bus should expose Config::sys_clk_hz as the pre-recompute seed");
+
+    // First write to a CLOCKS register triggers recompute, which
+    // overwrites the seed with the register-derived value. Reset
+    // register state routes CLK_SYS → clk_ref → ROSC.
+    let mut emu = emu;
+    emu.bus.write32(0x4001_0060, 0x0000_0000); // CLK_SYS_CTRL SRC=0 (clk_ref)
+    assert_eq!(emu.bus.sys_clk_hz(), ROSC_FREQ_HZ,
+        "First CLOCKS write should replace the seed with the derived ROSC frequency");
+}
