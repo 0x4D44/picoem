@@ -156,6 +156,20 @@ need single-instruction granularity opt in via
 `EmulatorBuilder::new(Config::default()).step_quantum(1).build()`. See
 `wrk_docs/2026.04.14 - HLD - mdrp2040 Quantum Step.md` (v1.2.0).
 
+### RP2040 pacer MHz panel undercounts consumed cycles
+
+`crates/mdrp2040app/src/sim.rs` calls `emu.run(pacer.quantum_cycles())`
+and `Pacer` reports MHz from cycles *asked for*. `run()` overshoots by
+up to `step_quantum - 1` cycles (quantum-step landed in
+`wrk_docs/2026.04.14 - HLD - mdrp2040 Quantum Step.md` v1.2.0), so the
+app's MHz panel systematically undercounts by up to ~22% at default
+settings — surfaced during the punchlist review (see
+`wrk_docs/2026.04.14 - HLD - mdrp2040 Quantum Step Punchlist.md`).
+Fix requires a `Pacer` API extension to feed consumed cycles back
+(replace `begin_quantum`/`end_quantum` with a form that takes the
+actual cycle count from `emu.run`'s return). Low priority — firmware
+runs correctly; only the displayed MHz figure is wrong.
+
 ### RP2040 SIO divider 2-read dirty clear heuristic
 
 `crates/mdrp2040/src/bus/sio.rs` clears the divider `dirty` flag after exactly two result reads. Real hardware clears `dirty` on any result read (per-register). The two-read heuristic happens to match the canonical `__aeabi_idivmod` pattern (quotient + remainder read in pairs), but misbehaves for firmware that reads only one result (e.g., modulo-only code paths leave `dirty` set until the next write). Low priority — fix by clearing on each read of `QUOTIENT`/`REMAINDER`.
