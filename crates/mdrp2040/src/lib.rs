@@ -150,19 +150,9 @@ impl Emulator {
         self.bus.load_bootrom(data);
     }
 
-    /// Load an XIP flash image (appears at XIP address `0x1000_0000`
-    /// and its aliases `0x1100_0000`, `0x1200_0000`, `0x1300_0000`).
-    ///
-    /// Oversized images are silently clamped to the 2 MB flash window
-    /// (see [`crate::memory::FLASH_SIZE`]). Reads past the loaded
-    /// length within the window return 0.
+    /// Load an XIP flash image (appears at XIP address `0x1000_0000`).
     pub fn load_flash(&mut self, data: &[u8]) {
-        let clamped = if data.len() > memory::FLASH_SIZE {
-            &data[..memory::FLASH_SIZE]
-        } else {
-            data
-        };
-        self.bus.load_flash(clamped);
+        self.bus.load_flash(data);
     }
 
     /// Advance the system by up to `step_quantum` master-clock cycles,
@@ -381,7 +371,6 @@ impl Emulator {
 pub struct EmulatorBuilder {
     config: Config,
     step_quantum: u32,
-    flash: Option<Vec<u8>>,
 }
 
 impl EmulatorBuilder {
@@ -389,7 +378,6 @@ impl EmulatorBuilder {
         Self {
             config,
             step_quantum: DEFAULT_STEP_QUANTUM,
-            flash: None,
         }
     }
 
@@ -397,13 +385,6 @@ impl EmulatorBuilder {
     pub fn step_quantum(mut self, n: u32) -> Self {
         debug_assert!(n > 0, "step_quantum must be >= 1");
         self.step_quantum = n;
-        self
-    }
-
-    /// Pre-load a flash image. Applied at [`Self::build`] time via
-    /// [`Emulator::load_flash`] (so the same 2 MB clamp applies).
-    pub fn flash(mut self, data: Vec<u8>) -> Self {
-        self.flash = Some(data);
         self
     }
 
@@ -418,9 +399,6 @@ impl EmulatorBuilder {
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         emu.cores[1].halt();
-        if let Some(data) = self.flash {
-            emu.load_flash(&data);
-        }
         emu
     }
 }
