@@ -228,6 +228,147 @@ impl Sio {
         }
     }
 
+    // --- CP0 GPIOC fast-path methods (Phase 7 Stage C) ---
+    //
+    // These expose the SIO output/OE state to the CP0 coprocessor without a
+    // bus round-trip. Input state lives on `Bus` per HLD §C.3, so no
+    // `gpio_bit_in_get` method is provided here — CP0 reads `bus.gpio_in`
+    // directly.
+    //
+    // RP2354A target: 30 pins. Bits [31:30] are masked on writes and read
+    // back as zero. The `PIN_MASK` constant encodes this.
+
+    /// Mask of valid GPIO pin bits for RP2354A (30 pins, bits [29:0]).
+    pub(crate) const PIN_MASK: u32 = 0x3FFF_FFFF;
+
+    // Per-bit output (GPIO_OUT) operations.
+
+    pub fn gpio_bit_out_get(&self, pin: u8) -> bool {
+        if pin >= 30 {
+            return false;
+        }
+        (self.gpio_out >> pin) & 1 != 0
+    }
+
+    pub fn gpio_bit_out_put(&mut self, pin: u8, v: bool) {
+        if pin >= 30 {
+            return;
+        }
+        let mask = 1u32 << pin;
+        if v {
+            self.gpio_out |= mask;
+        } else {
+            self.gpio_out &= !mask;
+        }
+    }
+
+    pub fn gpio_bit_out_set(&mut self, pin: u8) {
+        if pin >= 30 {
+            return;
+        }
+        self.gpio_out |= 1u32 << pin;
+    }
+
+    pub fn gpio_bit_out_clr(&mut self, pin: u8) {
+        if pin >= 30 {
+            return;
+        }
+        self.gpio_out &= !(1u32 << pin);
+    }
+
+    pub fn gpio_bit_out_xor(&mut self, pin: u8) {
+        if pin >= 30 {
+            return;
+        }
+        self.gpio_out ^= 1u32 << pin;
+    }
+
+    // Per-bit output-enable (GPIO_OE) operations.
+
+    pub fn gpio_bit_oe_get(&self, pin: u8) -> bool {
+        if pin >= 30 {
+            return false;
+        }
+        (self.gpio_oe >> pin) & 1 != 0
+    }
+
+    pub fn gpio_bit_oe_put(&mut self, pin: u8, v: bool) {
+        if pin >= 30 {
+            return;
+        }
+        let mask = 1u32 << pin;
+        if v {
+            self.gpio_oe |= mask;
+        } else {
+            self.gpio_oe &= !mask;
+        }
+    }
+
+    pub fn gpio_bit_oe_set(&mut self, pin: u8) {
+        if pin >= 30 {
+            return;
+        }
+        self.gpio_oe |= 1u32 << pin;
+    }
+
+    pub fn gpio_bit_oe_clr(&mut self, pin: u8) {
+        if pin >= 30 {
+            return;
+        }
+        self.gpio_oe &= !(1u32 << pin);
+    }
+
+    pub fn gpio_bit_oe_xor(&mut self, pin: u8) {
+        if pin >= 30 {
+            return;
+        }
+        self.gpio_oe ^= 1u32 << pin;
+    }
+
+    // Bulk GPIO_OUT operations — whole-bank (30 valid pins on RP2354A).
+
+    pub fn gpio_lo_out_get(&self) -> u32 {
+        self.gpio_out & Self::PIN_MASK
+    }
+
+    pub fn gpio_lo_out_put(&mut self, v: u32) {
+        self.gpio_out = v & Self::PIN_MASK;
+    }
+
+    pub fn gpio_lo_out_set(&mut self, v: u32) {
+        self.gpio_out |= v & Self::PIN_MASK;
+    }
+
+    pub fn gpio_lo_out_clr(&mut self, v: u32) {
+        self.gpio_out &= !(v & Self::PIN_MASK);
+    }
+
+    pub fn gpio_lo_out_xor(&mut self, v: u32) {
+        self.gpio_out ^= v & Self::PIN_MASK;
+    }
+
+    // Bulk GPIO_OE operations.
+
+    pub fn gpio_lo_oe_get(&self) -> u32 {
+        self.gpio_oe & Self::PIN_MASK
+    }
+
+    pub fn gpio_lo_oe_put(&mut self, v: u32) {
+        self.gpio_oe = v & Self::PIN_MASK;
+    }
+
+    pub fn gpio_lo_oe_set(&mut self, v: u32) {
+        self.gpio_oe |= v & Self::PIN_MASK;
+    }
+
+    pub fn gpio_lo_oe_clr(&mut self, v: u32) {
+        self.gpio_oe &= !(v & Self::PIN_MASK);
+    }
+
+    pub fn gpio_lo_oe_xor(&mut self, v: u32) {
+        self.gpio_oe ^= v & Self::PIN_MASK;
+    }
+
     // --- FIFO helpers ---
 
     /// Read FIFO_ST: status register from the calling core's perspective.
