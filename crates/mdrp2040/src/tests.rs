@@ -1958,3 +1958,146 @@ mod emulator_step {
         assert!(emu.cores[1].regs.pc() > pc_before, "core 1 PC must advance");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Quantum-step contracts (HLD v1.1.0 §B)
+// ---------------------------------------------------------------------------
+//
+// Four contracts the main quantum-step HLD (v1.2.0) relies on:
+//   1. `step_quantum(1)` advances by exactly one core-0 instruction.
+//   2. `step_quantum(N)` advances the clock into the half-open window
+//      `[N, N + MAX_INSTR_COST)` — overshoot bounded by the most
+//      expensive single M0+ instruction (BL = 4 cycles).
+//   3. `step()`'s return value equals the `clock.cycles` delta across
+//      the call.
+//   4. Peripherals tick once per `step()` — not once per inner-loop
+//      iteration. A single quantum-N step must land in the same PIO
+//      state as N quantum-1 steps against an identical program.
+mod quantum_contract {
+    use crate::bus::PIO0_BASE;
+    use crate::{Config, EmulatorBuilder, Emulator};
+
+    /// Seed a run of NOPs at 0x2000_1000 and park core 0 on them.
+    /// Each NOP is a 1-cycle instruction on M0+, so each `emu.step()`
+    /// call with `step_quantum(1)` advances the master clock by exactly
+    /// one cycle.
+    fn seed_nop_program(emu: &mut Emulator) {
+        let prog = 0x2000_1000u32;
+        for i in 0..256u32 {
+            emu.bus.write16(prog + i * 2, 0xBF00); // NOP
+        }
+        emu.cores[0].regs.set_pc(prog);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+    }
+
+    #[test]
+    fn step_quantum_1_advances_by_one_instruction() {
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        seed_nop_program(&mut emu);
+        let pc_before = emu.cores[0].regs.pc();
+        let consumed = emu.step();
+        assert_eq!(consumed, 1, "quantum=1 NOP must consume exactly 1 cycle");
+        assert_eq!(
+            emu.cores[0].regs.pc(),
+            pc_before + 2,
+            "PC must advance by one 2-byte Thumb instruction"
+        );
+    }
+
+    #[test]
+    fn step_quantum_n_advances_within_bounds() {
+        // With quantum=N, the loop keeps issuing instructions until the
+        // master clock reaches or exceeds `N`. A single instruction can
+        // cost at most `MAX_INSTR_COST = 4` cycles on M0+ (BL), so the
+        // overshoot is strictly bounded.
+        const N: u32 = 16;
+        const MAX_INSTR_COST: u64 = 4;
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(N).build();
+        seed_nop_program(&mut emu);
+        let consumed = emu.step();
+        assert!(
+            consumed >= N as u64,
+            "quantum={} must consume at least N cycles (got {})",
+            N,
+            consumed
+        );
+        assert!(
+            consumed < N as u64 + MAX_INSTR_COST,
+            "quantum={} overshoot must be bounded by MAX_INSTR_COST={} (got {})",
+            N,
+            MAX_INSTR_COST,
+            consumed
+        );
+    }
+
+    #[test]
+    fn step_return_equals_clock_delta() {
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(8).build();
+        seed_nop_program(&mut emu);
+        let before = emu.cycles();
+        let consumed = emu.step();
+        assert_eq!(
+            consumed,
+            emu.cycles() - before,
+            "step() return value must equal the clock.cycles delta"
+        );
+    }
+
+    /// Build an emulator with PIO0/SM0 loaded with a 2-instruction toggle
+    /// program — `SET PINS, 1` then `SET PINS, 0` with auto-wrap. On
+    /// each PIO cycle, `pad_out & 1` alternates between 1 and 0. Core 0
+    /// is parked on NOPs so each emu-step advances PIO by exactly `c0`
+    /// system-clock cycles.
+    fn toggle_emulator(step_quantum: u32) -> Emulator {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(step_quantum)
+            .build();
+
+        // Program: SET PINS, 1 @ addr 0; SET PINS, 0 @ addr 1.
+        let set_pins_1: u16 = 0xE001;
+        let set_pins_0: u16 = 0xE000;
+        for (i, insn) in [set_pins_1, set_pins_0].iter().enumerate() {
+            emu.bus
+                .write32(PIO0_BASE + 0x048 + (i as u32) * 4, *insn as u32);
+        }
+
+        // SM0_PINCTRL: set_count=1 (bits 28:26), set_base=0 (bits 9:5).
+        emu.bus.write32(PIO0_BASE + 0x0DC, 1u32 << 26);
+        // SM0_EXECCTRL: wrap_top=1, wrap_bottom=0 — auto-wrap 0→1→0.
+        emu.bus.write32(PIO0_BASE + 0x0CC, 1u32 << 12);
+        // Force SET PINDIRS, 1 so the output pin becomes driven.
+        emu.bus.write32(PIO0_BASE + 0x0D8, 0xE081);
+        // Enable SM0.
+        emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+
+        seed_nop_program(&mut emu);
+        emu
+    }
+
+    #[test]
+    fn peripherals_tick_once_per_step() {
+        // Reference: step_quantum(1) stepped N times — PIO is ticked N
+        // separate times, each with cycles=1.
+        // Subject:   step_quantum(N) stepped once — PIO is ticked once
+        // with cycles=N.
+        // `tick_pio` fires exactly once per `step()`, so both paths must
+        // land the PIO SM0 in the same position and `pad_out & 1` must
+        // match. A double-tick inside the inner loop would diverge.
+        const N: u32 = 8;
+
+        let mut reference = toggle_emulator(1);
+        for _ in 0..N {
+            reference.step();
+        }
+
+        let mut subject = toggle_emulator(N);
+        subject.step();
+
+        assert_eq!(
+            subject.bus.pio[0].pad_out & 1,
+            reference.bus.pio[0].pad_out & 1,
+            "one N-cycle step must leave the same pad_out state as N one-cycle steps",
+        );
+    }
+}
