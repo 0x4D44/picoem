@@ -16,6 +16,13 @@ pub struct PioBlock {
     fdebug: u32,
     pub pad_out: u32,
     pub pad_oe: u32,
+    /// Bit `i` is set iff `sm[i].enabled`. Deliberately redundant with
+    /// `sm[i].enabled` (the SM field stays authoritative) — this cached
+    /// mask exists solely for the single-load fast-path check at the top
+    /// of [`Self::step`] / [`Self::step_n`]. Maintained via
+    /// [`Self::set_sm_enabled`]; direct writes to `sm[i].enabled` must not
+    /// be reintroduced on the production path.
+    sm_enabled_mask: u8,
 }
 
 impl PioBlock {
@@ -37,6 +44,7 @@ impl PioBlock {
             fdebug: 0,
             pad_out: 0,
             pad_oe: 0,
+            sm_enabled_mask: 0,
         }
     }
 
@@ -51,10 +59,33 @@ impl PioBlock {
         self.fdebug = 0;
         self.pad_out = 0;
         self.pad_oe = 0;
+        self.sm_enabled_mask = 0;
+    }
+
+    /// Enable or disable state machine `i`, maintaining the cached
+    /// `sm_enabled_mask` invariant. Every enable-state transition
+    /// re-merges pin outputs so that a just-disabled SM's stuck pin
+    /// bits are cleared on the same tick — this is what makes the
+    /// fast-path skip in [`Self::step`] safe when the mask is zero.
+    pub fn set_sm_enabled(&mut self, i: usize, enabled: bool) {
+        let prev = self.sm[i].enabled;
+        if prev == enabled {
+            return;
+        }
+        self.sm[i].enabled = enabled;
+        if enabled {
+            self.sm_enabled_mask |= 1 << i;
+        } else {
+            self.sm_enabled_mask &= !(1 << i);
+        }
+        self.merge_pin_outputs();
     }
 
     /// Advance PIO block by one system clock.
     pub fn step(&mut self, gpio_in: u32) {
+        if self.sm_enabled_mask == 0 {
+            return;
+        }
         for i in 0..4 {
             if self.sm[i].clock_tick() {
                 self.sm[i].execute_cycle(&self.instr_mem, &mut self.irq_flags, gpio_in);
@@ -69,6 +100,9 @@ impl PioBlock {
     /// pin-output merging). A bulk-advance optimisation is future work if
     /// PIO appears hot in a flamegraph.
     pub fn step_n(&mut self, n: u32, gpio_in: u32) {
+        if self.sm_enabled_mask == 0 {
+            return;
+        }
         for _ in 0..n {
             self.step(gpio_in);
         }
@@ -356,14 +390,17 @@ impl PioBlock {
             0 => {
                 // Normal write: set SM_ENABLE directly
                 for i in 0..4 {
-                    self.sm[i].enabled = (sm_enable_bits >> i) & 1 != 0;
+                    self.set_sm_enabled(i, (sm_enable_bits >> i) & 1 != 0);
                 }
             }
             1 => {
                 // XOR
                 for i in 0..4 {
                     if (sm_enable_bits >> i) & 1 != 0 {
-                        self.sm[i].enabled = !self.sm[i].enabled;
+                        // Read current state before the call to sidestep
+                        // the &mut self borrow inside set_sm_enabled.
+                        let toggled = !self.sm[i].enabled;
+                        self.set_sm_enabled(i, toggled);
                     }
                 }
             }
@@ -371,7 +408,7 @@ impl PioBlock {
                 // SET (OR): enable indicated SMs
                 for i in 0..4 {
                     if (sm_enable_bits >> i) & 1 != 0 {
-                        self.sm[i].enabled = true;
+                        self.set_sm_enabled(i, true);
                     }
                 }
             }
@@ -379,7 +416,7 @@ impl PioBlock {
                 // CLR (AND NOT): disable indicated SMs
                 for i in 0..4 {
                     if (sm_enable_bits >> i) & 1 != 0 {
-                        self.sm[i].enabled = false;
+                        self.set_sm_enabled(i, false);
                     }
                 }
             }
@@ -500,7 +537,7 @@ mod tests {
     fn test_ctrl_restart_self_clearing() {
         let mut pio = PioBlock::new();
         // Enable SM0 and set some state
-        pio.sm[0].enabled = true;
+        pio.set_sm_enabled(0, true);
         pio.sm[0].pc = 15;
         pio.sm[0].x = 0x1234;
 
@@ -671,7 +708,7 @@ mod tests {
         let mut pio = PioBlock::new();
 
         // Dirty up state
-        pio.sm[0].enabled = true;
+        pio.set_sm_enabled(0, true);
         pio.sm[0].pc = 10;
         pio.sm[0].x = 0xDEAD;
         pio.sm[1].tx_fifo.push(42);
@@ -701,7 +738,7 @@ mod tests {
     #[test]
     fn test_clock_div_1() {
         let mut pio = PioBlock::new();
-        pio.sm[0].enabled = true;
+        pio.set_sm_enabled(0, true);
         pio.sm[0].clkdiv_int = 1;
         pio.sm[0].clkdiv_frac = 0;
         // Should tick every cycle
@@ -717,7 +754,7 @@ mod tests {
     #[test]
     fn test_clock_div_2() {
         let mut pio = PioBlock::new();
-        pio.sm[0].enabled = true;
+        pio.set_sm_enabled(0, true);
         pio.sm[0].clkdiv_int = 2;
         pio.sm[0].clkdiv_frac = 0;
         let mut ticks = 0;
@@ -732,7 +769,7 @@ mod tests {
     #[test]
     fn test_clock_div_1_frac_128() {
         let mut pio = PioBlock::new();
-        pio.sm[0].enabled = true;
+        pio.set_sm_enabled(0, true);
         pio.sm[0].clkdiv_int = 1;
         pio.sm[0].clkdiv_frac = 128;
         // Threshold = 256 + 128 = 384
@@ -750,7 +787,7 @@ mod tests {
     #[test]
     fn test_clock_div_large() {
         let mut pio = PioBlock::new();
-        pio.sm[0].enabled = true;
+        pio.set_sm_enabled(0, true);
         pio.sm[0].clkdiv_int = 1000;
         pio.sm[0].clkdiv_frac = 0;
         let mut ticks = 0;
@@ -827,7 +864,7 @@ mod tests {
         for (i, &insn) in program.iter().enumerate() {
             pio.instr_mem[i] = insn;
         }
-        pio.sm[0].enabled = true;
+        pio.set_sm_enabled(0, true);
         pio.sm[0].clkdiv_int = 1;
         pio.sm[0].clkdiv_frac = 0;
         pio
@@ -1060,13 +1097,13 @@ mod tests {
         // IRQ set rel 0: opcode=110, clear=0, wait=0, index=10000
         //   => 0b110_00000_0_0_0_10000 = 0xC010
         let mut pio = make_pio_with_program(&[0xC010]);
-        pio.sm[2].enabled = true;
+        pio.set_sm_enabled(2, true);
         pio.sm[2].clkdiv_int = 1;
         pio.sm[2].clkdiv_frac = 0;
         // SM2 has sm_id=2, so relative IRQ 0 -> (0+2)%4 = 2
         step_n(&mut pio, 1, 0); // SM0 ticks (at addr 0 which is same insn)
         // But we want SM2 to execute. SM0 also ticks. Let's disable SM0.
-        pio.sm[0].enabled = false;
+        pio.set_sm_enabled(0, false);
         // Reset SM2 PC to start fresh
         pio.sm[2].pc = 0;
         pio.irq_flags = 0;
@@ -1392,4 +1429,61 @@ mod tests {
     // `test_pio_spi_clk_mosi` (plus helpers `pio_write`,
     // `pio_test_emulator`, `pio_load_program`).
 
+    // ====================================================================
+    // PIO Idle Skip — fast-path regression probes
+    // ====================================================================
+
+    #[test]
+    fn idle_block_step_is_noop() {
+        // Fresh block, no SMs enabled: step_n must be a semantic no-op.
+        let mut pio = PioBlock::new();
+        // Capture per-SM cross-cycle state that the fast path must not perturb.
+        let pc_before: [u8; 4] = [pio.sm[0].pc, pio.sm[1].pc, pio.sm[2].pc, pio.sm[3].pc];
+        let acc_before: [u32; 4] = [
+            pio.sm[0].clkdiv_acc,
+            pio.sm[1].clkdiv_acc,
+            pio.sm[2].clkdiv_acc,
+            pio.sm[3].clkdiv_acc,
+        ];
+
+        pio.step_n(1000, 0);
+
+        assert_eq!(pio.pad_out, 0, "idle block must not drive pad_out");
+        assert_eq!(pio.pad_oe, 0, "idle block must not drive pad_oe");
+        for i in 0..4 {
+            assert_eq!(pio.sm[i].pc, pc_before[i], "SM{i} pc must not advance");
+            assert_eq!(
+                pio.sm[i].clkdiv_acc, acc_before[i],
+                "SM{i} clkdiv_acc must not advance"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_clears_pin_outputs() {
+        let mut pio = PioBlock::new();
+        pio.set_sm_enabled(0, true);
+        // Poke pin latches directly (pub(crate) fields) to avoid running a
+        // program — we only need the merge path to observe them.
+        pio.sm[0].pin_values = 0x1;
+        pio.sm[0].pin_dirs = 0x1;
+
+        pio.step(0);
+
+        assert!(
+            pio.pad_out & pio.pad_oe != 0,
+            "enabled SM's pin state should be merged into pad_out/pad_oe"
+        );
+
+        pio.set_sm_enabled(0, false);
+
+        assert_eq!(
+            pio.pad_out, 0,
+            "disabling the last SM must clear pad_out on the same tick"
+        );
+        assert_eq!(
+            pio.pad_oe, 0,
+            "disabling the last SM must clear pad_oe on the same tick"
+        );
+    }
 }
