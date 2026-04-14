@@ -3967,6 +3967,76 @@ fn fpu_vselgt_false_picks_sm() {
     assert_eq!(c.regs.s[0], 8.0);
 }
 
+#[test]
+fn fpu_vsel_gt_all_flag_combos() {
+    // GT condition: Z==0 && N==V.
+    // Walk every combination of N and V (with Z=0) to cover the full
+    // N/V truth table for the GT branch of vsel_condition_holds.
+    //
+    //   N==V==false → N==V → GT true  → picks Sn  (already covered above)
+    //   N==V==true  → N==V → GT true  → picks Sn
+    //   N!=V (N=1,V=0) → GT false → picks Sm
+    //   N!=V (N=0,V=1) → GT false → picks Sm
+    let (hw0, hw1) = enc_vsel(3, 0, 2, 4); // cc=11 (GT)
+
+    // Case: N==V==true → picks Sn
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 7.0;
+    c.regs.s[4] = 8.0;
+    c.regs.set_flag_z(false);
+    c.regs.set_flag_n(true);
+    c.regs.set_flag_v(true);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 7.0, "N==V==true should select Sn");
+
+    // Case: N=1, V=0 → N!=V → picks Sm
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 7.0;
+    c.regs.s[4] = 8.0;
+    c.regs.set_flag_z(false);
+    c.regs.set_flag_n(true);
+    c.regs.set_flag_v(false);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 8.0, "N!=V (N=1,V=0) should select Sm");
+
+    // Case: N=0, V=1 → N!=V → picks Sm
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 7.0;
+    c.regs.s[4] = 8.0;
+    c.regs.set_flag_z(false);
+    c.regs.set_flag_n(false);
+    c.regs.set_flag_v(true);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 8.0, "N!=V (N=0,V=1) should select Sm");
+
+    // Case: N==V==false → picks Sn (already covered by fpu_vselgt_true_picks_sn,
+    // repeated here to keep the full truth table visible in one place).
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 7.0;
+    c.regs.s[4] = 8.0;
+    c.regs.set_flag_z(false);
+    c.regs.set_flag_n(false);
+    c.regs.set_flag_v(false);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 7.0, "N==V==false should select Sn");
+}
+
+#[test]
+fn fpu_vcvta_is_undefined() {
+    // VCVTA.S32.F32 (Armv8-M FP, 0xFE family with hw0[7]=1 and hw0[6:5]!=00)
+    // is not dispatched in Phase 7.1 and must fall through to UNDEFINED,
+    // raising a UsageFault. This test locks in the boundary — if future
+    // dispatch work accidentally routes VCVTA somewhere, this breaks.
+    let mut c = CortexM33::new();
+    c.execute_one_wide(0xFEBD, 0x0A40);
+    assert!(
+        matches!(c.pending_fault, Some(crate::core::Fault::UsageFault)),
+        "VCVTA encoding must fall through to UsageFault (Phase 7.1 boundary); \
+         pending_fault = {:?}",
+        c.pending_fault
+    );
+}
+
 // ----- VMAXNM / VMINNM -----------------------------------------------------
 
 #[test]
@@ -4033,6 +4103,46 @@ fn fpu_vminnm_nan_returns_other() {
     assert!(c.regs.s[0].is_nan());
 }
 
+#[test]
+fn fpu_vmaxnm_zero_signs() {
+    // IEEE 754-2008 §5.3.1: maxNum(+0, -0) = +0 in both operand orders.
+    let mut c = CortexM33::new();
+
+    // (+0, -0)
+    c.regs.s[2] = 0.0f32;
+    c.regs.s[4] = -0.0f32;
+    let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 0x0000_0000, "maxNum(+0,-0) must be +0");
+
+    // (-0, +0) — same expected result regardless of order
+    c.regs.s[2] = -0.0f32;
+    c.regs.s[4] = 0.0f32;
+    let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 0x0000_0000, "maxNum(-0,+0) must be +0");
+}
+
+#[test]
+fn fpu_vminnm_zero_signs() {
+    // IEEE 754-2008 §5.3.1: minNum(+0, -0) = -0 in both operand orders.
+    let mut c = CortexM33::new();
+
+    // (+0, -0)
+    c.regs.s[2] = 0.0f32;
+    c.regs.s[4] = -0.0f32;
+    let (hw0, hw1) = enc_vminnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 0x8000_0000, "minNum(+0,-0) must be -0");
+
+    // (-0, +0) — same expected result regardless of order
+    c.regs.s[2] = -0.0f32;
+    c.regs.s[4] = 0.0f32;
+    let (hw0, hw1) = enc_vminnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits(), 0x8000_0000, "minNum(-0,+0) must be -0");
+}
+
 // ----- VCVTB / VCVTT (F16 <-> F32) -----------------------------------------
 
 #[test]
@@ -4097,6 +4207,72 @@ fn fpu_vcvtb_f32_f16_infinity() {
     c.execute_one_wide(hw0, hw1);
     assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x7C00);
     assert_eq!(c.regs.s[0].to_bits() & 0xFFFF_0000, 0xDEAD_0000);
+}
+
+#[test]
+fn fpu_vcvtb_f16_f32_overflow() {
+    // Values too large to represent in f16 must saturate to +inf (0x7C00).
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1e30_f32;
+    // Preserve top half so we can verify only the bottom half is written.
+    c.regs.s[0] = f32::from_bits(0xAAAA_0000);
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x7C00, "1e30 -> f16 must be +inf");
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF_0000, 0xAAAA_0000);
+}
+
+#[test]
+fn fpu_vcvtb_f16_f32_underflow() {
+    // Values smaller than the smallest f16 subnormal must flush to +0 (0x0000).
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1e-10_f32;
+    c.regs.s[0] = f32::from_bits(0x5555_0000);
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x0000, "1e-10 -> f16 must be +0");
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF_0000, 0x5555_0000);
+}
+
+#[test]
+fn fpu_vcvtb_f16_f32_negative_zero_roundtrip() {
+    // -0.0f32 → f16 → f32 must preserve the negative-zero sign bit.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = -0.0f32;
+    c.regs.s[0] = 0.0f32;
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    // f16 -0 is 0x8000 in the bottom half.
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x8000);
+
+    // Convert back: VCVTB.F32.F16 S4, S0
+    let (hw0, hw1) = enc_vcvtb_f32_f16(4, 0);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[4].to_bits(), 0x8000_0000, "round-trip must preserve -0 sign");
+}
+
+// ----- VSEL with D=1 -------------------------------------------------------
+//
+// Regression test for the D-bit decode: the Armv8-M 0xFE encodings put the D
+// bit at hw0[4] rather than hw0[6] (where VFPv4 encodings have it). Picking
+// an odd Sd (here S1) forces D=1 and exercises that code path.
+
+#[test]
+fn fpu_vsel_d_bit_set() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 10.0;
+    c.regs.s[4] = 20.0;
+    c.regs.set_flag_z(true); // EQ true → pick Sn
+    // Sd = S1 (odd) → D bit = 1. Sn = S2, Sm = S4.
+    let (hw0, hw1) = enc_vsel(0, 1, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[1], 10.0);
+
+    // Flip Z → EQ false → should pick Sm, writing S1 again.
+    c.regs.set_flag_z(false);
+    let (hw0, hw1) = enc_vsel(0, 1, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[1], 20.0);
 }
 
 // ============================================================================

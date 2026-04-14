@@ -254,8 +254,7 @@ impl CortexM33 {
     //   hw0[7]=1  → VMAXNM/VMINNM (hw1[6]=op: 0=max, 1=min; hw0[6:5]=00)
 
     fn fpu_v8m_dp(&mut self, hw0: u16, hw1: u16) -> u32 {
-        // In the Armv8-M 0xFE encodings the D bit sits at hw0[4] (instead of
-        // hw0[6] used by the VFPv4 family), so we can't share `vfp_sd` here.
+        // The 0xFE family encodes D at hw0[4].
         let vd = ((hw1 >> 12) & 0xF) as usize;
         let d = ((hw0 >> 4) & 1) as usize;
         let sd = (vd << 1) | d;
@@ -869,6 +868,7 @@ fn fpu_minnum(a: f32, b: f32) -> f32 {
 // and silently treat AHP=1 the same as AHP=0 for now — see Phase 7 HLD §A.2.
 
 /// Convert IEEE binary16 bits to an f32 value.
+// TODO(phase-7.1): honor FPSCR.AHP (alternative half-precision encoding).
 fn f16_bits_to_f32(h: u16) -> f32 {
     let sign = ((h as u32) & 0x8000) << 16;
     let exp = ((h as u32) >> 10) & 0x1F;
@@ -907,6 +907,7 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 }
 
 /// Convert an f32 value to IEEE binary16 bits (round-to-nearest-even, AHP=0).
+// TODO(phase-7.1): honor FPSCR.AHP (alternative half-precision encoding).
 fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -919,6 +920,7 @@ fn f32_to_f16_bits(v: f32) -> u16 {
             sign | 0x7C00
         } else {
             // Quiet NaN: preserve top 10 payload bits, force quiet bit.
+            // IEEE: sNaN must quieten; payload in bits [12:0] of f32 is lost — spec-allowed.
             let payload = (frac >> 13) as u16;
             sign | 0x7E00 | (payload & 0x1FF)
         };
