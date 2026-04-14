@@ -733,6 +733,8 @@ impl CortexM33 {
                     match hint_op {
                         0x0 | 0x1 => 1,                       // NOP, YIELD
                         0x2 => self.wfe(bus),                  // WFE
+                        // FPU × sleep (HLD §B.7): WFI/WFE retain S0-S31 +
+                        // FPSCR and do NOT clear FPCCR.LSPACT.
                         0x3 => 1,                              // WFI (NOP)
                         0x4 => { bus.signal_sev(); 1 },        // SEV
                         _ => 1,                                // Reserved

@@ -1037,7 +1037,13 @@ impl Bus {
                 let core = self.active_core();
                 self.ppb[core].write32(addr, val);
             }
-            _ => {}
+            // Unmapped regions raise a precise bus fault so flush-style
+            // writers (Phase 7 Stage B lazy FP) and other speculative
+            // stores see the failure. Mirrors the read32 unmapped path.
+            _ => {
+                self.bus_fault = true;
+                self.bus_fault_addr = addr;
+            }
         }
     }
 }

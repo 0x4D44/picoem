@@ -324,6 +324,30 @@ impl CortexM33 {
         self.dcp_halves[idx * 2] = bits as u32;
         self.dcp_halves[idx * 2 + 1] = (bits >> 32) as u32;
     }
+
+    // --- Phase 7 Stage B test/integration accessors ----------------------
+
+    /// True if a synchronous fault is pending delivery on the next step().
+    /// Used by integration tests to observe lazy-FP and stack-limit faults
+    /// without needing to wire up a fault handler.
+    #[doc(hidden)]
+    pub fn has_pending_fault(&self) -> bool {
+        self.pending_fault.is_some()
+    }
+
+    /// Direct exception entry — wraps the crate-internal `enter_exception`
+    /// for integration tests that want to drive the FP-frame paths
+    /// without synthesizing instructions.
+    #[doc(hidden)]
+    pub fn test_enter_exception(&mut self, exc_num: u16, bus: &mut Bus) -> u32 {
+        self.enter_exception(exc_num, bus)
+    }
+
+    /// Direct exception return — wraps the crate-internal `exit_exception`.
+    #[doc(hidden)]
+    pub fn test_exit_exception(&mut self, exc_return: u32, bus: &mut Bus) -> u32 {
+        self.exit_exception(exc_return, bus)
+    }
 }
 
 impl Default for CortexM33 {

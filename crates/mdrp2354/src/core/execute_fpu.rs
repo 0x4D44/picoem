@@ -533,6 +533,30 @@ impl CortexM33 {
             return self.thumb32_undefined(hw0, hw1);
         }
 
+        // Phase 7 Stage B: lazy FP context flush. If a prior exception
+        // entry deferred the FP register write (FPCCR.LSPACT=1), flush
+        // S0-S15 + FPSCR to the reserved frame *before* the first in-
+        // handler FP op. On flush failure, LSPACT is left set so a retry
+        // or exception-return sees the unflushed state; the fault itself
+        // is signalled via `bus.bus_fault` (for BusFault) or, in future,
+        // `self.pending_fault = Fault::MemManage` set inside
+        // flush_lazy_fp_context. Either way, we return zero cycles and
+        // let step() deliver the fault. After a successful flush (or if
+        // no flush was needed), set CONTROL.FPCA=1 — this is the only
+        // site that turns FPCA on.
+        let core_idx = bus.active_core();
+        if bus.ppb[core_idx].fpccr & crate::bus::ppb::FPCCR_LSPACT != 0 {
+            match self.flush_lazy_fp_context(bus) {
+                Ok(()) => {
+                    bus.ppb[bus.active_core()].fpccr &= !crate::bus::ppb::FPCCR_LSPACT;
+                }
+                Err(()) => {
+                    return 0;
+                }
+            }
+        }
+        self.regs.control |= crate::core::exceptions::CONTROL_FPCA;
+
         // Armv8-M FP extensions (VSEL, VMAXNM, VMINNM) are encoded with the
         // 0xFE prefix; the existing VFPv4 ops live under 0xEE.
         // `(hw1 & 0x10) == 0` means "CDP form" — the data-processing branch.
@@ -1128,6 +1152,61 @@ impl CortexM33 {
                 count as u32 // store: N cycles
             }
         }
+    }
+
+    /// Flush lazy FP context.
+    ///
+    /// Called from `fpu_execute` when FPCCR.LSPACT=1 — meaning a prior
+    /// exception entry reserved space at FPCAR but deferred the actual
+    /// S0-S15 + FPSCR write. Walks the reserved 18-word frame and writes
+    /// the 17 live values (S0..S15 + FPSCR; the trailing word is
+    /// architecturally reserved). Per HLD §B.8, on failure we leave
+    /// LSPACT set so a retry or exception-return sees the unflushed state.
+    ///
+    /// # Fault signalling
+    ///
+    /// Failures are communicated through two orthogonal channels rather
+    /// than a `Fault` enum:
+    ///   * **BusFault** — a bus-side write abort sets `bus.bus_fault = true`
+    ///     (picked up by `step()` in the main loop) and this function
+    ///     records the abort in `FPCCR.BFRDY`. `step()` then delivers the
+    ///     BusFault via `enter_exception(5)`.
+    ///   * **MemManage** — *not yet wired*. When Stage E enforces the MPU
+    ///     on data writes, this function will also set `FPCCR.MMRDY` and
+    ///     assign `self.pending_fault = Some(Fault::MemManage)` directly.
+    ///
+    /// The `Err(())` return is purely a signal that the flush aborted;
+    /// the caller just reports zero cycles and lets `step()` pick up the
+    /// side-channel bus-fault flag (or, in future, the pending MemManage).
+    /// Using a unit error avoids fabricating a `Fault::UsageFault` that
+    /// is never actually delivered (step() catches the bus flag first).
+    pub(crate) fn flush_lazy_fp_context(
+        &mut self,
+        bus: &mut Bus,
+    ) -> Result<(), ()> {
+        let core = bus.active_core();
+        let base = bus.ppb[core].fpcar;
+
+        // S0..S15 → +0..+60.
+        for i in 0..16 {
+            bus.write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits());
+            if bus.bus_fault() {
+                bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
+                return Err(());
+            }
+        }
+        // FPSCR → +64; reserved → +68 (write zero per architecture).
+        bus.write32(base.wrapping_add(64), self.regs.fpscr);
+        if bus.bus_fault() {
+            bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
+            return Err(());
+        }
+        bus.write32(base.wrapping_add(68), 0);
+        if bus.bus_fault() {
+            bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
+            return Err(());
+        }
+        Ok(())
     }
 }
 

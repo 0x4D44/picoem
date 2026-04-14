@@ -1,3 +1,12 @@
+// FPCCR bit positions (DDI0553 §D1.2.32). Public so other crate modules
+// (exceptions.rs, execute_fpu.rs) can reference them by name.
+pub const FPCCR_LSPACT:    u32 = 1 << 0;
+pub const FPCCR_MMRDY:     u32 = 1 << 5;
+pub const FPCCR_BFRDY:     u32 = 1 << 6;
+pub const FPCCR_SPLIMVIOL: u32 = 1 << 9;
+pub const FPCCR_LSPEN:     u32 = 1 << 30;
+pub const FPCCR_ASPEN:     u32 = 1 << 31;
+
 /// Per-core Private Peripheral Bus state (NVIC, SCB, SysTick stubs).
 /// Phase 3: slim — only what the bootrom needs.
 pub struct Ppb {
@@ -14,6 +23,34 @@ pub struct Ppb {
     pub bfar: u32,      // Bus Fault Address (0xE000ED38)
     pub cpacr: u32,     // Coprocessor Access Control (0xE000ED88)
     pub icsr: u32,      // Interrupt Control/State (0xE000ED04)
+
+    // FP extension registers (Phase 7 Stage B — DDI0553 §D1.2.32-34)
+    //
+    // Invariants enforced by the emulator:
+    //   1. CONTROL.FPCA=1 ⇒ S0-S31 + FPSCR are live thread-mode state.
+    //   2. FPCCR.LSPACT=1 ⇒ FPCAR points at a reserved FP frame; S0-S15
+    //      and FPSCR are still the pre-exception values, not yet written.
+    //   3. EXC_RETURN[4]=0 ⇒ exception entry reserved 18 words above the
+    //      basic frame.
+    //   4. Only fpu_execute writes FPCA=1; only enter_exception/
+    //      exit_exception write FPCA=0 / restore it.
+    //
+    /// FP Context Control Register. Reset 0xC000_0000 (ASPEN=1, LSPEN=1).
+    /// Bit layout per DDI0553 §D1.2.32:
+    ///   [0] LSPACT   [1] USER     [2] S        [3] THREAD
+    ///   [4] HFRDY    [5] MMRDY    [6] BFRDY    [7] SFRDY
+    ///   [8] MONRDY   [9] SPLIMVIOL [10] UFRDY  (11-25 reserved)
+    ///   [26] TS      [27] CLRONRETS [28] CLRONRET
+    ///   [29] LSPENS  [30] LSPEN   [31] ASPEN
+    /// Emulator actively models: ASPEN, LSPEN, LSPACT, SPLIMVIOL,
+    /// MMRDY, BFRDY. Others are RW storage but inert.
+    pub fpccr: u32,
+    /// FP Context Address Register. Writes mask bits [2:0] to 0
+    /// (8-byte alignment).
+    pub fpcar: u32,
+    /// FP Default Status Control. Template for FPSCR at exception entry;
+    /// active bits are AHP (26), DN (25), FZ (24), RMODE (23:22).
+    pub fpdscr: u32,
 
     // MPU (0xE000ED94-0xE000EDA0)
     pub mpu_ctrl: u32,                 // MPU Control (0xE000ED94)
@@ -41,6 +78,10 @@ impl Default for Ppb {
             bfar: 0,
             cpacr: 0x00F0_0000, // CP10/11 (FPU) full access
             icsr: 0,
+            // ASPEN=1 (auto FP context save), LSPEN=1 (lazy enabled).
+            fpccr: 0xC000_0000,
+            fpcar: 0,
+            fpdscr: 0,
             mpu_ctrl: 0,
             mpu_rnr: 0,
             mpu_regions: [(0, 0); 16],
@@ -126,6 +167,11 @@ impl Ppb {
 
             // CPACR
             0xED88 => self.cpacr,
+
+            // FPCCR / FPCAR / FPDSCR (Phase 7 Stage B)
+            0xEF34 => self.fpccr,
+            0xEF38 => self.fpcar,
+            0xEF3C => self.fpdscr,
 
             // MPU_TYPE: 16 regions on RP2350 Cortex-M33
             0xED90 => 0x0000_1000, // DREGION=16, IREGION=0, SEPARATE=0
@@ -232,6 +278,13 @@ impl Ppb {
 
             // CPACR
             0xED88 => self.cpacr = val,
+
+            // FPCCR / FPCAR / FPDSCR (Phase 7 Stage B). FPCAR is force-aligned
+            // to 8 bytes (DDI0553 §D1.2.33). FPCCR has reserved bits but no
+            // mask is applied — software is allowed to write the full word.
+            0xEF34 => self.fpccr = val,
+            0xEF38 => self.fpcar = val & !0x7,
+            0xEF3C => self.fpdscr = val,
 
             // MPU_TYPE: read-only
             0xED90 => {}
@@ -419,6 +472,43 @@ mod tests {
         let mut ppb = Ppb::default();
         ppb.write32(0xE000_EDD4, 0xDEAD);
         assert_eq!(ppb.read32(0xE000_EDD4), 8);
+    }
+
+    // ----------------------------------------------------------------
+    // FP extension registers (Phase 7 Stage B)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_fpccr_reset_value() {
+        let ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_EF34), 0xC000_0000);
+        assert_eq!(ppb.fpccr & FPCCR_ASPEN, FPCCR_ASPEN);
+        assert_eq!(ppb.fpccr & FPCCR_LSPEN, FPCCR_LSPEN);
+        assert_eq!(ppb.fpccr & FPCCR_LSPACT, 0);
+    }
+
+    #[test]
+    fn test_fpccr_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EF34, 0xDEAD_BEEF);
+        assert_eq!(ppb.read32(0xE000_EF34), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn test_fpcar_alignment_mask() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EF38, 0x2000_1007);
+        // Bits [2:0] are forced to 0.
+        assert_eq!(ppb.read32(0xE000_EF38), 0x2000_1000);
+    }
+
+    #[test]
+    fn test_fpdscr_roundtrip() {
+        let mut ppb = Ppb::default();
+        // Set AHP=1, DN=1, FZ=1, RMODE=10 (round toward -inf).
+        ppb.write32(0xE000_EF3C, (1 << 26) | (1 << 25) | (1 << 24) | (0b10 << 22));
+        assert_eq!(ppb.read32(0xE000_EF3C),
+            (1 << 26) | (1 << 25) | (1 << 24) | (0b10 << 22));
     }
 
     #[test]

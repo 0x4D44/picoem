@@ -850,6 +850,9 @@ impl CortexM33 {
                 0x00 => 1,                              // NOP.W
                 0x01 => 1,                              // YIELD.W
                 0x02 => self.wfe(bus),                   // WFE.W
+                // FPU × sleep (HLD §B.7): WFI/WFE retain S0-S31 + FPSCR
+                // and do NOT clear FPCCR.LSPACT. Resume continues with
+                // pre-sleep FP state intact.
                 0x03 => 1,                              // WFI.W
                 0x04 => { bus.signal_sev(); 1 },         // SEV.W
                 _ => self.thumb32_undefined(hw0, hw1),
@@ -940,10 +943,14 @@ impl CortexM33 {
             19 => {
                 self.regs.faultmask = val & 1;
             }
-            // CONTROL — nPRIV, SPSEL, FPCA; must sync SP around the switch
+            // CONTROL — nPRIV, SPSEL; must sync SP around the switch.
+            // Per DDI0553 §B3.4.1, MSR cannot change FPCA (bit 2) — that bit
+            // is owned exclusively by fpu_execute / enter_exception /
+            // exit_exception. Preserve the current FPCA across the write.
             20 => {
                 self.regs.sync_sp_to_banked();
-                self.regs.control = val & 0x7;
+                let preserved_fpca = self.regs.control & 0x4;
+                self.regs.control = (val & 0x3) | preserved_fpca;
                 self.regs.sync_sp_from_banked();
             }
             // --- Non-Secure banked registers (ARMv8-M, SYSm bit 7 = NS) ---
@@ -955,7 +962,11 @@ impl CortexM33 {
             0x90 => self.regs.primask_ns = val & 1,     // PRIMASK_NS
             0x91 => self.regs.basepri_ns = val & 0xFF,  // BASEPRI_NS
             0x93 => self.regs.faultmask_ns = val & 1,   // FAULTMASK_NS
-            0x94 => self.regs.control_ns = val & 0x7,   // CONTROL_NS
+            0x94 => {
+                // CONTROL_NS — same FPCA-preservation rule as Secure CONTROL.
+                let preserved_fpca = self.regs.control_ns & 0x4;
+                self.regs.control_ns = (val & 0x3) | preserved_fpca;
+            }
             _ => {} // reserved — ignore
         }
         1 // M33 measured: 1 cycle

@@ -1,5 +1,24 @@
 use crate::bus::Bus;
+use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY,
+    FPCCR_SPLIMVIOL};
 use super::{CortexM33, Fault};
+
+/// CONTROL.FPCA bit position (bit 2). Owned exclusively by the three sites
+/// in this file plus `fpu_execute`; see `Ppb` field doc invariants.
+pub(crate) const CONTROL_FPCA: u32 = 1 << 2;
+
+/// CFSR.UFSR.STKOF (bit 20) — stack overflow during hardware exception entry.
+/// Set by the stack-limit check in `enter_exception` when the reserved frame
+/// (basic + optional FP region) would underflow past M/PSPLIM. Phase 7
+/// Stage B introduced the FP-region contribution.
+const UFSR_STKOF: u32 = 1 << 20;
+
+/// CFSR.UFSR.INVPC (bit 17) — integrity check failure on EXC_RETURN.
+/// Set by `exit_exception` on an FP-frame mismatch: either EXC_RETURN[4]=0
+/// claims an FP frame but no entry path ever reserved one (FPCAR=0 and
+/// LSPACT=0), or EXC_RETURN[4]=1 claims no FP frame but FPCCR.LSPACT=1 is
+/// still set from a lazy reserve at entry.
+const UFSR_INVPC: u32 = 1 << 17;
 
 impl CortexM33 {
     // --- EXC_RETURN detection ---
@@ -51,10 +70,40 @@ impl CortexM33 {
         let use_psp = !self.regs.in_handler_mode() && self.regs.active_sp_is_psp();
         let original_sp = if use_psp { self.regs.psp } else { self.regs.msp };
 
+        // FP frame: thread mode with CONTROL.FPCA=1 forces FType=0 (FP frame
+        // present). DDI0553 §B3.4.3. Per HLD §B.4 and Phase 7 stub: only
+        // FPCA=1 → FP frame; we don't recompute via FPCCR.ASPEN since
+        // fpu_execute is the sole FPCA-on writer.
+        let had_fp = self.regs.control & CONTROL_FPCA != 0;
+
         // 8-byte align with padding tracking (CCR.STKALIGN is RAO on M33)
         let aligned_sp = original_sp & !0x7;
-        let frame_sp = aligned_sp.wrapping_sub(32);
+        let basic_frame: u32 = 32;
+        // Extra FP region: 18 words = S0-S15 + FPSCR + 1 reserved.
+        let fp_extra: u32 = if had_fp { 72 } else { 0 };
+        let frame_sp = aligned_sp.wrapping_sub(basic_frame + fp_extra);
         let was_padded = aligned_sp != original_sp;
+
+        // Stack-limit check (Armv8-M MSPLIM/PSPLIM, §B3.4.1). Compares
+        // before any frame writes. On violation, raise UsageFault with
+        // UFSR.STKOF (bit 20 of CFSR). Additionally, per DDI0553 §D1.2.32,
+        // FPCCR.SPLIMVIOL is set iff the FP region specifically caused
+        // the violation — i.e. the basic frame alone would have fit but
+        // adding the FP region pushes the SP past the limit. If the
+        // basic frame alone already underflows, SPLIMVIOL stays clear
+        // (the violation is not attributable to FP context).
+        let limit = if use_psp { self.regs.psplim } else { self.regs.msplim };
+        if frame_sp < limit {
+            let core = bus.active_core();
+            if had_fp && aligned_sp.wrapping_sub(basic_frame) >= limit {
+                // Basic frame alone would fit; the FP region drove the
+                // underflow → SPLIMVIOL attributable to FP.
+                bus.ppb[core].fpccr |= FPCCR_SPLIMVIOL;
+            }
+            bus.ppb[core].cfsr |= UFSR_STKOF;
+            self.pending_fault = Some(Fault::UsageFault);
+            return 0;
+        }
 
         // Encode IT state and alignment padding into stacked xPSR.
         // Mask IT bits [26:25,15:10] from base xPSR first to avoid OR corruption
@@ -75,6 +124,42 @@ impl CortexM33 {
         bus.write32(frame_sp.wrapping_add(24), self.return_address(exc_num));
         bus.write32(frame_sp.wrapping_add(28), stacked_xpsr);
 
+        // FP context — eager (LSPEN=0) writes S0-S15 + FPSCR now; lazy
+        // (LSPEN=1, default) reserves the slots and sets FPCCR.LSPACT
+        // so the first FP op in handler mode performs the flush.
+        if had_fp {
+            let fp_region_sp = frame_sp.wrapping_add(basic_frame);
+            let core = bus.active_core();
+            let lspen = bus.ppb[core].fpccr & FPCCR_LSPEN != 0;
+            // Always record FPCAR — needed by lazy path and by the
+            // exit-pop path when LSPACT is cleared.
+            bus.ppb[core].fpcar = fp_region_sp;
+            if lspen {
+                // Lazy: do not write S0-S15. Mark LSPACT so the first
+                // in-handler FP op flushes; clear any stale RDY bits we
+                // leave behind from a prior fault.
+                bus.ppb[core].fpccr |= FPCCR_LSPACT;
+                bus.ppb[core].fpccr &= !(FPCCR_MMRDY | FPCCR_BFRDY);
+            } else {
+                // Eager: write S0-S15 + FPSCR + reserved word. Layout
+                // per DDI0553 §B3.4.3 ExceptionEntry pseudocode.
+                for i in 0..16 {
+                    bus.write32(
+                        fp_region_sp.wrapping_add((i as u32) * 4),
+                        self.regs.s[i].to_bits(),
+                    );
+                }
+                bus.write32(fp_region_sp.wrapping_add(64), self.regs.fpscr);
+                bus.write32(fp_region_sp.wrapping_add(68), 0);
+            }
+            // Reset FPSCR from FPDSCR active bits: AHP[26], DN[25],
+            // FZ[24], RMODE[23:22] (DDI0553 §B3.4.3). Cumulative
+            // exception flags are NOT cleared by exception entry.
+            let fpdscr_mask: u32 = (1 << 26) | (1 << 25) | (1 << 24) | (0b11 << 22);
+            let fpdscr = bus.ppb[core].fpdscr & fpdscr_mask;
+            self.regs.fpscr = (self.regs.fpscr & !fpdscr_mask) | fpdscr;
+        }
+
         // Update SP
         if use_psp {
             self.regs.psp = frame_sp;
@@ -83,13 +168,17 @@ impl CortexM33 {
         }
 
         // FIXME(trustzone): these values don't encode the S bit — NS exceptions will claim Secure return
-        // Set LR to EXC_RETURN (Armv8-M, non-secure, no FP frame)
-        self.regs.r[14] = if self.regs.in_handler_mode() {
-            0xFFFF_FFF1 // return to Handler, MSP
+        // Set LR to EXC_RETURN (Armv8-M, non-secure). Bit [4] = FType: 0
+        // means an FP frame is present (so 0xFFFF_FFE_) and 1 means no FP
+        // frame (so 0xFFFF_FFF_, matching Phase 3 behavior). The S=1 stub
+        // is preserved per HLD §2 non-goals.
+        let base = if had_fp { 0xFFFF_FFE0_u32 } else { 0xFFFF_FFF0_u32 };
+        self.regs.r[14] = base | if self.regs.in_handler_mode() {
+            0x1 // return to Handler, MSP
         } else if use_psp {
-            0xFFFF_FFFD // return to Thread, PSP
+            0xD // return to Thread, PSP
         } else {
-            0xFFFF_FFF9 // return to Thread, MSP
+            0x9 // return to Thread, MSP
         };
 
         // Fetch vector from table
@@ -97,9 +186,12 @@ impl CortexM33 {
         let vector = bus.read32(vtor.wrapping_add((exc_num as u32) * 4));
         self.regs.set_pc(vector & !1);
 
-        // Enter handler mode: set IPSR, force MSP, clear IT
+        // Enter handler mode: set IPSR, force MSP, clear IT.
+        // Clear CONTROL.FPCA: handler enters as a non-FP-active context
+        // (the saved/lazy frame remembers prior thread state).
         self.regs.xpsr = (self.regs.xpsr & !0x1FF) | (exc_num as u32);
         self.regs.control &= !2; // handler always MSP
+        self.regs.control &= !CONTROL_FPCA;
         self.regs.sync_sp_from_banked();
         self.it_state = 0;
 
@@ -113,9 +205,47 @@ impl CortexM33 {
         let active_exc = self.regs.ipsr(); // capture BEFORE popping
 
         let return_to_psp = exc_return & 0x4 != 0;
+        // FType=0 (bit 4 clear) ⇒ FP frame present and must be unwound.
+        let had_fp_frame = exc_return & 0x10 == 0;
+
+        // Integrity check (DDI0553 §B3.4.4 ExceptionReturn): EXC_RETURN[4]
+        // must match the FP state reserved at entry. Two inconsistent-state
+        // cases both raise UsageFault.INVPC:
+        //
+        //   1. FType=0 (had_fp_frame) but no entry path ever reserved an FP
+        //      frame — FPCAR=0 and LSPACT=0. LR was fabricated.
+        //   2. FType=1 (no_fp_frame) but FPCCR.LSPACT=1 — a lazy reservation
+        //      from entry is still outstanding, so the handler is returning
+        //      with an EXC_RETURN that claims no FP context despite one
+        //      being architecturally pending. Silently clearing LSPACT would
+        //      leave FPCAR pointing at (potentially) stale stack memory, so
+        //      the next thread-mode FP op would flush into that region.
+        //      The spec-correct response is to catch the mismatch.
+        //
+        // Rationale for not silent-clearing: the integrity check catches the
+        // handler bug; a silent clear would mask it and allow a stale-FPCAR
+        // flush to corrupt memory on the next FP op.
+        {
+            let core = bus.active_core();
+            let fpccr = bus.ppb[core].fpccr;
+            let lspact = fpccr & FPCCR_LSPACT != 0;
+            let bogus = if had_fp_frame {
+                // Case 1: FType=0 but nothing reserved.
+                !lspact && bus.ppb[core].fpcar == 0
+            } else {
+                // Case 2: FType=1 but a lazy reservation is outstanding.
+                lspact
+            };
+            if bogus {
+                bus.ppb[core].cfsr |= UFSR_INVPC;
+                self.pending_fault = Some(Fault::UsageFault);
+                return 0;
+            }
+        }
+
         let sp = if return_to_psp { self.regs.psp } else { self.regs.msp };
 
-        // Pop frame
+        // Pop basic frame
         self.regs.r[0] = bus.read32(sp);
         self.regs.r[1] = bus.read32(sp.wrapping_add(4));
         self.regs.r[2] = bus.read32(sp.wrapping_add(8));
@@ -127,8 +257,34 @@ impl CortexM33 {
 
         self.regs.set_pc(return_pc & !1);
 
+        // FP frame restore (HLD §B.6).
+        //   LSPACT=1 → handler never touched FP. S0-S15 still hold the
+        //              pre-exception values; just skip the pop and clear
+        //              LSPACT. FPSCR retains the in-handler value (which
+        //              equals the pre-exception value — see fpu_execute).
+        //   LSPACT=0 → an FP op in the handler triggered the lazy flush,
+        //              or eager mode wrote the frame. Pop S0-S15 + FPSCR.
+        if had_fp_frame {
+            let core = bus.active_core();
+            let fp_region_sp = sp.wrapping_add(32);
+            let lspact = bus.ppb[core].fpccr & FPCCR_LSPACT != 0;
+            if lspact {
+                bus.ppb[core].fpccr &= !FPCCR_LSPACT;
+            } else {
+                for i in 0..16 {
+                    let bits = bus.read32(fp_region_sp.wrapping_add((i as u32) * 4));
+                    self.regs.s[i] = f32::from_bits(bits);
+                }
+                self.regs.fpscr = bus.read32(fp_region_sp.wrapping_add(64));
+            }
+        }
+
         // Alignment padding check (bit 9 of stacked xPSR)
-        let frame_size: u32 = if return_xpsr & (1 << 9) != 0 { 36 } else { 32 };
+        let mut frame_size: u32 = if return_xpsr & (1 << 9) != 0 { 36 } else { 32 };
+        if had_fp_frame {
+            // FP region is 18 words = 72 bytes.
+            frame_size = frame_size.saturating_add(72);
+        }
 
         // Restore xPSR: clear bit 9 (frame metadata) and IT bits [26:25,15:10]
         // (IT state lives in the separate it_state field, not in xPSR)
@@ -143,8 +299,14 @@ impl CortexM33 {
             self.regs.msp = sp.wrapping_add(frame_size);
         }
 
-        // Restore SPSEL
+        // Restore SPSEL and FPCA. CONTROL.FPCA = NOT EXC_RETURN[4]: an FP
+        // frame on entry implies FP-active thread state to resume.
         self.regs.control = (self.regs.control & !2) | if return_to_psp { 2 } else { 0 };
+        if had_fp_frame {
+            self.regs.control |= CONTROL_FPCA;
+        } else {
+            self.regs.control &= !CONTROL_FPCA;
+        }
         self.regs.sync_sp_from_banked();
 
         // Clear active exception
