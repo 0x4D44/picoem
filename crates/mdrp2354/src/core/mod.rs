@@ -13,6 +13,10 @@ pub use registers::Registers;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Fault {
     UsageFault,
+    #[allow(dead_code)] // constructed by Phase 7 Stage E (MPU lazy-FP flush)
+    MemManage,
+    #[allow(dead_code)] // constructed by Phase 7 Stage B (RCP assertion)
+    Nmi,
     // BusFault is delivered via bus.bus_fault() flag, not this enum
 }
 

@@ -189,6 +189,20 @@ impl CortexM33 {
                     self.enter_exception(3, bus) // escalate to HardFault
                 }
             }
+            Fault::MemManage => {
+                // Set MMFSR.DACCVIOL (bit 1 of CFSR). Data-side is the honest default:
+                // Phase 7 Stage B's MPU-fault-during-lazy-flush use case is data-side.
+                bus.ppb[core].cfsr |= 1 << 1;
+                if bus.ppb[core].shcsr & (1 << 16) != 0 {
+                    // MEMFAULTENA
+                    self.enter_exception(4, bus)
+                } else {
+                    bus.ppb[bus.active_core()].hfsr |= 1 << 30; // FORCED
+                    self.enter_exception(3, bus) // escalate to HardFault
+                }
+            }
+            // NMI has no enable bit; FAULTMASK is not re-checked at delivery (handled upstream if needed).
+            Fault::Nmi => self.enter_exception(2, bus),
         }
     }
 
@@ -300,5 +314,91 @@ impl CortexM33 {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bus::Bus;
+    use crate::core::{CortexM33, Fault};
+
+    /// Address of the synthetic vector table base (relocated into SRAM so
+    /// we can populate it).
+    const VT_BASE: u32 = 0x2000_0000;
+    /// Address of the synthetic handler (BKPT 0). Vectors below point here
+    /// with bit 0 set for Thumb state.
+    const HANDLER_ADDR: u32 = 0x2000_0100;
+    /// Vector value (HANDLER_ADDR | 1 for Thumb).
+    const HANDLER_VEC: u32 = HANDLER_ADDR | 1;
+
+    /// Build a core + bus with MSP pointing at valid SRAM so exception
+    /// frame pushes don't trigger a bus fault during delivery. Also
+    /// installs a synthetic vector table at VT_BASE and points VTOR at
+    /// it so enter_exception lands on a known handler address rather
+    /// than reading a zero vector from the default (zero-filled) table.
+    fn core_and_bus() -> (CortexM33, Bus) {
+        let mut cpu = CortexM33::new();
+        cpu.regs.msp = 0x2000_1000;
+        cpu.regs.r[13] = cpu.regs.msp;
+
+        let mut bus = Bus::default();
+
+        // Relocate VTOR into writable SRAM and populate vectors for the
+        // exceptions exercised by these tests: NMI (2), HardFault (3),
+        // MemManage (4).
+        let core = bus.active_core();
+        bus.ppb[core].vtor = VT_BASE;
+        bus.write32(VT_BASE + 8,  HANDLER_VEC); // NMI       (exc 2)
+        bus.write32(VT_BASE + 12, HANDLER_VEC); // HardFault (exc 3)
+        bus.write32(VT_BASE + 16, HANDLER_VEC); // MemManage (exc 4)
+        // BKPT 0 (0xBE00) at the handler address — we don't execute it in
+        // these unit tests, but it makes the handler well-defined.
+        bus.write32(HANDLER_ADDR, 0x0000_BE00);
+
+        (cpu, bus)
+    }
+
+    #[test]
+    fn test_nmi_delivered() {
+        let (mut cpu, mut bus) = core_and_bus();
+        cpu.pending_fault = Some(Fault::Nmi);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 2);
+        assert_eq!(cpu.regs.pc(), HANDLER_ADDR);
+    }
+
+    #[test]
+    fn test_memmanage_enabled() {
+        let (mut cpu, mut bus) = core_and_bus();
+        bus.ppb[0].shcsr |= 1 << 16; // MEMFAULTENA
+        cpu.pending_fault = Some(Fault::MemManage);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 4);
+        assert_eq!(cpu.regs.pc(), HANDLER_ADDR);
+    }
+
+    #[test]
+    fn test_memmanage_disabled_escalates() {
+        let (mut cpu, mut bus) = core_and_bus();
+        bus.ppb[0].shcsr &= !(1 << 16); // MEMFAULTENA cleared
+        cpu.pending_fault = Some(Fault::MemManage);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_ne!(bus.ppb[0].hfsr & (1 << 30), 0, "HFSR.FORCED should be set");
+        assert_eq!(cpu.regs.pc(), HANDLER_ADDR);
+    }
+
+    #[test]
+    fn test_memmanage_sets_mmfsr_daccviol() {
+        let (mut cpu, mut bus) = core_and_bus();
+        bus.ppb[0].shcsr |= 1 << 16; // MEMFAULTENA
+        cpu.pending_fault = Some(Fault::MemManage);
+        cpu.step(&mut bus);
+        assert_ne!(bus.ppb[0].cfsr & 0x2, 0, "MMFSR.DACCVIOL (bit 1) should be set");
+        // Pin this as the non-escalated path: IPSR must be MemManage (4),
+        // not HardFault (3). MMFSR.DACCVIOL would also be set after
+        // escalation, so asserting IPSR is what distinguishes the paths.
+        assert_eq!(cpu.regs.ipsr(), 4);
+        assert_eq!(cpu.regs.pc(), HANDLER_ADDR);
     }
 }
