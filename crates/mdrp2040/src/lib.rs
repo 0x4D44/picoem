@@ -150,56 +150,83 @@ impl Emulator {
         self.bus.load_bootrom(data);
     }
 
-    /// Load an XIP flash image (appears at XIP address `0x1000_0000`).
+    /// Load an XIP flash image (appears at XIP address `0x1000_0000`
+    /// and its aliases `0x1100_0000`, `0x1200_0000`, `0x1300_0000`).
+    ///
+    /// Oversized images are silently clamped to the 2 MB flash window
+    /// (see [`crate::memory::FLASH_SIZE`]). Reads past the loaded
+    /// length within the window return 0.
     pub fn load_flash(&mut self, data: &[u8]) {
-        self.bus.load_flash(data);
+        let clamped = if data.len() > memory::FLASH_SIZE {
+            &data[..memory::FLASH_SIZE]
+        } else {
+            data
+        };
+        self.bus.load_flash(clamped);
     }
 
     /// Advance the system by up to `step_quantum` master-clock cycles,
     /// then tick peripherals once. Returns the number of cycles actually
-    /// consumed in this quantum (may be less than `step_quantum` if
-    /// core 0 halts mid-quantum).
+    /// consumed in this quantum (may be less than `step_quantum` if both
+    /// cores halt mid-quantum).
     ///
     /// Per-instruction interleaving of core 0 and core 1 is preserved so
     /// that bank contention timing on core 1 (`contention_check_active`)
-    /// still accounts +1 cycle on same-port accesses. Per-instruction
-    /// FIFO wake checks (`maybe_wake_core1`) also remain so a FIFO write
-    /// from core 0 wakes core 1 within the same quantum.
+    /// still accounts +1 cycle on same-port accesses. Each core is armed
+    /// independently per iteration — core 1 can continue running while
+    /// core 0 is halted, and vice-versa. Per-instruction FIFO wake
+    /// checks (`maybe_wake_core1`) also remain so a FIFO write from
+    /// core 0 wakes core 1 within the same quantum.
     ///
     /// Dual-core schedule (per inner-loop iteration):
-    /// 1. Step core 0 — fetch/decode/execute one instruction.
+    /// 1. If core 0 is not halted, step it — fetch/decode/execute one
+    ///    instruction.
     /// 2. If core 1 is not halted, step it with `contention_check_active`
     ///    so same-bank SRAM accesses incur +1 cycle.
+    /// 3. Advance the master clock by `max(c0, c1)` — both cores share
+    ///    one clock on real silicon.
     ///
-    /// Once `clock.cycles >= target` (or core 0 halts), advance both PIO
-    /// blocks by the quantum's total consumed cycles, merge GPIO
-    /// outputs, and run wake checks. Mirrors `mdrp2350::Emulator::step`'s
-    /// quantum-end peripheral model; differs in per-iteration core
-    /// interleaving, which is required here to preserve bank-contention
-    /// timing on core 1.
+    /// The loop exits when `clock.cycles >= target` or both cores are
+    /// halted. Then advance both PIO blocks by the quantum's total
+    /// consumed cycles, merge GPIO outputs, and run wake checks. Mirrors
+    /// `mdrp2350::Emulator::step`'s quantum-end peripheral model; differs
+    /// in per-iteration core interleaving, which is required here to
+    /// preserve bank-contention timing on core 1.
     pub fn step(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
         let start = self.clock.cycles;
         let target = start.wrapping_add(self.step_quantum as u64);
 
-        while self.clock.cycles < target && !self.cores[0].is_halted() {
-            self.bus.set_active_core(0);
-            let c0 = self.cores[0].step(&mut self.bus) as u64;
-            self.maybe_wake_core1(0);
+        while self.clock.cycles < target
+            && (!self.cores[0].is_halted() || !self.cores[1].is_halted())
+        {
+            let c0 = if !self.cores[0].is_halted() {
+                self.bus.set_active_core(0);
+                let c = self.cores[0].step(&mut self.bus) as u64;
+                self.maybe_wake_core1(0);
+                c
+            } else {
+                0
+            };
 
-            if !self.cores[1].is_halted() {
+            let c1 = if !self.cores[1].is_halted() {
                 self.bus.set_active_core(1);
                 self.bus.begin_core1_step();
-                let _ = self.cores[1].step(&mut self.bus);
+                let c = self.cores[1].step(&mut self.bus) as u64;
                 self.bus.end_core1_step();
                 self.maybe_wake_core1(1);
+                c
             } else {
                 // Still clear any leftover bank-tracking state so the
                 // next iteration starts fresh.
                 self.bus.end_core1_step();
-            }
+                0
+            };
 
-            self.clock.cycles = self.clock.cycles.wrapping_add(c0);
+            if c0 == 0 && c1 == 0 {
+                break;
+            }
+            self.clock.cycles = self.clock.cycles.wrapping_add(c0.max(c1));
         }
 
         let consumed = self.clock.cycles.wrapping_sub(start);
@@ -354,6 +381,7 @@ impl Emulator {
 pub struct EmulatorBuilder {
     config: Config,
     step_quantum: u32,
+    flash: Option<Vec<u8>>,
 }
 
 impl EmulatorBuilder {
@@ -361,6 +389,7 @@ impl EmulatorBuilder {
         Self {
             config,
             step_quantum: DEFAULT_STEP_QUANTUM,
+            flash: None,
         }
     }
 
@@ -368,6 +397,13 @@ impl EmulatorBuilder {
     pub fn step_quantum(mut self, n: u32) -> Self {
         debug_assert!(n > 0, "step_quantum must be >= 1");
         self.step_quantum = n;
+        self
+    }
+
+    /// Pre-load a flash image. Applied at [`Self::build`] time via
+    /// [`Emulator::load_flash`] (so the same 2 MB clamp applies).
+    pub fn flash(mut self, data: Vec<u8>) -> Self {
+        self.flash = Some(data);
         self
     }
 
@@ -382,6 +418,9 @@ impl EmulatorBuilder {
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         emu.cores[1].halt();
+        if let Some(data) = self.flash {
+            emu.load_flash(&data);
+        }
         emu
     }
 }

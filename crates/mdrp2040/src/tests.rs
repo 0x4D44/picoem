@@ -1938,4 +1938,23 @@ mod emulator_step {
         assert_eq!(emu.cores[0].regs.ipsr(), 3);
         assert_eq!(emu.cores[0].regs.pc(), hf_handler);
     }
+
+    #[test]
+    fn halted_core0_does_not_freeze_core1() {
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(4).build();
+        let prog = 0x2000_1000u32;
+        for i in 0..8u32 {
+            emu.bus.write16(prog + i * 2, 0xBF00); // NOP
+        }
+        emu.cores[1].wake();
+        emu.cores[1].regs.set_pc(prog);
+        emu.cores[1].regs.msp = 0x2002_0000;
+        emu.cores[1].regs.r[13] = emu.cores[1].regs.msp;
+        emu.cores[0].halt();
+
+        let pc_before = emu.cores[1].regs.pc();
+        let consumed = emu.step();
+        assert!(consumed > 0, "step() must advance when core 1 is runnable");
+        assert!(emu.cores[1].regs.pc() > pc_before, "core 1 PC must advance");
+    }
 }
