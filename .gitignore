@@ -1,6 +1,5 @@
 target/
 target_ci/
-bin/
 obj/
 venv/
 .venv/
