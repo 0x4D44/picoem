@@ -14,7 +14,7 @@
 //! 0x0C: 00 00 00 D0  .word 0xD000_0000      ; SIO_BASE
 //! ```
 
-use mdrp2040::{Config, Emulator};
+use mdrp2040::{Config, Emulator, EmulatorBuilder};
 
 const SIO_BASE: u32 = 0xD000_0000;
 const GPIO_OUT_OFFSET: u32 = 0x010;
@@ -39,7 +39,9 @@ fn assemble_gpio_blink() -> Vec<u8> {
 
 #[test]
 fn gpio_blink_program_drives_pin0_high() {
-    let mut emu = Emulator::new(Config::default());
+    // Use step_quantum=1 so each step advances by one instruction —
+    // the loop count below counts instructions, not quanta.
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
     let prog = assemble_gpio_blink();
     let load_addr = 0x2000_0000u32;
     emu.load_image(load_addr, &prog);
@@ -89,7 +91,9 @@ fn sio_gpio_out_set_via_bus_write() {
 
 #[test]
 fn core1_stays_halted_until_fifo_wake() {
-    let mut emu = Emulator::new(Config::default());
+    // Use step_quantum=1 so the wake-on-FIFO observation happens in a
+    // single, well-defined step rather than after a 64-instruction drain.
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
     assert!(emu.cores[1].is_halted(), "core 1 should be halted at boot");
     // Core 0 pushes through the SIO FIFO → core 1 wakes.
     emu.bus.set_active_core(0);

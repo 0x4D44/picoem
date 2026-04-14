@@ -147,6 +147,15 @@ budget), but `paced_bench` for mdrp2040 is not directly comparable to
 mdrp2350's quantum-mode numbers until convergence happens. Still a real
 improvement to make, just not a blocker for firmware correctness.
 
+**Resolved (2026-04-14):** `Emulator::step` now drains both cores up to
+`step_quantum` master cycles per call and ticks PIO / GPIO / wake-checks
+once at quantum end, mirroring `mdrp2350::Emulator::step`. Per-instruction
+core-0/core-1 interleaving (and `maybe_wake_core1`) preserved so bank
+contention timing and intra-quantum FIFO wakes still fire. Tests that
+need single-instruction granularity opt in via
+`EmulatorBuilder::new(Config::default()).step_quantum(1).build()`. See
+`wrk_docs/2026.04.14 - HLD - mdrp2040 Quantum Step.md` (v1.1.0).
+
 ### RP2040 SIO divider 2-read dirty clear heuristic
 
 `crates/mdrp2040/src/bus/sio.rs` clears the divider `dirty` flag after exactly two result reads. Real hardware clears `dirty` on any result read (per-register). The two-read heuristic happens to match the canonical `__aeabi_idivmod` pattern (quotient + remainder read in pairs), but misbehaves for firmware that reads only one result (e.g., modulo-only code paths leave `dirty` set until the next write). Low priority — fix by clearing on each read of `QUOTIENT`/`REMAINDER`.

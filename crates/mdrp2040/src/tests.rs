@@ -1798,13 +1798,13 @@ mod t_bit_fault {
 // ---------------------------------------------------------------------------
 
 mod emulator_step {
-    use crate::{Config, Emulator};
+    use crate::{Config, EmulatorBuilder};
 
     #[test]
     fn step_executes_movs_sequence() {
         // Build a tiny program in SRAM and set PC there. Five MOVS instructions
         // writing constants to r0..r4.
-        let mut emu = Emulator::new(Config::default());
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
         let program_base: u32 = 0x2000_1000;
         let instrs: [u16; 5] = [
             0x2001, // MOVS r0, #1
@@ -1831,7 +1831,7 @@ mod emulator_step {
     fn step_handles_svc_and_return() {
         // Program: SVC #0 at 0x1000 followed by a NOP. Handler at 0x2000
         // is a single BX LR. Verify we reach the handler, then return.
-        let mut emu = Emulator::new(Config::default());
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
         let vtor = 0x2000_0000u32;
         let handler = 0x2000_1000u32;
         let stack_top = 0x2000_8000u32;
@@ -1863,7 +1863,7 @@ mod emulator_step {
 
     #[test]
     fn step_hardfault_on_undefined_then_unwinds() {
-        let mut emu = Emulator::new(Config::default());
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
         let vtor = 0x2000_0000u32;
         let handler = 0x2000_1000u32;
         let stack_top = 0x2000_8000u32;
@@ -1892,7 +1892,7 @@ mod emulator_step {
         // Emulator::run loops calling step until the cycle budget is met.
         // Lay down 10 NOPs and verify both PC and the cycle count advanced
         // as expected.
-        let mut emu = Emulator::new(Config::default());
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
         let prog = 0x2000_1000u32;
         for i in 0..10 {
             emu.bus.write16(prog + (i as u32) * 2, 0xBF00); // NOP
@@ -1916,7 +1916,7 @@ mod emulator_step {
         // — SVCall priority (0) is not higher than execution priority (0
         // with PRIMASK set). The architectural response is to escalate
         // to HardFault rather than silently deliver the SVCall.
-        let mut emu = Emulator::new(Config::default());
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
         let vtor = 0x2000_0000u32;
         let svc_handler = 0x2000_1000u32;
         let hf_handler = 0x2000_2000u32;

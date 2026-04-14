@@ -23,16 +23,20 @@
 //!
 //! # PIO cadence relative to core 0
 //!
-//! `Emulator::step()` advances the PIO by the number of system-clock
-//! cycles core 0 consumed in that step. A 1-cycle NOP advances PIO by
-//! 1 tick; a 3-cycle taken branch advances PIO by 3 ticks. Tests that
-//! need a fixed 1-tick-per-step cadence (see [`park_core0_on_nops`])
-//! park core 0 on a run of NOPs to get that guarantee.
+//! `Emulator::step()` drains up to `step_quantum` cycles per call and
+//! ticks the PIO once with the summed cycle count. With the default
+//! `step_quantum = DEFAULT_STEP_QUANTUM = 64`, intermediate pin states
+//! within a quantum are not observable. Tests that need to read PIO
+//! pin state on a per-instruction basis construct the emulator with
+//! `EmulatorBuilder::new(Config::default()).step_quantum(1).build()`
+//! so each `emu.step()` advances by exactly one core-0 instruction;
+//! [`park_core0_on_nops`] then parks core 0 on NOPs to guarantee a
+//! fixed 1-tick-per-step PIO cadence.
 
 #![allow(clippy::identity_op)]
 
 use crate::bus::{Bus, PIO0_BASE, PIO1_BASE};
-use crate::{Config, Emulator};
+use crate::{Config, Emulator, EmulatorBuilder};
 
 // ---------------------------------------------------------------------------
 // Bus-level dispatch
@@ -193,12 +197,17 @@ fn update_gpio_masks_to_30_pins() {
 /// a single output pin via SET PINS. Returns the emulator; caller runs
 /// `emu.step()` repeatedly.
 ///
+/// Uses `step_quantum=1` so each `emu.step()` advances by exactly one
+/// system-clock cycle — these tests read PIO pin state on a per-cycle
+/// basis, which the default quantum execution model would otherwise
+/// smear across up to `DEFAULT_STEP_QUANTUM` cycles.
+///
 /// Program:
 ///   addr 0: SET PINS, 1   (pin HIGH)
 ///   addr 1: SET PINS, 0   (pin LOW)
 ///   addr 2: JMP 0         (loop)
 fn blinky_emulator(pio_base: u32, pin: u8) -> Emulator {
-    let mut emu = Emulator::new(Config::default());
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
     let set_pins_1: u16 = 0xE001; // SET PINS, 1
     let set_pins_0: u16 = 0xE000; // SET PINS, 0
     let jmp_0: u16 = 0x0000; // JMP 0
@@ -284,7 +293,7 @@ fn pio1_blinky_is_independent_of_pio0() {
 fn pio0_and_pio1_drive_different_pins_concurrently() {
     // Run PIO0 on pin 5 and PIO1 on pin 12 simultaneously.
     // Both should reflect in gpio_in on the same step.
-    let mut emu = Emulator::new(Config::default());
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
 
     // Load identical blinky programs into both blocks.
     let set_pins_1: u16 = 0xE001;
@@ -325,7 +334,7 @@ fn pio_multi_sm_different_pins_in_one_block() {
     // SM0 drives pin 5, SM1 drives pin 12, both in PIO0. Both pins must
     // reflect in gpio_in after one step — two SMs on the same block tick
     // concurrently on each system-clock cycle (default clkdiv=1).
-    let mut emu = Emulator::new(Config::default());
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
 
     // Shared instruction memory layout:
     //   addr 0: SET PINS, 1  (SM0 body)
@@ -380,10 +389,16 @@ fn pio_multi_sm_different_pins_in_one_block() {
 
 #[test]
 fn emu_step_advances_pio_by_core0_cycle_cost() {
-    // Documents: `Emulator::step` advances the PIO by `c0` ticks, where
-    // `c0` is the number of system-clock cycles core 0's instruction
-    // consumed (see `Emulator::tick_pio` in lib.rs). A 1-cycle NOP
-    // advances PIO by 1 tick; a 3-cycle taken branch advances PIO by 3.
+    // Documents: with `step_quantum=1` (opt-in via `EmulatorBuilder`),
+    // `Emulator::step` advances the PIO by `c0` ticks, where `c0` is the
+    // number of system-clock cycles core 0's single instruction consumed
+    // (see `Emulator::tick_pio` in lib.rs). A 1-cycle NOP advances PIO
+    // by 1 tick; a 3-cycle taken branch advances PIO by 3.
+    //
+    // Under the default quantum (`DEFAULT_STEP_QUANTUM = 64`), `step()`
+    // drains many instructions per call and ticks the PIO once with the
+    // summed cycle count — the per-instruction cadence asserted here is
+    // a property of the `step_quantum=1` opt-in, not the default.
     //
     // Discriminator program (loaded at INSTR_MEM[0..3], wrap_top=3):
     //   addr 0: SET PINS, 0   (0xE000)
@@ -397,11 +412,10 @@ fn emu_step_advances_pio_by_core0_cycle_cost() {
     //   3 ticks -> 1 (SET PINS, 1 @ addr 2)    <-- discriminator
     //   4 ticks -> 1 (JMP 0, no pin change)
     //
-    // So one `emu.step()` with a 3-cycle branch on core 0 must leave
-    // pin-0 HIGH; with a 1-cycle NOP it must leave pin-0 LOW. If the
-    // cadence were fixed at 1 PIO tick per emu.step (regardless of c0),
-    // the branch case would also land on tick #1 and read LOW — the
-    // assertion below would fail.
+    // So with `step_quantum=1` one `emu.step()` running a 3-cycle branch
+    // on core 0 must leave pin-0 HIGH; with a 1-cycle NOP it must leave
+    // pin-0 LOW. The pair of cases together proves the per-instruction
+    // PIO cadence under the opt-in single-cycle quantum.
 
     fn setup_pio(emu: &mut Emulator) {
         // SET PINS, 0 / SET PINS, 0 / SET PINS, 1 / JMP 0
@@ -420,7 +434,7 @@ fn emu_step_advances_pio_by_core0_cycle_cost() {
     }
 
     // --- Baseline: core 0 on NOPs -> c0 = 1 per step -> 1 PIO tick -> pin 0.
-    let mut emu_nop = Emulator::new(Config::default());
+    let mut emu_nop = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
     setup_pio(&mut emu_nop);
     park_core0_on_nops(&mut emu_nop);
     emu_nop.step();
@@ -431,7 +445,7 @@ fn emu_step_advances_pio_by_core0_cycle_cost() {
     // 3 PIO ticks -> pin 1. Uses `B +0` (0xE000 Thumb-16), which
     // branches to the very next instruction at +3 cycles; chain enough
     // copies that the test can step multiple times if it wants to.
-    let mut emu_branch = Emulator::new(Config::default());
+    let mut emu_branch = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
     setup_pio(&mut emu_branch);
     let prog = 0x2000_0000u32;
     for i in 0..256u32 {
@@ -443,7 +457,8 @@ fn emu_step_advances_pio_by_core0_cycle_cost() {
     emu_branch.step();
     assert!(emu_branch.gpio_read(0),
         "after 3 PIO ticks pin 0 must be HIGH (SET PINS, 1 @ addr 2) — \
-         proves Emulator::step advances PIO by c0 cycles, not a fixed 1");
+         proves Emulator::step advances PIO by c0 cycles per instruction \
+         when step_quantum=1");
 }
 
 #[test]
