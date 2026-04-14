@@ -32,6 +32,28 @@ impl Memory {
         }
     }
 
+    /// Construct a `Memory` with chip-specific ROM, SRAM, and a fixed-size
+    /// flash window. Used by `mdrp2040` for its 2 MB XIP window: the
+    /// bus decoder maps a fixed address range, so the flash buffer must
+    /// cover the whole window regardless of image size.
+    ///
+    /// Flash bytes are zero-initialised; populate via [`Self::load_flash`],
+    /// which clamps to `flash_size` and zeroes any remaining tail.
+    pub fn with_flash(rom_size: usize, sram_size: usize, flash_size: usize) -> Self {
+        Self {
+            rom: vec![0u8; rom_size],
+            sram: vec![0u8; sram_size],
+            xip: vec![0u8; flash_size],
+        }
+    }
+
+    /// Current flash (XIP) buffer size in bytes. Zero when constructed
+    /// via `new()` / `with_sizes()` and `load_flash` has not been called
+    /// yet (mdrp2350 dynamic-resize path).
+    pub fn flash_size(&self) -> usize {
+        self.xip.len()
+    }
+
     // --- ROM ---
 
     pub fn load_rom(&mut self, data: &[u8]) {
@@ -124,8 +146,24 @@ impl Memory {
 
     // --- XIP (flash) ---
 
+    /// Copy `data` into the flash buffer starting at offset 0.
+    ///
+    /// * If the buffer was pre-sized via [`Self::with_flash`], the copy
+    ///   clamps at the buffer length and any previously-loaded tail is
+    ///   zeroed so a re-load doesn't leak stale bytes past the new image.
+    /// * Otherwise (default / `with_sizes` path — mdrp2350) the buffer
+    ///   is resized to match the new data. This preserves the pre-PicoGUS
+    ///   behaviour where callers treat XIP as a dynamically-sized image.
     pub fn load_flash(&mut self, data: &[u8]) {
-        self.xip = data.to_vec();
+        if self.xip.is_empty() {
+            self.xip = data.to_vec();
+        } else {
+            let n = data.len().min(self.xip.len());
+            self.xip[..n].copy_from_slice(&data[..n]);
+            for b in &mut self.xip[n..] {
+                *b = 0;
+            }
+        }
     }
 
     pub fn xip_read8(&self, offset: u32) -> u8 {
@@ -193,5 +231,52 @@ impl Memory {
 impl Default for Memory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_flash_preallocates_zeroed_buffer() {
+        // `with_flash` is the pre-sized flash constructor used by chips
+        // with a fixed-capacity flash window (e.g. mdrp2040's 2 MB XIP).
+        // Pre-allocated bytes must read back as zero.
+        let mem = Memory::with_flash(16 * 1024, 264 * 1024, 2 * 1024 * 1024);
+        assert_eq!(mem.flash_size(), 2 * 1024 * 1024);
+        assert_eq!(mem.xip_read8(0), 0);
+        assert_eq!(mem.xip_read8(2 * 1024 * 1024 - 1), 0);
+        assert_eq!(mem.xip_read32(0), 0);
+    }
+
+    #[test]
+    fn with_flash_load_clamps_into_fixed_buffer() {
+        // Loading data into a pre-sized buffer clamps at capacity and
+        // copies from offset 0. Previously-loaded bytes past the new
+        // image are zeroed so a re-load doesn't leak stale content.
+        let mut mem = Memory::with_flash(16 * 1024, 264 * 1024, 2 * 1024 * 1024);
+        mem.load_flash(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(mem.xip_read32(0), 0xDDCCBBAA);
+        // Past the loaded length: still zero within the mapped window.
+        assert_eq!(mem.xip_read8(4), 0);
+        assert_eq!(mem.xip_read8((2 * 1024 * 1024) - 1), 0);
+        // Re-load with a shorter image: old tail must be zeroed.
+        mem.load_flash(&[0x01]);
+        assert_eq!(mem.xip_read8(0), 0x01);
+        assert_eq!(mem.xip_read8(1), 0);
+        assert_eq!(mem.xip_read8(3), 0);
+    }
+
+    #[test]
+    fn with_sizes_keeps_legacy_dynamic_flash_behavior() {
+        // mdrp2350 uses `with_sizes` and expects `load_flash` to resize
+        // the buffer to the loaded bytes (current behaviour). Changing
+        // this would break the RP2350 XIP tests.
+        let mut mem = Memory::with_sizes(32 * 1024, 520 * 1024);
+        assert_eq!(mem.flash_size(), 0);
+        mem.load_flash(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(mem.flash_size(), 4);
+        assert_eq!(mem.xip_read32(0), 0x44332211);
     }
 }

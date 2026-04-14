@@ -13,6 +13,10 @@ pub use mdpicoem_common::memory::Memory;
 pub const ROM_SIZE: usize = 16 * 1024;
 /// SRAM size: 264 KB (4×64 striped + 2×4 scratch).
 pub const SRAM_SIZE: usize = 264 * 1024;
+/// XIP flash window size: 2 MB (stock Pico flash). Mapped at
+/// `0x1000_0000..0x1020_0000` with aliases at `0x1100_0000`,
+/// `0x1200_0000`, `0x1300_0000` (see `bus::region1_read`).
+pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
 
 /// Striped SRAM size: 256 KB (SRAM0-3 @ 64 KB each).
 pub(crate) const STRIPED_END: u32 = 0x0004_0000;

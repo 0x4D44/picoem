@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use mdpicoem_common::PioBlock;
 
-use crate::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
+use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
 use pads_bank0::PadsBank0;
@@ -59,6 +59,35 @@ pub const XIP_CTRL_BASE: u32 = 0x1400_0000;
 pub const SSI_BASE: u32 = 0x1800_0000;
 pub const XIP_SRAM_BASE: u32 = 0x1500_0000;
 pub const XIP_SRAM_END: u32 = 0x1500_4000; // 16 KB
+/// XIP flash window base. Aliases at `+0x0100_0000`, `+0x0200_0000`,
+/// `+0x0300_0000` mirror the same 2 MB flash buffer.
+pub const XIP_FLASH_BASE: u32 = 0x1000_0000;
+
+/// Returns `Some(offset)` if `addr` falls inside one of the four 2 MB
+/// XIP flash alias windows (`0x10`, `0x11`, `0x12`, `0x13` at bits
+/// [27:24]). The returned offset is the byte offset into the flash
+/// buffer (in `0..FLASH_SIZE`).
+#[inline]
+pub(crate) fn xip_flash_offset(addr: u32) -> Option<u32> {
+    // Region selector (bits [31:28]) must be 0x1 for XIP. Alias bits
+    // [27:24] (values 0..3 for the four 2 MB aliases) are validated
+    // below.
+    if (addr & 0xF000_0000) != XIP_FLASH_BASE {
+        return None;
+    }
+    // Alias select bits [27:24]: 0x0, 0x1, 0x2, 0x3.
+    let alias = (addr >> 24) & 0xF;
+    if alias > 3 {
+        return None;
+    }
+    // Offset inside the 2 MB alias window.
+    let offset = addr & 0x00FF_FFFF;
+    if (offset as usize) < FLASH_SIZE {
+        Some(offset)
+    } else {
+        None
+    }
+}
 
 // PIO AHB windows (RP2040 datasheet §3 — two PIO blocks).
 pub const PIO0_BASE: u32 = 0x5020_0000;
@@ -116,10 +145,6 @@ pub struct Bus {
     active_core: usize,
     /// Cycle cost of the most recent bus access.
     last_access_cycles: u32,
-    /// Whether flash (XIP) has been loaded — XIP reads before flash is
-    /// loaded trigger a bus fault so firmware testing under the bootrom
-    /// behaves predictably.
-    flash_loaded: bool,
     /// Bus fault sticky flags.
     bus_fault: bool,
     bus_fault_addr: u32,
@@ -135,7 +160,7 @@ pub struct Bus {
 impl Bus {
     pub fn new() -> Self {
         Self {
-            memory: Memory::with_sizes(ROM_SIZE, SRAM_SIZE),
+            memory: Memory::with_flash(ROM_SIZE, SRAM_SIZE, FLASH_SIZE),
             gpio_in: 0,
             ppb: [Ppb::new(), Ppb::new()],
             sio: Sio::new(),
@@ -156,7 +181,6 @@ impl Bus {
             event_flag: [false; 2],
             active_core: 0,
             last_access_cycles: 0,
-            flash_loaded: false,
             bus_fault: false,
             bus_fault_addr: 0,
             core0_bank_touched: 0,
@@ -224,18 +248,11 @@ impl Bus {
 
     // --- Flash / XIP management ------------------------------------------
 
+    /// Copy `data` into the 2 MB XIP flash window at offset 0. Oversized
+    /// images are clamped by [`Memory::load_flash`]; the mapped window
+    /// is always 2 MB so reads past the image length return 0.
     pub fn load_flash(&mut self, data: &[u8]) {
         self.memory.load_flash(data);
-        self.flash_loaded = true;
-    }
-
-    #[inline]
-    pub fn flash_loaded(&self) -> bool {
-        self.flash_loaded
-    }
-
-    pub fn set_flash_loaded(&mut self, loaded: bool) {
-        self.flash_loaded = loaded;
     }
 
     // --- Bus-fault plumbing -----------------------------------------------
@@ -784,14 +801,10 @@ impl Bus {
         if base == SSI_BASE {
             return self.ssi_read(offset);
         }
-        // Otherwise: XIP flash window (0x1000_0000..0x1400_0000).
-        if addr < XIP_CTRL_BASE {
-            if !self.flash_loaded {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
-                return 0;
-            }
-            let flash_off = addr & 0x0FFF_FFFF;
+        // XIP flash window (0x10/0x11/0x12/0x13, each a 2 MB mirror).
+        // PicoGUS Integration HLD (Stage 1): flash is a plain mapped
+        // window — no wait states, no cache, no fault before load.
+        if let Some(flash_off) = xip_flash_offset(addr) {
             return match width {
                 1 => self.memory.xip_read8(flash_off) as u32,
                 2 => self.memory.xip_read16(flash_off) as u32,
@@ -952,10 +965,16 @@ mod tests {
     }
 
     #[test]
-    fn xip_fault_before_flash_loaded() {
+    fn xip_fresh_bus_reads_zero_without_fault() {
+        // PicoGUS integration (Stage 1 HLD): flash is a plain mapped
+        // window. Reads before `load_flash` must return 0 without
+        // setting bus_fault so a firmware that probes XIP during boot
+        // doesn't take a spurious HardFault.
         let mut bus = Bus::new();
         assert_eq!(bus.read32(0x1000_0000), 0);
-        assert!(bus.bus_fault());
+        assert_eq!(bus.read8(0x1000_0001), 0);
+        assert_eq!(bus.read16(0x1000_0002), 0);
+        assert!(!bus.bus_fault());
     }
 
     #[test]
@@ -963,6 +982,64 @@ mod tests {
         let mut bus = Bus::new();
         bus.load_flash(&[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(bus.read32(0x1000_0000), 0xDDCCBBAA);
+        assert_eq!(bus.read8(0x1000_0000), 0xAA);
+        assert_eq!(bus.read8(0x1000_0003), 0xDD);
+        assert_eq!(bus.read16(0x1000_0002), 0xDDCC);
+    }
+
+    #[test]
+    fn xip_aliases_mirror_flash_base() {
+        // RP2040 XIP has three read-only aliases at 0x11/0x12/0x13 that
+        // map to the same 2 MB flash window. All four addresses must
+        // observe identical bytes after `load_flash`.
+        let mut bus = Bus::new();
+        bus.load_flash(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
+        let words_at = |bus: &mut Bus, base: u32| {
+            (
+                bus.read32(base),
+                bus.read32(base + 4),
+                bus.read8(base + 1),
+                bus.read16(base + 6),
+            )
+        };
+        let canonical = words_at(&mut bus, 0x1000_0000);
+        assert_eq!(words_at(&mut bus, 0x1100_0000), canonical);
+        assert_eq!(words_at(&mut bus, 0x1200_0000), canonical);
+        assert_eq!(words_at(&mut bus, 0x1300_0000), canonical);
+        assert_eq!(canonical.0, 0xEFBEADDE);
+    }
+
+    #[test]
+    fn xip_read_past_loaded_length_returns_zero() {
+        // Within the mapped 2 MB window, addresses past the loaded
+        // image length must read 0 (pre-allocated zero bytes in the
+        // backing buffer). No bus fault.
+        let mut bus = Bus::new();
+        bus.load_flash(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(bus.read32(0x1000_0004), 0);
+        assert_eq!(bus.read32(0x1010_0000), 0); // 1 MB in
+        assert_eq!(bus.read32(0x101F_FFFC), 0); // last word of window
+        assert_eq!(bus.read32(0x1110_0000), 0); // alias 0x11, mid-window
+        assert!(!bus.bus_fault());
+    }
+
+    #[test]
+    fn xip_writes_silently_ignored_at_every_width() {
+        // Real flash needs erase/program via XIP_SSI; at the AHB layer
+        // writes to the flash window must not fault and must not alter
+        // the loaded bytes.
+        let mut bus = Bus::new();
+        bus.load_flash(&[0x55, 0x66, 0x77, 0x88]);
+        bus.write8(0x1000_0000, 0xAA);
+        bus.write16(0x1000_0002, 0xBBBB);
+        bus.write32(0x1000_0000, 0xDEAD_BEEF);
+        // Aliases must also swallow writes.
+        bus.write8(0x1100_0000, 0xAA);
+        bus.write16(0x1200_0002, 0xBBBB);
+        bus.write32(0x1300_0000, 0xDEAD_BEEF);
+        assert!(!bus.bus_fault(), "flash writes must not raise bus_fault");
+        assert_eq!(bus.read32(0x1000_0000), 0x88776655);
+        assert_eq!(bus.read32(0x1100_0000), 0x88776655);
     }
 
     #[test]

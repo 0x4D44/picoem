@@ -262,3 +262,41 @@ differential oracle would catch decode/flag/SYSm corner cases that
 unit tests tend to miss. This entry supersedes the older "Thumb-32
 Test Generators" section above for the M0+-specific subset; the
 mdrp2350 T32 generator work remains pending separately.
+
+## PicoGUS Integration — Stage 1 follow-ups
+
+Surfaced by the devils-advocate review of Stage 1 (XIP flash in
+mdrp2040). None block Stage 2; logged here so they don't get lost.
+
+### `mdrp2040app` CLI does not expose `--flash`
+
+The PicoGUS HLD Stage 1 acceptance criterion reads
+`cargo run -p mdrp2040app -- --flash roms/rp2040/blinky.bin`. The
+functionality works — `mdrp2040app` loads its positional argument via
+`Emulator::load_flash` — but there is no `--flash` named flag. Either
+fix the HLD wording to match the positional-argument invocation, or
+add proper flag parsing to `mdrp2040app`. Low priority (cosmetic /
+docs drift).
+
+### `Memory::load_flash` branching on `xip.is_empty()` is a footgun
+
+`crates/mdpicoem-common/src/memory.rs` branches on `self.xip.is_empty()`
+to choose resize-vs-clamp semantics. On the mdrp2350 path
+(`with_sizes(rom, sram)` leaves `xip` empty), the first `load_flash`
+call resizes the buffer and subsequent calls fall into the clamp
+branch — so a follow-up `load_flash` with a larger image silently
+drops its tail. No current call site hits this, but it will bite when
+someone first reloads mdrp2350 flash with a different size. Fix:
+either always resize, or split into `load_flash_clamped` (mdrp2040
+fixed-window) and `load_flash_resize` (mdrp2350 dynamic). Medium
+priority — latent bug, not blocking.
+
+### XIP reads past the loaded image don't mirror within the 2 MB alias
+
+Each of the four RP2040 XIP aliases covers a 16 MB address range with
+a 2 MB physical flash — real hardware mirrors the image every 2 MB
+inside each alias. Our implementation returns 0 for reads in
+`0x10200000..0x11000000` (and the equivalent gaps in the other three
+aliases). Low priority — firmware that addresses past 2 MB is already
+buggy; current tests don't depend on the mirroring. One-line fix if
+we care: fold offset modulo `FLASH_SIZE` before indexing.

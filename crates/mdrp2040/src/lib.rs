@@ -371,6 +371,7 @@ impl Emulator {
 pub struct EmulatorBuilder {
     config: Config,
     step_quantum: u32,
+    flash: Option<Vec<u8>>,
 }
 
 impl EmulatorBuilder {
@@ -378,6 +379,7 @@ impl EmulatorBuilder {
         Self {
             config,
             step_quantum: DEFAULT_STEP_QUANTUM,
+            flash: None,
         }
     }
 
@@ -385,6 +387,14 @@ impl EmulatorBuilder {
     pub fn step_quantum(mut self, n: u32) -> Self {
         debug_assert!(n > 0, "step_quantum must be >= 1");
         self.step_quantum = n;
+        self
+    }
+
+    /// Pre-load an XIP flash image. Applied at [`Self::build`] time via
+    /// [`Emulator::load_flash`]; oversize images are silently clamped to
+    /// the 2 MB flash window.
+    pub fn flash(mut self, bytes: Vec<u8>) -> Self {
+        self.flash = Some(bytes);
         self
     }
 
@@ -399,6 +409,9 @@ impl EmulatorBuilder {
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         emu.cores[1].halt();
+        if let Some(bytes) = self.flash {
+            emu.load_flash(&bytes);
+        }
         emu
     }
 }

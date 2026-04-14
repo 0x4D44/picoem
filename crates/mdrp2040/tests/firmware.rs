@@ -109,3 +109,55 @@ fn core1_stays_halted_until_fifo_wake() {
     emu.step();
     assert!(!emu.cores[1].is_halted(), "FIFO push should wake core 1");
 }
+
+// ---------------------------------------------------------------------------
+// Stage 1 (PicoGUS Integration HLD): XIP flash
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emulator_load_flash_roundtrips_through_xip_window() {
+    // `Emulator::load_flash` must land bytes at flash offset 0, visible
+    // at the canonical XIP base 0x1000_0000 and each of the three
+    // aliases (0x11/0x12/0x13).
+    let mut emu = Emulator::new(Config::default());
+    emu.load_flash(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    assert_eq!(emu.bus.read32(0x1000_0000), 0x44332211);
+    assert_eq!(emu.bus.read32(0x1000_0004), 0x88776655);
+    assert_eq!(emu.bus.read32(0x1100_0000), 0x44332211);
+    assert_eq!(emu.bus.read32(0x1200_0000), 0x44332211);
+    assert_eq!(emu.bus.read32(0x1300_0000), 0x44332211);
+}
+
+#[test]
+fn emulator_load_flash_clamps_oversize_image() {
+    // Stage 1 HLD: "copies bytes into flash starting at offset 0,
+    // clamps/errors if too large." RP2040 flash window is 2 MB.
+    // Clamp silently at the emulator API boundary.
+    let mut emu = Emulator::new(Config::default());
+    let big = vec![0xABu8; 3 * 1024 * 1024]; // 3 MB > 2 MB window
+    emu.load_flash(&big);
+    // First 2 MB must all be 0xAB, aliases mirror.
+    assert_eq!(emu.bus.read8(0x1000_0000), 0xAB);
+    assert_eq!(emu.bus.read8(0x101F_FFFF), 0xAB);
+    assert_eq!(emu.bus.read8(0x1100_0000), 0xAB);
+}
+
+#[test]
+fn emulator_builder_flash_seeds_xip() {
+    // `EmulatorBuilder::flash(Vec<u8>)` lets callers pre-load flash
+    // before `build()`, matching the stage-1 CLI pattern
+    // `--flash <blinky.bin>`.
+    let flash = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let emu = EmulatorBuilder::new(Config::default()).flash(flash).build();
+    // Builder seeds before reset; bus peek observes the bytes directly.
+    assert_eq!(emu.bus.peek32(0x1000_0000), 0xEFBEADDE);
+}
+
+#[test]
+fn load_image_to_sram_still_works_after_flash_plumbing() {
+    // Regression: the existing `load_image` → SRAM path must keep
+    // working untouched by Stage 1 flash changes.
+    let mut emu = Emulator::new(Config::default());
+    emu.load_image(0x2000_0000, &[0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(emu.bus.read32(0x2000_0000), 0x04030201);
+}
