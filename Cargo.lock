@@ -1293,6 +1293,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdrp2040app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "mdrp2040",
+ "ratatui",
+]
+
+[[package]]
 name = "mdrp2350"
 version = "0.3.0"
 dependencies = [

@@ -9,4 +9,5 @@
 !benchmark.bin
 !blinky.bin
 !bootrom-combined.bin
+!bootrom.bin
 !lcd_demo.bin
