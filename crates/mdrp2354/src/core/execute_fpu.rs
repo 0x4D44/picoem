@@ -63,6 +63,318 @@ fn fpscr_rmode(fpscr: u32) -> u32 {
     (fpscr >> 22) & 0x3
 }
 
+// ----- Cumulative exception flags (Phase 7 Stage A.1, HLD §A.1) ------------
+//
+// All six flags are **sticky**: set by the op that triggered them, cleared
+// only by VMSR to FPSCR. M33 has no trapped handling (FPSCR[15:8] RAZ/WI),
+// so we accumulate only.
+//
+// Bit positions per DDI0553 §D1.2.88.
+
+const FPSCR_IOC: u32 = 1 << 0;
+const FPSCR_DZC: u32 = 1 << 1;
+const FPSCR_OFC: u32 = 1 << 2;
+const FPSCR_UFC: u32 = 1 << 3;
+const FPSCR_IXC: u32 = 1 << 4;
+const FPSCR_IDC: u32 = 1 << 7;
+
+/// FZ (flush-to-zero) control bit. When set, denormal inputs are treated as
+/// ±0 (+IDC) and tininess-before-rounding results are flushed (+UFC+IXC).
+const FPSCR_FZ: u32 = 1 << 24;
+
+/// DN (default NaN) control bit. When set, any NaN result becomes the canonical
+/// quiet NaN 0x7FC0_0000.
+const FPSCR_DN: u32 = 1 << 25;
+
+/// Smallest positive normal f32 as f64 constant (2^-126).
+///
+/// Must match the `MIN_NORMAL` constant in
+/// `crates/mdrp2354-test-harness/src/ieee754_ref.rs`. The two crates don't
+/// share arithmetic helpers, so duplication is pragmatic — but any drift
+/// would mis-classify underflow boundary cases in the differential oracle.
+const F32_MIN_NORMAL_F64: f64 = 1.175_494_350_822_287_5e-38;
+
+/// Returns true if `v` is a non-zero subnormal (denormal) f32.
+#[inline]
+fn is_denormal(v: f32) -> bool {
+    let bits = v.to_bits();
+    let exp = (bits >> 23) & 0xFF;
+    let frac = bits & 0x007F_FFFF;
+    exp == 0 && frac != 0
+}
+
+/// Apply FZ flush-to-zero to a denormal input. When FZ=1 and `v` is denormal,
+/// returns a signed zero and sets IDC. Otherwise returns `v` unchanged (IDC
+/// still accumulates on denormal input per ARM semantics).
+#[inline]
+fn ftz_input(fpscr: &mut u32, v: f32) -> f32 {
+    if is_denormal(v) {
+        *fpscr |= FPSCR_IDC;
+        if *fpscr & FPSCR_FZ != 0 {
+            return if v.is_sign_negative() { -0.0 } else { 0.0 };
+        }
+    }
+    v
+}
+
+/// Apply FZ flush-to-zero to the *result* when the unrounded exact value was
+/// tiny (|exact| < MIN_NORMAL) and the rounded f32 is subnormal (or zero after
+/// inexact rounding from a subnormal). Sets UFC+IXC and returns signed zero.
+/// Returns `None` if no flush is required, so the caller can keep the original
+/// result and emit UFC via the standard underflow path.
+#[inline]
+fn ftz_output(fpscr: u32, result: f32, exact: f64) -> Option<f32> {
+    if fpscr & FPSCR_FZ == 0 {
+        return None;
+    }
+    // Don't flush NaN or infinity.
+    if result.is_nan() || result.is_infinite() {
+        return None;
+    }
+    // Tininess-before-rounding: the pre-rounding magnitude is below MIN_NORMAL.
+    if exact.abs() >= F32_MIN_NORMAL_F64 || exact == 0.0 {
+        return None;
+    }
+    Some(if result.is_sign_negative() { -0.0 } else { 0.0 })
+}
+
+/// Apply Default NaN (DN=1): replace any NaN with canonical quiet NaN.
+#[inline]
+fn apply_dn(fpscr: u32, result: f32) -> f32 {
+    if fpscr & FPSCR_DN != 0 && result.is_nan() {
+        f32::from_bits(ARM_DEFAULT_NAN)
+    } else {
+        result
+    }
+}
+
+// Detection primitives shared across ops.
+
+#[inline]
+fn overflowed(result: f32, any_input_inf: bool) -> bool {
+    result.is_infinite() && !any_input_inf
+}
+
+/// Tininess-before-rounding + inexact: result is a finite tiny value that
+/// differs from the mathematical exact value.
+#[inline]
+fn underflowed(result: f32, exact: f64) -> bool {
+    if !result.is_finite() {
+        return false;
+    }
+    let abs_exact = exact.abs();
+    if abs_exact == 0.0 {
+        return false;
+    }
+    abs_exact < F32_MIN_NORMAL_F64 && (result as f64) != exact
+}
+
+/// `fp_add` wrapper — performs addition with FPSCR flag tracking.
+fn fp_add(fpscr: &mut u32, a: f32, b: f32) -> f32 {
+    let (a, b) = (ftz_input(fpscr, a), ftz_input(fpscr, b));
+    if is_snan(a) || is_snan(b) {
+        *fpscr |= FPSCR_IOC;
+    }
+    // inf + (-inf) is invalid.
+    if a.is_infinite() && b.is_infinite() && a.is_sign_negative() != b.is_sign_negative() {
+        *fpscr |= FPSCR_IOC;
+        let nan = canonicalize_nan(a + b, a, b);
+        return apply_dn(*fpscr, nan);
+    }
+    let result = canonicalize_nan(a + b, a, b);
+    if result.is_nan() {
+        return apply_dn(*fpscr, result);
+    }
+    let exact = (a as f64) + (b as f64);
+    if overflowed(result, a.is_infinite() || b.is_infinite()) {
+        *fpscr |= FPSCR_OFC | FPSCR_IXC;
+    } else if let Some(flushed) = ftz_output(*fpscr, result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+        return flushed;
+    } else if underflowed(result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+    } else if (result as f64) != exact {
+        *fpscr |= FPSCR_IXC;
+    }
+    result
+}
+
+/// `fp_sub` wrapper — performs subtraction with FPSCR flag tracking.
+fn fp_sub(fpscr: &mut u32, a: f32, b: f32) -> f32 {
+    let (a, b) = (ftz_input(fpscr, a), ftz_input(fpscr, b));
+    if is_snan(a) || is_snan(b) {
+        *fpscr |= FPSCR_IOC;
+    }
+    // inf - inf (same sign) is invalid.
+    if a.is_infinite() && b.is_infinite() && a.is_sign_negative() == b.is_sign_negative() {
+        *fpscr |= FPSCR_IOC;
+        let nan = canonicalize_nan(a - b, a, b);
+        return apply_dn(*fpscr, nan);
+    }
+    let result = canonicalize_nan(a - b, a, b);
+    if result.is_nan() {
+        return apply_dn(*fpscr, result);
+    }
+    let exact = (a as f64) - (b as f64);
+    if overflowed(result, a.is_infinite() || b.is_infinite()) {
+        *fpscr |= FPSCR_OFC | FPSCR_IXC;
+    } else if let Some(flushed) = ftz_output(*fpscr, result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+        return flushed;
+    } else if underflowed(result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+    } else if (result as f64) != exact {
+        *fpscr |= FPSCR_IXC;
+    }
+    result
+}
+
+/// `fp_mul` wrapper — performs multiplication with FPSCR flag tracking.
+fn fp_mul(fpscr: &mut u32, a: f32, b: f32) -> f32 {
+    let (a, b) = (ftz_input(fpscr, a), ftz_input(fpscr, b));
+    if is_snan(a) || is_snan(b) {
+        *fpscr |= FPSCR_IOC;
+    }
+    // 0 * inf or inf * 0 is invalid.
+    if is_mul_inf_zero(a, b) {
+        *fpscr |= FPSCR_IOC;
+        let nan = canonicalize_nan(a * b, a, b);
+        return apply_dn(*fpscr, nan);
+    }
+    let result = canonicalize_nan(a * b, a, b);
+    if result.is_nan() {
+        return apply_dn(*fpscr, result);
+    }
+    let exact = (a as f64) * (b as f64);
+    if overflowed(result, a.is_infinite() || b.is_infinite()) {
+        *fpscr |= FPSCR_OFC | FPSCR_IXC;
+    } else if let Some(flushed) = ftz_output(*fpscr, result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+        return flushed;
+    } else if underflowed(result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+    } else if (result as f64) != exact {
+        *fpscr |= FPSCR_IXC;
+    }
+    result
+}
+
+/// `fp_div` wrapper — performs division with FPSCR flag tracking.
+fn fp_div(fpscr: &mut u32, a: f32, b: f32) -> f32 {
+    let (a, b) = (ftz_input(fpscr, a), ftz_input(fpscr, b));
+    if is_snan(a) || is_snan(b) {
+        *fpscr |= FPSCR_IOC;
+    }
+    // 0/0 and inf/inf are invalid.
+    if (a == 0.0 && b == 0.0) || (a.is_infinite() && b.is_infinite()) {
+        *fpscr |= FPSCR_IOC;
+        let nan = canonicalize_nan(a / b, a, b);
+        return apply_dn(*fpscr, nan);
+    }
+    // Finite nonzero / 0 → divide by zero.
+    if b == 0.0 && a.is_finite() && a != 0.0 {
+        *fpscr |= FPSCR_DZC;
+        return a / b;
+    }
+    let result = canonicalize_nan(a / b, a, b);
+    if result.is_nan() {
+        return apply_dn(*fpscr, result);
+    }
+    let exact = (a as f64) / (b as f64);
+    if overflowed(result, a.is_infinite() || b.is_infinite()) {
+        *fpscr |= FPSCR_OFC | FPSCR_IXC;
+    } else if let Some(flushed) = ftz_output(*fpscr, result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+        return flushed;
+    } else if underflowed(result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+    } else {
+        // Residual test: a − q·b ≠ 0 ⇒ inexact.
+        let residual = (-(result as f64)).mul_add(b as f64, a as f64);
+        if residual != 0.0 {
+            *fpscr |= FPSCR_IXC;
+        }
+    }
+    result
+}
+
+/// `fp_sqrt` wrapper — performs square root with FPSCR flag tracking.
+fn fp_sqrt(fpscr: &mut u32, a: f32) -> f32 {
+    let a = ftz_input(fpscr, a);
+    if is_snan(a) {
+        *fpscr |= FPSCR_IOC;
+    }
+    // sqrt(negative non-zero, non-NaN) is invalid. sqrt(-0) = -0 is allowed.
+    if a.is_sign_negative() && a != 0.0 && !a.is_nan() {
+        *fpscr |= FPSCR_IOC;
+        let nan = canonicalize_nan_unary(a.sqrt(), a);
+        return apply_dn(*fpscr, nan);
+    }
+    let result = canonicalize_nan_unary(a.sqrt(), a);
+    if result.is_nan() {
+        return apply_dn(*fpscr, result);
+    }
+    if !result.is_finite() || result == 0.0 {
+        return result;
+    }
+    // Residual test: r² − x ≠ 0 ⇒ inexact.
+    let residual = (result as f64).mul_add(result as f64, -(a as f64));
+    if residual != 0.0 {
+        *fpscr |= FPSCR_IXC;
+    }
+    result
+}
+
+/// `fp_fma` wrapper — performs fused multiply-add with FPSCR flag tracking.
+/// Computes `a * b + c` with a single rounding.
+//
+// f64 mul_add is our IXC probe; for worst-case operands requiring >53 bits
+// of precision, the probe itself rounds and may miss inexactness. Accepted
+// limit — not visible in current fuzz coverage.
+fn fp_fma(fpscr: &mut u32, a: f32, b: f32, c: f32) -> f32 {
+    let (a, b, c) = (
+        ftz_input(fpscr, a),
+        ftz_input(fpscr, b),
+        ftz_input(fpscr, c),
+    );
+    if is_snan(a) || is_snan(b) || is_snan(c) {
+        *fpscr |= FPSCR_IOC;
+    }
+    // 0 * inf in the product is invalid, regardless of addend.
+    if is_mul_inf_zero(a, b) {
+        *fpscr |= FPSCR_IOC;
+        let nan = canonicalize_nan_fma(a.mul_add(b, c), c, a, b);
+        return apply_dn(*fpscr, nan);
+    }
+    let raw = a.mul_add(b, c);
+    let result = canonicalize_nan_fma(raw, c, a, b);
+    if result.is_nan() {
+        // (±inf) + (∓inf) via product + addend: IOC.
+        let prod_sign = a.is_sign_negative() ^ b.is_sign_negative();
+        let product_is_inf = (a.is_infinite() && b != 0.0 && !b.is_nan())
+            || (b.is_infinite() && a != 0.0 && !a.is_nan());
+        if product_is_inf && c.is_infinite() && prod_sign != c.is_sign_negative() {
+            *fpscr |= FPSCR_IOC;
+        }
+        return apply_dn(*fpscr, result);
+    }
+    let exact = (a as f64).mul_add(b as f64, c as f64);
+    if overflowed(
+        result,
+        a.is_infinite() || b.is_infinite() || c.is_infinite(),
+    ) {
+        *fpscr |= FPSCR_OFC | FPSCR_IXC;
+    } else if let Some(flushed) = ftz_output(*fpscr, result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+        return flushed;
+    } else if underflowed(result, exact) {
+        *fpscr |= FPSCR_UFC | FPSCR_IXC;
+    } else if (result as f64) != exact {
+        *fpscr |= FPSCR_IXC;
+    }
+    result
+}
+
 // ============================================================================
 // VFP immediate expansion (VMOV.F32 Sd, #imm)
 // ============================================================================
@@ -271,7 +583,15 @@ impl CortexM33 {
             1
         } else if (hw0 >> 5) & 0x3 == 0 {
             // VMAXNM / VMINNM
+            //
+            // Per DDI0553 §D1.2.88: these set IOC when either input is a
+            // signaling NaN (the rest of the semantics — NaN propagation,
+            // signed-zero — is handled by `fpu_maxnum` / `fpu_minnum`).
+            // No other flags are raised; the ops are pass-through otherwise.
             let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
+            if is_snan(sn_val) || is_snan(sm_val) {
+                self.regs.fpscr |= FPSCR_IOC;
+            }
             let is_min = hw1 & (1 << 6) != 0;
             self.regs.s[sd] = if is_min {
                 fpu_minnum(sn_val, sm_val)
@@ -329,87 +649,103 @@ impl CortexM33 {
             (0, 0b00, 0) => {
                 // VMLA.F32 Sd, Sn, Sm — Sd += Sn*Sm (non-fused: two sequential ops)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
-                self.regs.s[sd] = canonicalize_nan(d + mul, d, mul);
+                let mul = fp_mul(&mut self.regs.fpscr, sn_val, sm_val);
+                self.regs.s[sd] = fp_add(&mut self.regs.fpscr, d, mul);
                 3
             }
             (0, 0b00, 1) => {
                 // VMLS.F32 Sd, Sn, Sm — Sd -= Sn*Sm (non-fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
-                self.regs.s[sd] = canonicalize_nan(d - mul, d, mul);
+                let mul = fp_mul(&mut self.regs.fpscr, sn_val, sm_val);
+                self.regs.s[sd] = fp_sub(&mut self.regs.fpscr, d, mul);
                 3
             }
             (0, 0b01, 0) => {
                 // VNMLS.F32 Sd, Sn, Sm — Sd = Sn*Sm - Sd (non-fused, product first)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
-                self.regs.s[sd] = canonicalize_nan(mul - d, mul, d);
+                let mul = fp_mul(&mut self.regs.fpscr, sn_val, sm_val);
+                self.regs.s[sd] = fp_sub(&mut self.regs.fpscr, mul, d);
                 3
             }
             (0, 0b01, 1) => {
                 // VNMLA.F32 Sd, Sn, Sm — Sd = -(Sn*Sm + Sd) (non-fused, product first)
+                //
+                // FPNeg (DDI0553 §A2.2.6) is an unconditional sign-bit flip on
+                // bit [31], including for NaNs. If DN=1, `fp_add` has already
+                // canonicalized the NaN before we get it; the trailing negate
+                // is then re-canonicalized by `apply_dn` below.
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let mul = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
-                self.regs.s[sd] = canonicalize_nan(-(mul + d), mul, d);
+                let mul = fp_mul(&mut self.regs.fpscr, sn_val, sm_val);
+                let sum = fp_add(&mut self.regs.fpscr, mul, d);
+                self.regs.s[sd] = apply_dn(self.regs.fpscr, -sum);
                 3
             }
             (0, 0b10, 0) => {
                 // VMUL.F32 Sd, Sn, Sm
                 let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
-                self.regs.s[sd] = canonicalize_nan(sn_val * sm_val, sn_val, sm_val);
+                self.regs.s[sd] = fp_mul(&mut self.regs.fpscr, sn_val, sm_val);
                 1
             }
             (0, 0b10, 1) => {
                 // VNMUL.F32 Sd, Sn, Sm — Sd = -(Sn * Sm)
+                //
+                // Compute the multiply with flag tracking; the negation is a
+                // pure sign flip and doesn't change any exception flag.
+                // FPNeg (DDI0553 §A2.2.6) flips bit [31] unconditionally —
+                // including for NaNs — so we negate even NaN products. When
+                // DN=1 the product was already the canonical quiet NaN
+                // (positive); `apply_dn` re-canonicalizes after the flip so
+                // the visible result is still 0x7FC00000.
                 let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
-                self.regs.s[sd] = canonicalize_nan(-(sn_val * sm_val), sn_val, sm_val);
+                let prod = fp_mul(&mut self.regs.fpscr, sn_val, sm_val);
+                self.regs.s[sd] = apply_dn(self.regs.fpscr, -prod);
                 1
             }
             (0, 0b11, 0) => {
                 // VADD.F32 Sd, Sn, Sm
                 let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
-                self.regs.s[sd] = canonicalize_nan(sn_val + sm_val, sn_val, sm_val);
+                self.regs.s[sd] = fp_add(&mut self.regs.fpscr, sn_val, sm_val);
                 1
             }
             (0, 0b11, 1) => {
                 // VSUB.F32 Sd, Sn, Sm
                 let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
-                self.regs.s[sd] = canonicalize_nan(sn_val - sm_val, sn_val, sm_val);
+                self.regs.s[sd] = fp_sub(&mut self.regs.fpscr, sn_val, sm_val);
                 1
             }
             (1, 0b00, 0) => {
                 // VDIV.F32 Sd, Sn, Sm
                 let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
-                self.regs.s[sd] = canonicalize_nan(sn_val / sm_val, sn_val, sm_val);
+                self.regs.s[sd] = fp_div(&mut self.regs.fpscr, sn_val, sm_val);
                 14
             }
             (1, 0b01, 0) => {
                 // VFNMS.F32 Sd, Sn, Sm — Sd = Sn*Sm - Sd (fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = sn_val.mul_add(sm_val, -d);
-                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
+                self.regs.s[sd] = fp_fma(&mut self.regs.fpscr, sn_val, sm_val, -d);
                 3
             }
             (1, 0b01, 1) => {
                 // VFNMA.F32 Sd, Sn, Sm — Sd = -(Sn*Sm + Sd) (fused)
+                //
+                // Encoded as (-Sn)*Sm + (-Sd) per ARM pseudocode; the result
+                // sign is already correct because the fused op rounds once.
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = (-sn_val).mul_add(sm_val, -d);
-                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
+                self.regs.s[sd] = fp_fma(&mut self.regs.fpscr, -sn_val, sm_val, -d);
                 3
             }
             (1, 0b10, 0) => {
                 // VFMA.F32 Sd, Sn, Sm — Sd = Sd + Sn*Sm (fused)
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = sn_val.mul_add(sm_val, d);
-                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
+                self.regs.s[sd] = fp_fma(&mut self.regs.fpscr, sn_val, sm_val, d);
                 3
             }
             (1, 0b10, 1) => {
                 // VFMS.F32 Sd, Sn, Sm — Sd = Sd - Sn*Sm (fused)
+                //
+                // Encoded as (-Sn)*Sm + Sd to get a single-rounded fused op.
                 let (d, sn_val, sm_val) = (self.regs.s[sd], self.regs.s[sn], self.regs.s[sm]);
-                let result = (-sn_val).mul_add(sm_val, d);
-                self.regs.s[sd] = canonicalize_nan_fma(result, d, sn_val, sm_val);
+                self.regs.s[sd] = fp_fma(&mut self.regs.fpscr, -sn_val, sm_val, d);
                 3
             }
             (1, 0b11, 0) => {
@@ -459,7 +795,7 @@ impl CortexM33 {
             (0b0001, 1) => {
                 // VSQRT.F32 Sd, Sm
                 let sm_val = self.regs.s[sm];
-                self.regs.s[sd] = canonicalize_nan_unary(sm_val.sqrt(), sm_val);
+                self.regs.s[sd] = fp_sqrt(&mut self.regs.fpscr, sm_val);
                 14
             }
             (0b0010, 0) => {

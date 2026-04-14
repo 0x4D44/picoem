@@ -4143,6 +4143,216 @@ fn fpu_vminnm_zero_signs() {
     assert_eq!(c.regs.s[0].to_bits(), 0x8000_0000, "minNum(-0,+0) must be -0");
 }
 
+// ----- FPSCR exception flags (Phase 7 Stage A.1) ---------------------------
+//
+// Bit positions:
+//   IOC=bit 0, DZC=bit 1, OFC=bit 2, UFC=bit 3, IXC=bit 4, IDC=bit 7,
+//   FZ=bit 24, DN=bit 25. All cumulative flags are sticky.
+
+const FPSCR_IOC: u32 = 1 << 0;
+const FPSCR_DZC: u32 = 1 << 1;
+const FPSCR_OFC: u32 = 1 << 2;
+const FPSCR_UFC: u32 = 1 << 3;
+const FPSCR_IXC: u32 = 1 << 4;
+const FPSCR_IDC: u32 = 1 << 7;
+const FPSCR_FZ: u32 = 1 << 24;
+const FPSCR_DN: u32 = 1 << 25;
+
+#[test]
+fn fpscr_ixc_on_inexact_division() {
+    // 1.0 / 3.0 is inexact in f32 → IXC set.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vdiv(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(
+        c.regs.fpscr & FPSCR_IXC != 0,
+        "VDIV 1.0/3.0 should set IXC; fpscr=0x{:08X}",
+        c.regs.fpscr
+    );
+}
+
+#[test]
+fn fpscr_dzc_on_divide_by_zero() {
+    // 1.0 / 0.0 = +inf, DZC set, IOC clear.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.0;
+    c.regs.s[4] = 0.0;
+    let (hw0, hw1) = enc_vdiv(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], f32::INFINITY);
+    assert!(c.regs.fpscr & FPSCR_DZC != 0, "DZC must set");
+    assert!(c.regs.fpscr & FPSCR_IOC == 0, "IOC must NOT set for n/0");
+}
+
+#[test]
+fn fpscr_ioc_on_zero_divided_by_zero() {
+    // 0.0 / 0.0 = NaN, IOC set.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 0.0;
+    c.regs.s[4] = 0.0;
+    let (hw0, hw1) = enc_vdiv(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.s[0].is_nan());
+    assert!(c.regs.fpscr & FPSCR_IOC != 0);
+    assert!(c.regs.fpscr & FPSCR_DZC == 0);
+}
+
+#[test]
+fn fpscr_ofc_on_multiplication_overflow() {
+    // 1e20 * 1e20 = 1e40 which overflows f32 → ±inf, OFC+IXC.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1e20;
+    c.regs.s[4] = 1e20;
+    let (hw0, hw1) = enc_vmul(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.s[0].is_infinite());
+    assert!(c.regs.fpscr & FPSCR_OFC != 0, "OFC must set");
+    assert!(c.regs.fpscr & FPSCR_IXC != 0, "IXC must set on overflow");
+}
+
+#[test]
+fn fpscr_ufc_on_ftz_flush() {
+    // With FZ=1, 1e-20 * 1e-20 (tininess before rounding) flushes to ±0
+    // and sets UFC+IXC.
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_FZ;
+    c.regs.s[2] = 1e-20;
+    c.regs.s[4] = 1e-20;
+    let (hw0, hw1) = enc_vmul(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 0.0f32, "FTZ must flush to +0");
+    assert!(c.regs.fpscr & FPSCR_UFC != 0, "UFC must set on FTZ flush");
+    assert!(c.regs.fpscr & FPSCR_IXC != 0, "IXC must set on FTZ flush");
+}
+
+#[test]
+fn fpscr_idc_on_denormal_input() {
+    // VADD with a denormal input sets IDC (even when FZ=0).
+    let mut c = CortexM33::new();
+    let denorm = f32::from_bits(0x0000_0001); // smallest positive subnormal
+    c.regs.s[2] = denorm;
+    c.regs.s[4] = 1.0;
+    let (hw0, hw1) = enc_vadd(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.fpscr & FPSCR_IDC != 0, "IDC must set on denormal input");
+}
+
+#[test]
+fn fpscr_dn_replaces_nan_with_canonical() {
+    // With DN=1, any NaN result becomes 0x7FC0_0000 (no payload preservation).
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_DN;
+    // Hand-craft a quiet NaN with a custom payload.
+    c.regs.s[2] = f32::from_bits(0x7FC1_2345);
+    c.regs.s[4] = 1.0;
+    let (hw0, hw1) = enc_vadd(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(
+        c.regs.s[0].to_bits(),
+        0x7FC0_0000,
+        "DN=1 must force canonical quiet NaN; got 0x{:08X}",
+        c.regs.s[0].to_bits()
+    );
+}
+
+#[test]
+fn fpscr_flags_are_sticky_across_ops() {
+    // Set IXC by one op, then execute an exact op; IXC must remain set.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.0;
+    c.regs.s[4] = 3.0;
+    let (hw0, hw1) = enc_vdiv(0, 2, 4); // inexact → IXC
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.fpscr & FPSCR_IXC != 0);
+
+    // Exact op: 2.0 + 2.0 = 4.0
+    c.regs.s[2] = 2.0;
+    c.regs.s[4] = 2.0;
+    let (hw0, hw1) = enc_vadd(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(
+        c.regs.fpscr & FPSCR_IXC != 0,
+        "IXC must remain sticky across exact ops"
+    );
+}
+
+#[test]
+fn fpscr_sqrt_negative_sets_ioc() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = -4.0;
+    let (hw0, hw1) = enc_vsqrt(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.s[0].is_nan());
+    assert!(c.regs.fpscr & FPSCR_IOC != 0, "sqrt(-x) must set IOC");
+}
+
+#[test]
+fn fpscr_vmaxnm_snan_sets_ioc() {
+    // Per DDI0553: VMAXNM/VMINNM set IOC when either input is sNaN.
+    let mut c = CortexM33::new();
+    let snan = f32::from_bits(0x7F80_0001);
+    c.regs.s[2] = snan;
+    c.regs.s[4] = 1.0;
+    let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(
+        c.regs.fpscr & FPSCR_IOC != 0,
+        "VMAXNM with sNaN must set IOC"
+    );
+}
+
+#[test]
+fn fpu_vnmul_nan_sign_flipped_dn_off() {
+    // VNMUL = -(Sn * Sm). Per DDI0553 §A2.2.6, FPNeg is an unconditional
+    // sign-bit flip, *including* for NaN. With DN=0 the canonicalized
+    // quiet NaN from fp_mul is positive (0x7FC0_0000); negation must make
+    // the stored result negative (0xFFC0_0000).
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::NAN;
+    c.regs.s[4] = 1.0;
+    let (hw0, hw1) = enc_vnmul(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    let bits = c.regs.s[0].to_bits();
+    assert!(c.regs.s[0].is_nan(), "VNMUL(NaN,x) must produce NaN");
+    assert_eq!(
+        bits & 0x8000_0000,
+        0x8000_0000,
+        "FPNeg must flip sign bit even for NaN (DN=0); got 0x{:08X}",
+        bits
+    );
+}
+
+#[test]
+fn fpu_vnmul_nan_canonical_dn_on() {
+    // Same as above but with DN=1: the negated NaN must be re-canonicalized
+    // back to the positive canonical quiet NaN 0x7FC0_0000.
+    let mut c = CortexM33::new();
+    c.regs.fpscr = FPSCR_DN;
+    c.regs.s[2] = f32::NAN;
+    c.regs.s[4] = 1.0;
+    let (hw0, hw1) = enc_vnmul(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(
+        c.regs.s[0].to_bits(),
+        0x7FC0_0000,
+        "DN=1 must force canonical quiet NaN after negate; got 0x{:08X}",
+        c.regs.s[0].to_bits()
+    );
+}
+
+#[test]
+fn fpscr_add_inf_minus_inf_sets_ioc() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::INFINITY;
+    c.regs.s[4] = f32::NEG_INFINITY;
+    let (hw0, hw1) = enc_vadd(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.s[0].is_nan());
+    assert!(c.regs.fpscr & FPSCR_IOC != 0, "inf+(-inf) must set IOC");
+}
+
 // ----- VCVTB / VCVTT (F16 <-> F32) -----------------------------------------
 
 #[test]

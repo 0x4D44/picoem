@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2354-test-harness"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "mdrp2354",
