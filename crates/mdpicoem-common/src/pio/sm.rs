@@ -59,11 +59,12 @@ pub struct StateMachine {
     pub(crate) tx_fifo: PioFifo,
     pub(crate) rx_fifo: PioFifo,
 
-    // Pin output (per-SM, merged into PioBlock.pad_out/pad_oe)
-    pub(crate) pin_values: u32,     // Shared output latch: OUT PINS, SET PINS, MOV PINS
-    pub(crate) pin_dirs: u32,       // Shared direction latch: OUT PINDIRS, SET PINDIRS
-    pub(crate) sideset_pins: u32,   // Side-set pin values (separate base/count)
-    pub(crate) sideset_dirs: u32,   // Side-set pin directions (SIDE_PINDIR mode)
+    // Side-set is genuinely per-SM (each SM has its own sideset_base /
+    // sideset_count and these latches carry across the delay cycles). The
+    // non-side-set pad value / direction latches are shared at the block
+    // level — see `PioBlock::shared_pin_values` / `shared_pin_dirs`.
+    pub(crate) sideset_pins: u32,
+    pub(crate) sideset_dirs: u32,
 }
 
 /// Tracks what kind of stall we're in, so re-evaluation knows what to check.
@@ -86,7 +87,10 @@ impl StateMachine {
             isr: 0,
             osr: 0,
             isr_count: 0,
-            osr_count: 0,
+            // OSR "empty" at reset = all 32 bits have been shifted out
+            // (matches epio and real RP2350: autopull fires on the first
+            // OUT so OSR gets a fresh value instead of outputting zeros).
+            osr_count: 32,
             delay_count: 0,
             stalled: false,
             enabled: false,
@@ -102,9 +106,10 @@ impl StateMachine {
             pinctrl: 0x1400_0000,
             tx_fifo: PioFifo::new(4),
             rx_fifo: PioFifo::new(4),
-            pin_values: 0,
-            pin_dirs: 0,
-            sideset_pins: 0,
+            // Sideset latch takes the pullup-reset convention (matches
+            // epio and weakly-pulled-up RP2350 pad defaults): a side-set
+            // pin whose value has never been written reads high.
+            sideset_pins: u32::MAX,
             sideset_dirs: 0,
         }
     }
@@ -163,6 +168,8 @@ impl StateMachine {
         instr_mem: &[u16; 32],
         irq_flags: &mut u8,
         gpio_in: u32,
+        shared_pin_values: &mut u32,
+        shared_pin_dirs: &mut u32,
     ) {
         // Handle delay countdown
         if self.delay_count > 0 {
@@ -198,7 +205,13 @@ impl StateMachine {
         self.apply_sideset(&decoded);
 
         // Execute — returns true if instruction set PC directly (JMP, OUT PC, MOV PC)
-        let pc_set = self.execute_insn(&decoded, irq_flags, gpio_in);
+        let pc_set = self.execute_insn(
+            &decoded,
+            irq_flags,
+            gpio_in,
+            shared_pin_values,
+            shared_pin_dirs,
+        );
 
         // If not stalled, set delay and advance PC
         if !self.stalled {
@@ -218,13 +231,21 @@ impl StateMachine {
         instr_mem: &[u16; 32],
         irq_flags: &mut u8,
         gpio_in: u32,
+        shared_pin_values: &mut u32,
+        shared_pin_dirs: &mut u32,
     ) {
         // Clear any existing stall/delay
         self.stalled = false;
         self.stall_kind = StallKind::None;
         self.delay_count = 0;
         self.pending_exec = Some(insn);
-        self.execute_cycle(instr_mem, irq_flags, gpio_in);
+        self.execute_cycle(
+            instr_mem,
+            irq_flags,
+            gpio_in,
+            shared_pin_values,
+            shared_pin_dirs,
+        );
     }
 
     /// Check if the current stall condition is still active.
@@ -350,6 +371,8 @@ impl StateMachine {
         decoded: &DecodedInsn,
         irq_flags: &mut u8,
         gpio_in: u32,
+        shared_pin_values: &mut u32,
+        shared_pin_dirs: &mut u32,
     ) -> bool {
         match &decoded.op {
             PioOp::Jmp { condition, address } => {
@@ -364,7 +387,7 @@ impl StateMachine {
                 false
             }
             PioOp::Out { destination, bit_count } => {
-                self.exec_out(*destination, *bit_count)
+                self.exec_out(*destination, *bit_count, shared_pin_values, shared_pin_dirs)
             }
             PioOp::Push { if_full, block } => {
                 self.exec_push(*if_full, *block);
@@ -375,14 +398,21 @@ impl StateMachine {
                 false
             }
             PioOp::Mov { destination, op, source } => {
-                self.exec_mov(*destination, *op, *source, gpio_in)
+                self.exec_mov(
+                    *destination,
+                    *op,
+                    *source,
+                    gpio_in,
+                    shared_pin_values,
+                    shared_pin_dirs,
+                )
             }
             PioOp::Irq { clear, wait, index } => {
                 self.exec_irq(*clear, *wait, *index, irq_flags);
                 false
             }
             PioOp::Set { destination, data } => {
-                self.exec_set(*destination, *data);
+                self.exec_set(*destination, *data, shared_pin_values, shared_pin_dirs);
                 false
             }
         }
@@ -519,7 +549,13 @@ impl StateMachine {
     }
 
     /// OUT instruction. Returns true if destination is PC (PC was set).
-    fn exec_out(&mut self, destination: u8, bit_count: u8) -> bool {
+    fn exec_out(
+        &mut self,
+        destination: u8,
+        bit_count: u8,
+        shared_pin_values: &mut u32,
+        shared_pin_dirs: &mut u32,
+    ) -> bool {
         // Autopull: refill OSR from TX FIFO before OUT reads it
         if self.is_autopull_enabled() {
             let threshold = self.pull_threshold();
@@ -562,9 +598,7 @@ impl StateMachine {
                 let out_base = (self.pinctrl & 0x1F) as u8;
                 let out_count = ((self.pinctrl >> 20) & 0x3F) as u8;
                 let count = out_count.min(bit_count);
-                let mut pv = self.pin_values;
-                Self::write_pin_field(&mut pv, data, out_base, count);
-                self.pin_values = pv;
+                Self::write_pin_field(shared_pin_values, data, out_base, count);
             }
             1 => self.x = data,           // X
             2 => self.y = data,           // Y
@@ -574,9 +608,7 @@ impl StateMachine {
                 let out_base = (self.pinctrl & 0x1F) as u8;
                 let out_count = ((self.pinctrl >> 20) & 0x3F) as u8;
                 let count = out_count.min(bit_count);
-                let mut pd = self.pin_dirs;
-                Self::write_pin_field(&mut pd, data, out_base, count);
-                self.pin_dirs = pd;
+                Self::write_pin_field(shared_pin_dirs, data, out_base, count);
             }
             5 => {
                 // PC — set directly
@@ -640,10 +672,26 @@ impl StateMachine {
     }
 
     /// MOV instruction. Returns true if destination is PC (PC was set).
-    fn exec_mov(&mut self, destination: u8, op: u8, source: u8, gpio_in: u32) -> bool {
+    fn exec_mov(
+        &mut self,
+        destination: u8,
+        op: u8,
+        source: u8,
+        gpio_in: u32,
+        shared_pin_values: &mut u32,
+        shared_pin_dirs: &mut u32,
+    ) -> bool {
         // Read source
         let mut val = match source {
-            0 => self.read_pins(gpio_in),  // PINS
+            0 => {                          // PINS — RP2350 masks by IN_COUNT
+                let raw = self.read_pins(gpio_in);
+                let in_count = (self.shiftctrl & 0x1F) as u32;
+                if in_count == 0 || in_count >= 32 {
+                    raw
+                } else {
+                    raw & ((1u32 << in_count) - 1)
+                }
+            }
             1 => self.x,                    // X
             2 => self.y,                    // Y
             3 => 0,                         // NULL
@@ -677,12 +725,16 @@ impl StateMachine {
                 // PINS (out_base-relative) — writes shared output latch
                 let out_base = (self.pinctrl & 0x1F) as u8;
                 let out_count = ((self.pinctrl >> 20) & 0x3F) as u8;
-                let mut pv = self.pin_values;
-                Self::write_pin_field(&mut pv, val, out_base, out_count);
-                self.pin_values = pv;
+                Self::write_pin_field(shared_pin_values, val, out_base, out_count);
             }
             1 => self.x = val,
             2 => self.y = val,
+            3 => {
+                // PINDIRS (RP2350 extension) — OUT-pin-range direction latch.
+                let out_base = (self.pinctrl & 0x1F) as u8;
+                let out_count = ((self.pinctrl >> 20) & 0x3F) as u8;
+                Self::write_pin_field(shared_pin_dirs, val, out_base, out_count);
+            }
             4 => {
                 // EXEC — execute val as instruction next cycle
                 self.pending_exec = Some(val as u16);
@@ -715,15 +767,19 @@ impl StateMachine {
     }
 
     /// SET instruction.
-    fn exec_set(&mut self, destination: u8, data: u8) {
+    fn exec_set(
+        &mut self,
+        destination: u8,
+        data: u8,
+        shared_pin_values: &mut u32,
+        shared_pin_dirs: &mut u32,
+    ) {
         match destination {
             0 => {
                 // PINS (set_base-relative, up to SET_COUNT) — writes shared output latch
                 let set_base = ((self.pinctrl >> 5) & 0x1F) as u8;
                 let set_count = ((self.pinctrl >> 26) & 0x7) as u8;
-                let mut pv = self.pin_values;
-                Self::write_pin_field(&mut pv, data as u32, set_base, set_count);
-                self.pin_values = pv;
+                Self::write_pin_field(shared_pin_values, data as u32, set_base, set_count);
             }
             1 => self.x = data as u32,           // X (zero-extend)
             2 => self.y = data as u32,           // Y (zero-extend)
@@ -731,9 +787,7 @@ impl StateMachine {
                 // PINDIRS (set_base-relative, up to SET_COUNT) — writes shared direction latch
                 let set_base = ((self.pinctrl >> 5) & 0x1F) as u8;
                 let set_count = ((self.pinctrl >> 26) & 0x7) as u8;
-                let mut pd = self.pin_dirs;
-                Self::write_pin_field(&mut pd, data as u32, set_base, set_count);
-                self.pin_dirs = pd;
+                Self::write_pin_field(shared_pin_dirs, data as u32, set_base, set_count);
             }
             _ => {}
         }

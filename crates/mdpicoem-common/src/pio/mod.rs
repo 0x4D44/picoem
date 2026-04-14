@@ -14,6 +14,12 @@ pub struct PioBlock {
     pub(crate) irq_flags: u8,
     input_sync_bypass: u32,
     fdebug: u32,
+    /// Shared pad value latch — OUT/SET/MOV PINS from any SM writes here.
+    /// Reset to `u32::MAX` (weak-pullup convention, matches epio).
+    pub(crate) shared_pin_values: u32,
+    /// Shared pad direction latch — OUT/SET/MOV PINDIRS from any SM writes
+    /// here. Reset to 0 (all pins input). Side-set can overlay on top.
+    pub(crate) shared_pin_dirs: u32,
     pub pad_out: u32,
     pub pad_oe: u32,
     /// Bit `i` is set iff `sm[i].enabled`. Deliberately redundant with
@@ -42,6 +48,8 @@ impl PioBlock {
             irq_flags: 0,
             input_sync_bypass: 0,
             fdebug: 0,
+            shared_pin_values: u32::MAX,
+            shared_pin_dirs: 0,
             pad_out: 0,
             pad_oe: 0,
             sm_enabled_mask: 0,
@@ -57,9 +65,18 @@ impl PioBlock {
         self.irq_flags = 0;
         self.input_sync_bypass = 0;
         self.fdebug = 0;
+        self.shared_pin_values = u32::MAX;
+        self.shared_pin_dirs = 0;
         self.pad_out = 0;
         self.pad_oe = 0;
         self.sm_enabled_mask = 0;
+    }
+
+    /// True iff at least one SM in the block is enabled. Chip-side
+    /// fast-path uses this to decide whether a PIO step could move any
+    /// pin (disabled blocks are semantic no-ops — see [`Self::step`]).
+    pub fn any_sm_enabled(&self) -> bool {
+        self.sm_enabled_mask != 0
     }
 
     /// Enable or disable state machine `i`, maintaining the cached
@@ -88,7 +105,13 @@ impl PioBlock {
         }
         for i in 0..4 {
             if self.sm[i].clock_tick() {
-                self.sm[i].execute_cycle(&self.instr_mem, &mut self.irq_flags, gpio_in);
+                self.sm[i].execute_cycle(
+                    &self.instr_mem,
+                    &mut self.irq_flags,
+                    gpio_in,
+                    &mut self.shared_pin_values,
+                    &mut self.shared_pin_dirs,
+                );
             }
         }
         self.merge_pin_outputs();
@@ -108,19 +131,25 @@ impl PioBlock {
         }
     }
 
-    /// Merge all SM pin outputs into pad_out/pad_oe. SM0 lowest priority, SM3 highest.
+    /// Merge shared pad latches + per-SM side-set into pad_out/pad_oe.
+    /// Non-sideset writes land in `shared_pin_values` / `shared_pin_dirs`
+    /// directly — we just copy those. Side-set overlays on top.
+    ///
+    /// When every SM in the block is disabled, the PIO block isn't
+    /// driving any pin (even if a prior program left pindir bits set);
+    /// this is the property `disable_clears_pin_outputs` relies on.
     fn merge_pin_outputs(&mut self) {
-        let mut out: u32 = 0;
-        let mut oe: u32 = 0;
+        if self.sm_enabled_mask == 0 {
+            self.pad_out = 0;
+            self.pad_oe = 0;
+            return;
+        }
+        let mut out: u32 = self.shared_pin_values;
+        let mut oe: u32 = self.shared_pin_dirs;
         for sm in &self.sm {
             if !sm.enabled {
                 continue;
             }
-
-            // Pin values and directions from OUT/SET/MOV (shared latch)
-            let sm_oe = sm.pin_dirs;
-            out = (out & !sm_oe) | (sm.pin_values & sm_oe);
-            oe |= sm_oe;
 
             // Side-set pins (separate base/count from PINCTRL)
             let ss_count = ((sm.pinctrl >> 29) & 7) as u8;
@@ -371,6 +400,8 @@ impl PioBlock {
                     &self.instr_mem,
                     &mut self.irq_flags,
                     0, // gpio_in not available in register write — use 0
+                    &mut self.shared_pin_values,
+                    &mut self.shared_pin_dirs,
                 );
             }
             // SMn_PINCTRL
@@ -1057,7 +1088,7 @@ mod tests {
         step_n(&mut pio, 1, 0); // PULL => osr = 0x0000_000F
         step_n(&mut pio, 1, 0); // OUT PINS, 4 => shifts 4 LSBs out
         // With shift-right, bottom 4 bits of OSR = 0xF
-        assert_eq!(pio.sm[0].pin_values & 0xF, 0xF, "bottom 4 pins set to 1");
+        assert_eq!(pio.shared_pin_values & 0xF, 0xF, "bottom 4 pins set to 1");
     }
 
     #[test]
@@ -1307,7 +1338,7 @@ mod tests {
         // The remaining OSR should be 0x0000_ABCD >> 8 = 0x0000_00AB
         assert_eq!(pio.sm[0].osr, 0x0000_00AB);
         // out_pins bottom 8 bits should be 0xCD
-        assert_eq!(pio.sm[0].pin_values & 0xFF, 0xCD);
+        assert_eq!(pio.shared_pin_values & 0xFF, 0xCD);
     }
 
     #[test]
@@ -1358,16 +1389,20 @@ mod tests {
         // out_base=5, out_count=4
         pio.sm[0].pinctrl = (4u32 << 20) | 5u32; // out_count=4, out_base=5
         pio.sm[0].tx_fifo.push(0x0000_000F); // bottom 4 bits = 1111
+        // Block-shared pin_values resets to all-ones (pullup convention,
+        // matches epio); pin this assumption down explicitly so the
+        // OUT-only-touches-its-count assertion isolates OUT's behaviour.
+        pio.shared_pin_values = 0;
 
         step_n(&mut pio, 1, 0); // PULL
         step_n(&mut pio, 1, 0); // OUT PINS, 4
         // Default shiftctrl: shift right, so bottom 4 bits (0xF) are shifted out.
         // out_base=5 means bits should appear at positions 5,6,7,8.
         let expected_mask = 0xF << 5;
-        assert_eq!(pio.sm[0].pin_values & expected_mask, expected_mask,
+        assert_eq!(pio.shared_pin_values & expected_mask, expected_mask,
             "OUT PINS with out_base=5 should set pins [8:5]");
         // Other pins should be 0
-        assert_eq!(pio.sm[0].pin_values & !expected_mask, 0,
+        assert_eq!(pio.shared_pin_values & !expected_mask, 0,
             "only pins [8:5] should be set");
     }
 
@@ -1380,12 +1415,13 @@ mod tests {
         // out_base=30, out_count=4
         pio.sm[0].pinctrl = (4u32 << 20) | 30u32; // out_count=4, out_base=30
         pio.sm[0].tx_fifo.push(0x0000_000F); // bottom 4 bits = 1111
+        pio.shared_pin_values = 0; // see comment in test_pin_mapping_out
 
         step_n(&mut pio, 1, 0); // PULL
         step_n(&mut pio, 1, 0); // OUT PINS, 4
         // Pins should wrap: bits 30,31,0,1 all set
         let expected = (3u32 << 30) | 3u32; // bits 30,31 and bits 0,1
-        assert_eq!(pio.sm[0].pin_values, expected,
+        assert_eq!(pio.shared_pin_values, expected,
             "OUT PINS with out_base=30 should wrap to bits [31:30] and [1:0]");
     }
 
@@ -1463,10 +1499,10 @@ mod tests {
     fn disable_clears_pin_outputs() {
         let mut pio = PioBlock::new();
         pio.set_sm_enabled(0, true);
-        // Poke pin latches directly (pub(crate) fields) to avoid running a
-        // program — we only need the merge path to observe them.
-        pio.sm[0].pin_values = 0x1;
-        pio.sm[0].pin_dirs = 0x1;
+        // Poke the block-shared pad latches directly (pub(crate)) to avoid
+        // running a program — we only need the merge path to observe them.
+        pio.shared_pin_values = 0x1;
+        pio.shared_pin_dirs = 0x1;
 
         pio.step(0);
 

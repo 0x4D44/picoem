@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use mdpicoem_common::PioBlock;
 
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
+use crate::peripherals::psram::Psram;
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
 use pads_bank0::PadsBank0;
@@ -139,6 +140,10 @@ pub struct Bus {
     /// `0x5030_0000` (see [`PIO0_BASE`] / [`PIO1_BASE`]); output pins are
     /// merged into [`Self::gpio_in`] by [`crate::Emulator::update_gpio`].
     pub pio: [PioBlock; 2],
+    /// Off-chip 8 MB SPI PSRAM (PicoGUS v2 hardware). Observed via
+    /// [`crate::Emulator::update_gpio`] on GPIO1/2/3 (CS/SCK/MOSI) and
+    /// drives GPIO0 (MISO) back into [`Self::gpio_in`].
+    pub psram: Psram,
     /// Per-core event flag for WFE/SEV / FIFO event protocol.
     pub event_flag: [bool; 2],
     /// Which core is currently executing on the bus.
@@ -178,6 +183,7 @@ impl Bus {
             ssi_regs: HashMap::new(),
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
+            psram: Psram::new(),
             event_flag: [false; 2],
             active_core: 0,
             last_access_cycles: 0,

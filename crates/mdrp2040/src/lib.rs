@@ -17,6 +17,7 @@
 pub mod bus;
 pub mod core;
 pub mod memory;
+pub mod peripherals;
 
 #[cfg(test)]
 mod tests;
@@ -104,6 +105,7 @@ impl Emulator {
         for pio in &mut self.bus.pio {
             pio.reset();
         }
+        self.bus.psram.reset_state();
         self.bus.clear_bus_fault();
         self.bus.ppb = [Default::default(), Default::default()];
         self.bus.event_flag = [false; 2];
@@ -177,11 +179,28 @@ impl Emulator {
     ///    one clock on real silicon.
     ///
     /// The loop exits when `clock.cycles >= target` or both cores are
-    /// halted. Then advance both PIO blocks by the quantum's total
-    /// consumed cycles, merge GPIO outputs, and run wake checks. Mirrors
-    /// `mdrp2350::Emulator::step`'s quantum-end peripheral model; differs
-    /// in per-iteration core interleaving, which is required here to
-    /// preserve bank-contention timing on core 1.
+    /// halted. Then advance PIO and the GPIO/PSRAM merge **one system
+    /// cycle at a time** for each consumed cycle — so PIO-driven SPI
+    /// programs (which toggle SCK every 1–2 sysclks) present every edge
+    /// to the off-chip PSRAM model. A bulk `tick_pio(consumed)` followed
+    /// by a single `update_gpio()` would let SCK/CS edges slip between
+    /// the start and end of the quantum — the PSRAM would only ever see
+    /// the quantum's final pin snapshot.
+    ///
+    /// Fast-path: when both PIO blocks have no SM enabled, no GPIO pin
+    /// can change during this peripheral-tick window (SIO writes only
+    /// land inside the core loop above, which has already finished),
+    /// so a second `psram.tick` on the same pin snapshot would be a
+    /// semantic no-op — one bulk `tick_pio(consumed) + update_gpio()`
+    /// suffices. This preserves paced_bench_rp2040's throughput on
+    /// pure-ALU workloads (no PIO activity), which would otherwise pay
+    /// a per-cycle `update_gpio` tax for nothing.
+    ///
+    /// Core 1 halted ⇒ PIO may still be ticking (e.g. SPI PSRAM on core
+    /// 0), so the per-cycle loop runs regardless of core-halt state.
+    /// Differs from `mdrp2350::Emulator::step`'s quantum-end peripheral
+    /// tick — mdrp2040 has the external PSRAM which is sensitive to
+    /// sub-quantum edge timing; mdrp2350 has no equivalent peripheral.
     pub fn step(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
         let start = self.clock.cycles;
@@ -220,8 +239,20 @@ impl Emulator {
         }
 
         let consumed = self.clock.cycles.wrapping_sub(start);
-        self.tick_pio(consumed as u32);
-        self.update_gpio();
+        // See the fn docstring for the rationale on the fast-path and
+        // the per-cycle interleave. Measured impact of the fast-path
+        // gate on paced_bench_rp2040 (pure ALU, PIO disabled): without
+        // it, ~49% throughput regression; with it, neutral.
+        let pio_idle = !self.bus.pio[0].any_sm_enabled() && !self.bus.pio[1].any_sm_enabled();
+        if pio_idle {
+            self.tick_pio(consumed as u32);
+            self.update_gpio();
+        } else {
+            for _ in 0..consumed {
+                self.tick_pio(1);
+                self.update_gpio();
+            }
+        }
         self.wake_checks();
         consumed
     }
@@ -264,13 +295,25 @@ impl Emulator {
     /// wherever `pad_oe` has a bit set — mirrors `mdrp2350::Emulator::
     /// update_gpio`). The result is masked to the RP2040 30-pin range
     /// (GPIO0..GPIO29).
+    ///
+    /// Finally, the off-chip SPI PSRAM observes the post-merge pin state
+    /// on its CS/SCK/MOSI pins and, if it is currently driving MISO,
+    /// splices its bit into `gpio_in` bit 0. MISO override happens last
+    /// so MOSI/SCK/CS seen by the PSRAM reflect the actual pin levels
+    /// driven by PIO / SIO on this tick (no feedback from the override
+    /// into the PSRAM's observation on the same tick).
     pub(crate) fn update_gpio(&mut self) {
         let mut out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
         for pio in &self.bus.pio {
             let pio_mask = pio.pad_oe;
             out = (out & !pio_mask) | (pio.pad_out & pio_mask);
         }
-        self.bus.gpio_in = out & 0x3FFF_FFFF;
+        out &= 0x3FFF_FFFF;
+        if let Some(miso) = self.bus.psram.tick(out) {
+            let mask = 1u32 << crate::peripherals::psram::PIN_MISO;
+            out = (out & !mask) | ((miso as u32) << crate::peripherals::psram::PIN_MISO);
+        }
+        self.bus.gpio_in = out;
     }
 
     /// WFE/SEV wake check. Phase 5.A doesn't yet model WFE on M0+;

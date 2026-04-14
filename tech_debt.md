@@ -300,3 +300,29 @@ inside each alias. Our implementation returns 0 for reads in
 aliases). Low priority — firmware that addresses past 2 MB is already
 buggy; current tests don't depend on the mirroring. One-line fix if
 we care: fold offset modulo `FLASH_SIZE` before indexing.
+
+## PicoGUS Integration — Stage 2 follow-ups
+
+### PSRAM PIO-integration tests cover only 1 edge/quantum
+
+`pio_integration::pio_driven_write_then_read_round_trip` and
+`pio_driven_fast_read_returns_written_bytes` use `step_quantum=4` with
+SCK toggling every 2 sysclks — one rising edge per `emu.step()`. That
+means the test would pass even if `update_gpio()` ran twice per step
+instead of `consumed` times. Add a stress test at `step_quantum=64`
+with PIO toggling SCK every sysclk (32 rising edges per step) to
+actually prove the interleave fix catches every edge. Without this,
+a future regression to a narrower fast-path predicate would not be
+detected. Medium priority (insurance for Stage 6 firmware boot).
+
+### Enable-then-disable mid-quantum drops PSRAM edges
+
+`Emulator::step` checks `pio_idle` (`!any_sm_enabled`) at the *end*
+of the core loop. If a CPU instruction enables an SM at cycle C1 and
+another instruction disables it at C2 (both within the same quantum),
+the final state is "disabled" → `pio_idle=true` → fast-path runs
+`tick_pio(consumed)` which short-circuits → edges between C1..C2 are
+dropped. Unrealistic in firmware (SM-enable/disable pairs in a 64-
+cycle window is pathological) but a real semantic gap of the fast
+path. Low priority. Fix: OR the pre-loop enabled mask into the
+predicate.
