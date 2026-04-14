@@ -138,6 +138,15 @@ These surfaced during Phase 5.A code review. The emulator compiles and Phase 5.A
 
 `crates/mdrp2040/src/lib.rs` `Emulator::step` runs one instruction per core per call — unlike mdrp2350's quantum (N-instructions-per-quantum) scheduler. `update_gpio()` and `wake_checks()` also run per-instruction, which adds measurable per-Hz overhead and makes paced-throughput numbers worse than mdrp2350. Should converge to the quantum model before Phase 7 app work so `paced_bench` numbers are comparable across the two chips.
 
+**Status (2026-04-14, post-Phase-7):** not fixed. Phase 7 landed with
+`Emulator::step` still running one instruction per core per call. The
+`step_quantum` field on the builder is assigned but unused by `step()`,
+so configuring it is a no-op. Firmware correctness is unaffected (the
+blinky smoke test runs end-to-end in ~290ms, 7x headroom vs the 2s
+budget), but `paced_bench` for mdrp2040 is not directly comparable to
+mdrp2350's quantum-mode numbers until convergence happens. Still a real
+improvement to make, just not a blocker for firmware correctness.
+
 ### RP2040 SIO divider 2-read dirty clear heuristic
 
 `crates/mdrp2040/src/bus/sio.rs` clears the divider `dirty` flag after exactly two result reads. Real hardware clears `dirty` on any result read (per-register). The two-read heuristic happens to match the canonical `__aeabi_idivmod` pattern (quotient + remainder read in pairs), but misbehaves for firmware that reads only one result (e.g., modulo-only code paths leave `dirty` set until the next write). Low priority — fix by clearing on each read of `QUOTIENT`/`REMAINDER`.
@@ -191,3 +200,42 @@ Three Thumb-32 generator functions are stubbed out in lib.rs
 
 Uncomment and implement as Thumb-32 instruction classes are completed
 in the emulator.
+
+## Phase 6/7 Residuals
+
+These surfaced during the final conformance pass after Phase 7 shipped.
+None are firmware-correctness blockers; they are oracle-coverage and
+calibration gaps.
+
+### MULS cycle-count hardcode on mdrp2040 (not silicon-calibrated)
+
+`crates/mdrp2040/src/core/execute.rs` (~line 339) returns `1` cycle for
+`MULS`. Real Cortex-M0+ ships in two multiplier variants: a single-cycle
+"fast" multiplier (the RP2040's choice per the datasheet) and a
+32-cycle multi-cycle variant. `1` is defensible for the Pico's M0+ r0p1
+implementation, but the number is hardcoded with **no silicon
+calibration**. The `isa.rs` panel in `mdrp2040app` consumes this as
+ground truth (`MULS=1`). Not currently oracle-validated — the
+QEMU `cortex-m0` oracle does not compare cycle counts, and the probe
+oracle for RP2040 is a stub. Low priority — fix when a Pico probe
+harness is available to measure the real cycle count. Same caveat
+applies to the other hardcoded M0+ cycle counts in the same file
+(`LDR`, `LDM`, `B`, `BL`, `ADDS`).
+
+### Thumb-32 subset not QEMU-differentially validated
+
+`qemu_diff_m0plus` uses the `is_m0plus_safe` filter in
+`crates/mdpicoem-harness/src/lib.rs` which rejects every `TestCase` with
+`hw1.is_some()` — i.e., all 32-bit-wide Thumb encodings. Phase 4.B
+shipped ~700 lines of Thumb-32 executor code (`execute_wide.rs`) for
+`BL`, `MRS`, `MSR`, `DSB`, `DMB`, `ISB` with **unit-test-only
+coverage**; the QEMU differential oracle never exercises these paths.
+
+Fix: extend the fuzz generator (or add a new M0+-specific wide-subset
+generator) to produce valid `BL`/`MRS`/`MSR`/`DSB`/`DMB`/`ISB` test
+cases, then relax `is_m0plus_safe` to allow them through. Medium
+priority — unit tests cover the known happy paths but a
+differential oracle would catch decode/flag/SYSm corner cases that
+unit tests tend to miss. This entry supersedes the older "Thumb-32
+Test Generators" section above for the M0+-specific subset; the
+mdrp2350 T32 generator work remains pending separately.
