@@ -110,6 +110,38 @@ Fix: swap the bit check; update tests that used the wrong canonical encoding. Tr
 
 mdrp2040 Phase 4.A fixed the bug in its own code (2026-04-14).
 
+### mdrp2350 banked SP staleness in `enter_exception`/`exit_exception`
+
+mdrp2040 Phase 4.B uncovered (and fixed in its own tree) a banked-SP staleness hazard in the shared exception-entry/-exit pattern: `enter_exception` reads `self.regs.msp`/`psp` directly, but plain instructions (`SUB SP,#imm`, `ADD SP,#imm`, `PUSH`, `POP`) update `r[13]` without syncing back to the banked field. Handlers that allocate stack locals then return to unwind from a stale banked SP, corrupting the frame pointer. mdrp2350's `enter_exception`/`exit_exception` has the same shape and was not touched during Phase 4 per review scope. Fix: insert `sync_sp_to_banked()` at the top of both entry/exit and `sync_sp_from_banked()` after SP swaps, mirroring the mdrp2040 Phase 4.B apply-feedback change. Any Pico SDK handler stack-allocating locals will exhibit corruption today.
+
+## Phase 5.A Simplifications (RP2040 bus)
+
+These surfaced during Phase 5.A code review. The emulator compiles and Phase 5.A unit tests pass, but firmware exercising any of these paths will see incorrect behaviour. All are Phase 6+ work.
+
+### RP2040 WFE/SEV not wired on M0+
+
+`crates/mdrp2040/src/core/execute.rs` treats WFE and WFI as 1-cycle NOPs. `Emulator::step` clears `event_flag[0]` each step without a corresponding wait-state on core 0. Firmware using `__wfe`/SEV protocol will busy-loop rather than suspend. Needs a proper `wfe_waiting` flag per the mdrp2350 pattern (core suspends until a SEV, interrupt, or FIFO-rx event pending). Blocker before any multicore firmware with `__wfe()` idle loops (and any SDK `sev()`/`wfe()` helpers) can run correctly.
+
+### RP2040 SIO divider 8-cycle latency not modelled
+
+`crates/mdrp2040/src/bus/sio.rs` `DIV_CSR` reports `READY=1` immediately after a divider write. Real hardware requires 8 cycles for the DIV result to become available. Pico SDK `hw_divider_delay` uses inline-asm hard-coded NOPs rather than polling `CSR.READY`, so most SDK-using firmware is unaffected, but any firmware that busy-polls `CSR.READY` will read a stale result. Low priority — fix with a cycle counter on the divider state.
+
+### RP2040 PLL LOCK always 1
+
+`crates/mdrp2040/src/bus/clocks.rs` forces `PLL_SYS_CS[31]` (LOCK) to 1 on read so firmware wait-for-lock loops fall through on the first poll. If firmware writes `FBDIV_INT=0` and then polls LOCK, it will observe LOCK=1 but the derived `pll_output_hz` returns 0 (so the clock tree is 0 Hz). Partial mitigation: callers reading `sys_clk_hz` see the zero propagation. Proper modelling: LOCK=1 only when `pll_output_hz` > 0 (and/or only after a configured lock-delay). Low priority.
+
+### RP2040 core 1 SDK handshake not parsed
+
+`crates/mdrp2040/src/lib.rs` `maybe_wake_core1` wakes core 1 at its current reset-vector PC on any non-zero FIFO push by core 0. The real Pico SDK `multicore_launch_core1` sends a six-word handshake (0, 0, 1, VTOR, SP, entry) which the bootrom on core 1 parses before jumping. Our emulator ignores VTOR/SP/entry — any real SDK-based multicore firmware will either fault (bad SP) or land at the wrong entry. Fix in Phase 6: parse the six-word handshake in the SIO FIFO path and drive `core 1 wake + SP/PC/VTOR` from the handshake words.
+
+### RP2040 per-instruction dual-core cadence
+
+`crates/mdrp2040/src/lib.rs` `Emulator::step` runs one instruction per core per call — unlike mdrp2350's quantum (N-instructions-per-quantum) scheduler. `update_gpio()` and `wake_checks()` also run per-instruction, which adds measurable per-Hz overhead and makes paced-throughput numbers worse than mdrp2350. Should converge to the quantum model before Phase 7 app work so `paced_bench` numbers are comparable across the two chips.
+
+### RP2040 SIO divider 2-read dirty clear heuristic
+
+`crates/mdrp2040/src/bus/sio.rs` clears the divider `dirty` flag after exactly two result reads. Real hardware clears `dirty` on any result read (per-register). The two-read heuristic happens to match the canonical `__aeabi_idivmod` pattern (quotient + remainder read in pairs), but misbehaves for firmware that reads only one result (e.g., modulo-only code paths leave `dirty` set until the next write). Low priority — fix by clearing on each read of `QUOTIENT`/`REMAINDER`.
+
 ## Thumb-32 Test Generators
 
 Three Thumb-32 generator functions are stubbed out in lib.rs

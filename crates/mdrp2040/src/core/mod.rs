@@ -188,6 +188,17 @@ impl CortexM0Plus {
         }
         let mut cycles = self.decode_execute(bus);
 
+        // Synchronous bus fault — unmapped loads/stores or XIP-before-
+        // flash-loaded accesses set bus.bus_fault. On ARMv6-M (M0+) every
+        // synchronous fault escalates to the single HardFault vector (#3),
+        // so stage the HardFault and let deliver_fault drive entry. If the
+        // instruction also raised a pending_fault, the bus fault takes
+        // precedence (clearing the other keeps us from double-stacking).
+        if bus.bus_fault() {
+            bus.clear_bus_fault();
+            self.pending_fault = Some(Fault::HardFault);
+        }
+
         if let Some(fault) = self.pending_fault.take() {
             cycles = cycles.wrapping_add(self.deliver_fault(fault, bus));
         }

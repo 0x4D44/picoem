@@ -1,0 +1,400 @@
+//! RP2040 Single-cycle IO block (base 0xD000_0000).
+//!
+//! Dataheet §2.3. Provides:
+//!
+//! * CPUID (0x000) — reads as the requesting core's id (0 or 1).
+//! * GPIO_IN (0x004) — 30-bit input snapshot. Handled on Bus (merges SIO
+//!   output + PIO outputs). This struct owns the rest.
+//! * GPIO_OUT (0x010), GPIO_OUT_SET/CLR/XOR (0x014/0x018/0x01C).
+//! * GPIO_OE (0x020), GPIO_OE_SET/CLR/XOR (0x024/0x028/0x02C).
+//! * Inter-core FIFO (0x050-0x058).
+//! * 32 spinlocks at 0x100-0x17C.
+//! * Integer divider at 0x060-0x078.
+//! * Interpolators 0/1 at 0x080-0x0FC.
+//!
+//! **Differs from RP2350 SIO** by:
+//! * 30-bit GPIO mask (not 30 — same, but kept distinct for clarity).
+//! * GPIO_OUT/OE offsets `0x010`/`0x014`/… (SET/CLR/XOR at 4-byte spacing),
+//!   not the RP2350 8-byte spacing at `0x010`/`0x018`/….
+//! * **No** DOORBELL block — RP2040 has no inter-core doorbells.
+//! * **No** MTIME — RP2040 lacks the platform timer.
+//! * **No** coprocessor bridge FIFO.
+
+use mdpicoem_common::{Divider, Fifo};
+
+/// RP2040 GPIO pin mask — 30 valid GPIOs (bits [29:0]).
+pub(crate) const PIN_MASK: u32 = 0x3FFF_FFFF;
+
+/// Single-cycle IO block (RP2040).
+pub struct Sio {
+    /// GPIO_OUT register (offset 0x010).
+    pub gpio_out: u32,
+    /// GPIO_OE register (offset 0x020).
+    pub gpio_oe: u32,
+    /// Inter-processor FIFO: Core 0 writes → Core 1 reads.
+    fifo_to_core1: Fifo,
+    /// Inter-processor FIFO: Core 1 writes → Core 0 reads.
+    fifo_to_core0: Fifo,
+    /// Sticky write-overflow flag, per core.
+    fifo_wof: [bool; 2],
+    /// Sticky read-underflow flag, per core.
+    fifo_roe: [bool; 2],
+    /// 32 hardware spinlocks as a bitmask (bit N = SPINLOCK<N> claimed).
+    spinlock_bits: u32,
+    /// Set by FIFO_WR on successful push — Bus reads and clears this to
+    /// set `event_flag[other_core]`. `Some(other_core_idx)` while pending.
+    pub pending_fifo_event: Option<usize>,
+    /// Per-core integer divider.
+    divider: [Divider; 2],
+    /// Per-core interpolator register backing store (INTERP0 at 0x080-0x0BC,
+    /// INTERP1 at 0x0C0-0x0FC — 32 words per core).
+    interp: [[u32; 32]; 2],
+}
+
+impl Sio {
+    pub fn new() -> Self {
+        Self {
+            gpio_out: 0,
+            gpio_oe: 0,
+            fifo_to_core1: Fifo::new(),
+            fifo_to_core0: Fifo::new(),
+            fifo_wof: [false; 2],
+            fifo_roe: [false; 2],
+            spinlock_bits: 0,
+            pending_fifo_event: None,
+            divider: [Divider::default(); 2],
+            interp: [[0; 32]; 2],
+        }
+    }
+
+    /// Reset all SIO state. Called from `Emulator::reset()`.
+    pub fn reset(&mut self) {
+        self.gpio_out = 0;
+        self.gpio_oe = 0;
+        self.fifo_to_core1 = Fifo::new();
+        self.fifo_to_core0 = Fifo::new();
+        self.fifo_wof = [false; 2];
+        self.fifo_roe = [false; 2];
+        self.spinlock_bits = 0;
+        self.pending_fifo_event = None;
+        self.divider = [Divider::default(); 2];
+        self.interp = [[0; 32]; 2];
+    }
+
+    /// 32-bit register read. `offset` is masked to 12 bits by Bus. GPIO_IN
+    /// (0x004) is handled on Bus before this is called (merges SIO output
+    /// with PIO output — Phase 5.B wires PIO in).
+    pub fn read32(&mut self, offset: u32, core: usize) -> u32 {
+        match offset {
+            0x000 => core as u32, // CPUID
+            0x010 => self.gpio_out,
+            0x014 | 0x018 | 0x01C => self.gpio_out, // SET/CLR/XOR read as GPIO_OUT
+            0x020 => self.gpio_oe,
+            0x024 | 0x028 | 0x02C => self.gpio_oe,
+            // FIFO block.
+            0x050 => self.fifo_st_read(core),
+            0x058 => self.fifo_rd(core),
+            // Integer divider (0x060-0x078).
+            0x060 | 0x068 => self.divider[core].dividend,
+            0x064 | 0x06C => self.divider[core].divisor,
+            0x070 | 0x074 => self.divider_result_read(offset, core),
+            0x078 => {
+                let ready = 1u32;
+                let dirty = if self.divider[core].dirty { 2 } else { 0 };
+                ready | dirty
+            }
+            // Interpolators (0x080-0x0FC).
+            0x080..=0x0FC => {
+                let idx = ((offset - 0x080) >> 2) as usize;
+                self.interp[core][idx]
+            }
+            // Spinlock bank status at 0x05C (RP2040 specific).
+            0x05C => self.spinlock_bits,
+            // Spinlocks at 0x100-0x17F.
+            0x100..=0x17F => self.spinlock_read(offset),
+            _ => 0,
+        }
+    }
+
+    /// 32-bit register write.
+    pub fn write32(&mut self, offset: u32, val: u32, core: usize) {
+        match offset {
+            // GPIO_OUT block: 4-byte spacing (RP2040).
+            0x010 => self.gpio_out = val & PIN_MASK,
+            0x014 => self.gpio_out |= val & PIN_MASK, // SET
+            0x018 => self.gpio_out &= !(val & PIN_MASK), // CLR
+            0x01C => self.gpio_out ^= val & PIN_MASK, // XOR
+            // GPIO_OE block.
+            0x020 => self.gpio_oe = val & PIN_MASK,
+            0x024 => self.gpio_oe |= val & PIN_MASK,
+            0x028 => self.gpio_oe &= !(val & PIN_MASK),
+            0x02C => self.gpio_oe ^= val & PIN_MASK,
+            // FIFO block.
+            0x050 => self.fifo_st_write(val, core),
+            0x054 => self.fifo_wr(val, core),
+            // Divider.
+            0x060..=0x078 => self.divider_write(offset, val, core),
+            // Interpolators.
+            0x080..=0x0FC => {
+                let idx = ((offset - 0x080) >> 2) as usize;
+                if idx < 32 {
+                    self.interp[core][idx] = val;
+                }
+            }
+            // Spinlocks — any write releases.
+            0x100..=0x17F => self.spinlock_write(offset),
+            _ => {}
+        }
+    }
+
+    // --- GPIO bulk helpers (RP2040 has 30 valid GPIOs) --------------------
+
+    #[inline]
+    pub fn gpio_out_masked(&self) -> u32 {
+        self.gpio_out & PIN_MASK
+    }
+
+    #[inline]
+    pub fn gpio_oe_masked(&self) -> u32 {
+        self.gpio_oe & PIN_MASK
+    }
+
+    // --- FIFO helpers ------------------------------------------------------
+
+    fn fifo_st_read(&self, core: usize) -> u32 {
+        // Bit 0: VLD — this core's RX queue has data.
+        let rx_fifo = if core == 0 { &self.fifo_to_core0 } else { &self.fifo_to_core1 };
+        let vld = !rx_fifo.is_empty();
+        // Bit 1: RDY — other core's RX queue has space.
+        let tx_fifo = if core == 0 { &self.fifo_to_core1 } else { &self.fifo_to_core0 };
+        let rdy = !tx_fifo.is_full();
+        let wof = self.fifo_wof[core];
+        let roe = self.fifo_roe[core];
+        (vld as u32) | ((rdy as u32) << 1) | ((wof as u32) << 2) | ((roe as u32) << 3)
+    }
+
+    fn fifo_st_write(&mut self, val: u32, core: usize) {
+        if val & 0x4 != 0 {
+            self.fifo_wof[core] = false;
+        }
+        if val & 0x8 != 0 {
+            self.fifo_roe[core] = false;
+        }
+    }
+
+    fn fifo_wr(&mut self, val: u32, core: usize) {
+        let other = 1 - core;
+        let tx_fifo = if core == 0 {
+            &mut self.fifo_to_core1
+        } else {
+            &mut self.fifo_to_core0
+        };
+        if tx_fifo.push(val) {
+            self.pending_fifo_event = Some(other);
+        } else {
+            self.fifo_wof[core] = true;
+        }
+    }
+
+    fn fifo_rd(&mut self, core: usize) -> u32 {
+        let rx_fifo = if core == 0 {
+            &mut self.fifo_to_core0
+        } else {
+            &mut self.fifo_to_core1
+        };
+        match rx_fifo.pop() {
+            Some(v) => v,
+            None => {
+                self.fifo_roe[core] = true;
+                0
+            }
+        }
+    }
+
+    // --- Spinlock helpers --------------------------------------------------
+
+    fn spinlock_read(&mut self, offset: u32) -> u32 {
+        let n = ((offset - 0x100) >> 2) as u32;
+        debug_assert!(n < 32);
+        let mask = 1u32 << n;
+        if self.spinlock_bits & mask == 0 {
+            self.spinlock_bits |= mask;
+            mask
+        } else {
+            0
+        }
+    }
+
+    fn spinlock_write(&mut self, offset: u32) {
+        let n = ((offset - 0x100) >> 2) as u32;
+        debug_assert!(n < 32);
+        self.spinlock_bits &= !(1u32 << n);
+    }
+
+    // --- Divider helpers ---------------------------------------------------
+
+    fn divider_result_read(&mut self, offset: u32, core: usize) -> u32 {
+        let d = &mut self.divider[core];
+        let val = match offset {
+            0x070 => d.quotient,
+            0x074 => d.remainder,
+            _ => return 0,
+        };
+        if d.dirty {
+            d.reads_pending += 1;
+            if d.reads_pending >= 2 {
+                d.dirty = false;
+                d.reads_pending = 0;
+            }
+        }
+        val
+    }
+
+    fn divider_write(&mut self, offset: u32, val: u32, core: usize) {
+        let d = &mut self.divider[core];
+        match offset {
+            0x060 => { d.dividend = val; d.signed = false; }
+            0x064 => {
+                d.divisor = val;
+                d.signed = false;
+                Self::compute_division(d);
+            }
+            0x068 => { d.dividend = val; d.signed = true; }
+            0x06C => {
+                d.divisor = val;
+                d.signed = true;
+                Self::compute_division(d);
+            }
+            0x070 => { d.quotient = val; d.dirty = true; d.reads_pending = 0; }
+            0x074 => { d.remainder = val; d.dirty = true; d.reads_pending = 0; }
+            _ => {}
+        }
+    }
+
+    fn compute_division(d: &mut Divider) {
+        if d.divisor == 0 {
+            if d.signed {
+                let a = d.dividend as i32;
+                d.quotient = if a < 0 { 1u32 } else { (-1i32) as u32 };
+            } else {
+                d.quotient = 0xFFFF_FFFF;
+            }
+            d.remainder = d.dividend;
+        } else if d.signed {
+            let a = d.dividend as i32;
+            let b = d.divisor as i32;
+            d.quotient = a.wrapping_div(b) as u32;
+            d.remainder = a.wrapping_rem(b) as u32;
+        } else {
+            d.quotient = d.dividend.wrapping_div(d.divisor);
+            d.remainder = d.dividend.wrapping_rem(d.divisor);
+        }
+        d.dirty = true;
+        d.reads_pending = 0;
+    }
+}
+
+impl Default for Sio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpuid_returns_requesting_core() {
+        let mut sio = Sio::new();
+        assert_eq!(sio.read32(0x000, 0), 0);
+        assert_eq!(sio.read32(0x000, 1), 1);
+    }
+
+    #[test]
+    fn gpio_out_write_and_read() {
+        let mut sio = Sio::new();
+        sio.write32(0x010, 0x3F, 0);
+        assert_eq!(sio.read32(0x010, 0), 0x3F);
+    }
+
+    #[test]
+    fn gpio_out_set_clr_xor() {
+        let mut sio = Sio::new();
+        sio.write32(0x010, 0x0F, 0);
+        sio.write32(0x014, 0x10, 0); // SET
+        assert_eq!(sio.gpio_out, 0x1F);
+        sio.write32(0x018, 0x01, 0); // CLR
+        assert_eq!(sio.gpio_out, 0x1E);
+        sio.write32(0x01C, 0xFF, 0); // XOR
+        assert_eq!(sio.gpio_out, 0xE1);
+    }
+
+    #[test]
+    fn gpio_pin_mask_upper_bits() {
+        let mut sio = Sio::new();
+        sio.write32(0x010, 0xFFFF_FFFF, 0);
+        assert_eq!(sio.gpio_out, PIN_MASK);
+    }
+
+    #[test]
+    fn spinlock_claim_and_release() {
+        let mut sio = Sio::new();
+        // First claim returns the lock bit.
+        let claim = sio.read32(0x100, 0);
+        assert_eq!(claim, 1);
+        // Second claim returns 0.
+        let retry = sio.read32(0x100, 0);
+        assert_eq!(retry, 0);
+        // Release.
+        sio.write32(0x100, 0, 0);
+        let reclaim = sio.read32(0x100, 0);
+        assert_eq!(reclaim, 1);
+    }
+
+    #[test]
+    fn fifo_roundtrip() {
+        let mut sio = Sio::new();
+        // Core 0 writes -> core 1 reads.
+        sio.write32(0x054, 0xDEAD_BEEF, 0);
+        assert_eq!(sio.pending_fifo_event, Some(1));
+        let _ = sio.pending_fifo_event.take();
+        assert_eq!(sio.read32(0x058, 1), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn fifo_underflow_sets_roe() {
+        let mut sio = Sio::new();
+        // Read from empty RX fifo.
+        let v = sio.read32(0x058, 0);
+        assert_eq!(v, 0);
+        assert_eq!(sio.read32(0x050, 0) & 0x8, 0x8); // ROE bit
+    }
+
+    #[test]
+    fn divider_unsigned() {
+        let mut sio = Sio::new();
+        sio.write32(0x060, 100, 0);
+        sio.write32(0x064, 7, 0);
+        assert_eq!(sio.read32(0x070, 0), 14);
+        assert_eq!(sio.read32(0x074, 0), 2);
+    }
+
+    #[test]
+    fn divider_signed_divide_by_zero() {
+        let mut sio = Sio::new();
+        sio.write32(0x068, (-42i32) as u32, 0);
+        sio.write32(0x06C, 0, 0);
+        assert_eq!(sio.read32(0x070, 0), 1);
+        assert_eq!(sio.read32(0x074, 0), (-42i32) as u32);
+    }
+
+    #[test]
+    fn interp_roundtrip_per_core() {
+        let mut sio = Sio::new();
+        sio.write32(0x080, 0xAA, 0);
+        sio.write32(0x080, 0xBB, 1);
+        assert_eq!(sio.read32(0x080, 0), 0xAA);
+        assert_eq!(sio.read32(0x080, 1), 0xBB);
+    }
+}

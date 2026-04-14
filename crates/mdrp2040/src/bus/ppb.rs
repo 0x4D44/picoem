@@ -108,6 +108,69 @@ impl Ppb {
     pub fn any_active(&self) -> bool {
         self.active != 0
     }
+
+    /// Read a 32-bit PPB register.
+    ///
+    /// PPB base is `0xE000_0000`; the SCB lives at `0xE000_ED00..`.
+    /// Registers modelled on M0+:
+    /// * `CPUID`    at `0xE000_ED00` — read-only constant.
+    /// * `ICSR`     at `0xE000_ED04`.
+    /// * `VTOR`     at `0xE000_ED08`.
+    /// * `AIRCR`    at `0xE000_ED0C` — stub (VECTKEY echoes 0x05FA).
+    /// * `SHPR2/3`  at `0xE000_ED1C/20` (SHPR1 is RAZ on M0+).
+    /// Other offsets read-as-zero.
+    pub fn read32(&self, addr: u32) -> u32 {
+        match addr & 0x0FFF_FFFF {
+            0x000E_D000 => 0x410C_C601, // CPUID: Cortex-M0+ r0p1
+            0x000E_D004 => self.icsr,
+            0x000E_D008 => self.vtor,
+            0x000E_D00C => 0xFA05_0000, // AIRCR stub
+            0x000E_D01C => {
+                // SHPR2 covers exceptions 8..11 (SVCall at byte 3).
+                (self.shpr[7] as u32) << 24
+            }
+            0x000E_D020 => {
+                // SHPR3 covers exceptions 12..15 (PendSV byte 2, SysTick byte 3).
+                ((self.shpr[10] as u32) << 16) | ((self.shpr[11] as u32) << 24)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Write a 32-bit PPB register.
+    pub fn write32(&mut self, addr: u32, val: u32) {
+        match addr & 0x0FFF_FFFF {
+            0x000E_D004 => {
+                // ICSR: PENDSVSET / PENDSVCLR / PENDSTSET / PENDSTCLR
+                // are W1S/W1C bits; Phase 5.A stores the raw value so
+                // firmware round-trips, honouring clear bits as well.
+                if val & (1 << 27) != 0 {
+                    self.icsr &= !(1 << 28);
+                }
+                if val & (1 << 28) != 0 {
+                    self.icsr |= 1 << 28;
+                }
+                if val & (1 << 25) != 0 {
+                    self.icsr &= !(1 << 26);
+                }
+                if val & (1 << 26) != 0 {
+                    self.icsr |= 1 << 26;
+                }
+            }
+            0x000E_D008 => self.vtor = val,
+            0x000E_D01C => {
+                // SHPR2: byte 3 → SVCall priority (exception 11 → idx 7).
+                self.shpr[7] = ((val >> 24) & 0xFF) as u8;
+            }
+            0x000E_D020 => {
+                // SHPR3: byte 2 → PendSV (exc 14 → idx 10),
+                //         byte 3 → SysTick (exc 15 → idx 11).
+                self.shpr[10] = ((val >> 16) & 0xFF) as u8;
+                self.shpr[11] = ((val >> 24) & 0xFF) as u8;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Default for Ppb {

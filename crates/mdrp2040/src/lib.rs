@@ -1,18 +1,27 @@
-//! RP2040 emulator library. Phase 3 skeleton: only `new`/`reset` and
-//! direct memory peek/poke/cycles are implemented. All other methods
-//! are `todo!()` placeholders tagged with the phase that will fill
-//! them in.
+//! RP2040 emulator library.
+//!
+//! Phase 5.A fills in the bus fabric, CLOCKS/RESETS/PLL/XOSC/ROSC
+//! register storage, full SIO (GPIO, CPUID, FIFO, spinlocks, divider,
+//! interpolators — **no** doorbells / MTIME / coprocessor bridge),
+//! IO_BANK0 / PADS_BANK0, XIP_CTRL / SSI stubs, and dual-core stepping
+//! (core 0 runs; core 1 stays halted until woken via the SIO FIFO
+//! protocol).
+//!
+//! PIO blocks are reserved on the Bus struct but not wired up — that's
+//! Phase 5.B.
 //!
 //! See `wrk_docs/2026.04.14 - HLD - mdpicoem Workspace Restructure.md`.
 
 pub mod bus;
 pub mod core;
+pub mod memory;
 
 #[cfg(test)]
 mod tests;
 
 pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
+pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 
 pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats, Peripheral};
 #[cfg(target_arch = "x86_64")]
@@ -20,8 +29,7 @@ pub use mdpicoem_common::Pacer;
 
 /// ROSC nominal frequency (~6.5 MHz). RP2040 boots on ROSC at the same
 /// nominal rate as RP2350; PLL configuration (if any) happens later in
-/// firmware. Re-exported for callers that want the boot frequency
-/// without touching the common crate directly.
+/// firmware.
 pub use mdpicoem_common::ROSC_FREQ_HZ;
 
 /// Emulator configuration.
@@ -38,22 +46,16 @@ impl Default for Config {
     }
 }
 
-/// Default quantum size in cycles. Matches `mdrp2350`; Phase 4+ may
-/// revisit once the M0+ step path is wired up.
+/// Default quantum size in cycles. Matches `mdrp2350`.
 pub const DEFAULT_STEP_QUANTUM: u32 = 64;
 
 /// Top-level RP2040 emulator. Owns dual Cortex-M0+ cores, bus fabric,
 /// memory, and clock.
-///
-/// Phase 3 is a skeleton: only `new`/`reset` do real work. `step`,
-/// `run`, and anything touching peripherals/PIO/SIO panic with a
-/// `todo!` that names the phase responsible.
 pub struct Emulator {
     pub cores: [CortexM0Plus; 2],
     pub bus: Bus,
     pub clock: Clock,
-    /// Cycles advanced per call to `Emulator::step()`. See
-    /// [`DEFAULT_STEP_QUANTUM`].
+    /// Cycles advanced per call to [`Self::step`].
     pub step_quantum: u32,
 }
 
@@ -63,12 +65,12 @@ impl Emulator {
         EmulatorBuilder::new(config).build()
     }
 
-    /// Reset the emulator: load SP from ROM offset 0, PC from ROM offset 4.
-    /// Both cores boot from the reset vector.
-    ///
-    /// Phase 3 only sets registers; the Phase 4 M0+ exception model
-    /// will handle reset-exception accounting, MSP/PSP banking, and
-    /// NVIC state.
+    /// Reset the emulator:
+    /// * Load SP from ROM word 0, PC from ROM word 4 into both cores.
+    /// * Core 0 is the bootstrapped core (runs from reset).
+    /// * Core 1 is halted — the Pico SDK launches it by writing a
+    ///   wake sequence through the SIO FIFO; `step` calls
+    ///   [`Self::wake_checks`] each quantum to observe the handshake.
     pub fn reset(&mut self) {
         let initial_sp = self.bus.memory.rom_read32(0);
         let reset_vector = self.bus.memory.rom_read32(4);
@@ -80,70 +82,194 @@ impl Emulator {
             self.cores[i].regs.set_pc(reset_vector & !1);
             self.cores[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
         }
+        // Core 1 stays halted — bootrom on real silicon parks core 1 in
+        // a wait-for-event loop until core 0 sends the wake sequence.
+        self.cores[1].halt();
 
+        self.bus.sio.reset();
+        self.bus.resets.reset();
+        self.bus.clocks_regs.reset();
+        self.bus.xosc_regs.reset();
+        self.bus.rosc_regs.reset();
+        self.bus.pll_sys_regs = bus::clocks::PLL_RESET;
+        self.bus.pll_usb_regs = bus::clocks::PLL_RESET;
+        self.bus.clock_tree = Default::default();
+        self.bus.io_bank0.reset();
+        self.bus.pads_bank0.reset();
+        self.bus.clear_bus_fault();
+        self.bus.ppb = [Default::default(), Default::default()];
+        self.bus.event_flag = [false; 2];
         self.bus.gpio_in = 0;
+        self.bus.end_core1_step();
+
         self.clock = Clock { cycles: 0 };
     }
 
-    /// Load a raw binary at the given address.
-    pub fn load_image(&mut self, _addr: u32, _data: &[u8]) {
-        todo!("RP2040 load_image — Phase 5 (address decode)")
+    /// Load a raw binary at the given address. ROM writes are honoured
+    /// (test seeding path); SRAM writes land in the SRAM backing store;
+    /// XIP loads use [`Self::load_flash`].
+    pub fn load_image(&mut self, addr: u32, data: &[u8]) {
+        match addr >> 28 {
+            0x0 => {
+                // ROM: bootrom-style loads happen via `load_bootrom`.
+                // Support ROM overlay here for tests that want to place
+                // code at an arbitrary ROM offset without zero-padding.
+                let offset = (addr & 0x0FFF_FFFF) as usize;
+                let mut rom_buf = vec![0u8; ROM_SIZE];
+                // Seed with current ROM content so a partial overlay
+                // preserves whatever was already loaded.
+                for i in 0..ROM_SIZE {
+                    rom_buf[i] = self.bus.memory.rom_read8(i as u32);
+                }
+                let end = (offset + data.len()).min(ROM_SIZE);
+                if offset < ROM_SIZE {
+                    rom_buf[offset..end].copy_from_slice(&data[..end - offset]);
+                    self.bus.memory.load_rom(&rom_buf);
+                }
+            }
+            0x2 => {
+                for (i, &byte) in data.iter().enumerate() {
+                    let a = addr.wrapping_add(i as u32);
+                    self.bus.memory.sram_write8(a & 0x00FF_FFFF, byte);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Load the 16 KB RP2040 bootrom at address `0x0000_0000`.
-    pub fn load_bootrom(&mut self, _data: &[u8]) {
-        todo!("RP2040 load_bootrom — Phase 5 (BOOTROM mapping)")
+    pub fn load_bootrom(&mut self, data: &[u8]) {
+        self.bus.load_bootrom(data);
     }
 
     /// Load an XIP flash image (appears at XIP address `0x1000_0000`).
-    /// RP2040 has no onboard flash; the image is served from external
-    /// QSPI via XIP_CTRL+SSI. Phase 3 delegates straight to the memory
-    /// backing store; Phase 5 will add the XIP_CTRL+SSI wiring.
     pub fn load_flash(&mut self, data: &[u8]) {
         self.bus.load_flash(data);
     }
 
-    /// Advance the system by one quantum.
+    /// Advance the system by executing one instruction on each active
+    /// core (core 0 first, then core 1 if awake) and return the number
+    /// of cycles consumed.
     ///
-    /// Phase 4.B: drives core 0 only — `step` fetches / decodes /
-    /// executes a single instruction and returns the cycle cost. Phase 5
-    /// will extend this to dual-core scheduling with SIO + contention
-    /// bookkeeping.
+    /// Dual-core schedule:
+    /// 1. Step core 0 — fetch/decode/execute one instruction.
+    /// 2. If core 1 is not halted, step it with `contention_check_active`
+    ///    so same-bank SRAM accesses incur +1 cycle.
+    /// 3. Merge GPIO outputs and run wake checks.
+    ///
+    /// The return value is the *master-clock* delta — Phase 5.A uses
+    /// core 0's cycle cost (core 1 runs concurrently on real silicon).
     pub fn step(&mut self) -> u64 {
+        // Core 0 runs one instruction.
         self.bus.set_active_core(0);
-        let cycles = self.cores[0].step(&mut self.bus) as u64;
-        self.clock.cycles = self.clock.cycles.wrapping_add(cycles);
-        cycles
+        let c0 = self.cores[0].step(&mut self.bus) as u64;
+        self.maybe_wake_core1(0);
+
+        // Core 1 — one instruction if awake.
+        if !self.cores[1].is_halted() {
+            self.bus.set_active_core(1);
+            self.bus.begin_core1_step();
+            let _ = self.cores[1].step(&mut self.bus);
+            self.bus.end_core1_step();
+            self.maybe_wake_core1(1);
+        } else {
+            // Still clear any leftover bank-tracking state so the next
+            // quantum starts fresh.
+            self.bus.end_core1_step();
+        }
+
+        self.clock.cycles = self.clock.cycles.wrapping_add(c0);
+        self.update_gpio();
+        self.wake_checks();
+        c0
     }
 
     /// Run for at least `cycles` virtual cycles. Returns the number of
-    /// cycles actually executed (which may exceed the target by at most
-    /// one instruction's cost).
+    /// cycles actually executed (may overshoot by at most one instruction).
     pub fn run(&mut self, cycles: u64) -> u64 {
         let start = self.clock.cycles;
         while self.clock.cycles.wrapping_sub(start) < cycles {
             let consumed = self.step();
             if consumed == 0 {
-                // Halted core — avoid spinning forever.
                 break;
             }
         }
         self.clock.cycles.wrapping_sub(start)
     }
 
-    /// Read a GPIO pin from the merged pin state.
-    pub fn gpio_read(&self, _pin: u8) -> bool {
-        todo!("RP2040 gpio_read — Phase 5 (IO_BANK0 / PADS_BANK0)")
+    /// Merge SIO and PIO GPIO outputs into `bus.gpio_in`. Phase 5.A:
+    /// SIO output gated by OE is the only live source; PIO pads read
+    /// zero until Phase 5.B wires PIO in.
+    fn update_gpio(&mut self) {
+        let sio_out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        self.bus.gpio_in = sio_out & 0x3FFF_FFFF;
     }
 
-    /// Write a GPIO pin.
-    pub fn gpio_write(&mut self, _pin: u8, _value: bool) {
-        todo!("RP2040 gpio_write — Phase 5 (IO_BANK0 / PADS_BANK0)")
+    /// WFE/SEV wake check. Phase 5.A doesn't yet model WFE on M0+;
+    /// this is kept as a stub so the quantum-end plumbing lands where
+    /// Phase 6 (QEMU-diff validation) can hook in. For now, halted
+    /// core 1 is woken by `maybe_wake_core1` during FIFO traffic.
+    fn wake_checks(&mut self) {
+        // Consume any unhandled event flags so they don't latch forever.
+        self.bus.event_flag[0] = false;
+        // Leave core 1's flag alive — `maybe_wake_core1` observes it
+        // once the FIFO push handshake completes.
+    }
+
+    /// Observe the Pico SDK multicore-wake handshake. When core 0
+    /// writes a non-zero word through FIFO_WR while core 1 is halted,
+    /// pop the word and wake core 1 with SP/PC from the next two
+    /// handshake words (SDK convention).
+    ///
+    /// TODO(Phase 6): parse the full `multicore_launch_core1` handshake
+    /// (six-word sequence: 0, 0, 1, VTOR, SP, entry) and wake core 1 at
+    /// the supplied entry with the supplied SP/VTOR. Current placeholder
+    /// just wakes core 1 at its reset PC on any non-zero FIFO push —
+    /// enough to exercise the wake plumbing under unit tests, but any
+    /// real SDK-based multicore firmware will land at the wrong entry.
+    fn maybe_wake_core1(&mut self, writer_core: usize) {
+        if writer_core != 0 {
+            return;
+        }
+        if !self.cores[1].is_halted() {
+            return;
+        }
+        if self.bus.event_flag[1] {
+            // A FIFO write occurred — treat as a wake signal.
+            self.bus.event_flag[1] = false;
+            self.cores[1].wake();
+        }
+    }
+
+    /// Read a GPIO pin from the merged pin state.
+    pub fn gpio_read(&self, pin: u8) -> bool {
+        if pin >= 30 {
+            return false;
+        }
+        (self.bus.gpio_in >> pin) & 1 != 0
+    }
+
+    /// Write a GPIO pin. Sets the SIO GPIO_OUT bit and asserts output
+    /// enable so the pin state becomes observable via [`Self::gpio_read`].
+    /// Useful as a test-shim to inject a pin level without hand-rolling
+    /// the SIO register poking.
+    pub fn gpio_write(&mut self, pin: u8, value: bool) {
+        if pin >= 30 {
+            return;
+        }
+        let mask = 1u32 << pin;
+        self.bus.sio.gpio_oe |= mask;
+        if value {
+            self.bus.sio.gpio_out |= mask;
+        } else {
+            self.bus.sio.gpio_out &= !mask;
+        }
+        self.update_gpio();
     }
 
     /// Read all GPIO pins as a bitmask.
     pub fn gpio_read_all(&self) -> u64 {
-        todo!("RP2040 gpio_read_all — Phase 5 (IO_BANK0)")
+        self.bus.gpio_in as u64
     }
 
     /// Access core state.
@@ -155,9 +281,7 @@ impl Emulator {
         &mut self.cores[id]
     }
 
-    /// Direct memory read (bypasses bus timing). Phase 3 delegates to
-    /// the common `Memory` peek path; Phase 5 will add RP2040-specific
-    /// regions (boot ROM alias, XIP, SRAM scratch banks) as needed.
+    /// Direct memory read (bypasses bus timing).
     pub fn peek(&self, addr: u32) -> u32 {
         self.bus.peek32(addr)
     }
@@ -173,9 +297,9 @@ impl Emulator {
     }
 }
 
-/// Builder for assembling the emulator. Phase 3 has no optional
-/// components to wire up; Phase 5 will add peripheral injection points
-/// similar to `mdrp2350::EmulatorBuilder`.
+/// Builder for assembling the emulator. Seeds the Bus clock tree from
+/// `Config::sys_clk_hz` — the first CLOCKS / PLL register write
+/// replaces the seed with the derived value.
 pub struct EmulatorBuilder {
     config: Config,
     step_quantum: u32,
@@ -197,15 +321,17 @@ impl EmulatorBuilder {
     }
 
     pub fn build(self) -> Emulator {
-        // Phase 5 will seed the bus clock tree from `config.sys_clk_hz`.
-        // Phase 3 stores the value on `Config` but has no clock tree
-        // to seed — referenced here to silence "unused field" warnings.
-        let _ = self.config.sys_clk_hz;
-        Emulator {
+        let mut bus = Bus::new();
+        bus.seed_sys_clk_hz(self.config.sys_clk_hz);
+        let mut emu = Emulator {
             cores: [CortexM0Plus::with_id(0), CortexM0Plus::with_id(1)],
-            bus: Bus::new(),
+            bus,
             clock: Clock { cycles: 0 },
             step_quantum: self.step_quantum,
-        }
+        };
+        // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
+        emu.cores[1].halt();
+        emu
     }
 }
+

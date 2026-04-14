@@ -1656,6 +1656,30 @@ mod exceptions {
         cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
         assert_eq!(cpu.regs.sp(), initial_sp);
     }
+
+    /// An unmapped load sets `bus.bus_fault`; `step()` must observe the
+    /// flag, stage a HardFault, and deliver it via vector #3 (the single
+    /// synchronous-fault vector on ARMv6-M).
+    #[test]
+    fn unmapped_load_escalates_to_hardfault() {
+        let (mut bus, handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        // Program: LDR r1, [r0, #0] at 0x2000_4000 with r0 = 0x7000_0000
+        // (unmapped). Width-4 load through read32 sets bus_fault.
+        let prog = 0x2000_4000u32;
+        bus.write16(prog, 0x6801); // LDR r1, [r0]
+        cpu.regs.r[0] = 0x7000_0000;
+        cpu.regs.set_pc(prog);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3, "HardFault taken");
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+        assert!(
+            !bus.bus_fault(),
+            "step() cleared the sticky bus_fault flag"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
