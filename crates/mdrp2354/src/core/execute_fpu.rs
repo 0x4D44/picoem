@@ -221,6 +221,16 @@ impl CortexM33 {
             return self.thumb32_undefined(hw0, hw1);
         }
 
+        // Armv8-M FP extensions (VSEL, VMAXNM, VMINNM) are encoded with the
+        // 0xFE prefix; the existing VFPv4 ops live under 0xEE.
+        // `(hw1 & 0x10) == 0` means "CDP form" — the data-processing branch.
+        // The set bit is reserved for coprocessor register transfers, which
+        // the 0xFE family does not use.
+        let hw0_15_8 = (hw0 >> 8) & 0xFF;
+        if hw0_15_8 == 0xFE && hw1 & 0x10 == 0 {
+            return self.fpu_v8m_dp(hw0, hw1);
+        }
+
         // Distinguish data-processing / register-transfer from load/store
         // by hw0[11:8]. CDP/MCR/MRC have hw0[11:8]=0b1110, LDC/STC have 0b110x.
         let hw0_11_8 = (hw0 >> 8) & 0xF;
@@ -234,6 +244,59 @@ impl CortexM33 {
         } else {
             // Load/store (single or multiple)
             self.fpu_load_store(hw0, hw1, bus)
+        }
+    }
+
+    // -- Armv8-M data-processing extensions (VSEL / VMAXNM / VMINNM) --------
+    //
+    // Shared prefix hw0[15:8]=0xFE. The high bit hw0[7] splits the family:
+    //   hw0[7]=0  → VSEL<cc>   (hw0[6:5]=cc, cc in {EQ,VS,GE,GT})
+    //   hw0[7]=1  → VMAXNM/VMINNM (hw1[6]=op: 0=max, 1=min; hw0[6:5]=00)
+
+    fn fpu_v8m_dp(&mut self, hw0: u16, hw1: u16) -> u32 {
+        // In the Armv8-M 0xFE encodings the D bit sits at hw0[4] (instead of
+        // hw0[6] used by the VFPv4 family), so we can't share `vfp_sd` here.
+        let vd = ((hw1 >> 12) & 0xF) as usize;
+        let d = ((hw0 >> 4) & 1) as usize;
+        let sd = (vd << 1) | d;
+        let vn = (hw0 & 0xF) as usize;
+        let n = ((hw1 >> 7) & 1) as usize;
+        let sn = (vn << 1) | n;
+        let sm = vfp_sm(hw1);
+
+        if hw0 & 0x80 == 0 {
+            // VSEL<cc>.F32 — hw0[6:5] = cc: 00=EQ, 01=VS, 10=GE, 11=GT
+            let cc = (hw0 >> 5) & 0x3;
+            let take_sn = self.vsel_condition_holds(cc);
+            self.regs.s[sd] = if take_sn { self.regs.s[sn] } else { self.regs.s[sm] };
+            1
+        } else if (hw0 >> 5) & 0x3 == 0 {
+            // VMAXNM / VMINNM
+            let (sn_val, sm_val) = (self.regs.s[sn], self.regs.s[sm]);
+            let is_min = hw1 & (1 << 6) != 0;
+            self.regs.s[sd] = if is_min {
+                fpu_minnum(sn_val, sm_val)
+            } else {
+                fpu_maxnum(sn_val, sm_val)
+            };
+            1
+        } else {
+            self.thumb32_undefined(hw0, hw1)
+        }
+    }
+
+    /// Evaluate a VSEL condition against the current APSR flags.
+    /// Only four conditions are encodable: EQ, VS, GE, GT.
+    #[inline]
+    fn vsel_condition_holds(&self, cc: u16) -> bool {
+        let n = self.regs.flag_n();
+        let z = self.regs.flag_z();
+        let v = self.regs.flag_v();
+        match cc & 0x3 {
+            0b00 => z,               // EQ: Z == 1
+            0b01 => v,               // VS: V == 1
+            0b10 => n == v,          // GE: N == V
+            _    => !z && (n == v),  // GT: Z == 0 && N == V
         }
     }
 
@@ -401,20 +464,30 @@ impl CortexM33 {
                 14
             }
             (0b0010, 0) => {
-                // VCVTB.F16.F32 — half-precision conversion (stub)
-                self.thumb32_undefined(hw0, hw1)
+                // VCVTB.F16.F32 Sd, Sm — f32 Sm → f16 into bottom half of Sd
+                let half = f32_to_f16_bits(self.regs.s[sm]);
+                let dst = self.regs.s[sd].to_bits();
+                self.regs.s[sd] = f32::from_bits((dst & 0xFFFF_0000) | half as u32);
+                1
             }
             (0b0010, 1) => {
-                // VCVTT.F16.F32 — half-precision conversion (stub)
-                self.thumb32_undefined(hw0, hw1)
+                // VCVTT.F16.F32 Sd, Sm — f32 Sm → f16 into top half of Sd
+                let half = f32_to_f16_bits(self.regs.s[sm]);
+                let dst = self.regs.s[sd].to_bits();
+                self.regs.s[sd] = f32::from_bits((dst & 0x0000_FFFF) | ((half as u32) << 16));
+                1
             }
             (0b0011, 0) => {
-                // VCVTB.F32.F16 — half-precision conversion (stub)
-                self.thumb32_undefined(hw0, hw1)
+                // VCVTB.F32.F16 Sd, Sm — bottom half of Sm as f16 → f32 Sd
+                let half = (self.regs.s[sm].to_bits() & 0xFFFF) as u16;
+                self.regs.s[sd] = f16_bits_to_f32(half);
+                1
             }
             (0b0011, 1) => {
-                // VCVTT.F32.F16 — half-precision conversion (stub)
-                self.thumb32_undefined(hw0, hw1)
+                // VCVTT.F32.F16 Sd, Sm — top half of Sm as f16 → f32 Sd
+                let half = ((self.regs.s[sm].to_bits() >> 16) & 0xFFFF) as u16;
+                self.regs.s[sd] = f16_bits_to_f32(half);
+                1
             }
             (0b0100, 0) => {
                 // VCMP.F32 Sd, Sm — compare, quiet on NaN
@@ -721,4 +794,188 @@ fn fpu_vrint(val: f32, rmode: u32) -> f32 {
         0b10 => val.floor(),
         _ => val.trunc(),
     }
+}
+
+// ============================================================================
+// IEEE 754-2008 maxNum / minNum (NaN-aware)
+// ============================================================================
+//
+// If exactly one operand is NaN, return the other; if both are NaN, return a
+// default quiet NaN.
+//
+// Signed-zero handling (IEEE 754-2008 §5.3.1): maxNum(+0, -0) = +0 and
+// minNum(+0, -0) = -0 regardless of operand order. The float comparisons
+// `a > b` / `a < b` treat +0 and -0 as equal, so we must special-case zeros
+// via the sign bit.
+//
+// Exception flag tracking (IOC on sNaN, etc.) is deferred to Stage A.1.
+
+#[inline]
+fn fpu_maxnum(a: f32, b: f32) -> f32 {
+    if a.is_nan() && b.is_nan() {
+        f32::from_bits(ARM_DEFAULT_NAN)
+    } else if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a == 0.0 && b == 0.0 {
+        // Both zero: return +0 if either operand is +0.
+        // Sign bit is bit 31; 0 => positive.
+        if (a.to_bits() & 0x8000_0000) == 0 || (b.to_bits() & 0x8000_0000) == 0 {
+            0.0
+        } else {
+            -0.0
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline]
+fn fpu_minnum(a: f32, b: f32) -> f32 {
+    if a.is_nan() && b.is_nan() {
+        f32::from_bits(ARM_DEFAULT_NAN)
+    } else if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a == 0.0 && b == 0.0 {
+        // Both zero: return -0 if either operand is -0.
+        if (a.to_bits() & 0x8000_0000) != 0 || (b.to_bits() & 0x8000_0000) != 0 {
+            -0.0
+        } else {
+            0.0
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+// ============================================================================
+// Half-precision (IEEE 754 binary16) ↔ single-precision conversion
+// ============================================================================
+//
+// IEEE-754 layout:
+//   f16: sign(1) | exp(5) | frac(10)  — bias 15
+//   f32: sign(1) | exp(8) | frac(23)  — bias 127
+//
+// The FPSCR AHP bit (bit 26) selects "alternative half-precision" encoding
+// (no Inf/NaN, extended exponent range). RP2350 ships with AHP=0 at reset;
+// downstream code leaves it cleared. We implement IEEE (AHP=0) faithfully
+// and silently treat AHP=1 the same as AHP=0 for now — see Phase 7 HLD §A.2.
+
+/// Convert IEEE binary16 bits to an f32 value.
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = ((h as u32) >> 10) & 0x1F;
+    let frac = (h as u32) & 0x3FF;
+
+    let bits = if exp == 0 {
+        if frac == 0 {
+            // ±0
+            sign
+        } else {
+            // Subnormal half → normalized f32. Shift frac left until the
+            // hidden bit position is reached.
+            let mut mantissa = frac;
+            let mut e: i32 = 1; // biased-15 exponent of leading-1 after normalization
+            while mantissa & 0x400 == 0 {
+                mantissa <<= 1;
+                e -= 1;
+            }
+            let exp32 = (e - 15 + 127) as u32;
+            sign | (exp32 << 23) | ((mantissa & 0x3FF) << 13)
+        }
+    } else if exp == 0x1F {
+        // Inf / NaN
+        if frac == 0 {
+            sign | 0x7F80_0000
+        } else {
+            // Preserve NaN payload, force quiet bit
+            sign | 0x7F80_0000 | (frac << 13) | 0x0040_0000
+        }
+    } else {
+        // Normalized half → normalized f32
+        let exp32 = (exp as i32 - 15 + 127) as u32;
+        sign | (exp32 << 23) | (frac << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Convert an f32 value to IEEE binary16 bits (round-to-nearest-even, AHP=0).
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7F_FFFF;
+
+    if exp == 0xFF {
+        // Inf or NaN
+        return if frac == 0 {
+            sign | 0x7C00
+        } else {
+            // Quiet NaN: preserve top 10 payload bits, force quiet bit.
+            let payload = (frac >> 13) as u16;
+            sign | 0x7E00 | (payload & 0x1FF)
+        };
+    }
+
+    if exp == 0 {
+        // f32 zero or subnormal — all flush to f16 zero (tiny enough).
+        return sign;
+    }
+
+    // Unbiased f32 exponent.
+    let e = exp - 127;
+
+    if e > 15 {
+        // Overflow → +/- inf in IEEE half-precision.
+        return sign | 0x7C00;
+    }
+    if e < -24 {
+        // Smaller than smallest subnormal → ±0 (round-to-nearest-even).
+        return sign;
+    }
+
+    if e < -14 {
+        // Subnormal result in half precision. Compute
+        //   frac_10 = m * 2^(e+1)   where m is the 24-bit f32 mantissa
+        //   (implicit 1 + 23 fraction bits). Shift is `-e - 1` in [14, 23]
+        //   for e in [-15, -24] (we already returned zero for e < -24).
+        let m = (frac | 0x0080_0000) as u64;
+        let shift: u32 = (-e - 1) as u32;
+        let mantissa = (m >> shift) as u32;
+        let round_bit = if shift == 0 { 0 } else { ((m >> (shift - 1)) & 1) as u32 };
+        let sticky = if shift < 2 { false } else { (m & ((1u64 << (shift - 1)) - 1)) != 0 };
+        let lsb = mantissa & 1;
+        let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+        // Rounding up may carry the result into the normal range (2^-14),
+        // which is exactly exp=1, frac=0 in half precision.
+        if rounded >= 0x400 {
+            return sign | (1 << 10);
+        }
+        return sign | (rounded as u16 & 0x3FF);
+    }
+
+    // Normal result.
+    let exp16 = (e + 15) as u16;
+    let mantissa = frac >> 13;
+    let round_bit = (frac >> 12) & 1;
+    let sticky = (frac & 0xFFF) != 0;
+    let lsb = mantissa & 1;
+    let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+
+    // Rounding may overflow the 10-bit fraction into the exponent.
+    if rounded > 0x3FF {
+        let new_exp = exp16 + 1;
+        if new_exp >= 0x1F {
+            return sign | 0x7C00; // overflow to inf
+        }
+        return sign | (new_exp << 10);
+    }
+    sign | (exp16 << 10) | (rounded as u16 & 0x3FF)
 }

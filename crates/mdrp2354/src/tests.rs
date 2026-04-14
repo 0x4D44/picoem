@@ -3352,6 +3352,56 @@ fn enc_vpop(sd: u16, count: u16) -> (u16, u16) {
     (hw0, hw1)
 }
 
+/// Encode VSEL<cc>.F32 Sd, Sn, Sm (Armv8-M).
+/// cc ∈ {0=EQ, 1=VS, 2=GE, 3=GT}. Prefix 0xFE.
+/// hw0 = 1111 1110 | 0 cc[1] cc[0] D | Vn
+/// hw1 = Vd | 1010 | N 0 M 0 | Vm
+fn enc_vsel(cc: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xFE00 | ((cc & 0x3) << 5) | (d << 4) | vn;
+    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// Encode VMAXNM.F32 / VMINNM.F32 (Armv8-M).
+/// `op` = 0 → VMAXNM, `op` = 1 → VMINNM.
+/// hw0 = 1111 1110 | 1 0 0 D | Vn
+/// hw1 = Vd | 1010 | N op M 0 | Vm
+fn enc_vmaxminnm(op: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xFE00 | (1 << 7) | (d << 4) | vn;
+    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | ((op & 1) << 6) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// Encode VMAXNM.F32 Sd, Sn, Sm.
+fn enc_vmaxnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) { enc_vmaxminnm(0, sd, sn, sm) }
+
+/// Encode VMINNM.F32 Sd, Sn, Sm.
+fn enc_vminnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) { enc_vmaxminnm(1, sd, sn, sm) }
+
+/// Encode VCVTB.F16.F32 Sd, Sm (convert f32 → f16 into bottom half of Sd).
+fn enc_vcvtb_f16_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0010, 0, sd, sm) }
+
+/// Encode VCVTT.F16.F32 Sd, Sm (convert f32 → f16 into top half of Sd).
+fn enc_vcvtt_f16_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0010, 1, sd, sm) }
+
+/// Encode VCVTB.F32.F16 Sd, Sm (convert f16 from bottom half of Sm → f32 Sd).
+fn enc_vcvtb_f32_f16(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0011, 0, sd, sm) }
+
+/// Encode VCVTT.F32.F16 Sd, Sm (convert f16 from top half of Sm → f32 Sd).
+fn enc_vcvtt_f32_f16(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0011, 1, sd, sm) }
+
 // ============================================================================
 // FPU tests
 // ============================================================================
@@ -3811,6 +3861,242 @@ fn fpu_vmov_odd_register() {
     let (hw0, hw1) = enc_vmov_to_arm(1, 1);
     c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(1), 0xDEAD_BEEF);
+}
+
+// ----- VSEL ----------------------------------------------------------------
+
+#[test]
+fn fpu_vseleq_true_picks_sn() {
+    // Z=1 → condition EQ true → Sd = Sn
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.0;
+    c.regs.s[4] = 2.0;
+    c.regs.set_flag_z(true);
+    let (hw0, hw1) = enc_vsel(0, 0, 2, 4); // cc=00 (EQ)
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 1.0);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn fpu_vseleq_false_picks_sm() {
+    // Z=0 → condition EQ false → Sd = Sm
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.0;
+    c.regs.s[4] = 2.0;
+    c.regs.set_flag_z(false);
+    let (hw0, hw1) = enc_vsel(0, 0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 2.0);
+}
+
+#[test]
+fn fpu_vselvs_true_picks_sn() {
+    // V=1 → condition VS true → Sd = Sn
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 3.0;
+    c.regs.s[4] = 4.0;
+    c.regs.set_flag_v(true);
+    let (hw0, hw1) = enc_vsel(1, 0, 2, 4); // cc=01 (VS)
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 3.0);
+}
+
+#[test]
+fn fpu_vselvs_false_picks_sm() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 3.0;
+    c.regs.s[4] = 4.0;
+    c.regs.set_flag_v(false);
+    let (hw0, hw1) = enc_vsel(1, 0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 4.0);
+}
+
+#[test]
+fn fpu_vselge_true_picks_sn() {
+    // GE: N==V → true
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 5.0;
+    c.regs.s[4] = 6.0;
+    c.regs.set_flag_n(true);
+    c.regs.set_flag_v(true);
+    let (hw0, hw1) = enc_vsel(2, 0, 2, 4); // cc=10 (GE)
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 5.0);
+}
+
+#[test]
+fn fpu_vselge_false_picks_sm() {
+    // N != V → GE false
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 5.0;
+    c.regs.s[4] = 6.0;
+    c.regs.set_flag_n(true);
+    c.regs.set_flag_v(false);
+    let (hw0, hw1) = enc_vsel(2, 0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 6.0);
+}
+
+#[test]
+fn fpu_vselgt_true_picks_sn() {
+    // GT: Z==0 && N==V → true
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 7.0;
+    c.regs.s[4] = 8.0;
+    c.regs.set_flag_z(false);
+    c.regs.set_flag_n(false);
+    c.regs.set_flag_v(false);
+    let (hw0, hw1) = enc_vsel(3, 0, 2, 4); // cc=11 (GT)
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 7.0);
+}
+
+#[test]
+fn fpu_vselgt_false_picks_sm() {
+    // Z=1 → GT false (even with N==V)
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 7.0;
+    c.regs.s[4] = 8.0;
+    c.regs.set_flag_z(true);
+    c.regs.set_flag_n(false);
+    c.regs.set_flag_v(false);
+    let (hw0, hw1) = enc_vsel(3, 0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 8.0);
+}
+
+// ----- VMAXNM / VMINNM -----------------------------------------------------
+
+#[test]
+fn fpu_vmaxnm_normal() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.5;
+    c.regs.s[4] = 2.5;
+    let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 2.5);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn fpu_vmaxnm_nan_returns_other() {
+    // IEEE 754-2008 maxNum: NaN operand returns the non-NaN operand.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::NAN;
+    c.regs.s[4] = -3.0;
+    let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], -3.0);
+
+    // Other side: NaN as second operand
+    c.regs.s[2] = 7.0;
+    c.regs.s[4] = f32::NAN;
+    let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 7.0);
+
+    // Both NaN → result is qNaN (default NaN)
+    c.regs.s[2] = f32::NAN;
+    c.regs.s[4] = f32::NAN;
+    let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.s[0].is_nan());
+}
+
+#[test]
+fn fpu_vminnm_normal() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.5;
+    c.regs.s[4] = 2.5;
+    let (hw0, hw1) = enc_vminnm(0, 2, 4);
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 1.5);
+    assert_eq!(cy, 1);
+}
+
+#[test]
+fn fpu_vminnm_nan_returns_other() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::NAN;
+    c.regs.s[4] = 4.0;
+    let (hw0, hw1) = enc_vminnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], 4.0);
+
+    // Both NaN → qNaN
+    c.regs.s[2] = f32::NAN;
+    c.regs.s[4] = f32::NAN;
+    let (hw0, hw1) = enc_vminnm(0, 2, 4);
+    c.execute_one_wide(hw0, hw1);
+    assert!(c.regs.s[0].is_nan());
+}
+
+// ----- VCVTB / VCVTT (F16 <-> F32) -----------------------------------------
+
+#[test]
+fn fpu_vcvtb_f16_f32_roundtrip_bottom() {
+    // Round-trip 1.5 through bottom half: f32 -> f16 (bottom of Sd) -> f32.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.5f32;
+    // Preserve a known top half so we can verify it survives.
+    c.regs.s[0] = f32::from_bits(0xDEAD_0000);
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2); // VCVTB.F16.F32 S0, S2
+    let cy = c.execute_one_wide(hw0, hw1);
+    assert_eq!(cy, 1);
+
+    let bits = c.regs.s[0].to_bits();
+    // Top half preserved
+    assert_eq!(bits & 0xFFFF_0000, 0xDEAD_0000);
+
+    // Convert back: VCVTB.F32.F16 S4, S0 — read bottom half of S0 as f16, write to S4
+    let (hw0, hw1) = enc_vcvtb_f32_f16(4, 0);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[4], 1.5);
+}
+
+#[test]
+fn fpu_vcvtt_f16_f32_roundtrip_top() {
+    let mut c = CortexM33::new();
+    c.regs.s[2] = 1.5f32;
+    // Preserve known bottom half
+    c.regs.s[0] = f32::from_bits(0x0000_BEEF);
+    let (hw0, hw1) = enc_vcvtt_f16_f32(0, 2); // VCVTT.F16.F32 S0, S2
+    c.execute_one_wide(hw0, hw1);
+
+    let bits = c.regs.s[0].to_bits();
+    // Bottom half preserved
+    assert_eq!(bits & 0x0000_FFFF, 0x0000_BEEF);
+
+    // VCVTT.F32.F16 S4, S0 — read top half as f16 → f32
+    let (hw0, hw1) = enc_vcvtt_f32_f16(4, 0);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[4], 1.5);
+}
+
+#[test]
+fn fpu_vcvtb_f32_f16_infinity() {
+    // Half-precision +infinity is 0x7C00. Converting to f32 should give f32::INFINITY.
+    let mut c = CortexM33::new();
+    c.regs.s[2] = f32::from_bits(0x0000_7C00); // bottom half = +inf (h)
+    let (hw0, hw1) = enc_vcvtb_f32_f16(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], f32::INFINITY);
+
+    // Negative infinity: 0xFC00 in bottom half
+    c.regs.s[2] = f32::from_bits(0x0000_FC00);
+    let (hw0, hw1) = enc_vcvtb_f32_f16(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0], f32::NEG_INFINITY);
+
+    // And convert f32::INFINITY to f16 (bottom): bottom half should be 0x7C00
+    c.regs.s[2] = f32::INFINITY;
+    c.regs.s[0] = f32::from_bits(0xDEAD_0000);
+    let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
+    c.execute_one_wide(hw0, hw1);
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x7C00);
+    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF_0000, 0xDEAD_0000);
 }
 
 // ============================================================================
