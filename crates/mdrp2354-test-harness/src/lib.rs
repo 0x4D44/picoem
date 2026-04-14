@@ -4572,20 +4572,72 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     t
 }
 
+/// Instruction class selector for fuzz generation. Mirrors HLD §11:
+/// only `Base` (non-FPU Thumb-2) and `Fpu` are differential-testable
+/// against QEMU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuzzClass {
+    /// Base Thumb-16/Thumb-32 ALU + memory instructions (no FPU).
+    Base,
+    /// FPU (VFPv5) instructions only.
+    Fpu,
+    /// Both `Base` and `Fpu` (matches original `generate_fuzz` behaviour).
+    All,
+}
+
 /// Generate fuzz tests: random register values, random encodings.
 ///
 /// `count_per_class` tests are generated for each instruction class.
 /// `seed` makes the output reproducible.
 ///
 /// Returns (alu_tests, mem_tests) so the runner can prioritize differently.
+/// FPU tests are folded into `alu_tests` (no memory setup required — they
+/// use the FPU scratch area via R12). Kept for backwards compatibility;
+/// new callers should use [`generate_fuzz_classes`].
 pub fn generate_fuzz(count_per_class: usize, seed: u64) -> (Vec<TestCase>, Vec<TestCase>) {
+    let buckets = generate_fuzz_classes(count_per_class, seed);
+    let mut alu = buckets.base_alu;
+    alu.extend(buckets.fpu);
+    (alu, buckets.base_mem)
+}
+
+/// Fuzz buckets split by class. `base_alu` and `base_mem` are the
+/// non-FPU ALU and memory classes; `fpu` is the FPU class.
+pub struct FuzzBuckets {
+    pub base_alu: Vec<TestCase>,
+    pub base_mem: Vec<TestCase>,
+    pub fpu: Vec<TestCase>,
+}
+
+/// Generate fuzz tests partitioned by class. Seed order is preserved:
+/// base-alu first, then fpu, then base-mem — matching the RNG draw
+/// order of [`generate_fuzz`] so fuzz reproduction stays stable.
+pub fn generate_fuzz_classes(count_per_class: usize, seed: u64) -> FuzzBuckets {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut alu = generate_fuzz_alu(count_per_class, &mut rng);
-    alu.extend(thumb32_gen::generate_fuzz_t32_alu(count_per_class, &mut rng));
-    alu.extend(thumb32_gen::generate_fuzz_fpu(count_per_class, &mut rng));
-    let mut mem = generate_fuzz_mem(count_per_class, &mut rng);
-    mem.extend(thumb32_gen::generate_fuzz_t32_mem(count_per_class, &mut rng));
-    (alu, mem)
+    let mut base_alu = generate_fuzz_alu(count_per_class, &mut rng);
+    base_alu.extend(thumb32_gen::generate_fuzz_t32_alu(count_per_class, &mut rng));
+    let fpu = thumb32_gen::generate_fuzz_fpu(count_per_class, &mut rng);
+    let mut base_mem = generate_fuzz_mem(count_per_class, &mut rng);
+    base_mem.extend(thumb32_gen::generate_fuzz_t32_mem(count_per_class, &mut rng));
+    FuzzBuckets { base_alu, base_mem, fpu }
+}
+
+/// Filter buckets by selected class. `FuzzClass::All` returns
+/// everything; `Base` drops FPU; `Fpu` drops the base ALU/memory buckets.
+pub fn select_fuzz_class(buckets: FuzzBuckets, class: FuzzClass) -> FuzzBuckets {
+    match class {
+        FuzzClass::All => buckets,
+        FuzzClass::Base => FuzzBuckets {
+            base_alu: buckets.base_alu,
+            base_mem: buckets.base_mem,
+            fpu: Vec::new(),
+        },
+        FuzzClass::Fpu => FuzzBuckets {
+            base_alu: Vec::new(),
+            base_mem: Vec::new(),
+            fpu: buckets.fpu,
+        },
+    }
 }
 
 // ============================================================================
@@ -4757,25 +4809,12 @@ pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     // Reset bus wait-state accumulator (mirrors decode_execute path).
     shared_bus.reset_extra_wait_states();
 
-    // Step 1: the IT (or prelude) instruction. Drain any pre-existing stall
-    // cycles first, then execute exactly one instruction.
-    while core.stall_cycles() > 0 {
-        core.step(shared_bus);
-    }
+    // Step 1: the IT (or prelude) instruction.
+    // Step 2: the body instruction.
+    // `core.step()` is atomic (one instruction per call) in the quantum
+    // execution model — no drain needed.
     core.step(shared_bus);
-
-    // Step 2: the body instruction. Drain the stall cycles left over from
-    // step 1, then execute exactly one more instruction.
-    while core.stall_cycles() > 0 {
-        core.step(shared_bus);
-    }
     core.step(shared_bus);
-
-    // Drain any residual stall cycles so the core is at rest and PC points
-    // past the body instruction.
-    while core.stall_cycles() > 0 {
-        core.step(shared_bus);
-    }
 
     // Collect post-state
     let mut regs = [0u32; 16];
@@ -5100,13 +5139,7 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
 
     // Step through all instructions
     for _ in 0..n_insn {
-        while core.stall_cycles() > 0 {
-            core.step(shared_bus);
-        }
         core.step(shared_bus);
-        while core.stall_cycles() > 0 {
-            core.step(shared_bus);
-        }
     }
 
     // Collect integer post-state
@@ -5219,16 +5252,10 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
     // Reset bus wait-state accumulator.
     shared_bus.reset_extra_wait_states();
 
-    // Step through all 4 instructions using the drain-then-step pattern.
+    // Step through all 4 instructions. `core.step()` is atomic
+    // (one instruction per call) in the quantum execution model.
     for i in 0..4 {
-        while core.stall_cycles() > 0 {
-            core.step(shared_bus);
-        }
         core.step(shared_bus);
-        // Drain residual stall cycles from this instruction.
-        while core.stall_cycles() > 0 {
-            core.step(shared_bus);
-        }
 
         // Sanity: PC should advance by 4 each time (each instruction is 32-bit).
         let expected_pc = EMU_TEST_SLOT + (i + 1) * 4;
@@ -6358,6 +6385,62 @@ mod tests {
                 tc.name, tc.xpsr_pre
             );
         }
+    }
+
+    // -- FuzzClass / generate_fuzz_classes --
+
+    #[test]
+    fn fuzz_classes_partitions_match_legacy_generate_fuzz() {
+        // generate_fuzz_classes + fold matches the legacy generate_fuzz
+        // shape: base_alu + fpu = legacy alu; base_mem = legacy mem.
+        let buckets = generate_fuzz_classes(5, 42);
+        let (legacy_alu, legacy_mem) = generate_fuzz(5, 42);
+        assert_eq!(buckets.base_alu.len() + buckets.fpu.len(), legacy_alu.len());
+        assert_eq!(buckets.base_mem.len(), legacy_mem.len());
+        assert!(!buckets.fpu.is_empty(), "fpu bucket should be non-empty");
+        assert!(!buckets.base_alu.is_empty(), "base_alu bucket should be non-empty");
+    }
+
+    #[test]
+    fn fuzz_classes_fpu_bucket_only_fpu_tests() {
+        let buckets = generate_fuzz_classes(10, 0xABCD);
+        for tc in &buckets.fpu {
+            assert!(is_fpu_test(tc), "fpu bucket contains non-FPU test: {}", tc.name);
+        }
+        for tc in &buckets.base_alu {
+            assert!(!is_fpu_test(tc), "base_alu bucket contains FPU test: {}", tc.name);
+        }
+        for tc in &buckets.base_mem {
+            assert!(!is_fpu_test(tc), "base_mem bucket contains FPU test: {}", tc.name);
+        }
+    }
+
+    #[test]
+    fn select_fuzz_class_all_preserves_buckets() {
+        let buckets = generate_fuzz_classes(3, 7);
+        let (ba, bm, f) = (buckets.base_alu.len(), buckets.base_mem.len(), buckets.fpu.len());
+        let selected = select_fuzz_class(buckets, FuzzClass::All);
+        assert_eq!(selected.base_alu.len(), ba);
+        assert_eq!(selected.base_mem.len(), bm);
+        assert_eq!(selected.fpu.len(), f);
+    }
+
+    #[test]
+    fn select_fuzz_class_base_drops_fpu() {
+        let buckets = generate_fuzz_classes(3, 7);
+        let selected = select_fuzz_class(buckets, FuzzClass::Base);
+        assert!(selected.fpu.is_empty(), "Base class must produce empty fpu bucket");
+        assert!(!selected.base_alu.is_empty());
+        assert!(!selected.base_mem.is_empty());
+    }
+
+    #[test]
+    fn select_fuzz_class_fpu_drops_base() {
+        let buckets = generate_fuzz_classes(3, 7);
+        let selected = select_fuzz_class(buckets, FuzzClass::Fpu);
+        assert!(selected.base_alu.is_empty(), "Fpu class must produce empty base_alu bucket");
+        assert!(selected.base_mem.is_empty(), "Fpu class must produce empty base_mem bucket");
+        assert!(!selected.fpu.is_empty());
     }
 
     /// Guard against regressions in the probe_only producers:

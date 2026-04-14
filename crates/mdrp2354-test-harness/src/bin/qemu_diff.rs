@@ -4,9 +4,15 @@
 // in both QEMU and our emulator, compare results, report.
 //
 // Usage:
-//   qemu_diff                    Run targeted edge-case tests (default)
-//   qemu_diff --fuzz N           Run N random tests per instruction class
-//   qemu_diff --fuzz N --seed S  Reproducible fuzz run with seed S
+//   qemu_diff                              Run targeted edge-case tests (default)
+//   qemu_diff --fuzz N                     Run N random tests per instruction class
+//   qemu_diff --fuzz N --seed S            Reproducible fuzz run with seed S
+//   qemu_diff --fuzz N --classes=base|fpu|all
+//                                          Restrict fuzz to base (non-FPU) or FPU
+//                                          instructions. Defaults to `all`.
+//                                          Per HLD §11, only base and FPU classes
+//                                          are QEMU-oracled; CP0/CP4/CP5/CP7 are
+//                                          validated via softfloat_diff/unit tests.
 
 use std::time::Duration;
 
@@ -33,16 +39,36 @@ fn main() {
 struct Args {
     fuzz_count: Option<usize>,
     seed: Option<u64>,
+    class: FuzzClass,
+}
+
+fn parse_class(s: &str) -> Result<FuzzClass, String> {
+    match s {
+        "base" => Ok(FuzzClass::Base),
+        "fpu" => Ok(FuzzClass::Fpu),
+        "all" => Ok(FuzzClass::All),
+        other => Err(format!(
+            "invalid --classes value '{other}' (expected base|fpu|all)"
+        )),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut fuzz_count = None;
     let mut seed = None;
+    let mut class = FuzzClass::All;
     let mut i = 0;
 
     while i < args.len() {
-        match args[i].as_str() {
+        let a = args[i].as_str();
+        // Accept both `--classes=X` and `--classes X` forms.
+        if let Some(val) = a.strip_prefix("--classes=") {
+            class = parse_class(val)?;
+            i += 1;
+            continue;
+        }
+        match a {
             "--fuzz" => {
                 i += 1;
                 if i >= args.len() {
@@ -61,13 +87,21 @@ fn parse_args() -> Result<Args, String> {
                     format!("invalid seed '{}': {e}", args[i])
                 })?);
             }
+            "--classes" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--classes requires base|fpu|all".into());
+                }
+                class = parse_class(&args[i])?;
+            }
             other => {
                 return Err(format!(
                     "unknown argument '{other}'\n\
                      Usage:\n  \
-                     qemu_diff                    Run targeted edge-case tests (default)\n  \
-                     qemu_diff --fuzz N           Run N random tests per instruction class\n  \
-                     qemu_diff --fuzz N --seed S  Reproducible fuzz run with seed S"
+                     qemu_diff                              Run targeted edge-case tests (default)\n  \
+                     qemu_diff --fuzz N                     Run N random tests per class\n  \
+                     qemu_diff --fuzz N --seed S            Reproducible fuzz run\n  \
+                     qemu_diff --fuzz N --classes=base|fpu|all   Restrict fuzz to class"
                 ));
             }
         }
@@ -77,8 +111,11 @@ fn parse_args() -> Result<Args, String> {
     if seed.is_some() && fuzz_count.is_none() {
         return Err("--seed requires --fuzz".into());
     }
+    if class != FuzzClass::All && fuzz_count.is_none() {
+        return Err("--classes requires --fuzz".into());
+    }
 
-    Ok(Args { fuzz_count, seed })
+    Ok(Args { fuzz_count, seed, class })
 }
 
 // ============================================================================
@@ -110,7 +147,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_default()
                     .as_nanos() as u64
             });
-            run_fuzz(&mut gdb, &mut qemu, count, seed)
+            run_fuzz(&mut gdb, &mut qemu, count, seed, args.class)
         }
     }
 }
@@ -154,24 +191,37 @@ fn run_fuzz(
     qemu: &mut QemuProcess,
     count_per_class: usize,
     seed: u64,
+    class: FuzzClass,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Fuzz mode: {count_per_class} tests/class, seed={seed}");
-    println!("(reproduce with: qemu_diff --fuzz {count_per_class} --seed {seed})");
+    let class_str = match class {
+        FuzzClass::All => "all",
+        FuzzClass::Base => "base",
+        FuzzClass::Fpu => "fpu",
+    };
+    println!("Fuzz mode: {count_per_class} tests/class, seed={seed}, classes={class_str}");
+    println!(
+        "(reproduce with: qemu_diff --fuzz {count_per_class} --seed {seed} --classes={class_str})"
+    );
 
-    let (alu_tests, mem_tests) = generate_fuzz(count_per_class, seed);
-    let raw_total = alu_tests.len() + mem_tests.len();
-    let alu_tests: Vec<TestCase> = alu_tests.into_iter().filter(|tc| !tc.probe_only).collect();
-    let mem_tests: Vec<TestCase> = mem_tests.into_iter().filter(|tc| !tc.probe_only).collect();
-    let total = alu_tests.len() + mem_tests.len();
+    let buckets = select_fuzz_class(generate_fuzz_classes(count_per_class, seed), class);
+    let raw_total = buckets.base_alu.len() + buckets.base_mem.len() + buckets.fpu.len();
+    let alu_tests: Vec<TestCase> =
+        buckets.base_alu.into_iter().filter(|tc| !tc.probe_only).collect();
+    let mem_tests: Vec<TestCase> =
+        buckets.base_mem.into_iter().filter(|tc| !tc.probe_only).collect();
+    let fpu_tests: Vec<TestCase> =
+        buckets.fpu.into_iter().filter(|tc| !tc.probe_only).collect();
+    let total = alu_tests.len() + mem_tests.len() + fpu_tests.len();
     let filtered = raw_total - total;
     if filtered > 0 {
         println!("Filtered {filtered} probe-only tests (run via probe_diff)");
     }
     println!(
-        "Generated {} tests ({} ALU + {} memory)",
+        "Generated {} tests ({} ALU + {} memory + {} FPU)",
         total,
         alu_tests.len(),
-        mem_tests.len()
+        mem_tests.len(),
+        fpu_tests.len()
     );
 
     let mut shared_bus = Bus::new();
@@ -180,46 +230,32 @@ fn run_fuzz(
     let mut skip = 0usize;
     let mut done = 0usize;
 
-    // Run ALU tests first (fast, no memory setup)
-    for tc in &alu_tests {
-        done += 1;
-        if done % 1000 == 0 {
-            eprintln!("[{done}/{total}] {fail} failures...");
-        }
-        match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
-            Ok(()) => pass += 1,
-            Err(diff) if diff.starts_with("SKIPPED") => {
-                skip += 1;
-                eprintln!("[SKIP] {}: {}", tc.name, diff);
-            }
-            Err(diff) => {
-                fail += 1;
-                eprintln!(
-                    "[FAIL] {}\n  opcode: {:#06x}  hw1: {:?}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
-                    tc.name, tc.opcode, tc.hw1, tc.xpsr_pre, tc.reg_pre, diff
-                );
-            }
-        }
-    }
+    // Order: base ALU (fastest) -> FPU (no memory setup) -> base memory (slowest).
+    let buckets: [(&str, &[TestCase]); 3] = [
+        ("ALU", &alu_tests),
+        ("FPU", &fpu_tests),
+        ("MEM", &mem_tests),
+    ];
 
-    // Run memory tests (slower)
-    for tc in &mem_tests {
-        done += 1;
-        if done % 1000 == 0 {
-            eprintln!("[{done}/{total}] {fail} failures...");
-        }
-        match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
-            Ok(()) => pass += 1,
-            Err(diff) if diff.starts_with("SKIPPED") => {
-                skip += 1;
-                eprintln!("[SKIP] {}: {}", tc.name, diff);
+    for (_label, bucket) in &buckets {
+        for tc in *bucket {
+            done += 1;
+            if done % 1000 == 0 {
+                eprintln!("[{done}/{total}] {fail} failures...");
             }
-            Err(diff) => {
-                fail += 1;
-                eprintln!(
-                    "[FAIL] {}\n  opcode: {:#06x}  hw1: {:?}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
-                    tc.name, tc.opcode, tc.hw1, tc.xpsr_pre, tc.reg_pre, diff
-                );
+            match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
+                Ok(()) => pass += 1,
+                Err(diff) if diff.starts_with("SKIPPED") => {
+                    skip += 1;
+                    eprintln!("[SKIP] {}: {}", tc.name, diff);
+                }
+                Err(diff) => {
+                    fail += 1;
+                    eprintln!(
+                        "[FAIL] {}\n  opcode: {:#06x}  hw1: {:?}\n  xpsr_pre: {:#010x}\n  reg_pre: {:?}\n  diff: {}",
+                        tc.name, tc.opcode, tc.hw1, tc.xpsr_pre, tc.reg_pre, diff
+                    );
+                }
             }
         }
     }
@@ -228,13 +264,16 @@ fn run_fuzz(
     println!();
     println!("=== Fuzz summary ===");
     println!("Seed:    {seed}");
+    println!("Classes: {class_str}");
     println!("Total:   {total}");
     println!("Passed:  {pass}");
     println!("Failed:  {fail}");
     println!("Skipped: {skip}");
 
     if fail > 0 {
-        println!("\nReproduce: qemu_diff --fuzz {count_per_class} --seed {seed}");
+        println!(
+            "\nReproduce: qemu_diff --fuzz {count_per_class} --seed {seed} --classes={class_str}"
+        );
         std::process::exit(1);
     }
     Ok(())
