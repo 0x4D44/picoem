@@ -74,6 +74,19 @@ pub struct Bus {
     /// `pll_sys_regs`. Separate storage so configuring one PLL does
     /// not affect the other.
     pub(crate) pll_usb_regs: [u32; 4],
+    /// ROSC register image (LLD V2 §4.11). Indices map to offsets:
+    /// `0=CTRL (0x000)`, `1=FREQA (0x004)`, `2=FREQB (0x008)`,
+    /// `3=RANDOM (0x00C)`, `4=DORMANT (0x010)`, `5=DIV (0x014)`,
+    /// `6=STATUS (0x018)`, `7=RANDOMBIT (0x01C)`, `8=COUNT (0x020)`.
+    /// Storage-only — none of these affect the fixed 6.5 MHz ROSC
+    /// output. Read-only offsets (RANDOM, STATUS, RANDOMBIT, COUNT)
+    /// return synthesised values and ignore writes.
+    pub(crate) rosc_regs: [u32; 9],
+    /// XOSC register image (LLD V2 §4.12). Indices map to offsets:
+    /// `0=CTRL (0x000)`, `1=STATUS (0x004)`, `2=DORMANT (0x008)`,
+    /// `3=STARTUP (0x00C)`, `4=COUNT (0x01C)`.
+    /// Storage-only; STATUS and COUNT are read-only.
+    pub(crate) xosc_regs: [u32; 5],
     /// SIO GPIO_HI_IN (offset 0x008). Upper QSPI GPIO pins.
     /// When flash is loaded, returns pseudo-random noise to simulate
     /// QSPI pin activity (the bootrom samples this to detect flash).
@@ -119,6 +132,8 @@ impl Bus {
             clock_tree: ClockTree::default(),
             pll_sys_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
             pll_usb_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
+            rosc_regs: [0u32; 9],
+            xosc_regs: [0u32; 5],
             gpio_hi_noise_state: 0xA5A5_A5A5,
             xip_cache_offset: 0,
             sio: Sio::new(),
@@ -500,6 +515,7 @@ impl Bus {
                     0x4002_0000 => self.resets_read(offset),
                     0x4001_0000 => self.clocks_read(offset),
                     0x4004_8000 => self.xosc_read(offset),
+                    0x400E_8000 => self.rosc_read(offset),
                     0x4005_0000 => self.pll_sys_read(offset),
                     0x4005_8000 => self.pll_usb_read(offset),
                     0x400D_0000 => self.qmi_read(offset),
@@ -572,8 +588,8 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4004_8000 => {
-                        // SYSINFO (read-only), XOSC: ignore byte writes
+                    0x4000_0000 => {
+                        // SYSINFO: read-only, ignore byte writes
                     }
                     0x400D_0000 => {
                         // QMI: do RMW on the word
@@ -585,14 +601,15 @@ impl Bus {
                         bytes[byte_idx] = val;
                         self.qmi_write(reg_offset, u32::from_le_bytes(bytes));
                     }
-                    0x4001_0000 | 0x4005_0000 | 0x4005_8000 => {
-                        // CLOCKS / PLL_SYS / PLL_USB: peripherals that
-                        // handle the atomic alias internally. For a
-                        // subword SET/CLR/XOR we must preserve the
-                        // alias semantic — passing alias=0 after an
-                        // RMW merge would turn SET into plain overwrite
-                        // (see LLD V2 §4.8 note on the pre-existing
-                        // subword bug). Strategy:
+                    0x4001_0000 | 0x4005_0000 | 0x4005_8000
+                    | 0x4004_8000 | 0x400E_8000 => {
+                        // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
+                        // peripherals that handle the atomic alias
+                        // internally. For a subword SET/CLR/XOR we
+                        // must preserve the alias semantic — passing
+                        // alias=0 after an RMW merge would turn SET
+                        // into plain overwrite (see LLD V2 §4.8 note
+                        // on the pre-existing subword bug). Strategy:
                         //   • alias == 0 → RMW the word, pass alias=0.
                         //   • alias != 0 → expand byte to `byte << shift`
                         //     and let the peripheral's alias logic
@@ -604,7 +621,9 @@ impl Bus {
                             let old_word = match base {
                                 0x4001_0000 => self.clocks_read(reg_offset),
                                 0x4005_0000 => self.pll_sys_read(reg_offset),
-                                _ => self.pll_usb_read(reg_offset),
+                                0x4005_8000 => self.pll_usb_read(reg_offset),
+                                0x4004_8000 => self.xosc_read(reg_offset),
+                                _ => self.rosc_read(reg_offset),
                             };
                             let mut bytes = old_word.to_le_bytes();
                             bytes[byte_idx] = val;
@@ -615,7 +634,9 @@ impl Bus {
                         match base {
                             0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
                             0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
-                            _ => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                            0x4005_8000 => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                            0x4004_8000 => self.xosc_write(reg_offset, word_val, pass_alias),
+                            _ => self.rosc_write(reg_offset, word_val, pass_alias),
                         }
                     }
                     0x4002_0000 => {
@@ -687,6 +708,7 @@ impl Bus {
                     0x4002_0000 => self.resets_read(offset),
                     0x4001_0000 => self.clocks_read(offset),
                     0x4004_8000 => self.xosc_read(offset),
+                    0x400E_8000 => self.rosc_read(offset),
                     0x4005_0000 => self.pll_sys_read(offset),
                     0x4005_8000 => self.pll_usb_read(offset),
                     0x400D_0000 => self.qmi_read(offset),
@@ -766,8 +788,8 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4004_8000 => {
-                        // SYSINFO (read-only), XOSC: ignore halfword writes
+                    0x4000_0000 => {
+                        // SYSINFO: read-only, ignore halfword writes
                     }
                     0x400D_0000 => {
                         // QMI: do RMW on the word
@@ -779,9 +801,11 @@ impl Bus {
                         halves[half_idx] = val;
                         self.qmi_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
                     }
-                    0x4001_0000 | 0x4005_0000 | 0x4005_8000 => {
-                        // CLOCKS / PLL_SYS / PLL_USB: same subword-alias
-                        // strategy as `write8` (see the comment there).
+                    0x4001_0000 | 0x4005_0000 | 0x4005_8000
+                    | 0x4004_8000 | 0x400E_8000 => {
+                        // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
+                        // same subword-alias strategy as `write8`
+                        // (see the comment there).
                         let word_addr = canonical & !3;
                         let half_idx = ((canonical >> 1) & 1) as usize;
                         let reg_offset = word_addr & 0x0000_0FFF;
@@ -789,7 +813,9 @@ impl Bus {
                             let old_word = match base {
                                 0x4001_0000 => self.clocks_read(reg_offset),
                                 0x4005_0000 => self.pll_sys_read(reg_offset),
-                                _ => self.pll_usb_read(reg_offset),
+                                0x4005_8000 => self.pll_usb_read(reg_offset),
+                                0x4004_8000 => self.xosc_read(reg_offset),
+                                _ => self.rosc_read(reg_offset),
                             };
                             let mut halves: [u16; 2] =
                                 [old_word as u16, (old_word >> 16) as u16];
@@ -804,7 +830,9 @@ impl Bus {
                         match base {
                             0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
                             0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
-                            _ => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                            0x4005_8000 => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                            0x4004_8000 => self.xosc_write(reg_offset, word_val, pass_alias),
+                            _ => self.rosc_write(reg_offset, word_val, pass_alias),
                         }
                     }
                     0x4002_0000 => {
@@ -955,9 +983,8 @@ impl Bus {
                     0x4001_0000 => self.clocks_write(offset, val, alias),
                     0x4005_0000 => self.pll_sys_write(offset, val, alias),
                     0x4005_8000 => self.pll_usb_write(offset, val, alias),
-                    0x400E_8000 | 0x4004_8000 => {
-                        // ROSC, XOSC: accept writes, ignore (Phase D extends)
-                    }
+                    0x4004_8000 => self.xosc_write(offset, val, alias),
+                    0x400E_8000 => self.rosc_write(offset, val, alias),
                     // SYSINFO (0x4000_0000): read-only, ignore writes
                     0x4000_0000 => {}
                     0x5020_0000 => self.pio[0].write32(offset, val, alias),

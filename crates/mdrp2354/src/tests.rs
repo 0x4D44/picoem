@@ -5923,3 +5923,53 @@ fn test_pll_sys_write_set_alias_subword() {
     assert_eq!(bus.pll_usb_regs[1], 0x6D,
         "byte-wide SET alias on PLL_USB PWR must OR, not overwrite");
 }
+
+// ============================================================================
+// Clock Tree V2 Phase D: ROSC / XOSC register backing
+// ============================================================================
+
+#[test]
+fn test_rosc_ctrl_roundtrip() {
+    // Writing CTRL (0x000) should be stored and read back verbatim.
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x400E_8000, 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x400E_8000), 0xDEAD_BEEF,
+        "ROSC CTRL should round-trip writes (stored, reads return last write)");
+}
+
+#[test]
+fn test_rosc_status_unchanged_by_writes() {
+    // STATUS (0x018) is read-only: writes are dropped; reads always
+    // return STABLE | ENABLED per the V1 stub behaviour.
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x400E_8018, 0);
+    assert_eq!(bus.read32(0x400E_8018), (1 << 31) | (1 << 12),
+        "ROSC STATUS must remain STABLE|ENABLED regardless of writes");
+}
+
+#[test]
+fn test_xosc_ctrl_roundtrip() {
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x4004_8000, 0xCAFE_BABE);
+    assert_eq!(bus.read32(0x4004_8000), 0xCAFE_BABE,
+        "XOSC CTRL should round-trip writes");
+}
+
+#[test]
+fn test_xosc_startup_roundtrip() {
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x4004_800C, 0x0000_00C4);
+    assert_eq!(bus.read32(0x4004_800C), 0x0000_00C4,
+        "XOSC STARTUP should round-trip writes");
+}
+
+#[test]
+fn test_rosc_ctrl_alias_set() {
+    // Normal write CTRL=0x01, then write 0x02 via SET alias (0x400EA000)
+    // — bits should be OR-ed, not overwritten → CTRL reads 0x03.
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x400E_8000, 0x0000_0001);
+    bus.write32(0x400E_A000, 0x0000_0002);
+    assert_eq!(bus.read32(0x400E_8000), 0x0000_0003,
+        "SET alias on ROSC CTRL should OR bits, not overwrite");
+}

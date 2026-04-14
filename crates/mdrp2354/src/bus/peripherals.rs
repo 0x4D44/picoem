@@ -109,20 +109,91 @@ impl Bus {
         self.recompute_clock_tree();
     }
 
-    // --- ROSC (0x400E8000) ---
+    // --- ROSC (0x400E8000) --- see LLD V2 §4.11
+    //
+    // Register layout (`rosc_regs` index → offset):
+    //   0=CTRL (0x000), 1=FREQA (0x004), 2=FREQB (0x008),
+    //   3=RANDOM (0x00C), 4=DORMANT (0x010), 5=DIV (0x014),
+    //   6=STATUS (0x018), 7=RANDOMBIT (0x01C), 8=COUNT (0x020).
+    //
+    // Writes to writable offsets are stored but have no side effect on
+    // the fixed 6.5 MHz ROSC output. Reads from RANDOM, STATUS,
+    // RANDOMBIT, COUNT return synthesised values (writes are dropped).
     pub(crate) fn rosc_read(&self, offset: u32) -> u32 {
         match offset {
+            0x000 => self.rosc_regs[0], // CTRL
+            0x004 => self.rosc_regs[1], // FREQA
+            0x008 => self.rosc_regs[2], // FREQB
+            0x00C => 0,                 // RANDOM — stub (no PRNG)
+            0x010 => self.rosc_regs[4], // DORMANT
+            0x014 => self.rosc_regs[5], // DIV
             0x018 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
+            0x01C => 0,                 // RANDOMBIT
+            0x020 => 0,                 // COUNT
             _ => 0,
         }
     }
 
-    // --- XOSC (0x40048000) ---
+    /// Apply an alias-aware write to a ROSC register. `alias` matches
+    /// the APB convention (0=normal, 1=XOR, 2=SET, 3=CLR). Read-only
+    /// offsets (RANDOM, STATUS, RANDOMBIT, COUNT) ignore writes.
+    pub(crate) fn rosc_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let apply = |current: u32| match alias {
+            0 => val,
+            1 => current ^ val,
+            2 => current | val,
+            3 => current & !val,
+            _ => val,
+        };
+        let idx = match offset {
+            0x000 => 0, // CTRL
+            0x004 => 1, // FREQA
+            0x008 => 2, // FREQB
+            0x010 => 4, // DORMANT
+            0x014 => 5, // DIV
+            // 0x00C RANDOM / 0x018 STATUS / 0x01C RANDOMBIT / 0x020 COUNT
+            // are read-only — ignore writes.
+            _ => return,
+        };
+        self.rosc_regs[idx] = apply(self.rosc_regs[idx]);
+    }
+
+    // --- XOSC (0x40048000) --- see LLD V2 §4.12
+    //
+    // Register layout (`xosc_regs` index → offset):
+    //   0=CTRL (0x000), 1=STATUS (0x004), 2=DORMANT (0x008),
+    //   3=STARTUP (0x00C), 4=COUNT (0x01C).
+    //
+    // STATUS and COUNT are read-only.
     pub(crate) fn xosc_read(&self, offset: u32) -> u32 {
         match offset {
-            0x004 => (1 << 31) | (1 << 12), // STATUS: STABLE + ENABLED
+            0x000 => self.xosc_regs[0], // CTRL
+            0x004 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
+            0x008 => self.xosc_regs[2], // DORMANT
+            0x00C => self.xosc_regs[3], // STARTUP
+            0x01C => 0,                 // COUNT
             _ => 0,
         }
+    }
+
+    /// Apply an alias-aware write to an XOSC register. STATUS (0x004)
+    /// and COUNT (0x01C) are read-only and ignored.
+    pub(crate) fn xosc_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let apply = |current: u32| match alias {
+            0 => val,
+            1 => current ^ val,
+            2 => current | val,
+            3 => current & !val,
+            _ => val,
+        };
+        let idx = match offset {
+            0x000 => 0, // CTRL
+            0x008 => 2, // DORMANT
+            0x00C => 3, // STARTUP
+            // 0x004 STATUS / 0x01C COUNT are read-only — ignore writes.
+            _ => return,
+        };
+        self.xosc_regs[idx] = apply(self.xosc_regs[idx]);
     }
 
     // --- PLL_SYS (0x40050000) / PLL_USB (0x40058000) ---
