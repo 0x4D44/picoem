@@ -1,7 +1,7 @@
-mdrp2354 — NOTICE
+mdpicoem — NOTICE
 ==================
 
-The mdrp2354 codebase is licensed under MIT OR Apache-2.0 at your option.
+The mdpicoem codebase is licensed under MIT OR Apache-2.0 at your option.
 See LICENSE-MIT and LICENSE-APACHE for details.
 
 --------------------------------------------------------------------------------
@@ -9,7 +9,7 @@ See LICENSE-MIT and LICENSE-APACHE for details.
 Third-party content redistributed in this repository:
 
 Raspberry Pi RP2350 Bootrom
-    File:      roms/bootrom-combined.bin
+    File:      roms/rp2350/bootrom-combined.bin
     Source:    https://github.com/raspberrypi/pico-bootrom-rp2350
     License:   BSD-3-Clause
     Copyright: Copyright (c) 2024 Raspberry Pi Ltd.

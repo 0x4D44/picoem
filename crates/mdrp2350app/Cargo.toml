@@ -1,0 +1,12 @@
+[package]
+name = "mdrp2350app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mdrp2350 = { path = "../mdrp2350" }
+ratatui = "0.30"
+crossterm = "0.29"
+anyhow = "1"

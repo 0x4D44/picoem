@@ -1,13 +1,14 @@
-# mdrp2354
+# mdpicoem
 
-A cycle-accurate emulator for the Raspberry Pi **RP2354** microcontroller (dual Arm Cortex-M33 @ 150 MHz + 520 KB SRAM + PIO), written in Rust.
+A cycle-accurate emulator for the Raspberry Pi **RP2354** microcontroller (dual Arm Cortex-M33 @ 150 MHz + 520 KB SRAM + PIO), written in Rust. The workspace is being restructured to ship **RP2040** support alongside RP2350 — see `wrk_docs/2026.04.14 - HLD - mdpicoem Workspace Restructure.md` for the plan.
 
 The goal is a small, clean, verifiable emulator core that can boot the real Pi 2350/2354 bootrom, run Thumb-2 firmware with accurate cycle timing, and serve as a reusable library crate for downstream projects.
 
 ```
-mdrp2354 (this repo)          — RP2354 emulator crate + TUI + test harness
-  └─► onerom-emu              — OneROM firmware running on mdrp2354
-        └─► mddosem           — DOS emulator, uses OneROM as BIOS
+mdpicoem (this repo)           — RP2354 emulator crate + TUI + test harness
+  ├─► mdrp2350                 — RP2350 / RP2354 emulator library
+  └─► onerom-emu               — OneROM firmware running on mdrp2350
+        └─► mddosem            — DOS emulator, uses OneROM as BIOS
 ```
 
 ## Status
@@ -37,33 +38,31 @@ Actively developed. Arm-mode-only; Hazard3 RISC-V cores are out of scope.
 cargo build --release
 
 # Launch the interactive TUI with the blinky demo firmware
-cargo run -p mdrp2354-app --release
+cargo run -p mdrp2350app --release
 
 # Run a different bundled firmware preset
-cargo run -p mdrp2354-app --release -- lcd        # LCD demo
-cargo run -p mdrp2354-app --release -- benchmark  # throughput benchmark
-cargo run -p mdrp2354-app --release -- blinky     # (default)
+cargo run -p mdrp2350app --release -- lcd        # LCD demo
+cargo run -p mdrp2350app --release -- benchmark  # throughput benchmark
+cargo run -p mdrp2350app --release -- blinky     # (default)
 
 # Load your own firmware
-cargo run -p mdrp2354-app --release -- path/to/firmware.bin
+cargo run -p mdrp2350app --release -- path/to/firmware.bin
 ```
 
 The TUI has panels for CPU status, GPIO state, an LCD device emulator, an ISA trace view, and a live benchmark panel.
 
-Bundled ROMs under `roms/` (`blinky.bin`, `benchmark.bin`, `lcd_demo.bin`, `dualcore.bin`) are generated from the `gen_*.py` scripts in the same directory. The real Pi bootrom is checked in as `roms/bootrom-combined.bin`.
+Bundled ROMs under `roms/rp2350/` (`blinky.bin`, `benchmark.bin`, `lcd_demo.bin`, `dualcore.bin`) are generated from the `gen_*.py` scripts in the same directory. The real Pi bootrom is checked in as `roms/rp2350/bootrom-combined.bin`.
 
 ## Workspace Layout
 
-Six crates under `crates/`:
+Four crates under `crates/`:
 
-- **`mdrp2354`** — the emulator core library (CPUs, bus, memory, clocks, SIO, pacer). All the hot path lives here.
-- **`mdrp2354-app`** — the interactive TUI (ratatui + crossterm) with panels and a device frontend (LCD, benchmark).
-- **`mdrp2354-test-harness`** — all differential and hardware-in-the-loop test binaries.
-- **`mdrp2354-periph`** — peripheral implementations (UART/SPI/I2C/DMA) injected via the `Peripheral` trait. Stubbed.
-- **`mdrp2354-pio`** — PIO block emulation. Stubbed.
-- **`mdrp2354-debug`** — GDB RSP server and trace tooling. Stubbed.
+- **`mdrp2350`** — the emulator core library (CPUs, bus, memory, clocks, SIO, pacer). All the hot path lives here.
+- **`mdrp2350app`** — the interactive TUI (ratatui + crossterm) with panels and a device frontend (LCD, benchmark).
+- **`mdpicoem-harness`** — all differential and hardware-in-the-loop test binaries.
+- **`mdpicoem-debug`** — GDB RSP server and trace tooling. Stubbed.
 
-The top-level `src/main.rs` is a one-line sanity binary that prints config; the real UI is `mdrp2354-app`.
+The top-level `src/main.rs` is a one-line sanity binary that prints config; the real UI is `mdrp2350app`.
 
 ## Testing
 
@@ -73,11 +72,11 @@ The emulator is validated by three independent oracles, each catching different 
 
 ```bash
 cargo test                      # all crates
-cargo test -p mdrp2354          # core only
+cargo test -p mdrp2350          # core only
 cargo test <name_substring>     # filtered
 ```
 
-Instruction semantics, decode edge cases, exception mechanics, and clock-tree config live in `crates/mdrp2354/src/tests.rs`.
+Instruction semantics, decode edge cases, exception mechanics, and clock-tree config live in `crates/mdrp2350/src/tests.rs`.
 
 ### 2. QEMU differential harness
 
@@ -85,13 +84,13 @@ Spawns a QEMU Cortex-M33, connects over GDB on `localhost:3333`, runs the same i
 
 ```bash
 # Targeted edge-case suite (fast)
-cargo run -p mdrp2354-test-harness --release --bin qemu_diff
+cargo run -p mdpicoem-harness --release --bin qemu_diff
 
 # Random fuzz — N cases per instruction class
-cargo run -p mdrp2354-test-harness --release --bin qemu_diff -- --fuzz 100000
+cargo run -p mdpicoem-harness --release --bin qemu_diff -- --fuzz 100000
 
 # Reproduce a specific failure
-cargo run -p mdrp2354-test-harness --release --bin qemu_diff -- --fuzz 100000 --seed <S>
+cargo run -p mdpicoem-harness --release --bin qemu_diff -- --fuzz 100000 --seed <S>
 ```
 
 Requires `qemu-system-arm` on `PATH`.
@@ -102,13 +101,13 @@ Drive a real RP2354 board over SWD via a Pi Pico debug probe, single-step it, an
 
 ```bash
 # Same test suite as qemu_diff but against silicon
-cargo run -p mdrp2354-test-harness --release --bin probe_diff
+cargo run -p mdpicoem-harness --release --bin probe_diff
 
 # Register / DWT cycle-counter sanity checks
-cargo run -p mdrp2354-test-harness --release --bin probe_verify
+cargo run -p mdpicoem-harness --release --bin probe_verify
 
 # SRAM bank-conflict timing characterisation
-cargo run -p mdrp2354-test-harness --release --bin bank_conflict_test
+cargo run -p mdpicoem-harness --release --bin bank_conflict_test
 ```
 
 Requires a Pi Pico configured as a `probe-rs`-compatible debug probe wired to an RP2354 target.
@@ -116,7 +115,7 @@ Requires a Pi Pico configured as a `probe-rs`-compatible debug probe wired to an
 ### 4. Paced benchmark
 
 ```bash
-cargo run -p mdrp2354-test-harness --release --bin paced_bench
+cargo run -p mdpicoem-harness --release --bin paced_bench
 ```
 
 Measures real-time throughput with wall-clock pacing, useful for regression-checking performance work.
@@ -129,7 +128,7 @@ cargo llvm-cov
 
 ## Design Documents
 
-Phase HLDs live under `wrk_docs/`. Filenames follow `YYYY.MM.DD - HLD - <topic> V<N>.md`. Start with `2026.04.12 - RP2350 Emulator HLD.md` for the master design, then the phase docs (bus fabric, interrupts, dual-core, PIO, coprocessors/FPU) for subsystem detail. Newer dated versions supersede earlier drafts of the same phase.
+Phase HLDs live under `wrk_docs/`. Filenames follow `YYYY.MM.DD - HLD - <topic> V<N>.md`. Start with `2026.04.12 - RP2350 Emulator HLD.md` for the master design, then the phase docs (bus fabric, interrupts, dual-core, PIO, coprocessors/FPU) for subsystem detail. Newer dated versions supersede earlier drafts of the same phase. The ongoing workspace restructure is documented in `2026.04.14 - HLD - mdpicoem Workspace Restructure.md`.
 
 Per-session journals (investigations, performance work, review cycles) live under `wrk_journals/`. Known cycle-timing gaps tracked against real silicon are in `tech_debt.md`.
 
@@ -155,5 +154,5 @@ for inclusion in the work by you, as defined in the Apache-2.0 license, shall
 be dual licensed as above, without any additional terms or conditions.
 
 This repository also redistributes the Raspberry Pi RP2350 bootrom
-(`roms/bootrom-combined.bin`) under BSD-3-Clause — see [NOTICE](NOTICE) for
+(`roms/rp2350/bootrom-combined.bin`) under BSD-3-Clause — see [NOTICE](NOTICE) for
 attribution.

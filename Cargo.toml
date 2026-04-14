@@ -5,13 +5,14 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+rust-version = "1.88"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 panic = "abort"
 
-[profile.release.package.mdrp2354]
+[profile.release.package.mdrp2350]
 codegen-units = 1
 
 # Release build with line-tables for profiling (samply, perf, VTune).

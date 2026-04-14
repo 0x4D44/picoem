@@ -4,8 +4,8 @@
 # `+fma` the compiler falls back to `a*b + c` (two roundings), which would
 # produce UFC/IXC classification mismatches on boundary operands.
 #
-# See `fp_fma` in `crates/mdrp2354/src/core/execute_fpu.rs` and `ref_fma`
-# in `crates/mdrp2354-test-harness/src/ieee754_ref.rs`.
+# See `fp_fma` in `crates/mdrp2350/src/core/execute_fpu.rs` and `ref_fma`
+# in `crates/mdpicoem-harness/src/ieee754_ref.rs`.
 #
 # Belt-and-braces: `ieee754_ref.rs` also has a `compile_error!` gated on
 # `target_feature = "fma"` so any host NOT listed here fails the build

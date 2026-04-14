@@ -2,9 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## mdrp2354 — RP2354 Emulator
+## mdpicoem — RP2350 / RP2040 Emulator Workspace
 
-Cycle-accurate emulator for the Raspberry Pi RP2354 (dual Cortex-M33 + PIO). Rust workspace with six crates under `crates/`.
+Cycle-accurate emulator for the Raspberry Pi RP2354 / RP2350 family (dual Cortex-M33 + PIO), with planned RP2040 support. Rust workspace with four crates under `crates/` after the Phase 1 restructure:
+
+- `mdrp2350` — the RP2350/RP2354 emulator library (core, bus, memory, SIO, PIO, clocks, pacer).
+- `mdrp2350app` — the TUI demo app driving `mdrp2350`.
+- `mdpicoem-harness` — differential test binaries (QEMU diff, probe-rs diff, softfloat diff, paced benchmark, full-test runner).
+- `mdpicoem-debug` — GDB RSP scaffolding (stub).
+
+Later phases add `mdpicoem-common`, `mdrp2040`, and `mdrp2040app` — see `wrk_docs/2026.04.14 - HLD - mdpicoem Workspace Restructure.md`.
 
 ## Build & Test
 
@@ -19,7 +26,7 @@ cargo test
 cargo test <test_name_substr>
 
 # Run tests in one crate
-cargo test -p mdrp2354
+cargo test -p mdrp2350
 
 # Code coverage
 cargo llvm-cov
@@ -31,13 +38,13 @@ The QEMU harness spawns a QEMU Cortex-M33, connects over GDB on `localhost:3333`
 
 ```bash
 # Run N random fuzz tests per instruction class
-cargo run -p mdrp2354-test-harness --release --bin qemu_diff -- --fuzz <N>
+cargo run -p mdpicoem-harness --release --bin qemu_diff -- --fuzz <N>
 
 # Reproducible run with a specific seed
-cargo run -p mdrp2354-test-harness --release --bin qemu_diff -- --fuzz <N> --seed <S>
+cargo run -p mdpicoem-harness --release --bin qemu_diff -- --fuzz <N> --seed <S>
 
 # Targeted edge-case tests only (default, no args)
-cargo run -p mdrp2354-test-harness --release --bin qemu_diff
+cargo run -p mdpicoem-harness --release --bin qemu_diff
 ```
 
 ### Typical fuzz sessions
@@ -60,16 +67,14 @@ When the harness reports a mismatch:
 
 ## Workspace Layout
 
-- **`crates/mdrp2354`** — the emulator core (CPUs, bus, memory, clocks, SIO, pacer). All the hot path lives here.
-- **`crates/mdrp2354-app`** — interactive TUI (ratatui/crossterm) for register/memory/trace inspection and firmware loading.
-- **`crates/mdrp2354-debug`** — GDB RSP server + trace scaffolding (currently a stub).
-- **`crates/mdrp2354-periph`** — peripheral emulation (UART/SPI/I2C/timers/DMA) via the `Peripheral` trait defined in `mdrp2354`. Currently a stub.
-- **`crates/mdrp2354-pio`** — PIO block emulation (3 blocks × 4 state machines, 9-instruction ISA). Currently a stub.
-- **`crates/mdrp2354-test-harness`** — all test binaries (see "Testing Topology" below).
+- **`crates/mdrp2350`** — the emulator core (CPUs, bus, memory, clocks, SIO, pacer). All the hot path lives here.
+- **`crates/mdrp2350app`** — interactive TUI (ratatui/crossterm) for register/memory/trace inspection and firmware loading.
+- **`crates/mdpicoem-debug`** — GDB RSP server + trace scaffolding (currently a stub).
+- **`crates/mdpicoem-harness`** — all test binaries (see "Testing Topology" below).
 
-The top-level `src/main.rs` is a sanity-check stub that prints emulator config. **The real entry point is `mdrp2354-app`, not this binary.**
+The top-level `src/main.rs` is a sanity-check stub that prints emulator config. **The real entry point is `mdrp2350app`, not this binary.**
 
-## Core Emulator Architecture (`crates/mdrp2354/src/`)
+## Core Emulator Architecture (`crates/mdrp2350/src/`)
 
 - **`lib.rs`** — `Emulator` aggregates two `CortexM33` cores, `Bus`, `Clock`. Public API: `step`/`run`/`load_bootrom`/`load_flash`. Builder pattern for construction.
 - **`core/`** — CPU implementation:
@@ -90,14 +95,14 @@ The top-level `src/main.rs` is a sanity-check stub that prints emulator config. 
 
 Four independent oracles, each catching different bugs:
 
-1. **Unit tests** (`crates/mdrp2354/src/tests.rs`) — instruction semantics, decode, exceptions, clock tree.
+1. **Unit tests** (`crates/mdrp2350/src/tests.rs`) — instruction semantics, decode, exceptions, clock tree.
 2. **`qemu_diff`** — QEMU Cortex-M33 reference vs. emulator, via GDB single-step. Catches architectural mistakes (flag computation, wide-instruction decode, PC-relative addressing).
 3. **`probe_diff`** + **`probe_verify`** + **`bank_conflict_test`** — same idea but against **real RP2354 silicon** via SWD (probe-rs 0.31). Catches behaviours QEMU gets wrong or doesn't model (e.g. SRAM bank contention timing). Requires a Pico debug probe attached to RP2354 hardware.
 4. **`paced_bench`** and **`full_test`** — real-time paced throughput / integration smoke test.
 
 ## High-Level Design Documents
 
-Under `wrk_docs/`. HLDs are **phase-based and dated** (`YYYY.MM.DD - HLD - <topic> V<N>.md`). The original master HLD is `2026.04.12 - RP2350 Emulator HLD.md`, but subsequent phase HLDs (Phase 2 bus, Phase 3 interrupts, Phase 4 flash boot, Phase 5 dual-core SIO, Phase 6 PIO, Phase 7 coprocessors/FPU) supersede relevant sections.
+Under `wrk_docs/`. HLDs are **phase-based and dated** (`YYYY.MM.DD - HLD - <topic> V<N>.md`). The original master HLD is `2026.04.12 - RP2350 Emulator HLD.md`, but subsequent phase HLDs (Phase 2 bus, Phase 3 interrupts, Phase 4 flash boot, Phase 5 dual-core SIO, Phase 6 PIO, Phase 7 coprocessors/FPU) supersede relevant sections. The workspace restructure itself lives in `2026.04.14 - HLD - mdpicoem Workspace Restructure.md`.
 
 When working on a specific subsystem, **read the latest HLD for that phase** — not the master HLD. Later-dated versions (e.g. V5 over V2) supersede earlier drafts of the same phase.
 
@@ -109,4 +114,5 @@ Per-session notes live in `wrk_journals/`. Open technical debt is tracked in `te
 - **Pacer is `x86_64` only.** Don't assume it's available on other targets; gate usage accordingly.
 - **Clock tree is mutable at runtime.** Firmware can reprogram PLL/dividers via CLOCKS registers; the `ClockTree` cache on `Bus` is recomputed on each relevant register write. Don't hardcode frequencies.
 - **Hardware harness needs real silicon.** `probe_diff` / `probe_verify` / `bank_conflict_test` will not run in CI — they require a Pico debug probe attached to an RP2354 board.
-- **The `bin/` directory under `crates/mdrp2354-test-harness/src/` is tracked intentionally** — don't re-add a broad `bin/` rule to `.gitignore`; it silently hides test binaries.
+- **The `bin/` directory under `crates/mdpicoem-harness/src/` is tracked intentionally** — don't re-add a broad `bin/` rule to `.gitignore`; it silently hides test binaries.
+- **ROMs live under `roms/rp2350/`** (and `roms/rp2040/` once Phase 5 populates it). Pre-restructure code referenced bare `roms/...`; post-restructure, paths are `roms/rp2350/<file>`.

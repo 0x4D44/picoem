@@ -1264,48 +1264,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "mdrp2354"
+name = "mdpicoem-debug"
+version = "0.1.0"
+dependencies = [
+ "mdrp2350",
+]
+
+[[package]]
+name = "mdpicoem-harness"
+version = "0.10.0"
+dependencies = [
+ "chrono",
+ "mdrp2350",
+ "probe-rs",
+ "rand",
+]
+
+[[package]]
+name = "mdrp2350"
 version = "0.2.0"
 
 [[package]]
-name = "mdrp2354-app"
+name = "mdrp2350app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
- "mdrp2354",
+ "mdrp2350",
  "ratatui",
-]
-
-[[package]]
-name = "mdrp2354-debug"
-version = "0.1.0"
-dependencies = [
- "mdrp2354",
-]
-
-[[package]]
-name = "mdrp2354-periph"
-version = "0.1.0"
-dependencies = [
- "mdrp2354",
-]
-
-[[package]]
-name = "mdrp2354-pio"
-version = "0.1.0"
-dependencies = [
- "mdrp2354",
-]
-
-[[package]]
-name = "mdrp2354-test-harness"
-version = "0.10.0"
-dependencies = [
- "chrono",
- "mdrp2354",
- "probe-rs",
- "rand",
 ]
 
 [[package]]
