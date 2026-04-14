@@ -29,7 +29,12 @@
 // roundings, which silently de-synchronises the oracle from the emulator
 // (which uses `f32::mul_add`) and masks boundary bugs. Fail the build
 // LOUDLY rather than enumerate every possible host target in .cargo/config.toml.
-#[cfg(not(target_feature = "fma"))]
+//
+// Exclude `doctest` builds: rustdoc compiles doctests without the rustflags
+// declared in `.cargo/config.toml`, so the `+fma` check would spuriously
+// trigger. Doctests here do not execute FMA-sensitive code, and the real
+// `cargo test` path still enforces the feature via `--lib`/`--bin`.
+#[cfg(all(not(target_feature = "fma"), not(doctest)))]
 compile_error!(
     "mdrp2354-test-harness requires the +fma target feature. \
      Add 'rustflags = [\"-C\", \"target-feature=+fma\"]' to your \
@@ -392,6 +397,173 @@ pub fn ref_fma(a: f32, b: f32, c: f32, fpscr_in: u32) -> (f32, u32) {
     (result, flags)
 }
 
+/// Reference VRINT (round to integer per `rmode`).
+///
+/// `exact = true` matches VRINTX (raises IXC when the rounded value differs
+/// from the input); `exact = false` matches VRINTR/VRINTZ (no IXC tracking).
+/// All variants set IDC on denormal input, flush input under FZ=1, raise IOC
+/// on SNaN, and honor DN.
+///
+/// `rmode` encoding matches FPSCR[23:22]: 00=RN, 01=RP, 10=RM, 11=RZ.
+pub fn ref_vrint(val: f32, rmode: u32, fpscr_in: u32, exact: bool) -> (f32, u32) {
+    let mut flags = 0u32;
+    let val = ftz_input(fpscr_in, &mut flags, val);
+
+    if val.is_nan() {
+        if is_snan_f32(val) {
+            flags |= IOC;
+        }
+        // Quieten the NaN payload so DN=0 path is bit-stable across hosts;
+        // `apply_dn` substitutes the canonical NaN under DN=1.
+        let quiet = f32::from_bits(val.to_bits() | 0x0040_0000);
+        return (apply_dn(fpscr_in, quiet), flags);
+    }
+    if val.is_infinite() || val == 0.0 {
+        return (val, flags);
+    }
+    let rounded = match rmode {
+        0b00 => val.round_ties_even(),
+        0b01 => val.ceil(),
+        0b10 => val.floor(),
+        _ => val.trunc(),
+    };
+    if exact && rounded != val {
+        flags |= IXC;
+    }
+    (rounded, flags)
+}
+
+// ============================================================================
+// Half-precision (IEEE binary16) reference converters
+// ============================================================================
+//
+// Independent implementations — these must not call into the emulator's
+// half-precision helpers, since their job is to validate them.
+
+#[inline]
+fn is_snan_f16_bits(h: u16) -> bool {
+    let exp = (h >> 10) & 0x1F;
+    let frac = h & 0x3FF;
+    exp == 0x1F && frac != 0 && (frac & 0x200) == 0
+}
+
+/// Reference VCVTB/VCVTT.F32.F16 — convert a half-precision encoding to f32.
+///
+/// Cortex-M33 has no FZ16 control, so f16 denormals are value-preserved into
+/// f32 normals (no IDC). SNaN input raises IOC; DN=1 emits the f32 default
+/// NaN; DN=0 propagates the f16 payload into the f32 fraction with the quiet
+/// bit forced. `apply_dn` is the only DN choke point.
+pub fn ref_vcvt_f32_from_f16(h: u16, fpscr_in: u32) -> (f32, u32) {
+    let mut flags = 0u32;
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = ((h as u32) >> 10) & 0x1F;
+    let frac = (h as u32) & 0x3FF;
+
+    let bits = if exp == 0 {
+        if frac == 0 {
+            sign
+        } else {
+            // Subnormal half → normalized f32. Re-derive without the emulator's
+            // shift loop. Let `lz` be the count of leading zero bits above
+            // bit 9 of the 10-bit fraction (so lz ∈ [0, 9]). The highest set
+            // bit is at position `9 - lz`, the value is `2^(9-lz-24)`, and the
+            // biased f32 exponent is `(9 - lz) - 24 + 127 = 112 - lz`.
+            let lz = (frac as u16).leading_zeros() - 6;
+            let mantissa = (frac << (lz + 1)) & 0x3FF;
+            let exp32 = (112 - lz) as u32;
+            sign | (exp32 << 23) | (mantissa << 13)
+        }
+    } else if exp == 0x1F {
+        if frac == 0 {
+            sign | 0x7F80_0000
+        } else {
+            if is_snan_f16_bits(h) {
+                flags |= IOC;
+            }
+            sign | 0x7F80_0000 | (frac << 13) | 0x0040_0000
+        }
+    } else {
+        let exp32 = (exp as i32 - 15 + 127) as u32;
+        sign | (exp32 << 23) | (frac << 13)
+    };
+    (apply_dn(fpscr_in, f32::from_bits(bits)), flags)
+}
+
+/// Reference VCVTB/VCVTT.F16.F32 — convert f32 → f16 with round-to-nearest-even.
+///
+/// f32 denormal input flushes to f16 ±0 with IDC (denormal f32 magnitudes are
+/// well below the smallest f16 subnormal). SNaN input raises IOC; DN=1 emits
+/// the f16 default NaN (0x7E00).
+pub fn ref_vcvt_f16_from_f32(v: f32, fpscr_in: u32) -> (u16, u32) {
+    let mut flags = 0u32;
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7F_FFFF;
+
+    if exp == 0xFF {
+        let h = if frac == 0 {
+            sign | 0x7C00
+        } else {
+            if is_snan_f32(v) {
+                flags |= IOC;
+            }
+            if fpscr_in & DN != 0 {
+                0x7E00
+            } else {
+                let payload = (frac >> 13) as u16;
+                sign | 0x7E00 | (payload & 0x1FF)
+            }
+        };
+        return (h, flags);
+    }
+    if exp == 0 {
+        if frac != 0 {
+            flags |= IDC;
+        }
+        return (sign, flags);
+    }
+
+    let e = exp - 127;
+    if e > 15 {
+        return (sign | 0x7C00, flags);
+    }
+    if e < -24 {
+        return (sign, flags);
+    }
+    if e < -14 {
+        // Subnormal f16 result. Build the unrounded mantissa/round/sticky from
+        // the f32 fields directly — no shared helpers with the emulator.
+        let m = (frac | 0x0080_0000) as u64;
+        let shift: u32 = (-e - 1) as u32;
+        let mantissa = (m >> shift) as u32;
+        let round_bit = if shift == 0 { 0 } else { ((m >> (shift - 1)) & 1) as u32 };
+        let sticky = if shift < 2 { false } else { (m & ((1u64 << (shift - 1)) - 1)) != 0 };
+        let lsb = mantissa & 1;
+        let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+        if rounded >= 0x400 {
+            return (sign | (1 << 10), flags);
+        }
+        return (sign | (rounded as u16 & 0x3FF), flags);
+    }
+
+    let exp16 = (e + 15) as u16;
+    let mantissa = frac >> 13;
+    let round_bit = (frac >> 12) & 1;
+    let sticky = (frac & 0xFFF) != 0;
+    let lsb = mantissa & 1;
+    let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+
+    if rounded > 0x3FF {
+        let new_exp = exp16 + 1;
+        if new_exp >= 0x1F {
+            return (sign | 0x7C00, flags);
+        }
+        return (sign | (new_exp << 10), flags);
+    }
+    (sign | (exp16 << 10) | (rounded as u16 & 0x3FF), flags)
+}
+
 // ============================================================================
 // Unit tests — the oracle against known values
 // ============================================================================
@@ -654,5 +826,230 @@ mod tests {
         assert_eq!(r.to_bits(), 0x7FC0_0000);
         assert!(f & IOC != 0);
         assert!(f & IDC != 0);
+    }
+}
+
+// ============================================================================
+// DCP (CP4/5 double-precision coprocessor) reference oracle — Phase 7 Stage D
+// ============================================================================
+//
+// Unlike the single-precision FPU, the DCP doesn't have an FPSCR. Its status
+// register tracks four bits of the result only:
+//
+//   bit 0 — zero
+//   bit 1 — negative (sign bit set on result)
+//   bit 2 — infinity
+//   bit 3 — NaN
+//
+// No stickiness; each arithmetic op overwrites the register. No FZ/DN control;
+// we use native host f64 (IEEE-754 bit-exact).
+//
+// The reference is "host f64 op + derive the four status bits from the
+// result." Emulator and reference run the identical host op with identical
+// inputs, so bit equality is the only interesting test — but locking in the
+// status-bit derivation in *one* place is still worth it: if we ever move
+// the emulator to a non-trivial f64 implementation, this stays the oracle.
+
+/// DCP status bit masks.
+pub const DCP_Z: u32 = 1 << 0;
+pub const DCP_N: u32 = 1 << 1;
+pub const DCP_INF: u32 = 1 << 2;
+pub const DCP_NAN: u32 = 1 << 3;
+
+#[inline]
+fn dcp_status_from(r: f64) -> u32 {
+    let mut s = 0u32;
+    if r == 0.0 {
+        s |= DCP_Z;
+    }
+    if r.is_sign_negative() {
+        s |= DCP_N;
+    }
+    if r.is_infinite() {
+        s |= DCP_INF;
+    }
+    if r.is_nan() {
+        s |= DCP_NAN;
+    }
+    s
+}
+
+pub fn ref_dadd(a: f64, b: f64) -> (f64, u32) {
+    let r = a + b;
+    (r, dcp_status_from(r))
+}
+
+pub fn ref_dsub(a: f64, b: f64) -> (f64, u32) {
+    let r = a - b;
+    (r, dcp_status_from(r))
+}
+
+pub fn ref_dmul(a: f64, b: f64) -> (f64, u32) {
+    let r = a * b;
+    (r, dcp_status_from(r))
+}
+
+pub fn ref_ddiv(a: f64, b: f64) -> (f64, u32) {
+    let r = a / b;
+    (r, dcp_status_from(r))
+}
+
+pub fn ref_dsqrt(a: f64) -> (f64, u32) {
+    let r = a.sqrt();
+    (r, dcp_status_from(r))
+}
+
+pub fn ref_dcmp_eq(a: f64, b: f64) -> bool {
+    a == b
+}
+pub fn ref_dcmp_lt(a: f64, b: f64) -> bool {
+    a < b
+}
+pub fn ref_dcmp_le(a: f64, b: f64) -> bool {
+    a <= b
+}
+pub fn ref_dcmp_gt(a: f64, b: f64) -> bool {
+    a > b
+}
+pub fn ref_dcmp_ge(a: f64, b: f64) -> bool {
+    a >= b
+}
+
+/// Reference i32 → f64 conversion.
+pub fn ref_i2d(i: i32) -> f64 {
+    i as f64
+}
+/// Reference u32 → f64 conversion.
+pub fn ref_u2d(u: u32) -> f64 {
+    u as f64
+}
+/// Reference f64 → i32 (truncating, Rust `as` semantics).
+pub fn ref_d2i(d: f64) -> i32 {
+    d as i32
+}
+/// Reference f64 → u32 (truncating).
+pub fn ref_d2u(d: f64) -> u32 {
+    d as u32
+}
+/// Reference f64 → f32 (rounding per host f64-to-f32 convert).
+pub fn ref_d2f(d: f64) -> f32 {
+    d as f32
+}
+/// Reference f32 → f64 (exact, f32 is a subset of f64).
+pub fn ref_f2d(f: f32) -> f64 {
+    f as f64
+}
+
+#[cfg(test)]
+mod dcp_tests {
+    use super::*;
+
+    #[test]
+    fn ref_dadd_exact_integers_status_clear() {
+        let (r, s) = ref_dadd(1.0, 2.0);
+        assert_eq!(r, 3.0);
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn ref_dsub_produces_zero() {
+        let (r, s) = ref_dsub(3.0, 3.0);
+        assert_eq!(r, 0.0);
+        assert_eq!(s & DCP_Z, DCP_Z);
+    }
+
+    #[test]
+    fn ref_dsub_produces_negative() {
+        let (r, s) = ref_dsub(1.0, 2.0);
+        assert_eq!(r, -1.0);
+        assert_eq!(s & DCP_N, DCP_N);
+        assert_eq!(s & DCP_Z, 0);
+    }
+
+    #[test]
+    fn ref_ddiv_one_by_zero_plus_inf() {
+        let (r, s) = ref_ddiv(1.0, 0.0);
+        assert!(r.is_infinite() && r.is_sign_positive());
+        assert_eq!(s & DCP_INF, DCP_INF);
+        assert_eq!(s & DCP_Z, 0);
+        assert_eq!(s & DCP_N, 0);
+    }
+
+    #[test]
+    fn ref_ddiv_neg_one_by_zero_minus_inf() {
+        let (r, s) = ref_ddiv(-1.0, 0.0);
+        assert!(r.is_infinite() && r.is_sign_negative());
+        assert_eq!(s & DCP_INF, DCP_INF);
+        assert_eq!(s & DCP_N, DCP_N);
+    }
+
+    #[test]
+    fn ref_ddiv_zero_by_zero_nan() {
+        let (r, s) = ref_ddiv(0.0, 0.0);
+        assert!(r.is_nan());
+        assert_eq!(s & DCP_NAN, DCP_NAN);
+    }
+
+    #[test]
+    fn ref_dsqrt_four() {
+        let (r, s) = ref_dsqrt(4.0);
+        assert_eq!(r, 2.0);
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn ref_dsqrt_neg_produces_nan() {
+        let (r, s) = ref_dsqrt(-1.0);
+        assert!(r.is_nan());
+        assert_eq!(s & DCP_NAN, DCP_NAN);
+    }
+
+    #[test]
+    fn ref_dmul_large_overflow_to_inf() {
+        let (r, s) = ref_dmul(1e200, 1e200);
+        assert!(r.is_infinite());
+        assert_eq!(s & DCP_INF, DCP_INF);
+    }
+
+    #[test]
+    fn ref_dcmp_basic_predicates() {
+        assert!(ref_dcmp_eq(1.0, 1.0));
+        assert!(!ref_dcmp_eq(1.0, 2.0));
+        assert!(ref_dcmp_lt(1.0, 2.0));
+        assert!(!ref_dcmp_lt(2.0, 1.0));
+        assert!(!ref_dcmp_lt(1.0, 1.0));
+        assert!(ref_dcmp_le(1.0, 1.0));
+        assert!(ref_dcmp_gt(2.0, 1.0));
+        assert!(ref_dcmp_ge(2.0, 2.0));
+    }
+
+    #[test]
+    fn ref_dcmp_nan_all_false() {
+        let nan = f64::NAN;
+        assert!(!ref_dcmp_eq(nan, 1.0));
+        assert!(!ref_dcmp_lt(nan, 1.0));
+        assert!(!ref_dcmp_le(nan, 1.0));
+        assert!(!ref_dcmp_gt(nan, 1.0));
+        assert!(!ref_dcmp_ge(nan, 1.0));
+    }
+
+    #[test]
+    fn ref_convert_roundtrip() {
+        // i2d + d2i roundtrip.
+        let i = -0x1234_5678_i32;
+        let d = ref_i2d(i);
+        assert_eq!(d, i as f64);
+        assert_eq!(ref_d2i(d), i);
+
+        // u2d + d2u.
+        let u = 0xFEDC_BA98_u32;
+        let d = ref_u2d(u);
+        assert_eq!(d, u as f64);
+        assert_eq!(ref_d2u(d), u);
+
+        // f2d is exact; d2f may round.
+        let f = 3.14f32;
+        assert_eq!(ref_f2d(f), f as f64);
+        assert_eq!(ref_d2f(f as f64), f);
     }
 }

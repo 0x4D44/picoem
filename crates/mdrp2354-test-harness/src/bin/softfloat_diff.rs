@@ -12,12 +12,14 @@
 // see HLD §17.1 for the decision rationale.
 //
 // Usage:
-//   softfloat_diff                   Run edge-case tests
+//   softfloat_diff                   Run edge-case tests (FPU)
 //   softfloat_diff --fuzz N          Run N random tests per instruction type
 //   softfloat_diff --fuzz N --seed S Reproducible random run
+//   softfloat_diff --mode dcp        Switch to DCP (CP4/5) differential fuzzing
+//   softfloat_diff --mode all        FPU + DCP, edge-case or fuzz
 
 use mdrp2354_test_harness::ieee754_ref;
-use mdrp2354_test_harness::CortexM33;
+use mdrp2354_test_harness::{Bus, CortexM33};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -40,15 +42,24 @@ const FPSCR_MODES: [(u32, &str); 4] = [
 // Argument parsing
 // ============================================================================
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Fpu,
+    Dcp,
+    All,
+}
+
 struct Args {
     fuzz_count: Option<usize>,
     seed: Option<u64>,
+    mode: Mode,
 }
 
 fn parse_args() -> Result<Args, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut fuzz_count = None;
     let mut seed = None;
+    let mut mode = Mode::Fpu;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -70,13 +81,28 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("invalid seed: {e}"))?,
                 );
             }
+            "--mode" => {
+                i += 1;
+                mode = match args
+                    .get(i)
+                    .ok_or("--mode requires a value (fpu|dcp|all)")?
+                    .as_str()
+                {
+                    "fpu" => Mode::Fpu,
+                    "dcp" => Mode::Dcp,
+                    "all" => Mode::All,
+                    other => return Err(format!("unknown mode '{other}' (fpu|dcp|all)")),
+                };
+            }
             other => {
                 return Err(format!(
                     "unknown argument '{other}'\n\
                      Usage:\n  \
-                     softfloat_diff                   Run edge-case tests\n  \
+                     softfloat_diff                   Run edge-case tests (FPU)\n  \
                      softfloat_diff --fuzz N          Random tests per op type\n  \
-                     softfloat_diff --fuzz N --seed S Reproducible random run"
+                     softfloat_diff --fuzz N --seed S Reproducible random run\n  \
+                     softfloat_diff --mode dcp        Fuzz CP4/5 DCP against ref_d*\n  \
+                     softfloat_diff --mode all        FPU + DCP"
                 ));
             }
         }
@@ -85,7 +111,7 @@ fn parse_args() -> Result<Args, String> {
     if seed.is_some() && fuzz_count.is_none() {
         return Err("--seed requires --fuzz".into());
     }
-    Ok(Args { fuzz_count, seed })
+    Ok(Args { fuzz_count, seed, mode })
 }
 
 // ============================================================================
@@ -321,11 +347,35 @@ fn main() {
         }
     };
 
+    let seed = args.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    });
+
+    let mut any_fail = false;
+    if args.mode == Mode::Fpu || args.mode == Mode::All {
+        if !run_fpu(args.fuzz_count, seed) {
+            any_fail = true;
+        }
+    }
+    if args.mode == Mode::Dcp || args.mode == Mode::All {
+        if !run_dcp(args.fuzz_count, seed) {
+            any_fail = true;
+        }
+    }
+    if any_fail {
+        std::process::exit(1);
+    }
+}
+
+/// FPU mode runner — returns true on all-pass.
+fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
     let ops = [Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Sqrt, Op::Fma];
 
-    match args.fuzz_count {
+    match fuzz_count {
         None => {
-            // Targeted edge-case suite — run each case under all 4 FPSCR modes.
             let cases = edge_cases();
             let mut fail = 0usize;
             let mut total = 0usize;
@@ -338,27 +388,18 @@ fn main() {
                     }
                 }
             }
-            println!("Edge cases: {}/{} passed (across 4 FPSCR modes)", total - fail, total);
-            if fail > 0 {
-                std::process::exit(1);
-            }
+            println!("[FPU] Edge cases: {}/{} passed (across 4 FPSCR modes)", total - fail, total);
+            fail == 0
         }
         Some(count) => {
-            let seed = args.seed.unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64
-            });
             println!(
-                "Fuzz mode: {count} tests/op/mode × 4 FPSCR modes × 6 ops = {} total, seed={seed}\n\
+                "[FPU] Fuzz: {count} tests/op/mode × 4 FPSCR modes × 6 ops = {} total, seed={seed}\n\
                  (reproduce: softfloat_diff --fuzz {count} --seed {seed})",
                 count * 4 * ops.len()
             );
             let mut rng = StdRng::seed_from_u64(seed);
             let mut fail = 0usize;
             let mut total = 0usize;
-
             for (mode, label) in FPSCR_MODES {
                 for op in ops {
                     let arity = op.arity();
@@ -369,22 +410,297 @@ fn main() {
                         let c = if arity >= 3 { random_f32(&mut rng) } else { 0.0 };
                         if let Some(d) = run_single(op, a, b, c, mode, label) {
                             if fail < 20 {
-                                eprintln!("[FAIL] {d}");
+                                eprintln!("[FPU FAIL] {d}");
                             }
                             fail += 1;
                         }
                     }
                 }
             }
-            println!("Fuzz: {}/{} passed", total - fail, total);
-            if fail > 0 {
-                if fail >= 20 {
-                    eprintln!("(suppressed output for {} additional failures)", fail - 20);
+            println!("[FPU] Fuzz: {}/{} passed", total - fail, total);
+            if fail >= 20 {
+                eprintln!("[FPU] (suppressed output for {} additional failures)", fail - 20);
+            }
+            fail == 0
+        }
+    }
+}
+
+// ============================================================================
+// DCP (CP4/5) differential runner — Phase 7 Stage D
+// ============================================================================
+
+#[derive(Clone, Copy)]
+enum DcpOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sqrt,
+}
+
+impl DcpOp {
+    fn name(self) -> &'static str {
+        match self {
+            DcpOp::Add => "dadd",
+            DcpOp::Sub => "dsub",
+            DcpOp::Mul => "dmul",
+            DcpOp::Div => "ddiv",
+            DcpOp::Sqrt => "dsqrt",
+        }
+    }
+    /// The opc2 field in our DCP CDP encoding for opc1=0 (arithmetic).
+    fn opc2(self) -> u16 {
+        match self {
+            DcpOp::Add => 0,
+            DcpOp::Sub => 1,
+            DcpOp::Mul => 2,
+            DcpOp::Div => 3,
+            DcpOp::Sqrt => 4,
+        }
+    }
+    fn arity(self) -> usize {
+        match self {
+            DcpOp::Sqrt => 1,
+            _ => 2,
+        }
+    }
+}
+
+/// Encode a DCP CDP instruction on CP4 (see `coprocessor.rs::dcp_cdp_family`).
+///   hw0 = 0xEE00 | (opc1 << 4) | CRn
+///   hw1 = (CRd << 12) | (coproc << 8) | (opc2 << 5) | CRm     (bit 4 = 0 → CDP)
+fn enc_dcp_cdp(opc1: u16, opc2: u16, crd: u16, crn: u16, crm: u16) -> (u16, u16) {
+    let hw0 = 0xEE00 | ((opc1 & 0xF) << 4) | (crn & 0xF);
+    let hw1 = ((crd & 0xF) << 12) | (4 << 8) | ((opc2 & 0x7) << 5) | (crm & 0xF);
+    (hw0, hw1)
+}
+
+/// Enable a coprocessor in CPACR for core 0. Needed before any CP op.
+fn enable_cp(bus: &mut Bus, coproc: u8) {
+    let core = bus.active_core();
+    bus.ppb[core].cpacr |= 0x3 << (coproc as u32 * 2);
+}
+
+struct DcpDiscrepancy {
+    op: DcpOp,
+    a: f64,
+    b: f64,
+    emu_result: f64,
+    ref_result: f64,
+    emu_status: u32,
+    ref_status: u32,
+}
+
+impl std::fmt::Display for DcpDiscrepancy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} a=0x{:016X}({}) b=0x{:016X}({}) | \
+             emu=0x{:016X} status=0x{:02X} | ref=0x{:016X} status=0x{:02X}",
+            self.op.name(),
+            self.a.to_bits(),
+            self.a,
+            self.b.to_bits(),
+            self.b,
+            self.emu_result.to_bits(),
+            self.emu_status,
+            self.ref_result.to_bits(),
+            self.ref_status,
+        )
+    }
+}
+
+fn run_dcp_single(op: DcpOp, a: f64, b: f64) -> Option<DcpDiscrepancy> {
+    // Emulator side — load a, b into d[0], d[1]; execute into d[2].
+    let mut emu = CortexM33::new();
+    let mut bus = Bus::default();
+    enable_cp(&mut bus, 4);
+    emu.dcp_set_double(0, a);
+    if op.arity() >= 2 {
+        emu.dcp_set_double(1, b);
+    }
+    let (hw0, hw1) = enc_dcp_cdp(0, op.opc2(), 2, 0, 1);
+    emu.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+    let emu_result = emu.dcp_get_double(2);
+    let emu_status = emu.dcp_get_status();
+
+    // Reference side.
+    let (ref_result, ref_status) = match op {
+        DcpOp::Add => ieee754_ref::ref_dadd(a, b),
+        DcpOp::Sub => ieee754_ref::ref_dsub(a, b),
+        DcpOp::Mul => ieee754_ref::ref_dmul(a, b),
+        DcpOp::Div => ieee754_ref::ref_ddiv(a, b),
+        DcpOp::Sqrt => ieee754_ref::ref_dsqrt(a),
+    };
+
+    // NaN-vs-NaN: we don't contract payload bits (matches FPU handling).
+    let result_match = if emu_result.is_nan() && ref_result.is_nan() {
+        true
+    } else {
+        emu_result.to_bits() == ref_result.to_bits()
+    };
+    // When both sides produce a NaN, the status's N (sign) bit is
+    // implementation-defined per IEEE-754. Compare status with N masked
+    // out on NaN-vs-NaN.
+    let status_mask = if emu_result.is_nan() && ref_result.is_nan() {
+        !ieee754_ref::DCP_N
+    } else {
+        !0u32
+    };
+    let status_match = (emu_status & status_mask) == (ref_status & status_mask);
+
+    if result_match && status_match {
+        None
+    } else {
+        Some(DcpDiscrepancy {
+            op,
+            a,
+            b,
+            emu_result,
+            ref_result,
+            emu_status,
+            ref_status,
+        })
+    }
+}
+
+fn random_f64(rng: &mut StdRng) -> f64 {
+    let roll = rng.gen_range(0..20);
+    match roll {
+        0 => 0.0,
+        1 => -0.0,
+        2 => f64::INFINITY,
+        3 => f64::NEG_INFINITY,
+        4 => f64::NAN,
+        5 => f64::MIN_POSITIVE,
+        6 => f64::MAX,
+        7 => -f64::MAX,
+        8 => 1.0,
+        9 => -1.0,
+        10 => {
+            // Small magnitude.
+            let bits = rng.r#gen::<u64>() & 0x0FFF_FFFF_FFFF_FFFF;
+            f64::from_bits(bits | 0x0100_0000_0000_0000_u64) // ~1e-307
+        }
+        11 => {
+            // Large magnitude.
+            let bits = rng.r#gen::<u64>() & 0x0FFF_FFFF_FFFF_FFFF;
+            f64::from_bits(bits | 0x6E00_0000_0000_0000_u64) // ~1e+230
+        }
+        _ => f64::from_bits(rng.r#gen::<u64>()),
+    }
+}
+
+/// DCP mode runner — returns true on all-pass.
+fn run_dcp(fuzz_count: Option<usize>, seed: u64) -> bool {
+    let ops = [DcpOp::Add, DcpOp::Sub, DcpOp::Mul, DcpOp::Div, DcpOp::Sqrt];
+
+    match fuzz_count {
+        None => {
+            let mut fail = 0usize;
+            let mut total = 0usize;
+            for &op in &ops {
+                for (a, b) in dcp_edge_cases(op) {
+                    total += 1;
+                    if let Some(d) = run_dcp_single(op, a, b) {
+                        eprintln!("[DCP FAIL] {d}");
+                        fail += 1;
+                    }
                 }
-                std::process::exit(1);
+            }
+            println!("[DCP] Edge cases: {}/{} passed", total - fail, total);
+            fail == 0
+        }
+        Some(count) => {
+            println!(
+                "[DCP] Fuzz: {count} tests/op × 5 ops = {} total, seed={seed}",
+                count * ops.len()
+            );
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut fail = 0usize;
+            let mut total = 0usize;
+            for &op in &ops {
+                let arity = op.arity();
+                for _ in 0..count {
+                    total += 1;
+                    let a = random_f64(&mut rng);
+                    let b = if arity >= 2 { random_f64(&mut rng) } else { 0.0 };
+                    if let Some(d) = run_dcp_single(op, a, b) {
+                        if fail < 20 {
+                            eprintln!("[DCP FAIL] {d}");
+                        }
+                        fail += 1;
+                    }
+                }
+            }
+            println!("[DCP] Fuzz: {}/{} passed", total - fail, total);
+            if fail >= 20 {
+                eprintln!("[DCP] (suppressed output for {} additional failures)", fail - 20);
+            }
+            fail == 0
+        }
+    }
+}
+
+/// Small targeted DCP edge-case list per op.
+fn dcp_edge_cases(op: DcpOp) -> Vec<(f64, f64)> {
+    let mut v = Vec::new();
+    match op {
+        DcpOp::Add | DcpOp::Sub => {
+            v.extend_from_slice(&[
+                (1.0, 2.0),
+                (1.0, -1.0),
+                (f64::INFINITY, f64::NEG_INFINITY),
+                (f64::MAX, f64::MAX),
+                (1e300, 1e300),
+                (0.0, -0.0),
+                (f64::NAN, 1.0),
+                (1.0, 1e-16),
+            ]);
+        }
+        DcpOp::Mul => {
+            v.extend_from_slice(&[
+                (2.0, 3.0),
+                (1e200, 1e200),
+                (1e-200, 1e-200),
+                (f64::INFINITY, 0.0),
+                (0.0, f64::INFINITY),
+                (f64::NAN, 1.0),
+                (1.0, f64::NAN),
+                (f64::MAX, 0.5),
+            ]);
+        }
+        DcpOp::Div => {
+            v.extend_from_slice(&[
+                (1.0, 3.0),
+                (1.0, 0.0),
+                (-1.0, 0.0),
+                (0.0, 0.0),
+                (f64::INFINITY, f64::INFINITY),
+                (f64::NAN, 1.0),
+                (f64::MAX, 0.5),
+                (1.0, f64::MAX),
+            ]);
+        }
+        DcpOp::Sqrt => {
+            for a in [
+                4.0,
+                2.0,
+                -1.0,
+                0.0,
+                -0.0,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NAN,
+                1e200,
+                1e-200,
+            ] {
+                v.push((a, 0.0));
             }
         }
     }
+    v
 }
 
 /// Static suite of edge-case triplets: (op, a, b, c).

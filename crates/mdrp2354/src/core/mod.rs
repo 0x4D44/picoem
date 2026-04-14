@@ -42,8 +42,18 @@ pub struct CortexM33 {
     it_state: u8,
     /// Pending synchronous fault from the most recent instruction.
     pub(crate) pending_fault: Option<Fault>,
-    /// DCP (CP4/5) transfer registers.
-    pub(crate) dcp_data: [u32; 2],
+    /// DCP (CP4/5) half-word register file. Eight double-precision slots
+    /// (indexed 0..7), each made of two 32-bit halves: half A (low) at
+    /// index `d*2`, half B (high) at index `d*2 + 1`. Layout matches
+    /// RP2350 datasheet §3.6.7 (double-precision coprocessor).
+    pub(crate) dcp_halves: [u32; 16],
+    /// DCP status register. After each arithmetic op, cleared and then:
+    ///   bit 0 — result is zero
+    ///   bit 1 — result is negative
+    ///   bit 2 — result is infinity
+    ///   bit 3 — result is NaN
+    /// Compare ops set bit 0 on success, cleared on failure.
+    pub(crate) dcp_status: u32,
     /// ARM security state. `true` = Secure, `false` = Non-Secure.
     pub(crate) secure: bool,
     /// Core is halted — will not execute until explicitly woken.
@@ -65,7 +75,8 @@ impl CortexM33 {
             current_instr_addr: 0,
             it_state: 0,
             pending_fault: None,
-            dcp_data: [0; 2],
+            dcp_halves: [0; 16],
+            dcp_status: 0,
             secure: true,
             halted: false,
             wfe_waiting: false,
@@ -280,6 +291,38 @@ impl CortexM33 {
     /// Returns current IT block state (for testing).
     pub fn it_state(&self) -> u8 {
         self.it_state
+    }
+
+    // --- DCP (CP4/5) test/harness accessors (Phase 7 Stage D) ---
+
+    /// Read one 32-bit half of the DCP register file. `half_idx` is
+    /// `d*2 + (0 for half A, 1 for half B)`.
+    pub fn dcp_get_half(&self, half_idx: usize) -> u32 {
+        self.dcp_halves[half_idx]
+    }
+
+    /// Write one 32-bit half of the DCP register file.
+    pub fn dcp_set_half(&mut self, half_idx: usize, value: u32) {
+        self.dcp_halves[half_idx] = value;
+    }
+
+    /// Read the DCP status register (four result-classification bits).
+    pub fn dcp_get_status(&self) -> u32 {
+        self.dcp_status
+    }
+
+    /// Read a DCP double-precision value (index 0..7).
+    pub fn dcp_get_double(&self, idx: usize) -> f64 {
+        let lo = self.dcp_halves[idx * 2] as u64;
+        let hi = self.dcp_halves[idx * 2 + 1] as u64;
+        f64::from_bits((hi << 32) | lo)
+    }
+
+    /// Write a DCP double-precision value (index 0..7).
+    pub fn dcp_set_double(&mut self, idx: usize, v: f64) {
+        let bits = v.to_bits();
+        self.dcp_halves[idx * 2] = bits as u32;
+        self.dcp_halves[idx * 2 + 1] = (bits >> 32) as u32;
     }
 }
 

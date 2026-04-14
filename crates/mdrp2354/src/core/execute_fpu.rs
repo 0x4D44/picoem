@@ -800,14 +800,16 @@ impl CortexM33 {
             }
             (0b0010, 0) => {
                 // VCVTB.F16.F32 Sd, Sm — f32 Sm → f16 into bottom half of Sd
-                let half = f32_to_f16_bits(self.regs.s[sm]);
+                let (half, flags) = f32_to_f16_bits(self.regs.s[sm], self.regs.fpscr);
+                self.regs.fpscr |= flags;
                 let dst = self.regs.s[sd].to_bits();
                 self.regs.s[sd] = f32::from_bits((dst & 0xFFFF_0000) | half as u32);
                 1
             }
             (0b0010, 1) => {
                 // VCVTT.F16.F32 Sd, Sm — f32 Sm → f16 into top half of Sd
-                let half = f32_to_f16_bits(self.regs.s[sm]);
+                let (half, flags) = f32_to_f16_bits(self.regs.s[sm], self.regs.fpscr);
+                self.regs.fpscr |= flags;
                 let dst = self.regs.s[sd].to_bits();
                 self.regs.s[sd] = f32::from_bits((dst & 0x0000_FFFF) | ((half as u32) << 16));
                 1
@@ -815,13 +817,17 @@ impl CortexM33 {
             (0b0011, 0) => {
                 // VCVTB.F32.F16 Sd, Sm — bottom half of Sm as f16 → f32 Sd
                 let half = (self.regs.s[sm].to_bits() & 0xFFFF) as u16;
-                self.regs.s[sd] = f16_bits_to_f32(half);
+                let (val, flags) = f16_bits_to_f32(half, self.regs.fpscr);
+                self.regs.fpscr |= flags;
+                self.regs.s[sd] = val;
                 1
             }
             (0b0011, 1) => {
                 // VCVTT.F32.F16 Sd, Sm — top half of Sm as f16 → f32 Sd
                 let half = ((self.regs.s[sm].to_bits() >> 16) & 0xFFFF) as u16;
-                self.regs.s[sd] = f16_bits_to_f32(half);
+                let (val, flags) = f16_bits_to_f32(half, self.regs.fpscr);
+                self.regs.fpscr |= flags;
+                self.regs.s[sd] = val;
                 1
             }
             (0b0100, 0) => {
@@ -846,20 +852,27 @@ impl CortexM33 {
                 1
             }
             (0b0110, 0) => {
-                // VRINTR.F32 Sd, Sm — round per FPSCR.RMode
+                // VRINTR.F32 Sd, Sm — round per FPSCR.RMode (no IXC tracking)
                 let rmode = fpscr_rmode(self.regs.fpscr);
-                self.regs.s[sd] = fpu_vrint(self.regs.s[sm], rmode);
+                let (val, flags) = fpu_vrint(self.regs.s[sm], rmode, self.regs.fpscr, false);
+                self.regs.fpscr |= flags;
+                self.regs.s[sd] = val;
                 1
             }
             (0b0110, 1) => {
-                // VRINTZ.F32 Sd, Sm — round toward zero
-                self.regs.s[sd] = self.regs.s[sm].trunc();
+                // VRINTZ.F32 Sd, Sm — round toward zero (no IXC tracking)
+                let (val, flags) =
+                    fpu_vrint(self.regs.s[sm], 0b11, self.regs.fpscr, false);
+                self.regs.fpscr |= flags;
+                self.regs.s[sd] = val;
                 1
             }
             (0b0111, 0) => {
-                // VRINTX.F32 Sd, Sm — round per FPSCR.RMode (exact, may set FPSCR.IXC)
+                // VRINTX.F32 Sd, Sm — round per FPSCR.RMode, exact (raises IXC)
                 let rmode = fpscr_rmode(self.regs.fpscr);
-                self.regs.s[sd] = fpu_vrint(self.regs.s[sm], rmode);
+                let (val, flags) = fpu_vrint(self.regs.s[sm], rmode, self.regs.fpscr, true);
+                self.regs.fpscr |= flags;
+                self.regs.s[sd] = val;
                 1
             }
             (0b1000, 0) => {
@@ -1122,12 +1135,64 @@ impl CortexM33 {
 // VRINT helper
 // ============================================================================
 
-fn fpu_vrint(val: f32, rmode: u32) -> f32 {
-    match rmode {
+/// Round a single-precision value to integer per `rmode`, with full FPSCR
+/// accounting per ARM DDI0553 FPRoundInt.
+///
+/// `exact = true` matches VRINTX semantics (raise IXC when the rounded value
+/// differs from the input). `exact = false` matches VRINTR/VRINTZ (no IXC).
+///
+/// All variants set IDC on denormal input, flush input under FZ=1, raise IOC
+/// on SNaN, and replace any NaN result with the ARM default NaN under DN=1.
+/// Under DN=0, NaN payload is propagated with the quiet bit forced — matching
+/// the spec rather than relying on platform-specific NaN handling in the host
+/// rounding intrinsics.
+fn fpu_vrint(val: f32, rmode: u32, fpscr_in: u32, exact: bool) -> (f32, u32) {
+    let mut flags = 0u32;
+    let val = ftz_input_value(fpscr_in, &mut flags, val);
+
+    if val.is_nan() {
+        if is_snan(val) {
+            flags |= FPSCR_IOC;
+        }
+        let quietened = quieten_nan(val);
+        return (apply_dn(fpscr_in, quietened), flags);
+    }
+    if val.is_infinite() || val == 0.0 {
+        return (val, flags);
+    }
+    let rounded = match rmode {
         0b00 => val.round_ties_even(),
         0b01 => val.ceil(),
         0b10 => val.floor(),
         _ => val.trunc(),
+    };
+    if exact && rounded != val {
+        flags |= FPSCR_IXC;
+    }
+    (rounded, flags)
+}
+
+/// FTZ on input that returns flags via `&mut` rather than mutating an FPSCR
+/// register directly. Used by helpers that compose flag deltas.
+#[inline]
+fn ftz_input_value(fpscr_in: u32, flags: &mut u32, v: f32) -> f32 {
+    if is_denormal(v) {
+        *flags |= FPSCR_IDC;
+        if fpscr_in & FPSCR_FZ != 0 {
+            return if v.is_sign_negative() { -0.0 } else { 0.0 };
+        }
+    }
+    v
+}
+
+/// Force the quiet bit on any NaN value (no-op on non-NaN). Matches FPProcess
+/// quietening per DDI0553.
+#[inline]
+fn quieten_nan(v: f32) -> f32 {
+    if v.is_nan() {
+        f32::from_bits(v.to_bits() | 0x0040_0000)
+    } else {
+        v
     }
 }
 
@@ -1203,9 +1268,25 @@ fn fpu_minnum(a: f32, b: f32) -> f32 {
 // downstream code leaves it cleared. We implement IEEE (AHP=0) faithfully
 // and silently treat AHP=1 the same as AHP=0 for now — see Phase 7 HLD §A.2.
 
-/// Convert IEEE binary16 bits to an f32 value.
+/// True if a half-precision encoding is a signaling NaN (exp all-ones, frac
+/// non-zero, quiet bit clear). Quiet bit for f16 is bit 9 of the 10-bit
+/// fraction field.
+#[inline]
+fn is_snan_f16(h: u16) -> bool {
+    let exp = (h >> 10) & 0x1F;
+    let frac = h & 0x3FF;
+    exp == 0x1F && frac != 0 && (frac & 0x200) == 0
+}
+
+/// Convert IEEE binary16 bits to an f32 value with FPSCR accounting.
+///
+/// Sets IOC on signaling-NaN input. Replaces any NaN result with the ARM
+/// default NaN (0x7FC0_0000) when DN=1; otherwise propagates the f16 payload
+/// into the f32 fraction with the quiet bit forced. f16 denormals are
+/// value-preserved into f32 normals (Cortex-M33 has no FZ16 control).
 // TODO(phase-7.1): honor FPSCR.AHP (alternative half-precision encoding).
-fn f16_bits_to_f32(h: u16) -> f32 {
+fn f16_bits_to_f32(h: u16, fpscr_in: u32) -> (f32, u32) {
+    let mut flags = 0u32;
     let sign = ((h as u32) & 0x8000) << 16;
     let exp = ((h as u32) >> 10) & 0x1F;
     let frac = (h as u32) & 0x3FF;
@@ -1231,7 +1312,11 @@ fn f16_bits_to_f32(h: u16) -> f32 {
         if frac == 0 {
             sign | 0x7F80_0000
         } else {
-            // Preserve NaN payload, force quiet bit
+            if is_snan_f16(h) {
+                flags |= FPSCR_IOC;
+            }
+            // Preserve NaN payload into f32 fraction, force quiet bit.
+            // `apply_dn` below substitutes the canonical NaN under DN=1.
             sign | 0x7F80_0000 | (frac << 13) | 0x0040_0000
         }
     } else {
@@ -1239,12 +1324,20 @@ fn f16_bits_to_f32(h: u16) -> f32 {
         let exp32 = (exp as i32 - 15 + 127) as u32;
         sign | (exp32 << 23) | (frac << 13)
     };
-    f32::from_bits(bits)
+    let result = f32::from_bits(bits);
+    (apply_dn(fpscr_in, result), flags)
 }
 
-/// Convert an f32 value to IEEE binary16 bits (round-to-nearest-even, AHP=0).
+/// Convert an f32 value to IEEE binary16 bits (round-to-nearest-even, AHP=0)
+/// with FPSCR accounting.
+///
+/// Sets IOC on signaling-NaN input. Sets IDC on f32 denormal input (which
+/// flushes to f16 ±0 regardless of FZ — denormal f32 magnitudes are below the
+/// smallest representable f16 subnormal). Replaces any NaN result with the f16
+/// default NaN (0x7E00) when DN=1.
 // TODO(phase-7.1): honor FPSCR.AHP (alternative half-precision encoding).
-fn f32_to_f16_bits(v: f32) -> u16 {
+fn f32_to_f16_bits(v: f32, fpscr_in: u32) -> (u16, u32) {
+    let mut flags = 0u32;
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
@@ -1252,19 +1345,33 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 
     if exp == 0xFF {
         // Inf or NaN
-        return if frac == 0 {
+        let h = if frac == 0 {
             sign | 0x7C00
         } else {
-            // Quiet NaN: preserve top 10 payload bits, force quiet bit.
-            // IEEE: sNaN must quieten; payload in bits [12:0] of f32 is lost — spec-allowed.
-            let payload = (frac >> 13) as u16;
-            sign | 0x7E00 | (payload & 0x1FF)
+            if is_snan(v) {
+                flags |= FPSCR_IOC;
+            }
+            if fpscr_in & FPSCR_DN != 0 {
+                // Default NaN for f16: positive QNaN, no payload.
+                0x7E00
+            } else {
+                // Quiet NaN: preserve top 9 payload bits, force quiet bit.
+                // IEEE: sNaN must quieten; lower payload bits are lost — spec-allowed.
+                let payload = (frac >> 13) as u16;
+                sign | 0x7E00 | (payload & 0x1FF)
+            }
         };
+        return (h, flags);
     }
 
     if exp == 0 {
-        // f32 zero or subnormal — all flush to f16 zero (tiny enough).
-        return sign;
+        if frac != 0 {
+            // f32 subnormal → IDC. Always flushes to f16 ±0 (tiny enough that
+            // f16 round-to-nearest produces zero).
+            flags |= FPSCR_IDC;
+        }
+        // f32 ±0 or subnormal → f16 ±0.
+        return (sign, flags);
     }
 
     // Unbiased f32 exponent.
@@ -1272,11 +1379,11 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 
     if e > 15 {
         // Overflow → +/- inf in IEEE half-precision.
-        return sign | 0x7C00;
+        return (sign | 0x7C00, flags);
     }
     if e < -24 {
         // Smaller than smallest subnormal → ±0 (round-to-nearest-even).
-        return sign;
+        return (sign, flags);
     }
 
     if e < -14 {
@@ -1294,9 +1401,9 @@ fn f32_to_f16_bits(v: f32) -> u16 {
         // Rounding up may carry the result into the normal range (2^-14),
         // which is exactly exp=1, frac=0 in half precision.
         if rounded >= 0x400 {
-            return sign | (1 << 10);
+            return (sign | (1 << 10), flags);
         }
-        return sign | (rounded as u16 & 0x3FF);
+        return (sign | (rounded as u16 & 0x3FF), flags);
     }
 
     // Normal result.
@@ -1311,9 +1418,9 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     if rounded > 0x3FF {
         let new_exp = exp16 + 1;
         if new_exp >= 0x1F {
-            return sign | 0x7C00; // overflow to inf
+            return (sign | 0x7C00, flags); // overflow to inf
         }
-        return sign | (new_exp << 10);
+        return (sign | (new_exp << 10), flags);
     }
-    sign | (exp16 << 10) | (rounded as u16 & 0x3FF)
+    (sign | (exp16 << 10) | (rounded as u16 & 0x3FF), flags)
 }

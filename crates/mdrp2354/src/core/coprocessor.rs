@@ -211,24 +211,292 @@ impl CortexM33 {
         }
     }
 
-    /// CP4/5 (DCP): Double-precision coprocessor. Minimal transfer registers.
+    /// CP4/5 (DCP): Double-precision coprocessor (Phase 7 Stage D).
+    ///
+    /// Dispatch splits into two families, paralleling the CP7 layout:
+    ///   - `dcp_transfer_family`: MCR/MRC moving 32-bit halves between ARM
+    ///     registers and the DCP half-register file (`wxma/wxmb/rfma/rfmb`).
+    ///   - `dcp_cdp_family`: CDP/CDP2 for arithmetic, compare, convert,
+    ///     and status-register access.
+    ///
+    /// The encoding table is intentionally internally consistent (not
+    /// datasheet-verified — the datasheet §3.6.7 encodings are not
+    /// enumerated in repo). See the test module's "DCP encoding lock-in"
+    /// section for the full table.
     fn cp4_5_dcp(&mut self, hw0: u16, hw1: u16) -> u32 {
-        // Decode MCR vs MRC vs CDP from the instruction encoding
         let is_mrc_mcr = (hw0 >> 12) & 0xF == 0xE && hw1 & (1 << 4) != 0;
         if is_mrc_mcr {
-            let rd = ((hw1 >> 12) & 0xF) as usize;
-            let idx = (hw1 & 1) as usize; // use bit 0 to select register
-            let to_cp = (hw0 >> 4) & 1 == 0; // MCR: bit 4 of hw0 = 0
-            if to_cp {
-                // MCR: ARM register -> DCP
-                self.dcp_data[idx] = self.regs.r[rd];
-            } else {
-                // MRC: DCP -> ARM register
-                self.regs.r[rd] = self.dcp_data[idx];
-            }
+            self.dcp_transfer_family(hw0, hw1)
+        } else {
+            self.dcp_cdp_family(hw0, hw1)
         }
-        // CDP: accept as NOP
+    }
+
+    /// DCP MCR/MRC — `wxma/wxmb` (ARM → half) and `rfma/rfmb` (half → ARM).
+    ///
+    /// Encoding:
+    ///   hw0 = `1110 1110 opc1[3] L CRn[4]`, hw1 = `Rt[4] coproc[4] opc2[3] 1 CRm[4]`
+    /// Fields:
+    ///   L        = MCR/MRC discriminator (0 = MCR, 1 = MRC)
+    ///   opc1     = 0 (transfer family; other opc1 values silent-NOP)
+    ///   opc2     = 0 → half A (low word), 1 → half B (high word)
+    ///   CRm[2:0] = double index (0..7); CRm[3] ignored
+    ///   CRn      = unused (must be 0)
+    ///   Rt       = ARM register
+    ///
+    /// Cycle cost: 1 (per HLD §12).
+    fn dcp_transfer_family(&mut self, hw0: u16, hw1: u16) -> u32 {
+        let is_mrc = (hw0 >> 4) & 1 != 0;
+        let opc1 = ((hw0 >> 5) & 0x7) as u8;
+        let opc2 = ((hw1 >> 5) & 0x7) as u8;
+        let rt = ((hw1 >> 12) & 0xF) as usize;
+        let crm = (hw1 & 0xF) as u8;
+
+        if opc1 != 0 {
+            // Reserved opc1 for transfer family — silent NOP.
+            return 1;
+        }
+        debug_assert!(
+            crm & 0x8 == 0,
+            "DCP transfer CRm[3] must be 0; got {:x}",
+            crm
+        );
+        let double_idx = (crm as usize) & 0x7;
+        let half_idx = double_idx * 2 + (opc2 as usize & 1);
+
+        if is_mrc {
+            // rfma / rfmb — DCP half → ARM register
+            self.regs.r[rt] = self.dcp_halves[half_idx];
+        } else {
+            // wxma / wxmb — ARM register → DCP half
+            self.dcp_halves[half_idx] = self.regs.r[rt];
+        }
         1
+    }
+
+    /// DCP CDP/CDP2 — arithmetic, compare, convert, status access.
+    ///
+    /// Encoding:
+    ///   hw0 = `1110 1110 opc1[4] CRn[4]`, hw1 = `CRd[4] coproc[4] opc2[3] 0 CRm[4]`
+    ///   (CDP2 form uses 0xFE prefix; dispatch here treats both identically.)
+    /// Fields:
+    ///   opc1 = op class (see table below)
+    ///   opc2 = op subcode / compare predicate
+    ///   CRd  = destination double index (for arithmetic / convert)
+    ///   CRn  = source double #1
+    ///   CRm  = source double #2 (for binary ops) or source #1 for unary
+    ///
+    /// | opc1 | opc2 | Mnemonic   | Semantics                           | Cycles |
+    /// |------|------|------------|-------------------------------------|--------|
+    /// | 0    | 0    | dadd       | d[Rd] = d[Rn] + d[Rm], set status   | 4      |
+    /// | 0    | 1    | dsub       | d[Rd] = d[Rn] - d[Rm], set status   | 4      |
+    /// | 0    | 2    | dmul       | d[Rd] = d[Rn] * d[Rm], set status   | 5      |
+    /// | 0    | 3    | ddiv       | d[Rd] = d[Rn] / d[Rm], set status   | 18     |
+    /// | 0    | 4    | dsqrt      | d[Rd] = sqrt(d[Rn]), set status     | 28     |
+    /// | 1    | 0..4 | dcmp_*     | status bit 0 = predicate(d[Rn],d[Rm])| 4     |
+    /// | 2    | 0    | i2d        | d[Rd] = (f64) i32(half_a(d[Rn]))    | 4      |
+    /// | 2    | 1    | u2d        | d[Rd] = (f64) u32(half_a(d[Rn]))    | 4      |
+    /// | 2    | 2    | d2i        | half_a(d[Rd]) = d[Rn] as i32        | 4      |
+    /// | 2    | 3    | d2u        | half_a(d[Rd]) = d[Rn] as u32        | 4      |
+    /// | 2    | 4    | d2f        | half_a(d[Rd]) = d[Rn] as f32        | 4      |
+    /// | 2    | 5    | f2d        | d[Rd] = (f64) f32(half_a(d[Rn]))    | 4      |
+    /// | 3    | 0    | dcpstat_get| half_a(d[Rd]) = dcp_status          | 1      |
+    /// | 3    | 1    | dcpstat_clr| dcp_status = 0                      | 1      |
+    ///
+    /// Compare predicates (opc1=1):
+    ///   opc2=0 → dcmp_eq,  opc2=1 → dcmp_lt,  opc2=2 → dcmp_le,
+    ///   opc2=3 → dcmp_gt,  opc2=4 → dcmp_ge.
+    ///
+    /// Unrecognized (opc1, opc2) combinations silent-NOP (cycle cost 1).
+    fn dcp_cdp_family(&mut self, hw0: u16, hw1: u16) -> u32 {
+        let opc1 = ((hw0 >> 4) & 0xF) as u8;
+        let opc2 = ((hw1 >> 5) & 0x7) as u8;
+        let crd = ((hw1 >> 12) & 0xF) as usize & 0x7;
+        let crn = (hw0 & 0xF) as usize & 0x7;
+        let crm = (hw1 & 0xF) as usize & 0x7;
+
+        match opc1 {
+            0 => match opc2 {
+                0 => {
+                    let a = self.dcp_read_double(crn);
+                    let b = self.dcp_read_double(crm);
+                    let r = a + b;
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    4
+                }
+                1 => {
+                    let a = self.dcp_read_double(crn);
+                    let b = self.dcp_read_double(crm);
+                    let r = a - b;
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    4
+                }
+                2 => {
+                    let a = self.dcp_read_double(crn);
+                    let b = self.dcp_read_double(crm);
+                    let r = a * b;
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    5
+                }
+                3 => {
+                    let a = self.dcp_read_double(crn);
+                    let b = self.dcp_read_double(crm);
+                    let r = a / b;
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    18
+                }
+                4 => {
+                    let a = self.dcp_read_double(crn);
+                    let r = a.sqrt();
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    28
+                }
+                _ => 1, // Reserved opc2 under opc1=0 — silent NOP.
+            },
+            1 => {
+                let a = self.dcp_read_double(crn);
+                let b = self.dcp_read_double(crm);
+                // Note: any compare with a NaN operand is false per IEEE-754,
+                // EXCEPT dcmp_ne-style inequalities — we do not expose ne.
+                // Rust's native f64 comparison operators already implement
+                // the IEEE quiet-NaN-compares-false rule.
+                let pass = match opc2 {
+                    0 => a == b,     // eq
+                    1 => a < b,      // lt
+                    2 => a <= b,     // le
+                    3 => a > b,      // gt
+                    4 => a >= b,     // ge
+                    _ => {
+                        return 1; // Unknown compare — silent NOP, no status write.
+                    }
+                };
+                // Compares overwrite the entire status register with {1, 0},
+                // not just bit 0. This differs from the arith path which sets
+                // all 4 bits based on result — compares only care about the
+                // predicate outcome.
+                self.dcp_status = if pass { 1 } else { 0 };
+                4
+            }
+            2 => match opc2 {
+                0 => {
+                    // i2d: half A of CRn carries an i32.
+                    let i = self.dcp_halves[crn * 2] as i32;
+                    let r = i as f64;
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    4
+                }
+                1 => {
+                    // u2d: half A of CRn carries a u32.
+                    let u = self.dcp_halves[crn * 2];
+                    let r = u as f64;
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    4
+                }
+                2 => {
+                    // d2i: saturating per `as i32` (Rust defines this since 1.45).
+                    let d = self.dcp_read_double(crn);
+                    self.dcp_halves[crd * 2] = d as i32 as u32;
+                    self.dcp_halves[crd * 2 + 1] = 0;
+                    // Status reflects the produced integer as if re-cast;
+                    // datasheet §3.6.7 doesn't spec status here. We set
+                    // based on the pre-cast f64 result to match arithmetic.
+                    self.dcp_set_arith_status(d);
+                    4
+                }
+                3 => {
+                    // d2u: saturating.
+                    let d = self.dcp_read_double(crn);
+                    self.dcp_halves[crd * 2] = d as u32;
+                    self.dcp_halves[crd * 2 + 1] = 0;
+                    self.dcp_set_arith_status(d);
+                    4
+                }
+                4 => {
+                    // d2f: f64 → f32, stored in half A; half B cleared.
+                    let d = self.dcp_read_double(crn);
+                    let f = d as f32;
+                    self.dcp_halves[crd * 2] = f.to_bits();
+                    self.dcp_halves[crd * 2 + 1] = 0;
+                    // Use the f32 as f64 to set flags on the visible result.
+                    self.dcp_set_arith_status(f as f64);
+                    4
+                }
+                5 => {
+                    // f2d: f32 in half A of CRn → f64 in CRd.
+                    let f = f32::from_bits(self.dcp_halves[crn * 2]);
+                    let r = f as f64;
+                    self.dcp_write_double(crd, r);
+                    self.dcp_set_arith_status(r);
+                    4
+                }
+                _ => 1,
+            },
+            3 => match opc2 {
+                0 => {
+                    // dcpstat_get: status → half A of CRd; half B cleared.
+                    self.dcp_halves[crd * 2] = self.dcp_status;
+                    self.dcp_halves[crd * 2 + 1] = 0;
+                    1
+                }
+                1 => {
+                    // dcpstat_clr: zero the status register.
+                    self.dcp_status = 0;
+                    1
+                }
+                _ => 1,
+            },
+            _ => 1, // Unrecognized opc1 — silent NOP.
+        }
+    }
+
+    /// Pack two 32-bit halves back into an f64. Half A is the low 32 bits;
+    /// half B is the high 32 bits (little-endian layout).
+    #[inline]
+    fn dcp_read_double(&self, idx: usize) -> f64 {
+        let lo = self.dcp_halves[idx * 2] as u64;
+        let hi = self.dcp_halves[idx * 2 + 1] as u64;
+        f64::from_bits((hi << 32) | lo)
+    }
+
+    /// Split an f64 into two 32-bit halves and store at index `idx`.
+    #[inline]
+    fn dcp_write_double(&mut self, idx: usize, v: f64) {
+        let bits = v.to_bits();
+        self.dcp_halves[idx * 2] = bits as u32;
+        self.dcp_halves[idx * 2 + 1] = (bits >> 32) as u32;
+    }
+
+    /// Set `dcp_status` flags from an arithmetic result.
+    ///
+    /// Bit 0 — zero    (including ±0)
+    /// Bit 1 — negative (sign bit set; includes -0 and -NaN)
+    /// Bit 2 — infinity
+    /// Bit 3 — NaN
+    ///
+    /// All other bits are cleared; the status register is not sticky.
+    #[inline]
+    fn dcp_set_arith_status(&mut self, r: f64) {
+        let mut s = 0u32;
+        if r == 0.0 {
+            s |= 1 << 0;
+        }
+        if r.is_sign_negative() {
+            s |= 1 << 1;
+        }
+        if r.is_infinite() {
+            s |= 1 << 2;
+        }
+        if r.is_nan() {
+            s |= 1 << 3;
+        }
+        self.dcp_status = s;
     }
 
     /// CP7 (RCP): Redundancy coprocessor. Dispatches MCR/MRC (0xEE/0xFE)
@@ -488,6 +756,10 @@ mod tests {
 
     #[test]
     fn test_cp4_5_dcp_transfer() {
+        // Rewritten for Phase 7 Stage D (16-half register file).
+        // wxma (MCR opc2=0, CRm=0) writes ARM Rt into half A of double 0;
+        // rfma (MRC opc2=0, CRm=0) reads it back. Roundtrip locks in the
+        // canonical transfer encoding.
         let mut cpu = CortexM33::new();
         let mut bus = Bus::default();
         enable_cp(&mut bus, 4);
@@ -495,14 +767,14 @@ mod tests {
         let val: u32 = 0xCAFE_BABE;
         cpu.regs.r[2] = val;
 
-        // MCR: write R2 -> DCP[0]
-        let (hw0, hw1) = encode_mcr(4, 2, 0);
+        // wxma: R2 -> half A of double 0 (opc2=0, CRm=0).
+        let (hw0, hw1) = encode_mcr_full(4, 0, 0, 2, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_halves[0], val);
 
-        // MRC: read DCP[0] -> R3
-        let (hw0, hw1) = encode_mrc(4, 3, 0);
+        // rfma: half A of double 0 -> R3.
+        let (hw0, hw1) = encode_mrc_full(4, 0, 0, 3, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-
         assert_eq!(cpu.regs.r[3], val);
     }
 
@@ -1306,5 +1578,584 @@ mod tests {
         let (hw0, hw1) = encode_mcr2_full(7, 7, 0, 0, 7, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none(), "unknown CP7 encoding must be silent NOP");
+    }
+
+    // ============================================================
+    // Phase 7 Stage D — CP4/5 DCP (double-precision coprocessor)
+    // ============================================================
+    //
+    // Encoding lock-in — see `dcp_transfer_family` and `dcp_cdp_family`
+    // docstrings for the field meanings.
+    //
+    // | Mnemonic     | Form | opc1 | opc2 | CRn | CRm | Notes |
+    // |--------------|------|------|------|-----|-----|-------|
+    // | wxma         | MCR  | 0    | 0    | 0   | d[2:0] | ARM Rt -> half A of d |
+    // | wxmb         | MCR  | 0    | 1    | 0   | d[2:0] | ARM Rt -> half B of d |
+    // | rfma         | MRC  | 0    | 0    | 0   | d[2:0] | half A of d -> ARM Rt |
+    // | rfmb         | MRC  | 0    | 1    | 0   | d[2:0] | half B of d -> ARM Rt |
+    // | dadd         | CDP  | 0    | 0    | Rn  | Rm  | d[Rd] = d[Rn]+d[Rm]   |
+    // | dsub         | CDP  | 0    | 1    | Rn  | Rm  | d[Rd] = d[Rn]-d[Rm]   |
+    // | dmul         | CDP  | 0    | 2    | Rn  | Rm  | d[Rd] = d[Rn]*d[Rm]   |
+    // | ddiv         | CDP  | 0    | 3    | Rn  | Rm  | d[Rd] = d[Rn]/d[Rm]   |
+    // | dsqrt        | CDP  | 0    | 4    | Rn  | —   | d[Rd] = sqrt(d[Rn])   |
+    // | dcmp_eq      | CDP  | 1    | 0    | Rn  | Rm  | status bit 0 = (==)   |
+    // | dcmp_lt      | CDP  | 1    | 1    | Rn  | Rm  | status bit 0 = (<)    |
+    // | dcmp_le      | CDP  | 1    | 2    | Rn  | Rm  | status bit 0 = (<=)   |
+    // | dcmp_gt      | CDP  | 1    | 3    | Rn  | Rm  | status bit 0 = (>)    |
+    // | dcmp_ge      | CDP  | 1    | 4    | Rn  | Rm  | status bit 0 = (>=)   |
+    // | i2d          | CDP  | 2    | 0    | Rn  | —   | d[Rd] = (f64) i32(half_a(d[Rn])) |
+    // | u2d          | CDP  | 2    | 1    | Rn  | —   | d[Rd] = (f64) u32(half_a(d[Rn])) |
+    // | d2i          | CDP  | 2    | 2    | Rn  | —   | half_a(d[Rd]) = d[Rn] as i32     |
+    // | d2u          | CDP  | 2    | 3    | Rn  | —   | half_a(d[Rd]) = d[Rn] as u32     |
+    // | d2f          | CDP  | 2    | 4    | Rn  | —   | half_a(d[Rd]) = d[Rn] as f32     |
+    // | f2d          | CDP  | 2    | 5    | Rn  | —   | d[Rd] = (f64) f32(half_a(d[Rn])) |
+    // | dcpstat_get  | CDP  | 3    | 0    | —   | —   | half_a(d[Rd]) = dcp_status       |
+    // | dcpstat_clr  | CDP  | 3    | 1    | —   | —   | dcp_status = 0                   |
+
+    /// Write an f64 into double `d` of the DCP register file via two wxma
+    /// (half A) / wxmb (half B) MCR ops. Test-only helper.
+    fn dcp_load_double(cpu: &mut CortexM33, bus: &mut Bus, d: usize, v: f64) {
+        let bits = v.to_bits();
+        let lo = bits as u32;
+        let hi = (bits >> 32) as u32;
+        cpu.regs.r[0] = lo;
+        let (hw0, hw1) = encode_mcr_full(4, 0, 0, 0, 0, d as u8);
+        cpu.thumb32_coprocessor(hw0, hw1, bus);
+        cpu.regs.r[0] = hi;
+        let (hw0, hw1) = encode_mcr_full(4, 0, 0, 0, 1, d as u8);
+        cpu.thumb32_coprocessor(hw0, hw1, bus);
+    }
+
+    /// Read an f64 from double `d` via two rfma/rfmb MRC ops. Test-only.
+    fn dcp_read_double_via_mrc(cpu: &mut CortexM33, bus: &mut Bus, d: usize) -> f64 {
+        let (hw0, hw1) = encode_mrc_full(4, 0, 0, 1, 0, d as u8);
+        cpu.thumb32_coprocessor(hw0, hw1, bus);
+        let lo = cpu.regs.r[1];
+        let (hw0, hw1) = encode_mrc_full(4, 0, 0, 2, 1, d as u8);
+        cpu.thumb32_coprocessor(hw0, hw1, bus);
+        let hi = cpu.regs.r[2];
+        f64::from_bits(((hi as u64) << 32) | (lo as u64))
+    }
+
+    /// Encode a CDP to CP4 (or CP5) with our DCP encoding layout.
+    fn encode_cdp_dcp(opc1: u8, opc2: u8, crd: u8, crn: u8, crm: u8) -> (u16, u16) {
+        encode_cdp(4, opc1, crn, crd, opc2, crm)
+    }
+
+    /// Helper: seed both halves of double `d` directly on the CPU state.
+    /// Bypasses the MCR path — used by tests that want to test CDP in
+    /// isolation from transfer-family correctness.
+    fn dcp_set_double(cpu: &mut CortexM33, d: usize, v: f64) {
+        let bits = v.to_bits();
+        cpu.dcp_halves[d * 2] = bits as u32;
+        cpu.dcp_halves[d * 2 + 1] = (bits >> 32) as u32;
+    }
+
+    // -------- Transfer roundtrip --------
+
+    #[test]
+    fn test_dcp_wxma_wxmb_rfma_rfmb_roundtrip() {
+        // Half A and half B of a double roundtrip through the transfer
+        // family independently. Confirms the opc2 bit cleanly discriminates
+        // the two halves of a single double.
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+
+        let v = -1.5_f64;
+        dcp_load_double(&mut cpu, &mut bus, 2, v);
+        let got = dcp_read_double_via_mrc(&mut cpu, &mut bus, 2);
+        assert_eq!(got.to_bits(), v.to_bits());
+    }
+
+    #[test]
+    fn test_dcp_transfer_cp5_mirrors_cp4() {
+        // CP5 is a mirror of CP4 per the cp4_5_dcp dispatch. A write via
+        // CP5 MCR must be observable via a CP4 MRC (and vice versa) —
+        // they share the same register file on `CortexM33`.
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        enable_cp(&mut bus, 5);
+
+        cpu.regs.r[0] = 0xABCD_1234;
+        // Write via CP5 — half A of double 3.
+        let (hw0, hw1) = encode_mcr_full(5, 0, 0, 0, 0, 3);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        // Read back via CP4.
+        let (hw0, hw1) = encode_mrc_full(4, 0, 0, 1, 0, 3);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.r[1], 0xABCD_1234);
+    }
+
+    // -------- Arithmetic: dadd / dsub / dmul / ddiv / dsqrt --------
+
+    #[test]
+    fn test_dcp_dadd_basic() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+
+        dcp_set_double(&mut cpu, 0, 1.25);
+        dcp_set_double(&mut cpu, 1, 2.75);
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 0, 1);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 4);
+        assert_eq!(cpu.dcp_read_double(2), 4.0);
+        // Status: nonzero, positive, finite, not NaN — all bits clear.
+        assert_eq!(cpu.dcp_status, 0);
+    }
+
+    #[test]
+    fn test_dcp_dsub_negative_result_sets_neg_bit() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+
+        dcp_set_double(&mut cpu, 0, 1.0);
+        dcp_set_double(&mut cpu, 1, 5.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 1, 2, 0, 1);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 4);
+        assert_eq!(cpu.dcp_read_double(2), -4.0);
+        assert_eq!(cpu.dcp_status & 0b1111, 0b0010, "N=1, others=0");
+    }
+
+    #[test]
+    fn test_dcp_dmul_cycles_are_five() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 6.0);
+        dcp_set_double(&mut cpu, 1, 7.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 2, 2, 0, 1);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 5);
+        assert_eq!(cpu.dcp_read_double(2), 42.0);
+    }
+
+    #[test]
+    fn test_dcp_ddiv_cycles_eighteen() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 10.0);
+        dcp_set_double(&mut cpu, 1, 4.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 3, 2, 0, 1);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 18);
+        assert_eq!(cpu.dcp_read_double(2), 2.5);
+        assert_eq!(cpu.dcp_status, 0);
+    }
+
+    #[test]
+    fn test_dcp_dsqrt_cycles_twentyeight() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 16.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 4, 1, 0, 0);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 28);
+        assert_eq!(cpu.dcp_read_double(1), 4.0);
+    }
+
+    // -------- Status register bits --------
+
+    #[test]
+    fn test_dcp_status_zero_bit() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 3.0);
+        dcp_set_double(&mut cpu, 1, 3.0);
+        // 3.0 - 3.0 = 0.0 -> status bit 0 set.
+        let (hw0, hw1) = encode_cdp_dcp(0, 1, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status & 0b1111, 0b0001);
+    }
+
+    #[test]
+    fn test_dcp_status_negative_zero_bit() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, -0.0);
+        dcp_set_double(&mut cpu, 1, 0.0);
+        // -0.0 * 0.0 = -0.0 → Z=1 AND N=1.
+        let (hw0, hw1) = encode_cdp_dcp(0, 2, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status & 0b1111, 0b0011, "Z=1, N=1");
+    }
+
+    #[test]
+    fn test_dcp_status_infinity_bit() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 1.0);
+        dcp_set_double(&mut cpu, 1, 0.0);
+        // 1 / 0 → +inf
+        let (hw0, hw1) = encode_cdp_dcp(0, 3, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_read_double(2), f64::INFINITY);
+        assert_eq!(cpu.dcp_status & 0b1111, 0b0100, "Inf=1, Z=0, N=0, NaN=0");
+    }
+
+    #[test]
+    fn test_dcp_status_nan_bit() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 0.0);
+        dcp_set_double(&mut cpu, 1, 0.0);
+        // 0 / 0 → NaN
+        let (hw0, hw1) = encode_cdp_dcp(0, 3, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.dcp_read_double(2).is_nan());
+        // NaN bit is mandatory. Sign bit on a 0/0 NaN is implementation
+        // defined (x86 SSE yields a negative-signed NaN here); zero bit
+        // must NOT be set; infinity bit must NOT be set.
+        assert!(cpu.dcp_status & (1 << 3) != 0, "NaN bit must set");
+        assert_eq!(cpu.dcp_status & (1 << 0), 0, "zero bit must clear");
+        assert_eq!(cpu.dcp_status & (1 << 2), 0, "infinity bit must clear");
+    }
+
+    #[test]
+    fn test_dcp_status_negative_infinity() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, -1.0);
+        dcp_set_double(&mut cpu, 1, 0.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 3, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_read_double(2), f64::NEG_INFINITY);
+        assert_eq!(cpu.dcp_status & 0b1111, 0b0110, "Inf=1, N=1");
+    }
+
+    // -------- Compare operations --------
+
+    #[test]
+    fn test_dcp_dcmp_eq_true_and_false() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 3.14);
+        dcp_set_double(&mut cpu, 1, 3.14);
+        let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 1);
+
+        dcp_set_double(&mut cpu, 1, 3.15);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 0);
+    }
+
+    #[test]
+    fn test_dcp_dcmp_lt_le_gt_ge() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 1.0);
+        dcp_set_double(&mut cpu, 1, 2.0);
+
+        // lt: 1 < 2 true
+        let (hw0, hw1) = encode_cdp_dcp(1, 1, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 1);
+
+        // le: 1 <= 2 true
+        let (hw0, hw1) = encode_cdp_dcp(1, 2, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 1);
+
+        // gt: 1 > 2 false
+        let (hw0, hw1) = encode_cdp_dcp(1, 3, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 0);
+
+        // ge: 1 >= 2 false
+        let (hw0, hw1) = encode_cdp_dcp(1, 4, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 0);
+
+        // Equal case: le true, ge true, lt/gt false.
+        dcp_set_double(&mut cpu, 1, 1.0);
+        let (hw0, hw1) = encode_cdp_dcp(1, 2, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 1, "le on equals must be true");
+        let (hw0, hw1) = encode_cdp_dcp(1, 4, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 1, "ge on equals must be true");
+        let (hw0, hw1) = encode_cdp_dcp(1, 1, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 0, "lt on equals must be false");
+    }
+
+    #[test]
+    fn test_dcp_dcmp_nan_all_false() {
+        // IEEE-754: every compare involving a NaN (even eq) returns false.
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, f64::NAN);
+        dcp_set_double(&mut cpu, 1, 1.0);
+        for opc2 in 0..=4 {
+            let (hw0, hw1) = encode_cdp_dcp(1, opc2, 0, 0, 1);
+            cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+            assert_eq!(cpu.dcp_status, 0, "NaN compare opc2={opc2} must be false");
+        }
+    }
+
+    // -------- Convert --------
+
+    #[test]
+    fn test_dcp_i2d_then_d2i_roundtrip() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        // Half A of double 0 carries i32 = -42.
+        cpu.dcp_halves[0] = (-42_i32) as u32;
+        let (hw0, hw1) = encode_cdp_dcp(2, 0, 1, 0, 0); // i2d: d[1] = (f64)(-42)
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_read_double(1), -42.0);
+
+        // d2i: half_a(d[2]) = d[1] as i32
+        let (hw0, hw1) = encode_cdp_dcp(2, 2, 2, 1, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_halves[4] as i32, -42);
+    }
+
+    #[test]
+    fn test_dcp_u2d_then_d2u_roundtrip() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        cpu.dcp_halves[0] = 0x8000_0001_u32;
+        let (hw0, hw1) = encode_cdp_dcp(2, 1, 1, 0, 0); // u2d
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_read_double(1), 0x8000_0001_u32 as f64);
+
+        // d2u: half_a(d[2]) = d[1] as u32.
+        let (hw0, hw1) = encode_cdp_dcp(2, 3, 2, 1, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_halves[4], 0x8000_0001);
+    }
+
+    #[test]
+    fn test_dcp_d2i_rounds_toward_zero() {
+        // Rust's `f64 as i32` truncates toward zero. We adopt this as the DCP
+        // convention (cheapest, matches the Pico SDK documented semantics).
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 3.9);
+        let (hw0, hw1) = encode_cdp_dcp(2, 2, 1, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_halves[2] as i32, 3);
+
+        dcp_set_double(&mut cpu, 0, -3.9);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_halves[2] as i32, -3);
+    }
+
+    #[test]
+    fn test_dcp_f2d_then_d2f_roundtrip() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        let original: f32 = 2.71828;
+        cpu.dcp_halves[0] = original.to_bits();
+        // f2d: d[1] = (f64)(f32)d_half_a(d[0])
+        let (hw0, hw1) = encode_cdp_dcp(2, 5, 1, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_read_double(1), original as f64);
+
+        // d2f: half_a(d[2]) = f32(d[1])
+        let (hw0, hw1) = encode_cdp_dcp(2, 4, 2, 1, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(f32::from_bits(cpu.dcp_halves[4]), original);
+    }
+
+    // -------- Divide by zero / NaN edge cases --------
+
+    #[test]
+    fn test_dcp_ddiv_one_by_zero_plus_inf() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 1.0);
+        dcp_set_double(&mut cpu, 1, 0.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 3, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_read_double(2), f64::INFINITY);
+        assert_eq!(cpu.dcp_status & 0b1111, 0b0100, "Inf bit only");
+    }
+
+    #[test]
+    fn test_dcp_ddiv_zero_by_zero_nan() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+        dcp_set_double(&mut cpu, 0, 0.0);
+        dcp_set_double(&mut cpu, 1, 0.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 3, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.dcp_read_double(2).is_nan());
+        // NaN sign bit per IEEE is implementation-defined; on x86/ARM a
+        // default qNaN has bit 63 clear, so N bit will be 0. NaN bit only.
+        assert!(cpu.dcp_status & (1 << 3) != 0, "NaN bit must set");
+    }
+
+    // -------- Status register access via CDP --------
+
+    #[test]
+    fn test_dcp_status_get_and_clr() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+
+        // Generate a NaN result so status gets the NaN bit.
+        dcp_set_double(&mut cpu, 0, 0.0);
+        dcp_set_double(&mut cpu, 1, 0.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 3, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.dcp_status & (1 << 3) != 0);
+
+        // dcpstat_get: half A of d[3] = status.
+        let (hw0, hw1) = encode_cdp_dcp(3, 0, 3, 0, 0);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 1);
+        assert_eq!(cpu.dcp_halves[6], cpu.dcp_status);
+
+        // dcpstat_clr.
+        let (hw0, hw1) = encode_cdp_dcp(3, 1, 0, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_status, 0);
+    }
+
+    // -------- CPACR disabled --------
+
+    #[test]
+    fn test_dcp_cpacr_disabled_faults() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        // CPACR defaults to 0 — CP4/5 disabled.
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+    }
+
+    // -------- Unrecognized CDP encoding — silent NOP --------
+
+    #[test]
+    fn test_dcp_unrecognized_cdp_silent_nop() {
+        // opc1=7 is not assigned (we use 0..3). Reserved opc2 under a valid
+        // opc1 must also silent-NOP and not corrupt doubles.
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+
+        // Seed doubles to something recognizable.
+        dcp_set_double(&mut cpu, 2, 1234.5);
+        let halves_before = cpu.dcp_halves;
+
+        // Try opc1=7, opc2=7 — fully unassigned.
+        let (hw0, hw1) = encode_cdp_dcp(7, 7, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(cpu.dcp_halves, halves_before);
+
+        // Try opc1=0, opc2=7 (arith class with unassigned opc2).
+        let (hw0, hw1) = encode_cdp_dcp(0, 7, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(cpu.dcp_halves, halves_before);
+    }
+
+    // -------- Encoding lock-in — catch encoder-table drift --------
+
+    /// These are the canonical (hw0, hw1) pairs the DCP handler must
+    /// interpret as each listed op. If encoder helpers ever drift, this
+    /// test fails loudly before downstream tests get confused.
+    #[test]
+    fn test_dcp_encoding_lockin() {
+        // wxma Rt=1 -> half A of d[3]
+        let e = encode_mcr_full(4, 0, 0, 1, 0, 3);
+        assert_eq!(e.0 & 0xFFE0, 0xEE00, "wxma hw0 high bits");
+        assert_eq!(e.0 & 0x10, 0x00, "wxma L=0");
+        assert_eq!((e.1 >> 5) & 0x7, 0, "wxma opc2=0");
+        assert_eq!(e.1 & 0xF, 3, "wxma CRm=3");
+        assert_eq!(e.1 & 0x10, 0x10, "wxma bit4=1");
+
+        // rfmb Rt=5 -> half B of d[2]
+        let e = encode_mrc_full(4, 0, 0, 5, 1, 2);
+        assert_eq!(e.0 & 0xF0, 0x10, "rfmb L=1");
+        assert_eq!((e.1 >> 5) & 0x7, 1, "rfmb opc2=1");
+
+        // dadd d[2] = d[0] + d[1]: encode_cdp_dcp(0, 0, 2, 0, 1)
+        let e = encode_cdp_dcp(0, 0, 2, 0, 1);
+        assert_eq!((e.0 >> 4) & 0xF, 0, "dadd opc1=0");
+        assert_eq!((e.1 >> 5) & 0x7, 0, "dadd opc2=0");
+        assert_eq!(e.1 & 0x10, 0, "CDP: bit 4 = 0");
+
+        // dsqrt d[1] = sqrt(d[0])
+        let e = encode_cdp_dcp(0, 4, 1, 0, 0);
+        assert_eq!((e.0 >> 4) & 0xF, 0);
+        assert_eq!((e.1 >> 5) & 0x7, 4);
+    }
+
+    // -------- All eight doubles independently addressable --------
+
+    #[test]
+    fn test_dcp_all_eight_doubles_distinct() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+
+        for d in 0..8 {
+            dcp_load_double(&mut cpu, &mut bus, d, (d as f64) + 0.5);
+        }
+        for d in 0..8 {
+            let got = dcp_read_double_via_mrc(&mut cpu, &mut bus, d);
+            assert_eq!(got, (d as f64) + 0.5, "d[{d}] mismatch");
+        }
+    }
+
+    // -------- d2i/d2u NaN divergence lock-in --------
+
+    /// Locks in the current d2i(NaN) behaviour: Rust's `NaN as i32` yields 0
+    /// (since 1.45), so half A of the destination is 0; arith status then
+    /// reflects the NaN input with the NaN bit set. This diverges from some
+    /// FPUs that would signal IOC; we intentionally adopt the cheap Rust
+    /// cast semantics (HLD §17.x accepted). Future "fixes" that silently
+    /// change the produced integer or drop the NaN status bit must break
+    /// this test.
+    #[test]
+    fn test_dcp_d2i_nan_produces_zero_with_nan_status() {
+        let mut cpu = CortexM33::new();
+        let mut bus = Bus::default();
+        enable_cp(&mut bus, 4);
+
+        // Seed d[0] = NaN (quiet), then d2i: half_a(d[1]) = d[0] as i32.
+        dcp_set_double(&mut cpu, 0, f64::NAN);
+        let (hw0, hw1) = encode_cdp_dcp(2, 2, 1, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+
+        // Rust's `NaN as i32` saturates to 0.
+        assert_eq!(
+            cpu.dcp_halves[2] as i32,
+            0,
+            "d2i(NaN) half A must be 0 (Rust `NaN as i32` semantics)"
+        );
+        // Half B is always cleared by the d2i path.
+        assert_eq!(cpu.dcp_halves[3], 0, "d2i clears half B");
+        // Arith status is set from the pre-cast NaN: NaN bit (1<<3) set.
+        assert!(
+            cpu.dcp_status & (1 << 3) != 0,
+            "DCP_NAN status bit must be set; got {:#x}",
+            cpu.dcp_status
+        );
     }
 }
