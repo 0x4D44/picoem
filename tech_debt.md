@@ -154,7 +154,7 @@ core-0/core-1 interleaving (and `maybe_wake_core1`) preserved so bank
 contention timing and intra-quantum FIFO wakes still fire. Tests that
 need single-instruction granularity opt in via
 `EmulatorBuilder::new(Config::default()).step_quantum(1).build()`. See
-`wrk_docs/2026.04.14 - HLD - mdrp2040 Quantum Step.md` (v1.1.0).
+`wrk_docs/2026.04.14 - HLD - mdrp2040 Quantum Step.md` (v1.2.0).
 
 ### RP2040 SIO divider 2-read dirty clear heuristic
 
