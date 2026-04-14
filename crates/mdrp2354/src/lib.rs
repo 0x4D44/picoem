@@ -34,7 +34,9 @@ pub enum StopReason {
 
 /// ROSC nominal frequency (~6.5 MHz). The RP2350 boots on ROSC;
 /// PLL configuration (if any) happens later in firmware.
-pub const ROSC_FREQ_HZ: u32 = 6_500_000;
+///
+/// Re-exported from [`bus::clocks`] for backward compatibility.
+pub use self::bus::clocks::ROSC_FREQ_HZ;
 
 /// Emulator configuration.
 pub struct Config {

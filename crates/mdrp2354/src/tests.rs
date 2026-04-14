@@ -5768,3 +5768,55 @@ fn test_config_default_uses_rosc_frequency() {
     assert_eq!(Config::default().sys_clk_hz, 6_500_000,
         "Config::default() should use ROSC frequency (~6.5 MHz)");
 }
+
+// ============================================================================
+// Clock Tree V2 Phase A: CLOCKS-side sys_clk_hz derivation
+// ============================================================================
+
+#[test]
+fn test_rosc_is_default_sys_clock() {
+    use crate::bus::clocks::ROSC_FREQ_HZ;
+    let bus = Bus::new();
+    assert_eq!(bus.sys_clk_hz(), ROSC_FREQ_HZ,
+        "fresh Bus should report ROSC as the system clock");
+    assert_eq!(bus.ref_clk_hz(), ROSC_FREQ_HZ,
+        "fresh Bus should report ROSC as the reference clock");
+}
+
+#[test]
+fn test_xosc_via_clk_ref_sys_clock() {
+    use crate::bus::clocks::XOSC_FREQ_HZ;
+    let (_, mut bus) = core_and_bus();
+    // CLK_REF_CTRL SRC=2 (XOSC)
+    bus.write32(0x4001_0030, 0x0000_0002);
+    // CLK_SYS_CTRL SRC=0 (clk_ref)
+    bus.write32(0x4001_0060, 0x0000_0000);
+    assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ,
+        "CLK_SYS routed through CLK_REF=XOSC should give 12 MHz");
+    assert_eq!(bus.ref_clk_hz(), XOSC_FREQ_HZ);
+}
+
+#[test]
+fn test_clk_sys_div_scales_output() {
+    use crate::bus::clocks::XOSC_FREQ_HZ;
+    let (_, mut bus) = core_and_bus();
+    // Route CLK_SYS to XOSC via CLK_REF
+    bus.write32(0x4001_0030, 0x0000_0002);
+    bus.write32(0x4001_0060, 0x0000_0000);
+    // CLK_SYS_DIV integer = 2 (bits [31:16])
+    bus.write32(0x4001_0064, 0x0002_0000);
+    assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ / 2,
+        "CLK_SYS_DIV=2 should halve the source frequency");
+}
+
+#[test]
+fn test_clocks_write_alias_set() {
+    let (_, mut bus) = core_and_bus();
+    // Normal write: CLK_REF_CTRL = 0x01
+    bus.write32(0x4001_0030, 0x0000_0001);
+    // SET alias (alias=2) at offset 0x030 → 0x4001_0000 | (2 << 12) | 0x030
+    bus.write32(0x4001_2030, 0x0000_0002);
+    // Expect OR, not overwrite → 0x03
+    assert_eq!(bus.read32(0x4001_0030), 0x0000_0003,
+        "SET alias should OR bits into CLK_REF_CTRL, not overwrite");
+}

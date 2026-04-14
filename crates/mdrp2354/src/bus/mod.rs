@@ -1,8 +1,10 @@
+pub mod clocks;
 pub mod peripherals;
 pub mod ppb;
 
 use std::collections::HashMap;
 
+use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
 use crate::memory::{Memory, SRAM_SIZE};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
@@ -51,9 +53,17 @@ pub struct Bus {
     /// QMI register backing store (offsets 0x000..0x06C, 28 words).
     qmi_regs: [u32; 28],
     /// CLK_REF_CTRL register (CLOCKS offset 0x030).
-    clk_ref_ctrl: u32,
+    pub(crate) clk_ref_ctrl: u32,
     /// CLK_SYS_CTRL register (CLOCKS offset 0x060).
-    clk_sys_ctrl: u32,
+    pub(crate) clk_sys_ctrl: u32,
+    /// CLK_SYS_DIV register (CLOCKS offset 0x064).
+    /// [31:16] integer divider (0 treated as 1), [15:0] fractional (ignored).
+    /// Reset value 0x0001_0000 = integer div 1.
+    pub(crate) clk_sys_div: u32,
+    /// Derived clock-tree frequencies. Recomputed after each write to
+    /// CLK_REF_CTRL / CLK_SYS_CTRL / CLK_SYS_DIV (and in later phases
+    /// the PLL registers).
+    pub(crate) clock_tree: ClockTree,
     /// SIO GPIO_HI_IN (offset 0x008). Upper QSPI GPIO pins.
     /// When flash is loaded, returns pseudo-random noise to simulate
     /// QSPI pin activity (the bootrom samples this to detect flash).
@@ -95,6 +105,8 @@ impl Bus {
             qmi_regs: [0u32; 28],
             clk_ref_ctrl: 0,
             clk_sys_ctrl: 0,
+            clk_sys_div: 0x0001_0000,
+            clock_tree: ClockTree::default(),
             gpio_hi_noise_state: 0xA5A5_A5A5,
             xip_cache_offset: 0,
             sio: Sio::new(),
@@ -104,6 +116,63 @@ impl Bus {
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
             gpio_in: 0,
         }
+    }
+
+    // --- Clock tree accessors (see bus/clocks.rs and LLD V2 §4) ---
+
+    /// Current effective system clock frequency in Hz.
+    ///
+    /// Derived from CLK_SYS_CTRL / CLK_REF_CTRL / CLK_SYS_DIV and the
+    /// PLL registers (PLLs return 0 Hz until Phase B lands). The Pacer
+    /// reads this after each quantum to follow firmware clock changes.
+    pub fn sys_clk_hz(&self) -> u32 {
+        self.clock_tree.sys_clk_hz
+    }
+
+    /// Current effective reference clock frequency in Hz.
+    pub fn ref_clk_hz(&self) -> u32 {
+        self.clock_tree.ref_clk_hz
+    }
+
+    /// Recompute `clock_tree.sys_clk_hz` / `ref_clk_hz` from the current
+    /// CLOCKS register state. Called after any CLK_REF_CTRL /
+    /// CLK_SYS_CTRL / CLK_SYS_DIV write. Phase B will extend this to
+    /// also fire on PLL register writes.
+    ///
+    /// See LLD V2 §4.5 for the formulas.
+    pub(crate) fn recompute_clock_tree(&mut self) {
+        // PLL backing storage arrives in Phase B; the stub returns 0.
+        let pll_zero = [0u32; 4];
+
+        // --- ref_clk_hz -------------------------------------------------
+        let ref_hz = match self.clk_ref_ctrl & 0x3 {
+            0 => ROSC_FREQ_HZ,
+            1 => match (self.clk_ref_ctrl >> 5) & 0x7 {
+                0 => pll_output_hz(&pll_zero), // aux: PLL_USB (Phase B)
+                _ => 0,                        // clksrc_gpin0/1 — unmodeled
+            },
+            2 => XOSC_FREQ_HZ,
+            _ => ROSC_FREQ_HZ, // reserved — safe fallback
+        };
+
+        // --- sys_clk_hz -------------------------------------------------
+        let sys_src_hz = match self.clk_sys_ctrl & 0x1 {
+            0 => ref_hz, // clk_ref path
+            _ => match (self.clk_sys_ctrl >> 5) & 0x7 {
+                0 => pll_output_hz(&pll_zero), // PLL_SYS (Phase B)
+                1 => pll_output_hz(&pll_zero), // PLL_USB (Phase B)
+                2 => ROSC_FREQ_HZ,
+                3 => XOSC_FREQ_HZ,
+                _ => 0, // clksrc_gpin0/1 — unmodeled
+            },
+        };
+
+        // CLK_SYS_DIV[31:16] integer divider; 0 is reserved → treat as 1.
+        let int_div = ((self.clk_sys_div >> 16) & 0xFFFF).max(1);
+        let sys_hz = sys_src_hz / int_div;
+
+        self.clock_tree.ref_clk_hz = ref_hz;
+        self.clock_tree.sys_clk_hz = sys_hz;
     }
 
     // --- XIP SRAM helpers (0x1C00_0000..0x1C00_3FFF) ---
@@ -508,14 +577,16 @@ impl Bus {
                         self.qmi_write(reg_offset, u32::from_le_bytes(bytes));
                     }
                     0x4001_0000 => {
-                        // CLOCKS: do RMW on the word
+                        // CLOCKS: do RMW on the word. Alias bits were
+                        // already resolved via `canonical`, so pass 0
+                        // (normal write) to clocks_write.
                         let word_addr = canonical & !3;
                         let byte_idx = (canonical & 3) as usize;
                         let reg_offset = word_addr & 0x0000_0FFF;
                         let old_word = self.clocks_read(reg_offset);
                         let mut bytes = old_word.to_le_bytes();
                         bytes[byte_idx] = val;
-                        self.clocks_write(reg_offset, u32::from_le_bytes(bytes));
+                        self.clocks_write(reg_offset, u32::from_le_bytes(bytes), 0);
                     }
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore byte
@@ -679,14 +750,20 @@ impl Bus {
                         self.qmi_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
                     }
                     0x4001_0000 => {
-                        // CLOCKS: do RMW on the word
+                        // CLOCKS: do RMW on the word. Alias bits were
+                        // already resolved via `canonical`, so pass 0
+                        // (normal write) to clocks_write.
                         let word_addr = canonical & !3;
                         let half_idx = ((canonical >> 1) & 1) as usize;
                         let reg_offset = word_addr & 0x0000_0FFF;
                         let old_word = self.clocks_read(reg_offset);
                         let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
                         halves[half_idx] = val;
-                        self.clocks_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
+                        self.clocks_write(
+                            reg_offset,
+                            (halves[0] as u32) | ((halves[1] as u32) << 16),
+                            0,
+                        );
                     }
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore halfword
@@ -833,7 +910,7 @@ impl Bus {
                 match base {
                     0x4002_0000 => self.resets_write(offset, val, alias),
                     0x400D_0000 => self.qmi_write(offset, val),
-                    0x4001_0000 => self.clocks_write(offset, val),
+                    0x4001_0000 => self.clocks_write(offset, val, alias),
                     0x400E_8000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
                         // ROSC, XOSC, PLL: accept writes, ignore
                     }

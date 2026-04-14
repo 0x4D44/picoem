@@ -39,17 +39,34 @@ impl Bus {
             0x030 => self.clk_ref_ctrl,
             0x038 => 1 << (self.clk_ref_ctrl & 0x3), // CLK_REF_SELECTED
             0x060 => self.clk_sys_ctrl,
+            0x064 => self.clk_sys_div,
             0x068 => 1 << (self.clk_sys_ctrl & 0x1), // CLK_SYS_SELECTED
             _ => 0,
         }
     }
 
-    pub(crate) fn clocks_write(&mut self, offset: u32, val: u32) {
+    /// Apply an alias-aware write to one of the CLOCKS registers.
+    ///
+    /// `alias` encodes the atomic-access kind (0 = normal, 1 = XOR,
+    /// 2 = SET, 3 = CLR), matching the RP2350 APB aperture convention
+    /// already used by `resets_write`. After the underlying register
+    /// is updated, `recompute_clock_tree` refreshes the derived
+    /// `sys_clk_hz` / `ref_clk_hz` values.
+    pub(crate) fn clocks_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let apply = |current: u32| match alias {
+            0 => val,
+            1 => current ^ val,
+            2 => current | val,
+            3 => current & !val,
+            _ => val,
+        };
         match offset {
-            0x030 => self.clk_ref_ctrl = val,
-            0x060 => self.clk_sys_ctrl = val,
+            0x030 => self.clk_ref_ctrl = apply(self.clk_ref_ctrl),
+            0x060 => self.clk_sys_ctrl = apply(self.clk_sys_ctrl),
+            0x064 => self.clk_sys_div = apply(self.clk_sys_div),
             _ => {}
         }
+        self.recompute_clock_tree();
     }
 
     // --- ROSC (0x400E8000) ---
