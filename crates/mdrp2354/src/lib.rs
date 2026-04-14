@@ -160,8 +160,15 @@ impl Emulator {
                 && !self.cores[core_id].is_wfe_waiting()
                 && self.cores[core_id].cycles < target
             {
+                // Publish the core's cycle count into its PPB before each
+                // instruction so DWT_CYCCNT reads/writes land on a fresh
+                // value. Staleness is bounded by one instruction.
+                self.bus.ppb[core_id].update_latest_cycles(self.cores[core_id].cycles);
                 self.cores[core_id].step(&mut self.bus);
             }
+            // Final refresh so any post-quantum inspection (e.g. tests
+            // reading DWT_CYCCNT between steps) sees a current base.
+            self.bus.ppb[core_id].update_latest_cycles(self.cores[core_id].cycles);
         }
 
         self.clock.advance(self.step_quantum as u64);
@@ -194,11 +201,15 @@ impl Emulator {
         self.bus.sio.tick_mtime_n(cycles);
     }
 
-    /// Quantum-end SysTick advance. Stage 2 wiring — no-op for now;
-    /// DWT CYCCNT and SysTick CVR continue to return hardcoded 0
-    /// from `Ppb::read32` until the SysTick/DWT work lands.
+    /// Quantum-end SysTick advance. Each core's SysTick is ticked by the
+    /// delta between its current `cycles` and the last `systick_advance`
+    /// snapshot. The per-core CVR and COUNTFLAG state live on
+    /// `Bus::ppb[core_id]`; pending exception delivery sets
+    /// `ICSR.PENDSTSET` via `Ppb::pend_systick()` when TICKINT is enabled.
     fn tick_systick(&mut self) {
-        // Intentionally empty — Stage 2.
+        for core_id in 0..2 {
+            self.bus.ppb[core_id].systick_advance(self.cores[core_id].cycles());
+        }
     }
 
     /// WFE/SEV wake check. If a core is WFE-waiting and its event_flag

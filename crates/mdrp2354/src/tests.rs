@@ -6861,3 +6861,96 @@ fn test_config_sys_clk_hz_seeds_bus() {
     assert_eq!(emu.bus.sys_clk_hz(), ROSC_FREQ_HZ,
         "First CLOCKS write should replace the seed with the derived ROSC frequency");
 }
+
+// ============================================================================
+// Quantum Execution Model — Stage 2: DWT + SysTick Emulator-level wiring
+// ============================================================================
+
+/// Build a minimal emulator whose firmware is an infinite B-to-self loop at
+/// the reset vector. Both cores execute NOPs effectively, accumulating cycles
+/// at a steady rate so the SysTick tick_systick() call sees deltas.
+fn systick_test_emulator() -> crate::Emulator {
+    use crate::{Config, EmulatorBuilder};
+    let mut emu = EmulatorBuilder::new(Config::default()).build();
+    // Minimal bootrom: SP @ 0x2000_0100, PC @ reset vector 0x0000_0100
+    // with a NOP-equivalent `B .` loop so the core just keeps stepping.
+    let mut rom = vec![0u8; 32 * 1024];
+    // Initial SP
+    rom[0] = 0x00; rom[1] = 0x01; rom[2] = 0x00; rom[3] = 0x20;
+    // Reset vector: 0x0000_0101 (thumb bit)
+    rom[4] = 0x01; rom[5] = 0x01; rom[6] = 0x00; rom[7] = 0x00;
+    // At 0x100: B . (0xE7FE)
+    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    emu.load_bootrom(&rom);
+    emu.reset();
+    emu
+}
+
+#[test]
+fn test_dwt_cyccnt_wired_to_core_cycles() {
+    // With TRCENA + CYCCNTENA set on core 0, reading CYCCNT through the bus
+    // must reflect the core's accumulated cycle count after a quantum.
+    let mut emu = systick_test_emulator();
+
+    // Enable DWT: DEMCR.TRCENA then DWT_CTRL.CYCCNTENA
+    emu.bus.ppb[0].write32(0xE000_EDFC, 1 << 24);
+    emu.bus.ppb[0].write32(0xE000_1000, 1);
+
+    // Publish current cycle count into PPB so the write sees a fresh base.
+    emu.bus.ppb[0].update_latest_cycles(emu.cores[0].cycles());
+    // Zero CYCCNT.
+    emu.bus.ppb[0].write32(0xE000_1004, 0);
+
+    let cycles_before = emu.cores[0].cycles();
+    emu.step();
+    let cycles_after = emu.cores[0].cycles();
+    let delta = (cycles_after - cycles_before) as u32;
+
+    emu.bus.ppb[0].update_latest_cycles(emu.cores[0].cycles());
+    let cyccnt = emu.bus.ppb[0].read_cyccnt(emu.cores[0].cycles());
+    assert_eq!(cyccnt, delta,
+        "After zeroing CYCCNT, read must equal cycles elapsed since write");
+}
+
+#[test]
+fn test_emulator_tick_systick_advances_per_core() {
+    // Quantum-end tick_systick() must advance each enabled SysTick by the
+    // per-core cycle delta since the last tick. Verify via COUNTFLAG on CSR.
+    let mut emu = systick_test_emulator();
+
+    // Enable SysTick on core 0: ENABLE + TICKINT + CLKSOURCE
+    emu.bus.ppb[0].write32(0xE000_E010, 1 | (1 << 1) | (1 << 2));
+    // RVR = 1 (smallest non-zero period); CVR = 0 (will immediately underflow).
+    // Set CVR via field because register writes always clear CVR.
+    emu.bus.ppb[0].write32(0xE000_E014, 1);
+    emu.bus.ppb[0].syst_cvr = 0;
+    // Snapshot last_systick_cycles to the current value so delta is meaningful.
+    emu.bus.ppb[0].last_systick_cycles = emu.cores[0].cycles();
+
+    emu.step();
+
+    // Multi-reload within the quantum should have set COUNTFLAG.
+    assert_ne!(emu.bus.ppb[0].syst_csr & (1 << 16), 0,
+        "SysTick must underflow during the quantum");
+    // TICKINT=1: ICSR.PENDSTSET must be set.
+    assert_ne!(emu.bus.ppb[0].icsr & (1 << 26), 0,
+        "TICKINT=1 + underflow must pend SysTick via ICSR.PENDSTSET");
+}
+
+#[test]
+fn test_emulator_tick_systick_disabled_core_untouched() {
+    // If core 1's SysTick is disabled, tick_systick() must not perturb CVR.
+    let mut emu = systick_test_emulator();
+    // Core 1 SysTick disabled; core 0 left at defaults (also disabled).
+    emu.bus.ppb[1].write32(0xE000_E010, 1 << 2); // CLKSOURCE only
+    emu.bus.ppb[1].write32(0xE000_E014, 100);
+    // Set CVR via field; a register write would clear it.
+    emu.bus.ppb[1].syst_cvr = 77;
+
+    emu.step();
+
+    assert_eq!(emu.bus.ppb[1].syst_cvr, 77,
+        "Disabled SysTick must not tick at quantum end");
+    assert_eq!(emu.bus.ppb[1].syst_csr & (1 << 16), 0,
+        "Disabled SysTick must not set COUNTFLAG");
+}
