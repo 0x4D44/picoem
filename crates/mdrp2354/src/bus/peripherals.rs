@@ -1,5 +1,45 @@
 use super::Bus;
 
+/// Map a PLL register offset (`0x000`, `0x004`, `0x008`, `0x00C`) to
+/// its index in a `[u32; 4]` register image. Returns `None` for
+/// unknown offsets — callers should ignore those.
+fn pll_reg_index(offset: u32) -> Option<usize> {
+    match offset {
+        0x000 => Some(0),
+        0x004 => Some(1),
+        0x008 => Some(2),
+        0x00C => Some(3),
+        _ => None,
+    }
+}
+
+/// Read a PLL register, forcing the LOCK bit (`CS[31]`) on the CS
+/// register so firmware poll loops succeed immediately. Shared
+/// between PLL_SYS and PLL_USB.
+fn pll_read_from(regs: &[u32; 4], offset: u32) -> u32 {
+    match pll_reg_index(offset) {
+        Some(0) => regs[0] | (1 << 31), // CS: always report LOCK=1
+        Some(i) => regs[i],
+        None => 0,
+    }
+}
+
+/// Apply an alias-aware write to a PLL register image. `alias`
+/// follows the usual APB convention: 0=normal, 1=XOR, 2=SET, 3=CLR.
+/// Unknown offsets are silently dropped — real hardware also ignores
+/// accesses outside the 16-byte window.
+fn pll_write_into(regs: &mut [u32; 4], offset: u32, val: u32, alias: u32) {
+    if let Some(i) = pll_reg_index(offset) {
+        regs[i] = match alias {
+            0 => val,
+            1 => regs[i] ^ val,
+            2 => regs[i] | val,
+            3 => regs[i] & !val,
+            _ => val,
+        };
+    }
+}
+
 impl Bus {
     // --- SYSINFO (0x40000000) — read-only ---
     pub(crate) fn sysinfo_read(&self, offset: u32) -> u32 {
@@ -86,19 +126,27 @@ impl Bus {
     }
 
     // --- PLL_SYS (0x40050000) / PLL_USB (0x40058000) ---
-    // Both PLLs share the same register layout; report locked immediately.
+    //
+    // Both PLLs share the same register layout: CS (0x000), PWR (0x004),
+    // FBDIV_INT (0x008), PRIM (0x00C). We always force the LOCK bit
+    // (CS[31]) so firmware polling for lock succeeds on the first read
+    // — see LLD V2 §9 risk 2 for the known fidelity gap.
     pub(crate) fn pll_sys_read(&self, offset: u32) -> u32 {
-        match offset {
-            0x000 => 1 << 31, // CS: LOCK bit set
-            _ => 0,
-        }
+        pll_read_from(&self.pll_sys_regs, offset)
+    }
+
+    pub(crate) fn pll_sys_write(&mut self, offset: u32, val: u32, alias: u32) {
+        pll_write_into(&mut self.pll_sys_regs, offset, val, alias);
+        self.recompute_clock_tree();
     }
 
     pub(crate) fn pll_usb_read(&self, offset: u32) -> u32 {
-        match offset {
-            0x000 => 1 << 31, // CS: LOCK bit set
-            _ => 0,
-        }
+        pll_read_from(&self.pll_usb_regs, offset)
+    }
+
+    pub(crate) fn pll_usb_write(&mut self, offset: u32, val: u32, alias: u32) {
+        pll_write_into(&mut self.pll_usb_regs, offset, val, alias);
+        self.recompute_clock_tree();
     }
 
     // --- QMI (0x400D0000) --- QSPI memory interface

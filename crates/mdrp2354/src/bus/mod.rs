@@ -61,9 +61,19 @@ pub struct Bus {
     /// Reset value 0x0001_0000 = integer div 1.
     pub(crate) clk_sys_div: u32,
     /// Derived clock-tree frequencies. Recomputed after each write to
-    /// CLK_REF_CTRL / CLK_SYS_CTRL / CLK_SYS_DIV (and in later phases
-    /// the PLL registers).
+    /// CLK_REF_CTRL / CLK_SYS_CTRL / CLK_SYS_DIV or any PLL_SYS /
+    /// PLL_USB register.
     pub(crate) clock_tree: ClockTree,
+    /// PLL_SYS register image: `[CS, PWR, FBDIV_INT, PRIM]` at offsets
+    /// `0x000`, `0x004`, `0x008`, `0x00C` respectively. Reset values
+    /// per LLD V2 §4.3: CS=0x01 (REFDIV=1), PWR=0x2D (powered down),
+    /// FBDIV=0 (PLL off → `pll_output_hz` returns 0), PRIM=0x77000
+    /// (POSTDIV1=7, POSTDIV2=7).
+    pub(crate) pll_sys_regs: [u32; 4],
+    /// PLL_USB register image — same layout and reset values as
+    /// `pll_sys_regs`. Separate storage so configuring one PLL does
+    /// not affect the other.
+    pub(crate) pll_usb_regs: [u32; 4],
     /// SIO GPIO_HI_IN (offset 0x008). Upper QSPI GPIO pins.
     /// When flash is loaded, returns pseudo-random noise to simulate
     /// QSPI pin activity (the bootrom samples this to detect flash).
@@ -107,6 +117,8 @@ impl Bus {
             clk_sys_ctrl: 0,
             clk_sys_div: 0x0001_0000,
             clock_tree: ClockTree::default(),
+            pll_sys_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
+            pll_usb_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
             gpio_hi_noise_state: 0xA5A5_A5A5,
             xip_cache_offset: 0,
             sio: Sio::new(),
@@ -134,22 +146,19 @@ impl Bus {
         self.clock_tree.ref_clk_hz
     }
 
-    /// Recompute `clock_tree.sys_clk_hz` / `ref_clk_hz` from the current
-    /// CLOCKS register state. Called after any CLK_REF_CTRL /
-    /// CLK_SYS_CTRL / CLK_SYS_DIV write. Phase B will extend this to
-    /// also fire on PLL register writes.
+    /// Recompute `clock_tree.sys_clk_hz` / `ref_clk_hz` from the
+    /// current CLOCKS and PLL register state. Called after any write
+    /// to CLK_REF_CTRL / CLK_SYS_CTRL / CLK_SYS_DIV or any PLL_SYS /
+    /// PLL_USB register.
     ///
     /// See LLD V2 §4.5 for the formulas.
     pub(crate) fn recompute_clock_tree(&mut self) {
-        // PLL backing storage arrives in Phase B; the stub returns 0.
-        let pll_zero = [0u32; 4];
-
         // --- ref_clk_hz -------------------------------------------------
         let ref_hz = match self.clk_ref_ctrl & 0x3 {
             0 => ROSC_FREQ_HZ,
             1 => match (self.clk_ref_ctrl >> 5) & 0x7 {
-                0 => pll_output_hz(&pll_zero), // aux: PLL_USB (Phase B)
-                _ => 0,                        // clksrc_gpin0/1 — unmodeled
+                0 => pll_output_hz(&self.pll_usb_regs), // aux: PLL_USB
+                _ => 0,                                 // clksrc_gpin0/1 — unmodeled
             },
             2 => XOSC_FREQ_HZ,
             _ => ROSC_FREQ_HZ, // reserved — safe fallback
@@ -159,8 +168,8 @@ impl Bus {
         let sys_src_hz = match self.clk_sys_ctrl & 0x1 {
             0 => ref_hz, // clk_ref path
             _ => match (self.clk_sys_ctrl >> 5) & 0x7 {
-                0 => pll_output_hz(&pll_zero), // PLL_SYS (Phase B)
-                1 => pll_output_hz(&pll_zero), // PLL_USB (Phase B)
+                0 => pll_output_hz(&self.pll_sys_regs),
+                1 => pll_output_hz(&self.pll_usb_regs),
                 2 => ROSC_FREQ_HZ,
                 3 => XOSC_FREQ_HZ,
                 _ => 0, // clksrc_gpin0/1 — unmodeled
@@ -563,8 +572,8 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
-                        // SYSINFO (read-only), XOSC, PLL: ignore byte writes
+                    0x4000_0000 | 0x4004_8000 => {
+                        // SYSINFO (read-only), XOSC: ignore byte writes
                     }
                     0x400D_0000 => {
                         // QMI: do RMW on the word
@@ -576,17 +585,38 @@ impl Bus {
                         bytes[byte_idx] = val;
                         self.qmi_write(reg_offset, u32::from_le_bytes(bytes));
                     }
-                    0x4001_0000 => {
-                        // CLOCKS: do RMW on the word. Alias bits were
-                        // already resolved via `canonical`, so pass 0
-                        // (normal write) to clocks_write.
+                    0x4001_0000 | 0x4005_0000 | 0x4005_8000 => {
+                        // CLOCKS / PLL_SYS / PLL_USB: peripherals that
+                        // handle the atomic alias internally. For a
+                        // subword SET/CLR/XOR we must preserve the
+                        // alias semantic — passing alias=0 after an
+                        // RMW merge would turn SET into plain overwrite
+                        // (see LLD V2 §4.8 note on the pre-existing
+                        // subword bug). Strategy:
+                        //   • alias == 0 → RMW the word, pass alias=0.
+                        //   • alias != 0 → expand byte to `byte << shift`
+                        //     and let the peripheral's alias logic
+                        //     apply SET / CLR / XOR bit-wise.
                         let word_addr = canonical & !3;
                         let byte_idx = (canonical & 3) as usize;
                         let reg_offset = word_addr & 0x0000_0FFF;
-                        let old_word = self.clocks_read(reg_offset);
-                        let mut bytes = old_word.to_le_bytes();
-                        bytes[byte_idx] = val;
-                        self.clocks_write(reg_offset, u32::from_le_bytes(bytes), 0);
+                        let (word_val, pass_alias) = if alias == 0 {
+                            let old_word = match base {
+                                0x4001_0000 => self.clocks_read(reg_offset),
+                                0x4005_0000 => self.pll_sys_read(reg_offset),
+                                _ => self.pll_usb_read(reg_offset),
+                            };
+                            let mut bytes = old_word.to_le_bytes();
+                            bytes[byte_idx] = val;
+                            (u32::from_le_bytes(bytes), 0)
+                        } else {
+                            ((val as u32) << (byte_idx * 8), alias)
+                        };
+                        match base {
+                            0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
+                            0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
+                            _ => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                        }
                     }
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore byte
@@ -736,8 +766,8 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 match base {
-                    0x4000_0000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
-                        // SYSINFO (read-only), XOSC, PLL: ignore halfword writes
+                    0x4000_0000 | 0x4004_8000 => {
+                        // SYSINFO (read-only), XOSC: ignore halfword writes
                     }
                     0x400D_0000 => {
                         // QMI: do RMW on the word
@@ -749,21 +779,33 @@ impl Bus {
                         halves[half_idx] = val;
                         self.qmi_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
                     }
-                    0x4001_0000 => {
-                        // CLOCKS: do RMW on the word. Alias bits were
-                        // already resolved via `canonical`, so pass 0
-                        // (normal write) to clocks_write.
+                    0x4001_0000 | 0x4005_0000 | 0x4005_8000 => {
+                        // CLOCKS / PLL_SYS / PLL_USB: same subword-alias
+                        // strategy as `write8` (see the comment there).
                         let word_addr = canonical & !3;
                         let half_idx = ((canonical >> 1) & 1) as usize;
                         let reg_offset = word_addr & 0x0000_0FFF;
-                        let old_word = self.clocks_read(reg_offset);
-                        let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
-                        halves[half_idx] = val;
-                        self.clocks_write(
-                            reg_offset,
-                            (halves[0] as u32) | ((halves[1] as u32) << 16),
-                            0,
-                        );
+                        let (word_val, pass_alias) = if alias == 0 {
+                            let old_word = match base {
+                                0x4001_0000 => self.clocks_read(reg_offset),
+                                0x4005_0000 => self.pll_sys_read(reg_offset),
+                                _ => self.pll_usb_read(reg_offset),
+                            };
+                            let mut halves: [u16; 2] =
+                                [old_word as u16, (old_word >> 16) as u16];
+                            halves[half_idx] = val;
+                            (
+                                (halves[0] as u32) | ((halves[1] as u32) << 16),
+                                0,
+                            )
+                        } else {
+                            ((val as u32) << (half_idx * 16), alias)
+                        };
+                        match base {
+                            0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
+                            0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
+                            _ => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                        }
                     }
                     0x4002_0000 => {
                         // RESETS: only word-aligned writes meaningful, ignore halfword
@@ -911,8 +953,10 @@ impl Bus {
                     0x4002_0000 => self.resets_write(offset, val, alias),
                     0x400D_0000 => self.qmi_write(offset, val),
                     0x4001_0000 => self.clocks_write(offset, val, alias),
-                    0x400E_8000 | 0x4004_8000 | 0x4005_0000 | 0x4005_8000 => {
-                        // ROSC, XOSC, PLL: accept writes, ignore
+                    0x4005_0000 => self.pll_sys_write(offset, val, alias),
+                    0x4005_8000 => self.pll_usb_write(offset, val, alias),
+                    0x400E_8000 | 0x4004_8000 => {
+                        // ROSC, XOSC: accept writes, ignore (Phase D extends)
                     }
                     // SYSINFO (0x4000_0000): read-only, ignore writes
                     0x4000_0000 => {}

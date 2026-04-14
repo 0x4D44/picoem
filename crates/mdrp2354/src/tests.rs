@@ -5820,3 +5820,106 @@ fn test_clocks_write_alias_set() {
     assert_eq!(bus.read32(0x4001_0030), 0x0000_0003,
         "SET alias should OR bits into CLK_REF_CTRL, not overwrite");
 }
+
+// ============================================================================
+// Clock Tree V2 Phase B: PLL_SYS / PLL_USB model
+// ============================================================================
+
+#[test]
+fn test_pll_sys_at_150mhz() {
+    // Standard Pico SDK configuration: XOSC=12M, REFDIV=1, FBDIV=125,
+    // POSTDIV1=5, POSTDIV2=2 → VCO=1500M, output=150M.
+    let (_, mut bus) = core_and_bus();
+    // CS: REFDIV=1 (reset value already has this; write explicitly)
+    bus.write32(0x4005_0000, 0x0000_0001);
+    // FBDIV_INT = 125
+    bus.write32(0x4005_0008, 125);
+    // PRIM: POSTDIV1=5 in bits [18:16], POSTDIV2=2 in bits [14:12]
+    bus.write32(0x4005_000C, (5 << 16) | (2 << 12));
+    // Switch CLK_SYS to aux=0 (PLL_SYS): SRC=1, AUXSRC=0
+    bus.write32(0x4001_0060, 0x0000_0001);
+    assert_eq!(bus.sys_clk_hz(), 150_000_000,
+        "PLL_SYS configured for 150 MHz should give sys_clk_hz = 150_000_000");
+}
+
+#[test]
+fn test_unconfigured_pll_zero_hz() {
+    // Fresh Bus: reset values leave FBDIV=0, so pll_output_hz must return 0.
+    // Switching CLK_SYS to PLL_SYS without configuring should report 0 Hz.
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x4001_0060, 0x0000_0001); // SRC=1 (aux), AUXSRC=0 (PLL_SYS)
+    assert_eq!(bus.sys_clk_hz(), 0,
+        "Unconfigured PLL (FBDIV=0) must honestly report 0 Hz, not a .max(1) fudge");
+}
+
+#[test]
+fn test_pll_usb_separate_from_pll_sys() {
+    // Configuring PLL_USB must not bleed into PLL_SYS — they have
+    // separate backing arrays. CLK_SYS stays on clk_ref (ROSC), so
+    // sys_clk_hz is unaffected by PLL_USB changes.
+    let (_, mut bus) = core_and_bus();
+    let before = bus.sys_clk_hz();
+    // Configure PLL_USB to some non-trivial value (48 MHz: FBDIV=100,
+    // POSTDIV1=5, POSTDIV2=5; VCO=1200M / 25 = 48M).
+    bus.write32(0x4005_8000, 0x0000_0001); // CS REFDIV=1
+    bus.write32(0x4005_8008, 100);         // FBDIV_INT
+    bus.write32(0x4005_800C, (5 << 16) | (5 << 12));
+    assert_eq!(bus.sys_clk_hz(), before,
+        "PLL_USB changes must not affect sys_clk_hz while CLK_SYS is on ROSC");
+    // Sanity: PLL_USB registers actually took the writes.
+    assert_eq!(bus.read32(0x4005_8008), 100,
+        "PLL_USB FBDIV_INT should read back the value we wrote");
+}
+
+#[test]
+fn test_pll_fbdiv_max_no_overflow() {
+    // FBDIV=0xFFF (4095) with defaults (REFDIV=1, POSTDIV1=7, POSTDIV2=7)
+    // gives 12M * 4095 / 49 ≈ 1.003 GHz. Must not panic on u32 overflow.
+    let (_, mut bus) = core_and_bus();
+    bus.write32(0x4005_0008, 0xFFF); // FBDIV_INT = 4095 (max)
+    bus.write32(0x4001_0060, 0x0000_0001); // Route CLK_SYS → PLL_SYS
+    let hz = bus.sys_clk_hz();
+    assert!(hz > 1_000_000_000 && hz < 1_010_000_000,
+        "FBDIV=4095 with defaults should produce ~1.003 GHz (got {hz})");
+}
+
+#[test]
+fn test_pll_sys_reset_values() {
+    // Reset values per LLD §4.3 — CS read forces LOCK bit (1<<31).
+    let bus = Bus::new();
+    assert_eq!(bus.pll_sys_regs[0], 0x0000_0001,
+        "PLL_SYS CS reset = REFDIV=1");
+    assert_eq!(bus.pll_sys_regs[1], 0x0000_002D,
+        "PLL_SYS PWR reset = powered-down bits");
+    assert_eq!(bus.pll_sys_regs[2], 0,
+        "PLL_SYS FBDIV_INT reset = 0 (PLL off)");
+    assert_eq!(bus.pll_sys_regs[3], 0x0007_7000,
+        "PLL_SYS PRIM reset = POSTDIV1=7|POSTDIV2=7");
+    // Same for PLL_USB — independent backing.
+    assert_eq!(bus.pll_usb_regs, [0x0000_0001, 0x0000_002D, 0, 0x0007_7000]);
+}
+
+#[test]
+fn test_pll_cs_read_forces_lock_bit() {
+    // CS reads must return `stored | (1 << 31)` — so the LOCK bit is
+    // always present even though the stored value is just 0x01.
+    let mut bus = Bus::new();
+    let cs_read = bus.read32(0x4005_0000);
+    assert_eq!(cs_read, 0x8000_0001,
+        "CS read must force LOCK (bit 31) on top of the stored REFDIV=1");
+    // Masking out LOCK should give back the stored value.
+    assert_eq!(cs_read & !(1 << 31), 0x01);
+}
+
+#[test]
+fn test_pll_sys_write_set_alias_subword() {
+    // Subword SET alias on PLL_USB PWR — matches the bootrom's nsboot
+    // path. A byte-wide SET must OR into the register, not overwrite.
+    let mut bus = Bus::new();
+    // PLL_USB PWR reset = 0x2D. SET alias byte write of 0x40 to byte 0
+    // should yield 0x6D (0x2D | 0x40).
+    // Address: 0x4005_8004 + SET alias (2 << 12) = 0x4005_A004.
+    bus.write8(0x4005_A004, 0x40);
+    assert_eq!(bus.pll_usb_regs[1], 0x6D,
+        "byte-wide SET alias on PLL_USB PWR must OR, not overwrite");
+}
