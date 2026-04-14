@@ -1,41 +1,58 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.10.0"
+version = "0.11.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 mdrp2350 = { path = "../mdrp2350" }
+mdrp2040 = { path = "../mdrp2040" }
 probe-rs = "0.31"
 rand = "0.8"
 chrono = "0.4"
 
-[[bin]]
-name = "qemu_diff"
-path = "src/bin/qemu_diff.rs"
+# ---------------------------------------------------------------------------
+# RP2350 (Cortex-M33) binaries
+# ---------------------------------------------------------------------------
 
 [[bin]]
-name = "probe_verify"
-path = "src/bin/probe_verify.rs"
+name = "qemu_diff_m33"
+path = "src/bin/qemu_diff_m33.rs"
 
 [[bin]]
-name = "probe_diff"
-path = "src/bin/probe_diff.rs"
+name = "probe_verify_rp2350"
+path = "src/bin/probe_verify_rp2350.rs"
 
 [[bin]]
-name = "bank_conflict_test"
-path = "src/bin/bank_conflict_test.rs"
+name = "probe_diff_rp2350"
+path = "src/bin/probe_diff_rp2350.rs"
 
 [[bin]]
-name = "full_test"
-path = "src/bin/full_test.rs"
+name = "bank_conflict_test_rp2350"
+path = "src/bin/bank_conflict_test_rp2350.rs"
+
+[[bin]]
+name = "full_test_rp2350"
+path = "src/bin/full_test_rp2350.rs"
 test = false
 
 [[bin]]
-name = "paced_bench"
-path = "src/bin/paced_bench.rs"
+name = "paced_bench_rp2350"
+path = "src/bin/paced_bench_rp2350.rs"
 
 [[bin]]
 name = "softfloat_diff"
 path = "src/bin/softfloat_diff.rs"
+
+# ---------------------------------------------------------------------------
+# RP2040 (Cortex-M0+) binaries
+# ---------------------------------------------------------------------------
+
+[[bin]]
+name = "qemu_diff_m0plus"
+path = "src/bin/qemu_diff_m0plus.rs"
+
+[[bin]]
+name = "probe_diff_rp2040"
+path = "src/bin/probe_diff_rp2040.rs"

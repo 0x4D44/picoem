@@ -1,18 +1,22 @@
-// QEMU differential test runner.
+// QEMU differential test runner — mdrp2350 (Cortex-M33) oracle.
 //
-// Orchestrates: spawn QEMU, connect GDB, generate tests, run each test
-// in both QEMU and our emulator, compare results, report.
+// Orchestrates: spawn QEMU (mps2-an505 + cortex-m33), connect GDB on
+// localhost:3333, generate tests, run each test in both QEMU and our
+// mdrp2350 emulator, compare results, report.
+//
+// The parallel RP2040 runner is `qemu_diff_m0plus` (microbit + cortex-m0
+// on port 3334). See the workspace restructure HLD Phase 6 section.
 //
 // Usage:
-//   qemu_diff                              Run targeted edge-case tests (default)
-//   qemu_diff --fuzz N                     Run N random tests per instruction class
-//   qemu_diff --fuzz N --seed S            Reproducible fuzz run with seed S
-//   qemu_diff --fuzz N --classes=base|fpu|all
-//                                          Restrict fuzz to base (non-FPU) or FPU
-//                                          instructions. Defaults to `all`.
-//                                          Per HLD §11, only base and FPU classes
-//                                          are QEMU-oracled; CP0/CP4/CP5/CP7 are
-//                                          validated via softfloat_diff/unit tests.
+//   qemu_diff_m33                              Run targeted edge-case tests (default)
+//   qemu_diff_m33 --fuzz N                     Run N random tests per instruction class
+//   qemu_diff_m33 --fuzz N --seed S            Reproducible fuzz run with seed S
+//   qemu_diff_m33 --fuzz N --classes=base|fpu|all
+//                                              Restrict fuzz to base (non-FPU) or FPU
+//                                              instructions. Defaults to `all`.
+//                                              Per HLD §11, only base and FPU classes
+//                                              are QEMU-oracled; CP0/CP4/CP5/CP7 are
+//                                              validated via softfloat_diff/unit tests.
 
 use std::time::Duration;
 
@@ -98,10 +102,10 @@ fn parse_args() -> Result<Args, String> {
                 return Err(format!(
                     "unknown argument '{other}'\n\
                      Usage:\n  \
-                     qemu_diff                              Run targeted edge-case tests (default)\n  \
-                     qemu_diff --fuzz N                     Run N random tests per class\n  \
-                     qemu_diff --fuzz N --seed S            Reproducible fuzz run\n  \
-                     qemu_diff --fuzz N --classes=base|fpu|all   Restrict fuzz to class"
+                     qemu_diff_m33                              Run targeted edge-case tests (default)\n  \
+                     qemu_diff_m33 --fuzz N                     Run N random tests per class\n  \
+                     qemu_diff_m33 --fuzz N --seed S            Reproducible fuzz run\n  \
+                     qemu_diff_m33 --fuzz N --classes=base|fpu|all   Restrict fuzz to class"
                 ));
             }
         }
@@ -200,7 +204,7 @@ fn run_fuzz(
     };
     println!("Fuzz mode: {count_per_class} tests/class, seed={seed}, classes={class_str}");
     println!(
-        "(reproduce with: qemu_diff --fuzz {count_per_class} --seed {seed} --classes={class_str})"
+        "(reproduce with: qemu_diff_m33 --fuzz {count_per_class} --seed {seed} --classes={class_str})"
     );
 
     let buckets = select_fuzz_class(generate_fuzz_classes(count_per_class, seed), class);
@@ -272,7 +276,7 @@ fn run_fuzz(
 
     if fail > 0 {
         println!(
-            "\nReproduce: qemu_diff --fuzz {count_per_class} --seed {seed} --classes={class_str}"
+            "\nReproduce: qemu_diff_m33 --fuzz {count_per_class} --seed {seed} --classes={class_str}"
         );
         std::process::exit(1);
     }
@@ -313,7 +317,7 @@ fn run_one_test(
     } else {
         run_one_emu(tc, shared_bus)
     };
-    compare(tc, &qemu_state, &emu_state)
+    compare(tc, &qemu_state, &emu_state, &CompareBases::M33_RP2350)
 }
 
 /// Run a test with GDB error recovery. If GDB fails, respawn QEMU and reconnect.

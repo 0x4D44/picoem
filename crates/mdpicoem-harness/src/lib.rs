@@ -42,7 +42,19 @@ impl RngExt for StdRng {
 }
 
 // Re-export emulator types the harness needs.
+//
+// `Bus` / `CortexM33` are from the M33 (RP2350) emulator — the existing
+// QEMU M33 differential runner and softfloat_diff share these top-level
+// names directly.
+//
+// The M0+ (RP2040) runner imports its types under the explicit `m0plus`
+// sub-namespace to avoid colliding with the M33 path in the harness lib.
 pub use mdrp2350::{Bus, CortexM33};
+
+pub mod m0plus {
+    //! Re-exports for the RP2040 / Cortex-M0+ differential runner.
+    pub use mdrp2040::{Bus, CortexM0Plus, Emulator};
+}
 
 // ============================================================================
 // Address constants — QEMU side (MPS2-AN505 ssram-0)
@@ -54,6 +66,44 @@ pub const QEMU_TEST_SLOT: u32 = 0x0000_0100;
 pub const QEMU_TEST_STACK: u32 = 0x0004_0000;
 /// QEMU: scratch SRAM for load/store data.
 pub const QEMU_TEST_SCRATCH: u32 = 0x0000_0200;
+
+// ============================================================================
+// Address constants — QEMU M0+ side (microbit / cortex-m0)
+// ============================================================================
+//
+// The microbit machine models an nRF51822 with 16 KiB of SRAM at
+// 0x2000_0000. That's identical to our M0+ emulator's SRAM window, so the
+// address layout between QEMU and the emulator matches directly (no
+// per-side translation of absolute addresses is needed for the base
+// register file).
+//
+// Layout within SRAM:
+//   0x2000_0000 .. 0x2000_00FF  — reserved for a minimal vector table
+//                                 (SP at word 0, reset at word 1).
+//   0x2000_0100                 — TEST_SLOT — instruction slot.
+//   0x2000_0200                 — TEST_SCRATCH — 1 KiB data scratch.
+//   0x2000_1000                 — TEST_STACK — grows down from here.
+//
+// (The M0+ oracle does not exercise the FPU scratch area; M0+ has no FPU.)
+
+/// QEMU M0+: instruction slot (absolute address).
+pub const QEMU_M0PLUS_TEST_SLOT: u32 = 0x2000_0100;
+/// QEMU M0+: stack pointer.
+pub const QEMU_M0PLUS_TEST_STACK: u32 = 0x2000_1000;
+/// QEMU M0+: scratch SRAM for load/store data.
+pub const QEMU_M0PLUS_TEST_SCRATCH: u32 = 0x2000_0200;
+/// QEMU M0+: vector table base (SP + reset vector live here).
+pub const QEMU_M0PLUS_VECTOR_TABLE_BASE: u32 = 0x2000_0000;
+
+// Emulator-side M0+ layout. Happens to match the QEMU M0+ layout (mdrp2040's
+// SRAM window also starts at 0x2000_0000), but declared separately so
+// `CompareBases::M0PLUS_RP2040` reads symmetrically with `M33_RP2350`.
+/// Emulator M0+: instruction slot.
+pub const EMU_M0PLUS_TEST_SLOT: u32 = QEMU_M0PLUS_TEST_SLOT;
+/// Emulator M0+: stack pointer.
+pub const EMU_M0PLUS_TEST_STACK: u32 = QEMU_M0PLUS_TEST_STACK;
+/// Emulator M0+: scratch SRAM.
+pub const EMU_M0PLUS_TEST_SCRATCH: u32 = QEMU_M0PLUS_TEST_SCRATCH;
 
 // ============================================================================
 // Address constants — Emulator side (our SRAM address space)
@@ -74,6 +124,52 @@ pub const SCRATCH_SIZE: u32 = 1024;
 /// Layout: S-register data at offsets [0..128), FPSCR at offset 128.
 pub const EMU_FPU_SCRATCH: u32 = EMU_TEST_SCRATCH + SCRATCH_SIZE;
 pub const QEMU_FPU_SCRATCH: u32 = QEMU_TEST_SCRATCH + SCRATCH_SIZE;
+
+// ============================================================================
+// Per-chip address bases for `compare()`
+// ============================================================================
+
+/// The six address bases `compare()` needs to translate register values into
+/// chip-agnostic deltas. QEMU and the emulator live in different address
+/// spaces (and the address spaces themselves differ between RP2350 / M33 and
+/// RP2040 / M0+), so the comparator must be parameterized on these bases
+/// rather than hardcode M33 constants.
+///
+/// Use the associated consts `CompareBases::M33_RP2350` or
+/// `CompareBases::M0PLUS_RP2040` to select the right layout.
+#[derive(Copy, Clone, Debug)]
+pub struct CompareBases {
+    pub qemu_scratch: u32,
+    pub qemu_stack: u32,
+    pub qemu_slot: u32,
+    pub emu_scratch: u32,
+    pub emu_stack: u32,
+    pub emu_slot: u32,
+}
+
+impl CompareBases {
+    /// Address bases for the RP2350 / Cortex-M33 oracle
+    /// (`qemu_diff_m33` against MPS2-AN505 ssram-0).
+    pub const M33_RP2350: CompareBases = CompareBases {
+        qemu_scratch: QEMU_TEST_SCRATCH,
+        qemu_stack: QEMU_TEST_STACK,
+        qemu_slot: QEMU_TEST_SLOT,
+        emu_scratch: EMU_TEST_SCRATCH,
+        emu_stack: EMU_TEST_STACK,
+        emu_slot: EMU_TEST_SLOT,
+    };
+
+    /// Address bases for the RP2040 / Cortex-M0+ oracle
+    /// (`qemu_diff_m0plus` against microbit / cortex-m0).
+    pub const M0PLUS_RP2040: CompareBases = CompareBases {
+        qemu_scratch: QEMU_M0PLUS_TEST_SCRATCH,
+        qemu_stack: QEMU_M0PLUS_TEST_STACK,
+        qemu_slot: QEMU_M0PLUS_TEST_SLOT,
+        emu_scratch: EMU_M0PLUS_TEST_SCRATCH,
+        emu_stack: EMU_M0PLUS_TEST_STACK,
+        emu_slot: EMU_M0PLUS_TEST_SLOT,
+    };
+}
 
 // ============================================================================
 // GDB register indices (stable across QEMU >= 7.0)
@@ -5296,7 +5392,19 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
 ///
 /// Returns `Ok(())` if they match, or `Err(description)` listing all
 /// mismatches. This is a pure function — all I/O is done before calling it.
-pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), String> {
+///
+/// `bases` selects the per-chip address layout used for the relative
+/// (delta-from-base) comparisons — pass `CompareBases::M33_RP2350` for the
+/// RP2350 / Cortex-M33 oracle and `CompareBases::M0PLUS_RP2040` for the
+/// RP2040 / Cortex-M0+ oracle. The two chips live in different address
+/// spaces, so hardcoding M33 constants here causes every M0+ register to
+/// report as an address mismatch.
+pub fn compare(
+    tc: &TestCase,
+    qemu: &RunState,
+    emu: &RunState,
+    bases: &CompareBases,
+) -> Result<(), String> {
     let mut diffs = Vec::new();
 
     // R0-R12: absolute comparison for non-address registers,
@@ -5308,8 +5416,8 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
         if tc.addr_regs.contains(&(i as u8)) {
             // Address registers have per-side absolute values.
             // Compare as delta from scratch base to catch writeback updates.
-            let qemu_delta = qemu.regs[i].wrapping_sub(QEMU_TEST_SCRATCH);
-            let emu_delta = emu.regs[i].wrapping_sub(EMU_TEST_SCRATCH);
+            let qemu_delta = qemu.regs[i].wrapping_sub(bases.qemu_scratch);
+            let emu_delta = emu.regs[i].wrapping_sub(bases.emu_scratch);
             if qemu_delta != emu_delta {
                 diffs.push(format!(
                     "R{i} addr delta: QEMU={:#x} EMU={:#x}",
@@ -5327,9 +5435,9 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
     // SP (R13): relative delta comparison.
     // Base depends on whether SP was set via addr_regs (scratch) or default (stack).
     let (qemu_sp_base, emu_sp_base) = if tc.addr_regs.contains(&13) {
-        (QEMU_TEST_SCRATCH, EMU_TEST_SCRATCH)
+        (bases.qemu_scratch, bases.emu_scratch)
     } else {
-        (QEMU_TEST_STACK, EMU_TEST_STACK)
+        (bases.qemu_stack, bases.emu_stack)
     };
     let qemu_sp_delta = qemu.regs[13].wrapping_sub(qemu_sp_base);
     let emu_sp_delta = emu.regs[13].wrapping_sub(emu_sp_base);
@@ -5345,8 +5453,8 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
     if tc.modifies_lr {
         let qemu_lr = qemu.regs[14] & !1u32;
         let emu_lr = emu.regs[14] & !1u32;
-        let qemu_delta = qemu_lr.wrapping_sub(QEMU_TEST_SLOT);
-        let emu_delta = emu_lr.wrapping_sub(EMU_TEST_SLOT);
+        let qemu_delta = qemu_lr.wrapping_sub(bases.qemu_slot);
+        let emu_delta = emu_lr.wrapping_sub(bases.emu_slot);
         if qemu_delta != emu_delta {
             diffs.push(format!(
                 "LR delta: QEMU={:#x} EMU={:#x}",
@@ -5361,8 +5469,8 @@ pub fn compare(tc: &TestCase, qemu: &RunState, emu: &RunState) -> Result<(), Str
     }
 
     // PC (R15): relative delta comparison (different address spaces)
-    let qemu_pc_delta = qemu.regs[15].wrapping_sub(QEMU_TEST_SLOT);
-    let emu_pc_delta = emu.regs[15].wrapping_sub(EMU_TEST_SLOT);
+    let qemu_pc_delta = qemu.regs[15].wrapping_sub(bases.qemu_slot);
+    let emu_pc_delta = emu.regs[15].wrapping_sub(bases.emu_slot);
     if qemu_pc_delta != emu_pc_delta {
         diffs.push(format!(
             "PC delta: QEMU={:#x} EMU={:#x}",
@@ -5981,7 +6089,7 @@ mod tests {
         let tc = TestCase::default();
         let qemu = make_state(base_regs_qemu(), 0x0100_0000, vec![]);
         let emu = make_state(base_regs_emu(), 0x0100_0000, vec![]);
-        assert!(compare(&tc, &qemu, &emu).is_ok());
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
     }
 
     #[test]
@@ -5993,7 +6101,7 @@ mod tests {
         emu_regs[3] = 99;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("R3"), "expected R3 in error: {err}");
     }
 
@@ -6007,7 +6115,7 @@ mod tests {
         // emu_regs[13] = EMU_TEST_STACK (delta=0 vs delta=-4)
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("SP delta"), "expected SP delta in error: {err}");
     }
 
@@ -6016,7 +6124,7 @@ mod tests {
         let tc = TestCase::default(); // xpsr_mask = MASK_ALL_FLAGS
         let qemu = make_state(base_regs_qemu(), 0xC100_0000, vec![]); // N+Z set
         let emu = make_state(base_regs_emu(), 0x0100_0000, vec![]); // flags clear
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("xPSR"), "expected xPSR in error: {err}");
     }
 
@@ -6029,7 +6137,7 @@ mod tests {
         // Flags differ but mask is zero — should pass
         let qemu = make_state(base_regs_qemu(), 0xF100_0000, vec![]);
         let emu = make_state(base_regs_emu(), 0x0100_0000, vec![]);
-        assert!(compare(&tc, &qemu, &emu).is_ok());
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
     }
 
     #[test]
@@ -6042,7 +6150,7 @@ mod tests {
         // emu_regs[15] = EMU_TEST_SLOT + 2 (default)
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("PC delta"), "expected PC delta in error: {err}");
     }
 
@@ -6056,7 +6164,7 @@ mod tests {
         emu_regs[15] = EMU_TEST_SLOT + 10;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        assert!(compare(&tc, &qemu, &emu).is_ok());
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
     }
 
     #[test]
@@ -6069,7 +6177,7 @@ mod tests {
         emu_regs[14] = 0xBBBB_BBBB;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("LR"), "expected LR in error: {err}");
     }
 
@@ -6087,7 +6195,7 @@ mod tests {
         emu_regs[0] = EMU_TEST_SCRATCH;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![0xAB, 0xCD, 0xEF, 0x01]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![0xAB, 0xCD, 0x00, 0x01]);
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("MEM"), "expected MEM in error: {err}");
         assert!(err.contains("+0x2"), "expected offset +0x2 in error: {err}");
     }
@@ -6106,7 +6214,7 @@ mod tests {
         emu_regs[0] = EMU_TEST_SCRATCH;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![0xAB, 0xCD]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![0xAB, 0xCD]);
-        assert!(compare(&tc, &qemu, &emu).is_ok());
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
     }
 
     #[test]
@@ -6123,7 +6231,7 @@ mod tests {
         emu_regs[2] = EMU_TEST_SCRATCH + 4;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        assert!(compare(&tc, &qemu, &emu).is_ok());
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
     }
 
     #[test]
@@ -6140,7 +6248,7 @@ mod tests {
         emu_regs[2] = EMU_TEST_SCRATCH + 8;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("R2 addr delta"), "expected addr delta diff: {err}");
     }
 
@@ -6155,7 +6263,7 @@ mod tests {
         emu_regs[1] = 4;
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
-        let err = compare(&tc, &qemu, &emu).unwrap_err();
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
         assert!(err.contains("R0"), "expected R0: {err}");
         assert!(err.contains("R1"), "expected R1: {err}");
         assert!(err.contains(", "), "expected comma-separated: {err}");

@@ -5,10 +5,10 @@
 // (via probe-rs single-step), then comparing post-state.
 //
 // Usage:
-//   probe_diff                      Run targeted edge-case tests
-//   probe_diff --fuzz N             Random fuzz tests (N per class)
-//   probe_diff --fuzz N --seed S    Reproducible fuzz
-//   probe_diff --cycles             Also compare cycle counts
+//   probe_diff_rp2350                      Run targeted edge-case tests
+//   probe_diff_rp2350 --fuzz N             Random fuzz tests (N per class)
+//   probe_diff_rp2350 --fuzz N --seed S    Reproducible fuzz
+//   probe_diff_rp2350 --cycles             Also compare cycle counts
 
 use mdpicoem_harness::*;
 use probe_rs::{Core, MemoryInterface, RegisterId, Session, SessionConfig};
@@ -92,10 +92,10 @@ fn parse_args() -> Result<Args, String> {
                 return Err(format!(
                     "unknown argument '{other}'\n\
                      Usage:\n  \
-                     probe_diff                      Run targeted edge-case tests\n  \
-                     probe_diff --fuzz N             Random fuzz tests (N per class)\n  \
-                     probe_diff --fuzz N --seed S    Reproducible fuzz\n  \
-                     probe_diff --cycles             Also compare cycle counts"
+                     probe_diff_rp2350                      Run targeted edge-case tests\n  \
+                     probe_diff_rp2350 --fuzz N             Random fuzz tests (N per class)\n  \
+                     probe_diff_rp2350 --fuzz N --seed S    Reproducible fuzz\n  \
+                     probe_diff_rp2350 --cycles             Also compare cycle counts"
                 ));
             }
         }
@@ -114,7 +114,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 // ============================================================================
-// DWT helpers (copied from probe_verify.rs)
+// DWT helpers (copied from probe_verify_rp2350.rs)
 // ============================================================================
 
 /// Enable DWT CYCCNT: set TRCENA in DEMCR, then CYCCNTENA in DWT_CTRL.
@@ -308,8 +308,8 @@ fn run_one_probe(
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
 
-    println!("probe_diff: RP2354 hardware differential test runner");
-    println!("====================================================");
+    println!("probe_diff_rp2350: RP2354 hardware differential test runner");
+    println!("===========================================================");
 
     // 1. Attach to target via probe-rs
     let mut session = Session::auto_attach("rp2350", SessionConfig::default())?;
@@ -404,7 +404,7 @@ fn run_fuzz(
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Fuzz mode: {count_per_class} tests/class, seed={seed}");
-    println!("(reproduce with: probe_diff --fuzz {count_per_class} --seed {seed})");
+    println!("(reproduce with: probe_diff_rp2350 --fuzz {count_per_class} --seed {seed})");
 
     let (alu_tests, mem_tests) = generate_fuzz(count_per_class, seed);
     let total = alu_tests.len() + mem_tests.len();
@@ -455,7 +455,7 @@ fn run_fuzz(
     if args.cycles || args.fuzz_count.is_some() {
         println!("Seed: {seed}");
         if fail > 0 {
-            println!("Reproduce: probe_diff --fuzz {count_per_class} --seed {seed}");
+            println!("Reproduce: probe_diff_rp2350 --fuzz {count_per_class} --seed {seed}");
         }
     }
 

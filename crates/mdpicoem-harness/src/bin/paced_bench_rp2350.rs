@@ -36,7 +36,7 @@ enum Workload {
 /// Encode VFP data-processing (VADD/VSUB/VMUL/VDIV) single-precision.
 ///
 /// Mirrors the private `vfp_dp` helper in the test harness (kept local to
-/// this binary so `paced_bench` stays self-contained).
+/// this binary so `paced_bench_rp2350` stays self-contained).
 fn vfp_dp(op_hi: u16, op_lo: u16, op2_lo: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
     let d = sd & 1;

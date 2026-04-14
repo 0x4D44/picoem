@@ -3,7 +3,7 @@
 // Validates assumptions about register access, SRAM execution, DWT CYCCNT,
 // xPSR behaviour, and cycle-count consistency — all via SWD single-stepping.
 //
-// Run: cargo run -p mdpicoem-harness --bin probe_verify
+// Run: cargo run -p mdpicoem-harness --bin probe_verify_rp2350
 
 use probe_rs::config::MemoryRegion;
 use probe_rs::{Core, MemoryInterface, RegisterId, Session, SessionConfig};
@@ -362,8 +362,8 @@ fn test5_cyccnt_calibration(core: &mut Core, res: &mut Results) -> Result<(), pr
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("probe_verify: RP2354 hardware assumption checker");
-    println!("================================================");
+    println!("probe_verify_rp2350: RP2354 hardware assumption checker");
+    println!("=======================================================");
 
     // Attach to the RP2350 (covers both RP2350 and RP2354 variants).
     let mut session = Session::auto_attach("rp2350", SessionConfig::default())?;

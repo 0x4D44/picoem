@@ -6,7 +6,7 @@
 // SRAM bank formula: bank = (byte_address >> 2) & 7 (bits [4:2]).
 // TEST_SLOT = 0x20000100 → bank = (0x100 >> 2) & 7 = 0.
 //
-// Run: cargo run -p mdpicoem-harness --bin bank_conflict_test
+// Run: cargo run -p mdpicoem-harness --bin bank_conflict_test_rp2350
 
 use probe_rs::{Core, MemoryInterface, RegisterId, Session, SessionConfig};
 use std::time::Instant;
@@ -136,8 +136,8 @@ fn print_result(label: &str, samples: &[u32]) {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("bank_conflict_test: SRAM bank-conflict hypothesis checker");
-    println!("==========================================================");
+    println!("bank_conflict_test_rp2350: SRAM bank-conflict hypothesis checker");
+    println!("=================================================================");
     println!("TEST_SLOT = 0x{TEST_SLOT:08X}  (bank {})", bank_of(TEST_SLOT));
     println!();
 

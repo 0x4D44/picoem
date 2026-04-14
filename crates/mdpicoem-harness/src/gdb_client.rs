@@ -3,7 +3,11 @@
 // Minimal GDB Remote Serial Protocol client implementing 5 packet types:
 //   p/P (read/write register), m/M (read/write memory), s (single-step).
 //
-// Tested with QEMU 7.0–10.2, MPS2-AN505 machine, Cortex-M33 CPU.
+// Tested with QEMU 7.0–10.2:
+//   * MPS2-AN505 machine, Cortex-M33 CPU (RP2350 oracle).
+//   * Microbit machine, Cortex-M0 CPU (RP2040 oracle — QEMU 10.2 does not
+//     ship a cortex-m0plus CPU model; the M0+ ISA is a strict superset of
+//     the M0 ISA plus a 2-cycle MUL and the MOVS IR register pseudo-op).
 //
 // Note: QEMU's M-profile GDB stub omits EPSR.T (bit 24) from xPSR reads.
 // The Thumb bit is implicit — Cortex-M always runs in Thumb mode.
@@ -17,33 +21,91 @@ use std::time::{Duration, Instant};
 use crate::REG_XPSR;
 
 // ============================================================================
+// QemuProfile — which QEMU machine/CPU/port to spawn
+// ============================================================================
+
+/// Selects the QEMU machine, CPU model and GDB port for [`QemuProcess::spawn_with`].
+///
+/// The two profiles in use by the harness correspond to the two chips modelled:
+///   * [`QemuProfile::M33_RP2350`] — MPS2-AN505 + cortex-m33 on port 3333.
+///   * [`QemuProfile::M0_PLUS_RP2040`] — microbit + cortex-m0 on port 3334.
+///
+/// QEMU 10.2 only exposes `cortex-m0` for -cpu; there is no `cortex-m0plus`
+/// model. The M0+ is a strict superset of M0 for the ARMv6-M Thumb-16/Thumb-32
+/// subset we care about (the Pico SDK uses the same binary for either chip),
+/// so the M0 oracle is an acceptable M0+ reference for differential testing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QemuProfile {
+    pub machine: &'static str,
+    pub cpu: &'static str,
+    pub gdb_port: u16,
+}
+
+impl QemuProfile {
+    /// MPS2-AN505 + cortex-m33 on port 3333 (the mdrp2350 oracle).
+    pub const M33_RP2350: Self = Self {
+        machine: "mps2-an505",
+        cpu: "cortex-m33",
+        gdb_port: 3333,
+    };
+    /// Microbit + cortex-m0 on port 3334 (the mdrp2040 oracle).
+    ///
+    /// Port 3334 is used so the two harnesses can run concurrently on the
+    /// same host without fighting for 3333.
+    pub const M0_PLUS_RP2040: Self = Self {
+        machine: "microbit",
+        cpu: "cortex-m0",
+        gdb_port: 3334,
+    };
+
+    /// Formatted `tcp::<port>` string for the `-gdb` argument.
+    fn gdb_arg(&self) -> String {
+        format!("tcp::{}", self.gdb_port)
+    }
+
+    /// Formatted `localhost:<port>` string for [`GdbClient::connect`].
+    pub fn gdb_addr(&self) -> String {
+        format!("localhost:{}", self.gdb_port)
+    }
+}
+
+// ============================================================================
 // QemuProcess — manages the QEMU child process lifetime
 // ============================================================================
 
 /// Owns a QEMU child process. Kills it on drop.
 pub struct QemuProcess {
     child: Child,
+    profile: QemuProfile,
 }
 
 impl QemuProcess {
-    /// Spawn `qemu-system-arm` with MPS2-AN505 machine, Cortex-M33 CPU,
-    /// halted at reset (`-S`), GDB server on port 3333.
-    ///
-    /// Returns an error with a clear message if `qemu-system-arm` is not found.
     /// Standard Windows install path (winget / qemu.org installer).
     const WINDOWS_QEMU_PATH: &'static str =
         r"C:\Program Files\qemu\qemu-system-arm.exe";
 
+    /// Spawn `qemu-system-arm` with the default M33 / RP2350 profile.
+    ///
+    /// Returns an error with a clear message if `qemu-system-arm` is not found.
     pub fn spawn() -> io::Result<Self> {
+        Self::spawn_with(QemuProfile::M33_RP2350)
+    }
+
+    /// Spawn `qemu-system-arm` with the given profile.
+    ///
+    /// Used by the M0+ harness (`qemu_diff_m0plus`) to target a microbit /
+    /// cortex-m0 oracle on a non-conflicting port.
+    pub fn spawn_with(profile: QemuProfile) -> io::Result<Self> {
+        let gdb_arg = profile.gdb_arg();
         let args = [
             "-machine",
-            "mps2-an505",
+            profile.machine,
             "-cpu",
-            "cortex-m33",
+            profile.cpu,
             "-nographic",
             "-S",
             "-gdb",
-            "tcp::3333",
+            gdb_arg.as_str(),
         ];
 
         // Try PATH first, then the standard Windows install location.
@@ -82,7 +144,13 @@ impl QemuProcess {
                 }
             })?;
 
-        Ok(Self { child })
+        Ok(Self { child, profile })
+    }
+
+    /// Returns the profile used to spawn this QEMU instance. Useful for
+    /// reconnecting the GDB client after a respawn.
+    pub fn profile(&self) -> QemuProfile {
+        self.profile
     }
 }
 

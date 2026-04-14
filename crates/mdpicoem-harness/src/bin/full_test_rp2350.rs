@@ -8,7 +8,7 @@
 //! Generates a markdown report in tests/results/.
 //!
 //! Usage:
-//!   cargo run --release -p mdpicoem-harness --bin full_test
+//!   cargo run --release -p mdpicoem-harness --bin full_test_rp2350
 //!
 //! Options:
 //!   --skip-quality    Skip code quality checks (fmt, clippy)
@@ -89,12 +89,12 @@ fn parse_options(args: &[String]) -> Option<Options> {
 }
 
 fn print_help() {
-    println!("full_test v{VERSION}");
+    println!("full_test_rp2350 v{VERSION}");
     println!();
     println!("Full test runner for mdrp2350 ARM Cortex-M33 emulator.");
     println!();
     println!("USAGE:");
-    println!("    cargo run --release -p mdpicoem-harness --bin full_test [OPTIONS]");
+    println!("    cargo run --release -p mdpicoem-harness --bin full_test_rp2350 [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    --skip-quality    Skip code quality checks (fmt, clippy)");
@@ -112,10 +112,10 @@ fn print_help() {
     println!("    Generates markdown report in tests/results/");
     println!();
     println!("EXAMPLES:");
-    println!("    cargo run --release -p mdpicoem-harness --bin full_test");
+    println!("    cargo run --release -p mdpicoem-harness --bin full_test_rp2350");
     println!("        Run full test suite");
     println!();
-    println!("    cargo run --release -p mdpicoem-harness --bin full_test -- --quick");
+    println!("    cargo run --release -p mdpicoem-harness --bin full_test_rp2350 -- --quick");
     println!("        Skip code quality checks");
 }
 

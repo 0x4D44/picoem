@@ -152,6 +152,32 @@ a safe simplification — but firmware that expects a mid-execution SM to
 freeze on RESETS assert will diverge. mdrp2350 carries the same
 behaviour.
 
+## Phase 6 Simplifications (Harness split)
+
+These surfaced during Phase 6 (the `mdpicoem-harness` binary split into
+chip-suffixed runners). The workspace compiles and both `qemu_diff_m33`
+and `qemu_diff_m0plus` oracles pass their smoke runs, but the following
+corners are deferred to later phases.
+
+### `probe_diff_rp2040` is a stub
+
+`crates/mdpicoem-harness/src/bin/probe_diff_rp2040.rs` is a placeholder
+that exits 2 with a rationale; no probe-rs wiring exists. The lab rig
+only carries an RP2354, so there is no hardware to diff against. Future
+work: mirror `probe_diff_rp2350` with a chip-pack of `"RP2040"` and
+extract the `is_m0plus_safe` filter out of `qemu_diff_m0plus` into
+`mdpicoem-harness::lib` so both runners can share it.
+
+### QEMU M0+ oracle uses `cortex-m0`, not `cortex-m0plus`
+
+QEMU 10.2 does not expose a `cortex-m0plus` CPU model, so
+`qemu_diff_m0plus` pins the oracle CPU to `cortex-m0`. The M0+ is a
+strict ISA superset of the M0 for the Thumb-16 / Thumb-32 subset under
+test (MUL cycle counts differ, but the harness does not compare cycle
+counts), so the M0 reference is safe for architectural (register /
+memory / xPSR) diffs. Switch to `cortex-m0plus` once a future QEMU
+release exposes it.
+
 ## Thumb-32 Test Generators
 
 Three Thumb-32 generator functions are stubbed out in lib.rs
