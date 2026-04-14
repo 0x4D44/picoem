@@ -35,6 +35,14 @@ pub(crate) fn sign_extend(val: u32, bits: u32) -> u32 {
     ((val << shift) as i32 >> shift) as u32
 }
 
+/// Alignment check for word / halfword memory accesses. Returns `true`
+/// when `addr` is aligned to `size` bytes — `size` must be a power of
+/// two. Byte accesses (`size == 1`) are always legal and return `true`.
+#[inline(always)]
+pub(crate) fn is_aligned(addr: u32, size: u32) -> bool {
+    addr & (size - 1) == 0
+}
+
 // ============================================================================
 // Thumb-16: Shift (immediate)
 // ============================================================================
@@ -357,7 +365,7 @@ impl CortexM0Plus {
     ///
     /// ADD and MOV do NOT update flags (unlike low-register variants).
     /// CMP updates flags. BX/BLX transfer control via register.
-    pub(crate) fn thumb16_special_data_bx(&mut self, opcode: u16) -> u32 {
+    pub(crate) fn thumb16_special_data_bx(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
         let op = (opcode >> 8) & 0x3;
         match op {
             0b00 => {
@@ -368,7 +376,10 @@ impl CortexM0Plus {
                 let rd_val = if d == 15 { self.read_pc() } else { self.regs.r[d] };
                 let result = rd_val.wrapping_add(rm_val);
                 if d == 15 {
-                    // TODO(Phase 4.B): HardFault if target_addr bit 0 == 0.
+                    if result & 1 == 0 {
+                        self.pending_fault = Some(Fault::InvalidEpsr);
+                        return 1;
+                    }
                     self.regs.set_pc(result & !1);
                     return 3; // pipeline flush
                 }
@@ -391,7 +402,10 @@ impl CortexM0Plus {
                 let rm = ((opcode >> 3) & 0xF) as usize;
                 let val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
                 if d == 15 {
-                    // TODO(Phase 4.B): HardFault if target_addr bit 0 == 0.
+                    if val & 1 == 0 {
+                        self.pending_fault = Some(Fault::InvalidEpsr);
+                        return 1;
+                    }
                     self.regs.set_pc(val & !1);
                     return 3; // pipeline flush
                 }
@@ -403,22 +417,35 @@ impl CortexM0Plus {
                 //
                 // ARMv6-M: BX bits[7:0] are xxxx_x000 with Rm in bits[6:3];
                 // BLX bits[7:0] are xxxx_x000 with bit 7 = 1. Bit 0 of the
-                // target encodes Thumb state (must be 1 on M0+ — Phase 4.B
-                // will raise HardFault when the bit is clear).
+                // target encodes Thumb state (must be 1 on M0+ — HardFault
+                // if clear). BX to an EXC_RETURN magic value performs an
+                // exception return instead of a branch.
                 let rm = ((opcode >> 3) & 0xF) as usize;
                 let target = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
                 let link = opcode & (1 << 7) != 0;
                 if link {
                     // BLX Rm — LR = address of next instruction | 1.
-                    // `current_instr_addr + 2` (T16) is the return point;
-                    // OR 1 to keep the T bit set per AAPCS.
                     let next = self.current_instr_addr.wrapping_add(2) | 1;
                     self.regs.set_lr(next);
+                    // BLX's target must have the Thumb bit set (it's a
+                    // subroutine call, never an exception return).
+                    if target & 1 == 0 {
+                        self.pending_fault = Some(Fault::InvalidEpsr);
+                        return 1;
+                    }
+                    self.regs.set_pc(target & !1);
+                    return 3;
                 }
-                // TODO(Phase 4.B): HardFault if target_addr bit 0 == 0.
+                // BX in Handler mode with EXC_RETURN magic → exception exit.
+                if self.regs.in_handler_mode() && Self::is_exc_return(target) {
+                    self.exit_exception(target, bus);
+                    return 3;
+                }
+                if target & 1 == 0 {
+                    self.pending_fault = Some(Fault::InvalidEpsr);
+                    return 1;
+                }
                 self.regs.set_pc(target & !1);
-                // M0+ measured: ~3 cycles (pipeline flush). Phase 5 bus
-                // will recalibrate; keep symmetry with ADD/MOV PC-write.
                 3
             }
         }
@@ -434,6 +461,10 @@ impl CortexM0Plus {
         let imm8 = (opcode & 0xFF) as u32;
         let base = self.read_pc() & !3;
         let addr = base.wrapping_add(imm8 << 2);
+        // PC-relative LDR is always word-aligned by construction (base
+        // is force-aligned via & !3), but keep the check for symmetry —
+        // cost is free.
+        debug_assert!(is_aligned(addr, 4));
         self.regs.r[rt] = bus.read32(addr);
         2
     }
@@ -453,10 +484,18 @@ impl CortexM0Plus {
 
         match opc {
             0b000 => {
+                if !is_aligned(addr, 4) {
+                    self.pending_fault = Some(Fault::Unaligned);
+                    return 1;
+                }
                 bus.write32(addr, self.regs.r[rt]);
                 2
             }
             0b001 => {
+                if !is_aligned(addr, 2) {
+                    self.pending_fault = Some(Fault::Unaligned);
+                    return 1;
+                }
                 bus.write16(addr, self.regs.r[rt] as u16);
                 2
             }
@@ -470,10 +509,18 @@ impl CortexM0Plus {
                 2
             }
             0b100 => {
+                if !is_aligned(addr, 4) {
+                    self.pending_fault = Some(Fault::Unaligned);
+                    return 1;
+                }
                 self.regs.r[rt] = bus.read32(addr);
                 2
             }
             0b101 => {
+                if !is_aligned(addr, 2) {
+                    self.pending_fault = Some(Fault::Unaligned);
+                    return 1;
+                }
                 self.regs.r[rt] = bus.read16(addr) as u32;
                 2
             }
@@ -483,6 +530,10 @@ impl CortexM0Plus {
             }
             _ => {
                 // 0b111: LDRSH Rt, [Rn, Rm]
+                if !is_aligned(addr, 2) {
+                    self.pending_fault = Some(Fault::Unaligned);
+                    return 1;
+                }
                 let val = bus.read16(addr) as i16 as i32 as u32;
                 self.regs.r[rt] = val;
                 2
@@ -500,6 +551,10 @@ impl CortexM0Plus {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 2);
+        if !is_aligned(addr, 4) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
         bus.write32(addr, self.regs.r[rt]);
         2
     }
@@ -510,6 +565,10 @@ impl CortexM0Plus {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 2);
+        if !is_aligned(addr, 4) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
         self.regs.r[rt] = bus.read32(addr);
         2
     }
@@ -540,6 +599,10 @@ impl CortexM0Plus {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 1);
+        if !is_aligned(addr, 2) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
         bus.write16(addr, self.regs.r[rt] as u16);
         2
     }
@@ -550,6 +613,10 @@ impl CortexM0Plus {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 1);
+        if !is_aligned(addr, 2) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
         self.regs.r[rt] = bus.read16(addr) as u32;
         2
     }
@@ -563,6 +630,10 @@ impl CortexM0Plus {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
+        if !is_aligned(addr, 4) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
         bus.write32(addr, self.regs.r[rt]);
         2
     }
@@ -572,6 +643,10 @@ impl CortexM0Plus {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
+        if !is_aligned(addr, 4) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
         self.regs.r[rt] = bus.read32(addr);
         2
     }
@@ -647,7 +722,12 @@ impl CortexM0Plus {
                     reglist |= 1 << 14; // LR
                 }
                 let count = reglist.count_ones();
-                let mut addr = self.regs.sp().wrapping_sub(count * 4);
+                let base = self.regs.sp().wrapping_sub(count * 4);
+                if !is_aligned(base, 4) {
+                    self.pending_fault = Some(Fault::Unaligned);
+                    return 1;
+                }
+                let mut addr = base;
                 self.regs.set_sp(addr);
                 for i in 0..15 {
                     if reglist & (1 << i) != 0 {
@@ -704,15 +784,18 @@ impl CortexM0Plus {
                     reglist |= 1 << 15;
                 }
                 let count = reglist.count_ones();
-                let mut addr = self.regs.sp();
+                let sp_start = self.regs.sp();
+                if !is_aligned(sp_start, 4) {
+                    self.pending_fault = Some(Fault::Unaligned);
+                    return 1;
+                }
+                let mut addr = sp_start;
+                let mut popped_pc: Option<u32> = None;
                 for i in 0..16 {
                     if reglist & (1 << i) != 0 {
                         let val = bus.read32(addr);
                         if i == 15 {
-                            // Phase 4.B: detect EXC_RETURN magic. For
-                            // now, just write PC with the T bit cleared.
-                            // TODO(Phase 4.B): HardFault if target_addr bit 0 == 0.
-                            self.regs.set_pc(val & !1);
+                            popped_pc = Some(val);
                         } else {
                             self.regs.r[i] = val;
                         }
@@ -720,11 +803,23 @@ impl CortexM0Plus {
                     }
                 }
                 self.regs.set_sp(addr);
+                if let Some(pc_val) = popped_pc {
+                    // EXC_RETURN magic in Handler mode → exception return.
+                    if self.regs.in_handler_mode() && Self::is_exc_return(pc_val) {
+                        self.exit_exception(pc_val, bus);
+                    } else if pc_val & 1 == 0 {
+                        self.pending_fault = Some(Fault::InvalidEpsr);
+                        return 1 + count;
+                    } else {
+                        self.regs.set_pc(pc_val & !1);
+                    }
+                }
                 if pop_pc { 1 + count + 3 } else { 1 + count }
             }
             0b1110 => {
-                // BKPT #imm8 — Phase 4.B will deliver HardFault here.
-                // For Phase 4.A, flag it as pending so tests can observe.
+                // BKPT #imm8 — with no debugger attached this raises
+                // HardFault (ARMv6-M ARM §A6.7.16). The Phase 4.B fault
+                // path translates this into exception #3 entry.
                 self.pending_fault = Some(Fault::HardFault);
                 1
             }
@@ -763,6 +858,10 @@ impl CortexM0Plus {
         let reglist = (opcode & 0xFF) as u32;
         let count = reglist.count_ones();
         let mut addr = self.regs.r[rn];
+        if !is_aligned(addr, 4) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
 
         for i in 0..8 {
             if reglist & (1 << i) != 0 {
@@ -781,6 +880,10 @@ impl CortexM0Plus {
         let reglist = (opcode & 0xFF) as u32;
         let count = reglist.count_ones();
         let mut addr = self.regs.r[rn];
+        if !is_aligned(addr, 4) {
+            self.pending_fault = Some(Fault::Unaligned);
+            return 1;
+        }
 
         for i in 0..8 {
             if reglist & (1 << i) != 0 {
@@ -807,10 +910,8 @@ impl CortexM0Plus {
         match cond {
             0xE => self.thumb16_undefined(opcode),
             0xF => {
-                // SVC #imm8 — Phase 4.B will enter exception 11. For now,
-                // flag as pending fault so tests can observe the SVC
-                // encoding reached the dispatch path.
-                self.pending_fault = Some(Fault::HardFault);
+                // SVC #imm8 — deliver exception 11 via the fault path.
+                self.pending_fault = Some(Fault::Svc);
                 1
             }
             _ => {

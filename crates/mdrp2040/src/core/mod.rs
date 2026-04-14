@@ -1,10 +1,12 @@
 //! Cortex-M0+ CPU core (ARMv6-M).
 //!
 //! Phase 4.A: full Thumb-16 decode + execute for every encoding the
-//! ARMv6-M ISA supports. Thumb-32 subset (BL / MRS / MSR / DSB / DMB /
-//! ISB), the exception model (stacking, EXC_RETURN, vector table),
-//! unaligned-access fault, `Emulator::step` integration, and bus
-//! contention land in Phase 4.B and Phase 5.
+//! ARMv6-M ISA supports.
+//!
+//! Phase 4.B: adds the Thumb-32 subset (BL / MRS / MSR / DSB / DMB /
+//! ISB), the exception model (stacking, EXC_RETURN, vector walk),
+//! unaligned-access fault, and `Emulator::step` integration. Bus
+//! contention + full address decode remain Phase 5.
 //!
 //! M0+ is a strict subset of the M33 register/decode path: no IT blocks,
 //! no CBZ/CBNZ, no security state, no FP, no MPU, no wide-path handling
@@ -13,29 +15,34 @@
 pub mod registers;
 pub(crate) mod decode;
 mod execute;
+mod execute_wide;
+pub(crate) mod exceptions;
 
 use crate::bus::Bus;
 pub use registers::Registers;
 
 /// Synchronous faults raised during instruction execution.
 ///
-/// ARMv6-M has a single synchronous-fault vector (HardFault). Phase 4.B
-/// turns each of these variants into HardFault (exception #3) via the
-/// fault-delivery path. Keeping the variants distinct lets the fault
-/// path record why the fault was taken even though they all share a
-/// vector.
-#[derive(Debug, Clone, Copy)]
+/// ARMv6-M has a single synchronous-fault vector (HardFault) plus the
+/// SVC call (exception 11). Phase 4.B turns these variants into the
+/// appropriate exception number via [`CortexM0Plus::deliver_fault`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum Fault {
-    /// Undefined instruction — decoder rejected the encoding.
+    /// Undefined instruction — decoder rejected the encoding. Delivers
+    /// as HardFault (exception #3).
     Undefined,
-    /// Unaligned access — Phase 4.B will drive this from the bus path.
-    #[allow(dead_code)]
+    /// Unaligned word / halfword access. Delivers as HardFault.
     Unaligned,
-    /// SVC / BKPT-initiated fault — Phase 4.B delivers as HardFault when
-    /// the SVC handler path lands.
-    #[allow(dead_code)]
+    /// BKPT without a debugger attached. Delivers as HardFault — M0+
+    /// has no DebugMonitor exception.
     HardFault,
+    /// SVC #imm8 — delivers as SVCall (exception #11).
+    Svc,
+    /// EXC_RETURN with invalid magic bits [3:0] — delivers as HardFault.
+    InvalidExcReturn,
+    /// Branch target with Thumb bit clear. Delivers as HardFault.
+    InvalidEpsr,
 }
 
 /// Cortex-M0+ CPU core.
@@ -150,6 +157,57 @@ impl CortexM0Plus {
         self.current_instr_addr = pc;
         self.regs.set_pc(pc.wrapping_add(2));
         self.execute_thumb16(opcode, bus)
+    }
+
+    /// Execute a single 32-bit Thumb-2 instruction directly (bypasses
+    /// fetch). Advances PC by 4 before execution. Uses a default
+    /// [`Bus`] with zero-cycle memory.
+    pub fn execute_one_wide(&mut self, hw0: u16, hw1: u16) -> u32 {
+        let mut bus = Bus::default();
+        self.execute_one_wide_with_bus(hw0, hw1, &mut bus)
+    }
+
+    /// Execute a single 32-bit Thumb-2 instruction against the supplied
+    /// [`Bus`].
+    pub fn execute_one_wide_with_bus(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+        self.pending_fault = None;
+        let pc = self.regs.pc();
+        self.current_instr_addr = pc;
+        self.regs.set_pc(pc.wrapping_add(4));
+        self.execute_thumb32(hw0, hw1, bus)
+    }
+
+    /// Fetch-decode-execute one instruction. Integrates pending-fault
+    /// delivery with the exception model — Phase 4.B wiring.
+    ///
+    /// Returns the cycle count consumed (instruction + any exception
+    /// entry on fault delivery).
+    pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        if self.halted {
+            return 0;
+        }
+        let mut cycles = self.decode_execute(bus);
+
+        if let Some(fault) = self.pending_fault.take() {
+            cycles = cycles.wrapping_add(self.deliver_fault(fault, bus));
+        }
+
+        self.cycles = self.cycles.wrapping_add(cycles as u64);
+        cycles
+    }
+
+    /// Test helper — direct exception entry without synthesising an
+    /// instruction. Used by the exception-model unit tests.
+    #[doc(hidden)]
+    pub fn test_enter_exception(&mut self, exc_num: u16, bus: &mut Bus) -> u32 {
+        self.enter_exception(exc_num, bus)
+    }
+
+    /// Test helper — direct exception return. Used by the
+    /// exception-model unit tests.
+    #[doc(hidden)]
+    pub fn test_exit_exception(&mut self, exc_return: u32, bus: &mut Bus) -> u32 {
+        self.exit_exception(exc_return, bus)
     }
 
     /// The ARM-defined "read PC" value during instruction execution:

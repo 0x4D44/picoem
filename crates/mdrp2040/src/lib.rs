@@ -104,13 +104,31 @@ impl Emulator {
     }
 
     /// Advance the system by one quantum.
+    ///
+    /// Phase 4.B: drives core 0 only — `step` fetches / decodes /
+    /// executes a single instruction and returns the cycle cost. Phase 5
+    /// will extend this to dual-core scheduling with SIO + contention
+    /// bookkeeping.
     pub fn step(&mut self) -> u64 {
-        todo!("RP2040 M0+ step — Phase 4 (CPU) + Phase 5 (bus)")
+        self.bus.set_active_core(0);
+        let cycles = self.cores[0].step(&mut self.bus) as u64;
+        self.clock.cycles = self.clock.cycles.wrapping_add(cycles);
+        cycles
     }
 
-    /// Run for at least `cycles` virtual cycles.
-    pub fn run(&mut self, _cycles: u64) -> u64 {
-        todo!("RP2040 run — Phase 4 (depends on step)")
+    /// Run for at least `cycles` virtual cycles. Returns the number of
+    /// cycles actually executed (which may exceed the target by at most
+    /// one instruction's cost).
+    pub fn run(&mut self, cycles: u64) -> u64 {
+        let start = self.clock.cycles;
+        while self.clock.cycles.wrapping_sub(start) < cycles {
+            let consumed = self.step();
+            if consumed == 0 {
+                // Halted core — avoid spinning forever.
+                break;
+            }
+        }
+        self.clock.cycles.wrapping_sub(start)
     }
 
     /// Read a GPIO pin from the merged pin state.

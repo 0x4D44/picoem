@@ -13,7 +13,7 @@
 //!   other two M33 wide prefixes (`0b11101`, `0b11111`) decode as
 //!   undefined on M0+.
 
-use super::{CortexM0Plus, Fault};
+use super::CortexM0Plus;
 use crate::bus::Bus;
 
 /// Returns true iff the first halfword is the Thumb-32 prefix defined
@@ -27,23 +27,18 @@ pub(crate) fn is_wide(hw0: u16) -> bool {
 impl CortexM0Plus {
     /// Fetch-decode-execute one instruction. Returns cycle count.
     ///
-    /// Phase 4.A implements the Thumb-16 path end-to-end. The
-    /// Thumb-32 path currently flags [`Fault::Undefined`] — Phase 4.B
-    /// will replace it with BL / MRS / MSR / barrier decode.
-    #[allow(dead_code)]
+    /// Phase 4.B: the Thumb-32 path routes BL / MRS / MSR / DSB / DMB /
+    /// ISB through [`Self::execute_thumb32`]; any other wide encoding
+    /// raises HardFault via [`super::Fault::Undefined`].
     pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         let hw0 = bus.read16(pc);
 
         if is_wide(hw0) {
-            // Phase 4.B will supply the Thumb-32 subset executor. For
-            // now, consume the second halfword and flag undefined so
-            // Phase 4.B fault-delivery wiring can observe the encoding.
-            let _hw1 = bus.read16(pc.wrapping_add(2));
+            let hw1 = bus.read16(pc.wrapping_add(2));
             self.regs.set_pc(pc.wrapping_add(4));
-            self.pending_fault = Some(Fault::Undefined);
-            1
+            self.execute_thumb32(hw0, hw1, bus)
         } else {
             self.regs.set_pc(pc.wrapping_add(2));
             self.execute_thumb16(hw0, bus)
@@ -72,7 +67,7 @@ impl CortexM0Plus {
                 if opcode & (1 << 10) == 0 {
                     self.thumb16_data_processing(opcode)
                 } else {
-                    self.thumb16_special_data_bx(opcode)
+                    self.thumb16_special_data_bx(opcode, bus)
                 }
             }
             0b01001 => self.thumb16_ldr_literal(opcode, bus),

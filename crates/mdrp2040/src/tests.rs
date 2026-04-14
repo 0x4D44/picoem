@@ -1234,3 +1234,684 @@ mod cycle_counts {
         assert_eq!(cycles, 4);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4.B — Thumb-32 subset (BL / MRS / MSR / DSB / DMB / ISB)
+// ---------------------------------------------------------------------------
+
+mod thumb32_bl {
+    use super::*;
+
+    /// BL with small positive offset:
+    /// Assembled by arm-none-eabi-as for `bl target` where target is
+    /// PC+4+4 at PC=0x1000 → target = 0x1008. Encoding = F000 F802.
+    #[test]
+    fn bl_sets_lr_to_next_instr_and_branches() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.set_pc(0x1000);
+        // BL +4: hw0=0xF000, hw1=0xF802 → imm25 = 0x000_0004
+        let cycles = cpu.execute_one_wide(0xF000, 0xF802);
+        assert_eq!(cpu.regs.lr(), 0x1004 | 1, "LR = return addr with T bit");
+        assert_eq!(cpu.regs.pc(), 0x1008, "PC = target (T bit cleared)");
+        assert_eq!(cycles, 4);
+    }
+
+    /// BL with negative offset: PC=0x1000, BL -4 → target = 0x1000.
+    /// Encoding F7FF FFFE yields offset=-2 per the standard encoding.
+    #[test]
+    fn bl_negative_offset() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.set_pc(0x2000);
+        // BL -2: hw0=0xF7FF hw1=0xFFFF → imm25 = 0x1FF_FFFE (sign-extended)
+        // S=1, J1=J2=1 → I1=I2=1, imm10=0x3FF, imm11=0x7FF
+        // imm25 = 0x1FFFFFE → sign-extended = 0xFFFFFFFE (i.e. -2)
+        cpu.execute_one_wide(0xF7FF, 0xFFFF);
+        // target = read_pc(=0x2004) + (-2) = 0x2002 → cleared to 0x2002.
+        assert_eq!(cpu.regs.pc(), 0x2002);
+        assert_eq!(cpu.regs.lr(), 0x2004 | 1);
+    }
+}
+
+mod thumb32_mrs_msr {
+    use super::*;
+
+    /// MRS r0, PRIMASK — SYSm=16.
+    /// Encoding: hw0=0xF3EF, hw1=0x8010 (Rd=0, SYSm=0x10).
+    #[test]
+    fn mrs_reads_primask() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.primask = 1;
+        cpu.execute_one_wide(0xF3EF, 0x8010);
+        assert_eq!(cpu.regs.r[0], 1);
+    }
+
+    /// MRS r1, xPSR (SYSm=0) — returns only NZCV flags.
+    #[test]
+    fn mrs_reads_xpsr_flags() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.set_flag_n(true);
+        cpu.regs.set_flag_c(true);
+        // hw1 = 0x8100 (Rd=1, SYSm=0)
+        cpu.execute_one_wide(0xF3EF, 0x8100);
+        // N and C bits set in r1.
+        assert_eq!(cpu.regs.r[1] & 0xF000_0000, 0xA000_0000);
+    }
+
+    /// MSR PRIMASK, r2 — writes bit 0 of r2 into PRIMASK.
+    #[test]
+    fn msr_writes_primask() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[2] = 0xFFFF_FFFF;
+        // hw0=0xF382, hw1=0x8810 (Rn=2, mask=1000, SYSm=0x10)
+        cpu.execute_one_wide(0xF382, 0x8810);
+        assert_eq!(cpu.regs.primask, 1);
+    }
+
+    /// MSR CONTROL, r3 — writes bit 1 / bit 0 of r3 into CONTROL.
+    #[test]
+    fn msr_writes_control_thread_mode() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_0100;
+        cpu.regs.psp = 0x2000_0200;
+        cpu.regs.r[3] = 0x2; // SPSEL=1
+        // hw0=0xF383, hw1=0x8814 (Rn=3, mask=1000, SYSm=0x14)
+        cpu.execute_one_wide(0xF383, 0x8814);
+        assert_eq!(cpu.regs.control, 0x2);
+        // SP now tracks PSP.
+        assert_eq!(cpu.regs.sp(), 0x2000_0200);
+    }
+
+    /// MSR with reserved SYSm (e.g. SYSm=4) raises HardFault.
+    /// ARMv6-M ARM §B5.2.3 — anything outside {0, 3, 5, 8, 9, 16, 20}
+    /// is reserved on v6-M and must trap.
+    #[test]
+    fn msr_reserved_sysm_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0xDEAD_BEEF;
+        // hw0=0xF380 (Rn=0), hw1=0x8804 (mask=1000, SYSm=4 — reserved)
+        cpu.execute_one_wide(0xF380, 0x8804);
+        assert!(cpu.has_pending_fault());
+    }
+
+    /// MRS with reserved SYSm (e.g. SYSm=15) raises HardFault.
+    #[test]
+    fn mrs_reserved_sysm_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        // hw0=0xF3EF, hw1=0x800F (Rd=0, SYSm=15 — reserved)
+        cpu.execute_one_wide(0xF3EF, 0x800F);
+        assert!(cpu.has_pending_fault());
+    }
+}
+
+mod thumb32_barriers {
+    use super::*;
+
+    /// DSB #SY — hw0=0xF3BF, hw1=0x8F4F.
+    #[test]
+    fn dsb_noops_cleanly() {
+        let mut cpu = CortexM0Plus::new();
+        let cycles = cpu.execute_one_wide(0xF3BF, 0x8F4F);
+        assert_eq!(cycles, 1);
+        assert!(!cpu.has_pending_fault());
+    }
+
+    /// DMB #SY — hw0=0xF3BF, hw1=0x8F5F.
+    #[test]
+    fn dmb_noops_cleanly() {
+        let mut cpu = CortexM0Plus::new();
+        let cycles = cpu.execute_one_wide(0xF3BF, 0x8F5F);
+        assert_eq!(cycles, 1);
+        assert!(!cpu.has_pending_fault());
+    }
+
+    /// ISB #SY — hw0=0xF3BF, hw1=0x8F6F.
+    #[test]
+    fn isb_noops_cleanly() {
+        let mut cpu = CortexM0Plus::new();
+        let cycles = cpu.execute_one_wide(0xF3BF, 0x8F6F);
+        assert_eq!(cycles, 1);
+        assert!(!cpu.has_pending_fault());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.B — Exception model
+// ---------------------------------------------------------------------------
+
+/// Helper: lay out a minimal SRAM-based vector table at address 0x2000_0000
+/// and point VTOR at it. Entry N (for N >= 1) → handler address 0x2000_1000 +
+/// N*32. Returns `(bus, handler_addrs)` where `handler_addrs[N]` is the
+/// handler PC we mapped for exception N.
+fn make_test_bus_with_vector_table() -> (Bus, [u32; 16]) {
+    let mut bus = Bus::default();
+    let vtor: u32 = 0x2000_0000;
+    let mut handlers = [0u32; 16];
+    for i in 0..16 {
+        let handler = 0x2000_1000 + (i as u32) * 32;
+        bus.write32(vtor + (i as u32) * 4, handler | 1); // Thumb bit set
+        handlers[i] = handler;
+    }
+    bus.ppb[0].vtor = vtor;
+    (bus, handlers)
+}
+
+mod exceptions {
+    use super::*;
+
+    #[test]
+    fn svc_delivers_exception_11() {
+        let (mut bus, handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        // Place SVC #0 at 0x1000 so we can observe the return address.
+        let prog = 0x2000_4000u32;
+        bus.write16(prog, 0xDF00);
+        cpu.regs.set_pc(prog);
+        let cycles = cpu.step(&mut bus);
+        // IPSR should now be 11, PC at SVC handler, SP decremented by 32.
+        assert_eq!(cpu.regs.ipsr(), 11);
+        assert_eq!(cpu.regs.pc(), handlers[11]);
+        assert_eq!(cpu.regs.sp(), 0x2000_8000 - 32);
+        // LR carries the EXC_RETURN magic for Thread+MSP.
+        assert_eq!(cpu.regs.lr(), 0xFFFF_FFF9);
+        assert!(cycles >= 16);
+    }
+
+    #[test]
+    fn bkpt_delivers_hardfault() {
+        let (mut bus, handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        let prog = 0x2000_4000u32;
+        bus.write16(prog, 0xBE00); // BKPT #0
+        cpu.regs.set_pc(prog);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+    }
+
+    #[test]
+    fn undefined_encoding_delivers_hardfault() {
+        let (mut bus, handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        // Thumb-32 prefix with body that no misc-control encoding matches.
+        let prog = 0x2000_4000u32;
+        bus.write16(prog, 0xF000);
+        bus.write16(prog + 2, 0x0000);
+        cpu.regs.set_pc(prog);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+    }
+
+    #[test]
+    fn nmi_enters_handler_2() {
+        let (mut bus, handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        cpu.test_enter_exception(2, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 2);
+        assert_eq!(cpu.regs.pc(), handlers[2]);
+    }
+
+    #[test]
+    fn exc_return_thread_msp_restores_state() {
+        let (mut bus, _handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        // Pre-load caller state we can verify after unwind.
+        for i in 0..4 {
+            cpu.regs.r[i] = 0x1000 + i as u32;
+        }
+        cpu.regs.r[12] = 0xC12;
+        cpu.regs.set_lr(0xBADC0DE1); // pre-entry LR (caller's return)
+        cpu.regs.set_pc(0x1000);
+        cpu.test_enter_exception(11, &mut bus);
+        // Handler overwrites r0 to prove unwind reverses it.
+        cpu.regs.r[0] = 0xFFFF_FFFF;
+        // EXC_RETURN to thread + MSP.
+        cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0, "Back in thread mode");
+        assert_eq!(cpu.regs.r[0], 0x1000);
+        assert_eq!(cpu.regs.r[12], 0xC12);
+        assert_eq!(cpu.regs.pc(), 0x1000);
+        assert_eq!(cpu.regs.sp(), 0x2000_8000);
+    }
+
+    #[test]
+    fn exc_return_thread_psp_restores_psp_and_sp_selection() {
+        let (mut bus, _handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.psp = 0x2000_4000;
+        cpu.regs.control = 0x2; // SPSEL=1 (thread PSP)
+        cpu.regs.set_sp(0x2000_4000);
+        cpu.regs.set_pc(0x1100);
+        cpu.test_enter_exception(11, &mut bus);
+        // Entry pushed to PSP; EXC_RETURN magic should be 0xFFFF_FFFD.
+        assert_eq!(cpu.regs.lr(), 0xFFFF_FFFD);
+        cpu.test_exit_exception(0xFFFF_FFFD, &mut bus);
+        assert_eq!(cpu.regs.control & 0x2, 0x2, "Back to PSP in thread mode");
+        assert_eq!(cpu.regs.sp(), 0x2000_4000);
+    }
+
+    #[test]
+    fn exc_return_handler_requires_active_exception() {
+        let (mut bus, _handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        // Nested scenario: first enter #11 (SVC), then enter #2 (NMI) so
+        // both are "active". LR after NMI entry is 0xFFFF_FFF1
+        // (Handler, MSP). EXC_RETURN 0xF1 must be valid since #11 is
+        // still active.
+        cpu.regs.set_pc(0x1000);
+        cpu.test_enter_exception(11, &mut bus);
+        let lr_after_nmi = cpu.regs.lr(); // 0xFFFF_FFF1 for handler→handler
+        cpu.test_enter_exception(2, &mut bus);
+        assert_eq!(cpu.regs.lr(), 0xFFFF_FFF1);
+        let _ = lr_after_nmi;
+        // Return from NMI → should land back in SVC handler.
+        cpu.test_exit_exception(0xFFFF_FFF1, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 11);
+    }
+
+    #[test]
+    fn exc_return_invalid_low_nibble_raises_hardfault() {
+        let (mut bus, _handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        cpu.test_enter_exception(11, &mut bus);
+        // Corrupt LR value — bits[3:0] = 0x2 is not a legal EXC_RETURN.
+        cpu.test_exit_exception(0xFFFF_FFF2, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn bx_to_exc_return_unwinds() {
+        // Set up entry → handler writes BX LR → unwind observed.
+        let (mut bus, _handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        cpu.regs.set_pc(0x1000);
+        cpu.test_enter_exception(11, &mut bus);
+        // BX LR with LR = EXC_RETURN. Encoding: 0x4770.
+        bus.write16(cpu.regs.pc(), 0x4770);
+        // Step through the BX.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0);
+    }
+
+    #[test]
+    fn handler_sp_mutations_sync_to_banked_on_exit() {
+        // Regression test for banked-SP staleness across exception entry/exit.
+        // SUB SP / ADD SP / PUSH / POP write r[13] directly and never touch
+        // the banked msp. If enter_exception / exit_exception read msp
+        // without first syncing from r[13], mismatched SP manipulation
+        // in a handler ends up popping from the wrong address.
+        let (mut bus, _handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        let initial_sp = 0x2000_3F00u32;
+        // Only touch r[13] — do NOT explicitly set regs.msp. A correct
+        // enter_exception must sync r[13] into msp before reading it.
+        cpu.regs.set_sp(initial_sp);
+        cpu.regs.set_pc(0x1000);
+        // Place the SVC handler in SRAM so we can step real instructions.
+        let handler = 0x2000_5000u32;
+        bus.write32(0x2000_0000 + 11 * 4, handler | 1);
+        // Handler body: SUB SP,#8 ; ADD SP,#8 ; BX LR
+        bus.write16(handler, 0xB082);        // SUB SP, #8
+        bus.write16(handler + 2, 0xB002);    // ADD SP, #8
+        bus.write16(handler + 4, 0x4770);    // BX LR
+        // Deliver SVC via the real fault path so enter_exception is driven
+        // by the same code path that normal execution uses.
+        cpu.pending_fault = Some(crate::core::Fault::Svc);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 11);
+        assert_eq!(cpu.regs.pc(), handler);
+        assert_eq!(cpu.regs.sp(), initial_sp - 32);
+        // Step through SUB SP, #8 — r[13] diverges from msp (msp stays
+        // at initial_sp - 32).
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.sp(), initial_sp - 40);
+        // Step through ADD SP, #8 — r[13] back to the post-entry value.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.sp(), initial_sp - 32);
+        // Step through BX LR with LR = EXC_RETURN — triggers exit_exception.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0, "Returned to thread mode");
+        // Unwind deallocated 32 bytes from the stack — net SP back to start.
+        assert_eq!(
+            cpu.regs.sp(),
+            initial_sp,
+            "SP restored to pre-fault value"
+        );
+    }
+
+    #[test]
+    fn nonhardfault_with_t0_vector_escalates_to_hardfault() {
+        // ARMv6-M ARM §B1.5 — a vector entry with the Thumb bit clear is
+        // an entry-path fault. For HardFault itself, this is lockup; for
+        // anything else, escalate to HardFault. The first step executes
+        // the SVC and stages a HardFault; the second step delivers it.
+        let (mut bus, handlers) = make_test_bus_with_vector_table();
+        // Corrupt SVCall vector — strip the T bit to simulate a malformed
+        // vector table entry. HardFault vector stays well-formed so the
+        // escalation can actually land.
+        let bad_svc = 0x2000_0200u32; // no T bit
+        bus.write32(0x2000_0000 + 11 * 4, bad_svc);
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        let prog = 0x2000_4000u32;
+        bus.write16(prog, 0xDF00); // SVC #0
+        cpu.regs.set_pc(prog);
+        // First step: SVC sets pending_fault=Svc, deliver_fault tries to
+        // enter vector #11, finds T=0, escalates by setting
+        // pending_fault=HardFault. No handler reached yet.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0, "Did not yet enter any handler");
+        assert!(cpu.has_pending_fault(), "HardFault staged");
+        // Stage the HardFault without fetching from a bogus PC — the step
+        // loop's decode_execute would otherwise try to fetch from whatever
+        // instruction follows the SVC.
+        let fault = cpu.pending_fault.take().unwrap();
+        cpu.deliver_fault(fault, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+    }
+
+    #[test]
+    fn exception_entry_pads_when_sp_is_4_aligned_not_8() {
+        // ARMv6-M ARM §B1.5.6 — exception entry forces 8-byte alignment
+        // by pre-decrementing SP by 4 when the pre-entry SP is 4-aligned
+        // but not 8-aligned. The padding bit (bit 9 of stacked xPSR)
+        // records that fact so exit_exception can undo it.
+        let (mut bus, _handlers) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        let initial_sp = 0x2000_3FF4u32; // 4-aligned, not 8-aligned
+        cpu.regs.msp = initial_sp;
+        cpu.regs.set_sp(initial_sp);
+        cpu.regs.set_pc(0x1000);
+        cpu.test_enter_exception(11, &mut bus);
+        // SP = initial_sp - 4 (pad) - 32 (frame) = initial_sp - 36.
+        let frame_sp = initial_sp - 36;
+        assert_eq!(cpu.regs.sp(), frame_sp);
+        // Stacked xPSR lives at frame_sp + 28 — bit 9 must be set.
+        let stacked_xpsr = bus.read32(frame_sp + 28);
+        assert_ne!(
+            stacked_xpsr & (1 << 9),
+            0,
+            "STKALIGN padding bit recorded in stacked xPSR"
+        );
+        // Unwind restores the pre-entry SP, including the pad.
+        cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
+        assert_eq!(cpu.regs.sp(), initial_sp);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.B — Unaligned access fault
+// ---------------------------------------------------------------------------
+
+mod unaligned {
+    use super::*;
+
+    #[test]
+    fn ldr_word_unaligned_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0x2000_0001; // misaligned word
+        // LDR r1, [r0, #0] — encoding 0x6801
+        cpu.execute_one_with_bus(0x6801, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn str_word_unaligned_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0x2000_0002;
+        cpu.regs.r[1] = 0xDEAD_BEEF;
+        // STR r1, [r0, #0] — encoding 0x6001
+        cpu.execute_one_with_bus(0x6001, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn ldrh_unaligned_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0x2000_0001;
+        // LDRH r1, [r0, #0] — encoding 0x8801
+        cpu.execute_one_with_bus(0x8801, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn ldm_unaligned_base_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0x2000_0001; // misaligned LDM base
+        // LDMIA r0!, {r1, r2} — 0xC806
+        cpu.execute_one_with_bus(0xC806, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn ldrb_byte_any_alignment_ok() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        bus.write8(0x2000_0003, 0x42);
+        cpu.regs.r[0] = 0x2000_0003; // byte access to odd address — fine
+        // LDRB r1, [r0, #0] — encoding 0x7801
+        cpu.execute_one_with_bus(0x7801, &mut bus);
+        assert!(!cpu.has_pending_fault());
+        assert_eq!(cpu.regs.r[1], 0x42);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.B — T=0 branch target HardFault
+// ---------------------------------------------------------------------------
+
+mod t_bit_fault {
+    use super::*;
+
+    #[test]
+    fn bx_with_t0_target_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[1] = 0x2000; // even address → T bit clear
+        // BX r1 — encoding 0x4708
+        cpu.execute_one_with_bus(0x4708, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn blx_with_t0_target_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[2] = 0x4000;
+        // BLX r2 — encoding 0x4790
+        cpu.execute_one_with_bus(0x4790, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn pop_pc_with_t0_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        bus.write32(0x2000_0000, 0x1000); // even popped PC
+        cpu.regs.set_sp(0x2000_0000);
+        // POP {pc} — 0xBD00
+        cpu.execute_one_with_bus(0xBD00, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn mov_pc_with_t0_raises_fault() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0x1000; // even
+        // MOV PC, r0 — encoding 0x4687 (op=10, Rm=0, D=1, rd=7)
+        //   bits: 010001 10 D(0) Rm(0000) Rd(111) → 0x46 << 8 | 0x87
+        cpu.execute_one_with_bus(0x4687, &mut bus);
+        assert!(cpu.has_pending_fault());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4.B — Emulator::step integration smoke tests
+// ---------------------------------------------------------------------------
+
+mod emulator_step {
+    use crate::{Config, Emulator};
+
+    #[test]
+    fn step_executes_movs_sequence() {
+        // Build a tiny program in SRAM and set PC there. Five MOVS instructions
+        // writing constants to r0..r4.
+        let mut emu = Emulator::new(Config::default());
+        let program_base: u32 = 0x2000_1000;
+        let instrs: [u16; 5] = [
+            0x2001, // MOVS r0, #1
+            0x2102, // MOVS r1, #2
+            0x2203, // MOVS r2, #3
+            0x2304, // MOVS r3, #4
+            0x2405, // MOVS r4, #5
+        ];
+        for (i, w) in instrs.iter().enumerate() {
+            emu.bus.write16(program_base + (i as u32) * 2, *w);
+        }
+        emu.cores[0].regs.set_pc(program_base);
+        for _ in 0..instrs.len() {
+            emu.step();
+        }
+        assert_eq!(emu.cores[0].regs.r[0], 1);
+        assert_eq!(emu.cores[0].regs.r[1], 2);
+        assert_eq!(emu.cores[0].regs.r[2], 3);
+        assert_eq!(emu.cores[0].regs.r[3], 4);
+        assert_eq!(emu.cores[0].regs.r[4], 5);
+    }
+
+    #[test]
+    fn step_handles_svc_and_return() {
+        // Program: SVC #0 at 0x1000 followed by a NOP. Handler at 0x2000
+        // is a single BX LR. Verify we reach the handler, then return.
+        let mut emu = Emulator::new(Config::default());
+        let vtor = 0x2000_0000u32;
+        let handler = 0x2000_1000u32;
+        let stack_top = 0x2000_8000u32;
+        // Vector table: entry 11 → handler|1
+        for i in 0..16 {
+            emu.bus.write32(vtor + (i as u32) * 4, 0);
+        }
+        emu.bus.write32(vtor + 11 * 4, handler | 1);
+        emu.bus.ppb[0].vtor = vtor;
+        // Caller program at 0x2000_4000
+        let prog = 0x2000_4000u32;
+        emu.bus.write16(prog, 0xDF00); // SVC #0
+        emu.bus.write16(prog + 2, 0xBF00); // NOP (resume point)
+        // Handler: BX LR
+        emu.bus.write16(handler, 0x4770);
+        // Init core
+        emu.cores[0].regs.msp = stack_top;
+        emu.cores[0].regs.set_sp(stack_top);
+        emu.cores[0].regs.set_pc(prog);
+        // Step 1: executes SVC → enters handler.
+        emu.step();
+        assert_eq!(emu.cores[0].regs.ipsr(), 11);
+        assert_eq!(emu.cores[0].regs.pc(), handler);
+        // Step 2: executes BX LR → unwinds.
+        emu.step();
+        assert_eq!(emu.cores[0].regs.ipsr(), 0);
+        assert_eq!(emu.cores[0].regs.pc(), prog + 2);
+    }
+
+    #[test]
+    fn step_hardfault_on_undefined_then_unwinds() {
+        let mut emu = Emulator::new(Config::default());
+        let vtor = 0x2000_0000u32;
+        let handler = 0x2000_1000u32;
+        let stack_top = 0x2000_8000u32;
+        for i in 0..16 {
+            emu.bus.write32(vtor + (i as u32) * 4, 0);
+        }
+        emu.bus.write32(vtor + 3 * 4, handler | 1);
+        emu.bus.ppb[0].vtor = vtor;
+        // Program: undefined encoding (BKPT, which raises HardFault on M0+
+        // without a debugger) at 0x2000_4000.
+        let prog = 0x2000_4000u32;
+        emu.bus.write16(prog, 0xBE00); // BKPT #0 → HardFault
+        // Handler at 0x2000_1000: BX LR.
+        emu.bus.write16(handler, 0x4770);
+        emu.cores[0].regs.msp = stack_top;
+        emu.cores[0].regs.set_sp(stack_top);
+        emu.cores[0].regs.set_pc(prog);
+        emu.step();
+        assert_eq!(emu.cores[0].regs.ipsr(), 3);
+        emu.step();
+        assert_eq!(emu.cores[0].regs.ipsr(), 0);
+    }
+
+    #[test]
+    fn run_advances_pc_over_nops() {
+        // Emulator::run loops calling step until the cycle budget is met.
+        // Lay down 10 NOPs and verify both PC and the cycle count advanced
+        // as expected.
+        let mut emu = Emulator::new(Config::default());
+        let prog = 0x2000_1000u32;
+        for i in 0..10 {
+            emu.bus.write16(prog + (i as u32) * 2, 0xBF00); // NOP
+        }
+        emu.cores[0].regs.set_pc(prog);
+        let start_cycles = emu.cycles();
+        let executed = emu.run(10);
+        assert!(
+            executed >= 10,
+            "run() returned at least the requested cycle count"
+        );
+        // Each NOP takes 1 cycle on M0+, so ~10 steps to meet a 10-cycle
+        // budget. PC should have advanced ≥20 bytes (10 × 2-byte NOPs).
+        assert_eq!(emu.cores[0].regs.pc(), prog + 20);
+        assert_eq!(emu.cycles() - start_cycles, executed);
+    }
+
+    #[test]
+    fn step_primask_escalates_svc_to_hardfault() {
+        // ARMv6-M ARM §B1.5.8: executing SVC while PRIMASK=1 cannot preempt
+        // — SVCall priority (0) is not higher than execution priority (0
+        // with PRIMASK set). The architectural response is to escalate
+        // to HardFault rather than silently deliver the SVCall.
+        let mut emu = Emulator::new(Config::default());
+        let vtor = 0x2000_0000u32;
+        let svc_handler = 0x2000_1000u32;
+        let hf_handler = 0x2000_2000u32;
+        let stack_top = 0x2000_8000u32;
+        for i in 0..16 {
+            emu.bus.write32(vtor + (i as u32) * 4, 0);
+        }
+        emu.bus.write32(vtor + 3 * 4, hf_handler | 1);
+        emu.bus.write32(vtor + 11 * 4, svc_handler | 1);
+        emu.bus.ppb[0].vtor = vtor;
+        let prog = 0x2000_4000u32;
+        emu.bus.write16(prog, 0xDF00); // SVC #0
+        emu.cores[0].regs.msp = stack_top;
+        emu.cores[0].regs.set_sp(stack_top);
+        emu.cores[0].regs.primask = 1;
+        emu.cores[0].regs.set_pc(prog);
+        emu.step();
+        // SVC escalated to HardFault — land at vector #3, not #11.
+        assert_eq!(emu.cores[0].regs.ipsr(), 3);
+        assert_eq!(emu.cores[0].regs.pc(), hf_handler);
+    }
+}

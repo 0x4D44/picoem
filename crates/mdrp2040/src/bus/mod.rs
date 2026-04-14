@@ -4,7 +4,10 @@
 //! storage, XIP_CTRL+SSI path, PIO blocks (2 vs RP2350's 3), and the
 //! RP2040 SRAM bank / contention model are all Phase 5.
 
+pub mod ppb;
+
 use mdpicoem_common::Memory;
+use ppb::Ppb;
 
 /// RP2040 memory sizes.
 ///
@@ -22,6 +25,16 @@ pub struct Bus {
     pub memory: Memory,
     /// GPIO input pin state (post-mux). Cleared on reset.
     pub gpio_in: u32,
+    /// Per-core PPB state (VTOR, SHPR, ICSR, active-exception bitmap).
+    /// Indexed by core id (0 or 1). Phase 4.B uses index 0 exclusively
+    /// since `Emulator::step` only drives core 0; Phase 5 will wire up
+    /// core 1 once SIO/NVIC dispatch lands.
+    pub ppb: [Ppb; 2],
+    /// Identifies which core is currently executing on the bus. Kept as
+    /// a field so PPB-indexed helpers (`bus.ppb[bus.active_core()]`)
+    /// mirror the mdrp2350 call pattern even though Phase 4.B only uses
+    /// core 0.
+    active_core: usize,
 }
 
 impl Bus {
@@ -30,7 +43,23 @@ impl Bus {
         Self {
             memory: Memory::with_sizes(ROM_SIZE, SRAM_SIZE),
             gpio_in: 0,
+            ppb: [Ppb::new(), Ppb::new()],
+            active_core: 0,
         }
+    }
+
+    /// Currently-executing core (0 or 1).
+    #[inline]
+    pub fn active_core(&self) -> usize {
+        self.active_core
+    }
+
+    /// Set the active core. Phase 4.B only drives core 0; Phase 5 will
+    /// alternate between cores each quantum.
+    #[inline]
+    pub fn set_active_core(&mut self, core: usize) {
+        debug_assert!(core < 2);
+        self.active_core = core;
     }
 
     /// Direct memory read (bypasses bus timing). Delegates to the
