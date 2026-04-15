@@ -376,10 +376,11 @@ impl CortexM0Plus {
                 let rd_val = if d == 15 { self.read_pc() } else { self.regs.r[d] };
                 let result = rd_val.wrapping_add(rm_val);
                 if d == 15 {
-                    if result & 1 == 0 {
-                        self.pending_fault = Some(Fault::InvalidEpsr);
-                        return 1;
-                    }
+                    // ARMv6-M ARM DDI 0419E §A5.1.2: ADD Rdn, Rm with Rd==15
+                    // uses ALUWritePC(), defined as BranchWritePC which masks
+                    // the LSB via BranchTo(addr<31:1>:'0'). No fault on even
+                    // target — only BX/BLX (BXWritePC) and POP {PC}
+                    // (LoadWritePC) check the LSB.
                     self.regs.set_pc(result & !1);
                     return 3; // pipeline flush
                 }
@@ -402,10 +403,11 @@ impl CortexM0Plus {
                 let rm = ((opcode >> 3) & 0xF) as usize;
                 let val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
                 if d == 15 {
-                    if val & 1 == 0 {
-                        self.pending_fault = Some(Fault::InvalidEpsr);
-                        return 1;
-                    }
+                    // ARMv6-M ARM DDI 0419E §A5.1.2: MOV Rd, Rm with Rd==15
+                    // uses ALUWritePC(), defined as BranchWritePC which masks
+                    // the LSB via BranchTo(addr<31:1>:'0'). No fault on even
+                    // target — only BX/BLX (BXWritePC) and POP {PC}
+                    // (LoadWritePC) check the LSB.
                     self.regs.set_pc(val & !1);
                     return 3; // pipeline flush
                 }

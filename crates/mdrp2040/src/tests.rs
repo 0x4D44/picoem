@@ -1782,14 +1782,36 @@ mod t_bit_fault {
     }
 
     #[test]
-    fn mov_pc_with_t0_raises_fault() {
+    fn mov_pc_with_even_target_branches() {
+        // ARMv6-M ARM §A5.1.2: MOV Rd, Rm with Rd==15 goes through
+        // ALUWritePC → BranchWritePC → BranchTo(addr<31:1>:'0'). The LSB
+        // is masked, never checked. gcc's switch-statement jump tables
+        // load even-aligned label addresses and branch via this path.
         let mut cpu = CortexM0Plus::new();
         let mut bus = Bus::default();
-        cpu.regs.r[0] = 0x1000; // even
-        // MOV PC, r0 — encoding 0x4687 (op=10, Rm=0, D=1, rd=7)
-        //   bits: 010001 10 D(0) Rm(0000) Rd(111) → 0x46 << 8 | 0x87
+        cpu.regs.r[0] = 0x2000_1000; // even target
+        // MOV PC, r0 — 0x4687 (op=10, D:Rd = 1:111 = 15, Rm = 0)
         cpu.execute_one_with_bus(0x4687, &mut bus);
-        assert!(cpu.has_pending_fault());
+        assert!(!cpu.has_pending_fault());
+        assert_eq!(cpu.regs.pc(), 0x2000_1000);
+    }
+
+    #[test]
+    fn add_pc_with_even_target_branches() {
+        // ARMv6-M ARM §A5.1.2: ADD Rdn, Rm with Rd==15 also uses
+        // ALUWritePC. Even Rm is legal; LSB is masked.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        let base: u32 = 0x2000_2000;
+        cpu.regs.set_pc(base);
+        cpu.regs.r[0] = 0x1000; // even displacement
+        // ADD PC, r0 — 0x4487 (op=00, D:Rd = 1:111 = 15, Rm = 0)
+        // execute_one_with_bus sets current_instr_addr = base and bumps
+        // pc; read_pc() returns base + 4 per ARMv6-M semantics.
+        // Expected target: (base + 4 + 0x1000) with LSB masked = base + 0x1004.
+        cpu.execute_one_with_bus(0x4487, &mut bus);
+        assert!(!cpu.has_pending_fault());
+        assert_eq!(cpu.regs.pc(), base + 0x1004);
     }
 }
 
