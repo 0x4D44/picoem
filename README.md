@@ -122,7 +122,7 @@ cargo run -p mdpicoem-harness --release --bin probe_verify_rp2350
 cargo run -p mdpicoem-harness --release --bin bank_conflict_test_rp2350
 ```
 
-Requires a Pi Pico configured as a `probe-rs`-compatible debug probe wired to an RP2354 target. `probe_diff_rp2040` is currently a stub — the lab rig carries no RP2040 silicon; the ISA oracle for `mdrp2040` is `qemu_diff_m0plus` only.
+Requires a Pi Pico configured as a `probe-rs`-compatible debug probe wired to an RP2354 target (for the `*_rp2350` binaries) or a Pico V1 / RP2040 target (for `probe_diff_rp2040`). On a host with both probes attached, disambiguate with `--probe <VID:PID:SERIAL>` — `probe-rs list` shows the available serials.
 
 ### 4. Paced benchmark and full integration
 
