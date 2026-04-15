@@ -326,3 +326,38 @@ dropped. Unrealistic in firmware (SM-enable/disable pairs in a 64-
 cycle window is pathological) but a real semantic gap of the fast
 path. Low priority. Fix: OR the pre-loop enabled mask into the
 predicate.
+
+## PicoGUS Integration — Stage 3 follow-ups (build-time only)
+
+Neither item affects first-party Rust code. Both fire only when
+someone actually applies the DOSBox-X patch and builds it.
+
+### GUS DMA-channel traffic not captured by the tap
+
+The patch hooks `read_gus` / `write_gus`, which capture direct GUS
+register I/O but *not* DMA transfers. Real GUS ("DRAM DMA" via the
+GF1 register set) pumps patch samples from DOS RAM into GUS DRAM via
+ISA DMA cycles. Depending on DOSBox-X's DMA implementation, these
+may flow through `write_gus` (captured) or bypass via
+`GUS::DMA_Callback` (NOT captured). If bypassed, no samples ever
+reach PicoGUS's PSRAM in the replay and Stage 6 produces silence.
+
+Mitigation options:
+1. Extend the patch to hook `GUS::DMA_Callback` emitting synthetic
+   `write8` records at the GUS DRAM data port (0x247).
+2. Pre-load PSRAM from a known patch-bank dump before replay starts
+   (requires parsing GUS .pat or .ult formats).
+3. Use a MIDI demo that relies only on built-in GM patches baked
+   into firmware (may not exist for PicoGUS).
+
+Must resolve before Stage 6 demo. Medium priority.
+
+### Tap reentrant guard is not exception-safe
+
+The `picogus_tap_reentrant` static bool in the DOSBox-X patch is
+set/cleared around the `iolen==2` recursion in `read_gus`. If a
+C++ exception unwinds through `read_gus` (DOSBox-X uses `E_Exit` in
+some paths), the flag stays `true` and all subsequent tap entries
+silently skip. Fix: RAII guard struct (ctor sets, dtor clears).
+Five-line change. Low priority — unlikely in steady-state MIDI
+playback.

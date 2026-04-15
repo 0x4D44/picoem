@@ -1,0 +1,169 @@
+From: mdpicoem PicoGUS Integration <martingdavidson@gmail.com>
+Date: 2026-04-14
+Subject: [PATCH] gus: optional CSV tap of GUS port I/O for mdpicoem replayer
+
+Adds a lightweight, env-gated hook to DOSBox-X's GUS read/write paths
+that logs every port access to a CSV file. Used by the mdpicoem
+`picogus_diff_rp2040` harness to drive PicoGUS firmware inside the
+RP2040 emulator.
+
+Activation: set PICOGUS_TAP_FILE=<path> in the environment before
+launching DOSBox-X. If unset, no tap; the GUS code is unchanged at
+runtime.
+
+Format (one event per line, matching HLD Stage 3):
+
+    # picogus-tap v1
+    ns,port,value,kind
+    0,0x243,0x00,write8
+    1234567,0x240,0xff,write8
+
+`ns` is derived from PIC_FullIndex() (milliseconds * 1e6), `port` is
+the full 12-bit decoded ISA port, `value` is 0x%02x for width-1 or
+0x%04x for width-2, `kind` is write8|write16|read8|read16.
+
+The file is fopen'd once lazily on the first access, fflushed per
+line, and closed at process exit (via its static lifetime). Single-
+file diff against src/hardware/gus.cpp.
+
+Hunk headers use approximate line offsets from upstream commit
+f43ce61 (2026-04-14). Apply with GNU `patch -p1 -F5 --no-backup-if-mismatch`
+or `git apply --3way` so fuzzy matching can absorb minor upstream drift.
+See third_party/README.md for details.
+
+---
+ src/hardware/gus.cpp | 104 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 103 insertions(+), 1 deletion(-)
+
+diff --git a/src/hardware/gus.cpp b/src/hardware/gus.cpp
+--- a/src/hardware/gus.cpp
++++ b/src/hardware/gus.cpp
+@@ -1,6 +1,7 @@
+ #include <assert.h>
+ #include <string.h>
++#include <stdlib.h>
+ #include <iomanip>
+ #include <sstream>
+ #include "dosbox.h"
+ #include "inout.h"
+@@ -14,6 +15,86 @@
+ #include "bitop.h"
+ #include "math.h"
+ #include "regs.h"
++
++/* ---------------- mdpicoem PicoGUS tap (begin) ----------------
++ *
++ * Logs every GUS port I/O to a CSV trace when PICOGUS_TAP_FILE is
++ * set in the environment. Consumed by the mdpicoem
++ * picogus_diff_rp2040 harness. OFF by default -- the GUS code path
++ * is unchanged when the env var is unset.
++ *
++ * Format: see third_party/README.md in the mdpicoem workspace.
++ */
++static FILE*   picogus_tap_fp           = NULL;
++static bool    picogus_tap_initialized  = false;
++static bool    picogus_tap_enabled      = false;
++static bool    picogus_tap_reentrant    = false;
++static uint64_t picogus_tap_last_ns     = 0;
++
++static void picogus_tap_init(void) {
++    if (picogus_tap_initialized) return;
++    picogus_tap_initialized = true;
++    const char* path = getenv("PICOGUS_TAP_FILE");
++    if (path == NULL || path[0] == '\0') {
++        picogus_tap_enabled = false;
++        return;
++    }
++    picogus_tap_fp = fopen(path, "wb");
++    if (picogus_tap_fp == NULL) {
++        LOG_MSG("PicoGUS tap: fopen(\"%s\") failed, tap disabled", path);
++        picogus_tap_enabled = false;
++        return;
++    }
++    picogus_tap_enabled = true;
++    fprintf(picogus_tap_fp, "# picogus-tap v1\n");
++    fprintf(picogus_tap_fp, "ns,port,value,kind\n");
++    fflush(picogus_tap_fp);
++    LOG_MSG("PicoGUS tap: logging GUS I/O to \"%s\"", path);
++}
++
++static uint64_t picogus_tap_now_ns(void) {
++    /* PIC_FullIndex() returns milliseconds since DOSBox-X start as
++     * a high-precision floating value. Multiply to ns and truncate.
++     * The value can step backwards across DOSBox-X pause/resume, so
++     * clamp to the last observed timestamp to preserve the Stage 4
++     * replayer's monotonicity contract. */
++    double ms = (double)PIC_FullIndex();
++    if (ms < 0.0) ms = 0.0;
++    uint64_t ns = (uint64_t)(ms * 1.0e6);
++    if (ns < picogus_tap_last_ns) ns = picogus_tap_last_ns;
++    picogus_tap_last_ns = ns;
++    return ns;
++}
++
++static inline void picogus_tap_log(const char* kind, Bitu port, Bitu val, Bitu iolen) {
++    if (!picogus_tap_initialized) picogus_tap_init();
++    if (!picogus_tap_enabled) return;
++    /* Recursion guard: read_gus recurses with iolen==1 for 16-bit
++     * reads. The outer 16-bit call logs "read16" at the recursion
++     * site and sets picogus_tap_reentrant across the recursion
++     * expression (see the read_gus hunk below), so the inner
++     * tap_log calls land here with the flag set and return early.
++     * Result: exactly one record per outermost logical access.
++     * DOSBox-X's CPU thread is single-threaded, so a plain static
++     * bool is sufficient -- no thread-local needed. */
++    if (picogus_tap_reentrant) return;
++    uint64_t ns = picogus_tap_now_ns();
++    if (iolen == 2) {
++        fprintf(picogus_tap_fp, "%llu,0x%03x,0x%04x,%s\n",
++                (unsigned long long)ns,
++                (unsigned)(port & 0xFFF),
++                (unsigned)(val & 0xFFFF),
++                kind);
++    } else {
++        fprintf(picogus_tap_fp, "%llu,0x%03x,0x%02x,%s\n",
++                (unsigned long long)ns,
++                (unsigned)(port & 0xFFF),
++                (unsigned)(val & 0xFF),
++                kind);
++    }
++    fflush(picogus_tap_fp);
++}
++/* ---------------- mdpicoem PicoGUS tap (end) ------------------ */
+
+ static GUS* test = NULL;
+
+@@ -1935,5 +1998,21 @@ static Bitu read_gus(Bitu port,Bitu iolen) {
+-			return (read_gus(port,1) & 0xFF) + (read_gus(port+1,1) << 8u);
++			/* mdpicoem PicoGUS tap: log the outer 16-bit read once
++			 * and suppress the two recursive 8-bit sub-reads by
++			 * holding picogus_tap_reentrant across the recursion.
++			 * Without this the inner calls would reach the tap
++			 * site below and emit spurious read8 records. */
++			picogus_tap_log("read16", port, 0, 2);
++			picogus_tap_reentrant = true;
++			Bitu _picogus_tap_r16 = (read_gus(port,1) & 0xFF) + (read_gus(port+1,1) << 8u);
++			picogus_tap_reentrant = false;
++			return _picogus_tap_r16;
+ 		}
+ 	}
++
++	/* mdpicoem PicoGUS tap: log the 8-bit read entry (and any 16-bit
++	 * path that fell through without recursing). Logged before
++	 * dispatch so timestamps correlate with the ISA cycle the DOS
++	 * program issued. Value is unknown at entry -- log 0 for reads;
++	 * the replayer ignores reads (see HLD Stage 3 / Stage 4). */
++	picogus_tap_log(iolen == 2 ? "read16" : "read8", port, 0, iolen);
+
+ 	switch (port - GUS_BASE) {
+@@ -2070,5 +2138,10 @@ static void write_gus(Bitu port,Bitu val,Bitu iolen) {
+ 	 *
+ 	 * More than 10 bits must be decoded in order for GUS MAX extended registers at 7xx to work */
+ 	port &= 0xFFF;
++
++	/* mdpicoem PicoGUS tap: log the decoded write. Placed after the
++	 * 12-bit port mask so the logged port matches the GUS's internal
++	 * view of the access. */
++	picogus_tap_log(iolen == 2 ? "write16" : "write8", port, val, iolen);
+
+ 	/* Ok, so get this: There's a demoscene entry, 1997 demo "Atlantis, Deep Like A Sea", with code
