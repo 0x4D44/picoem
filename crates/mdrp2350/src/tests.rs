@@ -6110,9 +6110,9 @@ fn test_sio_cpuid() {
 fn test_clocks_source_tracking() {
     let (_, mut bus) = core_and_bus();
     // Write CLK_SYS_CTRL to select source 1 (aux)
-    bus.write32(0x4001_0060, 0x0000_0001);
+    bus.write32(0x4001_003C, 0x0000_0001);
     // CLK_SYS_SELECTED should reflect 1 << 1 = 2
-    assert_eq!(bus.read32(0x4001_0068), 0x2);
+    assert_eq!(bus.read32(0x4001_0044), 0x2);
 
     // Write CLK_REF_CTRL to select source 2
     bus.write32(0x4001_0030, 0x0000_0002);
@@ -6650,7 +6650,7 @@ fn test_xosc_via_clk_ref_sys_clock() {
     // CLK_REF_CTRL SRC=2 (XOSC)
     bus.write32(0x4001_0030, 0x0000_0002);
     // CLK_SYS_CTRL SRC=0 (clk_ref)
-    bus.write32(0x4001_0060, 0x0000_0000);
+    bus.write32(0x4001_003C, 0x0000_0000);
     assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ,
         "CLK_SYS routed through CLK_REF=XOSC should give 12 MHz");
     assert_eq!(bus.ref_clk_hz(), XOSC_FREQ_HZ);
@@ -6662,9 +6662,9 @@ fn test_clk_sys_div_scales_output() {
     let (_, mut bus) = core_and_bus();
     // Route CLK_SYS to XOSC via CLK_REF
     bus.write32(0x4001_0030, 0x0000_0002);
-    bus.write32(0x4001_0060, 0x0000_0000);
+    bus.write32(0x4001_003C, 0x0000_0000);
     // CLK_SYS_DIV integer = 2 (bits [31:16])
-    bus.write32(0x4001_0064, 0x0002_0000);
+    bus.write32(0x4001_0040, 0x0002_0000);
     assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ / 2,
         "CLK_SYS_DIV=2 should halve the source frequency");
 }
@@ -6697,7 +6697,7 @@ fn test_pll_sys_at_150mhz() {
     // PRIM: POSTDIV1=5 in bits [18:16], POSTDIV2=2 in bits [14:12]
     bus.write32(0x4005_000C, (5 << 16) | (2 << 12));
     // Switch CLK_SYS to aux=0 (PLL_SYS): SRC=1, AUXSRC=0
-    bus.write32(0x4001_0060, 0x0000_0001);
+    bus.write32(0x4001_003C, 0x0000_0001);
     assert_eq!(bus.sys_clk_hz(), 150_000_000,
         "PLL_SYS configured for 150 MHz should give sys_clk_hz = 150_000_000");
 }
@@ -6707,7 +6707,7 @@ fn test_unconfigured_pll_zero_hz() {
     // Fresh Bus: reset values leave FBDIV=0, so pll_output_hz must return 0.
     // Switching CLK_SYS to PLL_SYS without configuring should report 0 Hz.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x4001_0060, 0x0000_0001); // SRC=1 (aux), AUXSRC=0 (PLL_SYS)
+    bus.write32(0x4001_003C, 0x0000_0001); // SRC=1 (aux), AUXSRC=0 (PLL_SYS)
     assert_eq!(bus.sys_clk_hz(), 0,
         "Unconfigured PLL (FBDIV=0) must honestly report 0 Hz, not a .max(1) fudge");
 }
@@ -6737,7 +6737,7 @@ fn test_pll_fbdiv_max_no_overflow() {
     // gives 12M * 4095 / 49 ≈ 1.003 GHz. Must not panic on u32 overflow.
     let (_, mut bus) = core_and_bus();
     bus.write32(0x4005_0008, 0xFFF); // FBDIV_INT = 4095 (max)
-    bus.write32(0x4001_0060, 0x0000_0001); // Route CLK_SYS → PLL_SYS
+    bus.write32(0x4001_003C, 0x0000_0001); // Route CLK_SYS → PLL_SYS
     let hz = bus.sys_clk_hz();
     assert!(hz > 1_000_000_000 && hz < 1_010_000_000,
         "FBDIV=4095 with defaults should produce ~1.003 GHz (got {hz})");
@@ -6856,7 +6856,7 @@ fn test_config_sys_clk_hz_seeds_bus() {
     // overwrites the seed with the register-derived value. Reset
     // register state routes CLK_SYS → clk_ref → ROSC.
     let mut emu = emu;
-    emu.bus.write32(0x4001_0060, 0x0000_0000); // CLK_SYS_CTRL SRC=0 (clk_ref)
+    emu.bus.write32(0x4001_003C, 0x0000_0000); // CLK_SYS_CTRL SRC=0 (clk_ref)
     assert_eq!(emu.bus.sys_clk_hz(), ROSC_FREQ_HZ,
         "First CLOCKS write should replace the seed with the derived ROSC frequency");
 }
@@ -6953,3 +6953,4 @@ fn test_emulator_tick_systick_disabled_core_untouched() {
     assert_eq!(emu.bus.ppb[1].syst_csr & (1 << 16), 0,
         "Disabled SysTick must not set COUNTFLAG");
 }
+

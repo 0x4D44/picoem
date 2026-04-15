@@ -74,13 +74,21 @@ impl Bus {
     }
 
     // --- CLOCKS (0x40010000) ---
+    //
+    // RP2350 layout (different from RP2040). RP2350 adds GPOUT4-7 blocks
+    // before CLK_REF, shifting CLK_SYS earlier:
+    //   0x30 CLK_REF_CTRL
+    //   0x38 CLK_REF_SELECTED
+    //   0x3C CLK_SYS_CTRL
+    //   0x40 CLK_SYS_DIV
+    //   0x44 CLK_SYS_SELECTED
     pub(crate) fn clocks_read(&self, offset: u32) -> u32 {
         match offset {
             0x030 => self.clk_ref_ctrl,
             0x038 => 1 << (self.clk_ref_ctrl & 0x3), // CLK_REF_SELECTED
-            0x060 => self.clk_sys_ctrl,
-            0x064 => self.clk_sys_div,
-            0x068 => 1 << (self.clk_sys_ctrl & 0x1), // CLK_SYS_SELECTED
+            0x03C => self.clk_sys_ctrl,
+            0x040 => self.clk_sys_div,
+            0x044 => 1 << (self.clk_sys_ctrl & 0x1), // CLK_SYS_SELECTED
             _ => 0,
         }
     }
@@ -102,8 +110,8 @@ impl Bus {
         };
         match offset {
             0x030 => self.clk_ref_ctrl = apply(self.clk_ref_ctrl),
-            0x060 => self.clk_sys_ctrl = apply(self.clk_sys_ctrl),
-            0x064 => self.clk_sys_div = apply(self.clk_sys_div),
+            0x03C => self.clk_sys_ctrl = apply(self.clk_sys_ctrl),
+            0x040 => self.clk_sys_div = apply(self.clk_sys_div),
             _ => {}
         }
         self.recompute_clock_tree();
@@ -291,6 +299,7 @@ mod tests {
     #[test]
     fn test_clk_sys_selected() {
         let mut bus = Bus::new();
-        assert_eq!(bus.read32(0x4001_0068), 0x1);
+        // RP2350 CLK_SYS_SELECTED at 0x040_10044.
+        assert_eq!(bus.read32(0x4001_0044), 0x1);
     }
 }
