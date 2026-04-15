@@ -5,7 +5,14 @@
 
 pub mod cycle_cases;
 pub mod gdb_client;
+pub mod i2s_capture;
 pub mod ieee754_ref;
+pub mod onerom_glue_dma;
+pub mod onerom_snapshot_fmt;
+pub mod onerom_sync;
+pub mod onerom_trace;
+pub mod picogus_pins;
+pub mod silicon_scenarios;
 pub mod thumb32_gen;
 
 use rand::rngs::StdRng;
@@ -137,6 +144,13 @@ pub const QEMU_FPU_SCRATCH: u32 = QEMU_TEST_SCRATCH + SCRATCH_SIZE;
 /// Lives above `EMU_TEST_STACK` (0x2004_0000) so it does not collide
 /// with pushed/popped frames from the stub's callee-saved save.
 pub const CYCLE_MAILBOX_BASE: u32 = 0x2004_0100;
+
+/// Sled base for `silicon_periph_diff_rp2350`. 4 KB below the ISA /
+/// cycle-oracle test slot; holds the countdown-loop sled the runner
+/// uploads per-scenario (shape: `movs r0, #N / subs r0, #1 / bne -4 /
+/// bkpt`). Picked to stay clear of the cycle-oracle stub at
+/// `EMU_TEST_SLOT` + its sequence-slot neighbours.
+pub const SILICON_RUN_SLED: u32 = EMU_TEST_SLOT + 0x1000;
 
 // ============================================================================
 // Per-chip address bases for `compare()`

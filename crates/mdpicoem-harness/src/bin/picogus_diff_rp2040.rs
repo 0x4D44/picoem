@@ -1,10 +1,12 @@
 // PicoGUS trace replayer — mdrp2040 (Cortex-M0+) harness.
 //
-// Stage 4 of the PicoGUS Integration HLD
+// Stages 4 + 5 of the PicoGUS Integration HLD
 // (`wrk_docs/2026.04.14 - HLD - PicoGUS Integration.md`). Reads a CSV
 // trace captured from a patched DOSBox-X and drives synthetic ISA bus
 // cycles into our `mdrp2040::Emulator`, stepping virtual time forward
-// to match each event's wall-clock offset.
+// to match each event's wall-clock offset. Per-cycle samples the I2S
+// pins (BCLK / LRCLK / DOUT) and writes the decoded stereo PCM to a
+// WAV file at the end of the run.
 //
 // Trace format (produced by Stage 3):
 //
@@ -29,26 +31,23 @@
 // Injection strategy — idealised ISA waveform
 // -------------------------------------------
 //
-// PicoGUS v4.0.0 (`github.com/polpo/picogus` tag `v4.0.0`,
-// `sw/isa/isa_io.pio` + `sw/CMakeLists.txt`) pins the ISA bus to the
-// following RP2040 GPIOs (via `.define public` directives in
-// `isa_io.pio` lines 19–26):
+// The authoritative RP2040 GPIO mapping lives in
+// [`mdpicoem_harness::picogus_pins`]. It is cross-checked against the
+// PicoGUS v4.0.0 firmware (`github.com/polpo/picogus` tag `v4.0.0`) and
+// used by both this replayer and the I2S capture module.
 //
-//     GPIO  4   IOW_PIN       I/O write strobe  (active low)
-//     GPIO  5   IOR_PIN       I/O read strobe   (active low)
-//     GPIO  6..15   AD0..AD9  10-bit multiplexed address / 8-bit data
-//     GPIO 19   DACK_PIN      DMA acknowledge
-//     GPIO 21   IRQ_PIN       firmware-driven IRQ output
-//     GPIO 26   IOCHRDY_PIN   sideset output (wait-state handshake)
-//     GPIO 27   ADS_PIN       sideset output (address / data mux select)
-//     GPIO 28   UART_TX_PIN
+// Summary for the pins this file drives / reads:
 //
-// PSRAM pins (from `sw/CMakeLists.txt` ~line 260, `build_gus`):
-//
-//     GPIO  0   PSRAM_PIN_MISO
-//     GPIO  1   PSRAM_PIN_CS
-//     GPIO  2   PSRAM_PIN_SCK
-//     GPIO  3   PSRAM_PIN_MOSI
+//     GPIO  0..3     PSRAM (MISO/CS/SCK/MOSI — owned by on-chip merge)
+//     GPIO  4        ISA IOW#           (harness drives)
+//     GPIO  5        ISA IOR#           (harness drives)
+//     GPIO  6..15    ISA AD0..AD9       (harness drives)
+//     GPIO 16..18    I2S DOUT/BCLK/LRCLK (firmware drives — we observe)
+//     GPIO 19        ISA DACK
+//     GPIO 21        ISA IRQ
+//     GPIO 26        ISA IOCHRDY
+//     GPIO 27        ISA ADS
+//     GPIO 28        UART TX
 //
 // The PIO `iow` program (isa_io.pio) samples the bus in two phases:
 // phase A — waits for IOW falling edge, then reads 10 bits of address
@@ -88,16 +87,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use mdpicoem_harness::i2s_capture::{self, I2sCapture};
+use mdpicoem_harness::picogus_pins::{
+    ISA_AD0 as PIN_AD0, ISA_AD_COUNT as PIN_AD_COUNT, ISA_EXTERNAL_PIN_MASK, ISA_IOR as PIN_IOR,
+    ISA_IOW as PIN_IOW,
+};
 use mdrp2040::{Config, Emulator, EmulatorBuilder};
-
-// ----------------------------------------------------------------------------
-// Pin mapping (sourced from PicoGUS v4.0.0 firmware — see module comment).
-// ----------------------------------------------------------------------------
-
-const PIN_IOW: u8 = 4;
-const PIN_IOR: u8 = 5;
-const PIN_AD0: u8 = 6; // AD0..AD9 occupy GPIO6..GPIO15
-const PIN_AD_COUNT: u8 = 10;
 
 /// Address width on the ISA bus for the GUS decode window (0x240..0x24F).
 /// The PIO program reads 10 bits — we drive all 10, upper bits zero for
@@ -310,15 +305,14 @@ pub trait IsaSink {
     fn step(&mut self, cycles: u32);
     fn cycles(&self) -> u64;
     fn drive_pins(&mut self, iow_low: bool, ior_low: bool, ad_bus: u16);
+    /// Current merged pad state (the value the firmware's PIO
+    /// observes). Default is zero — sinks that don't model pads can
+    /// leave this alone. The I2S capture wrapper ([`CapturingSink`])
+    /// uses this to sample BCLK / LRCLK / DOUT each cycle.
+    fn pad_state(&self) -> u32 {
+        0
+    }
 }
-
-/// Bitmask of GPIO pins the harness drives externally — IOW#, IOR#, and
-/// the 10-bit AD bus AD0..AD9. PSRAM pins (GPIO0..3) are deliberately
-/// **not** in this mask; they remain owned by the on-chip SIO/PIO/PSRAM
-/// merge inside `Emulator::update_gpio`.
-pub const ISA_EXTERNAL_PIN_MASK: u32 = (1u32 << PIN_IOW)
-    | (1u32 << PIN_IOR)
-    | (((1u32 << PIN_AD_COUNT) - 1) << PIN_AD0);
 
 impl IsaSink for Emulator {
     #[inline]
@@ -332,6 +326,11 @@ impl IsaSink for Emulator {
     #[inline]
     fn cycles(&self) -> u64 {
         self.clock.cycles
+    }
+
+    #[inline]
+    fn pad_state(&self) -> u32 {
+        self.bus.gpio_in
     }
 
     /// Drive the ISA control + address/data bus by populating the Bus's
@@ -359,6 +358,72 @@ impl IsaSink for Emulator {
         let ext_mask = self.bus.external_gpio_in_mask;
         self.bus.gpio_in = (self.bus.gpio_in & !ext_mask)
             | (self.bus.external_gpio_in_override & ext_mask);
+    }
+}
+
+/// Wraps an inner [`IsaSink`] (typically [`Emulator`]) with a per-step
+/// tick into an [`I2sCapture`]. The inner sink is stepped in fine
+/// increments and the capture is ticked with the true sysclk stamp
+/// (`inner.cycles()`) after each, so BCLK / LRCLK edges are timestamped
+/// in system-clock cycles rather than in tick-call counts — at 48 kHz
+/// stereo with 32 BCLKs per frame the bit clock is ~1.5 MHz on a
+/// 125 MHz sys_clk, so fine-grained sampling stays well above Nyquist.
+pub struct CapturingSink<S: IsaSink> {
+    inner: S,
+    capture: I2sCapture,
+}
+
+impl<S: IsaSink> CapturingSink<S> {
+    pub fn new(inner: S, sys_clk_hz: u32) -> Self {
+        Self {
+            inner,
+            capture: I2sCapture::new(sys_clk_hz),
+        }
+    }
+
+    pub fn capture(&self) -> &I2sCapture {
+        &self.capture
+    }
+
+    pub fn into_parts(self) -> (S, I2sCapture) {
+        (self.inner, self.capture)
+    }
+}
+
+impl<S: IsaSink> IsaSink for CapturingSink<S> {
+    /// Advance the inner sink until its cycle count reaches or passes
+    /// `inner.cycles() + cycles`, ticking the I2S capture after each
+    /// inner step with the *actual* sysclk stamp. With
+    /// `Emulator::step_quantum(1)` each `inner.step(1)` advances by one
+    /// instruction (1–4 sysclks on M0+), so the cycle delta between
+    /// consecutive ticks matches the real sysclk delta — not the loop
+    /// iteration count. The capture's LRCLK edge timestamps are
+    /// therefore in system-clock units, and `inferred_sample_rate_hz`
+    /// returns the true rate.
+    fn step(&mut self, cycles: u32) {
+        let target = self.inner.cycles().wrapping_add(cycles as u64);
+        while self.inner.cycles() < target {
+            let before = self.inner.cycles();
+            self.inner.step(1);
+            if self.inner.cycles() == before {
+                // Inner sink stalled; stop the sub-loop so the outer
+                // stall guard in `replay()` can observe it.
+                break;
+            }
+            self.capture.tick(self.inner.pad_state(), self.inner.cycles());
+        }
+    }
+
+    fn cycles(&self) -> u64 {
+        self.inner.cycles()
+    }
+
+    fn drive_pins(&mut self, iow_low: bool, ior_low: bool, ad_bus: u16) {
+        self.inner.drive_pins(iow_low, ior_low, ad_bus);
+    }
+
+    fn pad_state(&self) -> u32 {
+        self.inner.pad_state()
     }
 }
 
@@ -539,6 +604,7 @@ struct Args {
     trace: PathBuf,
     duration_secs: Option<f64>,
     post_roll_secs: f64,
+    out: Option<PathBuf>,
 }
 
 /// Default post-roll duration in seconds. 500 ms gives enough simulated
@@ -552,6 +618,7 @@ fn parse_args() -> Result<Args, String> {
     let mut trace = None;
     let mut duration_secs = None;
     let mut post_roll_secs = DEFAULT_POST_ROLL_SECS;
+    let mut out = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -592,6 +659,13 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--post-roll must be >= 0".into());
                 }
             }
+            "--out" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--out requires a path".into());
+                }
+                out = Some(PathBuf::from(&args[i]));
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -609,6 +683,7 @@ fn parse_args() -> Result<Args, String> {
         trace,
         duration_secs,
         post_roll_secs,
+        out,
     })
 }
 
@@ -616,7 +691,7 @@ fn print_usage() {
     eprintln!(
         "Usage:\n  \
          picogus_diff_rp2040 --trace <path>\n                      \
-         [--flash <path>] [--duration <secs>] [--post-roll <secs>]\n\
+         [--flash <path>] [--duration <secs>] [--post-roll <secs>] [--out <path>]\n\
          \n\
          --flash      Optional 2 MB XIP flash image (.bin). Without it the\n              \
                       emulator runs with empty flash; the replayer still\n              \
@@ -627,7 +702,9 @@ fn print_usage() {
          --post-roll  Optional (default 0.5 s). After the last trace event\n              \
                       (or the duration cap), step the emulator for this many\n              \
                       additional simulated seconds without firing events —\n              \
-                      lets firmware drain trailing I2S / DMA buffers."
+                      lets firmware drain trailing I2S / DMA buffers.\n\
+         --out        Optional. Path for the captured I2S WAV. Default:\n              \
+                      crates/mdpicoem-harness/oracles/picogus_<trace_stem>.wav."
     );
 }
 
@@ -683,16 +760,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .duration_secs
         .map(|s| (s * 1e9).max(0.0) as u64);
     let post_roll_ns = (args.post_roll_secs * 1e9).max(0.0) as u64;
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| i2s_capture::default_out_path(&args.trace));
 
     let wall_start = Instant::now();
+    let mut sink = CapturingSink::new(emu, DEFAULT_SYS_CLK_HZ);
     let summary = replay(
-        &mut emu,
+        &mut sink,
         &events,
         DEFAULT_SYS_CLK_HZ,
         duration_ns,
         Some(post_roll_ns),
     );
     let wall_elapsed = wall_start.elapsed();
+    let (_emu, capture) = sink.into_parts();
+
+    // Persist the captured audio. Reject directories and create any
+    // missing parent dirs (handled inside `write_wav`).
+    let inferred_rate = capture.inferred_sample_rate_hz();
+    let wav_rate = inferred_rate
+        .map(|r| r.round() as u32)
+        .filter(|r| *r > 0)
+        .unwrap_or(44_100);
+    capture
+        .write_wav(&out_path, wav_rate)
+        .map_err(|e| format!("writing WAV to {}: {e}", out_path.display()))?;
+    let wav_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
 
     println!();
     println!("=== picogus_diff_rp2040 summary ===");
@@ -720,6 +815,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Ratio (sim/wall): {:.3}x",
             sim_s / wall_elapsed.as_secs_f64()
         );
+    }
+
+    println!();
+    println!("--- I2S capture ---");
+    println!("WAV path:         {}", out_path.display());
+    println!("WAV size:         {} bytes", wav_bytes);
+    println!("Frames:           {}", capture.frames().len());
+    println!("LRCLK edges:      {}", capture.lrclk_edge_count());
+    match inferred_rate {
+        Some(rate) => println!(
+            "Sample rate:      {:.1} Hz (inferred from LRCLK)",
+            rate
+        ),
+        None => println!(
+            "Sample rate:      — (no LRCLK activity; header stamped {} Hz)",
+            wav_rate
+        ),
+    }
+    let duration = capture.duration_secs(wav_rate);
+    println!("Audio duration:   {:.3} s", duration);
+    if capture.lrclk_edge_count() == 0 {
+        println!("(no I2S output detected — WAV contains only the 44-byte header)");
     }
     Ok(())
 }
@@ -1310,5 +1427,248 @@ ns,port,value,kind
             summary.final_cycles,
             summary.post_roll_cycles
         );
+    }
+
+    /// Inner sink that doesn't actually model audio but exposes a
+    /// synthetic `pad_state` whose bits toggle each cycle. If the
+    /// CapturingSink wires the tick correctly, the I2sCapture inside
+    /// will observe BCLK and LRCLK edges and produce at least a non-
+    /// zero LRCLK edge count.
+    #[test]
+    fn capturing_sink_forwards_ticks_to_i2s_capture() {
+        use mdpicoem_harness::picogus_pins::{I2S_BCLK, I2S_LRCLK};
+
+        /// Synthetic pad generator: BCLK toggles every cycle, LRCLK
+        /// toggles every 16 cycles (one half-frame).
+        struct SynthSink {
+            cycles: u64,
+        }
+        impl IsaSink for SynthSink {
+            fn step(&mut self, cycles: u32) {
+                self.cycles = self.cycles.wrapping_add(cycles as u64);
+            }
+            fn cycles(&self) -> u64 {
+                self.cycles
+            }
+            fn drive_pins(&mut self, _iow_low: bool, _ior_low: bool, _ad_bus: u16) {}
+            fn pad_state(&self) -> u32 {
+                let mut p = 0u32;
+                if self.cycles & 1 != 0 {
+                    p |= 1u32 << I2S_BCLK;
+                }
+                if (self.cycles / 16) & 1 != 0 {
+                    p |= 1u32 << I2S_LRCLK;
+                }
+                p
+            }
+        }
+
+        let mut sink = CapturingSink::new(SynthSink { cycles: 0 }, 125_000_000);
+        // Step 1024 cycles — 1024/16 = 64 LRCLK edges.
+        sink.step(1024);
+        let cap = sink.capture();
+        assert!(
+            cap.lrclk_edge_count() > 0,
+            "expected LRCLK edges from synthetic pads, got {}",
+            cap.lrclk_edge_count()
+        );
+        // LRCLK toggles every 16 cycles; by cycle 1024 we should have
+        // ~63 edges (the first toggle is at cycle 16, last at 1008).
+        assert!(
+            cap.lrclk_edge_count() >= 60 && cap.lrclk_edge_count() <= 65,
+            "LRCLK edge count {} out of expected range [60..=65]",
+            cap.lrclk_edge_count()
+        );
+    }
+
+    /// The CapturingSink must advance the inner sink by exactly `n`
+    /// cycles when the inner sink is not stalled.
+    #[test]
+    fn capturing_sink_advances_one_cycle_at_a_time() {
+        let mut inner = MockSink::new();
+        inner.last_iow_low = false; // ensure no stale state
+        let inner_wrapped = CapturingWrapper { inner: &mut inner };
+        let mut sink = CapturingSink::new(inner_wrapped, 125_000_000);
+        sink.step(100);
+        assert_eq!(
+            sink.cycles(),
+            100,
+            "100 single-cycle inner steps must leave inner at 100 cycles"
+        );
+    }
+
+    /// The I2S capture timestamps must track the inner sink's sysclk
+    /// count, not the number of `inner.step(1)` calls. This is the
+    /// synthetic repro: a mock whose `step(1)` advances cycles by 4 —
+    /// simulating a multi-sysclk M0+ instruction (e.g. BL, LDM {R0..R2}).
+    /// Under the broken per-call cycle counter, LRCLK edges would be
+    /// stamped at iteration index (1, 2, 3, …) instead of sysclk index
+    /// (4, 8, 12, …), inflating `inferred_sample_rate_hz` by 4×.
+    #[test]
+    fn capturing_sink_stamps_edges_in_sysclks_not_ticks() {
+        use mdpicoem_harness::picogus_pins::I2S_LRCLK;
+
+        /// Mock whose `step(1)` reports 4 cycles consumed, with LRCLK
+        /// toggling on every inner step boundary. If the CapturingSink
+        /// stamps edges in `inner.cycles()` (4, 8, 12, …), the inferred
+        /// period is 8 sysclks per full LRCLK cycle. If it stamps in
+        /// tick-call counts (1, 2, 3, …), the inferred period would be
+        /// 2 units → 4× too fast.
+        struct MultiCycleSink {
+            cycles: u64,
+            lrclk_high: bool,
+        }
+        impl IsaSink for MultiCycleSink {
+            fn step(&mut self, _cycles: u32) {
+                // Always report 4 cycles per inner step, regardless of
+                // the requested count — models a 4-cycle M0+ BL.
+                self.cycles = self.cycles.wrapping_add(4);
+                // Flip LRCLK after every step so every inner step is an
+                // LRCLK edge.
+                self.lrclk_high = !self.lrclk_high;
+            }
+            fn cycles(&self) -> u64 {
+                self.cycles
+            }
+            fn drive_pins(&mut self, _iow_low: bool, _ior_low: bool, _ad_bus: u16) {}
+            fn pad_state(&self) -> u32 {
+                if self.lrclk_high { 1u32 << I2S_LRCLK } else { 0 }
+            }
+        }
+
+        // Scripted run: `sink.step(40)` should loop until inner.cycles()
+        // >= 40 (10 inner steps @ 4 cycles each). That gives us 10 LRCLK
+        // edges with monotonic sysclk stamps 4, 8, 12, …, 40.
+        let sys_clk = 40u32;
+        let mut sink = CapturingSink::new(
+            MultiCycleSink { cycles: 0, lrclk_high: false },
+            sys_clk,
+        );
+        sink.step(40);
+        assert_eq!(
+            sink.cycles(),
+            40,
+            "inner should advance to 40 cycles (10 iterations of +4)"
+        );
+        let cap = sink.capture();
+        assert_eq!(
+            cap.lrclk_edge_count(),
+            10,
+            "expected one LRCLK edge per inner step"
+        );
+        let inferred = cap
+            .inferred_sample_rate_hz()
+            .expect("10 edges should infer a rate");
+        // `half_periods = edges - 1 = 9`, total cycles = 40 - 4 = 36
+        // → rate = sys_clk * 9 / (2 * 36) = 40 * 9 / 72 = 5 Hz.
+        // If the fix were reverted and edges were stamped at iteration
+        // indices (1, 2, …, 10), total_cycles would be 9 and the
+        // inferred rate would be 40 * 9 / 18 = 20 Hz — 4× too high.
+        let expected = 5.0f64;
+        let rel_err = (inferred - expected).abs() / expected;
+        assert!(
+            rel_err < 1e-9,
+            "expected {expected} Hz (sysclk-stamped edges), got {inferred} Hz \
+             — if this fails with ~20 Hz, the capture is counting ticks \
+             instead of sysclks"
+        );
+    }
+
+    /// End-to-end with a real `mdrp2040::Emulator`: a branch-to-self
+    /// (`B .` at 3 cycles per iteration) parks core 0 on a multi-cycle
+    /// instruction. Each `sink.step(1)` should trigger exactly one
+    /// `inner.step(1)` + one I2S tick — but `inner.cycles()` advances
+    /// by 3, and the I2S tick stamp must reflect that sysclk delta.
+    #[test]
+    fn capturing_sink_cycle_matches_emulator_cycles() {
+        // Build a minimal ROM: vector table + `B .` at the reset entry
+        // so core 0 loops on a 3-cycle taken branch forever.
+        let mut emu = EmulatorBuilder::new(Config {
+            sys_clk_hz: 125_000_000,
+        })
+        .step_quantum(1)
+        .build();
+
+        let mut rom = vec![0u8; 16];
+        // Initial SP at top of SRAM
+        rom[0..4].copy_from_slice(&0x2004_2000u32.to_le_bytes());
+        // Reset vector → PC = 0x09 (Thumb bit set, entry at 0x08)
+        rom[4..8].copy_from_slice(&0x0000_0009u32.to_le_bytes());
+        // `B .` at 0x08: encoded 0xE7FE — taken branch, 3 cycles per
+        // iteration on M0+.
+        rom[8..10].copy_from_slice(&0xe7feu16.to_le_bytes());
+        emu.load_image(0x0000_0000, &rom);
+        emu.reset();
+
+        // Reference cycle trace: drive a bare emulator through N inner
+        // steps, recording `cycles()` after each step. Each step is one
+        // taken branch = 3 sysclks.
+        let mut reference_cycles: Vec<u64> = Vec::new();
+        for _ in 0..8 {
+            emu.step();
+            reference_cycles.push(emu.cycles());
+        }
+        assert_eq!(
+            reference_cycles.last().copied(),
+            Some(24),
+            "8 taken branches of 3 cycles each must leave emu at 24 cycles"
+        );
+
+        // Now build a fresh emulator (same program) and wrap it. Use
+        // `sink.step(1)` N times; each iteration should advance the
+        // inner emulator by 3 cycles (not 1, which is what the old
+        // CapturingSink::step(n) for-loop implicitly assumed).
+        let mut emu2 = EmulatorBuilder::new(Config {
+            sys_clk_hz: 125_000_000,
+        })
+        .step_quantum(1)
+        .build();
+        emu2.load_image(0x0000_0000, &rom);
+        emu2.reset();
+        let mut sink = CapturingSink::new(emu2, 125_000_000);
+
+        // Each outer step(1) asks to advance by 1 sysclk; the inner
+        // emulator overshoots to 3 cycles on the first `inner.step(1)`
+        // (the branch), satisfying the `cycles >= target` exit in
+        // CapturingSink::step, so exactly one inner step happens per
+        // outer step.
+        let mut observed_cycles: Vec<u64> = Vec::new();
+        for _ in 0..8 {
+            sink.step(1);
+            observed_cycles.push(sink.cycles());
+        }
+        assert_eq!(
+            observed_cycles, reference_cycles,
+            "CapturingSink must advance inner emulator by true sysclks per \
+             instruction, not by the number of step calls. Got {:?} vs \
+             expected {:?}.",
+            observed_cycles, reference_cycles
+        );
+
+        // Now drive the same emulator with an LRCLK-toggle fixture and
+        // check the capture records monotonically increasing sysclk
+        // stamps. We can't easily inject LRCLK without firmware, but we
+        // can assert the capture's internal first/last cycle bounds via
+        // `inferred_sample_rate_hz` on a synthetic pad toggle above. The
+        // key contract — "tick sees inner.cycles(), not a call counter"
+        // — is already proven by the cycle equality above plus the
+        // `capturing_sink_stamps_edges_in_sysclks_not_ticks` test.
+    }
+
+    /// Small adapter around `&mut MockSink` so we can use a MockSink as
+    /// the inner sink of CapturingSink without moving ownership.
+    struct CapturingWrapper<'a> {
+        inner: &'a mut MockSink,
+    }
+    impl<'a> IsaSink for CapturingWrapper<'a> {
+        fn step(&mut self, cycles: u32) {
+            self.inner.step(cycles);
+        }
+        fn cycles(&self) -> u64 {
+            self.inner.cycles()
+        }
+        fn drive_pins(&mut self, iow_low: bool, ior_low: bool, ad_bus: u16) {
+            self.inner.drive_pins(iow_low, ior_low, ad_bus);
+        }
     }
 }
