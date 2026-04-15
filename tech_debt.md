@@ -599,58 +599,105 @@ to boot real SDK firmware, because our peripheral model is incomplete,
 and the SDK runtime itself also trips an assertion we don't yet
 understand.
 
-### PicoGUS v4.0.0 firmware panics early in pico-sdk runtime
+### ~~PicoGUS v4.0.0 firmware panics early in pico-sdk runtime~~ (resolved 2026-04-15)
 
-**Impact: HIGH.** Still blocks the HLD's subjective-ear-test acceptance.
+Resolved across four phases. Full narrative in
+`wrk_journals/2026.04.15 - JRN - PicoGUS SDK Panic Debug.md`. The
+"alarm 1 already claimed" hypothesis from the original diagnosis
+turned out to be a red herring — the r0=1 panic argument was the
+IRQ number passed to `irq_set_exclusive_handler`, not a hardware
+alarm index.
 
-After vendoring the B2 bootrom and adding `Emulator::direct_boot_from_flash`
-(which skips the bootrom's QSPI-flash-detection check and jumps
-directly to the SDK firmware's reset handler at `flash+0x100`), firmware
-progresses ~785× farther — from cycle 8209 to ~1.35 M — then takes a
-HardFault. Investigation in the 2026-04-15 journal:
+- **Phase 1** (`22135ff`, `eadda71`) — `direct_boot_from_flash`
+  didn't write VTOR. Real silicon's `exit_from_boot2` writes SP +
+  VTOR + PC before jumping to the SDK reset handler; we were only
+  setting SP + PC. Added the VTOR write, both cores.
+- **Phase 2** (`34d7d6a`) — `crates/mdrp2040/src/bus/ppb.rs` had a
+  broken mask/pattern pair. `match addr & 0x0FFF_FFFF { 0x000E_D008
+  => self.vtor }` never matched because for `addr = 0xE000_ED08` the
+  mask yields `0x0000_ED08`, not `0x000E_D008`. Every SCB register
+  read returned 0, every write was silently dropped. Existing tests
+  all used direct field assignment (`bus.ppb[0].vtor = val`) which
+  bypassed the match, so the bug was invisible. Rewrote using the
+  correct mdrp2350 idiom (`match addr & 0xFFFF { 0xED08 =>
+  self.vtor }`) + added 5 regression tests + bus-level integration
+  assertion.
+- **Phase 4** (`5e113dc`) — `execute.rs` incorrectly raised
+  `Fault::InvalidEpsr` on `MOV PC, Rm` and `ADD PC, Rm` with even
+  destination. Per ARMv6-M ARM DDI 0419E §A5.1.2, `ALUWritePC`
+  (used by those two instructions when Rd=15) just masks the LSB —
+  only `BXWritePC` / `LoadWritePC` correctly fault. gcc emits `mov
+  pc, rN` for switch jump tables with even-aligned label targets;
+  this tripped the bogus fault in `_vfprintf`. Removed the check,
+  added positive regression tests. mdrp2350 already had the correct
+  behaviour.
 
-- Cycle ~1.35 M: firmware hits a `BKPT #0` at flash-SRAM address
-  `0x200035ac`, immediately after `bl 0x200035ac` from an inline
-  `__breakpoint()` at `0x20000298`. PC then vectors to the bootrom's
-  `_dead` handler at `0x30` with `LR=0xFFFFFFF9` (EXC_RETURN
-  handler-MSP).
-- Panic format string decoded as `"Hard assert"` (pico-sdk
-  `hard_assertion_failure()`), invoked with `r0=1`.
-- Call chain traced via the interrupt-stacked frame:
-  `hard_assertion_failure` (`0x20000db8`) ←
-  some checker at `0x20000364` ← `0x200007f0` ← further up.
-  Checker loads `r3 = *(array + (r0 + 0x10) << 2)` inside a spinlock,
-  compares to `r5` (caller's expected) and a magic constant, asserts
-  on mismatch. Matches pico-sdk's `hw_claim_or_assert` pattern —
-  firmware thinks a hardware resource (probably alarm 1) is already
-  claimed on cold boot, which suggests a peripheral register we stub
-  is feeding a non-zero claim-bit that firmware then rejects.
-- Does **not** reproduce on our `roms/rp2040/i2s_chime.bin` smoke
-  firmware, so the I2S / GPIO / SIO path itself is fine end-to-end —
-  see `chime_firmware_produces_nonzero_audio` test in
-  `picogus_diff_rp2040.rs`. The gap is specifically in the set of
-  peripherals the pico-sdk runtime touches before reaching `main()`.
+**Result**: real PicoGUS v4.0.0 firmware now runs through
+`picogus_diff_rp2040` for 62.7 M cycles (2.002 s simulated time)
+with zero stall events. All SDK panic paths are cleared.
 
-Fix paths (ranked, no one picked):
+Three new blockers surfaced during Phase 5 diagnosis (no audio yet)
+— see entries below.
 
-1. **Instrument the panic stack further** — dump the SRAM-stacked
-   PC chain above the panic wrapper on the next fault, walk back to
-   the callsite that invoked `hw_claim_or_assert`, and identify which
-   peripheral register returned the wrong value. Likely finding:
-   a specific TIMER/RESETS/CLOCKS/SYSINFO stub needs a more
-   representative value. ~2–4 hours once a maintainer starts.
-2. **Stub out the assertion** — intercept the BKPT path for just
-   that call site and continue past, accepting silent divergence
-   from real silicon behaviour. Hacky; only useful as a bisection
-   tool to see how far the next layer of firmware gets.
-3. **Build a thinner firmware** — e.g. take the PicoGUS source and
-   produce a boot that skips the SDK runtime init phase that
-   asserts. High coupling to upstream PicoGUS; rejected unless (1)
-   fails.
+### PicoGUS: no I2S output — blocked on three sequential peripheral gates
 
-Until resolved, acceptance depends on the `i2s_chime` smoke firmware
-(proves the emulator audio path) plus the real bootrom being loaded
-for firmware that can boot past SDK runtime init (none yet).
+**Impact: HIGH** for the end-to-end PicoGUS ear-test acceptance.
+None blocks the oracle itself — the SDK panic is cleared, tests are
+green, chime firmware still produces audio.
+
+After the Phase 1-4 fixes (above), PicoGUS v4.0.0 firmware parks at
+SRAM 0x2000d628 — pico-sdk's `busy_wait_us_32` polling TIMER at
+0x40054000+0x28 (TIMERAWL). Our emulator has no TIMER model, so the
+read returns 0, `now - start = 0`, the busy-wait loop never exits.
+Firmware never reaches `main()` or PicoGUS's audio bring-up path.
+
+**Three sequential gates** (each a separate workstream with its
+own HLD + sprint; ALL needed for audio):
+
+1. **RP2040 TIMER peripheral model** (blocker-1, MEDIUM impact).
+   Minimum: cycle-driven 64-bit microsecond counter at TIMER_BASE +
+   0x24/0x28 (TIMERAWH/TIMERAWL). Expressed as
+   `bus.cycles / (sys_clk_hz / 1_000_000)`. Probably also needs
+   ALARM0..3 + NVIC IRQ routing for the full SDK — most of
+   pico-sdk's scheduler uses alarms. Scope: ~2 days once someone
+   starts. mdrp2350 has a stub in `bus/clocks.rs` but doesn't model
+   ALARM/IRQ.
+
+2. **RP2040 core 1 SDK launch handshake** (blocker-2, HIGH impact).
+   PicoGUS runs the ISA service loop on core 1; main on core 0 does
+   the GUS emulation + DMA. Our emulator keeps core 1 halted after
+   reset; `multicore_launch_core1` from the SDK pokes the SIO FIFO
+   with a specific handshake sequence (SP, PC, vtable ptr via the 6
+   FIFO messages) which our SIO currently ignores. mdrp2040 needs
+   to parse that handshake and unhalt core 1. See `bus/sio.rs`
+   FIFO path. Scope: ~1 day.
+
+3. **RP2040 DMA block model** (blocker-3, MEDIUM impact). I2S
+   output is DMA → PIO TX FIFO. No DMA = no PIO FIFO samples ever
+   get loaded = no BCLK/LRCLK/DOUT output even if PIO were
+   programmed. Our emulator's `bus/mod.rs` has a generic
+   `peripheral_regs` HashMap fall-through at 0x50000000; DMA writes
+   land there and do nothing. Scope: ~3-5 days, this is the biggest
+   of the three.
+
+4. (Non-emulator) Real DOSBox-X trace capture to drive audio,
+   tracked as an external dependency in the PicoGUS Integration HLD
+   Stage 6.
+
+All three emulator gates are sequential — none of them alone
+produces audio. Order them 1 → 2 → 3; measure progress per-gate.
+
+### Secondary finding — ISA-pin idle default matters for diagnostic probes
+
+`picogus_diff_rp2040` primes ISA pins to idle (IOW#=IOR#=HIGH)
+between replay events via `CapturingSink`. Without that priming
+(plain `picogus_probe_pc` before the Phase 5 edit), firmware
+observes phantom ISA bus cycles and faults at a different site
+early in init. Not a regression — the oracle's priming is
+correct-by-design — but it means downstream probes/oracles must
+mirror the idle-pin convention to reproduce `picogus_diff_rp2040`'s
+observed behaviour. Document in any new PicoGUS-adjacent oracle
+binary.
 
 ### RP2040 bootrom's QSPI flash detection needs SSI+pads model to pass
 
