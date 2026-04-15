@@ -244,8 +244,93 @@ pub const MAIN_OFFSET: u32 = 0x100;
 /// path doesn't need scenario-specific sizing.
 pub const ISR_IMAGE_SIZE: usize = 0x180;
 
+/// Extended image size for Phase 0a external-IRQ scenarios.
+///
+/// The baseline image reserves only 16 vector-table entries (64 bytes)
+/// and places the default handler opcode at 0x040 — overlapping
+/// external-IRQ vector slots 16+. External-IRQ scenarios need room for
+/// the full NVIC input range 0..=47 (slots 16..=63) plus SPARE lines
+/// up to IRQ 47, so this variant reserves the first 256 bytes (0x100)
+/// for a 64-entry vector table and then lays out the default handler,
+/// primary handler, alternate handler, and main body after it.
+///
+/// Layout:
+///
+/// ```text
+///   + 0x000 .. 0x100  vector table — 64 entries, slots 0..=63
+///                       [0] initial MSP = ISR_STACK_TOP
+///                       [1] Reset_Handler = base | 1 | IRQ_MAIN_OFFSET
+///                       [2..13] default handler = base | 1 | IRQ_DEFAULT_HANDLER_OFFSET
+///                       [14] PendSV / [15] SysTick → IRQ_HANDLER_OFFSET
+///                       [16..63] extra_slots populate via modeset;
+///                                unpopulated slots fall through to the
+///                                default handler (bkpt #1)
+///   + 0x100 .. 0x104  default handler: bkpt #1 (0xBE01)
+///   + 0x104 .. 0x140  primary handler body (30 halfwords max)
+///   + 0x140 .. 0x180  alternate handler body (32 halfwords max)
+///   + 0x180 .. 0x200  main body + literal pool (64 halfwords)
+/// ```
+pub const IRQ_IMAGE_SIZE: usize = 0x200;
+
+/// Byte offset of the default handler (bkpt #1) inside an
+/// `IRQ_IMAGE_SIZE` image.
+pub const IRQ_DEFAULT_HANDLER_OFFSET: u32 = 0x100;
+/// Byte offset of the primary handler body inside an `IRQ_IMAGE_SIZE`
+/// image. Used for PendSV, SysTick, and any extra slots that point at
+/// `IRQ_HANDLER_OFFSET`.
+pub const IRQ_HANDLER_OFFSET: u32 = 0x104;
+/// Byte offset of the alternate handler body inside an `IRQ_IMAGE_SIZE`
+/// image. Scenarios that need a second handler body (e.g. priority
+/// preemption with distinct low-priority and high-priority handlers)
+/// place it here and list it in their `extra_slots`.
+pub const IRQ_ALT_HANDLER_OFFSET: u32 = 0x140;
+/// Byte offset of the main routine inside an `IRQ_IMAGE_SIZE` image.
+pub const IRQ_MAIN_OFFSET: u32 = 0x180;
+
+/// One vector-table slot populator for [`build_image_modeset`].
+///
+/// Each slot maps a vector-table index (word offset in the image's
+/// first 0x100 bytes) to a handler offset within the image. The builder
+/// writes `(image_base + handler_offset) | 1` into vector word `index`
+/// so the entered handler has the Thumb bit set.
+///
+/// Index range is 0..=63 — the default image carries a 16-entry vector
+/// table but `ISR_IMAGE_SIZE` leaves room for up to 64 vector entries
+/// before colliding with the default-handler opcode at 0x040. Callers
+/// that need more slots should bump `ISR_IMAGE_SIZE` first.
+#[derive(Copy, Clone, Debug)]
+pub struct VectorSlot {
+    /// Vector-table word index (0..=63). Exceptions 14 (PendSV) and 15
+    /// (SysTick) are populated by default even when `extra_slots` is
+    /// empty — listing them here again overrides the handler offset.
+    pub index: usize,
+    /// Byte offset within the image where the handler body lives. The
+    /// builder records `(image_base + handler_offset) | 1` in the
+    /// vector slot.
+    pub handler_offset: u32,
+}
+
+impl VectorSlot {
+    /// Construct a slot. `const` so the mode-sets can live in `static`
+    /// items.
+    pub const fn new(index: usize, handler_offset: u32) -> Self {
+        Self { index, handler_offset }
+    }
+}
+
+/// Default mode-set for scenarios that touch only PendSV + SysTick —
+/// preserves the v1 image shape. Every slot maps to [`HANDLER_OFFSET`]
+/// so the single handler body `handler_hw` serves both.
+pub const DEFAULT_MODESET: &[VectorSlot] = &[
+    VectorSlot::new(14, HANDLER_OFFSET),
+    VectorSlot::new(15, HANDLER_OFFSET),
+];
+
 /// Assemble a complete scenario image from its hand-assembled handler
-/// body, main body, and literal pool.
+/// body, main body, and literal pool — with no extra vector-slot
+/// populators. Equivalent to [`build_image_modeset`] with
+/// `extra_slots = &[]`, i.e. only PendSV (14) and SysTick (15) are
+/// populated at `HANDLER_OFFSET`.
 ///
 /// Layout:
 ///
@@ -275,14 +360,39 @@ const fn build_image<const N_HANDLER_HW: usize, const N_MAIN_HW: usize>(
     handler_hw: [u16; N_HANDLER_HW],
     main_hw: [u16; N_MAIN_HW],
 ) -> [u8; ISR_IMAGE_SIZE] {
+    build_image_modeset(image_base, stack_top, handler_hw, main_hw, &[])
+}
+
+/// Mode-set aware image builder (HLD V5 §4.1.6).
+///
+/// Produces the same layout as [`build_image`] but accepts an
+/// `extra_slots` slice of additional vector-table entries to populate.
+/// Use this variant for external-IRQ scenarios that need a second
+/// handler body in the image (e.g. TIMER0_IRQ_0 alongside PendSV).
+///
+/// PendSV (14) and SysTick (15) always point at `HANDLER_OFFSET` —
+/// extra slots may override them by listing the same index. The builder
+/// applies `extra_slots` after the default PendSV/SysTick writes so
+/// overrides win, and listing an index outside 0..=63 is a no-op (the
+/// `while` guard clips it).
+///
+/// The handler body at `HANDLER_OFFSET` is shared by every slot that
+/// references it, so external-IRQ scenarios that reuse the baseline
+/// handler do not need to carry a second body. Scenarios that need a
+/// distinct second handler can place its bytes further into the image
+/// (e.g. at 0x080) and list that offset in `extra_slots`.
+const fn build_image_modeset<const N_HANDLER_HW: usize, const N_MAIN_HW: usize>(
+    image_base: u32,
+    stack_top: u32,
+    handler_hw: [u16; N_HANDLER_HW],
+    main_hw: [u16; N_MAIN_HW],
+    extra_slots: &[VectorSlot],
+) -> [u8; ISR_IMAGE_SIZE] {
     let mut out = [0u8; ISR_IMAGE_SIZE];
 
-    // Vector table (16 entries × 4 bytes = 64 bytes).
-    //   [0] initial MSP
-    //   [1] Reset_Handler
-    //   [2..13] default handler for all others
-    //   [14] PendSV
-    //   [15] SysTick
+    // Vector table defaults. PendSV (14) and SysTick (15) go through
+    // the same `HANDLER_OFFSET` so the single shared handler body
+    // services both.
     let reset_vec = (image_base + MAIN_OFFSET) | 1;
     let default_vec = (image_base + 0x040) | 1;
     let pendsv_vec = (image_base + HANDLER_OFFSET) | 1;
@@ -328,6 +438,27 @@ const fn build_image<const N_HANDLER_HW: usize, const N_MAIN_HW: usize>(
     out[62] = sv[2];
     out[63] = sv[3];
 
+    // Apply extra-slot populators from the mode-set. Each slot writes
+    // a vector-table entry at `index * 4` pointing at
+    // `(image_base + handler_offset) | 1`. Applied after the defaults
+    // so a slot listing index 14 or 15 overrides PendSV / SysTick.
+    let mut s = 0;
+    while s < extra_slots.len() {
+        let slot = extra_slots[s];
+        if slot.index < 64 {
+            let off = slot.index * 4;
+            if off + 4 <= ISR_IMAGE_SIZE {
+                let vec = (image_base + slot.handler_offset) | 1;
+                let b = vec.to_le_bytes();
+                out[off] = b[0];
+                out[off + 1] = b[1];
+                out[off + 2] = b[2];
+                out[off + 3] = b[3];
+            }
+        }
+        s += 1;
+    }
+
     // Default handler at offset 0x040: bkpt #1 (0xBE01). A halt here
     // means the trigger hit the wrong vector slot — distinct halt
     // reason from the expected `bkpt #0` inside the real handler.
@@ -350,6 +481,139 @@ const fn build_image<const N_HANDLER_HW: usize, const N_MAIN_HW: usize>(
     let mut m = 0;
     while m < N_MAIN_HW {
         let off = 0x100 + m * 2;
+        let b = main_hw[m].to_le_bytes();
+        out[off] = b[0];
+        out[off + 1] = b[1];
+        m += 1;
+    }
+
+    out
+}
+
+/// Extended-layout image builder for Phase 0a external-IRQ scenarios
+/// (HLD V5 §4.1.5 + §4.1.6).
+///
+/// Produces an [`IRQ_IMAGE_SIZE`] image with a 48-entry vector table,
+/// supporting vector slots for IRQs 0..=31 without colliding with the
+/// default-handler opcode. Callers supply:
+///
+/// * `handler_hw` — primary handler body at [`IRQ_HANDLER_OFFSET`].
+///   Shared by PendSV, SysTick, and any `extra_slots` that reference
+///   this offset.
+/// * `alt_handler_hw` — alternate handler body at [`IRQ_ALT_HANDLER_OFFSET`].
+///   Length may be zero (the scenario uses only one handler body).
+/// * `main_hw` — main routine at [`IRQ_MAIN_OFFSET`].
+/// * `extra_slots` — additional vector-table populators beyond the
+///   default PendSV (14) + SysTick (15).
+const fn build_image_irq<
+    const N_HANDLER_HW: usize,
+    const N_ALT_HW: usize,
+    const N_MAIN_HW: usize,
+>(
+    image_base: u32,
+    stack_top: u32,
+    handler_hw: [u16; N_HANDLER_HW],
+    alt_handler_hw: [u16; N_ALT_HW],
+    main_hw: [u16; N_MAIN_HW],
+    extra_slots: &[VectorSlot],
+) -> [u8; IRQ_IMAGE_SIZE] {
+    let mut out = [0u8; IRQ_IMAGE_SIZE];
+
+    let reset_vec = (image_base + IRQ_MAIN_OFFSET) | 1;
+    let default_vec = (image_base + IRQ_DEFAULT_HANDLER_OFFSET) | 1;
+    let pendsv_vec = (image_base + IRQ_HANDLER_OFFSET) | 1;
+    let systick_vec = (image_base + IRQ_HANDLER_OFFSET) | 1;
+
+    // Word 0: initial MSP
+    let msp_bytes = stack_top.to_le_bytes();
+    out[0] = msp_bytes[0];
+    out[1] = msp_bytes[1];
+    out[2] = msp_bytes[2];
+    out[3] = msp_bytes[3];
+
+    // Word 1: Reset_Handler
+    let rv = reset_vec.to_le_bytes();
+    out[4] = rv[0];
+    out[5] = rv[1];
+    out[6] = rv[2];
+    out[7] = rv[3];
+
+    // Words 2..13: default handler
+    let mut i = 2;
+    while i < 14 {
+        let off = i * 4;
+        let b = default_vec.to_le_bytes();
+        out[off] = b[0];
+        out[off + 1] = b[1];
+        out[off + 2] = b[2];
+        out[off + 3] = b[3];
+        i += 1;
+    }
+
+    // Word 14: PendSV / Word 15: SysTick
+    let pv = pendsv_vec.to_le_bytes();
+    out[56] = pv[0]; out[57] = pv[1]; out[58] = pv[2]; out[59] = pv[3];
+    let sv = systick_vec.to_le_bytes();
+    out[60] = sv[0]; out[61] = sv[1]; out[62] = sv[2]; out[63] = sv[3];
+
+    // Default external-IRQ entries 16..=63: default handler (bkpt #1
+    // halt). Scenarios override via extra_slots. Covers all 48 NVIC
+    // inputs (IRQs 0..=47 map to exception numbers 16..=63) so a
+    // scenario that pends a high-numbered IRQ without an explicit
+    // extra_slots entry still lands on the halt handler instead of
+    // jumping to address 0.
+    let mut ext_slot = 16;
+    while ext_slot < 64 {
+        let off = ext_slot * 4;
+        let b = default_vec.to_le_bytes();
+        out[off] = b[0]; out[off + 1] = b[1]; out[off + 2] = b[2]; out[off + 3] = b[3];
+        ext_slot += 1;
+    }
+
+    // Extra-slot overrides. Accept indices 0..=63 so external-IRQ
+    // scenarios can populate any NVIC input line.
+    let mut s = 0;
+    while s < extra_slots.len() {
+        let slot = extra_slots[s];
+        if slot.index < 64 {
+            let off = slot.index * 4;
+            let vec = (image_base + slot.handler_offset) | 1;
+            let b = vec.to_le_bytes();
+            out[off] = b[0]; out[off + 1] = b[1]; out[off + 2] = b[2]; out[off + 3] = b[3];
+        }
+        s += 1;
+    }
+
+    // Default handler at 0x0C0: bkpt #1.
+    out[IRQ_DEFAULT_HANDLER_OFFSET as usize] = 0x01;
+    out[IRQ_DEFAULT_HANDLER_OFFSET as usize + 1] = 0xBE;
+    out[IRQ_DEFAULT_HANDLER_OFFSET as usize + 2] = 0x00;
+    out[IRQ_DEFAULT_HANDLER_OFFSET as usize + 3] = 0x00;
+
+    // Primary handler body at IRQ_HANDLER_OFFSET.
+    let mut h = 0;
+    while h < N_HANDLER_HW {
+        let off = IRQ_HANDLER_OFFSET as usize + h * 2;
+        let b = handler_hw[h].to_le_bytes();
+        out[off] = b[0];
+        out[off + 1] = b[1];
+        h += 1;
+    }
+
+    // Alternate handler body at IRQ_ALT_HANDLER_OFFSET.
+    let mut a = 0;
+    while a < N_ALT_HW {
+        let off = IRQ_ALT_HANDLER_OFFSET as usize + a * 2;
+        let b = alt_handler_hw[a].to_le_bytes();
+        out[off] = b[0];
+        out[off + 1] = b[1];
+        a += 1;
+    }
+
+    // Main body at IRQ_MAIN_OFFSET.
+    let mut m = 0;
+    while m < N_MAIN_HW {
+        let off = IRQ_MAIN_OFFSET as usize + m * 2;
         let b = main_hw[m].to_le_bytes();
         out[off] = b[0];
         out[off + 1] = b[1];
@@ -645,6 +909,276 @@ const MAIN_EAGER_FP: [u16; 22] = MAIN_LAZY_FP;
 const MAIN_TAIL_CHAIN: [u16; 22] = MAIN_BASELINE;
 
 // ---------------------------------------------------------------------------
+// Phase 0a external-IRQ handlers + mains (HLD V5 §4.1.5)
+// ---------------------------------------------------------------------------
+//
+// Three scenarios cover:
+//   (a) cold TIMER0_IRQ_0 assert + handler entry
+//   (b) masked-pending → unmask delivery
+//   (c) priority preemption (two IRQs)
+//
+// All three use the extended IRQ_IMAGE_SIZE layout (HLD V5 §4.1.6) so
+// vector slots 16+ (external IRQs) don't collide with the default-
+// handler opcode at 0x040 in the baseline layout.
+
+/// Baseline IRQ handler — reads CYCCNT, writes to mailbox, BKPT #0.
+/// Same shape as [`HANDLER_BASELINE`] but laid out for the extended
+/// `IRQ_IMAGE_SIZE` image — handler sits at `IRQ_HANDLER_OFFSET =
+/// 0x104` so the literal-pool math differs from the 0x044 variant.
+///
+/// ```text
+///   [0] ldr r0, [pc, #8]     ; r0 = DWT_CYCCNT_ADDR (lit at hw[6])
+///   [1] ldr r0, [r0]         ; r0 = *DWT_CYCCNT
+///   [2] ldr r1, [pc, #8]     ; r1 = ISR_MAILBOX_CYCCNT (lit at hw[8])
+///   [3] str r0, [r1]         ; mailbox = CYCCNT
+///   [4] bkpt #0              ; halt
+///   [5] bkpt #0              ; padding
+///   [6..7] lit: DWT_CYCCNT_ADDR
+///   [8..9] lit: ISR_MAILBOX_CYCCNT
+/// ```
+///
+/// Literal-pool math (hw[0] at byte 0x104, PC=0x108, Align(PC,4)=0x108,
+/// target = 0x108 + 8 = 0x110 → hw[6]; hw[2] at 0x108, PC=0x10C,
+/// Align=0x10C, target = 0x10C + 8 = 0x114 → hw[8]). Both opcodes
+/// encode imm8=2 (offset 8) so nothing changes at the opcode level
+/// when the handler base moves — PC-relative LDR is offset-agnostic.
+const HANDLER_IRQ_CYCCNT: [u16; 10] = [
+    0x4802, //  [0] ldr r0, [pc, #8]
+    0x6800, //  [1] ldr r0, [r0]
+    0x4902, //  [2] ldr r1, [pc, #8]
+    0x6008, //  [3] str r0, [r1]
+    0xBE00, //  [4] bkpt #0
+    0xBE00, //  [5] bkpt #0 (padding)
+    0x1004, //  [6] lit: DWT_CYCCNT_ADDR low
+    0xE000, //  [7] lit: DWT_CYCCNT_ADDR high
+    0x3FF8, //  [8] lit: ISR_MAILBOX_CYCCNT low
+    0x2000, //  [9] lit: ISR_MAILBOX_CYCCNT high
+];
+
+/// High-priority preempting handler — writes 0xBBBBBBBB to mailbox and
+/// BKPTs. Used by scenario C's primary (IRQ 1) handler. Placed at
+/// IRQ_HANDLER_OFFSET = 0x104.
+///
+/// ```text
+///   [0] ldr r0, [pc, #8]     ; r0 = 0xBBBBBBBB (lit at hw[6])
+///   [1] ldr r1, [pc, #12]    ; r1 = ISR_MAILBOX_CYCCNT (lit at hw[8])
+///   [2] str r0, [r1]         ; mailbox = sentinel B
+///   [3] bkpt #0              ; halt
+///   [4] bkpt #0              ; padding
+///   [5] bkpt #0              ; padding
+///   [6..7] lit: 0xBBBBBBBB
+///   [8..9] lit: ISR_MAILBOX_CYCCNT
+/// ```
+const HANDLER_IRQ_PREEMPT: [u16; 10] = [
+    0x4802, //  [0] ldr r0, [pc, #8]    — r0 = 0xBBBB_BBBB
+    0x4903, //  [1] ldr r1, [pc, #12]   — r1 = ISR_MAILBOX_CYCCNT
+    0x6008, //  [2] str r0, [r1]
+    0xBE00, //  [3] bkpt #0
+    0xBE00, //  [4] bkpt #0             — padding
+    0xBE00, //  [5] bkpt #0             — padding
+    0xBBBB, //  [6] lit: sentinel_b low
+    0xBBBB, //  [7] lit: sentinel_b high
+    0x3FF8, //  [8] lit: ISR_MAILBOX_CYCCNT low
+    0x2000, //  [9] lit: ISR_MAILBOX_CYCCNT high
+];
+
+/// Low-priority preempted handler — writes 0xAAAAAAAA to mailbox, pends
+/// IRQ 1 via NVIC_ISPR, then busy-waits (expecting IRQ 1 to preempt).
+/// Used by scenario C's alternate (IRQ 0) handler at
+/// IRQ_ALT_HANDLER_OFFSET = 0x140.
+///
+/// ```text
+///   [0] ldr r0, [pc, #12]    ; r0 = 0xAAAAAAAA (lit hw[8])
+///   [1] ldr r1, [pc, #16]    ; r1 = ISR_MAILBOX_CYCCNT (hw[10])
+///   [2] str r0, [r1]         ; mailbox = sentinel A
+///   [3] ldr r2, [pc, #16]    ; r2 = NVIC_ISPR0 (hw[12])
+///   [4] movs r3, #2          ; r3 = 0x2 (bit for IRQ 1)
+///   [5] str r3, [r2]         ; NVIC_ISPR |= 2 → pend IRQ 1
+///   [6] b .                  ; busy-wait; IRQ 1 should preempt here
+///   [7] bkpt #0              ; safety (reached only if no preemption)
+///   [8..9] lit: 0xAAAAAAAA
+///   [10..11] lit: ISR_MAILBOX_CYCCNT
+///   [12..13] lit: NVIC_ISPR0
+/// ```
+///
+/// Literal math (hw[0] at byte 0x140, PC=0x144, Align=0x144, target
+/// hw[8] = 0x150, offset = 0x0C → imm8 = 3 → 0x4803). PC-relative LDR
+/// is offset-agnostic, so opcodes remain the same regardless of the
+/// handler base address.
+const HANDLER_IRQ_LOW_PRIO: [u16; 14] = [
+    0x4803, //  [0] ldr r0, [pc, #12]   — r0 = 0xAAAA_AAAA
+    0x4904, //  [1] ldr r1, [pc, #16]   — r1 = ISR_MAILBOX_CYCCNT
+    0x6008, //  [2] str r0, [r1]
+    0x4A04, //  [3] ldr r2, [pc, #16]   — r2 = NVIC_ISPR0
+    0x2302, //  [4] movs r3, #2
+    0x6013, //  [5] str r3, [r2]        — pend IRQ 1
+    0xE7FE, //  [6] b .                 — busy-wait; IRQ 1 preempts
+    0xBE00, //  [7] bkpt #0             — safety
+    0xAAAA, //  [8] lit: sentinel_a low
+    0xAAAA, //  [9] lit: sentinel_a high
+    0x3FF8, // [10] lit: ISR_MAILBOX_CYCCNT low
+    0x2000, // [11] lit: ISR_MAILBOX_CYCCNT high
+    0xE200, // [12] lit: NVIC_ISPR0 low
+    0xE000, // [13] lit: NVIC_ISPR0 high
+];
+
+/// Scenario A main — cold TIMER0_IRQ_0. Enable IRQ 0 then pend.
+///
+/// ```text
+///   [ 0] movs r4, #1
+///   [ 1] ldr  r5, [pc, #28]   ; r5 = DWT_CYCCNT_ADDR
+///   [ 2] ldr  r6, [pc, #28]   ; r6 = NVIC_ISER0
+///   [ 3] ldr  r7, [pc, #32]   ; r7 = NVIC_ISPR0
+///   [ 4] str  r4, [r6]        ; NVIC_ISER |= 1 (enable IRQ 0)
+///   [ 5] movs r4, #0
+///   [ 6] str  r4, [r5]        ; CYCCNT = 0 (reset)
+///   [ 7] movs r4, #1
+///   [ 8] str  r4, [r7]        ; NVIC_ISPR |= 1 (pend — TRIGGER)
+///   [ 9] b    .               ; busy-wait
+///   [10] bkpt #0              ; safety
+///   [11..15] nop padding
+///   [16..17] lit: DWT_CYCCNT_ADDR
+///   [18..19] lit: NVIC_ISER0
+///   [20..21] lit: NVIC_ISPR0
+/// ```
+///
+/// Literal-pool math is PC-relative, so moving `IRQ_MAIN_OFFSET`
+/// doesn't change the opcodes. At `IRQ_MAIN_OFFSET = 0x180`:
+///   hw[1] at 0x182: PC = 0x186, Align = 0x184, target hw[16] = 0x1A0,
+///     offset = 0x1C → imm8 = 7 → 0x4D07.
+///   hw[2] at 0x184: PC = 0x188, Align = 0x188, target hw[18] = 0x1A4,
+///     offset = 0x1C → imm8 = 7 → 0x4E07.
+///   hw[3] at 0x186: PC = 0x18A, Align = 0x188, target hw[20] = 0x1A8,
+///     offset = 0x20 → imm8 = 8 → 0x4F08.
+const MAIN_IRQ_COLD: [u16; 22] = [
+    0x2401, // [ 0] movs r4, #1
+    0x4D07, // [ 1] ldr  r5, [pc, #28]   — r5 = DWT_CYCCNT_ADDR
+    0x4E07, // [ 2] ldr  r6, [pc, #28]   — r6 = NVIC_ISER0
+    0x4F08, // [ 3] ldr  r7, [pc, #32]   — r7 = NVIC_ISPR0
+    0x6034, // [ 4] str  r4, [r6]        — enable IRQ 0
+    0x2400, // [ 5] movs r4, #0
+    0x602C, // [ 6] str  r4, [r5]        — reset CYCCNT
+    0x2401, // [ 7] movs r4, #1
+    0x603C, // [ 8] str  r4, [r7]        — pend IRQ 0 (TRIGGER)
+    0xE7FE, // [ 9] b    .
+    0xBE00, // [10] bkpt #0              — safety
+    0xBF00, // [11] nop
+    0xBF00, // [12] nop
+    0xBF00, // [13] nop
+    0xBF00, // [14] nop
+    0xBF00, // [15] nop
+    0x1004, // [16] lit: DWT_CYCCNT_ADDR low
+    0xE000, // [17] lit: DWT_CYCCNT_ADDR high
+    0xE100, // [18] lit: NVIC_ISER0 low
+    0xE000, // [19] lit: NVIC_ISER0 high
+    0xE200, // [20] lit: NVIC_ISPR0 low
+    0xE000, // [21] lit: NVIC_ISPR0 high
+];
+
+/// Scenario B main — masked-pending, then unmask. Pend IRQ 0 with
+/// ISER=0 (no delivery), a few cycles pass, then enable (trigger).
+///
+/// Identical literal pool to [`MAIN_IRQ_COLD`]; the only difference is
+/// the order of the ISPR and ISER writes (line [4] vs [8]).
+const MAIN_IRQ_MASKED_PEND: [u16; 22] = [
+    0x2401, // [ 0] movs r4, #1
+    0x4D07, // [ 1] ldr  r5, [pc, #28]   — r5 = DWT_CYCCNT_ADDR
+    0x4E07, // [ 2] ldr  r6, [pc, #28]   — r6 = NVIC_ISER0
+    0x4F08, // [ 3] ldr  r7, [pc, #32]   — r7 = NVIC_ISPR0
+    0x603C, // [ 4] str  r4, [r7]        — pend IRQ 0 (latches, NO delivery)
+    0x2400, // [ 5] movs r4, #0
+    0x602C, // [ 6] str  r4, [r5]        — reset CYCCNT
+    0x2401, // [ 7] movs r4, #1
+    0x6034, // [ 8] str  r4, [r6]        — enable IRQ 0 (TRIGGER)
+    0xE7FE, // [ 9] b    .
+    0xBE00, // [10] bkpt #0              — safety
+    0xBF00, // [11] nop
+    0xBF00, // [12] nop
+    0xBF00, // [13] nop
+    0xBF00, // [14] nop
+    0xBF00, // [15] nop
+    0x1004, // [16] lit: DWT_CYCCNT_ADDR low
+    0xE000, // [17] lit: DWT_CYCCNT_ADDR high
+    0xE100, // [18] lit: NVIC_ISER0 low
+    0xE000, // [19] lit: NVIC_ISER0 high
+    0xE200, // [20] lit: NVIC_ISPR0 low
+    0xE000, // [21] lit: NVIC_ISPR0 high
+];
+
+/// Scenario C main — priority preemption. Configure IRQ 0 priority =
+/// 0xC0 (low) and IRQ 1 priority = 0x40 (high), enable both, pend IRQ 0.
+/// The IRQ 0 handler (alt, at IRQ_ALT_HANDLER_OFFSET) then pends IRQ 1
+/// from inside itself, triggering a preemption.
+///
+/// ```text
+///   [ 0] ldr  r4, [pc, #28]   ; r4 = NVIC_IPR0_addr
+///   [ 1] ldr  r5, [pc, #32]   ; r5 = 0x0000_40C0 (IPR priorities)
+///   [ 2] str  r5, [r4]        ; NVIC_IPR0 = priorities
+///   [ 3] ldr  r4, [pc, #32]   ; r4 = NVIC_ISER0
+///   [ 4] movs r5, #3
+///   [ 5] str  r5, [r4]        ; enable IRQ 0 + 1
+///   [ 6] ldr  r4, [pc, #28]   ; r4 = DWT_CYCCNT_ADDR
+///   [ 7] movs r5, #0
+///   [ 8] str  r5, [r4]        ; CYCCNT = 0
+///   [ 9] ldr  r4, [pc, #28]   ; r4 = NVIC_ISPR0
+///   [10] movs r5, #1
+///   [11] str  r5, [r4]        ; pend IRQ 0 — TRIGGER
+///   [12] b    .
+///   [13] bkpt #0              ; safety
+///   [14..15] nop padding
+///   [16..17] lit: NVIC_IPR0_addr
+///   [18..19] lit: IPR priorities = 0x0000_40C0
+///   [20..21] lit: NVIC_ISER0
+///   [22..23] lit: DWT_CYCCNT_ADDR
+///   [24..25] lit: NVIC_ISPR0
+/// ```
+///
+/// Literal math is PC-relative; main moves to `IRQ_MAIN_OFFSET = 0x180`:
+///   hw[0] at 0x180: PC = 0x184, Align = 0x184, target hw[16] = 0x1A0,
+///     offset = 0x1C → imm8 = 7 → 0x4C07.
+///   hw[1] at 0x182: PC = 0x186, Align = 0x184, target hw[18] = 0x1A4,
+///     offset = 0x20 → imm8 = 8 → 0x4D08.
+///   hw[3] at 0x186: PC = 0x18A, Align = 0x188, target hw[20] = 0x1A8,
+///     offset = 0x20 → imm8 = 8 → 0x4C08.
+///   hw[6] at 0x18C: PC = 0x190, Align = 0x190, target hw[22] = 0x1AC,
+///     offset = 0x1C → imm8 = 7 → 0x4C07.
+///   hw[9] at 0x192: PC = 0x196, Align = 0x194, target hw[24] = 0x1B0,
+///     offset = 0x1C → imm8 = 7 → 0x4C07.
+const MAIN_IRQ_PRIORITY_PREEMPT: [u16; 26] = [
+    0x4C07, // [ 0] ldr  r4, [pc, #28]   — r4 = NVIC_IPR0_addr
+    0x4D08, // [ 1] ldr  r5, [pc, #32]   — r5 = 0x0000_40C0
+    0x6025, // [ 2] str  r5, [r4]        — NVIC_IPR0 = priorities
+    0x4C08, // [ 3] ldr  r4, [pc, #32]   — r4 = NVIC_ISER0
+    0x2503, // [ 4] movs r5, #3
+    0x6025, // [ 5] str  r5, [r4]        — enable IRQ 0 + 1
+    0x4C07, // [ 6] ldr  r4, [pc, #28]   — r4 = DWT_CYCCNT_ADDR
+    0x2500, // [ 7] movs r5, #0
+    0x6025, // [ 8] str  r5, [r4]        — CYCCNT = 0
+    0x4C07, // [ 9] ldr  r4, [pc, #28]   — r4 = NVIC_ISPR0
+    0x2501, // [10] movs r5, #1
+    0x6025, // [11] str  r5, [r4]        — pend IRQ 0 (TRIGGER)
+    0xE7FE, // [12] b    .
+    0xBE00, // [13] bkpt #0              — safety
+    0xBF00, // [14] nop
+    0xBF00, // [15] nop
+    0xE400, // [16] lit: NVIC_IPR0_addr low
+    0xE000, // [17] lit: NVIC_IPR0_addr high
+    0x40C0, // [18] lit: priorities low  (bytes [0xC0, 0x40, 0x00, 0x00])
+    0x0000, // [19] lit: priorities high
+    0xE100, // [20] lit: NVIC_ISER0 low
+    0xE000, // [21] lit: NVIC_ISER0 high
+    0x1004, // [22] lit: DWT_CYCCNT_ADDR low
+    0xE000, // [23] lit: DWT_CYCCNT_ADDR high
+    0xE200, // [24] lit: NVIC_ISPR0 low
+    0xE000, // [25] lit: NVIC_ISPR0 high
+];
+
+/// No alternate handler body — scenarios A and B use only the primary
+/// handler at IRQ_HANDLER_OFFSET. Length-0 array keeps `build_image_irq`'s
+/// const-generic instantiation happy.
+const HANDLER_NONE: [u16; 0] = [];
+
+// ---------------------------------------------------------------------------
 // Scenario images (built at compile time from handlers + mains)
 // ---------------------------------------------------------------------------
 
@@ -661,6 +1195,36 @@ const IMAGE_EAGER_FP_SAVE: [u8; ISR_IMAGE_SIZE] =
 
 const IMAGE_TAIL_CHAIN: [u8; ISR_IMAGE_SIZE] =
     build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_BASELINE, MAIN_TAIL_CHAIN);
+
+// Mode-set slices for external-IRQ scenarios. Each maps the relevant
+// external IRQ slot to its handler offset inside the image.
+//
+// Scenarios A + B populate only slot 16 (TIMER0_IRQ_0) and point it at
+// `IRQ_HANDLER_OFFSET` — the shared CYCCNT-mailbox handler.
+const MODESET_IRQ_TIMER0: &[VectorSlot] = &[
+    VectorSlot::new(16, IRQ_HANDLER_OFFSET),
+];
+
+// Scenario C populates slot 16 (TIMER0_IRQ_0 → low-priority alt handler)
+// and slot 17 (TIMER0_IRQ_1 → high-priority primary handler). The slot
+// order encodes the preemption relationship: 17 is numerically later but
+// architecturally higher-priority (0x40 < 0xC0).
+const MODESET_IRQ_PREEMPT: &[VectorSlot] = &[
+    VectorSlot::new(16, IRQ_ALT_HANDLER_OFFSET),
+    VectorSlot::new(17, IRQ_HANDLER_OFFSET),
+];
+
+const IMAGE_IRQ_COLD: [u8; IRQ_IMAGE_SIZE] =
+    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
+        HANDLER_IRQ_CYCCNT, HANDLER_NONE, MAIN_IRQ_COLD, MODESET_IRQ_TIMER0);
+
+const IMAGE_IRQ_MASKED_PEND: [u8; IRQ_IMAGE_SIZE] =
+    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
+        HANDLER_IRQ_CYCCNT, HANDLER_NONE, MAIN_IRQ_MASKED_PEND, MODESET_IRQ_TIMER0);
+
+const IMAGE_IRQ_PRIORITY_PREEMPT: [u8; IRQ_IMAGE_SIZE] =
+    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
+        HANDLER_IRQ_PREEMPT, HANDLER_IRQ_LOW_PRIO, MAIN_IRQ_PRIORITY_PREEMPT, MODESET_IRQ_PREEMPT);
 
 // ---------------------------------------------------------------------------
 // Observables + init_regs per scenario
@@ -756,12 +1320,81 @@ const OBS_TAIL_CHAIN: &[(&str, IsrObservable)] = &[
     ("stacked_pc", IsrObservable::Stacked(StackedReg::Pc)),
 ];
 
+// -- Scenario 5: isr_ext_irq_timer0_cold (Phase 0a / HLD V5 §4.1.5 a) --
+//
+// Main enables IRQ 0 (TIMER0_IRQ_0) in NVIC_ISER then pends it via
+// NVIC_ISPR. The handler reads CYCCNT and halts at BKPT #0. Observables:
+//
+//   * CycleDelta — cold external-IRQ entry is ~12 cycles plus handler
+//     prologue. HW and EMU should agree.
+//   * Stacked PC — the `b .` at main hw[9] = byte 0x152.
+//   * Stacked xPSR — carries IRQ 0's active exception number (16).
+//
+// VTOR points at ISR_IMAGE_BASE; no other preamble required.
+const INIT_EXT_IRQ_COLD: &[(IsrReg, u32)] = &[
+    (IsrReg::Vtor, ISR_IMAGE_BASE),
+];
+const OBS_EXT_IRQ_COLD: &[(&str, IsrObservable)] = &[
+    ("cyccnt_delta", IsrObservable::CycleDelta),
+    ("stacked_pc", IsrObservable::Stacked(StackedReg::Pc)),
+    ("stacked_xpsr", IsrObservable::Stacked(StackedReg::Xpsr)),
+];
+
+// -- Scenario 6: isr_ext_irq_masked_pending (Phase 0a / HLD V5 §4.1.5 b) --
+//
+// Main pends IRQ 0 BEFORE enabling NVIC_ISER. Pending bit latches but
+// no delivery happens. Then main writes NVIC_ISER → unmask triggers
+// delivery. Same observables as scenario 5 since the end state is
+// identical — the point is that delivery is deferred until ISER is set.
+const INIT_EXT_IRQ_MASKED_PEND: &[(IsrReg, u32)] = &[
+    (IsrReg::Vtor, ISR_IMAGE_BASE),
+];
+const OBS_EXT_IRQ_MASKED_PEND: &[(&str, IsrObservable)] = &[
+    ("cyccnt_delta", IsrObservable::CycleDelta),
+    ("stacked_pc", IsrObservable::Stacked(StackedReg::Pc)),
+    ("stacked_xpsr", IsrObservable::Stacked(StackedReg::Xpsr)),
+];
+
+// -- Scenario 7: isr_ext_irq_priority_preempt (Phase 0a / HLD V5 §4.1.5 c) --
+//
+// Two IRQs: IRQ 0 at priority 0xC0 (low), IRQ 1 at priority 0x40 (high).
+// Main pends IRQ 0 → low-priority handler fires. Low-priority handler
+// writes sentinel 0xAAAAAAAA to mailbox, then pends IRQ 1. High-priority
+// IRQ 1 preempts before the low-priority busy-wait completes. IRQ 1
+// handler writes sentinel 0xBBBBBBBB to mailbox and BKPTs.
+//
+// Observable: `mailbox (CycleDelta slot)` — should read 0xBBBB_BBBB iff
+// preemption occurred. If preemption is broken (no dispatch of IRQ 1
+// while IRQ 0's handler is running), the scenario times out with
+// mailbox = 0xAAAA_AAAA.
+const INIT_EXT_IRQ_PRIORITY_PREEMPT: &[(IsrReg, u32)] = &[
+    (IsrReg::Vtor, ISR_IMAGE_BASE),
+];
+const OBS_EXT_IRQ_PRIORITY_PREEMPT: &[(&str, IsrObservable)] = &[
+    // `CycleDelta` reads ISR_MAILBOX_CYCCNT; scenario C reuses the slot
+    // for the sentinel byte. The expected value on both HW and EMU is
+    // 0xBBBB_BBBB (high-priority handler overwrote low's write).
+    ("mailbox_sentinel", IsrObservable::CycleDelta),
+];
+
 // ---------------------------------------------------------------------------
 // Catalogue
 // ---------------------------------------------------------------------------
 
-/// Initial catalogue. 4 scenarios per HLD §Component 2 §"Initial catalogue".
-/// All names have the `isr_` prefix for orchestrator substring-uniqueness.
+/// Initial catalogue + Phase 0a external-IRQ additions.
+///
+/// v1 covered 4 scenarios (PendSV/SysTick/FP). Phase 0a adds three
+/// external-IRQ scenarios (HLD V5 §4.1.5) that validate the new NVIC
+/// dispatch path:
+///
+///   5. `isr_ext_irq_timer0_cold` — cold TIMER0_IRQ_0 assert + entry.
+///   6. `isr_ext_irq_masked_pending` — pend-before-unmask delivery.
+///   7. `isr_ext_irq_priority_preempt` — high-priority IRQ preempts
+///       low-priority handler mid-execution.
+///
+/// All names keep the `isr_` prefix for orchestrator substring-
+/// uniqueness; the `_ext_irq_` mid-segment distinguishes them from the
+/// v1 PendSV/SysTick scenarios.
 pub const SCENARIOS: &[IsrScenario] = &[
     IsrScenario {
         name: "isr_pendsv_cold",
@@ -794,6 +1427,30 @@ pub const SCENARIOS: &[IsrScenario] = &[
         init_regs: INIT_TAIL_CHAIN,
         max_sysclks: 1200,
         observe: OBS_TAIL_CHAIN,
+    },
+    IsrScenario {
+        name: "isr_ext_irq_timer0_cold",
+        image: &IMAGE_IRQ_COLD,
+        entry_offset: IRQ_MAIN_OFFSET,
+        init_regs: INIT_EXT_IRQ_COLD,
+        max_sysclks: 1000,
+        observe: OBS_EXT_IRQ_COLD,
+    },
+    IsrScenario {
+        name: "isr_ext_irq_masked_pending",
+        image: &IMAGE_IRQ_MASKED_PEND,
+        entry_offset: IRQ_MAIN_OFFSET,
+        init_regs: INIT_EXT_IRQ_MASKED_PEND,
+        max_sysclks: 1200,
+        observe: OBS_EXT_IRQ_MASKED_PEND,
+    },
+    IsrScenario {
+        name: "isr_ext_irq_priority_preempt",
+        image: &IMAGE_IRQ_PRIORITY_PREEMPT,
+        entry_offset: IRQ_MAIN_OFFSET,
+        init_regs: INIT_EXT_IRQ_PRIORITY_PREEMPT,
+        max_sysclks: 2000,
+        observe: OBS_EXT_IRQ_PRIORITY_PREEMPT,
     },
 ];
 
@@ -1324,10 +1981,41 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    // (1) Catalogue presence — exactly 4 scenarios, all `isr_*` prefix.
+    /// Per-scenario layout constants. Phase 0a introduces a second
+    /// image size (`IRQ_IMAGE_SIZE`) for external-IRQ scenarios, so
+    /// tests that assert layout invariants pick constants based on the
+    /// scenario's image length.
+    struct Layout {
+        image_size: usize,
+        main_offset: u32,
+        handler_offset: u32,
+        default_handler_offset: u32,
+    }
+
+    fn layout_for(sc: &IsrScenario) -> Layout {
+        if sc.image.len() == IRQ_IMAGE_SIZE {
+            Layout {
+                image_size: IRQ_IMAGE_SIZE,
+                main_offset: IRQ_MAIN_OFFSET,
+                handler_offset: IRQ_HANDLER_OFFSET,
+                default_handler_offset: IRQ_DEFAULT_HANDLER_OFFSET,
+            }
+        } else {
+            Layout {
+                image_size: ISR_IMAGE_SIZE,
+                main_offset: MAIN_OFFSET,
+                handler_offset: HANDLER_OFFSET,
+                default_handler_offset: 0x040,
+            }
+        }
+    }
+
+    // (1) Catalogue presence — v1 + Phase 0a = 7 scenarios, all `isr_*`
+    //     prefix.
     #[test]
     fn test_catalogue_size_and_prefix() {
-        assert_eq!(SCENARIOS.len(), 4, "catalogue must carry 4 scenarios in v1");
+        assert_eq!(SCENARIOS.len(), 7,
+            "catalogue must carry v1 (4) + Phase 0a (3) = 7 scenarios");
         for s in SCENARIOS {
             assert!(
                 s.name.starts_with("isr_"),
@@ -1337,19 +2025,21 @@ mod tests {
         }
     }
 
-    // (2) Image-layout invariants — every image is ISR_IMAGE_SIZE bytes
-    //     and the first word of the vector table = ISR_STACK_TOP (initial
-    //     MSP), word 1 has Thumb LSB, word 14 (PendSV) has Thumb LSB,
-    //     word 15 (SysTick) has Thumb LSB.
+    // (2) Image-layout invariants — per-scenario layout table (baseline
+    //     = ISR_IMAGE_SIZE, extended = IRQ_IMAGE_SIZE). Word 0 is
+    //     ISR_STACK_TOP, word 1 points at main with Thumb LSB, words
+    //     14/15 point at the primary handler, and the default handler
+    //     is `bkpt #1`.
     #[test]
     fn test_image_layout_invariants() {
         for sc in SCENARIOS {
+            let layout = layout_for(sc);
             assert_eq!(
                 sc.image.len(),
-                ISR_IMAGE_SIZE,
+                layout.image_size,
                 "scenario '{}' image must be {} bytes",
                 sc.name,
-                ISR_IMAGE_SIZE,
+                layout.image_size,
             );
 
             // Word 0 — initial MSP.
@@ -1380,9 +2070,10 @@ mod tests {
             );
             assert_eq!(
                 rv & !1,
-                ISR_IMAGE_BASE + MAIN_OFFSET,
-                "scenario '{}' vector[1] must point at main",
+                ISR_IMAGE_BASE + layout.main_offset,
+                "scenario '{}' vector[1] must point at main (offset 0x{:X})",
                 sc.name,
+                layout.main_offset,
             );
 
             // Word 14 — PendSV handler.
@@ -1400,8 +2091,8 @@ mod tests {
             );
             assert_eq!(
                 pv & !1,
-                ISR_IMAGE_BASE + HANDLER_OFFSET,
-                "scenario '{}' vector[14] must point at handler",
+                ISR_IMAGE_BASE + layout.handler_offset,
+                "scenario '{}' vector[14] must point at primary handler",
                 sc.name,
             );
 
@@ -1419,35 +2110,37 @@ mod tests {
                 sc.name,
             );
 
-            // Default handler at offset 0x040 must be bkpt #1 (0xBE01).
+            // Default handler must be bkpt #1 (0xBE01).
+            let dh_off = layout.default_handler_offset as usize;
             let dh = u16::from_le_bytes([
-                sc.image[0x040],
-                sc.image[0x041],
+                sc.image[dh_off],
+                sc.image[dh_off + 1],
             ]);
             assert_eq!(
                 dh, 0xBE01,
-                "scenario '{}' default handler must be bkpt #1",
+                "scenario '{}' default handler at 0x{:03X} must be bkpt #1",
                 sc.name,
+                dh_off,
             );
         }
     }
 
     // (3) Main routine fits within the image. Every scenario must have
-    //     at least MAIN_OFFSET + 4 bytes of content (room for one
-    //     instruction + terminator).
+    //     at least `main_offset + 4` bytes of content and a non-zero
+    //     leading halfword (catches a malformed image where main never
+    //     got written).
     #[test]
     fn test_main_routine_fits_image() {
         for sc in SCENARIOS {
+            let layout = layout_for(sc);
             assert!(
-                sc.image.len() >= (MAIN_OFFSET as usize) + 4,
-                "scenario '{}' image too small to contain main at MAIN_OFFSET",
+                sc.image.len() >= (layout.main_offset as usize) + 4,
+                "scenario '{}' image too small to contain main at main_offset",
                 sc.name,
             );
-            // Main at MAIN_OFFSET must NOT be zero (catches a malformed
-            // image where main never got written).
             let main_hw0 = u16::from_le_bytes([
-                sc.image[MAIN_OFFSET as usize],
-                sc.image[MAIN_OFFSET as usize + 1],
+                sc.image[layout.main_offset as usize],
+                sc.image[layout.main_offset as usize + 1],
             ]);
             assert_ne!(
                 main_hw0, 0,
@@ -1455,6 +2148,93 @@ mod tests {
                 sc.name,
             );
         }
+    }
+
+    // (3a) Phase 0a mode-set invariants — external-IRQ scenarios
+    //      populate vector slot 16 (TIMER0_IRQ_0) and, for scenario C,
+    //      slot 17 (TIMER0_IRQ_1). Assert the entries are non-default
+    //      (i.e. the mode-set override took effect).
+    #[test]
+    fn test_external_irq_scenarios_populate_slot_16() {
+        for sc in SCENARIOS {
+            if !sc.name.starts_with("isr_ext_irq_") {
+                continue;
+            }
+            // Slot 16 at byte offset 64. Must have Thumb LSB set and
+            // point past the default handler (otherwise the mode-set
+            // write didn't land).
+            let vec16 = u32::from_le_bytes([
+                sc.image[64],
+                sc.image[65],
+                sc.image[66],
+                sc.image[67],
+            ]);
+            assert_eq!(vec16 & 1, 1,
+                "scenario '{}' slot 16 missing Thumb LSB", sc.name);
+            let target = vec16 & !1;
+            assert_ne!(
+                target,
+                ISR_IMAGE_BASE + IRQ_DEFAULT_HANDLER_OFFSET,
+                "scenario '{}' slot 16 still points at the default handler — \
+                 mode-set override did not apply",
+                sc.name,
+            );
+            // Target must be inside the image.
+            let image_end = ISR_IMAGE_BASE + IRQ_IMAGE_SIZE as u32;
+            assert!(
+                target >= ISR_IMAGE_BASE && target < image_end,
+                "scenario '{}' slot 16 target 0x{target:08X} is outside image",
+                sc.name,
+            );
+        }
+    }
+
+    // (3b) Scenario C specifically populates both slot 16 and 17 (the
+    //      preemption scenario's two distinct IRQs). Slot 16 points at
+    //      the alternate handler; slot 17 points at the primary.
+    #[test]
+    fn test_priority_preempt_scenario_populates_two_slots() {
+        let sc = SCENARIOS
+            .iter()
+            .find(|s| s.name == "isr_ext_irq_priority_preempt")
+            .expect("priority_preempt scenario must be in catalogue");
+        let vec16 = u32::from_le_bytes([
+            sc.image[64],  sc.image[65],  sc.image[66],  sc.image[67],
+        ]);
+        let vec17 = u32::from_le_bytes([
+            sc.image[68],  sc.image[69],  sc.image[70],  sc.image[71],
+        ]);
+        assert_eq!(vec16 & !1,
+            ISR_IMAGE_BASE + IRQ_ALT_HANDLER_OFFSET,
+            "slot 16 must point at alt handler (low-priority IRQ 0)");
+        assert_eq!(vec17 & !1,
+            ISR_IMAGE_BASE + IRQ_HANDLER_OFFSET,
+            "slot 17 must point at primary handler (high-priority IRQ 1)");
+    }
+
+    // (3c) `build_image_modeset` with an empty slice must produce
+    //      an image bit-identical to `build_image` — the API migration
+    //      contract.
+    #[test]
+    fn test_build_image_modeset_empty_slice_matches_build_image() {
+        const HW: [u16; 2] = [0xBE00, 0xBE00];
+        let a = build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW);
+        let b = build_image_modeset(ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW, &[]);
+        assert_eq!(a, b, "empty mode-set must behave identically to build_image");
+    }
+
+    // (3d) DEFAULT_MODESET (PendSV + SysTick at HANDLER_OFFSET) must
+    //      produce an image bit-identical to `build_image` — callers
+    //      migrating from `build_image` to `build_image_modeset` with
+    //      the default set shouldn't change behaviour.
+    #[test]
+    fn test_build_image_modeset_default_matches_build_image() {
+        const HW: [u16; 2] = [0xBE00, 0xBE00];
+        let a = build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW);
+        let b = build_image_modeset(
+            ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW, DEFAULT_MODESET,
+        );
+        assert_eq!(a, b, "DEFAULT_MODESET must behave identically to build_image");
     }
 
     // (4) Substring-uniqueness within the catalogue. Orchestrator fires
@@ -1546,14 +2326,17 @@ mod tests {
         }
     }
 
-    // (9) Handler at offset 0x044 must end in bkpt #0 somewhere in the
-    //     first 12 halfwords — the runner relies on the handler halting.
+    // (9) Handler must end in bkpt #0 somewhere in the first 12
+    //     halfwords — the runner relies on the handler halting. Layout-
+    //     aware: baseline scenarios check 0x044, external-IRQ scenarios
+    //     check IRQ_HANDLER_OFFSET.
     #[test]
     fn test_handler_contains_bkpt0() {
         for sc in SCENARIOS {
+            let layout = layout_for(sc);
             let mut saw_bkpt0 = false;
             for hw in 0..12 {
-                let off = (HANDLER_OFFSET as usize) + hw * 2;
+                let off = (layout.handler_offset as usize) + hw * 2;
                 let half = u16::from_le_bytes([sc.image[off], sc.image[off + 1]]);
                 if half == 0xBE00 {
                     saw_bkpt0 = true;
@@ -1562,8 +2345,9 @@ mod tests {
             }
             assert!(
                 saw_bkpt0,
-                "scenario '{}' handler body must contain bkpt #0",
+                "scenario '{}' handler body at 0x{:03X} must contain bkpt #0",
                 sc.name,
+                layout.handler_offset,
             );
         }
     }
@@ -1574,9 +2358,10 @@ mod tests {
     #[test]
     fn test_main_contains_busy_wait() {
         for sc in SCENARIOS {
+            let layout = layout_for(sc);
             let mut saw_busy_wait = false;
             for hw in 0..16 {
-                let off = (MAIN_OFFSET as usize) + hw * 2;
+                let off = (layout.main_offset as usize) + hw * 2;
                 let half = u16::from_le_bytes([sc.image[off], sc.image[off + 1]]);
                 if half == 0xE7FE {
                     saw_busy_wait = true;
@@ -1644,27 +2429,25 @@ mod tests {
         out
     }
 
-    /// Every PC-relative LDR in the handler body (0x044..0x100) must
-    /// target a word inside the handler's literal pool region, not
-    /// anywhere else. We define the handler literal pool region as the
-    /// tail of the handler body past the last BKPT padding halfword —
-    /// concretely, `[0x050..0x100]` for the 10-halfword baseline
-    /// handler and `[0x054..0x100]` for the 14-halfword observe
-    /// handler. A stricter invariant would enumerate every `(hw, slot)`
-    /// pair, but the catch we care about is "off-by-one-imm8 caused an
-    /// LDR to resolve to the wrong literal"; bound-based checking is
-    /// enough because the region beyond the pool is zero-padded and
-    /// would never satisfy the expected-literal check in (12).
+    /// Every PC-relative LDR in the handler body must target a
+    /// word-aligned address inside the handler body (before the main
+    /// routine). Layout-aware: baseline scenarios check [0x044..0x100),
+    /// external-IRQ scenarios check [IRQ_HANDLER_OFFSET..IRQ_MAIN_OFFSET).
     #[test]
     fn test_handler_literal_loads_target_in_pool() {
         for sc in SCENARIOS {
+            let layout = layout_for(sc);
+            // External-IRQ scenarios place a second handler body at
+            // IRQ_ALT_HANDLER_OFFSET = 0x100 which also emits LDR
+            // literals. Walk through IRQ_MAIN_OFFSET so both handler
+            // bodies are covered; they share the same pool structure.
+            let end = layout.main_offset as usize;
             let loads = collect_ldr_literal_loads(
                 sc.image,
-                HANDLER_OFFSET as usize,
-                MAIN_OFFSET as usize,
+                layout.handler_offset as usize,
+                end,
             );
             for (instr_off, rd, target, word) in loads {
-                // Target must be word-aligned.
                 assert_eq!(
                     target & 3,
                     0,
@@ -1672,43 +2455,31 @@ mod tests {
                      computes non-word-aligned target 0x{target:03X}",
                     sc.name,
                 );
-                // Target must be inside handler body, past the handler
-                // instructions. A handler body cannot load a literal
-                // from the main routine (different PC base) without
-                // being blatantly wrong.
                 assert!(
-                    target >= HANDLER_OFFSET as usize && target < MAIN_OFFSET as usize,
+                    target >= layout.handler_offset as usize && target < end,
                     "scenario '{}' handler LDR at 0x{instr_off:03X} (r{rd}) \
                      resolves to 0x{target:03X} (word 0x{word:08X}) \
-                     outside handler literal pool [0x{:03X}..0x{:03X})",
+                     outside handler pool [0x{:03X}..0x{:03X})",
                     sc.name,
-                    HANDLER_OFFSET,
-                    MAIN_OFFSET,
+                    layout.handler_offset,
+                    end,
                 );
             }
         }
     }
 
-    /// Every PC-relative LDR in the main body (0x100..image_end) must
-    /// resolve to a word in the main routine's literal pool. Main
-    /// routines in v1 place their pool at hw[16..22] (byte 0x120..0x12C)
-    /// — the three scenario literals are DWT_CYCCNT_ADDR, SCB_ICSR_ADDR,
-    /// and ICSR_PENDSVSET.
+    /// Every PC-relative LDR in the main body of a **baseline** scenario
+    /// must resolve to one of the three v1 literals (DWT_CYCCNT_ADDR,
+    /// SCB_ICSR_ADDR, ICSR_PENDSVSET). This is the specific regression
+    /// check for the "0x4F04 vs 0x4F05" bug — an off-by-one imm8 in
+    /// MAIN_LAZY_FP[9] would load SCB_ICSR_ADDR where ICSR_PENDSVSET
+    /// was expected, silently writing ICSR with the wrong value.
     ///
-    /// This test is the specific regression check for the "0x4F04 vs
-    /// 0x4F05" bug: an off-by-one imm8 in MAIN_LAZY_FP[9] would resolve
-    /// to 0x124 (SCB_ICSR_ADDR) instead of 0x128 (ICSR_PENDSVSET),
-    /// silently writing ICSR with the wrong value and firing NMI
-    /// instead of PendSV. Both targets are inside the literal pool
-    /// bounds, so bounds-only checking is not enough — this test uses
-    /// the per-register expected literal to pin the exact word.
+    /// External-IRQ scenarios use a different literal pool layout
+    /// (NVIC_ISER / NVIC_ISPR / NVIC_IPR / DWT_CYCCNT_ADDR) and are
+    /// validated by [`test_ext_irq_main_literals_resolve_inside_pool`].
     #[test]
     fn test_main_literal_loads_match_expected() {
-        // Per-register expected-literal map, shared by all v1 main
-        // routines (they all reuse the same three literals).
-        //
-        // We match on the stored word, not on the slot index, because
-        // the layout constants are scenario-wide.
         fn expected_for_reg(rd: u8) -> u32 {
             match rd {
                 5 => 0xE000_1004, // DWT_CYCCNT_ADDR
@@ -1721,6 +2492,11 @@ mod tests {
         }
 
         for sc in SCENARIOS {
+            // Scoped to baseline scenarios only; external-IRQ scenarios
+            // have a different literal set.
+            if sc.image.len() != ISR_IMAGE_SIZE {
+                continue;
+            }
             let loads = collect_ldr_literal_loads(
                 sc.image,
                 MAIN_OFFSET as usize,
@@ -1728,12 +2504,10 @@ mod tests {
             );
             assert!(
                 !loads.is_empty(),
-                "scenario '{}' main routine has no LDR literal loads — \
-                 literal pool walk is dead code",
+                "scenario '{}' main routine has no LDR literal loads",
                 sc.name,
             );
             for (instr_off, rd, target, word) in loads {
-                // Target must be word-aligned.
                 assert_eq!(
                     target & 3,
                     0,
@@ -1741,9 +2515,6 @@ mod tests {
                      computes non-word-aligned target 0x{target:03X}",
                     sc.name,
                 );
-                // Target must lie inside the main routine's literal
-                // pool, which starts after the final non-literal
-                // halfword. Pool byte range: [0x120..0x12C].
                 assert!(
                     (0x120..0x12C).contains(&target),
                     "scenario '{}' main LDR at 0x{instr_off:03X} (r{rd}) \
@@ -1751,15 +2522,71 @@ mod tests {
                      [0x120..0x12C)",
                     sc.name,
                 );
-                // The loaded word must match the per-register expected
-                // literal. This catches the hw[9] 0x4F04 bug: imm8=4
-                // would give target 0x124 = SCB_ICSR_ADDR, but r7's
-                // expected literal is ICSR_PENDSVSET = 0x1000_0000.
                 let expected = expected_for_reg(rd);
                 assert_eq!(
                     word, expected,
                     "scenario '{}' main LDR at 0x{instr_off:03X} (r{rd}) \
                      loads 0x{word:08X}, expected 0x{expected:08X}",
+                    sc.name,
+                );
+            }
+        }
+    }
+
+    /// External-IRQ scenarios: every PC-relative LDR in the main body
+    /// must resolve to a word-aligned address inside the image and
+    /// inside the main routine's literal pool window (past the
+    /// branch-to-self). Looser than the baseline check because the
+    /// external-IRQ scenarios use varying literal counts (3 for A/B,
+    /// 5 for C); the strong form pins each load to a known NVIC MMIO
+    /// address or to DWT_CYCCNT_ADDR.
+    #[test]
+    fn test_ext_irq_main_literals_resolve_inside_pool() {
+        // Accept the five NVIC + CYCCNT addresses the external-IRQ
+        // scenarios use. Any other word indicates an off-by-one imm8.
+        const EXPECTED_WORDS: &[u32] = &[
+            0xE000_1004, // DWT_CYCCNT_ADDR
+            0xE000_E100, // NVIC_ISER0
+            0xE000_E200, // NVIC_ISPR0
+            0xE000_E400, // NVIC_IPR0 addr
+            0x0000_40C0, // packed priorities: IRQ0=0xC0, IRQ1=0x40
+        ];
+
+        for sc in SCENARIOS {
+            if sc.image.len() != IRQ_IMAGE_SIZE {
+                continue;
+            }
+            let loads = collect_ldr_literal_loads(
+                sc.image,
+                IRQ_MAIN_OFFSET as usize,
+                IRQ_IMAGE_SIZE,
+            );
+            assert!(
+                !loads.is_empty(),
+                "scenario '{}' ext-IRQ main has no LDR literal loads",
+                sc.name,
+            );
+            for (instr_off, rd, target, word) in loads {
+                assert_eq!(
+                    target & 3,
+                    0,
+                    "scenario '{}' main LDR at 0x{instr_off:03X} (r{rd}) \
+                     computes non-word-aligned target 0x{target:03X}",
+                    sc.name,
+                );
+                // Target inside the image — specifically in the main-
+                // routine region (above IRQ_MAIN_OFFSET).
+                assert!(
+                    target >= IRQ_MAIN_OFFSET as usize && target < IRQ_IMAGE_SIZE,
+                    "scenario '{}' main LDR at 0x{instr_off:03X} (r{rd}) \
+                     resolves to 0x{target:03X} outside main pool window",
+                    sc.name,
+                );
+                // Word must be one of the expected NVIC/CYCCNT literals.
+                assert!(
+                    EXPECTED_WORDS.contains(&word),
+                    "scenario '{}' main LDR at 0x{instr_off:03X} (r{rd}) \
+                     loads unexpected word 0x{word:08X}",
                     sc.name,
                 );
             }

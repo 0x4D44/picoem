@@ -32,6 +32,22 @@ const ICSR_PENDSVCLR:             u32 = 1 << 27;
 pub(crate) const ICSR_PENDSTSET:  u32 = 1 << 26;
 const ICSR_PENDSTCLR:             u32 = 1 << 25;
 
+/// M33 implements 3 bits of priority — bits [7:5] of each priority
+/// byte. 8 architectural levels; the remaining bits are RES0 and read
+/// back as zero. Used for both system-handler priority bytes (SHPR) and
+/// external-IRQ priority bytes (IPR).
+pub(crate) const NVIC_PRIORITY_MASK: u8 = 0xE0;
+
+/// Number of 32-bit IRQ-bit words needed to cover 52 IRQ inputs.
+/// `ceil(52/32) = 2` — matches RP2350 datasheet §3.2 which reserves
+/// NVIC_ISER0..1 / ICER0..1 / ISPR0..1 / ICPR0..1 / IABR0..1.
+pub(crate) const NVIC_BIT_WORDS: usize = 2;
+
+/// Number of 32-bit IPR words needed to cover 52 × 8-bit priority
+/// lanes. `ceil(52/4) = 13` — NVIC_IPR0..12. The high lanes of IPR12
+/// are unused (IRQs 52..55 do not exist).
+pub(crate) const NVIC_IPR_WORDS: usize = 13;
+
 /// Per-core Private Peripheral Bus state (NVIC, SCB, SysTick stubs).
 /// Phase 3: slim — only what the bootrom needs.
 pub struct Ppb {
@@ -117,6 +133,36 @@ pub struct Ppb {
     /// Delta since the previous tick is computed as
     /// `core.cycles - last_systick_cycles` and then subtracted from CVR.
     pub last_systick_cycles: u64,
+
+    // NVIC — Nested Vectored Interrupt Controller, per-core on M33
+    // (ARMv8-M §B3.4). 52 input lines (RP2350 datasheet §3.2).
+    //
+    // Each of the bitmap registers is a 2×u32 word-array covering IRQs
+    // [0..32] in word 0 and [32..52] in word 1. Bits 52..63 of word 1
+    // are RES0 — writes ignored, reads return 0.
+    //
+    // IPR is 13×u32 covering 52 × 8-bit priority bytes (4 bytes per
+    // word). M33 implements bits [7:5] of each byte; [4:0] are RES0.
+    //
+    // IABR (active-bit register) tracks which external IRQ's handler is
+    // currently executing. Set by exception entry, cleared on return.
+    // Managed alongside the ICSR/IPSR active state on the core.
+    /// NVIC_ISER0..1 — interrupt set-enable.
+    /// Writes are W1S; ICER writes clear the same state. Read returns
+    /// the unified enable mask.
+    pub nvic_iser: [u32; NVIC_BIT_WORDS],
+    /// NVIC_ISPR0..1 — interrupt set-pending. All 52 bits are writable
+    /// via software; peripherals drive only 0..=45. `NVIC_ISPR` accepts
+    /// software-writes to 46..=51 and they latch (RP2350 datasheet §3.2
+    /// note following Table 95).
+    pub nvic_ispr: [u32; NVIC_BIT_WORDS],
+    /// NVIC_IABR0..1 — interrupt active. Bit N set iff external IRQ N's
+    /// handler is currently the active exception. Exception entry sets
+    /// the bit; exit clears it.
+    pub nvic_iabr: [u32; NVIC_BIT_WORDS],
+    /// NVIC_IPR0..12 — priority bytes, packed 4 per word. Each byte is
+    /// masked to [`NVIC_PRIORITY_MASK`] (bits [7:5], 8 levels).
+    pub nvic_ipr: [u32; NVIC_IPR_WORDS],
 }
 
 impl Default for Ppb {
@@ -152,6 +198,10 @@ impl Default for Ppb {
             syst_rvr: 0,
             syst_cvr: 0,
             last_systick_cycles: 0,
+            nvic_iser: [0; NVIC_BIT_WORDS],
+            nvic_ispr: [0; NVIC_BIT_WORDS],
+            nvic_iabr: [0; NVIC_BIT_WORDS],
+            nvic_ipr: [0; NVIC_IPR_WORDS],
         }
     }
 }
@@ -197,7 +247,27 @@ impl Ppb {
             // SYST_CALIB — RP2350 doesn't expose calibration; return 0.
             0xE01C => 0,
 
-            // NVIC (stub)
+            // NVIC — 52 IRQ lines, per-core banks.
+            //
+            // Address map (ARMv8-M §B3.4.x):
+            //   NVIC_ISER0..1 : 0xE100, 0xE104  — read enable mask
+            //   NVIC_ICER0..1 : 0xE180, 0xE184  — read enable mask (mirror)
+            //   NVIC_ISPR0..1 : 0xE200, 0xE204  — read pending mask
+            //   NVIC_ICPR0..1 : 0xE280, 0xE284  — read pending mask (mirror)
+            //   NVIC_IABR0..1 : 0xE300, 0xE304  — read active mask
+            //   NVIC_IPR0..12 : 0xE400..0xE430  — priority bytes
+            // Any other address in 0xE100..=0xE4FF (reserved / non-existent
+            // registers) reads as 0.
+            0xE100 | 0xE180 => self.nvic_iser[0],
+            0xE104 | 0xE184 => self.nvic_iser[1],
+            0xE200 | 0xE280 => self.nvic_ispr[0],
+            0xE204 | 0xE284 => self.nvic_ispr[1],
+            0xE300 => self.nvic_iabr[0],
+            0xE304 => self.nvic_iabr[1],
+            0xE400..=0xE430 if (addr & 0x3) == 0 => {
+                let idx = (((addr & 0xFFFF) - 0xE400) / 4) as usize;
+                if idx < NVIC_IPR_WORDS { self.nvic_ipr[idx] } else { 0 }
+            }
             0xE100..=0xE4FF => 0,
 
             // DWT_CTRL — CYCCNTENA + reserved bits.
@@ -329,8 +399,47 @@ impl Ppb {
             // SYST_CALIB — read-only, writes ignored.
             0xE01C => {}
 
-            // NVIC (stub — accept and ignore)
-            0xE100..=0xE4FF => {}
+            // NVIC writes (ARMv8-M §B3.4.x).
+            //
+            // All four bitmap pairs are W1-semantic: writing a 1-bit
+            // sets/clears the corresponding bit; writing 0 has no effect.
+            // Bits above the implemented IRQ count are ignored by the
+            // `& valid_mask` restriction (word 1 covers IRQs 32..52 so
+            // bits 20..32 are RES0).
+            //
+            // ISPR is special: ALL 52 bits accept software-driven sets
+            // (datasheet §3.2 note following Table 95). Peripherals only
+            // drive 0..=45, but the software-self-pend path works for
+            // 46..=51 as well.
+            0xE100 => self.nvic_iser[0] |= val,
+            0xE104 => self.nvic_iser[1] |= val & nvic_word1_valid_mask(),
+            0xE180 => self.nvic_iser[0] &= !val,
+            0xE184 => self.nvic_iser[1] &= !val,
+            0xE200 => self.nvic_ispr[0] |= val,
+            0xE204 => self.nvic_ispr[1] |= val & nvic_word1_valid_mask(),
+            0xE280 => self.nvic_ispr[0] &= !val,
+            0xE284 => self.nvic_ispr[1] &= !val,
+            // IABR is read-only; writes are ignored.
+            0xE300 | 0xE304 => {}
+            // NVIC_IPR0..12 — 4×u8 lanes, each masked to bits [7:5].
+            // Misaligned or out-of-range IPR writes fall through to the
+            // reserved-region silent-ignore arm below.
+            addr if (0xE400..=0xE430).contains(&addr) && (addr & 0x3) == 0 => {
+                let idx = (((addr & 0xFFFF) - 0xE400) / 4) as usize;
+                if idx < NVIC_IPR_WORDS {
+                    // Mask every lane to 0xE0 — M33 implements 3 priority
+                    // bits per byte (bits [4:0] are RES0).
+                    let lane_mask = u32::from_le_bytes([
+                        NVIC_PRIORITY_MASK,
+                        NVIC_PRIORITY_MASK,
+                        NVIC_PRIORITY_MASK,
+                        NVIC_PRIORITY_MASK,
+                    ]);
+                    self.nvic_ipr[idx] = val & lane_mask;
+                }
+            }
+            // Reserved / non-existent NVIC registers — writes ignored.
+            addr if (0xE100..=0xE4FF).contains(&addr) => {}
 
             // DWT_CTRL — only CYCCNTENA (bit 0) is modelled; other bits
             // are stored for firmware round-trip.
@@ -459,21 +568,134 @@ impl Ppb {
         }
     }
 
-    /// Get the priority of a system exception (4-15) from SHPR.
-    /// Returns i16: HardFault=-1, others from shpr[]. Only bits [7:5] used.
+    /// Get the priority of a system exception (4-15) from SHPR, or an
+    /// external IRQ (≥16) from NVIC_IPR.
+    ///
+    /// Returns `i16`:
+    /// * Reset / NMI / HardFault have fixed architectural priorities.
+    /// * System exceptions 4..=15 read `SHPR[exc_num-4] & 0xE0`.
+    /// * External IRQs (exc_num ≥ 16) read the corresponding IPR byte.
+    ///   `exc_num - 16` is the NVIC input line; `lane = (exc_num-16) & 3`
+    ///   picks the byte within the word and the word is `ipr[(exc_num-16)/4]`.
+    ///   Bits [7:5] of the byte carry the priority (M33 implements 3 bits).
+    ///
+    /// IRQs beyond the implemented range return 0 (highest configurable
+    /// priority) — matches silicon behaviour for unconfigured lines.
     pub fn exception_priority(&self, exc_num: u16) -> i16 {
         match exc_num {
             1 => -3,  // Reset
             2 => -2,  // NMI
             3 => -1,  // HardFault (fixed)
-            4..=15 => (self.shpr[(exc_num - 4) as usize] & 0xE0) as i16,
-            _ => 0,   // External IRQs default to 0 (Phase 5 will add NVIC_IPR)
+            4..=15 => (self.shpr[(exc_num - 4) as usize] & NVIC_PRIORITY_MASK) as i16,
+            _ => {
+                // External IRQ: IRQ_NUM = exc_num - 16. NVIC_IPR packs 4
+                // bytes per word — word = irq / 4, lane = irq % 4.
+                let irq = exc_num.wrapping_sub(16) as usize;
+                let word_idx = irq / 4;
+                let lane = irq % 4;
+                if word_idx < NVIC_IPR_WORDS {
+                    let byte = ((self.nvic_ipr[word_idx] >> (lane * 8)) & 0xFF) as u8;
+                    (byte & NVIC_PRIORITY_MASK) as i16
+                } else {
+                    0
+                }
+            }
         }
     }
 
-    /// Clear the active bit for an exception. Phase 3 stub: just clear IPSR-related state in ICSR.
-    pub fn clear_active(&mut self, _exc_num: u16) {
-        // Phase 3: no NVIC active tracking. ICSR.VECTACTIVE handled by core IPSR.
+    /// Clear the active bit for an exception. External IRQs (≥16) drop
+    /// their NVIC_IABR bit here; system exceptions have no persistent
+    /// active tracking outside ICSR/IPSR.
+    pub fn clear_active(&mut self, exc_num: u16) {
+        if exc_num >= 16 {
+            let irq = (exc_num - 16) as usize;
+            let word_idx = irq / 32;
+            let bit = irq % 32;
+            if word_idx < NVIC_BIT_WORDS {
+                self.nvic_iabr[word_idx] &= !(1u32 << bit);
+            }
+        }
+    }
+
+    // --- NVIC helpers ----------------------------------------------------
+
+    /// Highest-priority enabled-and-pending NVIC IRQ, as an external
+    /// exception number (16..=67). Returns `None` if no enabled IRQ is
+    /// pending.
+    ///
+    /// Ties are broken by IRQ number — lower IRQ wins. Called by the
+    /// M33 step path before instruction fetch; the caller then compares
+    /// the returned exception's priority against `execution_priority`
+    /// to decide whether to preempt.
+    pub(crate) fn highest_priority_pending_irq(&self) -> Option<u16> {
+        let mut best: Option<(i16, u16)> = None;
+        for word_idx in 0..NVIC_BIT_WORDS {
+            let ready = self.nvic_iser[word_idx] & self.nvic_ispr[word_idx];
+            if ready == 0 { continue; }
+            let mut remaining = ready;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as u16;
+                let irq = (word_idx as u16) * 32 + bit;
+                let exc_num = irq + 16;
+                let prio = self.exception_priority(exc_num);
+                let replace = match best {
+                    None => true,
+                    Some((b_prio, b_exc)) => prio < b_prio
+                        || (prio == b_prio && exc_num < b_exc),
+                };
+                if replace {
+                    best = Some((prio, exc_num));
+                }
+                remaining &= remaining - 1;
+            }
+        }
+        best.map(|(_, exc)| exc)
+    }
+
+    /// Mark an external IRQ as pending in NVIC_ISPR. No-op if the IRQ
+    /// exceeds the implemented count.
+    pub(crate) fn set_irq_pending(&mut self, irq: u32) {
+        if irq < crate::irq::IRQ_COUNT {
+            let word = (irq / 32) as usize;
+            let bit = irq % 32;
+            self.nvic_ispr[word] |= 1u32 << bit;
+        }
+    }
+
+    /// Clear an external IRQ's pending bit. Phase 1 drain-loop callers
+    /// use this when a level source stops asserting; the step-path
+    /// dispatch in `try_take_any_pending_exception` writes `nvic_ispr`
+    /// directly to keep the hot path inlined.
+    #[allow(dead_code)]
+    pub(crate) fn clear_irq_pending(&mut self, irq: u32) {
+        if irq < crate::irq::IRQ_COUNT {
+            let word = (irq / 32) as usize;
+            let bit = irq % 32;
+            self.nvic_ispr[word] &= !(1u32 << bit);
+        }
+    }
+
+    /// Set an external IRQ's active bit. Called by exception entry.
+    pub(crate) fn set_irq_active(&mut self, irq: u32) {
+        if irq < crate::irq::IRQ_COUNT {
+            let word = (irq / 32) as usize;
+            let bit = irq % 32;
+            self.nvic_iabr[word] |= 1u32 << bit;
+        }
+    }
+
+    /// True iff the IRQ is enabled in NVIC_ISER. Surfaces the primitive
+    /// the drain loop uses to decide level-reassert; `highest_priority_pending_irq`
+    /// folds the same check into its bitmask AND, so the step-path hot
+    /// loop never calls this directly.
+    #[allow(dead_code)]
+    pub(crate) fn irq_enabled(&self, irq: u32) -> bool {
+        if irq >= crate::irq::IRQ_COUNT {
+            return false;
+        }
+        let word = (irq / 32) as usize;
+        let bit = irq % 32;
+        (self.nvic_iser[word] & (1u32 << bit)) != 0
     }
 
     // ----------------------------------------------------------------
@@ -567,6 +789,17 @@ impl Ppb {
     pub fn pend_systick(&mut self) {
         self.icsr |= ICSR_PENDSTSET;
     }
+}
+
+/// Bits 20..32 of NVIC_ISER1 / ICER1 / ICPR1 correspond to IRQ numbers
+/// 52..63 which are not implemented on RP2350. Restrict software writes
+/// so those bits never latch. `ISPR1` bits 32..51 (IRQs 46..51) are
+/// valid software-self-pend targets per datasheet §3.2 note.
+#[inline]
+pub(crate) fn nvic_word1_valid_mask() -> u32 {
+    // IRQs 32..52 → bits 0..20 of word 1.
+    const VALID_BITS: u32 = crate::irq::IRQ_COUNT - 32;
+    (1u32 << VALID_BITS) - 1
 }
 
 #[cfg(test)]
@@ -684,11 +917,243 @@ mod tests {
         assert_eq!(ppb.exception_priority(4), 0xA0_u8 as i16);
     }
 
+    // -------------------------------------------------------------------
+    // NVIC register banks (Phase 0a)
+    //
+    // Per HLD V5 §4.1.2 and §8: per-core ISER / ICER / ISPR / ICPR /
+    // IABR / IPR covering 52 IRQs. All 52 bits writable in ISPR (software
+    // self-pend on 46..=51 per datasheet §3.2 note).
+    // -------------------------------------------------------------------
+
+    const NVIC_ISER0: u32 = 0xE000_E100;
+    const NVIC_ISER1: u32 = 0xE000_E104;
+    const NVIC_ICER0: u32 = 0xE000_E180;
+    const NVIC_ICER1: u32 = 0xE000_E184;
+    const NVIC_ISPR0: u32 = 0xE000_E200;
+    const NVIC_ISPR1: u32 = 0xE000_E204;
+    const NVIC_ICPR0: u32 = 0xE000_E280;
+    const NVIC_ICPR1: u32 = 0xE000_E284;
+    const NVIC_IABR0: u32 = 0xE000_E300;
+    const NVIC_IPR0:  u32 = 0xE000_E400;
+
     #[test]
-    fn test_nvic_stub_returns_zero() {
+    fn test_nvic_word1_icer_and_icpr_work_on_high_irqs() {
+        // IRQs 32..=51 live in word 1. ICER1 and ICPR1 are the high-half
+        // clear paths — exercise the same round-trip shape as the
+        // word-0 tests.
         let mut ppb = Ppb::default();
-        // NVIC_ISER0 at 0xE000E100
-        assert_eq!(ppb.read32(0xE000_E100), 0);
+        ppb.write32(NVIC_ISER1, 0x0000_000F); // enable IRQs 32..35
+        ppb.write32(NVIC_ICER1, 0x0000_0005); // clear bits 32 and 34
+        assert_eq!(ppb.read32(NVIC_ISER1), 0x0000_000A,
+            "ICER1 must clear matching bits in the IRQ>=32 half");
+
+        ppb.write32(NVIC_ISPR1, 0x0000_0007); // pend 32..34
+        ppb.write32(NVIC_ICPR1, 0x0000_0002); // clear IRQ 33
+        assert_eq!(ppb.read32(NVIC_ISPR1), 0x0000_0005,
+            "ICPR1 must clear matching bits in the IRQ>=32 half");
+    }
+
+    #[test]
+    fn test_nvic_iser_write_read_round_trip() {
+        let mut ppb = Ppb::default();
+        // Writing ISER sets enable bits; reading returns the union.
+        ppb.write32(NVIC_ISER0, 0x0000_0001); // enable IRQ 0
+        ppb.write32(NVIC_ISER0, 0x0000_0080); // enable IRQ 7
+        assert_eq!(ppb.read32(NVIC_ISER0), 0x0000_0081,
+            "ISER writes OR into the mask");
+    }
+
+    #[test]
+    fn test_nvic_iser_icer_alias_for_read() {
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_ISER0, 0xAAAA_AAAA);
+        // ICER0 read returns the same enable mask (ARMv8-M: ICER and
+        // ISER are mirrors for reads).
+        assert_eq!(ppb.read32(NVIC_ICER0), 0xAAAA_AAAA);
+    }
+
+    #[test]
+    fn test_nvic_icer_clears_enable_bits() {
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_ISER0, 0xFFFF_FFFF);
+        ppb.write32(NVIC_ICER0, 0x0000_0FF0); // clear bits 4..11
+        assert_eq!(ppb.read32(NVIC_ISER0), 0xFFFF_F00F);
+    }
+
+    #[test]
+    fn test_nvic_ispr_write_read_round_trip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_ISPR0, 0x0000_0004); // pend IRQ 2
+        assert_eq!(ppb.read32(NVIC_ISPR0), 0x0000_0004);
+    }
+
+    #[test]
+    fn test_nvic_ispr_icpr_alias_for_read() {
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_ISPR0, 0xCAFE_C0DE);
+        assert_eq!(ppb.read32(NVIC_ICPR0), 0xCAFE_C0DE);
+    }
+
+    #[test]
+    fn test_nvic_icpr_clears_pending_bits() {
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_ISPR0, 0xFFFF_FFFF);
+        ppb.write32(NVIC_ICPR0, 0x000F_0000);
+        assert_eq!(ppb.read32(NVIC_ISPR0), 0xFFF0_FFFF);
+    }
+
+    #[test]
+    fn test_nvic_iabr_read_only_mirrors_active() {
+        // IABR writes are ignored; reads reflect the active bits which
+        // are managed by `set_irq_active`. This test exercises the
+        // write-ignore path and the read path separately.
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_IABR0, 0xFFFF_FFFF);
+        assert_eq!(ppb.read32(NVIC_IABR0), 0,
+            "IABR is read-only; write must be ignored");
+
+        ppb.set_irq_active(5);
+        assert_eq!(ppb.read32(NVIC_IABR0), 1 << 5,
+            "IABR must reflect `set_irq_active` state");
+    }
+
+    #[test]
+    fn test_nvic_ipr_priority_byte_masking() {
+        let mut ppb = Ppb::default();
+        // Write IPR0 with four byte lanes: 0xFF, 0x80, 0x40, 0x20.
+        // M33 priority mask is 0xE0 → lanes become 0xE0, 0x80, 0x40, 0x20.
+        let val = u32::from_le_bytes([0xFF, 0x80, 0x40, 0x20]);
+        ppb.write32(NVIC_IPR0, val);
+        let read = ppb.read32(NVIC_IPR0);
+        assert_eq!(
+            read,
+            u32::from_le_bytes([0xE0, 0x80, 0x40, 0x20]),
+            "IPR bytes must be masked to 0xE0"
+        );
+    }
+
+    #[test]
+    fn test_nvic_ipr_lane_assignment_matches_exception_priority() {
+        // NVIC_IPR0 byte-lane 0 corresponds to IRQ 0 → exception 16.
+        // Assigning 0x80 to IRQ 3 should round-trip via exception_priority(19).
+        let mut ppb = Ppb::default();
+        let val = u32::from_le_bytes([0x00, 0x00, 0x00, 0x80]);
+        ppb.write32(NVIC_IPR0, val);
+        assert_eq!(
+            ppb.exception_priority(16 + 3),
+            0x80,
+            "IRQ 3 priority (exception 19) must read 0x80"
+        );
+    }
+
+    #[test]
+    fn test_nvic_ispr_self_pend_bit_48_latches() {
+        // Datasheet §3.2 note following Table 95: software may ISPR-pend
+        // IRQs 46..=51 even though no peripheral drives them. Bit 48 in
+        // ISPR1 is IRQ 48 (32 + 16).
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_ISPR1, 1u32 << (48 - 32));
+        assert_eq!(
+            ppb.read32(NVIC_ISPR1) & (1u32 << (48 - 32)),
+            1u32 << (48 - 32),
+            "IRQ 48 software self-pend must latch in NVIC_ISPR1"
+        );
+    }
+
+    #[test]
+    fn test_nvic_ispr_self_pend_bit_48_sets_ispr_bit() {
+        // The set_irq_pending helper must also reach bit 48 — covers the
+        // path an ISR-scenario "software self-pend" scenario exercises
+        // via NVIC_ISPR directly. Dispatch is tested at the `step`
+        // level in tests.rs; this test only pins the ISPR-bank write.
+        let mut ppb = Ppb::default();
+        ppb.set_irq_pending(48);
+        assert_eq!(
+            ppb.nvic_ispr[1] & (1u32 << (48 - 32)),
+            1u32 << (48 - 32),
+            "set_irq_pending(48) must land on NVIC_ISPR1"
+        );
+    }
+
+    #[test]
+    fn test_nvic_iser1_bit_20_to_31_res0_for_spare_shims() {
+        // IRQs 52..=63 do not exist on RP2350; writes must not latch.
+        let mut ppb = Ppb::default();
+        ppb.write32(NVIC_ISER1, 0xFFFF_FFFF);
+        // Only bits 0..=19 (IRQs 32..=51) survive.
+        assert_eq!(
+            ppb.read32(NVIC_ISER1),
+            0x000F_FFFF,
+            "bits 20..=31 of NVIC_ISER1 are RES0"
+        );
+    }
+
+    #[test]
+    fn test_highest_priority_pending_irq_honours_enable() {
+        let mut ppb = Ppb::default();
+        ppb.set_irq_pending(10);
+        // Not enabled → nothing to take.
+        assert_eq!(ppb.highest_priority_pending_irq(), None);
+        // Enable → exception 26 (IRQ 10) should be ready.
+        ppb.write32(NVIC_ISER0, 1u32 << 10);
+        assert_eq!(ppb.highest_priority_pending_irq(), Some(16 + 10));
+    }
+
+    #[test]
+    fn test_highest_priority_pending_irq_picks_lowest_exc_on_tie() {
+        let mut ppb = Ppb::default();
+        // Both IRQ 5 and IRQ 10 pending-and-enabled at default priority 0
+        // → IRQ 5 (exception 21) wins the tie.
+        ppb.set_irq_pending(5);
+        ppb.set_irq_pending(10);
+        ppb.write32(NVIC_ISER0, (1u32 << 5) | (1u32 << 10));
+        assert_eq!(ppb.highest_priority_pending_irq(), Some(16 + 5));
+    }
+
+    #[test]
+    fn test_highest_priority_pending_irq_prefers_numerical_lower_priority() {
+        let mut ppb = Ppb::default();
+        // IRQ 5 priority = 0x80; IRQ 10 priority = 0x40 (higher-priority =
+        // lower numeric value). Both enabled+pending → IRQ 10 wins.
+        ppb.set_irq_pending(5);
+        ppb.set_irq_pending(10);
+        ppb.write32(NVIC_ISER0, (1u32 << 5) | (1u32 << 10));
+        // IPR0 byte-lanes: [IRQ0, IRQ1, IRQ2, IRQ3]
+        // IPR1 byte-lanes: [IRQ4, IRQ5, IRQ6, IRQ7]
+        // IPR2 byte-lanes: [IRQ8, IRQ9, IRQ10, IRQ11]
+        ppb.write32(
+            0xE000_E404, // IPR1
+            u32::from_le_bytes([0, 0x80, 0, 0]),
+        );
+        ppb.write32(
+            0xE000_E408, // IPR2
+            u32::from_le_bytes([0, 0, 0x40, 0]),
+        );
+        assert_eq!(
+            ppb.highest_priority_pending_irq(),
+            Some(16 + 10),
+            "IRQ 10 (priority 0x40) must outrank IRQ 5 (priority 0x80)"
+        );
+    }
+
+    #[test]
+    fn test_nvic_stub_returns_zero_for_unmapped_registers() {
+        let mut ppb = Ppb::default();
+        // 0xE000_E120 — inside the NVIC address block but not mapped to
+        // any register. Reads must return 0.
+        assert_eq!(ppb.read32(0xE000_E120), 0);
+        // Writes are silent no-ops — exercising the catch-all match arm.
+        ppb.write32(0xE000_E120, 0xFFFF_FFFF);
+        assert_eq!(ppb.read32(0xE000_E120), 0);
+    }
+
+    #[test]
+    fn test_clear_active_drops_iabr_bit() {
+        let mut ppb = Ppb::default();
+        ppb.set_irq_active(7);
+        assert_ne!(ppb.nvic_iabr[0] & (1u32 << 7), 0);
+        ppb.clear_active(16 + 7);
+        assert_eq!(ppb.nvic_iabr[0] & (1u32 << 7), 0);
     }
 
     #[test]

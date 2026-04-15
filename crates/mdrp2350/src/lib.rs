@@ -1,5 +1,6 @@
 pub mod core;
 pub mod bus;
+pub mod irq;
 pub mod memory;
 pub mod sio;
 pub mod pio;
@@ -91,6 +92,7 @@ impl Emulator {
         self.bus.clear_bus_fault();
         self.bus.ppb = [Default::default(), Default::default()];
         self.bus.resets_state = 0x1FFF_FFFF;
+        self.bus.irq_pending = [0; 2];
         self.bus.event_flag = [false; 2];
         self.bus.rcp_salt = [0; 2];
         self.bus.rcp_salt_valid = [false; 2];

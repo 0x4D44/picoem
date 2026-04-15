@@ -97,12 +97,15 @@ impl CortexM33 {
             return;
         }
 
-        // ARMv8-M §B1.5.8: take the highest-priority pending asynchronous
+        // ARMv8-M §B1.5.8 + §B3.7: take the highest-priority pending
         // exception at this instruction boundary before fetching the next
-        // instruction. Covers firmware pends via ICSR (PendSV/SysTick/NMI)
+        // instruction. Unified arbitration over NMI + PendSV + SysTick +
+        // external NVIC IRQs, so an external IRQ with a higher priority
+        // than a pending PendSV/SysTick wins (and vice-versa). Covers
+        // firmware pends via ICSR, peripheral asserts via `assert_irq_core`,
         // and tail-chain-as-re-entry after EXC_RETURN — the subsequent
         // step's top-of-loop check sees the still-pending exception.
-        if let Some(cost) = self.try_take_async_exception(bus) {
+        if let Some(cost) = self.try_take_any_pending_exception(bus) {
             self.cycles = self.cycles.wrapping_add(cost as u64);
             return;
         }

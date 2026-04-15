@@ -104,6 +104,21 @@ pub struct Bus {
     active_core: usize,
     /// Per-core PPB register files (NVIC, SCB, SysTick stubs).
     pub ppb: [ppb::Ppb; 2],
+    /// Per-core external-IRQ pending mask. Bit N set means IRQ N is
+    /// latched on that core's NVIC; the M33 step loop short-circuits on
+    /// `irq_pending[core] == 0` to skip the NVIC walk on the common no-
+    /// IRQ path. `assert_irq_core(core, irq)` is the peripheral-facing
+    /// setter — peripherals choose the receiver at assert time rather
+    /// than relying on a drain loop fan-out (see HLD V5 §5.3).
+    ///
+    /// 64 bits is sufficient for the 52 NVIC inputs; bits 52..63 are
+    /// never set. `u64` avoids a per-word `u32` pair while staying
+    /// cache-line-friendly (16 bytes / 128 bits for both cores fits in
+    /// the same line as `resets_state` and the downstream flags).
+    ///
+    /// Phase 0a lands the field + helper. Phase 1 wires the drain into
+    /// the per-core NVIC banks on Ppb (ISPR writes).
+    pub(crate) irq_pending: [u64; 2],
     /// RESETS peripheral state: bits set = peripheral in reset.
     /// Default 0x1FFF_FFFF — all peripherals held in reset at boot.
     pub resets_state: u32,
@@ -226,6 +241,7 @@ impl Bus {
             resets_state: 0x1FFF_FFFF,
             active_core: 0,
             ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
+            irq_pending: [0; 2],
             bus_fault: false,
             bus_fault_addr: 0,
             flash_loaded: false,
@@ -473,6 +489,102 @@ impl Bus {
     /// Returns the currently executing core index (0 or 1).
     pub fn active_core(&self) -> usize {
         self.active_core
+    }
+
+    /// Assert an external IRQ at a specific core. `core` names the NVIC
+    /// **receiver** — not the writer. Example: when core 1 writes the
+    /// core-0-bound FIFO, SIO calls `bus.assert_irq_core(0, IRQ_SIO_IRQ_FIFO)`
+    /// so the latch lands on core 0's pending mask. This matches the
+    /// HLD V5 §5.3 direction and mirrors the mdrp2040 V7 pattern.
+    ///
+    /// **Contract**: this helper is for IRQs listed in
+    /// [`crate::irq::CORE_LOCAL_IRQS`] — lines that are routed to one
+    /// specific core by peripheral design (SIO per-core FIFO/BELL/MTIMECMP,
+    /// GPIO bank-0, GPIO QSPI). For IRQs that should fire on both cores
+    /// (every shared peripheral — TIMER, DMA, UART, SPI, I2C, PIO, etc.)
+    /// use [`Self::assert_irq_shared`]. A `debug_assert!` sanity-checks
+    /// that callers of this helper are targeting a core-local IRQ.
+    ///
+    /// Out-of-range arguments are silent no-ops:
+    /// * `core >= 2` — only two cores exist on RP2350.
+    /// * `irq >= IRQ_COUNT (52)` — NVIC has 52 inputs; asserting beyond
+    ///   is a peripheral bug the emulator silently drops rather than
+    ///   latching somewhere unexpected.
+    ///
+    /// The assert mirrors the pending bit into both `irq_pending[core]`
+    /// (a test/observability side-channel) and the target core's
+    /// NVIC_ISPR (the architectural latch the dispatch path walks).
+    pub fn assert_irq_core(&mut self, core: usize, irq: u32) {
+        debug_assert!(
+            irq >= crate::irq::IRQ_COUNT || Self::is_core_local_irq(irq),
+            "assert_irq_core called with shared IRQ {irq}; use assert_irq_shared(irq)"
+        );
+        if core < 2 && irq < crate::irq::IRQ_COUNT {
+            self.irq_pending[core] |= 1u64 << irq;
+            self.ppb[core].set_irq_pending(irq);
+        }
+    }
+
+    /// Assert an external IRQ on every core for a shared peripheral line.
+    /// Peripherals that do not route their IRQ to a specific core (every
+    /// non-SIO / non-GPIO line on RP2350) call this so both NVICs see the
+    /// pending bit and dispatch picks it up on whichever core has the
+    /// lowest current execution priority.
+    ///
+    /// **Contract**: `irq` must NOT be in [`crate::irq::CORE_LOCAL_IRQS`].
+    /// A `debug_assert!` guards that invariant; release builds silently
+    /// latch on both cores.
+    ///
+    /// Out-of-range arguments are silent no-ops (see
+    /// [`Self::assert_irq_core`]).
+    pub fn assert_irq_shared(&mut self, irq: u32) {
+        debug_assert!(
+            !Self::is_core_local_irq(irq),
+            "assert_irq_shared called with core-local IRQ {irq}; use assert_irq_core(core, irq)"
+        );
+        if irq < crate::irq::IRQ_COUNT {
+            for core in 0..2 {
+                self.irq_pending[core] |= 1u64 << irq;
+                self.ppb[core].set_irq_pending(irq);
+            }
+        }
+    }
+
+    /// Clear a core-local IRQ's pending bit on one core. Mirror of
+    /// [`Self::assert_irq_core`]. Peripherals call this when a level-
+    /// triggered source de-asserts; they own the latch lifecycle.
+    /// Out-of-range arguments are silent no-ops.
+    pub fn clear_irq_core(&mut self, core: usize, irq: u32) {
+        if core < 2 && irq < crate::irq::IRQ_COUNT {
+            self.irq_pending[core] &= !(1u64 << irq);
+            self.ppb[core].clear_irq_pending(irq);
+        }
+    }
+
+    /// Clear a shared IRQ's pending bit on both cores. Mirror of
+    /// [`Self::assert_irq_shared`]. Out-of-range arguments are silent
+    /// no-ops.
+    pub fn clear_irq_shared(&mut self, irq: u32) {
+        if irq < crate::irq::IRQ_COUNT {
+            for core in 0..2 {
+                self.irq_pending[core] &= !(1u64 << irq);
+                self.ppb[core].clear_irq_pending(irq);
+            }
+        }
+    }
+
+    /// Internal: is this IRQ a core-local line? Used by the debug-assert
+    /// guards on [`Self::assert_irq_core`] / [`Self::assert_irq_shared`].
+    #[inline]
+    fn is_core_local_irq(irq: u32) -> bool {
+        let mut i = 0;
+        while i < crate::irq::CORE_LOCAL_IRQS.len() {
+            if crate::irq::CORE_LOCAL_IRQS[i] == irq {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Returns true if a bus fault was detected on the last access.
@@ -1194,6 +1306,27 @@ impl Bus {
             0xE => {
                 let core = self.active_core();
                 self.ppb[core].write32(addr, val);
+                // Mirror NVIC pending writes back into the step-path
+                // short-circuit mask (`irq_pending`). MMIO writes to
+                // NVIC_ISPR land only in `ppb.nvic_ispr`; the dispatch
+                // hot-path in `CortexM33::step` gates the NVIC walk on
+                // `irq_pending != 0`, so without this mirror, firmware-
+                // side self-pends (including bits 46..51 per datasheet
+                // §3.2 note) skip dispatch. Reconstruct `irq_pending`
+                // from the post-write ISPR for the affected word so the
+                // mask stays in sync regardless of whether the store
+                // set, cleared, or left bits unchanged (ICPR clears
+                // drop bits; ISPR writes only ever add them — either
+                // way, `irq_pending` for that word equals the current
+                // ISPR word after the write).
+                let low = addr & 0xFFFF;
+                if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
+                    let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
+                    let ispr = self.ppb[core].nvic_ispr[word];
+                    let mask64 = (ispr as u64) << (word * 32);
+                    let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
+                    self.irq_pending[core] = (self.irq_pending[core] & keep) | mask64;
+                }
             }
             // Unmapped regions raise a precise bus fault so flush-style
             // writers (Phase 7 Stage B lazy FP) and other speculative

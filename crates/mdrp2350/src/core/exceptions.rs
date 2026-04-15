@@ -318,13 +318,38 @@ impl CortexM33 {
     // --- Priority evaluation ---
 
     /// Effective execution priority (lower = higher priority).
-    #[allow(dead_code)]
+    ///
+    /// Folds four contributions per ARMv8-M §B3.4:
+    /// * FAULTMASK=1 clamps to -1 (HardFault priority).
+    /// * PRIMASK=1 clamps to 0 (all configurable priorities masked).
+    /// * **BASEPRI non-zero clamps to `basepri & 0xE0`** — pending IRQs
+    ///   with priority value ≥ BASEPRI are masked. M33 implements 3 bits
+    ///   of priority (bits [7:5]) so the stored byte is pre-masked to
+    ///   `0xE0`; the compare against IRQ priorities is numeric.
+    /// * IPSR > 0 pulls the currently-active exception's priority into
+    ///   the running value.
+    ///
+    /// The lowest (most restrictive in architectural terms, numerically
+    /// smallest) of these wins.
     pub(crate) fn execution_priority(&self, bus: &Bus) -> i16 {
         let mut prio: i16 = 256;
         if self.regs.faultmask & 1 != 0 {
             prio = -1;
         } else if self.regs.primask & 1 != 0 {
             prio = 0;
+        }
+
+        // BASEPRI: when non-zero, masks pending IRQs whose priority
+        // value is >= BASEPRI. Folding as `prio = min(prio, basepri)`
+        // preserves the ordering PendingPrio < ExecPrio ⇒ preempt.
+        // BASEPRI is byte-wide; pre-mask to 0xE0 so callers who write
+        // an unmasked byte observe the architectural fold.
+        let basepri = (self.regs.basepri & 0xFF) as u8;
+        if basepri != 0 {
+            let bp = (basepri & 0xE0) as i16;
+            if bp < prio {
+                prio = bp;
+            }
         }
 
         let ipsr = self.regs.ipsr();
@@ -337,53 +362,98 @@ impl CortexM33 {
         prio
     }
 
-    #[allow(dead_code)]
+    /// True if an exception numbered `exc_num` would preempt the core's
+    /// current execution priority. Called by the unified exception-
+    /// arbitration path and by tests that probe architectural priority
+    /// behaviour (BASEPRI / PRIMASK / FAULTMASK / active-exception
+    /// interactions).
     pub(crate) fn can_preempt(&self, exc_num: u16, bus: &Bus) -> bool {
         let exc_prio = bus.ppb[bus.active_core()].exception_priority(exc_num);
         exc_prio < self.execution_priority(bus)
     }
 
-    /// Attempt to take the highest-priority pending asynchronous exception
-    /// from ICSR (NMI/PendSV/SysTick). Clears the corresponding SET bit and
-    /// enters the exception via `enter_exception`. Returns `Some(cycles)`
+    /// Attempt to take the highest-priority pending exception at this
+    /// instruction boundary, unified across NMI, PendSV, SysTick, and
+    /// external NVIC IRQs. ARMv8-M §B3.7 mandates a single priority
+    /// ordering over all pending exceptions — when both an asynchronous
+    /// system exception and an external IRQ are pending, the numerically-
+    /// lower priority wins (NMI's fixed -2 beats any configurable IRQ;
+    /// an IRQ at priority 0x20 beats a PendSV at 0x80). Ties resolve to
+    /// the lower exception number.
+    ///
+    /// Called at the top of `CortexM33::step`. Returns `Some(cycles)`
     /// if an exception was entered, `None` otherwise.
     ///
-    /// Called at the top of `CortexM33::step`. ARMv8-M §B1.5.8: pending
-    /// exceptions are taken at instruction boundaries. NMI bypasses
-    /// PRIMASK/FAULTMASK; PendSV/SysTick go through `can_preempt`.
-    pub(crate) fn try_take_async_exception(&mut self, bus: &mut Bus) -> Option<u32> {
+    /// NMI bypasses PRIMASK/FAULTMASK and never consults `can_preempt`;
+    /// every other candidate goes through `can_preempt` so PRIMASK /
+    /// BASEPRI / FAULTMASK / active-exception priority all apply.
+    pub(crate) fn try_take_any_pending_exception(&mut self, bus: &mut Bus) -> Option<u32> {
         let core = bus.active_core();
         let icsr = bus.ppb[core].icsr;
 
-        // NMI (exc 2): non-maskable, highest fixed priority.
+        // NMI (exc 2, priority -2): non-maskable, highest fixed priority.
+        // No preempt check — NMI preempts unconditionally per ARMv8-M.
         if icsr & crate::bus::ppb::ICSR_NMIPENDSET != 0 {
             bus.ppb[core].icsr &= !crate::bus::ppb::ICSR_NMIPENDSET;
             return Some(self.enter_exception(2, bus));
         }
 
+        // Collect the three remaining candidate exceptions and pick the
+        // numerically-lowest priority; tie-break by lower exception number.
+        // `best` holds `(priority, exc_num)`; `None` means no candidate.
+        let mut best: Option<(i16, u16)> = None;
         let pendsv = icsr & crate::bus::ppb::ICSR_PENDSVSET != 0;
         let pendst = icsr & crate::bus::ppb::ICSR_PENDSTSET != 0;
-        if !pendsv && !pendst {
-            return None;
+        let ppb = &bus.ppb[core];
+        if pendsv {
+            best = Some((ppb.exception_priority(14), 14));
+        }
+        if pendst {
+            let prio = ppb.exception_priority(15);
+            best = match best {
+                None => Some((prio, 15)),
+                Some((bp, be)) if prio < bp || (prio == bp && 15 < be) => Some((prio, 15)),
+                other => other,
+            };
+        }
+        if let Some(ext_exc) = ppb.highest_priority_pending_irq() {
+            let prio = ppb.exception_priority(ext_exc);
+            best = match best {
+                None => Some((prio, ext_exc)),
+                Some((bp, be)) if prio < bp || (prio == bp && ext_exc < be) => Some((prio, ext_exc)),
+                other => other,
+            };
         }
 
-        // Pick highest-priority pending; tie-break by lower exception number
-        // (PendSV=14 wins a tie over SysTick=15 per ARMv8-M §B3.4.1).
-        let ppb = &bus.ppb[core];
-        let sv_prio = if pendsv { ppb.exception_priority(14) } else { i16::MAX };
-        let st_prio = if pendst { ppb.exception_priority(15) } else { i16::MAX };
-        let candidate: u16 = if sv_prio <= st_prio { 14 } else { 15 };
-
+        let (_, candidate) = best?;
         if !self.can_preempt(candidate, bus) {
             return None;
         }
 
-        let clear_mask = if candidate == 14 {
-            crate::bus::ppb::ICSR_PENDSVSET
-        } else {
-            crate::bus::ppb::ICSR_PENDSTSET
-        };
-        bus.ppb[core].icsr &= !clear_mask;
+        // Dispatch-path cleanup differs by exception class: ICSR SET bits
+        // for system exceptions, NVIC_ISPR + IABR for external IRQs.
+        match candidate {
+            14 => {
+                bus.ppb[core].icsr &= !crate::bus::ppb::ICSR_PENDSVSET;
+            }
+            15 => {
+                bus.ppb[core].icsr &= !crate::bus::ppb::ICSR_PENDSTSET;
+            }
+            _ => {
+                // External IRQ. Clear the pending bit on both the
+                // `irq_pending` mask (step-path short-circuit gate) and
+                // the NVIC_ISPR word (architectural latch), then flip
+                // NVIC_IABR to reflect the active handler.
+                let irq = candidate - 16;
+                let word = (irq / 32) as usize;
+                let bit = irq % 32;
+                if word < crate::bus::ppb::NVIC_BIT_WORDS {
+                    bus.irq_pending[core] &= !(1u64 << irq);
+                    bus.ppb[core].nvic_ispr[word] &= !(1u32 << bit);
+                }
+                bus.ppb[core].set_irq_active(irq as u32);
+            }
+        }
         Some(self.enter_exception(candidate, bus))
     }
 

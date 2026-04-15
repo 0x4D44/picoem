@@ -5817,6 +5817,416 @@ fn test_async_dispatch_systick_enters_handler() {
 }
 
 // ============================================================================
+// External-IRQ dispatch (Phase 0a, HLD V5 §4.1.4)
+// ============================================================================
+//
+// `CortexM33::step` runs `try_take_any_pending_exception` at each
+// instruction boundary — a single priority comparison over NMI, PendSV,
+// SysTick, and the highest-priority enabled-pending external IRQ.
+// `bus.irq_pending[core]` is an observability side-channel that mirrors
+// NVIC_ISPR (B1); MMIO writes to NVIC_ISPR/ICPR keep it in sync so
+// tests and firmware can both watch the pending mask. The tests below
+// pend IRQs via direct `bus.irq_pending` / ISPR writes (both paths
+// land the same latch) and verify dispatch lands on the right
+// vector-table slot.
+
+/// ROM with a vector table big enough for external IRQs plus a tight
+/// busy-wait main body. The IRQ handler at slot `exc_num` points into
+/// SRAM at `0x2000_0200 + (exc_num - 16) * 0x40` so each IRQ in the
+/// test suite gets a distinct handler address.
+fn external_irq_rom() -> Vec<u8> {
+    // Vector table size = (16 system + 52 external) * 4 = 272 bytes.
+    // Pad out to 0x100 so the main routine sits cleanly at 0x100.
+    let mut rom = vec![0u8; 2048];
+    rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes()); // SP
+    rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes()); // Reset -> 0x100
+    // External IRQ N's vector is at offset (16 + N) * 4. Point every
+    // external IRQ at a distinct SRAM address 0x2000_0200 + N*0x40 so
+    // test-side assertions on the entered handler's PC pick up the IRQ
+    // number from the address bits.
+    for irq in 0..52u32 {
+        let vec_off = (16 + irq as usize) * 4;
+        let handler_addr = 0x2000_0200u32 + irq * 0x40;
+        rom[vec_off..vec_off + 4].copy_from_slice(&(handler_addr | 1).to_le_bytes());
+    }
+    // Main at 0x100: busy-wait.
+    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    rom
+}
+
+fn load_external_irq_emu() -> Emulator {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&external_irq_rom());
+    emu.reset();
+    // Place a busy-wait handler body in SRAM for every IRQ slot — the
+    // scenarios inspect PC only, not handler behaviour.
+    for irq in 0..52u32 {
+        let handler_addr = 0x2000_0200u32 + irq * 0x40;
+        emu.bus.memory.sram_write8(handler_addr & 0x0FFF_FFFF, 0xFE);
+        emu.bus.memory.sram_write8((handler_addr + 1) & 0x0FFF_FFFF, 0xE7);
+    }
+    for _ in 0..5 { core0_step(&mut emu); }
+    emu
+}
+
+#[test]
+fn test_external_irq_pend_plus_enable_enters_handler() {
+    // Pending + enabled IRQ 0 (TIMER0_IRQ_0) should dispatch; PC lands
+    // at the TIMER0_IRQ_0 vector slot.
+    let mut emu = load_external_irq_emu();
+    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0); // NVIC_ISER enable IRQ 0
+    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+
+    core0_step(&mut emu);
+
+    assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
+        "IPSR must be TIMER0_IRQ_0 (exception 16)");
+    assert_eq!(emu.cores[0].regs.pc(), 0x2000_0200,
+        "PC at TIMER0 handler entry");
+}
+
+#[test]
+fn test_external_irq_pending_without_enable_does_not_dispatch() {
+    // irq_pending bit is set but NVIC_ISER bit is clear → no dispatch.
+    let mut emu = load_external_irq_emu();
+    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+
+    for _ in 0..5 { core0_step(&mut emu); }
+    assert_eq!(emu.cores[0].regs.ipsr(), 0,
+        "pending-without-enable must not dispatch");
+}
+
+#[test]
+fn test_external_irq_priority_mask_blocks_dispatch() {
+    // PRIMASK=1 blocks all configurable priorities, including external
+    // IRQs at priority 0.
+    let mut emu = load_external_irq_emu();
+    emu.cores[0].regs.primask = 1;
+    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0);
+    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+
+    for _ in 0..5 { core0_step(&mut emu); }
+    assert_eq!(emu.cores[0].regs.ipsr(), 0,
+        "PRIMASK must block external IRQ dispatch");
+}
+
+#[test]
+fn test_external_irq_basepri_masks_dispatch() {
+    // BASEPRI=0x20 + IRQ priority 0xC0 → IRQ priority is numerically
+    // larger (lower priority) than BASEPRI → IRQ is masked.
+    let mut emu = load_external_irq_emu();
+    emu.cores[0].regs.basepri = 0x20;
+    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0);
+    emu.bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+
+    for _ in 0..5 { core0_step(&mut emu); }
+    assert_eq!(emu.cores[0].regs.ipsr(), 0,
+        "BASEPRI=0x20 must mask IRQ at priority 0xC0");
+}
+
+#[test]
+fn test_external_irq_basepri_zero_is_transparent() {
+    // BASEPRI=0 (the default) must not mask any IRQ.
+    let mut emu = load_external_irq_emu();
+    emu.cores[0].regs.basepri = 0;
+    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0);
+    emu.bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+
+    core0_step(&mut emu);
+    assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
+        "BASEPRI=0 is transparent; IRQ 0 must dispatch");
+}
+
+#[test]
+fn test_assert_irq_core_targets_receiver() {
+    // assert_irq_core(1, IRQ_SIO_IRQ_FIFO) must latch on core 1's mask
+    // and NOT core 0's — the `core` argument names the receiver.
+    // SIO FIFO is a core-local line (CORE_LOCAL_IRQS) so this is the
+    // correct helper; assert_irq_shared would put it on both cores.
+    let mut emu = load_external_irq_emu();
+    let irq = crate::irq::IRQ_SIO_IRQ_FIFO; // 25, core-local
+    emu.bus.assert_irq_core(1, irq);
+    assert_eq!(emu.bus.irq_pending[0], 0,
+        "core 0 irq_pending must remain clear");
+    assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+        "core 1 irq_pending must record the assert");
+    // NVIC_ISPR must land on core 1's bank.
+    assert_ne!(emu.bus.ppb[1].nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 1 must latch");
+    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 0 must remain clear");
+}
+
+#[test]
+fn test_assert_irq_core_silently_drops_oob_args() {
+    let mut emu = load_external_irq_emu();
+    emu.bus.assert_irq_core(0, 100); // above IRQ_COUNT (52) — guarded by debug_assert
+    assert_eq!(emu.bus.irq_pending[0], 0);
+    // core >= 2 with a core-local IRQ — silently drops without latching.
+    emu.bus.assert_irq_core(5, crate::irq::IRQ_SIO_IRQ_FIFO);
+    assert_eq!(emu.bus.irq_pending[0], 0);
+    assert_eq!(emu.bus.irq_pending[1], 0);
+}
+
+#[test]
+fn test_assert_irq_shared_latches_on_both_cores() {
+    // assert_irq_shared(IRQ_TIMER0_IRQ_0) must land pending on both
+    // cores so dispatch can pick the core with lowest execution
+    // priority — shared peripheral lines are not routed to a specific
+    // receiver by the peripheral itself.
+    let mut emu = load_external_irq_emu();
+    let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
+    emu.bus.assert_irq_shared(irq);
+    assert_ne!(emu.bus.irq_pending[0] & (1u64 << irq), 0,
+        "core 0 irq_pending must record the assert");
+    assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+        "core 1 irq_pending must record the assert");
+    assert_ne!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 0 must latch");
+    assert_ne!(emu.bus.ppb[1].nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 1 must latch");
+}
+
+#[test]
+fn test_clear_irq_core_drops_pending_on_one_core() {
+    let mut emu = load_external_irq_emu();
+    let irq = crate::irq::IRQ_SIO_IRQ_FIFO; // core-local
+    emu.bus.assert_irq_core(0, irq);
+    emu.bus.assert_irq_core(1, irq);
+    emu.bus.clear_irq_core(0, irq);
+    assert_eq!(emu.bus.irq_pending[0] & (1u64 << irq), 0,
+        "clear_irq_core must drop the pending bit on the named core");
+    assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+        "clear_irq_core must not touch the other core");
+    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 0 must also clear");
+}
+
+#[test]
+fn test_clear_irq_shared_drops_pending_on_both_cores() {
+    let mut emu = load_external_irq_emu();
+    let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
+    emu.bus.assert_irq_shared(irq);
+    emu.bus.clear_irq_shared(irq);
+    assert_eq!(emu.bus.irq_pending[0] & (1u64 << irq), 0,
+        "clear_irq_shared must clear core 0's pending bit");
+    assert_eq!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+        "clear_irq_shared must clear core 1's pending bit");
+    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 0 must also clear");
+    assert_eq!(emu.bus.ppb[1].nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 1 must also clear");
+}
+
+#[test]
+fn test_mmio_nvic_ispr_write_mirrors_into_irq_pending_and_dispatches() {
+    // R1: Firmware-side MMIO writes to NVIC_ISPR must both (a) mirror
+    // the set bit into `bus.irq_pending[core]` (so tests and
+    // observability code see the pending state) and (b) trigger
+    // dispatch on the next step. Covers HLD V5 §5.3 mandated case.
+    let mut emu = load_external_irq_emu();
+    // Enable IRQ 0 via MMIO path.
+    emu.bus.write32(0xE000_E100, 1u32 << 0);
+    // Pend IRQ 0 via MMIO path — this is the case B1 restores.
+    emu.bus.write32(0xE000_E200, 1u32 << 0);
+    // After write, bus.irq_pending must reflect the latch.
+    assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
+        "NVIC_ISPR MMIO write must mirror into bus.irq_pending[core]");
+    // And the dispatch path must enter the handler on next step.
+    core0_step(&mut emu);
+    assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
+        "MMIO-pended IRQ 0 must enter exception 16 on next step");
+}
+
+#[test]
+fn test_mmio_nvic_icpr_write_drops_irq_pending_mirror() {
+    // Symmetric to R1: NVIC_ICPR MMIO writes must also clear the
+    // corresponding `bus.irq_pending` bit so stale-mask interference
+    // doesn't let a cleared IRQ re-dispatch.
+    let mut emu = load_external_irq_emu();
+    // Pend via MMIO (mirrors set bit).
+    emu.bus.write32(0xE000_E200, 1u32 << 0);
+    assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0);
+    // Clear via MMIO ICPR.
+    emu.bus.write32(0xE000_E280, 1u32 << 0);
+    assert_eq!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
+        "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror");
+    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << 0), 0,
+        "NVIC_ICPR MMIO write must clear the architectural latch");
+}
+
+#[test]
+fn test_mmio_nvic_ispr_word1_write_mirrors_high_half() {
+    // The mirror path handles both words of irq_pending — IRQs 32..=51
+    // land in word 1 (NVIC_ISPR1 at 0xE000_E204). Pin this explicitly:
+    // pending IRQ 40 (PROC0_IRQ_CSIDE in the catalogue) must surface
+    // in bits 32..=63 of irq_pending.
+    let mut emu = load_external_irq_emu();
+    emu.bus.write32(0xE000_E204, 1u32 << (40 - 32));
+    assert_ne!(emu.bus.irq_pending[0] & (1u64 << 40), 0,
+        "NVIC_ISPR1 write for IRQ 40 must mirror into bus.irq_pending[core] bit 40");
+}
+
+#[test]
+fn test_execution_priority_basepri_leq_current_is_noop() {
+    // R2: BASEPRI >= current execution priority is a no-op. Put the
+    // core in a handler at priority 0x40 (active IPSR implies
+    // execution_priority=0x40), then set BASEPRI=0xE0 (numerically
+    // higher = lower architectural priority). `execution_priority`
+    // must still return 0x40 — BASEPRI only lowers the ceiling, it
+    // never raises it.
+    let (mut c, mut bus) = core_and_bus();
+    // Pretend we're in handler mode at exception 16 (IRQ 0).
+    c.regs.xpsr = (c.regs.xpsr & !0x1FF) | 16;
+    // Give IRQ 0 priority 0x40 via NVIC_IPR0 byte 0.
+    bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0x40, 0, 0, 0]));
+    c.regs.basepri = 0xE0;
+    let prio = c.execution_priority(&bus);
+    assert_eq!(prio, 0x40,
+        "BASEPRI=0xE0 must NOT raise execution priority above the \
+         current active-exception priority 0x40");
+}
+
+#[test]
+fn test_unified_arbitration_external_irq_beats_pendsv() {
+    // B2 regression check: PendSV at SHPR3-programmed priority 0x80
+    // and an external IRQ at IPR priority 0x20 pending simultaneously
+    // must resolve to the IRQ (exception 16), not PendSV (14). This
+    // was the pre-B2 bug: try_take_async_exception fired before
+    // try_take_external_irq without consulting priority.
+    let mut emu = load_external_irq_emu();
+    // Set PendSV priority to 0x80 via SHPR3 (PendSV is byte [10] → lane 2
+    // of SHPR3 at 0xE000_ED20).
+    emu.bus.write32(0xE000_ED20, u32::from_le_bytes([0, 0, 0x80, 0]));
+    // Set IRQ 0 priority to 0x20.
+    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0x20, 0, 0, 0]));
+    // Enable IRQ 0.
+    emu.bus.write32(0xE000_E100, 1u32 << 0);
+    // Pend both.
+    emu.bus.write32(0xE000_ED04, 1u32 << 28); // ICSR.PENDSVSET
+    emu.bus.write32(0xE000_E200, 1u32 << 0); // NVIC_ISPR IRQ 0
+    // One step: unified arbitration picks IRQ 0 (priority 0x20 beats 0x80).
+    core0_step(&mut emu);
+    assert_eq!(emu.cores[0].regs.ipsr(), 16,
+        "unified arbitration must pick IRQ 0 (priority 0x20) over PendSV (priority 0x80)");
+}
+
+#[test]
+fn test_priority_preempt_end_to_end_via_step_loop() {
+    // R3: Pend IRQ 0 at priority 0xC0, step until IPSR == 16, then
+    // pend IRQ 1 at priority 0x40, step once, assert IPSR == 17 —
+    // a higher-priority IRQ preempts a running handler.
+    let mut emu = load_external_irq_emu();
+    // Priorities: IRQ 0 = 0xC0 (lane 0), IRQ 1 = 0x40 (lane 1).
+    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0x40, 0, 0]));
+    // Enable both IRQs.
+    emu.bus.write32(0xE000_E100, 0b11);
+    // Pend IRQ 0 + step until the handler is entered.
+    emu.bus.write32(0xE000_E200, 1u32 << 0);
+    let mut taken = false;
+    for _ in 0..5 {
+        core0_step(&mut emu);
+        if emu.cores[0].regs.ipsr() == 16 {
+            taken = true;
+            break;
+        }
+    }
+    assert!(taken, "IRQ 0 must dispatch within a few steps (IPSR=16)");
+    // Now pend IRQ 1 at higher priority. Must preempt on next step.
+    emu.bus.write32(0xE000_E200, 1u32 << 1);
+    core0_step(&mut emu);
+    assert_eq!(emu.cores[0].regs.ipsr(), 17,
+        "IRQ 1 (priority 0x40) must preempt IRQ 0 handler (priority 0xC0)");
+}
+
+// ============================================================================
+// BASEPRI fold into execution_priority (Phase 0a, HLD V5 §4.1.3)
+// ============================================================================
+//
+// Before Phase 0a, execution_priority read PRIMASK and FAULTMASK but
+// ignored BASEPRI. HLD V5 §4.1.3 requires BASEPRI to clamp the running
+// priority to `basepri & 0xE0` when non-zero. Pin the case it was silent
+// about previously:
+//
+//   basepri=0x80, primask=0, faultmask=0, inactive_irq_at_prio=0xC0
+//   → execution_priority must return 0x80, NOT 0xC0.
+//
+// The test uses an emulator with the default NVIC state so no active
+// exception muddies the base priority.
+
+#[test]
+fn test_execution_priority_basepri_clamps_masked_value() {
+    let (mut c, bus) = core_and_bus();
+    c.regs.basepri = 0x80;
+    c.regs.primask = 0;
+    c.regs.faultmask = 0;
+    // No active exception, no FAULTMASK, no PRIMASK, no pending IRQ.
+    // Pre-Phase-0a this returned 256 (the initial "no mask" value);
+    // post-Phase-0a it returns 0x80.
+    let prio = c.execution_priority(&bus);
+    assert_eq!(prio, 0x80, "BASEPRI=0x80 must clamp execution_priority to 0x80");
+}
+
+#[test]
+fn test_execution_priority_basepri_masks_unimplemented_bits() {
+    // M33 implements bits [7:5] of priority bytes. A BASEPRI of 0x9F
+    // (bits 4..0 set) must behave identically to 0x80 — the clamp
+    // discards the unimplemented bits.
+    let (mut c, bus) = core_and_bus();
+    c.regs.basepri = 0x9F;
+    let prio_masked = c.execution_priority(&bus);
+    c.regs.basepri = 0x80;
+    let prio_pure = c.execution_priority(&bus);
+    assert_eq!(prio_masked, prio_pure,
+        "BASEPRI bits [4:0] must be masked before clamping");
+}
+
+#[test]
+fn test_execution_priority_basepri_zero_does_nothing() {
+    // BASEPRI=0 is the "disabled" marker — do not clamp at all.
+    let (mut c, bus) = core_and_bus();
+    c.regs.basepri = 0;
+    let prio = c.execution_priority(&bus);
+    assert_eq!(prio, 256,
+        "BASEPRI=0 must leave priority at its thread-mode max");
+}
+
+#[test]
+fn test_execution_priority_primask_overrides_basepri() {
+    // PRIMASK=1 clamps to 0, which is numerically less than any BASEPRI
+    // value — PRIMASK wins by architectural ordering.
+    let (mut c, bus) = core_and_bus();
+    c.regs.primask = 1;
+    c.regs.basepri = 0xE0;
+    let prio = c.execution_priority(&bus);
+    assert_eq!(prio, 0, "PRIMASK=1 must beat BASEPRI=0xE0");
+}
+
+#[test]
+fn test_execution_priority_basepri_vs_higher_priority_irq() {
+    // Still the "without this HLD" regression case, phrased more
+    // explicitly: with BASEPRI=0x80 and no active exception, a pending
+    // IRQ at priority 0xC0 (numerically greater than BASEPRI) must be
+    // blocked — `can_preempt(0xC0_irq)` should return false.
+    let mut emu = load_external_irq_emu();
+    emu.cores[0].regs.basepri = 0x80;
+    let can = emu.cores[0].can_preempt(16 + 0, &emu.bus); // IRQ 0 priority 0
+    assert!(can, "IRQ at priority 0 always beats BASEPRI 0x80");
+    // But an IRQ with priority 0xC0 set via NVIC_IPR should NOT preempt.
+    emu.bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    let can_irq0_at_0xc0 = emu.cores[0].can_preempt(16 + 0, &emu.bus);
+    assert!(!can_irq0_at_0xc0,
+        "IRQ 0 at priority 0xC0 must not preempt BASEPRI 0x80");
+}
+
+// ============================================================================
 // SAU + TT (Test Target) instruction
 // ============================================================================
 
