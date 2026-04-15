@@ -236,15 +236,6 @@ chip-suffixed runners). The workspace compiles and both `qemu_diff_m33`
 and `qemu_diff_m0plus` oracles pass their smoke runs, but the following
 corners are deferred to later phases.
 
-### `probe_diff_rp2040` is a stub
-
-`crates/mdpicoem-harness/src/bin/probe_diff_rp2040.rs` is a placeholder
-that exits 2 with a rationale; no probe-rs wiring exists. The lab rig
-only carries an RP2354, so there is no hardware to diff against. Future
-work: mirror `probe_diff_rp2350` with a chip-pack of `"RP2040"` and
-extract the `is_m0plus_safe` filter out of `qemu_diff_m0plus` into
-`mdpicoem-harness::lib` so both runners can share it.
-
 ### QEMU M0+ oracle uses `cortex-m0`, not `cortex-m0plus`
 
 QEMU 10.2 does not expose a `cortex-m0plus` CPU model, so
