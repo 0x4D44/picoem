@@ -263,6 +263,43 @@ unit tests tend to miss. This entry supersedes the older "Thumb-32
 Test Generators" section above for the M0+-specific subset; the
 mdrp2350 T32 generator work remains pending separately.
 
+### Exception entry/exit not differentially validated
+
+`qemu_diff_m33` and `qemu_diff_m0plus` single-step individual
+instructions; neither fuzzer exercises asynchronous exception entry
+(external interrupt, SysTick tick) or any of its corners. Exception
+entry is the fattest remaining code path in the emulator that is
+unit-test-only — covered by targeted tests in `mdrp2350/src/tests.rs`
+and `mdrp2040/src/tests.rs` but not fuzzed against any reference.
+
+For M33 in particular, the combinatorial surface is large: stacking
+(8 regs plus FPU lazy save via FPCCR.LSPACT), SP switching
+(MSP/PSP × S/NS), xPSR/EPSR update, EXC_RETURN encoding, security-
+state transitions, stack-limit (MSPLIM/PSPLIM) checks, tail-chaining,
+late-arriving preemption. Unit tests cover known corners but not the
+cross-product.
+
+Fix (three-stage plan):
+1. Add `--workload isr` to `paced_bench_*` — exercises the path;
+   bench-level regression signal. Cheap first step.
+2. Add targeted unit tests for the known-hairy corners (FPU lazy
+   save on entry, stack-limit fault, security transition).
+3. Add a dedicated ISR diff fuzzer (`qemu_diff_isr_*`) that treats
+   entry as an atomic unit — compare state *after* entry completes,
+   not cycle-by-cycle.
+
+**Caveat for M33:** QEMU's M33 NVIC/SCB modelling is believed to be
+less mature than its integer-ops support (needs confirmation when we
+get there); if true, a meaningful fraction of findings from a
+QEMU-based ISR fuzzer will be QEMU bugs, not ours. For M33,
+`probe_diff_rp2350` against real RP2354 silicon is likely the
+higher-yield ISR oracle once the infrastructure is in place. For
+M0+, QEMU is probably fine.
+
+Medium priority. The path is correct for current firmware (unit
+tests gate it) but has no regression safety net at the breadth a
+fuzzer provides.
+
 ## PicoGUS Integration — Stage 1 follow-ups
 
 Surfaced by the devils-advocate review of Stage 1 (XIP flash in
