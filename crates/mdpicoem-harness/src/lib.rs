@@ -3,6 +3,7 @@
 // Validates Thumb-2 instruction semantics by executing identical instructions
 // in both QEMU (Cortex-M33 model) and our emulator, then diffing state.
 
+pub mod bank_conflict_cases;
 pub mod cycle_cases;
 pub mod gdb_client;
 pub mod i2s_capture;
@@ -13,6 +14,7 @@ pub mod onerom_snapshot_fmt;
 pub mod onerom_sync;
 pub mod onerom_trace;
 pub mod picogus_pins;
+pub mod silicon_oracle;
 pub mod silicon_scenarios;
 pub mod thumb32_gen;
 

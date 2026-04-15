@@ -1,351 +1,180 @@
-// SRAM bank-conflict test for RP2354 (OneROM) via SWD single-step.
+// bank_conflict_test_rp2350 — SRAM bank-conflict oracle for mdrp2350 vs
+// real RP2354 silicon (halt-step protocol).
 //
-// Tests the hypothesis: when instruction fetch and data access hit the SAME
-// SRAM bank, the Cortex-M33 bus multiplexer stalls +1 cycle.
-//
-// SRAM bank formula: bank = (byte_address >> 2) & 7 (bits [4:2]).
-// TEST_SLOT = 0x20000100 → bank = (0x100 >> 2) & 7 = 0.
-//
-// Run: cargo run -p mdpicoem-harness --bin bank_conflict_test_rp2350
+// Thin CLI wrapper over `bank_conflict_cases::run_against`. Per the HLD
+// (wrk_docs/2026.04.15 - HLD - test_silicon Orchestrator and Coverage
+// Expansion.md §Library-API extraction), this oracle stays with
+// halt-step + NOP-baseline calibration because the K-delta protocol
+// masks the +1 cycle SRAM bank-contention signal (see
+// tech_debt.md:545-554). The emulator-side measurement runs
+// `emu.cores[0].step(&mut emu.bus)` once per case and compares the
+// cycle count against the NOP-corrected HW median.
 
-use probe_rs::{Core, MemoryInterface, RegisterId, Session, SessionConfig};
-use std::time::Instant;
+use mdpicoem_harness::bank_conflict_cases::{
+    build_catalog, measure_nop_baseline_hw, run_bank_case, BankArgs, BankCase,
+};
+use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_filter, Verdict};
+use probe_rs::{Session, SessionConfig};
+use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+const USAGE: &str = "\
+Usage: bank_conflict_test_rp2350 [--filter <substr>] [--num-samples <N>] \
+[--tolerance <N>]
 
-/// SRAM slot for injected instructions — always bank 0.
-const TEST_SLOT: u64 = 0x2000_0100;
+Options:
+  --filter       Only run cases whose name contains <substr>
+  --num-samples  HW samples per case; median reported (default 20)
+  --tolerance    |(hw-overhead) - emu| tolerance in cycles (default 1)
+";
 
-// ARM Cortex-M register IDs.
-const R0: RegisterId = RegisterId(0);
-const R1: RegisterId = RegisterId(1);
-const PC: RegisterId = RegisterId(15);
-
-// DWT / CoreDebug MMIO addresses.
-const DEMCR: u64 = 0xE000_EDFC;
-const DWT_CTRL: u64 = 0xE000_1000;
-const DWT_CYCCNT: u64 = 0xE000_1004;
-
-// DEMCR / DWT bits.
-const TRCENA: u32 = 1 << 24;
-const CYCCNTENA: u32 = 1 << 0;
-
-// Thumb-2 encoded instructions (16-bit, little-endian).
-const LDR_R0_R1: u32 = 0x6808; // LDR R0, [R1, #0]
-const STR_R0_R1: u32 = 0x6008; // STR R0, [R1, #0]
-
-// Data addresses for each SRAM bank (fetch is always from bank 0 at TEST_SLOT).
-const DATA_BANK0: u64 = 0x2000_0200; // bank = (0x200 >> 2) & 7 = 0
-const DATA_BANK1: u64 = 0x2000_0204; // bank = (0x204 >> 2) & 7 = 1
-const DATA_BANK2: u64 = 0x2000_0208; // bank = (0x208 >> 2) & 7 = 2
-const DATA_BANK3: u64 = 0x2000_020C; // bank = (0x20C >> 2) & 7 = 3
-const DATA_BANK4: u64 = 0x2000_0210; // bank = (0x210 >> 2) & 7 = 4
-
-const NUM_SAMPLES: usize = 20;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Write a 16-bit Thumb instruction at `addr` in SRAM.
-fn write_thumb(core: &mut Core, addr: u64, hw: u32) -> Result<(), probe_rs::Error> {
-    let bytes = (hw as u16).to_le_bytes();
-    core.write_8(addr, &bytes)?;
-    Ok(())
-}
-
-/// Enable DWT CYCCNT.
-fn enable_cyccnt(core: &mut Core) -> Result<(), probe_rs::Error> {
-    let demcr: u32 = core.read_word_32(DEMCR)?;
-    core.write_word_32(DEMCR, demcr | TRCENA)?;
-    let ctrl: u32 = core.read_word_32(DWT_CTRL)?;
-    core.write_word_32(DWT_CTRL, ctrl | CYCCNTENA)?;
-    Ok(())
-}
-
-fn reset_cyccnt(core: &mut Core) -> Result<(), probe_rs::Error> {
-    core.write_word_32(DWT_CYCCNT, 0)?;
-    Ok(())
-}
-
-fn read_cyccnt(core: &mut Core) -> Result<u32, probe_rs::Error> {
-    core.read_word_32(DWT_CYCCNT)
-}
-
-/// Measure cycle count for a single instruction at TEST_SLOT that accesses
-/// memory at `data_addr`. Sets up R1 = data_addr, writes test data, then
-/// single-steps and reads CYCCNT.
-fn measure_mem_insn(
-    core: &mut Core,
-    insn: u32,
-    data_addr: u64,
-) -> Result<u32, probe_rs::Error> {
-    // Write instruction at TEST_SLOT.
-    write_thumb(core, TEST_SLOT, insn)?;
-
-    // Point R1 at the data address and ensure valid data is there.
-    core.write_core_reg(R1, data_addr)?;
-    core.write_word_32(data_addr, 0xCAFE_BABE)?;
-
-    // For STR, put something in R0 to store.
-    core.write_core_reg(R0, 0x1234_5678u64)?;
-
-    // Set PC, reset counter, step, read counter.
-    core.write_core_reg(PC, TEST_SLOT)?;
-    reset_cyccnt(core)?;
-    core.step()?;
-    read_cyccnt(core)
-}
-
-/// Collect NUM_SAMPLES measurements.
-fn collect_samples(
-    core: &mut Core,
-    insn: u32,
-    data_addr: u64,
-) -> Result<Vec<u32>, probe_rs::Error> {
-    let mut samples = Vec::with_capacity(NUM_SAMPLES);
-    for _ in 0..NUM_SAMPLES {
-        samples.push(measure_mem_insn(core, insn, data_addr)?);
+fn parse_args() -> Result<BankArgs, String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut args = BankArgs::default();
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--filter" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--filter requires a substring\n{USAGE}"));
+                }
+                args.filter = Some(argv[i].clone());
+            }
+            "--num-samples" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--num-samples requires a value\n{USAGE}"));
+                }
+                args.num_samples = argv[i]
+                    .parse()
+                    .map_err(|e| format!("invalid --num-samples '{}': {e}\n{USAGE}", argv[i]))?;
+            }
+            "--tolerance" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--tolerance requires a value\n{USAGE}"));
+                }
+                args.tolerance = argv[i]
+                    .parse()
+                    .map_err(|e| format!("invalid --tolerance '{}': {e}\n{USAGE}", argv[i]))?;
+            }
+            "--help" | "-h" => return Err(USAGE.to_string()),
+            other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
+        }
+        i += 1;
     }
-    Ok(samples)
+    if args.num_samples == 0 {
+        return Err(format!("--num-samples must be >= 1\n{USAGE}"));
+    }
+    Ok(args)
 }
 
-fn median(samples: &[u32]) -> u32 {
-    let mut sorted = samples.to_vec();
-    sorted.sort();
-    sorted[sorted.len() / 2]
+fn main() {
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(2);
+        }
+    }
 }
 
-fn bank_of(addr: u64) -> u32 {
-    ((addr >> 2) & 7) as u32
-}
+fn run() -> Result<i32, Box<dyn std::error::Error>> {
+    let args = parse_args().map_err(|e| {
+        eprintln!("{e}");
+        "bad arguments"
+    })?;
 
-fn print_result(label: &str, samples: &[u32]) {
-    let med = median(samples);
-    let min = *samples.iter().min().unwrap();
-    let max = *samples.iter().max().unwrap();
-    println!("{label}");
-    println!("  samples: {samples:?}");
-    println!("  median={med}  min={min}  max={max}");
-}
+    let catalog = build_catalog();
+    let selected: Vec<&BankCase> = catalog
+        .iter()
+        .filter(|c| name_matches_filter(c.name, args.filter.as_deref()))
+        .collect();
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+    if selected.is_empty() {
+        println!("no bank cases match filter; nothing to do");
+        return Ok(0);
+    }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("bank_conflict_test_rp2350: SRAM bank-conflict hypothesis checker");
-    println!("=================================================================");
-    println!("TEST_SLOT = 0x{TEST_SLOT:08X}  (bank {})", bank_of(TEST_SLOT));
+    println!(
+        "bank_conflict_test_rp2350: halt-step protocol (num_samples={} tol={})",
+        args.num_samples, args.tolerance,
+    );
+    println!(
+        "(fetch lives in bank 0 by default; data bank cycles through 0..8 for LDR + STR; \
+         fetch-bank sweep cycles fetch 0..8)"
+    );
+    println!("selected {} case(s)", selected.len());
     println!();
 
     let mut session = Session::auto_attach("rp2350", SessionConfig::default())?;
     let mut core = session.core(0)?;
-    core.reset_and_halt(std::time::Duration::from_millis(500))?;
+    core.reset_and_halt(Duration::from_millis(500))?;
     enable_cyccnt(&mut core)?;
 
+    // Calibrate the NOP baseline once per run — mirrors the original
+    // `bank_conflict_test` and matches `run_against`'s contract so the
+    // binary and orchestrator agree on the debug-overhead constant.
+    let nop_baseline = measure_nop_baseline_hw(&mut core, args.num_samples)?;
+    println!("nop_baseline (median) = {nop_baseline} cycles");
+    println!();
+
+    println!(
+        "{:<26} {:>5} {:>5} {:>11} {:>9} {:>7} {:>7} {:>+7} {:>6} {:>6}",
+        "case",
+        "fbnk",
+        "dbnk",
+        "data",
+        "hw_med",
+        "hw_adj",
+        "emu",
+        "delta",
+        "tol",
+        "verdict",
+    );
+    println!("{}", "-".repeat(110));
+
+    let mut total = 0usize;
+    let mut pass = 0usize;
+    let mut fail = 0usize;
     let t0 = Instant::now();
-
-    // -- Test A: LDR same bank (fetch bank 0, data bank 0) --
-    let a = collect_samples(&mut core, LDR_R0_R1, DATA_BANK0)?;
-    print_result(
-        &format!(
-            "Test A  LDR same-bank  fetch=bank{}  data=0x{:08X} bank{}",
-            bank_of(TEST_SLOT),
-            DATA_BANK0,
-            bank_of(DATA_BANK0),
-        ),
-        &a,
-    );
-
-    // -- Test B: LDR different bank (fetch bank 0, data bank 1) --
-    let b = collect_samples(&mut core, LDR_R0_R1, DATA_BANK1)?;
-    print_result(
-        &format!(
-            "Test B  LDR diff-bank  fetch=bank{}  data=0x{:08X} bank{}",
-            bank_of(TEST_SLOT),
-            DATA_BANK1,
-            bank_of(DATA_BANK1),
-        ),
-        &b,
-    );
-
-    // -- Test D: LDR more bank combinations --
-    let d_addrs = [
-        (DATA_BANK2, "D1"),
-        (DATA_BANK3, "D2"),
-        (DATA_BANK4, "D3"),
-    ];
-    let mut d_results = Vec::new();
-    for (addr, tag) in &d_addrs {
-        let samples = collect_samples(&mut core, LDR_R0_R1, *addr)?;
-        print_result(
-            &format!(
-                "Test {tag}  LDR  fetch=bank{}  data=0x{addr:08X} bank{}",
-                bank_of(TEST_SLOT),
-                bank_of(*addr),
-            ),
-            &samples,
-        );
-        d_results.push((*addr, samples));
-    }
-
-    // -- Test E: STR same-bank vs different-bank --
-    let e_same = collect_samples(&mut core, STR_R0_R1, DATA_BANK0)?;
-    print_result(
-        &format!(
-            "Test E1 STR same-bank  fetch=bank{}  data=0x{:08X} bank{}",
-            bank_of(TEST_SLOT),
-            DATA_BANK0,
-            bank_of(DATA_BANK0),
-        ),
-        &e_same,
-    );
-
-    let e_diff = collect_samples(&mut core, STR_R0_R1, DATA_BANK1)?;
-    print_result(
-        &format!(
-            "Test E2 STR diff-bank  fetch=bank{}  data=0x{:08X} bank{}",
-            bank_of(TEST_SLOT),
-            DATA_BANK1,
-            bank_of(DATA_BANK1),
-        ),
-        &e_diff,
-    );
-
-    // -- Test F: Sweep all 8 banks with LDR to see which ones are +1 --
-    println!();
-    println!("Test F: LDR sweep across all 8 banks (data addresses 0x200..0x21C)");
-    let sweep_base: u64 = 0x2000_0200;
-    let mut sweep_medians = Vec::new();
-    for bank in 0..8u64 {
-        let addr = sweep_base + bank * 4;
-        let samples = collect_samples(&mut core, LDR_R0_R1, addr)?;
-        let med = median(&samples);
-        sweep_medians.push((bank, addr, med));
-        println!(
-            "  bank {bank}: data=0x{addr:08X}  median={med}  samples={samples:?}"
-        );
-    }
-
-    // -- Test G: Confirm bank 2 at multiple different base addresses --
-    println!();
-    println!("Test G: LDR bank 2 at different base addresses");
-    let bank2_addrs: Vec<u64> = vec![
-        0x2000_0208, // bank 2
-        0x2000_0228, // bank 2 (+ 0x20)
-        0x2000_0248, // bank 2 (+ 0x40)
-        0x2000_0308, // bank 2 (different 256-byte region)
-        0x2000_0408, // bank 2 (yet another region)
-    ];
-    for addr in &bank2_addrs {
-        let bk = bank_of(*addr);
-        let samples = collect_samples(&mut core, LDR_R0_R1, *addr)?;
-        let med = median(&samples);
-        println!(
-            "  data=0x{addr:08X} bank={bk}  median={med}  samples={samples:?}"
-        );
-    }
-
-    // -- Test H: Also try addresses NOT bank 2 but nearby --
-    println!();
-    println!("Test H: LDR non-bank-2 addresses near 0x208");
-    let near_addrs: Vec<u64> = vec![
-        0x2000_0200, // bank 0
-        0x2000_0204, // bank 1
-        0x2000_0208, // bank 2
-        0x2000_020C, // bank 3
-        0x2000_0210, // bank 4
-        0x2000_0214, // bank 5
-        0x2000_0218, // bank 6
-        0x2000_021C, // bank 7
-    ];
-    for addr in &near_addrs {
-        let bk = bank_of(*addr);
-        let samples = collect_samples(&mut core, LDR_R0_R1, *addr)?;
-        let med = median(&samples);
-        println!(
-            "  data=0x{addr:08X} bank={bk}  median={med}  samples={:?}",
-            &samples[..5],
-        );
-    }
-
-    // -- Test I: Try different fetch addresses (move TEST_SLOT) --
-    println!();
-    println!("Test I: Move instruction to different banks, data at 0x20000300");
-    let data_fixed: u64 = 0x2000_0300; // bank = (0x300 >> 2) & 7 = 0
-    core.write_word_32(data_fixed, 0xDEAD_BEEF)?;
-    for fetch_bank in 0..8u64 {
-        let fetch_addr = 0x2000_0100 + fetch_bank * 4; // banks 0..7
-        write_thumb(&mut core, fetch_addr, LDR_R0_R1)?;
-        let mut samples = Vec::with_capacity(NUM_SAMPLES);
-        for _ in 0..NUM_SAMPLES {
-            core.write_core_reg(R1, data_fixed)?;
-            core.write_core_reg(R0, 0u64)?;
-            core.write_core_reg(PC, fetch_addr)?;
-            reset_cyccnt(&mut core)?;
-            core.step()?;
-            samples.push(read_cyccnt(&mut core)?);
+    for case in &selected {
+        let r = run_bank_case(&mut core, case, args.num_samples, args.tolerance, nop_baseline)?;
+        total += 1;
+        match r.verdict {
+            Verdict::Pass => pass += 1,
+            Verdict::Fail => fail += 1,
         }
-        let med = median(&samples);
         println!(
-            "  fetch=0x{fetch_addr:08X} bank={}  data=0x{data_fixed:08X} bank={}  median={med}  samples={:?}",
-            bank_of(fetch_addr),
-            bank_of(data_fixed),
-            &samples[..5],
+            "{:<26} {:>5} {:>5} 0x{:08X} {:>9} {:>7} {:>7} {:>+7} {:>6} {:>6}",
+            r.name,
+            r.fetch_bank,
+            r.data_bank,
+            r.data_addr,
+            r.hw_median,
+            r.hw_adjusted,
+            r.emu_cycles,
+            r.delta,
+            args.tolerance,
+            r.verdict.as_str(),
+        );
+        if r.emu_cycles != r.emu_baseline {
+            println!(
+                "    NOTE: emu ({}) differs from BankCase::emu_baseline ({}); update catalogue",
+                r.emu_cycles, r.emu_baseline,
+            );
+        }
+        println!(
+            "    samples: {:?}  (fetch=0x{:08X})",
+            r.hw_samples, r.fetch_addr,
         );
     }
 
     let elapsed = t0.elapsed();
-
-    // -- Summary --
     println!();
-    println!("==========================================================");
-    println!("Summary (medians):");
-
-    let med_a = median(&a);
-    let med_b = median(&b);
-    let med_e_same = median(&e_same);
-    let med_e_diff = median(&e_diff);
-
-    println!("  LDR same-bank  (0→0): {med_a}");
-    println!("  LDR diff-bank  (0→1): {med_b}");
-    for (addr, samples) in &d_results {
-        println!(
-            "  LDR diff-bank  (0→{}): {}",
-            bank_of(*addr),
-            median(samples)
-        );
-    }
-    println!("  STR same-bank  (0→0): {med_e_same}");
-    println!("  STR diff-bank  (0→1): {med_e_diff}");
-
-    // Determine if bank conflict is confirmed.
-    // If same-bank is consistently higher than all diff-bank, it's confirmed.
-    let all_diff_ldr: Vec<u32> = std::iter::once(med_b)
-        .chain(d_results.iter().map(|(_, s)| median(s)))
-        .collect();
-    let max_diff_ldr = *all_diff_ldr.iter().max().unwrap();
-
-    let ldr_conflict = med_a > max_diff_ldr;
-    let str_conflict = med_e_same > med_e_diff;
-
-    println!();
-    if ldr_conflict && str_conflict {
-        println!("Conclusion: bank conflict CONFIRMED (both LDR and STR show +1 for same-bank)");
-    } else if ldr_conflict {
-        println!("Conclusion: bank conflict CONFIRMED for LDR only (STR unaffected)");
-    } else if str_conflict {
-        println!("Conclusion: bank conflict CONFIRMED for STR only (LDR unaffected)");
-    } else {
-        println!("Conclusion: bank conflict NOT CONFIRMED (same-bank and diff-bank show equal cycles)");
-    }
-    println!("  LDR delta (same - max_diff): {}", med_a as i32 - max_diff_ldr as i32);
-    println!("  STR delta (same - diff):     {}", med_e_same as i32 - med_e_diff as i32);
-    println!();
-    println!("Completed in {:.1}s", elapsed.as_secs_f64());
-
-    Ok(())
+    println!(
+        "summary: total={total} pass={pass} fail={fail}  ({:.2}s)",
+        elapsed.as_secs_f64()
+    );
+    Ok(if fail > 0 { 1 } else { 0 })
 }

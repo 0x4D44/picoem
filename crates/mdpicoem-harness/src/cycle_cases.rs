@@ -412,12 +412,12 @@ pub const MBX_ITER: u32 = 0x0C;
 pub const MBX_CYCLES: u32 = 0x10;
 pub const MBX_RESERVED: u32 = 0x14;
 
-// DWT / CoreDebug MMIO.
-pub const DEMCR: u32 = 0xE000_EDFC;
-pub const DWT_CTRL: u32 = 0xE000_1000;
-pub const DWT_CYCCNT_ADDR: u32 = 0xE000_1004;
-pub const TRCENA: u32 = 1 << 24;
-pub const CYCCNTENA: u32 = 1 << 0;
+// DWT / CoreDebug MMIO — deduped in `silicon_oracle.rs`; re-exported so
+// existing consumers (`pack_stub`, the binary wrappers) don't need path
+// churn when they hoisted out from duplicated copies.
+pub use crate::silicon_oracle::{
+    CYCCNTENA, DEMCR_U32 as DEMCR, DWT_CTRL_U32 as DWT_CTRL, DWT_CYCCNT_ADDR, TRCENA,
+};
 
 /// Produce the fully-patched stub bytes (little-endian halfwords) with
 /// the MAILBOX_BASE and DWT_CYCCNT literals written into the pool slots.
@@ -444,6 +444,291 @@ pub fn pack_seq(seq: &[u16]) -> Vec<u8> {
     }
     out.extend_from_slice(&0x4770u16.to_le_bytes()); // bx lr sentinel
     out
+}
+
+// ---------------------------------------------------------------------------
+// Hardware-side measurement (probe-rs path, shared with the orchestrator)
+// ---------------------------------------------------------------------------
+//
+// These helpers were formerly private to `bin/silicon_cycle_oracle_rp2350.rs`.
+// Hoisting them into the catalogue module lets `run_against` (and, by
+// extension, the `test_silicon` orchestrator) drive the same measurement
+// path without duplicating MMIO constants.
+
+use crate::silicon_oracle::{self, enable_cyccnt, CaseOutcome, Verdict};
+use probe_rs::{Core, MemoryInterface, RegisterId};
+use std::time::{Duration, Instant};
+
+const PC_REG: RegisterId = RegisterId(15);
+const XPSR_REG: RegisterId = RegisterId(16);
+const SP_REG: RegisterId = RegisterId(13);
+const LR_REG: RegisterId = RegisterId(14);
+
+// SCB fault-status registers (host side — used in timeout diagnostics).
+const HFSR_ADDR: u64 = 0xE000_ED2C;
+const CFSR_ADDR: u64 = 0xE000_ED28;
+
+/// Per-K polling timeout for DONE (per case, per iteration count).
+const DONE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Zero the mailbox region on silicon (six u32 slots).
+fn zero_mailbox_hw(core: &mut Core) -> Result<(), probe_rs::Error> {
+    for off in [MBX_GO, MBX_DONE, MBX_SEQ_PTR, MBX_ITER, MBX_CYCLES, MBX_RESERVED] {
+        core.write_word_32((CYCLE_MAILBOX_BASE + off) as u64, 0)?;
+    }
+    Ok(())
+}
+
+/// Write mailbox: GO=1, DONE=0, SEQ_PTR=seq_start|1, ITER=K.
+fn kick_mailbox_hw(core: &mut Core, seq_start: u32, k: u32) -> Result<(), probe_rs::Error> {
+    debug_assert!(
+        seq_start & 1 == 0,
+        "seq_start must be halfword-aligned before OR'ing Thumb bit"
+    );
+    core.write_word_32((CYCLE_MAILBOX_BASE + MBX_DONE) as u64, 0)?;
+    core.write_word_32((CYCLE_MAILBOX_BASE + MBX_CYCLES) as u64, 0)?;
+    core.write_word_32((CYCLE_MAILBOX_BASE + MBX_SEQ_PTR) as u64, seq_start | 1)?;
+    core.write_word_32((CYCLE_MAILBOX_BASE + MBX_ITER) as u64, k)?;
+    // GO last — stub is spinning on this.
+    core.write_word_32((CYCLE_MAILBOX_BASE + MBX_GO) as u64, 1)?;
+    Ok(())
+}
+
+/// Resume, poll DONE until 1 or timeout, halt, read CYCLES.
+///
+/// On timeout, returns a diagnostic string containing PC/SP/LR/CFSR/HFSR and
+/// the six mailbox slots — just enough state to distinguish "stub wedged in
+/// poll" from "fault in stub" from "fault in seq".
+fn wait_and_read_cycles_hw(core: &mut Core) -> Result<u32, Box<dyn std::error::Error>> {
+    core.run()?;
+    let deadline = Instant::now() + DONE_TIMEOUT;
+    loop {
+        let done: u32 = core.read_word_32((CYCLE_MAILBOX_BASE + MBX_DONE) as u64)?;
+        if done == 1 {
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = core.halt(Duration::from_millis(200));
+            let pc: u32 = core.read_core_reg(PC_REG).unwrap_or(0xDEAD_BEEF);
+            let sp: u32 = core.read_core_reg(SP_REG).unwrap_or(0xDEAD_BEEF);
+            let lr: u32 = core.read_core_reg(LR_REG).unwrap_or(0xDEAD_BEEF);
+            let hfsr: u32 = core.read_word_32(HFSR_ADDR).unwrap_or(0xDEAD_BEEF);
+            let cfsr: u32 = core.read_word_32(CFSR_ADDR).unwrap_or(0xDEAD_BEEF);
+            let go: u32 = core
+                .read_word_32((CYCLE_MAILBOX_BASE + MBX_GO) as u64)
+                .unwrap_or(0xDEAD_BEEF);
+            let done_v: u32 = core
+                .read_word_32((CYCLE_MAILBOX_BASE + MBX_DONE) as u64)
+                .unwrap_or(0xDEAD_BEEF);
+            let seq_ptr: u32 = core
+                .read_word_32((CYCLE_MAILBOX_BASE + MBX_SEQ_PTR) as u64)
+                .unwrap_or(0xDEAD_BEEF);
+            let iter: u32 = core
+                .read_word_32((CYCLE_MAILBOX_BASE + MBX_ITER) as u64)
+                .unwrap_or(0xDEAD_BEEF);
+            let cycles: u32 = core
+                .read_word_32((CYCLE_MAILBOX_BASE + MBX_CYCLES) as u64)
+                .unwrap_or(0xDEAD_BEEF);
+            return Err(format!(
+                "timeout waiting for stub DONE=1\n\
+                 PC=0x{pc:08X} SP=0x{sp:08X} LR=0x{lr:08X}\n\
+                 HFSR=0x{hfsr:08X} CFSR=0x{cfsr:08X}\n\
+                 mailbox: GO={go} DONE={done_v} SEQ_PTR=0x{seq_ptr:08X} ITER={iter} CYCLES={cycles}"
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    core.halt(Duration::from_millis(200))?;
+    let cycles: u32 = core.read_word_32((CYCLE_MAILBOX_BASE + MBX_CYCLES) as u64)?;
+    Ok(cycles)
+}
+
+/// Measure raw cycles for one K-value on hardware. Caller is responsible for
+/// having written the stub + sequence + mailbox state before the first call.
+pub fn measure_hw(
+    core: &mut Core,
+    seq_start: u32,
+    k: u32,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    // Re-prime PC so the run re-enters the stub's push frame fresh.
+    core.write_core_reg(PC_REG, STUB_START)?;
+    core.write_core_reg(XPSR_REG, 0x0100_0000u32)?; // T=1
+    core.write_core_reg(SP_REG, EMU_TEST_STACK)?;
+    core.write_core_reg(LR_REG, 0xFFFF_FFFFu32)?;
+    kick_mailbox_hw(core, seq_start, k)?;
+    wait_and_read_cycles_hw(core)
+}
+
+// ---------------------------------------------------------------------------
+// Public CLI-level runner args + `run_against`
+// ---------------------------------------------------------------------------
+
+/// Arguments for `run_against`. Mirrors the standalone binary's CLI.
+#[derive(Clone, Debug)]
+pub struct CycleArgs {
+    pub filter: Option<String>,
+    pub iter_low: u32,
+    pub iter_high: u32,
+    pub tolerance: u32,
+}
+
+impl Default for CycleArgs {
+    fn default() -> Self {
+        Self {
+            filter: None,
+            iter_low: 101,
+            iter_high: 201,
+            tolerance: 0,
+        }
+    }
+}
+
+/// Per-case richer result used by the standalone binary's table output.
+#[derive(Debug)]
+pub struct CycleCaseResult {
+    pub name: &'static str,
+    pub hw_low: u32,
+    pub hw_high: u32,
+    pub hw_per_iter: u32,
+    pub emu_low: u32,
+    pub emu_high: u32,
+    pub emu_per_iter: u32,
+    pub emu_baseline: u32,
+    pub delta: i64,
+    pub verdict: Verdict,
+    pub elapsed_ms: u32,
+}
+
+impl CycleCaseResult {
+    /// Convert this per-case result into a `CaseOutcome` for the unified
+    /// report.
+    pub fn to_outcome(&self) -> CaseOutcome {
+        if self.verdict == Verdict::Pass {
+            CaseOutcome::pass("cycle", self.name, self.elapsed_ms)
+        } else {
+            let detail = format!(
+                "hw={} emu={} delta={:+} tol={}",
+                self.hw_per_iter, self.emu_per_iter, self.delta,
+                // tolerance not stored on the result struct; callers that
+                // want it in-detail can format themselves.
+                0,
+            );
+            CaseOutcome::fail("cycle", self.name, detail, self.elapsed_ms)
+        }
+    }
+}
+
+/// Run a single case end-to-end (HW + EMU) and produce a `CycleCaseResult`.
+/// Separate from `to_outcome` so the standalone binary can keep its rich
+/// per-case table.
+pub fn run_cycle_case(
+    core: &mut Core,
+    case: &CycleCase,
+    iter_low: u32,
+    iter_high: u32,
+    tolerance: u32,
+) -> Result<CycleCaseResult, Box<dyn std::error::Error>> {
+    let t0 = Instant::now();
+    let seq_bytes = pack_seq(case.seq);
+
+    // Write seq to hardware SRAM once per case.
+    core.write_8(CYCLE_SEQ_SLOT as u64, &seq_bytes)?;
+
+    let hw_low = measure_hw(core, CYCLE_SEQ_SLOT, iter_low)?;
+    let hw_high = measure_hw(core, CYCLE_SEQ_SLOT, iter_high)?;
+    let hw_per_iter = (hw_high - hw_low) / (iter_high - iter_low);
+
+    let mut emu = fresh_emulator(&seq_bytes);
+    let emu_low = measure_emu(&mut emu, CYCLE_SEQ_SLOT, iter_low)?;
+    let emu_high = measure_emu(&mut emu, CYCLE_SEQ_SLOT, iter_high)?;
+    let emu_per_iter = (emu_high - emu_low) / (iter_high - iter_low);
+
+    let delta = hw_per_iter as i64 - emu_per_iter as i64;
+    let verdict = if (delta.unsigned_abs() as u32) <= tolerance {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    };
+
+    let elapsed_ms = t0.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    Ok(CycleCaseResult {
+        name: case.name,
+        hw_low,
+        hw_high,
+        hw_per_iter,
+        emu_low,
+        emu_high,
+        emu_per_iter,
+        emu_baseline: case.emu_baseline,
+        delta,
+        verdict,
+        elapsed_ms,
+    })
+}
+
+/// Library entry point used by `silicon_cycle_oracle_rp2350` and the
+/// `test_silicon` orchestrator.
+///
+/// **Cleanup contract**: none. The cycle oracle only writes SRAM scratch
+/// (stub + sequences + mailbox) and enables DWT — both defaulted by
+/// `core.reset_and_halt`, so the next oracle in an orchestrated run sees
+/// a clean slate without any explicit teardown.
+///
+/// Preconditions: `core` is halted. `reset_and_halt` + `enable_cyccnt` have
+/// been called (the orchestrator owns these; the standalone binary's thin
+/// wrapper does them before calling here).
+pub fn run_against(
+    core: &mut Core,
+    args: &CycleArgs,
+) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
+    debug_assert!(args.iter_high > args.iter_low, "iter_high must exceed iter_low");
+
+    // Enable DWT defensively — idempotent; lets the standalone binary be
+    // minimal and also lets the orchestrator call us without trusting
+    // upstream setup.
+    enable_cyccnt(core)?;
+
+    // Write the stub once; it stays resident across all cases.
+    let stub_bytes = pack_stub();
+    core.write_8(STUB_START as u64, &stub_bytes)?;
+    zero_mailbox_hw(core)?;
+
+    // Prime core registers. probe-rs strips the Thumb LSB internally; write
+    // the aligned PC and set XPSR.T=1.
+    core.write_core_reg(PC_REG, STUB_START)?;
+    core.write_core_reg(XPSR_REG, 0x0100_0000u32)?; // T=1
+    core.write_core_reg(SP_REG, EMU_TEST_STACK)?;
+    core.write_core_reg(LR_REG, 0xFFFF_FFFFu32)?;
+
+    let selected: Vec<&CycleCase> = CASES
+        .iter()
+        .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
+        .collect();
+
+    let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
+    for case in selected {
+        let r = run_cycle_case(core, case, args.iter_low, args.iter_high, args.tolerance)?;
+        let detail = if r.verdict == Verdict::Pass {
+            String::new()
+        } else {
+            format!(
+                "hw={} emu={} delta={:+} tol={}",
+                r.hw_per_iter, r.emu_per_iter, r.delta, args.tolerance,
+            )
+        };
+        outcomes.push(CaseOutcome {
+            oracle: "cycle",
+            case: r.name,
+            verdict: r.verdict,
+            detail,
+            elapsed_ms: r.elapsed_ms,
+        });
+        // `reset_and_halt` is not needed between cases; the stub's final
+        // `b poll` at [19] loops back to the poll label and `measure_hw`
+        // re-primes PC on each call.
+    }
+    Ok(outcomes)
 }
 
 /// Build a fresh emulator pre-loaded with the stub + seq bytes, mailbox

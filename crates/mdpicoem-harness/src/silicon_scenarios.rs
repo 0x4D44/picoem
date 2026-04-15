@@ -269,6 +269,341 @@ pub const SCENARIOS: &[PeriphScenario] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Library-API entry point (`run_against`)
+// ---------------------------------------------------------------------------
+
+use crate::silicon_oracle::{
+    self, enable_cyccnt, read_cyccnt, reset_cyccnt, CaseOutcome, Verdict,
+};
+use crate::{EMU_TEST_STACK, SILICON_RUN_SLED};
+use mdrp2350::{Config, EmulatorBuilder};
+use probe_rs::{Core, MemoryInterface, RegisterId};
+use std::time::{Duration, Instant};
+
+const PC_REG: RegisterId = RegisterId(15);
+const XPSR_REG: RegisterId = RegisterId(16);
+const SP_REG: RegisterId = RegisterId(13);
+const LR_REG: RegisterId = RegisterId(14);
+
+/// Per-scenario BKPT timeout. Largest scenario (PLL) is ~1500 sysclks,
+/// microseconds at any reasonable sys_clk; 5 s is absurd headroom.
+const BKPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Arguments for `run_against`. Mirrors the standalone binary's CLI.
+#[derive(Clone, Debug, Default)]
+pub struct PeriphArgs {
+    pub filter: Option<String>,
+    pub verbose: bool,
+}
+
+/// Build the countdown sled bytes for `max_sysclks`.
+///
+///   movw r0, #N      ; N = ceil(max_sysclks / 4), capped at 0xFFFF
+///   subs r0, #1
+///   bne  -4          ; back to subs
+///   bkpt #0
+pub fn assemble_sled(max_sysclks: u32) -> Vec<u8> {
+    let mut n = max_sysclks.div_ceil(4);
+    if n == 0 {
+        n = 1;
+    }
+    if n > 0xFFFF {
+        n = 0xFFFF;
+    }
+
+    let i_bit = (n >> 11) & 1;
+    let imm4 = (n >> 12) & 0xF;
+    let imm3 = (n >> 8) & 0x7;
+    let imm8 = n & 0xFF;
+    let hw0 = (0xF240u32 | (i_bit << 10) | imm4) as u16;
+    let hw1 = ((imm3 << 12) | imm8) as u16;
+
+    let halfwords = [hw0, hw1, 0x3801u16, 0xD1FDu16, 0xBE00u16];
+    let mut out = Vec::with_capacity(halfwords.len() * 2);
+    for hw in halfwords {
+        out.extend_from_slice(&hw.to_le_bytes());
+    }
+    out
+}
+
+/// Release PIO0 / PIO1 / PLL_SYS from reset. Individual scenarios may
+/// re-assert specific bits afterwards.
+fn release_common_resets(core: &mut Core) -> Result<(), probe_rs::Error> {
+    let state: u32 = core.read_word_32(RESETS_RESET as u64)?;
+    let cleared = state & !(RESET_PIO0 | RESET_PIO1 | RESET_PLL_SYS);
+    core.write_word_32(RESETS_RESET as u64, cleared)?;
+    Ok(())
+}
+
+fn apply_setup_hw(core: &mut Core, setup: &[(u32, u32)]) -> Result<(), probe_rs::Error> {
+    for &(addr, val) in setup {
+        core.write_word_32(addr as u64, val)?;
+    }
+    Ok(())
+}
+
+/// Gate the peripheral off immediately after BKPT so readback is atomic.
+/// Scenario-specific, driven by name prefix.
+fn gate_peripheral_hw(core: &mut Core, name: &str) -> Result<(), probe_rs::Error> {
+    if name.starts_with("pio0") {
+        core.write_word_32((PIO0_BASE + PIO_CTRL_OFF) as u64, 0)?;
+    } else if name.starts_with("pio1") {
+        core.write_word_32((PIO1_BASE + PIO_CTRL_OFF) as u64, 0)?;
+    } else if name.starts_with("pll_sys") {
+        // PLL_SYS has no CS.ENABLE; re-assert RESETS bit to freeze.
+        let state: u32 = core.read_word_32(RESETS_RESET as u64)?;
+        core.write_word_32(RESETS_RESET as u64, state | RESET_PLL_SYS)?;
+    }
+    Ok(())
+}
+
+fn gate_peripheral_emu(emu: &mut mdrp2350::Emulator, name: &str) {
+    if name.starts_with("pio0") {
+        emu.mmio_write32(PIO0_BASE + PIO_CTRL_OFF, 0);
+    } else if name.starts_with("pio1") {
+        emu.mmio_write32(PIO1_BASE + PIO_CTRL_OFF, 0);
+    } else if name.starts_with("pll_sys") {
+        let state = emu.mmio_read32(RESETS_RESET);
+        emu.mmio_write32(RESETS_RESET, state | RESET_PLL_SYS);
+    }
+}
+
+fn run_sled_hw(core: &mut Core) -> Result<u32, Box<dyn std::error::Error>> {
+    reset_cyccnt(core)?;
+    core.write_core_reg(PC_REG, SILICON_RUN_SLED)?;
+    core.write_core_reg(XPSR_REG, 0x0100_0000u32)?; // T=1
+    core.write_core_reg(SP_REG, EMU_TEST_STACK)?;
+    core.write_core_reg(LR_REG, 0xFFFF_FFFFu32)?;
+    core.run()?;
+
+    let deadline = Instant::now() + BKPT_TIMEOUT;
+    loop {
+        if core.status()?.is_halted() {
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = core.halt(Duration::from_millis(200));
+            let pc: u32 = core.read_core_reg(PC_REG).unwrap_or(0xDEAD_BEEF);
+            let sp: u32 = core.read_core_reg(SP_REG).unwrap_or(0xDEAD_BEEF);
+            let lr: u32 = core.read_core_reg(LR_REG).unwrap_or(0xDEAD_BEEF);
+            return Err(format!(
+                "BKPT timeout: PC=0x{pc:08X} SP=0x{sp:08X} LR=0x{lr:08X}"
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    read_cyccnt(core).map_err(Into::into)
+}
+
+fn sample_pins_hw(core: &mut Core, mask: u32) -> Result<(u32, u32), probe_rs::Error> {
+    let oe: u32 = core.read_word_32(SIO_GPIO_OE as u64)?;
+    let in_: u32 = core.read_word_32(SIO_GPIO_IN as u64)?;
+    Ok((oe & mask, in_ & mask))
+}
+
+fn sample_pins_emu(emu: &mut mdrp2350::Emulator, mask: u32) -> (u32, u32) {
+    let oe = emu.mmio_read32(SIO_GPIO_OE) & mask;
+    let in_ = emu.mmio_read32(SIO_GPIO_IN) & mask;
+    (oe, in_)
+}
+
+/// Per-scenario rich result used by the standalone binary.
+pub struct PeriphScenarioResult {
+    pub name: &'static str,
+    pub verdict: Verdict,
+    pub actual_sysclks: u32,
+    pub first_divergence: Option<String>,
+    pub elapsed: Duration,
+}
+
+pub fn run_scenario(
+    core: &mut Core,
+    sc: &PeriphScenario,
+    first_scenario: bool,
+    verbose: bool,
+) -> Result<PeriphScenarioResult, Box<dyn std::error::Error>> {
+    let t0 = Instant::now();
+
+    if first_scenario {
+        core.reset_and_halt(Duration::from_millis(500))?;
+        enable_cyccnt(core)?;
+    } else if !core.status()?.is_halted() {
+        core.halt(Duration::from_millis(200))?;
+    }
+    release_common_resets(core)?;
+
+    apply_setup_hw(core, sc.setup)?;
+    let sled = assemble_sled(sc.max_sysclks);
+    core.write_8(SILICON_RUN_SLED as u64, &sled)?;
+    let actual_sysclks = run_sled_hw(core)?;
+    gate_peripheral_hw(core, sc.name)?;
+
+    let hw_obs: Vec<u32> = sc
+        .observe
+        .iter()
+        .map(|(addr, _m)| core.read_word_32(*addr as u64))
+        .collect::<Result<_, _>>()?;
+    let hw_pins = if sc.observe_pins != 0 {
+        Some(sample_pins_hw(core, sc.observe_pins)?)
+    } else {
+        None
+    };
+
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    emu.core_mut(0).halt();
+    emu.core_mut(1).halt();
+    for &(addr, val) in sc.setup {
+        emu.mmio_write32(addr, val);
+    }
+    emu.run(actual_sysclks as u64);
+    gate_peripheral_emu(&mut emu, sc.name);
+
+    let emu_obs: Vec<u32> =
+        sc.observe.iter().map(|(addr, _m)| emu.mmio_read32(*addr)).collect();
+    let emu_pins = if sc.observe_pins != 0 {
+        Some(sample_pins_emu(&mut emu, sc.observe_pins))
+    } else {
+        None
+    };
+
+    let mut first_div: Option<String> = None;
+    for (i, (addr, mask)) in sc.observe.iter().enumerate() {
+        let h = hw_obs[i] & *mask;
+        let e = emu_obs[i] & *mask;
+        if h != e {
+            let msg = format!(
+                "MMIO 0x{:08X} mask=0x{:08X}: HW=0x{:08X} EMU=0x{:08X} (xor=0x{:08X})",
+                addr, mask, h, e, h ^ e,
+            );
+            if first_div.is_none() {
+                first_div = Some(msg.clone());
+            }
+            if verbose {
+                println!("    DIFF {msg}");
+            }
+        } else if verbose {
+            println!("    ok   MMIO 0x{:08X} mask=0x{:08X}: 0x{:08X}", addr, mask, h);
+        }
+    }
+    if let (Some(h), Some(e)) = (hw_pins, emu_pins) {
+        if h != e {
+            let msg = format!(
+                "GPIO mask=0x{:08X}: HW oe=0x{:08X} level=0x{:08X}, \
+                 EMU oe=0x{:08X} level=0x{:08X}",
+                sc.observe_pins, h.0, h.1, e.0, e.1,
+            );
+            if first_div.is_none() {
+                first_div = Some(msg.clone());
+            }
+            if verbose {
+                println!("    DIFF {msg}");
+            }
+        } else if verbose {
+            println!(
+                "    ok   GPIO mask=0x{:08X}: oe=0x{:08X} level=0x{:08X}",
+                sc.observe_pins, h.0, h.1
+            );
+        }
+    }
+
+    let verdict = if first_div.is_none() { Verdict::Pass } else { Verdict::Fail };
+    Ok(PeriphScenarioResult {
+        name: sc.name,
+        verdict,
+        actual_sysclks,
+        first_divergence: first_div,
+        elapsed: t0.elapsed(),
+    })
+}
+
+/// Library entry point used by `silicon_periph_diff_rp2350` and the
+/// `test_silicon` orchestrator.
+///
+/// **Cleanup contract**: on exit, re-assert the RESETS bits the catalogue
+/// cleared (`RESET_PIO0 | RESET_PIO1 | RESET_PLL_SYS`) so the next oracle
+/// in an orchestrated iteration sees default peripheral state. Runs
+/// unconditionally — even if a case fails mid-loop — to avoid order-
+/// dependent flakes per the HLD's cross-oracle state-cleanup contract.
+///
+/// Preconditions: `core` is live (auto-attached). The function handles
+/// reset / CYCCNT enable on the first selected scenario.
+pub fn run_against(
+    core: &mut Core,
+    args: &PeriphArgs,
+) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
+    let selected: Vec<&PeriphScenario> = SCENARIOS
+        .iter()
+        .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
+        .collect();
+
+    let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
+    let mut loop_err: Option<Box<dyn std::error::Error>> = None;
+    for (i, sc) in selected.iter().enumerate() {
+        match run_scenario(core, sc, i == 0, args.verbose) {
+            Ok(r) => {
+                let elapsed_ms = r.elapsed.as_millis().min(u32::MAX as u128) as u32;
+                let outcome = if r.verdict == Verdict::Pass {
+                    CaseOutcome::pass("periph", r.name, elapsed_ms)
+                } else {
+                    CaseOutcome::fail(
+                        "periph",
+                        r.name,
+                        r.first_divergence.unwrap_or_default(),
+                        elapsed_ms,
+                    )
+                };
+                outcomes.push(outcome);
+            }
+            Err(e) => {
+                // Capture the error, stop running further cases, but still
+                // execute the cleanup block below.
+                loop_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    // Cleanup: re-assert the RESETS bits the catalogue cleared.
+    // Runs even on error so the next oracle sees a clean state.
+    //
+    // The mask below must track every RESETS bit any scenario touches
+    // via `ALIAS_CLR` — see HLD v1.1.1 §Cross-oracle state-cleanup
+    // contract. `RESET_IO_BANK0` / `RESET_PADS_BANK0` are cleared by the
+    // `pio0_side_set_toggle` scenario; leaving them un-asserted here
+    // would leave GPIO0 configured for PIO0 at the start of the next
+    // iteration's first scenario, leaking state across oracles.
+    //
+    // Cleanup failures are logged to stderr even though the rest of
+    // `run_against` is silent — an operator needs to see them to
+    // diagnose a wedged probe, and swallowing the error would make a
+    // soak run lose the signal entirely.
+    if let Err(e) = core.halt(Duration::from_millis(200)) {
+        eprintln!("warning: periph cleanup halt failed: {e}");
+    }
+    match core.read_word_32(RESETS_RESET as u64) {
+        Ok(state) => {
+            let bits = RESET_PIO0
+                | RESET_PIO1
+                | RESET_PLL_SYS
+                | RESET_IO_BANK0
+                | RESET_PADS_BANK0;
+            if let Err(e) = core.write_word_32(RESETS_RESET as u64, state | bits) {
+                eprintln!("warning: periph cleanup RESETS write failed: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: periph cleanup RESETS read failed: {e}");
+        }
+    }
+
+    if let Some(e) = loop_err {
+        return Err(e);
+    }
+    Ok(outcomes)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
