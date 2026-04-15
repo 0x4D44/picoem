@@ -38,7 +38,10 @@ const PIO_BASES: [u32; 3] = [0x5020_0000, 0x5030_0000, 0x5040_0000];
 
 /// Rx FIFO 0 offset inside a PIO block. Reading it **pops**.
 const PIO_RXF0: u32 = 0x020;
-/// Tx FIFO 0 offset — writes push into SM0's TX FIFO.
+/// Tx FIFO 0 offset — writes push into SM0's TX FIFO. Only used by
+/// legacy tests that target SM0 directly; the production path now
+/// routes per-channel via `decode_pio_tx_addr`.
+#[cfg_attr(not(test), allow(dead_code))]
 const PIO_TXF0: u32 = 0x010;
 /// FSTAT register.
 const PIO_FSTAT: u32 = 0x004;
@@ -231,23 +234,37 @@ impl GlueDma {
         }
     }
 
-    /// CH1: source SRAM byte at `read_addr`, sink PIO2.TX0.
+    /// CH1: source SRAM byte at `read_addr`, sink the PIO TX FIFO at
+    /// the channel's configured `write_addr`. OneROM's real firmware
+    /// targets `PIO2 TXF1` (SM1's TX FIFO at offset `0x014`) because
+    /// SM1 is the data-writer; hard-coding `TXF0` would drop bytes
+    /// into SM0 (the CS handler) where they are never read.
     fn tick_ch1(&mut self, bus: &mut Bus) {
         // Write stage: back-pressure on TX-full.
         if self.ch1_write_delay > 0 {
             self.ch1_write_delay -= 1;
             if self.ch1_write_delay == 0 && self.ch1_has_pending {
-                let fstat = bus.read32(PIO_BASES[2] + PIO_FSTAT);
-                let sm0_tx_full = (fstat >> (FSTAT_TXFULL_SM0 + 0)) & 1 != 0;
-                if sm0_tx_full {
-                    // Retry next cycle.
-                    self.ch1_write_delay = 1;
-                } else {
-                    bus.write32(PIO_BASES[2] + PIO_TXF0, self.ch1_value);
-                    self.ch1_has_pending = false;
-                    self.ch1_value = 0;
-                    self.ch1_push_count = self.ch1_push_count.saturating_add(1);
+                let write_addr = self.ch[1].write_addr;
+                if let Some((pio_base, sm_idx)) = decode_pio_tx_addr(write_addr) {
+                    let fstat = bus.read32(pio_base + PIO_FSTAT);
+                    let tx_full = (fstat >> (FSTAT_TXFULL_SM0 + sm_idx)) & 1 != 0;
+                    if tx_full {
+                        // Retry next cycle.
+                        self.ch1_write_delay = 1;
+                        return;
+                    }
                 }
+                // Either the sink is a recognised PIO TXFn slot with
+                // room, or it's some other register (no back-pressure
+                // model available) — either way, just push.
+                // TODO: if a future test points CH1 at a non-PIO sink,
+                // the silent "push without back-pressure" path here
+                // becomes observable; add a one-shot eprintln! when
+                // `decode_pio_tx_addr` returns None so the case surfaces.
+                bus.write32(write_addr, self.ch1_value);
+                self.ch1_has_pending = false;
+                self.ch1_value = 0;
+                self.ch1_push_count = self.ch1_push_count.saturating_add(1);
             }
             return;
         }
@@ -288,6 +305,21 @@ fn read_ch_reg(bus: &mut Bus, ch: u32, reg: u32) -> u32 {
 
 fn read_trig(bus: &mut Bus, ch: u32) -> u32 {
     read_ch_reg(bus, ch, DMA_CH_CTRL_TRIG)
+}
+
+/// Decode a PIO TXFn register address into `(pio_base, sm_index)`.
+/// Returns `None` if the address is not one of the recognised
+/// `PIO{0,1,2}.TXF{0..3}` slots, in which case the harness write is
+/// performed without a TX-full back-pressure check.
+fn decode_pio_tx_addr(addr: u32) -> Option<(u32, u32)> {
+    for &base in &PIO_BASES {
+        let off = addr.wrapping_sub(base);
+        // TXF0..TXF3 live at offsets 0x010, 0x014, 0x018, 0x01C.
+        if (0x010..0x020).contains(&off) && off & 0x3 == 0 {
+            return Some((base, (off - 0x010) >> 2));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -516,5 +548,68 @@ mod tests {
         let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT);
         let tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
         assert!(!tx_empty, "PIO2 SM0 TX empty after chain push; FSTAT=0x{:08X}", fstat);
+    }
+
+    /// The channel's configured `write_addr` must be respected — prior
+    /// to the fix, `tick_ch1` hard-coded `PIO_TXF0` (SM0's TX FIFO) and
+    /// dropped bytes into the wrong SM whenever firmware targeted a
+    /// different SM. The real OneROM firmware programs CH1 to write to
+    /// `PIO2 TXF1` (SM1's TX FIFO, offset `0x014`) because SM1 is the
+    /// data-writer; SM0 is the CS handler and has no PULL.
+    ///
+    /// This test arms CH1 to target TXF1 directly and asserts the byte
+    /// lands in SM1's TX FIFO, not SM0's.
+    #[test]
+    fn glue_dma_ch1_respects_write_addr_for_non_sm0_target() {
+        let mut emu = new_emu();
+        let mut dma = GlueDma::new();
+
+        // SRAM @ 0x2000_0100 holds 0xA5.
+        emu.bus.write8(0x2000_0100, 0xA5);
+
+        // Bring PIO2 out of reset.
+        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+
+        dma.prime_after_sync(&mut emu.bus);
+
+        // Arm CH1 with write_addr = PIO2 TXF1 (SM1's TX FIFO, offset 0x014).
+        // This mirrors the real OneROM configuration observed at runtime:
+        //   DMA CH1 armed: read=0x20000000 write=0x50400014 count=... ctrl=...
+        let txf1_addr = PIO_BASES[2] + 0x014;
+        program_channel(&mut emu.bus, 1, 0x2000_0100, txf1_addr, 1, 0x0000_0001);
+
+        // Tick to latch, then drive enough ticks to complete the
+        // 4-cycle read + 4-cycle write pipeline.
+        dma.tick(&mut emu.bus);
+        for _ in 0..8 {
+            dma.tick(&mut emu.bus);
+        }
+
+        assert_eq!(
+            dma.ch1_pushes(),
+            1,
+            "CH1 should have pushed exactly one word to its configured \
+             write_addr within 8 cycles"
+        );
+
+        let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT);
+        let sm0_tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
+        let sm1_tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 1)) & 1 != 0;
+
+        // The byte must have landed in SM1's TX FIFO, not SM0's.
+        assert!(
+            !sm1_tx_empty,
+            "SM1 TX FIFO empty after push targeted at TXF1; FSTAT=0x{:08X}. \
+             Glue DMA is routing to the wrong SM (see tick_ch1 hard-coded \
+             PIO_TXF0).",
+            fstat
+        );
+        assert!(
+            sm0_tx_empty,
+            "SM0 TX FIFO non-empty despite no push to TXF0; FSTAT=0x{:08X}. \
+             Glue DMA ignored the channel's write_addr and mis-routed to \
+             SM0.",
+            fstat
+        );
     }
 }

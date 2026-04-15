@@ -440,3 +440,99 @@ fn test_pio_spi_clk_mosi() {
         assert!(clk_trace[i], "CLK must be HIGH when MOSI data bit is presented (step {})", i);
     }
 }
+
+/// Reproduce the OneROM PIO2 data-writer shape in isolation: SM1 runs
+/// `OUT PINS, 8` at a wrap_top=wrap_bottom=6 self-loop, with autopull
+/// threshold 8 and shift-right. A byte pushed to SM1's TX FIFO should
+/// autopull into the OSR and drive `pad_out` bits 16..23 within a few
+/// cycles. This guards the PIO primitive against regressions of the
+/// exact shape OneROM's data-writer SM uses — see
+/// `wrk_journals/2026.04.15 - JRN - PIO2 pad_out Propagation Fix.md`.
+///
+/// Pushes go to SM1's TX FIFO (TXF1 at offset `0x014`), not SM0's (TXF0
+/// at `0x010`). Routing pushes to the wrong FIFO is exactly the
+/// harness-side bug the accompanying glue-DMA fix corrects; this test
+/// proves the PIO engine itself correctly handles the shape.
+#[test]
+fn test_pio_onerom_sm1_out_pins_8_autopull_drives_pad_out() {
+    let mut emu = pio_test_emulator();
+
+    // OneROM's PIO2 data-writer is a one-instruction loop at PC 6.
+    // The instructions before PC 6 belong to SM0 (CS handler) in the
+    // real firmware; we leave them zero here — SM1 never reaches them
+    // because its wrap_top = wrap_bottom = 6.
+    let out_pins_8: u16 = 0x6008; // OUT PINS, 8
+    pio_load_program(&mut emu, &[0, 0, 0, 0, 0, 0, out_pins_8, 0]);
+
+    // SM1 base = 0x0E0 (SM0=0x0C8, stride 0x18).
+    const SM1_EXECCTRL: u32 = 0x0E0 + 0x04;
+    const SM1_SHIFTCTRL: u32 = 0x0E0 + 0x08;
+    const SM1_PINCTRL: u32 = 0x0E0 + 0x14;
+    const SM1_INSTR: u32 = 0x0E0 + 0x10;
+
+    // SM1 EXECCTRL: wrap_top = 6, wrap_bottom = 6 (self-loop on PC 6).
+    // Other fields zero — no side-set, no JMP_PIN, etc.
+    let execctrl: u32 = (6u32 << 12) | (6u32 << 7);
+    pio_write(&mut emu, SM1_EXECCTRL, execctrl);
+
+    // SM1 SHIFTCTRL: OUT_SHIFTDIR = 1 (shift right), AUTOPULL = 1,
+    // PULL_THRESH = 8, IN_COUNT = 0. Bit 19 = OUT_SHIFTDIR,
+    // bit 17 = AUTOPULL, bits [29:25] = PULL_THRESH.
+    let shiftctrl: u32 = (1u32 << 19) | (1u32 << 17) | (8u32 << 25);
+    pio_write(&mut emu, SM1_SHIFTCTRL, shiftctrl);
+
+    // SM1 PINCTRL: OUT_BASE = 16, OUT_COUNT = 8 (D0..D7 on GPIO 16..23).
+    // bits [25:20] = OUT_COUNT, bits [4:0] = OUT_BASE.
+    let pinctrl: u32 = (8u32 << 20) | 16u32;
+    pio_write(&mut emu, SM1_PINCTRL, pinctrl);
+
+    // Force SM1's PC to 6 via force-execute of `JMP 6` (opcode 0x0006).
+    pio_write(&mut emu, SM1_INSTR, 0x0006);
+
+    // Enable output direction for pins 16..23 by force-executing a
+    // MOV PINDIRS, !NULL via SM1 (PINCTRL OUT_BASE/OUT_COUNT picks the
+    // window). Encoding: MOV dest=PINDIRS(3), op=invert(1), source=NULL(3)
+    // = 1010_0000_011_01_011 = 0xA06B.
+    pio_write(&mut emu, SM1_INSTR, 0xA06B);
+
+    // Enable SM1.
+    pio_write(&mut emu, 0x000, 0b0010);
+
+    // Seed SM1's TX FIFO with a fresh byte every cycle so the autopull
+    // pipeline always has data. Byte is `0xAA` — nonzero and
+    // distinguishable from `0xFF` (reset) and `0x00`.
+    const PAYLOAD: u8 = 0xAA;
+    let word: u32 = (PAYLOAD as u32)
+        | ((PAYLOAD as u32) << 8)
+        | ((PAYLOAD as u32) << 16)
+        | ((PAYLOAD as u32) << 24);
+
+    // Push once and step enough cycles for autopull → OSR → OUT PINS →
+    // shared_pin_values → pad_out propagation. With autopull refilling
+    // the OSR, OUT PINS, 8 drops one byte per step, so the new value is
+    // latched by `merge_pin_outputs` on the very first step.
+    pio_write(&mut emu, 0x014, word); // TXF1 (SM1's TX FIFO)
+    emu.step();
+    emu.step();
+
+    // Helpers default to PIO0; read the same block here.
+    let pad_out = emu.bus.pio[0].pad_out;
+    let data_slice = ((pad_out >> 16) & 0xFF) as u8;
+    assert_eq!(
+        data_slice, PAYLOAD,
+        "pad_out bits 16..23 should reflect 0x{:02X} after SM1 autopull+OUT PINS; \
+         got pad_out=0x{:08X}",
+        PAYLOAD, pad_out
+    );
+
+    // Sanity: pad_oe should also have the D0..D7 region driven, proving
+    // MOV PINDIRS ran through the shared direction latch. This mirrors
+    // the OneROM sync-time state (pad_oe = 0xFF across D0..D7).
+    let pad_oe_slice = ((emu.bus.pio[0].pad_oe >> 16) & 0xFF) as u8;
+    assert_eq!(
+        pad_oe_slice, 0xFF,
+        "pad_oe bits 16..23 should be driven after MOV PINDIRS, !NULL; \
+         got pad_oe=0x{:08X}",
+        emu.bus.pio[0].pad_oe
+    );
+}
