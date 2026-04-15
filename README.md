@@ -109,7 +109,7 @@ On Windows, a running `.exe` is locked against overwrite, so a long fuzz session
 
 ### 3. Hardware-in-the-loop (real silicon)
 
-Drive a real RP2354 board over SWD via a Pi Pico debug probe, single-step it, and diff against the emulator. Catches behaviours QEMU doesn't model correctly — e.g. SRAM bank contention, pipeline effects.
+Drive a real RP2354 board over SWD via a Pi Pico debug probe, single-step it, and diff against the emulator. Catches behaviours QEMU doesn't model correctly — e.g. pipeline effects, peripheral timing. `bank_conflict_test_rp2350` characterises SRAM bank-contention timing on silicon for reference; the emulator itself does **not** model bank contention on RP2350 (see `CLAUDE.md` / `wrk_journals/2026.04.15 - JRN - Contention Modelling Declined.md` for rationale).
 
 ```bash
 # Same instruction-level test suite as qemu_diff_m33 but against silicon
