@@ -6,14 +6,17 @@
 //! glue DMA pump, and proves the byte observed on D0..D7 matches the
 //! shadow byte at the resolved CH1.READ_ADDR.
 //!
-//! Stage G.1 — one baseline case (`0x1800`). G.2 lights up the full
-//! walking-1s + pattern sweep. G.3 adds the latency report.
+//! Stage G.2 — full 15-case walking-1s + pattern sweep through the
+//! serving pipeline. One line per case scrolls as the run proceeds so
+//! a stuck or crashing case is obvious from the partial output. G.3
+//! adds the latency report + ns conversion + envelope check.
 //!
 //! Design: `wrk_docs/2026.04.15 - HLD - OneROM Serving Oracle (Stage G).md`.
 //!
 //! Usage:
 //!   cargo run -p mdpicoem-harness --bin onerom_serving_oracle_rp2350 --release
 
+use std::collections::HashSet;
 use std::process::ExitCode;
 
 use mdpicoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_sync};
@@ -123,60 +126,136 @@ fn main() -> ExitCode {
     glue.prime_after_sync(&mut emu.bus);
     let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus);
 
+    // Shadow-integrity tripwire (devil's-advocate Attack 2, Stage G.2):
+    // `ServingOracle::new_at_sync` captures the 8 KB shadow from SRAM at
+    // SHADOW_BASE. If that region is uniform (all zeros, all 0xFF, etc.),
+    // no address-decode bug can possibly be caught — every resolved_addr
+    // would look up the same byte. We sample the same SRAM region the
+    // oracle did and surface the unique-byte count so the operator sees
+    // the tripwire before reading a false PASS.
+    let mut shadow_sample = [0u8; onerom_serving_oracle::SHADOW_SIZE];
+    for i in 0..onerom_serving_oracle::SHADOW_SIZE {
+        shadow_sample[i] = emu.bus.memory.sram_read8(i as u32);
+    }
+    let unique: HashSet<u8> = shadow_sample.iter().copied().collect();
+    println!(
+        "shadow @ 0x{:08X}..+0x{:04X}: {} unique bytes",
+        onerom_serving_oracle::SHADOW_BASE,
+        onerom_serving_oracle::SHADOW_SIZE,
+        unique.len(),
+    );
+    if unique.len() == 1 {
+        println!(
+            "WARNING: shadow is uniform — oracle cannot distinguish between addresses."
+        );
+        println!(
+            "         See \"Shadow source investigation\" in the Stage G journal."
+        );
+    }
+
     // No pre-case external-input setup needed: `run_case` authoritatively
     // sets `gpio_external_mask` and drives `gpio_external_in` (init seed
     // on first call, stimulus level thereafter). Mirroring it here would
     // be dead writes overwritten on the first iteration below.
 
-    // G.1 caveat: DEFAULT_CASES currently contains only the baseline
-    // `0x1800` case. At this stimulus, CH1.READ_ADDR has not yet been
-    // overwritten by CH0 (which forwards PIO1-decoded addresses) — so
-    // the byte observed reflects CH1's pre-loaded READ_ADDR=0x20000000,
-    // NOT a genuine pin→PIO1→CH0→CH1 round trip. The real address
-    // pipeline is exercised by G.2's sweep. See HLD §9 and the
-    // Stage G journal for details.
-    // Run each case.
-    for case in onerom_serving_oracle::DEFAULT_CASES {
+    // G.2 caveat inherited from G.1: the very first case (`walk1
+    // baseline`, 0x1800) runs before CH0 has had a chance to overwrite
+    // CH1.READ_ADDR with a PIO1-decoded address, so its resolved_addr
+    // reflects CH1's pre-loaded READ_ADDR=0x20000000 rather than a
+    // genuine pin→PIO1→CH0→CH1 round trip. The subsequent 14 cases do
+    // exercise the full pipeline as READ_ADDR moves. See HLD §9 and
+    // the Stage G journal for details.
+    //
+    // Per-case one-line output: operator sees progress even if a later
+    // case hangs or crashes. Keep the format narrow enough that 15
+    // lines fit on one screen.
+    let total = onerom_serving_oracle::DEFAULT_CASES.len();
+    for (idx, case) in onerom_serving_oracle::DEFAULT_CASES.iter().enumerate() {
         let result = oracle.run_case(&mut emu, &mut glue, *case);
+        let verdict_str = format_verdict_short(&result.verdict);
+        let expected = result
+            .expected_byte
+            .map(|b| format!("0x{:02X}", b))
+            .unwrap_or_else(|| "—".to_string());
+        let observed = result
+            .observed_byte
+            .map(|b| format!("0x{:02X}", b))
+            .unwrap_or_else(|| "—".to_string());
+        let cycles = result
+            .latency_cycles
+            .map(|c| format!("{}", c))
+            .unwrap_or_else(|| "—".to_string());
+        // TODO(G.3): include `resolved=0x...` column in per-case output
+        // (see onerom_serving_oracle format_report). Once the parallel
+        // PIO2 fix lands, knowing *where* WrongByte read from is
+        // diagnostic gold; G.3's full report formatter will fold it in.
         println!(
-            "CASE {:<28} addr=0x{:04X}  verdict={:?}  resolved={}  expected={}  observed={}  cycles={}",
+            "[{:>2}/{:>2}] {:<16} addr=0x{:04X} verdict={:<12} expected={} observed={} cycles={}",
+            idx + 1,
+            total,
             result.case.label,
             result.case.addr_bits,
-            result.verdict,
-            result
-                .resolved_addr
-                .map(|a| format!("0x{:08X}", a))
-                .unwrap_or_else(|| "—".to_string()),
-            result
-                .expected_byte
-                .map(|b| format!("0x{:02X}", b))
-                .unwrap_or_else(|| "—".to_string()),
-            result
-                .observed_byte
-                .map(|b| format!("0x{:02X}", b))
-                .unwrap_or_else(|| "—".to_string()),
-            result
-                .latency_cycles
-                .map(|c| format!("{}", c))
-                .unwrap_or_else(|| "—".to_string()),
+            verdict_str,
+            expected,
+            observed,
+            cycles,
         );
     }
 
-    let sys_hz = emu.bus.sys_clk_hz();
-    println!();
-    println!("{}", oracle.format_report(sys_hz));
+    // Summary tally — bucket verdicts by class so the operator sees at
+    // a glance what failed and why. `WrongByte` is expected to dominate
+    // until the parallel PIO2 pad_out team lands their fix; other
+    // variants are real findings worth surfacing separately.
+    let results = oracle.results();
+    let mut pass = 0usize;
+    let mut wrong_byte = 0usize;
+    let mut no_resolve = 0usize;
+    let mut no_stable = 0usize;
+    let mut out_of_range = 0usize;
+    let mut latency_out = 0usize;
+    for r in results {
+        match r.verdict {
+            onerom_serving_oracle::Verdict::Pass => pass += 1,
+            onerom_serving_oracle::Verdict::WrongByte { .. } => wrong_byte += 1,
+            onerom_serving_oracle::Verdict::NoResolve => no_resolve += 1,
+            onerom_serving_oracle::Verdict::NoStableByte => no_stable += 1,
+            onerom_serving_oracle::Verdict::ResolvedAddrOutOfRange { .. } => {
+                out_of_range += 1
+            }
+            onerom_serving_oracle::Verdict::LatencyOutOfEnvelope { .. } => {
+                latency_out += 1
+            }
+        }
+    }
+    let fail = total - pass;
+    println!(
+        "{}/{} PASS, {}/{} FAIL ({} wrong byte, {} no-resolve, {} no-stable-byte, {} addr-out-of-range, {} latency-out-of-envelope)",
+        pass, total, fail, total,
+        wrong_byte, no_resolve, no_stable, out_of_range, latency_out,
+    );
 
-    let all_pass = oracle
-        .results()
-        .iter()
-        .all(|r| r.verdict == onerom_serving_oracle::Verdict::Pass);
-
-    if all_pass {
-        println!("SERVING ORACLE PASS — all {} case(s) matched the SRAM shadow",
-                 oracle.results().len());
+    if pass == total {
         ExitCode::SUCCESS
     } else {
-        println!("SERVING ORACLE FAIL — see per-case verdicts above");
         ExitCode::FAILURE
+    }
+}
+
+/// Compact verdict label for the per-case progress line. We want every
+/// class to fit in a 12-character column so the table aligns, and we
+/// want the reader to distinguish the verdict at a glance without
+/// wading through the full `Debug` form.
+fn format_verdict_short(v: &onerom_serving_oracle::Verdict) -> String {
+    match v {
+        onerom_serving_oracle::Verdict::Pass => "Pass".to_string(),
+        onerom_serving_oracle::Verdict::WrongByte { .. } => "WrongByte".to_string(),
+        onerom_serving_oracle::Verdict::NoResolve => "NoResolve".to_string(),
+        onerom_serving_oracle::Verdict::NoStableByte => "NoStableByte".to_string(),
+        onerom_serving_oracle::Verdict::ResolvedAddrOutOfRange { .. } => {
+            "AddrOOR".to_string()
+        }
+        onerom_serving_oracle::Verdict::LatencyOutOfEnvelope { .. } => {
+            "LatencyOOE".to_string()
+        }
     }
 }

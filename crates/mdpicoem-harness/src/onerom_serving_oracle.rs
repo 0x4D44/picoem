@@ -64,7 +64,15 @@ const MIN_STABLE_CYCLES: usize = 3;
 const SEED_CYCLES: u32 = 4;
 
 /// CS-high settle between consecutive cases.
-const GAP_CYCLES: u32 = 3;
+///
+/// GAP_CYCLES must exceed the glue DMA pipeline depth
+/// (`DMA_READ_CYCLES + DMA_WRITE_CYCLES = 4 + 4 = 8` cycles in
+/// `onerom_glue_dma.rs`) so a push issued in case N's tail drains before
+/// case N+1's `pushes_before` snapshot. Otherwise a trailing push from
+/// case N leaks into case N+1's observation window and `resolved_addr`
+/// readings lag by one case (devil's-advocate Attack 3, Stage G.2).
+/// 12 = 8 + 4 cycles of slack.
+const GAP_CYCLES: u32 = 12;
 
 /// Cycle budget per case (envelope is 11..=14; 60 gives ~4× slack).
 const PER_CASE_TIMEOUT: u32 = 60;
@@ -106,13 +114,43 @@ impl Case {
     }
 }
 
-/// Default address-case set.
+/// Default address-case set — walking-1s over A0..A10 plus three
+/// high-coverage patterns. See HLD §4.2.
 ///
-/// G.1 ships only the baseline. G.2 will extend to the full
-/// walking-1s over A0..A10 plus patterns from HLD §4.2.
-// TODO(G.2): populate full walking-1s + pattern set (15 cases)
+/// Structure:
+/// - 1 baseline case (`0x1800` — all low bits clear, A11=A12=1 only).
+/// - 11 walking-1s cases: one per A0..A10 bit, labelled `walk1 A<n>`
+///   where `n` is the bit index (so `walk1 A0` = `0x1801` = bit 0 set).
+/// - 3 pattern cases: `0x1AAA` (alt), `0x1D55` (comp-alt), `0x1FFF`
+///   (all low 11 bits set). HLD §4.2 lists a fourth "0x1800" pattern
+///   entry but notes it's already the baseline, so the pattern block
+///   contributes only 3 non-duplicate cases.
+///
+/// Total: 15 entries. Construction enforces `addr_bits & 0x1800 == 0x1800`.
+/// In debug builds, both `Case::new`'s and `run_case`'s `debug_assert!`
+/// guards catch a bad entry. In release builds (where both asserts compile
+/// away), the `default_cases_full_sweep_shape` unit test is the backstop:
+/// it runs under `cargo test --release` and re-checks the invariant on
+/// every entry, so a bad addition fails loudly the next time tests run.
 pub const DEFAULT_CASES: &[Case] = &[
-    Case::new("walk1 A0 (baseline)", 0x1800),
+    // Baseline: A11=A12=1, all of A0..A10 low.
+    Case::new("walk1 baseline", 0x1800),
+    // Walking-1s across A0..A10 (bit index matches label number).
+    Case::new("walk1 A0", 0x1801),
+    Case::new("walk1 A1", 0x1802),
+    Case::new("walk1 A2", 0x1804),
+    Case::new("walk1 A3", 0x1808),
+    Case::new("walk1 A4", 0x1810),
+    Case::new("walk1 A5", 0x1820),
+    Case::new("walk1 A6", 0x1840),
+    Case::new("walk1 A7", 0x1880),
+    Case::new("walk1 A8", 0x1900),
+    Case::new("walk1 A9", 0x1A00),
+    Case::new("walk1 A10", 0x1C00),
+    // Pattern cases — wider-range coverage.
+    Case::new("pattern AAA", 0x1AAA),
+    Case::new("pattern D55", 0x1D55),
+    Case::new("pattern FFF", 0x1FFF),
 ];
 
 /// Outcome for one case.
@@ -755,5 +793,88 @@ mod tests {
         );
         assert_eq!(result.resolved_addr, Some(bad_addr));
         assert!(result.expected_byte.is_none());
+    }
+
+    /// 6. Full sweep shape: G.2 landed the 15-case walking-1s + pattern
+    /// set. Validate length, the A11=A12=1 invariant on every entry, and
+    /// single-bit coverage across A0..A10 (each low-bit appears in
+    /// exactly one non-baseline walking case, plus the all-zero baseline).
+    #[test]
+    fn default_cases_full_sweep_shape() {
+        // Length as specified by HLD §4.2: 12 walking-1s (baseline + one
+        // per A0..A10 = 12) + 3 distinct pattern cases (0x1AAA, 0x1D55,
+        // 0x1FFF; the 0x1800 "pattern" is already the baseline).
+        assert_eq!(DEFAULT_CASES.len(), 15, "expected 15 cases");
+
+        // Every case must keep CS2/CS3 deasserted (A11=A12=1).
+        for c in DEFAULT_CASES {
+            assert_eq!(
+                c.addr_bits & ADDR_A11_A12_HIGH,
+                ADDR_A11_A12_HIGH,
+                "case `{}` has wrong high bits: 0x{:04X}",
+                c.label,
+                c.addr_bits
+            );
+        }
+
+        // Walking-1s coverage: for each bit in A0..A10, exactly one
+        // walking case must have that bit set with all other low bits
+        // zero. Accumulate the set of "single-bit masks" seen and
+        // compare against the reference 11-bit set {0x001,..,0x400}.
+        let low_bits = |addr: u16| -> u16 { addr & 0x07FF };
+        let is_walking_single_bit =
+            |bits: u16| -> bool { bits != 0 && bits.count_ones() == 1 };
+
+        let mut seen_single_bits: u16 = 0; // OR of all walking-1 masks observed
+        let mut baseline_seen = false;
+        for c in DEFAULT_CASES {
+            let lb = low_bits(c.addr_bits);
+            if lb == 0 {
+                baseline_seen = true;
+            } else if is_walking_single_bit(lb) {
+                assert_eq!(
+                    seen_single_bits & lb,
+                    0,
+                    "duplicate walking-1 bit in case `{}`: 0x{:04X}",
+                    c.label,
+                    c.addr_bits
+                );
+                seen_single_bits |= lb;
+            }
+        }
+        assert!(baseline_seen, "baseline (low bits 0) must be present");
+        assert_eq!(
+            seen_single_bits, 0x07FF,
+            "walking-1s coverage incomplete: got 0x{:04X}, want 0x07FF",
+            seen_single_bits
+        );
+
+        // Pattern cases must all be distinct from walking cases and
+        // from each other. The spec calls out exactly three non-baseline
+        // patterns: 0x1AAA, 0x1D55, 0x1FFF.
+        let mut saw_aaa = false;
+        let mut saw_d55 = false;
+        let mut saw_fff = false;
+        for c in DEFAULT_CASES {
+            match c.addr_bits {
+                0x1AAA => saw_aaa = true,
+                0x1D55 => saw_d55 = true,
+                0x1FFF => saw_fff = true,
+                _ => {}
+            }
+        }
+        assert!(saw_aaa, "missing pattern case 0x1AAA");
+        assert!(saw_d55, "missing pattern case 0x1D55");
+        assert!(saw_fff, "missing pattern case 0x1FFF");
+
+        // Final sanity: no duplicate addr_bits anywhere in the list.
+        let mut uniq = std::collections::HashSet::new();
+        for c in DEFAULT_CASES {
+            assert!(
+                uniq.insert(c.addr_bits),
+                "duplicate case addr_bits: 0x{:04X}",
+                c.addr_bits
+            );
+        }
     }
 }
