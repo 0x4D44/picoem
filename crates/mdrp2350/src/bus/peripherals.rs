@@ -344,9 +344,25 @@ mod tests {
     }
 
     #[test]
-    fn test_resets_default_all_in_reset() {
+    fn test_resets_default_post_bootrom_state() {
+        // HLD V5 §5.7: `Bus::new()` seeds the post-bootrom RESETS
+        // state (TIMER0/1, PLL_SYS/USB, IO_BANK0, PADS_BANK0,
+        // SYSCFG, SYSINFO released). Hardware-reset value is
+        // `0x1FFF_FFFF` (all held); the emulator starts beyond
+        // bootrom because `load_image` doesn't run the bootrom.
         let bus = Bus::new();
-        assert_eq!(bus.resets_state, 0x1FFF_FFFF);
+        assert_eq!(bus.resets_state, crate::bus::RESETS_POST_BOOTROM);
+        // Peripherals landed in Phase 1 must be released.
+        assert_eq!(
+            bus.resets_state & (1u32 << crate::bus::RESET_TIMER0),
+            0,
+            "TIMER0 must be released at post-bootrom"
+        );
+        assert_eq!(
+            bus.resets_state & (1u32 << crate::bus::RESET_TIMER1),
+            0,
+            "TIMER1 must be released at post-bootrom"
+        );
     }
 
     #[test]

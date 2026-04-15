@@ -7245,13 +7245,20 @@ fn test_config_default_uses_rosc_frequency() {
 // ============================================================================
 
 #[test]
-fn test_rosc_is_default_sys_clock() {
-    use crate::bus::clocks::ROSC_FREQ_HZ;
+fn test_bus_new_is_post_bootrom_sys_clock() {
+    // B5 (HLD V5 §5.7): Bus::new() installs the post-bootrom clock
+    // table directly — clk_sys=150 MHz, clk_ref=12 MHz. This is the
+    // state firmware sees after pico-sdk `runtime_init_clocks` on
+    // silicon, and load_image-based tests need to see it too.
+    // Replaces the earlier "Bus::new starts at ROSC" test, which was
+    // locking in the pre-B5 inconsistency (Bus::new returned ROSC
+    // while Emulator::reset returned post-bootrom).
+    use mdpicoem_common::clocks::{RP2350_SYS_CLK_HZ, XOSC_FREQ_HZ};
     let bus = Bus::new();
-    assert_eq!(bus.sys_clk_hz(), ROSC_FREQ_HZ,
-        "fresh Bus should report ROSC as the system clock");
-    assert_eq!(bus.ref_clk_hz(), ROSC_FREQ_HZ,
-        "fresh Bus should report ROSC as the reference clock");
+    assert_eq!(bus.sys_clk_hz(), RP2350_SYS_CLK_HZ,
+        "fresh Bus must report post-bootrom clk_sys = 150 MHz");
+    assert_eq!(bus.ref_clk_hz(), XOSC_FREQ_HZ,
+        "fresh Bus must report post-bootrom clk_ref = 12 MHz (XOSC)");
 }
 
 #[test]
@@ -7326,9 +7333,15 @@ fn test_unconfigured_pll_zero_hz() {
 #[test]
 fn test_pll_usb_separate_from_pll_sys() {
     // Configuring PLL_USB must not bleed into PLL_SYS — they have
-    // separate backing arrays. CLK_SYS stays on clk_ref (ROSC), so
-    // sys_clk_hz is unaffected by PLL_USB changes.
+    // separate backing arrays. CLK_SYS stays on clk_ref (ROSC at reset
+    // register state), so sys_clk_hz is unaffected by PLL_USB changes.
+    // We sample `before` after an initial CLOCKS write so recompute
+    // has installed the register-derived value — post-B5, Bus::new
+    // seeds the post-bootrom table, but a CLOCKS write always reverts
+    // sys_clk_hz to the register-derived frequency.
     let (_, mut bus) = core_and_bus();
+    // Prime `before` with a CLOCKS write to trigger recompute once.
+    bus.write32(0x4001_003C, 0x0000_0000); // CLK_SYS_CTRL SRC=0 (clk_ref → ROSC)
     let before = bus.sys_clk_hz();
     // Configure PLL_USB to some non-trivial value (48 MHz: FBDIV=100,
     // POSTDIV1=5, POSTDIV2=5; VCO=1200M / 25 = 48M).

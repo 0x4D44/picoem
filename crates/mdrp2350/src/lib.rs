@@ -2,6 +2,7 @@ pub mod core;
 pub mod bus;
 pub mod irq;
 pub mod memory;
+pub mod peripherals;
 pub mod sio;
 pub mod pio;
 
@@ -91,7 +92,14 @@ impl Emulator {
         // Clear bus state
         self.bus.clear_bus_fault();
         self.bus.ppb = [Default::default(), Default::default()];
-        self.bus.resets_state = 0x1FFF_FFFF;
+        // HLD V5 §5.7: post-bootrom RESETS state — peripherals
+        // released by pico-sdk `runtime_init_bootrom_reset` start
+        // deasserted. The emulator never runs the bootrom; we seed
+        // the post-bootrom state directly.
+        self.bus.resets_state = crate::bus::RESETS_POST_BOOTROM;
+        self.bus.ticks.reset();
+        self.bus.timer0.reset();
+        self.bus.timer1.reset();
         self.bus.irq_pending = [0; 2];
         self.bus.event_flag = [false; 2];
         self.bus.rcp_salt = [0; 2];
@@ -119,6 +127,12 @@ impl Emulator {
         // Reset clock. The authoritative sys_clk_hz lives on Bus's
         // clock tree (see bus/clocks.rs), so nothing to preserve here.
         self.clock = Clock { cycles: 0 };
+
+        // HLD V5 §5.7: post-bootrom clock tree. firmware running via
+        // `load_image` bypasses the bootrom, so scenarios see the
+        // pico-sdk post-`runtime_init_clocks` state (clk_sys = 150 MHz,
+        // clk_ref = 12 MHz, clk_peri = clk_sys).
+        self.bus.seed_post_bootrom_clocks();
     }
 
     /// Load a raw binary at the given address.
@@ -188,6 +202,16 @@ impl Emulator {
         }
 
         self.clock.advance(self.step_quantum as u64);
+        // S4: peripherals tick the full quantum, not `consumed` (bytes
+        // the cores actually executed). V5 §5.5 prescribes an
+        // unconditional per-cycle tick; batching by `step_quantum`
+        // preserves the contract while saving dispatch cost. A halted
+        // core skews `core.cycles` against `clock.cycles` by at most one
+        // quantum, so the drift never exceeds `step_quantum` cycles — a
+        // tolerance the HLD accepts (see V5 §5.5). mdrp2040's tick loop
+        // uses `consumed` instead; mdrp2350 explicitly diverges because
+        // the ARMv8-M dual-core contention model is disabled here
+        // (CLAUDE.md "Bank contention model").
         self.tick_peripherals(self.step_quantum);
         self.tick_systick();
         self.wake_checks();
@@ -215,6 +239,11 @@ impl Emulator {
         }
         self.update_gpio();
         self.bus.sio.tick_mtime_n(cycles);
+        // Bus peripherals (TICKS + TIMER0 + TIMER1 in V5 Phase 1).
+        // HLD V5 §5.3 / §5.5: tick runs every quantum unconditionally,
+        // no fast-path gate in V5. Drains alarm-match IRQs into both
+        // cores' NVIC pending masks via `assert_irq_shared`.
+        self.bus.tick_peripherals(cycles);
     }
 
     /// Quantum-end SysTick advance. Each core's SysTick is ticked by the
@@ -368,11 +397,16 @@ impl EmulatorBuilder {
     }
 
     pub fn build(self) -> Emulator {
-        // Seed Bus's clock tree from Config::sys_clk_hz (vestigial
-        // seed per LLD V2 §4.9). First write to any CLOCKS/PLL
-        // register replaces the seed with the derived value.
+        // `Bus::new` already installs the HLD V5 §5.7 post-bootrom clock
+        // table (`clk_sys = 150 MHz`, `clk_ref = 12 MHz`). Only override
+        // it when the caller supplied a non-default `Config::sys_clk_hz`
+        // — overwriting the post-bootrom seed with ROSC for default
+        // callers would regress the invariant "Bus::new(), Emulator::new,
+        // and Emulator::reset all yield the same clock state".
         let mut bus = Bus::new();
-        bus.seed_sys_clk_hz(self.config.sys_clk_hz);
+        if self.config.sys_clk_hz != Config::default().sys_clk_hz {
+            bus.seed_sys_clk_hz(self.config.sys_clk_hz);
+        }
         Emulator {
             cores: [CortexM33::with_id(0), CortexM33::with_id(1)],
             bus,

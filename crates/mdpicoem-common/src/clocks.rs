@@ -17,6 +17,15 @@ pub const ROSC_FREQ_HZ: u32 = 6_500_000;
 /// XOSC nominal frequency (12 MHz). Standard Pico SDK configuration.
 pub const XOSC_FREQ_HZ: u32 = 12_000_000;
 
+/// RP2350 nominal post-bootrom system clock (150 MHz). Used by the
+/// emulator to seed `clk_sys` at reset so firmware running via
+/// `load_image` (bypassing the bootrom) sees the same clock state it
+/// would on real silicon after `runtime_init_clocks`. HLD V5 §5.7.
+pub const RP2350_SYS_CLK_HZ: u32 = 150_000_000;
+
+/// RP2350 nominal post-bootrom ADC clock (48 MHz — USB PLL / 10).
+pub const RP2350_ADC_CLK_HZ: u32 = 48_000_000;
+
 /// Derived clock tree frequencies. Recomputed eagerly whenever any
 /// clock-relevant register (CLOCKS, PLL_SYS, PLL_USB) changes.
 #[derive(Debug, Clone, Copy)]

@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
+use crate::irq::{IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0};
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
+use crate::peripherals::ticks::{TicksRegs, TICKS_BASE};
+use crate::peripherals::timer::{TimerRegs, TIMER0_BASE, TIMER1_BASE};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
 
@@ -82,6 +85,101 @@ pub(crate) fn is_cacheable_pc(pc: u32) -> bool {
     matches!(pc >> 28, 0x0 | 0x1 | 0x2)
 }
 
+// --- RESETS bit assignments (RP2350 datasheet §7.5 Table 486) ----------
+//
+// RP2350 RESETS.RESET is a 29-bit field (bits 0..=28); bits 29..=31 are
+// RAZ/WI. Constants here are cross-checked against
+// `target/tmp/src_clone/one-rom/sdrr/include/reg-rp235x.h` (which
+// quotes the relevant subset from datasheet Table 486). Only the
+// peripherals Phase 1+ actually model are named; extend as each new
+// peripheral lands.
+//
+// TICKS is **not** gated by RESETS — the tick generator is a bus-level
+// block that silicon does not put behind a reset line. Pico-SDK runtime
+// init programs TICKS before any TIMER use without touching RESETS for
+// it.
+
+/// RESETS bit for ADC (datasheet §7.5).
+pub const RESET_ADC: u8 = 0;
+/// RESETS bit for DMA.
+pub const RESET_DMA: u8 = 2;
+/// RESETS bit for HSTX.
+pub const RESET_HSTX: u8 = 3;
+/// RESETS bit for IO_BANK0.
+pub const RESET_IO_BANK0: u8 = 6;
+/// RESETS bit for PADS_BANK0.
+pub const RESET_PADS_BANK0: u8 = 9;
+/// RESETS bit for PIO0.
+pub const RESET_PIO0: u8 = 11;
+/// RESETS bit for PIO1.
+pub const RESET_PIO1: u8 = 12;
+/// RESETS bit for PIO2.
+pub const RESET_PIO2: u8 = 13;
+/// RESETS bit for PLL_SYS.
+pub const RESET_PLL_SYS: u8 = 14;
+/// RESETS bit for PLL_USB.
+pub const RESET_PLL_USB: u8 = 15;
+/// RESETS bit for PWM.
+pub const RESET_PWM: u8 = 16;
+/// RESETS bit for SPI0.
+pub const RESET_SPI0: u8 = 18;
+/// RESETS bit for SPI1.
+pub const RESET_SPI1: u8 = 19;
+/// RESETS bit for SYSCFG.
+pub const RESET_SYSCFG: u8 = 20;
+/// RESETS bit for SYSINFO.
+pub const RESET_SYSINFO: u8 = 21;
+/// RESETS bit for TIMER0 (datasheet §7.5, `RESET_TIMER0` in
+/// `reg-rp235x.h`).
+pub const RESET_TIMER0: u8 = 23;
+/// RESETS bit for TIMER1 (datasheet §7.5; alphabetical slot after
+/// TIMER0 / TBMAN).
+pub const RESET_TIMER1: u8 = 24;
+/// RESETS bit for UART0.
+pub const RESET_UART0: u8 = 26;
+/// RESETS bit for UART1.
+pub const RESET_UART1: u8 = 27;
+/// RESETS bit for USBCTRL.
+pub const RESET_USBCTRL: u8 = 28;
+
+/// Post-bootrom `RESETS.RESET` state — peripherals released by pico-sdk
+/// `runtime_init_bootrom_reset`. See HLD V5 §5.7.
+///
+/// Held-in-reset bits (bits 0..=28 minus the released set) cover
+/// OTP, SHA256, TRNG, GLITCH_DETECTOR, POWMAN — blocks the emulator
+/// does not model; keeping them held means firmware that accidentally
+/// pokes those windows gets 0/noop via the Bus-level guard rather
+/// than the HashMap fallthrough.
+pub const RESETS_POST_BOOTROM: u32 = {
+    let released = (1u32 << RESET_PLL_SYS)
+        | (1u32 << RESET_PLL_USB)
+        | (1u32 << RESET_IO_BANK0)
+        | (1u32 << RESET_PADS_BANK0)
+        | (1u32 << RESET_TIMER0)
+        | (1u32 << RESET_TIMER1)
+        | (1u32 << RESET_SYSCFG)
+        | (1u32 << RESET_SYSINFO);
+    // Field width is 29 bits (datasheet §7.5).
+    let mask: u32 = 0x1FFF_FFFF;
+    mask & !released
+};
+
+/// Maps a peripheral base address to the RESETS bit gating it. Used
+/// by [`Bus::is_held_in_reset_base`] to inline the RESETS guard on
+/// `read32` / `write32` dispatch (HLD V5 §5.3, inline, no separate
+/// `peripheral_dispatch.rs` file).
+///
+/// Peripherals not listed here are either not reset-gated (SIO, PPB,
+/// memory, TICKS) or not yet modelled at the Bus level.
+#[inline]
+pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
+    match base {
+        TIMER0_BASE => Some(RESET_TIMER0),
+        TIMER1_BASE => Some(RESET_TIMER1),
+        _ => None,
+    }
+}
+
 /// Bus fabric — address decode and cycle accounting.
 ///
 /// Phase 1: flat memory, single-cycle access everywhere.
@@ -121,8 +219,19 @@ pub struct Bus {
     /// the per-core NVIC banks on Ppb (ISPR writes).
     pub(crate) irq_pending: [u64; 2],
     /// RESETS peripheral state: bits set = peripheral in reset.
-    /// Default 0x1FFF_FFFF — all peripherals held in reset at boot.
+    /// Default [`RESETS_POST_BOOTROM`] — peripherals released by
+    /// pico-sdk `runtime_init_bootrom_reset` per HLD V5 §5.7.
+    /// `Emulator::reset` restores this value. The underlying RP2350
+    /// hardware-reset value is 0x1FFF_FFFF (all 29 peripherals held),
+    /// but the emulator starts from post-bootrom state because
+    /// `load_image` bypasses the bootrom.
     pub resets_state: u32,
+    /// TICKS block (HLD V5 §5.4). Six-domain 1 µs tick generator.
+    pub(crate) ticks: TicksRegs,
+    /// TIMER0 — 64-bit microsecond counter + four alarms (HLD V5 §5.4).
+    pub(crate) timer0: TimerRegs,
+    /// TIMER1 — same shape as TIMER0, driven by the TIMER1 TICKS domain.
+    pub(crate) timer1: TimerRegs,
     /// Bus fault detected on last access.
     bus_fault: bool,
     /// Address that caused the most recent bus fault.
@@ -255,12 +364,26 @@ pub struct Bus {
 
 impl Bus {
     pub fn new() -> Self {
+        // HLD V5 §5.7: construction alone produces post-bootrom state.
+        // `Bus::new()`, `Emulator::new(...)`, and `Emulator::reset()` all
+        // land on the same clock / RESETS / TICKS table, so `load_image`
+        // firmware (which bypasses the bootrom) observes the same state
+        // real silicon would see after pico-sdk `runtime_init_*`.
+        use mdpicoem_common::clocks::{RP2350_SYS_CLK_HZ, XOSC_FREQ_HZ};
+        let post_bootrom_tree = ClockTree {
+            sys_clk_hz: RP2350_SYS_CLK_HZ,
+            ref_clk_hz: XOSC_FREQ_HZ,
+            peri_clk_hz: RP2350_SYS_CLK_HZ,
+        };
         Self {
             memory: Memory::new(),
             last_access_cycles: 0,
             extra_wait_states: 0,
             peripheral_regs: HashMap::new(),
-            resets_state: 0x1FFF_FFFF,
+            resets_state: RESETS_POST_BOOTROM,
+            ticks: TicksRegs::post_bootrom(),
+            timer0: TimerRegs::new(IRQ_TIMER0_IRQ_0),
+            timer1: TimerRegs::new(IRQ_TIMER1_IRQ_0),
             active_core: 0,
             ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
             irq_pending: [0; 2],
@@ -274,7 +397,7 @@ impl Bus {
             clk_ref_ctrl: 0,
             clk_sys_ctrl: 0,
             clk_sys_div: 0x0001_0000,
-            clock_tree: ClockTree::default(),
+            clock_tree: post_bootrom_tree,
             pll_sys_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
             pll_usb_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
             master_cycle: 0,
@@ -323,11 +446,37 @@ impl Bus {
     /// by any write to a CLOCKS or PLL register — overwrites the seed
     /// with the register-derived value.
     ///
-    /// Used by `EmulatorBuilder::build` to forward `Config::sys_clk_hz`
-    /// into the Bus as the vestigial seed (LLD V2 §4.9).
+    /// Used by `EmulatorBuilder::build` to forward a non-default
+    /// `Config::sys_clk_hz` into the Bus as the vestigial seed
+    /// (LLD V2 §4.9). `Bus::new` already installs the HLD V5 §5.7
+    /// post-bootrom table, so only non-default configs need this
+    /// override — hence the builder's call is conditional.
     pub fn seed_sys_clk_hz(&mut self, hz: u32) {
         self.clock_tree.sys_clk_hz = hz;
         self.clock_tree.ref_clk_hz = hz;
+    }
+
+    /// Seed the clock tree to the RP2350 post-bootrom state per HLD
+    /// V5 §5.7: `clk_sys = 150 MHz`, `clk_ref = 12 MHz`,
+    /// `clk_peri = clk_sys`. Idempotent with [`Self::new`], which
+    /// already installs this table — called again from
+    /// `Emulator::reset` so a reset that ran firmware first (and
+    /// mutated the `ClockTree` via register writes) returns to a known
+    /// baseline.
+    ///
+    /// A subsequent write to any CLOCKS / PLL register triggers
+    /// [`Self::recompute_clock_tree`], which replaces these seeded
+    /// values with register-derived ones — so firmware that actually
+    /// reprograms the clock tree at boot still produces the right
+    /// post-reprogram frequencies.
+    ///
+    /// `clk_adc` is not yet carried on `ClockTree`; when Phase 2 adds
+    /// it, seed it here to `RP2350_ADC_CLK_HZ` (48 MHz).
+    pub fn seed_post_bootrom_clocks(&mut self) {
+        use mdpicoem_common::clocks::{RP2350_SYS_CLK_HZ, XOSC_FREQ_HZ};
+        self.clock_tree.sys_clk_hz = RP2350_SYS_CLK_HZ;
+        self.clock_tree.ref_clk_hz = XOSC_FREQ_HZ;
+        self.clock_tree.peri_clk_hz = RP2350_SYS_CLK_HZ;
     }
 
     /// Current effective reference clock frequency in Hz.
@@ -675,6 +824,80 @@ impl Bus {
         false
     }
 
+    // --- RESETS guard / peripheral tick (HLD V5 §5.3 / §5.5) ------------
+
+    /// True iff the peripheral whose bus base is `base` is currently
+    /// held in `RESETS.RESET`. Called inline from `read32` / `write32`
+    /// dispatch before routing to the peripheral module. HLD V5 §5.3.
+    ///
+    /// Returns `false` for unmapped bases — they fall through to the
+    /// non-reset-gated HashMap / peripheral path.
+    #[inline]
+    pub(crate) fn is_held_in_reset_base(&self, base: u32) -> bool {
+        match reset_bit_for_base(base) {
+            Some(bit) => (self.resets_state & (1u32 << bit)) != 0,
+            None => false,
+        }
+    }
+
+    /// True iff the peripheral whose RESETS bit is `bit` is currently
+    /// held. Used by the tick path to skip reset-held peripherals.
+    #[inline]
+    pub(crate) fn is_held_in_reset_bit(&self, bit: u8) -> bool {
+        (self.resets_state & (1u32 << bit)) != 0
+    }
+
+    /// Advance every stateful peripheral by `sys_clks` system-clock
+    /// cycles, then route any latched IRQs into the NVIC pending masks.
+    /// Called at quantum end from [`crate::Emulator::step`] per HLD
+    /// V5 §5.3 / §5.5.
+    ///
+    /// V5 does NOT gate this call — the prompt is explicit: "tick
+    /// every cycle, unconditionally. A follow-up HLD will add a gate
+    /// if `paced_bench_rp2350` regression exceeds the §9.8 threshold."
+    pub(crate) fn tick_peripherals(&mut self, sys_clks: u32) {
+        // TICKS runs unconditionally — there is no RESETS bit for the
+        // tick generator (it is bus-level plumbing). Advance all six
+        // domains; only TIMER0 / TIMER1 consumers drain edges.
+        self.ticks.advance_all(sys_clks);
+
+        // TIMER0 — advance microsecond counter by the edges accumulated
+        // on the TIMER0 TICKS domain, poll alarms, route shared IRQ.
+        if !self.is_held_in_reset_bit(RESET_TIMER0) {
+            let edges = self.ticks.take_timer0_edges();
+            if edges > 0 {
+                self.timer0.advance_us(edges);
+            }
+            let bits = self.timer0.poll_alarms();
+            self.raise_timer_irqs(bits);
+        }
+
+        // TIMER1 — same as TIMER0 against its own domain + IRQ base.
+        if !self.is_held_in_reset_bit(RESET_TIMER1) {
+            let edges = self.ticks.take_timer1_edges();
+            if edges > 0 {
+                self.timer1.advance_us(edges);
+            }
+            let bits = self.timer1.poll_alarms();
+            self.raise_timer_irqs(bits);
+        }
+    }
+
+    /// Raise the IRQ lines encoded in `bits` via `assert_irq_shared`.
+    /// TIMER0/1 IRQs are all shared (both cores' NVIC see the pend).
+    #[inline]
+    fn raise_timer_irqs(&mut self, bits: u64) {
+        if bits == 0 {
+            return;
+        }
+        let mut remaining = bits;
+        while remaining != 0 {
+            let irq = remaining.trailing_zeros();
+            self.assert_irq_shared(irq);
+            remaining &= remaining - 1;
+        }
+    }
+
     /// Returns true if a bus fault was detected on the last access.
     pub fn bus_fault(&self) -> bool {
         self.bus_fault
@@ -888,19 +1111,26 @@ impl Bus {
                 let base = canonical & 0xFFFF_F000;
                 let word_addr = canonical & !3;
                 let offset = word_addr & 0x0000_0FFF;
-                let word = match base {
-                    0x4000_0000 => self.sysinfo_read(offset),
-                    0x4002_0000 => self.resets_read(offset),
-                    0x4001_0000 => self.clocks_read(offset),
-                    0x4004_8000 => self.xosc_read(offset),
-                    0x400E_8000 => self.rosc_read(offset),
-                    0x4005_0000 => self.pll_sys_read(offset),
-                    0x4005_8000 => self.pll_usb_read(offset),
-                    0x400D_0000 => self.qmi_read(offset),
-                    0x5020_0000 => self.pio[0].read32(offset),
-                    0x5030_0000 => self.pio[1].read32(offset),
-                    0x5040_0000 => self.pio[2].read32(offset),
-                    _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                let word = if self.is_held_in_reset_base(base) {
+                    0
+                } else {
+                    match base {
+                        0x4000_0000 => self.sysinfo_read(offset),
+                        0x4002_0000 => self.resets_read(offset),
+                        0x4001_0000 => self.clocks_read(offset),
+                        0x4004_8000 => self.xosc_read(offset),
+                        0x400E_8000 => self.rosc_read(offset),
+                        0x4005_0000 => self.pll_sys_read(offset),
+                        0x4005_8000 => self.pll_usb_read(offset),
+                        0x400D_0000 => self.qmi_read(offset),
+                        TIMER0_BASE => self.timer0.read32(offset),
+                        TIMER1_BASE => self.timer1.read32(offset),
+                        TICKS_BASE => self.ticks.read32(offset),
+                        0x5020_0000 => self.pio[0].read32(offset),
+                        0x5030_0000 => self.pio[1].read32(offset),
+                        0x5040_0000 => self.pio[2].read32(offset),
+                        _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                    }
                 };
                 let byte_idx = (canonical & 3) as usize;
                 word.to_le_bytes()[byte_idx]
@@ -971,76 +1201,112 @@ impl Bus {
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
-                match base {
-                    0x4000_0000 => {
-                        // SYSINFO: read-only, ignore byte writes
-                    }
-                    0x400D_0000 => {
-                        // QMI: do RMW on the word
-                        let word_addr = canonical & !3;
-                        let byte_idx = (canonical & 3) as usize;
-                        let reg_offset = word_addr & 0x0000_0FFF;
-                        let old_word = self.qmi_read(reg_offset);
-                        let mut bytes = old_word.to_le_bytes();
-                        bytes[byte_idx] = val;
-                        self.qmi_write(reg_offset, u32::from_le_bytes(bytes));
-                    }
-                    0x4001_0000 | 0x4005_0000 | 0x4005_8000
-                    | 0x4004_8000 | 0x400E_8000 => {
-                        // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
-                        // peripherals that handle the atomic alias
-                        // internally. For a subword SET/CLR/XOR we
-                        // must preserve the alias semantic — passing
-                        // alias=0 after an RMW merge would turn SET
-                        // into plain overwrite (see LLD V2 §4.8 note
-                        // on the pre-existing subword bug). Strategy:
-                        //   • alias == 0 → RMW the word, pass alias=0.
-                        //   • alias != 0 → expand byte to `byte << shift`
-                        //     and let the peripheral's alias logic
-                        //     apply SET / CLR / XOR bit-wise.
-                        let word_addr = canonical & !3;
-                        let byte_idx = (canonical & 3) as usize;
-                        let reg_offset = word_addr & 0x0000_0FFF;
-                        let (word_val, pass_alias) = if alias == 0 {
-                            let old_word = match base {
-                                0x4001_0000 => self.clocks_read(reg_offset),
-                                0x4005_0000 => self.pll_sys_read(reg_offset),
-                                0x4005_8000 => self.pll_usb_read(reg_offset),
-                                0x4004_8000 => self.xosc_read(reg_offset),
-                                _ => self.rosc_read(reg_offset),
-                            };
+                // RESETS Bus-level guard (HLD V5 §5.3). Held
+                // peripherals drop the write silently.
+                if self.is_held_in_reset_base(base) {
+                    // no-op
+                } else {
+                    match base {
+                        0x4000_0000 => {
+                            // SYSINFO: read-only, ignore byte writes
+                        }
+                        0x400D_0000 => {
+                            // QMI: do RMW on the word
+                            let word_addr = canonical & !3;
+                            let byte_idx = (canonical & 3) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let old_word = self.qmi_read(reg_offset);
                             let mut bytes = old_word.to_le_bytes();
                             bytes[byte_idx] = val;
-                            (u32::from_le_bytes(bytes), 0)
-                        } else {
-                            ((val as u32) << (byte_idx * 8), alias)
-                        };
-                        match base {
-                            0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
-                            0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
-                            0x4005_8000 => self.pll_usb_write(reg_offset, word_val, pass_alias),
-                            0x4004_8000 => self.xosc_write(reg_offset, word_val, pass_alias),
-                            _ => self.rosc_write(reg_offset, word_val, pass_alias),
+                            self.qmi_write(reg_offset, u32::from_le_bytes(bytes));
                         }
-                    }
-                    0x4002_0000 => {
-                        // RESETS: only word-aligned writes meaningful, ignore byte
-                    }
-                    0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
-                    _ => {
-                        let word_addr = canonical & !3;
-                        let byte_idx = (canonical & 3) as usize;
-                        let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
-                        let mut bytes = old_word.to_le_bytes();
-                        let old_byte = bytes[byte_idx];
-                        bytes[byte_idx] = match alias {
-                            0 => val,
-                            1 => old_byte ^ val,
-                            2 => old_byte | val,
-                            3 => old_byte & !val,
-                            _ => unreachable!(),
-                        };
-                        self.peripheral_regs.insert(word_addr, u32::from_le_bytes(bytes));
+                        0x4001_0000 | 0x4005_0000 | 0x4005_8000
+                        | 0x4004_8000 | 0x400E_8000 => {
+                            // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
+                            // peripherals that handle the atomic alias
+                            // internally. For a subword SET/CLR/XOR we
+                            // must preserve the alias semantic — passing
+                            // alias=0 after an RMW merge would turn SET
+                            // into plain overwrite (see LLD V2 §4.8 note
+                            // on the pre-existing subword bug). Strategy:
+                            //   • alias == 0 → RMW the word, pass alias=0.
+                            //   • alias != 0 → expand byte to `byte << shift`
+                            //     and let the peripheral's alias logic
+                            //     apply SET / CLR / XOR bit-wise.
+                            let word_addr = canonical & !3;
+                            let byte_idx = (canonical & 3) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    0x4001_0000 => self.clocks_read(reg_offset),
+                                    0x4005_0000 => self.pll_sys_read(reg_offset),
+                                    0x4005_8000 => self.pll_usb_read(reg_offset),
+                                    0x4004_8000 => self.xosc_read(reg_offset),
+                                    _ => self.rosc_read(reg_offset),
+                                };
+                                let mut bytes = old_word.to_le_bytes();
+                                bytes[byte_idx] = val;
+                                (u32::from_le_bytes(bytes), 0)
+                            } else {
+                                ((val as u32) << (byte_idx * 8), alias)
+                            };
+                            match base {
+                                0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
+                                0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
+                                0x4005_8000 => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                                0x4004_8000 => self.xosc_write(reg_offset, word_val, pass_alias),
+                                _ => self.rosc_write(reg_offset, word_val, pass_alias),
+                            }
+                        }
+                        TIMER0_BASE | TIMER1_BASE | TICKS_BASE => {
+                            // TIMER / TICKS: same subword-alias
+                            // strategy as CLOCKS — preserve SET/CLR/XOR
+                            // semantics when the access was an alias.
+                            let word_addr = canonical & !3;
+                            let byte_idx = (canonical & 3) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    TIMER0_BASE => self.timer0.read32(reg_offset),
+                                    TIMER1_BASE => self.timer1.read32(reg_offset),
+                                    _ => self.ticks.read32(reg_offset),
+                                };
+                                let mut bytes = old_word.to_le_bytes();
+                                bytes[byte_idx] = val;
+                                (u32::from_le_bytes(bytes), 0)
+                            } else {
+                                ((val as u32) << (byte_idx * 8), alias)
+                            };
+                            match base {
+                                TIMER0_BASE => self.timer0.write32(reg_offset, word_val, pass_alias),
+                                TIMER1_BASE => self.timer1.write32(reg_offset, word_val, pass_alias),
+                                _ => {
+                                    if self.ticks.write32(reg_offset, word_val, pass_alias) {
+                                        self.timer0.invalidate_lazy();
+                                        self.timer1.invalidate_lazy();
+                                    }
+                                }
+                            }
+                        }
+                        0x4002_0000 => {
+                            // RESETS: only word-aligned writes meaningful, ignore byte
+                        }
+                        0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
+                        _ => {
+                            let word_addr = canonical & !3;
+                            let byte_idx = (canonical & 3) as usize;
+                            let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
+                            let mut bytes = old_word.to_le_bytes();
+                            let old_byte = bytes[byte_idx];
+                            bytes[byte_idx] = match alias {
+                                0 => val,
+                                1 => old_byte ^ val,
+                                2 => old_byte | val,
+                                3 => old_byte & !val,
+                                _ => unreachable!(),
+                            };
+                            self.peripheral_regs.insert(word_addr, u32::from_le_bytes(bytes));
+                        }
                     }
                 }
             }
@@ -1091,19 +1357,26 @@ impl Bus {
                 let base = canonical & 0xFFFF_F000;
                 let word_addr = canonical & !3;
                 let offset = word_addr & 0x0000_0FFF;
-                let word = match base {
-                    0x4000_0000 => self.sysinfo_read(offset),
-                    0x4002_0000 => self.resets_read(offset),
-                    0x4001_0000 => self.clocks_read(offset),
-                    0x4004_8000 => self.xosc_read(offset),
-                    0x400E_8000 => self.rosc_read(offset),
-                    0x4005_0000 => self.pll_sys_read(offset),
-                    0x4005_8000 => self.pll_usb_read(offset),
-                    0x400D_0000 => self.qmi_read(offset),
-                    0x5020_0000 => self.pio[0].read32(offset),
-                    0x5030_0000 => self.pio[1].read32(offset),
-                    0x5040_0000 => self.pio[2].read32(offset),
-                    _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                let word = if self.is_held_in_reset_base(base) {
+                    0
+                } else {
+                    match base {
+                        0x4000_0000 => self.sysinfo_read(offset),
+                        0x4002_0000 => self.resets_read(offset),
+                        0x4001_0000 => self.clocks_read(offset),
+                        0x4004_8000 => self.xosc_read(offset),
+                        0x400E_8000 => self.rosc_read(offset),
+                        0x4005_0000 => self.pll_sys_read(offset),
+                        0x4005_8000 => self.pll_usb_read(offset),
+                        0x400D_0000 => self.qmi_read(offset),
+                        TIMER0_BASE => self.timer0.read32(offset),
+                        TIMER1_BASE => self.timer1.read32(offset),
+                        TICKS_BASE => self.ticks.read32(offset),
+                        0x5020_0000 => self.pio[0].read32(offset),
+                        0x5030_0000 => self.pio[1].read32(offset),
+                        0x5040_0000 => self.pio[2].read32(offset),
+                        _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                    }
                 };
                 let half_idx = ((canonical >> 1) & 1) as usize;
                 let halves: [u16; 2] = [word as u16, (word >> 16) as u16];
@@ -1181,73 +1454,112 @@ impl Bus {
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
-                match base {
-                    0x4000_0000 => {
-                        // SYSINFO: read-only, ignore halfword writes
-                    }
-                    0x400D_0000 => {
-                        // QMI: do RMW on the word
-                        let word_addr = canonical & !3;
-                        let half_idx = ((canonical >> 1) & 1) as usize;
-                        let reg_offset = word_addr & 0x0000_0FFF;
-                        let old_word = self.qmi_read(reg_offset);
-                        let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
-                        halves[half_idx] = val;
-                        self.qmi_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
-                    }
-                    0x4001_0000 | 0x4005_0000 | 0x4005_8000
-                    | 0x4004_8000 | 0x400E_8000 => {
-                        // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
-                        // same subword-alias strategy as `write8`
-                        // (see the comment there).
-                        let word_addr = canonical & !3;
-                        let half_idx = ((canonical >> 1) & 1) as usize;
-                        let reg_offset = word_addr & 0x0000_0FFF;
-                        let (word_val, pass_alias) = if alias == 0 {
-                            let old_word = match base {
-                                0x4001_0000 => self.clocks_read(reg_offset),
-                                0x4005_0000 => self.pll_sys_read(reg_offset),
-                                0x4005_8000 => self.pll_usb_read(reg_offset),
-                                0x4004_8000 => self.xosc_read(reg_offset),
-                                _ => self.rosc_read(reg_offset),
-                            };
-                            let mut halves: [u16; 2] =
-                                [old_word as u16, (old_word >> 16) as u16];
-                            halves[half_idx] = val;
-                            (
-                                (halves[0] as u32) | ((halves[1] as u32) << 16),
-                                0,
-                            )
-                        } else {
-                            ((val as u32) << (half_idx * 16), alias)
-                        };
-                        match base {
-                            0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
-                            0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
-                            0x4005_8000 => self.pll_usb_write(reg_offset, word_val, pass_alias),
-                            0x4004_8000 => self.xosc_write(reg_offset, word_val, pass_alias),
-                            _ => self.rosc_write(reg_offset, word_val, pass_alias),
+                // RESETS Bus-level guard (HLD V5 §5.3). Held
+                // peripherals drop the write silently.
+                if self.is_held_in_reset_base(base) {
+                    // no-op
+                } else {
+                    match base {
+                        0x4000_0000 => {
+                            // SYSINFO: read-only, ignore halfword writes
                         }
-                    }
-                    0x4002_0000 => {
-                        // RESETS: only word-aligned writes meaningful, ignore halfword
-                    }
-                    0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
-                    _ => {
-                        let word_addr = canonical & !3;
-                        let half_idx = ((canonical >> 1) & 1) as usize;
-                        let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
-                        let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
-                        let old_half = halves[half_idx];
-                        halves[half_idx] = match alias {
-                            0 => val,
-                            1 => old_half ^ val,
-                            2 => old_half | val,
-                            3 => old_half & !val,
-                            _ => unreachable!(),
-                        };
-                        let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
-                        self.peripheral_regs.insert(word_addr, new_word);
+                        0x400D_0000 => {
+                            // QMI: do RMW on the word
+                            let word_addr = canonical & !3;
+                            let half_idx = ((canonical >> 1) & 1) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let old_word = self.qmi_read(reg_offset);
+                            let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
+                            halves[half_idx] = val;
+                            self.qmi_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
+                        }
+                        0x4001_0000 | 0x4005_0000 | 0x4005_8000
+                        | 0x4004_8000 | 0x400E_8000 => {
+                            // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
+                            // same subword-alias strategy as `write8`
+                            // (see the comment there).
+                            let word_addr = canonical & !3;
+                            let half_idx = ((canonical >> 1) & 1) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    0x4001_0000 => self.clocks_read(reg_offset),
+                                    0x4005_0000 => self.pll_sys_read(reg_offset),
+                                    0x4005_8000 => self.pll_usb_read(reg_offset),
+                                    0x4004_8000 => self.xosc_read(reg_offset),
+                                    _ => self.rosc_read(reg_offset),
+                                };
+                                let mut halves: [u16; 2] =
+                                    [old_word as u16, (old_word >> 16) as u16];
+                                halves[half_idx] = val;
+                                (
+                                    (halves[0] as u32) | ((halves[1] as u32) << 16),
+                                    0,
+                                )
+                            } else {
+                                ((val as u32) << (half_idx * 16), alias)
+                            };
+                            match base {
+                                0x4001_0000 => self.clocks_write(reg_offset, word_val, pass_alias),
+                                0x4005_0000 => self.pll_sys_write(reg_offset, word_val, pass_alias),
+                                0x4005_8000 => self.pll_usb_write(reg_offset, word_val, pass_alias),
+                                0x4004_8000 => self.xosc_write(reg_offset, word_val, pass_alias),
+                                _ => self.rosc_write(reg_offset, word_val, pass_alias),
+                            }
+                        }
+                        TIMER0_BASE | TIMER1_BASE | TICKS_BASE => {
+                            // TIMER / TICKS halfword access: same
+                            // subword-alias strategy as CLOCKS.
+                            let word_addr = canonical & !3;
+                            let half_idx = ((canonical >> 1) & 1) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    TIMER0_BASE => self.timer0.read32(reg_offset),
+                                    TIMER1_BASE => self.timer1.read32(reg_offset),
+                                    _ => self.ticks.read32(reg_offset),
+                                };
+                                let mut halves: [u16; 2] =
+                                    [old_word as u16, (old_word >> 16) as u16];
+                                halves[half_idx] = val;
+                                (
+                                    (halves[0] as u32) | ((halves[1] as u32) << 16),
+                                    0,
+                                )
+                            } else {
+                                ((val as u32) << (half_idx * 16), alias)
+                            };
+                            match base {
+                                TIMER0_BASE => self.timer0.write32(reg_offset, word_val, pass_alias),
+                                TIMER1_BASE => self.timer1.write32(reg_offset, word_val, pass_alias),
+                                _ => {
+                                    if self.ticks.write32(reg_offset, word_val, pass_alias) {
+                                        self.timer0.invalidate_lazy();
+                                        self.timer1.invalidate_lazy();
+                                    }
+                                }
+                            }
+                        }
+                        0x4002_0000 => {
+                            // RESETS: only word-aligned writes meaningful, ignore halfword
+                        }
+                        0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
+                        _ => {
+                            let word_addr = canonical & !3;
+                            let half_idx = ((canonical >> 1) & 1) as usize;
+                            let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
+                            let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
+                            let old_half = halves[half_idx];
+                            halves[half_idx] = match alias {
+                                0 => val,
+                                1 => old_half ^ val,
+                                2 => old_half | val,
+                                3 => old_half & !val,
+                                _ => unreachable!(),
+                            };
+                            let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
+                            self.peripheral_regs.insert(word_addr, new_word);
+                        }
                     }
                 }
             }
@@ -1301,19 +1613,30 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 let offset = canonical & 0x0000_0FFF;
-                match base {
-                    0x4000_0000 => self.sysinfo_read(offset),
-                    0x4002_0000 => self.resets_read(offset),
-                    0x4001_0000 => self.clocks_read(offset),
-                    0x4004_8000 => self.xosc_read(offset),
-                    0x400E_8000 => self.rosc_read(offset),
-                    0x4005_0000 => self.pll_sys_read(offset),
-                    0x4005_8000 => self.pll_usb_read(offset),
-                    0x400D_0000 => self.qmi_read(offset),
-                    0x5020_0000 => self.pio[0].read32(offset),
-                    0x5030_0000 => self.pio[1].read32(offset),
-                    0x5040_0000 => self.pio[2].read32(offset),
-                    _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
+                // RESETS Bus-level guard (HLD V5 §5.3). Reset-gated
+                // peripherals return 0 without reaching the peripheral
+                // module. Inline — no separate peripheral_dispatch.rs
+                // file per V5 §8.
+                if self.is_held_in_reset_base(base) {
+                    0
+                } else {
+                    match base {
+                        0x4000_0000 => self.sysinfo_read(offset),
+                        0x4002_0000 => self.resets_read(offset),
+                        0x4001_0000 => self.clocks_read(offset),
+                        0x4004_8000 => self.xosc_read(offset),
+                        0x400E_8000 => self.rosc_read(offset),
+                        0x4005_0000 => self.pll_sys_read(offset),
+                        0x4005_8000 => self.pll_usb_read(offset),
+                        0x400D_0000 => self.qmi_read(offset),
+                        TIMER0_BASE => self.timer0.read32(offset),
+                        TIMER1_BASE => self.timer1.read32(offset),
+                        TICKS_BASE => self.ticks.read32(offset),
+                        0x5020_0000 => self.pio[0].read32(offset),
+                        0x5030_0000 => self.pio[1].read32(offset),
+                        0x5040_0000 => self.pio[2].read32(offset),
+                        _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
+                    }
                 }
             }
             0xD => {
@@ -1381,30 +1704,50 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 let offset = canonical & 0x0000_0FFF;
-                match base {
-                    0x4002_0000 => self.resets_write(offset, val, alias),
-                    0x400D_0000 => self.qmi_write(offset, val),
-                    0x4001_0000 => self.clocks_write(offset, val, alias),
-                    0x4005_0000 => self.pll_sys_write(offset, val, alias),
-                    0x4005_8000 => self.pll_usb_write(offset, val, alias),
-                    0x4004_8000 => self.xosc_write(offset, val, alias),
-                    0x400E_8000 => self.rosc_write(offset, val, alias),
-                    // SYSINFO (0x4000_0000): read-only, ignore writes
-                    0x4000_0000 => {}
-                    0x5020_0000 => self.pio[0].write32(offset, val, alias),
-                    0x5030_0000 => self.pio[1].write32(offset, val, alias),
-                    0x5040_0000 => self.pio[2].write32(offset, val, alias),
-                    _ => {
-                        // Existing HashMap path with alias logic
-                        let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
-                        let new_val = match alias {
-                            0 => val,
-                            1 => old ^ val,
-                            2 => old | val,
-                            3 => old & !val,
-                            _ => unreachable!(),
-                        };
-                        self.peripheral_regs.insert(canonical, new_val);
+                // RESETS Bus-level guard (HLD V5 §5.3). Reset-gated
+                // peripherals drop writes silently (inline per V5 §8).
+                if self.is_held_in_reset_base(base) {
+                    // no-op
+                } else {
+                    match base {
+                        0x4002_0000 => self.resets_write(offset, val, alias),
+                        0x400D_0000 => self.qmi_write(offset, val),
+                        0x4001_0000 => self.clocks_write(offset, val, alias),
+                        0x4005_0000 => self.pll_sys_write(offset, val, alias),
+                        0x4005_8000 => self.pll_usb_write(offset, val, alias),
+                        0x4004_8000 => self.xosc_write(offset, val, alias),
+                        0x400E_8000 => self.rosc_write(offset, val, alias),
+                        // SYSINFO (0x4000_0000): read-only, ignore writes
+                        0x4000_0000 => {}
+                        TIMER0_BASE => self.timer0.write32(offset, val, alias),
+                        TIMER1_BASE => self.timer1.write32(offset, val, alias),
+                        TICKS_BASE => {
+                            // HLD V5 §5.4: a TICKS write that can shift
+                            // the tick rate must invalidate TIMER0/1
+                            // cached match cycles. TicksRegs::write32
+                            // returns `true` for any TIMER0/1 domain
+                            // CTRL/CYCLES/COUNT touch.
+                            let invalidate = self.ticks.write32(offset, val, alias);
+                            if invalidate {
+                                self.timer0.invalidate_lazy();
+                                self.timer1.invalidate_lazy();
+                            }
+                        }
+                        0x5020_0000 => self.pio[0].write32(offset, val, alias),
+                        0x5030_0000 => self.pio[1].write32(offset, val, alias),
+                        0x5040_0000 => self.pio[2].write32(offset, val, alias),
+                        _ => {
+                            // Existing HashMap path with alias logic
+                            let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
+                            let new_val = match alias {
+                                0 => val,
+                                1 => old ^ val,
+                                2 => old | val,
+                                3 => old & !val,
+                                _ => unreachable!(),
+                            };
+                            self.peripheral_regs.insert(canonical, new_val);
+                        }
                     }
                 }
             }

@@ -396,6 +396,104 @@ const SLED_CLOCK_DIV_CHANGE_PIO_RUNNING_HW: [u16; 18] = [
 const SLED_CLOCK_DIV_CHANGE_PIO_RUNNING: &[u8] =
     &halfwords_to_le_bytes::<18, 36>(SLED_CLOCK_DIV_CHANGE_PIO_RUNNING_HW);
 
+// Phase 1 B1: `timer0_alarm0_fire_and_clear` — end-to-end TIMER0
+// exercise. Sled reads TIMELR, programs ALARM_0 at +1000 µs, enables
+// INTE.bit0, busy-polls INTS until bit 0, W1C's INTR, writes the
+// marker 0xDEADBEEF to 0x2000_0300, then BKPT #0. The scenario's setup
+// layer releases TIMER0 from RESETS and enables the TIMER0 TICKS
+// domain; post-bootrom CYCLES=12 is already in place (HLD V5 §5.7), so
+// no explicit CYCLES write is needed.
+//
+// Silicon expectations (validated by Arthur on the lab rig):
+//   - TIMER0.INTR reads 0 post-W1C.
+//   - TIMER0.TIMELR reads ≥ 1000 µs (alarm fired at ≥ target).
+//   - 0x2000_0300 holds 0xDEADBEEF (sled reached the marker write,
+//     i.e. INTS asserted and the W1C landed).
+//
+// Registers used (all caller-saved):
+//   r0 — scratch (TIMELR read, ALARM target)
+//   r1 — INTE/INTR/ALARM arm value (1)
+//   r2 — INTS read for polling
+//   r3 — TIMER0_BASE (0x400B_0000)
+//   r4 — marker value 0xDEADBEEF
+//   r5 — marker address 0x2000_0300
+//
+// Thumb-2 encodings per ARMv8-M ARM (same idioms as the PLL sled above):
+//   movw T3 / movt T1 / ldr T1 / str T1 (imm5 word offset, R0-R7) /
+//   adds T1 (reg) / movs T1 / tst T1 (reg) / b T1 (cond) / bkpt T1.
+#[rustfmt::skip]
+const SLED_TIMER0_ALARM0_FIRE_AND_CLEAR_HW: [u16; 25] = [
+    0xF240, //  [ 0] movw r3, #0x0000       ; r3 = TIMER0_BASE low half
+    0x0300, //  [ 1]
+    0xF2C4, //  [ 2] movt r3, #0x400B       ; r3 = 0x400B_0000
+    0x030B, //  [ 3]
+    0x68D8, //  [ 4] ldr  r0, [r3, #0x0C]   ; r0 = TIMELR (µs snapshot)
+    0xF240, //  [ 5] movw r1, #1000         ; r1 = 1000 µs offset
+    0x31E8, //  [ 6]
+    0x1840, //  [ 7] adds r0, r0, r1        ; r0 = target_us
+    0x6118, //  [ 8] str  r0, [r3, #0x10]   ; ALARM_0 = target (arms alarm 0)
+    0x2101, //  [ 9] movs r1, #1            ; r1 = 1 (bit0 mask)
+    0x6419, //  [10] str  r1, [r3, #0x40]   ; INTE = 1 (alarm-0 int enable)
+    0x6C9A, //  [11] ldr  r2, [r3, #0x48]   ; loop: r2 = INTS
+    0x420A, //  [12] tst  r2, r1            ;   Z=1 if INTS.bit0 == 0
+    0xD0FC, //  [13] beq  loop              ;   offset = -8 (back to [11])
+    0x63D9, //  [14] str  r1, [r3, #0x3C]   ; INTR = 1 (W1C alarm-0 latch)
+    0xF64B, //  [15] movw r4, #0xBEEF       ; r4 low half
+    0x64EF, //  [16]
+    0xF6CD, //  [17] movt r4, #0xDEAD       ; r4 = 0xDEADBEEF
+    0x64AD, //  [18]
+    0xF240, //  [19] movw r5, #0x0300       ; r5 low half
+    0x3500, //  [20]
+    0xF2C2, //  [21] movt r5, #0x2000       ; r5 = 0x2000_0300 (marker slot)
+    0x0500, //  [22]
+    0x602C, //  [23] str  r4, [r5, #0]      ; marker = 0xDEADBEEF
+    0xBE00, //  [24] bkpt #0                ; end of sled
+];
+const SLED_TIMER0_ALARM0_FIRE_AND_CLEAR: &[u8] =
+    &halfwords_to_le_bytes::<25, 50>(SLED_TIMER0_ALARM0_FIRE_AND_CLEAR_HW);
+
+// Phase 1 B2: `ticks_timer0_retarget_halves_rate` — verify that
+// doubling `TICKS.TIMER0.CYCLES` from 12 to 24 halves the observed
+// TIMER0 advance rate. Sled writes `TICKS.TIMER0.CYCLES = 24` then
+// busy-spins ~4800 sys_clks. On silicon at clk_ref=12 MHz with the
+// new CYCLES=24, the post-bootrom 1-µs cadence halves to 0.5-µs; in
+// the ~400 µs wall-clock window the busy-loop covers, TIMER0 should
+// advance ~200 µs (with CYCLES unchanged it would have advanced ~400).
+// The emulator's TICKS model divides sys_clks by CYCLES, so the same
+// retarget produces the same halving effect.
+//
+// The observable is TIMER0.TIMELR masked to the low 8 bits after the
+// sled halts. Both sides should land in the same ballpark. If the
+// EMU ignored the CYCLES write, its TIMELR would be roughly double
+// the silicon value and the low-byte diverge catches it.
+//
+// Silicon validation happens on Arthur's lab rig — the low-8-bit
+// mask carries an inherent fuzziness (both sides complete different
+// numbers of µs-edges depending on spin-loop timing), but the
+// coarse-grained band is sized to catch the "CYCLES write silently
+// dropped" failure mode which is the primary EMU concern.
+//
+// Registers used:
+//   r2 — TICKS.TIMER0.CYCLES address literal (0x4010_881C)
+//   r4 — spin counter
+//   r6 — new CYCLES value (24)
+#[rustfmt::skip]
+const SLED_TICKS_TIMER0_RETARGET_HW: [u16; 11] = [
+    0xF648, //  [ 0] movw r2, #0x881C       ; r2 = TICKS.TIMER0.CYCLES low half
+    0x021C, //  [ 1]                        ; (imm4=8, i=1, imm3=0, Rd=2, imm8=0x1C)
+    0xF2C4, //  [ 2] movt r2, #0x4010       ; r2 = 0x4010_881C
+    0x0210, //  [ 3]
+    0x2618, //  [ 4] movs r6, #24           ; r6 = new CYCLES value
+    0x6016, //  [ 5] str  r6, [r2, #0]      ; CYCLES = 24 (retarget)
+    0xF240, //  [ 6] movw r4, #1200         ; r4 = spin iters (~4800 sys_clks)
+    0x44B0, //  [ 7]                        ; (imm4=0, i=0, imm3=4, Rd=4, imm8=0xB0)
+    0x3C01, //  [ 8] subs r4, #1            ; spin:
+    0xD1FD, //  [ 9] bne  -4                ;   → [8] subs
+    0xBE00, //  [10] bkpt #0                ; end of sled
+];
+const SLED_TICKS_TIMER0_RETARGET: &[u8] =
+    &halfwords_to_le_bytes::<11, 22>(SLED_TICKS_TIMER0_RETARGET_HW);
+
 /// Compile-time helper: serialize a fixed-length array of Thumb
 /// halfwords to little-endian bytes, producing an array suitable for
 /// `&[u8]` borrow into a `'static` slot. `N_HW = N_BYTES / 2`.
@@ -413,6 +511,71 @@ const fn halfwords_to_le_bytes<const N_HW: usize, const N_BYTES: usize>(
     }
     out
 }
+
+// Phase 1 B1/B2 scenario setup/observe tables.
+//
+// TIMER0_ALARM0_FIRE_AND_CLEAR:
+//   - Release TIMER0 from RESETS so its bus dispatch unmasks.
+//   - Enable TICKS.TIMER0 (CTRL.ENABLE = 1). Post-bootrom CYCLES=12 is
+//     already installed by both silicon's bootrom and the emulator's
+//     `Bus::new()` per HLD V5 §5.7 (see phase1 tests).
+//   - Custom sled (SLED_TIMER0_ALARM0_FIRE_AND_CLEAR) runs the
+//     TIMELR-read → ALARM_0-arm → poll-INTS → W1C-INTR sequence and
+//     writes 0xDEADBEEF to 0x2000_0300 on success.
+const S_TIMER0_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] = &[
+    // Release TIMER0 (bit 23) from the RESETS guard.
+    (RESETS_RESET + ALIAS_CLR, RESET_TIMER0_BIT),
+    // Enable the TIMER0 TICKS domain.
+    (TICKS_TIMER0_CTRL, TICKS_CTRL_ENABLE),
+];
+const O_TIMER0_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] = &[
+    // Post-W1C: INTR.bit0 must be clear. Positive proof that the sled
+    // reached the "W1C INTR after INTS asserted" branch — had the
+    // busy-poll timed out, INTR.bit0 would still read 1 on silicon.
+    (TIMER0_INTR, 0x1),
+    // INTE stayed set (we never wrote it clear). The sled's `str r1,
+    // [r3, #0x40]` lands bit 0; both sides must mirror. This locks
+    // the test to "the sled actually wrote INTE" without which INTS
+    // would never assert and the scenario would hang.
+    (TIMER0_INTE, 0x1),
+    // ARMED.bit0 = 0 — the alarm auto-disarms on match per §12.8.3.
+    // HW and EMU both clear bit 0 of ARMED when the alarm fires.
+    (TIMER0_ARMED, 0x1),
+];
+
+// TICKS_TIMER0_RETARGET_HALVES_RATE:
+//   - Release TIMER0 from RESETS.
+//   - Enable TIMER0 TICKS domain at post-bootrom CYCLES=12.
+//   - Custom sled (SLED_TICKS_TIMER0_RETARGET) samples TIMELR,
+//     reprograms CYCLES to 24, busy-spins ~2400 sys_clks, samples
+//     TIMELR again, and stores the delta at 0x2000_0300.
+//
+// The observable is the delta at 0x2000_0300. At the original cadence
+// (CYCLES=12) the spin would elapse ~100 µs; at CYCLES=24 it elapses
+// ~50 µs. Both sides should land in the ~50 band. The mask `0xFF`
+// catches any gross-miscomputation divergence (e.g. EMU ignoring the
+// CYCLES write would leave the delta at ~100 ≈ 0x64, clearly distinct
+// from ~50 ≈ 0x32).
+const S_TICKS_TIMER0_RETARGET: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_TIMER0_BIT),
+    (TICKS_TIMER0_CTRL, TICKS_CTRL_ENABLE),
+];
+const O_TICKS_TIMER0_RETARGET: &[(u32, u32)] = &[
+    // TICKS.TIMER0.CYCLES must land at 24 — positive proof the retarget
+    // landed on both sides. If silicon accepted the write but EMU
+    // dropped it, this observable catches the divergence directly
+    // without any timing-band fuzziness.
+    (TICKS_TIMER0_CYCLES, 0xFF),
+    // TIMER0.TIMERAWL after the sled halts. Silicon at 150 MHz
+    // post-bootrom + CYCLES=24 yields ~200 µs in the spin window; EMU
+    // (same sys_clks, same TICKS divider) produces the same order of
+    // magnitude. Mask the low 10 bits to catch a gross divergence
+    // (e.g. EMU at ~400 µs because CYCLES stayed at 12) while tolerating
+    // the ~5% timing jitter inherent in busy-loop scheduling. The
+    // primary signal is the CYCLES readback above — TIMERAWL is a
+    // secondary consistency check.
+    (TIMER0_TIMERAWL, 0x3FF),
+];
 
 /// Initial catalog. New scenarios append to the end so filter-by-substring
 /// output stays ordered as cases are added.
@@ -473,6 +636,37 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe_pins: 0,
         custom_sled: Some(SLED_CLOCK_DIV_CHANGE_PIO_RUNNING),
     },
+    // Phase 1 B1: TIMER0 alarm-fire + W1C-clear scenario (HLD V5 §6
+    // Phase 1 exit). Sled reads TIMELR, arms ALARM_0 at +1000 µs,
+    // busy-polls INTS, W1C's INTR, writes a marker. Silicon
+    // validation happens on Arthur's lab rig.
+    //
+    // max_sysclks is sized for 1000 µs of busy-poll plus sled overhead.
+    // At 150 MHz post-bootrom clk_sys: 1000 µs ≈ 150_000 sys_clks; add
+    // ~10_000 sys_clks for the setup MOV/STR block and the poll-loop
+    // iterations. Round up to 200_000 for headroom. On the emulator,
+    // TICKS divides sys_clks by CYCLES=12 → 12_000 sys_clks produces
+    // 1000 edges, well below the budget.
+    PeriphScenario {
+        name: "timer0_alarm0_fire_and_clear",
+        setup: S_TIMER0_ALARM0_FIRE_AND_CLEAR,
+        max_sysclks: 200_000,
+        observe: O_TIMER0_ALARM0_FIRE_AND_CLEAR,
+        observe_pins: 0,
+        custom_sled: Some(SLED_TIMER0_ALARM0_FIRE_AND_CLEAR),
+    },
+    // Phase 1 B2: TICKS retarget — verify TIMER0 advances at ~half
+    // rate after CYCLES doubles 12 → 24 (HLD V5 §6 Phase 1 exit).
+    // Sled samples TIMELR, writes CYCLES=24, spin-waits ~2400
+    // sys_clks, samples TIMELR again, stores delta at 0x2000_0300.
+    PeriphScenario {
+        name: "ticks_timer0_retarget_halves_rate",
+        setup: S_TICKS_TIMER0_RETARGET,
+        max_sysclks: 10_000,
+        observe: O_TICKS_TIMER0_RETARGET,
+        observe_pins: 0,
+        custom_sled: Some(SLED_TICKS_TIMER0_RETARGET),
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -496,10 +690,15 @@ pub const SCENARIOS: &[PeriphScenario] = &[
 // the red-path catalogue keeps proving "oracle CAN report FAIL".
 //
 // Honest classification:
-//   * `red_timer0_timerawl_unmodelled` — TIMER0 at `0x400B_0000` is
-//     unmodelled (no dispatch arm in `bus::read32`). Silicon's TIMERAWL
-//     advances between setup-write and observe-read; EMU returns 0.
-//     HW ≠ EMU → FAIL. Mirrors `GAP_TIMER_UNMODELLED` on RP2040.
+//   * `red_spi0_sspsr_tfe_unmodelled` — SPI0 is unmodelled at
+//     `0x4008_0000` (no dispatch arm in `bus::read32`; falls through
+//     to the `peripheral_regs` HashMap stub). Setup releases SPI0
+//     from reset. Observe reads SSPSR (`+0x0C`) masked to TFE (bit 0).
+//     ARM PrimeCell PL022 TRM §3.4.6: TFE (TX FIFO empty) is asserted
+//     on reset. HW (0x01) ≠ EMU (0) → FAIL. B4 replacement: Phase 1
+//     modelled TIMER0, so `red_timer0_timerawl_unmodelled` PASSed both
+//     sides and stopped being a red-path witness. SPI0 is not part of
+//     Phase 1 and still falls through to the HashMap stub.
 //   * `red_uart0_fr_at_reset_unmodelled` — UART0 is unmodelled at
 //     `0x4007_0000`. Setup releases UART0 from reset; observe reads
 //     UARTFR (`+0x18`) masked to TXFE | RXFE (bits 4 + 7 = 0x90). ARM
@@ -520,9 +719,45 @@ pub const SCENARIOS: &[PeriphScenario] = &[
 // every observable mask hits a bit EMU can't produce.
 
 /// TIMER0 base (RP2350 datasheet §12.8, `0x400B_0000`) and TIMERAWL
-/// offset (`0x28` — timer value low half, no latching on read).
+/// offset (`0x28` — timer value low half, no latching on read). Used
+/// by the B1 `timer0_alarm0_fire_and_clear` main-path scenario.
 pub const TIMER0_BASE: u32 = 0x400B_0000;
 pub const TIMER0_TIMERAWL: u32 = TIMER0_BASE + 0x28;
+/// TIMER0 ALARM_0 offset (`0x10`) — write a 32-bit microsecond target
+/// to arm + schedule alarm 0.
+pub const TIMER0_ALARM0: u32 = TIMER0_BASE + 0x10;
+/// TIMER0 ARMED offset (`0x20`) — RW (write 1-to-disarm).
+pub const TIMER0_ARMED: u32 = TIMER0_BASE + 0x20;
+/// TIMER0 TIMELR offset (`0x0C`) — read low 32 bits (latches TIMEHR).
+pub const TIMER0_TIMELR: u32 = TIMER0_BASE + 0x0C;
+/// TIMER0 INTR offset (`0x3C`) — W1C on the four alarm bits.
+pub const TIMER0_INTR: u32 = TIMER0_BASE + 0x3C;
+/// TIMER0 INTE offset (`0x40`) — per-alarm interrupt enable.
+pub const TIMER0_INTE: u32 = TIMER0_BASE + 0x40;
+/// TIMER0 INTS offset (`0x48`) — `(INTR | INTF) & INTE`.
+pub const TIMER0_INTS: u32 = TIMER0_BASE + 0x48;
+
+/// TICKS block (RP2350 datasheet §8.5, `0x4010_8000`). Six-domain 1 µs
+/// tick generator. TIMER0 draws edges from the TIMER0 domain at
+/// `+0x18` (CTRL/CYCLES/COUNT stride of `0x0C`).
+pub const TICKS_BASE: u32 = 0x4010_8000;
+pub const TICKS_TIMER0_CTRL: u32 = TICKS_BASE + 0x18;
+pub const TICKS_TIMER0_CYCLES: u32 = TICKS_BASE + 0x1C;
+/// `TICKS.CTRL.ENABLE` bit mask (bit 0).
+pub const TICKS_CTRL_ENABLE: u32 = 1 << 0;
+
+/// RESETS bit for TIMER0 (RP2350 §7.5, bit 23). Used by Phase 1
+/// scenarios to release TIMER0 from reset.
+pub const RESET_TIMER0_BIT: u32 = 1 << 23;
+
+/// SPI0 base (RP2350 datasheet §12.2, `0x4008_0000`). PrimeCell PL022.
+pub const SPI0_BASE: u32 = 0x4008_0000;
+/// PL022 SSPSR offset (`0x0C`) — status register. TFE (TX FIFO empty)
+/// is bit 0 and is asserted at reset (TRM §3.4.6). Silicon reports
+/// SSPSR & 1 == 1 after SPI0 release; EMU's HashMap stub returns 0.
+pub const SPI0_SSPSR: u32 = SPI0_BASE + 0x0C;
+/// PL022 SSPSR.TFE (bit 0) — TX FIFO empty, reset-asserted.
+pub const SSPSR_TFE: u32 = 1 << 0;
 
 /// UART0 base (RP2350 datasheet §12.1.1, `0x4007_0000`). UART uses the
 /// ARM PL011 register map: UARTFR lives at `+0x18`.
@@ -560,17 +795,24 @@ pub const SIO_GPIO_OE_SET: u32 = 0xD000_0038;
 // anything the broad CLR doesn't already deliver.
 const RESETS_CLR_ALL: u32 = 0xFFFF_FFFF;
 
-// S_R1: red-path TIMER0 — release TIMER0, wait, observe TIMERAWL
-// non-zero. TIMER0 is not modelled in the RP2350 emulator so EMU
-// returns 0 while HW advances. Genuine red-path witness. Mirrors
-// `GAP_TIMER_UNMODELLED` on RP2040.
-const S_RED_TIMER0_UNMODELLED: &[(u32, u32)] = &[
+// S_R1: red-path SPI0 — release SPI0, observe SSPSR.TFE. Silicon
+// asserts TFE (TX FIFO empty, bit 0) at reset per PrimeCell PL022 TRM
+// §3.4.6. The emulator's HashMap stub returns 0 for any un-written SPI
+// address. Divergence on bit 0 → FAIL.
+//
+// B4 replacement: Phase 1 modelled TIMER0, so the earlier
+// `red_timer0_timerawl_unmodelled` scenario started PASSing both
+// sides (TIMER0 dispatch now lives in `bus/mod.rs`). SPI0 is Phase 2
+// scope and still falls through to the HashMap fallthrough on
+// `bus::read32`. Until the SPI model lands this is a genuine red-
+// path witness; when it lands, replace with a fresh unmodelled
+// peripheral (candidates: I2C0 IC_STATUS.TFE, TRNG READY, SHA256
+// CSR, GLITCH_DETECTOR — all un-modelled as of Phase 1).
+const S_RED_SPI0_SSPSR_UNMODELLED: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
 ];
-const O_RED_TIMER0_UNMODELLED: &[(u32, u32)] = &[
-    // Mask the low 24 bits so partial-read conventions don't matter;
-    // any non-zero low-byte on silicon diverges from EMU's 0.
-    (TIMER0_TIMERAWL, 0x00FF_FFFF),
+const O_RED_SPI0_SSPSR_UNMODELLED: &[(u32, u32)] = &[
+    (SPI0_SSPSR, SSPSR_TFE),
 ];
 
 // S_R2: red-path UART0 — release UART0, observe UARTFR's TXFE + RXFE
@@ -600,10 +842,10 @@ const O_RED_ADC_CS_UNMODELLED: &[(u32, u32)] = &[
 /// --red-path` (mutually exclusive with the default catalogue).
 pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
     PeriphScenario {
-        name: "red_timer0_timerawl_unmodelled",
-        setup: S_RED_TIMER0_UNMODELLED,
+        name: "red_spi0_sspsr_tfe_unmodelled",
+        setup: S_RED_SPI0_SSPSR_UNMODELLED,
         max_sysclks: 500,
-        observe: O_RED_TIMER0_UNMODELLED,
+        observe: O_RED_SPI0_SSPSR_UNMODELLED,
         observe_pins: 0,
         custom_sled: None,
     },
@@ -1292,9 +1534,9 @@ mod tests {
         assert!(validate_custom_sled(ok).is_ok());
     }
 
-    /// The two new clock-reprogram sleds ship bundled as byte slices — the
-    /// validator must accept them without complaint; a future edit that
-    /// accidentally breaks the terminator gets caught here.
+    /// All shipped sleds must validate — a future edit that accidentally
+    /// breaks the `bkpt #0` terminator (or odd-aligns a halfword pair)
+    /// gets caught here.
     #[test]
     fn test_validate_custom_sled_accepts_shipped_sleds() {
         assert!(
@@ -1304,6 +1546,14 @@ mod tests {
         assert!(
             validate_custom_sled(SLED_CLOCK_DIV_CHANGE_PIO_RUNNING).is_ok(),
             "clock_div_change_pio_running sled must validate",
+        );
+        assert!(
+            validate_custom_sled(SLED_TIMER0_ALARM0_FIRE_AND_CLEAR).is_ok(),
+            "timer0_alarm0_fire_and_clear sled must validate",
+        );
+        assert!(
+            validate_custom_sled(SLED_TICKS_TIMER0_RETARGET).is_ok(),
+            "ticks_timer0_retarget_halves_rate sled must validate",
         );
     }
 
@@ -1384,15 +1634,19 @@ mod tests {
     }
 
     /// Existing scenarios shouldn't gain a custom sled by accident —
-    /// only the two new Stage-4 entries opt in. If a future scenario
+    /// only the entries explicitly enumerated here. If a future scenario
     /// author adds a custom sled and forgets to add it to this
     /// allow-list, the test flags it so the reviewer double-checks
-    /// the intent.
+    /// the intent. Phase 1 added two new entries:
+    /// `timer0_alarm0_fire_and_clear` and
+    /// `ticks_timer0_retarget_halves_rate`.
     #[test]
     fn test_custom_sled_opt_in_roster() {
         let expected_custom: HashSet<&str> = [
             "clock_pll_sys_reprogram_mid_run",
             "clock_div_change_pio_running",
+            "timer0_alarm0_fire_and_clear",
+            "ticks_timer0_retarget_halves_rate",
         ]
         .into_iter()
         .collect();
@@ -1489,8 +1743,10 @@ mod tests {
 
     #[test]
     fn test_red_path_catalogue_names_match_spec() {
+        // Phase 1 replaced `red_timer0_timerawl_unmodelled` with
+        // `red_spi0_sspsr_tfe_unmodelled` (B4) once TIMER0 was modelled.
         let expected: HashSet<&str> = [
-            "red_timer0_timerawl_unmodelled",
+            "red_spi0_sspsr_tfe_unmodelled",
             "red_uart0_fr_at_reset_unmodelled",
             "red_adc_cs_ready_unmodelled",
         ]
@@ -1499,8 +1755,8 @@ mod tests {
         let actual: HashSet<&str> = RED_PATH_SCENARIOS.iter().map(|s| s.name).collect();
         assert_eq!(
             actual, expected,
-            "red-path catalogue names must match HLD V5 §4.2.8 (genuine \
-             red-path witnesses); got {:?}",
+            "red-path catalogue names must match the Phase 1 spec \
+             (genuine red-path witnesses); got {:?}",
             actual,
         );
     }
