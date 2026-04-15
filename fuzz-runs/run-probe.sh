@@ -3,12 +3,11 @@
 # No --cycles flag: known cycle mismatches (bank contention, backward branch,
 # PUSH minimum cost) are catalogued in tech_debt.md and would be noise.
 LOG="fuzz-runs/probe.log"
-DEADLINE_FILE="fuzz-runs/deadline"
 BATCH=0
 : > "$LOG"
 # Read deadline once at start. If the file vanishes mid-run we still
 # keep going for the full window we captured here.
-DEADLINE="$(cat "$DEADLINE_FILE" 2>/dev/null)"
+DEADLINE="$(cat "fuzz-runs/deadline" 2>/dev/null)"
 if [ -z "$DEADLINE" ]; then
   DEADLINE=$(( $(date +%s) + 28800 ))
 fi
@@ -17,7 +16,10 @@ echo "=== PROBE driver deadline=$DEADLINE ($(date -d @$DEADLINE -Iseconds)) ==="
 # overwrite target/release/probe_diff_rp2350.exe while we fuzz (Windows
 # holds an exclusive lock on a running .exe).
 BIN="fuzz-runs/probe_diff_rp2350.$$.exe"
-cp -f target/release/probe_diff_rp2350.exe "$BIN"
+cp -f target/release/probe_diff_rp2350.exe "$BIN" || {
+  echo "=== FATAL: target/release/probe_diff_rp2350.exe missing or unreadable ===" >> "$LOG"
+  exit 1
+}
 trap 'rm -f "$BIN"' EXIT
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   BATCH=$((BATCH+1))
