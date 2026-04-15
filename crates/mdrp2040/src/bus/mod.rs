@@ -20,6 +20,7 @@
 pub mod clocks;
 pub mod io_bank0;
 pub mod pads_bank0;
+pub mod peripheral_dispatch;
 pub mod ppb;
 pub mod resets;
 pub mod sio;
@@ -30,8 +31,10 @@ use std::io::Write;
 use mdpicoem_common::PioBlock;
 use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
+use crate::dma::Dma;
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use crate::peripherals::psram::Psram;
+use crate::peripherals::watchdog_tick::WatchdogTickRegs;
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
 use pads_bank0::PadsBank0;
@@ -58,6 +61,15 @@ pub const PLL_SYS_BASE: u32 = 0x4002_8000;
 pub const PLL_USB_BASE: u32 = 0x4002_C000;
 pub const BUSCTRL_BASE: u32 = 0x4003_0000;
 pub const ROSC_BASE: u32 = 0x4006_0000;
+/// TIMER block base (RP2040 datasheet §4.6). Reset-gated on
+/// [`peripheral_dispatch::RESET_TIMER`] (bit 21) — TIMER and WATCHDOG
+/// have independent RESETS bits per datasheet §2.14 Table 26. The 1 µs
+/// cadence coupling to WATCHDOG_TICK is runtime signalling, not a
+/// reset-bit relationship.
+pub const TIMER_BASE: u32 = 0x4005_4000;
+/// WATCHDOG block base (RP2040 datasheet §4.7). Phase 1 models only
+/// `WATCHDOG_TICK` (offset `0x2C`); remaining registers read as 0.
+pub const WATCHDOG_BASE: u32 = 0x4005_8000;
 pub const XIP_CTRL_BASE: u32 = 0x1400_0000;
 pub const SSI_BASE: u32 = 0x1800_0000;
 pub const XIP_SRAM_BASE: u32 = 0x1500_0000;
@@ -168,6 +180,20 @@ pub struct Bus {
     /// `0x5030_0000` (see [`PIO0_BASE`] / [`PIO1_BASE`]); output pins are
     /// merged into [`Self::gpio_in`] by [`crate::Emulator::update_gpio`].
     pub pio: [PioBlock; 2],
+    /// WATCHDOG_TICK register model (Phase 1 scope — HLD V7 §5.5). Only
+    /// the `TICK` register at offset `0x2C` is modelled today; the rest
+    /// of the WATCHDOG block reads as 0.
+    pub(crate) watchdog_tick: WatchdogTickRegs,
+    /// DMA controller — Phase 1 stub (always idle). Phase 4 replaces
+    /// this with the 12-channel model. Consulted by the fast-path gate
+    /// in [`crate::Emulator::step`] via [`Dma::is_idle`].
+    pub(crate) dma: Dma,
+    /// Pending external IRQ bitmap (bit N = IRQ #N asserted this
+    /// cycle). Peripherals OR into this field when their state raises
+    /// a line; [`crate::Emulator::drain_pending_irqs_to_cores`] drains
+    /// the bitmap into both cores' NVIC pending latches per inner-loop
+    /// iteration (HLD V7 §5.2).
+    pub(crate) irq_pending: u32,
     /// Off-chip 8 MB SPI PSRAM (PicoGUS v2 hardware). Observed via
     /// [`crate::Emulator::update_gpio`] on GPIO1/2/3 (CS/SCK/MOSI) and
     /// drives GPIO0 (MISO) back into [`Self::gpio_in`].
@@ -249,6 +275,9 @@ impl Bus {
             ssi_regs: HashMap::new(),
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
+            watchdog_tick: WatchdogTickRegs::new(),
+            dma: Dma::new(),
+            irq_pending: 0,
             psram: Psram::new(),
             external_gpio_in_override: 0,
             external_gpio_in_mask: 0,
@@ -528,6 +557,11 @@ impl Bus {
         let canonical = addr & !0x3000;
         let base = canonical & 0xFFFF_F000;
         let offset = canonical & 0x0000_0FFF;
+        // RESETS Bus-level guard (HLD V7 §5.3). Reset-gated peripherals
+        // return 0 without the peripheral module ever seeing the read.
+        if peripheral_dispatch::is_held_in_reset(self, base) {
+            return 0;
+        }
         match base {
             SYSINFO_BASE => self.sysinfo_read(offset),
             CLOCKS_BASE => self.clocks_regs.read32(offset),
@@ -550,6 +584,7 @@ impl Bus {
             PADS_BANK0_BASE => self.pads_bank0.read32(offset),
             PIO0_BASE => self.pio[0].read32(offset),
             PIO1_BASE => self.pio[1].read32(offset),
+            WATCHDOG_BASE => self.watchdog_tick.read32(offset),
             _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
         }
     }
@@ -558,6 +593,11 @@ impl Bus {
         let canonical = addr & !0x3000;
         let base = canonical & 0xFFFF_F000;
         let offset = canonical & 0x0000_0FFF;
+        // RESETS Bus-level guard (HLD V7 §5.3). Reset-gated peripherals
+        // drop the write without the peripheral module ever seeing it.
+        if peripheral_dispatch::is_held_in_reset(self, base) {
+            return;
+        }
         match base {
             SYSINFO_BASE => {} // read-only
             CLOCKS_BASE => {
@@ -596,6 +636,7 @@ impl Bus {
             PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
             PIO0_BASE => self.pio[0].write32(offset, val, alias),
             PIO1_BASE => self.pio[1].write32(offset, val, alias),
+            WATCHDOG_BASE => self.watchdog_tick.write32(offset, val, alias),
             _ => {
                 // Catch-all: store with alias semantics so firmware round-trips.
                 let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
@@ -1032,6 +1073,73 @@ impl Bus {
     pub fn signal_sev(&mut self) {
         self.event_flag[0] = true;
         self.event_flag[1] = true;
+    }
+
+    // --- Fast-path gate helpers (HLD V7 §5.5) ----------------------------
+
+    /// True iff every stateful peripheral is idle — i.e. nothing that
+    /// could observably change on a per-cycle tick is currently active.
+    ///
+    /// **MUST be updated when a new stateful peripheral is added to
+    /// `Bus`.** This function is the fast-path gate in
+    /// [`crate::Emulator::step`]; forgetting to AND a new peripheral's
+    /// `is_idle()` into the result silently keeps the fast path taken
+    /// while the peripheral is actually running, losing per-cycle
+    /// observability (interrupts, FIFO edges, DMA transfers).
+    ///
+    /// Phase 1 peripherals with state (`TIMER`, `WATCHDOG_TICK`) are
+    /// lazy and therefore always idle at the fast-path check — their
+    /// internal effects fire on alarm-match rather than per-cycle. DMA
+    /// is tracked separately via [`crate::dma::Dma::is_idle`] because
+    /// it's a bus master, not a per-cycle-ticked peripheral, and is
+    /// AND-ed into the fast-path gate alongside this result in
+    /// [`crate::Emulator::step`]. Later phases will OR new AND-terms
+    /// here for UART/SPI/I2C/ADC/PWM as they land.
+    #[inline]
+    pub fn all_peripherals_idle(&self) -> bool {
+        // Explicit acknowledgement of every stateful peripheral field.
+        // When a new peripheral field is added to `Bus`, add a
+        // reference here; Rust will flag any field rename / removal at
+        // compile time. Phase 1: TIMER + WATCHDOG_TICK are lazy so they
+        // are always idle; DMA is checked at the caller.
+        #[cfg(debug_assertions)]
+        {
+            let _ = (&self.watchdog_tick, &self.dma);
+        }
+        true
+    }
+
+    /// True iff at least one PIO SM is enabled in either block, or any
+    /// IRQ flag is still asserted. Either condition means a per-cycle
+    /// PIO step could mutate pin state or the IRQ-flags register — so
+    /// the fast-path is not safe (HLD V7 §5.5, "`pio_all_idle`"
+    /// semantics).
+    #[inline]
+    pub fn pio_all_idle(&self) -> bool {
+        !self.pio[0].any_sm_enabled()
+            && !self.pio[1].any_sm_enabled()
+            && self.pio[0].pending_irqs() == 0
+            && self.pio[1].pending_irqs() == 0
+    }
+
+    /// Advance every stateful peripheral by one system-clock cycle.
+    ///
+    /// Called from the slow-path loop in [`crate::Emulator::step`]
+    /// whenever the fast-path gate opens (PIO active, DMA live, or an
+    /// IRQ already pending). Phase 1 peripherals (`TIMER`,
+    /// `WATCHDOG_TICK`) are lazy and have nothing to do per cycle — the
+    /// body is empty. Later phases add `self.uart0.tick(&mut
+    /// self.irq_pending)` etc.
+    #[inline]
+    pub fn tick_peripherals(&mut self) {
+        // Phase 1: every peripheral is lazy. Deliberately empty.
+    }
+
+    /// Read the current pending-IRQ bitmap. Mostly for tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn irq_pending(&self) -> u32 {
+        self.irq_pending
     }
 
     /// ROSC nominal frequency re-export.

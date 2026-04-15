@@ -12,7 +12,7 @@ pub use self::bus::Bus;
 pub use self::memory::Memory;
 pub use self::sio::Sio;
 
-pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats, Peripheral};
+pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats};
 #[cfg(target_arch = "x86_64")]
 pub use mdpicoem_common::Pacer;
 

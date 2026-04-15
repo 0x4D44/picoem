@@ -2405,3 +2405,217 @@ mod pll_lock {
         assert_eq!(bus.pll_usb_lock_at_cycle, None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1 Wave 1 — IRQ plumbing, RESETS guard, fast-path gate, PIO routing
+// ---------------------------------------------------------------------------
+//
+// Covers HLD V7 §5.2 (irq_pending drain), §5.3 (RESETS Bus-level guard),
+// §5.5 (fast-path gate with DMA + peripherals + IRQ), and the PIO →
+// NVIC routing helper in `Emulator::tick_pio_and_route_irqs_single`.
+mod phase1_wave1 {
+    use crate::bus::{Bus, PIO0_BASE, PIO1_BASE, TIMER_BASE, WATCHDOG_BASE};
+    use crate::bus::peripheral_dispatch::{RESET_WATCHDOG, is_held_in_reset};
+    use crate::irq::{IRQ_PIO0_IRQ_0, IRQ_PIO1_IRQ_0, IRQ_TIMER_IRQ_0};
+    use crate::peripherals::watchdog_tick::TICK_OFFSET;
+    use crate::{Config, EmulatorBuilder};
+
+    // --- IRQ plumbing ----------------------------------------------------
+
+    #[test]
+    fn irq_pending_field_defaults_zero() {
+        let bus = Bus::new();
+        assert_eq!(bus.irq_pending(), 0);
+    }
+
+    #[test]
+    fn drain_pushes_to_both_cores_nvic_pending() {
+        // Directly set irq_pending on the bus; one step of the slow path
+        // drains it into both cores. (The fast path cannot drain because
+        // it early-exits on `any_irq`.)
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        // Park a NOP so the step path has something to execute.
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Assert TIMER_IRQ_0 (line 0) via the bus's pending bitmap.
+        emu.bus.irq_pending |= 1u32 << IRQ_TIMER_IRQ_0;
+        emu.step();
+        assert!(emu.cores[0].nvic.is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "core 0 NVIC must latch TIMER_IRQ_0 from irq_pending");
+        assert!(emu.cores[1].nvic.is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "core 1 NVIC must also latch it (shared IRQ wire)");
+        assert_eq!(emu.bus.irq_pending(), 0,
+            "drain must clear the bus-level bitmap");
+    }
+
+    // --- RESETS Bus-level guard -----------------------------------------
+
+    #[test]
+    fn timer_read_returns_zero_while_held_in_reset() {
+        // Fresh bus: every peripheral is held in reset. TIMER reads
+        // must return 0 without the TIMER module seeing the call.
+        let mut bus = Bus::new();
+        assert!(is_held_in_reset(&bus, TIMER_BASE));
+        assert_eq!(bus.read32(TIMER_BASE), 0);
+        assert_eq!(bus.read32(TIMER_BASE + 0x28), 0); // TIMERAWL offset
+    }
+
+    #[test]
+    fn watchdog_tick_write_swallowed_while_held_in_reset() {
+        let mut bus = Bus::new();
+        // Default RESETS holds bit 24 (WATCHDOG) — writing to
+        // WATCHDOG_TICK must be a no-op.
+        bus.write32(WATCHDOG_BASE + TICK_OFFSET, 0x0000_03FF);
+        assert_eq!(bus.watchdog_tick.cycles, 12, "CYCLES stays at reset default");
+        assert!(!bus.watchdog_tick.enable);
+    }
+
+    #[test]
+    fn watchdog_tick_write_honoured_after_reset_released() {
+        let mut bus = Bus::new();
+        // CLR RESETS bit 24 (WATCHDOG) via the alias at 0x4000_F000.
+        bus.write32(0x4000_F000, 1u32 << RESET_WATCHDOG);
+        // Write CYCLES = 0x41, ENABLE = 1.
+        bus.write32(WATCHDOG_BASE + TICK_OFFSET, 0x0000_0241);
+        assert_eq!(bus.watchdog_tick.cycles, 0x41);
+        assert!(bus.watchdog_tick.enable);
+        // Read-back through the bus surfaces the same word (with
+        // RUNNING mirrored into bit 10).
+        let v = bus.read32(WATCHDOG_BASE + TICK_OFFSET);
+        assert_eq!(v & 0x1FF, 0x41);
+        assert_eq!(v & (1 << 9), 1 << 9);
+        assert_eq!(v & (1 << 10), 1 << 10);
+    }
+
+    #[test]
+    fn reset_gate_covers_all_four_access_widths() {
+        let mut bus = Bus::new();
+        // TIMER held in reset: every read width returns 0.
+        assert_eq!(bus.read32(TIMER_BASE + 0x28), 0);
+        assert_eq!(bus.read16(TIMER_BASE + 0x28), 0);
+        assert_eq!(bus.read8(TIMER_BASE + 0x28), 0);
+        // Writes drop silently — no bus fault.
+        bus.write32(TIMER_BASE + 0x28, 0xDEAD_BEEF);
+        bus.write16(TIMER_BASE + 0x28, 0xBEEF);
+        bus.write8(TIMER_BASE + 0x28, 0xEF);
+        assert!(!bus.bus_fault());
+    }
+
+    // --- Fast-path gate --------------------------------------------------
+
+    #[test]
+    fn fast_path_taken_when_everything_idle() {
+        // Build an emulator with no PIO activity, no DMA, no IRQ
+        // pending. A single NOP step should still succeed and leave
+        // irq_pending at 0 (fast path never touches it).
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        assert!(emu.bus.pio_all_idle());
+        assert!(emu.bus.all_peripherals_idle());
+        assert!(emu.bus.dma.is_idle());
+        assert_eq!(emu.bus.irq_pending(), 0);
+        let consumed = emu.step();
+        assert_eq!(consumed, 1);
+        assert_eq!(emu.bus.irq_pending(), 0);
+        // Fast path drains nothing: both cores' NVIC stays empty.
+        assert_eq!(emu.cores[0].nvic.pending, 0);
+    }
+
+    #[test]
+    fn slow_path_triggered_by_pending_irq() {
+        // When irq_pending is non-zero at the start of the quantum,
+        // the gate opens and the slow-path loop runs — which drains
+        // irq_pending into the NVIC.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        emu.bus.irq_pending |= 1u32 << IRQ_TIMER_IRQ_0;
+        let consumed = emu.step();
+        assert_eq!(consumed, 1);
+        // Slow path drained.
+        assert_eq!(emu.bus.irq_pending(), 0);
+        assert!(emu.cores[0].nvic.is_pending(IRQ_TIMER_IRQ_0 as u8));
+    }
+
+    // --- PIO → NVIC routing ---------------------------------------------
+
+    #[test]
+    fn pio0_irq_flag_bit0_routes_to_nvic_line_7() {
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Force PIO0 IRQ flag bit 0 via IRQ_FORCE (offset 0x034).
+        emu.bus.write32(PIO0_BASE + 0x034, 0x01);
+        // Asserting the IRQ flag means pio_all_idle is false now, so
+        // stepping takes the slow path and routes into irq_pending +
+        // drains into the NVIC.
+        assert!(!emu.bus.pio_all_idle());
+        emu.step();
+        assert!(emu.cores[0].nvic.is_pending(IRQ_PIO0_IRQ_0 as u8),
+            "PIO0 IRQ flag bit 0 must route to NVIC line #7 (PIO0_IRQ_0)");
+    }
+
+    #[test]
+    fn pio1_irq_flag_bit1_routes_to_nvic_line_10() {
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // PIO1 IRQ flag bit 1 → NVIC line 10 (PIO1_IRQ_1).
+        emu.bus.write32(PIO1_BASE + 0x034, 0x02);
+        emu.step();
+        // PIO1_IRQ_1 is IRQ_PIO1_IRQ_0 + 1.
+        assert!(emu.cores[0].nvic.is_pending((IRQ_PIO1_IRQ_0 + 1) as u8),
+            "PIO1 IRQ flag bit 1 must route to NVIC line #10 (PIO1_IRQ_1)");
+    }
+
+    #[test]
+    fn pio_high_irq_flags_do_not_route_to_nvic() {
+        // PIO has 8 internal IRQ flags; only IRQ[3:0] are NVIC-routable
+        // (via INT0_INTE/INT1_INTE, not yet modelled — see `tech_debt.md`
+        // entry "PIO INTn_INTE routing not modelled"). Flags 4-7 are
+        // strictly intra-PIO SM-to-SM signalling and must NEVER raise
+        // any NVIC line regardless of the routing model.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Flags 4..=7 forced on PIO0 (bits outside the routable subset).
+        emu.bus.write32(PIO0_BASE + 0x034, 0xF0);
+        emu.step();
+        // No NVIC line 7..=10 should be latched.
+        assert_eq!(emu.cores[0].nvic.pending & 0x780, 0,
+            "high IRQ flags (bits 4-7) must not route to PIO0/PIO1 NVIC lines");
+    }
+
+    #[test]
+    fn pio_irq_flag_bit2_over_routes_to_both_nvic_lines() {
+        // Phase 1 Wave 1 simplification: until INT0_INTE/INT1_INTE land,
+        // any of PIO IRQ[3:0] set on a block fires *both* of that block's
+        // NVIC lines. Previously `& 0x3` silently dropped bits 2-3; this
+        // test pins the new over-route behaviour (safer than dropping).
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Force PIO0 IRQ flag bit 2 via IRQ_FORCE.
+        emu.bus.write32(PIO0_BASE + 0x034, 0x04);
+        emu.step();
+        assert!(emu.cores[0].nvic.is_pending(IRQ_PIO0_IRQ_0 as u8),
+            "PIO0 bit 2 must over-route to NVIC #7 until INTE lands");
+        assert!(emu.cores[0].nvic.is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
+            "PIO0 bit 2 must over-route to NVIC #8 until INTE lands");
+    }
+}

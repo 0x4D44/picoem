@@ -23,11 +23,6 @@ pub use self::pio::PioBlock;
 #[cfg(target_arch = "x86_64")]
 pub use self::pacer::Pacer;
 
-/// Trait for memory-mapped peripherals. Implemented by chip-specific
-/// peripheral crates; the common crate defines only the interface.
-pub trait Peripheral {
-    fn read32(&mut self, offset: u32) -> u32;
-    fn write32(&mut self, offset: u32, value: u32);
-    /// Called once per system clock. Return true if interrupt asserted.
-    fn step(&mut self) -> bool;
-}
+// Former `Peripheral` trait removed — zero impls workspace-wide.
+// See `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md`
+// §5.1 for the inherent-methods convention that replaces it.

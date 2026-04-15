@@ -210,6 +210,18 @@ a safe simplification — but firmware that expects a mid-execution SM to
 freeze on RESETS assert will diverge. mdrp2350 carries the same
 behaviour.
 
+### PIO INTn_INTE routing not modelled
+
+`Emulator::tick_pio_and_route_irqs_single` in mdrp2040 over-routes each
+PIO block's IRQ[3:0] flags to *both* of that block's NVIC lines — if any
+of bits 0-3 is set, both of PIO0_IRQ_0/1 (or PIO1_IRQ_0/1) fire. Real
+silicon uses `INT0_INTE` / `INT1_INTE` (plus `INTF` force and `INTS`
+status at offsets `0x12C`..`0x140`) to route each PIO IRQ flag to a
+specific NVIC line. Impact: Phase 2 firmware that enables multiple PIO
+IRQ flags will see spurious NVIC wakes. Phase 2 owes `INTE`/`INTF`/`INTS`
+plumbing in `PioBlock` and a matching routing model in the dispatch
+helper.
+
 ## Phase 6 Simplifications (Harness split)
 
 These surfaced during Phase 6 (the `mdpicoem-harness` binary split into

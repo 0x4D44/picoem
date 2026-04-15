@@ -16,6 +16,7 @@
 
 pub mod bus;
 pub mod core;
+pub mod dma;
 pub mod irq;
 pub mod memory;
 pub mod peripherals;
@@ -30,7 +31,7 @@ pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
 pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 
-pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats, Peripheral};
+pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats};
 #[cfg(target_arch = "x86_64")]
 pub use mdpicoem_common::Pacer;
 
@@ -98,6 +99,11 @@ impl Emulator {
         self.bus.clocks_regs.reset();
         self.bus.xosc_regs.reset();
         self.bus.rosc_regs.reset();
+        self.bus.watchdog_tick.reset();
+        self.bus.irq_pending = 0;
+        for core in &mut self.cores {
+            core.nvic.reset();
+        }
         self.bus.pll_sys_regs = bus::clocks::PLL_RESET;
         self.bus.pll_usb_regs = bus::clocks::PLL_RESET;
         self.bus.pll_sys_lock_at_cycle = None;
@@ -301,18 +307,91 @@ impl Emulator {
         // the per-cycle interleave. Measured impact of the fast-path
         // gate on paced_bench_rp2040 (pure ALU, PIO disabled): without
         // it, ~49% throughput regression; with it, neutral.
-        let pio_idle = !self.bus.pio[0].any_sm_enabled() && !self.bus.pio[1].any_sm_enabled();
-        if pio_idle {
+        //
+        // HLD V7 §5.5 broadens the gate from "PIO idle" to "PIO idle
+        // AND peripherals idle AND DMA idle AND no IRQ pending".
+        // Phase 1 peripherals are all lazy (TIMER/WATCHDOG_TICK), and
+        // DMA is a Phase 1 always-idle stub, so in practice the gate
+        // still reduces to the PIO check — but the extra conditions
+        // are in place so later phases don't need to reopen this
+        // site.
+        let pio_idle = self.bus.pio_all_idle();
+        let peri_idle = self.bus.all_peripherals_idle();
+        let dma_idle = self.bus.dma.is_idle();
+        let any_irq = self.bus.irq_pending != 0;
+        if pio_idle && peri_idle && dma_idle && !any_irq {
             self.tick_pio(consumed as u32);
             self.update_gpio();
         } else {
             for _ in 0..consumed {
-                self.tick_pio(1);
+                self.bus.tick_peripherals();
+                self.tick_pio_and_route_irqs_single();
                 self.update_gpio();
+                self.drain_pending_irqs_to_cores();
             }
         }
         self.wake_checks();
         consumed
+    }
+
+    /// Drain [`Bus::irq_pending`] into both cores' NVIC pending
+    /// latches. Per HLD V7 §5.2 this runs once per slow-path inner
+    /// cycle so level-triggered peripherals have at most one
+    /// architectural cycle of routing lag from assert to NVIC latch.
+    ///
+    /// Both cores see every IRQ — RP2040 has a single NVIC per core
+    /// but shared peripheral IRQ wires, so each line latches
+    /// independently on both cores and firmware routes via
+    /// `NVIC_IPR` / `NVIC_ISER` (not modelled yet — tech_debt).
+    fn drain_pending_irqs_to_cores(&mut self) {
+        if self.bus.irq_pending != 0 {
+            let raised = std::mem::replace(&mut self.bus.irq_pending, 0);
+            for irq in 0..crate::irq::IRQ_COUNT {
+                if raised & (1u32 << irq) != 0 {
+                    self.cores[0].nvic.set_pending(irq as u8);
+                    self.cores[1].nvic.set_pending(irq as u8);
+                }
+            }
+        }
+    }
+
+    /// Step both PIO blocks by exactly one system clock and route
+    /// their IRQ flags into [`Bus::irq_pending`].
+    ///
+    /// Per HLD V7 §5.5 + Appendix B, each PIO block has 8 internal
+    /// IRQ flags (`IRQ[7:0]`). Flags `IRQ[3:0]` can be routed to
+    /// either of the block's two NVIC lines via the `INTn_INTE`
+    /// enable registers; flags `IRQ[7:4]` stay block-local (SM-to-SM
+    /// signalling) and do not reach the NVIC. NVIC mapping:
+    /// PIO0_IRQ_0/1 are NVIC #7/#8, PIO1_IRQ_0/1 are NVIC #9/#10.
+    ///
+    /// **Temporary simplification**: `INT0_INTE` / `INT1_INTE` (plus
+    /// their `INTF` / `INTS` siblings) are not modelled yet. Until
+    /// they are, we over-route — if *any* of bits 0-3 of a block's
+    /// pending-IRQ word is set, we fire *both* of that block's NVIC
+    /// lines. This is strictly safer than silently dropping bits 2-3
+    /// (what the previous `& 0x3` mask did): firmware that enables a
+    /// handler sees a spurious wake at most, never a missed one. See
+    /// `tech_debt.md` entry "PIO INTn_INTE routing not modelled".
+    fn tick_pio_and_route_irqs_single(&mut self) {
+        let gpio_in = self.bus.gpio_in;
+        self.bus.pio[0].step_n(1, gpio_in);
+        self.bus.pio[1].step_n(1, gpio_in);
+        // Mask to IRQ[3:0] — the NVIC-routable subset per HLD V7
+        // Appendix B. Bits 4-7 are intra-PIO signalling and must not
+        // escape to the NVIC.
+        let any0 = (self.bus.pio[0].pending_irqs() & 0xF) != 0;
+        let any1 = (self.bus.pio[1].pending_irqs() & 0xF) != 0;
+        // Over-route: any flagged bit on a block fires both of that
+        // block's NVIC lines. Remove when INT0_INTE/INT1_INTE land.
+        let mut nvic_bits = 0u32;
+        if any0 {
+            nvic_bits |= 0b11 << 7; // NVIC #7 + #8 (PIO0_IRQ_0/1)
+        }
+        if any1 {
+            nvic_bits |= 0b11 << 9; // NVIC #9 + #10 (PIO1_IRQ_0/1)
+        }
+        self.bus.irq_pending |= nvic_bits;
     }
 
     /// Advance both PIO blocks by `cycles` system-clock cycles.

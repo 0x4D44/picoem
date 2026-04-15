@@ -79,6 +79,27 @@ impl PioBlock {
         self.sm_enabled_mask != 0
     }
 
+    /// The 8-bit PIO IRQ-flag register as a `u32` (upper bits zero).
+    ///
+    /// PIO maintains 8 internal IRQ flags (`IRQ[7:0]`); flags 0..3
+    /// optionally route to the NVIC when the corresponding `IRQn_INTE`
+    /// bit is set on the block's `IRQ0`/`IRQ1` interrupt controllers.
+    /// The two RP2040 NVIC lines per block (`PIO0_IRQ_0`, `PIO0_IRQ_1`,
+    /// `PIO1_IRQ_0`, `PIO1_IRQ_1`) carry only the low 2 of those 4
+    /// routable flags each — the chip-side routing helper in
+    /// `mdrp2040::Emulator::tick_pio_and_route_irqs_single` masks
+    /// accordingly.
+    ///
+    /// This getter surfaces the flags as a `u32` so callers can shift
+    /// / mask into the `Bus::irq_pending` wire without a cast at every
+    /// site. It does not mutate state — firmware clears flags via the
+    /// `IRQ` register W1C path already modelled in [`Self::write32`].
+    /// Zero behaviour change; added for the Wave 1 IRQ-routing helper.
+    #[inline]
+    pub fn pending_irqs(&self) -> u32 {
+        self.irq_flags as u32
+    }
+
     /// Read-only view of the 32-entry instruction memory. RP2350
     /// `INSTR_MEM` is write-only via the register interface, so test
     /// harnesses use this accessor to verify programs were loaded.

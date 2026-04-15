@@ -40,6 +40,29 @@ impl Resets {
         self.wdsel = 0;
     }
 
+    /// True iff the peripheral at bit `bit` is currently held in
+    /// reset. Bit numbering matches RP2040 datasheet §2.14 Table 26
+    /// (TIMER = bit 21, WATCHDOG = bit 24, etc.).
+    ///
+    /// The Bus-level dispatch in
+    /// [`super::peripheral_dispatch::is_held_in_reset`] calls this
+    /// before routing MMIO to the peripheral — reset-gated access
+    /// returns 0 / no-ops without ever reaching the peripheral module.
+    ///
+    /// Out-of-range `bit` values (≥25, the field width on RP2040)
+    /// return `false` — the RESETS register doesn't carry state for
+    /// them, so treating them as "not held" lets dispatch fall
+    /// through to the non-reset-gated path. Today this affects no
+    /// peripheral we route; a future `bit = 26` caller would be a
+    /// programming error the unit tests catch at the dispatch table.
+    #[inline]
+    pub fn is_held(&self, bit: u8) -> bool {
+        if bit >= 25 {
+            return false;
+        }
+        (self.state & (1u32 << bit)) != 0
+    }
+
     /// Read a RESETS register by offset.
     pub fn read32(&self, offset: u32) -> u32 {
         match offset {
@@ -128,5 +151,28 @@ mod tests {
         let before = r.state;
         r.write32(0x08, 0x1234, 0);
         assert_eq!(r.state, before);
+    }
+
+    #[test]
+    fn is_held_reflects_reset_state_bit() {
+        let mut r = Resets::new();
+        // Default: every peripheral in reset → every valid bit is held.
+        assert!(r.is_held(0));
+        assert!(r.is_held(21)); // TIMER
+        assert!(r.is_held(24)); // WATCHDOG
+        // Release TIMER (bit 21) via CLR alias.
+        r.write32(0x00, 1 << 21, 3);
+        assert!(!r.is_held(21));
+        // WATCHDOG still held.
+        assert!(r.is_held(24));
+    }
+
+    #[test]
+    fn is_held_out_of_range_returns_false() {
+        // RP2040 has 25 peripherals; bits ≥ 25 are not modelled.
+        let r = Resets::new();
+        assert!(!r.is_held(25));
+        assert!(!r.is_held(31));
+        assert!(!r.is_held(200));
     }
 }

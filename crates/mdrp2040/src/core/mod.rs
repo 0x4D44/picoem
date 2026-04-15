@@ -17,8 +17,10 @@ pub(crate) mod decode;
 mod execute;
 mod execute_wide;
 pub(crate) mod exceptions;
+pub mod nvic;
 
 use crate::bus::Bus;
+pub use nvic::Nvic;
 pub use registers::Registers;
 
 /// Synchronous faults raised during instruction execution.
@@ -61,6 +63,11 @@ pub struct CortexM0Plus {
     /// Phase 4.B consumes this after instruction retire and drives
     /// HardFault entry.
     pub(crate) pending_fault: Option<Fault>,
+    /// NVIC pending latch — peripheral-asserted external IRQs land
+    /// here via [`crate::Emulator::drain_pending_irqs_to_cores`]. Full
+    /// ISER / ICER / IPR decode lands in a later wave; Phase 1 only
+    /// needs the pending bits.
+    pub nvic: Nvic,
     /// Core is halted — will not execute until explicitly woken.
     halted: bool,
 }
@@ -77,6 +84,7 @@ impl CortexM0Plus {
             core_id,
             current_instr_addr: 0,
             pending_fault: None,
+            nvic: Nvic::new(),
             halted: false,
         }
     }
