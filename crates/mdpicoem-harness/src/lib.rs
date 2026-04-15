@@ -3,6 +3,7 @@
 // Validates Thumb-2 instruction semantics by executing identical instructions
 // in both QEMU (Cortex-M33 model) and our emulator, then diffing state.
 
+pub mod cycle_cases;
 pub mod gdb_client;
 pub mod ieee754_ref;
 pub mod thumb32_gen;
@@ -124,6 +125,18 @@ pub const SCRATCH_SIZE: u32 = 1024;
 /// Layout: S-register data at offsets [0..128), FPSCR at offset 128.
 pub const EMU_FPU_SCRATCH: u32 = EMU_TEST_SCRATCH + SCRATCH_SIZE;
 pub const QEMU_FPU_SCRATCH: u32 = QEMU_TEST_SCRATCH + SCRATCH_SIZE;
+
+/// Cycle-oracle mailbox base. Six u32 slots starting here (see
+/// `silicon_cycle_oracle_rp2350`):
+///   +0x00 GO        host→stub
+///   +0x04 DONE      stub→host
+///   +0x08 SEQ_PTR   host→stub (Thumb LSB=1)
+///   +0x0C ITER      host→stub (K count)
+///   +0x10 CYCLES    stub→host (raw CYCCNT delta)
+///   +0x14 reserved
+/// Lives above `EMU_TEST_STACK` (0x2004_0000) so it does not collide
+/// with pushed/popped frames from the stub's callee-saved save.
+pub const CYCLE_MAILBOX_BASE: u32 = 0x2004_0100;
 
 // ============================================================================
 // Per-chip address bases for `compare()`

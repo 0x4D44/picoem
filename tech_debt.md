@@ -448,3 +448,111 @@ preserves bit-position-wise, but `update_gpio` always rebuilds
 mirroring into `bus.gpio_in` within `drive_pins` is decorative for
 testability, not load-bearing for correctness. Tidy the comment.
 Trivial (1 minute).
+
+## Cycle-Timing — Sequence-in-Loop Measurements (2026-04-15)
+
+Entries below come from `silicon_cycle_oracle_rp2350` — a sequence-in-
+loop oracle that measures one `BLX seq / seq body / BX LR` round-trip
+per iteration inside a steady-state K-delta measurement loop
+(K_low=101, K_high=201; per_iter = (m_high − m_low) / (K_high − K_low)).
+
+**These entries are NOT directly comparable to the halt-step per-
+instruction entries above** (under "Cycle Timing — Phase 2 (Bus
+Fabric)" and "Cycle Timing — Halt-Step Measurement Limitations").
+The halt-step entries isolate one instruction's cost plus a fixed
+5-cycle debug overhead; the entries here measure a *bundle* (BLX +
+seq body + BX LR + loop overhead) at native speed with pipeline
+effects fully engaged. Deltas of a few cycles between HW and EMU in
+one measurement mode do not imply the other mode is wrong — the two
+modes answer different questions. Do not fold these numbers into
+tech-debt estimates framed in the halt-step context, and do not
+"close" halt-step entries based on sequence-in-loop results.
+
+Measured on the RP2354 attached via Pico debug probe, 2026-04-15,
+with per-case emu baselines seeded from the current mdrp2350 cycle
+model.
+
+### Positive-control case — nop_chain_8 FAIL
+
+Case: 8× Thumb NOP (`0xBF00`) inside the BLX/BX LR frame. At
+per-iter=8 this would indicate HW and EMU agree on "1-cycle NOP
+plus frame overhead that matches". They do NOT agree.
+
+HW per-iter: 11    EMU per-iter: 16    delta: −5
+
+Measured as BLX / 8×NOP / BX LR round-trip in a steady-state loop
+— NOT directly comparable to the halt-step per-instruction
+entries above.
+
+Interpretation options (unresolved — flagged for Arthur):
+
+1. Emulator's pipeline model is pessimistic on the per-iter
+   framing overhead: BLX (emu 2) + BX LR (emu 2) + SUBS (1) +
+   BNE-taken (emu 3) = 8 cycles of overhead, on top of 8 cycles of
+   NOPs, matches the observed EMU=16. Silicon folds some of this
+   into the pipeline (likely branch prediction on BX LR and the
+   BNE) and observes 11.
+2. The oracle's per-iter definition (BLX round-trip included) does
+   not isolate "NOP cost" — the author's expectation that HW==EMU
+   at per-iter=8 silently assumed zero framing overhead, which
+   does not match either side.
+
+Either way, **do not infer from this that every delta below is
+"5 cycles of bias" and subtract it**. The framing overhead is real
+on both sides and genuinely models differently in HW vs EMU; this
+is an emulator-fidelity finding, not an oracle-calibration finding.
+
+### Sequence-in-loop deltas per case
+
+All nine cases at tol=0. HW is the silicon measurement; EMU is the
+mdrp2350 cycle model's measurement through the same stub. `measured
+as BLX / seq / BX LR round-trip in a steady-state loop — NOT
+directly comparable to the halt-step per-instruction entries above`
+applies to every row.
+
+| case                             | HW/iter | EMU/iter | delta |
+|----------------------------------|--------:|---------:|------:|
+| nop_chain_8                      |      11 |       16 |    −5 |
+| push_2_min_cost                  |      10 |       13 |    −3 |
+| backward_branch_small            |      13 |       11 |    +2 |
+| backward_branch_large            |      13 |       14 |    −1 |
+| bank_contention_fetch_data_same  |       9 |       11 |    −2 |
+| bank_contention_fetch_data_diff  |       9 |       11 |    −2 |
+| ldm_8_reg                        |      17 |       18 |    −1 |
+| single_adds                      |       7 |        7 |     0 |
+| back_to_back_alu                 |      14 |       16 |    −2 |
+
+Notable observations:
+
+- `single_adds` is the only PASS at tol=0. Whatever the emulator's
+  per-iter framing cost is, it matches silicon exactly for the
+  1-instruction case. That constrains option (1) above: the framing
+  overhead is the *same* on HW and EMU for a minimal sequence body,
+  and the HW−EMU divergence in other cases grows with the specific
+  instructions in the body.
+- `bank_contention_fetch_data_same` (bank 0 fetch vs bank 0 data)
+  and `bank_contention_fetch_data_diff` (bank 0 fetch vs bank 1
+  data) measure *identically* on both HW (9) and EMU (11). No
+  observable bank-contention signal in this measurement mode.
+  This does not invalidate the halt-step "SRAM Bank Contention"
+  entry above — that measures the contention on a single instruction
+  in isolation, and the effect may be masked at sequence-in-loop
+  scale by other pipeline effects. Treat the halt-step entry as
+  authoritative for its own context.
+- `backward_branch_large` (302-byte span) and `backward_branch_small`
+  (22-byte span) measure *identically* on HW (13 each). No
+  observable large-branch penalty in this measurement mode.
+  Again, this does not invalidate the halt-step "Backward Branch
+  Pipeline Penalty" entry above; that was measured at isolation,
+  not in a tight loop where branch target buffering has warmed up.
+
+### What this does not do
+
+- Does not close any of the halt-step entries above. Sequence-in-
+  loop and halt-step are disjoint measurement modalities; closing a
+  halt-step entry requires a halt-step measurement confirming the
+  emulator matches silicon in that mode.
+- Does not confirm or refute individual instruction cycle costs. It
+  diffs *bundle* costs only.
+- Does not resolve the `nop_chain_8` positive-control failure.
+  Flagged for Arthur.
