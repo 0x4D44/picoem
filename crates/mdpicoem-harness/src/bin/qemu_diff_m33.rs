@@ -184,7 +184,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 fn run_targeted(
     gdb: &mut GdbClient,
     qemu: &mut QemuProcess,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let all_tests = generate_all();
     let total_before = all_tests.len();
     let tests: Vec<TestCase> = all_tests.into_iter().filter(|tc| !tc.probe_only).collect();
@@ -197,6 +197,10 @@ fn run_targeted(
     let mut fail = 0usize;
 
     for tc in &tests {
+        if shutdown_requested() {
+            eprintln!("interrupted (Ctrl-C); exiting cleanly");
+            return Ok(ExitCode::from(130));
+        }
         match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
             Ok(()) => pass += 1,
             Err(diff) => {
@@ -208,9 +212,9 @@ fn run_targeted(
 
     println!("{pass}/{} passed", pass + fail);
     if fail > 0 {
-        std::process::exit(1);
+        return Ok(ExitCode::from(1));
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Run fuzz tests with progress reporting and recovery.
@@ -220,7 +224,7 @@ fn run_fuzz(
     count_per_class: usize,
     seed: u64,
     class: FuzzClass,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let class_str = match class {
         FuzzClass::All => "all",
         FuzzClass::Base => "base",
@@ -270,6 +274,19 @@ fn run_fuzz(
             done += 1;
             if done % 1000 == 0 {
                 eprintln!("[{done}/{total}] {fail} failures...");
+                // Cheap check at the existing heartbeat — keeps Ctrl-C
+                // latency under ~1 s without touching the per-instruction
+                // hot path.
+                if shutdown_requested() {
+                    eprintln!("interrupted (Ctrl-C); exiting cleanly");
+                    return Ok(ExitCode::from(130));
+                }
+            }
+            // Also poll before each iteration of `run_with_recovery` so a
+            // long-running recovery doesn't swallow the interrupt.
+            if shutdown_requested() {
+                eprintln!("interrupted (Ctrl-C); exiting cleanly");
+                return Ok(ExitCode::from(130));
             }
             match run_with_recovery(gdb, qemu, &mut shared_bus, tc) {
                 Ok(()) => pass += 1,
@@ -302,9 +319,9 @@ fn run_fuzz(
         println!(
             "\nReproduce: qemu_diff_m33 --fuzz {count_per_class} --seed {seed} --classes={class_str}"
         );
-        std::process::exit(1);
+        return Ok(ExitCode::from(1));
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 // ============================================================================

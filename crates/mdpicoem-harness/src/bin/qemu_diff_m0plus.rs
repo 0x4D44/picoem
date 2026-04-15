@@ -21,6 +21,8 @@
 //   qemu_diff_m0plus --fuzz N                     Random fuzz, N tests per class
 //   qemu_diff_m0plus --fuzz N --seed S            Reproducible fuzz
 
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile};
@@ -36,10 +38,24 @@ use mdpicoem_harness::{
 /// BKPT #0 instruction (little-endian bytes).
 const BKPT_BYTES: [u8; 2] = [0x00, 0xBE];
 
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("fatal: {e}");
-        std::process::exit(2);
+/// Set by the Ctrl-C handler. See sibling comment in `qemu_diff_m33`.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+fn main() -> ExitCode {
+    if let Err(e) = ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst)) {
+        eprintln!("warning: failed to install Ctrl-C handler: {e}");
+    }
+
+    match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -103,7 +119,7 @@ fn parse_args() -> Result<Args, String> {
 // Main runner
 // ============================================================================
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = parse_args()?;
 
     let profile = QemuProfile::M0_PLUS_RP2040;
@@ -138,7 +154,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_targeted(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Error>> {
+fn run_targeted(gdb: &mut GdbClient) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let all = generate_all();
     let tests: Vec<TestCase> = all
         .into_iter()
@@ -151,6 +167,10 @@ fn run_targeted(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Error>> {
     let mut pass = 0usize;
     let mut fail = 0usize;
     for tc in &tests {
+        if shutdown_requested() {
+            eprintln!("interrupted (Ctrl-C); exiting cleanly");
+            return Ok(ExitCode::from(130));
+        }
         match run_one_test(gdb, &mut bus, tc) {
             Ok(()) => pass += 1,
             Err(d) => {
@@ -161,16 +181,16 @@ fn run_targeted(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{pass}/{} passed", pass + fail);
     if fail > 0 {
-        std::process::exit(1);
+        return Ok(ExitCode::from(1));
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_fuzz(
     gdb: &mut GdbClient,
     count_per_class: usize,
     seed: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("M0+ fuzz mode: {count_per_class} tests/class, seed={seed}");
     println!(
         "(reproduce with: qemu_diff_m0plus --fuzz {count_per_class} --seed {seed})"
@@ -207,6 +227,14 @@ fn run_fuzz(
             done += 1;
             if done % 1000 == 0 {
                 eprintln!("[{done}/{total}] {fail} failures...");
+                if shutdown_requested() {
+                    eprintln!("interrupted (Ctrl-C); exiting cleanly");
+                    return Ok(ExitCode::from(130));
+                }
+            }
+            if shutdown_requested() {
+                eprintln!("interrupted (Ctrl-C); exiting cleanly");
+                return Ok(ExitCode::from(130));
             }
             match run_one_test(gdb, &mut bus, tc) {
                 Ok(()) => pass += 1,
@@ -231,9 +259,9 @@ fn run_fuzz(
         println!(
             "\nReproduce: qemu_diff_m0plus --fuzz {count_per_class} --seed {seed}"
         );
-        std::process::exit(1);
+        return Ok(ExitCode::from(1));
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 // ============================================================================
