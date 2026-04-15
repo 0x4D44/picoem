@@ -103,7 +103,7 @@ pub(crate) fn barrel_shift(val: u32, shift_type: u8, amount: u32, carry_in: bool
 impl CortexM33 {
     // -- Data processing (modified immediate) --------------------------------
 
-    pub(crate) fn thumb32_dp_modified_imm(&mut self, hw0: u16, hw1: u16) -> u32 {
+    pub(crate) fn thumb32_dp_modified_imm(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let op = ((hw0 >> 5) & 0xF) as u8;
         let s = (hw0 >> 4) & 1 != 0;
         let rn = (hw0 & 0xF) as usize;
@@ -242,13 +242,13 @@ impl CortexM33 {
                 cy
             }
             // Undefined op values
-            _ => self.thumb32_undefined(hw0, hw1),
+            _ => self.thumb32_undefined(hw0, hw1, bus),
         }
     }
 
     // -- Data processing (plain binary immediate) ----------------------------
 
-    pub(crate) fn thumb32_dp_plain_imm(&mut self, hw0: u16, hw1: u16) -> u32 {
+    pub(crate) fn thumb32_dp_plain_imm(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let op = ((hw0 >> 4) & 0x1F) as u8;
         let rn = (hw0 & 0xF) as usize;
         let rd = ((hw1 >> 8) & 0xF) as usize;
@@ -371,13 +371,13 @@ impl CortexM33 {
                 1 // M33 measured: 1 cycle
             }
             // Undefined
-            _ => self.thumb32_undefined(hw0, hw1),
+            _ => self.thumb32_undefined(hw0, hw1, bus),
         }
     }
 
     // -- Data processing (shifted register) ----------------------------------
 
-    pub(crate) fn thumb32_dp_shifted_reg(&mut self, hw0: u16, hw1: u16) -> u32 {
+    pub(crate) fn thumb32_dp_shifted_reg(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let op = ((hw0 >> 5) & 0xF) as u8;
         let s = (hw0 >> 4) & 1 != 0;
         let rn = (hw0 & 0xF) as usize;
@@ -517,7 +517,7 @@ impl CortexM33 {
                 }
                 cy
             }
-            _ => self.thumb32_undefined(hw0, hw1),
+            _ => self.thumb32_undefined(hw0, hw1, bus),
         }
     }
 
@@ -634,7 +634,7 @@ impl CortexM33 {
         let mut addr = match op {
             0b01 => self.regs.r[rn],                                // IA: start at Rn
             0b10 => self.regs.r[rn].wrapping_sub(count * 4),       // DB: start at Rn - 4*count
-            _ => return self.thumb32_undefined(hw0, hw1),
+            _ => return self.thumb32_undefined(hw0, hw1, bus),
         };
 
         bus.set_burst_mode();
@@ -855,7 +855,7 @@ impl CortexM33 {
                 // pre-sleep FP state intact.
                 0x03 => 1,                              // WFI.W
                 0x04 => { bus.signal_sev(); 1 },         // SEV.W
-                _ => self.thumb32_undefined(hw0, hw1),
+                _ => self.thumb32_undefined(hw0, hw1, bus),
             };
         }
 
@@ -867,7 +867,7 @@ impl CortexM33 {
                 0x4 => 1, // DSB
                 0x5 => 1, // DMB
                 0x6 => 1, // ISB
-                _ => self.thumb32_undefined(hw0, hw1),
+                _ => self.thumb32_undefined(hw0, hw1, bus),
             };
         }
 
@@ -882,7 +882,7 @@ impl CortexM33 {
             return self.thumb32_mrs(hw1);
         }
 
-        self.thumb32_undefined(hw0, hw1)
+        self.thumb32_undefined(hw0, hw1, bus)
     }
 
     /// MSR — write a general-purpose register to a special system register.
@@ -1020,7 +1020,7 @@ impl CortexM33 {
 
     // -- Multiply (32-bit result) --------------------------------------------
 
-    pub(crate) fn thumb32_multiply(&mut self, hw0: u16, hw1: u16) -> u32 {
+    pub(crate) fn thumb32_multiply(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let op1 = ((hw0 >> 4) & 0x7) as u8;
         let rn = (hw0 & 0xF) as usize;
         let ra = ((hw1 >> 12) & 0xF) as usize;
@@ -1183,14 +1183,14 @@ impl CortexM33 {
                     self.regs.r[rd] = sum.wrapping_add(self.regs.r[ra]);
                 }
             }
-            _ => return self.thumb32_undefined(hw0, hw1),
+            _ => return self.thumb32_undefined(hw0, hw1, bus),
         }
         2 // M33 measured: 2 cycles (multiplier)
     }
 
     // -- Long multiply / divide (64-bit result) ------------------------------
 
-    pub(crate) fn thumb32_long_multiply(&mut self, hw0: u16, hw1: u16) -> u32 {
+    pub(crate) fn thumb32_long_multiply(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let op1 = ((hw0 >> 4) & 0x7) as u8;
         let rn = (hw0 & 0xF) as usize;
         let rd_lo = ((hw1 >> 12) & 0xF) as usize;
@@ -1327,13 +1327,13 @@ impl CortexM33 {
                 self.regs.r[rd_hi] = (result >> 32) as u32;
                 2 // M33 measured: 2 cycles (multiplier)
             }
-            _ => return self.thumb32_undefined(hw0, hw1),
+            _ => return self.thumb32_undefined(hw0, hw1, bus),
         }
     }
 
     // -- Data processing (register) ------------------------------------------
 
-    pub(crate) fn thumb32_dp_register(&mut self, hw0: u16, hw1: u16) -> u32 {
+    pub(crate) fn thumb32_dp_register(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
         let rd = ((hw1 >> 8) & 0xF) as usize;
         let rm = (hw1 & 0xF) as usize;
 
@@ -1377,7 +1377,7 @@ impl CortexM33 {
                         self.regs.r[rd] = val.leading_zeros();
                         1 // M33 measured: 1 cycle
                     }
-                    _ => self.thumb32_undefined(hw0, hw1),
+                    _ => self.thumb32_undefined(hw0, hw1, bus),
                 }
             } else {
                 // hw0[4]=0: QADD/QSUB/QDADD/QDSUB/SEL
@@ -1450,7 +1450,7 @@ impl CortexM33 {
                         self.regs.r[rd] = result;
                         2 // M33 measured: 2 cycles (DSP hardware)
                     }
-                    _ => self.thumb32_undefined(hw0, hw1),
+                    _ => self.thumb32_undefined(hw0, hw1, bus),
                 }
             }
         } else if hw1 & 0x80 != 0 {
@@ -1478,7 +1478,7 @@ impl CortexM33 {
                     }
                     0b100 => (rotated as i8) as i32 as u32,           // SXTB
                     0b101 => rotated & 0xFF,                          // UXTB
-                    _ => return self.thumb32_undefined(hw0, hw1),
+                    _ => return self.thumb32_undefined(hw0, hw1, bus),
                 };
                 self.regs.r[rd] = result;
                 1 // M33 measured: 1 cycle (plain extend)
@@ -1506,7 +1506,7 @@ impl CortexM33 {
                     }
                     0b100 => addend.wrapping_add((rotated as i8) as i32 as u32),  // SXTAB
                     0b101 => addend.wrapping_add(rotated & 0xFF),                 // UXTAB
-                    _ => return self.thumb32_undefined(hw0, hw1),
+                    _ => return self.thumb32_undefined(hw0, hw1, bus),
                 };
                 self.regs.r[rd] = result;
                 2 // M33 measured: 2 cycles (DSP hardware)
@@ -1769,7 +1769,7 @@ impl CortexM33 {
     // -- Undefined 32-bit instruction ----------------------------------------
 
     /// Undefined 32-bit instruction — raises UsageFault.
-    pub(crate) fn thumb32_undefined(&mut self, _hw0: u16, _hw1: u16) -> u32 {
+    pub(crate) fn thumb32_undefined(&mut self, _hw0: u16, _hw1: u16, _bus: &mut Bus) -> u32 {
         self.pending_fault = Some(super::Fault::UsageFault);
         0
     }

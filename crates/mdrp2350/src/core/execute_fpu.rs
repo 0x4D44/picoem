@@ -530,7 +530,7 @@ impl CortexM33 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
         if coproc == 11 {
             // Double-precision not present on RP2350
-            return self.thumb32_undefined(hw0, hw1);
+            return self.thumb32_undefined(hw0, hw1, bus);
         }
 
         // Phase 7 Stage B: lazy FP context flush. If a prior exception
@@ -624,7 +624,8 @@ impl CortexM33 {
             };
             1
         } else {
-            self.thumb32_undefined(hw0, hw1)
+            self.pending_fault = Some(super::Fault::UsageFault);
+            0
         }
     }
 
@@ -786,7 +787,10 @@ impl CortexM33 {
                 // VCMP, VCMPE, VCVT, VRINTR, VRINTZ, VRINTX)
                 self.fpu_unary(hw0, hw1, sd, sm)
             }
-            _ => self.thumb32_undefined(hw0, hw1),
+            _ => {
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
+            }
         }
     }
 
@@ -913,19 +917,23 @@ impl CortexM33 {
             }
             (0b1010, 0) => {
                 // VCVT.F32.FX.U16 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1010, 1) => {
                 // VCVT.F32.FX.S16 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1011, 0) => {
                 // VCVT.F32.FX.U32 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1011, 1) => {
                 // VCVT.F32.FX.S32 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1100, 0) => {
                 // VCVTR.U32.F32 Sd, Sm — float → unsigned int (round per FPSCR)
@@ -955,21 +963,28 @@ impl CortexM33 {
             }
             (0b1110, 0) => {
                 // VCVT.FX.U16.F32 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1110, 1) => {
                 // VCVT.FX.S16.F32 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1111, 0) => {
                 // VCVT.FX.U32.F32 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1111, 1) => {
                 // VCVT.FX.S32.F32 — fixed-point, stub
-                self.thumb32_undefined(hw0, hw1)
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
-            _ => self.thumb32_undefined(hw0, hw1),
+            _ => {
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
+            }
         }
     }
 
@@ -1109,7 +1124,7 @@ impl CortexM33 {
             // VLDM / VSTM / VPUSH / VPOP (multiple registers)
             let count = imm8 as usize;
             if count == 0 {
-                return self.thumb32_undefined(hw0, hw1);
+                return self.thumb32_undefined(hw0, hw1, bus);
             }
 
             let base = self.regs.r[rn];
