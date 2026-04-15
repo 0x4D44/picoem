@@ -50,3 +50,30 @@ fn core_ids_are_0_and_1() {
     assert_eq!(emu.core(0).id(), 0);
     assert_eq!(emu.core(1).id(), 1);
 }
+
+#[test]
+fn direct_boot_from_flash_applies_vector_table() {
+    // Simulate pico-sdk layout: boot2 at offset 0, vector table at 0x100
+    // with SP at word 0 and reset handler (Thumb bit set) at word 1.
+    let mut flash = vec![0u8; 0x200];
+    // SP = 0x20042000
+    flash[0x100..0x104].copy_from_slice(&0x2004_2000u32.to_le_bytes());
+    // PC = 0x10000321 (thumb-tagged)
+    flash[0x104..0x108].copy_from_slice(&0x1000_0321u32.to_le_bytes());
+
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .flash(flash)
+        .build();
+    emu.reset();
+    emu.direct_boot_from_flash(0x100);
+
+    // Both cores should now carry the vector-table values; core 1
+    // remains halted (per reset() semantics).
+    for core in &emu.cores {
+        assert_eq!(core.regs.msp, 0x2004_2000);
+        assert_eq!(core.regs.r[13], 0x2004_2000);
+        // Thumb bit stripped from PC.
+        assert_eq!(core.regs.r[15], 0x1000_0320);
+    }
+    assert!(emu.cores[1].is_halted());
+}

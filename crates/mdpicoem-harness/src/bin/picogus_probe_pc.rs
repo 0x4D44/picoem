@@ -77,6 +77,18 @@ fn main() {
                 "    r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
             );
+            // Dump SRAM around the crash-time SP to reveal the call chain.
+            // Pico-sdk panic() at 0x20000274 pushes {r0,r1,r2,r3} then {lr},
+            // so the immediate caller's LR is near SP at panic time.
+            let dump_base = before_sp.saturating_sub(16);
+            eprint!("    stack@sp-16: ");
+            for i in 0..24 {
+                let addr = dump_base + (i * 4);
+                let w = emu.bus.read32(addr);
+                eprint!("{w:#010x} ");
+                if i % 4 == 3 { eprint!("\n                  "); }
+            }
+            eprintln!();
             break;
         }
         if left_exception {
