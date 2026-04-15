@@ -107,6 +107,13 @@ impl Emulator {
         self.bus.gpio_external_in = 0;
         self.bus.gpio_external_mask = 0;
 
+        // Drop PLL lock-arm state so a post-reset power-up re-arms the
+        // counter against the freshly-zeroed master cycle. Mirrors the
+        // mdrp2040 reset path.
+        self.bus.master_cycle = 0;
+        self.bus.pll_sys_lock_at_cycle = None;
+        self.bus.pll_usb_lock_at_cycle = None;
+
         // Reset clock. The authoritative sys_clk_hz lives on Bus's
         // clock tree (see bus/clocks.rs), so nothing to preserve here.
         self.clock = Clock { cycles: 0 };

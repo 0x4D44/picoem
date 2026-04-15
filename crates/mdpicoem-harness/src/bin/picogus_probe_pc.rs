@@ -51,11 +51,12 @@ fn main() {
         emu.cores[0].regs.lr(),
     );
 
-    // Single-step all instructions, but only log when PC leaves the
-    // inner data-init copy loop or a fault trampoline is entered.
+    // Single-step all instructions, but only log at function-call
+    // transitions and exception entry. Exception entry is the real
+    // signal we want — LR becoming 0xFFFFFFxx (EXC_RETURN) after a
+    // step means the core vectored to an exception handler.
     emu.step_quantum = 1;
-    let mut last_pc_logged = 0u32;
-    let copy_loop = 0x1000022eu32..=0x10000234u32;
+    let mut last_in_exception = false;
     for s in 0..5_000_000u64 {
         let before_pc = emu.cores[0].regs.pc();
         let before_lr = emu.cores[0].regs.lr();
@@ -63,34 +64,31 @@ fn main() {
         let r = emu.cores[0].regs.r;
         let consumed = emu.step();
         let after_pc = emu.cores[0].regs.pc();
-        // Log when we exit the copy loop, enter a fault handler, or at
-        // a fixed sampling cadence.
-        let interesting = !copy_loop.contains(&after_pc)
-            && copy_loop.contains(&before_pc);
-        let fault = after_pc < 0x1000 && before_pc >= 0x10000000;
-        if interesting || fault || s < 16 || (s % 50000 == 0) {
+        let after_lr = emu.cores[0].regs.lr();
+        let in_exception = (after_lr & 0xFFFF_FFF0) == 0xFFFF_FFF0;
+        let entered_exception = in_exception && !last_in_exception;
+        let left_exception = !in_exception && last_in_exception;
+        last_in_exception = in_exception;
+        if entered_exception {
             eprintln!(
-                "#{s:>7} pc={before_pc:#010x}->{after_pc:#010x} sp={before_sp:#010x} lr={before_lr:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
-                r[1], r[2], r[3],
+                "*** EXC ENTRY #{s}: pc {before_pc:#010x} -> {after_pc:#010x}, lr {before_lr:#010x} -> {after_lr:#010x}, sp {before_sp:#010x}",
             );
-            last_pc_logged = after_pc;
-        }
-        if consumed == 0 { eprintln!("HALT @ {s}"); break; }
-        if fault {
-            eprintln!("FAULT at step {s}, jumped to {after_pc:#010x}");
-            // Trace a few more to see what happens
-            for k in 0..8 {
-                let p = emu.cores[0].regs.pc();
-                let _ = emu.step();
-                eprintln!("  fault+{k}: {p:#010x} -> {:#010x}", emu.cores[0].regs.pc());
-            }
+            eprintln!(
+                "    r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+            );
             break;
         }
+        if left_exception {
+            eprintln!(
+                "EXC RETURN #{s}: pc {before_pc:#010x} -> {after_pc:#010x}",
+            );
+        }
+        if consumed == 0 { eprintln!("HALT @ {s}"); break; }
     }
-    let _ = last_pc_logged;
     emu.step_quantum = 64;
 
-    let mut steps = trace_first;
+    let mut steps = 0u64;
     let mut last_sample_cycles = emu.cycles();
     let mut last_pc = 0u32;
     let mut same_pc_count = 0u64;
