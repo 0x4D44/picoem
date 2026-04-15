@@ -63,6 +63,14 @@ pub const PLL_FBDIV_INT_OFF: u32 = 0x008;
 pub const PLL_PRIM_OFF: u32 = 0x00C;
 pub const PLL_CS_LOCK_BIT: u32 = 1 << 31;
 
+// CLOCKS block (RP2350). Base is 0x4001_0000. Per datasheet layout in
+// `crates/mdrp2350/src/bus/peripherals.rs:79-87`, RP2350's CLOCKS
+// register map adds GPOUT4-7 before CLK_REF, shifting CLK_SYS earlier
+// than on RP2040: CLK_SYS_DIV lives at offset 0x040 (not 0x044 —
+// that's CLK_SYS_SELECTED, which is read-only). Writable integer
+// divider is in bits [31:16]; fractional in [15:0].
+pub const CLOCKS_CLK_SYS_DIV: u32 = 0x4001_0040;
+
 // ---------------------------------------------------------------------------
 // Scenario type
 // ---------------------------------------------------------------------------
@@ -83,6 +91,10 @@ pub struct PeriphScenario {
     pub observe: &'static [(u32, u32)],
     /// GPIO pins to sample drive+level. 0 = skip pins.
     pub observe_pins: u32,
+    /// If `Some(bytes)`, the runner uploads these as the sled instead
+    /// of auto-assembling a countdown. Bytes must end in `bkpt #0`
+    /// (`0xBE00`). Existing scenarios leave this `None`.
+    pub custom_sled: Option<&'static [u8]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +240,180 @@ const O_PLL_SYS_LOCK_TIMING: &[(u32, u32)] = &[
     (PLL_SYS_BASE + PLL_CS_OFF, PLL_CS_LOCK_BIT),
 ];
 
+// S6: Clock tree — PLL_SYS FBDIV reprogrammed mid-run. Setup primes
+// PLL_SYS at FBDIV=125 (12 MHz × 125 / (2·2) = 375 MHz VCO, 93.75 MHz
+// postdiv). The custom sled spins ~500 sysclks, writes FBDIV=100 to
+// PLL_SYS (mid-run reprogramming without toggling RESETS), spins ~500
+// more sysclks, then BKPTs. Observables: PLL_SYS.CS (LOCK + status
+// bits), PLL_SYS.FBDIV_INT (the new value must have stuck),
+// PLL_SYS.PRIM (post-divs unchanged).
+//
+// Safety: PLL_SYS is *not* switched to be sys_clk's source by this
+// scenario's setup. The core keeps running on whatever source the
+// bootrom left active (typically ROSC / XOSC post-reset_and_halt), so
+// reprogramming PLL_SYS FBDIV is architecturally a no-op for the
+// running core — no glitch risk. Exercises the ClockTree recompute
+// path on the PLL register write, per the HLD §"Cycle-vs-frequency
+// semantics" (CYCCNT counts core ticks regardless of PLL state).
+const S_CLOCK_PLL_SYS_REPROGRAM_MID_RUN: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_PLL_SYS),
+    (PLL_SYS_BASE + PLL_CS_OFF, 1),        // REFDIV=1
+    (PLL_SYS_BASE + PLL_FBDIV_INT_OFF, 125), // initial FBDIV
+    (PLL_SYS_BASE + PLL_PRIM_OFF, (2u32 << 16) | (2u32 << 12)), // POSTDIV1=2, POSTDIV2=2
+    (PLL_SYS_BASE + PLL_PWR_OFF, 0),       // all powered up
+];
+const O_CLOCK_PLL_SYS_REPROGRAM_MID_RUN: &[(u32, u32)] = &[
+    // CS.LOCK (bit 31) — by the end of the post-reprogram window LOCK
+    // should either re-assert or at least match between HW and EMU.
+    (PLL_SYS_BASE + PLL_CS_OFF, PLL_CS_LOCK_BIT),
+    // FBDIV_INT is a 12-bit field — mask enforces that we only read
+    // architecturally-defined bits (datasheet §8.6.2: 12-bit divider).
+    (PLL_SYS_BASE + PLL_FBDIV_INT_OFF, 0x0000_0FFF),
+    // PRIM holds POSTDIV1 [18:16] and POSTDIV2 [14:12]. Verify they
+    // survived the FBDIV write untouched.
+    (PLL_SYS_BASE + PLL_PRIM_OFF, (7u32 << 16) | (7u32 << 12)),
+];
+
+// Custom sled for `clock_pll_sys_reprogram_mid_run`.
+//
+// Structure:
+//   - Spin ~500 sysclks (125-iter × ~4 cycles/iter countdown).
+//   - Write FBDIV_INT = 100 to PLL_SYS at 0x4005_0008.
+//   - Spin ~500 more sysclks.
+//   - BKPT #0.
+//
+// Registers used (all caller-saved, no need to preserve):
+//   r0 — loop counter
+//   r1 — PLL_SYS.FBDIV_INT address literal (0x4005_0008)
+//   r2 — new FBDIV value literal (100)
+//
+// Thumb-2 encodings per ARMv8-M ARM:
+//   movw T3:   hw0 = 0xF240 | (i<<10) | imm4,
+//              hw1 = (imm3<<12) | (Rd<<8) | imm8
+//   movt T1:   hw0 = 0xF2C0 | (i<<10) | imm4, hw1 format same as movw
+//   subs T2:   hw0 = 0x3800 | (Rdn<<8) | imm8   (16-bit)
+//   bne  T1:   hw0 = 0xD100 | (imm8 & 0xFF)     (16-bit, imm8 halfwords,
+//                                               target = PC+4 + imm8*2)
+//   str  T1:   hw0 = 0x6000 | (imm5<<6) | (Rn<<3) | Rt   (16-bit)
+//   bkpt T1:   hw0 = 0xBE00 | imm8              (16-bit)
+//
+// `0xD1FD` decodes to `bne` with imm8 = -3 → target = PC+4 + (-3)*2 =
+// PC-2, i.e. one halfword before the bne — the adjacent subs.
+#[rustfmt::skip]
+const SLED_CLOCK_PLL_SYS_REPROGRAM_MID_RUN_HW: [u16; 16] = [
+    0xF240, //  [ 0] movw r0, #125 hw0     ; r0 = loop-1 counter
+    0x007D, //  [ 1] movw r0, #125 hw1     ; (i=0, imm4=0, imm3=0, Rd=0, imm8=0x7D)
+    0x3801, //  [ 2] subs r0, #1           ; loop1:
+    0xD1FD, //  [ 3] bne  -4               ;   → [2] subs
+    0xF240, //  [ 4] movw r1, #0x0008 hw0  ; r1 = PLL_SYS.FBDIV_INT low half
+    0x0108, //  [ 5] movw r1, #0x0008 hw1  ; (Rd=1, imm8=0x08)
+    0xF2C4, //  [ 6] movt r1, #0x4005 hw0  ; r1 high half (imm4=4, imm8=0x05)
+    0x0105, //  [ 7] movt r1, #0x4005 hw1  ; r1 = 0x4005_0008 (FBDIV_INT addr)
+    0xF240, //  [ 8] movw r2, #100   hw0   ; r2 = new FBDIV value (100)
+    0x0264, //  [ 9] movw r2, #100   hw1   ; (Rd=2, imm8=0x64)
+    0x600A, //  [10] str  r2, [r1]         ; *FBDIV_INT = 100 — reprogram mid-run
+    0xF240, //  [11] movw r0, #125 hw0     ; r0 = loop-2 counter
+    0x007D, //  [12] movw r0, #125 hw1
+    0x3801, //  [13] subs r0, #1           ; loop2:
+    0xD1FD, //  [14] bne  -4               ;   → [13] subs
+    0xBE00, //  [15] bkpt #0               ; end of sled
+];
+const SLED_CLOCK_PLL_SYS_REPROGRAM_MID_RUN: &[u8] =
+    &halfwords_to_le_bytes::<16, 32>(SLED_CLOCK_PLL_SYS_REPROGRAM_MID_RUN_HW);
+
+// `clock_div_change_pio_running` — sled changes CLOCKS_CLK_SYS_DIV
+// mid-run; observe CLK_SYS_DIV register readback survives. Originally
+// designed to also verify PIO0 SM0_ADDR progress ratio matches the
+// divider change, but the emulator's PIO advances one sysclk per
+// step_quantum independent of clock_tree.sys_clk_hz (see
+// `mdpicoem-common/src/pio/mod.rs:143`); both sides converge on the
+// stall value regardless of CLK_SYS_DIV. The HLD §"Cycle-vs-
+// frequency semantics" warns about this. Restore the SM_ADDR
+// observable when the emulator's PIO honors sys_clk_hz.
+//
+// The scenario is retained in the catalogue in degraded form because
+// it still exercises the mid-sled MMIO write path (ClockTree recompute
+// on CLK_SYS_DIV write) and the readback proves the write landed on
+// both sides.
+const S_CLOCK_DIV_CHANGE_PIO_RUNNING: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_PIO0 | RESET_IO_BANK0 | RESET_PADS_BANK0),
+    (pio_instr_mem_addr(PIO0_BASE, 0), 0xE03F), // SET X, 31
+    (pio_instr_mem_addr(PIO0_BASE, 1), 0x0041), // JMP X-- 1
+    (pio_instr_mem_addr(PIO0_BASE, 2), 0x0002), // JMP 2 (stall)
+    (pio_sm_addr(PIO0_BASE, 0, PIO_SM_CLKDIV_OFF), 0x0001_0000),
+    // EXECCTRL: WRAP_TOP=2 (bits 16:12), WRAP_BOTTOM=0 (bits 11:7).
+    (pio_sm_addr(PIO0_BASE, 0, PIO_SM_EXECCTRL_OFF), 2u32 << 12),
+    (PIO0_BASE + PIO_CTRL_OFF + ALIAS_SET, 0x0000_0001),
+    // Leave CLK_SYS_DIV at its reset default (integer=1, fractional=0)
+    // so the sled's mid-run write is the only change during the run.
+];
+const O_CLOCK_DIV_CHANGE_PIO_RUNNING: &[(u32, u32)] = &[
+    // CLK_SYS_DIV — integer bits [31:16] must match the sled's write.
+    // This is the sole observable: the PIO_SM_ADDR / FDEBUG observables
+    // that previously lived here were dropped (see scenario comment
+    // above) — the emulator's PIO step is independent of
+    // clock_tree.sys_clk_hz so both sides converge on the same stall
+    // value regardless of the divider change, producing a false-PASS.
+    (CLOCKS_CLK_SYS_DIV, 0xFFFF_0000),
+];
+
+// Custom sled for `clock_div_change_pio_running`.
+//
+// Structure:
+//   - Spin ~500 sysclks (125-iter × ~4 cycles/iter countdown).
+//   - Build r1 = CLK_SYS_DIV address (0x4001_0040) via movw + movt.
+//   - Build r2 = new divider value (0x0002_0000 = integer=2) via
+//     movw + movt (since the immediate > 16 bits).
+//   - str r2, [r1]       — halve sys_clk.
+//   - Spin ~500 more sysclks at the new (slower) divider.
+//   - BKPT #0.
+//
+// Registers used (all caller-saved):
+//   r0 — loop counter
+//   r1 — CLK_SYS_DIV address literal (0x4001_0040)
+//   r2 — new CLK_SYS_DIV value (0x0002_0000)
+#[rustfmt::skip]
+const SLED_CLOCK_DIV_CHANGE_PIO_RUNNING_HW: [u16; 18] = [
+    0xF240, //  [ 0] movw r0, #125 hw0     ; r0 = loop-1 counter
+    0x007D, //  [ 1] movw r0, #125 hw1
+    0x3801, //  [ 2] subs r0, #1           ; loop1:
+    0xD1FD, //  [ 3] bne  -4               ;   → [2] subs
+    0xF240, //  [ 4] movw r1, #0x0040 hw0  ; r1 = CLK_SYS_DIV low half
+    0x0140, //  [ 5] movw r1, #0x0040 hw1  ; (Rd=1, imm8=0x40)
+    0xF2C4, //  [ 6] movt r1, #0x4001 hw0  ; r1 high half (imm4=4, imm8=0x01)
+    0x0101, //  [ 7] movt r1, #0x4001 hw1  ; r1 = 0x4001_0040 (CLK_SYS_DIV)
+    0xF240, //  [ 8] movw r2, #0     hw0   ; r2 low = 0 (fractional)
+    0x0200, //  [ 9] movw r2, #0     hw1   ; (Rd=2, imm8=0)
+    0xF2C0, //  [10] movt r2, #2     hw0   ; r2 high = 2 (integer divider)
+    0x0202, //  [11] movt r2, #2     hw1   ; r2 = 0x0002_0000
+    0x600A, //  [12] str  r2, [r1]         ; CLK_SYS_DIV = integer 2 mid-run
+    0xF240, //  [13] movw r0, #125 hw0     ; r0 = loop-2 counter
+    0x007D, //  [14] movw r0, #125 hw1
+    0x3801, //  [15] subs r0, #1           ; loop2:
+    0xD1FD, //  [16] bne  -4               ;   → [15] subs
+    0xBE00, //  [17] bkpt #0               ; end of sled
+];
+const SLED_CLOCK_DIV_CHANGE_PIO_RUNNING: &[u8] =
+    &halfwords_to_le_bytes::<18, 36>(SLED_CLOCK_DIV_CHANGE_PIO_RUNNING_HW);
+
+/// Compile-time helper: serialize a fixed-length array of Thumb
+/// halfwords to little-endian bytes, producing an array suitable for
+/// `&[u8]` borrow into a `'static` slot. `N_HW = N_BYTES / 2`.
+const fn halfwords_to_le_bytes<const N_HW: usize, const N_BYTES: usize>(
+    hws: [u16; N_HW],
+) -> [u8; N_BYTES] {
+    assert!(N_BYTES == N_HW * 2, "N_BYTES must be 2 * N_HW");
+    let mut out = [0u8; N_BYTES];
+    let mut i = 0;
+    while i < N_HW {
+        let hw = hws[i];
+        out[2 * i] = (hw & 0xFF) as u8;
+        out[2 * i + 1] = (hw >> 8) as u8;
+        i += 1;
+    }
+    out
+}
+
 /// Initial catalog. New scenarios append to the end so filter-by-substring
 /// output stays ordered as cases are added.
 pub const SCENARIOS: &[PeriphScenario] = &[
@@ -237,6 +423,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         max_sysclks: 100,
         observe: O_PIO0_NOP_LOOP,
         observe_pins: 0,
+        custom_sled: None,
     },
     PeriphScenario {
         name: "pio0_fixed_cycles",
@@ -244,6 +431,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         max_sysclks: 200,
         observe: O_PIO0_FIXED_CYCLES,
         observe_pins: 0,
+        custom_sled: None,
     },
     PeriphScenario {
         name: "pio0_side_set_toggle",
@@ -251,6 +439,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         max_sysclks: 100,
         observe: O_PIO0_SIDE_SET_TOGGLE,
         observe_pins: 0x0000_0001,
+        custom_sled: None,
     },
     PeriphScenario {
         name: "pio0_reset_gating_placeholder",
@@ -258,6 +447,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         max_sysclks: 200,
         observe: O_PIO0_RESET_GATING_PLACEHOLDER,
         observe_pins: 0,
+        custom_sled: None,
     },
     PeriphScenario {
         name: "pll_sys_lock_timing",
@@ -265,6 +455,23 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         max_sysclks: 1500,
         observe: O_PLL_SYS_LOCK_TIMING,
         observe_pins: 0,
+        custom_sled: None,
+    },
+    PeriphScenario {
+        name: "clock_pll_sys_reprogram_mid_run",
+        setup: S_CLOCK_PLL_SYS_REPROGRAM_MID_RUN,
+        max_sysclks: 2000,
+        observe: O_CLOCK_PLL_SYS_REPROGRAM_MID_RUN,
+        observe_pins: 0,
+        custom_sled: Some(SLED_CLOCK_PLL_SYS_REPROGRAM_MID_RUN),
+    },
+    PeriphScenario {
+        name: "clock_div_change_pio_running",
+        setup: S_CLOCK_DIV_CHANGE_PIO_RUNNING,
+        max_sysclks: 2000,
+        observe: O_CLOCK_DIV_CHANGE_PIO_RUNNING,
+        observe_pins: 0,
+        custom_sled: Some(SLED_CLOCK_DIV_CHANGE_PIO_RUNNING),
     },
 ];
 
@@ -294,6 +501,49 @@ const BKPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PeriphArgs {
     pub filter: Option<String>,
     pub verbose: bool,
+}
+
+/// Reject any sled that isn't terminated by a `bkpt #0` (encoded as
+/// Thumb halfword `0xBE00`, little-endian `[0x00, 0xBE]`). This catches
+/// authoring mistakes (missing terminator, odd length, empty slice) at
+/// scenario-evaluation time on both the HW and EMU paths.
+///
+/// Restriction: only `bkpt #0` (`0xBE00`) is accepted. Future scenarios
+/// that need distinguishable halt reasons via `bkpt #N` (`0xBE00 | N`)
+/// would need to relax this check to match any `0xBE**` halfword.
+///
+/// Returns the sled bytes unchanged on success; an error string on
+/// failure. The caller decides whether to panic, abort the scenario,
+/// or log — `run_scenario` currently converts errors to
+/// `Box<dyn Error>`.
+pub fn validate_custom_sled(bytes: &[u8]) -> Result<&[u8], String> {
+    if bytes.is_empty() {
+        return Err("custom sled is empty".to_string());
+    }
+    if bytes.len() < 2 {
+        return Err(format!(
+            "custom sled must be at least one halfword (got {} bytes)",
+            bytes.len()
+        ));
+    }
+    if !bytes.len().is_multiple_of(2) {
+        return Err(format!(
+            "custom sled must be a whole number of halfwords (got {} bytes)",
+            bytes.len()
+        ));
+    }
+    let n = bytes.len();
+    // Thumb halfwords are little-endian: `bkpt #0` = 0xBE00 serialises
+    // to `[0x00, 0xBE]`.
+    if bytes[n - 2] != 0x00 || bytes[n - 1] != 0xBE {
+        return Err(format!(
+            "custom sled must end in `bkpt #0` (0xBE00); last halfword \
+             is 0x{:02X}{:02X}",
+            bytes[n - 1],
+            bytes[n - 2],
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Build the countdown sled bytes for `max_sysclks`.
@@ -434,8 +684,22 @@ pub fn run_scenario(
     release_common_resets(core)?;
 
     apply_setup_hw(core, sc.setup)?;
-    let sled = assemble_sled(sc.max_sysclks);
-    core.write_8(SILICON_RUN_SLED as u64, &sled)?;
+    // `custom_sled = Some(bytes)` → upload as-is (after end-terminator
+    // validation). `None` → fall through to the countdown-loop sled
+    // sized by `max_sysclks`. The validator is the single guard
+    // against authoring mistakes; same check runs on the EMU side
+    // below so a malformed sled fails before any bus state is touched.
+    let owned_sled: Vec<u8>;
+    let sled_bytes: &[u8] = match sc.custom_sled {
+        Some(bytes) => validate_custom_sled(bytes).map_err(|e| {
+            format!("scenario '{}': {e}", sc.name)
+        })?,
+        None => {
+            owned_sled = assemble_sled(sc.max_sysclks);
+            &owned_sled
+        }
+    };
+    core.write_8(SILICON_RUN_SLED as u64, sled_bytes)?;
     let actual_sysclks = run_sled_hw(core)?;
     gate_peripheral_hw(core, sc.name)?;
 
@@ -451,12 +715,71 @@ pub fn run_scenario(
     };
 
     let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
-    emu.core_mut(0).halt();
+    // Core 1 stays halted throughout; scenarios are single-core only.
     emu.core_mut(1).halt();
     for &(addr, val) in sc.setup {
         emu.mmio_write32(addr, val);
     }
-    emu.run(actual_sysclks as u64);
+
+    if let Some(bytes) = sc.custom_sled {
+        // Mirror the HW path: validate first, upload to SRAM, then let
+        // core 0 execute the sled so its embedded MMIO writes (clock
+        // reprogramming, etc.) hit the emulator's bus at the same point
+        // in the run they hit silicon. Matching execution on both sides
+        // is the only way the ClockTree recompute path sees load.
+        //
+        // Termination: step until PC == sled-end BKPT address, bounded
+        // by `actual_sysclks` as a safety cap. This avoids BKPT
+        // overshoot — HW halts cleanly on BKPT, and the emulator's BKPT
+        // handler is currently a 1-cycle NOP that would otherwise fall
+        // through into zero-initialised SRAM (harmless `LSLS R0, R0, #0`)
+        // and consume the remaining cycle budget, letting flag state
+        // drift from HW in a way no current observable notices but
+        // future scenarios might. Stopping at BKPT keeps xPSR in the
+        // same shape on both sides.
+        let vetted: &[u8] = validate_custom_sled(bytes)
+            .map_err(|e| format!("scenario '{}': {e}", sc.name))?;
+        emu.load_image(SILICON_RUN_SLED, vetted);
+        // NOTE: depends on fresh EmulatorBuilder per scenario for default-zero
+        // PRIMASK/CONTROL/FAULTMASK; reusing a long-lived emulator would
+        // inherit stale state and this release block would need to reset those
+        // too.
+        {
+            let c = emu.core_mut(0);
+            c.wake();
+            c.set_reg(13, EMU_TEST_STACK);  // SP
+            c.set_reg(14, 0xFFFF_FFFF);     // LR
+            c.regs.set_pc(SILICON_RUN_SLED);
+            c.regs.xpsr = 0x0100_0000;      // T=1 (Thumb)
+        }
+        let bkpt_pc = SILICON_RUN_SLED + (vetted.len() as u32) - 2;
+        let start = emu.cycles();
+        let budget = actual_sysclks as u64;
+        while emu.core(0).regs.pc() != bkpt_pc
+            && emu.cycles().saturating_sub(start) < budget
+        {
+            emu.step();
+        }
+        let overshot = emu.core(0).regs.pc() != bkpt_pc;
+        if overshot && verbose {
+            println!(
+                "    warn scenario '{}': EMU exhausted {}-cycle budget before \
+                 reaching BKPT at PC=0x{:08X} (PC=0x{:08X})",
+                sc.name,
+                budget,
+                bkpt_pc,
+                emu.core(0).regs.pc(),
+            );
+        }
+        emu.core_mut(0).halt();
+    } else {
+        // Default (non-custom-sled) path: halt both cores and advance
+        // only bus/peripheral state. S1–S5 observables are all "steady-
+        // state after N cycles" — the sled's job on HW is just to burn
+        // N cycles, not to mutate MMIO.
+        emu.core_mut(0).halt();
+        emu.run(actual_sysclks as u64);
+    }
     gate_peripheral_emu(&mut emu, sc.name);
 
     let emu_obs: Vec<u32> =
@@ -621,6 +944,19 @@ pub fn run_against(
         }
     }
 
+    // Restore CLK_SYS_DIV to its reset default (integer=1, fractional=0).
+    // RESETS does *not* gate the CLOCKS block, so a scenario that
+    // reprograms CLK_SYS_DIV (`clock_div_change_pio_running`) leaves the
+    // divider at 0x0002_0000 even after we re-assert the RESETS mask
+    // above. Unconditional — a no-op if the divider was already at 1.
+    // Without this, a PIO scenario later in the same test_silicon
+    // iteration would see HW running at half sys_clk while the emulator
+    // (freshly built each scenario) sees the reset default, diverging
+    // on timing-sensitive observables.
+    if let Err(e) = core.write_word_32(CLOCKS_CLK_SYS_DIV as u64, 0x0001_0000) {
+        eprintln!("warning: periph cleanup CLK_SYS_DIV write failed: {e}");
+    }
+
     if let Some(e) = loop_err {
         return Err(e);
     }
@@ -715,5 +1051,159 @@ mod tests {
             }
         }
         assert_eq!(violations, 0, "FIFO-popping observables present");
+    }
+
+    // ---- Custom sled validator tests ------------------------------------
+
+    /// A sled that doesn't end in `bkpt #0` (`0xBE00` → bytes `[0x00, 0xBE]`)
+    /// must be rejected by the validator — the runner relies on BKPT to
+    /// terminate HW execution, so a missing terminator would wedge the
+    /// probe path until `BKPT_TIMEOUT`.
+    #[test]
+    fn test_validate_custom_sled_rejects_missing_terminator() {
+        // Ends in 0xBF00 (nop), not 0xBE00 (bkpt).
+        let bad: &[u8] = &[0x00, 0xBF, 0x00, 0xBF];
+        let err = validate_custom_sled(bad).expect_err("sled without BKPT should be rejected");
+        assert!(err.contains("bkpt"), "error should mention bkpt, got: {err}");
+    }
+
+    /// Odd-length byte stream can't be a Thumb halfword sequence — reject.
+    #[test]
+    fn test_validate_custom_sled_rejects_odd_length() {
+        let bad: &[u8] = &[0x00, 0xBE, 0x00]; // 3 bytes
+        let err = validate_custom_sled(bad).expect_err("odd-length sled should be rejected");
+        assert!(
+            err.contains("halfword") || err.contains("whole"),
+            "error should mention alignment, got: {err}",
+        );
+    }
+
+    /// Empty sled — nothing to run, reject.
+    #[test]
+    fn test_validate_custom_sled_rejects_empty() {
+        let err = validate_custom_sled(&[]).expect_err("empty sled should be rejected");
+        assert!(err.contains("empty"), "error should mention empty, got: {err}");
+    }
+
+    /// Happy path: a minimal valid sled is just one halfword of BKPT #0.
+    #[test]
+    fn test_validate_custom_sled_accepts_bare_bkpt() {
+        let ok: &[u8] = &[0x00, 0xBE];
+        assert!(validate_custom_sled(ok).is_ok());
+    }
+
+    /// The two new clock-reprogram sleds ship bundled as byte slices — the
+    /// validator must accept them without complaint; a future edit that
+    /// accidentally breaks the terminator gets caught here.
+    #[test]
+    fn test_validate_custom_sled_accepts_shipped_sleds() {
+        assert!(
+            validate_custom_sled(SLED_CLOCK_PLL_SYS_REPROGRAM_MID_RUN).is_ok(),
+            "clock_pll_sys_reprogram_mid_run sled must validate",
+        );
+        assert!(
+            validate_custom_sled(SLED_CLOCK_DIV_CHANGE_PIO_RUNNING).is_ok(),
+            "clock_div_change_pio_running sled must validate",
+        );
+    }
+
+    // ---- Catalogue presence tests for Stage 4 scenarios -----------------
+
+    /// Both Stage-4 clock-reprogram scenarios must be in the catalogue so
+    /// `test_silicon --filter clock_` picks them up, and so the soak-mode
+    /// catalogue shuffle can randomise them alongside everything else.
+    #[test]
+    fn test_clock_pll_sys_reprogram_mid_run_present() {
+        let sc = SCENARIOS.iter().find(|s| s.name == "clock_pll_sys_reprogram_mid_run");
+        assert!(sc.is_some(), "scenario 'clock_pll_sys_reprogram_mid_run' missing");
+        let sc = sc.unwrap();
+        assert!(
+            sc.custom_sled.is_some(),
+            "clock_pll_sys_reprogram_mid_run must ship a custom sled",
+        );
+    }
+
+    #[test]
+    fn test_clock_div_change_pio_running_present() {
+        let sc = SCENARIOS.iter().find(|s| s.name == "clock_div_change_pio_running");
+        assert!(sc.is_some(), "scenario 'clock_div_change_pio_running' missing");
+        let sc = sc.unwrap();
+        assert!(
+            sc.custom_sled.is_some(),
+            "clock_div_change_pio_running must ship a custom sled",
+        );
+    }
+
+    /// After Stage 4 review feedback the scenario's sole MMIO observable
+    /// is CLK_SYS_DIV — the PIO_SM_ADDR / FDEBUG observables were
+    /// dropped because the emulator's PIO step is independent of
+    /// `clock_tree.sys_clk_hz`, so both sides converge on the same
+    /// stall value regardless of the divider change (false-PASS). This
+    /// test locks that invariant: if anyone adds an SM_ADDR observable
+    /// back without first fixing the PIO/sys_clk coupling, the test
+    /// fails and the reviewer is forced to look at the bug report.
+    #[test]
+    fn test_clock_div_change_pio_running_observes_clk_sys_div_only() {
+        let sc = SCENARIOS
+            .iter()
+            .find(|s| s.name == "clock_div_change_pio_running")
+            .expect("scenario missing");
+        assert_eq!(
+            sc.observe.len(),
+            1,
+            "expected exactly one observable (CLK_SYS_DIV); got {} — did \
+             someone restore the SM_ADDR observable?",
+            sc.observe.len(),
+        );
+        let (addr, mask) = sc.observe[0];
+        assert_eq!(
+            addr, CLOCKS_CLK_SYS_DIV,
+            "sole observable must target CLK_SYS_DIV (0x{:08X}); got \
+             0x{:08X}",
+            CLOCKS_CLK_SYS_DIV, addr,
+        );
+        assert_eq!(
+            mask, 0xFFFF_0000,
+            "CLK_SYS_DIV mask must cover only the integer-divider \
+             bits [31:16]; got 0x{:08X}",
+            mask,
+        );
+        assert_eq!(
+            sc.observe_pins, 0,
+            "no GPIO observables expected — the scenario is MMIO-only",
+        );
+    }
+
+    /// Sanity-check: the CLK_SYS_DIV register address must resolve to the
+    /// writable RP2350 CLOCKS slot at 0x4001_0040 (bits [31:16] = integer
+    /// divider). `0x4001_0044` is CLK_SYS_SELECTED, which is read-only;
+    /// getting this wrong turns the scenario into a silent no-op.
+    #[test]
+    fn test_clocks_clk_sys_div_address() {
+        assert_eq!(CLOCKS_CLK_SYS_DIV, 0x4001_0040);
+    }
+
+    /// Existing scenarios shouldn't gain a custom sled by accident —
+    /// only the two new Stage-4 entries opt in. If a future scenario
+    /// author adds a custom sled and forgets to add it to this
+    /// allow-list, the test flags it so the reviewer double-checks
+    /// the intent.
+    #[test]
+    fn test_custom_sled_opt_in_roster() {
+        let expected_custom: HashSet<&str> = [
+            "clock_pll_sys_reprogram_mid_run",
+            "clock_div_change_pio_running",
+        ]
+        .into_iter()
+        .collect();
+        for sc in SCENARIOS {
+            let has_custom = sc.custom_sled.is_some();
+            let expected = expected_custom.contains(sc.name);
+            assert_eq!(
+                has_custom, expected,
+                "scenario '{}' custom_sled={} but expected={}",
+                sc.name, has_custom, expected,
+            );
+        }
     }
 }
