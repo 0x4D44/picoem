@@ -142,6 +142,14 @@ path = "src/bin/picogus_diff_rp2040.rs"
 name = "mmio_trace_rp2040"
 path = "src/bin/mmio_trace_rp2040.rs"
 
+[[bin]]
+name = "silicon_periph_diff_rp2040"
+path = "src/bin/silicon_periph_diff_rp2040.rs"
+
+[[bin]]
+name = "silicon_isr_diff_rp2040"
+path = "src/bin/silicon_isr_diff_rp2040.rs"
+
 # ---------------------------------------------------------------------------
 # Test-only helper binaries (used by integration tests; not for production)
 # ---------------------------------------------------------------------------
