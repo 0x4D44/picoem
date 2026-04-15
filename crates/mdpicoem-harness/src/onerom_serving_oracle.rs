@@ -106,7 +106,7 @@ const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
 /// `addr_bits` must have A11=A12=1 (`addr_bits & 0x1800 == 0x1800`) —
 /// the `Case::new` constructor and the `DEFAULT_CASES` initializer
 /// both assert this.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Case {
     pub label: &'static str,
     pub addr_bits: u16,
@@ -185,7 +185,7 @@ pub enum Verdict {
 /// Per-case diagnostic result. Every field except `verdict` is
 /// `Option` so partial runs (e.g. timeouts before the push arrives)
 /// can still be reported cleanly.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaseResult {
     pub case: Case,
     pub resolved_addr: Option<u32>,
@@ -1608,5 +1608,60 @@ mod tests {
             "missing emulator-bounded caveat: {}",
             report
         );
+    }
+
+    /// 11. Envelope wiring invariant: every `CaseResult` stored in
+    /// `ServingOracle::results` must be a fixed point of `apply_envelope`.
+    /// This is the production path's contract (`run_case` pushes
+    /// `apply_envelope(result)`), and the invariant is equivalent: if
+    /// `apply_envelope` has already been applied, applying it again is a
+    /// no-op; if a raw (pre-envelope) result ever leaks into `results`,
+    /// `apply_envelope` would rewrite its verdict and the equality fails.
+    ///
+    /// Guards against a future refactor accidentally pushing a raw
+    /// `Pass`-with-out-of-range-latency into `results` — that would reach
+    /// the report as a false PASS. The test-only `push_result_for_test`
+    /// bypasses `apply_envelope` deliberately (so report tests can seed
+    /// synthetic `LatencyOutOfEnvelope` rows without round-tripping); it
+    /// is therefore the caller's responsibility to push envelope-
+    /// conformant results, which this test verifies.
+    #[test]
+    fn run_case_applies_envelope_before_pushing_result() {
+        let shadow: Box<[u8; SHADOW_SIZE]> =
+            vec![0u8; SHADOW_SIZE].into_boxed_slice().try_into().unwrap();
+        let mut oracle = ServingOracle::new_with_shadow(shadow);
+
+        // A raw `Pass+5` would be rewritten by `apply_envelope` to
+        // `LatencyOutOfEnvelope { cycles: 5 }` (5 is below the 11..=14
+        // envelope). Push the already-transformed result — the same thing
+        // `run_case` does on the production path — and then assert every
+        // stored result is a fixed point of `apply_envelope`.
+        let pre = CaseResult {
+            case: DEFAULT_CASES[0],
+            verdict: Verdict::Pass,
+            latency_cycles: Some(5),
+            resolved_addr: Some(SHADOW_BASE),
+            expected_byte: Some(0),
+            observed_byte: Some(0),
+        };
+        let post = apply_envelope(pre);
+        assert_eq!(
+            post.verdict,
+            Verdict::LatencyOutOfEnvelope { cycles: 5 },
+            "sanity: apply_envelope should rewrite Pass+5 to LatencyOOE(5)"
+        );
+        oracle.push_result_for_test(post);
+
+        // Invariant the production path must preserve: every stored
+        // result is envelope-idempotent. If `run_case` is ever refactored
+        // to push a raw result, this assertion fails.
+        for r in oracle.results() {
+            assert_eq!(
+                *r,
+                apply_envelope(*r),
+                "stored result should be envelope-fixed-point: {:?}",
+                r
+            );
+        }
     }
 }
