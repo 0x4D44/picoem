@@ -75,5 +75,10 @@ fn direct_boot_from_flash_applies_vector_table() {
         // Thumb bit stripped from PC.
         assert_eq!(core.regs.r[15], 0x1000_0320);
     }
+    // Both cores' VTOR must point at the flash vector table — the SDK's
+    // runtime_init_install_ram_vector_table copies from `mem[VTOR + 4*i]`
+    // and would otherwise read garbage out of the bootrom region.
+    assert_eq!(emu.bus.ppb[0].vtor, 0x1000_0100);
+    assert_eq!(emu.bus.ppb[1].vtor, 0x1000_0100);
     assert!(emu.cores[1].is_halted());
 }

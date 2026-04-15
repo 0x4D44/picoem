@@ -162,20 +162,31 @@ impl Emulator {
         self.bus.load_flash(data);
     }
 
-    /// Direct-boot into an SDK-style firmware by reading the vector table
-    /// at `vtor_offset` within flash (typically `0x100` for pico-sdk).
-    /// Override both cores' SP with word 0 of the vector, PC with word 1
-    /// (Thumb bit stripped), and park core 1 halted as `reset()` does.
+    /// Direct-boot into an SDK-style firmware by emulating the boot2 →
+    /// application handoff. On real silicon the boot2 stub does three
+    /// things before jumping to the application reset handler: it loads
+    /// SP from word 0 of the vector table, sets VTOR to the vector
+    /// table's flash address, and branches to the reset handler at word
+    /// 1 (Thumb bit stripped). This helper performs the same three-piece
+    /// handoff — SP, VTOR, PC — into both cores, then parks core 1
+    /// halted as `reset()` does. The vector table is expected at
+    /// `vtor_offset` within flash (typically `0x100` for pico-sdk).
     ///
-    /// Why this exists — the real RP2040 B2 bootrom detects an attached
-    /// QSPI flash chip by sampling six QSPI pads via `SIO GPIO_HI_IN`
-    /// (offset `0x008`) and validates boot2 by CRC of the first 252
-    /// flash bytes read through the SSI peripheral. Our emulator stubs
-    /// SSI and has no QSPI pad model, so the bootrom (correctly) gives
-    /// up and enters USB MSC boot mode, where it waits forever for a
-    /// UF2 drop. This helper bypasses the check: it takes the same
-    /// "here is SP, here is PC" handoff the bootrom would have performed
-    /// on real silicon after validating boot2.
+    /// Skipping VTOR is silently fatal for any pico-sdk firmware that
+    /// calls `runtime_init_install_ram_vector_table`, which copies the
+    /// flash vector table into SRAM and then writes the SRAM address to
+    /// VTOR. The copy walks `mem[VTOR + 4*i]` for `i` in 0..48; with
+    /// VTOR left at `0x0000_0000` that reads from the bootrom image —
+    /// garbage bytes get installed as exception handlers and the first
+    /// systick fault sends PC into the weeds.
+    ///
+    /// Why this helper exists at all — the real RP2040 B2 bootrom
+    /// detects an attached QSPI flash chip by sampling six QSPI pads via
+    /// `SIO GPIO_HI_IN` (offset `0x008`) and validates boot2 by CRC of
+    /// the first 252 flash bytes read through the SSI peripheral. Our
+    /// emulator stubs SSI and has no QSPI pad model, so the bootrom
+    /// (correctly) gives up and enters USB MSC boot mode, where it waits
+    /// forever for a UF2 drop. This helper bypasses that check.
     ///
     /// The bootrom image remains populated at `0x00000000` so firmware
     /// can resolve ROM function-table pointers (`rom_func_lookup`,
@@ -184,11 +195,14 @@ impl Emulator {
     pub fn direct_boot_from_flash(&mut self, vtor_offset: u32) {
         let sp = self.bus.memory.xip_read32(vtor_offset);
         let pc = self.bus.memory.xip_read32(vtor_offset + 4) & !1;
+        let vtor_addr = bus::XIP_FLASH_BASE + vtor_offset;
         for core in 0..2 {
             self.cores[core].regs.msp = sp;
             self.cores[core].regs.r[13] = sp;
             self.cores[core].regs.set_pc(pc);
         }
+        self.bus.ppb[0].vtor = vtor_addr;
+        self.bus.ppb[1].vtor = vtor_addr;
         // Core 1 stays halted — SDK firmware launches it explicitly via
         // the SIO FIFO handshake, same as after bootrom hand-off.
         self.cores[1].halt();
