@@ -100,6 +100,28 @@ impl PioBlock {
         self.irq_flags as u32
     }
 
+    /// DREQ (data-request) for SM `sm`'s TX FIFO: true when the FIFO
+    /// has room for another word. Consumed by the RP2040 DMA matrix
+    /// (Phase 4) for `DREQ_PIO{0,1}_TX{0..3}`. Out-of-range `sm` is
+    /// treated as "not ready" so the caller doesn't need to bounds-check.
+    #[inline]
+    pub fn tx_dreq(&self, sm: usize) -> bool {
+        if sm >= self.sm.len() {
+            return false;
+        }
+        !self.sm[sm].tx_fifo_full()
+    }
+
+    /// DREQ for SM `sm`'s RX FIFO: true when the FIFO has data to drain.
+    /// Consumed by the RP2040 DMA matrix for `DREQ_PIO{0,1}_RX{0..3}`.
+    #[inline]
+    pub fn rx_dreq(&self, sm: usize) -> bool {
+        if sm >= self.sm.len() {
+            return false;
+        }
+        !self.sm[sm].rx_fifo_empty()
+    }
+
     /// Read-only view of the 32-entry instruction memory. RP2350
     /// `INSTR_MEM` is write-only via the register interface, so test
     /// harnesses use this accessor to verify programs were loaded.

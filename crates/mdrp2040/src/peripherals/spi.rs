@@ -152,6 +152,19 @@ impl SpiRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    /// DREQ: TX FIFO has room and the peripheral is enabled. Phase 4
+    /// DMA TREQ matrix consults this for `SPI0_TX` / `SPI1_TX`.
+    #[inline]
+    pub fn tx_dreq(&self) -> bool {
+        self.is_enabled() && self.tx_fifo.len() < SSP_FIFO_DEPTH
+    }
+
+    /// DREQ: RX FIFO has data to drain.
+    #[inline]
+    pub fn rx_dreq(&self) -> bool {
+        self.is_enabled() && !self.rx_fifo.is_empty()
+    }
+
     #[inline]
     fn is_enabled(&self) -> bool {
         (self.cr1 & SSPCR1_SSE) != 0

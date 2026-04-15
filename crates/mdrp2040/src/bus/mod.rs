@@ -149,6 +149,11 @@ pub(crate) fn xip_flash_offset(addr: u32) -> Option<u32> {
 pub const PIO0_BASE: u32 = 0x5020_0000;
 pub const PIO1_BASE: u32 = 0x5030_0000;
 
+/// DMA peripheral base (RP2040 datasheet §2.5 — single 4 KB window
+/// covering 12 channels + global registers + debug aliases). Phase 4
+/// (HLD V7 §5.6) enables the full DMA model.
+pub const DMA_BASE: u32 = 0x5000_0000;
+
 /// XIP SRAM size (16 KB on RP2040 — the cache RAM exposed as scratch).
 pub const XIP_SRAM_SIZE: usize = 16 * 1024;
 
@@ -654,6 +659,7 @@ impl Bus {
             PADS_BANK0_BASE => self.pads_bank0.read32(offset),
             PIO0_BASE => self.pio[0].read32(offset),
             PIO1_BASE => self.pio[1].read32(offset),
+            DMA_BASE => self.dma.read32(offset),
             TIMER_BASE => self
                 .timer
                 .read32(offset, self.master_cycle, self.clock_tree.sys_clk_hz),
@@ -717,6 +723,7 @@ impl Bus {
             PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
             PIO0_BASE => self.pio[0].write32(offset, val, alias),
             PIO1_BASE => self.pio[1].write32(offset, val, alias),
+            DMA_BASE => self.dma.write32(offset, val, alias),
             TIMER_BASE => {
                 let sys_hz = self.clock_tree.sys_clk_hz;
                 let mc = self.master_cycle;
@@ -1472,6 +1479,7 @@ impl Bus {
             && self.i2c1.is_idle()
             && self.adc.is_idle()
             && self.pwm.is_idle()
+            && self.dma.is_idle()
     }
 
     /// True iff at least one PIO SM is enabled in either block, or any
@@ -1485,6 +1493,113 @@ impl Bus {
             && !self.pio[1].any_sm_enabled()
             && self.pio[0].pending_irqs() == 0
             && self.pio[1].pending_irqs() == 0
+    }
+
+    /// Collect the current DREQ (data-request) bitmap for all 64 TREQ
+    /// sources + the FORCE sentinel at bit 63.
+    ///
+    /// Layout (RP2040 datasheet §2.5.3.1 Table 120, pinned in HLD V7
+    /// Appendix C):
+    /// * bits 0..3   PIO0 TX0..3
+    /// * bits 4..7   PIO0 RX0..3
+    /// * bits 8..11  PIO1 TX0..3
+    /// * bits 12..15 PIO1 RX0..3
+    /// * bit  16     SPI0 TX
+    /// * bit  17     SPI0 RX
+    /// * bit  18     SPI1 TX
+    /// * bit  19     SPI1 RX
+    /// * bit  20     UART0 TX
+    /// * bit  21     UART0 RX
+    /// * bit  22     UART1 TX
+    /// * bit  23     UART1 RX
+    /// * bits 24..31 PWM WRAP0..7 (deferred — one-shot per wrap, V1 zero)
+    /// * bit  32     I2C0 TX
+    /// * bit  33     I2C0 RX
+    /// * bit  34     I2C1 TX
+    /// * bit  35     I2C1 RX
+    /// * bit  36     ADC FIFO
+    /// * bits 37..39 XIP (not modelled)
+    /// * bit  63     FORCE (always true — `TREQ_SEL == 0x3F` bypass)
+    ///
+    /// Consumed by [`crate::dma::Dma::tick`] — snapshot taken before any
+    /// bus access so peripheral state changes driven by the current
+    /// transfer don't feed back into same-cycle DREQ arbitration.
+    pub fn collect_dreqs(&self) -> u64 {
+        let mut bits = 0u64;
+        // PIO0 / PIO1 — four SM × (TX | RX) per block.
+        for sm in 0..4 {
+            if self.pio[0].tx_dreq(sm) {
+                bits |= 1u64 << sm;
+            }
+            if self.pio[0].rx_dreq(sm) {
+                bits |= 1u64 << (4 + sm);
+            }
+            if self.pio[1].tx_dreq(sm) {
+                bits |= 1u64 << (8 + sm);
+            }
+            if self.pio[1].rx_dreq(sm) {
+                bits |= 1u64 << (12 + sm);
+            }
+        }
+        if self.spi0.tx_dreq() {
+            bits |= 1u64 << 16;
+        }
+        if self.spi0.rx_dreq() {
+            bits |= 1u64 << 17;
+        }
+        if self.spi1.tx_dreq() {
+            bits |= 1u64 << 18;
+        }
+        if self.spi1.rx_dreq() {
+            bits |= 1u64 << 19;
+        }
+        if self.uart0.tx_dreq() {
+            bits |= 1u64 << 20;
+        }
+        if self.uart0.rx_dreq() {
+            bits |= 1u64 << 21;
+        }
+        if self.uart1.tx_dreq() {
+            bits |= 1u64 << 22;
+        }
+        if self.uart1.rx_dreq() {
+            bits |= 1u64 << 23;
+        }
+        // PWM wrap DREQs (bits 24..31) are one-shot-per-wrap and deferred
+        // to a later phase; `audio_i2s` uses PIO DREQ, not PWM wrap.
+        if self.i2c0.tx_dreq() {
+            bits |= 1u64 << 32;
+        }
+        if self.i2c0.rx_dreq() {
+            bits |= 1u64 << 33;
+        }
+        if self.i2c1.tx_dreq() {
+            bits |= 1u64 << 34;
+        }
+        if self.i2c1.rx_dreq() {
+            bits |= 1u64 << 35;
+        }
+        if self.adc.dreq() {
+            bits |= 1u64 << 36;
+        }
+        // XIP DREQs (bits 37..39) not modelled.
+        // FORCE is always 1 — no peripheral produces it.
+        bits |= 1u64 << 63;
+        bits
+    }
+
+    /// Drive the DMA by one cycle. Swaps the DMA out of `self` to avoid
+    /// cross-borrows while it issues transfers through the bus, then
+    /// restores it and routes any pending IRQs through `irq_pending`.
+    ///
+    /// Per HLD V7 §5.6 ordering contract: peripherals tick first (to
+    /// produce DREQ), then `tick_dma` consumes the snapshot. Call at the
+    /// tail of [`Self::tick_peripherals`].
+    pub fn tick_dma(&mut self) {
+        let mut dma = std::mem::take(&mut self.dma);
+        dma.tick(self);
+        dma.route_irqs(&mut self.irq_pending);
+        self.dma = dma;
     }
 
     /// Advance every stateful peripheral by one system-clock cycle.
@@ -1517,6 +1632,9 @@ impl Bus {
         self.adc.tick(1, &self.clock_tree, &mut self.irq_pending);
         // PWM: per-slice counter advance + wrap-IRQ latch.
         self.pwm.tick(1, &self.clock_tree, &mut self.irq_pending);
+        // DMA ticks LAST per HLD V7 §5.6 ordering contract — peripherals
+        // produce DREQ on this cycle, DMA snapshots + consumes.
+        self.tick_dma();
     }
 
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).

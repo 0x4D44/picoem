@@ -193,6 +193,22 @@ impl AdcRegs {
             && self.intr == 0
     }
 
+    /// DREQ: FIFO level crosses `FCS.THRESH` with `FCS.DREQ_EN` set.
+    /// Phase 4 DMA TREQ `DREQ_ADC` consults this — firmware that wants
+    /// DMA'd samples writes `FCS.EN=1, DREQ_EN=1, THRESH=n` and the DMA
+    /// kicks whenever the FIFO is at or above that level. If `DREQ_EN`
+    /// is clear the DREQ never asserts even while samples are waiting.
+    #[inline]
+    pub fn dreq(&self) -> bool {
+        if !self.fcs_enabled() || (self.fcs & FCS_DREQ_EN) == 0 {
+            return false;
+        }
+        let thresh = ((self.fcs & FCS_THRESH_MASK) >> FCS_THRESH_SHIFT) as usize;
+        // THRESH = 0 → datasheet says "DREQ every sample"; use >= 1.
+        let effective = thresh.max(1);
+        self.fifo.len() >= effective
+    }
+
     #[inline]
     fn is_enabled(&self) -> bool {
         (self.cs & CS_EN) != 0

@@ -17,6 +17,7 @@
 pub mod bus;
 pub mod core;
 pub mod dma;
+pub mod dreq;
 pub mod irq;
 pub mod memory;
 pub mod peripherals;
@@ -109,6 +110,7 @@ impl Emulator {
         self.bus.i2c1.reset();
         self.bus.adc.reset();
         self.bus.pwm.reset();
+        self.bus.dma.reset();
         self.bus.irq_pending = 0;
         for n in &mut self.bus.nvics {
             n.reset();

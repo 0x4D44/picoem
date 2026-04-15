@@ -16,12 +16,15 @@
 //! distinct CLR writes. Phase 3 adds ADC (bit 0) and PWM (bit 14).
 
 use super::{
-    ADC_BASE, Bus, I2C0_BASE, I2C1_BASE, PWM_BASE, SPI0_BASE, SPI1_BASE, TIMER_BASE, UART0_BASE,
-    UART1_BASE, WATCHDOG_BASE,
+    ADC_BASE, Bus, DMA_BASE, I2C0_BASE, I2C1_BASE, PWM_BASE, SPI0_BASE, SPI1_BASE, TIMER_BASE,
+    UART0_BASE, UART1_BASE, WATCHDOG_BASE,
 };
 
 /// RESETS bit for the ADC peripheral (RP2040 datasheet §2.14 Table 26).
 pub const RESET_ADC: u8 = 0;
+/// RESETS bit for the DMA peripheral (RP2040 datasheet §2.14 Table 26).
+/// Phase 4 (HLD V7 §5.6) — bit 2 gates the entire 12-channel DMA window.
+pub const RESET_DMA: u8 = 2;
 /// RESETS bit for I2C0 (RP2040 datasheet §2.14 Table 26).
 pub const RESET_I2C0: u8 = 3;
 /// RESETS bit for I2C1.
@@ -57,6 +60,7 @@ pub const RESET_WATCHDOG: u8 = 24;
 /// memory) or because RESETS routing for it hasn't landed yet.
 pub static BASE_RESET_MAP: &[(u32, u8)] = &[
     (ADC_BASE, RESET_ADC),
+    (DMA_BASE, RESET_DMA),
     (I2C0_BASE, RESET_I2C0),
     (I2C1_BASE, RESET_I2C1),
     (PWM_BASE, RESET_PWM),

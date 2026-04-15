@@ -226,6 +226,22 @@ impl UartRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    /// DREQ: TX FIFO has room and the UART is enabled. Consumed by the
+    /// RP2040 DMA matrix (Phase 4) — firmware-selected `UART0_TX` /
+    /// `UART1_TX` TREQ values unblock transfers whenever this is true.
+    #[inline]
+    pub fn tx_dreq(&self) -> bool {
+        self.is_enabled() && self.tx_fifo.len() < self.tx_capacity()
+    }
+
+    /// DREQ: RX FIFO non-empty. Not wired into `dma_uart` corpus
+    /// (which drives TX only), but lands alongside `tx_dreq` so the
+    /// DREQ matrix is complete.
+    #[inline]
+    pub fn rx_dreq(&self) -> bool {
+        self.is_enabled() && !self.rx_fifo.is_empty()
+    }
+
     /// Enabled state: UARTEN bit in UARTCR.
     #[inline]
     fn is_enabled(&self) -> bool {

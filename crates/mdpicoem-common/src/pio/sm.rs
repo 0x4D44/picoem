@@ -130,6 +130,19 @@ impl StateMachine {
         self.enabled
     }
 
+    /// True iff this SM's TX FIFO is full (no room for another word).
+    /// Used by `PioBlock::tx_dreq` to surface DMA DREQ status without
+    /// exposing the FIFO itself.
+    pub fn tx_fifo_full(&self) -> bool {
+        self.tx_fifo.is_full()
+    }
+
+    /// True iff this SM's RX FIFO is empty (nothing to drain). Used by
+    /// `PioBlock::rx_dreq`.
+    pub fn rx_fifo_empty(&self) -> bool {
+        self.rx_fifo.is_empty()
+    }
+
     /// Read the CLKDIV register value (int[31:16], frac[15:8]).
     pub fn read_clkdiv(&self) -> u32 {
         ((self.clkdiv_int as u32) << 16) | ((self.clkdiv_frac as u32) << 8)

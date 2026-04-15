@@ -217,6 +217,19 @@ impl I2cRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.raw_intr_stat == 0
     }
 
+    /// DREQ: TX FIFO has room and the peripheral is enabled. Phase 4
+    /// DMA TREQ matrix consults this for `I2C0_TX` / `I2C1_TX`.
+    #[inline]
+    pub fn tx_dreq(&self) -> bool {
+        self.is_enabled() && self.tx_fifo.len() < I2C_FIFO_DEPTH
+    }
+
+    /// DREQ: RX FIFO has data to drain.
+    #[inline]
+    pub fn rx_dreq(&self) -> bool {
+        self.is_enabled() && !self.rx_fifo.is_empty()
+    }
+
     #[inline]
     fn is_enabled(&self) -> bool {
         (self.enable & 1) != 0
