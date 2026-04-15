@@ -50,6 +50,10 @@ path = "src/bin/softfloat_diff.rs"
 name = "onerom_pio_diff_rp2350"
 path = "src/bin/onerom_pio_diff_rp2350.rs"
 
+[[bin]]
+name = "onerom_full_system_rp2350"
+path = "src/bin/onerom_full_system_rp2350.rs"
+
 # ---------------------------------------------------------------------------
 # RP2040 (Cortex-M0+) binaries
 # ---------------------------------------------------------------------------
