@@ -6981,6 +6981,37 @@ fn test_pll_usb_independent_of_pll_sys() {
     assert_eq!(bus.pll_usb_lock_at_cycle, None);
 }
 
+#[test]
+fn test_pll_cs_rearm_on_fbdiv_change_mid_run() {
+    // Bus-level integration probe for the Option B fidelity path:
+    // changing FBDIV while the PLL is still powered re-arms the
+    // lock-detect counter, so LOCK drops back to 0 until the new
+    // arm elapses. (Option C — the original HLD draft — would have
+    // kept LOCK latched here.)
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);    // FBDIV = 100
+    bus.write32(0x4005_0004, 0);      // PWR = 0 → arm
+    bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+        "initial lock past first arm");
+
+    let reconfig_at = PLL_LOCK_DELAY_SYSCLKS + 100;
+    bus.master_cycle = reconfig_at;
+    bus.write32(0x4005_0008, 125);    // change FBDIV while powered
+    assert_eq!(
+        bus.pll_sys_lock_at_cycle,
+        Some(reconfig_at + PLL_LOCK_DELAY_SYSCLKS),
+        "FBDIV change must re-arm the lock-detect counter",
+    );
+    assert_eq!(bus.read32(0x4005_0000) & (1 << 31), 0,
+        "LOCK must drop to 0 between rearm and the new arm point");
+
+    bus.master_cycle = reconfig_at + PLL_LOCK_DELAY_SYSCLKS + 1;
+    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+        "LOCK must re-assert past the new arm");
+}
+
 // ============================================================================
 // Clock Tree V2 Phase D: ROSC / XOSC register backing
 // ============================================================================

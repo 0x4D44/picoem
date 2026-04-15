@@ -73,8 +73,9 @@ sections "00:05–00:15" and "06:09"):
 
 The same sequence is the only thing that worked during the earlier
 "00:05–00:15 — Cleanup attempts failed on Windows" debugging window,
-where `TaskStop`, `kill -9 <WINPID>`, two flavours of `taskkill`, and
-`powershell Stop-Process` had all hung or no-op'd.
+where `TaskStop` returned success but left orphaned children, and
+`kill -9 <WINPID>`, two flavours of `taskkill`, and
+`powershell Stop-Process` all hung or returned "No such process".
 
 ### When to reach for it
 
