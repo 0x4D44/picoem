@@ -11,3 +11,10 @@ env/
 # roms/: tracked binaries (blinky.bin, bootrom-combined.bin, lcd_demo.bin)
 # are whitelisted by roms/.gitignore. Other build artefacts under roms/
 # are still ignored by that file's rules.
+# third_party/picogus/: firmware artefacts are fetched at demo time.
+# Keep the VERSION pin + README in git, ignore the downloaded blobs.
+third_party/picogus/*.zip
+third_party/picogus/*.uf2
+third_party/picogus/*.bin
+third_party/picogus/*.exe
+third_party/picogus/UPSTREAM_README.md
