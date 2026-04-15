@@ -128,9 +128,10 @@ fn setup_gpio_output(emu: &mut Emulator, pin: u8, funcsel: u8) {
     // disable (OD, bit 7) and enable the input (IE, bit 6) matching
     // Pico SDK defaults for an output pin.
     let pad_offset = 0x04 + (pin as u32) * 4;
-    // IE=1 (bit 6), DRIVE=2 (bits 5:4 = 01 = 4 mA default), PUE=0, PDE=0.
-    // Matches `PAD_RESET` on the emulator side (0x56) with OD cleared.
-    emu.mmio_write32(PADS_BANK0_BASE + pad_offset, 0x0000_0056);
+    // SCHMITT=1 (bit 1), DRIVE=01=4mA (bits 5:4), IE=1 (bit 6);
+    // PUE=0, PDE=0, OD=0. SDK-style default for an output pin with the
+    // pull-down explicitly disabled.
+    emu.mmio_write32(PADS_BANK0_BASE + pad_offset, 0x0000_0052);
 }
 
 /// Install a minimal two-instruction wrap loop on PIO0 SM0:
@@ -234,10 +235,12 @@ fn setup_basic_core1_at(emu: &mut Emulator, addr: u32) {
 
 /// Dispatch: set up the emulator for the chosen workload.
 fn setup(emu: &mut Emulator, workload: Workload) {
-    // Stack placement: scratch SRAM5 on RP2040 (0x2004_1000..0x2004_2000).
-    // Top of SRAM5 is 0x2004_2000 (first push lands at 0x2004_1FFC).
-    // For dual-core workloads, split: core 0 uses top half, core 1 the
-    // lower half.
+    // Stack placement. Single-core workloads park core 0's stack top at
+    // 0x2004_0000 (SRAM3/SRAM4 boundary — first push lands at
+    // 0x2003_FFFC in striped SRAM3). Dual-core workloads move core 0's
+    // stack top to 0x2004_2000 (top of SRAM5 scratch — first push at
+    // 0x2004_1FFC) and give core 1 the 0x2004_1800 mid-point of SRAM5
+    // so push/pop traffic stays off the bank-0 fetch-contention signal.
     let core0_stack_top: u32 = if workload.is_dual_core() {
         0x2004_2000
     } else {
@@ -276,8 +279,17 @@ fn setup(emu: &mut Emulator, workload: Workload) {
             emu.mmio_write32(SIO_GPIO_OE_SET, 1u32 << SIO_TOGGLE_PIN);
             setup_pio0_sm0_wrap(emu, PIO_PIN);
 
-            // Core 1 runs basic ALU loop at 0x2000_0040 (bank 0).
-            setup_basic_core1_at(emu, 0x2000_0040);
+            // Core 1 placed at 0x2000_0044 (word 17 = bank 1) so its
+            // two-halfword ALU loop fetches land on core 0's peripheral
+            // hot-path banks — core 0's ADDS@0x4 / STR@0x6 both live in
+            // bank 1, core 0's B@0x8 in bank 2; core 1's ADDS@0x46 in
+            // bank 1 and B@0x48 in bank 2. Contention fires whenever
+            // both cores happen to fetch bank 1 or bank 2 on the same
+            // cycle. (Core 0's `Contention` workload uses 0x2000_0040
+            // — bank 0 — which works because core 0's basic ALU loop is
+            // in bank 0. The peripheral shape here spans banks 1 and 2,
+            // so stress needs a different offset.)
+            setup_basic_core1_at(emu, 0x2000_0044);
             let core1_stack_top: u32 = 0x2004_1800;
             emu.core_mut(1).regs.msp = core1_stack_top;
             emu.core_mut(1).regs.r[13] = core1_stack_top;
@@ -343,6 +355,19 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
+
+    // `--dual-core` was removed in the workload-spread refactor: core
+    // count is now a property of the workload (Basic/Peripheral → single
+    // core; Contention/Stress → dual core). Reject it explicitly so
+    // stale scripts get a helpful nudge instead of silently running the
+    // wrong workload.
+    if std::env::args().any(|a| a == "--dual-core") {
+        eprintln!(
+            "error: --dual-core has been removed. Use --workload {{contention,stress}} \
+             for dual-core workloads."
+        );
+        std::process::exit(1);
+    }
 
     if seconds == 0 || clock_mhz == 0 {
         eprintln!("error: --seconds and --clock-mhz must be > 0");

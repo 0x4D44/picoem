@@ -40,11 +40,15 @@ enum Workload {
     /// in the background (keeps `PioBlock::execute_cycle` on the hot
     /// path).
     Peripheral,
-    /// Both cores running the ALU loop in striped SRAM bank 0 (16-byte
-    /// apart) — exercises the contention accounting on core 1.
+    /// Both cores running the ALU loop (core 1 placed at bank-0 offset
+    /// for CLI symmetry with RP2040). mdrp2350 runs cores sequentially
+    /// per quantum with no production-path contention hooks, so this
+    /// workload measures dual-core compute cost only — no bank-contention
+    /// accounting. See HLD "Chip asymmetry" note.
     Contention,
     /// Composite: core 0 runs the peripheral loop, core 1 runs the basic
-    /// ALU loop, both in bank 0; PIO0 SM0 running. Realistic worst case.
+    /// ALU loop, PIO0 SM0 running. On RP2350 this is dual-core compute +
+    /// peripheral cost (no bank contention — see `Contention` above).
     Stress,
     /// FPU-heavy: VADD/VMUL/VDIV/VSQRT loop exercising the FPU hot path.
     /// Used by the HLD §12 performance budget check.
@@ -173,10 +177,10 @@ fn setup_gpio_output(emu: &mut Emulator, pin: u8, funcsel: u8) {
     let ctrl_offset = 0x04 + (pin as u32) * 8;
     emu.mmio_write32(IO_BANK0_BASE + ctrl_offset, funcsel as u32);
 
-    // PADS_BANK0_GPIO<pin> at offset 0x04 + pin*4. IE=1 (bit 6),
-    // DRIVE=2 (bits 5:4 = 01 = 4 mA default).
+    // PADS_BANK0_GPIO<pin> at offset 0x04 + pin*4. SCHMITT=1 (bit 1),
+    // DRIVE=01=4mA (bits 5:4), IE=1 (bit 6); PUE=0, PDE=0, OD=0.
     let pad_offset = 0x04 + (pin as u32) * 4;
-    emu.mmio_write32(PADS_BANK0_BASE + pad_offset, 0x0000_0056);
+    emu.mmio_write32(PADS_BANK0_BASE + pad_offset, 0x0000_0052);
 }
 
 /// Install a minimal two-instruction wrap loop on PIO0 SM0:
@@ -332,12 +336,17 @@ fn setup(emu: &mut Emulator, workload: Workload) {
         }
         Workload::Contention => {
             setup_basic_core0(emu);
-            // Core 1 in striped bank 0 at 0x2000_0040 (word 16, 16 % 8 = 0).
+            // Core 1 placed 16 words past core 0 (RP2040 bank-0 layout).
+            // No timing effect on RP2350 — cores run sequentially per
+            // quantum, no production-path contention model. Kept for
+            // CLI symmetry. See HLD "Chip asymmetry" note.
             setup_basic_core1_at(emu, 0x2000_0040);
-            // Core 1 stack in SRAM9 (non-striped scratch).
-            let core1_stack_top: u32 = 0x2008_2000;
+            // Core 1 stack in SRAM9 (non-striped scratch). SRAM9 ends at
+            // 0x2008_2000; first push lands at 0x2008_1FFC.
+            let core1_stack_top: u32 = 0x2008_1FFC;
             emu.core_mut(1).regs.msp = core1_stack_top;
             emu.core_mut(1).regs.r[13] = core1_stack_top;
+            emu.core_mut(1).wake();
         }
         Workload::Stress => {
             setup_peripheral_core0(emu);
@@ -345,11 +354,14 @@ fn setup(emu: &mut Emulator, workload: Workload) {
             emu.mmio_write32(SIO_GPIO_OE_SET, 1u32 << SIO_TOGGLE_PIN);
             setup_pio0_sm0_wrap(emu, PIO_PIN);
 
-            // Core 1 runs basic ALU loop at 0x2000_0040 (bank 0).
+            // Core 1 runs basic ALU loop at 0x2000_0040. No cross-core
+            // bank contention on RP2350 — dual-core compute + peripheral
+            // cost only. See HLD "Chip asymmetry" note.
             setup_basic_core1_at(emu, 0x2000_0040);
-            let core1_stack_top: u32 = 0x2008_2000;
+            let core1_stack_top: u32 = 0x2008_1FFC;
             emu.core_mut(1).regs.msp = core1_stack_top;
             emu.core_mut(1).regs.r[13] = core1_stack_top;
+            emu.core_mut(1).wake();
         }
         Workload::FpuHeavy => {
             setup_fpu_heavy_core0(emu);
@@ -415,6 +427,19 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
+
+    // `--dual-core` was removed in the workload-spread refactor: core
+    // count is now a property of the workload (Basic/Peripheral/FpuHeavy
+    // → single core; Contention/Stress → dual core). Reject it
+    // explicitly so stale scripts get a helpful nudge instead of
+    // silently running the wrong workload.
+    if std::env::args().any(|a| a == "--dual-core") {
+        eprintln!(
+            "error: --dual-core has been removed. Use --workload {{contention,stress}} \
+             for dual-core workloads."
+        );
+        std::process::exit(1);
+    }
 
     if seconds == 0 || clock_mhz == 0 {
         eprintln!("error: --seconds and --clock-mhz must be > 0");
@@ -516,11 +541,25 @@ fn main() {
         let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / unpaced_cycles as f64;
         println!("Total cycles:   {}", unpaced_cycles);
         println!("Avg MHz:        {:.1}", mhz);
-        println!("Host/emu cycle: {:.2} (target: <33 per HLD §12)", host_cycles_per_emu);
-        if host_cycles_per_emu < 33.0 {
-            println!("Budget:         OK ({:.2} < 33)", host_cycles_per_emu);
+        // HLD §12's <33 host-cycles/emu-cycle budget was calibrated
+        // against `basic` and `fpu-heavy`. The peripheral / contention /
+        // stress workloads deliberately do more work per master cycle
+        // (PIO tick, GPIO merge, dual-core dispatch) and will always
+        // exceed 33 — that's the cost the bench is designed to reveal,
+        // not a regression. Show the budget verdict only for the two
+        // workloads the gate was calibrated for; emit the raw number
+        // informationally for the rest.
+        let budget_gated = matches!(workload, Workload::Basic | Workload::FpuHeavy);
+        if budget_gated {
+            println!("Host/emu cycle: {:.2} (target: <33 per HLD §12)", host_cycles_per_emu);
+            if host_cycles_per_emu < 33.0 {
+                println!("Budget:         OK ({:.2} < 33)", host_cycles_per_emu);
+            } else {
+                println!("Budget:         OVER ({:.2} >= 33) — investigate regression", host_cycles_per_emu);
+            }
         } else {
-            println!("Budget:         OVER ({:.2} >= 33) — investigate regression", host_cycles_per_emu);
+            println!("Host/emu cycle: {:.2} (informational; HLD §12 budget only gates basic/fpu-heavy)",
+                     host_cycles_per_emu);
         }
         println!("Verdict:        UNPACED (profiling mode)");
         return;

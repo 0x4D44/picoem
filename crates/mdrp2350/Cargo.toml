@@ -8,6 +8,8 @@ rust-version.workspace = true
 [features]
 # Forward the PIO `test-hooks` feature to `mdpicoem-common`. Enables
 # cross-crate unit tests to push RX FIFO words via `PioBlock::push_rx`.
+# (Consumed by mdpicoem-harness [dev-dependencies] — removing this
+# breaks the concurrent PicoGUS / silicon-oracle test harness.)
 test-hooks = ["mdpicoem-common/test-hooks"]
 
 [dependencies]
