@@ -1,5 +1,17 @@
 [workspace]
 members = ["crates/*"]
+# epio-sys requires clang and vendored submodules. Excluded from
+# default-members so `cargo build` at the root keeps working on hosts
+# without clang. Build it explicitly: `cargo build -p epio-sys`.
+default-members = [
+    "crates/mdpicoem-common",
+    "crates/mdpicoem-debug",
+    "crates/mdpicoem-harness",
+    "crates/mdrp2040",
+    "crates/mdrp2040app",
+    "crates/mdrp2350",
+    "crates/mdrp2350app",
+]
 resolver = "2"
 
 [workspace.package]

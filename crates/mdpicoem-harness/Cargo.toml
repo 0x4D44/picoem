@@ -1,11 +1,12 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.11.0"
+version = "0.12.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mdpicoem-common = { path = "../mdpicoem-common" }
 mdrp2350 = { path = "../mdrp2350" }
 mdrp2040 = { path = "../mdrp2040" }
 probe-rs = "0.31"
@@ -45,6 +46,10 @@ path = "src/bin/paced_bench_rp2350.rs"
 name = "softfloat_diff"
 path = "src/bin/softfloat_diff.rs"
 
+[[bin]]
+name = "onerom_pio_diff_rp2350"
+path = "src/bin/onerom_pio_diff_rp2350.rs"
+
 # ---------------------------------------------------------------------------
 # RP2040 (Cortex-M0+) binaries
 # ---------------------------------------------------------------------------
@@ -56,3 +61,7 @@ path = "src/bin/qemu_diff_m0plus.rs"
 [[bin]]
 name = "probe_diff_rp2040"
 path = "src/bin/probe_diff_rp2040.rs"
+
+[[bin]]
+name = "paced_bench_rp2040"
+path = "src/bin/paced_bench_rp2040.rs"

@@ -1,0 +1,6 @@
+[submodule "crates/epio-sys/third_party/epio"]
+	path = crates/epio-sys/third_party/epio
+	url = https://github.com/piersfinlayson/epio.git
+[submodule "crates/epio-sys/third_party/apio"]
+	path = crates/epio-sys/third_party/apio
+	url = https://github.com/piersfinlayson/apio.git

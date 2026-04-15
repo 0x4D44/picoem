@@ -1,0 +1,19 @@
+[package]
+name = "epio-sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Links marker prevents duplicate linking of the native library if another
+# crate ever tries to bring its own copy.
+links = "epio"
+
+[build-dependencies]
+cc = "1.2"
+bindgen = "0.72"
+
+[[bin]]
+name = "onerom_trace_gen_rp2350"
+path = "src/bin/onerom_trace_gen_rp2350.rs"
