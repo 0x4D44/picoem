@@ -678,9 +678,21 @@ pub fn run_cycle_case(
 /// Preconditions: `core` is halted. `reset_and_halt` + `enable_cyccnt` have
 /// been called (the orchestrator owns these; the standalone binary's thin
 /// wrapper does them before calling here).
+///
+/// Case selection semantics:
+/// * `order = None` — run every catalogue case whose name matches
+///   `args.filter`, in catalogue-declared order (single-pass / standalone
+///   default).
+/// * `order = Some(&[name, name, …])` — run exactly those cases in that
+///   order. `args.filter` is ignored for selection (the caller already
+///   applied any filtering when building the list). Names not present in
+///   the catalogue are skipped with a single `eprintln!` warning per
+///   unknown name so a mis-shuffled call leaves a breadcrumb but does
+///   not bring down the run.
 pub fn run_against(
     core: &mut Core,
     args: &CycleArgs,
+    order: Option<&[&str]>,
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
     debug_assert!(args.iter_high > args.iter_low, "iter_high must exceed iter_low");
 
@@ -701,10 +713,24 @@ pub fn run_against(
     core.write_core_reg(SP_REG, EMU_TEST_STACK)?;
     core.write_core_reg(LR_REG, 0xFFFF_FFFFu32)?;
 
-    let selected: Vec<&CycleCase> = CASES
-        .iter()
-        .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
-        .collect();
+    let selected: Vec<&CycleCase> = match order {
+        None => CASES
+            .iter()
+            .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
+            .collect(),
+        Some(names) => {
+            let mut v: Vec<&CycleCase> = Vec::with_capacity(names.len());
+            for name in names {
+                match CASES.iter().find(|c| c.name == *name) {
+                    Some(c) => v.push(c),
+                    None => eprintln!(
+                        "cycle_cases::run_against: unknown case '{name}' in order list; skipping",
+                    ),
+                }
+            }
+            v
+        }
+    };
 
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
     for case in selected {

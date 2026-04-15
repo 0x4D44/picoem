@@ -528,14 +528,38 @@ pub fn run_scenario(
 ///
 /// Preconditions: `core` is live (auto-attached). The function handles
 /// reset / CYCCNT enable on the first selected scenario.
+///
+/// Case selection semantics:
+/// * `order = None` — run every catalogue scenario whose name matches
+///   `args.filter`, in catalogue-declared order (single-pass / standalone
+///   default).
+/// * `order = Some(&[name, name, …])` — run exactly those scenarios in
+///   that order. `args.filter` is ignored for selection. Names not
+///   present in the catalogue are skipped with a single `eprintln!`
+///   warning per unknown name.
 pub fn run_against(
     core: &mut Core,
     args: &PeriphArgs,
+    order: Option<&[&str]>,
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
-    let selected: Vec<&PeriphScenario> = SCENARIOS
-        .iter()
-        .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
-        .collect();
+    let selected: Vec<&PeriphScenario> = match order {
+        None => SCENARIOS
+            .iter()
+            .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
+            .collect(),
+        Some(names) => {
+            let mut v: Vec<&PeriphScenario> = Vec::with_capacity(names.len());
+            for name in names {
+                match SCENARIOS.iter().find(|s| s.name == *name) {
+                    Some(sc) => v.push(sc),
+                    None => eprintln!(
+                        "silicon_scenarios::run_against: unknown scenario '{name}' in order list; skipping",
+                    ),
+                }
+            }
+            v
+        }
+    };
 
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
     let mut loop_err: Option<Box<dyn std::error::Error>> = None;

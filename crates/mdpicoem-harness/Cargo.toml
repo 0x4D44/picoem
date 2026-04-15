@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.19.0"
+version = "0.20.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ probe-rs = "0.31"
 rand = "0.8"
 chrono = "0.4"
 ctrlc = "3"
+humantime = "2"
 
 # Windows-only: Job Object handles for kernel-enforced parent->child
 # lifetime on QEMU children spawned by `QemuProcess`. Pinned to the same
@@ -100,6 +101,10 @@ path = "src/bin/silicon_cycle_oracle_rp2350.rs"
 [[bin]]
 name = "silicon_periph_diff_rp2350"
 path = "src/bin/silicon_periph_diff_rp2350.rs"
+
+[[bin]]
+name = "test_silicon"
+path = "src/bin/test_silicon.rs"
 
 # ---------------------------------------------------------------------------
 # RP2040 (Cortex-M0+) binaries

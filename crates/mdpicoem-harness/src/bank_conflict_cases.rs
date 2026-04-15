@@ -148,10 +148,10 @@ pub fn build_catalog() -> Vec<BankCase> {
     // 256-byte regions. Expected identical to LDR_b2_diff if bank bits
     // alone decide contention.
     for (name, addr) in [
-        ("bank_near_b2_228", 0x2000_0228u32),
-        ("bank_near_b2_248", 0x2000_0248u32),
-        ("bank_near_b2_308", 0x2000_0308u32),
-        ("bank_near_b2_408", 0x2000_0408u32),
+        ("bankcfl_near_b2_228", 0x2000_0228u32),
+        ("bankcfl_near_b2_248", 0x2000_0248u32),
+        ("bankcfl_near_b2_308", 0x2000_0308u32),
+        ("bankcfl_near_b2_408", 0x2000_0408u32),
     ] {
         debug_assert_eq!(bank_of(addr), 2, "near-neighbour addr must be bank 2");
         out.push(BankCase {
@@ -167,35 +167,41 @@ pub fn build_catalog() -> Vec<BankCase> {
 
 // Static name tables — `BankCase.name: &'static str` so `CaseOutcome`
 // concatenation in the orchestrator stays allocation-free.
+//
+// All bank-conflict case names use the `bankcfl_` prefix so they can
+// never be a strict substring of any cycle-oracle sequence name that
+// happens to contain the word "bank" (e.g. `bank_contention_*`). The
+// orchestrator's substring-uniqueness validator asserts this at startup;
+// keep the prefix consistent here so the validator does not fire.
 const LDR_NAMES: [&str; 8] = [
-    "bank_ldr_b0_same",
-    "bank_ldr_b1_diff",
-    "bank_ldr_b2_diff",
-    "bank_ldr_b3_diff",
-    "bank_ldr_b4_diff",
-    "bank_ldr_b5_diff",
-    "bank_ldr_b6_diff",
-    "bank_ldr_b7_diff",
+    "bankcfl_ldr_b0_same",
+    "bankcfl_ldr_b1_diff",
+    "bankcfl_ldr_b2_diff",
+    "bankcfl_ldr_b3_diff",
+    "bankcfl_ldr_b4_diff",
+    "bankcfl_ldr_b5_diff",
+    "bankcfl_ldr_b6_diff",
+    "bankcfl_ldr_b7_diff",
 ];
 const STR_NAMES: [&str; 8] = [
-    "bank_str_b0_same",
-    "bank_str_b1_diff",
-    "bank_str_b2_diff",
-    "bank_str_b3_diff",
-    "bank_str_b4_diff",
-    "bank_str_b5_diff",
-    "bank_str_b6_diff",
-    "bank_str_b7_diff",
+    "bankcfl_str_b0_same",
+    "bankcfl_str_b1_diff",
+    "bankcfl_str_b2_diff",
+    "bankcfl_str_b3_diff",
+    "bankcfl_str_b4_diff",
+    "bankcfl_str_b5_diff",
+    "bankcfl_str_b6_diff",
+    "bankcfl_str_b7_diff",
 ];
 const FETCH_NAMES: [&str; 8] = [
-    "bank_fetch_b0_data_b0",
-    "bank_fetch_b1_data_b0",
-    "bank_fetch_b2_data_b0",
-    "bank_fetch_b3_data_b0",
-    "bank_fetch_b4_data_b0",
-    "bank_fetch_b5_data_b0",
-    "bank_fetch_b6_data_b0",
-    "bank_fetch_b7_data_b0",
+    "bankcfl_fetch_b0_data_b0",
+    "bankcfl_fetch_b1_data_b0",
+    "bankcfl_fetch_b2_data_b0",
+    "bankcfl_fetch_b3_data_b0",
+    "bankcfl_fetch_b4_data_b0",
+    "bankcfl_fetch_b5_data_b0",
+    "bankcfl_fetch_b6_data_b0",
+    "bankcfl_fetch_b7_data_b0",
 ];
 
 // ---------------------------------------------------------------------------
@@ -454,9 +460,24 @@ pub fn run_bank_case(
 ///
 /// Preconditions: `core` is halted. DWT enable is idempotent and done
 /// here, matching the shape of `cycle_cases::run_against`.
+///
+/// Case selection semantics:
+/// * `order = None` — run every catalogue case whose name matches
+///   `args.filter`, in catalogue-declared order (single-pass / standalone
+///   default).
+/// * `order = Some(&[name, name, …])` — run exactly those cases in that
+///   order. `args.filter` is ignored for selection. Names not present in
+///   the catalogue are skipped with a single `eprintln!` warning per
+///   unknown name.
+///
+/// The NOP baseline is calibrated once per call (20 halt-step samples
+/// ≈ 1 second). Passing a single-element `order` list therefore means
+/// paying the baselining cost per call — the orchestrator amortises this
+/// by passing the full shuffled order list in one call per iteration.
 pub fn run_against(
     core: &mut Core,
     args: &BankArgs,
+    order: Option<&[&str]>,
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
     debug_assert!(args.num_samples >= 1, "num_samples must be >= 1");
 
@@ -464,10 +485,24 @@ pub fn run_against(
     let nop_baseline = measure_nop_baseline_hw(core, args.num_samples)?;
 
     let catalog = build_catalog();
-    let selected: Vec<BankCase> = catalog
-        .into_iter()
-        .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
-        .collect();
+    let selected: Vec<BankCase> = match order {
+        None => catalog
+            .into_iter()
+            .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
+            .collect(),
+        Some(names) => {
+            let mut v: Vec<BankCase> = Vec::with_capacity(names.len());
+            for name in names {
+                match catalog.iter().find(|c| c.name == *name) {
+                    Some(c) => v.push(c.clone()),
+                    None => eprintln!(
+                        "bank_conflict_cases::run_against: unknown case '{name}' in order list; skipping",
+                    ),
+                }
+            }
+            v
+        }
+    };
 
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
     for case in &selected {
@@ -530,10 +565,10 @@ mod tests {
         let cat = build_catalog();
         // 8 LDR + 8 STR + 8 fetch-bank + 4 near-neighbour = 28.
         assert_eq!(cat.len(), 28, "catalogue size mismatch");
-        assert!(cat.iter().any(|c| c.name == "bank_ldr_b0_same"));
-        assert!(cat.iter().any(|c| c.name == "bank_str_b7_diff"));
-        assert!(cat.iter().any(|c| c.name == "bank_fetch_b5_data_b0"));
-        assert!(cat.iter().any(|c| c.name == "bank_near_b2_248"));
+        assert!(cat.iter().any(|c| c.name == "bankcfl_ldr_b0_same"));
+        assert!(cat.iter().any(|c| c.name == "bankcfl_str_b7_diff"));
+        assert!(cat.iter().any(|c| c.name == "bankcfl_fetch_b5_data_b0"));
+        assert!(cat.iter().any(|c| c.name == "bankcfl_near_b2_248"));
         // All names unique — orchestrator filter + report depend on it.
         let mut seen: std::collections::HashSet<&str> = Default::default();
         for c in &cat {
@@ -546,7 +581,7 @@ mod tests {
         let cat = build_catalog();
         let fetch_cases: Vec<&BankCase> = cat
             .iter()
-            .filter(|c| c.name.starts_with("bank_fetch_"))
+            .filter(|c| c.name.starts_with("bankcfl_fetch_"))
             .collect();
         assert_eq!(fetch_cases.len(), 8);
         let mut banks_seen: std::collections::HashSet<u32> = Default::default();
@@ -622,19 +657,19 @@ mod tests {
         let cat = build_catalog();
         let ldr: Vec<&BankCase> = cat
             .iter()
-            .filter(|c| silicon_oracle::name_matches_filter(c.name, Some("bank_ldr_")))
+            .filter(|c| silicon_oracle::name_matches_filter(c.name, Some("bankcfl_ldr_")))
             .collect();
-        assert_eq!(ldr.len(), 8, "filter 'bank_ldr_' must match all 8 LDR cases");
+        assert_eq!(ldr.len(), 8, "filter 'bankcfl_ldr_' must match all 8 LDR cases");
         let b0: Vec<&BankCase> = cat
             .iter()
             .filter(|c| silicon_oracle::name_matches_filter(c.name, Some("_b0_")))
             .collect();
         // `_b0_` bracketed by underscores matches:
-        //   - bank_ldr_b0_same
-        //   - bank_str_b0_same
-        //   - bank_fetch_b0_data_b0  (has "_b0_" in the middle as well
-        //     as the trailing "_b0", but filter semantics are substring,
-        //     one match per name is enough)
+        //   - bankcfl_ldr_b0_same
+        //   - bankcfl_str_b0_same
+        //   - bankcfl_fetch_b0_data_b0  (has "_b0_" in the middle as
+        //     well as the trailing "_b0", but filter semantics are
+        //     substring, one match per name is enough)
         // The other fetch-bank names end in "_b0" (not "_b0_") and do
         // NOT match; near-neighbour names contain "_b2_".
         assert_eq!(b0.len(), 3);
