@@ -16,32 +16,98 @@
 pub use mdpicoem_common::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
 
 // --- CLOCKS offsets (RP2040 datasheet §2.15.7) -----------------------------
+//
+// All 10 clocks follow a CTRL / DIV / SELECTED triple, except that clk_peri
+// has no divider hardware — offset 0x4C reads zero. Offsets below match the
+// datasheet.
+pub(crate) const CLK_GPOUT0_CTRL: u32 = 0x00;
+pub(crate) const CLK_GPOUT0_DIV: u32 = 0x04;
+pub(crate) const CLK_GPOUT0_SELECTED: u32 = 0x08;
+pub(crate) const CLK_GPOUT1_CTRL: u32 = 0x0C;
+pub(crate) const CLK_GPOUT1_DIV: u32 = 0x10;
+pub(crate) const CLK_GPOUT1_SELECTED: u32 = 0x14;
+pub(crate) const CLK_GPOUT2_CTRL: u32 = 0x18;
+pub(crate) const CLK_GPOUT2_DIV: u32 = 0x1C;
+pub(crate) const CLK_GPOUT2_SELECTED: u32 = 0x20;
+pub(crate) const CLK_GPOUT3_CTRL: u32 = 0x24;
+pub(crate) const CLK_GPOUT3_DIV: u32 = 0x28;
+pub(crate) const CLK_GPOUT3_SELECTED: u32 = 0x2C;
 pub(crate) const CLK_REF_CTRL: u32 = 0x30;
 pub(crate) const CLK_REF_DIV: u32 = 0x34;
 pub(crate) const CLK_REF_SELECTED: u32 = 0x38;
 pub(crate) const CLK_SYS_CTRL: u32 = 0x3C;
 pub(crate) const CLK_SYS_DIV: u32 = 0x40;
 pub(crate) const CLK_SYS_SELECTED: u32 = 0x44;
+pub(crate) const CLK_PERI_CTRL: u32 = 0x48;
+// 0x4C: CLK_PERI_DIV — no divider hardware, reads-as-zero
+pub(crate) const CLK_PERI_SELECTED: u32 = 0x50;
+pub(crate) const CLK_USB_CTRL: u32 = 0x54;
+pub(crate) const CLK_USB_DIV: u32 = 0x58;
+pub(crate) const CLK_USB_SELECTED: u32 = 0x5C;
+pub(crate) const CLK_ADC_CTRL: u32 = 0x60;
+pub(crate) const CLK_ADC_DIV: u32 = 0x64;
+pub(crate) const CLK_ADC_SELECTED: u32 = 0x68;
+pub(crate) const CLK_RTC_CTRL: u32 = 0x6C;
+pub(crate) const CLK_RTC_DIV: u32 = 0x70;
+pub(crate) const CLK_RTC_SELECTED: u32 = 0x74;
 
 /// RP2040 CLOCKS register storage.
 ///
 /// Only the fields firmware actually pokes at are backed by real storage;
-/// the rest read-as-zero. `CLK_REF_SELECTED` / `CLK_SYS_SELECTED` are
-/// synthesised from their respective CTRL SRC fields on read (one-hot mux).
+/// the rest read-as-zero. All `CLK_*_SELECTED` registers are synthesised on
+/// read — pico-sdk's `clock_configure` busy-waits on this handshake:
+///
+/// * Glitchless muxes (`clk_ref`, `clk_sys`): `_SELECTED` is `1 << SRC`,
+///   mirroring `CTRL[SRC]` immediately.
+/// * Non-glitchless clocks (`clk_gpout{0..3}`, `clk_peri`, `clk_usb`,
+///   `clk_adc`, `clk_rtc`): `_SELECTED` reads as `1` unconditionally. This
+///   matches silicon — the mux is a simple AUXSRC demux, always "selected"
+///   from firmware's perspective — and satisfies pico-sdk's
+///   `while (!(selected & (1u << 0)))` after each CTRL write.
 pub struct ClocksRegs {
+    pub clk_gpout0_ctrl: u32,
+    pub clk_gpout0_div: u32,
+    pub clk_gpout1_ctrl: u32,
+    pub clk_gpout1_div: u32,
+    pub clk_gpout2_ctrl: u32,
+    pub clk_gpout2_div: u32,
+    pub clk_gpout3_ctrl: u32,
+    pub clk_gpout3_div: u32,
     pub clk_ref_ctrl: u32,
     pub clk_ref_div: u32,
     pub clk_sys_ctrl: u32,
     pub clk_sys_div: u32,
+    pub clk_peri_ctrl: u32,
+    pub clk_usb_ctrl: u32,
+    pub clk_usb_div: u32,
+    pub clk_adc_ctrl: u32,
+    pub clk_adc_div: u32,
+    pub clk_rtc_ctrl: u32,
+    pub clk_rtc_div: u32,
 }
 
 impl ClocksRegs {
     pub fn new() -> Self {
         Self {
+            clk_gpout0_ctrl: 0,
+            clk_gpout0_div: 0x0000_0100,
+            clk_gpout1_ctrl: 0,
+            clk_gpout1_div: 0x0000_0100,
+            clk_gpout2_ctrl: 0,
+            clk_gpout2_div: 0x0000_0100,
+            clk_gpout3_ctrl: 0,
+            clk_gpout3_div: 0x0000_0100,
             clk_ref_ctrl: 0,
             clk_ref_div: 0x0000_0100, // default int div = 1 (bits [11:8])
             clk_sys_ctrl: 0,
             clk_sys_div: 0x0001_0000, // default int div = 1 (bits [31:16])
+            clk_peri_ctrl: 0,
+            clk_usb_ctrl: 0,
+            clk_usb_div: 0x0000_0100,
+            clk_adc_ctrl: 0,
+            clk_adc_div: 0x0000_0100,
+            clk_rtc_ctrl: 0,
+            clk_rtc_div: 0x0000_0100,
         }
     }
 
@@ -52,19 +118,46 @@ impl ClocksRegs {
     /// Read a CLOCKS register by byte offset.
     pub fn read32(&self, offset: u32) -> u32 {
         match offset {
+            // clk_gpout0..3 — no SRC mux, `_SELECTED` reads 1.
+            CLK_GPOUT0_CTRL => self.clk_gpout0_ctrl,
+            CLK_GPOUT0_DIV => self.clk_gpout0_div,
+            CLK_GPOUT0_SELECTED => 1,
+            CLK_GPOUT1_CTRL => self.clk_gpout1_ctrl,
+            CLK_GPOUT1_DIV => self.clk_gpout1_div,
+            CLK_GPOUT1_SELECTED => 1,
+            CLK_GPOUT2_CTRL => self.clk_gpout2_ctrl,
+            CLK_GPOUT2_DIV => self.clk_gpout2_div,
+            CLK_GPOUT2_SELECTED => 1,
+            CLK_GPOUT3_CTRL => self.clk_gpout3_ctrl,
+            CLK_GPOUT3_DIV => self.clk_gpout3_div,
+            CLK_GPOUT3_SELECTED => 1,
+            // clk_ref — glitchless, 2-bit SRC field in [1:0].
             CLK_REF_CTRL => self.clk_ref_ctrl,
             CLK_REF_DIV => self.clk_ref_div,
             CLK_REF_SELECTED => 1 << (self.clk_ref_ctrl & 0x3),
+            // clk_sys — glitchless, 1-bit SRC field in [0].
             CLK_SYS_CTRL => self.clk_sys_ctrl,
             CLK_SYS_DIV => self.clk_sys_div,
             CLK_SYS_SELECTED => 1 << (self.clk_sys_ctrl & 0x1),
+            // clk_peri — no DIV field on RP2040; `_SELECTED` reads 1.
+            CLK_PERI_CTRL => self.clk_peri_ctrl,
+            CLK_PERI_SELECTED => 1,
+            CLK_USB_CTRL => self.clk_usb_ctrl,
+            CLK_USB_DIV => self.clk_usb_div,
+            CLK_USB_SELECTED => 1,
+            CLK_ADC_CTRL => self.clk_adc_ctrl,
+            CLK_ADC_DIV => self.clk_adc_div,
+            CLK_ADC_SELECTED => 1,
+            CLK_RTC_CTRL => self.clk_rtc_ctrl,
+            CLK_RTC_DIV => self.clk_rtc_div,
+            CLK_RTC_SELECTED => 1,
             _ => 0,
         }
     }
 
     /// Write a CLOCKS register with an alias-aware update.
     /// Returns `true` if the write affected a field that feeds the
-    /// derived [`ClockTree`].
+    /// derived [`ClockTree`] (only `clk_ref` / `clk_sys` CTRL/DIV in V1).
     pub fn write32(&mut self, offset: u32, val: u32, alias: u32) -> bool {
         let apply = |cur: u32, v: u32| match alias {
             0 => v,
@@ -74,6 +167,38 @@ impl ClocksRegs {
             _ => v,
         };
         match offset {
+            CLK_GPOUT0_CTRL => {
+                self.clk_gpout0_ctrl = apply(self.clk_gpout0_ctrl, val);
+                false
+            }
+            CLK_GPOUT0_DIV => {
+                self.clk_gpout0_div = apply(self.clk_gpout0_div, val);
+                false
+            }
+            CLK_GPOUT1_CTRL => {
+                self.clk_gpout1_ctrl = apply(self.clk_gpout1_ctrl, val);
+                false
+            }
+            CLK_GPOUT1_DIV => {
+                self.clk_gpout1_div = apply(self.clk_gpout1_div, val);
+                false
+            }
+            CLK_GPOUT2_CTRL => {
+                self.clk_gpout2_ctrl = apply(self.clk_gpout2_ctrl, val);
+                false
+            }
+            CLK_GPOUT2_DIV => {
+                self.clk_gpout2_div = apply(self.clk_gpout2_div, val);
+                false
+            }
+            CLK_GPOUT3_CTRL => {
+                self.clk_gpout3_ctrl = apply(self.clk_gpout3_ctrl, val);
+                false
+            }
+            CLK_GPOUT3_DIV => {
+                self.clk_gpout3_div = apply(self.clk_gpout3_div, val);
+                false
+            }
             CLK_REF_CTRL => {
                 self.clk_ref_ctrl = apply(self.clk_ref_ctrl, val);
                 true
@@ -89,6 +214,34 @@ impl ClocksRegs {
             CLK_SYS_DIV => {
                 self.clk_sys_div = apply(self.clk_sys_div, val);
                 true
+            }
+            CLK_PERI_CTRL => {
+                self.clk_peri_ctrl = apply(self.clk_peri_ctrl, val);
+                false
+            }
+            CLK_USB_CTRL => {
+                self.clk_usb_ctrl = apply(self.clk_usb_ctrl, val);
+                false
+            }
+            CLK_USB_DIV => {
+                self.clk_usb_div = apply(self.clk_usb_div, val);
+                false
+            }
+            CLK_ADC_CTRL => {
+                self.clk_adc_ctrl = apply(self.clk_adc_ctrl, val);
+                false
+            }
+            CLK_ADC_DIV => {
+                self.clk_adc_div = apply(self.clk_adc_div, val);
+                false
+            }
+            CLK_RTC_CTRL => {
+                self.clk_rtc_ctrl = apply(self.clk_rtc_ctrl, val);
+                false
+            }
+            CLK_RTC_DIV => {
+                self.clk_rtc_div = apply(self.clk_rtc_div, val);
+                false
             }
             _ => false,
         }
@@ -441,5 +594,156 @@ mod tests {
         assert_eq!(tree.sys_clk_hz, ROSC_FREQ_HZ / 2);
         // CLK_SYS_SELECTED is a read-only mux indicator at 0x44.
         assert_eq!(CLK_SYS_SELECTED, 0x44);
+    }
+
+    // --- CLOCKS `_SELECTED` handshake (HLD V7 §4.4 point 5 / §5.3) ---------
+    //
+    // pico-sdk's `clock_configure` busy-waits on `_SELECTED` reflecting the
+    // new source after each `_CTRL` write. The handshake is single-cycle
+    // (no state machine).
+
+    #[test]
+    fn clk_sys_selected_mirrors_src_bit_zero() {
+        // Datasheet-specified semantic: `CLK_SYS_SELECTED = 1 << SRC`.
+        // Default SRC=0 (clk_ref) → `_SELECTED = 1`.
+        let mut c = ClocksRegs::new();
+        assert_eq!(c.read32(CLK_SYS_SELECTED), 1);
+        // Writing SRC=1 (AUX) → `_SELECTED = 2`.
+        c.write32(CLK_SYS_CTRL, 1, 0);
+        assert_eq!(c.read32(CLK_SYS_SELECTED), 2);
+    }
+
+    #[test]
+    fn clk_ref_selected_mirrors_src_two_bits() {
+        let mut c = ClocksRegs::new();
+        // SRC=2 (XOSC) → `_SELECTED = 1 << 2 = 4`.
+        c.write32(CLK_REF_CTRL, 2, 0);
+        assert_eq!(c.read32(CLK_REF_SELECTED), 4);
+        // SRC=1 (AUX) → `_SELECTED = 2`.
+        c.write32(CLK_REF_CTRL, 1, 0);
+        assert_eq!(c.read32(CLK_REF_SELECTED), 2);
+    }
+
+    #[test]
+    fn clk_peri_selected_after_ctrl_write_is_one() {
+        let mut c = ClocksRegs::new();
+        // pico-sdk passes CTRL = AUXSRC_BITS | ENABLE_BIT (0x0800_0000). The
+        // exact value is irrelevant to the non-glitchless mux — any write
+        // results in `_SELECTED = 1`.
+        c.write32(CLK_PERI_CTRL, 0x0800_0000, 0);
+        assert_eq!(c.read32(CLK_PERI_SELECTED), 1);
+    }
+
+    #[test]
+    fn all_ten_clocks_handshake_after_ctrl_write() {
+        // Each clock's `_CTRL` write must leave the matching `_SELECTED`
+        // register satisfying pico-sdk's `selected & (1u << div_input)` test
+        // on the very next read — no intermediate cycle required.
+        //
+        // Glitchless clocks use `div_input = CTRL.SRC`; non-glitchless clocks
+        // use `div_input = 0`, so `_SELECTED = 1` is always accepted.
+        let cases: &[(u32, u32, u32, u32)] = &[
+            // (CTRL offset, SELECTED offset, CTRL value, expected SELECTED)
+            (CLK_GPOUT0_CTRL, CLK_GPOUT0_SELECTED, 0x0000_0820, 1),
+            (CLK_GPOUT1_CTRL, CLK_GPOUT1_SELECTED, 0x0000_0830, 1),
+            (CLK_GPOUT2_CTRL, CLK_GPOUT2_SELECTED, 0x0000_0840, 1),
+            (CLK_GPOUT3_CTRL, CLK_GPOUT3_SELECTED, 0x0000_0850, 1),
+            (CLK_REF_CTRL, CLK_REF_SELECTED, 0x0000_0002, 1 << 2), // SRC=2 (XOSC)
+            (CLK_SYS_CTRL, CLK_SYS_SELECTED, 0x0000_0001, 1 << 1), // SRC=1 (AUX)
+            (CLK_PERI_CTRL, CLK_PERI_SELECTED, 0x0800_0000, 1),
+            (CLK_USB_CTRL, CLK_USB_SELECTED, 0x0800_0000, 1),
+            (CLK_ADC_CTRL, CLK_ADC_SELECTED, 0x0800_0000, 1),
+            (CLK_RTC_CTRL, CLK_RTC_SELECTED, 0x0800_0000, 1),
+        ];
+        for &(ctrl_off, sel_off, ctrl_val, expected) in cases {
+            let mut c = ClocksRegs::new();
+            c.write32(ctrl_off, ctrl_val, 0);
+            assert_eq!(
+                c.read32(sel_off),
+                expected,
+                "CTRL=0x{:02x} SELECTED=0x{:02x} after write 0x{:08x}",
+                ctrl_off,
+                sel_off,
+                ctrl_val
+            );
+        }
+    }
+
+    #[test]
+    fn clk_sys_selected_idempotent_on_same_src() {
+        // Writing the same SRC twice must not perturb `_SELECTED` — the
+        // handshake is stateless.
+        let mut c = ClocksRegs::new();
+        c.write32(CLK_SYS_CTRL, 1, 0);
+        let first = c.read32(CLK_SYS_SELECTED);
+        c.write32(CLK_SYS_CTRL, 1, 0);
+        let second = c.read32(CLK_SYS_SELECTED);
+        assert_eq!(first, second);
+        assert_eq!(first, 2);
+    }
+
+    #[test]
+    fn clk_peri_selected_idempotent_on_repeated_ctrl_writes() {
+        let mut c = ClocksRegs::new();
+        c.write32(CLK_PERI_CTRL, 0x0800_0000, 0);
+        let first = c.read32(CLK_PERI_SELECTED);
+        c.write32(CLK_PERI_CTRL, 0x0800_0000, 0);
+        let second = c.read32(CLK_PERI_SELECTED);
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+    }
+
+    #[test]
+    fn non_glitchless_selected_unaffected_by_ctrl_value() {
+        // Regardless of what bits firmware writes into CLK_*_CTRL (AUXSRC,
+        // ENABLE, phase, nudge), the `_SELECTED` read for a non-glitchless
+        // clock must be 1 — there is no SRC to mirror.
+        let mut c = ClocksRegs::new();
+        for ctrl_val in [0u32, 0xFFFF_FFFF, 0x0800_0000, 0x0000_0AA0] {
+            c.write32(CLK_USB_CTRL, ctrl_val, 0);
+            assert_eq!(c.read32(CLK_USB_SELECTED), 1);
+        }
+    }
+
+    #[test]
+    fn non_glitchless_ctrl_does_not_trigger_recompute() {
+        // `write32` returning `false` for non-glitchless clocks keeps the
+        // Bus from recomputing the ClockTree on every unrelated CTRL poke —
+        // only clk_ref / clk_sys CTRL/DIV affect V1 tree frequencies.
+        let mut c = ClocksRegs::new();
+        assert!(!c.write32(CLK_GPOUT0_CTRL, 0x0800_0000, 0));
+        assert!(!c.write32(CLK_PERI_CTRL, 0x0800_0000, 0));
+        assert!(!c.write32(CLK_USB_CTRL, 0x0800_0000, 0));
+        assert!(!c.write32(CLK_ADC_CTRL, 0x0800_0000, 0));
+        assert!(!c.write32(CLK_RTC_CTRL, 0x0800_0000, 0));
+        // Glitchless clocks still affect the tree.
+        assert!(c.write32(CLK_REF_CTRL, 2, 0));
+        assert!(c.write32(CLK_SYS_CTRL, 1, 0));
+    }
+
+    #[test]
+    fn alias_rmw_applies_to_new_clock_fields() {
+        // pico-sdk reaches the CLOCKS block via alias offsets as well as the
+        // plain base: `*(CLK_PERI_CTRL_BITSET) = 0x800` is an hw_set_bits
+        // macro expansion. The CTRL/DIV backing storage for the seven clocks
+        // added in Wave 1 (gpout0..3, peri, usb, adc, rtc) must honour the
+        // same alias semantics as clk_ref / clk_sys: alias=0 plain store,
+        // alias=1 XOR, alias=2 BITSET, alias=3 BITCLR.
+        let mut c = ClocksRegs::new();
+
+        // CTRL-field path: CLK_PERI_CTRL.
+        c.write32(CLK_PERI_CTRL, 0x0800_0000, 0);
+        assert_eq!(c.read32(CLK_PERI_CTRL), 0x0800_0000);
+        c.write32(CLK_PERI_CTRL, 0x0000_00FF, 2); // BITSET
+        assert_eq!(c.read32(CLK_PERI_CTRL), 0x0800_00FF);
+        c.write32(CLK_PERI_CTRL, 0x0000_000F, 3); // BITCLR
+        assert_eq!(c.read32(CLK_PERI_CTRL), 0x0800_00F0);
+
+        // DIV-field path: CLK_ADC_DIV. Reset value is 0x0000_0100.
+        assert_eq!(c.read32(CLK_ADC_DIV), 0x0000_0100);
+        c.write32(CLK_ADC_DIV, 0x0000_00FF, 2); // BITSET
+        assert_eq!(c.read32(CLK_ADC_DIV), 0x0000_01FF);
+        c.write32(CLK_ADC_DIV, 0x0000_000F, 3); // BITCLR
+        assert_eq!(c.read32(CLK_ADC_DIV), 0x0000_01F0);
     }
 }

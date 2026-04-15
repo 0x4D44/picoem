@@ -16,6 +16,7 @@
 
 pub mod bus;
 pub mod core;
+pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
