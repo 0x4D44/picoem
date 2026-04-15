@@ -33,6 +33,11 @@ impl CortexM0Plus {
     pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
+        // Publish the instruction PC on the bus so the MMIO trace
+        // (HLD V7 §4.3) can report it for every access this instruction
+        // performs. Set before the fetch so the I-fetch itself is tagged
+        // with its own PC.
+        bus.set_active_pc(pc);
         let hw0 = bus.read16(pc);
 
         if is_wide(hw0) {

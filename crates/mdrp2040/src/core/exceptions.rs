@@ -51,6 +51,14 @@ impl CortexM0Plus {
     ///
     /// Cycle cost: ~16 (M0+ TRM).
     pub(crate) fn enter_exception(&mut self, exc_num: u16, bus: &mut Bus) -> u32 {
+        // Publish a sentinel "hardware-triggered exception stacking" PC so
+        // the MMIO trace distinguishes the 8 stacking writes from the
+        // faulting instruction's own access pattern. Value `0xFFFF_FFFE`
+        // cannot collide with a real Thumb instruction PC (those are
+        // even-aligned in the low 28 bits of the address map). Regular
+        // PC publishing resumes at the handler's first `decode_execute`.
+        bus.set_active_pc(0xFFFF_FFFE);
+
         // HardFault-in-HardFault → lockup (architecturally undefined on
         // v6-M but the common behaviour is to halt the core).
         if exc_num == 3 && self.regs.ipsr() == 3 {
@@ -151,6 +159,14 @@ impl CortexM0Plus {
     /// writes a value with the EXC_RETURN pattern. Validates the magic
     /// and selects the target stack.
     pub(crate) fn exit_exception(&mut self, exc_return: u32, bus: &mut Bus) -> u32 {
+        // Publish a sentinel "exception-return unstacking" PC so the
+        // MMIO trace distinguishes the 8 unstacking reads from ordinary
+        // instruction-driven access. Value `0xFFFF_FFFD` is paired with
+        // the entry sentinel `0xFFFF_FFFE` and cannot collide with a
+        // real Thumb instruction PC. Regular PC publishing resumes when
+        // the returned-to instruction hits `decode_execute`.
+        bus.set_active_pc(0xFFFF_FFFD);
+
         let active_exc = self.regs.ipsr();
 
         // Handler-mode SP manipulation (SUB SP / ADD SP / PUSH / POP) writes

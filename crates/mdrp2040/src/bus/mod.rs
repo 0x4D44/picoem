@@ -25,6 +25,7 @@ pub mod resets;
 pub mod sio;
 
 use std::collections::HashMap;
+use std::io::Write;
 
 use mdpicoem_common::PioBlock;
 use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
@@ -202,6 +203,26 @@ pub struct Bus {
     /// up contention against `core0_bank_touched`. Set/cleared by the
     /// dual-core scheduler via `begin_core1_step` / `end_core1_step`.
     contention_check_active: bool,
+    /// MMIO trace toggle (see `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral
+    /// Coverage V7.md` §4.3). When `true`, each byte/half/word bus access
+    /// and each peripheral/SIO/PPB dispatch emits a line to
+    /// [`Self::trace_sink`] (defaults to stdout when `None`). Zero overhead
+    /// when `false` — the hot path short-circuits before any formatting.
+    pub trace_enabled: bool,
+    /// Per-core, per-instruction PC snapshot. Indexed by `active_core`
+    /// so that a scheduler switch (`set_active_core(0→1→0)`) does not
+    /// alias one core's decode PC onto the other. Set by the core's
+    /// decode path (`CortexM0Plus::decode_execute`) immediately before
+    /// instruction fetch, so every read/write during that instruction
+    /// carries the correct architectural PC. Also set to sentinel values
+    /// by `enter_exception` / `exit_exception` when hardware stacks or
+    /// unstacks the 8-word frame (see `core::exceptions`).
+    /// Default `[0, 0]`; only meaningful while a core is executing.
+    pub(crate) active_pc: [u32; 2],
+    /// Optional override sink for trace output. `None` routes to stdout
+    /// via `println!`. Unit tests inject a `Vec<u8>`-backed sink to
+    /// capture lines without wrestling with fd 1 redirection.
+    pub(crate) trace_sink: Option<Box<dyn Write>>,
 }
 
 impl Bus {
@@ -238,6 +259,9 @@ impl Bus {
             bus_fault_addr: 0,
             core0_bank_touched: 0,
             contention_check_active: false,
+            trace_enabled: false,
+            active_pc: [0; 2],
+            trace_sink: None,
         }
     }
 
@@ -252,6 +276,62 @@ impl Bus {
     pub fn set_active_core(&mut self, core: usize) {
         debug_assert!(core < 2);
         self.active_core = core;
+    }
+
+    /// Stash the instruction PC of the currently-executing instruction
+    /// for the *currently-active core*. Called by
+    /// [`crate::core::CortexM0Plus::decode_execute`] before instruction
+    /// fetch so the MMIO trace can report a meaningful PC for every
+    /// access that instruction performs. Also called by exception
+    /// entry / exit with sentinel values (`0xFFFF_FFFE`,
+    /// `0xFFFF_FFFD`) so stacking / unstacking lines are distinguishable
+    /// from ordinary instruction-driven access. See HLD V7 §4.3.
+    #[inline]
+    pub fn set_active_pc(&mut self, pc: u32) {
+        self.active_pc[self.active_core] = pc;
+    }
+
+    /// Emit a single trace line. `rw` is `'R'` or `'W'`, `size` is 1/2/4
+    /// bytes, `val` is the value read or written. Zero overhead when
+    /// [`Self::trace_enabled`] is `false`; the caller is expected to gate
+    /// with `if self.trace_enabled` so the formatting cost is paid only
+    /// when tracing.
+    ///
+    /// Routes to [`Self::trace_sink`] if set, else `println!` (stdout).
+    /// No buffering — each line flushes at the `writeln!` boundary.
+    ///
+    /// Coverage note (see HLD V7 §4.3). The trace is emitted only from the
+    /// six outer access methods ([`Self::read8`] … [`Self::write32`]). The
+    /// internal peripheral/SIO/PPB dispatch helpers (`peripheral_read32`,
+    /// `peripheral_write32`, `sio_read32`, `sio_write32`,
+    /// `ppb[].read32/write32`) are **only reachable** from those six
+    /// methods — they have no other callers in the crate (verified by
+    /// grep) and are not `pub`. So outer-only tracing covers 100% of the
+    /// MMIO surface firmware can touch, at one line per architectural
+    /// access. Hooking the inner helpers as well would double-emit on
+    /// word-sized peripheral access (outer calls inner directly) and
+    /// surface the byte/half RMW-through-word32 artefact on narrow
+    /// peripheral access — neither of which helps the "what does firmware
+    /// touch next?" workflow the oracle is meant to unblock.
+    #[inline(never)]
+    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32) {
+        let line = format!(
+            "TRACE {} {} 0x{:08X} val=0x{:08X} core={} pc=0x{:08X}",
+            rw, size, addr, val, self.active_core, self.active_pc[self.active_core]
+        );
+        if let Some(sink) = self.trace_sink.as_mut() {
+            let _ = writeln!(sink, "{}", line);
+        } else {
+            println!("{}", line);
+        }
+    }
+
+    /// Install a captured trace sink (used by unit tests). `None` routes
+    /// back to stdout. This is `pub(crate)` to keep it off the public
+    /// surface — the binary toggles `trace_enabled` only.
+    #[cfg(test)]
+    pub(crate) fn set_trace_sink(&mut self, sink: Option<Box<dyn Write>>) {
+        self.trace_sink = sink;
     }
 
     /// Called before core 1 steps each quantum — enables the contention
@@ -574,7 +654,7 @@ impl Bus {
     pub fn read8(&mut self, addr: u32) -> u8 {
         let region = addr >> 28;
         self.last_access_cycles = Self::read_latency(region);
-        match region {
+        let val = match region {
             0x0 if (addr & 0x0FFF_FFFF) < ROM_SIZE as u32 => {
                 self.memory.rom_read8(addr & 0x0FFF_FFFF)
             }
@@ -607,13 +687,17 @@ impl Bus {
                 self.bus_fault_addr = addr;
                 0
             }
+        };
+        if self.trace_enabled {
+            self.emit_trace('R', 1, addr, val as u32);
         }
+        val
     }
 
     pub fn read16(&mut self, addr: u32) -> u16 {
         let region = addr >> 28;
         self.last_access_cycles = Self::read_latency(region);
-        match region {
+        let val = match region {
             0x0 if (addr & 0x0FFF_FFFF) + 1 < ROM_SIZE as u32 => {
                 self.memory.rom_read16(addr & 0x0FFF_FFFF)
             }
@@ -649,13 +733,17 @@ impl Bus {
                 self.bus_fault_addr = addr;
                 0
             }
+        };
+        if self.trace_enabled {
+            self.emit_trace('R', 2, addr, val as u32);
         }
+        val
     }
 
     pub fn read32(&mut self, addr: u32) -> u32 {
         let region = addr >> 28;
         self.last_access_cycles = Self::read_latency(region);
-        match region {
+        let val = match region {
             0x0 if (addr & 0x0FFF_FFFF) + 3 < ROM_SIZE as u32 => {
                 self.memory.rom_read32(addr & 0x0FFF_FFFF)
             }
@@ -679,10 +767,17 @@ impl Bus {
                 self.bus_fault_addr = addr;
                 0
             }
+        };
+        if self.trace_enabled {
+            self.emit_trace('R', 4, addr, val);
         }
+        val
     }
 
     pub fn write8(&mut self, addr: u32, val: u8) {
+        if self.trace_enabled {
+            self.emit_trace('W', 1, addr, val as u32);
+        }
         let region = addr >> 28;
         self.last_access_cycles = Self::write_latency(region);
         match region {
@@ -756,6 +851,9 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16) {
+        if self.trace_enabled {
+            self.emit_trace('W', 2, addr, val as u32);
+        }
         let region = addr >> 28;
         self.last_access_cycles = Self::write_latency(region);
         match region {
@@ -822,6 +920,9 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32) {
+        if self.trace_enabled {
+            self.emit_trace('W', 4, addr, val);
+        }
         let region = addr >> 28;
         self.last_access_cycles = Self::write_latency(region);
         match region {
@@ -1198,5 +1299,127 @@ mod tests {
         let _ = bus.read32(0x2000_0004); // bank 1
         assert_eq!(bus.last_access_cycles, 1);
         bus.end_core1_step();
+    }
+
+    /// A thread-safe `Vec<u8>` sink so we can capture the trace output
+    /// without wrestling with stdout redirection. Wraps `Vec<u8>` behind
+    /// an `Arc<Mutex<...>>` so the test can drain the buffer after the
+    /// bus has written through the sink. (`Bus::trace_sink` requires
+    /// `Write + Send`.)
+    #[derive(Clone)]
+    struct CaptureSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trace_enabled_emits_write32_line() {
+        // HLD V7 §4.3: `write32(addr, val)` with `trace_enabled = true`
+        // emits one line in the prescribed format. We inject a captured
+        // `CaptureSink` so the test doesn't depend on fd 1 redirection.
+        let capture = CaptureSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let mut bus = Bus::new();
+        bus.set_active_core(0);
+        bus.set_active_pc(0x1000_0100);
+        bus.trace_enabled = true;
+        bus.set_trace_sink(Some(Box::new(capture.clone())));
+
+        // SRAM word write — exercises the hot path and one of the six
+        // access methods required by the spec.
+        bus.write32(0x2000_0200, 0xDEAD_BEEF);
+
+        let captured = capture.0.lock().unwrap();
+        let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+        // Exactly one line, with the expected fields.
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected one trace line, got {}: {:?}",
+            lines.len(),
+            lines
+        );
+        let line = lines[0];
+        assert!(line.starts_with("TRACE W 4 0x20000200"), "line = {:?}", line);
+        assert!(line.contains("val=0xDEADBEEF"), "line = {:?}", line);
+        assert!(line.contains("core=0"), "line = {:?}", line);
+        assert!(line.contains("pc=0x10000100"), "line = {:?}", line);
+    }
+
+    #[test]
+    fn trace_disabled_emits_nothing() {
+        // Zero-overhead path — `trace_enabled = false` must not route any
+        // bytes to the sink. Guards the hot path (non-trace runs must not
+        // pay a formatting cost).
+        let capture = CaptureSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let mut bus = Bus::new();
+        bus.set_trace_sink(Some(Box::new(capture.clone())));
+        // trace_enabled is false by default.
+        bus.write32(0x2000_0200, 0xCAFE_F00D);
+        let _ = bus.read32(0x2000_0200);
+        assert!(capture.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn trace_active_pc_is_per_core() {
+        // Regression guard for the dual-core `active_pc` staleness bug
+        // (Wave 2 review SHOULD-FIX 1). The scheduler alternates
+        // `set_active_core(0)` / `set_active_core(1)` each quantum; a
+        // bus access on core 1 that doesn't go through `decode_execute`
+        // (e.g. exception stacking) must NOT observe core 0's last decode
+        // PC, and vice versa. Simulate the pattern: decode PC=0x1000 on
+        // core 0, switch to core 1, decode PC=0x2000, switch back to
+        // core 0 and issue an access *without* re-decoding — the trace
+        // line must still carry PC=0x1000 for core 0.
+        let capture = CaptureSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let mut bus = Bus::new();
+        bus.trace_enabled = true;
+        bus.set_trace_sink(Some(Box::new(capture.clone())));
+
+        // Core 0 "decodes" at 0x1000 and writes.
+        bus.set_active_core(0);
+        bus.set_active_pc(0x0000_1000);
+        bus.write32(0x2000_0100, 0xAAAA_AAAA);
+
+        // Scheduler switches to core 1, which "decodes" at 0x2000 and
+        // writes.
+        bus.set_active_core(1);
+        bus.set_active_pc(0x0000_2000);
+        bus.write32(0x2000_0104, 0xBBBB_BBBB);
+
+        // Scheduler switches back to core 0 WITHOUT a re-decode (mimics
+        // hardware-triggered access like exception stacking before the
+        // handler's first `decode_execute`). The stored per-core PC
+        // must still be 0x1000 for core 0 — not 0x2000 from core 1's
+        // quantum.
+        bus.set_active_core(0);
+        bus.write32(0x2000_0108, 0xCCCC_CCCC);
+
+        let captured = capture.0.lock().unwrap();
+        let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "expected three trace lines, got {:?}", lines);
+        assert!(
+            lines[0].contains("core=0") && lines[0].contains("pc=0x00001000"),
+            "line 0 = {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("core=1") && lines[1].contains("pc=0x00002000"),
+            "line 1 = {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("core=0") && lines[2].contains("pc=0x00001000"),
+            "line 2 = {:?} (core 0 PC must survive the core-1 excursion)",
+            lines[2]
+        );
     }
 }
