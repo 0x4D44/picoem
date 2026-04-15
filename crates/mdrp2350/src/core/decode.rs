@@ -1,4 +1,4 @@
-use crate::bus::{Bus, DecodedOp, DECODE_CACHE_SIZE, is_cacheable_pc};
+use crate::bus::{Bus, DecodedOp, DECODE_CACHE_SIZE, Handler, is_cacheable_pc};
 use super::CortexM33;
 
 // Direct-mapped index mask — kept local to avoid crossing `pub(crate)`
@@ -230,6 +230,102 @@ fn classify_thumb32_misc_control_pure(hw0: u16, hw1: u16) -> bool {
     false
 }
 
+/// Map `(hw0, hw1, is_wide)` to the top-level dispatched handler.
+///
+/// **Mirror of `CortexM33::execute_thumb16` (`execute_thumb16` below) and
+/// `CortexM33::execute_thumb32` (in `execute_thumb32.rs` via this module).**
+/// Any edit to the live dispatcher trees MUST land here too, or cache-
+/// populate will stamp the wrong handler. The `dispatch_equiv` test module
+/// in `crates/mdrp2350/src/tests.rs` backstops this — it covers every
+/// top-level arm (including every sub-arm) from HLD §2.4.
+///
+/// See HLD `2026.04.15 - HLD - Fn-Pointer Dispatch in DecodedOp.md` §2.4.
+pub(crate) fn classify_handler(hw0: u16, hw1: u16, is_wide: bool) -> Handler {
+    if !is_wide {
+        return match hw0 >> 11 {
+            0b00000 => CortexM33::thumb16_lsl_imm,
+            0b00001 => CortexM33::thumb16_lsr_imm,
+            0b00010 => CortexM33::thumb16_asr_imm,
+            0b00011 => CortexM33::thumb16_add_sub,
+            0b00100 => CortexM33::thumb16_mov_imm,
+            0b00101 => CortexM33::thumb16_cmp_imm,
+            0b00110 => CortexM33::thumb16_add_imm8,
+            0b00111 => CortexM33::thumb16_sub_imm8,
+            0b01000 => {
+                if hw0 & (1 << 10) == 0 {
+                    CortexM33::thumb16_data_processing
+                } else {
+                    CortexM33::thumb16_special_data_bx
+                }
+            }
+            0b01001 => CortexM33::thumb16_ldr_literal,
+            0b01010 | 0b01011 => CortexM33::thumb16_load_store_reg,
+            0b01100 => CortexM33::thumb16_str_imm,
+            0b01101 => CortexM33::thumb16_ldr_imm,
+            0b01110 => CortexM33::thumb16_strb_imm,
+            0b01111 => CortexM33::thumb16_ldrb_imm,
+            0b10000 => CortexM33::thumb16_strh_imm,
+            0b10001 => CortexM33::thumb16_ldrh_imm,
+            0b10010 => CortexM33::thumb16_str_sp,
+            0b10011 => CortexM33::thumb16_ldr_sp,
+            0b10100 => CortexM33::thumb16_adr,
+            0b10101 => CortexM33::thumb16_add_sp_imm,
+            0b10110 | 0b10111 => CortexM33::thumb16_misc,
+            0b11000 => CortexM33::thumb16_stm,
+            0b11001 => CortexM33::thumb16_ldm,
+            0b11010 | 0b11011 => CortexM33::thumb16_cond_branch_svc,
+            0b11100 => CortexM33::thumb16_branch,
+            _ => CortexM33::thumb16_undefined,
+        };
+    }
+
+    let op1 = (hw0 >> 11) & 0x3;
+    let op2 = ((hw0 >> 4) & 0x7F) as u32;
+    let op = (hw1 >> 15) & 0x1;
+
+    match op1 {
+        0b01 => match op2 >> 5 {
+            0b00 => {
+                if op2 & 0x04 == 0 {
+                    CortexM33::thumb32_ldm_stm
+                } else {
+                    CortexM33::thumb32_load_store_dual
+                }
+            }
+            0b01 => CortexM33::thumb32_dp_shifted_reg,
+            _ => CortexM33::thumb32_coprocessor,
+        },
+        0b10 => {
+            if op == 0 {
+                if op2 & 0x20 == 0 {
+                    CortexM33::thumb32_dp_modified_imm
+                } else {
+                    CortexM33::thumb32_dp_plain_imm
+                }
+            } else {
+                CortexM33::thumb32_branch_misc
+            }
+        }
+        0b11 => {
+            if op2 & 0x40 != 0 {
+                CortexM33::thumb32_coprocessor
+            } else if op2 & 0x20 == 0 {
+                CortexM33::thumb32_load_store_single
+            } else if op2 & 0x10 == 0 {
+                CortexM33::thumb32_dp_register
+            } else if op2 & 0x08 == 0 {
+                CortexM33::thumb32_multiply
+            } else {
+                CortexM33::thumb32_long_multiply
+            }
+        }
+        // op1 == 0 is unreachable: `is_wide` demands `hw0 >= 0xE800`, so
+        // `(hw0 >> 11) & 3` ∈ {0b01, 0b10, 0b11}. The `_` arm mirrors the
+        // unreachable fall-through of the live dispatcher for completeness.
+        _ => CortexM33::thumb32_undefined,
+    }
+}
+
 impl CortexM33 {
     /// Fetch, decode, and execute one instruction. Returns cycle count.
     ///
@@ -241,6 +337,12 @@ impl CortexM33 {
     ///
     /// Slow path (cache miss, or hit on an impure op): identical cycle
     /// semantics to pre-cache behaviour.
+    ///
+    /// Dispatch goes through the cached `entry.handler` fn pointer stamped
+    /// by `classify_handler` at populate time — a single indirect call
+    /// replaces both `execute_thumb16` and `execute_thumb32`'s top-level
+    /// match. `is_wide` is still consulted for the PC increment (+2 vs +4).
+    /// See HLD `2026.04.15 - HLD - Fn-Pointer Dispatch in DecodedOp.md` §2.5.
     pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
@@ -282,31 +384,22 @@ impl CortexM33 {
             #[cfg(debug_assertions)]
             let ws_before = bus.extra_wait_states();
 
-            let cycles = if is_wide {
-                self.regs.set_pc(pc.wrapping_add(4));
-                let c = if cond_passed {
-                    self.execute_thumb32(hw0, hw1, bus)
-                } else {
-                    1
-                };
-                if in_it { self.advance_it_state(); }
-                c
+            let pc_inc = if is_wide { 4 } else { 2 };
+            self.regs.set_pc(pc.wrapping_add(pc_inc));
+            let saved_flags = if in_it && !is_wide {
+                self.regs.xpsr & 0xF800_0000
             } else {
-                self.regs.set_pc(pc.wrapping_add(2));
-                let saved_flags = if in_it { self.regs.xpsr & 0xF800_0000 } else { 0 };
-                let c = if cond_passed {
-                    self.execute_thumb16(hw0, bus)
-                } else {
-                    1
-                };
-                // Flag-only suppression in IT blocks — same logic as the
-                // slow path, but using the pre-computed `flag_only` bit.
-                if in_it && cond_passed && !flag_only {
-                    self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
-                }
-                if in_it { self.advance_it_state(); }
-                c
+                0
             };
+            let cycles = if cond_passed {
+                (entry.handler)(self, hw0, hw1, bus)
+            } else {
+                1
+            };
+            if in_it && !is_wide && cond_passed && !flag_only {
+                self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
+            }
+            if in_it { self.advance_it_state(); }
 
             #[cfg(debug_assertions)]
             debug_assert_eq!(
@@ -329,42 +422,43 @@ impl CortexM33 {
             // folds it in exactly as the non-cached path would.
             bus.add_extra_wait_states(entry.fetch_wait as u32);
 
-            if is_wide {
-                self.regs.set_pc(pc.wrapping_add(4));
-                let cycles = if cond_passed {
-                    self.execute_thumb32(hw0, hw1, bus)
-                } else {
-                    1
-                };
-                if in_it { self.advance_it_state(); }
-                cycles + bus.extra_wait_states()
+            let pc_inc = if is_wide { 4 } else { 2 };
+            self.regs.set_pc(pc.wrapping_add(pc_inc));
+            let saved_flags = if in_it && !is_wide {
+                self.regs.xpsr & 0xF800_0000
             } else {
-                self.regs.set_pc(pc.wrapping_add(2));
-                let saved_flags = if in_it { self.regs.xpsr & 0xF800_0000 } else { 0 };
-                let cycles = if cond_passed {
-                    self.execute_thumb16(hw0, bus)
-                } else {
-                    1
-                };
-                if in_it && cond_passed && !flag_only {
-                    self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
-                }
-                if in_it { self.advance_it_state(); }
-                cycles + bus.extra_wait_states()
+                0
+            };
+            let cycles = if cond_passed {
+                (entry.handler)(self, hw0, hw1, bus)
+            } else {
+                1
+            };
+            if in_it && !is_wide && cond_passed && !flag_only {
+                self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
             }
+            if in_it { self.advance_it_state(); }
+            cycles + bus.extra_wait_states()
         }
     }
 
     /// Populate path — runs on a cache miss. Fetches `hw0` (and `hw1`
-    /// for wide instructions) via the bus, classifies purity, and
-    /// writes the slot. Returns a `DecodedOp` for the caller to
-    /// dispatch immediately.
+    /// for wide instructions) via the bus, classifies purity, stamps
+    /// the dispatched handler, and writes the slot. Returns a
+    /// `DecodedOp` for the caller to dispatch immediately.
     ///
     /// Faulty fetches are NOT cached (see HLD §8.1): the slot is left
     /// untouched, the returned entry still carries the fetched
     /// halfwords so `decode_execute` can drive the existing fault
     /// delivery path (which checks `bus.bus_fault()` after the
-    /// `decode_execute` call returns).
+    /// `decode_execute` call returns). The fault-fetch sentinel gets
+    /// a width-matched undefined handler — `thumb16_undefined` for the
+    /// narrow path, `thumb32_undefined` for the wide path — so the
+    /// indirect dispatch on the caller side runs something harmless
+    /// before `step()` delivers the fault. Strictly safer than the
+    /// pre-Stage-B behaviour, which would have run the cached handler
+    /// on junk halfwords. See HLD
+    /// `2026.04.15 - HLD - Fn-Pointer Dispatch in DecodedOp.md` §5.
     #[cold]
     #[inline(never)]
     fn populate_decode_cache(&mut self, bus: &mut Bus, pc: u32) -> DecodedOp {
@@ -382,6 +476,7 @@ impl CortexM33 {
             // delivery will fire. `is_pure = false` keeps us on the slow
             // path, which preserves today's `+extra_wait_states` behaviour.
             return DecodedOp {
+                handler: CortexM33::thumb16_undefined,
                 tag: u32::MAX,
                 hw0,
                 hw1: 0,
@@ -394,6 +489,7 @@ impl CortexM33 {
         let hw1 = if wide { bus.read16(pc.wrapping_add(2)) } else { 0 };
         if wide && bus.bus_fault() {
             return DecodedOp {
+                handler: CortexM33::thumb32_undefined,
                 tag: u32::MAX,
                 hw0,
                 hw1,
@@ -408,13 +504,14 @@ impl CortexM33 {
 
         let flag_only = !wide && is_thumb16_flag_only(hw0);
         let pure = classify_is_pure(hw0, hw1, wide);
+        let handler = classify_handler(hw0, hw1, wide);
 
         let mut flags = 0u8;
         if wide { flags |= DecodedOp::FLAG_WIDE; }
         if pure { flags |= DecodedOp::FLAG_PURE; }
         if flag_only { flags |= DecodedOp::FLAG_FLAG_ONLY; }
 
-        let entry = DecodedOp { tag: pc, hw0, hw1, fetch_wait, flags };
+        let entry = DecodedOp { handler, tag: pc, hw0, hw1, fetch_wait, flags };
 
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
@@ -424,110 +521,38 @@ impl CortexM33 {
         entry
     }
 
-    /// Top-level Thumb-16 dispatch. Routes to instruction group handlers
-    /// in execute.rs based on bits [15:11].
+    /// Top-level Thumb-16 dispatch.
     ///
-    /// Every arm calls a handler with the uniform signature
-    /// `fn(&mut CortexM33, hw0: u16, hw1: u16, &mut Bus) -> u32`. For
-    /// Thumb-16 the opcode is the single halfword, so `hw0 = opcode`
-    /// and `hw1 = 0`. Prerequisite for fn-pointer dispatch (Stage A of
-    /// HLD 2026.04.15).
+    /// Post-Stage-B this is a thin wrapper around `classify_handler` —
+    /// the cache hit path in `decode_execute` dispatches via the cached
+    /// fn pointer without touching this function. `execute_one*_with_bus`
+    /// test helpers in `core/mod.rs` still call here so they can drive a
+    /// single opcode without populating the cache.
+    ///
+    /// **Mirror:** `classify_handler` (this module) routes the exact same
+    /// `(hw0, 0, is_wide=false)` input to the same handler item. Any edit
+    /// to one MUST land in the other or the `dispatch_equiv` tests in
+    /// `tests.rs` will fail.
+    ///
+    /// See HLD `2026.04.15 - HLD - Fn-Pointer Dispatch in DecodedOp.md` §2.6.
     pub(crate) fn execute_thumb16(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
-        match opcode >> 11 {
-            // Shift (immediate)
-            0b00000 => self.thumb16_lsl_imm(opcode, 0, bus),
-            0b00001 => self.thumb16_lsr_imm(opcode, 0, bus),
-            0b00010 => self.thumb16_asr_imm(opcode, 0, bus),
-            // Add/sub register and 3-bit immediate
-            0b00011 => self.thumb16_add_sub(opcode, 0, bus),
-            // Move/compare/add/sub 8-bit immediate
-            0b00100 => self.thumb16_mov_imm(opcode, 0, bus),
-            0b00101 => self.thumb16_cmp_imm(opcode, 0, bus),
-            0b00110 => self.thumb16_add_imm8(opcode, 0, bus),
-            0b00111 => self.thumb16_sub_imm8(opcode, 0, bus),
-            // Data processing + special data + BX
-            // bits[15:10] = 010000 → data processing
-            // bits[15:10] = 010001 → special data / BX / BLX
-            0b01000 => {
-                if opcode & (1 << 10) == 0 {
-                    self.thumb16_data_processing(opcode, 0, bus)
-                } else {
-                    self.thumb16_special_data_bx(opcode, 0, bus)
-                }
-            }
-            0b01001 => self.thumb16_ldr_literal(opcode, 0, bus),
-            // Load/store register offset
-            0b01010 | 0b01011 => self.thumb16_load_store_reg(opcode, 0, bus),
-            // Load/store word immediate offset
-            0b01100 => self.thumb16_str_imm(opcode, 0, bus),
-            0b01101 => self.thumb16_ldr_imm(opcode, 0, bus),
-            // Load/store byte immediate offset
-            0b01110 => self.thumb16_strb_imm(opcode, 0, bus),
-            0b01111 => self.thumb16_ldrb_imm(opcode, 0, bus),
-            // Load/store halfword immediate offset
-            0b10000 => self.thumb16_strh_imm(opcode, 0, bus),
-            0b10001 => self.thumb16_ldrh_imm(opcode, 0, bus),
-            // SP-relative load/store
-            0b10010 => self.thumb16_str_sp(opcode, 0, bus),
-            0b10011 => self.thumb16_ldr_sp(opcode, 0, bus),
-            // ADR (PC-relative) and ADD SP+imm
-            0b10100 => self.thumb16_adr(opcode, 0, bus),
-            0b10101 => self.thumb16_add_sp_imm(opcode, 0, bus),
-            // Miscellaneous
-            0b10110 | 0b10111 => self.thumb16_misc(opcode, 0, bus),
-            // Store/Load multiple
-            0b11000 => self.thumb16_stm(opcode, 0, bus),
-            0b11001 => self.thumb16_ldm(opcode, 0, bus),
-            // Conditional branch + SVC
-            0b11010 | 0b11011 => self.thumb16_cond_branch_svc(opcode, 0, bus),
-            // Unconditional branch
-            0b11100 => self.thumb16_branch(opcode, 0, bus),
-            // 32-bit prefix (should not reach here via this path)
-            _ => self.thumb16_undefined(opcode, 0, bus),
-        }
+        (classify_handler(opcode, 0, false))(self, opcode, 0, bus)
     }
 
     /// Top-level Thumb-32 dispatch.
     ///
-    /// Every arm calls a handler with the uniform signature
-    /// `fn(&mut CortexM33, hw0: u16, hw1: u16, &mut Bus) -> u32`.
-    /// Prerequisite for fn-pointer dispatch (Stage A of HLD 2026.04.15).
+    /// Post-Stage-B this is a thin wrapper around `classify_handler` —
+    /// the cache hit path in `decode_execute` dispatches via the cached
+    /// fn pointer without touching this function. `execute_one_wide*`
+    /// test helpers in `core/mod.rs` still call here.
+    ///
+    /// **Mirror:** `classify_handler` (this module) routes the exact same
+    /// `(hw0, hw1, is_wide=true)` input to the same handler item. Any
+    /// edit to one MUST land in the other or the `dispatch_equiv` tests
+    /// in `tests.rs` will fail.
+    ///
+    /// See HLD `2026.04.15 - HLD - Fn-Pointer Dispatch in DecodedOp.md` §2.6.
     pub(crate) fn execute_thumb32(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
-        let op1 = (hw0 >> 11) & 0x3;
-        let op2 = ((hw0 >> 4) & 0x7F) as u32;
-        let op  = (hw1 >> 15) & 0x1;
-
-        match op1 {
-            0b01 => match op2 >> 5 {
-                0b00 => if op2 & 0x04 == 0 {
-                    self.thumb32_ldm_stm(hw0, hw1, bus)
-                } else {
-                    self.thumb32_load_store_dual(hw0, hw1, bus)
-                },
-                0b01 => self.thumb32_dp_shifted_reg(hw0, hw1, bus),
-                _    => self.thumb32_coprocessor(hw0, hw1, bus),
-            },
-            0b10 => if op == 0 {
-                if op2 & 0x20 == 0 {
-                    self.thumb32_dp_modified_imm(hw0, hw1, bus)
-                } else {
-                    self.thumb32_dp_plain_imm(hw0, hw1, bus)
-                }
-            } else {
-                self.thumb32_branch_misc(hw0, hw1, bus)
-            },
-            0b11 => if op2 & 0x40 != 0 {
-                self.thumb32_coprocessor(hw0, hw1, bus)
-            } else if op2 & 0x20 == 0 {
-                self.thumb32_load_store_single(hw0, hw1, bus)
-            } else if op2 & 0x10 == 0 {
-                self.thumb32_dp_register(hw0, hw1, bus)
-            } else if op2 & 0x08 == 0 {
-                self.thumb32_multiply(hw0, hw1, bus)
-            } else {
-                self.thumb32_long_multiply(hw0, hw1, bus)
-            },
-            _ => self.thumb32_undefined(hw0, hw1, bus),
-        }
+        (classify_handler(hw0, hw1, true))(self, hw0, hw1, bus)
     }
 }

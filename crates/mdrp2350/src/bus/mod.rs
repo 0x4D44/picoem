@@ -15,15 +15,34 @@ use crate::sio::Sio;
 pub(crate) const DECODE_CACHE_SIZE: usize = 16384;
 const DECODE_CACHE_MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
 
-/// One decoded instruction. 12 bytes. `Copy`.
+/// Uniform dispatched-handler signature. Every `thumb16_*` / `thumb32_*`
+/// function on a top-level dispatch arm matches this shape — narrow
+/// handlers accept `hw1` and ignore it, handlers that don't touch the bus
+/// accept `&mut Bus` and ignore it. LLVM elides dead args at the leaf.
+///
+/// Stamped on `DecodedOp::handler` at populate time and invoked via a
+/// single indirect call on the hit path. See HLD
+/// `2026.04.15 - HLD - Fn-Pointer Dispatch in DecodedOp.md` §2.1.
+pub(crate) type Handler = fn(&mut crate::core::CortexM33, u16, u16, &mut Bus) -> u32;
+
+/// One decoded instruction. 24 bytes. `Copy`.
 ///
 /// Populated lazily on a cache miss by `CortexM33::populate_decode_cache`.
 /// An entry with `tag == u32::MAX` is empty (that value is odd and cannot
 /// match a halfword-aligned PC).
 ///
-/// See HLD §2.
+/// Layout mirrors HLD §2.1: `handler` is placed first so the hit path
+/// reads it in the same cache line as `tag`. The 6 B tail pad is the
+/// 8-byte alignment of the function pointer.
+///
+/// See HLD `2026.04.14 - HLD - Decoded-Op Cache.md` and
+/// `2026.04.15 - HLD - Fn-Pointer Dispatch in DecodedOp.md`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodedOp {
+    /// Dispatched handler for this opcode. Computed by
+    /// `classify_handler(hw0, hw1, is_wide)` at populate time so the hit
+    /// path can skip the top-level match entirely.
+    pub handler: Handler,
     /// PC this entry is valid for. Full tag (no shift). `u32::MAX` = empty.
     pub tag: u32,
     /// First halfword (the one at PC).
@@ -53,7 +72,18 @@ impl DecodedOp {
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
-        Self { tag: u32::MAX, hw0: 0, hw1: 0, fetch_wait: 0, flags: 0 }
+        // Width-matched undefined sentinel: an empty slot can never be
+        // dispatched (tag == u32::MAX can't match a halfword-aligned PC),
+        // but the field needs a valid function pointer. `thumb16_undefined`
+        // is as good as any.
+        Self {
+            handler: crate::core::CortexM33::thumb16_undefined,
+            tag: u32::MAX,
+            hw0: 0,
+            hw1: 0,
+            fetch_wait: 0,
+            flags: 0,
+        }
     }
 
     #[inline(always)]
@@ -209,10 +239,12 @@ pub struct Bus {
     /// (no stimulus — legacy behaviour).
     pub gpio_external_mask: u32,
     /// PC-keyed decoded-op cache. Direct-mapped, `DECODE_CACHE_SIZE`
-    /// entries × 12 B = 192 KB. Populated lazily on fetch by
+    /// entries × 24 B = 384 KB. Populated lazily on fetch by
     /// `CortexM33::populate_decode_cache`; invalidated on writes to
     /// executable memory (regions 0x1 / 0x2) and on bulk loads
-    /// (`load_bootrom` / `load_flash`). See HLD §3.
+    /// (`load_bootrom` / `load_flash`). See HLD `2026.04.14 -
+    /// HLD - Decoded-Op Cache.md` §3 and HLD `2026.04.15 - HLD -
+    /// Fn-Pointer Dispatch in DecodedOp.md` §2.1.
     pub(crate) decode_cache: Box<[DecodedOp; DECODE_CACHE_SIZE]>,
 }
 
