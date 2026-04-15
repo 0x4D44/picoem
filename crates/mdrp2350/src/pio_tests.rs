@@ -65,6 +65,40 @@ fn test_ctrl_alias_set_clr() {
 }
 
 #[test]
+fn test_ctrl_alias_xor() {
+    // XOR alias: addr + 0x1000 (alias=1). SM_ENABLE bits with 1 toggle
+    // the corresponding SM; bits with 0 leave it untouched.
+    let mut bus = Bus::new();
+
+    // Start: SM0 and SM2 enabled via normal write.
+    bus.write32(0x5020_0000, 0x5);
+    assert!(bus.pio[0].sm[0].enabled());
+    assert!(!bus.pio[0].sm[1].enabled());
+    assert!(bus.pio[0].sm[2].enabled());
+    assert!(!bus.pio[0].sm[3].enabled());
+
+    // XOR with 0x3: toggles SM0 (1->0) and SM1 (0->1); SM2/SM3 unchanged.
+    bus.write32(0x5020_1000, 0x3);
+    assert!(!bus.pio[0].sm[0].enabled());
+    assert!(bus.pio[0].sm[1].enabled());
+    assert!(bus.pio[0].sm[2].enabled());
+    assert!(!bus.pio[0].sm[3].enabled());
+    assert_eq!(bus.read32(0x5020_0000), 0x6);
+
+    // XOR with 0x0: no-op.
+    bus.write32(0x5020_1000, 0x0);
+    assert_eq!(bus.read32(0x5020_0000), 0x6);
+
+    // XOR with 0xF: toggles every SM.
+    bus.write32(0x5020_1000, 0xF);
+    assert!(bus.pio[0].sm[0].enabled());
+    assert!(!bus.pio[0].sm[1].enabled());
+    assert!(!bus.pio[0].sm[2].enabled());
+    assert!(bus.pio[0].sm[3].enabled());
+    assert_eq!(bus.read32(0x5020_0000), 0x9);
+}
+
+#[test]
 fn test_gpio_in_moved_to_bus() {
     let mut bus = Bus::new();
     bus.gpio_in = 0xFF;
