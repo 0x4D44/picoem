@@ -22,8 +22,15 @@ const SYST_CSR_COUNTFLAG: u32 = 1 << 16;
 /// SysTick CVR is a 24-bit counter.
 const SYST_24BIT_MASK: u32 = 0x00FF_FFFF;
 
-/// ICSR.PENDSTSET — SysTick set-pending bit (ARMv8-M §B3.2.4).
-const ICSR_PENDSTSET:     u32 = 1 << 26;
+// ICSR pending bits (ARMv8-M §B3.2.4). SET bits are W1S (write 1 sets,
+// write 0 ignored). CLR bits are W1C for the corresponding SET bit
+// (write 1 clears the SET bit, write 0 ignored). Other ICSR bits are
+// read-only status; writes are preserved only in storage for round-trip.
+pub(crate) const ICSR_NMIPENDSET: u32 = 1 << 31;
+pub(crate) const ICSR_PENDSVSET:  u32 = 1 << 28;
+const ICSR_PENDSVCLR:             u32 = 1 << 27;
+pub(crate) const ICSR_PENDSTSET:  u32 = 1 << 26;
+const ICSR_PENDSTCLR:             u32 = 1 << 25;
 
 /// Per-core Private Peripheral Bus state (NVIC, SCB, SysTick stubs).
 /// Phase 3: slim — only what the bootrom needs.
@@ -335,8 +342,19 @@ impl Ppb {
             // CPUID — read-only, ignore writes
             0xED00 => {}
 
-            // ICSR
-            0xED04 => self.icsr = val,
+            // ICSR — ARMv8-M §B3.2.4: pend bits (PENDSVSET, PENDSTSET,
+            // NMIPENDSET) are W1S; clear bits (PENDSVCLR, PENDSTCLR) are
+            // W1C for the corresponding SET bit. Writing 0 to any of these
+            // is ignored. If a SET and its CLR are written in the same
+            // store, CLR wins (apply CLR after SET so the net effect is
+            // "not pended"). Other ICSR bits are read-only status.
+            0xED04 => {
+                if val & ICSR_NMIPENDSET != 0 { self.icsr |= ICSR_NMIPENDSET; }
+                if val & ICSR_PENDSVSET  != 0 { self.icsr |= ICSR_PENDSVSET;  }
+                if val & ICSR_PENDSTSET  != 0 { self.icsr |= ICSR_PENDSTSET;  }
+                if val & ICSR_PENDSVCLR  != 0 { self.icsr &= !ICSR_PENDSVSET; }
+                if val & ICSR_PENDSTCLR  != 0 { self.icsr &= !ICSR_PENDSTSET; }
+            }
 
             // VTOR — 128-byte aligned
             0xED08 => self.vtor = val & !0x7F,
@@ -596,6 +614,63 @@ mod tests {
         ppb.cfsr = 0xFF;
         ppb.write32(0xE000_ED28, 0x0F);
         assert_eq!(ppb.read32(0xE000_ED28), 0xF0);
+    }
+
+    // --- ICSR W1S/W1C semantics (ARMv8-M §B3.2.4) ---
+
+    #[test]
+    fn test_icsr_pendsv_set_w1s() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED04, ICSR_PENDSVSET);
+        assert_ne!(ppb.read32(0xE000_ED04) & ICSR_PENDSVSET, 0);
+    }
+
+    #[test]
+    fn test_icsr_write_zero_preserves_set_bit() {
+        let mut ppb = Ppb::default();
+        ppb.icsr = ICSR_PENDSVSET;
+        // Writing 0 to PENDSVSET must NOT clear it (W1S — write 0 ignored).
+        ppb.write32(0xE000_ED04, 0);
+        assert_ne!(ppb.read32(0xE000_ED04) & ICSR_PENDSVSET, 0);
+    }
+
+    #[test]
+    fn test_icsr_pendsv_clr_clears_set() {
+        let mut ppb = Ppb::default();
+        ppb.icsr = ICSR_PENDSVSET;
+        ppb.write32(0xE000_ED04, ICSR_PENDSVCLR);
+        assert_eq!(ppb.read32(0xE000_ED04) & ICSR_PENDSVSET, 0);
+    }
+
+    #[test]
+    fn test_icsr_pendst_set_w1s() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED04, ICSR_PENDSTSET);
+        assert_ne!(ppb.read32(0xE000_ED04) & ICSR_PENDSTSET, 0);
+    }
+
+    #[test]
+    fn test_icsr_pendst_clr_clears_set() {
+        let mut ppb = Ppb::default();
+        ppb.icsr = ICSR_PENDSTSET;
+        ppb.write32(0xE000_ED04, ICSR_PENDSTCLR);
+        assert_eq!(ppb.read32(0xE000_ED04) & ICSR_PENDSTSET, 0);
+    }
+
+    #[test]
+    fn test_icsr_set_and_clr_simultaneous_clr_wins() {
+        // ARMv8-M §B3.2.4: if both SET and CLR bits are written as 1 in the
+        // same store, the CLR takes effect and the exception is NOT pended.
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED04, ICSR_PENDSVSET | ICSR_PENDSVCLR);
+        assert_eq!(ppb.read32(0xE000_ED04) & ICSR_PENDSVSET, 0);
+    }
+
+    #[test]
+    fn test_icsr_nmipendset_w1s() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED04, ICSR_NMIPENDSET);
+        assert_ne!(ppb.read32(0xE000_ED04) & ICSR_NMIPENDSET, 0);
     }
 
     #[test]
