@@ -110,6 +110,8 @@ impl Emulator {
         self.bus.ppb = [Default::default(), Default::default()];
         self.bus.event_flag = [false; 2];
         self.bus.gpio_in = 0;
+        self.bus.external_gpio_in_override = 0;
+        self.bus.external_gpio_in_mask = 0;
         self.bus.end_core1_step();
 
         self.clock = Clock { cycles: 0 };
@@ -296,12 +298,20 @@ impl Emulator {
     /// update_gpio`). The result is masked to the RP2040 30-pin range
     /// (GPIO0..GPIO29).
     ///
-    /// Finally, the off-chip SPI PSRAM observes the post-merge pin state
+    /// Next, the off-chip SPI PSRAM observes the post-merge pin state
     /// on its CS/SCK/MOSI pins and, if it is currently driving MISO,
-    /// splices its bit into `gpio_in` bit 0. MISO override happens last
-    /// so MOSI/SCK/CS seen by the PSRAM reflect the actual pin levels
-    /// driven by PIO / SIO on this tick (no feedback from the override
-    /// into the PSRAM's observation on the same tick).
+    /// splices its bit into `gpio_in` bit 0. MISO override happens after
+    /// SIO/PIO so MOSI/SCK/CS seen by the PSRAM reflect the actual pin
+    /// levels driven by PIO / SIO on this tick (no feedback from the
+    /// override into the PSRAM's observation on the same tick).
+    ///
+    /// Finally, any [`Bus::external_gpio_in_mask`] bits override the
+    /// merged value with [`Bus::external_gpio_in_override`]. External
+    /// drivers (e.g. the `picogus_diff_rp2040` harness injecting a
+    /// synthetic ISA waveform) win over the on-chip merge for the pins
+    /// they claim — without this final override step, harness pokes to
+    /// `bus.gpio_in` would be silently clobbered the next time
+    /// `update_gpio` ran.
     pub(crate) fn update_gpio(&mut self) {
         let mut out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
         for pio in &self.bus.pio {
@@ -312,6 +322,10 @@ impl Emulator {
         if let Some(miso) = self.bus.psram.tick(out) {
             let mask = 1u32 << crate::peripherals::psram::PIN_MISO;
             out = (out & !mask) | ((miso as u32) << crate::peripherals::psram::PIN_MISO);
+        }
+        let ext_mask = self.bus.external_gpio_in_mask;
+        if ext_mask != 0 {
+            out = (out & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);
         }
         self.bus.gpio_in = out;
     }
@@ -405,6 +419,32 @@ impl Emulator {
     /// Current master cycle count.
     pub fn cycles(&self) -> u64 {
         self.clock.cycles
+    }
+
+    /// Write a 32-bit word to an MMIO address via the bus. Charges zero
+    /// emulator cycles (intended for setup code running outside `run()`).
+    ///
+    /// Delegates to [`Bus::write32`], so alias bits (`(addr >> 12) & 3`)
+    /// are honoured: base address = normal, XOR alias = `|0x1000`, SET
+    /// alias = `|0x2000`, CLR alias = `|0x3000`. Useful for poking PIO
+    /// INSTR_MEM, configuring SIO GPIO_OE/_OUT, releasing RESETS bits,
+    /// etc., without hand-rolling the bus machinery.
+    pub fn mmio_write32(&mut self, addr: u32, value: u32) {
+        self.bus.write32(addr, value);
+    }
+
+    /// Read a 32-bit word from an MMIO address via the bus. Charges zero
+    /// emulator cycles (intended for setup code running outside `run()`).
+    ///
+    /// **Warning: reads may have side effects.** Several RP2040 MMIO
+    /// registers mutate state on read — e.g. PIO `RXFn` pops the receive
+    /// FIFO, SIO divider `QUOTIENT` / `REMAINDER` clear the CSR dirty
+    /// bit, and a handful of W1C sticky flags are cleared by reads. Setup
+    /// code should therefore be write-heavy; reads through this method
+    /// are for confirmation only and should be chosen carefully to avoid
+    /// disturbing the peripheral's state.
+    pub fn mmio_read32(&mut self, addr: u32) -> u32 {
+        self.bus.read32(addr)
     }
 }
 

@@ -100,6 +100,12 @@ impl Emulator {
             pio.reset();
         }
         self.bus.gpio_in = 0;
+        // External-input stimulus (harness-owned pin forcing) survives
+        // reset only if the harness re-applies it post-reset. Clearing
+        // here matches the real-silicon model: any host stimulus must
+        // be re-asserted after a chip reset.
+        self.bus.gpio_external_in = 0;
+        self.bus.gpio_external_mask = 0;
 
         // Reset clock. The authoritative sys_clk_hz lives on Bus's
         // clock tree (see bus/clocks.rs), so nothing to preserve here.
@@ -118,9 +124,11 @@ impl Emulator {
         }
     }
 
-    /// Load the bootrom (32 kB at address 0x00000000).
+    /// Load the bootrom (32 kB at address 0x00000000). Also invalidates
+    /// any decoded-op cache entries that pointed into ROM — the bytes
+    /// have been replaced wholesale.
     pub fn load_bootrom(&mut self, data: &[u8]) {
-        self.bus.memory.load_rom(data);
+        self.bus.load_bootrom(data);
     }
 
     /// Load flash image (appears at XIP address 0x10000000).
@@ -218,13 +226,20 @@ impl Emulator {
 
     /// Merge SIO and PIO GPIO outputs into bus.gpio_in.
     /// PIO output-enable overrides SIO: if a PIO block drives a pin, its value wins.
+    ///
+    /// External-input stimulus (see [`Bus::gpio_external_mask`]) is overlaid
+    /// last so the harness can force pins (CS, address bus, etc.) that would
+    /// otherwise be recomputed every tick. Mask-clear bits reflect whatever
+    /// SIO/PIO produced; mask-set bits reflect `gpio_external_in`.
     pub(crate) fn update_gpio(&mut self) {
         let mut out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
         for pio in &self.bus.pio {
             let pio_mask = pio.pad_oe;
             out = (out & !pio_mask) | (pio.pad_out & pio_mask);
         }
-        self.bus.gpio_in = out;
+        let ext_mask = self.bus.gpio_external_mask;
+        let ext_val = self.bus.gpio_external_in;
+        self.bus.gpio_in = (out & !ext_mask) | (ext_val & ext_mask);
     }
 
     /// Read a GPIO pin from the merged pin state.
@@ -259,6 +274,14 @@ impl Emulator {
     }
 
     /// Direct memory write (bypasses bus timing).
+    ///
+    /// **Cache note:** this bypasses the `Bus::write32` path and does
+    /// NOT invalidate the decoded-op cache. Callers that poke into
+    /// executable memory (ROM / XIP / SRAM) and then `step()` must call
+    /// [`Bus::invalidate_all`] on `self.bus` between the poke and the
+    /// next `step` to avoid executing stale decoded ops. Pre-boot
+    /// pokes (the common case for the harness) happen before any cache
+    /// entries exist and are safe without an explicit invalidation.
     pub fn poke(&mut self, addr: u32, value: u32) {
         if Bus::is_boot_ram(addr) {
             self.bus.boot_ram_write32(addr, value);
@@ -270,6 +293,32 @@ impl Emulator {
     /// Current master cycle count.
     pub fn cycles(&self) -> u64 {
         self.clock.cycles
+    }
+
+    /// Write a 32-bit word to an MMIO address via the bus. Charges zero
+    /// emulator cycles (intended for setup code running outside `run()`).
+    ///
+    /// Delegates to [`Bus::write32`], so alias bits (`(addr >> 12) & 3`)
+    /// are honoured: base address = normal, XOR alias = `|0x1000`, SET
+    /// alias = `|0x2000`, CLR alias = `|0x3000`. Useful for poking PIO
+    /// INSTR_MEM, configuring SIO GPIO_OE/_OUT, releasing RESETS bits,
+    /// etc., without hand-rolling the bus machinery.
+    pub fn mmio_write32(&mut self, addr: u32, value: u32) {
+        self.bus.write32(addr, value);
+    }
+
+    /// Read a 32-bit word from an MMIO address via the bus. Charges zero
+    /// emulator cycles (intended for setup code running outside `run()`).
+    ///
+    /// **Warning: reads may have side effects.** Several RP2350 MMIO
+    /// registers mutate state on read — e.g. PIO `RXFn` pops the receive
+    /// FIFO, SIO divider `QUOTIENT` / `REMAINDER` clear the CSR dirty
+    /// bit, and a handful of W1C sticky flags are cleared by reads. Setup
+    /// code should therefore be write-heavy; reads through this method
+    /// are for confirmation only and should be chosen carefully to avoid
+    /// disturbing the peripheral's state.
+    pub fn mmio_read32(&mut self, addr: u32) -> u32 {
+        self.bus.read32(addr)
     }
 }
 

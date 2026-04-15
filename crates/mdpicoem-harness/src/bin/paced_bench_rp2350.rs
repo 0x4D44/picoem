@@ -1,4 +1,12 @@
-//! Paced benchmark: measures whether the emulator can sustain real-time at 150 MHz.
+//! Paced benchmark: measures whether the mdrp2350 emulator can sustain
+//! real-time at the RP2354's stock 150 MHz.
+//!
+//! The `--workload` flag picks from a set of synthetic workloads that
+//! span the cost envelope from single-core ALU floor to "both cores
+//! active + peripherals singing" realistic worst case, plus the
+//! existing `fpu-heavy` workload (RP2350-specific, used by the HLD §12
+//! performance budget check). See `wrk_docs/2026.04.15 - HLD - Paced
+//! Bench Workload Spread.md` for rationale.
 //!
 //! Flags:
 //!   --seconds N        Wall-clock duration (default 5; ignored with --cycles).
@@ -11,10 +19,10 @@
 //!   --unpaced          Run flat-out, no real-time pacing; also emits the
 //!                      host-cycles-per-emulated-cycle figure for the HLD §12
 //!                      performance budget check.
-//!   --dual-core        Run both M33 cores in parallel (single-threaded).
-//!   --workload basic   Tight MOVS/ADDS/B loop (default).
-//!   --workload fpu-heavy
-//!                      VADD/VMUL/VDIV/VSQRT loop exercising the FPU hot path.
+//!   --workload <name>  One of: basic (default), peripheral, contention,
+//!                      stress, fpu-heavy. Core count is implied by the
+//!                      workload: basic / peripheral / fpu-heavy are
+//!                      single-core, contention / stress are dual-core.
 
 use mdrp2350::{Config, Emulator, Pacer, PacerStats};
 use std::sync::Arc;
@@ -28,9 +36,39 @@ use std::time::{Duration, Instant};
 enum Workload {
     /// Default: MOVS R0,#1 / ADDS R0,R0,#1 / B .-2 — tight ALU loop.
     Basic,
-    /// FPU-heavy: VADD S3,S1,S2 / VMUL S3,S3,S1 / VDIV S3,S3,S2 / VSQRT S3,S3 / B.
+    /// Single-core ALU + SIO GPIO toggle, with PIO0 SM0 blinking a pin
+    /// in the background (keeps `PioBlock::execute_cycle` on the hot
+    /// path).
+    Peripheral,
+    /// Both cores running the ALU loop in striped SRAM bank 0 (16-byte
+    /// apart) — exercises the contention accounting on core 1.
+    Contention,
+    /// Composite: core 0 runs the peripheral loop, core 1 runs the basic
+    /// ALU loop, both in bank 0; PIO0 SM0 running. Realistic worst case.
+    Stress,
+    /// FPU-heavy: VADD/VMUL/VDIV/VSQRT loop exercising the FPU hot path.
     /// Used by the HLD §12 performance budget check.
     FpuHeavy,
+}
+
+impl Workload {
+    fn is_dual_core(self) -> bool {
+        matches!(self, Workload::Contention | Workload::Stress)
+    }
+
+    fn needs_pio(self) -> bool {
+        matches!(self, Workload::Peripheral | Workload::Stress)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Workload::Basic => "basic",
+            Workload::Peripheral => "peripheral",
+            Workload::Contention => "contention",
+            Workload::Stress => "stress",
+            Workload::FpuHeavy => "fpu-heavy",
+        }
+    }
 }
 
 /// Encode VFP data-processing (VADD/VSUB/VMUL/VDIV) single-precision.
@@ -68,6 +106,261 @@ fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) {
 fn pair(hw0: u16, hw1: u16) -> u32 {
     (hw1 as u32) << 16 | (hw0 as u32)
 }
+
+// ---------------------------------------------------------------------------
+// RP2350 MMIO register addresses (RP2350 datasheet).
+// ---------------------------------------------------------------------------
+
+/// RESETS base on RP2350 (see `mdrp2350/src/bus/peripherals.rs`).
+const RESETS_BASE: u32 = 0x4002_0000;
+const RESETS_RESET_OFFSET: u32 = 0x00;
+/// RESETS.RESET bit 15 = PIO0 on RP2350.
+const RESETS_PIO0_BIT: u32 = 1 << 15;
+
+const IO_BANK0_BASE: u32 = 0x4002_8000;
+const PADS_BANK0_BASE: u32 = 0x4003_8000;
+
+const SIO_BASE: u32 = 0xD000_0000;
+/// SIO GPIO_OE_SET on RP2350 (8-byte spacing — SET is offset 0x038).
+const SIO_GPIO_OE_SET: u32 = SIO_BASE + 0x038;
+/// SIO GPIO_OUT_XOR on RP2350 (8-byte spacing — XOR is offset 0x028).
+const SIO_GPIO_OUT_XOR: u32 = SIO_BASE + 0x028;
+
+const PIO0_BASE: u32 = 0x5020_0000;
+const PIO_CTRL: u32 = 0x000;
+const PIO_INSTR_MEM0: u32 = 0x048;
+const PIO_SM0_CLKDIV: u32 = 0x0C8;
+const PIO_SM0_EXECCTRL: u32 = 0x0CC;
+const PIO_SM0_SHIFTCTRL: u32 = 0x0D0;
+const PIO_SM0_INSTR: u32 = 0x0D8;
+const PIO_SM0_PINCTRL: u32 = 0x0DC;
+
+/// FUNCSEL for PIO0 (RP2350: 6 = PIO0, same as RP2040).
+const FUNCSEL_PIO0: u8 = 6;
+
+/// PIO pin number driven by the wrap-loop program.
+const PIO_PIN: u8 = 2;
+/// SIO GPIO pin toggled by the core's STR in the peripheral loop. Bit 0
+/// so the pin mask fits in a `MOVS R1, #1` (T16 immediate), matching the
+/// HLD loop shape exactly.
+const SIO_TOGGLE_PIN: u8 = 0;
+
+// ---------------------------------------------------------------------------
+// Setup helpers
+// ---------------------------------------------------------------------------
+
+/// De-assert the RESETS bit for PIO0. The emulator doesn't currently gate
+/// PIO activity on the RESETS bit, but matching real firmware bring-up
+/// keeps us forward-compatible the day that tech-debt entry gets closed.
+fn resets_deassert_pio0(emu: &mut Emulator) {
+    // APB CLR alias (+0x3000): writing 1s clears the corresponding RESET
+    // bits, bringing those peripherals out of reset.
+    emu.mmio_write32(
+        RESETS_BASE + RESETS_RESET_OFFSET + 0x3000,
+        RESETS_PIO0_BIT,
+    );
+}
+
+/// Configure a GPIO pin for output on `funcsel`: program the IO_BANK0
+/// GPIO_CTRL.FUNCSEL and set the PADS_BANK0 entry so the pad is driven.
+///
+/// RP2350 IO_BANK0 / PADS_BANK0 aren't deeply modelled (writes land in
+/// the bus's catch-all peripheral_regs map), but emit the writes anyway
+/// so the workload setup matches real firmware bring-up.
+fn setup_gpio_output(emu: &mut Emulator, pin: u8, funcsel: u8) {
+    // IO_BANK0_GPIO<pin>_CTRL is at offset 0x04 + pin*8 (per-pin pair:
+    // STATUS at 0x00 + 8*pin, CTRL at 0x04 + 8*pin).
+    let ctrl_offset = 0x04 + (pin as u32) * 8;
+    emu.mmio_write32(IO_BANK0_BASE + ctrl_offset, funcsel as u32);
+
+    // PADS_BANK0_GPIO<pin> at offset 0x04 + pin*4. IE=1 (bit 6),
+    // DRIVE=2 (bits 5:4 = 01 = 4 mA default).
+    let pad_offset = 0x04 + (pin as u32) * 4;
+    emu.mmio_write32(PADS_BANK0_BASE + pad_offset, 0x0000_0056);
+}
+
+/// Install a minimal two-instruction wrap loop on PIO0 SM0:
+///   addr 0: SET PINS, 1
+///   addr 1: SET PINS, 0
+///   .wrap (via EXECCTRL wrap_top=1, wrap_bottom=0)
+/// Force a `SET PINDIRS, 1` via SM0_INSTR so the pin is driven, set
+/// CLKDIV=1 (one SM cycle per sys_clk), and enable SM0 via CTRL.
+/// Also configures IO_BANK0 / PADS_BANK0 for the target pin.
+fn setup_pio0_sm0_wrap(emu: &mut Emulator, pin: u8) {
+    resets_deassert_pio0(emu);
+
+    // Route the pin through PIO0.
+    setup_gpio_output(emu, pin, FUNCSEL_PIO0);
+
+    // INSTR_MEM[0]: SET PINS, 1  (0xE001)
+    // INSTR_MEM[1]: SET PINS, 0  (0xE000)
+    emu.mmio_write32(PIO0_BASE + PIO_INSTR_MEM0, 0xE001);
+    emu.mmio_write32(PIO0_BASE + PIO_INSTR_MEM0 + 4, 0xE000);
+
+    // SM0_PINCTRL: SET_COUNT=1 (bits 28:26), SET_BASE=pin (bits 9:5).
+    let pinctrl = (1u32 << 26) | ((pin as u32) << 5);
+    emu.mmio_write32(PIO0_BASE + PIO_SM0_PINCTRL, pinctrl);
+
+    // SM0_EXECCTRL: wrap_top=1 (bits 16:12), wrap_bottom=0 (bits 11:7).
+    let execctrl = 1u32 << 12;
+    emu.mmio_write32(PIO0_BASE + PIO_SM0_EXECCTRL, execctrl);
+
+    // SM0_SHIFTCTRL: re-emit the reset value (autopush/autopull off,
+    // thresholds 32 — encoded as 0).
+    emu.mmio_write32(PIO0_BASE + PIO_SM0_SHIFTCTRL, 0x000C_0000);
+
+    // SM0_CLKDIV: INT=1 (bits 31:16), FRAC=0. One SM cycle per sys_clk.
+    emu.mmio_write32(PIO0_BASE + PIO_SM0_CLKDIV, 1u32 << 16);
+
+    // Force `SET PINDIRS, 1` through SM0_INSTR so the pin becomes driven.
+    // Encoding: opcode=111 (SET), dest=PINDIRS (4), data=1 → 0xE081.
+    emu.mmio_write32(PIO0_BASE + PIO_SM0_INSTR, 0xE081);
+
+    // CTRL.SM_ENABLE bit 0 — enable SM0.
+    emu.mmio_write32(PIO0_BASE + PIO_CTRL, 0x1);
+}
+
+// ---------------------------------------------------------------------------
+// Workload dispatch
+// ---------------------------------------------------------------------------
+
+/// Core 0 basic ALU loop at 0x2000_0000:
+///   MOVS R0, #1 / ADDS R0, R0, #1 / B .-2
+fn setup_basic_core0(emu: &mut Emulator) {
+    // halfwords[0]=0x2001 MOVS R0,#1 | halfwords[1]=0x1C40 ADDS R0,R0,#1
+    emu.poke(0x2000_0000, 0x1C40_2001);
+    // halfwords[0]=0xE7FD B .-2 (back to ADDS)
+    emu.poke(0x2000_0004, 0x0000_E7FD);
+
+    emu.core_mut(0).regs.set_pc(0x2000_0000);
+    emu.core_mut(0).regs.xpsr = 1 << 24;
+}
+
+/// Core 0 peripheral loop at 0x2000_0000, matching the HLD shape:
+///   prologue: LDR R2, [PC, #lit] | MOVS R1, #1
+///   loop:     ADDS R0, R0, #1 | STR R1, [R2] | B loop
+///
+/// Layout:
+///   0x0: LDR  R2, [PC, #8]  (0x4A02) — R2 = SIO_GPIO_OUT_XOR
+///   0x2: MOVS R1, #1        (0x2101) — R1 = pin mask (GPIO0)
+///   0x4: ADDS R0, R0, #1    (0x1C40) — loop start
+///   0x6: STR  R1, [R2]      (0x6011) — SIO XOR write
+///   0x8: B    loop          (0xE7FC) — target = 0x4
+///   0xA: NOP                (0xBF00) — alignment halfword
+///   0xC: .word SIO_GPIO_OUT_XOR
+fn setup_peripheral_core0(emu: &mut Emulator) {
+    emu.poke(0x2000_0000, 0x2101_4A02);           // LDR R2 | MOVS R1
+    emu.poke(0x2000_0004, 0x6011_1C40);           // ADDS R0,R0,#1 | STR R1,[R2]
+    emu.poke(0x2000_0008, 0xBF00_E7FC);           // B .-8 | NOP
+    emu.poke(0x2000_000C, SIO_GPIO_OUT_XOR);      // literal: SIO XOR addr
+
+    // Enter at the prologue (LDR R2).
+    emu.core_mut(0).regs.set_pc(0x2000_0000);
+    emu.core_mut(0).regs.xpsr = 1 << 24;
+}
+
+/// Core 1 basic ALU loop at a caller-supplied address. Uses R1 as the
+/// accumulator to differentiate from core 0 in register dumps.
+fn setup_basic_core1_at(emu: &mut Emulator, addr: u32) {
+    // halfwords[0]=0x2101 MOVS R1,#1 | halfwords[1]=0x1C49 ADDS R1,R1,#1
+    emu.poke(addr, 0x1C49_2101);
+    // halfwords[0]=0xE7FD B .-2
+    emu.poke(addr + 4, 0x0000_E7FD);
+
+    emu.core_mut(1).regs.set_pc(addr);
+    emu.core_mut(1).regs.xpsr = 1 << 24;
+}
+
+/// Build the FPU-heavy workload at 0x2000_0000:
+///   VADD S3, S1, S2
+///   VMUL S3, S3, S1
+///   VDIV S3, S3, S2
+///   VSQRT S3, S3
+///   B .-20
+fn setup_fpu_heavy_core0(emu: &mut Emulator) {
+    let (va0, va1) = enc_vadd(3, 1, 2);   // VADD  S3, S1, S2
+    let (vm0, vm1) = enc_vmul(3, 3, 1);   // VMUL  S3, S3, S1
+    let (vd0, vd1) = enc_vdiv(3, 3, 2);   // VDIV  S3, S3, S2
+    let (vs0, vs1) = enc_vsqrt(3, 3);     // VSQRT S3, S3
+    emu.poke(0x2000_0000, pair(va0, va1));
+    emu.poke(0x2000_0004, pair(vm0, vm1));
+    emu.poke(0x2000_0008, pair(vd0, vd1));
+    emu.poke(0x2000_000C, pair(vs0, vs1));
+    // B .-20 back to 0x2000_0000 (PC at B is 0x2000_0010, PC+4 = 0x2000_0014,
+    // target = 0x2000_0000, imm11 = -10 = 0x7F6 → hw = 0xE7F6).
+    emu.poke(0x2000_0010, 0x0000_E7F6);
+
+    emu.core_mut(0).regs.set_pc(0x2000_0000);
+    emu.core_mut(0).regs.xpsr = 1 << 24;
+
+    // Seed the FPU sources so the steady-state is finite and well-behaved
+    // (no NaN/Inf churn that would distort timing). Pick values that
+    // cycle without overflow:
+    //   S1 = 2.0, S2 = 3.0
+    //   VADD S3 = 5.0 ; VMUL S3 = 10.0 ; VDIV S3 ≈ 3.333 ; VSQRT S3 ≈ 1.826
+    emu.core_mut(0).regs.s[1] = 2.0;
+    emu.core_mut(0).regs.s[2] = 3.0;
+}
+
+/// Dispatch: set up the emulator for the chosen workload.
+fn setup(emu: &mut Emulator, workload: Workload) {
+    // Stack placement for RP2350. SRAM8 (0x2008_0000) and SRAM9
+    // (0x2008_1000) are non-striped scratch banks — keeping stacks
+    // there keeps push/pop traffic out of the bank-0 fetch-contention
+    // signal in the dual-core workloads.
+    let core0_stack_top: u32 = if workload.is_dual_core() {
+        0x2008_1000 // top of SRAM8
+    } else {
+        0x2008_0000 // top of striped region (workloads use a low-touch stack)
+    };
+    emu.core_mut(0).regs.msp = core0_stack_top;
+    emu.core_mut(0).regs.r[13] = core0_stack_top;
+
+    match workload {
+        Workload::Basic => {
+            setup_basic_core0(emu);
+            emu.core_mut(1).halt();
+        }
+        Workload::Peripheral => {
+            setup_peripheral_core0(emu);
+            // SIO drives pin 25 directly; PIO drives PIO_PIN.
+            setup_gpio_output(emu, SIO_TOGGLE_PIN, 5); // FUNCSEL=5 = SIO
+            // Set OE bit for SIO pin so the toggle is observable.
+            emu.mmio_write32(SIO_GPIO_OE_SET, 1u32 << SIO_TOGGLE_PIN);
+            setup_pio0_sm0_wrap(emu, PIO_PIN);
+            emu.core_mut(1).halt();
+        }
+        Workload::Contention => {
+            setup_basic_core0(emu);
+            // Core 1 in striped bank 0 at 0x2000_0040 (word 16, 16 % 8 = 0).
+            setup_basic_core1_at(emu, 0x2000_0040);
+            // Core 1 stack in SRAM9 (non-striped scratch).
+            let core1_stack_top: u32 = 0x2008_2000;
+            emu.core_mut(1).regs.msp = core1_stack_top;
+            emu.core_mut(1).regs.r[13] = core1_stack_top;
+        }
+        Workload::Stress => {
+            setup_peripheral_core0(emu);
+            setup_gpio_output(emu, SIO_TOGGLE_PIN, 5);
+            emu.mmio_write32(SIO_GPIO_OE_SET, 1u32 << SIO_TOGGLE_PIN);
+            setup_pio0_sm0_wrap(emu, PIO_PIN);
+
+            // Core 1 runs basic ALU loop at 0x2000_0040 (bank 0).
+            setup_basic_core1_at(emu, 0x2000_0040);
+            let core1_stack_top: u32 = 0x2008_2000;
+            emu.core_mut(1).regs.msp = core1_stack_top;
+            emu.core_mut(1).regs.r[13] = core1_stack_top;
+        }
+        Workload::FpuHeavy => {
+            setup_fpu_heavy_core0(emu);
+            emu.core_mut(1).halt();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows thread-priority + affinity shims
+// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
 #[allow(non_camel_case_types)]
@@ -118,7 +411,6 @@ fn main() {
     let sys_clk_hz = clock_mhz * 1_000_000;
     let core = parse_arg("--core").unwrap_or(2) as usize;
     let unpaced = std::env::args().any(|a| a == "--unpaced");
-    let dual_core = std::env::args().any(|a| a == "--dual-core");
     let workload = parse_workload().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -132,12 +424,6 @@ fn main() {
         eprintln!("error: --cycles requires --unpaced (paced mode is duration-driven)");
         std::process::exit(1);
     }
-    if dual_core && workload == Workload::FpuHeavy {
-        // Keep the FPU-heavy workload single-core for a clean host-cycles/emu-cycle
-        // reading; dual-core contends on the shared bus and muddies the metric.
-        eprintln!("error: --workload fpu-heavy is not supported with --dual-core");
-        std::process::exit(1);
-    }
 
     // Raise priority and pin to a specific core to minimise OS preemption.
     // Uses HIGH_PRIORITY_CLASS (not REALTIME) to stay safe — won't block kernel threads.
@@ -149,78 +435,22 @@ fn main() {
     #[cfg(not(target_os = "windows"))]
     let _ = core;
 
-    // --- Set up emulator with the selected SRAM workload ---
+    // --- Set up emulator + selected workload ---
     let mut emu = Emulator::new(Config {
         sys_clk_hz,
         ..Default::default()
     });
-
-    match workload {
-        Workload::Basic => {
-            // Write workload: MOVS R0,#1 | ADDS R0,R0,#1 then B .-2 (back to ADDS)
-            emu.poke(0x20000000, 0x1C40_2001);
-            emu.poke(0x20000004, 0x0000_E7FD);
-        }
-        Workload::FpuHeavy => {
-            // FPU hot-path workload — exercises VADD/VMUL/VDIV/VSQRT plus the
-            // loop branch. Total loop length: 4 T32 FPU ops (16 bytes) + 1 T16
-            // backward branch (2 bytes) = 18 bytes = 9 halfwords.
-            let (va0, va1) = enc_vadd(3, 1, 2);   // VADD  S3, S1, S2
-            let (vm0, vm1) = enc_vmul(3, 3, 1);   // VMUL  S3, S3, S1
-            let (vd0, vd1) = enc_vdiv(3, 3, 2);   // VDIV  S3, S3, S2
-            let (vs0, vs1) = enc_vsqrt(3, 3);     // VSQRT S3, S3
-            emu.poke(0x20000000, pair(va0, va1));
-            emu.poke(0x20000004, pair(vm0, vm1));
-            emu.poke(0x20000008, pair(vd0, vd1));
-            emu.poke(0x2000000C, pair(vs0, vs1));
-            // B .-20 back to 0x20000000 (PC at B is 0x20000010, PC+4 = 0x20000014,
-            // target = 0x20000000, imm11 = -10 = 0x7F6 → hw = 0xE7F6).
-            emu.poke(0x20000010, 0x0000_E7F6);
-        }
-    }
-
-    // Core 0: run from SRAM
-    emu.core_mut(0).regs.set_pc(0x20000000);
-    emu.core_mut(0).regs.xpsr = 1 << 24; // Thumb bit
-    emu.core_mut(0).regs.msp = 0x2008_0000;
-    emu.core_mut(0).regs.r[13] = 0x2008_0000;
-
-    if workload == Workload::FpuHeavy {
-        // Seed the FPU sources so the steady-state is finite and well-behaved
-        // (no NaN/Inf churn that would distort timing). Pick values that
-        // cycle without overflow:
-        //   S1 = 2.0, S2 = 3.0
-        //   VADD S3 = 5.0 ; VMUL S3 = 10.0 ; VDIV S3 ≈ 3.333 ; VSQRT S3 ≈ 1.826
-        emu.core_mut(0).regs.s[1] = 2.0;
-        emu.core_mut(0).regs.s[2] = 3.0;
-    }
-
-    if dual_core {
-        // Core 1: running its own loop at a different SRAM address
-        // (different bank to avoid confounding bus contention with perf measurement)
-        emu.poke(0x20001000, 0x1C49_2101); // MOVS R1, #1 | ADDS R1, R1, #1
-        emu.poke(0x20001004, 0x0000_E7FD); // B .-2 (back to ADDS)
-        emu.core_mut(1).regs.set_pc(0x20001000);
-        emu.core_mut(1).regs.xpsr = 1 << 24;
-        emu.core_mut(1).regs.msp = 0x2007_0000;
-        emu.core_mut(1).regs.r[13] = 0x2007_0000;
-    } else {
-        // Core 1: halted
-        emu.core_mut(1).halt();
-    }
+    setup(&mut emu, workload);
 
     // --- Set up pacer ---
     let mut pacer = Pacer::with_quantum(sys_clk_hz, quantum.into());
     let stats = pacer.stats();
 
-    let core_mode = if dual_core { "dual-core" } else { "single-core" };
-    let workload_str = match workload {
-        Workload::Basic => "basic",
-        Workload::FpuHeavy => "fpu-heavy",
-    };
+    let core_mode = if workload.is_dual_core() { "dual-core" } else { "single-core" };
+    let pio_mode = if workload.needs_pio() { " + PIO0 SM0 wrap" } else { "" };
     println!(
-        "mdrp2350 paced benchmark — target {} MHz, quantum {} cycles, {}, workload {}",
-        clock_mhz, quantum, core_mode, workload_str
+        "mdrp2350 paced benchmark — target {} MHz, quantum {} cycles, {}, workload {}{}",
+        clock_mhz, quantum, core_mode, workload.as_str(), pio_mode,
     );
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
     println!("{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
@@ -275,6 +505,7 @@ fn main() {
     let wall_secs = start.elapsed().as_secs_f64();
     println!("\n--- summary ---");
     println!("Duration:       {:.1} s", wall_secs);
+    println!("Workload:       {}", workload.as_str());
 
     if unpaced {
         let mhz = unpaced_cycles as f64 / wall_secs / 1_000_000.0;
@@ -285,7 +516,6 @@ fn main() {
         let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / unpaced_cycles as f64;
         println!("Total cycles:   {}", unpaced_cycles);
         println!("Avg MHz:        {:.1}", mhz);
-        println!("Workload:       {}", workload_str);
         println!("Host/emu cycle: {:.2} (target: <33 per HLD §12)", host_cycles_per_emu);
         if host_cycles_per_emu < 33.0 {
             println!("Budget:         OK ({:.2} < 33)", host_cycles_per_emu);
@@ -361,7 +591,9 @@ fn parse_workload() -> Result<Workload, String> {
             return match_workload(v);
         }
         if a == "--workload" {
-            let v = args.get(i + 1).ok_or("--workload requires basic|fpu-heavy")?;
+            let v = args
+                .get(i + 1)
+                .ok_or("--workload requires basic|peripheral|contention|stress|fpu-heavy")?;
             return match_workload(v);
         }
     }
@@ -371,9 +603,12 @@ fn parse_workload() -> Result<Workload, String> {
 fn match_workload(s: &str) -> Result<Workload, String> {
     match s {
         "basic" => Ok(Workload::Basic),
+        "peripheral" => Ok(Workload::Peripheral),
+        "contention" => Ok(Workload::Contention),
+        "stress" => Ok(Workload::Stress),
         "fpu-heavy" => Ok(Workload::FpuHeavy),
         other => Err(format!(
-            "invalid --workload '{other}' (expected basic|fpu-heavy)"
+            "invalid --workload '{other}' (expected basic|peripheral|contention|stress|fpu-heavy)"
         )),
     }
 }
