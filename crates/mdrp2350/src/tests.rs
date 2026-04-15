@@ -5662,6 +5662,20 @@ fn test_busfault_on_unmapped_access() {
     assert_ne!(emu.bus.ppb[0].cfsr & (1 << 9), 0, "PRECISERR should be set");
 }
 
+/// BKPT must halt the core. The silicon oracles (`silicon_isr_diff_*`,
+/// `silicon_cycle_oracle_*`) place a `BKPT #0` at the end of every
+/// scenario's handler/main and poll `is_halted()` for end-of-test —
+/// pre-fix, BKPT was a Phase-1 NOP stub, so handler bodies ran off into
+/// the literal pool and HardFaulted, over-stacking the original
+/// exception frame. Matches probe-rs/debugger semantics on real silicon.
+#[test]
+fn test_bkpt_halts_core() {
+    let (mut c, mut bus) = core_and_bus();
+    assert!(!c.is_halted(), "core not halted before BKPT");
+    c.execute_one_with_bus(0xBE00, &mut bus); // BKPT #0
+    assert!(c.is_halted(), "BKPT must halt the core");
+}
+
 // ============================================================================
 // Asynchronous exception dispatch (PendSV / SysTick / NMI)
 // ============================================================================

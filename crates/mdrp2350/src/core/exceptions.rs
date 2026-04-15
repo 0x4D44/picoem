@@ -632,9 +632,11 @@ mod tests {
         bus.write32(VT_BASE + 8,  HANDLER_VEC); // NMI       (exc 2)
         bus.write32(VT_BASE + 12, HANDLER_VEC); // HardFault (exc 3)
         bus.write32(VT_BASE + 16, HANDLER_VEC); // MemManage (exc 4)
-        // BKPT 0 (0xBE00) at the handler address — we don't execute it in
-        // these unit tests, but it makes the handler well-defined.
-        bus.write32(HANDLER_ADDR, 0x0000_BE00);
+        // `B .` (0xE7FE) at the handler address — keeps the handler
+        // well-defined without halting (BKPT halts via the debugger
+        // semantic). Tests that exercise step-after-entry rely on the
+        // handler being a no-op-equivalent.
+        bus.write32(HANDLER_ADDR, 0x0000_E7FE);
 
         (cpu, bus)
     }

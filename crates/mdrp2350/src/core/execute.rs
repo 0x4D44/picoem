@@ -718,7 +718,11 @@ impl CortexM33 {
                 if pop_pc { 1 + count + 3 } else { 1 + count }
             }
             0b1110 => {
-                // BKPT #imm8 — stub: treat as NOP for Phase 1
+                // BKPT #imm8 — halt the core for debugger inspection.
+                // Matches probe-rs semantics on real silicon (debugger
+                // attached) and the end-of-scenario sentinel that the
+                // silicon ISR / cycle oracles poll via `is_halted()`.
+                self.halted = true;
                 1
             }
             0b1111 => {
