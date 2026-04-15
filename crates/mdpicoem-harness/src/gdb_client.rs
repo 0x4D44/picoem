@@ -72,11 +72,156 @@ impl QemuProfile {
 // ============================================================================
 // QemuProcess — manages the QEMU child process lifetime
 // ============================================================================
+//
+// Lifetime guarantee: the QEMU child must die when the parent (this) process
+// exits — for *any* reason. The cooperative path is the explicit
+// `child.kill()` + `child.wait()` in `Drop::drop` below; this fires on
+// normal return, `?`-propagated errors, and panic-unwind.
+//
+// On Windows the workspace runs with `panic = "abort"` in release, which
+// skips `Drop` entirely. External `TerminateProcess` (taskkill /F, sibling
+// agents, Defender) bypasses userspace too. For both of these the safety
+// net is a Windows Job Object created with
+// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assigned to the spawned QEMU:
+// when the parent dies abnormally, the kernel closes the parent's handle
+// to the Job, the Job tears down every process inside it, and QEMU is
+// killed without any userspace involvement.
+//
+// Field declaration order matters: `_job` must drop *after* `child` so that
+// in the cooperative path QEMU is already gone before the Job handle closes.
+
+#[cfg(windows)]
+mod job {
+    //! Windows Job Object glue for `QemuProcess`.
+    //!
+    //! Best-effort: any failure here logs to stderr but does NOT fail the
+    //! spawn — the cooperative `Drop` path remains the primary kill, and
+    //! the Job is insurance for the abnormal-exit case.
+
+    use std::process::Child;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    /// RAII wrapper around a Win32 Job Object handle.
+    ///
+    /// Closing the last handle to a Job created with
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` causes the kernel to terminate
+    /// every process assigned to the Job.
+    pub(super) struct JobHandle(HANDLE);
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was returned by a successful
+            // `CreateJobObjectW` and has not been closed yet.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Wrap `child` in a kill-on-close Job Object.
+    ///
+    /// Any failure is logged to stderr; we return `None` and let the
+    /// caller proceed without the safety net — the cooperative kill in
+    /// `Drop::drop` is still wired, so the only behaviour we lose is
+    /// kernel-enforced cleanup on abnormal exit. We deliberately do NOT
+    /// fail the spawn for a Win32 edge case that would never be the
+    /// user's fault.
+    pub(super) fn assign_to_kill_on_close_job(child: &Child) -> Option<JobHandle> {
+        // SAFETY: see comments inline. All Win32 calls are documented to
+        // accept the arguments we pass.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() || job == INVALID_HANDLE_VALUE {
+                eprintln!(
+                    "warning: CreateJobObjectW failed (errno {}); QEMU child \
+                     will not be kernel-cleaned on abnormal parent exit",
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+            let job = JobHandle(job);
+
+            // Configure kill-on-close.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation = JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..std::mem::zeroed()
+            };
+            let info_size =
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+            let ok = SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                info_size,
+            );
+            if ok == 0 {
+                eprintln!(
+                    "warning: SetInformationJobObject failed (errno {}); \
+                     QEMU child will not be kernel-cleaned on abnormal parent exit",
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+
+            // Open the child with the rights needed for AssignProcessToJobObject.
+            let proc_handle = OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                FALSE,
+                child.id(),
+            );
+            if proc_handle.is_null() {
+                eprintln!(
+                    "warning: OpenProcess(child={}) failed (errno {}); \
+                     QEMU child will not be kernel-cleaned on abnormal parent exit",
+                    child.id(),
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+
+            let assigned = AssignProcessToJobObject(job.0, proc_handle);
+            // We only needed the process handle long enough to call Assign;
+            // the kernel keeps the assignment alive via the Job itself.
+            CloseHandle(proc_handle);
+
+            if assigned == 0 {
+                eprintln!(
+                    "warning: AssignProcessToJobObject failed (errno {}); \
+                     QEMU child will not be kernel-cleaned on abnormal parent exit",
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+
+            Some(job)
+        }
+    }
+}
 
 /// Owns a QEMU child process. Kills it on drop.
+///
+/// On Windows the spawned child is also assigned to a kill-on-close Job
+/// Object — see the module-level comment above.
 pub struct QemuProcess {
     child: Child,
     profile: QemuProfile,
+    /// Windows-only. Field exists purely so its `Drop` runs (which closes
+    /// the last handle to the Job, triggering kernel cleanup). Declared
+    /// **last** so it drops *after* `child` in the abnormal-exit case
+    /// where the explicit `Drop::drop` did not run cooperatively.
+    #[cfg(windows)]
+    _job: Option<job::JobHandle>,
 }
 
 impl QemuProcess {
@@ -144,7 +289,35 @@ impl QemuProcess {
                 }
             })?;
 
-        Ok(Self { child, profile })
+        Self::from_child(child, profile)
+    }
+
+    /// Wrap an already-spawned child process in a `QemuProcess`.
+    ///
+    /// Public so integration tests can construct a `QemuProcess` around a
+    /// stand-in child (e.g. `ping` / `sleep`) without going through the
+    /// full QEMU command-line. Production callers should use [`spawn`] /
+    /// [`spawn_with`] instead.
+    #[doc(hidden)]
+    pub fn from_child(child: Child, profile: QemuProfile) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let _job = job::assign_to_kill_on_close_job(&child);
+            Ok(Self { child, profile, _job })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self { child, profile })
+        }
+    }
+
+    /// Returns the OS-level PID of the child for test assertions.
+    ///
+    /// Hidden from production callers; tests use this to verify the child
+    /// disappears after `Drop`.
+    #[doc(hidden)]
+    pub fn child_id(&self) -> u32 {
+        self.child.id()
     }
 
     /// Returns the profile used to spawn this QEMU instance. Useful for
@@ -156,6 +329,13 @@ impl QemuProcess {
 
 impl Drop for QemuProcess {
     fn drop(&mut self) {
+        // Cooperative fast path: kill QEMU immediately and reap the zombie.
+        // On Windows the Job handle closes after this returns (field drop
+        // order: child first, then `_job`); QEMU is already dead by then.
+        // In abnormal-exit paths where this does not run (panic-abort,
+        // external TerminateProcess), the kernel closes the parent's Job
+        // handle as part of process teardown, which kills QEMU via
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

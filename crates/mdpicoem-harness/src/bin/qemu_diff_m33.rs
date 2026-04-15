@@ -18,6 +18,8 @@
 //                                              are QEMU-oracled; CP0/CP4/CP5/CP7 are
 //                                              validated via softfloat_diff/unit tests.
 
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mdpicoem_harness::gdb_client::{sanity_check, GdbClient, QemuProcess};
@@ -29,10 +31,32 @@ const BKPT_BYTES: [u8; 2] = [0x00, 0xBE];
 /// Vector table base address (secure alias of ssram-0).
 const VECTOR_TABLE_BASE: u32 = 0x1000_0000;
 
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("fatal: {e}");
-        std::process::exit(2);
+/// Set by the Ctrl-C handler. Polled at fuzz-loop checkpoints; never
+/// inspected from the handler itself (handlers must not call
+/// `process::exit` — that would skip `QemuProcess`'s `Drop` and re-open
+/// the very leak this HLD closes).
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Returns true once the user has requested shutdown via Ctrl-C.
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+fn main() -> ExitCode {
+    // Best-effort Ctrl-C handler: flips a flag the main loop polls. If the
+    // OS rejects the install (rare; unsupported platform, already-installed
+    // handler), keep going — the cooperative `Drop` and the Job Object will
+    // still keep QEMU off the GDB port on normal exit.
+    if let Err(e) = ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst)) {
+        eprintln!("warning: failed to install Ctrl-C handler: {e}");
+    }
+
+    match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -126,7 +150,7 @@ fn parse_args() -> Result<Args, String> {
 // Main runner
 // ============================================================================
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = parse_args()?;
 
     // 1. Spawn QEMU

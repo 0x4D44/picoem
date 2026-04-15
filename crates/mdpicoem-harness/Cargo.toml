@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.18.2"
+version = "0.18.3"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,18 @@ mdrp2040 = { path = "../mdrp2040" }
 probe-rs = "0.31"
 rand = "0.8"
 chrono = "0.4"
+ctrlc = "3"
+
+# Windows-only: Job Object handles for kernel-enforced parent->child
+# lifetime on QEMU children spawned by `QemuProcess`. Pinned to the same
+# major version (0.61) already used transitively via probe-rs to avoid
+# pulling a second copy.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
 
 # Dev-only: re-declare `mdrp2350` with the `test-hooks` feature so
 # unit tests can call `PioBlock::push_rx` for staging RX FIFO words
@@ -21,6 +33,20 @@ chrono = "0.4"
 [dev-dependencies]
 mdrp2350 = { path = "../mdrp2350", features = ["test-hooks"] }
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
+
+# L1/L2/L3 integration tests for the QemuProcess child-cleanup path
+# need `OpenProcess` / `WaitForSingleObject` / `TerminateProcess` to
+# query and kill processes. Pinned to the same major already in the
+# tree (see [target.cfg(windows).dependencies] above).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+# L1 integration test on Unix uses `libc::kill(pid, 0)` to query liveness.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 # ---------------------------------------------------------------------------
 # RP2350 (Cortex-M33) binaries
@@ -90,3 +116,12 @@ path = "src/bin/paced_bench_rp2040.rs"
 [[bin]]
 name = "picogus_diff_rp2040"
 path = "src/bin/picogus_diff_rp2040.rs"
+
+# ---------------------------------------------------------------------------
+# Test-only helper binaries (used by integration tests; not for production)
+# ---------------------------------------------------------------------------
+
+[[bin]]
+name = "test_helper_job_object"
+path = "src/bin/test_helper_job_object.rs"
+test = false
