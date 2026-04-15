@@ -361,10 +361,10 @@ fn test_pio_spi_clk_mosi() {
 
     // SM0_PINCTRL:
     //   out_base=0 (MOSI on pin 0), out_count=1
-    //   set_base=0, set_count=1
+    //   set_base=0, set_count=2 (covers both MOSI at pin 0 and CLK at pin 1)
     //   sideset_base=1 (CLK on pin 1), sideset_count=1
     let pinctrl = (1u32 << 29)   // sideset_count=1
-                | (1u32 << 26)   // set_count=1
+                | (2u32 << 26)   // set_count=2
                 | (1u32 << 20)   // out_count=1
                 | (1u32 << 10)   // sideset_base=1
                 | (0u32 << 5)    // set_base=0
@@ -375,13 +375,12 @@ fn test_pio_spi_clk_mosi() {
     let execctrl = (4u32 << 12) | (0u32 << 7);
     pio_write(&mut emu, 0x0CC, execctrl);
 
-    // Force-execute SET PINDIRS, 3 to enable output on pins 0 and 1.
-    // But SET PINDIRS uses set_base/set_count from pinctrl. We have
-    // set_count=1, set_base=0, so SET PINDIRS,1 only enables pin 0.
-    // We need pin 1 (CLK) enabled too. Side-set pins get their OE
-    // set automatically by merge_pin_outputs when sideset_count > 0.
-    // So we only need to force-enable pin 0 direction:
-    pio_write(&mut emu, 0x0D8, 0xE081); // SET PINDIRS, 1
+    // Force-execute SET PINDIRS, 3 — bits[1:0] drive the direction
+    // latch for the two SET pins starting at SET_BASE=0: pin 0 (MOSI)
+    // and pin 1 (CLK). Silicon requires explicit PINDIRS programming
+    // for side-set pins to drive; side-set with SIDE_PINDIR=0 writes
+    // pin values only, not directions (RP2350 §11.3.2.3).
+    pio_write(&mut emu, 0x0D8, 0xE083); // SET PINDIRS, 3
 
     // Push 0x55 to TX FIFO
     pio_write(&mut emu, 0x010, 0x55);

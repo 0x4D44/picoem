@@ -79,6 +79,24 @@ impl PioBlock {
         self.sm_enabled_mask != 0
     }
 
+    /// Read-only view of the 32-entry instruction memory. RP2350
+    /// `INSTR_MEM` is write-only via the register interface, so test
+    /// harnesses use this accessor to verify programs were loaded.
+    pub fn instr_mem(&self) -> &[u16; 32] {
+        &self.instr_mem
+    }
+
+    /// Test-only: push a word directly into SM `sm`'s RX FIFO. Only
+    /// available when the crate is built with `--features test-hooks`
+    /// (or under `#[cfg(test)]`). Enables cross-crate tests that need
+    /// to stage RX words without reaching into `pub(crate)` state.
+    ///
+    /// Returns `true` on success, `false` if the FIFO is full.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn push_rx(&mut self, sm: usize, word: u32) -> bool {
+        self.sm[sm].rx_fifo.push(word)
+    }
+
     /// Enable or disable state machine `i`, maintaining the cached
     /// `sm_enabled_mask` invariant. Every enable-state transition
     /// re-merges pin outputs so that a just-disabled SM's stuck pin
@@ -173,9 +191,11 @@ impl PioBlock {
                     // Side-set controls pin directions
                     oe = (oe & !positioned_mask) | (sm.sideset_dirs & positioned_mask);
                 } else {
-                    // Side-set controls pin values (normal mode)
+                    // Side-set controls pin values (normal mode). Per RP2350
+                    // §11.3.2.3, value-drive side-set does NOT contribute to
+                    // pad_oe; pin direction is owned by SET/OUT/MOV PINDIRS
+                    // (already merged into `oe` via `shared_pin_dirs` above).
                     out = (out & !positioned_mask) | (sm.sideset_pins & positioned_mask);
-                    oe |= positioned_mask; // side-set pins are always output-enabled
                 }
             }
         }
@@ -1520,6 +1540,131 @@ mod tests {
         assert_eq!(
             pio.pad_oe, 0,
             "disabling the last SM must clear pad_oe on the same tick"
+        );
+    }
+
+    // ====================================================================
+    // Side-set pad_oe — RP2350 §11.3.2.3 compliance
+    // ====================================================================
+
+    #[test]
+    fn side_set_value_drive_does_not_force_oe() {
+        // With EXECCTRL.SIDE_PINDIR=0 (value-drive), side-set writes pin
+        // values only; pad_oe must stay zero absent an explicit PINDIRS
+        // programming. Reproduces the tech-debt scenario from
+        // `silicon_periph_diff_rp2350::pio0_side_set_toggle`.
+        let mut pio = PioBlock::new();
+        // PINCTRL: SIDESET_COUNT=1, SIDESET_BASE=0
+        pio.sm[0].pinctrl = 1u32 << 29;
+        // EXECCTRL: SIDE_EN=0, SIDE_PINDIR=0 (value-drive)
+        pio.sm[0].execctrl = 0;
+        // JMP 0, side 1 (side-set bit in [12]=1, delay 0, JMP addr=0)
+        pio.instr_mem[0] = 0x1000;
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 1;
+        pio.sm[0].clkdiv_frac = 0;
+
+        pio.step(0);
+
+        // Side-set drove the VALUE on pin 0 …
+        assert_ne!(
+            pio.pad_out & 1,
+            0,
+            "side-set pin 0 value should be driven high"
+        );
+        // … but DID NOT force the direction.
+        assert_eq!(
+            pio.pad_oe & 1,
+            0,
+            "side-set value-drive must not set pad_oe without PINDIRS"
+        );
+    }
+
+    #[test]
+    fn side_set_direction_drive_still_sets_oe() {
+        // Regression guard: EXECCTRL.SIDE_PINDIR=1 (direction-drive) must
+        // continue to set pad_oe for the side-set pin — this path is
+        // unchanged by the fix.
+        let mut pio = PioBlock::new();
+        pio.sm[0].pinctrl = 1u32 << 29; // SIDESET_COUNT=1
+        pio.sm[0].execctrl = 1u32 << 29; // SIDE_PINDIR=1
+        pio.instr_mem[0] = 0x1000; // JMP 0, side 1
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 1;
+        pio.sm[0].clkdiv_frac = 0;
+
+        pio.step(0);
+
+        // Side-set wrote the DIRECTION bit via sideset_dirs;
+        // merge_pin_outputs ORs sideset_dirs & positioned_mask into oe.
+        assert_ne!(
+            pio.pad_oe & 1,
+            0,
+            "SIDE_PINDIR=1 must still set pad_oe for the side-set pin"
+        );
+    }
+
+    #[test]
+    fn set_pindirs_drives_oe_without_side_set() {
+        // Confirms the non-side-set PINDIRS path still works — the fix
+        // leans on `shared_pin_dirs` (populated by SET/OUT/MOV PINDIRS)
+        // being the sole source of pad_oe for side-set pins.
+        let mut pio = PioBlock::new();
+        pio.set_sm_enabled(0, true);
+        // PINCTRL: SET_COUNT=1, SET_BASE=0
+        pio.sm[0].pinctrl = (1u32 << 26) | (0u32 << 5);
+        // SET PINDIRS, 1  (opcode=111, dest=100, data=00001) = 0xE081
+        pio.write32(0x0D8, 0xE081, 0);
+
+        pio.step(0);
+
+        assert_ne!(
+            pio.pad_oe & 1,
+            0,
+            "SET PINDIRS, 1 with SET_BASE=0 must drive pad_oe bit 0"
+        );
+    }
+
+    #[test]
+    fn side_set_after_pindirs_keeps_oe() {
+        // Composite: firmware uses SET PINDIRS to establish direction,
+        // then side-set toggles values. The PINDIRS-established OE must
+        // persist across the side-set (bidirectional-bus / open-drain
+        // pattern).
+        let mut pio = PioBlock::new();
+        // PINCTRL: SIDESET_COUNT=1, SIDESET_BASE=0,
+        //          SET_COUNT=1, SET_BASE=0
+        pio.sm[0].pinctrl = (1u32 << 29) | (1u32 << 26);
+        // EXECCTRL: SIDE_EN=0, SIDE_PINDIR=0, WRAP_TOP=31 (default-style
+        // full-memory wrap so PC advances 0→1 between ticks instead of
+        // wrapping back to 0).
+        pio.sm[0].execctrl = 0x1Fu32 << 12;
+        // Program:
+        //   addr 0: SET PINDIRS, 1  (enable pin 0 as output)
+        //   addr 1: NOP, side 1     (MOV Y, Y with side=1 — drives pin 0 high)
+        pio.instr_mem[0] = 0xE081; // SET PINDIRS, 1
+        pio.instr_mem[1] = 0xA042 | (1 << 12); // MOV Y,Y + side=1
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 1;
+        pio.sm[0].clkdiv_frac = 0;
+
+        pio.step(0); // SET PINDIRS, 1 → shared_pin_dirs bit 0 = 1
+        assert_ne!(
+            pio.pad_oe & 1,
+            0,
+            "OE established by SET PINDIRS on tick 1"
+        );
+
+        pio.step(0); // NOP side 1 → sideset_pins bit 0 = 1; oe stays set
+        assert_ne!(
+            pio.pad_oe & 1,
+            0,
+            "OE from PINDIRS must persist across side-set value write"
+        );
+        assert_ne!(
+            pio.pad_out & 1,
+            0,
+            "side-set drove the value high on tick 2"
         );
     }
 }

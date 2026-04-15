@@ -154,6 +154,9 @@ const O_PIO0_SIDE_SET_TOGGLE: &[(u32, u32)] = &[
     // read 0 here post-gate — included for conceptual completeness
     // and to catch a future emulator regression that leaks pad_oe
     // past the gate, but it is NOT the bug-exposing signal today.
+    // Status: FIXED 2026-04-15 — `merge_pin_outputs` no longer forces
+    // OE in the value-drive branch; bug-exposing `GPIO_IN` divergence
+    // below is now resolved. Scenario retained as regression guard.
     (PIO0_BASE + PIO_DBG_PADOE_OFF, 0xFFFF_FFFF),
     // FDEBUG TXSTALL/TXOVER bands [27:24] + [19:16] — a healthy
     // side-set loop keeps both zero.
