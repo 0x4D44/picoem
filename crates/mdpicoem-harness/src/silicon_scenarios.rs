@@ -142,40 +142,60 @@ const S_PIO0_SIDE_SET_TOGGLE: &[(u32, u32)] = &[
     (PIO0_BASE + PIO_CTRL_OFF + ALIAS_SET, 0x0000_0001),
 ];
 const O_PIO0_SIDE_SET_TOGGLE: &[(u32, u32)] = &[
-    // PRIMARY SIGNAL. `DBG_PADOE` is the PIO-side output-enable mirror
-    // (PIO0 + 0x040). With EXECCTRL.SIDE_PINDIR=0 and no explicit
-    // `SET PINDIRS`, RP2350 §11.3.2.3 says side-set drives pin values
-    // only — direction stays zero. Emulator's `PioBlock::update_pads`
-    // currently ORs the positioned side-set mask into `pad_oe`
-    // unconditionally (see `mdpicoem-common/src/pio/mod.rs:196`), so
-    // HW=0 / EMU=1 here is the load-bearing divergence.
+    // `DBG_PADOE` is the PIO-side output-enable mirror (PIO0 + 0x040).
+    // Per RP2350 §11.3.2.3, with `EXECCTRL.SIDE_PINDIR=0` and no
+    // explicit `SET PINDIRS`, side-set drives pin *values* only —
+    // direction stays zero. Silicon correctly reports `pad_oe=0`; the
+    // emulator's `PioBlock::merge_pin_outputs` (see
+    // `crates/mdpicoem-common/src/pio/mod.rs:196`) ORs the positioned
+    // side-set mask into `pad_oe` while SMs run, but the runner's gate
+    // write (`PIO_CTRL=0`) disables all SMs before readback, and
+    // `merge_pin_outputs` then zeroes `pad_oe` again. So both sides
+    // read 0 here post-gate — included for conceptual completeness
+    // and to catch a future emulator regression that leaks pad_oe
+    // past the gate, but it is NOT the bug-exposing signal today.
     (PIO0_BASE + PIO_DBG_PADOE_OFF, 0xFFFF_FFFF),
-    // Corroboration: FDEBUG TXSTALL/TXOVER bands [27:24] + [19:16] — a
-    // healthy side-set loop keeps both zero.
+    // FDEBUG TXSTALL/TXOVER bands [27:24] + [19:16] — a healthy
+    // side-set loop keeps both zero.
     (PIO0_BASE + PIO_FDEBUG_OFF, 0x0F0F_0000),
-    // Corroboration only — `observe_pins` below samples the SIO-side
-    // OE/IN latches through `SIO_GPIO_OE` / `SIO_GPIO_IN`. These mirror
-    // bus state and trivially agree regardless of which peripheral is
-    // driving, so they corroborate but do not themselves expose the
-    // bug. The primary signal is `DBG_PADOE` above.
+    // The load-bearing signal lives in `observe_pins` below: SIO-side
+    // `GPIO_OE` / `GPIO_IN` at `0xD000_0030` / `0xD000_0004`. These
+    // reflect the output-fabric state, and the side-set `pad_oe` bug
+    // leaks through into `GPIO_IN`'s level bit — HW reads 0 (tri-
+    // state), EMU reads 1 (driven-high from side-set). That is the
+    // divergence this scenario catches.
 ];
 
-// S4: PIO0 RESETS gating — 2-instruction program (NOP + JMP 0) so
-// ADDR alternates 0↔1 while running. Re-asserting PIO0 reset *after*
-// starting SM0 should freeze ADDR on silicon (RP2350 holds PIO inert
-// while RESETS bit is set). The emulator currently ticks PIO
-// regardless of RESETS (tech-debt "PIO not gated on RESETS bit") so a
-// broken emu keeps alternating during `emu.run(actual_sysclks)` and
-// terminates at `actual_sysclks % 2`; a correctly-gated emu stays at
-// its post-setup ADDR (0). Silicon's ADDR at gate time is a function
-// of probe-rs setup latency (HW runs real sysclks between each MMIO
-// write), so HW lands at either 0 or 1.
+// S4: PIO0 RESETS gating — PLACEHOLDER.
 //
-// This is an imperfect oracle: if EMU (broken) and HW happen to land
-// on the same parity, the bug hides for that run. Acceptable as a
-// best-effort signal — the ~50% exposure rate is strictly better than
-// the prior 1-instruction design's 0% exposure.
-const S_PIO0_RESET_GATING: &[(u32, u32)] = &[
+// Intent: assert PIO0 reset mid-run and verify the SM freezes, which
+// tests the tech-debt item "PIO not gated on RESETS bit" (both
+// mdrp2350 and mdrp2040 tick PIO unconditionally regardless of
+// RESETS). The original 1-instruction design (JMP 0) couldn't
+// exercise the bug because ADDR=0 is invariant. The devils-advocate
+// reviewer proposed upgrading to a 2-instruction program (NOP + JMP
+// 0) so ADDR alternates 0↔1 and a broken emu (ticking PIO while
+// gated) lands at `actual_sysclks % 2`, while a correctly-gated emu
+// stays at its post-setup ADDR.
+//
+// Empirical result (2026-04-15 run): this still PASSes on silicon
+// with the 2-instruction program. HW settles at ADDR=0 (setup writes
+// are fast enough on probe-rs that PIO hasn't advanced from 0 by the
+// time the RESETS_SET write lands), and the measured
+// `actual_sysclks=158` is even, so broken-EMU also lands at ADDR=0.
+// A longer program (3+ states) has the same modular-agreement
+// hazard, and `actual_sysclks` is determined by sled pipelining on
+// silicon — not controllable to force a mismatch.
+//
+// Verdict: the scenario as designed cannot reliably expose the bug.
+// Kept in the catalog as a placeholder so the tech-debt target
+// stays visible and the next scenario redesign has an entry point.
+// Proper future design: either poll ADDR *while* the gate is held
+// (requires mid-run probe sampling, not end-state diff), or
+// arrange a program whose reset-frozen state is architecturally
+// distinct from any transient running state (tricky on PIO given
+// that ADDR is the only non-FIFO state observable externally).
+const S_PIO0_RESET_GATING_PLACEHOLDER: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
     (pio_instr_mem_addr(PIO0_BASE, 0), 0xA042), // NOP (MOV Y, Y)
     (pio_instr_mem_addr(PIO0_BASE, 1), 0x0000), // JMP 0
@@ -184,8 +204,8 @@ const S_PIO0_RESET_GATING: &[(u32, u32)] = &[
     // Slam PIO0 back into reset after SM is running.
     (RESETS_RESET + ALIAS_SET, RESET_PIO0),
 ];
-const O_PIO0_RESET_GATING: &[(u32, u32)] = &[
-    // SM_ADDR (5-bit). Divergence here = gating broken.
+const O_PIO0_RESET_GATING_PLACEHOLDER: &[(u32, u32)] = &[
+    // SM_ADDR (5-bit). Can false-PASS — see scenario comment above.
     (pio_sm_addr(PIO0_BASE, 0, PIO_SM_ADDR_OFF), 0x1F),
 ];
 
@@ -230,10 +250,10 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe_pins: 0x0000_0001,
     },
     PeriphScenario {
-        name: "pio0_reset_gating",
-        setup: S_PIO0_RESET_GATING,
+        name: "pio0_reset_gating_placeholder",
+        setup: S_PIO0_RESET_GATING_PLACEHOLDER,
         max_sysclks: 200,
-        observe: O_PIO0_RESET_GATING,
+        observe: O_PIO0_RESET_GATING_PLACEHOLDER,
         observe_pins: 0,
     },
     PeriphScenario {

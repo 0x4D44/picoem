@@ -130,6 +130,8 @@ These surfaced during Phase 5.A code review. The emulator compiles and Phase 5.A
 
 `crates/mdrp2040/src/bus/clocks.rs` forces `PLL_SYS_CS[31]` (LOCK) to 1 on read so firmware wait-for-lock loops fall through on the first poll. If firmware writes `FBDIV_INT=0` and then polls LOCK, it will observe LOCK=1 but the derived `pll_output_hz` returns 0 (so the clock tree is 0 Hz). Partial mitigation: callers reading `sys_clk_hz` see the zero propagation. Proper modelling: LOCK=1 only when `pll_output_hz` > 0 (and/or only after a configured lock-delay). Low priority.
 
+**Confirmed present on mdrp2350** (2026-04-15) via `silicon_periph_diff_rp2350` `pll_sys_lock_timing` scenario — `crates/mdrp2350/src/bus/peripherals.rs:21` forces CS[31]=1 unconditionally regardless of CS.ENABLE, PWR, or settle time. Same fix applies.
+
 ### RP2040 core 1 SDK handshake not parsed
 
 `crates/mdrp2040/src/lib.rs` `maybe_wake_core1` wakes core 1 at its current reset-vector PC on any non-zero FIFO push by core 0. The real Pico SDK `multicore_launch_core1` sends a six-word handshake (0, 0, 1, VTOR, SP, entry) which the bootrom on core 1 parses before jumping. Our emulator ignores VTOR/SP/entry — any real SDK-based multicore firmware will either fault (bad SP) or land at the wrong entry. Fix in Phase 6: parse the six-word handshake in the SIO FIFO path and drive `core 1 wake + SP/PC/VTOR` from the handshake words.
@@ -183,6 +185,33 @@ disabled before RESETS is de-asserted stays disabled anyway, so this is
 a safe simplification — but firmware that expects a mid-execution SM to
 freeze on RESETS assert will diverge. mdrp2350 carries the same
 behaviour.
+
+### PIO side-set drives pad_oe without PINDIRS
+
+`crates/mdpicoem-common/src/pio/mod.rs:196` unconditionally ORs the
+positioned side-set mask into `pad_oe` when `EXECCTRL.SIDE_PINDIR=0`,
+but per RP2350 §11.3.2.3 side-set with `SIDE_PINDIR=0` drives pin
+*values* only — pin direction is controlled by `SET PINDIRS` / `OUT
+PINDIRS` or by `SIDE_PINDIR=1`. The emulator's behaviour is
+equivalent to "side-set always forces OE=1 for its pins", which is
+wrong.
+
+Impact: any scenario that writes `PINCTRL.SIDESET_COUNT>0` with no
+explicit `PINDIRS` programming sees phantom drive on the side-set
+pins. Real firmware that relies on tri-state side-set signals (e.g.
+bidirectional data buses with direction managed separately) will
+behave differently on silicon.
+
+Reproducer: configure SM0 with `PINCTRL.SIDESET_COUNT=1`, `EXECCTRL=0`
+(SIDE_EN=0, SIDE_PINDIR=0), load `JMP 0, side 1` at slot 0, enable,
+step once, assert `pad_oe==0` — fails today because line 196 forces
+the side-set bit into `pad_oe`.
+
+Surfaced by `silicon_periph_diff_rp2350::pio0_side_set_toggle`
+scenario (2026-04-15). Fix is local to `PioBlock::update_pads`:
+either drop the `oe |= positioned_mask` in the value-drive branch, or
+track an explicit per-SM "pin-direction set by PINDIRS" mask and OR
+only that. Medium priority.
 
 ## Phase 6 Simplifications (Harness split)
 
