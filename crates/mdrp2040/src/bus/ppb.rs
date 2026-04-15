@@ -119,17 +119,22 @@ impl Ppb {
     /// * `AIRCR`    at `0xE000_ED0C` — stub (VECTKEY echoes 0x05FA).
     /// * `SHPR2/3`  at `0xE000_ED1C/20` (SHPR1 is RAZ on M0+).
     /// Other offsets read-as-zero.
+    ///
+    /// Addresses are decoded by `addr & 0xFFFF`, matching mdrp2350's
+    /// idiom — the top nibble (0xE) is already guaranteed by the bus
+    /// region decoder, and bits [27:16] are all zero for the SCB
+    /// window, so the low 16 bits uniquely identify the register.
     pub fn read32(&self, addr: u32) -> u32 {
-        match addr & 0x0FFF_FFFF {
-            0x000E_D000 => 0x410C_C601, // CPUID: Cortex-M0+ r0p1
-            0x000E_D004 => self.icsr,
-            0x000E_D008 => self.vtor,
-            0x000E_D00C => 0xFA05_0000, // AIRCR stub
-            0x000E_D01C => {
+        match addr & 0xFFFF {
+            0xED00 => 0x410C_C601, // CPUID: Cortex-M0+ r0p1
+            0xED04 => self.icsr,
+            0xED08 => self.vtor,
+            0xED0C => 0xFA05_0000, // AIRCR stub (VECTKEY echo)
+            0xED1C => {
                 // SHPR2 covers exceptions 8..11 (SVCall at byte 3).
                 (self.shpr[7] as u32) << 24
             }
-            0x000E_D020 => {
+            0xED20 => {
                 // SHPR3 covers exceptions 12..15 (PendSV byte 2, SysTick byte 3).
                 ((self.shpr[10] as u32) << 16) | ((self.shpr[11] as u32) << 24)
             }
@@ -139,8 +144,8 @@ impl Ppb {
 
     /// Write a 32-bit PPB register.
     pub fn write32(&mut self, addr: u32, val: u32) {
-        match addr & 0x0FFF_FFFF {
-            0x000E_D004 => {
+        match addr & 0xFFFF {
+            0xED04 => {
                 // ICSR: PENDSVSET / PENDSVCLR / PENDSTSET / PENDSTCLR
                 // are W1S/W1C bits; Phase 5.A stores the raw value so
                 // firmware round-trips, honouring clear bits as well.
@@ -157,12 +162,12 @@ impl Ppb {
                     self.icsr |= 1 << 26;
                 }
             }
-            0x000E_D008 => self.vtor = val,
-            0x000E_D01C => {
+            0xED08 => self.vtor = val,
+            0xED1C => {
                 // SHPR2: byte 3 → SVCall priority (exception 11 → idx 7).
                 self.shpr[7] = ((val >> 24) & 0xFF) as u8;
             }
-            0x000E_D020 => {
+            0xED20 => {
                 // SHPR3: byte 2 → PendSV (exc 14 → idx 10),
                 //         byte 3 → SysTick (exc 15 → idx 11).
                 self.shpr[10] = ((val >> 16) & 0xFF) as u8;
@@ -176,5 +181,53 @@ impl Ppb {
 impl Default for Ppb {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpuid_read_returns_m0plus_r0p1() {
+        let ppb = Ppb::default();
+        // Cortex-M0+ r0p1 CPUID constant per ARM DDI 0484C §B3.2.3.
+        assert_eq!(ppb.read32(0xE000_ED00), 0x410C_C601);
+    }
+
+    #[test]
+    fn vtor_roundtrip_through_memory_mapped_path() {
+        // Regression for the Phase-2 mask/pattern bug: Phase 1's
+        // direct_boot_from_flash set the field, but pico-sdk's
+        // get_vtable() reads VTOR via 0xE000_ED08 and saw 0.
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED08, 0x1000_0100);
+        assert_eq!(ppb.read32(0xE000_ED08), 0x1000_0100);
+    }
+
+    #[test]
+    fn icsr_pendsvset_is_sticky_through_read32() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED04, 1 << 28); // PENDSVSET
+        assert_eq!(ppb.read32(0xE000_ED04) & (1 << 28), 1 << 28);
+    }
+
+    #[test]
+    fn aircr_stub_returns_vectkey_echo() {
+        // SDK reset code reads AIRCR to preserve VECTKEYSTAT; stub returns
+        // 0xFA05_0000 so a subsequent RMW writes a valid VECTKEY of 0x05FA.
+        let ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_ED0C), 0xFA05_0000);
+    }
+
+    #[test]
+    fn shpr3_roundtrip_pendsv_and_systick() {
+        let mut ppb = Ppb::default();
+        // byte 2 = PendSV (exc 14 → idx 10), byte 3 = SysTick (exc 15 → idx 11)
+        let val = (0xC0u32 << 16) | (0x80u32 << 24);
+        ppb.write32(0xE000_ED20, val);
+        assert_eq!(ppb.read32(0xE000_ED20), val);
+        assert_eq!(ppb.shpr[10], 0xC0);
+        assert_eq!(ppb.shpr[11], 0x80);
     }
 }

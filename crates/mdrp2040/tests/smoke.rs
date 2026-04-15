@@ -80,5 +80,11 @@ fn direct_boot_from_flash_applies_vector_table() {
     // and would otherwise read garbage out of the bootrom region.
     assert_eq!(emu.bus.ppb[0].vtor, 0x1000_0100);
     assert_eq!(emu.bus.ppb[1].vtor, 0x1000_0100);
+    // Integration oracle: the SDK reads VTOR through the memory-mapped
+    // 0xE000_ED08 path via get_vtable(). Phase 1 set the field correctly,
+    // but the PPB match in read32 was masking 28 bits then comparing a
+    // pattern-style constant, so every SCB read fell through to 0. This
+    // assertion proves the end-to-end path is wired up.
+    assert_eq!(emu.bus.read32(0xE000_ED08), 0x1000_0100);
     assert!(emu.cores[1].is_halted());
 }

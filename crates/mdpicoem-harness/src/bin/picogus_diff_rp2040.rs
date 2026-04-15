@@ -838,7 +838,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         const SDK_VTOR_FLASH_OFFSET: u32 = 0x100;
         let sp_at_vtor = emu.bus.memory.xip_read32(SDK_VTOR_FLASH_OFFSET);
         let pc_at_vtor = emu.bus.memory.xip_read32(SDK_VTOR_FLASH_OFFSET + 4);
-        let sp_in_sram = (0x2000_0000..0x2004_2000).contains(&sp_at_vtor);
+        // Top-of-SRAM initial SP (0x2004_2000) is the canonical pico-sdk
+        // value — one past the last valid SRAM byte, since Thumb pushes
+        // pre-decrement. Use an inclusive range so it's accepted.
+        let sp_in_sram = (0x2000_0000..=0x2004_2000).contains(&sp_at_vtor);
         let pc_in_flash = (0x1000_0000..0x1020_0000).contains(&(pc_at_vtor & !1));
         if sp_in_sram && pc_in_flash {
             emu.direct_boot_from_flash(SDK_VTOR_FLASH_OFFSET);
