@@ -150,6 +150,12 @@ impl Emulator {
     /// `while` predicate never fires and the core is skipped cheaply.
     pub fn step(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
+        // Refresh the Bus's view of the master cycle count so any MMIO
+        // reads / writes performed during this quantum (notably PLL CS
+        // lock bit + lock-arm transitions — see
+        // `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` §6 P2)
+        // observe a current cycle. Staleness is bounded by one quantum.
+        self.bus.master_cycle = self.clock.cycles;
         let target = self.clock.cycles + self.step_quantum as u64;
 
         // Core 0 first, then core 1. `bus.active_core` must be set so that
@@ -304,6 +310,10 @@ impl Emulator {
     /// INSTR_MEM, configuring SIO GPIO_OE/_OUT, releasing RESETS bits,
     /// etc., without hand-rolling the bus machinery.
     pub fn mmio_write32(&mut self, addr: u32, value: u32) {
+        // Mirror the `step()` stash so PLL write-time lock-arm transitions
+        // observe the current cycle count when the harness pokes MMIO
+        // outside the step path. See HLD §6 P2.
+        self.bus.master_cycle = self.clock.cycles;
         self.bus.write32(addr, value);
     }
 
@@ -318,6 +328,9 @@ impl Emulator {
     /// are for confirmation only and should be chosen carefully to avoid
     /// disturbing the peripheral's state.
     pub fn mmio_read32(&mut self, addr: u32) -> u32 {
+        // Mirror the `step()` stash so PLL CS reads observe the current
+        // cycle count when the harness reads MMIO outside the step path.
+        self.bus.master_cycle = self.clock.cycles;
         self.bus.read32(addr)
     }
 }

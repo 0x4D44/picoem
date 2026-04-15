@@ -6761,14 +6761,16 @@ fn test_pll_sys_reset_values() {
 
 #[test]
 fn test_pll_cs_read_forces_lock_bit() {
-    // CS reads must return `stored | (1 << 31)` — so the LOCK bit is
-    // always present even though the stored value is just 0x01.
+    // Post-`2026.04.15 HLD - PLL LOCK Modelling` fix: CS[31] is no longer
+    // forced. At Bus::new() reset, PWR=0x2D (PD+VCOPD set) and FBDIV=0,
+    // so `pll_is_locked_base` is false and CS reads return the stored
+    // value with LOCK=0. Pre-fix this asserted `0x8000_0001`; that
+    // assertion was locking in the known bug (see tech_debt.md).
     let mut bus = Bus::new();
     let cs_read = bus.read32(0x4005_0000);
-    assert_eq!(cs_read, 0x8000_0001,
-        "CS read must force LOCK (bit 31) on top of the stored REFDIV=1");
-    // Masking out LOCK should give back the stored value.
-    assert_eq!(cs_read & !(1 << 31), 0x01);
+    assert_eq!(cs_read, 0x0000_0001,
+        "CS read at reset must NOT force LOCK — PLL is powered down, FBDIV=0");
+    assert_eq!(cs_read & (1 << 31), 0, "LOCK=0 at reset");
 }
 
 #[test]
@@ -6782,6 +6784,201 @@ fn test_pll_sys_write_set_alias_subword() {
     bus.write8(0x4005_A004, 0x40);
     assert_eq!(bus.pll_usb_regs[1], 0x6D,
         "byte-wide SET alias on PLL_USB PWR must OR, not overwrite");
+}
+
+// ============================================================================
+// PLL LOCK modelling — see `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md`
+// ============================================================================
+//
+// Twelve integration tests exercising CS[31] read and write-time lock-arm
+// transitions through `Bus::read32` / `Bus::write32`. `bus.master_cycle`
+// is seeded directly on the Bus (a `pub(crate)` field) between writes and
+// reads; the Emulator's step entry stashes this value from `Clock::cycles`
+// in production, but tests bypass that plumbing to exercise the Bus path
+// in isolation.
+
+use mdpicoem_common::clocks::PLL_LOCK_DELAY_SYSCLKS;
+
+#[test]
+fn test_pll_cs_read_lock_zero_at_reset() {
+    // At `Bus::new()`, PWR=0x2D (PD+VCOPD set) and FBDIV=0 → base
+    // predicate is false ⇒ CS[31] must read 0 regardless of cycle.
+    let mut bus = Bus::new();
+    let cs = bus.read32(0x4005_0000);
+    assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 at reset");
+}
+
+#[test]
+fn test_pll_cs_lock_zero_before_arm() {
+    // Power up the PLL and configure FBDIV. Immediately after the write,
+    // `lock_at_cycle = now + PLL_LOCK_DELAY_SYSCLKS`; reading CS before
+    // that arm must yield LOCK=0.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);    // FBDIV_INT = 100
+    bus.write32(0x4005_0004, 0);      // PWR = 0 (fully powered up)
+    bus.master_cycle = 100;
+    let cs = bus.read32(0x4005_0000);
+    assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 before arm cycle");
+}
+
+#[test]
+fn test_pll_cs_lock_one_after_arm() {
+    // Same sequence, but read after the arm expiry.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);    // FBDIV_INT = 100
+    bus.write32(0x4005_0004, 0);      // PWR = 0
+    bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+    let cs = bus.read32(0x4005_0000);
+    assert_ne!(cs & (1 << 31), 0, "LOCK must be 1 past arm cycle");
+}
+
+#[test]
+fn test_pll_cs_lock_zero_with_pd_set() {
+    // PD only, FBDIV=100 — PD gate wins regardless of cycle count.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);
+    bus.write32(0x4005_0004, 0x01);   // PWR = 0x01 (PD only)
+    bus.master_cycle = 10_000;
+    let cs = bus.read32(0x4005_0000);
+    assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while PD=1");
+}
+
+#[test]
+fn test_pll_cs_lock_zero_with_vcopd_set() {
+    // VCOPD only (PD clear), FBDIV=100 — VCOPD gate wins.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);
+    bus.write32(0x4005_0004, 0x20);   // PWR = 0x20 (VCOPD only)
+    bus.master_cycle = 10_000;
+    let cs = bus.read32(0x4005_0000);
+    assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while VCOPD=1");
+}
+
+#[test]
+fn test_pll_cs_lock_zero_with_fbdiv_zero() {
+    // PWR=0, FBDIV=0 — unconfigured PLL; predicate false.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0004, 0);      // PWR = 0
+    // FBDIV stays at reset value of 0.
+    bus.master_cycle = 10_000;
+    let cs = bus.read32(0x4005_0000);
+    assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 when FBDIV=0");
+}
+
+#[test]
+fn test_pll_cs_lock_rearm_after_powerdown() {
+    // Power up, pass the arm, observe LOCK=1; re-assert PD+VCOPD → LOCK=0
+    // on next read. Confirms we are NOT on a one-shot latch path
+    // (Option B from the HLD drops the arm on any write landing in
+    // "not powered / not configured" territory).
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);
+    bus.write32(0x4005_0004, 0);      // power up
+    bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+    let cs1 = bus.read32(0x4005_0000);
+    assert_ne!(cs1 & (1 << 31), 0, "LOCK must be 1 after initial lock");
+
+    bus.write32(0x4005_0004, 0x21);   // PD+VCOPD set → drop lock
+    let cs2 = bus.read32(0x4005_0000);
+    assert_eq!(cs2 & (1 << 31), 0, "LOCK must drop when power-down re-asserts");
+}
+
+#[test]
+fn test_pll_cs_bypass_does_not_force_lock() {
+    // Set BYPASS (CS[8]=1) with PWR=0 and FBDIV=100 but read before the
+    // arm elapses — BYPASS must not short-circuit LOCK. Matches
+    // conservative "BYPASS doesn't assert LOCK" interpretation (HLD §2).
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0000, 0x101);  // CS: REFDIV=1 | BYPASS=1
+    bus.write32(0x4005_0008, 100);    // FBDIV = 100
+    bus.write32(0x4005_0004, 0);      // PWR = 0
+    bus.master_cycle = 100;           // still well before arm
+    let cs = bus.read32(0x4005_0000);
+    assert_eq!(cs & (1 << 31), 0, "BYPASS must not force LOCK=1");
+}
+
+#[test]
+fn test_pll_cs_read_preserves_refdiv() {
+    // Write CS with REFDIV=5, power up, pass the arm → LOCK=1 AND
+    // REFDIV bits preserved in the read-back.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0000, 0x05);   // REFDIV = 5
+    bus.write32(0x4005_0008, 100);
+    bus.write32(0x4005_0004, 0);
+    bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+    let cs = bus.read32(0x4005_0000);
+    assert_eq!(cs & 0x3F, 5, "REFDIV must round-trip");
+    assert_ne!(cs & (1 << 31), 0, "LOCK must be 1");
+}
+
+#[test]
+fn test_pll_cs_alias_writes_trigger_arm() {
+    // Exercise SET / CLR alias writes and confirm the arm transition
+    // fires at the PWR CLR (which flips the predicate true), not the
+    // CS SET (which leaves the PLL powered down).
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);    // FBDIV = 100 (predicate still
+                                      // false because PWR is still 0x2D)
+    assert_eq!(bus.pll_sys_lock_at_cycle, None,
+        "FBDIV write must not arm while PLL is powered down");
+
+    // SET alias on CS: OR 0x01 (no visible change — REFDIV already 1).
+    bus.write32(0x4005_2000, 0x01);
+    assert_eq!(bus.pll_sys_lock_at_cycle, None,
+        "CS SET alias must not arm while PLL is powered down");
+
+    bus.master_cycle = 100;
+    // CLR alias on PWR: clear all power-down bits.
+    bus.write32(0x4005_3004, 0x2D);
+    assert_eq!(bus.pll_sys_lock_at_cycle, Some(100 + PLL_LOCK_DELAY_SYSCLKS),
+        "PWR CLR alias must arm the lock at now + delay");
+}
+
+#[test]
+fn test_pll_prim_write_does_not_rearm() {
+    // Establish an arm, then write PRIM (POSTDIV1/2). The arm point
+    // must NOT move — PRIM is post-VCO.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);
+    bus.write32(0x4005_0004, 0);
+    let armed_at = bus.pll_sys_lock_at_cycle;
+    assert_eq!(armed_at, Some(PLL_LOCK_DELAY_SYSCLKS));
+
+    bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+    // Read once to confirm LOCK=1 baseline.
+    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0);
+
+    // Write PRIM to a different POSTDIV combination.
+    bus.write32(0x4005_000C, (2u32 << 16) | (2u32 << 12));
+    assert_eq!(bus.pll_sys_lock_at_cycle, armed_at,
+        "PRIM write must not rearm the lock-detect counter");
+    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+        "LOCK must stay 1 after PRIM-only write");
+}
+
+#[test]
+fn test_pll_usb_independent_of_pll_sys() {
+    // Arm PLL_SYS; PLL_USB should remain un-armed and read LOCK=0.
+    let mut bus = Bus::new();
+    bus.master_cycle = 0;
+    bus.write32(0x4005_0008, 100);    // PLL_SYS FBDIV
+    bus.write32(0x4005_0004, 0);      // PLL_SYS PWR = 0
+    bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+        "PLL_SYS should report LOCK=1 past arm");
+    assert_eq!(bus.read32(0x4005_8000) & (1 << 31), 0,
+        "PLL_USB must remain LOCK=0 (independent state)");
+    assert_eq!(bus.pll_usb_lock_at_cycle, None);
 }
 
 // ============================================================================
@@ -6954,3 +7151,393 @@ fn test_emulator_tick_systick_disabled_core_untouched() {
         "Disabled SysTick must not set COUNTFLAG");
 }
 
+// ============================================================================
+// Decoded-Op Cache (HLD 2026.04.14)
+//
+// The cache is exercised transparently by every existing test, so these
+// add focused coverage for the hit/miss paths, invalidation hooks, and
+// cycle-accuracy preservation on bank-2 SRAM. Internal fields are
+// `pub(crate)` so we can assert slot state directly.
+// ============================================================================
+
+/// Convert a PC into its direct-mapped cache slot index.
+fn cache_slot(pc: u32) -> usize {
+    ((pc >> 1) & 0x3FFF) as usize
+}
+
+/// Write a halfword into SRAM via the untimed memory accessor — used to
+/// seed code at a specific address before the first cache populate.
+fn place_hw_in_sram(bus: &mut crate::bus::Bus, addr: u32, hw: u16) {
+    let bytes = hw.to_le_bytes();
+    let off = addr & 0x00FF_FFFF;
+    bus.memory.sram_write8(off, bytes[0]);
+    bus.memory.sram_write8(off + 1, bytes[1]);
+}
+
+#[test]
+fn decode_cache_hit_miss_smoke() {
+    // After the first decode_execute at a PC, the slot's tag must equal
+    // the PC. A second decode_execute at the same PC takes the hit path
+    // and observes the same behaviour.
+    let (mut core, mut bus) = core_and_bus();
+
+    // NOP (MOVS R0, R0 = 0x0000, which decodes to LSLS R0, R0, #0 — pure).
+    let pc = 0x2000_0000u32;
+    place_hw_in_sram(&mut bus, pc, 0x0000);
+    place_hw_in_sram(&mut bus, pc + 2, 0x0000);
+    core.regs.set_pc(pc);
+
+    let slot = cache_slot(pc);
+    assert_eq!(bus.decode_cache[slot].tag, u32::MAX, "slot starts empty");
+
+    // First step — miss, populates.
+    core.step(&mut bus);
+    assert_eq!(bus.decode_cache[slot].tag, pc, "populate set tag");
+    assert_eq!(bus.decode_cache[slot].hw0, 0x0000);
+    assert!(bus.decode_cache[slot].is_pure(), "LSLS is classified pure");
+
+    // Second step at pc+2 — populates the next slot too.
+    core.step(&mut bus);
+    let slot2 = cache_slot(pc + 2);
+    assert_eq!(bus.decode_cache[slot2].tag, pc + 2);
+
+    // Rewind PC and step again — the first slot must be a hit (tag
+    // unchanged, no re-population).
+    core.regs.set_pc(pc);
+    let tag_before = bus.decode_cache[slot].tag;
+    core.step(&mut bus);
+    assert_eq!(bus.decode_cache[slot].tag, tag_before,
+        "second visit is a hit — tag unchanged");
+}
+
+#[test]
+fn decode_cache_invalidation_on_sram_write() {
+    // After caching, a Bus::write16 to the cached halfword must clear
+    // the slot so the next fetch picks up the new bytes.
+    let (mut core, mut bus) = core_and_bus();
+
+    let pc = 0x2000_0100u32;
+    place_hw_in_sram(&mut bus, pc, 0x0000); // LSLS R0,R0,#0 — pure
+    core.regs.set_pc(pc);
+    core.step(&mut bus);
+    assert_eq!(bus.decode_cache[cache_slot(pc)].tag, pc);
+
+    // Rewrite the halfword via the bus — must invalidate.
+    bus.write16(pc, 0x1C40); // ADDS R0, R0, #1
+    assert_eq!(bus.decode_cache[cache_slot(pc)].tag, u32::MAX,
+        "Bus::write16 to cached PC clears the slot");
+
+    // Next fetch re-populates with the new bytes.
+    core.regs.set_pc(pc);
+    core.step(&mut bus);
+    assert_eq!(bus.decode_cache[cache_slot(pc)].hw0, 0x1C40,
+        "re-populate picked up the new halfword");
+}
+
+#[test]
+fn decode_cache_invalidation_on_load_flash() {
+    // Populate the cache with an entry whose tag lies in the XIP region,
+    // then load_flash; the entry must be cleared.
+    //
+    // Pick PCs that map to *different* cache slots so the assertions on
+    // the SRAM-region entry's survival aren't confounded by a collision.
+    let mut bus = crate::bus::Bus::new();
+
+    // Fake a populated XIP-region entry directly in the cache.
+    let xip_pc = 0x1000_0002u32;   // slot 1
+    let sram_pc = 0x2000_0008u32;  // slot 4 — different slot
+    assert_ne!(cache_slot(xip_pc), cache_slot(sram_pc),
+        "test precondition: the two PCs must hash to distinct slots");
+
+    bus.decode_cache[cache_slot(xip_pc)] = crate::bus::DecodedOp {
+        tag: xip_pc,
+        hw0: 0xDEAD,
+        hw1: 0,
+        fetch_wait: 0,
+        flags: crate::bus::DecodedOp::FLAG_PURE,
+    };
+    bus.decode_cache[cache_slot(sram_pc)] = crate::bus::DecodedOp {
+        tag: sram_pc,
+        hw0: 0xBEEF,
+        hw1: 0,
+        fetch_wait: 0,
+        flags: 0,
+    };
+
+    bus.load_flash(&[0x00; 256]);
+
+    assert_eq!(bus.decode_cache[cache_slot(xip_pc)].tag, u32::MAX,
+        "XIP-region entry invalidated by load_flash");
+    assert_eq!(bus.decode_cache[cache_slot(sram_pc)].tag, sram_pc,
+        "SRAM-region entry unaffected");
+}
+
+#[test]
+fn decode_cache_wide_boundary_invalidation() {
+    // A wide instruction cached at PC=N with its hw1 at N+2. A write
+    // targeting N+2 must clear the slot at N (so the next fetch re-reads
+    // both halfwords).
+    let mut bus = crate::bus::Bus::new();
+
+    let wide_pc = 0x2000_0200u32;
+    // Populate a fake wide entry.
+    bus.decode_cache[cache_slot(wide_pc)] = crate::bus::DecodedOp {
+        tag: wide_pc,
+        hw0: 0xF000, // any wide prefix
+        hw1: 0x8000,
+        fetch_wait: 0,
+        flags: crate::bus::DecodedOp::FLAG_WIDE,
+    };
+    // Populate a narrow entry at wide_pc+2 too — it should also be
+    // cleared (the preceding-slot rule).
+    bus.decode_cache[cache_slot(wide_pc + 2)] = crate::bus::DecodedOp {
+        tag: wide_pc + 2,
+        hw0: 0x2001,
+        hw1: 0,
+        fetch_wait: 0,
+        flags: crate::bus::DecodedOp::FLAG_PURE,
+    };
+
+    // Writing a halfword at wide_pc+2 must clear the wide slot at N.
+    bus.write16(wide_pc + 2, 0xAAAA);
+    assert_eq!(bus.decode_cache[cache_slot(wide_pc)].tag, u32::MAX,
+        "write at hw1 boundary clears the wide slot at N");
+    assert_eq!(bus.decode_cache[cache_slot(wide_pc + 2)].tag, u32::MAX,
+        "write to the slot itself also clears");
+}
+
+#[test]
+fn decode_cache_bank2_fetch_wait_preserved() {
+    // Code placed in SRAM bank 2: the fetch adds +1 extra wait state on
+    // each read. The returned cycle count from decode_execute must be
+    // identical on the first (populate) and second (hit) execution.
+    let (mut core, mut bus) = core_and_bus();
+
+    // Bank 2 address: (offset >> 2) & 7 == 2 means offset 8, 40, 72, ...
+    let pc = 0x2000_0008u32;
+    // Sanity-check the bank.
+    assert_eq!(crate::memory::bank_for_address(pc), Some(2),
+        "test precondition: PC must be in bank 2");
+
+    place_hw_in_sram(&mut bus, pc, 0x0000); // LSLS R0,R0,#0 — pure, 1 cycle
+
+    // First execution: populate + execute.
+    core.regs.set_pc(pc);
+    let cycles_before = core.cycles();
+    core.step(&mut bus);
+    let c1 = core.cycles() - cycles_before;
+
+    // Second execution at same PC: cache hit + execute.
+    core.regs.set_pc(pc);
+    let cycles_mid = core.cycles();
+    core.step(&mut bus);
+    let c2 = core.cycles() - cycles_mid;
+
+    assert_eq!(c1, c2,
+        "populate and hit must return identical cycle counts for bank-2 SRAM");
+    assert!(c1 >= 2, "bank 2 fetch adds a wait state, so cycles >= 1+1");
+    assert_eq!(bus.decode_cache[cache_slot(pc)].fetch_wait, 1,
+        "fetch_wait for bank 2 is 1");
+}
+
+#[test]
+fn decode_cache_pure_path_preserves_accumulator() {
+    // A pure ALU op must not mutate bus.extra_wait_states. The
+    // debug-assert in the fast path enforces this, but we also verify
+    // externally — pollute the accumulator via a direct bank-2 read,
+    // then execute a pure op and confirm the pollution is preserved.
+    //
+    // This also exercises the "pure path doesn't touch the accumulator"
+    // contract described in HLD B §3.
+    let (mut core, mut bus) = core_and_bus();
+
+    let pc = 0x2000_0400u32;
+    place_hw_in_sram(&mut bus, pc, 0x0000); // LSLS — pure
+
+    // First populate the cache so the next step takes the pure hit path.
+    core.regs.set_pc(pc);
+    core.step(&mut bus);
+    assert!(bus.decode_cache[cache_slot(pc)].is_pure());
+
+    // Pollute the accumulator with a direct bank-2 read.
+    bus.reset_extra_wait_states();
+    let _ = bus.read16(0x2000_0008); // bank 2 — +1 wait state
+    let polluted = bus.extra_wait_states();
+    assert_eq!(polluted, 1);
+
+    // Rewind PC and step — this must be a pure cache hit that leaves
+    // the accumulator exactly as it was.
+    core.regs.set_pc(pc);
+    core.step(&mut bus);
+    assert_eq!(bus.extra_wait_states(), polluted,
+        "pure path must not touch bus.extra_wait_states");
+}
+
+#[test]
+fn decode_cache_impure_ldr_still_works() {
+    // Smoke test: a non-cached impure instruction (LDR) still executes
+    // correctly via the slow path, including after it's been cached.
+    let (mut core, mut bus) = core_and_bus();
+
+    // LDR R0, [PC, #0] — PC-relative load. 0x4800 | imm8=0 -> 0x4800.
+    let pc = 0x2000_0100u32;
+    place_hw_in_sram(&mut bus, pc, 0x4800);
+    // Literal pool at (pc & ~3) + 4 = pc + 4.
+    let literal_addr = (pc & !3).wrapping_add(4);
+    bus.write32(literal_addr, 0xDEAD_BEEF);
+
+    core.regs.set_pc(pc);
+    core.step(&mut bus);
+    assert_eq!(core.reg(0), 0xDEAD_BEEF, "LDR literal loaded expected value");
+
+    // Cache entry must be classified impure (LDR literal hits the bus).
+    assert!(!bus.decode_cache[cache_slot(pc)].is_pure(),
+        "LDR literal is impure");
+
+    // A second execution at the same PC still works.
+    core.regs.set_pc(pc);
+    core.set_reg(0, 0);
+    core.step(&mut bus);
+    assert_eq!(core.reg(0), 0xDEAD_BEEF, "hit on impure op re-executes correctly");
+}
+
+#[test]
+fn decode_cache_invalidate_all_clears_everything() {
+    // invalidate_all() must wipe every slot regardless of tag/region.
+    let mut bus = crate::bus::Bus::new();
+
+    // Pre-populate a handful of slots across regions.
+    for (i, pc) in [0x0000_0004u32, 0x1000_0008, 0x2000_0010, 0x2080_0020]
+        .iter().enumerate()
+    {
+        bus.decode_cache[cache_slot(*pc)] = crate::bus::DecodedOp {
+            tag: *pc,
+            hw0: i as u16,
+            hw1: 0,
+            fetch_wait: 0,
+            flags: 0,
+        };
+    }
+
+    bus.invalidate_all();
+
+    for pc in [0x0000_0004u32, 0x1000_0008, 0x2000_0010, 0x2080_0020] {
+        assert_eq!(bus.decode_cache[cache_slot(pc)].tag, u32::MAX,
+            "invalidate_all cleared slot for PC={:08X}", pc);
+    }
+}
+
+#[test]
+fn decode_cache_classify_is_pure_table() {
+    // Regression guard on the classify_is_pure table in core/decode.rs.
+    // Each row pins a representative opcode from one classification arm;
+    // moving an op between arms without updating this table flags the
+    // change as a test failure. Keep entries concise — encodings are
+    // verified by construction from the HLD B §1 bit layouts.
+    use crate::core::decode::classify_is_pure;
+
+    // (name, hw0, hw1, is_wide, expected_is_pure)
+    const CASES: &[(&str, u16, u16, bool, bool)] = &[
+        // --- Pure Thumb-16 ----------------------------------------------
+        ("LSLS imm (00000)",           0x0000, 0x0000, false, true),
+        ("ADD/SUB reg/imm3 (00011)",   0x1800, 0x0000, false, true),
+        ("MOV imm8 (00100)",           0x2000, 0x0000, false, true),
+        ("CMP imm8 (00101)",           0x2800, 0x0000, false, true),
+        ("DP ADC/SBC (01000, b10=0)",  0x4000, 0x0000, false, true),
+        ("ADR (10100)",                0xA000, 0x0000, false, true),
+        ("ADD SP imm (10101)",         0xA800, 0x0000, false, true),
+        ("B uncond (11100)",           0xE000, 0x0000, false, true),
+        // --- Impure Thumb-16 --------------------------------------------
+        ("BX/BLX special (01000 b10=1)", 0x4400, 0x0000, false, false),
+        ("LDR literal (01001)",          0x4800, 0x0000, false, false),
+        ("LDR reg (01010)",              0x5800, 0x0000, false, false),
+        ("STR imm (01100)",              0x6000, 0x0000, false, false),
+        ("LDM (11001)",                  0xC800, 0x0000, false, false),
+        ("SVC (11011, cond=F)",          0xDF00, 0x0000, false, false),
+        ("PUSH (misc 0100)",             0xB400, 0x0000, false, false),
+        ("POP (misc 1100)",              0xBC00, 0x0000, false, false),
+        // --- Pure Thumb-32 ----------------------------------------------
+        ("dp_modified_imm",              0xF000, 0x0000, true,  true),
+        ("dp_shifted_reg",               0xEA00, 0x0000, true,  true),
+        ("multiply",                     0xFA00, 0x0000, true,  true),
+        ("BL (branch_misc)",             0xF000, 0xD000, true,  true),
+        ("DMB (barrier)",                0xF3BF, 0x8F50, true,  true),
+        // --- Impure Thumb-32 --------------------------------------------
+        ("LDR.W (load_store_single)",    0xF850, 0x0000, true,  false),
+        ("STM.W (ldm_stm)",              0xE880, 0x0000, true,  false),
+        ("LDRD (load_store_dual)",       0xE850, 0x0000, true,  false),
+        ("VLDR (coprocessor/FPU)",       0xED50, 0x0000, true,  false),
+        ("MRC on CP7 RCP (coprocessor)", 0xEE70, 0x0000, true,  false),
+    ];
+
+    for &(name, hw0, hw1, is_wide, expected) in CASES {
+        let got = classify_is_pure(hw0, hw1, is_wide);
+        assert_eq!(got, expected,
+            "classify_is_pure({:04X}, {:04X}, wide={}) = {} for {}, expected {}",
+            hw0, hw1, is_wide, got, name, expected);
+    }
+}
+
+// ============================================================================
+// External GPIO stimulus overlay (gpio_external_in + gpio_external_mask)
+// ============================================================================
+
+/// External stimulus must dominate on masked bits and leave PIO/SIO output
+/// untouched on unmasked bits. Covers the post-review Fix #2 in the
+/// OneROM full-system harness.
+#[test]
+fn gpio_external_stimulus_overlays_masked_bits() {
+    use crate::{Emulator, Config};
+
+    let mut emu = Emulator::new(Config::default());
+
+    // Bring PIO0 out of reset so its pad_out/pad_oe updates propagate.
+    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+
+    // Force PIO0 to drive bit 0 (unmasked) high. We poke pad_out / pad_oe
+    // directly — we're only interested in what `update_gpio` composes.
+    emu.bus.pio[0].pad_oe = 0x0000_0001;
+    emu.bus.pio[0].pad_out = 0x0000_0001;
+
+    // Harness claims bit 5 and bit 10 (drive HIGH) and bit 12 (drive LOW).
+    emu.bus.gpio_external_mask = (1 << 5) | (1 << 10) | (1 << 12);
+    emu.bus.gpio_external_in = (1 << 5) | (1 << 10); // bit 12 low
+
+    // One step. Single-quantum is fine — `update_gpio` runs inside it.
+    emu.run(1);
+
+    // Bit 0: PIO-driven high.
+    assert_eq!(emu.bus.gpio_in & (1 << 0), 1 << 0, "PIO bit lost");
+    // Bits 5, 10: external stimulus high.
+    assert_eq!(emu.bus.gpio_in & (1 << 5), 1 << 5, "ext bit 5 lost");
+    assert_eq!(emu.bus.gpio_in & (1 << 10), 1 << 10, "ext bit 10 lost");
+    // Bit 12: masked to 0 regardless of what SIO/PIO say.
+    assert_eq!(emu.bus.gpio_in & (1 << 12), 0, "ext bit 12 forced low");
+    // Untouched bits stay 0.
+    assert_eq!(
+        emu.bus.gpio_in & !((1 << 0) | (1 << 5) | (1 << 10) | (1 << 12)),
+        0,
+        "unexpected bits set in gpio_in"
+    );
+}
+
+/// External mask of 0 (default) must leave legacy behaviour unchanged —
+/// `gpio_in` is whatever SIO + PIO produce.
+#[test]
+fn gpio_external_mask_zero_is_noop() {
+    use crate::{Emulator, Config};
+
+    let mut emu = Emulator::new(Config::default());
+    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+
+    emu.bus.pio[0].pad_oe = 0x0000_00FF;
+    emu.bus.pio[0].pad_out = 0x0000_005A;
+
+    // No external stimulus.
+    emu.bus.gpio_external_mask = 0;
+    emu.bus.gpio_external_in = 0xFFFF_FFFF; // set but masked out
+
+    emu.run(1);
+
+    assert_eq!(emu.bus.gpio_in, 0x0000_005A, "legacy update_gpio path broken");
+}

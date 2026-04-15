@@ -2197,3 +2197,189 @@ mod external_gpio_override {
         assert_eq!(emu.bus.external_gpio_in_override, 0);
     }
 }
+
+// ============================================================================
+// PLL LOCK modelling — see `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md`
+// ============================================================================
+//
+// Twelve integration tests mirroring the mdrp2350 set. PLL_SYS lives at
+// 0x4002_8000 and PLL_USB at 0x4002_C000 on RP2040 (compare the mdrp2350
+// 0x4005_0000 / 0x4005_8000 layout); alias bits are the same `+0x1000/0x2000/0x3000`
+// APB convention. `bus.master_cycle` is seeded directly between writes
+// and reads — Emulator::step stashes it from Clock::cycles in production.
+
+mod pll_lock {
+    use crate::bus::Bus;
+    use crate::bus::PLL_SYS_BASE;
+    use crate::bus::PLL_USB_BASE;
+    use mdpicoem_common::clocks::PLL_LOCK_DELAY_SYSCLKS;
+
+    const CS_OFF: u32 = 0x00;
+    const PWR_OFF: u32 = 0x04;
+    const FBDIV_OFF: u32 = 0x08;
+    const PRIM_OFF: u32 = 0x0C;
+    const ALIAS_XOR: u32 = 0x1000;
+    const ALIAS_SET: u32 = 0x2000;
+    const ALIAS_CLR: u32 = 0x3000;
+
+    #[inline]
+    fn pll_sys(offset: u32) -> u32 { PLL_SYS_BASE + offset }
+    #[inline]
+    fn pll_usb(offset: u32) -> u32 { PLL_USB_BASE + offset }
+
+    #[test]
+    fn test_pll_cs_read_lock_zero_at_reset() {
+        let mut bus = Bus::new();
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 at reset");
+    }
+
+    #[test]
+    fn test_pll_cs_lock_zero_before_arm() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0);
+        bus.master_cycle = 100;
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 before arm cycle");
+    }
+
+    #[test]
+    fn test_pll_cs_lock_one_after_arm() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0);
+        bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_ne!(cs & (1 << 31), 0, "LOCK must be 1 past arm cycle");
+    }
+
+    #[test]
+    fn test_pll_cs_lock_zero_with_pd_set() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0x01); // PD only
+        bus.master_cycle = 10_000;
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while PD=1");
+    }
+
+    #[test]
+    fn test_pll_cs_lock_zero_with_vcopd_set() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0x20); // VCOPD only
+        bus.master_cycle = 10_000;
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while VCOPD=1");
+    }
+
+    #[test]
+    fn test_pll_cs_lock_zero_with_fbdiv_zero() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(PWR_OFF), 0);
+        bus.master_cycle = 10_000;
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 when FBDIV=0");
+    }
+
+    #[test]
+    fn test_pll_cs_lock_rearm_after_powerdown() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0);
+        bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+        let cs1 = bus.read32(pll_sys(CS_OFF));
+        assert_ne!(cs1 & (1 << 31), 0, "LOCK must be 1 after initial lock");
+
+        bus.write32(pll_sys(PWR_OFF), 0x21); // PD+VCOPD set
+        let cs2 = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs2 & (1 << 31), 0, "LOCK must drop when power-down re-asserts");
+    }
+
+    #[test]
+    fn test_pll_cs_bypass_does_not_force_lock() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(CS_OFF), 0x101); // REFDIV=1 | BYPASS=1
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0);
+        bus.master_cycle = 100;
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs & (1 << 31), 0, "BYPASS must not force LOCK=1");
+    }
+
+    #[test]
+    fn test_pll_cs_read_preserves_refdiv() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(CS_OFF), 0x05);
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0);
+        bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+        let cs = bus.read32(pll_sys(CS_OFF));
+        assert_eq!(cs & 0x3F, 5, "REFDIV must round-trip");
+        assert_ne!(cs & (1 << 31), 0, "LOCK must be 1");
+    }
+
+    #[test]
+    fn test_pll_cs_alias_writes_trigger_arm() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        assert_eq!(bus.pll_sys_lock_at_cycle, None,
+            "FBDIV write must not arm while PLL is powered down");
+
+        // SET alias on CS: OR 0x01 (no visible change — REFDIV already 1).
+        bus.write32(pll_sys(CS_OFF) + ALIAS_SET, 0x01);
+        assert_eq!(bus.pll_sys_lock_at_cycle, None,
+            "CS SET alias must not arm while PLL is powered down");
+        // Reference ALIAS_XOR to keep the alias alphabet in the test body
+        // (avoids dead_code warnings and documents the three-alias shape).
+        let _ = ALIAS_XOR;
+
+        bus.master_cycle = 100;
+        bus.write32(pll_sys(PWR_OFF) + ALIAS_CLR, 0x2D);
+        assert_eq!(bus.pll_sys_lock_at_cycle, Some(100 + PLL_LOCK_DELAY_SYSCLKS),
+            "PWR CLR alias must arm the lock at now + delay");
+    }
+
+    #[test]
+    fn test_pll_prim_write_does_not_rearm() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0);
+        let armed_at = bus.pll_sys_lock_at_cycle;
+        assert_eq!(armed_at, Some(PLL_LOCK_DELAY_SYSCLKS));
+
+        bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+        assert_ne!(bus.read32(pll_sys(CS_OFF)) & (1 << 31), 0);
+
+        bus.write32(pll_sys(PRIM_OFF), (2u32 << 16) | (2u32 << 12));
+        assert_eq!(bus.pll_sys_lock_at_cycle, armed_at,
+            "PRIM write must not rearm the lock-detect counter");
+        assert_ne!(bus.read32(pll_sys(CS_OFF)) & (1 << 31), 0,
+            "LOCK must stay 1 after PRIM-only write");
+    }
+
+    #[test]
+    fn test_pll_usb_independent_of_pll_sys() {
+        let mut bus = Bus::new();
+        bus.master_cycle = 0;
+        bus.write32(pll_sys(FBDIV_OFF), 100);
+        bus.write32(pll_sys(PWR_OFF), 0);
+        bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
+        assert_ne!(bus.read32(pll_sys(CS_OFF)) & (1 << 31), 0,
+            "PLL_SYS should report LOCK=1 past arm");
+        assert_eq!(bus.read32(pll_usb(CS_OFF)) & (1 << 31), 0,
+            "PLL_USB must remain LOCK=0 (independent state)");
+        assert_eq!(bus.pll_usb_lock_at_cycle, None);
+    }
+}

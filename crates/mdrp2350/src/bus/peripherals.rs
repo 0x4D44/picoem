@@ -1,4 +1,5 @@
 use super::Bus;
+use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
 /// Map a PLL register offset (`0x000`, `0x004`, `0x008`, `0x00C`) to
 /// its index in a `[u32; 4]` register image. Returns `None` for
@@ -13,12 +14,14 @@ fn pll_reg_index(offset: u32) -> Option<usize> {
     }
 }
 
-/// Read a PLL register, forcing the LOCK bit (`CS[31]`) on the CS
-/// register so firmware poll loops succeed immediately. Shared
-/// between PLL_SYS and PLL_USB.
-fn pll_read_from(regs: &[u32; 4], offset: u32) -> u32 {
+/// Read a PLL register. For CS (offset 0x000), the LOCK bit (`CS[31]`)
+/// is derived from `(regs, lock_at, now)` via
+/// `mdpicoem_common::clocks::pll_cs_read_with_lock` — see
+/// `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md`. Other offsets
+/// return the raw stored value.
+fn pll_read_from(regs: &[u32; 4], offset: u32, lock_at: Option<u64>, now: u64) -> u32 {
     match pll_reg_index(offset) {
-        Some(0) => regs[0] | (1 << 31), // CS: always report LOCK=1
+        Some(0) => pll_cs_read_with_lock(regs, lock_at, now),
         Some(i) => regs[i],
         None => 0,
     }
@@ -207,24 +210,49 @@ impl Bus {
     // --- PLL_SYS (0x40050000) / PLL_USB (0x40058000) ---
     //
     // Both PLLs share the same register layout: CS (0x000), PWR (0x004),
-    // FBDIV_INT (0x008), PRIM (0x00C). We always force the LOCK bit
-    // (CS[31]) so firmware polling for lock succeeds on the first read
-    // — see LLD V2 §9 risk 2 for the known fidelity gap.
+    // FBDIV_INT (0x008), PRIM (0x00C). CS[31] (LOCK) is derived from
+    // register image + `pll_*_lock_at_cycle` + `master_cycle` on each read;
+    // writes consult `pll_should_arm_lock` to rearm / drop the arm per
+    // HLD §4. See `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md`.
     pub(crate) fn pll_sys_read(&self, offset: u32) -> u32 {
-        pll_read_from(&self.pll_sys_regs, offset)
+        pll_read_from(
+            &self.pll_sys_regs,
+            offset,
+            self.pll_sys_lock_at_cycle,
+            self.master_cycle,
+        )
     }
 
     pub(crate) fn pll_sys_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let old_regs = self.pll_sys_regs;
         pll_write_into(&mut self.pll_sys_regs, offset, val, alias);
+        self.pll_sys_lock_at_cycle = pll_should_arm_lock(
+            &old_regs,
+            &self.pll_sys_regs,
+            self.pll_sys_lock_at_cycle,
+            self.master_cycle,
+        );
         self.recompute_clock_tree();
     }
 
     pub(crate) fn pll_usb_read(&self, offset: u32) -> u32 {
-        pll_read_from(&self.pll_usb_regs, offset)
+        pll_read_from(
+            &self.pll_usb_regs,
+            offset,
+            self.pll_usb_lock_at_cycle,
+            self.master_cycle,
+        )
     }
 
     pub(crate) fn pll_usb_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let old_regs = self.pll_usb_regs;
         pll_write_into(&mut self.pll_usb_regs, offset, val, alias);
+        self.pll_usb_lock_at_cycle = pll_should_arm_lock(
+            &old_regs,
+            &self.pll_usb_regs,
+            self.pll_usb_lock_at_cycle,
+            self.master_cycle,
+        );
         self.recompute_clock_tree();
     }
 
@@ -291,9 +319,13 @@ mod tests {
 
     #[test]
     fn test_pll_locked() {
+        // Post-`2026.04.15 HLD - PLL LOCK Modelling` fix: at reset PWR=0x2D
+        // (PD+VCOPD set), FBDIV=0 → lock base predicate is false, CS[31]
+        // must read 0. This inverts the pre-fix assertion, which was
+        // locking in the known bug (see tech_debt.md).
         let mut bus = Bus::new();
         let cs = bus.read32(0x4005_0000);
-        assert_ne!(cs & (1 << 31), 0, "LOCK bit should be set");
+        assert_eq!(cs & (1 << 31), 0, "LOCK bit must be 0 at reset (PLL unpowered)");
     }
 
     #[test]

@@ -236,11 +236,16 @@ impl Default for RoscRegs {
 //   0x0C PRIM (POSTDIV1 in [18:16], POSTDIV2 in [14:12]).
 //
 // Reset values per RP2040 SVD:
-//   CS = 0x0000_0001 (REFDIV = 1, LOCK = 0 — forced to 1 on read for
-//   firmware convenience).
+//   CS = 0x0000_0001 (REFDIV = 1, LOCK = 0).
 //   PWR = 0x0000_002D (powered down).
 //   FBDIV_INT = 0.
 //   PRIM = 0x0007_7000 (POSTDIV1 = 7, POSTDIV2 = 7).
+//
+// CS[31] (LOCK) is now derived from register image + per-PLL arm state +
+// master cycle count via `mdpicoem_common::clocks::pll_cs_read_with_lock`
+// at the Bus dispatch layer; `pll_read` below returns the raw stored CS
+// value (bit 31 reflects whatever was written, i.e. 0 at reset). See
+// `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md`.
 
 /// PLL register image stored as `[CS, PWR, FBDIV_INT, PRIM]`.
 pub type PllRegs = [u32; 4];
@@ -258,11 +263,11 @@ fn pll_reg_index(offset: u32) -> Option<usize> {
     }
 }
 
-/// Read a PLL register, forcing CS[31] (LOCK) high so firmware lock-poll
-/// loops fall through immediately.
+/// Read a raw PLL register word. CS[31] (LOCK) is returned exactly as
+/// stored — Bus-level dispatch overlays the modelled lock status via
+/// `mdpicoem_common::clocks::pll_cs_read_with_lock`.
 pub fn pll_read(regs: &PllRegs, offset: u32) -> u32 {
     match pll_reg_index(offset) {
-        Some(0) => regs[0] | (1 << 31),
         Some(i) => regs[i],
         None => 0,
     }
@@ -385,9 +390,14 @@ mod tests {
 
     #[test]
     fn pll_forces_lock_bit_on_read() {
+        // Post-`2026.04.15 HLD - PLL LOCK Modelling` fix: `pll_read`
+        // now returns the raw stored CS value. CS[31] is only set when
+        // the Bus dispatch layer composes it from (regs, lock_at, now)
+        // via `pll_cs_read_with_lock`. See the clocks.rs top-of-file
+        // comment for the architectural note.
         let regs: PllRegs = [0; 4];
         let cs = pll_read(&regs, 0x00);
-        assert_ne!(cs & (1 << 31), 0, "CS[31] LOCK must read as 1");
+        assert_eq!(cs & (1 << 31), 0, "CS[31] must not be forced — raw read");
     }
 
     #[test]

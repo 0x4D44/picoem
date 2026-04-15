@@ -99,6 +99,9 @@ impl Emulator {
         self.bus.rosc_regs.reset();
         self.bus.pll_sys_regs = bus::clocks::PLL_RESET;
         self.bus.pll_usb_regs = bus::clocks::PLL_RESET;
+        self.bus.pll_sys_lock_at_cycle = None;
+        self.bus.pll_usb_lock_at_cycle = None;
+        self.bus.master_cycle = 0;
         self.bus.clock_tree = Default::default();
         self.bus.io_bank0.reset();
         self.bus.pads_bank0.reset();
@@ -159,6 +162,38 @@ impl Emulator {
         self.bus.load_flash(data);
     }
 
+    /// Direct-boot into an SDK-style firmware by reading the vector table
+    /// at `vtor_offset` within flash (typically `0x100` for pico-sdk).
+    /// Override both cores' SP with word 0 of the vector, PC with word 1
+    /// (Thumb bit stripped), and park core 1 halted as `reset()` does.
+    ///
+    /// Why this exists — the real RP2040 B2 bootrom detects an attached
+    /// QSPI flash chip by sampling six QSPI pads via `SIO GPIO_HI_IN`
+    /// (offset `0x008`) and validates boot2 by CRC of the first 252
+    /// flash bytes read through the SSI peripheral. Our emulator stubs
+    /// SSI and has no QSPI pad model, so the bootrom (correctly) gives
+    /// up and enters USB MSC boot mode, where it waits forever for a
+    /// UF2 drop. This helper bypasses the check: it takes the same
+    /// "here is SP, here is PC" handoff the bootrom would have performed
+    /// on real silicon after validating boot2.
+    ///
+    /// The bootrom image remains populated at `0x00000000` so firmware
+    /// can resolve ROM function-table pointers (`rom_func_lookup`,
+    /// `rom_data_lookup`). Call **after** `load_bootrom` + `load_flash`
+    /// + `reset` — this method only rewrites SP/PC.
+    pub fn direct_boot_from_flash(&mut self, vtor_offset: u32) {
+        let sp = self.bus.memory.xip_read32(vtor_offset);
+        let pc = self.bus.memory.xip_read32(vtor_offset + 4) & !1;
+        for core in 0..2 {
+            self.cores[core].regs.msp = sp;
+            self.cores[core].regs.r[13] = sp;
+            self.cores[core].regs.set_pc(pc);
+        }
+        // Core 1 stays halted — SDK firmware launches it explicitly via
+        // the SIO FIFO handshake, same as after bootrom hand-off.
+        self.cores[1].halt();
+    }
+
     /// Advance the system by up to `step_quantum` master-clock cycles,
     /// then tick peripherals once. Returns the number of cycles actually
     /// consumed in this quantum (may be less than `step_quantum` if both
@@ -205,6 +240,12 @@ impl Emulator {
     /// sub-quantum edge timing; mdrp2350 has no equivalent peripheral.
     pub fn step(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
+        // Refresh the Bus's view of the master cycle count so any MMIO
+        // reads / writes performed during this quantum (notably PLL CS
+        // lock bit + lock-arm transitions — see
+        // `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` §6 P2)
+        // observe a current cycle. Staleness is bounded by one quantum.
+        self.bus.master_cycle = self.clock.cycles;
         let start = self.clock.cycles;
         let target = start.wrapping_add(self.step_quantum as u64);
 
@@ -430,6 +471,10 @@ impl Emulator {
     /// INSTR_MEM, configuring SIO GPIO_OE/_OUT, releasing RESETS bits,
     /// etc., without hand-rolling the bus machinery.
     pub fn mmio_write32(&mut self, addr: u32, value: u32) {
+        // Mirror the `step()` stash so PLL write-time lock-arm transitions
+        // observe the current cycle count when the harness pokes MMIO
+        // outside the step path. See HLD §6 P2.
+        self.bus.master_cycle = self.clock.cycles;
         self.bus.write32(addr, value);
     }
 
@@ -444,6 +489,9 @@ impl Emulator {
     /// are for confirmation only and should be chosen carefully to avoid
     /// disturbing the peripheral's state.
     pub fn mmio_read32(&mut self, addr: u32) -> u32 {
+        // Mirror the `step()` stash so PLL CS reads observe the current
+        // cycle count when the harness reads MMIO outside the step path.
+        self.bus.master_cycle = self.clock.cycles;
         self.bus.read32(addr)
     }
 }

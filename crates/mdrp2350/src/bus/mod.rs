@@ -9,6 +9,78 @@ use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
 
+/// Number of entries in the PC-keyed decoded-op cache.
+/// Direct-mapped, indexed by `(pc >> 1) & (DECODE_CACHE_SIZE - 1)`.
+/// See HLD `2026.04.14 - HLD - Decoded-Op Cache.md` §3.
+pub(crate) const DECODE_CACHE_SIZE: usize = 16384;
+const DECODE_CACHE_MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
+
+/// One decoded instruction. 12 bytes. `Copy`.
+///
+/// Populated lazily on a cache miss by `CortexM33::populate_decode_cache`.
+/// An entry with `tag == u32::MAX` is empty (that value is odd and cannot
+/// match a halfword-aligned PC).
+///
+/// See HLD §2.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DecodedOp {
+    /// PC this entry is valid for. Full tag (no shift). `u32::MAX` = empty.
+    pub tag: u32,
+    /// First halfword (the one at PC).
+    pub hw0: u16,
+    /// Second halfword (at PC+2). Zero for narrow instructions.
+    pub hw1: u16,
+    /// Extra wait states the bus charged when these halfwords were last
+    /// fetched (bank 2/6 SRAM `+1`; other regions 0). Max observed = 2
+    /// (wide instruction straddling bank 2/6). Replayed on every hit so
+    /// the fast path matches the non-cached cycle count exactly.
+    pub fetch_wait: u8,
+    /// Packed flags.
+    ///   bit 0 — `is_wide`
+    ///   bit 1 — `is_pure` (handler does not touch the bus wait-state
+    ///           accumulator nor raise a synchronous fault)
+    ///   bit 2 — `is_thumb16_flag_only` (CMP/CMN/TST — always set flags
+    ///           even inside an IT block; pre-computed to avoid a nested
+    ///           match on every narrow-in-IT execution)
+    ///   bits 3..7 — reserved
+    pub flags: u8,
+}
+
+impl DecodedOp {
+    pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
+    pub(crate) const FLAG_PURE: u8 = 0b0000_0010;
+    pub(crate) const FLAG_FLAG_ONLY: u8 = 0b0000_0100;
+
+    #[inline(always)]
+    pub(crate) fn empty() -> Self {
+        Self { tag: u32::MAX, hw0: 0, hw1: 0, fetch_wait: 0, flags: 0 }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_wide(&self) -> bool {
+        self.flags & Self::FLAG_WIDE != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_pure(&self) -> bool {
+        self.flags & Self::FLAG_PURE != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_flag_only(&self) -> bool {
+        self.flags & Self::FLAG_FLAG_ONLY != 0
+    }
+}
+
+/// True if `pc` lies in an executable region the cache may index.
+/// Only ROM (0x0), XIP/XIP-SRAM (0x1), and SRAM (0x2) qualify. Other
+/// regions either cannot legitimately contain code or are dynamic and
+/// not worth caching.
+#[inline(always)]
+pub(crate) fn is_cacheable_pc(pc: u32) -> bool {
+    matches!(pc >> 28, 0x0 | 0x1 | 0x2)
+}
+
 /// Bus fabric — address decode and cycle accounting.
 ///
 /// Phase 1: flat memory, single-cycle access everywhere.
@@ -76,6 +148,19 @@ pub struct Bus {
     /// `pll_sys_regs`. Separate storage so configuring one PLL does
     /// not affect the other.
     pub(crate) pll_usb_regs: [u32; 4],
+    /// Master cycle count at the start of the current step. Populated by
+    /// `Emulator::step` / `Emulator::run` before any core dispatch so that
+    /// PLL CS reads and write-time lock-arm transitions observe a fresh
+    /// cycle. See `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` §6 P2.
+    pub(crate) master_cycle: u64,
+    /// Master cycle at which PLL_SYS's lock-detect counter expires. `None`
+    /// means the PLL is not currently armed (powered down, unconfigured,
+    /// or hasn't been powered up yet). Managed by `pll_sys_write` via
+    /// `mdpicoem_common::clocks::pll_should_arm_lock`.
+    pub(crate) pll_sys_lock_at_cycle: Option<u64>,
+    /// Master cycle at which PLL_USB's lock-detect counter expires. Same
+    /// semantics as `pll_sys_lock_at_cycle`.
+    pub(crate) pll_usb_lock_at_cycle: Option<u64>,
     /// ROSC register image (LLD V2 §4.11). Indices map to offsets:
     /// `0=CTRL (0x000)`, `1=FREQA (0x004)`, `2=FREQB (0x008)`,
     /// `3=RANDOM (0x00C)`, `4=DORMANT (0x010)`, `5=DIV (0x014)`,
@@ -113,6 +198,22 @@ pub struct Bus {
     pub pio: [PioBlock; 3],
     /// Combined GPIO pin state (readable by SIO and PIO).
     pub gpio_in: u32,
+    /// External-input stimulus value. Bits selected by
+    /// [`Self::gpio_external_mask`] are forced to the corresponding
+    /// bits of this value after `update_gpio` merges SIO/PIO outputs.
+    /// Lets the harness drive pins (CS, address bus, etc.) that the
+    /// emulator otherwise recomputes every tick. Defaults to 0.
+    pub gpio_external_in: u32,
+    /// External-input stimulus mask. Bit `i` set = the harness dictates
+    /// `gpio_in[i]`; bit `i` clear = PIO/SIO dictates. Defaults to 0
+    /// (no stimulus — legacy behaviour).
+    pub gpio_external_mask: u32,
+    /// PC-keyed decoded-op cache. Direct-mapped, `DECODE_CACHE_SIZE`
+    /// entries × 12 B = 192 KB. Populated lazily on fetch by
+    /// `CortexM33::populate_decode_cache`; invalidated on writes to
+    /// executable memory (regions 0x1 / 0x2) and on bulk loads
+    /// (`load_bootrom` / `load_flash`). See HLD §3.
+    pub(crate) decode_cache: Box<[DecodedOp; DECODE_CACHE_SIZE]>,
 }
 
 impl Bus {
@@ -138,6 +239,9 @@ impl Bus {
             clock_tree: ClockTree::default(),
             pll_sys_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
             pll_usb_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
+            master_cycle: 0,
+            pll_sys_lock_at_cycle: None,
+            pll_usb_lock_at_cycle: None,
             rosc_regs: [0u32; 9],
             xosc_regs: [0u32; 5],
             gpio_hi_noise_state: 0xA5A5_A5A5,
@@ -149,6 +253,15 @@ impl Bus {
             rcp_count: 0,
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
             gpio_in: 0,
+            gpio_external_in: 0,
+            gpio_external_mask: 0,
+            // 192 KB heap allocation — can't live on the stack. Every slot
+            // starts with `tag = u32::MAX` so lookups never spuriously hit
+            // before the first populate.
+            decode_cache: vec![DecodedOp::empty(); DECODE_CACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("length matches DECODE_CACHE_SIZE by construction"),
         }
     }
 
@@ -408,9 +521,12 @@ impl Bus {
     }
 
     /// Load flash data into XIP memory and mark flash as loaded.
+    /// Invalidates any cache entries in the XIP region — flash bytes
+    /// have been replaced wholesale.
     pub fn load_flash(&mut self, data: &[u8]) {
         self.memory.load_flash(data);
         self.flash_loaded = true;
+        self.invalidate_region(0x1);
     }
 
     // --- Latency accounting ---
@@ -428,6 +544,70 @@ impl Bus {
     /// Reset extra wait state accumulator. Called at start of each instruction.
     pub fn reset_extra_wait_states(&mut self) {
         self.extra_wait_states = 0;
+    }
+
+    /// Adds `n` to the extra-wait-states accumulator. Used by the slow
+    /// path in `decode_execute` to re-inject the cache entry's `fetch_wait`
+    /// after `reset_extra_wait_states`, preserving cycle-count identity
+    /// with the pre-cache behaviour.
+    #[inline(always)]
+    pub fn add_extra_wait_states(&mut self, n: u32) {
+        self.extra_wait_states += n;
+    }
+
+    // --- Decoded-op cache invalidation (see HLD §7) ----------------------
+
+    /// Invalidate the cache slot(s) covering `[addr, addr+len)`.
+    /// Also clears the slot at `addr - 2` so a wide instruction whose
+    /// hw0 lives at `addr - 2` and hw1 at `addr` gets evicted when its
+    /// hw1 is rewritten. `len` is 1, 2, or 4 bytes for the three write
+    /// widths.
+    #[inline]
+    fn invalidate_pc_range(&mut self, addr: u32, len: u8) {
+        debug_assert!(len == 1 || len == 2 || len == 4);
+        let start = addr & !1; // align down to halfword
+        let end = (addr.wrapping_add(len as u32 - 1)) & !1;
+        let mut p = start.wrapping_sub(2); // preceding slot covers wide boundary
+        loop {
+            if is_cacheable_pc(p) {
+                let slot = ((p >> 1) & DECODE_CACHE_MASK) as usize;
+                self.decode_cache[slot].tag = u32::MAX;
+            }
+            if p == end {
+                break;
+            }
+            p = p.wrapping_add(2);
+        }
+    }
+
+    /// Invalidate every cache entry whose tag lies in the given 256 MB
+    /// region (`addr >> 28 == region`). Used on bulk loads. Cost is
+    /// `DECODE_CACHE_SIZE` × 4 B reads + compare — small enough for
+    /// once-per-boot paths.
+    #[inline]
+    fn invalidate_region(&mut self, region: u32) {
+        for slot in self.decode_cache.iter_mut() {
+            if slot.tag != u32::MAX && (slot.tag >> 28) == region {
+                slot.tag = u32::MAX;
+            }
+        }
+    }
+
+    /// Invalidate every cache entry. Public escape hatch for tools /
+    /// tests that write executable bytes through paths that bypass the
+    /// usual invalidation hooks (e.g. `Emulator::poke` or direct
+    /// `bus.memory.sram_write*`).
+    pub fn invalidate_all(&mut self) {
+        for slot in self.decode_cache.iter_mut() {
+            slot.tag = u32::MAX;
+        }
+    }
+
+    /// Load the bootrom (32 KB ROM image at 0x0000_0000) and invalidate
+    /// any cache entries pointing into the ROM region.
+    pub fn load_bootrom(&mut self, data: &[u8]) {
+        self.memory.load_rom(data);
+        self.invalidate_region(0x0);
     }
 
     /// Enable burst mode — suppresses per-word SRAM bank wait states.
@@ -560,7 +740,10 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
-            0x1 if Self::is_xip_sram(addr) => self.xip_sram_write8(addr, val),
+            0x1 if Self::is_xip_sram(addr) => {
+                self.xip_sram_write8(addr, val);
+                self.invalidate_pc_range(addr, 1);
+            }
             0x2 if offset < SRAM_SIZE as u32 => {
                 let sram_alias = (addr >> 24) & 0x3;
                 if sram_alias == 0 {
@@ -576,6 +759,7 @@ impl Bus {
                     self.memory.sram_write8(offset, new_val);
                 }
                 self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                self.invalidate_pc_range(addr, 1);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -756,7 +940,10 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
-            0x1 if Self::is_xip_sram(addr) => self.xip_sram_write16(addr, val),
+            0x1 if Self::is_xip_sram(addr) => {
+                self.xip_sram_write16(addr, val);
+                self.invalidate_pc_range(addr, 2);
+            }
             0x2 if (offset + 1) < SRAM_SIZE as u32 => {
                 let sram_alias = (addr >> 24) & 0x3;
                 if sram_alias == 0 {
@@ -772,6 +959,7 @@ impl Bus {
                     self.memory.sram_write16(offset, new_val);
                 }
                 self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                self.invalidate_pc_range(addr, 2);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -941,7 +1129,10 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
-            0x1 if Self::is_xip_sram(addr) => self.xip_sram_write32(addr, val),
+            0x1 if Self::is_xip_sram(addr) => {
+                self.xip_sram_write32(addr, val);
+                self.invalidate_pc_range(addr, 4);
+            }
             0x2 if (offset + 3) < SRAM_SIZE as u32 => {
                 let sram_alias = (addr >> 24) & 0x3;
                 if sram_alias == 0 {
@@ -957,6 +1148,7 @@ impl Bus {
                     self.memory.sram_write32(offset, new_val);
                 }
                 self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                self.invalidate_pc_range(addr, 4);
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;

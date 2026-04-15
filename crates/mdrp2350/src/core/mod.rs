@@ -1,5 +1,5 @@
 pub mod registers;
-mod decode;
+pub(crate) mod decode;
 mod execute;
 pub(crate) mod execute_thumb32;
 mod execute_fpu;

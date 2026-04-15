@@ -27,6 +27,7 @@ pub mod sio;
 use std::collections::HashMap;
 
 use mdpicoem_common::PioBlock;
+use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use crate::peripherals::psram::Psram;
@@ -63,6 +64,20 @@ pub const XIP_SRAM_END: u32 = 0x1500_4000; // 16 KB
 /// XIP flash window base. Aliases at `+0x0100_0000`, `+0x0200_0000`,
 /// `+0x0300_0000` mirror the same 2 MB flash buffer.
 pub const XIP_FLASH_BASE: u32 = 0x1000_0000;
+
+/// Read a PLL register image with CS[31] (LOCK) derived from the
+/// current arm state and master cycle count. Non-CS offsets return the
+/// raw stored value via `clocks::pll_read`.
+///
+/// See `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` §4.
+#[inline]
+fn pll_read_with_lock(regs: &PllRegs, offset: u32, lock_at: Option<u64>, now: u64) -> u32 {
+    if offset == 0x00 {
+        pll_cs_read_with_lock(regs, lock_at, now)
+    } else {
+        clocks::pll_read(regs, offset)
+    }
+}
 
 /// Returns `Some(offset)` if `addr` falls inside one of the four 2 MB
 /// XIP flash alias windows (`0x10`, `0x11`, `0x12`, `0x13` at bits
@@ -119,6 +134,18 @@ pub struct Bus {
     pub pll_sys_regs: PllRegs,
     /// PLL_USB register image.
     pub pll_usb_regs: PllRegs,
+    /// Master cycle count at the start of the current step. Populated by
+    /// `Emulator::step` / `Emulator::run` before any core dispatch so that
+    /// PLL CS reads and write-time lock-arm transitions observe a fresh
+    /// cycle. See `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` §6 P2.
+    pub(crate) master_cycle: u64,
+    /// Master cycle at which PLL_SYS's lock-detect counter expires. `None`
+    /// means the PLL is not currently armed. Managed by the peripheral
+    /// write dispatch via `mdpicoem_common::clocks::pll_should_arm_lock`.
+    pub(crate) pll_sys_lock_at_cycle: Option<u64>,
+    /// Master cycle at which PLL_USB's lock-detect counter expires. Same
+    /// semantics as `pll_sys_lock_at_cycle`.
+    pub(crate) pll_usb_lock_at_cycle: Option<u64>,
     /// Derived clock tree frequencies (recomputed on any CLOCKS/PLL write).
     pub clock_tree: ClockTree,
     /// IO_BANK0 per-pin function select.
@@ -190,6 +217,9 @@ impl Bus {
             rosc_regs: RoscRegs::new(),
             pll_sys_regs: PLL_RESET,
             pll_usb_regs: PLL_RESET,
+            master_cycle: 0,
+            pll_sys_lock_at_cycle: None,
+            pll_usb_lock_at_cycle: None,
             clock_tree: ClockTree::default(),
             io_bank0: IoBank0::new(),
             pads_bank0: PadsBank0::new(),
@@ -423,8 +453,18 @@ impl Bus {
             CLOCKS_BASE => self.clocks_regs.read32(offset),
             RESETS_BASE => self.resets.read32(offset),
             XOSC_BASE => self.xosc_regs.read32(offset),
-            PLL_SYS_BASE => clocks::pll_read(&self.pll_sys_regs, offset),
-            PLL_USB_BASE => clocks::pll_read(&self.pll_usb_regs, offset),
+            PLL_SYS_BASE => pll_read_with_lock(
+                &self.pll_sys_regs,
+                offset,
+                self.pll_sys_lock_at_cycle,
+                self.master_cycle,
+            ),
+            PLL_USB_BASE => pll_read_with_lock(
+                &self.pll_usb_regs,
+                offset,
+                self.pll_usb_lock_at_cycle,
+                self.master_cycle,
+            ),
             ROSC_BASE => self.rosc_regs.read32(offset),
             IO_BANK0_BASE => self.io_bank0.read32(offset),
             PADS_BANK0_BASE => self.pads_bank0.read32(offset),
@@ -448,12 +488,26 @@ impl Bus {
             RESETS_BASE => self.resets.write32(offset, val, alias),
             XOSC_BASE => self.xosc_regs.write32(offset, val, alias),
             PLL_SYS_BASE => {
+                let old_regs = self.pll_sys_regs;
                 if clocks::pll_write(&mut self.pll_sys_regs, offset, val, alias) {
+                    self.pll_sys_lock_at_cycle = pll_should_arm_lock(
+                        &old_regs,
+                        &self.pll_sys_regs,
+                        self.pll_sys_lock_at_cycle,
+                        self.master_cycle,
+                    );
                     self.recompute_clock_tree();
                 }
             }
             PLL_USB_BASE => {
+                let old_regs = self.pll_usb_regs;
                 if clocks::pll_write(&mut self.pll_usb_regs, offset, val, alias) {
+                    self.pll_usb_lock_at_cycle = pll_should_arm_lock(
+                        &old_regs,
+                        &self.pll_usb_regs,
+                        self.pll_usb_lock_at_cycle,
+                        self.master_cycle,
+                    );
                     self.recompute_clock_tree();
                 }
             }
@@ -959,9 +1013,14 @@ mod tests {
 
     #[test]
     fn pll_lock_bit_forced_high() {
+        // Post-`2026.04.15 HLD - PLL LOCK Modelling` fix: at Bus::new()
+        // the PLL is powered down (PWR=0x2D), FBDIV=0, so CS[31] must
+        // read 0. The test name is historical — the old pre-fix
+        // behaviour forced the bit; the new modelled behaviour derives
+        // it from power state + FBDIV + arm timing.
         let mut bus = Bus::new();
         let cs = bus.read32(PLL_SYS_BASE);
-        assert_ne!(cs & (1 << 31), 0);
+        assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 at reset (PLL unpowered)");
     }
 
     #[test]
