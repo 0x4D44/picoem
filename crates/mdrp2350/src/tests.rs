@@ -5663,6 +5663,146 @@ fn test_busfault_on_unmapped_access() {
 }
 
 // ============================================================================
+// Asynchronous exception dispatch (PendSV / SysTick / NMI)
+// ============================================================================
+//
+// `CortexM33::step` polls ICSR at the top of each call and takes the
+// highest-priority pending async exception before fetching the next
+// instruction. Verified here with targeted pend/step/assert fixtures;
+// the `silicon_isr_diff_rp2350` oracle exercises the cross-product
+// against real RP2354.
+
+/// ROM variants for async-dispatch tests.
+///
+/// `looping_handlers`: handler body is an infinite `B .`. Used for entry
+/// tests so the observation "IPSR == N after one core-step" is stable.
+///
+/// `bx_lr_handlers`: handler body is `BX LR`. Used for round-trip tests
+/// that verify entry+exit leaves the core back in thread mode.
+fn async_dispatch_rom(looping_handlers: bool) -> Vec<u8> {
+    let mut rom = vec![0u8; 1024];
+    rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes()); // SP
+    rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes()); // Reset -> 0x100
+    rom[0x38..0x3C].copy_from_slice(&0x0000_0201u32.to_le_bytes()); // PendSV -> 0x200
+    rom[0x3C..0x40].copy_from_slice(&0x0000_0281u32.to_le_bytes()); // SysTick -> 0x280
+    // Main at 0x100: `B .` — async exception is the only way to move.
+    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    let handler: [u8; 2] = if looping_handlers {
+        [0xFE, 0xE7] // B .
+    } else {
+        [0x70, 0x47] // BX LR
+    };
+    rom[0x200..0x202].copy_from_slice(&handler);
+    rom[0x280..0x282].copy_from_slice(&handler);
+    rom
+}
+
+/// Single-step core 0 (bypassing the quantum loop in `Emulator::step`)
+/// so tests can assert per-instruction state. `Emulator::step` advances
+/// 64 cycles per call by default — enough to run entry, handler, and
+/// return in one call, which defeats "after one step, IPSR == 14"
+/// assertions.
+fn core0_step(emu: &mut Emulator) {
+    emu.bus.set_active_core(0);
+    emu.cores[0].step(&mut emu.bus);
+}
+
+const ICSR_ADDR: u32 = 0xE000_ED04;
+const ICSR_PENDSVSET_BIT: u32 = 1 << 28;
+const ICSR_PENDSVCLR_BIT: u32 = 1 << 27;
+const ICSR_PENDSTSET_BIT: u32 = 1 << 26;
+
+#[test]
+fn test_async_dispatch_pendsv_enters_handler() {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&async_dispatch_rom(true));
+    emu.reset();
+
+    for _ in 0..5 { core0_step(&mut emu); }
+    assert_eq!(emu.cores[0].regs.ipsr(), 0, "must be in thread mode before pend");
+
+    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+    core0_step(&mut emu);
+
+    assert_eq!(emu.cores[0].regs.ipsr(), 14, "should be in PendSV handler");
+    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0200, "PC at PendSV handler entry");
+}
+
+#[test]
+fn test_async_dispatch_clears_pending_bit_on_entry() {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&async_dispatch_rom(true));
+    emu.reset();
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+    core0_step(&mut emu);
+
+    assert_eq!(emu.bus.ppb[0].icsr & ICSR_PENDSVSET_BIT, 0,
+        "SET bit must clear on exception activation (ARMv8-M §B3.2.4)");
+}
+
+#[test]
+fn test_async_dispatch_primask_masks_pendsv() {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&async_dispatch_rom(true));
+    emu.reset();
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    emu.cores[0].regs.primask = 1;
+    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+
+    for _ in 0..10 { core0_step(&mut emu); }
+    assert_eq!(emu.cores[0].regs.ipsr(), 0, "PRIMASK must block PendSV");
+    assert_ne!(emu.bus.ppb[0].icsr & ICSR_PENDSVSET_BIT, 0, "pending bit must remain set");
+}
+
+#[test]
+fn test_async_dispatch_pendsvclr_prevents_dispatch() {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&async_dispatch_rom(true));
+    emu.reset();
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    emu.bus.ppb[0].write32(ICSR_ADDR, ICSR_PENDSVSET_BIT);
+    emu.bus.ppb[0].write32(ICSR_ADDR, ICSR_PENDSVCLR_BIT);
+
+    for _ in 0..5 { core0_step(&mut emu); }
+    assert_eq!(emu.cores[0].regs.ipsr(), 0, "cleared pend bit must not dispatch");
+}
+
+#[test]
+fn test_async_dispatch_pendsv_round_trip() {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&async_dispatch_rom(false)); // BX LR handler
+    emu.reset();
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    let main_pc_before = emu.cores[0].regs.pc();
+    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+
+    // Step enough for entry + BX LR + exit: 3 instructions worth.
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    assert_eq!(emu.cores[0].regs.ipsr(), 0, "must be back in thread mode");
+    assert_eq!(emu.cores[0].regs.pc(), main_pc_before, "must resume main loop PC");
+}
+
+#[test]
+fn test_async_dispatch_systick_enters_handler() {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&async_dispatch_rom(true));
+    emu.reset();
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    emu.bus.ppb[0].icsr |= ICSR_PENDSTSET_BIT;
+    core0_step(&mut emu);
+
+    assert_eq!(emu.cores[0].regs.ipsr(), 15, "should be in SysTick handler");
+    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0280, "PC at SysTick handler entry");
+}
+
+// ============================================================================
 // SAU + TT (Test Target) instruction
 // ============================================================================
 

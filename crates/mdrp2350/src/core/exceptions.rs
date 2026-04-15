@@ -343,6 +343,50 @@ impl CortexM33 {
         exc_prio < self.execution_priority(bus)
     }
 
+    /// Attempt to take the highest-priority pending asynchronous exception
+    /// from ICSR (NMI/PendSV/SysTick). Clears the corresponding SET bit and
+    /// enters the exception via `enter_exception`. Returns `Some(cycles)`
+    /// if an exception was entered, `None` otherwise.
+    ///
+    /// Called at the top of `CortexM33::step`. ARMv8-M §B1.5.8: pending
+    /// exceptions are taken at instruction boundaries. NMI bypasses
+    /// PRIMASK/FAULTMASK; PendSV/SysTick go through `can_preempt`.
+    pub(crate) fn try_take_async_exception(&mut self, bus: &mut Bus) -> Option<u32> {
+        let core = bus.active_core();
+        let icsr = bus.ppb[core].icsr;
+
+        // NMI (exc 2): non-maskable, highest fixed priority.
+        if icsr & crate::bus::ppb::ICSR_NMIPENDSET != 0 {
+            bus.ppb[core].icsr &= !crate::bus::ppb::ICSR_NMIPENDSET;
+            return Some(self.enter_exception(2, bus));
+        }
+
+        let pendsv = icsr & crate::bus::ppb::ICSR_PENDSVSET != 0;
+        let pendst = icsr & crate::bus::ppb::ICSR_PENDSTSET != 0;
+        if !pendsv && !pendst {
+            return None;
+        }
+
+        // Pick highest-priority pending; tie-break by lower exception number
+        // (PendSV=14 wins a tie over SysTick=15 per ARMv8-M §B3.4.1).
+        let ppb = &bus.ppb[core];
+        let sv_prio = if pendsv { ppb.exception_priority(14) } else { i16::MAX };
+        let st_prio = if pendst { ppb.exception_priority(15) } else { i16::MAX };
+        let candidate: u16 = if sv_prio <= st_prio { 14 } else { 15 };
+
+        if !self.can_preempt(candidate, bus) {
+            return None;
+        }
+
+        let clear_mask = if candidate == 14 {
+            crate::bus::ppb::ICSR_PENDSVSET
+        } else {
+            crate::bus::ppb::ICSR_PENDSTSET
+        };
+        bus.ppb[core].icsr &= !clear_mask;
+        Some(self.enter_exception(candidate, bus))
+    }
+
     // --- Fault delivery ---
 
     /// Deliver a pending fault. Returns cycle cost.

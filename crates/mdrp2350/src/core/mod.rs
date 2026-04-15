@@ -96,6 +96,17 @@ impl CortexM33 {
         if self.halted {
             return;
         }
+
+        // ARMv8-M §B1.5.8: take the highest-priority pending asynchronous
+        // exception at this instruction boundary before fetching the next
+        // instruction. Covers firmware pends via ICSR (PendSV/SysTick/NMI)
+        // and tail-chain-as-re-entry after EXC_RETURN — the subsequent
+        // step's top-of-loop check sees the still-pending exception.
+        if let Some(cost) = self.try_take_async_exception(bus) {
+            self.cycles = self.cycles.wrapping_add(cost as u64);
+            return;
+        }
+
         let mut cycles = self.decode_execute(bus);
 
         // Synchronous bus fault
