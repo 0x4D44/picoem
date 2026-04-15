@@ -57,6 +57,13 @@ fn main() {
     // step means the core vectored to an exception handler.
     emu.step_quantum = 1;
     let mut last_in_exception = false;
+    // Ring-buffer of recent call transitions. Each entry captures
+    // (step, from_pc, to_pc, lr, r0, r1, vtor).
+    const RING_LEN: usize = 64;
+    #[derive(Clone, Copy)]
+    struct CallRec { step: u64, from: u32, to: u32, lr: u32, r0: u32, r1: u32, vtor: u32 }
+    let mut ring: Vec<CallRec> = Vec::with_capacity(RING_LEN);
+    let mut ring_head: usize = 0;
     for s in 0..5_000_000u64 {
         let before_pc = emu.cores[0].regs.pc();
         let before_lr = emu.cores[0].regs.lr();
@@ -65,6 +72,24 @@ fn main() {
         let consumed = emu.step();
         let after_pc = emu.cores[0].regs.pc();
         let after_lr = emu.cores[0].regs.lr();
+        // BL/BLX detection: LR changed AND new LR points just past the
+        // prior instruction (thumb-tagged). If so, record a call.
+        if after_lr != before_lr && (after_lr & 1) == 1 {
+            let expected_ret = (before_pc + 2) | 1;
+            let expected_ret_wide = (before_pc + 4) | 1;
+            if after_lr == expected_ret || after_lr == expected_ret_wide {
+                let vtor = emu.bus.read32(0xe000_ed08);
+                let r0 = emu.cores[0].regs.r[0];
+                let r1 = emu.cores[0].regs.r[1];
+                let rec = CallRec { step: s, from: before_pc, to: after_pc, lr: after_lr, r0, r1, vtor };
+                if ring.len() < RING_LEN {
+                    ring.push(rec);
+                } else {
+                    ring[ring_head] = rec;
+                    ring_head = (ring_head + 1) % RING_LEN;
+                }
+            }
+        }
         let in_exception = (after_lr & 0xFFFF_FFF0) == 0xFFFF_FFF0;
         let entered_exception = in_exception && !last_in_exception;
         let left_exception = !in_exception && last_in_exception;
@@ -89,6 +114,40 @@ fn main() {
                 if i % 4 == 3 { eprint!("\n                  "); }
             }
             eprintln!();
+            // Dump instructions around pre-PC (the BKPT/panic site) and
+            // panic wrapper. Each Thumb-16 halfword printed as u16.
+            let dump_windows = [
+                ("crash site", before_pc.saturating_sub(16), before_pc.saturating_add(16)),
+                ("panic wrapper", 0x2000_0290, 0x2000_02a8),
+                ("hard_assertion_failure", 0x2000_0db0, 0x2000_0de0),
+                ("caller @ r5/stack+36", (r[5] & !1).saturating_sub(16), (r[5] & !1).saturating_add(16)),
+                ("stack chain 0x20000449", 0x2000_0440, 0x2000_0460),
+                ("stack chain 0x20000393", 0x2000_0380, 0x2000_03a8),
+            ];
+            // Dump the ring buffer of recent calls in chronological order.
+            eprintln!("--- last {} BL/BLX calls (chronological) ---", ring.len());
+            let order: Box<dyn Iterator<Item = usize>> = if ring.len() < RING_LEN {
+                Box::new(0..ring.len())
+            } else {
+                Box::new((ring_head..RING_LEN).chain(0..ring_head))
+            };
+            for idx in order {
+                let CallRec { step: s, from, to, lr, r0, r1, vtor } = ring[idx];
+                eprintln!(
+                    "    step={s:>6}  {from:#010x} -> {to:#010x}  r0={r0:#010x} r1={r1:#010x} vtor={vtor:#010x}"
+                );
+            }
+            for (label, lo, hi) in dump_windows {
+                eprintln!("--- {label} [{lo:#010x}..{hi:#010x}]");
+                let mut addr = lo & !1;
+                while addr < hi {
+                    let hw = emu.bus.read32(addr & !3);
+                    let low = hw as u16;
+                    let high = (hw >> 16) as u16;
+                    eprintln!("    {:#010x}: {:04x}  {:#010x}: {:04x}", addr, low, addr+2, high);
+                    addr += 4;
+                }
+            }
             break;
         }
         if left_exception {
