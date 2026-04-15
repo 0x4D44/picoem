@@ -101,6 +101,12 @@ impl Emulator {
         self.bus.rosc_regs.reset();
         self.bus.watchdog_tick.reset();
         self.bus.timer.reset();
+        self.bus.uart0.reset();
+        self.bus.uart1.reset();
+        self.bus.spi0.reset();
+        self.bus.spi1.reset();
+        self.bus.i2c0.reset();
+        self.bus.i2c1.reset();
         self.bus.irq_pending = 0;
         for n in &mut self.bus.nvics {
             n.reset();

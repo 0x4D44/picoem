@@ -783,3 +783,38 @@ owners below.
   the core. Real silicon wakes via the IRQ-pending line even from WFE.
   Phase 2+ wake path needs to re-check `nvic.pending_and_enabled()` on
   peripheral tick and clear `is_halted` when a deliverable IRQ appears.
+
+## Phase 2 known limitations (mdrp2040 UART / SPI / I2C)
+
+Closed-out from Phase 2 Wave 1 (`HLD V7 §5.3`/`§6`) code review. All
+five items are by design for Phase 2 and documented in the relevant
+peripheral module.
+
+- **UART RX stimulus path not wired** —
+  `crates/mdrp2040/src/peripherals/uart.rs` models the TX side (FIFO
+  drain + baud-timed cycle accumulator) but does not inject RX bytes
+  from any external source. The Phase 2 corpus (`hello_uart`) only
+  exercises TX. Firmware that reads `UARTFR.RXFE` or attempts
+  `UARTDR` reads will see `RXFE=1` forever. Phase 3+ will need a loop-
+  back or scripted stimulus hook.
+- **UART modem flow control tied high** — CTS/DCD/DSR/RI bits in
+  `UARTFR` are either hardwired high (CTS) or zero (DCD/DSR/RI);
+  `UARTCR.RTS`/`CTSEn`/`RTSEn` are stored but have no effect on TX
+  gating. Firmware that relies on handshake will run ungated.
+- **SPI master-slave arbitration: loopback-only** —
+  `crates/mdrp2040/src/peripherals/spi.rs` implements `SSPCR1.LBM=1`
+  (master/loopback) to round-trip TX→RX so the `hello_spi` corpus can
+  verify baud-rate math. Off-chip slave interaction is not modelled;
+  any non-LBM transaction drains TX but produces no RX data.
+- **I2C 10-bit addressing not modelled** —
+  `crates/mdrp2040/src/peripherals/i2c.rs` silently NACKs every
+  transaction when `IC_CON.10BITADDR_MASTER=1`, latching TX_ABRT with
+  the distinctive `ABRT_10ADDR1_NOACK` bit (not `ABRT_7B_ADDR_NOACK`)
+  so firmware can distinguish "unsupported 10-bit" from "7-bit unknown
+  slave".
+- **I2C SCL timing not modelled** — `IC_SS_SCL_*` / `IC_FS_SCL_*` /
+  `IC_SDA_HOLD` / `IC_FS_SPKLEN` are storage-only. Transactions fire
+  synchronously at `IC_DATA_CMD` write time (instant ACK/NACK +
+  STOP_DET), so firmware that spin-checks `IC_STATUS.ACTIVITY` or
+  raw-IRQ ordering expecting bus-cycle-paced events may see different
+  interleavings than real silicon.

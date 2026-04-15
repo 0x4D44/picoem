@@ -2886,3 +2886,299 @@ mod phase1_wave2 {
         assert_eq!(armed & 1, 0, "ARMED bit 0 must auto-clear on fire");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 — UART / SPI / I2C bus integration
+// ---------------------------------------------------------------------------
+//
+// Covers the end-to-end path: firmware-style MMIO writes through `Bus::write32`
+// / `Bus::write8` / `Bus::read32`, RESETS gating at bus dispatch, narrow-access
+// dispatch for UART_DR / SSPDR / IC_DATA_CMD, and IRQ routing from peripheral
+// `tick` / `simulate_transaction` into `bus.irq_pending` (and onward to the
+// NVIC via `drain_pending_irqs_to_cores`).
+mod phase2_uart_spi_i2c {
+    use crate::bus::peripheral_dispatch::{
+        RESET_I2C0, RESET_SPI0, RESET_UART0, is_held_in_reset,
+    };
+    use crate::bus::{
+        Bus, I2C0_BASE, I2C1_BASE, SPI0_BASE, SPI1_BASE, UART0_BASE, UART1_BASE,
+    };
+    use crate::irq::{IRQ_I2C0_IRQ, IRQ_SPI0_IRQ, IRQ_UART0_IRQ};
+    use crate::peripherals::i2c::{IC_CLR_TX_ABRT, IC_ENABLE, IC_RAW_INTR_STAT, IC_TAR, INT_TX_ABRT};
+    use crate::peripherals::spi::{
+        SSP_INT_RX, SSPCR0, SSPCR1, SSPDR, SSPIMSC, SSPRIS,
+    };
+    use crate::peripherals::uart::{
+        UARTCR, UARTDR, UARTFBRD, UARTFR, UARTIBRD, UARTIMSC, UARTLCR_H, UARTRIS, UART_INT_TX,
+    };
+    use crate::{Config, EmulatorBuilder};
+
+    /// CLR alias for RESETS: base 0x4000_C000 + 0x3000 = 0x4000_F000.
+    const RESETS_CLR: u32 = 0x4000_F000;
+
+    /// Release every peripheral from reset so tests can drive firmware.
+    fn release_all(bus: &mut Bus) {
+        // Writing `!0` to the BITCLR alias clears every reset bit.
+        bus.write32(RESETS_CLR, 0xFFFF_FFFF);
+    }
+
+    // --- Reset defaults + RESETS gating ------------------------------
+
+    #[test]
+    fn fresh_bus_holds_uart_spi_i2c_in_reset() {
+        let bus = Bus::new();
+        assert!(is_held_in_reset(&bus, UART0_BASE));
+        assert!(is_held_in_reset(&bus, UART1_BASE));
+        assert!(is_held_in_reset(&bus, SPI0_BASE));
+        assert!(is_held_in_reset(&bus, SPI1_BASE));
+        assert!(is_held_in_reset(&bus, I2C0_BASE));
+        assert!(is_held_in_reset(&bus, I2C1_BASE));
+    }
+
+    #[test]
+    fn uart0_write_blocked_while_held_in_reset() {
+        let mut bus = Bus::new();
+        // UART0 is held in reset by default.
+        bus.write32(UART0_BASE + UARTCR, 0x301);
+        // Release then verify the write actually takes effect.
+        bus.write32(RESETS_CLR, 1u32 << RESET_UART0);
+        assert_eq!(bus.read32(UART0_BASE + UARTCR), 0, "pre-release write swallowed");
+        bus.write32(UART0_BASE + UARTCR, 0x301);
+        assert_eq!(bus.read32(UART0_BASE + UARTCR), 0x301);
+    }
+
+    #[test]
+    fn spi0_write_blocked_while_held_in_reset() {
+        let mut bus = Bus::new();
+        bus.write32(SPI0_BASE + SSPCR1, 0x2);
+        bus.write32(RESETS_CLR, 1u32 << RESET_SPI0);
+        assert_eq!(bus.read32(SPI0_BASE + SSPCR1), 0, "pre-release write swallowed");
+        bus.write32(SPI0_BASE + SSPCR1, 0x2);
+        assert_eq!(bus.read32(SPI0_BASE + SSPCR1), 0x2);
+    }
+
+    #[test]
+    fn i2c0_write_blocked_while_held_in_reset() {
+        let mut bus = Bus::new();
+        bus.write32(I2C0_BASE + IC_ENABLE, 0x1);
+        bus.write32(RESETS_CLR, 1u32 << RESET_I2C0);
+        assert_eq!(bus.read32(I2C0_BASE + IC_ENABLE), 0, "pre-release write swallowed");
+        bus.write32(I2C0_BASE + IC_ENABLE, 0x1);
+        assert_eq!(bus.read32(I2C0_BASE + IC_ENABLE), 0x1);
+    }
+
+    // --- UART integration --------------------------------------------
+
+    #[test]
+    fn uart0_byte_write_to_dr_uses_narrow_dispatch() {
+        // The narrow-access path must not round-trip via word-RMW (which
+        // would re-push the DR value through `push_tx` twice per write).
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        bus.write32(UART0_BASE + UARTLCR_H, 1 << 4); // FEN
+        bus.write32(UART0_BASE + UARTCR, 0x301); // UARTEN | TXE
+        bus.write8(UART0_BASE + UARTDR, 0xA5);
+        // FR.TXFE must clear — something in the FIFO.
+        let fr = bus.read32(UART0_BASE + UARTFR);
+        assert!(fr & (1 << 7) == 0, "TXFE must clear after push");
+    }
+
+    #[test]
+    fn uart0_baud_configure_drain_fires_tx_irq() {
+        // Full firmware-style sequence: configure baud at 115200,
+        // enable, push a byte, run the emulator for enough cycles that
+        // the slow-path tick drains the FIFO and raises TXIS. Confirm
+        // the bit lands in `bus.irq_pending` and then in the NVIC.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        // Seed 125 MHz so the baud math matches pico-sdk defaults.
+        emu.bus.seed_sys_clk_hz(125_000_000);
+        // peri_clk_hz follows sys via the default CLK_PERI_CTRL AUXSRC=0.
+        emu.bus.clock_tree.peri_clk_hz = 125_000_000;
+        emu.bus.clock_tree.sys_clk_hz = 125_000_000;
+        release_all(&mut emu.bus);
+        emu.bus.write32(UART0_BASE + UARTIBRD, 67);
+        emu.bus.write32(UART0_BASE + UARTFBRD, 52);
+        emu.bus.write32(UART0_BASE + UARTLCR_H, 1 << 4);
+        emu.bus.write32(UART0_BASE + UARTCR, 0x301);
+        emu.bus.write32(UART0_BASE + UARTIMSC, UART_INT_TX);
+        emu.bus.write32(UART0_BASE + UARTDR, 0x5A);
+        // Park a NOP so `step()` has something to do. The fast-path
+        // gate sees UART non-idle so the slow-path ticks UART every
+        // cycle.
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // At 115200 baud × 10 bits, 1 byte takes ≈ 86.8 µs = 10850 cycles.
+        // Run several quanta.
+        for _ in 0..20_000 {
+            emu.step();
+            if emu.bus.nvics[0].is_pending(IRQ_UART0_IRQ as u8) {
+                break;
+            }
+        }
+        assert_eq!(
+            emu.bus.read32(UART0_BASE + UARTRIS) & UART_INT_TX,
+            UART_INT_TX,
+            "RIS must latch TXIS after FIFO drains"
+        );
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_UART0_IRQ as u8),
+            "UART0 IRQ must latch in core 0 NVIC"
+        );
+    }
+
+    #[test]
+    fn uart_is_idle_gates_fast_path() {
+        // Before any activity, all peripherals report idle.
+        let bus = Bus::new();
+        assert!(bus.all_peripherals_idle());
+    }
+
+    // --- SPI integration ---------------------------------------------
+
+    #[test]
+    fn spi0_loopback_roundtrips_via_bus() {
+        // Full firmware-like sequence: enable SPI0 with LBM=1, write
+        // 0xA5 via SSPDR, read it back.
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        // DSS = 7 (8-bit frames).
+        bus.write32(SPI0_BASE + SSPCR0, 0x07);
+        // SSE | LBM.
+        bus.write32(SPI0_BASE + SSPCR1, 0x3);
+        bus.write32(SPI0_BASE + SSPDR, 0xA5);
+        // Loopback pushes into RX FIFO at write time — read DR.
+        assert_eq!(bus.read32(SPI0_BASE + SSPDR), 0xA5);
+    }
+
+    #[test]
+    fn spi0_loopback_via_byte_access() {
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        bus.write32(SPI0_BASE + SSPCR0, 0x07);
+        bus.write32(SPI0_BASE + SSPCR1, 0x3);
+        bus.write8(SPI0_BASE + SSPDR, 0x73);
+        assert_eq!(bus.read8(SPI0_BASE + SSPDR), 0x73);
+    }
+
+    #[test]
+    fn spi0_rx_irq_routes_through_bus() {
+        // Load enough loopback words to cross RX half-full threshold
+        // (4 of 8 entries). RIS latches RX; IMSC = RX enables it;
+        // route through the bus's IRQ assertion path.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        release_all(&mut emu.bus);
+        emu.bus.write32(SPI0_BASE + SSPCR0, 0x07);
+        emu.bus.write32(SPI0_BASE + SSPCR1, 0x3); // SSE | LBM
+        emu.bus.write32(SPI0_BASE + SSPIMSC, SSP_INT_RX);
+        for i in 0..4 {
+            emu.bus.write32(SPI0_BASE + SSPDR, i as u32);
+        }
+        assert_eq!(
+            emu.bus.read32(SPI0_BASE + SSPRIS) & SSP_INT_RX,
+            SSP_INT_RX,
+            "RIS must latch RX at FIFO half-full"
+        );
+        assert!(
+            emu.bus.irq_pending & (1u32 << IRQ_SPI0_IRQ) != 0,
+            "SPI0 IRQ bit must be set in irq_pending"
+        );
+    }
+
+    // --- I2C integration ---------------------------------------------
+
+    #[test]
+    fn i2c0_bus_scan_ack_address_latches_stop_det() {
+        // Mirror pico-sdk's `bus_scan`: set TAR=0x3C, enable, write
+        // CMD_WRITE. Expect STOP_DET latched and NO TX_ABRT.
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        // TAR writes need EN=0.
+        bus.write32(I2C0_BASE + IC_TAR, 0x3C);
+        bus.write32(I2C0_BASE + IC_ENABLE, 1);
+        // DATA_CMD write: data=0, STOP=1 (bit 9).
+        bus.write32(I2C0_BASE + 0x10, 0x200);
+        let ris = bus.read32(I2C0_BASE + IC_RAW_INTR_STAT);
+        assert!(ris & (1 << 9) != 0, "STOP_DET must latch for ACK addr");
+        assert_eq!(ris & INT_TX_ABRT, 0, "TX_ABRT must NOT latch");
+    }
+
+    #[test]
+    fn i2c0_bus_scan_nack_address_latches_tx_abrt() {
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        bus.write32(I2C0_BASE + IC_TAR, 0x55); // NACK address
+        bus.write32(I2C0_BASE + IC_ENABLE, 1);
+        bus.write32(I2C0_BASE + 0x10, 0x200);
+        let ris = bus.read32(I2C0_BASE + IC_RAW_INTR_STAT);
+        assert!(ris & INT_TX_ABRT != 0, "TX_ABRT must latch for NACK addr");
+    }
+
+    #[test]
+    fn i2c0_clr_tx_abrt_via_bus_clears_sticky() {
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        bus.write32(I2C0_BASE + IC_TAR, 0x55);
+        bus.write32(I2C0_BASE + IC_ENABLE, 1);
+        bus.write32(I2C0_BASE + 0x10, 0x200);
+        // Read IC_CLR_TX_ABRT to drop the sticky.
+        let _ = bus.read32(I2C0_BASE + IC_CLR_TX_ABRT);
+        let ris = bus.read32(I2C0_BASE + IC_RAW_INTR_STAT);
+        assert_eq!(ris & INT_TX_ABRT, 0, "TX_ABRT cleared on CLR_TX_ABRT read");
+    }
+
+    #[test]
+    fn i2c0_nack_routes_through_nvic() {
+        // With IC_INTR_MASK set to admit TX_ABRT, the I2C module
+        // pushes the IRQ into irq_pending during `simulate_transaction`.
+        // Stepping the emulator drains it into the NVIC.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        release_all(&mut emu.bus);
+        emu.bus.write32(I2C0_BASE + IC_TAR, 0x55);
+        emu.bus.write32(I2C0_BASE + IC_ENABLE, 1);
+        // IC_INTR_MASK = INT_TX_ABRT (bit 6).
+        emu.bus.write32(I2C0_BASE + 0x30, INT_TX_ABRT);
+        emu.bus.write32(I2C0_BASE + 0x10, 0x200);
+        assert!(
+            emu.bus.irq_pending & (1u32 << IRQ_I2C0_IRQ) != 0,
+            "I2C0 IRQ must surface in irq_pending"
+        );
+        // One more step drains it to the NVIC.
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        emu.step();
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_I2C0_IRQ as u8),
+            "I2C0 NVIC pending must be set after drain"
+        );
+    }
+
+    // --- is_idle coverage --------------------------------------------
+
+    #[test]
+    fn all_peripherals_idle_flips_when_uart_has_pending_tx() {
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        assert!(bus.all_peripherals_idle());
+        bus.write32(UART0_BASE + UARTLCR_H, 1 << 4);
+        bus.write32(UART0_BASE + UARTCR, 0x301);
+        bus.write32(UART0_BASE + UARTDR, 0x42);
+        assert!(!bus.all_peripherals_idle(),
+            "pending TX byte breaks the idle gate");
+    }
+
+    #[test]
+    fn spi0_reset_post_activity_returns_to_idle() {
+        let mut bus = Bus::new();
+        release_all(&mut bus);
+        bus.write32(SPI0_BASE + SSPCR0, 0x07);
+        bus.write32(SPI0_BASE + SSPCR1, 0x3);
+        bus.write32(SPI0_BASE + SSPDR, 0x11);
+        assert!(!bus.spi0.is_idle());
+        bus.spi0.reset();
+        assert!(bus.spi0.is_idle());
+    }
+}

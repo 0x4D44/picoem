@@ -217,7 +217,11 @@ impl ClocksRegs {
             }
             CLK_PERI_CTRL => {
                 self.clk_peri_ctrl = apply(self.clk_peri_ctrl, val);
-                false
+                // Peripheral clock derivation follows AUXSRC + ENABLE,
+                // so the clock tree must be recomputed whenever CLK_PERI
+                // changes — UART/SPI/I2C baud-rate models read
+                // `ClockTree::peri_hz()` on every cadence decision.
+                true
             }
             CLK_USB_CTRL => {
                 self.clk_usb_ctrl = apply(self.clk_usb_ctrl, val);
@@ -492,8 +496,35 @@ pub fn recompute(
     let int_div = ((clocks.clk_sys_div >> 16) & 0xFFFF).max(1);
     let sys_hz = sys_src_hz / int_div;
 
+    // RP2040 CLK_PERI mux (CLK_PERI_CTRL[7:5] = AUXSRC):
+    //   0 = clk_sys, 1 = PLL_SYS, 2 = PLL_USB, 3 = ROSC, 4 = XOSC,
+    //   5 = clksrc_gpin0, 6 = clksrc_gpin1, 7 = reserved.
+    // pico-sdk default is AUXSRC=0 (clk_sys); firmware often overrides
+    // to AUXSRC=1 (PLL_SYS direct) to detach clk_peri from clk_sys DIV.
+    let peri_enable = (clocks.clk_peri_ctrl & (1 << 11)) != 0;
+    let peri_src_hz = match (clocks.clk_peri_ctrl >> 5) & 0x7 {
+        0 => sys_hz,
+        1 => pll_output_hz(pll_sys),
+        2 => pll_output_hz(pll_usb),
+        3 => ROSC_FREQ_HZ,
+        4 => XOSC_FREQ_HZ,
+        _ => 0, // gpin0 / gpin1 / reserved — unmodelled
+    };
+    // CLK_PERI has no DIV on RP2040 (offset 0x4C reads zero). Treat the
+    // ENABLE bit as a gate: when clear, the peripheral clock defaults to
+    // clk_sys so a firmware that pokes at UART/SPI/I2C without
+    // programming CLK_PERI_CTRL still gets cadence. pico-sdk's
+    // `clock_configure` writes ENABLE along with AUXSRC, so the gate is
+    // benign in practice.
+    let peri_hz = if peri_enable {
+        peri_src_hz.max(1)
+    } else {
+        sys_hz.max(1)
+    };
+
     tree.ref_clk_hz = ref_hz;
     tree.sys_clk_hz = sys_hz;
+    tree.peri_clk_hz = peri_hz;
 }
 
 #[cfg(test)]
@@ -706,13 +737,19 @@ mod tests {
     }
 
     #[test]
-    fn non_glitchless_ctrl_does_not_trigger_recompute() {
-        // `write32` returning `false` for non-glitchless clocks keeps the
-        // Bus from recomputing the ClockTree on every unrelated CTRL poke —
-        // only clk_ref / clk_sys CTRL/DIV affect V1 tree frequencies.
+    fn non_sys_peri_ctrl_does_not_trigger_recompute() {
+        // `write32` returning `false` for non-tree-relevant clocks keeps
+        // the Bus from recomputing the ClockTree on every unrelated CTRL
+        // poke. Phase 2: CLK_PERI_CTRL DOES trigger recompute (unlike
+        // other non-glitchless clocks) because UART/SPI/I2C peripherals
+        // depend on `ClockTree::peri_clk_hz` for their baud-rate /
+        // bit-rate models.
         let mut c = ClocksRegs::new();
         assert!(!c.write32(CLK_GPOUT0_CTRL, 0x0800_0000, 0));
-        assert!(!c.write32(CLK_PERI_CTRL, 0x0800_0000, 0));
+        assert!(
+            c.write32(CLK_PERI_CTRL, 0x0800_0000, 0),
+            "CLK_PERI_CTRL must trigger recompute (Phase 2 UART/SPI/I2C cadence)"
+        );
         assert!(!c.write32(CLK_USB_CTRL, 0x0800_0000, 0));
         assert!(!c.write32(CLK_ADC_CTRL, 0x0800_0000, 0));
         assert!(!c.write32(CLK_RTC_CTRL, 0x0800_0000, 0));

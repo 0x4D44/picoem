@@ -25,6 +25,11 @@ pub struct ClockTree {
     pub sys_clk_hz: u32,
     /// Effective reference clock in Hz.
     pub ref_clk_hz: u32,
+    /// Effective peripheral clock in Hz (UART / SPI / I2C source).
+    /// Follows the selected `CLK_PERI_CTRL.AUXSRC` on RP2040; falls back
+    /// to `sys_clk_hz` when the peripheral clock is not separately
+    /// programmed (the pico-sdk default).
+    pub peri_clk_hz: u32,
 }
 
 impl Default for ClockTree {
@@ -32,7 +37,18 @@ impl Default for ClockTree {
         Self {
             sys_clk_hz: ROSC_FREQ_HZ,
             ref_clk_hz: ROSC_FREQ_HZ,
+            peri_clk_hz: ROSC_FREQ_HZ,
         }
+    }
+}
+
+impl ClockTree {
+    /// Current peripheral-clock frequency in Hz. UART baud-rate
+    /// divisors, SPI bit-rate prescalers, and I2C SCL generators all
+    /// derive their cadence from this frequency.
+    #[inline]
+    pub fn peri_hz(&self) -> u64 {
+        self.peri_clk_hz as u64
     }
 }
 

@@ -33,9 +33,13 @@ use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
 use crate::core::Nvic;
 use crate::dma::Dma;
+use crate::irq::{IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ, IRQ_UART1_IRQ};
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
+use crate::peripherals::i2c::I2cRegs;
 use crate::peripherals::psram::Psram;
+use crate::peripherals::spi::SpiRegs;
 use crate::peripherals::timer::TimerRegs;
+use crate::peripherals::uart::UartRegs;
 use crate::peripherals::watchdog_tick::WatchdogTickRegs;
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
@@ -63,6 +67,18 @@ pub const PLL_SYS_BASE: u32 = 0x4002_8000;
 pub const PLL_USB_BASE: u32 = 0x4002_C000;
 pub const BUSCTRL_BASE: u32 = 0x4003_0000;
 pub const ROSC_BASE: u32 = 0x4006_0000;
+/// UART0 block base (RP2040 datasheet §4.2). Reset-gated on bit 22.
+pub const UART0_BASE: u32 = 0x4003_4000;
+/// UART1 block base (RP2040 datasheet §4.2). Reset-gated on bit 23.
+pub const UART1_BASE: u32 = 0x4003_8000;
+/// SPI0 block base (RP2040 datasheet §4.4). Reset-gated on bit 16.
+pub const SPI0_BASE: u32 = 0x4003_C000;
+/// SPI1 block base (RP2040 datasheet §4.4). Reset-gated on bit 17.
+pub const SPI1_BASE: u32 = 0x4004_0000;
+/// I2C0 block base (RP2040 datasheet §4.3). Reset-gated on bit 3.
+pub const I2C0_BASE: u32 = 0x4004_4000;
+/// I2C1 block base (RP2040 datasheet §4.3). Reset-gated on bit 4.
+pub const I2C1_BASE: u32 = 0x4004_8000;
 /// TIMER block base (RP2040 datasheet §4.6). Reset-gated on
 /// [`peripheral_dispatch::RESET_TIMER`] (bit 21) — TIMER and WATCHDOG
 /// have independent RESETS bits per datasheet §2.14 Table 26. The 1 µs
@@ -191,6 +207,18 @@ pub struct Bus {
     /// polls `poll_alarms` on every step tail to surface alarm-match
     /// IRQs into `irq_pending`.
     pub(crate) timer: TimerRegs,
+    /// UART0 — PL011-derived (Phase 2 — HLD V7 §5.3).
+    pub(crate) uart0: UartRegs,
+    /// UART1 — PL011-derived.
+    pub(crate) uart1: UartRegs,
+    /// SPI0 — PL022-derived.
+    pub(crate) spi0: SpiRegs,
+    /// SPI1 — PL022-derived.
+    pub(crate) spi1: SpiRegs,
+    /// I2C0 — DW_apb_i2c.
+    pub(crate) i2c0: I2cRegs,
+    /// I2C1 — DW_apb_i2c.
+    pub(crate) i2c1: I2cRegs,
     /// DMA controller — Phase 1 stub (always idle). Phase 4 replaces
     /// this with the 12-channel model. Consulted by the fast-path gate
     /// in [`crate::Emulator::step`] via [`Dma::is_idle`].
@@ -291,6 +319,12 @@ impl Bus {
             pio: [PioBlock::new(), PioBlock::new()],
             watchdog_tick: WatchdogTickRegs::new(),
             timer: TimerRegs::new(),
+            uart0: UartRegs::new(IRQ_UART0_IRQ),
+            uart1: UartRegs::new(IRQ_UART1_IRQ),
+            spi0: SpiRegs::new(IRQ_SPI0_IRQ),
+            spi1: SpiRegs::new(IRQ_SPI1_IRQ),
+            i2c0: I2cRegs::new(IRQ_I2C0_IRQ),
+            i2c1: I2cRegs::new(IRQ_I2C1_IRQ),
             dma: Dma::new(),
             irq_pending: 0,
             nvics: [Nvic::new(), Nvic::new()],
@@ -604,6 +638,12 @@ impl Bus {
                 .timer
                 .read32(offset, self.master_cycle, self.clock_tree.sys_clk_hz),
             WATCHDOG_BASE => self.watchdog_tick.read32(offset),
+            UART0_BASE => self.uart0.read32(offset),
+            UART1_BASE => self.uart1.read32(offset),
+            SPI0_BASE => self.spi0.read32(offset),
+            SPI1_BASE => self.spi1.read32(offset),
+            I2C0_BASE => self.i2c0.read32(offset),
+            I2C1_BASE => self.i2c1.read32(offset),
             _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
         }
     }
@@ -661,6 +701,12 @@ impl Bus {
                 self.timer.write32(offset, val, alias, mc, sys_hz);
             }
             WATCHDOG_BASE => self.watchdog_tick.write32(offset, val, alias),
+            UART0_BASE => self.uart0.write32(offset, val, alias, &mut self.irq_pending),
+            UART1_BASE => self.uart1.write32(offset, val, alias, &mut self.irq_pending),
+            SPI0_BASE => self.spi0.write32(offset, val, alias, &mut self.irq_pending),
+            SPI1_BASE => self.spi1.write32(offset, val, alias, &mut self.irq_pending),
+            I2C0_BASE => self.i2c0.write32(offset, val, alias, &mut self.irq_pending),
+            I2C1_BASE => self.i2c1.write32(offset, val, alias, &mut self.irq_pending),
             _ => {
                 // Catch-all: store with alias semantics so firmware round-trips.
                 let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
@@ -712,6 +758,102 @@ impl Bus {
         self.ssi_regs.insert(offset, val);
     }
 
+    // ----------------------------------------------------------------
+    // Narrow-access dispatch for byte/halfword-significant peripheral
+    // registers (UART_DR, SSPDR, IC_DATA_CMD). Returns `Some(val)` /
+    // `true` when handled, `None` / `false` to signal the caller it
+    // should fall back to the word-RMW path. This keeps UART/SPI/I2C
+    // side-effect registers from suffering spurious FIFO pops on a
+    // byte write that would otherwise execute `read32` → splice →
+    // `write32` and double-side-effect the register.
+    // ----------------------------------------------------------------
+
+    /// Per HLD V7 §5.4, only peripherals with side-effect narrow
+    /// registers need narrow dispatch. Returns `true` if the peripheral
+    /// at `base` has one (UART DR, SPI DR, I2C DATA_CMD); callers
+    /// dispatch to `narrow_peripheral_read*` / `narrow_peripheral_write*`
+    /// when this is set, otherwise RMW-through-word is used.
+    #[inline]
+    fn peripheral_has_narrow_register(base: u32, offset: u32) -> bool {
+        match base {
+            UART0_BASE | UART1_BASE => offset == crate::peripherals::uart::UARTDR,
+            SPI0_BASE | SPI1_BASE => offset == crate::peripherals::spi::SSPDR,
+            I2C0_BASE | I2C1_BASE => offset == crate::peripherals::i2c::IC_DATA_CMD,
+            _ => false,
+        }
+    }
+
+    /// Byte-read a peripheral register with side-effect semantics —
+    /// UART_DR / SSPDR / IC_DATA_CMD. Caller guarantees `base + offset`
+    /// has been checked by `peripheral_has_narrow_register`.
+    fn narrow_peripheral_read8(&mut self, base: u32, offset: u32) -> u8 {
+        // RESETS is Bus-level — held peripherals return 0.
+        if peripheral_dispatch::is_held_in_reset(self, base) {
+            return 0;
+        }
+        match base {
+            UART0_BASE => self.uart0.read8(offset),
+            UART1_BASE => self.uart1.read8(offset),
+            SPI0_BASE => self.spi0.read8(offset),
+            SPI1_BASE => self.spi1.read8(offset),
+            I2C0_BASE => self.i2c0.read8(offset),
+            I2C1_BASE => self.i2c1.read8(offset),
+            _ => 0,
+        }
+    }
+
+    /// Halfword-read. Same constraints as `narrow_peripheral_read8`.
+    fn narrow_peripheral_read16(&mut self, base: u32, offset: u32) -> u16 {
+        if peripheral_dispatch::is_held_in_reset(self, base) {
+            return 0;
+        }
+        match base {
+            SPI0_BASE => self.spi0.read16(offset),
+            SPI1_BASE => self.spi1.read16(offset),
+            // UART DR and I2C DATA_CMD don't carry halfword semantics
+            // — a 16-bit read collapses to the low byte with zero in
+            // the high byte. Use the narrow byte dispatch and
+            // zero-extend.
+            UART0_BASE => self.uart0.read8(offset) as u16,
+            UART1_BASE => self.uart1.read8(offset) as u16,
+            I2C0_BASE => self.i2c0.read32(offset) as u16,
+            I2C1_BASE => self.i2c1.read32(offset) as u16,
+            _ => 0,
+        }
+    }
+
+    /// Byte-write.
+    fn narrow_peripheral_write8(&mut self, base: u32, offset: u32, val: u8) {
+        if peripheral_dispatch::is_held_in_reset(self, base) {
+            return;
+        }
+        match base {
+            UART0_BASE => self.uart0.write8(offset, val, &mut self.irq_pending),
+            UART1_BASE => self.uart1.write8(offset, val, &mut self.irq_pending),
+            SPI0_BASE => self.spi0.write8(offset, val, &mut self.irq_pending),
+            SPI1_BASE => self.spi1.write8(offset, val, &mut self.irq_pending),
+            I2C0_BASE => self.i2c0.write8(offset, val, &mut self.irq_pending),
+            I2C1_BASE => self.i2c1.write8(offset, val, &mut self.irq_pending),
+            _ => {}
+        }
+    }
+
+    /// Halfword-write.
+    fn narrow_peripheral_write16(&mut self, base: u32, offset: u32, val: u16) {
+        if peripheral_dispatch::is_held_in_reset(self, base) {
+            return;
+        }
+        match base {
+            SPI0_BASE => self.spi0.write16(offset, val, &mut self.irq_pending),
+            SPI1_BASE => self.spi1.write16(offset, val, &mut self.irq_pending),
+            UART0_BASE => self.uart0.write8(offset, val as u8, &mut self.irq_pending),
+            UART1_BASE => self.uart1.write8(offset, val as u8, &mut self.irq_pending),
+            I2C0_BASE => self.i2c0.write32(offset, val as u32, 0, &mut self.irq_pending),
+            I2C1_BASE => self.i2c1.write32(offset, val as u32, 0, &mut self.irq_pending),
+            _ => {}
+        }
+    }
+
     // ======================================================================
     // Read / write entry points
     // ======================================================================
@@ -736,8 +878,15 @@ impl Bus {
                 }
             }
             0x4 | 0x5 => {
-                let word = self.peripheral_read32(addr & !3);
-                word.to_le_bytes()[(addr & 3) as usize]
+                let canonical = addr & !0x3000;
+                let base = canonical & 0xFFFF_F000;
+                let offset = canonical & 0x0000_0FFF;
+                if Self::peripheral_has_narrow_register(base, offset & !3) {
+                    self.narrow_peripheral_read8(base, offset & !3)
+                } else {
+                    let word = self.peripheral_read32(addr & !3);
+                    word.to_le_bytes()[(addr & 3) as usize]
+                }
             }
             0xD => {
                 let word = self.sio_read32(addr & !3);
@@ -782,9 +931,16 @@ impl Bus {
                 }
             }
             0x4 | 0x5 => {
-                let word = self.peripheral_read32(addr & !3);
-                let half = ((addr >> 1) & 1) as usize;
-                [word as u16, (word >> 16) as u16][half]
+                let canonical = addr & !0x3000;
+                let base = canonical & 0xFFFF_F000;
+                let offset = canonical & 0x0000_0FFF;
+                if Self::peripheral_has_narrow_register(base, offset & !3) {
+                    self.narrow_peripheral_read16(base, offset & !3)
+                } else {
+                    let word = self.peripheral_read32(addr & !3);
+                    let half = ((addr >> 1) & 1) as usize;
+                    [word as u16, (word >> 16) as u16][half]
+                }
             }
             0xD => {
                 let word = self.sio_read32(addr & !3);
@@ -884,21 +1040,27 @@ impl Bus {
                     // read. Silently ignore.
                     return;
                 }
-                let alias = (addr >> 12) & 3;
-                // Byte-level RMW into the word, preserving alias semantics.
-                let word_addr = canonical & !3;
-                let byte_idx = (canonical & 3) as usize;
-                let old = self.peripheral_read32(word_addr);
-                let mut bytes = old.to_le_bytes();
-                bytes[byte_idx] = val;
-                let new_word = u32::from_le_bytes(bytes);
-                // For an alias access, convert the byte to a positioned
-                // word and defer alias math to the peripheral layer.
-                if alias == 0 {
-                    self.peripheral_write32(word_addr, new_word, 0);
+                let offset = canonical & 0x0000_0FFF;
+                let word_offset = offset & !3;
+                if Self::peripheral_has_narrow_register(base, word_offset) {
+                    self.narrow_peripheral_write8(base, word_offset, val);
                 } else {
-                    let shifted = (val as u32) << (byte_idx * 8);
-                    self.peripheral_write32(word_addr, shifted, alias);
+                    let alias = (addr >> 12) & 3;
+                    // Byte-level RMW into the word, preserving alias semantics.
+                    let word_addr = canonical & !3;
+                    let byte_idx = (canonical & 3) as usize;
+                    let old = self.peripheral_read32(word_addr);
+                    let mut bytes = old.to_le_bytes();
+                    bytes[byte_idx] = val;
+                    let new_word = u32::from_le_bytes(bytes);
+                    // For an alias access, convert the byte to a positioned
+                    // word and defer alias math to the peripheral layer.
+                    if alias == 0 {
+                        self.peripheral_write32(word_addr, new_word, 0);
+                    } else {
+                        let shifted = (val as u32) << (byte_idx * 8);
+                        self.peripheral_write32(word_addr, shifted, alias);
+                    }
                 }
             }
             0xD => {
@@ -961,18 +1123,24 @@ impl Bus {
                     // PIO is 32-bit access only (matches mdrp2350).
                     return;
                 }
-                let alias = (addr >> 12) & 3;
-                let word_addr = canonical & !3;
-                let half_idx = ((canonical >> 1) & 1) as usize;
-                let old = self.peripheral_read32(word_addr);
-                let mut halves: [u16; 2] = [old as u16, (old >> 16) as u16];
-                halves[half_idx] = val;
-                let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
-                if alias == 0 {
-                    self.peripheral_write32(word_addr, new_word, 0);
+                let offset = canonical & 0x0000_0FFF;
+                let word_offset = offset & !3;
+                if Self::peripheral_has_narrow_register(base, word_offset) {
+                    self.narrow_peripheral_write16(base, word_offset, val);
                 } else {
-                    let shifted = (val as u32) << (half_idx * 16);
-                    self.peripheral_write32(word_addr, shifted, alias);
+                    let alias = (addr >> 12) & 3;
+                    let word_addr = canonical & !3;
+                    let half_idx = ((canonical >> 1) & 1) as usize;
+                    let old = self.peripheral_read32(word_addr);
+                    let mut halves: [u16; 2] = [old as u16, (old >> 16) as u16];
+                    halves[half_idx] = val;
+                    let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
+                    if alias == 0 {
+                        self.peripheral_write32(word_addr, new_word, 0);
+                    } else {
+                        let shifted = (val as u32) << (half_idx * 16);
+                        self.peripheral_write32(word_addr, shifted, alias);
+                    }
                 }
             }
             0xD => {
@@ -1237,11 +1405,29 @@ impl Bus {
         // itself runs in the fast path. A latched INTR without INTE
         // set (no NVIC routing) still counts as idle because nothing
         // observable happens per-cycle. WATCHDOG_TICK has no tick.
+        // Phase 2: UART/SPI/I2C are per-cycle-tickable — their
+        // `is_idle()` getters gate the fast path.
         #[cfg(debug_assertions)]
         {
-            let _ = (&self.watchdog_tick, &self.dma, &self.timer);
+            let _ = (
+                &self.watchdog_tick,
+                &self.dma,
+                &self.timer,
+                &self.uart0,
+                &self.uart1,
+                &self.spi0,
+                &self.spi1,
+                &self.i2c0,
+                &self.i2c1,
+            );
         }
         self.timer.is_idle()
+            && self.uart0.is_idle()
+            && self.uart1.is_idle()
+            && self.spi0.is_idle()
+            && self.spi1.is_idle()
+            && self.i2c0.is_idle()
+            && self.i2c1.is_idle()
     }
 
     /// True iff at least one PIO SM is enabled in either block, or any
@@ -1261,10 +1447,10 @@ impl Bus {
     ///
     /// Called from the slow-path loop in [`crate::Emulator::step`]
     /// whenever the fast-path gate opens (PIO active, DMA live, or an
-    /// IRQ already pending). Phase 1 Wave 2: only TIMER contributes —
-    /// `poll_alarms` folds any just-fired alarm IRQs into
-    /// [`Self::irq_pending`]. Later phases add `self.uart0.tick(&mut
-    /// self.irq_pending)` etc.
+    /// IRQ already pending). TIMER alarms are polled here for lazy-
+    /// fire at match. UART/SPI/I2C advance their TX shift registers
+    /// by one sysclk via `tick(1, clock_tree, irqs)` and OR any
+    /// level-driven IRQs into `irq_pending`.
     #[inline]
     pub fn tick_peripherals(&mut self) {
         // TIMER alarms are lazy-fire at match: `poll_alarms` is cheap
@@ -1276,6 +1462,13 @@ impl Bus {
             .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
         // TIMER IRQs occupy NVIC lines 0..3.
         self.irq_pending |= nvic_bits & 0xF;
+        // UART / SPI / I2C: per-cycle TX drain + IRQ route.
+        self.uart0.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.uart1.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.spi0.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.spi1.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.i2c0.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.i2c1.tick(1, &self.clock_tree, &mut self.irq_pending);
     }
 
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).

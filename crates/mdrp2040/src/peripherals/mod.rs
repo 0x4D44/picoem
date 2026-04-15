@@ -41,8 +41,11 @@
 //! not re-shift into the original `0x0000 / 0x1000 / 0x2000 / 0x3000`
 //! bit positions.
 
+pub mod i2c;
 pub mod psram;
+pub mod spi;
 pub mod timer;
+pub mod uart;
 pub mod watchdog_tick;
 
 /// Apply an APB alias read-modify-write onto a plain-storage register.

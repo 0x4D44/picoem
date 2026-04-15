@@ -16,10 +16,25 @@
 //! distinct CLR writes. Additional entries are added per-phase as UART /
 //! SPI / I2C / ADC / PWM land.
 
-use super::{Bus, TIMER_BASE, WATCHDOG_BASE};
+use super::{
+    Bus, I2C0_BASE, I2C1_BASE, SPI0_BASE, SPI1_BASE, TIMER_BASE, UART0_BASE, UART1_BASE,
+    WATCHDOG_BASE,
+};
 
-/// RESETS bit for the TIMER peripheral (RP2040 datasheet §2.14 Table 26).
+/// RESETS bit for I2C0 (RP2040 datasheet §2.14 Table 26).
+pub const RESET_I2C0: u8 = 3;
+/// RESETS bit for I2C1.
+pub const RESET_I2C1: u8 = 4;
+/// RESETS bit for SPI0.
+pub const RESET_SPI0: u8 = 16;
+/// RESETS bit for SPI1.
+pub const RESET_SPI1: u8 = 17;
+/// RESETS bit for the TIMER peripheral.
 pub const RESET_TIMER: u8 = 21;
+/// RESETS bit for UART0.
+pub const RESET_UART0: u8 = 22;
+/// RESETS bit for UART1.
+pub const RESET_UART1: u8 = 23;
 
 /// RESETS bit for the watchdog + its tick divider (RP2040 datasheet §2.14
 /// Table 26). Independent of [`RESET_TIMER`] — the 1 µs cadence coupling
@@ -37,7 +52,13 @@ pub const RESET_WATCHDOG: u8 = 24;
 /// level — either because it has no reset bit (SIO, PPB, XIP_CTRL,
 /// memory) or because RESETS routing for it hasn't landed yet.
 pub static BASE_RESET_MAP: &[(u32, u8)] = &[
+    (I2C0_BASE, RESET_I2C0),
+    (I2C1_BASE, RESET_I2C1),
+    (SPI0_BASE, RESET_SPI0),
+    (SPI1_BASE, RESET_SPI1),
     (TIMER_BASE, RESET_TIMER),
+    (UART0_BASE, RESET_UART0),
+    (UART1_BASE, RESET_UART1),
     (WATCHDOG_BASE, RESET_WATCHDOG),
 ];
 
