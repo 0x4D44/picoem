@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.13.0"
+version = "0.16.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,15 @@ mdrp2040 = { path = "../mdrp2040" }
 probe-rs = "0.31"
 rand = "0.8"
 chrono = "0.4"
+
+# Dev-only: re-declare `mdrp2350` with the `test-hooks` feature so
+# unit tests can call `PioBlock::push_rx` for staging RX FIFO words
+# (e.g. the end-to-end glue DMA chain test). Cargo unifies features
+# across `[dependencies]` and `[dev-dependencies]` of the same crate,
+# so this implicitly enables `mdpicoem-common/test-hooks` during tests.
+[dev-dependencies]
+mdrp2350 = { path = "../mdrp2350", features = ["test-hooks"] }
+mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
 
 # ---------------------------------------------------------------------------
 # RP2350 (Cortex-M33) binaries
@@ -58,6 +67,10 @@ path = "src/bin/onerom_full_system_rp2350.rs"
 name = "smoke_pio_halt_atomicity"
 path = "src/bin/smoke_pio_halt_atomicity.rs"
 
+[[bin]]
+name = "silicon_cycle_oracle_rp2350"
+path = "src/bin/silicon_cycle_oracle_rp2350.rs"
+
 # ---------------------------------------------------------------------------
 # RP2040 (Cortex-M0+) binaries
 # ---------------------------------------------------------------------------
@@ -73,3 +86,7 @@ path = "src/bin/probe_diff_rp2040.rs"
 [[bin]]
 name = "paced_bench_rp2040"
 path = "src/bin/paced_bench_rp2040.rs"
+
+[[bin]]
+name = "picogus_diff_rp2040"
+path = "src/bin/picogus_diff_rp2040.rs"

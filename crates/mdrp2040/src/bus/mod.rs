@@ -144,6 +144,21 @@ pub struct Bus {
     /// [`crate::Emulator::update_gpio`] on GPIO1/2/3 (CS/SCK/MOSI) and
     /// drives GPIO0 (MISO) back into [`Self::gpio_in`].
     pub psram: Psram,
+    /// Externally-driven GPIO input override values. Bits set in
+    /// [`Self::external_gpio_in_mask`] take their value from this field
+    /// instead of whatever SIO / PIO / PSRAM would have produced; bits
+    /// not set in the mask are unaffected. Used by the
+    /// `picogus_diff_rp2040` harness to inject synthetic ISA bus
+    /// waveforms (IOW#, IOR#, AD0..AD9) without those pokes being
+    /// clobbered by [`crate::Emulator::update_gpio`]. The override is
+    /// applied last in the merge — after SIO, PIO, and PSRAM — so an
+    /// external driver always wins on the pins it claims.
+    pub external_gpio_in_override: u32,
+    /// Mask of GPIO input bits driven externally (see
+    /// [`Self::external_gpio_in_override`]). The harness sets this to
+    /// cover the ISA pins it injects (IOW#, IOR#, AD0..AD9) but **not**
+    /// PSRAM pins (GPIO0..3) — those still belong to the on-chip merge.
+    pub external_gpio_in_mask: u32,
     /// Per-core event flag for WFE/SEV / FIFO event protocol.
     pub event_flag: [bool; 2],
     /// Which core is currently executing on the bus.
@@ -184,6 +199,8 @@ impl Bus {
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
             psram: Psram::new(),
+            external_gpio_in_override: 0,
+            external_gpio_in_mask: 0,
             event_flag: [false; 2],
             active_core: 0,
             last_access_cycles: 0,

@@ -2101,3 +2101,99 @@ mod quantum_contract {
         );
     }
 }
+
+mod external_gpio_override {
+    //! Tests for `Bus::external_gpio_in_override` /
+    //! `external_gpio_in_mask` — the harness-injection escape hatch that
+    //! lets `picogus_diff_rp2040` drive synthetic ISA pins (IOW, IOR,
+    //! AD0..AD9) without `Emulator::update_gpio` clobbering them on the
+    //! next merge.
+    //!
+    //! Without these tests, the regression caught by Stage 4 review (B1
+    //! — direct `bus.gpio_in` writes vanish on the first `update_gpio`)
+    //! has no fixed defence: a future `update_gpio` change could
+    //! reintroduce the same overwrite without anything failing.
+    use crate::{Config, EmulatorBuilder};
+
+    #[test]
+    fn override_wins_over_default_merge() {
+        // Set bits on GPIO10..15 via the override. After update_gpio,
+        // those bits in `gpio_in` must reflect the override exactly.
+        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        emu.reset();
+
+        let mask: u32 = 0b111111u32 << 10; // GPIO10..GPIO15
+        let value: u32 = 0b101010u32 << 10;
+        emu.bus.external_gpio_in_mask = mask;
+        emu.bus.external_gpio_in_override = value;
+
+        emu.update_gpio();
+
+        assert_eq!(
+            emu.bus.gpio_in & mask,
+            value & mask,
+            "override pins must reflect external_gpio_in_override after update_gpio"
+        );
+    }
+
+    #[test]
+    fn override_wins_over_sio_drive() {
+        // Drive the same pins via SIO (gpio_oe + gpio_out), then assert
+        // the override still wins. This is the exact race that B1 hid:
+        // SIO sets a bit, update_gpio merges, and the override would be
+        // lost without the post-PSRAM splice.
+        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        emu.reset();
+
+        let mask: u32 = 0b111111u32 << 10;
+        let override_value: u32 = 0b101010u32 << 10;
+        let sio_value: u32 = 0b010101u32 << 10; // bit-inverse pattern
+
+        // First, no override — confirm SIO drives gpio_in normally.
+        emu.bus.sio.gpio_oe = mask;
+        emu.bus.sio.gpio_out = sio_value;
+        emu.update_gpio();
+        assert_eq!(
+            emu.bus.gpio_in & mask,
+            sio_value & mask,
+            "without override, SIO must drive these pins"
+        );
+
+        // Now apply the override on the same pins. Override must win.
+        emu.bus.external_gpio_in_mask = mask;
+        emu.bus.external_gpio_in_override = override_value;
+        emu.update_gpio();
+        assert_eq!(
+            emu.bus.gpio_in & mask,
+            override_value & mask,
+            "with override on, override pins must override SIO"
+        );
+
+        // Pins outside the mask should still reflect SIO. Drive bit 0
+        // via SIO as a witness; with mask covering 10..15 only, bit 0
+        // stays from SIO.
+        emu.bus.sio.gpio_oe |= 1;
+        emu.bus.sio.gpio_out |= 1;
+        emu.update_gpio();
+        assert_eq!(emu.bus.gpio_in & 1, 1, "non-overridden pins follow SIO");
+        // And the override pins still win.
+        assert_eq!(
+            emu.bus.gpio_in & mask,
+            override_value & mask,
+            "override unchanged by an unrelated SIO write"
+        );
+    }
+
+    #[test]
+    fn reset_clears_override() {
+        // Set the override, reset, verify both fields are 0 — protects
+        // tests from leaking state across resets and matches the rest
+        // of the Bus reset conventions.
+        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        emu.bus.external_gpio_in_mask = 0xFFFF_FFFF;
+        emu.bus.external_gpio_in_override = 0xDEAD_BEEF;
+        emu.reset();
+        assert_eq!(emu.bus.external_gpio_in_mask, 0);
+        assert_eq!(emu.bus.external_gpio_in_override, 0);
+    }
+}

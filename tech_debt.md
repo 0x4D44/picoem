@@ -398,3 +398,53 @@ some paths), the flag stays `true` and all subsequent tap entries
 silently skip. Fix: RAII guard struct (ctor sets, dtor clears).
 Five-line change. Low priority — unlikely in steady-state MIDI
 playback.
+
+## PicoGUS Integration — Stage 4 follow-ups
+
+Surfaced by Stage 4 devils-advocate. Some items are blockers for
+Stage 6 and must be resolved before the end-to-end MIDI demo lands.
+
+### ISA pin mapping not cross-checked against PicoGUS v4.0.0 firmware
+
+Stage 4's replayer hardcodes pin assignments (IOW=GPIO4, IOR=GPIO5,
+AD0..9=GPIO6..15) in the top-of-file comment. These came from the
+original research summary but have NOT been cross-checked line-for-
+line against `github.com/polpo/picogus/blob/v4.0.0/sw/isa_io.pio`
+and `sw/CMakeLists.txt`. Two concrete risks:
+
+1. A pin number mismatch means the firmware's PIO program never sees
+   the waveform we drive, Stage 6 produces silence.
+2. If any ISA pin collides with the I2S pins Stage 5 needs
+   (PCM5102-style I2S typically lives on GPIO26/27/28 in PicoGUS),
+   we'll have a collision at Stage 5/6 integration time.
+
+Fix: before Stage 5 coding starts, vendor `polpo/picogus@v4.0.0`'s
+`isa_io.pio` + `CMakeLists.txt` snapshots under `third_party/` and
+extract the authoritative pin constants into a shared module (e.g.
+`mdpicoem-common::picogus_pins`). Stage 4's replayer and Stage 5's
+I2S decoder should both import from there. **Must resolve before
+Stage 6.**
+
+### `write16` → two `write8`s is semantically wrong for GUS 16-bit ports
+
+The replayer splits a `write16` event at port P into two write8s at
+P and P+1. Real GUS has 16-bit registers (e.g. voice-start-high)
+that decode as a single 16-bit port, not two 8-bit ports. Splitting
+can write to the wrong register. Real firmware may not trip this
+(DOSBox-X's tap preserves the width, and GUS MIDI playback may not
+actually use 16-bit port accesses), but traces from some drivers
+could. Fix: either (a) extend the synthetic waveform to drive SBHE#
+and a second pin block for D8..D15, or (b) emit a warning on first
+`write16` and document as a caveat. Defer until Stage 6 surfaces the
+need (if a MIDI file fails to replay correctly). Low priority.
+
+### Stage 4 misleading comment after B1 fix
+
+Comment in `picogus_diff_rp2040.rs` near the drive_pins path still
+refers to preserving "firmware-driven pin state" (PSRAM MISO etc.).
+The B1 fix (external override on Bus) makes this a lie — the mask
+preserves bit-position-wise, but `update_gpio` always rebuilds
+`bus.gpio_in` from scratch and re-applies the override. The test
+mirroring into `bus.gpio_in` within `drive_pins` is decorative for
+testability, not load-bearing for correctness. Tidy the comment.
+Trivial (1 minute).
