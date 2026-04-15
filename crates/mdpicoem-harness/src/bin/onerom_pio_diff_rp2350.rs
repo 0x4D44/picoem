@@ -10,11 +10,11 @@
 //! Zero C dependencies — the trace file is the only interface to epio.
 
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use mdpicoem_common::pio::PioBlock;
+use mdpicoem_harness::onerom_trace::{self, Trace};
 
 /// Start PCs for OneROM's three SMs (derived from `setup_onerom`'s
 /// instruction layout: SM0 = 6 instrs at 0-5, SM1 = 2 instrs at 6-7,
@@ -34,108 +34,7 @@ const SM1_PRE_INSTRS: &[u16] = &[
     0xA027, // MOV X, OSR    (101_0_0000_0010_0111)
 ];
 
-// ---------------------------------------------------------------------------
-// Trace file
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct Trace {
-    instrs: Vec<u16>,
-    sm_regs: [SmReg; 4],
-    rows: Vec<BodyRow>,
-}
-
-#[derive(Copy, Clone, Default)]
-struct SmReg {
-    clkdiv: u32,
-    execctrl: u32,
-    shiftctrl: u32,
-    pinctrl: u32,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-struct BodyRow {
-    cycle: u32,
-    input_drive: u32,
-    input_level: u32,
-    out_drive: u32,
-    out_level: u32,
-}
-
-fn parse_trace(path: &PathBuf) -> Result<Trace, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let mut trace = Trace::default();
-    for (lineno, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("instr ") {
-            parse_instr(rest, &mut trace).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
-        } else if let Some(rest) = line.strip_prefix("reg ") {
-            parse_reg(rest, &mut trace).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
-        } else {
-            parse_body_row(line, &mut trace).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
-        }
-    }
-    Ok(trace)
-}
-
-fn parse_instr(rest: &str, trace: &mut Trace) -> Result<(), String> {
-    let mut toks = rest.split_ascii_whitespace();
-    let _block: u8 = next_num(&mut toks, "block")?;
-    let count: u32 = next_num(&mut toks, "count")?;
-    for _ in 0..count {
-        let word = toks.next().ok_or("missing instr word")?;
-        let v = u16::from_str_radix(word.trim_start_matches("0x"), 16)
-            .map_err(|_| format!("bad instr hex: {}", word))?;
-        trace.instrs.push(v);
-    }
-    Ok(())
-}
-
-fn parse_reg(rest: &str, trace: &mut Trace) -> Result<(), String> {
-    let mut toks = rest.split_ascii_whitespace();
-    let _block: u8 = next_num(&mut toks, "block")?;
-    let sm: u8 = next_num(&mut toks, "sm")?;
-    if sm >= 4 {
-        return Err(format!("sm out of range: {}", sm));
-    }
-    let clkdiv = next_hex(&mut toks, "clkdiv")?;
-    let execctrl = next_hex(&mut toks, "execctrl")?;
-    let shiftctrl = next_hex(&mut toks, "shiftctrl")?;
-    let pinctrl = next_hex(&mut toks, "pinctrl")?;
-    trace.sm_regs[sm as usize] = SmReg { clkdiv, execctrl, shiftctrl, pinctrl };
-    Ok(())
-}
-
-fn parse_body_row(line: &str, trace: &mut Trace) -> Result<(), String> {
-    let mut toks = line.split_ascii_whitespace();
-    let cycle: u32 = next_num(&mut toks, "cycle")?;
-    let input_drive = next_hex(&mut toks, "input_drive")?;
-    let input_level = next_hex(&mut toks, "input_level")?;
-    let out_drive = next_hex(&mut toks, "out_drive")?;
-    let out_level = next_hex(&mut toks, "out_level")?;
-    trace.rows.push(BodyRow { cycle, input_drive, input_level, out_drive, out_level });
-    Ok(())
-}
-
-fn next_num<'a, T: std::str::FromStr>(
-    toks: &mut impl Iterator<Item = &'a str>,
-    what: &str,
-) -> Result<T, String> {
-    let s = toks.next().ok_or_else(|| format!("missing {}", what))?;
-    s.parse::<T>().map_err(|_| format!("bad {} number: {}", what, s))
-}
-
-fn next_hex<'a>(
-    toks: &mut impl Iterator<Item = &'a str>,
-    what: &str,
-) -> Result<u32, String> {
-    let s = toks.next().ok_or_else(|| format!("missing {}", what))?;
-    u32::from_str_radix(s.trim_start_matches("0x"), 16)
-        .map_err(|_| format!("bad {} hex: {}", what, s))
-}
+// Trace file model (parsing lives in `mdpicoem_harness::onerom_trace`).
 
 // ---------------------------------------------------------------------------
 // Our-PIO setup — reproduce epio's post-`epio_from_apio()` state
@@ -153,7 +52,7 @@ fn setup_pio(trace: &Trace) -> PioBlock {
     // Configure each SM (SM3 regs are zero — skipping them avoids
     // `clkdiv=0` landmines, though write32 tolerates it).
     for sm in 0..4u32 {
-        let reg = &trace.sm_regs[sm as usize];
+        let reg = &trace.regs[sm as usize];
         let base = 0x0C8 + sm * 0x18;
         pio.write32(base + 0x00, reg.clkdiv, 0);
         pio.write32(base + 0x04, reg.execctrl, 0);
@@ -301,7 +200,7 @@ fn main() -> ExitCode {
         PathBuf::from("crates/mdpicoem-harness/oracles/onerom_2364.trace")
     };
 
-    let trace = match parse_trace(&trace_path) {
+    let trace = match onerom_trace::parse_trace(&trace_path) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("failed to parse {}: {}", trace_path.display(), e);
@@ -312,7 +211,7 @@ fn main() -> ExitCode {
     println!(
         "loaded {} instrs, {} body rows from {}",
         trace.instrs.len(),
-        trace.rows.len(),
+        trace.body.len(),
         trace_path.display()
     );
 
@@ -320,7 +219,7 @@ fn main() -> ExitCode {
 
     let mut divergences = 0usize;
     let mut glue_dma = GlueDma::default();
-    for row in &trace.rows {
+    for row in &trace.body {
         let gpio_in = compose_gpio_in(row.input_drive, row.input_level);
         pio.step(gpio_in);
         glue_dma.tick(&mut pio);
@@ -351,7 +250,7 @@ fn main() -> ExitCode {
     }
 
     if divergences == 0 {
-        println!("PASS — all {} cycles match the committed trace", trace.rows.len());
+        println!("PASS — all {} cycles match the committed trace", trace.body.len());
         ExitCode::SUCCESS
     } else {
         println!();
