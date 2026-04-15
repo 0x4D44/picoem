@@ -161,3 +161,63 @@ fn load_image_to_sram_still_works_after_flash_plumbing() {
     emu.load_image(0x2000_0000, &[0x01, 0x02, 0x03, 0x04]);
     assert_eq!(emu.bus.read32(0x2000_0000), 0x04030201);
 }
+
+// ---------------------------------------------------------------------------
+// Phase A (PicoGUS Bring-up): ADC CS.READY init-gate
+// ---------------------------------------------------------------------------
+
+/// Hand-assembled Thumb-16 mirror of pico-sdk's `adc_init()` wait-for-
+/// READY loop. Success sentinel is the `B .` self-loop at 0x2000_0010
+/// — asserting `PC == 0x2000_0010` rules out "still spinning at the
+/// poll BEQ target 0x2000_000A" and "faulted into 0x0000_0000".
+fn assemble_adc_init_poll() -> Vec<u8> {
+    let halfwords: &[u16] = &[
+        0x4B04, // 0x00: LDR  r3, [PC, #16]   ; r3 = ADC_BASE
+        0x2101, // 0x02: MOVS r1, #1          ; r1 = CS_EN
+        0x2280, // 0x04: MOVS r2, #0x80
+        0x0052, // 0x06: LSLS r2, r2, #1      ; r2 = 0x100 (CS_READY)
+        0x6019, // 0x08: STR  r1, [r3, #0]    ; adc_hw->cs = EN
+        0x681C, // 0x0A: LDR  r4, [r3, #0]    ; poll: r4 = adc_hw->cs
+        0x4214, // 0x0C: TST  r4, r2          ; r4 & CS_READY
+        0xD0FC, // 0x0E: BEQ  poll            ; back to 0x2000_000A
+        0xE7FE, // 0x10: B    .               ; exit sentinel
+        0xBF00, // 0x12: NOP                  ; align literal pool
+    ];
+    let mut out = Vec::with_capacity(halfwords.len() * 2 + 4);
+    for hw in halfwords {
+        out.extend_from_slice(&hw.to_le_bytes());
+    }
+    // Literal pool at 0x2000_0014: ADC_BASE = 0x4004_C000.
+    out.extend_from_slice(&0x4004_C000u32.to_le_bytes());
+    out
+}
+
+#[test]
+fn adc_init_sdk_pattern_exits_ready_poll() {
+    const RESETS_BASE: u32 = 0x4000_C000;
+    const RESETS_CLR_ALIAS: u32 = 0x3000;
+
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let prog = assemble_adc_init_poll();
+    let load_addr = 0x2000_0000u32;
+    emu.load_image(load_addr, &prog);
+
+    // Default Bus holds ADC in reset; release it so CS writes land.
+    emu.bus.write32(RESETS_BASE + RESETS_CLR_ALIAS, 1u32 << 0);
+
+    emu.cores[0].regs.msp = 0x2002_0000;
+    emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+    emu.cores[0].regs.set_pc(load_addr);
+    emu.cores[0].regs.xpsr = 1 << 24; // Thumb bit
+
+    for _ in 0..64 {
+        emu.step();
+    }
+
+    assert_eq!(
+        emu.cores[0].regs.pc(),
+        0x2000_0010,
+        "adc_init poll must exit to B . sentinel; PC={:#010x}",
+        emu.cores[0].regs.pc()
+    );
+}

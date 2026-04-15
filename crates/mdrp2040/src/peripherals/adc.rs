@@ -376,12 +376,30 @@ impl AdcRegs {
     pub fn write32(&mut self, offset: u32, value: u32, alias: u32, irqs: &mut u32) {
         match offset {
             CS => {
+                let old_cs = self.cs;
                 let mut stored = self.cs;
                 apply_alias_rmw(&mut stored, value, alias);
                 // Clear bits that firmware isn't allowed to set
                 // directly (READY is driven by the peripheral; ERR is
                 // a sticky derived from conversion overruns).
                 self.cs = (stored & CS_WRITE_MASK) | (self.cs & (CS_READY | CS_ERR));
+                // Power-up latch: silicon asserts READY after EN 0->1
+                // once the analog block stabilises (~200 µs). We model
+                // that as a zero-delay transition so pico-sdk's
+                // `adc_init()` poll loop exits on its first re-read.
+                // `maybe_start` below will then clear READY again if
+                // the same write armed a conversion — keeping existing
+                // Phase 3 end-state behaviour intact.
+                let en_before = (old_cs & CS_EN) != 0;
+                let en_after = (self.cs & CS_EN) != 0;
+                if !en_before && en_after && self.conversion_remaining.is_none() {
+                    self.cs |= CS_READY;
+                } else if en_before && !en_after {
+                    // EN 1->0: ADC powers down. Abort any in-flight
+                    // conversion and clear READY (ADC off → not ready).
+                    self.conversion_remaining = None;
+                    self.cs &= !CS_READY;
+                }
                 self.maybe_start();
             }
             RESULT => {} // read-only
@@ -781,5 +799,74 @@ mod tests {
         let mut irqs = 0u32;
         a.write32(DIV, 0x0012_3456, 0, &mut irqs);
         assert_eq!(a.read32(DIV), 0x0012_3456);
+    }
+
+    // --- EN 0->1 READY power-up latch (Phase A, PicoGUS) -----------------
+
+    #[test]
+    fn en_alone_sets_ready() {
+        let mut a = AdcRegs::new(ADC_IRQ);
+        let mut irqs = 0u32;
+        a.write32(CS, CS_EN, 0, &mut irqs);
+        assert_eq!(a.cs & CS_READY, CS_READY, "EN 0->1 must latch READY");
+    }
+
+    #[test]
+    fn en_then_sdk_style_poll_exits() {
+        let mut a = AdcRegs::new(ADC_IRQ);
+        let mut irqs = 0u32;
+        a.write32(CS, CS_EN, 0, &mut irqs);
+        let cs = a.read32(CS);
+        assert_ne!(cs & CS_READY, 0, "pico-sdk adc_init poll must exit on first re-read");
+    }
+
+    #[test]
+    fn conversion_in_flight_clears_ready_then_restores() {
+        let mut a = AdcRegs::new(ADC_IRQ);
+        let mut irqs = 0u32;
+        // EN alone latches READY.
+        a.write32(CS, CS_EN, 0, &mut irqs);
+        assert_eq!(a.cs & CS_READY, CS_READY);
+        // BITSET START_ONCE → maybe_start arms conversion and clears READY.
+        a.write32(CS, CS_START_ONCE, 2, &mut irqs);
+        assert_eq!(a.cs & CS_READY, 0, "conversion armed should clear READY");
+        // Complete the conversion.
+        a.tick(400, &default_tree(), &mut irqs);
+        assert_eq!(a.cs & CS_READY, CS_READY, "conversion completion re-latches READY");
+    }
+
+    #[test]
+    fn en_cleared_clears_ready() {
+        let mut a = AdcRegs::new(ADC_IRQ);
+        let mut irqs = 0u32;
+        a.write32(CS, CS_EN, 0, &mut irqs);
+        assert_eq!(a.cs & CS_READY, CS_READY);
+        // BITCLR EN → READY follows EN back to zero.
+        a.write32(CS, CS_EN, 3, &mut irqs);
+        assert_eq!(a.cs & CS_READY, 0, "EN 1->0 must clear READY");
+    }
+
+    #[test]
+    fn en_cleared_midconversion_cancels() {
+        let mut a = AdcRegs::new(ADC_IRQ);
+        let mut irqs = 0u32;
+        // EN + START_ONCE: maybe_start arms, READY cleared for the window.
+        a.write32(CS, CS_EN | CS_START_ONCE, 0, &mut irqs);
+        assert!(a.conversion_remaining.is_some());
+        assert_eq!(a.cs & CS_READY, 0);
+        // BITCLR EN mid-conversion.
+        a.write32(CS, CS_EN, 3, &mut irqs);
+        assert!(a.conversion_remaining.is_none(), "EN 1->0 aborts in-flight conversion");
+        assert_eq!(a.cs & CS_READY, 0, "aborted conversion leaves READY clear");
+    }
+
+    #[test]
+    fn bitset_en_alias_path_sets_ready() {
+        let mut a = AdcRegs::new(ADC_IRQ);
+        let mut irqs = 0u32;
+        // Start from EN=0; then BITSET EN.
+        a.write32(CS, 0, 0, &mut irqs);
+        a.write32(CS, CS_EN, 2, &mut irqs);
+        assert_eq!(a.cs & CS_READY, CS_READY, "edge detection must work through alias RMW");
     }
 }
