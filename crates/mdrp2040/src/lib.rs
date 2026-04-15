@@ -107,6 +107,8 @@ impl Emulator {
         self.bus.spi1.reset();
         self.bus.i2c0.reset();
         self.bus.i2c1.reset();
+        self.bus.adc.reset();
+        self.bus.pwm.reset();
         self.bus.irq_pending = 0;
         for n in &mut self.bus.nvics {
             n.reset();

@@ -33,10 +33,15 @@ use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
 use crate::core::Nvic;
 use crate::dma::Dma;
-use crate::irq::{IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ, IRQ_UART1_IRQ};
+use crate::irq::{
+    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ,
+    IRQ_UART0_IRQ, IRQ_UART1_IRQ,
+};
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
+use crate::peripherals::adc::AdcRegs;
 use crate::peripherals::i2c::I2cRegs;
 use crate::peripherals::psram::Psram;
+use crate::peripherals::pwm::PwmRegs;
 use crate::peripherals::spi::SpiRegs;
 use crate::peripherals::timer::TimerRegs;
 use crate::peripherals::uart::UartRegs;
@@ -79,6 +84,10 @@ pub const SPI1_BASE: u32 = 0x4004_0000;
 pub const I2C0_BASE: u32 = 0x4004_4000;
 /// I2C1 block base (RP2040 datasheet §4.3). Reset-gated on bit 4.
 pub const I2C1_BASE: u32 = 0x4004_8000;
+/// ADC block base (RP2040 datasheet §4.9). Reset-gated on bit 0.
+pub const ADC_BASE: u32 = 0x4004_C000;
+/// PWM block base (RP2040 datasheet §4.5). Reset-gated on bit 14.
+pub const PWM_BASE: u32 = 0x4005_0000;
 /// TIMER block base (RP2040 datasheet §4.6). Reset-gated on
 /// [`peripheral_dispatch::RESET_TIMER`] (bit 21) — TIMER and WATCHDOG
 /// have independent RESETS bits per datasheet §2.14 Table 26. The 1 µs
@@ -219,6 +228,15 @@ pub struct Bus {
     pub(crate) i2c0: I2cRegs,
     /// I2C1 — DW_apb_i2c.
     pub(crate) i2c1: I2cRegs,
+    /// ADC — single instance at 0x4004_C000 (Phase 3 — HLD V7 §5.3).
+    /// Runs on `clk_adc` (48 MHz nominal) via a fixed-point accumulator
+    /// scaling from `clk_sys`. Reset-gated on RESETS bit 0.
+    pub(crate) adc: AdcRegs,
+    /// PWM — 8-slice block at 0x4005_0000 (Phase 3 — HLD V7 §5.3).
+    /// Phase 3 cadence: CTR += 1 per sys_clk on enabled slices (DIV
+    /// ignored); wrap latches `INTR[slice]` and routes `PWM_IRQ_WRAP`.
+    /// Reset-gated on RESETS bit 14.
+    pub(crate) pwm: PwmRegs,
     /// DMA controller — Phase 1 stub (always idle). Phase 4 replaces
     /// this with the 12-channel model. Consulted by the fast-path gate
     /// in [`crate::Emulator::step`] via [`Dma::is_idle`].
@@ -325,6 +343,8 @@ impl Bus {
             spi1: SpiRegs::new(IRQ_SPI1_IRQ),
             i2c0: I2cRegs::new(IRQ_I2C0_IRQ),
             i2c1: I2cRegs::new(IRQ_I2C1_IRQ),
+            adc: AdcRegs::new(IRQ_ADC_IRQ_FIFO),
+            pwm: PwmRegs::new(IRQ_PWM_IRQ_WRAP),
             dma: Dma::new(),
             irq_pending: 0,
             nvics: [Nvic::new(), Nvic::new()],
@@ -644,6 +664,8 @@ impl Bus {
             SPI1_BASE => self.spi1.read32(offset),
             I2C0_BASE => self.i2c0.read32(offset),
             I2C1_BASE => self.i2c1.read32(offset),
+            ADC_BASE => self.adc.read32(offset),
+            PWM_BASE => self.pwm.read32(offset),
             _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
         }
     }
@@ -707,6 +729,8 @@ impl Bus {
             SPI1_BASE => self.spi1.write32(offset, val, alias, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write32(offset, val, alias, &mut self.irq_pending),
             I2C1_BASE => self.i2c1.write32(offset, val, alias, &mut self.irq_pending),
+            ADC_BASE => self.adc.write32(offset, val, alias, &mut self.irq_pending),
+            PWM_BASE => self.pwm.write32(offset, val, alias, &mut self.irq_pending),
             _ => {
                 // Catch-all: store with alias semantics so firmware round-trips.
                 let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
@@ -779,13 +803,20 @@ impl Bus {
             UART0_BASE | UART1_BASE => offset == crate::peripherals::uart::UARTDR,
             SPI0_BASE | SPI1_BASE => offset == crate::peripherals::spi::SSPDR,
             I2C0_BASE | I2C1_BASE => offset == crate::peripherals::i2c::IC_DATA_CMD,
+            // ADC FIFO pops a sample on any-width read; a byte / halfword
+            // read must hit the narrow path so a spurious word32 read-
+            // modify-write doesn't double-pop the FIFO. Datasheet §4.9.6
+            // notes firmware may configure FCS.SHIFT to right-justify the
+            // 12-bit sample to an 8-bit halfword read.
+            ADC_BASE => offset == crate::peripherals::adc::FIFO,
             _ => false,
         }
     }
 
     /// Byte-read a peripheral register with side-effect semantics —
-    /// UART_DR / SSPDR / IC_DATA_CMD. Caller guarantees `base + offset`
-    /// has been checked by `peripheral_has_narrow_register`.
+    /// UART_DR / SSPDR / IC_DATA_CMD / ADC FIFO. Caller guarantees
+    /// `base + offset` has been checked by
+    /// `peripheral_has_narrow_register`.
     fn narrow_peripheral_read8(&mut self, base: u32, offset: u32) -> u8 {
         // RESETS is Bus-level — held peripherals return 0.
         if peripheral_dispatch::is_held_in_reset(self, base) {
@@ -798,6 +829,7 @@ impl Bus {
             SPI1_BASE => self.spi1.read8(offset),
             I2C0_BASE => self.i2c0.read8(offset),
             I2C1_BASE => self.i2c1.read8(offset),
+            ADC_BASE => self.adc.read16(offset) as u8,
             _ => 0,
         }
     }
@@ -818,6 +850,7 @@ impl Bus {
             UART1_BASE => self.uart1.read8(offset) as u16,
             I2C0_BASE => self.i2c0.read32(offset) as u16,
             I2C1_BASE => self.i2c1.read32(offset) as u16,
+            ADC_BASE => self.adc.read16(offset),
             _ => 0,
         }
     }
@@ -834,6 +867,8 @@ impl Bus {
             SPI1_BASE => self.spi1.write8(offset, val, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write8(offset, val, &mut self.irq_pending),
             I2C1_BASE => self.i2c1.write8(offset, val, &mut self.irq_pending),
+            // ADC FIFO is read-only — narrow writes swallowed.
+            ADC_BASE => {}
             _ => {}
         }
     }
@@ -850,6 +885,8 @@ impl Bus {
             UART1_BASE => self.uart1.write8(offset, val as u8, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write32(offset, val as u32, 0, &mut self.irq_pending),
             I2C1_BASE => self.i2c1.write32(offset, val as u32, 0, &mut self.irq_pending),
+            // ADC FIFO is read-only — narrow writes swallowed.
+            ADC_BASE => {}
             _ => {}
         }
     }
@@ -1393,8 +1430,8 @@ impl Bus {
     /// is tracked separately via [`crate::dma::Dma::is_idle`] because
     /// it's a bus master, not a per-cycle-ticked peripheral, and is
     /// AND-ed into the fast-path gate alongside this result in
-    /// [`crate::Emulator::step`]. Later phases will OR new AND-terms
-    /// here for UART/SPI/I2C/ADC/PWM as they land.
+    /// [`crate::Emulator::step`]. Phase 3 adds ADC (idle iff no
+    /// conversion armed) and PWM (idle iff `EN == 0`).
     #[inline]
     pub fn all_peripherals_idle(&self) -> bool {
         // Explicit acknowledgement of every stateful peripheral field.
@@ -1407,6 +1444,9 @@ impl Bus {
         // observable happens per-cycle. WATCHDOG_TICK has no tick.
         // Phase 2: UART/SPI/I2C are per-cycle-tickable — their
         // `is_idle()` getters gate the fast path.
+        // Phase 3: ADC + PWM added — ADC mid-conversion must keep the
+        // fast path closed so the clk_adc accumulator advances at all;
+        // PWM with any enabled slice similarly.
         #[cfg(debug_assertions)]
         {
             let _ = (
@@ -1419,6 +1459,8 @@ impl Bus {
                 &self.spi1,
                 &self.i2c0,
                 &self.i2c1,
+                &self.adc,
+                &self.pwm,
             );
         }
         self.timer.is_idle()
@@ -1428,6 +1470,8 @@ impl Bus {
             && self.spi1.is_idle()
             && self.i2c0.is_idle()
             && self.i2c1.is_idle()
+            && self.adc.is_idle()
+            && self.pwm.is_idle()
     }
 
     /// True iff at least one PIO SM is enabled in either block, or any
@@ -1469,6 +1513,10 @@ impl Bus {
         self.spi1.tick(1, &self.clock_tree, &mut self.irq_pending);
         self.i2c0.tick(1, &self.clock_tree, &mut self.irq_pending);
         self.i2c1.tick(1, &self.clock_tree, &mut self.irq_pending);
+        // ADC: fixed-point clk_adc accumulator advances via tick.
+        self.adc.tick(1, &self.clock_tree, &mut self.irq_pending);
+        // PWM: per-slice counter advance + wrap-IRQ latch.
+        self.pwm.tick(1, &self.clock_tree, &mut self.irq_pending);
     }
 
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).
@@ -1960,5 +2008,92 @@ mod tests {
         let mut bus = Bus::new();
         bus.write32(0xE000_E100, 1u32 << 0);
         assert_eq!(bus.read32(0xE000_E100), 1u32 << 0);
+    }
+
+    // ----- ADC + PWM bus integration (Phase 3) --------------------------
+
+    #[test]
+    fn adc_held_in_reset_returns_zero() {
+        // Default Bus holds RESET_ADC (bit 0) asserted — reads must
+        // return 0 and writes must not route.
+        let mut bus = Bus::new();
+        bus.write32(ADC_BASE + crate::peripherals::adc::CS, 0x1);
+        assert_eq!(
+            bus.read32(ADC_BASE + crate::peripherals::adc::CS),
+            0,
+            "ADC held in reset must RAZ"
+        );
+    }
+
+    #[test]
+    fn adc_unreset_roundtrips_cs() {
+        let mut bus = Bus::new();
+        // Clear RESET_ADC (bit 0) via CLR alias at RESETS+0x3000.
+        bus.write32(0x4000_F000, 0x1);
+        bus.write32(
+            ADC_BASE + crate::peripherals::adc::CS,
+            crate::peripherals::adc::CS_EN,
+        );
+        assert_eq!(
+            bus.read32(ADC_BASE + crate::peripherals::adc::CS)
+                & crate::peripherals::adc::CS_EN,
+            crate::peripherals::adc::CS_EN
+        );
+    }
+
+    #[test]
+    fn pwm_held_in_reset_returns_zero() {
+        let mut bus = Bus::new();
+        bus.write32(PWM_BASE + crate::peripherals::pwm::EN, 0xFF);
+        assert_eq!(bus.read32(PWM_BASE + crate::peripherals::pwm::EN), 0);
+    }
+
+    #[test]
+    fn pwm_unreset_roundtrips_slice_registers() {
+        let mut bus = Bus::new();
+        // Clear RESET_PWM (bit 14).
+        bus.write32(0x4000_F000, 1u32 << 14);
+        // Slice 0 TOP = 100 via canonical address.
+        let slice0_top = PWM_BASE + 0x10;
+        bus.write32(slice0_top, 100);
+        assert_eq!(bus.read32(slice0_top), 100);
+    }
+
+    #[test]
+    fn adc_fifo_narrow_read_does_not_double_pop() {
+        // Drive one sample into the ADC FIFO and read it back byte-wise
+        // via `read8` — the narrow dispatch must pop exactly one entry,
+        // not trigger an RMW that pops twice.
+        let mut bus = Bus::new();
+        // Release ADC from reset.
+        bus.write32(0x4000_F000, 0x1);
+        // Prime the internal FIFO with one known sample by driving
+        // through the Phase 3 path: enable + FCS + start_once + tick.
+        bus.adc.reset();
+        let mut irqs = 0u32;
+        // Channel 3 so the sample is non-zero.
+        bus.adc.write32(
+            crate::peripherals::adc::FCS,
+            crate::peripherals::adc::FCS_EN,
+            0,
+            &mut irqs,
+        );
+        bus.adc.write32(
+            crate::peripherals::adc::CS,
+            crate::peripherals::adc::CS_EN
+                | crate::peripherals::adc::CS_START_ONCE
+                | (3 << 12),
+            0,
+            &mut irqs,
+        );
+        // Tick enough sys cycles to complete the conversion
+        // (96 adc_clk / 48 MHz ≈ 2 µs = 250 sys_clk at 125 MHz).
+        bus.seed_sys_clk_hz(125_000_000);
+        bus.adc.tick(400, &bus.clock_tree, &mut irqs);
+        assert_eq!(bus.adc.fifo_len(), 1, "one sample must be queued");
+        // Byte read must not over-pop — still one sample, count drops
+        // to zero only once.
+        let _ = bus.read8(ADC_BASE + crate::peripherals::adc::FIFO);
+        assert_eq!(bus.adc.fifo_len(), 0, "byte read pops exactly once");
     }
 }
