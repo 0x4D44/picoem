@@ -8,6 +8,7 @@ pub mod gdb_client;
 pub mod i2s_capture;
 pub mod ieee754_ref;
 pub mod onerom_glue_dma;
+pub mod onerom_serving_oracle;
 pub mod onerom_snapshot_fmt;
 pub mod onerom_sync;
 pub mod onerom_trace;

@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.18.3"
+version = "0.19.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -88,6 +88,10 @@ path = "src/bin/onerom_pio_diff_rp2350.rs"
 [[bin]]
 name = "onerom_full_system_rp2350"
 path = "src/bin/onerom_full_system_rp2350.rs"
+
+[[bin]]
+name = "onerom_serving_oracle_rp2350"
+path = "src/bin/onerom_serving_oracle_rp2350.rs"
 
 [[bin]]
 name = "silicon_cycle_oracle_rp2350"
