@@ -25,6 +25,10 @@
 //
 //     picogus_diff_rp2040
 //         --flash <path>       (optional; Stage 4 accepts trace-only runs)
+//         --bootrom <path>     (optional; default-searches
+//                               roms/rp2040/bootrom-rp2040-b2.bin when
+//                               --flash is supplied — required for real
+//                               SDK firmware to boot past boot2)
 //         --trace <path>       (required)
 //         --duration <secs>    (optional; caps replay to N sim-seconds)
 //
@@ -601,11 +605,17 @@ pub fn replay<S: IsaSink>(
 
 struct Args {
     flash: Option<PathBuf>,
+    bootrom: Option<PathBuf>,
     trace: PathBuf,
     duration_secs: Option<f64>,
     post_roll_secs: f64,
     out: Option<PathBuf>,
 }
+
+/// Default location searched for a real RP2040 bootrom when `--flash` is
+/// supplied and `--bootrom` is absent. Provenance in
+/// `roms/rp2040/README.md`.
+pub const DEFAULT_BOOTROM_PATH: &str = "roms/rp2040/bootrom-rp2040-b2.bin";
 
 /// Default post-roll duration in seconds. 500 ms gives enough simulated
 /// time for firmware's I2S DMA chain to flush its trailing audio buffer
@@ -615,6 +625,7 @@ const DEFAULT_POST_ROLL_SECS: f64 = 0.5;
 fn parse_args() -> Result<Args, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut flash = None;
+    let mut bootrom = None;
     let mut trace = None;
     let mut duration_secs = None;
     let mut post_roll_secs = DEFAULT_POST_ROLL_SECS;
@@ -628,6 +639,13 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--flash requires a path".into());
                 }
                 flash = Some(PathBuf::from(&args[i]));
+            }
+            "--bootrom" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--bootrom requires a path".into());
+                }
+                bootrom = Some(PathBuf::from(&args[i]));
             }
             "--trace" => {
                 i += 1;
@@ -680,6 +698,7 @@ fn parse_args() -> Result<Args, String> {
     let trace = trace.ok_or("--trace is required")?;
     Ok(Args {
         flash,
+        bootrom,
         trace,
         duration_secs,
         post_roll_secs,
@@ -687,15 +706,42 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+/// Resolve the bootrom path given an explicit `--bootrom` flag and the
+/// presence (or absence) of `--flash`.
+///
+/// Rules:
+/// * If `--bootrom` is supplied, always honour it (must exist).
+/// * Else if `--flash` is absent, return `None` (no firmware to boot).
+/// * Else default-search [`DEFAULT_BOOTROM_PATH`]. If the file is
+///   present, use it. If not, return `None` — the caller emits a hint.
+pub fn resolve_bootrom_path(
+    explicit: Option<&Path>,
+    flash_present: bool,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    if !flash_present {
+        return None;
+    }
+    let default = PathBuf::from(DEFAULT_BOOTROM_PATH);
+    if default.is_file() { Some(default) } else { None }
+}
+
 fn print_usage() {
     eprintln!(
         "Usage:\n  \
          picogus_diff_rp2040 --trace <path>\n                      \
-         [--flash <path>] [--duration <secs>] [--post-roll <secs>] [--out <path>]\n\
+         [--flash <path>] [--bootrom <path>] [--duration <secs>]\n                      \
+         [--post-roll <secs>] [--out <path>]\n\
          \n\
          --flash      Optional 2 MB XIP flash image (.bin). Without it the\n              \
                       emulator runs with empty flash; the replayer still\n              \
                       pokes GPIO inputs — useful for harness tests.\n\
+         --bootrom    Optional 16 KB RP2040 bootrom image. When --flash is\n              \
+                      supplied and this flag is absent, we default-search\n              \
+                      `roms/rp2040/bootrom-rp2040-b2.bin`. Required for\n              \
+                      real SDK firmware to boot past boot2.\n\
          --trace      Required. CSV file in picogus-tap v1 format.\n\
          --duration   Optional. Stops replay once trace timestamp exceeds\n              \
                       this many simulated seconds.\n\
@@ -754,7 +800,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.flash(flash_bytes);
     }
     let mut emu = builder.build();
+
+    // Load the RP2040 bootrom before calling reset(): reset() reads SP
+    // and the reset vector from ROM word 0 / word 4, so the ROM must be
+    // populated first. If no explicit --bootrom is supplied, default-
+    // search `roms/rp2040/bootrom-rp2040-b2.bin` when we have flash to
+    // boot; otherwise skip (the replayer's unit-test path runs without).
+    let resolved_bootrom =
+        resolve_bootrom_path(args.bootrom.as_deref(), args.flash.is_some());
+    match (&resolved_bootrom, args.flash.is_some()) {
+        (Some(path), _) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("reading bootrom {}: {e}", path.display()))?;
+            eprintln!("Loaded bootrom: {} bytes from {}", bytes.len(), path.display());
+            emu.load_bootrom(&bytes);
+        }
+        (None, true) => {
+            eprintln!(
+                "warning: --flash supplied but no bootrom found at {} — firmware will wedge at boot2 return",
+                DEFAULT_BOOTROM_PATH
+            );
+        }
+        (None, false) => {}
+    }
+
     emu.reset();
+
+    // Direct-boot past the vendored bootrom's USB-MSC wait loop. See
+    // `Emulator::direct_boot_from_flash` for full rationale: we don't
+    // model QSPI pads or SSI enough for the bootrom's flash detection
+    // to succeed, so we hand control straight to the SDK firmware's
+    // own reset handler at VTOR+0x100 with the vector table's declared
+    // SP. Bootrom image remains loaded for ROM function-table lookups.
+    if args.flash.is_some() {
+        const SDK_VTOR_FLASH_OFFSET: u32 = 0x100;
+        emu.direct_boot_from_flash(SDK_VTOR_FLASH_OFFSET);
+        eprintln!(
+            "direct-boot: SP={:#010x} PC={:#010x} (flash+{:#x})",
+            emu.cores[0].regs.sp(),
+            emu.cores[0].regs.pc(),
+            SDK_VTOR_FLASH_OFFSET
+        );
+    }
 
     let duration_ns = args
         .duration_secs
