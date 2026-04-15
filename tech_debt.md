@@ -2,6 +2,13 @@
 
 Items discovered during development that need addressing in later phases.
 
+## Corpus reproducibility caveat
+
+First-build binary SHA256s recorded during Phase 0 corpus pinning are NOT
+byte-reproducible without `SOURCE_DATE_EPOCH`, `-Wl,--build-id=none`, and
+`-no-canonical-prefixes`. V1 treats the SHA as an artefact identifier, not
+a reproducibility guarantee. Tracked per V7 HLD §3.
+
 ## Resolved
 
 ### PIO side-set drives pad_oe without PINDIRS — Resolved (2026-04-15)
@@ -818,3 +825,50 @@ peripheral module.
   STOP_DET), so firmware that spin-checks `IC_STATUS.ACTIVITY` or
   raw-IRQ ordering expecting bus-cycle-paced events may see different
   interleavings than real silicon.
+
+## Phase 3 known limitations (mdrp2040 ADC / PWM)
+
+Closed-out from Phase 3 (`HLD V7 §6`) code review. All five items are
+by design for Phase 3 and documented in the relevant peripheral module.
+
+- **PWM fractional `CH_DIV` (16.4 fixed-point divisor)** — slices
+  advance CTR one per sys_clk regardless of DIV. `hello_pwm` corpus
+  unaffected (uses DIV=1). See `crates/mdrp2040/src/peripherals/pwm.rs:17`.
+- **PWM `PH_CORRECT` triangle mode and `A_INV`/`B_INV` output
+  inversion** — storage-only; no behavioural effect.
+- **ADC round-robin channel advancement** — `RROBIN` bits stored but
+  AINSEL never advances between samples; multi-channel firmware sees
+  single-channel behaviour. See
+  `crates/mdrp2040/src/peripherals/adc.rs:7`.
+- **ADC DREQ emission (DREQ source 36 per V7 Appendix C)** —
+  FCS.DREQ_EN stored but no DREQ signal emitted to DMA today. Phase 4
+  DMA doesn't consume this lane.
+- **PWM wrap DREQs (sources 24..31)** — unmodelled; `collect_dreqs`
+  leaves the band zero. `audio_i2s` uses PIO DREQ so the corpus is
+  unaffected.
+
+## Phase 4 known limitations (mdrp2040 DMA)
+
+Closed-out from Phase 4 (`HLD V7 §7`) code review. All items are by
+design for Phase 4 and documented in the relevant DMA module.
+
+- **DMA `CTRL.BSWAP` (byte-swap) bit** — stored in CTRL but transfer
+  ignores it. No corpus firmware uses it.
+- **DMA `SNIFF_EN` and `SNIFF_CTRL`/`SNIFF_DATA` registers** —
+  storage-only. CRC not implemented.
+- **DMA `HIGH_PRIORITY` tier arbitration** — stored in CTRL but
+  ignored; flat lowest-channel arbitration used. `audio_i2s` does not
+  rely on priority.
+- **DMA XIP DREQ sources (37..39, XIP_STREAM / XIP_SSITX /
+  XIP_SSIRX)** — not modelled (XIP MMIO stub predates Phase 4).
+- **DMA Timer pacing (`TIMER0..3` registers at `DMA_BASE + 0x440`)** —
+  storage-only, pacing not applied.
+- **Per-channel `DBG_CTDREQ` / `DBG_TCR` debug registers** — read as
+  zero. No corpus consults them.
+- **`DmaChannel.trans_count_reload` field is redundant with
+  `trans_count` today** — overwritten on every TRANS_COUNT write.
+  Audit pending to either remove it or capture reload at trigger time.
+  See review M1.
+- **DMA `mem::take` swap: zero-read window if DMA self-targets its own
+  registers during a transfer** — unreachable in corpus firmware;
+  documented as known anomaly.
