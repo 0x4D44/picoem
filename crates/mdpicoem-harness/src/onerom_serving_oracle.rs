@@ -40,11 +40,20 @@ use crate::onerom_glue_dma::{
 /// See HLD §4.1 + the CAUTION block in `onerom_full_system_rp2350.rs`.
 pub const ADDR_A11_A12_HIGH: u16 = 0x1800;
 
-/// Base of the SRAM shadow — SRAM region origin on RP2350.
+/// Base of the SRAM shadow — matches the OneROM runtime's `rom_table`
+/// destination on RP2350. `preload_rom_image` copies the 64 KB pre-
+/// processed ROM image to `_ram_rom_image_start`, which this firmware
+/// build places at SRAM origin (confirmed via `sdrr_runtime_info` at
+/// `0x20080000`: `rom_table = 0x20000000`, `rom_table_size = 65536`).
 pub const SHADOW_BASE: u32 = 0x2000_0000;
 
-/// Shadow size: one 2364-class ROM.
-pub const SHADOW_SIZE: usize = 0x2000;
+/// Shadow size: 64 KB — the full `rom_table` span. SDRR's "pre-
+/// processed" 2364-class ROM is 8 KB of raw bytes baked into a 64 KB
+/// address-permutation table, so PIO1's resolved addresses span the
+/// whole 64 KB region (observed 0x20000000..0x2000B000 across the 15
+/// address-sweep cases). An 8 KB shadow misses the upper two-thirds
+/// and trips `ResolvedAddrOutOfRange` spuriously.
+pub const SHADOW_SIZE: usize = 0x1_0000;
 
 /// Acceptable CS-low-to-stable-byte cycle envelope per `piorom.c`.
 pub const ENVELOPE_CYCLES: std::ops::RangeInclusive<u32> = 11..=14;
@@ -219,25 +228,74 @@ pub struct ServingOracle {
 }
 
 impl ServingOracle {
-    /// Capture the SRAM shadow. Called once after the harness confirms
+    /// Capture the ROM-table shadow. Called once after the harness confirms
     /// OneROM has reached steady state (`onerom_sync::is_synced` true).
     ///
-    /// Uses `bus.memory.sram_read8` rather than `bus.read8` to bypass the
-    /// bus fabric: an 8192-iteration SRAM read loop through `read8` would
-    /// accumulate `sram_bank_wait` contention into `bus.extra_wait_states`,
-    /// perturbing the cycle accounting for the next CPU instruction (which
-    /// Stage G.3 will trust for latency measurement). SHADOW_BASE is the
-    /// SRAM origin (0x2000_0000), so SRAM offset `i` maps directly.
-    pub fn new_at_sync(bus: &mut Bus) -> Self {
-        let mut shadow = Box::new([0u8; SHADOW_SIZE]);
-        for i in 0..SHADOW_SIZE {
-            shadow[i] = bus.memory.sram_read8(i as u32);
-        }
+    /// Lifts the shadow from the loaded **flash image** rather than SRAM,
+    /// because at the current sync criterion (`PIO1.CTRL.SM_ENABLE &&
+    /// PIO2.CTRL.SM_ENABLE`) the DMA-driven `preload_rom_image` copy has
+    /// NOT yet populated `rom_table` in SRAM. Observed: even stepping
+    /// 1 M cycles past sync leaves SRAM[0x20000000..+0x10000] entirely
+    /// zero on our emulator (the preload DMA program is not executed).
+    /// See `wrk_journals/2026.04.15 - JRN - OneROM Shadow Source
+    /// Investigation.md` for the evidence trail.
+    ///
+    /// The canonical ground truth is therefore the **pre-processed ROM
+    /// image embedded in flash** — the exact bytes `preload_rom_image`
+    /// *would* copy if the DMA ran to completion. We read
+    /// `rom_set_index` from `sdrr_runtime_info` in SRAM (the one field
+    /// the firmware does populate by sync), then walk the flash structs
+    /// (`sdrr_info_t` → `onerom_metadata_header_t` → `sdrr_rom_set_t[]`)
+    /// to locate the selected set's `data` pointer and copy its
+    /// `SHADOW_SIZE` bytes into the shadow.
+    ///
+    /// Fall-backs: on any parse failure (bad magic, out-of-range pointer,
+    /// index out of range) the shadow is zero-filled. The binary-level
+    /// "shadow-integrity tripwire" reports `unique bytes == 1` and warns,
+    /// so a silently-wrong shadow still surfaces to the operator.
+    pub fn new_at_sync(bus: &mut Bus, flash: &[u8]) -> Self {
+        // Offset of `sdrr_runtime_info.rom_set_index` within SRAM:
+        // `_sdrr_runtime_info_location = _end - 8192 = 0x20080000` (per
+        // `sdrr/link/common.ld`); `rom_set_index` is at runtime-info
+        // offset +6 (see `sdrr_runtime_info_t` in
+        // `sdrr/include/config_base.h`).
+        const RUNTIME_INFO_SRAM_OFF: u32 = 0x0008_0000;
+        const ROM_SET_INDEX_OFFSET: u32 = 6;
+        let rom_set_index = bus
+            .memory
+            .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
+
+        let shadow = lift_shadow_from_flash(flash, rom_set_index)
+            .unwrap_or_else(|| Box::new([0u8; SHADOW_SIZE]));
+
         Self {
             rom_shadow: shadow,
             results: Vec::new(),
             seed_done: false,
         }
+    }
+
+    /// Test-only constructor that skips the emulator-side SRAM capture
+    /// and accepts a caller-provided shadow. Used by
+    /// `format_report_has_required_sections` (and future trace-free
+    /// report tests) so the formatter can be exercised without spinning
+    /// up an emulator just to seed SRAM.
+    #[cfg(test)]
+    pub(crate) fn new_with_shadow(shadow: Box<[u8; SHADOW_SIZE]>) -> Self {
+        Self {
+            rom_shadow: shadow,
+            results: Vec::new(),
+            seed_done: false,
+        }
+    }
+
+    /// Test-only push to seed the results vector for report tests.
+    /// Not wired through `run_case`'s envelope post-processing: the
+    /// caller is responsible for passing already-post-processed results
+    /// when that matters.
+    #[cfg(test)]
+    pub(crate) fn push_result_for_test(&mut self, r: CaseResult) {
+        self.results.push(r);
     }
 
     /// Drive one case end-to-end. Steps the emulator and pumps the glue
@@ -332,7 +390,7 @@ impl ServingOracle {
                 emu.bus.gpio_external_in = gap_level;
                 self.tick_cycles(emu, glue, GAP_CYCLES);
 
-                self.results.push(result);
+                self.results.push(apply_envelope(result));
                 return self.results.last().unwrap();
             }
         }
@@ -346,7 +404,7 @@ impl ServingOracle {
         emu.bus.gpio_external_in = gap_level;
         self.tick_cycles(emu, glue, GAP_CYCLES);
 
-        self.results.push(result);
+        self.results.push(apply_envelope(result));
         self.results.last().unwrap()
     }
 
@@ -355,24 +413,77 @@ impl ServingOracle {
         &self.results
     }
 
-    /// Minimal per-case report. G.3 will replace this with the full
-    /// table + aggregate stats + `sys_clk_hz` conversion + the
-    /// emulator-bounded-ns caveat from HLD §5.4.
-    // TODO(G.3): latency stats, ns conversion, ROM-speed class, caveat
+    /// Accessor for the ROM-table shadow. Used by the binary's
+    /// shadow-integrity tripwire (the `unique bytes` diagnostic) so it
+    /// checks the authoritative shadow the verdict evaluator will
+    /// consult, rather than sampling SRAM — which is no longer the
+    /// shadow source on this build.
+    pub fn shadow(&self) -> &[u8; SHADOW_SIZE] {
+        &self.rom_shadow
+    }
+
+    /// Full report formatter (HLD §5 + §5.4).
+    ///
+    /// Sections: header (sys_clk_hz + shadow stats + case count),
+    /// per-case table, summary (pass/fail counts + latency stats +
+    /// ROM speed class), and the emulator-bounded caveat.
+    ///
+    /// If `sys_clk_hz == 0` (PLL not settled at sync — see HLD §5.2),
+    /// prints an `UNAVAILABLE` marker in the header and omits all ns
+    /// columns from the table and the summary.
     pub fn format_report(&self, sys_clk_hz: u32) -> String {
         let mut out = String::new();
+        let ns_available = sys_clk_hz != 0;
+
+        // --- Header -------------------------------------------------------
+        let _ = writeln!(out, "OneROM Serving Oracle — Report");
+        if ns_available {
+            let mhz = sys_clk_hz as f64 / 1_000_000.0;
+            let _ = writeln!(
+                out,
+                "sys_clk_hz: {} Hz ({:.3} MHz)",
+                sys_clk_hz, mhz
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "sys_clk_hz: UNAVAILABLE (PLL not settled at sync)"
+            );
+        }
+        let unique_shadow: std::collections::HashSet<u8> =
+            self.rom_shadow.iter().copied().collect();
         let _ = writeln!(
             out,
-            "OneROM serving oracle — {} case(s), sys_clk_hz = {}",
-            self.results.len(),
-            sys_clk_hz
+            "shadow: 0x{:08X} + 0x{:04X} bytes, {} unique",
+            SHADOW_BASE,
+            SHADOW_SIZE,
+            unique_shadow.len()
         );
-        let _ = writeln!(
-            out,
-            "  {:<24} {:>10} {:>10} {:>8} {:>8} {:>8}  verdict",
-            "case", "addr", "resolved", "expect", "observed", "cycles"
-        );
-        for r in &self.results {
+        let _ = writeln!(out, "cases: {}", self.results.len());
+        let _ = writeln!(out);
+
+        // --- Per-case table ----------------------------------------------
+        // Columns: idx, label, addr, resolved, expected, observed, cycles,
+        // [ns,] verdict. ns column is omitted when sys_clk_hz == 0.
+        if ns_available {
+            let _ = writeln!(
+                out,
+                " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6} {:>6}  verdict",
+                "idx", "label", "addr", "resolved", "expected", "observed",
+                "cycles", "ns"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6}  verdict",
+                "idx", "label", "addr", "resolved", "expected", "observed",
+                "cycles"
+            );
+        }
+
+        let total = self.results.len();
+        for (i, r) in self.results.iter().enumerate() {
+            let idx = format!("{}/{}", i + 1, total);
             let addr = format!("0x{:04X}", r.case.addr_bits);
             let resolved = r
                 .resolved_addr
@@ -390,12 +501,122 @@ impl ServingOracle {
                 .latency_cycles
                 .map(|c| format!("{}", c))
                 .unwrap_or_else(|| "—".to_string());
+            let verdict = format_verdict_full(&r.verdict);
+
+            if ns_available {
+                let ns = r
+                    .latency_cycles
+                    .map(|c| format!("{}", cycles_to_ns(c, sys_clk_hz)))
+                    .unwrap_or_else(|| "—".to_string());
+                let _ = writeln!(
+                    out,
+                    " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6} {:>6}  {}",
+                    idx, r.case.label, addr, resolved, expected, observed,
+                    cycles, ns, verdict
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6}  {}",
+                    idx, r.case.label, addr, resolved, expected, observed,
+                    cycles, verdict
+                );
+            }
+        }
+        let _ = writeln!(out);
+
+        // --- Summary -----------------------------------------------------
+        let mut pass = 0usize;
+        let mut wrong_byte = 0usize;
+        let mut no_resolve = 0usize;
+        let mut no_stable = 0usize;
+        let mut out_of_range = 0usize;
+        let mut latency_oor = 0usize;
+        let mut pass_latencies: Vec<u32> = Vec::new();
+        for r in &self.results {
+            match r.verdict {
+                Verdict::Pass => {
+                    pass += 1;
+                    if let Some(c) = r.latency_cycles {
+                        pass_latencies.push(c);
+                    }
+                }
+                Verdict::WrongByte { .. } => wrong_byte += 1,
+                Verdict::NoResolve => no_resolve += 1,
+                Verdict::NoStableByte => no_stable += 1,
+                Verdict::ResolvedAddrOutOfRange { .. } => out_of_range += 1,
+                Verdict::LatencyOutOfEnvelope { .. } => latency_oor += 1,
+            }
+        }
+        let fail = total - pass;
+
+        let _ = writeln!(out, "Summary:");
+        let _ = writeln!(out, "  {} cases total", total);
+        let _ = writeln!(out, "  {} PASS", pass);
+        let _ = writeln!(
+            out,
+            "  {} FAIL  ({} wrong-byte, {} no-resolve, {} no-stable-byte, {} addr-out-of-range, {} latency-out-of-envelope)",
+            fail, wrong_byte, no_resolve, no_stable, out_of_range, latency_oor
+        );
+
+        if pass_latencies.is_empty() {
             let _ = writeln!(
                 out,
-                "  {:<24} {:>10} {:>10} {:>8} {:>8} {:>8}  {:?}",
-                r.case.label, addr, resolved, expected, observed, cycles, r.verdict
+                "  latency stats: — no Pass cases, latency stats unavailable"
             );
+        } else {
+            let min = *pass_latencies.iter().min().unwrap();
+            let max = *pass_latencies.iter().max().unwrap();
+            let sum: u32 = pass_latencies.iter().sum();
+            let mean = sum / pass_latencies.len() as u32;
+            if ns_available {
+                let min_ns = cycles_to_ns(min, sys_clk_hz);
+                let max_ns = cycles_to_ns(max, sys_clk_hz);
+                let mean_ns = cycles_to_ns(mean, sys_clk_hz);
+                let _ = writeln!(
+                    out,
+                    "  latency stats (Pass cases only): min={} max={} mean={} cycles ({} ns / {} ns / {} ns)",
+                    min, max, mean, min_ns, max_ns, mean_ns
+                );
+                let _ = writeln!(
+                    out,
+                    "  ROM speed class: {} (mean={} ns)",
+                    rom_speed_class(mean_ns),
+                    mean_ns
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  latency stats (Pass cases only): min={} max={} mean={} cycles (ns unavailable)",
+                    min, max, mean
+                );
+                let _ = writeln!(
+                    out,
+                    "  ROM speed class: unavailable (sys_clk_hz == 0)"
+                );
+            }
         }
+
+        let _ = writeln!(out);
+
+        // --- Emulator-bounded caveat (HLD §5.4, verbatim) ----------------
+        let _ = writeln!(
+            out,
+            "  Latency measured against the emulator's glue DMA + PIO model"
+        );
+        let _ = writeln!(
+            out,
+            "  (4+4 cycle DMA latency; PIO timing per mdpicoem-common::pio)."
+        );
+        let _ = writeln!(
+            out,
+            "  Silicon-calibrated timing is a future pass via the silicon oracle"
+        );
+        let _ = writeln!(
+            out,
+            "  rig (see silicon_cycle_oracle_rp2350)."
+        );
+
         out
     }
 
@@ -429,6 +650,104 @@ fn stimulus_level(addr_bits: u16) -> u32 {
     }
     // CS1 stays low — do not set bit 13.
     level
+}
+
+// ---------------------------------------------------------------------------
+// Flash struct parser — shadow ground truth
+// ---------------------------------------------------------------------------
+
+/// Flash base address on RP2350 (XIP start). Pointers in the embedded
+/// SDRR structs are all expressed as XIP addresses; subtract this to
+/// get a byte offset into the loaded `.bin`.
+const FLASH_BASE: u32 = 0x1000_0000;
+
+/// Offset of `sdrr_info_t` within flash (per `sdrr/link/common.ld`:
+/// `flash_isr_vector` + boot block ends at `0x200`, `sdrr_info_t`
+/// follows).
+const SDRR_INFO_OFFSET: usize = 0x0200;
+
+/// Field offset of `metadata_header` pointer within `sdrr_info_t`
+/// (see `sdrr_info_t` comments in `sdrr/include/config_base.h`).
+const SDRR_INFO_METADATA_PTR_OFFSET: usize = 44;
+
+/// Field offset of `rom_sets` pointer within `onerom_metadata_header_t`.
+const METADATA_HEADER_ROM_SETS_PTR_OFFSET: usize = 24;
+
+/// Field offset of `rom_set_count` within `onerom_metadata_header_t`.
+const METADATA_HEADER_ROM_SET_COUNT_OFFSET: usize = 20;
+
+/// Stride of `sdrr_rom_set_t` in the `rom_sets` array. The struct is
+/// padded to 64 bytes (see `pad2[40]` in `config_base.h`).
+const ROM_SET_STRIDE: usize = 64;
+
+/// Field offset of `data` pointer within `sdrr_rom_set_t`.
+const ROM_SET_DATA_PTR_OFFSET: usize = 0;
+
+/// Field offset of `size` within `sdrr_rom_set_t`.
+const ROM_SET_SIZE_OFFSET: usize = 4;
+
+/// Lift the ROM-table shadow from the loaded flash bytes.
+///
+/// Walks the SDRR flash layout (`sdrr_info_t` at `0x200` →
+/// `onerom_metadata_header_t` → `sdrr_rom_set_t[rom_set_index]`) to
+/// locate the selected ROM set's pre-processed image, then copies
+/// `SHADOW_SIZE` bytes from it. This is the exact byte sequence
+/// `preload_rom_image` copies from flash to `rom_table` in SRAM —
+/// reading it from flash directly sidesteps the preload-not-done-at-
+/// sync problem (the DMA program never fires on our emulator).
+///
+/// Returns `None` on any parse failure (malformed struct pointer,
+/// index out of range, source truncated). Callers fall back to a
+/// zero-filled shadow, which the binary-level tripwire surfaces via
+/// the `unique bytes == 1` warning.
+pub(crate) fn lift_shadow_from_flash(
+    flash: &[u8],
+    rom_set_index: u8,
+) -> Option<Box<[u8; SHADOW_SIZE]>> {
+    // Pointer → flash-byte-offset, with bounds check against the loaded
+    // slice length. Ptrs < FLASH_BASE or past end of flash return None.
+    let ptr_to_off = |ptr: u32| -> Option<usize> {
+        let off = (ptr.checked_sub(FLASH_BASE)?) as usize;
+        if off >= flash.len() {
+            None
+        } else {
+            Some(off)
+        }
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        let bytes = flash.get(off..off + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+
+    // sdrr_info_t at flash+0x200 → metadata_header pointer at +44.
+    let metadata_ptr =
+        read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
+    let metadata_off = ptr_to_off(metadata_ptr)?;
+
+    // onerom_metadata_header_t: rom_set_count at +20, rom_sets ptr at +24.
+    let rom_set_count =
+        *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)?;
+    if rom_set_index >= rom_set_count {
+        return None;
+    }
+    let rom_sets_ptr =
+        read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
+    let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
+
+    // sdrr_rom_set_t[rom_set_index]: data ptr at +0, size at +4.
+    let set_off = rom_sets_off + (rom_set_index as usize) * ROM_SET_STRIDE;
+    let data_ptr = read_u32(set_off + ROM_SET_DATA_PTR_OFFSET)?;
+    let size = read_u32(set_off + ROM_SET_SIZE_OFFSET)? as usize;
+    let data_off = ptr_to_off(data_ptr)?;
+
+    // Copy up to SHADOW_SIZE bytes; zero-pad the tail if the set data is
+    // smaller than the shadow (shouldn't happen for RP2350 builds — all
+    // sets are `ROM_SET_IMAGE_SIZE = 65536 = SHADOW_SIZE` — but defend).
+    let copy_len = size.min(SHADOW_SIZE);
+    let src = flash.get(data_off..data_off + copy_len)?;
+    let mut shadow = Box::new([0u8; SHADOW_SIZE]);
+    shadow[..copy_len].copy_from_slice(src);
+    Some(shadow)
 }
 
 // ---------------------------------------------------------------------------
@@ -609,13 +928,91 @@ pub(crate) fn evaluate_case_trace(
 }
 
 // ---------------------------------------------------------------------------
+// Envelope post-processing
+// ---------------------------------------------------------------------------
+
+/// Applies the `piorom.c` latency envelope (`ENVELOPE_CYCLES` = 11..=14)
+/// to a [`CaseResult`]. If the verdict is [`Verdict::Pass`] and
+/// `latency_cycles` is out of envelope, rewrites the verdict to
+/// [`Verdict::LatencyOutOfEnvelope`]. All other verdicts pass through
+/// unchanged.
+///
+/// Separating this from [`evaluate_case_trace`] keeps the evaluator pure
+/// over the trace (no policy) and lets unit tests exercise the envelope
+/// rule without synthesizing traces. Wired into
+/// [`ServingOracle::run_case`] as the final post-processing step.
+pub fn apply_envelope(result: CaseResult) -> CaseResult {
+    match result.verdict {
+        Verdict::Pass => match result.latency_cycles {
+            Some(cycles) if !ENVELOPE_CYCLES.contains(&cycles) => CaseResult {
+                verdict: Verdict::LatencyOutOfEnvelope { cycles },
+                ..result
+            },
+            _ => result,
+        },
+        _ => result,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Report helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a cycle count to nanoseconds via the provided sysclk.
+/// Panics are impossible because callers guard on `sys_clk_hz != 0`
+/// before invoking. Integer-divide truncates toward zero; intentional —
+/// ROM speed-class bands use inclusive `<=` upper bounds so truncation
+/// doesn't mis-classify.
+fn cycles_to_ns(cycles: u32, sys_clk_hz: u32) -> u64 {
+    (cycles as u64) * 1_000_000_000 / (sys_clk_hz as u64)
+}
+
+/// ROM speed classification table from HLD §5.3. Label-only; never a
+/// pass/fail criterion (the envelope check is).
+fn rom_speed_class(ns: u64) -> &'static str {
+    if ns <= 55 {
+        "fast"
+    } else if ns <= 70 {
+        "standard fast"
+    } else if ns <= 100 {
+        "standard"
+    } else if ns <= 120 {
+        "slow standard"
+    } else if ns <= 150 {
+        "slow"
+    } else {
+        "very slow"
+    }
+}
+
+/// Full verdict label for the report's per-case table. Longer than the
+/// binary's compact `format_verdict_short` — the report can afford the
+/// space and a reader looking at a table wants to see the parameters
+/// (e.g. `LatencyOutOfEnvelope(5)`).
+fn format_verdict_full(v: &Verdict) -> String {
+    match v {
+        Verdict::Pass => "Pass".to_string(),
+        Verdict::WrongByte { expected, observed } => {
+            format!("WrongByte(exp=0x{:02X}, obs=0x{:02X})", expected, observed)
+        }
+        Verdict::NoResolve => "NoResolve".to_string(),
+        Verdict::NoStableByte => "NoStableByte".to_string(),
+        Verdict::ResolvedAddrOutOfRange { addr } => {
+            format!("AddrOOR(0x{:08X})", addr)
+        }
+        Verdict::LatencyOutOfEnvelope { cycles } => {
+            format!("LatencyOutOfEnvelope({})", cycles)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mdrp2350::{Config, EmulatorBuilder};
 
     fn mk_case() -> Case {
         Case::new("test", 0x1800)
@@ -625,26 +1022,166 @@ mod tests {
         Box::new([0u8; SHADOW_SIZE])
     }
 
-    /// 1. `new_at_sync` captures SRAM[SHADOW_BASE..+SHADOW_SIZE] byte-for-byte.
-    ///
-    /// This is the only test that touches a real emulator: everything
-    /// else is trace-driven.
-    #[test]
-    fn rom_shadow_captures_sram_at_build_time() {
-        let mut emu = EmulatorBuilder::new(Config::default()).build();
-        // Write a walking pattern byte-i = i-as-u8 across the full shadow.
-        for i in 0..SHADOW_SIZE {
-            emu.bus.write8(SHADOW_BASE + i as u32, i as u8);
+    /// Build a synthetic flash blob that mimics the SDRR flash layout
+    /// enough for `lift_shadow_from_flash` to find a ROM set. The blob
+    /// packs: sdrr_info_t at `0x200`, metadata_header at `0xC000` (so
+    /// the `metadata_header` pointer points at 0x1000C000 as in the real
+    /// fixture), rom_sets array at `0xC100`, and two ROM set images —
+    /// set 0 at `0x20000` and set 1 at `0x10000`. Each image is a
+    /// walking byte pattern keyed on the set index so the test can
+    /// discriminate which set was picked.
+    fn synth_flash(rom_set_count: u8) -> Vec<u8> {
+        let mut flash = vec![0u8; 0x3_0000]; // 192 KB, room for 2 sets
+        // sdrr_info_t.metadata_header at flash+0x200+44 → 0x1000C000.
+        flash[0x200 + SDRR_INFO_METADATA_PTR_OFFSET
+            ..0x200 + SDRR_INFO_METADATA_PTR_OFFSET + 4]
+            .copy_from_slice(&(0x1000_C000u32).to_le_bytes());
+        // metadata_header.rom_set_count at 0xC000 + 20.
+        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = rom_set_count;
+        // metadata_header.rom_sets at 0xC000 + 24 → 0x1000C100.
+        flash[0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET
+            ..0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET + 4]
+            .copy_from_slice(&(0x1000_C100u32).to_le_bytes());
+        // Two sdrr_rom_set_t entries, stride 64 bytes.
+        for i in 0..2 {
+            let entry = 0xC100 + i * ROM_SET_STRIDE;
+            // data ptr: set 0 → 0x10020000, set 1 → 0x10010000.
+            let data_ptr = if i == 0 { 0x1002_0000u32 } else { 0x1001_0000u32 };
+            flash[entry + ROM_SET_DATA_PTR_OFFSET
+                ..entry + ROM_SET_DATA_PTR_OFFSET + 4]
+                .copy_from_slice(&data_ptr.to_le_bytes());
+            // size = SHADOW_SIZE.
+            flash[entry + ROM_SET_SIZE_OFFSET
+                ..entry + ROM_SET_SIZE_OFFSET + 4]
+                .copy_from_slice(&(SHADOW_SIZE as u32).to_le_bytes());
         }
-        let oracle = ServingOracle::new_at_sync(&mut emu.bus);
+        // Per-set ROM image: walking byte keyed on set index.
+        for j in 0..SHADOW_SIZE {
+            flash[0x20000 + j] = j as u8; // set 0: i as u8
+            flash[0x10000 + j] = (j as u8).wrapping_add(0x80); // set 1
+        }
+        flash
+    }
+
+    /// 1. `lift_shadow_from_flash` follows the SDRR struct chain and
+    /// returns the selected set's bytes. Exercises the parser with a
+    /// synthetic two-set flash blob — no emulator in the loop.
+    #[test]
+    fn lift_shadow_from_flash_happy_path() {
+        let flash = synth_flash(2);
+
+        // Set 0 → pattern (j as u8).
+        let s0 = lift_shadow_from_flash(&flash, 0).expect("set 0");
         for i in 0..SHADOW_SIZE {
             assert_eq!(
-                oracle.rom_shadow[i], i as u8,
-                "shadow[{}] = 0x{:02X}, expected 0x{:02X}",
-                i, oracle.rom_shadow[i], i as u8
+                s0[i],
+                i as u8,
+                "set 0 shadow[{}] = 0x{:02X}, expected 0x{:02X}",
+                i,
+                s0[i],
+                i as u8
+            );
+        }
+
+        // Set 1 → pattern (j as u8) + 0x80.
+        let s1 = lift_shadow_from_flash(&flash, 1).expect("set 1");
+        for i in 0..SHADOW_SIZE {
+            let want = (i as u8).wrapping_add(0x80);
+            assert_eq!(
+                s1[i], want,
+                "set 1 shadow[{}] = 0x{:02X}, expected 0x{:02X}",
+                i, s1[i], want
             );
         }
     }
+
+    /// 2. `lift_shadow_from_flash` returns `None` when `rom_set_index`
+    /// is out of range. Protects against the firmware-not-yet-initialised
+    /// case where `rom_set_index == 0xFF` and naively indexing would
+    /// walk off the end of the array.
+    #[test]
+    fn lift_shadow_rejects_out_of_range_index() {
+        let flash = synth_flash(2);
+        assert!(
+            lift_shadow_from_flash(&flash, 2).is_none(),
+            "index 2 must be rejected (count = 2)"
+        );
+        assert!(
+            lift_shadow_from_flash(&flash, 0xFF).is_none(),
+            "index 0xFF must be rejected"
+        );
+    }
+
+    /// 3. `lift_shadow_from_flash` returns `None` on a malformed blob
+    /// (here: truncated so the metadata_header pointer reads past EOF).
+    /// Callers must never panic on a bad fixture.
+    #[test]
+    fn lift_shadow_rejects_truncated_flash() {
+        let flash = vec![0u8; 0x300]; // only ~sdrr_info_t bytes; no metadata.
+        assert!(lift_shadow_from_flash(&flash, 0).is_none());
+    }
+
+    /// 4. Real fixture check — `test-sdrr-0.bin` set 1 (the one our
+    /// boot path selects: `rom_set_index = 0x01` confirmed via the live
+    /// binary's runtime_info diagnostic at 2026-04-15) must yield a
+    /// non-uniform shadow AND have meaningful variation at the walking-
+    /// 1s offsets. This is the tripwire from the task brief:
+    ///
+    ///   "the bytes at shadow[0x001], shadow[0x002], ..., shadow[0x400]
+    ///    (the walking-1 offsets) should be pairwise distinct, or at
+    ///    least have meaningful variation"
+    ///
+    /// Pairwise distinctness is too strict — several walking-1 slots
+    /// in the SDRR pre-processed image hold 0x00, so we relax to
+    /// "at least 5 unique values among the 11 walking-1 offsets".
+    /// The live set 1 data has exactly 6 unique walking-1 bytes (see
+    /// the journal), so 5 is a comfortable lower bound.
+    #[test]
+    fn walking_1s_distinctness_from_real_fixture() {
+        let flash_path =
+            "fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
+        let flash = match std::fs::read(flash_path) {
+            Ok(b) => b,
+            Err(_) => {
+                // If running from the workspace root, paths are relative
+                // to the harness crate, but `cargo test` runs with cwd
+                // set to the crate root. Try both.
+                std::fs::read(
+                    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin",
+                )
+                .expect("test fixture must be present at either path")
+            }
+        };
+
+        let shadow = lift_shadow_from_flash(&flash, 1)
+            .expect("real fixture must parse");
+
+        // Whole-shadow uniqueness — this is the false-green tripwire.
+        let unique_total: std::collections::HashSet<u8> =
+            shadow.iter().copied().collect();
+        assert!(
+            unique_total.len() > 1,
+            "shadow is uniform ({} unique byte) — false-green tripwire would trip",
+            unique_total.len()
+        );
+
+        // Walking-1 distinctness.
+        let walks: [usize; 11] = [
+            0x001, 0x002, 0x004, 0x008, 0x010, 0x020, 0x040, 0x080,
+            0x100, 0x200, 0x400,
+        ];
+        let unique_walks: std::collections::HashSet<u8> =
+            walks.iter().map(|&o| shadow[o]).collect();
+        assert!(
+            unique_walks.len() >= 5,
+            "walking-1 offsets must have meaningful variation (got {} unique values \
+             among {} offsets): {:?}",
+            unique_walks.len(),
+            walks.len(),
+            walks.iter().map(|&o| shadow[o]).collect::<Vec<_>>(),
+        );
+    }
+
 
     /// 2. Happy-path PASS: push at cycle 5, stable 0x42 from cycle 12 for 3 cycles.
     #[test]
@@ -876,5 +1413,200 @@ mod tests {
                 c.addr_bits
             );
         }
+    }
+
+    // --- G.3 tests: envelope post-processing + report formatter ----------
+
+    /// 7. Envelope pass-through: a Pass verdict with latency inside the
+    /// [11, 14] envelope must survive `apply_envelope` unchanged.
+    #[test]
+    fn apply_envelope_passes_through_in_range_latency() {
+        let case = mk_case();
+        let result = CaseResult {
+            case,
+            resolved_addr: Some(SHADOW_BASE + 0x10),
+            expected_byte: Some(0x42),
+            observed_byte: Some(0x42),
+            latency_cycles: Some(12),
+            verdict: Verdict::Pass,
+        };
+        let out = apply_envelope(result);
+        assert_eq!(out.verdict, Verdict::Pass);
+        assert_eq!(out.latency_cycles, Some(12));
+    }
+
+    /// 8. Envelope rewrite: a Pass verdict with latency outside the
+    /// envelope must be reclassified as `LatencyOutOfEnvelope`.
+    #[test]
+    fn apply_envelope_rewrites_out_of_range_latency() {
+        let case = mk_case();
+        let result = CaseResult {
+            case,
+            resolved_addr: Some(SHADOW_BASE + 0x10),
+            expected_byte: Some(0x42),
+            observed_byte: Some(0x42),
+            latency_cycles: Some(20),
+            verdict: Verdict::Pass,
+        };
+        let out = apply_envelope(result);
+        assert_eq!(
+            out.verdict,
+            Verdict::LatencyOutOfEnvelope { cycles: 20 }
+        );
+        // Other fields survive the rewrite.
+        assert_eq!(out.latency_cycles, Some(20));
+        assert_eq!(out.observed_byte, Some(0x42));
+    }
+
+    /// 9. Non-Pass verdicts are never rewritten by the envelope check.
+    /// Tests WrongByte, NoResolve, NoStableByte, and
+    /// ResolvedAddrOutOfRange — the envelope filter must be a no-op
+    /// regardless of what `latency_cycles` says.
+    #[test]
+    fn apply_envelope_leaves_non_pass_verdicts_alone() {
+        let case = mk_case();
+
+        // WrongByte with latency inside the envelope.
+        let wrong_byte = CaseResult {
+            case,
+            resolved_addr: Some(SHADOW_BASE + 0x10),
+            expected_byte: Some(0x42),
+            observed_byte: Some(0xFF),
+            latency_cycles: Some(12),
+            verdict: Verdict::WrongByte {
+                expected: 0x42,
+                observed: 0xFF,
+            },
+        };
+        let out = apply_envelope(wrong_byte);
+        assert_eq!(
+            out.verdict,
+            Verdict::WrongByte {
+                expected: 0x42,
+                observed: 0xFF,
+            }
+        );
+
+        // NoResolve with no latency at all.
+        let no_resolve = CaseResult {
+            case,
+            resolved_addr: None,
+            expected_byte: None,
+            observed_byte: None,
+            latency_cycles: None,
+            verdict: Verdict::NoResolve,
+        };
+        let out = apply_envelope(no_resolve);
+        assert_eq!(out.verdict, Verdict::NoResolve);
+
+        // ResolvedAddrOutOfRange: even if latency is set (it shouldn't
+        // be, but defend anyway), apply_envelope must not rewrite.
+        let bad_addr = 0x2100_0000u32;
+        let addr_oor = CaseResult {
+            case,
+            resolved_addr: Some(bad_addr),
+            expected_byte: None,
+            observed_byte: None,
+            latency_cycles: None,
+            verdict: Verdict::ResolvedAddrOutOfRange { addr: bad_addr },
+        };
+        let out = apply_envelope(addr_oor);
+        assert_eq!(
+            out.verdict,
+            Verdict::ResolvedAddrOutOfRange { addr: bad_addr }
+        );
+    }
+
+    /// 10. `format_report` sections smoke-check. Builds a
+    /// `ServingOracle` with three hand-crafted results (one per major
+    /// verdict shape), renders the report, and asserts the required
+    /// sections are present. Deliberately NOT a pixel-perfect check —
+    /// formatter tweaks should not break this test.
+    #[test]
+    fn format_report_has_required_sections() {
+        let mut shadow = Box::new([0u8; SHADOW_SIZE]);
+        shadow[0x10] = 0x42;
+        let mut oracle = ServingOracle::new_with_shadow(shadow);
+
+        let case = mk_case();
+
+        // One Pass (in envelope) → exercises the latency-stats branch.
+        oracle.push_result_for_test(CaseResult {
+            case,
+            resolved_addr: Some(SHADOW_BASE + 0x10),
+            expected_byte: Some(0x42),
+            observed_byte: Some(0x42),
+            latency_cycles: Some(12),
+            verdict: Verdict::Pass,
+        });
+
+        // One WrongByte → exercises the WrongByte row + fail bucket.
+        oracle.push_result_for_test(CaseResult {
+            case,
+            resolved_addr: Some(SHADOW_BASE + 0x10),
+            expected_byte: Some(0x42),
+            observed_byte: Some(0xFF),
+            latency_cycles: Some(12),
+            verdict: Verdict::WrongByte {
+                expected: 0x42,
+                observed: 0xFF,
+            },
+        });
+
+        // One LatencyOutOfEnvelope → exercises the LatencyOOE row.
+        oracle.push_result_for_test(CaseResult {
+            case,
+            resolved_addr: Some(SHADOW_BASE + 0x10),
+            expected_byte: Some(0x42),
+            observed_byte: Some(0x42),
+            latency_cycles: Some(5),
+            verdict: Verdict::LatencyOutOfEnvelope { cycles: 5 },
+        });
+
+        let report = oracle.format_report(150_000_000);
+
+        // Header.
+        assert!(
+            report.contains("sys_clk_hz: 150000000"),
+            "header missing sys_clk_hz: {}",
+            report
+        );
+        assert!(
+            report.contains("cases: 3"),
+            "header missing cases count: {}",
+            report
+        );
+
+        // Per-case table rows — one per verdict shape.
+        assert!(report.contains("Pass"), "missing Pass row: {}", report);
+        assert!(
+            report.contains("WrongByte"),
+            "missing WrongByte row: {}",
+            report
+        );
+        assert!(
+            report.contains("LatencyOutOfEnvelope"),
+            "missing LatencyOutOfEnvelope row: {}",
+            report
+        );
+
+        // Summary section.
+        assert!(
+            report.contains("Summary:"),
+            "missing Summary section: {}",
+            report
+        );
+        assert!(
+            report.contains("ROM speed class:"),
+            "missing ROM speed class line: {}",
+            report
+        );
+
+        // Emulator-bounded caveat snippet (HLD §5.4).
+        assert!(
+            report.contains("glue DMA + PIO model"),
+            "missing emulator-bounded caveat: {}",
+            report
+        );
     }
 }

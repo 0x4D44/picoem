@@ -6,10 +6,16 @@
 //! glue DMA pump, and proves the byte observed on D0..D7 matches the
 //! shadow byte at the resolved CH1.READ_ADDR.
 //!
-//! Stage G.2 — full 15-case walking-1s + pattern sweep through the
-//! serving pipeline. One line per case scrolls as the run proceeds so
-//! a stuck or crashing case is obvious from the partial output. G.3
-//! adds the latency report + ns conversion + envelope check.
+//! Stage G.3 — full 15-case walking-1s + pattern sweep through the
+//! serving pipeline, followed by the `format_report` render. One line
+//! per case still scrolls as the run proceeds so a stuck or crashing
+//! case is obvious from the partial output; the full report (table,
+//! summary, latency stats, ROM speed class, emulator-bounded caveat)
+//! prints after the sweep completes. Envelope post-processing
+//! (`apply_envelope`) is applied per-case inside
+//! `ServingOracle::run_case`, so a Pass with latency outside the
+//! `11..=14` envelope is reclassified to `LatencyOutOfEnvelope` before
+//! the report renders.
 //!
 //! Design: `wrk_docs/2026.04.15 - HLD - OneROM Serving Oracle (Stage G).md`.
 //!
@@ -124,20 +130,21 @@ fn main() -> ExitCode {
 
     // Prime the DMA and capture the SRAM shadow.
     glue.prime_after_sync(&mut emu.bus);
-    let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus);
 
-    // Shadow-integrity tripwire (devil's-advocate Attack 2, Stage G.2):
-    // `ServingOracle::new_at_sync` captures the 8 KB shadow from SRAM at
-    // SHADOW_BASE. If that region is uniform (all zeros, all 0xFF, etc.),
-    // no address-decode bug can possibly be caught — every resolved_addr
-    // would look up the same byte. We sample the same SRAM region the
-    // oracle did and surface the unique-byte count so the operator sees
-    // the tripwire before reading a false PASS.
-    let mut shadow_sample = [0u8; onerom_serving_oracle::SHADOW_SIZE];
-    for i in 0..onerom_serving_oracle::SHADOW_SIZE {
-        shadow_sample[i] = emu.bus.memory.sram_read8(i as u32);
-    }
-    let unique: HashSet<u8> = shadow_sample.iter().copied().collect();
+    let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, &flash);
+
+    // Shadow-integrity tripwire (devil's-advocate Attack 2, Stage G.2 +
+    // Stage G shadow-source investigation, 2026-04-15):
+    // `ServingOracle::new_at_sync` now lifts the shadow from the flash
+    // bytes via SDRR struct parsing (the SRAM-at-sync assumption from
+    // HLD §3.1 was false — preload DMA hasn't landed by our sync
+    // criterion). If the resulting shadow is uniform, either the parse
+    // failed (fell back to zeros) or the selected ROM set is a genuine
+    // null fixture like `zero8192.rom`. Either way, no address-decode
+    // bug can be caught — every resolved_addr would look up the same
+    // byte. Surface the unique count so the operator sees the tripwire
+    // before misreading a false PASS.
+    let unique: HashSet<u8> = oracle.shadow().iter().copied().collect();
     println!(
         "shadow @ 0x{:08X}..+0x{:04X}: {} unique bytes",
         onerom_serving_oracle::SHADOW_BASE,
@@ -149,7 +156,7 @@ fn main() -> ExitCode {
             "WARNING: shadow is uniform — oracle cannot distinguish between addresses."
         );
         println!(
-            "         See \"Shadow source investigation\" in the Stage G journal."
+            "         See the Shadow Source Investigation journal (2026-04-15)."
         );
     }
 
@@ -185,10 +192,6 @@ fn main() -> ExitCode {
             .latency_cycles
             .map(|c| format!("{}", c))
             .unwrap_or_else(|| "—".to_string());
-        // TODO(G.3): include `resolved=0x...` column in per-case output
-        // (see onerom_serving_oracle format_report). Once the parallel
-        // PIO2 fix lands, knowing *where* WrongByte read from is
-        // diagnostic gold; G.3's full report formatter will fold it in.
         println!(
             "[{:>2}/{:>2}] {:<16} addr=0x{:04X} verdict={:<12} expected={} observed={} cycles={}",
             idx + 1,
@@ -202,39 +205,23 @@ fn main() -> ExitCode {
         );
     }
 
-    // Summary tally — bucket verdicts by class so the operator sees at
-    // a glance what failed and why. `WrongByte` is expected to dominate
-    // until the parallel PIO2 pad_out team lands their fix; other
-    // variants are real findings worth surfacing separately.
-    let results = oracle.results();
-    let mut pass = 0usize;
-    let mut wrong_byte = 0usize;
-    let mut no_resolve = 0usize;
-    let mut no_stable = 0usize;
-    let mut out_of_range = 0usize;
-    let mut latency_out = 0usize;
-    for r in results {
-        match r.verdict {
-            onerom_serving_oracle::Verdict::Pass => pass += 1,
-            onerom_serving_oracle::Verdict::WrongByte { .. } => wrong_byte += 1,
-            onerom_serving_oracle::Verdict::NoResolve => no_resolve += 1,
-            onerom_serving_oracle::Verdict::NoStableByte => no_stable += 1,
-            onerom_serving_oracle::Verdict::ResolvedAddrOutOfRange { .. } => {
-                out_of_range += 1
-            }
-            onerom_serving_oracle::Verdict::LatencyOutOfEnvelope { .. } => {
-                latency_out += 1
-            }
-        }
-    }
-    let fail = total - pass;
-    println!(
-        "{}/{} PASS, {}/{} FAIL ({} wrong byte, {} no-resolve, {} no-stable-byte, {} addr-out-of-range, {} latency-out-of-envelope)",
-        pass, total, fail, total,
-        wrong_byte, no_resolve, no_stable, out_of_range, latency_out,
-    );
+    // Full Stage G.3 report: header (sys_clk_hz), per-case table,
+    // summary (pass/fail counts + latency stats + ROM speed class),
+    // and the emulator-bounded caveat. `format_report` is the single
+    // canonical renderer — the G.2 inline summary tally has been
+    // retired in favor of it.
+    println!();
+    let sys_clk_hz = emu.bus.sys_clk_hz();
+    print!("{}", oracle.format_report(sys_clk_hz));
 
-    if pass == total {
+    // Exit code: pass iff every case is Pass.
+    let results = oracle.results();
+    let pass_count = results
+        .iter()
+        .filter(|r| matches!(r.verdict, onerom_serving_oracle::Verdict::Pass))
+        .count();
+
+    if pass_count == results.len() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
