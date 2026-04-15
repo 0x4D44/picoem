@@ -72,6 +72,21 @@ When the harness reports a mismatch:
 3. Investigate the specific instruction's decode/execute path in our emulator.
 4. Fix and re-run the same seed to confirm.
 
+### Running alongside concurrent builds (Windows)
+
+Windows holds an exclusive lock on a running `.exe`. While `qemu_diff_m33.exe` / `qemu_diff_m0plus.exe` is fuzzing, any link step that tries to overwrite *that specific binary* — workspace-wide `cargo build --release`, or `-p mdpicoem-harness` — will fail with an access-denied linker error. This blocks other agents rebuilding the harness.
+
+Scope is narrow: builds and tests that don't touch the harness binary (e.g. `cargo build -p mdrp2350`, `cargo test -p mdrp2040`) are unaffected.
+
+When starting a long fuzz run, copy the binary first so `target/release/<bin>.exe` stays free:
+
+```bash
+cp target/release/qemu_diff_m33.exe /tmp/fuzzer.exe
+/tmp/fuzzer.exe --fuzz 100000
+```
+
+The overnight drivers under `fuzz-runs/` (`run-m33.sh`, `run-m0plus.sh`, `run-probe.sh`) already do this — they copy the harness to `fuzz-runs/<bin>.<pid>.exe` at startup and delete it on exit.
+
 ## Workspace Layout
 
 - **`crates/mdpicoem-common`** — shared primitives pulled out in Phase 2: `Memory` (with `new()` for RP2350 sizes and `with_sizes(rom, sram)` for RP2040 / future chips), `ClockTree` math, `Pacer` (`x86_64`-only), `PioBlock`/`StateMachine`, `Divider`, `Fifo`, and the `Peripheral` trait. Both chip crates depend on this.

@@ -105,6 +105,8 @@ cargo run -p mdpicoem-harness --release --bin qemu_diff_m0plus -- --fuzz 100000 
 
 Requires `qemu-system-arm` on `PATH`.
 
+On Windows, a running `.exe` is locked against overwrite, so a long fuzz session will block concurrent `cargo build --release` (or any build that relinks the harness). Copy the binary out before a long run — e.g. `cp target/release/qemu_diff_m33.exe /tmp/fuzzer.exe && /tmp/fuzzer.exe --fuzz 100000`. The overnight drivers under `fuzz-runs/` handle this automatically. See `CLAUDE.md` for the full note.
+
 ### 3. Hardware-in-the-loop (real silicon)
 
 Drive a real RP2354 board over SWD via a Pi Pico debug probe, single-step it, and diff against the emulator. Catches behaviours QEMU doesn't model correctly — e.g. SRAM bank contention, pipeline effects.
