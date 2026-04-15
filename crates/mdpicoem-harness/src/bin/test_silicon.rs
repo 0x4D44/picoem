@@ -1,10 +1,12 @@
 // test_silicon — unified orchestrator for the silicon-gated oracles.
 //
-// Wraps the three Stage 2 library APIs under one shared probe session:
+// Wraps the five library APIs under one shared probe session:
 //
 //   * `cycle_cases::run_against`        (cycle oracle)
 //   * `silicon_scenarios::run_against`  (periph oracle)
 //   * `bank_conflict_cases::run_against` (bank-conflict oracle)
+//   * `dualcore_cases::run_against`     (dual-core contention oracle)
+//   * `isr_scenarios::run_against`      (exception entry / FP save oracle)
 //
 // Single-pass mode (default) runs each oracle's catalogue once in catalogue
 // order — each oracle's `run_against` is called exactly once, with
@@ -40,6 +42,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mdpicoem_harness::bank_conflict_cases::{self, BankArgs};
 use mdpicoem_harness::cycle_cases::{self, CycleArgs};
 use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs};
+use mdpicoem_harness::isr_scenarios::{self, IsrArgs};
 use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter};
 use mdpicoem_harness::silicon_scenarios::{self, PeriphArgs};
 use probe_rs::{Session, SessionConfig};
@@ -59,6 +62,7 @@ const ORACLE_CYCLE: &str = "cycle";
 const ORACLE_PERIPH: &str = "periph";
 const ORACLE_BANK: &str = "bank";
 const ORACLE_DUALCORE: &str = "dualcore";
+const ORACLE_ISR: &str = "isr";
 
 const USAGE: &str = "\
 Usage: test_silicon [--soak <duration>] [--seed <u64>] [--filter <substr>] [--verbose]
@@ -206,7 +210,7 @@ fn validate_catalogue_names_are_unique(names: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Combine the four catalogues' names into one `Vec<&str>` for the
+/// Combine the five catalogues' names into one `Vec<&str>` for the
 /// validator to chew on. Called once at startup.
 fn collect_all_catalogue_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
@@ -221,6 +225,9 @@ fn collect_all_catalogue_names() -> Vec<&'static str> {
     }
     for c in dualcore_cases::CASES {
         names.push(c.name);
+    }
+    for s in isr_scenarios::SCENARIOS {
+        names.push(s.name);
     }
     names
 }
@@ -263,6 +270,7 @@ enum OracleKind {
     Periph,
     Bank,
     DualCore,
+    Isr,
 }
 
 impl OracleKind {
@@ -272,6 +280,7 @@ impl OracleKind {
             OracleKind::Periph => ORACLE_PERIPH,
             OracleKind::Bank => ORACLE_BANK,
             OracleKind::DualCore => ORACLE_DUALCORE,
+            OracleKind::Isr => ORACLE_ISR,
         }
     }
 }
@@ -289,6 +298,7 @@ fn oracle_name_static(name: &str) -> &'static str {
         ORACLE_PERIPH => ORACLE_PERIPH,
         ORACLE_BANK => ORACLE_BANK,
         ORACLE_DUALCORE => ORACLE_DUALCORE,
+        ORACLE_ISR => ORACLE_ISR,
         _ => "unknown",
     }
 }
@@ -396,6 +406,14 @@ fn run_one_oracle(
                 ..DualCoreArgs::default()
             };
             dualcore_cases::run_against(session, &args, order_slice)
+        }
+        OracleKind::Isr => {
+            let mut core = session.core(0).map_err(|e| e.to_string())?;
+            let args = IsrArgs {
+                filter: plan.filter.clone(),
+                verbose: false,
+            };
+            isr_scenarios::run_against(&mut core, &args, order_slice)
         }
     };
     result.map_err(|e| e.to_string())
@@ -645,6 +663,7 @@ fn single_pass(
         OracleKind::Periph,
         OracleKind::Bank,
         OracleKind::DualCore,
+        OracleKind::Isr,
     ] {
         println!("--- oracle: {} ---", oracle.as_str());
         let t0 = Instant::now();
@@ -777,11 +796,17 @@ fn soak_loop(
         .map(|c| c.name)
         .filter(|n| name_matches_filter(n, args.filter.as_deref()))
         .collect();
+    let isr_names: Vec<&'static str> = isr_scenarios::SCENARIOS
+        .iter()
+        .map(|s| s.name)
+        .filter(|n| name_matches_filter(n, args.filter.as_deref()))
+        .collect();
 
     if cycle_names.is_empty()
         && periph_names.is_empty()
         && bank_names.is_empty()
         && dualcore_names.is_empty()
+        && isr_names.is_empty()
     {
         println!(
             "test_silicon: no cases match filter '{}' in any oracle; exiting",
@@ -800,10 +825,12 @@ fn soak_loop(
         let mut periph_plan: Vec<&'static str> = periph_names.clone();
         let mut bank_plan: Vec<&'static str> = bank_names.clone();
         let mut dualcore_plan: Vec<&'static str> = dualcore_names.clone();
+        let mut isr_plan: Vec<&'static str> = isr_names.clone();
         shuffle_in_place(&mut cycle_plan, &mut rng);
         shuffle_in_place(&mut periph_plan, &mut rng);
         shuffle_in_place(&mut bank_plan, &mut rng);
         shuffle_in_place(&mut dualcore_plan, &mut rng);
+        shuffle_in_place(&mut isr_plan, &mut rng);
 
         if args.verbose {
             println!("{} iter={} seed={} starting", fmt_elapsed(start.elapsed()), iter_index, s);
@@ -819,7 +846,7 @@ fn soak_loop(
         //     ONCE at the start of bank (once per iteration).
         //   - No reset between cycle→periph→bank inside one iteration —
         //     the HLD's cross-oracle state-cleanup contract is honoured.
-        let plans: [(OracleKind, Vec<String>); 4] = [
+        let plans: [(OracleKind, Vec<String>); 5] = [
             (
                 OracleKind::Cycle,
                 cycle_plan.into_iter().map(String::from).collect(),
@@ -835,6 +862,10 @@ fn soak_loop(
             (
                 OracleKind::DualCore,
                 dualcore_plan.into_iter().map(String::from).collect(),
+            ),
+            (
+                OracleKind::Isr,
+                isr_plan.into_iter().map(String::from).collect(),
             ),
         ];
 
@@ -1213,7 +1244,38 @@ mod tests {
         assert_eq!(oracle_name_static("periph"), ORACLE_PERIPH);
         assert_eq!(oracle_name_static("bank"), ORACLE_BANK);
         assert_eq!(oracle_name_static("dualcore"), ORACLE_DUALCORE);
+        assert_eq!(oracle_name_static("isr"), ORACLE_ISR);
         assert_eq!(oracle_name_static("foo"), "unknown");
+    }
+
+    /// Every ISR scenario must start with `isr_` for substring-uniqueness.
+    /// Fires at `cargo test` time so a bad rename in isr_scenarios.rs
+    /// breaks the orchestrator's filter semantics locally.
+    #[test]
+    fn test_all_isr_scenarios_have_isr_prefix() {
+        for s in isr_scenarios::SCENARIOS {
+            assert!(
+                s.name.starts_with("isr_"),
+                "isr scenario '{}' missing 'isr_' prefix",
+                s.name,
+            );
+        }
+    }
+
+    /// All five catalogues must round-trip through the orchestrator's
+    /// substring-uniqueness validator. This is load-bearing: without it,
+    /// an accidental `isr_pendsv` case colliding with a future
+    /// `bankcfl_isr_pendsv` rename would silently alias both under one
+    /// `--filter isr_pendsv` flag.
+    #[test]
+    fn test_five_catalogues_cover_correct_oracles() {
+        let names = collect_all_catalogue_names();
+        // At least one name per oracle.
+        assert!(names.iter().any(|n| n.starts_with("cycle") || n.starts_with("nop") || n.starts_with("push") || n.starts_with("backward") || n.starts_with("ldm") || n.starts_with("bank_")));
+        assert!(names.iter().any(|n| n.starts_with("pio0") || n.starts_with("pll_sys") || n.starts_with("clock")));
+        assert!(names.iter().any(|n| n.starts_with("bankcfl_")));
+        assert!(names.iter().any(|n| n.starts_with("dualcore_")));
+        assert!(names.iter().any(|n| n.starts_with("isr_")));
     }
 
     #[test]

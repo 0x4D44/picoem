@@ -9,6 +9,7 @@ pub mod dualcore_cases;
 pub mod gdb_client;
 pub mod i2s_capture;
 pub mod ieee754_ref;
+pub mod isr_scenarios;
 pub mod onerom_glue_dma;
 pub mod onerom_serving_oracle;
 pub mod onerom_snapshot_fmt;
@@ -185,6 +186,52 @@ pub const DUALCORE_CORE1_DATA: u32 = 0x2000_1200;
 /// below `EMU_TEST_STACK`, well beyond any plausible core-1 frame depth
 /// for the short antagonist loops this oracle runs.
 pub const DUALCORE_CORE1_STACK: u32 = 0x2003_E000;
+
+/// ISR oracle (`silicon_isr_diff_rp2350`) SRAM image base. Each scenario's
+/// hand-assembled Thumb image (vector table + handler stub + main routine
+/// + literal pool) is uploaded starting here. Chosen to sit above the
+/// periph oracle's sled (`SILICON_RUN_SLED = 0x2000_1100`) and the
+/// antagonist slot (`DUALCORE_ANTAGONIST_SLOT = 0x2000_1114`), so the
+/// oracles do not collide within a single orchestrator iteration. The
+/// address is 32-word aligned (0x80) — a stricter alignment than
+/// VTOR's minimum (7 bits of the low word must be zero for M33) — so
+/// VTOR writes pointing here are always well-formed.
+pub const ISR_IMAGE_BASE: u32 = 0x2000_2000;
+
+/// ISR oracle stack top. Reset vector word 0 (initial MSP) is
+/// programmed to this address; all scenarios start in Thread mode on
+/// MSP with SP = ISR_STACK_TOP. 4 KB above `ISR_IMAGE_BASE` leaves
+/// plenty of headroom for the 64-byte vector table + ~256 bytes of
+/// handler/main code + literal pool without reaching the mailbox.
+pub const ISR_STACK_TOP: u32 = 0x2000_3000;
+
+/// ISR oracle mailbox base. Two u32 slots at `ISR_STACK_TOP + 0xFF8`
+/// and `ISR_STACK_TOP + 0xFFC` — the handler stores the CYCCNT reading
+/// into `ISR_MAILBOX_CYCCNT` (offset 0) before halting on BKPT #0, and
+/// the host reads it post-halt to compare against the emulator's
+/// equivalent. Placed in the last 8 bytes of the 4 KB page that starts
+/// at `ISR_STACK_TOP` (the highest u32 slot in that page is
+/// `ISR_STACK_TOP + 0xFFC`; the mailbox occupies the two words at
+/// `+0xFF8` and `+0xFFC`). This is above the stack (which grows down
+/// from `ISR_STACK_TOP`) and well clear of any exception stacking the
+/// handler might perform.
+pub const ISR_MAILBOX_BASE: u32 = 0x2000_3FF8;
+
+/// Address of the CYCCNT mailbox slot the handler writes.
+pub const ISR_MAILBOX_CYCCNT: u32 = ISR_MAILBOX_BASE;
+
+/// Reserved u32 slot adjacent to `ISR_MAILBOX_CYCCNT`. Currently
+/// unused; earmarked for a future "what fired" nonce so handlers that
+/// multiplex PendSV + SysTick can distinguish which path ran.
+pub const ISR_MAILBOX_RESERVED: u32 = ISR_MAILBOX_BASE + 4;
+
+/// Offset (within each scenario's SRAM image) of the shared default
+/// handler. The default handler is a single `bkpt #1` instruction
+/// slotted here so every unused vector-table entry points to a
+/// known-bad stop. If a scenario's trigger mis-fires and the wrong
+/// vector entry takes effect, the core halts on `bkpt #1` and the
+/// host sees a distinct halt reason from the expected `bkpt #0`.
+pub const ISR_DEFAULT_HANDLER_OFF: u32 = 0x040;
 
 // ============================================================================
 // Per-chip address bases for `compare()`
