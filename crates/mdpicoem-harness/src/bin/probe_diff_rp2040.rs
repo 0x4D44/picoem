@@ -33,7 +33,8 @@ use mdpicoem_harness::{
     EMU_M0PLUS_TEST_SCRATCH, EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK,
     MASK_ALL_FLAGS, MASK_NZ_ONLY, SCRATCH_SIZE,
 };
-use probe_rs::{Core, MemoryInterface, RegisterId, Session, SessionConfig};
+use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::{Core, MemoryInterface, Permissions, RegisterId, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,12 @@ const XPSR: RegisterId = RegisterId(16);
 
 // BKPT #0 sentinel placed after test instruction.
 const BKPT: u16 = 0xBE00;
+
+// RP2040 bootrom occupies 0x0000_0000..=0x0000_3FFF (16 KB). The
+// UNDEF-on-silicon classifier treats any post-step PC landing in this
+// range as evidence that silicon HardFaulted and was dispatched via
+// VTOR=0 into the bootrom's fault handler.
+const RP2040_BOOTROM_END: u32 = 0x0000_4000;
 
 fn main() {
     if let Err(e) = run() {
@@ -61,12 +68,19 @@ fn main() {
 struct Args {
     fuzz_count: Option<usize>,
     seed: Option<u64>,
+    probe: Option<DebugProbeSelector>,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn parse_probe_selector(s: &str) -> Result<DebugProbeSelector, String> {
+    DebugProbeSelector::try_from(s)
+        .map_err(|e| format!("invalid probe selector '{s}': {e}"))
+}
+
+fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
+    let args: Vec<String> = argv.into_iter().collect();
     let mut fuzz_count = None;
     let mut seed = None;
+    let mut probe = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -93,13 +107,21 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("invalid seed '{}': {e}", args[i]))?,
                 );
             }
+            "--probe" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--probe requires a VID:PID:SERIAL argument".into());
+                }
+                probe = Some(parse_probe_selector(&args[i])?);
+            }
             other => {
                 return Err(format!(
                     "unknown argument '{other}'\n\
                      Usage:\n  \
                      probe_diff_rp2040                      Run targeted edge-case tests\n  \
                      probe_diff_rp2040 --fuzz N             Random fuzz tests (N per class)\n  \
-                     probe_diff_rp2040 --fuzz N --seed S    Reproducible fuzz"
+                     probe_diff_rp2040 --fuzz N --seed S    Reproducible fuzz\n  \
+                     probe_diff_rp2040 --probe VID:PID:SERIAL  Select a specific probe"
                 ));
             }
         }
@@ -110,7 +132,11 @@ fn parse_args() -> Result<Args, String> {
         return Err("--seed requires --fuzz".into());
     }
 
-    Ok(Args { fuzz_count, seed })
+    Ok(Args { fuzz_count, seed, probe })
+}
+
+fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
 }
 
 // ============================================================================
@@ -229,29 +255,29 @@ fn is_m0plus_silicon_safe(tc: &TestCase) -> bool {
 fn run_one_probe(
     core: &mut Core,
     tc: &TestCase,
-) -> Result<RunState, probe_rs::Error> {
+) -> Result<RunState, DiffError> {
     // 1. Write instruction (16 or 32 bits) + BKPT sentinel to test slot.
     let mut code = tc.opcode.to_le_bytes().to_vec();
     if let Some(hw1) = tc.hw1 {
         code.extend_from_slice(&hw1.to_le_bytes());
     }
     code.extend_from_slice(&BKPT.to_le_bytes());
-    core.write_8(EMU_M0PLUS_TEST_SLOT as u64, &code)?;
+    core.write_8(EMU_M0PLUS_TEST_SLOT as u64, &code).map_err(DiffError::ProbeError)?;
 
     // 2. Set register defaults: R0-R12 = 0
     for i in 0..=12u16 {
-        core.write_core_reg(RegisterId(i), 0u32)?;
+        core.write_core_reg(RegisterId(i), 0u32).map_err(DiffError::ProbeError)?;
     }
     // SP = test stack, LR = sentinel, PC = test slot, xPSR = precondition.
-    core.write_core_reg(RegisterId(13), EMU_M0PLUS_TEST_STACK)?;
-    core.write_core_reg(RegisterId(14), 0xFFFF_FFFFu32)?;
-    core.write_core_reg(PC, EMU_M0PLUS_TEST_SLOT)?;
-    core.write_core_reg(XPSR, tc.xpsr_pre)?;
+    core.write_core_reg(RegisterId(13), EMU_M0PLUS_TEST_STACK).map_err(DiffError::ProbeError)?;
+    core.write_core_reg(RegisterId(14), 0xFFFF_FFFFu32).map_err(DiffError::ProbeError)?;
+    core.write_core_reg(PC, EMU_M0PLUS_TEST_SLOT).map_err(DiffError::ProbeError)?;
+    core.write_core_reg(XPSR, tc.xpsr_pre).map_err(DiffError::ProbeError)?;
 
     // 3. Apply register preconditions (same address space as the emulator).
     for &(reg, val) in &tc.reg_pre {
         let val = setup_reg(reg, val, tc, EMU_M0PLUS_TEST_SCRATCH);
-        core.write_core_reg(RegisterId(reg as u16), val)?;
+        core.write_core_reg(RegisterId(reg as u16), val).map_err(DiffError::ProbeError)?;
     }
 
     // 4. Memory setup (zero scratch + write preconditions).
@@ -259,28 +285,37 @@ fn run_one_probe(
         core.write_8(
             EMU_M0PLUS_TEST_SCRATCH as u64,
             &[0u8; SCRATCH_SIZE as usize],
-        )?;
+        ).map_err(DiffError::ProbeError)?;
         for &(offset, val) in &tc.mem_pre {
-            core.write_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &[val])?;
+            core.write_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &[val]).map_err(DiffError::ProbeError)?;
         }
     }
 
     // 5. Single-step the instruction under test. Thumb-32 is one step on
     // M0+ just like on M33 — the CPU consumes both halfwords per step.
-    core.step()?;
+    core.step().map_err(DiffError::ProbeError)?;
 
-    // 6. Read post-state.
+    // 6. UNDEF-on-silicon sanity: if PC landed inside bootrom, silicon
+    // HardFaulted and was dispatched via VTOR=0. Short-circuit before
+    // touching the rest of the state. Branch targets inside the test
+    // region are left for `compare_probe` to evaluate semantically.
+    let pc_after: u32 = core.read_core_reg(PC).map_err(DiffError::ProbeError)?;
+    if let Some(pc) = classify_post_step_pc(pc_after) {
+        return Err(DiffError::UndefOnSilicon { pc });
+    }
+
+    // 7. Read post-state.
     let mut regs = [0u32; 16];
     for i in 0..16u32 {
-        regs[i as usize] = core.read_core_reg(RegisterId(i as u16))?;
+        regs[i as usize] = core.read_core_reg(RegisterId(i as u16)).map_err(DiffError::ProbeError)?;
     }
-    let xpsr: u32 = core.read_core_reg(XPSR)?;
+    let xpsr: u32 = core.read_core_reg(XPSR).map_err(DiffError::ProbeError)?;
 
-    // 7. Read memory at mem_check offsets.
+    // 8. Read memory at mem_check offsets.
     let mut mem = Vec::new();
     for &offset in &tc.mem_check {
         let mut byte = [0u8; 1];
-        core.read_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &mut byte)?;
+        core.read_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &mut byte).map_err(DiffError::ProbeError)?;
         mem.push(byte[0]);
     }
 
@@ -372,8 +407,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("probe_diff_rp2040: RP2040 hardware differential test runner");
     println!("===========================================================");
 
-    // 1. Attach to target via probe-rs.
-    let mut session = Session::auto_attach("rp2040", SessionConfig::default())?;
+    // 1. Attach to target via probe-rs. With --probe, route through the
+    // explicit selector to disambiguate multiple attached probes (see HLD
+    // §2.1 — `auto_attach` just picks the first-enumerated probe).
+    let mut session = match args.probe.as_ref() {
+        None => Session::auto_attach("rp2040", SessionConfig::default())?,
+        Some(selector) => {
+            let probe = Lister::new().open(selector.clone())?;
+            probe.attach("rp2040", Permissions::default())?
+        }
+    };
     let mut core = session.core(0)?;
     println!("Attached to target, using core 0");
 
@@ -413,6 +456,7 @@ fn run_targeted(core: &mut Core) -> Result<(), Box<dyn std::error::Error>> {
     let mut pass = 0usize;
     let mut fail = 0usize;
     let mut skip = 0usize;
+    let mut undef = 0usize;
     let t0 = Instant::now();
 
     for (i, tc) in tests.iter().enumerate() {
@@ -433,13 +477,20 @@ fn run_targeted(core: &mut Core) -> Result<(), Box<dyn std::error::Error>> {
                 skip += 1;
                 eprintln!("[SKIP] {}: probe-rs error: {e}", tc.name);
             }
+            Err(DiffError::UndefOnSilicon { pc }) => {
+                undef += 1;
+                eprintln!(
+                    "[UNDEF] {}: silicon dispatched to bootrom @ {:#010x} (filter gap)\n  opcode: {:#06x}  hw1: {:?}",
+                    tc.name, pc, tc.opcode, tc.hw1
+                );
+            }
         }
     }
 
     let elapsed = t0.elapsed();
-    print_summary("targeted", pass, fail, skip, elapsed);
+    print_summary("targeted", pass, fail, skip, undef, elapsed);
 
-    if fail > 0 {
+    if fail > 0 || undef > 0 {
         std::process::exit(1);
     }
     Ok(())
@@ -476,6 +527,7 @@ fn run_fuzz(
     let mut pass = 0usize;
     let mut fail = 0usize;
     let mut skip = 0usize;
+    let mut undef = 0usize;
     let mut done = 0usize;
     let t0 = Instant::now();
 
@@ -498,13 +550,20 @@ fn run_fuzz(
                 skip += 1;
                 eprintln!("[SKIP] {}: probe-rs error: {e}", tc.name);
             }
+            Err(DiffError::UndefOnSilicon { pc }) => {
+                undef += 1;
+                eprintln!(
+                    "[UNDEF] {}: silicon dispatched to bootrom @ {:#010x} (filter gap)\n  opcode: {:#06x}  hw1: {:?}",
+                    tc.name, pc, tc.opcode, tc.hw1
+                );
+            }
         }
     }
 
     let elapsed = t0.elapsed();
-    print_summary("fuzz", pass, fail, skip, elapsed);
+    print_summary("fuzz", pass, fail, skip, undef, elapsed);
     println!("Seed: {seed}");
-    if fail > 0 {
+    if fail > 0 || undef > 0 {
         println!("Reproduce: probe_diff_rp2040 --fuzz {count_per_class} --seed {seed}");
         std::process::exit(1);
     }
@@ -518,6 +577,23 @@ fn run_fuzz(
 enum DiffError {
     Mismatch(String),
     ProbeError(probe_rs::Error),
+    /// Post-step PC landed inside the RP2040 bootrom (0..0x3FFF), which
+    /// on a VTOR=0 core means the instruction UNDEF'd on silicon and was
+    /// dispatched into the bootrom's HardFault handler. Surfaces
+    /// filter-gap bugs in `is_m0plus_silicon_safe`.
+    UndefOnSilicon { pc: u32 },
+}
+
+/// Classify the PC read after `core.step()`. Returns `Some(pc)` only when
+/// silicon dispatched into the bootrom (the specific case the HLD set out
+/// to catch); all other post-step PCs — BKPT sentinel, branch targets,
+/// POP-to-PC landings — are left to the register-level comparison.
+fn classify_post_step_pc(pc: u32) -> Option<u32> {
+    if pc < RP2040_BOOTROM_END {
+        Some(pc)
+    } else {
+        None
+    }
 }
 
 /// Run one test on both hardware and the emulator, compare results.
@@ -527,7 +603,7 @@ fn run_one_diff(
     bus: &mut M0Bus,
     tc: &TestCase,
 ) -> Result<(), DiffError> {
-    let hw_state = run_one_probe(core, tc).map_err(DiffError::ProbeError)?;
+    let hw_state = run_one_probe(core, tc)?;
     let emu_state = run_one_emu_m0plus(tc, bus);
     compare_probe(tc, &hw_state, &emu_state).map_err(DiffError::Mismatch)
 }
@@ -541,15 +617,17 @@ fn print_summary(
     pass: usize,
     fail: usize,
     skip: usize,
+    undef: usize,
     elapsed: Duration,
 ) {
-    let total = pass + fail + skip;
+    let total = pass + fail + skip + undef;
     println!();
     println!("=== {mode} summary ===");
     println!("Total:   {total}");
     println!("Passed:  {pass}");
     println!("Failed:  {fail}");
     println!("Skipped: {skip}");
+    println!("Undef:   {undef}");
     println!("Time:    {:.1}s", elapsed.as_secs_f64());
 }
 
@@ -748,6 +826,90 @@ mod tests {
         let state = run_one_emu_m0plus(&tc, &mut bus);
         assert_eq!(state.regs[0], 0x5A);
         assert_eq!(state.regs[15], EMU_M0PLUS_TEST_SLOT + 2);
+    }
+
+    // -----------------------------------------------------------------
+    // --probe flag parsing
+    // -----------------------------------------------------------------
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn probe_flag_parses_full_selector() {
+        let args = parse(&["--probe", "2e8a:000c:ABC"]).expect("selector must parse");
+        let sel = args.probe.expect("probe must be Some");
+        assert_eq!(sel.vendor_id, 0x2e8a);
+        assert_eq!(sel.product_id, 0x000c);
+        assert_eq!(sel.serial_number.as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn probe_flag_missing_value_errors() {
+        match parse(&["--probe"]) {
+            Err(err) => assert!(err.contains("--probe requires"), "unexpected error: {err}"),
+            Ok(_) => panic!("bare --probe must error"),
+        }
+    }
+
+    #[test]
+    fn probe_flag_bogus_value_errors_cleanly() {
+        match parse(&["--probe", "bogus"]) {
+            Err(err) => {
+                assert!(
+                    err.contains("invalid probe selector"),
+                    "error should name the flag: {err}"
+                );
+                assert!(err.contains("bogus"), "error should echo the bad value: {err}");
+            }
+            Ok(_) => panic!("bogus selector must error"),
+        }
+    }
+
+    #[test]
+    fn probe_flag_absent_leaves_probe_none() {
+        let args = parse(&["--fuzz", "10"]).expect("parse");
+        assert!(args.probe.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Post-step PC classification
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_pc_in_bootrom_flags_undef() {
+        // Anywhere in 0..0x3FFF is evidence of HardFault dispatch via VTOR=0.
+        for pc in [0x0000_0004, 0x0000_0010, 0x0000_1234, 0x0000_3FFC] {
+            assert_eq!(classify_post_step_pc(pc), Some(pc), "pc={pc:#010x}");
+        }
+    }
+
+    #[test]
+    fn classify_pc_at_bootrom_boundary_is_not_undef() {
+        // 0x4000 is the first address outside bootrom — exclusive upper bound.
+        assert_eq!(classify_post_step_pc(0x0000_4000), None);
+    }
+
+    #[test]
+    fn classify_pc_at_test_slot_bkpt_is_not_undef() {
+        // Happy-path PCs for Thumb-16 (slot+2) and Thumb-32 (slot+4) BKPT sentinels.
+        assert_eq!(classify_post_step_pc(EMU_M0PLUS_TEST_SLOT + 2), None);
+        assert_eq!(classify_post_step_pc(EMU_M0PLUS_TEST_SLOT + 4), None);
+    }
+
+    #[test]
+    fn classify_pc_at_bl_target_is_not_undef() {
+        // Regression for the bug this fix closes: BL lands past slot+4 but
+        // still inside the test region, NOT inside bootrom.
+        assert_eq!(classify_post_step_pc(EMU_M0PLUS_TEST_SLOT + 8), None);
+    }
+
+    #[test]
+    fn classify_pc_at_pop_pc_garbage_is_not_undef() {
+        // POP {PC} with stack garbage lands at some non-bootrom address;
+        // let `compare_probe` flag it semantically rather than UNDEF-classify.
+        assert_eq!(classify_post_step_pc(EMU_M0PLUS_TEST_STACK + 0x100), None);
     }
 
     #[test]

@@ -11,7 +11,8 @@
 //   probe_diff_rp2350 --cycles             Also compare cycle counts
 
 use mdpicoem_harness::*;
-use probe_rs::{Core, MemoryInterface, RegisterId, Session, SessionConfig};
+use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::{Core, MemoryInterface, Permissions, RegisterId, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -52,13 +53,20 @@ struct Args {
     fuzz_count: Option<usize>,
     seed: Option<u64>,
     cycles: bool,
+    probe: Option<DebugProbeSelector>,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn parse_probe_selector(s: &str) -> Result<DebugProbeSelector, String> {
+    DebugProbeSelector::try_from(s)
+        .map_err(|e| format!("invalid probe selector '{s}': {e}"))
+}
+
+fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
+    let args: Vec<String> = argv.into_iter().collect();
     let mut fuzz_count = None;
     let mut seed = None;
     let mut cycles = false;
+    let mut probe = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -88,6 +96,13 @@ fn parse_args() -> Result<Args, String> {
             "--cycles" => {
                 cycles = true;
             }
+            "--probe" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--probe requires a VID:PID:SERIAL argument".into());
+                }
+                probe = Some(parse_probe_selector(&args[i])?);
+            }
             other => {
                 return Err(format!(
                     "unknown argument '{other}'\n\
@@ -95,7 +110,8 @@ fn parse_args() -> Result<Args, String> {
                      probe_diff_rp2350                      Run targeted edge-case tests\n  \
                      probe_diff_rp2350 --fuzz N             Random fuzz tests (N per class)\n  \
                      probe_diff_rp2350 --fuzz N --seed S    Reproducible fuzz\n  \
-                     probe_diff_rp2350 --cycles             Also compare cycle counts"
+                     probe_diff_rp2350 --cycles             Also compare cycle counts\n  \
+                     probe_diff_rp2350 --probe VID:PID:SERIAL  Select a specific probe"
                 ));
             }
         }
@@ -110,7 +126,12 @@ fn parse_args() -> Result<Args, String> {
         fuzz_count,
         seed,
         cycles,
+        probe,
     })
+}
+
+fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
 }
 
 // ============================================================================
@@ -311,8 +332,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("probe_diff_rp2350: RP2354 hardware differential test runner");
     println!("===========================================================");
 
-    // 1. Attach to target via probe-rs
-    let mut session = Session::auto_attach("rp2350", SessionConfig::default())?;
+    // 1. Attach to target via probe-rs. With --probe, route through the
+    // explicit selector to disambiguate multiple attached probes (see HLD
+    // §2.1 — `auto_attach` just picks the first-enumerated probe).
+    let mut session = match args.probe.as_ref() {
+        None => Session::auto_attach("rp2350", SessionConfig::default())?,
+        Some(selector) => {
+            let probe = Lister::new().open(selector.clone())?;
+            probe.attach("rp2350", Permissions::default())?
+        }
+    };
     let mut core = session.core(0)?;
     println!("Attached to target, using core 0");
 
@@ -542,4 +571,54 @@ fn print_summary(
         println!("Cycle mismatches: {cycle_mismatches}");
     }
     println!("Time:    {:.1}s", elapsed.as_secs_f64());
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn probe_flag_parses_full_selector() {
+        let args = parse(&["--probe", "2e8a:000c:ABC"]).expect("selector must parse");
+        let sel = args.probe.expect("probe must be Some");
+        assert_eq!(sel.vendor_id, 0x2e8a);
+        assert_eq!(sel.product_id, 0x000c);
+        assert_eq!(sel.serial_number.as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn probe_flag_missing_value_errors() {
+        match parse(&["--probe"]) {
+            Err(err) => assert!(err.contains("--probe requires"), "unexpected error: {err}"),
+            Ok(_) => panic!("bare --probe must error"),
+        }
+    }
+
+    #[test]
+    fn probe_flag_bogus_value_errors_cleanly() {
+        match parse(&["--probe", "bogus"]) {
+            Err(err) => {
+                assert!(
+                    err.contains("invalid probe selector"),
+                    "error should name the flag: {err}"
+                );
+                assert!(err.contains("bogus"), "error should echo the bad value: {err}");
+            }
+            Ok(_) => panic!("bogus selector must error"),
+        }
+    }
+
+    #[test]
+    fn probe_flag_absent_leaves_probe_none() {
+        let args = parse(&["--fuzz", "10"]).expect("parse");
+        assert!(args.probe.is_none());
+    }
 }
