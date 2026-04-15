@@ -191,7 +191,7 @@ impl Emulator {
     /// The bootrom image remains populated at `0x00000000` so firmware
     /// can resolve ROM function-table pointers (`rom_func_lookup`,
     /// `rom_data_lookup`). Call **after** `load_bootrom` + `load_flash`
-    /// + `reset` — this method only rewrites SP/PC.
+    /// + `reset`.
     pub fn direct_boot_from_flash(&mut self, vtor_offset: u32) {
         let sp = self.bus.memory.xip_read32(vtor_offset);
         let pc = self.bus.memory.xip_read32(vtor_offset + 4) & !1;
