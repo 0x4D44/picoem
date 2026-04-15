@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.24.0"
+version = "0.25.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -117,6 +117,10 @@ path = "src/bin/silicon_isr_diff_rp2350.rs"
 [[bin]]
 name = "smoke_per_core_cyccnt_rp2350"
 path = "src/bin/smoke_per_core_cyccnt_rp2350.rs"
+
+[[bin]]
+name = "mmio_trace_rp2350"
+path = "src/bin/mmio_trace_rp2350.rs"
 
 # ---------------------------------------------------------------------------
 # RP2040 (Cortex-M0+) binaries

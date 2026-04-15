@@ -476,6 +476,156 @@ pub const SCENARIOS: &[PeriphScenario] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Red-path scenarios — Phase 0b HLD V5 §4.2.8
+// ---------------------------------------------------------------------------
+//
+// Three deliberately-broken scenarios designed to exercise the oracle's
+// FAIL path: `first_divergence` must render correctly when HW and EMU
+// disagree. Gated behind `--red-path` on the standalone binary so
+// normal runs (and `test_silicon`) don't flake on them.
+//
+// All three are GENUINE red-path witnesses on the current emulator:
+// each observable diverges because the RP2350 emulator's APB fallthrough
+// (`peripheral_regs` HashMap — see `crates/mdrp2350/src/bus/mod.rs`
+// §read32/§write32) does not model the peripheral state that silicon
+// produces. A fresh HashMap entry returns 0 on read; a written key
+// returns exactly the stored bits, never the state-driven flags silicon
+// computes. When future phases wire in TIMER/UART/ADC modelling, these
+// scenarios become smoke-witnesses (PASS both sides) — at that point
+// they need to be replaced with fresh unmodelled-peripheral cases so
+// the red-path catalogue keeps proving "oracle CAN report FAIL".
+//
+// Honest classification:
+//   * `red_timer0_timerawl_unmodelled` — TIMER0 at `0x400B_0000` is
+//     unmodelled (no dispatch arm in `bus::read32`). Silicon's TIMERAWL
+//     advances between setup-write and observe-read; EMU returns 0.
+//     HW ≠ EMU → FAIL. Mirrors `GAP_TIMER_UNMODELLED` on RP2040.
+//   * `red_uart0_fr_at_reset_unmodelled` — UART0 is unmodelled at
+//     `0x4007_0000`. Setup releases UART0 from reset; observe reads
+//     UARTFR (`+0x18`) masked to TXFE | RXFE (bits 4 + 7 = 0x90). ARM
+//     PL011 TRM §3.3.3: TXFE and RXFE both default to 1 after reset
+//     (both FIFOs empty). EMU HashMap returns 0. HW (0x90) ≠ EMU (0)
+//     → FAIL.
+//   * `red_adc_cs_ready_unmodelled` — ADC is unmodelled at
+//     `0x400A_0000`. Setup releases ADC from reset and writes CS=0x1
+//     (EN=1). Observe reads CS masked to READY (bit 8). Silicon's ADC
+//     sets READY a few cycles after EN=1; EMU stores 0x1 in HashMap
+//     verbatim (bit 8 never set). HW (0x100) ≠ EMU (0) → FAIL.
+//
+// HLD V5 §4.2.8's example register choices (GPIO25 bit-24 observe and
+// XOSC_CTRL round-trip) both passed on current EMU because SIO GPIO
+// and `xosc_write` are modelled correctly — the examples lost their
+// red-path quality before landing. These two replacements touch
+// peripherals that genuinely fall through to the HashMap stub, so
+// every observable mask hits a bit EMU can't produce.
+
+/// TIMER0 base (RP2350 datasheet §12.8, `0x400B_0000`) and TIMERAWL
+/// offset (`0x28` — timer value low half, no latching on read).
+pub const TIMER0_BASE: u32 = 0x400B_0000;
+pub const TIMER0_TIMERAWL: u32 = TIMER0_BASE + 0x28;
+
+/// UART0 base (RP2350 datasheet §12.1.1, `0x4007_0000`). UART uses the
+/// ARM PL011 register map: UARTFR lives at `+0x18`.
+pub const UART0_BASE: u32 = 0x4007_0000;
+pub const UART0_UARTFR: u32 = UART0_BASE + 0x18;
+/// PL011 UARTFR.TXFE (bit 7) — transmit FIFO empty. Set at reset.
+pub const UARTFR_TXFE: u32 = 1 << 7;
+/// PL011 UARTFR.RXFE (bit 4) — receive FIFO empty. Set at reset.
+pub const UARTFR_RXFE: u32 = 1 << 4;
+
+/// ADC base (RP2350 datasheet §12.4, `0x400A_0000`). The CS register
+/// (offset 0) carries EN in bit 0 and READY in bit 8.
+pub const ADC_BASE: u32 = 0x400A_0000;
+pub const ADC_CS: u32 = ADC_BASE + 0x00;
+/// ADC_CS.READY (bit 8) — asserted by silicon once the ADC has finished
+/// powering up after EN goes high. Never asserted on the emulator today
+/// (ADC is a HashMap-stub register).
+pub const ADC_CS_READY: u32 = 1 << 8;
+
+/// SIO GPIO_OUT (RP2350 offset 0x010).
+pub const SIO_GPIO_OUT: u32 = 0xD000_0010;
+/// SIO GPIO_OUT_SET (RP2350 offset 0x018 — write-1-set).
+pub const SIO_GPIO_OUT_SET: u32 = 0xD000_0018;
+/// SIO GPIO_OE_SET (RP2350 offset 0x038 — write-1-set). Offset table
+/// per datasheet §3.1.2.
+pub const SIO_GPIO_OE_SET: u32 = 0xD000_0038;
+
+// Shared: release every peripheral from reset by writing `!0` to the
+// RESETS_RESET.CLR alias. The RP2350 RESETS register only defines bits
+// 0..=28 (`resets_state` init mask is `0x1FFF_FFFF`); writes to bits
+// 29..=31 are RAZ/WI and therefore harmless. The red-path scenarios
+// never consult the exact per-peripheral bit assignment — silicon only
+// needs the relevant peripheral out of reset; a scenario-specific
+// constant would bit-rot against datasheet revisions without buying
+// anything the broad CLR doesn't already deliver.
+const RESETS_CLR_ALL: u32 = 0xFFFF_FFFF;
+
+// S_R1: red-path TIMER0 — release TIMER0, wait, observe TIMERAWL
+// non-zero. TIMER0 is not modelled in the RP2350 emulator so EMU
+// returns 0 while HW advances. Genuine red-path witness. Mirrors
+// `GAP_TIMER_UNMODELLED` on RP2040.
+const S_RED_TIMER0_UNMODELLED: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+];
+const O_RED_TIMER0_UNMODELLED: &[(u32, u32)] = &[
+    // Mask the low 24 bits so partial-read conventions don't matter;
+    // any non-zero low-byte on silicon diverges from EMU's 0.
+    (TIMER0_TIMERAWL, 0x00FF_FFFF),
+];
+
+// S_R2: red-path UART0 — release UART0, observe UARTFR's TXFE + RXFE
+// bits. Silicon's PL011 always reports both FIFOs empty after reset;
+// the emulator's HashMap stub returns 0 for any un-written UART
+// address. Divergence on bits 4 + 7 → FAIL.
+const S_RED_UART0_FR_UNMODELLED: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+];
+const O_RED_UART0_FR_UNMODELLED: &[(u32, u32)] = &[
+    (UART0_UARTFR, UARTFR_TXFE | UARTFR_RXFE),
+];
+
+// S_R3: red-path ADC — release ADC, enable it (CS.EN=1), observe
+// CS.READY. Silicon sets READY a few cycles after EN; the emulator's
+// HashMap stores CS=0x1 verbatim so READY (bit 8) stays 0. Divergence
+// on bit 8 → FAIL.
+const S_RED_ADC_CS_UNMODELLED: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (ADC_CS, 0x0000_0001), // EN=1
+];
+const O_RED_ADC_CS_UNMODELLED: &[(u32, u32)] = &[
+    (ADC_CS, ADC_CS_READY),
+];
+
+/// Red-path catalogue. Selected by `silicon_periph_diff_rp2350
+/// --red-path` (mutually exclusive with the default catalogue).
+pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
+    PeriphScenario {
+        name: "red_timer0_timerawl_unmodelled",
+        setup: S_RED_TIMER0_UNMODELLED,
+        max_sysclks: 500,
+        observe: O_RED_TIMER0_UNMODELLED,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+    PeriphScenario {
+        name: "red_uart0_fr_at_reset_unmodelled",
+        setup: S_RED_UART0_FR_UNMODELLED,
+        max_sysclks: 500,
+        observe: O_RED_UART0_FR_UNMODELLED,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+    PeriphScenario {
+        name: "red_adc_cs_ready_unmodelled",
+        setup: S_RED_ADC_CS_UNMODELLED,
+        max_sysclks: 500,
+        observe: O_RED_ADC_CS_UNMODELLED,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+];
+
+// ---------------------------------------------------------------------------
 // Library-API entry point (`run_against`)
 // ---------------------------------------------------------------------------
 
@@ -840,6 +990,56 @@ pub fn run_scenario(
     })
 }
 
+/// Retry-once wrapper. The only probe-rs error kinds we retry on are
+/// the transient ones: `Probe` (DebugProbeError — USB disconnect /
+/// buffer drain stalls) and `Timeout` (ARM DAP timeout). Everything
+/// else is a hard fail on the first attempt.
+///
+/// On retry, we pause briefly to let the probe's internal queue drain
+/// before kicking off the next scenario's reset_and_halt.
+///
+/// Direct port of `silicon_periph_diff_rp2040.rs::run_scenario_with_retry`
+/// (RP2040 Phase 0 Wave 3). Lives in the shared module so both
+/// `silicon_periph_diff_rp2350` and `run_against` (test_silicon
+/// orchestrator) benefit without duplication.
+pub fn run_scenario_with_retry(
+    core: &mut Core,
+    sc: &PeriphScenario,
+    first_scenario: bool,
+    verbose: bool,
+) -> Result<PeriphScenarioResult, Box<dyn std::error::Error>> {
+    match run_scenario(core, sc, first_scenario, verbose) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if is_transient_probe_error(e.as_ref()) {
+                eprintln!(
+                    "  scenario '{}': transient probe error, retrying once: {e}",
+                    sc.name,
+                );
+                std::thread::sleep(Duration::from_millis(250));
+                run_scenario(core, sc, first_scenario, verbose)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Strict error-kind match: retry only on `probe_rs::Error::Probe` and
+/// `probe_rs::Error::Timeout`. Anything else — including `Arm` errors,
+/// `ChipNotFound`, memory-alignment errors — is a hard fail.
+///
+/// `'static` bound on the trait object is required because
+/// `Any::downcast_ref` (pulled in via `Error::downcast_ref`) can only
+/// work on types that don't borrow from shorter-lived scopes.
+pub fn is_transient_probe_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(pe) = e.downcast_ref::<probe_rs::Error>() {
+        matches!(pe, probe_rs::Error::Probe(_) | probe_rs::Error::Timeout)
+    } else {
+        false
+    }
+}
+
 /// Library entry point used by `silicon_periph_diff_rp2350` and the
 /// `test_silicon` orchestrator.
 ///
@@ -887,7 +1087,7 @@ pub fn run_against(
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
     let mut loop_err: Option<Box<dyn std::error::Error>> = None;
     for (i, sc) in selected.iter().enumerate() {
-        match run_scenario(core, sc, i == 0, args.verbose) {
+        match run_scenario_with_retry(core, sc, i == 0, args.verbose) {
             Ok(r) => {
                 let elapsed_ms = r.elapsed.as_millis().min(u32::MAX as u128) as u32;
                 let outcome = if r.verdict == Verdict::Pass {
@@ -1204,6 +1404,210 @@ mod tests {
                 "scenario '{}' custom_sled={} but expected={}",
                 sc.name, has_custom, expected,
             );
+        }
+    }
+
+    // ---- Retry-wrapper transient-error classifier (HLD V5 §4.2.9) -------
+    //
+    // `run_scenario_with_retry` takes a real `probe_rs::Core`, which
+    // can't be mocked from a unit test. The retry logic itself is a
+    // two-liner (match on Ok/Err + classify); the load-bearing piece
+    // is `is_transient_probe_error` — the filter that decides which
+    // error kinds get a second chance. Tests cover it directly.
+    //
+    // Port of the RP2040 transient-error contract: retry ONLY on
+    // `probe_rs::Error::Probe` and `probe_rs::Error::Timeout`.
+
+    /// `Probe` wraps a `DebugProbeError` — treat as transient (USB
+    /// disconnect / buffer drain stalls).
+    #[test]
+    fn test_is_transient_probe_error_probe_variant() {
+        // `DebugProbeError::Timeout` is a unit-ish variant in probe-rs
+        // 0.31 and the easiest to construct without pulling feature
+        // flags. Wrap it in `probe_rs::Error::Probe(_)` to exercise
+        // the transient-arm.
+        let inner = probe_rs::probe::DebugProbeError::Timeout;
+        let e: Box<dyn std::error::Error + 'static> = Box::new(probe_rs::Error::Probe(inner));
+        assert!(
+            is_transient_probe_error(e.as_ref()),
+            "probe_rs::Error::Probe must be classified as transient",
+        );
+    }
+
+    /// `Timeout` is the ARM DAP timeout — treat as transient.
+    #[test]
+    fn test_is_transient_probe_error_timeout_variant() {
+        let e: Box<dyn std::error::Error + 'static> = Box::new(probe_rs::Error::Timeout);
+        assert!(
+            is_transient_probe_error(e.as_ref()),
+            "probe_rs::Error::Timeout must be classified as transient",
+        );
+    }
+
+    /// A plain `String` error (or anything that isn't a
+    /// `probe_rs::Error`) must NOT be treated as transient — hard
+    /// fail on the first attempt.
+    #[test]
+    fn test_is_transient_probe_error_rejects_non_probe_errors() {
+        let e: Box<dyn std::error::Error + 'static> =
+            Box::<dyn std::error::Error + Send + Sync>::from("some other failure");
+        assert!(
+            !is_transient_probe_error(e.as_ref()),
+            "non-probe-rs errors must be classified as hard failures",
+        );
+    }
+
+    /// `ChipNotFound` is configuration-level — not worth retrying.
+    #[test]
+    fn test_is_transient_probe_error_rejects_chip_not_found() {
+        let e: Box<dyn std::error::Error + 'static> =
+            Box::new(probe_rs::Error::ChipNotFound(
+                probe_rs::config::RegistryError::ChipNotFound("rp2350".into()),
+            ));
+        assert!(
+            !is_transient_probe_error(e.as_ref()),
+            "probe_rs::Error::ChipNotFound must NOT be classified as transient",
+        );
+    }
+
+    // ---- Red-path catalogue (Phase 0b HLD V5 §4.2.8) --------------------
+    //
+    // The red-path catalogue is gated behind `--red-path` on the
+    // standalone binary so normal runs don't flake. These tests verify
+    // the catalogue ships the three required scenarios and its shape
+    // matches the default catalogue's invariants.
+
+    #[test]
+    fn test_red_path_catalogue_has_three_scenarios() {
+        assert_eq!(
+            RED_PATH_SCENARIOS.len(),
+            3,
+            "HLD V5 §4.2.8 requires exactly 3 red-path scenarios; got {}",
+            RED_PATH_SCENARIOS.len(),
+        );
+    }
+
+    #[test]
+    fn test_red_path_catalogue_names_match_spec() {
+        let expected: HashSet<&str> = [
+            "red_timer0_timerawl_unmodelled",
+            "red_uart0_fr_at_reset_unmodelled",
+            "red_adc_cs_ready_unmodelled",
+        ]
+        .into_iter()
+        .collect();
+        let actual: HashSet<&str> = RED_PATH_SCENARIOS.iter().map(|s| s.name).collect();
+        assert_eq!(
+            actual, expected,
+            "red-path catalogue names must match HLD V5 §4.2.8 (genuine \
+             red-path witnesses); got {:?}",
+            actual,
+        );
+    }
+
+    #[test]
+    fn test_red_path_catalogue_all_setup_addresses_absolute_mmio() {
+        for sc in RED_PATH_SCENARIOS {
+            for (i, (a, _)) in sc.setup.iter().enumerate() {
+                assert!(
+                    is_mmio(*a),
+                    "{} setup[{}] 0x{:08X} is not in MMIO range",
+                    sc.name,
+                    i,
+                    a,
+                );
+            }
+            for (i, (a, _)) in sc.observe.iter().enumerate() {
+                assert!(
+                    is_mmio(*a),
+                    "{} observe[{}] 0x{:08X} is not in MMIO range",
+                    sc.name,
+                    i,
+                    a,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_red_path_catalogue_no_name_overlap_with_default() {
+        let default: HashSet<&str> = SCENARIOS.iter().map(|s| s.name).collect();
+        for sc in RED_PATH_SCENARIOS {
+            assert!(
+                !default.contains(sc.name),
+                "red-path scenario '{}' collides with default catalogue name",
+                sc.name,
+            );
+        }
+    }
+
+    /// Observable set must be non-empty for every red-path scenario —
+    /// otherwise the oracle reports PASS trivially.
+    #[test]
+    fn test_red_path_catalogue_observe_nonempty() {
+        for sc in RED_PATH_SCENARIOS {
+            let any = sc.observe.iter().any(|(_, m)| *m != 0) || sc.observe_pins != 0;
+            assert!(
+                any,
+                "red-path scenario '{}' observes nothing (mask=0)",
+                sc.name,
+            );
+        }
+    }
+
+    /// `max_sysclks > 0` — same invariant as the default catalogue.
+    #[test]
+    fn test_red_path_catalogue_max_sysclks_positive() {
+        for sc in RED_PATH_SCENARIOS {
+            assert!(
+                sc.max_sysclks > 0,
+                "red-path scenario '{}' has max_sysclks=0",
+                sc.name,
+            );
+        }
+    }
+
+    /// Drive every red-path scenario through the same EMU-side
+    /// sequence that `run_scenario` uses — apply setup writes, advance
+    /// `max_sysclks` cycles with both cores halted, then read the
+    /// observables — and assert each one leaves EMU with **zero** in
+    /// every masked bit. Any non-zero silicon observation (the whole
+    /// point of a red-path witness) therefore diverges. This is the
+    /// local half of the HW != EMU contract: the HW side is gated on
+    /// real silicon and runs in Arthur's lab, but the EMU side must
+    /// hold here or the red-path catalogue is silently green.
+    ///
+    /// If a future phase wires a real peripheral model at one of these
+    /// addresses, this test starts passing with a non-zero value — the
+    /// signal to replace that scenario with a fresh unmodelled one.
+    #[test]
+    fn test_red_path_emu_observables_are_zero_under_mask() {
+        use mdrp2350::{Config, EmulatorBuilder};
+        for sc in RED_PATH_SCENARIOS {
+            let mut emu = EmulatorBuilder::new(Config::default())
+                .step_quantum(1)
+                .build();
+            emu.core_mut(0).halt();
+            emu.core_mut(1).halt();
+            for &(addr, val) in sc.setup {
+                emu.mmio_write32(addr, val);
+            }
+            emu.run(sc.max_sysclks as u64);
+            for &(addr, mask) in sc.observe {
+                let got = emu.mmio_read32(addr) & mask;
+                assert_eq!(
+                    got,
+                    0,
+                    "red-path scenario '{}': EMU read 0x{:08X} & 0x{:08X} = \
+                     0x{:08X}, expected 0 (any non-zero silicon reading \
+                     would diverge — if EMU now matches silicon, replace \
+                     this scenario with a fresh unmodelled-peripheral one)",
+                    sc.name,
+                    emu.mmio_read32(addr),
+                    mask,
+                    got,
+                );
+            }
         }
     }
 }

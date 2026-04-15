@@ -3,6 +3,7 @@ pub mod peripherals;
 pub mod ppb;
 
 use std::collections::HashMap;
+use std::io::Write;
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
@@ -229,6 +230,27 @@ pub struct Bus {
     /// executable memory (regions 0x1 / 0x2) and on bulk loads
     /// (`load_bootrom` / `load_flash`). See HLD §3.
     pub(crate) decode_cache: Box<[DecodedOp; DECODE_CACHE_SIZE]>,
+    /// MMIO trace toggle (see `wrk_docs/2026.04.15 - HLD - RP2350 Peripheral
+    /// Coverage V5.md` §4 / §4.2.7). When `true`, each byte/half/word bus
+    /// access emits one line to [`Self::trace_sink`] (defaults to stdout
+    /// when `None`). Zero overhead when `false` — the hot path
+    /// short-circuits before any formatting. Mirrors the mdrp2040 V7 idiom.
+    pub trace_enabled: bool,
+    /// Per-core, per-instruction PC snapshot. Indexed by `active_core`
+    /// so that a core switch does not alias one core's decode PC onto
+    /// the other. Set by the core's decode path
+    /// (`CortexM33::decode_execute`) immediately before instruction
+    /// fetch, so every read/write during that instruction carries the
+    /// correct architectural PC. Also set to sentinel values
+    /// (`0xFFFF_FFFE` / `0xFFFF_FFFD`) by `enter_exception` /
+    /// `exit_exception` so stacking / unstacking lines are
+    /// distinguishable from ordinary instruction-driven access.
+    /// Default `[0, 0]`; only meaningful while a core is executing.
+    pub(crate) active_pc: [u32; 2],
+    /// Optional override sink for trace output. `None` routes to stdout
+    /// via `println!`. Unit tests inject a `Vec<u8>`-backed sink to
+    /// capture lines without wrestling with fd 1 redirection.
+    pub(crate) trace_sink: Option<Box<dyn Write>>,
 }
 
 impl Bus {
@@ -278,6 +300,9 @@ impl Bus {
                 .into_boxed_slice()
                 .try_into()
                 .expect("length matches DECODE_CACHE_SIZE by construction"),
+            trace_enabled: false,
+            active_pc: [0; 2],
+            trace_sink: None,
         }
     }
 
@@ -489,6 +514,69 @@ impl Bus {
     /// Returns the currently executing core index (0 or 1).
     pub fn active_core(&self) -> usize {
         self.active_core
+    }
+
+    /// Stash the instruction PC of the currently-executing instruction
+    /// for the *currently-active core*. Called by
+    /// [`crate::core::CortexM33::decode_execute`] before instruction
+    /// fetch so the MMIO trace can report a meaningful PC for every
+    /// access that instruction performs. Also called by exception
+    /// entry / exit with sentinel values (`0xFFFF_FFFE`,
+    /// `0xFFFF_FFFD`) so stacking / unstacking lines are distinguishable
+    /// from ordinary instruction-driven access. See HLD V5 §4.2.7.
+    #[inline]
+    pub fn set_active_pc(&mut self, pc: u32) {
+        self.active_pc[self.active_core] = pc;
+    }
+
+    /// Emit a single trace line. `rw` is `'R'` or `'W'`, `size` is 1/2/4
+    /// bytes, `val` is the value read or written. Called from the six
+    /// outer bus access methods only when [`Self::trace_enabled`] is
+    /// `true`; the caller gates with `if self.trace_enabled` so the
+    /// formatting cost is paid only when tracing.
+    ///
+    /// Routes to [`Self::trace_sink`] if set, else `println!` (stdout).
+    /// No buffering — each line flushes at the `writeln!` boundary.
+    ///
+    /// Coverage note (mirrors mdrp2040 V7 §4.3). The trace is emitted
+    /// only from the six outer access methods ([`Self::read8`] …
+    /// [`Self::write32`]). The internal peripheral dispatch helpers
+    /// (`sysinfo_read`, `clocks_read/write`, `pll_sys_read/write`, PIO
+    /// block `read32`/`write32`, SIO dispatch, PPB dispatch) are **only
+    /// reachable** from those six methods — they have no other callers
+    /// in the crate and are `pub(crate)`. So outer-only tracing covers
+    /// 100% of the MMIO surface firmware can touch, at one line per
+    /// architectural access. Hooking the inner helpers as well would
+    /// double-emit on word-sized peripheral access and surface the
+    /// byte/half RMW-through-word32 artefact on narrow peripheral
+    /// access — neither of which helps the "what does firmware touch
+    /// next?" workflow.
+    ///
+    /// `#[cold]` + `#[inline(never)]` keeps the cold path out of the
+    /// caller's register allocation so the `if self.trace_enabled`
+    /// fast-path stays branch-predicted-not-taken and decoded-op-cache
+    /// hot paths are unaffected when tracing is off. This is the
+    /// "V2 reverted to runtime flag" decision in V4's review history.
+    #[cold]
+    #[inline(never)]
+    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32) {
+        let line = format!(
+            "TRACE {} {} 0x{:08X} val=0x{:08X} core={} pc=0x{:08X}",
+            rw, size, addr, val, self.active_core, self.active_pc[self.active_core]
+        );
+        if let Some(sink) = self.trace_sink.as_mut() {
+            let _ = writeln!(sink, "{}", line);
+        } else {
+            println!("{}", line);
+        }
+    }
+
+    /// Install a captured trace sink (used by unit tests). `None` routes
+    /// back to stdout. This is `pub(crate)` to keep it off the public
+    /// surface — the binary toggles `trace_enabled` only.
+    #[cfg(test)]
+    pub(crate) fn set_trace_sink(&mut self, sink: Option<Box<dyn Write>>) {
+        self.trace_sink = sink;
     }
 
     /// Assert an external IRQ at a specific core. `core` names the NVIC
@@ -773,7 +861,7 @@ impl Bus {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
             _   => addr & 0x0FFF_FFFF,
         };
-        match region {
+        let val = match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
             0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
                 self.memory.xip_read8((addr - 0x1C00_0000) + self.xip_cache_offset)
@@ -783,14 +871,17 @@ impl Bus {
                 if !self.flash_loaded {
                     self.bus_fault = true;
                     self.bus_fault_addr = addr;
+                    if self.trace_enabled {
+                        self.emit_trace('R', 1, addr, 0);
+                    }
                     return 0;
                 }
                 self.memory.xip_read8(offset)
             }
             0x2 if offset < SRAM_SIZE as u32 => {
-                let val = self.memory.sram_read8(offset);
+                let v = self.memory.sram_read8(offset);
                 self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
-                val
+                v
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -834,7 +925,11 @@ impl Bus {
                 self.bus_fault_addr = addr;
                 0
             }
+        };
+        if self.trace_enabled {
+            self.emit_trace('R', 1, addr, val as u32);
         }
+        val
     }
 
     pub fn write8(&mut self, addr: u32, val: u8) {
@@ -952,6 +1047,9 @@ impl Bus {
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write8(addr, val),
             _ => {} // ROM read-only, others unmapped/stub
         }
+        if self.trace_enabled {
+            self.emit_trace('W', 1, addr, val as u32);
+        }
     }
 
     // --- 16-bit access ---
@@ -966,7 +1064,7 @@ impl Bus {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
             _   => addr & 0x0FFF_FFFF,
         };
-        match region {
+        let val = match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
             0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
                 self.memory.xip_read16((addr - 0x1C00_0000) + self.xip_cache_offset)
@@ -976,14 +1074,17 @@ impl Bus {
                 if !self.flash_loaded {
                     self.bus_fault = true;
                     self.bus_fault_addr = addr;
+                    if self.trace_enabled {
+                        self.emit_trace('R', 2, addr, 0);
+                    }
                     return 0;
                 }
                 self.memory.xip_read16(offset)
             }
             0x2 if (offset + 1) < SRAM_SIZE as u32 => {
-                let val = self.memory.sram_read16(offset);
+                let v = self.memory.sram_read16(offset);
                 self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
-                val
+                v
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -1034,7 +1135,11 @@ impl Bus {
                 self.bus_fault_addr = addr;
                 0
             }
+        };
+        if self.trace_enabled {
+            self.emit_trace('R', 2, addr, val as u32);
         }
+        val
     }
 
     pub fn write16(&mut self, addr: u32, val: u16) {
@@ -1149,6 +1254,9 @@ impl Bus {
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write16(addr, val),
             _ => {}
         }
+        if self.trace_enabled {
+            self.emit_trace('W', 2, addr, val as u32);
+        }
     }
 
     // --- 32-bit access ---
@@ -1163,7 +1271,7 @@ impl Bus {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
             _   => addr & 0x0FFF_FFFF,
         };
-        match region {
+        let val = match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
             0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
                 // XIP SRAM (0x1C00_0000): when flash is loaded, the bootrom
@@ -1177,14 +1285,17 @@ impl Bus {
                 if !self.flash_loaded {
                     self.bus_fault = true;
                     self.bus_fault_addr = addr;
+                    if self.trace_enabled {
+                        self.emit_trace('R', 4, addr, 0);
+                    }
                     return 0;
                 }
                 self.memory.xip_read32(offset)
             }
             0x2 if (offset + 3) < SRAM_SIZE as u32 => {
-                let val = self.memory.sram_read32(offset);
+                let v = self.memory.sram_read32(offset);
                 self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
-                val
+                v
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -1223,7 +1334,11 @@ impl Bus {
                 self.bus_fault_addr = addr;
                 0
             }
+        };
+        if self.trace_enabled {
+            self.emit_trace('R', 4, addr, val);
         }
+        val
     }
 
     pub fn write32(&mut self, addr: u32, val: u32) {
@@ -1335,6 +1450,9 @@ impl Bus {
                 self.bus_fault = true;
                 self.bus_fault_addr = addr;
             }
+        }
+        if self.trace_enabled {
+            self.emit_trace('W', 4, addr, val);
         }
     }
 }

@@ -6685,6 +6685,53 @@ fn test_clocks_source_tracking() {
     assert_eq!(bus.read32(0x4001_0038), 0x4);
 }
 
+/// HLD V5 §4.2.10: every `clk_*_SELECTED` register on RP2350 must
+/// report a non-zero value so pico-sdk's `clock_configure` busy-wait
+/// completes. For glitchless clocks (clk_ref, clk_sys) the value is
+/// `1 << (CTRL & SRC_MASK)`; for non-glitchless clocks (clk_gpout*,
+/// clk_peri, clk_hstx, clk_usb, clk_adc) the value is `1`.
+///
+/// This guards against the "return 0 everywhere else" gap that the
+/// mdrp2040 commit `b1a40e4` fixed on its sibling. Every RP2350
+/// `_SELECTED` offset is exercised here — any future refactor that
+/// drops one of these handshake returns fails this test.
+#[test]
+fn test_clocks_all_selected_registers_nonzero() {
+    let (_, mut bus) = core_and_bus();
+
+    // Non-glitchless clocks — `_SELECTED` reads 1 unconditionally.
+    // clk_gpout0..3 at 0x008, 0x014, 0x020, 0x02C.
+    assert_eq!(bus.read32(0x4001_0008), 1, "CLK_GPOUT0_SELECTED");
+    assert_eq!(bus.read32(0x4001_0014), 1, "CLK_GPOUT1_SELECTED");
+    assert_eq!(bus.read32(0x4001_0020), 1, "CLK_GPOUT2_SELECTED");
+    assert_eq!(bus.read32(0x4001_002C), 1, "CLK_GPOUT3_SELECTED");
+    // clk_peri at 0x050, clk_hstx at 0x05C, clk_usb at 0x068, clk_adc
+    // at 0x074. RP2350 has no CLK_RTC (unlike RP2040).
+    assert_eq!(bus.read32(0x4001_0050), 1, "CLK_PERI_SELECTED");
+    assert_eq!(bus.read32(0x4001_005C), 1, "CLK_HSTX_SELECTED");
+    assert_eq!(bus.read32(0x4001_0068), 1, "CLK_USB_SELECTED");
+    assert_eq!(bus.read32(0x4001_0074), 1, "CLK_ADC_SELECTED");
+
+    // Glitchless clocks — default CTRL = 0, so `_SELECTED = 1 << 0 = 1`.
+    assert_eq!(bus.read32(0x4001_0038), 1, "CLK_REF_SELECTED default");
+    assert_eq!(bus.read32(0x4001_0044), 1, "CLK_SYS_SELECTED default");
+
+    // Glitchless clocks — CTRL update reflected immediately (one-cycle
+    // handshake, HLD V5 §5.7).
+    bus.write32(0x4001_003C, 0x0000_0001);
+    assert_eq!(
+        bus.read32(0x4001_0044),
+        1 << 1,
+        "CLK_SYS_SELECTED after CTRL = 1",
+    );
+    bus.write32(0x4001_0030, 0x0000_0003);
+    assert_eq!(
+        bus.read32(0x4001_0038),
+        1 << 3,
+        "CLK_REF_SELECTED after CTRL = 3 (2-bit SRC field)",
+    );
+}
+
 // ============================================================================
 // Phase 4: Flash boot integration — bootrom loads blinky to main()
 // ============================================================================
@@ -8135,4 +8182,361 @@ fn gpio_external_mask_zero_is_noop() {
     emu.run(1);
 
     assert_eq!(emu.bus.gpio_in, 0x0000_005A, "legacy update_gpio path broken");
+}
+
+// ============================================================================
+// MMIO trace hook — Phase 0b (HLD V5 §4.2.7)
+// ============================================================================
+//
+// The trace is a runtime flag (`Bus::trace_enabled`) gating a cold
+// `emit_trace` helper. Zero overhead when off; one line per outer
+// bus access when on. See `mdrp2040/src/bus/mod.rs` for the V7 idiom
+// these tests mirror.
+
+/// A thread-safe `Vec<u8>` sink so we can capture the trace output
+/// without wrestling with stdout redirection. Wraps `Vec<u8>` behind
+/// an `Arc<Mutex<...>>` so the test can drain the buffer after the
+/// bus has written through the sink. (`Bus::trace_sink` holds a
+/// `Box<dyn Write>`; tests hand it a `CaptureSink` clone.)
+#[derive(Clone)]
+struct TraceCaptureSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for TraceCaptureSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn new_capture() -> TraceCaptureSink {
+    TraceCaptureSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+}
+
+#[test]
+fn trace_enabled_emits_write32_line() {
+    // HLD V5 §4.2.7: `write32(addr, val)` with `trace_enabled = true`
+    // emits one line in the prescribed format. We inject a captured
+    // `TraceCaptureSink` so the test doesn't depend on fd 1 redirection.
+    let capture = new_capture();
+    let mut bus = Bus::new();
+    bus.set_active_core(0);
+    bus.set_active_pc(0x1000_0100);
+    bus.trace_enabled = true;
+    bus.set_trace_sink(Some(Box::new(capture.clone())));
+
+    // SRAM word write — exercises the hot path and one of the six
+    // access methods required by the spec.
+    bus.write32(0x2000_0200, 0xDEAD_BEEF);
+
+    let captured = capture.0.lock().unwrap();
+    let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected one trace line, got {}: {:?}",
+        lines.len(),
+        lines,
+    );
+    let line = lines[0];
+    assert!(line.starts_with("TRACE W 4 0x20000200"), "line = {:?}", line);
+    assert!(line.contains("val=0xDEADBEEF"), "line = {:?}", line);
+    assert!(line.contains("core=0"), "line = {:?}", line);
+    assert!(line.contains("pc=0x10000100"), "line = {:?}", line);
+}
+
+#[test]
+fn trace_enabled_emits_all_six_access_methods() {
+    // Each of the six outer bus methods must emit exactly one line
+    // with the correct size/RW tag. SRAM-backed region 0x2000_0000
+    // is the cleanest target — no peripheral side-effects.
+    let capture = new_capture();
+    let mut bus = Bus::new();
+    bus.set_active_core(0);
+    bus.set_active_pc(0x1000_0100);
+    bus.trace_enabled = true;
+    bus.set_trace_sink(Some(Box::new(capture.clone())));
+
+    bus.write8(0x2000_0100, 0xAB);
+    bus.write16(0x2000_0102, 0xCDEF);
+    bus.write32(0x2000_0104, 0x1234_5678);
+    let _ = bus.read8(0x2000_0100);
+    let _ = bus.read16(0x2000_0102);
+    let _ = bus.read32(0x2000_0104);
+
+    let captured = capture.0.lock().unwrap();
+    let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 6, "expected 6 trace lines, got {:?}", lines);
+    assert!(lines[0].starts_with("TRACE W 1 0x20000100"), "{:?}", lines[0]);
+    assert!(lines[1].starts_with("TRACE W 2 0x20000102"), "{:?}", lines[1]);
+    assert!(lines[2].starts_with("TRACE W 4 0x20000104"), "{:?}", lines[2]);
+    assert!(lines[3].starts_with("TRACE R 1 0x20000100"), "{:?}", lines[3]);
+    assert!(lines[4].starts_with("TRACE R 2 0x20000102"), "{:?}", lines[4]);
+    assert!(lines[5].starts_with("TRACE R 4 0x20000104"), "{:?}", lines[5]);
+    for line in &lines {
+        assert!(line.contains("core=0") && line.contains("pc=0x10000100"), "{}", line);
+    }
+}
+
+#[test]
+fn trace_disabled_emits_nothing() {
+    // Zero-overhead path — `trace_enabled = false` must not route any
+    // bytes to the sink. Guards the hot path (non-trace runs must not
+    // pay a formatting cost, and must not write bytes to the sink).
+    let capture = new_capture();
+    let mut bus = Bus::new();
+    bus.set_trace_sink(Some(Box::new(capture.clone())));
+    // trace_enabled is false by default.
+    bus.write32(0x2000_0200, 0xCAFE_F00D);
+    let _ = bus.read32(0x2000_0200);
+    bus.write16(0x2000_0200, 0xABCD);
+    let _ = bus.read16(0x2000_0200);
+    bus.write8(0x2000_0200, 0xEF);
+    let _ = bus.read8(0x2000_0200);
+    assert!(
+        capture.0.lock().unwrap().is_empty(),
+        "trace sink received bytes with trace_enabled=false",
+    );
+}
+
+#[test]
+fn trace_active_pc_is_per_core() {
+    // Regression guard against a dual-core active_pc-staleness bug
+    // (V7 §4.3). The scheduler alternates `set_active_core(0)` /
+    // `set_active_core(1)` each quantum; a bus access on core 1 that
+    // doesn't go through `decode_execute` (e.g. exception stacking)
+    // must NOT observe core 0's last decode PC, and vice versa.
+    // Simulate the pattern: decode PC=0x1000 on core 0, switch to core
+    // 1, decode PC=0x2000, switch back to core 0 and issue an access
+    // *without* re-decoding — the trace line must still carry PC=0x1000
+    // for core 0.
+    let capture = new_capture();
+    let mut bus = Bus::new();
+    bus.trace_enabled = true;
+    bus.set_trace_sink(Some(Box::new(capture.clone())));
+
+    // Core 0 "decodes" at 0x1000 and writes.
+    bus.set_active_core(0);
+    bus.set_active_pc(0x0000_1000);
+    bus.write32(0x2000_0100, 0xAAAA_AAAA);
+
+    // Scheduler switches to core 1, which "decodes" at 0x2000 and writes.
+    bus.set_active_core(1);
+    bus.set_active_pc(0x0000_2000);
+    bus.write32(0x2000_0104, 0xBBBB_BBBB);
+
+    // Scheduler switches back to core 0 WITHOUT a re-decode (mimics
+    // hardware-triggered access like exception stacking before the
+    // handler's first `decode_execute`). The stored per-core PC must
+    // still be 0x1000 for core 0 — not 0x2000 from core 1's quantum.
+    bus.set_active_core(0);
+    bus.write32(0x2000_0108, 0xCCCC_CCCC);
+
+    let captured = capture.0.lock().unwrap();
+    let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "expected three trace lines, got {:?}", lines);
+    assert!(
+        lines[0].contains("core=0") && lines[0].contains("pc=0x00001000"),
+        "line 0 = {:?}",
+        lines[0],
+    );
+    assert!(
+        lines[1].contains("core=1") && lines[1].contains("pc=0x00002000"),
+        "line 1 = {:?}",
+        lines[1],
+    );
+    assert!(
+        lines[2].contains("core=0") && lines[2].contains("pc=0x00001000"),
+        "line 2 = {:?} (core 0 PC must survive the core-1 excursion)",
+        lines[2],
+    );
+}
+
+#[test]
+fn trace_emulator_step_publishes_pc_via_decode() {
+    // End-to-end: running one instruction through the emulator must
+    // publish its PC via `bus.set_active_pc` from `decode_execute`,
+    // so the trace line for any bus access during that instruction
+    // reports the true architectural PC — not the stale default `0`.
+    //
+    // Build a minimal test: put a `nop ; nop` at SRAM origin, point
+    // core 0's PC and VTOR there, enable trace, step once. The I-fetch
+    // at that PC is the observed access (a `read16` from the SRAM
+    // region holding the instruction).
+    use crate::{Config, Emulator};
+    let capture = new_capture();
+
+    let mut emu = Emulator::new(Config::default());
+    // Two `nop` halfwords at SRAM base 0x2000_0000.
+    emu.bus.memory.sram_write16(0, 0xBF00); // nop
+    emu.bus.memory.sram_write16(2, 0xBF00);
+    emu.bus.invalidate_all(); // evict any stale cache entries for this PC.
+
+    // Core 0 runs the nop at 0x2000_0000. Set Thumb bit, point PC at
+    // our nop, halt core 1 so only core 0 traces.
+    emu.cores[0].regs.set_pc(0x2000_0000);
+    emu.cores[0].regs.xpsr = 1 << 24;
+    emu.cores[0].wake();
+    emu.cores[1].halt();
+
+    emu.bus.trace_enabled = true;
+    emu.bus.set_trace_sink(Some(Box::new(capture.clone())));
+    emu.step();
+    emu.bus.trace_enabled = false;
+
+    let captured = capture.0.lock().unwrap();
+    let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "step should emit at least the I-fetch line",
+    );
+    // Look for at least one line with pc=0x20000000 and core=0.
+    let has_expected_pc = lines
+        .iter()
+        .any(|l| l.contains("core=0") && l.contains("pc=0x20000000"));
+    assert!(
+        has_expected_pc,
+        "no trace line carried the expected PC 0x20000000; lines={:?}",
+        lines,
+    );
+}
+
+// Regression guards for the exception-entry / exit sentinel PCs
+// (`0xFFFF_FFFE` for stacking, `0xFFFF_FFFD` for unstacking). HLD V5
+// §4.2.7 requires those trace lines to be distinguishable from ordinary
+// instruction-driven access — the sentinel call-sites live in
+// `crates/mdrp2350/src/core/exceptions.rs:72` (entry) and `:219` (exit).
+// The invariant under test is "the sentinel reaches the trace pipeline",
+// not "the full exception flow is bit-exact"; the lazy-FP integration
+// suite (`tests/lazy_fp.rs`) already covers the semantics.
+
+#[test]
+fn trace_exception_entry_publishes_sentinel_fe() {
+    // `enter_exception` must publish PC=0xFFFFFFFE before pushing the
+    // exception frame, so every stacking-write trace line carries the
+    // sentinel rather than the faulting instruction's PC.
+    use crate::bus::Bus;
+    use crate::core::CortexM33;
+
+    let capture = new_capture();
+    let mut cpu = CortexM33::new();
+    // Place MSP above a usable stack region so the 32-byte basic frame
+    // lands in SRAM. SRAM base is 0x20000000; a 0x2000_2000 MSP leaves
+    // 8 KB of stack below — more than enough for an SVC frame.
+    cpu.regs.msp = 0x2000_2000;
+    cpu.regs.r[13] = cpu.regs.msp;
+
+    let mut bus = Bus::new();
+    // Vector table in SRAM so the entry's vector fetch succeeds; point
+    // SVC (vector 11) at an arbitrary address — the handler never runs
+    // here because we return to the caller after `test_enter_exception`.
+    let vtor: u32 = 0x2000_4000;
+    let core = bus.active_core();
+    bus.ppb[core].vtor = vtor;
+    bus.write32(vtor + 11 * 4, 0x2000_0200 | 1); // SVC → 0x2000_0200 (Thumb)
+
+    // Enable trace AFTER the pre-flight setup so we only capture the
+    // stacking writes + vector fetch. `set_active_pc` seeds with a
+    // plausible in-thread PC so a regression (missing sentinel) would
+    // show THAT value in the stacking-line output — easier to spot.
+    bus.set_active_pc(0x0000_1000);
+    bus.trace_enabled = true;
+    bus.set_trace_sink(Some(Box::new(capture.clone())));
+
+    cpu.test_enter_exception(11, &mut bus);
+
+    // Disable trace before we walk the capture so any cleanup work
+    // outside the test doesn't pollute the vector.
+    bus.trace_enabled = false;
+    let captured = capture.0.lock().unwrap();
+    let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "exception entry must emit at least one stacking-write trace line",
+    );
+    let sentinel_lines: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains("pc=0xFFFFFFFE"))
+        .collect();
+    assert!(
+        !sentinel_lines.is_empty(),
+        "no stacking trace line carried the 0xFFFFFFFE sentinel; lines={:?}",
+        lines,
+    );
+    // Every line that appears after the sentinel was published should
+    // carry the sentinel too — the 1000-seeded PC from before the
+    // `enter_exception` call must NOT leak into any traced access.
+    for l in &lines {
+        assert!(
+            !l.contains("pc=0x00001000"),
+            "pre-entry PC 0x00001000 leaked into a stacking trace line: {:?}",
+            l,
+        );
+    }
+}
+
+#[test]
+fn trace_exception_exit_publishes_sentinel_fd() {
+    // `exit_exception` must publish PC=0xFFFFFFFD before popping the
+    // frame, so every unstacking-read trace line carries the unstacking
+    // sentinel rather than a stale in-handler PC.
+    use crate::bus::Bus;
+    use crate::core::CortexM33;
+
+    let capture = new_capture();
+    let mut cpu = CortexM33::new();
+    cpu.regs.msp = 0x2000_2000;
+    cpu.regs.r[13] = cpu.regs.msp;
+
+    let mut bus = Bus::new();
+    let vtor: u32 = 0x2000_4000;
+    let core = bus.active_core();
+    bus.ppb[core].vtor = vtor;
+    bus.write32(vtor + 11 * 4, 0x2000_0200 | 1);
+
+    // Drive an SVC entry first (sets up the stacked frame that exit
+    // will pop). Trace is off here — we only want the exit lines.
+    cpu.test_enter_exception(11, &mut bus);
+
+    bus.set_active_pc(0x0000_2000); // an in-handler PC that must NOT leak.
+    bus.trace_enabled = true;
+    bus.set_trace_sink(Some(Box::new(capture.clone())));
+
+    // EXC_RETURN 0xFFFF_FFF9: return to Thread mode, MSP, no FP frame —
+    // matches the basic frame pushed above.
+    cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
+
+    bus.trace_enabled = false;
+    let captured = capture.0.lock().unwrap();
+    let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "exception exit must emit at least one unstacking-read trace line",
+    );
+    let sentinel_lines: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains("pc=0xFFFFFFFD"))
+        .collect();
+    assert!(
+        !sentinel_lines.is_empty(),
+        "no unstacking trace line carried the 0xFFFFFFFD sentinel; lines={:?}",
+        lines,
+    );
+    for l in &lines {
+        assert!(
+            !l.contains("pc=0x00002000"),
+            "pre-exit PC 0x00002000 leaked into an unstacking trace line: {:?}",
+            l,
+        );
+    }
 }

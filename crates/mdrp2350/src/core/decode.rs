@@ -244,6 +244,13 @@ impl CortexM33 {
     pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
+        // Publish the instruction PC on the bus so the MMIO trace
+        // (HLD V5 §4.2.7) can report it for every access this
+        // instruction performs. Set before the fetch so the I-fetch
+        // itself is tagged with its own PC. Zero-cost when tracing is
+        // off — the store lands in a cold struct field touched only
+        // by `emit_trace`.
+        bus.set_active_pc(pc);
 
         // Cache lookup — by-value (`DecodedOp: Copy`), so no borrow on
         // `bus` survives into dispatch.

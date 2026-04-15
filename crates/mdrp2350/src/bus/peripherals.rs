@@ -78,20 +78,63 @@ impl Bus {
 
     // --- CLOCKS (0x40010000) ---
     //
-    // RP2350 layout (different from RP2040). RP2350 adds GPOUT4-7 blocks
-    // before CLK_REF, shifting CLK_SYS earlier:
-    //   0x30 CLK_REF_CTRL
-    //   0x38 CLK_REF_SELECTED
-    //   0x3C CLK_SYS_CTRL
-    //   0x40 CLK_SYS_DIV
-    //   0x44 CLK_SYS_SELECTED
+    // RP2350 layout (datasheet §8.1). Differs from RP2040: drops RTC,
+    // adds HSTX. Full offset map:
+    //   0x00-0x2C GPOUT0-3 (CTRL / DIV / SELECTED each)
+    //   0x30 CLK_REF_CTRL   / 0x34 CLK_REF_DIV   / 0x38 CLK_REF_SELECTED
+    //   0x3C CLK_SYS_CTRL   / 0x40 CLK_SYS_DIV   / 0x44 CLK_SYS_SELECTED
+    //   0x48 CLK_PERI_CTRL  / 0x4C CLK_PERI_DIV  / 0x50 CLK_PERI_SELECTED
+    //   0x54 CLK_HSTX_CTRL  / 0x58 CLK_HSTX_DIV  / 0x5C CLK_HSTX_SELECTED
+    //   0x60 CLK_USB_CTRL   / 0x64 CLK_USB_DIV   / 0x68 CLK_USB_SELECTED
+    //   0x6C CLK_ADC_CTRL   / 0x70 CLK_ADC_DIV   / 0x74 CLK_ADC_SELECTED
+    //
+    // `_SELECTED` handshake (HLD V5 §4.2.10 / §5.7, pico-sdk
+    // `clock_configure` busy-wait):
+    //   * Glitchless (clk_ref, clk_sys): `_SELECTED = 1 << (CTRL & SRC_MASK)`.
+    //   * Non-glitchless (clk_gpout*, clk_peri, clk_hstx, clk_usb,
+    //     clk_adc): `_SELECTED` reads `1` unconditionally. Silicon
+    //     always reports the AUXSRC path as "selected" from firmware's
+    //     perspective; satisfies pico-sdk's
+    //     `while (!(selected & (1u << 0)))` after each CTRL write.
+    //
+    // Ported from mdrp2040 commit `b1a40e4` (RP2040 Phase 0 Wave 1).
+    // The mdrp2350 implementation prior to this audit returned 0 for
+    // every non-REF/non-SYS `_SELECTED` offset — pico-sdk firmware
+    // reprogramming clk_peri / clk_hstx / clk_usb / clk_adc would spin
+    // forever.
     pub(crate) fn clocks_read(&self, offset: u32) -> u32 {
         match offset {
+            // clk_gpout0..3 — non-glitchless, `_SELECTED` reads 1.
+            // CTRL/DIV are plain-storage from `peripheral_regs` (see
+            // the HashMap fallthrough in write32 for APB peripherals
+            // that don't have a dedicated backing store yet).
+            0x000 | 0x004 => 0, // CLK_GPOUT0_CTRL / DIV — storage not modelled
+            0x008 => 1,         // CLK_GPOUT0_SELECTED
+            0x00C | 0x010 => 0, // CLK_GPOUT1_CTRL / DIV
+            0x014 => 1,         // CLK_GPOUT1_SELECTED
+            0x018 | 0x01C => 0, // CLK_GPOUT2_CTRL / DIV
+            0x020 => 1,         // CLK_GPOUT2_SELECTED
+            0x024 | 0x028 => 0, // CLK_GPOUT3_CTRL / DIV
+            0x02C => 1,         // CLK_GPOUT3_SELECTED
+            // clk_ref — glitchless, 2-bit SRC in CTRL[1:0].
             0x030 => self.clk_ref_ctrl,
             0x038 => 1 << (self.clk_ref_ctrl & 0x3), // CLK_REF_SELECTED
+            // clk_sys — glitchless, 1-bit SRC in CTRL[0].
             0x03C => self.clk_sys_ctrl,
             0x040 => self.clk_sys_div,
             0x044 => 1 << (self.clk_sys_ctrl & 0x1), // CLK_SYS_SELECTED
+            // clk_peri — non-glitchless.
+            0x048 | 0x04C => 0, // CTRL / DIV — storage not modelled
+            0x050 => 1,         // CLK_PERI_SELECTED
+            // clk_hstx — non-glitchless (RP2350-only block).
+            0x054 | 0x058 => 0, // CTRL / DIV
+            0x05C => 1,         // CLK_HSTX_SELECTED
+            // clk_usb — non-glitchless.
+            0x060 | 0x064 => 0,
+            0x068 => 1,         // CLK_USB_SELECTED
+            // clk_adc — non-glitchless.
+            0x06C | 0x070 => 0,
+            0x074 => 1,         // CLK_ADC_SELECTED
             _ => 0,
         }
     }
@@ -103,6 +146,14 @@ impl Bus {
     /// already used by `resets_write`. After the underlying register
     /// is updated, `recompute_clock_tree` refreshes the derived
     /// `sys_clk_hz` / `ref_clk_hz` values.
+    ///
+    /// Only CLK_REF_CTRL / CLK_SYS_CTRL / CLK_SYS_DIV write to real
+    /// backing storage today; the other clocks' writes are dropped
+    /// (the `_SELECTED` handshake reads `1` regardless of CTRL). This
+    /// matches silicon behaviour for firmware that only cares about
+    /// completing `clock_configure`'s busy-wait. Per-channel CTRL
+    /// storage lands in Phase 2 when clk_peri / clk_usb frequencies
+    /// feed real peripheral models.
     pub(crate) fn clocks_write(&mut self, offset: u32, val: u32, alias: u32) {
         let apply = |current: u32| match alias {
             0 => val,
