@@ -279,16 +279,6 @@ impl CortexM33 {
         self.current_instr_addr.wrapping_add(4)
     }
 
-    /// Raise a synchronous `UsageFault` and return a zero cycle count.
-    /// Used by Thumb-32 FPU / coprocessor stubs that reject unsupported
-    /// encodings — `CortexM33::step` picks the fault up after
-    /// `decode_execute` returns and delivers it via `enter_exception`.
-    #[inline]
-    pub(crate) fn raise_usage_fault(&mut self) -> u32 {
-        self.pending_fault = Some(Fault::UsageFault);
-        0
-    }
-
     /// Advance IT block state after executing one instruction inside an IT block.
     /// Shifts the mask left; clears it_state entirely when the last instruction completes.
     fn advance_it_state(&mut self) {

@@ -624,7 +624,8 @@ impl CortexM33 {
             };
             1
         } else {
-            self.raise_usage_fault()
+            self.pending_fault = Some(super::Fault::UsageFault);
+            0
         }
     }
 
@@ -786,7 +787,10 @@ impl CortexM33 {
                 // VCMP, VCMPE, VCVT, VRINTR, VRINTZ, VRINTX)
                 self.fpu_unary(hw0, hw1, sd, sm)
             }
-            _ => self.raise_usage_fault(),
+            _ => {
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
+            }
         }
     }
 
@@ -913,19 +917,23 @@ impl CortexM33 {
             }
             (0b1010, 0) => {
                 // VCVT.F32.FX.U16 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1010, 1) => {
                 // VCVT.F32.FX.S16 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1011, 0) => {
                 // VCVT.F32.FX.U32 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1011, 1) => {
                 // VCVT.F32.FX.S32 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1100, 0) => {
                 // VCVTR.U32.F32 Sd, Sm — float → unsigned int (round per FPSCR)
@@ -955,21 +963,28 @@ impl CortexM33 {
             }
             (0b1110, 0) => {
                 // VCVT.FX.U16.F32 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1110, 1) => {
                 // VCVT.FX.S16.F32 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1111, 0) => {
                 // VCVT.FX.U32.F32 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
             (0b1111, 1) => {
                 // VCVT.FX.S32.F32 — fixed-point, stub
-                self.raise_usage_fault()
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
             }
-            _ => self.raise_usage_fault(),
+            _ => {
+                self.pending_fault = Some(super::Fault::UsageFault);
+                0
+            }
         }
     }
 
