@@ -183,10 +183,17 @@ pub struct ServingOracle {
 impl ServingOracle {
     /// Capture the SRAM shadow. Called once after the harness confirms
     /// OneROM has reached steady state (`onerom_sync::is_synced` true).
+    ///
+    /// Uses `bus.memory.sram_read8` rather than `bus.read8` to bypass the
+    /// bus fabric: an 8192-iteration SRAM read loop through `read8` would
+    /// accumulate `sram_bank_wait` contention into `bus.extra_wait_states`,
+    /// perturbing the cycle accounting for the next CPU instruction (which
+    /// Stage G.3 will trust for latency measurement). SHADOW_BASE is the
+    /// SRAM origin (0x2000_0000), so SRAM offset `i` maps directly.
     pub fn new_at_sync(bus: &mut Bus) -> Self {
         let mut shadow = Box::new([0u8; SHADOW_SIZE]);
         for i in 0..SHADOW_SIZE {
-            shadow[i] = bus.read8(SHADOW_BASE + i as u32);
+            shadow[i] = bus.memory.sram_read8(i as u32);
         }
         Self {
             rom_shadow: shadow,
@@ -244,6 +251,12 @@ impl ServingOracle {
         // Snapshot the push counter *before* any ticks at this stimulus.
         // HLD §4.4: the push counter is how we distinguish a fresh byte
         // arriving from residual data left by a prior case.
+        //
+        // `pushes_before` snapshot must happen before any run_case tick
+        // advances the glue DMA. `glue.tick` is only invoked by this
+        // module (here and in `tick_cycles`), so after the
+        // `gpio_external_in` assignment above and before the per-cycle
+        // loop below, `ch1_pushes()` is stable.
         let pushes_before = glue.ch1_pushes();
 
         // 3. wait_push → wait_stable: tick up to PER_CASE_TIMEOUT cycles,
@@ -253,7 +266,10 @@ impl ServingOracle {
             emu.run(1);
             glue.tick(&mut emu.bus);
 
-            let pushes = glue.ch1_pushes().saturating_sub(pushes_before);
+            // Plain subtraction — `glue.ch1_pushes()` is monotonic on a
+            // single GlueDma, so an underflow here is a true invariant
+            // violation we want to surface, not silently mask.
+            let pushes = glue.ch1_pushes() - pushes_before;
             let resolved = emu
                 .bus
                 .read32(DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR);
@@ -366,10 +382,8 @@ impl ServingOracle {
 /// per the pin-map collision); A0..A12 reflect `addr_bits`.
 fn stimulus_level(addr_bits: u16) -> u32 {
     let mut level: u32 = 0;
-    // CS2/CS3 high (these overlap A12/A11, and A11=A12=1 is the invariant).
-    level |= 1u32 << GPIO_CS2;
-    level |= 1u32 << GPIO_CS3;
-    // Address bits A0..A12.
+    // CS2 (GPIO12)/CS3 (GPIO15) double as A12/A11 — driven high by the
+    // A11=A12=1 case invariant (asserted in `Case::new`).
     for (i, &pin) in ADDR_PINS.iter().enumerate() {
         if (addr_bits >> i) & 1 != 0 {
             level |= 1u32 << pin;
@@ -405,6 +419,10 @@ enum EvalState {
 /// has been observed for `MIN_STABLE_CYCLES` cycles after the push. If
 /// the state machine determines the case is definitively unresolvable
 /// (e.g. `ResolvedAddrOutOfRange`), that also counts as conclusive.
+// TODO(G.2): re-runs `evaluate_case_trace` from scratch every tick (O(N²)
+// per case, N ≤ 60). Acceptable at the G.1 N=60 × single-case scale. If
+// the 15-case sweep shows measurable cost, refactor to a streaming
+// evaluator that carries state across ticks.
 fn try_evaluate_conclusive(
     case: Case,
     shadow: &[u8; SHADOW_SIZE],
@@ -492,7 +510,10 @@ pub(crate) fn evaluate_case_trace(
                                 // construction of `run_case`).
                                 let stable_start_idx = i + 1 - *len;
                                 let stable_cycle = trace[stable_start_idx].cycle;
-                                let cs_low_cycle = trace.first().map(|o| o.cycle).unwrap_or(0);
+                                // `trace[0]` is safe here: we only reach this
+                                // arm after consuming at least MIN_STABLE_CYCLES
+                                // observations, so the trace is non-empty.
+                                let cs_low_cycle = trace[0].cycle;
                                 let latency = (stable_cycle - cs_low_cycle) as u32;
                                 let observed = *byte;
 
@@ -656,6 +677,16 @@ mod tests {
     /// latency measurement to anchor after cycle 5. The earliest
     /// stable cycle is 6 (pad_oe=0xFF + cycle > 5), so 3-cycle run
     /// completes at cycle 8 → stable_cycle=6 → latency=6.
+    ///
+    // Validates: residue rejection — the push-anchored latency anchors
+    // after the push cycle, not at cycle 0 of a residual byte.
+    // Does NOT directly validate: the `>` vs `>=` distinction on line 497.
+    // The `continue;` after the WaitPush→WaitStable transition already
+    // prevents the push cycle from entering the WaitStable arm, so either
+    // mutation of that comparator survives this test. The `>` guard is
+    // belt-and-braces alongside the `continue;`. If either the `continue;`
+    // OR the `>` guard is removed the other still protects; remove with
+    // caution.
     #[test]
     fn verdict_rejects_prior_case_residue() {
         let case = mk_case();

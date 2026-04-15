@@ -14,7 +14,6 @@
 //! Usage:
 //!   cargo run -p mdpicoem-harness --bin onerom_serving_oracle_rp2350 --release
 
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mdpicoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_sync};
@@ -28,32 +27,22 @@ const FLASH_PATH: &str =
 /// arrives around cycle 7k; 10M is generous.
 const BOOT_CYCLE_CAP: u64 = 10_000_000;
 
-/// Data bus + CS lanes + address pins. Mirrored from Stage F.
-const GPIO_CS1: u8 = 13;
-const GPIO_CS2: u8 = 12;
-const GPIO_CS3: u8 = 15;
-const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
-
-fn repo_root_relative(rel: &str) -> PathBuf {
-    Path::new(rel).to_path_buf()
-}
-
 fn main() -> ExitCode {
-    let bootrom_path = repo_root_relative(BOOTROM_PATH);
-    let flash_path = repo_root_relative(FLASH_PATH);
+    let bootrom_path = BOOTROM_PATH;
+    let flash_path = FLASH_PATH;
 
-    let bootrom = match std::fs::read(&bootrom_path) {
+    let bootrom = match std::fs::read(bootrom_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("failed to read bootrom at {}: {}", bootrom_path.display(), e);
+            eprintln!("failed to read bootrom at {}: {}", bootrom_path, e);
             return ExitCode::from(2);
         }
     };
 
-    let flash = match std::fs::read(&flash_path) {
+    let flash = match std::fs::read(flash_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("failed to read flash image at {}: {}", flash_path.display(), e);
+            eprintln!("failed to read flash image at {}: {}", flash_path, e);
             return ExitCode::from(2);
         }
     };
@@ -134,18 +123,18 @@ fn main() -> ExitCode {
     glue.prime_after_sync(&mut emu.bus);
     let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus);
 
-    // Establish the external-input overlay exactly like Stage F's
-    // post-sync hook: CS1 high (for the init seed inside `run_case`),
-    // CS2/CS3 high, address pins = 0. The mask covers CS1/CS2/CS3 and
-    // all address pins; D0..D7 stay PIO-driven.
-    let ext_mask: u32 = (1u32 << GPIO_CS1)
-        | (1u32 << GPIO_CS2)
-        | (1u32 << GPIO_CS3)
-        | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
-    let seed_level: u32 = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-    emu.bus.gpio_external_mask = ext_mask;
-    emu.bus.gpio_external_in = seed_level;
+    // No pre-case external-input setup needed: `run_case` authoritatively
+    // sets `gpio_external_mask` and drives `gpio_external_in` (init seed
+    // on first call, stimulus level thereafter). Mirroring it here would
+    // be dead writes overwritten on the first iteration below.
 
+    // G.1 caveat: DEFAULT_CASES currently contains only the baseline
+    // `0x1800` case. At this stimulus, CH1.READ_ADDR has not yet been
+    // overwritten by CH0 (which forwards PIO1-decoded addresses) — so
+    // the byte observed reflects CH1's pre-loaded READ_ADDR=0x20000000,
+    // NOT a genuine pin→PIO1→CH0→CH1 round trip. The real address
+    // pipeline is exercised by G.2's sweep. See HLD §9 and the
+    // Stage G journal for details.
     // Run each case.
     for case in onerom_serving_oracle::DEFAULT_CASES {
         let result = oracle.run_case(&mut emu, &mut glue, *case);
