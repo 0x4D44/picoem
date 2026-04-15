@@ -39,6 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mdpicoem_harness::bank_conflict_cases::{self, BankArgs};
 use mdpicoem_harness::cycle_cases::{self, CycleArgs};
+use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs};
 use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter};
 use mdpicoem_harness::silicon_scenarios::{self, PeriphArgs};
 use probe_rs::{Session, SessionConfig};
@@ -57,6 +58,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3600);
 const ORACLE_CYCLE: &str = "cycle";
 const ORACLE_PERIPH: &str = "periph";
 const ORACLE_BANK: &str = "bank";
+const ORACLE_DUALCORE: &str = "dualcore";
 
 const USAGE: &str = "\
 Usage: test_silicon [--soak <duration>] [--seed <u64>] [--filter <substr>] [--verbose]
@@ -204,7 +206,7 @@ fn validate_catalogue_names_are_unique(names: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Combine the three catalogues' names into one `Vec<&str>` for the
+/// Combine the four catalogues' names into one `Vec<&str>` for the
 /// validator to chew on. Called once at startup.
 fn collect_all_catalogue_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
@@ -215,6 +217,9 @@ fn collect_all_catalogue_names() -> Vec<&'static str> {
         names.push(s.name);
     }
     for c in bank_conflict_cases::build_catalog() {
+        names.push(c.name);
+    }
+    for c in dualcore_cases::CASES {
         names.push(c.name);
     }
     names
@@ -257,6 +262,7 @@ enum OracleKind {
     Cycle,
     Periph,
     Bank,
+    DualCore,
 }
 
 impl OracleKind {
@@ -265,13 +271,14 @@ impl OracleKind {
             OracleKind::Cycle => ORACLE_CYCLE,
             OracleKind::Periph => ORACLE_PERIPH,
             OracleKind::Bank => ORACLE_BANK,
+            OracleKind::DualCore => ORACLE_DUALCORE,
         }
     }
 }
 
 /// Map a runtime oracle-name `&str` back to one of the pinned
 /// `&'static str` oracle-id constants so `CaseOutcome.oracle` stays
-/// `&'static str` without leaking. The three known oracles round-trip;
+/// `&'static str` without leaking. The known oracles round-trip;
 /// anything else is coerced to the literal `"unknown"`.
 ///
 /// Despite the literal `Box::leak`-sounding name of its predecessor, this
@@ -281,6 +288,7 @@ fn oracle_name_static(name: &str) -> &'static str {
         ORACLE_CYCLE => ORACLE_CYCLE,
         ORACLE_PERIPH => ORACLE_PERIPH,
         ORACLE_BANK => ORACLE_BANK,
+        ORACLE_DUALCORE => ORACLE_DUALCORE,
         _ => "unknown",
     }
 }
@@ -335,15 +343,17 @@ fn run_oracle_against(
     }
 }
 
-/// Inside the worker: take a mutable Session, open core 0, dispatch to the
-/// right `run_against`. Converts any `Box<dyn Error>` into a `String` so it
-/// can cross the channel boundary (`Box<dyn Error>` is not `Send` by
-/// default).
+/// Inside the worker: take a mutable Session, dispatch to the right
+/// `run_against`. Cycle / periph / bank open core 0 and run through the
+/// `Core` handle; dualcore takes `&mut Session` directly because it
+/// needs to drive core 1 as well as core 0.
+///
+/// Converts any `Box<dyn Error>` into a `String` so it can cross the
+/// channel boundary (`Box<dyn Error>` is not `Send` by default).
 fn run_one_oracle(
     session: &mut Session,
     plan: &OraclePlan,
 ) -> Result<Vec<CaseOutcome>, String> {
-    let mut core = session.core(0).map_err(|e| e.to_string())?;
     // When `order` is provided, convert `Vec<String>` into a transient
     // `Vec<&str>` for the library call. The caller owns the `String`
     // backing storage for the duration of this function.
@@ -355,6 +365,7 @@ fn run_one_oracle(
 
     let result = match plan.oracle {
         OracleKind::Cycle => {
+            let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = CycleArgs {
                 filter: plan.filter.clone(),
                 ..CycleArgs::default()
@@ -362,6 +373,7 @@ fn run_one_oracle(
             cycle_cases::run_against(&mut core, &args, order_slice)
         }
         OracleKind::Periph => {
+            let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = PeriphArgs {
                 filter: plan.filter.clone(),
                 verbose: false,
@@ -369,11 +381,21 @@ fn run_one_oracle(
             silicon_scenarios::run_against(&mut core, &args, order_slice)
         }
         OracleKind::Bank => {
+            let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = BankArgs {
                 filter: plan.filter.clone(),
                 ..BankArgs::default()
             };
             bank_conflict_cases::run_against(&mut core, &args, order_slice)
+        }
+        OracleKind::DualCore => {
+            // Dualcore needs &mut Session (it toggles core 1), so we
+            // skip the per-oracle `session.core(0)` acquisition here.
+            let args = DualCoreArgs {
+                filter: plan.filter.clone(),
+                ..DualCoreArgs::default()
+            };
+            dualcore_cases::run_against(session, &args, order_slice)
         }
     };
     result.map_err(|e| e.to_string())
@@ -618,7 +640,12 @@ fn single_pass(
     log_path: &PathBuf,
     verbose: bool,
 ) -> Result<Session, String> {
-    for oracle in [OracleKind::Cycle, OracleKind::Periph, OracleKind::Bank] {
+    for oracle in [
+        OracleKind::Cycle,
+        OracleKind::Periph,
+        OracleKind::Bank,
+        OracleKind::DualCore,
+    ] {
         println!("--- oracle: {} ---", oracle.as_str());
         let t0 = Instant::now();
         let plan = OraclePlan {
@@ -745,8 +772,17 @@ fn soak_loop(
         .filter(|c| name_matches_filter(c.name, args.filter.as_deref()))
         .map(|c| c.name)
         .collect();
+    let dualcore_names: Vec<&'static str> = dualcore_cases::CASES
+        .iter()
+        .map(|c| c.name)
+        .filter(|n| name_matches_filter(n, args.filter.as_deref()))
+        .collect();
 
-    if cycle_names.is_empty() && periph_names.is_empty() && bank_names.is_empty() {
+    if cycle_names.is_empty()
+        && periph_names.is_empty()
+        && bank_names.is_empty()
+        && dualcore_names.is_empty()
+    {
         println!(
             "test_silicon: no cases match filter '{}' in any oracle; exiting",
             args.filter.as_deref().unwrap_or("<none>"),
@@ -763,9 +799,11 @@ fn soak_loop(
         let mut cycle_plan: Vec<&'static str> = cycle_names.clone();
         let mut periph_plan: Vec<&'static str> = periph_names.clone();
         let mut bank_plan: Vec<&'static str> = bank_names.clone();
+        let mut dualcore_plan: Vec<&'static str> = dualcore_names.clone();
         shuffle_in_place(&mut cycle_plan, &mut rng);
         shuffle_in_place(&mut periph_plan, &mut rng);
         shuffle_in_place(&mut bank_plan, &mut rng);
+        shuffle_in_place(&mut dualcore_plan, &mut rng);
 
         if args.verbose {
             println!("{} iter={} seed={} starting", fmt_elapsed(start.elapsed()), iter_index, s);
@@ -781,7 +819,7 @@ fn soak_loop(
         //     ONCE at the start of bank (once per iteration).
         //   - No reset between cycle→periph→bank inside one iteration —
         //     the HLD's cross-oracle state-cleanup contract is honoured.
-        let plans: [(OracleKind, Vec<String>); 3] = [
+        let plans: [(OracleKind, Vec<String>); 4] = [
             (
                 OracleKind::Cycle,
                 cycle_plan.into_iter().map(String::from).collect(),
@@ -793,6 +831,10 @@ fn soak_loop(
             (
                 OracleKind::Bank,
                 bank_plan.into_iter().map(String::from).collect(),
+            ),
+            (
+                OracleKind::DualCore,
+                dualcore_plan.into_iter().map(String::from).collect(),
             ),
         ];
 
@@ -1170,6 +1212,7 @@ mod tests {
         assert_eq!(oracle_name_static("cycle"), ORACLE_CYCLE);
         assert_eq!(oracle_name_static("periph"), ORACLE_PERIPH);
         assert_eq!(oracle_name_static("bank"), ORACLE_BANK);
+        assert_eq!(oracle_name_static("dualcore"), ORACLE_DUALCORE);
         assert_eq!(oracle_name_static("foo"), "unknown");
     }
 

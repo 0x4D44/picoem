@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.20.0"
+version = "0.22.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -101,6 +101,10 @@ path = "src/bin/silicon_cycle_oracle_rp2350.rs"
 [[bin]]
 name = "silicon_periph_diff_rp2350"
 path = "src/bin/silicon_periph_diff_rp2350.rs"
+
+[[bin]]
+name = "silicon_dualcore_diff_rp2350"
+path = "src/bin/silicon_dualcore_diff_rp2350.rs"
 
 [[bin]]
 name = "test_silicon"

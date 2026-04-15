@@ -5,6 +5,7 @@
 
 pub mod bank_conflict_cases;
 pub mod cycle_cases;
+pub mod dualcore_cases;
 pub mod gdb_client;
 pub mod i2s_capture;
 pub mod ieee754_ref;
@@ -154,6 +155,36 @@ pub const CYCLE_MAILBOX_BASE: u32 = 0x2004_0100;
 /// bkpt`). Picked to stay clear of the cycle-oracle stub at
 /// `EMU_TEST_SLOT` + its sequence-slot neighbours.
 pub const SILICON_RUN_SLED: u32 = EMU_TEST_SLOT + 0x1000;
+
+/// Core-1 antagonist sequence upload slot, used by
+/// `silicon_dualcore_diff_rp2350`. Sits between `CYCLE_SEQ_SLOT`
+/// (0x2000_1000) and the core-1 data scratch below. The runner pokes
+/// the per-case antagonist bytes here with an infinite branch appended.
+///
+/// **Bank choice**: placed in SRAM bank 5 so core 1's instruction
+/// fetches do not collide with core 0's bank-0 I-fetch (`STUB_START`,
+/// `CYCLE_SEQ_SLOT`) or bank-0 data (`DUALCORE_CORE1_DATA` in the
+/// same-bank case). Bank math: `offset = addr & 0x000F_FFFF`, `bank =
+/// (offset >> 2) & 7`; for `0x2000_1114` the offset is `0x1114`, so
+/// `bank = (0x1114 >> 2) & 7 = 0x445 & 7 = 5`. This isolates the
+/// intended bank-match contrast in the `dualcore_load_same_bank` vs
+/// `dualcore_load_diff_bank` pair — otherwise both cores' I-fetches
+/// dominate the K-delta regardless of the data-bank match bit.
+/// See `wrk_docs/2026.04.15 - HLD - test_silicon Orchestrator and
+/// Coverage Expansion.md` §Component 3 "SRAM layout".
+pub const DUALCORE_ANTAGONIST_SLOT: u32 = 0x2000_1114;
+
+/// Core-1 data scratch for the dualcore oracle. Antagonist sequences
+/// that load/store use this slot (bank 0: `(0x200 >> 2) & 7 = 0`, but
+/// offsets inside the 256-byte window let a scenario address any bank).
+pub const DUALCORE_CORE1_DATA: u32 = 0x2000_1200;
+
+/// Core-1 stack top for the dualcore oracle. Separate from core 0's
+/// `EMU_TEST_STACK` (0x2004_0000) so the two cores' stacks can't collide.
+/// Placed safely below core 0's frame; `0x2003_E000` leaves an 8 KB gap
+/// below `EMU_TEST_STACK`, well beyond any plausible core-1 frame depth
+/// for the short antagonist loops this oracle runs.
+pub const DUALCORE_CORE1_STACK: u32 = 0x2003_E000;
 
 // ============================================================================
 // Per-chip address bases for `compare()`
@@ -5759,6 +5790,62 @@ mod tests {
     fn slot_scratch_separation() {
         assert_eq!(QEMU_TEST_SCRATCH - QEMU_TEST_SLOT, 0x100);
         assert_eq!(EMU_TEST_SCRATCH - EMU_TEST_SLOT, 0x100);
+    }
+
+    // -- Dualcore oracle address invariants --
+    //
+    // The dualcore bank-conflict pair (same-bank vs diff-bank) relies on
+    // core 1's instruction fetches NOT landing on the same SRAM bank
+    // port as core 0's fetches/data. Otherwise the intended bank-match
+    // contrast is dominated by I-fetch contention. Bank math matches
+    // `mdrp2350::bus::sram_bank_wait`: `offset = addr & 0x000F_FFFF`,
+    // `bank = (offset >> 2) & 7`.
+
+    fn bank_of(addr: u32) -> u32 {
+        let offset = addr & 0x000F_FFFF;
+        (offset >> 2) & 7
+    }
+
+    #[test]
+    fn dualcore_addresses_correct() {
+        assert_eq!(DUALCORE_ANTAGONIST_SLOT, 0x2000_1114);
+        assert_eq!(DUALCORE_CORE1_DATA, 0x2000_1200);
+        assert_eq!(DUALCORE_CORE1_STACK, 0x2003_E000);
+    }
+
+    #[test]
+    fn dualcore_antagonist_slot_not_bank_zero() {
+        // Core 0's stub/seq live in bank 0. Core 1's antagonist I-fetch
+        // must land elsewhere so the bank-match oracle isolates the
+        // data-bank contrast, not I-fetch contention.
+        assert_ne!(
+            bank_of(DUALCORE_ANTAGONIST_SLOT),
+            0,
+            "antagonist slot collides with core-0 bank-0 I-fetch",
+        );
+    }
+
+    #[test]
+    fn dualcore_core1_data_banks_differ() {
+        // The `dualcore_load_same_bank` case uses `DUALCORE_CORE1_DATA`
+        // (same bank as core 0's bank-0 data). The `diff_bank` case uses
+        // `+ 4`, which bumps the bank by 1. Verify the two addresses
+        // resolve to different banks so the contrast is meaningful.
+        let same = bank_of(DUALCORE_CORE1_DATA);
+        let diff = bank_of(DUALCORE_CORE1_DATA + 4);
+        assert_eq!(same, 0, "same-bank case must target bank 0");
+        assert_ne!(same, diff, "diff-bank case must target a different bank");
+    }
+
+    #[test]
+    fn dualcore_core1_stack_margin() {
+        // At least 8 KB gap below EMU_TEST_STACK so core 1's downward-
+        // growing stack cannot collide with core 0's frames.
+        let gap = EMU_TEST_STACK.saturating_sub(DUALCORE_CORE1_STACK);
+        assert!(
+            gap >= 0x2000,
+            "DUALCORE_CORE1_STACK must sit at least 8 KB below EMU_TEST_STACK; gap = 0x{gap:X}",
+        );
     }
 
     // -- GDB register indices --

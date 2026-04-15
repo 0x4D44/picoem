@@ -993,6 +993,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,10 +1387,11 @@ dependencies = [
 
 [[package]]
 name = "mdpicoem-harness"
-version = "0.19.0"
+version = "0.22.1"
 dependencies = [
  "chrono",
  "ctrlc",
+ "humantime",
  "libc",
  "mdpicoem-common",
  "mdrp2040",
