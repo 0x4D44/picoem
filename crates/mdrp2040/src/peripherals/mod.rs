@@ -42,6 +42,7 @@
 //! bit positions.
 
 pub mod psram;
+pub mod timer;
 pub mod watchdog_tick;
 
 /// Apply an APB alias read-modify-write onto a plain-storage register.

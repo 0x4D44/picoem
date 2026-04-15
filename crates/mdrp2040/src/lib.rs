@@ -100,9 +100,10 @@ impl Emulator {
         self.bus.xosc_regs.reset();
         self.bus.rosc_regs.reset();
         self.bus.watchdog_tick.reset();
+        self.bus.timer.reset();
         self.bus.irq_pending = 0;
-        for core in &mut self.cores {
-            core.nvic.reset();
+        for n in &mut self.bus.nvics {
+            n.reset();
         }
         self.bus.pll_sys_regs = bus::clocks::PLL_RESET;
         self.bus.pll_usb_regs = bus::clocks::PLL_RESET;
@@ -321,9 +322,22 @@ impl Emulator {
         let any_irq = self.bus.irq_pending != 0;
         if pio_idle && peri_idle && dma_idle && !any_irq {
             self.tick_pio(consumed as u32);
+            // Advance lazy-scheduled peripherals (TIMER alarms) by the
+            // same window the cores consumed. Any alarm matching inside
+            // the window fires into `bus.irq_pending` and gets drained
+            // in the same breath — so firmware that kicks off an alarm
+            // in one quantum sees the IRQ land by the start of the
+            // next.
+            self.bus.advance_lazy_scheduled(consumed);
+            self.drain_pending_irqs_to_cores();
             self.update_gpio();
         } else {
             for _ in 0..consumed {
+                // Advance the master-cycle cache one tick so per-cycle
+                // `tick_peripherals` sees a fresh `now` each iteration;
+                // TIMER's alarm poll only fires on >= match so a stale
+                // snapshot would quietly postpone the IRQ.
+                self.bus.master_cycle = self.bus.master_cycle.wrapping_add(1);
                 self.bus.tick_peripherals();
                 self.tick_pio_and_route_irqs_single();
                 self.update_gpio();
@@ -348,8 +362,8 @@ impl Emulator {
             let raised = std::mem::replace(&mut self.bus.irq_pending, 0);
             for irq in 0..crate::irq::IRQ_COUNT {
                 if raised & (1u32 << irq) != 0 {
-                    self.cores[0].nvic.set_pending(irq as u8);
-                    self.cores[1].nvic.set_pending(irq as u8);
+                    self.bus.nvics[0].set_pending(irq as u8);
+                    self.bus.nvics[1].set_pending(irq as u8);
                 }
             }
         }

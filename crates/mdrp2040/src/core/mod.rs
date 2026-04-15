@@ -63,11 +63,6 @@ pub struct CortexM0Plus {
     /// Phase 4.B consumes this after instruction retire and drives
     /// HardFault entry.
     pub(crate) pending_fault: Option<Fault>,
-    /// NVIC pending latch — peripheral-asserted external IRQs land
-    /// here via [`crate::Emulator::drain_pending_irqs_to_cores`]. Full
-    /// ISER / ICER / IPR decode lands in a later wave; Phase 1 only
-    /// needs the pending bits.
-    pub nvic: Nvic,
     /// Core is halted — will not execute until explicitly woken.
     halted: bool,
 }
@@ -84,7 +79,6 @@ impl CortexM0Plus {
             core_id,
             current_instr_addr: 0,
             pending_fault: None,
-            nvic: Nvic::new(),
             halted: false,
         }
     }
@@ -188,12 +182,29 @@ impl CortexM0Plus {
     /// Fetch-decode-execute one instruction. Integrates pending-fault
     /// delivery with the exception model — Phase 4.B wiring.
     ///
+    /// Phase 1 Wave 2 additions (HLD V7 §5.2): before instruction fetch
+    /// the step path polls the per-core NVIC for a pending-and-enabled
+    /// IRQ whose priority can preempt the current execution priority.
+    /// If one exists and isn't masked by PRIMASK, exception entry runs
+    /// against vector `16 + irq` and the instruction fetch is deferred
+    /// to the next call. Otherwise we fall through to the normal
+    /// fetch-decode-execute path.
+    ///
     /// Returns the cycle count consumed (instruction + any exception
     /// entry on fault delivery).
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
         if self.halted {
             return 0;
         }
+
+        // IRQ poll + dispatch (before instruction fetch). Returns the
+        // cycle cost of exception entry if one was taken; `0` otherwise.
+        let irq_cycles = self.maybe_dispatch_external_irq(bus);
+        if irq_cycles != 0 {
+            self.cycles = self.cycles.wrapping_add(irq_cycles as u64);
+            return irq_cycles;
+        }
+
         let mut cycles = self.decode_execute(bus);
 
         // Synchronous bus fault — unmapped loads/stores or XIP-before-
@@ -213,6 +224,74 @@ impl CortexM0Plus {
 
         self.cycles = self.cycles.wrapping_add(cycles as u64);
         cycles
+    }
+
+    /// Poll the per-core NVIC for a dispatchable external IRQ.
+    ///
+    /// Selection rule (HLD V7 §5.2, adapted for M0+'s 4-level priority):
+    /// 1. Mask to pending AND enabled (`nvic.pending_and_enabled()`).
+    /// 2. If PRIMASK is set, dispatch no external IRQ (PRIMASK raises
+    ///    execution priority to 0, which ties all configurable IRQ
+    ///    priorities).
+    /// 3. Otherwise pick the lowest-numerical-priority IRQ (lower value
+    ///    = architecturally higher priority); tie-break by lowest IRQ
+    ///    number (ARMv6-M ARM §B1.5.10).
+    /// 4. Require the candidate's priority to be strictly less (higher)
+    ///    than the current execution priority. Current execution
+    ///    priority is 0 when we're already in any handler (we simplify:
+    ///    any in-progress exception has priority 0 on M0+, so external
+    ///    IRQs with configurable priority never preempt — tail-chaining
+    ///    still works because it runs from `exit_exception` not here).
+    ///
+    /// Returns the cycle count of exception entry (non-zero on dispatch,
+    /// `0` otherwise).
+    fn maybe_dispatch_external_irq(&mut self, bus: &mut Bus) -> u32 {
+        // PRIMASK blocks everything below NMI/HardFault priority. Per
+        // ARMv6-M M0+, configurable priorities are 0x00..0xC0; PRIMASK=1
+        // effectively sets the "current execution priority floor" to 0,
+        // masking all external IRQs.
+        if self.regs.primask & 1 != 0 {
+            return 0;
+        }
+
+        // If already in a handler, don't preempt for an external IRQ.
+        // M0+ has coarse priority and our model collapses handler
+        // priority to "higher than any configurable". Tail-chain flows
+        // through `exit_exception`; this path only dispatches from
+        // thread mode.
+        if self.regs.in_handler_mode() {
+            return 0;
+        }
+
+        let core_idx = self.core_id as usize;
+        let candidates = bus.nvics[core_idx].pending_and_enabled();
+        if candidates == 0 {
+            return 0;
+        }
+
+        // Scan for lowest priority value, tie-break by lowest IRQ
+        // number. Only look at implemented IRQs (0..32; RP2040 uses
+        // 0..26 but the NVIC itself is 32 lines wide).
+        let mut best_irq: Option<u8> = None;
+        let mut best_prio: u8 = 0xFF;
+        for irq in 0u8..32 {
+            if candidates & (1u32 << irq) == 0 {
+                continue;
+            }
+            let p = bus.nvics[core_idx].priority[irq as usize];
+            if best_irq.is_none() || p < best_prio {
+                best_irq = Some(irq);
+                best_prio = p;
+            }
+        }
+        let Some(irq) = best_irq else { return 0 };
+
+        // Dispatch: clear pending, run exception entry against vector
+        // 16 + irq. The NVIC pending bit stays clear until the source
+        // re-asserts (level peripheral) or firmware writes NVIC_ISPR
+        // (software-set).
+        bus.nvics[core_idx].clear_pending(irq);
+        self.enter_exception(16u16 + irq as u16, bus)
     }
 
     /// Test helper — direct exception entry without synthesising an

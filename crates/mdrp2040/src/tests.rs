@@ -2442,9 +2442,9 @@ mod phase1_wave1 {
         // Assert TIMER_IRQ_0 (line 0) via the bus's pending bitmap.
         emu.bus.irq_pending |= 1u32 << IRQ_TIMER_IRQ_0;
         emu.step();
-        assert!(emu.cores[0].nvic.is_pending(IRQ_TIMER_IRQ_0 as u8),
+        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
             "core 0 NVIC must latch TIMER_IRQ_0 from irq_pending");
-        assert!(emu.cores[1].nvic.is_pending(IRQ_TIMER_IRQ_0 as u8),
+        assert!(emu.bus.nvics[1].is_pending(IRQ_TIMER_IRQ_0 as u8),
             "core 1 NVIC must also latch it (shared IRQ wire)");
         assert_eq!(emu.bus.irq_pending(), 0,
             "drain must clear the bus-level bitmap");
@@ -2523,7 +2523,7 @@ mod phase1_wave1 {
         assert_eq!(consumed, 1);
         assert_eq!(emu.bus.irq_pending(), 0);
         // Fast path drains nothing: both cores' NVIC stays empty.
-        assert_eq!(emu.cores[0].nvic.pending, 0);
+        assert_eq!(emu.bus.nvics[0].pending, 0);
     }
 
     #[test]
@@ -2541,7 +2541,7 @@ mod phase1_wave1 {
         assert_eq!(consumed, 1);
         // Slow path drained.
         assert_eq!(emu.bus.irq_pending(), 0);
-        assert!(emu.cores[0].nvic.is_pending(IRQ_TIMER_IRQ_0 as u8));
+        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8));
     }
 
     // --- PIO → NVIC routing ---------------------------------------------
@@ -2560,7 +2560,7 @@ mod phase1_wave1 {
         // drains into the NVIC.
         assert!(!emu.bus.pio_all_idle());
         emu.step();
-        assert!(emu.cores[0].nvic.is_pending(IRQ_PIO0_IRQ_0 as u8),
+        assert!(emu.bus.nvics[0].is_pending(IRQ_PIO0_IRQ_0 as u8),
             "PIO0 IRQ flag bit 0 must route to NVIC line #7 (PIO0_IRQ_0)");
     }
 
@@ -2575,7 +2575,7 @@ mod phase1_wave1 {
         emu.bus.write32(PIO1_BASE + 0x034, 0x02);
         emu.step();
         // PIO1_IRQ_1 is IRQ_PIO1_IRQ_0 + 1.
-        assert!(emu.cores[0].nvic.is_pending((IRQ_PIO1_IRQ_0 + 1) as u8),
+        assert!(emu.bus.nvics[0].is_pending((IRQ_PIO1_IRQ_0 + 1) as u8),
             "PIO1 IRQ flag bit 1 must route to NVIC line #10 (PIO1_IRQ_1)");
     }
 
@@ -2595,7 +2595,7 @@ mod phase1_wave1 {
         emu.bus.write32(PIO0_BASE + 0x034, 0xF0);
         emu.step();
         // No NVIC line 7..=10 should be latched.
-        assert_eq!(emu.cores[0].nvic.pending & 0x780, 0,
+        assert_eq!(emu.bus.nvics[0].pending & 0x780, 0,
             "high IRQ flags (bits 4-7) must not route to PIO0/PIO1 NVIC lines");
     }
 
@@ -2613,9 +2613,276 @@ mod phase1_wave1 {
         // Force PIO0 IRQ flag bit 2 via IRQ_FORCE.
         emu.bus.write32(PIO0_BASE + 0x034, 0x04);
         emu.step();
-        assert!(emu.cores[0].nvic.is_pending(IRQ_PIO0_IRQ_0 as u8),
+        assert!(emu.bus.nvics[0].is_pending(IRQ_PIO0_IRQ_0 as u8),
             "PIO0 bit 2 must over-route to NVIC #7 until INTE lands");
-        assert!(emu.cores[0].nvic.is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
+        assert!(emu.bus.nvics[0].is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
             "PIO0 bit 2 must over-route to NVIC #8 until INTE lands");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 Wave 2 — NVIC ISER/ICER/ISPR/ICPR/IPR + CPU-side dispatch
+// ---------------------------------------------------------------------------
+//
+// Covers HLD V7 §5.2 (NVIC register surface) plus CortexM0Plus::step's
+// per-cycle IRQ poll. `silicon_isr_diff_rp2040::isr_m0_timer_cold`
+// cannot pass without these.
+mod phase1_wave2 {
+    use crate::bus::Bus;
+    use crate::irq::IRQ_TIMER_IRQ_0;
+    use crate::{Config, EmulatorBuilder};
+
+    /// Plant a 48-entry vector table (covers all 16 system + 26 RP2040
+    /// external IRQs with headroom) plus a minimal handler at the given
+    /// base address. Returns `(handler_addr, main_addr)` so callers can
+    /// wire VTOR and PC.
+    ///
+    /// Layout (addresses inside SRAM, all Thumb-aligned):
+    /// * `base + 0x00`        — initial SP slot (= 0x2002_0000).
+    /// * `base + 0x04..+0xC0` — 47 exception vectors, each pointing at
+    ///   `handler_addr`.
+    /// * `base + 0x80` — `handler_addr`: NOP + self-loop (`B .`) so the
+    ///   handler is safe to execute.
+    /// * `base + 0x100` — `main_addr`: NOP + self-loop.
+    fn plant_vector_table(bus: &mut Bus, base: u32) -> (u32, u32) {
+        let handler_addr = base + 0x80;
+        let main_addr = base + 0x100;
+        // Initial SP at offset 0 — point at end of SRAM.
+        bus.write32(base, 0x2002_0000);
+        // Vectors 1..=47 all go to the handler (OR the Thumb bit). 47
+        // = 16 system exceptions (Reset..SysTick) + 32 external IRQ
+        // lines (RP2040 only uses 26, but stamping past the used set is
+        // free and guards against test drift).
+        for i in 1..48 {
+            bus.write32(base + (i as u32) * 4, handler_addr | 1);
+        }
+        // Handler: NOP + self-loop.
+        bus.write16(handler_addr, 0xBF00);
+        bus.write16(handler_addr + 2, 0xE7FE);
+        // Main: NOP + self-loop.
+        bus.write16(main_addr, 0xBF00);
+        bus.write16(main_addr + 2, 0xE7FE);
+        (handler_addr, main_addr)
+    }
+
+    // --- NVIC struct via bus_nvics field --------------------------------
+
+    #[test]
+    fn bus_nvics_field_defaults_empty() {
+        let bus = Bus::new();
+        assert_eq!(bus.nvics[0].pending, 0);
+        assert_eq!(bus.nvics[0].enabled, 0);
+        assert_eq!(bus.nvics[1].pending, 0);
+        assert_eq!(bus.nvics[1].enabled, 0);
+    }
+
+    // --- CPU dispatch ----------------------------------------------------
+
+    #[test]
+    fn enabled_and_pending_dispatches_exception_at_vector_16() {
+        // Core 0, thread mode, PRIMASK clear. Enable IRQ 0 and assert it
+        // pending via the bus bitmap (drained on first slow-path step).
+        // Expected: exception entry to vector 16 (TIMER_IRQ_0).
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let (handler_addr, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
+        // Wire VTOR + PC + SP on core 0.
+        emu.bus.ppb[0].vtor = 0x2000_0000;
+        emu.cores[0].regs.set_pc(main_addr);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Enable IRQ_TIMER_IRQ_0 (line 0) directly in the NVIC.
+        emu.bus.nvics[0].set_enabled(IRQ_TIMER_IRQ_0 as u8);
+        // Assert the IRQ via the bus-level bitmap (Phase 1 Wave 1 plumbing).
+        emu.bus.irq_pending |= 1u32 << IRQ_TIMER_IRQ_0;
+        // First step: slow path drains irq_pending into NVIC (fast path
+        // would early-exit on `any_irq`).
+        emu.step();
+        // Drain happened — NVIC latched the pending bit.
+        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "NVIC must latch the pending bit after slow-path drain");
+        // Second step: CPU-side poll picks it up and enters the handler.
+        emu.step();
+        // PC must be at the handler.
+        assert_eq!(emu.cores[0].regs.pc(), handler_addr,
+            "exception entry must land at the handler address");
+        // IPSR must be 16 (exception number for TIMER_IRQ_0 → 16).
+        assert_eq!(emu.cores[0].regs.ipsr(), 16,
+            "IPSR must encode exception #16 inside the handler");
+        // NVIC pending bit is cleared by dispatch.
+        assert!(!emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "dispatch clears the pending bit");
+    }
+
+    #[test]
+    fn pending_without_enable_does_not_dispatch() {
+        // NVIC pending but not enabled — CPU must stay in thread mode
+        // and keep executing the main routine.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
+        emu.bus.ppb[0].vtor = 0x2000_0000;
+        emu.cores[0].regs.set_pc(main_addr);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        emu.bus.nvics[0].set_pending(IRQ_TIMER_IRQ_0 as u8);
+        // enabled bit intentionally not set.
+        emu.step();
+        assert_eq!(emu.cores[0].regs.ipsr(), 0, "still in thread mode");
+        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "pending bit stays set when NVIC masks the line");
+    }
+
+    #[test]
+    fn primask_blocks_dispatch() {
+        // Pending + enabled but PRIMASK set — no dispatch, pending
+        // bit remains latched.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
+        emu.bus.ppb[0].vtor = 0x2000_0000;
+        emu.cores[0].regs.set_pc(main_addr);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        emu.cores[0].regs.primask = 1;
+        emu.bus.nvics[0].set_enabled(IRQ_TIMER_IRQ_0 as u8);
+        emu.bus.nvics[0].set_pending(IRQ_TIMER_IRQ_0 as u8);
+        emu.step();
+        assert_eq!(emu.cores[0].regs.ipsr(), 0,
+            "PRIMASK=1 must block dispatch — stay in thread mode");
+        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "PRIMASK leaves the pending bit latched");
+    }
+
+    #[test]
+    fn handler_mode_does_not_preempt_for_external_irq() {
+        // If we're already in a handler, an external IRQ must not
+        // preempt on our simplified M0+ priority model.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
+        emu.bus.ppb[0].vtor = 0x2000_0000;
+        emu.cores[0].regs.set_pc(main_addr);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Fake handler-mode: IPSR = exception 11 (SVCall).
+        emu.cores[0].regs.xpsr = (emu.cores[0].regs.xpsr & !0x1FF) | 11;
+        emu.bus.nvics[0].set_enabled(IRQ_TIMER_IRQ_0 as u8);
+        emu.bus.nvics[0].set_pending(IRQ_TIMER_IRQ_0 as u8);
+        emu.step();
+        // IPSR stays at 11; pending bit still latched.
+        assert_eq!(emu.cores[0].regs.ipsr(), 11, "in-handler: no preempt");
+        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8));
+    }
+
+    #[test]
+    fn lowest_priority_value_wins_tiebreak_by_irq_number() {
+        // Two IRQs pending: IRQ 3 at priority 0xC0, IRQ 5 at priority
+        // 0x40. Lower priority value = higher priority, so IRQ 5 wins.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
+        emu.bus.ppb[0].vtor = 0x2000_0000;
+        emu.cores[0].regs.set_pc(main_addr);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        emu.bus.nvics[0].set_enabled(3);
+        emu.bus.nvics[0].set_enabled(5);
+        emu.bus.nvics[0].set_pending(3);
+        emu.bus.nvics[0].set_pending(5);
+        emu.bus.nvics[0].set_priority(3, 0xC0);
+        emu.bus.nvics[0].set_priority(5, 0x40);
+        emu.step();
+        // IPSR must be exception #(16 + 5) = 21 (UART1_IRQ by table).
+        assert_eq!(emu.cores[0].regs.ipsr(), 21,
+            "higher-priority (lower value) IRQ must dispatch first");
+        // IRQ 5 dispatched (cleared); IRQ 3 still pending.
+        assert!(!emu.bus.nvics[0].is_pending(5));
+        assert!(emu.bus.nvics[0].is_pending(3));
+    }
+
+    #[test]
+    fn equal_priority_picks_lowest_irq_number() {
+        // Two IRQs at the same priority 0x00 — lowest-number wins.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
+        emu.bus.ppb[0].vtor = 0x2000_0000;
+        emu.cores[0].regs.set_pc(main_addr);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        emu.bus.nvics[0].set_enabled(2);
+        emu.bus.nvics[0].set_enabled(5);
+        emu.bus.nvics[0].set_pending(2);
+        emu.bus.nvics[0].set_pending(5);
+        // Both defaults to priority 0x00.
+        emu.step();
+        assert_eq!(emu.cores[0].regs.ipsr(), 16 + 2,
+            "tie-break by lowest IRQ number");
+    }
+
+    // --- Bus-level TIMER dispatch + RESETS gate -------------------------
+
+    #[test]
+    fn bus_timer_write_swallowed_while_held_in_reset() {
+        let mut bus = Bus::new();
+        // Default RESETS holds TIMER. A write to ALARM0 must be dropped
+        // by the bus guard — reading it back returns 0 (the default).
+        bus.write32(crate::bus::TIMER_BASE + 0x10, 500);
+        // Read comes back through reset-gate: 0.
+        assert_eq!(bus.read32(crate::bus::TIMER_BASE + 0x10), 0);
+        assert_eq!(bus.timer.read32(0x10, 0, 125_000_000), 0,
+            "direct peripheral read-back confirms no state change");
+    }
+
+    #[test]
+    fn bus_timer_write_after_reset_released() {
+        let mut bus = Bus::new();
+        // Release RESET_TIMER (bit 21).
+        bus.write32(0x4000_F000, 1u32 << 21);
+        // Write ALARM0 = 42 µs via the bus.
+        bus.write32(crate::bus::TIMER_BASE + 0x10, 42);
+        // Direct read through the bus (normal alias).
+        assert_eq!(bus.read32(crate::bus::TIMER_BASE + 0x10), 42);
+    }
+
+    #[test]
+    fn bus_timerawl_returns_live_microseconds() {
+        let mut bus = Bus::new();
+        bus.write32(0x4000_F000, 1u32 << 21); // release TIMER reset
+        // Default clock tree: sys_clk_hz seeded from ROSC. But
+        // `Bus::new()` seeds ROSC (6.5 MHz) which leaves (sys_hz/1M)
+        // at 6. So set master_cycle to 6000 to produce 1000 µs.
+        bus.master_cycle = (bus.clock_tree.sys_clk_hz / 1_000_000).max(1) as u64 * 1000;
+        let lo = bus.read32(crate::bus::TIMER_BASE + 0x28);
+        assert_eq!(lo, 1000, "TIMERAWL = now in µs at this master_cycle");
+    }
+
+    #[test]
+    fn advance_lazy_scheduled_fires_timer_alarm() {
+        // Program an alarm that matches inside the window we'll pass to
+        // advance_lazy_scheduled and assert the IRQ bit lands in
+        // bus.irq_pending + the NVIC gets it on drain.
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(64).build();
+        // Release TIMER's RESET bit.
+        emu.bus.write32(0x4000_F000, 1u32 << 21);
+        // Park a NOP so step() has something to execute.
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // INTE alarm 0 enabled so poll_alarms raises NVIC bit.
+        emu.bus.write32(crate::bus::TIMER_BASE + 0x38, 0x1);
+        // ALARM0 = 1 µs: matches at sys_hz/1M cycles.
+        emu.bus.write32(crate::bus::TIMER_BASE + 0x10, 1);
+        // Step enough cycles for the fast path to push master_cycle
+        // past 1 µs. Default sys_hz = ROSC; with step_quantum=64 a
+        // single step covers 64 cycles. We need sys_hz/1M cycles to
+        // reach 1 µs — at ROSC 6.5 MHz that's 6 cycles. One step
+        // suffices.
+        emu.step();
+        // NVIC must have picked up IRQ_TIMER_IRQ_0 via drain after the
+        // fast-path `advance_lazy_scheduled`.
+        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "ALARM0 match must propagate to NVIC via lazy schedule");
+        // INTR must show the alarm fired and armed cleared.
+        let intr = emu.bus.read32(crate::bus::TIMER_BASE + 0x34);
+        assert_eq!(intr & 1, 1, "INTR bit 0 must latch");
+        let armed = emu.bus.read32(crate::bus::TIMER_BASE + 0x20);
+        assert_eq!(armed & 1, 0, "ARMED bit 0 must auto-clear on fire");
     }
 }

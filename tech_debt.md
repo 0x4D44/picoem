@@ -749,3 +749,37 @@ because none of them are redistributable under clear licences we've
 verified. When Stage 6 acceptance runs end-to-end, record the
 specific player used + its version in `wrk_journals/` so the trace
 is reproducible.
+
+## Phase 1 known limitations (mdrp2040 IRQ / TIMER)
+
+Closed-out from Phase 1 Wave 2 (`HLD V7 §5.2`/`§5.3`) code review.
+All four items are by design for Phase 1 and have explicit deferral
+owners below.
+
+- **32-bit alarm wrap math** — `TimerRegs::poll_alarms`
+  (`crates/mdrp2040/src/peripherals/timer.rs`) does not re-check the
+  wrap across a 32-bit boundary for alarms scheduled near the low-word
+  rollover. Arming computes `fire_cycle = now + (target - now_lo)` in
+  master-cycle space at write time, but a firmware that arms then
+  reprograms the time register could mis-fire. Phase 2+.
+- **Fixed `sys_hz/1_000_000` tick derivation** — TIMER's
+  `cycles_to_us` / `us_to_cycles` collapse the WATCHDOG_TICK.CYCLES
+  divider out of the formula and assume one microsecond per
+  `sys_hz / 1_000_000` sysclk cycles. Firmware that reprograms
+  `clk_peri` or `WATCHDOG_TICK.CYCLES` mid-run will see TIMER drift.
+  Phase 2+.
+- **Dual-core preemption under the 4-priority collapsed model** —
+  `CortexM0Plus::maybe_dispatch_external_irq`
+  (`crates/mdrp2040/src/core/mod.rs`) blocks all higher-priority IRQs
+  on any core while any core is in handler mode. ARMv6-M real silicon
+  preempts per-core: a higher-priority IRQ on core 1 should preempt a
+  core-1 handler running at lower priority even while core 0 is in
+  handler mode. Our simplified model suffices for corpus firmware that
+  uses a single priority level per IRQ; correct per-core nesting is a
+  later-phase item.
+- **Halted-core IRQ wake (WFE/WFI)** — if core N is halted (WFE/WFI)
+  and an IRQ becomes pending+enabled on core N's NVIC, the early-return
+  on `is_halted` in `maybe_dispatch_external_irq` means nothing wakes
+  the core. Real silicon wakes via the IRQ-pending line even from WFE.
+  Phase 2+ wake path needs to re-check `nvic.pending_and_enabled()` on
+  peripheral tick and clear `is_halted` when a deliverable IRQ appears.

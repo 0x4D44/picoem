@@ -31,9 +31,11 @@ use std::io::Write;
 use mdpicoem_common::PioBlock;
 use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
+use crate::core::Nvic;
 use crate::dma::Dma;
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use crate::peripherals::psram::Psram;
+use crate::peripherals::timer::TimerRegs;
 use crate::peripherals::watchdog_tick::WatchdogTickRegs;
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
@@ -184,6 +186,11 @@ pub struct Bus {
     /// the `TICK` register at offset `0x2C` is modelled today; the rest
     /// of the WATCHDOG block reads as 0.
     pub(crate) watchdog_tick: WatchdogTickRegs,
+    /// TIMER register model (Phase 1 Wave 2 — HLD V7 §5.3). Lazy
+    /// microsecond counter + four alarms; `advance_lazy_scheduled`
+    /// polls `poll_alarms` on every step tail to surface alarm-match
+    /// IRQs into `irq_pending`.
+    pub(crate) timer: TimerRegs,
     /// DMA controller — Phase 1 stub (always idle). Phase 4 replaces
     /// this with the 12-channel model. Consulted by the fast-path gate
     /// in [`crate::Emulator::step`] via [`Dma::is_idle`].
@@ -194,6 +201,13 @@ pub struct Bus {
     /// the bitmap into both cores' NVIC pending latches per inner-loop
     /// iteration (HLD V7 §5.2).
     pub(crate) irq_pending: u32,
+    /// Per-core NVIC — one pending/enabled/priority set per CPU. The
+    /// System Control Space NVIC registers (`0xE000_E100..0xE000_E41F`)
+    /// are banked per-core on M0+; `nvics[active_core]` is the one the
+    /// currently-executing CPU sees. Drained from [`Self::irq_pending`]
+    /// by [`crate::Emulator::drain_pending_irqs_to_cores`], polled by
+    /// [`crate::core::CortexM0Plus::step`] for dispatch.
+    pub nvics: [Nvic; 2],
     /// Off-chip 8 MB SPI PSRAM (PicoGUS v2 hardware). Observed via
     /// [`crate::Emulator::update_gpio`] on GPIO1/2/3 (CS/SCK/MOSI) and
     /// drives GPIO0 (MISO) back into [`Self::gpio_in`].
@@ -276,8 +290,10 @@ impl Bus {
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
             watchdog_tick: WatchdogTickRegs::new(),
+            timer: TimerRegs::new(),
             dma: Dma::new(),
             irq_pending: 0,
+            nvics: [Nvic::new(), Nvic::new()],
             psram: Psram::new(),
             external_gpio_in_override: 0,
             external_gpio_in_mask: 0,
@@ -584,6 +600,9 @@ impl Bus {
             PADS_BANK0_BASE => self.pads_bank0.read32(offset),
             PIO0_BASE => self.pio[0].read32(offset),
             PIO1_BASE => self.pio[1].read32(offset),
+            TIMER_BASE => self
+                .timer
+                .read32(offset, self.master_cycle, self.clock_tree.sys_clk_hz),
             WATCHDOG_BASE => self.watchdog_tick.read32(offset),
             _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
         }
@@ -636,6 +655,11 @@ impl Bus {
             PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
             PIO0_BASE => self.pio[0].write32(offset, val, alias),
             PIO1_BASE => self.pio[1].write32(offset, val, alias),
+            TIMER_BASE => {
+                let sys_hz = self.clock_tree.sys_clk_hz;
+                let mc = self.master_cycle;
+                self.timer.write32(offset, val, alias, mc, sys_hz);
+            }
             WATCHDOG_BASE => self.watchdog_tick.write32(offset, val, alias),
             _ => {
                 // Catch-all: store with alias semantics so firmware round-trips.
@@ -720,7 +744,10 @@ impl Bus {
                 word.to_le_bytes()[(addr & 3) as usize]
             }
             0xE => {
-                let word = self.ppb[self.active_core].read32(addr & !3);
+                let w32 = addr & !3;
+                let word = self
+                    .nvic_mmio_read32(w32)
+                    .unwrap_or_else(|| self.ppb[self.active_core].read32(w32));
                 word.to_le_bytes()[(addr & 3) as usize]
             }
             _ => {
@@ -765,7 +792,10 @@ impl Bus {
                 [word as u16, (word >> 16) as u16][half]
             }
             0xE => {
-                let word = self.ppb[self.active_core].read32(addr & !3);
+                let w32 = addr & !3;
+                let word = self
+                    .nvic_mmio_read32(w32)
+                    .unwrap_or_else(|| self.ppb[self.active_core].read32(w32));
                 let half = ((addr >> 1) & 1) as usize;
                 [word as u16, (word >> 16) as u16][half]
             }
@@ -802,7 +832,13 @@ impl Bus {
             }
             0x4 | 0x5 => self.peripheral_read32(addr),
             0xD => self.sio_read32(addr),
-            0xE => self.ppb[self.active_core].read32(addr),
+            0xE => {
+                if let Some(w) = self.nvic_mmio_read32(addr) {
+                    w
+                } else {
+                    self.ppb[self.active_core].read32(addr)
+                }
+            }
             _ => {
                 self.bus_fault = true;
                 self.bus_fault_addr = addr;
@@ -876,10 +912,15 @@ impl Bus {
             0xE => {
                 let word_addr = addr & !3;
                 let byte_idx = (addr & 3) as usize;
-                let old = self.ppb[self.active_core].read32(word_addr);
+                let old = self
+                    .nvic_mmio_read32(word_addr)
+                    .unwrap_or_else(|| self.ppb[self.active_core].read32(word_addr));
                 let mut bytes = old.to_le_bytes();
                 bytes[byte_idx] = val;
-                self.ppb[self.active_core].write32(word_addr, u32::from_le_bytes(bytes));
+                let new_word = u32::from_le_bytes(bytes);
+                if !self.nvic_mmio_write32(word_addr, new_word) {
+                    self.ppb[self.active_core].write32(word_addr, new_word);
+                }
             }
             0x0 | 0x1 => {} // ROM / XIP flash — silently ignored at any width
             _ => {
@@ -946,11 +987,15 @@ impl Bus {
             0xE => {
                 let word_addr = addr & !3;
                 let half_idx = ((addr >> 1) & 1) as usize;
-                let old = self.ppb[self.active_core].read32(word_addr);
+                let old = self
+                    .nvic_mmio_read32(word_addr)
+                    .unwrap_or_else(|| self.ppb[self.active_core].read32(word_addr));
                 let mut halves: [u16; 2] = [old as u16, (old >> 16) as u16];
                 halves[half_idx] = val;
                 let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
-                self.ppb[self.active_core].write32(word_addr, new_word);
+                if !self.nvic_mmio_write32(word_addr, new_word) {
+                    self.ppb[self.active_core].write32(word_addr, new_word);
+                }
             }
             0x0 | 0x1 => {} // ROM / XIP flash — silently ignored at any width
             _ => {
@@ -997,7 +1042,11 @@ impl Bus {
                 self.peripheral_write32(addr, val, alias);
             }
             0xD => self.sio_write32(addr, val),
-            0xE => self.ppb[self.active_core].write32(addr, val),
+            0xE => {
+                if !self.nvic_mmio_write32(addr, val) {
+                    self.ppb[self.active_core].write32(addr, val);
+                }
+            }
             0x0 => {} // ROM — silently ignored at any width
             _ => {
                 self.bus_fault = true;
@@ -1032,6 +1081,89 @@ impl Bus {
             };
         }
         0
+    }
+
+    // --- PPB + NVIC read/write dispatch ----------------------------------
+    //
+    // The NVIC lives in the System Control Space at `0xE000_E100..=
+    // 0xE000_E41F`. These registers are banked per-core on M0+, so
+    // `nvics[active_core]` is the one the currently-executing CPU sees.
+    // Other 0xE000_Exxx addresses fall through to the PPB.
+
+    /// Intercept NVIC MMIO before the PPB sees it. Returns `Some(word)`
+    /// when `addr` lies inside the NVIC ISER0 / ICER0 / ISPR0 / ICPR0 /
+    /// IPR0..7 range, `None` otherwise so the caller can fall through
+    /// to the PPB dispatch.
+    fn nvic_mmio_read32(&self, addr: u32) -> Option<u32> {
+        let low = addr & 0xFFFF;
+        let n = &self.nvics[self.active_core];
+        match low {
+            // NVIC_ISER0 (0xE100) and NVIC_ICER0 (0xE180) both READ the
+            // enable mask (ARMv6-M ARM §B3.4.4 / §B3.4.5).
+            0xE100 | 0xE180 => Some(n.enabled),
+            // NVIC_ISPR0 (0xE200) / NVIC_ICPR0 (0xE280) both READ the
+            // pending mask.
+            0xE200 | 0xE280 => Some(n.pending),
+            // NVIC_IPR0..7 at 0xE400 + 4N. Each word holds 4 × 8-bit
+            // priority bytes for IRQs [N*4..N*4+4].
+            0xE400..=0xE41F => {
+                let word_idx = ((low - 0xE400) >> 2) as usize;
+                let base_irq = word_idx * 4;
+                let mut w = 0u32;
+                for lane in 0..4 {
+                    let irq = base_irq + lane;
+                    if irq < 32 {
+                        w |= (n.priority[irq] as u32) << (lane * 8);
+                    }
+                }
+                Some(w)
+            }
+            _ => None,
+        }
+    }
+
+    /// Intercept NVIC MMIO writes. Returns `true` when handled. All
+    /// four register families are per-core.
+    fn nvic_mmio_write32(&mut self, addr: u32, val: u32) -> bool {
+        let low = addr & 0xFFFF;
+        let n = &mut self.nvics[self.active_core];
+        match low {
+            // NVIC_ISER0: write-1-to-SET the enable bit.
+            0xE100 => {
+                n.enabled |= val;
+                true
+            }
+            // NVIC_ICER0: write-1-to-CLEAR the enable bit.
+            0xE180 => {
+                n.enabled &= !val;
+                true
+            }
+            // NVIC_ISPR0: write-1-to-SET the pending bit.
+            0xE200 => {
+                n.pending |= val;
+                true
+            }
+            // NVIC_ICPR0: write-1-to-CLEAR the pending bit.
+            0xE280 => {
+                n.pending &= !val;
+                true
+            }
+            // NVIC_IPR0..7: 4×u8 priority bytes, each masked to the
+            // implemented bits [7:6] (M0+ supports 4 priority levels).
+            0xE400..=0xE41F => {
+                let word_idx = ((low - 0xE400) >> 2) as usize;
+                let base_irq = word_idx * 4;
+                for lane in 0..4 {
+                    let irq = base_irq + lane;
+                    if irq < 32 {
+                        let byte = ((val >> (lane * 8)) & 0xFF) as u8;
+                        n.priority[irq] = byte & crate::core::nvic::PRIORITY_MASK;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     // --- SIO read/write dispatch -----------------------------------------
@@ -1100,13 +1232,16 @@ impl Bus {
         // Explicit acknowledgement of every stateful peripheral field.
         // When a new peripheral field is added to `Bus`, add a
         // reference here; Rust will flag any field rename / removal at
-        // compile time. Phase 1: TIMER + WATCHDOG_TICK are lazy so they
-        // are always idle; DMA is checked at the caller.
+        // compile time. Phase 1 Wave 2: TIMER is a lazy peripheral —
+        // alarm firing happens inside `advance_lazy_scheduled`, which
+        // itself runs in the fast path. A latched INTR without INTE
+        // set (no NVIC routing) still counts as idle because nothing
+        // observable happens per-cycle. WATCHDOG_TICK has no tick.
         #[cfg(debug_assertions)]
         {
-            let _ = (&self.watchdog_tick, &self.dma);
+            let _ = (&self.watchdog_tick, &self.dma, &self.timer);
         }
-        true
+        self.timer.is_idle()
     }
 
     /// True iff at least one PIO SM is enabled in either block, or any
@@ -1126,13 +1261,39 @@ impl Bus {
     ///
     /// Called from the slow-path loop in [`crate::Emulator::step`]
     /// whenever the fast-path gate opens (PIO active, DMA live, or an
-    /// IRQ already pending). Phase 1 peripherals (`TIMER`,
-    /// `WATCHDOG_TICK`) are lazy and have nothing to do per cycle — the
-    /// body is empty. Later phases add `self.uart0.tick(&mut
+    /// IRQ already pending). Phase 1 Wave 2: only TIMER contributes —
+    /// `poll_alarms` folds any just-fired alarm IRQs into
+    /// [`Self::irq_pending`]. Later phases add `self.uart0.tick(&mut
     /// self.irq_pending)` etc.
     #[inline]
     pub fn tick_peripherals(&mut self) {
-        // Phase 1: every peripheral is lazy. Deliberately empty.
+        // TIMER alarms are lazy-fire at match: `poll_alarms` is cheap
+        // (four armed-bit checks) and we run it here so firmware
+        // stepping in the slow path observes alarm-match IRQs on the
+        // same inner cycle as the source condition.
+        let nvic_bits = self
+            .timer
+            .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
+        // TIMER IRQs occupy NVIC lines 0..3.
+        self.irq_pending |= nvic_bits & 0xF;
+    }
+
+    /// Fast-path lazy-schedule advance (HLD V7 §5.5).
+    ///
+    /// Called from [`crate::Emulator::step`]'s fast-path branch after
+    /// the core(s) have stepped. Bumps the bus's master-cycle cache by
+    /// `consumed` and polls all lazy peripherals (TIMER alarms) to
+    /// surface IRQs for any events that fell inside the window
+    /// `[old_master_cycle, old_master_cycle + consumed]`.
+    ///
+    /// TIMER is currently the only lazy peripheral; later phases may
+    /// add RTC alarm + PWM wrap-on-overflow.
+    pub fn advance_lazy_scheduled(&mut self, consumed: u64) {
+        self.master_cycle = self.master_cycle.wrapping_add(consumed);
+        let nvic_bits = self
+            .timer
+            .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
+        self.irq_pending |= nvic_bits & 0xF;
     }
 
     /// Read the current pending-IRQ bitmap. Mostly for tests.
@@ -1529,5 +1690,82 @@ mod tests {
             "line 2 = {:?} (core 0 PC must survive the core-1 excursion)",
             lines[2]
         );
+    }
+
+    // ----- NVIC MMIO dispatch (Phase 1 Wave 2, HLD V7 §5.2) --------------
+    //
+    // Exercise the bus-level interception of the NVIC register window
+    // `0xE000_E100..=0xE000_E41F`. Reads go through the Bus's normal
+    // `read32`/`read16`/`read8` API so alias + byte/halfword access is
+    // covered; writes mirror.
+
+    #[test]
+    fn nvic_iser0_write_sets_enable_read_back() {
+        let mut bus = Bus::new();
+        // Enable IRQ 5 + IRQ 12.
+        bus.write32(0xE000_E100, (1u32 << 5) | (1u32 << 12));
+        // ISER0 read returns the enabled mask.
+        assert_eq!(bus.read32(0xE000_E100), (1u32 << 5) | (1u32 << 12));
+        // ICER0 read aliases the same mask.
+        assert_eq!(bus.read32(0xE000_E180), (1u32 << 5) | (1u32 << 12));
+        // Writing ICER0 clears the specified bits.
+        bus.write32(0xE000_E180, 1u32 << 5);
+        assert_eq!(bus.read32(0xE000_E100), 1u32 << 12);
+        // ISER0 write is write-1-set (does not clear unchanged bits).
+        bus.write32(0xE000_E100, 1u32 << 3);
+        assert_eq!(bus.read32(0xE000_E100), (1u32 << 3) | (1u32 << 12));
+    }
+
+    #[test]
+    fn nvic_ispr0_write_sets_pending_read_back() {
+        let mut bus = Bus::new();
+        // Set pending IRQ 0 via ISPR0.
+        bus.write32(0xE000_E200, 1u32 << 0);
+        assert_eq!(bus.read32(0xE000_E200), 1u32 << 0);
+        assert_eq!(bus.read32(0xE000_E280), 1u32 << 0); // ICPR0 shows pending too
+        // W1C via ICPR0.
+        bus.write32(0xE000_E280, 1u32 << 0);
+        assert_eq!(bus.read32(0xE000_E200), 0);
+    }
+
+    #[test]
+    fn nvic_ipr_word_encodes_four_priorities() {
+        let mut bus = Bus::new();
+        // Write IPR1 (covers IRQs 4..=7). Priority 0xC0 on IRQ 4 (lane 0),
+        // 0x80 on IRQ 5 (lane 1), 0x40 on IRQ 6 (lane 2), 0x00 on IRQ 7
+        // (lane 3).
+        let word = 0xC0u32 | (0x80u32 << 8) | (0x40u32 << 16) | (0x00u32 << 24);
+        bus.write32(0xE000_E404, word);
+        assert_eq!(bus.read32(0xE000_E404), word);
+        // Non-implemented bits of a priority byte must be masked — write
+        // 0x3F (all low bits) to IRQ 8 on IPR2 lane 0; readback is 0.
+        bus.write32(0xE000_E408, 0x3F);
+        assert_eq!(bus.read32(0xE000_E408), 0);
+    }
+
+    #[test]
+    fn nvic_is_per_core_banked() {
+        // ARMv6-M banks the SCS per-core. Active core = 0: writes land
+        // on nvics[0] only; active core = 1 sees independent state.
+        let mut bus = Bus::new();
+        bus.set_active_core(0);
+        bus.write32(0xE000_E100, 1u32 << 4);
+        bus.set_active_core(1);
+        bus.write32(0xE000_E100, 1u32 << 19);
+        // Core 0 must NOT see IRQ 19 enabled; core 1 must NOT see IRQ 4.
+        bus.set_active_core(0);
+        assert_eq!(bus.read32(0xE000_E100), 1u32 << 4);
+        bus.set_active_core(1);
+        assert_eq!(bus.read32(0xE000_E100), 1u32 << 19);
+    }
+
+    #[test]
+    fn nvic_mmio_reset_gate_does_not_apply() {
+        // NVIC is part of SCS (0xE...), not an APB peripheral — no RESETS
+        // bit gates it. Freshly-constructed bus with everything held in
+        // reset still honours NVIC reads/writes.
+        let mut bus = Bus::new();
+        bus.write32(0xE000_E100, 1u32 << 0);
+        assert_eq!(bus.read32(0xE000_E100), 1u32 << 0);
     }
 }
