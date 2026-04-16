@@ -6,9 +6,11 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
+use crate::dma::{DMA_BASE, Dma};
 use crate::irq::{
-    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ,
-    IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0, IRQ_UART0_IRQ, PERIPH_IRQ_MASK,
+    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_PWM_IRQ_WRAP_0,
+    IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0, IRQ_UART0_IRQ,
+    PERIPH_IRQ_MASK,
 };
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::{ADC_BASE, AdcRegs};
@@ -179,7 +181,9 @@ pub const RESETS_POST_BOOTROM: u32 = {
         | (1u32 << RESET_SPI0)
         | (1u32 << RESET_I2C0)
         | (1u32 << RESET_ADC)
-        | (1u32 << RESET_PWM);
+        | (1u32 << RESET_PWM)
+        // Phase 3: DMA released post-bootrom.
+        | (1u32 << RESET_DMA);
     // Field width is 29 bits (datasheet §7.5).
     let mask: u32 = 0x1FFF_FFFF;
     mask & !released
@@ -204,6 +208,7 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
         PWM_BASE => Some(RESET_PWM),
         IO_BANK0_BASE => Some(RESET_IO_BANK0),
         PADS_BANK0_BASE => Some(RESET_PADS_BANK0),
+        DMA_BASE => Some(RESET_DMA),
         _ => None,
     }
 }
@@ -274,6 +279,8 @@ pub struct Bus {
     pub(crate) io_bank0: IoBank0Regs,
     /// PADS_BANK0 plain-storage pad drive/pull control.
     pub(crate) pads_bank0: PadsBank0Regs,
+    /// DMA controller — 16 channels (HLD V5 §5.6, Phase 3).
+    pub(crate) dma: Dma,
     /// Bus fault detected on last access.
     bus_fault: bool,
     /// Address that caused the most recent bus fault.
@@ -433,6 +440,7 @@ impl Bus {
             pwm: PwmRegs::new(IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1),
             io_bank0: IoBank0Regs::new(),
             pads_bank0: PadsBank0Regs::new(),
+            dma: Dma::new(),
             active_core: 0,
             ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
             irq_pending: [0; 2],
@@ -951,6 +959,11 @@ impl Bus {
             self.pwm.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
         }
         self.raise_irqs_u64(ext_irqs);
+
+        // DMA ticks after peripherals produce DREQ (HLD V5 §5.6).
+        if !self.is_held_in_reset_bit(RESET_DMA) {
+            self.tick_dma();
+        }
     }
 
     /// Raise the IRQ lines encoded in `bits` via `assert_irq_shared`.
@@ -2009,6 +2022,7 @@ impl Bus {
                         PWM_BASE => self.pwm.read32(offset),
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
                         PADS_BANK0_BASE => self.pads_bank0.read32(offset),
+                        DMA_BASE => self.dma.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -2137,6 +2151,7 @@ impl Bus {
                         }
                         IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
                         PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
+                        DMA_BASE => self.dma.write32(offset, val, alias),
                         0x5020_0000 => self.pio[0].write32(offset, val, alias),
                         0x5030_0000 => self.pio[1].write32(offset, val, alias),
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),
@@ -2201,6 +2216,92 @@ impl Bus {
         if self.trace_enabled {
             self.emit_trace('W', 4, addr, val);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // DMA wiring (HLD V5 §5.6, Phase 3)
+    // -----------------------------------------------------------------
+
+    /// Snapshot every peripheral's DREQ condition into a 64-bit bitmap.
+    /// Bit positions follow `dreq.rs` constants — RP2350 datasheet
+    /// §12.6.4.2 Table 124. Called by `Dma::tick` before arbitration so
+    /// the DMA sees a consistent snapshot across all channels.
+    pub fn collect_dreqs(&self) -> u64 {
+        let mut bits = 0u64;
+
+        // PIO0 / PIO1 / PIO2 — four SM × (TX | RX) per block.
+        for sm in 0..4 {
+            if self.pio[0].tx_dreq(sm) {
+                bits |= 1u64 << (sm as u64);          // DREQ 0..3
+            }
+            if self.pio[0].rx_dreq(sm) {
+                bits |= 1u64 << (4 + sm as u64);      // DREQ 4..7
+            }
+            if self.pio[1].tx_dreq(sm) {
+                bits |= 1u64 << (8 + sm as u64);      // DREQ 8..11
+            }
+            if self.pio[1].rx_dreq(sm) {
+                bits |= 1u64 << (12 + sm as u64);     // DREQ 12..15
+            }
+            if self.pio[2].tx_dreq(sm) {
+                bits |= 1u64 << (16 + sm as u64);     // DREQ 16..19
+            }
+            if self.pio[2].rx_dreq(sm) {
+                bits |= 1u64 << (20 + sm as u64);     // DREQ 20..23
+            }
+        }
+
+        // SPI0 TX/RX (DREQ 24/25). SPI1 not modelled in V1.
+        if self.spi0.tx_dreq() {
+            bits |= 1u64 << 24;
+        }
+        if self.spi0.rx_dreq() {
+            bits |= 1u64 << 25;
+        }
+
+        // UART0 TX/RX (DREQ 28/29). UART1 not modelled in V1.
+        if self.uart0.tx_dreq() {
+            bits |= 1u64 << 28;
+        }
+        if self.uart0.rx_dreq() {
+            bits |= 1u64 << 29;
+        }
+
+        // PWM wrap DREQs (32..43) — one-shot-per-wrap, not modelled in V1.
+
+        // I2C0 TX/RX (DREQ 44/45). I2C1 not modelled in V1.
+        if self.i2c0.tx_dreq() {
+            bits |= 1u64 << 44;
+        }
+        if self.i2c0.rx_dreq() {
+            bits |= 1u64 << 45;
+        }
+
+        // ADC (DREQ 48).
+        if self.adc.dreq() {
+            bits |= 1u64 << 48;
+        }
+
+        // XIP stream/QMI (49..51), HSTX (52), CORESIGHT (53), SHA256 (54)
+        // — not modelled in V1.
+
+        // FORCE (bit 63) — always asserted.
+        bits |= 1u64 << 63;
+
+        bits
+    }
+
+    /// Drive the DMA by one cycle. Swaps the DMA out of `self` to avoid
+    /// cross-borrows while it issues transfers through the bus, then
+    /// restores it and routes any pending IRQs through `irq_pending`.
+    ///
+    /// Per HLD V5 §5.6 ordering contract: peripherals tick first (to
+    /// produce DREQ), then `tick_dma` consumes the snapshot.
+    pub fn tick_dma(&mut self) {
+        let mut dma = std::mem::take(&mut self.dma);
+        dma.tick(self);
+        dma.route_irqs(&mut self.irq_pending);
+        self.dma = dma;
     }
 }
 

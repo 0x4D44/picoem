@@ -304,7 +304,10 @@ fn read_ch_reg(bus: &mut Bus, ch: u32, reg: u32) -> u32 {
 }
 
 fn read_trig(bus: &mut Bus, ch: u32) -> u32 {
-    read_ch_reg(bus, ch, DMA_CH_CTRL_TRIG)
+    // Mask out BUSY (bit 24) and error bits (29..31) — the real DMA
+    // controller sets these status-only bits on readback and they must
+    // not perturb the GlueDma's change-detection logic.
+    read_ch_reg(bus, ch, DMA_CH_CTRL_TRIG) & 0x00FF_FFFF
 }
 
 /// Decode a PIO TXFn register address into `(pio_base, sm_index)`.

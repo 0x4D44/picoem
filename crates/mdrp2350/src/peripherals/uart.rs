@@ -192,6 +192,19 @@ impl UartRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    /// DREQ: TX FIFO has room and the UART is enabled. Consumed by the
+    /// RP2350 DMA matrix (Phase 3).
+    #[inline]
+    pub fn tx_dreq(&self) -> bool {
+        self.is_enabled() && self.tx_fifo.len() < self.tx_capacity()
+    }
+
+    /// DREQ: RX FIFO non-empty and UART enabled.
+    #[inline]
+    pub fn rx_dreq(&self) -> bool {
+        self.is_enabled() && !self.rx_fifo.is_empty()
+    }
+
     /// Enabled state: UARTEN bit in UARTCR.
     #[inline]
     fn is_enabled(&self) -> bool {

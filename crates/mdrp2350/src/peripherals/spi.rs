@@ -137,6 +137,18 @@ impl SpiRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    /// DREQ: TX FIFO has room and SSE=1.
+    #[inline]
+    pub fn tx_dreq(&self) -> bool {
+        self.is_enabled() && self.tx_fifo.len() < SSP_FIFO_DEPTH
+    }
+
+    /// DREQ: RX FIFO non-empty and SSE=1.
+    #[inline]
+    pub fn rx_dreq(&self) -> bool {
+        self.is_enabled() && !self.rx_fifo.is_empty()
+    }
+
     #[inline]
     fn is_enabled(&self) -> bool {
         (self.cr1 & SSPCR1_SSE) != 0

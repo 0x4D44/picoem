@@ -11,5 +11,8 @@
 !bootrom-combined.bin
 !bootrom.bin
 !bootrom-rp2040-b2.bin
+!hello_dma.bin
+!hello_pwm.bin
 !hello_timer.bin
+!hello_uart.bin
 !lcd_demo.bin

@@ -158,6 +158,13 @@ impl AdcRegs {
             && self.intr == 0
     }
 
+    /// DREQ: ADC FIFO non-empty and `FCS.DREQ_EN` is set. Consumed by
+    /// the DMA DREQ matrix (Phase 3).
+    #[inline]
+    pub fn dreq(&self) -> bool {
+        (self.fcs & FCS_DREQ_EN) != 0 && !self.fifo.is_empty()
+    }
+
     #[inline]
     fn is_enabled(&self) -> bool {
         (self.cs & CS_EN) != 0

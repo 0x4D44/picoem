@@ -1,5 +1,7 @@
 pub mod core;
 pub mod bus;
+pub mod dma;
+pub mod dreq;
 pub mod irq;
 pub mod memory;
 pub mod peripherals;

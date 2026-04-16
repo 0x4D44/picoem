@@ -140,6 +140,16 @@ impl PioBlock {
         self.sm[sm].rx_fifo.push(word)
     }
 
+    /// Test-only: pop a word from SM `sm`'s TX FIFO. Symmetric with
+    /// [`Self::push_rx`] — enables cross-crate tests that need to
+    /// verify TXF push values without reaching into `pub(crate)` state.
+    ///
+    /// Returns `None` if the FIFO is empty.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn pop_tx(&mut self, sm: usize) -> Option<u32> {
+        self.sm[sm].tx_fifo.pop()
+    }
+
     /// Enable or disable state machine `i`, maintaining the cached
     /// `sm_enabled_mask` invariant. Every enable-state transition
     /// re-merges pin outputs so that a just-disabled SM's stuck pin

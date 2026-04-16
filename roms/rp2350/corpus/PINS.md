@@ -26,13 +26,15 @@ Two classes of binaries live under this directory:
 | `roms/rp2350/hello_timer.bin` | `roms/rp2350/gen_hello_timer.py`      | 256 B | `4ce00917417410a9e0f20de5db20bcbf86171cc97910a3938dfbce3b7f10c582` |
 | `roms/rp2350/hello_uart.bin`  | `roms/rp2350/gen_hello_uart.py`       | 256 B | `2fb7f0a258c64f48120ffed8e4fdb362275efadda9f9251780f01c29a6599add` |
 | `roms/rp2350/hello_pwm.bin`   | `roms/rp2350/gen_hello_pwm.py`        | 256 B | `b1d0b59984cb856a1f7b324485f1a2985d97b480cec4c97a595f47cd860e0b6a` |
+| `roms/rp2350/hello_dma.bin`   | `roms/rp2350/gen_hello_dma.py`        | 190 B | `ad926ceb32f6b60d4f72d66c42d29650edf6a6d575edaf32bcd0bdb85678b334` |
 
-Regenerate all three via:
+Regenerate all four via:
 
 ```bash
 python3 roms/rp2350/gen_hello_timer.py
 python3 roms/rp2350/gen_hello_uart.py
 python3 roms/rp2350/gen_hello_pwm.py
+python3 roms/rp2350/gen_hello_dma.py
 ```
 
 Verify with:
@@ -40,7 +42,8 @@ Verify with:
 ```bash
 sha256sum roms/rp2350/hello_timer.bin \
           roms/rp2350/hello_uart.bin \
-          roms/rp2350/hello_pwm.bin
+          roms/rp2350/hello_pwm.bin \
+          roms/rp2350/hello_dma.bin
 ```
 
 If the hash differs from the table above, the generator and the binary

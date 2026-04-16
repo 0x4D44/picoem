@@ -851,6 +851,24 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe_pins: 0,
         custom_sled: None,
     },
+    // Phase 3 — DMA mem-to-mem 32-bit, 4 words (V5 §5.6).
+    PeriphScenario {
+        name: "dma_mem_to_mem_32bit",
+        setup: S_DMA_MEM_TO_MEM_32BIT,
+        max_sysclks: 500,
+        observe: O_DMA_MEM_TO_MEM_32BIT,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+    // Phase 3 — DMA chain trigger: ch0 → ch1 (V5 §5.6).
+    PeriphScenario {
+        name: "dma_chain_trigger",
+        setup: S_DMA_CHAIN_TRIGGER,
+        max_sysclks: 500,
+        observe: O_DMA_CHAIN_TRIGGER,
+        observe_pins: 0,
+        custom_sled: None,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1047,93 @@ const S_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[
 ];
 const O_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[
     (SHA256_CSR, SHA256_CSR_WFIFO_READY),
+];
+
+// ---------------------------------------------------------------------------
+// DMA scenarios — Phase 3 (HLD V5 §5.6)
+// ---------------------------------------------------------------------------
+
+/// DMA base (RP2350 §12.6, `0x5000_0000`).
+pub const DMA_BASE: u32 = 0x5000_0000;
+/// RESETS bit for DMA (§7.5, bit 2).
+pub const RESET_DMA_BIT: u32 = 1 << 2;
+/// DMA global INTR offset (§12.6.6).
+pub const DMA_INTR: u32 = DMA_BASE + 0x400;
+
+// S_DMA1: DMA mem-to-mem 32-bit, 4 words, DREQ_FORCE (ch0).
+// Setup: write 4 words at SRAM 0x2000_0100, configure DMA ch0
+// (READ_ADDR, WRITE_ADDR, TRANS_COUNT, CTRL_TRIG) with EN=1,
+// DATA_SIZE=2 (word), INCR_READ, INCR_WRITE, TREQ_SEL=63 (FORCE),
+// CHAIN_TO=0 (self = no chain). After max_sysclks, observe destination
+// SRAM at 0x2000_0300 and DMA INTR bit 0.
+//
+// CTRL_TRIG value breakdown:
+//   bit 0      : EN = 1
+//   bits [3:2] : DATA_SIZE = 2 (word)
+//   bit 4      : INCR_READ = 1
+//   bit 5      : INCR_WRITE = 1
+//   bits [20:15]: TREQ_SEL = 63 (0x3F)
+//   bits [14:11]: CHAIN_TO = 0
+//   → 0x001F_8039
+const S_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
+    // Seed source SRAM with 4 words.
+    (0x2000_0100, 0xDEAD_0001),
+    (0x2000_0104, 0xDEAD_0002),
+    (0x2000_0108, 0xDEAD_0003),
+    (0x2000_010C, 0xDEAD_0004),
+    // Program DMA ch0.
+    (DMA_BASE + 0x00, 0x2000_0100),  // READ_ADDR
+    (DMA_BASE + 0x04, 0x2000_0300),  // WRITE_ADDR
+    (DMA_BASE + 0x08, 4),            // TRANS_COUNT
+    (DMA_BASE + 0x0C, 0x001F_8039),  // CTRL_TRIG
+];
+const O_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
+    // All 4 destination words must match source.
+    (0x2000_0300, 0xFFFF_FFFF),
+    (0x2000_0304, 0xFFFF_FFFF),
+    (0x2000_0308, 0xFFFF_FFFF),
+    (0x2000_030C, 0xFFFF_FFFF),
+    // DMA INTR bit 0 must be set (transfer complete).
+    (DMA_INTR, 0x0000_0001),
+];
+
+// S_DMA2: DMA chain trigger — ch0 completes, chains to ch1.
+// Ch0: copy 1 word SRAM→SRAM, CHAIN_TO=1.
+// Ch1: pre-programmed (1 word SRAM→SRAM, no trigger).
+// After run, both INTR bits 0 and 1 must be set.
+//
+// Ch0 CTRL_TRIG: EN=1, DATA_SIZE=2, INCR_READ, INCR_WRITE,
+//   TREQ_SEL=63, CHAIN_TO=1.
+//   → 0x001F_8839  (CHAIN_TO=1 in bits [14:11] = 0x0800)
+//
+// Ch1 AL1_CTRL (no trigger): EN=1, DATA_SIZE=2, INCR_READ, INCR_WRITE,
+//   TREQ_SEL=63, CHAIN_TO=1 (self = no chain).
+//   → 0x001F_8839 at offset 0x40+0x10 (AL1_CTRL)
+const S_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
+    // Source data for ch0.
+    (0x2000_0400, 0xAAAA_0000),
+    // Source data for ch1.
+    (0x2000_0500, 0xBBBB_1111),
+    // Program ch1 first (no trigger — use AL1_CTRL at 0x40+0x10).
+    (DMA_BASE + 0x40 + 0x00, 0x2000_0500),  // ch1 READ_ADDR
+    (DMA_BASE + 0x40 + 0x04, 0x2000_0700),  // ch1 WRITE_ADDR
+    (DMA_BASE + 0x40 + 0x08, 1),            // ch1 TRANS_COUNT
+    (DMA_BASE + 0x40 + 0x10, 0x001F_8839),  // ch1 AL1_CTRL (no trigger)
+    // Program ch0 last (CTRL_TRIG triggers it).
+    (DMA_BASE + 0x00, 0x2000_0400),  // ch0 READ_ADDR
+    (DMA_BASE + 0x04, 0x2000_0600),  // ch0 WRITE_ADDR
+    (DMA_BASE + 0x08, 1),            // ch0 TRANS_COUNT
+    (DMA_BASE + 0x0C, 0x001F_8839),  // ch0 CTRL_TRIG (CHAIN_TO=1)
+];
+const O_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
+    // Ch0 destination.
+    (0x2000_0600, 0xFFFF_FFFF),
+    // Ch1 destination.
+    (0x2000_0700, 0xFFFF_FFFF),
+    // INTR bits 0 and 1 must be set.
+    (DMA_INTR, 0x0000_0003),
 ];
 
 /// Red-path catalogue. Selected by `silicon_periph_diff_rp2350
@@ -1608,7 +1713,8 @@ mod tests {
     use std::collections::HashSet;
 
     fn is_mmio(addr: u32) -> bool {
-        (0x4000_0000..0x6000_0000).contains(&addr)
+        (0x2000_0000..0x2008_0000).contains(&addr) // SRAM (for DMA src/dst seed)
+            || (0x4000_0000..0x6000_0000).contains(&addr)
             || (0xD000_0000..0xE000_0000).contains(&addr)
     }
 
