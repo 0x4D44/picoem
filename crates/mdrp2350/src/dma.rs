@@ -107,13 +107,17 @@ const CTRL_TREQ_SEL_MASK: u32 = 0x3F << CTRL_TREQ_SEL_SHIFT;
 const CTRL_IRQ_QUIET: u32 = 1 << 21;
 /// `BSWAP` (byte-swap) flag — not modelled in V1 (HLD V5 §5.6 "Not in
 /// V1"). Stored through CTRL RMW but ignored on transfer.
+// RP2350 datasheet §12.6 CH0_CTRL_TRIG bit positions (V5 fix 2026-04-16):
+// bit 24: BSWAP, bit 25: SNIFF_EN, bit 26: BUSY, bits[28:27]: reserved,
+// bit 29: WRITE_ERROR, bit 30: READ_ERROR, bit 31: AHB_ERROR.
+// Previous values were off by +2 (used bit 22/23/24 instead of 24/25/26).
 #[allow(dead_code)]
-const CTRL_BSWAP: u32 = 1 << 22;
+const CTRL_BSWAP: u32 = 1 << 24;
 /// `SNIFF_EN` — not modelled in V1 (no CRC). Stored but ignored.
 #[allow(dead_code)]
-const CTRL_SNIFF_EN: u32 = 1 << 23;
-const CTRL_BUSY: u32 = 1 << 24;
-// Bits [28:25] are reserved.
+const CTRL_SNIFF_EN: u32 = 1 << 25;
+const CTRL_BUSY: u32 = 1 << 26;
+// Bits [28:27] are reserved.
 const CTRL_WRITE_ERROR: u32 = 1 << 29;
 const CTRL_READ_ERROR: u32 = 1 << 30;
 const CTRL_AHB_ERROR: u32 = 1u32 << 31;
