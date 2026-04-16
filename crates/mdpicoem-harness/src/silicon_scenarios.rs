@@ -1199,35 +1199,41 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         min_sysclks: 2,
     },
     // Phase 3 — DMA mem-to-mem 32-bit, 4 words (V5 §5.6).
+    // CPU-bus sled rearchitecture (2026-04-16): sled seeds SRAM via CPU
+    // STRs, configures DMA ch0, triggers, and busy-polls CTRL_TRIG.BUSY.
     PeriphScenario {
         name: "dma_mem_to_mem_32bit",
         setup: S_DMA_MEM_TO_MEM_32BIT,
         max_sysclks: 500,
         observe: O_DMA_MEM_TO_MEM_32BIT,
         observe_pins: 0,
-        custom_sled: None,
+        custom_sled: Some(SLED_DMA_MEM_TO_MEM_32BIT),
         // 4-word DMA transfer -> at least 4 bus cycles.
         min_sysclks: 4,
     },
     // Phase 3 — DMA chain trigger: ch0 → ch1 (V5 §5.6).
+    // CPU-bus sled rearchitecture: sled seeds both source words, configures
+    // ch1 (via AL1_CTRL non-triggering alias), triggers ch0, polls both.
     PeriphScenario {
         name: "dma_chain_trigger",
         setup: S_DMA_CHAIN_TRIGGER,
         max_sysclks: 500,
         observe: O_DMA_CHAIN_TRIGGER,
         observe_pins: 0,
-        custom_sled: None,
+        custom_sled: Some(SLED_DMA_CHAIN_TRIGGER),
         // Two chained DMA transfers -> at least 8 bus cycles.
         min_sysclks: 8,
     },
     // Phase 3.3 — DMA timer-paced transfer: TREQ_SEL=59 (TIMER0), rate 1/10.
+    // CPU-bus sled rearchitecture: sled programs DMA_TIMER0, configures ch0
+    // with TREQ_SEL=59, triggers, and polls BUSY until transfer completes.
     PeriphScenario {
         name: "dma_timer_paced",
         setup: S_DMA_TIMER_PACED,
-        max_sysclks: 200,
+        max_sysclks: 500,
         observe: O_DMA_TIMER_PACED,
         observe_pins: 0,
-        custom_sled: None,
+        custom_sled: Some(SLED_DMA_TIMER_PACED),
         // 4 transfers at 1/10 rate → at least 40 sysclks.
         min_sysclks: 40,
     },
@@ -1500,35 +1506,27 @@ pub const RESET_DMA_BIT: u32 = 1 << 2;
 pub const DMA_INTR: u32 = DMA_BASE + 0x400;
 
 // S_DMA1: DMA mem-to-mem 32-bit, 4 words, DREQ_FORCE (ch0).
-// Setup: write 4 words at SRAM 0x2000_0100, configure DMA ch0
-// (READ_ADDR, WRITE_ADDR, TRANS_COUNT, CTRL_TRIG) with EN=1,
-// DATA_SIZE=2 (word), INCR_READ, INCR_WRITE, TREQ_SEL=63 (FORCE),
-// CHAIN_TO=0 (self = no chain). After max_sysclks, observe destination
-// SRAM at 0x2000_0300 and DMA INTR bit 0.
+//
+// CPU-bus sled rearchitecture (2026-04-16): DAP writes do not drive DMA
+// on silicon — the DMA controller's bus-master port never sees the DAP's
+// seed data and debug-halt clocks can gate DMA completion. The setup
+// table is now minimal (RESETS release only); a custom sled seeds SRAM
+// and drives DMA entirely through CPU stores, then busy-polls CTRL_TRIG
+// BUSY (bit 26) until the transfer completes.
 //
 // CTRL_TRIG value breakdown:
 //   bit 0      : EN = 1
 //   bits [3:2] : DATA_SIZE = 2 (word)
 //   bit 4      : INCR_READ = 1
 //   bit 5      : INCR_WRITE = 1
-//   bits [20:15]: TREQ_SEL = 63 (0x3F)
-//   bits [14:11]: CHAIN_TO = 0
+//   bits [20:15]: TREQ_SEL = 63 (0x3F, FORCE)
+//   bits [14:11]: CHAIN_TO = 0 (self)
 //   → 0x001F_8039
 const S_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
-    // Seed source SRAM with 4 words.
-    (0x2000_0100, 0xDEAD_0001),
-    (0x2000_0104, 0xDEAD_0002),
-    (0x2000_0108, 0xDEAD_0003),
-    (0x2000_010C, 0xDEAD_0004),
-    // Program DMA ch0.
-    (DMA_BASE + 0x00, 0x2000_0100),  // READ_ADDR
-    (DMA_BASE + 0x04, 0x2000_0300),  // WRITE_ADDR
-    (DMA_BASE + 0x08, 4),            // TRANS_COUNT
-    (DMA_BASE + 0x0C, 0x001F_8039),  // CTRL_TRIG
 ];
 const O_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
-    // All 4 destination words must match source.
+    // All 4 destination words must match source (seeded 0xDEAD_0001..4).
     (0x2000_0300, 0xFFFF_FFFF),
     (0x2000_0304, 0xFFFF_FFFF),
     (0x2000_0308, 0xFFFF_FFFF),
@@ -1537,50 +1535,245 @@ const O_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
     (DMA_INTR, 0x0000_0001),
 ];
 
+// Sled: seed 4 words at 0x2000_0100 (0xDEAD_0001..4), configure DMA
+// ch0 for SRAM→SRAM copy, trigger via CTRL_TRIG write, poll BUSY clear.
+//
+// Register assignments (all caller-saved):
+//   r0 — word value (initialised to 0xDEAD_0001, incremented per word)
+//   r1 — DMA_BASE (0x5000_0000), then reused for CTRL_TRIG poll
+//   r3 — BUSY mask (0x0400_0000 = bit 26)
+//   r4 — address / config scratch
+//   r5 — source SRAM address (0x2000_0100)
+//
+// Thumb-2 encodings — all ARMv8-M Thumb (see
+// crates/mdpicoem-harness/src/silicon_scenarios.rs sled comment block):
+//   movw T3 / movt T1 / movs T1 / adds T2 / str T1 / ldr T1 /
+//   lsls T1 / tst T1 / bne T1 / bkpt T1.
+//
+// Busy-poll loop (halfwords [37..39]):
+//   [37] ldr  r2, [r1, #0x0C]  ; read CH0_CTRL_TRIG
+//   [38] tst  r2, r3           ; test BUSY (bit 26)
+//   [39] bne  [37]             ; imm8=-4 → D1FC; loop if busy
+// B<cond> T1: target=PC+4+SignExtend(imm8,8)*2. [39] at byte 78.
+// PC = byte78+4=byte82. target=sled+74 ([37]). imm8=(74-82)/2=-4=0xFC.
+#[rustfmt::skip]
+const SLED_DMA_MEM_TO_MEM_32BIT_HW: [u16; 41] = [
+    // ---- seed source SRAM (r0 = 0xDEAD_0001, r5 = 0x2000_0100) -----------
+    0x2001, //  [ 0] movs r0, #1
+    0xF6CD, //  [ 1] movt r0, #0xDEAD hw0   (imm4=D,i=1,imm3=6,imm8=AD)
+    0x60AD, //  [ 2] movt r0, #0xDEAD hw1   (Rd=0)
+    0xF240, //  [ 3] movw r5, #0x0100 hw0
+    0x1500, //  [ 4] movw r5, #0x0100 hw1   (imm3=1,Rd=5,imm8=00)
+    0xF2C2, //  [ 5] movt r5, #0x2000 hw0
+    0x0500, //  [ 6] movt r5, #0x2000 hw1   (Rd=5)
+    0x6028, //  [ 7] str  r0, [r5, #0]      ; src[0]=0xDEAD_0001
+    0x3001, //  [ 8] adds r0, r0, #1
+    0x6068, //  [ 9] str  r0, [r5, #4]      ; src[1]=0xDEAD_0002
+    0x3001, //  [10] adds r0, r0, #1
+    0x60A8, //  [11] str  r0, [r5, #8]      ; src[2]=0xDEAD_0003
+    0x3001, //  [12] adds r0, r0, #1
+    0x60E8, //  [13] str  r0, [r5, #12]     ; src[3]=0xDEAD_0004
+    // ---- build DMA_BASE in r1 (0x5000_0000) --------------------------------
+    0xF240, //  [14] movw r1, #0x0000 hw0
+    0x0100, //  [15] movw r1, #0x0000 hw1   (Rd=1)
+    0xF2C5, //  [16] movt r1, #0x5000 hw0
+    0x0100, //  [17] movt r1, #0x5000 hw1   (Rd=1)
+    // ---- program CH0_READ_ADDR = 0x2000_0100 (in r4) -----------------------
+    0xF240, //  [18] movw r4, #0x0100 hw0
+    0x1400, //  [19] movw r4, #0x0100 hw1   (Rd=4)
+    0xF2C2, //  [20] movt r4, #0x2000 hw0
+    0x0400, //  [21] movt r4, #0x2000 hw1   (Rd=4)
+    0x600C, //  [22] str  r4, [r1, #0]      ; CH0_READ_ADDR
+    // ---- program CH0_WRITE_ADDR = 0x2000_0300 (in r4) ----------------------
+    0xF240, //  [23] movw r4, #0x0300 hw0
+    0x3400, //  [24] movw r4, #0x0300 hw1   (imm3=3,Rd=4)
+    0xF2C2, //  [25] movt r4, #0x2000 hw0
+    0x0400, //  [26] movt r4, #0x2000 hw1
+    0x604C, //  [27] str  r4, [r1, #4]      ; CH0_WRITE_ADDR  (imm5=1)
+    // ---- program CH0_TRANS_COUNT = 4 ----------------------------------------
+    0x2404, //  [28] movs r4, #4
+    0x608C, //  [29] str  r4, [r1, #8]      ; CH0_TRANS_COUNT (imm5=2)
+    // ---- program CH0_CTRL_TRIG = 0x001F_8039 (triggers transfer) -----------
+    0xF248, //  [30] movw r4, #0x8039 hw0   (imm4=8,i=0,imm3=0,imm8=39)
+    0x0439, //  [31] movw r4, #0x8039 hw1   (Rd=4)
+    0xF2C0, //  [32] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
+    0x041F, //  [33] movt r4, #0x001F hw1   (Rd=4, imm3=0)
+    0x60CC, //  [34] str  r4, [r1, #0x0C]   ; CH0_CTRL_TRIG   (imm5=3)
+    // ---- build BUSY mask in r3 (bit 26 = 0x0400_0000) ----------------------
+    0x2301, //  [35] movs r3, #1
+    0x069B, //  [36] lsls r3, r3, #26       ; r3 = 0x0400_0000
+    // ---- busy-poll loop (target=[37], bne imm8=-4 = 0xFC) ------------------
+    // B<cond> T1: target = PC + 4 + SignExtend(imm8,8)*2.
+    // [39] is at byte 78 from sled start. PC = byte78 + 4 = byte 82.
+    // Target = sled + 74 (halfword [37] = ldr r2,...).
+    // imm8 = (74 - 82) / 2 = -4 = 0xFC.
+    0x68CA, //  [37] ldr  r2, [r1, #0x0C]   ; read CH0_CTRL_TRIG (imm5=3)
+    0x421A, //  [38] tst  r2, r3            ; test BUSY
+    0xD1FC, //  [39] bne  [37]              ; loop while BUSY set
+    0xBE00, //  [40] bkpt #0
+];
+const SLED_DMA_MEM_TO_MEM_32BIT: &[u8] =
+    &halfwords_to_le_bytes::<41, 82>(SLED_DMA_MEM_TO_MEM_32BIT_HW);
+
 // S_DMA2: DMA chain trigger — ch0 completes, chains to ch1.
-// Ch0: copy 1 word SRAM→SRAM, CHAIN_TO=1.
-// Ch1: pre-programmed (1 word SRAM→SRAM, no trigger).
-// After run, both INTR bits 0 and 1 must be set.
+//
+// CPU-bus sled rearchitecture (same rationale as S_DMA1). Setup table
+// releases DMA from reset only. Sled seeds both source words via CPU
+// STRs, programs ch1 (via AL1_CTRL — non-triggering alias at +0x50),
+// then programs ch0 CTRL_TRIG (triggers). Poll ch0 BUSY until clear
+// (chain arms ch1 automatically on ch0 completion), then poll ch1 BUSY.
 //
 // Ch0 CTRL_TRIG: EN=1, DATA_SIZE=2, INCR_READ, INCR_WRITE,
 //   TREQ_SEL=63, CHAIN_TO=1.
 //   → 0x001F_8839  (CHAIN_TO=1 in bits [14:11] = 0x0800)
 //
-// Ch1 AL1_CTRL (no trigger): EN=1, DATA_SIZE=2, INCR_READ, INCR_WRITE,
-//   TREQ_SEL=63, CHAIN_TO=1 (self = no chain).
-//   → 0x001F_8839 at offset 0x40+0x10 (AL1_CTRL)
+// Ch1 AL1_CTRL (non-triggering alias at DMA_BASE+0x050):
+//   EN=1, DATA_SIZE=2, INCR_READ, INCR_WRITE, TREQ_SEL=63, CHAIN_TO=1
+//   (self = no further chain).
+//   → 0x001F_8839
 const S_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
-    // Source data for ch0.
-    (0x2000_0400, 0xAAAA_0000),
-    // Source data for ch1.
-    (0x2000_0500, 0xBBBB_1111),
-    // Program ch1 first (no trigger — use AL1_CTRL at 0x40+0x10).
-    (DMA_BASE + 0x40 + 0x00, 0x2000_0500),  // ch1 READ_ADDR
-    (DMA_BASE + 0x40 + 0x04, 0x2000_0700),  // ch1 WRITE_ADDR
-    (DMA_BASE + 0x40 + 0x08, 1),            // ch1 TRANS_COUNT
-    (DMA_BASE + 0x40 + 0x10, 0x001F_8839),  // ch1 AL1_CTRL (no trigger)
-    // Program ch0 last (CTRL_TRIG triggers it).
-    (DMA_BASE + 0x00, 0x2000_0400),  // ch0 READ_ADDR
-    (DMA_BASE + 0x04, 0x2000_0600),  // ch0 WRITE_ADDR
-    (DMA_BASE + 0x08, 1),            // ch0 TRANS_COUNT
-    (DMA_BASE + 0x0C, 0x001F_8839),  // ch0 CTRL_TRIG (CHAIN_TO=1)
 ];
 const O_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
-    // Ch0 destination.
+    // Ch0 destination (0x2000_0600 ← 0xAAAA_0000).
     (0x2000_0600, 0xFFFF_FFFF),
-    // Ch1 destination.
+    // Ch1 destination (0x2000_0700 ← 0xBBBB_1111).
     (0x2000_0700, 0xFFFF_FFFF),
-    // INTR bits 0 and 1 must be set.
+    // INTR bits 0 and 1 must be set (both transfers complete).
     (DMA_INTR, 0x0000_0003),
 ];
 
+// Sled for dma_chain_trigger.
+//
+// Register assignments:
+//   r0 — word value scratch
+//   r1 — DMA_BASE (0x5000_0000)
+//   r2 — temp (CTRL_TRIG readback)
+//   r3 — BUSY mask (0x0400_0000)
+//   r4 — config / address scratch
+//   r5 — source/dest address scratch
+//
+// Register layout of DMA channels from DMA_BASE (r1):
+//   ch0: +0x00=READ_ADDR, +0x04=WRITE_ADDR, +0x08=TRANS_COUNT, +0x0C=CTRL_TRIG
+//   ch1: +0x40=READ_ADDR, +0x44=WRITE_ADDR, +0x48=TRANS_COUNT, +0x50=AL1_CTRL,
+//        +0x4C=CTRL_TRIG (written by ch0's chain completion, not the sled)
+//
+// Halfword index breakdown:
+//   [0..5]   seed ch0 source word (0xAAAA_0000) at 0x2000_0400
+//   [6..11]  seed ch1 source word (0xBBBB_1111) at 0x2000_0500
+//   [12..17] build DMA_BASE in r1
+//   [18..27] configure ch1 via non-triggering AL1 alias
+//   [28..37] configure ch0 CTRL_TRIG (triggers ch0, chains to ch1)
+//   [38..40] build BUSY mask in r3
+//   [41..43] poll ch0 BUSY (loop until ch0 complete → chain arms ch1)
+//   [44..46] poll ch1 BUSY (loop until ch1 complete)
+//   [47]     bkpt #0
+//
+// Key encodings:
+//   0xAAAA_0000: movs r0,#0 / movt r0,#0xAAAA
+//     movt r0,#0xAAAA: 0xAAAA→imm4=A,i=1,imm3=2,imm8=AA
+//       hw0=F2C0|(1<<10)|0xA=F6CA, hw1=(2<<12)|(0<<8)|0xAA=0x20AA
+//   0xBBBB_1111: movw r0,#0x1111 / movt r0,#0xBBBB
+//     movw r0,#0x1111: imm4=1,i=0,imm3=1,imm8=11 → hw0=F241, hw1=0x1011
+//     movt r0,#0xBBBB: imm4=B,i=1,imm3=3,imm8=BB → hw0=F6CB, hw1=0x30BB
+//   0x8839: imm4=8,i=1 (bit11 of 0x8839=1000_1000... bit11=1),imm3=0,imm8=39
+//     Verify: 0x8839=1000_1000_0011_1001. bit15..12=1000=8, bit11=1(i), bit10..8=000(imm3=0), bit7..0=0x39
+//     hw0=F240|(1<<10)|8=F648, hw1=(Rd<<8)|0x39
+//   0x001F for movt high: imm4=0,i=0,imm3=0,imm8=1F → hw0=F2C0, hw1=(Rd<<8)|0x1F
+//   str r4,[r1,#0x40] imm5=16: 0x6000|(16<<6)|(1<<3)|4=0x640C
+//   str r4,[r1,#0x44] imm5=17: 0x6000|(17<<6)|(1<<3)|4=0x644C
+//   str r4,[r1,#0x48] imm5=18: 0x6000|(18<<6)|(1<<3)|4=0x648C
+//   str r4,[r1,#0x50] imm5=20: 0x6000|(20<<6)|(1<<3)|4=0x650C
+//   ldr r2,[r1,#0x4C] imm5=19: 0x6800|(19<<6)|(1<<3)|2=0x6CCA (poll ch1)
+#[rustfmt::skip]
+const SLED_DMA_CHAIN_TRIGGER_HW: [u16; 64] = [
+    // ---- seed ch0 source: 0xAAAA_0000 → 0x2000_0400 ----------------------
+    0x2000, //  [ 0] movs r0, #0
+    0xF6CA, //  [ 1] movt r0, #0xAAAA hw0
+    0x20AA, //  [ 2] movt r0, #0xAAAA hw1   (Rd=0)
+    0xF240, //  [ 3] movw r5, #0x0400 hw0   (imm3=4,Rd=5)
+    0x4500, //  [ 4] movw r5, #0x0400 hw1
+    0xF2C2, //  [ 5] movt r5, #0x2000 hw0
+    0x0500, //  [ 6] movt r5, #0x2000 hw1
+    0x6028, //  [ 7] str  r0, [r5, #0]      ; ch0 src word
+    // ---- seed ch1 source: 0xBBBB_1111 → 0x2000_0500 ----------------------
+    0xF241, //  [ 8] movw r0, #0x1111 hw0   (imm4=1,i=0,imm3=1,imm8=11)
+    0x1011, //  [ 9] movw r0, #0x1111 hw1   (Rd=0)
+    0xF6CB, //  [10] movt r0, #0xBBBB hw0   (imm4=B,i=1,imm3=3,imm8=BB)
+    0x30BB, //  [11] movt r0, #0xBBBB hw1   (Rd=0)
+    0xF240, //  [12] movw r5, #0x0500 hw0   (imm3=5,Rd=5)
+    0x5500, //  [13] movw r5, #0x0500 hw1
+    0xF2C2, //  [14] movt r5, #0x2000 hw0
+    0x0500, //  [15] movt r5, #0x2000 hw1
+    0x6028, //  [16] str  r0, [r5, #0]      ; ch1 src word
+    // ---- build DMA_BASE in r1 (0x5000_0000) --------------------------------
+    0xF240, //  [17] movw r1, #0x0000 hw0
+    0x0100, //  [18] movw r1, #0x0000 hw1
+    0xF2C5, //  [19] movt r1, #0x5000 hw0
+    0x0100, //  [20] movt r1, #0x5000 hw1
+    // ---- configure ch1 via non-triggering AL1_CTRL (at +0x50) ------------
+    0xF240, //  [21] movw r4, #0x0500 hw0   ; ch1 READ_ADDR = 0x2000_0500
+    0x5400, //  [22] movw r4, #0x0500 hw1   (Rd=4)
+    0xF2C2, //  [23] movt r4, #0x2000 hw0
+    0x0400, //  [24] movt r4, #0x2000 hw1
+    0x640C, //  [25] str  r4, [r1, #0x40]   ; CH1_READ_ADDR  (imm5=16)
+    0xF240, //  [26] movw r4, #0x0700 hw0   ; ch1 WRITE_ADDR = 0x2000_0700
+    0x7400, //  [27] movw r4, #0x0700 hw1   (imm3=7,Rd=4)
+    0xF2C2, //  [28] movt r4, #0x2000 hw0
+    0x0400, //  [29] movt r4, #0x2000 hw1
+    0x644C, //  [30] str  r4, [r1, #0x44]   ; CH1_WRITE_ADDR (imm5=17)
+    0x2401, //  [31] movs r4, #1            ; ch1 TRANS_COUNT=1
+    0x648C, //  [32] str  r4, [r1, #0x48]   ; CH1_TRANS_COUNT (imm5=18)
+    0xF648, //  [33] movw r4, #0x8839 hw0   ; ch1 ctrl: EN,DATA_SIZE=2,INCR,TREQ=63,CHAIN_TO=1
+    0x4439, //  [34] movw r4, #0x8839 hw1   (Rd=4)
+    0xF2C0, //  [35] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
+    0x041F, //  [36] movt r4, #0x001F hw1   (Rd=4, imm3=0)
+    0x650C, //  [37] str  r4, [r1, #0x50]   ; CH1_AL1_CTRL   (imm5=20)
+    // ---- configure ch0 and trigger (CTRL_TRIG at +0x0C) -------------------
+    0xF240, //  [38] movw r4, #0x0400 hw0   ; ch0 READ_ADDR = 0x2000_0400
+    0x4400, //  [39] movw r4, #0x0400 hw1   (imm3=4,Rd=4)
+    0xF2C2, //  [40] movt r4, #0x2000 hw0
+    0x0400, //  [41] movt r4, #0x2000 hw1
+    0x600C, //  [42] str  r4, [r1, #0]      ; CH0_READ_ADDR
+    0xF240, //  [43] movw r4, #0x0600 hw0   ; ch0 WRITE_ADDR = 0x2000_0600
+    0x6400, //  [44] movw r4, #0x0600 hw1   (imm3=6,Rd=4)
+    0xF2C2, //  [45] movt r4, #0x2000 hw0
+    0x0400, //  [46] movt r4, #0x2000 hw1
+    0x604C, //  [47] str  r4, [r1, #4]      ; CH0_WRITE_ADDR (imm5=1)
+    0x2401, //  [48] movs r4, #1            ; ch0 TRANS_COUNT=1
+    0x608C, //  [49] str  r4, [r1, #8]      ; CH0_TRANS_COUNT (imm5=2)
+    0xF648, //  [50] movw r4, #0x8839 hw0   ; ch0 ctrl: CHAIN_TO=1
+    0x4439, //  [51] movw r4, #0x8839 hw1   (Rd=4)
+    0xF2C0, //  [52] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
+    0x041F, //  [53] movt r4, #0x001F hw1   (Rd=4, imm3=0)
+    0x60CC, //  [54] str  r4, [r1, #0x0C]   ; CH0_CTRL_TRIG → triggers ch0
+    // ---- BUSY mask: r3 = bit 26 (0x0400_0000) ------------------------------
+    0x2301, //  [55] movs r3, #1
+    0x069B, //  [56] lsls r3, r3, #26
+    // ---- poll ch0 BUSY (ch0 chains to ch1 on completion) ------------------
+    // B<cond> T1: target = PC + 4 + SignExtend(imm8,8)*2.
+    // [59] at byte 118. PC = byte118 + 4 = byte 122. Target = byte 114 ([57]).
+    // imm8 = (114 - 122) / 2 = -4 = 0xFC.
+    0x68CA, //  [57] ldr  r2, [r1, #0x0C]   ; read CH0_CTRL_TRIG (imm5=3)
+    0x421A, //  [58] tst  r2, r3
+    0xD1FC, //  [59] bne  [57]              ; imm8=-4 → loop while ch0 busy
+    // ---- poll ch1 BUSY at +0x4C (imm5=19) ---------------------------------
+    // [62] at byte 124. PC = byte124 + 4 = byte 128. Target = byte 120 ([60]).
+    // imm8 = (120 - 128) / 2 = -4 = 0xFC.
+    0x6CCA, //  [60] ldr  r2, [r1, #0x4C]   ; read CH1_CTRL_TRIG
+    0x421A, //  [61] tst  r2, r3
+    0xD1FC, //  [62] bne  [60]              ; imm8=-4 → loop while ch1 busy
+    0xBE00, //  [63] bkpt #0
+];
+const SLED_DMA_CHAIN_TRIGGER: &[u8] =
+    &halfwords_to_le_bytes::<64, 128>(SLED_DMA_CHAIN_TRIGGER_HW);
+
 // S_DMA3: DMA timer-paced transfer — TREQ_SEL=59 (TIMER0), rate 1/10.
-// DMA channel 0 performs a 4-word mem-to-mem transfer gated by the
-// DMA-internal TIMER0 (TREQ 59). TIMER0 register = (1 << 16) | 10
-// meaning the accumulator adds 1 per sysclk and fires when it reaches
-// 10, i.e. once every 10 system clocks. Four transfers require ~40
-// sysclks; 200 gives headroom.
+//
+// CPU-bus sled rearchitecture (same rationale as S_DMA1). Setup table
+// releases DMA from reset only. Sled seeds SRAM, programs DMA_TIMER0
+// (0x5000_0420, X=1/Y=10 → fires every 10 sysclks), configures ch0
+// (TREQ_SEL=59), triggers, and polls BUSY until complete.
 //
 // CTRL_TRIG value breakdown:
 //   bit 0      : EN = 1
@@ -1588,27 +1781,15 @@ const O_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
 //   bit 4      : INCR_READ = 1
 //   bit 5      : INCR_WRITE = 1
 //   bits [20:15]: TREQ_SEL = 59 (0x3B)
-//   bits [14:11]: CHAIN_TO = 0
+//   bits [14:11]: CHAIN_TO = 0 (self)
 //   → 0x001D_8039
 /// DMA TIMER0 register absolute address (DMA_BASE + 0x420).
 pub const DMA_TIMER0: u32 = DMA_BASE + 0x420;
 const S_DMA_TIMER_PACED: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
-    // Seed source SRAM with 4 words.
-    (0x2000_0A00, 0xCAFE_0001),
-    (0x2000_0A04, 0xCAFE_0002),
-    (0x2000_0A08, 0xCAFE_0003),
-    (0x2000_0A0C, 0xCAFE_0004),
-    // Program DMA TIMER0: X=1, Y=10 → fire every 10 sysclks.
-    (DMA_TIMER0, (1u32 << 16) | 10),
-    // Program DMA ch0.
-    (DMA_BASE + 0x00, 0x2000_0A00),  // READ_ADDR
-    (DMA_BASE + 0x04, 0x2000_0B00),  // WRITE_ADDR
-    (DMA_BASE + 0x08, 4),            // TRANS_COUNT
-    (DMA_BASE + 0x0C, 0x001D_8039),  // CTRL_TRIG (TREQ_SEL=59)
 ];
 const O_DMA_TIMER_PACED: &[(u32, u32)] = &[
-    // All 4 destination words must match source.
+    // All 4 destination words must match source (seeded 0xCAFE_0001..4).
     (0x2000_0B00, 0xFFFF_FFFF),
     (0x2000_0B04, 0xFFFF_FFFF),
     (0x2000_0B08, 0xFFFF_FFFF),
@@ -1616,6 +1797,97 @@ const O_DMA_TIMER_PACED: &[(u32, u32)] = &[
     // DMA INTR bit 0 must be set (transfer complete).
     (DMA_INTR, 0x0000_0001),
 ];
+
+// Sled for dma_timer_paced.
+//
+// Register assignments:
+//   r0 — word value (0xCAFE_0001, incremented)
+//   r1 — DMA_BASE (0x5000_0000)
+//   r2 — DMA_TIMER0 address scratch / CTRL_TRIG readback
+//   r3 — BUSY mask (0x0400_0000)
+//   r4 — config / address scratch
+//   r5 — source SRAM address (0x2000_0A00)
+//
+// DMA_TIMER0 = 0x5000_0420 — cannot reach with a simple [r1,#imm5*4]
+// (0x420/4=264 > imm5_max=31), so we build the address in r2 explicitly
+// and use str r4,[r2,#0].
+//
+// Key encodings:
+//   MOVW T3: imm16={imm4,i,imm3,imm8}; hw0=F240|(i<<10)|imm4, hw1=(imm3<<12)|(Rd<<8)|imm8
+//   hw1 bit15 MUST be 0; values ≥0x0800 set i=1 in hw0 (→0xF640+imm4).
+//   0x0A00={imm4=0,i=1,imm3=2,imm8=0x00} → hw0=F640, hw1=(2<<12)|(Rd<<8)
+//   0x0B00={imm4=0,i=1,imm3=3,imm8=0x00} → hw0=F640, hw1=(3<<12)|(Rd<<8)
+//   0x0420={imm4=0,i=0,imm3=4,imm8=0x20} → hw0=F240, hw1=(4<<12)|(Rd<<8)|0x20
+//   0xCAFE={imm4=C,i=1,imm3=2,imm8=FE} → hw0=F6CC(MOVT hw0=F2C0+0x0400+0xC), hw1=0x2xFE
+//   0x001D={imm4=0,i=0,imm3=1,imm8=1D} → MOVT hw0=F2C0, hw1=(1<<12)|(Rd<<8)|0x1D
+//   DMA_TIMER0 value 0x0001_000A: movs r4,#0x0A; movt r4,#0x0001
+//     movt #0x0001: imm4=0,i=0,imm3=0,imm8=1 → hw0=F2C0, hw1=(Rd<<8)|1
+#[rustfmt::skip]
+const SLED_DMA_TIMER_PACED_HW: [u16; 49] = [
+    // ---- seed source SRAM (r0 = 0xCAFE_0001, r5 = 0x2000_0A00) -----------
+    0x2001, //  [ 0] movs r0, #1
+    0xF6CC, //  [ 1] movt r0, #0xCAFE hw0   (imm4=C,i=1,imm3=2,imm8=FE)
+    0x20FE, //  [ 2] movt r0, #0xCAFE hw1   (Rd=0)
+    0xF640, //  [ 3] movw r5, #0x0A00 hw0   (i=1,imm4=0 → F240|(1<<10)=F640)
+    0x2500, //  [ 4] movw r5, #0x0A00 hw1   (imm3=2,Rd=5,imm8=00)
+    0xF2C2, //  [ 5] movt r5, #0x2000 hw0
+    0x0500, //  [ 6] movt r5, #0x2000 hw1
+    0x6028, //  [ 7] str  r0, [r5, #0]      ; src[0]=0xCAFE_0001
+    0x3001, //  [ 8] adds r0, r0, #1
+    0x6068, //  [ 9] str  r0, [r5, #4]      ; src[1]=0xCAFE_0002
+    0x3001, //  [10] adds r0, r0, #1
+    0x60A8, //  [11] str  r0, [r5, #8]      ; src[2]=0xCAFE_0003
+    0x3001, //  [12] adds r0, r0, #1
+    0x60E8, //  [13] str  r0, [r5, #12]     ; src[3]=0xCAFE_0004
+    // ---- build DMA_BASE in r1 (0x5000_0000) --------------------------------
+    0xF240, //  [14] movw r1, #0x0000 hw0
+    0x0100, //  [15] movw r1, #0x0000 hw1
+    0xF2C5, //  [16] movt r1, #0x5000 hw0
+    0x0100, //  [17] movt r1, #0x5000 hw1
+    // ---- write DMA_TIMER0 = 0x0001_000A (r2 = 0x5000_0420) ---------------
+    0xF240, //  [18] movw r2, #0x0420 hw0   (imm3=4,imm8=0x20)
+    0x4220, //  [19] movw r2, #0x0420 hw1   (Rd=2)
+    0xF2C5, //  [20] movt r2, #0x5000 hw0
+    0x0200, //  [21] movt r2, #0x5000 hw1   (Rd=2)
+    0x240A, //  [22] movs r4, #0x0A         ; r4 low = 10 (Y=10)
+    0xF2C0, //  [23] movt r4, #0x0001 hw0   (imm4=0,i=0,imm3=0,imm8=1)
+    0x0401, //  [24] movt r4, #0x0001 hw1   (Rd=4, r4=0x0001_000A)
+    0x6014, //  [25] str  r4, [r2, #0]      ; DMA_TIMER0 = (X=1)<<16|(Y=10)
+    // ---- program CH0_READ_ADDR = 0x2000_0A00 --------------------------------
+    0xF640, //  [26] movw r4, #0x0A00 hw0   (i=1,imm4=0 → F640)
+    0x2400, //  [27] movw r4, #0x0A00 hw1   (imm3=2,Rd=4,imm8=00)
+    0xF2C2, //  [28] movt r4, #0x2000 hw0
+    0x0400, //  [29] movt r4, #0x2000 hw1
+    0x600C, //  [30] str  r4, [r1, #0]      ; CH0_READ_ADDR
+    // ---- program CH0_WRITE_ADDR = 0x2000_0B00 --------------------------------
+    0xF640, //  [31] movw r4, #0x0B00 hw0   (i=1,imm4=0 → F640)
+    0x3400, //  [32] movw r4, #0x0B00 hw1   (imm3=3,Rd=4,imm8=00)
+    0xF2C2, //  [33] movt r4, #0x2000 hw0
+    0x0400, //  [34] movt r4, #0x2000 hw1
+    0x604C, //  [35] str  r4, [r1, #4]      ; CH0_WRITE_ADDR (imm5=1)
+    // ---- program CH0_TRANS_COUNT = 4 -----------------------------------------
+    0x2404, //  [36] movs r4, #4
+    0x608C, //  [37] str  r4, [r1, #8]      ; CH0_TRANS_COUNT (imm5=2)
+    // ---- program CH0_CTRL_TRIG = 0x001D_8039 (TREQ_SEL=59, triggers) -------
+    0xF248, //  [38] movw r4, #0x8039 hw0   (imm4=8,i=0,imm3=0,imm8=39)
+    0x0439, //  [39] movw r4, #0x8039 hw1   (Rd=4)
+    0xF2C0, //  [40] movt r4, #0x001D hw0   (imm4=0,i=0,imm3=1,imm8=1D)
+    0x041D, //  [41] movt r4, #0x001D hw1   (Rd=4)
+    0x60CC, //  [42] str  r4, [r1, #0x0C]   ; CH0_CTRL_TRIG → triggers
+    // ---- BUSY mask in r3 (bit 26) -------------------------------------------
+    0x2301, //  [43] movs r3, #1
+    0x069B, //  [44] lsls r3, r3, #26
+    // ---- busy-poll loop (target=[45]) ----------------------------------------
+    // B<cond> T1: target = PC + 4 + SignExtend(imm8,8)*2.
+    // [47] at byte 94. PC = byte94 + 4 = byte 98. Target = byte 90 ([45]).
+    // imm8 = (90 - 98) / 2 = -4 = 0xFC.
+    0x68CA, //  [45] ldr  r2, [r1, #0x0C]   ; read CH0_CTRL_TRIG
+    0x421A, //  [46] tst  r2, r3
+    0xD1FC, //  [47] bne  [45]              ; imm8=-4 → loop while BUSY
+    0xBE00, //  [48] bkpt #0
+];
+const SLED_DMA_TIMER_PACED: &[u8] =
+    &halfwords_to_le_bytes::<49, 98>(SLED_DMA_TIMER_PACED_HW);
 
 /// Red-path catalogue. Selected by `silicon_periph_diff_rp2350
 /// --red-path` (mutually exclusive with the default catalogue).
@@ -1674,6 +1946,7 @@ const BKPT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, Default)]
 pub struct PeriphArgs {
     pub filter: Option<String>,
+    pub exclude: Option<String>,
     pub verbose: bool,
 }
 
@@ -2144,6 +2417,7 @@ pub fn run_against(
         None => SCENARIOS
             .iter()
             .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
+            .filter(|s| !silicon_oracle::name_matches_exclude(s.name, args.exclude.as_deref()))
             .collect(),
         Some(names) => {
             let mut v: Vec<&PeriphScenario> = Vec::with_capacity(names.len());
@@ -2398,6 +2672,18 @@ mod tests {
             validate_custom_sled(SLED_TIMER1_ALARM0_FIRE_AND_CLEAR).is_ok(),
             "timer1_alarm0_fire_and_clear sled must validate",
         );
+        assert!(
+            validate_custom_sled(SLED_DMA_MEM_TO_MEM_32BIT).is_ok(),
+            "dma_mem_to_mem_32bit sled must validate",
+        );
+        assert!(
+            validate_custom_sled(SLED_DMA_CHAIN_TRIGGER).is_ok(),
+            "dma_chain_trigger sled must validate",
+        );
+        assert!(
+            validate_custom_sled(SLED_DMA_TIMER_PACED).is_ok(),
+            "dma_timer_paced sled must validate",
+        );
     }
 
     // ---- Catalogue presence tests for Stage 4 scenarios -----------------
@@ -2492,6 +2778,9 @@ mod tests {
             "ticks_timer0_retarget_halves_rate",
             "sio_mtime_count_and_match",
             "timer1_alarm0_fire_and_clear",
+            "dma_mem_to_mem_32bit",
+            "dma_chain_trigger",
+            "dma_timer_paced",
         ]
         .into_iter()
         .collect();
@@ -2724,6 +3013,86 @@ mod tests {
             !(sc.min_sysclks > 0 && actual_sysclks < sc.min_sysclks),
             "min_sysclks=0 must never trigger the warning",
         );
+    }
+
+    // ---- DMA sled emulator verification ------------------------------------
+    //
+    // Each test below loads the sled into SILICON_RUN_SLED, runs the
+    // emulator's CPU (core 0) to completion (BKPT), then checks that the
+    // destination SRAM words match the expected seeded pattern under full
+    // mask.  This exercises the emulator's DMA implementation end-to-end
+    // via the same CPU-store path used on real silicon.
+
+    fn run_dma_sled_on_emu(sled: &'static [u8], budget: u64) -> mdrp2350::Emulator {
+        use mdrp2350::{Config, EmulatorBuilder};
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build();
+        // Apply the RESETS CLR so DMA is out of reset (mirrors setup table).
+        emu.mmio_write32(RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT);
+        // Load and run the sled.
+        emu.load_image(SILICON_RUN_SLED, sled);
+        {
+            let c = emu.core_mut(0);
+            c.wake();
+            c.set_reg(13, EMU_TEST_STACK);
+            c.set_reg(14, 0xFFFF_FFFF);
+            c.regs.set_pc(SILICON_RUN_SLED);
+            c.regs.xpsr = 0x0100_0000;
+        }
+        let bkpt_pc = SILICON_RUN_SLED + (sled.len() as u32) - 2;
+        let start = emu.cycles();
+        while emu.core(0).regs.pc() != bkpt_pc
+            && emu.cycles().saturating_sub(start) < budget
+        {
+            emu.step();
+        }
+        assert_eq!(
+            emu.core(0).regs.pc(),
+            bkpt_pc,
+            "sled did not reach BKPT within {budget} cycles (PC=0x{:08X})",
+            emu.core(0).regs.pc(),
+        );
+        emu
+    }
+
+    #[test]
+    fn test_dma_mem_to_mem_32bit_sled_on_emu() {
+        let mut emu = run_dma_sled_on_emu(SLED_DMA_MEM_TO_MEM_32BIT, 2000);
+        // Destination 0x2000_0300..030C must mirror source 0xDEAD_0001..4.
+        assert_eq!(emu.mmio_read32(0x2000_0300), 0xDEAD_0001, "word 0");
+        assert_eq!(emu.mmio_read32(0x2000_0304), 0xDEAD_0002, "word 1");
+        assert_eq!(emu.mmio_read32(0x2000_0308), 0xDEAD_0003, "word 2");
+        assert_eq!(emu.mmio_read32(0x2000_030C), 0xDEAD_0004, "word 3");
+        // DMA INTR bit 0 must be set.
+        assert_ne!(emu.mmio_read32(DMA_INTR) & 0x0000_0001, 0, "DMA INTR bit 0");
+    }
+
+    #[test]
+    fn test_dma_chain_trigger_sled_on_emu() {
+        let mut emu = run_dma_sled_on_emu(SLED_DMA_CHAIN_TRIGGER, 4000);
+        // Ch0 destination 0x2000_0600 ← 0xAAAA_0000.
+        assert_eq!(emu.mmio_read32(0x2000_0600), 0xAAAA_0000, "ch0 dst");
+        // Ch1 destination 0x2000_0700 ← 0xBBBB_1111.
+        assert_eq!(emu.mmio_read32(0x2000_0700), 0xBBBB_1111, "ch1 dst");
+        // DMA INTR bits 0 and 1 must both be set.
+        assert_eq!(
+            emu.mmio_read32(DMA_INTR) & 0x0000_0003,
+            0x0000_0003,
+            "DMA INTR bits 0+1",
+        );
+    }
+
+    #[test]
+    fn test_dma_timer_paced_sled_on_emu() {
+        let mut emu = run_dma_sled_on_emu(SLED_DMA_TIMER_PACED, 2000);
+        // Destination 0x2000_0B00..0B0C must mirror source 0xCAFE_0001..4.
+        assert_eq!(emu.mmio_read32(0x2000_0B00), 0xCAFE_0001, "word 0");
+        assert_eq!(emu.mmio_read32(0x2000_0B04), 0xCAFE_0002, "word 1");
+        assert_eq!(emu.mmio_read32(0x2000_0B08), 0xCAFE_0003, "word 2");
+        assert_eq!(emu.mmio_read32(0x2000_0B0C), 0xCAFE_0004, "word 3");
+        // DMA INTR bit 0 must be set.
+        assert_ne!(emu.mmio_read32(DMA_INTR) & 0x0000_0001, 0, "DMA INTR bit 0");
     }
 
     /// Drive every red-path scenario through the same EMU-side

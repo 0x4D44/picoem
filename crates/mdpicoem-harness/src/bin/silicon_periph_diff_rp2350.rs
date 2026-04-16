@@ -5,7 +5,7 @@
 // setup + diff lives in the library module so the `test_silicon`
 // orchestrator can share it.
 
-use mdpicoem_harness::silicon_oracle::Verdict;
+use mdpicoem_harness::silicon_oracle::{name_matches_exclude, name_matches_filter, Verdict};
 use mdpicoem_harness::silicon_scenarios::{
     run_scenario_with_retry, PeriphArgs, PeriphScenario, PLL_SYS_BASE, RESETS_BASE, RESETS_RESET,
     RESET_PIO0, RESET_PIO1, RESET_PLL_SYS, RED_PATH_SCENARIOS, SCENARIOS,
@@ -15,10 +15,11 @@ use probe_rs::{MemoryInterface, Session, SessionConfig};
 use std::time::Instant;
 
 const USAGE: &str = "\
-Usage: silicon_periph_diff_rp2350 [--filter <substr>] [--verbose] [--red-path]
+Usage: silicon_periph_diff_rp2350 [--filter <substr>] [--exclude <substr>] [--verbose] [--red-path]
 
 Options:
   --filter    Only run scenarios whose name contains <substr>
+  --exclude   Skip scenarios whose name contains <substr> (applied after --filter)
   --verbose   Print per-observable diffs, not just the first divergence
   --red-path  Run the red-path witness catalogue instead of the default
               catalogue (Phase 0b HLD V5 §4.2.8 — proves the oracle FAIL
@@ -54,6 +55,13 @@ fn parse_args() -> Result<Args, String> {
                     return Err(format!("--filter requires a substring\n{USAGE}"));
                 }
                 args.inner.filter = Some(argv[i].clone());
+            }
+            "--exclude" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--exclude requires a substring\n{USAGE}"));
+                }
+                args.inner.exclude = Some(argv[i].clone());
             }
             "--verbose" => args.inner.verbose = true,
             "--red-path" => args.red_path = true,
@@ -91,25 +99,39 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         SCENARIOS
     };
 
+    let mut skipped_filter = 0usize;
+    let mut skipped_exclude = 0usize;
     let selected: Vec<&PeriphScenario> = catalogue
         .iter()
-        .filter(|s| args.inner.filter.as_deref().is_none_or(|sub| s.name.contains(sub)))
+        .filter(|s| {
+            if !name_matches_filter(s.name, args.inner.filter.as_deref()) {
+                skipped_filter += 1;
+                return false;
+            }
+            if name_matches_exclude(s.name, args.inner.exclude.as_deref()) {
+                skipped_exclude += 1;
+                return false;
+            }
+            true
+        })
         .collect();
 
-    let skipped = catalogue.len() - selected.len();
     if selected.is_empty() {
         println!(
-            "silicon_periph_diff_rp2350: no scenarios match filter '{}'; nothing to do",
+            "silicon_periph_diff_rp2350: no scenarios match filter '{}' (exclude '{}')); nothing to do",
             args.inner.filter.as_deref().unwrap_or(""),
+            args.inner.exclude.as_deref().unwrap_or(""),
         );
         return Ok(0);
     }
 
     println!(
-        "silicon_periph_diff_rp2350: {} scenario(s) selected from {} catalogue ({} skipped by filter)",
+        "silicon_periph_diff_rp2350: {} scenario(s) selected from {} catalogue \
+         ({} skipped by filter, {} skipped by exclude)",
         selected.len(),
         if args.red_path { "red-path" } else { "default" },
-        skipped,
+        skipped_filter,
+        skipped_exclude,
     );
     println!("sled=0x{SILICON_RUN_SLED:08X} resets=0x{RESETS_BASE:08X} pll_sys=0x{PLL_SYS_BASE:08X}");
     println!();
@@ -154,11 +176,12 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "summary: total={} pass={} fail={} skipped={}  ({:.2}s)",
+        "summary: total={} pass={} fail={} skipped_filter={} skipped_exclude={}  ({:.2}s)",
         selected.len(),
         pass,
         fail,
-        skipped,
+        skipped_filter,
+        skipped_exclude,
         t_total.elapsed().as_secs_f64(),
     );
     Ok(if fail > 0 { 1 } else { 0 })

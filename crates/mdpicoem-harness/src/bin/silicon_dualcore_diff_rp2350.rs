@@ -17,17 +17,18 @@
 // the hardware-gated prerequisites.
 
 use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs, DualCoreCase, CASES};
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_filter, Verdict};
+use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_exclude, name_matches_filter, Verdict};
 use mdpicoem_harness::{CYCLE_MAILBOX_BASE, DUALCORE_ANTAGONIST_SLOT};
 use probe_rs::{MemoryInterface, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
-Usage: silicon_dualcore_diff_rp2350 [--filter <substr>] [--iter-low <K1>] \
-[--iter-high <K2>] [--tolerance <N>]
+Usage: silicon_dualcore_diff_rp2350 [--filter <substr>] [--exclude <substr>] \
+[--iter-low <K1>] [--iter-high <K2>] [--tolerance <N>]
 
 Options:
   --filter    Only run cases whose name contains <substr>
+  --exclude   Skip cases whose name contains <substr> (applied after --filter)
   --iter-low  K_low   (default 101)
   --iter-high K_high  (default 201, must be > K_low)
   --tolerance Cycle-delta tolerance before marking FAIL (default 0)
@@ -46,6 +47,13 @@ fn parse_args() -> Result<DualCoreArgs, String> {
                     return Err(format!("--filter requires a substring\n{USAGE}"));
                 }
                 args.filter = Some(argv[i].clone());
+            }
+            "--exclude" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--exclude requires a substring\n{USAGE}"));
+                }
+                args.exclude = Some(argv[i].clone());
             }
             "--iter-low" => {
                 i += 1;
@@ -105,13 +113,25 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "bad arguments"
     })?;
 
+    let mut skipped_filter = 0usize;
+    let mut skipped_exclude = 0usize;
     let selected: Vec<&DualCoreCase> = CASES
         .iter()
-        .filter(|c| name_matches_filter(c.name, args.filter.as_deref()))
+        .filter(|c| {
+            if !name_matches_filter(c.name, args.filter.as_deref()) {
+                skipped_filter += 1;
+                return false;
+            }
+            if name_matches_exclude(c.name, args.exclude.as_deref()) {
+                skipped_exclude += 1;
+                return false;
+            }
+            true
+        })
         .collect();
 
     if selected.is_empty() {
-        println!("no cases match filter; nothing to do");
+        println!("no cases match filter/exclude; nothing to do");
         return Ok(0);
     }
 
@@ -122,7 +142,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     println!(
         "antagonist=0x{DUALCORE_ANTAGONIST_SLOT:08X} mailbox=0x{CYCLE_MAILBOX_BASE:08X}",
     );
-    println!("selected {} case(s)", selected.len());
+    println!(
+        "selected {} case(s) ({} skipped by filter, {} skipped by exclude)",
+        selected.len(), skipped_filter, skipped_exclude,
+    );
     println!();
 
     let mut session = Session::auto_attach("rp2350", SessionConfig::default())?;
@@ -219,7 +242,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let elapsed = t0.elapsed();
     println!();
     println!(
-        "summary: total={total} pass={pass} fail={fail}  ({:.2}s)",
+        "summary: total={total} pass={pass} fail={fail} \
+         skipped_filter={skipped_filter} skipped_exclude={skipped_exclude}  ({:.2}s)",
         elapsed.as_secs_f64()
     );
     Ok(if fail > 0 { 1 } else { 0 })

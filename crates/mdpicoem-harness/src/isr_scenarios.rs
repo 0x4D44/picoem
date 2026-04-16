@@ -1466,6 +1466,7 @@ const BKPT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, Default)]
 pub struct IsrArgs {
     pub filter: Option<String>,
+    pub exclude: Option<String>,
     pub verbose: bool,
 }
 
@@ -1870,6 +1871,7 @@ pub fn run_against(
         None => SCENARIOS
             .iter()
             .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
+            .filter(|s| !silicon_oracle::name_matches_exclude(s.name, args.exclude.as_deref()))
             .collect(),
         Some(names) => {
             let mut v: Vec<&IsrScenario> = Vec::with_capacity(names.len());

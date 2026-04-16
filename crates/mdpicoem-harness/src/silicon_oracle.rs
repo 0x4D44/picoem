@@ -141,6 +141,49 @@ pub fn name_matches_filter(name: &str, filter: Option<&str>) -> bool {
     }
 }
 
+/// Return `true` iff `exclude` does NOT match `name` — None never excludes,
+/// Some excludes when the substring matches.
+pub fn name_matches_exclude(name: &str, exclude: Option<&str>) -> bool {
+    match exclude {
+        None => false,
+        Some(sub) => name.contains(sub),
+    }
+}
+
+/// Select scenario/case names from a slice given `filter` (include) and
+/// `exclude` (skip) substrings.
+///
+/// Rules:
+/// - Both `None`: all names pass.
+/// - `filter` only: include names containing the filter substring.
+/// - `exclude` only: include names NOT containing the exclude substring.
+/// - Both: apply filter first, then subtract any that match exclude.
+///
+/// Returns `(selected_indices, n_skipped_by_filter, n_skipped_by_exclude)`.
+pub fn select_by_name<'a>(
+    names: &[&'a str],
+    filter: Option<&str>,
+    exclude: Option<&str>,
+) -> (Vec<usize>, usize, usize) {
+    let mut selected = Vec::new();
+    let mut skipped_filter = 0usize;
+    let mut skipped_exclude = 0usize;
+
+    for (i, name) in names.iter().enumerate() {
+        if !name_matches_filter(name, filter) {
+            skipped_filter += 1;
+            continue;
+        }
+        if name_matches_exclude(name, exclude) {
+            skipped_exclude += 1;
+            continue;
+        }
+        selected.push(i);
+    }
+
+    (selected, skipped_filter, skipped_exclude)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -183,5 +226,81 @@ mod tests {
         assert!(name_matches_filter("pio0_nop_loop", Some("pio0")));
         assert!(name_matches_filter("pio0_nop_loop", Some("nop")));
         assert!(!name_matches_filter("pll_sys_lock_timing", Some("pio0")));
+    }
+
+    #[test]
+    fn test_name_matches_exclude_none_never_excludes() {
+        assert!(!name_matches_exclude("anything", None));
+        assert!(!name_matches_exclude("adc_one_shot", None));
+    }
+
+    #[test]
+    fn test_name_matches_exclude_substring() {
+        assert!(name_matches_exclude("adc_one_shot", Some("adc")));
+        assert!(name_matches_exclude("adc_round_robin_2ch", Some("adc")));
+        assert!(!name_matches_exclude("pio0_nop_loop", Some("adc")));
+    }
+
+    // -------------------------------------------------------------------
+    // select_by_name — the central selection helper used by all 4 binaries
+    // -------------------------------------------------------------------
+
+    const NAMES: &[&str] = &[
+        "pio0_nop_loop",
+        "pio1_nop_loop",
+        "adc_one_shot",
+        "adc_round_robin_2ch",
+        "pll_sys_lock_timing",
+    ];
+
+    #[test]
+    fn test_select_both_none_selects_all() {
+        let (sel, sf, se) = select_by_name(NAMES, None, None);
+        assert_eq!(sel, vec![0, 1, 2, 3, 4]);
+        assert_eq!(sf, 0);
+        assert_eq!(se, 0);
+    }
+
+    #[test]
+    fn test_select_filter_only() {
+        let (sel, sf, se) = select_by_name(NAMES, Some("pio"), None);
+        assert_eq!(sel, vec![0, 1]);
+        assert_eq!(sf, 3);  // adc_one_shot, adc_round_robin_2ch, pll_sys_lock_timing
+        assert_eq!(se, 0);
+    }
+
+    #[test]
+    fn test_select_exclude_only() {
+        let (sel, sf, se) = select_by_name(NAMES, None, Some("adc"));
+        assert_eq!(sel, vec![0, 1, 4]);
+        assert_eq!(sf, 0);
+        assert_eq!(se, 2);  // adc_one_shot, adc_round_robin_2ch
+    }
+
+    #[test]
+    fn test_select_filter_and_exclude_disjoint() {
+        // filter="pio" picks indices 0,1; exclude="adc" hits nothing in that set
+        let (sel, sf, se) = select_by_name(NAMES, Some("pio"), Some("adc"));
+        assert_eq!(sel, vec![0, 1]);
+        assert_eq!(sf, 3);
+        assert_eq!(se, 0);
+    }
+
+    #[test]
+    fn test_select_filter_and_exclude_overlapping() {
+        // filter="" matches all 5; exclude="adc" removes 2
+        let (sel, sf, se) = select_by_name(NAMES, Some(""), Some("adc"));
+        assert_eq!(sel, vec![0, 1, 4]);
+        assert_eq!(sf, 0);
+        assert_eq!(se, 2);
+    }
+
+    #[test]
+    fn test_select_exclude_removes_all_in_filter() {
+        // filter="adc" picks 2; exclude="adc" removes all 2 → empty
+        let (sel, sf, se) = select_by_name(NAMES, Some("adc"), Some("adc"));
+        assert!(sel.is_empty());
+        assert_eq!(sf, 3);  // pio0, pio1, pll skipped by filter
+        assert_eq!(se, 2);  // both adc* skipped by exclude
     }
 }

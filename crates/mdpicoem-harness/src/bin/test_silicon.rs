@@ -35,7 +35,6 @@ use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,7 +49,6 @@ use probe_rs::{Permissions, Session, SessionConfig};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-const WATCHDOG: Duration = Duration::from_secs(60);
 const REATTACH_RETRY: Duration = Duration::from_secs(5);
 const REATTACH_TIMEOUT: Duration = Duration::from_secs(60);
 const REATTACH_INITIAL_SLEEP: Duration = Duration::from_secs(1);
@@ -85,12 +83,9 @@ Options:
              Default: auto-attach (first enumerated probe).
 ";
 
-// Sentinel case name used for synthesised watchdog / probe-rs failures
-// where we know which oracle was running but the per-case name is either
-// unknown or attribution is meaningless (one call wraps the whole
-// oracle, so timing out inside cycle at case 3/9 still gets this marker —
-// partial results above it are already recorded).
-const WATCHDOG_SENTINEL: &str = "<watchdog timeout — partial results may be missing>";
+// Sentinel case name used for synthesised probe-rs error outcomes where we
+// know which oracle was running but not which case. Attribution is whole-oracle
+// — partial results for cases earlier in the list are already recorded.
 const PROBE_ERROR_SENTINEL: &str = "<probe-rs error — partial results may be missing>";
 
 // ---------------------------------------------------------------------------
@@ -332,50 +327,11 @@ struct OraclePlan {
     filter: Option<String>,
 }
 
-/// Result produced by the worker thread running a single `run_against` call.
-/// Shape keeps the Session alive so the main thread can reuse it — or drop
-/// it on error for a fresh attach.
-struct WorkerResult {
-    session: Session,
-    outcome: Result<Vec<CaseOutcome>, String>,
-}
-
-/// Run one `run_against` for one oracle with the given plan. Spawns a
-/// worker thread with the Session so the main thread can enforce the
-/// watchdog via `recv_timeout`. On watchdog timeout: abandon the thread
-/// (it'll exit when its probe-rs call returns), return `Err(...)`; caller
-/// re-attaches.
-fn run_oracle_against(
-    session: Session,
-    plan: OraclePlan,
-) -> (Option<Session>, Result<Vec<CaseOutcome>, String>) {
-    let (tx, rx) = mpsc::sync_channel::<WorkerResult>(1);
-    thread::spawn(move || {
-        let mut sess = session;
-        let outcome = run_one_oracle(&mut sess, &plan);
-        let _ = tx.send(WorkerResult { session: sess, outcome });
-    });
-    match rx.recv_timeout(WATCHDOG) {
-        Ok(res) => (Some(res.session), res.outcome),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Worker is stuck inside probe-rs; abandon it. Its Session
-            // drops when the thread eventually finishes.
-            (None, Err("watchdog timeout".to_string()))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // Worker panicked before sending — treat like a probe-rs error.
-            (None, Err("worker thread panicked".to_string()))
-        }
-    }
-}
-
-/// Inside the worker: take a mutable Session, dispatch to the right
-/// `run_against`. Cycle / periph / bank open core 0 and run through the
-/// `Core` handle; dualcore takes `&mut Session` directly because it
-/// needs to drive core 1 as well as core 0.
-///
-/// Converts any `Box<dyn Error>` into a `String` so it can cross the
-/// channel boundary (`Box<dyn Error>` is not `Send` by default).
+/// Dispatch to the right `run_against` for the given oracle plan.
+/// Cycle / periph / bank / ISR open core 0 and work through the `Core`
+/// handle; dualcore takes `&mut Session` directly because it drives
+/// core 1 as well. Session stays on the calling thread throughout — no
+/// worker thread (probe-rs USB handles are thread-affine on Windows).
 fn run_one_oracle(
     session: &mut Session,
     plan: &OraclePlan,
@@ -427,6 +383,7 @@ fn run_one_oracle(
             let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = IsrArgs {
                 filter: plan.filter.clone(),
+                exclude: None,
                 verbose: false,
             };
             isr_scenarios::run_against(&mut core, &args, order_slice)
@@ -521,7 +478,6 @@ struct Stats {
 #[derive(Default)]
 struct Summary {
     totals: BTreeMap<&'static str, Stats>,
-    watchdog_count: u64,
     reattach_count: u64,
     /// (oracle, case) -> smallest iter_seed that reproduced a FAIL.
     failing_cases: BTreeMap<(&'static str, String), u64>,
@@ -563,7 +519,6 @@ impl Summary {
                 oracle, s.pass, s.fail,
             );
         }
-        println!("watchdog_timeouts: {}", self.watchdog_count);
         println!("reattach_count:    {}", self.reattach_count);
         if self.failing_cases.is_empty() {
             println!("failing cases: none");
@@ -716,8 +671,7 @@ fn single_pass(
             order: None, // None → library default: filter + catalogue order.
             filter: filter.clone(),
         };
-        let (maybe_sess, outcome) = run_oracle_against(session, plan);
-        match outcome {
+        match run_one_oracle(&mut session, &plan) {
             Ok(outcomes) => {
                 for o in &outcomes {
                     println!(
@@ -730,36 +684,21 @@ fn single_pass(
                     );
                 }
                 summary.record(&outcomes, 0);
-                session = match maybe_sess {
-                    Some(s) => s,
-                    None => {
-                        // Shouldn't happen on Ok, but be defensive.
-                        reattach_with_retries(probe)?
-                    }
-                };
             }
             Err(e) => {
                 let msg = format!(
                     "{} iter=0 oracle={} case={} detail={e}",
                     now_iso(),
                     oracle.as_str(),
-                    if e == "watchdog timeout" {
-                        WATCHDOG_SENTINEL
-                    } else {
-                        PROBE_ERROR_SENTINEL
-                    },
+                    PROBE_ERROR_SENTINEL,
                 );
                 eprintln!("ERROR: {msg}");
                 append_error_log(log_path, &msg);
                 // Synthesise a Fail outcome so single-pass records the failure.
                 // Single-pass wraps a whole oracle per call, so the sentinel
-                // names reflect "whole-oracle timeout / error" rather than a
+                // name reflects "whole-oracle probe error" rather than a
                 // specific case name.
-                let case_name: &'static str = if e == "watchdog timeout" {
-                    interner.intern(WATCHDOG_SENTINEL)
-                } else {
-                    interner.intern(PROBE_ERROR_SENTINEL)
-                };
+                let case_name: &'static str = interner.intern(PROBE_ERROR_SENTINEL);
                 let synthetic = CaseOutcome::fail(
                     oracle_name_static(oracle.as_str()),
                     case_name,
@@ -767,9 +706,6 @@ fn single_pass(
                     0,
                 );
                 summary.record(&[synthetic], 0);
-                if e == "watchdog timeout" {
-                    summary.watchdog_count += 1;
-                }
                 // Reattach so the next oracle can run.
                 summary.reattach_count += 1;
                 session = reattach_with_retries(probe)
@@ -923,10 +859,8 @@ fn soak_loop(
                 // every case).
                 continue;
             }
-            // Take the session for this oracle; we'll put it back from
-            // the Ok arm or replace it after a successful reattach.
-            let Some(this_session) = session_opt.take() else {
-                // No session this iteration — previously-failed reattach.
+            // No session this iteration — previously-failed reattach.
+            let Some(ref mut this_session) = session_opt else {
                 break 'plans;
             };
             let plan = OraclePlan {
@@ -934,8 +868,7 @@ fn soak_loop(
                 order: Some(names.clone()),
                 filter: args.filter.clone(),
             };
-            let (maybe_sess, outcome) = run_oracle_against(this_session, plan);
-            match outcome {
+            match run_one_oracle(this_session, &plan) {
                 Ok(outcomes) => {
                     for o in &outcomes {
                         if args.verbose {
@@ -959,68 +892,23 @@ fn soak_loop(
                         }
                     }
                     summary.record(&outcomes, s);
-                    session_opt = match maybe_sess {
-                        Some(sess) => Some(sess),
-                        None => {
-                            // Impossible on Ok (the worker always sends
-                            // both session + outcome), but treat as a
-                            // lost session and reattach rather than
-                            // panic. Log loudly so we can diagnose if it
-                            // ever fires.
-                            let line = format!(
-                                "{} iter={} reached Ok(outcomes) with maybe_sess=None — reattaching",
-                                fmt_elapsed(start.elapsed()),
-                                iter_index,
-                            );
-                            emit_log_line(log_path, &line);
-                            summary.reattach_count += 1;
-                            match reattach_with_retries(probe) {
-                                Ok(s) => Some(s),
-                                Err(rerr) => {
-                                    consecutive_reattach_fails += 1;
-                                    let rline = format!(
-                                        "{} iter={} reattach failed: {rerr} (consecutive={})",
-                                        fmt_elapsed(start.elapsed()),
-                                        iter_index, consecutive_reattach_fails,
-                                    );
-                                    emit_log_line(log_path, &rline);
-                                    if consecutive_reattach_fails >= GIVE_UP_THRESHOLD {
-                                        return Ok((2, total_iters));
-                                    }
-                                    break 'plans;
-                                }
-                            }
-                        }
-                    };
                     consecutive_reattach_fails = 0;
                 }
                 Err(e) => {
-                    let is_watchdog = e == "watchdog timeout";
-                    if is_watchdog {
-                        summary.watchdog_count += 1;
-                    }
                     let synthetic_oracle = oracle_name_static(oracle.as_str());
-                    let detail = if is_watchdog {
-                        "watchdog timeout".to_string()
-                    } else {
-                        format!("probe-rs error: {e}")
-                    };
-                    // Watchdog / probe-rs error terminated the whole
-                    // oracle call. Attribution is "the oracle, not the
-                    // case" — we don't know which case was running when
-                    // the probe wedged. Partial results may be missing
-                    // for cases later in the shuffled list.
-                    let case_name_static: &'static str = if is_watchdog {
-                        interner.intern(WATCHDOG_SENTINEL)
-                    } else {
-                        interner.intern(PROBE_ERROR_SENTINEL)
-                    };
+                    let detail = format!("probe-rs error: {e}");
+                    // Probe-rs error terminated the whole oracle call.
+                    // Attribution is "the oracle, not the case" — we don't
+                    // know which case was running when the probe wedged.
+                    // Partial results for cases earlier in the shuffled
+                    // list are already recorded above.
+                    let case_name_static: &'static str = interner.intern(PROBE_ERROR_SENTINEL);
                     let synth = CaseOutcome {
                         oracle: synthetic_oracle,
                         case: case_name_static,
                         verdict: Verdict::Fail,
                         detail: detail.clone(),
-                        elapsed_ms: WATCHDOG.as_millis() as u32,
+                        elapsed_ms: 0,
                     };
                     let line = format!(
                         "{} iter={} seed={} oracle={} case={} detail={}",
@@ -1030,10 +918,12 @@ fn soak_loop(
                     emit_log_line(log_path, &line);
                     summary.record(&[synth], s);
 
+                    // Drop the dead session so reattach can open a fresh one.
+                    session_opt = None;
                     summary.reattach_count += 1;
                     match reattach_with_retries(probe) {
-                        Ok(s) => {
-                            session_opt = Some(s);
+                        Ok(fresh) => {
+                            session_opt = Some(fresh);
                             consecutive_reattach_fails = 0;
                         }
                         Err(rerr) => {
@@ -1098,12 +988,11 @@ fn soak_loop(
             let total_pass: u64 = summary.totals.values().map(|x| x.pass).sum();
             let total_fail: u64 = summary.totals.values().map(|x| x.fail).sum();
             println!(
-                "{} iter={} pass={} fail={} watchdog={} reattach={}",
+                "{} iter={} pass={} fail={} reattach={}",
                 fmt_elapsed(start.elapsed()),
                 iter_index,
                 total_pass,
                 total_fail,
-                summary.watchdog_count,
                 summary.reattach_count,
             );
             next_heartbeat = now + HEARTBEAT_INTERVAL;

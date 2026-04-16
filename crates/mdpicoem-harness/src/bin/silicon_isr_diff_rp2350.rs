@@ -22,16 +22,17 @@
 // divergences, not a missing dispatch path.
 
 use mdpicoem_harness::isr_scenarios::{self, IsrArgs, IsrScenario, SCENARIOS};
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_filter, Verdict};
+use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_exclude, name_matches_filter, Verdict};
 use mdpicoem_harness::{ISR_IMAGE_BASE, ISR_MAILBOX_CYCCNT, ISR_STACK_TOP};
 use probe_rs::{Session, SessionConfig};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
-Usage: silicon_isr_diff_rp2350 [--filter <substr>] [--verbose]
+Usage: silicon_isr_diff_rp2350 [--filter <substr>] [--exclude <substr>] [--verbose]
 
 Options:
   --filter   Only run scenarios whose name contains <substr>
+  --exclude  Skip scenarios whose name contains <substr> (applied after --filter)
   --verbose  Print all observables, not just the first divergence
 ";
 
@@ -47,6 +48,13 @@ fn parse_args() -> Result<IsrArgs, String> {
                     return Err(format!("--filter requires a substring\n{USAGE}"));
                 }
                 args.filter = Some(argv[i].clone());
+            }
+            "--exclude" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--exclude requires a substring\n{USAGE}"));
+                }
+                args.exclude = Some(argv[i].clone());
             }
             "--verbose" => args.verbose = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
@@ -74,22 +82,35 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "bad arguments"
     })?;
 
+    let mut skipped_filter = 0usize;
+    let mut skipped_exclude = 0usize;
     let selected: Vec<&IsrScenario> = SCENARIOS
         .iter()
-        .filter(|s| name_matches_filter(s.name, args.filter.as_deref()))
+        .filter(|s| {
+            if !name_matches_filter(s.name, args.filter.as_deref()) {
+                skipped_filter += 1;
+                return false;
+            }
+            if name_matches_exclude(s.name, args.exclude.as_deref()) {
+                skipped_exclude += 1;
+                return false;
+            }
+            true
+        })
         .collect();
 
     if selected.is_empty() {
         println!(
-            "silicon_isr_diff_rp2350: no scenarios match filter '{}'; nothing to do",
+            "silicon_isr_diff_rp2350: no scenarios match filter '{}' (exclude '{}')); nothing to do",
             args.filter.as_deref().unwrap_or(""),
+            args.exclude.as_deref().unwrap_or(""),
         );
         return Ok(0);
     }
 
     println!(
-        "silicon_isr_diff_rp2350: {} scenario(s) selected",
-        selected.len(),
+        "silicon_isr_diff_rp2350: {} scenario(s) selected ({} skipped by filter, {} skipped by exclude)",
+        selected.len(), skipped_filter, skipped_exclude,
     );
     println!(
         "image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X} mailbox=0x{ISR_MAILBOX_CYCCNT:08X}",
@@ -137,7 +158,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let elapsed = t_total.elapsed();
     println!();
     println!(
-        "summary: total={} pass={} fail={}  ({:.2}s)",
+        "summary: total={} pass={} fail={}          skipped_filter={skipped_filter} skipped_exclude={skipped_exclude}  ({:.2}s)",
         pass + fail,
         pass,
         fail,

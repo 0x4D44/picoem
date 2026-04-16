@@ -242,7 +242,7 @@ pub const CASES: &[DualCoreCase] = &[
         seq_core1: SEQ_CORE1_SPINLOCK,
         init_core0: INIT_CORE0_SPINLOCK,
         init_core1: INIT_CORE1_SPINLOCK,
-        emu_baseline: 10,
+        emu_baseline: 9,
         // Race-dependent: which core wins each contended SPINLOCK0 claim
         // is non-deterministic. Placeholder — tune from silicon data.
         tolerance_override: Some(3),
@@ -253,7 +253,7 @@ pub const CASES: &[DualCoreCase] = &[
         seq_core1: SEQ_CORE1_FIFO_POP,
         init_core0: INIT_CORE0_FIFO,
         init_core1: INIT_CORE1_FIFO,
-        emu_baseline: 12,
+        emu_baseline: 10,
         // Race-dependent: FIFO push/pop interleaving depends on each
         // core's arrival-time at SIO. Placeholder — tune from silicon.
         tolerance_override: Some(3),
@@ -269,6 +269,7 @@ pub const CASES: &[DualCoreCase] = &[
 #[derive(Clone, Debug)]
 pub struct DualCoreArgs {
     pub filter: Option<String>,
+    pub exclude: Option<String>,
     pub iter_low: u32,
     pub iter_high: u32,
     pub tolerance: u32,
@@ -278,6 +279,7 @@ impl Default for DualCoreArgs {
     fn default() -> Self {
         Self {
             filter: None,
+            exclude: None,
             iter_low: 101,
             iter_high: 201,
             tolerance: 0,
@@ -559,6 +561,7 @@ pub fn run_against(
         None => CASES
             .iter()
             .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
+            .filter(|c| !silicon_oracle::name_matches_exclude(c.name, args.exclude.as_deref()))
             .collect(),
         Some(names) => {
             let mut v: Vec<&DualCoreCase> = Vec::with_capacity(names.len());

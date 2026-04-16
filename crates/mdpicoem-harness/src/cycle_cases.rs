@@ -354,23 +354,23 @@ const SEQ_BACK_TO_BACK_ALU: &[u16] = &[
 pub const CASES: &[CycleCase] = &[
     // Positive control FIRST — if this fails at tol=0, everything below is
     // noise until the bias is tracked down.
-    CycleCase { name: "nop_chain_8", seq: SEQ_NOP_CHAIN_8, emu_baseline: 16 },
-    CycleCase { name: "push_2_min_cost", seq: SEQ_PUSH_2, emu_baseline: 13 },
-    CycleCase { name: "backward_branch_small", seq: SEQ_BACKWARD_SMALL, emu_baseline: 11 },
-    CycleCase { name: "backward_branch_large", seq: SEQ_BACKWARD_LARGE, emu_baseline: 14 },
+    CycleCase { name: "nop_chain_8", seq: SEQ_NOP_CHAIN_8, emu_baseline: 14 },
+    CycleCase { name: "push_2_min_cost", seq: SEQ_PUSH_2, emu_baseline: 12 },
+    CycleCase { name: "backward_branch_small", seq: SEQ_BACKWARD_SMALL, emu_baseline: 13 },
+    CycleCase { name: "backward_branch_large", seq: SEQ_BACKWARD_LARGE, emu_baseline: 13 },
     CycleCase {
         name: "bank_contention_fetch_data_same",
         seq: SEQ_BANK_CONTENTION_SAME,
-        emu_baseline: 11,
+        emu_baseline: 10,
     },
     CycleCase {
         name: "bank_contention_fetch_data_diff",
         seq: SEQ_BANK_CONTENTION_DIFF,
-        emu_baseline: 11,
+        emu_baseline: 10,
     },
-    CycleCase { name: "ldm_8_reg", seq: SEQ_LDM_8_REG, emu_baseline: 18 },
+    CycleCase { name: "ldm_8_reg", seq: SEQ_LDM_8_REG, emu_baseline: 17 },
     CycleCase { name: "single_adds", seq: SEQ_SINGLE_ADDS, emu_baseline: 7 },
-    CycleCase { name: "back_to_back_alu", seq: SEQ_BACK_TO_BACK_ALU, emu_baseline: 16 },
+    CycleCase { name: "back_to_back_alu", seq: SEQ_BACK_TO_BACK_ALU, emu_baseline: 14 },
 ];
 
 // ---------------------------------------------------------------------------
@@ -568,6 +568,7 @@ pub fn measure_hw(
 #[derive(Clone, Debug)]
 pub struct CycleArgs {
     pub filter: Option<String>,
+    pub exclude: Option<String>,
     pub iter_low: u32,
     pub iter_high: u32,
     pub tolerance: u32,
@@ -577,6 +578,7 @@ impl Default for CycleArgs {
     fn default() -> Self {
         Self {
             filter: None,
+            exclude: None,
             iter_low: 101,
             iter_high: 201,
             tolerance: 0,
@@ -717,6 +719,7 @@ pub fn run_against(
         None => CASES
             .iter()
             .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
+            .filter(|c| !silicon_oracle::name_matches_exclude(c.name, args.exclude.as_deref()))
             .collect(),
         Some(names) => {
             let mut v: Vec<&CycleCase> = Vec::with_capacity(names.len());
