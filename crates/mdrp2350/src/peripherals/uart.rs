@@ -92,7 +92,8 @@ const UARTCR_RXE: u32 = 1 << 9;
 const UARTLCR_H_FEN: u32 = 1 << 4;
 
 // --- UARTFR bits ------------------------------------------------------
-const UARTFR_CTS: u32 = 1 << 0;
+/// CTS flag bit in UARTFR (complement of the nUARTCTS modem input pin).
+pub(crate) const UARTFR_CTS: u32 = 1 << 0;
 const UARTFR_BUSY: u32 = 1 << 3;
 const UARTFR_RXFE: u32 = 1 << 4;
 const UARTFR_TXFF: u32 = 1 << 5;
@@ -237,8 +238,11 @@ impl UartRegs {
     /// Build the UARTFR flag word from the live TX/RX FIFO state.
     fn fr_read(&self) -> u32 {
         let mut fr = 0u32;
-        // CTS tied high — flow control not modelled.
-        fr |= UARTFR_CTS;
+        // CTS (bit 0): complement of the nUARTCTS modem-input pin.
+        // nUARTCTS is mux-routed from a GPIO pad via IO_BANK0 function
+        // select (GPIO17 is one candidate for UART0 on RP2354; see RP2350
+        // pin-function tables). We model CTS=0 (no modem attached) until
+        // the IO mux model carries the real pin state.
         let cap = self.tx_capacity();
         if self.tx_fifo.is_empty() {
             fr |= UARTFR_TXFE;
@@ -536,6 +540,77 @@ mod tests {
         assert!(fr & UARTFR_TXFE != 0, "TX FIFO empty at reset");
         assert!(fr & UARTFR_RXFE != 0, "RX FIFO empty at reset");
         assert!(fr & UARTFR_BUSY == 0, "BUSY clear at reset");
+    }
+
+    /// CTS must NOT be hardwired high. RP2354 silicon oracle
+    /// `uart0_rx_loopback` reads UARTFR = 0x18 (BUSY|RXFE, bit 0 = 0).
+    /// Prior to this fix the emulator unconditionally set bit 0 = 1,
+    /// producing 0x19 / 0x81 depending on TX state — wrong in both cases.
+    #[test]
+    fn fr_cts_is_zero_at_reset_not_hardwired_high() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let fr = u.read32(UARTFR);
+        assert_eq!(fr & UARTFR_CTS, 0, "CTS must be 0 (not hardwired high)");
+    }
+
+    /// Replicates the `uart0_rx_loopback` silicon scenario: configure
+    /// UART with loopback (LBE=1, RXE=1), push one byte, tick for ~30%
+    /// of one byte-time. UARTFR must show BUSY=1 and RXFE=1 (CTS=0) —
+    /// i.e. 0x18, matching what RP2354 silicon reports when observed
+    /// mid-transmission. Previously the emulator returned 0x19
+    /// (BUSY|RXFE|CTS) because CTS was hardwired high.
+    ///
+    /// At 115200 baud / 150 MHz clk_peri:
+    ///   div_64 = 81*64 + 24 = 5208
+    ///   baud   ≈ 150 MHz × 4 / 5208 ≈ 115207
+    ///   byte-time ≈ 150 MHz × 10 / 115207 ≈ 13020 sysclks
+    /// 4000 cycles is well below that threshold, so the TX FIFO is still
+    /// non-empty and `tick` has exercised the accumulator code path.
+    #[test]
+    fn uart_loopback_uartfr_mid_tx_matches_silicon_0x18() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0u64;
+        // IBRD=81, FBRD=24 → 115200 baud at 150 MHz clk_peri.
+        u.write32(UARTIBRD, 81, 0, &mut irqs);
+        u.write32(UARTFBRD, 24, 0, &mut irqs);
+        u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_LBE | (1 << 9) /* RXE */ | UARTCR_TXE, 0, &mut irqs);
+        u.write32(UARTDR, 0x42, 0, &mut irqs);
+        // Tick for 4000 sysclks — roughly 30% of one byte-time (~13020
+        // cycles). TX FIFO is still non-empty: BUSY=1, RXFE=1, CTS=0.
+        let t = tree(SYS_HZ); // 150 MHz
+        u.tick(4_000, &t, &mut irqs);
+        let fr = u.read32(UARTFR);
+        assert_eq!(
+            fr,
+            0x0000_0018,
+            "UARTFR mid-TX must be 0x18 (BUSY|RXFE, CTS=0); got 0x{fr:08X}",
+        );
+    }
+
+    /// After enough cycles for one byte-time, the loopback byte drains from
+    /// TX FIFO and appears in RX FIFO. UARTFR should be TXFE=1, RXFE=0,
+    /// CTS=0 → 0x80. Previously the emulator returned 0x81 (TXFE|CTS).
+    #[test]
+    fn uart_loopback_uartfr_after_full_tx_is_0x80() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0u64;
+        u.write32(UARTIBRD, 81, 0, &mut irqs);
+        u.write32(UARTFBRD, 24, 0, &mut irqs);
+        u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_LBE | (1 << 9) /* RXE */ | UARTCR_TXE, 0, &mut irqs);
+        u.write32(UARTDR, 0x42, 0, &mut irqs);
+        // Tick well past one byte-time at 150 MHz (~1302 sysclks).
+        let t = tree(SYS_HZ); // 150 MHz
+        u.tick(60_000, &t, &mut irqs);
+        let fr = u.read32(UARTFR);
+        assert_eq!(
+            fr,
+            0x0000_0080,
+            "UARTFR post-TX must be 0x80 (TXFE, loopback byte in RX, CTS=0); got 0x{fr:08X}",
+        );
+        // Also verify the byte is recoverable via UARTDR read.
+        assert_eq!(u.read8(UARTDR), 0x42, "loopback byte must be in RX FIFO");
     }
 
     // --- IBRD / FBRD round-trip ---------------------------------------
