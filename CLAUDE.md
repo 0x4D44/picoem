@@ -164,9 +164,12 @@ Use the `tracing` crate for all diagnostic output in library crates. **Never add
 
 ### Level guide
 - `error!` — emulation-breaking conditions (internal invariant violations)
+- `warn!` — suspicious but non-fatal (unexpected clock config, repeated fault loops)
 - `info!` — lifecycle events (init, firmware load, clock config, HardFault escalation)
-- `debug!` — subsystem events (exception entry/return, DMA, PIO, clock reprogram, bus faults)
-- `trace!` — high-frequency cold-path events (spinlock ops, FIFO ops, PIO instruction step)
+- `debug!` — subsystem events (exception entry/return, clock reprogram, bus faults)
+- `trace!` — high-frequency cold-path events (spinlock acquire/release)
+
+Currently instrumented: exception entry/return, HardFault escalation, bus faults, clock tree recompute, emulator construction, spinlock ops. DMA, PIO, and peripheral subsystems will be instrumented incrementally as those areas are worked on.
 
 ### What NOT to trace
 - **Instruction decode/execute hot path** (`execute.rs`, `decode.rs`, `execute_thumb32.rs`, `execute_fpu.rs`, `execute_wide.rs`) — use differential oracles, not logging. Even in debug builds, tracing here would be too slow.

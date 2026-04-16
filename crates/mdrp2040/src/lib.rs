@@ -716,6 +716,8 @@ impl EmulatorBuilder {
         info!(
             rom_size = ROM_SIZE,
             sram_size = SRAM_SIZE,
+            step_quantum = self.step_quantum,
+            sys_clk_hz = self.config.sys_clk_hz,
             "emulator constructed"
         );
         emu
