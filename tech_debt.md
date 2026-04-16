@@ -231,17 +231,23 @@ a safe simplification — but firmware that expects a mid-execution SM to
 freeze on RESETS assert will diverge. mdrp2350 carries the same
 behaviour.
 
-### PIO INTn_INTE routing not modelled
+### PIO INTn_INTE routing — RESOLVED 2026-04-16
 
-`Emulator::tick_pio_and_route_irqs_single` in mdrp2040 over-routes each
-PIO block's IRQ[3:0] flags to *both* of that block's NVIC lines — if any
-of bits 0-3 is set, both of PIO0_IRQ_0/1 (or PIO1_IRQ_0/1) fire. Real
-silicon uses `INT0_INTE` / `INT1_INTE` (plus `INTF` force and `INTS`
-status at offsets `0x12C`..`0x140`) to route each PIO IRQ flag to a
-specific NVIC line. Impact: Phase 2 firmware that enables multiple PIO
-IRQ flags will see spurious NVIC wakes. Phase 2 owes `INTE`/`INTF`/`INTS`
-plumbing in `PioBlock` and a matching routing model in the dispatch
-helper.
+`Emulator::tick_pio_and_route_irqs_single` in mdrp2040 now routes via
+`PioBlock::int0_ints` / `int1_ints` (i.e. `(INTR & INTE) | INTF`),
+matching the mdrp2350 implementation landed in commit `8bb7614`. The
+shared register surface (offsets `0x12C`..`0x140` on `PioBlock`) is
+already wired through the bus dispatch. Resolves the PicoGUS audio
+blocker — firmware ISA handlers fire on PIO0 RX FIFO RXNEMPTY as
+intended.
+
+Note: `pio_all_idle()` still keys on `irq_flags` only, not on
+`int0_ints` / `int1_ints`. Firmware that enables `INTn_INTE` for an
+RXNEMPTY/TXNFULL bit while leaving all SMs disabled (an unusual
+pattern) will miss the IRQ on the fast path. PicoGUS keeps SM0
+enabled whenever the IRQ matters, so this is not on the critical
+path. Update `pio_all_idle()` to consult `int0_ints`/`int1_ints` if
+a future workload needs the disabled-SM IRQ behaviour.
 
 ## Phase 6 Simplifications (Harness split)
 

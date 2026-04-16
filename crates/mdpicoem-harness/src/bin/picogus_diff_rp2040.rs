@@ -91,7 +91,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mdpicoem_devices::I2sCapture;
+use mdpicoem_devices::{I2sCapture, Psram};
 use mdpicoem_harness::picogus_pins::{
     ISA_AD0 as PIN_AD0, ISA_AD_COUNT as PIN_AD_COUNT, ISA_EXTERNAL_PIN_MASK, ISA_IOR as PIN_IOR,
     ISA_IOW as PIN_IOW, I2S_BCLK, I2S_DOUT, I2S_LRCLK,
@@ -790,7 +790,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = EmulatorBuilder::new(Config {
         sys_clk_hz: DEFAULT_SYS_CLK_HZ,
     })
-    .step_quantum(1);
+    .step_quantum(1)
+    .psram(Psram::picogus());
     if let Some(path) = &args.flash {
         let flash_bytes = load_flash(path)?;
         eprintln!(
@@ -892,11 +893,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(post_roll_ns),
     );
     let wall_elapsed = wall_start.elapsed();
-    let (emu, capture) = sink.into_parts();
+    let (mut emu, capture) = sink.into_parts();
     // Core 1 launch check — if `multicore_launch_core1` succeeded, core 1's PC
     // has advanced past its reset state of 0.
     let core1_pc = emu.cores[1].regs.pc();
     let core1_halted = emu.cores[1].is_halted();
+
+    // PSRAM diagnostics — shows whether the ISA → firmware → PSRAM
+    // pipeline delivered any data.
+    if let Some(ref psram) = emu.bus.psram {
+        let nz = psram.buffer.iter().filter(|&&b| b != 0).count();
+        println!();
+        println!("--- PSRAM diagnostics ---");
+        println!("Non-zero bytes:   {} / {}", nz, psram.buffer.len());
+    }
+    println!();
+    println!("--- Diag: PIO + NVIC state ---");
+    println!("Core 0 PC:        0x{:08x}", emu.cores[0].regs.pc());
+    println!("Core 1 PC:        0x{:08x}", emu.cores[1].regs.pc());
+    println!(
+        "PIO0 SM enabled:  0x{:x}    PIO1 SM enabled:  0x{:x}",
+        emu.bus.read32(0x5020_0000) & 0xF,
+        emu.bus.read32(0x5030_0000) & 0xF,
+    );
+    println!(
+        "PIO0 INT0_INTE:   0x{:03x}  INT0_INTS:        0x{:03x}",
+        emu.bus.read32(0x5020_012C),
+        emu.bus.read32(0x5020_0134),
+    );
+    println!(
+        "PIO0 INT1_INTE:   0x{:03x}  INT1_INTS:        0x{:03x}",
+        emu.bus.read32(0x5020_0138),
+        emu.bus.read32(0x5020_0140),
+    );
+    println!(
+        "PIO0 INTR:        0x{:03x}  (raw status — IRQ[3:0] | RXNEMPTY[3:0]<<4 | TXNFULL[3:0]<<8)",
+        emu.bus.read32(0x5020_0128),
+    );
+    println!(
+        "NVIC[0].pending:  0x{:08x}  NVIC[1].pending:  0x{:08x}",
+        emu.bus.nvics[0].pending,
+        emu.bus.nvics[1].pending,
+    );
 
     // Persist the captured audio. Reject directories and create any
     // missing parent dirs (handled inside `write_wav`).
@@ -1013,6 +1051,45 @@ mod tests {
         assert!(counts[1] > 0, "no write16 events");
         assert!(counts[2] > 0, "no read8 events");
         assert!(counts[3] > 0, "no read16 events");
+    }
+
+    #[test]
+    fn parse_monkey_island_fixture() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("monkey_island_theme.trace");
+        let text = std::fs::read_to_string(&path)
+            .expect("monkey_island_theme.trace missing");
+        let events = parse_trace(&text).expect("parse monkey_island_theme.trace");
+
+        // 30 s of Monkey Island theme via GUS: init + ~100 KB DRAM upload
+        // + 246 note-on events = ~500K total trace events.
+        assert!(
+            events.len() > 100_000,
+            "expected >100K events, got {}",
+            events.len()
+        );
+
+        // Timespan: must span at least 20 s of the theme.
+        let span_ns = events.last().unwrap().ns - events.first().unwrap().ns;
+        assert!(
+            span_ns > 20_000_000_000,
+            "expected >20 s span, got {:.1} s",
+            span_ns as f64 / 1e9
+        );
+
+        // Must contain DRAM uploads (port 0x347) — real .pat waveform data.
+        let dram_writes = events.iter().filter(|e| e.port == 0x347).count();
+        assert!(
+            dram_writes >= 50_000,
+            "expected >=50K DRAM writes (patch waveforms), got {}",
+            dram_writes
+        );
+
+        // Must contain both write8 and write16 kinds.
+        let w8 = events.iter().filter(|e| e.kind == TraceKind::Write8).count();
+        let w16 = events.iter().filter(|e| e.kind == TraceKind::Write16).count();
+        assert!(w8 > 0 && w16 > 0, "need both write8 ({w8}) and write16 ({w16})");
     }
 
     #[test]

@@ -2553,6 +2553,8 @@ mod phase1_wave1 {
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
         emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Enable IRQ flag 0 routing on INT0 (NVIC line 7) only.
+        emu.bus.write32(PIO0_BASE + 0x12C, 0x001);
         // Force PIO0 IRQ flag bit 0 via IRQ_FORCE (offset 0x034).
         emu.bus.write32(PIO0_BASE + 0x034, 0x01);
         // Asserting the IRQ flag means pio_all_idle is false now, so
@@ -2571,6 +2573,8 @@ mod phase1_wave1 {
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
         emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+        // Enable IRQ flag 1 routing on INT1 (NVIC line 10) only.
+        emu.bus.write32(PIO1_BASE + 0x138, 0x002);
         // PIO1 IRQ flag bit 1 → NVIC line 10 (PIO1_IRQ_1).
         emu.bus.write32(PIO1_BASE + 0x034, 0x02);
         emu.step();
@@ -2600,23 +2604,32 @@ mod phase1_wave1 {
     }
 
     #[test]
-    fn pio_irq_flag_bit2_over_routes_to_both_nvic_lines() {
-        // Phase 1 Wave 1 simplification: until INT0_INTE/INT1_INTE land,
-        // any of PIO IRQ[3:0] set on a block fires *both* of that block's
-        // NVIC lines. Previously `& 0x3` silently dropped bits 2-3; this
-        // test pins the new over-route behaviour (safer than dropping).
+    fn pio0_int0_intf_forces_nvic_line_7_only() {
+        // INT0_INTF (PIO0 + 0x130) directly forces individual bits in
+        // the effective INT0 line value (`int0_ints = (INTR & INTE) | INTF`).
+        // Forcing bit 0 of INT0 must fire only NVIC line 7 (PIO0_IRQ_0)
+        // and must NOT bleed into NVIC line 8 (PIO0_IRQ_1) — the two
+        // lines are independently routed via INT0_INTE / INT1_INTE.
+        //
+        // This test fails on the over-route code path (which only
+        // reads `irq_flags`, not the INTE/INTF registers). It passes
+        // once `tick_pio_and_route_irqs_single` is wired through
+        // `PioBlock::int0_ints` / `int1_ints`.
         let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
         emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
-        // Force PIO0 IRQ flag bit 2 via IRQ_FORCE.
-        emu.bus.write32(PIO0_BASE + 0x034, 0x04);
+        // Enable PIO0 SM0 so `pio_all_idle()` returns false and the
+        // slow path runs IRQ routing each cycle. Mirrors the PicoGUS
+        // production case (ISA IOW SM is always enabled).
+        emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+        emu.bus.write32(PIO0_BASE + 0x130, 0x001);
         emu.step();
         assert!(emu.bus.nvics[0].is_pending(IRQ_PIO0_IRQ_0 as u8),
-            "PIO0 bit 2 must over-route to NVIC #7 until INTE lands");
-        assert!(emu.bus.nvics[0].is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
-            "PIO0 bit 2 must over-route to NVIC #8 until INTE lands");
+            "INT0_INTF bit 0 must route to NVIC #7 (PIO0_IRQ_0)");
+        assert!(!emu.bus.nvics[0].is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
+            "INT0_INTF bit 0 must NOT bleed into NVIC #8 (PIO0_IRQ_1)");
     }
 }
 

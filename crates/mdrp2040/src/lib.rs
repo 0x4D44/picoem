@@ -392,39 +392,25 @@ impl Emulator {
     /// their IRQ flags into [`Bus::irq_pending`].
     ///
     /// Per HLD V7 §5.5 + Appendix B, each PIO block has 8 internal
-    /// IRQ flags (`IRQ[7:0]`). Flags `IRQ[3:0]` can be routed to
-    /// either of the block's two NVIC lines via the `INTn_INTE`
-    /// enable registers; flags `IRQ[7:4]` stay block-local (SM-to-SM
-    /// signalling) and do not reach the NVIC. NVIC mapping:
-    /// PIO0_IRQ_0/1 are NVIC #7/#8, PIO1_IRQ_0/1 are NVIC #9/#10.
-    ///
-    /// **Temporary simplification**: `INT0_INTE` / `INT1_INTE` (plus
-    /// their `INTF` / `INTS` siblings) are not modelled yet. Until
-    /// they are, we over-route — if *any* of bits 0-3 of a block's
-    /// pending-IRQ word is set, we fire *both* of that block's NVIC
-    /// lines. This is strictly safer than silently dropping bits 2-3
-    /// (what the previous `& 0x3` mask did): firmware that enables a
-    /// handler sees a spurious wake at most, never a missed one. See
-    /// `tech_debt.md` entry "PIO INTn_INTE routing not modelled".
+    /// Per-block 12-bit raw status (`IRQ[3:0]` + RXNEMPTY[3:0] +
+    /// TXNFULL[3:0]) is masked through `INT0_INTE` / `INT1_INTE` and
+    /// OR'd with `INT0_INTF` / `INT1_INTF` to derive the effective
+    /// values on each NVIC line. Each block has two lines: PIO0_IRQ_0/1
+    /// at NVIC #7/#8 and PIO1_IRQ_0/1 at NVIC #9/#10. PicoGUS firmware
+    /// enables `RXNEMPTY_SM0` on PIO0 INT0_INTE so its ISA handler
+    /// fires when an autopushed event lands in PIO0 SM0's RX FIFO.
     fn tick_pio_and_route_irqs_single(&mut self) {
         let gpio_in = self.bus.gpio_in;
         self.bus.pio[0].step_n(1, gpio_in);
         self.bus.pio[1].step_n(1, gpio_in);
-        // Mask to IRQ[3:0] — the NVIC-routable subset per HLD V7
-        // Appendix B. Bits 4-7 are intra-PIO signalling and must not
-        // escape to the NVIC.
-        let any0 = (self.bus.pio[0].pending_irqs() & 0xF) != 0;
-        let any1 = (self.bus.pio[1].pending_irqs() & 0xF) != 0;
-        // Over-route: any flagged bit on a block fires both of that
-        // block's NVIC lines. Remove when INT0_INTE/INT1_INTE land.
-        let mut nvic_bits = 0u32;
-        if any0 {
-            nvic_bits |= 0b11 << 7; // NVIC #7 + #8 (PIO0_IRQ_0/1)
+        for (block, line0_bit) in [(0usize, 7u32), (1usize, 9u32)] {
+            if self.bus.pio[block].int0_ints() != 0 {
+                self.bus.irq_pending |= 1u32 << line0_bit;
+            }
+            if self.bus.pio[block].int1_ints() != 0 {
+                self.bus.irq_pending |= 1u32 << (line0_bit + 1);
+            }
         }
-        if any1 {
-            nvic_bits |= 0b11 << 9; // NVIC #9 + #10 (PIO1_IRQ_0/1)
-        }
-        self.bus.irq_pending |= nvic_bits;
     }
 
     /// Advance both PIO blocks by `cycles` system-clock cycles.
