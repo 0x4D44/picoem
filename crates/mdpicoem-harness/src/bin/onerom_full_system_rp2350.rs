@@ -241,15 +241,15 @@ fn main() -> ExitCode {
             // actually see when firmware programs each PIO block's first
             // instruction slot.
             let snap = PeriphSnapshot {
-                resets:       emu.bus.read32(0x4002_0000),
+                resets:       emu.bus.read32(0x4002_0000, 0),
                 pio0_ctrl:    emu.bus.pio[0].read32(0x000),
                 pio1_ctrl:    emu.bus.pio[1].read32(0x000),
                 pio2_ctrl:    emu.bus.pio[2].read32(0x000),
                 pio0_im0:     emu.bus.pio[0].instr_mem()[0] as u32,
                 pio1_im0:     emu.bus.pio[1].instr_mem()[0] as u32,
                 pio2_im0:     emu.bus.pio[2].instr_mem()[0] as u32,
-                clk_sys_ctrl: emu.bus.read32(0x4001_003C),
-                clk_sys_sel:  emu.bus.read32(0x4001_0044),
+                clk_sys_ctrl: emu.bus.read32(0x4001_003C, 0),
+                clk_sys_sel:  emu.bus.read32(0x4001_0044, 0),
             };
             let mut push = |tag: &'static str, old: u32, new: u32| {
                 if old != new {
@@ -383,7 +383,7 @@ fn main() -> ExitCode {
         ("0x10005094 (CBZ)", 0x10005094u32),
         ("0x10005098 (prologue?)", 0x10005098u32),
     ] {
-        let w = emu.bus.read32(addr);
+        let w = emu.bus.read32(addr, 0);
         println!("  {:32} = 0x{:08X}", label, w);
     }
 
@@ -423,8 +423,8 @@ fn main() -> ExitCode {
     println!("CLOCKS DIAGNOSTICS:");
     println!(
         "  CLK_SYS_CTRL = 0x{:08X}  CLK_SYS_SELECTED = 0x{:08X}",
-        emu.bus.read32(0x4001_003C),
-        emu.bus.read32(0x4001_0044)
+        emu.bus.read32(0x4001_003C, 0),
+        emu.bus.read32(0x4001_0044, 0)
     );
     println!("  sys_clk_hz (computed) = {}", emu.bus.sys_clk_hz());
 

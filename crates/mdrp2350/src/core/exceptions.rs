@@ -69,7 +69,7 @@ impl CortexM33 {
         // cannot collide with a real Thumb instruction PC (those are
         // even-aligned in the low 28 bits of the address map). Regular
         // PC publishing resumes at the handler's first `decode_execute`.
-        bus.set_active_pc(0xFFFF_FFFE);
+        bus.set_active_pc(0xFFFF_FFFE, self.core_id);
 
         if exc_num == 3 && self.regs.ipsr() == 3 {
             self.halted = true;
@@ -123,14 +123,14 @@ impl CortexM33 {
         }
 
         // Push exception frame: R0, R1, R2, R3, R12, LR, ReturnAddress, xPSR
-        bus.write32(frame_sp, self.regs.r[0]);
-        bus.write32(frame_sp.wrapping_add(4), self.regs.r[1]);
-        bus.write32(frame_sp.wrapping_add(8), self.regs.r[2]);
-        bus.write32(frame_sp.wrapping_add(12), self.regs.r[3]);
-        bus.write32(frame_sp.wrapping_add(16), self.regs.r[12]);
-        bus.write32(frame_sp.wrapping_add(20), self.regs.lr());
-        bus.write32(frame_sp.wrapping_add(24), self.return_address(exc_num));
-        bus.write32(frame_sp.wrapping_add(28), stacked_xpsr);
+        bus.write32(frame_sp, self.regs.r[0], self.core_id);
+        bus.write32(frame_sp.wrapping_add(4), self.regs.r[1], self.core_id);
+        bus.write32(frame_sp.wrapping_add(8), self.regs.r[2], self.core_id);
+        bus.write32(frame_sp.wrapping_add(12), self.regs.r[3], self.core_id);
+        bus.write32(frame_sp.wrapping_add(16), self.regs.r[12], self.core_id);
+        bus.write32(frame_sp.wrapping_add(20), self.regs.lr(), self.core_id);
+        bus.write32(frame_sp.wrapping_add(24), self.return_address(exc_num), self.core_id);
+        bus.write32(frame_sp.wrapping_add(28), stacked_xpsr, self.core_id);
 
         // FP context — eager (LSPEN=0) writes S0-S15 + FPSCR now; lazy
         // (LSPEN=1, default) reserves the slots and sets FPCCR.LSPACT
@@ -155,10 +155,11 @@ impl CortexM33 {
                     bus.write32(
                         fp_region_sp.wrapping_add((i as u32) * 4),
                         self.regs.s[i].to_bits(),
+                        self.core_id,
                     );
                 }
-                bus.write32(fp_region_sp.wrapping_add(64), self.regs.fpscr);
-                bus.write32(fp_region_sp.wrapping_add(68), 0);
+                bus.write32(fp_region_sp.wrapping_add(64), self.regs.fpscr, self.core_id);
+                bus.write32(fp_region_sp.wrapping_add(68), 0, self.core_id);
             }
             // Reset FPSCR from FPDSCR active bits: AHP[26], DN[25],
             // FZ[24], RMODE[23:22] (DDI0553 §B3.4.3). Cumulative
@@ -191,7 +192,7 @@ impl CortexM33 {
 
         // Fetch vector from table
         let vtor = bus.ppb[bus.active_core()].vtor;
-        let vector = bus.read32(vtor.wrapping_add((exc_num as u32) * 4));
+        let vector = bus.read32(vtor.wrapping_add((exc_num as u32) * 4), self.core_id);
         self.regs.set_pc(vector & !1);
 
         // Enter handler mode: set IPSR, force MSP, clear IT.
@@ -216,7 +217,7 @@ impl CortexM33 {
         // the entry sentinel `0xFFFF_FFFE` and cannot collide with a
         // real Thumb instruction PC. Regular PC publishing resumes when
         // the returned-to instruction hits `decode_execute`.
-        bus.set_active_pc(0xFFFF_FFFD);
+        bus.set_active_pc(0xFFFF_FFFD, self.core_id);
 
         let active_exc = self.regs.ipsr(); // capture BEFORE popping
 
@@ -262,14 +263,14 @@ impl CortexM33 {
         let sp = if return_to_psp { self.regs.psp } else { self.regs.msp };
 
         // Pop basic frame
-        self.regs.r[0] = bus.read32(sp);
-        self.regs.r[1] = bus.read32(sp.wrapping_add(4));
-        self.regs.r[2] = bus.read32(sp.wrapping_add(8));
-        self.regs.r[3] = bus.read32(sp.wrapping_add(12));
-        self.regs.r[12] = bus.read32(sp.wrapping_add(16));
-        self.regs.r[14] = bus.read32(sp.wrapping_add(20));
-        let return_pc = bus.read32(sp.wrapping_add(24));
-        let return_xpsr = bus.read32(sp.wrapping_add(28));
+        self.regs.r[0] = bus.read32(sp, self.core_id);
+        self.regs.r[1] = bus.read32(sp.wrapping_add(4), self.core_id);
+        self.regs.r[2] = bus.read32(sp.wrapping_add(8), self.core_id);
+        self.regs.r[3] = bus.read32(sp.wrapping_add(12), self.core_id);
+        self.regs.r[12] = bus.read32(sp.wrapping_add(16), self.core_id);
+        self.regs.r[14] = bus.read32(sp.wrapping_add(20), self.core_id);
+        let return_pc = bus.read32(sp.wrapping_add(24), self.core_id);
+        let return_xpsr = bus.read32(sp.wrapping_add(28), self.core_id);
 
         self.regs.set_pc(return_pc & !1);
 
@@ -288,10 +289,10 @@ impl CortexM33 {
                 bus.ppb[core].fpccr &= !FPCCR_LSPACT;
             } else {
                 for i in 0..16 {
-                    let bits = bus.read32(fp_region_sp.wrapping_add((i as u32) * 4));
+                    let bits = bus.read32(fp_region_sp.wrapping_add((i as u32) * 4), self.core_id);
                     self.regs.s[i] = f32::from_bits(bits);
                 }
-                self.regs.fpscr = bus.read32(fp_region_sp.wrapping_add(64));
+                self.regs.fpscr = bus.read32(fp_region_sp.wrapping_add(64), self.core_id);
             }
         }
 
@@ -715,14 +716,14 @@ mod tests {
         // MemManage (4).
         let core = bus.active_core();
         bus.ppb[core].vtor = VT_BASE;
-        bus.write32(VT_BASE + 8,  HANDLER_VEC); // NMI       (exc 2)
-        bus.write32(VT_BASE + 12, HANDLER_VEC); // HardFault (exc 3)
-        bus.write32(VT_BASE + 16, HANDLER_VEC); // MemManage (exc 4)
+        bus.write32(VT_BASE + 8,  HANDLER_VEC, 0); // NMI       (exc 2)
+        bus.write32(VT_BASE + 12, HANDLER_VEC, 0); // HardFault (exc 3)
+        bus.write32(VT_BASE + 16, HANDLER_VEC, 0); // MemManage (exc 4)
         // `B .` (0xE7FE) at the handler address — keeps the handler
         // well-defined without halting (BKPT halts via the debugger
         // semantic). Tests that exercise step-after-entry rely on the
         // handler being a no-op-equivalent.
-        bus.write32(HANDLER_ADDR, 0x0000_E7FE);
+        bus.write32(HANDLER_ADDR, 0x0000_E7FE, 0);
 
         (cpu, bus)
     }

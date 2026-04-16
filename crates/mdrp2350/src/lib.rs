@@ -214,6 +214,12 @@ impl Emulator {
         // uses `consumed` instead; mdrp2350 explicitly diverges because
         // the ARMv8-M dual-core contention model is disabled here
         // (CLAUDE.md "Bank contention model").
+        // Peripherals (and DMA inside them) issue bus reads/writes as
+        // core 0 per the Phase 0b.1 DMA CoreId convention. During the
+        // interim migration, Bus methods `debug_assert!` that their
+        // `core` argument equals `self.active_core`, so we reset the
+        // active-core indicator to 0 before the peripheral sweep.
+        self.bus.set_active_core(0);
         self.tick_peripherals(self.step_quantum);
         self.tick_systick();
         self.wake_checks();
@@ -354,7 +360,7 @@ impl Emulator {
         // observe the current cycle count when the harness pokes MMIO
         // outside the step path. See HLD §6 P2.
         self.bus.master_cycle = self.clock.cycles;
-        self.bus.write32(addr, value);
+        self.bus.write32(addr, value, 0);
     }
 
     /// Read a 32-bit word from an MMIO address via the bus. Charges zero
@@ -371,7 +377,7 @@ impl Emulator {
         // Mirror the `step()` stash so PLL CS reads observe the current
         // cycle count when the harness reads MMIO outside the step path.
         self.bus.master_cycle = self.clock.cycles;
-        self.bus.read32(addr)
+        self.bus.read32(addr, 0)
     }
 }
 

@@ -355,16 +355,16 @@ fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
 
     // Seed the data slot so LDR yields a deterministic value and STR has
     // somewhere to land.
-    emu.bus.write32(data_addr, 0xCAFE_BABE);
+    emu.bus.write32(data_addr, 0xCAFE_BABE, 0);
 
     // Enable DWT on the emulator side too, for parity even though we do
     // not sample CYCCNT here — the emulator's cycle accounting lives on
     // `core.cycles()`.
-    let demcr = emu.bus.read32(silicon_oracle::DEMCR_U32);
-    emu.bus.write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA);
-    let ctrl = emu.bus.read32(silicon_oracle::DWT_CTRL_U32);
+    let demcr = emu.bus.read32(silicon_oracle::DEMCR_U32, 0);
+    emu.bus.write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA, 0);
+    let ctrl = emu.bus.read32(silicon_oracle::DWT_CTRL_U32, 0);
     emu.bus
-        .write32(silicon_oracle::DWT_CTRL_U32, ctrl | silicon_oracle::CYCCNTENA);
+        .write32(silicon_oracle::DWT_CTRL_U32, ctrl | silicon_oracle::CYCCNTENA, 0);
 
     // Prime core 0 registers to execute exactly one instruction.
     emu.cores[0].wake();

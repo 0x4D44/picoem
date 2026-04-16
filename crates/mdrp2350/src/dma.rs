@@ -504,14 +504,14 @@ impl Dma {
 
         // Issue one transfer.
         let value = match size {
-            1 => bus.read8(read_addr) as u32,
-            2 => bus.read16(read_addr) as u32,
-            _ => bus.read32(read_addr),
+            1 => bus.read8(read_addr, 0) as u32,
+            2 => bus.read16(read_addr, 0) as u32,
+            _ => bus.read32(read_addr, 0),
         };
         match size {
-            1 => bus.write8(write_addr, value as u8),
-            2 => bus.write16(write_addr, value as u16),
-            _ => bus.write32(write_addr, value),
+            1 => bus.write8(write_addr, value as u8, 0),
+            2 => bus.write16(write_addr, value as u16, 0),
+            _ => bus.write32(write_addr, value, 0),
         }
 
         // Update addresses.
@@ -687,7 +687,7 @@ mod tests {
     fn release_dma(bus: &mut Bus) {
         use crate::bus::RESET_DMA;
         // CLR alias at RESETS: offset 0x3000.
-        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA);
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
     }
 
     // ----------------------------------------------------------------
@@ -701,13 +701,13 @@ mod tests {
         release_dma(&mut bus);
 
         // Write ch0 registers via DMA_BASE
-        bus.write32(DMA_BASE + 0x00, 0x2000_1000); // READ_ADDR
-        bus.write32(DMA_BASE + 0x04, 0x2000_2000); // WRITE_ADDR
-        bus.write32(DMA_BASE + 0x08, 42);           // TRANS_COUNT
+        bus.write32(DMA_BASE + 0x00, 0x2000_1000, 0); // READ_ADDR
+        bus.write32(DMA_BASE + 0x04, 0x2000_2000, 0); // WRITE_ADDR
+        bus.write32(DMA_BASE + 0x08, 42, 0);           // TRANS_COUNT
 
-        assert_eq!(bus.read32(DMA_BASE + 0x00), 0x2000_1000);
-        assert_eq!(bus.read32(DMA_BASE + 0x04), 0x2000_2000);
-        assert_eq!(bus.read32(DMA_BASE + 0x08), 42);
+        assert_eq!(bus.read32(DMA_BASE + 0x00, 0), 0x2000_1000);
+        assert_eq!(bus.read32(DMA_BASE + 0x04, 0), 0x2000_2000);
+        assert_eq!(bus.read32(DMA_BASE + 0x08, 0), 42);
     }
 
     // ----------------------------------------------------------------
@@ -722,18 +722,18 @@ mod tests {
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
         // Seed source memory
-        bus.write32(src, 0xDEAD_BEEF);
+        bus.write32(src, 0xDEAD_BEEF, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         // CTRL_TRIG: EN=1, DATA_SIZE=2 (word), INCR_READ=1, INCR_WRITE=1,
         // TREQ_SEL=63 (FORCE), CHAIN_TO=0 (self = no chain)
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // Read CTRL_TRIG — BUSY should be set
-        let readback = bus.read32(DMA_BASE + 0x0C);
+        let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_ne!(readback & CTRL_BUSY, 0, "BUSY must be set after CTRL_TRIG write");
     }
 
@@ -748,20 +748,20 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write32(src, 0xCAFE_BABE);
+        bus.write32(src, 0xCAFE_BABE, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // Tick once — should complete the transfer
         bus.tick_dma();
 
-        assert_eq!(bus.read32(dst), 0xCAFE_BABE);
+        assert_eq!(bus.read32(dst, 0), 0xCAFE_BABE);
         // BUSY should be clear
-        let readback = bus.read32(DMA_BASE + 0x0C);
+        let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(readback & CTRL_BUSY, 0, "BUSY must clear after transfer completes");
     }
 
@@ -777,14 +777,14 @@ mod tests {
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
         for i in 0..4u32 {
-            bus.write32(src + i * 4, i + 1);
+            bus.write32(src + i * 4, i + 1, 0);
         }
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 4);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // Tick 4 times
         for _ in 0..4 {
@@ -793,12 +793,12 @@ mod tests {
 
         // Verify destination
         for i in 0..4u32 {
-            assert_eq!(bus.read32(dst + i * 4), i + 1, "word {i} mismatch");
+            assert_eq!(bus.read32(dst + i * 4, 0), i + 1, "word {i} mismatch");
         }
         // INTR bit 0 should be set
-        assert_ne!(bus.read32(DMA_BASE + REG_INTR) & 1, 0, "INTR bit 0 must latch");
+        assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0, "INTR bit 0 must latch");
         // BUSY should be clear
-        let ctrl_read = bus.read32(DMA_BASE + 0x0C);
+        let ctrl_read = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(ctrl_read & CTRL_BUSY, 0, "BUSY must be clear");
     }
 
@@ -813,22 +813,22 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write32(src, 0xAAAA_BBBB);
+        bus.write32(src, 0xAAAA_BBBB, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         // TREQ_SEL = UART0_TX (28) — UART0 is empty so DREQ should be
         // deasserted (TX not enabled).
         let ctrl = make_ctrl(true, 2, true, true, 28, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // Tick — DREQ not asserted, so no transfer should happen
         bus.tick_dma();
 
-        assert_eq!(bus.read32(dst), 0, "no transfer should occur when DREQ is not asserted");
+        assert_eq!(bus.read32(dst, 0), 0, "no transfer should occur when DREQ is not asserted");
         // Channel should still be BUSY
-        let readback = bus.read32(DMA_BASE + 0x0C);
+        let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_ne!(readback & CTRL_BUSY, 0, "channel must remain BUSY");
     }
 
@@ -845,15 +845,15 @@ mod tests {
         // 16-byte ring buffer at 0x2000_0200 (aligned to 16 bytes)
         let dst: u32 = 0x2000_0200;
         for i in 0..8u32 {
-            bus.write32(src + i * 4, 0x1000 + i);
+            bus.write32(src + i * 4, 0x1000 + i, 0);
         }
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 8);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 8, 0);
         // RING_SIZE=4 (16 bytes), RING_SEL=1 (ring on write address)
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 4, true);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // Tick 8 times — writes wrap around the 16-byte ring
         for _ in 0..8 {
@@ -862,10 +862,10 @@ mod tests {
 
         // After 8 words, the write pointer should have wrapped twice.
         // The last 4 words overwrite the first 4.
-        assert_eq!(bus.read32(dst + 0), 0x1004, "ring wrap word 0");
-        assert_eq!(bus.read32(dst + 4), 0x1005, "ring wrap word 1");
-        assert_eq!(bus.read32(dst + 8), 0x1006, "ring wrap word 2");
-        assert_eq!(bus.read32(dst + 12), 0x1007, "ring wrap word 3");
+        assert_eq!(bus.read32(dst + 0, 0), 0x1004, "ring wrap word 0");
+        assert_eq!(bus.read32(dst + 4, 0), 0x1005, "ring wrap word 1");
+        assert_eq!(bus.read32(dst + 8, 0), 0x1006, "ring wrap word 2");
+        assert_eq!(bus.read32(dst + 12, 0), 0x1007, "ring wrap word 3");
     }
 
     // ----------------------------------------------------------------
@@ -880,41 +880,41 @@ mod tests {
         // Channel 0: copy one word from src0 to dst0, chain to ch 1
         let src0: u32 = 0x2000_0100;
         let dst0: u32 = 0x2000_0200;
-        bus.write32(src0, 0xAAAA_0000);
+        bus.write32(src0, 0xAAAA_0000, 0);
 
-        bus.write32(DMA_BASE + 0x00, src0);
-        bus.write32(DMA_BASE + 0x04, dst0);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x00, src0, 0);
+        bus.write32(DMA_BASE + 0x04, dst0, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         // CHAIN_TO=1 (chain to channel 1)
         let ctrl0 = make_ctrl(true, 2, true, true, 63, 1, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl0);
+        bus.write32(DMA_BASE + 0x0C, ctrl0, 0);
 
         // Channel 1: pre-program (no trigger yet)
         let src1: u32 = 0x2000_0300;
         let dst1: u32 = 0x2000_0400;
-        bus.write32(src1, 0xBBBB_1111);
+        bus.write32(src1, 0xBBBB_1111, 0);
 
         // Use AL1_CTRL (no trigger) to write ch1 CTRL
-        bus.write32(DMA_BASE + 0x40 + 0x00, src1);    // ch1 READ_ADDR
-        bus.write32(DMA_BASE + 0x40 + 0x04, dst1);    // ch1 WRITE_ADDR
-        bus.write32(DMA_BASE + 0x40 + 0x08, 1);       // ch1 TRANS_COUNT
+        bus.write32(DMA_BASE + 0x40 + 0x00, src1, 0);    // ch1 READ_ADDR
+        bus.write32(DMA_BASE + 0x40 + 0x04, dst1, 0);    // ch1 WRITE_ADDR
+        bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0);       // ch1 TRANS_COUNT
         let ctrl1 = make_ctrl(true, 2, true, true, 63, 1, 0, false);
-        bus.write32(DMA_BASE + 0x40 + 0x10, ctrl1);   // ch1 AL1_CTRL (no trigger)
+        bus.write32(DMA_BASE + 0x40 + 0x10, ctrl1, 0);   // ch1 AL1_CTRL (no trigger)
 
         // Tick once: ch0 completes, chains to ch1
         bus.tick_dma();
-        assert_eq!(bus.read32(dst0), 0xAAAA_0000);
+        assert_eq!(bus.read32(dst0, 0), 0xAAAA_0000);
 
         // ch1 should now be BUSY
-        let ch1_ctrl = bus.read32(DMA_BASE + 0x40 + 0x0C);
+        let ch1_ctrl = bus.read32(DMA_BASE + 0x40 + 0x0C, 0);
         assert_ne!(ch1_ctrl & CTRL_BUSY, 0, "channel 1 must be BUSY after chain");
 
         // Tick again: ch1 completes
         bus.tick_dma();
-        assert_eq!(bus.read32(dst1), 0xBBBB_1111);
+        assert_eq!(bus.read32(dst1, 0), 0xBBBB_1111);
 
         // Both INTR bits should be set
-        let intr = bus.read32(DMA_BASE + REG_INTR);
+        let intr = bus.read32(DMA_BASE + REG_INTR, 0);
         assert_ne!(intr & (1 << 0), 0, "ch0 INTR");
         assert_ne!(intr & (1 << 1), 0, "ch1 INTR");
     }
@@ -930,22 +930,22 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 100); // large count
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 100, 0); // large count
         // TREQ_SEL=28 (UART0_TX) — DREQ gated so no transfers happen
         let ctrl = make_ctrl(true, 2, true, true, 28, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // Verify BUSY
-        let r = bus.read32(DMA_BASE + 0x0C);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
         assert_ne!(r & CTRL_BUSY, 0);
 
         // Abort ch0
-        bus.write32(DMA_BASE + REG_CHAN_ABORT, 0x0001);
+        bus.write32(DMA_BASE + REG_CHAN_ABORT, 0x0001, 0);
 
         // BUSY should be clear
-        let r = bus.read32(DMA_BASE + 0x0C);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(r & CTRL_BUSY, 0, "abort must clear BUSY");
     }
 
@@ -960,21 +960,21 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write32(src, 0x12345678);
+        bus.write32(src, 0x12345678, 0);
 
         // Enable INTE0 bit 0
-        bus.write32(DMA_BASE + REG_INTE0, 0x0001);
+        bus.write32(DMA_BASE + REG_INTE0, 0x0001, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         bus.tick_dma();
 
         // INTS0 should be nonzero
-        let ints0 = bus.read32(DMA_BASE + REG_INTS0);
+        let ints0 = bus.read32(DMA_BASE + REG_INTS0, 0);
         assert_ne!(ints0, 0, "INTS0 must be set after transfer completes with INTE0 enabled");
 
         // irq_pending should have DMA_IRQ_0 set
@@ -992,20 +992,20 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write32(src, 0xABCD_EF01);
+        bus.write32(src, 0xABCD_EF01, 0);
 
         // Enable INTE1 bit 0
-        bus.write32(DMA_BASE + REG_INTE1, 0x0001);
+        bus.write32(DMA_BASE + REG_INTE1, 0x0001, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         bus.tick_dma();
 
-        let ints1 = bus.read32(DMA_BASE + REG_INTS1);
+        let ints1 = bus.read32(DMA_BASE + REG_INTS1, 0);
         assert_ne!(ints1, 0, "INTS1 must be set");
         assert_ne!(
             bus.irq_pending[0] & (1u64 << IRQ_DMA_IRQ_1),
@@ -1025,18 +1025,18 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write32(src, 0x11111111);
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(src, 0x11111111, 0);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
         bus.tick_dma();
 
-        assert_ne!(bus.read32(DMA_BASE + REG_INTR) & 1, 0);
+        assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0);
         // W1C: write 1 to bit 0 to clear
-        bus.write32(DMA_BASE + REG_INTR, 1);
-        assert_eq!(bus.read32(DMA_BASE + REG_INTR) & 1, 0, "INTR bit 0 must be cleared");
+        bus.write32(DMA_BASE + REG_INTR, 1, 0);
+        assert_eq!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0, "INTR bit 0 must be cleared");
     }
 
     // ----------------------------------------------------------------
@@ -1047,11 +1047,11 @@ mod tests {
     fn collect_dreqs_uart0_tx() {
         let mut bus = Bus::new();
         // Release UART0 from RESETS
-        bus.write32(0x4002_0000 + 0x3000, 1u32 << crate::bus::RESET_UART0);
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << crate::bus::RESET_UART0, 0);
 
         // Enable UART0: UARTEN=1, TXE=1 in UARTCR
         use crate::peripherals::uart::UART0_BASE;
-        bus.write32(UART0_BASE + 0x030, (1 << 0) | (1 << 8)); // UARTEN | TXE
+        bus.write32(UART0_BASE + 0x030, (1 << 0) | (1 << 8), 0); // UARTEN | TXE
 
         let dreqs = bus.collect_dreqs();
         // UART0 TX DREQ is at bit 28 on RP2350
@@ -1073,21 +1073,21 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write8(src, 0xAB);
-        bus.write8(src + 1, 0xCD);
+        bus.write8(src, 0xAB, 0);
+        bus.write8(src + 1, 0xCD, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 2);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 2, 0);
         // DATA_SIZE=0 (byte), INCR_READ=1, INCR_WRITE=1
         let ctrl = make_ctrl(true, 0, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         bus.tick_dma();
         bus.tick_dma();
 
-        assert_eq!(bus.read8(dst), 0xAB);
-        assert_eq!(bus.read8(dst + 1), 0xCD);
+        assert_eq!(bus.read8(dst, 0), 0xAB);
+        assert_eq!(bus.read8(dst + 1, 0), 0xCD);
     }
 
     // ----------------------------------------------------------------
@@ -1101,21 +1101,21 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write16(src, 0x1234);
-        bus.write16(src + 2, 0x5678);
+        bus.write16(src, 0x1234, 0);
+        bus.write16(src + 2, 0x5678, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 2);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 2, 0);
         // DATA_SIZE=1 (halfword)
         let ctrl = make_ctrl(true, 1, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         bus.tick_dma();
         bus.tick_dma();
 
-        assert_eq!(bus.read16(dst), 0x1234);
-        assert_eq!(bus.read16(dst + 2), 0x5678);
+        assert_eq!(bus.read16(dst, 0), 0x1234);
+        assert_eq!(bus.read16(dst + 2, 0), 0x5678);
     }
 
     // ----------------------------------------------------------------
@@ -1129,17 +1129,17 @@ mod tests {
 
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
-        bus.write32(src, 0x11111111);
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(src, 0x11111111, 0);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         let mut ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
         ctrl |= CTRL_IRQ_QUIET;
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         bus.tick_dma();
 
-        assert_eq!(bus.read32(DMA_BASE + REG_INTR), 0, "IRQ_QUIET must suppress INTR");
+        assert_eq!(bus.read32(DMA_BASE + REG_INTR, 0), 0, "IRQ_QUIET must suppress INTR");
     }
 
     // ----------------------------------------------------------------
@@ -1154,24 +1154,24 @@ mod tests {
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0300;
         for i in 0..4u32 {
-            bus.write32(src + i * 4, 0xA000_0000 + i);
+            bus.write32(src + i * 4, 0xA000_0000 + i, 0);
         }
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 4);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         for _ in 0..4 {
             bus.tick_dma();
         }
 
         for i in 0..4u32 {
-            assert_eq!(bus.read32(dst + i * 4), 0xA000_0000 + i, "word {i}");
+            assert_eq!(bus.read32(dst + i * 4, 0), 0xA000_0000 + i, "word {i}");
         }
         // INTR bit 0 set
-        assert_ne!(bus.read32(DMA_BASE + REG_INTR) & 1, 0);
+        assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0);
     }
 
     // ----------------------------------------------------------------

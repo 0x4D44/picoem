@@ -250,7 +250,7 @@ impl CortexM33 {
         // itself is tagged with its own PC. Zero-cost when tracing is
         // off — the store lands in a cold struct field touched only
         // by `emit_trace`.
-        bus.set_active_pc(pc);
+        bus.set_active_pc(pc, self.core_id);
 
         // Cache lookup — by-value (`DecodedOp: Copy`), so no borrow on
         // `bus` survives into dispatch.
@@ -382,7 +382,7 @@ impl CortexM33 {
         // `entry.fetch_wait` on both paths.
         bus.reset_extra_wait_states();
 
-        let hw0 = bus.read16(pc);
+        let hw0 = bus.read16(pc, self.core_id);
         if bus.bus_fault() {
             // Fetch fault — DO NOT cache. Return a minimal entry so the
             // caller's dispatch path can proceed and the post-step fault
@@ -398,7 +398,7 @@ impl CortexM33 {
         }
 
         let wide = is_wide(hw0);
-        let hw1 = if wide { bus.read16(pc.wrapping_add(2)) } else { 0 };
+        let hw1 = if wide { bus.read16(pc.wrapping_add(2), self.core_id) } else { 0 };
         if wide && bus.bus_fault() {
             return DecodedOp {
                 tag: u32::MAX,

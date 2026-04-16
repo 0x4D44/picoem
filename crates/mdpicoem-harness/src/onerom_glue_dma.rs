@@ -219,17 +219,17 @@ impl GlueDma {
                 // firmware yet, we still land the write in peripheral_regs
                 // (the poll_triggers tick after CH1's own CTRL_TRIG write
                 // will then latch it cleanly).
-                bus.write32(DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR, self.ch0_pending_addr);
+                bus.write32(DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR, self.ch0_pending_addr, 0);
             }
             return;
         }
 
         // New read trigger: if PIO1 SM0 has an address word waiting, pop it
         // and start the 4-cycle read pipeline.
-        let fstat = bus.read32(PIO_BASES[1] + PIO_FSTAT);
+        let fstat = bus.read32(PIO_BASES[1] + PIO_FSTAT, 0);
         let sm0_rx_empty = (fstat >> (FSTAT_RXEMPTY_SM0 + 0)) & 1 != 0;
         if !sm0_rx_empty {
-            self.ch0_pending_addr = bus.read32(PIO_BASES[1] + PIO_RXF0);
+            self.ch0_pending_addr = bus.read32(PIO_BASES[1] + PIO_RXF0, 0);
             self.ch0_read_delay = DMA_READ_CYCLES;
         }
     }
@@ -246,7 +246,7 @@ impl GlueDma {
             if self.ch1_write_delay == 0 && self.ch1_has_pending {
                 let write_addr = self.ch[1].write_addr;
                 if let Some((pio_base, sm_idx)) = decode_pio_tx_addr(write_addr) {
-                    let fstat = bus.read32(pio_base + PIO_FSTAT);
+                    let fstat = bus.read32(pio_base + PIO_FSTAT, 0);
                     let tx_full = (fstat >> (FSTAT_TXFULL_SM0 + sm_idx)) & 1 != 0;
                     if tx_full {
                         // Retry next cycle.
@@ -261,7 +261,7 @@ impl GlueDma {
                 // the silent "push without back-pressure" path here
                 // becomes observable; add a one-shot eprintln! when
                 // `decode_pio_tx_addr` returns None so the case surfaces.
-                bus.write32(write_addr, self.ch1_value);
+                bus.write32(write_addr, self.ch1_value, 0);
                 self.ch1_has_pending = false;
                 self.ch1_value = 0;
                 self.ch1_push_count = self.ch1_push_count.saturating_add(1);
@@ -273,7 +273,7 @@ impl GlueDma {
         if self.ch1_read_delay > 0 {
             self.ch1_read_delay -= 1;
             if self.ch1_read_delay == 0 {
-                let byte = bus.read8(self.ch1_read_addr);
+                let byte = bus.read8(self.ch1_read_addr, 0);
                 // bit_mode=8: replicate the byte across all four lanes.
                 let v = byte as u32;
                 self.ch1_value = v | (v << 8) | (v << 16) | (v << 24);
@@ -300,7 +300,7 @@ impl GlueDma {
 }
 
 fn read_ch_reg(bus: &mut Bus, ch: u32, reg: u32) -> u32 {
-    bus.read32(DMA_BASE + ch * DMA_CH_STRIDE + reg)
+    bus.read32(DMA_BASE + ch * DMA_CH_STRIDE + reg, 0)
 }
 
 fn read_trig(bus: &mut Bus, ch: u32) -> u32 {
@@ -334,10 +334,10 @@ mod tests {
     /// upstream registers in the order firmware does. The values are
     /// `(read_addr, write_addr, trans_count, ctrl_trig)`.
     fn program_channel(bus: &mut Bus, ch: u32, r: u32, w: u32, n: u32, ctrl: u32) {
-        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_READ_ADDR, r);
-        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_WRITE_ADDR, w);
-        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_TRANS_COUNT, n);
-        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_CTRL_TRIG, ctrl);
+        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_READ_ADDR, r, 0);
+        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_WRITE_ADDR, w, 0);
+        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_TRANS_COUNT, n, 0);
+        bus.write32(DMA_BASE + ch * DMA_CH_STRIDE + DMA_CH_CTRL_TRIG, ctrl, 0);
     }
 
     fn new_emu() -> Emulator {
@@ -397,13 +397,13 @@ mod tests {
         let mut dma = GlueDma::new();
 
         // Put 0xA5 into SRAM at 0x2000_0100. SRAM base is 0x2000_0000.
-        emu.bus.write8(0x2000_0100, 0xA5);
+        emu.bus.write8(0x2000_0100, 0xA5, 0);
 
         // Bring PIO2 out of reset so writes to TXF0 aren't no-oped by any
         // future peripheral masking. (Today the emulator doesn't gate
         // PIO writes on RESETS, but it's the shape the firmware does —
         // keeps the test robust against future changes.)
-        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
 
         dma.prime_after_sync(&mut emu.bus);
 
@@ -431,7 +431,7 @@ mod tests {
 
         // Pop PIO2 SM0 TX FIFO by reading it indirectly: TXF is write-only,
         // but the FSTAT TXEMPTY bit (bit 24+sm) reports non-empty after a push.
-        let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT);
+        let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT, 0);
         let tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
         assert!(
             !tx_empty,
@@ -489,10 +489,10 @@ mod tests {
         let mut dma = GlueDma::new();
 
         // SRAM @ 0x2000_0200 holds 0x5A.
-        emu.bus.write8(0x2000_0200, 0x5A);
+        emu.bus.write8(0x2000_0200, 0x5A, 0);
 
         // Bring PIO1 + PIO2 out of reset.
-        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
 
         // Push the target address into PIO1 SM0 RX FIFO via the test hook.
         emu.bus.pio[1].push_rx(0, 0x2000_0200);
@@ -548,7 +548,7 @@ mod tests {
         );
 
         // PIO2 SM0 TX FIFO must now report non-empty.
-        let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT);
+        let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT, 0);
         let tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
         assert!(!tx_empty, "PIO2 SM0 TX empty after chain push; FSTAT=0x{:08X}", fstat);
     }
@@ -568,10 +568,10 @@ mod tests {
         let mut dma = GlueDma::new();
 
         // SRAM @ 0x2000_0100 holds 0xA5.
-        emu.bus.write8(0x2000_0100, 0xA5);
+        emu.bus.write8(0x2000_0100, 0xA5, 0);
 
         // Bring PIO2 out of reset.
-        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
 
         dma.prime_after_sync(&mut emu.bus);
 
@@ -595,7 +595,7 @@ mod tests {
              write_addr within 8 cycles"
         );
 
-        let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT);
+        let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT, 0);
         let sm0_tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
         let sm1_tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 1)) & 1 != 0;
 

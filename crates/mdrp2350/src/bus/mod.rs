@@ -731,8 +731,10 @@ impl Bus {
     /// `0xFFFF_FFFD`) so stacking / unstacking lines are distinguishable
     /// from ordinary instruction-driven access. See HLD V5 §4.2.7.
     #[inline]
-    pub fn set_active_pc(&mut self, pc: u32) {
-        self.active_pc[self.active_core] = pc;
+    pub fn set_active_pc(&mut self, pc: u32, core: u8) {
+        debug_assert_eq!(self.active_core, core as usize,
+            "core parameter must match active_core during interim migration");
+        self.active_pc[core as usize] = pc;
     }
 
     /// Emit a single trace line. `rw` is `'R'` or `'W'`, `size` is 1/2/4
@@ -765,10 +767,10 @@ impl Bus {
     /// "V2 reverted to runtime flag" decision in V4's review history.
     #[cold]
     #[inline(never)]
-    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32) {
+    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
         let line = format!(
             "TRACE {} {} 0x{:08X} val=0x{:08X} core={} pc=0x{:08X}",
-            rw, size, addr, val, self.active_core, self.active_pc[self.active_core]
+            rw, size, addr, val, core as usize, self.active_pc[core as usize]
         );
         if let Some(sink) = self.trace_sink.as_mut() {
             let _ = writeln!(sink, "{}", line);
@@ -1157,7 +1159,9 @@ impl Bus {
 
     // --- 8-bit access ---
 
-    pub fn read8(&mut self, addr: u32) -> u8 {
+    pub fn read8(&mut self, addr: u32, core: u8) -> u8 {
+        debug_assert_eq!(self.active_core, core as usize,
+            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -1178,7 +1182,7 @@ impl Bus {
                     self.bus_fault = true;
                     self.bus_fault_addr = addr;
                     if self.trace_enabled {
-                        self.emit_trace('R', 1, addr, 0);
+                        self.emit_trace('R', 1, addr, 0, core);
                     }
                     return 0;
                 }
@@ -1202,28 +1206,28 @@ impl Bus {
                         (UART0_BASE, crate::peripherals::uart::UARTDR) => {
                             let v = self.uart0.read8(crate::peripherals::uart::UARTDR);
                             if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32);
+                                self.emit_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
                             let v = self.spi0.read8(crate::peripherals::spi::SSPDR);
                             if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32);
+                                self.emit_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
                             let v = self.i2c0.read8(crate::peripherals::i2c::IC_DATA_CMD);
                             if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32);
+                                self.emit_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (ADC_BASE, crate::peripherals::adc::FIFO) => {
                             let v = self.adc.read8(crate::peripherals::adc::FIFO);
                             if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32);
+                                self.emit_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
@@ -1268,8 +1272,7 @@ impl Bus {
                     0x004 => self.gpio_in,
                     0x008 => self.read_gpio_hi_in(),
                     _ => {
-                        let core = self.active_core();
-                        self.sio.read32(word_offset, core)
+                        self.sio.read32(word_offset, core as usize)
                     }
                 };
                 word.to_le_bytes()[(addr & 3) as usize]
@@ -1283,12 +1286,14 @@ impl Bus {
             }
         };
         if self.trace_enabled {
-            self.emit_trace('R', 1, addr, val as u32);
+            self.emit_trace('R', 1, addr, val as u32, core);
         }
         val
     }
 
-    pub fn write8(&mut self, addr: u32, val: u8) {
+    pub fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        debug_assert_eq!(self.active_core, core as usize,
+            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -1349,7 +1354,7 @@ impl Bus {
                             );
                             self.raise_irqs_u64(ext_irqs);
                             if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32);
+                                self.emit_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1362,7 +1367,7 @@ impl Bus {
                             );
                             self.raise_irqs_u64(ext_irqs);
                             if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32);
+                                self.emit_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1375,7 +1380,7 @@ impl Bus {
                             );
                             self.raise_irqs_u64(ext_irqs);
                             if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32);
+                                self.emit_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1392,7 +1397,7 @@ impl Bus {
                         // doesn't hit this; matches RP2040 idiom.
                         (ADC_BASE, crate::peripherals::adc::FIFO) => {
                             if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32);
+                                self.emit_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1544,7 +1549,7 @@ impl Bus {
             _ => {} // ROM read-only, others unmapped/stub
         }
         if self.trace_enabled {
-            self.emit_trace('W', 1, addr, val as u32);
+            self.emit_trace('W', 1, addr, val as u32, core);
         }
     }
 
@@ -1573,7 +1578,9 @@ impl Bus {
 
     // --- 16-bit access ---
 
-    pub fn read16(&mut self, addr: u32) -> u16 {
+    pub fn read16(&mut self, addr: u32, core: u8) -> u16 {
+        debug_assert_eq!(self.active_core, core as usize,
+            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -1594,7 +1601,7 @@ impl Bus {
                     self.bus_fault = true;
                     self.bus_fault_addr = addr;
                     if self.trace_enabled {
-                        self.emit_trace('R', 2, addr, 0);
+                        self.emit_trace('R', 2, addr, 0, core);
                     }
                     return 0;
                 }
@@ -1616,7 +1623,7 @@ impl Bus {
                     if (base, offset) == (SPI0_BASE, crate::peripherals::spi::SSPDR) {
                         let v = self.spi0.read16(crate::peripherals::spi::SSPDR);
                         if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32);
+                            self.emit_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
@@ -1625,21 +1632,21 @@ impl Bus {
                     if (base, offset) == (UART0_BASE, crate::peripherals::uart::UARTDR) {
                         let v = self.uart0.read8(crate::peripherals::uart::UARTDR) as u16;
                         if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32);
+                            self.emit_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
                     if (base, offset) == (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) {
                         let v = self.i2c0.read32(crate::peripherals::i2c::IC_DATA_CMD) as u16;
                         if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32);
+                            self.emit_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
                     if (base, offset) == (ADC_BASE, crate::peripherals::adc::FIFO) {
                         let v = self.adc.read16(crate::peripherals::adc::FIFO);
                         if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32);
+                            self.emit_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
@@ -1683,8 +1690,7 @@ impl Bus {
                     0x004 => self.gpio_in,
                     0x008 => self.read_gpio_hi_in(),
                     _ => {
-                        let core = self.active_core();
-                        self.sio.read32(word_offset, core)
+                        self.sio.read32(word_offset, core as usize)
                     }
                 };
                 let half_idx = ((addr >> 1) & 1) as usize;
@@ -1693,7 +1699,7 @@ impl Bus {
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read16(addr),
             0xE => {
                 // PPB: extract halfword from 32-bit register read
-                let word = self.ppb[self.active_core()].read32(addr & !3);
+                let word = self.ppb[core as usize].read32(addr & !3);
                 let half_idx = ((addr >> 1) & 1) as usize;
                 [word as u16, (word >> 16) as u16][half_idx]
             }
@@ -1704,12 +1710,14 @@ impl Bus {
             }
         };
         if self.trace_enabled {
-            self.emit_trace('R', 2, addr, val as u32);
+            self.emit_trace('R', 2, addr, val as u32, core);
         }
         val
     }
 
-    pub fn write16(&mut self, addr: u32, val: u16) {
+    pub fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        debug_assert_eq!(self.active_core, core as usize,
+            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -1764,7 +1772,7 @@ impl Bus {
                             );
                             self.raise_irqs_u64(ext_irqs);
                             if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32);
+                                self.emit_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1777,7 +1785,7 @@ impl Bus {
                             );
                             self.raise_irqs_u64(ext_irqs);
                             if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32);
+                                self.emit_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1791,7 +1799,7 @@ impl Bus {
                             );
                             self.raise_irqs_u64(ext_irqs);
                             if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32);
+                                self.emit_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1800,7 +1808,7 @@ impl Bus {
                         // RMW path doesn't silently pop a sample.
                         (ADC_BASE, crate::peripherals::adc::FIFO) => {
                             if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32);
+                                self.emit_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1950,13 +1958,15 @@ impl Bus {
             _ => {}
         }
         if self.trace_enabled {
-            self.emit_trace('W', 2, addr, val as u32);
+            self.emit_trace('W', 2, addr, val as u32, core);
         }
     }
 
     // --- 32-bit access ---
 
-    pub fn read32(&mut self, addr: u32) -> u32 {
+    pub fn read32(&mut self, addr: u32, core: u8) -> u32 {
+        debug_assert_eq!(self.active_core, core as usize,
+            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -1981,7 +1991,7 @@ impl Bus {
                     self.bus_fault = true;
                     self.bus_fault_addr = addr;
                     if self.trace_enabled {
-                        self.emit_trace('R', 4, addr, 0);
+                        self.emit_trace('R', 4, addr, 0, core);
                     }
                     return 0;
                 }
@@ -2036,13 +2046,12 @@ impl Bus {
                     0x004 => self.gpio_in,
                     0x008 => self.read_gpio_hi_in(),
                     _ => {
-                        let core = self.active_core();
-                        self.sio.read32(reg_offset, core)
+                        self.sio.read32(reg_offset, core as usize)
                     }
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
-            0xE => self.ppb[self.active_core()].read32(addr),
+            0xE => self.ppb[core as usize].read32(addr),
             _ => {
                 self.bus_fault = true;
                 self.bus_fault_addr = addr;
@@ -2050,12 +2059,14 @@ impl Bus {
             }
         };
         if self.trace_enabled {
-            self.emit_trace('R', 4, addr, val);
+            self.emit_trace('R', 4, addr, val, core);
         }
         val
     }
 
-    pub fn write32(&mut self, addr: u32, val: u32) {
+    pub fn write32(&mut self, addr: u32, val: u32, core: u8) {
+        debug_assert_eq!(self.active_core, core as usize,
+            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -2172,8 +2183,7 @@ impl Bus {
             }
             0xD => {
                 let reg_offset = addr & 0xFFF;
-                let core = self.active_core();
-                self.sio.write32(reg_offset, val, core);
+                self.sio.write32(reg_offset, val, core as usize);
                 // FIFO_WR event signaling: set event_flag for receiver core.
                 if let Some(receiver) = self.sio.pending_fifo_event.take() {
                     self.event_flag[receiver] = true;
@@ -2181,8 +2191,8 @@ impl Bus {
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),
             0xE => {
-                let core = self.active_core();
-                self.ppb[core].write32(addr, val);
+                let core_idx = core as usize;
+                self.ppb[core_idx].write32(addr, val);
                 // Mirror NVIC pending writes back into the step-path
                 // short-circuit mask (`irq_pending`). MMIO writes to
                 // NVIC_ISPR land only in `ppb.nvic_ispr`; the dispatch
@@ -2199,10 +2209,10 @@ impl Bus {
                 let low = addr & 0xFFFF;
                 if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
                     let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-                    let ispr = self.ppb[core].nvic_ispr[word];
+                    let ispr = self.ppb[core_idx].nvic_ispr[word];
                     let mask64 = (ispr as u64) << (word * 32);
                     let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
-                    self.irq_pending[core] = (self.irq_pending[core] & keep) | mask64;
+                    self.irq_pending[core_idx] = (self.irq_pending[core_idx] & keep) | mask64;
                 }
             }
             // Unmapped regions raise a precise bus fault so flush-style
@@ -2214,7 +2224,7 @@ impl Bus {
             }
         }
         if self.trace_enabled {
-            self.emit_trace('W', 4, addr, val);
+            self.emit_trace('W', 4, addr, val, core);
         }
     }
 

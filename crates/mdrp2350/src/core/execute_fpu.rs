@@ -1113,11 +1113,11 @@ impl CortexM33 {
 
             if l != 0 {
                 // VLDR.32
-                self.regs.s[sd] = f32::from_bits(bus.read32(addr));
+                self.regs.s[sd] = f32::from_bits(bus.read32(addr, self.core_id));
                 2
             } else {
                 // VSTR.32
-                bus.write32(addr, self.regs.s[sd].to_bits());
+                bus.write32(addr, self.regs.s[sd].to_bits(), self.core_id);
                 1
             }
         } else {
@@ -1145,9 +1145,9 @@ impl CortexM33 {
                 if reg >= 32 { break; }
 
                 if l != 0 {
-                    self.regs.s[reg] = f32::from_bits(bus.read32(addr));
+                    self.regs.s[reg] = f32::from_bits(bus.read32(addr, self.core_id));
                 } else {
-                    bus.write32(addr, self.regs.s[reg].to_bits());
+                    bus.write32(addr, self.regs.s[reg].to_bits(), self.core_id);
                 }
                 addr = addr.wrapping_add(4);
             }
@@ -1204,19 +1204,19 @@ impl CortexM33 {
 
         // S0..S15 → +0..+60.
         for i in 0..16 {
-            bus.write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits());
+            bus.write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits(), self.core_id);
             if bus.bus_fault() {
                 bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
                 return Err(());
             }
         }
         // FPSCR → +64; reserved → +68 (write zero per architecture).
-        bus.write32(base.wrapping_add(64), self.regs.fpscr);
+        bus.write32(base.wrapping_add(64), self.regs.fpscr, self.core_id);
         if bus.bus_fault() {
             bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());
         }
-        bus.write32(base.wrapping_add(68), 0);
+        bus.write32(base.wrapping_add(68), 0, self.core_id);
         if bus.bus_fault() {
             bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());

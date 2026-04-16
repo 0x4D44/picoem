@@ -368,7 +368,7 @@ impl ServingOracle {
             let pushes = glue.ch1_pushes() - pushes_before;
             let resolved = emu
                 .bus
-                .read32(DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR);
+                .read32(DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR, 0);
             let data_byte = ((emu.bus.gpio_in >> GPIO_DATA_BASE) & 0xFF) as u8;
             let pad_oe = ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
 

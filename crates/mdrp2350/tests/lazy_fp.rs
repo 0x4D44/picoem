@@ -43,7 +43,7 @@ fn fixture() -> (CortexM33, Bus) {
     // Vectors 2 (NMI), 3 (HardFault), 4 (MemManage), 5 (BusFault),
     // 6 (UsageFault), 11 (SVC), 14 (PendSV), 15 (SysTick).
     for &exc in &[2u32, 3, 4, 5, 6, 11, 14, 15] {
-        bus.write32(VT_BASE + exc * 4, HANDLER_VEC);
+        bus.write32(VT_BASE + exc * 4, HANDLER_VEC, 0);
     }
     // Enable MEMFAULTENA (16), BUSFAULTENA (17), USGFAULTENA (18).
     bus.ppb[core].shcsr |= (1 << 16) | (1 << 17) | (1 << 18);
@@ -160,7 +160,7 @@ fn fp_handler_lazy_flush_then_return() {
     // the live S0..S15 at the time of the flush — which now includes the
     // 99.0 sentinel. So check S10 == 99.0 in the flushed slot AFTER the
     // ADD overwrote S0 and S10 was poked.
-    assert_eq!(bus.read32(fpcar + 10 * 4), (99.0f32).to_bits());
+    assert_eq!(bus.read32(fpcar + 10 * 4, 0), (99.0f32).to_bits());
 
     // Return — LSPACT=0 now, so the pop path runs and restores S0..S15
     // from the frame. (The pre-exception values are gone — they were
@@ -280,11 +280,11 @@ fn eager_mode_writes_fp_frame_on_entry() {
     // Verify each saved word.
     for i in 0..16 {
         let expected = 0xFACE_0000 + i as u32;
-        assert_eq!(bus.read32(fpcar + (i as u32) * 4), expected,
+        assert_eq!(bus.read32(fpcar + (i as u32) * 4, 0), expected,
             "S{} eager save mismatch", i);
     }
-    assert_eq!(bus.read32(fpcar + 64), 0xC000_0000, "FPSCR eager save");
-    assert_eq!(bus.read32(fpcar + 68), 0, "reserved word");
+    assert_eq!(bus.read32(fpcar + 64, 0), 0xC000_0000, "FPSCR eager save");
+    assert_eq!(bus.read32(fpcar + 68, 0), 0, "reserved word");
 }
 
 // ===========================================================================
@@ -392,7 +392,7 @@ fn bus_fault_during_lazy_flush_delivers_busfault() {
     // the flush sets bus.bus_fault, step() picks it up, and enters
     // exception 5 (BusFault).
     let (hw0, hw1) = enc_vadd(0, 2, 4);
-    bus.write32(HANDLER_ADDR, ((hw1 as u32) << 16) | hw0 as u32);
+    bus.write32(HANDLER_ADDR, ((hw1 as u32) << 16) | hw0 as u32, 0);
     assert_eq!(cpu.regs.pc(), HANDLER_ADDR, "PC sits at handler after entry");
 
     // One step: decode fetches VADD, fpu_execute runs the lazy flush which
@@ -550,7 +550,7 @@ fn core1_fpu_entry_exit_isolated_from_core0() {
     let mut bus = Bus::default();
     // Vectors for both PPB lanes.
     for &exc in &[2u32, 3, 4, 5, 6, 11, 14, 15] {
-        bus.write32(VT_BASE + exc * 4, HANDLER_VEC);
+        bus.write32(VT_BASE + exc * 4, HANDLER_VEC, 0);
     }
     bus.ppb[0].vtor = VT_BASE;
     bus.ppb[1].vtor = VT_BASE;

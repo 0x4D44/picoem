@@ -18,10 +18,10 @@ fn test_bus_dispatch_pio0() {
     let mut bus = Bus::new();
 
     // Write SM0 PINCTRL via PIO0 base address
-    bus.write32(0x5020_00DC, 0x1234_5678);
+    bus.write32(0x5020_00DC, 0x1234_5678, 0);
 
     // Read back
-    let val = bus.read32(0x5020_00DC);
+    let val = bus.read32(0x5020_00DC, 0);
     assert_eq!(val, 0x1234_5678);
 }
 
@@ -31,12 +31,12 @@ fn test_bus_dispatch_pio1_pio2() {
 
     // PIO1: write SM1 CLKDIV (SM1 offset = 0x0E0)
     let clkdiv = (500u32 << 16) | (64u32 << 8);
-    bus.write32(0x5030_00E0, clkdiv);
-    assert_eq!(bus.read32(0x5030_00E0), clkdiv);
+    bus.write32(0x5030_00E0, clkdiv, 0);
+    assert_eq!(bus.read32(0x5030_00E0, 0), clkdiv);
 
     // PIO2: write CTRL to enable SM3
-    bus.write32(0x5040_0000, 0x8);
-    assert_eq!(bus.read32(0x5040_0000), 0x8);
+    bus.write32(0x5040_0000, 0x8, 0);
+    assert_eq!(bus.read32(0x5040_0000, 0), 0x8);
     assert!(bus.pio[2].sm[3].enabled());
 }
 
@@ -46,22 +46,22 @@ fn test_ctrl_alias_set_clr() {
 
     // SET alias: addr + 0x2000 (alias=2)
     // Enable SM0 via SET alias
-    bus.write32(0x5020_2000, 0x1); // SET alias on CTRL
+    bus.write32(0x5020_2000, 0x1, 0); // SET alias on CTRL
     assert!(bus.pio[0].sm[0].enabled());
-    assert_eq!(bus.read32(0x5020_0000), 0x1);
+    assert_eq!(bus.read32(0x5020_0000, 0), 0x1);
 
     // Enable SM2 via SET alias (SM0 should remain enabled)
-    bus.write32(0x5020_2000, 0x4);
+    bus.write32(0x5020_2000, 0x4, 0);
     assert!(bus.pio[0].sm[0].enabled());
     assert!(bus.pio[0].sm[2].enabled());
-    assert_eq!(bus.read32(0x5020_0000), 0x5);
+    assert_eq!(bus.read32(0x5020_0000, 0), 0x5);
 
     // CLR alias: addr + 0x3000 (alias=3)
     // Disable SM0 via CLR alias
-    bus.write32(0x5020_3000, 0x1);
+    bus.write32(0x5020_3000, 0x1, 0);
     assert!(!bus.pio[0].sm[0].enabled());
     assert!(bus.pio[0].sm[2].enabled());
-    assert_eq!(bus.read32(0x5020_0000), 0x4);
+    assert_eq!(bus.read32(0x5020_0000, 0), 0x4);
 }
 
 #[test]
@@ -71,31 +71,31 @@ fn test_ctrl_alias_xor() {
     let mut bus = Bus::new();
 
     // Start: SM0 and SM2 enabled via normal write.
-    bus.write32(0x5020_0000, 0x5);
+    bus.write32(0x5020_0000, 0x5, 0);
     assert!(bus.pio[0].sm[0].enabled());
     assert!(!bus.pio[0].sm[1].enabled());
     assert!(bus.pio[0].sm[2].enabled());
     assert!(!bus.pio[0].sm[3].enabled());
 
     // XOR with 0x3: toggles SM0 (1->0) and SM1 (0->1); SM2/SM3 unchanged.
-    bus.write32(0x5020_1000, 0x3);
+    bus.write32(0x5020_1000, 0x3, 0);
     assert!(!bus.pio[0].sm[0].enabled());
     assert!(bus.pio[0].sm[1].enabled());
     assert!(bus.pio[0].sm[2].enabled());
     assert!(!bus.pio[0].sm[3].enabled());
-    assert_eq!(bus.read32(0x5020_0000), 0x6);
+    assert_eq!(bus.read32(0x5020_0000, 0), 0x6);
 
     // XOR with 0x0: no-op.
-    bus.write32(0x5020_1000, 0x0);
-    assert_eq!(bus.read32(0x5020_0000), 0x6);
+    bus.write32(0x5020_1000, 0x0, 0);
+    assert_eq!(bus.read32(0x5020_0000, 0), 0x6);
 
     // XOR with 0xF: toggles every SM.
-    bus.write32(0x5020_1000, 0xF);
+    bus.write32(0x5020_1000, 0xF, 0);
     assert!(bus.pio[0].sm[0].enabled());
     assert!(!bus.pio[0].sm[1].enabled());
     assert!(!bus.pio[0].sm[2].enabled());
     assert!(bus.pio[0].sm[3].enabled());
-    assert_eq!(bus.read32(0x5020_0000), 0x9);
+    assert_eq!(bus.read32(0x5020_0000, 0), 0x9);
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn test_gpio_in_moved_to_bus() {
     bus.gpio_in = 0xFF;
 
     // Read SIO GPIO_IN via bus at 0xD000_0004
-    let val = bus.read32(0xD000_0004);
+    let val = bus.read32(0xD000_0004, 0);
     assert_eq!(val, 0xFF);
 }
 
@@ -151,7 +151,7 @@ const PIO0_BASE: u32 = 0x5020_0000;
 
 /// Write a PIO0 register through the emulator bus.
 fn pio_write(emu: &mut Emulator, offset: u32, val: u32) {
-    emu.bus.write32(PIO0_BASE + offset, val);
+    emu.bus.write32(PIO0_BASE + offset, val, 0);
 }
 
 /// Create an emulator configured for PIO integration tests.

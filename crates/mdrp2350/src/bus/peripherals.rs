@@ -334,13 +334,13 @@ mod tests {
     #[test]
     fn test_sysinfo_chip_id() {
         let mut bus = Bus::new();
-        assert_eq!(bus.read32(0x4000_0000), 0x0000_0002);
+        assert_eq!(bus.read32(0x4000_0000, 0), 0x0000_0002);
     }
 
     #[test]
     fn test_sysinfo_platform() {
         let mut bus = Bus::new();
-        assert_eq!(bus.read32(0x4000_0008), 0x0000_0001);
+        assert_eq!(bus.read32(0x4000_0008, 0), 0x0000_0001);
     }
 
     #[test]
@@ -370,17 +370,17 @@ mod tests {
         let mut bus = Bus::new();
         // Write via CLR alias (alias 3) to deassert all resets
         // CLR alias address: base 0x4002_0000 + offset 0x000 + alias 3 => 0x4002_3000
-        bus.write32(0x4002_3000, 0x1FFF_FFFF);
+        bus.write32(0x4002_3000, 0x1FFF_FFFF, 0);
         // RESET register should now be 0
-        assert_eq!(bus.read32(0x4002_0000), 0x0000_0000);
+        assert_eq!(bus.read32(0x4002_0000, 0), 0x0000_0000);
         // RESET_DONE should be all 1s
-        assert_eq!(bus.read32(0x4002_0008), 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0x4002_0008, 0), 0xFFFF_FFFF);
     }
 
     #[test]
     fn test_xosc_stable() {
         let mut bus = Bus::new();
-        let status = bus.read32(0x4004_8004);
+        let status = bus.read32(0x4004_8004, 0);
         assert_ne!(status & (1 << 31), 0, "STABLE bit should be set");
     }
 
@@ -391,7 +391,7 @@ mod tests {
         // must read 0. This inverts the pre-fix assertion, which was
         // locking in the known bug (see tech_debt.md).
         let mut bus = Bus::new();
-        let cs = bus.read32(0x4005_0000);
+        let cs = bus.read32(0x4005_0000, 0);
         assert_eq!(cs & (1 << 31), 0, "LOCK bit must be 0 at reset (PLL unpowered)");
     }
 
@@ -399,6 +399,6 @@ mod tests {
     fn test_clk_sys_selected() {
         let mut bus = Bus::new();
         // RP2350 CLK_SYS_SELECTED at 0x040_10044.
-        assert_eq!(bus.read32(0x4001_0044), 0x1);
+        assert_eq!(bus.read32(0x4001_0044, 0), 0x1);
     }
 }

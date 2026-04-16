@@ -494,7 +494,7 @@ fn str_ldr_reg() {
     c.set_reg(2, 4);           // offset
     // STR R0, [R1, R2]: 0101_000_010_001_000 = 0x5088
     c.execute_one_with_bus(0x5088, &mut bus);
-    assert_eq!(bus.read32(0x2000_0004), 0xCAFE_BABE);
+    assert_eq!(bus.read32(0x2000_0004, 0), 0xCAFE_BABE);
     // LDR R3, [R1, R2]: 0101_100_010_001_011 = 0x588B
     c.execute_one_with_bus(0x588B, &mut bus);
     assert_eq!(c.reg(3), 0xCAFE_BABE);
@@ -508,7 +508,7 @@ fn strb_ldrb_reg() {
     c.set_reg(2, 1);
     // STRB R0, [R1, R2]: 0101_010_010_001_000 = 0x5488
     c.execute_one_with_bus(0x5488, &mut bus);
-    assert_eq!(bus.read8(0x2000_0001), 0xAB);
+    assert_eq!(bus.read8(0x2000_0001, 0), 0xAB);
     // LDRB R3, [R1, R2]: 0101_110_010_001_011 = 0x5C8B
     c.execute_one_with_bus(0x5C8B, &mut bus);
     assert_eq!(c.reg(3), 0xAB);
@@ -517,7 +517,7 @@ fn strb_ldrb_reg() {
 #[test]
 fn ldrsb_sign_extends() {
     let (mut c, mut bus) = core_and_bus();
-    bus.write8(0x2000_0000, 0x80); // -128 as signed byte
+    bus.write8(0x2000_0000, 0x80, 0); // -128 as signed byte
     c.set_reg(1, 0x2000_0000);
     c.set_reg(2, 0);
     // LDRSB R0, [R1, R2]: 0101_011_010_001_000 = 0x5688
@@ -536,7 +536,7 @@ fn str_ldr_imm_word() {
     c.set_reg(1, 0x2000_0000);
     // STR R0, [R1, #8]: 01100_00010_001_000 = 0x6088
     c.execute_one_with_bus(0x6088, &mut bus);
-    assert_eq!(bus.read32(0x2000_0008), 0x1234_5678);
+    assert_eq!(bus.read32(0x2000_0008, 0), 0x1234_5678);
     // LDR R2, [R1, #8]: 01101_00010_001_010 = 0x688A
     c.execute_one_with_bus(0x688A, &mut bus);
     assert_eq!(c.reg(2), 0x1234_5678);
@@ -549,7 +549,7 @@ fn strb_ldrb_imm() {
     c.set_reg(1, 0x2000_0000);
     // STRB R0, [R1, #2]: 01110_00010_001_000 = 0x7088
     c.execute_one_with_bus(0x7088, &mut bus);
-    assert_eq!(bus.read8(0x2000_0002), 0xCD);
+    assert_eq!(bus.read8(0x2000_0002, 0), 0xCD);
 }
 
 #[test]
@@ -559,7 +559,7 @@ fn strh_ldrh_imm() {
     c.set_reg(1, 0x2000_0000);
     // STRH R0, [R1, #4]: 10000_00010_001_000 = 0x8088
     c.execute_one_with_bus(0x8088, &mut bus);
-    assert_eq!(bus.read16(0x2000_0004), 0xBEEF);
+    assert_eq!(bus.read16(0x2000_0004, 0), 0xBEEF);
     // LDRH R2, [R1, #4]: 10001_00010_001_010 = 0x888A
     c.execute_one_with_bus(0x888A, &mut bus);
     assert_eq!(c.reg(2), 0xBEEF);
@@ -576,7 +576,7 @@ fn str_ldr_sp() {
     c.set_reg(0, 0xDEAD_BEEF);
     // STR R0, [SP, #8]: 10010_000_00000010 = 0x9002
     c.execute_one_with_bus(0x9002, &mut bus);
-    assert_eq!(bus.read32(0x2000_1008), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2000_1008, 0), 0xDEAD_BEEF);
     // LDR R1, [SP, #8]: 10011_001_00000010 = 0x9902
     c.execute_one_with_bus(0x9902, &mut bus);
     assert_eq!(c.reg(1), 0xDEAD_BEEF);
@@ -677,8 +677,8 @@ fn push_pop_basic() {
     // PUSH {R0, R1}: 1011_0100_00000011 = 0xB403
     c.execute_one_with_bus(0xB403, &mut bus);
     assert_eq!(c.regs.sp(), 0x2000_0FF8); // SP -= 8 (2 regs)
-    assert_eq!(bus.read32(0x2000_0FF8), 0xAAAA);
-    assert_eq!(bus.read32(0x2000_0FFC), 0xBBBB);
+    assert_eq!(bus.read32(0x2000_0FF8, 0), 0xAAAA);
+    assert_eq!(bus.read32(0x2000_0FFC, 0), 0xBBBB);
     // POP {R2, R3}: 1011_1100_00001100 = 0xBC0C
     c.execute_one_with_bus(0xBC0C, &mut bus);
     assert_eq!(c.reg(2), 0xAAAA);
@@ -694,7 +694,7 @@ fn push_lr_pop_pc() {
     // PUSH {LR}: 1011_0101_00000000 = 0xB500
     c.execute_one_with_bus(0xB500, &mut bus);
     assert_eq!(c.regs.sp(), 0x2000_0FFC);
-    assert_eq!(bus.read32(0x2000_0FFC), 0x0800_0101);
+    assert_eq!(bus.read32(0x2000_0FFC, 0), 0x0800_0101);
     // POP {PC}: 1011_1101_00000000 = 0xBD00
     c.execute_one_with_bus(0xBD00, &mut bus);
     assert_eq!(c.regs.pc(), 0x0800_0100); // bit 0 cleared
@@ -715,9 +715,9 @@ fn stm_ldm() {
     // STM R4!, {R0, R1, R2}: 11000_100_00000111 = 0xC407
     c.execute_one_with_bus(0xC407, &mut bus);
     assert_eq!(c.reg(4), 0x2000_010C); // writeback
-    assert_eq!(bus.read32(0x2000_0100), 0x11);
-    assert_eq!(bus.read32(0x2000_0104), 0x22);
-    assert_eq!(bus.read32(0x2000_0108), 0x33);
+    assert_eq!(bus.read32(0x2000_0100, 0), 0x11);
+    assert_eq!(bus.read32(0x2000_0104, 0), 0x22);
+    assert_eq!(bus.read32(0x2000_0108, 0), 0x33);
     // LDM R5!, {R0, R1, R2} — load from same address
     c.set_reg(5, 0x2000_0100);
     // LDM R5!, {R0,R1,R2}: 11001_101_00000111 = 0xCD07
@@ -832,7 +832,7 @@ fn run_small_program() {
     let base = 0x2000_0000u32;
     for (i, &instr) in program.iter().enumerate() {
         let addr = base + (i as u32) * 2;
-        bus.write16(addr, instr);
+        bus.write16(addr, instr, 0);
     }
 
     // Set PC to program start
@@ -1655,7 +1655,7 @@ fn encode_ldr_w_imm8_puw(rt: u8, rn: u8, imm8: u8, p: bool, u: bool, w: bool) ->
 fn ldr_w_imm12() {
     // LDR.W R0, [R1, #100]
     let (mut c, mut bus) = core_and_bus();
-    bus.write32(0x2000_0064, 0xDEAD_BEEF);
+    bus.write32(0x2000_0064, 0xDEAD_BEEF, 0);
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldr_w_imm12(0, 1, 100);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -1671,7 +1671,7 @@ fn str_w_imm12() {
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_str_w_imm12(0, 1, 100);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(bus.read32(0x2000_0064), 0xCAFE_BABE);
+    assert_eq!(bus.read32(0x2000_0064, 0), 0xCAFE_BABE);
     assert_eq!(cy, 2); // M33 measured: 2 cycles (SRAM, zero-wait-state)
 }
 
@@ -1679,7 +1679,7 @@ fn str_w_imm12() {
 fn ldr_w_reg() {
     // LDR.W R0, [R1, R2, LSL #2] — array indexing pattern
     let (mut c, mut bus) = core_and_bus();
-    bus.write32(0x2000_0010, 0x1234_5678); // array[4] at base + 4*4
+    bus.write32(0x2000_0010, 0x1234_5678, 0); // array[4] at base + 4*4
     c.set_reg(1, 0x2000_0000); // base
     c.set_reg(2, 4);           // index
     let (hw0, hw1) = encode_ldr_w_reg(0, 1, 2, 2); // LSL #2
@@ -1692,7 +1692,7 @@ fn ldr_w_reg() {
 fn ldrb_w_imm12() {
     // LDRB.W R0, [R1, #10] — unsigned byte load
     let (mut c, mut bus) = core_and_bus();
-    bus.write8(0x2000_000A, 0xAB);
+    bus.write8(0x2000_000A, 0xAB, 0);
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldrb_w_imm12(0, 1, 10);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -1704,7 +1704,7 @@ fn ldrb_w_imm12() {
 fn ldrh_w_imm12() {
     // LDRH.W R0, [R1, #6] — unsigned halfword load
     let (mut c, mut bus) = core_and_bus();
-    bus.write16(0x2000_0006, 0xBEEF);
+    bus.write16(0x2000_0006, 0xBEEF, 0);
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldrh_w_imm12(0, 1, 6);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -1716,7 +1716,7 @@ fn ldrh_w_imm12() {
 fn ldrsb_w_imm12() {
     // LDRSB.W R0, [R1, #0] — signed byte, negative value
     let (mut c, mut bus) = core_and_bus();
-    bus.write8(0x2000_0000, 0x80); // -128 signed
+    bus.write8(0x2000_0000, 0x80, 0); // -128 signed
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldrsb_w_imm12(0, 1, 0);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -1728,7 +1728,7 @@ fn ldrsb_w_imm12() {
 fn ldrsh_w_imm12() {
     // LDRSH.W R0, [R1, #2] — signed halfword, negative value
     let (mut c, mut bus) = core_and_bus();
-    bus.write16(0x2000_0002, 0x8001); // -32767 signed
+    bus.write16(0x2000_0002, 0x8001, 0); // -32767 signed
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldrsh_w_imm12(0, 1, 2);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -1744,7 +1744,7 @@ fn strb_w_imm12() {
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_strb_w_imm12(0, 1, 5);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(bus.read8(0x2000_0005), 0x42);
+    assert_eq!(bus.read8(0x2000_0005, 0), 0x42);
     assert_eq!(cy, 2); // M33 measured: 2 cycles (SRAM, zero-wait-state)
 }
 
@@ -1756,7 +1756,7 @@ fn strh_w_imm12() {
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_strh_w_imm12(0, 1, 8);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(bus.read16(0x2000_0008), 0xBEEF);
+    assert_eq!(bus.read16(0x2000_0008, 0), 0xBEEF);
     assert_eq!(cy, 2); // M33 measured: 2 cycles (SRAM, zero-wait-state)
 }
 
@@ -1768,7 +1768,7 @@ fn ldr_w_literal() {
     c.regs.set_pc(0x2000_1000);
     // read_pc() = instr_addr + 4 = 0x2000_1000 + 4 = 0x2000_1004, aligned = 0x2000_1004
     // With imm12=8, addr = 0x2000_1004 + 8 = 0x2000_100C
-    bus.write32(0x2000_100C, 0xAAAA_BBBB);
+    bus.write32(0x2000_100C, 0xAAAA_BBBB, 0);
     // Rn=15 with U=1 (hw0[7]=1): LDR.W R0, [PC, #+imm12]
     let hw0: u16 = 0xF8DF; // sign=0, hw0[7]=1, size=10, load=1, Rn=1111
     let hw1: u16 = 0x0008; // Rt=R0, imm12=8
@@ -1782,7 +1782,7 @@ fn ldr_w_pre_index() {
     // LDR.W R0, [R1, #4]! — pre-index with writeback
     // P=1, U=1, W=1, imm8=4
     let (mut c, mut bus) = core_and_bus();
-    bus.write32(0x2000_0004, 0x1111_2222);
+    bus.write32(0x2000_0004, 0x1111_2222, 0);
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldr_w_imm8_puw(0, 1, 4, true, true, true);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -1796,7 +1796,7 @@ fn ldr_w_post_index() {
     // LDR.W R0, [R1], #4 — post-index
     // P=0, U=1, W=1 (post-index: p=false implies writeback)
     let (mut c, mut bus) = core_and_bus();
-    bus.write32(0x2000_0000, 0x3333_4444);
+    bus.write32(0x2000_0000, 0x3333_4444, 0);
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldr_w_imm8_puw(0, 1, 4, false, true, true);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -1811,7 +1811,7 @@ fn pld_rt15_is_nop() {
     let (mut c, mut bus) = core_and_bus();
     c.regs.set_pc(0x1000);
     c.set_reg(1, 0x2000_0000);
-    bus.write32(0x2000_0000, 0xDEAD_BEEF);
+    bus.write32(0x2000_0000, 0xDEAD_BEEF, 0);
     // LDRB.W R15, [R1, #0] → Rt=15, size=byte → PLD, returns 1
     let (hw0, hw1) = encode_ldrb_w_imm12(15, 1, 0);
     let pc_before = c.regs.pc();
@@ -1827,7 +1827,7 @@ fn ldr_w_rt15_loads_pc() {
     let (mut c, mut bus) = core_and_bus();
     c.regs.set_pc(0x1000);
     c.set_reg(1, 0x2000_0000);
-    bus.write32(0x2000_0000, 0x0000_1001); // target addr with thumb bit
+    bus.write32(0x2000_0000, 0x0000_1001, 0); // target addr with thumb bit
     // LDR.W R15, [R1, #0] → Rt=15, size=word → loads PC
     let (hw0, hw1) = encode_ldr_w_imm12(15, 1, 0);
     eprintln!("hw0={:#06x} hw1={:#06x}", hw0, hw1);
@@ -2051,10 +2051,10 @@ fn stm_w_ia() {
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
 
     // Verify memory contents
-    assert_eq!(bus.read32(0x2000_0100), 0xAAAA_0000); // R0
-    assert_eq!(bus.read32(0x2000_0104), 0xBBBB_1111); // R1
-    assert_eq!(bus.read32(0x2000_0108), 0xCCCC_2222); // R2
-    assert_eq!(bus.read32(0x2000_010C), 0xDDDD_3333); // R3
+    assert_eq!(bus.read32(0x2000_0100, 0), 0xAAAA_0000); // R0
+    assert_eq!(bus.read32(0x2000_0104, 0), 0xBBBB_1111); // R1
+    assert_eq!(bus.read32(0x2000_0108, 0), 0xCCCC_2222); // R2
+    assert_eq!(bus.read32(0x2000_010C, 0), 0xDDDD_3333); // R3
     // Writeback: R4 = 0x2000_0100 + 4*4 = 0x2000_0110
     assert_eq!(c.reg(4), 0x2000_0110);
     // Cost: 1 + 4 = 5
@@ -2066,10 +2066,10 @@ fn ldm_w_ia() {
     // LDMIA.W R4!, {R0-R3} — load 4 regs from R4, writeback
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0200;
-    bus.write32(base, 0x1111_1111);
-    bus.write32(base + 4, 0x2222_2222);
-    bus.write32(base + 8, 0x3333_3333);
-    bus.write32(base + 12, 0x4444_4444);
+    bus.write32(base, 0x1111_1111, 0);
+    bus.write32(base + 4, 0x2222_2222, 0);
+    bus.write32(base + 8, 0x3333_3333, 0);
+    bus.write32(base + 12, 0x4444_4444, 0);
     c.set_reg(4, base);
     c.regs.set_pc(0x1000);
 
@@ -2105,11 +2105,11 @@ fn stm_w_db() {
 
     // DB: start addr = SP - 5*4 = 0x2000_0FEC
     let start = sp - 20;
-    assert_eq!(bus.read32(start),      0x4444_4444); // R4
-    assert_eq!(bus.read32(start + 4),  0x5555_5555); // R5
-    assert_eq!(bus.read32(start + 8),  0x6666_6666); // R6
-    assert_eq!(bus.read32(start + 12), 0x7777_7777); // R7
-    assert_eq!(bus.read32(start + 16), 0xEEEE_EEEE); // LR
+    assert_eq!(bus.read32(start, 0),      0x4444_4444); // R4
+    assert_eq!(bus.read32(start + 4, 0),  0x5555_5555); // R5
+    assert_eq!(bus.read32(start + 8, 0),  0x6666_6666); // R6
+    assert_eq!(bus.read32(start + 12, 0), 0x7777_7777); // R7
+    assert_eq!(bus.read32(start + 16, 0), 0xEEEE_EEEE); // LR
     // Writeback: SP = SP - 5*4 = 0x2000_0FEC
     assert_eq!(c.reg(13), start);
     // Cost: 1 + 5 = 6
@@ -2121,11 +2121,11 @@ fn ldm_w_db_with_pc() {
     // LDMIA.W R13!, {R4-R7, PC} — pop with PC (5 regs including PC)
     let (mut c, mut bus) = core_and_bus();
     let sp = 0x2000_0FEC;
-    bus.write32(sp,      0x4444_4444); // R4
-    bus.write32(sp + 4,  0x5555_5555); // R5
-    bus.write32(sp + 8,  0x6666_6666); // R6
-    bus.write32(sp + 12, 0x7777_7777); // R7
-    bus.write32(sp + 16, 0x0800_0101); // PC value (Thumb bit set)
+    bus.write32(sp,      0x4444_4444, 0); // R4
+    bus.write32(sp + 4,  0x5555_5555, 0); // R5
+    bus.write32(sp + 8,  0x6666_6666, 0); // R6
+    bus.write32(sp + 12, 0x7777_7777, 0); // R7
+    bus.write32(sp + 16, 0x0800_0101, 0); // PC value (Thumb bit set)
     c.set_reg(13, sp);
     c.regs.set_pc(0x1000);
 
@@ -2752,8 +2752,8 @@ fn ldrd_basic() {
     // offset = 8 >> 2 = imm8=2, actual offset = 2 << 2 = 8
     let (mut c, mut bus) = core_and_bus();
     c.set_reg(2, 0x2000_0000);
-    bus.write32(0x2000_0008, 0xAAAA_BBBB);
-    bus.write32(0x2000_000C, 0xCCCC_DDDD);
+    bus.write32(0x2000_0008, 0xAAAA_BBBB, 0);
+    bus.write32(0x2000_000C, 0xCCCC_DDDD, 0);
     let (hw0, hw1) = encode_ldrd_strd(true, true, false, true, 2, 0, 1, 2);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0xAAAA_BBBB);
@@ -2771,8 +2771,8 @@ fn strd_basic() {
     c.set_reg(2, 0x2000_0000);
     let (hw0, hw1) = encode_ldrd_strd(true, true, false, false, 2, 0, 1, 2);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(bus.read32(0x2000_0008), 0x1111_2222);
-    assert_eq!(bus.read32(0x2000_000C), 0x3333_4444);
+    assert_eq!(bus.read32(0x2000_0008, 0), 0x1111_2222);
+    assert_eq!(bus.read32(0x2000_000C, 0), 0x3333_4444);
     assert_eq!(cy, 3); // M33 measured: 3 cycles (two word transfers)
 }
 
@@ -2787,8 +2787,8 @@ fn strd_ldrd_roundtrip() {
     // STRD R0, R1, [R4, #16]
     let (hw0, hw1) = encode_ldrd_strd(true, true, false, false, 4, 0, 1, 4); // imm8=4 → offset=16
     c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(bus.read32(0x2000_0110), 0xDEAD_BEEF);
-    assert_eq!(bus.read32(0x2000_0114), 0xCAFE_BABE);
+    assert_eq!(bus.read32(0x2000_0110, 0), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2000_0114, 0), 0xCAFE_BABE);
 
     // LDRD R2, R3, [R4, #16]
     let (hw0, hw1) = encode_ldrd_strd(true, true, false, true, 4, 2, 3, 4);
@@ -2804,8 +2804,8 @@ fn ldrd_literal() {
     // offset = 4 (imm8=1, offset = 1<<2 = 4), U=1 → addr = 0x2000_1008
     let (mut c, mut bus) = core_and_bus();
     c.regs.set_pc(0x2000_1000);
-    bus.write32(0x2000_1008, 0x1234_5678);
-    bus.write32(0x2000_100C, 0x9ABC_DEF0);
+    bus.write32(0x2000_1008, 0x1234_5678, 0);
+    bus.write32(0x2000_100C, 0x9ABC_DEF0, 0);
     let (hw0, hw1) = encode_ldrd_strd(true, true, false, true, 15, 0, 1, 1);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0x1234_5678);
@@ -2826,7 +2826,7 @@ fn tbb_basic() {
     c.regs.set_pc(0x1000);
     c.set_reg(0, 0x2000_0000);   // base
     c.set_reg(1, 3);              // index
-    bus.write8(0x2000_0003, 10);  // table[3] = 10
+    bus.write8(0x2000_0003, 10, 0);  // table[3] = 10
     // read_pc = 0x1004, target = 0x1004 + 10*2 = 0x1018
     let hw0: u16 = 0xE8D0; // Rn=0
     let hw1: u16 = 0xF001; // Rm=1, H=0
@@ -2842,7 +2842,7 @@ fn tbh_basic() {
     c.regs.set_pc(0x1000);
     c.set_reg(0, 0x2000_0000);   // base
     c.set_reg(1, 2);              // index
-    bus.write16(0x2000_0004, 20); // table[2] = 20 (at base + 2*2 = base+4)
+    bus.write16(0x2000_0004, 20, 0); // table[2] = 20 (at base + 2*2 = base+4)
     // read_pc = 0x1004, target = 0x1004 + 20*2 = 0x102C
     let hw0: u16 = 0xE8D0; // Rn=0
     let hw1: u16 = 0xF011; // Rm=1, H=1 (bit 4 set)
@@ -2979,9 +2979,9 @@ fn it_eq_taken() {
     // IT EQ; MOVS R0, #42 — condition true (Z=1), should execute
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF08);       // IT EQ (firstcond=0000, mask=1000)
-    bus.write16(base + 2, 0x202A);   // MOVS R0, #42
-    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF08, 0);       // IT EQ (firstcond=0000, mask=1000)
+    bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42
+    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(true); // EQ condition true
 
@@ -2998,9 +2998,9 @@ fn it_eq_skipped() {
     // IT EQ; MOVS R0, #42 — condition false (Z=0), should skip
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF08);       // IT EQ
-    bus.write16(base + 2, 0x202A);   // MOVS R0, #42
-    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF08, 0);       // IT EQ
+    bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42
+    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(false); // EQ condition false
 
@@ -3017,9 +3017,9 @@ fn it_flag_suppression() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // ADDS R0, R1, R2 = 0x1888
-    bus.write16(base, 0xBF08);       // IT EQ
-    bus.write16(base + 2, 0x1888);   // ADDS R0, R1, R2
-    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF08, 0);       // IT EQ
+    bus.write16(base + 2, 0x1888, 0);   // ADDS R0, R1, R2
+    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.set_reg(1, 5);
     c.set_reg(2, 10);
@@ -3041,9 +3041,9 @@ fn it_cmp_always_sets_flags() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // CMP R0, R1 (data processing) = 0x4288
-    bus.write16(base, 0xBF08);       // IT EQ
-    bus.write16(base + 2, 0x4288);   // CMP R0, R1
-    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF08, 0);       // IT EQ
+    bus.write16(base + 2, 0x4288, 0);   // CMP R0, R1
+    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.set_reg(0, 10);
     c.set_reg(1, 5);
@@ -3064,9 +3064,9 @@ fn it_cmp_imm_always_sets_flags() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // CMP R0, #5 = 0x2805 (bits[15:11]=00101, Rn=000, imm8=0x05)
-    bus.write16(base, 0xBF08);       // IT EQ
-    bus.write16(base + 2, 0x2805);   // CMP R0, #5
-    bus.write16(base + 4, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF08, 0);       // IT EQ
+    bus.write16(base + 2, 0x2805, 0);   // CMP R0, #5
+    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.set_reg(0, 10);
     c.regs.set_flag_z(true);  // EQ true
@@ -3085,10 +3085,10 @@ fn ite_then_else_taken() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // ITE EQ: firstcond=0000, mask=0100 with E-bit set → mask=1100 = 0x0C
-    bus.write16(base, 0xBF0C);       // ITE EQ
-    bus.write16(base + 2, 0x2001);   // MOVS R0, #1 (Then)
-    bus.write16(base + 4, 0x2002);   // MOVS R0, #2 (Else)
-    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF0C, 0);       // ITE EQ
+    bus.write16(base + 2, 0x2001, 0);   // MOVS R0, #1 (Then)
+    bus.write16(base + 4, 0x2002, 0);   // MOVS R0, #2 (Else)
+    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(true); // EQ true → Then
 
@@ -3105,10 +3105,10 @@ fn ite_then_else_not_taken() {
     // ITE EQ; MOVS R0, #1; MOVS R0, #2 — with Z=0: R0=2 (Then skipped, Else taken)
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF0C);       // ITE EQ
-    bus.write16(base + 2, 0x2001);   // MOVS R0, #1 (Then — skipped)
-    bus.write16(base + 4, 0x2002);   // MOVS R0, #2 (Else — executed)
-    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF0C, 0);       // ITE EQ
+    bus.write16(base + 2, 0x2001, 0);   // MOVS R0, #1 (Then — skipped)
+    bus.write16(base + 4, 0x2002, 0);   // MOVS R0, #2 (Else — executed)
+    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(false); // EQ false → Else
 
@@ -3126,10 +3126,10 @@ fn itt_eq_both_taken() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // ITT EQ: firstcond=0000, mask=0100 (two Then, no Else)
-    bus.write16(base, 0xBF04);       // ITT EQ
-    bus.write16(base + 2, 0x2001);   // MOVS R0, #1
-    bus.write16(base + 4, 0x2102);   // MOVS R1, #2
-    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF04, 0);       // ITT EQ
+    bus.write16(base + 2, 0x2001, 0);   // MOVS R0, #1
+    bus.write16(base + 4, 0x2102, 0);   // MOVS R1, #2
+    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(true);
 
@@ -3147,10 +3147,10 @@ fn it_state_cleared_after_block() {
     // After IT block completes, the next instruction should execute unconditionally
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF08);       // IT EQ
-    bus.write16(base + 2, 0x202A);   // MOVS R0, #42 (in IT block)
-    bus.write16(base + 4, 0x2103);   // MOVS R1, #3 (outside IT block)
-    bus.write16(base + 6, 0xE7FE);   // B . (halt)
+    bus.write16(base, 0xBF08, 0);       // IT EQ
+    bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42 (in IT block)
+    bus.write16(base + 4, 0x2103, 0);   // MOVS R1, #3 (outside IT block)
+    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(false); // EQ false → IT body skipped
 
@@ -3619,7 +3619,7 @@ fn fpu_vldr_vstr() {
     c.regs.s[4] = 2.5;
     let (hw0, hw1) = enc_vstr(4, 0, 0); // VSTR.32 S4, [R0, #0]
     c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(bus.read32(addr), 2.5f32.to_bits());
+    assert_eq!(bus.read32(addr, 0), 2.5f32.to_bits());
 
     // Load it back via VLDR
     c.regs.s[6] = 0.0;
@@ -3634,7 +3634,7 @@ fn fpu_vldr_positive_offset() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0100u32;
     c.set_reg(0, base);
-    bus.write32(base + 16, 7.0f32.to_bits());
+    bus.write32(base + 16, 7.0f32.to_bits(), 0);
     let (hw0, hw1) = enc_vldr(0, 0, 16); // VLDR.32 S0, [R0, #+16]
     c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.regs.s[0], 7.0);
@@ -3645,7 +3645,7 @@ fn fpu_vldr_negative_offset() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0110u32;
     c.set_reg(0, base);
-    bus.write32(base - 8, 9.0f32.to_bits());
+    bus.write32(base - 8, 9.0f32.to_bits(), 0);
     let (hw0, hw1) = enc_vldr(0, 0, -8); // VLDR.32 S0, [R0, #-8]
     c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.regs.s[0], 9.0);
@@ -3668,9 +3668,9 @@ fn fpu_vpush_vpop() {
     assert_eq!(c.reg(13), sp - 12); // SP decremented by 3*4
 
     // Verify memory
-    assert_eq!(f32::from_bits(bus.read32(sp - 12)), 1.0);
-    assert_eq!(f32::from_bits(bus.read32(sp - 8)), 2.0);
-    assert_eq!(f32::from_bits(bus.read32(sp - 4)), 3.0);
+    assert_eq!(f32::from_bits(bus.read32(sp - 12, 0)), 1.0);
+    assert_eq!(f32::from_bits(bus.read32(sp - 8, 0)), 2.0);
+    assert_eq!(f32::from_bits(bus.read32(sp - 4, 0)), 3.0);
 
     // Clear S0-S2
     c.regs.s[0] = 0.0;
@@ -4974,21 +4974,21 @@ fn bus_rom_read_returns_loaded_data() {
     let rom_data: Vec<u8> = (0..32u8).collect();
     bus.memory.load_rom(&rom_data);
     // Read through bus at ROM address 0x00000000
-    assert_eq!(bus.read8(0x0000_0000), 0);
-    assert_eq!(bus.read8(0x0000_0001), 1);
-    assert_eq!(bus.read8(0x0000_001F), 31);
-    assert_eq!(bus.read32(0x0000_0000), 0x03020100);
+    assert_eq!(bus.read8(0x0000_0000, 0), 0);
+    assert_eq!(bus.read8(0x0000_0001, 0), 1);
+    assert_eq!(bus.read8(0x0000_001F, 0), 31);
+    assert_eq!(bus.read32(0x0000_0000, 0), 0x03020100);
 }
 
 #[test]
 fn bus_sram_write_then_read_roundtrip() {
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x2000_0000, 0xDEAD_BEEF);
-    assert_eq!(bus.read32(0x2000_0000), 0xDEAD_BEEF);
-    bus.write16(0x2000_0004, 0xCAFE);
-    assert_eq!(bus.read16(0x2000_0004), 0xCAFE);
-    bus.write8(0x2000_0006, 0x42);
-    assert_eq!(bus.read8(0x2000_0006), 0x42);
+    bus.write32(0x2000_0000, 0xDEAD_BEEF, 0);
+    assert_eq!(bus.read32(0x2000_0000, 0), 0xDEAD_BEEF);
+    bus.write16(0x2000_0004, 0xCAFE, 0);
+    assert_eq!(bus.read16(0x2000_0004, 0), 0xCAFE);
+    bus.write8(0x2000_0006, 0x42, 0);
+    assert_eq!(bus.read8(0x2000_0006, 0), 0x42);
 }
 
 #[test]
@@ -4996,25 +4996,25 @@ fn bus_xip_read_returns_loaded_flash_data() {
     let (_, mut bus) = core_and_bus();
     let flash = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
     bus.load_flash(&flash);
-    assert_eq!(bus.read8(0x1000_0000), 0xAA);
-    assert_eq!(bus.read32(0x1000_0000), 0xDDCCBBAA);
-    assert_eq!(bus.read32(0x1000_0004), 0x44332211);
+    assert_eq!(bus.read8(0x1000_0000, 0), 0xAA);
+    assert_eq!(bus.read32(0x1000_0000, 0), 0xDDCCBBAA);
+    assert_eq!(bus.read32(0x1000_0004, 0), 0x44332211);
 }
 
 #[test]
 fn bus_sram_boundary_last_valid_byte() {
     // SRAM is 520 KB = 0x82000 bytes. Last valid address: 0x20081FFF.
     let (_, mut bus) = core_and_bus();
-    bus.write8(0x2008_1FFF, 0x77);
-    assert_eq!(bus.read8(0x2008_1FFF), 0x77);
+    bus.write8(0x2008_1FFF, 0x77, 0);
+    assert_eq!(bus.read8(0x2008_1FFF, 0), 0x77);
 }
 
 #[test]
 fn bus_sram_boundary_out_of_range_returns_zero() {
     // Address 0x20082000 is beyond the 520 KB SRAM region.
     let (_, mut bus) = core_and_bus();
-    bus.write8(0x2008_2000, 0xFF); // should be silently ignored
-    assert_eq!(bus.read8(0x2008_2000), 0); // out-of-range → 0
+    bus.write8(0x2008_2000, 0xFF, 0); // should be silently ignored
+    assert_eq!(bus.read8(0x2008_2000, 0), 0); // out-of-range → 0
 }
 
 #[test]
@@ -5024,9 +5024,9 @@ fn bus_rom_boundary_32kb() {
     let mut rom_data = vec![0u8; 32 * 1024];
     rom_data[0x7FFF] = 0xEE;
     bus.memory.load_rom(&rom_data);
-    assert_eq!(bus.read8(0x0000_7FFF), 0xEE); // last byte of 32 KB ROM
-    assert_eq!(bus.read8(0x0000_8000), 0);     // beyond ROM → 0
-    assert_eq!(bus.read8(0x0000_FFFF), 0);     // well beyond ROM → 0
+    assert_eq!(bus.read8(0x0000_7FFF, 0), 0xEE); // last byte of 32 KB ROM
+    assert_eq!(bus.read8(0x0000_8000, 0), 0);     // beyond ROM → 0
+    assert_eq!(bus.read8(0x0000_FFFF, 0), 0);     // well beyond ROM → 0
 }
 
 #[test]
@@ -5035,20 +5035,20 @@ fn bus_writes_to_rom_are_silently_ignored() {
     let rom_data = vec![0x42; 16];
     bus.memory.load_rom(&rom_data);
     // Attempt to write to ROM address — should be ignored
-    bus.write8(0x0000_0000, 0xFF);
-    bus.write32(0x0000_0004, 0xFFFF_FFFF);
+    bus.write8(0x0000_0000, 0xFF, 0);
+    bus.write32(0x0000_0004, 0xFFFF_FFFF, 0);
     // Original data preserved
-    assert_eq!(bus.read8(0x0000_0000), 0x42);
-    assert_eq!(bus.read32(0x0000_0004), 0x42424242);
+    assert_eq!(bus.read8(0x0000_0000, 0), 0x42);
+    assert_eq!(bus.read32(0x0000_0004, 0), 0x42424242);
 }
 
 #[test]
 fn bus_unmapped_region_reads_zero() {
     // Regions 0x3, 0x6..0xC, 0xF are unmapped — should read as 0.
     let (_, mut bus) = core_and_bus();
-    assert_eq!(bus.read32(0x3000_0000), 0);
-    assert_eq!(bus.read32(0x6000_0000), 0);
-    assert_eq!(bus.read32(0xF000_0000), 0);
+    assert_eq!(bus.read32(0x3000_0000, 0), 0);
+    assert_eq!(bus.read32(0x6000_0000, 0), 0);
+    assert_eq!(bus.read32(0xF000_0000, 0), 0);
 }
 
 // ============================================================================
@@ -5063,30 +5063,30 @@ fn bus_unmapped_region_reads_zero() {
 fn sram_bank0_write_read() {
     // Word at SRAM base + 0x00 → bank 0 (word_offset 0 % 8 = 0)
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x2000_0000, 0x1111_1111);
-    assert_eq!(bus.read32(0x2000_0000), 0x1111_1111);
+    bus.write32(0x2000_0000, 0x1111_1111, 0);
+    assert_eq!(bus.read32(0x2000_0000, 0), 0x1111_1111);
 }
 
 #[test]
 fn sram8_write_read() {
     // SRAM8: 4 KB at 0x20080000 (non-striped)
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x2008_0000, 0xAAAA_BBBB);
-    assert_eq!(bus.read32(0x2008_0000), 0xAAAA_BBBB);
+    bus.write32(0x2008_0000, 0xAAAA_BBBB, 0);
+    assert_eq!(bus.read32(0x2008_0000, 0), 0xAAAA_BBBB);
     // Last word of SRAM8: 0x20080FFC
-    bus.write32(0x2008_0FFC, 0xCCCC_DDDD);
-    assert_eq!(bus.read32(0x2008_0FFC), 0xCCCC_DDDD);
+    bus.write32(0x2008_0FFC, 0xCCCC_DDDD, 0);
+    assert_eq!(bus.read32(0x2008_0FFC, 0), 0xCCCC_DDDD);
 }
 
 #[test]
 fn sram9_write_read() {
     // SRAM9: 4 KB at 0x20081000 (non-striped)
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x2008_1000, 0x1234_5678);
-    assert_eq!(bus.read32(0x2008_1000), 0x1234_5678);
+    bus.write32(0x2008_1000, 0x1234_5678, 0);
+    assert_eq!(bus.read32(0x2008_1000, 0), 0x1234_5678);
     // Last word of SRAM9: 0x20081FFC
-    bus.write32(0x2008_1FFC, 0x9ABC_DEF0);
-    assert_eq!(bus.read32(0x2008_1FFC), 0x9ABC_DEF0);
+    bus.write32(0x2008_1FFC, 0x9ABC_DEF0, 0);
+    assert_eq!(bus.read32(0x2008_1FFC, 0), 0x9ABC_DEF0);
 }
 
 #[test]
@@ -5102,12 +5102,12 @@ fn sram_striped_access_consecutive_words_go_to_consecutive_banks() {
     for i in 0u32..9 {
         let addr = 0x2000_0000 + i * 4;
         let val = 0xA000_0000 | i;
-        bus.write32(addr, val);
+        bus.write32(addr, val, 0);
     }
     for i in 0u32..9 {
         let addr = 0x2000_0000 + i * 4;
         let expected = 0xA000_0000 | i;
-        assert_eq!(bus.read32(addr), expected, "word {} at 0x{:08X}", i, addr);
+        assert_eq!(bus.read32(addr, 0), expected, "word {} at 0x{:08X}", i, addr);
     }
 }
 
@@ -5160,7 +5160,7 @@ fn bank_for_address_rejects_non_sram() {
 fn bus_latency_sram_read_1_cycle() {
     // SRAM is AHB-attached: 1-cycle read, zero wait state.
     let (_, mut bus) = core_and_bus();
-    bus.read32(0x2000_0000);
+    bus.read32(0x2000_0000, 0);
     assert_eq!(bus.last_access_cycles(), 1);
 }
 
@@ -5168,7 +5168,7 @@ fn bus_latency_sram_read_1_cycle() {
 fn bus_latency_sram_write_1_cycle() {
     // SRAM is AHB-attached: 1-cycle write.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x2000_0000, 0x42);
+    bus.write32(0x2000_0000, 0x42, 0);
     assert_eq!(bus.last_access_cycles(), 1);
 }
 
@@ -5176,7 +5176,7 @@ fn bus_latency_sram_write_1_cycle() {
 fn bus_latency_rom_read_1_cycle() {
     // ROM is AHB-attached: 1-cycle read.
     let (_, mut bus) = core_and_bus();
-    bus.read32(0x0000_0000);
+    bus.read32(0x0000_0000, 0);
     assert_eq!(bus.last_access_cycles(), 1);
 }
 
@@ -5184,7 +5184,7 @@ fn bus_latency_rom_read_1_cycle() {
 fn bus_latency_apb_peripheral_read_3_cycles() {
     // APB peripherals at 0x40000000: 3-cycle read latency.
     let (_, mut bus) = core_and_bus();
-    bus.read32(0x4000_0000);
+    bus.read32(0x4000_0000, 0);
     assert_eq!(bus.last_access_cycles(), 3);
 }
 
@@ -5192,7 +5192,7 @@ fn bus_latency_apb_peripheral_read_3_cycles() {
 fn bus_latency_apb_peripheral_write_4_cycles() {
     // APB peripherals at 0x40000000: 4-cycle write latency.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x4000_0000, 0x1);
+    bus.write32(0x4000_0000, 0x1, 0);
     assert_eq!(bus.last_access_cycles(), 4);
 }
 
@@ -5200,7 +5200,7 @@ fn bus_latency_apb_peripheral_write_4_cycles() {
 fn bus_latency_sio_access_1_cycle() {
     // SIO at 0xD0000000: single-cycle access.
     let (_, mut bus) = core_and_bus();
-    bus.read32(0xD000_0000);
+    bus.read32(0xD000_0000, 0);
     assert_eq!(bus.last_access_cycles(), 1);
 }
 
@@ -5221,8 +5221,8 @@ fn atomic_alias_normal_write() {
     // Base+0x0000: normal write replaces the value.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000; // APB peripheral base (generic, not a stub peripheral)
-    bus.write32(base + 0x0000, 0xFF00_FF00);
-    assert_eq!(bus.read32(base), 0xFF00_FF00);
+    bus.write32(base + 0x0000, 0xFF00_FF00, 0);
+    assert_eq!(bus.read32(base, 0), 0xFF00_FF00);
 }
 
 #[test]
@@ -5230,9 +5230,9 @@ fn atomic_alias_xor_write() {
     // Base+0x1000: XOR — new_val = old_val ^ written_val.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
-    bus.write32(base + 0x0000, 0xFF00_FF00); // seed value
-    bus.write32(base + 0x1000, 0x0F0F_0F0F); // XOR alias
-    assert_eq!(bus.read32(base), 0xF00F_F00F);
+    bus.write32(base + 0x0000, 0xFF00_FF00, 0); // seed value
+    bus.write32(base + 0x1000, 0x0F0F_0F0F, 0); // XOR alias
+    assert_eq!(bus.read32(base, 0), 0xF00F_F00F);
 }
 
 #[test]
@@ -5240,9 +5240,9 @@ fn atomic_alias_set_write() {
     // Base+0x2000: SET — new_val = old_val | written_val.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
-    bus.write32(base + 0x0000, 0x0000_00FF); // seed value
-    bus.write32(base + 0x2000, 0x0000_FF00); // SET alias
-    assert_eq!(bus.read32(base), 0x0000_FFFF);
+    bus.write32(base + 0x0000, 0x0000_00FF, 0); // seed value
+    bus.write32(base + 0x2000, 0x0000_FF00, 0); // SET alias
+    assert_eq!(bus.read32(base, 0), 0x0000_FFFF);
 }
 
 #[test]
@@ -5250,9 +5250,9 @@ fn atomic_alias_clr_write() {
     // Base+0x3000: CLR — new_val = old_val & ~written_val.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
-    bus.write32(base + 0x0000, 0xFFFF_FFFF); // seed value
-    bus.write32(base + 0x3000, 0x00FF_00FF); // CLR alias
-    assert_eq!(bus.read32(base), 0xFF00_FF00);
+    bus.write32(base + 0x0000, 0xFFFF_FFFF, 0); // seed value
+    bus.write32(base + 0x3000, 0x00FF_00FF, 0); // CLR alias
+    assert_eq!(bus.read32(base, 0), 0xFF00_FF00);
 }
 
 #[test]
@@ -5260,11 +5260,11 @@ fn atomic_alias_read_ignores_alias_bits() {
     // Reads from any alias offset return the same canonical value.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
-    bus.write32(base, 0xBEEF_CAFE);
-    assert_eq!(bus.read32(base + 0x0000), 0xBEEF_CAFE);
-    assert_eq!(bus.read32(base + 0x1000), 0xBEEF_CAFE); // XOR alias read
-    assert_eq!(bus.read32(base + 0x2000), 0xBEEF_CAFE); // SET alias read
-    assert_eq!(bus.read32(base + 0x3000), 0xBEEF_CAFE); // CLR alias read
+    bus.write32(base, 0xBEEF_CAFE, 0);
+    assert_eq!(bus.read32(base + 0x0000, 0), 0xBEEF_CAFE);
+    assert_eq!(bus.read32(base + 0x1000, 0), 0xBEEF_CAFE); // XOR alias read
+    assert_eq!(bus.read32(base + 0x2000, 0), 0xBEEF_CAFE); // SET alias read
+    assert_eq!(bus.read32(base + 0x3000, 0), 0xBEEF_CAFE); // CLR alias read
 }
 
 #[test]
@@ -5273,14 +5273,14 @@ fn atomic_alias_ahb_peripheral() {
     // PIO0 CTRL: SM_ENABLE [3:0] with SET/CLR/XOR alias support.
     let mut bus = Bus::new();
     let base = 0x5020_0000; // PIO0 CTRL
-    bus.write32(base, 0x5); // enable SM0 + SM2
-    assert_eq!(bus.read32(base), 0x5);
-    bus.write32(base + 0x2000, 0xA); // SET alias: enable SM1 + SM3
-    assert_eq!(bus.read32(base), 0xF); // all 4 SMs enabled
+    bus.write32(base, 0x5, 0); // enable SM0 + SM2
+    assert_eq!(bus.read32(base, 0), 0x5);
+    bus.write32(base + 0x2000, 0xA, 0); // SET alias: enable SM1 + SM3
+    assert_eq!(bus.read32(base, 0), 0xF); // all 4 SMs enabled
     // AHB atomics have no extra latency cost (unlike APB interposed)
-    bus.write32(base + 0x1000, 0x3); // XOR alias: toggle SM0 + SM1
+    bus.write32(base + 0x1000, 0x3, 0); // XOR alias: toggle SM0 + SM1
     assert_eq!(bus.last_access_cycles(), 1); // no extra cost
-    assert_eq!(bus.read32(base), 0xC); // SM2 + SM3 remain enabled
+    assert_eq!(bus.read32(base, 0), 0xC); // SM2 + SM3 remain enabled
 }
 
 #[test]
@@ -5289,16 +5289,16 @@ fn atomic_alias_apb_interposed_latency() {
     let mut bus = Bus::new();
     let base = 0x4007_0000; // UART0
     // Normal APB write: 4 cycles
-    bus.write32(base, 0x1234);
+    bus.write32(base, 0x1234, 0);
     assert_eq!(bus.last_access_cycles(), 4);
     // XOR alias APB write: 6 cycles (4 + 2 interposed)
-    bus.write32(base + 0x1000, 0x00FF);
+    bus.write32(base + 0x1000, 0x00FF, 0);
     assert_eq!(bus.last_access_cycles(), 6);
     // SET alias: also 6 cycles
-    bus.write32(base + 0x2000, 0x00FF);
+    bus.write32(base + 0x2000, 0x00FF, 0);
     assert_eq!(bus.last_access_cycles(), 6);
     // CLR alias: also 6 cycles
-    bus.write32(base + 0x3000, 0x00FF);
+    bus.write32(base + 0x3000, 0x00FF, 0);
     assert_eq!(bus.last_access_cycles(), 6);
 }
 
@@ -5388,51 +5388,51 @@ fn arbitration_core_local_never_contends() {
 #[test]
 fn sram_atomic_xor() {
     let mut bus = Bus::new();
-    bus.write32(0x2000_0000, 0xAAAA_5555); // seed via normal write
-    bus.write32(0x2100_0000, 0xFFFF_FFFF); // XOR alias
-    assert_eq!(bus.read32(0x2000_0000), 0x5555_AAAA);
+    bus.write32(0x2000_0000, 0xAAAA_5555, 0); // seed via normal write
+    bus.write32(0x2100_0000, 0xFFFF_FFFF, 0); // XOR alias
+    assert_eq!(bus.read32(0x2000_0000, 0), 0x5555_AAAA);
 }
 
 #[test]
 fn sram_atomic_set() {
     let mut bus = Bus::new();
-    bus.write32(0x2000_0000, 0x0000_00FF);
-    bus.write32(0x2200_0000, 0x0000_FF00); // SET alias
-    assert_eq!(bus.read32(0x2000_0000), 0x0000_FFFF);
+    bus.write32(0x2000_0000, 0x0000_00FF, 0);
+    bus.write32(0x2200_0000, 0x0000_FF00, 0); // SET alias
+    assert_eq!(bus.read32(0x2000_0000, 0), 0x0000_FFFF);
 }
 
 #[test]
 fn sram_atomic_clr() {
     let mut bus = Bus::new();
-    bus.write32(0x2000_0000, 0xFFFF_FFFF);
-    bus.write32(0x2300_0000, 0x00FF_00FF); // CLR alias
-    assert_eq!(bus.read32(0x2000_0000), 0xFF00_FF00);
+    bus.write32(0x2000_0000, 0xFFFF_FFFF, 0);
+    bus.write32(0x2300_0000, 0x00FF_00FF, 0); // CLR alias
+    assert_eq!(bus.read32(0x2000_0000, 0), 0xFF00_FF00);
 }
 
 #[test]
 fn sram_atomic_read_returns_canonical() {
     let mut bus = Bus::new();
-    bus.write32(0x2000_0010, 0xDEAD_BEEF);
+    bus.write32(0x2000_0010, 0xDEAD_BEEF, 0);
     // All alias reads return the same canonical value
-    assert_eq!(bus.read32(0x2000_0010), 0xDEAD_BEEF);
-    assert_eq!(bus.read32(0x2100_0010), 0xDEAD_BEEF);
-    assert_eq!(bus.read32(0x2200_0010), 0xDEAD_BEEF);
-    assert_eq!(bus.read32(0x2300_0010), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2000_0010, 0), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2100_0010, 0), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2200_0010, 0), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2300_0010, 0), 0xDEAD_BEEF);
 }
 
 #[test]
 fn sram_atomic_8bit_xor_doesnt_affect_neighbors() {
     let mut bus = Bus::new();
-    bus.write32(0x2000_0000, 0xAABB_CCDD);
-    bus.write8(0x2100_0001, 0xFF); // XOR byte at offset 1 only
+    bus.write32(0x2000_0000, 0xAABB_CCDD, 0);
+    bus.write8(0x2100_0001, 0xFF, 0); // XOR byte at offset 1 only
     // Byte 0: 0xDD unchanged, Byte 1: 0xCC ^ 0xFF = 0x33, Byte 2-3: unchanged
-    assert_eq!(bus.read32(0x2000_0000), 0xAABB_33DD);
+    assert_eq!(bus.read32(0x2000_0000, 0), 0xAABB_33DD);
 }
 
 #[test]
 fn sram_atomic_no_extra_latency() {
     let mut bus = Bus::new();
-    bus.write32(0x2200_0000, 0xFF); // SET alias write
+    bus.write32(0x2200_0000, 0xFF, 0); // SET alias write
     assert_eq!(bus.last_access_cycles(), 1); // same as normal SRAM
 }
 
@@ -5476,7 +5476,7 @@ fn dual_core_extra_wait_states_no_pollution() {
 
     // Artificially pollute the accumulator to prove the reset kills it.
     bus.reset_extra_wait_states();
-    let _ = bus.read32(0x2000_0008); // SRAM bank 2 read adds +1 wait state
+    let _ = bus.read32(0x2000_0008, 0); // SRAM bank 2 read adds +1 wait state
     assert_eq!(bus.extra_wait_states(), 1, "precondition: bank-2 read adds wait");
 
     // Core 0 executes one NOP — decode_execute must reset the accumulator
@@ -5505,7 +5505,7 @@ fn sram_bank2_read_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20000008: offset 0x8, bank = (0x8 >> 2) & 7 = 2
-    let _ = bus.read32(0x2000_0008);
+    let _ = bus.read32(0x2000_0008, 0);
     assert_eq!(bus.extra_wait_states(), 1, "bank 2 read should add +1 wait state");
 }
 
@@ -5514,7 +5514,7 @@ fn sram_bank6_read_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20000018: offset 0x18, bank = (0x18 >> 2) & 7 = 6
-    let _ = bus.read32(0x2000_0018);
+    let _ = bus.read32(0x2000_0018, 0);
     assert_eq!(bus.extra_wait_states(), 1, "bank 6 read should add +1 wait state");
 }
 
@@ -5523,7 +5523,7 @@ fn sram_bank0_no_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20000000: offset 0x0, bank = (0x0 >> 2) & 7 = 0
-    let _ = bus.read32(0x2000_0000);
+    let _ = bus.read32(0x2000_0000, 0);
     assert_eq!(bus.extra_wait_states(), 0, "bank 0 read should have no extra wait state");
 }
 
@@ -5532,7 +5532,7 @@ fn sram_bank2_write_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20000008: offset 0x8, bank = (0x8 >> 2) & 7 = 2
-    bus.write32(0x2000_0008, 0xDEAD_BEEF);
+    bus.write32(0x2000_0008, 0xDEAD_BEEF, 0);
     assert_eq!(bus.extra_wait_states(), 1, "bank 2 write should add +1 wait state");
 }
 
@@ -5541,7 +5541,7 @@ fn sram_bank89_no_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20080000: offset 0x80000, non-striped SRAM8
-    let _ = bus.read32(0x2008_0000);
+    let _ = bus.read32(0x2008_0000, 0);
     assert_eq!(bus.extra_wait_states(), 0, "SRAM8 read should have no extra wait state");
 }
 
@@ -6033,9 +6033,9 @@ fn test_mmio_nvic_ispr_write_mirrors_into_irq_pending_and_dispatches() {
     // dispatch on the next step. Covers HLD V5 §5.3 mandated case.
     let mut emu = load_external_irq_emu();
     // Enable IRQ 0 via MMIO path.
-    emu.bus.write32(0xE000_E100, 1u32 << 0);
+    emu.bus.write32(0xE000_E100, 1u32 << 0, 0);
     // Pend IRQ 0 via MMIO path — this is the case B1 restores.
-    emu.bus.write32(0xE000_E200, 1u32 << 0);
+    emu.bus.write32(0xE000_E200, 1u32 << 0, 0);
     // After write, bus.irq_pending must reflect the latch.
     assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
         "NVIC_ISPR MMIO write must mirror into bus.irq_pending[core]");
@@ -6052,10 +6052,10 @@ fn test_mmio_nvic_icpr_write_drops_irq_pending_mirror() {
     // doesn't let a cleared IRQ re-dispatch.
     let mut emu = load_external_irq_emu();
     // Pend via MMIO (mirrors set bit).
-    emu.bus.write32(0xE000_E200, 1u32 << 0);
+    emu.bus.write32(0xE000_E200, 1u32 << 0, 0);
     assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0);
     // Clear via MMIO ICPR.
-    emu.bus.write32(0xE000_E280, 1u32 << 0);
+    emu.bus.write32(0xE000_E280, 1u32 << 0, 0);
     assert_eq!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
         "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror");
     assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << 0), 0,
@@ -6069,7 +6069,7 @@ fn test_mmio_nvic_ispr_word1_write_mirrors_high_half() {
     // pending IRQ 40 (PROC0_IRQ_CSIDE in the catalogue) must surface
     // in bits 32..=63 of irq_pending.
     let mut emu = load_external_irq_emu();
-    emu.bus.write32(0xE000_E204, 1u32 << (40 - 32));
+    emu.bus.write32(0xE000_E204, 1u32 << (40 - 32), 0);
     assert_ne!(emu.bus.irq_pending[0] & (1u64 << 40), 0,
         "NVIC_ISPR1 write for IRQ 40 must mirror into bus.irq_pending[core] bit 40");
 }
@@ -6104,14 +6104,14 @@ fn test_unified_arbitration_external_irq_beats_pendsv() {
     let mut emu = load_external_irq_emu();
     // Set PendSV priority to 0x80 via SHPR3 (PendSV is byte [10] → lane 2
     // of SHPR3 at 0xE000_ED20).
-    emu.bus.write32(0xE000_ED20, u32::from_le_bytes([0, 0, 0x80, 0]));
+    emu.bus.write32(0xE000_ED20, u32::from_le_bytes([0, 0, 0x80, 0]), 0);
     // Set IRQ 0 priority to 0x20.
-    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0x20, 0, 0, 0]));
+    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0x20, 0, 0, 0]), 0);
     // Enable IRQ 0.
-    emu.bus.write32(0xE000_E100, 1u32 << 0);
+    emu.bus.write32(0xE000_E100, 1u32 << 0, 0);
     // Pend both.
-    emu.bus.write32(0xE000_ED04, 1u32 << 28); // ICSR.PENDSVSET
-    emu.bus.write32(0xE000_E200, 1u32 << 0); // NVIC_ISPR IRQ 0
+    emu.bus.write32(0xE000_ED04, 1u32 << 28, 0); // ICSR.PENDSVSET
+    emu.bus.write32(0xE000_E200, 1u32 << 0, 0); // NVIC_ISPR IRQ 0
     // One step: unified arbitration picks IRQ 0 (priority 0x20 beats 0x80).
     core0_step(&mut emu);
     assert_eq!(emu.cores[0].regs.ipsr(), 16,
@@ -6125,11 +6125,11 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
     // a higher-priority IRQ preempts a running handler.
     let mut emu = load_external_irq_emu();
     // Priorities: IRQ 0 = 0xC0 (lane 0), IRQ 1 = 0x40 (lane 1).
-    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0x40, 0, 0]));
+    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0x40, 0, 0]), 0);
     // Enable both IRQs.
-    emu.bus.write32(0xE000_E100, 0b11);
+    emu.bus.write32(0xE000_E100, 0b11, 0);
     // Pend IRQ 0 + step until the handler is entered.
-    emu.bus.write32(0xE000_E200, 1u32 << 0);
+    emu.bus.write32(0xE000_E200, 1u32 << 0, 0);
     let mut taken = false;
     for _ in 0..5 {
         core0_step(&mut emu);
@@ -6140,7 +6140,7 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
     }
     assert!(taken, "IRQ 0 must dispatch within a few steps (IPSR=16)");
     // Now pend IRQ 1 at higher priority. Must preempt on next step.
-    emu.bus.write32(0xE000_E200, 1u32 << 1);
+    emu.bus.write32(0xE000_E200, 1u32 << 1, 0);
     core0_step(&mut emu);
     assert_eq!(emu.cores[0].regs.ipsr(), 17,
         "IRQ 1 (priority 0x40) must preempt IRQ 0 handler (priority 0xC0)");
@@ -6367,7 +6367,7 @@ fn tt_does_not_collide_with_strex() {
     // R0 (Rd) should be 0 (STREX success)
     assert_eq!(c.reg(0), 0);
     // Memory at 0x20000100 should have the stored value
-    assert_eq!(bus.read32(0x2000_0100), 0xDEAD_BEEF);
+    assert_eq!(bus.read32(0x2000_0100, 0), 0xDEAD_BEEF);
 }
 
 // ============================================================================
@@ -6606,16 +6606,16 @@ fn bootrom_diagnostic_run() {
 fn test_qmi_register_roundtrip() {
     let (_, mut bus) = core_and_bus();
     // M0_TIMING is at QMI offset 0x004
-    bus.write32(0x400D_0004, 0xDEAD_BEEF);
-    assert_eq!(bus.read32(0x400D_0004), 0xDEAD_BEEF);
+    bus.write32(0x400D_0004, 0xDEAD_BEEF, 0);
+    assert_eq!(bus.read32(0x400D_0004, 0), 0xDEAD_BEEF);
 }
 
 #[test]
 fn test_qmi_direct_csr_always_ready() {
     let (_, mut bus) = core_and_bus();
     // Write something to DIRECT_CSR (offset 0x000)
-    bus.write32(0x400D_0000, 0x0000_0042);
-    let csr = bus.read32(0x400D_0000);
+    bus.write32(0x400D_0000, 0x0000_0042, 0);
+    let csr = bus.read32(0x400D_0000, 0);
     // TXEMPTY (bit 16) and RXEMPTY (bit 17) must always be set
     assert_ne!(csr & (1 << 16), 0, "TXEMPTY must be set");
     assert_ne!(csr & (1 << 17), 0, "RXEMPTY must be set");
@@ -6630,40 +6630,40 @@ fn test_qmi_direct_csr_always_ready() {
 #[test]
 fn test_sio_gpio_out_write_read() {
     let (_, mut bus) = core_and_bus();
-    bus.write32(0xD000_0010, 0xAAAA_5555);
-    assert_eq!(bus.read32(0xD000_0010), 0xAAAA_5555);
+    bus.write32(0xD000_0010, 0xAAAA_5555, 0);
+    assert_eq!(bus.read32(0xD000_0010, 0), 0xAAAA_5555);
 }
 
 #[test]
 fn test_sio_gpio_set_clr_xor() {
     let (_, mut bus) = core_and_bus();
     // Start with known value
-    bus.write32(0xD000_0010, 0x0000_00FF);
+    bus.write32(0xD000_0010, 0x0000_00FF, 0);
     // SET bits 8-15 (RP2350 GPIO_OUT_SET = 0x018)
-    bus.write32(0xD000_0018, 0x0000_FF00);
-    assert_eq!(bus.read32(0xD000_0010), 0x0000_FFFF);
+    bus.write32(0xD000_0018, 0x0000_FF00, 0);
+    assert_eq!(bus.read32(0xD000_0010, 0), 0x0000_FFFF);
     // CLR bits 0-7 (RP2350 GPIO_OUT_CLR = 0x020)
-    bus.write32(0xD000_0020, 0x0000_00FF);
-    assert_eq!(bus.read32(0xD000_0010), 0x0000_FF00);
+    bus.write32(0xD000_0020, 0x0000_00FF, 0);
+    assert_eq!(bus.read32(0xD000_0010, 0), 0x0000_FF00);
     // XOR bit 15 (RP2350 GPIO_OUT_XOR = 0x028)
-    bus.write32(0xD000_0028, 0x0000_8000);
-    assert_eq!(bus.read32(0xD000_0010), 0x0000_7F00);
+    bus.write32(0xD000_0028, 0x0000_8000, 0);
+    assert_eq!(bus.read32(0xD000_0010, 0), 0x0000_7F00);
 
     // Same for GPIO_OE (RP2350 base = 0x030)
-    bus.write32(0xD000_0030, 0xFFFF_0000);
-    bus.write32(0xD000_0040, 0x00FF_0000); // GPIO_OE_CLR (0x040)
-    assert_eq!(bus.read32(0xD000_0030), 0xFF00_0000);
-    bus.write32(0xD000_0038, 0x0000_FFFF); // GPIO_OE_SET (0x038)
-    assert_eq!(bus.read32(0xD000_0030), 0xFF00_FFFF);
-    bus.write32(0xD000_0048, 0x0100_0001); // GPIO_OE_XOR (0x048)
-    assert_eq!(bus.read32(0xD000_0030), 0xFE00_FFFE);
+    bus.write32(0xD000_0030, 0xFFFF_0000, 0);
+    bus.write32(0xD000_0040, 0x00FF_0000, 0); // GPIO_OE_CLR (0x040)
+    assert_eq!(bus.read32(0xD000_0030, 0), 0xFF00_0000);
+    bus.write32(0xD000_0038, 0x0000_FFFF, 0); // GPIO_OE_SET (0x038)
+    assert_eq!(bus.read32(0xD000_0030, 0), 0xFF00_FFFF);
+    bus.write32(0xD000_0048, 0x0100_0001, 0); // GPIO_OE_XOR (0x048)
+    assert_eq!(bus.read32(0xD000_0030, 0), 0xFE00_FFFE);
 }
 
 #[test]
 fn test_sio_cpuid() {
     let (_, mut bus) = core_and_bus();
     // Default active_core is 0
-    assert_eq!(bus.read32(0xD000_0000), 0);
+    assert_eq!(bus.read32(0xD000_0000, 0), 0);
 }
 
 // ============================================================================
@@ -6674,15 +6674,15 @@ fn test_sio_cpuid() {
 fn test_clocks_source_tracking() {
     let (_, mut bus) = core_and_bus();
     // Write CLK_SYS_CTRL to select source 1 (aux)
-    bus.write32(0x4001_003C, 0x0000_0001);
+    bus.write32(0x4001_003C, 0x0000_0001, 0);
     // CLK_SYS_SELECTED should reflect 1 << 1 = 2
-    assert_eq!(bus.read32(0x4001_0044), 0x2);
+    assert_eq!(bus.read32(0x4001_0044, 0), 0x2);
 
     // Write CLK_REF_CTRL to select source 2
-    bus.write32(0x4001_0030, 0x0000_0002);
-    assert_eq!(bus.read32(0x4001_0030), 0x0000_0002);
+    bus.write32(0x4001_0030, 0x0000_0002, 0);
+    assert_eq!(bus.read32(0x4001_0030, 0), 0x0000_0002);
     // CLK_REF_SELECTED should reflect 1 << 2 = 4
-    assert_eq!(bus.read32(0x4001_0038), 0x4);
+    assert_eq!(bus.read32(0x4001_0038, 0), 0x4);
 }
 
 /// HLD V5 §4.2.10: every `clk_*_SELECTED` register on RP2350 must
@@ -6701,32 +6701,32 @@ fn test_clocks_all_selected_registers_nonzero() {
 
     // Non-glitchless clocks — `_SELECTED` reads 1 unconditionally.
     // clk_gpout0..3 at 0x008, 0x014, 0x020, 0x02C.
-    assert_eq!(bus.read32(0x4001_0008), 1, "CLK_GPOUT0_SELECTED");
-    assert_eq!(bus.read32(0x4001_0014), 1, "CLK_GPOUT1_SELECTED");
-    assert_eq!(bus.read32(0x4001_0020), 1, "CLK_GPOUT2_SELECTED");
-    assert_eq!(bus.read32(0x4001_002C), 1, "CLK_GPOUT3_SELECTED");
+    assert_eq!(bus.read32(0x4001_0008, 0), 1, "CLK_GPOUT0_SELECTED");
+    assert_eq!(bus.read32(0x4001_0014, 0), 1, "CLK_GPOUT1_SELECTED");
+    assert_eq!(bus.read32(0x4001_0020, 0), 1, "CLK_GPOUT2_SELECTED");
+    assert_eq!(bus.read32(0x4001_002C, 0), 1, "CLK_GPOUT3_SELECTED");
     // clk_peri at 0x050, clk_hstx at 0x05C, clk_usb at 0x068, clk_adc
     // at 0x074. RP2350 has no CLK_RTC (unlike RP2040).
-    assert_eq!(bus.read32(0x4001_0050), 1, "CLK_PERI_SELECTED");
-    assert_eq!(bus.read32(0x4001_005C), 1, "CLK_HSTX_SELECTED");
-    assert_eq!(bus.read32(0x4001_0068), 1, "CLK_USB_SELECTED");
-    assert_eq!(bus.read32(0x4001_0074), 1, "CLK_ADC_SELECTED");
+    assert_eq!(bus.read32(0x4001_0050, 0), 1, "CLK_PERI_SELECTED");
+    assert_eq!(bus.read32(0x4001_005C, 0), 1, "CLK_HSTX_SELECTED");
+    assert_eq!(bus.read32(0x4001_0068, 0), 1, "CLK_USB_SELECTED");
+    assert_eq!(bus.read32(0x4001_0074, 0), 1, "CLK_ADC_SELECTED");
 
     // Glitchless clocks — default CTRL = 0, so `_SELECTED = 1 << 0 = 1`.
-    assert_eq!(bus.read32(0x4001_0038), 1, "CLK_REF_SELECTED default");
-    assert_eq!(bus.read32(0x4001_0044), 1, "CLK_SYS_SELECTED default");
+    assert_eq!(bus.read32(0x4001_0038, 0), 1, "CLK_REF_SELECTED default");
+    assert_eq!(bus.read32(0x4001_0044, 0), 1, "CLK_SYS_SELECTED default");
 
     // Glitchless clocks — CTRL update reflected immediately (one-cycle
     // handshake, HLD V5 §5.7).
-    bus.write32(0x4001_003C, 0x0000_0001);
+    bus.write32(0x4001_003C, 0x0000_0001, 0);
     assert_eq!(
-        bus.read32(0x4001_0044),
+        bus.read32(0x4001_0044, 0),
         1 << 1,
         "CLK_SYS_SELECTED after CTRL = 1",
     );
-    bus.write32(0x4001_0030, 0x0000_0003);
+    bus.write32(0x4001_0030, 0x0000_0003, 0);
     assert_eq!(
-        bus.read32(0x4001_0038),
+        bus.read32(0x4001_0038, 0),
         1 << 3,
         "CLK_REF_SELECTED after CTRL = 3 (2-bit SRC field)",
     );
@@ -6853,26 +6853,26 @@ fn set_core0(bus: &mut Bus) {
 fn fifo_push_pop_basic_roundtrip() {
     let mut bus = Bus::new();
     // Core 0 writes 3 values to Core 1's RX FIFO
-    bus.write32(FIFO_WR, 0xAAAA_BBBB);
-    bus.write32(FIFO_WR, 0xCCCC_DDDD);
-    bus.write32(FIFO_WR, 0x1234_5678);
+    bus.write32(FIFO_WR, 0xAAAA_BBBB, 0);
+    bus.write32(FIFO_WR, 0xCCCC_DDDD, 0);
+    bus.write32(FIFO_WR, 0x1234_5678, 0);
 
     // Core 1 reads them back in FIFO order
     set_core1(&mut bus);
-    assert_eq!(bus.read32(FIFO_RD), 0xAAAA_BBBB);
-    assert_eq!(bus.read32(FIFO_RD), 0xCCCC_DDDD);
-    assert_eq!(bus.read32(FIFO_RD), 0x1234_5678);
+    assert_eq!(bus.read32(FIFO_RD, 1), 0xAAAA_BBBB);
+    assert_eq!(bus.read32(FIFO_RD, 1), 0xCCCC_DDDD);
+    assert_eq!(bus.read32(FIFO_RD, 1), 0x1234_5678);
 }
 
 #[test]
 fn fifo_empty_read_returns_zero_and_sets_roe() {
     let mut bus = Bus::new();
     // Core 0 reads from empty RX FIFO
-    let val = bus.read32(FIFO_RD);
+    let val = bus.read32(FIFO_RD, 0);
     assert_eq!(val, 0, "Empty FIFO read should return 0");
 
     // FIFO_ST should show ROE (bit 3) set for Core 0
-    let st = bus.read32(FIFO_ST);
+    let st = bus.read32(FIFO_ST, 0);
     assert!(st & 0x8 != 0, "ROE bit should be set after empty read, FIFO_ST={:#x}", st);
 }
 
@@ -6881,47 +6881,47 @@ fn fifo_full_write_drops_data_and_sets_wof() {
     let mut bus = Bus::new();
     // Fill Core 1's RX FIFO (8 entries) from Core 0
     for i in 0..8u32 {
-        bus.write32(FIFO_WR, i);
+        bus.write32(FIFO_WR, i, 0);
     }
     // 9th write should overflow
-    bus.write32(FIFO_WR, 0xDEAD);
+    bus.write32(FIFO_WR, 0xDEAD, 0);
 
     // Core 0's FIFO_ST should show WOF (bit 2) set
-    let st = bus.read32(FIFO_ST);
+    let st = bus.read32(FIFO_ST, 0);
     assert!(st & 0x4 != 0, "WOF bit should be set after overflow, FIFO_ST={:#x}", st);
 
     // Core 1 should read the original 8 values, not the dropped 0xDEAD
     set_core1(&mut bus);
     for i in 0..8u32 {
-        assert_eq!(bus.read32(FIFO_RD), i);
+        assert_eq!(bus.read32(FIFO_RD, 1), i);
     }
     // Next read is empty
-    assert_eq!(bus.read32(FIFO_RD), 0);
+    assert_eq!(bus.read32(FIFO_RD, 1), 0);
 }
 
 #[test]
 fn fifo_st_reflects_vld_and_rdy() {
     let mut bus = Bus::new();
     // Initially: Core 0 RX is empty (VLD=0), Core 1 RX has space (RDY=1)
-    let st = bus.read32(FIFO_ST);
+    let st = bus.read32(FIFO_ST, 0);
     assert_eq!(st & 0x1, 0, "VLD should be 0 when RX is empty");
     assert_eq!(st & 0x2, 0x2, "RDY should be 1 when TX has space");
 
     // Core 1 writes to Core 0's RX FIFO
     set_core1(&mut bus);
-    bus.write32(FIFO_WR, 42);
+    bus.write32(FIFO_WR, 42, 1);
     set_core0(&mut bus);
 
     // Now Core 0's RX has data
-    let st = bus.read32(FIFO_ST);
+    let st = bus.read32(FIFO_ST, 0);
     assert_eq!(st & 0x1, 0x1, "VLD should be 1 after data written to our RX");
 
     // Fill Core 1's RX from Core 0 (8 entries)
     for i in 0..8u32 {
-        bus.write32(FIFO_WR, i);
+        bus.write32(FIFO_WR, i, 0);
     }
     // RDY should be 0 (Core 1's RX is full)
-    let st = bus.read32(FIFO_ST);
+    let st = bus.read32(FIFO_ST, 0);
     assert_eq!(st & 0x2, 0, "RDY should be 0 when other core's RX is full");
 }
 
@@ -6929,36 +6929,36 @@ fn fifo_st_reflects_vld_and_rdy() {
 fn fifo_st_w1c_clears_wof_and_roe() {
     let mut bus = Bus::new();
     // Trigger ROE by reading empty FIFO
-    bus.read32(FIFO_RD);
-    let st = bus.read32(FIFO_ST);
+    bus.read32(FIFO_RD, 0);
+    let st = bus.read32(FIFO_ST, 0);
     assert!(st & 0x8 != 0, "ROE should be set");
 
     // Fill FIFO then overflow to trigger WOF
     for _ in 0..9 {
-        bus.write32(FIFO_WR, 0);
+        bus.write32(FIFO_WR, 0, 0);
     }
-    let st = bus.read32(FIFO_ST);
+    let st = bus.read32(FIFO_ST, 0);
     assert!(st & 0x4 != 0, "WOF should be set");
     assert!(st & 0x8 != 0, "ROE should still be set");
 
     // W1C: clear WOF only
-    bus.write32(FIFO_ST, 0x4);
-    let st = bus.read32(FIFO_ST);
+    bus.write32(FIFO_ST, 0x4, 0);
+    let st = bus.read32(FIFO_ST, 0);
     assert_eq!(st & 0x4, 0, "WOF should be cleared");
     assert!(st & 0x8 != 0, "ROE should still be set (not cleared)");
 
     // W1C: clear ROE
-    bus.write32(FIFO_ST, 0x8);
-    let st = bus.read32(FIFO_ST);
+    bus.write32(FIFO_ST, 0x8, 0);
+    let st = bus.read32(FIFO_ST, 0);
     assert_eq!(st & 0x8, 0, "ROE should be cleared");
 
     // W1C: writing 0xFFFFFFFF clears both
-    bus.read32(FIFO_RD); // trigger ROE again
+    bus.read32(FIFO_RD, 0); // trigger ROE again
     for _ in 0..9 {
-        bus.write32(FIFO_WR, 0);
+        bus.write32(FIFO_WR, 0, 0);
     }
-    bus.write32(FIFO_ST, 0xFFFF_FFFF);
-    let st = bus.read32(FIFO_ST);
+    bus.write32(FIFO_ST, 0xFFFF_FFFF, 0);
+    let st = bus.read32(FIFO_ST, 0);
     assert_eq!(st & 0xC, 0, "Both WOF and ROE should be cleared");
 }
 
@@ -6970,7 +6970,7 @@ fn fifo_write_sets_event_flag_on_receiver() {
     assert!(!bus.event_flag[1]);
 
     // Core 0 writes FIFO_WR -> should set event_flag[1] (receiver = Core 1)
-    bus.write32(FIFO_WR, 0x42);
+    bus.write32(FIFO_WR, 0x42, 0);
     assert!(bus.event_flag[1], "event_flag[1] should be set after Core 0 FIFO write");
     assert!(!bus.event_flag[0], "event_flag[0] should NOT be set");
 
@@ -6979,7 +6979,7 @@ fn fifo_write_sets_event_flag_on_receiver() {
 
     // Core 1 writes FIFO_WR -> should set event_flag[0] (receiver = Core 0)
     set_core1(&mut bus);
-    bus.write32(FIFO_WR, 0x43);
+    bus.write32(FIFO_WR, 0x43, 1);
     set_core0(&mut bus);
     assert!(bus.event_flag[0], "event_flag[0] should be set after Core 1 FIFO write");
 }
@@ -6989,13 +6989,13 @@ fn fifo_overflow_does_not_set_event_flag() {
     let mut bus = Bus::new();
     // Fill Core 1's RX FIFO
     for i in 0..8u32 {
-        bus.write32(FIFO_WR, i);
+        bus.write32(FIFO_WR, i, 0);
     }
     // Clear event flags
     bus.event_flag = [false; 2];
 
     // Overflow write should NOT set event flag
-    bus.write32(FIFO_WR, 0xDEAD);
+    bus.write32(FIFO_WR, 0xDEAD, 0);
     assert!(!bus.event_flag[1], "event_flag should NOT be set on overflow write");
 }
 
@@ -7007,11 +7007,11 @@ fn fifo_overflow_does_not_set_event_flag() {
 fn spinlock_claim_returns_bit_mask() {
     let mut bus = Bus::new();
     // Claim spinlock 5 from Core 0
-    let result = bus.read32(spinlock_addr(5));
+    let result = bus.read32(spinlock_addr(5), 0);
     assert_eq!(result, 1 << 5, "Claiming lock 5 should return 1<<5");
 
     // SPINLOCK_ST should reflect the claimed lock
-    let st = bus.read32(SPINLOCK_ST);
+    let st = bus.read32(SPINLOCK_ST, 0);
     assert_eq!(st & (1 << 5), 1 << 5, "SPINLOCK_ST should show lock 5 claimed");
 }
 
@@ -7019,11 +7019,11 @@ fn spinlock_claim_returns_bit_mask() {
 fn spinlock_already_claimed_returns_zero() {
     let mut bus = Bus::new();
     // Claim lock 10
-    let first = bus.read32(spinlock_addr(10));
+    let first = bus.read32(spinlock_addr(10), 0);
     assert_eq!(first, 1 << 10);
 
     // Second claim returns 0
-    let second = bus.read32(spinlock_addr(10));
+    let second = bus.read32(spinlock_addr(10), 0);
     assert_eq!(second, 0, "Already-claimed lock should return 0");
 }
 
@@ -7031,15 +7031,15 @@ fn spinlock_already_claimed_returns_zero() {
 fn spinlock_release_via_write() {
     let mut bus = Bus::new();
     // Claim lock 7
-    bus.read32(spinlock_addr(7));
-    assert_eq!(bus.read32(SPINLOCK_ST) & (1 << 7), 1 << 7);
+    bus.read32(spinlock_addr(7), 0);
+    assert_eq!(bus.read32(SPINLOCK_ST, 0) & (1 << 7), 1 << 7);
 
     // Release via write (any value)
-    bus.write32(spinlock_addr(7), 0);
-    assert_eq!(bus.read32(SPINLOCK_ST) & (1 << 7), 0, "Lock 7 should be released");
+    bus.write32(spinlock_addr(7), 0, 0);
+    assert_eq!(bus.read32(SPINLOCK_ST, 0) & (1 << 7), 0, "Lock 7 should be released");
 
     // Re-claim should succeed
-    let result = bus.read32(spinlock_addr(7));
+    let result = bus.read32(spinlock_addr(7), 0);
     assert_eq!(result, 1 << 7, "Re-claiming released lock should succeed");
 }
 
@@ -7047,20 +7047,20 @@ fn spinlock_release_via_write() {
 fn spinlock_contention_core0_claims_core1_sees_zero() {
     let mut bus = Bus::new();
     // Core 0 claims lock 15
-    let c0 = bus.read32(spinlock_addr(15));
+    let c0 = bus.read32(spinlock_addr(15), 0);
     assert_eq!(c0, 1 << 15);
 
     // Core 1 tries to claim same lock -> gets 0
     set_core1(&mut bus);
-    let c1 = bus.read32(spinlock_addr(15));
+    let c1 = bus.read32(spinlock_addr(15), 1);
     assert_eq!(c1, 0, "Core 1 should fail to claim lock already held by Core 0");
 
     // Core 1 can release it though (any write clears)
-    bus.write32(spinlock_addr(15), 1);
+    bus.write32(spinlock_addr(15), 1, 1);
     set_core0(&mut bus);
 
     // Lock is now free, Core 0 can reclaim
-    let c0_again = bus.read32(spinlock_addr(15));
+    let c0_again = bus.read32(spinlock_addr(15), 0);
     assert_eq!(c0_again, 1 << 15);
 }
 
@@ -7068,17 +7068,17 @@ fn spinlock_contention_core0_claims_core1_sees_zero() {
 fn spinlock_st_bitmask_reflects_state() {
     let mut bus = Bus::new();
     // Claim locks 0, 3, 31
-    bus.read32(spinlock_addr(0));
-    bus.read32(spinlock_addr(3));
-    bus.read32(spinlock_addr(31));
+    bus.read32(spinlock_addr(0), 0);
+    bus.read32(spinlock_addr(3), 0);
+    bus.read32(spinlock_addr(31), 0);
 
-    let st = bus.read32(SPINLOCK_ST);
+    let st = bus.read32(SPINLOCK_ST, 0);
     assert_eq!(st, (1 << 0) | (1 << 3) | (1 << 31),
         "SPINLOCK_ST should reflect exactly the claimed locks, got {:#010x}", st);
 
     // Release lock 3
-    bus.write32(spinlock_addr(3), 0);
-    let st = bus.read32(SPINLOCK_ST);
+    bus.write32(spinlock_addr(3), 0, 0);
+    let st = bus.read32(SPINLOCK_ST, 0);
     assert_eq!(st, (1 << 0) | (1 << 31),
         "SPINLOCK_ST should reflect lock 3 released, got {:#010x}", st);
 }
@@ -7228,7 +7228,7 @@ fn test_dualcore_launch() {
 #[test]
 fn test_rosc_status_returns_stable_enabled() {
     let (_, mut bus) = core_and_bus();
-    let status = bus.read32(0x400E_8018);
+    let status = bus.read32(0x400E_8018, 0);
     assert_eq!(status, (1 << 31) | (1 << 12),
         "ROSC STATUS should report STABLE | ENABLED");
 }
@@ -7266,9 +7266,9 @@ fn test_xosc_via_clk_ref_sys_clock() {
     use crate::bus::clocks::XOSC_FREQ_HZ;
     let (_, mut bus) = core_and_bus();
     // CLK_REF_CTRL SRC=2 (XOSC)
-    bus.write32(0x4001_0030, 0x0000_0002);
+    bus.write32(0x4001_0030, 0x0000_0002, 0);
     // CLK_SYS_CTRL SRC=0 (clk_ref)
-    bus.write32(0x4001_003C, 0x0000_0000);
+    bus.write32(0x4001_003C, 0x0000_0000, 0);
     assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ,
         "CLK_SYS routed through CLK_REF=XOSC should give 12 MHz");
     assert_eq!(bus.ref_clk_hz(), XOSC_FREQ_HZ);
@@ -7279,10 +7279,10 @@ fn test_clk_sys_div_scales_output() {
     use crate::bus::clocks::XOSC_FREQ_HZ;
     let (_, mut bus) = core_and_bus();
     // Route CLK_SYS to XOSC via CLK_REF
-    bus.write32(0x4001_0030, 0x0000_0002);
-    bus.write32(0x4001_003C, 0x0000_0000);
+    bus.write32(0x4001_0030, 0x0000_0002, 0);
+    bus.write32(0x4001_003C, 0x0000_0000, 0);
     // CLK_SYS_DIV integer = 2 (bits [31:16])
-    bus.write32(0x4001_0040, 0x0002_0000);
+    bus.write32(0x4001_0040, 0x0002_0000, 0);
     assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ / 2,
         "CLK_SYS_DIV=2 should halve the source frequency");
 }
@@ -7291,11 +7291,11 @@ fn test_clk_sys_div_scales_output() {
 fn test_clocks_write_alias_set() {
     let (_, mut bus) = core_and_bus();
     // Normal write: CLK_REF_CTRL = 0x01
-    bus.write32(0x4001_0030, 0x0000_0001);
+    bus.write32(0x4001_0030, 0x0000_0001, 0);
     // SET alias (alias=2) at offset 0x030 → 0x4001_0000 | (2 << 12) | 0x030
-    bus.write32(0x4001_2030, 0x0000_0002);
+    bus.write32(0x4001_2030, 0x0000_0002, 0);
     // Expect OR, not overwrite → 0x03
-    assert_eq!(bus.read32(0x4001_0030), 0x0000_0003,
+    assert_eq!(bus.read32(0x4001_0030, 0), 0x0000_0003,
         "SET alias should OR bits into CLK_REF_CTRL, not overwrite");
 }
 
@@ -7309,13 +7309,13 @@ fn test_pll_sys_at_150mhz() {
     // POSTDIV1=5, POSTDIV2=2 → VCO=1500M, output=150M.
     let (_, mut bus) = core_and_bus();
     // CS: REFDIV=1 (reset value already has this; write explicitly)
-    bus.write32(0x4005_0000, 0x0000_0001);
+    bus.write32(0x4005_0000, 0x0000_0001, 0);
     // FBDIV_INT = 125
-    bus.write32(0x4005_0008, 125);
+    bus.write32(0x4005_0008, 125, 0);
     // PRIM: POSTDIV1=5 in bits [18:16], POSTDIV2=2 in bits [14:12]
-    bus.write32(0x4005_000C, (5 << 16) | (2 << 12));
+    bus.write32(0x4005_000C, (5 << 16) | (2 << 12), 0);
     // Switch CLK_SYS to aux=0 (PLL_SYS): SRC=1, AUXSRC=0
-    bus.write32(0x4001_003C, 0x0000_0001);
+    bus.write32(0x4001_003C, 0x0000_0001, 0);
     assert_eq!(bus.sys_clk_hz(), 150_000_000,
         "PLL_SYS configured for 150 MHz should give sys_clk_hz = 150_000_000");
 }
@@ -7325,7 +7325,7 @@ fn test_unconfigured_pll_zero_hz() {
     // Fresh Bus: reset values leave FBDIV=0, so pll_output_hz must return 0.
     // Switching CLK_SYS to PLL_SYS without configuring should report 0 Hz.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x4001_003C, 0x0000_0001); // SRC=1 (aux), AUXSRC=0 (PLL_SYS)
+    bus.write32(0x4001_003C, 0x0000_0001, 0); // SRC=1 (aux), AUXSRC=0 (PLL_SYS)
     assert_eq!(bus.sys_clk_hz(), 0,
         "Unconfigured PLL (FBDIV=0) must honestly report 0 Hz, not a .max(1) fudge");
 }
@@ -7341,17 +7341,17 @@ fn test_pll_usb_separate_from_pll_sys() {
     // sys_clk_hz to the register-derived frequency.
     let (_, mut bus) = core_and_bus();
     // Prime `before` with a CLOCKS write to trigger recompute once.
-    bus.write32(0x4001_003C, 0x0000_0000); // CLK_SYS_CTRL SRC=0 (clk_ref → ROSC)
+    bus.write32(0x4001_003C, 0x0000_0000, 0); // CLK_SYS_CTRL SRC=0 (clk_ref → ROSC)
     let before = bus.sys_clk_hz();
     // Configure PLL_USB to some non-trivial value (48 MHz: FBDIV=100,
     // POSTDIV1=5, POSTDIV2=5; VCO=1200M / 25 = 48M).
-    bus.write32(0x4005_8000, 0x0000_0001); // CS REFDIV=1
-    bus.write32(0x4005_8008, 100);         // FBDIV_INT
-    bus.write32(0x4005_800C, (5 << 16) | (5 << 12));
+    bus.write32(0x4005_8000, 0x0000_0001, 0); // CS REFDIV=1
+    bus.write32(0x4005_8008, 100, 0);         // FBDIV_INT
+    bus.write32(0x4005_800C, (5 << 16) | (5 << 12), 0);
     assert_eq!(bus.sys_clk_hz(), before,
         "PLL_USB changes must not affect sys_clk_hz while CLK_SYS is on ROSC");
     // Sanity: PLL_USB registers actually took the writes.
-    assert_eq!(bus.read32(0x4005_8008), 100,
+    assert_eq!(bus.read32(0x4005_8008, 0), 100,
         "PLL_USB FBDIV_INT should read back the value we wrote");
 }
 
@@ -7360,8 +7360,8 @@ fn test_pll_fbdiv_max_no_overflow() {
     // FBDIV=0xFFF (4095) with defaults (REFDIV=1, POSTDIV1=7, POSTDIV2=7)
     // gives 12M * 4095 / 49 ≈ 1.003 GHz. Must not panic on u32 overflow.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x4005_0008, 0xFFF); // FBDIV_INT = 4095 (max)
-    bus.write32(0x4001_003C, 0x0000_0001); // Route CLK_SYS → PLL_SYS
+    bus.write32(0x4005_0008, 0xFFF, 0); // FBDIV_INT = 4095 (max)
+    bus.write32(0x4001_003C, 0x0000_0001, 0); // Route CLK_SYS → PLL_SYS
     let hz = bus.sys_clk_hz();
     assert!(hz > 1_000_000_000 && hz < 1_010_000_000,
         "FBDIV=4095 with defaults should produce ~1.003 GHz (got {hz})");
@@ -7391,7 +7391,7 @@ fn test_pll_cs_read_forces_lock_bit() {
     // value with LOCK=0. Pre-fix this asserted `0x8000_0001`; that
     // assertion was locking in the known bug (see tech_debt.md).
     let mut bus = Bus::new();
-    let cs_read = bus.read32(0x4005_0000);
+    let cs_read = bus.read32(0x4005_0000, 0);
     assert_eq!(cs_read, 0x0000_0001,
         "CS read at reset must NOT force LOCK — PLL is powered down, FBDIV=0");
     assert_eq!(cs_read & (1 << 31), 0, "LOCK=0 at reset");
@@ -7405,7 +7405,7 @@ fn test_pll_sys_write_set_alias_subword() {
     // PLL_USB PWR reset = 0x2D. SET alias byte write of 0x40 to byte 0
     // should yield 0x6D (0x2D | 0x40).
     // Address: 0x4005_8004 + SET alias (2 << 12) = 0x4005_A004.
-    bus.write8(0x4005_A004, 0x40);
+    bus.write8(0x4005_A004, 0x40, 0);
     assert_eq!(bus.pll_usb_regs[1], 0x6D,
         "byte-wide SET alias on PLL_USB PWR must OR, not overwrite");
 }
@@ -7428,7 +7428,7 @@ fn test_pll_cs_read_lock_zero_at_reset() {
     // At `Bus::new()`, PWR=0x2D (PD+VCOPD set) and FBDIV=0 → base
     // predicate is false ⇒ CS[31] must read 0 regardless of cycle.
     let mut bus = Bus::new();
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 at reset");
 }
 
@@ -7439,10 +7439,10 @@ fn test_pll_cs_lock_zero_before_arm() {
     // that arm must yield LOCK=0.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);    // FBDIV_INT = 100
-    bus.write32(0x4005_0004, 0);      // PWR = 0 (fully powered up)
+    bus.write32(0x4005_0008, 100, 0);    // FBDIV_INT = 100
+    bus.write32(0x4005_0004, 0, 0);      // PWR = 0 (fully powered up)
     bus.master_cycle = 100;
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 before arm cycle");
 }
 
@@ -7451,10 +7451,10 @@ fn test_pll_cs_lock_one_after_arm() {
     // Same sequence, but read after the arm expiry.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);    // FBDIV_INT = 100
-    bus.write32(0x4005_0004, 0);      // PWR = 0
+    bus.write32(0x4005_0008, 100, 0);    // FBDIV_INT = 100
+    bus.write32(0x4005_0004, 0, 0);      // PWR = 0
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_ne!(cs & (1 << 31), 0, "LOCK must be 1 past arm cycle");
 }
 
@@ -7463,10 +7463,10 @@ fn test_pll_cs_lock_zero_with_pd_set() {
     // PD only, FBDIV=100 — PD gate wins regardless of cycle count.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);
-    bus.write32(0x4005_0004, 0x01);   // PWR = 0x01 (PD only)
+    bus.write32(0x4005_0008, 100, 0);
+    bus.write32(0x4005_0004, 0x01, 0);   // PWR = 0x01 (PD only)
     bus.master_cycle = 10_000;
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while PD=1");
 }
 
@@ -7475,10 +7475,10 @@ fn test_pll_cs_lock_zero_with_vcopd_set() {
     // VCOPD only (PD clear), FBDIV=100 — VCOPD gate wins.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);
-    bus.write32(0x4005_0004, 0x20);   // PWR = 0x20 (VCOPD only)
+    bus.write32(0x4005_0008, 100, 0);
+    bus.write32(0x4005_0004, 0x20, 0);   // PWR = 0x20 (VCOPD only)
     bus.master_cycle = 10_000;
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while VCOPD=1");
 }
 
@@ -7487,10 +7487,10 @@ fn test_pll_cs_lock_zero_with_fbdiv_zero() {
     // PWR=0, FBDIV=0 — unconfigured PLL; predicate false.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0004, 0);      // PWR = 0
+    bus.write32(0x4005_0004, 0, 0);      // PWR = 0
     // FBDIV stays at reset value of 0.
     bus.master_cycle = 10_000;
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 when FBDIV=0");
 }
 
@@ -7502,14 +7502,14 @@ fn test_pll_cs_lock_rearm_after_powerdown() {
     // "not powered / not configured" territory).
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);
-    bus.write32(0x4005_0004, 0);      // power up
+    bus.write32(0x4005_0008, 100, 0);
+    bus.write32(0x4005_0004, 0, 0);      // power up
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-    let cs1 = bus.read32(0x4005_0000);
+    let cs1 = bus.read32(0x4005_0000, 0);
     assert_ne!(cs1 & (1 << 31), 0, "LOCK must be 1 after initial lock");
 
-    bus.write32(0x4005_0004, 0x21);   // PD+VCOPD set → drop lock
-    let cs2 = bus.read32(0x4005_0000);
+    bus.write32(0x4005_0004, 0x21, 0);   // PD+VCOPD set → drop lock
+    let cs2 = bus.read32(0x4005_0000, 0);
     assert_eq!(cs2 & (1 << 31), 0, "LOCK must drop when power-down re-asserts");
 }
 
@@ -7520,11 +7520,11 @@ fn test_pll_cs_bypass_does_not_force_lock() {
     // conservative "BYPASS doesn't assert LOCK" interpretation (HLD §2).
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0000, 0x101);  // CS: REFDIV=1 | BYPASS=1
-    bus.write32(0x4005_0008, 100);    // FBDIV = 100
-    bus.write32(0x4005_0004, 0);      // PWR = 0
+    bus.write32(0x4005_0000, 0x101, 0);  // CS: REFDIV=1 | BYPASS=1
+    bus.write32(0x4005_0008, 100, 0);    // FBDIV = 100
+    bus.write32(0x4005_0004, 0, 0);      // PWR = 0
     bus.master_cycle = 100;           // still well before arm
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "BYPASS must not force LOCK=1");
 }
 
@@ -7534,11 +7534,11 @@ fn test_pll_cs_read_preserves_refdiv() {
     // REFDIV bits preserved in the read-back.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0000, 0x05);   // REFDIV = 5
-    bus.write32(0x4005_0008, 100);
-    bus.write32(0x4005_0004, 0);
+    bus.write32(0x4005_0000, 0x05, 0);   // REFDIV = 5
+    bus.write32(0x4005_0008, 100, 0);
+    bus.write32(0x4005_0004, 0, 0);
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & 0x3F, 5, "REFDIV must round-trip");
     assert_ne!(cs & (1 << 31), 0, "LOCK must be 1");
 }
@@ -7550,19 +7550,19 @@ fn test_pll_cs_alias_writes_trigger_arm() {
     // CS SET (which leaves the PLL powered down).
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);    // FBDIV = 100 (predicate still
+    bus.write32(0x4005_0008, 100, 0);    // FBDIV = 100 (predicate still
                                       // false because PWR is still 0x2D)
     assert_eq!(bus.pll_sys_lock_at_cycle, None,
         "FBDIV write must not arm while PLL is powered down");
 
     // SET alias on CS: OR 0x01 (no visible change — REFDIV already 1).
-    bus.write32(0x4005_2000, 0x01);
+    bus.write32(0x4005_2000, 0x01, 0);
     assert_eq!(bus.pll_sys_lock_at_cycle, None,
         "CS SET alias must not arm while PLL is powered down");
 
     bus.master_cycle = 100;
     // CLR alias on PWR: clear all power-down bits.
-    bus.write32(0x4005_3004, 0x2D);
+    bus.write32(0x4005_3004, 0x2D, 0);
     assert_eq!(bus.pll_sys_lock_at_cycle, Some(100 + PLL_LOCK_DELAY_SYSCLKS),
         "PWR CLR alias must arm the lock at now + delay");
 }
@@ -7573,20 +7573,20 @@ fn test_pll_prim_write_does_not_rearm() {
     // must NOT move — PRIM is post-VCO.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);
-    bus.write32(0x4005_0004, 0);
+    bus.write32(0x4005_0008, 100, 0);
+    bus.write32(0x4005_0004, 0, 0);
     let armed_at = bus.pll_sys_lock_at_cycle;
     assert_eq!(armed_at, Some(PLL_LOCK_DELAY_SYSCLKS));
 
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
     // Read once to confirm LOCK=1 baseline.
-    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0);
+    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0);
 
     // Write PRIM to a different POSTDIV combination.
-    bus.write32(0x4005_000C, (2u32 << 16) | (2u32 << 12));
+    bus.write32(0x4005_000C, (2u32 << 16) | (2u32 << 12), 0);
     assert_eq!(bus.pll_sys_lock_at_cycle, armed_at,
         "PRIM write must not rearm the lock-detect counter");
-    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
         "LOCK must stay 1 after PRIM-only write");
 }
 
@@ -7595,12 +7595,12 @@ fn test_pll_usb_independent_of_pll_sys() {
     // Arm PLL_SYS; PLL_USB should remain un-armed and read LOCK=0.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);    // PLL_SYS FBDIV
-    bus.write32(0x4005_0004, 0);      // PLL_SYS PWR = 0
+    bus.write32(0x4005_0008, 100, 0);    // PLL_SYS FBDIV
+    bus.write32(0x4005_0004, 0, 0);      // PLL_SYS PWR = 0
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
         "PLL_SYS should report LOCK=1 past arm");
-    assert_eq!(bus.read32(0x4005_8000) & (1 << 31), 0,
+    assert_eq!(bus.read32(0x4005_8000, 0) & (1 << 31), 0,
         "PLL_USB must remain LOCK=0 (independent state)");
     assert_eq!(bus.pll_usb_lock_at_cycle, None);
 }
@@ -7614,25 +7614,25 @@ fn test_pll_cs_rearm_on_fbdiv_change_mid_run() {
     // kept LOCK latched here.)
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100);    // FBDIV = 100
-    bus.write32(0x4005_0004, 0);      // PWR = 0 → arm
+    bus.write32(0x4005_0008, 100, 0);    // FBDIV = 100
+    bus.write32(0x4005_0004, 0, 0);      // PWR = 0 → arm
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
         "initial lock past first arm");
 
     let reconfig_at = PLL_LOCK_DELAY_SYSCLKS + 100;
     bus.master_cycle = reconfig_at;
-    bus.write32(0x4005_0008, 125);    // change FBDIV while powered
+    bus.write32(0x4005_0008, 125, 0);    // change FBDIV while powered
     assert_eq!(
         bus.pll_sys_lock_at_cycle,
         Some(reconfig_at + PLL_LOCK_DELAY_SYSCLKS),
         "FBDIV change must re-arm the lock-detect counter",
     );
-    assert_eq!(bus.read32(0x4005_0000) & (1 << 31), 0,
+    assert_eq!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
         "LOCK must drop to 0 between rearm and the new arm point");
 
     bus.master_cycle = reconfig_at + PLL_LOCK_DELAY_SYSCLKS + 1;
-    assert_ne!(bus.read32(0x4005_0000) & (1 << 31), 0,
+    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
         "LOCK must re-assert past the new arm");
 }
 
@@ -7644,8 +7644,8 @@ fn test_pll_cs_rearm_on_fbdiv_change_mid_run() {
 fn test_rosc_ctrl_roundtrip() {
     // Writing CTRL (0x000) should be stored and read back verbatim.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x400E_8000, 0xDEAD_BEEF);
-    assert_eq!(bus.read32(0x400E_8000), 0xDEAD_BEEF,
+    bus.write32(0x400E_8000, 0xDEAD_BEEF, 0);
+    assert_eq!(bus.read32(0x400E_8000, 0), 0xDEAD_BEEF,
         "ROSC CTRL should round-trip writes (stored, reads return last write)");
 }
 
@@ -7654,24 +7654,24 @@ fn test_rosc_status_unchanged_by_writes() {
     // STATUS (0x018) is read-only: writes are dropped; reads always
     // return STABLE | ENABLED per the V1 stub behaviour.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x400E_8018, 0);
-    assert_eq!(bus.read32(0x400E_8018), (1 << 31) | (1 << 12),
+    bus.write32(0x400E_8018, 0, 0);
+    assert_eq!(bus.read32(0x400E_8018, 0), (1 << 31) | (1 << 12),
         "ROSC STATUS must remain STABLE|ENABLED regardless of writes");
 }
 
 #[test]
 fn test_xosc_ctrl_roundtrip() {
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x4004_8000, 0xCAFE_BABE);
-    assert_eq!(bus.read32(0x4004_8000), 0xCAFE_BABE,
+    bus.write32(0x4004_8000, 0xCAFE_BABE, 0);
+    assert_eq!(bus.read32(0x4004_8000, 0), 0xCAFE_BABE,
         "XOSC CTRL should round-trip writes");
 }
 
 #[test]
 fn test_xosc_startup_roundtrip() {
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x4004_800C, 0x0000_00C4);
-    assert_eq!(bus.read32(0x4004_800C), 0x0000_00C4,
+    bus.write32(0x4004_800C, 0x0000_00C4, 0);
+    assert_eq!(bus.read32(0x4004_800C, 0), 0x0000_00C4,
         "XOSC STARTUP should round-trip writes");
 }
 
@@ -7680,9 +7680,9 @@ fn test_rosc_ctrl_alias_set() {
     // Normal write CTRL=0x01, then write 0x02 via SET alias (0x400EA000)
     // — bits should be OR-ed, not overwritten → CTRL reads 0x03.
     let (_, mut bus) = core_and_bus();
-    bus.write32(0x400E_8000, 0x0000_0001);
-    bus.write32(0x400E_A000, 0x0000_0002);
-    assert_eq!(bus.read32(0x400E_8000), 0x0000_0003,
+    bus.write32(0x400E_8000, 0x0000_0001, 0);
+    bus.write32(0x400E_A000, 0x0000_0002, 0);
+    assert_eq!(bus.read32(0x400E_8000, 0), 0x0000_0003,
         "SET alias on ROSC CTRL should OR bits, not overwrite");
 }
 
@@ -7708,7 +7708,7 @@ fn test_config_sys_clk_hz_seeds_bus() {
     // overwrites the seed with the register-derived value. Reset
     // register state routes CLK_SYS → clk_ref → ROSC.
     let mut emu = emu;
-    emu.bus.write32(0x4001_003C, 0x0000_0000); // CLK_SYS_CTRL SRC=0 (clk_ref)
+    emu.bus.write32(0x4001_003C, 0x0000_0000, 0); // CLK_SYS_CTRL SRC=0 (clk_ref)
     assert_eq!(emu.bus.sys_clk_hz(), ROSC_FREQ_HZ,
         "First CLOCKS write should replace the seed with the derived ROSC frequency");
 }
@@ -7878,7 +7878,7 @@ fn decode_cache_invalidation_on_sram_write() {
     assert_eq!(bus.decode_cache[cache_slot(pc)].tag, pc);
 
     // Rewrite the halfword via the bus — must invalidate.
-    bus.write16(pc, 0x1C40); // ADDS R0, R0, #1
+    bus.write16(pc, 0x1C40, 0); // ADDS R0, R0, #1
     assert_eq!(bus.decode_cache[cache_slot(pc)].tag, u32::MAX,
         "Bus::write16 to cached PC clears the slot");
 
@@ -7954,7 +7954,7 @@ fn decode_cache_wide_boundary_invalidation() {
     };
 
     // Writing a halfword at wide_pc+2 must clear the wide slot at N.
-    bus.write16(wide_pc + 2, 0xAAAA);
+    bus.write16(wide_pc + 2, 0xAAAA, 0);
     assert_eq!(bus.decode_cache[cache_slot(wide_pc)].tag, u32::MAX,
         "write at hw1 boundary clears the wide slot at N");
     assert_eq!(bus.decode_cache[cache_slot(wide_pc + 2)].tag, u32::MAX,
@@ -8016,7 +8016,7 @@ fn decode_cache_pure_path_preserves_accumulator() {
 
     // Pollute the accumulator with a direct bank-2 read.
     bus.reset_extra_wait_states();
-    let _ = bus.read16(0x2000_0008); // bank 2 — +1 wait state
+    let _ = bus.read16(0x2000_0008, 0); // bank 2 — +1 wait state
     let polluted = bus.extra_wait_states();
     assert_eq!(polluted, 1);
 
@@ -8039,7 +8039,7 @@ fn decode_cache_impure_ldr_still_works() {
     place_hw_in_sram(&mut bus, pc, 0x4800);
     // Literal pool at (pc & ~3) + 4 = pc + 4.
     let literal_addr = (pc & !3).wrapping_add(4);
-    bus.write32(literal_addr, 0xDEAD_BEEF);
+    bus.write32(literal_addr, 0xDEAD_BEEF, 0);
 
     core.regs.set_pc(pc);
     core.step(&mut bus);
@@ -8147,7 +8147,7 @@ fn gpio_external_stimulus_overlays_masked_bits() {
     let mut emu = Emulator::new(Config::default());
 
     // Bring PIO0 out of reset so its pad_out/pad_oe updates propagate.
-    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
 
     // Force PIO0 to drive bit 0 (unmasked) high. We poke pad_out / pad_oe
     // directly — we're only interested in what `update_gpio` composes.
@@ -8183,7 +8183,7 @@ fn gpio_external_mask_zero_is_noop() {
     use crate::{Emulator, Config};
 
     let mut emu = Emulator::new(Config::default());
-    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17));
+    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
 
     emu.bus.pio[0].pad_oe = 0x0000_00FF;
     emu.bus.pio[0].pad_out = 0x0000_005A;
@@ -8236,13 +8236,13 @@ fn trace_enabled_emits_write32_line() {
     let capture = new_capture();
     let mut bus = Bus::new();
     bus.set_active_core(0);
-    bus.set_active_pc(0x1000_0100);
+    bus.set_active_pc(0x1000_0100, 0);
     bus.trace_enabled = true;
     bus.set_trace_sink(Some(Box::new(capture.clone())));
 
     // SRAM word write — exercises the hot path and one of the six
     // access methods required by the spec.
-    bus.write32(0x2000_0200, 0xDEAD_BEEF);
+    bus.write32(0x2000_0200, 0xDEAD_BEEF, 0);
 
     let captured = capture.0.lock().unwrap();
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
@@ -8269,16 +8269,16 @@ fn trace_enabled_emits_all_six_access_methods() {
     let capture = new_capture();
     let mut bus = Bus::new();
     bus.set_active_core(0);
-    bus.set_active_pc(0x1000_0100);
+    bus.set_active_pc(0x1000_0100, 0);
     bus.trace_enabled = true;
     bus.set_trace_sink(Some(Box::new(capture.clone())));
 
-    bus.write8(0x2000_0100, 0xAB);
-    bus.write16(0x2000_0102, 0xCDEF);
-    bus.write32(0x2000_0104, 0x1234_5678);
-    let _ = bus.read8(0x2000_0100);
-    let _ = bus.read16(0x2000_0102);
-    let _ = bus.read32(0x2000_0104);
+    bus.write8(0x2000_0100, 0xAB, 0);
+    bus.write16(0x2000_0102, 0xCDEF, 0);
+    bus.write32(0x2000_0104, 0x1234_5678, 0);
+    let _ = bus.read8(0x2000_0100, 0);
+    let _ = bus.read16(0x2000_0102, 0);
+    let _ = bus.read32(0x2000_0104, 0);
 
     let captured = capture.0.lock().unwrap();
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
@@ -8304,12 +8304,12 @@ fn trace_disabled_emits_nothing() {
     let mut bus = Bus::new();
     bus.set_trace_sink(Some(Box::new(capture.clone())));
     // trace_enabled is false by default.
-    bus.write32(0x2000_0200, 0xCAFE_F00D);
-    let _ = bus.read32(0x2000_0200);
-    bus.write16(0x2000_0200, 0xABCD);
-    let _ = bus.read16(0x2000_0200);
-    bus.write8(0x2000_0200, 0xEF);
-    let _ = bus.read8(0x2000_0200);
+    bus.write32(0x2000_0200, 0xCAFE_F00D, 0);
+    let _ = bus.read32(0x2000_0200, 0);
+    bus.write16(0x2000_0200, 0xABCD, 0);
+    let _ = bus.read16(0x2000_0200, 0);
+    bus.write8(0x2000_0200, 0xEF, 0);
+    let _ = bus.read8(0x2000_0200, 0);
     assert!(
         capture.0.lock().unwrap().is_empty(),
         "trace sink received bytes with trace_enabled=false",
@@ -8334,20 +8334,20 @@ fn trace_active_pc_is_per_core() {
 
     // Core 0 "decodes" at 0x1000 and writes.
     bus.set_active_core(0);
-    bus.set_active_pc(0x0000_1000);
-    bus.write32(0x2000_0100, 0xAAAA_AAAA);
+    bus.set_active_pc(0x0000_1000, 0);
+    bus.write32(0x2000_0100, 0xAAAA_AAAA, 0);
 
     // Scheduler switches to core 1, which "decodes" at 0x2000 and writes.
     bus.set_active_core(1);
-    bus.set_active_pc(0x0000_2000);
-    bus.write32(0x2000_0104, 0xBBBB_BBBB);
+    bus.set_active_pc(0x0000_2000, 1);
+    bus.write32(0x2000_0104, 0xBBBB_BBBB, 1);
 
     // Scheduler switches back to core 0 WITHOUT a re-decode (mimics
     // hardware-triggered access like exception stacking before the
     // handler's first `decode_execute`). The stored per-core PC must
     // still be 0x1000 for core 0 — not 0x2000 from core 1's quantum.
     bus.set_active_core(0);
-    bus.write32(0x2000_0108, 0xCCCC_CCCC);
+    bus.write32(0x2000_0108, 0xCCCC_CCCC, 0);
 
     let captured = capture.0.lock().unwrap();
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
@@ -8452,13 +8452,13 @@ fn trace_exception_entry_publishes_sentinel_fe() {
     let vtor: u32 = 0x2000_4000;
     let core = bus.active_core();
     bus.ppb[core].vtor = vtor;
-    bus.write32(vtor + 11 * 4, 0x2000_0200 | 1); // SVC → 0x2000_0200 (Thumb)
+    bus.write32(vtor + 11 * 4, 0x2000_0200 | 1, 0); // SVC → 0x2000_0200 (Thumb)
 
     // Enable trace AFTER the pre-flight setup so we only capture the
     // stacking writes + vector fetch. `set_active_pc` seeds with a
     // plausible in-thread PC so a regression (missing sentinel) would
     // show THAT value in the stacking-line output — easier to spot.
-    bus.set_active_pc(0x0000_1000);
+    bus.set_active_pc(0x0000_1000, 0);
     bus.trace_enabled = true;
     bus.set_trace_sink(Some(Box::new(capture.clone())));
 
@@ -8513,13 +8513,13 @@ fn trace_exception_exit_publishes_sentinel_fd() {
     let vtor: u32 = 0x2000_4000;
     let core = bus.active_core();
     bus.ppb[core].vtor = vtor;
-    bus.write32(vtor + 11 * 4, 0x2000_0200 | 1);
+    bus.write32(vtor + 11 * 4, 0x2000_0200 | 1, 0);
 
     // Drive an SVC entry first (sets up the stacked frame that exit
     // will pop). Trace is off here — we only want the exit lines.
     cpu.test_enter_exception(11, &mut bus);
 
-    bus.set_active_pc(0x0000_2000); // an in-handler PC that must NOT leak.
+    bus.set_active_pc(0x0000_2000, 0); // an in-handler PC that must NOT leak.
     bus.trace_enabled = true;
     bus.set_trace_sink(Some(Box::new(capture.clone())));
 

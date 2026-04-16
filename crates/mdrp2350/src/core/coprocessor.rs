@@ -1103,11 +1103,11 @@ mod tests {
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
 
         // Read GPIO_OUT through the SIO MMIO path at 0xD000_0010.
-        let mmio_val = bus.read32(0xD000_0010);
+        let mmio_val = bus.read32(0xD000_0010, 0);
         assert_eq!(mmio_val, 1 << pin);
 
         // Conversely: write via MMIO GPIO_OUT_SET (0xD000_0018) and read via CP0.
-        bus.write32(0xD000_0018, 1 << 20);
+        bus.write32(0xD000_0018, 1 << 20, 0);
         let (crn, crm) = pin_split(20);
         let (hw0, hw1) = encode_mrc_full(0, 0, crn, 0, 0, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);

@@ -775,13 +775,13 @@ pub fn fresh_emulator(seq_bytes: &[u8]) -> Emulator {
         emu.bus.memory.sram_write8((CYCLE_SEQ_SLOT - 0x2000_0000) + i as u32, b);
     }
     for off in [MBX_GO, MBX_DONE, MBX_SEQ_PTR, MBX_ITER, MBX_CYCLES, MBX_RESERVED] {
-        emu.bus.write32(CYCLE_MAILBOX_BASE + off, 0);
+        emu.bus.write32(CYCLE_MAILBOX_BASE + off, 0, 0);
     }
 
-    let demcr = emu.bus.read32(DEMCR);
-    emu.bus.write32(DEMCR, demcr | TRCENA);
-    let ctrl = emu.bus.read32(DWT_CTRL);
-    emu.bus.write32(DWT_CTRL, ctrl | CYCCNTENA);
+    let demcr = emu.bus.read32(DEMCR, 0);
+    emu.bus.write32(DEMCR, demcr | TRCENA, 0);
+    let ctrl = emu.bus.read32(DWT_CTRL, 0);
+    emu.bus.write32(DWT_CTRL, ctrl | CYCCNTENA, 0);
 
     emu.cores[0].wake();
     emu.cores[0].regs.set_pc(STUB_START);
@@ -803,17 +803,17 @@ pub fn measure_emu(emu: &mut Emulator, seq_start: u32, k: u32) -> Result<u32, St
         seq_start & 1 == 0,
         "seq_start must be halfword-aligned before OR'ing Thumb bit"
     );
-    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_DONE, 0);
-    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_CYCLES, 0);
-    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_SEQ_PTR, seq_start | 1);
-    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_ITER, k);
-    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_GO, 1);
+    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_DONE, 0, 0);
+    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_CYCLES, 0, 0);
+    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_SEQ_PTR, seq_start | 1, 0);
+    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_ITER, k, 0);
+    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_GO, 1, 0);
 
     let budget: u64 = 1_000_000u64.max((k as u64) * 200);
     let start_cycles = emu.cycles();
     loop {
         emu.step();
-        let done = emu.bus.read32(CYCLE_MAILBOX_BASE + MBX_DONE);
+        let done = emu.bus.read32(CYCLE_MAILBOX_BASE + MBX_DONE, 0);
         if done == 1 {
             break;
         }
@@ -823,7 +823,7 @@ pub fn measure_emu(emu: &mut Emulator, seq_start: u32, k: u32) -> Result<u32, St
             ));
         }
     }
-    Ok(emu.bus.read32(CYCLE_MAILBOX_BASE + MBX_CYCLES))
+    Ok(emu.bus.read32(CYCLE_MAILBOX_BASE + MBX_CYCLES, 0))
 }
 
 // ---------------------------------------------------------------------------

@@ -39,12 +39,12 @@ fn resets_guard_read_held_timer0_returns_zero() {
     // Seed TIMER0 counter bypassing the Bus (internal tick path).
     bus.timer0.advance_us(12345);
     assert_eq!(bus.resets_state & (1 << RESET_TIMER0), 0);
-    assert_eq!(bus.read32(TIMER0_BASE + TIMERAWL_OFFSET), 12345);
+    assert_eq!(bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0), 12345);
     // Re-assert TIMER0 reset via SET alias.
-    bus.write32(0x4002_2000, 1 << RESET_TIMER0);
+    bus.write32(0x4002_2000, 1 << RESET_TIMER0, 0);
     assert_ne!(bus.resets_state & (1 << RESET_TIMER0), 0);
     assert_eq!(
-        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET),
+        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         0,
         "held TIMER0 must read 0 via RESETS guard"
     );
@@ -53,11 +53,11 @@ fn resets_guard_read_held_timer0_returns_zero() {
 #[test]
 fn resets_guard_write_held_timer0_discarded() {
     let mut bus = Bus::new();
-    bus.write32(0x4002_2000, 1 << RESET_TIMER0);
-    bus.write32(TIMER0_BASE + INTE_OFFSET, 0xF);
-    bus.write32(0x4002_3000, 1 << RESET_TIMER0);
+    bus.write32(0x4002_2000, 1 << RESET_TIMER0, 0);
+    bus.write32(TIMER0_BASE + INTE_OFFSET, 0xF, 0);
+    bus.write32(0x4002_3000, 1 << RESET_TIMER0, 0);
     assert_eq!(
-        bus.read32(TIMER0_BASE + INTE_OFFSET),
+        bus.read32(TIMER0_BASE + INTE_OFFSET, 0),
         0,
         "writes to held TIMER0 must be discarded"
     );
@@ -66,22 +66,22 @@ fn resets_guard_write_held_timer0_discarded() {
 #[test]
 fn resets_guard_write_held_timer1_discarded() {
     let mut bus = Bus::new();
-    bus.write32(0x4002_2000, 1 << RESET_TIMER1);
-    bus.write32(TIMER1_BASE + INTE_OFFSET, 0xF);
-    bus.write32(0x4002_3000, 1 << RESET_TIMER1);
-    assert_eq!(bus.read32(TIMER1_BASE + INTE_OFFSET), 0);
+    bus.write32(0x4002_2000, 1 << RESET_TIMER1, 0);
+    bus.write32(TIMER1_BASE + INTE_OFFSET, 0xF, 0);
+    bus.write32(0x4002_3000, 1 << RESET_TIMER1, 0);
+    assert_eq!(bus.read32(TIMER1_BASE + INTE_OFFSET, 0), 0);
 }
 
 #[test]
 fn resets_guard_held_timer0_does_not_tick() {
     let mut bus = Bus::new();
-    bus.write32(0x4002_2000, 1 << RESET_TIMER0);
+    bus.write32(0x4002_2000, 1 << RESET_TIMER0, 0);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.tick_peripherals(240);
-    bus.write32(0x4002_3000, 1 << RESET_TIMER0);
+    bus.write32(0x4002_3000, 1 << RESET_TIMER0, 0);
     assert_eq!(
-        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET),
+        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         0,
         "TIMER0 must not advance while held in RESETS"
     );
@@ -90,10 +90,10 @@ fn resets_guard_held_timer0_does_not_tick() {
 #[test]
 fn resets_guard_unrelated_peripheral_unaffected() {
     let mut bus = Bus::new();
-    bus.write32(0x4002_2000, 1 << RESET_TIMER0);
+    bus.write32(0x4002_2000, 1 << RESET_TIMER0, 0);
     bus.timer1.advance_us(999);
     assert_eq!(
-        bus.read32(TIMER1_BASE + TIMERAWL_OFFSET),
+        bus.read32(TIMER1_BASE + TIMERAWL_OFFSET, 0),
         999,
         "TIMER1 unaffected by TIMER0 reset"
     );
@@ -176,7 +176,7 @@ fn bus_new_equals_emulator_reset_clock_state() {
 #[test]
 fn reset_state_xosc_stable() {
     let mut bus = Bus::new();
-    let status = bus.read32(0x4004_8004);
+    let status = bus.read32(0x4004_8004, 0);
     assert_ne!(
         status & (1u32 << 31),
         0,
@@ -196,7 +196,7 @@ fn reset_state_pll_sys_cs_lock_phase1_gap() {
     // current behaviour so a future fix has a canary. R4: explicit
     // coverage of the §5.7 LOCK line.
     let mut bus = Bus::new();
-    let cs = bus.read32(0x4005_0000);
+    let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(
         cs & (1u32 << 31),
         0,
@@ -210,7 +210,7 @@ fn reset_state_pll_usb_cs_lock_phase1_gap() {
     // Same story as PLL_SYS — HLD V5 §5.7 says LOCK=1, but the PLL
     // image is hardware-reset. Phase 2 closes this.
     let mut bus = Bus::new();
-    let cs = bus.read32(0x4005_8000);
+    let cs = bus.read32(0x4005_8000, 0);
     assert_eq!(
         cs & (1u32 << 31),
         0,
@@ -224,7 +224,7 @@ fn reset_state_clk_ref_selected_mirrors_ctrl() {
     // reset CLK_REF_CTRL.SRC = 0 → SELECTED = 1<<0 = 1 (glitchless
     // mux — see bus/peripherals.rs::clocks_read).
     let mut bus = Bus::new();
-    let sel = bus.read32(0x4001_0038);
+    let sel = bus.read32(0x4001_0038, 0);
     assert_eq!(
         sel, 0x1,
         "CLK_REF_SELECTED must mirror CTRL.SRC at reset (§5.7)"
@@ -235,7 +235,7 @@ fn reset_state_clk_ref_selected_mirrors_ctrl() {
 fn reset_state_clk_sys_selected_mirrors_ctrl() {
     // CLK_SYS_CTRL.SRC = 0 → SELECTED = 1. Glitchless mux.
     let mut bus = Bus::new();
-    let sel = bus.read32(0x4001_0044);
+    let sel = bus.read32(0x4001_0044, 0);
     assert_eq!(
         sel, 0x1,
         "CLK_SYS_SELECTED must mirror CTRL.SRC at reset (§5.7)"
@@ -248,14 +248,14 @@ fn reset_state_clk_peri_selected_reads_one() {
     // bus/peripherals.rs::clocks_read). Satisfies pico-sdk's busy-wait
     // on clock_configure.
     let mut bus = Bus::new();
-    assert_eq!(bus.read32(0x4001_0050), 0x1, "CLK_PERI_SELECTED = 1");
+    assert_eq!(bus.read32(0x4001_0050, 0), 0x1, "CLK_PERI_SELECTED = 1");
 }
 
 #[test]
 fn reset_state_ticks_timer0_cycles_is_12() {
     let mut bus = Bus::new();
     let off_cycles = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE + CYCLES_OFFSET;
-    assert_eq!(bus.read32(off_cycles), CYCLES_POST_BOOTROM);
+    assert_eq!(bus.read32(off_cycles, 0), CYCLES_POST_BOOTROM);
     assert_eq!(CYCLES_POST_BOOTROM, 12);
 }
 
@@ -263,7 +263,7 @@ fn reset_state_ticks_timer0_cycles_is_12() {
 fn reset_state_ticks_timer1_cycles_is_12() {
     let mut bus = Bus::new();
     let off_cycles = TICKS_BASE + DOMAIN_TIMER1 as u32 * DOMAIN_STRIDE + CYCLES_OFFSET;
-    assert_eq!(bus.read32(off_cycles), CYCLES_POST_BOOTROM);
+    assert_eq!(bus.read32(off_cycles, 0), CYCLES_POST_BOOTROM);
 }
 
 #[test]
@@ -280,10 +280,10 @@ fn reset_state_resets_releases_timer_and_pll() {
 fn emulator_reset_restores_post_bootrom_ticks_cycles() {
     let mut emu = Emulator::new(crate::Config::default());
     let off_cycles = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE + CYCLES_OFFSET;
-    emu.bus.write32(off_cycles, 24);
-    assert_eq!(emu.bus.read32(off_cycles), 24);
+    emu.bus.write32(off_cycles, 24, 0);
+    assert_eq!(emu.bus.read32(off_cycles, 0), 24);
     emu.reset();
-    assert_eq!(emu.bus.read32(off_cycles), 12);
+    assert_eq!(emu.bus.read32(off_cycles, 0), 12);
 }
 
 // ----------------------------------------------------------------------------
@@ -294,10 +294,10 @@ fn emulator_reset_restores_post_bootrom_ticks_cycles() {
 fn tick_peripherals_advances_timer0_after_ticks_enable() {
     let mut bus = Bus::new();
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.tick_peripherals(120);
     assert_eq!(
-        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET),
+        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         10,
         "120 sys_clks / 12 = 10 µs on TIMER0"
     );
@@ -307,12 +307,12 @@ fn tick_peripherals_advances_timer0_after_ticks_enable() {
 fn tick_peripherals_timer0_halts_when_ticks_cycles_zero() {
     let mut bus = Bus::new();
     let ticks_cycles_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE + CYCLES_OFFSET;
-    bus.write32(ticks_cycles_t0, 0);
+    bus.write32(ticks_cycles_t0, 0, 0);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.tick_peripherals(1_000_000);
     assert_eq!(
-        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET),
+        bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         0,
         "CYCLES=0 freezes TIMER0"
     );
@@ -322,9 +322,9 @@ fn tick_peripherals_timer0_halts_when_ticks_cycles_zero() {
 fn tick_peripherals_alarm_match_raises_irq_via_assert_shared() {
     let mut bus = Bus::new();
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
-    bus.write32(TIMER0_BASE + INTE_OFFSET, 0x1);
-    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 5);
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
+    bus.write32(TIMER0_BASE + INTE_OFFSET, 0x1, 0);
+    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 5, 0);
     bus.tick_peripherals(60);
     let irq = crate::irq::IRQ_TIMER0_IRQ_0;
     assert_ne!(
@@ -337,17 +337,17 @@ fn tick_peripherals_alarm_match_raises_irq_via_assert_shared() {
         0,
         "core 1 sees TIMER0 IRQ 0 (shared)"
     );
-    assert_eq!(bus.read32(TIMER0_BASE + INTR_OFFSET) & 1, 1);
-    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1, 0);
+    assert_eq!(bus.read32(TIMER0_BASE + INTR_OFFSET, 0) & 1, 1);
+    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1, 0);
 }
 
 #[test]
 fn tick_peripherals_timer1_fires_on_its_own_irq_base() {
     let mut bus = Bus::new();
     let ticks_ctrl_t1 = TICKS_BASE + DOMAIN_TIMER1 as u32 * DOMAIN_STRIDE;
-    bus.write32(ticks_ctrl_t1, CTRL_ENABLE);
-    bus.write32(TIMER1_BASE + INTE_OFFSET, 0x1);
-    bus.write32(TIMER1_BASE + ALARM0_OFFSET, 3);
+    bus.write32(ticks_ctrl_t1, CTRL_ENABLE, 0);
+    bus.write32(TIMER1_BASE + INTE_OFFSET, 0x1, 0);
+    bus.write32(TIMER1_BASE + ALARM0_OFFSET, 3, 0);
     bus.tick_peripherals(36);
     let irq1 = crate::irq::IRQ_TIMER1_IRQ_0;
     assert_ne!(bus.irq_pending[0] & (1u64 << irq1), 0);
@@ -361,21 +361,21 @@ fn emulator_step_calls_tick_peripherals_each_iteration() {
     emu.cores[0].halt();
     emu.cores[1].halt();
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    emu.bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
+    emu.bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     // step_quantum default = 64 sys_clks. At CYCLES=12:
     //   step 1: acc=0,  +64 → 64, 64/12 = 5 edges rem 4 → TIMER0 = 5
     //   step 2: acc=4,  +64 → 68, 68/12 = 5 edges rem 8 → TIMER0 = 10
     //   step 3: acc=8,  +64 → 72, 72/12 = 6 edges rem 0 → TIMER0 = 16
     emu.step();
     assert_eq!(
-        emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET),
+        emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         5,
         "1 step × 64 sys_clks / 12 = 5 edges on TIMER0"
     );
     emu.step();
     emu.step();
     assert_eq!(
-        emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET),
+        emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         16,
         "3 steps × 64 sys_clks / 12 = 16 edges (carrying remainders)"
     );
@@ -394,13 +394,13 @@ fn ticks_cycles_change_preserves_timer_alarms() {
     // of the divider).
     let mut bus = Bus::new();
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
-    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 100);
-    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1, 1);
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
+    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 100, 0);
+    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1, 1);
     let ticks_cycles_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE + CYCLES_OFFSET;
-    bus.write32(ticks_cycles_t0, 24);
+    bus.write32(ticks_cycles_t0, 24, 0);
     assert_eq!(
-        bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1,
+        bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1,
         1,
         "TICKS rate change must NOT disarm TIMER0 alarms (R1)"
     );
@@ -408,7 +408,7 @@ fn ticks_cycles_change_preserves_timer_alarms() {
     // At CYCLES=24, 100 µs needs 2400 sys_clks.
     bus.tick_peripherals(3000);
     assert_eq!(
-        bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1,
+        bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1,
         0,
         "alarm must fire at the new TICKS rate without re-arm"
     );
@@ -422,11 +422,11 @@ fn ticks_ctrl_enable_set_invalidates_timer_alarms() {
     // the cached fire-µs is dropped.
     let mut bus = Bus::new();
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 50);
-    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1, 1);
-    bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
+    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 50, 0);
+    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1, 1);
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     assert_eq!(
-        bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1,
+        bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1,
         1,
         "TICKS ENABLE set must NOT disarm TIMER0 alarms (R1)"
     );
@@ -435,12 +435,12 @@ fn ticks_ctrl_enable_set_invalidates_timer_alarms() {
 #[test]
 fn ticks_proc0_domain_does_not_invalidate_timer_alarms() {
     let mut bus = Bus::new();
-    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 50);
-    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1, 1);
+    bus.write32(TIMER0_BASE + ALARM0_OFFSET, 50, 0);
+    assert_eq!(bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1, 1);
     let ticks_cycles_proc0 = TICKS_BASE + CYCLES_OFFSET;
-    bus.write32(ticks_cycles_proc0, 24);
+    bus.write32(ticks_cycles_proc0, 24, 0);
     assert_eq!(
-        bus.read32(TIMER0_BASE + ARMED_OFFSET) & 1,
+        bus.read32(TIMER0_BASE + ARMED_OFFSET, 0) & 1,
         1,
         "PROC0 TICKS write must not touch TIMER alarms"
     );
@@ -454,19 +454,19 @@ fn ticks_proc0_domain_does_not_invalidate_timer_alarms() {
 fn timer0_inte_write8_round_trips() {
     let mut bus = Bus::new();
     // Write byte 0 of INTE with 0xF.
-    bus.write8(TIMER0_BASE + INTE_OFFSET, 0xF);
-    assert_eq!(bus.read32(TIMER0_BASE + INTE_OFFSET) & 0xF, 0xF);
+    bus.write8(TIMER0_BASE + INTE_OFFSET, 0xF, 0);
+    assert_eq!(bus.read32(TIMER0_BASE + INTE_OFFSET, 0) & 0xF, 0xF);
 }
 
 #[test]
 fn timer0_inte_bitset_alias_via_bus() {
     let mut bus = Bus::new();
     // Alias 2 (SET) — offset 0x2000 relative to TIMER0_BASE.
-    bus.write32(TIMER0_BASE + 0x2000 + INTE_OFFSET, 0x5);
-    assert_eq!(bus.read32(TIMER0_BASE + INTE_OFFSET) & 0xF, 0x5);
+    bus.write32(TIMER0_BASE + 0x2000 + INTE_OFFSET, 0x5, 0);
+    assert_eq!(bus.read32(TIMER0_BASE + INTE_OFFSET, 0) & 0xF, 0x5);
     // Add more bits via SET.
-    bus.write32(TIMER0_BASE + 0x2000 + INTE_OFFSET, 0xA);
-    assert_eq!(bus.read32(TIMER0_BASE + INTE_OFFSET) & 0xF, 0xF);
+    bus.write32(TIMER0_BASE + 0x2000 + INTE_OFFSET, 0xA, 0);
+    assert_eq!(bus.read32(TIMER0_BASE + INTE_OFFSET, 0) & 0xF, 0xF);
 }
 
 #[test]
@@ -475,9 +475,9 @@ fn ticks_held_timer_write_discarded_via_bus_guard() {
     // is never blocked by the guard. This test documents that contract.
     let mut bus = Bus::new();
     // Hold TIMER0 — does NOT affect TICKS access.
-    bus.write32(0x4002_2000, 1 << RESET_TIMER0);
+    bus.write32(0x4002_2000, 1 << RESET_TIMER0, 0);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
-    bus.write32(ticks_ctrl_t0, CTRL_ENABLE);
+    bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     // TICKS accepts the write even though TIMER0 is held.
-    assert_ne!(bus.read32(ticks_ctrl_t0) & CTRL_ENABLE, 0);
+    assert_ne!(bus.read32(ticks_ctrl_t0, 0) & CTRL_ENABLE, 0);
 }

@@ -71,8 +71,8 @@ pub struct SyncReport {
 /// Returns true once `BLOCK_ADDR` (PIO1) and `BLOCK_DATA` (PIO2) both have
 /// at least one SM enabled. PIO0 is ignored (monitor block, optional).
 pub fn is_synced(bus: &mut Bus) -> bool {
-    let ctrl1 = bus.read32(PIO_BASES[1] + PIO_CTRL);
-    let ctrl2 = bus.read32(PIO_BASES[2] + PIO_CTRL);
+    let ctrl1 = bus.read32(PIO_BASES[1] + PIO_CTRL, 0);
+    let ctrl2 = bus.read32(PIO_BASES[2] + PIO_CTRL, 0);
     (ctrl1 & 0xF) != 0 && (ctrl2 & 0xF) != 0
 }
 
@@ -91,9 +91,9 @@ pub fn capture_snapshot(bus: &mut Bus, cycle: u64) -> SyncReport {
 
 fn capture_block(bus: &mut Bus, block: u8) -> PioSnapshot {
     let base = PIO_BASES[block as usize];
-    let ctrl = bus.read32(base + PIO_CTRL);
-    let dbg_padout = bus.read32(base + DBG_PADOUT);
-    let dbg_padoe = bus.read32(base + DBG_PADOE);
+    let ctrl = bus.read32(base + PIO_CTRL, 0);
+    let dbg_padout = bus.read32(base + DBG_PADOUT, 0);
+    let dbg_padoe = bus.read32(base + DBG_PADOE, 0);
 
     // INSTR_MEM is write-only via MMIO: the PIO block returns 0 for
     // reads at `0x048..=0x0C4` (see `mdpicoem_common::pio::PioBlock::read32`).
@@ -107,12 +107,12 @@ fn capture_block(bus: &mut Bus, block: u8) -> PioSnapshot {
         sms[sm as usize] = SmSnapshot {
             block,
             sm,
-            clkdiv: bus.read32(sm_base + 0x00),
-            execctrl: bus.read32(sm_base + 0x04),
-            shiftctrl: bus.read32(sm_base + 0x08),
-            addr: bus.read32(sm_base + 0x0C),
-            last_insn: bus.read32(sm_base + 0x10),
-            pinctrl: bus.read32(sm_base + 0x14),
+            clkdiv: bus.read32(sm_base + 0x00, 0),
+            execctrl: bus.read32(sm_base + 0x04, 0),
+            shiftctrl: bus.read32(sm_base + 0x08, 0),
+            addr: bus.read32(sm_base + 0x0C, 0),
+            last_insn: bus.read32(sm_base + 0x10, 0),
+            pinctrl: bus.read32(sm_base + 0x14, 0),
         };
     }
 
@@ -141,7 +141,7 @@ mod tests {
     fn release_pio_reset(bus: &mut Bus) {
         // RESETS register at 0x4002_0000 is the reset *hold* mask; write
         // alias=3 (CLR) to clear PIO bits.
-        bus.write32(RESETS_RESET_OFFSET | (3 << 12), PIO_RESET_MASK);
+        bus.write32(RESETS_RESET_OFFSET | (3 << 12), PIO_RESET_MASK, 0);
     }
 
     #[test]
@@ -156,11 +156,11 @@ mod tests {
         release_pio_reset(&mut emu.bus);
 
         // Only PIO1 enabled → not synced yet.
-        emu.bus.write32(PIO_BASES[1] + PIO_CTRL, 0b0001);
+        emu.bus.write32(PIO_BASES[1] + PIO_CTRL, 0b0001, 0);
         assert!(!is_synced(&mut emu.bus));
 
         // Now PIO2 too — synced.
-        emu.bus.write32(PIO_BASES[2] + PIO_CTRL, 0b0011);
+        emu.bus.write32(PIO_BASES[2] + PIO_CTRL, 0b0011, 0);
         assert!(is_synced(&mut emu.bus));
     }
 
@@ -173,17 +173,17 @@ mod tests {
         release_pio_reset(&mut emu.bus);
 
         // Program a single instruction: JMP 0 (opcode 0x0000) in slot 0.
-        emu.bus.write32(PIO_BASES[1] + 0x048, 0x0000);
+        emu.bus.write32(PIO_BASES[1] + 0x048, 0x0000, 0);
 
         // SM0 configuration.
         let sm_base = PIO_BASES[1] + SM_BASE;
         let clkdiv_val = (1302u32 << 16) | (128u32 << 8); // int=1302, frac=128
-        emu.bus.write32(sm_base + 0x00, clkdiv_val);
+        emu.bus.write32(sm_base + 0x00, clkdiv_val, 0);
         let pinctrl_val = (5u32 << 26) | (3u32 << 20); // SET_COUNT=5, OUT_COUNT=3
-        emu.bus.write32(sm_base + 0x14, pinctrl_val);
+        emu.bus.write32(sm_base + 0x14, pinctrl_val, 0);
 
         // Enable SM0.
-        emu.bus.write32(PIO_BASES[1] + PIO_CTRL, 0b0001);
+        emu.bus.write32(PIO_BASES[1] + PIO_CTRL, 0b0001, 0);
 
         let report = capture_snapshot(&mut emu.bus, 12345);
         assert_eq!(report.cycle, 12345);

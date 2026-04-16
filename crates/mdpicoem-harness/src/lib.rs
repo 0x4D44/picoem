@@ -4917,10 +4917,10 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     // Execute
     if tc.needs_bus {
         for i in 0..SCRATCH_SIZE {
-            shared_bus.write8(EMU_TEST_SCRATCH + i, 0);
+            shared_bus.write8(EMU_TEST_SCRATCH + i, 0, 0);
         }
         for &(offset, val) in &tc.mem_pre {
-            shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
+            shared_bus.write8(EMU_TEST_SCRATCH + offset, val, 0);
         }
     }
     // Reset bus wait-state accumulator before execution (mirrors decode_execute).
@@ -4949,7 +4949,7 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     let mem: Vec<u8> = tc
         .mem_check
         .iter()
-        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
+        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset, 0))
         .collect();
 
     RunState { regs, xpsr, mem, cycles, fpu: Vec::new(), fpscr: 0 }
@@ -4987,28 +4987,28 @@ pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     // Memory setup (if needed)
     if tc.needs_bus {
         for i in 0..SCRATCH_SIZE {
-            shared_bus.write8(EMU_TEST_SCRATCH + i, 0);
+            shared_bus.write8(EMU_TEST_SCRATCH + i, 0, 0);
         }
         for &(offset, val) in &tc.mem_pre {
-            shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
+            shared_bus.write8(EMU_TEST_SCRATCH + offset, val, 0);
         }
     }
 
     // Write the first instruction (e.g., IT) at the test slot.
-    shared_bus.write16(EMU_TEST_SLOT, tc.opcode);
+    shared_bus.write16(EMU_TEST_SLOT, tc.opcode, 0);
     // If the first instruction is Thumb-32, its second halfword goes next.
     let body_offset: u32 = match tc.hw1 {
         Some(hw1) => {
-            shared_bus.write16(EMU_TEST_SLOT + 2, hw1);
+            shared_bus.write16(EMU_TEST_SLOT + 2, hw1, 0);
             4
         }
         None => 2,
     };
     // Write the body instruction (the instruction under test inside IT).
     let op2 = tc.opcode2.expect("run_one_emu_multistep requires tc.opcode2");
-    shared_bus.write16(EMU_TEST_SLOT + body_offset, op2);
+    shared_bus.write16(EMU_TEST_SLOT + body_offset, op2, 0);
     if let Some(hw1_2) = tc.hw1_2 {
-        shared_bus.write16(EMU_TEST_SLOT + body_offset + 2, hw1_2);
+        shared_bus.write16(EMU_TEST_SLOT + body_offset + 2, hw1_2, 0);
     }
 
     // Reset bus wait-state accumulator (mirrors decode_execute path).
@@ -5030,7 +5030,7 @@ pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     let mem: Vec<u8> = tc
         .mem_check
         .iter()
-        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
+        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset, 0))
         .collect();
 
     // Cycle counting is intentionally skipped for multi-step tests.
@@ -5312,22 +5312,22 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     // Memory setup — clear regular scratch and FPU scratch
     if tc.needs_bus {
         for i in 0..SCRATCH_SIZE {
-            shared_bus.write8(EMU_TEST_SCRATCH + i, 0);
+            shared_bus.write8(EMU_TEST_SCRATCH + i, 0, 0);
         }
         for &(offset, val) in &tc.mem_pre {
-            shared_bus.write8(EMU_TEST_SCRATCH + offset, val);
+            shared_bus.write8(EMU_TEST_SCRATCH + offset, val, 0);
         }
     }
     // Clear FPU scratch (S0-S31 data + FPSCR slot = 132 bytes)
     for i in 0..136u32 {
-        shared_bus.write8(EMU_FPU_SCRATCH + i, 0);
+        shared_bus.write8(EMU_FPU_SCRATCH + i, 0, 0);
     }
     // Write fpu_pre bit patterns to FPU scratch memory
     for &(sn, bits) in &tc.fpu_pre {
         let base = EMU_FPU_SCRATCH + (sn as u32) * 4;
         let bytes = bits.to_le_bytes();
         for (j, &b) in bytes.iter().enumerate() {
-            shared_bus.write8(base + j as u32, b);
+            shared_bus.write8(base + j as u32, b, 0);
         }
     }
 
@@ -5335,7 +5335,7 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     let (halfwords, n_insn) = build_fpu_test_sequence(tc);
     let mut addr = EMU_TEST_SLOT;
     for &hw in &halfwords {
-        shared_bus.write16(addr, hw);
+        shared_bus.write16(addr, hw, 0);
         addr += 2;
     }
 
@@ -5356,7 +5356,7 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     let mem: Vec<u8> = tc
         .mem_check
         .iter()
-        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset))
+        .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset, 0))
         .collect();
 
     // Read FPU results from FPU scratch memory
@@ -5367,7 +5367,7 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
             let base = EMU_FPU_SCRATCH + (sn as u32) * 4;
             let mut bytes = [0u8; 4];
             for i in 0..4 {
-                bytes[i] = shared_bus.read8(base + i as u32);
+                bytes[i] = shared_bus.read8(base + i as u32, 0);
             }
             u32::from_le_bytes(bytes)
         })
@@ -5377,7 +5377,7 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     let fpscr = if tc.fpscr_mask != 0 {
         let mut bytes = [0u8; 4];
         for i in 0..4 {
-            bytes[i] = shared_bus.read8(EMU_FPU_SCRATCH + 128 + i as u32);
+            bytes[i] = shared_bus.read8(EMU_FPU_SCRATCH + 128 + i as u32, 0);
         }
         u32::from_le_bytes(bytes)
     } else {
@@ -5409,7 +5409,7 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
 
     // Enable FPU in CPACR (CP10/11 full access). The emulator defaults this,
     // but be explicit so this test validates the mechanism for future use.
-    shared_bus.write32(0xE000_ED88, 0x00F0_0000);
+    shared_bus.write32(0xE000_ED88, 0x00F0_0000, 0);
 
     // Write float preconditions to scratch memory:
     //   scratch+0: 1.5f32
@@ -5418,13 +5418,13 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
     let val_1_5 = 1.5f32.to_bits().to_le_bytes();
     let val_2_5 = 2.5f32.to_bits().to_le_bytes();
     for (i, &b) in val_1_5.iter().enumerate() {
-        shared_bus.write8(scratch + i as u32, b);
+        shared_bus.write8(scratch + i as u32, b, 0);
     }
     for (i, &b) in val_2_5.iter().enumerate() {
-        shared_bus.write8(scratch + 4 + i as u32, b);
+        shared_bus.write8(scratch + 4 + i as u32, b, 0);
     }
     for i in 0..4u32 {
-        shared_bus.write8(scratch + 8 + i, 0);
+        shared_bus.write8(scratch + 8 + i, 0, 0);
     }
 
     // Write the 4-instruction sequence to the bus at EMU_TEST_SLOT.
@@ -5433,26 +5433,26 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
 
     // Instruction 1: VLDR S0, [R12, #0]
     let (hw0, hw1) = enc_vldr(0, 12, 0);
-    shared_bus.write16(addr, hw0);
-    shared_bus.write16(addr + 2, hw1);
+    shared_bus.write16(addr, hw0, 0);
+    shared_bus.write16(addr + 2, hw1, 0);
     addr += 4;
 
     // Instruction 2: VLDR S1, [R12, #4]
     let (hw0, hw1) = enc_vldr(1, 12, 4);
-    shared_bus.write16(addr, hw0);
-    shared_bus.write16(addr + 2, hw1);
+    shared_bus.write16(addr, hw0, 0);
+    shared_bus.write16(addr + 2, hw1, 0);
     addr += 4;
 
     // Instruction 3: VADD.F32 S2, S0, S1
     let (hw0, hw1) = enc_vadd(2, 0, 1);
-    shared_bus.write16(addr, hw0);
-    shared_bus.write16(addr + 2, hw1);
+    shared_bus.write16(addr, hw0, 0);
+    shared_bus.write16(addr + 2, hw1, 0);
     addr += 4;
 
     // Instruction 4: VSTR S2, [R12, #8]
     let (hw0, hw1) = enc_vstr(2, 12, 8);
-    shared_bus.write16(addr, hw0);
-    shared_bus.write16(addr + 2, hw1);
+    shared_bus.write16(addr, hw0, 0);
+    shared_bus.write16(addr + 2, hw1, 0);
 
     // Reset bus wait-state accumulator.
     shared_bus.reset_extra_wait_states();
@@ -5476,7 +5476,7 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
     // Read scratch+8..+12 from the bus, interpret as f32.
     let mut result_bytes = [0u8; 4];
     for i in 0..4 {
-        result_bytes[i] = shared_bus.read8(scratch + 8 + i as u32);
+        result_bytes[i] = shared_bus.read8(scratch + 8 + i as u32, 0);
     }
     let result_bits = u32::from_le_bytes(result_bytes);
     let expected_bits = 4.0f32.to_bits();
