@@ -110,6 +110,16 @@ pub struct Psram {
     /// strictly required by the firmware but handy for debugging.
     bytes_written: u64,
     bytes_read: u64,
+
+    /// Number of times [`Psram::tick`] has been invoked. Useful for
+    /// chain-of-life diagnostics in the harness when PSRAM appears
+    /// unused — if `tick_count == 0` the bus integration never wired
+    /// the tick into `update_gpio`; if non-zero but `cs_falling_count`
+    /// is 0, the master never asserted CS#.
+    pub tick_count: u64,
+    /// Number of CS# falling edges observed (start of an SPI frame).
+    /// A non-zero value means the master attempted at least one frame.
+    pub cs_falling_count: u64,
 }
 
 impl Psram {
@@ -144,6 +154,8 @@ impl Psram {
             driving_miso: false,
             bytes_written: 0,
             bytes_read: 0,
+            tick_count: 0,
+            cs_falling_count: 0,
         }
     }
 
@@ -156,6 +168,21 @@ impl Psram {
     /// GPIO pin number for MISO.
     pub fn pin_miso(&self) -> u8 {
         self.pin_miso
+    }
+
+    /// GPIO pin number for CS#.
+    pub fn pin_cs(&self) -> u8 {
+        self.pin_cs
+    }
+
+    /// GPIO pin number for SCK.
+    pub fn pin_sck(&self) -> u8 {
+        self.pin_sck
+    }
+
+    /// GPIO pin number for MOSI.
+    pub fn pin_mosi(&self) -> u8 {
+        self.pin_mosi
     }
 
     /// Reset the protocol state machine (buffer preserved). Mirrors the
@@ -183,6 +210,8 @@ impl Psram {
     /// The caller is responsible for splicing the returned bit into
     /// `gpio_in` bit `pin_miso`.
     pub fn tick(&mut self, pins: u32) -> Option<bool> {
+        self.tick_count = self.tick_count.wrapping_add(1);
+
         let cs = ((pins >> self.pin_cs) & 1) != 0;
         let sck = ((pins >> self.pin_sck) & 1) != 0;
         let mosi = ((pins >> self.pin_mosi) & 1) != 0;
@@ -197,6 +226,7 @@ impl Psram {
             self.end_frame();
         }
         if cs_fell {
+            self.cs_falling_count = self.cs_falling_count.wrapping_add(1);
             self.begin_frame();
         }
 

@@ -65,9 +65,10 @@
 //
 //   1. Drive address bits A0..A9 on GPIO6..GPIO15, IOW# high (idle).
 //      (ADS reflects address phase; the PIO program drives it, not us.)
-//   2. Assert IOW# low (GPIO4 = 0). Hold `WRITE_ASSERT_CYCLES` cycles.
-//   3. Switch the AD0_PIN bus to data bits D0..D7 (or D0..D15 mirrored
-//      for write16). Hold another `WRITE_ASSERT_CYCLES`.
+//   2. Assert IOW# low (GPIO4 = 0). Hold `WRITE_ADDR_HOLD` cycles
+//      (address phase — PIO reads 10 address bits).
+//   3. Switch the AD0_PIN bus to data bits D0..D7. Hold
+//      `WRITE_DATA_HOLD` cycles (data phase — PIO reads 8 data bits).
 //   4. Deassert IOW# high. Idle for `WRITE_IDLE_CYCLES`.
 //
 // At sys_clk = 125 MHz, 37 cycles ≈ 300 ns (an ISA I/O write half-
@@ -106,8 +107,16 @@ const ADDR_BITS: u32 = 10;
 /// Data width for an 8-bit write.
 const DATA_BITS: u32 = 8;
 
-/// Cycles to hold a write phase asserted. 37 cycles ≈ 300 ns at 125 MHz.
-const WRITE_ASSERT_CYCLES: u32 = 37;
+/// Cycles to hold address on the bus after IOW falls. Must be long
+/// enough for the PIO to execute `jmp pin` + `in pins, 10 [3]`
+/// (= 5 PIO cycles ≈ 10 sysclks at clkdiv=2). 12 gives margin.
+const WRITE_ADDR_HOLD: u32 = 12;
+
+/// Cycles to hold data on the bus after the address→data switch.
+/// The PIO reads data via `in pins, 8` after 4 more PIO cycles of
+/// `nop [3]` delay (~8 sysclks). 25 cycles gives margin for the PIO
+/// to complete the read + autopush + OUT X + JMP.
+const WRITE_DATA_HOLD: u32 = 25;
 
 /// Cycles of idle between back-to-back writes.
 const WRITE_IDLE_CYCLES: u32 = 12;
@@ -440,18 +449,21 @@ pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: b
     sink.drive_pins(false, false, addr_bits);
     sink.step(WRITE_IDLE_CYCLES);
 
-    // Phase 1: assert IOW low with address still on the bus — PIO
-    // latches the address on the IOW falling edge.
+    // Phase 1: assert IOW low with address on the bus. The PIO fires
+    // on the IOW falling edge, reads 10 address bits via `in pins, 10`,
+    // then flips ADS high via sideset. On real hardware ADS triggers
+    // a 74HC mux that switches the AD bus from address to data. We
+    // model this by switching the bus to data after WRITE_ADDR_HOLD
+    // cycles — enough time for the PIO to have captured the address.
     sink.drive_pins(true, false, addr_bits);
-    sink.step(WRITE_ASSERT_CYCLES);
+    sink.step(WRITE_ADDR_HOLD);
 
-    // Phase 2: data onto the bus, IOW still asserted. For write16 we
-    // also drive the high byte on the low pins — the PIO program only
-    // samples 8 bits per cycle (18-bit autopush = 10 addr + 8 data);
-    // 16-bit writes split into two 8-bit cycles back-to-back below.
+    // Phase 2: data onto the bus, IOW still asserted. The PIO's
+    // `in pins, 8` reads data from the same GPIO pins after a NOP
+    // delay. This must happen before the PIO executes its data read.
     let data_lo = data & ((1u16 << DATA_BITS) - 1);
     sink.drive_pins(true, false, data_lo);
-    sink.step(WRITE_ASSERT_CYCLES);
+    sink.step(WRITE_DATA_HOLD);
 
     // Phase 3: deassert IOW, release the bus. Idle.
     sink.drive_pins(false, false, 0);
@@ -465,9 +477,9 @@ pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: b
         sink.drive_pins(false, false, addr2);
         sink.step(WRITE_IDLE_CYCLES);
         sink.drive_pins(true, false, addr2);
-        sink.step(WRITE_ASSERT_CYCLES);
+        sink.step(WRITE_ADDR_HOLD);
         sink.drive_pins(true, false, data_hi);
-        sink.step(WRITE_ASSERT_CYCLES);
+        sink.step(WRITE_DATA_HOLD);
         sink.drive_pins(false, false, 0);
         sink.step(WRITE_IDLE_CYCLES);
     }
@@ -905,8 +917,120 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let nz = psram.buffer.iter().filter(|&&b| b != 0).count();
         println!();
         println!("--- PSRAM diagnostics ---");
-        println!("Non-zero bytes:   {} / {}", nz, psram.buffer.len());
+        println!("Non-zero bytes:    {} / {}", nz, psram.buffer.len());
+        println!(
+            "Pin assignment:    MISO=GPIO{}  CS=GPIO{}  SCK=GPIO{}  MOSI=GPIO{}",
+            psram.pin_miso(),
+            psram.pin_cs(),
+            psram.pin_sck(),
+            psram.pin_mosi(),
+        );
+        println!("tick() calls:      {}", psram.tick_count);
+        println!("CS# falling edges: {}  (== SPI frames started)", psram.cs_falling_count);
     }
+
+    // ------------------------------------------------------------------
+    // PIO1 sweep — the PicoGUS PSRAM SPI lives on PIO1 SM0 (single-SPI
+    // bit-banger driving GPIO0..3). Mirrors the PIO0 dump above so the
+    // two are directly comparable. PIO1_BASE = 0x5030_0000.
+    // ------------------------------------------------------------------
+    println!();
+    println!("--- Diag: PIO1 state ---");
+    let p1_ctrl = emu.bus.read32(0x5030_0000);
+    println!(
+        "PIO1 CTRL:         0x{:08x}  SM enabled mask=0x{:x}",
+        p1_ctrl,
+        p1_ctrl & 0xF,
+    );
+    let p1_fstat = emu.bus.read32(0x5030_0000 + 0x004);
+    println!("PIO1 FSTAT:        0x{:08x}", p1_fstat);
+    for sm in 0..4u32 {
+        let rxfull = (p1_fstat >> sm) & 1;
+        let rxempty = (p1_fstat >> (8 + sm)) & 1;
+        let txfull = (p1_fstat >> (16 + sm)) & 1;
+        let txempty = (p1_fstat >> (24 + sm)) & 1;
+        println!(
+            "PIO1 FSTAT SM{}:    RX full={} empty={}   TX full={} empty={}",
+            sm, rxfull, rxempty, txfull, txempty
+        );
+    }
+    println!();
+    println!("--- Diag: PIO1 per-SM sweep ---");
+    for sm in 0..4u32 {
+        let base = 0x5030_0000 + 0x0C8 + sm * 0x18;
+        let cd = emu.bus.read32(base);
+        let cd_int = (cd >> 16) & 0xFFFF;
+        let cd_frac = (cd >> 8) & 0xFF;
+        let cd_eff = if cd_int == 0 { 65536 } else { cd_int };
+        let ec = emu.bus.read32(base + 0x04);
+        let pc = emu.bus.read32(base + 0x0C) & 0x1F;
+        let pin = emu.bus.read32(base + 0x14);
+        let sideset_count = (pin >> 29) & 0x7;
+        let set_count = (pin >> 26) & 0x7;
+        let out_count = (pin >> 20) & 0x3F;
+        let in_base = (pin >> 15) & 0x1F;
+        let sideset_base = (pin >> 10) & 0x1F;
+        let set_base = (pin >> 5) & 0x1F;
+        let out_base = pin & 0x1F;
+        println!(
+            "PIO1 SM{} PC: 0x{:02x}  CLKDIV: 0x{:08x} ({}.{:03} eff={})  EXECCTRL: 0x{:08x}",
+            sm, pc, cd, cd_int, cd_frac, cd_eff, ec
+        );
+        println!(
+            "         PINCTRL: 0x{:08x}  SIDESET cnt={} base={}  SET cnt={} base={}  OUT cnt={} base={}  IN base={}",
+            pin, sideset_count, sideset_base, set_count, set_base, out_count, out_base, in_base
+        );
+        let sc = emu.bus.read32(base + 0x08);
+        let autopush = (sc >> 16) & 1;
+        let autopull = (sc >> 17) & 1;
+        let in_shiftdir = (sc >> 18) & 1;
+        let out_shiftdir = (sc >> 19) & 1;
+        let push_thresh_raw = (sc >> 20) & 0x1F;
+        let pull_thresh_raw = (sc >> 25) & 0x1F;
+        let push_thresh = if push_thresh_raw == 0 { 32 } else { push_thresh_raw };
+        let pull_thresh = if pull_thresh_raw == 0 { 32 } else { pull_thresh_raw };
+        println!(
+            "         SHIFTCTRL: 0x{:08x}  AUTOPUSH={} PUSH_THRESH={}  AUTOPULL={} PULL_THRESH={}  IN_SHIFTDIR={} OUT_SHIFTDIR={}",
+            sc, autopush, push_thresh, autopull, pull_thresh, in_shiftdir, out_shiftdir
+        );
+        let pushes = emu.bus.pio[1].sm[sm as usize].autopush_count;
+        println!("         autopush_count: {}", pushes);
+    }
+
+    // PIO1 pad state — which GPIOs PIO1 is actually driving.
+    let p1_pad_oe = emu.bus.pio[1].pad_oe;
+    let p1_pad_out = emu.bus.pio[1].pad_out;
+    println!();
+    println!("--- Diag: PIO1 pad state ---");
+    println!(
+        "PIO1 pad_oe:       0x{:08x}  bit0(MISO)={} bit1(CS)={} bit2(SCK)={} bit3(MOSI)={}",
+        p1_pad_oe,
+        (p1_pad_oe >> 0) & 1,
+        (p1_pad_oe >> 1) & 1,
+        (p1_pad_oe >> 2) & 1,
+        (p1_pad_oe >> 3) & 1,
+    );
+    println!(
+        "PIO1 pad_out:      0x{:08x}  bit0(MISO)={} bit1(CS)={} bit2(SCK)={} bit3(MOSI)={}",
+        p1_pad_out,
+        (p1_pad_out >> 0) & 1,
+        (p1_pad_out >> 1) & 1,
+        (p1_pad_out >> 2) & 1,
+        (p1_pad_out >> 3) & 1,
+    );
+
+    // Final GPIO 0..3 state — what the PSRAM model actually sees.
+    let gpio_lo = emu.bus.gpio_in & 0xF;
+    println!();
+    println!("--- Diag: GPIO 0..3 (PSRAM bus) ---");
+    println!(
+        "gpio_in[3:0]:      0x{:x}  (MISO={} CS={} SCK={} MOSI={})",
+        gpio_lo,
+        gpio_lo & 1,
+        (gpio_lo >> 1) & 1,
+        (gpio_lo >> 2) & 1,
+        (gpio_lo >> 3) & 1,
+    );
     println!();
     println!("--- Diag: PIO + NVIC state ---");
     println!("Core 0 PC:        0x{:08x}", emu.cores[0].regs.pc());
