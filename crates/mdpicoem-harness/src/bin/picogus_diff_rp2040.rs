@@ -859,6 +859,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Patch SRAM after runtime_init so .data copy is in place.
+    // test_psram takes ~1 hour to complete; stub it to return 0.
+    {
+        let old_q = emu.step_quantum;
+        emu.step_quantum = 64;
+        for _ in 0..200_000u64 {
+            if emu.step() == 0 { break; }
+        }
+        emu.bus.write32(0x2001_2FA4, 0x4770_2000); // MOVS R0,#0; BX LR
+        emu.step_quantum = old_q;
+        eprintln!("patched SRAM 0x20012FA4: test_psram -> return 0");
+    }
+
     let duration_ns = args
         .duration_secs
         .map(|s| (s * 1e9).max(0.0) as u64);

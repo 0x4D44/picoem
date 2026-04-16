@@ -52,6 +52,17 @@ fn main() {
     emu.bus.external_gpio_in_mask = ISA_EXTERNAL_PIN_MASK;
     emu.bus.external_gpio_in_override = (1u32 << ISA_IOW) | (1u32 << ISA_IOR);
 
+    // Run past runtime_init so .data copy completes, then patch SRAM.
+    // test_psram at SRAM 0x20012FA4 takes ~1 hour to complete; stub it
+    // to return 0 (success) immediately so we can debug downstream init.
+    emu.step_quantum = 64;
+    for _ in 0..200_000u64 {
+        if emu.step() == 0 { break; }
+    }
+    // Patch: MOVS R0, #0 (0x2000) + BX LR (0x4770) at test_psram entry
+    emu.bus.write32(0x2001_2FA4, 0x4770_2000);
+    eprintln!("patched SRAM 0x20012FA4: test_psram -> return 0");
+
     eprintln!(
         "reset: core0 pc={:#010x} sp={:#010x} lr={:#010x} (ISA idle primed)",
         emu.cores[0].regs.pc(),
