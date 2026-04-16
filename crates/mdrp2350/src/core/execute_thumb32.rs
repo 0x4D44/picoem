@@ -1,6 +1,8 @@
 // Helpers used by stubs once instructions are implemented in later stages.
 #![allow(dead_code)]
 
+use std::sync::atomic::Ordering;
+
 use crate::bus::Bus;
 use super::CortexM33;
 use super::execute::{sign_extend, add_with_carry};
@@ -927,7 +929,16 @@ impl CortexM33 {
                 // FPU × sleep (HLD §B.7): WFI/WFE retain S0-S31 + FPSCR
                 // and do NOT clear FPCCR.LSPACT. Resume continues with
                 // pre-sleep FP state intact.
-                0x03 => 1,                              // WFI.W
+                0x03 => {
+                    // WFI.W: sleep unless there's an enabled pending IRQ
+                    let pending = bus.irq_pending[self.core_id as usize];
+                    if self.ppb.any_pending_enabled(pending) {
+                        1
+                    } else {
+                        self.halted.store(true, Ordering::Release);
+                        1
+                    }
+                }
                 0x04 => { bus.signal_sev(); 1 },         // SEV.W
                 _ => self.thumb32_undefined(hw0, hw1, bus),
             };

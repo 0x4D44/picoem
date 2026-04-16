@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 pub mod core;
 pub mod bus;
 pub mod dma;
@@ -104,7 +106,8 @@ impl Emulator {
         self.bus.timer1.reset();
         self.bus.irq_pending = [0; 2];
         self.bus.irq_pending_dirty = [false; 2];
-        self.bus.event_flag = [false; 2];
+        self.bus.event_flag[0].store(false, Ordering::Relaxed);
+        self.bus.event_flag[1].store(false, Ordering::Relaxed);
         self.bus.rcp_salt = [0; 2];
         self.bus.rcp_salt_valid = [false; 2];
         self.bus.rcp_count = 0;
@@ -288,13 +291,26 @@ impl Emulator {
         }
     }
 
-    /// WFE/SEV wake check. If a core is WFE-waiting and its event_flag
-    /// is set, consume the event and wake the core.
-    fn wake_checks(&mut self) {
+    /// WFE/SEV and WFI wake checks.
+    /// - WFE: if event_flag is set, consume it and wake the core.
+    /// - WFI: if an enabled pending IRQ exists, wake the core.
+    pub(crate) fn wake_checks(&mut self) {
         for i in 0..2 {
-            if self.cores[i].wfe_waiting && self.bus.event_flag[i] {
-                self.bus.event_flag[i] = false;
-                self.cores[i].wfe_waiting = false;
+            // WFE wake: event flag clears WFE sleep
+            if self.cores[i].wfe_waiting.load(Ordering::Acquire)
+                && self.bus.event_flag[i].load(Ordering::Acquire)
+            {
+                self.bus.event_flag[i].store(false, Ordering::Release);
+                self.cores[i].wfe_waiting.store(false, Ordering::Release);
+            }
+            // WFI wake: enabled pending IRQ clears WFI sleep
+            if self.cores[i].halted.load(Ordering::Acquire) {
+                let pending = self.bus.irq_pending[i];
+                if pending != 0
+                    && self.cores[i].ppb.any_pending_enabled(pending)
+                {
+                    self.cores[i].halted.store(false, Ordering::Release);
+                }
             }
         }
     }
@@ -392,7 +408,7 @@ impl Emulator {
             let low = addr & 0xFFFF;
             if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
                 let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-                let ispr = self.cores[0].ppb.nvic_ispr[word];
+                let ispr = self.cores[0].ppb.nvic_ispr[word].load(Ordering::Relaxed);
                 let mask64 = (ispr as u64) << (word * 32);
                 let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
                 self.bus.irq_pending[0] = (self.bus.irq_pending[0] & keep) | mask64;

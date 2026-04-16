@@ -6,6 +6,8 @@ mod execute_fpu;
 pub(crate) mod exceptions;
 pub(crate) mod coprocessor;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::bus::Bus;
 use crate::bus::ppb::Ppb;
 pub use registers::Registers;
@@ -61,9 +63,11 @@ pub struct CortexM33 {
     /// ARM security state. `true` = Secure, `false` = Non-Secure.
     pub(crate) secure: bool,
     /// Core is halted — will not execute until explicitly woken.
-    halted: bool,
+    /// `AtomicBool` for threading readiness (Phase 0b.3).
+    pub(crate) halted: AtomicBool,
     /// Core is sleeping on WFE — will resume when event_flag is set.
-    pub(crate) wfe_waiting: bool,
+    /// `AtomicBool` for threading readiness (Phase 0b.3).
+    pub(crate) wfe_waiting: AtomicBool,
     /// Per-core Private Peripheral Bus (NVIC, SCB, SysTick, FPCCR, MPU,
     /// SAU, DWT — all per-core M33 architectural state). Moved from
     /// `Bus.ppb: [Ppb; 2]` in Phase 0b.1 Commit B. See
@@ -108,8 +112,8 @@ impl CortexM33 {
             dcp_halves: [0; 16],
             dcp_status: 0,
             secure: true,
-            halted: false,
-            wfe_waiting: false,
+            halted: AtomicBool::new(false),
+            wfe_waiting: AtomicBool::new(false),
             ppb: Ppb::default(),
             exclusive_address: None,
             did_write_this_quantum: false,
@@ -120,10 +124,10 @@ impl CortexM33 {
     /// count by the instruction's cycle cost (including any exception-entry
     /// cost if a synchronous fault is taken).
     pub fn step(&mut self, bus: &mut Bus) {
-        if self.wfe_waiting {
+        if self.wfe_waiting.load(Ordering::Relaxed) {
             return;
         }
-        if self.halted {
+        if self.halted.load(Ordering::Relaxed) {
             return;
         }
 
@@ -185,6 +189,14 @@ impl CortexM33 {
         self.cycles = self.cycles.wrapping_add(cycles as u64);
     }
 
+    /// Debug step: clears halted/wfe_waiting before stepping.
+    /// Used by QEMU diff harness so WFI doesn't stall the oracle.
+    pub fn debug_step(&mut self, bus: &mut Bus) {
+        self.halted.store(false, Ordering::Relaxed);
+        self.wfe_waiting.store(false, Ordering::Relaxed);
+        self.step(bus);
+    }
+
     /// Returns the core ID (0 or 1).
     pub fn id(&self) -> u8 {
         self.core_id
@@ -229,35 +241,35 @@ impl CortexM33 {
     /// Halt the core indefinitely — will not execute until explicitly woken.
     /// Used to hold Core 1 during reset.
     pub fn halt(&mut self) {
-        self.halted = true;
+        self.halted.store(true, Ordering::Relaxed);
         self.pending_fault = None;
     }
 
     /// Resume a halted core. The caller must set PC, SP, and xpsr before
     /// calling this — wake() only clears the halted flag.
     pub fn wake(&mut self) {
-        self.halted = false;
+        self.halted.store(false, Ordering::Relaxed);
     }
 
     /// Returns `true` if the core is halted.
     pub fn is_halted(&self) -> bool {
-        self.halted
+        self.halted.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if the core is sleeping on WFE.
     pub fn is_wfe_waiting(&self) -> bool {
-        self.wfe_waiting
+        self.wfe_waiting.load(Ordering::Relaxed)
     }
 
     /// Execute WFE hint. If event_flag is pending, consume it and continue.
     /// Otherwise, enter WFE sleep.
     pub(crate) fn wfe(&mut self, bus: &mut Bus) -> u32 {
         let core = self.core_id as usize;
-        if bus.event_flag[core] {
-            bus.event_flag[core] = false;
+        if bus.event_flag[core].load(Ordering::Acquire) {
+            bus.event_flag[core].store(false, Ordering::Release);
             1 // event was pending, consume it, no sleep
         } else {
-            self.wfe_waiting = true;
+            self.wfe_waiting.store(true, Ordering::Release);
             1
         }
     }
@@ -384,7 +396,7 @@ impl CortexM33 {
         let low = addr & 0xFFFF;
         if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
             let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-            let ispr = self.ppb.nvic_ispr[word];
+            let ispr = self.ppb.nvic_ispr[word].load(Ordering::Relaxed);
             let mask64 = (ispr as u64) << (word * 32);
             let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
             let core = self.core_id as usize;

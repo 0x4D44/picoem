@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crate::bus::Bus;
 use super::CortexM33;
 
@@ -722,7 +724,7 @@ impl CortexM33 {
                 // Matches probe-rs semantics on real silicon (debugger
                 // attached) and the end-of-scenario sentinel that the
                 // silicon ISR / cycle oracles poll via `is_halted()`.
-                self.halted = true;
+                self.halted.store(true, Ordering::Relaxed);
                 1
             }
             0b1111 => {
@@ -739,7 +741,16 @@ impl CortexM33 {
                         0x2 => self.wfe(bus),                  // WFE
                         // FPU × sleep (HLD §B.7): WFI/WFE retain S0-S31 +
                         // FPSCR and do NOT clear FPCCR.LSPACT.
-                        0x3 => 1,                              // WFI (NOP)
+                        0x3 => {
+                            // WFI: sleep unless there's an enabled pending IRQ
+                            let pending = bus.irq_pending[self.core_id as usize];
+                            if self.ppb.any_pending_enabled(pending) {
+                                1 // pending enabled IRQ → act as NOP
+                            } else {
+                                self.halted.store(true, Ordering::Release);
+                                1
+                            }
+                        }
                         0x4 => { bus.signal_sev(); 1 },        // SEV
                         _ => 1,                                // Reserved
                     }

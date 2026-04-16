@@ -4,6 +4,7 @@ pub mod ppb;
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
 use crate::dma::{DMA_BASE, Dma};
@@ -357,7 +358,8 @@ pub struct Bus {
     /// Single-cycle IO block (GPIO, CPUID, spinlocks, FIFO, divider, etc.).
     pub sio: Sio,
     /// Per-core event flag for WFE/SEV protocol.
-    pub event_flag: [bool; 2],
+    /// `AtomicBool` for threading readiness (Phase 0b.3).
+    pub event_flag: [AtomicBool; 2],
     /// Per-core RCP salt value (shared state for cross-core writes).
     pub rcp_salt: [u32; 2],
     /// Per-core RCP salt validity flag.
@@ -463,7 +465,7 @@ impl Bus {
             gpio_hi_noise_state: 0xA5A5_A5A5,
             xip_cache_offset: 0,
             sio: Sio::new(),
-            event_flag: [false; 2],
+            event_flag: [AtomicBool::new(false), AtomicBool::new(false)],
             rcp_salt: [0; 2],
             rcp_salt_valid: [false; 2],
             rcp_count: 0,
@@ -997,8 +999,8 @@ impl Bus {
 
     /// Signal an SEV event to both cores.
     pub fn signal_sev(&mut self) {
-        self.event_flag[0] = true;
-        self.event_flag[1] = true;
+        self.event_flag[0].store(true, Ordering::Release);
+        self.event_flag[1].store(true, Ordering::Release);
     }
 
     /// Read GPIO_HI_IN (SIO offset 0x008). Returns QSPI pin state.
@@ -2181,7 +2183,7 @@ impl Bus {
                 self.sio.write32(reg_offset, val, core as usize);
                 // FIFO_WR event signaling: set event_flag for receiver core.
                 if let Some(receiver) = self.sio.pending_fifo_event.take() {
-                    self.event_flag[receiver] = true;
+                    self.event_flag[receiver].store(true, Ordering::Release);
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),

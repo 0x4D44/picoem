@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+
 // FPCCR bit positions (DDI0553 §D1.2.32). Public so other crate modules
 // (exceptions.rs, execute_fpu.rs) can reference them by name.
 pub const FPCCR_LSPACT:    u32 = 1 << 0;
@@ -150,16 +152,19 @@ pub struct Ppb {
     /// NVIC_ISER0..1 — interrupt set-enable.
     /// Writes are W1S; ICER writes clear the same state. Read returns
     /// the unified enable mask.
-    pub nvic_iser: [u32; NVIC_BIT_WORDS],
+    /// `AtomicU32` for threading readiness (Phase 0b.3).
+    pub nvic_iser: [AtomicU32; NVIC_BIT_WORDS],
     /// NVIC_ISPR0..1 — interrupt set-pending. All 52 bits are writable
     /// via software; peripherals drive only 0..=45. `NVIC_ISPR` accepts
     /// software-writes to 46..=51 and they latch (RP2350 datasheet §3.2
     /// note following Table 95).
-    pub nvic_ispr: [u32; NVIC_BIT_WORDS],
+    /// `AtomicU32` for threading readiness (Phase 0b.3).
+    pub nvic_ispr: [AtomicU32; NVIC_BIT_WORDS],
     /// NVIC_IABR0..1 — interrupt active. Bit N set iff external IRQ N's
     /// handler is currently the active exception. Exception entry sets
     /// the bit; exit clears it.
-    pub nvic_iabr: [u32; NVIC_BIT_WORDS],
+    /// `AtomicU32` for threading readiness (Phase 0b.3).
+    pub nvic_iabr: [AtomicU32; NVIC_BIT_WORDS],
     /// NVIC_IPR0..12 — priority bytes, packed 4 per word. Each byte is
     /// masked to [`NVIC_PRIORITY_MASK`] (bits [7:5], 8 levels).
     pub nvic_ipr: [u32; NVIC_IPR_WORDS],
@@ -198,9 +203,9 @@ impl Default for Ppb {
             syst_rvr: 0,
             syst_cvr: 0,
             last_systick_cycles: 0,
-            nvic_iser: [0; NVIC_BIT_WORDS],
-            nvic_ispr: [0; NVIC_BIT_WORDS],
-            nvic_iabr: [0; NVIC_BIT_WORDS],
+            nvic_iser: [AtomicU32::new(0), AtomicU32::new(0)],
+            nvic_ispr: [AtomicU32::new(0), AtomicU32::new(0)],
+            nvic_iabr: [AtomicU32::new(0), AtomicU32::new(0)],
             nvic_ipr: [0; NVIC_IPR_WORDS],
         }
     }
@@ -258,12 +263,12 @@ impl Ppb {
             //   NVIC_IPR0..12 : 0xE400..0xE430  — priority bytes
             // Any other address in 0xE100..=0xE4FF (reserved / non-existent
             // registers) reads as 0.
-            0xE100 | 0xE180 => self.nvic_iser[0],
-            0xE104 | 0xE184 => self.nvic_iser[1],
-            0xE200 | 0xE280 => self.nvic_ispr[0],
-            0xE204 | 0xE284 => self.nvic_ispr[1],
-            0xE300 => self.nvic_iabr[0],
-            0xE304 => self.nvic_iabr[1],
+            0xE100 | 0xE180 => self.nvic_iser[0].load(Ordering::Relaxed),
+            0xE104 | 0xE184 => self.nvic_iser[1].load(Ordering::Relaxed),
+            0xE200 | 0xE280 => self.nvic_ispr[0].load(Ordering::Relaxed),
+            0xE204 | 0xE284 => self.nvic_ispr[1].load(Ordering::Relaxed),
+            0xE300 => self.nvic_iabr[0].load(Ordering::Relaxed),
+            0xE304 => self.nvic_iabr[1].load(Ordering::Relaxed),
             0xE400..=0xE430 if (addr & 0x3) == 0 => {
                 let idx = (((addr & 0xFFFF) - 0xE400) / 4) as usize;
                 if idx < NVIC_IPR_WORDS { self.nvic_ipr[idx] } else { 0 }
@@ -411,14 +416,14 @@ impl Ppb {
             // (datasheet §3.2 note following Table 95). Peripherals only
             // drive 0..=45, but the software-self-pend path works for
             // 46..=51 as well.
-            0xE100 => self.nvic_iser[0] |= val,
-            0xE104 => self.nvic_iser[1] |= val & nvic_word1_valid_mask(),
-            0xE180 => self.nvic_iser[0] &= !val,
-            0xE184 => self.nvic_iser[1] &= !val,
-            0xE200 => self.nvic_ispr[0] |= val,
-            0xE204 => self.nvic_ispr[1] |= val & nvic_word1_valid_mask(),
-            0xE280 => self.nvic_ispr[0] &= !val,
-            0xE284 => self.nvic_ispr[1] &= !val,
+            0xE100 => { self.nvic_iser[0].fetch_or(val, Ordering::Relaxed); }
+            0xE104 => { self.nvic_iser[1].fetch_or(val & nvic_word1_valid_mask(), Ordering::Relaxed); }
+            0xE180 => { self.nvic_iser[0].fetch_and(!val, Ordering::Relaxed); }
+            0xE184 => { self.nvic_iser[1].fetch_and(!val, Ordering::Relaxed); }
+            0xE200 => { self.nvic_ispr[0].fetch_or(val, Ordering::Relaxed); }
+            0xE204 => { self.nvic_ispr[1].fetch_or(val & nvic_word1_valid_mask(), Ordering::Relaxed); }
+            0xE280 => { self.nvic_ispr[0].fetch_and(!val, Ordering::Relaxed); }
+            0xE284 => { self.nvic_ispr[1].fetch_and(!val, Ordering::Relaxed); }
             // IABR is read-only; writes are ignored.
             0xE300 | 0xE304 => {}
             // NVIC_IPR0..12 — 4×u8 lanes, each masked to bits [7:5].
@@ -612,7 +617,7 @@ impl Ppb {
             let word_idx = irq / 32;
             let bit = irq % 32;
             if word_idx < NVIC_BIT_WORDS {
-                self.nvic_iabr[word_idx] &= !(1u32 << bit);
+                self.nvic_iabr[word_idx].fetch_and(!(1u32 << bit), Ordering::Relaxed);
             }
         }
     }
@@ -630,7 +635,8 @@ impl Ppb {
     pub(crate) fn highest_priority_pending_irq(&self) -> Option<u16> {
         let mut best: Option<(i16, u16)> = None;
         for word_idx in 0..NVIC_BIT_WORDS {
-            let ready = self.nvic_iser[word_idx] & self.nvic_ispr[word_idx];
+            let ready = self.nvic_iser[word_idx].load(Ordering::Relaxed)
+                      & self.nvic_ispr[word_idx].load(Ordering::Relaxed);
             if ready == 0 { continue; }
             let mut remaining = ready;
             while remaining != 0 {
@@ -661,7 +667,7 @@ impl Ppb {
         if irq < crate::irq::IRQ_COUNT {
             let word = (irq / 32) as usize;
             let bit = irq % 32;
-            self.nvic_ispr[word] |= 1u32 << bit;
+            self.nvic_ispr[word].fetch_or(1u32 << bit, Ordering::Relaxed);
         }
     }
 
@@ -672,8 +678,17 @@ impl Ppb {
     /// `nvic_ispr` survive — the dispatch path clears bits on its own
     /// (dual-clear invariant at `exceptions.rs` `try_take_any_pending_exception`).
     pub(crate) fn merge_irq_pending(&mut self, pending: u64) {
-        self.nvic_ispr[0] |= pending as u32;
-        self.nvic_ispr[1] |= (pending >> 32) as u32;
+        self.nvic_ispr[0].fetch_or(pending as u32, Ordering::Relaxed);
+        self.nvic_ispr[1].fetch_or((pending >> 32) as u32, Ordering::Relaxed);
+    }
+
+    /// True iff any bit in `pending` is enabled in NVIC_ISER. Uses
+    /// `Acquire` ordering so cross-core IRQ signalling sees the enable
+    /// mask written by the peer. Phase 0b.3.
+    pub fn any_pending_enabled(&self, pending: u64) -> bool {
+        let iser = self.nvic_iser[0].load(Ordering::Acquire) as u64
+                 | (self.nvic_iser[1].load(Ordering::Acquire) as u64) << 32;
+        (pending & iser) != 0
     }
 
     /// Clear an external IRQ's pending bit. Phase 1 drain-loop callers
@@ -685,7 +700,7 @@ impl Ppb {
         if irq < crate::irq::IRQ_COUNT {
             let word = (irq / 32) as usize;
             let bit = irq % 32;
-            self.nvic_ispr[word] &= !(1u32 << bit);
+            self.nvic_ispr[word].fetch_and(!(1u32 << bit), Ordering::Relaxed);
         }
     }
 
@@ -694,7 +709,7 @@ impl Ppb {
         if irq < crate::irq::IRQ_COUNT {
             let word = (irq / 32) as usize;
             let bit = irq % 32;
-            self.nvic_iabr[word] |= 1u32 << bit;
+            self.nvic_iabr[word].fetch_or(1u32 << bit, Ordering::Relaxed);
         }
     }
 
@@ -709,7 +724,7 @@ impl Ppb {
         }
         let word = (irq / 32) as usize;
         let bit = irq % 32;
-        (self.nvic_iser[word] & (1u32 << bit)) != 0
+        (self.nvic_iser[word].load(Ordering::Relaxed) & (1u32 << bit)) != 0
     }
 
     // ----------------------------------------------------------------
@@ -1083,7 +1098,7 @@ mod tests {
         let mut ppb = Ppb::default();
         ppb.set_irq_pending(48);
         assert_eq!(
-            ppb.nvic_ispr[1] & (1u32 << (48 - 32)),
+            ppb.nvic_ispr[1].load(Ordering::Relaxed) & (1u32 << (48 - 32)),
             1u32 << (48 - 32),
             "set_irq_pending(48) must land on NVIC_ISPR1"
         );
@@ -1165,9 +1180,9 @@ mod tests {
     fn test_clear_active_drops_iabr_bit() {
         let mut ppb = Ppb::default();
         ppb.set_irq_active(7);
-        assert_ne!(ppb.nvic_iabr[0] & (1u32 << 7), 0);
+        assert_ne!(ppb.nvic_iabr[0].load(Ordering::Relaxed) & (1u32 << 7), 0);
         ppb.clear_active(16 + 7);
-        assert_eq!(ppb.nvic_iabr[0] & (1u32 << 7), 0);
+        assert_eq!(ppb.nvic_iabr[0].load(Ordering::Relaxed) & (1u32 << 7), 0);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crate::core::CortexM33;
 use crate::bus::Bus;
 
@@ -5881,7 +5883,7 @@ fn test_external_irq_pend_plus_enable_enters_handler() {
     let mut emu = load_external_irq_emu();
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0); // NVIC_ISER enable IRQ 0
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     core0_step(&mut emu);
 
@@ -5896,7 +5898,7 @@ fn test_external_irq_pending_without_enable_does_not_dispatch() {
     // irq_pending bit is set but NVIC_ISER bit is clear → no dispatch.
     let mut emu = load_external_irq_emu();
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0,
@@ -5911,7 +5913,7 @@ fn test_external_irq_priority_mask_blocks_dispatch() {
     emu.cores[0].regs.primask = 1;
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0,
@@ -5927,7 +5929,7 @@ fn test_external_irq_basepri_masks_dispatch() {
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
     emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0,
@@ -5942,7 +5944,7 @@ fn test_external_irq_basepri_zero_is_transparent() {
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
     emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     core0_step(&mut emu);
     assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
@@ -5974,9 +5976,9 @@ fn test_assert_irq_core_targets_receiver() {
     // Drive the merge and re-check NVIC_ISPR — core 1 latches, core 0
     // stays clean.
     emu.cores[1].ppb.merge_irq_pending(emu.bus.irq_pending[1]);
-    assert_ne!(emu.cores[1].ppb.nvic_ispr[0] & (1u32 << irq), 0,
+    assert_ne!(emu.cores[1].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 1 must latch after merge");
-    assert_eq!(emu.cores[0].ppb.nvic_ispr[0] & (1u32 << irq), 0,
+    assert_eq!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 0 must remain clear");
 }
 
@@ -6012,9 +6014,9 @@ fn test_assert_irq_shared_latches_on_both_cores() {
         "both cores' irq_pending_dirty flags must be set");
     emu.cores[0].ppb.merge_irq_pending(emu.bus.irq_pending[0]);
     emu.cores[1].ppb.merge_irq_pending(emu.bus.irq_pending[1]);
-    assert_ne!(emu.cores[0].ppb.nvic_ispr[0] & (1u32 << irq), 0,
+    assert_ne!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 0 must latch after merge");
-    assert_ne!(emu.cores[1].ppb.nvic_ispr[0] & (1u32 << irq), 0,
+    assert_ne!(emu.cores[1].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 1 must latch after merge");
 }
 
@@ -6086,7 +6088,7 @@ fn test_mmio_nvic_icpr_write_drops_irq_pending_mirror() {
     emu.mmio_write32(0xE000_E280, 1u32 << 0);
     assert_eq!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
         "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror");
-    assert_eq!(emu.cores[0].ppb.nvic_ispr[0] & (1u32 << 0), 0,
+    assert_eq!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 0), 0,
         "NVIC_ICPR MMIO write must clear the architectural latch");
 }
 
@@ -7302,22 +7304,23 @@ fn fifo_st_w1c_clears_wof_and_roe() {
 fn fifo_write_sets_event_flag_on_receiver() {
     let mut bus = Bus::new();
     // Event flags start clear
-    assert!(!bus.event_flag[0]);
-    assert!(!bus.event_flag[1]);
+    assert!(!bus.event_flag[0].load(Ordering::Relaxed));
+    assert!(!bus.event_flag[1].load(Ordering::Relaxed));
 
     // Core 0 writes FIFO_WR -> should set event_flag[1] (receiver = Core 1)
     bus.write32(FIFO_WR, 0x42, 0);
-    assert!(bus.event_flag[1], "event_flag[1] should be set after Core 0 FIFO write");
-    assert!(!bus.event_flag[0], "event_flag[0] should NOT be set");
+    assert!(bus.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after Core 0 FIFO write");
+    assert!(!bus.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should NOT be set");
 
     // Clear event flags
-    bus.event_flag = [false; 2];
+    bus.event_flag[0].store(false, Ordering::Relaxed);
+    bus.event_flag[1].store(false, Ordering::Relaxed);
 
     // Core 1 writes FIFO_WR -> should set event_flag[0] (receiver = Core 0)
     set_core1(&mut bus);
     bus.write32(FIFO_WR, 0x43, 1);
     set_core0(&mut bus);
-    assert!(bus.event_flag[0], "event_flag[0] should be set after Core 1 FIFO write");
+    assert!(bus.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after Core 1 FIFO write");
 }
 
 #[test]
@@ -7328,11 +7331,12 @@ fn fifo_overflow_does_not_set_event_flag() {
         bus.write32(FIFO_WR, i, 0);
     }
     // Clear event flags
-    bus.event_flag = [false; 2];
+    bus.event_flag[0].store(false, Ordering::Relaxed);
+    bus.event_flag[1].store(false, Ordering::Relaxed);
 
     // Overflow write should NOT set event flag
     bus.write32(FIFO_WR, 0xDEAD, 0);
-    assert!(!bus.event_flag[1], "event_flag should NOT be set on overflow write");
+    assert!(!bus.event_flag[1].load(Ordering::Relaxed), "event_flag should NOT be set on overflow write");
 }
 
 // ============================================================================
@@ -7426,17 +7430,17 @@ fn spinlock_st_bitmask_reflects_state() {
 #[test]
 fn wfe_with_event_pending_consumes_and_continues() {
     let (mut cpu, mut bus) = core_and_bus();
-    bus.event_flag[0] = true;
+    bus.event_flag[0].store(true, Ordering::Relaxed);
     // WFE Thumb-16 encoding: 0xBF20 (hint op = 0x2, mask = 0)
     cpu.execute_one_with_bus(0xBF20, &mut bus);
-    assert!(!bus.event_flag[0], "event_flag should be consumed");
+    assert!(!bus.event_flag[0].load(Ordering::Relaxed), "event_flag should be consumed");
     assert!(!cpu.is_wfe_waiting(), "core should NOT be sleeping — event was pending");
 }
 
 #[test]
 fn wfe_without_event_enters_sleep() {
     let (mut cpu, mut bus) = core_and_bus();
-    assert!(!bus.event_flag[0]);
+    assert!(!bus.event_flag[0].load(Ordering::Relaxed));
     cpu.execute_one_with_bus(0xBF20, &mut bus);
     assert!(cpu.is_wfe_waiting(), "core should be sleeping — no event was pending");
 }
@@ -7444,12 +7448,12 @@ fn wfe_without_event_enters_sleep() {
 #[test]
 fn sev_sets_both_event_flags() {
     let (mut cpu, mut bus) = core_and_bus();
-    assert!(!bus.event_flag[0]);
-    assert!(!bus.event_flag[1]);
+    assert!(!bus.event_flag[0].load(Ordering::Relaxed));
+    assert!(!bus.event_flag[1].load(Ordering::Relaxed));
     // SEV Thumb-16 encoding: 0xBF40 (hint op = 0x4, mask = 0)
     cpu.execute_one_with_bus(0xBF40, &mut bus);
-    assert!(bus.event_flag[0], "event_flag[0] should be set after SEV");
-    assert!(bus.event_flag[1], "event_flag[1] should be set after SEV");
+    assert!(bus.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after SEV");
+    assert!(bus.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after SEV");
 }
 
 #[test]
@@ -7466,13 +7470,13 @@ fn wake_check_clears_wfe_on_event() {
     emu.reset();
 
     // Manually put core 0 into WFE sleep and set its event flag
-    emu.cores[0].wfe_waiting = true;
-    emu.bus.event_flag[0] = true;
+    emu.cores[0].wfe_waiting.store(true, Ordering::Relaxed);
+    emu.bus.event_flag[0].store(true, Ordering::Relaxed);
 
     emu.step();
 
-    assert!(!emu.cores[0].wfe_waiting, "core should have been woken by event_flag");
-    assert!(!emu.bus.event_flag[0], "event_flag should have been consumed");
+    assert!(!emu.cores[0].wfe_waiting.load(Ordering::Relaxed), "core should have been woken by event_flag");
+    assert!(!emu.bus.event_flag[0].load(Ordering::Relaxed), "event_flag should have been consumed");
 }
 
 // ============================================================================
@@ -8881,4 +8885,86 @@ fn trace_exception_exit_publishes_sentinel_fd() {
             l,
         );
     }
+}
+
+// ============================================================================
+// WFI behaviour (Phase 0b.3)
+// ============================================================================
+
+#[test]
+fn wfi_halts_when_no_pending_irq() {
+    let (mut core, mut bus) = core_and_bus();
+    // WFI via execute_one_with_bus: opcode 0xBF30
+    let pre_halted = core.halted.load(Ordering::Relaxed);
+    assert!(!pre_halted, "should not be halted before WFI");
+    core.execute_one_with_bus(0xBF30, &mut bus);
+    assert!(core.halted.load(Ordering::Relaxed),
+        "WFI with no pending IRQ should halt the core");
+}
+
+#[test]
+fn wfi_nop_when_enabled_pending_irq() {
+    let (mut core, mut bus) = core_and_bus();
+    // Enable IRQ 0 in NVIC
+    core.ppb.nvic_iser[0].store(1, Ordering::Relaxed);
+    // Assert IRQ 0 pending
+    bus.irq_pending[0] = 1;
+    // WFI: 0xBF30
+    core.execute_one_with_bus(0xBF30, &mut bus);
+    assert!(!core.halted.load(Ordering::Relaxed),
+        "WFI with enabled pending IRQ should NOT halt (acts as NOP)");
+}
+
+#[test]
+fn wfi_halts_when_pending_but_disabled_irq() {
+    let (mut core, mut bus) = core_and_bus();
+    // IRQ pending but NOT enabled
+    bus.irq_pending[0] = 1;
+    core.ppb.nvic_iser[0].store(0, Ordering::Relaxed);
+    // WFI: 0xBF30
+    core.execute_one_with_bus(0xBF30, &mut bus);
+    assert!(core.halted.load(Ordering::Relaxed),
+        "WFI with pending but disabled IRQ should halt");
+}
+
+#[test]
+fn wfi_wake_on_irq_assert() {
+    let mut emu = crate::Emulator::new(crate::Config::default());
+    emu.load_flash(&[]);
+    // Halt core via WFI
+    emu.cores[0].halted.store(true, Ordering::Relaxed);
+    // Enable IRQ 0
+    emu.cores[0].ppb.nvic_iser[0].store(1, Ordering::Relaxed);
+    // Assert IRQ 0
+    emu.bus.irq_pending[0] = 1;
+    // Wake check should clear halted
+    emu.wake_checks();
+    assert!(!emu.cores[0].halted.load(Ordering::Relaxed),
+        "wake_checks should wake WFI-halted core with enabled pending IRQ");
+}
+
+#[test]
+fn wfi_stays_halted_without_enabled_irq() {
+    let mut emu = crate::Emulator::new(crate::Config::default());
+    emu.load_flash(&[]);
+    emu.cores[0].halted.store(true, Ordering::Relaxed);
+    // IRQ pending but not enabled
+    emu.bus.irq_pending[0] = 1;
+    emu.cores[0].ppb.nvic_iser[0].store(0, Ordering::Relaxed);
+    emu.wake_checks();
+    assert!(emu.cores[0].halted.load(Ordering::Relaxed),
+        "wake_checks should NOT wake WFI-halted core without enabled IRQ");
+}
+
+#[test]
+fn debug_step_clears_halted() {
+    let mut emu = crate::Emulator::new(crate::Config::default());
+    emu.load_flash(&[]);
+    emu.cores[0].halted.store(true, Ordering::Relaxed);
+    emu.cores[0].regs.r[15] = 0x2000_0000;
+    // NOP instruction
+    emu.bus.memory.sram_write16(0, 0xBF00);
+    emu.cores[0].debug_step(&mut emu.bus);
+    assert!(!emu.cores[0].halted.load(Ordering::Relaxed),
+        "debug_step should clear halted before stepping");
 }

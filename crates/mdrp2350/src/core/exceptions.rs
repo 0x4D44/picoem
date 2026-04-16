@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crate::bus::Bus;
 use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY,
     FPCCR_SPLIMVIOL};
@@ -78,7 +80,7 @@ impl CortexM33 {
         self.exclusive_address = None;
 
         if exc_num == 3 && self.regs.ipsr() == 3 {
-            self.halted = true;
+            self.halted.store(true, Ordering::Relaxed);
             return 0;
         }
         let use_psp = !self.regs.in_handler_mode() && self.regs.active_sp_is_psp();
@@ -484,7 +486,7 @@ impl CortexM33 {
                 if word < crate::bus::ppb::NVIC_BIT_WORDS {
                     let core = self.core_id as usize;
                     bus.irq_pending[core] &= !(1u64 << irq);
-                    self.ppb.nvic_ispr[word] &= !(1u32 << bit);
+                    self.ppb.nvic_ispr[word].fetch_and(!(1u32 << bit), Ordering::Relaxed);
                 }
                 self.ppb.set_irq_active(irq as u32);
             }
