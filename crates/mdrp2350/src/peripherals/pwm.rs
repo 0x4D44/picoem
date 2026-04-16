@@ -274,6 +274,10 @@ impl PwmRegs {
                     let mut stored = self.slices[slice].div;
                     apply_alias_rmw(&mut stored, value, alias);
                     self.slices[slice].div = stored & 0x0FFF;
+                    // Reset the fractional accumulator: its residue was
+                    // valid under the old divisor and would be out-of-range
+                    // (or produce a phantom advance) under the new one.
+                    self.slices[slice].frac_accum = 0;
                 }
                 SLICE_CTR => {
                     let mut stored = self.slices[slice].ctr as u32;
@@ -360,13 +364,18 @@ impl PwmRegs {
             }
 
             // O(1) fractional accumulator: DIV is 8.4 fixed-point
-            // (INT[11:4]:FRAC[3:0]).
-            let int_part = (slice.div >> 4) as u32;   // INT[11:4]
-            let frac_part = (slice.div & 0xF) as u32; // FRAC[3:0]
-            let total_frac = slice.frac_accum as u32 + frac_part * cycles;
-            let carry = total_frac / 16;
-            slice.frac_accum = (total_frac % 16) as u16;
-            let advance = int_part * cycles + carry;
+            // (INT[11:4]:FRAC[3:0]) = INT*16+FRAC in raw form. The
+            // counter advances once per `divisor` sys_clk ticks, so
+            // multiply cycles by 16 to convert to the same unit.
+            let divisor = slice.div & 0x0FFF;
+            if divisor == 0 {
+                continue;
+            }
+            // `cycles * 16` stays within u32: step_quantum ≤ 1024 cycles,
+            // so max product is 16384, well below u32::MAX.
+            let total = slice.frac_accum as u32 + cycles * 16;
+            let advance = total / divisor;
+            slice.frac_accum = (total % divisor) as u16;
 
             if advance == 0 {
                 continue;
