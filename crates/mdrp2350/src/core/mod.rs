@@ -30,6 +30,35 @@ pub(crate) enum Fault {
     // BusFault is delivered via bus.bus_fault() flag, not this enum
 }
 
+/// Per-core access counters for workload characterization (Phase 0a).
+#[derive(Debug, Default, Clone)]
+pub struct CoreCounters {
+    pub decode_execute_cycles: u64,
+    pub wfi_cycles: u64,
+    pub wfe_cycles: u64,
+    pub sram_reads: u64,
+    pub sram_writes: u64,
+    pub sio_accesses: u64,
+    pub peripheral_accesses: u64,
+    pub ppb_accesses: u64,
+}
+
+impl CoreCounters {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn classify_access(&mut self, addr: u32, is_write: bool) {
+        let region = addr >> 28;
+        match region {
+            0x2 => if is_write { self.sram_writes += 1 } else { self.sram_reads += 1 },
+            0xD => self.sio_accesses += 1,
+            0xE => self.ppb_accesses += 1,
+            _ => self.peripheral_accesses += 1,
+        }
+    }
+}
+
 /// Cortex-M33 CPU core.
 pub struct CortexM33 {
     pub regs: Registers,
@@ -94,6 +123,8 @@ pub struct CortexM33 {
     /// writes do NOT invalidate the local monitor (per ARM semantics).
     /// Phase 0b.2 of the Threaded Dual-Core Emulation plan.
     pub(crate) did_write_this_quantum: bool,
+    /// Per-core workload counters (Phase 0a instrumentation).
+    pub counters: CoreCounters,
 }
 
 impl CortexM33 {
@@ -117,6 +148,7 @@ impl CortexM33 {
             ppb: Ppb::default(),
             exclusive_address: None,
             did_write_this_quantum: false,
+            counters: CoreCounters::default(),
         }
     }
 
@@ -125,9 +157,11 @@ impl CortexM33 {
     /// cost if a synchronous fault is taken).
     pub fn step(&mut self, bus: &mut Bus) {
         if self.wfe_waiting.load(Ordering::Relaxed) {
+            self.counters.wfe_cycles += 1;
             return;
         }
         if self.halted.load(Ordering::Relaxed) {
+            self.counters.wfi_cycles += 1;
             return;
         }
 
@@ -186,6 +220,7 @@ impl CortexM33 {
             self.pending_fault = None;
         }
 
+        self.counters.decode_execute_cycles += cycles as u64;
         self.cycles = self.cycles.wrapping_add(cycles as u64);
     }
 
@@ -287,6 +322,7 @@ impl CortexM33 {
     // -------------------------------------------------------------------
 
     pub(crate) fn bus_read32(&mut self, addr: u32, bus: &mut Bus) -> u32 {
+        self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             let val = self.ppb.read32(addr);
             if bus.trace_enabled {
@@ -299,6 +335,7 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write32(&mut self, addr: u32, val: u32, bus: &mut Bus) {
+        self.counters.classify_access(addr, true);
         // Phase 0b.2: any data-side write invalidates a peer core's
         // exclusive monitor. `Emulator::step` snoops this flag after the
         // core's quantum slice and clears the peer's `exclusive_address`.
@@ -315,6 +352,7 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_read16(&mut self, addr: u32, bus: &mut Bus) -> u16 {
+        self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // ARMv8-M: halfword PPB accesses are UNPREDICTABLE (word-only
             // registers). We defensively compose the result from the
@@ -334,6 +372,7 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write16(&mut self, addr: u32, val: u16, bus: &mut Bus) {
+        self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
@@ -358,6 +397,7 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_read8(&mut self, addr: u32, bus: &mut Bus) -> u8 {
+        self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte reads return 0.
             if bus.trace_enabled {
@@ -370,6 +410,7 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write8(&mut self, addr: u32, val: u8, bus: &mut Bus) {
+        self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {

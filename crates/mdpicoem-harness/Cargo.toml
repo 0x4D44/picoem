@@ -122,6 +122,10 @@ path = "src/bin/smoke_per_core_cyccnt_rp2350.rs"
 name = "mmio_trace_rp2350"
 path = "src/bin/mmio_trace_rp2350.rs"
 
+[[bin]]
+name = "workload_study_rp2350"
+path = "src/bin/workload_study_rp2350.rs"
+
 # ---------------------------------------------------------------------------
 # RP2040 (Cortex-M0+) binaries
 # ---------------------------------------------------------------------------

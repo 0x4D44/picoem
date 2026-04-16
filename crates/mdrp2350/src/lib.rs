@@ -14,6 +14,7 @@ pub mod pio;
 mod pio_tests;
 
 pub use self::core::CortexM33;
+pub use self::core::CoreCounters;
 pub use self::bus::Bus;
 pub use self::memory::Memory;
 pub use self::sio::Sio;
@@ -353,6 +354,18 @@ impl Emulator {
 
     pub fn core_mut(&mut self, id: usize) -> &mut CortexM33 {
         &mut self.cores[id]
+    }
+
+    /// Get a reference to a core's workload counters.
+    pub fn core_counters(&self, core_id: usize) -> &CoreCounters {
+        &self.cores[core_id].counters
+    }
+
+    /// Reset all core counters.
+    pub fn reset_counters(&mut self) {
+        for core in &mut self.cores {
+            core.counters.reset();
+        }
     }
 
     /// Direct memory read (bypasses bus timing).
