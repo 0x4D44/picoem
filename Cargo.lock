@@ -1452,6 +1452,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdpicoem-devices"
+version = "0.2.0"
+
+[[package]]
 name = "mdpicoem-harness"
 version = "0.25.0"
 dependencies = [
@@ -1471,9 +1475,10 @@ dependencies = [
 
 [[package]]
 name = "mdrp2040"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "mdpicoem-common",
+ "mdpicoem-devices",
  "tracing",
 ]
 

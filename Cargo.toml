@@ -6,6 +6,7 @@ members = ["crates/*"]
 default-members = [
     "crates/mdpicoem-common",
     "crates/mdpicoem-debug",
+    "crates/mdpicoem-devices",
     "crates/mdpicoem-harness",
     "crates/mdrp2040",
     "crates/mdrp2040app",

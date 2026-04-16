@@ -125,7 +125,9 @@ impl Emulator {
         for pio in &mut self.bus.pio {
             pio.reset();
         }
-        self.bus.psram.reset_state();
+        if let Some(ref mut psram) = self.bus.psram {
+            psram.reset_state();
+        }
         self.bus.clear_bus_fault();
         self.bus.ppb = [Default::default(), Default::default()];
         self.bus.event_flag = [false; 2];
@@ -485,9 +487,12 @@ impl Emulator {
             out = (out & !pio_mask) | (pio.pad_out & pio_mask);
         }
         out &= 0x3FFF_FFFF;
-        if let Some(miso) = self.bus.psram.tick(out) {
-            let mask = 1u32 << crate::peripherals::psram::PIN_MISO;
-            out = (out & !mask) | ((miso as u32) << crate::peripherals::psram::PIN_MISO);
+        if let Some(ref mut psram) = self.bus.psram {
+            if let Some(miso) = psram.tick(out) {
+                let pin = psram.pin_miso();
+                let mask = 1u32 << pin;
+                out = (out & !mask) | ((miso as u32) << pin);
+            }
         }
         let ext_mask = self.bus.external_gpio_in_mask;
         if ext_mask != 0 {
@@ -671,6 +676,7 @@ pub struct EmulatorBuilder {
     config: Config,
     step_quantum: u32,
     flash: Option<Vec<u8>>,
+    psram: Option<mdpicoem_devices::Psram>,
 }
 
 impl EmulatorBuilder {
@@ -679,6 +685,7 @@ impl EmulatorBuilder {
             config,
             step_quantum: DEFAULT_STEP_QUANTUM,
             flash: None,
+            psram: None,
         }
     }
 
@@ -697,9 +704,18 @@ impl EmulatorBuilder {
         self
     }
 
+    /// Attach an off-chip SPI PSRAM device to the emulator. When set,
+    /// [`Emulator::update_gpio`] feeds the device's `tick()` method on
+    /// every GPIO merge and splices its MISO output back into `gpio_in`.
+    pub fn psram(mut self, psram: mdpicoem_devices::Psram) -> Self {
+        self.psram = Some(psram);
+        self
+    }
+
     pub fn build(self) -> Emulator {
         let mut bus = Bus::new();
         bus.seed_sys_clk_hz(self.config.sys_clk_hz);
+        bus.psram = self.psram;
         let mut emu = Emulator {
             cores: [CortexM0Plus::with_id(0), CortexM0Plus::with_id(1)],
             bus,

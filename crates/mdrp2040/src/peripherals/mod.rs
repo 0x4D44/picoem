@@ -1,8 +1,7 @@
-//! Off-chip and on-chip peripheral models.
+//! On-chip peripheral models plus integration tests for off-chip devices.
 //!
-//! Two sub-categories share this module:
-//!
-//! * `psram` — off-chip PicoGUS v2 SPI PSRAM (lives on GPIO0..3).
+//! * `psram` — integration tests for the off-chip SPI PSRAM model (the
+//!   device itself lives in `mdpicoem-devices::psram`).
 //! * `watchdog_tick` / future siblings — on-chip RP2040 peripherals with
 //!   a register surface that fronts `Bus::peripheral_read32` /
 //!   `peripheral_write32`.

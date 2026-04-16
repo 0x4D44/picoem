@@ -42,7 +42,7 @@ use crate::irq::{
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::AdcRegs;
 use crate::peripherals::i2c::I2cRegs;
-use crate::peripherals::psram::Psram;
+use mdpicoem_devices::Psram;
 use crate::peripherals::pwm::PwmRegs;
 use crate::peripherals::spi::SpiRegs;
 use crate::peripherals::timer::TimerRegs;
@@ -261,10 +261,11 @@ pub struct Bus {
     /// by [`crate::Emulator::drain_pending_irqs_to_cores`], polled by
     /// [`crate::core::CortexM0Plus::step`] for dispatch.
     pub nvics: [Nvic; 2],
-    /// Off-chip 8 MB SPI PSRAM (PicoGUS v2 hardware). Observed via
-    /// [`crate::Emulator::update_gpio`] on GPIO1/2/3 (CS/SCK/MOSI) and
-    /// drives GPIO0 (MISO) back into [`Self::gpio_in`].
-    pub psram: Psram,
+    /// Off-chip 8 MB SPI PSRAM (PicoGUS v2 hardware). `None` when no
+    /// PSRAM is attached (e.g. non-PicoGUS boards). Observed via
+    /// [`crate::Emulator::update_gpio`] on the device's pin assignments
+    /// and drives MISO back into [`Self::gpio_in`].
+    pub psram: Option<Psram>,
     /// Externally-driven GPIO input override values. Bits set in
     /// [`Self::external_gpio_in_mask`] take their value from this field
     /// instead of whatever SIO / PIO / PSRAM would have produced; bits
@@ -355,7 +356,7 @@ impl Bus {
             dma: Dma::new(),
             irq_pending: 0,
             nvics: [Nvic::new(), Nvic::new()],
-            psram: Psram::new(),
+            psram: None,
             external_gpio_in_override: 0,
             external_gpio_in_mask: 0,
             event_flag: [false; 2],
