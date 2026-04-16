@@ -9,6 +9,7 @@ pub mod memory;
 pub mod peripherals;
 pub mod sio;
 pub mod pio;
+pub mod threaded;
 
 #[cfg(test)]
 mod pio_tests;
