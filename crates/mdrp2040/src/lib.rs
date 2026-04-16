@@ -68,6 +68,30 @@ pub struct Emulator {
     pub clock: Clock,
     /// Cycles advanced per call to [`Self::step`].
     pub step_quantum: u32,
+    /// Total PIO ticks performed in the slow path
+    /// (`tick_pio_and_route_irqs_single`). Diagnostic-only — used by the
+    /// PicoGUS harness to confirm PIO is actually being driven.
+    pub pio_tick_count: u64,
+    /// Subset of [`Self::pio_tick_count`] where bit 4 (IOW for PicoGUS)
+    /// of `bus.gpio_in` was low at the moment of the tick. If this stays
+    /// at zero while the harness is asserting IOW low, the override
+    /// merge is breaking somewhere in the path.
+    pub pio_tick_iow_low_count: u64,
+    /// Diagnostic — maximum PC value PIO0 SM0 has held during the run
+    /// (observed after each slow-path tick). PicoGUS bring-up: if this
+    /// stays at the WAIT-pin instruction slot, SM0 never escaped its
+    /// wait. If it climbs to a higher slot, SM0 advanced through the
+    /// program. Slow-path-only — fast-path skips PIO when both blocks
+    /// are idle so SM0 wouldn't be moving regardless.
+    pub pio0_sm0_max_pc: u8,
+    /// Diagnostic — number of times PIO0 SM0's PC differed from its
+    /// previous-tick value (advanced or jumped). Slow-path-only.
+    pub pio0_sm0_pc_advances: u64,
+    /// Last observed PC of PIO0 SM0 — internal scratch used by
+    /// [`Self::tick_pio_and_route_irqs_single`] to decide whether the
+    /// PC moved this tick. Initialised to a sentinel `0xFF` so the
+    /// very first observation always counts as an advance.
+    pio0_sm0_last_pc: u8,
 }
 
 impl Emulator {
@@ -125,6 +149,13 @@ impl Emulator {
         for pio in &mut self.bus.pio {
             pio.reset();
         }
+        // Diagnostic counters track post-reset behaviour, so zero them
+        // on `reset()` too (the SM `pc` field also resets to 0, hence
+        // the sentinel `0xFF` for `last_pc` to make the first observed
+        // PC count as an advance).
+        self.pio0_sm0_max_pc = 0;
+        self.pio0_sm0_pc_advances = 0;
+        self.pio0_sm0_last_pc = 0xFF;
         if let Some(ref mut psram) = self.bus.psram {
             psram.reset_state();
         }
@@ -401,8 +432,24 @@ impl Emulator {
     /// fires when an autopushed event lands in PIO0 SM0's RX FIFO.
     fn tick_pio_and_route_irqs_single(&mut self) {
         let gpio_in = self.bus.gpio_in;
+        self.pio_tick_count = self.pio_tick_count.wrapping_add(1);
+        if gpio_in & (1u32 << 4) == 0 {
+            self.pio_tick_iow_low_count = self.pio_tick_iow_low_count.wrapping_add(1);
+        }
         self.bus.pio[0].step_n(1, gpio_in);
         self.bus.pio[1].step_n(1, gpio_in);
+        // Observe PIO0 SM0's PC after the step. Tracks max PC and the
+        // number of times the PC differs from the prior observation
+        // (counts both linear advances and jumps; sequential same-PC
+        // ticks — e.g. a stalled WAIT — do not increment).
+        let sm0_pc = self.bus.pio[0].sm[0].pc();
+        if sm0_pc > self.pio0_sm0_max_pc {
+            self.pio0_sm0_max_pc = sm0_pc;
+        }
+        if sm0_pc != self.pio0_sm0_last_pc {
+            self.pio0_sm0_pc_advances = self.pio0_sm0_pc_advances.wrapping_add(1);
+            self.pio0_sm0_last_pc = sm0_pc;
+        }
         for (block, line0_bit) in [(0usize, 7u32), (1usize, 9u32)] {
             if self.bus.pio[block].int0_ints() != 0 {
                 self.bus.irq_pending |= 1u32 << line0_bit;
@@ -707,6 +754,11 @@ impl EmulatorBuilder {
             bus,
             clock: Clock { cycles: 0 },
             step_quantum: self.step_quantum,
+            pio_tick_count: 0,
+            pio_tick_iow_low_count: 0,
+            pio0_sm0_max_pc: 0,
+            pio0_sm0_pc_advances: 0,
+            pio0_sm0_last_pc: 0xFF,
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         // Route through the wrapper so the SIO handshake FSM `armed`

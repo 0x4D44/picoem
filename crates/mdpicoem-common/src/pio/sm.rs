@@ -65,6 +65,13 @@ pub struct StateMachine {
     // level — see `PioBlock::shared_pin_values` / `shared_pin_dirs`.
     pub(crate) sideset_pins: u32,
     pub(crate) sideset_dirs: u32,
+
+    /// Diagnostic counter — number of times this SM has successfully
+    /// autopushed `isr` into `rx_fifo` (i.e. autopush enabled, threshold
+    /// reached, and FIFO had room). Used by the PicoGUS bring-up harness
+    /// to confirm the IN PINS → autopush → RX FIFO chain reaches the
+    /// firmware. Pure observation — never read by execution logic.
+    pub autopush_count: u64,
 }
 
 /// Tracks what kind of stall we're in, so re-evaluation knows what to check.
@@ -111,6 +118,7 @@ impl StateMachine {
             // pin whose value has never been written reads high.
             sideset_pins: u32::MAX,
             sideset_dirs: 0,
+            autopush_count: 0,
         }
     }
 
@@ -135,6 +143,25 @@ impl StateMachine {
     /// exposing the FIFO itself.
     pub fn tx_fifo_full(&self) -> bool {
         self.tx_fifo.is_full()
+    }
+
+    /// Read-only view of the SM's program counter (5-bit, 0..=31).
+    /// Diagnostic — chip-side observers (PicoGUS bring-up harness) need
+    /// to track PC advances per system clock without going through MMIO.
+    pub fn pc(&self) -> u8 {
+        self.pc
+    }
+
+    /// Diagnostic: current ISR contents (32-bit). For tests that need
+    /// to inspect the input shift register without popping it through
+    /// the FIFO. Pure observation.
+    pub fn isr_value(&self) -> u32 {
+        self.isr
+    }
+
+    /// Diagnostic: current ISR shift count (0..=32).
+    pub fn isr_shift_count(&self) -> u8 {
+        self.isr_count
     }
 
     /// True iff this SM's RX FIFO is empty (nothing to drain). Used by
@@ -555,6 +582,7 @@ impl StateMachine {
                     self.rx_fifo.push(self.isr);
                     self.isr = 0;
                     self.isr_count = 0;
+                    self.autopush_count = self.autopush_count.wrapping_add(1);
                 }
                 // If RX FIFO is full, ISR retains its value (no stall for autopush)
             }

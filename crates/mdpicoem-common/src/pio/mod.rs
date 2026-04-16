@@ -486,7 +486,7 @@ impl PioBlock {
                 }
             }
             // Per-SM registers
-            0x0C8..=0x127 => self.write_sm_reg(offset, val),
+            0x0C8..=0x127 => self.write_sm_reg(offset, val, alias),
             // INTR: read-only
             0x128 => {}
             // IRQ0_INTE (12-bit mask, alias-aware)
@@ -570,8 +570,15 @@ impl PioBlock {
         }
     }
 
-    /// Write per-SM register.
-    fn write_sm_reg(&mut self, offset: u32, val: u32) {
+    /// Write per-SM register, honouring the four-way APB alias dispatch
+    /// (`alias=0`=plain, 1=XOR, 2=SET, 3=CLR). All five storage-backed
+    /// per-SM registers (CLKDIV, EXECCTRL, SHIFTCTRL, INSTR, PINCTRL) are
+    /// alias-aware. Read-only registers (ADDR) ignore writes regardless.
+    ///
+    /// PicoGUS firmware exercises XOR aliases on SHIFTCTRL to flip
+    /// FJOIN_TX without disturbing the rest of the register; treating
+    /// aliases as plain writes here silently corrupts AUTOPUSH/PUSH_THRESH.
+    fn write_sm_reg(&mut self, offset: u32, val: u32, alias: u32) {
         let sm_offset = offset - 0x0C8;
         let sm_idx = (sm_offset / 0x18) as usize;
         let reg = sm_offset % 0x18;
@@ -579,24 +586,42 @@ impl PioBlock {
             return;
         }
         match reg {
-            // SMn_CLKDIV
-            0x00 => self.sm[sm_idx].write_clkdiv(val),
-            // SMn_EXECCTRL: bit 31 is read-only (EXEC_STALLED)
-            0x04 => self.sm[sm_idx].execctrl = val & 0x7FFF_FFFF,
-            // SMn_SHIFTCTRL: reconfigure FIFO joining when changed
+            // SMn_CLKDIV: pack/unpack through int/frac so alias-RMW
+            // semantics apply to the canonical 32-bit register layout.
+            0x00 => {
+                let mut current = self.sm[sm_idx].read_clkdiv();
+                Self::apply_alias_rmw(&mut current, val, alias);
+                self.sm[sm_idx].write_clkdiv(current);
+            }
+            // SMn_EXECCTRL: bit 31 is read-only (EXEC_STALLED). Mask it
+            // out of the alias operand so `SET`/`XOR` of bit 31 cannot
+            // poison the stored value.
+            0x04 => {
+                let mut current = self.sm[sm_idx].execctrl;
+                Self::apply_alias_rmw(&mut current, val & 0x7FFF_FFFF, alias);
+                self.sm[sm_idx].execctrl = current & 0x7FFF_FFFF;
+            }
+            // SMn_SHIFTCTRL: reconfigure FIFO joining when the FJOIN bits
+            // [31:30] change after the alias is applied.
             0x08 => {
                 let old_join = self.sm[sm_idx].shiftctrl & 0xC000_0000;
-                self.sm[sm_idx].shiftctrl = val;
-                let new_join = val & 0xC000_0000;
+                let mut current = self.sm[sm_idx].shiftctrl;
+                Self::apply_alias_rmw(&mut current, val, alias);
+                self.sm[sm_idx].shiftctrl = current;
+                let new_join = current & 0xC000_0000;
                 if old_join != new_join {
                     self.apply_fifo_join(sm_idx);
                 }
             }
             // SMn_ADDR: read-only
             0x0C => {}
-            // SMn_INSTR: force-execute
+            // SMn_INSTR: force-execute. Apply the alias against the last
+            // executed instruction (the register's only readable storage)
+            // so an aliased write force-executes the RMW result.
             0x10 => {
-                let insn = val as u16;
+                let mut current = self.sm[sm_idx].last_insn as u32;
+                Self::apply_alias_rmw(&mut current, val, alias);
+                let insn = current as u16;
                 self.sm[sm_idx].force_execute(
                     insn,
                     &self.instr_mem,
@@ -607,7 +632,25 @@ impl PioBlock {
                 );
             }
             // SMn_PINCTRL
-            0x14 => self.sm[sm_idx].pinctrl = val,
+            0x14 => {
+                let mut current = self.sm[sm_idx].pinctrl;
+                Self::apply_alias_rmw(&mut current, val, alias);
+                self.sm[sm_idx].pinctrl = current;
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply APB alias semantics to a stored register field.
+    /// Mirrors `mdrp2040::peripherals::apply_alias_rmw`, inlined here
+    /// because `mdpicoem-common` cannot depend on `mdrp2040`.
+    #[inline]
+    fn apply_alias_rmw(stored: &mut u32, value: u32, alias: u32) {
+        match alias {
+            0 => *stored = value,
+            1 => *stored ^= value,
+            2 => *stored |= value,
+            3 => *stored &= !value,
             _ => {}
         }
     }
@@ -733,6 +776,39 @@ mod tests {
         let val = 0xDEAD_BEEF;
         pio.write32(0x0D0, val, 0); // SM0 SHIFTCTRL
         assert_eq!(pio.read32(0x0D0), val);
+    }
+
+    /// Per-SM XOR alias must flip the targeted bits in SHIFTCTRL rather than
+    /// silently clobbering the register with a plain write.
+    ///
+    /// PicoGUS firmware programs SHIFTCTRL=0x012b0000 then issues two
+    /// `SHIFTCTRL_XOR` writes of 0x80000000 to toggle FJOIN_TX off and on
+    /// (a no-op pair). If the alias parameter is dropped on the per-SM
+    /// dispatch path, the second write leaves SHIFTCTRL at 0x80000000,
+    /// which silently disables AUTOPUSH and PUSH_THRESH and breaks audio
+    /// ingestion.
+    #[test]
+    fn per_sm_xor_alias_flips_bits_in_shiftctrl() {
+        let mut pio = PioBlock::new();
+        // 1. Plain write of the production SHIFTCTRL value.
+        pio.write32(0x0D0, 0x012b_0000, 0);
+        assert_eq!(pio.read32(0x0D0), 0x012b_0000, "plain write roundtrip");
+
+        // 2. XOR-flip bit 31.
+        pio.write32(0x0D0, 0x8000_0000, 1);
+        assert_eq!(
+            pio.read32(0x0D0),
+            0x812b_0000,
+            "XOR alias must flip bit 31, leaving the rest intact",
+        );
+
+        // 3. XOR again — bit 31 toggles back, the rest still untouched.
+        pio.write32(0x0D0, 0x8000_0000, 1);
+        assert_eq!(
+            pio.read32(0x0D0),
+            0x012b_0000,
+            "second XOR alias write must restore the original value",
+        );
     }
 
     #[test]

@@ -936,6 +936,242 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         emu.bus.nvics[1].pending,
     );
 
+    // ------------------------------------------------------------------
+    // PIO0 SM0 deep-dive — investigates why the IOW capture program
+    // never pushes into RX FIFO despite SM0 being enabled.
+    //
+    // Hypotheses being probed:
+    //   H1: clkdiv too high → PIO ticks too slowly to see our 37-cycle
+    //       ISA pulse windows.
+    //   H2: DACK pin (GPIO19) is high → `jmp pin restart` always taken.
+    //   H3: INSTR_MEM never loaded → SM is running NOPs / zeros.
+    //
+    // Register layout (PIO0_BASE = 0x5020_0000):
+    //   0x004 FSTAT          per-SM TX/RX EMPTY/FULL flags
+    //   0x048+i*4 INSTR_MEMi  (write-only on silicon → reads return 0)
+    //   0x0C8 SM0_CLKDIV     hi16=int, lo16=frac
+    //   0x0CC SM0_EXECCTRL   (bit 31 EXEC_STALLED is computed at read)
+    //   0x0D4 SM0_ADDR       current PC (5-bit)
+    // ------------------------------------------------------------------
+    println!();
+    println!("--- Diag: PIO0 SM0 deep-dive ---");
+    let clkdiv = emu.bus.read32(0x5020_0000 + 0x0C8);
+    let clkdiv_int = (clkdiv >> 16) & 0xFFFF;
+    let clkdiv_frac = (clkdiv >> 8) & 0xFF;
+    // RP2040 SMn_CLKDIV: bits [31:16]=INT, [15:8]=FRAC, [7:0]=reserved.
+    // INT==0 is treated as 65536 by hardware. FRAC is x/256.
+    let effective_int = if clkdiv_int == 0 { 65536 } else { clkdiv_int };
+    println!(
+        "SM0 CLKDIV raw:   0x{:08x}  ({}.{:03} effective ~{} sysclk/PIO-tick)",
+        clkdiv, clkdiv_int, clkdiv_frac, effective_int
+    );
+    let sm_addr = emu.bus.read32(0x5020_0000 + 0x0D4) & 0x1F;
+    println!("SM0 PC:           0x{:02x}", sm_addr);
+    let execctrl = emu.bus.read32(0x5020_0000 + 0x0CC);
+    println!(
+        "SM0 EXECCTRL:     0x{:08x}  (bit31 EXEC_STALLED={})",
+        execctrl,
+        (execctrl >> 31) & 1
+    );
+
+    // INSTR_MEM via MMIO returns 0 (real-silicon-faithful), so also
+    // dump the raw backing store via PioBlock::instr_mem() — that gives
+    // us the truth on whether firmware actually programmed it.
+    println!("INSTR_MEM (first 16 — MMIO read / raw backing):");
+    // Snapshot the raw backing store first to avoid an immutable+mutable
+    // borrow overlap with the subsequent read32() calls on emu.bus.
+    let raw_im_snapshot: [u16; 32] = *emu.bus.pio[0].instr_mem();
+    for i in 0..16usize {
+        let mmio = emu.bus.read32(0x5020_0000 + 0x048 + (i as u32) * 4) & 0xFFFF;
+        println!(
+            "  [{:2}] mmio=0x{:04x}  raw=0x{:04x}",
+            i, mmio, raw_im_snapshot[i]
+        );
+    }
+
+    // DACK = GPIO19 (picogus_pins::ISA_DACK). `wait 1 gpio` /
+    // `jmp pin` against this pin gates the whole PIO program.
+    let gpio_in = emu.bus.gpio_in;
+    let dack_high = (gpio_in >> 19) & 1 != 0;
+    println!(
+        "DACK (GPIO19):    {}    (gpio_in=0x{:08x})",
+        if dack_high { "high" } else { "low" },
+        gpio_in
+    );
+
+    // FSTAT decode for SM0. Bits per RP2040 datasheet §3.7:
+    //   [3:0]   RXFULL   (sm0..sm3)
+    //   [11:8]  RXEMPTY
+    //   [19:16] TXFULL
+    //   [27:24] TXEMPTY
+    // (NB: prompt's bit map was approximate; this matches the impl in
+    //  mdpicoem-common/src/pio/mod.rs::fstat().)
+    let fstat = emu.bus.read32(0x5020_0000 + 0x004);
+    let sm0_rxfull = (fstat >> 0) & 1;
+    let sm0_rxempty = (fstat >> 8) & 1;
+    let sm0_txfull = (fstat >> 16) & 1;
+    let sm0_txempty = (fstat >> 24) & 1;
+    // FLEVEL @ 0x00C: per-SM TX in low nibble, RX in high nibble of
+    // each byte; SM0 occupies bits [7:0].
+    let flevel = emu.bus.read32(0x5020_0000 + 0x00C);
+    let sm0_tx_level = flevel & 0xF;
+    let sm0_rx_level = (flevel >> 4) & 0xF;
+    println!(
+        "FSTAT:            0x{:08x}  SM0 RX lvl={} (full={} empty={})  TX lvl={} (full={} empty={})",
+        fstat, sm0_rx_level, sm0_rxfull, sm0_rxempty, sm0_tx_level, sm0_txfull, sm0_txempty
+    );
+    // FSTAT per-SM bit-decode for all four SMs (RXFULL/RXEMPTY/TXFULL/TXEMPTY).
+    for sm in 0..4u32 {
+        let rxfull = (fstat >> sm) & 1;
+        let rxempty = (fstat >> (8 + sm)) & 1;
+        let txfull = (fstat >> (16 + sm)) & 1;
+        let txempty = (fstat >> (24 + sm)) & 1;
+        println!(
+            "FSTAT SM{}:        RX full={} empty={}   TX full={} empty={}",
+            sm, rxfull, rxempty, txfull, txempty
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Per-SM register sweep — the SM0 deep-dive above showed SM0 stuck
+    // at WAIT 0 GPIO 4 (PC=0x0b). This block extends the picture to the
+    // other three SMs in PIO0 to see whether anything else is running
+    // (and thus might be stomping pad_oe[4] or otherwise interfering).
+    // ------------------------------------------------------------------
+    println!();
+    println!("--- Diag: PIO0 per-SM sweep ---");
+    for sm in 0..4u32 {
+        let base = 0x5020_0000 + 0x0C8 + sm * 0x18;
+        let cd = emu.bus.read32(base);
+        let cd_int = (cd >> 16) & 0xFFFF;
+        let cd_frac = (cd >> 8) & 0xFF;
+        let cd_eff = if cd_int == 0 { 65536 } else { cd_int };
+        let ec = emu.bus.read32(base + 0x04);
+        let pc = emu.bus.read32(base + 0x0C) & 0x1F;
+        let pin = emu.bus.read32(base + 0x14);
+        let sideset_count = (pin >> 29) & 0x7;
+        let set_count = (pin >> 26) & 0x7;
+        let out_count = (pin >> 20) & 0x3F;
+        let in_base = (pin >> 15) & 0x1F;
+        let sideset_base = (pin >> 10) & 0x1F;
+        let set_base = (pin >> 5) & 0x1F;
+        let out_base = pin & 0x1F;
+        println!(
+            "SM{} PC: 0x{:02x}  CLKDIV: 0x{:08x} ({}.{:03} eff={})  EXECCTRL: 0x{:08x}",
+            sm, pc, cd, cd_int, cd_frac, cd_eff, ec
+        );
+        println!(
+            "       PINCTRL: 0x{:08x}  SIDESET cnt={} base={}  SET cnt={} base={}  OUT cnt={} base={}  IN base={}",
+            pin, sideset_count, sideset_base, set_count, set_base, out_count, out_base, in_base
+        );
+        // SHIFTCTRL @ +0x08 from CLKDIV. Bits per RP2040 datasheet §3.7:
+        //   [16] AUTOPUSH       [17] AUTOPULL
+        //   [18] IN_SHIFTDIR    [19] OUT_SHIFTDIR  (0=left, 1=right)
+        //   [20:24] PUSH_THRESH (0 means 32, otherwise N)
+        //   [25:29] PULL_THRESH (0 means 32, otherwise N)
+        // PIO0 firmware uses autopush at threshold 18 (10 addr + 8 data).
+        let sc = emu.bus.read32(base + 0x08);
+        let autopush = (sc >> 16) & 1;
+        let autopull = (sc >> 17) & 1;
+        let in_shiftdir = (sc >> 18) & 1;
+        let out_shiftdir = (sc >> 19) & 1;
+        let push_thresh_raw = (sc >> 20) & 0x1F;
+        let pull_thresh_raw = (sc >> 25) & 0x1F;
+        let push_thresh = if push_thresh_raw == 0 { 32 } else { push_thresh_raw };
+        let pull_thresh = if pull_thresh_raw == 0 { 32 } else { pull_thresh_raw };
+        println!(
+            "       SHIFTCTRL: 0x{:08x}  AUTOPUSH={} PUSH_THRESH={}  AUTOPULL={} PULL_THRESH={}  IN_SHIFTDIR={} OUT_SHIFTDIR={}",
+            sc, autopush, push_thresh, autopull, pull_thresh, in_shiftdir, out_shiftdir
+        );
+    }
+
+    // PIO0 pad_out / pad_oe — if PIO0 is driving GPIO 4 as an output
+    // (pad_oe bit 4 set), the WAIT 1 / WAIT 0 IOW pattern is being
+    // shorted by PIO0 itself, and the harness override gets ignored
+    // upstream of PIO's view of gpio_in (PIO sees its own pad_out
+    // merged in). Bit 4 highlight is the smoking gun for that case.
+    let p0_pad_oe = emu.bus.pio[0].pad_oe;
+    let p0_pad_out = emu.bus.pio[0].pad_out;
+    let p0_drives_iow = (p0_pad_oe >> 4) & 1 != 0;
+    println!();
+    println!("--- Diag: PIO0 pad state ---");
+    println!(
+        "PIO0 pad_oe:      0x{:08x}  bit4(IOW)={} {}",
+        p0_pad_oe,
+        (p0_pad_oe >> 4) & 1,
+        if p0_drives_iow {
+            "*** PIO0 driving IOW as output — conflicts with harness override ***"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "PIO0 pad_out:     0x{:08x}  bit4(IOW)={}",
+        p0_pad_out,
+        (p0_pad_out >> 4) & 1,
+    );
+
+    // SIO GPIO at bit 4 — the harness expects SIO not to be driving IOW
+    // (SDK firmware should leave the pad SIO-disabled / OE=0). If SIO is
+    // driving IOW high, the merged value before the override would also
+    // be high, but the override step in `update_gpio` should still win.
+    let sio_oe4 = (emu.bus.sio.gpio_oe >> 4) & 1;
+    let sio_out4 = (emu.bus.sio.gpio_out >> 4) & 1;
+    println!();
+    println!("--- Diag: SIO GPIO 4 ---");
+    println!(
+        "SIO gpio_oe[4]:   {}    SIO gpio_out[4]:  {}",
+        sio_oe4, sio_out4
+    );
+
+    // External override sanity check — if the harness has dropped its
+    // override before this point (e.g. by hitting reset()), `gpio_in`
+    // has nothing forcing IOW low and the WAIT 0 GPIO 4 will sit
+    // forever. Confirm both mask and override level for bit 4.
+    let ext_mask4 = (emu.bus.external_gpio_in_mask >> 4) & 1;
+    let ext_ovr4 = (emu.bus.external_gpio_in_override >> 4) & 1;
+    println!(
+        "ext mask[4]:      {}    ext override[4]:  {}    (full mask=0x{:08x} override=0x{:08x})",
+        ext_mask4,
+        ext_ovr4,
+        emu.bus.external_gpio_in_mask,
+        emu.bus.external_gpio_in_override,
+    );
+
+    // PIO ticks vs IOW-low ticks — the smoking gun. If
+    // pio_tick_iow_low_count == 0 across the whole run, PIO never
+    // observed IOW asserted low and the bug is upstream (override
+    // merge order, harness sequencing, etc.). If non-zero, PIO did see
+    // IOW low and the bug is inside the PIO program / decode itself.
+    println!();
+    println!("--- Diag: PIO tick counters (slow path only) ---");
+    println!("PIO ticks total:           {}", emu.pio_tick_count);
+    println!(
+        "PIO ticks with IOW low:    {}  ({:.4}%)",
+        emu.pio_tick_iow_low_count,
+        if emu.pio_tick_count > 0 {
+            100.0 * emu.pio_tick_iow_low_count as f64 / emu.pio_tick_count as f64
+        } else {
+            0.0
+        }
+    );
+
+    // Triage matrix for the SM0 sample-at-PC=11 question:
+    //   max_pc <= 0x0B && advances ≈ 1 → genuinely stuck on WAIT 0
+    //   max_pc >  0x0B && autopushes > 0 → SM is running; bug is downstream
+    //   max_pc >  0x0B && autopushes == 0 → SM cleared the WAIT but
+    //                                        stalls before IN PINS lands
+    let sm0_autopush = emu.bus.pio[0].sm[0].autopush_count;
+    println!(
+        "PIO0 SM0 max PC:           0x{:02x}",
+        emu.pio0_sm0_max_pc
+    );
+    println!(
+        "PIO0 SM0 PC advances:      {}",
+        emu.pio0_sm0_pc_advances
+    );
+    println!("PIO0 SM0 autopushes:       {}", sm0_autopush);
+
     // Persist the captured audio. Reject directories and create any
     // missing parent dirs (handled inside `write_wav`).
     let inferred_rate = capture.inferred_sample_rate_hz();

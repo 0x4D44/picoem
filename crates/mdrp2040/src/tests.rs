@@ -2631,6 +2631,100 @@ mod phase1_wave1 {
         assert!(!emu.bus.nvics[0].is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
             "INT0_INTF bit 0 must NOT bleed into NVIC #8 (PIO0_IRQ_1)");
     }
+
+    /// Regression: PicoGUS PIO0 SM0 (IOW capture) program is
+    ///   slot 0: WAIT 1 GPIO 4
+    ///   slot 1: WAIT 0 GPIO 4
+    ///   slot 2: IRQ 0
+    ///   slot 3: JMP 0
+    /// driven by toggling GPIO 4 via `external_gpio_in_mask` / `_override`
+    /// (the same mechanism `picogus_diff_rp2040::Emulator::drive_pins`
+    /// uses). After driving IOW high then low, SM0 should advance past
+    /// both WAITs and execute IRQ 0, raising IRQ flag bit 0. This test
+    /// is the RED-phase reproducer for the bug where SM0 latches the
+    /// HIGH transition but never advances past WAIT 0 when IOW is then
+    /// driven low through the override path.
+    #[test]
+    fn pio0_sm0_catches_external_gpio_iow_low_after_high() {
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+
+        // Park core 0 on a NOP at 0x2000_1000 so step() always has
+        // somewhere to fetch and never faults the CPU side.
+        emu.bus.write16(0x2000_1000, 0xBF00);
+        emu.cores[0].regs.set_pc(0x2000_1000);
+        emu.cores[0].regs.msp = 0x2002_0000;
+        emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
+
+        // Load SM0's instruction memory at INSTR_MEM[0..3]
+        // (PIO0_BASE + 0x048 + slot*4). Each instruction is a 16-bit
+        // PIO opcode written into the low 16 bits of the 32-bit slot.
+        let prog: [u16; 4] = [
+            0x2084, // slot 0: WAIT 1 GPIO 4
+            0x2004, // slot 1: WAIT 0 GPIO 4
+            0xC000, // slot 2: IRQ 0 (I=0, C=0, W=0, IRQ index 0)
+            0x0000, // slot 3: JMP 0
+        ];
+        for (i, insn) in prog.iter().enumerate() {
+            emu.bus
+                .write32(PIO0_BASE + 0x048 + (i as u32) * 4, *insn as u32);
+        }
+
+        // SM0_EXECCTRL (PIO0_BASE + 0x0CC): wrap_top=3 (bits 16:12),
+        // wrap_bottom=0 (bits 11:7) — wrap whole 4-instruction program.
+        emu.bus.write32(PIO0_BASE + 0x0CC, 3u32 << 12);
+        // SM0_CLKDIV (PIO0_BASE + 0x0C8): integer=1, fraction=0 →
+        // 0x0001_0000 (one PIO cycle per system cycle).
+        emu.bus.write32(PIO0_BASE + 0x0C8, 0x0001_0000);
+        // CTRL (PIO0_BASE + 0x000): SM_ENABLE bit 0 → enable SM0.
+        emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+
+        // ---- Drive IOW high via the harness's external override path ----
+        // This is the exact same pattern `Emulator::drive_pins` uses
+        // (picogus_diff_rp2040.rs:349-365): set the mask to mark which
+        // bits the harness owns, the override to the desired value, and
+        // mirror into `gpio_in` so reads between drive_pins() and the
+        // next step() observe the asserted line.
+        emu.bus.external_gpio_in_mask = 1u32 << 4;
+        emu.bus.external_gpio_in_override = 1u32 << 4;
+        emu.bus.gpio_in = (emu.bus.gpio_in & !emu.bus.external_gpio_in_mask)
+            | (emu.bus.external_gpio_in_override & emu.bus.external_gpio_in_mask);
+
+        // Step ~20 sysclk cycles. SM0 should catch WAIT 1 GPIO 4 and
+        // advance from PC=0 to PC=1 (WAIT 0 GPIO 4).
+        for _ in 0..20 {
+            emu.step();
+        }
+
+        // ---- Drive IOW low ----
+        // Keep the mask (the harness still owns the pin), drop the
+        // override, and mirror into gpio_in.
+        emu.bus.external_gpio_in_override = 0;
+        emu.bus.gpio_in &= !(1u32 << 4);
+
+        // Step ~20 sysclk cycles. SM0 should catch WAIT 0 GPIO 4,
+        // advance to slot 2 (IRQ 0), execute it (raising flag bit 0),
+        // then advance to slot 3 (JMP 0) and wrap back to slot 0.
+        for _ in 0..20 {
+            emu.step();
+        }
+
+        // SM0_ADDR is at PIO0_BASE + 0x0D4 (per RP2040 datasheet
+        // §3.7 PIO register map). After IRQ 0 + JMP 0 + wrap, PC is
+        // back at 0 (or 1 if it caught WAIT 1 again on the wrap).
+        let sm0_pc = emu.bus.read32(PIO0_BASE + 0x0D4);
+
+        assert!(
+            emu.bus.pio[0].pending_irqs() & 0x01 != 0,
+            "PIO IRQ flag 0 not set — PIO never advanced past WAIT 0 \
+             (SM0 PC = {})",
+            sm0_pc
+        );
+        assert!(
+            sm0_pc <= 1,
+            "After IRQ 0 + JMP 0 + wrap, SM0 PC must be 0 or 1 (got {})",
+            sm0_pc
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

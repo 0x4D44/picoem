@@ -487,3 +487,129 @@ fn emulator_reset_clears_pio_state() {
     assert_eq!(emu.bus.pio[1].pad_oe, 0,
         "reset() must also reset PIO1");
 }
+
+#[test]
+fn pio0_sm0_autopush_at_threshold_18() {
+    // Reproducer for the PicoGUS autopush regression (Stage 3 of the
+    // PicoGUS bring-up): firmware loads a PIO program that does
+    //   addr 0: IN PINS, 10   (samples 10-bit ISA address)
+    //   addr 1: IN PINS, 8    (samples 8-bit ISA data)
+    //   addr 2: JMP 0
+    // with SHIFTCTRL.AUTOPUSH=1 and PUSH_THRESH=18. Real silicon pushes
+    // the combined 18-bit ISR into the RX FIFO after the second IN.
+    // Our model: across 3.73M SM0 PC advances in the harness run,
+    // autopush_count stayed at 0 — which means either the autopush
+    // trigger isn't firing or the IN PINS path isn't reaching it.
+    //
+    // This test isolates exactly that path with no ISA waveform, no
+    // boot path, no other SMs — just the IN/IN/JMP loop and a
+    // controlled GPIO pattern.
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+
+    // PIO0 instruction memory.
+    let in_pins_10: u16 = 0x400A; // IN PINS, 10  (010 00000 000 01010)
+    let in_pins_8:  u16 = 0x4008; // IN PINS, 8   (010 00000 000 01000)
+    let jmp_0:      u16 = 0x0000; // JMP 0
+    for (i, insn) in [in_pins_10, in_pins_8, jmp_0].iter().enumerate() {
+        emu.bus.write32(PIO0_BASE + 0x048 + (i as u32) * 4, *insn as u32);
+    }
+
+    // SM0_SHIFTCTRL @ +0x0D0:
+    //   bit 16 AUTOPUSH = 1
+    //   bit 18 IN_SHIFTDIR = 0  (shift left)
+    //   bits 24:20 PUSH_THRESH = 18
+    let shiftctrl = (1u32 << 16) | (18u32 << 20);
+    emu.bus.write32(PIO0_BASE + 0x0D0, shiftctrl);
+
+    // SM0_PINCTRL @ +0x0DC: IN_BASE=6 (bits 19:15).
+    emu.bus.write32(PIO0_BASE + 0x0DC, 6u32 << 15);
+
+    // SM0_EXECCTRL @ +0x0CC: wrap_top=2, wrap_bottom=0.
+    emu.bus.write32(PIO0_BASE + 0x0CC, (2u32 << 12) | (0u32 << 7));
+
+    // SM0_CLKDIV @ +0x0C8: 1.0 (one PIO cycle per system clock).
+    emu.bus.write32(PIO0_BASE + 0x0C8, 0x0001_0000);
+
+    // Park core 0 on a NOP loop so PIO ticks once per emu.step().
+    park_core0_on_nops(&mut emu);
+
+    // Drive GPIO 6..15 with the address pattern (0x123 in those 10 bits).
+    // `read_pins` does `gpio_in.rotate_right(in_base)` then masks low 10
+    // bits, so we shift the value LEFT by IN_BASE=6 to land it in the
+    // right pins.
+    let addr_pattern: u32 = 0x123u32 << 6;
+    let data_pattern: u32 = 0xABu32 << 6;
+    let pin_mask_10: u32 = 0x3FFu32 << 6; // GPIO 6..15
+    emu.bus.external_gpio_in_mask = pin_mask_10;
+    emu.bus.external_gpio_in_override = addr_pattern;
+    // The slow-path inner loop ticks PIO with the *current* `bus.gpio_in`
+    // BEFORE running update_gpio (lib.rs Emulator::step). Pre-load
+    // gpio_in directly so the first PIO tick observes the address
+    // pattern instead of the post-builder zero state.
+    emu.bus.gpio_in = (emu.bus.gpio_in & !pin_mask_10) | (addr_pattern & pin_mask_10);
+
+    // Enable SM0 (CTRL.SM_ENABLE bit 0).
+    emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+
+    // Step 1: IN PINS, 10 — ISR <<= 10; ISR |= addr (=0x123); isr_count=10.
+    // No autopush yet (10 < 18).
+    emu.step();
+    assert_eq!(
+        emu.bus.pio[0].sm[0].isr_shift_count(),
+        10,
+        "isr_count must be 10 after first IN PINS, 10"
+    );
+    assert_eq!(
+        emu.bus.pio[0].sm[0].isr_value(),
+        0x123,
+        "ISR must hold the 10-bit address pattern after first IN"
+    );
+    assert_eq!(
+        emu.bus.pio[0].sm[0].autopush_count,
+        0,
+        "autopush must not fire at isr_count=10 (threshold=18)"
+    );
+    assert!(
+        emu.bus.pio[0].sm[0].rx_fifo_empty(),
+        "RX FIFO must be empty before threshold"
+    );
+
+    // Switch the GPIO pattern to the data byte (0xAB on the bottom 8 of
+    // GPIO 6..15) before the second IN executes. Pre-load gpio_in for
+    // the same pre-tick reason as before.
+    emu.bus.external_gpio_in_override = data_pattern;
+    emu.bus.gpio_in = (emu.bus.gpio_in & !pin_mask_10) | (data_pattern & pin_mask_10);
+
+    // Step 2: IN PINS, 8 — ISR <<= 8; ISR |= 0xAB; isr_count=18 → autopush.
+    // Combined ISR (left shift): (0x123 << 8) | 0xAB = 0x123AB.
+    emu.step();
+
+    let autopushes = emu.bus.pio[0].sm[0].autopush_count;
+    // FLEVEL @ +0x00C: SM0 TX in low nibble, RX in next nibble.
+    let flevel = emu.bus.read32(PIO0_BASE + 0x00C);
+    let rx_level = (flevel >> 4) & 0xF;
+    assert!(
+        autopushes >= 1,
+        "expected autopush after IN PINS, 10 + IN PINS, 8 (autopush_count={autopushes}, rx_level={rx_level})"
+    );
+    assert!(
+        rx_level >= 1,
+        "RX FIFO must have at least one entry after autopush (level={rx_level})"
+    );
+
+    // Drain RXF0 @ 0x020 and verify the 18-bit pattern. Per RP2040
+    // datasheet §3.6.4, IN with shift-left places the most-recently
+    // read bits at the LSB end of the ISR and existing bits shift up,
+    // so the final 32-bit ISR is just the 18-bit value 0x123AB packed
+    // into the low bits — no padding shift on push (real silicon
+    // pushes the ISR contents verbatim regardless of isr_count).
+    let popped = emu.bus.read32(PIO0_BASE + 0x020);
+    assert_eq!(
+        popped, 0x123AB,
+        "RX FIFO contents must match (addr<<8)|data = 0x123AB, got 0x{popped:05X}"
+    );
+    assert!(
+        emu.bus.pio[0].sm[0].rx_fifo_empty(),
+        "FIFO drained after read"
+    );
+}
