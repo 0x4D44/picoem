@@ -95,6 +95,10 @@ pub struct PeriphScenario {
     /// of auto-assembling a countdown. Bytes must end in `bkpt #0`
     /// (`0xBE00`). Existing scenarios leave this `None`.
     pub custom_sled: Option<&'static [u8]>,
+    /// Soft lower bound on sysclks. If the emulator completes in fewer
+    /// cycles than this, a WARNING is printed but the scenario is NOT
+    /// failed (V5 §4 / §7). 0 = no minimum.
+    pub min_sysclks: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +730,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_PIO0_NOP_LOOP,
         observe_pins: 0,
         custom_sled: None,
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "pio0_fixed_cycles",
@@ -734,6 +739,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_PIO0_FIXED_CYCLES,
         observe_pins: 0,
         custom_sled: None,
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "pio0_side_set_toggle",
@@ -742,6 +748,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_PIO0_SIDE_SET_TOGGLE,
         observe_pins: 0x0000_0001,
         custom_sled: None,
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "pio0_reset_gating_placeholder",
@@ -750,6 +757,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_PIO0_RESET_GATING_PLACEHOLDER,
         observe_pins: 0,
         custom_sled: None,
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "pll_sys_lock_timing",
@@ -758,6 +766,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_PLL_SYS_LOCK_TIMING,
         observe_pins: 0,
         custom_sled: None,
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "clock_pll_sys_reprogram_mid_run",
@@ -766,6 +775,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_CLOCK_PLL_SYS_REPROGRAM_MID_RUN,
         observe_pins: 0,
         custom_sled: Some(SLED_CLOCK_PLL_SYS_REPROGRAM_MID_RUN),
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "clock_div_change_pio_running",
@@ -774,6 +784,7 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_CLOCK_DIV_CHANGE_PIO_RUNNING,
         observe_pins: 0,
         custom_sled: Some(SLED_CLOCK_DIV_CHANGE_PIO_RUNNING),
+        min_sysclks: 0,
     },
     // Phase 1 B1: TIMER0 alarm-fire + W1C-clear scenario (HLD V5 §6
     // Phase 1 exit). Sled reads TIMELR, arms ALARM_0 at +1000 µs,
@@ -793,6 +804,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_TIMER0_ALARM0_FIRE_AND_CLEAR,
         observe_pins: 0,
         custom_sled: Some(SLED_TIMER0_ALARM0_FIRE_AND_CLEAR),
+        // 1000 us alarm with CYCLES=12 -> 12_000 sys_clks minimum.
+        min_sysclks: 12_000,
     },
     // Phase 1 B2: TICKS retarget — verify TIMER0 advances at ~half
     // rate after CYCLES doubles 12 → 24 (HLD V5 §6 Phase 1 exit).
@@ -805,6 +818,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_TICKS_TIMER0_RETARGET,
         observe_pins: 0,
         custom_sled: Some(SLED_TICKS_TIMER0_RETARGET),
+        // Sled spin-waits ~2400 sys_clks after retarget.
+        min_sysclks: 2_400,
     },
     // Phase 2 — UART0 single-byte TX (V5 §6 row 2).
     PeriphScenario {
@@ -814,6 +829,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_UART0_TX_SINGLE_BYTE,
         observe_pins: 0,
         custom_sled: None,
+        // 1 byte at 115200 baud ~ 87 us; at 150 MHz ~ 13_000 sys_clks.
+        min_sysclks: 10_000,
     },
     // Phase 2 — SPI0 loopback round-trip.
     PeriphScenario {
@@ -823,6 +840,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_SPI0_LOOPBACK_SINGLE_BYTE,
         observe_pins: 0,
         custom_sled: None,
+        // 8-bit SPI transfer at prescaler divider -> ~16 sys_clks minimum.
+        min_sysclks: 16,
     },
     // Phase 2 — I2C0 bus scan NACK on a reserved address (0x7F).
     PeriphScenario {
@@ -832,6 +851,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_I2C0_BUS_SCAN_NACK,
         observe_pins: 0,
         custom_sled: None,
+        // I2C START + 7-bit addr + R/W + NACK -> ~9 bit periods.
+        min_sysclks: 20,
     },
     // Phase 2 — ADC one-shot conversion.
     PeriphScenario {
@@ -841,6 +862,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_ADC_ONE_SHOT,
         observe_pins: 0,
         custom_sled: None,
+        // ADC conversion takes ~96 clk_adc cycles.
+        min_sysclks: 96,
     },
     // Phase 2 — PWM slice-0 wrap IRQ latch.
     PeriphScenario {
@@ -850,6 +873,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_PWM_WRAP_IRQ,
         observe_pins: 0,
         custom_sled: None,
+        // PWM counter must wrap at least once.
+        min_sysclks: 2,
     },
     // Phase 3 — DMA mem-to-mem 32-bit, 4 words (V5 §5.6).
     PeriphScenario {
@@ -859,6 +884,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_DMA_MEM_TO_MEM_32BIT,
         observe_pins: 0,
         custom_sled: None,
+        // 4-word DMA transfer -> at least 4 bus cycles.
+        min_sysclks: 4,
     },
     // Phase 3 — DMA chain trigger: ch0 → ch1 (V5 §5.6).
     PeriphScenario {
@@ -868,6 +895,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_DMA_CHAIN_TRIGGER,
         observe_pins: 0,
         custom_sled: None,
+        // Two chained DMA transfers -> at least 8 bus cycles.
+        min_sysclks: 8,
     },
 ];
 
@@ -1146,6 +1175,7 @@ pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
         observe: O_RED_UART1_FR_UNMODELLED,
         observe_pins: 0,
         custom_sled: None,
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "red_trng_imr_unmodelled",
@@ -1154,6 +1184,7 @@ pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
         observe: O_RED_TRNG_IMR_UNMODELLED,
         observe_pins: 0,
         custom_sled: None,
+        min_sysclks: 0,
     },
     PeriphScenario {
         name: "red_sha256_csr_wfifo_ready_unmodelled",
@@ -1162,6 +1193,7 @@ pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
         observe: O_RED_SHA256_CSR_UNMODELLED,
         observe_pins: 0,
         custom_sled: None,
+        min_sysclks: 0,
     },
 ];
 
@@ -1471,6 +1503,15 @@ pub fn run_scenario(
         emu.run(actual_sysclks as u64);
     }
     gate_peripheral_emu(&mut emu, sc.name);
+
+    // V5 §4 soft-window: warn if the scenario completed implausibly fast.
+    if sc.min_sysclks > 0 && actual_sysclks < sc.min_sysclks {
+        println!(
+            "    WARNING scenario '{}': completed implausibly fast \
+             ({} sysclks < min_sysclks {})",
+            sc.name, actual_sysclks, sc.min_sysclks,
+        );
+    }
 
     let emu_obs: Vec<u32> =
         sc.observe.iter().map(|(addr, _m)| emu.mmio_read32(*addr)).collect();
@@ -2121,6 +2162,63 @@ mod tests {
                 sc.name,
             );
         }
+    }
+
+    // ---- min_sysclks soft-window (V5 §4) --------------------------------
+
+    /// `min_sysclks <= max_sysclks` for every scenario in both catalogues.
+    #[test]
+    fn test_min_sysclks_le_max_sysclks() {
+        for sc in SCENARIOS.iter().chain(RED_PATH_SCENARIOS.iter()) {
+            assert!(
+                sc.min_sysclks <= sc.max_sysclks,
+                "'{}' min_sysclks {} > max_sysclks {}",
+                sc.name, sc.min_sysclks, sc.max_sysclks,
+            );
+        }
+    }
+
+    /// When `min_sysclks > 0` and `actual < min_sysclks`, the warning
+    /// fires. This test checks the condition directly (the println in
+    /// `run_scenario` cannot be captured without a real probe session).
+    #[test]
+    fn test_min_sysclks_warning_fires_when_below() {
+        let sc = PeriphScenario {
+            name: "synth_fast",
+            setup: &[],
+            max_sysclks: 200,
+            observe: &[],
+            observe_pins: 0,
+            custom_sled: None,
+            min_sysclks: 100,
+        };
+        let actual_sysclks: u32 = 50;
+        // Condition mirrors `run_scenario`'s guard.
+        assert!(
+            sc.min_sysclks > 0 && actual_sysclks < sc.min_sysclks,
+            "expected warning condition to trigger for actual={} < min={}",
+            actual_sysclks, sc.min_sysclks,
+        );
+    }
+
+    /// When `min_sysclks == 0`, the warning condition never fires
+    /// regardless of `actual_sysclks`.
+    #[test]
+    fn test_min_sysclks_zero_no_warning() {
+        let sc = PeriphScenario {
+            name: "synth_no_min",
+            setup: &[],
+            max_sysclks: 200,
+            observe: &[],
+            observe_pins: 0,
+            custom_sled: None,
+            min_sysclks: 0,
+        };
+        let actual_sysclks: u32 = 0;
+        assert!(
+            !(sc.min_sysclks > 0 && actual_sysclks < sc.min_sysclks),
+            "min_sysclks=0 must never trigger the warning",
+        );
     }
 
     /// Drive every red-path scenario through the same EMU-side
