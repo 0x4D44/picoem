@@ -32,30 +32,35 @@ impl AtomicGpio {
     /// Read the full 32-bit OUT register for `bank` (0 or 1).
     #[inline]
     pub fn read_out(&self, bank: usize) -> u32 {
+        debug_assert!(bank < 2);
         self.out[bank].load(Relaxed)
     }
 
     /// Overwrite the full 32-bit OUT register for `bank`.
     #[inline]
     pub fn write_out(&self, bank: usize, val: u32) {
+        debug_assert!(bank < 2);
         self.out[bank].store(val, Relaxed);
     }
 
     /// SET: `out[bank] |= mask`.
     #[inline]
     pub fn set_out(&self, bank: usize, mask: u32) {
+        debug_assert!(bank < 2);
         self.out[bank].fetch_or(mask, Relaxed);
     }
 
     /// CLR: `out[bank] &= !mask`.
     #[inline]
     pub fn clear_out(&self, bank: usize, mask: u32) {
+        debug_assert!(bank < 2);
         self.out[bank].fetch_and(!mask, Relaxed);
     }
 
     /// XOR: `out[bank] ^= mask`.
     #[inline]
     pub fn xor_out(&self, bank: usize, mask: u32) {
+        debug_assert!(bank < 2);
         self.out[bank].fetch_xor(mask, Relaxed);
     }
 
@@ -64,30 +69,35 @@ impl AtomicGpio {
     /// Read the full 32-bit OE register for `bank` (0 or 1).
     #[inline]
     pub fn read_oe(&self, bank: usize) -> u32 {
+        debug_assert!(bank < 2);
         self.oe[bank].load(Relaxed)
     }
 
     /// Overwrite the full 32-bit OE register for `bank`.
     #[inline]
     pub fn write_oe(&self, bank: usize, val: u32) {
+        debug_assert!(bank < 2);
         self.oe[bank].store(val, Relaxed);
     }
 
     /// SET: `oe[bank] |= mask`.
     #[inline]
     pub fn set_oe(&self, bank: usize, mask: u32) {
+        debug_assert!(bank < 2);
         self.oe[bank].fetch_or(mask, Relaxed);
     }
 
     /// CLR: `oe[bank] &= !mask`.
     #[inline]
     pub fn clear_oe(&self, bank: usize, mask: u32) {
+        debug_assert!(bank < 2);
         self.oe[bank].fetch_and(!mask, Relaxed);
     }
 
     /// XOR: `oe[bank] ^= mask`.
     #[inline]
     pub fn xor_oe(&self, bank: usize, mask: u32) {
+        debug_assert!(bank < 2);
         self.oe[bank].fetch_xor(mask, Relaxed);
     }
 

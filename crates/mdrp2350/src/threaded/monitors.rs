@@ -37,16 +37,19 @@ impl ExclusiveMonitors {
     /// Mark a reservation. `addr` should be a SRAM bus address;
     /// encoding normalizes to word-aligned offset.
     pub fn set(&self, core: usize, addr: u32) {
+        debug_assert!(core < 2);
         self.monitors[core].store(encode(addr), Relaxed);
     }
 
     /// Clear a reservation (CLREX, exception entry/exit, STREX).
     pub fn clear(&self, core: usize) {
+        debug_assert!(core < 2);
         self.monitors[core].store(0, Relaxed);
     }
 
     /// Check if a reservation is still valid for this address.
     pub fn check(&self, core: usize, addr: u32) -> bool {
+        debug_assert!(core < 2);
         self.monitors[core].load(Relaxed) == encode(addr)
     }
 
@@ -66,6 +69,12 @@ impl ExclusiveMonitors {
         for m in &self.monitors {
             let _ = m.compare_exchange(tag, 0, Relaxed, Relaxed);
         }
+    }
+}
+
+impl Default for ExclusiveMonitors {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

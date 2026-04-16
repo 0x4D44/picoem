@@ -26,13 +26,25 @@ impl SharedMemory {
             xip: Box::new([]),
         }
     }
+}
 
+impl Default for SharedMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedMemory {
     // ---------------------------------------------------------------
     // Address helpers
     // ---------------------------------------------------------------
 
     /// Convert a bus address to a SRAM word index.
     /// Strips SRAM alias bits [27:24] per RP2350 memory map.
+    ///
+    /// Bounds check is word-granular: returns `Some` for any byte within
+    /// a valid SRAM word. Callers should provide aligned addresses for
+    /// multi-byte reads/writes.
     fn sram_idx(addr: u32) -> Option<usize> {
         let region = addr >> 28;
         if region == 0x2 {
@@ -61,6 +73,8 @@ impl SharedMemory {
         if let Some(idx) = Self::sram_idx(addr) {
             self.sram[idx].load(Relaxed)
         } else if addr < ROM_BASE + ROM_SIZE {
+            // ROM_BASE is 0, so addr is used directly as a byte offset.
+            // If ROM_BASE ever changes, subtract base here.
             self.read_rom32(addr)
         } else if addr >= XIP_BASE && ((addr - XIP_BASE) as usize) < self.xip.len() {
             self.read_xip32(addr)
@@ -84,6 +98,8 @@ impl SharedMemory {
             let word = self.sram[idx].load(Relaxed);
             (word >> ((addr & 3) * 8)) as u8
         } else if addr < ROM_BASE + ROM_SIZE {
+            // ROM_BASE is 0, so addr is used directly as a byte offset.
+            // If ROM_BASE ever changes, subtract base here.
             self.rom[addr as usize]
         } else if addr >= XIP_BASE {
             let off = (addr - XIP_BASE) as usize;
@@ -399,6 +415,39 @@ mod tests {
         assert_eq!(mem.read32(0x4000_0000), 0);
         assert_eq!(mem.read16(0x4000_0000), 0);
         assert_eq!(mem.read8(0x4000_0000), 0);
+    }
+
+    #[test]
+    fn rom_read8() {
+        let mut mem = SharedMemory::new();
+        mem.load_rom(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(mem.read8(0x0000_0000), 0x11);
+        assert_eq!(mem.read8(0x0000_0001), 0x22);
+        assert_eq!(mem.read8(0x0000_0002), 0x33);
+        assert_eq!(mem.read8(0x0000_0003), 0x44);
+    }
+
+    #[test]
+    fn rom_read16() {
+        let mut mem = SharedMemory::new();
+        mem.load_rom(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(mem.read16(0x0000_0000), 0x2211); // little-endian
+        assert_eq!(mem.read16(0x0000_0002), 0x4433);
+    }
+
+    #[test]
+    fn xip_read8() {
+        let mut mem = SharedMemory::new();
+        mem.load_xip(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(mem.read8(0x1000_0000), 0xAA);
+        assert_eq!(mem.read8(0x1000_0003), 0xDD);
+    }
+
+    #[test]
+    fn write_out_of_range_sram_is_noop() {
+        let mem = SharedMemory::new();
+        mem.write32(0x2008_2000, 0xDEAD_BEEF); // just past SRAM end
+        assert_eq!(mem.read32(0x2008_2000), 0); // reads back 0
     }
 
     #[test]
