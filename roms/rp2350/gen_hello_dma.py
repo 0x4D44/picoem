@@ -24,7 +24,7 @@ The firmware:
      - TRANS_COUNT = 4
      - CTRL_TRIG: EN=1, DATA_SIZE=2 (word), INCR_READ, INCR_WRITE,
        TREQ_SEL=63 (FORCE), CHAIN_TO=0 (self = no chain)
-  4. Poll CTRL_TRIG bit 24 (BUSY) until clear.
+  4. Poll CTRL_TRIG bit 26 (BUSY) until clear.
   5. Read INTR, write marker to counter cell if INTR bit 0 is set.
   6. BKPT #0 / WFI (halt).
 
@@ -167,7 +167,7 @@ def build_reset_handler():
       r3 — destination address (0x2000_2000)
       r4 — RESETS_RESET_CLR (0x4002_3000)
       r5 — counter cell address (0x2000_3000)
-      r6 — BUSY mask (1 << 24)
+      r6 — BUSY mask (1 << 26)
       r7 — counter scratch
     """
     code = b''
@@ -201,8 +201,8 @@ def build_reset_handler():
     code += thumb_mov_imm32(0, CTRL_TRIG_VALUE)
     code += thumb_str_imm(0, 1, 0x0C)              # [r1+0x0C] = CTRL_TRIG
 
-    # --- Step 4: Poll CTRL_TRIG bit 24 (BUSY) until clear ---
-    code += thumb_mov_imm32(6, 1 << 24)            # r6 = BUSY mask
+    # --- Step 4: Poll CTRL_TRIG bit 26 (BUSY) until clear ---
+    code += thumb_mov_imm32(6, 1 << 26)            # r6 = BUSY mask
     # poll_loop:
     poll_loop_start = len(code)
     code += thumb_ldr_imm(0, 1, 0x0C)              # r0 = [r1+0x0C] (CTRL_TRIG)

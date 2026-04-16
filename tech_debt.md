@@ -1026,3 +1026,17 @@ design for Phase 4 and documented in the relevant DMA module.
   analog subsystem appears fundamentally hostile to halted-core probe
   access.  Recommend gating behind `--include-adc` flag or moving to
   `RED_PATH_SCENARIOS`.
+
+- **`hello_dma.bin` generator drift** — the checked-in binary is generated
+  by `roms/rp2350/gen_hello_dma.py`; any datasheet correction (e.g. the
+  CTRL_BUSY bit-24 → bit-26 fix, 2026-04-16) silently invalidates the blob
+  until the script is updated and regenerated.  Fix candidates: make it a
+  `build.rs` artefact, or add CI that diffs generator output against the
+  committed binary.
+
+- **`#[allow(dead_code)]` on DMA flag constants masks bit-position bugs** —
+  `CTRL_BSWAP`, `CTRL_SNIFF_EN`, `CTRL_HIGH_PRIORITY` in
+  `crates/mdrp2350/src/dma.rs` are stored but ignored.  When promoted to
+  active use in a future phase, the promotion path must include a
+  bit-position assertion test (see `ctrl_busy_is_at_bit_26_not_bit_24` for
+  the pattern).

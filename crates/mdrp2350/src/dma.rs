@@ -772,6 +772,32 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
+    // CTRL_BUSY bit position: must be bit 26, not bit 24 (BSWAP).
+    // Pins the datasheet fix so a silent revert would fail immediately.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn ctrl_busy_is_at_bit_26_not_bit_24() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        bus.write32(DMA_BASE + 0x00, 0x2000_0100);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0200);
+        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x00, 0x2000_0100); // seed source addr
+        // Write a dummy source word.
+        bus.write32(0x2000_0100, 0xA5A5_A5A5);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl); // triggers transfer
+
+        let raw = bus.read32(DMA_BASE + 0x0C);
+        // BUSY must be asserted immediately after CTRL_TRIG write.
+        assert_ne!(raw & (1 << 26), 0, "BUSY is at bit 26");
+        // Bit 24 is BSWAP — must not be set (we did not request byte-swap).
+        assert_eq!(raw & (1 << 24), 0, "bit 24 is BSWAP, not BUSY");
+    }
+
+    // ----------------------------------------------------------------
     // One transfer per tick (mem-to-mem with DREQ_FORCE)
     // ----------------------------------------------------------------
 

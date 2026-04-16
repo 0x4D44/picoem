@@ -92,8 +92,8 @@ const UARTCR_RXE: u32 = 1 << 9;
 const UARTLCR_H_FEN: u32 = 1 << 4;
 
 // --- UARTFR bits ------------------------------------------------------
-/// CTS flag bit in UARTFR (complement of the nUARTCTS modem input pin).
-pub(crate) const UARTFR_CTS: u32 = 1 << 0;
+// bit 0: CTS (complement of nUARTCTS pin) — not hardwired; reads 0 when
+// GPIO17 is not asserted. Removed as a named constant: no non-test callers.
 const UARTFR_BUSY: u32 = 1 << 3;
 const UARTFR_RXFE: u32 = 1 << 4;
 const UARTFR_TXFF: u32 = 1 << 5;
@@ -550,7 +550,7 @@ mod tests {
     fn fr_cts_is_zero_at_reset_not_hardwired_high() {
         let mut u = UartRegs::new(UART0_IRQ);
         let fr = u.read32(UARTFR);
-        assert_eq!(fr & UARTFR_CTS, 0, "CTS must be 0 (not hardwired high)");
+        assert_eq!(fr & (1 << 0), 0, "CTS (bit 0) must be 0 (not hardwired high)");
     }
 
     /// Replicates the `uart0_rx_loopback` silicon scenario: configure
