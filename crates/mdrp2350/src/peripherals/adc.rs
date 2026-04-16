@@ -200,17 +200,31 @@ impl AdcRegs {
 
     /// Deterministic 12-bit sample for a given channel. Firmware needs
     /// non-zero, varying data without a modelled analog frontend.
+    ///
+    /// Returns a raw 12-bit result (bits [11:0] only). The caller is
+    /// responsible for packing this into the hardware FIFO format
+    /// `ERR[15]:AINSEL[14:12]:RESULT[11:0]`.
     #[inline]
     fn make_sample(&self, channel: u32) -> u16 {
         let payload = ((channel & 0xF) << 8) | (self.conversion_counter & 0xFF);
         (payload & 0xFFF) as u16
     }
 
+    /// Pack a raw 12-bit sample into the hardware FIFO word format:
+    /// `ERR[15]:AINSEL[14:12]:RESULT[11:0]` (datasheet §12.4.5 FIFO
+    /// register). ERR is always 0 (no error modelling).
+    #[inline]
+    fn hw_fifo_word(channel: u32, raw_sample: u16) -> u16 {
+        ((channel as u16 & 0x7) << 12) | (raw_sample & 0xFFF)
+    }
+
     /// Fire a single completed conversion.
     fn complete_conversion(&mut self) -> bool {
         let ch = self.ainsel();
-        let sample = self.make_sample(ch);
-        self.last_sample = sample;
+        let raw = self.make_sample(ch);
+        let hw_word = Self::hw_fifo_word(ch, raw);
+        // RESULT register holds the raw 12-bit sample (datasheet §12.4.2).
+        self.last_sample = raw;
         self.conversion_counter = self.conversion_counter.wrapping_add(1);
         self.cs |= CS_READY;
 
@@ -219,10 +233,22 @@ impl AdcRegs {
             if self.fifo.len() >= ADC_FIFO_DEPTH {
                 self.fcs |= FCS_OVER;
             } else {
-                self.fifo.push_back(sample);
+                self.fifo.push_back(hw_word);
                 fifo_edge = true;
             }
         }
+
+        // Round-robin channel advancement (datasheet §12.4.3 CS.RROBIN).
+        let rrobin = (self.cs & CS_RROBIN_MASK) >> CS_RROBIN_SHIFT;
+        if rrobin != 0 {
+            let current = ch;
+            let mut next = (current + 1) % 5; // 5 ADC channels on RP2350
+            while rrobin & (1 << next) == 0 {
+                next = (next + 1) % 5;
+            }
+            self.cs = (self.cs & !CS_AINSEL_MASK) | (next << CS_AINSEL_SHIFT);
+        }
+
         self.cs &= !CS_START_ONCE;
         self.conversion_remaining = None;
         fifo_edge

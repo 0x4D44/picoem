@@ -805,6 +805,8 @@ const ADC_CS_READY_BIT: u32 = 1 << 8;
 /// 0x14), plus global EN/INTR at `+0xF0` / `+0xF4`.
 pub const PWM_BASE_RP2350: u32 = 0x400A_8000;
 const PWM_SLICE0_CSR: u32 = PWM_BASE_RP2350 + 0x00;
+const PWM_SLICE0_DIV: u32 = PWM_BASE_RP2350 + 0x04;
+const PWM_SLICE0_CTR: u32 = PWM_BASE_RP2350 + 0x08;
 const PWM_SLICE0_TOP: u32 = PWM_BASE_RP2350 + 0x10;
 const PWM_EN_OFFSET: u32 = PWM_BASE_RP2350 + 0xF0;
 const PWM_INTR_OFFSET: u32 = PWM_BASE_RP2350 + 0xF4;
@@ -901,6 +903,61 @@ const S_PWM_WRAP_IRQ: &[(u32, u32)] = &[
 ];
 const O_PWM_WRAP_IRQ: &[(u32, u32)] = &[
     (PWM_INTR_OFFSET, 0x1),
+];
+
+/// Phase 3.2 — PWM fractional divider: slice 0, TOP=0xFFFF, DIV=0x0020
+/// (integer 2, frac 0 = divisor 2.0), EN=1. After 200 sys_clks the
+/// counter should advance by 100 (200/2). No wrap expected at TOP=0xFFFF.
+const S_PWM_FRACTIONAL_DIV: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (PWM_SLICE0_TOP, 0xFFFF),
+    (PWM_SLICE0_DIV, 0x0020), // INT=2, FRAC=0 -> divisor 2.0
+    (PWM_SLICE0_CSR, PWM_CSR_EN_BIT),
+    (PWM_EN_OFFSET, 1),
+];
+const O_PWM_FRACTIONAL_DIV: &[(u32, u32)] = &[
+    (PWM_SLICE0_CTR, 100), // 200 sysclks / divisor 2.0 = 100
+    (PWM_INTR_OFFSET, 0x0), // no wrap at TOP=0xFFFF
+];
+
+// Phase 3.1 — ADC round-robin 2-channel. RROBIN = 0x03 (ch0 + ch1),
+// EN + START_MANY, FCS with SHIFT + EN. After ≥ 2 conversions (~600
+// sys_clks at 150 MHz / 48 MHz ADC × 96 ticks/conversion), AINSEL
+// should have advanced from ch0 to ch1 or wrapped back. Observable:
+// CS register masked to AINSEL bits [14:12] (0x7000). We do NOT
+// observe FIFO contents — floating pin noise on silicon makes the raw
+// sample values non-deterministic.
+//
+// GPIO26 pad setup mirrors `adc_one_shot`: disable digital input buffer
+// (OD=1, IE=0) and set funcsel=31 (NULL/ADC) to avoid the silicon APB
+// bus lockup that occurs when the ADC samples while a digital input
+// driver is active on the same pad.
+/// ADC FCS register (ADC_BASE + 0x08).
+const ADC_FCS_RP2350: u32 = ADC_BASE + 0x08;
+/// CS value: EN=1, START_MANY=1, RROBIN bits [20:16] = 0x03 (ch0+ch1).
+const ADC_CS_RROBIN_2CH: u32 = CS_EN_BIT | (1 << 3) | (0x03 << 16);
+/// FCS value: EN=1, SHIFT=1.
+const ADC_FCS_SHIFT_EN: u32 = 0x03;
+/// CS.AINSEL mask — bits [14:12].
+const ADC_CS_AINSEL_MASK: u32 = 0x7000;
+
+const S_ADC_ROUND_ROBIN_2CH: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    // GPIO26 pad: OD=1, IE=0 (disable digital input buffer for ADC).
+    (PADS_BANK0_GPIO26, 0x96),
+    // GPIO26 funcsel = NULL (31) — route pin to ADC, not digital fabric.
+    (IO_BANK0_GPIO26_CTRL, 31),
+    // Enable FIFO with SHIFT.
+    (ADC_FCS_RP2350, ADC_FCS_SHIFT_EN),
+    // Enable ADC with round-robin on channels 0+1 and START_MANY.
+    (ADC_CS_RP2350, ADC_CS_RROBIN_2CH),
+];
+const O_ADC_ROUND_ROBIN_2CH: &[(u32, u32)] = &[
+    // CS masked to AINSEL bits [14:12] only. After 2+ conversions with
+    // RROBIN=0x03, AINSEL must have advanced from the reset default (0).
+    // The exact value depends on how many conversions completed in the
+    // window, but both HW and EMU should agree.
+    (ADC_CS_RP2350, ADC_CS_AINSEL_MASK),
 ];
 
 /// Initial catalog. New scenarios append to the end so filter-by-substring
@@ -1081,6 +1138,17 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         // Two chained DMA transfers -> at least 8 bus cycles.
         min_sysclks: 8,
     },
+    // Phase 3.3 — DMA timer-paced transfer: TREQ_SEL=59 (TIMER0), rate 1/10.
+    PeriphScenario {
+        name: "dma_timer_paced",
+        setup: S_DMA_TIMER_PACED,
+        max_sysclks: 200,
+        observe: O_DMA_TIMER_PACED,
+        observe_pins: 0,
+        custom_sled: None,
+        // 4 transfers at 1/10 rate → at least 40 sysclks.
+        min_sysclks: 40,
+    },
     // Phase 1 Expansion — SIO unsigned divider.
     PeriphScenario {
         name: "sio_divider_unsigned",
@@ -1120,6 +1188,27 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe_pins: 0,
         custom_sled: Some(SLED_TIMER1_ALARM0_FIRE_AND_CLEAR),
         min_sysclks: 12_000,
+    },
+    // Phase 3.2 — PWM fractional divider (divisor 2.0, no wrap).
+    PeriphScenario {
+        name: "pwm_fractional_div",
+        setup: S_PWM_FRACTIONAL_DIV,
+        max_sysclks: 200,
+        observe: O_PWM_FRACTIONAL_DIV,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Phase 3.1 — ADC round-robin 2-channel advancement.
+    PeriphScenario {
+        name: "adc_round_robin_2ch",
+        setup: S_ADC_ROUND_ROBIN_2CH,
+        max_sysclks: 1_000,
+        observe: O_ADC_ROUND_ROBIN_2CH,
+        observe_pins: 0,
+        custom_sled: None,
+        // 2 conversions: 2 × 96 adc ticks × (150/48) sys/adc ≈ 600 sys_clks.
+        min_sysclks: 300,
     },
 ];
 
@@ -1386,6 +1475,48 @@ const O_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
     (0x2000_0700, 0xFFFF_FFFF),
     // INTR bits 0 and 1 must be set.
     (DMA_INTR, 0x0000_0003),
+];
+
+// S_DMA3: DMA timer-paced transfer — TREQ_SEL=59 (TIMER0), rate 1/10.
+// DMA channel 0 performs a 4-word mem-to-mem transfer gated by the
+// DMA-internal TIMER0 (TREQ 59). TIMER0 register = (1 << 16) | 10
+// meaning the accumulator adds 1 per sysclk and fires when it reaches
+// 10, i.e. once every 10 system clocks. Four transfers require ~40
+// sysclks; 200 gives headroom.
+//
+// CTRL_TRIG value breakdown:
+//   bit 0      : EN = 1
+//   bits [3:2] : DATA_SIZE = 2 (word)
+//   bit 4      : INCR_READ = 1
+//   bit 5      : INCR_WRITE = 1
+//   bits [20:15]: TREQ_SEL = 59 (0x3B)
+//   bits [14:11]: CHAIN_TO = 0
+//   → 0x001D_8039
+/// DMA TIMER0 register absolute address (DMA_BASE + 0x420).
+pub const DMA_TIMER0: u32 = DMA_BASE + 0x420;
+const S_DMA_TIMER_PACED: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
+    // Seed source SRAM with 4 words.
+    (0x2000_0A00, 0xCAFE_0001),
+    (0x2000_0A04, 0xCAFE_0002),
+    (0x2000_0A08, 0xCAFE_0003),
+    (0x2000_0A0C, 0xCAFE_0004),
+    // Program DMA TIMER0: X=1, Y=10 → fire every 10 sysclks.
+    (DMA_TIMER0, (1u32 << 16) | 10),
+    // Program DMA ch0.
+    (DMA_BASE + 0x00, 0x2000_0A00),  // READ_ADDR
+    (DMA_BASE + 0x04, 0x2000_0B00),  // WRITE_ADDR
+    (DMA_BASE + 0x08, 4),            // TRANS_COUNT
+    (DMA_BASE + 0x0C, 0x001D_8039),  // CTRL_TRIG (TREQ_SEL=59)
+];
+const O_DMA_TIMER_PACED: &[(u32, u32)] = &[
+    // All 4 destination words must match source.
+    (0x2000_0B00, 0xFFFF_FFFF),
+    (0x2000_0B04, 0xFFFF_FFFF),
+    (0x2000_0B08, 0xFFFF_FFFF),
+    (0x2000_0B0C, 0xFFFF_FFFF),
+    // DMA INTR bit 0 must be set (transfer complete).
+    (DMA_INTR, 0x0000_0001),
 ];
 
 /// Red-path catalogue. Selected by `silicon_periph_diff_rp2350

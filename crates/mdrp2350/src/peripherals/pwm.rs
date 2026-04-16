@@ -36,10 +36,11 @@
 //!
 //! # Counter cadence
 //!
-//! Phase 2 simplification (mirrors RP2040 V7 §5.3 Phase 3): each enabled
-//! slice increments its CTR by 1 per `clk_sys` cycle, ignoring `CH_DIV`.
-//! Good enough for `hello_pwm` corpus wrap-interrupt coverage. Fractional
-//! divider support is future work.
+//! Each enabled slice uses its `CH_DIV` 8.4 fixed-point divider
+//! (INT[11:4]:FRAC[3:0]) to convert `clk_sys` ticks into counter
+//! advances. The O(1) closed-form fractional accumulator avoids
+//! per-cycle iteration. At the reset value DIV=0x0010 (1.0), advance
+//! equals cycles — identical to the Phase 2 simplification.
 
 use mdpicoem_common::clocks::ClockTree;
 
@@ -102,7 +103,7 @@ const CSR_WRITE_MASK: u32 = CSR_EN
 /// `TOP` reset value (datasheet §12.5.2.4): full 16-bit counter range.
 pub const TOP_RESET: u32 = 0xFFFF;
 
-/// `CH_DIV` reset value (16.4 fixed-point 1.0).
+/// `CH_DIV` reset value (8.4 fixed-point (INT[11:4]:FRAC[3:0]) 1.0).
 pub const DIV_RESET: u32 = 0x0010;
 
 /// Mask covering all 12 slice bits.
@@ -119,6 +120,8 @@ pub struct PwmSlice {
     pub ctr: u16,
     pub cc: u32,
     pub top: u16,
+    /// Fractional accumulator for the 8.4 fixed-point divider.
+    pub frac_accum: u16,
 }
 
 impl PwmSlice {
@@ -129,6 +132,7 @@ impl PwmSlice {
             ctr: 0,
             cc: 0,
             top: TOP_RESET as u16,
+            frac_accum: 0,
         }
     }
 }
@@ -304,6 +308,10 @@ impl PwmRegs {
     }
 
     /// Advance the PWM peripheral by `cycles` `clk_sys` ticks.
+    ///
+    /// Each enabled slice uses its `CH_DIV` 8.4 fixed-point divider to
+    /// convert sys_clk ticks into counter advances via an O(1)
+    /// closed-form fractional accumulator.
     pub fn tick(&mut self, cycles: u32, _clock_tree: &ClockTree, irqs: &mut u64) {
         if cycles == 0 {
             self.route_irq(irqs);
@@ -316,12 +324,26 @@ impl PwmRegs {
             if !globally_enabled || !locally_enabled {
                 continue;
             }
+
+            // O(1) fractional accumulator: DIV is 8.4 fixed-point
+            // (INT[11:4]:FRAC[3:0]).
+            let int_part = (slice.div >> 4) as u32;   // INT[11:4]
+            let frac_part = (slice.div & 0xF) as u32; // FRAC[3:0]
+            let total_frac = slice.frac_accum as u32 + frac_part * cycles;
+            let carry = total_frac / 16;
+            slice.frac_accum = (total_frac % 16) as u16;
+            let advance = int_part * cycles + carry;
+
+            if advance == 0 {
+                continue;
+            }
+
             let top = slice.top as u64;
             let period = top + 1;
             let old_ctr = slice.ctr as u64;
-            let new_ctr = (old_ctr + cycles as u64) % period;
+            let new_ctr = (old_ctr + advance as u64) % period;
             let to_first_wrap = period - old_ctr;
-            let wrapped = (cycles as u64) >= to_first_wrap;
+            let wrapped = (advance as u64) >= to_first_wrap;
             slice.ctr = new_ctr as u16;
             if wrapped {
                 self.latch_wrap(slice_idx);

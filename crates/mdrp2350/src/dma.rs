@@ -38,7 +38,7 @@
 //! data phases, but no corpus scenario distinguishes.
 
 use crate::bus::Bus;
-use crate::dreq::DREQ_FORCE;
+use crate::dreq::{DREQ_FORCE, DREQ_TIMER0, DREQ_TIMER3};
 use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1};
 
 /// Total number of DMA channels on RP2350 (datasheet §12.6.1).
@@ -218,6 +218,13 @@ pub struct Dma {
     intf0: u32,
     intf1: u32,
     timer: [u32; 4],
+    /// Fractional accumulators for the four DMA-internal pacing timers
+    /// (TREQ 59..62). Each timer's register is `X[31:16]:Y[15:0]`;
+    /// every `tick()` adds X to the accumulator and fires when it >= Y.
+    timer_accum: [u32; 4],
+    /// One-cycle assertion flags set by the timer accumulator overflow.
+    /// Consumed by the DREQ readiness check during the same `tick()`.
+    timer_dreq_asserted: [bool; 4],
     sniff_ctrl: u32,
     sniff_data: u32,
 }
@@ -239,6 +246,8 @@ impl Dma {
             intf0: 0,
             intf1: 0,
             timer: [0; 4],
+            timer_accum: [0; 4],
+            timer_dreq_asserted: [false; 4],
             sniff_ctrl: 0,
             sniff_data: 0,
         }
@@ -467,6 +476,25 @@ impl Dma {
     /// state changes produced by the transfer don't feed back into
     /// same-cycle DREQ arbitration.
     pub fn tick(&mut self, bus: &mut Bus) {
+        // DMA-internal timers (TREQ 59–62). Format: X[31:16]:Y[15:0],
+        // rate = X/Y of sys_clk. Accumulator fires when accum >= Y.
+        for i in 0..4 {
+            let reg = self.timer[i];
+            let x = (reg >> 16) & 0xFFFF;
+            let y = reg & 0xFFFF;
+            if x == 0 || y == 0 {
+                self.timer_dreq_asserted[i] = false;
+                continue;
+            }
+            self.timer_accum[i] += x;
+            if self.timer_accum[i] >= y {
+                self.timer_accum[i] -= y;
+                self.timer_dreq_asserted[i] = true;
+            } else {
+                self.timer_dreq_asserted[i] = false;
+            }
+        }
+
         let dreqs = bus.collect_dreqs();
         let mut selected: Option<usize> = None;
         for i in 0..NUM_CHANNELS {
@@ -476,6 +504,9 @@ impl Dma {
             }
             let treq = ch.treq_sel();
             let ready = treq == DREQ_FORCE
+                || (treq >= DREQ_TIMER0
+                    && treq <= DREQ_TIMER3
+                    && self.timer_dreq_asserted[(treq - DREQ_TIMER0) as usize])
                 || (treq < 64 && (dreqs >> treq) & 1 != 0);
             if ready {
                 selected = Some(i);
@@ -1185,5 +1216,56 @@ mod tests {
         let bus = Bus::new();
         let dreqs = bus.collect_dreqs();
         assert_ne!(dreqs & (1u64 << 63), 0, "FORCE DREQ must always be set");
+    }
+
+    // ----------------------------------------------------------------
+    // DMA timer pacing: TREQ_SEL=59 (TIMER0), rate X/Y = 1/10
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn dma_timer_paced_transfer() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0800;
+        let dst: u32 = 0x2000_0900;
+        for i in 0..4u32 {
+            bus.write32(src + i * 4, 0xF000_0000 + i);
+        }
+
+        // Program DMA TIMER0: X=1, Y=10 → fires every 10 sysclks.
+        bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 10);
+
+        bus.write32(DMA_BASE + 0x00, src);
+        bus.write32(DMA_BASE + 0x04, dst);
+        bus.write32(DMA_BASE + 0x08, 4);
+        // TREQ_SEL=59 (0x3B) = DREQ_TIMER0
+        let ctrl = make_ctrl(true, 2, true, true, 59, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl);
+
+        // At rate 1/10, the timer fires on tick 10, 20, 30, 40.
+        // After 9 ticks nothing should have transferred.
+        for _ in 0..9 {
+            bus.tick_dma();
+        }
+        assert_eq!(bus.read32(dst), 0, "no transfer before first timer fire");
+        let readback = bus.read32(DMA_BASE + 0x0C);
+        assert_ne!(readback & CTRL_BUSY, 0, "channel must still be BUSY");
+
+        // Tick 10: first timer fire → first transfer.
+        bus.tick_dma();
+        assert_eq!(bus.read32(dst), 0xF000_0000, "first word after tick 10");
+
+        // Complete remaining 3 transfers (30 more ticks).
+        for _ in 0..30 {
+            bus.tick_dma();
+        }
+        for i in 0..4u32 {
+            assert_eq!(bus.read32(dst + i * 4), 0xF000_0000 + i, "word {i}");
+        }
+        // BUSY should be clear, INTR bit 0 set.
+        let readback = bus.read32(DMA_BASE + 0x0C);
+        assert_eq!(readback & CTRL_BUSY, 0, "BUSY must clear after completion");
+        assert_ne!(bus.read32(DMA_BASE + REG_INTR) & 1, 0, "INTR bit 0 must latch");
     }
 }

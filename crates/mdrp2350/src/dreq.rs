@@ -124,6 +124,17 @@ pub const DREQ_CORESIGHT: u8 = 53;
 /// SHA256 (not modelled in V1).
 pub const DREQ_SHA256: u8 = 54;
 
+/// DMA internal timer 0 (`CTRL.TREQ_SEL == 59`). Rate = X/Y per
+/// `DMA.TIMER0` register (bits [31:16] = X, [15:0] = Y). Accumulator
+/// fires when `accum += X` overflows Y.
+pub const DREQ_TIMER0: u8 = 59;
+/// DMA internal timer 1 (`CTRL.TREQ_SEL == 60`).
+pub const DREQ_TIMER1: u8 = 60;
+/// DMA internal timer 2 (`CTRL.TREQ_SEL == 61`).
+pub const DREQ_TIMER2: u8 = 61;
+/// DMA internal timer 3 (`CTRL.TREQ_SEL == 62`).
+pub const DREQ_TIMER3: u8 = 62;
+
 /// FORCE — `CTRL.TREQ_SEL == 63` bypasses the DREQ matrix and always
 /// runs. Used for pure memory-to-memory transfers (`hello_dma`).
 pub const DREQ_FORCE: u8 = 63;
@@ -147,6 +158,10 @@ mod tests {
         assert_eq!(DREQ_I2C0_TX, 44);
         assert_eq!(DREQ_ADC, 48);
         assert_eq!(DREQ_HSTX, 52);
+        assert_eq!(DREQ_TIMER0, 59);
+        assert_eq!(DREQ_TIMER1, 60);
+        assert_eq!(DREQ_TIMER2, 61);
+        assert_eq!(DREQ_TIMER3, 62);
         assert_eq!(DREQ_FORCE, 63);
     }
 
@@ -178,6 +193,7 @@ mod tests {
             DREQ_ADC,
             DREQ_XIP_STREAM, DREQ_XIP_QMITX, DREQ_XIP_QMIRX,
             DREQ_HSTX, DREQ_CORESIGHT, DREQ_SHA256,
+            DREQ_TIMER0, DREQ_TIMER1, DREQ_TIMER2, DREQ_TIMER3,
             DREQ_FORCE,
         ];
         for &d in all {
