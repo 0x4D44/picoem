@@ -8589,15 +8589,15 @@ fn gpio_external_mask_zero_is_noop() {
 // MMIO trace hook — Phase 0b (HLD V5 §4.2.7)
 // ============================================================================
 //
-// The trace is a runtime flag (`Bus::trace_enabled`) gating a cold
-// `emit_trace` helper. Zero overhead when off; one line per outer
+// The trace is a runtime flag (`Bus::mmio_trace_enabled`) gating a cold
+// `emit_mmio_trace` helper. Zero overhead when off; one line per outer
 // bus access when on. See `mdrp2040/src/bus/mod.rs` for the V7 idiom
 // these tests mirror.
 
 /// A thread-safe `Vec<u8>` sink so we can capture the trace output
 /// without wrestling with stdout redirection. Wraps `Vec<u8>` behind
 /// an `Arc<Mutex<...>>` so the test can drain the buffer after the
-/// bus has written through the sink. (`Bus::trace_sink` holds a
+/// bus has written through the sink. (`Bus::mmio_trace_sink` holds a
 /// `Box<dyn Write>`; tests hand it a `CaptureSink` clone.)
 #[derive(Clone)]
 struct TraceCaptureSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -8618,14 +8618,14 @@ fn new_capture() -> TraceCaptureSink {
 
 #[test]
 fn trace_enabled_emits_write32_line() {
-    // HLD V5 §4.2.7: `write32(addr, val)` with `trace_enabled = true`
+    // HLD V5 §4.2.7: `write32(addr, val)` with `mmio_trace_enabled = true`
     // emits one line in the prescribed format. We inject a captured
     // `TraceCaptureSink` so the test doesn't depend on fd 1 redirection.
     let capture = new_capture();
     let mut bus = Bus::new();
     bus.set_active_pc(0x1000_0100, 0);
-    bus.trace_enabled = true;
-    bus.set_trace_sink(Some(Box::new(capture.clone())));
+    bus.mmio_trace_enabled = true;
+    bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
 
     // SRAM word write — exercises the hot path and one of the six
     // access methods required by the spec.
@@ -8656,8 +8656,8 @@ fn trace_enabled_emits_all_six_access_methods() {
     let capture = new_capture();
     let mut bus = Bus::new();
     bus.set_active_pc(0x1000_0100, 0);
-    bus.trace_enabled = true;
-    bus.set_trace_sink(Some(Box::new(capture.clone())));
+    bus.mmio_trace_enabled = true;
+    bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
 
     bus.write8(0x2000_0100, 0xAB, 0);
     bus.write16(0x2000_0102, 0xCDEF, 0);
@@ -8683,13 +8683,13 @@ fn trace_enabled_emits_all_six_access_methods() {
 
 #[test]
 fn trace_disabled_emits_nothing() {
-    // Zero-overhead path — `trace_enabled = false` must not route any
+    // Zero-overhead path — `mmio_trace_enabled = false` must not route any
     // bytes to the sink. Guards the hot path (non-trace runs must not
     // pay a formatting cost, and must not write bytes to the sink).
     let capture = new_capture();
     let mut bus = Bus::new();
-    bus.set_trace_sink(Some(Box::new(capture.clone())));
-    // trace_enabled is false by default.
+    bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
+    // mmio_trace_enabled is false by default.
     bus.write32(0x2000_0200, 0xCAFE_F00D, 0);
     let _ = bus.read32(0x2000_0200, 0);
     bus.write16(0x2000_0200, 0xABCD, 0);
@@ -8698,7 +8698,7 @@ fn trace_disabled_emits_nothing() {
     let _ = bus.read8(0x2000_0200, 0);
     assert!(
         capture.0.lock().unwrap().is_empty(),
-        "trace sink received bytes with trace_enabled=false",
+        "trace sink received bytes with mmio_trace_enabled=false",
     );
 }
 
@@ -8715,8 +8715,8 @@ fn trace_active_pc_is_per_core() {
     // still carry PC=0x1000 for core 0.
     let capture = new_capture();
     let mut bus = Bus::new();
-    bus.trace_enabled = true;
-    bus.set_trace_sink(Some(Box::new(capture.clone())));
+    bus.mmio_trace_enabled = true;
+    bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
 
     // Core 0 "decodes" at 0x1000 and writes.
     bus.set_active_pc(0x0000_1000, 0);
@@ -8780,10 +8780,10 @@ fn trace_emulator_step_publishes_pc_via_decode() {
     emu.cores[0].wake();
     emu.cores[1].halt();
 
-    emu.bus.trace_enabled = true;
-    emu.bus.set_trace_sink(Some(Box::new(capture.clone())));
+    emu.bus.mmio_trace_enabled = true;
+    emu.bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
     emu.step();
-    emu.bus.trace_enabled = false;
+    emu.bus.mmio_trace_enabled = false;
 
     let captured = capture.0.lock().unwrap();
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
@@ -8841,14 +8841,14 @@ fn trace_exception_entry_publishes_sentinel_fe() {
     // plausible in-thread PC so a regression (missing sentinel) would
     // show THAT value in the stacking-line output — easier to spot.
     bus.set_active_pc(0x0000_1000, 0);
-    bus.trace_enabled = true;
-    bus.set_trace_sink(Some(Box::new(capture.clone())));
+    bus.mmio_trace_enabled = true;
+    bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
 
     cpu.test_enter_exception(11, &mut bus);
 
     // Disable trace before we walk the capture so any cleanup work
     // outside the test doesn't pollute the vector.
-    bus.trace_enabled = false;
+    bus.mmio_trace_enabled = false;
     let captured = capture.0.lock().unwrap();
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
     let lines: Vec<&str> = text.lines().collect();
@@ -8901,14 +8901,14 @@ fn trace_exception_exit_publishes_sentinel_fd() {
     cpu.test_enter_exception(11, &mut bus);
 
     bus.set_active_pc(0x0000_2000, 0); // an in-handler PC that must NOT leak.
-    bus.trace_enabled = true;
-    bus.set_trace_sink(Some(Box::new(capture.clone())));
+    bus.mmio_trace_enabled = true;
+    bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
 
     // EXC_RETURN 0xFFFF_FFF9: return to Thread mode, MSP, no FP frame —
     // matches the basic frame pushed above.
     cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
 
-    bus.trace_enabled = false;
+    bus.mmio_trace_enabled = false;
     let captured = capture.0.lock().unwrap();
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
     let lines: Vec<&str> = text.lines().collect();

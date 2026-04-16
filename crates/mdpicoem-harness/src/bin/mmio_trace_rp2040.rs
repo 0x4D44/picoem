@@ -1,7 +1,7 @@
 //! MMIO trace runner — mdrp2040 (Cortex-M0+) bus access logger.
 //!
 //! Phase 0 sub-task 0.C per `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral
-//! Coverage V7.md` §4.3 / §4.4: load firmware, enable `Bus::trace_enabled`,
+//! Coverage V7.md` §4.3 / §4.4: load firmware, enable `Bus::mmio_trace_enabled`,
 //! run for a caller-supplied cycle budget, and emit one line per bus
 //! access to stdout in the format
 //!
@@ -34,7 +34,7 @@ use mdrp2040::{Config, EmulatorBuilder};
 /// that any buffered trace lines reach the terminal / redirected file even
 /// if `run()` panics mid-loop — without this, a panic inside `emu.run()`
 /// could discard the tail of the trace. Pairs with `println!` in
-/// `Bus::emit_trace` which writes through line-buffered stdout.
+/// `Bus::emit_mmio_trace` which writes through line-buffered stdout.
 struct StdoutFlushGuard;
 
 impl Drop for StdoutFlushGuard {
@@ -241,9 +241,9 @@ fn run() -> Result<(), String> {
         "mmio_trace_rp2040: running for {} cycles (trace on stdout)",
         args.cycles
     );
-    emu.bus.trace_enabled = true;
+    emu.bus.mmio_trace_enabled = true;
     let ran = emu.run(args.cycles);
-    emu.bus.trace_enabled = false;
+    emu.bus.mmio_trace_enabled = false;
     eprintln!("mmio_trace_rp2040: ran {} cycles (requested {})", ran, args.cycles);
 
     Ok(())

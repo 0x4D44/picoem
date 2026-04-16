@@ -673,14 +673,14 @@ impl CortexM33 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             let val = self.ppb.read32(addr);
-            if bus.trace_enabled() {
-                bus.emit_trace('R', 4, addr, val, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
             }
             val
         } else if Self::is_sio_local(addr) {
             let val = self.sio_local.read32(addr & 0xFFF);
-            if bus.trace_enabled() {
-                bus.emit_trace('R', 4, addr, val, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
             }
             val
         } else {
@@ -697,13 +697,13 @@ impl CortexM33 {
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             self.ppb.write32(addr, val);
             self.sync_nvic_to_irq_pending(addr, bus);
-            if bus.trace_enabled() {
-                bus.emit_trace('W', 4, addr, val, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('W', 4, addr, val, self.core_id);
             }
         } else if Self::is_sio_local(addr) {
             self.sio_local.write32(addr & 0xFFF, val);
-            if bus.trace_enabled() {
-                bus.emit_trace('W', 4, addr, val, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('W', 4, addr, val, self.core_id);
             }
         } else {
             bus.write32(addr, val, self.core_id);
@@ -721,8 +721,8 @@ impl CortexM33 {
             // via a telltale zero.
             let word = self.ppb.read32(addr & !3);
             let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
-            if bus.trace_enabled() {
-                bus.emit_trace('R', 2, addr, val as u32, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
             }
             val
         } else if Self::is_sio_local(addr) {
@@ -730,8 +730,8 @@ impl CortexM33 {
             // containing 32-bit SIO register and slice the halfword.
             let word = self.sio_local.read32(addr & 0xFFF & !3);
             let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
-            if bus.trace_enabled() {
-                bus.emit_trace('R', 2, addr, val as u32, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
             }
             val
         } else {
@@ -756,16 +756,16 @@ impl CortexM33 {
             };
             self.ppb.write32(addr & !3, new_val);
             self.sync_nvic_to_irq_pending(addr & !3, bus);
-            if bus.trace_enabled() {
-                bus.emit_trace('W', 2, addr, val as u32, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('W', 2, addr, val as u32, self.core_id);
             }
         } else if Self::is_sio_local(addr) {
             // Pre-Stage-3 `Bus::write16` dropped SIO writes silently
             // (region 0xD had no write16 arm). Preserve that here: drop
             // the write, but still emit the trace line so observability
             // is unchanged.
-            if bus.trace_enabled() {
-                bus.emit_trace('W', 2, addr, val as u32, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('W', 2, addr, val as u32, self.core_id);
             }
         } else {
             bus.write16(addr, val, self.core_id);
@@ -776,8 +776,8 @@ impl CortexM33 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte reads return 0.
-            if bus.trace_enabled() {
-                bus.emit_trace('R', 1, addr, 0, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('R', 1, addr, 0, self.core_id);
             }
             0
         } else if Self::is_sio_local(addr) {
@@ -786,8 +786,8 @@ impl CortexM33 {
             let word = self.sio_local.read32(addr & 0xFFF & !3);
             let byte_idx = (addr & 3) as usize;
             let val = word.to_le_bytes()[byte_idx];
-            if bus.trace_enabled() {
-                bus.emit_trace('R', 1, addr, val as u32, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('R', 1, addr, val as u32, self.core_id);
             }
             val
         } else {
@@ -801,15 +801,15 @@ impl CortexM33 {
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte writes drop.
-            if bus.trace_enabled() {
-                bus.emit_trace('W', 1, addr, val as u32, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);
             }
         } else if Self::is_sio_local(addr) {
             // Pre-Stage-3 `Bus::write8` dropped SIO writes silently
             // (region 0xD had no write8 arm). Preserve that; see the
             // matching note in `bus_write16`.
-            if bus.trace_enabled() {
-                bus.emit_trace('W', 1, addr, val as u32, self.core_id);
+            if bus.mmio_trace_enabled() {
+                bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);
             }
         } else {
             bus.write8(addr, val, self.core_id);

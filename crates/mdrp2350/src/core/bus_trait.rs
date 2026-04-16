@@ -121,6 +121,6 @@ pub trait CoreBus {
     /// MMIO trace sink. TRANSIENT: used by `CortexM33`'s PPB-intercept
     /// read/write wrappers so PPB accesses land in the same wire-format
     /// stream as ordinary bus accesses.
-    fn trace_enabled(&self) -> bool;
-    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8);
+    fn mmio_trace_enabled(&self) -> bool;
+    fn emit_mmio_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8);
 }

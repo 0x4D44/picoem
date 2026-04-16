@@ -1383,11 +1383,11 @@ impl CoreBus for WorkerBus {
     }
 
     #[inline]
-    fn trace_enabled(&self) -> bool {
+    fn mmio_trace_enabled(&self) -> bool {
         false
     }
     #[inline]
-    fn emit_trace(&mut self, _rw: char, _size: u32, _addr: u32, _val: u32, _core: u8) {
+    fn emit_mmio_trace(&mut self, _rw: char, _size: u32, _addr: u32, _val: u32, _core: u8) {
         // Trace routing is coordinator-side in the threaded runtime
         // (Phase 4 wiring). Stage 5 drops trace events on the worker
         // path.
@@ -1656,8 +1656,8 @@ mod tests {
         let _ = bus_dyn.gpio_read_in();
         let _ = bus_dyn.extra_wait_states();
         bus_dyn.reset_extra_wait_states();
-        let _ = bus_dyn.trace_enabled();
-        bus_dyn.emit_trace('R', 4, 0x2000_0000, 0, 0);
+        let _ = bus_dyn.mmio_trace_enabled();
+        bus_dyn.emit_mmio_trace('R', 4, 0x2000_0000, 0, 0);
     }
 
     // ------------------------------------------------------------

@@ -178,8 +178,8 @@ impl ThreadedEmulator {
             extra_wait_states: _,
             burst_mode: _,
             active_pc: _,
-            trace_enabled: _,
-            trace_sink: _,
+            mmio_trace_enabled: _,
+            mmio_trace_sink: _,
             pending_cache_invalidations: _,
             pending_invalidation_regions: _,
         } = bus;

@@ -1,7 +1,7 @@
 //! MMIO trace runner — mdrp2350 (Cortex-M33) bus access logger.
 //!
 //! Phase 0b per `wrk_docs/2026.04.15 - HLD - RP2350 Peripheral Coverage V5.md`
-//! §4 / §4.2.7: load firmware, enable `Bus::trace_enabled`, run for a
+//! §4 / §4.2.7: load firmware, enable `Bus::mmio_trace_enabled`, run for a
 //! caller-supplied cycle budget, and emit one line per bus access to
 //! stdout in the format
 //!
@@ -25,7 +25,7 @@
 //! ELF is supplied.
 //!
 //! Mirrors the RP2040 sibling at `mmio_trace_rp2040.rs`. Same runtime
-//! flag idiom; see `crates/mdrp2350/src/bus/mod.rs::Bus::emit_trace`
+//! flag idiom; see `crates/mdrp2350/src/bus/mod.rs::Bus::emit_mmio_trace`
 //! for the coverage rationale.
 
 use std::io::Write;
@@ -38,7 +38,7 @@ use mdrp2350::{Config, Emulator};
 /// that any buffered trace lines reach the terminal / redirected file even
 /// if `run()` panics mid-loop — without this, a panic inside `emu.run()`
 /// could discard the tail of the trace. Pairs with `println!` in
-/// `Bus::emit_trace` which writes through line-buffered stdout.
+/// `Bus::emit_mmio_trace` which writes through line-buffered stdout.
 struct StdoutFlushGuard;
 
 impl Drop for StdoutFlushGuard {
@@ -218,9 +218,9 @@ fn run() -> Result<(), String> {
         "mmio_trace_rp2350: running for {} cycles (trace on stdout)",
         args.cycles,
     );
-    emu.bus.trace_enabled = true;
+    emu.bus.mmio_trace_enabled = true;
     let ran = emu.run(args.cycles);
-    emu.bus.trace_enabled = false;
+    emu.bus.mmio_trace_enabled = false;
     eprintln!(
         "mmio_trace_rp2350: ran {} cycles (requested {})",
         ran, args.cycles,

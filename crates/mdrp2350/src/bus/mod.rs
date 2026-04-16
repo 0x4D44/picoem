@@ -401,10 +401,10 @@ pub struct Bus {
     pub pending_invalidation_regions: u8,
     /// MMIO trace toggle (see `wrk_docs/2026.04.15 - HLD - RP2350 Peripheral
     /// Coverage V5.md` §4 / §4.2.7). When `true`, each byte/half/word bus
-    /// access emits one line to [`Self::trace_sink`] (defaults to stdout
+    /// access emits one line to [`Self::mmio_trace_sink`] (defaults to stdout
     /// when `None`). Zero overhead when `false` — the hot path
     /// short-circuits before any formatting. Mirrors the mdrp2040 V7 idiom.
-    pub trace_enabled: bool,
+    pub mmio_trace_enabled: bool,
     /// Per-core, per-instruction PC snapshot. Indexed by the core id
     /// passed to `set_active_pc(pc, core)` so a core switch does not
     /// alias one core's decode PC onto the other. Set by the core's
@@ -419,7 +419,7 @@ pub struct Bus {
     /// Optional override sink for trace output. `None` routes to stdout
     /// via `println!`. Unit tests inject a `Vec<u8>`-backed sink to
     /// capture lines without wrestling with fd 1 redirection.
-    pub(crate) trace_sink: Option<Box<dyn Write>>,
+    pub(crate) mmio_trace_sink: Option<Box<dyn Write>>,
 }
 
 impl Bus {
@@ -491,9 +491,9 @@ impl Bus {
             // spills 16 words. Matches `WorkerBus::pending_cache_invalidations`.
             pending_cache_invalidations: Vec::with_capacity(16),
             pending_invalidation_regions: 0,
-            trace_enabled: false,
+            mmio_trace_enabled: false,
             active_pc: [0; 2],
-            trace_sink: None,
+            mmio_trace_sink: None,
         }
     }
 
@@ -735,11 +735,11 @@ impl Bus {
 
     /// Emit a single trace line. `rw` is `'R'` or `'W'`, `size` is 1/2/4
     /// bytes, `val` is the value read or written. Called from the six
-    /// outer bus access methods only when [`Self::trace_enabled`] is
-    /// `true`; the caller gates with `if self.trace_enabled` so the
+    /// outer bus access methods only when [`Self::mmio_trace_enabled`] is
+    /// `true`; the caller gates with `if self.mmio_trace_enabled` so the
     /// formatting cost is paid only when tracing.
     ///
-    /// Routes to [`Self::trace_sink`] if set, else `println!` (stdout).
+    /// Routes to [`Self::mmio_trace_sink`] if set, else `println!` (stdout).
     /// No buffering — each line flushes at the `writeln!` boundary.
     ///
     /// Coverage note (mirrors mdrp2040 V7 §4.3). The trace is emitted
@@ -757,18 +757,18 @@ impl Bus {
     /// next?" workflow.
     ///
     /// `#[cold]` + `#[inline(never)]` keeps the cold path out of the
-    /// caller's register allocation so the `if self.trace_enabled`
+    /// caller's register allocation so the `if self.mmio_trace_enabled`
     /// fast-path stays branch-predicted-not-taken and decoded-op-cache
     /// hot paths are unaffected when tracing is off. This is the
     /// "V2 reverted to runtime flag" decision in V4's review history.
     #[cold]
     #[inline(never)]
-    pub(crate) fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
+    pub(crate) fn emit_mmio_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
         let line = format!(
             "TRACE {} {} 0x{:08X} val=0x{:08X} core={} pc=0x{:08X}",
             rw, size, addr, val, core as usize, self.active_pc[core as usize]
         );
-        if let Some(sink) = self.trace_sink.as_mut() {
+        if let Some(sink) = self.mmio_trace_sink.as_mut() {
             let _ = writeln!(sink, "{}", line);
         } else {
             println!("{}", line);
@@ -777,10 +777,10 @@ impl Bus {
 
     /// Install a captured trace sink (used by unit tests). `None` routes
     /// back to stdout. This is `pub(crate)` to keep it off the public
-    /// surface — the binary toggles `trace_enabled` only.
+    /// surface — the binary toggles `mmio_trace_enabled` only.
     #[cfg(test)]
-    pub(crate) fn set_trace_sink(&mut self, sink: Option<Box<dyn Write>>) {
-        self.trace_sink = sink;
+    pub(crate) fn set_mmio_trace_sink(&mut self, sink: Option<Box<dyn Write>>) {
+        self.mmio_trace_sink = sink;
     }
 
     /// Assert an external IRQ at a specific core. `core` names the NVIC
@@ -1182,8 +1182,8 @@ impl Bus {
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
-                    if self.trace_enabled {
-                        self.emit_trace('R', 1, addr, 0, core);
+                    if self.mmio_trace_enabled {
+                        self.emit_mmio_trace('R', 1, addr, 0, core);
                     }
                     return 0;
                 }
@@ -1206,29 +1206,29 @@ impl Bus {
                     match (base, offset) {
                         (UART0_BASE, crate::peripherals::uart::UARTDR) => {
                             let v = self.uart0.read8(crate::peripherals::uart::UARTDR);
-                            if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
                             let v = self.spi0.read8(crate::peripherals::spi::SSPDR);
-                            if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
                             let v = self.i2c0.read8(crate::peripherals::i2c::IC_DATA_CMD);
-                            if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (ADC_BASE, crate::peripherals::adc::FIFO) => {
                             let v = self.adc.read8(crate::peripherals::adc::FIFO);
-                            if self.trace_enabled {
-                                self.emit_trace('R', 1, addr, v as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
@@ -1290,8 +1290,8 @@ impl Bus {
                 0
             }
         };
-        if self.trace_enabled {
-            self.emit_trace('R', 1, addr, val as u32, core);
+        if self.mmio_trace_enabled {
+            self.emit_mmio_trace('R', 1, addr, val as u32, core);
         }
         val
     }
@@ -1361,8 +1361,8 @@ impl Bus {
                                 &mut ext_irqs,
                             );
                             self.raise_irqs_u64(ext_irqs);
-                            if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1374,8 +1374,8 @@ impl Bus {
                                 &mut ext_irqs,
                             );
                             self.raise_irqs_u64(ext_irqs);
-                            if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1387,8 +1387,8 @@ impl Bus {
                                 &mut ext_irqs,
                             );
                             self.raise_irqs_u64(ext_irqs);
-                            if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1404,8 +1404,8 @@ impl Bus {
                         // also pop via the RMW path — silicon firmware
                         // doesn't hit this; matches RP2040 idiom.
                         (ADC_BASE, crate::peripherals::adc::FIFO) => {
-                            if self.trace_enabled {
-                                self.emit_trace('W', 1, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1556,8 +1556,8 @@ impl Bus {
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write8(addr, val),
             _ => {} // ROM read-only, others unmapped/stub
         }
-        if self.trace_enabled {
-            self.emit_trace('W', 1, addr, val as u32, core);
+        if self.mmio_trace_enabled {
+            self.emit_mmio_trace('W', 1, addr, val as u32, core);
         }
     }
 
@@ -1611,8 +1611,8 @@ impl Bus {
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
-                    if self.trace_enabled {
-                        self.emit_trace('R', 2, addr, 0, core);
+                    if self.mmio_trace_enabled {
+                        self.emit_mmio_trace('R', 2, addr, 0, core);
                     }
                     return 0;
                 }
@@ -1633,8 +1633,8 @@ impl Bus {
                 if !self.is_held_in_reset_base(base) {
                     if (base, offset) == (SPI0_BASE, crate::peripherals::spi::SSPDR) {
                         let v = self.spi0.read16(crate::peripherals::spi::SSPDR);
-                        if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32, core);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
@@ -1642,22 +1642,22 @@ impl Bus {
                     // byte via narrow path (zero-extended).
                     if (base, offset) == (UART0_BASE, crate::peripherals::uart::UARTDR) {
                         let v = self.uart0.read8(crate::peripherals::uart::UARTDR) as u16;
-                        if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32, core);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
                     if (base, offset) == (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) {
                         let v = self.i2c0.read32(crate::peripherals::i2c::IC_DATA_CMD) as u16;
-                        if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32, core);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
                     if (base, offset) == (ADC_BASE, crate::peripherals::adc::FIFO) {
                         let v = self.adc.read16(crate::peripherals::adc::FIFO);
-                        if self.trace_enabled {
-                            self.emit_trace('R', 2, addr, v as u32, core);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
                         }
                         return v;
                     }
@@ -1718,8 +1718,8 @@ impl Bus {
                 0
             }
         };
-        if self.trace_enabled {
-            self.emit_trace('R', 2, addr, val as u32, core);
+        if self.mmio_trace_enabled {
+            self.emit_mmio_trace('R', 2, addr, val as u32, core);
         }
         val
     }
@@ -1788,8 +1788,8 @@ impl Bus {
                                 &mut ext_irqs,
                             );
                             self.raise_irqs_u64(ext_irqs);
-                            if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1801,8 +1801,8 @@ impl Bus {
                                 &mut ext_irqs,
                             );
                             self.raise_irqs_u64(ext_irqs);
-                            if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1815,8 +1815,8 @@ impl Bus {
                                 &mut ext_irqs,
                             );
                             self.raise_irqs_u64(ext_irqs);
-                            if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1824,8 +1824,8 @@ impl Bus {
                         // `write8` above. Swallow halfword writes so the
                         // RMW path doesn't silently pop a sample.
                         (ADC_BASE, crate::peripherals::adc::FIFO) => {
-                            if self.trace_enabled {
-                                self.emit_trace('W', 2, addr, val as u32, core);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
                             }
                             return;
                         }
@@ -1974,8 +1974,8 @@ impl Bus {
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write16(addr, val),
             _ => {}
         }
-        if self.trace_enabled {
-            self.emit_trace('W', 2, addr, val as u32, core);
+        if self.mmio_trace_enabled {
+            self.emit_mmio_trace('W', 2, addr, val as u32, core);
         }
     }
 
@@ -2010,8 +2010,8 @@ impl Bus {
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
-                    if self.trace_enabled {
-                        self.emit_trace('R', 4, addr, 0, core);
+                    if self.mmio_trace_enabled {
+                        self.emit_mmio_trace('R', 4, addr, 0, core);
                     }
                     return 0;
                 }
@@ -2081,8 +2081,8 @@ impl Bus {
                 0
             }
         };
-        if self.trace_enabled {
-            self.emit_trace('R', 4, addr, val, core);
+        if self.mmio_trace_enabled {
+            self.emit_mmio_trace('R', 4, addr, val, core);
         }
         val
     }
@@ -2228,8 +2228,8 @@ impl Bus {
                 self.atomics.set_bus_fault(core as usize, addr);
             }
         }
-        if self.trace_enabled {
-            self.emit_trace('W', 4, addr, val, core);
+        if self.mmio_trace_enabled {
+            self.emit_mmio_trace('W', 4, addr, val, core);
         }
     }
 
@@ -2492,12 +2492,12 @@ impl CoreBus for Bus {
     }
 
     #[inline(always)]
-    fn trace_enabled(&self) -> bool {
-        self.trace_enabled
+    fn mmio_trace_enabled(&self) -> bool {
+        self.mmio_trace_enabled
     }
     #[inline(always)]
-    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
-        Bus::emit_trace(self, rw, size, addr, val, core)
+    fn emit_mmio_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
+        Bus::emit_mmio_trace(self, rw, size, addr, val, core)
     }
 }
 
@@ -2557,9 +2557,9 @@ mod corebus_trait_tests {
         let _ = bus_dyn.gpio_read_in();
         let _ = bus_dyn.extra_wait_states();
         bus_dyn.reset_extra_wait_states();
-        let _ = bus_dyn.trace_enabled();
-        // emit_trace is a no-op unless trace_enabled is true, but we
+        let _ = bus_dyn.mmio_trace_enabled();
+        // emit_mmio_trace is a no-op unless mmio_trace_enabled is true, but we
         // still call it to validate the signature.
-        bus_dyn.emit_trace('R', 4, 0x2000_0000, 0, 0);
+        bus_dyn.emit_mmio_trace('R', 4, 0x2000_0000, 0, 0);
     }
 }

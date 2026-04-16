@@ -10,3 +10,5 @@ mdrp2040 = { path = "../mdrp2040" }
 ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -249,7 +249,7 @@ impl CortexM33 {
         // instruction performs. Set before the fetch so the I-fetch
         // itself is tagged with its own PC. Zero-cost when tracing is
         // off — the store lands in a cold struct field touched only
-        // by `emit_trace`.
+        // by `emit_mmio_trace`.
         bus.set_active_pc(pc, self.core_id);
 
         // Cache lookup — by-value (`DecodedOp: Copy`), so no borrow on

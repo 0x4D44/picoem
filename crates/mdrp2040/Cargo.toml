@@ -13,6 +13,7 @@ test-hooks = ["mdpicoem-common/test-hooks"]
 
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
+tracing = { workspace = true }
 
 [dev-dependencies]
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }

@@ -14,6 +14,7 @@ test-hooks = ["mdpicoem-common/test-hooks"]
 
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
+tracing = { workspace = true }
 
 # Enable the PIO `test-hooks` feature for in-crate tests so `pop_tx` /
 # `push_rx` are callable without gating the production build. This
