@@ -858,3 +858,45 @@ design for Phase 4 and documented in the relevant DMA module.
 - **DMA `mem::take` swap: zero-read window if DMA self-targets its own
   registers during a transfer** — unreachable in corpus firmware;
   documented as known anomaly.
+
+### test_silicon residual failures (2026-04-16 baseline)
+
+- **Cycle timing residuals (3 cases)**: `push_2_min_cost` (delta=-2),
+  `bank_contention_fetch_data_same` and `_diff` (delta=-1 each).  All
+  are pipeline-overlap effects: M33 store-buffer drain overlapping with
+  POP loads (PUSH case), and load-use latency hiding where LDR costs 1
+  when the next instruction doesn't consume the loaded register (bank
+  contention cases).  Requires register-dependency tracking between
+  consecutive instructions — Phase 2 pipeline model work.
+
+- **TICKS TIMER0 CYCLES readback**: `ticks_timer0_retarget_halves_rate`
+  fails with EMU=0x18 (correctly accepts aliased write), HW=0x00.
+  Pre-existing: the scenario was failing before the aliasing fix too
+  (EMU=0x0C, HW=0x00).  The CYCLES register on silicon may not be a
+  simple static reload value, or the domain tick logic modifies it.
+  Needs investigation on real silicon (probe-read CYCLES at multiple
+  points during the scenario to characterise the actual register
+  behaviour).
+
+- **DMA oracle scenarios**: `dma_mem_to_mem_32bit` and `dma_chain_trigger`
+  diverge because the probe-based setup (DAP writes) doesn't produce a
+  valid DMA transfer on silicon.  Emulator DMA is correct (destination
+  contains seed data).  RESET_DONE polling was added but didn't resolve
+  the issue — likely a DAP write-buffer coherency or debug-halt clock
+  gating issue.  Fix: rearchitect DMA scenarios to use a custom sled
+  that performs SRAM seeding + DMA configuration + busy-wait at runtime
+  through the CPU bus interface, not through the debug port.
+
+- **test_silicon orchestrator**: `session.core(0)` fails in worker
+  thread even with `--probe` explicit selector.  Root cause is cross-
+  thread session transfer in probe-rs, not probe selection.  Standalone
+  oracle binaries work fine.  The `--probe` flag is still valuable for
+  multi-probe disambiguation.  Needs probe-rs investigation or
+  restructuring the orchestrator to call `session.core(0)` from the
+  main thread before moving to the worker.
+
+- **adc_one_shot**: crashes probe with "An ARM specific error" even
+  with GPIO26 pad configuration (OD=1, IE=0, funcsel=NULL).  ADC
+  analog subsystem appears fundamentally hostile to halted-core probe
+  access.  Recommend gating behind `--include-adc` flag or moving to
+  `RED_PATH_SCENARIOS`.

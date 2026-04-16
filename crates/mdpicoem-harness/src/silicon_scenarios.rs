@@ -16,6 +16,10 @@ pub const PLL_SYS_BASE: u32 = 0x4005_0000;
 
 pub const RESETS_BASE: u32 = 0x4002_0000;
 pub const RESETS_RESET: u32 = RESETS_BASE + 0x00;
+/// RESET_DONE: each bit reads 1 once the corresponding peripheral has
+/// fully exited reset.  Polling this after a RESETS_CLR write ensures
+/// the peripheral's register file is accessible before we touch it.
+pub const RESETS_RESET_DONE: u32 = RESETS_BASE + 0x08;
 
 /// APB alias offsets. `+0x2000` = SET (OR), `+0x3000` = CLR (AND NOT).
 pub const ALIAS_SET: u32 = 0x2000;
@@ -588,6 +592,165 @@ const O_TICKS_TIMER0_RETARGET: &[(u32, u32)] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Phase 1 Expansion: SIO divider, MTIME, TIMER1
+// ---------------------------------------------------------------------------
+
+// SIO divider register addresses (RP2350 §3.1.2).
+const SIO_DIV_UDIVIDEND: u32 = 0xD000_0060;
+const SIO_DIV_UDIVISOR: u32 = 0xD000_0064;
+const SIO_DIV_SDIVIDEND: u32 = 0xD000_0068;
+const SIO_DIV_SDIVISOR: u32 = 0xD000_006C;
+const SIO_DIV_QUOTIENT: u32 = 0xD000_0070;
+const SIO_DIV_REMAINDER: u32 = 0xD000_0074;
+const SIO_DIV_CSR: u32 = 0xD000_0078;
+
+// SIO MTIME register addresses (RP2350 §3.1.2).
+const SIO_MTIME_CTRL: u32 = 0xD000_01A0;
+const SIO_MTIME_LO: u32 = 0xD000_01A8;
+const SIO_MTIME_HI: u32 = 0xD000_01AC;
+
+// TIMER1 base (RP2350 datasheet §12.8, `0x400B_8000`).
+pub const TIMER1_BASE: u32 = 0x400B_8000;
+pub const TIMER1_INTR: u32 = TIMER1_BASE + 0x3C;
+pub const TIMER1_INTE: u32 = TIMER1_BASE + 0x40;
+pub const TIMER1_ARMED: u32 = TIMER1_BASE + 0x20;
+/// RESETS bit for TIMER1 (RP2350 §7.5, bit 24).
+pub const RESET_TIMER1_BIT: u32 = 1 << 24;
+/// TICKS.TIMER1 control register (TICKS_BASE + 0x24).
+pub const TICKS_TIMER1_CTRL: u32 = TICKS_BASE + 0x24;
+
+// S_SIO_DIV_UNSIGNED: Write 100 / 7 unsigned, observe quotient/remainder/CSR.
+const S_SIO_DIVIDER_UNSIGNED: &[(u32, u32)] = &[
+    (SIO_DIV_UDIVIDEND, 100),
+    (SIO_DIV_UDIVISOR, 7),
+];
+const O_SIO_DIVIDER_UNSIGNED: &[(u32, u32)] = &[
+    (SIO_DIV_QUOTIENT, 0xFFFF_FFFF),
+    (SIO_DIV_REMAINDER, 0xFFFF_FFFF),
+    (SIO_DIV_CSR, 0x3), // READY + DIRTY only
+];
+
+// S_SIO_DIV_SIGNED: Write -100 / 7 signed, observe quotient/remainder/CSR.
+const S_SIO_DIVIDER_SIGNED: &[(u32, u32)] = &[
+    (SIO_DIV_SDIVIDEND, 0xFFFF_FF9C), // -100
+    (SIO_DIV_SDIVISOR, 7),
+];
+const O_SIO_DIVIDER_SIGNED: &[(u32, u32)] = &[
+    (SIO_DIV_QUOTIENT, 0xFFFF_FFFF),
+    (SIO_DIV_REMAINDER, 0xFFFF_FFFF),
+    (SIO_DIV_CSR, 0x3),
+];
+
+// S_SIO_MTIME_COUNT_AND_MATCH: Enable MTIME, spin ~50 iters, disable, observe.
+const S_SIO_MTIME_COUNT_AND_MATCH: &[(u32, u32)] = &[
+    (SIO_MTIME_CTRL, 0), // ensure clean start
+];
+const O_SIO_MTIME_COUNT_AND_MATCH: &[(u32, u32)] = &[
+    (SIO_MTIME_CTRL, 0x1),       // EN bit (should be 0 after sled disables)
+    (SIO_MTIME_LO, 0xFFFF_FFFF), // frozen counter low
+    (SIO_MTIME_HI, 0xFFFF_FFFF), // frozen counter high
+];
+
+// Custom sled for `sio_mtime_count_and_match`.
+//
+// Structure:
+//   - Build R0 = MTIME_CTRL address (0xD000_01A0) via movw + movt.
+//   - MOVS R1, #1 — enable value.
+//   - STR R1, [R0, #0] — MTIME_CTRL = 1 (enable counting).
+//   - MOVS R2, #50 — spin counter.
+//   - SUBS R2, #1 / BNE — spin loop (~50 iterations).
+//   - MOVS R1, #0 — disable value.
+//   - STR R1, [R0, #0] — MTIME_CTRL = 0 (freeze counter).
+//   - BKPT #0.
+//
+// Registers used:
+//   R0 — MTIME_CTRL address (0xD000_01A0)
+//   R1 — enable/disable value
+//   R2 — spin counter
+//
+// Thumb-2 encodings:
+//   movw R0, #0x01A0: imm4=0, i=0, imm3=1, imm8=0xA0
+//     hw0 = 0xF240, hw1 = 0x10A0
+//   movt R0, #0xD000: imm4=0xD, i=0, imm3=0, imm8=0x00
+//     hw0 = 0xF2CD, hw1 = 0x0000
+#[rustfmt::skip]
+const SLED_SIO_MTIME_COUNT_AND_MATCH_HW: [u16; 12] = [
+    0xF240, //  [ 0] movw r0, #0x01A0 hw0  ; r0 = MTIME_CTRL low half
+    0x10A0, //  [ 1] movw r0, #0x01A0 hw1  ; (imm3=1, Rd=0, imm8=0xA0)
+    0xF2CD, //  [ 2] movt r0, #0xD000 hw0  ; r0 high half (imm4=0xD)
+    0x0000, //  [ 3] movt r0, #0xD000 hw1  ; r0 = 0xD000_01A0
+    0x2101, //  [ 4] movs r1, #1           ; r1 = 1 (enable)
+    0x6001, //  [ 5] str  r1, [r0, #0]     ; MTIME_CTRL = 1 (start counting)
+    0x2232, //  [ 6] movs r2, #50          ; r2 = spin counter
+    0x3A01, //  [ 7] subs r2, #1           ; spin:
+    0xD1FD, //  [ 8] bne  -4               ;   → [7] subs
+    0x2100, //  [ 9] movs r1, #0           ; r1 = 0 (disable)
+    0x6001, //  [10] str  r1, [r0, #0]     ; MTIME_CTRL = 0 (freeze counter)
+    0xBE00, //  [11] bkpt #0               ; end of sled
+];
+const SLED_SIO_MTIME_COUNT_AND_MATCH: &[u8] =
+    &halfwords_to_le_bytes::<12, 24>(SLED_SIO_MTIME_COUNT_AND_MATCH_HW);
+
+// Phase 1 B1 clone: `timer1_alarm0_fire_and_clear` — same logic as TIMER0
+// but targeting TIMER1 at 0x400B_8000. Every TIMER0 address in setup,
+// observe, AND the custom sled is shifted +0x8000.
+//
+// Sled register offsets from r3 (TIMER1_BASE = 0x400B_8000):
+//   TIMELR = [r3, #0x0C], ALARM_0 = [r3, #0x10], INTR = [r3, #0x3C],
+//   INTE = [r3, #0x40], INTS = [r3, #0x48] — all identical to TIMER0.
+//
+// Only the movw/movt pair building r3 changes:
+//   TIMER0: movw r3, #0x0000 / movt r3, #0x400B
+//   TIMER1: movw r3, #0x8000 / movt r3, #0x400B
+//
+// movw R3, #0x8000: imm16 = 0x8000
+//   imm4 = 8 (bits[15:12]), i = 0 (bit[11]), imm3 = 0 (bits[10:8]),
+//   imm8 = 0x00 (bits[7:0])
+//   hw0 = 0xF240 | (0 << 10) | 8 = 0xF248
+//   hw1 = (0 << 12) | (3 << 8) | 0 = 0x0300
+// movt R3, #0x400B — unchanged from TIMER0.
+#[rustfmt::skip]
+const SLED_TIMER1_ALARM0_FIRE_AND_CLEAR_HW: [u16; 25] = [
+    0xF248, //  [ 0] movw r3, #0x8000       ; r3 = TIMER1_BASE low half
+    0x0300, //  [ 1]
+    0xF2C4, //  [ 2] movt r3, #0x400B       ; r3 = 0x400B_8000
+    0x030B, //  [ 3]
+    0x68D8, //  [ 4] ldr  r0, [r3, #0x0C]   ; r0 = TIMELR (µs snapshot)
+    0xF240, //  [ 5] movw r1, #1000         ; r1 = 1000 µs offset
+    0x31E8, //  [ 6]
+    0x1840, //  [ 7] adds r0, r0, r1        ; r0 = target_us
+    0x6118, //  [ 8] str  r0, [r3, #0x10]   ; ALARM_0 = target (arms alarm 0)
+    0x2101, //  [ 9] movs r1, #1            ; r1 = 1 (bit0 mask)
+    0x6419, //  [10] str  r1, [r3, #0x40]   ; INTE = 1 (alarm-0 int enable)
+    0x6C9A, //  [11] ldr  r2, [r3, #0x48]   ; loop: r2 = INTS
+    0x420A, //  [12] tst  r2, r1            ;   Z=1 if INTS.bit0 == 0
+    0xD0FC, //  [13] beq  loop              ;   offset = -8 (back to [11])
+    0x63D9, //  [14] str  r1, [r3, #0x3C]   ; INTR = 1 (W1C alarm-0 latch)
+    0xF64B, //  [15] movw r4, #0xBEEF       ; r4 low half
+    0x64EF, //  [16]
+    0xF6CD, //  [17] movt r4, #0xDEAD       ; r4 = 0xDEADBEEF
+    0x64AD, //  [18]
+    0xF240, //  [19] movw r5, #0x0300       ; r5 low half
+    0x3500, //  [20]
+    0xF2C2, //  [21] movt r5, #0x2000       ; r5 = 0x2000_0300 (marker slot)
+    0x0500, //  [22]
+    0x602C, //  [23] str  r4, [r5, #0]      ; marker = 0xDEADBEEF
+    0xBE00, //  [24] bkpt #0                ; end of sled
+];
+const SLED_TIMER1_ALARM0_FIRE_AND_CLEAR: &[u8] =
+    &halfwords_to_le_bytes::<25, 50>(SLED_TIMER1_ALARM0_FIRE_AND_CLEAR_HW);
+
+const S_TIMER1_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_TIMER1_BIT),
+    (TICKS_TIMER1_CTRL, TICKS_CTRL_ENABLE),
+];
+const O_TIMER1_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] = &[
+    (TIMER1_INTR, 0x1),
+    (TIMER1_INTE, 0x1),
+    (TIMER1_ARMED, 0x1),
+];
+
+// ---------------------------------------------------------------------------
 // Phase 2 scenarios — UART0, SPI0, I2C0, ADC, PWM
 // ---------------------------------------------------------------------------
 //
@@ -917,6 +1080,46 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         custom_sled: None,
         // Two chained DMA transfers -> at least 8 bus cycles.
         min_sysclks: 8,
+    },
+    // Phase 1 Expansion — SIO unsigned divider.
+    PeriphScenario {
+        name: "sio_divider_unsigned",
+        setup: S_SIO_DIVIDER_UNSIGNED,
+        max_sysclks: 100,
+        observe: O_SIO_DIVIDER_UNSIGNED,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Phase 1 Expansion — SIO signed divider.
+    PeriphScenario {
+        name: "sio_divider_signed",
+        setup: S_SIO_DIVIDER_SIGNED,
+        max_sysclks: 100,
+        observe: O_SIO_DIVIDER_SIGNED,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Phase 1 Expansion — SIO MTIME count + disable (custom sled).
+    PeriphScenario {
+        name: "sio_mtime_count_and_match",
+        setup: S_SIO_MTIME_COUNT_AND_MATCH,
+        max_sysclks: 500,
+        observe: O_SIO_MTIME_COUNT_AND_MATCH,
+        observe_pins: 0,
+        custom_sled: Some(SLED_SIO_MTIME_COUNT_AND_MATCH),
+        min_sysclks: 0,
+    },
+    // Phase 1 Expansion — TIMER1 alarm0 fire and clear (clone of TIMER0).
+    PeriphScenario {
+        name: "timer1_alarm0_fire_and_clear",
+        setup: S_TIMER1_ALARM0_FIRE_AND_CLEAR,
+        max_sysclks: 200_000,
+        observe: O_TIMER1_ALARM0_FIRE_AND_CLEAR,
+        observe_pins: 0,
+        custom_sled: Some(SLED_TIMER1_ALARM0_FIRE_AND_CLEAR),
+        min_sysclks: 12_000,
     },
 ];
 
@@ -1328,8 +1531,26 @@ fn release_common_resets(core: &mut Core) -> Result<(), probe_rs::Error> {
 }
 
 fn apply_setup_hw(core: &mut Core, setup: &[(u32, u32)]) -> Result<(), probe_rs::Error> {
+    const RESETS_CLR_ADDR: u32 = RESETS_RESET + ALIAS_CLR;
+
     for &(addr, val) in setup {
         core.write_word_32(addr as u64, val)?;
+
+        // After releasing peripherals from reset, wait for the reset
+        // tree to propagate.  On RP2350, RESETS.RESET_DONE reflects
+        // which peripherals have fully exited reset.  Without this
+        // barrier the very next DAP write can arrive before the
+        // peripheral's register file is accessible, silently dropping
+        // the configuration (observed on DMA — see the test_silicon
+        // baseline journal 2026-04-16).
+        if addr == RESETS_CLR_ADDR && val != 0 {
+            loop {
+                let done = core.read_word_32(RESETS_RESET_DONE as u64)?;
+                if done & val == val {
+                    break;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1916,6 +2137,14 @@ mod tests {
             validate_custom_sled(SLED_TICKS_TIMER0_RETARGET).is_ok(),
             "ticks_timer0_retarget_halves_rate sled must validate",
         );
+        assert!(
+            validate_custom_sled(SLED_SIO_MTIME_COUNT_AND_MATCH).is_ok(),
+            "sio_mtime_count_and_match sled must validate",
+        );
+        assert!(
+            validate_custom_sled(SLED_TIMER1_ALARM0_FIRE_AND_CLEAR).is_ok(),
+            "timer1_alarm0_fire_and_clear sled must validate",
+        );
     }
 
     // ---- Catalogue presence tests for Stage 4 scenarios -----------------
@@ -2008,6 +2237,8 @@ mod tests {
             "clock_div_change_pio_running",
             "timer0_alarm0_fire_and_clear",
             "ticks_timer0_retarget_halves_rate",
+            "sio_mtime_count_and_match",
+            "timer1_alarm0_fire_and_clear",
         ]
         .into_iter()
         .collect();
