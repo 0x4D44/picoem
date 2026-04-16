@@ -45,11 +45,13 @@ pub const PIO_SM_EXECCTRL_OFF: u32 = 0x04;
 pub const PIO_SM_ADDR_OFF: u32 = 0x0C;
 pub const PIO_SM_PINCTRL_OFF: u32 = 0x14;
 pub const PIO_IRQ_OFF: u32 = 0x030;
-pub const PIO_INTR_OFF: u32 = 0x128;
-pub const PIO_IRQ0_INTE_OFF: u32 = 0x12C;
-pub const PIO_IRQ0_INTS_OFF: u32 = 0x134;
-pub const PIO_IRQ1_INTE_OFF: u32 = 0x138;
-pub const PIO_IRQ1_INTS_OFF: u32 = 0x140;
+pub const PIO_INTR_OFF: u32 = 0x16C;
+pub const PIO_IRQ0_INTE_OFF: u32 = 0x170;
+pub const PIO_IRQ0_INTF_OFF: u32 = 0x174;
+pub const PIO_IRQ0_INTS_OFF: u32 = 0x178;
+pub const PIO_IRQ1_INTE_OFF: u32 = 0x17C;
+pub const PIO_IRQ1_INTF_OFF: u32 = 0x180;
+pub const PIO_IRQ1_INTS_OFF: u32 = 0x184;
 
 /// Compute the absolute address of `SMx_<field>` for a given PIO base.
 pub const fn pio_sm_addr(base: u32, sm: u32, field_off: u32) -> u32 {
@@ -611,9 +613,11 @@ const SIO_DIV_REMAINDER: u32 = 0xD000_0074;
 const SIO_DIV_CSR: u32 = 0xD000_0078;
 
 // SIO MTIME register addresses (RP2350 §3.1.2).
-const SIO_MTIME_CTRL: u32 = 0xD000_01A0;
-const SIO_MTIME_LO: u32 = 0xD000_01A8;
-const SIO_MTIME_HI: u32 = 0xD000_01AC;
+// NOTE: 0x1A0 is RISCV_SOFTIRQ (not MTIME_CTRL). Correct map:
+//   0x1A0 = RISCV_SOFTIRQ, 0x1A4 = MTIME_CTRL, 0x1B0 = MTIME_LO, 0x1B4 = MTIME_HI.
+const SIO_MTIME_CTRL: u32 = 0xD000_01A4;
+const SIO_MTIME_LO: u32 = 0xD000_01B0;
+const SIO_MTIME_HI: u32 = 0xD000_01B4;
 
 // TIMER1 base (RP2350 datasheet §12.8, `0x400B_8000`).
 pub const TIMER1_BASE: u32 = 0x400B_8000;
@@ -660,7 +664,7 @@ const O_SIO_MTIME_COUNT_AND_MATCH: &[(u32, u32)] = &[
 // Custom sled for `sio_mtime_count_and_match`.
 //
 // Structure:
-//   - Build R0 = MTIME_CTRL address (0xD000_01A0) via movw + movt.
+//   - Build R0 = MTIME_CTRL address (0xD000_01A4) via movw + movt.
 //   - MOVS R1, #1 — enable value.
 //   - STR R1, [R0, #0] — MTIME_CTRL = 1 (enable counting).
 //   - MOVS R2, #50 — spin counter.
@@ -670,21 +674,21 @@ const O_SIO_MTIME_COUNT_AND_MATCH: &[(u32, u32)] = &[
 //   - BKPT #0.
 //
 // Registers used:
-//   R0 — MTIME_CTRL address (0xD000_01A0)
+//   R0 — MTIME_CTRL address (0xD000_01A4)
 //   R1 — enable/disable value
 //   R2 — spin counter
 //
 // Thumb-2 encodings:
-//   movw R0, #0x01A0: imm4=0, i=0, imm3=1, imm8=0xA0
-//     hw0 = 0xF240, hw1 = 0x10A0
+//   movw R0, #0x01A4: imm4=0, i=0, imm3=1, imm8=0xA4
+//     hw0 = 0xF240, hw1 = 0x10A4
 //   movt R0, #0xD000: imm4=0xD, i=0, imm3=0, imm8=0x00
 //     hw0 = 0xF2CD, hw1 = 0x0000
 #[rustfmt::skip]
 const SLED_SIO_MTIME_COUNT_AND_MATCH_HW: [u16; 12] = [
-    0xF240, //  [ 0] movw r0, #0x01A0 hw0  ; r0 = MTIME_CTRL low half
-    0x10A0, //  [ 1] movw r0, #0x01A0 hw1  ; (imm3=1, Rd=0, imm8=0xA0)
+    0xF240, //  [ 0] movw r0, #0x01A4 hw0  ; r0 = MTIME_CTRL low half
+    0x10A4, //  [ 1] movw r0, #0x01A4 hw1  ; (imm3=1, Rd=0, imm8=0xA4)
     0xF2CD, //  [ 2] movt r0, #0xD000 hw0  ; r0 high half (imm4=0xD)
-    0x0000, //  [ 3] movt r0, #0xD000 hw1  ; r0 = 0xD000_01A0
+    0x0000, //  [ 3] movt r0, #0xD000 hw1  ; r0 = 0xD000_01A4
     0x2101, //  [ 4] movs r1, #1           ; r1 = 1 (enable)
     0x6001, //  [ 5] str  r1, [r0, #0]     ; MTIME_CTRL = 1 (start counting)
     0x2232, //  [ 6] movs r2, #50          ; r2 = spin counter
@@ -994,31 +998,33 @@ const O_ADC_ROUND_ROBIN_2CH: &[(u32, u32)] = &[
 
 // S_PIO0_INT_ROUTING_SPLIT — Phase 4.1: PIO0 SM0 asserts IRQ flag 0;
 // INT0_INTE enables flag 0 only, INT1_INTE enables flag 1 only.
-// After running, IRQ0_INTS must show bit 0 set, IRQ1_INTS must be 0.
+// After running, IRQ0_INTS must show bit 8 set (SM0/IRQ-flag-0 position in the
+// 16-bit INTR layout: bits [15:8]=SM7..SM0, [7:4]=TXNFULL, [3:0]=RXNEMPTY).
+// IRQ1_INTS must be 0 because SM0 never asserts IRQ flag 1.
 const S_PIO0_INT_ROUTING_SPLIT: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
-    // INSTR_MEM[0] = IRQ SET 0 (opcode 110, no delay, index=0): 0xC000
+    // INSTR_MEM[0] = IRQ SET 0 (opcode 0xC000): asserts PIO IRQ flag 0
     (pio_instr_mem_addr(PIO0_BASE, 0), 0xC000),
     // INSTR_MEM[1] = JMP 1 (spin in place): 0x0001
     (pio_instr_mem_addr(PIO0_BASE, 1), 0x0001),
     // SM0 CLKDIV = 1.0 (integer=1, frac=0)
     (pio_sm_addr(PIO0_BASE, 0, PIO_SM_CLKDIV_OFF), 0x0001_0000),
-    // INT0_INTE = 0x001 — enable IRQ flag 0 on NVIC line 0
-    (PIO0_BASE + PIO_IRQ0_INTE_OFF, 0x001),
-    // INT1_INTE = 0x002 — enable IRQ flag 1 on NVIC line 1
-    // (SM0 never sets flag 1, so line 1 must stay quiet)
-    (PIO0_BASE + PIO_IRQ1_INTE_OFF, 0x002),
+    // IRQ0_INTE = 0x100 — bit 8 = SM0/IRQ-flag-0 (RP2350 ds Table 1019)
+    (PIO0_BASE + PIO_IRQ0_INTE_OFF, 0x100),
+    // IRQ1_INTE = 0x200 — bit 9 = SM1/IRQ-flag-1
+    // (SM0 never sets flag 1, so NVIC line 1 must stay quiet)
+    (PIO0_BASE + PIO_IRQ1_INTE_OFF, 0x200),
     // Enable SM0
     (PIO0_BASE + PIO_CTRL_OFF + ALIAS_SET, 0x0000_0001),
 ];
 const O_PIO0_INT_ROUTING_SPLIT: &[(u32, u32)] = &[
-    // IRQ0_INTS: bit 0 must be set (IRQ flag 0 enabled on line 0).
-    // Mask to 12-bit field.
-    (PIO0_BASE + PIO_IRQ0_INTS_OFF, 0xFFF),
-    // IRQ1_INTS: must be 0 (flag 1 never set by SM0).
-    // Mask to 12-bit field — all bits must be 0.
-    (PIO0_BASE + PIO_IRQ1_INTS_OFF, 0xFFF),
-    // Also check raw IRQ register — bit 0 must be set (SM0 asserted it).
+    // IRQ0_INTS at 0x178: bit 8 must be set (IRQ flag 0 enabled on line 0).
+    // Mask to 16-bit field.
+    (PIO0_BASE + PIO_IRQ0_INTS_OFF, 0xFFFF),
+    // IRQ1_INTS at 0x184: must be 0 (flag 1 never set by SM0).
+    // Mask to 16-bit field — all bits must be 0.
+    (PIO0_BASE + PIO_IRQ1_INTS_OFF, 0xFFFF),
+    // Also check raw IRQ register — bit 0 must be set (SM0 asserted flag 0).
     (PIO0_BASE + PIO_IRQ_OFF, 0xFF),
 ];
 
@@ -1142,8 +1148,11 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_UART0_RX_LOOPBACK,
         observe_pins: 0,
         custom_sled: None,
-        // 1 byte at 115200 baud ~ 13_000 sys_clks for TX drain + loopback.
-        min_sysclks: 10_000,
+        // 1 byte at 115200 baud @ 150 MHz ~ 13_020 sys_clks for TX drain.
+        // LBE loopback adds FIFO pipeline latency on top. 25_000 gives ~2x
+        // margin over the bare baud-rate minimum so silicon is never sampled
+        // mid-TX (silicon observed UARTFR=0x18 BUSY|RXFE at 10_000).
+        min_sysclks: 25_000,
     },
     // Phase 2 — SPI0 loopback round-trip.
     PeriphScenario {
@@ -1284,7 +1293,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         min_sysclks: 300,
     },
     // Phase 4.1 — PIO0 INTn routing split. SM0 asserts IRQ flag 0;
-    // INT0_INTE enables flag 0 only (→ IRQ0_INTS has bit 0 set).
+    // INT0_INTE enables flag 0 only (→ IRQ0_INTS has bit 8 set;
+    // RP2350 INTR layout: IRQ flag 0 at bit position 8).
     // INT1_INTE enables flag 1 only (→ IRQ1_INTS stays 0 because SM0
     // never sets flag 1). Validates that the emulator routes each PIO
     // IRQ flag through the per-line INTE mask rather than over-routing
