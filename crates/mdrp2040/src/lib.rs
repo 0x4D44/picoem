@@ -14,6 +14,8 @@
 //!
 //! See `wrk_docs/2026.04.14 - HLD - mdpicoem Workspace Restructure.md`.
 
+use tracing::info;
+
 pub mod bus;
 pub mod core;
 pub mod dma;
@@ -711,6 +713,11 @@ impl EmulatorBuilder {
         if let Some(bytes) = self.flash {
             emu.load_flash(&bytes);
         }
+        info!(
+            rom_size = ROM_SIZE,
+            sram_size = SRAM_SIZE,
+            "emulator constructed"
+        );
         emu
     }
 }

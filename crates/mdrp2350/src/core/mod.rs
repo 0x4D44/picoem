@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use mdpicoem_common::Divider;
 
+use tracing::info;
+
 use crate::bus::Bus;
 use crate::bus::ppb::Ppb;
 use crate::threaded::CoreAtomics;
@@ -435,6 +437,10 @@ impl CortexM33 {
             if busfault_ena {
                 cycles = self.enter_exception(5, bus);
             } else {
+                info!(
+                    pc = format_args!("{:#010x}", self.current_instr_addr),
+                    "HardFault escalation from BusFault",
+                );
                 self.ppb.hfsr |= 1 << 30;
                 cycles = self.enter_exception(3, bus);
             }

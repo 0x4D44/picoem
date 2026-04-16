@@ -1,3 +1,5 @@
+use tracing::trace;
+
 use mdpicoem_common::Fifo;
 
 /// Single-cycle IO block.
@@ -387,6 +389,7 @@ impl Sio {
         let mask = 1u32 << n;
         if self.spinlock_bits & mask == 0 {
             self.spinlock_bits |= mask;
+            trace!(lock_id = n, "spinlock acquired");
             mask
         } else {
             0
@@ -398,6 +401,7 @@ impl Sio {
         let n = ((offset - 0x100) >> 2) as u32;
         debug_assert!(n < 32);
         self.spinlock_bits &= !(1u32 << n);
+        trace!(lock_id = n, "spinlock released");
     }
 
     // Integer divider helpers moved to `core::PerCoreSio` in Phase 3

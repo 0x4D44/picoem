@@ -1,5 +1,8 @@
 use std::sync::atomic::Ordering;
 
+use tracing::{debug, info};
+
+
 use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY,
     FPCCR_SPLIMVIOL};
 use super::{CortexM33, CoreBus, Fault};
@@ -209,6 +212,14 @@ impl CortexM33 {
         self.regs.sync_sp_from_banked();
         self.it_state = 0;
 
+        debug!(
+            exception_num = exc_num,
+            priority = %self.ppb.exception_priority(exc_num),
+            pc = format_args!("{:#010x}", vector & !1),
+            lr = format_args!("{:#010x}", self.regs.lr()),
+            "exception entry",
+        );
+
         12
     }
 
@@ -335,6 +346,12 @@ impl CortexM33 {
 
         // Clear active exception
         self.ppb.clear_active(active_exc as u16);
+
+        debug!(
+            exc_return = format_args!("{:#010x}", exc_return),
+            restored_pc = format_args!("{:#010x}", return_pc & !1),
+            "exception return",
+        );
 
         12
     }
@@ -505,6 +522,10 @@ impl CortexM33 {
                     // USGFAULTENA
                     self.enter_exception(6, bus)
                 } else {
+                    info!(
+                        pc = format_args!("{:#010x}", self.current_instr_addr),
+                        "HardFault escalation from UsageFault",
+                    );
                     self.ppb.hfsr |= 1 << 30; // FORCED
                     self.enter_exception(3, bus) // escalate to HardFault
                 }
@@ -517,6 +538,10 @@ impl CortexM33 {
                     // MEMFAULTENA
                     self.enter_exception(4, bus)
                 } else {
+                    info!(
+                        pc = format_args!("{:#010x}", self.current_instr_addr),
+                        "HardFault escalation from MemManage",
+                    );
                     self.ppb.hfsr |= 1 << 30; // FORCED
                     self.enter_exception(3, bus) // escalate to HardFault
                 }
@@ -538,6 +563,10 @@ impl CortexM33 {
                 let ipsr = self.regs.ipsr();
                 if ipsr == 2 {
                     // NMI-in-NMI — cannot preempt itself. Escalate to HardFault.
+                    info!(
+                        pc = format_args!("{:#010x}", self.current_instr_addr),
+                        "HardFault escalation from NMI-in-NMI",
+                    );
                     self.ppb.hfsr |= 1 << 30; // FORCED
                     self.enter_exception(3, bus)
                 } else {

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
+use tracing::debug;
+
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
 use crate::threaded::CoreAtomics;
 use crate::dma::{DMA_BASE, Dma};
@@ -588,6 +590,13 @@ impl Bus {
 
         self.clock_tree.ref_clk_hz = ref_hz;
         self.clock_tree.sys_clk_hz = sys_hz;
+
+        debug!(
+            sys_clk_hz = sys_hz,
+            ref_clk_hz = ref_hz,
+            peri_clk_hz = self.clock_tree.peri_clk_hz,
+            "clock tree recomputed",
+        );
     }
 
     // --- XIP SRAM helpers (0x1C00_0000..0x1C00_3FFF) ---

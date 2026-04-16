@@ -19,6 +19,8 @@ mod execute_wide;
 pub(crate) mod exceptions;
 pub mod nvic;
 
+use tracing::info;
+
 use crate::bus::Bus;
 pub use nvic::Nvic;
 pub use registers::Registers;
@@ -237,6 +239,11 @@ impl CortexM0Plus {
         // instruction also raised a pending_fault, the bus fault takes
         // precedence (clearing the other keeps us from double-stacking).
         if bus.bus_fault() {
+            info!(
+                pc = format_args!("{:#010x}", self.current_instr_addr),
+                addr = format_args!("{:#010x}", bus.bus_fault_addr()),
+                "HardFault escalation from bus fault"
+            );
             bus.clear_bus_fault();
             self.pending_fault = Some(Fault::HardFault);
         }

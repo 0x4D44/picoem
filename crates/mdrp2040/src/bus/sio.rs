@@ -20,6 +20,8 @@
 //! * **No** MTIME — RP2040 lacks the platform timer.
 //! * **No** coprocessor bridge FIFO.
 
+use tracing::trace;
+
 use mdpicoem_common::{Divider, Fifo};
 
 /// RP2040 GPIO pin mask — 30 valid GPIOs (bits [29:0]).
@@ -394,6 +396,7 @@ impl Sio {
         let mask = 1u32 << n;
         if self.spinlock_bits & mask == 0 {
             self.spinlock_bits |= mask;
+            trace!(lock_id = n, "spinlock acquired");
             mask
         } else {
             0
@@ -404,6 +407,7 @@ impl Sio {
         let n = ((offset - 0x100) >> 2) as u32;
         debug_assert!(n < 32);
         self.spinlock_bits &= !(1u32 << n);
+        trace!(lock_id = n, "spinlock released");
     }
 
     // --- Divider helpers ---------------------------------------------------

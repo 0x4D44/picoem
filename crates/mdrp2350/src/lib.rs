@@ -11,6 +11,8 @@ pub mod sio;
 pub mod pio;
 pub mod threaded;
 
+use tracing::info;
+
 #[cfg(test)]
 mod pio_tests;
 
@@ -578,6 +580,13 @@ impl EmulatorBuilder {
         if self.config.sys_clk_hz != Config::default().sys_clk_hz {
             bus.seed_sys_clk_hz(self.config.sys_clk_hz);
         }
+        info!(
+            rom_size = memory::ROM_SIZE,
+            sram_size = memory::SRAM_SIZE,
+            step_quantum = self.step_quantum,
+            sys_clk_hz = bus.sys_clk_hz(),
+            "emulator constructed",
+        );
         Emulator {
             cores: [
                 CortexM33::new(0, Arc::clone(&atomics)),

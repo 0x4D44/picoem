@@ -17,6 +17,8 @@
 //!
 //! Cycle counts: entry ≈ 16, exit ≈ 12 (M0+ TRM typical).
 
+use tracing::debug;
+
 use crate::bus::Bus;
 use super::{CortexM0Plus, Fault};
 
@@ -146,6 +148,15 @@ impl CortexM0Plus {
         self.regs.sync_sp_from_banked();
 
         bus.ppb[bus.active_core()].mark_active(exc_num);
+
+        debug!(
+            exception_num = exc_num,
+            priority = %bus.ppb[bus.active_core()].exception_priority(exc_num),
+            pc = format_args!("{:#010x}", vector & !1),
+            lr = format_args!("{:#010x}", self.regs.lr()),
+            "exception entry"
+        );
+
         16
     }
 
@@ -238,6 +249,12 @@ impl CortexM0Plus {
 
         // Drop the outgoing exception from the active set.
         bus.ppb[bus.active_core()].clear_active(active_exc as u16);
+
+        debug!(
+            exc_return = format_args!("{:#010x}", exc_return),
+            restored_pc = format_args!("{:#010x}", return_pc & !1),
+            "exception return"
+        );
 
         12
     }

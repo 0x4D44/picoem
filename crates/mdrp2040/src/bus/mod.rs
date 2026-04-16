@@ -28,6 +28,8 @@ pub mod sio;
 use std::collections::HashMap;
 use std::io::Write;
 
+use tracing::debug;
+
 use mdpicoem_common::PioBlock;
 use mdpicoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
@@ -481,6 +483,12 @@ impl Bus {
             &self.pll_usb_regs,
             &mut self.clock_tree,
         );
+        debug!(
+            sys_clk_hz = self.clock_tree.sys_clk_hz,
+            ref_clk_hz = self.clock_tree.ref_clk_hz,
+            peri_clk_hz = self.clock_tree.peri_clk_hz,
+            "clock tree recomputed"
+        );
     }
 
     // --- Flash / XIP management ------------------------------------------
@@ -504,6 +512,16 @@ impl Bus {
 
     pub fn clear_bus_fault(&mut self) {
         self.bus_fault = false;
+    }
+
+    /// Set the sticky bus-fault flag and record the faulting address.
+    /// Emits a tracing event on the cold path so unmapped accesses are
+    /// observable without throwaway `eprintln!`.
+    #[inline]
+    fn set_bus_fault(&mut self, addr: u32) {
+        debug!(addr = format_args!("{:#010x}", addr), "unmapped bus access");
+        self.bus_fault = true;
+        self.bus_fault_addr = addr;
     }
 
     // --- Direct peek/poke (bypasses decode, still routes through regions)
@@ -916,8 +934,7 @@ impl Bus {
                     self.last_access_cycles += self.note_sram_access(addr);
                     self.memory.sram_read8(off)
                 } else {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.set_bus_fault(addr);
                     0
                 }
             }
@@ -944,8 +961,7 @@ impl Bus {
                 word.to_le_bytes()[(addr & 3) as usize]
             }
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.set_bus_fault(addr);
                 0
             }
         };
@@ -969,8 +985,7 @@ impl Bus {
                     self.last_access_cycles += self.note_sram_access(addr);
                     self.memory.sram_read16(off)
                 } else {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.set_bus_fault(addr);
                     0
                 }
             }
@@ -1000,8 +1015,7 @@ impl Bus {
                 [word as u16, (word >> 16) as u16][half]
             }
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.set_bus_fault(addr);
                 0
             }
         };
@@ -1025,8 +1039,7 @@ impl Bus {
                     self.last_access_cycles += self.note_sram_access(addr);
                     self.memory.sram_read32(off)
                 } else {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.set_bus_fault(addr);
                     0
                 }
             }
@@ -1040,8 +1053,7 @@ impl Bus {
                 }
             }
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.set_bus_fault(addr);
                 0
             }
         };
@@ -1071,8 +1083,7 @@ impl Bus {
                     // flavours for DMA, not peripheral XOR/SET/CLR.
                     self.memory.sram_write8(off, val);
                 } else {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.set_bus_fault(addr);
                 }
             }
             0x4 | 0x5 => {
@@ -1143,8 +1154,7 @@ impl Bus {
             _ => {
                 // Unmapped at any width sets the sticky bus-fault flag so
                 // step() can escalate to HardFault.
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.set_bus_fault(addr);
             }
         }
     }
@@ -1167,8 +1177,7 @@ impl Bus {
                     // (RP2040 datasheet §2.1.2).
                     self.memory.sram_write16(off, val);
                 } else {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.set_bus_fault(addr);
                 }
             }
             0x4 | 0x5 => {
@@ -1233,8 +1242,7 @@ impl Bus {
             }
             0x0 | 0x1 => {} // ROM / XIP flash — silently ignored at any width
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.set_bus_fault(addr);
             }
         }
     }
@@ -1267,8 +1275,7 @@ impl Bus {
                     // (RP2040 datasheet §2.1.2).
                     self.memory.sram_write32(off, val);
                 } else {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.set_bus_fault(addr);
                 }
             }
             0x4 | 0x5 => {
@@ -1283,8 +1290,7 @@ impl Bus {
             }
             0x0 => {} // ROM — silently ignored at any width
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.set_bus_fault(addr);
             }
         }
     }
