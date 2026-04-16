@@ -1751,6 +1751,19 @@ fn release_common_resets(core: &mut Core) -> Result<(), probe_rs::Error> {
 
 fn apply_setup_hw(core: &mut Core, setup: &[(u32, u32)]) -> Result<(), probe_rs::Error> {
     const RESETS_CLR_ADDR: u32 = RESETS_RESET + ALIAS_CLR;
+    // RP2350 RESETS.RESET is a 29-bit field (bits 0..=28). Reserved bits
+    // 29..=31 are RAZ on RESET_DONE, so a scenario that writes
+    // `RESETS_CLR_ALL = 0xFFFF_FFFF` to the ALIAS_CLR (harmless — reserved
+    // bits are RAZ/WI on writes) would otherwise spin forever waiting for
+    // those reserved bits to read back as 1. Mask the poll to the
+    // implemented bits.
+    const RESETS_IMPLEMENTED_MASK: u32 = 0x1FFF_FFFF;
+    // Real peripherals exit reset in microseconds; 50 ms is a generous
+    // ceiling that still keeps scenarios snappy. Observed in practice
+    // that RESETS_DONE doesn't always read back the full implemented
+    // mask even long after clearing — scenarios that depend on a
+    // specific peripheral should narrow `val` to that peripheral's bit.
+    const RESETS_DONE_TIMEOUT: Duration = Duration::from_millis(50);
 
     for &(addr, val) in setup {
         core.write_word_32(addr as u64, val)?;
@@ -1763,10 +1776,21 @@ fn apply_setup_hw(core: &mut Core, setup: &[(u32, u32)]) -> Result<(), probe_rs:
         // the configuration (observed on DMA — see the test_silicon
         // baseline journal 2026-04-16).
         if addr == RESETS_CLR_ADDR && val != 0 {
-            loop {
-                let done = core.read_word_32(RESETS_RESET_DONE as u64)?;
-                if done & val == val {
-                    break;
+            let wait_mask = val & RESETS_IMPLEMENTED_MASK;
+            if wait_mask != 0 {
+                let deadline = Instant::now() + RESETS_DONE_TIMEOUT;
+                loop {
+                    let done = core.read_word_32(RESETS_RESET_DONE as u64)?;
+                    if done & wait_mask == wait_mask {
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        // Don't hang forever if a peripheral never comes
+                        // out of reset; let the scenario proceed and fail
+                        // on observation rather than masking it as a
+                        // harness hang.
+                        break;
+                    }
                 }
             }
         }

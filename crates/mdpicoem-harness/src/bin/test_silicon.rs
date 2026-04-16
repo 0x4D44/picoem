@@ -436,13 +436,20 @@ fn run_one_oracle(
 }
 
 fn attach(probe: Option<&DebugProbeSelector>) -> Result<Session, probe_rs::Error> {
-    match probe {
-        None => Session::auto_attach("rp2350", SessionConfig::default()),
+    let mut session = match probe {
+        None => Session::auto_attach("rp2350", SessionConfig::default())?,
         Some(selector) => {
             let probe = Lister::new().open(selector.clone())?;
-            probe.attach("rp2350", Permissions::default())
+            probe.attach("rp2350", Permissions::default())?
         }
-    }
+    };
+    // Reset + halt on attach so the first oracle finds the core in a
+    // known state. Standalone oracle binaries call `reset_and_halt`
+    // themselves right after opening the session; test_silicon skipped
+    // this step and the cycle oracle's first `write_core_reg` landed on
+    // a running target → "An ARM specific error occurred".
+    session.core(0)?.reset_and_halt(Duration::from_millis(500))?;
+    Ok(session)
 }
 
 /// Re-attach with the HLD retry schedule: sleep 1s, then retry every 5s up

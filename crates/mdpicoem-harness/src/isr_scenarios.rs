@@ -1642,9 +1642,17 @@ fn run_one_scenario(
     // HW side
     // --------------------------------------------------------------
 
-    if !core.status()?.is_halted() {
-        core.halt(Duration::from_millis(200))?;
-    }
+    // Reset + halt between scenarios so NVIC pending/active state,
+    // SysTick configuration, SHCSR.PENDSVACT, and other SCB state from
+    // the prior scenario can't leak into this one. Observed in practice:
+    // `isr_lazy_fp_save` hangs when run right after `isr_pendsv_cold` in
+    // catalogue order but passes in isolation — prior scenario left the
+    // CPU in a state where the new scenario's entry executes a stale
+    // exception before reaching its own BKPT. A plain `halt` alone
+    // doesn't clear that. SYSRESETREQ disables DWT/CYCCNT, so re-enable
+    // before the observation logic reaches `reset_cyccnt`.
+    core.reset_and_halt(Duration::from_millis(500))?;
+    enable_cyccnt(core)?;
 
     // Upload the scenario image to SRAM.
     core.write_8(ISR_IMAGE_BASE as u64, sc.image)?;
@@ -2567,5 +2575,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------- ISR oracle delta investigation (2026-04-16) -----------
+
+    /// Run a scenario EMU-side and return the mailbox CYCCNT value the
+    /// handler wrote. Used by the investigation test below to compare
+    /// `isr_pendsv_cold` and `isr_tail_chain_pendsv_systick` in isolation.
+    ///
+    /// Mirrors the EMU-side half of `run_one_scenario` but skips HW.
+    fn run_scenario_emu_mailbox(sc: &IsrScenario) -> u32 {
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        emu.core_mut(1).halt();
+        emu.bus.set_active_core(0);
+
+        // Upload image.
+        for chunk_off in (0..sc.image.len()).step_by(4) {
+            let word = u32::from_le_bytes([
+                sc.image[chunk_off],
+                sc.image[chunk_off + 1],
+                sc.image[chunk_off + 2],
+                sc.image[chunk_off + 3],
+            ]);
+            emu.poke(crate::ISR_IMAGE_BASE + chunk_off as u32, word);
+        }
+        emu.bus.invalidate_all();
+
+        emu.mmio_write32(crate::ISR_MAILBOX_CYCCNT, 0);
+        emu.mmio_write32(FPCCR_ADDR, FPCCR_ASPEN | FPCCR_LSPEN);
+
+        apply_init_regs_emu(&mut emu, sc.init_regs);
+        scenario_preamble_emu(&mut emu, sc.name);
+
+        // Enable DWT CYCCNT.
+        let demcr = emu.mmio_read32(crate::silicon_oracle::DEMCR_U32);
+        emu.mmio_write32(crate::silicon_oracle::DEMCR_U32,
+            demcr | crate::silicon_oracle::TRCENA);
+        let dwt_ctrl = emu.mmio_read32(crate::silicon_oracle::DWT_CTRL_U32);
+        emu.mmio_write32(crate::silicon_oracle::DWT_CTRL_U32,
+            dwt_ctrl | crate::silicon_oracle::CYCCNTENA);
+        emu.mmio_write32(crate::silicon_oracle::DWT_CYCCNT_ADDR, 0);
+
+        // Prime core 0.
+        {
+            let c = emu.core_mut(0);
+            c.wake();
+            c.regs.set_pc(crate::ISR_IMAGE_BASE + sc.entry_offset);
+            c.regs.xpsr = 0x0100_0000;
+            c.regs.r[13] = crate::ISR_STACK_TOP;
+            c.regs.msp = crate::ISR_STACK_TOP;
+            c.regs.r[14] = 0xFFFF_FFFF;
+            c.regs.control = 0;
+            c.regs.primask = 0;
+            c.regs.basepri = 0;
+            c.regs.faultmask = 0;
+        }
+
+        let budget = sc.max_sysclks as u64;
+        let start_cycles = emu.cycles();
+        while !emu.core(0).is_halted() && emu.cycles().saturating_sub(start_cycles) < budget {
+            emu.step();
+        }
+        emu.core_mut(0).halt();
+        emu.bus.set_active_core(0);
+
+        emu.mmio_read32(crate::ISR_MAILBOX_CYCCNT)
+    }
+
+    /// Investigation: measure EMU-side mailbox CYCCNT for both scenarios,
+    /// confirm the ~10-cycle spread between them (previous session
+    /// reported EMU=25 for cold, EMU=15 for tail-chain, both HW=19).
+    ///
+    /// The two scenarios use identical images — same main, same handler
+    /// — so the only EMU-side difference is `scenario_preamble_emu`'s
+    /// SysTick arming for the tail-chain case. Whatever mechanism makes
+    /// the CYCCNT readings diverge is a function of that state.
+    ///
+    /// This test prints the values so `cargo test -- --nocapture` shows
+    /// the current spread; no assertion is load-bearing on cycle count
+    /// (cycle models evolve).
+    #[test]
+    fn test_investigate_cold_vs_tail_chain_emu_cyccnt() {
+        let cold = SCENARIOS.iter().find(|s| s.name == "isr_pendsv_cold").unwrap();
+        let tail = SCENARIOS.iter().find(|s| s.name == "isr_tail_chain_pendsv_systick").unwrap();
+
+        let cold_mbx = run_scenario_emu_mailbox(cold);
+        let tail_mbx = run_scenario_emu_mailbox(tail);
+
+        eprintln!("=== ISR oracle delta investigation ===");
+        eprintln!("isr_pendsv_cold                  mailbox_cyccnt = {cold_mbx}");
+        eprintln!("isr_tail_chain_pendsv_systick    mailbox_cyccnt = {tail_mbx}");
+        eprintln!("delta (cold - tail)              = {}", cold_mbx as i64 - tail_mbx as i64);
+        eprintln!("HW reference (previous session)  = 19 for both");
+
+        // Sanity-check both scenarios actually reached their handler.
+        assert!(cold_mbx > 0, "cold scenario never wrote mailbox");
+        assert!(tail_mbx > 0, "tail-chain scenario never wrote mailbox");
     }
 }
