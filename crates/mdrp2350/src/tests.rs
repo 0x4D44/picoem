@@ -9022,3 +9022,87 @@ fn debug_step_clears_halted() {
     assert!(!emu.cores[0].is_halted(),
         "debug_step should clear halted before stepping");
 }
+
+// ============================================================================
+// Banked SP staleness fix (Phase 2.1)
+// ============================================================================
+//
+// Regular instructions (PUSH, POP, SUB SP, ADD SP) write to r[13] via
+// set_sp() without syncing to the banked msp/psp fields. If an exception
+// fires after SP-modifying instructions, enter_exception must read the
+// current r[13] (via sync_sp_to_banked) rather than the stale banked
+// value. Same applies to exit_exception when unstacking.
+
+#[test]
+fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
+    let mut emu = Emulator::new(Config::default());
+
+    // Build a ROM with vector table + main code + PendSV handler.
+    let mut rom = vec![0u8; 1024];
+
+    // Vector table:
+    //   offset 0x00: Initial SP = 0x2008_0000
+    //   offset 0x04: Reset vector -> 0x100 (Thumb)
+    //   offset 0x38: PendSV vector (exception 14, offset 14*4=56=0x38) -> 0x200 (Thumb)
+    rom[0x00..0x04].copy_from_slice(&0x2008_0000u32.to_le_bytes()); // SP
+    rom[0x04..0x08].copy_from_slice(&0x0000_0101u32.to_le_bytes()); // Reset -> 0x100
+    rom[0x38..0x3C].copy_from_slice(&0x0000_0201u32.to_le_bytes()); // PendSV -> 0x200
+
+    // Main at 0x100: SUB SP, SP, #0x80 (Thumb-16 encoding: 0xB0A0)
+    // Encoding: 1011 0000 1_0100000 = 0xB0A0 (subtract 0x80 = 128 bytes from SP)
+    rom[0x100] = 0xA0; rom[0x101] = 0xB0; // SUB SP, #0x80
+    // 0x102: B . (infinite loop — PendSV will preempt here)
+    rom[0x102] = 0xFE; rom[0x103] = 0xE7;
+
+    // PendSV handler at 0x200: B . (infinite loop so we can inspect state)
+    rom[0x200] = 0xFE; rom[0x201] = 0xE7;
+
+    emu.load_bootrom(&rom);
+    emu.reset();
+
+    // Run a few steps so the core reaches 0x100 and executes the SUB SP.
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    // After reset, SP starts at 0x2008_0000. After SUB SP, #0x80, r[13]
+    // should be 0x2007_FF80. Confirm the SUB executed.
+    let sp_after_sub = emu.cores[0].regs.r[13];
+    assert_eq!(sp_after_sub, 0x2007_FF80,
+        "SP after SUB SP, #0x80 should be 0x2007_FF80, got {:#010x}", sp_after_sub);
+
+    // The banked MSP may be stale (still 0x2008_0000) because set_sp()
+    // only writes r[13]. This is the bug we're testing.
+    // (Don't assert staleness — the fix makes them match; the test
+    // validates the stacked frame uses the correct SP regardless.)
+
+    // Pend PendSV and step to take the exception.
+    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
+    core0_step(&mut emu);
+
+    assert_eq!(emu.cores[0].regs.ipsr(), 14,
+        "should be in PendSV handler after step");
+
+    // The exception frame should have been pushed at the post-SUB SP value
+    // (0x2007_FF80), 8-byte aligned, minus 32 bytes for the basic frame.
+    // 0x2007_FF80 is already 8-byte aligned, so frame_sp = 0x2007_FF80 - 32 = 0x2007_FF60.
+    let expected_frame_sp = 0x2007_FF60u32;
+
+    // The stacked return address (at frame_sp + 24) should point to the
+    // instruction after SUB SP — i.e. the B . at 0x102.
+    let stacked_return_addr = emu.bus.read32(expected_frame_sp.wrapping_add(24), 0);
+    assert_eq!(stacked_return_addr, 0x0000_0102,
+        "stacked return address should be 0x102 (the B . after SUB SP), got {:#010x}",
+        stacked_return_addr);
+
+    // The MSP (banked) should now be the frame SP after entry wrote it back.
+    assert_eq!(emu.cores[0].regs.msp, expected_frame_sp,
+        "banked MSP after exception entry should be frame_sp={:#010x}, got {:#010x}",
+        expected_frame_sp, emu.cores[0].regs.msp);
+
+    // Also verify stacked R0 is readable at the frame base (sanity check
+    // that the frame landed at the right address, not at the stale SP).
+    let stacked_xpsr = emu.bus.read32(expected_frame_sp.wrapping_add(28), 0);
+    // xPSR bit 9 should be 0 (no alignment padding needed since SP was
+    // already 8-byte aligned).
+    assert_eq!(stacked_xpsr & (1 << 9), 0,
+        "no alignment padding expected (SP was 8-aligned)");
+}

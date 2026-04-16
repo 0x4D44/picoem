@@ -85,6 +85,10 @@ impl CortexM33 {
             self.atomics.set_halted(self.core_id as usize);
             return 0;
         }
+        // Plain instructions (PUSH, POP, SUB SP, ADD SP) update r[13]
+        // directly without touching the banked msp/psp fields. Sync now
+        // so the stacking address below reflects the real SP.
+        self.regs.sync_sp_to_banked();
         let use_psp = !self.regs.in_handler_mode() && self.regs.active_sp_is_psp();
         let original_sp = if use_psp { self.regs.psp } else { self.regs.msp };
 
@@ -279,6 +283,9 @@ impl CortexM33 {
             }
         }
 
+        // Handler-mode instructions may have modified r[13] (MSP) without
+        // syncing to the banked field. Flush now for correct unstack addr.
+        self.regs.sync_sp_to_banked();
         let sp = if return_to_psp { self.regs.psp } else { self.regs.msp };
 
         // Pop basic frame

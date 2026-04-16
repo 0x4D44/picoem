@@ -15,10 +15,11 @@
 //
 // Hardware prerequisite: Pico debug probe attached to an RP2354 board.
 // See the HLD §Component 2 and `CLAUDE.md` under "Testing Topology" for
-// the hardware-gated prerequisites. The ISR oracle is directly
-// addressed to `tech_debt.md:295` ("Exception entry/exit not
-// differentially validated") — v1 scenarios are expected to FAIL on the
-// EMU side until mdrp2350's step loop polls ICSR for pending exceptions.
+// the hardware-gated prerequisites. ICSR dispatch IS wired:
+// `try_take_any_pending_exception` (exceptions.rs:422, called at
+// mod.rs:110) polls ICSR.PENDSVSET / PENDSTSET / NMI / NVIC at each
+// instruction boundary. Remaining scenario FAILs surface real
+// divergences, not a missing dispatch path.
 
 use mdpicoem_harness::isr_scenarios::{self, IsrArgs, IsrScenario, SCENARIOS};
 use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_filter, Verdict};

@@ -14,30 +14,15 @@
 // stub, and main routine, all in SRAM, VTOR reprogrammed to point at the
 // SRAM vector table.
 //
-// **Expected EMU behaviour.** As of Stage 6 landing, the mdrp2350 core's
-// `step()` does NOT poll ICSR.PENDSVSET / PENDSTSET between
-// instructions — an `str icsr, #PENDSVSET` write sets the latch but no
-// exception is dispatched. That is exactly the tech-debt item this
-// oracle is designed to expose: see `tech_debt.md:295` ("Exception
-// entry/exit not differentially validated") and HLD §Component 2 rationale.
-// v1 scenarios are expected to FAIL on the EMU side until pending-
-// exception dispatch lands; every FAIL should surface a concrete
-// divergence (CYCCNT delta, stacked frame layout, FPCCR state).
-//
-// **Known EMU limitation — ICSR W1S/W1C semantics.** Per ARMv8-M, writing
-// a 1 to ICSR.PENDSVSET (bit 28) or ICSR.PENDSTSET (bit 26) SETS the
-// corresponding pending bit, and writing a 1 to PENDSVCLR (bit 27) or
-// PENDSTCLR (bit 25) CLEARS it. `crates/mdrp2350/src/bus/ppb.rs` does
-// not currently implement these write-1-to-set / write-1-to-clear
-// semantics — a plain `str` to ICSR lands as a direct register write,
-// not a latch update. The consequence for this oracle is that any EMU
-// run that depends on ICSR write semantics to trigger an exception
-// will miss the trigger entirely; this compounds with the pending-
-// exception dispatch gap above and is part of the same tech-debt fix
-// (tech_debt.md:295, "Exception entry/exit not differentially
-// validated"). TODO: resolve alongside the CortexM33 exception-dispatch
-// landing; when that lands, add PENDSVSET / PENDSTSET / PENDSVCLR /
-// PENDSTCLR write-side handling in ppb.rs.
+// **EMU dispatch status.** ICSR dispatch IS wired: `step()` calls
+// `try_take_any_pending_exception` (exceptions.rs:422) at each
+// instruction boundary (mod.rs:110), which polls ICSR.PENDSVSET /
+// PENDSTSET / NMI / NVIC and takes the highest-priority pending
+// exception. ICSR W1S/W1C write semantics are also implemented
+// (ppb.rs:454-465). Remaining scenario FAILs surface real divergences
+// in stacked-frame layout, FPCCR state, or CYCCNT delta — not a
+// missing dispatch path. See tech_debt.md:314 ("Exception entry/exit
+// not differentially validated") for the broader validation roadmap.
 
 // ---------------------------------------------------------------------------
 // Absolute MMIO constants (RP2350 M33)
