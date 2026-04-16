@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2040"
-version = "0.11.1"
+version = "0.12.1"
 dependencies = [
  "mdpicoem-common",
 ]
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2350"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "mdpicoem-common",
 ]

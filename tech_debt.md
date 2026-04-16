@@ -163,9 +163,21 @@ deliberately do not rearm). See
 twelve per-chip integration tests (`test_pll_cs_*` / `test_pll_usb_*`)
 plus sixteen common-side helper tests cover the blast radius.
 
-### RP2040 core 1 SDK handshake not parsed
+### ~~RP2040 core 1 SDK handshake not parsed~~ (resolved 2026-04-16)
 
-`crates/mdrp2040/src/lib.rs` `maybe_wake_core1` wakes core 1 at its current reset-vector PC on any non-zero FIFO push by core 0. The real Pico SDK `multicore_launch_core1` sends a six-word handshake (0, 0, 1, VTOR, SP, entry) which the bootrom on core 1 parses before jumping. Our emulator ignores VTOR/SP/entry — any real SDK-based multicore firmware will either fault (bad SP) or land at the wrong entry. Fix in Phase 6: parse the six-word handshake in the SIO FIFO path and drive `core 1 wake + SP/PC/VTOR` from the handshake words.
+Resolved by `wrk_docs/2026.04.16 - HLD - RP2040 Core 1 Multicore Launch Handshake.md`. `Sio::fifo_wr` now runs a 6-state FSM for the full `multicore_launch_core1_raw` protocol (0, 0, 1, VTOR, SP, entry) while core 1 is halted; `Emulator::maybe_wake_core1` consumes the emitted `Core1Launch` token and applies VTOR/MSP/PC + `reset_control_for_launch` before waking the core. Covered by T1..T9 in `crates/mdrp2040/tests/multicore.rs` (including the SDK-sender-scripted T9).
+
+### RP2040 multicore launch: entry with Thumb bit clear silently stripped
+
+`Emulator::maybe_wake_core1` and `Emulator::direct_boot_from_flash` both land core 1 with `pc = entry & !1`. On real silicon a BLX target with bit 0 clear raises a UsageFault (escalated to HardFault on M0+). Our emulator silently strips the bit, so malformed vector tables get the wrong diagnostic. Low risk — pico-sdk always sets the Thumb bit on reset-vector words — but if real PicoGUS-like firmware miswrites the handshake `entry` field, our emulator will run where silicon would fault. Fix: validate bit 0 on entry and raise `Fault::InvalidEpsr` / `HardFault` instead. Applies to both sites symmetrically.
+
+### RP2040 multicore launch: SCR.SLEEPDEEP not cleared on core 1 wake
+
+The real RP2040 bootrom at `bootrom_rt0.S:366-368` clears `SCR.SLEEPDEEP` immediately before `BLX` on the freshly-launched core 1. Our `maybe_wake_core1` shortcut skips that write — consistent with `direct_boot_from_flash` which also doesn't touch SCR. Low risk: firmware expects SCR=0 on a fresh launch and a fresh core boots with SCR=0, so the real bootrom's clear is defensive. Fix for parity: in `maybe_wake_core1`, clear `ppb[1].scr & !0x4` (SLEEPDEEP is bit 2) before wake.
+
+### RP2040 SIO address-mask quirk: atomic aliases hit unmapped offsets
+
+`Bus::sio_write32` does `offset = addr & 0xFFF` before dispatch. That strips the atomic-alias bits (bits 12-13), but it also folds `0xD000_2054` (which is outside the SIO window on real silicon — SIO is 4 KB at 0xD000_0000..0xD000_0FFF) down onto `fifo_wr`. Effect: firmware that inadvertently writes to the second SIO-sized page sees our FIFO respond when real silicon would bus-fault. Pre-existing, surfaced while auditing `fifo_wr` for the multicore handshake HLD. Fix: validate `addr` is within `SIO_BASE..SIO_BASE+0x1000` before dispatch, or preserve the alias bits and use proper alias semantics.
 
 ### RP2040 per-instruction dual-core cadence
 
@@ -649,53 +661,36 @@ with zero stall events. All SDK panic paths are cleared.
 Three new blockers surfaced during Phase 5 diagnosis (no audio yet)
 — see entries below.
 
-### PicoGUS: no I2S output — blocked on three sequential peripheral gates
+### PicoGUS: no I2S output — blocked on remaining DMA gate
 
 **Impact: HIGH** for the end-to-end PicoGUS ear-test acceptance.
 None blocks the oracle itself — the SDK panic is cleared, tests are
 green, chime firmware still produces audio.
 
-After the Phase 1-4 fixes (above), PicoGUS v4.0.0 firmware parks at
-SRAM 0x2000d628 — pico-sdk's `busy_wait_us_32` polling TIMER at
-0x40054000+0x28 (TIMERAWL). Our emulator has no TIMER model, so the
-read returns 0, `now - start = 0`, the busy-wait loop never exits.
-Firmware never reaches `main()` or PicoGUS's audio bring-up path.
+Two of three emulator peripheral gates are now resolved; the
+remaining gate is DMA.
 
-**Three sequential gates** (each a separate workstream with its
-own HLD + sprint; ALL needed for audio):
+1. ~~**RP2040 TIMER peripheral model** (blocker-1)~~ — RESOLVED.
+   TIMERAWH/TIMERAWL + ALARM0..3 + NVIC IRQ routing landed.
 
-1. **RP2040 TIMER peripheral model** (blocker-1, MEDIUM impact).
-   Minimum: cycle-driven 64-bit microsecond counter at TIMER_BASE +
-   0x24/0x28 (TIMERAWH/TIMERAWL). Expressed as
-   `bus.cycles / (sys_clk_hz / 1_000_000)`. Probably also needs
-   ALARM0..3 + NVIC IRQ routing for the full SDK — most of
-   pico-sdk's scheduler uses alarms. Scope: ~2 days once someone
-   starts. mdrp2350 has a stub in `bus/clocks.rs` but doesn't model
-   ALARM/IRQ.
+2. ~~**RP2040 core 1 SDK launch handshake** (blocker-2)~~ — RESOLVED
+   2026-04-16 by the multicore-launch HLD. `Sio::fifo_wr` now parses
+   the full `multicore_launch_core1` 6-word handshake; core 1 wakes
+   at the supplied entry with the supplied MSP/VTOR. See
+   `crates/mdrp2040/tests/multicore.rs` T1..T9.
 
-2. **RP2040 core 1 SDK launch handshake** (blocker-2, HIGH impact).
-   PicoGUS runs the ISA service loop on core 1; main on core 0 does
-   the GUS emulation + DMA. Our emulator keeps core 1 halted after
-   reset; `multicore_launch_core1` from the SDK pokes the SIO FIFO
-   with a specific handshake sequence (SP, PC, vtable ptr via the 6
-   FIFO messages) which our SIO currently ignores. mdrp2040 needs
-   to parse that handshake and unhalt core 1. See `bus/sio.rs`
-   FIFO path. Scope: ~1 day.
-
-3. **RP2040 DMA block model** (blocker-3, MEDIUM impact). I2S
-   output is DMA → PIO TX FIFO. No DMA = no PIO FIFO samples ever
-   get loaded = no BCLK/LRCLK/DOUT output even if PIO were
+3. **RP2040 DMA block model** (remaining blocker, MEDIUM impact).
+   I2S output is DMA → PIO TX FIFO. No DMA = no PIO FIFO samples
+   ever get loaded = no BCLK/LRCLK/DOUT output even if PIO were
    programmed. Our emulator's `bus/mod.rs` has a generic
    `peripheral_regs` HashMap fall-through at 0x50000000; DMA writes
-   land there and do nothing. Scope: ~3-5 days, this is the biggest
-   of the three.
+   land there and do nothing. Scope: ~3-5 days.
 
 4. (Non-emulator) Real DOSBox-X trace capture to drive audio,
    tracked as an external dependency in the PicoGUS Integration HLD
    Stage 6.
 
-All three emulator gates are sequential — none of them alone
-produces audio. Order them 1 → 2 → 3; measure progress per-gate.
+After gate-3 lands, audio should finally reach the I2S pins.
 
 ### Secondary finding — ISA-pin idle default matters for diagnostic probes
 

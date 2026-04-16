@@ -878,7 +878,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(post_roll_ns),
     );
     let wall_elapsed = wall_start.elapsed();
-    let (_emu, capture) = sink.into_parts();
+    let (emu, capture) = sink.into_parts();
+    // Core 1 launch check — if `multicore_launch_core1` succeeded, core 1's PC
+    // has advanced past its reset state of 0.
+    let core1_pc = emu.cores[1].regs.pc();
+    let core1_halted = emu.cores[1].is_halted();
 
     // Persist the captured audio. Reject directories and create any
     // missing parent dirs (handled inside `write_wav`).
@@ -911,6 +915,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_SYS_CLK_HZ
     );
     println!("Final cycles:     {}", summary.final_cycles + summary.post_roll_cycles);
+    println!("Core 1 halted:    {}", core1_halted);
+    println!("Core 1 PC:        0x{:08x}", core1_pc);
     println!("Wall elapsed:     {:.3} s", wall_elapsed.as_secs_f64());
     if wall_elapsed.as_secs_f64() > 0.0 {
         let sim_s = summary.final_sim_ns as f64 / 1e9;

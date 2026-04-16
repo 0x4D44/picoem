@@ -25,6 +25,52 @@ use mdpicoem_common::{Divider, Fifo};
 /// RP2040 GPIO pin mask — 30 valid GPIOs (bits [29:0]).
 pub(crate) const PIN_MASK: u32 = 0x3FFF_FFFF;
 
+/// Launch token produced by the multicore handshake FSM on completion of
+/// the 6-word sequence `{0, 0, 1, VTOR, SP, entry}`. Consumed by
+/// `Emulator::step` via [`Sio::take_pending_launch`] to apply VTOR / MSP /
+/// PC on core 1 and wake it.
+#[derive(Debug, Clone, Copy)]
+pub struct Core1Launch {
+    pub vtor: u32,
+    pub sp: u32,
+    pub entry: u32,
+}
+
+/// Pico SDK / bootrom multicore-launch handshake mirror.
+///
+/// See `wrk_docs/2026.04.16 - HLD - RP2040 Core 1 Multicore Launch Handshake.md`.
+/// The FSM is armed iff core 1 is halted (flag tracked eagerly by the
+/// enclosing Emulator via `halt_core1` / `wake_core1`). While armed,
+/// core-0 writes to `SIO_FIFO_WR` are consumed by the FSM — nothing is
+/// pushed into `fifo_to_core1`; the expected response is echoed back into
+/// `fifo_to_core0`.
+struct MulticoreHandshake {
+    /// True iff core 1 is halted (FSM only runs while armed).
+    armed: bool,
+    /// Current expected-word slot (0..=5). Resets to 0 on any mismatch.
+    seq: u8,
+    /// VTOR captured at seq=3.
+    vtor: u32,
+    /// SP captured at seq=4.
+    sp: u32,
+    /// Set at seq=5 on successful handshake completion. Consumed by
+    /// `Emulator::step`.
+    pending_launch: Option<Core1Launch>,
+}
+
+impl Default for MulticoreHandshake {
+    fn default() -> Self {
+        // Core 1 boots halted, so the FSM is armed from construction.
+        Self {
+            armed: true,
+            seq: 0,
+            vtor: 0,
+            sp: 0,
+            pending_launch: None,
+        }
+    }
+}
+
 /// Single-cycle IO block (RP2040).
 pub struct Sio {
     /// GPIO_OUT register (offset 0x010).
@@ -49,6 +95,8 @@ pub struct Sio {
     /// Per-core interpolator register backing store (INTERP0 at 0x080-0x0BC,
     /// INTERP1 at 0x0C0-0x0FC — 32 words per core).
     interp: [[u32; 32]; 2],
+    /// Multicore-launch handshake FSM (per-HLD 2026.04.16).
+    handshake: MulticoreHandshake,
 }
 
 impl Sio {
@@ -64,6 +112,7 @@ impl Sio {
             pending_fifo_event: None,
             divider: [Divider::default(); 2],
             interp: [[0; 32]; 2],
+            handshake: MulticoreHandshake::default(),
         }
     }
 
@@ -79,6 +128,50 @@ impl Sio {
         self.pending_fifo_event = None;
         self.divider = [Divider::default(); 2];
         self.interp = [[0; 32]; 2];
+        // Core 1 is re-halted by `Emulator::reset`, so the FSM re-arms.
+        self.handshake = MulticoreHandshake::default();
+    }
+
+    // --- Multicore handshake plumbing (HLD 2026.04.16) ---------------------
+
+    /// Sync the FSM `armed` flag with core 1's halt state. Called by
+    /// `Emulator::halt_core1` / `Emulator::wake_core1` — the only
+    /// sanctioned path for toggling core 1's halt in production code.
+    /// Direct `cores[1].halt()` / `wake()` bypass this and will drift
+    /// `armed` out of sync with reality (see §5 invariant in the HLD).
+    #[inline]
+    pub fn set_handshake_armed(&mut self, armed: bool) {
+        self.handshake.armed = armed;
+        if !armed {
+            // Wake → FSM disabled. Clear any half-completed progress so
+            // a future re-halt restarts from seq=0.
+            self.handshake.seq = 0;
+            self.handshake.vtor = 0;
+            self.handshake.sp = 0;
+            self.handshake.pending_launch = None;
+        }
+    }
+
+    /// True iff the FSM is armed (core 1 currently halted). Exposed for
+    /// tests (T6 in particular) and for future debuggers.
+    #[inline]
+    pub fn is_handshake_armed(&self) -> bool {
+        self.handshake.armed
+    }
+
+    /// Current FSM slot (0..=5). Advances as valid words land; resets to
+    /// 0 on any mismatch per §2.3. Exposed for tests.
+    #[inline]
+    pub fn handshake_seq(&self) -> u8 {
+        self.handshake.seq
+    }
+
+    /// Consume any pending launch token produced by the FSM. Called by
+    /// `Emulator::step` immediately after each core-0 step; on Some,
+    /// the emulator applies VTOR / MSP / PC to core 1 and wakes it.
+    #[inline]
+    pub fn take_pending_launch(&mut self) -> Option<Core1Launch> {
+        self.handshake.pending_launch.take()
     }
 
     /// 32-bit register read. `offset` is masked to 12 bits by Bus. GPIO_IN
@@ -183,6 +276,15 @@ impl Sio {
     }
 
     fn fifo_wr(&mut self, val: u32, core: usize) {
+        // Armed path: core 0 pushing while core 1 halted. The FSM
+        // consumes `val` — nothing lands in fifo_to_core1 — and the
+        // required echo lands in fifo_to_core0. See §2.3 of the HLD.
+        if core == 0 && self.handshake.armed {
+            self.handshake_step(val);
+            return;
+        }
+
+        // Unarmed path — existing behaviour. Raw IPC push.
         let other = 1 - core;
         let tx_fifo = if core == 0 {
             &mut self.fifo_to_core1
@@ -193,6 +295,79 @@ impl Sio {
             self.pending_fifo_event = Some(other);
         } else {
             self.fifo_wof[core] = true;
+        }
+    }
+
+    /// Drive the multicore-launch FSM for one incoming word from core 0.
+    /// Echoes the protocol-defined response into `fifo_to_core0` and
+    /// signals `pending_fifo_event = Some(0)` so Bus bubbles it up to
+    /// `event_flag[0]` — identical to a user-code push from core 1.
+    ///
+    /// Transition table mirrors §2.3 of the HLD.
+    fn handshake_step(&mut self, val: u32) {
+        let seq = self.handshake.seq;
+        debug_assert!(seq <= 5, "handshake.seq invariant: 0..=5");
+        let (echo, next_seq) = match seq {
+            0 => (0u32, if val == 0 { 1 } else { 0 }),
+            1 => (0u32, if val == 0 { 2 } else { 0 }),
+            2 => {
+                if val == 1 {
+                    (1u32, 3)
+                } else {
+                    (0u32, 0)
+                }
+            }
+            3 => {
+                if val == 0 {
+                    (0u32, 0)
+                } else {
+                    self.handshake.vtor = val;
+                    (val, 4)
+                }
+            }
+            4 => {
+                if val == 0 {
+                    (0u32, 0)
+                } else {
+                    self.handshake.sp = val;
+                    (val, 5)
+                }
+            }
+            5 => {
+                if val == 0 {
+                    (0u32, 0)
+                } else {
+                    self.handshake.pending_launch = Some(Core1Launch {
+                        vtor: self.handshake.vtor,
+                        sp: self.handshake.sp,
+                        entry: val,
+                    });
+                    (val, 0)
+                }
+            }
+            _ => {
+                debug_assert!(false, "handshake.seq out of range: {}", seq);
+                (0u32, 0)
+            }
+        };
+        self.handshake.seq = next_seq;
+
+        // Echo into fifo_to_core0. Sender (core 0) pops this via FIFO_RD
+        // as its `pop_blocking` response. `pending_fifo_event = Some(0)`
+        // so Bus routes the usual FIFO-event bubble into event_flag[0].
+        if self.fifo_to_core0.push(echo) {
+            self.pending_fifo_event = Some(0);
+        } else {
+            // Unreachable on spec traffic: the sender `pop_blocking`s each
+            // echo before the next push, and the FSM only echoes once per
+            // incoming write, so `fifo_to_core0` holds at most one prior
+            // unread echo well under the queue depth. Pin as a debug
+            // invariant; silent drop in release rather than falsely
+            // attributing a WOF to core 1 (the FSM is the sender here).
+            debug_assert!(
+                false,
+                "handshake echo overflowed fifo_to_core0 — sender didn't drain per spec"
+            );
         }
     }
 
@@ -355,11 +530,63 @@ mod tests {
     #[test]
     fn fifo_roundtrip() {
         let mut sio = Sio::new();
+        // Default arm state is on (core 1 halted). Disarm so this test
+        // exercises the raw-IPC pass-through path, not the handshake FSM.
+        sio.set_handshake_armed(false);
         // Core 0 writes -> core 1 reads.
         sio.write32(0x054, 0xDEAD_BEEF, 0);
         assert_eq!(sio.pending_fifo_event, Some(1));
         let _ = sio.pending_fifo_event.take();
         assert_eq!(sio.read32(0x058, 1), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn handshake_fsm_armed_by_default() {
+        let sio = Sio::new();
+        assert!(sio.is_handshake_armed());
+        assert_eq!(sio.handshake_seq(), 0);
+    }
+
+    #[test]
+    fn handshake_seq_advances_on_valid_word() {
+        let mut sio = Sio::new();
+        sio.write32(0x054, 0, 0); // seq 0 -> 1
+        assert_eq!(sio.handshake_seq(), 1);
+        // Echo landed on fifo_to_core0.
+        assert_eq!(sio.read32(0x058, 0), 0);
+    }
+
+    #[test]
+    fn handshake_resets_on_mismatch() {
+        let mut sio = Sio::new();
+        sio.write32(0x054, 0x42, 0); // seq 0 mismatch -> 0
+        assert_eq!(sio.handshake_seq(), 0);
+        assert_eq!(sio.read32(0x058, 0), 0); // echoed 0
+    }
+
+    #[test]
+    fn handshake_produces_launch_on_full_sequence() {
+        let mut sio = Sio::new();
+        let seq = [0u32, 0, 1, 0x2004_0000, 0x2001_0000, 0x2000_1001];
+        for w in seq {
+            sio.write32(0x054, w, 0);
+            let _ = sio.read32(0x058, 0); // drain echo
+        }
+        let launch = sio.take_pending_launch().expect("launch token");
+        assert_eq!(launch.vtor, 0x2004_0000);
+        assert_eq!(launch.sp, 0x2001_0000);
+        assert_eq!(launch.entry, 0x2000_1001);
+    }
+
+    #[test]
+    fn handshake_unarmed_falls_through_to_raw_fifo() {
+        let mut sio = Sio::new();
+        sio.set_handshake_armed(false);
+        sio.write32(0x054, 0x1234_5678, 0);
+        // Raw push into fifo_to_core1; no echo on core-0 RX side.
+        assert_eq!(sio.pending_fifo_event, Some(1));
+        let _ = sio.pending_fifo_event.take();
+        assert_eq!(sio.read32(0x058, 1), 0x1234_5678);
     }
 
     #[test]

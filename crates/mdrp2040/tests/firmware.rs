@@ -91,23 +91,58 @@ fn sio_gpio_out_set_via_bus_write() {
 
 #[test]
 fn core1_stays_halted_until_fifo_wake() {
-    // Use step_quantum=1 so the wake-on-FIFO observation happens in a
-    // single, well-defined step rather than after a 64-instruction drain.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    // Regression for the placeholder "wake-on-any-non-zero push" behaviour
+    // — replaced by the full 6-word SDK handshake (HLD 2026.04.16).
+    // A single non-zero push must NOT wake core 1; only a complete valid
+    // handshake does.
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build();
     assert!(emu.cores[1].is_halted(), "core 1 should be halted at boot");
-    // Core 0 pushes through the SIO FIFO → core 1 wakes.
-    emu.bus.set_active_core(0);
-    emu.bus.write32(SIO_BASE + 0x054, 0xAA);
-    // Step once so `maybe_wake_core1` observes the pending event.
-    // Pre-seed core 0 with a NOP at its current PC so step doesn't fault.
+
+    // Pre-seed core 0 with a NOP so step() never faults during the probe.
     let nop_addr = 0x2001_0000u32;
     emu.bus.write16(nop_addr, 0xBF00);
     emu.cores[0].regs.set_pc(nop_addr);
     emu.cores[0].regs.msp = 0x2002_0000;
     emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
     emu.cores[0].regs.xpsr = 1 << 24;
+
+    // Single non-zero push — at seq=0 the FSM expects a 0; the mismatch
+    // resets seq to 0 and echoes a 0, BUT does not produce a launch.
+    emu.bus.set_active_core(0);
+    emu.bus.write32(SIO_BASE + 0x054, 0xAA);
     emu.step();
-    assert!(!emu.cores[1].is_halted(), "FIFO push should wake core 1");
+    assert!(
+        emu.cores[1].is_halted(),
+        "single non-zero push must not wake core 1 — placeholder semantics gone"
+    );
+
+    // Now the full valid handshake — this MUST wake core 1.
+    const VTOR: u32 = 0x2004_0000;
+    const SP: u32 = 0x2001_0000;
+    const ENTRY: u32 = 0x2000_1001;
+    let seq = [0u32, 0, 1, VTOR, SP, ENTRY];
+    emu.bus.set_active_core(0);
+    for &w in &seq {
+        emu.bus.write32(SIO_BASE + 0x054, w);
+        // Drain the echo so the FSM can run the next slot with a clean
+        // RX queue view (avoids conflating echoes with IPC traffic).
+        let _ = emu.bus.read32(SIO_BASE + 0x058);
+    }
+    // Plant a `B .` self-loop at the entry so that when `emu.step()`
+    // wakes core 1 and (with step_quantum=1) runs one core-1
+    // instruction in the same quantum, PC stays pinned to entry for
+    // the asserts below.
+    emu.bus.write16(ENTRY & !1, 0xE7FE);
+    emu.step();
+    assert!(
+        !emu.cores[1].is_halted(),
+        "full 6-word handshake must wake core 1"
+    );
+    assert_eq!(emu.cores[1].regs.pc(), ENTRY & !1);
+    assert_eq!(emu.cores[1].regs.msp, SP);
+    assert_eq!(emu.bus.ppb[1].vtor, VTOR);
 }
 
 // ---------------------------------------------------------------------------

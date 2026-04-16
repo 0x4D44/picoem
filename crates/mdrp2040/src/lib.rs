@@ -91,9 +91,6 @@ impl Emulator {
             self.cores[i].regs.set_pc(reset_vector & !1);
             self.cores[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
         }
-        // Core 1 stays halted — bootrom on real silicon parks core 1 in
-        // a wait-for-event loop until core 0 sends the wake sequence.
-        self.cores[1].halt();
 
         self.bus.sio.reset();
         self.bus.resets.reset();
@@ -136,6 +133,12 @@ impl Emulator {
         self.bus.end_core1_step();
 
         self.clock = Clock { cycles: 0 };
+
+        // Core 1 stays halted — bootrom on real silicon parks core 1 in
+        // a wait-for-event loop until core 0 sends the wake sequence.
+        // Routed through the wrapper so the SIO handshake FSM `armed`
+        // flag stays in sync with core 1's halt state (HLD §2.1).
+        self.halt_core1();
     }
 
     /// Load a raw binary at the given address. ROM writes are honoured
@@ -222,8 +225,10 @@ impl Emulator {
         self.bus.ppb[0].vtor = vtor_addr;
         self.bus.ppb[1].vtor = vtor_addr;
         // Core 1 stays halted — SDK firmware launches it explicitly via
-        // the SIO FIFO handshake, same as after bootrom hand-off.
-        self.cores[1].halt();
+        // the SIO FIFO handshake, same as after bootrom hand-off. Route
+        // through the wrapper so the handshake FSM re-arms if the caller
+        // used `direct_boot_from_flash` as a mode-switch (§2.1).
+        self.halt_core1();
     }
 
     /// Advance the system by up to `step_quantum` master-clock cycles,
@@ -492,37 +497,80 @@ impl Emulator {
     /// WFE/SEV wake check. Phase 5.A doesn't yet model WFE on M0+;
     /// this is kept as a stub so the quantum-end plumbing lands where
     /// Phase 6 (QEMU-diff validation) can hook in. For now, halted
-    /// core 1 is woken by `maybe_wake_core1` during FIFO traffic.
+    /// core 1 is woken by `maybe_wake_core1` consuming the SDK
+    /// handshake launch token (HLD 2026.04.16).
     fn wake_checks(&mut self) {
         // Consume any unhandled event flags so they don't latch forever.
         self.bus.event_flag[0] = false;
-        // Leave core 1's flag alive — `maybe_wake_core1` observes it
-        // once the FIFO push handshake completes.
+        // event_flag[1] is consumed by the launch consumer below; no
+        // latch-clear required here.
     }
 
-    /// Observe the Pico SDK multicore-wake handshake. When core 0
-    /// writes a non-zero word through FIFO_WR while core 1 is halted,
-    /// pop the word and wake core 1 with SP/PC from the next two
-    /// handshake words (SDK convention).
+    /// Halt core 1 and synchronously re-arm the multicore-launch FSM.
     ///
-    /// TODO(Phase 6): parse the full `multicore_launch_core1` handshake
-    /// (six-word sequence: 0, 0, 1, VTOR, SP, entry) and wake core 1 at
-    /// the supplied entry with the supplied SP/VTOR. Current placeholder
-    /// just wakes core 1 at its reset PC on any non-zero FIFO push —
-    /// enough to exercise the wake plumbing under unit tests, but any
-    /// real SDK-based multicore firmware will land at the wrong entry.
-    fn maybe_wake_core1(&mut self, writer_core: usize) {
-        if writer_core != 0 {
+    /// This is the ONLY sanctioned path for halting core 1 from
+    /// production code. Direct `cores[1].halt()` skips the `armed`
+    /// sync and will silently drift the FSM state against the core's
+    /// actual halt status. See HLD 2026.04.16 §5 (invariants).
+    pub fn halt_core1(&mut self) {
+        self.cores[1].halt();
+        self.bus.sio.set_handshake_armed(true);
+    }
+
+    /// Wake core 1 and synchronously disarm the multicore-launch FSM.
+    ///
+    /// This is the ONLY sanctioned path for waking core 1 from
+    /// production code. The launch consumer in [`Self::maybe_wake_core1`]
+    /// calls this after applying VTOR / MSP / PC; external callers
+    /// (tests simulating a mode switch; future reset-path code) also
+    /// route through here.
+    ///
+    /// `wake_core1` does not touch CPU register state. Callers that need
+    /// a clean architectural baseline (e.g. the launch consumer after a
+    /// re-halt) must call [`CortexM0Plus::reset_control_for_launch`]
+    /// before this.
+    pub fn wake_core1(&mut self) {
+        self.cores[1].wake();
+        self.bus.sio.set_handshake_armed(false);
+    }
+
+    /// Observe the Pico SDK multicore-launch handshake. The armed-path
+    /// FSM in [`crate::bus::Sio::fifo_wr`] consumes core-0 FIFO pushes
+    /// while core 1 is halted; on the 6th valid word the FSM produces a
+    /// [`crate::bus::sio::Core1Launch`] token. This consumer applies
+    /// VTOR / MSP / PC to core 1, resets CONTROL/PSP/xPSR/IPSR/PRIMASK
+    /// to a clean launch baseline, clears any stale `event_flag[1]`,
+    /// and wakes the core via the [`Self::wake_core1`] wrapper (which
+    /// synchronously disarms the FSM).
+    ///
+    /// Called once after each core-0 step so that a pushed-then-popped
+    /// handshake within a single quantum still wakes core 1 in that
+    /// quantum. The `writer_core` argument is unused on this branch —
+    /// the FSM is only armed while core 0 pushes, so a core-1 step
+    /// cannot produce a pending_launch. Kept for call-site-compatibility
+    /// with the replaced placeholder.
+    fn maybe_wake_core1(&mut self, _writer_core: usize) {
+        let Some(launch) = self.bus.sio.take_pending_launch() else {
             return;
-        }
-        if !self.cores[1].is_halted() {
-            return;
-        }
-        if self.bus.event_flag[1] {
-            // A FIFO write occurred — treat as a wake signal.
-            self.bus.event_flag[1] = false;
-            self.cores[1].wake();
-        }
+        };
+        // Invariant: the FSM only arms while core 1 is halted; launch
+        // tokens can only be produced in that state. If this fails we
+        // have a logic bug in the arming mechanism (HLD §2.5).
+        debug_assert!(
+            self.cores[1].is_halted(),
+            "pending_launch emitted against an awake core 1 — arming bug"
+        );
+
+        self.bus.ppb[1].vtor = launch.vtor;
+        self.cores[1].regs.msp = launch.sp;
+        self.cores[1].regs.r[13] = launch.sp;
+        // `entry & !1` matches `direct_boot_from_flash` (silent strip).
+        // On real silicon a Thumb-bit-clear BLX target HardFaults; this
+        // asymmetry is logged in tech_debt.md alongside direct_boot.
+        self.cores[1].regs.set_pc(launch.entry & !1);
+        self.cores[1].reset_control_for_launch();
+        self.bus.event_flag[1] = false; // clear any stale wake signal
+        self.wake_core1();
     }
 
     /// Read a GPIO pin from the merged pin state.
@@ -657,7 +705,9 @@ impl EmulatorBuilder {
             step_quantum: self.step_quantum,
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
-        emu.cores[1].halt();
+        // Route through the wrapper so the SIO handshake FSM `armed`
+        // flag is in sync (HLD 2026.04.16 §2.1 / §5 invariant).
+        emu.halt_core1();
         if let Some(bytes) = self.flash {
             emu.load_flash(&bytes);
         }

@@ -109,6 +109,29 @@ impl CortexM0Plus {
         self.halted = false;
     }
 
+    /// Reset thread-mode architectural state before a multicore-launch
+    /// wake. Mirrors `Emulator::reset`'s per-core init (`lib.rs:83-96`),
+    /// but scoped to the fields that could leak across a halt/launch
+    /// cycle (T5 "rehalt then relaunch" scenario):
+    ///
+    /// * `control = 0`    — SPSEL=0, so r13 aliases MSP after launch.
+    /// * `psp     = 0`    — no stale process-stack pointer.
+    /// * `xpsr    = 1<<24` — T bit set (ARMv6-M is Thumb-only), all
+    ///   other xPSR bits (including the IPSR field at bits [8:0])
+    ///   cleared. This puts the core in thread mode with NZCV=0.
+    /// * `primask = 0`    — interrupts un-masked.
+    ///
+    /// Does NOT touch R0-R12, PC, MSP, or the halted/cycle counters —
+    /// those are either set explicitly by the launch consumer (PC, MSP)
+    /// or intentionally preserved (R0-R12 convey arguments; cycle
+    /// counters are monotonic).
+    pub fn reset_control_for_launch(&mut self) {
+        self.regs.control = 0;
+        self.regs.psp = 0;
+        self.regs.xpsr = 1 << 24;
+        self.regs.primask = 0;
+    }
+
     // --- Test / debug accessors ---
 
     pub fn reg(&self, n: usize) -> u32 {
