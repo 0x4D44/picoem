@@ -95,7 +95,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X} mailbox=0x{ISR_MAILBOX_CYCCNT:08X}",
     );
     println!(
-        "NOTE: v1 expected to FAIL on EMU until pending-exception dispatch lands (tech_debt.md:295)",
+        "NOTE: ICSR dispatch is wired; remaining FAILs surface real divergences (tech_debt.md:314)",
     );
     println!();
 

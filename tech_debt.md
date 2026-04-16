@@ -130,7 +130,9 @@ mdrp2040 Phase 4.A fixed the bug in its own code (2026-04-14).
 
 ### mdrp2350 banked SP staleness in `enter_exception`/`exit_exception`
 
-mdrp2040 Phase 4.B uncovered (and fixed in its own tree) a banked-SP staleness hazard in the shared exception-entry/-exit pattern: `enter_exception` reads `self.regs.msp`/`psp` directly, but plain instructions (`SUB SP,#imm`, `ADD SP,#imm`, `PUSH`, `POP`) update `r[13]` without syncing back to the banked field. Handlers that allocate stack locals then return to unwind from a stale banked SP, corrupting the frame pointer. mdrp2350's `enter_exception`/`exit_exception` has the same shape and was not touched during Phase 4 per review scope. Fix: insert `sync_sp_to_banked()` at the top of both entry/exit and `sync_sp_from_banked()` after SP swaps, mirroring the mdrp2040 Phase 4.B apply-feedback change. Any Pico SDK handler stack-allocating locals will exhibit corruption today.
+mdrp2040 Phase 4.B uncovered (and fixed in its own tree) a banked-SP staleness hazard in the shared exception-entry/-exit pattern: `enter_exception` reads `self.regs.msp`/`psp` directly, but plain instructions (`SUB SP,#imm`, `ADD SP,#imm`, `PUSH`, `POP`) update `r[13]` without syncing back to the banked field. Handlers that allocate stack locals then return to unwind from a stale banked SP, corrupting the frame pointer.
+
+**Resolved (2026-04-16):** `sync_sp_to_banked()` inserted at the top of both `enter_exception` (after lockup check) and `exit_exception` (before unstack address read) in `crates/mdrp2350/src/core/exceptions.rs`, mirroring the mdrp2040 Phase 4.B fix. Unit test `test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp` confirms the frame is stacked at the correct post-SUB address.
 
 ## Phase 5.A Simplifications (RP2040 bus)
 
