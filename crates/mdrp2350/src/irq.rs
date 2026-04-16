@@ -42,9 +42,12 @@ pub const IRQ_TIMER1_IRQ_1: u32 = 5;
 pub const IRQ_TIMER1_IRQ_2: u32 = 6;
 /// TIMER1 alarm 3.
 pub const IRQ_TIMER1_IRQ_3: u32 = 7;
-/// PWM wrap (slices 0-3).
+/// PWM wrap (slices 0-7 — low byte of PWM_INTR/INTE/INTF/INTS).
+/// RP2350 has 12 PWM slices; WRAP_0 covers slices 0..=7 (mask 0x00FF) and
+/// WRAP_1 covers slices 8..=11 (mask 0x0F00). RP2040 had 8 slices split
+/// 0..=3 / 4..=7 — ensure datasheet references are the RP2350 variant.
 pub const IRQ_PWM_IRQ_WRAP_0: u32 = 8;
-/// PWM wrap (slices 4-7).
+/// PWM wrap (slices 8-11 — upper nibble of PWM_INTR/INTE/INTF/INTS).
 pub const IRQ_PWM_IRQ_WRAP_1: u32 = 9;
 /// DMA IRQ line 0.
 pub const IRQ_DMA_IRQ_0: u32 = 10;
@@ -149,6 +152,13 @@ pub const IRQ_COUNT: u32 = 52;
 /// never drive them. `NVIC_ISPR` accepts software-writes to all 52 bits
 /// so `set_pending` calls with an IRQ in 46..=51 still latch.
 pub const PERIPH_IRQ_COUNT: u32 = 46;
+
+/// Bitmask selecting the peripheral-driven IRQ lines (0..=45). Used by
+/// `Bus::raise_irqs_u64` to filter out-of-range bits before they reach
+/// `assert_irq_shared`: a peripheral `mask |= 1 << IRQ_*` typo on a
+/// software-only line (46..=51) would otherwise silently misassert.
+/// Width: 46 bits. Zero-extended to `u64` for mask operations.
+pub const PERIPH_IRQ_MASK: u64 = (1u64 << PERIPH_IRQ_COUNT) - 1;
 
 /// IRQ lines that are routed to a specific core rather than shared
 /// between cores. `bus.assert_irq_core(core, irq)` is the mechanism that

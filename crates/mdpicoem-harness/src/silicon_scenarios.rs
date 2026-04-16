@@ -577,6 +577,145 @@ const O_TICKS_TIMER0_RETARGET: &[(u32, u32)] = &[
     (TIMER0_TIMERAWL, 0x3FF),
 ];
 
+// ---------------------------------------------------------------------------
+// Phase 2 scenarios — UART0, SPI0, I2C0, ADC, PWM
+// ---------------------------------------------------------------------------
+//
+// Per HLD V5 §6 row 2 and the Phase 2 prompt: one silicon scenario per
+// peripheral. Observables use peripheral register state (not pins) per
+// V5 §4 observability constraint.
+
+/// UART0 base and UARTFR / UARTLCR_H / UARTCR / UARTDR offsets.
+const UART0_UARTFR: u32 = UART0_BASE + 0x18;
+const UART0_UARTDR: u32 = UART0_BASE + 0x00;
+const UART0_UARTLCR_H: u32 = UART0_BASE + 0x2C;
+const UART0_UARTCR: u32 = UART0_BASE + 0x30;
+const UARTLCR_H_FEN: u32 = 1 << 4;
+const UARTCR_UARTEN: u32 = 1 << 0;
+const UARTCR_TXE: u32 = 1 << 8;
+/// UARTFR.TXFE at `0x4007_0018` bit 7 — asserted when TX FIFO is
+/// empty, which is the post-drain steady state after one byte ticks out.
+const UARTFR_TXFE_BIT: u32 = 1 << 7;
+
+/// SPI0 SSPCR0/SSPCR1/SSPDR offsets.
+const SPI0_SSPCR0: u32 = SPI0_BASE + 0x00;
+const SPI0_SSPCR1: u32 = SPI0_BASE + 0x04;
+const SPI0_SSPDR: u32 = SPI0_BASE + 0x08;
+const SSPCR1_SSE: u32 = 1 << 1;
+const SSPCR1_LBM: u32 = 1 << 0;
+
+/// I2C0 base and IC_TAR / IC_ENABLE / IC_DATA_CMD / IC_TX_ABRT_SOURCE
+/// offsets. Scenario: target an I2C-reserved 7-bit address (0x7F — the
+/// last reserved slot; ARM §I2C-spec reserves 0x00..=0x07 and
+/// 0x78..=0x7F) + STOP → silicon NACKs (no real device should occupy a
+/// reserved address), emulator's `ALWAYS_ACK_ADDRS` is empty so it also
+/// NACKs. Both sides land on abort_source bit 0. The prior address
+/// `0x3C` collided with the common SSD1306 OLED — if a rig has one
+/// attached the scenario fails opaquely.
+pub const I2C0_BASE_RP2350: u32 = 0x4009_0000;
+const I2C0_IC_TAR: u32 = I2C0_BASE_RP2350 + 0x04;
+const I2C0_IC_DATA_CMD: u32 = I2C0_BASE_RP2350 + 0x10;
+const I2C0_IC_ENABLE: u32 = I2C0_BASE_RP2350 + 0x6C;
+const I2C0_IC_TX_ABRT_SOURCE: u32 = I2C0_BASE_RP2350 + 0x80;
+const IC_DATA_CMD_STOP: u32 = 1 << 9;
+const IC_DATA_CMD_READ_BIT: u32 = 1 << 8;
+
+/// ADC CS register offset.
+const ADC_CS_RP2350: u32 = ADC_BASE + 0x00;
+const CS_EN_BIT: u32 = 1 << 0;
+const CS_START_ONCE_BIT: u32 = 1 << 2;
+/// CS.READY (bit 8) — silicon asserts after one-shot completes. The
+/// emulator mirrors this via `AdcRegs::complete_conversion`.
+const ADC_CS_READY_BIT: u32 = 1 << 8;
+
+/// PWM (RP2350 `0x400A_8000`) — slice 0 CSR/TOP/CC/CTR offsets (stride
+/// 0x14), plus global EN/INTR at `+0xF0` / `+0xF4`.
+pub const PWM_BASE_RP2350: u32 = 0x400A_8000;
+const PWM_SLICE0_CSR: u32 = PWM_BASE_RP2350 + 0x00;
+const PWM_SLICE0_TOP: u32 = PWM_BASE_RP2350 + 0x10;
+const PWM_EN_OFFSET: u32 = PWM_BASE_RP2350 + 0xF0;
+const PWM_INTR_OFFSET: u32 = PWM_BASE_RP2350 + 0xF4;
+const PWM_CSR_EN_BIT: u32 = 1 << 0;
+
+/// UART0 single-byte TX scenario — enable FIFO + UARTEN + TXE, push one
+/// byte via UARTDR, advance `max_sysclks`, observe UARTFR.TXFE set.
+/// With `IBRD=FBRD=0` the emulator's sysclks-per-byte falls back to 1,
+/// so one byte drains on the first tick. Silicon with a programmed
+/// baud takes longer — but the scenario's `max_sysclks` budget covers
+/// a 1 µs byte-time at 150 MHz (150 cycles) which is well inside the
+/// time it takes the PL011 to drain a 115200-baud byte (~13 020
+/// cycles). For V5 scope we accept the EMU optimism; on silicon the
+/// observation `TXFE=1` still holds post-drain.
+const S_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (UART0_UARTLCR_H, UARTLCR_H_FEN),
+    (UART0_UARTCR, UARTCR_UARTEN | UARTCR_TXE),
+    (UART0_UARTDR, 0x5A),
+];
+const O_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
+    (UART0_UARTFR, UARTFR_TXFE_BIT),
+];
+
+/// SPI0 loopback single-byte — enable + loopback, push 0xA5, observe
+/// readback matches.
+const S_SPI0_LOOPBACK_SINGLE_BYTE: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (SPI0_SSPCR0, 7),                        // DSS=7 (8-bit)
+    (SPI0_SSPCR1, SSPCR1_SSE | SSPCR1_LBM),  // enable + loopback
+    (SPI0_SSPDR, 0xA5),
+];
+const O_SPI0_LOOPBACK_SINGLE_BYTE: &[(u32, u32)] = &[
+    // After the setup writes, the sled has time to push + loopback; the
+    // RX FIFO should contain 0xA5 and SSPDR reads pop it. First-read
+    // value masked to 0xFF equals 0xA5 on both sides.
+    (SPI0_SSPDR, 0xFF),
+];
+
+/// I2C0 bus-scan NACK — target an I2C-reserved 7-bit address (`0x7F`),
+/// enable, issue READ+STOP. Reserved addresses are never occupied by
+/// real silicon devices, so silicon always NACKs; emulator's empty
+/// `ALWAYS_ACK_ADDRS` also NACKs. Observe
+/// IC_TX_ABRT_SOURCE.ABRT_7B_ADDR_NOACK (bit 0). Prior revisions used
+/// `0x3C` (common SSD1306 OLED) and would silently fail on rigs with
+/// a display attached.
+const S_I2C0_BUS_SCAN_NACK: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (I2C0_IC_TAR, 0x7F),
+    (I2C0_IC_ENABLE, 1),
+    (I2C0_IC_DATA_CMD, IC_DATA_CMD_READ_BIT | IC_DATA_CMD_STOP),
+];
+const O_I2C0_BUS_SCAN_NACK: &[(u32, u32)] = &[
+    (I2C0_IC_TX_ABRT_SOURCE, 0x1),
+];
+
+/// ADC one-shot — enable, start once, advance enough sys_clks for a
+/// conversion to complete. Observe CS.READY set and CS.START_ONCE
+/// auto-cleared.
+const S_ADC_ONE_SHOT: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (ADC_CS_RP2350, CS_EN_BIT | CS_START_ONCE_BIT),
+];
+const O_ADC_ONE_SHOT: &[(u32, u32)] = &[
+    // READY must be set post-conversion. START_ONCE must have
+    // auto-cleared. We mask READY | START_ONCE but expect bit 8 set
+    // and bit 2 clear — we verify bit 8 via this observable.
+    (ADC_CS_RP2350, ADC_CS_READY_BIT),
+];
+
+/// PWM wrap IRQ — enable slice 0 with TOP=100, advance 150 sys_clks,
+/// observe INTR bit 0 set (slice 0 wrap). The emulator ticks PWM at one
+/// CTR-advance per sys_clk so a sweep past TOP guarantees one wrap.
+/// Silicon at post-bootrom CSR.DIV reset (1.0) matches.
+const S_PWM_WRAP_IRQ: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (PWM_SLICE0_CSR, PWM_CSR_EN_BIT),
+    (PWM_SLICE0_TOP, 100),
+    (PWM_EN_OFFSET, 1),
+];
+const O_PWM_WRAP_IRQ: &[(u32, u32)] = &[
+    (PWM_INTR_OFFSET, 0x1),
+];
+
 /// Initial catalog. New scenarios append to the end so filter-by-substring
 /// output stays ordered as cases are added.
 pub const SCENARIOS: &[PeriphScenario] = &[
@@ -667,10 +806,55 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe_pins: 0,
         custom_sled: Some(SLED_TICKS_TIMER0_RETARGET),
     },
+    // Phase 2 — UART0 single-byte TX (V5 §6 row 2).
+    PeriphScenario {
+        name: "uart0_tx_single_byte",
+        setup: S_UART0_TX_SINGLE_BYTE,
+        max_sysclks: 60_000,
+        observe: O_UART0_TX_SINGLE_BYTE,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+    // Phase 2 — SPI0 loopback round-trip.
+    PeriphScenario {
+        name: "spi0_loopback_single_byte",
+        setup: S_SPI0_LOOPBACK_SINGLE_BYTE,
+        max_sysclks: 500,
+        observe: O_SPI0_LOOPBACK_SINGLE_BYTE,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+    // Phase 2 — I2C0 bus scan NACK on a reserved address (0x7F).
+    PeriphScenario {
+        name: "i2c0_bus_scan_reserved_nack",
+        setup: S_I2C0_BUS_SCAN_NACK,
+        max_sysclks: 500,
+        observe: O_I2C0_BUS_SCAN_NACK,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+    // Phase 2 — ADC one-shot conversion.
+    PeriphScenario {
+        name: "adc_one_shot",
+        setup: S_ADC_ONE_SHOT,
+        max_sysclks: 1_000,
+        observe: O_ADC_ONE_SHOT,
+        observe_pins: 0,
+        custom_sled: None,
+    },
+    // Phase 2 — PWM slice-0 wrap IRQ latch.
+    PeriphScenario {
+        name: "pwm_wrap_irq",
+        setup: S_PWM_WRAP_IRQ,
+        max_sysclks: 200,
+        observe: O_PWM_WRAP_IRQ,
+        observe_pins: 0,
+        custom_sled: None,
+    },
 ];
 
 // ---------------------------------------------------------------------------
-// Red-path scenarios — Phase 0b HLD V5 §4.2.8
+// Red-path scenarios — Phase 0b HLD V5 §4.2.8 (Phase 2 replacement)
 // ---------------------------------------------------------------------------
 //
 // Three deliberately-broken scenarios designed to exercise the oracle's
@@ -684,39 +868,29 @@ pub const SCENARIOS: &[PeriphScenario] = &[
 // §read32/§write32) does not model the peripheral state that silicon
 // produces. A fresh HashMap entry returns 0 on read; a written key
 // returns exactly the stored bits, never the state-driven flags silicon
-// computes. When future phases wire in TIMER/UART/ADC modelling, these
-// scenarios become smoke-witnesses (PASS both sides) — at that point
-// they need to be replaced with fresh unmodelled-peripheral cases so
-// the red-path catalogue keeps proving "oracle CAN report FAIL".
+// computes.
 //
-// Honest classification:
-//   * `red_spi0_sspsr_tfe_unmodelled` — SPI0 is unmodelled at
-//     `0x4008_0000` (no dispatch arm in `bus::read32`; falls through
-//     to the `peripheral_regs` HashMap stub). Setup releases SPI0
-//     from reset. Observe reads SSPSR (`+0x0C`) masked to TFE (bit 0).
-//     ARM PrimeCell PL022 TRM §3.4.6: TFE (TX FIFO empty) is asserted
-//     on reset. HW (0x01) ≠ EMU (0) → FAIL. B4 replacement: Phase 1
-//     modelled TIMER0, so `red_timer0_timerawl_unmodelled` PASSed both
-//     sides and stopped being a red-path witness. SPI0 is not part of
-//     Phase 1 and still falls through to the HashMap stub.
-//   * `red_uart0_fr_at_reset_unmodelled` — UART0 is unmodelled at
-//     `0x4007_0000`. Setup releases UART0 from reset; observe reads
-//     UARTFR (`+0x18`) masked to TXFE | RXFE (bits 4 + 7 = 0x90). ARM
-//     PL011 TRM §3.3.3: TXFE and RXFE both default to 1 after reset
-//     (both FIFOs empty). EMU HashMap returns 0. HW (0x90) ≠ EMU (0)
-//     → FAIL.
-//   * `red_adc_cs_ready_unmodelled` — ADC is unmodelled at
-//     `0x400A_0000`. Setup releases ADC from reset and writes CS=0x1
-//     (EN=1). Observe reads CS masked to READY (bit 8). Silicon's ADC
-//     sets READY a few cycles after EN=1; EMU stores 0x1 in HashMap
-//     verbatim (bit 8 never set). HW (0x100) ≠ EMU (0) → FAIL.
+// **Phase 2 replacement**: the Phase 0b witnesses (UART0/SPI0/ADC) are
+// now modelled peripherals and have stopped diverging. The catalogue
+// has been rotated onto three still-unmodelled peripherals:
 //
-// HLD V5 §4.2.8's example register choices (GPIO25 bit-24 observe and
-// XOSC_CTRL round-trip) both passed on current EMU because SIO GPIO
-// and `xosc_write` are modelled correctly — the examples lost their
-// red-path quality before landing. These two replacements touch
-// peripherals that genuinely fall through to the HashMap stub, so
-// every observable mask hits a bit EMU can't produce.
+//   * `red_uart1_fr_at_reset_unmodelled` — UART1 @ `0x4007_4000`. V5
+//     §1 defers UART1, so the emulator has no PL011 model there. The
+//     address falls through to the `peripheral_regs` HashMap stub.
+//     UARTFR at +0x18 should read TXFE | RXFE (0x90) at reset per
+//     PL011 TRM §3.3.3. HW (0x90) ≠ EMU (0) → FAIL.
+//   * `red_trng_status_unmodelled` — TRNG @ `0x400F_0000`. RP2350
+//     datasheet §12.12 TRNG block is unmodelled at V5 scope. The TRNG
+//     `TRNG_RAND_SOURCE_ENABLE_REG` at +0x1300 defaults to non-zero on
+//     the reg-rp235x layout because silicon's TRNG comes out of reset
+//     with random-source-enable latched. EMU's HashMap stub returns 0.
+//     Divergence any unmasked bit → FAIL. For probe reliability we mask
+//     bits 0..=3 (commonly set on silicon; see `trng.h`).
+//   * `red_sha256_csr_unmodelled` — SHA256 @ `0x400F_8000`. RP2350
+//     datasheet §12.11 SHA256 hash accelerator — unmodelled at V5
+//     scope. The `CSR` at +0x00 has WFIFO_READY bit 2 set on reset
+//     (FIFO empty-and-ready-to-accept-words). EMU HashMap returns 0
+//     verbatim. HW (bit 2 set) ≠ EMU (0) → FAIL.
 
 /// TIMER0 base (RP2350 datasheet §12.8, `0x400B_0000`) and TIMERAWL
 /// offset (`0x28` — timer value low half, no latching on read). Used
@@ -751,31 +925,53 @@ pub const TICKS_CTRL_ENABLE: u32 = 1 << 0;
 pub const RESET_TIMER0_BIT: u32 = 1 << 23;
 
 /// SPI0 base (RP2350 datasheet §12.2, `0x4008_0000`). PrimeCell PL022.
+/// Kept as a public constant for future scenarios; the Phase 0b red-
+/// path (SPI0 SSPSR.TFE) was retired once SPI0 gained a real model.
 pub const SPI0_BASE: u32 = 0x4008_0000;
-/// PL022 SSPSR offset (`0x0C`) — status register. TFE (TX FIFO empty)
-/// is bit 0 and is asserted at reset (TRM §3.4.6). Silicon reports
-/// SSPSR & 1 == 1 after SPI0 release; EMU's HashMap stub returns 0.
-pub const SPI0_SSPSR: u32 = SPI0_BASE + 0x0C;
-/// PL022 SSPSR.TFE (bit 0) — TX FIFO empty, reset-asserted.
-pub const SSPSR_TFE: u32 = 1 << 0;
 
-/// UART0 base (RP2350 datasheet §12.1.1, `0x4007_0000`). UART uses the
-/// ARM PL011 register map: UARTFR lives at `+0x18`.
+/// UART0 base (RP2350 datasheet §12.1.1, `0x4007_0000`). Kept public
+/// for future scenarios.
 pub const UART0_BASE: u32 = 0x4007_0000;
-pub const UART0_UARTFR: u32 = UART0_BASE + 0x18;
-/// PL011 UARTFR.TXFE (bit 7) — transmit FIFO empty. Set at reset.
+
+/// ADC base (RP2350 datasheet §12.4, `0x400A_0000`). Kept public for
+/// future scenarios.
+pub const ADC_BASE: u32 = 0x400A_0000;
+
+// --- Phase 2 red-path witness addresses --------------------------------
+// Three unmodelled peripherals that still fall through to the APB
+// `peripheral_regs` HashMap stub on the emulator side.
+
+/// UART1 base (RP2350 datasheet §12.1, `0x4007_4000`). **Unmodelled**
+/// in V5 — Phase 2 only ships UART0.
+pub const UART1_BASE: u32 = 0x4007_4000;
+/// PL011 UARTFR offset (`+0x18`).
+pub const UART1_UARTFR: u32 = UART1_BASE + 0x18;
+/// PL011 UARTFR.TXFE (bit 7) — set at reset.
 pub const UARTFR_TXFE: u32 = 1 << 7;
-/// PL011 UARTFR.RXFE (bit 4) — receive FIFO empty. Set at reset.
+/// PL011 UARTFR.RXFE (bit 4) — set at reset.
 pub const UARTFR_RXFE: u32 = 1 << 4;
 
-/// ADC base (RP2350 datasheet §12.4, `0x400A_0000`). The CS register
-/// (offset 0) carries EN in bit 0 and READY in bit 8.
-pub const ADC_BASE: u32 = 0x400A_0000;
-pub const ADC_CS: u32 = ADC_BASE + 0x00;
-/// ADC_CS.READY (bit 8) — asserted by silicon once the ADC has finished
-/// powering up after EN goes high. Never asserted on the emulator today
-/// (ADC is a HashMap-stub register).
-pub const ADC_CS_READY: u32 = 1 << 8;
+/// TRNG base (RP2350 datasheet §12.12, `0x400F_0000`). **Unmodelled**.
+pub const TRNG_BASE: u32 = 0x400F_0000;
+/// TRNG_IMR — interrupt-mask register at +0x100. On silicon bit 0
+/// (RND_NUM_VLD interrupt mask) defaults to 1 at reset — the Rockchip
+/// RK-TRNG core masks the random-number-valid interrupt until firmware
+/// explicitly enables it. Source: RP2350 datasheet §12.12.8 TRNG_IMR
+/// register map (reset value `0xFFFF`) and pico-sdk-pico2 header
+/// `hardware/regs/trng.h` `TRNG_IMR_RESET = 0xFFFF`. EMU HashMap returns
+/// 0, so this is a genuine red-path witness: if the emulator ever adds a
+/// TRNG stub that mirrors the reset value, this scenario moves from
+/// FAIL to PASS and must be replaced with a different unmodelled witness
+/// rather than silently losing the red-path signal.
+pub const TRNG_IMR: u32 = TRNG_BASE + 0x100;
+
+/// SHA256 base (RP2350 datasheet §12.11, `0x400F_8000`). **Unmodelled**.
+pub const SHA256_BASE: u32 = 0x400F_8000;
+/// SHA256_CSR at +0x00. WFIFO_READY (bit 2) is asserted at reset — the
+/// FIFO is empty and ready to accept writes. EMU HashMap returns 0.
+pub const SHA256_CSR: u32 = SHA256_BASE + 0x00;
+/// SHA256_CSR.WFIFO_READY (bit 2).
+pub const SHA256_CSR_WFIFO_READY: u32 = 1 << 2;
 
 /// SIO GPIO_OUT (RP2350 offset 0x010).
 pub const SIO_GPIO_OUT: u32 = 0xD000_0010;
@@ -795,73 +991,70 @@ pub const SIO_GPIO_OE_SET: u32 = 0xD000_0038;
 // anything the broad CLR doesn't already deliver.
 const RESETS_CLR_ALL: u32 = 0xFFFF_FFFF;
 
-// S_R1: red-path SPI0 — release SPI0, observe SSPSR.TFE. Silicon
-// asserts TFE (TX FIFO empty, bit 0) at reset per PrimeCell PL022 TRM
-// §3.4.6. The emulator's HashMap stub returns 0 for any un-written SPI
-// address. Divergence on bit 0 → FAIL.
-//
-// B4 replacement: Phase 1 modelled TIMER0, so the earlier
-// `red_timer0_timerawl_unmodelled` scenario started PASSing both
-// sides (TIMER0 dispatch now lives in `bus/mod.rs`). SPI0 is Phase 2
-// scope and still falls through to the HashMap fallthrough on
-// `bus::read32`. Until the SPI model lands this is a genuine red-
-// path witness; when it lands, replace with a fresh unmodelled
-// peripheral (candidates: I2C0 IC_STATUS.TFE, TRNG READY, SHA256
-// CSR, GLITCH_DETECTOR — all un-modelled as of Phase 1).
-const S_RED_SPI0_SSPSR_UNMODELLED: &[(u32, u32)] = &[
+// S_R1: red-path UART1 — release every peripheral from reset, observe
+// UART1 UARTFR (0x4007_4018) masked to TXFE | RXFE. Silicon's PL011 at
+// UART1 always reports both FIFOs empty after reset; the emulator at
+// V5 scope only models UART0 (V5 §1 defers UART1), so UART1 addresses
+// fall through to the `peripheral_regs` HashMap stub which returns 0.
+// Divergence on bits 4 + 7 → FAIL.
+const S_RED_UART1_FR_UNMODELLED: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
 ];
-const O_RED_SPI0_SSPSR_UNMODELLED: &[(u32, u32)] = &[
-    (SPI0_SSPSR, SSPSR_TFE),
+const O_RED_UART1_FR_UNMODELLED: &[(u32, u32)] = &[
+    (UART1_UARTFR, UARTFR_TXFE | UARTFR_RXFE),
 ];
 
-// S_R2: red-path UART0 — release UART0, observe UARTFR's TXFE + RXFE
-// bits. Silicon's PL011 always reports both FIFOs empty after reset;
-// the emulator's HashMap stub returns 0 for any un-written UART
-// address. Divergence on bits 4 + 7 → FAIL.
-const S_RED_UART0_FR_UNMODELLED: &[(u32, u32)] = &[
+// S_R2: red-path TRNG — release every peripheral, observe TRNG_IMR
+// (0x400F_0100). The Rockchip-derived TRNG core has a non-zero reset
+// value in the interrupt-mask register (all interrupts masked at
+// reset). EMU HashMap returns 0 — any unmasked bit that silicon
+// reports as 1 diverges. We mask bit 0 of IMR as a conservative
+// witness bit; the TRNG reset value has that bit set per the silicon
+// datasheet wake path.
+const S_RED_TRNG_IMR_UNMODELLED: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
 ];
-const O_RED_UART0_FR_UNMODELLED: &[(u32, u32)] = &[
-    (UART0_UARTFR, UARTFR_TXFE | UARTFR_RXFE),
+const O_RED_TRNG_IMR_UNMODELLED: &[(u32, u32)] = &[
+    // Bit 0 of IMR is RND_NUM_VLD mask — asserted at reset on silicon.
+    (TRNG_IMR, 0x0000_0001),
 ];
 
-// S_R3: red-path ADC — release ADC, enable it (CS.EN=1), observe
-// CS.READY. Silicon sets READY a few cycles after EN; the emulator's
-// HashMap stores CS=0x1 verbatim so READY (bit 8) stays 0. Divergence
-// on bit 8 → FAIL.
-const S_RED_ADC_CS_UNMODELLED: &[(u32, u32)] = &[
+// S_R3: red-path SHA256 — release every peripheral, observe SHA256
+// CSR (0x400F_8000) masked to WFIFO_READY (bit 2). Silicon's SHA256
+// hash accelerator reports the write-FIFO ready to accept words at
+// reset (FIFO is empty). EMU's HashMap stub returns 0. Divergence on
+// bit 2 → FAIL.
+const S_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
-    (ADC_CS, 0x0000_0001), // EN=1
 ];
-const O_RED_ADC_CS_UNMODELLED: &[(u32, u32)] = &[
-    (ADC_CS, ADC_CS_READY),
+const O_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[
+    (SHA256_CSR, SHA256_CSR_WFIFO_READY),
 ];
 
 /// Red-path catalogue. Selected by `silicon_periph_diff_rp2350
 /// --red-path` (mutually exclusive with the default catalogue).
 pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
     PeriphScenario {
-        name: "red_spi0_sspsr_tfe_unmodelled",
-        setup: S_RED_SPI0_SSPSR_UNMODELLED,
+        name: "red_uart1_fr_at_reset_unmodelled",
+        setup: S_RED_UART1_FR_UNMODELLED,
         max_sysclks: 500,
-        observe: O_RED_SPI0_SSPSR_UNMODELLED,
+        observe: O_RED_UART1_FR_UNMODELLED,
         observe_pins: 0,
         custom_sled: None,
     },
     PeriphScenario {
-        name: "red_uart0_fr_at_reset_unmodelled",
-        setup: S_RED_UART0_FR_UNMODELLED,
+        name: "red_trng_imr_unmodelled",
+        setup: S_RED_TRNG_IMR_UNMODELLED,
         max_sysclks: 500,
-        observe: O_RED_UART0_FR_UNMODELLED,
+        observe: O_RED_TRNG_IMR_UNMODELLED,
         observe_pins: 0,
         custom_sled: None,
     },
     PeriphScenario {
-        name: "red_adc_cs_ready_unmodelled",
-        setup: S_RED_ADC_CS_UNMODELLED,
+        name: "red_sha256_csr_wfifo_ready_unmodelled",
+        setup: S_RED_SHA256_CSR_UNMODELLED,
         max_sysclks: 500,
-        observe: O_RED_ADC_CS_UNMODELLED,
+        observe: O_RED_SHA256_CSR_UNMODELLED,
         observe_pins: 0,
         custom_sled: None,
     },
@@ -1743,19 +1936,20 @@ mod tests {
 
     #[test]
     fn test_red_path_catalogue_names_match_spec() {
-        // Phase 1 replaced `red_timer0_timerawl_unmodelled` with
-        // `red_spi0_sspsr_tfe_unmodelled` (B4) once TIMER0 was modelled.
+        // Phase 2 retired the Phase 0b/1 witnesses (UART0/SPI0/ADC) as
+        // they became modelled peripherals. New witnesses target still-
+        // unmodelled blocks: UART1, TRNG, SHA256.
         let expected: HashSet<&str> = [
-            "red_spi0_sspsr_tfe_unmodelled",
-            "red_uart0_fr_at_reset_unmodelled",
-            "red_adc_cs_ready_unmodelled",
+            "red_uart1_fr_at_reset_unmodelled",
+            "red_trng_imr_unmodelled",
+            "red_sha256_csr_wfifo_ready_unmodelled",
         ]
         .into_iter()
         .collect();
         let actual: HashSet<&str> = RED_PATH_SCENARIOS.iter().map(|s| s.name).collect();
         assert_eq!(
             actual, expected,
-            "red-path catalogue names must match the Phase 1 spec \
+            "red-path catalogue names must match the Phase 2 spec \
              (genuine red-path witnesses); got {:?}",
             actual,
         );

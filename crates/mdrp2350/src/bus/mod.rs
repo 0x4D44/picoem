@@ -6,10 +6,20 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
-use crate::irq::{IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0};
+use crate::irq::{
+    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ,
+    IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0, IRQ_UART0_IRQ, PERIPH_IRQ_MASK,
+};
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
-use crate::peripherals::ticks::{TicksRegs, TICKS_BASE};
-use crate::peripherals::timer::{TimerRegs, TIMER0_BASE, TIMER1_BASE};
+use crate::peripherals::adc::{ADC_BASE, AdcRegs};
+use crate::peripherals::i2c::{I2C0_BASE, I2cRegs};
+use crate::peripherals::io_bank0::{IO_BANK0_BASE, IoBank0Regs};
+use crate::peripherals::pads_bank0::{PADS_BANK0_BASE, PadsBank0Regs};
+use crate::peripherals::pwm::{PWM_BASE, PwmRegs};
+use crate::peripherals::spi::{SPI0_BASE, SpiRegs};
+use crate::peripherals::ticks::{TICKS_BASE, TicksRegs};
+use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE, TimerRegs};
+use crate::peripherals::uart::{UART0_BASE, UartRegs};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
 
@@ -105,6 +115,10 @@ pub const RESET_ADC: u8 = 0;
 pub const RESET_DMA: u8 = 2;
 /// RESETS bit for HSTX.
 pub const RESET_HSTX: u8 = 3;
+/// RESETS bit for I2C0 (RP2350 datasheet §7.5 Table 486).
+pub const RESET_I2C0: u8 = 4;
+/// RESETS bit for I2C1.
+pub const RESET_I2C1: u8 = 5;
 /// RESETS bit for IO_BANK0.
 pub const RESET_IO_BANK0: u8 = 6;
 /// RESETS bit for PADS_BANK0.
@@ -158,7 +172,14 @@ pub const RESETS_POST_BOOTROM: u32 = {
         | (1u32 << RESET_TIMER0)
         | (1u32 << RESET_TIMER1)
         | (1u32 << RESET_SYSCFG)
-        | (1u32 << RESET_SYSINFO);
+        | (1u32 << RESET_SYSINFO)
+        // Phase 2 peripherals: V5 §5.7 lists these as post-bootrom
+        // released (pico-sdk `runtime_init_bootrom_reset` covers them).
+        | (1u32 << RESET_UART0)
+        | (1u32 << RESET_SPI0)
+        | (1u32 << RESET_I2C0)
+        | (1u32 << RESET_ADC)
+        | (1u32 << RESET_PWM);
     // Field width is 29 bits (datasheet §7.5).
     let mask: u32 = 0x1FFF_FFFF;
     mask & !released
@@ -176,6 +197,13 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
     match base {
         TIMER0_BASE => Some(RESET_TIMER0),
         TIMER1_BASE => Some(RESET_TIMER1),
+        UART0_BASE => Some(RESET_UART0),
+        SPI0_BASE => Some(RESET_SPI0),
+        I2C0_BASE => Some(RESET_I2C0),
+        ADC_BASE => Some(RESET_ADC),
+        PWM_BASE => Some(RESET_PWM),
+        IO_BANK0_BASE => Some(RESET_IO_BANK0),
+        PADS_BANK0_BASE => Some(RESET_PADS_BANK0),
         _ => None,
     }
 }
@@ -232,6 +260,20 @@ pub struct Bus {
     pub(crate) timer0: TimerRegs,
     /// TIMER1 — same shape as TIMER0, driven by the TIMER1 TICKS domain.
     pub(crate) timer1: TimerRegs,
+    /// UART0 — PL011-derived UART at `0x4007_0000` (HLD V5 §6 row 2).
+    pub(crate) uart0: UartRegs,
+    /// SPI0 — PL022-derived SPI at `0x4008_0000`.
+    pub(crate) spi0: SpiRegs,
+    /// I2C0 — DesignWare DW_apb_i2c at `0x4009_0000`.
+    pub(crate) i2c0: I2cRegs,
+    /// ADC — single instance at `0x400A_0000`.
+    pub(crate) adc: AdcRegs,
+    /// PWM — 12-slice block at `0x4005_0000`.
+    pub(crate) pwm: PwmRegs,
+    /// IO_BANK0 plain-storage GPIO control (HLD V5 §5.8).
+    pub(crate) io_bank0: IoBank0Regs,
+    /// PADS_BANK0 plain-storage pad drive/pull control.
+    pub(crate) pads_bank0: PadsBank0Regs,
     /// Bus fault detected on last access.
     bus_fault: bool,
     /// Address that caused the most recent bus fault.
@@ -384,6 +426,13 @@ impl Bus {
             ticks: TicksRegs::post_bootrom(),
             timer0: TimerRegs::new(IRQ_TIMER0_IRQ_0),
             timer1: TimerRegs::new(IRQ_TIMER1_IRQ_0),
+            uart0: UartRegs::new(IRQ_UART0_IRQ),
+            spi0: SpiRegs::new(IRQ_SPI0_IRQ),
+            i2c0: I2cRegs::new(IRQ_I2C0_IRQ),
+            adc: AdcRegs::new(IRQ_ADC_IRQ_FIFO),
+            pwm: PwmRegs::new(IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1),
+            io_bank0: IoBank0Regs::new(),
+            pads_bank0: PadsBank0Regs::new(),
             active_core: 0,
             ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
             irq_pending: [0; 2],
@@ -881,6 +930,27 @@ impl Bus {
             let bits = self.timer1.poll_alarms();
             self.raise_timer_irqs(bits);
         }
+
+        // Phase 2 peripherals — each advances per sys_clk unless held
+        // in reset. Any raised NVIC lines get folded into the per-core
+        // pending masks via `raise_irqs_u64`.
+        let mut ext_irqs = 0u64;
+        if !self.is_held_in_reset_bit(RESET_UART0) {
+            self.uart0.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        if !self.is_held_in_reset_bit(RESET_SPI0) {
+            self.spi0.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        if !self.is_held_in_reset_bit(RESET_I2C0) {
+            self.i2c0.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        if !self.is_held_in_reset_bit(RESET_ADC) {
+            self.adc.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        if !self.is_held_in_reset_bit(RESET_PWM) {
+            self.pwm.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        self.raise_irqs_u64(ext_irqs);
     }
 
     /// Raise the IRQ lines encoded in `bits` via `assert_irq_shared`.
@@ -1111,6 +1181,42 @@ impl Bus {
                 let base = canonical & 0xFFFF_F000;
                 let word_addr = canonical & !3;
                 let offset = word_addr & 0x0000_0FFF;
+                // Narrow-access dispatch for byte-significant Phase 2
+                // registers: UARTDR pops one RX byte per access; SSPDR
+                // pops one RX word per access (low byte here).
+                if !self.is_held_in_reset_base(base) {
+                    match (base, offset) {
+                        (UART0_BASE, crate::peripherals::uart::UARTDR) => {
+                            let v = self.uart0.read8(crate::peripherals::uart::UARTDR);
+                            if self.trace_enabled {
+                                self.emit_trace('R', 1, addr, v as u32);
+                            }
+                            return v;
+                        }
+                        (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
+                            let v = self.spi0.read8(crate::peripherals::spi::SSPDR);
+                            if self.trace_enabled {
+                                self.emit_trace('R', 1, addr, v as u32);
+                            }
+                            return v;
+                        }
+                        (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                            let v = self.i2c0.read8(crate::peripherals::i2c::IC_DATA_CMD);
+                            if self.trace_enabled {
+                                self.emit_trace('R', 1, addr, v as u32);
+                            }
+                            return v;
+                        }
+                        (ADC_BASE, crate::peripherals::adc::FIFO) => {
+                            let v = self.adc.read8(crate::peripherals::adc::FIFO);
+                            if self.trace_enabled {
+                                self.emit_trace('R', 1, addr, v as u32);
+                            }
+                            return v;
+                        }
+                        _ => {}
+                    }
+                }
                 let word = if self.is_held_in_reset_base(base) {
                     0
                 } else {
@@ -1126,6 +1232,13 @@ impl Bus {
                         TIMER0_BASE => self.timer0.read32(offset),
                         TIMER1_BASE => self.timer1.read32(offset),
                         TICKS_BASE => self.ticks.read32(offset),
+                        UART0_BASE => self.uart0.read32(offset),
+                        SPI0_BASE => self.spi0.read32(offset),
+                        I2C0_BASE => self.i2c0.read32(offset),
+                        ADC_BASE => self.adc.read32(offset),
+                        PWM_BASE => self.pwm.read32(offset),
+                        IO_BANK0_BASE => self.io_bank0.read32(offset),
+                        PADS_BANK0_BASE => self.pads_bank0.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -1201,11 +1314,77 @@ impl Bus {
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
+                let word_offset_for_narrow = (canonical & !3) & 0x0000_0FFF;
                 // RESETS Bus-level guard (HLD V5 §5.3). Held
                 // peripherals drop the write silently.
                 if self.is_held_in_reset_base(base) {
                     // no-op
                 } else {
+                    // Narrow-access dispatch for byte-significant Phase 2
+                    // registers: UARTDR pushes one TX byte per access;
+                    // SSPDR pushes one TX word per access; IC_DATA_CMD
+                    // triggers one transaction per access. Bypass the
+                    // word-RMW path so these side-effect registers aren't
+                    // double-fired.
+                    match (base, word_offset_for_narrow) {
+                        (UART0_BASE, crate::peripherals::uart::UARTDR) => {
+                            let mut ext_irqs = 0u64;
+                            self.uart0.write8(
+                                crate::peripherals::uart::UARTDR,
+                                val,
+                                &mut ext_irqs,
+                            );
+                            self.raise_irqs_u64(ext_irqs);
+                            if self.trace_enabled {
+                                self.emit_trace('W', 1, addr, val as u32);
+                            }
+                            return;
+                        }
+                        (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
+                            let mut ext_irqs = 0u64;
+                            self.spi0.write8(
+                                crate::peripherals::spi::SSPDR,
+                                val,
+                                &mut ext_irqs,
+                            );
+                            self.raise_irqs_u64(ext_irqs);
+                            if self.trace_enabled {
+                                self.emit_trace('W', 1, addr, val as u32);
+                            }
+                            return;
+                        }
+                        (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                            let mut ext_irqs = 0u64;
+                            self.i2c0.write8(
+                                crate::peripherals::i2c::IC_DATA_CMD,
+                                val,
+                                &mut ext_irqs,
+                            );
+                            self.raise_irqs_u64(ext_irqs);
+                            if self.trace_enabled {
+                                self.emit_trace('W', 1, addr, val as u32);
+                            }
+                            return;
+                        }
+                        // ADC FIFO is a side-effect register: `adc.read32(FIFO)`
+                        // pops a sample. A byte write through the RMW path
+                        // would read-then-write-back and silently pop the
+                        // FIFO. The FIFO has no architected narrow-write
+                        // semantics on real silicon (datasheet §12.4.5 lists
+                        // FIFO as read-only) — swallow the access. Mirrors
+                        // the RP2040 `narrow_peripheral_write8` ADC arm
+                        // (`crates/mdrp2040/src/bus/mod.rs:877-878`). Note:
+                        // byte lanes >0 within other narrow registers will
+                        // also pop via the RMW path — silicon firmware
+                        // doesn't hit this; matches RP2040 idiom.
+                        (ADC_BASE, crate::peripherals::adc::FIFO) => {
+                            if self.trace_enabled {
+                                self.emit_trace('W', 1, addr, val as u32);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
                     match base {
                         0x4000_0000 => {
                             // SYSINFO: read-only, ignore byte writes
@@ -1291,6 +1470,44 @@ impl Bus {
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore byte
                         }
+                        UART0_BASE | SPI0_BASE | I2C0_BASE | ADC_BASE | PWM_BASE
+                        | IO_BANK0_BASE | PADS_BANK0_BASE => {
+                            // Phase 2 peripherals that don't need narrow
+                            // byte dispatch (already intercepted above for
+                            // UART_DR / SSPDR / IC_DATA_CMD). Use the same
+                            // subword-alias pattern as CLOCKS/TIMER: preserve
+                            // SET/CLR/XOR semantics.
+                            let word_addr = canonical & !3;
+                            let byte_idx = (canonical & 3) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    UART0_BASE => self.uart0.read32(reg_offset),
+                                    SPI0_BASE => self.spi0.read32(reg_offset),
+                                    I2C0_BASE => self.i2c0.read32(reg_offset),
+                                    ADC_BASE => self.adc.read32(reg_offset),
+                                    PWM_BASE => self.pwm.read32(reg_offset),
+                                    IO_BANK0_BASE => self.io_bank0.read32(reg_offset),
+                                    _ => self.pads_bank0.read32(reg_offset),
+                                };
+                                let mut bytes = old_word.to_le_bytes();
+                                bytes[byte_idx] = val;
+                                (u32::from_le_bytes(bytes), 0u32)
+                            } else {
+                                ((val as u32) << (byte_idx * 8), alias)
+                            };
+                            let mut ext_irqs = 0u64;
+                            match base {
+                                UART0_BASE => self.uart0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                SPI0_BASE => self.spi0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                I2C0_BASE => self.i2c0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                ADC_BASE => self.adc.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                PWM_BASE => self.pwm.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                IO_BANK0_BASE => self.io_bank0.write32(reg_offset, word_val, pass_alias),
+                                _ => self.pads_bank0.write32(reg_offset, word_val, pass_alias),
+                            }
+                            self.raise_irqs_u64(ext_irqs);
+                        }
                         0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
                         _ => {
                             let word_addr = canonical & !3;
@@ -1315,6 +1532,29 @@ impl Bus {
         }
         if self.trace_enabled {
             self.emit_trace('W', 1, addr, val as u32);
+        }
+    }
+
+    /// Fold an `irqs: u64` mask from a peripheral's write-path into
+    /// the per-core pending banks via [`Self::assert_irq_shared`]. Used
+    /// by the narrow-access dispatch and the word-RMW dispatch paths;
+    /// unit-tested via the Phase 2 integration tests.
+    ///
+    /// Bits outside the peripheral-driven range (`PERIPH_IRQ_MASK` —
+    /// lines 46..=51 are software-only, writable only via `NVIC_ISPR`)
+    /// are filtered out. A peripheral `mask |= 1 << IRQ_*` typo on an
+    /// out-of-range constant would otherwise silently misassert a
+    /// software-only line.
+    #[inline]
+    pub(crate) fn raise_irqs_u64(&mut self, irqs: u64) {
+        let mut remaining = irqs & PERIPH_IRQ_MASK;
+        if remaining == 0 {
+            return;
+        }
+        while remaining != 0 {
+            let irq = remaining.trailing_zeros();
+            self.assert_irq_shared(irq);
+            remaining &= remaining - 1;
         }
     }
 
@@ -1357,6 +1597,40 @@ impl Bus {
                 let base = canonical & 0xFFFF_F000;
                 let word_addr = canonical & !3;
                 let offset = word_addr & 0x0000_0FFF;
+                // Narrow halfword path: SPI SSPDR is the only half-significant
+                // register (8..16-bit frames pop one word/pop one word).
+                if !self.is_held_in_reset_base(base) {
+                    if (base, offset) == (SPI0_BASE, crate::peripherals::spi::SSPDR) {
+                        let v = self.spi0.read16(crate::peripherals::spi::SSPDR);
+                        if self.trace_enabled {
+                            self.emit_trace('R', 2, addr, v as u32);
+                        }
+                        return v;
+                    }
+                    // UARTDR and IC_DATA_CMD: halfword read collapses to
+                    // byte via narrow path (zero-extended).
+                    if (base, offset) == (UART0_BASE, crate::peripherals::uart::UARTDR) {
+                        let v = self.uart0.read8(crate::peripherals::uart::UARTDR) as u16;
+                        if self.trace_enabled {
+                            self.emit_trace('R', 2, addr, v as u32);
+                        }
+                        return v;
+                    }
+                    if (base, offset) == (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) {
+                        let v = self.i2c0.read32(crate::peripherals::i2c::IC_DATA_CMD) as u16;
+                        if self.trace_enabled {
+                            self.emit_trace('R', 2, addr, v as u32);
+                        }
+                        return v;
+                    }
+                    if (base, offset) == (ADC_BASE, crate::peripherals::adc::FIFO) {
+                        let v = self.adc.read16(crate::peripherals::adc::FIFO);
+                        if self.trace_enabled {
+                            self.emit_trace('R', 2, addr, v as u32);
+                        }
+                        return v;
+                    }
+                }
                 let word = if self.is_held_in_reset_base(base) {
                     0
                 } else {
@@ -1372,6 +1646,13 @@ impl Bus {
                         TIMER0_BASE => self.timer0.read32(offset),
                         TIMER1_BASE => self.timer1.read32(offset),
                         TICKS_BASE => self.ticks.read32(offset),
+                        UART0_BASE => self.uart0.read32(offset),
+                        SPI0_BASE => self.spi0.read32(offset),
+                        I2C0_BASE => self.i2c0.read32(offset),
+                        ADC_BASE => self.adc.read32(offset),
+                        PWM_BASE => self.pwm.read32(offset),
+                        IO_BANK0_BASE => self.io_bank0.read32(offset),
+                        PADS_BANK0_BASE => self.pads_bank0.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -1454,11 +1735,64 @@ impl Bus {
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
-                // RESETS Bus-level guard (HLD V5 §5.3). Held
-                // peripherals drop the write silently.
+                let word_offset_for_narrow = (canonical & !3) & 0x0000_0FFF;
+                // RESETS Bus-level guard (HLD V5 §5.3).
                 if self.is_held_in_reset_base(base) {
                     // no-op
                 } else {
+                    // Narrow halfword dispatch for side-effect registers.
+                    match (base, word_offset_for_narrow) {
+                        (UART0_BASE, crate::peripherals::uart::UARTDR) => {
+                            let mut ext_irqs = 0u64;
+                            self.uart0.write8(
+                                crate::peripherals::uart::UARTDR,
+                                val as u8,
+                                &mut ext_irqs,
+                            );
+                            self.raise_irqs_u64(ext_irqs);
+                            if self.trace_enabled {
+                                self.emit_trace('W', 2, addr, val as u32);
+                            }
+                            return;
+                        }
+                        (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
+                            let mut ext_irqs = 0u64;
+                            self.spi0.write16(
+                                crate::peripherals::spi::SSPDR,
+                                val,
+                                &mut ext_irqs,
+                            );
+                            self.raise_irqs_u64(ext_irqs);
+                            if self.trace_enabled {
+                                self.emit_trace('W', 2, addr, val as u32);
+                            }
+                            return;
+                        }
+                        (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                            let mut ext_irqs = 0u64;
+                            self.i2c0.write32(
+                                crate::peripherals::i2c::IC_DATA_CMD,
+                                val as u32,
+                                0,
+                                &mut ext_irqs,
+                            );
+                            self.raise_irqs_u64(ext_irqs);
+                            if self.trace_enabled {
+                                self.emit_trace('W', 2, addr, val as u32);
+                            }
+                            return;
+                        }
+                        // ADC FIFO read-only: see matching comment in
+                        // `write8` above. Swallow halfword writes so the
+                        // RMW path doesn't silently pop a sample.
+                        (ADC_BASE, crate::peripherals::adc::FIFO) => {
+                            if self.trace_enabled {
+                                self.emit_trace('W', 2, addr, val as u32);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
                     match base {
                         0x4000_0000 => {
                             // SYSINFO: read-only, ignore halfword writes
@@ -1542,6 +1876,42 @@ impl Bus {
                         }
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore halfword
+                        }
+                        UART0_BASE | SPI0_BASE | I2C0_BASE | ADC_BASE | PWM_BASE
+                        | IO_BANK0_BASE | PADS_BANK0_BASE => {
+                            // Phase 2 peripherals halfword path — subword
+                            // alias preservation.
+                            let word_addr = canonical & !3;
+                            let half_idx = ((canonical >> 1) & 1) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    UART0_BASE => self.uart0.read32(reg_offset),
+                                    SPI0_BASE => self.spi0.read32(reg_offset),
+                                    I2C0_BASE => self.i2c0.read32(reg_offset),
+                                    ADC_BASE => self.adc.read32(reg_offset),
+                                    PWM_BASE => self.pwm.read32(reg_offset),
+                                    IO_BANK0_BASE => self.io_bank0.read32(reg_offset),
+                                    _ => self.pads_bank0.read32(reg_offset),
+                                };
+                                let mut halves: [u16; 2] =
+                                    [old_word as u16, (old_word >> 16) as u16];
+                                halves[half_idx] = val;
+                                ((halves[0] as u32) | ((halves[1] as u32) << 16), 0u32)
+                            } else {
+                                ((val as u32) << (half_idx * 16), alias)
+                            };
+                            let mut ext_irqs = 0u64;
+                            match base {
+                                UART0_BASE => self.uart0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                SPI0_BASE => self.spi0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                I2C0_BASE => self.i2c0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                ADC_BASE => self.adc.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                PWM_BASE => self.pwm.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                IO_BANK0_BASE => self.io_bank0.write32(reg_offset, word_val, pass_alias),
+                                _ => self.pads_bank0.write32(reg_offset, word_val, pass_alias),
+                            }
+                            self.raise_irqs_u64(ext_irqs);
                         }
                         0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
                         _ => {
@@ -1632,6 +2002,13 @@ impl Bus {
                         TIMER0_BASE => self.timer0.read32(offset),
                         TIMER1_BASE => self.timer1.read32(offset),
                         TICKS_BASE => self.ticks.read32(offset),
+                        UART0_BASE => self.uart0.read32(offset),
+                        SPI0_BASE => self.spi0.read32(offset),
+                        I2C0_BASE => self.i2c0.read32(offset),
+                        ADC_BASE => self.adc.read32(offset),
+                        PWM_BASE => self.pwm.read32(offset),
+                        IO_BANK0_BASE => self.io_bank0.read32(offset),
+                        PADS_BANK0_BASE => self.pads_bank0.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -1733,6 +2110,33 @@ impl Bus {
                                 self.timer1.invalidate_lazy();
                             }
                         }
+                        UART0_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.uart0.write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        SPI0_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.spi0.write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        I2C0_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.i2c0.write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        ADC_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.adc.write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        PWM_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.pwm.write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
+                        PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
                         0x5020_0000 => self.pio[0].write32(offset, val, alias),
                         0x5030_0000 => self.pio[1].write32(offset, val, alias),
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),

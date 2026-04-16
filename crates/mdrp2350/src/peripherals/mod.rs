@@ -22,11 +22,21 @@
 //! The helper takes `alias` in the canonical 2-bit form (0..=3), matching
 //! the normalised alias argument already threaded through `Bus::write32`.
 
+pub mod adc;
+pub mod i2c;
+pub mod io_bank0;
+pub mod pads_bank0;
+pub mod pwm;
+pub mod spi;
 pub mod ticks;
 pub mod timer;
+pub mod uart;
 
 #[cfg(test)]
 mod phase1_tests;
+
+#[cfg(test)]
+mod phase2_tests;
 
 /// Apply an APB alias read-modify-write onto a plain-storage register.
 ///
