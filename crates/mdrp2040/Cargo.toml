@@ -1,9 +1,18 @@
 [package]
 name = "mdrp2040"
-version = "0.12.1"
+version = "0.13.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Forward the PIO `test-hooks` feature to `mdpicoem-common`. Enables
+# cross-crate unit tests to pop TX FIFO words via `PioBlock::pop_tx`
+# and push RX FIFO words via `PioBlock::push_rx`.
+test-hooks = ["mdpicoem-common/test-hooks"]
+
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
+
+[dev-dependencies]
+mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }

@@ -427,12 +427,12 @@ impl Dma {
                 self.channels[ch_idx].write_addr = new;
                 self.trigger_channel(ch_idx);
             }
-            CH_TRANS_COUNT | CH_AL1_TRANS_COUNT | CH_AL3_TRANS_COUNT => {
+            CH_TRANS_COUNT | CH_AL3_TRANS_COUNT => {
                 let new = apply_alias(self.channels[ch_idx].trans_count, value, alias);
                 self.channels[ch_idx].trans_count = new;
                 self.channels[ch_idx].trans_count_reload = new;
             }
-            CH_AL2_TRANS_COUNT_TRIG => {
+            CH_AL1_TRANS_COUNT | CH_AL2_TRANS_COUNT_TRIG => {
                 let new = apply_alias(self.channels[ch_idx].trans_count, value, alias);
                 self.channels[ch_idx].trans_count = new;
                 self.channels[ch_idx].trans_count_reload = new;

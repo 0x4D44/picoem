@@ -1079,9 +1079,20 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 if base == PIO0_BASE || base == PIO1_BASE {
-                    // PIO is 32-bit access only (matches mdrp2350) — byte
-                    // writes would trigger spurious RXF pops via the RMW
-                    // read. Silently ignore.
+                    let pio_offset = canonical & 0x0000_0FFF;
+                    match pio_offset {
+                        // TXF0-3: byte-replicate (ARM AHB-Lite HSIZE=0
+                        // replication) and push to the TX FIFO.
+                        0x010..=0x01C => {
+                            let replicated = (val as u32) * 0x0101_0101;
+                            let idx = if base == PIO0_BASE { 0 } else { 1 };
+                            self.pio[idx].write32(pio_offset, replicated, 0);
+                        }
+                        // All other PIO registers: 32-bit access only.
+                        // Byte writes would trigger spurious RXF pops via
+                        // the RMW read. Silently ignore.
+                        _ => {}
+                    }
                     return;
                 }
                 let offset = canonical & 0x0000_0FFF;
@@ -1164,7 +1175,18 @@ impl Bus {
                 let canonical = addr & !0x3000;
                 let base = canonical & 0xFFFF_F000;
                 if base == PIO0_BASE || base == PIO1_BASE {
-                    // PIO is 32-bit access only (matches mdrp2350).
+                    let pio_offset = canonical & 0x0000_0FFF;
+                    match pio_offset {
+                        // TXF0-3: halfword-replicate (ARM AHB-Lite HSIZE=1
+                        // replication) and push to the TX FIFO.
+                        0x010..=0x01C => {
+                            let replicated = (val as u32) | ((val as u32) << 16);
+                            let idx = if base == PIO0_BASE { 0 } else { 1 };
+                            self.pio[idx].write32(pio_offset, replicated, 0);
+                        }
+                        // All other PIO registers: 32-bit access only.
+                        _ => {}
+                    }
                     return;
                 }
                 let offset = canonical & 0x0000_0FFF;
@@ -2175,6 +2197,63 @@ mod tests {
         let slice0_top = PWM_BASE + 0x10;
         bus.write32(slice0_top, 100);
         assert_eq!(bus.read32(slice0_top), 100);
+    }
+
+    // ----- PIO TXF narrow-write dispatch (Phase D) -------------------------
+    //
+    // Regression tests for the PIO byte/halfword TXF write fix.
+    // DMA_SIZE_8 writes to TXF were silently dropped by the blanket PIO
+    // guard in `write8`/`write16`, breaking rp2040-psram transfers.
+
+    #[test]
+    fn pio_txf_byte_write_pushes_replicated_word() {
+        let mut bus = Bus::new();
+        // Release PIO1 from reset (RESETS bit 11).
+        bus.write32(0x4000_F000, 1u32 << 11);
+        // Enable PIO1 SM0 via CTRL.SM_ENABLE bit 0.
+        bus.write32(PIO1_BASE + 0x000, 0x1);
+        // Byte write to PIO1 TXF0.
+        bus.write8(PIO1_BASE + 0x010, 0x42);
+        // FSTAT: TXEMPTY bit 24 for SM0 must be cleared.
+        let fstat = bus.read32(PIO1_BASE + 0x004);
+        assert_eq!(fstat & (1 << 24), 0, "TX FIFO must not be empty after byte write");
+        // Pop from TX FIFO and verify byte-replicated value.
+        let val = bus.pio[1].pop_tx(0).expect("TX FIFO should have one entry");
+        assert_eq!(val, 0x42424242, "byte 0x42 must be replicated to all four lanes");
+    }
+
+    #[test]
+    fn pio_txf_halfword_write_pushes_replicated_word() {
+        let mut bus = Bus::new();
+        // Release PIO1 from reset.
+        bus.write32(0x4000_F000, 1u32 << 11);
+        // Enable PIO1 SM0.
+        bus.write32(PIO1_BASE + 0x000, 0x1);
+        // Halfword write to PIO1 TXF0.
+        bus.write16(PIO1_BASE + 0x010, 0x1234);
+        // FSTAT: TXEMPTY bit 24 for SM0 must be cleared.
+        let fstat = bus.read32(PIO1_BASE + 0x004);
+        assert_eq!(fstat & (1 << 24), 0, "TX FIFO must not be empty after halfword write");
+        // Pop from TX FIFO and verify halfword-replicated value.
+        let val = bus.pio[1].pop_tx(0).expect("TX FIFO should have one entry");
+        assert_eq!(val, 0x12341234, "halfword 0x1234 must be replicated to both lanes");
+    }
+
+    #[test]
+    fn pio_non_txf_byte_write_still_dropped() {
+        let mut bus = Bus::new();
+        // Release PIO1 from reset.
+        bus.write32(0x4000_F000, 1u32 << 11);
+        // Write CTRL to enable SM0 (known baseline).
+        bus.write32(PIO1_BASE + 0x000, 0x1);
+        let ctrl_before = bus.read32(PIO1_BASE + 0x000);
+        // Byte write to PIO1 CTRL (offset 0x000) — must be silently dropped.
+        bus.write8(PIO1_BASE + 0x000, 0xFF);
+        let ctrl_after = bus.read32(PIO1_BASE + 0x000);
+        assert_eq!(
+            ctrl_before, ctrl_after,
+            "byte write to non-TXF PIO register must be dropped"
+        );
     }
 
     #[test]
