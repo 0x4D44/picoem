@@ -288,6 +288,33 @@ impl CortexM33 {
         self.regs.sync_sp_to_banked();
         let sp = if return_to_psp { self.regs.psp } else { self.regs.msp };
 
+        // Tail-chain speculation (ARMv8-M §B3.4.2).
+        //
+        // If a pending exception can preempt the post-pop execution
+        // priority, hardware skips the unstack + re-stack and jumps
+        // directly to the new handler at ~6 cycles. The stacked frame
+        // remains valid — the new handler eventually EXC_RETURNs and
+        // unstacks back to the original pre-emption state.
+        //
+        // Peek the stacked xPSR (sp+28) to determine post-pop IPSR —
+        // nested returns land in an outer handler, not necessarily
+        // thread mode. Temporarily swap IPSR + clear the departing
+        // exception's active tracking so `can_preempt` reflects the
+        // post-pop state; restore on no-tail-chain below.
+        let stacked_xpsr_peek = self.bus_read32(sp.wrapping_add(28), bus);
+        let post_pop_ipsr = (stacked_xpsr_peek & 0x1FF) as u16;
+        let saved_ipsr_bits = self.regs.xpsr & 0x1FF;
+        self.regs.xpsr = (self.regs.xpsr & !0x1FF) | (post_pop_ipsr as u32);
+        self.ppb.clear_active(active_exc as u16);
+        if let Some(new_exc) = self.pick_tail_chain_target() {
+            return self.activate_tail_chain(new_exc, exc_return, bus);
+        }
+        // No tail-chain: restore IPSR so the unstack below overwrites
+        // it with the stacked value (the normal pre-emption semantics).
+        // The cleared active bit stays cleared — the normal pop path
+        // below does the same clear at its tail.
+        self.regs.xpsr = (self.regs.xpsr & !0x1FF) | saved_ipsr_bits;
+
         // Pop basic frame
         self.regs.r[0] = self.bus_read32(sp, bus);
         self.regs.r[1] = self.bus_read32(sp.wrapping_add(4), bus);
@@ -351,8 +378,8 @@ impl CortexM33 {
         }
         self.regs.sync_sp_from_banked();
 
-        // Clear active exception
-        self.ppb.clear_active(active_exc as u16);
+        // Active exception was already cleared in the tail-chain
+        // speculation step above.
 
         debug!(
             exc_return = format_args!("{:#010x}", exc_return),
@@ -361,6 +388,105 @@ impl CortexM33 {
         );
 
         12
+    }
+
+    // --- Tail-chain fast path (ARMv8-M §B3.4.2) ---
+
+    /// Pick the highest-priority pending exception that would preempt
+    /// the current execution priority, for the tail-chain decision at
+    /// EXC_RETURN. Uses the same arbitration ordering as
+    /// `try_take_any_pending_exception` (NMI unconditional, then priority
+    /// + exc-num tie-break over PendSV / SysTick / external IRQs).
+    ///
+    /// Callers must have transitioned self.regs.xpsr + bus active
+    /// tracking into the post-pop state before calling; see
+    /// `exit_exception`.
+    fn pick_tail_chain_target(&self) -> Option<u16> {
+        let icsr = self.ppb.icsr;
+
+        // NMI: non-maskable, always preempts.
+        if icsr & crate::bus::ppb::ICSR_NMIPENDSET != 0 {
+            return Some(2);
+        }
+
+        let ppb = &self.ppb;
+        let mut best: Option<(i16, u16)> = None;
+        if icsr & crate::bus::ppb::ICSR_PENDSVSET != 0 {
+            best = Some((ppb.exception_priority(14), 14));
+        }
+        if icsr & crate::bus::ppb::ICSR_PENDSTSET != 0 {
+            let prio = ppb.exception_priority(15);
+            best = match best {
+                None => Some((prio, 15)),
+                Some((bp, be)) if prio < bp || (prio == bp && 15 < be) => Some((prio, 15)),
+                other => other,
+            };
+        }
+        if let Some(ext_exc) = ppb.highest_priority_pending_irq() {
+            let prio = ppb.exception_priority(ext_exc);
+            best = match best {
+                None => Some((prio, ext_exc)),
+                Some((bp, be)) if prio < bp || (prio == bp && ext_exc < be) => Some((prio, ext_exc)),
+                other => other,
+            };
+        }
+
+        let (_, candidate) = best?;
+        if !self.can_preempt(candidate) {
+            return None;
+        }
+        Some(candidate)
+    }
+
+    /// Activate a tail-chained exception. The stacked frame from the
+    /// departing exception remains on the stack — the new handler
+    /// eventually EXC_RETURNs and unstacks back to the original
+    /// pre-emption state. Cycle cost is 6 (ARMv8-M M33) vs 12 for a
+    /// full unstack.
+    fn activate_tail_chain<B: CoreBus>(&mut self, new_exc: u16, exc_return: u32, bus: &mut B) -> u32 {
+        // Dispatch cleanup — mirror `try_take_any_pending_exception` +
+        // `enter_exception`: clear pending for the new exception,
+        // set active for external IRQs.
+        match new_exc {
+            2 => self.ppb.icsr &= !crate::bus::ppb::ICSR_NMIPENDSET,
+            14 => self.ppb.icsr &= !crate::bus::ppb::ICSR_PENDSVSET,
+            15 => self.ppb.icsr &= !crate::bus::ppb::ICSR_PENDSTSET,
+            _ => {
+                let irq = new_exc - 16;
+                let word = (irq / 32) as usize;
+                let bit = irq % 32;
+                if word < crate::bus::ppb::NVIC_BIT_WORDS {
+                    let core = self.core_id as usize;
+                    self.atomics.clear_irq(core, irq as u32);
+                    self.ppb.nvic_ispr[word].fetch_and(!(1u32 << bit), Ordering::Relaxed);
+                }
+                self.ppb.set_irq_active(irq as u32);
+            }
+        }
+
+        // IPSR → new exception number; IT state clears on handler entry.
+        self.regs.xpsr = (self.regs.xpsr & !0x1FF) | (new_exc as u32);
+        self.it_state = 0;
+
+        // LR holds EXC_RETURN matching the preserved frame — on the
+        // NEW handler's eventual EXC_RETURN, the full unstack restores
+        // the original pre-emption state.
+        self.regs.r[14] = exc_return;
+
+        // Fetch vector, update PC. Already in handler mode on MSP,
+        // so no CONTROL/SP changes.
+        let vtor = self.ppb.vtor;
+        let vector = self.bus_read32(vtor.wrapping_add((new_exc as u32) * 4), bus);
+        self.regs.set_pc(vector & !1);
+        self.regs.sync_sp_from_banked();
+
+        debug!(
+            new_exception = new_exc,
+            pc = format_args!("{:#010x}", vector & !1),
+            "tail-chain activation",
+        );
+
+        6
     }
 
     // --- Priority evaluation ---

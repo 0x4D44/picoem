@@ -5842,6 +5842,121 @@ fn test_async_dispatch_systick_enters_handler() {
 }
 
 // ============================================================================
+// Tail-chain fast path (ARMv8-M §B3.4.2)
+// ============================================================================
+//
+// On EXC_RETURN with another exception pending at a priority that would
+// preempt the post-pop execution priority, hardware skips both the
+// unstack of the departing frame and the re-stack of the new entry —
+// the stacked frame already reflects the pre-emption state that the
+// new handler will eventually return to. The ARMv8-M M33 TRM states
+// this path costs ~6 cycles vs ~24 (12 exit + 12 re-entry) for the
+// full two-step sequence. Before this path existed, the emulator
+// relied on `exit_exception` fully unstacking and the top-of-loop
+// `try_take_any_pending_exception` check re-entering on the next step
+// — end-state correct, but cycle-cost wrong in both directions (under
+// for this case because the stack churn was cheaper than silicon's
+// true tail-chain sequencing, over for the cold case because we paid
+// the full double framing cost).
+
+/// Tail-chain integration: EXC_RETURN with pending SysTick transitions
+/// directly into SysTick without unstacking the PendSV frame.
+#[test]
+fn test_tail_chain_pendsv_to_systick_preserves_frame() {
+    let mut emu = Emulator::new(Config::default());
+    emu.load_bootrom(&async_dispatch_rom(false)); // BX LR handler
+    emu.reset();
+    for _ in 0..5 { core0_step(&mut emu); }
+
+    // Step 1: pend PendSV + SysTick simultaneously. PendSV wins dispatch
+    // (lower exc number at same priority). Single-step enters PendSV.
+    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT | ICSR_PENDSTSET_BIT;
+    core0_step(&mut emu);
+    assert_eq!(emu.cores[0].regs.ipsr(), 14, "PendSV wins arbitration");
+    assert_ne!(emu.cores[0].ppb.icsr & ICSR_PENDSTSET_BIT, 0,
+        "SysTick must remain pending while PendSV is active");
+    let msp_in_pendsv = emu.cores[0].regs.msp;
+
+    // Step 2: runs the single BX LR in the handler. exit_exception
+    // sees SysTick pending and tail-chains — no unstack, no re-stack.
+    core0_step(&mut emu);
+
+    assert_eq!(emu.cores[0].regs.ipsr(), 15,
+        "tail-chain must activate SysTick, not return to thread");
+    assert_eq!(emu.cores[0].regs.msp, msp_in_pendsv,
+        "tail-chain must NOT pop the frame — MSP preserved for the new handler");
+    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0280,
+        "PC at SysTick handler entry address");
+    assert_eq!(emu.cores[0].ppb.icsr & ICSR_PENDSTSET_BIT, 0,
+        "SysTick pending bit clears on tail-chain activation");
+    assert!(CortexM33::is_exc_return(emu.cores[0].regs.lr()),
+        "LR still an EXC_RETURN magic (frame held for eventual thread return)");
+}
+
+/// Tail-chain cycle cost: ~6 cycles (ARMv8-M §B3.4.2), vs ~12 for a
+/// full `exit_exception` unstack. Driven via `test_exit_exception` so
+/// the cost is isolated from per-instruction fetch/execute.
+#[test]
+fn test_tail_chain_cycle_cost_is_discounted() {
+    use crate::bus::Bus;
+    use crate::core::CortexM33;
+
+    let mut bus = Bus::new();
+    let mut cpu = CortexM33::new(0, bus.atomics.clone());
+    cpu.regs.msp = 0x2000_2000;
+    cpu.regs.r[13] = cpu.regs.msp;
+
+    let vtor: u32 = 0x2000_4000;
+    cpu.ppb.vtor = vtor;
+    bus.write32(vtor + 14 * 4, 0x2000_0200 | 1, 0); // PendSV → 0x2000_0200
+    bus.write32(vtor + 15 * 4, 0x2000_0280 | 1, 0); // SysTick → 0x2000_0280
+
+    // Enter PendSV so a frame is on the stack.
+    cpu.test_enter_exception(14, &mut bus);
+    assert_eq!(cpu.regs.ipsr(), 14);
+
+    // Pend SysTick.
+    cpu.ppb.icsr |= 1u32 << 26; // ICSR_PENDSTSET
+
+    // EXC_RETURN: thread, MSP, no FP. With SysTick pending, the fast
+    // path should tail-chain at a discounted cost.
+    let cycles = cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
+
+    assert_eq!(cpu.regs.ipsr(), 15, "tail-chained into SysTick");
+    assert_eq!(cycles, 6,
+        "tail-chain cost is 6 cycles, not 12 (full unstack); got {cycles}");
+}
+
+/// Negative control: EXC_RETURN with no pending exception must not
+/// tail-chain — full unstack back to thread mode at normal 12-cycle cost.
+#[test]
+fn test_exc_return_without_pending_does_full_unstack() {
+    use crate::bus::Bus;
+    use crate::core::CortexM33;
+
+    let mut bus = Bus::new();
+    let mut cpu = CortexM33::new(0, bus.atomics.clone());
+    cpu.regs.msp = 0x2000_2000;
+    cpu.regs.r[13] = cpu.regs.msp;
+    let msp_pre_entry = cpu.regs.msp;
+
+    let vtor: u32 = 0x2000_4000;
+    cpu.ppb.vtor = vtor;
+    bus.write32(vtor + 14 * 4, 0x2000_0200 | 1, 0);
+
+    cpu.test_enter_exception(14, &mut bus);
+    assert_eq!(cpu.regs.ipsr(), 14);
+    assert_ne!(cpu.regs.msp, msp_pre_entry, "frame pushed");
+
+    // No pending exceptions. EXC_RETURN should unstack normally.
+    let cycles = cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
+
+    assert_eq!(cpu.regs.ipsr(), 0, "returned to thread mode");
+    assert_eq!(cpu.regs.msp, msp_pre_entry, "frame fully popped");
+    assert_eq!(cycles, 12, "normal exit cost is 12 cycles; got {cycles}");
+}
+
+// ============================================================================
 // External-IRQ dispatch (Phase 0a, HLD V5 §4.1.4)
 // ============================================================================
 //

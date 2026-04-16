@@ -356,6 +356,124 @@ Medium priority. The path is correct for current firmware (unit
 tests gate it) but has no regression safety net at the breadth a
 fuzzer provides.
 
+## ISR Oracle Residual Cycle Deltas (mdrp2350)
+
+Measured by `silicon_isr_diff_rp2350` against real RP2354 silicon.
+State observables (stacked frame, FPCCR, IPSR) all match; only
+`cyccnt_delta` diverges on the two cases below.
+
+### `isr_pendsv_cold` — EMU overcounts by 6 (HW=19, EMU=25)
+
+Cold PendSV entry: main pends PendSV, single handler fires, reads
+CYCCNT into the mailbox, BKPTs. No EXC_RETURN, no tail-chain. The
+EMU+6 delta on the cold path is the remaining gap once load-use
+latency and write-buffer drain aren't modelled.
+
+Contributing factors, all documented in
+`wrk_docs/2026.04.16 - HLD - Cycle and DualCore Timing Accuracy.md`
+§9 "Future Work":
+
+1. **LDR load-use pipeline overlap** — handler's two `LDR` (CYCCNT
+   address, CYCCNT value) return 2+2=4 cycles in EMU; silicon can
+   fold one to 1 when the destination isn't consumed by the next
+   instruction. Worth ~1-2 cycles.
+2. **Write-buffer drain overlap on stacking stores** — the 8-word
+   basic-frame push on exception entry drains through a write buffer
+   on silicon, overlapping with the vector fetch. EMU charges a flat
+   12 cycles. Worth ~2-4 cycles.
+3. **Handler prologue fetch from a mid-image offset** — the handler
+   starts at 0x044 (bank depends on image_base); exception-entry
+   vector fetch lands on a non-sequential PC that `decode.rs` will
+   correctly penalise at bank 2/6, but the flat 12-cycle
+   `enter_exception` cost may already include / exclude this
+   inconsistently.
+
+Fixing any single one of these is scope-creep against the HLD that
+already landed (5 of 10 oracle cases fixed, 5 improved-but-residual).
+Treat as a follow-up HLD for exception-entry cycle fidelity when the
+residual causes a firmware-observable timing bug.
+
+### `isr_tail_chain_pendsv_systick` — scenario mis-named (RESOLVED to cold parity)
+
+The scenario as catalogued in v1 does NOT exercise tail-chain
+transitions. Shared `HANDLER_BASELINE` ends in `bkpt #0` at halfword
+[4] — no EXC_RETURN is ever issued, so the emulator's tail-chain
+path (landed 2026-04-16) is never entered by this scenario.
+
+**Root cause of the original HW=19 / EMU=15 delta (investigated 2026-04-16):**
+
+The preamble writes `SYST_CVR=0` then `SYST_CSR=ENABLE|TICKINT|CLKSOURCE`.
+`Ppb::systick_advance` at `crates/mdrp2350/src/bus/ppb.rs:743` had an
+off-by-RVR bug at CVR=0 startup:
+
+```rust
+// Pre-fix: cvr=0, rem=1 → "rem -= cvr+1 = 1; cvr=RVR; FIRE."
+// Consumed 1 cycle to fire, wrong by RVR cycles vs silicon.
+```
+
+ARMv8-M §B11.2.1 counter operation: when CVR=0 at start of a tick,
+the counter LOADS RVR into CVR on that tick (reload, no fire).
+Pending only asserts on the subsequent cvr→0 decrement transition.
+So CVR=0 with RVR=4 should take 5 ticks to the first fire (1 reload
++ 4 decrements). EMU fired after just 1 tick.
+
+**Fix landed (2026-04-16):** `systick_advance` now handles the CVR=0
+start as a reload-without-fire step, then falls through to the
+normal countdown loop. Regression test
+`test_systick_cvr_zero_reloads_without_fire_on_first_tick` pins the
+behaviour. Scratch investigation test
+`test_investigate_cold_vs_tail_chain_emu_cyccnt` in
+`crates/mdpicoem-harness/src/isr_scenarios.rs` confirms both
+scenarios now report mailbox CYCCNT = 22 (HW=19 for both, so EMU=+3
+matching the cold-ISR residual above). The scenarios are no longer
+divergent between themselves on EMU.
+
+### `Ppb::systick_advance` — cvr→0 via subtraction is silent (bug 2)
+
+Separate systick bug discovered during the investigation. The
+`rem <= cvr` branch does `cvr -= rem` and, when the result is
+exactly 0, does NOT fire COUNTFLAG / pend the exception. Silicon
+fires on the transition to 0 regardless of whether it's reached by
+decrement or by a multi-cycle subtraction.
+
+**Scope:** one if-block in `systick_advance`:
+
+```rust
+if rem <= self.syst_cvr {
+    self.syst_cvr -= rem;
+    // TODO: if cvr==0 here, set COUNTFLAG + pend_systick (if TICKINT).
+    break;
+}
+```
+
+**Why deferred:** The fix is silicon-accurate in isolation but
+interacts with the cold-ISR cycle residual (HLD §9 Future Work:
+main instruction cycle model over-counts by ~3 cycles on EMU vs
+silicon). Applying it makes the `isr_tail_chain_pendsv_systick`
+scenario fire SysTick one EMU step earlier than silicon would,
+splitting the ISR oracle's unified +3 residual into +3 (cold) /
+−3 (tail-chain) — a worse oracle signal. Once the cold-ISR
+residual is closed, re-apply bug 2 fix to regain silicon semantics
+without signal degradation.
+
+Priority: low (latent, no current scenario exercises the rem=cvr
+boundary in a way that observably diverges from silicon).
+
+### Tail-chain fast path landed (2026-04-16)
+
+`exit_exception` now speculates post-pop priority against pending
+exceptions; on tail-chain, skips the unstack + re-stack and jumps
+directly to the new handler at 6 cycles (vs ~24 for the old
+two-step exit-then-reentry). See
+`crates/mdrp2350/src/core/exceptions.rs` `activate_tail_chain`, and
+unit tests `test_tail_chain_pendsv_to_systick_preserves_frame` +
+`test_tail_chain_cycle_cost_is_discounted` in
+`crates/mdrp2350/src/tests.rs`. Architecturally correct; does not
+close the `isr_pendsv_cold` residual (separate cold-entry gap) and
+did not directly close `isr_tail_chain_pendsv_systick` either —
+that scenario's delta was caused by the systick CVR=0 bug above,
+closed by a separate fix to `Ppb::systick_advance`.
+
 ## PicoGUS Integration — Stage 1 follow-ups
 
 Surfaced by the devils-advocate review of Stage 1 (XIP flash in
