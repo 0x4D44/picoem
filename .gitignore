@@ -6,6 +6,7 @@ venv/
 env/
 *.tmp
 *.log
+*.bak
 # Claude Code session runtime state (scheduled_tasks.lock etc.)
 /.claude/
 # roms/: tracked binaries (blinky.bin, bootrom-combined.bin, lcd_demo.bin)
