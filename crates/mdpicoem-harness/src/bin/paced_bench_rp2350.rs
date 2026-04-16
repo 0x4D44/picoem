@@ -472,6 +472,7 @@ impl Runtime {
 }
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     let seconds = parse_arg("--seconds").unwrap_or(5);
     let cycles_target = parse_arg_u64("--cycles");
     let quantum = parse_arg("--quantum").unwrap_or(150);

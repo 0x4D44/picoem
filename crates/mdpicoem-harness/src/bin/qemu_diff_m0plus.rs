@@ -46,6 +46,8 @@ fn shutdown_requested() -> bool {
 }
 
 fn main() -> ExitCode {
+    mdpicoem_harness::harness_tracing_init();
+
     if let Err(e) = ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst)) {
         eprintln!("warning: failed to install Ctrl-C handler: {e}");
     }

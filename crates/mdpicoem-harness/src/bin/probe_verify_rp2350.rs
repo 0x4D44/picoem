@@ -362,6 +362,7 @@ fn test5_cyccnt_calibration(core: &mut Core, res: &mut Results) -> Result<(), pr
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    mdpicoem_harness::harness_tracing_init();
     println!("probe_verify_rp2350: RP2354 hardware assumption checker");
     println!("=======================================================");
 

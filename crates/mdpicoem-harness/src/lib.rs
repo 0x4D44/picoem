@@ -3,6 +3,27 @@
 // Validates Thumb-2 instruction semantics by executing identical instructions
 // in both QEMU (Cortex-M33 model) and our emulator, then diffing state.
 
+// ============================================================================
+// Subscriber init — call once at the top of every harness `main()`.
+// ============================================================================
+
+/// Initialise the `tracing` subscriber for harness binaries.
+///
+/// Reads `RUST_LOG` for level filtering (default: `warn`). Output goes to
+/// stderr so that structured test output on stdout is unaffected.
+///
+/// Call once at the top of `main()`. Safe to call multiple times (second
+/// call is a no-op — `try_init` swallows the error).
+pub fn harness_tracing_init() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing_subscriber::filter::LevelFilter::WARN.into()),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 pub mod bank_conflict_cases;
 pub mod cycle_cases;
 pub mod dualcore_cases;

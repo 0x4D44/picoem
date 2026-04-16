@@ -16,6 +16,7 @@ use mdrp2040::{Config, EmulatorBuilder};
 use std::path::PathBuf;
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut flash = None;
     let mut bootrom = None;

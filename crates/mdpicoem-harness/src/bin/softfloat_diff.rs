@@ -382,6 +382,7 @@ fn random_f32(rng: &mut StdRng) -> f32 {
 // ============================================================================
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

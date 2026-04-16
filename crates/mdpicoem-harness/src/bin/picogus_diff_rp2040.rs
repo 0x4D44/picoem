@@ -755,6 +755,7 @@ fn print_usage() {
 }
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     if let Err(e) = run() {
         eprintln!("fatal: {e}");
         std::process::exit(2);

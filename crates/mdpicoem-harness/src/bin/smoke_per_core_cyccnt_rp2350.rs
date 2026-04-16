@@ -127,6 +127,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {

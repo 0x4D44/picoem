@@ -162,6 +162,8 @@ fn load_firmware(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn main() -> ExitCode {
+    mdpicoem_harness::harness_tracing_init();
+
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

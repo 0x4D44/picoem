@@ -84,6 +84,8 @@ fn repo_root_relative(rel: &str) -> PathBuf {
 }
 
 fn main() -> ExitCode {
+    mdpicoem_harness::harness_tracing_init();
+
     let bootrom_path = repo_root_relative(BOOTROM_PATH);
     let flash_path = repo_root_relative(FLASH_PATH);
 

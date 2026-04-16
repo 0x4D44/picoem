@@ -703,6 +703,7 @@ fn is_transient_probe_error(e: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {

@@ -64,6 +64,15 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Tracing subscriber — stderr so the TUI owns stdout uncontested.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing_subscriber::filter::LevelFilter::WARN.into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let arg = std::env::args().nth(1).unwrap_or_else(|| "blinky".into());
     let fw_path = resolve_firmware_path(&arg);
     let bootrom_path = bootrom_path();

@@ -39,6 +39,7 @@ const NOP: u16 = 0xBF00;
 const BKPT: u16 = 0xBE00;
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     if let Err(e) = run() {
         eprintln!("fatal: {e}");
         std::process::exit(2);

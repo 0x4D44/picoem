@@ -37,6 +37,8 @@ const FLASH_PATH: &str =
 const BOOT_CYCLE_CAP: u64 = 10_000_000;
 
 fn main() -> ExitCode {
+    mdpicoem_harness::harness_tracing_init();
+
     let bootrom_path = BOOTROM_PATH;
     let flash_path = FLASH_PATH;
 

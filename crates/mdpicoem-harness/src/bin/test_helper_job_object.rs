@@ -27,6 +27,7 @@ use std::process::{Command, Stdio};
 use mdpicoem_harness::gdb_client::{QemuProcess, QemuProfile};
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     #[cfg(windows)]
     {
         // Stand-in child that lasts long enough for the test to observe.

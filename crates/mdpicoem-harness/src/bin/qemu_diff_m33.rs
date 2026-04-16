@@ -43,6 +43,8 @@ fn shutdown_requested() -> bool {
 }
 
 fn main() -> ExitCode {
+    mdpicoem_harness::harness_tracing_init();
+
     // Best-effort Ctrl-C handler: flips a flag the main loop polls. If the
     // OS rejects the install (rare; unsupported platform, already-installed
     // handler), keep going — the cooperative `Drop` and the Job Object will

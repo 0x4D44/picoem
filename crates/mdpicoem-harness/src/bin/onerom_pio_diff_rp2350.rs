@@ -193,6 +193,8 @@ fn observe(pio: &PioBlock, input_drive: u32, input_level: u32) -> (u32, u32) {
 // ---------------------------------------------------------------------------
 
 fn main() -> ExitCode {
+    mdpicoem_harness::harness_tracing_init();
+
     let args: Vec<String> = env::args().collect();
     let trace_path = if args.len() == 2 {
         PathBuf::from(&args[1])

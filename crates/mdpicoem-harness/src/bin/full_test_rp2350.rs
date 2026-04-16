@@ -648,6 +648,7 @@ fn generate_report(
 // ============================================================================
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     set_low_priority();
 
     let args: Vec<String> = std::env::args().collect();

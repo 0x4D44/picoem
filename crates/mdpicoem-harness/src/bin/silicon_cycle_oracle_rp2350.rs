@@ -87,6 +87,7 @@ fn parse_args() -> Result<CycleArgs, String> {
 }
 
 fn main() {
+    mdpicoem_harness::harness_tracing_init();
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
