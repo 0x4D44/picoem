@@ -1871,7 +1871,7 @@ pub fn run_against(
         None => SCENARIOS
             .iter()
             .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
-            .filter(|s| !silicon_oracle::name_matches_exclude(s.name, args.exclude.as_deref()))
+            .filter(|s| !silicon_oracle::should_exclude(s.name, args.exclude.as_deref()))
             .collect(),
         Some(names) => {
             let mut v: Vec<&IsrScenario> = Vec::with_capacity(names.len());

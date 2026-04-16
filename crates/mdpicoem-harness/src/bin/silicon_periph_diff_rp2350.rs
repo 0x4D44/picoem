@@ -5,7 +5,7 @@
 // setup + diff lives in the library module so the `test_silicon`
 // orchestrator can share it.
 
-use mdpicoem_harness::silicon_oracle::{name_matches_exclude, name_matches_filter, Verdict};
+use mdpicoem_harness::silicon_oracle::{select_by_name, Verdict};
 use mdpicoem_harness::silicon_scenarios::{
     run_scenario_with_retry, PeriphArgs, PeriphScenario, PLL_SYS_BASE, RESETS_BASE, RESETS_RESET,
     RESET_PIO0, RESET_PIO1, RESET_PLL_SYS, RED_PATH_SCENARIOS, SCENARIOS,
@@ -99,22 +99,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         SCENARIOS
     };
 
-    let mut skipped_filter = 0usize;
-    let mut skipped_exclude = 0usize;
-    let selected: Vec<&PeriphScenario> = catalogue
-        .iter()
-        .filter(|s| {
-            if !name_matches_filter(s.name, args.inner.filter.as_deref()) {
-                skipped_filter += 1;
-                return false;
-            }
-            if name_matches_exclude(s.name, args.inner.exclude.as_deref()) {
-                skipped_exclude += 1;
-                return false;
-            }
-            true
-        })
-        .collect();
+    let catalogue_names: Vec<&str> = catalogue.iter().map(|s| s.name).collect();
+    let (indices, skipped_filter, skipped_exclude) = select_by_name(
+        &catalogue_names,
+        args.inner.filter.as_deref(),
+        args.inner.exclude.as_deref(),
+    );
+    let selected: Vec<&PeriphScenario> = indices.into_iter().map(|i| &catalogue[i]).collect();
 
     if selected.is_empty() {
         println!(

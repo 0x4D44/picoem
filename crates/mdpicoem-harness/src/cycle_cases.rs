@@ -719,7 +719,7 @@ pub fn run_against(
         None => CASES
             .iter()
             .filter(|c| silicon_oracle::name_matches_filter(c.name, args.filter.as_deref()))
-            .filter(|c| !silicon_oracle::name_matches_exclude(c.name, args.exclude.as_deref()))
+            .filter(|c| !silicon_oracle::should_exclude(c.name, args.exclude.as_deref()))
             .collect(),
         Some(names) => {
             let mut v: Vec<&CycleCase> = Vec::with_capacity(names.len());

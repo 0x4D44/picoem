@@ -21,8 +21,8 @@
 // instruction boundary. Remaining scenario FAILs surface real
 // divergences, not a missing dispatch path.
 
-use mdpicoem_harness::isr_scenarios::{self, IsrArgs, IsrScenario, SCENARIOS};
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_exclude, name_matches_filter, Verdict};
+use mdpicoem_harness::isr_scenarios::{self, IsrArgs, SCENARIOS};
+use mdpicoem_harness::silicon_oracle::{enable_cyccnt, select_by_name, Verdict};
 use mdpicoem_harness::{ISR_IMAGE_BASE, ISR_MAILBOX_CYCCNT, ISR_STACK_TOP};
 use probe_rs::{Session, SessionConfig};
 use std::time::{Duration, Instant};
@@ -82,24 +82,11 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "bad arguments"
     })?;
 
-    let mut skipped_filter = 0usize;
-    let mut skipped_exclude = 0usize;
-    let selected: Vec<&IsrScenario> = SCENARIOS
-        .iter()
-        .filter(|s| {
-            if !name_matches_filter(s.name, args.filter.as_deref()) {
-                skipped_filter += 1;
-                return false;
-            }
-            if name_matches_exclude(s.name, args.exclude.as_deref()) {
-                skipped_exclude += 1;
-                return false;
-            }
-            true
-        })
-        .collect();
+    let scenario_names: Vec<&str> = SCENARIOS.iter().map(|s| s.name).collect();
+    let (indices, skipped_filter, skipped_exclude) =
+        select_by_name(&scenario_names, args.filter.as_deref(), args.exclude.as_deref());
 
-    if selected.is_empty() {
+    if indices.is_empty() {
         println!(
             "silicon_isr_diff_rp2350: no scenarios match filter '{}' (exclude '{}')); nothing to do",
             args.filter.as_deref().unwrap_or(""),
@@ -110,7 +97,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     println!(
         "silicon_isr_diff_rp2350: {} scenario(s) selected ({} skipped by filter, {} skipped by exclude)",
-        selected.len(), skipped_filter, skipped_exclude,
+        indices.len(), skipped_filter, skipped_exclude,
     );
     println!(
         "image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X} mailbox=0x{ISR_MAILBOX_CYCCNT:08X}",

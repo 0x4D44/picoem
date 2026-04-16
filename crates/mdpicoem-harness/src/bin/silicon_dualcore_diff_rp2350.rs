@@ -17,7 +17,7 @@
 // the hardware-gated prerequisites.
 
 use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs, DualCoreCase, CASES};
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_exclude, name_matches_filter, Verdict};
+use mdpicoem_harness::silicon_oracle::{enable_cyccnt, select_by_name, Verdict};
 use mdpicoem_harness::{CYCLE_MAILBOX_BASE, DUALCORE_ANTAGONIST_SLOT};
 use probe_rs::{MemoryInterface, Session, SessionConfig};
 use std::time::{Duration, Instant};
@@ -113,22 +113,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "bad arguments"
     })?;
 
-    let mut skipped_filter = 0usize;
-    let mut skipped_exclude = 0usize;
-    let selected: Vec<&DualCoreCase> = CASES
-        .iter()
-        .filter(|c| {
-            if !name_matches_filter(c.name, args.filter.as_deref()) {
-                skipped_filter += 1;
-                return false;
-            }
-            if name_matches_exclude(c.name, args.exclude.as_deref()) {
-                skipped_exclude += 1;
-                return false;
-            }
-            true
-        })
-        .collect();
+    let case_names: Vec<&str> = CASES.iter().map(|c| c.name).collect();
+    let (indices, skipped_filter, skipped_exclude) =
+        select_by_name(&case_names, args.filter.as_deref(), args.exclude.as_deref());
+    let selected: Vec<&DualCoreCase> = indices.into_iter().map(|i| &CASES[i]).collect();
 
     if selected.is_empty() {
         println!("no cases match filter/exclude; nothing to do");

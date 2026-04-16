@@ -1725,7 +1725,7 @@ const SLED_DMA_CHAIN_TRIGGER_HW: [u16; 64] = [
     0x2401, //  [31] movs r4, #1            ; ch1 TRANS_COUNT=1
     0x648C, //  [32] str  r4, [r1, #0x48]   ; CH1_TRANS_COUNT (imm5=18)
     0xF648, //  [33] movw r4, #0x8839 hw0   ; ch1 ctrl: EN,DATA_SIZE=2,INCR,TREQ=63,CHAIN_TO=1
-    0x4439, //  [34] movw r4, #0x8839 hw1   (Rd=4)
+    0x0439, //  [34] movw r4, #0x8839 hw1   (Rd=4)
     0xF2C0, //  [35] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
     0x041F, //  [36] movt r4, #0x001F hw1   (Rd=4, imm3=0)
     0x650C, //  [37] str  r4, [r1, #0x50]   ; CH1_AL1_CTRL   (imm5=20)
@@ -1743,7 +1743,7 @@ const SLED_DMA_CHAIN_TRIGGER_HW: [u16; 64] = [
     0x2401, //  [48] movs r4, #1            ; ch0 TRANS_COUNT=1
     0x608C, //  [49] str  r4, [r1, #8]      ; CH0_TRANS_COUNT (imm5=2)
     0xF648, //  [50] movw r4, #0x8839 hw0   ; ch0 ctrl: CHAIN_TO=1
-    0x4439, //  [51] movw r4, #0x8839 hw1   (Rd=4)
+    0x0439, //  [51] movw r4, #0x8839 hw1   (Rd=4)
     0xF2C0, //  [52] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
     0x041F, //  [53] movt r4, #0x001F hw1   (Rd=4, imm3=0)
     0x60CC, //  [54] str  r4, [r1, #0x0C]   ; CH0_CTRL_TRIG → triggers ch0
@@ -2417,7 +2417,7 @@ pub fn run_against(
         None => SCENARIOS
             .iter()
             .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
-            .filter(|s| !silicon_oracle::name_matches_exclude(s.name, args.exclude.as_deref()))
+            .filter(|s| !silicon_oracle::should_exclude(s.name, args.exclude.as_deref()))
             .collect(),
         Some(names) => {
             let mut v: Vec<&PeriphScenario> = Vec::with_capacity(names.len());
@@ -3081,6 +3081,14 @@ mod tests {
             0x0000_0003,
             "DMA INTR bits 0+1",
         );
+        // Neither channel must have RING_SEL set (bit 10). The sled encodes
+        // CTRL=0x001F_8839 which has RING_SIZE=0 and RING_SEL=0; the old hw1
+        // value 0x4439 had imm3=4, reconstructing 0x001F_8C39 which set
+        // RING_SIZE=4, corrupting the ring configuration.
+        let ch0_ctrl = emu.mmio_read32(DMA_BASE + 0x0C);
+        let ch1_ctrl = emu.mmio_read32(DMA_BASE + 0x50);
+        assert_eq!(ch0_ctrl & (1 << 10), 0, "ch0 must not have RING_SEL set");
+        assert_eq!(ch1_ctrl & (1 << 10), 0, "ch1 must not have RING_SEL set");
     }
 
     #[test]

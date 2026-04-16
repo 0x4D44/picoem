@@ -42,7 +42,7 @@ use mdpicoem_harness::bank_conflict_cases::{self, BankArgs};
 use mdpicoem_harness::cycle_cases::{self, CycleArgs};
 use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs};
 use mdpicoem_harness::isr_scenarios::{self, IsrArgs};
-use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter};
+use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter, should_exclude};
 use mdpicoem_harness::silicon_scenarios::{self, PeriphArgs};
 use probe_rs::probe::{list::Lister, DebugProbeSelector};
 use probe_rs::{Permissions, Session, SessionConfig};
@@ -64,7 +64,7 @@ const ORACLE_DUALCORE: &str = "dualcore";
 const ORACLE_ISR: &str = "isr";
 
 const USAGE: &str = "\
-Usage: test_silicon [--soak <duration>] [--seed <u64>] [--filter <substr>] [--verbose] [--probe VID:PID:SERIAL]
+Usage: test_silicon [--soak <duration>] [--seed <u64>] [--filter <substr>] [--exclude <substr>] [--verbose] [--probe VID:PID:SERIAL]
 
 Options:
   --soak     Run continuously for the given duration (e.g. 30m, 4h, 7d).
@@ -73,6 +73,8 @@ Options:
              Default: current Unix epoch seconds.
   --filter   Only run cases whose name contains <substr>. Applied to
              every oracle's catalogue. Default: all cases.
+  --exclude  Skip cases whose name contains <substr> (applied after --filter).
+             Applied to every oracle's catalogue. Default: none.
   --verbose  In soak mode, print full per-case output every iteration
              (default: quiet — failures + hourly heartbeat).
              In single-pass mode, has no additional effect (output is
@@ -97,6 +99,7 @@ struct CliArgs {
     soak: Option<Duration>,
     seed: u64,
     filter: Option<String>,
+    exclude: Option<String>,
     verbose: bool,
     probe: Option<DebugProbeSelector>,
 }
@@ -105,6 +108,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
     let mut soak: Option<Duration> = None;
     let mut seed: Option<u64> = None;
     let mut filter: Option<String> = None;
+    let mut exclude: Option<String> = None;
     let mut verbose = false;
     let mut probe: Option<DebugProbeSelector> = None;
     let mut i = 0;
@@ -135,6 +139,13 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
                 }
                 filter = Some(argv[i].clone());
             }
+            "--exclude" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--exclude requires a substring\n{USAGE}"));
+                }
+                exclude = Some(argv[i].clone());
+            }
             "--probe" => {
                 i += 1;
                 if i >= argv.len() {
@@ -152,7 +163,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
         i += 1;
     }
     let seed = seed.unwrap_or_else(default_seed);
-    Ok(CliArgs { soak, seed, filter, verbose, probe })
+    Ok(CliArgs { soak, seed, filter, exclude, verbose, probe })
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -325,6 +336,9 @@ struct OraclePlan {
     /// Original filter (still passed via `args.filter` for the `None`
     /// path; the library applies it itself).
     filter: Option<String>,
+    /// Exclude substring (passed via `args.exclude` for the `None` path;
+    /// the library applies it itself). Not supported by `BankArgs`.
+    exclude: Option<String>,
 }
 
 /// Dispatch to the right `run_against` for the given oracle plan.
@@ -350,6 +364,7 @@ fn run_one_oracle(
             let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = CycleArgs {
                 filter: plan.filter.clone(),
+                exclude: plan.exclude.clone(),
                 ..CycleArgs::default()
             };
             cycle_cases::run_against(&mut core, &args, order_slice)
@@ -358,13 +373,18 @@ fn run_one_oracle(
             let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = PeriphArgs {
                 filter: plan.filter.clone(),
-                exclude: None,
+                exclude: plan.exclude.clone(),
                 verbose: false,
             };
             silicon_scenarios::run_against(&mut core, &args, order_slice)
         }
         OracleKind::Bank => {
             let mut core = session.core(0).map_err(|e| e.to_string())?;
+            // Note: BankArgs does not have an `exclude` field; --exclude
+            // is silently not applied to the bank oracle in single-pass
+            // mode. Soak mode builds the bank name list with exclude
+            // applied before handing it to run_against via order=Some(..),
+            // so soak mode is correct.
             let args = BankArgs {
                 filter: plan.filter.clone(),
                 ..BankArgs::default()
@@ -376,6 +396,7 @@ fn run_one_oracle(
             // skip the per-oracle `session.core(0)` acquisition here.
             let args = DualCoreArgs {
                 filter: plan.filter.clone(),
+                exclude: plan.exclude.clone(),
                 ..DualCoreArgs::default()
             };
             dualcore_cases::run_against(session, &args, order_slice)
@@ -384,7 +405,7 @@ fn run_one_oracle(
             let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = IsrArgs {
                 filter: plan.filter.clone(),
-                exclude: None,
+                exclude: plan.exclude.clone(),
                 verbose: false,
             };
             isr_scenarios::run_against(&mut core, &args, order_slice)
@@ -559,6 +580,7 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
     }
     println!("  seed:    {}", args.seed);
     println!("  filter:  {}", args.filter.as_deref().unwrap_or("<none>"));
+    println!("  exclude: {}", args.exclude.as_deref().unwrap_or("<none>"));
     println!("  verbose: {}", args.verbose);
     println!(
         "  probe:   {}",
@@ -600,6 +622,7 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
             // Single-pass mode: deterministic order, full output, exit 1 on any FAIL.
             session = single_pass(
                 &args.filter,
+                &args.exclude,
                 session,
                 &mut summary,
                 &mut interner,
@@ -651,6 +674,7 @@ fn now_iso() -> String {
 /// users at the standalone binaries when full detail is needed.
 fn single_pass(
     filter: &Option<String>,
+    exclude: &Option<String>,
     mut session: Session,
     summary: &mut Summary,
     interner: &mut NameInterner,
@@ -671,6 +695,7 @@ fn single_pass(
             oracle,
             order: None, // None → library default: filter + catalogue order.
             filter: filter.clone(),
+            exclude: exclude.clone(),
         };
         match run_one_oracle(&mut session, &plan) {
             Ok(outcomes) => {
@@ -752,36 +777,41 @@ fn soak_loop(
     let mut consecutive_reattach_fails: u32 = 0;
     let mut total_iters: u64 = 0;
 
-    // Build the per-oracle name lists ONCE. Filter is applied here;
-    // each iteration just shuffles and hands the list to the library.
-    // `&'static str` catalogue entries mean the static name tables never
-    // move; only the order changes.
+    // Build the per-oracle name lists ONCE. Filter and exclude are both
+    // applied here; each iteration just shuffles and hands the list to
+    // the library. `&'static str` catalogue entries mean the static name
+    // tables never move; only the order changes.
     let cycle_names: Vec<&'static str> = cycle_cases::CASES
         .iter()
         .map(|c| c.name)
         .filter(|n| name_matches_filter(n, args.filter.as_deref()))
+        .filter(|n| !should_exclude(n, args.exclude.as_deref()))
         .collect();
     let periph_names: Vec<&'static str> = silicon_scenarios::SCENARIOS
         .iter()
         .map(|s| s.name)
         .filter(|n| name_matches_filter(n, args.filter.as_deref()))
+        .filter(|n| !should_exclude(n, args.exclude.as_deref()))
         .collect();
     // Bank catalogue is `Vec<BankCase>` but names are `&'static str` on
     // the case struct, so we can collect them as `&'static str`.
     let bank_names: Vec<&'static str> = bank_conflict_cases::build_catalog()
         .into_iter()
         .filter(|c| name_matches_filter(c.name, args.filter.as_deref()))
+        .filter(|c| !should_exclude(c.name, args.exclude.as_deref()))
         .map(|c| c.name)
         .collect();
     let dualcore_names: Vec<&'static str> = dualcore_cases::CASES
         .iter()
         .map(|c| c.name)
         .filter(|n| name_matches_filter(n, args.filter.as_deref()))
+        .filter(|n| !should_exclude(n, args.exclude.as_deref()))
         .collect();
     let isr_names: Vec<&'static str> = isr_scenarios::SCENARIOS
         .iter()
         .map(|s| s.name)
         .filter(|n| name_matches_filter(n, args.filter.as_deref()))
+        .filter(|n| !should_exclude(n, args.exclude.as_deref()))
         .collect();
 
     if cycle_names.is_empty()
@@ -791,8 +821,9 @@ fn soak_loop(
         && isr_names.is_empty()
     {
         println!(
-            "test_silicon: no cases match filter '{}' in any oracle; exiting",
+            "test_silicon: no cases match filter '{}' (exclude '{}') in any oracle; exiting",
             args.filter.as_deref().unwrap_or("<none>"),
+            args.exclude.as_deref().unwrap_or("<none>"),
         );
         return Ok((0, 0));
     }
@@ -868,6 +899,11 @@ fn soak_loop(
                 oracle,
                 order: Some(names.clone()),
                 filter: args.filter.clone(),
+                // In soak mode, exclude is already applied when building the
+                // name lists above, so the library's `run_against` receives a
+                // pre-filtered `order=Some(..)` list and applies no further
+                // exclude filtering. Carry the field for completeness.
+                exclude: args.exclude.clone(),
             };
             match run_one_oracle(this_session, &plan) {
                 Ok(outcomes) => {
@@ -1219,6 +1255,7 @@ mod tests {
         let a = parse_args(vec![]).unwrap();
         assert!(a.soak.is_none());
         assert!(a.filter.is_none());
+        assert!(a.exclude.is_none());
         assert!(!a.verbose);
         assert!(a.probe.is_none());
     }

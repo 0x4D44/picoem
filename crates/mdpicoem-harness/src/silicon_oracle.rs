@@ -141,9 +141,9 @@ pub fn name_matches_filter(name: &str, filter: Option<&str>) -> bool {
     }
 }
 
-/// Return `true` iff `exclude` does NOT match `name` — None never excludes,
-/// Some excludes when the substring matches.
-pub fn name_matches_exclude(name: &str, exclude: Option<&str>) -> bool {
+/// Return `true` iff `name` should be excluded — None never excludes,
+/// Some excludes when the name contains the substring.
+pub fn should_exclude(name: &str, exclude: Option<&str>) -> bool {
     match exclude {
         None => false,
         Some(sub) => name.contains(sub),
@@ -174,7 +174,7 @@ pub fn select_by_name<'a>(
             skipped_filter += 1;
             continue;
         }
-        if name_matches_exclude(name, exclude) {
+        if should_exclude(name, exclude) {
             skipped_exclude += 1;
             continue;
         }
@@ -229,16 +229,16 @@ mod tests {
     }
 
     #[test]
-    fn test_name_matches_exclude_none_never_excludes() {
-        assert!(!name_matches_exclude("anything", None));
-        assert!(!name_matches_exclude("adc_one_shot", None));
+    fn test_should_exclude_none_never_excludes() {
+        assert!(!should_exclude("anything", None));
+        assert!(!should_exclude("adc_one_shot", None));
     }
 
     #[test]
-    fn test_name_matches_exclude_substring() {
-        assert!(name_matches_exclude("adc_one_shot", Some("adc")));
-        assert!(name_matches_exclude("adc_round_robin_2ch", Some("adc")));
-        assert!(!name_matches_exclude("pio0_nop_loop", Some("adc")));
+    fn test_should_exclude_substring() {
+        assert!(should_exclude("adc_one_shot", Some("adc")));
+        assert!(should_exclude("adc_round_robin_2ch", Some("adc")));
+        assert!(!should_exclude("pio0_nop_loop", Some("adc")));
     }
 
     // -------------------------------------------------------------------
