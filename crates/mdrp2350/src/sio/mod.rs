@@ -34,9 +34,14 @@ pub struct Sio {
     pub pending_fifo_event: Option<usize>,
     /// Doorbell pending bits — 4 bits per core (§2.5).
     pub doorbell_pending: [u8; 2],
+    /// RISCV_SOFTIRQ register (offset 0x1A0, §3.1, Table 79). Split SET/CLR
+    /// register: bits [1:0] (CORE0_SET/CORE1_SET) write-1-to-set; bits [9:8]
+    /// (CORE0_CLR/CORE1_CLR) write-1-to-clear. Read returns only bits [1:0]
+    /// (status); bits [9:8] are write-only and always read as 0.
+    riscv_softirq: u32,
     /// 64-bit platform timer counter (§2.6).
     pub mtime: u64,
-    /// MTIME control register — bit 0 = enable (§2.6).
+    /// MTIME control register at offset 0x1A4 — bit 0 = enable (§2.6).
     pub mtime_ctrl: u32,
     /// Per-core 64-bit compare value (§2.6).
     pub mtimecmp: [u64; 2],
@@ -62,8 +67,10 @@ impl Sio {
             spinlock_bits: 0,
             pending_fifo_event: None,
             doorbell_pending: [0; 2],
+            riscv_softirq: 0,
             mtime: 0,
-            mtime_ctrl: 0,
+            // Per datasheet Table 80: EN=1, DBGPAUSE_CORE0=1, DBGPAUSE_CORE1=1.
+            mtime_ctrl: 0x0F,
             mtimecmp: [0; 2],
             mtime_match_asserted: [false; 2],
         }
@@ -114,8 +121,9 @@ impl Sio {
         self.spinlock_bits = 0;
         self.pending_fifo_event = None;
         self.doorbell_pending = [0; 2];
+        self.riscv_softirq = 0;
         self.mtime = 0;
-        self.mtime_ctrl = 0;
+        self.mtime_ctrl = 0x0F;
         self.mtimecmp = [0; 2];
         self.mtime_match_asserted = [false; 2];
     }
@@ -141,14 +149,15 @@ impl Sio {
             0x100..=0x17F => self.spinlock_read(offset),
             // Doorbells
             0x188 => self.doorbell_pending[core] as u32,  // DOORBELL_IN_SET read
-            // MTIME registers (0x1A0–0x1BC)
-            0x1A0 => self.mtime_ctrl,
-            0x1A8 => self.mtime as u32,
-            0x1AC => (self.mtime >> 32) as u32,
-            0x1B0 => self.mtimecmp[0] as u32,
-            0x1B4 => (self.mtimecmp[0] >> 32) as u32,
-            0x1B8 => self.mtimecmp[1] as u32,
-            0x1BC => (self.mtimecmp[1] >> 32) as u32,
+            // RISCV_SOFTIRQ (0x1A0, §3.1): per-core RISC-V SW interrupt flags.
+            // Bits [1:0] = {CORE1_SET, CORE0_SET}. Write sets; read returns state.
+            0x1A0 => self.riscv_softirq & 0x3,
+            // MTIME registers (0x1A4–0x1BC, §2.6)
+            0x1A4 => self.mtime_ctrl,
+            0x1B0 => self.mtime as u32,
+            0x1B4 => (self.mtime >> 32) as u32,
+            0x1B8 => self.mtimecmp[core] as u32,
+            0x1BC => (self.mtimecmp[core] >> 32) as u32,
             _ => 0,
         }
     }
@@ -181,14 +190,24 @@ impl Sio {
             0x180 => self.doorbell_pending[1 - core] |= (val & 0xF) as u8,   // DOORBELL_OUT_SET
             0x184 => self.doorbell_pending[1 - core] &= !((val & 0xF) as u8), // DOORBELL_OUT_CLR
             0x18C => self.doorbell_pending[core] &= !((val & 0xF) as u8),     // DOORBELL_IN_CLR
-            // MTIME registers (0x1A0–0x1BC)
-            0x1A0 => self.mtime_ctrl = val,
-            0x1A8 => self.mtime = (self.mtime & 0xFFFF_FFFF_0000_0000) | val as u64,
-            0x1AC => self.mtime = (self.mtime & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32),
-            0x1B0 => self.mtimecmp[0] = (self.mtimecmp[0] & 0xFFFF_FFFF_0000_0000) | val as u64,
-            0x1B4 => self.mtimecmp[0] = (self.mtimecmp[0] & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32),
-            0x1B8 => self.mtimecmp[1] = (self.mtimecmp[1] & 0xFFFF_FFFF_0000_0000) | val as u64,
-            0x1BC => self.mtimecmp[1] = (self.mtimecmp[1] & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32),
+            // RISCV_SOFTIRQ (0x1A0, §3.1, Table 79): split SET/CLR register.
+            // Bits [1:0]  = CORE0_SET/CORE1_SET: write 1 sets the IRQ flag.
+            // Bits [9:8]  = CORE0_CLR/CORE1_CLR: write 1 clears the IRQ flag.
+            // Per datasheet: if a flag is both set and cleared on the same cycle,
+            // only the set takes effect (apply clear first, then set).
+            // Bits [9:8] are write-only control; they always read as 0.
+            0x1A0 => {
+                let set_bits = val & 0x3;
+                let clr_bits = (val >> 8) & 0x3;
+                self.riscv_softirq &= !clr_bits;
+                self.riscv_softirq |= set_bits;
+            }
+            // MTIME registers (0x1A4–0x1BC, §2.6)
+            0x1A4 => self.mtime_ctrl = val,
+            0x1B0 => self.mtime = (self.mtime & 0xFFFF_FFFF_0000_0000) | val as u64,
+            0x1B4 => self.mtime = (self.mtime & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32),
+            0x1B8 => self.mtimecmp[core] = (self.mtimecmp[core] & 0xFFFF_FFFF_0000_0000) | val as u64,
+            0x1BC => self.mtimecmp[core] = (self.mtimecmp[core] & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32),
             _ => {}
         }
     }
@@ -422,6 +441,7 @@ impl Sio {
     // Integer divider helpers moved to `core::PerCoreSio` in Phase 3
     // Stage 3 (LLD V7 §6). See `crates/mdrp2350/src/core/mod.rs`.
 
+
     // --- MTIME helpers (§2.6) ---
 
     /// Tick the MTIME counter. Called once per `Emulator::step()` after
@@ -475,10 +495,55 @@ impl Default for Sio {
 mod tests {
     use super::*;
 
-    // Integer divider and interpolator tests moved to `core::mod`'s
-    // `tests` module alongside `PerCoreSio` in Phase 3 Stage 3 (LLD V7
-    // §6). DIV / INTERP are now per-core state on `CortexM33`, not
-    // shared SIO state.
+    // ---- Integer divider tests (RP2350 RAZ/WI — §3.1.7) ----
+    //
+    // Per-core divider state lives on `PerCoreSio` (Phase 3 Stage 3 —
+    // LLD V7 §6). `CortexM33::bus_read32`/`bus_write32` intercepts the
+    // 0x060..=0x078 window, so writes/reads direct to `Sio` fall through
+    // to the catch-all `_ => 0` / `_ => {}` arms: the tests below
+    // exercise that Sio itself never stores anything at divider offsets.
+
+    /// All divider-range offsets read as 0 regardless of prior writes.
+    #[test]
+    fn div_csr_all_reserved_offsets_raz() {
+        let mut sio = Sio::new();
+        let core = 0;
+        let offsets = [0x060u32, 0x064, 0x068, 0x06C, 0x070, 0x074, 0x078];
+        // Cold read — all must be 0.
+        for &off in &offsets {
+            assert_eq!(sio.read32(off, core), 0,
+                "offset 0x{off:03X} must RAZ on cold read");
+        }
+        // Write arbitrary values, then read back — still 0 (WI).
+        for &off in &offsets {
+            sio.write32(off, 0xDEAD_BEEF, core);
+        }
+        for &off in &offsets {
+            assert_eq!(sio.read32(off, core), 0,
+                "offset 0x{off:03X} must RAZ after arbitrary write (WI)");
+        }
+    }
+
+    /// Writing operand values and reading DIV_CSR / QUOTIENT / REMAINDER all
+    /// return 0 on RP2350 — the divider does not compute anything via Sio.
+    #[test]
+    fn div_csr_post_write_is_still_zero() {
+        let mut sio = Sio::new();
+        let core = 0;
+        // Simulate what a program would do with the RP2040 divider.
+        sio.write32(0x060, 5, core);   // DIV_UDIVIDEND
+        sio.write32(0x064, 2, core);   // DIV_UDIVISOR
+        assert_eq!(sio.read32(0x078, core), 0, "DIV_CSR must be 0 on RP2350 via Sio");
+        assert_eq!(sio.read32(0x070, core), 0, "DIV_QUOTIENT must be 0 on RP2350 via Sio");
+        assert_eq!(sio.read32(0x074, core), 0, "DIV_REMAINDER must be 0 on RP2350 via Sio");
+    }
+
+    /// Cold-read DIV_CSR is 0 before any writes.
+    #[test]
+    fn div_csr_cold_read_is_zero() {
+        let mut sio = Sio::new();
+        assert_eq!(sio.read32(0x078, 0), 0, "DIV_CSR must be 0 on cold read");
+    }
 
     // ---- Doorbell tests (Stage C1) ----
 
@@ -581,25 +646,39 @@ mod tests {
         assert!(!sio.mtime_match_asserted[0]);
     }
 
+    /// MTIME_CTRL resets to 0x0F per datasheet Table 80.
+    /// Bits: EN=1, FRACT=0, DBGPAUSE_CORE0=1, DBGPAUSE_CORE1=1.
+    #[test]
+    fn mtime_ctrl_reset_value_is_0x0f() {
+        let sio = Sio::new();
+        assert_eq!(sio.mtime_ctrl, 0x0F,
+            "MTIME_CTRL must reset to 0x0F (EN + DBGPAUSE_CORE0 + DBGPAUSE_CORE1)");
+        // Verify reset() also restores 0x0F.
+        let mut sio2 = Sio::new();
+        sio2.mtime_ctrl = 0;
+        sio2.reset();
+        assert_eq!(sio2.mtime_ctrl, 0x0F, "MTIME_CTRL must be 0x0F after reset()");
+    }
+
     #[test]
     fn mtime_register_read_write() {
         let mut sio = Sio::new();
-        // Write MTIME_CTRL
-        sio.write32(0x1A0, 0x1, 0);
-        assert_eq!(sio.read32(0x1A0, 0), 0x1);
-        // Write MTIME low + high
-        sio.write32(0x1A8, 0xDEAD_BEEF, 0);
-        sio.write32(0x1AC, 0x0000_0042, 0);
+        // MTIME_CTRL is at 0x1A4 on RP2350 (0x1A0 is RISCV_SOFTIRQ)
+        sio.write32(0x1A4, 0x1, 0);
+        assert_eq!(sio.read32(0x1A4, 0), 0x1);
+        // Write MTIME low + high (0x1B0/0x1B4 on RP2350)
+        sio.write32(0x1B0, 0xDEAD_BEEF, 0);
+        sio.write32(0x1B4, 0x0000_0042, 0);
         assert_eq!(sio.mtime, 0x0000_0042_DEAD_BEEF);
-        assert_eq!(sio.read32(0x1A8, 0), 0xDEAD_BEEF);
-        assert_eq!(sio.read32(0x1AC, 0), 0x42);
-        // Write MTIMECMP0
-        sio.write32(0x1B0, 0x1111, 0);
-        sio.write32(0x1B4, 0x2222, 0);
+        assert_eq!(sio.read32(0x1B0, 0), 0xDEAD_BEEF);
+        assert_eq!(sio.read32(0x1B4, 0), 0x42);
+        // Write MTIMECMP for core 0 (core-local at 0x1B8/0x1BC)
+        sio.write32(0x1B8, 0x1111, 0);
+        sio.write32(0x1BC, 0x2222, 0);
         assert_eq!(sio.mtimecmp[0], 0x0000_2222_0000_1111);
-        // Write MTIMECMP1
-        sio.write32(0x1B8, 0x3333, 0);
-        sio.write32(0x1BC, 0x4444, 0);
+        // Write MTIMECMP for core 1 (same offsets, different core)
+        sio.write32(0x1B8, 0x3333, 1);
+        sio.write32(0x1BC, 0x4444, 1);
         assert_eq!(sio.mtimecmp[1], 0x0000_4444_0000_3333);
     }
 
@@ -610,8 +689,98 @@ mod tests {
     // per-core isolation + bus dispatch tests live in `core::tests`
     // exercising the `PerCoreSio` route.
 
-    // Silicon oracle regression tests (silicon_periph_diff_rp2350) —
-    // DIV_CSR RAZ + RISCV_SOFTIRQ semantics — land with `e051bb3`
-    // (SIO silicon fidelity) backfill; removed here to avoid a temporary
-    // 4-test regression between P5 and the backfill.
+    // Interp per-core + dispatch tests live in `core::tests` — they
+    // must go through `CortexM33::bus_read32/write32` intercept to hit
+    // PerCoreSio, not via `sio.write32(0x080, ...)` which falls through
+    // to `_ => {}` in threading's model.
+
+    // `interp_all_registers` passive round-trip removed — threading's
+    // PerCoreSio intercept + live Interp semantics mean not every offset
+    // is a round-trip storage register. Arithmetic coverage lives in
+    // `sio::interp::tests`.
+
+    // ---- Silicon oracle regression tests (silicon_periph_diff_rp2350) ----
+
+    /// `sio_divider_unsigned` oracle: DIV_CSR.READY (bit 0) must be 0 on RP2350.
+    ///
+    /// RP2350 datasheet §3.1.7 — the RP2040 memory-mapped integer divider is
+    /// not present; address range 0x060–0x078 is reserved. Silicon reads 0x00
+    /// for DIV_CSR, so READY (bit 0) must be 0 in the emulator too.
+    #[test]
+    fn div_csr_ready_is_zero_on_rp2350() {
+        let mut sio = Sio::new();
+        let core = 0;
+        // Trigger an unsigned divide — same writes as the silicon scenario.
+        sio.write32(0x060, 100, core); // DIV_UDIVIDEND
+        sio.write32(0x064, 7, core);   // DIV_UDIVISOR
+        // READY (bit 0) must be 0; DIRTY (bit 1) may be set.
+        assert_eq!(sio.read32(0x078, core) & 0x1, 0x0,
+            "DIV_CSR.READY must be 0 on RP2350 (reserved register)");
+    }
+
+    /// `sio_divider_signed` oracle: same as unsigned — READY=0.
+    #[test]
+    fn div_csr_ready_is_zero_after_signed_divide() {
+        let mut sio = Sio::new();
+        let core = 0;
+        sio.write32(0x068, 0xFFFF_FF9C, core); // DIV_SDIVIDEND (-100)
+        sio.write32(0x06C, 7, core);            // DIV_SDIVISOR
+        assert_eq!(sio.read32(0x078, core) & 0x1, 0x0,
+            "DIV_CSR.READY must be 0 on RP2350 (reserved register)");
+    }
+
+    /// `sio_mtime_count_and_match` oracle: RISCV_SOFTIRQ at 0x1A0 is
+    /// write-to-set; writing 1 sets bit 0 (CORE0_SET) permanently until
+    /// cleared via CORE0_CLR (bit 1). Writing 0 is a no-op (no bits set).
+    #[test]
+    fn riscv_softirq_write_to_set_semantics() {
+        let mut sio = Sio::new();
+        // Initial state: both flags clear.
+        assert_eq!(sio.read32(0x1A0, 0), 0x0);
+        // Write 1 — sets CORE0_SET (bit 0).
+        sio.write32(0x1A0, 1, 0);
+        assert_eq!(sio.read32(0x1A0, 0), 0x1,
+            "RISCV_SOFTIRQ: writing 1 must set CORE0_SET bit");
+        // Write 0 — no-op; bit 0 stays set.
+        sio.write32(0x1A0, 0, 0);
+        assert_eq!(sio.read32(0x1A0, 0), 0x1,
+            "RISCV_SOFTIRQ: writing 0 must not clear any flag");
+    }
+
+    /// RISCV_SOFTIRQ write 1 then write 0: bit 0 remains 1.
+    /// This matches what silicon observes in the `sio_mtime_count_and_match`
+    /// sled (STR r1=1 → STR r1=0 → BKPT → read back 0x1).
+    #[test]
+    fn riscv_softirq_set_then_zero_stays_set() {
+        let mut sio = Sio::new();
+        sio.write32(0x1A0, 1, 0);
+        sio.write32(0x1A0, 0, 0);
+        assert_eq!(sio.read32(0x1A0, 0) & 0x1, 0x1,
+            "RISCV_SOFTIRQ.CORE0_SET must stay 1 after writing 0 (only CORE0_CLR=bit1 clears it)");
+    }
+
+    /// RISCV_SOFTIRQ: write 0x100 (CORE0_CLR bit [8]) clears CORE0_SET (bit [0]).
+    /// Per RP2350 datasheet Table 79 §3.1: bits [9:8] are write-1-to-clear control.
+    #[test]
+    fn riscv_softirq_write_to_clear_via_bit_8_clears_core0() {
+        let mut sio = Sio::new();
+        // Step 1: set CORE0 via bit [0].
+        sio.write32(0x1A0, 0x01, 0);
+        assert_eq!(sio.read32(0x1A0, 0), 0x01, "CORE0_SET should be 1 after write 0x01");
+        // Step 2: clear CORE0 via bit [8] (CORE0_CLR).
+        sio.write32(0x1A0, 0x100, 0);
+        assert_eq!(sio.read32(0x1A0, 0), 0x00, "CORE0_SET should be 0 after CORE0_CLR write 0x100");
+    }
+
+    /// RISCV_SOFTIRQ simultaneous SET and CLR: set wins per datasheet.
+    /// Writing 0x101 (bit [0] = CORE0_SET, bit [8] = CORE0_CLR) must leave
+    /// CORE0_SET = 1 (set takes priority over clear on the same cycle).
+    #[test]
+    fn riscv_softirq_simultaneous_set_and_clear_set_wins() {
+        let mut sio = Sio::new();
+        // Write with both CORE0_SET (bit 0) and CORE0_CLR (bit 8) asserted.
+        sio.write32(0x1A0, 0x101, 0);
+        assert_eq!(sio.read32(0x1A0, 0), 0x01,
+            "RISCV_SOFTIRQ: simultaneous SET+CLR must leave the flag set (set wins)");
+    }
 }
