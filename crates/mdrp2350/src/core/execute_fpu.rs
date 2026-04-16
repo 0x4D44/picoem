@@ -544,11 +544,10 @@ impl CortexM33 {
         // let step() deliver the fault. After a successful flush (or if
         // no flush was needed), set CONTROL.FPCA=1 — this is the only
         // site that turns FPCA on.
-        let core_idx = bus.active_core();
-        if bus.ppb[core_idx].fpccr & crate::bus::ppb::FPCCR_LSPACT != 0 {
+        if self.ppb.fpccr & crate::bus::ppb::FPCCR_LSPACT != 0 {
             match self.flush_lazy_fp_context(bus) {
                 Ok(()) => {
-                    bus.ppb[bus.active_core()].fpccr &= !crate::bus::ppb::FPCCR_LSPACT;
+                    self.ppb.fpccr &= !crate::bus::ppb::FPCCR_LSPACT;
                 }
                 Err(()) => {
                     return 0;
@@ -1113,11 +1112,11 @@ impl CortexM33 {
 
             if l != 0 {
                 // VLDR.32
-                self.regs.s[sd] = f32::from_bits(bus.read32(addr, self.core_id));
+                self.regs.s[sd] = f32::from_bits(self.bus_read32(addr, bus));
                 2
             } else {
                 // VSTR.32
-                bus.write32(addr, self.regs.s[sd].to_bits(), self.core_id);
+                self.bus_write32(addr, self.regs.s[sd].to_bits(), bus);
                 1
             }
         } else {
@@ -1145,9 +1144,9 @@ impl CortexM33 {
                 if reg >= 32 { break; }
 
                 if l != 0 {
-                    self.regs.s[reg] = f32::from_bits(bus.read32(addr, self.core_id));
+                    self.regs.s[reg] = f32::from_bits(self.bus_read32(addr, bus));
                 } else {
-                    bus.write32(addr, self.regs.s[reg].to_bits(), self.core_id);
+                    self.bus_write32(addr, self.regs.s[reg].to_bits(), bus);
                 }
                 addr = addr.wrapping_add(4);
             }
@@ -1199,26 +1198,25 @@ impl CortexM33 {
         &mut self,
         bus: &mut Bus,
     ) -> Result<(), ()> {
-        let core = bus.active_core();
-        let base = bus.ppb[core].fpcar;
+        let base = self.ppb.fpcar;
 
         // S0..S15 → +0..+60.
         for i in 0..16 {
-            bus.write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits(), self.core_id);
+            self.bus_write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits(), bus);
             if bus.bus_fault() {
-                bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
+                self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
                 return Err(());
             }
         }
         // FPSCR → +64; reserved → +68 (write zero per architecture).
-        bus.write32(base.wrapping_add(64), self.regs.fpscr, self.core_id);
+        self.bus_write32(base.wrapping_add(64), self.regs.fpscr, bus);
         if bus.bus_fault() {
-            bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
+            self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());
         }
-        bus.write32(base.wrapping_add(68), 0, self.core_id);
+        self.bus_write32(base.wrapping_add(68), 0, bus);
         if bus.bus_fault() {
-            bus.ppb[bus.active_core()].fpccr |= crate::bus::ppb::FPCCR_BFRDY;
+            self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());
         }
         Ok(())

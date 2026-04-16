@@ -7,6 +7,7 @@ pub(crate) mod exceptions;
 pub(crate) mod coprocessor;
 
 use crate::bus::Bus;
+use crate::bus::ppb::Ppb;
 pub use registers::Registers;
 
 /// Synchronous faults raised during instruction execution.
@@ -63,6 +64,17 @@ pub struct CortexM33 {
     halted: bool,
     /// Core is sleeping on WFE — will resume when event_flag is set.
     pub(crate) wfe_waiting: bool,
+    /// Per-core Private Peripheral Bus (NVIC, SCB, SysTick, FPCCR, MPU,
+    /// SAU, DWT — all per-core M33 architectural state). Moved from
+    /// `Bus.ppb: [Ppb; 2]` in Phase 0b.1 Commit B. See
+    /// `wrk_docs/2026.04.16 - LLD - Threaded Dual-Core Phase 0 V4.md`.
+    ///
+    /// Public so integration tests and harness binaries (phase-7 lazy FP
+    /// suite, softfloat_diff, isr_scenarios, probe/silicon oracles) can
+    /// poke FPCCR/FPCAR/VTOR/CPACR/NVIC state without hand-rolling MMIO
+    /// writes. The crate's public surface accepts this — the pre-Commit-B
+    /// equivalent `Bus::ppb` was also public.
+    pub ppb: Ppb,
 }
 
 impl CortexM33 {
@@ -83,6 +95,7 @@ impl CortexM33 {
             secure: true,
             halted: false,
             wfe_waiting: false,
+            ppb: Ppb::default(),
         }
     }
 
@@ -95,6 +108,20 @@ impl CortexM33 {
         }
         if self.halted {
             return;
+        }
+
+        // Phase 0b.1 Commit B: merge peripheral-asserted IRQs into this
+        // core's NVIC_ISPR before the dispatch check. `assert_irq_core/shared`
+        // sets the dirty flag when it updates `bus.irq_pending`; we union
+        // those bits into `self.ppb.nvic_ispr` so the inline dispatch path
+        // walks a fresh latch. Cost: one bool load per instruction.
+        // Note: `bus.irq_pending_dirty[core]` is indexed per-core (not
+        // global), so under future threaded execution each core only
+        // reads/clears its own slot — no cross-core race on this flag.
+        let core = self.core_id as usize;
+        if bus.irq_pending_dirty[core] {
+            self.ppb.merge_irq_pending(bus.irq_pending[core]);
+            bus.irq_pending_dirty[core] = false;
         }
 
         // ARMv8-M §B1.5.8 + §B3.7: take the highest-priority pending
@@ -116,15 +143,14 @@ impl CortexM33 {
         let mut fault_handled = false;
         if bus.bus_fault() {
             fault_handled = true;
-            let core = bus.active_core();
-            let busfault_ena = bus.ppb[core].shcsr & (1 << 17) != 0;
-            bus.ppb[core].cfsr |= (1 << 9) | (1 << 15); // PRECISERR + BFARVALID
-            bus.ppb[core].bfar = bus.bus_fault_addr();
+            let busfault_ena = self.ppb.shcsr & (1 << 17) != 0;
+            self.ppb.cfsr |= (1 << 9) | (1 << 15); // PRECISERR + BFARVALID
+            self.ppb.bfar = bus.bus_fault_addr();
             bus.clear_bus_fault();
             if busfault_ena {
                 cycles = self.enter_exception(5, bus);
             } else {
-                bus.ppb[bus.active_core()].hfsr |= 1 << 30;
+                self.ppb.hfsr |= 1 << 30;
                 cycles = self.enter_exception(3, bus);
             }
         }
@@ -209,13 +235,135 @@ impl CortexM33 {
     /// Execute WFE hint. If event_flag is pending, consume it and continue.
     /// Otherwise, enter WFE sleep.
     pub(crate) fn wfe(&mut self, bus: &mut Bus) -> u32 {
-        let core = bus.active_core();
+        let core = self.core_id as usize;
         if bus.event_flag[core] {
             bus.event_flag[core] = false;
             1 // event was pending, consume it, no sleep
         } else {
             self.wfe_waiting = true;
             1
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // PPB-intercept bus wrappers (Phase 0b.1 Commit B).
+    //
+    // Data-side bus accesses route through these: PPB addresses
+    // (`0xE000_0000..=0xEFFF_FFFF`) resolve against `self.ppb` directly;
+    // everything else (including the boot-RAM carve-out at
+    // `0xEFFF_F000..0xF000_0000`) falls through to `Bus::readN/writeN`.
+    //
+    // Instruction-fetch path in `decode.rs` bypasses these — opcodes are
+    // never fetched from PPB, so the extra branch is pure overhead there.
+    // -------------------------------------------------------------------
+
+    pub(crate) fn bus_read32(&mut self, addr: u32, bus: &mut Bus) -> u32 {
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            let val = self.ppb.read32(addr);
+            if bus.trace_enabled {
+                bus.emit_trace('R', 4, addr, val, self.core_id);
+            }
+            val
+        } else {
+            bus.read32(addr, self.core_id)
+        }
+    }
+
+    pub(crate) fn bus_write32(&mut self, addr: u32, val: u32, bus: &mut Bus) {
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            self.ppb.write32(addr, val);
+            self.sync_nvic_to_irq_pending(addr, bus);
+            if bus.trace_enabled {
+                bus.emit_trace('W', 4, addr, val, self.core_id);
+            }
+        } else {
+            bus.write32(addr, val, self.core_id);
+        }
+    }
+
+    pub(crate) fn bus_read16(&mut self, addr: u32, bus: &mut Bus) -> u16 {
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            // ARMv8-M: halfword PPB accesses are UNPREDICTABLE (word-only
+            // registers). We defensively compose the result from the
+            // containing 32-bit register rather than faulting, so rogue
+            // firmware sees plausible data. Contrast bus_read8, which
+            // returns 0 — byte access is more unusual and worth flagging
+            // via a telltale zero.
+            let word = self.ppb.read32(addr & !3);
+            let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
+            if bus.trace_enabled {
+                bus.emit_trace('R', 2, addr, val as u32, self.core_id);
+            }
+            val
+        } else {
+            bus.read16(addr, self.core_id)
+        }
+    }
+
+    pub(crate) fn bus_write16(&mut self, addr: u32, val: u16, bus: &mut Bus) {
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            // ARMv8-M: halfword PPB accesses are UNPREDICTABLE. We
+            // defensively RMW the matching half of the containing 32-bit
+            // register rather than faulting. Contrast bus_write8, which
+            // drops the write — byte writes to PPB are more unusual.
+            let old = self.ppb.read32(addr & !3);
+            let new_val = if addr & 2 != 0 {
+                (old & 0x0000_FFFF) | ((val as u32) << 16)
+            } else {
+                (old & 0xFFFF_0000) | val as u32
+            };
+            self.ppb.write32(addr & !3, new_val);
+            self.sync_nvic_to_irq_pending(addr & !3, bus);
+            if bus.trace_enabled {
+                bus.emit_trace('W', 2, addr, val as u32, self.core_id);
+            }
+        } else {
+            bus.write16(addr, val, self.core_id);
+        }
+    }
+
+    pub(crate) fn bus_read8(&mut self, addr: u32, bus: &mut Bus) -> u8 {
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            // PPB registers are word-access-only; byte reads return 0.
+            if bus.trace_enabled {
+                bus.emit_trace('R', 1, addr, 0, self.core_id);
+            }
+            0
+        } else {
+            bus.read8(addr, self.core_id)
+        }
+    }
+
+    pub(crate) fn bus_write8(&mut self, addr: u32, val: u8, bus: &mut Bus) {
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            // PPB registers are word-access-only; byte writes drop.
+            if bus.trace_enabled {
+                bus.emit_trace('W', 1, addr, val as u32, self.core_id);
+            }
+        } else {
+            bus.write8(addr, val, self.core_id);
+        }
+    }
+
+    /// After a PPB write that may have touched NVIC_ISPR / NVIC_ICPR,
+    /// reconstruct `bus.irq_pending[core]` from the post-write ISPR.
+    /// Phase 0b.1 Commit B: replaces the mirror the old Bus-side PPB
+    /// dispatch arm did inline (see `Bus::write32` 0xE branch before the
+    /// PPB move).
+    ///
+    /// Firmware self-pends via ISPR and software-clears via ICPR — either
+    /// way the architectural latch lives in `nvic_ispr`. `irq_pending`
+    /// gates the step-path NVIC walk for cheap short-circuiting, so it
+    /// must stay in sync with `nvic_ispr` after each write.
+    fn sync_nvic_to_irq_pending(&self, addr: u32, bus: &mut Bus) {
+        let low = addr & 0xFFFF;
+        if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
+            let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
+            let ispr = self.ppb.nvic_ispr[word];
+            let mask64 = (ispr as u64) << (word * 32);
+            let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
+            let core = self.core_id as usize;
+            bus.irq_pending[core] = (bus.irq_pending[core] & keep) | mask64;
         }
     }
 
@@ -348,6 +496,16 @@ impl CortexM33 {
     #[doc(hidden)]
     pub fn has_pending_fault(&self) -> bool {
         self.pending_fault.is_some()
+    }
+
+    /// Enable a coprocessor in CPACR (full access = 0b11 for the slot).
+    /// Convenience for unit tests and harnesses that need to flip
+    /// coprocessor gates without threading MMIO writes through the bus.
+    ///
+    /// `coproc` is 0..=15; the bit positions are `[2*coproc+1:2*coproc]`.
+    #[doc(hidden)]
+    pub fn enable_coprocessor(&mut self, coproc: u8) {
+        self.ppb.cpacr |= 0x3 << (coproc as u32 * 2);
     }
 
     /// Direct exception entry — wraps the crate-internal `enter_exception`

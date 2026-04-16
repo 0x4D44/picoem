@@ -382,7 +382,8 @@ fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
 /// Run one instruction on core 0 and return the cycles it reported.
 fn measure_emu_one(instr: u32, fetch_addr: u32, data_addr: u32) -> u32 {
     let mut emu = fresh_emulator(instr, fetch_addr, data_addr);
-    emu.bus.set_active_core(0);
+    // Phase 0b.1 Commit B: no `set_active_core` needed — CortexM33::step
+    // takes a `&mut Bus` and self-supplies its core id for bus routing.
     let before = emu.cores[0].cycles();
     // Step exactly one instruction on core 0. We bypass `Emulator::step`
     // (which advances both cores and peripherals) because halt-step cares

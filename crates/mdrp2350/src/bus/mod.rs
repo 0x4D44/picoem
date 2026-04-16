@@ -228,14 +228,6 @@ pub struct Bus {
     /// Keyed by canonical address (alias bits stripped).
     /// TODO: Replace with direct Peripheral trait dispatch when real peripherals are added.
     peripheral_regs: HashMap<u32, u32>,
-    /// Which core is currently executing. Set explicitly by
-    /// `Emulator::step` before each core's quantum so that
-    /// `bus.ppb[active_core]` routing lands on the right per-core PPB
-    /// (NVIC, SCB, SysTick, FPCCR, MPU, fault state). 35+ sites across
-    /// the core crate depend on this being accurate.
-    active_core: usize,
-    /// Per-core PPB register files (NVIC, SCB, SysTick stubs).
-    pub ppb: [ppb::Ppb; 2],
     /// Per-core external-IRQ pending mask. Bit N set means IRQ N is
     /// latched on that core's NVIC; the M33 step loop short-circuits on
     /// `irq_pending[core] == 0` to skip the NVIC walk on the common no-
@@ -251,6 +243,13 @@ pub struct Bus {
     /// Phase 0a lands the field + helper. Phase 1 wires the drain into
     /// the per-core NVIC banks on Ppb (ISPR writes).
     pub(crate) irq_pending: [u64; 2],
+    /// Per-core "needs merge" flag. Set by `assert_irq_core/shared` when
+    /// a peripheral raises a new IRQ. Consumed by `CortexM33::step` (and
+    /// the quantum-boundary merge in `Emulator::step`) which unions
+    /// `irq_pending[core]` into `self.ppb.nvic_ispr`. Keeps the
+    /// zero-latency IRQ visibility the pre-Commit-B code had when
+    /// `Bus::assert_irq_*` wrote both bitmaps inline.
+    pub(crate) irq_pending_dirty: [bool; 2],
     /// RESETS peripheral state: bits set = peripheral in reset.
     /// Default [`RESETS_POST_BOOTROM`] — peripherals released by
     /// pico-sdk `runtime_init_bootrom_reset` per HLD V5 §5.7.
@@ -394,13 +393,13 @@ pub struct Bus {
     /// when `None`). Zero overhead when `false` — the hot path
     /// short-circuits before any formatting. Mirrors the mdrp2040 V7 idiom.
     pub trace_enabled: bool,
-    /// Per-core, per-instruction PC snapshot. Indexed by `active_core`
-    /// so that a core switch does not alias one core's decode PC onto
-    /// the other. Set by the core's decode path
-    /// (`CortexM33::decode_execute`) immediately before instruction
-    /// fetch, so every read/write during that instruction carries the
-    /// correct architectural PC. Also set to sentinel values
-    /// (`0xFFFF_FFFE` / `0xFFFF_FFFD`) by `enter_exception` /
+    /// Per-core, per-instruction PC snapshot. Indexed by the core id
+    /// passed to `set_active_pc(pc, core)` so a core switch does not
+    /// alias one core's decode PC onto the other. Set by the core's
+    /// decode path (`CortexM33::decode_execute`) immediately before
+    /// instruction fetch, so every read/write during that instruction
+    /// carries the correct architectural PC. Also set to sentinel
+    /// values (`0xFFFF_FFFE` / `0xFFFF_FFFD`) by `enter_exception` /
     /// `exit_exception` so stacking / unstacking lines are
     /// distinguishable from ordinary instruction-driven access.
     /// Default `[0, 0]`; only meaningful while a core is executing.
@@ -441,9 +440,8 @@ impl Bus {
             io_bank0: IoBank0Regs::new(),
             pads_bank0: PadsBank0Regs::new(),
             dma: Dma::new(),
-            active_core: 0,
-            ppb: [ppb::Ppb::default(), ppb::Ppb::default()],
             irq_pending: [0; 2],
+            irq_pending_dirty: [false; 2],
             bus_fault: false,
             bus_fault_addr: 0,
             flash_loaded: false,
@@ -709,21 +707,8 @@ impl Bus {
         }
     }
 
-    /// Select which core is currently executing. Must be called by the
-    /// scheduler before a core runs so that every `bus.ppb[bus.active_core()]`
-    /// access (NVIC, SCB, SysTick, FPCCR, MPU, fault state) lands on the
-    /// right per-core register file.
-    pub fn set_active_core(&mut self, id: usize) {
-        self.active_core = id;
-    }
-
-    /// Returns the currently executing core index (0 or 1).
-    pub fn active_core(&self) -> usize {
-        self.active_core
-    }
-
     /// Stash the instruction PC of the currently-executing instruction
-    /// for the *currently-active core*. Called by
+    /// on the specified core. Called by
     /// [`crate::core::CortexM33::decode_execute`] before instruction
     /// fetch so the MMIO trace can report a meaningful PC for every
     /// access that instruction performs. Also called by exception
@@ -732,8 +717,6 @@ impl Bus {
     /// from ordinary instruction-driven access. See HLD V5 §4.2.7.
     #[inline]
     pub fn set_active_pc(&mut self, pc: u32, core: u8) {
-        debug_assert_eq!(self.active_core, core as usize,
-            "core parameter must match active_core during interim migration");
         self.active_pc[core as usize] = pc;
     }
 
@@ -767,7 +750,7 @@ impl Bus {
     /// "V2 reverted to runtime flag" decision in V4's review history.
     #[cold]
     #[inline(never)]
-    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
+    pub(crate) fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
         let line = format!(
             "TRACE {} {} 0x{:08X} val=0x{:08X} core={} pc=0x{:08X}",
             rw, size, addr, val, core as usize, self.active_pc[core as usize]
@@ -817,7 +800,10 @@ impl Bus {
         );
         if core < 2 && irq < crate::irq::IRQ_COUNT {
             self.irq_pending[core] |= 1u64 << irq;
-            self.ppb[core].set_irq_pending(irq);
+            // Phase 0b.1 Commit B: the per-core PPB (`nvic_ispr`) now
+            // lives on `CortexM33`. Signal the step path to merge the
+            // new pending bit into its NVIC_ISPR on the next dispatch.
+            self.irq_pending_dirty[core] = true;
         }
     }
 
@@ -841,7 +827,9 @@ impl Bus {
         if irq < crate::irq::IRQ_COUNT {
             for core in 0..2 {
                 self.irq_pending[core] |= 1u64 << irq;
-                self.ppb[core].set_irq_pending(irq);
+                // Phase 0b.1 Commit B: signal the step path to union
+                // the new pending bit into each core's NVIC_ISPR.
+                self.irq_pending_dirty[core] = true;
             }
         }
     }
@@ -850,21 +838,25 @@ impl Bus {
     /// [`Self::assert_irq_core`]. Peripherals call this when a level-
     /// triggered source de-asserts; they own the latch lifecycle.
     /// Out-of-range arguments are silent no-ops.
+    ///
+    /// Phase 0b.1 Commit B: no dirty-flag is set on clear. The forward
+    /// merge is a union (`|=`), and a stale `nvic_ispr` bit does not
+    /// re-fire on its own — only the dispatch path and explicit ICPR
+    /// writes clear `nvic_ispr`. See the "dual-clear invariant" docs at
+    /// `core/exceptions.rs::try_take_any_pending_exception`.
     pub fn clear_irq_core(&mut self, core: usize, irq: u32) {
         if core < 2 && irq < crate::irq::IRQ_COUNT {
             self.irq_pending[core] &= !(1u64 << irq);
-            self.ppb[core].clear_irq_pending(irq);
         }
     }
 
     /// Clear a shared IRQ's pending bit on both cores. Mirror of
     /// [`Self::assert_irq_shared`]. Out-of-range arguments are silent
-    /// no-ops.
+    /// no-ops. No dirty-flag (see [`Self::clear_irq_core`]).
     pub fn clear_irq_shared(&mut self, irq: u32) {
         if irq < crate::irq::IRQ_COUNT {
             for core in 0..2 {
                 self.irq_pending[core] &= !(1u64 << irq);
-                self.ppb[core].clear_irq_pending(irq);
             }
         }
     }
@@ -1160,8 +1152,6 @@ impl Bus {
     // --- 8-bit access ---
 
     pub fn read8(&mut self, addr: u32, core: u8) -> u8 {
-        debug_assert_eq!(self.active_core, core as usize,
-            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -1292,8 +1282,6 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8, core: u8) {
-        debug_assert_eq!(self.active_core, core as usize,
-            "core parameter must match active_core during interim migration");
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -1579,8 +1567,12 @@ impl Bus {
     // --- 16-bit access ---
 
     pub fn read16(&mut self, addr: u32, core: u8) -> u16 {
-        debug_assert_eq!(self.active_core, core as usize,
-            "core parameter must match active_core during interim migration");
+        // Phase 0b.1 Commit B: PPB addresses route through
+        // `CortexM33::bus_read16`. Bus-level read16 is still reachable
+        // from decode.rs (opcode fetch) and non-PPB tests.
+        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+            "PPB address 0x{:08X} reached Bus::read16 — use CortexM33::bus_read16 wrapper",
+            addr);
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -1697,12 +1689,6 @@ impl Bus {
                 [word as u16, (word >> 16) as u16][half_idx]
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read16(addr),
-            0xE => {
-                // PPB: extract halfword from 32-bit register read
-                let word = self.ppb[core as usize].read32(addr & !3);
-                let half_idx = ((addr >> 1) & 1) as usize;
-                [word as u16, (word >> 16) as u16][half_idx]
-            }
             _ => {
                 self.bus_fault = true;
                 self.bus_fault_addr = addr;
@@ -1716,8 +1702,11 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16, core: u8) {
-        debug_assert_eq!(self.active_core, core as usize,
-            "core parameter must match active_core during interim migration");
+        // Phase 0b.1 Commit B: PPB addresses route through
+        // `CortexM33::bus_write16`.
+        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+            "PPB address 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
+            addr);
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -1965,8 +1954,12 @@ impl Bus {
     // --- 32-bit access ---
 
     pub fn read32(&mut self, addr: u32, core: u8) -> u32 {
-        debug_assert_eq!(self.active_core, core as usize,
-            "core parameter must match active_core during interim migration");
+        // Phase 0b.1 Commit B: PPB addresses are routed through
+        // `CortexM33::bus_read32` before reaching here. Anything at
+        // `0xE0..0xEF` that is not boot RAM is a caller bug.
+        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+            "PPB address 0x{:08X} reached Bus::read32 — use CortexM33::bus_read32 wrapper",
+            addr);
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -2051,7 +2044,6 @@ impl Bus {
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
-            0xE => self.ppb[core as usize].read32(addr),
             _ => {
                 self.bus_fault = true;
                 self.bus_fault_addr = addr;
@@ -2065,8 +2057,11 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32, core: u8) {
-        debug_assert_eq!(self.active_core, core as usize,
-            "core parameter must match active_core during interim migration");
+        // Phase 0b.1 Commit B: PPB addresses are routed through
+        // `CortexM33::bus_write32` before reaching here.
+        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+            "PPB address 0x{:08X} reached Bus::write32 — use CortexM33::bus_write32 wrapper",
+            addr);
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -2190,31 +2185,6 @@ impl Bus {
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),
-            0xE => {
-                let core_idx = core as usize;
-                self.ppb[core_idx].write32(addr, val);
-                // Mirror NVIC pending writes back into the step-path
-                // short-circuit mask (`irq_pending`). MMIO writes to
-                // NVIC_ISPR land only in `ppb.nvic_ispr`; the dispatch
-                // hot-path in `CortexM33::step` gates the NVIC walk on
-                // `irq_pending != 0`, so without this mirror, firmware-
-                // side self-pends (including bits 46..51 per datasheet
-                // §3.2 note) skip dispatch. Reconstruct `irq_pending`
-                // from the post-write ISPR for the affected word so the
-                // mask stays in sync regardless of whether the store
-                // set, cleared, or left bits unchanged (ICPR clears
-                // drop bits; ISPR writes only ever add them — either
-                // way, `irq_pending` for that word equals the current
-                // ISPR word after the write).
-                let low = addr & 0xFFFF;
-                if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
-                    let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-                    let ispr = self.ppb[core_idx].nvic_ispr[word];
-                    let mask64 = (ispr as u64) << (word * 32);
-                    let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
-                    self.irq_pending[core_idx] = (self.irq_pending[core_idx] & keep) | mask64;
-                }
-            }
             // Unmapped regions raise a precise bus fault so flush-style
             // writers (Phase 7 Stage B lazy FP) and other speculative
             // stores see the failure. Mirrors the read32 unmapped path.

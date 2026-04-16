@@ -5481,12 +5481,10 @@ fn dual_core_extra_wait_states_no_pollution() {
 
     // Core 0 executes one NOP — decode_execute must reset the accumulator
     // before the fetch, so the observed value reflects only this fetch.
-    bus.set_active_core(0);
     core0.step(&mut bus);
     let c0_waits = bus.extra_wait_states();
 
     // Core 1 executes one NOP — again, decode_execute must reset cleanly.
-    bus.set_active_core(1);
     core1.step(&mut bus);
     let c1_waits = bus.extra_wait_states();
 
@@ -5651,7 +5649,7 @@ fn test_busfault_on_unmapped_access() {
     // Pre-set: R1 = 0x60000000 (unmapped address)
     emu.cores[0].regs.r[1] = 0x6000_0000;
     // Enable BusFault handler in SHCSR (bit 17)
-    emu.bus.ppb[0].shcsr |= 1 << 17;
+    emu.cores[0].ppb.shcsr |= 1 << 17;
 
     // Run
     for _ in 0..50 {
@@ -5659,7 +5657,7 @@ fn test_busfault_on_unmapped_access() {
     }
 
     // CFSR should have PRECISERR (bit 9) set
-    assert_ne!(emu.bus.ppb[0].cfsr & (1 << 9), 0, "PRECISERR should be set");
+    assert_ne!(emu.cores[0].ppb.cfsr & (1 << 9), 0, "PRECISERR should be set");
 }
 
 /// BKPT must halt the core. The silicon oracles (`silicon_isr_diff_*`,
@@ -5717,7 +5715,14 @@ fn async_dispatch_rom(looping_handlers: bool) -> Vec<u8> {
 /// return in one call, which defeats "after one step, IPSR == 14"
 /// assertions.
 fn core0_step(emu: &mut Emulator) {
-    emu.bus.set_active_core(0);
+    // Phase 0b.1 Commit B: IRQ-merge happens inside `CortexM33::step`, not
+    // at the `Bus::set_active_core` indirection that no longer exists.
+    // Replicate the quantum-boundary merge that `Emulator::step` does so
+    // inline-tick-triggered IRQs show up on this manual step.
+    if emu.bus.irq_pending_dirty[0] {
+        emu.cores[0].ppb.merge_irq_pending(emu.bus.irq_pending[0]);
+        emu.bus.irq_pending_dirty[0] = false;
+    }
     emu.cores[0].step(&mut emu.bus);
 }
 
@@ -5735,7 +5740,7 @@ fn test_async_dispatch_pendsv_enters_handler() {
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0, "must be in thread mode before pend");
 
-    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
     assert_eq!(emu.cores[0].regs.ipsr(), 14, "should be in PendSV handler");
@@ -5749,10 +5754,10 @@ fn test_async_dispatch_clears_pending_bit_on_entry() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.bus.ppb[0].icsr & ICSR_PENDSVSET_BIT, 0,
+    assert_eq!(emu.cores[0].ppb.icsr & ICSR_PENDSVSET_BIT, 0,
         "SET bit must clear on exception activation (ARMv8-M §B3.2.4)");
 }
 
@@ -5764,11 +5769,11 @@ fn test_async_dispatch_primask_masks_pendsv() {
     for _ in 0..5 { core0_step(&mut emu); }
 
     emu.cores[0].regs.primask = 1;
-    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
 
     for _ in 0..10 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0, "PRIMASK must block PendSV");
-    assert_ne!(emu.bus.ppb[0].icsr & ICSR_PENDSVSET_BIT, 0, "pending bit must remain set");
+    assert_ne!(emu.cores[0].ppb.icsr & ICSR_PENDSVSET_BIT, 0, "pending bit must remain set");
 }
 
 #[test]
@@ -5778,8 +5783,8 @@ fn test_async_dispatch_pendsvclr_prevents_dispatch() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    emu.bus.ppb[0].write32(ICSR_ADDR, ICSR_PENDSVSET_BIT);
-    emu.bus.ppb[0].write32(ICSR_ADDR, ICSR_PENDSVCLR_BIT);
+    emu.cores[0].ppb.write32(ICSR_ADDR, ICSR_PENDSVSET_BIT);
+    emu.cores[0].ppb.write32(ICSR_ADDR, ICSR_PENDSVCLR_BIT);
 
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0, "cleared pend bit must not dispatch");
@@ -5793,7 +5798,7 @@ fn test_async_dispatch_pendsv_round_trip() {
     for _ in 0..5 { core0_step(&mut emu); }
 
     let main_pc_before = emu.cores[0].regs.pc();
-    emu.bus.ppb[0].icsr |= ICSR_PENDSVSET_BIT;
+    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
 
     // Step enough for entry + BX LR + exit: 3 instructions worth.
     for _ in 0..5 { core0_step(&mut emu); }
@@ -5809,7 +5814,7 @@ fn test_async_dispatch_systick_enters_handler() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    emu.bus.ppb[0].icsr |= ICSR_PENDSTSET_BIT;
+    emu.cores[0].ppb.icsr |= ICSR_PENDSTSET_BIT;
     core0_step(&mut emu);
 
     assert_eq!(emu.cores[0].regs.ipsr(), 15, "should be in SysTick handler");
@@ -5874,9 +5879,9 @@ fn test_external_irq_pend_plus_enable_enters_handler() {
     // Pending + enabled IRQ 0 (TIMER0_IRQ_0) should dispatch; PC lands
     // at the TIMER0_IRQ_0 vector slot.
     let mut emu = load_external_irq_emu();
-    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0); // NVIC_ISER enable IRQ 0
+    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0); // NVIC_ISER enable IRQ 0
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
 
     core0_step(&mut emu);
 
@@ -5891,7 +5896,7 @@ fn test_external_irq_pending_without_enable_does_not_dispatch() {
     // irq_pending bit is set but NVIC_ISER bit is clear → no dispatch.
     let mut emu = load_external_irq_emu();
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
 
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0,
@@ -5904,9 +5909,9 @@ fn test_external_irq_priority_mask_blocks_dispatch() {
     // IRQs at priority 0.
     let mut emu = load_external_irq_emu();
     emu.cores[0].regs.primask = 1;
-    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0);
+    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
 
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0,
@@ -5919,10 +5924,10 @@ fn test_external_irq_basepri_masks_dispatch() {
     // larger (lower priority) than BASEPRI → IRQ is masked.
     let mut emu = load_external_irq_emu();
     emu.cores[0].regs.basepri = 0x20;
-    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0);
-    emu.bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
+    emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
 
     for _ in 0..5 { core0_step(&mut emu); }
     assert_eq!(emu.cores[0].regs.ipsr(), 0,
@@ -5934,10 +5939,10 @@ fn test_external_irq_basepri_zero_is_transparent() {
     // BASEPRI=0 (the default) must not mask any IRQ.
     let mut emu = load_external_irq_emu();
     emu.cores[0].regs.basepri = 0;
-    emu.bus.ppb[0].write32(0xE000_E100, 1u32 << 0);
-    emu.bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
+    emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.irq_pending[0] |= 1u64 << 0;
-    emu.bus.ppb[0].nvic_ispr[0] |= 1u32 << 0;
+    emu.cores[0].ppb.nvic_ispr[0] |= 1u32 << 0;
 
     core0_step(&mut emu);
     assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
@@ -5950,6 +5955,11 @@ fn test_assert_irq_core_targets_receiver() {
     // and NOT core 0's — the `core` argument names the receiver.
     // SIO FIFO is a core-local line (CORE_LOCAL_IRQS) so this is the
     // correct helper; assert_irq_shared would put it on both cores.
+    //
+    // Phase 0b.1 Commit B: `assert_irq_core` now sets `irq_pending` +
+    // the per-core `irq_pending_dirty` flag; the NVIC_ISPR merge happens
+    // at the next scheduler tick or on the step-path dirty check. We
+    // drive the merge manually here and then assert both observables.
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_SIO_IRQ_FIFO; // 25, core-local
     emu.bus.assert_irq_core(1, irq);
@@ -5957,10 +5967,16 @@ fn test_assert_irq_core_targets_receiver() {
         "core 0 irq_pending must remain clear");
     assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
         "core 1 irq_pending must record the assert");
-    // NVIC_ISPR must land on core 1's bank.
-    assert_ne!(emu.bus.ppb[1].nvic_ispr[0] & (1u32 << irq), 0,
-        "NVIC_ISPR on core 1 must latch");
-    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
+    assert!(emu.bus.irq_pending_dirty[1],
+        "core 1 irq_pending_dirty must signal the pending merge");
+    assert!(!emu.bus.irq_pending_dirty[0],
+        "core 0 irq_pending_dirty must remain clear");
+    // Drive the merge and re-check NVIC_ISPR — core 1 latches, core 0
+    // stays clean.
+    emu.cores[1].ppb.merge_irq_pending(emu.bus.irq_pending[1]);
+    assert_ne!(emu.cores[1].ppb.nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 1 must latch after merge");
+    assert_eq!(emu.cores[0].ppb.nvic_ispr[0] & (1u32 << irq), 0,
         "NVIC_ISPR on core 0 must remain clear");
 }
 
@@ -5981,6 +5997,10 @@ fn test_assert_irq_shared_latches_on_both_cores() {
     // cores so dispatch can pick the core with lowest execution
     // priority — shared peripheral lines are not routed to a specific
     // receiver by the peripheral itself.
+    //
+    // Phase 0b.1 Commit B: assert_irq_shared sets `irq_pending` +
+    // `irq_pending_dirty` on both cores; the NVIC_ISPR merge happens
+    // at the next scheduler tick / step. Drive the merge manually here.
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
     emu.bus.assert_irq_shared(irq);
@@ -5988,14 +6008,24 @@ fn test_assert_irq_shared_latches_on_both_cores() {
         "core 0 irq_pending must record the assert");
     assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
         "core 1 irq_pending must record the assert");
-    assert_ne!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
-        "NVIC_ISPR on core 0 must latch");
-    assert_ne!(emu.bus.ppb[1].nvic_ispr[0] & (1u32 << irq), 0,
-        "NVIC_ISPR on core 1 must latch");
+    assert!(emu.bus.irq_pending_dirty[0] && emu.bus.irq_pending_dirty[1],
+        "both cores' irq_pending_dirty flags must be set");
+    emu.cores[0].ppb.merge_irq_pending(emu.bus.irq_pending[0]);
+    emu.cores[1].ppb.merge_irq_pending(emu.bus.irq_pending[1]);
+    assert_ne!(emu.cores[0].ppb.nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 0 must latch after merge");
+    assert_ne!(emu.cores[1].ppb.nvic_ispr[0] & (1u32 << irq), 0,
+        "NVIC_ISPR on core 1 must latch after merge");
 }
 
 #[test]
 fn test_clear_irq_core_drops_pending_on_one_core() {
+    // Phase 0b.1 Commit B: `clear_irq_core` clears `irq_pending` only;
+    // any matching `nvic_ispr` bit will be cleared by the step-path
+    // dual-clear on dispatch (see `try_take_any_pending_exception`'s
+    // DUAL-CLEAR INVARIANT). Assert the new contract here — the test's
+    // original post-condition (nvic_ispr also cleared by clear_irq_*)
+    // was an artefact of the previous inline-write model.
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_SIO_IRQ_FIFO; // core-local
     emu.bus.assert_irq_core(0, irq);
@@ -6005,12 +6035,14 @@ fn test_clear_irq_core_drops_pending_on_one_core() {
         "clear_irq_core must drop the pending bit on the named core");
     assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
         "clear_irq_core must not touch the other core");
-    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
-        "NVIC_ISPR on core 0 must also clear");
 }
 
 #[test]
 fn test_clear_irq_shared_drops_pending_on_both_cores() {
+    // Phase 0b.1 Commit B: see comment on
+    // `test_clear_irq_core_drops_pending_on_one_core`. `clear_irq_shared`
+    // clears `irq_pending` on both cores; NVIC_ISPR lives on the cores
+    // and is touched only by dispatch / ICPR writes.
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
     emu.bus.assert_irq_shared(irq);
@@ -6019,10 +6051,6 @@ fn test_clear_irq_shared_drops_pending_on_both_cores() {
         "clear_irq_shared must clear core 0's pending bit");
     assert_eq!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
         "clear_irq_shared must clear core 1's pending bit");
-    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << irq), 0,
-        "NVIC_ISPR on core 0 must also clear");
-    assert_eq!(emu.bus.ppb[1].nvic_ispr[0] & (1u32 << irq), 0,
-        "NVIC_ISPR on core 1 must also clear");
 }
 
 #[test]
@@ -6033,9 +6061,9 @@ fn test_mmio_nvic_ispr_write_mirrors_into_irq_pending_and_dispatches() {
     // dispatch on the next step. Covers HLD V5 §5.3 mandated case.
     let mut emu = load_external_irq_emu();
     // Enable IRQ 0 via MMIO path.
-    emu.bus.write32(0xE000_E100, 1u32 << 0, 0);
+    emu.mmio_write32(0xE000_E100, 1u32 << 0);
     // Pend IRQ 0 via MMIO path — this is the case B1 restores.
-    emu.bus.write32(0xE000_E200, 1u32 << 0, 0);
+    emu.mmio_write32(0xE000_E200, 1u32 << 0);
     // After write, bus.irq_pending must reflect the latch.
     assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
         "NVIC_ISPR MMIO write must mirror into bus.irq_pending[core]");
@@ -6052,13 +6080,13 @@ fn test_mmio_nvic_icpr_write_drops_irq_pending_mirror() {
     // doesn't let a cleared IRQ re-dispatch.
     let mut emu = load_external_irq_emu();
     // Pend via MMIO (mirrors set bit).
-    emu.bus.write32(0xE000_E200, 1u32 << 0, 0);
+    emu.mmio_write32(0xE000_E200, 1u32 << 0);
     assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0);
     // Clear via MMIO ICPR.
-    emu.bus.write32(0xE000_E280, 1u32 << 0, 0);
+    emu.mmio_write32(0xE000_E280, 1u32 << 0);
     assert_eq!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
         "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror");
-    assert_eq!(emu.bus.ppb[0].nvic_ispr[0] & (1u32 << 0), 0,
+    assert_eq!(emu.cores[0].ppb.nvic_ispr[0] & (1u32 << 0), 0,
         "NVIC_ICPR MMIO write must clear the architectural latch");
 }
 
@@ -6069,7 +6097,7 @@ fn test_mmio_nvic_ispr_word1_write_mirrors_high_half() {
     // pending IRQ 40 (PROC0_IRQ_CSIDE in the catalogue) must surface
     // in bits 32..=63 of irq_pending.
     let mut emu = load_external_irq_emu();
-    emu.bus.write32(0xE000_E204, 1u32 << (40 - 32), 0);
+    emu.mmio_write32(0xE000_E204, 1u32 << (40 - 32));
     assert_ne!(emu.bus.irq_pending[0] & (1u64 << 40), 0,
         "NVIC_ISPR1 write for IRQ 40 must mirror into bus.irq_pending[core] bit 40");
 }
@@ -6082,13 +6110,13 @@ fn test_execution_priority_basepri_leq_current_is_noop() {
     // higher = lower architectural priority). `execution_priority`
     // must still return 0x40 — BASEPRI only lowers the ceiling, it
     // never raises it.
-    let (mut c, mut bus) = core_and_bus();
+    let (mut c, _bus) = core_and_bus();
     // Pretend we're in handler mode at exception 16 (IRQ 0).
     c.regs.xpsr = (c.regs.xpsr & !0x1FF) | 16;
     // Give IRQ 0 priority 0x40 via NVIC_IPR0 byte 0.
-    bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0x40, 0, 0, 0]));
+    c.ppb.write32(0xE000_E400, u32::from_le_bytes([0x40, 0, 0, 0]));
     c.regs.basepri = 0xE0;
-    let prio = c.execution_priority(&bus);
+    let prio = c.execution_priority();
     assert_eq!(prio, 0x40,
         "BASEPRI=0xE0 must NOT raise execution priority above the \
          current active-exception priority 0x40");
@@ -6104,14 +6132,14 @@ fn test_unified_arbitration_external_irq_beats_pendsv() {
     let mut emu = load_external_irq_emu();
     // Set PendSV priority to 0x80 via SHPR3 (PendSV is byte [10] → lane 2
     // of SHPR3 at 0xE000_ED20).
-    emu.bus.write32(0xE000_ED20, u32::from_le_bytes([0, 0, 0x80, 0]), 0);
+    emu.mmio_write32(0xE000_ED20, u32::from_le_bytes([0, 0, 0x80, 0]));
     // Set IRQ 0 priority to 0x20.
-    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0x20, 0, 0, 0]), 0);
+    emu.mmio_write32(0xE000_E400, u32::from_le_bytes([0x20, 0, 0, 0]));
     // Enable IRQ 0.
-    emu.bus.write32(0xE000_E100, 1u32 << 0, 0);
+    emu.mmio_write32(0xE000_E100, 1u32 << 0);
     // Pend both.
-    emu.bus.write32(0xE000_ED04, 1u32 << 28, 0); // ICSR.PENDSVSET
-    emu.bus.write32(0xE000_E200, 1u32 << 0, 0); // NVIC_ISPR IRQ 0
+    emu.mmio_write32(0xE000_ED04, 1u32 << 28); // ICSR.PENDSVSET
+    emu.mmio_write32(0xE000_E200, 1u32 << 0); // NVIC_ISPR IRQ 0
     // One step: unified arbitration picks IRQ 0 (priority 0x20 beats 0x80).
     core0_step(&mut emu);
     assert_eq!(emu.cores[0].regs.ipsr(), 16,
@@ -6125,11 +6153,11 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
     // a higher-priority IRQ preempts a running handler.
     let mut emu = load_external_irq_emu();
     // Priorities: IRQ 0 = 0xC0 (lane 0), IRQ 1 = 0x40 (lane 1).
-    emu.bus.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0x40, 0, 0]), 0);
+    emu.mmio_write32(0xE000_E400, u32::from_le_bytes([0xC0, 0x40, 0, 0]));
     // Enable both IRQs.
-    emu.bus.write32(0xE000_E100, 0b11, 0);
+    emu.mmio_write32(0xE000_E100, 0b11);
     // Pend IRQ 0 + step until the handler is entered.
-    emu.bus.write32(0xE000_E200, 1u32 << 0, 0);
+    emu.mmio_write32(0xE000_E200, 1u32 << 0);
     let mut taken = false;
     for _ in 0..5 {
         core0_step(&mut emu);
@@ -6140,7 +6168,7 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
     }
     assert!(taken, "IRQ 0 must dispatch within a few steps (IPSR=16)");
     // Now pend IRQ 1 at higher priority. Must preempt on next step.
-    emu.bus.write32(0xE000_E200, 1u32 << 1, 0);
+    emu.mmio_write32(0xE000_E200, 1u32 << 1);
     core0_step(&mut emu);
     assert_eq!(emu.cores[0].regs.ipsr(), 17,
         "IRQ 1 (priority 0x40) must preempt IRQ 0 handler (priority 0xC0)");
@@ -6163,14 +6191,14 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
 
 #[test]
 fn test_execution_priority_basepri_clamps_masked_value() {
-    let (mut c, bus) = core_and_bus();
+    let (mut c, _bus) = core_and_bus();
     c.regs.basepri = 0x80;
     c.regs.primask = 0;
     c.regs.faultmask = 0;
     // No active exception, no FAULTMASK, no PRIMASK, no pending IRQ.
     // Pre-Phase-0a this returned 256 (the initial "no mask" value);
     // post-Phase-0a it returns 0x80.
-    let prio = c.execution_priority(&bus);
+    let prio = c.execution_priority();
     assert_eq!(prio, 0x80, "BASEPRI=0x80 must clamp execution_priority to 0x80");
 }
 
@@ -6179,11 +6207,11 @@ fn test_execution_priority_basepri_masks_unimplemented_bits() {
     // M33 implements bits [7:5] of priority bytes. A BASEPRI of 0x9F
     // (bits 4..0 set) must behave identically to 0x80 — the clamp
     // discards the unimplemented bits.
-    let (mut c, bus) = core_and_bus();
+    let (mut c, _bus) = core_and_bus();
     c.regs.basepri = 0x9F;
-    let prio_masked = c.execution_priority(&bus);
+    let prio_masked = c.execution_priority();
     c.regs.basepri = 0x80;
-    let prio_pure = c.execution_priority(&bus);
+    let prio_pure = c.execution_priority();
     assert_eq!(prio_masked, prio_pure,
         "BASEPRI bits [4:0] must be masked before clamping");
 }
@@ -6191,9 +6219,9 @@ fn test_execution_priority_basepri_masks_unimplemented_bits() {
 #[test]
 fn test_execution_priority_basepri_zero_does_nothing() {
     // BASEPRI=0 is the "disabled" marker — do not clamp at all.
-    let (mut c, bus) = core_and_bus();
+    let (mut c, _bus) = core_and_bus();
     c.regs.basepri = 0;
-    let prio = c.execution_priority(&bus);
+    let prio = c.execution_priority();
     assert_eq!(prio, 256,
         "BASEPRI=0 must leave priority at its thread-mode max");
 }
@@ -6202,10 +6230,10 @@ fn test_execution_priority_basepri_zero_does_nothing() {
 fn test_execution_priority_primask_overrides_basepri() {
     // PRIMASK=1 clamps to 0, which is numerically less than any BASEPRI
     // value — PRIMASK wins by architectural ordering.
-    let (mut c, bus) = core_and_bus();
+    let (mut c, _bus) = core_and_bus();
     c.regs.primask = 1;
     c.regs.basepri = 0xE0;
-    let prio = c.execution_priority(&bus);
+    let prio = c.execution_priority();
     assert_eq!(prio, 0, "PRIMASK=1 must beat BASEPRI=0xE0");
 }
 
@@ -6217,11 +6245,11 @@ fn test_execution_priority_basepri_vs_higher_priority_irq() {
     // blocked — `can_preempt(0xC0_irq)` should return false.
     let mut emu = load_external_irq_emu();
     emu.cores[0].regs.basepri = 0x80;
-    let can = emu.cores[0].can_preempt(16 + 0, &emu.bus); // IRQ 0 priority 0
+    let can = emu.cores[0].can_preempt(16 + 0); // IRQ 0 priority 0
     assert!(can, "IRQ at priority 0 always beats BASEPRI 0x80");
     // But an IRQ with priority 0xC0 set via NVIC_IPR should NOT preempt.
-    emu.bus.ppb[0].write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
-    let can_irq0_at_0xc0 = emu.cores[0].can_preempt(16 + 0, &emu.bus);
+    emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    let can_irq0_at_0xc0 = emu.cores[0].can_preempt(16 + 0);
     assert!(!can_irq0_at_0xc0,
         "IRQ 0 at priority 0xC0 must not preempt BASEPRI 0x80");
 }
@@ -6251,10 +6279,10 @@ fn tt_sau_region_match() {
     // Configure SAU region 3 covering 0x4780-0x7FFF (Secure), then TT an address in range
     let (mut c, mut bus) = core_and_bus();
     // Enable SAU
-    bus.ppb[0].sau_ctrl = 1;
+    c.ppb.sau_ctrl = 1;
     // Region 3: RBAR=0x4787, RLAR=0x7FE1 (enabled, NSC=0 -> Secure)
-    bus.ppb[0].sau_rnr = 3;
-    bus.ppb[0].sau_regions[3] = (0x4787, 0x7FE1);
+    c.ppb.sau_rnr = 3;
+    c.ppb.sau_regions[3] = (0x4787, 0x7FE1);
 
     c.set_reg(5, 0x7FE1); // address in range (secure ROM range, IDAU-secure)
     // TT R2, R5: hw0=0xE845, hw1=0xF200
@@ -6276,10 +6304,10 @@ fn tt_sau_region_match() {
 fn tt_sau_region_nsc() {
     // Configure SAU region 0 as NSC (Non-Secure Callable)
     let (mut c, mut bus) = core_and_bus();
-    bus.ppb[0].sau_ctrl = 1;
+    c.ppb.sau_ctrl = 1;
     // Region 0: base=0x1000, limit=0x1FFF, NSC=1, enabled
     // RBAR = 0x1000, RLAR = 0x1FE0 | 0x3 (NSC=1, enable=1)
-    bus.ppb[0].sau_regions[0] = (0x1000, 0x1FE3);
+    c.ppb.sau_regions[0] = (0x1000, 0x1FE3);
 
     c.set_reg(1, 0x1500); // address in range (secure ROM range)
     // TT R0, R1: hw0=0xE841, hw1=0xF000
@@ -6301,7 +6329,7 @@ fn tt_sau_region_nsc() {
 fn tt_sau_no_match_allns_clear() {
     // SAU enabled, no regions match, ALLNS=0 -> Secure
     let (mut c, mut bus) = core_and_bus();
-    bus.ppb[0].sau_ctrl = 1; // enable, ALLNS=0
+    c.ppb.sau_ctrl = 1; // enable, ALLNS=0
 
     c.set_reg(3, 0xFFFF_0000); // address not in any region
     // TT R0, R3: hw0=0xE843, hw1=0xF000
@@ -6316,7 +6344,7 @@ fn tt_sau_no_match_allns_clear() {
 fn tt_sau_no_match_allns_set() {
     // SAU enabled, no regions match, ALLNS=1 -> Non-Secure
     let (mut c, mut bus) = core_and_bus();
-    bus.ppb[0].sau_ctrl = 3; // enable + ALLNS
+    c.ppb.sau_ctrl = 3; // enable + ALLNS
 
     c.set_reg(3, 0xFFFF_0000);
     // TT R0, R3: hw0=0xE843, hw1=0xF000
@@ -6333,9 +6361,9 @@ fn tt_bootrom_scenario() {
     // Reproduce the bootrom's exact SAU+TT sequence:
     // Region 7: RBAR=0x4787, RLAR=0x7FE1, TT address=0x7FE1
     let (mut c, mut bus) = core_and_bus();
-    bus.ppb[0].sau_ctrl = 1;
-    bus.ppb[0].sau_rnr = 7;
-    bus.ppb[0].sau_regions[7] = (0x4787, 0x7FE1);
+    c.ppb.sau_ctrl = 1;
+    c.ppb.sau_rnr = 7;
+    c.ppb.sau_regions[7] = (0x4787, 0x7FE1);
 
     c.set_reg(5, 0x7FE1);
     // TT R2, R5: hw0=0xE845, hw1=0xF200
@@ -6529,8 +6557,8 @@ fn bootrom_diagnostic_run() {
             };
             eprintln!("*** {} entered at cycle {} ***", exc_name, cycle);
             eprintln!("  PC={:#010x} LR={:#010x}", pc, emu.cores[0].regs.lr());
-            eprintln!("  CFSR={:#010x} HFSR={:#010x}", emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
-            eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.bus.ppb[0].bfar, emu.bus.ppb[0].mmfar);
+            eprintln!("  CFSR={:#010x} HFSR={:#010x}", emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
+            eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.cores[0].ppb.bfar, emu.cores[0].ppb.mmfar);
             eprintln!("  R0-R3: {:#010x} {:#010x} {:#010x} {:#010x}",
                 emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
                 emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
@@ -6557,7 +6585,7 @@ fn bootrom_diagnostic_run() {
             if stuck_count > 100 {
                 eprintln!("Stuck at PC={:#010x} after {} cycles", pc, cycle);
                 eprintln!("  IPSR={}, LR={:#010x}", emu.cores[0].regs.ipsr(), emu.cores[0].regs.lr());
-                eprintln!("  CFSR={:#010x}, HFSR={:#010x}", emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
+                eprintln!("  CFSR={:#010x}, HFSR={:#010x}", emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
                 eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
                     emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
                     emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
@@ -6565,7 +6593,7 @@ fn bootrom_diagnostic_run() {
                     emu.cores[0].regs.r[4], emu.cores[0].regs.r[5],
                     emu.cores[0].regs.r[6], emu.cores[0].regs.r[7]);
                 eprintln!("  SP={:#010x} MSP={:#010x}", emu.cores[0].regs.sp(), emu.cores[0].regs.msp);
-                eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.bus.ppb[0].bfar, emu.bus.ppb[0].mmfar);
+                eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.cores[0].ppb.bfar, emu.cores[0].ppb.mmfar);
                 eprintln!("  Max bootrom PC reached={:#010x}", max_pc);
                 // Try to read stacked PC from exception frame
                 let sp = emu.cores[0].regs.msp;
@@ -6590,7 +6618,7 @@ fn bootrom_diagnostic_run() {
     let final_pc = emu.cores[0].regs.pc();
     eprintln!("Final PC={:#010x}, cycles run", final_pc);
     eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
-        emu.cores[0].regs.ipsr(), emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
+        emu.cores[0].regs.ipsr(), emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
     eprintln!("  secure={}, LR={:#010x}, SP={:#010x}",
         emu.cores[0].secure, emu.cores[0].regs.lr(), emu.cores[0].regs.sp());
     eprintln!("  MSP={:#010x} MSP_NS={:#010x}",
@@ -6791,7 +6819,7 @@ fn test_flash_boot_blinky() {
                     pc, cycle, emu.bus.sio.gpio_out);
                 eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
                     emu.cores[0].regs.ipsr(),
-                    emu.bus.ppb[0].cfsr, emu.bus.ppb[0].hfsr);
+                    emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
                 break;
             }
         } else {
@@ -6839,15 +6867,13 @@ fn spinlock_addr(n: u32) -> u32 {
     SIO_BASE + 0x100 + 4 * n
 }
 
-/// Switch Bus to Core 1's perspective — routes PPB access to `ppb[1]`.
-fn set_core1(bus: &mut Bus) {
-    bus.set_active_core(1);
-}
-
-/// Switch Bus back to Core 0's perspective — routes PPB access to `ppb[0]`.
-fn set_core0(bus: &mut Bus) {
-    bus.set_active_core(0);
-}
+/// Phase 0b.1 Commit B: the `Bus::set_active_core` indirection is gone
+/// (per-core PPB moved onto `CortexM33`). These helpers are retained as
+/// no-ops to keep the FIFO/spinlock tests' call-sites readable.
+/// SIO dispatch now takes a `core: u8` parameter explicitly via the bus
+/// read/write methods that each test site already threads.
+fn set_core1(_bus: &mut Bus) {}
+fn set_core0(_bus: &mut Bus) {}
 
 #[test]
 fn fifo_push_pop_basic_roundtrip() {
@@ -7744,21 +7770,21 @@ fn test_dwt_cyccnt_wired_to_core_cycles() {
     let mut emu = systick_test_emulator();
 
     // Enable DWT: DEMCR.TRCENA then DWT_CTRL.CYCCNTENA
-    emu.bus.ppb[0].write32(0xE000_EDFC, 1 << 24);
-    emu.bus.ppb[0].write32(0xE000_1000, 1);
+    emu.cores[0].ppb.write32(0xE000_EDFC, 1 << 24);
+    emu.cores[0].ppb.write32(0xE000_1000, 1);
 
     // Publish current cycle count into PPB so the write sees a fresh base.
-    emu.bus.ppb[0].update_latest_cycles(emu.cores[0].cycles());
+    emu.cores[0].ppb.update_latest_cycles(emu.cores[0].cycles());
     // Zero CYCCNT.
-    emu.bus.ppb[0].write32(0xE000_1004, 0);
+    emu.cores[0].ppb.write32(0xE000_1004, 0);
 
     let cycles_before = emu.cores[0].cycles();
     emu.step();
     let cycles_after = emu.cores[0].cycles();
     let delta = (cycles_after - cycles_before) as u32;
 
-    emu.bus.ppb[0].update_latest_cycles(emu.cores[0].cycles());
-    let cyccnt = emu.bus.ppb[0].read_cyccnt(emu.cores[0].cycles());
+    emu.cores[0].ppb.update_latest_cycles(emu.cores[0].cycles());
+    let cyccnt = emu.cores[0].ppb.read_cyccnt(emu.cores[0].cycles());
     assert_eq!(cyccnt, delta,
         "After zeroing CYCCNT, read must equal cycles elapsed since write");
 }
@@ -7770,21 +7796,21 @@ fn test_emulator_tick_systick_advances_per_core() {
     let mut emu = systick_test_emulator();
 
     // Enable SysTick on core 0: ENABLE + TICKINT + CLKSOURCE
-    emu.bus.ppb[0].write32(0xE000_E010, 1 | (1 << 1) | (1 << 2));
+    emu.cores[0].ppb.write32(0xE000_E010, 1 | (1 << 1) | (1 << 2));
     // RVR = 1 (smallest non-zero period); CVR = 0 (will immediately underflow).
     // Set CVR via field because register writes always clear CVR.
-    emu.bus.ppb[0].write32(0xE000_E014, 1);
-    emu.bus.ppb[0].syst_cvr = 0;
+    emu.cores[0].ppb.write32(0xE000_E014, 1);
+    emu.cores[0].ppb.syst_cvr = 0;
     // Snapshot last_systick_cycles to the current value so delta is meaningful.
-    emu.bus.ppb[0].last_systick_cycles = emu.cores[0].cycles();
+    emu.cores[0].ppb.last_systick_cycles = emu.cores[0].cycles();
 
     emu.step();
 
     // Multi-reload within the quantum should have set COUNTFLAG.
-    assert_ne!(emu.bus.ppb[0].syst_csr & (1 << 16), 0,
+    assert_ne!(emu.cores[0].ppb.syst_csr & (1 << 16), 0,
         "SysTick must underflow during the quantum");
     // TICKINT=1: ICSR.PENDSTSET must be set.
-    assert_ne!(emu.bus.ppb[0].icsr & (1 << 26), 0,
+    assert_ne!(emu.cores[0].ppb.icsr & (1 << 26), 0,
         "TICKINT=1 + underflow must pend SysTick via ICSR.PENDSTSET");
 }
 
@@ -7793,16 +7819,16 @@ fn test_emulator_tick_systick_disabled_core_untouched() {
     // If core 1's SysTick is disabled, tick_systick() must not perturb CVR.
     let mut emu = systick_test_emulator();
     // Core 1 SysTick disabled; core 0 left at defaults (also disabled).
-    emu.bus.ppb[1].write32(0xE000_E010, 1 << 2); // CLKSOURCE only
-    emu.bus.ppb[1].write32(0xE000_E014, 100);
+    emu.cores[1].ppb.write32(0xE000_E010, 1 << 2); // CLKSOURCE only
+    emu.cores[1].ppb.write32(0xE000_E014, 100);
     // Set CVR via field; a register write would clear it.
-    emu.bus.ppb[1].syst_cvr = 77;
+    emu.cores[1].ppb.syst_cvr = 77;
 
     emu.step();
 
-    assert_eq!(emu.bus.ppb[1].syst_cvr, 77,
+    assert_eq!(emu.cores[1].ppb.syst_cvr, 77,
         "Disabled SysTick must not tick at quantum end");
-    assert_eq!(emu.bus.ppb[1].syst_csr & (1 << 16), 0,
+    assert_eq!(emu.cores[1].ppb.syst_csr & (1 << 16), 0,
         "Disabled SysTick must not set COUNTFLAG");
 }
 
@@ -8235,7 +8261,6 @@ fn trace_enabled_emits_write32_line() {
     // `TraceCaptureSink` so the test doesn't depend on fd 1 redirection.
     let capture = new_capture();
     let mut bus = Bus::new();
-    bus.set_active_core(0);
     bus.set_active_pc(0x1000_0100, 0);
     bus.trace_enabled = true;
     bus.set_trace_sink(Some(Box::new(capture.clone())));
@@ -8268,7 +8293,6 @@ fn trace_enabled_emits_all_six_access_methods() {
     // is the cleanest target — no peripheral side-effects.
     let capture = new_capture();
     let mut bus = Bus::new();
-    bus.set_active_core(0);
     bus.set_active_pc(0x1000_0100, 0);
     bus.trace_enabled = true;
     bus.set_trace_sink(Some(Box::new(capture.clone())));
@@ -8319,26 +8343,24 @@ fn trace_disabled_emits_nothing() {
 #[test]
 fn trace_active_pc_is_per_core() {
     // Regression guard against a dual-core active_pc-staleness bug
-    // (V7 §4.3). The scheduler alternates `set_active_core(0)` /
-    // `set_active_core(1)` each quantum; a bus access on core 1 that
-    // doesn't go through `decode_execute` (e.g. exception stacking)
-    // must NOT observe core 0's last decode PC, and vice versa.
-    // Simulate the pattern: decode PC=0x1000 on core 0, switch to core
-    // 1, decode PC=0x2000, switch back to core 0 and issue an access
-    // *without* re-decoding — the trace line must still carry PC=0x1000
-    // for core 0.
+    // (V7 §4.3). Every bus access carries an explicit `core` parameter
+    // (Phase 0b.1 Commit A) so PC attribution indexes directly into
+    // `bus.active_pc[core]`. A bus access on core 1 that doesn't go
+    // through `decode_execute` (e.g. exception stacking) must NOT
+    // observe core 0's last decode PC, and vice versa. Simulate:
+    // decode PC=0x1000 on core 0, decode PC=0x2000 on core 1, then core
+    // 0 issues an access *without* re-decoding — the trace line must
+    // still carry PC=0x1000 for core 0.
     let capture = new_capture();
     let mut bus = Bus::new();
     bus.trace_enabled = true;
     bus.set_trace_sink(Some(Box::new(capture.clone())));
 
     // Core 0 "decodes" at 0x1000 and writes.
-    bus.set_active_core(0);
     bus.set_active_pc(0x0000_1000, 0);
     bus.write32(0x2000_0100, 0xAAAA_AAAA, 0);
 
     // Scheduler switches to core 1, which "decodes" at 0x2000 and writes.
-    bus.set_active_core(1);
     bus.set_active_pc(0x0000_2000, 1);
     bus.write32(0x2000_0104, 0xBBBB_BBBB, 1);
 
@@ -8346,7 +8368,6 @@ fn trace_active_pc_is_per_core() {
     // hardware-triggered access like exception stacking before the
     // handler's first `decode_execute`). The stored per-core PC must
     // still be 0x1000 for core 0 — not 0x2000 from core 1's quantum.
-    bus.set_active_core(0);
     bus.write32(0x2000_0108, 0xCCCC_CCCC, 0);
 
     let captured = capture.0.lock().unwrap();
@@ -8450,8 +8471,7 @@ fn trace_exception_entry_publishes_sentinel_fe() {
     // SVC (vector 11) at an arbitrary address — the handler never runs
     // here because we return to the caller after `test_enter_exception`.
     let vtor: u32 = 0x2000_4000;
-    let core = bus.active_core();
-    bus.ppb[core].vtor = vtor;
+    cpu.ppb.vtor = vtor;
     bus.write32(vtor + 11 * 4, 0x2000_0200 | 1, 0); // SVC → 0x2000_0200 (Thumb)
 
     // Enable trace AFTER the pre-flight setup so we only capture the
@@ -8511,8 +8531,7 @@ fn trace_exception_exit_publishes_sentinel_fd() {
 
     let mut bus = Bus::new();
     let vtor: u32 = 0x2000_4000;
-    let core = bus.active_core();
-    bus.ppb[core].vtor = vtor;
+    cpu.ppb.vtor = vtor;
     bus.write32(vtor + 11 * 4, 0x2000_0200 | 1, 0);
 
     // Drive an SVC entry first (sets up the stacked frame that exit

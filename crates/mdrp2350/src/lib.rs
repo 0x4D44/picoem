@@ -91,9 +91,9 @@ impl Emulator {
             self.cores[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
         }
 
-        // Clear bus state
+        // Clear bus state. Per-core PPB is reset via `CortexM33::with_id`
+        // above (Phase 0b.1 Commit B moved PPB onto CortexM33).
         self.bus.clear_bus_fault();
-        self.bus.ppb = [Default::default(), Default::default()];
         // HLD V5 §5.7: post-bootrom RESETS state — peripherals
         // released by pico-sdk `runtime_init_bootrom_reset` start
         // deasserted. The emulator never runs the bootrom; we seed
@@ -103,6 +103,7 @@ impl Emulator {
         self.bus.timer0.reset();
         self.bus.timer1.reset();
         self.bus.irq_pending = [0; 2];
+        self.bus.irq_pending_dirty = [false; 2];
         self.bus.event_flag = [false; 2];
         self.bus.rcp_salt = [0; 2];
         self.bus.rcp_salt_valid = [false; 2];
@@ -183,11 +184,20 @@ impl Emulator {
         self.bus.master_cycle = self.clock.cycles;
         let target = self.clock.cycles + self.step_quantum as u64;
 
-        // Core 0 first, then core 1. `bus.active_core` must be set so that
-        // every `bus.ppb[bus.active_core()]` access (NVIC, SCB, SysTick,
-        // FPCCR, MPU, fault state) lands on the right per-core PPB.
+        // Core 0 first, then core 1. Phase 0b.1 Commit B: each PPB is
+        // now owned by its own `CortexM33`, so no `set_active_core`
+        // indirection is needed.
         for core_id in 0..2 {
-            self.bus.set_active_core(core_id);
+            // Quantum-boundary IRQ merge: peripherals in `tick_peripherals`
+            // at the previous quantum raised IRQs via `assert_irq_*`,
+            // which set `irq_pending_dirty[core]`. Union those bits into
+            // this core's NVIC_ISPR before any dispatch check, so the
+            // first instruction of the new quantum sees them.
+            if self.bus.irq_pending_dirty[core_id] {
+                self.cores[core_id].ppb.merge_irq_pending(self.bus.irq_pending[core_id]);
+                self.bus.irq_pending_dirty[core_id] = false;
+            }
+
             while !self.cores[core_id].is_halted()
                 && !self.cores[core_id].is_wfe_waiting()
                 && self.cores[core_id].cycles < target
@@ -195,12 +205,13 @@ impl Emulator {
                 // Publish the core's cycle count into its PPB before each
                 // instruction so DWT_CYCCNT reads/writes land on a fresh
                 // value. Staleness is bounded by one instruction.
-                self.bus.ppb[core_id].update_latest_cycles(self.cores[core_id].cycles);
-                self.cores[core_id].step(&mut self.bus);
+                self.cores[core_id].ppb.update_latest_cycles(self.cores[core_id].cycles);
+                let bus = &mut self.bus;
+                self.cores[core_id].step(bus);
             }
             // Final refresh so any post-quantum inspection (e.g. tests
             // reading DWT_CYCCNT between steps) sees a current base.
-            self.bus.ppb[core_id].update_latest_cycles(self.cores[core_id].cycles);
+            self.cores[core_id].ppb.update_latest_cycles(self.cores[core_id].cycles);
         }
 
         self.clock.advance(self.step_quantum as u64);
@@ -214,12 +225,6 @@ impl Emulator {
         // uses `consumed` instead; mdrp2350 explicitly diverges because
         // the ARMv8-M dual-core contention model is disabled here
         // (CLAUDE.md "Bank contention model").
-        // Peripherals (and DMA inside them) issue bus reads/writes as
-        // core 0 per the Phase 0b.1 DMA CoreId convention. During the
-        // interim migration, Bus methods `debug_assert!` that their
-        // `core` argument equals `self.active_core`, so we reset the
-        // active-core indicator to 0 before the peripheral sweep.
-        self.bus.set_active_core(0);
         self.tick_peripherals(self.step_quantum);
         self.tick_systick();
         self.wake_checks();
@@ -256,12 +261,14 @@ impl Emulator {
 
     /// Quantum-end SysTick advance. Each core's SysTick is ticked by the
     /// delta between its current `cycles` and the last `systick_advance`
-    /// snapshot. The per-core CVR and COUNTFLAG state live on
-    /// `Bus::ppb[core_id]`; pending exception delivery sets
-    /// `ICSR.PENDSTSET` via `Ppb::pend_systick()` when TICKINT is enabled.
+    /// snapshot. The per-core CVR and COUNTFLAG state lives on
+    /// `CortexM33::ppb` (Phase 0b.1 Commit B); pending exception delivery
+    /// sets `ICSR.PENDSTSET` via `Ppb::pend_systick()` when TICKINT is
+    /// enabled.
     fn tick_systick(&mut self) {
         for core_id in 0..2 {
-            self.bus.ppb[core_id].systick_advance(self.cores[core_id].cycles());
+            let cycles = self.cores[core_id].cycles();
+            self.cores[core_id].ppb.systick_advance(cycles);
         }
     }
 
@@ -360,7 +367,23 @@ impl Emulator {
         // observe the current cycle count when the harness pokes MMIO
         // outside the step path. See HLD §6 P2.
         self.bus.master_cycle = self.clock.cycles;
-        self.bus.write32(addr, value, 0);
+        // Phase 0b.1 Commit B: PPB addresses live on core 0's per-core
+        // PPB from the harness's perspective (same convention as before).
+        // Route there directly; mirror any NVIC_ISPR/ICPR writes back to
+        // `bus.irq_pending[0]` so the dispatch short-circuit stays in sync.
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            self.cores[0].ppb.write32(addr, value);
+            let low = addr & 0xFFFF;
+            if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
+                let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
+                let ispr = self.cores[0].ppb.nvic_ispr[word];
+                let mask64 = (ispr as u64) << (word * 32);
+                let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
+                self.bus.irq_pending[0] = (self.bus.irq_pending[0] & keep) | mask64;
+            }
+        } else {
+            self.bus.write32(addr, value, 0);
+        }
     }
 
     /// Read a 32-bit word from an MMIO address via the bus. Charges zero
@@ -377,7 +400,12 @@ impl Emulator {
         // Mirror the `step()` stash so PLL CS reads observe the current
         // cycle count when the harness reads MMIO outside the step path.
         self.bus.master_cycle = self.clock.cycles;
-        self.bus.read32(addr, 0)
+        // Phase 0b.1 Commit B: PPB addresses route to core 0's PPB.
+        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+            self.cores[0].ppb.read32(addr)
+        } else {
+            self.bus.read32(addr, 0)
+        }
     }
 }
 

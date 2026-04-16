@@ -429,7 +429,7 @@ impl CortexM33 {
         // PC is aligned down to word boundary, then offset added
         let base = self.read_pc() & !3;
         let addr = base.wrapping_add(imm8 << 2);
-        self.regs.r[rt] = bus.read32(addr, self.core_id);
+        self.regs.r[rt] = self.bus_read32(addr, bus);
         2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
@@ -449,43 +449,43 @@ impl CortexM33 {
         match opc {
             0b000 => {
                 // STR Rt, [Rn, Rm]
-                bus.write32(addr, self.regs.r[rt], self.core_id);
+                self.bus_write32(addr, self.regs.r[rt], bus);
                 2 // M33 measured: 2 cycles
             }
             0b001 => {
                 // STRH Rt, [Rn, Rm]
-                bus.write16(addr, self.regs.r[rt] as u16, self.core_id);
+                self.bus_write16(addr, self.regs.r[rt] as u16, bus);
                 2 // M33 measured: 2 cycles
             }
             0b010 => {
                 // STRB Rt, [Rn, Rm]
-                bus.write8(addr, self.regs.r[rt] as u8, self.core_id);
+                self.bus_write8(addr, self.regs.r[rt] as u8, bus);
                 2 // M33 measured: 2 cycles
             }
             0b011 => {
                 // LDRSB Rt, [Rn, Rm]
-                let val = bus.read8(addr, self.core_id) as i8 as i32 as u32;
+                let val = self.bus_read8(addr, bus) as i8 as i32 as u32;
                 self.regs.r[rt] = val;
                 2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             0b100 => {
                 // LDR Rt, [Rn, Rm]
-                self.regs.r[rt] = bus.read32(addr, self.core_id);
+                self.regs.r[rt] = self.bus_read32(addr, bus);
                 2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             0b101 => {
                 // LDRH Rt, [Rn, Rm]
-                self.regs.r[rt] = bus.read16(addr, self.core_id) as u32;
+                self.regs.r[rt] = self.bus_read16(addr, bus) as u32;
                 2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             0b110 => {
                 // LDRB Rt, [Rn, Rm]
-                self.regs.r[rt] = bus.read8(addr, self.core_id) as u32;
+                self.regs.r[rt] = self.bus_read8(addr, bus) as u32;
                 2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
             _ => {
                 // 0b111: LDRSH Rt, [Rn, Rm]
-                let val = bus.read16(addr, self.core_id) as i16 as i32 as u32;
+                let val = self.bus_read16(addr, bus) as i16 as i32 as u32;
                 self.regs.r[rt] = val;
                 2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
             }
@@ -502,7 +502,7 @@ impl CortexM33 {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 2);
-        bus.write32(addr, self.regs.r[rt], self.core_id);
+        self.bus_write32(addr, self.regs.r[rt], bus);
         2 // M33 measured: 2 cycles
     }
 
@@ -512,7 +512,7 @@ impl CortexM33 {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 2);
-        self.regs.r[rt] = bus.read32(addr, self.core_id);
+        self.regs.r[rt] = self.bus_read32(addr, bus);
         2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
@@ -522,7 +522,7 @@ impl CortexM33 {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5);
-        bus.write8(addr, self.regs.r[rt] as u8, self.core_id);
+        self.bus_write8(addr, self.regs.r[rt] as u8, bus);
         2 // M33 measured: 2 cycles
     }
 
@@ -532,7 +532,7 @@ impl CortexM33 {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5);
-        self.regs.r[rt] = bus.read8(addr, self.core_id) as u32;
+        self.regs.r[rt] = self.bus_read8(addr, bus) as u32;
         2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
@@ -542,7 +542,7 @@ impl CortexM33 {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 1);
-        bus.write16(addr, self.regs.r[rt] as u16, self.core_id);
+        self.bus_write16(addr, self.regs.r[rt] as u16, bus);
         2 // M33 measured: 2 cycles
     }
 
@@ -552,7 +552,7 @@ impl CortexM33 {
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 1);
-        self.regs.r[rt] = bus.read16(addr, self.core_id) as u32;
+        self.regs.r[rt] = self.bus_read16(addr, bus) as u32;
         2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
@@ -565,7 +565,7 @@ impl CortexM33 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
-        bus.write32(addr, self.regs.r[rt], self.core_id);
+        self.bus_write32(addr, self.regs.r[rt], bus);
         2 // M33 measured: 2 cycles
     }
 
@@ -574,7 +574,7 @@ impl CortexM33 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
-        self.regs.r[rt] = bus.read32(addr, self.core_id);
+        self.regs.r[rt] = self.bus_read32(addr, bus);
         2 // M33 measured: 2 cycles (SRAM, zero-wait-state)
     }
 
@@ -645,7 +645,7 @@ impl CortexM33 {
                 bus.set_burst_mode(); // suppress per-word bank wait states
                 for i in 0..15 {
                     if reglist & (1 << i) != 0 {
-                        bus.write32(addr, self.regs.r[i], self.core_id);
+                        self.bus_write32(addr, self.regs.r[i], bus);
                         addr = addr.wrapping_add(4);
                     }
                 }
@@ -698,7 +698,7 @@ impl CortexM33 {
                 bus.set_burst_mode(); // suppress per-word bank wait states
                 for i in 0..16 {
                     if reglist & (1 << i) != 0 {
-                        let val = bus.read32(addr, self.core_id);
+                        let val = self.bus_read32(addr, bus);
                         if i == 15 {
                             if Self::is_exc_return(val) {
                                 self.regs.set_sp(addr.wrapping_add(4));
@@ -779,7 +779,7 @@ impl CortexM33 {
         bus.set_burst_mode();
         for i in 0..8 {
             if reglist & (1 << i) != 0 {
-                bus.write32(addr, self.regs.r[i], self.core_id);
+                self.bus_write32(addr, self.regs.r[i], bus);
                 addr = addr.wrapping_add(4);
             }
         }
@@ -800,7 +800,7 @@ impl CortexM33 {
         bus.set_burst_mode();
         for i in 0..8 {
             if reglist & (1 << i) != 0 {
-                self.regs.r[i] = bus.read32(addr, self.core_id);
+                self.regs.r[i] = self.bus_read32(addr, bus);
                 addr = addr.wrapping_add(4);
             }
         }

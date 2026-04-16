@@ -585,24 +585,24 @@ impl CortexM33 {
     ) -> u32 {
         match (size, sign) {
             (0b00, false) => {
-                if load { self.regs.r[rt] = bus.read8(addr, self.core_id) as u32; }
-                else { bus.write8(addr, self.regs.r[rt] as u8, self.core_id); }
+                if load { self.regs.r[rt] = self.bus_read8(addr, bus) as u32; }
+                else { self.bus_write8(addr, self.regs.r[rt] as u8, bus); }
             }
             (0b00, true) => {
                 // LDRSB (load only; signed stores don't exist)
-                self.regs.r[rt] = bus.read8(addr, self.core_id) as i8 as i32 as u32;
+                self.regs.r[rt] = self.bus_read8(addr, bus) as i8 as i32 as u32;
             }
             (0b01, false) => {
-                if load { self.regs.r[rt] = bus.read16(addr, self.core_id) as u32; }
-                else { bus.write16(addr, self.regs.r[rt] as u16, self.core_id); }
+                if load { self.regs.r[rt] = self.bus_read16(addr, bus) as u32; }
+                else { self.bus_write16(addr, self.regs.r[rt] as u16, bus); }
             }
             (0b01, true) => {
                 // LDRSH (load only)
-                self.regs.r[rt] = bus.read16(addr, self.core_id) as i16 as i32 as u32;
+                self.regs.r[rt] = self.bus_read16(addr, bus) as i16 as i32 as u32;
             }
             (0b10, false) => {
                 if load {
-                    let val = bus.read32(addr, self.core_id);
+                    let val = self.bus_read32(addr, bus);
                     if rt == 15 {
                         if Self::is_exc_return(val) {
                             return self.exit_exception(val, bus);
@@ -612,7 +612,7 @@ impl CortexM33 {
                     }
                     self.regs.r[rt] = val;
                 } else {
-                    bus.write32(addr, self.regs.r[rt], self.core_id);
+                    self.bus_write32(addr, self.regs.r[rt], bus);
                 }
             }
             _ => return 1, // undefined: signed word or size=11
@@ -641,7 +641,7 @@ impl CortexM33 {
         for i in 0..16 {
             if reglist & (1 << i) != 0 {
                 if load {
-                    let val = bus.read32(addr, self.core_id);
+                    let val = self.bus_read32(addr, bus);
                     if i == 15 {
                         if Self::is_exc_return(val) {
                             bus.clear_burst_mode();
@@ -652,7 +652,7 @@ impl CortexM33 {
                         self.regs.r[i] = val;
                     }
                 } else {
-                    bus.write32(addr, self.regs.r[i], self.core_id);
+                    self.bus_write32(addr, self.regs.r[i], bus);
                 }
                 addr = addr.wrapping_add(4);
             }
@@ -697,10 +697,10 @@ impl CortexM33 {
             let h = (hw1 >> 4) & 1 != 0;
             let base = self.regs.r[rn];
             if h {
-                let halfword = bus.read16(base.wrapping_add(self.regs.r[rm] << 1), self.core_id);
+                let halfword = self.bus_read16(base.wrapping_add(self.regs.r[rm] << 1), bus);
                 self.regs.set_pc(self.read_pc().wrapping_add((halfword as u32) << 1));
             } else {
-                let byte = bus.read8(base.wrapping_add(self.regs.r[rm]), self.core_id);
+                let byte = self.bus_read8(base.wrapping_add(self.regs.r[rm]), bus);
                 self.regs.set_pc(self.read_pc().wrapping_add((byte as u32) << 1));
             }
             return 4;
@@ -714,7 +714,7 @@ impl CortexM33 {
             let rt = ((hw1 >> 12) & 0xF) as usize;
             let imm8 = (hw1 & 0xFF) as u32;
             let addr = self.regs.r[rn].wrapping_add(imm8 << 2);
-            self.regs.r[rt] = bus.read32(addr, self.core_id);
+            self.regs.r[rt] = self.bus_read32(addr, bus);
             return 2;
         }
         if hw0 & 0xFFF0 == 0xE840 {
@@ -723,7 +723,7 @@ impl CortexM33 {
                 let rn = (hw0 & 0xF) as usize;
                 let rd = ((hw1 >> 8) & 0xF) as usize;
                 let addr = self.regs.r[rn];
-                self.regs.r[rd] = Self::execute_tt(addr, bus);
+                self.regs.r[rd] = self.execute_tt(addr);
                 return 1;
             }
             // STREX (treat as normal STR for Phase 1, Rd gets 0 = success)
@@ -732,7 +732,7 @@ impl CortexM33 {
             let rd = ((hw1 >> 8) & 0xF) as usize;
             let imm8 = (hw1 & 0xFF) as u32;
             let addr = self.regs.r[rn].wrapping_add(imm8 << 2);
-            bus.write32(addr, self.regs.r[rt], self.core_id);
+            self.bus_write32(addr, self.regs.r[rt], bus);
             self.regs.r[rd] = 0; // success
             return 2;
         }
@@ -758,11 +758,11 @@ impl CortexM33 {
 
         bus.set_burst_mode();
         if load {
-            self.regs.r[rt] = bus.read32(addr, self.core_id);
-            self.regs.r[rt2] = bus.read32(addr.wrapping_add(4), self.core_id);
+            self.regs.r[rt] = self.bus_read32(addr, bus);
+            self.regs.r[rt2] = self.bus_read32(addr.wrapping_add(4), bus);
         } else {
-            bus.write32(addr, self.regs.r[rt], self.core_id);
-            bus.write32(addr.wrapping_add(4), self.regs.r[rt2], self.core_id);
+            self.bus_write32(addr, self.regs.r[rt], bus);
+            self.bus_write32(addr.wrapping_add(4), self.regs.r[rt2], bus);
         }
         bus.clear_burst_mode();
 

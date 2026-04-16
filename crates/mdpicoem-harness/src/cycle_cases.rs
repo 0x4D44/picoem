@@ -778,10 +778,13 @@ pub fn fresh_emulator(seq_bytes: &[u8]) -> Emulator {
         emu.bus.write32(CYCLE_MAILBOX_BASE + off, 0, 0);
     }
 
-    let demcr = emu.bus.read32(DEMCR, 0);
-    emu.bus.write32(DEMCR, demcr | TRCENA, 0);
-    let ctrl = emu.bus.read32(DWT_CTRL, 0);
-    emu.bus.write32(DWT_CTRL, ctrl | CYCCNTENA, 0);
+    // DEMCR + DWT_CTRL live in the PPB region. Phase 0b.1 Commit B
+    // moved the per-core PPB onto CortexM33; `Emulator::mmio_read32` /
+    // `mmio_write32` intercept PPB addresses and route to core 0's PPB.
+    let demcr = emu.mmio_read32(DEMCR);
+    emu.mmio_write32(DEMCR, demcr | TRCENA);
+    let ctrl = emu.mmio_read32(DWT_CTRL);
+    emu.mmio_write32(DWT_CTRL, ctrl | CYCCNTENA);
 
     emu.cores[0].wake();
     emu.cores[0].regs.set_pc(STUB_START);

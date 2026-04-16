@@ -5409,7 +5409,8 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
 
     // Enable FPU in CPACR (CP10/11 full access). The emulator defaults this,
     // but be explicit so this test validates the mechanism for future use.
-    shared_bus.write32(0xE000_ED88, 0x00F0_0000, 0);
+    // Phase 0b.1 Commit B: CPACR lives on `CortexM33.ppb`, not the Bus.
+    core.ppb.cpacr |= 0x00F0_0000;
 
     // Write float preconditions to scratch memory:
     //   scratch+0: 1.5f32

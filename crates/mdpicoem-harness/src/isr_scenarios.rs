@@ -1734,15 +1734,10 @@ fn run_one_scenario(
     let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
     emu.core_mut(1).halt();
 
-    // Pin bus.active_core to core 0 before any harness MMIO. The PPB
-    // state (SCB, NVIC, SysTick, FPCCR, MPU, fault regs) is per-core;
-    // `Emulator::mmio_{read,write}32` dispatches via `bus.active_core`,
-    // which only gets refreshed inside the `step()` loop. A fresh
-    // emulator defaults to 0, but we set it explicitly so later code
-    // (e.g. post-step observable reads) that expects core 0 state
-    // doesn't accidentally hit core 1's PPB. Core 1 is halted for the
-    // entire scenario, so there is no contention.
-    emu.bus.set_active_core(0);
+    // Phase 0b.1 Commit B: per-core PPB (SCB, NVIC, SysTick, FPCCR,
+    // MPU, fault regs) lives on CortexM33 now; `Emulator::mmio_*` route
+    // PPB addresses to core 0's PPB directly, so no `set_active_core`
+    // bookkeeping is needed. Core 1 is halted for the entire scenario.
 
     // Upload image via poke (word-aligned) to avoid byte-by-byte
     // overhead. The image is always a multiple of 4 bytes.
@@ -1808,14 +1803,10 @@ fn run_one_scenario(
     // MSP unchanged).
     emu.core_mut(0).halt();
 
-    // Restore `bus.active_core` to 0 before reading observables. The
-    // `step()` loop iterates both cores and leaves `active_core` at
-    // whichever core ran last (core 1 for two-iteration quanta, even
-    // though its inner loop was a no-op because it's halted). PPB
-    // observables (FPCCR, SysTick regs) must route to core 0 where the
-    // scenario actually executed — otherwise `mmio_read32(FPCCR_ADDR)`
-    // returns core 1's untouched default and falsely diffs against HW.
-    emu.bus.set_active_core(0);
+    // Phase 0b.1 Commit B: `Emulator::mmio_read32` routes PPB addresses
+    // directly to `self.cores[0].ppb`; no `set_active_core` rewind is
+    // needed. Core 0 is where the scenario executed; observables read
+    // from core 0's PPB.
 
     let emu_msp = emu.core(0).regs.msp;
     let emu_obs: Vec<u32> = sc

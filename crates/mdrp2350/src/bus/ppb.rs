@@ -653,13 +653,27 @@ impl Ppb {
     }
 
     /// Mark an external IRQ as pending in NVIC_ISPR. No-op if the IRQ
-    /// exceeds the implemented count.
+    /// exceeds the implemented count. Unit-test helper; release paths
+    /// set NVIC_ISPR via [`Self::merge_irq_pending`] or direct MMIO
+    /// writes going through `CortexM33::bus_write32`.
+    #[allow(dead_code)]
     pub(crate) fn set_irq_pending(&mut self, irq: u32) {
         if irq < crate::irq::IRQ_COUNT {
             let word = (irq / 32) as usize;
             let bit = irq % 32;
             self.nvic_ispr[word] |= 1u32 << bit;
         }
+    }
+
+    /// Union a 64-bit peripheral IRQ-pending bitmap into `nvic_ispr`.
+    /// Phase 0b.1 Commit B: called by the scheduler + step-path when
+    /// `bus.irq_pending_dirty[core]` signals a peripheral has asserted
+    /// a new IRQ. Uses `|=` so firmware self-pends already present in
+    /// `nvic_ispr` survive — the dispatch path clears bits on its own
+    /// (dual-clear invariant at `exceptions.rs` `try_take_any_pending_exception`).
+    pub(crate) fn merge_irq_pending(&mut self, pending: u64) {
+        self.nvic_ispr[0] |= pending as u32;
+        self.nvic_ispr[1] |= (pending >> 32) as u32;
     }
 
     /// Clear an external IRQ's pending bit. Phase 1 drain-loop callers

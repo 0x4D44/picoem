@@ -782,10 +782,11 @@ fn enc_dcp_cdp(opc1: u16, opc2: u16, crd: u16, crn: u16, crm: u16) -> (u16, u16)
     (hw0, hw1)
 }
 
-/// Enable a coprocessor in CPACR for core 0. Needed before any CP op.
-fn enable_cp(bus: &mut Bus, coproc: u8) {
-    let core = bus.active_core();
-    bus.ppb[core].cpacr |= 0x3 << (coproc as u32 * 2);
+/// Enable a coprocessor in CPACR. Phase 0b.1 Commit B moved the per-core
+/// PPB onto `CortexM33.ppb`; the public API exposes CPACR via the
+/// `enable_coprocessor` helper on CortexM33.
+fn enable_cp(cpu: &mut CortexM33, coproc: u8) {
+    cpu.enable_coprocessor(coproc);
 }
 
 struct DcpDiscrepancy {
@@ -821,7 +822,7 @@ fn run_dcp_single(op: DcpOp, a: f64, b: f64) -> Option<DcpDiscrepancy> {
     // Emulator side — load a, b into d[0], d[1]; execute into d[2].
     let mut emu = CortexM33::new();
     let mut bus = Bus::default();
-    enable_cp(&mut bus, 4);
+    enable_cp(&mut emu, 4);
     emu.dcp_set_double(0, a);
     if op.arity() >= 2 {
         emu.dcp_set_double(1, b);

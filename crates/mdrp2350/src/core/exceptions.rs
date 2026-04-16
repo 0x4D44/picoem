@@ -102,13 +102,12 @@ impl CortexM33 {
         // (the violation is not attributable to FP context).
         let limit = if use_psp { self.regs.psplim } else { self.regs.msplim };
         if frame_sp < limit {
-            let core = bus.active_core();
             if had_fp && aligned_sp.wrapping_sub(basic_frame) >= limit {
                 // Basic frame alone would fit; the FP region drove the
                 // underflow → SPLIMVIOL attributable to FP.
-                bus.ppb[core].fpccr |= FPCCR_SPLIMVIOL;
+                self.ppb.fpccr |= FPCCR_SPLIMVIOL;
             }
-            bus.ppb[core].cfsr |= UFSR_STKOF;
+            self.ppb.cfsr |= UFSR_STKOF;
             self.pending_fault = Some(Fault::UsageFault);
             return 0;
         }
@@ -123,49 +122,48 @@ impl CortexM33 {
         }
 
         // Push exception frame: R0, R1, R2, R3, R12, LR, ReturnAddress, xPSR
-        bus.write32(frame_sp, self.regs.r[0], self.core_id);
-        bus.write32(frame_sp.wrapping_add(4), self.regs.r[1], self.core_id);
-        bus.write32(frame_sp.wrapping_add(8), self.regs.r[2], self.core_id);
-        bus.write32(frame_sp.wrapping_add(12), self.regs.r[3], self.core_id);
-        bus.write32(frame_sp.wrapping_add(16), self.regs.r[12], self.core_id);
-        bus.write32(frame_sp.wrapping_add(20), self.regs.lr(), self.core_id);
-        bus.write32(frame_sp.wrapping_add(24), self.return_address(exc_num), self.core_id);
-        bus.write32(frame_sp.wrapping_add(28), stacked_xpsr, self.core_id);
+        self.bus_write32(frame_sp, self.regs.r[0], bus);
+        self.bus_write32(frame_sp.wrapping_add(4), self.regs.r[1], bus);
+        self.bus_write32(frame_sp.wrapping_add(8), self.regs.r[2], bus);
+        self.bus_write32(frame_sp.wrapping_add(12), self.regs.r[3], bus);
+        self.bus_write32(frame_sp.wrapping_add(16), self.regs.r[12], bus);
+        self.bus_write32(frame_sp.wrapping_add(20), self.regs.lr(), bus);
+        self.bus_write32(frame_sp.wrapping_add(24), self.return_address(exc_num), bus);
+        self.bus_write32(frame_sp.wrapping_add(28), stacked_xpsr, bus);
 
         // FP context — eager (LSPEN=0) writes S0-S15 + FPSCR now; lazy
         // (LSPEN=1, default) reserves the slots and sets FPCCR.LSPACT
         // so the first FP op in handler mode performs the flush.
         if had_fp {
             let fp_region_sp = frame_sp.wrapping_add(basic_frame);
-            let core = bus.active_core();
-            let lspen = bus.ppb[core].fpccr & FPCCR_LSPEN != 0;
+            let lspen = self.ppb.fpccr & FPCCR_LSPEN != 0;
             // Always record FPCAR — needed by lazy path and by the
             // exit-pop path when LSPACT is cleared.
-            bus.ppb[core].fpcar = fp_region_sp;
+            self.ppb.fpcar = fp_region_sp;
             if lspen {
                 // Lazy: do not write S0-S15. Mark LSPACT so the first
                 // in-handler FP op flushes; clear any stale RDY bits we
                 // leave behind from a prior fault.
-                bus.ppb[core].fpccr |= FPCCR_LSPACT;
-                bus.ppb[core].fpccr &= !(FPCCR_MMRDY | FPCCR_BFRDY);
+                self.ppb.fpccr |= FPCCR_LSPACT;
+                self.ppb.fpccr &= !(FPCCR_MMRDY | FPCCR_BFRDY);
             } else {
                 // Eager: write S0-S15 + FPSCR + reserved word. Layout
                 // per DDI0553 §B3.4.3 ExceptionEntry pseudocode.
                 for i in 0..16 {
-                    bus.write32(
+                    self.bus_write32(
                         fp_region_sp.wrapping_add((i as u32) * 4),
                         self.regs.s[i].to_bits(),
-                        self.core_id,
+                        bus,
                     );
                 }
-                bus.write32(fp_region_sp.wrapping_add(64), self.regs.fpscr, self.core_id);
-                bus.write32(fp_region_sp.wrapping_add(68), 0, self.core_id);
+                self.bus_write32(fp_region_sp.wrapping_add(64), self.regs.fpscr, bus);
+                self.bus_write32(fp_region_sp.wrapping_add(68), 0, bus);
             }
             // Reset FPSCR from FPDSCR active bits: AHP[26], DN[25],
             // FZ[24], RMODE[23:22] (DDI0553 §B3.4.3). Cumulative
             // exception flags are NOT cleared by exception entry.
             let fpdscr_mask: u32 = (1 << 26) | (1 << 25) | (1 << 24) | (0b11 << 22);
-            let fpdscr = bus.ppb[core].fpdscr & fpdscr_mask;
+            let fpdscr = self.ppb.fpdscr & fpdscr_mask;
             self.regs.fpscr = (self.regs.fpscr & !fpdscr_mask) | fpdscr;
         }
 
@@ -191,8 +189,8 @@ impl CortexM33 {
         };
 
         // Fetch vector from table
-        let vtor = bus.ppb[bus.active_core()].vtor;
-        let vector = bus.read32(vtor.wrapping_add((exc_num as u32) * 4), self.core_id);
+        let vtor = self.ppb.vtor;
+        let vector = self.bus_read32(vtor.wrapping_add((exc_num as u32) * 4), bus);
         self.regs.set_pc(vector & !1);
 
         // Enter handler mode: set IPSR, force MSP, clear IT.
@@ -243,18 +241,17 @@ impl CortexM33 {
         // handler bug; a silent clear would mask it and allow a stale-FPCAR
         // flush to corrupt memory on the next FP op.
         {
-            let core = bus.active_core();
-            let fpccr = bus.ppb[core].fpccr;
+            let fpccr = self.ppb.fpccr;
             let lspact = fpccr & FPCCR_LSPACT != 0;
             let bogus = if had_fp_frame {
                 // Case 1: FType=0 but nothing reserved.
-                !lspact && bus.ppb[core].fpcar == 0
+                !lspact && self.ppb.fpcar == 0
             } else {
                 // Case 2: FType=1 but a lazy reservation is outstanding.
                 lspact
             };
             if bogus {
-                bus.ppb[core].cfsr |= UFSR_INVPC;
+                self.ppb.cfsr |= UFSR_INVPC;
                 self.pending_fault = Some(Fault::UsageFault);
                 return 0;
             }
@@ -263,14 +260,14 @@ impl CortexM33 {
         let sp = if return_to_psp { self.regs.psp } else { self.regs.msp };
 
         // Pop basic frame
-        self.regs.r[0] = bus.read32(sp, self.core_id);
-        self.regs.r[1] = bus.read32(sp.wrapping_add(4), self.core_id);
-        self.regs.r[2] = bus.read32(sp.wrapping_add(8), self.core_id);
-        self.regs.r[3] = bus.read32(sp.wrapping_add(12), self.core_id);
-        self.regs.r[12] = bus.read32(sp.wrapping_add(16), self.core_id);
-        self.regs.r[14] = bus.read32(sp.wrapping_add(20), self.core_id);
-        let return_pc = bus.read32(sp.wrapping_add(24), self.core_id);
-        let return_xpsr = bus.read32(sp.wrapping_add(28), self.core_id);
+        self.regs.r[0] = self.bus_read32(sp, bus);
+        self.regs.r[1] = self.bus_read32(sp.wrapping_add(4), bus);
+        self.regs.r[2] = self.bus_read32(sp.wrapping_add(8), bus);
+        self.regs.r[3] = self.bus_read32(sp.wrapping_add(12), bus);
+        self.regs.r[12] = self.bus_read32(sp.wrapping_add(16), bus);
+        self.regs.r[14] = self.bus_read32(sp.wrapping_add(20), bus);
+        let return_pc = self.bus_read32(sp.wrapping_add(24), bus);
+        let return_xpsr = self.bus_read32(sp.wrapping_add(28), bus);
 
         self.regs.set_pc(return_pc & !1);
 
@@ -282,17 +279,16 @@ impl CortexM33 {
         //   LSPACT=0 → an FP op in the handler triggered the lazy flush,
         //              or eager mode wrote the frame. Pop S0-S15 + FPSCR.
         if had_fp_frame {
-            let core = bus.active_core();
             let fp_region_sp = sp.wrapping_add(32);
-            let lspact = bus.ppb[core].fpccr & FPCCR_LSPACT != 0;
+            let lspact = self.ppb.fpccr & FPCCR_LSPACT != 0;
             if lspact {
-                bus.ppb[core].fpccr &= !FPCCR_LSPACT;
+                self.ppb.fpccr &= !FPCCR_LSPACT;
             } else {
                 for i in 0..16 {
-                    let bits = bus.read32(fp_region_sp.wrapping_add((i as u32) * 4), self.core_id);
+                    let bits = self.bus_read32(fp_region_sp.wrapping_add((i as u32) * 4), bus);
                     self.regs.s[i] = f32::from_bits(bits);
                 }
-                self.regs.fpscr = bus.read32(fp_region_sp.wrapping_add(64), self.core_id);
+                self.regs.fpscr = self.bus_read32(fp_region_sp.wrapping_add(64), bus);
             }
         }
 
@@ -327,7 +323,7 @@ impl CortexM33 {
         self.regs.sync_sp_from_banked();
 
         // Clear active exception
-        bus.ppb[bus.active_core()].clear_active(active_exc as u16);
+        self.ppb.clear_active(active_exc as u16);
 
         12
     }
@@ -348,7 +344,7 @@ impl CortexM33 {
     ///
     /// The lowest (most restrictive in architectural terms, numerically
     /// smallest) of these wins.
-    pub(crate) fn execution_priority(&self, bus: &Bus) -> i16 {
+    pub(crate) fn execution_priority(&self) -> i16 {
         let mut prio: i16 = 256;
         if self.regs.faultmask & 1 != 0 {
             prio = -1;
@@ -371,7 +367,7 @@ impl CortexM33 {
 
         let ipsr = self.regs.ipsr();
         if ipsr > 0 {
-            let exc_prio = bus.ppb[bus.active_core()].exception_priority(ipsr as u16);
+            let exc_prio = self.ppb.exception_priority(ipsr as u16);
             if exc_prio < prio {
                 prio = exc_prio;
             }
@@ -384,9 +380,9 @@ impl CortexM33 {
     /// arbitration path and by tests that probe architectural priority
     /// behaviour (BASEPRI / PRIMASK / FAULTMASK / active-exception
     /// interactions).
-    pub(crate) fn can_preempt(&self, exc_num: u16, bus: &Bus) -> bool {
-        let exc_prio = bus.ppb[bus.active_core()].exception_priority(exc_num);
-        exc_prio < self.execution_priority(bus)
+    pub(crate) fn can_preempt(&self, exc_num: u16) -> bool {
+        let exc_prio = self.ppb.exception_priority(exc_num);
+        exc_prio < self.execution_priority()
     }
 
     /// Attempt to take the highest-priority pending exception at this
@@ -405,13 +401,12 @@ impl CortexM33 {
     /// every other candidate goes through `can_preempt` so PRIMASK /
     /// BASEPRI / FAULTMASK / active-exception priority all apply.
     pub(crate) fn try_take_any_pending_exception(&mut self, bus: &mut Bus) -> Option<u32> {
-        let core = bus.active_core();
-        let icsr = bus.ppb[core].icsr;
+        let icsr = self.ppb.icsr;
 
         // NMI (exc 2, priority -2): non-maskable, highest fixed priority.
         // No preempt check — NMI preempts unconditionally per ARMv8-M.
         if icsr & crate::bus::ppb::ICSR_NMIPENDSET != 0 {
-            bus.ppb[core].icsr &= !crate::bus::ppb::ICSR_NMIPENDSET;
+            self.ppb.icsr &= !crate::bus::ppb::ICSR_NMIPENDSET;
             return Some(self.enter_exception(2, bus));
         }
 
@@ -421,20 +416,19 @@ impl CortexM33 {
         let mut best: Option<(i16, u16)> = None;
         let pendsv = icsr & crate::bus::ppb::ICSR_PENDSVSET != 0;
         let pendst = icsr & crate::bus::ppb::ICSR_PENDSTSET != 0;
-        let ppb = &bus.ppb[core];
         if pendsv {
-            best = Some((ppb.exception_priority(14), 14));
+            best = Some((self.ppb.exception_priority(14), 14));
         }
         if pendst {
-            let prio = ppb.exception_priority(15);
+            let prio = self.ppb.exception_priority(15);
             best = match best {
                 None => Some((prio, 15)),
                 Some((bp, be)) if prio < bp || (prio == bp && 15 < be) => Some((prio, 15)),
                 other => other,
             };
         }
-        if let Some(ext_exc) = ppb.highest_priority_pending_irq() {
-            let prio = ppb.exception_priority(ext_exc);
+        if let Some(ext_exc) = self.ppb.highest_priority_pending_irq() {
+            let prio = self.ppb.exception_priority(ext_exc);
             best = match best {
                 None => Some((prio, ext_exc)),
                 Some((bp, be)) if prio < bp || (prio == bp && ext_exc < be) => Some((prio, ext_exc)),
@@ -443,32 +437,46 @@ impl CortexM33 {
         }
 
         let (_, candidate) = best?;
-        if !self.can_preempt(candidate, bus) {
+        if !self.can_preempt(candidate) {
             return None;
         }
 
         // Dispatch-path cleanup differs by exception class: ICSR SET bits
         // for system exceptions, NVIC_ISPR + IABR for external IRQs.
+        //
+        // ***DUAL-CLEAR INVARIANT (Phase 0b.1 Commit B)***
+        //
+        // For external IRQs, we clear BOTH `bus.irq_pending[core]` (the
+        // peripheral-facing short-circuit mask used to gate the NVIC
+        // walk on the common no-IRQ path) AND `self.ppb.nvic_ispr[word]`
+        // (the architectural latch). Keeping these in lockstep is what
+        // makes the `merge_irq_pending` union-merge safe: a stale clear
+        // in one without the other would either cause a silent no-fire
+        // (clear nvic_ispr but leave irq_pending set → union re-pends
+        // it on the next step) or an untracked fire (clear irq_pending
+        // but leave nvic_ispr set → short-circuit gate opens while
+        // latch still drives). Do not change this without re-checking
+        // `Bus::assert_irq_core/shared`, `Bus::clear_irq_core/shared`,
+        // `CortexM33::sync_nvic_to_irq_pending`, and the
+        // `irq_pending_dirty` merge points in `step`/`Emulator::step`.
         match candidate {
             14 => {
-                bus.ppb[core].icsr &= !crate::bus::ppb::ICSR_PENDSVSET;
+                self.ppb.icsr &= !crate::bus::ppb::ICSR_PENDSVSET;
             }
             15 => {
-                bus.ppb[core].icsr &= !crate::bus::ppb::ICSR_PENDSTSET;
+                self.ppb.icsr &= !crate::bus::ppb::ICSR_PENDSTSET;
             }
             _ => {
-                // External IRQ. Clear the pending bit on both the
-                // `irq_pending` mask (step-path short-circuit gate) and
-                // the NVIC_ISPR word (architectural latch), then flip
-                // NVIC_IABR to reflect the active handler.
+                // External IRQ. See DUAL-CLEAR INVARIANT above.
                 let irq = candidate - 16;
                 let word = (irq / 32) as usize;
                 let bit = irq % 32;
                 if word < crate::bus::ppb::NVIC_BIT_WORDS {
+                    let core = self.core_id as usize;
                     bus.irq_pending[core] &= !(1u64 << irq);
-                    bus.ppb[core].nvic_ispr[word] &= !(1u32 << bit);
+                    self.ppb.nvic_ispr[word] &= !(1u32 << bit);
                 }
-                bus.ppb[core].set_irq_active(irq as u32);
+                self.ppb.set_irq_active(irq as u32);
             }
         }
         Some(self.enter_exception(candidate, bus))
@@ -478,28 +486,27 @@ impl CortexM33 {
 
     /// Deliver a pending fault. Returns cycle cost.
     pub(crate) fn deliver_fault(&mut self, fault: Fault, bus: &mut Bus) -> u32 {
-        let core = bus.active_core();
         match fault {
             Fault::UsageFault => {
                 // Set UFSR.UNDEFINSTR (bit 16 of CFSR)
-                bus.ppb[core].cfsr |= 1 << 16;
-                if bus.ppb[core].shcsr & (1 << 18) != 0 {
+                self.ppb.cfsr |= 1 << 16;
+                if self.ppb.shcsr & (1 << 18) != 0 {
                     // USGFAULTENA
                     self.enter_exception(6, bus)
                 } else {
-                    bus.ppb[bus.active_core()].hfsr |= 1 << 30; // FORCED
+                    self.ppb.hfsr |= 1 << 30; // FORCED
                     self.enter_exception(3, bus) // escalate to HardFault
                 }
             }
             Fault::MemManage => {
                 // Set MMFSR.DACCVIOL (bit 1 of CFSR). Data-side is the honest default:
                 // Phase 7 Stage E's MPU-fault-during-lazy-flush use case is data-side.
-                bus.ppb[core].cfsr |= 1 << 1;
-                if bus.ppb[core].shcsr & (1 << 16) != 0 {
+                self.ppb.cfsr |= 1 << 1;
+                if self.ppb.shcsr & (1 << 16) != 0 {
                     // MEMFAULTENA
                     self.enter_exception(4, bus)
                 } else {
-                    bus.ppb[bus.active_core()].hfsr |= 1 << 30; // FORCED
+                    self.ppb.hfsr |= 1 << 30; // FORCED
                     self.enter_exception(3, bus) // escalate to HardFault
                 }
             }
@@ -520,7 +527,7 @@ impl CortexM33 {
                 let ipsr = self.regs.ipsr();
                 if ipsr == 2 {
                     // NMI-in-NMI — cannot preempt itself. Escalate to HardFault.
-                    bus.ppb[bus.active_core()].hfsr |= 1 << 30; // FORCED
+                    self.ppb.hfsr |= 1 << 30; // FORCED
                     self.enter_exception(3, bus)
                 } else {
                     self.enter_exception(2, bus)
@@ -546,8 +553,8 @@ impl CortexM33 {
     ///   [22]    S  — Secure
     ///   [23]    IRVALID — IDAU region valid
     ///   [25]    RP2350 IDAU exempt flag
-    pub(crate) fn execute_tt(addr: u32, bus: &Bus) -> u32 {
-        let ppb = &bus.ppb[bus.active_core()];
+    pub(crate) fn execute_tt(&self, addr: u32) -> u32 {
+        let ppb = &self.ppb;
 
         // RP2350 IDAU: built-in security attribution for the address space.
         let idau_result = Self::rp2350_idau(addr);
@@ -713,9 +720,9 @@ mod tests {
 
         // Relocate VTOR into writable SRAM and populate vectors for the
         // exceptions exercised by these tests: NMI (2), HardFault (3),
-        // MemManage (4).
-        let core = bus.active_core();
-        bus.ppb[core].vtor = VT_BASE;
+        // MemManage (4). Phase 0b.1 Commit B: per-core PPB now lives on
+        // `CortexM33`, so VTOR is set on `cpu.ppb`.
+        cpu.ppb.vtor = VT_BASE;
         bus.write32(VT_BASE + 8,  HANDLER_VEC, 0); // NMI       (exc 2)
         bus.write32(VT_BASE + 12, HANDLER_VEC, 0); // HardFault (exc 3)
         bus.write32(VT_BASE + 16, HANDLER_VEC, 0); // MemManage (exc 4)
@@ -740,7 +747,7 @@ mod tests {
     #[test]
     fn test_memmanage_enabled() {
         let (mut cpu, mut bus) = core_and_bus();
-        bus.ppb[0].shcsr |= 1 << 16; // MEMFAULTENA
+        cpu.ppb.shcsr |= 1 << 16; // MEMFAULTENA
         cpu.pending_fault = Some(Fault::MemManage);
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.ipsr(), 4);
@@ -750,21 +757,21 @@ mod tests {
     #[test]
     fn test_memmanage_disabled_escalates() {
         let (mut cpu, mut bus) = core_and_bus();
-        bus.ppb[0].shcsr &= !(1 << 16); // MEMFAULTENA cleared
+        cpu.ppb.shcsr &= !(1 << 16); // MEMFAULTENA cleared
         cpu.pending_fault = Some(Fault::MemManage);
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.ipsr(), 3);
-        assert_ne!(bus.ppb[0].hfsr & (1 << 30), 0, "HFSR.FORCED should be set");
+        assert_ne!(cpu.ppb.hfsr & (1 << 30), 0, "HFSR.FORCED should be set");
         assert_eq!(cpu.regs.pc(), HANDLER_ADDR);
     }
 
     #[test]
     fn test_memmanage_sets_mmfsr_daccviol() {
         let (mut cpu, mut bus) = core_and_bus();
-        bus.ppb[0].shcsr |= 1 << 16; // MEMFAULTENA
+        cpu.ppb.shcsr |= 1 << 16; // MEMFAULTENA
         cpu.pending_fault = Some(Fault::MemManage);
         cpu.step(&mut bus);
-        assert_ne!(bus.ppb[0].cfsr & 0x2, 0, "MMFSR.DACCVIOL (bit 1) should be set");
+        assert_ne!(cpu.ppb.cfsr & 0x2, 0, "MMFSR.DACCVIOL (bit 1) should be set");
         // Pin this as the non-escalated path: IPSR must be MemManage (4),
         // not HardFault (3). MMFSR.DACCVIOL would also be set after
         // escalation, so asserting IPSR is what distinguishes the paths.
@@ -792,7 +799,7 @@ mod tests {
         // 3. Should have escalated to HardFault with FORCED set; NOT halted.
         assert_eq!(cpu.regs.ipsr(), 3,
             "NMI-in-NMI must escalate to HardFault (IPSR=3), got {}", cpu.regs.ipsr());
-        assert_ne!(bus.ppb[0].hfsr & (1 << 30), 0,
+        assert_ne!(cpu.ppb.hfsr & (1 << 30), 0,
             "HFSR.FORCED should be set on escalation");
         assert!(!cpu.is_halted(), "NMI-in-NMI must NOT halt the core");
         assert_eq!(cpu.regs.pc(), HANDLER_ADDR);
@@ -838,36 +845,38 @@ mod tests {
     /// disabled, `execute_tt`'s SAU-off path unconditionally returns
     /// universal R+RW (independent of MPU state), which would mask the
     /// MPU's AP restrictions we're trying to exercise.
+    ///
+    /// Phase 0b.1 Commit B: per-core MPU/SAU state lives on
+    /// `CortexM33.ppb` rather than `Bus.ppb`; helper now targets a CPU.
     fn program_mpu_region(
-        bus: &mut Bus,
+        cpu: &mut CortexM33,
         idx: usize,
         base: u32,
         limit: u32,
         ap: u32,
         enable: bool,
     ) {
-        let core = bus.active_core();
         // MPU on.
-        bus.ppb[core].mpu_ctrl |= 1;
+        cpu.ppb.mpu_ctrl |= 1;
         let rbar = (base & !0x1F) | ((ap & 0x3) << 1);
         let rlar = (limit & !0x1F) | if enable { 1 } else { 0 };
-        bus.ppb[core].mpu_regions[idx] = (rbar, rlar);
+        cpu.ppb.mpu_regions[idx] = (rbar, rlar);
 
         // SAU on with a catch-all Secure region — required to avoid the
         // SAU-disabled universal-RW fallback. Region 0 covers everything.
-        bus.ppb[core].sau_ctrl |= 1; // SAU enable
-        bus.ppb[core].sau_regions[0] = (0x0000_0000, 0xFFFF_FFE1); // full range, NSC=0, EN=1
+        cpu.ppb.sau_ctrl |= 1; // SAU enable
+        cpu.ppb.sau_regions[0] = (0x0000_0000, 0xFFFF_FFE1); // full range, NSC=0, EN=1
     }
 
     /// Region EN=0: TT must treat the region as absent — no MRVALID,
     /// no R, no RW from the MPU side.
     #[test]
     fn test_tt_mpu_disabled_region() {
-        let mut bus = Bus::default();
+        let mut cpu = CortexM33::new();
         // Program region 0 covering 0x2000_0000..0x2000_0FFF, EN=0.
-        program_mpu_region(&mut bus, 0, 0x2000_0000, 0x2000_0FFF, 0, false);
+        program_mpu_region(&mut cpu, 0, 0x2000_0000, 0x2000_0FFF, 0, false);
 
-        let r = CortexM33::execute_tt(0x2000_0400, &bus);
+        let r = cpu.execute_tt(0x2000_0400);
         assert_eq!(r & (1 << 16), 0, "MRVALID must be 0 for disabled region");
         // Note: with MPU enabled but no match, execute_tt falls back to
         // universal R/RW — that's independent of the disabled-region
@@ -877,11 +886,11 @@ mod tests {
     /// AP[2:1] = 00 (RW for privileged): TT must return R=1 and RW=1.
     #[test]
     fn test_tt_mpu_rw_access() {
-        let mut bus = Bus::default();
+        let mut cpu = CortexM33::new();
         // Region 2, AP=0 (RW), enabled.
-        program_mpu_region(&mut bus, 2, 0x2000_0000, 0x2000_0FFF, 0, true);
+        program_mpu_region(&mut cpu, 2, 0x2000_0000, 0x2000_0FFF, 0, true);
 
-        let r = CortexM33::execute_tt(0x2000_0080, &bus);
+        let r = cpu.execute_tt(0x2000_0080);
         assert_ne!(r & (1 << 16), 0, "MRVALID must be set when region matches");
         assert_ne!(r & (1 << 18), 0, "R must be set for RW region");
         assert_ne!(r & (1 << 19), 0, "RW must be set for AP=00 (read-write)");
@@ -891,11 +900,11 @@ mod tests {
     /// AP[2:1] = 10 (RO): TT must return R=1 but RW=0.
     #[test]
     fn test_tt_mpu_ro_access() {
-        let mut bus = Bus::default();
+        let mut cpu = CortexM33::new();
         // Region 5, AP=2 (RO), enabled.
-        program_mpu_region(&mut bus, 5, 0x2000_1000, 0x2000_1FFF, 2, true);
+        program_mpu_region(&mut cpu, 5, 0x2000_1000, 0x2000_1FFF, 2, true);
 
-        let r = CortexM33::execute_tt(0x2000_1500, &bus);
+        let r = cpu.execute_tt(0x2000_1500);
         assert_ne!(r & (1 << 16), 0, "MRVALID must be set for RO region");
         assert_ne!(r & (1 << 18), 0, "R must be set for RO region");
         assert_eq!(r & (1 << 19), 0, "RW must be clear for AP=10 (read-only)");
@@ -908,15 +917,15 @@ mod tests {
     /// — the bootrom's MPU self-test assumes first-match semantics.
     #[test]
     fn test_tt_mpu_overlapping_regions_first_match() {
-        let mut bus = Bus::default();
+        let mut cpu = CortexM33::new();
         // Region 1: AP=0 (RW), covers 0x2000_0000..0x2000_1FFF.
-        program_mpu_region(&mut bus, 1, 0x2000_0000, 0x2000_1FFF, 0, true);
+        program_mpu_region(&mut cpu, 1, 0x2000_0000, 0x2000_1FFF, 0, true);
         // Region 7: AP=2 (RO), covers 0x2000_0000..0x2000_0FFF — overlaps
         // the low half of region 1. First-match-wins means region 1 is
         // returned, with RW still set.
-        program_mpu_region(&mut bus, 7, 0x2000_0000, 0x2000_0FFF, 2, true);
+        program_mpu_region(&mut cpu, 7, 0x2000_0000, 0x2000_0FFF, 2, true);
 
-        let r = CortexM33::execute_tt(0x2000_0400, &bus);
+        let r = cpu.execute_tt(0x2000_0400);
         assert_eq!(
             r & 0xFF,
             1,
