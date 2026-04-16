@@ -72,6 +72,34 @@ pub struct StateMachine {
     /// to confirm the IN PINS → autopush → RX FIFO chain reaches the
     /// firmware. Pure observation — never read by execution logic.
     pub autopush_count: u64,
+
+    /// Diagnostic mirror of the ISR word at the moment of the most
+    /// recent successful autopush. Updated in the autopush branch only
+    /// (paired with `autopush_count`); explicit `PUSH` instructions do
+    /// not touch this field. Used by the PicoGUS capture-coverage
+    /// diagnostic to decode the pushed `(addr, data)` against the fired
+    /// event and attribute captured vs misattributed. Pure observation.
+    pub last_autopush_word: u32,
+
+    /// Diagnostic per-PC execution counters (one entry per 5-bit PC
+    /// value). Incremented when an instruction fetched from
+    /// `instr_mem[pc]` actually executes without stalling. Forced
+    /// executions via `SMn_INSTR` (`pending_exec`) are excluded — they
+    /// don't correspond to PC-driven control flow. Used by the PicoGUS
+    /// PSRAM SPI debug to confirm the wrap loop visits each slot. Pure
+    /// observation.
+    pub pc_visits: [u64; 32],
+
+    /// Diagnostic — count of PIO clock cycles where this SM was stalled
+    /// (any `StallKind`), i.e. the `check_stall` → `still_stalled`
+    /// early-return path in `execute_cycle`. Pure observation. Useful
+    /// when paired with `pc_visits` to distinguish "SM made no progress
+    /// because it was stalled" from "SM never reached that PC".
+    pub stall_cycles: u64,
+
+    /// Diagnostic — subset of `stall_cycles` where the stalled PC equals
+    /// 0x19 (the PicoGUS PSRAM SPI `OUT PINS,1` slot). Pure observation.
+    pub cycles_stalled_at_pc_0x19: u64,
 }
 
 /// Tracks what kind of stall we're in, so re-evaluation knows what to check.
@@ -119,6 +147,10 @@ impl StateMachine {
             sideset_pins: u32::MAX,
             sideset_dirs: 0,
             autopush_count: 0,
+            last_autopush_word: 0,
+            pc_visits: [0; 32],
+            stall_cycles: 0,
+            cycles_stalled_at_pc_0x19: 0,
         }
     }
 
@@ -168,6 +200,55 @@ impl StateMachine {
     /// `PioBlock::rx_dreq`.
     pub fn rx_fifo_empty(&self) -> bool {
         self.rx_fifo.is_empty()
+    }
+
+    /// Diagnostic: number of successful TX FIFO pushes (FIFO had room).
+    /// Pure observation; never read by execution. Surfaced by the
+    /// PicoGUS DMA-dispatch diagnostic to confirm DMA→TXF actually
+    /// landed bytes vs hit a full FIFO.
+    pub fn tx_push_success(&self) -> u64 {
+        self.tx_fifo.push_success
+    }
+
+    /// Diagnostic: number of TX FIFO pushes that hit a full FIFO and
+    /// silently dropped the value. Non-zero indicates the SM didn't
+    /// drain fast enough OR DREQ throttling failed upstream.
+    pub fn tx_push_drop(&self) -> u64 {
+        self.tx_fifo.push_drop
+    }
+
+    /// Diagnostic: number of successful RX FIFO pushes (autopush /
+    /// explicit PUSH that found room). Mirrors `tx_push_success` for
+    /// the RX direction. Catches autopush dropping on a full RX FIFO.
+    pub fn rx_push_success(&self) -> u64 {
+        self.rx_fifo.push_success
+    }
+
+    /// Diagnostic: number of RX FIFO pushes that hit a full FIFO and
+    /// silently dropped the value. Non-zero usually means the chip
+    /// side isn't draining RXF fast enough (or autopush is firing on
+    /// a stalled consumer).
+    pub fn rx_push_drop(&self) -> u64 {
+        self.rx_fifo.push_drop
+    }
+
+    /// Diagnostic: per-PC execution counter snapshot. Element `i` is the
+    /// number of times a fetched-from-`instr_mem[i]` instruction has
+    /// executed without stalling. Pure observation.
+    pub fn pc_visits(&self) -> &[u64; 32] {
+        &self.pc_visits
+    }
+
+    /// Diagnostic: total number of PIO clock cycles this SM spent
+    /// stalled (any `StallKind`). Pure observation.
+    pub fn stall_cycles(&self) -> u64 {
+        self.stall_cycles
+    }
+
+    /// Diagnostic: number of stalled PIO clock cycles observed at
+    /// PC=0x19 specifically. Pure observation.
+    pub fn cycles_stalled_at_pc_0x19(&self) -> u64 {
+        self.cycles_stalled_at_pc_0x19
     }
 
     /// Read the CLKDIV register value (int[31:16], frac[15:8]).
@@ -221,6 +302,12 @@ impl StateMachine {
         if self.stalled {
             let still_stalled = self.check_stall(irq_flags, gpio_in);
             if still_stalled {
+                // Diagnostic: bump stall-cycle counters. Pure observation.
+                self.stall_cycles = self.stall_cycles.wrapping_add(1);
+                if self.pc == 0x19 {
+                    self.cycles_stalled_at_pc_0x19 =
+                        self.cycles_stalled_at_pc_0x19.wrapping_add(1);
+                }
                 return;
             }
             self.stalled = false;
@@ -237,6 +324,11 @@ impl StateMachine {
         } else {
             (instr_mem[self.pc as usize], false)
         };
+
+        // Snapshot the fetched-from PC before execute_insn mutates
+        // self.pc (JMP / OUT PC / MOV PC set it directly). Used by the
+        // pc_visits diagnostic below.
+        let fetched_pc = self.pc;
 
         // Decode
         let decoded = decode(insn, self.pinctrl, self.execctrl);
@@ -258,6 +350,24 @@ impl StateMachine {
             self.delay_count = decoded.delay;
             if !is_forced && !pc_set {
                 self.advance_pc();
+            }
+            // Diagnostic: this instruction actually ran to completion
+            // at `fetched_pc`. Exclude forced execs (no PC fetch) and
+            // cycles that stalled mid-execute (e.g. OUT stalling on a
+            // just-emptied TX FIFO under autopull). Pure observation.
+            if !is_forced {
+                self.pc_visits[(fetched_pc as usize) & 0x1F] =
+                    self.pc_visits[(fetched_pc as usize) & 0x1F].wrapping_add(1);
+            }
+        } else {
+            // Instruction freshly stalled this cycle (e.g. WAIT with
+            // condition unmet, PULL on empty TX FIFO). Count the cycle
+            // against stall_cycles so the "cycles at PC=0x19 stalled"
+            // counter includes both re-stalls and first-stalls.
+            self.stall_cycles = self.stall_cycles.wrapping_add(1);
+            if fetched_pc == 0x19 {
+                self.cycles_stalled_at_pc_0x19 =
+                    self.cycles_stalled_at_pc_0x19.wrapping_add(1);
             }
         }
 
@@ -580,6 +690,10 @@ impl StateMachine {
             if self.isr_count >= threshold {
                 if !self.rx_fifo.is_full() {
                     self.rx_fifo.push(self.isr);
+                    // Mirror the just-pushed word for downstream
+                    // diagnostics. Paired with `autopush_count`; stays
+                    // unchanged when the FIFO is full (no bump).
+                    self.last_autopush_word = self.isr;
                     self.isr = 0;
                     self.isr_count = 0;
                     self.autopush_count = self.autopush_count.wrapping_add(1);
@@ -842,5 +956,99 @@ impl StateMachine {
         } else {
             index & 7
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `last_autopush_word` — the diagnostic mirror
+    //! paired with `autopush_count`.
+
+    use super::*;
+
+    /// Build an SM with autopush enabled at an 8-bit threshold, shifting
+    /// left (so an 8-bit IN of `value` lands as `value` in ISR bits 7..0).
+    fn autopush_sm() -> StateMachine {
+        let mut sm = StateMachine::new();
+        // SHIFTCTRL: AUTOPUSH (bit 16) + PUSH_THRESH = 8 (bits 24..20)
+        // + IN_SHIFTDIR = left (bit 18 = 0). Leave OUT_SHIFTDIR at its
+        // reset value (bit 19 still cleared here — the tests don't OUT).
+        sm.shiftctrl = (1u32 << 16) | (8u32 << 20);
+        sm
+    }
+
+    #[test]
+    fn last_autopush_word_tracks_last_autopushed_isr() {
+        let mut sm = autopush_sm();
+        sm.x = 0xAB;
+        // IN X, 8 — shift 8 bits of X into ISR. With IN_SHIFTDIR=left,
+        // ISR becomes 0xAB; isr_count reaches 8 == push threshold and
+        // autopush fires into the empty RX FIFO.
+        sm.exec_in(1, 8, 0);
+        assert_eq!(sm.autopush_count, 1);
+        assert_eq!(sm.last_autopush_word, 0xAB);
+        // A second IN with a distinct value updates the mirror.
+        sm.x = 0xCD;
+        sm.exec_in(1, 8, 0);
+        assert_eq!(sm.autopush_count, 2);
+        assert_eq!(sm.last_autopush_word, 0xCD);
+    }
+
+    #[test]
+    fn last_autopush_word_unchanged_when_fifo_full() {
+        let mut sm = autopush_sm();
+        // Fill the 4-entry RX FIFO directly so the next autopush finds
+        // it full (matches the existing `autopush_count` semantics: no
+        // bump when the FIFO has no room).
+        for v in 0..4u32 {
+            assert!(sm.rx_fifo.push(v));
+        }
+        assert!(sm.rx_fifo.is_full());
+        let before_word = sm.last_autopush_word;
+        let before_cnt = sm.autopush_count;
+        sm.x = 0x5A;
+        sm.exec_in(1, 8, 0);
+        // autopush must not fire — ISR retains its value.
+        assert_eq!(sm.autopush_count, before_cnt);
+        assert_eq!(sm.last_autopush_word, before_word);
+        assert_eq!(sm.isr, 0x5A);
+        assert_eq!(sm.isr_count, 8);
+    }
+
+    /// pc_visits counter bumps once per completed non-stalling fetch at
+    /// the corresponding slot. Program: slot 0 = `MOV Y, Y` (no-op that
+    /// never stalls), slot 1 = `JMP 0` (unconditional, never stalls).
+    /// Executing 10 cycles with a fresh SM should visit each slot five
+    /// times (slot 0 → advance_pc → slot 1 → JMP 0 → slot 0 …).
+    #[test]
+    fn pc_visits_counter_splits_two_slot_loop() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        // Reset wrap top to 0x01 so advance_pc at slot 0 goes to slot 1
+        // (default wrap_top=0x1F, wrap_bottom=0 would also work since
+        // we JMP 0 from slot 1 — advance_pc after slot 0 just increments).
+        // Leave execctrl at default (wrap_top=0x1F, wrap_bottom=0).
+        let mut instr_mem = [0u16; 32];
+        // MOV Y, Y: opcode 101_00000_010_00010 = 0xA042
+        //   bits [15:13]=101 (MOV), [12:8]=00000 (delay/sideset=0),
+        //   [7:5]=010 (dst=Y), [4:3]=00 (op=none), [2:0]=010 (src=Y).
+        instr_mem[0] = 0xA042;
+        // JMP 0 (unconditional): 000_00000_000_00000 = 0x0000
+        instr_mem[1] = 0x0000;
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        for _ in 0..10 {
+            sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        }
+        // Ten cycles split evenly across slots 0 and 1.
+        assert_eq!(sm.pc_visits[0], 5, "slot 0 visited 5 times");
+        assert_eq!(sm.pc_visits[1], 5, "slot 1 visited 5 times");
+        // No other slots touched.
+        let other_visits: u64 = (2..32).map(|i| sm.pc_visits[i]).sum();
+        assert_eq!(other_visits, 0, "only slots 0 and 1 are visited");
+        // Neither instruction stalls, so stall_cycles should be zero.
+        assert_eq!(sm.stall_cycles, 0);
+        assert_eq!(sm.cycles_stalled_at_pc_0x19, 0);
     }
 }

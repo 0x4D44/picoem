@@ -149,6 +149,46 @@ pub struct DmaChannel {
     /// Transfer-in-progress flag. Decoupled from `ctrl` so a
     /// read-through-CTRL still surfaces the live state correctly.
     pub busy: bool,
+    // ---------------------------------------------------------------
+    // PicoGUS DMA-dispatch diagnostic counters (HLD Rev. 1 §3).
+    // Pure observation — increment beside existing logic and never
+    // feed back into control flow. All default-zero so the `Copy +
+    // Default` derive above keeps holding.
+    // ---------------------------------------------------------------
+    /// Sticky bit per PIO1 TXF target this channel has ever pointed
+    /// at. Bit N set iff a WRITE_ADDR-family write (any of the four
+    /// aliases) landed the post-alias `write_addr` in
+    /// `0x5030_0010 + N*4`, i.e. PIO1 TXF`N`.
+    pub ever_wrote_pio1_txf_mask: u8,
+    /// How many times this channel's `CTRL_TRIG` (offset 0x0C) arm
+    /// fired — the "CTRL write that triggers" idiom.
+    pub trig_ctrl: u32,
+    /// Trigger-writes via `AL1_WRITE_ADDR_TRIG` (offset 0x18).
+    pub trig_write_addr: u32,
+    /// Trigger-writes via `AL1_TRANS_COUNT` (offset 0x1C). Despite
+    /// lacking `_TRIG` in its name this alias *does* trigger — the
+    /// Phase-D bug the diagnostic is meant to surface.
+    pub trig_trans_count: u32,
+    /// Trigger-writes via `AL2_TRANS_COUNT_TRIG` (offset 0x24). Kept
+    /// distinct from `trig_trans_count` because the two share a
+    /// match arm in `channel_write32` but mean different things.
+    pub trig_al2_trans: u32,
+    /// Trigger-writes via `AL3_READ_ADDR_TRIG` (offset 0x3C).
+    pub trig_al3_read_addr: u32,
+    /// Trigger-writes via `MULTI_CHAN_TRIGGER` with this channel's
+    /// bit set. Increments even when `CTRL.EN=0` (captures firmware
+    /// intent).
+    pub trig_multi: u32,
+    /// Monotonic count of bus transfers issued for this channel
+    /// (bumped at the top of `issue_transfer`).
+    pub transfers_issued: u64,
+    /// Sticky bitmap of TREQ indices for which this channel was
+    /// `ready` at least once inside `Dma::tick`. Bit 63 is the
+    /// `DREQ_FORCE` alias. Non-zero means firmware's `CTRL.TREQ_SEL`
+    /// pointed at a DREQ line that the emulator asserted at least
+    /// once while this channel was armed — distinguishes "DREQ seen
+    /// but engine didn't serve" from "TREQ never asserted".
+    pub dreq_observed_mask: u64,
 }
 
 impl DmaChannel {
@@ -206,6 +246,22 @@ impl DmaChannel {
         let base = addr & !mask;
         let low = (addr.wrapping_add(size)) & mask;
         base | low
+    }
+
+    /// Diagnostic: set the sticky `ever_wrote_pio1_txf_mask` bit
+    /// corresponding to `addr` when it lies in the PIO1 TXF window
+    /// (`0x5030_0010..=0x5030_001C`, word-aligned, one bit per TXF). No
+    /// effect for addresses outside that window. Called on every post-
+    /// `apply_alias` `write_addr` update so AL2 (SET) / AL3 (CLR)
+    /// constructions are also captured.
+    #[inline]
+    fn mark_if_pio1_txf(&mut self, addr: u32) {
+        const PIO1_TXF_BASE: u32 = 0x5030_0010;
+        const PIO1_TXF_LAST: u32 = 0x5030_001C;
+        if addr >= PIO1_TXF_BASE && addr <= PIO1_TXF_LAST && (addr & 3) == 0 {
+            let n = ((addr - PIO1_TXF_BASE) >> 2) & 0x3;
+            self.ever_wrote_pio1_txf_mask |= 1u8 << n;
+        }
     }
 }
 
@@ -363,6 +419,11 @@ impl Dma {
                 let mask = apply_alias(0, value, alias) & 0xFFF;
                 for i in 0..NUM_CHANNELS {
                     if (mask >> i) & 1 != 0 {
+                        // Diagnostic counter bumps even when EN=0 —
+                        // captures firmware intent regardless of
+                        // whether `trigger_channel` would arm.
+                        self.channels[i].trig_multi =
+                            self.channels[i].trig_multi.wrapping_add(1);
                         self.trigger_channel(i);
                     }
                 }
@@ -416,15 +477,21 @@ impl Dma {
             CH_AL3_READ_ADDR_TRIG => {
                 let new = apply_alias(self.channels[ch_idx].read_addr, value, alias);
                 self.channels[ch_idx].read_addr = new;
+                self.channels[ch_idx].trig_al3_read_addr =
+                    self.channels[ch_idx].trig_al3_read_addr.wrapping_add(1);
                 self.trigger_channel(ch_idx);
             }
             CH_WRITE_ADDR | CH_AL2_WRITE_ADDR | CH_AL3_WRITE_ADDR => {
                 let new = apply_alias(self.channels[ch_idx].write_addr, value, alias);
                 self.channels[ch_idx].write_addr = new;
+                self.channels[ch_idx].mark_if_pio1_txf(new);
             }
             CH_AL1_WRITE_ADDR_TRIG => {
                 let new = apply_alias(self.channels[ch_idx].write_addr, value, alias);
                 self.channels[ch_idx].write_addr = new;
+                self.channels[ch_idx].mark_if_pio1_txf(new);
+                self.channels[ch_idx].trig_write_addr =
+                    self.channels[ch_idx].trig_write_addr.wrapping_add(1);
                 self.trigger_channel(ch_idx);
             }
             CH_TRANS_COUNT | CH_AL3_TRANS_COUNT => {
@@ -436,11 +503,24 @@ impl Dma {
                 let new = apply_alias(self.channels[ch_idx].trans_count, value, alias);
                 self.channels[ch_idx].trans_count = new;
                 self.channels[ch_idx].trans_count_reload = new;
+                // Split the shared arm: AL1 at 0x1C is the Phase-D
+                // "triggers-despite-no-_TRIG-in-name" alias; AL2 at 0x24
+                // is the canonical _TRIG variant. Both trigger, but we
+                // track them separately for the diagnostic.
+                if inner == CH_AL1_TRANS_COUNT {
+                    self.channels[ch_idx].trig_trans_count =
+                        self.channels[ch_idx].trig_trans_count.wrapping_add(1);
+                } else {
+                    self.channels[ch_idx].trig_al2_trans =
+                        self.channels[ch_idx].trig_al2_trans.wrapping_add(1);
+                }
                 self.trigger_channel(ch_idx);
             }
             CH_CTRL_TRIG => {
                 let new = apply_alias(self.channels[ch_idx].ctrl, value, alias);
                 self.channels[ch_idx].ctrl = new & CTRL_WRITABLE_MASK;
+                self.channels[ch_idx].trig_ctrl =
+                    self.channels[ch_idx].trig_ctrl.wrapping_add(1);
                 self.trigger_channel(ch_idx);
             }
             CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
@@ -491,8 +571,14 @@ impl Dma {
             let ready = treq == DREQ_FORCE
                 || (treq < 64 && (dreqs >> treq) & 1 != 0);
             if ready {
-                selected = Some(i);
-                break;
+                // Diagnostic: record that this channel's TREQ_SEL was
+                // satisfied at least once. Kept sticky so per-channel
+                // verdicts survive arbitration loss to a lower-indexed
+                // peer. Set before `issue_transfer` picks one.
+                self.channels[i].dreq_observed_mask |= 1u64 << treq;
+                if selected.is_none() {
+                    selected = Some(i);
+                }
             }
         }
         let Some(idx) = selected else {
@@ -502,6 +588,11 @@ impl Dma {
     }
 
     fn issue_transfer(&mut self, ch_idx: usize, bus: &mut Bus) {
+        // Diagnostic — bump before the bus access so aborts / bus faults
+        // mid-transfer still register the engine's intent. Pure
+        // observation; does not alter control flow.
+        self.channels[ch_idx].transfers_issued =
+            self.channels[ch_idx].transfers_issued.wrapping_add(1);
         let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write) = {
             let ch = &self.channels[ch_idx];
             (
@@ -1041,5 +1132,131 @@ mod tests {
         assert!(bus.dma.channel(0).busy);
         assert!(bus.dma.channel(1).busy);
         assert!(bus.dma.channel(2).busy);
+    }
+
+    // ------------------------------------------------------------
+    // PicoGUS DMA-dispatch diagnostic counters (HLD Rev. 1)
+    // ------------------------------------------------------------
+
+    #[test]
+    fn mark_if_pio1_txf_sets_bit_for_each_txf() {
+        let mut ch = DmaChannel::default();
+        ch.mark_if_pio1_txf(0x5030_0010);
+        assert_eq!(ch.ever_wrote_pio1_txf_mask, 0b0001, "TXF0 → bit 0");
+        ch.mark_if_pio1_txf(0x5030_0014);
+        assert_eq!(ch.ever_wrote_pio1_txf_mask, 0b0011, "TXF0+TXF1");
+        ch.mark_if_pio1_txf(0x5030_0018);
+        assert_eq!(ch.ever_wrote_pio1_txf_mask, 0b0111, "TXF0..2");
+        ch.mark_if_pio1_txf(0x5030_001C);
+        assert_eq!(ch.ever_wrote_pio1_txf_mask, 0b1111, "TXF0..3");
+    }
+
+    #[test]
+    fn mark_if_pio1_txf_ignores_out_of_range() {
+        let mut ch = DmaChannel::default();
+        // Just below the window and on a non-word-aligned address.
+        ch.mark_if_pio1_txf(0x5030_000F);
+        ch.mark_if_pio1_txf(0x5030_0020);
+        // Byte-misaligned inside the window — still not a TXF write.
+        ch.mark_if_pio1_txf(0x5030_0011);
+        assert_eq!(ch.ever_wrote_pio1_txf_mask, 0);
+    }
+
+    #[test]
+    fn trig_counters_bump_per_alias_write() {
+        // Exercise each trigger-alias write path and confirm the
+        // matching per-channel counter is exactly 1. The counters bump
+        // unconditionally — even when `CTRL.EN=0` — so firmware intent
+        // is still captured in bring-up traces.
+        let mut dma = Dma::new();
+
+        // AL1_WRITE_ADDR_TRIG (0x18).
+        dma.write32(CH_AL1_WRITE_ADDR_TRIG, 0x2000_0000, 0);
+        assert_eq!(dma.channel(0).trig_write_addr, 1);
+
+        // AL1_TRANS_COUNT (0x1C) — the Phase-D alias.
+        dma.write32(CH_AL1_TRANS_COUNT, 1, 0);
+        assert_eq!(dma.channel(0).trig_trans_count, 1);
+        assert_eq!(dma.channel(0).trig_al2_trans, 0, "must not cross over");
+
+        // AL2_TRANS_COUNT_TRIG (0x24).
+        dma.write32(CH_AL2_TRANS_COUNT_TRIG, 1, 0);
+        assert_eq!(dma.channel(0).trig_al2_trans, 1);
+        assert_eq!(dma.channel(0).trig_trans_count, 1, "must not cross over");
+
+        // CTRL_TRIG (0x0C).
+        dma.write32(CH_CTRL_TRIG, 0, 0);
+        assert_eq!(dma.channel(0).trig_ctrl, 1);
+
+        // AL3_READ_ADDR_TRIG (0x3C).
+        dma.write32(CH_AL3_READ_ADDR_TRIG, 0x2000_0100, 0);
+        assert_eq!(dma.channel(0).trig_al3_read_addr, 1);
+
+        // MULTI_CHAN_TRIGGER — bit 0 set bumps channel 0's counter.
+        dma.write32(REG_MULTI_CHAN_TRIGGER, 1, 0);
+        assert_eq!(dma.channel(0).trig_multi, 1);
+    }
+
+    #[test]
+    fn pio1_txf_sticky_mask_captures_ctrl_only_channel_program() {
+        // The sticky mask must catch plain (non-trigger) WRITE_ADDR
+        // writes too — firmware that programs CTRL via AL1_CTRL and
+        // sets WRITE_ADDR via CH_WRITE_ADDR without using the _TRIG
+        // alias must still be visible as "ever targeted TXF".
+        let mut dma = Dma::new();
+        dma.write32(CH_WRITE_ADDR, 0x5030_0010, 0);
+        assert_eq!(dma.channel(0).ever_wrote_pio1_txf_mask, 0b0001);
+    }
+
+    #[test]
+    fn transfers_issued_bumps_on_issue_transfer() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let ctrl = make_ctrl(
+            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
+        );
+        bus.write32(0x2000_0100, 0xBEEF);
+        program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 3, ctrl);
+        trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
+        for _ in 0..3 {
+            bus.tick_dma();
+        }
+        assert_eq!(bus.dma.channel(0).transfers_issued, 3);
+    }
+
+    #[test]
+    fn dreq_observed_mask_captures_treq_index() {
+        // FORCE TREQ = 63 → bit 63 sticks after the first ready tick.
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let ctrl = make_ctrl(
+            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
+        );
+        bus.write32(0x2000_0100, 0xC0DE);
+        program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, ctrl);
+        trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
+        bus.tick_dma();
+        assert!(
+            (bus.dma.channel(0).dreq_observed_mask >> DREQ_FORCE as u64) & 1 != 0,
+            "FORCE TREQ must latch bit 63"
+        );
+
+        // Non-FORCE TREQ: program CH1 with UART0_TX and release UART0
+        // so `tx_dreq` asserts. After the tick, bit DREQ_UART0_TX must
+        // be set in the mask.
+        bus.write32(RESETS_BASE + 0x3000, 1u32 << RESET_UART0);
+        bus.write32(0x4003_4030, 1); // UARTEN
+        let ctrl_uart = make_ctrl(
+            true, false, false, 2, 0, DREQ_UART0_TX, 0, false, false,
+        );
+        program_channel(&mut bus, 1, 0x2000_0100, 0x2000_0300, 1, ctrl_uart);
+        trigger_channel_via_ctrl_trig(&mut bus, 1, ctrl_uart);
+        bus.tick_dma();
+        assert!(
+            (bus.dma.channel(1).dreq_observed_mask >> DREQ_UART0_TX as u64) & 1 != 0,
+            "UART0_TX TREQ must latch bit {}",
+            DREQ_UART0_TX,
+        );
+        let _ = RESET_UART1;
     }
 }

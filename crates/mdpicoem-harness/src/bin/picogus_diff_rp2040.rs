@@ -398,6 +398,13 @@ impl<S: IsaSink> CapturingSink<S> {
         &self.capture
     }
 
+    /// Read-only access to the wrapped sink — used by the capture-
+    /// coverage diagnostic to peek at the inner `Emulator`'s PIO0 SM0
+    /// autopush mirror between `drive_write_cycle` calls.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
     pub fn into_parts(self) -> (S, I2sCapture) {
         (self.inner, self.capture)
     }
@@ -609,6 +616,421 @@ pub fn replay<S: IsaSink>(
     }
 
     summary
+}
+
+// ----------------------------------------------------------------------------
+// Capture-coverage diagnostic (HLD "PicoGUS Capture Coverage Diagnostic"
+// Rev. 1 §3). Per-class `(fired, captured, misattributed)` accounting
+// of ISA bus writes against PIO0 SM0 autopushes, plus deciles of the
+// fired/captured ratio to expose clustering.
+// ----------------------------------------------------------------------------
+
+/// Per-`(port, value)` bucket key. Matches the taxonomy in HLD §3.1
+/// and the example output in §5.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+enum ClassKey {
+    /// Port 0x343 exact value (`0x43`, `0x44`, `0x4C`, or other).
+    P343(u8),
+    /// First half of a write16 at 0x344 (the low-byte sub-event).
+    /// Write8 writes to 0x344 also land here.
+    P344Lo,
+    /// Second half of a write16 at 0x344 (the high-byte sub-event;
+    /// fires on the bus at port 0x345 but classes by its origin).
+    P344Hi,
+    /// Port 0x345 exact value (write8 at 0x345 — distinct from the
+    /// write16-origin-at-0x344 second half).
+    P345(u8),
+    /// Port 0x347 — collapsed into a single `data` bucket regardless
+    /// of value, since these are bulk DRAM bytes.
+    P347,
+    /// Any other port. One row per port, collapsed across values
+    /// (setup ports like 0x240, 0x24b, 0x342 tend to appear in small
+    /// counts — the bulk of traffic is on 0x343..0x347).
+    OtherPort(u16),
+}
+
+impl ClassKey {
+    /// Render the class as a human-readable label matching HLD §5.
+    fn label(self) -> String {
+        match self {
+            ClassKey::P343(v) => match v {
+                0x43 => "(0x343 <- 0x43)".to_string(),
+                0x44 => "(0x343 <- 0x44)".to_string(),
+                0x4C => "(0x343 <- 0x4C)".to_string(),
+                other => format!("(0x343 <- 0x{:02x})", other),
+            },
+            ClassKey::P344Lo => "(0x344 addr_lo)".to_string(),
+            ClassKey::P344Hi => "(0x344 addr_hi)".to_string(),
+            ClassKey::P345(v) => format!("(0x345 <- 0x{:02x})", v),
+            ClassKey::P347 => "(0x347 <- data)".to_string(),
+            ClassKey::OtherPort(p) => format!("(0x{:03x} <- *)", p),
+        }
+    }
+}
+
+/// Classify one sub-event (the PIO-level capture, post write16 split)
+/// into a `ClassKey`. `origin_port`/`origin_value`/`is_write16` refer
+/// to the trace event; `sub_idx` is 0 for the low-byte sub-event and
+/// 1 for the high-byte of a write16.
+fn classify_sub_event(
+    origin_port: u16,
+    origin_value: u16,
+    is_write16: bool,
+    sub_idx: usize,
+) -> ClassKey {
+    // Write16 at 0x344 is special-cased per HLD §3.1 — both sub-events
+    // attribute to the origin port with `addr_lo`/`addr_hi` sub-keys.
+    if is_write16 && origin_port == 0x344 {
+        return if sub_idx == 0 {
+            ClassKey::P344Lo
+        } else {
+            ClassKey::P344Hi
+        };
+    }
+    // Otherwise use the sub-event's own fired port and data.
+    let fired_port = origin_port.wrapping_add(sub_idx as u16);
+    let fired_data = if sub_idx == 0 {
+        (origin_value & 0xFF) as u8
+    } else {
+        ((origin_value >> 8) & 0xFF) as u8
+    };
+    match fired_port {
+        0x343 => ClassKey::P343(fired_data),
+        0x344 => ClassKey::P344Lo,
+        0x345 => ClassKey::P345(fired_data),
+        0x347 => ClassKey::P347,
+        other => ClassKey::OtherPort(other),
+    }
+}
+
+/// Per-class counters.
+#[derive(Default, Copy, Clone)]
+struct CoverageClass {
+    fired: u64,
+    captured: u64,
+    misattributed: u64,
+}
+
+/// Full capture-coverage result.
+#[derive(Default)]
+struct CaptureCoverage {
+    classes: std::collections::BTreeMap<ClassKey, CoverageClass>,
+    /// Per-trace-progress decile totals (10 buckets of fired / captured).
+    decile_fired: [u64; 10],
+    decile_captured: [u64; 10],
+    /// Catch-up deltas > 2 whose surplus pushes we couldn't credit to
+    /// a specific event (surfaces as a residual bucket).
+    catch_up_unattributed: u64,
+    /// Post-roll pushes that landed after the last fired sub-event.
+    /// Credited to the last sub-event's class if the decoded `(addr,data)`
+    /// matches it; otherwise incremented here.
+    post_roll_orphans: u64,
+    /// Total sub-events fired — exposed for the SUMMARY check
+    /// (`fired_sum == summary.writes_fired × (1 + write16_share)`).
+    fired_sub_events: u64,
+}
+
+impl CaptureCoverage {
+    /// Core delta-classifier state transition. Extracted as a pure
+    /// method so it can be unit-tested without a live emulator.
+    ///
+    /// Preconditions:
+    /// - Caller has already bumped `classes[class].fired` and
+    ///   `decile_fired[decile]`.
+    /// - `delta` is the post-cycle `autopush_count` delta (0, 1, or
+    ///   more) and `decode_matches_current` is true iff the decoded
+    ///   last-pushed `(addr,data)` matches the current sub-event's
+    ///   fired `(addr,data)`.
+    /// - `pending` carries (class, decile) of the previous sub-event
+    ///   whose push may still be in flight.
+    ///
+    /// Invariant (HLD §7(4)): every physical push must bump exactly
+    /// one `captured` or `misattributed` bucket. Surplus pushes in a
+    /// `delta > 1` catch-up flow into `catch_up_unattributed`.
+    fn classify_sub_event(
+        &mut self,
+        delta: u64,
+        decode_matches_current: bool,
+        class: ClassKey,
+        decile: usize,
+        pending: &mut Option<(ClassKey, usize)>,
+    ) {
+        match delta {
+            0 => {
+                // No push observed. Our push may still be in flight —
+                // become (or replace) the pending event so the next
+                // cycle can reconcile.
+                *pending = Some((class, decile));
+            }
+            1 => {
+                if decode_matches_current {
+                    // Captured cleanly — attributed to current event.
+                    let e = self.classes.entry(class).or_default();
+                    e.captured += 1;
+                    self.decile_captured[decile] += 1;
+                    *pending = None;
+                } else if let Some((prev_class, prev_decile)) = pending.take() {
+                    // Push landed but decode is for the previous event
+                    // — its push arrived late. Credit prev as
+                    // misattributed (HLD §3.3 "captured-misattributed")
+                    // and record under the PREVIOUS event's decile so
+                    // the clustering table counts this drift-captured
+                    // push (SHOULD-FIX 2). Current event's own push is
+                    // still missing, so current becomes the new pending.
+                    let e = self.classes.entry(prev_class).or_default();
+                    e.misattributed += 1;
+                    self.decile_captured[prev_decile] += 1;
+                    *pending = Some((class, decile));
+                } else {
+                    // Stray push with no pending owner. Credit to
+                    // current as misattributed so the invariant still
+                    // balances (exactly one bucket bump per push).
+                    // Current event's own push is still unaccounted —
+                    // keep it pending for the next cycle.
+                    let e = self.classes.entry(class).or_default();
+                    e.misattributed += 1;
+                    self.decile_captured[decile] += 1;
+                    *pending = Some((class, decile));
+                }
+            }
+            more => {
+                // Catch-up: multiple pushes landed in one drive window.
+                // Decode identifies only the last; credit the current
+                // event if its decode matches, plus one preceding
+                // pending event, and surface any residual as
+                // `catch_up_unattributed`. Each credit bumps both the
+                // class counter and the decile bucket for the class
+                // being credited — NOT for the current decile
+                // unconditionally (SHOULD-FIX 2).
+                let mut credits: u64 = 0;
+                if decode_matches_current {
+                    let e = self.classes.entry(class).or_default();
+                    e.captured += 1;
+                    self.decile_captured[decile] += 1;
+                    credits += 1;
+                }
+                if let Some((prev_class, prev_decile)) = pending.take() {
+                    let e = self.classes.entry(prev_class).or_default();
+                    e.captured += 1;
+                    self.decile_captured[prev_decile] += 1;
+                    credits += 1;
+                }
+                if more > credits {
+                    self.catch_up_unattributed += more - credits;
+                }
+                *pending = None;
+            }
+        }
+    }
+}
+
+/// One decoded autopush word — the PIO captured `(addr, data)` pair.
+#[inline]
+fn decode_push(word: u32) -> (u16, u8) {
+    // IN_SHIFTDIR = left on PIO0 SM0 (SHIFTCTRL bit 18 = 0 — verified
+    // on both emulator and silicon, 0x012b0000). Shift-in of 10 address
+    // bits then 8 data bits leaves `(addr << 8) | data` in the ISR:
+    //   bits  7..0 = data
+    //   bits 17..8 = addr
+    let data = (word & 0xFF) as u8;
+    let addr = ((word >> 8) & 0x3FF) as u16;
+    (addr, data)
+}
+
+/// Replay a trace while capturing per-class PIO0-SM0 autopush coverage.
+///
+/// Mirrors [`replay`] but specialised for `CapturingSink<Emulator>` so
+/// the inner emulator's `pio[0].sm[0].autopush_count` /
+/// `.last_autopush_word` can be read between `drive_write_cycle`
+/// calls. Classification rules follow HLD §3.3.
+fn replay_with_coverage(
+    sink: &mut CapturingSink<Emulator>,
+    events: &[TraceEvent],
+    sys_clk_hz: u32,
+    duration_ns: Option<u64>,
+    post_roll_ns: Option<u64>,
+) -> (ReplaySummary, CaptureCoverage) {
+    let mut summary = ReplaySummary {
+        events_total: events.len(),
+        ..Default::default()
+    };
+    let mut cov = CaptureCoverage::default();
+
+    // Running state for the delta-classifier. `pending` carries the
+    // class AND decile of the previous sub-event whose push may still
+    // be in flight (delta=0 / mismatched-decode cases). Reconciled on
+    // the next sub-event. The decile half (SHOULD-FIX 2) ensures that
+    // when drift-attribution credits the previous event, the
+    // clustering decile table is bumped against the previous event's
+    // decile, not the current one.
+    let mut pending: Option<(ClassKey, usize)> = None;
+    // Track the last fired sub-event class — used by the post-roll
+    // reconciliation block to attribute trailing pushes.
+    let mut last_fired_class: Option<ClassKey> = None;
+    let mut last_fired_port_data: Option<(u16, u8)> = None;
+
+    // Count the sub-events we will actually fire (after duration cap)
+    // so decile bucket math works without two passes.
+    let mut total_to_fire: u64 = 0;
+    for ev in events {
+        if let Some(limit) = duration_ns {
+            if ev.ns > limit {
+                break;
+            }
+        }
+        if !ev.kind.is_write() {
+            continue;
+        }
+        total_to_fire += if matches!(ev.kind, TraceKind::Write16) { 2 } else { 1 };
+    }
+
+    let mut fired_so_far: u64 = 0;
+
+    for ev in events {
+        if let Some(limit) = duration_ns {
+            if ev.ns > limit {
+                summary.duration_capped = true;
+                break;
+            }
+        }
+
+        let target = ns_to_cycles(ev.ns, sys_clk_hz);
+        while sink.cycles() < target {
+            let remaining = target - sink.cycles();
+            let chunk = remaining.clamp(1, 64) as u32;
+            let before = sink.cycles();
+            sink.step(chunk);
+            if sink.cycles() == before {
+                if summary.stall_events == 0 {
+                    eprintln!(
+                        "warning: emulator stalled at cycle {} \
+                         — subsequent events fire at the stall cycle",
+                        before
+                    );
+                }
+                summary.stall_events += 1;
+                break;
+            }
+        }
+
+        if !ev.kind.is_write() {
+            summary.reads_skipped += 1;
+            summary.final_sim_ns = ev.ns;
+            continue;
+        }
+
+        let is_wide = matches!(ev.kind, TraceKind::Write16);
+        let sub_count = if is_wide { 2usize } else { 1 };
+
+        for sub_idx in 0..sub_count {
+            let fired_port = ev.port.wrapping_add(sub_idx as u16);
+            let fired_data = if sub_idx == 0 {
+                (ev.value & 0xFF) as u8
+            } else {
+                ((ev.value >> 8) & 0xFF) as u8
+            };
+            let class = classify_sub_event(ev.port, ev.value, is_wide, sub_idx);
+
+            let before_cnt = sink.inner().bus.pio[0].sm[0].autopush_count;
+            // Drive one 8-bit cycle. We deliberately call with wide=false
+            // and do the split manually so per-sub-event delta checks
+            // match the PIO captures one-to-one.
+            drive_write_cycle(sink, fired_port, fired_data as u16, false);
+            let after_cnt = sink.inner().bus.pio[0].sm[0].autopush_count;
+            let pushed_word = sink.inner().bus.pio[0].sm[0].last_autopush_word;
+            let delta = after_cnt.wrapping_sub(before_cnt);
+
+            // Decile bucket for this sub-event (based on fired-order
+            // progress through the total sub-events we'll fire).
+            let decile = if total_to_fire == 0 {
+                0
+            } else {
+                ((fired_so_far * 10) / total_to_fire).min(9) as usize
+            };
+
+            // Always bump `fired` for this class / decile.
+            {
+                let e = cov.classes.entry(class).or_default();
+                e.fired += 1;
+            }
+            cov.decile_fired[decile] += 1;
+            cov.fired_sub_events += 1;
+
+            let (decoded_addr, decoded_data) = decode_push(pushed_word);
+            let decode_matches_current =
+                decoded_addr == fired_port & 0x3FF && decoded_data == fired_data;
+            cov.classify_sub_event(
+                delta,
+                decode_matches_current,
+                class,
+                decile,
+                &mut pending,
+            );
+
+            last_fired_class = Some(class);
+            last_fired_port_data = Some((fired_port & 0x3FF, fired_data));
+            fired_so_far += 1;
+            summary.writes_fired += if sub_idx == 0 { 1 } else { 0 };
+        }
+
+        summary.final_sim_ns = ev.ns;
+    }
+
+    summary.final_cycles = sink.cycles();
+
+    // Post-roll drain — mirror `replay()` but also reconcile any final
+    // trailing push by decode match.
+    let autopush_before_post_roll = sink.inner().bus.pio[0].sm[0].autopush_count;
+    if let Some(post_ns) = post_roll_ns {
+        if post_ns > 0 {
+            let target_cycles = ns_to_cycles(post_ns, sys_clk_hz);
+            let post_start = sink.cycles();
+            let target = post_start.wrapping_add(target_cycles);
+            while sink.cycles() < target {
+                let remaining = target - sink.cycles();
+                let chunk = remaining.clamp(1, 64) as u32;
+                let before = sink.cycles();
+                sink.step(chunk);
+                if sink.cycles() == before {
+                    if summary.stall_events == 0 {
+                        eprintln!(
+                            "warning: emulator stalled at cycle {} during post-roll",
+                            before
+                        );
+                    }
+                    summary.stall_events += 1;
+                    break;
+                }
+            }
+            summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start);
+        }
+    }
+    let autopush_after_post_roll = sink.inner().bus.pio[0].sm[0].autopush_count;
+    let post_roll_delta = autopush_after_post_roll.wrapping_sub(autopush_before_post_roll);
+    if post_roll_delta > 0 {
+        let last_word = sink.inner().bus.pio[0].sm[0].last_autopush_word;
+        let (addr, data) = decode_push(last_word);
+        match (last_fired_class, last_fired_port_data) {
+            (Some(class), Some((last_port, last_data)))
+                if addr == last_port && data == last_data =>
+            {
+                // The trailing push decodes to the last fired sub-event
+                // — credit its class once.
+                let e = cov.classes.entry(class).or_default();
+                e.captured += 1;
+                // Residual pushes in the post-roll delta that don't
+                // decode to the last event stay as orphans.
+                if post_roll_delta > 1 {
+                    cov.post_roll_orphans += post_roll_delta - 1;
+                }
+            }
+            _ => {
+                cov.post_roll_orphans += post_roll_delta;
+            }
+        }
+    }
+
+    (summary, cov)
 }
 
 // ----------------------------------------------------------------------------
@@ -897,7 +1319,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let wall_start = Instant::now();
     let mut sink = CapturingSink::new(emu, DEFAULT_SYS_CLK_HZ);
-    let summary = replay(
+    let (summary, coverage) = replay_with_coverage(
         &mut sink,
         &events,
         DEFAULT_SYS_CLK_HZ,
@@ -1018,6 +1440,285 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (p1_pad_out >> 2) & 1,
         (p1_pad_out >> 3) & 1,
     );
+
+    // ------------------------------------------------------------------
+    // PIO1 SM0 deep-dive — mirror of the PIO0 SM0 deep-dive below, but
+    // for the PSRAM SPI bit-banger. Dumps all 32 instruction slots with
+    // a disassembly annotation + PC arrow so we can see exactly which
+    // opcode the SM is stalled on. Raw backing is accessed directly
+    // because the RP2040 MMIO read of INSTR_MEM returns 0 per the
+    // datasheet (write-only register interface).
+    //
+    // DACK (GPIO19) is reported even though the PSRAM program almost
+    // certainly does not gate on it — kept for symmetry with the PIO0
+    // deep-dive and as a negative datapoint.
+    // ------------------------------------------------------------------
+    println!();
+    println!("--- Diag: PIO1 SM0 deep-dive ---");
+    let p1_sm0_clkdiv = emu.bus.read32(0x5030_0000 + 0x0C8);
+    let p1_sm0_clkdiv_int = (p1_sm0_clkdiv >> 16) & 0xFFFF;
+    let p1_sm0_clkdiv_frac = (p1_sm0_clkdiv >> 8) & 0xFF;
+    let p1_sm0_clkdiv_eff = if p1_sm0_clkdiv_int == 0 { 65536 } else { p1_sm0_clkdiv_int };
+    println!(
+        "PIO1 SM0 CLKDIV raw: 0x{:08x}  ({}.{:03} effective ~{} sysclk/PIO-tick)",
+        p1_sm0_clkdiv, p1_sm0_clkdiv_int, p1_sm0_clkdiv_frac, p1_sm0_clkdiv_eff
+    );
+    let p1_sm0_addr = emu.bus.read32(0x5030_0000 + 0x0D4) & 0x1F;
+    println!("PIO1 SM0 PC:         0x{:02x}", p1_sm0_addr);
+    let p1_sm0_execctrl = emu.bus.read32(0x5030_0000 + 0x0CC);
+    println!(
+        "PIO1 SM0 EXECCTRL:   0x{:08x}  (bit31 EXEC_STALLED={})",
+        p1_sm0_execctrl,
+        (p1_sm0_execctrl >> 31) & 1
+    );
+    let gpio_in_p1 = emu.bus.gpio_in;
+    let dack_high_p1 = (gpio_in_p1 >> 19) & 1 != 0;
+    println!(
+        "DACK (GPIO19):       {}    (gpio_in=0x{:08x})",
+        if dack_high_p1 { "high" } else { "low" },
+        gpio_in_p1
+    );
+
+    // INSTR_MEM dump — all 32 slots with MMIO (returns 0), raw backing,
+    // and the disassembly annotation. Snapshot the backing store first
+    // to avoid a borrow overlap with the subsequent MMIO read32() calls
+    // on emu.bus.
+    println!("INSTR_MEM (all 32 slots — MMIO / raw / DISASM):");
+    let p1_im_snapshot: [u16; 32] = *emu.bus.pio[1].instr_mem();
+    for i in 0..32usize {
+        let mmio = emu.bus.read32(0x5030_0000 + 0x048 + (i as u32) * 4) & 0xFFFF;
+        let raw = p1_im_snapshot[i];
+        let arrow = if i as u32 == p1_sm0_addr {
+            "  <-- PC"
+        } else {
+            ""
+        };
+        println!(
+            "  [0x{:02x}] mmio=0x{:04x} raw=0x{:04x}  {}{}",
+            i,
+            mmio,
+            raw,
+            disasm_pio_instr(raw),
+            arrow,
+        );
+    }
+
+    // Execution counters — per-PC visit table plus stall counters.
+    // PC visits bump when a fetched instruction at that slot actually
+    // executes without stalling (forced execs excluded). Comparing the
+    // visit count at slot 0x19 (OUT PINS, 1 with sideset) to the
+    // pad_out CS-fall count and the PSRAM model's CS-fall count
+    // localises where the PSRAM SPI pipeline drops edges.
+    let p1_sm0 = &emu.bus.pio[1].sm[0];
+    let p1_sm0_pc_visits = *p1_sm0.pc_visits();
+    let p1_sm0_stall_cycles = p1_sm0.stall_cycles();
+    let p1_sm0_stall_at_19 = p1_sm0.cycles_stalled_at_pc_0x19();
+    println!("PIO1 SM0 execution counters:");
+    println!("  stall cycles:              {}", p1_sm0_stall_cycles);
+    println!("  cycles stalled at PC=0x19: {}", p1_sm0_stall_at_19);
+    println!("  PC visits:");
+    for i in 0x0eusize..=0x1fusize {
+        println!("    [0x{:02x}] = {}", i, p1_sm0_pc_visits[i]);
+    }
+    println!("PIO1 pad_out transition counters (bits 1=CS, 2=SCK, 3=MOSI):");
+    println!("  CS  falls:     {}", emu.bus.pio[1].pad_out_cs_falls);
+    println!("  CS  rises:     {}", emu.bus.pio[1].pad_out_cs_rises);
+    println!("  SCK toggles:   {}", emu.bus.pio[1].pad_out_sck_toggles);
+    println!(
+        "  MOSI=1 cycles: {}",
+        emu.bus.pio[1].pad_out_mosi_writes_of_1
+    );
+
+    // ------------------------------------------------------------------
+    // DMA dispatch diagnostic (HLD "PicoGUS DMA Dispatch Diagnostic"
+    // Rev. 1). Four-way verdict across the 12 DMA channels: (1) no
+    // config, (2) configured but never triggered, (3) triggered but the
+    // engine never served, (4) engine served but PIO1 didn't consume.
+    // All counters live on `DmaChannel`; end-state reads go through the
+    // bus so CTRL splices live BUSY correctly.
+    // ------------------------------------------------------------------
+    println!();
+    println!("--- Diag: DMA dispatch ---");
+    const DMA_BASE_DIAG: u32 = 0x5000_0000;
+    println!(
+        "CH  READ_ADDR   WRITE_ADDR  COUNT   CTRL       EN TREQ BUSY ever→TXF  \
+         trig(CTRL/WADDR/TCNT/AL2T/AL3R/MULTI)  xfers      dreq_seen"
+    );
+    let mut ever_txf_channels: Vec<usize> = Vec::new();
+    let mut triggered_channels: Vec<usize> = Vec::new();
+    let mut served_channels: Vec<usize> = Vec::new();
+    for ch in 0..12usize {
+        let base = DMA_BASE_DIAG + (ch as u32) * 0x40;
+        let read_addr = emu.bus.read32(base + 0x00);
+        let write_addr = emu.bus.read32(base + 0x04);
+        let trans_count = emu.bus.read32(base + 0x08);
+        let ctrl = emu.bus.read32(base + 0x0C);
+        let en = ctrl & 1;
+        let treq = (ctrl >> 15) & 0x3F;
+        let busy = (ctrl >> 24) & 1;
+        let c = emu.bus.dma.channel(ch);
+        let any_trig = c.trig_ctrl
+            + c.trig_write_addr
+            + c.trig_trans_count
+            + c.trig_al2_trans
+            + c.trig_al3_read_addr
+            + c.trig_multi;
+        // Sticky-mask-only "ever targeted PIO1 TXF" check — triggers
+        // aren't required; firmware may have programmed WRITE_ADDR
+        // without arming yet.
+        if c.ever_wrote_pio1_txf_mask != 0 {
+            ever_txf_channels.push(ch);
+        }
+        if any_trig > 0 {
+            triggered_channels.push(ch);
+        }
+        if c.transfers_issued > 0 {
+            served_channels.push(ch);
+        }
+        let dreq_bit_for_ctrl = if treq < 64 {
+            (c.dreq_observed_mask >> treq) & 1
+        } else {
+            0
+        };
+        println!(
+            "{:2}  0x{:08x} 0x{:08x} 0x{:04x}  0x{:08x} {}  {:2}   {}    0x{:x}      \
+             {}/{}/{}/{}/{}/{}                              {:<10} {}",
+            ch,
+            read_addr,
+            write_addr,
+            trans_count & 0xFFFF,
+            ctrl,
+            en,
+            treq,
+            busy,
+            c.ever_wrote_pio1_txf_mask,
+            c.trig_ctrl,
+            c.trig_write_addr,
+            c.trig_trans_count,
+            c.trig_al2_trans,
+            c.trig_al3_read_addr,
+            c.trig_multi,
+            c.transfers_issued,
+            if dreq_bit_for_ctrl != 0 { "YES" } else { "no" },
+        );
+    }
+
+    // PIO1 SM0 TX FIFO level end-state. `tx_fifo_full()` is one
+    // data point; FLEVEL gives the sharp number.
+    let pio1_flevel = emu.bus.read32(0x5030_0000 + 0x00C);
+    let pio1_sm0_tx_level = pio1_flevel & 0xF;
+    let pio1_sm0_autopush = emu.bus.pio[1].sm[0].autopush_count;
+
+    println!();
+    println!("Summary:");
+    println!(
+        "  ever-targeting PIO1 TXF0-3:  {:?}",
+        ever_txf_channels
+    );
+    println!("  channels triggered:           {:?}", triggered_channels);
+    println!("  channels served by engine:    {:?}", served_channels);
+    println!(
+        "  PIO1 SM0 TX FIFO level:       {}  (autopush_count={})",
+        pio1_sm0_tx_level, pio1_sm0_autopush,
+    );
+
+    // PSRAM non-zero byte count — HLD §7(6) strict rule: the "FULL
+    // DISPATCH OK" verdict requires data to have actually landed in
+    // PSRAM (PSRAM non-zero OR PIO1 SM0 saw autopushes). Zero means
+    // firmware is still losing bytes downstream of PIO1 TX.
+    let psram_nonzero_bytes: usize = emu
+        .bus
+        .psram
+        .as_ref()
+        .map(|p| p.buffer.iter().filter(|&&b| b != 0).count())
+        .unwrap_or(0);
+
+    // Verdict. Priority order (most informative first):
+    //   1. No PIO1-TXF config AND no triggers on any channel → NO DISPATCH.
+    //   2. Ever-TXF set but no triggers → CONFIGURED, NEVER TRIGGERED.
+    //   3. Triggered but no served xfer → TREQ / engine verdicts.
+    //   4. Engine served but PIO1 SM0 didn't see FIFO traffic →
+    //      ENGINE SERVED, PIO DIDN'T CONSUME.
+    //   5. PIO1 SM0 saw transfers → FULL DISPATCH OK.
+    //   6. Fallback: only fire if PSRAM actually has data (HLD §7(6)
+    //      strict rule — "PIO1-SM0-autopush and PSRAM both zero must
+    //      NOT be FULL DISPATCH OK"). This arm is normally unreachable
+    //      given the preceding checks, but the explicit PSRAM guard
+    //      defends against future refactors that shuffle arm order.
+    let verdict = if ever_txf_channels.is_empty() && triggered_channels.is_empty() {
+        "NO DISPATCH".to_string()
+    } else if !ever_txf_channels.is_empty() && triggered_channels.is_empty() {
+        "CONFIGURED, NEVER TRIGGERED".to_string()
+    } else if !triggered_channels.is_empty() && served_channels.is_empty() {
+        // Pick a representative channel for the verdict text: the first
+        // triggered channel is fine — the HLD rule is "if ANY channel
+        // fits the pattern".
+        let ch = triggered_channels[0];
+        let c = emu.bus.dma.channel(ch);
+        let treq = ((c.ctrl >> 15) & 0x3F) as u8;
+        let dreq_bit = if treq < 64 {
+            (c.dreq_observed_mask >> treq) & 1 != 0
+        } else {
+            false
+        };
+        if !dreq_bit {
+            format!(
+                "TREQ never asserted — check firmware CTRL.TREQ_SEL={} or emulator DREQ plumbing for TREQ {}",
+                treq, treq,
+            )
+        } else {
+            "DREQ seen but engine did not serve — likely emulator engine gap".to_string()
+        }
+    } else if !served_channels.is_empty() && pio1_sm0_autopush == 0 {
+        let ch = served_channels[0];
+        let c = emu.bus.dma.channel(ch);
+        format!(
+            "ENGINE SERVED, PIO DIDN'T CONSUME (CH{} xfers={}) — \
+             investigate PIO1 SM0 pull/shift or TX FIFO sink plumbing",
+            ch, c.transfers_issued,
+        )
+    } else if pio1_sm0_autopush > 0 {
+        "FULL DISPATCH OK (PIO1 SM0 saw transfers)".to_string()
+    } else if psram_nonzero_bytes > 0 {
+        format!(
+            "FULL DISPATCH OK (PSRAM has {} non-zero bytes)",
+            psram_nonzero_bytes,
+        )
+    } else {
+        // HLD §7(6): PIO1-SM0-autopush == 0 AND PSRAM all-zero — both
+        // sinks empty. Must NOT be "FULL DISPATCH OK".
+        "DISPATCH UNCLEAR — PIO1 SM0 autopush == 0 and PSRAM all-zero \
+         despite upstream counters — check downstream plumbing"
+            .to_string()
+    };
+    println!();
+    println!("Verdict: {}", verdict);
+
+    // ------------------------------------------------------------------
+    // PIO FIFO push accounting. Per-SM TX/RX push success vs drop
+    // counters from `PioFifo`. If DMA is "served" (transfers_issued > 0)
+    // but TX push_drop > 0 and push_success == 0 (or far below), the
+    // bytes evaporated at the FIFO. Symmetric RX numbers catch
+    // autopush-into-full-FIFO drops on the chip-side (firmware not
+    // draining RXF fast enough).
+    // ------------------------------------------------------------------
+    println!();
+    println!("--- Diag: PIO FIFO push accounting ---");
+    for (pio_idx, pio) in emu.bus.pio.iter().enumerate() {
+        for sm_idx in 0..4 {
+            let sm = &pio.sm[sm_idx];
+            println!(
+                "PIO{} SM{} TX: push_ok={:<10} push_drop={:<10}    \
+                 RX: push_ok={:<10} push_drop={:<10}",
+                pio_idx,
+                sm_idx,
+                sm.tx_push_success(),
+                sm.tx_push_drop(),
+                sm.rx_push_success(),
+                sm.rx_push_drop(),
+            );
+        }
+    }
 
     // Final GPIO 0..3 state — what the PSRAM model actually sees.
     let gpio_lo = emu.bus.gpio_in & 0xF;
@@ -1308,6 +2009,99 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("writing WAV to {}: {e}", out_path.display()))?;
     let wav_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
 
+    // ------------------------------------------------------------------
+    // PicoGUS ISA capture coverage (HLD "PicoGUS Capture Coverage
+    // Diagnostic" Rev. 1 §5). Per-class `(fired, captured, misattr,
+    // drop%)` table plus decile clustering and ground-truth cross-check.
+    // ------------------------------------------------------------------
+    println!();
+    println!("--- Diag: PicoGUS ISA capture coverage ---");
+    println!(
+        "{:<22} {:>9}  {:>9}  {:>8}  {:>7}",
+        "Event axis", "fired", "captured", "misattr", "drop%"
+    );
+    let mut total_fired: u64 = 0;
+    let mut total_captured: u64 = 0;
+    let mut total_misattr: u64 = 0;
+    for (class, stats) in coverage.classes.iter() {
+        let drop_pct = if stats.fired > 0 {
+            100.0 * (1.0 - (stats.captured as f64 / stats.fired as f64))
+        } else {
+            0.0
+        };
+        println!(
+            "{:<22} {:>9}  {:>9}  {:>8}  {:>6.1}%",
+            class.label(),
+            stats.fired,
+            stats.captured,
+            stats.misattributed,
+            drop_pct,
+        );
+        total_fired += stats.fired;
+        total_captured += stats.captured;
+        total_misattr += stats.misattributed;
+    }
+    println!(
+        "{:<22} {:>9}  {:>9}  {:>8}",
+        "                 ----", "--------", "--------", "-------"
+    );
+    let total_drop_pct = if total_fired > 0 {
+        100.0 * (1.0 - (total_captured as f64 / total_fired as f64))
+    } else {
+        0.0
+    };
+    println!(
+        "{:<22} {:>9}  {:>9}  {:>8}  {:>6.1}%",
+        "total", total_fired, total_captured, total_misattr, total_drop_pct
+    );
+    println!(
+        "post_roll_orphans: {}  catch_up_unattributed: {}",
+        coverage.post_roll_orphans, coverage.catch_up_unattributed
+    );
+    println!();
+    println!("Clustering (per trace decile, captured / fired):");
+    for d in 0..10usize {
+        let fired = coverage.decile_fired[d];
+        let captured = coverage.decile_captured[d];
+        let pct = if fired > 0 {
+            100.0 * captured as f64 / fired as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  [{:2}-{:2}%]  {:>6} / {:>6}  ({:>5.1}%)",
+            d * 10,
+            (d + 1) * 10,
+            captured,
+            fired,
+            pct,
+        );
+    }
+    let sm0_autopush_ground_truth = emu.bus.pio[0].sm[0].autopush_count;
+    println!(
+        "autopush_count ground truth (SM0): {}",
+        sm0_autopush_ground_truth
+    );
+    // HLD §7 acceptance (4): captured_sum + misattr_sum + post_roll_orphans
+    // should equal the PIO0 SM0 ground-truth autopush count.
+    // HLD §7 (5): fired_sum == summary.writes_fired × (1 + write16_share).
+    let reconciliation_total =
+        total_captured + total_misattr + coverage.post_roll_orphans;
+    println!(
+        "reconciliation: captured({}) + misattr({}) + orphans({}) = {}  \
+         vs. autopush={}  (Δ={})",
+        total_captured,
+        total_misattr,
+        coverage.post_roll_orphans,
+        reconciliation_total,
+        sm0_autopush_ground_truth,
+        sm0_autopush_ground_truth as i64 - reconciliation_total as i64,
+    );
+    println!(
+        "fired sub-events: {}  writes_fired: {}",
+        coverage.fired_sub_events, summary.writes_fired,
+    );
+
     println!();
     println!("=== picogus_diff_rp2040 summary ===");
     println!("Events total:     {}", summary.events_total);
@@ -1372,6 +2166,196 @@ fn load_flash(path: &Path) -> Result<Vec<u8>, String> {
         );
     }
     Ok(bytes)
+}
+
+// ============================================================================
+// PIO instruction disassembler
+// ============================================================================
+
+/// Decode a 16-bit RP2040 PIO instruction word into a human-readable
+/// mnemonic. Format follows the RP2040 datasheet §3.4:
+///
+/// ```text
+/// bits[15:13]  OP    (0=JMP, 1=WAIT, 2=IN, 3=OUT, 4=PUSH/PULL,
+///                     5=MOV, 6=IRQ, 7=SET)
+/// bits[12:8]   DELAY/SIDESET (5 bits)
+/// bits[7:0]    instruction body
+/// ```
+///
+/// Side-set/delay is always rendered in `[n]` form even if SIDESET is
+/// programmed — this is a *legibility* disassembler, not a faithful
+/// reassembler. Fine-grained SIDESET vs DELAY partitioning lives in
+/// PIO1 SM0's PINCTRL register and isn't worth threading through here
+/// for diagnostic dumps.
+pub fn disasm_pio_instr(word: u16) -> String {
+    let op = (word >> 13) & 0x7;
+    let delay_ss = (word >> 8) & 0x1F;
+    let body = word & 0xFF;
+    let tail = if delay_ss != 0 {
+        format!(" [{}]", delay_ss)
+    } else {
+        String::new()
+    };
+    match op {
+        0 => {
+            // JMP cond, addr
+            let cond = (body >> 5) & 0x7;
+            let addr = body & 0x1F;
+            let cond_s = match cond {
+                0 => "",
+                1 => "!x, ",
+                2 => "x--, ",
+                3 => "!y, ",
+                4 => "y--, ",
+                5 => "x!=y, ",
+                6 => "pin, ",
+                7 => "!osre, ",
+                _ => unreachable!(),
+            };
+            format!("JMP {}0x{:02x}{}", cond_s, addr, tail)
+        }
+        1 => {
+            // WAIT pol src idx
+            let pol = (body >> 7) & 1;
+            let src = (body >> 5) & 0x3;
+            let idx = body & 0x1F;
+            let src_s = match src {
+                0 => "GPIO",
+                1 => "PIN",
+                2 => "IRQ",
+                3 => "RSVD3",
+                _ => unreachable!(),
+            };
+            format!("WAIT {} {} {}{}", pol, src_s, idx, tail)
+        }
+        2 => {
+            // IN src, bit_count
+            let src = (body >> 5) & 0x7;
+            let n_raw = body & 0x1F;
+            let n = if n_raw == 0 { 32 } else { n_raw };
+            let src_s = match src {
+                0 => "PINS",
+                1 => "X",
+                2 => "Y",
+                3 => "NULL",
+                4 => "RSVD4",
+                5 => "RSVD5",
+                6 => "ISR",
+                7 => "OSR",
+                _ => unreachable!(),
+            };
+            format!("IN {}, {}{}", src_s, n, tail)
+        }
+        3 => {
+            // OUT dst, bit_count
+            let dst = (body >> 5) & 0x7;
+            let n_raw = body & 0x1F;
+            let n = if n_raw == 0 { 32 } else { n_raw };
+            let dst_s = match dst {
+                0 => "PINS",
+                1 => "X",
+                2 => "Y",
+                3 => "NULL",
+                4 => "PINDIRS",
+                5 => "PC",
+                6 => "ISR",
+                7 => "EXEC",
+                _ => unreachable!(),
+            };
+            format!("OUT {}, {}{}", dst_s, n, tail)
+        }
+        4 => {
+            // PUSH / PULL — bit[7] selects direction
+            let is_pull = (body >> 7) & 1 != 0;
+            let iff = (body >> 6) & 1 != 0;
+            let blk = (body >> 5) & 1 != 0;
+            let iff_s = if iff {
+                if is_pull {
+                    "IFEMPTY "
+                } else {
+                    "IFFULL "
+                }
+            } else {
+                ""
+            };
+            let blk_s = if blk { "BLOCK" } else { "NOBLOCK" };
+            if is_pull {
+                format!("PULL {}{}{}", iff_s, blk_s, tail)
+            } else {
+                format!("PUSH {}{}{}", iff_s, blk_s, tail)
+            }
+        }
+        5 => {
+            // MOV dst, op, src
+            let dst = (body >> 5) & 0x7;
+            let mop = (body >> 3) & 0x3;
+            let src = body & 0x7;
+            let dst_s = match dst {
+                0 => "PINS",
+                1 => "X",
+                2 => "Y",
+                3 => "RSVD3",
+                4 => "EXEC",
+                5 => "PC",
+                6 => "STATUS",
+                7 => "ISR",
+                _ => unreachable!(),
+            };
+            let src_s = match src {
+                0 => "PINS",
+                1 => "X",
+                2 => "Y",
+                3 => "NULL",
+                4 => "RSVD4",
+                5 => "STATUS",
+                6 => "ISR",
+                7 => "OSR",
+                _ => unreachable!(),
+            };
+            let op_s = match mop {
+                0 => "",
+                1 => "~",
+                2 => "::",
+                3 => "RSVD3:",
+                _ => unreachable!(),
+            };
+            format!("MOV {}, {}{}{}", dst_s, op_s, src_s, tail)
+        }
+        6 => {
+            // IRQ — bit[6] CLR, bit[5] WAIT, bit[4] REL, bits[3:0] idx
+            let clr = (body >> 6) & 1 != 0;
+            let wait = (body >> 5) & 1 != 0;
+            let rel = (body >> 4) & 1 != 0;
+            let idx = body & 0xF;
+            let mode = if clr {
+                "CLR"
+            } else if wait {
+                "WAIT"
+            } else {
+                "SET"
+            };
+            let rel_s = if rel { " REL" } else { "" };
+            format!("IRQ {} {}{}{}", mode, idx, rel_s, tail)
+        }
+        7 => {
+            // SET dst, val
+            let dst = (body >> 5) & 0x7;
+            let val = body & 0x1F;
+            let dst_s = match dst {
+                0 => "PINS",
+                1 => "X",
+                2 => "Y",
+                3 => "RSVD3",
+                4 => "PINDIRS",
+                5 => "RSVD5",
+                6 => "RSVD6",
+                7 => "RSVD7",
+                _ => unreachable!(),
+            };
+            format!("SET {}, {}{}", dst_s, val, tail)
+        }
+        _ => unreachable!(),
+    }
 }
 
 // ============================================================================
@@ -2316,5 +3300,442 @@ ns,port,value,kind
             "expected ≥50% non-zero frames, got {nz}/{}",
             frames.len()
         );
+    }
+
+    // ----------------------------------------------------------------
+    // CaptureCoverage classifier unit tests (HLD §3.3).
+    //
+    // Guards the delta/pending state machine against regressions —
+    // specifically the HLD §7(4) invariant
+    // `captured + misattributed + post_roll_orphans == autopush_count`.
+    // Each test simulates a sequence of (delta, decode-matches, class,
+    // decile) sub-event inputs to `CaptureCoverage::classify_sub_event`,
+    // then asserts the per-bucket totals and the global invariant.
+    // ----------------------------------------------------------------
+
+    /// Sum `captured` over all `ClassKey` rows.
+    fn sum_captured(cov: &CaptureCoverage) -> u64 {
+        cov.classes.values().map(|c| c.captured).sum()
+    }
+
+    /// Sum `misattributed` over all `ClassKey` rows.
+    fn sum_misattr(cov: &CaptureCoverage) -> u64 {
+        cov.classes.values().map(|c| c.misattributed).sum()
+    }
+
+    /// HLD §7(4) invariant. Excludes `catch_up_unattributed` because
+    /// it's a residual bucket by design — `delta > 1` cases with
+    /// fewer credits than pushes spill into it.
+    fn assert_invariant(cov: &CaptureCoverage, total_pushes: u64) {
+        let accounted = sum_captured(cov)
+            + sum_misattr(cov)
+            + cov.post_roll_orphans
+            + cov.catch_up_unattributed;
+        assert_eq!(
+            accounted, total_pushes,
+            "HLD §7(4): captured ({}) + misattr ({}) + orphans ({}) + \
+             catch_up_unattributed ({}) = {} != autopush_count ({})",
+            sum_captured(cov),
+            sum_misattr(cov),
+            cov.post_roll_orphans,
+            cov.catch_up_unattributed,
+            accounted,
+            total_pushes,
+        );
+    }
+
+    /// Helper: mark a sub-event as fired and run the classifier.
+    fn record(
+        cov: &mut CaptureCoverage,
+        delta: u64,
+        decode_matches: bool,
+        class: ClassKey,
+        decile: usize,
+        pending: &mut Option<(ClassKey, usize)>,
+    ) {
+        let e = cov.classes.entry(class).or_default();
+        e.fired += 1;
+        cov.decile_fired[decile] += 1;
+        cov.fired_sub_events += 1;
+        cov.classify_sub_event(delta, decode_matches, class, decile, pending);
+    }
+
+    /// `delta == 1` with a decode that matches current → `captured`
+    /// bumps on current class; pending cleared.
+    #[test]
+    fn classifier_delta1_match_credits_current_captured() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+        record(&mut cov, 1, true, ClassKey::P347, 0, &mut pending);
+        assert_eq!(cov.classes[&ClassKey::P347].captured, 1);
+        assert_eq!(cov.classes[&ClassKey::P347].misattributed, 0);
+        assert_eq!(cov.decile_captured[0], 1);
+        assert!(pending.is_none(), "pending should clear on clean capture");
+        assert_invariant(&cov, 1);
+    }
+
+    /// `delta == 0` → no bucket bump; current becomes pending.
+    #[test]
+    fn classifier_delta0_leaves_current_pending() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+        record(&mut cov, 0, false, ClassKey::P344Lo, 3, &mut pending);
+        assert_eq!(cov.classes[&ClassKey::P344Lo].captured, 0);
+        assert_eq!(cov.classes[&ClassKey::P344Lo].misattributed, 0);
+        assert_eq!(cov.decile_captured[3], 0);
+        assert_eq!(pending, Some((ClassKey::P344Lo, 3)));
+        // No pushes landed yet → invariant holds with 0 pushes.
+        assert_invariant(&cov, 0);
+    }
+
+    /// MUST-FIX 1 regression guard: `delta == 1` with mismatched
+    /// decode and a pending previous class → credit the PREVIOUS
+    /// class as `misattributed` (NOT captured), bump the previous
+    /// event's decile (SHOULD-FIX 2), current becomes new pending.
+    /// Only ONE bucket bumps per physical push.
+    #[test]
+    fn classifier_delta1_mismatch_with_pending_credits_prev_misattr() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+
+        // Event A: delta=0 → A pends at decile 2.
+        record(&mut cov, 0, false, ClassKey::P347, 2, &mut pending);
+        assert_eq!(pending, Some((ClassKey::P347, 2)));
+        // No pushes observed so far.
+        assert_invariant(&cov, 0);
+
+        // Event B: delta=1, decode mismatches B → A's late push landed.
+        // A should get `misattributed += 1` (NOT captured), decile
+        // table should bump A's decile (2), B becomes the new pending.
+        record(&mut cov, 1, false, ClassKey::P344Lo, 5, &mut pending);
+        assert_eq!(
+            cov.classes[&ClassKey::P347].misattributed, 1,
+            "prev (A) must get misattr += 1"
+        );
+        assert_eq!(
+            cov.classes[&ClassKey::P347].captured, 0,
+            "prev (A) must NOT get captured (pre-MUST-FIX bug)"
+        );
+        assert_eq!(
+            cov.classes[&ClassKey::P344Lo].captured, 0,
+            "current (B) must NOT double-count as captured"
+        );
+        assert_eq!(
+            cov.classes[&ClassKey::P344Lo].misattributed, 0,
+            "current (B) must NOT double-count as misattr \
+             (pre-MUST-FIX bug)"
+        );
+        assert_eq!(
+            cov.decile_captured[2], 1,
+            "SHOULD-FIX 2: decile must bump at PREV event's decile (2)"
+        );
+        assert_eq!(
+            cov.decile_captured[5], 0,
+            "current event's decile must not be credited here"
+        );
+        assert_eq!(pending, Some((ClassKey::P344Lo, 5)));
+        // Exactly 1 push landed.
+        assert_invariant(&cov, 1);
+    }
+
+    /// `delta == 1` with mismatched decode and NO pending → a stray
+    /// push lands; credit current as `misattributed`, current stays
+    /// pending for next cycle.
+    #[test]
+    fn classifier_delta1_mismatch_no_pending_credits_current_misattr() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+        record(&mut cov, 1, false, ClassKey::P343(0x43), 4, &mut pending);
+        assert_eq!(cov.classes[&ClassKey::P343(0x43)].captured, 0);
+        assert_eq!(cov.classes[&ClassKey::P343(0x43)].misattributed, 1);
+        assert_eq!(cov.decile_captured[4], 1);
+        assert_eq!(pending, Some((ClassKey::P343(0x43), 4)));
+        // One stray push landed → one bucket bumped.
+        assert_invariant(&cov, 1);
+    }
+
+    /// `delta == 2` catch-up with both decode-match AND pending
+    /// present → credit current (captured) + prev (captured), each
+    /// in its own decile (SHOULD-FIX 2). No residual unattributed.
+    #[test]
+    fn classifier_delta2_catchup_match_with_pending() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+
+        // Event A: delta=0 → A pends at decile 1.
+        record(&mut cov, 0, false, ClassKey::P347, 1, &mut pending);
+        assert_invariant(&cov, 0);
+
+        // Event B: delta=2, decode matches B → 2 pushes landed,
+        // credit B (captured at decile 7) and A (captured at decile 1).
+        record(&mut cov, 2, true, ClassKey::P344Lo, 7, &mut pending);
+        assert_eq!(cov.classes[&ClassKey::P344Lo].captured, 1);
+        assert_eq!(cov.classes[&ClassKey::P347].captured, 1);
+        assert_eq!(
+            cov.decile_captured[7], 1,
+            "current event's decile must bump on match"
+        );
+        assert_eq!(
+            cov.decile_captured[1], 1,
+            "SHOULD-FIX 2: previous event's decile must bump too"
+        );
+        assert_eq!(cov.catch_up_unattributed, 0);
+        assert!(pending.is_none(), "pending must clear after catch-up");
+        // 2 physical pushes landed.
+        assert_invariant(&cov, 2);
+    }
+
+    /// `delta == 3` catch-up with match + pending → credits 2
+    /// (current + prev), surplus 1 → `catch_up_unattributed`. The
+    /// invariant still balances because we include
+    /// `catch_up_unattributed` in the accounting.
+    #[test]
+    fn classifier_delta3_catchup_surplus_goes_unattributed() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+        record(&mut cov, 0, false, ClassKey::P347, 0, &mut pending);
+        record(&mut cov, 3, true, ClassKey::P344Lo, 9, &mut pending);
+        assert_eq!(cov.classes[&ClassKey::P344Lo].captured, 1);
+        assert_eq!(cov.classes[&ClassKey::P347].captured, 1);
+        assert_eq!(
+            cov.catch_up_unattributed, 1,
+            "surplus push (3 - 2 credits) → unattributed"
+        );
+        assert_invariant(&cov, 3);
+    }
+
+    /// `delta == 2` catch-up with mismatch + no pending → 0 credits,
+    /// all 2 pushes land in `catch_up_unattributed`. Boundary case
+    /// for the surplus-accounting fix.
+    #[test]
+    fn classifier_delta2_catchup_mismatch_no_pending_all_unattributed() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+        record(&mut cov, 2, false, ClassKey::P347, 3, &mut pending);
+        assert_eq!(cov.classes[&ClassKey::P347].captured, 0);
+        assert_eq!(cov.classes[&ClassKey::P347].misattributed, 0);
+        assert_eq!(
+            cov.catch_up_unattributed, 2,
+            "no credits possible → all 2 pushes unattributed"
+        );
+        assert_invariant(&cov, 2);
+    }
+
+    /// End-to-end mixed sequence: interleaves all classifier paths and
+    /// checks the HLD §7(4) invariant holds at the end. Models a
+    /// realistic steady-state drift pattern:
+    ///   - Normal captures (delta=1 match) for bulk 0x347 data.
+    ///   - One drift event (delta=0 then delta=1 mismatch).
+    ///   - A stray push with no pending (delta=1 mismatch, no pending).
+    ///   - A catch-up (delta=2 match with pending).
+    ///   - A post-roll orphan injected separately.
+    /// Total simulated pushes: 3 + 1 + 1 + 2 + 1 = 8.
+    #[test]
+    fn classifier_invariant_holds_across_mixed_sequence() {
+        let mut cov = CaptureCoverage::default();
+        let mut pending: Option<(ClassKey, usize)> = None;
+
+        // 3× clean captures on 0x347 (bulk DRAM bytes).
+        record(&mut cov, 1, true, ClassKey::P347, 0, &mut pending);
+        record(&mut cov, 1, true, ClassKey::P347, 0, &mut pending);
+        record(&mut cov, 1, true, ClassKey::P347, 0, &mut pending);
+
+        // Drift pair: A pends (delta=0), B mismatches → A misattr,
+        // B pending.
+        record(&mut cov, 0, false, ClassKey::P343(0x43), 1, &mut pending);
+        record(&mut cov, 1, false, ClassKey::P344Lo, 2, &mut pending);
+        assert_eq!(pending, Some((ClassKey::P344Lo, 2)));
+
+        // C matches → C captured, pending (B) silently dropped
+        // (HLD §3.3: clean match clears pending).
+        record(&mut cov, 1, true, ClassKey::P347, 3, &mut pending);
+        assert!(pending.is_none());
+
+        // Stray push with no pending.
+        record(
+            &mut cov,
+            1,
+            false,
+            ClassKey::P345(0x01),
+            4,
+            &mut pending,
+        );
+        assert!(pending.is_some());
+
+        // Catch-up on a new event D: delta=2, match, with pending from
+        // the previous mismatch → 2 credits, no surplus.
+        record(&mut cov, 2, true, ClassKey::P347, 5, &mut pending);
+
+        // Post-roll: inject 1 orphan directly (mimics what
+        // replay_with_coverage's post-roll path would do).
+        cov.post_roll_orphans += 1;
+
+        // Bucket accounting:
+        //   captured: 3 (first 3) + 1 (C) + 2 (D catch-up) = 6
+        //   misattributed: 1 (A drift) + 1 (stray) = 2
+        //   orphans: 1
+        // Total = 9 buckets. But physical pushes during main loop =
+        // 3 + 0 + 1 + 1 + 1 + 2 = 8, plus 1 orphan = 9 → invariant
+        // holds at autopush_count=9.
+        assert_eq!(sum_captured(&cov), 6);
+        assert_eq!(sum_misattr(&cov), 2);
+        assert_eq!(cov.post_roll_orphans, 1);
+        assert_eq!(cov.catch_up_unattributed, 0);
+        assert_invariant(&cov, 9);
+    }
+
+    // ----------------------------------------------------------------
+    // `decode_push` — PIO0 SM0 autopush word layout.
+    //
+    // PIO0 SM0 SHIFTCTRL reads 0x012b0000 on both emulator and silicon;
+    // bit 18 (IN_SHIFTDIR) is 0 → shift LEFT. With shift-left, `IN PINS,
+    // 10` then `IN PINS, 8` leaves `(addr << 8) | data` in the ISR, so
+    // the autopushed word layout is:
+    //
+    //     bits  7..0 : data  (8 bits)
+    //     bits 17..8 : addr  (10 bits)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn decode_autopush_word_matches_left_shift_layout() {
+        // Sentinel pair chosen to exercise bits across both fields.
+        let addr: u16 = 0x347;
+        let data: u8 = 0x68;
+        let word: u32 = ((addr as u32) << 8) | (data as u32);
+        let (decoded_addr, decoded_data) = decode_push(word);
+        assert_eq!(decoded_addr, addr, "addr decode under left-shift layout");
+        assert_eq!(decoded_data, data, "data decode under left-shift layout");
+    }
+
+    #[test]
+    fn decode_autopush_word_round_trips_edge_values() {
+        for (addr, data) in [
+            (0x000u16, 0x00u8),
+            (0x3ffu16, 0xffu8),
+            (0x000u16, 0xffu8),
+            (0x3ffu16, 0x00u8),
+        ] {
+            let word: u32 = ((addr as u32) << 8) | (data as u32);
+            let (decoded_addr, decoded_data) = decode_push(word);
+            assert_eq!(
+                decoded_addr, addr,
+                "addr edge case (addr=0x{:03x}, data=0x{:02x})",
+                addr, data
+            );
+            assert_eq!(
+                decoded_data, data,
+                "data edge case (addr=0x{:03x}, data=0x{:02x})",
+                addr, data
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // PIO disassembler — one focused test per opcode class. The goal
+    // isn't a bit-perfect reassembler (see module docs); it's that the
+    // human-readable string contains the right mnemonic + key operands.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn disasm_jmp_always() {
+        // JMP 0x05 (unconditional) — op=0, cond=0, addr=5.
+        let s = disasm_pio_instr(0x0005);
+        assert!(s.contains("JMP"), "got: {s}");
+        assert!(s.contains("0x05"), "got: {s}");
+    }
+
+    #[test]
+    fn disasm_jmp_conditional_with_delay() {
+        // JMP pin, 0x0c, delay 3 — op=0, delay=3, cond=6 (pin), addr=0xc.
+        //   [15:13]=000 [12:8]=00011 [7:5]=110 [4:0]=01100 = 0x03cc
+        let s = disasm_pio_instr(0x03cc);
+        assert!(s.contains("JMP"), "got: {s}");
+        assert!(s.contains("pin,"), "got: {s}");
+        assert!(s.contains("0x0c"), "got: {s}");
+        assert!(s.contains("[3]"), "got: {s}");
+    }
+
+    #[test]
+    fn disasm_wait_pin() {
+        // WAIT 1 PIN 0 — op=1, pol=1, src=1 (PIN), idx=0.
+        //   [15:13]=001 [12:8]=00000 [7]=1 [6:5]=01 [4:0]=00000 = 0x20a0
+        let s = disasm_pio_instr(0x20a0);
+        assert!(s.contains("WAIT"), "got: {s}");
+        assert!(s.contains("PIN"), "got: {s}");
+        assert!(s.contains(" 1 "), "got: {s}"); // polarity
+    }
+
+    #[test]
+    fn disasm_wait_gpio() {
+        // WAIT 0 GPIO 4 — op=1, pol=0, src=0 (GPIO), idx=4.
+        //   [15:13]=001 [12:8]=00000 [7]=0 [6:5]=00 [4:0]=00100 = 0x2004
+        let s = disasm_pio_instr(0x2004);
+        assert!(s.contains("WAIT"), "got: {s}");
+        assert!(s.contains("GPIO"), "got: {s}");
+        assert!(s.contains(" 0 "), "got: {s}");
+        assert!(s.ends_with("4"), "got: {s}");
+    }
+
+    #[test]
+    fn disasm_in_pins() {
+        // IN PINS, 8 — op=2, src=0 (PINS), n=8.
+        //   [15:13]=010 [12:8]=00000 [7:5]=000 [4:0]=01000 = 0x4008
+        let s = disasm_pio_instr(0x4008);
+        assert!(s.contains("IN"), "got: {s}");
+        assert!(s.contains("PINS"), "got: {s}");
+        assert!(s.contains("8"), "got: {s}");
+    }
+
+    #[test]
+    fn disasm_out_pins() {
+        // OUT PINS, 1 — op=3, dst=0 (PINS), n=1.
+        //   [15:13]=011 [12:8]=00000 [7:5]=000 [4:0]=00001 = 0x6001
+        let s = disasm_pio_instr(0x6001);
+        assert!(s.contains("OUT"), "got: {s}");
+        assert!(s.contains("PINS"), "got: {s}");
+        assert!(s.contains("1"), "got: {s}");
+    }
+
+    #[test]
+    fn disasm_pull_block() {
+        // PULL BLOCK — op=4, bit[7]=1 (pull), bit[6]=0, bit[5]=1.
+        //   [15:13]=100 [12:8]=00000 [7]=1 [6]=0 [5]=1 [4:0]=00000 = 0x80a0
+        let s = disasm_pio_instr(0x80a0);
+        assert!(s.contains("PULL"), "got: {s}");
+        assert!(s.contains("BLOCK"), "got: {s}");
+    }
+
+    #[test]
+    fn disasm_push_iffull() {
+        // PUSH IFFULL BLOCK — op=4, bit[7]=0 (push), bit[6]=1 (IFFULL),
+        //   bit[5]=1 (BLOCK).
+        //   [15:13]=100 [12:8]=00000 [7]=0 [6]=1 [5]=1 [4:0]=00000 = 0x8060
+        let s = disasm_pio_instr(0x8060);
+        assert!(s.contains("PUSH"), "got: {s}");
+        assert!(s.contains("IFFULL"), "got: {s}");
+        assert!(s.contains("BLOCK"), "got: {s}");
+    }
+
+    #[test]
+    fn disasm_mov_and_set_and_irq() {
+        // MOV Y, X — op=5, dst=2 (Y), mop=0 (none), src=1 (X).
+        //   [15:13]=101 [12:8]=00000 [7:5]=010 [4:3]=00 [2:0]=001 = 0xa041
+        let s = disasm_pio_instr(0xa041);
+        assert!(s.contains("MOV"), "got: {s}");
+        assert!(s.contains("Y"), "got: {s}");
+        assert!(s.contains("X"), "got: {s}");
+
+        // SET X, 7 — op=7, dst=1 (X), val=7.
+        //   [15:13]=111 [12:8]=00000 [7:5]=001 [4:0]=00111 = 0xe027
+        let s = disasm_pio_instr(0xe027);
+        assert!(s.contains("SET"), "got: {s}");
+        assert!(s.contains("X"), "got: {s}");
+        assert!(s.contains("7"), "got: {s}");
+
+        // IRQ SET 0 — op=6, CLR=0, WAIT=0, REL=0, idx=0.
+        //   [15:13]=110 [12:8]=00000 [7:4]=0000 [3:0]=0000 = 0xc000
+        let s = disasm_pio_instr(0xc000);
+        assert!(s.contains("IRQ"), "got: {s}");
+        assert!(s.contains("SET"), "got: {s}");
     }
 }

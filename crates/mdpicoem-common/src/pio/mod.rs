@@ -41,6 +41,31 @@ pub struct PioBlock {
     pub int1_inte: u32,
     /// IRQ1_INTF — 16-bit interrupt force for NVIC line 1. Offset 0x180.
     int1_intf: u32,
+
+    /// Diagnostic — count of `pad_out` bit 1 transitions from 1 to 0.
+    /// Tracks PSRAM SPI CS falling edges (PicoGUS pin assignment:
+    /// CS=GPIO1). Observed by comparing `pad_out` before and after
+    /// every [`Self::merge_pin_outputs`] within [`Self::step`]. Pure
+    /// observation — never read by block execution. Independent of
+    /// any downstream device model's own edge counters.
+    pub pad_out_cs_falls: u64,
+    /// Diagnostic — count of `pad_out` bit 1 transitions from 0 to 1.
+    /// Paired with [`Self::pad_out_cs_falls`]; a healthy SPI program
+    /// alternates falls and rises.
+    pub pad_out_cs_rises: u64,
+    /// Diagnostic — count of `pad_out` bit 2 toggles (either direction).
+    /// Tracks PSRAM SPI SCK edges. Each SPI bit-clock period produces
+    /// two toggles (rising + falling), so this counter divided by two
+    /// estimates the number of SCK cycles that actually ran.
+    pub pad_out_sck_toggles: u64,
+    /// Diagnostic — count of cycles where `pad_out` bit 3 is high.
+    /// MOSI is a level on a given PIO clock cycle; this count rises
+    /// by one per cycle that drives it high. Pure observation.
+    pub pad_out_mosi_writes_of_1: u64,
+    /// Prior snapshot of `pad_out` used by the transition counters
+    /// above. Seeded on construction/reset so the first step's
+    /// comparison is against the reset value (0).
+    pub(crate) prev_pad_out_diag: u32,
 }
 
 impl PioBlock {
@@ -69,6 +94,11 @@ impl PioBlock {
             int0_intf: 0,
             int1_inte: 0,
             int1_intf: 0,
+            pad_out_cs_falls: 0,
+            pad_out_cs_rises: 0,
+            pad_out_sck_toggles: 0,
+            pad_out_mosi_writes_of_1: 0,
+            prev_pad_out_diag: 0,
         }
     }
 
@@ -90,6 +120,11 @@ impl PioBlock {
         self.int0_intf = 0;
         self.int1_inte = 0;
         self.int1_intf = 0;
+        self.pad_out_cs_falls = 0;
+        self.pad_out_cs_rises = 0;
+        self.pad_out_sck_toggles = 0;
+        self.pad_out_mosi_writes_of_1 = 0;
+        self.prev_pad_out_diag = 0;
     }
 
     /// True iff at least one SM in the block is enabled. Chip-side
@@ -288,6 +323,7 @@ impl PioBlock {
             }
         }
         self.merge_pin_outputs();
+        self.bump_pad_out_diag();
     }
 
     /// Advance PIO block by `n` system clocks. Quantum-end variant of
@@ -356,6 +392,40 @@ impl PioBlock {
         }
         self.pad_out = out;
         self.pad_oe = oe;
+    }
+
+    /// Diagnostic: compare the current `pad_out` against the prior
+    /// snapshot and bump the PSRAM-SPI transition counters (bit 1=CS,
+    /// bit 2=SCK, bit 3=MOSI). Called at the end of each [`Self::step`]
+    /// after the pin outputs have been merged, so the counters track
+    /// per-sysclock transitions as observed on the block's pad. Pure
+    /// observation — never touches execution state. Kept independent
+    /// of any downstream device model's own edge counts so the three
+    /// numbers can be compared (SM PC visits ↔ pad_out transitions ↔
+    /// PSRAM model edges) to localise gaps.
+    #[inline]
+    fn bump_pad_out_diag(&mut self) {
+        let prev = self.prev_pad_out_diag;
+        let cur = self.pad_out;
+        if prev != cur {
+            let prev_cs = (prev >> 1) & 1;
+            let cur_cs = (cur >> 1) & 1;
+            if prev_cs == 1 && cur_cs == 0 {
+                self.pad_out_cs_falls = self.pad_out_cs_falls.wrapping_add(1);
+            } else if prev_cs == 0 && cur_cs == 1 {
+                self.pad_out_cs_rises = self.pad_out_cs_rises.wrapping_add(1);
+            }
+            let prev_sck = (prev >> 2) & 1;
+            let cur_sck = (cur >> 2) & 1;
+            if prev_sck != cur_sck {
+                self.pad_out_sck_toggles = self.pad_out_sck_toggles.wrapping_add(1);
+            }
+        }
+        if (cur >> 3) & 1 != 0 {
+            self.pad_out_mosi_writes_of_1 =
+                self.pad_out_mosi_writes_of_1.wrapping_add(1);
+        }
+        self.prev_pad_out_diag = cur;
     }
 
     /// Compute FSTAT register from current SM FIFO states.
@@ -1079,6 +1149,57 @@ mod tests {
         assert_eq!(pio.irq_flags, 0);
         assert_eq!(pio.fdebug, 0);
         assert_eq!(pio.pad_out, 0);
+    }
+
+    /// Load a tiny `SET PINS, data=val` / `SET PINS, 0` alternating
+    /// program into SM0's instr_mem, enable SM0, and return the block
+    /// so a test can drive transitions through the `step()` path. Uses
+    /// default pinctrl (set_base=0, set_count=5) so SET writes land on
+    /// pad bits [4:0] — letting the pad_out transition counters see
+    /// bit 1 (CS) and bit 2 (SCK) directly.
+    fn make_pio_for_set_pins_test(high_data: u8) -> PioBlock {
+        let mut pio = PioBlock::new();
+        // SET PINS, high_data (opcode=111, dst=0, data=high_data)
+        pio.instr_mem[0] = 0xE000 | ((high_data as u16) & 0x1F);
+        // SET PINS, 0 (opcode=111, dst=0, data=0)
+        pio.instr_mem[1] = 0xE000;
+        // Wrap: execctrl default has wrap_top=0x1F, wrap_bottom=0 —
+        // after slot 1 advance_pc→2, but we only step twice so we never
+        // reach slot 2. Default is fine.
+        pio.set_sm_enabled(0, true);
+        pio
+    }
+
+    #[test]
+    fn pad_out_cs_fall_counter_bumps_on_1_to_0() {
+        // First step: SET PINS, 2 → pad bit 1 goes 0 → 1 (a rise).
+        // Second step: SET PINS, 0 → pad bit 1 goes 1 → 0 (a fall).
+        let mut pio = make_pio_for_set_pins_test(0b00010);
+        assert_eq!(pio.pad_out_cs_falls, 0);
+        pio.step(0);
+        // After one step: pad bit 1 is high. No fall yet.
+        assert_eq!(pio.pad_out_cs_falls, 0);
+        assert_eq!((pio.pad_out >> 1) & 1, 1, "pad bit 1 high after SET 2");
+        pio.step(0);
+        // After the second step: pad bit 1 goes low — one fall.
+        assert_eq!((pio.pad_out >> 1) & 1, 0, "pad bit 1 low after SET 0");
+        assert_eq!(pio.pad_out_cs_falls, 1, "one 1→0 transition on bit 1");
+    }
+
+    #[test]
+    fn pad_out_cs_rise_counter_independent() {
+        // Same program; after the first step we expect exactly one rise
+        // and zero falls (asymmetric with the fall-only test above).
+        let mut pio = make_pio_for_set_pins_test(0b00010);
+        assert_eq!(pio.pad_out_cs_rises, 0);
+        assert_eq!(pio.pad_out_cs_falls, 0);
+        pio.step(0);
+        assert_eq!(pio.pad_out_cs_rises, 1, "one 0→1 transition on bit 1");
+        assert_eq!(pio.pad_out_cs_falls, 0, "no fall yet");
+        // Bit 2 (SCK) never toggles under this program.
+        assert_eq!(pio.pad_out_sck_toggles, 0);
+        // Bit 3 (MOSI) stays low.
+        assert_eq!(pio.pad_out_mosi_writes_of_1, 0);
     }
 
     // `test_gpio_in_moved_to_bus` lives in `crates/mdrp2350/src/pio_tests.rs`

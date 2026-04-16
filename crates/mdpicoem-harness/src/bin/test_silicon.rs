@@ -358,6 +358,7 @@ fn run_one_oracle(
             let mut core = session.core(0).map_err(|e| e.to_string())?;
             let args = PeriphArgs {
                 filter: plan.filter.clone(),
+                exclude: None,
                 verbose: false,
             };
             silicon_scenarios::run_against(&mut core, &args, order_slice)
