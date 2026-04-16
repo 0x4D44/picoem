@@ -212,6 +212,22 @@ impl Emulator {
             // Final refresh so any post-quantum inspection (e.g. tests
             // reading DWT_CYCCNT between steps) sees a current base.
             self.cores[core_id].ppb.update_latest_cycles(self.cores[core_id].cycles);
+
+            // Phase 0b.2: exclusive-monitor snoop. If the peer core has an
+            // outstanding LDREX address and *this* core performed any
+            // data-side write during its quantum slice, invalidate the
+            // peer's monitor. Same-core writes do NOT invalidate the local
+            // monitor (per ARMv8-M §A3.4). Clear the flag for the next
+            // quantum. Correct under the serial-interleave scheduler
+            // because cores run sequentially within a quantum; threaded
+            // mode (Phase 1+) will require atomic CAS on SharedMemory.
+            let peer = 1 - core_id;
+            if self.cores[peer].exclusive_address.is_some()
+                && self.cores[core_id].did_write_this_quantum
+            {
+                self.cores[peer].exclusive_address = None;
+            }
+            self.cores[core_id].did_write_this_quantum = false;
         }
 
         self.clock.advance(self.step_quantum as u64);

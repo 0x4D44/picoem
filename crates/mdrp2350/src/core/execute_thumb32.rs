@@ -708,13 +708,16 @@ impl CortexM33 {
 
         // LDREX: hw0 = 1110_1000_0101_Rn (0xE85x)
         // STREX: hw0 = 1110_1000_0100_Rn (0xE84x)
+        // Phase 0b.2: address-based exclusive monitor per ARMv8-M §A3.4.
+        // Peer-core writes invalidate via `Emulator::step` snoop.
         if hw0 & 0xFFF0 == 0xE850 {
-            // LDREX (treat as normal LDR for Phase 1)
+            // LDREX
             let rn = (hw0 & 0xF) as usize;
             let rt = ((hw1 >> 12) & 0xF) as usize;
             let imm8 = (hw1 & 0xFF) as u32;
             let addr = self.regs.r[rn].wrapping_add(imm8 << 2);
             self.regs.r[rt] = self.bus_read32(addr, bus);
+            self.exclusive_address = Some(addr);
             return 2;
         }
         if hw0 & 0xFFF0 == 0xE840 {
@@ -726,19 +729,90 @@ impl CortexM33 {
                 self.regs.r[rd] = self.execute_tt(addr);
                 return 1;
             }
-            // STREX (treat as normal STR for Phase 1, Rd gets 0 = success)
+            // STREX: monitor-gated store. No value comparison; address-only.
             let rn = (hw0 & 0xF) as usize;
             let rt = ((hw1 >> 12) & 0xF) as usize;
             let rd = ((hw1 >> 8) & 0xF) as usize;
             let imm8 = (hw1 & 0xFF) as u32;
             let addr = self.regs.r[rn].wrapping_add(imm8 << 2);
-            self.bus_write32(addr, self.regs.r[rt], bus);
-            self.regs.r[rd] = 0; // success
+            if self.exclusive_address == Some(addr) {
+                self.bus_write32(addr, self.regs.r[rt], bus);
+                self.regs.r[rd] = 0; // success
+            } else {
+                self.regs.r[rd] = 1; // failure: monitor open or different address
+            }
+            // STREX always clears the local monitor per ARMv8-M §A3.4.
+            self.exclusive_address = None;
             return 2;
         }
 
-        // LDREXB/LDREXH/STREXB/STREXH: hw0 = 0xE8Cx or 0xE8Dx patterns
-        // Phase 1: treat as normal load/store variants
+        // LDREXB/LDREXH: hw0 = 0xE8Dx, hw1[11:4] selects size, hw1[3:0] = 0xF
+        // STREXB/STREXH: hw0 = 0xE8Cx, hw1[11:4] selects size, hw1[3:0] = Rd
+        // Encodings per ARMv8-M DDI0553:
+        //   LDREXB T1: 1110 1000 1101 Rn / Rt 1111 0100 1111
+        //   LDREXH T1: 1110 1000 1101 Rn / Rt 1111 0101 1111
+        //   STREXB T1: 1110 1000 1100 Rn / Rt 1111 0100 Rd
+        //   STREXH T1: 1110 1000 1100 Rn / Rt 1111 0101 Rd
+        // Monitor tracks the word-aligned address regardless of access
+        // width, matching ARMv8-M's "the monitor covers the naturally
+        // aligned block of memory containing the address". That way a
+        // LDREXB/STREXB pair at the same byte offset still round-trips,
+        // and LDREXH at an odd-word offset (0x102) lines up with STREXH
+        // at that same offset.
+        if hw0 & 0xFFF0 == 0xE8D0
+            && (hw1 >> 4) & 0xFF == 0xF4
+            && hw1 & 0xF == 0xF
+        {
+            // LDREXB
+            let rn = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let addr = self.regs.r[rn];
+            self.regs.r[rt] = self.bus_read8(addr, bus) as u32;
+            self.exclusive_address = Some(addr & !3);
+            return 2;
+        }
+        if hw0 & 0xFFF0 == 0xE8D0
+            && (hw1 >> 4) & 0xFF == 0xF5
+            && hw1 & 0xF == 0xF
+        {
+            // LDREXH
+            let rn = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let addr = self.regs.r[rn];
+            self.regs.r[rt] = self.bus_read16(addr, bus) as u32;
+            self.exclusive_address = Some(addr & !3);
+            return 2;
+        }
+        if hw0 & 0xFFF0 == 0xE8C0 && (hw1 >> 4) & 0xFF == 0xF4 {
+            // STREXB
+            let rn = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let rd = (hw1 & 0xF) as usize;
+            let addr = self.regs.r[rn];
+            if self.exclusive_address == Some(addr & !3) {
+                self.bus_write8(addr, self.regs.r[rt] as u8, bus);
+                self.regs.r[rd] = 0;
+            } else {
+                self.regs.r[rd] = 1;
+            }
+            self.exclusive_address = None;
+            return 2;
+        }
+        if hw0 & 0xFFF0 == 0xE8C0 && (hw1 >> 4) & 0xFF == 0xF5 {
+            // STREXH
+            let rn = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let rd = (hw1 & 0xF) as usize;
+            let addr = self.regs.r[rn];
+            if self.exclusive_address == Some(addr & !3) {
+                self.bus_write16(addr, self.regs.r[rt] as u16, bus);
+                self.regs.r[rd] = 0;
+            } else {
+                self.regs.r[rd] = 1;
+            }
+            self.exclusive_address = None;
+            return 2;
+        }
         // (Falls through to LDRD/STRD for any other unrecognized pattern)
 
         // LDRD/STRD (immediate): default path
@@ -863,7 +937,8 @@ impl CortexM33 {
         if hw0 == 0xF3BF {
             let barrier_op = (hw1 >> 4) & 0xF;
             return match barrier_op {
-                0x2 => 1, // CLREX
+                // CLREX: clear the local exclusive monitor (Phase 0b.2).
+                0x2 => { self.exclusive_address = None; 1 }
                 0x4 => 1, // DSB
                 0x5 => 1, // DMB
                 0x6 => 1, // ISB

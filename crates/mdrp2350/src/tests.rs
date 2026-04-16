@@ -6387,15 +6387,325 @@ fn tt_bootrom_scenario() {
 #[test]
 fn tt_does_not_collide_with_strex() {
     // STREX R0, R1, [R2, #0]: hw0=0xE842, hw1=0x1000
-    // hw1[15:12]=1 (Rt=R1), hw1[7:0]=0 (imm8=0) — this is STREX, not TT
+    // hw1[15:12]=1 (Rt=R1), hw1[7:0]=0 (imm8=0) — this is STREX, not TT.
+    // Phase 0b.2: the decoder still routes this to STREX (not TT), but
+    // with no prior LDREX the monitor is open, so STREX fails (Rd = 1)
+    // and memory is unchanged. Pre-Phase-0b.2 the stub unconditionally
+    // succeeded; this assertion now encodes the address-based monitor.
     let (mut c, mut bus) = core_and_bus();
+    // Seed memory with a known sentinel so a failed STREX is observable.
+    bus.write32(0x2000_0100, 0x1234_5678, 0);
     c.set_reg(1, 0xDEAD_BEEF);
     c.set_reg(2, 0x2000_0100);
     c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus);
-    // R0 (Rd) should be 0 (STREX success)
+    // STREX with open monitor -> Rd = 1 (failure); memory unchanged.
+    assert_eq!(c.reg(0), 1);
+    assert_eq!(bus.read32(0x2000_0100, 0), 0x1234_5678);
+}
+
+// ============================================================================
+// LDREX / STREX / CLREX — Phase 0b.2 address-based exclusive monitor.
+// ============================================================================
+//
+// Core semantics (ARMv8-M §A3.4):
+//   - LDREX(addr)   -> load 32-bit, set local monitor to addr
+//   - STREX(addr,v) -> if monitor == addr: store v, Rd=0; else Rd=1.
+//                      Always clears the local monitor afterwards.
+//   - CLREX         -> clear the local monitor unconditionally.
+//   - Byte/halfword variants mirror the same monitor semantics, just with
+//     a narrower data transfer.
+//
+// Cross-core invalidation is handled by `Emulator::step` via the snoop
+// hook — peer-core data writes drop the local monitor. Same-core writes
+// do NOT invalidate the local monitor (ARM is explicit on this: it's the
+// firmware's job to reissue LDREX if a same-core STR was intentional).
+
+#[test]
+fn ldrex_strex_success() {
+    // LDREX then STREX to the same address with no intervening peer write
+    // -> STREX succeeds (Rd = 0) and memory is updated.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0200, 0xAAAA_AAAA, 0); // seed memory
+    c.set_reg(2, 0x2000_0200);                // Rn base
+    c.set_reg(1, 0xBEEF_F00D);                // Rt (STREX store value)
+
+    // LDREX R3, [R2, #0]: hw0=0xE852, hw1=0x3F00
+    //   hw0[3:0]=Rn=2, hw1[15:12]=Rt=3, hw1[11:8]=0xF, hw1[7:0]=imm8=0
+    c.execute_one_wide_with_bus(0xE852, 0x3F00, &mut bus);
+    assert_eq!(c.reg(3), 0xAAAA_AAAA, "LDREX loaded seed value");
+    assert_eq!(c.exclusive_address, Some(0x2000_0200),
+        "LDREX set local monitor to the loaded address");
+
+    // STREX R0, R1, [R2, #0]: hw0=0xE842, hw1=0x1000
+    //   hw0[3:0]=Rn=2, hw1[15:12]=Rt=1, hw1[11:8]=Rd=0, hw1[7:0]=imm8=0
+    c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus);
+    assert_eq!(c.reg(0), 0, "STREX success -> Rd = 0");
+    assert_eq!(bus.read32(0x2000_0200, 0), 0xBEEF_F00D,
+        "STREX updated memory on success");
+    assert_eq!(c.exclusive_address, None,
+        "STREX clears the local monitor");
+}
+
+#[test]
+fn ldrex_clrex_strex_fail() {
+    // LDREX, CLREX, STREX -> STREX fails (Rd = 1), memory unchanged.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0210, 0xAAAA_AAAA, 0);
+    c.set_reg(2, 0x2000_0210);
+    c.set_reg(1, 0xBEEF_F00D);
+
+    c.execute_one_wide_with_bus(0xE852, 0x3F00, &mut bus); // LDREX
+    assert_eq!(c.exclusive_address, Some(0x2000_0210));
+
+    // CLREX: hw0 = 0xF3BF, hw1[7:4] = 0x2 -> hw1 = 0x8F2F (mask[7:4]=2, rest=don't-care pattern)
+    c.execute_one_wide_with_bus(0xF3BF, 0x8F2F, &mut bus);
+    assert_eq!(c.exclusive_address, None, "CLREX clears the local monitor");
+
+    c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus); // STREX
+    assert_eq!(c.reg(0), 1, "STREX after CLREX must fail");
+    assert_eq!(bus.read32(0x2000_0210, 0), 0xAAAA_AAAA,
+        "memory must be unchanged after failed STREX");
+}
+
+#[test]
+fn ldrex_samecore_str_strex_success() {
+    // LDREX, then a same-core STR to the same address, then STREX.
+    // Per ARMv8-M §A3.4 the local monitor is address-based and same-core
+    // writes do NOT invalidate it — so STREX still succeeds.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0220, 0xAAAA_AAAA, 0);
+    c.set_reg(2, 0x2000_0220);
+    c.set_reg(1, 0xBEEF_F00D);
+
+    c.execute_one_wide_with_bus(0xE852, 0x3F00, &mut bus); // LDREX R3, [R2]
+    // STR via the bus wrapper simulates a normal same-core store. Using
+    // the wrapper flips `did_write_this_quantum` but must NOT clear the
+    // local monitor — that's the invariant under test.
+    c.bus_write32(0x2000_0220, 0x1111_2222, &mut bus);
+    assert_eq!(c.exclusive_address, Some(0x2000_0220),
+        "same-core write must NOT clear local monitor");
+    assert!(c.did_write_this_quantum, "same-core write set the flag");
+
+    c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus); // STREX R0, R1, [R2]
+    assert_eq!(c.reg(0), 0, "STREX succeeds despite same-core STR");
+    assert_eq!(bus.read32(0x2000_0220, 0), 0xBEEF_F00D);
+    assert_eq!(c.exclusive_address, None);
+}
+
+#[test]
+fn ldrex_strex_different_addr_fail() {
+    // LDREX addr A, STREX addr B -> Rd = 1; neither address updated.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0230, 0xAAAA_AAAA, 0); // A
+    bus.write32(0x2000_0234, 0xCCCC_CCCC, 0); // B
+    c.set_reg(2, 0x2000_0230);
+    c.set_reg(5, 0x2000_0234); // Rn for the STREX
+    c.set_reg(1, 0xBEEF_F00D);
+
+    c.execute_one_wide_with_bus(0xE852, 0x3F00, &mut bus); // LDREX R3, [R2]
+    assert_eq!(c.exclusive_address, Some(0x2000_0230));
+
+    // STREX R0, R1, [R5, #0]: hw0=0xE845 (Rn=5), hw1=0x1000
+    c.execute_one_wide_with_bus(0xE845, 0x1000, &mut bus);
+    assert_eq!(c.reg(0), 1, "STREX to different address must fail");
+    assert_eq!(bus.read32(0x2000_0234, 0), 0xCCCC_CCCC, "B unchanged");
+    assert_eq!(bus.read32(0x2000_0230, 0), 0xAAAA_AAAA, "A unchanged");
+    assert_eq!(c.exclusive_address, None,
+        "STREX clears the monitor even on failure");
+}
+
+#[test]
+fn ldrex_peer_write_strex_fail() {
+    // Peer-core write snoop must invalidate our monitor. This test drives
+    // the actual `Emulator::step` snoop hook: core 0 holds an outstanding
+    // LDREX, core 1 performs a normal data write via `bus_write32`, and
+    // after the quantum the snoop must clear core 0's monitor so core 0's
+    // next STREX fails.
+    let mut emu = Emulator::new(Config::default());
+    let addr = 0x2000_0400u32;
+    emu.bus.write32(addr, 0xAAAA_AAAA, 0);
+
+    // Seed core 0 with an outstanding LDREX and core 1 with the pending
+    // write setup. We hand-install `exclusive_address` on core 0 rather
+    // than running a LDREX instruction — this test is about the snoop,
+    // not the LDREX decode path.
+    emu.cores[0].exclusive_address = Some(addr);
+    // Core 1 performs a write via the wrapper; this sets its
+    // `did_write_this_quantum = true` and writes to memory.
+    emu.cores[1].bus_write32(addr, 0x1234_5678, &mut emu.bus);
+    assert!(emu.cores[1].did_write_this_quantum);
+
+    // Drive one Emulator::step — both cores are at reset-vector PC (fetch
+    // whatever is at ROM 0, likely a NOP-like default), but the only
+    // thing we care about is the snoop firing at the quantum boundary.
+    // Halt both cores so they don't execute anything and clobber state;
+    // the snoop logic runs regardless of execution.
+    emu.cores[0].halt();
+    emu.cores[1].halt();
+    emu.step();
+    assert_eq!(emu.cores[0].exclusive_address, None,
+        "peer-core write must invalidate our monitor via the snoop");
+    assert!(!emu.cores[1].did_write_this_quantum,
+        "snoop must clear did_write_this_quantum for the next quantum");
+
+    // And STREX from core 0 now fails, completing the scenario.
+    emu.cores[0].wake();
+    emu.cores[0].set_reg(2, addr);
+    emu.cores[0].set_reg(1, 0xBEEF_F00D);
+    emu.cores[0].execute_one_wide_with_bus(0xE842, 0x1000, &mut emu.bus);
+    assert_eq!(emu.cores[0].reg(0), 1, "STREX must fail after peer snoop");
+}
+
+#[test]
+fn ldrex_ldrex_strex_strex_race() {
+    // Two-core race: both cores LDREX the same address, then both STREX.
+    // Phase 0b.2 snoop guarantees the first STREX invalidates the peer's
+    // monitor before the peer runs its STREX, so exactly one wins.
+    //
+    // Layout: step_quantum = 1 forces at most one instruction per core
+    // per `Emulator::step()` call. Each core executes one instruction,
+    // then the snoop fires at the quantum boundary.
+    let mut emu = crate::EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build();
+
+    // Minimal ROM — reset vector points at 0x2000_0000 (SRAM). We drive
+    // state directly via the registers so we don't need a full vector
+    // table here.
+    let mut rom = vec![0u8; 512];
+    rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes()); // MSP
+    rom[4..8].copy_from_slice(&0x2000_0001u32.to_le_bytes()); // reset vector (thumb)
+    emu.load_bootrom(&rom);
+    emu.reset();
+
+    // Seed memory + registers on both cores. The two cores will execute
+    // distinct instruction pairs from different SRAM offsets.
+    let addr = 0x2000_1000u32;
+    emu.bus.write32(addr, 0x1111_1111, 0);
+
+    // Core 0 program at 0x2000_0000: LDREX R3, [R2] ; STREX R0, R1, [R2]
+    //   0xE852, 0x3F00, 0xE842, 0x1000
+    let c0_prog: [u16; 4] = [0xE852, 0x3F00, 0xE842, 0x1000];
+    for (i, w) in c0_prog.iter().enumerate() {
+        emu.bus.write16(0x2000_0000 + (i as u32) * 2, *w, 0);
+    }
+
+    // Core 1 program at 0x2000_0100: same sequence but distinct Rt value.
+    //   Same encodings because registers are free.
+    let c1_prog: [u16; 4] = [0xE852, 0x3F00, 0xE842, 0x1000];
+    for (i, w) in c1_prog.iter().enumerate() {
+        emu.bus.write16(0x2000_0100 + (i as u32) * 2, *w, 1);
+    }
+
+    // Set each core's PC, SP, and working regs.
+    for c in 0..2 {
+        emu.cores[c].regs.msp = 0x2008_0000;
+        emu.cores[c].regs.r[13] = 0x2008_0000;
+        emu.cores[c].regs.r[2] = addr;
+        emu.cores[c].regs.xpsr = 1 << 24; // Thumb
+    }
+    emu.cores[0].regs.set_pc(0x2000_0000);
+    emu.cores[0].regs.r[1] = 0xAAAA_0000;
+    emu.cores[1].regs.set_pc(0x2000_0100);
+    emu.cores[1].regs.r[1] = 0xBBBB_0000;
+
+    // Drive enough quanta for both cores to execute LDREX (step 1) then
+    // STREX (step 2). LDREX/STREX cost 2 cycles each and `step_quantum=1`,
+    // so it takes a few quanta to accumulate each instruction. We stop as
+    // soon as both cores have executed both instructions (PC advanced by
+    // 8 bytes from their program start).
+    for _ in 0..64 {
+        if emu.cores[0].regs.pc() >= 0x2000_0008
+            && emu.cores[1].regs.pc() >= 0x2000_0108
+        {
+            break;
+        }
+        emu.step();
+    }
+    assert_eq!(emu.cores[0].reg(0), 0, "core 0 STREX wins");
+    assert_eq!(emu.cores[1].reg(0), 1, "core 1 STREX loses");
+    assert_eq!(emu.bus.read32(addr, 0), 0xAAAA_0000,
+        "memory shows the winning store");
+    assert_eq!(emu.cores[0].exclusive_address, None);
+    assert_eq!(emu.cores[1].exclusive_address, None);
+}
+
+// -- LDREXB / STREXB ---------------------------------------------------------
+
+#[test]
+fn ldrexb_strexb_success() {
+    // LDREXB/STREXB round-trip on a single core.
+    //   LDREXB Rt, [Rn]:    hw0 = 0xE8D0 | Rn, hw1 = (Rt << 12) | 0x0F4F
+    //   STREXB Rd, Rt, [Rn]: hw0 = 0xE8C0 | Rn, hw1 = (Rt << 12) | 0x0F40 | Rd
+    let (mut c, mut bus) = core_and_bus();
+    bus.write8(0x2000_0300, 0xAA, 0);
+    c.set_reg(2, 0x2000_0300);
+    c.set_reg(1, 0x5A);
+
+    // LDREXB R3, [R2]: hw0=0xE8D2 (Rn=2), hw1=0x3F4F (Rt=3)
+    c.execute_one_wide_with_bus(0xE8D2, 0x3F4F, &mut bus);
+    assert_eq!(c.reg(3), 0xAA, "LDREXB zero-extends the byte");
+    assert_eq!(c.exclusive_address, Some(0x2000_0300));
+
+    // STREXB R0, R1, [R2]: hw0=0xE8C2 (Rn=2), hw1=0x1F40 (Rt=1, Rd=0)
+    c.execute_one_wide_with_bus(0xE8C2, 0x1F40, &mut bus);
+    assert_eq!(c.reg(0), 0, "STREXB success");
+    assert_eq!(bus.read8(0x2000_0300, 0), 0x5A);
+    assert_eq!(c.exclusive_address, None);
+}
+
+#[test]
+fn ldrexb_clrex_strexb_fail() {
+    // LDREXB, CLREX, STREXB -> Rd = 1, memory unchanged.
+    let (mut c, mut bus) = core_and_bus();
+    bus.write8(0x2000_0304, 0xAA, 0);
+    c.set_reg(2, 0x2000_0304);
+    c.set_reg(1, 0x5A);
+
+    c.execute_one_wide_with_bus(0xE8D2, 0x3F4F, &mut bus); // LDREXB
+    c.execute_one_wide_with_bus(0xF3BF, 0x8F2F, &mut bus); // CLREX
+    assert_eq!(c.exclusive_address, None);
+
+    c.execute_one_wide_with_bus(0xE8C2, 0x1F40, &mut bus); // STREXB
+    assert_eq!(c.reg(0), 1);
+    assert_eq!(bus.read8(0x2000_0304, 0), 0xAA, "memory unchanged");
+}
+
+// -- LDREXH / STREXH ---------------------------------------------------------
+
+#[test]
+fn ldrexh_strexh_success() {
+    //   LDREXH Rt, [Rn]:    hw0 = 0xE8D0 | Rn, hw1 = (Rt << 12) | 0x0F5F
+    //   STREXH Rd, Rt, [Rn]: hw0 = 0xE8C0 | Rn, hw1 = (Rt << 12) | 0x0F50 | Rd
+    let (mut c, mut bus) = core_and_bus();
+    bus.write16(0x2000_0310, 0xAABB, 0);
+    c.set_reg(2, 0x2000_0310);
+    c.set_reg(1, 0xCAFE);
+
+    // LDREXH R3, [R2]: hw0=0xE8D2, hw1=0x3F5F
+    c.execute_one_wide_with_bus(0xE8D2, 0x3F5F, &mut bus);
+    assert_eq!(c.reg(3), 0xAABB);
+    assert_eq!(c.exclusive_address, Some(0x2000_0310));
+
+    // STREXH R0, R1, [R2]: hw0=0xE8C2, hw1=0x1F50
+    c.execute_one_wide_with_bus(0xE8C2, 0x1F50, &mut bus);
     assert_eq!(c.reg(0), 0);
-    // Memory at 0x20000100 should have the stored value
-    assert_eq!(bus.read32(0x2000_0100, 0), 0xDEAD_BEEF);
+    assert_eq!(bus.read16(0x2000_0310, 0), 0xCAFE);
+    assert_eq!(c.exclusive_address, None);
+}
+
+#[test]
+fn ldrexh_clrex_strexh_fail() {
+    let (mut c, mut bus) = core_and_bus();
+    bus.write16(0x2000_0314, 0xAABB, 0);
+    c.set_reg(2, 0x2000_0314);
+    c.set_reg(1, 0xCAFE);
+
+    c.execute_one_wide_with_bus(0xE8D2, 0x3F5F, &mut bus); // LDREXH
+    c.execute_one_wide_with_bus(0xF3BF, 0x8F2F, &mut bus); // CLREX
+    c.execute_one_wide_with_bus(0xE8C2, 0x1F50, &mut bus); // STREXH
+    assert_eq!(c.reg(0), 1);
+    assert_eq!(bus.read16(0x2000_0314, 0), 0xAABB);
 }
 
 // ============================================================================

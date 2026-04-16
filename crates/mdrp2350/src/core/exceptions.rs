@@ -71,6 +71,12 @@ impl CortexM33 {
         // PC publishing resumes at the handler's first `decode_execute`.
         bus.set_active_pc(0xFFFF_FFFE, self.core_id);
 
+        // ARMv8-M B1.5.18: exception entry clears the local exclusive
+        // monitor. Without this, a LDREX/STREX pair straddling an
+        // exception would let STREX succeed on return — the monitor
+        // must be reset so returning code re-issues LDREX.
+        self.exclusive_address = None;
+
         if exc_num == 3 && self.regs.ipsr() == 3 {
             self.halted = true;
             return 0;
@@ -216,6 +222,10 @@ impl CortexM33 {
         // real Thumb instruction PC. Regular PC publishing resumes when
         // the returned-to instruction hits `decode_execute`.
         bus.set_active_pc(0xFFFF_FFFD, self.core_id);
+
+        // ARMv8-M B1.5.18: exception return clears the local exclusive
+        // monitor, matching the entry-side clear.
+        self.exclusive_address = None;
 
         let active_exc = self.regs.ipsr(); // capture BEFORE popping
 

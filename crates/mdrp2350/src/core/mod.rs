@@ -75,6 +75,21 @@ pub struct CortexM33 {
     /// writes. The crate's public surface accepts this — the pre-Commit-B
     /// equivalent `Bus::ppb` was also public.
     pub ppb: Ppb,
+    /// ARMv8-M local exclusive monitor: address tracked by the last LDREX
+    /// on this core, or `None` when the monitor is open (no outstanding
+    /// LDREX, or cleared by CLREX / peer write / successful STREX).
+    /// Address-based per ARMv8-M §A3.4 — no value tracking. Invalidated
+    /// by `Emulator::step` when the peer core performed any data-side
+    /// write during its quantum (see `did_write_this_quantum`).
+    /// Phase 0b.2 of the Threaded Dual-Core Emulation plan.
+    pub(crate) exclusive_address: Option<u32>,
+    /// Set by `bus_write{8,16,32}` on any data-side write by this core
+    /// during the current quantum. Read and cleared by `Emulator::step`
+    /// after the core's quantum slice completes — if the peer core has
+    /// an outstanding LDREX, its monitor is invalidated. Same-core
+    /// writes do NOT invalidate the local monitor (per ARM semantics).
+    /// Phase 0b.2 of the Threaded Dual-Core Emulation plan.
+    pub(crate) did_write_this_quantum: bool,
 }
 
 impl CortexM33 {
@@ -96,6 +111,8 @@ impl CortexM33 {
             halted: false,
             wfe_waiting: false,
             ppb: Ppb::default(),
+            exclusive_address: None,
+            did_write_this_quantum: false,
         }
     }
 
@@ -270,6 +287,10 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write32(&mut self, addr: u32, val: u32, bus: &mut Bus) {
+        // Phase 0b.2: any data-side write invalidates a peer core's
+        // exclusive monitor. `Emulator::step` snoops this flag after the
+        // core's quantum slice and clears the peer's `exclusive_address`.
+        self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             self.ppb.write32(addr, val);
             self.sync_nvic_to_irq_pending(addr, bus);
@@ -301,6 +322,8 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write16(&mut self, addr: u32, val: u16, bus: &mut Bus) {
+        // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
+        self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // ARMv8-M: halfword PPB accesses are UNPREDICTABLE. We
             // defensively RMW the matching half of the containing 32-bit
@@ -335,6 +358,8 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write8(&mut self, addr: u32, val: u8, bus: &mut Bus) {
+        // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
+        self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte writes drop.
             if bus.trace_enabled {
