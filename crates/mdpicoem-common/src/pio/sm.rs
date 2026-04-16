@@ -210,9 +210,10 @@ impl StateMachine {
         self.tx_fifo.push_success
     }
 
-    /// Diagnostic: number of TX FIFO pushes that hit a full FIFO and
-    /// silently dropped the value. Non-zero indicates the SM didn't
-    /// drain fast enough OR DREQ throttling failed upstream.
+    /// Diagnostic: number of MMIO TXFn writes that hit a full TX FIFO
+    /// and silently dropped the value (the only external path to
+    /// `tx_fifo.push`). Non-zero means the SM didn't drain fast enough
+    /// OR DREQ throttling failed upstream.
     pub fn tx_push_drop(&self) -> u64 {
         self.tx_fifo.push_drop
     }
@@ -224,10 +225,11 @@ impl StateMachine {
         self.rx_fifo.push_success
     }
 
-    /// Diagnostic: number of RX FIFO pushes that hit a full FIFO and
-    /// silently dropped the value. Non-zero usually means the chip
-    /// side isn't draining RXF fast enough (or autopush is firing on
-    /// a stalled consumer).
+    /// Diagnostic: number of explicit non-blocking `PUSH` instructions
+    /// that hit a full RX FIFO and silently dropped the word. Autopush
+    /// does NOT bump this counter — it gates on non-full and stalls
+    /// otherwise, so use `autopush_count` staying low as the
+    /// autopush-loss diagnostic instead.
     pub fn rx_push_drop(&self) -> u64 {
         self.rx_fifo.push_drop
     }
@@ -573,15 +575,25 @@ impl StateMachine {
         let take_jump = match condition {
             0 => true,                    // Always
             1 => self.x == 0,            // !X
-            2 => {                        // X-- (post-decrement, jump if was nonzero)
+            2 => {                        // X-- (jump+decrement iff X != 0)
+                // Datasheet §3.4.4: if X is already 0, the branch is
+                // not taken AND X remains 0. The decrement is part of
+                // the taken-jump action, not a mandatory side effect —
+                // otherwise X=0 wraps to 0xFFFFFFFF and the loop never
+                // terminates (observed as the PicoGUS PSRAM slot 0x1A
+                // running 1.1M iterations without reaching slot 0x1B).
                 let was_nonzero = self.x != 0;
-                self.x = self.x.wrapping_sub(1);
+                if was_nonzero {
+                    self.x = self.x.wrapping_sub(1);
+                }
                 was_nonzero
             }
             3 => self.y == 0,            // !Y
-            4 => {                        // Y-- (post-decrement, jump if was nonzero)
+            4 => {                        // Y-- (jump+decrement iff Y != 0)
                 let was_nonzero = self.y != 0;
-                self.y = self.y.wrapping_sub(1);
+                if was_nonzero {
+                    self.y = self.y.wrapping_sub(1);
+                }
                 was_nonzero
             }
             5 => self.x != self.y,       // X!=Y
@@ -1050,5 +1062,98 @@ mod tests {
         // Neither instruction stalls, so stall_cycles should be zero.
         assert_eq!(sm.stall_cycles, 0);
         assert_eq!(sm.cycles_stalled_at_pc_0x19, 0);
+    }
+
+    /// JMP X-- termination: with X=3 the loop body (slot 0) + back-edge
+    /// (slot 1 = JMP X-- 0) must run exactly X+1 = 4 iterations, then
+    /// fall through to the exit sentinel at slot 2. Datasheet §3.4.4:
+    /// X-- evaluates `X != 0`; on true it jumps and decrements X, on
+    /// false it falls through without decrement. Regression guard for
+    /// the PicoGUS PSRAM SPI bring-up symptom where slot 0x19/0x1A
+    /// looped 1,146,584 times and slot 0x1B never executed.
+    #[test]
+    fn jmp_x_minus_minus_exits_after_x_plus_one_iterations() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        sm.x = 3;
+        let mut instr_mem = [0u16; 32];
+        // Slot 0: MOV Y, Y (no-op body) = 0xA042.
+        instr_mem[0] = 0xA042;
+        // Slot 1: JMP X-- 0 = opcode 000, cond=010 (X--), addr=00000 = 0x0040.
+        instr_mem[1] = 0x0040;
+        // Slot 2: SET PINS, 0xF (exit sentinel) = 0xE00F.
+        instr_mem[2] = 0xE00F;
+        // Slot 3: WAIT 1 IRQ 0 = 0x20C0 — stalls forever so the counters
+        // beyond the exit don't keep churning and perturb the asserts.
+        instr_mem[3] = 0x20C0;
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        for _ in 0..50 {
+            sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        }
+        assert_eq!(sm.x, 0, "X must be 0 after termination");
+        assert_eq!(sm.pc_visits[0], 4, "slot 0 runs X+1 = 4 times");
+        assert_eq!(sm.pc_visits[1], 4, "slot 1 runs X+1 = 4 times");
+        assert!(
+            sm.pc_visits[2] >= 1,
+            "slot 2 (exit sentinel) must execute at least once, got {}",
+            sm.pc_visits[2]
+        );
+    }
+
+    /// JMP Y-- termination: analogous to the X-- test with Y=2 → 3
+    /// iterations. Separate test because Y is a distinct condition
+    /// code (4 vs 2) on a different register path in `exec_jmp`.
+    #[test]
+    fn jmp_y_minus_minus_exits_after_y_plus_one_iterations() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        sm.y = 2;
+        let mut instr_mem = [0u16; 32];
+        // Slot 0: MOV Y, Y (no-op body) = 0xA042.
+        instr_mem[0] = 0xA042;
+        // Slot 1: JMP Y-- 0 = opcode 000, cond=100 (Y--), addr=00000 = 0x0080.
+        instr_mem[1] = 0x0080;
+        // Slot 2: SET PINS, 0xF (exit sentinel) = 0xE00F.
+        instr_mem[2] = 0xE00F;
+        // Slot 3: WAIT 1 IRQ 0 = 0x20C0 (park after exit).
+        instr_mem[3] = 0x20C0;
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        for _ in 0..50 {
+            sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        }
+        assert_eq!(sm.y, 0, "Y must be 0 after termination");
+        assert_eq!(sm.pc_visits[0], 3, "slot 0 runs Y+1 = 3 times");
+        assert_eq!(sm.pc_visits[1], 3, "slot 1 runs Y+1 = 3 times");
+        assert!(
+            sm.pc_visits[2] >= 1,
+            "slot 2 (exit sentinel) must execute at least once, got {}",
+            sm.pc_visits[2]
+        );
+    }
+
+    /// JMP X-- with X=0 falls through without decrementing. Datasheet
+    /// §3.4.4: the condition is `X != 0`; a zero X must neither jump
+    /// nor wrap around to 0xFFFFFFFF.
+    #[test]
+    fn jmp_x_minus_minus_with_x_zero_falls_through_without_decrement() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        // X is 0 from reset; spell it out for the reader.
+        assert_eq!(sm.x, 0);
+        let mut instr_mem = [0u16; 32];
+        // Slot 0: JMP X-- 5 = opcode 000, cond=010, addr=00101 = 0x0045.
+        instr_mem[0] = 0x0045;
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.x, 0, "X must stay 0 (no wrap to 0xFFFFFFFF)");
+        assert_eq!(sm.pc, 1, "PC must advance past the JMP, not jump to 5");
+        assert_eq!(sm.pc_visits[0], 1);
+        assert_eq!(sm.pc_visits[5], 0, "target slot 5 must not have been visited");
     }
 }
