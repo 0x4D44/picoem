@@ -160,10 +160,17 @@ fn pio_write(emu: &mut Emulator, offset: u32, val: u32) {
 /// one cycle — these tests read PIO pin state on a per-cycle basis,
 /// which the quantum execution model would otherwise smear across up
 /// to `DEFAULT_STEP_QUANTUM` cycles.
+///
+/// Releases PIO0 from RESETS so `tick_peripherals` actually ticks it.
+/// PIO is held in reset post-bootrom (§7.5); the existing waveform
+/// tests all target PIO0 and need it released before `step()`.
 fn pio_test_emulator() -> Emulator {
-    EmulatorBuilder::new(Config::default())
+    let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build()
+        .build();
+    // De-assert PIO0's RESETS bit via the CLR alias.
+    emu.bus.resets_state &= !(1u32 << crate::bus::RESET_PIO0);
+    emu
 }
 
 /// Load a PIO program into instruction memory via bus writes.
@@ -534,5 +541,86 @@ fn test_pio_onerom_sm1_out_pins_8_autopull_drives_pad_out() {
         "pad_oe bits 16..23 should be driven after MOV PINDIRS, !NULL; \
          got pad_oe=0x{:08X}",
         emu.bus.pio[0].pad_oe
+    );
+}
+
+// ====================================================================
+// Phase 4.3: PIO RESETS gating
+// ====================================================================
+//
+// Real hardware holds PIO inert while its RESETS bit is asserted.
+// The tick path in `Emulator::tick_peripherals` must skip a PIO block
+// whose RESETS bit is still set. This test verifies that contract.
+
+#[test]
+fn test_pio_resets_gating() {
+    // Build an emulator with step_quantum=1 but do NOT release PIO0
+    // from reset — the default `RESETS_POST_BOOTROM` holds PIO0/1/2.
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build();
+
+    // Confirm PIO0 is held in reset.
+    assert_ne!(
+        emu.bus.resets_state & (1u32 << crate::bus::RESET_PIO0),
+        0,
+        "PIO0 should be held in reset post-bootrom"
+    );
+
+    // Program a trivial PIO0 SM0 program: NOP loop.
+    //   addr 0: MOV Y, Y  (NOP — any non-branch that advances PC)
+    //   addr 1: JMP 0     (loop back)
+    //
+    // MOV Y, Y = 101_00000_010_00_010 = 0xA042
+    let nop: u16 = 0xA042;
+    let jmp_0: u16 = 0x0000;
+    // Write to instruction memory (register writes pass through even
+    // while PIO is held in reset — matching real hardware).
+    emu.bus.write32(PIO0_BASE + 0x048, nop as u32, 0);
+    emu.bus.write32(PIO0_BASE + 0x04C, jmp_0 as u32, 0);
+
+    // SM0_EXECCTRL: wrap_top=1, wrap_bottom=0.
+    emu.bus.write32(PIO0_BASE + 0x0CC, (1u32 << 12) | (0u32 << 7), 0);
+    // SM0_CLKDIV: integer=1, frac=0 (one instruction per system clock).
+    emu.bus.write32(PIO0_BASE + 0x0C8, 1u32 << 16, 0);
+
+    // Enable SM0 via CTRL.
+    emu.bus.write32(PIO0_BASE + 0x000, 0x1, 0);
+
+    // Read SM0_ADDR (PC) via the bus register path at PIO offset
+    // 0x0C8 (SM0 base) + 0x0C (ADDR within SM) = 0x0D4.
+    let pc_before = emu.bus.read32(PIO0_BASE + 0x0D4, 0);
+
+    // Tick several cycles — PIO0 is held in reset, so SM0's PC must
+    // not advance.
+    for _ in 0..10 {
+        emu.step();
+    }
+
+    assert_eq!(
+        emu.bus.read32(PIO0_BASE + 0x0D4, 0),
+        pc_before,
+        "SM0 PC must not advance while PIO0 is held in reset"
+    );
+
+    // De-assert PIO0's RESETS bit (clear bit 11).
+    emu.bus.resets_state &= !(1u32 << crate::bus::RESET_PIO0);
+    assert_eq!(
+        emu.bus.resets_state & (1u32 << crate::bus::RESET_PIO0),
+        0,
+        "PIO0 should be released from reset"
+    );
+
+    // Now tick — SM0 should execute and its PC should advance.
+    let pc_after_release = emu.bus.read32(PIO0_BASE + 0x0D4, 0);
+    for _ in 0..5 {
+        emu.step();
+    }
+
+    assert_ne!(
+        emu.bus.read32(PIO0_BASE + 0x0D4, 0),
+        pc_after_release,
+        "SM0 PC must advance after PIO0 is released from reset \
+         (ran 5 cycles with a 2-instruction NOP loop)"
     );
 }

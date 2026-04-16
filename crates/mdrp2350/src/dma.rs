@@ -1230,42 +1230,42 @@ mod tests {
         let src: u32 = 0x2000_0800;
         let dst: u32 = 0x2000_0900;
         for i in 0..4u32 {
-            bus.write32(src + i * 4, 0xF000_0000 + i);
+            bus.write32(src + i * 4, 0xF000_0000 + i, 0);
         }
 
         // Program DMA TIMER0: X=1, Y=10 → fires every 10 sysclks.
-        bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 10);
+        bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 10, 0);
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 4);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
         // TREQ_SEL=59 (0x3B) = DREQ_TIMER0
         let ctrl = make_ctrl(true, 2, true, true, 59, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // At rate 1/10, the timer fires on tick 10, 20, 30, 40.
         // After 9 ticks nothing should have transferred.
         for _ in 0..9 {
             bus.tick_dma();
         }
-        assert_eq!(bus.read32(dst), 0, "no transfer before first timer fire");
-        let readback = bus.read32(DMA_BASE + 0x0C);
+        assert_eq!(bus.read32(dst, 0), 0, "no transfer before first timer fire");
+        let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_ne!(readback & CTRL_BUSY, 0, "channel must still be BUSY");
 
         // Tick 10: first timer fire → first transfer.
         bus.tick_dma();
-        assert_eq!(bus.read32(dst), 0xF000_0000, "first word after tick 10");
+        assert_eq!(bus.read32(dst, 0), 0xF000_0000, "first word after tick 10");
 
         // Complete remaining 3 transfers (30 more ticks).
         for _ in 0..30 {
             bus.tick_dma();
         }
         for i in 0..4u32 {
-            assert_eq!(bus.read32(dst + i * 4), 0xF000_0000 + i, "word {i}");
+            assert_eq!(bus.read32(dst + i * 4, 0), 0xF000_0000 + i, "word {i}");
         }
         // BUSY should be clear, INTR bit 0 set.
-        let readback = bus.read32(DMA_BASE + 0x0C);
+        let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(readback & CTRL_BUSY, 0, "BUSY must clear after completion");
-        assert_ne!(bus.read32(DMA_BASE + REG_INTR) & 1, 0, "INTR bit 0 must latch");
+        assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0, "INTR bit 0 must latch");
     }
 }

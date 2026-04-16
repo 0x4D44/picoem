@@ -84,8 +84,8 @@ pub const UARTPCELLID3: u32 = 0xFFC;
 
 // --- UARTCR bits ------------------------------------------------------
 const UARTCR_UARTEN: u32 = 1 << 0;
+const UARTCR_LBE: u32 = 1 << 7;
 const UARTCR_TXE: u32 = 1 << 8;
-#[allow(dead_code)] // documented bit; RX path not yet wired (Phase 2 deferral)
 const UARTCR_RXE: u32 = 1 << 9;
 
 // --- UARTLCR_H bits ---------------------------------------------------
@@ -467,9 +467,14 @@ impl UartRegs {
         }
         let sysclks_per_byte = self.sysclks_per_byte(clock_tree);
         self.tx_cycle_accum = self.tx_cycle_accum.saturating_add(cycles as u64);
+        let loopback = (self.cr & UARTCR_LBE) != 0 && (self.cr & UARTCR_RXE) != 0;
+        let rx_cap = if self.fifos_enabled() { UART_FIFO_DEPTH } else { 1 };
         while self.tx_cycle_accum >= sysclks_per_byte && !self.tx_fifo.is_empty() {
             self.tx_cycle_accum -= sysclks_per_byte;
-            self.tx_fifo.pop_front();
+            let byte = self.tx_fifo.pop_front().unwrap();
+            if loopback && self.rx_fifo.len() < rx_cap {
+                self.rx_fifo.push_back(byte);
+            }
         }
         self.refresh_tx_interrupt();
         self.route_irq(irqs);

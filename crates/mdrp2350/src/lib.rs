@@ -347,9 +347,18 @@ impl Emulator {
     /// end of each quantum.
     fn tick_peripherals(&mut self, cycles: u32) {
         let gpio_in = self.bus.gpio_in;
-        for pio in &mut self.bus.pio {
-            pio.step_n(cycles, gpio_in);
+        let resets = self.bus.resets_state;
+        // PIO0/1/2 are gated by their RESETS bits — real hardware holds
+        // PIO inert while its reset line is asserted. RESET_PIO0..2 are
+        // contiguous (11, 12, 13), so `RESET_PIO0 + i` gives the bit
+        // for `pio[i]`.
+        for (i, pio) in self.bus.pio.iter_mut().enumerate() {
+            let bit = crate::bus::RESET_PIO0 + i as u8;
+            if (resets & (1u32 << bit)) == 0 {
+                pio.step_n(cycles, gpio_in);
+            }
         }
+        self.route_pio_irqs();
         self.update_gpio();
         self.bus.sio.tick_mtime_n(cycles);
         // Bus peripherals (TICKS + TIMER0 + TIMER1 in V5 Phase 1).
@@ -357,6 +366,33 @@ impl Emulator {
         // no fast-path gate in V5. Drains alarm-match IRQs into both
         // cores' NVIC pending masks via `assert_irq_shared`.
         self.bus.tick_peripherals(cycles);
+    }
+
+    /// Route PIO IRQ flags to the NVIC via INT0_INTE / INT1_INTE masks.
+    ///
+    /// Each PIO block has two NVIC lines (IRQ_0 and IRQ_1). The 12-bit
+    /// raw status (INTR) comprises `IRQ[3:0]` flags plus FIFO status
+    /// (TXNFULL / RXNEMPTY). A flag reaches NVIC line N iff
+    /// `(INTR & INTn_INTE) | INTn_INTF != 0`.
+    ///
+    /// PIO IRQs are shared (both cores see them). The IRQ numbers for
+    /// each block are contiguous pairs starting at `IRQ_PIO0_IRQ_0`.
+    fn route_pio_irqs(&mut self) {
+        use crate::irq::IRQ_PIO0_IRQ_0;
+        for i in 0..3 {
+            // Capture INTS values before mutably borrowing `self.bus` for
+            // `assert_irq_shared`.
+            let ints0 = self.bus.pio[i].int0_ints();
+            let ints1 = self.bus.pio[i].int1_ints();
+            let irq0_line = IRQ_PIO0_IRQ_0 + (i as u32) * 2;
+            let irq1_line = irq0_line + 1;
+            if ints0 != 0 {
+                self.bus.assert_irq_shared(irq0_line);
+            }
+            if ints1 != 0 {
+                self.bus.assert_irq_shared(irq1_line);
+            }
+        }
     }
 
     /// Quantum-end SysTick advance. Each core's SysTick is ticked by the

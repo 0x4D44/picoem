@@ -29,6 +29,18 @@ pub struct PioBlock {
     /// [`Self::set_sm_enabled`]; direct writes to `sm[i].enabled` must not
     /// be reintroduced on the production path.
     sm_enabled_mask: u8,
+    /// IRQ0_INTE — 12-bit interrupt enable mask for NVIC line 0.
+    /// Bits [11:8] = SM3..SM0 TXNFULL, [7:4] = SM3..SM0 RXNEMPTY,
+    /// [3:0] = IRQ flags SM3..SM0. RP2350 datasheet offset 0x12C.
+    pub int0_inte: u32,
+    /// IRQ0_INTF — 12-bit interrupt force for NVIC line 0. Software
+    /// can force individual interrupt sources. Offset 0x130.
+    int0_intf: u32,
+    /// IRQ1_INTE — 12-bit interrupt enable mask for NVIC line 1.
+    /// Offset 0x138.
+    pub int1_inte: u32,
+    /// IRQ1_INTF — 12-bit interrupt force for NVIC line 1. Offset 0x13C.
+    int1_intf: u32,
 }
 
 impl PioBlock {
@@ -53,6 +65,10 @@ impl PioBlock {
             pad_out: 0,
             pad_oe: 0,
             sm_enabled_mask: 0,
+            int0_inte: 0,
+            int0_intf: 0,
+            int1_inte: 0,
+            int1_intf: 0,
         }
     }
 
@@ -70,6 +86,10 @@ impl PioBlock {
         self.pad_out = 0;
         self.pad_oe = 0;
         self.sm_enabled_mask = 0;
+        self.int0_inte = 0;
+        self.int0_intf = 0;
+        self.int1_inte = 0;
+        self.int1_intf = 0;
     }
 
     /// True iff at least one SM in the block is enabled. Chip-side
@@ -108,6 +128,41 @@ impl PioBlock {
     #[inline]
     pub fn pending_irqs(&self) -> u32 {
         self.irq_flags as u32
+    }
+
+    /// Compute the 12-bit raw interrupt status (INTR register).
+    ///
+    /// Layout per RP2350 datasheet PIO register map:
+    ///   bits [11:8] = SM3..SM0 TXNFULL (TX not full → 1)
+    ///   bits  [7:4] = SM3..SM0 RXNEMPTY (RX not empty → 1)
+    ///   bits  [3:0] = IRQ flags 3..0 (from `irq_flags`)
+    ///
+    /// The NVIC-routable set is `IRQ[3:0]` plus the FIFO status bits;
+    /// `IRQ[7:4]` are intra-PIO signalling only and do NOT appear in INTR.
+    #[inline]
+    pub fn raw_intr(&self) -> u32 {
+        let mut v: u32 = (self.irq_flags as u32) & 0xF;
+        for i in 0..4u32 {
+            if !self.sm[i as usize].rx_fifo.is_empty() {
+                v |= 1 << (4 + i);
+            }
+            if !self.sm[i as usize].tx_fifo.is_full() {
+                v |= 1 << (8 + i);
+            }
+        }
+        v
+    }
+
+    /// Effective interrupt status for NVIC line 0: `(INTR & INTE) | INTF`.
+    #[inline]
+    pub fn int0_ints(&self) -> u32 {
+        (self.raw_intr() & self.int0_inte) | self.int0_intf
+    }
+
+    /// Effective interrupt status for NVIC line 1: `(INTR & INTE) | INTF`.
+    #[inline]
+    pub fn int1_ints(&self) -> u32 {
+        (self.raw_intr() & self.int1_inte) | self.int1_intf
     }
 
     /// DREQ (data-request) for SM `sm`'s TX FIFO: true when the FIFO
@@ -355,6 +410,20 @@ impl PioBlock {
             0x048..=0x0C4 => 0,
             // Per-SM registers (stride 0x18, SM0 at 0x0C8)
             0x0C8..=0x127 => self.read_sm_reg(offset),
+            // INTR: raw interrupt status (read-only, 12 bits)
+            0x128 => self.raw_intr(),
+            // IRQ0_INTE
+            0x12C => self.int0_inte,
+            // IRQ0_INTF
+            0x130 => self.int0_intf,
+            // IRQ0_INTS: effective status = (INTR & INTE) | INTF
+            0x134 => self.int0_ints(),
+            // IRQ1_INTE
+            0x138 => self.int1_inte,
+            // IRQ1_INTF
+            0x13C => self.int1_intf,
+            // IRQ1_INTS: effective status = (INTR & INTE) | INTF
+            0x140 => self.int1_ints(),
             _ => 0,
         }
     }
@@ -418,6 +487,56 @@ impl PioBlock {
             }
             // Per-SM registers
             0x0C8..=0x127 => self.write_sm_reg(offset, val),
+            // INTR: read-only
+            0x128 => {}
+            // IRQ0_INTE (12-bit mask, alias-aware)
+            0x12C => {
+                let mask = val & 0xFFF;
+                match alias {
+                    0 => self.int0_inte = mask,
+                    1 => self.int0_inte ^= mask,
+                    2 => self.int0_inte |= mask,
+                    3 => self.int0_inte &= !mask,
+                    _ => {}
+                }
+            }
+            // IRQ0_INTF (12-bit force, alias-aware)
+            0x130 => {
+                let mask = val & 0xFFF;
+                match alias {
+                    0 => self.int0_intf = mask,
+                    1 => self.int0_intf ^= mask,
+                    2 => self.int0_intf |= mask,
+                    3 => self.int0_intf &= !mask,
+                    _ => {}
+                }
+            }
+            // IRQ0_INTS: read-only
+            0x134 => {}
+            // IRQ1_INTE (12-bit mask, alias-aware)
+            0x138 => {
+                let mask = val & 0xFFF;
+                match alias {
+                    0 => self.int1_inte = mask,
+                    1 => self.int1_inte ^= mask,
+                    2 => self.int1_inte |= mask,
+                    3 => self.int1_inte &= !mask,
+                    _ => {}
+                }
+            }
+            // IRQ1_INTF (12-bit force, alias-aware)
+            0x13C => {
+                let mask = val & 0xFFF;
+                match alias {
+                    0 => self.int1_intf = mask,
+                    1 => self.int1_intf ^= mask,
+                    2 => self.int1_intf |= mask,
+                    3 => self.int1_intf &= !mask,
+                    _ => {}
+                }
+            }
+            // IRQ1_INTS: read-only
+            0x140 => {}
             _ => {}
         }
     }

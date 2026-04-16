@@ -44,6 +44,12 @@ pub const PIO_SM_CLKDIV_OFF: u32 = 0x00;
 pub const PIO_SM_EXECCTRL_OFF: u32 = 0x04;
 pub const PIO_SM_ADDR_OFF: u32 = 0x0C;
 pub const PIO_SM_PINCTRL_OFF: u32 = 0x14;
+pub const PIO_IRQ_OFF: u32 = 0x030;
+pub const PIO_INTR_OFF: u32 = 0x128;
+pub const PIO_IRQ0_INTE_OFF: u32 = 0x12C;
+pub const PIO_IRQ0_INTS_OFF: u32 = 0x134;
+pub const PIO_IRQ1_INTE_OFF: u32 = 0x138;
+pub const PIO_IRQ1_INTS_OFF: u32 = 0x140;
 
 /// Compute the absolute address of `SMx_<field>` for a given PIO base.
 pub const fn pio_sm_addr(base: u32, sm: u32, field_off: u32) -> u32 {
@@ -765,7 +771,11 @@ const UART0_UARTLCR_H: u32 = UART0_BASE + 0x2C;
 const UART0_UARTCR: u32 = UART0_BASE + 0x30;
 const UARTLCR_H_FEN: u32 = 1 << 4;
 const UARTCR_UARTEN: u32 = 1 << 0;
+const UARTCR_LBE: u32 = 1 << 7;
 const UARTCR_TXE: u32 = 1 << 8;
+const UARTCR_RXE: u32 = 1 << 9;
+const UART0_UARTIBRD: u32 = UART0_BASE + 0x24;
+const UART0_UARTFBRD: u32 = UART0_BASE + 0x28;
 /// UARTFR.TXFE at `0x4007_0018` bit 7 — asserted when TX FIFO is
 /// empty, which is the post-drain steady state after one byte ticks out.
 const UARTFR_TXFE_BIT: u32 = 1 << 7;
@@ -829,6 +839,28 @@ const S_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
 ];
 const O_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
     (UART0_UARTFR, UARTFR_TXFE_BIT),
+];
+
+/// UART0 RX loopback — enable FIFO + UARTEN + TXE + RXE + LBE,
+/// program baud (IBRD=81, FBRD=24 = 115200 @ 150 MHz clk_peri), push
+/// 0x42 via UARTDR, advance enough sysclks for baud-timed TX drain +
+/// loopback into RX FIFO. Observe UARTFR (RXFE clear) and UARTDR
+/// readback (pop 0x42 from RX FIFO).
+const S_UART0_RX_LOOPBACK: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (UART0_UARTIBRD, 81),
+    (UART0_UARTFBRD, 24),
+    (UART0_UARTLCR_H, UARTLCR_H_FEN),
+    (UART0_UARTCR, UARTCR_UARTEN | UARTCR_LBE | UARTCR_TXE | UARTCR_RXE),
+    (UART0_UARTDR, 0x42),
+];
+const O_UART0_RX_LOOPBACK: &[(u32, u32)] = &[
+    // UARTFR: full-word mask — RXFE (bit 4) must be clear on both sides
+    // because the RX FIFO holds the looped-back byte. TXFE (bit 7)
+    // must be set because the TX byte has drained.
+    (UART0_UARTFR, 0xFFFF_FFFF),
+    // UARTDR: reading pops the RX FIFO head — should be 0x42.
+    (UART0_UARTDR, 0xFF),
 ];
 
 /// SPI0 loopback single-byte — enable + loopback, push 0xA5, observe
@@ -960,6 +992,36 @@ const O_ADC_ROUND_ROBIN_2CH: &[(u32, u32)] = &[
     (ADC_CS_RP2350, ADC_CS_AINSEL_MASK),
 ];
 
+// S_PIO0_INT_ROUTING_SPLIT — Phase 4.1: PIO0 SM0 asserts IRQ flag 0;
+// INT0_INTE enables flag 0 only, INT1_INTE enables flag 1 only.
+// After running, IRQ0_INTS must show bit 0 set, IRQ1_INTS must be 0.
+const S_PIO0_INT_ROUTING_SPLIT: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
+    // INSTR_MEM[0] = IRQ SET 0 (opcode 110, no delay, index=0): 0xC000
+    (pio_instr_mem_addr(PIO0_BASE, 0), 0xC000),
+    // INSTR_MEM[1] = JMP 1 (spin in place): 0x0001
+    (pio_instr_mem_addr(PIO0_BASE, 1), 0x0001),
+    // SM0 CLKDIV = 1.0 (integer=1, frac=0)
+    (pio_sm_addr(PIO0_BASE, 0, PIO_SM_CLKDIV_OFF), 0x0001_0000),
+    // INT0_INTE = 0x001 — enable IRQ flag 0 on NVIC line 0
+    (PIO0_BASE + PIO_IRQ0_INTE_OFF, 0x001),
+    // INT1_INTE = 0x002 — enable IRQ flag 1 on NVIC line 1
+    // (SM0 never sets flag 1, so line 1 must stay quiet)
+    (PIO0_BASE + PIO_IRQ1_INTE_OFF, 0x002),
+    // Enable SM0
+    (PIO0_BASE + PIO_CTRL_OFF + ALIAS_SET, 0x0000_0001),
+];
+const O_PIO0_INT_ROUTING_SPLIT: &[(u32, u32)] = &[
+    // IRQ0_INTS: bit 0 must be set (IRQ flag 0 enabled on line 0).
+    // Mask to 12-bit field.
+    (PIO0_BASE + PIO_IRQ0_INTS_OFF, 0xFFF),
+    // IRQ1_INTS: must be 0 (flag 1 never set by SM0).
+    // Mask to 12-bit field — all bits must be 0.
+    (PIO0_BASE + PIO_IRQ1_INTS_OFF, 0xFFF),
+    // Also check raw IRQ register — bit 0 must be set (SM0 asserted it).
+    (PIO0_BASE + PIO_IRQ_OFF, 0xFF),
+];
+
 /// Initial catalog. New scenarios append to the end so filter-by-substring
 /// output stays ordered as cases are added.
 pub const SCENARIOS: &[PeriphScenario] = &[
@@ -1070,6 +1132,17 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe_pins: 0,
         custom_sled: None,
         // 1 byte at 115200 baud ~ 87 us; at 150 MHz ~ 13_000 sys_clks.
+        min_sysclks: 10_000,
+    },
+    // Phase 4.2 — UART0 RX via internal loopback.
+    PeriphScenario {
+        name: "uart0_rx_loopback",
+        setup: S_UART0_RX_LOOPBACK,
+        max_sysclks: 60_000,
+        observe: O_UART0_RX_LOOPBACK,
+        observe_pins: 0,
+        custom_sled: None,
+        // 1 byte at 115200 baud ~ 13_000 sys_clks for TX drain + loopback.
         min_sysclks: 10_000,
     },
     // Phase 2 — SPI0 loopback round-trip.
@@ -1209,6 +1282,21 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         custom_sled: None,
         // 2 conversions: 2 × 96 adc ticks × (150/48) sys/adc ≈ 600 sys_clks.
         min_sysclks: 300,
+    },
+    // Phase 4.1 — PIO0 INTn routing split. SM0 asserts IRQ flag 0;
+    // INT0_INTE enables flag 0 only (→ IRQ0_INTS has bit 0 set).
+    // INT1_INTE enables flag 1 only (→ IRQ1_INTS stays 0 because SM0
+    // never sets flag 1). Validates that the emulator routes each PIO
+    // IRQ flag through the per-line INTE mask rather than over-routing
+    // to both lines.
+    PeriphScenario {
+        name: "pio0_int_routing_split",
+        setup: S_PIO0_INT_ROUTING_SPLIT,
+        max_sysclks: 100,
+        observe: O_PIO0_INT_ROUTING_SPLIT,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
     },
 ];
 
