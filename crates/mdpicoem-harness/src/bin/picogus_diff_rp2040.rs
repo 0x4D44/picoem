@@ -91,10 +91,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mdpicoem_harness::i2s_capture::{self, I2sCapture};
+use mdpicoem_devices::I2sCapture;
 use mdpicoem_harness::picogus_pins::{
     ISA_AD0 as PIN_AD0, ISA_AD_COUNT as PIN_AD_COUNT, ISA_EXTERNAL_PIN_MASK, ISA_IOR as PIN_IOR,
-    ISA_IOW as PIN_IOW,
+    ISA_IOW as PIN_IOW, I2S_BCLK, I2S_DOUT, I2S_LRCLK,
 };
 use mdrp2040::{Config, Emulator, EmulatorBuilder};
 
@@ -381,7 +381,7 @@ impl<S: IsaSink> CapturingSink<S> {
     pub fn new(inner: S, sys_clk_hz: u32) -> Self {
         Self {
             inner,
-            capture: I2sCapture::new(sys_clk_hz),
+            capture: I2sCapture::new(sys_clk_hz, I2S_BCLK, I2S_LRCLK, I2S_DOUT),
         }
     }
 
@@ -880,7 +880,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let out_path = args
         .out
         .clone()
-        .unwrap_or_else(|| i2s_capture::default_out_path(&args.trace));
+        .unwrap_or_else(|| mdpicoem_harness::default_out_path(&args.trace));
 
     let wall_start = Instant::now();
     let mut sink = CapturingSink::new(emu, DEFAULT_SYS_CLK_HZ);

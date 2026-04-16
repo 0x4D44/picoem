@@ -4,10 +4,12 @@
 //!
 //! | GPIO | Role                                         |
 //! |------|----------------------------------------------|
-//! |  14  | SCLK — rising edge latches DATA              |
-//! |  15  | DATA — MSB-first, stable while SCLK is high  |
-//! |  16  | CS   — active low; frames a transaction      |
+//! | SCLK | rising edge latches DATA                     |
+//! | DATA | MSB-first, stable while SCLK is high         |
+//! | CS   | active low; frames a transaction             |
 //! |------|----------------------------------------------|
+//!
+//! Pin numbers are configurable via [`LcdDecoder::new`].
 //!
 //! Each frame is the sequence of bytes shifted in between a CS falling edge
 //! and the next CS rising edge. The first byte of a frame is the opcode
@@ -25,24 +27,38 @@
 //! `0x00` and `0x04..=0xFF`) is silently dropped — no characters written,
 //! no state change. A zero-byte frame is likewise a no-op.
 //!
-//! The decoder is fed one sample per sim-thread quantum via [`sample`].
+//! The decoder is fed one sample per sim-thread quantum via [`LcdDecoder::sample`].
 //! Because it only sees the GPIO state at the end of each quantum, the
 //! firmware must hold every signal level that the decoder needs to observe
 //! for at least `2 * quantum_cycles` cycles (the contract in LLD §4.1).
-//! `roms/rp2350/gen_lcd_demo.py` satisfies this with a ~300-cycle inline delay
-//! loop at every edge.
 
-use crate::snapshot::LcdState;
-
-pub const SCLK_BIT: u32 = 1 << 14;
-pub const DATA_BIT: u32 = 1 << 15;
-pub const CS_BIT: u32 = 1 << 16;
+// ---- observable state -------------------------------------------------------
 
 const LCD_COLS: usize = 20;
 const LCD_ROWS: usize = 2;
 
+#[derive(Clone)]
+pub struct LcdState {
+    pub rows: [[u8; 20]; 2],
+    pub cursor: (u8, u8),
+}
+
+impl Default for LcdState {
+    fn default() -> Self {
+        Self {
+            rows: [[b' '; 20]; 2],
+            cursor: (0, 0),
+        }
+    }
+}
+
+// ---- decoder ----------------------------------------------------------------
+
 #[derive(Default)]
 pub struct LcdDecoder {
+    sclk_mask: u32,
+    data_mask: u32,
+    cs_mask: u32,
     state: LcdState,
     prev_gpio: u32,
     have_prev: bool,
@@ -53,8 +69,13 @@ pub struct LcdDecoder {
 }
 
 impl LcdDecoder {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(sclk_pin: u8, data_pin: u8, cs_pin: u8) -> Self {
+        Self {
+            sclk_mask: 1u32 << sclk_pin,
+            data_mask: 1u32 << data_pin,
+            cs_mask: 1u32 << cs_pin,
+            ..Self::default()
+        }
     }
 
     /// Feed one post-quantum GPIO snapshot into the decoder.
@@ -65,11 +86,11 @@ impl LcdDecoder {
             return;
         }
 
-        let cs_now = (gpio_out & CS_BIT) == 0;
-        let cs_prev = (self.prev_gpio & CS_BIT) == 0;
-        let sclk_now = (gpio_out & SCLK_BIT) != 0;
-        let sclk_prev = (self.prev_gpio & SCLK_BIT) != 0;
-        let data_now = (gpio_out & DATA_BIT) != 0;
+        let cs_now = (gpio_out & self.cs_mask) == 0;
+        let cs_prev = (self.prev_gpio & self.cs_mask) == 0;
+        let sclk_now = (gpio_out & self.sclk_mask) != 0;
+        let sclk_prev = (self.prev_gpio & self.sclk_mask) != 0;
+        let data_now = (gpio_out & self.data_mask) != 0;
 
         let cs_falling = cs_now && !cs_prev;
 
@@ -108,7 +129,7 @@ impl LcdDecoder {
         // (e.g. leftover state from a prior firmware, or the very first
         // sample of a run). Without this, bit 7 would be silently lost.
         if cs_falling {
-            self.prev_gpio &= !SCLK_BIT;
+            self.prev_gpio &= !self.sclk_mask;
         }
     }
 
@@ -187,17 +208,21 @@ impl LcdDecoder {
 mod tests {
     use super::*;
 
+    const TEST_SCLK: u8 = 14;
+    const TEST_DATA: u8 = 15;
+    const TEST_CS: u8 = 16;
+
     /// Builds a GPIO word with the three LCD pins set to the requested state.
     fn make_gpio(cs_low: bool, sclk_high: bool, data_high: bool) -> u32 {
         let mut g: u32 = 0;
         if !cs_low {
-            g |= CS_BIT;
+            g |= 1u32 << TEST_CS;
         }
         if sclk_high {
-            g |= SCLK_BIT;
+            g |= 1u32 << TEST_SCLK;
         }
         if data_high {
-            g |= DATA_BIT;
+            g |= 1u32 << TEST_DATA;
         }
         g
     }
@@ -240,7 +265,7 @@ mod tests {
 
     #[test]
     fn clear_set_cursor_and_write_hi() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
 
         // Frame 1: CLEAR
         push_frame(&mut dec, &[0x01]);
@@ -258,7 +283,7 @@ mod tests {
 
     #[test]
     fn clear_fills_rows_with_spaces_and_homes_cursor() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
 
         // Dirty the display first by writing an 'X' at (5, 1).
         push_frame(&mut dec, &[0x02, 5, 1]);
@@ -276,7 +301,7 @@ mod tests {
 
     #[test]
     fn wrap_and_scroll_when_row1_overflows() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
 
         // Clear, then position cursor at (19, 1).
         push_frame(&mut dec, &[0x01]);
@@ -297,7 +322,7 @@ mod tests {
 
     #[test]
     fn unknown_opcode_is_silently_dropped() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
         // Prime with a known-good state.
         push_frame(&mut dec, &[0x03, b'X']);
         let before = dec.state();
@@ -317,7 +342,7 @@ mod tests {
 
     #[test]
     fn zero_byte_frame_is_a_noop() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
         // Prime with a known-good state.
         push_frame(&mut dec, &[0x03, b'Y']);
         let before = dec.state();
@@ -333,7 +358,7 @@ mod tests {
 
     #[test]
     fn set_cursor_missing_row_arg_defaults_to_zero() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
         // SET_CURSOR with col=5 but no row byte.
         push_frame(&mut dec, &[0x02, 5]);
         assert_eq!(dec.state().cursor, (5, 0));
@@ -341,7 +366,7 @@ mod tests {
 
     #[test]
     fn set_cursor_out_of_range_args_clamp() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
         push_frame(&mut dec, &[0x02, 25, 5]);
         // col clamps to 19 (LCD_COLS-1), row clamps to 1 (LCD_ROWS-1).
         assert_eq!(dec.state().cursor, (19, 1));
@@ -349,7 +374,7 @@ mod tests {
 
     #[test]
     fn col_wrap_without_scroll_keeps_cursor_in_range() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
         // CLEAR, SET_CURSOR (19, 0), WRITE "XY".
         push_frame(&mut dec, &[0x01]);
         push_frame(&mut dec, &[0x02, 19, 0]);
@@ -368,7 +393,7 @@ mod tests {
     fn cursor_never_out_of_range_after_single_row0_write() {
         // Regression for the transient (20, 1) cursor: after one write at
         // col=19, the cursor should already have wrapped to col=0 row=1.
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
         push_frame(&mut dec, &[0x01]);
         push_frame(&mut dec, &[0x02, 19, 0]);
         push_frame(&mut dec, &[0x03, b'Z']);
@@ -382,7 +407,7 @@ mod tests {
 
     #[test]
     fn mid_byte_frame_abort_drops_partial_byte() {
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
         // Prime the display with a known 'Q'.
         push_frame(&mut dec, &[0x03, b'Q']);
         let before = dec.state();
@@ -419,7 +444,7 @@ mod tests {
         //
         // Payload: [0x81, 0xAA, 0x55, 0x00]
         //   Post-fix: rx_buf = [0x81, 0xAA, 0x55, 0x00]. first=0x81 is an
-        //             unknown opcode → frame dropped → cursor stays (0,0),
+        //             unknown opcode -> frame dropped -> cursor stays (0,0),
         //             rows blank.
         //   Pre-fix:  bit 7 of byte 0 lost. Decoder shifts in 7 bits of
         //             0x81 (0b0000001) + bit 7 of 0xAA (1) = 0b00000011
@@ -428,7 +453,7 @@ mod tests {
         //             runs WRITE, writes 'T' at (0,0) and 0xAA at (1,0),
         //             advances cursor to (2, 0). Test fails on both the
         //             rows[0][0]=='T' and cursor==(2,0) assertions.
-        let mut dec = LcdDecoder::new();
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
 
         // Idle state with SCLK HIGH — simulate the hazard.
         dec.sample(make_gpio(false, true, false));

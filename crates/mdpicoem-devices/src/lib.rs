@@ -14,6 +14,10 @@
 //!   outside the step loop. Called by the app or harness, not by the
 //!   emulator core.
 
+pub mod i2s_capture;
+pub mod lcd;
 pub mod psram;
 
+pub use i2s_capture::I2sCapture;
+pub use lcd::{LcdDecoder, LcdState};
 pub use psram::Psram;

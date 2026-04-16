@@ -1,17 +1,16 @@
-//! I2S capture → WAV writer for `picogus_diff_rp2040`.
+//! I2S capture -> WAV writer.
 //!
-//! The PicoGUS v4.0.0 firmware emits a stereo 16-bit I2S stream on
-//! GPIO 16 (DOUT), 17 (BCLK) and 18 (LRCLK) — see [`crate::picogus_pins`]
-//! for the authoritative mapping sourced from
-//! <https://github.com/polpo/picogus/blob/v4.0.0/sw/CMakeLists.txt>
-//! lines 84–88.
+//! Decodes a stereo 16-bit I2S stream from GPIO pins and writes
+//! the captured frames as a canonical 16-bit PCM WAV file. The pin
+//! numbers are parameterised at construction time so the same capture
+//! logic works for any board mapping (PicoGUS, custom test rigs, etc.).
 //!
 //! [`I2sCapture::tick`] is called **once per emulator cycle** with the
 //! current merged GPIO state (from `emu.bus.gpio_in`) and the caller's
 //! system-clock cycle stamp. The cycle stamp must track actual sysclks
 //! elapsed (e.g. `Emulator::cycles()`) — not the number of `tick` calls
 //! — otherwise `inferred_sample_rate_hz` drifts by a factor of the
-//! average cycles-per-instruction (~1.5–2×) when the caller steps one
+//! average cycles-per-instruction (~1.5-2x) when the caller steps one
 //! instruction (multi-cycle) per tick. See [`Self::tick`] for details.
 //!
 //! The capture observes BCLK and LRCLK edges and assembles 16-bit PCM
@@ -36,9 +35,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-
-use crate::picogus_pins::{I2S_BCLK, I2S_DOUT, I2S_LRCLK};
+use std::path::Path;
 
 /// Which channel the next finalised sample belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +55,11 @@ pub const WAV_HEADER_BYTES: usize = 44;
 /// frames.
 #[derive(Debug)]
 pub struct I2sCapture {
+    // Pin assignments (GPIO numbers).
+    bclk_pin: u8,
+    lrclk_pin: u8,
+    dout_pin: u8,
+
     // Last observed pin levels, for edge detection.
     prev_bclk: bool,
     prev_lrclk: bool,
@@ -100,9 +102,14 @@ pub struct I2sCapture {
 impl I2sCapture {
     /// Build a new capture expecting the emulator to run at
     /// `sys_clk_hz` (used only for sample-rate inference on the
-    /// captured output).
-    pub fn new(sys_clk_hz: u32) -> Self {
+    /// captured output). The three pin numbers identify which GPIO
+    /// bits in the `pads` argument to [`Self::tick`] carry the I2S
+    /// signals.
+    pub fn new(sys_clk_hz: u32, bclk_pin: u8, lrclk_pin: u8, dout_pin: u8) -> Self {
         Self {
+            bclk_pin,
+            lrclk_pin,
+            dout_pin,
             prev_bclk: false,
             prev_lrclk: false,
             accumulator: 0,
@@ -128,9 +135,9 @@ impl I2sCapture {
     /// average cycles-per-instruction and stamp the resulting WAV with
     /// the wrong sample rate.
     pub fn tick(&mut self, pads: u32, now_cycles: u64) {
-        let bclk = pads & (1u32 << I2S_BCLK) != 0;
-        let lrclk = pads & (1u32 << I2S_LRCLK) != 0;
-        let dout = pads & (1u32 << I2S_DOUT) != 0;
+        let bclk = pads & (1u32 << self.bclk_pin) != 0;
+        let lrclk = pads & (1u32 << self.lrclk_pin) != 0;
+        let dout = pads & (1u32 << self.dout_pin) != 0;
 
         // LRCLK edge: finalise the in-flight sample, assign it to the
         // channel matching the *previous* LRCLK level, then reset the
@@ -318,21 +325,6 @@ pub fn write_wav(path: &Path, sample_rate_hz: u32, frames: &[(i16, i16)]) -> io:
     Ok(())
 }
 
-/// Compute the default output WAV path for a given trace path.
-/// Places the file under the harness's `oracles/` directory using the
-/// trace's stem, matching the HLD Stage 5 spec:
-/// `crates/mdpicoem-harness/oracles/picogus_<stem>.wav`.
-pub fn default_out_path(trace: &Path) -> PathBuf {
-    let stem = trace
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("capture");
-    PathBuf::from("crates")
-        .join("mdpicoem-harness")
-        .join("oracles")
-        .join(format!("picogus_{stem}.wav"))
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -340,19 +332,25 @@ pub fn default_out_path(trace: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    // Local pin constants for tests — match PicoGUS v4.0.0 mapping.
+    const BCLK: u8 = 17;
+    const LRCLK: u8 = 18;
+    const DOUT: u8 = 16;
 
     /// One "cycle" of the pin bus, as fed to [`I2sCapture::tick`].
     /// Helper to make the scripted waveform tests readable.
     fn pads(bclk: bool, lrclk: bool, dout: bool) -> u32 {
         let mut p = 0u32;
         if bclk {
-            p |= 1u32 << I2S_BCLK;
+            p |= 1u32 << BCLK;
         }
         if lrclk {
-            p |= 1u32 << I2S_LRCLK;
+            p |= 1u32 << LRCLK;
         }
         if dout {
-            p |= 1u32 << I2S_DOUT;
+            p |= 1u32 << DOUT;
         }
         p
     }
@@ -388,7 +386,7 @@ mod tests {
         // word we clock in is discarded. So encode: discard-left,
         // right=unused, left=0x1234, right=0x5678, then a trailing
         // LRCLK edge to flush the last right sample.
-        let mut cap = I2sCapture::new(125_000_000);
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
         let mut cycle: u64 = 0;
 
         // Prime: LRCLK low, clock 16 bits of junk (discarded).
@@ -480,7 +478,7 @@ mod tests {
 
     #[test]
     fn no_activity_produces_empty_wav() {
-        let mut cap = I2sCapture::new(125_000_000);
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
         for i in 0..10_000u64 {
             cap.tick(0, i);
         }
@@ -510,19 +508,19 @@ mod tests {
     #[test]
     fn sample_rate_inferred_from_lrclk() {
         // Script a 48 kHz stream at 125 MHz sys_clk. One full LRCLK
-        // period = 125_000_000 / 48_000 cycles ≈ 2604.17 cycles. We
-        // use an exact-integer alternative: 4 kHz at 64 MHz sys_clk →
+        // period = 125_000_000 / 48_000 cycles ~= 2604.17 cycles. We
+        // use an exact-integer alternative: 4 kHz at 64 MHz sys_clk ->
         // period 16000 cycles, half-period 8000.
         //
         // Simpler: fake sys_clk = 32_000, LRCLK period = 2 cycles
-        // → 16 kHz. Generate many LRCLK edges and check the inferred
+        // -> 16 kHz. Generate many LRCLK edges and check the inferred
         // rate lands at 16 kHz.
         //
         // This test explicitly passes a monotonic sysclk counter to
         // `tick` to prove `inferred_sample_rate_hz` consumes the
         // externally supplied stamp (not an internal tick count).
         let sys_clk = 32_000u32;
-        let mut cap = I2sCapture::new(sys_clk);
+        let mut cap = I2sCapture::new(sys_clk, BCLK, LRCLK, DOUT);
 
         // 10 full frames => 20 LRCLK edges, each half-period 1 cycle.
         // We need non-trivial half-periods to avoid the first/last
@@ -553,12 +551,12 @@ mod tests {
     fn pad_mask_respects_pin_mapping() {
         // Drive BCLK/LRCLK on the WRONG pins (e.g. GPIO 7 and 8, which
         // are part of the ISA AD bus). Expect zero frames, zero edges —
-        // the capture only looks at bits I2S_BCLK/I2S_LRCLK/I2S_DOUT.
+        // the capture only looks at bits bclk_pin/lrclk_pin/dout_pin.
         const WRONG_BCLK: u8 = 7;
         const WRONG_LRCLK: u8 = 8;
         const WRONG_DOUT: u8 = 9;
 
-        let mut cap = I2sCapture::new(125_000_000);
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
         let mut lrclk = false;
         let mut cycle: u64 = 0;
         for _ in 0..200 {
@@ -586,19 +584,6 @@ mod tests {
             "wrong-pin activity must not produce frames"
         );
         assert_eq!(cap.lrclk_edge_count(), 0);
-    }
-
-    #[test]
-    fn default_out_path_uses_stem() {
-        let expected_dir = PathBuf::from("crates")
-            .join("mdpicoem-harness")
-            .join("oracles");
-
-        let p = default_out_path(Path::new("fixtures/sample_gus.trace"));
-        assert_eq!(p, expected_dir.join("picogus_sample_gus.wav"));
-
-        let p = default_out_path(Path::new("foo.bin"));
-        assert_eq!(p, expected_dir.join("picogus_foo.wav"));
     }
 
     #[test]

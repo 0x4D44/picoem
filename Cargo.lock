@@ -1453,17 +1453,18 @@ dependencies = [
 
 [[package]]
 name = "mdpicoem-devices"
-version = "0.2.0"
+version = "0.4.0"
 
 [[package]]
 name = "mdpicoem-harness"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "chrono",
  "ctrlc",
  "humantime",
  "libc",
  "mdpicoem-common",
+ "mdpicoem-devices",
  "mdrp2040",
  "mdrp2350",
  "probe-rs",
@@ -1484,10 +1485,11 @@ dependencies = [
 
 [[package]]
 name = "mdrp2040app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossterm",
+ "mdpicoem-devices",
  "mdrp2040",
  "ratatui",
  "tracing",

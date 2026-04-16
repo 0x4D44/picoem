@@ -24,11 +24,27 @@ pub fn harness_tracing_init() {
         .try_init();
 }
 
+use std::path::{Path, PathBuf};
+
+/// Compute the default output WAV path for a given trace path.
+/// Places the file under the harness's `oracles/` directory using the
+/// trace's stem:
+/// `crates/mdpicoem-harness/oracles/picogus_<stem>.wav`.
+pub fn default_out_path(trace: &Path) -> PathBuf {
+    let stem = trace
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("capture");
+    PathBuf::from("crates")
+        .join("mdpicoem-harness")
+        .join("oracles")
+        .join(format!("picogus_{stem}.wav"))
+}
+
 pub mod bank_conflict_cases;
 pub mod cycle_cases;
 pub mod dualcore_cases;
 pub mod gdb_client;
-pub mod i2s_capture;
 pub mod ieee754_ref;
 pub mod isr_scenarios;
 pub mod isr_scenarios_rp2040;
@@ -6991,5 +7007,20 @@ mod tests {
     fn fpu_smoke_test_vadd() {
         let mut bus = Bus::new();
         run_fpu_smoke_test(&mut bus).unwrap();
+    }
+
+    // -- default_out_path --
+
+    #[test]
+    fn default_out_path_uses_stem() {
+        let expected_dir = PathBuf::from("crates")
+            .join("mdpicoem-harness")
+            .join("oracles");
+
+        let p = default_out_path(Path::new("fixtures/sample_gus.trace"));
+        assert_eq!(p, expected_dir.join("picogus_sample_gus.wav"));
+
+        let p = default_out_path(Path::new("foo.bin"));
+        assert_eq!(p, expected_dir.join("picogus_foo.wav"));
     }
 }

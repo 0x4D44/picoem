@@ -9,7 +9,7 @@ use std::time::Instant;
 use mdrp2040::{Config, Emulator, Pacer};
 
 use crate::devices::bench::BenchmarkPoller;
-use crate::devices::lcd::LcdDecoder;
+use mdpicoem_devices::LcdDecoder;
 use crate::snapshot::Snapshot;
 
 pub struct FirmwareBytes {
@@ -38,7 +38,7 @@ pub fn run(
     let qc = pacer.quantum_cycles();
     let start = Instant::now();
 
-    let mut lcd = LcdDecoder::new();
+    let mut lcd = LcdDecoder::new(14, 15, 16);
     let mut bench = BenchmarkPoller::new();
 
     // Windowed MHz measurement: update every ~500ms for a responsive reading
