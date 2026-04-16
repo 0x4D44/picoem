@@ -118,6 +118,14 @@ pub trait CoreBus {
     fn extra_wait_states(&self) -> u32;
     fn reset_extra_wait_states(&mut self);
 
+    /// Address of the most recently fetched instruction. Used by
+    /// `CortexM33::decode` to determine whether the current fetch is
+    /// sequential (prefetch buffer absorbs bank 2/6 penalty) or
+    /// non-sequential (penalty applies). Silicon fidelity fix from
+    /// test_silicon baseline campaign (2026-04-16).
+    fn last_fetch_addr(&self) -> u32;
+    fn set_last_fetch_addr(&mut self, addr: u32);
+
     /// MMIO trace sink. TRANSIENT: used by `CortexM33`'s PPB-intercept
     /// read/write wrappers so PPB accesses land in the same wire-format
     /// stream as ordinary bus accesses.

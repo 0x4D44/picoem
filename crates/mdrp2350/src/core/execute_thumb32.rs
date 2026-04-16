@@ -616,7 +616,7 @@ impl CortexM33 {
             }
             _ => return 1, // undefined: signed word or size=11
         }
-        if load { 2 } else { 2 } // M33 measured: 2 cycles (SRAM, zero-wait-state)
+        if load { 2 } else if addr >> 28 == 0xD { 1 } else { 2 } // SIO stores single-cycle
     }
 
     // -- Load/store multiple -------------------------------------------------
@@ -742,7 +742,7 @@ impl CortexM33 {
             }
             // STREX always clears the local monitor per ARMv8-M §A3.4.
             self.exclusive_address = None;
-            return 2;
+            return if addr >> 28 == 0xD { 1 } else { 2 };
         }
 
         // LDREXB/LDREXH: hw0 = 0xE8Dx, hw1[11:4] selects size, hw1[3:0] = 0xF

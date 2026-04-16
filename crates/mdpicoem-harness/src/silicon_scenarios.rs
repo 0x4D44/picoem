@@ -21,7 +21,8 @@ pub const RESETS_RESET: u32 = RESETS_BASE + 0x00;
 pub const ALIAS_SET: u32 = 0x2000;
 pub const ALIAS_CLR: u32 = 0x3000;
 
-/// RESETS bits used by v1 scenarios.
+/// RESETS bits used by scenarios and cleanup.
+pub const RESET_ADC: u32 = 1 << 0;
 pub const RESET_IO_BANK0: u32 = 1 << 6;
 pub const RESET_PADS_BANK0: u32 = 1 << 9;
 pub const RESET_PIO0: u32 = 1 << 11;
@@ -55,6 +56,11 @@ pub const SIO_GPIO_IN: u32 = 0xD000_0004;
 pub const SIO_GPIO_OE: u32 = 0xD000_0030;
 pub const IO_BANK0_GPIO0_CTRL: u32 = 0x4002_8000 + 0x04;
 pub const PADS_BANK0_GPIO0: u32 = 0x4003_8000 + 0x04;
+
+/// PADS_BANK0 GPIO26 -- controls digital input buffer for ADC channel 0.
+pub const PADS_BANK0_GPIO26: u32 = 0x4003_8000 + 0x04 + (26 * 4);
+/// IO_BANK0 GPIO26_CTRL -- function select for ADC channel 0.
+pub const IO_BANK0_GPIO26_CTRL: u32 = 0x4002_8000 + (26 * 8) + 0x04;
 
 // PLL_SYS register offsets + CS.LOCK bit.
 pub const PLL_CS_OFF: u32 = 0x000;
@@ -695,8 +701,22 @@ const O_I2C0_BUS_SCAN_NACK: &[(u32, u32)] = &[
 /// ADC one-shot — enable, start once, advance enough sys_clks for a
 /// conversion to complete. Observe CS.READY set and CS.START_ONCE
 /// auto-cleared.
+///
+/// GPIO26 must be configured for analog input before starting the
+/// conversion: disable the digital input buffer (OD=1, IE=0 in
+/// PADS_BANK0) and set funcsel to NULL (31) in IO_BANK0. Without this,
+/// silicon's ADC sample-and-hold conflicts with the digital input
+/// driver and locks the APB bus, causing probe-rs ARM errors.
 const S_ADC_ONE_SHOT: &[(u32, u32)] = &[
+    // 1. Release all peripherals from reset (incl. ADC, IO_BANK0, PADS_BANK0).
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    // 2. Disable digital input buffer on GPIO26 pad (clear IE bit 6, set OD bit 7).
+    //    Reset value is 0x56 (IE=1, PUE=1, PDE=1, SCHMITT=1, DRIVE=4mA).
+    //    Target: 0x96 = OD=1, IE=0, rest unchanged.
+    (PADS_BANK0_GPIO26, 0x96),
+    // 3. Set GPIO26 funcsel to NULL (31) so the pin is routed to ADC, not digital.
+    (IO_BANK0_GPIO26_CTRL, 31),
+    // 4. Now safe to enable ADC and start one-shot conversion on channel 0.
     (ADC_CS_RP2350, CS_EN_BIT | CS_START_ONCE_BIT),
 ];
 const O_ADC_ONE_SHOT: &[(u32, u32)] = &[
@@ -1711,7 +1731,8 @@ pub fn run_against(
     }
     match core.read_word_32(RESETS_RESET as u64) {
         Ok(state) => {
-            let bits = RESET_PIO0
+            let bits = RESET_ADC
+                | RESET_PIO0
                 | RESET_PIO1
                 | RESET_PLL_SYS
                 | RESET_IO_BANK0

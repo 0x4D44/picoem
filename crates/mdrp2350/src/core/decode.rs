@@ -252,6 +252,13 @@ impl CortexM33 {
         // by `emit_mmio_trace`.
         bus.set_active_pc(pc, self.core_id);
 
+        // Is this fetch sequential from the previous instruction?
+        // The M33 prefetch buffer absorbs bank 2/6 penalty on sequential
+        // fetches. Read BEFORE the cache lookup (which may call
+        // populate_decode_cache).
+        let last = bus.last_fetch_addr();
+        let is_sequential = pc == last.wrapping_add(2) || pc == last.wrapping_add(4);
+
         // Cache lookup — by-value (`DecodedOp: Copy`), so no borrow on
         // `bus` survives into dispatch. Cache lives on `self`
         // (per-core) since Phase 3 follow-up #10.
@@ -273,6 +280,12 @@ impl CortexM33 {
         let is_wide = entry.is_wide();
         let is_pure = entry.is_pure();
         let flag_only = entry.is_flag_only();
+
+        // Update last_fetch_addr for the NEXT instruction's sequential
+        // check. For wide instructions the second halfword is at pc+2,
+        // so the next sequential PC is pc+4 (checked via wrapping_add(2)
+        // on the stored value pc+2).
+        bus.set_last_fetch_addr(if is_wide { pc.wrapping_add(2) } else { pc });
 
         // IT block state — identical to pre-cache behaviour.
         let in_it = self.it_state & 0xF != 0;
@@ -325,17 +338,18 @@ impl CortexM33 {
                 pc, hw0, hw1,
             );
 
-            // Fetch wait states are baked into the entry; no accumulator
-            // touch, just a direct add.
-            cycles + entry.fetch_wait as u32
+            // Apply bank penalty only on non-sequential fetches. The
+            // M33 prefetch buffer absorbs the penalty on sequential PC
+            // advances (PC+2 or PC+4).
+            let bank_penalty = if is_sequential { 0 } else { entry.fetch_wait as u32 };
+            cycles + bank_penalty
         } else {
             // Slow path — preserves existing semantics verbatim.
             bus.reset_extra_wait_states();
-            // Fetch contribution for this impure op must be accounted
-            // for the same way today's code does: add it into the
-            // accumulator before dispatch, so the final `+extra_wait_states()`
-            // folds it in exactly as the non-cached path would.
-            bus.add_extra_wait_states(entry.fetch_wait as u32);
+            // Fetch contribution: apply only on non-sequential fetches.
+            if !is_sequential {
+                bus.add_extra_wait_states(entry.fetch_wait as u32);
+            }
 
             if is_wide {
                 self.regs.set_pc(pc.wrapping_add(4));
@@ -377,10 +391,9 @@ impl CortexM33 {
     #[inline(never)]
     fn populate_decode_cache<B: CoreBus>(&mut self, bus: &mut B, pc: u32) -> DecodedOp {
         // Reset the accumulator so the fetch's wait-state contribution
-        // (sram bank 2/6 = +1, others = 0) can be captured cleanly in
-        // `fetch_wait`. The caller (`decode_execute`) will not look at
-        // `bus.extra_wait_states()` after we return; it uses
-        // `entry.fetch_wait` on both paths.
+        // can be captured cleanly. bus.read16(pc) no longer accumulates
+        // sram_bank_wait (removed from data paths), so extra_wait_states
+        // only catches non-SRAM fetch penalty (APB/XIP).
         bus.reset_extra_wait_states();
 
         let hw0 = bus.read16(pc, self.core_id);
@@ -410,9 +423,24 @@ impl CortexM33 {
             };
         }
 
-        // Whatever the two fetches charged is the fetch contribution.
-        // Max value is 2 (wide crossing bank 2/6 twice). u8 is ample.
-        let fetch_wait = bus.extra_wait_states().min(u8::MAX as u32) as u8;
+        // Compute raw SRAM bank penalty from the PC address. This is the
+        // penalty for a NON-sequential fetch; the caller (decode_execute)
+        // decides whether to apply it based on sequentiality at dispatch
+        // time. bus.read16(pc) no longer accumulates sram_bank_wait.
+        let sram_fetch_penalty: u8 = {
+            let off = pc & 0x000F_FFFF;
+            if off < 0x8_0000 {
+                let bank = (off >> 2) & 7;
+                if bank == 2 || bank == 6 { 1 } else { 0 }
+            } else {
+                0
+            }
+        };
+        // Capture any NON-SRAM fetch penalty (APB/XIP) that the bus read
+        // may have accumulated.
+        let extra_from_bus = bus.extra_wait_states().min(u8::MAX as u32) as u8;
+        bus.reset_extra_wait_states();
+        let fetch_wait = sram_fetch_penalty + extra_from_bus;
 
         let flag_only = !wide && is_thumb16_flag_only(hw0);
         let pure = classify_is_pure(hw0, hw1, wide);

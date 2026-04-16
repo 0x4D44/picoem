@@ -450,17 +450,17 @@ impl CortexM33 {
             0b000 => {
                 // STR Rt, [Rn, Rm]
                 self.bus_write32(addr, self.regs.r[rt], bus);
-                2 // M33 measured: 2 cycles
+                if addr >> 28 == 0xD { 1 } else { 2 } // SIO stores single-cycle
             }
             0b001 => {
                 // STRH Rt, [Rn, Rm]
                 self.bus_write16(addr, self.regs.r[rt] as u16, bus);
-                2 // M33 measured: 2 cycles
+                if addr >> 28 == 0xD { 1 } else { 2 }
             }
             0b010 => {
                 // STRB Rt, [Rn, Rm]
                 self.bus_write8(addr, self.regs.r[rt] as u8, bus);
-                2 // M33 measured: 2 cycles
+                if addr >> 28 == 0xD { 1 } else { 2 }
             }
             0b011 => {
                 // LDRSB Rt, [Rn, Rm]
@@ -503,7 +503,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 2);
         self.bus_write32(addr, self.regs.r[rt], bus);
-        2 // M33 measured: 2 cycles
+        if addr >> 28 == 0xD { 1 } else { 2 } // SIO stores single-cycle
     }
 
     /// LDR Rt, [Rn, #imm5*4] (01101_imm5_Rn_Rt).
@@ -523,7 +523,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5);
         self.bus_write8(addr, self.regs.r[rt] as u8, bus);
-        2 // M33 measured: 2 cycles
+        if addr >> 28 == 0xD { 1 } else { 2 } // SIO stores single-cycle
     }
 
     /// LDRB Rt, [Rn, #imm5] (01111_imm5_Rn_Rt).
@@ -543,7 +543,7 @@ impl CortexM33 {
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
         let addr = self.regs.r[rn].wrapping_add(imm5 << 1);
         self.bus_write16(addr, self.regs.r[rt] as u16, bus);
-        2 // M33 measured: 2 cycles
+        if addr >> 28 == 0xD { 1 } else { 2 } // SIO stores single-cycle
     }
 
     /// LDRH Rt, [Rn, #imm5*2] (10001_imm5_Rn_Rt).
@@ -566,7 +566,7 @@ impl CortexM33 {
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
         self.bus_write32(addr, self.regs.r[rt], bus);
-        2 // M33 measured: 2 cycles
+        if addr >> 28 == 0xD { 1 } else { 2 } // SIO stores single-cycle
     }
 
     /// LDR Rt, [SP, #imm8*4] (10011_Rt_imm8).
@@ -650,8 +650,9 @@ impl CortexM33 {
                     }
                 }
                 bus.set_burst_mode(false);
-                // M33 measured: 2*N for N<=2, 1+N for N>2
-                if count <= 2 { 2 * count } else { 1 + count }
+                // M33 K-delta steady-state: 1+N for all N (the halt-step
+                // 2*N for N<=2 includes debug pipeline disruption).
+                1 + count
             }
             0b0110 => {
                 // CPS: CPSIE/CPSID — affects PRIMASK/FAULTMASK
@@ -863,9 +864,20 @@ impl CortexM33 {
         let offset = sign_extend(imm11 << 1, 12); // 11-bit imm, shifted left 1, sign-extended from bit 11
         let target = self.read_pc().wrapping_add(offset);
         self.regs.set_pc(target);
-        // M33 measured: 1 cycle for forward/small backward, 6 for large backward
-        // Threshold between -256 and -500 bytes
-        if (offset as i32) < -256 { 6 } else { 1 }
+        // M33 K-delta steady-state: two-tier backward branch model.
+        // Forward branches: target may be in prefetch buffer.
+        // Small backward: pipeline flush, short refill.
+        // Large backward: pipeline flush, long refill.
+        // NOTE: applies ONLY to unconditional B. Conditional B.cond
+        // stays at 1 (M33 branch predictor handles tight loops).
+        let signed = offset as i32;
+        if signed >= 0 {
+            1
+        } else if signed >= -256 {
+            3
+        } else {
+            5
+        }
     }
 
     // ========================================================================

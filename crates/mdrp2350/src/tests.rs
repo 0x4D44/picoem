@@ -5487,9 +5487,11 @@ fn dual_core_extra_wait_states_no_pollution() {
     core1.regs.set_pc(0x2000_0004); // SRAM bank 1
 
     // Artificially pollute the accumulator to prove the reset kills it.
+    // Bank 2/6 penalty removed from data paths, so use add_extra_wait_states
+    // directly to simulate pollution.
     bus.reset_extra_wait_states();
-    let _ = bus.read32(0x2000_0008, 0); // SRAM bank 2 read adds +1 wait state
-    assert_eq!(bus.extra_wait_states(), 1, "precondition: bank-2 read adds wait");
+    bus.add_extra_wait_states(1);
+    assert_eq!(bus.extra_wait_states(), 1, "precondition: manual pollution applied");
 
     // Core 0 executes one NOP — decode_execute must reset the accumulator
     // before the fetch, so the observed value reflects only this fetch.
@@ -5515,8 +5517,10 @@ fn sram_bank2_read_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20000008: offset 0x8, bank = (0x8 >> 2) & 7 = 2
+    // Bank 2/6 penalty removed from data paths (modeled on instruction
+    // fetch only, conditional on sequentiality in decode.rs).
     let _ = bus.read32(0x2000_0008, 0);
-    assert_eq!(bus.extra_wait_states(), 1, "bank 2 read should add +1 wait state");
+    assert_eq!(bus.extra_wait_states(), 0, "bank 2/6 data penalty removed");
 }
 
 #[test]
@@ -5524,8 +5528,9 @@ fn sram_bank6_read_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20000018: offset 0x18, bank = (0x18 >> 2) & 7 = 6
+    // Bank 2/6 penalty removed from data paths.
     let _ = bus.read32(0x2000_0018, 0);
-    assert_eq!(bus.extra_wait_states(), 1, "bank 6 read should add +1 wait state");
+    assert_eq!(bus.extra_wait_states(), 0, "bank 2/6 data penalty removed");
 }
 
 #[test]
@@ -5542,8 +5547,9 @@ fn sram_bank2_write_extra_wait() {
     let mut bus = crate::bus::Bus::new();
     bus.reset_extra_wait_states();
     // 0x20000008: offset 0x8, bank = (0x8 >> 2) & 7 = 2
+    // Bank 2/6 penalty removed from data paths.
     bus.write32(0x2000_0008, 0xDEAD_BEEF, 0);
-    assert_eq!(bus.extra_wait_states(), 1, "bank 2 write should add +1 wait state");
+    assert_eq!(bus.extra_wait_states(), 0, "bank 2/6 data penalty removed");
 }
 
 #[test]
@@ -8400,9 +8406,9 @@ fn decode_cache_pure_path_preserves_accumulator() {
     core.step(&mut bus);
     assert!(core.decode_cache[cache_slot(pc)].is_pure());
 
-    // Pollute the accumulator with a direct bank-2 read.
+    // Pollute the accumulator directly (bank 2/6 data penalty removed).
     bus.reset_extra_wait_states();
-    let _ = bus.read16(0x2000_0008, 0); // bank 2 — +1 wait state
+    bus.add_extra_wait_states(1);
     let polluted = bus.extra_wait_states();
     assert_eq!(polluted, 1);
 

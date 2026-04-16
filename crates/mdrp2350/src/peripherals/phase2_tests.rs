@@ -29,7 +29,7 @@ use crate::peripherals::io_bank0::IO_BANK0_BASE;
 use crate::peripherals::pads_bank0::PADS_BANK0_BASE;
 use crate::peripherals::pwm::{CSR_EN, EN as PWM_EN, INTE0, INTR as PWM_INTR, PWM_BASE};
 use crate::peripherals::spi::{
-    SPI0_BASE, SSPCR0, SSPCR1, SSPDR, SSPSR,
+    SPI0_BASE, SSPCPSR, SSPCR0, SSPCR1, SSPDR, SSPSR,
 };
 use crate::peripherals::uart::{
     UART0_BASE, UARTCR, UARTDR, UARTFR, UARTIMSC, UARTLCR_H, UART_INT_TX,
@@ -127,7 +127,8 @@ fn uart0_irq_routed_to_bus_irq_pending() {
     bus.write32(UART0_BASE + UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0);
     bus.write32(UART0_BASE + UARTIMSC, UART_INT_TX, 0);
     bus.write32(UART0_BASE + UARTDR, 0x55, 0);
-    // Tick enough sys_clks to drain the byte at default (IBRD=0 → 1 cycle/byte).
+    // Tick to let refresh_tx_interrupt fire. TXIS triggers on FIFO
+    // level (<= threshold), not on drain -- works even with IBRD=0.
     bus.tick_peripherals(100);
     for core in 0..2 {
         assert_ne!(
@@ -152,11 +153,13 @@ fn spi0_sspsr_at_reset_reports_tfe() {
 #[test]
 fn spi0_loopback_rx_matches_tx() {
     let mut bus = Bus::new();
-    // DSS=7 (8-bit), SSE=1, LBM=1.
+    // DSS=7 (8-bit), SSE=1, LBM=1, CPSR=2 (min prescale to run the clock).
     bus.write32(SPI0_BASE + SSPCR0, 7, 0);
     bus.write32(SPI0_BASE + SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0);
+    bus.write32(SPI0_BASE + SSPCPSR, 2, 0);
     bus.write32(SPI0_BASE + SSPDR, 0xA5, 0);
-    // Narrow read via read8 must pop one byte from RX FIFO.
+    // Loopback is baud-timed: tick enough cycles to transfer.
+    bus.tick_peripherals(1_000);
     let got = bus.read32(SPI0_BASE + SSPDR, 0);
     assert_eq!(got & 0xFF, 0xA5);
 }
@@ -166,7 +169,10 @@ fn spi0_byte_narrow_read_from_dr() {
     let mut bus = Bus::new();
     bus.write32(SPI0_BASE + SSPCR0, 7, 0);
     bus.write32(SPI0_BASE + SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0);
+    bus.write32(SPI0_BASE + SSPCPSR, 2, 0);
     bus.write32(SPI0_BASE + SSPDR, 0x33, 0);
+    // Loopback is baud-timed: tick enough cycles to transfer.
+    bus.tick_peripherals(1_000);
     let b = bus.read8(SPI0_BASE + SSPDR, 0);
     assert_eq!(b, 0x33);
 }
@@ -179,16 +185,16 @@ fn spi0_byte_narrow_read_from_dr() {
 fn i2c0_bus_scan_nacks_with_abrt_7b() {
     let mut bus = Bus::new();
     // Target 0x7F (I2C-reserved 7-bit address, never occupied by real
-    // devices — matches `silicon_scenarios::S_I2C0_BUS_SCAN_NACK`).
+    // devices -- matches `silicon_scenarios::S_I2C0_BUS_SCAN_NACK`).
     bus.write32(I2C0_BASE + IC_TAR, 0x7F, 0);
     bus.write32(I2C0_BASE + IC_ENABLE, 1, 0);
     bus.write32(I2C0_BASE + IC_DATA_CMD, (1 << 8) | (1 << 9), 0); // READ + STOP
-    // Expect TX_ABRT in raw interrupt status.
+    // Expect TX_ABRT in raw interrupt status (latching, survives STOP).
     let raw = bus.read32(I2C0_BASE + IC_RAW_INTR_STAT, 0);
     assert_ne!(raw & INT_TX_ABRT, 0, "TX_ABRT must latch on NACK");
-    // Abort source: 7-bit no ack.
+    // IC_TX_ABRT_SOURCE is transient -- auto-cleared by STOP on silicon.
     let src = bus.read32(I2C0_BASE + IC_TX_ABRT_SOURCE, 0);
-    assert_eq!(src & 0x1, 0x1);
+    assert_eq!(src, 0, "tx_abrt_source auto-cleared by STOP");
 }
 
 #[test]

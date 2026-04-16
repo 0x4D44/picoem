@@ -293,6 +293,11 @@ pub struct Bus {
     /// (STM/LDM/PUSH/POP). The SRAM controller handles sequential word
     /// accesses without per-word bank penalties.
     pub(crate) burst_mode: bool,
+    /// Address of the most recently fetched instruction. Used to determine
+    /// whether the current fetch is sequential (prefetch buffer absorbs
+    /// bank penalty) or non-sequential (bank penalty applies).
+    /// Initialized to `u32::MAX` so the first fetch is non-sequential.
+    pub(crate) last_fetch_addr: u32,
     /// 4 KB boot RAM at 0xEFFF_F000..0xF000_0000.
     /// RP2350 maps this as the secure boot stack (USB DPRAM secure alias).
     /// Initial SP = 0xF000_0000 (top of this region).
@@ -467,6 +472,7 @@ impl Bus {
             atomics,
             flash_loaded: false,
             burst_mode: false,
+            last_fetch_addr: u32::MAX,
             boot_ram: Box::new([0u8; 4096]),
             xip_sram: Box::new([0u8; 16384]),
             qmi_regs: [0u32; 28],
@@ -1200,7 +1206,8 @@ impl Bus {
             }
             0x2 if offset < SRAM_SIZE as u32 => {
                 let v = self.memory.sram_read8(offset);
-                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                // sram_bank_wait removed: bank 2/6 penalty is modeled on
+                // instruction fetch only (in decode.rs), not data accesses.
                 v
             }
             0x4 | 0x5 => {
@@ -1343,7 +1350,7 @@ impl Bus {
                     };
                     self.memory.sram_write8(offset, new_val);
                 }
-                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                // sram_bank_wait removed: bank penalty on instruction fetch only.
                 self.invalidate_pc_range(addr, 1);
             }
             0x4 | 0x5 => {
@@ -1629,7 +1636,7 @@ impl Bus {
             }
             0x2 if (offset + 1) < SRAM_SIZE as u32 => {
                 let v = self.memory.sram_read16(offset);
-                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                // sram_bank_wait removed: bank penalty on instruction fetch only.
                 v
             }
             0x4 | 0x5 => {
@@ -1776,7 +1783,7 @@ impl Bus {
                     };
                     self.memory.sram_write16(offset, new_val);
                 }
-                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                // sram_bank_wait removed: bank penalty on instruction fetch only.
                 self.invalidate_pc_range(addr, 2);
             }
             0x4 | 0x5 => {
@@ -2028,7 +2035,7 @@ impl Bus {
             }
             0x2 if (offset + 3) < SRAM_SIZE as u32 => {
                 let v = self.memory.sram_read32(offset);
-                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                // sram_bank_wait removed: bank penalty on instruction fetch only.
                 v
             }
             0x4 | 0x5 => {
@@ -2134,7 +2141,7 @@ impl Bus {
                     };
                     self.memory.sram_write32(offset, new_val);
                 }
-                self.extra_wait_states += sram_bank_wait(addr, self.burst_mode);
+                // sram_bank_wait removed: bank penalty on instruction fetch only.
                 self.invalidate_pc_range(addr, 4);
             }
             0x4 | 0x5 => {
@@ -2329,10 +2336,13 @@ impl Bus {
     }
 }
 
-/// Extra wait-state for SRAM bank access.
+/// Extra wait-state for SRAM bank access (retained for documentation).
 /// Banks 2 and 6 have +1 cycle on RP2350 (measured on silicon via DWT CYCCNT).
+/// No longer called from data-access paths. Bank 2/6 penalty is now
+/// modeled on instruction fetch only, conditional on sequentiality.
 /// Returns 0 during burst mode (STM/LDM/PUSH/POP) — the SRAM controller
 /// handles sequential accesses without per-word bank penalties.
+#[allow(dead_code)]
 fn sram_bank_wait(addr: u32, burst: bool) -> u32 {
     if burst {
         return 0;
@@ -2498,6 +2508,15 @@ impl CoreBus for Bus {
     #[inline(always)]
     fn reset_extra_wait_states(&mut self) {
         Bus::reset_extra_wait_states(self)
+    }
+
+    #[inline(always)]
+    fn last_fetch_addr(&self) -> u32 {
+        self.last_fetch_addr
+    }
+    #[inline(always)]
+    fn set_last_fetch_addr(&mut self, addr: u32) {
+        self.last_fetch_addr = addr;
     }
 
     #[inline(always)]

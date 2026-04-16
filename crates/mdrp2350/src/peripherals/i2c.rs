@@ -12,11 +12,12 @@
 //! # Bus-scan ACK model
 //!
 //! For V5 scope, this emulator NACKs every address by default
-//! (`ALWAYS_ACK_ADDRS` is empty) — the corpus `bus_scan` scenario
+//! (`ALWAYS_ACK_ADDRS` is empty) -- the corpus `bus_scan` scenario
 //! expects NACK-everything behaviour and the runner validates via
-//! `IC_TX_ABRT_SOURCE.ABRT_7B_ADDR_NOACK`. If scenarios later require
-//! at-least-one-slave, extend `ALWAYS_ACK_ADDRS` with the specific
-//! address(es).
+//! `IC_RAW_INTR_STAT.TX_ABRT` (the latching indicator; note that
+//! `IC_TX_ABRT_SOURCE` is transient and auto-cleared by STOP). If
+//! scenarios later require at-least-one-slave, extend
+//! `ALWAYS_ACK_ADDRS` with the specific address(es).
 
 use std::collections::VecDeque;
 
@@ -257,6 +258,11 @@ impl I2cRegs {
         if (cmd & DATA_CMD_STOP) != 0 || !ack {
             self.raw_intr_stat |= INT_STOP_DET;
             self.activity = false;
+            // DW_apb_i2c auto-clears the abort source register when the
+            // bus returns to idle after STOP. The snapshot is transient --
+            // only valid while IC_RAW_INTR_STAT.TX_ABRT is asserted.
+            // Once STOP completes, silicon clears it.
+            self.tx_abrt_source = 0;
         }
         self.route_irq(irqs);
     }
@@ -518,8 +524,12 @@ mod tests {
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
         // Issue a dummy read-with-stop.
         i.write32(IC_DATA_CMD, DATA_CMD_READ | DATA_CMD_STOP, 0, &mut irqs);
+        // IC_RAW_INTR_STAT.TX_ABRT latches until explicitly cleared --
+        // this is the durable abort indicator. IC_TX_ABRT_SOURCE is
+        // transient and auto-cleared by STOP (matching DW_apb_i2c
+        // silicon behaviour).
         assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
-        assert_ne!(i.tx_abrt_source & ABRT_7B_ADDR_NOACK, 0);
+        assert_eq!(i.tx_abrt_source, 0, "auto-cleared by STOP");
         assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
     }
 
@@ -560,6 +570,8 @@ mod tests {
         i.write32(IC_TAR, 0x3C, 0, &mut irqs);
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
         i.write32(IC_DATA_CMD, DATA_CMD_STOP, 0, &mut irqs);
-        assert_ne!(i.tx_abrt_source & ABRT_10ADDR1_NOACK, 0);
+        // tx_abrt_source is auto-cleared by STOP; check the latching
+        // RAW_INTR_STAT.TX_ABRT instead.
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
     }
 }

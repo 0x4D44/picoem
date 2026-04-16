@@ -45,7 +45,8 @@ use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs};
 use mdpicoem_harness::isr_scenarios::{self, IsrArgs};
 use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter};
 use mdpicoem_harness::silicon_scenarios::{self, PeriphArgs};
-use probe_rs::{Session, SessionConfig};
+use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::{Permissions, Session, SessionConfig};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -65,7 +66,7 @@ const ORACLE_DUALCORE: &str = "dualcore";
 const ORACLE_ISR: &str = "isr";
 
 const USAGE: &str = "\
-Usage: test_silicon [--soak <duration>] [--seed <u64>] [--filter <substr>] [--verbose]
+Usage: test_silicon [--soak <duration>] [--seed <u64>] [--filter <substr>] [--verbose] [--probe VID:PID:SERIAL]
 
 Options:
   --soak     Run continuously for the given duration (e.g. 30m, 4h, 7d).
@@ -79,6 +80,9 @@ Options:
              In single-pass mode, has no additional effect (output is
              already the per-case table; the standalone binaries carry
              richer per-case detail — see the banner printed at start).
+  --probe    Select a specific debug probe by VID:PID:SERIAL.
+             Required on hosts with multiple probes attached.
+             Default: auto-attach (first enumerated probe).
 ";
 
 // Sentinel case name used for synthesised watchdog / probe-rs failures
@@ -99,6 +103,7 @@ struct CliArgs {
     seed: u64,
     filter: Option<String>,
     verbose: bool,
+    probe: Option<DebugProbeSelector>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
@@ -106,6 +111,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
     let mut seed: Option<u64> = None;
     let mut filter: Option<String> = None;
     let mut verbose = false;
+    let mut probe: Option<DebugProbeSelector> = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -134,6 +140,16 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
                 }
                 filter = Some(argv[i].clone());
             }
+            "--probe" => {
+                i += 1;
+                if i >= argv.len() {
+                    return Err(format!("--probe requires a VID:PID:SERIAL argument\n{USAGE}"));
+                }
+                probe = Some(
+                    DebugProbeSelector::try_from(argv[i].as_str())
+                        .map_err(|e| format!("invalid probe selector '{}': {e}\n{USAGE}", argv[i]))?,
+                );
+            }
             "--verbose" => verbose = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
@@ -141,7 +157,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
         i += 1;
     }
     let seed = seed.unwrap_or_else(default_seed);
-    Ok(CliArgs { soak, seed, filter, verbose })
+    Ok(CliArgs { soak, seed, filter, verbose, probe })
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -419,17 +435,23 @@ fn run_one_oracle(
     result.map_err(|e| e.to_string())
 }
 
-fn attach() -> Result<Session, probe_rs::Error> {
-    Session::auto_attach("rp2350", SessionConfig::default())
+fn attach(probe: Option<&DebugProbeSelector>) -> Result<Session, probe_rs::Error> {
+    match probe {
+        None => Session::auto_attach("rp2350", SessionConfig::default()),
+        Some(selector) => {
+            let probe = Lister::new().open(selector.clone())?;
+            probe.attach("rp2350", Permissions::default())
+        }
+    }
 }
 
 /// Re-attach with the HLD retry schedule: sleep 1s, then retry every 5s up
 /// to 60s. Returns the fresh Session or the last error.
-fn reattach_with_retries() -> Result<Session, String> {
+fn reattach_with_retries(probe: Option<&DebugProbeSelector>) -> Result<Session, String> {
     thread::sleep(REATTACH_INITIAL_SLEEP);
     let deadline = Instant::now() + REATTACH_TIMEOUT;
     loop {
-        match attach() {
+        match attach(probe) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 if Instant::now() >= deadline {
@@ -575,6 +597,17 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
     println!("  seed:    {}", args.seed);
     println!("  filter:  {}", args.filter.as_deref().unwrap_or("<none>"));
     println!("  verbose: {}", args.verbose);
+    println!(
+        "  probe:   {}",
+        args.probe.as_ref().map_or("<auto>".to_string(), |p| {
+            format!(
+                "{:04x}:{:04x}:{}",
+                p.vendor_id,
+                p.product_id,
+                p.serial_number.as_deref().unwrap_or("")
+            )
+        })
+    );
     println!("  errlog:  {}", log_path.display());
     println!(
         "  NOTE: single-pass mode prints only the per-case outcome table; \
@@ -585,7 +618,8 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
     println!();
 
     // Attach once up front.
-    let mut session = match attach() {
+    let probe_sel = args.probe.as_ref();
+    let mut session = match attach(probe_sel) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("test_silicon: initial attach failed: {e}");
@@ -608,6 +642,7 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
                 &mut interner,
                 &log_path,
                 args.verbose,
+                probe_sel,
             )?;
             let _ = session; // silence unused warning after last use
             summary.print(1);
@@ -625,6 +660,7 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
                 &log_path,
                 deadline,
                 stop_flag,
+                probe_sel,
             )?;
             summary.print(total_iters);
             if give_up_code == 2 {
@@ -657,6 +693,7 @@ fn single_pass(
     interner: &mut NameInterner,
     log_path: &PathBuf,
     verbose: bool,
+    probe: Option<&DebugProbeSelector>,
 ) -> Result<Session, String> {
     for oracle in [
         OracleKind::Cycle,
@@ -690,7 +727,7 @@ fn single_pass(
                     Some(s) => s,
                     None => {
                         // Shouldn't happen on Ok, but be defensive.
-                        reattach_with_retries()?
+                        reattach_with_retries(probe)?
                     }
                 };
             }
@@ -728,7 +765,7 @@ fn single_pass(
                 }
                 // Reattach so the next oracle can run.
                 summary.reattach_count += 1;
-                session = reattach_with_retries()
+                session = reattach_with_retries(probe)
                     .map_err(|e| format!("reattach failed: {e}"))?;
             }
         }
@@ -762,6 +799,7 @@ fn soak_loop(
     log_path: &PathBuf,
     deadline: Instant,
     stop_flag: Arc<AtomicBool>,
+    probe: Option<&DebugProbeSelector>,
 ) -> Result<(i32, u64), String> {
     let mut session_opt: Option<Session> = Some(initial_session);
     let start = Instant::now();
@@ -929,7 +967,7 @@ fn soak_loop(
                             );
                             emit_log_line(log_path, &line);
                             summary.reattach_count += 1;
-                            match reattach_with_retries() {
+                            match reattach_with_retries(probe) {
                                 Ok(s) => Some(s),
                                 Err(rerr) => {
                                     consecutive_reattach_fails += 1;
@@ -986,7 +1024,7 @@ fn soak_loop(
                     summary.record(&[synth], s);
 
                     summary.reattach_count += 1;
-                    match reattach_with_retries() {
+                    match reattach_with_retries(probe) {
                         Ok(s) => {
                             session_opt = Some(s);
                             consecutive_reattach_fails = 0;
@@ -1021,7 +1059,7 @@ fn soak_loop(
         // If we have no session at this point (reattach exhausted), try
         // once more before next iteration.
         if session_opt.is_none() {
-            match reattach_with_retries() {
+            match reattach_with_retries(probe) {
                 Ok(s) => {
                     session_opt = Some(s);
                     consecutive_reattach_fails = 0;
@@ -1285,6 +1323,7 @@ mod tests {
         assert!(a.soak.is_none());
         assert!(a.filter.is_none());
         assert!(!a.verbose);
+        assert!(a.probe.is_none());
     }
 
     #[test]
@@ -1303,6 +1342,31 @@ mod tests {
         assert_eq!(a.seed, 999);
         assert_eq!(a.filter.as_deref(), Some("pio0"));
         assert!(a.verbose);
+    }
+
+    #[test]
+    fn test_parse_args_probe_full_selector() {
+        let a = parse_args(vec!["--probe".into(), "2e8a:000c:E46410955F614129".into()])
+            .unwrap();
+        let sel = a.probe.expect("probe must be Some");
+        assert_eq!(sel.vendor_id, 0x2e8a);
+        assert_eq!(sel.product_id, 0x000c);
+        assert_eq!(sel.serial_number.as_deref(), Some("E46410955F614129"));
+    }
+
+    #[test]
+    fn test_parse_args_probe_missing_value_errors() {
+        assert!(parse_args(vec!["--probe".into()]).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_probe_bogus_value_errors() {
+        let err = parse_args(vec!["--probe".into(), "bogus".into()])
+            .expect_err("bogus selector must error");
+        assert!(
+            err.contains("invalid probe selector"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

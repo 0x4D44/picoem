@@ -11,9 +11,11 @@
 //!
 //! # Loopback model (`SSPCR1.LBM`)
 //!
-//! When firmware sets `SSPCR1.LBM=1`, every write to `SSPDR` pushes the
-//! word into the RX FIFO directly — simulating the PL022's internal TX
-//! → RX tie.
+//! When firmware sets `SSPCR1.LBM=1`, the PL022's internal TX-to-RX tie
+//! is active. Words written to `SSPDR` enter the TX FIFO and transfer to
+//! the RX FIFO at the programmed baud rate via `tick()`, matching
+//! silicon's shift-register timing. With `SSPCPSR=0` (clock stopped),
+//! no transfer occurs and the word stays in the TX FIFO.
 //!
 //! # Register map (offsets relative to `SPI0_BASE`)
 //!
@@ -207,7 +209,9 @@ impl SpiRegs {
         }
     }
 
-    /// Push a word into the TX FIFO; loopback mirrors into RX.
+    /// Push a word into the TX FIFO. Loopback (LBM=1) is handled in
+    /// [`tick`] -- the word transfers from TX to RX at the programmed
+    /// baud rate, matching silicon's PL022 shift-register timing.
     fn push_dr(&mut self, value: u32, irqs: &mut u64) {
         if !self.is_enabled() {
             return;
@@ -216,11 +220,6 @@ impl SpiRegs {
         let word = value & mask;
         if self.tx_fifo.len() < SSP_FIFO_DEPTH {
             self.tx_fifo.push_back(word);
-            if self.is_loopback() && self.rx_fifo.len() < SSP_FIFO_DEPTH {
-                self.rx_fifo.push_back(word);
-            }
-        } else if self.is_loopback() {
-            self.ris |= SSP_INT_ROR;
         }
         self.refresh_tx_rx_interrupts();
         self.route_irq(irqs);
@@ -231,7 +230,11 @@ impl SpiRegs {
     }
 
     fn sysclks_per_word(&self, clock_tree: &ClockTree) -> u64 {
-        let cpsdvsr = (self.cpsr & 0xFE).max(2) as u64;
+        let raw_cpsr = self.cpsr & 0xFE;
+        if raw_cpsr == 0 {
+            return u64::MAX; // SPI clock stopped -- no transfer
+        }
+        let cpsdvsr = raw_cpsr as u64;
         let scr = ((self.cr0 >> 8) & 0xFF) as u64;
         let peri = clock_tree.peri_hz().max(1);
         let bits_per_frame = ((self.cr0 & 0xF).max(3) + 1) as u64;
@@ -358,7 +361,13 @@ impl SpiRegs {
         self.tx_cycle_accum = self.tx_cycle_accum.saturating_add(cycles as u64);
         while self.tx_cycle_accum >= spw && !self.tx_fifo.is_empty() {
             self.tx_cycle_accum -= spw;
-            let _ = self.tx_fifo.pop_front();
+            let word = self.tx_fifo.pop_front().unwrap_or(0);
+            // In loopback mode the PL022 shift register ties TX out
+            // back to RX in -- the popped word appears in the RX FIFO
+            // after one word-time, matching silicon's baud-timed path.
+            if self.is_loopback() && self.rx_fifo.len() < SSP_FIFO_DEPTH {
+                self.rx_fifo.push_back(word);
+            }
         }
         self.refresh_tx_rx_interrupts();
         self.route_irq(irqs);
@@ -413,10 +422,14 @@ mod tests {
     fn loopback_rx_matches_tx_single_byte() {
         let mut s = SpiRegs::new(SPI0_IRQ);
         let mut irqs = 0u64;
-        // Enable + loopback + DSS=7 (8-bit frame).
+        // Enable + loopback + DSS=7 (8-bit frame) + CPSR=2 (min prescale).
         s.write32(SSPCR0, 7, 0, &mut irqs);
         s.write32(SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0, &mut irqs);
+        s.write32(SSPCPSR, 2, 0, &mut irqs);
         s.write32(SSPDR, 0xA5, 0, &mut irqs);
+        // Loopback is baud-timed: tick enough cycles to transfer.
+        let t = tree();
+        s.tick(1_000, &t, &mut irqs);
         assert_eq!(s.rx_fifo.len(), 1);
         assert_eq!(s.read32(SSPDR), 0xA5);
     }
@@ -427,12 +440,31 @@ mod tests {
         let mut irqs = 0u64;
         s.write32(SSPCR0, 7, 0, &mut irqs);
         s.write32(SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0, &mut irqs);
+        s.write32(SSPCPSR, 2, 0, &mut irqs);
         for b in [0x11, 0x22, 0x33] {
             s.write32(SSPDR, b, 0, &mut irqs);
         }
+        // Tick enough for all 3 words to transfer through loopback.
+        let t = tree();
+        s.tick(10_000, &t, &mut irqs);
         assert_eq!(s.read32(SSPDR), 0x11);
         assert_eq!(s.read32(SSPDR), 0x22);
         assert_eq!(s.read32(SSPDR), 0x33);
+    }
+
+    #[test]
+    fn loopback_no_transfer_when_clock_stopped() {
+        // SSPCPSR=0 means the SPI clock is stopped -- no TX->RX transfer.
+        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut irqs = 0u64;
+        s.write32(SSPCR0, 7, 0, &mut irqs);
+        s.write32(SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0, &mut irqs);
+        // CPSR stays at reset value 0.
+        s.write32(SSPDR, 0xA5, 0, &mut irqs);
+        let t = tree();
+        s.tick(100_000, &t, &mut irqs);
+        assert_eq!(s.rx_fifo.len(), 0, "clock stopped: no loopback transfer");
+        assert_eq!(s.tx_fifo.len(), 1, "word stays in TX FIFO");
     }
 
     #[test]

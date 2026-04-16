@@ -131,6 +131,11 @@ pub struct WorkerBus {
     active_pc: u32,
     burst_mode: bool,
     extra_wait_states: u32,
+    /// Sequential-fetch tracking for bank 2/6 penalty (silicon fidelity
+    /// fix from test_silicon baseline campaign 2026-04-16; see
+    /// `core/decode.rs::decode_execute`). Initialised to `u32::MAX` so
+    /// the first fetch is non-sequential.
+    last_fetch_addr: u32,
     /// SRAM / ROM / XIP write addresses queued this instruction.
     /// Drained by the worker loop after each `core.step`.
     pub pending_cache_invalidations: Vec<u32>,
@@ -154,6 +159,7 @@ impl WorkerBus {
             active_pc: 0,
             burst_mode: false,
             extra_wait_states: 0,
+            last_fetch_addr: u32::MAX,
             pending_cache_invalidations,
         }
     }
@@ -1380,6 +1386,15 @@ impl CoreBus for WorkerBus {
     #[inline]
     fn reset_extra_wait_states(&mut self) {
         self.extra_wait_states = 0;
+    }
+
+    #[inline]
+    fn last_fetch_addr(&self) -> u32 {
+        self.last_fetch_addr
+    }
+    #[inline]
+    fn set_last_fetch_addr(&mut self, addr: u32) {
+        self.last_fetch_addr = addr;
     }
 
     #[inline]

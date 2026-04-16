@@ -14,6 +14,11 @@ const HELLO_UART_BIN: &[u8] = include_bytes!("../../../roms/rp2350/hello_uart.bi
 const COUNTER_ADDR: u32 = 0x2000_3000;
 const LOAD_BASE: u32 = 0x2000_0000;
 
+/// UART0 register offsets.
+const UART0_BASE: u32 = 0x4007_0000;
+const UARTIBRD: u32 = 0x024;
+const UARTFBRD: u32 = 0x028;
+
 fn prepare_emu() -> Emulator {
     let mut emu = Emulator::new(Config::default());
     emu.load_image(LOAD_BASE, HELLO_UART_BIN);
@@ -33,6 +38,15 @@ fn prepare_emu() -> Emulator {
         emu.cores[i].regs.set_pc(reset_vector & !1);
     }
     emu.cores[1].halt();
+
+    // The firmware does not program UARTIBRD/FBRD. With the MMIO
+    // fidelity fix, IBRD=FBRD=0 correctly stops the baud clock
+    // (matching silicon). Seed a valid baud divisor so the TX FIFO
+    // drains and the firmware's TXFE poll loop terminates.
+    // 115200 baud at 150 MHz clk_peri: IBRD=81, FBRD=24.
+    emu.mmio_write32(UART0_BASE + UARTIBRD, 81);
+    emu.mmio_write32(UART0_BASE + UARTFBRD, 24);
+
     emu
 }
 
@@ -41,11 +55,10 @@ fn hello_uart_firmware_increments_counter() {
     let mut emu = prepare_emu();
     assert_eq!(emu.peek(COUNTER_ADDR), 0);
 
-    // With IBRD=FBRD=0 the emulator's sysclks-per-byte falls back to 1,
-    // so the TX FIFO drains on the first tick. One loop iteration =
-    // byte-write + 1-instruction-poll + counter-increment = ~10
-    // instructions = ~10-20 sys_clks. 500k cycles gives ≥1000 loop
-    // iterations of headroom.
+    // With IBRD=81, FBRD=24 (115200 baud at 150 MHz peri), ~13k
+    // sysclks per byte. One loop iteration = byte-write +
+    // TX-drain-poll + counter-increment. 500k cycles gives plenty of
+    // headroom for at least one iteration.
     emu.run(500_000);
 
     let counter = emu.peek(COUNTER_ADDR);

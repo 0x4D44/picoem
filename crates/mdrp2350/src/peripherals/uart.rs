@@ -289,7 +289,7 @@ impl UartRegs {
         let ibrd = self.ibrd & 0xFFFF;
         let fbrd = self.fbrd & 0x3F;
         if ibrd == 0 && fbrd == 0 {
-            return 1;
+            return u64::MAX; // baud clock stopped -- no transmission
         }
         let peri = clock_tree.peri_hz().max(1);
         let sys = clock_tree.sys_clk_hz.max(1) as u64;

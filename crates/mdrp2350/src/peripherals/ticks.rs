@@ -199,10 +199,16 @@ impl TicksRegs {
     /// [`COUNT_OFFSET`]. Returns `None` for out-of-window offsets.
     #[inline]
     fn decode_offset(offset: u32) -> Option<(usize, u32)> {
-        if offset >= DOMAIN_STRIDE * DOMAIN_COUNT as u32 {
+        // RP2350 APB does not fully decode the 12-bit page offset for
+        // the TICKS block. Only the low 7 bits (selecting domain +
+        // register) are meaningful; upper bits are not connected on the
+        // APB bus fabric. Mask to the power-of-two decode width before
+        // dispatch.
+        let offset = offset & 0x7F;
+        let domain = (offset / DOMAIN_STRIDE) as usize;
+        if domain >= DOMAIN_COUNT {
             return None;
         }
-        let domain = (offset / DOMAIN_STRIDE) as usize;
         let reg = offset % DOMAIN_STRIDE;
         Some((domain, reg))
     }
@@ -324,11 +330,18 @@ mod tests {
 
     #[test]
     fn decode_offset_rejects_out_of_range() {
+        // Offset 0x48 (domain 6) is within the 0x7F mask but beyond the
+        // 6-domain window -- must return None.
         assert_eq!(
             TicksRegs::decode_offset(DOMAIN_STRIDE * DOMAIN_COUNT as u32),
             None
         );
-        assert_eq!(TicksRegs::decode_offset(0x80), None);
+        // Offset 0x80 aliases to 0x00 (domain 0, CTRL) via the & 0x7F
+        // mask, matching silicon's incomplete APB decode.
+        assert_eq!(
+            TicksRegs::decode_offset(0x80),
+            Some((0, CTRL_OFFSET))
+        );
     }
 
     // --- Reset state -----------------------------------------------------
@@ -566,15 +579,21 @@ mod tests {
     #[test]
     fn read_past_block_returns_zero() {
         let t = TicksRegs::post_bootrom();
+        // 0x80 aliases to domain 0 CTRL (offset 0x00) via & 0x7F --
+        // domain 0 is disabled at post_bootrom, so CTRL reads 0.
         assert_eq!(t.read32(0x80), 0);
+        // 0xFF & 0x7F = 0x7F -> domain 0x7F/0x0C = 10, which is
+        // >= DOMAIN_COUNT (6), so decode_offset returns None -> 0.
         assert_eq!(t.read32(0xFF), 0);
     }
 
     #[test]
     fn write_past_block_is_noop() {
         let mut t = TicksRegs::post_bootrom();
+        // 0x4C & 0x7F = 0x4C -> domain 0x4C/0x0C = 6, which is
+        // >= DOMAIN_COUNT, so the write is rejected (returns false).
         let before = t.domains;
-        assert!(!t.write32(0x80, 0xFFFF_FFFF, 0));
+        assert!(!t.write32(0x4C, 0xFFFF_FFFF, 0));
         assert_eq!(t.domains.map(|d| (d.enable, d.cycles)),
                    before.map(|d| (d.enable, d.cycles)));
     }
