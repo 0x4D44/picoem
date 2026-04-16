@@ -155,6 +155,14 @@ name = "silicon_isr_diff_rp2040"
 path = "src/bin/silicon_isr_diff_rp2040.rs"
 
 # ---------------------------------------------------------------------------
+# Cross-cutting / threading micro-benchmarks
+# ---------------------------------------------------------------------------
+
+[[bin]]
+name = "threading_micro"
+path = "src/bin/threading_micro.rs"
+
+# ---------------------------------------------------------------------------
 # Test-only helper binaries (used by integration tests; not for production)
 # ---------------------------------------------------------------------------
 
