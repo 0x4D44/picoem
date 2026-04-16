@@ -29,17 +29,17 @@ pub struct PioBlock {
     /// [`Self::set_sm_enabled`]; direct writes to `sm[i].enabled` must not
     /// be reintroduced on the production path.
     sm_enabled_mask: u8,
-    /// IRQ0_INTE — 12-bit interrupt enable mask for NVIC line 0.
-    /// Bits [11:8] = SM3..SM0 TXNFULL, [7:4] = SM3..SM0 RXNEMPTY,
-    /// [3:0] = IRQ flags SM3..SM0. RP2350 datasheet offset 0x12C.
+    /// IRQ0_INTE — 16-bit interrupt enable mask for NVIC line 0.
+    /// Bits [15:8] = SM7..SM0 IRQ flags, [7:4] = SM3..SM0 TXNFULL,
+    /// [3:0] = SM3..SM0 RXNEMPTY. RP2350 datasheet offset 0x170.
     pub int0_inte: u32,
-    /// IRQ0_INTF — 12-bit interrupt force for NVIC line 0. Software
-    /// can force individual interrupt sources. Offset 0x130.
+    /// IRQ0_INTF — 16-bit interrupt force for NVIC line 0. Software
+    /// can force individual interrupt sources. Offset 0x174.
     int0_intf: u32,
-    /// IRQ1_INTE — 12-bit interrupt enable mask for NVIC line 1.
-    /// Offset 0x138.
+    /// IRQ1_INTE — 16-bit interrupt enable mask for NVIC line 1.
+    /// Offset 0x17C.
     pub int1_inte: u32,
-    /// IRQ1_INTF — 12-bit interrupt force for NVIC line 1. Offset 0x13C.
+    /// IRQ1_INTF — 16-bit interrupt force for NVIC line 1. Offset 0x180.
     int1_intf: u32,
 }
 
@@ -130,39 +130,76 @@ impl PioBlock {
         self.irq_flags as u32
     }
 
-    /// Compute the 12-bit raw interrupt status (INTR register).
-    ///
-    /// Layout per RP2350 datasheet PIO register map:
-    ///   bits [11:8] = SM3..SM0 TXNFULL (TX not full → 1)
+    /// Compute the 12-bit raw interrupt status (INTR register) using the
+    /// RP2040 bit layout (RP2040 datasheet Table 358, INTR at offset 0x128):
+    ///   bits  [3:0] = SM3..SM0 IRQ flags (from `irq_flags[3:0]`)
     ///   bits  [7:4] = SM3..SM0 RXNEMPTY (RX not empty → 1)
-    ///   bits  [3:0] = IRQ flags 3..0 (from `irq_flags`)
+    ///   bits [11:8] = SM3..SM0 TXNFULL  (TX not full → 1)
     ///
-    /// The NVIC-routable set is `IRQ[3:0]` plus the FIFO status bits;
-    /// `IRQ[7:4]` are intra-PIO signalling only and do NOT appear in INTR.
+    /// Only the low 4 IRQ flags are routable on RP2040; flags 4..7 are
+    /// intra-PIO only and do not appear in INTR. Bits [31:12] are zero.
     #[inline]
-    pub fn raw_intr(&self) -> u32 {
-        let mut v: u32 = (self.irq_flags as u32) & 0xF;
+    pub fn raw_intr_rp2040(&self) -> u32 {
+        let mut v: u32 = (self.irq_flags as u32) & 0xF; // IRQ[3:0] → bits [3:0]
         for i in 0..4u32 {
             if !self.sm[i as usize].rx_fifo.is_empty() {
-                v |= 1 << (4 + i);
+                v |= 1 << (4 + i); // RXNEMPTY → bits [7:4]
             }
             if !self.sm[i as usize].tx_fifo.is_full() {
-                v |= 1 << (8 + i);
+                v |= 1 << (8 + i); // TXNFULL  → bits [11:8]
             }
         }
         v
     }
 
-    /// Effective interrupt status for NVIC line 0: `(INTR & INTE) | INTF`.
+    /// Compute the 16-bit raw interrupt status (INTR register) using the
+    /// RP2350 bit layout (RP2350 datasheet Table 1018, INTR at offset 0x16C):
+    ///   bits  [3:0] = SM3..SM0 RXNEMPTY (RX not empty → 1)
+    ///   bits  [7:4] = SM3..SM0 TXNFULL  (TX not full → 1)
+    ///   bits [15:8] = SM7..SM0 IRQ flags (from `irq_flags`)
+    ///
+    /// All 8 IRQ flags appear; the NVIC-routable subset is determined
+    /// by which bits the firmware sets in IRQ0_INTE / IRQ1_INTE.
     #[inline]
-    pub fn int0_ints(&self) -> u32 {
-        (self.raw_intr() & self.int0_inte) | self.int0_intf
+    pub fn raw_intr_rp2350(&self) -> u32 {
+        let mut v: u32 = (self.irq_flags as u32) << 8; // IRQ[7:0] → bits [15:8]
+        for i in 0..4u32 {
+            if !self.sm[i as usize].rx_fifo.is_empty() {
+                v |= 1 << i; // RXNEMPTY → bits [3:0]
+            }
+            if !self.sm[i as usize].tx_fifo.is_full() {
+                v |= 1 << (4 + i); // TXNFULL → bits [7:4]
+            }
+        }
+        v
     }
 
-    /// Effective interrupt status for NVIC line 1: `(INTR & INTE) | INTF`.
+    /// Effective interrupt status for NVIC line 0 (RP2040 layout):
+    /// `(INTR_rp2040 & INTE) | INTF`.
     #[inline]
-    pub fn int1_ints(&self) -> u32 {
-        (self.raw_intr() & self.int1_inte) | self.int1_intf
+    pub fn int0_ints_rp2040(&self) -> u32 {
+        (self.raw_intr_rp2040() & self.int0_inte) | self.int0_intf
+    }
+
+    /// Effective interrupt status for NVIC line 1 (RP2040 layout):
+    /// `(INTR_rp2040 & INTE) | INTF`.
+    #[inline]
+    pub fn int1_ints_rp2040(&self) -> u32 {
+        (self.raw_intr_rp2040() & self.int1_inte) | self.int1_intf
+    }
+
+    /// Effective interrupt status for NVIC line 0 (RP2350 layout):
+    /// `(INTR_rp2350 & INTE) | INTF`.
+    #[inline]
+    pub fn int0_ints_rp2350(&self) -> u32 {
+        (self.raw_intr_rp2350() & self.int0_inte) | self.int0_intf
+    }
+
+    /// Effective interrupt status for NVIC line 1 (RP2350 layout):
+    /// `(INTR_rp2350 & INTE) | INTF`.
+    #[inline]
+    pub fn int1_ints_rp2350(&self) -> u32 {
+        (self.raw_intr_rp2350() & self.int1_inte) | self.int1_intf
     }
 
     /// DREQ (data-request) for SM `sm`'s TX FIFO: true when the FIFO
@@ -410,20 +447,23 @@ impl PioBlock {
             0x048..=0x0C4 => 0,
             // Per-SM registers (stride 0x18, SM0 at 0x0C8)
             0x0C8..=0x127 => self.read_sm_reg(offset),
-            // INTR: raw interrupt status (read-only, 12 bits)
-            0x128 => self.raw_intr(),
-            // IRQ0_INTE
-            0x12C => self.int0_inte,
-            // IRQ0_INTF
-            0x130 => self.int0_intf,
-            // IRQ0_INTS: effective status = (INTR & INTE) | INTF
-            0x134 => self.int0_ints(),
-            // IRQ1_INTE
-            0x138 => self.int1_inte,
-            // IRQ1_INTF
-            0x13C => self.int1_intf,
-            // IRQ1_INTS: effective status = (INTR & INTE) | INTF
-            0x140 => self.int1_ints(),
+            // RXFn_PUTGET0..3 (4 SMs × 4 entries, RP2350 offsets 0x128..0x164)
+            // and GPIOBASE (0x168): unmodeled, return 0.
+            0x128..=0x168 => 0,
+            // INTR: raw interrupt status (read-only, 16 bits). RP2350 offset 0x16C.
+            0x16C => self.raw_intr_rp2350(),
+            // IRQ0_INTE. RP2350 offset 0x170.
+            0x170 => self.int0_inte,
+            // IRQ0_INTF. RP2350 offset 0x174.
+            0x174 => self.int0_intf,
+            // IRQ0_INTS: effective status = (INTR & INTE) | INTF. RP2350 offset 0x178.
+            0x178 => self.int0_ints_rp2350(),
+            // IRQ1_INTE. RP2350 offset 0x17C.
+            0x17C => self.int1_inte,
+            // IRQ1_INTF. RP2350 offset 0x180.
+            0x180 => self.int1_intf,
+            // IRQ1_INTS: effective status = (INTR & INTE) | INTF. RP2350 offset 0x184.
+            0x184 => self.int1_ints_rp2350(),
             _ => 0,
         }
     }
@@ -487,11 +527,13 @@ impl PioBlock {
             }
             // Per-SM registers
             0x0C8..=0x127 => self.write_sm_reg(offset, val, alias),
+            // RXFn_PUTGET0..3 and GPIOBASE (0x128..0x168): unmodeled, ignore writes.
+            0x128..=0x168 => {}
             // INTR: read-only
-            0x128 => {}
-            // IRQ0_INTE (12-bit mask, alias-aware)
-            0x12C => {
-                let mask = val & 0xFFF;
+            0x16C => {}
+            // IRQ0_INTE (16-bit mask, alias-aware). RP2350 offset 0x170.
+            0x170 => {
+                let mask = val & 0xFFFF;
                 match alias {
                     0 => self.int0_inte = mask,
                     1 => self.int0_inte ^= mask,
@@ -500,9 +542,9 @@ impl PioBlock {
                     _ => {}
                 }
             }
-            // IRQ0_INTF (12-bit force, alias-aware)
-            0x130 => {
-                let mask = val & 0xFFF;
+            // IRQ0_INTF (16-bit force, alias-aware). RP2350 offset 0x174.
+            0x174 => {
+                let mask = val & 0xFFFF;
                 match alias {
                     0 => self.int0_intf = mask,
                     1 => self.int0_intf ^= mask,
@@ -512,10 +554,10 @@ impl PioBlock {
                 }
             }
             // IRQ0_INTS: read-only
-            0x134 => {}
-            // IRQ1_INTE (12-bit mask, alias-aware)
-            0x138 => {
-                let mask = val & 0xFFF;
+            0x178 => {}
+            // IRQ1_INTE (16-bit mask, alias-aware). RP2350 offset 0x17C.
+            0x17C => {
+                let mask = val & 0xFFFF;
                 match alias {
                     0 => self.int1_inte = mask,
                     1 => self.int1_inte ^= mask,
@@ -524,9 +566,9 @@ impl PioBlock {
                     _ => {}
                 }
             }
-            // IRQ1_INTF (12-bit force, alias-aware)
-            0x13C => {
-                let mask = val & 0xFFF;
+            // IRQ1_INTF (16-bit force, alias-aware). RP2350 offset 0x180.
+            0x180 => {
+                let mask = val & 0xFFFF;
                 match alias {
                     0 => self.int1_intf = mask,
                     1 => self.int1_intf ^= mask,
@@ -536,7 +578,7 @@ impl PioBlock {
                 }
             }
             // IRQ1_INTS: read-only
-            0x140 => {}
+            0x184 => {}
             _ => {}
         }
     }
@@ -1041,6 +1083,82 @@ mod tests {
 
     // `test_gpio_in_moved_to_bus` lives in `crates/mdrp2350/src/pio_tests.rs`
     // — it exercises the chip `Bus`'s SIO GPIO_IN mirror.
+
+    /// RP2350 silicon oracle regression: offset 0x134 is RXF0_PUTGET3
+    /// (unmodeled FIFO debug access), NOT IRQ0_INTS.  IRQ0_INTS lives at
+    /// 0x178 per the RP2350 datasheet (Table 1021).  Before this fix the
+    /// emulator exposed IRQ0_INTS at 0x134, causing the
+    /// `pio0_int_routing_split` silicon scenario to diverge (EMU=0x001,
+    /// HW=0x987 at 0x50200134).
+    ///
+    /// Also validates the corrected bit layout of INTR / IRQ0_INTS:
+    ///   bit 8 = SM0 IRQ flag 0 (RP2350 ds Table 1018 — "SM0" at bit 8)
+    ///   bit 4 = SM0_TXNFULL
+    ///   bit 0 = SM0_RXNEMPTY
+    #[test]
+    fn pio_int_registers_at_rp2350_offsets() {
+        let mut pio = PioBlock::new();
+
+        // 0x134 must NOT be IRQ0_INTS — it is RXF0_PUTGET3 (unmodeled → 0).
+        assert_eq!(pio.read32(0x134), 0,
+            "0x134 is RXF0_PUTGET3 on RP2350, must return 0");
+
+        // Inject IRQ flag 0 via the IRQ_FORCE register (offset 0x034).
+        pio.write32(0x034, 0x01, 0);
+        assert_eq!(pio.irq_flags, 0x01, "irq_flags bit 0 set by IRQ_FORCE");
+
+        // INTR at 0x16C must expose IRQ flag 0 at bit 8 (not bit 0).
+        let intr = pio.read32(0x16C);
+        assert_ne!(intr & (1 << 8), 0,
+            "INTR at 0x16C: SM0 IRQ flag 0 must appear at bit 8");
+        assert_eq!(intr & 0x1, 0,
+            "INTR at 0x16C: bit 0 (SM0_RXNEMPTY) must be 0 when RX FIFO empty");
+
+        // IRQ0_INTE at 0x170: write 0x100 (bit 8 = SM0/IRQ flag 0).
+        pio.write32(0x170, 0x100, 0);
+        assert_eq!(pio.int0_inte, 0x100, "int0_inte set via offset 0x170");
+
+        // IRQ0_INTS at 0x178: (INTR & INTE) | INTF — must return 0x100.
+        let ints = pio.read32(0x178);
+        assert_ne!(ints & 0x100, 0,
+            "IRQ0_INTS at 0x178 must show SM0 IRQ flag (bit 8) when INTE bit 8 set");
+
+        // IRQ1_INTE at 0x17C: bit 9 (SM1/IRQ flag 1), SM0 never set it.
+        pio.write32(0x17C, 0x200, 0);
+        let ints1 = pio.read32(0x184);  // IRQ1_INTS
+        assert_eq!(ints1 & 0x200, 0,
+            "IRQ1_INTS must be 0: SM0 never set IRQ flag 1");
+    }
+
+    /// RP2040 INTR bit layout: IRQ flags at [3:0], RXNEMPTY at [7:4],
+    /// TXNFULL at [11:8] — 12-bit register (RP2040 ds Table 358).
+    /// IRQ flag 0 → bit 0. Asserts that `raw_intr_rp2040` returns 0x001.
+    #[test]
+    fn raw_intr_rp2040_layout() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x034, 0x01, 0);
+        assert_eq!(pio.irq_flags, 0x01, "irq_flags bit 0 must be set");
+        let intr = pio.raw_intr_rp2040();
+        assert_eq!(intr & 0x001, 0x001,
+            "raw_intr_rp2040: IRQ flag 0 must appear at bit 0 (RP2040 ds Table 358)");
+        assert_eq!(intr >> 12, 0,
+            "raw_intr_rp2040: bits [31:12] must be zero (12-bit register)");
+    }
+
+    /// RP2350 INTR bit layout: IRQ flags at [15:8], TXNFULL at [7:4],
+    /// RXNEMPTY at [3:0] — 16-bit register (RP2350 ds Table 1018).
+    /// IRQ flag 0 → bit 8. Asserts that `raw_intr_rp2350` returns 0x100.
+    #[test]
+    fn raw_intr_rp2350_layout() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x034, 0x01, 0);
+        assert_eq!(pio.irq_flags, 0x01, "irq_flags bit 0 must be set");
+        let intr = pio.raw_intr_rp2350();
+        assert_ne!(intr & 0x100, 0,
+            "raw_intr_rp2350: IRQ flag 0 must appear at bit 8 (RP2350 ds Table 1018)");
+        assert_eq!(intr & 0x001, 0,
+            "raw_intr_rp2350: bit 0 (SM0_RXNEMPTY) must be 0 when RX FIFO empty");
+    }
 
     // ---- Stage B: Clock divider tests ----
 

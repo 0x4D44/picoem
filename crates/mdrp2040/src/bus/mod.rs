@@ -151,6 +151,44 @@ pub(crate) fn xip_flash_offset(addr: u32) -> Option<u32> {
 pub const PIO0_BASE: u32 = 0x5020_0000;
 pub const PIO1_BASE: u32 = 0x5030_0000;
 
+/// Translate an RP2040 PIO register offset to the internal PioBlock offset.
+///
+/// `PioBlock` uses RP2350-style offsets (INTR at 0x16C, IRQ0_INTE at 0x170,
+/// …, IRQ1_INTS at 0x184) because that is the authoritative silicon layout.
+/// The RP2040 has no RXFn_PUTGET / GPIOBASE registers, so its INT block
+/// starts immediately after the per-SM block at 0x128 — 0x44 bytes earlier.
+/// This helper compensates for that shift when the RP2040 bus dispatches
+/// into PioBlock.
+#[inline(always)]
+const fn pio_rp2040_to_internal(offset: u32) -> u32 {
+    if offset >= 0x128 && offset <= 0x140 {
+        offset + 0x44
+    } else {
+        offset
+    }
+}
+
+/// RP2040 PIO register read dispatch. Handles INTR and INTn_INTS using the
+/// RP2040-specific bit layout (IRQ flags at [3:0], RXNEMPTY at [7:4],
+/// TXNFULL at [11:8]); all other registers are forwarded through the
+/// standard offset translator `pio_rp2040_to_internal`.
+///
+/// Only the INTR, INT0_INTS, and INT1_INTS reads differ between chips —
+/// the INTE/INTF registers expose the same raw storage value regardless
+/// of which bit layout is in use.
+fn pio_read_rp2040(pio: &mut PioBlock, offset: u32) -> u32 {
+    match offset {
+        // INTR (RP2040 offset 0x128): raw status in RP2040 12-bit layout.
+        0x128 => pio.raw_intr_rp2040(),
+        // INT0_INTS (RP2040 offset 0x134): (INTR_rp2040 & INTE) | INTF.
+        0x134 => pio.int0_ints_rp2040(),
+        // INT1_INTS (RP2040 offset 0x140): (INTR_rp2040 & INTE) | INTF.
+        0x140 => pio.int1_ints_rp2040(),
+        // All other offsets: translate to RP2350-internal and dispatch normally.
+        other => pio.read32(pio_rp2040_to_internal(other)),
+    }
+}
+
 /// DMA peripheral base (RP2040 datasheet §2.5 — single 4 KB window
 /// covering 12 channels + global registers + debug aliases). Phase 4
 /// (HLD V7 §5.6) enables the full DMA model.
@@ -247,7 +285,12 @@ pub struct Bus {
     /// DMA controller — Phase 1 stub (always idle). Phase 4 replaces
     /// this with the 12-channel model. Consulted by the fast-path gate
     /// in [`crate::Emulator::step`] via [`Dma::is_idle`].
-    pub(crate) dma: Dma,
+    ///
+    /// `pub` so diagnostic harnesses (e.g. `picogus_diff_rp2040`) can
+    /// read per-channel observation counters on `DmaChannel` without
+    /// going through MMIO. Matches the precedent of `pub gpio_in` and
+    /// `pub pio` above. Control still flows through `bus.write32`.
+    pub dma: Dma,
     /// Pending external IRQ bitmap (bit N = IRQ #N asserted this
     /// cycle). Peripherals OR into this field when their state raises
     /// a line; [`crate::Emulator::drain_pending_irqs_to_cores`] drains
@@ -676,8 +719,8 @@ impl Bus {
             ROSC_BASE => self.rosc_regs.read32(offset),
             IO_BANK0_BASE => self.io_bank0.read32(offset),
             PADS_BANK0_BASE => self.pads_bank0.read32(offset),
-            PIO0_BASE => self.pio[0].read32(offset),
-            PIO1_BASE => self.pio[1].read32(offset),
+            PIO0_BASE => pio_read_rp2040(&mut self.pio[0], offset),
+            PIO1_BASE => pio_read_rp2040(&mut self.pio[1], offset),
             DMA_BASE => self.dma.read32(offset),
             TIMER_BASE => self
                 .timer
@@ -740,8 +783,8 @@ impl Bus {
             ROSC_BASE => self.rosc_regs.write32(offset, val, alias),
             IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
             PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
-            PIO0_BASE => self.pio[0].write32(offset, val, alias),
-            PIO1_BASE => self.pio[1].write32(offset, val, alias),
+            PIO0_BASE => self.pio[0].write32(pio_rp2040_to_internal(offset), val, alias),
+            PIO1_BASE => self.pio[1].write32(pio_rp2040_to_internal(offset), val, alias),
             DMA_BASE => self.dma.write32(offset, val, alias),
             TIMER_BASE => {
                 let sys_hz = self.clock_tree.sys_clk_hz;

@@ -382,8 +382,8 @@ impl Emulator {
         for i in 0..3 {
             // Capture INTS values before mutably borrowing `self.bus` for
             // `assert_irq_shared`.
-            let ints0 = self.bus.pio[i].int0_ints();
-            let ints1 = self.bus.pio[i].int1_ints();
+            let ints0 = self.bus.pio[i].int0_ints_rp2350();
+            let ints1 = self.bus.pio[i].int1_ints_rp2350();
             let irq0_line = IRQ_PIO0_IRQ_0 + (i as u32) * 2;
             let irq1_line = irq0_line + 1;
             if ints0 != 0 {

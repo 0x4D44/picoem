@@ -451,10 +451,10 @@ impl Emulator {
             self.pio0_sm0_last_pc = sm0_pc;
         }
         for (block, line0_bit) in [(0usize, 7u32), (1usize, 9u32)] {
-            if self.bus.pio[block].int0_ints() != 0 {
+            if self.bus.pio[block].int0_ints_rp2040() != 0 {
                 self.bus.irq_pending |= 1u32 << line0_bit;
             }
-            if self.bus.pio[block].int1_ints() != 0 {
+            if self.bus.pio[block].int1_ints_rp2040() != 0 {
                 self.bus.irq_pending |= 1u32 << (line0_bit + 1);
             }
         }
