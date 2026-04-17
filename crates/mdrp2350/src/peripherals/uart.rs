@@ -947,4 +947,65 @@ mod tests {
         assert_eq!(bus.read32(UART0_BASE + UARTIBRD, 0), 0x11);
         assert_eq!(bus.read32(UART1_BASE + UARTIBRD, 0), 0x22);
     }
+
+    /// End-to-end replica of the `uart0_rx_loopback` silicon scenario:
+    /// writes go through `Bus::write32` in the same order the scenario
+    /// applies them on silicon, including the `CLK_PERI_CTRL.ENABLE=1`
+    /// and `UARTLCR_H.WLEN=8-bit` writes that close residual A.2.2.
+    /// Asserts EMU side produces UARTFR = 0x80 after one byte-time at
+    /// 150 MHz and that the looped-back byte is recoverable from UARTDR.
+    ///
+    /// Two of the scenario writes are no-ops on EMU today:
+    ///   * `CLK_PERI_CTRL` — the emulator runs clk_peri unconditionally
+    ///     (tech_debt.md "UART/SPI/I2C ignore CLK_PERI_CTRL.ENABLE").
+    ///   * `UARTLCR_H.WLEN` — the emulator doesn't mask transmitted/
+    ///     received data to `WLEN+5` bits (PL011 silicon does; WLEN=00
+    ///     at reset truncates `0x42` to `0x02` on the wire).
+    /// This test locks in both invariants so a future emulator refactor
+    /// that starts honouring either gate keeps the scenario passing.
+    ///
+    /// At 115200 baud / 150 MHz clk_peri:
+    ///   div_64 = 81*64 + 24 = 5208
+    ///   baud   ≈ 150 MHz × 4 / 5208 ≈ 115207
+    ///   byte-time ≈ 150 MHz × 10 / 115207 ≈ 13020 sysclks
+    /// 60_000 sysclks (matching the scenario's max_sysclks) is well
+    /// above one byte-time.
+    #[test]
+    fn scenario_uart0_rx_loopback_emu_end_to_end_matches_silicon_expected() {
+        use crate::Bus;
+        use crate::bus::RESET_UART0;
+        // Scenario constants mirror `silicon_scenarios.rs` by design —
+        // mdrp2350 is upstream of the harness, so we can't import them.
+        const RESETS_CLR: u32 = 0x4002_0000 + 0x3000;
+        const CLOCKS_CLK_PERI_CTRL: u32 = 0x4001_0048;
+        const CLK_CTRL_ENABLE: u32 = 1 << 11;
+        const LCR_H_WLEN_8: u32 = 0b11 << 5;
+
+        let mut bus = Bus::new();
+        // Release UART0 (scenario's RESETS_CLR_ALL does this; UART0 is
+        // already released post-bootrom on the emulator, but we mirror
+        // the silicon setup sequence exactly).
+        bus.write32(RESETS_CLR, 1 << RESET_UART0);
+        // Scenario setup sequence (matching silicon_scenarios.rs order).
+        bus.write32(CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE);
+        bus.write32(UART0_BASE + UARTIBRD, 81);
+        bus.write32(UART0_BASE + UARTFBRD, 24);
+        bus.write32(UART0_BASE + UARTLCR_H, UARTLCR_H_FEN | LCR_H_WLEN_8);
+        bus.write32(
+            UART0_BASE + UARTCR,
+            UARTCR_UARTEN | UARTCR_LBE | UARTCR_RXE | UARTCR_TXE,
+        );
+        bus.write32(UART0_BASE + UARTDR, 0x42);
+        // Advance 60,000 sysclks (matching the scenario's max_sysclks).
+        bus.tick_peripherals(60_000);
+        let fr = bus.read32(UART0_BASE + UARTFR);
+        assert_eq!(
+            fr, 0x0000_0080,
+            "end-to-end EMU UARTFR must be 0x80 (TXFE + RX byte + CTS=0); got 0x{fr:08X}",
+        );
+        // The looped-back byte must be recoverable — the observable
+        // UARTDR mask 0xFF on silicon reads 0x42 after the fix.
+        let dr = bus.read32(UART0_BASE + UARTDR) & 0xFF;
+        assert_eq!(dr, 0x42, "RX FIFO must hold the loopback byte 0x42; got 0x{dr:02X}");
+    }
 }

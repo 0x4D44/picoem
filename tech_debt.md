@@ -1081,6 +1081,29 @@ design for Phase 4 and documented in the relevant DMA module.
   pass. Surfaced by the scenario-fixes agent during the Stage A fidelity
   fix wave (2026-04-16) but deferred to keep that wave's scope tight.
 
+- **UART/SPI/I2C ignore `CLK_PERI_CTRL.ENABLE`** — peripheral `tick`
+  paths in `crates/mdrp2350/src/peripherals/{uart,spi,i2c}.rs` advance
+  their state machines regardless of the `CLK_PERI_CTRL.ENABLE` gate.
+  Silicon post-`Core::reset_and_halt` starts with `CLK_PERI_CTRL=0`
+  (the bootrom's `runtime_init_clocks` didn't run), so silicon's UART
+  shift register sits idle until firmware flips ENABLE. The emulator
+  happily drains at its seeded 150 MHz peri_clk in the same window.
+  Evidence: residual A.2.2 — `uart0_rx_loopback` reported
+  `HW=0x18 EMU=0x80` at `0x4007_0018` until the scenario started
+  writing `CLK_PERI_CTRL=0x800` as its second setup step (2026-04-17,
+  `wrk_docs/2026.04.17 - HLD - Residual A.2.2 UART RX Loopback BUSY
+  Fix.md`). Adding gate-aware tick paths is tempting for fidelity but
+  carries wide blast radius: every scenario that currently passes does
+  so because the emulator runs clk_peri unconditionally
+  (`spi0_loopback_single_byte`, `i2c0_bus_scan_reserved_nack`,
+  `uart0_tx_single_byte` all skip the ENABLE write). A co-ordinated
+  audit of peri-clock consumers plus every scenario that implicitly
+  relies on "clk_peri always live" is needed before flipping the
+  switch. Defer until a firmware scenario genuinely exercises dynamic
+  `CLK_PERI_CTRL` enable/disable. Related emitter:
+  `crates/mdrp2350/src/bus/peripherals.rs:194` warn-once
+  "CLOCKS CLK_*_CTRL.ENABLE cleared; clock-gate behaviour not modelled".
+
 ### `Verdict::ResolvedAddrOutOfRange` unreachable at runtime
 
 In `crates/mdpicoem-harness/src/onerom_serving_oracle.rs`, the stim-pattern

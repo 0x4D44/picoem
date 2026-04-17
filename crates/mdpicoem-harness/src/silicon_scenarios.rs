@@ -89,6 +89,15 @@ pub const PLL_CS_LOCK_BIT: u32 = 1 << 31;
 // divider is in bits [31:16]; fractional in [15:0].
 pub const CLOCKS_CLK_SYS_DIV: u32 = 0x4001_0040;
 
+/// CLOCKS CLK_PERI_CTRL — gate for the peripheral clock (UART / SPI /
+/// I2C). Silicon reset value: 0 (ENABLE=0, AUXSRC=0). Post-bootrom
+/// silicon stays ungated until `runtime_init_clocks` sets ENABLE=1.
+/// After `Core::reset_and_halt` the bootrom does NOT run, so scenarios
+/// that program a real UART baud must set ENABLE=1 themselves.
+pub const CLOCKS_CLK_PERI_CTRL: u32 = 0x4001_0048;
+/// ENABLE bit for CLK_*_CTRL (bit 11 on every gated channel).
+pub const CLK_CTRL_ENABLE: u32 = 1 << 11;
+
 // ---------------------------------------------------------------------------
 // Scenario type
 // ---------------------------------------------------------------------------
@@ -774,6 +783,10 @@ const UART0_UARTDR: u32 = UART0_BASE + 0x00;
 const UART0_UARTLCR_H: u32 = UART0_BASE + 0x2C;
 const UART0_UARTCR: u32 = UART0_BASE + 0x30;
 const UARTLCR_H_FEN: u32 = 1 << 4;
+/// UARTLCR_H.WLEN = 0b11 (bits [6:5]) — 8-bit word length. PL011 masks
+/// transmitted/received data to `WLEN+5` bits; without this, silicon
+/// defaults to WLEN=00 = 5-bit and truncates `0x42` → `0x02`.
+const UARTLCR_H_WLEN_8: u32 = 0b11 << 5;
 const UARTCR_UARTEN: u32 = 1 << 0;
 const UARTCR_LBE: u32 = 1 << 7;
 const UARTCR_TXE: u32 = 1 << 8;
@@ -850,11 +863,31 @@ const O_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
 /// 0x42 via UARTDR, advance enough sysclks for baud-timed TX drain +
 /// loopback into RX FIFO. Observe UARTFR (RXFE clear) and UARTDR
 /// readback (pop 0x42 from RX FIFO).
+///
+/// Residual A.2.2 fix (2026-04-17): two scenario edits close this
+/// oracle against RP2354 silicon:
+///
+/// 1. Enable `CLK_PERI_CTRL.ENABLE=1` before touching UART registers.
+///    The bootrom is skipped by `Core::reset_and_halt`, so silicon
+///    starts with `CLK_PERI_CTRL=0` (gate closed, UARTCLK stopped).
+///    Without this write silicon's TX shift register never advances
+///    and UARTFR stays at 0x18 (BUSY|RXFE) indefinitely. The emulator
+///    currently ignores the gate (tech_debt.md "UART/SPI/I2C ignore
+///    CLK_PERI_CTRL.ENABLE"), so this write is a no-op on EMU — but
+///    it pins the scenario's precondition for the day the emulator
+///    starts honouring the gate.
+/// 2. Set `UARTLCR_H.WLEN=0b11` (8-bit) alongside FEN. PL011 masks
+///    both TX and loopback-RX data to `WLEN+5` bits; with WLEN=00
+///    (reset default) silicon truncates `0x42` → `0x02` in the RX
+///    FIFO and the UARTDR observable diverges. The emulator doesn't
+///    model WLEN-based data truncation today, so this write is also
+///    a no-op on EMU.
 const S_UART0_RX_LOOPBACK: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE),
     (UART0_UARTIBRD, 81),
     (UART0_UARTFBRD, 24),
-    (UART0_UARTLCR_H, UARTLCR_H_FEN),
+    (UART0_UARTLCR_H, UARTLCR_H_FEN | UARTLCR_H_WLEN_8),
     (UART0_UARTCR, UARTCR_UARTEN | UARTCR_LBE | UARTCR_TXE | UARTCR_RXE),
     (UART0_UARTDR, 0x42),
 ];
@@ -1148,10 +1181,11 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         observe: O_UART0_RX_LOOPBACK,
         observe_pins: 0,
         custom_sled: None,
-        // 1 byte at 115200 baud @ 150 MHz ~ 13_020 sys_clks for TX drain.
-        // LBE loopback adds FIFO pipeline latency on top. 25_000 gives ~2x
-        // margin over the bare baud-rate minimum so silicon is never sampled
-        // mid-TX (silicon observed UARTFR=0x18 BUSY|RXFE at 10_000).
+        // 1 byte at 115200 baud @ 150 MHz ~ 13_020 sys_clks for TX drain
+        // (reachable now that S_UART0_RX_LOOPBACK enables CLK_PERI_CTRL
+        // before programming baud — see residual A.2.2 fix). LBE loopback
+        // adds FIFO pipeline latency on top. 25_000 gives ~2x margin over
+        // the bare baud-rate minimum so silicon is never sampled mid-TX.
         min_sysclks: 25_000,
     },
     // Phase 2 — SPI0 loopback round-trip.
