@@ -37,6 +37,11 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 mdrp2350 = { path = "../mdrp2350", features = ["test-hooks"] }
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
+# External authoritative RISC-V decoder used by the `riscv_gen` property
+# test (spec cross-check against our private encoder; see
+# `wrk_docs/2026.04.17 - LLD - QEMU Diff RISC-V V1.md` §8). Exact-version
+# pinned so upstream drift surfaces explicitly — upgrade review required.
+riscv-decode = "=0.2.3"
 
 # L1/L2/L3 integration tests for the QemuProcess child-cleanup path
 # need `OpenProcess` / `WaitForSingleObject` / `TerminateProcess` to
@@ -100,6 +105,10 @@ path = "src/bin/onerom_serving_oracle_rp2350.rs"
 [[bin]]
 name = "onerom_serving_oracle_cpu_rp2350"
 path = "src/bin/onerom_serving_oracle_cpu_rp2350.rs"
+
+[[bin]]
+name = "onerom_stress_cpu_rp2350"
+path = "src/bin/onerom_stress_cpu_rp2350.rs"
 
 [[bin]]
 name = "onerom_stress_pio_rp2350"

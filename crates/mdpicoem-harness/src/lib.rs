@@ -56,6 +56,7 @@ pub mod onerom_stress;
 pub mod onerom_sync;
 pub mod onerom_trace;
 pub mod picogus_pins;
+pub mod riscv_gen;
 pub mod silicon_oracle;
 pub mod silicon_scenarios;
 pub mod thumb32_gen;
