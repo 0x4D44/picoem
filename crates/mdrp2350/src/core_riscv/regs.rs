@@ -3,16 +3,11 @@
 // `wrk_docs/2026.04.17 - HLD - RP2350 RISC-V Hazard3 Core Support.md`
 // §4.5.
 
-/// M-mode CSR storage for one hart. All fields are plain storage — P1b
-/// applies §4.3 reset values only. Trap rules, WARL rounding, and
-/// hardwired zero enforcement (`mtval`) live in the P2 CSR dispatch.
+/// M-mode CSR storage for one hart. Plain field storage; trap rules,
+/// WARL rounding, and hardwired zero enforcement (`mtval`) live in the
+/// P2 CSR dispatch (`csr.rs`). P2 accesses every field.
 ///
 /// Explicitly not a `HashMap` — the HLD pins this to a known fixed set.
-///
-/// P1b stores values only; all reads/writes are dead code until P2
-/// wires the Zicsr dispatch. `#[allow(dead_code)]` blankets the struct
-/// rather than annotating 11 fields individually.
-#[allow(dead_code)]
 pub(crate) struct CsrFile {
     /// Machine status. Reset: 0.
     pub mstatus: u32,

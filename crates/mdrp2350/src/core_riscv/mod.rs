@@ -1,12 +1,22 @@
-// Hazard3 RISC-V core skeleton. P1b lands the struct + reset + CSR
-// storage only; decode/execute/trap/IRQ/atomics live in P2..P4 per
+// Hazard3 RISC-V core. P1b landed the struct + reset + CSR storage;
+// P2 wires real fetch-decode-execute for RV32I + Zicsr + Zifencei,
+// trap entry / mret, and `wfi`-park semantics. IRQ controller and
+// atomics live in P3/P4 per
 // `wrk_docs/2026.04.17 - HLD - RP2350 RISC-V Hazard3 Core Support.md`
 // §4.4.
 
 pub(crate) mod regs;
+pub(crate) mod decode;
+pub(crate) mod csr;
+pub(crate) mod trap;
+pub(crate) mod execute;
+
+#[cfg(test)]
+mod tests_p2;
 
 use crate::Bus;
 use regs::CsrFile;
+use trap::cause;
 
 /// `misa` hardwired value — MXL=01 (bit 30) + X (bit 23) + I (bit 8) +
 /// M (bit 12) + A (bit 0) + C (bit 2). No U/S/B. Per HLD §4.3.
@@ -19,9 +29,7 @@ const RESET_PC: u32 = 0x2000_0000;
 /// Hazard3 core (single hart). Dual-core complex holds two of these.
 pub struct Hazard3 {
     /// Integer register file. `x[0]` is architecturally wired to zero —
-    /// the P2 executor is responsible for ignoring writes to index 0.
-    /// P1b stores plain u32 without that guard.
-    #[allow(dead_code)]
+    /// the P2 executor ignores writes to index 0 via `rd_x`/`wr`.
     pub(crate) x: [u32; 32],
     /// Program counter.
     pub(crate) pc: u32,
@@ -61,12 +69,54 @@ impl Hazard3 {
         *self = Self::new(self.hart_id);
     }
 
-    /// Stub step. P2 replaces this with real fetch-decode-execute.
-    /// Advances PC by 4 and the cycle counter by 1 so the quantum
-    /// scheduler makes forward progress during bring-up.
-    pub fn step(&mut self, _bus: &mut Bus) {
-        self.pc = self.pc.wrapping_add(4);
+    /// Execute one RV32I instruction. Flat 1-cycle cost (HLD §8 Q5;
+    /// silicon cycle oracle is P5/P6 work). Parked / halted harts are
+    /// no-ops.
+    pub fn step(&mut self, bus: &mut Bus) {
+        if self.halted || self.wfi_parked {
+            return;
+        }
+        let epc = self.pc;
+
+        // Instruction-address misalignment. Without C-extension the
+        // minimum alignment is 4 bytes. HLD §4.5 cause 0. TODO: when C
+        // lands in P3, relax this to (epc & 1) != 0.
+        if epc & 0b11 != 0 {
+            self.enter_trap(cause::INSTR_ADDR_MISALIGNED, epc, epc);
+            self.cycles = self.cycles.wrapping_add(1);
+            return;
+        }
+
+        // Publish current-instruction PC for the MMIO trace (HLD §4.6).
+        // Must precede the fetch so fetch-side bus transactions attribute
+        // to the correct PC.
+        bus.set_active_pc(epc, self.hart_id);
+
+        // Fetch.
+        let insn = bus.read32(epc, self.hart_id);
+        if bus.bus_fault(self.hart_id as usize) {
+            bus.clear_bus_fault(self.hart_id as usize);
+            self.enter_trap(cause::INSTR_ACCESS_FAULT, epc, epc);
+            self.cycles = self.cycles.wrapping_add(1);
+            return;
+        }
+
+        // Decode + dispatch.
+        let op = decode::decode(insn);
+        self.execute(op, bus, epc);
+
+        // Flat-cycle cost. The HLD's M/load mult-cycle budget lands in P3.
         self.cycles = self.cycles.wrapping_add(1);
+
+        // RV-priv §3.1.11: `mcycle` / `minstret` tick when their
+        // respective `mcountinhibit` bit is clear. Reset inhibits both
+        // (mcountinhibit = 0b101), so firmware must opt in.
+        if self.csrs.mcountinhibit & 0b001 == 0 {
+            self.csrs.mcycle = self.csrs.mcycle.wrapping_add(1);
+        }
+        if self.csrs.mcountinhibit & 0b100 == 0 {
+            self.csrs.minstret = self.csrs.minstret.wrapping_add(1);
+        }
     }
 
     /// Per-core cycle count (scheduler view).
@@ -87,38 +137,32 @@ impl Hazard3 {
     }
 
     /// Hard-wired `mhartid` (HLD §4.3). Exposed for P2 CSR dispatch.
-    #[allow(dead_code)]
     pub(crate) fn mhartid(&self) -> u32 {
         self.hart_id as u32
     }
 
     /// Hard-wired `misa` value — `0x4080_1105` (HLD §4.3).
-    #[allow(dead_code)]
     pub(crate) fn misa(&self) -> u32 {
         MISA_VALUE
     }
 
     /// Hard-wired `mvendorid` — 0 (Hazard3 upstream default).
-    #[allow(dead_code)]
     pub(crate) fn mvendorid(&self) -> u32 {
         0
     }
 
     /// Hard-wired `marchid` — 0 (Hazard3 upstream default).
-    #[allow(dead_code)]
     pub(crate) fn marchid(&self) -> u32 {
         0
     }
 
     /// Hard-wired `mimpid` — 0 (Hazard3 upstream default).
-    #[allow(dead_code)]
     pub(crate) fn mimpid(&self) -> u32 {
         0
     }
 
     /// Hard-wired `mconfigptr` (CSR 0xF15) — 0 (RV-priv 1.12 mandatory;
     /// Hazard3 csr.adoc :79).
-    #[allow(dead_code)]
     pub(crate) fn mconfigptr(&self) -> u32 {
         0
     }
@@ -194,6 +238,10 @@ mod tests {
     fn step_advances_pc_and_cycles() {
         let mut c = Hazard3::new(0);
         let mut bus = Bus::new();
+        // Plant a NOP (ADDI x0, x0, 0) at the reset PC so the fetch
+        // decodes cleanly — without this the zeroed SRAM decodes as an
+        // illegal (low bits != 0b11) and the trap path overrides pc.
+        bus.memory.sram_write32(0, 0x0000_0013);
         c.step(&mut bus);
         assert_eq!(c.pc, 0x2000_0004);
         assert_eq!(c.cycles(), 1);

@@ -709,6 +709,9 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
 /// target.
 fn step_pair_riscv(cs: &mut [Hazard3; 2], bus: &mut Bus, target: u64) {
     for core_id in 0..2 {
+        // Threading removed `bus.set_active_core`; each hart passes its
+        // own `hart_id` into `bus.read*` / `write*` / `bus_fault(core)`
+        // for MMIO-trace attribution and per-core bus-fault routing.
         while !cs[core_id].is_halted() && cs[core_id].cycles() < target {
             cs[core_id].step(bus);
         }
