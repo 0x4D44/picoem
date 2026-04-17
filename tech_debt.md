@@ -1080,3 +1080,38 @@ design for Phase 4 and documented in the relevant DMA module.
   flake or fail under timing variance. Bump to ~20,000 in a follow-up
   pass. Surfaced by the scenario-fixes agent during the Stage A fidelity
   fix wave (2026-04-16) but deferred to keep that wave's scope tight.
+
+### `Verdict::ResolvedAddrOutOfRange` unreachable at runtime
+
+In `crates/mdpicoem-harness/src/onerom_serving_oracle.rs`, the stim-pattern
+predicate already restricts resolved addresses to `hi16 == 0x2000` before
+the `SHADOW_BASE..SHADOW_BASE + SHADOW_SIZE` bounds check runs. With
+`SHADOW_SIZE = 0x1_0000` the shadow spans the full u16 low-half, so every
+stim-matching push is architecturally in-range and the
+`Verdict::ResolvedAddrOutOfRange` arm cannot fire. The variant is kept
+intentionally as a belt-and-braces guard: if a future shrink of
+`SHADOW_SIZE` drops below `0x1_0000`, the check catches the regression
+instead of indexing past the shadow. Document-only; no code change.
+
+### `CpuServingOracle` pin map is hardcoded (blocks CPU-mode stress on non-`test-sdrr-0` fixtures)
+
+In `crates/mdpicoem-harness/src/onerom_serving_oracle_cpu.rs`, `run_case`
+drives CS via `GPIO_CS1 = 13` (plus `GPIO_CS2 = 12`, `GPIO_CS3 = 15`) and
+uses the fixed `ADDR_PINS` permutation. Those constants match the
+`test-sdrr-0-cpu` fixture, where the CPU firmware was baked to read CS
+from GPIO13. The `1541-cpu` fixture was baked with its "chip select"
+wired to GPIO0 instead (firmware-side metadata difference; both use the
+same `fire-24-a` hardware pin mapping, but the firmware's runtime gating
+register is different). Net effect: `onerom_stress_cpu_rp2350` against
+`1541-cpu.bin` only passes ~140/2048 cases — every case where the
+stim-pattern happens to set GPIO0 high passes; the rest report
+`NoResolve` because the firmware's wait-loop poll never takes the "CS
+asserted" branch.
+
+Fix: parameterise `CpuServingOracle::run_case` over a `PinProfile` read
+from the fixture's SDRR metadata (see HLD
+`wrk_docs/2026.04.17 - HLD - OneROM Stress Harness.md` §Open questions
+for the shape). Low-risk change once scoped — ~1 day. Out of scope for
+the initial stress-harness wave (2026-04-17). The stress CPU binary is
+retained as a latent regression target: when the fix lands, it'll flip
+to full 2048/2048 PASS without any binary-side change.
