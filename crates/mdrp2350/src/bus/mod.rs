@@ -1038,8 +1038,17 @@ impl Bus {
     pub(crate) fn tick_peripherals(&mut self, sys_clks: u32) {
         // TICKS runs unconditionally — there is no RESETS bit for the
         // tick generator (it is bus-level plumbing). Advance all six
-        // domains; only TIMER0 / TIMER1 consumers drain edges.
+        // domains; consumers (TIMER0/TIMER1/RISCV-MTIME) drain edges.
         self.ticks.advance_all(sys_clks);
+
+        // MTIME (SIO §3.1.8) — drain RISCV TICKS edges and advance the
+        // RISC-V platform timer. `Sio::tick_mtime_from_ticks` picks
+        // between the edge count and `sys_clks` based on
+        // `MTIME_CTRL.FULLSPEED`; it also gates on `MTIME_CTRL.EN`.
+        // See HLD `2026.04.17 - HLD - Residual A.2.1 MTIME
+        // WATCHDOG_TICK Fix.md`.
+        let riscv_edges = self.ticks.take_riscv_edges();
+        self.sio.tick_mtime_from_ticks(riscv_edges, sys_clks);
 
         // TIMER0 — advance microsecond counter by the edges accumulated
         // on the TIMER0 TICKS domain, poll alarms, route shared IRQ.

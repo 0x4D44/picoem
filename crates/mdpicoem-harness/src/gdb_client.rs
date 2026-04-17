@@ -15,10 +15,59 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::REG_XPSR;
+
+// ============================================================================
+// RISC-V GDB register indices
+// ============================================================================
+//
+// Per target.xml served by qemu-system-riscv32 with `f=false,d=false` pinned
+// (see `2026.04.17 - LLD - QEMU Diff RISC-V V1.md` §3). Indices are GDB
+// register numbers — decimal on the wire, but hex-formatted in `p`/`P`
+// packets (`p20` = PC). Declared as `u32` to match the LLD specification
+// and leave headroom for future CSR indices (though V1 uses the proxy,
+// not flat-index CSR reads).
+//
+// No CSR constants here: the CSR-diff proxy (LLD §3) reads CSRs via
+// `csrrs`/`sw` sequences spliced into the test slot, not via GDB `p`.
+
+pub const REG_RV_X0: u32 = 0;
+pub const REG_RV_X1: u32 = 1;
+pub const REG_RV_X2: u32 = 2;
+pub const REG_RV_X3: u32 = 3;
+pub const REG_RV_X4: u32 = 4;
+pub const REG_RV_X5: u32 = 5;
+pub const REG_RV_X6: u32 = 6;
+pub const REG_RV_X7: u32 = 7;
+pub const REG_RV_X8: u32 = 8;
+pub const REG_RV_X9: u32 = 9;
+pub const REG_RV_X10: u32 = 10;
+pub const REG_RV_X11: u32 = 11;
+pub const REG_RV_X12: u32 = 12;
+pub const REG_RV_X13: u32 = 13;
+pub const REG_RV_X14: u32 = 14;
+pub const REG_RV_X15: u32 = 15;
+pub const REG_RV_X16: u32 = 16;
+pub const REG_RV_X17: u32 = 17;
+pub const REG_RV_X18: u32 = 18;
+pub const REG_RV_X19: u32 = 19;
+pub const REG_RV_X20: u32 = 20;
+pub const REG_RV_X21: u32 = 21;
+pub const REG_RV_X22: u32 = 22;
+pub const REG_RV_X23: u32 = 23;
+pub const REG_RV_X24: u32 = 24;
+pub const REG_RV_X25: u32 = 25;
+pub const REG_RV_X26: u32 = 26;
+pub const REG_RV_X27: u32 = 27;
+pub const REG_RV_X28: u32 = 28;
+pub const REG_RV_X29: u32 = 29;
+pub const REG_RV_X30: u32 = 30;
+pub const REG_RV_X31: u32 = 31;
+pub const REG_RV_PC: u32 = 32;
 
 // ============================================================================
 // QemuProfile — which QEMU machine/CPU/port to spawn
@@ -26,19 +75,36 @@ use crate::REG_XPSR;
 
 /// Selects the QEMU machine, CPU model and GDB port for [`QemuProcess::spawn_with`].
 ///
-/// The two profiles in use by the harness correspond to the two chips modelled:
+/// The three profiles in use by the harness correspond to the three CPU
+/// variants modelled:
 ///   * [`QemuProfile::M33_RP2350`] — MPS2-AN505 + cortex-m33 on port 3333.
 ///   * [`QemuProfile::M0_PLUS_RP2040`] — microbit + cortex-m0 on port 3334.
+///   * [`QemuProfile::RISCV32_RP2350`] — `-machine none` + generic rv32 CPU
+///     on port 3335 (the Hazard3 RISC-V oracle).
 ///
 /// QEMU 10.2 only exposes `cortex-m0` for -cpu; there is no `cortex-m0plus`
 /// model. The M0+ is a strict superset of M0 for the ARMv6-M Thumb-16/Thumb-32
 /// subset we care about (the Pico SDK uses the same binary for either chip),
 /// so the M0 oracle is an acceptable M0+ reference for differential testing.
+///
+/// `bios` and `loader_addr` are only populated for the RISC-V profile. ARM
+/// profiles leave both `None`; the ARM spawn path uses QEMU's default BIOS
+/// behaviour and injects test firmware via GDB `M` packets after connect.
+/// The RISC-V profile uses `-bios none` (required with `-machine none`) and
+/// places a boot-stub image at `loader_addr` via `-device loader,...`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QemuProfile {
     pub machine: &'static str,
     pub cpu: &'static str,
     pub gdb_port: u16,
+    /// If `Some(val)`, appends `-bios <val>` to the spawn args. `None` leaves
+    /// the QEMU default in place (ARM profiles).
+    pub bios: Option<&'static str>,
+    /// If `Some(addr)`, the caller must invoke [`QemuProcess::spawn_with_image`]
+    /// and QEMU is spawned with `-device loader,file=<path>,addr=<addr>,cpu-num=0`
+    /// (RISC-V profile). `None` means the test image is injected later via
+    /// GDB `M` packets (ARM profiles).
+    pub loader_addr: Option<u32>,
 }
 
 impl QemuProfile {
@@ -47,6 +113,8 @@ impl QemuProfile {
         machine: "mps2-an505",
         cpu: "cortex-m33",
         gdb_port: 3333,
+        bios: None,
+        loader_addr: None,
     };
     /// Microbit + cortex-m0 on port 3334 (the mdrp2040 oracle).
     ///
@@ -56,6 +124,21 @@ impl QemuProfile {
         machine: "microbit",
         cpu: "cortex-m0",
         gdb_port: 3334,
+        bios: None,
+        loader_addr: None,
+    };
+    /// `-machine none` + generic `rv32` CPU on port 3335 (the Hazard3 oracle).
+    ///
+    /// Feature string pins RV32IMAC + Zicsr + Zifencei with F and D explicitly
+    /// disabled (see `2026.04.17 - LLD - QEMU Diff RISC-V V1.md` §2). Disabling
+    /// F/D removes the FPR block from the GDB register map so the `g`/`G`
+    /// packet stays at 132 bytes (33 × u32 = GPRs + PC).
+    pub const RISCV32_RP2350: Self = Self {
+        machine: "none",
+        cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,f=false,d=false",
+        gdb_port: 3335,
+        bios: Some("none"),
+        loader_addr: Some(0x2000_0000),
     };
 
     /// Formatted `tcp::<port>` string for the `-gdb` argument.
@@ -66,6 +149,17 @@ impl QemuProfile {
     /// Formatted `localhost:<port>` string for [`GdbClient::connect`].
     pub fn gdb_addr(&self) -> String {
         format!("localhost:{}", self.gdb_port)
+    }
+
+    /// True when this profile selects a RISC-V QEMU binary.
+    ///
+    /// Dispatch key for [`QemuProcess::spawn_with`] and
+    /// [`QemuProcess::spawn_with_image`]: when set, `qemu-system-riscv32` is
+    /// launched instead of `qemu-system-arm`.
+    fn is_riscv(&self) -> bool {
+        // Matches any rv32* CPU string (e.g. rv32, rv32e) — future embedded-
+        // profile variants will still dispatch to qemu-system-riscv32.
+        self.cpu.starts_with("rv32")
     }
 }
 
@@ -225,9 +319,12 @@ pub struct QemuProcess {
 }
 
 impl QemuProcess {
-    /// Standard Windows install path (winget / qemu.org installer).
-    const WINDOWS_QEMU_PATH: &'static str =
+    /// Standard Windows install path for the ARM QEMU binary.
+    const WINDOWS_QEMU_ARM_PATH: &'static str =
         r"C:\Program Files\qemu\qemu-system-arm.exe";
+    /// Standard Windows install path for the RISC-V 32-bit QEMU binary.
+    const WINDOWS_QEMU_RISCV32_PATH: &'static str =
+        r"C:\Program Files\qemu\qemu-system-riscv32.exe";
 
     /// Spawn `qemu-system-arm` with the default M33 / RP2350 profile.
     ///
@@ -236,25 +333,111 @@ impl QemuProcess {
         Self::spawn_with(QemuProfile::M33_RP2350)
     }
 
-    /// Spawn `qemu-system-arm` with the given profile.
+    /// Spawn QEMU with the given profile.
     ///
     /// Used by the M0+ harness (`qemu_diff_m0plus`) to target a microbit /
-    /// cortex-m0 oracle on a non-conflicting port.
+    /// cortex-m0 oracle on a non-conflicting port. For profiles that require
+    /// a loader image (i.e. `profile.loader_addr.is_some()`) use
+    /// [`Self::spawn_with_image`] instead — this method rejects such profiles
+    /// with an `InvalidInput` error because the `-device loader,file=...` arg
+    /// has no default path.
+    ///
+    /// The ARM profiles inject their test firmware via GDB `M` packets after
+    /// connect, so they carry no loader image and are the intended callers
+    /// of this method.
     pub fn spawn_with(profile: QemuProfile) -> io::Result<Self> {
+        if profile.loader_addr.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "spawn_with: profile requires a loader image; use spawn_with_image()",
+            ));
+        }
+        Self::spawn_inner(profile, None)
+    }
+
+    /// Spawn QEMU with the given profile and a pre-loaded image file.
+    ///
+    /// Required for profiles that set `loader_addr` (currently only
+    /// [`QemuProfile::RISCV32_RP2350`]). The image file is placed at
+    /// `profile.loader_addr` via QEMU's `-device loader,file=<path>,addr=<addr>,cpu-num=0`
+    /// — matching the RP2350 SRAM base (`0x2000_0000`). QEMU is held at `-S`
+    /// so execution does not begin until the caller resumes via GDB.
+    ///
+    /// Returns `InvalidInput` if the profile does not declare a `loader_addr`.
+    pub fn spawn_with_image(profile: QemuProfile, path: &Path) -> io::Result<Self> {
+        if profile.loader_addr.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "spawn_with_image requires a profile with loader_addr set (RISC-V). \
+                 For ARM profiles use spawn_with() and inject firmware via GDB M-packets.",
+            ));
+        }
+        Self::spawn_inner(profile, Some(path))
+    }
+
+    /// Build the full arg vector and spawn the child process.
+    ///
+    /// Dispatches between `qemu-system-arm` and `qemu-system-riscv32` based
+    /// on `profile.is_riscv()`. The RV path adds the extra flags pinned in
+    /// LLD §2: `-bios <val>`, `-m 8M`, `-display none`, and the
+    /// `-device loader,...` string. `-icount` is intentionally omitted per
+    /// LLD §12 Q1.
+    fn spawn_inner(profile: QemuProfile, image: Option<&Path>) -> io::Result<Self> {
         let gdb_arg = profile.gdb_arg();
-        let args = [
-            "-machine",
-            profile.machine,
-            "-cpu",
-            profile.cpu,
-            "-nographic",
-            "-S",
-            "-gdb",
-            gdb_arg.as_str(),
-        ];
+        // `loader_device` and `image_str` own their strings for the lifetime
+        // of `args`; all other entries borrow from `profile` or stack locals.
+        let image_str = image.map(|p| p.to_string_lossy().into_owned());
+        let loader_device = match (profile.loader_addr, image_str.as_deref()) {
+            (Some(addr), Some(path)) => Some(format!(
+                "loader,file={},addr=0x{:x},cpu-num=0",
+                path, addr
+            )),
+            _ => None,
+        };
+
+        let mut args: Vec<&str> = Vec::with_capacity(16);
+        args.push("-machine");
+        args.push(profile.machine);
+        if let Some(bios) = profile.bios {
+            args.push("-bios");
+            args.push(bios);
+        }
+        args.push("-cpu");
+        args.push(profile.cpu);
+        if profile.is_riscv() {
+            // RV pinned invocation (LLD §2): 8 MiB RAM, no display.
+            args.push("-m");
+            args.push("8M");
+            args.push("-nographic");
+            args.push("-display");
+            args.push("none");
+        } else {
+            args.push("-nographic");
+        }
+        args.push("-gdb");
+        args.push(gdb_arg.as_str());
+        args.push("-S");
+        if let Some(dev) = loader_device.as_deref() {
+            args.push("-device");
+            args.push(dev);
+        }
+
+        let (primary, fallback, binary_name) = if profile.is_riscv() {
+            (
+                "qemu-system-riscv32",
+                Self::WINDOWS_QEMU_RISCV32_PATH,
+                "qemu-system-riscv32",
+            )
+        } else {
+            (
+                "qemu-system-arm",
+                Self::WINDOWS_QEMU_ARM_PATH,
+                "qemu-system-arm",
+            )
+        };
 
         // Try PATH first, then the standard Windows install location.
-        let child = Command::new("qemu-system-arm")
+        let child = Command::new(primary)
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -262,7 +445,7 @@ impl QemuProcess {
             .spawn()
             .or_else(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
-                    Command::new(Self::WINDOWS_QEMU_PATH)
+                    Command::new(fallback)
                         .args(&args)
                         .stdout(Stdio::null())
                         .stderr(Stdio::piped())
@@ -276,18 +459,27 @@ impl QemuProcess {
                 if e.kind() == io::ErrorKind::NotFound {
                     io::Error::new(
                         io::ErrorKind::NotFound,
-                        "qemu-system-arm not found on PATH or at \
-                         C:\\Program Files\\qemu\\. \
-                         Install QEMU >= 7.0 (winget install \
-                         SoftwareFreedomConservancy.QEMU).",
+                        format!(
+                            "{binary_name} not found on PATH or at \
+                             C:\\Program Files\\qemu\\. \
+                             Install QEMU >= 7.0 (winget install \
+                             SoftwareFreedomConservancy.QEMU)."
+                        ),
                     )
                 } else {
                     io::Error::new(
                         e.kind(),
-                        format!("failed to spawn qemu-system-arm: {e}"),
+                        format!("failed to spawn {binary_name}: {e}"),
                     )
                 }
             })?;
+
+        tracing::info!(
+            target: "mdpicoem_harness::gdb_client",
+            binary = %binary_name,
+            port = profile.gdb_port,
+            "spawned QEMU",
+        );
 
         Self::from_child(child, profile)
     }
@@ -505,6 +697,30 @@ impl GdbClient {
     /// Send kill packet. Best-effort — errors are ignored.
     pub fn kill(&mut self) {
         let _ = self.send_packet("k");
+    }
+
+    /// Read PC from a RISC-V QEMU session (index `0x20` per the target.xml map)
+    /// and verify it equals the expected loader address.
+    ///
+    /// Intended to be called once immediately after [`Self::connect`] +
+    /// [`Self::handshake`] as a sanity check that QEMU came up held at `-S`
+    /// with the loader image in place.
+    pub fn verify_rv_loader_pc(&mut self, expected: u32) -> io::Result<()> {
+        let pc = self.read_reg(REG_RV_PC as u8)?;
+        if pc != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "RV loader PC mismatch: expected {expected:#010x}, got {pc:#010x}"
+                ),
+            ));
+        }
+        tracing::info!(
+            target: "mdpicoem_harness::gdb_client",
+            pc = format!("{pc:#010x}"),
+            "RV loader PC verified",
+        );
+        Ok(())
     }
 
     // ========================================================================
@@ -836,5 +1052,29 @@ mod tests {
         // 0xDEADBEEF in LE bytes: EF, BE, AD, DE
         let hex = encode_le_hex32(0xDEAD_BEEF);
         assert_eq!(hex, "efbeadde");
+    }
+
+    // -- spawn dispatch guards --
+    //
+    // Both tests fail at the guard check BEFORE any Command::new / QEMU spawn,
+    // so they do not require a QEMU binary on PATH. Pattern-match instead of
+    // `.unwrap_err()` because `QemuProcess` does not implement `Debug`.
+
+    #[test]
+    fn spawn_with_rejects_riscv_profile() {
+        match QemuProcess::spawn_with(QemuProfile::RISCV32_RP2350) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("spawn_with must reject RISC-V profiles"),
+        }
+    }
+
+    #[test]
+    fn spawn_with_image_rejects_arm_profile() {
+        use std::path::PathBuf;
+        let dummy_path = PathBuf::from("/tmp/irrelevant.bin");
+        match QemuProcess::spawn_with_image(QemuProfile::M33_RP2350, &dummy_path) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("spawn_with_image must reject ARM profiles"),
+        }
     }
 }

@@ -5,6 +5,25 @@ use mdpicoem_common::Fifo;
 mod interp;
 pub use interp::Interp;
 
+/// `MTIME_CTRL.EN` bit mask (datasheet §3.1 Table 80, bit 0).
+/// When 0, the MTIME counter is frozen regardless of tick source.
+pub(crate) const MTIME_CTRL_EN: u32 = 1 << 0;
+
+/// `MTIME_CTRL.FULLSPEED` bit mask (datasheet §3.1 Table 80, bit 1).
+/// When 1, MTIME increments every sys_clk, bypassing `TICKS.RISCV`;
+/// when 0, MTIME advances only on `TICKS.RISCV` edges.
+pub(crate) const MTIME_CTRL_FULLSPEED: u32 = 1 << 1;
+
+/// `MTIME_CTRL` reset value per datasheet §3.1 Table 80.
+///
+/// Bits: EN=1 (bit 0), FULLSPEED=0 (bit 1), DBGPAUSE_CORE0=1 (bit 2),
+/// DBGPAUSE_CORE1=1 (bit 3) → `0b1101 = 0x0D`.
+///
+/// Residual A.2.1 corrected this from the pre-existing Stage A value of
+/// 0x0F, which incorrectly asserted FULLSPEED=1 at reset. See
+/// `wrk_docs/2026.04.17 - HLD - Residual A.2.1 MTIME WATCHDOG_TICK Fix.md`.
+pub(crate) const MTIME_CTRL_RESET: u32 = 0x0D;
+
 /// Single-cycle IO block.
 ///
 /// GPIO output/OE/input registers + CPUID dispatch, FIFOs, spinlocks,
@@ -69,8 +88,7 @@ impl Sio {
             doorbell_pending: [0; 2],
             riscv_softirq: 0,
             mtime: 0,
-            // Per datasheet Table 80: EN=1, DBGPAUSE_CORE0=1, DBGPAUSE_CORE1=1.
-            mtime_ctrl: 0x0F,
+            mtime_ctrl: MTIME_CTRL_RESET,
             mtimecmp: [0; 2],
             mtime_match_asserted: [false; 2],
         }
@@ -130,7 +148,7 @@ impl Sio {
         self.doorbell_pending = [0; 2];
         self.riscv_softirq = 0;
         self.mtime = 0;
-        self.mtime_ctrl = 0x0F;
+        self.mtime_ctrl = MTIME_CTRL_RESET;
         self.mtimecmp = [0; 2];
         self.mtime_match_asserted = [false; 2];
     }
@@ -448,34 +466,37 @@ impl Sio {
     // Integer divider helpers moved to `core::PerCoreSio` in Phase 3
     // Stage 3 (LLD V7 §6). See `crates/mdrp2350/src/core/mod.rs`.
 
+    // --- MTIME helpers (§2.6 / §3.1.8) ---
 
-    // --- MTIME helpers (§2.6) ---
-
-    /// Tick the MTIME counter. Called once per `Emulator::step()` after
-    /// both cores have stepped and the wake check has run.
-    pub fn tick_mtime(&mut self) {
-        if self.mtime_ctrl & 1 != 0 {
-            let new_mtime = self.mtime.wrapping_add(1);
-            self.mtime = new_mtime;
-            for core in 0..2 {
-                let match_now = new_mtime >= self.mtimecmp[core];
-                if match_now && !self.mtime_match_asserted[core] {
-                    self.mtime_match_asserted[core] = true;
-                }
-                if !match_now {
-                    self.mtime_match_asserted[core] = false;
-                }
-            }
+    /// Advance MTIME using tick-generator edges and/or sys_clks.
+    ///
+    /// Called once per quantum from `Bus::tick_peripherals` after
+    /// `TicksRegs::advance_all` has populated `TICKS.RISCV` edges.
+    ///
+    /// Semantics (RP2350 datasheet §3.1.8 and Table 80):
+    /// - `MTIME_CTRL.EN` = 0 → counter frozen, no-op.
+    /// - `MTIME_CTRL.FULLSPEED` = 1 → increment by `sys_clks` (bypass TICKS).
+    /// - `MTIME_CTRL.FULLSPEED` = 0 → increment by `riscv_edges`.
+    ///
+    /// Exactly one source is consumed per call: `sys_clks` is ignored when
+    /// FULLSPEED=0, and `riscv_edges` is ignored when FULLSPEED=1. Callers
+    /// should still pass the real quantum values for both — the mode
+    /// selection happens here, not at the call site.
+    ///
+    /// Match-asserted flags are updated once against the final post-advance
+    /// value — interrupt edges that land mid-quantum are still observed,
+    /// but with up-to-one-quantum latency, consistent with the quantum
+    /// execution model.
+    pub fn tick_mtime_from_ticks(&mut self, riscv_edges: u32, sys_clks: u32) {
+        if self.mtime_ctrl & MTIME_CTRL_EN == 0 {
+            return;
         }
-    }
-
-    /// Bulk-advance MTIME by `n` cycles. Quantum-end variant of
-    /// [`Self::tick_mtime`]. Match-asserted flags are updated once against
-    /// the final post-advance value — interrupt edges that land mid-quantum
-    /// are still observed, but with up-to-one-quantum latency, consistent
-    /// with the quantum execution model.
-    pub fn tick_mtime_n(&mut self, n: u32) {
-        if n == 0 || self.mtime_ctrl & 1 == 0 {
+        let n = if self.mtime_ctrl & MTIME_CTRL_FULLSPEED != 0 {
+            sys_clks
+        } else {
+            riscv_edges
+        };
+        if n == 0 {
             return;
         }
         let new_mtime = self.mtime.wrapping_add(n as u64);
@@ -594,13 +615,19 @@ mod tests {
 
     // ---- MTIME tests (Stage C2) ----
 
+    // The legacy per-edge `tick_mtime()` helper was retired in Residual A.2.1
+    // (HLD `2026.04.17 - HLD - Residual A.2.1 MTIME WATCHDOG_TICK Fix.md`).
+    // These tests exercise the single-edge path by calling
+    // `tick_mtime_from_ticks(1, 0)` with `MTIME_CTRL.FULLSPEED = 0`, which
+    // is the semantically identical invocation.
+
     #[test]
     fn mtime_counting() {
         let mut sio = Sio::new();
-        sio.mtime_ctrl = 1; // Enable
-        sio.tick_mtime();
+        sio.mtime_ctrl = 1; // EN=1, FULLSPEED=0
+        sio.tick_mtime_from_ticks(1, 0);
         assert_eq!(sio.mtime, 1);
-        sio.tick_mtime();
+        sio.tick_mtime_from_ticks(1, 0);
         assert_eq!(sio.mtime, 2);
     }
 
@@ -608,7 +635,7 @@ mod tests {
     fn mtime_disabled_no_count() {
         let mut sio = Sio::new();
         sio.mtime_ctrl = 0; // Disabled
-        sio.tick_mtime();
+        sio.tick_mtime_from_ticks(1, 0);
         assert_eq!(sio.mtime, 0);
     }
 
@@ -617,13 +644,13 @@ mod tests {
         let mut sio = Sio::new();
         sio.mtime_ctrl = 1;
         sio.mtimecmp[0] = 3;
-        sio.tick_mtime(); // mtime = 1
+        sio.tick_mtime_from_ticks(1, 0); // mtime = 1
         assert!(!sio.mtime_match_asserted[0]);
-        sio.tick_mtime(); // mtime = 2
+        sio.tick_mtime_from_ticks(1, 0); // mtime = 2
         assert!(!sio.mtime_match_asserted[0]);
-        sio.tick_mtime(); // mtime = 3 → match fires
+        sio.tick_mtime_from_ticks(1, 0); // mtime = 3 → match fires
         assert!(sio.mtime_match_asserted[0]);
-        sio.tick_mtime(); // mtime = 4 → still asserted (level)
+        sio.tick_mtime_from_ticks(1, 0); // mtime = 4 → still asserted (level)
         assert!(sio.mtime_match_asserted[0]);
     }
 
@@ -632,12 +659,12 @@ mod tests {
         let mut sio = Sio::new();
         sio.mtime_ctrl = 1;
         sio.mtimecmp[0] = 2;
-        sio.tick_mtime(); // 1
-        sio.tick_mtime(); // 2 → match
+        sio.tick_mtime_from_ticks(1, 0); // 1
+        sio.tick_mtime_from_ticks(1, 0); // 2 → match
         assert!(sio.mtime_match_asserted[0]);
         // Rewrite compare to value above current mtime
         sio.mtimecmp[0] = 100;
-        sio.tick_mtime(); // 3 < 100 → clears
+        sio.tick_mtime_from_ticks(1, 0); // 3 < 100 → clears
         assert!(!sio.mtime_match_asserted[0]);
     }
 
@@ -647,24 +674,25 @@ mod tests {
         sio.mtime_ctrl = 1;
         sio.mtime = u64::MAX;
         sio.mtimecmp[0] = 5;
-        sio.tick_mtime(); // wraps to 0
+        sio.tick_mtime_from_ticks(1, 0); // wraps to 0
         assert_eq!(sio.mtime, 0);
         // 0 < 5 → not matched
         assert!(!sio.mtime_match_asserted[0]);
     }
 
-    /// MTIME_CTRL resets to 0x0F per datasheet Table 80.
-    /// Bits: EN=1, FRACT=0, DBGPAUSE_CORE0=1, DBGPAUSE_CORE1=1.
+    /// MTIME_CTRL resets to 0x0D per datasheet Table 80.
+    /// Bits: EN=1, FULLSPEED=0, DBGPAUSE_CORE0=1, DBGPAUSE_CORE1=1 -> 0b1101.
+    /// Residual A.2.1 corrected this from the pre-existing 0x0F value.
     #[test]
-    fn mtime_ctrl_reset_value_is_0x0f() {
+    fn mtime_ctrl_reset_value_is_0x0d() {
         let sio = Sio::new();
-        assert_eq!(sio.mtime_ctrl, 0x0F,
-            "MTIME_CTRL must reset to 0x0F (EN + DBGPAUSE_CORE0 + DBGPAUSE_CORE1)");
-        // Verify reset() also restores 0x0F.
+        assert_eq!(sio.mtime_ctrl, 0x0D,
+            "MTIME_CTRL must reset to 0x0D (EN + DBGPAUSE_CORE0 + DBGPAUSE_CORE1)");
+        // Verify reset() also restores 0x0D.
         let mut sio2 = Sio::new();
         sio2.mtime_ctrl = 0;
         sio2.reset();
-        assert_eq!(sio2.mtime_ctrl, 0x0F, "MTIME_CTRL must be 0x0F after reset()");
+        assert_eq!(sio2.mtime_ctrl, 0x0D, "MTIME_CTRL must be 0x0D after reset()");
     }
 
     #[test]
@@ -789,5 +817,50 @@ mod tests {
         sio.write32(0x1A0, 0x101, 0);
         assert_eq!(sio.read32(0x1A0, 0), 0x01,
             "RISCV_SOFTIRQ: simultaneous SET+CLR must leave the flag set (set wins)");
+    }
+
+    // ---- MTIME / FULLSPEED vs TICKS.RISCV tests (Residual A.2.1) ----
+    //
+    // HLD `2026.04.17 - HLD - Residual A.2.1 MTIME WATCHDOG_TICK Fix.md`:
+    // MTIME must not advance from sys_clks in the default FULLSPEED=0 mode
+    // unless TICKS.RISCV is configured to emit edges. These three tests
+    // pin the MTIME_CTRL.FULLSPEED and RISCV-edges semantics of the new
+    // `tick_mtime_from_ticks` entry point.
+
+    /// Post-reset MTIME_CTRL=0x0D (EN=1, FULLSPEED=0, DBGPAUSE*=1).
+    /// Pumping sys_clks with zero RISCV edges must leave MTIME at zero —
+    /// matches silicon.
+    #[test]
+    fn mtime_post_reset_does_not_count_from_sys_clks_alone() {
+        let mut sio = Sio::new();
+        assert_eq!(sio.mtime_ctrl, 0x0D);
+        sio.tick_mtime_from_ticks(0, 1000);
+        assert_eq!(sio.mtime, 0,
+            "FULLSPEED=0 + zero RISCV edges must not advance MTIME");
+    }
+
+    /// In the default TICKS mode (FULLSPEED=0), MTIME advances by one per
+    /// RISCV edge and ignores sys_clks entirely.
+    #[test]
+    fn mtime_advances_one_per_riscv_edge_in_ticks_mode() {
+        let mut sio = Sio::new();
+        sio.mtime_ctrl = 0x01; // EN=1, FULLSPEED=0.
+        sio.tick_mtime_from_ticks(5, 0);
+        assert_eq!(sio.mtime, 5, "5 RISCV edges -> MTIME += 5 in TICKS mode");
+        sio.tick_mtime_from_ticks(0, 1000);
+        assert_eq!(sio.mtime, 5, "sys_clks alone never advance in TICKS mode");
+    }
+
+    /// FULLSPEED=1 counts sys_clks directly and ignores RISCV edges
+    /// entirely (no double-count).
+    #[test]
+    fn mtime_fullspeed_counts_sys_clks_directly() {
+        let mut sio = Sio::new();
+        sio.mtime_ctrl = 0x03; // EN=1 + FULLSPEED=1.
+        sio.tick_mtime_from_ticks(0, 100);
+        assert_eq!(sio.mtime, 100, "FULLSPEED=1 -> MTIME counts sys_clks");
+        // RISCV edges ignored in FULLSPEED mode.
+        sio.tick_mtime_from_ticks(9, 50);
+        assert_eq!(sio.mtime, 150, "edges ignored when FULLSPEED=1");
     }
 }

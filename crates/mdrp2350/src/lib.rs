@@ -443,11 +443,13 @@ impl Emulator {
         }
         self.route_pio_irqs();
         self.update_gpio();
-        self.bus.sio.tick_mtime_n(cycles);
-        // Bus peripherals (TICKS + TIMER0 + TIMER1 in V5 Phase 1).
+        // Bus peripherals (TICKS + TIMER0/1 + RISC-V MTIME).
         // HLD V5 §5.3 / §5.5: tick runs every quantum unconditionally,
-        // no fast-path gate in V5. Drains alarm-match IRQs into both
-        // cores' NVIC pending masks via `assert_irq_shared`.
+        // no fast-path gate in V5. MTIME ticks are drained from
+        // `TICKS.RISCV` inside `Bus::tick_peripherals` per residual A.2.1
+        // (HLD `2026.04.17 - HLD - Residual A.2.1 MTIME WATCHDOG_TICK Fix.md`).
+        // Drains alarm-match IRQs into both cores' NVIC pending masks
+        // via `assert_irq_shared`.
         self.bus.tick_peripherals(cycles);
     }
 

@@ -194,6 +194,14 @@ impl TicksRegs {
         std::mem::take(&mut self.domains[DOMAIN_TIMER1].pending_edges)
     }
 
+    /// Drain and return pending edges from the RISCV domain. The RISC-V
+    /// platform timer (MTIME) consumes these edges in TICKS mode
+    /// (`MTIME_CTRL.FULLSPEED = 0`). See datasheet §3.1.8 and HLD
+    /// `2026.04.17 - HLD - Residual A.2.1 MTIME WATCHDOG_TICK Fix.md`.
+    pub fn take_riscv_edges(&mut self) -> u32 {
+        std::mem::take(&mut self.domains[DOMAIN_RISCV].pending_edges)
+    }
+
     /// Map an offset within the TICKS window to `(domain_idx, reg_offset)`
     /// where `reg_offset` is one of [`CTRL_OFFSET`], [`CYCLES_OFFSET`],
     /// [`COUNT_OFFSET`]. Returns `None` for out-of-window offsets.
@@ -610,5 +618,22 @@ mod tests {
         assert!(!t.write32(0x4C, 0xFFFF_FFFF, 0));
         assert_eq!(t.domains.map(|d| (d.enable, d.cycles)),
                    before.map(|d| (d.enable, d.cycles)));
+    }
+
+    // --- RISCV domain drain (Residual A.2.1) -----------------------------
+    //
+    // HLD `2026.04.17 - HLD - Residual A.2.1 MTIME WATCHDOG_TICK Fix.md`:
+    // the RISCV domain feeds MTIME just as TIMER0/1 feed their timers.
+    // `take_riscv_edges` drains accumulated edges with the same semantics
+    // as `take_timer0_edges` / `take_timer1_edges`.
+
+    #[test]
+    fn take_riscv_edges_drains_like_timer_edges() {
+        let mut t = TicksRegs::new_hardware_reset();
+        t.domains[DOMAIN_RISCV].enable = true;
+        t.domains[DOMAIN_RISCV].cycles = 12;
+        t.advance_all(24);
+        assert_eq!(t.take_riscv_edges(), 2);
+        assert_eq!(t.take_riscv_edges(), 0, "drained state is empty");
     }
 }

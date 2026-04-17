@@ -9350,3 +9350,26 @@ fn sio_non_gpio_out_byte_write_still_rmw() {
         "non-GPIO_OUT byte write must be byte-lane RMW, not replicated"
     );
 }
+
+/// Residual A.2.1 end-to-end regression: MTIME must not advance without
+/// `TICKS.RISCV` configuration. Silicon reads 0 in the
+/// `sio_mtime_count_and_match` scenario gate because `TICKS.RISCV.CYCLES=0`
+/// halts the divider; the emulator must match.
+///
+/// See `wrk_docs/2026.04.17 - HLD - Residual A.2.1 MTIME WATCHDOG_TICK Fix.md`.
+#[test]
+fn mtime_stays_zero_at_post_reset_matches_silicon() {
+    use crate::{Config, EmulatorBuilder};
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    emu.core_mut(0).halt();
+    emu.core_mut(1).halt();
+    // Post-reset MTIME_CTRL is 0x0D (EN + DBGPAUSE_CORE0 + DBGPAUSE_CORE1,
+    // FULLSPEED=0); write EN=1 explicitly so the test survives a future
+    // reset-default change.
+    emu.mmio_write32(0xD000_01A4, 0x01);
+    emu.run(200);
+    let mtime_lo = emu.mmio_read32(0xD000_01B0);
+    assert_eq!(mtime_lo, 0,
+        "MTIME must not advance without TICKS.RISCV configuration \
+         (silicon reads 0 at this scenario gate)");
+}
