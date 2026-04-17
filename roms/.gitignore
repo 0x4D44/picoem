@@ -8,6 +8,7 @@
 # work out of a fresh clone without extra downloads.
 !benchmark.bin
 !blinky.bin
+!blinky-riscv.bin
 !bootrom-combined.bin
 !bootrom.bin
 !bootrom-rp2040-b2.bin
