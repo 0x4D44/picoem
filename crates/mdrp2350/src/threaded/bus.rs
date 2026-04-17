@@ -235,9 +235,9 @@ impl WorkerBus {
             TIMER1_BASE => self.shared.peripherals.timers.lock().unwrap().timer1.read32(offset),
             TICKS_BASE => self.shared.peripherals.timers.lock().unwrap().ticks.read32(offset),
 
-            UART0_BASE => self.shared.peripherals.apb.lock().unwrap().uart0.read32(offset),
-            SPI0_BASE => self.shared.peripherals.apb.lock().unwrap().spi0.read32(offset),
-            I2C0_BASE => self.shared.peripherals.apb.lock().unwrap().i2c0.read32(offset),
+            UART0_BASE => self.shared.peripherals.apb.lock().unwrap().uart[0].read32(offset),
+            SPI0_BASE => self.shared.peripherals.apb.lock().unwrap().spi[0].read32(offset),
+            I2C0_BASE => self.shared.peripherals.apb.lock().unwrap().i2c[0].read32(offset),
             ADC_BASE => self.shared.peripherals.apb.lock().unwrap().adc.read32(offset),
             PWM_BASE => self.shared.peripherals.apb.lock().unwrap().pwm.read32(offset),
             IO_BANK0_BASE => self.shared.peripherals.apb.lock().unwrap().io_bank0.read32(offset),
@@ -359,7 +359,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .uart0
+                    .uart[0]
                     .write32(offset, val, alias, &mut ext_irqs);
                 self.raise_irqs_shared(ext_irqs);
             }
@@ -370,7 +370,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .spi0
+                    .spi[0]
                     .write32(offset, val, alias, &mut ext_irqs);
                 self.raise_irqs_shared(ext_irqs);
             }
@@ -381,7 +381,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .i2c0
+                    .i2c[0]
                     .write32(offset, val, alias, &mut ext_irqs);
                 self.raise_irqs_shared(ext_irqs);
             }
@@ -764,7 +764,7 @@ impl WorkerBus {
                 .apb
                 .lock()
                 .unwrap()
-                .uart0
+                .uart[0]
                 .read8(crate::peripherals::uart::UARTDR),
             (SPI0_BASE, crate::peripherals::spi::SSPDR) => self
                 .shared
@@ -772,7 +772,7 @@ impl WorkerBus {
                 .apb
                 .lock()
                 .unwrap()
-                .spi0
+                .spi[0]
                 .read8(crate::peripherals::spi::SSPDR),
             (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => self
                 .shared
@@ -780,7 +780,7 @@ impl WorkerBus {
                 .apb
                 .lock()
                 .unwrap()
-                .i2c0
+                .i2c[0]
                 .read8(crate::peripherals::i2c::IC_DATA_CMD),
             (ADC_BASE, crate::peripherals::adc::FIFO) => self
                 .shared
@@ -828,7 +828,7 @@ impl WorkerBus {
                 .apb
                 .lock()
                 .unwrap()
-                .spi0
+                .spi[0]
                 .read16(crate::peripherals::spi::SSPDR),
             (UART0_BASE, crate::peripherals::uart::UARTDR) => self
                 .shared
@@ -836,7 +836,7 @@ impl WorkerBus {
                 .apb
                 .lock()
                 .unwrap()
-                .uart0
+                .uart[0]
                 .read8(crate::peripherals::uart::UARTDR) as u16,
             (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => self
                 .shared
@@ -844,7 +844,7 @@ impl WorkerBus {
                 .apb
                 .lock()
                 .unwrap()
-                .i2c0
+                .i2c[0]
                 .read8(crate::peripherals::i2c::IC_DATA_CMD) as u16,
             (ADC_BASE, crate::peripherals::adc::FIFO) => self
                 .shared
@@ -896,7 +896,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .uart0
+                    .uart[0]
                     .write8(crate::peripherals::uart::UARTDR, val, &mut ext_irqs);
             }
             (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
@@ -905,7 +905,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .spi0
+                    .spi[0]
                     .write8(crate::peripherals::spi::SSPDR, val, &mut ext_irqs);
             }
             (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
@@ -914,7 +914,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .i2c0
+                    .i2c[0]
                     .write8(crate::peripherals::i2c::IC_DATA_CMD, val, &mut ext_irqs);
             }
             (ADC_BASE, crate::peripherals::adc::FIFO) => {
@@ -964,7 +964,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .spi0
+                    .spi[0]
                     .write16(crate::peripherals::spi::SSPDR, val, &mut ext_irqs);
             }
             (UART0_BASE, crate::peripherals::uart::UARTDR) => {
@@ -973,7 +973,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .uart0
+                    .uart[0]
                     .write8(crate::peripherals::uart::UARTDR, val as u8, &mut ext_irqs);
             }
             (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
@@ -982,7 +982,7 @@ impl WorkerBus {
                     .apb
                     .lock()
                     .unwrap()
-                    .i2c0
+                    .i2c[0]
                     .write8(crate::peripherals::i2c::IC_DATA_CMD, val as u8, &mut ext_irqs);
             }
             (ADC_BASE, crate::peripherals::adc::FIFO) => {

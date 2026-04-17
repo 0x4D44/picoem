@@ -1,8 +1,7 @@
 //! RP2350 UART peripheral (PL011-derived; datasheet §12.1).
 //!
 //! Phase 2 of the RP2350 peripheral coverage plan (HLD V5 §6 row 2).
-//! UART0 lives at `0x4007_0000`. UART1 @ `0x4007_4000` is deferred per
-//! V5 §1.
+//! UART0 lives at `0x4007_0000`, UART1 at `0x4007_4000`.
 //!
 //! Mirrors the RP2040 UART (`mdrp2040::peripherals::uart`) idioms
 //! verbatim — same PL011 register surface, same byte-lane narrow-access
@@ -38,10 +37,13 @@ use std::collections::VecDeque;
 
 use mdpicoem_common::clocks::ClockTree;
 
+use crate::dreq::{DREQ_UART0_RX, DREQ_UART0_TX};
 use crate::irq::IRQ_UART0_IRQ;
 
 /// UART0 base (RP2350 datasheet §12.1.1).
 pub const UART0_BASE: u32 = 0x4007_0000;
+/// UART1 base (RP2350 datasheet §12.1.1, 4 KB stride).
+pub const UART1_BASE: u32 = 0x4007_4000;
 
 /// Offset: `UARTDR` — data register (byte side-effect: FIFO push/pop).
 pub const UARTDR: u32 = 0x000;
@@ -156,12 +158,17 @@ pub struct UartRegs {
     /// NVIC IRQ number this UART raises into `bus.irq_pending`.
     /// UART0 → [`IRQ_UART0_IRQ`] (33).
     nvic_irq: u32,
+    /// DREQ index for TX FIFO not-full (`DREQ_UART0_TX` / `DREQ_UART1_TX`).
+    dreq_tx: u8,
+    /// DREQ index for RX FIFO not-empty.
+    dreq_rx: u8,
 }
 
 impl UartRegs {
     /// Construct a fresh UART at power-on default state. `nvic_irq` is
-    /// the NVIC line (33 for UART0 on RP2350).
-    pub fn new(nvic_irq: u32) -> Self {
+    /// the NVIC line (33 for UART0, 34 for UART1). `dreq_tx` / `dreq_rx`
+    /// are the peripheral's DREQ indices into the DMA matrix.
+    pub fn new(nvic_irq: u32, dreq_tx: u8, dreq_rx: u8) -> Self {
         Self {
             rsr_ecr: 0,
             ibrd: 0,
@@ -178,13 +185,29 @@ impl UartRegs {
             rx_fifo: VecDeque::with_capacity(UART_FIFO_DEPTH),
             tx_cycle_accum: 0,
             nvic_irq,
+            dreq_tx,
+            dreq_rx,
         }
     }
 
     /// Reset every field to post-init defaults.
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
-        *self = Self::new(irq);
+        let dtx = self.dreq_tx;
+        let drx = self.dreq_rx;
+        *self = Self::new(irq, dtx, drx);
+    }
+
+    /// DREQ index for TX FIFO (consumed by the DMA matrix).
+    #[inline]
+    pub fn dreq_tx_index(&self) -> u8 {
+        self.dreq_tx
+    }
+
+    /// DREQ index for RX FIFO.
+    #[inline]
+    pub fn dreq_rx_index(&self) -> u8 {
+        self.dreq_rx
     }
 
     /// True iff the UART has no outstanding work (TX FIFO drained, RX
@@ -487,16 +510,22 @@ impl UartRegs {
 
 impl Default for UartRegs {
     fn default() -> Self {
-        Self::new(IRQ_UART0_IRQ)
+        Self::new(IRQ_UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dreq::{DREQ_UART1_RX, DREQ_UART1_TX};
+    use crate::irq::IRQ_UART1_IRQ;
 
     const UART0_IRQ: u32 = IRQ_UART0_IRQ;
     const SYS_HZ: u32 = 150_000_000;
+
+    fn u0() -> UartRegs {
+        UartRegs::new(UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX)
+    }
 
     fn tree(peri: u32) -> ClockTree {
         ClockTree {
@@ -510,7 +539,7 @@ mod tests {
 
     #[test]
     fn reset_defaults_all_zero_except_ifls() {
-        let u = UartRegs::new(UART0_IRQ);
+        let u = u0();
         assert_eq!(u.ibrd, 0);
         assert_eq!(u.fbrd, 0);
         assert_eq!(u.lcr_h, 0);
@@ -522,7 +551,7 @@ mod tests {
 
     #[test]
     fn reset_clears_runtime_state() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.cr = UARTCR_UARTEN | UARTCR_TXE;
         u.lcr_h = UARTLCR_H_FEN;
@@ -535,7 +564,7 @@ mod tests {
 
     #[test]
     fn fr_reads_txfe_rxfe_at_reset() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let fr = u.read32(UARTFR);
         assert!(fr & UARTFR_TXFE != 0, "TX FIFO empty at reset");
         assert!(fr & UARTFR_RXFE != 0, "RX FIFO empty at reset");
@@ -548,7 +577,7 @@ mod tests {
     /// producing 0x19 / 0x81 depending on TX state — wrong in both cases.
     #[test]
     fn fr_cts_is_zero_at_reset_not_hardwired_high() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let fr = u.read32(UARTFR);
         assert_eq!(fr & (1 << 0), 0, "CTS (bit 0) must be 0 (not hardwired high)");
     }
@@ -568,7 +597,7 @@ mod tests {
     /// non-empty and `tick` has exercised the accumulator code path.
     #[test]
     fn uart_loopback_uartfr_mid_tx_matches_silicon_0x18() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         // IBRD=81, FBRD=24 → 115200 baud at 150 MHz clk_peri.
         u.write32(UARTIBRD, 81, 0, &mut irqs);
@@ -593,7 +622,7 @@ mod tests {
     /// CTS=0 → 0x80. Previously the emulator returned 0x81 (TXFE|CTS).
     #[test]
     fn uart_loopback_uartfr_after_full_tx_is_0x80() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTIBRD, 81, 0, &mut irqs);
         u.write32(UARTFBRD, 24, 0, &mut irqs);
@@ -617,7 +646,7 @@ mod tests {
 
     #[test]
     fn ibrd_fbrd_roundtrip() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTIBRD, 81, 0, &mut irqs); // 115200 baud at 150MHz clk_peri
         u.write32(UARTFBRD, 24, 0, &mut irqs);
@@ -627,7 +656,7 @@ mod tests {
 
     #[test]
     fn ibrd_truncated_to_16_bits() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTIBRD, 0xDEAD_BEEF, 0, &mut irqs);
         assert_eq!(u.read32(UARTIBRD), 0xBEEF);
@@ -635,7 +664,7 @@ mod tests {
 
     #[test]
     fn fbrd_truncated_to_6_bits() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTFBRD, 0xFF, 0, &mut irqs);
         assert_eq!(u.read32(UARTFBRD), 0x3F);
@@ -645,7 +674,7 @@ mod tests {
 
     #[test]
     fn dr_write_before_enable_is_dropped() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTDR, 0xA5, 0, &mut irqs);
         assert!(u.tx_fifo.is_empty());
@@ -653,7 +682,7 @@ mod tests {
 
     #[test]
     fn dr_write_after_enable_pushes_into_tx_fifo() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
@@ -664,7 +693,7 @@ mod tests {
 
     #[test]
     fn byte_write_to_dr_uses_narrow_path() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
@@ -674,7 +703,7 @@ mod tests {
 
     #[test]
     fn tx_fifo_caps_at_16_when_fen_set() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
@@ -686,7 +715,7 @@ mod tests {
 
     #[test]
     fn tx_fifo_caps_at_1_when_fen_clear() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
         for i in 0..5u8 {
@@ -699,7 +728,7 @@ mod tests {
 
     #[test]
     fn byte_read_dr_pops_rx_fifo_head() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         u.rx_fifo.push_back(0xAB);
         u.rx_fifo.push_back(0xCD);
         assert_eq!(u.read8(UARTDR), 0xAB);
@@ -710,7 +739,7 @@ mod tests {
     #[test]
     fn word_read_dr_also_pops_one_byte() {
         // Word reads are the non-narrow path; they still pop one byte.
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         u.rx_fifo.push_back(0xAB);
         u.rx_fifo.push_back(0xCD);
         assert_eq!(u.read32(UARTDR) & 0xFF, 0xAB);
@@ -721,7 +750,7 @@ mod tests {
 
     #[test]
     fn tick_drains_fifo_at_derived_cadence() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
@@ -741,7 +770,7 @@ mod tests {
 
     #[test]
     fn tick_ignored_when_uart_disabled() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTCR, UARTCR_TXE, 0, &mut irqs);
         u.tx_fifo.push_back(0xFF);
@@ -754,7 +783,7 @@ mod tests {
 
     #[test]
     fn tx_empty_raises_txis_when_imsc_set() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
@@ -774,7 +803,7 @@ mod tests {
 
     #[test]
     fn icr_is_write_one_to_clear() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.ris = UART_INT_TX | UART_INT_RX;
         u.write32(UARTICR, UART_INT_TX, 0, &mut irqs);
@@ -784,7 +813,7 @@ mod tests {
 
     #[test]
     fn ris_and_mis_readonly_writes_are_dropped() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.ris = UART_INT_TX;
         u.write32(UARTRIS, 0xFF, 0, &mut irqs);
@@ -794,7 +823,7 @@ mod tests {
 
     #[test]
     fn mis_is_ris_masked_by_imsc() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         u.ris = UART_INT_TX | UART_INT_RX;
         u.imsc = UART_INT_RX;
         assert_eq!(u.read32(UARTMIS), UART_INT_RX);
@@ -804,13 +833,13 @@ mod tests {
 
     #[test]
     fn is_idle_true_at_reset() {
-        let u = UartRegs::new(UART0_IRQ);
+        let u = u0();
         assert!(u.is_idle());
     }
 
     #[test]
     fn is_idle_false_with_pending_tx() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
@@ -822,7 +851,7 @@ mod tests {
 
     #[test]
     fn clearing_fen_truncates_tx_fifo_to_one() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
@@ -837,7 +866,7 @@ mod tests {
 
     #[test]
     fn peripheral_and_pcell_id_match_pl011() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         assert_eq!(u.read32(UARTPERIPHID0), 0x11);
         assert_eq!(u.read32(UARTPERIPHID1), 0x10);
         assert_eq!(u.read32(UARTPERIPHID2), 0x34);
@@ -852,7 +881,7 @@ mod tests {
 
     #[test]
     fn imsc_bitset_alias_works() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.write32(UARTIMSC, UART_INT_TX, 2, &mut irqs);
         u.write32(UARTIMSC, UART_INT_RX, 2, &mut irqs);
@@ -861,10 +890,61 @@ mod tests {
 
     #[test]
     fn imsc_bitclr_alias_works() {
-        let mut u = UartRegs::new(UART0_IRQ);
+        let mut u = u0();
         let mut irqs = 0u64;
         u.imsc = UART_INT_MASK;
         u.write32(UARTIMSC, UART_INT_TX, 3, &mut irqs);
         assert_eq!(u.imsc & UART_INT_TX, 0);
+    }
+
+    // --- two-instance reshape (HLD V5 §6.C) --------------------------------
+
+    #[test]
+    fn constructor_records_irq_and_dreq_indices() {
+        let u0 = UartRegs::new(IRQ_UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX);
+        let u1 = UartRegs::new(IRQ_UART1_IRQ, DREQ_UART1_TX, DREQ_UART1_RX);
+        assert_eq!(u0.nvic_irq, IRQ_UART0_IRQ);
+        assert_eq!(u0.dreq_tx_index(), DREQ_UART0_TX);
+        assert_eq!(u0.dreq_rx_index(), DREQ_UART0_RX);
+        assert_eq!(u1.nvic_irq, IRQ_UART1_IRQ);
+        assert_eq!(u1.dreq_tx_index(), DREQ_UART1_TX);
+        assert_eq!(u1.dreq_rx_index(), DREQ_UART1_RX);
+    }
+
+    #[test]
+    fn two_instances_do_not_alias_state() {
+        let mut u0 = UartRegs::new(IRQ_UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX);
+        let mut u1 = UartRegs::new(IRQ_UART1_IRQ, DREQ_UART1_TX, DREQ_UART1_RX);
+        let mut irqs0 = 0u64;
+        let mut irqs1 = 0u64;
+        u0.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs0);
+        u0.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs0);
+        u1.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs1);
+        u1.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs1);
+        u0.write32(UARTDR, 0xAA, 0, &mut irqs0);
+        assert_eq!(u0.tx_fifo.len(), 1);
+        assert_eq!(u1.tx_fifo.len(), 0, "UART1 must not see UART0 TX push");
+        u1.write32(UARTDR, 0xBB, 0, &mut irqs1);
+        assert_eq!(u0.tx_fifo.front().copied(), Some(0xAA));
+        assert_eq!(u1.tx_fifo.front().copied(), Some(0xBB));
+    }
+
+    /// Bus-level routing proof for the two-instance reshape: writes to
+    /// `UART0_BASE + UARTIBRD` and `UART1_BASE + UARTIBRD` must land in
+    /// independent instances behind the Bus dispatch (HLD V5 §6.C Step 2).
+    /// UART1 is held in reset post-bootrom, so release it via RESETS BITCLR
+    /// first.
+    #[test]
+    fn uart1_routes_independently_from_uart0() {
+        use crate::Bus;
+        use crate::bus::RESET_UART1;
+        const RESETS_BASE: u32 = 0x4002_0000;
+        let mut bus = Bus::new();
+        // Release UART1 (post-bootrom holds it).
+        bus.write32(RESETS_BASE + 0x3000, 1 << RESET_UART1, 0);
+        bus.write32(UART0_BASE + UARTIBRD, 0x11, 0);
+        bus.write32(UART1_BASE + UARTIBRD, 0x22, 0);
+        assert_eq!(bus.read32(UART0_BASE + UARTIBRD, 0), 0x11);
+        assert_eq!(bus.read32(UART1_BASE + UARTIBRD, 0), 0x22);
     }
 }

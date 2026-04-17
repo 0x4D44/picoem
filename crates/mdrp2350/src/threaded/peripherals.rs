@@ -448,12 +448,12 @@ impl ResetsState {
 
 /// APB peripheral register state. Mirrors `bus/mod.rs:253..266`.
 pub struct ApbState {
-    /// UART0 — PL011-derived UART at 0x4007_0000.
-    pub uart0: UartRegs,
-    /// SPI0 — PL022-derived SPI at 0x4008_0000.
-    pub spi0: SpiRegs,
-    /// I2C0 — DesignWare DW_apb_i2c at 0x4009_0000.
-    pub i2c0: I2cRegs,
+    /// UART0/UART1 — PL011-derived UART at 0x4007_0000 / 0x4007_4000.
+    pub uart: [UartRegs; 2],
+    /// SPI0/SPI1 — PL022-derived SPI at 0x4008_0000 / 0x4008_4000.
+    pub spi: [SpiRegs; 2],
+    /// I2C0/I2C1 — DesignWare DW_apb_i2c at 0x4009_0000 / 0x4009_4000.
+    pub i2c: [I2cRegs; 2],
     /// ADC — single instance at 0x400A_0000.
     pub adc: AdcRegs,
     /// PWM — 12-slice block at 0x4005_0000.
@@ -469,13 +469,28 @@ impl ApbState {
     /// peripheral as the single-threaded path.
     pub fn post_bootrom() -> Self {
         use crate::irq::{
-            IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1,
-            IRQ_SPI0_IRQ, IRQ_UART0_IRQ,
+            IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP_0,
+            IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ,
+            IRQ_UART1_IRQ,
+        };
+        use crate::dreq::{
+            DREQ_I2C0_RX, DREQ_I2C0_TX, DREQ_I2C1_RX, DREQ_I2C1_TX, DREQ_SPI0_RX,
+            DREQ_SPI0_TX, DREQ_SPI1_RX, DREQ_SPI1_TX, DREQ_UART0_RX, DREQ_UART0_TX,
+            DREQ_UART1_RX, DREQ_UART1_TX,
         };
         Self {
-            uart0: UartRegs::new(IRQ_UART0_IRQ),
-            spi0: SpiRegs::new(IRQ_SPI0_IRQ),
-            i2c0: I2cRegs::new(IRQ_I2C0_IRQ),
+            uart: [
+                UartRegs::new(IRQ_UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX),
+                UartRegs::new(IRQ_UART1_IRQ, DREQ_UART1_TX, DREQ_UART1_RX),
+            ],
+            spi: [
+                SpiRegs::new(IRQ_SPI0_IRQ, DREQ_SPI0_TX, DREQ_SPI0_RX),
+                SpiRegs::new(IRQ_SPI1_IRQ, DREQ_SPI1_TX, DREQ_SPI1_RX),
+            ],
+            i2c: [
+                I2cRegs::new(IRQ_I2C0_IRQ, DREQ_I2C0_TX, DREQ_I2C0_RX),
+                I2cRegs::new(IRQ_I2C1_IRQ, DREQ_I2C1_TX, DREQ_I2C1_RX),
+            ],
             adc: AdcRegs::new(IRQ_ADC_IRQ_FIFO),
             pwm: PwmRegs::new(IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1),
             io_bank0: IoBank0Regs::new(),

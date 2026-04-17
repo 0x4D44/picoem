@@ -152,9 +152,9 @@ impl ThreadedEmulator {
             ticks,
             timer0,
             timer1,
-            uart0,
-            spi0,
-            i2c0,
+            uart,
+            spi,
+            i2c,
             adc,
             pwm,
             io_bank0,
@@ -243,9 +243,9 @@ impl ThreadedEmulator {
             }),
             resets: Mutex::new(ResetsState { resets_state }),
             apb: Mutex::new(ApbState {
-                uart0,
-                spi0,
-                i2c0,
+                uart,
+                spi,
+                i2c,
                 adc,
                 pwm,
                 io_bank0,
@@ -812,7 +812,8 @@ fn update_gpio(shared: &SharedState) {
 /// Phase 5 alongside PIO-DREQ wiring (HLD V7 §2.2).
 fn tick_peripherals(shared: &SharedState, cycles: u32) {
     use crate::bus::{
-        RESET_ADC, RESET_I2C0, RESET_PWM, RESET_SPI0, RESET_TIMER0, RESET_TIMER1, RESET_UART0,
+        RESET_ADC, RESET_I2C0, RESET_I2C1, RESET_PWM, RESET_SPI0, RESET_SPI1, RESET_TIMER0,
+        RESET_TIMER1, RESET_UART0, RESET_UART1,
     };
 
     // RESETS snapshot — single acquire, reused for all five gates this
@@ -852,13 +853,22 @@ fn tick_peripherals(shared: &SharedState, cycles: u32) {
     {
         let mut apb = shared.peripherals.apb.lock().unwrap();
         if !held(RESET_UART0) {
-            apb.uart0.tick(cycles, &tree, &mut ext_irqs);
+            apb.uart[0].tick(cycles, &tree, &mut ext_irqs);
+        }
+        if !held(RESET_UART1) {
+            apb.uart[1].tick(cycles, &tree, &mut ext_irqs);
         }
         if !held(RESET_SPI0) {
-            apb.spi0.tick(cycles, &tree, &mut ext_irqs);
+            apb.spi[0].tick(cycles, &tree, &mut ext_irqs);
+        }
+        if !held(RESET_SPI1) {
+            apb.spi[1].tick(cycles, &tree, &mut ext_irqs);
         }
         if !held(RESET_I2C0) {
-            apb.i2c0.tick(cycles, &tree, &mut ext_irqs);
+            apb.i2c[0].tick(cycles, &tree, &mut ext_irqs);
+        }
+        if !held(RESET_I2C1) {
+            apb.i2c[1].tick(cycles, &tree, &mut ext_irqs);
         }
         if !held(RESET_ADC) {
             apb.adc.tick(cycles, &tree, &mut ext_irqs);

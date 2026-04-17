@@ -1,8 +1,7 @@
 //! RP2350 SPI peripheral (PL022-derived; datasheet §12.2).
 //!
 //! Phase 2 of the RP2350 peripheral coverage plan (HLD V5 §6 row 2).
-//! SPI0 lives at `0x4008_0000`. SPI1 @ `0x4008_4000` is deferred per
-//! V5 §1.
+//! SPI0 lives at `0x4008_0000`, SPI1 at `0x4008_4000`.
 //!
 //! Mirrors the RP2040 SPI (`mdrp2040::peripherals::spi`) verbatim. The
 //! only RP2350 deltas are the NVIC IRQ number ([`crate::irq::IRQ_SPI0_IRQ`]
@@ -36,10 +35,13 @@ use std::collections::VecDeque;
 
 use mdpicoem_common::clocks::ClockTree;
 
+use crate::dreq::{DREQ_SPI0_RX, DREQ_SPI0_TX};
 use crate::irq::IRQ_SPI0_IRQ;
 
 /// SPI0 base (RP2350 datasheet §12.2).
 pub const SPI0_BASE: u32 = 0x4008_0000;
+/// SPI1 base (RP2350 datasheet §12.2, 4 KB stride).
+pub const SPI1_BASE: u32 = 0x4008_4000;
 
 /// Offset: `SSPCR0` — frame format / clock rate.
 pub const SSPCR0: u32 = 0x000;
@@ -108,12 +110,15 @@ pub struct SpiRegs {
     rx_fifo: VecDeque<u32>,
     tx_cycle_accum: u64,
     nvic_irq: u32,
+    dreq_tx: u8,
+    dreq_rx: u8,
 }
 
 impl SpiRegs {
     /// Construct a fresh SPI at power-on default state. `nvic_irq` is
-    /// the NVIC line (31 for SPI0 on RP2350).
-    pub fn new(nvic_irq: u32) -> Self {
+    /// the NVIC line (31 for SPI0, 32 for SPI1). `dreq_tx` / `dreq_rx`
+    /// are the peripheral's DREQ indices into the DMA matrix.
+    pub fn new(nvic_irq: u32, dreq_tx: u8, dreq_rx: u8) -> Self {
         Self {
             cr0: 0,
             cr1: 0,
@@ -125,12 +130,28 @@ impl SpiRegs {
             rx_fifo: VecDeque::with_capacity(SSP_FIFO_DEPTH),
             tx_cycle_accum: 0,
             nvic_irq,
+            dreq_tx,
+            dreq_rx,
         }
     }
 
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
-        *self = Self::new(irq);
+        let dtx = self.dreq_tx;
+        let drx = self.dreq_rx;
+        *self = Self::new(irq, dtx, drx);
+    }
+
+    /// DREQ index for TX FIFO (consumed by the DMA matrix).
+    #[inline]
+    pub fn dreq_tx_index(&self) -> u8 {
+        self.dreq_tx
+    }
+
+    /// DREQ index for RX FIFO.
+    #[inline]
+    pub fn dreq_rx_index(&self) -> u8 {
+        self.dreq_rx
     }
 
     /// True iff no outstanding work — TX and RX FIFOs empty, no latched
@@ -376,16 +397,22 @@ impl SpiRegs {
 
 impl Default for SpiRegs {
     fn default() -> Self {
-        Self::new(IRQ_SPI0_IRQ)
+        Self::new(IRQ_SPI0_IRQ, DREQ_SPI0_TX, DREQ_SPI0_RX)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dreq::{DREQ_SPI1_RX, DREQ_SPI1_TX};
+    use crate::irq::IRQ_SPI1_IRQ;
 
     const SPI0_IRQ: u32 = IRQ_SPI0_IRQ;
     const SYS_HZ: u32 = 150_000_000;
+
+    fn s0() -> SpiRegs {
+        SpiRegs::new(SPI0_IRQ, DREQ_SPI0_TX, DREQ_SPI0_RX)
+    }
 
     fn tree() -> ClockTree {
         ClockTree {
@@ -399,7 +426,7 @@ mod tests {
 
     #[test]
     fn reset_defaults_all_zero() {
-        let s = SpiRegs::new(SPI0_IRQ);
+        let s = s0();
         assert_eq!(s.cr0, 0);
         assert_eq!(s.cr1, 0);
         assert_eq!(s.cpsr, 0);
@@ -408,7 +435,7 @@ mod tests {
 
     #[test]
     fn sr_reports_tfe_at_reset() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let sr = s.read32(SSPSR);
         assert!(sr & SSPSR_TFE != 0);
         assert!(sr & SSPSR_TNF != 0);
@@ -420,7 +447,7 @@ mod tests {
 
     #[test]
     fn loopback_rx_matches_tx_single_byte() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         // Enable + loopback + DSS=7 (8-bit frame) + CPSR=2 (min prescale).
         s.write32(SSPCR0, 7, 0, &mut irqs);
@@ -436,7 +463,7 @@ mod tests {
 
     #[test]
     fn loopback_round_trip_multiple_bytes() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         s.write32(SSPCR0, 7, 0, &mut irqs);
         s.write32(SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0, &mut irqs);
@@ -455,7 +482,7 @@ mod tests {
     #[test]
     fn loopback_no_transfer_when_clock_stopped() {
         // SSPCPSR=0 means the SPI clock is stopped -- no TX->RX transfer.
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         s.write32(SSPCR0, 7, 0, &mut irqs);
         s.write32(SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0, &mut irqs);
@@ -469,7 +496,7 @@ mod tests {
 
     #[test]
     fn write_dropped_when_disabled() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         s.write32(SSPDR, 0xA5, 0, &mut irqs);
         assert_eq!(s.tx_fifo.len(), 0, "writes ignored when SSE=0");
@@ -479,7 +506,7 @@ mod tests {
 
     #[test]
     fn tx_fifo_drain_raises_tx_irq_when_masked() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         // Enable without loopback; populate TX and set IMSC.TX.
         s.write32(SSPCR1, SSPCR1_SSE, 0, &mut irqs);
@@ -494,7 +521,7 @@ mod tests {
 
     #[test]
     fn icr_clears_ror_rt_only() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         s.ris = SSP_INT_ROR | SSP_INT_RT | SSP_INT_TX | SSP_INT_RX;
         s.write32(SSPICR, SSP_INT_ROR | SSP_INT_RT, 0, &mut irqs);
@@ -509,7 +536,7 @@ mod tests {
 
     #[test]
     fn byte_write_to_dr_pushes_into_fifo() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         s.write32(SSPCR0, 7, 0, &mut irqs);
         s.write32(SSPCR1, SSPCR1_SSE, 0, &mut irqs);
@@ -519,7 +546,7 @@ mod tests {
 
     #[test]
     fn halfword_write_to_dr_pushes_into_fifo() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         // DSS=15 → 16-bit frames.
         s.write32(SSPCR0, 0xF, 0, &mut irqs);
@@ -532,7 +559,7 @@ mod tests {
 
     #[test]
     fn peripheral_and_pcell_id_match_pl022() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         assert_eq!(s.read32(SSPPERIPHID0), 0x22);
         assert_eq!(s.read32(SSPPERIPHID1), 0x10);
         assert_eq!(s.read32(SSPPERIPHID2), 0x34);
@@ -544,10 +571,40 @@ mod tests {
 
     #[test]
     fn imsc_bitset_alias() {
-        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut s = s0();
         let mut irqs = 0u64;
         s.write32(SSPIMSC, SSP_INT_TX, 2, &mut irqs);
         s.write32(SSPIMSC, SSP_INT_RX, 2, &mut irqs);
         assert_eq!(s.imsc, SSP_INT_TX | SSP_INT_RX);
+    }
+
+    /// SPI1 constructs with distinct IRQ/DREQ wiring from SPI0. Smoke
+    /// test for the UART1/SPI1/I2C1 reshape (HLD V5 §6 row 2).
+    #[test]
+    fn spi1_constructs_with_distinct_irq_and_dreq() {
+        let s = SpiRegs::new(IRQ_SPI1_IRQ, DREQ_SPI1_TX, DREQ_SPI1_RX);
+        assert_eq!(s.dreq_tx_index(), DREQ_SPI1_TX);
+        assert_eq!(s.dreq_rx_index(), DREQ_SPI1_RX);
+        // Distinct from SPI0.
+        assert_ne!(s.dreq_tx_index(), DREQ_SPI0_TX);
+        assert_ne!(s.dreq_rx_index(), DREQ_SPI0_RX);
+    }
+
+    /// Bus-level routing proof for the two-instance reshape: writes to
+    /// `SPI0_BASE + SSPCPSR` and `SPI1_BASE + SSPCPSR` must land in
+    /// independent instances behind the Bus dispatch (HLD V5 §6.C Step 2).
+    /// SPI1 is held in reset post-bootrom, so release it via RESETS BITCLR
+    /// first. `SSPCPSR` is masked to 0xFE — LSB must be 0.
+    #[test]
+    fn spi1_routes_independently_from_spi0() {
+        use crate::Bus;
+        use crate::bus::RESET_SPI1;
+        const RESETS_BASE: u32 = 0x4002_0000;
+        let mut bus = Bus::new();
+        bus.write32(RESETS_BASE + 0x3000, 1 << RESET_SPI1, 0);
+        bus.write32(SPI0_BASE + SSPCPSR, 0x10, 0);
+        bus.write32(SPI1_BASE + SSPCPSR, 0x20, 0);
+        assert_eq!(bus.read32(SPI0_BASE + SSPCPSR, 0), 0x10);
+        assert_eq!(bus.read32(SPI1_BASE + SSPCPSR, 0), 0x20);
     }
 }

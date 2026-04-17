@@ -1,8 +1,7 @@
 //! RP2350 I2C peripheral (Synopsys DW_apb_i2c; datasheet §12.3).
 //!
 //! Phase 2 of the RP2350 peripheral coverage plan (HLD V5 §6 row 2).
-//! I2C0 lives at `0x4009_0000`. I2C1 @ `0x4009_8000` is deferred per
-//! V5 §1.
+//! I2C0 lives at `0x4009_0000`, I2C1 at `0x4009_4000`.
 //!
 //! Mirrors the RP2040 I2C (`mdrp2040::peripherals::i2c`) verbatim. The
 //! only RP2350 deltas are the NVIC IRQ number
@@ -23,10 +22,13 @@ use std::collections::VecDeque;
 
 use mdpicoem_common::clocks::ClockTree;
 
+use crate::dreq::{DREQ_I2C0_RX, DREQ_I2C0_TX};
 use crate::irq::IRQ_I2C0_IRQ;
 
 /// I2C0 base (RP2350 datasheet §12.3).
 pub const I2C0_BASE: u32 = 0x4009_0000;
+/// I2C1 base (RP2350 datasheet §12.3, 4 KB stride).
+pub const I2C1_BASE: u32 = 0x4009_4000;
 
 pub const IC_CON: u32 = 0x00;
 pub const IC_TAR: u32 = 0x04;
@@ -133,12 +135,15 @@ pub struct I2cRegs {
     rx_fifo: VecDeque<u32>,
     activity: bool,
     nvic_irq: u32,
+    dreq_tx: u8,
+    dreq_rx: u8,
 }
 
 impl I2cRegs {
     /// Construct a fresh I2C at power-on defaults. `nvic_irq` is the
-    /// NVIC line (36 for I2C0 on RP2350).
-    pub fn new(nvic_irq: u32) -> Self {
+    /// NVIC line (36 for I2C0, 37 for I2C1). `dreq_tx` / `dreq_rx` are
+    /// the peripheral's DREQ indices into the DMA matrix.
+    pub fn new(nvic_irq: u32, dreq_tx: u8, dreq_rx: u8) -> Self {
         Self {
             // DW reset value: master mode, 7-bit, fast, slave disabled,
             // restart enabled.
@@ -164,12 +169,28 @@ impl I2cRegs {
             rx_fifo: VecDeque::with_capacity(I2C_FIFO_DEPTH),
             activity: false,
             nvic_irq,
+            dreq_tx,
+            dreq_rx,
         }
     }
 
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
-        *self = Self::new(irq);
+        let dtx = self.dreq_tx;
+        let drx = self.dreq_rx;
+        *self = Self::new(irq, dtx, drx);
+    }
+
+    /// DREQ index for TX FIFO (consumed by the DMA matrix).
+    #[inline]
+    pub fn dreq_tx_index(&self) -> u8 {
+        self.dreq_tx
+    }
+
+    /// DREQ index for RX FIFO.
+    #[inline]
+    pub fn dreq_rx_index(&self) -> u8 {
+        self.dreq_rx
     }
 
     /// True iff FIFOs empty, no sticky interrupts, bus inactive.
@@ -463,15 +484,21 @@ impl I2cRegs {
 
 impl Default for I2cRegs {
     fn default() -> Self {
-        Self::new(IRQ_I2C0_IRQ)
+        Self::new(IRQ_I2C0_IRQ, DREQ_I2C0_TX, DREQ_I2C0_RX)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dreq::{DREQ_I2C1_RX, DREQ_I2C1_TX};
+    use crate::irq::IRQ_I2C1_IRQ;
 
     const I2C0_IRQ: u32 = IRQ_I2C0_IRQ;
+
+    fn i0() -> I2cRegs {
+        I2cRegs::new(I2C0_IRQ, DREQ_I2C0_TX, DREQ_I2C0_RX)
+    }
 
     fn default_tree() -> ClockTree {
         ClockTree {
@@ -483,7 +510,7 @@ mod tests {
 
     #[test]
     fn reset_defaults() {
-        let i = I2cRegs::new(I2C0_IRQ);
+        let i = i0();
         assert_eq!(i.enable, 0);
         assert_eq!(i.tar, 0);
         assert!(i.is_idle());
@@ -491,7 +518,7 @@ mod tests {
 
     #[test]
     fn ic_con_writable_only_when_disabled() {
-        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut i = i0();
         let mut irqs = 0u64;
         let before = i.con;
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
@@ -506,7 +533,7 @@ mod tests {
 
     #[test]
     fn ic_tar_writable_only_when_disabled() {
-        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut i = i0();
         let mut irqs = 0u64;
         i.write32(IC_TAR, 0x3C, 0, &mut irqs);
         assert_eq!(i.tar, 0x3C);
@@ -518,7 +545,7 @@ mod tests {
     #[test]
     fn nack_default_for_bus_scan() {
         // With an empty ALWAYS_ACK_ADDRS, every transaction NACKs.
-        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut i = i0();
         let mut irqs = 0u64;
         i.write32(IC_TAR, 0x3C, 0, &mut irqs);
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
@@ -535,7 +562,7 @@ mod tests {
 
     #[test]
     fn clr_tx_abrt_read_clears_both_bits() {
-        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut i = i0();
         i.raw_intr_stat = INT_TX_ABRT;
         i.tx_abrt_source = ABRT_7B_ADDR_NOACK;
         let _ = i.read32(IC_CLR_TX_ABRT);
@@ -545,7 +572,7 @@ mod tests {
 
     #[test]
     fn ic_status_tfe_set_at_reset() {
-        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut i = i0();
         let s = i.read32(IC_STATUS);
         assert_ne!(s & STATUS_TFE, 0);
         assert_ne!(s & STATUS_TFNF, 0);
@@ -553,7 +580,7 @@ mod tests {
 
     #[test]
     fn irq_routed_when_unmasked_raw_set() {
-        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut i = i0();
         let mut irqs = 0u64;
         i.intr_mask = INT_TX_ABRT;
         i.raw_intr_stat = INT_TX_ABRT;
@@ -563,7 +590,7 @@ mod tests {
 
     #[test]
     fn ten_bit_addressing_nacks_with_specific_abrt_bit() {
-        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut i = i0();
         let mut irqs = 0u64;
         // Enable 10-bit master addressing.
         i.write32(IC_CON, i.con | IC_CON_10BIT_ADDR_MASTER, 0, &mut irqs);
@@ -573,5 +600,34 @@ mod tests {
         // tx_abrt_source is auto-cleared by STOP; check the latching
         // RAW_INTR_STAT.TX_ABRT instead.
         assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+    }
+
+    /// I2C1 constructs with distinct IRQ/DREQ wiring from I2C0. Smoke
+    /// test for the UART1/SPI1/I2C1 reshape (HLD V5 §6 row 2).
+    #[test]
+    fn i2c1_constructs_with_distinct_irq_and_dreq() {
+        let i = I2cRegs::new(IRQ_I2C1_IRQ, DREQ_I2C1_TX, DREQ_I2C1_RX);
+        assert_eq!(i.dreq_tx_index(), DREQ_I2C1_TX);
+        assert_eq!(i.dreq_rx_index(), DREQ_I2C1_RX);
+        assert_ne!(i.dreq_tx_index(), DREQ_I2C0_TX);
+        assert_ne!(i.dreq_rx_index(), DREQ_I2C0_RX);
+    }
+
+    /// Bus-level routing proof for the two-instance reshape: writes to
+    /// `I2C0_BASE + IC_SS_SCL_HCNT` and `I2C1_BASE + IC_SS_SCL_HCNT` must
+    /// land in independent instances behind the Bus dispatch (HLD V5 §6.C
+    /// Step 2). I2C1 is held in reset post-bootrom, so release it via
+    /// RESETS BITCLR first.
+    #[test]
+    fn i2c1_routes_independently_from_i2c0() {
+        use crate::Bus;
+        use crate::bus::RESET_I2C1;
+        const RESETS_BASE: u32 = 0x4002_0000;
+        let mut bus = Bus::new();
+        bus.write32(RESETS_BASE + 0x3000, 1 << RESET_I2C1, 0);
+        bus.write32(I2C0_BASE + IC_SS_SCL_HCNT, 0x30, 0);
+        bus.write32(I2C1_BASE + IC_SS_SCL_HCNT, 0x40, 0);
+        assert_eq!(bus.read32(I2C0_BASE + IC_SS_SCL_HCNT, 0), 0x30);
+        assert_eq!(bus.read32(I2C1_BASE + IC_SS_SCL_HCNT, 0), 0x40);
     }
 }

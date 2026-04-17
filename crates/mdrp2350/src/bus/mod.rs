@@ -11,21 +11,25 @@ use tracing::debug;
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
 use crate::threaded::CoreAtomics;
 use crate::dma::{DMA_BASE, Dma};
+use crate::dreq::{
+    DREQ_I2C0_RX, DREQ_I2C0_TX, DREQ_I2C1_RX, DREQ_I2C1_TX, DREQ_SPI0_RX, DREQ_SPI0_TX,
+    DREQ_SPI1_RX, DREQ_SPI1_TX, DREQ_UART0_RX, DREQ_UART0_TX, DREQ_UART1_RX, DREQ_UART1_TX,
+};
 use crate::irq::{
-    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_PWM_IRQ_WRAP_0,
-    IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0, IRQ_UART0_IRQ,
-    PERIPH_IRQ_MASK,
+    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP_0,
+    IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0,
+    IRQ_UART0_IRQ, IRQ_UART1_IRQ, PERIPH_IRQ_MASK,
 };
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::{ADC_BASE, AdcRegs};
-use crate::peripherals::i2c::{I2C0_BASE, I2cRegs};
+use crate::peripherals::i2c::{I2C0_BASE, I2C1_BASE, I2cRegs};
 use crate::peripherals::io_bank0::{IO_BANK0_BASE, IoBank0Regs};
 use crate::peripherals::pads_bank0::{PADS_BANK0_BASE, PadsBank0Regs};
 use crate::peripherals::pwm::{PWM_BASE, PwmRegs};
-use crate::peripherals::spi::{SPI0_BASE, SpiRegs};
+use crate::peripherals::spi::{SPI0_BASE, SPI1_BASE, SpiRegs};
 use crate::peripherals::ticks::{TICKS_BASE, TicksRegs};
 use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE, TimerRegs};
-use crate::peripherals::uart::{UART0_BASE, UartRegs};
+use crate::peripherals::uart::{UART0_BASE, UART1_BASE, UartRegs};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
 
@@ -225,8 +229,11 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
         TIMER0_BASE => Some(RESET_TIMER0),
         TIMER1_BASE => Some(RESET_TIMER1),
         UART0_BASE => Some(RESET_UART0),
+        UART1_BASE => Some(RESET_UART1),
         SPI0_BASE => Some(RESET_SPI0),
+        SPI1_BASE => Some(RESET_SPI1),
         I2C0_BASE => Some(RESET_I2C0),
+        I2C1_BASE => Some(RESET_I2C1),
         ADC_BASE => Some(RESET_ADC),
         PWM_BASE => Some(RESET_PWM),
         IO_BANK0_BASE => Some(RESET_IO_BANK0),
@@ -271,12 +278,13 @@ pub struct Bus {
     pub(crate) timer0: TimerRegs,
     /// TIMER1 — same shape as TIMER0, driven by the TIMER1 TICKS domain.
     pub(crate) timer1: TimerRegs,
-    /// UART0 — PL011-derived UART at `0x4007_0000` (HLD V5 §6 row 2).
-    pub(crate) uart0: UartRegs,
-    /// SPI0 — PL022-derived SPI at `0x4008_0000`.
-    pub(crate) spi0: SpiRegs,
-    /// I2C0 — DesignWare DW_apb_i2c at `0x4009_0000`.
-    pub(crate) i2c0: I2cRegs,
+    /// UART0/1 — PL011-derived UARTs at `0x4007_0000` / `0x4007_4000`
+    /// (HLD V5 §6 row 2). Indexed `[0]=UART0`, `[1]=UART1`.
+    pub(crate) uart: [UartRegs; 2],
+    /// SPI0/1 — PL022-derived SPIs at `0x4008_0000` / `0x4008_4000`.
+    pub(crate) spi: [SpiRegs; 2],
+    /// I2C0/1 — DesignWare DW_apb_i2c at `0x4009_0000` / `0x4009_4000`.
+    pub(crate) i2c: [I2cRegs; 2],
     /// ADC — single instance at `0x400A_0000`.
     pub(crate) adc: AdcRegs,
     /// PWM — 12-slice block at `0x4005_0000`.
@@ -472,9 +480,18 @@ impl Bus {
             ticks: TicksRegs::post_bootrom(),
             timer0: TimerRegs::new(IRQ_TIMER0_IRQ_0),
             timer1: TimerRegs::new(IRQ_TIMER1_IRQ_0),
-            uart0: UartRegs::new(IRQ_UART0_IRQ),
-            spi0: SpiRegs::new(IRQ_SPI0_IRQ),
-            i2c0: I2cRegs::new(IRQ_I2C0_IRQ),
+            uart: [
+                UartRegs::new(IRQ_UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX),
+                UartRegs::new(IRQ_UART1_IRQ, DREQ_UART1_TX, DREQ_UART1_RX),
+            ],
+            spi: [
+                SpiRegs::new(IRQ_SPI0_IRQ, DREQ_SPI0_TX, DREQ_SPI0_RX),
+                SpiRegs::new(IRQ_SPI1_IRQ, DREQ_SPI1_TX, DREQ_SPI1_RX),
+            ],
+            i2c: [
+                I2cRegs::new(IRQ_I2C0_IRQ, DREQ_I2C0_TX, DREQ_I2C0_RX),
+                I2cRegs::new(IRQ_I2C1_IRQ, DREQ_I2C1_TX, DREQ_I2C1_RX),
+            ],
             adc: AdcRegs::new(IRQ_ADC_IRQ_FIFO),
             pwm: PwmRegs::new(IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1),
             io_bank0: IoBank0Regs::new(),
@@ -972,13 +989,22 @@ impl Bus {
         // pending masks via `raise_irqs_u64`.
         let mut ext_irqs = 0u64;
         if !self.is_held_in_reset_bit(RESET_UART0) {
-            self.uart0.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+            self.uart[0].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        if !self.is_held_in_reset_bit(RESET_UART1) {
+            self.uart[1].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
         }
         if !self.is_held_in_reset_bit(RESET_SPI0) {
-            self.spi0.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+            self.spi[0].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        if !self.is_held_in_reset_bit(RESET_SPI1) {
+            self.spi[1].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
         }
         if !self.is_held_in_reset_bit(RESET_I2C0) {
-            self.i2c0.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+            self.i2c[0].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        if !self.is_held_in_reset_bit(RESET_I2C1) {
+            self.i2c[1].tick(sys_clks, &self.clock_tree, &mut ext_irqs);
         }
         if !self.is_held_in_reset_bit(RESET_ADC) {
             self.adc.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
@@ -1274,21 +1300,42 @@ impl Bus {
                 if !self.is_held_in_reset_base(base) {
                     match (base, offset) {
                         (UART0_BASE, crate::peripherals::uart::UARTDR) => {
-                            let v = self.uart0.read8(crate::peripherals::uart::UARTDR);
+                            let v = self.uart[0].read8(crate::peripherals::uart::UARTDR);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
+                            }
+                            return v;
+                        }
+                        (UART1_BASE, crate::peripherals::uart::UARTDR) => {
+                            let v = self.uart[1].read8(crate::peripherals::uart::UARTDR);
                             if self.mmio_trace_enabled {
                                 self.emit_mmio_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
-                            let v = self.spi0.read8(crate::peripherals::spi::SSPDR);
+                            let v = self.spi[0].read8(crate::peripherals::spi::SSPDR);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
+                            }
+                            return v;
+                        }
+                        (SPI1_BASE, crate::peripherals::spi::SSPDR) => {
+                            let v = self.spi[1].read8(crate::peripherals::spi::SSPDR);
                             if self.mmio_trace_enabled {
                                 self.emit_mmio_trace('R', 1, addr, v as u32, core);
                             }
                             return v;
                         }
                         (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
-                            let v = self.i2c0.read8(crate::peripherals::i2c::IC_DATA_CMD);
+                            let v = self.i2c[0].read8(crate::peripherals::i2c::IC_DATA_CMD);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
+                            }
+                            return v;
+                        }
+                        (I2C1_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                            let v = self.i2c[1].read8(crate::peripherals::i2c::IC_DATA_CMD);
                             if self.mmio_trace_enabled {
                                 self.emit_mmio_trace('R', 1, addr, v as u32, core);
                             }
@@ -1319,9 +1366,12 @@ impl Bus {
                         TIMER0_BASE => self.timer0.read32(offset),
                         TIMER1_BASE => self.timer1.read32(offset),
                         TICKS_BASE => self.ticks.read32(offset),
-                        UART0_BASE => self.uart0.read32(offset),
-                        SPI0_BASE => self.spi0.read32(offset),
-                        I2C0_BASE => self.i2c0.read32(offset),
+                        UART0_BASE => self.uart[0].read32(offset),
+                        UART1_BASE => self.uart[1].read32(offset),
+                        SPI0_BASE => self.spi[0].read32(offset),
+                        SPI1_BASE => self.spi[1].read32(offset),
+                        I2C0_BASE => self.i2c[0].read32(offset),
+                        I2C1_BASE => self.i2c[1].read32(offset),
                         ADC_BASE => self.adc.read32(offset),
                         PWM_BASE => self.pwm.read32(offset),
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
@@ -1424,10 +1474,28 @@ impl Bus {
                     // triggers one transaction per access. Bypass the
                     // word-RMW path so these side-effect registers aren't
                     // double-fired.
-                    match (base, word_offset_for_narrow) {
-                        (UART0_BASE, crate::peripherals::uart::UARTDR) => {
+                    // Map the two possible bases for each peripheral to
+                    // an instance index so we can share one narrow-access
+                    // block.
+                    let uart_instance: Option<usize> = match base {
+                        UART0_BASE => Some(0),
+                        UART1_BASE => Some(1),
+                        _ => None,
+                    };
+                    let spi_instance: Option<usize> = match base {
+                        SPI0_BASE => Some(0),
+                        SPI1_BASE => Some(1),
+                        _ => None,
+                    };
+                    let i2c_instance: Option<usize> = match base {
+                        I2C0_BASE => Some(0),
+                        I2C1_BASE => Some(1),
+                        _ => None,
+                    };
+                    if let Some(idx) = uart_instance {
+                        if word_offset_for_narrow == crate::peripherals::uart::UARTDR {
                             let mut ext_irqs = 0u64;
-                            self.uart0.write8(
+                            self.uart[idx].write8(
                                 crate::peripherals::uart::UARTDR,
                                 val,
                                 &mut ext_irqs,
@@ -1438,9 +1506,11 @@ impl Bus {
                             }
                             return;
                         }
-                        (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
+                    }
+                    if let Some(idx) = spi_instance {
+                        if word_offset_for_narrow == crate::peripherals::spi::SSPDR {
                             let mut ext_irqs = 0u64;
-                            self.spi0.write8(
+                            self.spi[idx].write8(
                                 crate::peripherals::spi::SSPDR,
                                 val,
                                 &mut ext_irqs,
@@ -1451,9 +1521,11 @@ impl Bus {
                             }
                             return;
                         }
-                        (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                    }
+                    if let Some(idx) = i2c_instance {
+                        if word_offset_for_narrow == crate::peripherals::i2c::IC_DATA_CMD {
                             let mut ext_irqs = 0u64;
-                            self.i2c0.write8(
+                            self.i2c[idx].write8(
                                 crate::peripherals::i2c::IC_DATA_CMD,
                                 val,
                                 &mut ext_irqs,
@@ -1464,6 +1536,8 @@ impl Bus {
                             }
                             return;
                         }
+                    }
+                    match (base, word_offset_for_narrow) {
                         // ADC FIFO is a side-effect register: `adc.read32(FIFO)`
                         // pops a sample. A byte write through the RMW path
                         // would read-then-write-back and silently pop the
@@ -1568,8 +1642,9 @@ impl Bus {
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore byte
                         }
-                        UART0_BASE | SPI0_BASE | I2C0_BASE | ADC_BASE | PWM_BASE
-                        | IO_BANK0_BASE | PADS_BANK0_BASE => {
+                        UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
+                        | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
+                        | PADS_BANK0_BASE => {
                             // Phase 2 peripherals that don't need narrow
                             // byte dispatch (already intercepted above for
                             // UART_DR / SSPDR / IC_DATA_CMD). Use the same
@@ -1580,9 +1655,12 @@ impl Bus {
                             let reg_offset = word_addr & 0x0000_0FFF;
                             let (word_val, pass_alias) = if alias == 0 {
                                 let old_word = match base {
-                                    UART0_BASE => self.uart0.read32(reg_offset),
-                                    SPI0_BASE => self.spi0.read32(reg_offset),
-                                    I2C0_BASE => self.i2c0.read32(reg_offset),
+                                    UART0_BASE => self.uart[0].read32(reg_offset),
+                                    UART1_BASE => self.uart[1].read32(reg_offset),
+                                    SPI0_BASE => self.spi[0].read32(reg_offset),
+                                    SPI1_BASE => self.spi[1].read32(reg_offset),
+                                    I2C0_BASE => self.i2c[0].read32(reg_offset),
+                                    I2C1_BASE => self.i2c[1].read32(reg_offset),
                                     ADC_BASE => self.adc.read32(reg_offset),
                                     PWM_BASE => self.pwm.read32(reg_offset),
                                     IO_BANK0_BASE => self.io_bank0.read32(reg_offset),
@@ -1596,9 +1674,12 @@ impl Bus {
                             };
                             let mut ext_irqs = 0u64;
                             match base {
-                                UART0_BASE => self.uart0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                SPI0_BASE => self.spi0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                I2C0_BASE => self.i2c0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                UART0_BASE => self.uart[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                UART1_BASE => self.uart[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                SPI0_BASE => self.spi[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                SPI1_BASE => self.spi[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                I2C0_BASE => self.i2c[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                I2C1_BASE => self.i2c[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
                                 ADC_BASE => self.adc.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
                                 PWM_BASE => self.pwm.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
                                 IO_BANK0_BASE => self.io_bank0.write32(reg_offset, word_val, pass_alias),
@@ -1704,28 +1785,51 @@ impl Bus {
                 // Narrow halfword path: SPI SSPDR is the only half-significant
                 // register (8..16-bit frames pop one word/pop one word).
                 if !self.is_held_in_reset_base(base) {
-                    if (base, offset) == (SPI0_BASE, crate::peripherals::spi::SSPDR) {
-                        let v = self.spi0.read16(crate::peripherals::spi::SSPDR);
-                        if self.mmio_trace_enabled {
-                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
+                    // SPI halfword side-effect registers (both instances).
+                    let spi_idx: Option<usize> = match base {
+                        SPI0_BASE => Some(0),
+                        SPI1_BASE => Some(1),
+                        _ => None,
+                    };
+                    if let Some(idx) = spi_idx {
+                        if offset == crate::peripherals::spi::SSPDR {
+                            let v = self.spi[idx].read16(crate::peripherals::spi::SSPDR);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 2, addr, v as u32, core);
+                            }
+                            return v;
                         }
-                        return v;
                     }
                     // UARTDR and IC_DATA_CMD: halfword read collapses to
                     // byte via narrow path (zero-extended).
-                    if (base, offset) == (UART0_BASE, crate::peripherals::uart::UARTDR) {
-                        let v = self.uart0.read8(crate::peripherals::uart::UARTDR) as u16;
-                        if self.mmio_trace_enabled {
-                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
+                    let uart_idx: Option<usize> = match base {
+                        UART0_BASE => Some(0),
+                        UART1_BASE => Some(1),
+                        _ => None,
+                    };
+                    if let Some(idx) = uart_idx {
+                        if offset == crate::peripherals::uart::UARTDR {
+                            let v = self.uart[idx].read8(crate::peripherals::uart::UARTDR) as u16;
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 2, addr, v as u32, core);
+                            }
+                            return v;
                         }
-                        return v;
                     }
-                    if (base, offset) == (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) {
-                        let v = self.i2c0.read32(crate::peripherals::i2c::IC_DATA_CMD) as u16;
-                        if self.mmio_trace_enabled {
-                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
+                    let i2c_idx: Option<usize> = match base {
+                        I2C0_BASE => Some(0),
+                        I2C1_BASE => Some(1),
+                        _ => None,
+                    };
+                    if let Some(idx) = i2c_idx {
+                        if offset == crate::peripherals::i2c::IC_DATA_CMD {
+                            let v =
+                                self.i2c[idx].read32(crate::peripherals::i2c::IC_DATA_CMD) as u16;
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 2, addr, v as u32, core);
+                            }
+                            return v;
                         }
-                        return v;
                     }
                     if (base, offset) == (ADC_BASE, crate::peripherals::adc::FIFO) {
                         let v = self.adc.read16(crate::peripherals::adc::FIFO);
@@ -1750,9 +1854,12 @@ impl Bus {
                         TIMER0_BASE => self.timer0.read32(offset),
                         TIMER1_BASE => self.timer1.read32(offset),
                         TICKS_BASE => self.ticks.read32(offset),
-                        UART0_BASE => self.uart0.read32(offset),
-                        SPI0_BASE => self.spi0.read32(offset),
-                        I2C0_BASE => self.i2c0.read32(offset),
+                        UART0_BASE => self.uart[0].read32(offset),
+                        UART1_BASE => self.uart[1].read32(offset),
+                        SPI0_BASE => self.spi[0].read32(offset),
+                        SPI1_BASE => self.spi[1].read32(offset),
+                        I2C0_BASE => self.i2c[0].read32(offset),
+                        I2C1_BASE => self.i2c[1].read32(offset),
                         ADC_BASE => self.adc.read32(offset),
                         PWM_BASE => self.pwm.read32(offset),
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
@@ -1854,11 +1961,27 @@ impl Bus {
                 if self.is_held_in_reset_base(base) {
                     // no-op
                 } else {
-                    // Narrow halfword dispatch for side-effect registers.
-                    match (base, word_offset_for_narrow) {
-                        (UART0_BASE, crate::peripherals::uart::UARTDR) => {
+                    // Narrow halfword dispatch for side-effect registers
+                    // (UART0/1, SPI0/1, I2C0/1).
+                    let uart_instance: Option<usize> = match base {
+                        UART0_BASE => Some(0),
+                        UART1_BASE => Some(1),
+                        _ => None,
+                    };
+                    let spi_instance: Option<usize> = match base {
+                        SPI0_BASE => Some(0),
+                        SPI1_BASE => Some(1),
+                        _ => None,
+                    };
+                    let i2c_instance: Option<usize> = match base {
+                        I2C0_BASE => Some(0),
+                        I2C1_BASE => Some(1),
+                        _ => None,
+                    };
+                    if let Some(idx) = uart_instance {
+                        if word_offset_for_narrow == crate::peripherals::uart::UARTDR {
                             let mut ext_irqs = 0u64;
-                            self.uart0.write8(
+                            self.uart[idx].write8(
                                 crate::peripherals::uart::UARTDR,
                                 val as u8,
                                 &mut ext_irqs,
@@ -1869,9 +1992,11 @@ impl Bus {
                             }
                             return;
                         }
-                        (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
+                    }
+                    if let Some(idx) = spi_instance {
+                        if word_offset_for_narrow == crate::peripherals::spi::SSPDR {
                             let mut ext_irqs = 0u64;
-                            self.spi0.write16(
+                            self.spi[idx].write16(
                                 crate::peripherals::spi::SSPDR,
                                 val,
                                 &mut ext_irqs,
@@ -1882,9 +2007,11 @@ impl Bus {
                             }
                             return;
                         }
-                        (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                    }
+                    if let Some(idx) = i2c_instance {
+                        if word_offset_for_narrow == crate::peripherals::i2c::IC_DATA_CMD {
                             let mut ext_irqs = 0u64;
-                            self.i2c0.write32(
+                            self.i2c[idx].write32(
                                 crate::peripherals::i2c::IC_DATA_CMD,
                                 val as u32,
                                 0,
@@ -1896,6 +2023,8 @@ impl Bus {
                             }
                             return;
                         }
+                    }
+                    match (base, word_offset_for_narrow) {
                         // ADC FIFO read-only: see matching comment in
                         // `write8` above. Swallow halfword writes so the
                         // RMW path doesn't silently pop a sample.
@@ -1991,8 +2120,9 @@ impl Bus {
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore halfword
                         }
-                        UART0_BASE | SPI0_BASE | I2C0_BASE | ADC_BASE | PWM_BASE
-                        | IO_BANK0_BASE | PADS_BANK0_BASE => {
+                        UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
+                        | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
+                        | PADS_BANK0_BASE => {
                             // Phase 2 peripherals halfword path — subword
                             // alias preservation.
                             let word_addr = canonical & !3;
@@ -2000,9 +2130,12 @@ impl Bus {
                             let reg_offset = word_addr & 0x0000_0FFF;
                             let (word_val, pass_alias) = if alias == 0 {
                                 let old_word = match base {
-                                    UART0_BASE => self.uart0.read32(reg_offset),
-                                    SPI0_BASE => self.spi0.read32(reg_offset),
-                                    I2C0_BASE => self.i2c0.read32(reg_offset),
+                                    UART0_BASE => self.uart[0].read32(reg_offset),
+                                    UART1_BASE => self.uart[1].read32(reg_offset),
+                                    SPI0_BASE => self.spi[0].read32(reg_offset),
+                                    SPI1_BASE => self.spi[1].read32(reg_offset),
+                                    I2C0_BASE => self.i2c[0].read32(reg_offset),
+                                    I2C1_BASE => self.i2c[1].read32(reg_offset),
                                     ADC_BASE => self.adc.read32(reg_offset),
                                     PWM_BASE => self.pwm.read32(reg_offset),
                                     IO_BANK0_BASE => self.io_bank0.read32(reg_offset),
@@ -2017,9 +2150,12 @@ impl Bus {
                             };
                             let mut ext_irqs = 0u64;
                             match base {
-                                UART0_BASE => self.uart0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                SPI0_BASE => self.spi0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                I2C0_BASE => self.i2c0.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                UART0_BASE => self.uart[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                UART1_BASE => self.uart[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                SPI0_BASE => self.spi[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                SPI1_BASE => self.spi[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                I2C0_BASE => self.i2c[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
+                                I2C1_BASE => self.i2c[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
                                 ADC_BASE => self.adc.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
                                 PWM_BASE => self.pwm.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
                                 IO_BANK0_BASE => self.io_bank0.write32(reg_offset, word_val, pass_alias),
@@ -2122,9 +2258,12 @@ impl Bus {
                         TIMER0_BASE => self.timer0.read32(offset),
                         TIMER1_BASE => self.timer1.read32(offset),
                         TICKS_BASE => self.ticks.read32(offset),
-                        UART0_BASE => self.uart0.read32(offset),
-                        SPI0_BASE => self.spi0.read32(offset),
-                        I2C0_BASE => self.i2c0.read32(offset),
+                        UART0_BASE => self.uart[0].read32(offset),
+                        UART1_BASE => self.uart[1].read32(offset),
+                        SPI0_BASE => self.spi[0].read32(offset),
+                        SPI1_BASE => self.spi[1].read32(offset),
+                        I2C0_BASE => self.i2c[0].read32(offset),
+                        I2C1_BASE => self.i2c[1].read32(offset),
                         ADC_BASE => self.adc.read32(offset),
                         PWM_BASE => self.pwm.read32(offset),
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
@@ -2243,17 +2382,32 @@ impl Bus {
                         }
                         UART0_BASE => {
                             let mut ext_irqs = 0u64;
-                            self.uart0.write32(offset, val, alias, &mut ext_irqs);
+                            self.uart[0].write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        UART1_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.uart[1].write32(offset, val, alias, &mut ext_irqs);
                             self.raise_irqs_u64(ext_irqs);
                         }
                         SPI0_BASE => {
                             let mut ext_irqs = 0u64;
-                            self.spi0.write32(offset, val, alias, &mut ext_irqs);
+                            self.spi[0].write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        SPI1_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.spi[1].write32(offset, val, alias, &mut ext_irqs);
                             self.raise_irqs_u64(ext_irqs);
                         }
                         I2C0_BASE => {
                             let mut ext_irqs = 0u64;
-                            self.i2c0.write32(offset, val, alias, &mut ext_irqs);
+                            self.i2c[0].write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        I2C1_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.i2c[1].write32(offset, val, alias, &mut ext_irqs);
                             self.raise_irqs_u64(ext_irqs);
                         }
                         ADC_BASE => {
@@ -2347,30 +2501,48 @@ impl Bus {
             }
         }
 
-        // SPI0 TX/RX (DREQ 24/25). SPI1 not modelled in V1.
-        if self.spi0.tx_dreq() {
-            bits |= 1u64 << 24;
+        // SPI0/1 TX/RX (DREQ 24..27).
+        if self.spi[0].tx_dreq() {
+            bits |= 1u64 << DREQ_SPI0_TX;
         }
-        if self.spi0.rx_dreq() {
-            bits |= 1u64 << 25;
+        if self.spi[0].rx_dreq() {
+            bits |= 1u64 << DREQ_SPI0_RX;
+        }
+        if self.spi[1].tx_dreq() {
+            bits |= 1u64 << DREQ_SPI1_TX;
+        }
+        if self.spi[1].rx_dreq() {
+            bits |= 1u64 << DREQ_SPI1_RX;
         }
 
-        // UART0 TX/RX (DREQ 28/29). UART1 not modelled in V1.
-        if self.uart0.tx_dreq() {
-            bits |= 1u64 << 28;
+        // UART0/1 TX/RX (DREQ 28..31).
+        if self.uart[0].tx_dreq() {
+            bits |= 1u64 << DREQ_UART0_TX;
         }
-        if self.uart0.rx_dreq() {
-            bits |= 1u64 << 29;
+        if self.uart[0].rx_dreq() {
+            bits |= 1u64 << DREQ_UART0_RX;
+        }
+        if self.uart[1].tx_dreq() {
+            bits |= 1u64 << DREQ_UART1_TX;
+        }
+        if self.uart[1].rx_dreq() {
+            bits |= 1u64 << DREQ_UART1_RX;
         }
 
         // PWM wrap DREQs (32..43) — one-shot-per-wrap, not modelled in V1.
 
-        // I2C0 TX/RX (DREQ 44/45). I2C1 not modelled in V1.
-        if self.i2c0.tx_dreq() {
-            bits |= 1u64 << 44;
+        // I2C0/1 TX/RX (DREQ 44..47).
+        if self.i2c[0].tx_dreq() {
+            bits |= 1u64 << DREQ_I2C0_TX;
         }
-        if self.i2c0.rx_dreq() {
-            bits |= 1u64 << 45;
+        if self.i2c[0].rx_dreq() {
+            bits |= 1u64 << DREQ_I2C0_RX;
+        }
+        if self.i2c[1].tx_dreq() {
+            bits |= 1u64 << DREQ_I2C1_TX;
+        }
+        if self.i2c[1].rx_dreq() {
+            bits |= 1u64 << DREQ_I2C1_RX;
         }
 
         // ADC (DREQ 48).

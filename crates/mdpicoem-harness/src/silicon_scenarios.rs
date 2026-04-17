@@ -1334,14 +1334,12 @@ pub const SCENARIOS: &[PeriphScenario] = &[
 // computes.
 //
 // **Phase 2 replacement**: the Phase 0b witnesses (UART0/SPI0/ADC) are
-// now modelled peripherals and have stopped diverging. The catalogue
-// has been rotated onto three still-unmodelled peripherals:
+// now modelled peripherals and have stopped diverging. **Step 2 of the
+// V5 §6.C gap fill** (UART1/SPI1/I2C1 array reshape) turned UART1 into
+// a modelled peripheral too, so the former `red_uart1_fr_at_reset_
+// unmodelled` witness was retired. The catalogue now targets two
+// still-unmodelled blocks:
 //
-//   * `red_uart1_fr_at_reset_unmodelled` — UART1 @ `0x4007_4000`. V5
-//     §1 defers UART1, so the emulator has no PL011 model there. The
-//     address falls through to the `peripheral_regs` HashMap stub.
-//     UARTFR at +0x18 should read TXFE | RXFE (0x90) at reset per
-//     PL011 TRM §3.3.3. HW (0x90) ≠ EMU (0) → FAIL.
 //   * `red_trng_status_unmodelled` — TRNG @ `0x400F_0000`. RP2350
 //     datasheet §12.12 TRNG block is unmodelled at V5 scope. The TRNG
 //     `TRNG_RAND_SOURCE_ENABLE_REG` at +0x1300 defaults to non-zero on
@@ -1404,16 +1402,6 @@ pub const ADC_BASE: u32 = 0x400A_0000;
 // Three unmodelled peripherals that still fall through to the APB
 // `peripheral_regs` HashMap stub on the emulator side.
 
-/// UART1 base (RP2350 datasheet §12.1, `0x4007_4000`). **Unmodelled**
-/// in V5 — Phase 2 only ships UART0.
-pub const UART1_BASE: u32 = 0x4007_4000;
-/// PL011 UARTFR offset (`+0x18`).
-pub const UART1_UARTFR: u32 = UART1_BASE + 0x18;
-/// PL011 UARTFR.TXFE (bit 7) — set at reset.
-pub const UARTFR_TXFE: u32 = 1 << 7;
-/// PL011 UARTFR.RXFE (bit 4) — set at reset.
-pub const UARTFR_RXFE: u32 = 1 << 4;
-
 /// TRNG base (RP2350 datasheet §12.12, `0x400F_0000`). **Unmodelled**.
 pub const TRNG_BASE: u32 = 0x400F_0000;
 /// TRNG_IMR — interrupt-mask register at +0x100. On silicon bit 0
@@ -1453,19 +1441,6 @@ pub const SIO_GPIO_OE_SET: u32 = 0xD000_0038;
 // constant would bit-rot against datasheet revisions without buying
 // anything the broad CLR doesn't already deliver.
 const RESETS_CLR_ALL: u32 = 0xFFFF_FFFF;
-
-// S_R1: red-path UART1 — release every peripheral from reset, observe
-// UART1 UARTFR (0x4007_4018) masked to TXFE | RXFE. Silicon's PL011 at
-// UART1 always reports both FIFOs empty after reset; the emulator at
-// V5 scope only models UART0 (V5 §1 defers UART1), so UART1 addresses
-// fall through to the `peripheral_regs` HashMap stub which returns 0.
-// Divergence on bits 4 + 7 → FAIL.
-const S_RED_UART1_FR_UNMODELLED: &[(u32, u32)] = &[
-    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
-];
-const O_RED_UART1_FR_UNMODELLED: &[(u32, u32)] = &[
-    (UART1_UARTFR, UARTFR_TXFE | UARTFR_RXFE),
-];
 
 // S_R2: red-path TRNG — release every peripheral, observe TRNG_IMR
 // (0x400F_0100). The Rockchip-derived TRNG core has a non-zero reset
@@ -1926,15 +1901,6 @@ const SLED_DMA_TIMER_PACED: &[u8] =
 /// Red-path catalogue. Selected by `silicon_periph_diff_rp2350
 /// --red-path` (mutually exclusive with the default catalogue).
 pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
-    PeriphScenario {
-        name: "red_uart1_fr_at_reset_unmodelled",
-        setup: S_RED_UART1_FR_UNMODELLED,
-        max_sysclks: 500,
-        observe: O_RED_UART1_FR_UNMODELLED,
-        observe_pins: 0,
-        custom_sled: None,
-        min_sysclks: 0,
-    },
     PeriphScenario {
         name: "red_trng_imr_unmodelled",
         setup: S_RED_TRNG_IMR_UNMODELLED,
@@ -2900,11 +2866,12 @@ mod tests {
     // matches the default catalogue's invariants.
 
     #[test]
-    fn test_red_path_catalogue_has_three_scenarios() {
+    fn test_red_path_catalogue_has_two_scenarios() {
         assert_eq!(
             RED_PATH_SCENARIOS.len(),
-            3,
-            "HLD V5 §4.2.8 requires exactly 3 red-path scenarios; got {}",
+            2,
+            "V5 §6.C Step 2 retired the UART1 witness (UART1 is now modelled); \
+             expected 2 red-path scenarios, got {}",
             RED_PATH_SCENARIOS.len(),
         );
     }
@@ -2912,10 +2879,10 @@ mod tests {
     #[test]
     fn test_red_path_catalogue_names_match_spec() {
         // Phase 2 retired the Phase 0b/1 witnesses (UART0/SPI0/ADC) as
-        // they became modelled peripherals. New witnesses target still-
-        // unmodelled blocks: UART1, TRNG, SHA256.
+        // they became modelled peripherals. V5 §6.C Step 2 retired the
+        // UART1 witness for the same reason. Remaining witnesses target
+        // still-unmodelled blocks: TRNG, SHA256.
         let expected: HashSet<&str> = [
-            "red_uart1_fr_at_reset_unmodelled",
             "red_trng_imr_unmodelled",
             "red_sha256_csr_wfifo_ready_unmodelled",
         ]
