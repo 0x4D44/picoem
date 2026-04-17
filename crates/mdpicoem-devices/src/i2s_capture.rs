@@ -37,6 +37,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+use tracing::{debug, trace};
+
 /// Which channel the next finalised sample belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Channel {
@@ -156,6 +158,21 @@ impl I2sCapture {
     }
 
     fn on_lrclk_edge(&mut self, new_lrclk: bool, now_cycles: u64) {
+        // Diagnostic trace: every LRCLK edge with the in-flight sample
+        // and the bit count latched. Pure observation. `debug!` so it
+        // stays out of release builds; the silent-WAV diagnosis runs a
+        // debug build of `picogus_diff_rp2040` against this target.
+        debug!(
+            target: "mdpicoem_devices::i2s_capture",
+            now_cycles,
+            new_lrclk,
+            channel = ?self.current_channel,
+            accumulator = format_args!("0x{:04x}", self.accumulator),
+            bit_count = self.bit_count,
+            edges_seen = self.lrclk_edges,
+            "lrclk_edge",
+        );
+
         // Finalise the sample that was being shifted in under the
         // *previous* LRCLK level. Only emit if we actually clocked in
         // 16 bits — fractional words are ignored (the very first half-
@@ -204,6 +221,17 @@ impl I2sCapture {
         // MSB first: bit 15 shifted in first, bit 0 last.
         self.accumulator = (self.accumulator << 1) | (dout as u16);
         self.bit_count += 1;
+        // Diagnostic trace per latched bit. `trace!` (very high
+        // frequency: BCLK is ~1.5 MHz at 44 kHz stereo) so production
+        // release builds compile this to nothing. Useful when the WAV
+        // is silent and we need to confirm DOUT=1 ever shows up at all.
+        trace!(
+            target: "mdpicoem_devices::i2s_capture",
+            dout,
+            bit_count = self.bit_count,
+            accumulator = format_args!("0x{:04x}", self.accumulator),
+            "bclk_rising_latch",
+        );
     }
 
     /// Override the `sys_clk_hz` used by [`Self::inferred_sample_rate_hz`].

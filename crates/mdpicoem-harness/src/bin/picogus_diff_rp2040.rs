@@ -316,6 +316,21 @@ pub fn cycles_to_ns(cycles: u64, sys_clk_hz: u32) -> u64 {
     ns as u64
 }
 
+/// Map a trace-domain timestamp `ev_ns` to its sim-domain target,
+/// given a pre-roll offset and a stretch factor. The stretch is applied
+/// in trace-domain; the pre-roll is added in sim-domain (they do not
+/// compose). With `pre_roll_ns = 0` and `trace_stretch = 1.0`, the
+/// result equals `ev_ns` exactly — byte-identical baseline behaviour.
+#[inline]
+pub fn stretched_target_ns(ev_ns: u64, pre_roll_ns: u64, trace_stretch: f64) -> u64 {
+    let stretched = if (trace_stretch - 1.0).abs() < f64::EPSILON {
+        ev_ns
+    } else {
+        ((ev_ns as f64) * trace_stretch) as u64
+    };
+    pre_roll_ns.saturating_add(stretched)
+}
+
 /// Fast-forward `sink` by stepping one bounded chunk at a time until
 /// the simulated wall-clock elapsed (carried in `sim_ns`) reaches
 /// `target_ns`. Returns the number of stall events observed (0 or 1 —
@@ -635,7 +650,9 @@ pub struct ReplaySummary {
 /// Replay a trace against any `IsaSink`. Returns a summary.
 ///
 /// `duration_ns = Some(n)` stops replay when `event.ns > n`. `None`
-/// runs to the end of the trace.
+/// runs to the end of the trace. The cap is compared against
+/// *trace-domain* timestamps (i.e. pre-stretch), so it isn't shifted
+/// by `pre_roll_ns` or scaled by `trace_stretch`.
 ///
 /// `post_roll_ns = Some(n)` runs the sink for an additional `n` ns of
 /// simulated time after the last fired event (or the duration cap),
@@ -643,11 +660,21 @@ pub struct ReplaySummary {
 /// I2S / DMA pipelines after the last ISA write — Stage 5 needs a few
 /// hundred ms of post-roll to capture the trailing audio buffer. `None`
 /// or `Some(0)` skips the drain entirely.
+///
+/// `pre_roll_ns` steps the sink for this many sim-ns *before* firing
+/// the first event — gives firmware time to finish boot and arm PIO
+/// state machines. `0` skips the pre-roll.
+///
+/// `trace_stretch` multiplies every event's `ev.ns` target in the
+/// sim-domain. `1.0` = unchanged; `>1.0` opens inter-event gaps;
+/// `<1.0` compresses. Must be finite and `> 0`.
 pub fn replay<S: IsaSink>(
     sink: &mut S,
     events: &[TraceEvent],
     duration_ns: Option<u64>,
     post_roll_ns: Option<u64>,
+    pre_roll_ns: u64,
+    trace_stretch: f64,
 ) -> ReplaySummary {
     let mut summary = ReplaySummary {
         events_total: events.len(),
@@ -661,6 +688,19 @@ pub fn replay<S: IsaSink>(
     let mut sim_ns: u64 = 0;
     let mut stall_warned = summary.stall_events > 0;
 
+    if pre_roll_ns > 0 {
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, pre_roll_ns, |cycle| {
+            if !stall_warned {
+                eprintln!(
+                    "warning: emulator stalled at cycle {} during pre-roll",
+                    cycle
+                );
+                stall_warned = true;
+            }
+        });
+        summary.stall_events += stalls;
+    }
+
     for ev in events {
         if let Some(limit) = duration_ns {
             if ev.ns > limit {
@@ -669,7 +709,8 @@ pub fn replay<S: IsaSink>(
             }
         }
 
-        let stalls = advance_to_sim_ns(sink, &mut sim_ns, ev.ns, |cycle| {
+        let target_ns = stretched_target_ns(ev.ns, pre_roll_ns, trace_stretch);
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, target_ns, |cycle| {
             if !stall_warned {
                 eprintln!(
                     "warning: emulator stalled at cycle {} \
@@ -948,6 +989,8 @@ fn replay_with_coverage(
     events: &[TraceEvent],
     duration_ns: Option<u64>,
     post_roll_ns: Option<u64>,
+    pre_roll_ns: u64,
+    trace_stretch: f64,
 ) -> (ReplaySummary, CaptureCoverage) {
     let mut summary = ReplaySummary {
         events_total: events.len(),
@@ -958,6 +1001,19 @@ fn replay_with_coverage(
     // Running simulated wall-clock in ns — see `replay()` for rationale.
     let mut sim_ns: u64 = 0;
     let mut stall_warned = false;
+
+    if pre_roll_ns > 0 {
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, pre_roll_ns, |cycle| {
+            if !stall_warned {
+                eprintln!(
+                    "warning: emulator stalled at cycle {} during pre-roll",
+                    cycle
+                );
+                stall_warned = true;
+            }
+        });
+        summary.stall_events += stalls;
+    }
 
     // Running state for the delta-classifier. `pending` carries the
     // class AND decile of the previous sub-event whose push may still
@@ -997,7 +1053,8 @@ fn replay_with_coverage(
             }
         }
 
-        let stalls = advance_to_sim_ns(sink, &mut sim_ns, ev.ns, |cycle| {
+        let target_ns = stretched_target_ns(ev.ns, pre_roll_ns, trace_stretch);
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, target_ns, |cycle| {
             if !stall_warned {
                 eprintln!(
                     "warning: emulator stalled at cycle {} \
@@ -1132,6 +1189,8 @@ struct Args {
     trace: PathBuf,
     duration_secs: Option<f64>,
     post_roll_secs: f64,
+    pre_roll_secs: f64,
+    trace_stretch: f64,
     out: Option<PathBuf>,
 }
 
@@ -1152,6 +1211,8 @@ fn parse_args() -> Result<Args, String> {
     let mut trace = None;
     let mut duration_secs = None;
     let mut post_roll_secs = DEFAULT_POST_ROLL_SECS;
+    let mut pre_roll_secs: f64 = 0.0;
+    let mut trace_stretch: f64 = 1.0;
     let mut out = None;
     let mut i = 0;
     while i < args.len() {
@@ -1200,6 +1261,30 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--post-roll must be >= 0".into());
                 }
             }
+            "--pre-roll" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--pre-roll requires seconds".into());
+                }
+                pre_roll_secs = args[i]
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid --pre-roll '{}': {e}", args[i]))?;
+                if !pre_roll_secs.is_finite() || pre_roll_secs < 0.0 {
+                    return Err("--pre-roll must be a finite value >= 0".into());
+                }
+            }
+            "--trace-stretch" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--trace-stretch requires a factor".into());
+                }
+                trace_stretch = args[i]
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid --trace-stretch '{}': {e}", args[i]))?;
+                if !trace_stretch.is_finite() || trace_stretch <= 0.0 {
+                    return Err("--trace-stretch must be a finite value > 0".into());
+                }
+            }
             "--out" => {
                 i += 1;
                 if i >= args.len() {
@@ -1225,6 +1310,8 @@ fn parse_args() -> Result<Args, String> {
         trace,
         duration_secs,
         post_roll_secs,
+        pre_roll_secs,
+        trace_stretch,
         out,
     })
 }
@@ -1272,6 +1359,18 @@ fn print_usage() {
                       (or the duration cap), step the emulator for this many\n              \
                       additional simulated seconds without firing events —\n              \
                       lets firmware drain trailing I2S / DMA buffers.\n\
+         --pre-roll   Optional (default 0 s). Before firing the first trace\n              \
+                      event, step the emulator for this many simulated\n              \
+                      seconds so firmware can finish boot / arm PIO state\n              \
+                      machines. Does NOT shift the duration cap (which is\n              \
+                      compared against trace-domain timestamps).\n\
+         --trace-stretch\n              \
+                      Optional (default 1.0). Multiply every trace event's\n              \
+                      timestamp by this factor when advancing sim-time —\n              \
+                      stretches inter-event gaps (>1.0) or compresses them\n              \
+                      (<1.0). Useful when residual drops suggest PIO can't\n              \
+                      keep up with back-to-back ISA writes. Applied in\n              \
+                      trace-domain and summed with pre-roll in sim-domain.\n\
          --out        Optional. Path for the captured I2S WAV. Default:\n              \
                       crates/mdpicoem-harness/oracles/picogus_<trace_stem>.wav."
     );
@@ -1401,10 +1500,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .duration_secs
         .map(|s| (s * 1e9).max(0.0) as u64);
     let post_roll_ns = (args.post_roll_secs * 1e9).max(0.0) as u64;
+    let pre_roll_ns = (args.pre_roll_secs * 1e9).max(0.0) as u64;
+    let trace_stretch = args.trace_stretch;
     let out_path = args
         .out
         .clone()
         .unwrap_or_else(|| mdpicoem_harness::default_out_path(&args.trace));
+
+    if pre_roll_ns > 0 || (trace_stretch - 1.0).abs() >= f64::EPSILON {
+        eprintln!(
+            "replay: pre_roll={:.3} s  trace_stretch={:.3}x",
+            pre_roll_ns as f64 / 1e9,
+            trace_stretch
+        );
+    }
 
     let wall_start = Instant::now();
     let mut sink = CapturingSink::new(emu, DEFAULT_SYS_CLK_HZ);
@@ -1413,6 +1522,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &events,
         duration_ns,
         Some(post_roll_ns),
+        pre_roll_ns,
+        trace_stretch,
     );
     let wall_elapsed = wall_start.elapsed();
     let (mut emu, mut capture) = sink.into_parts();
@@ -2691,7 +2802,7 @@ ns,port,value,kind
             kind: TraceKind::Write8,
         }];
 
-        let summary = replay(&mut emu, &events, None, None);
+        let summary = replay(&mut emu, &events, None, None, 0, 1.0);
         assert!(
             emu.cycles() >= 125_000,
             "emu cycles {} did not reach 125_000",
@@ -2720,7 +2831,7 @@ ns,port,value,kind
         ];
 
         let mut sink = MockSink::new();
-        let summary = replay(&mut sink, &events, None, None);
+        let summary = replay(&mut sink, &events, None, None, 0, 1.0);
         assert_eq!(summary.writes_fired, 1);
         assert_eq!(summary.reads_skipped, 1);
         // MockSink only sees drive_pins during writes; a read emits
@@ -2911,7 +3022,7 @@ ns,port,value,kind
 
         let mut sink = MockSink::new();
         // Cap at 1 s.
-        let summary = replay(&mut sink, &events, Some(1_000_000_000), None);
+        let summary = replay(&mut sink, &events, Some(1_000_000_000), None, 0, 1.0);
         assert_eq!(summary.writes_fired, 2);
         assert!(summary.duration_capped);
     }
@@ -2934,6 +3045,8 @@ ns,port,value,kind
             &events,
             None,
             Some(1_000_000), // 1 ms
+            0,
+            1.0,
         );
 
         assert_eq!(summary.writes_fired, 1);
@@ -2965,13 +3078,71 @@ ns,port,value,kind
         }];
 
         let mut sink_zero = MockSink::new();
-        let summary_zero = replay(&mut sink_zero, &events, None, Some(0));
+        let summary_zero = replay(&mut sink_zero, &events, None, Some(0), 0, 1.0);
         assert_eq!(summary_zero.post_roll_cycles, 0);
 
         let mut sink_none = MockSink::new();
-        let summary_none = replay(&mut sink_none, &events, None, None);
+        let summary_none = replay(&mut sink_none, &events, None, None, 0, 1.0);
         assert_eq!(summary_none.post_roll_cycles, 0);
         assert_eq!(sink_zero.cycles(), sink_none.cycles());
+    }
+
+    #[test]
+    fn pre_roll_advances_sink_before_first_event() {
+        // With `pre_roll_ns = 1_000_000` and a single event at ev.ns=0,
+        // the sink should advance by the pre-roll AMOUNT (125_000 cyc
+        // at 125 MHz) before firing, so final cycles = pre-roll + drive
+        // overhead (~60 cycles).
+        let events = vec![TraceEvent {
+            ns: 0,
+            port: 0x240,
+            value: 0xAB,
+            kind: TraceKind::Write8,
+        }];
+        let mut sink = MockSink::new();
+        let summary = replay(&mut sink, &events, None, None, 1_000_000, 1.0);
+        assert_eq!(summary.writes_fired, 1);
+        // MockSink's clock is 125 MHz; 1 ms pre-roll → 125_000 cycles
+        // before the write fires. drive_write_cycle adds overhead.
+        assert!(
+            sink.cycles() >= 125_000,
+            "pre-roll did not advance sink: cycles = {}",
+            sink.cycles()
+        );
+    }
+
+    #[test]
+    fn trace_stretch_scales_inter_event_gap() {
+        // Two events at ns=0 and ns=1_000_000 (1 ms apart). Stretch 2.0
+        // should make the second event fire at sim-time 2 ms, i.e. the
+        // final sink cycle count is ≥ 2 × the stretch=1.0 case.
+        let events = vec![
+            TraceEvent { ns: 0, port: 0x240, value: 0x01, kind: TraceKind::Write8 },
+            TraceEvent { ns: 1_000_000, port: 0x241, value: 0x02, kind: TraceKind::Write8 },
+        ];
+        let mut sink1 = MockSink::new();
+        let _ = replay(&mut sink1, &events, None, None, 0, 1.0);
+        let c1 = sink1.cycles();
+
+        let mut sink2 = MockSink::new();
+        let _ = replay(&mut sink2, &events, None, None, 0, 2.0);
+        let c2 = sink2.cycles();
+
+        // Ignoring drive overhead, c1 ≈ 125_000 cyc, c2 ≈ 250_000 cyc.
+        // Check c2 is meaningfully > c1 (> 1.5×) — stretch took effect.
+        assert!(
+            c2 > c1 * 3 / 2,
+            "stretch=2.0 should lengthen sim-time: c1={c1} c2={c2}"
+        );
+    }
+
+    #[test]
+    fn stretched_target_ns_is_identity_with_defaults() {
+        // Byte-identical baseline contract: pre_roll=0 & stretch=1.0
+        // must leave ev.ns untouched at every input.
+        for ev_ns in [0u64, 1, 1_000, 1_000_000, 29_991_219_767] {
+            assert_eq!(stretched_target_ns(ev_ns, 0, 1.0), ev_ns);
+        }
     }
 
     /// Mock sink that refuses to advance — used to verify the stall
@@ -3016,7 +3187,7 @@ ns,port,value,kind
             },
         ];
         let mut sink = StalledSink { cycles: 0 };
-        let summary = replay(&mut sink, &events, None, None);
+        let summary = replay(&mut sink, &events, None, None, 0, 1.0);
         // Each event needed a fast-forward, each stalled — so 3 stalls.
         assert_eq!(summary.stall_events, 3);
         // Writes still fired even though the sink stalled.
@@ -3058,6 +3229,8 @@ ns,port,value,kind
             &events,
             None,
             Some(1_000_000), // 1 ms post-roll
+            0,
+            1.0,
         );
         assert_eq!(summary.writes_fired, 1);
         assert!(
@@ -3925,7 +4098,7 @@ ns,port,value,kind
 
         // Post-fix: `replay()` has no sys_clk_hz parameter — the true
         // cadence comes from `IsaSink::sys_clk_hz()` polled per chunk.
-        let summary = replay(&mut sink, &events, None, None);
+        let summary = replay(&mut sink, &events, None, None, 0, 1.0);
         assert_eq!(summary.writes_fired, 2);
 
         // Post-fix expected cycles:
@@ -3947,7 +4120,7 @@ ns,port,value,kind
         // ev[1] lands at 10 ms * 125 MHz = 1_250_000 cycles — about
         // 490k fewer.
         let mut sink_noflip = VariableClockSink::new(125_000_000, u64::MAX, 125_000_000);
-        let _ = replay(&mut sink_noflip, &events, None, None);
+        let _ = replay(&mut sink_noflip, &events, None, None, 0, 1.0);
         let noflip_cycles = sink_noflip.cycles();
         assert!(
             noflip_cycles < final_cycles,
@@ -3971,7 +4144,7 @@ ns,port,value,kind
             value: 0xAB,
             kind: TraceKind::Write8,
         }];
-        let summary = replay(&mut sink, &events, None, None);
+        let summary = replay(&mut sink, &events, None, None, 0, 1.0);
         assert_eq!(summary.writes_fired, 1);
         // 1 ms @ 125 MHz = 125_000 cycles; plus drive_write_cycle
         // (4 phases × step deltas = 12 + 12 + 25 + 12 = 61 cycles).

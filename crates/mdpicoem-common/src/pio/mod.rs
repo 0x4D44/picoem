@@ -390,6 +390,22 @@ impl PioBlock {
                 }
             }
         }
+        // Diagnostic trace: if pad_out has changed since last merge,
+        // emit a `trace!` with the new value AND the diff mask. Fires
+        // at most once per `step()` (one merge per sysclk). Volume is
+        // PIO-tick-bound (millions per second of sim time) so use
+        // `trace!` to keep release builds silent — diagnostic builds
+        // narrow the filter via `RUST_LOG`.
+        if out != self.pad_out || oe != self.pad_oe {
+            tracing::trace!(
+                target: "mdpicoem_common::pio",
+                old_out = format_args!("0x{:08x}", self.pad_out),
+                new_out = format_args!("0x{:08x}", out),
+                old_oe = format_args!("0x{:08x}", self.pad_oe),
+                new_oe = format_args!("0x{:08x}", oe),
+                "pad_change",
+            );
+        }
         self.pad_out = out;
         self.pad_oe = oe;
     }
@@ -563,11 +579,59 @@ impl PioBlock {
             }
             // FLEVEL: read-only
             0x00C => {}
-            // TXF0-3: push to SM's TX FIFO
-            0x010 => { self.sm[0].tx_fifo.push(val); }
-            0x014 => { self.sm[1].tx_fifo.push(val); }
-            0x018 => { self.sm[2].tx_fifo.push(val); }
-            0x01C => { self.sm[3].tx_fifo.push(val); }
+            // TXF0-3: push to SM's TX FIFO. Trace per push so the
+            // PicoGUS silent-WAV class of bug (PWM-IRQ pushes the right
+            // sample but the SM never shifts it out, or the SM shifts
+            // out zeros because pushes never landed) can be told apart
+            // by looking at the actual pushed `val` interleaved with
+            // pad-out transitions and i2s_capture LRCLK edges.
+            // `debug!` keeps this out of release builds. Volume: one
+            // line per audio sample (~44 kHz) — fine for diag, never in
+            // the hot path of release.
+            0x010 => {
+                let ok = self.sm[0].tx_fifo.push(val);
+                tracing::debug!(
+                    target: "mdpicoem_common::pio",
+                    sm = 0u8,
+                    val = format_args!("0x{:08x}", val),
+                    push_ok = ok,
+                    occupancy = self.sm[0].tx_fifo.level(),
+                    "txf_write",
+                );
+            }
+            0x014 => {
+                let ok = self.sm[1].tx_fifo.push(val);
+                tracing::debug!(
+                    target: "mdpicoem_common::pio",
+                    sm = 1u8,
+                    val = format_args!("0x{:08x}", val),
+                    push_ok = ok,
+                    occupancy = self.sm[1].tx_fifo.level(),
+                    "txf_write",
+                );
+            }
+            0x018 => {
+                let ok = self.sm[2].tx_fifo.push(val);
+                tracing::debug!(
+                    target: "mdpicoem_common::pio",
+                    sm = 2u8,
+                    val = format_args!("0x{:08x}", val),
+                    push_ok = ok,
+                    occupancy = self.sm[2].tx_fifo.level(),
+                    "txf_write",
+                );
+            }
+            0x01C => {
+                let ok = self.sm[3].tx_fifo.push(val);
+                tracing::debug!(
+                    target: "mdpicoem_common::pio",
+                    sm = 3u8,
+                    val = format_args!("0x{:08x}", val),
+                    push_ok = ok,
+                    occupancy = self.sm[3].tx_fifo.level(),
+                    "txf_write",
+                );
+            }
             // RXF0-3: read-only
             0x020..=0x02C => {}
             // IRQ: W1C (or alias)
