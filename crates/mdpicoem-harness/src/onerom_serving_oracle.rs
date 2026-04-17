@@ -208,7 +208,7 @@ pub(crate) struct Observation {
     pub cycle: u64,
     /// `GlueDma::ch1_pushes()` sampled this cycle.
     pub ch1_pushes: u32,
-    /// `bus.read32(CH1.READ_ADDR)` sampled this cycle.
+    /// `bus.read32(CH1.READ_ADDR, 0)` sampled this cycle.
     pub resolved_addr: u32,
     /// Byte currently exposed on D0..D7 (`(gpio_in >> 16) & 0xFF`).
     pub data_byte: u8,

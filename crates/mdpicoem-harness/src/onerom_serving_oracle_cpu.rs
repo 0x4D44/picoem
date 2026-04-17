@@ -273,7 +273,7 @@ impl CpuServingOracle {
         for tick in 0..PER_CASE_TIMEOUT {
             emu.run(1);
 
-            let sio_oe = emu.bus.read32(SIO_GPIO_OE_ADDR);
+            let sio_oe = emu.bus.read32(SIO_GPIO_OE_ADDR, 0);
             let oe_data = ((sio_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
             // Observe byte from `gpio_in` — this is the composite of
             // external-input stimulus + SIO/PIO outputs after the

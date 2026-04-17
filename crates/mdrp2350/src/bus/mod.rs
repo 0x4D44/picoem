@@ -1922,26 +1922,26 @@ impl Bus {
                 let reg_offset = word_addr & 0xFFF;
                 if Self::is_sio_gpio_out_replicating_reg(reg_offset) {
                     let replicated = u32::from(val) * 0x0101_0101;
-                    self.write32(word_addr, replicated);
+                    self.write32(word_addr, replicated, core);
                 } else {
                     let byte_idx = (addr & 3) as usize;
-                    let core = self.active_core();
+                    // core is the outer write8/16/32 param
                     // Read via the low-level SIO path rather than
-                    // `self.read32(word_addr)` so we don't trip the
+                    // `self.read32(word_addr, core)` so we don't trip the
                     // GPIO_IN mirror short-circuit — the merged
                     // write we emit goes back to
-                    // `self.write32(word_addr, ...)`, which
+                    // `self.write32(word_addr, ..., core)`, which
                     // preserves FIFO_WR / doorbell / softirq
                     // semantics for any byte-lane access that hits
                     // a side-effect offset.
                     let old_word = match reg_offset {
                         0x004 => self.gpio_in,
                         0x008 => self.read_gpio_hi_in(),
-                        _ => self.sio.read32(reg_offset, core),
+                        _ => self.sio.read32(reg_offset, core as usize),
                     };
                     let mut bytes = old_word.to_le_bytes();
                     bytes[byte_idx] = val;
-                    self.write32(word_addr, u32::from_le_bytes(bytes));
+                    self.write32(word_addr, u32::from_le_bytes(bytes), core);
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write8(addr, val),
@@ -2534,20 +2534,20 @@ impl Bus {
                 let reg_offset = word_addr & 0xFFF;
                 if Self::is_sio_gpio_out_replicating_reg(reg_offset) {
                     let replicated = u32::from(val) * 0x0001_0001;
-                    self.write32(word_addr, replicated);
+                    self.write32(word_addr, replicated, core);
                 } else {
                     let half_idx = ((addr >> 1) & 1) as usize;
-                    let core = self.active_core();
+                    // core is the outer write8/16/32 param
                     let old_word = match reg_offset {
                         0x004 => self.gpio_in,
                         0x008 => self.read_gpio_hi_in(),
-                        _ => self.sio.read32(reg_offset, core),
+                        _ => self.sio.read32(reg_offset, core as usize),
                     };
                     let mut halves: [u16; 2] =
                         [old_word as u16, (old_word >> 16) as u16];
                     halves[half_idx] = val;
                     let merged = (halves[0] as u32) | ((halves[1] as u32) << 16);
-                    self.write32(word_addr, merged);
+                    self.write32(word_addr, merged, core);
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write16(addr, val),

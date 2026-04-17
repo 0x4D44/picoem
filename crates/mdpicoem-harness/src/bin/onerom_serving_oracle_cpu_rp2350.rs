@@ -225,8 +225,8 @@ fn main() -> ExitCode {
     );
 
     // Diagnostic: confirm PIO CTRLs are 0 (CPU-mode shouldn't touch PIO).
-    let pio1_ctrl = emu.bus.read32(0x5030_0000);
-    let pio2_ctrl = emu.bus.read32(0x5040_0000);
+    let pio1_ctrl = emu.bus.read32(0x5030_0000, 0);
+    let pio2_ctrl = emu.bus.read32(0x5040_0000, 0);
     println!(
         "  PIO1.CTRL = 0x{:08X}, PIO2.CTRL = 0x{:08X} (both 0 expected for CPU mode)",
         pio1_ctrl, pio2_ctrl

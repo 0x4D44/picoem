@@ -107,3 +107,114 @@ or driver might run.
   **not** address why the zombies appeared. The real fix for the
   source bug is Agent A's child-process cleanup —
   see `wrk_docs/2026.04.15 - HLD - QEMU Child Cleanup on Exit.md`.
+
+## Putting RP2354 into RISC-V mode
+
+### Background
+
+RP2354 ships two complete CPU complexes (2× Cortex-M33, 2× Hazard3
+RISC-V). Only one runs at a time. The selection — ARCHSEL — is latched
+at reset from two inputs, evaluated in order:
+
+1. **POWMAN `CHIP_RESET.ARCH_SEL`** soft-override in sticky always-on
+   storage — revertible on next reset if written again.
+2. **`CHIP_INFO.ARCH_SEL`** OTP fuse — one-way, permanent once burned.
+
+Default silicon (no OTP burn, no soft-override) boots into Arm.
+
+For spike and oracle runs where we want to flip between Arm and RV
+without reburning fuses, use the POWMAN soft-override.
+
+### Mechanism 1 — POWMAN soft-override (preferred for spike runs)
+
+Revertible; persists across soft reset via always-on storage but is
+cleared on a fresh cold power-up. Sequence:
+
+1. Attach via SWD with the probe in its current arch (Arm usually).
+2. Write `CHIP_RESET.ARCH_SEL` via the POWMAN register window.
+   - **ASSUMPTION — not yet pinned from datasheet.** `POWMAN_BASE` and
+     the `CHIP_RESET` offset *must* be pinned from RP2350 datasheet
+     §5.10 before `riscv_probe_spike --attempt-archsel-flip` attempts
+     a write. The emulator's current values are **assumptions**:
+     `POWMAN_BASE = 0x4010_0000`, `CHIP_RESET` offset `0x20`, both
+     explicitly flagged ASSUMPTION in
+     `crates/mdrp2350/src/peripherals/powman.rs` module doc (offset
+     `0x20` is an educated guess inside the 4 KB POWMAN aperture; the
+     emulator's storage model round-trips regardless of whether the
+     offset matches silicon exactly, so the in-tree offset itself is
+     not evidence of the datasheet value).
+   - Until the datasheet pin lands here, Row A2 of the Phase 1 spike
+     (`--attempt-archsel-flip`) will SKIP with the reason "A2 skipped:
+     POWMAN CHIP_RESET offset not pinned in RUNBOOK" even when the
+     flag is passed. Row A1 (read-only probe) runs unconditionally and
+     prints whatever is at `POWMAN_BASE + 0x20` — that output is a
+     starting data point for triaging the real offset, not a
+     confirmation that `0x20` is correct.
+   - **Do not blindly adopt other offsets proposed in review without
+     primary-source evidence.** Another reviewer has asserted the
+     datasheet value is `0x08`; until that is confirmed against the
+     actual RP2350 datasheet §5.10 (or an alternative primary source
+     such as `one-rom/sdrr/include/reg-rp235x.h`), neither `0x20` nor
+     `0x08` should be trusted on silicon.
+3. Issue a reset (e.g. `probe-rs reset`, or re-cycle nRST).
+4. Re-attach. Next boot comes up in the selected arch.
+
+#### Pinning the offset (procedure)
+
+1. Locate RP2350 datasheet §5.10 (POWMAN register map) or
+   `one-rom/sdrr/include/reg-rp235x.h` if available.
+2. Read off `POWMAN_BASE` (expect `0x4010_0000`; confirm) and the
+   `CHIP_RESET` register offset.
+3. Update this section to replace the ASSUMPTION block with a pinned
+   value, citing the source.
+4. Update `POWMAN_OFFSET_PINNED` in
+   `crates/mdpicoem-harness/src/bin/riscv_probe_spike.rs` from
+   `false` to `true` and fix the `POWMAN_BASE` / `CHIP_RESET_OFFSET`
+   constants to match.
+5. Update the emulator's `crates/mdrp2350/src/peripherals/powman.rs`
+   module doc to drop the ASSUMPTION flag on the matching offset (if
+   the datasheet value equals the emulator's current guess) or to
+   correct the guess (if not — will require a storage-model audit,
+   but the round-trip tests should remain green regardless).
+
+### Mechanism 2 — OTP fuse burn (permanent)
+
+Burn `CHIP_INFO.ARCH_SEL` via `picotool otp set-default-boot ...`
+(exact sub-command — see picotool help). One-way: once burned you
+cannot un-burn, though a subsequent POWMAN soft-override in the
+opposite direction still works.
+
+Use only if:
+
+- The board is dedicated to one arch for the foreseeable future.
+- The OTP-fuse escape path (opposite-direction POWMAN override) is
+  documented for the operator who will later revive the board.
+
+### Checking current mode
+
+After attach:
+
+- `probe-rs list` shows the probe but **does not** report current
+  CPU arch — the probe YAML is ARM-only and probe-rs routes through
+  the Arm debug sequence regardless of silicon state.
+- Run `riscv_probe_spike` (the Phase 1 spike binary in
+  `crates/mdpicoem-harness/src/bin/riscv_probe_spike.rs`). It
+  calls `Core::architecture()` and reads `mhartid`; the summary row
+  "1. Attach + RV core enumeration" tells you which arch the silicon
+  booted into. PASS = RV, FAIL with "architectures = [Arm, Arm]" =
+  still Arm.
+
+### Notes and caveats
+
+- A cold power cycle (full power removal, not just nRST) can clear
+  the POWMAN soft-override depending on the board's always-on rail.
+  If the override unexpectedly reverts, check whether the board cut
+  AON power during the "reset".
+- probe-rs 0.31's embedded `RP235x.yaml` has no RV core stanza. Even
+  when silicon is in RV mode, probe-rs hands out ARM `Core`s and
+  `architecture()` may still report `Arm` — this is the probe-rs
+  side of the gap, not a silicon bug. See
+  `wrk_docs/2026.04.17 - LLD - RISC-V Probe-rs Attach Spike V1.md`
+  §2 for the implication.
+- Two-probe + two-board setups can run Arm and RV in parallel; the
+  POWMAN override is a one-board recipe.

@@ -1457,7 +1457,7 @@ version = "0.6.0"
 
 [[package]]
 name = "mdpicoem-harness"
-version = "0.28.2"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -1498,7 +1498,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2350"
-version = "1.8.1"
+version = "1.8.3"
 dependencies = [
  "mdpicoem-common",
  "sha2",

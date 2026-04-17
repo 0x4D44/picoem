@@ -9267,15 +9267,15 @@ fn sio_gpio_out_byte_write_replicates_across_lanes() {
 
     // Enable OE for all 30 valid pins so `update_gpio` can surface the
     // replicated output on `gpio_in`.
-    emu.bus.write32(0xD000_0030, 0x3FFF_FFFF);
+    emu.bus.write32(0xD000_0030, 0x3FFF_FFFF, 0);
 
     // Byte write to SIO_GPIO_OUT offset 0.
-    emu.bus.write8(0xD000_0010, 0xA5);
+    emu.bus.write8(0xD000_0010, 0xA5, 0);
 
     // The 32-bit SIO_GPIO_OUT register must hold the byte replicated
     // across every lane.
     assert_eq!(
-        emu.bus.read32(0xD000_0010),
+        emu.bus.read32(0xD000_0010, 0),
         0xA5A5_A5A5,
         "byte write to SIO_GPIO_OUT must replicate across all 4 lanes"
     );
@@ -9304,10 +9304,10 @@ fn sio_gpio_out_halfword_write_replicates() {
 
     let mut emu = Emulator::new(Config::default());
 
-    emu.bus.write16(0xD000_0010, 0x1234);
+    emu.bus.write16(0xD000_0010, 0x1234, 0);
 
     assert_eq!(
-        emu.bus.read32(0xD000_0010),
+        emu.bus.read32(0xD000_0010, 0),
         0x1234_1234,
         "halfword write to SIO_GPIO_OUT must replicate across both halves"
     );
@@ -9323,8 +9323,8 @@ fn sio_gpio_out_halfword_write_replicates() {
 fn sio_gpio_oe_byte_write_replicates_across_lanes() {
     use crate::{Config, EmulatorBuilder};
     let mut emu = EmulatorBuilder::new(Config::default()).build();
-    emu.bus.write8(0xD000_0030, 0xFF);
-    let word = emu.bus.read32(0xD000_0030);
+    emu.bus.write8(0xD000_0030, 0xFF, 0);
+    let word = emu.bus.read32(0xD000_0030, 0);
     assert_eq!(word, 0xFFFF_FFFF,
         "STRB to SIO_GPIO_OE must replicate byte across all four lanes; got {:#010x}", word);
 }
@@ -9340,12 +9340,12 @@ fn sio_non_gpio_out_byte_write_still_rmw() {
 
     // MTIMEL (offset 0x1B0) is a plain storage register on RP2350 SIO
     // — no side-effect semantics, perfect for verifying the RMW path.
-    emu.bus.write32(0xD000_01B0, 0xFFFF_FFFF);
-    emu.bus.write8(0xD000_01B1, 0xAA);
+    emu.bus.write32(0xD000_01B0, 0xFFFF_FFFF, 0);
+    emu.bus.write8(0xD000_01B1, 0xAA, 0);
 
     // Only byte 1 should have changed.
     assert_eq!(
-        emu.bus.read32(0xD000_01B0),
+        emu.bus.read32(0xD000_01B0, 0),
         0xFFFF_AAFF,
         "non-GPIO_OUT byte write must be byte-lane RMW, not replicated"
     );

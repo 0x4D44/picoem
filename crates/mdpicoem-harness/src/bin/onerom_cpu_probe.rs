@@ -95,7 +95,7 @@ fn main() -> ExitCode {
             eprintln!("cycle stalled at {}", before);
             return ExitCode::FAILURE;
         }
-        let oe = emu.bus.read32(0xD000_0020);
+        let oe = emu.bus.read32(0xD000_0020, 0);
         let oe_data = ((oe >> 16) & 0xFF) as u8;
         if oe_data != last_oe_data && oe_change_count < 20 {
             let pc = emu.core(0).regs.pc();
@@ -112,8 +112,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let pio1_ctrl = emu.bus.read32(0x5030_0000);
-    let pio2_ctrl = emu.bus.read32(0x5040_0000);
+    let pio1_ctrl = emu.bus.read32(0x5030_0000, 0);
+    let pio2_ctrl = emu.bus.read32(0x5040_0000, 0);
     println!(
         "after warm-up at cycle {}: PIO1.CTRL=0x{:08X} PIO2.CTRL=0x{:08X}",
         emu.cycles(),
@@ -135,7 +135,7 @@ fn main() -> ExitCode {
     println!();
     println!("Dump around serve loop (0x10000900..=0x10000960):");
     for addr in (0x10000900u32..=0x10000960u32).step_by(2) {
-        let hw = emu.bus.read8(addr) as u32 | ((emu.bus.read8(addr + 1) as u32) << 8);
+        let hw = emu.bus.read8(addr, 0) as u32 | ((emu.bus.read8(addr + 1, 0) as u32) << 8);
         // Minimal classifier — just show the encoding family.
         let mnemonic = match hw & 0xF800 {
             0x6000 => format!("STR R{}, [R{}, #{}]", hw & 7, (hw >> 3) & 7, ((hw >> 6) & 0x1F) * 4),
@@ -155,7 +155,7 @@ fn main() -> ExitCode {
     let mut nonzero = 0usize;
     let mut first_values = [0u8; 16];
     for i in 0..0x1_0000u32 {
-        let b = emu.bus.read8(0x2000_0000 + i);
+        let b = emu.bus.read8(0x2000_0000 + i, 0);
         if b != 0 {
             nonzero += 1;
         }
@@ -167,17 +167,17 @@ fn main() -> ExitCode {
     println!("SRAM shadow scan: {} non-zero bytes out of 65536", nonzero);
     println!("  first 16 bytes at 0x20000000: {:02X?}", first_values);
     // Spot-check key shadow offsets that the oracle will look up:
-    println!("  shadow[0x9000] = 0x{:02X}  (walk1 baseline pin pattern)", emu.bus.read8(0x2000_9000));
-    println!("  shadow[0x9080] = 0x{:02X}  (walk1 A0 pin pattern)", emu.bus.read8(0x2000_9080));
-    println!("  shadow[0x9040] = 0x{:02X}  (walk1 A1 pin pattern)", emu.bus.read8(0x2000_9040));
-    println!("  shadow[0x9020] = 0x{:02X}  (walk1 A2 pin pattern)", emu.bus.read8(0x2000_9020));
-    println!("  shadow[0x9010] = 0x{:02X}  (walk1 A3 pin pattern)", emu.bus.read8(0x2000_9010));
+    println!("  shadow[0x9000] = 0x{:02X}  (walk1 baseline pin pattern)", emu.bus.read8(0x2000_9000, 0));
+    println!("  shadow[0x9080] = 0x{:02X}  (walk1 A0 pin pattern)", emu.bus.read8(0x2000_9080, 0));
+    println!("  shadow[0x9040] = 0x{:02X}  (walk1 A1 pin pattern)", emu.bus.read8(0x2000_9040, 0));
+    println!("  shadow[0x9020] = 0x{:02X}  (walk1 A2 pin pattern)", emu.bus.read8(0x2000_9020, 0));
+    println!("  shadow[0x9010] = 0x{:02X}  (walk1 A3 pin pattern)", emu.bus.read8(0x2000_9010, 0));
 
     // Inspect the serve loop bytes.
     println!();
     println!("Serve loop disassembly (instruction words at each hot PC):");
     for pc in [0x10000926, 0x10000928, 0x1000092A, 0x1000092C, 0x1000092E, 0x10000930u32] {
-        let w = emu.bus.read32(pc);
+        let w = emu.bus.read32(pc, 0);
         println!("  PC=0x{:08X}: raw 0x{:08X}  [lo=0x{:04X} hi=0x{:04X}]", pc, w, w & 0xFFFF, (w >> 16) & 0xFFFF);
     }
 
@@ -196,8 +196,8 @@ fn main() -> ExitCode {
     emu.bus.gpio_external_in = stim_level_cs1_low;
     for n in 0..500u64 {
         emu.run(1);
-        let oe = emu.bus.read32(0xD000_0020);
-        let out = emu.bus.read32(0xD000_0010);
+        let oe = emu.bus.read32(0xD000_0020, 0);
+        let out = emu.bus.read32(0xD000_0010, 0);
         if (oe >> 16) & 0xFF != 0 || (out >> 16) & 0xFF != 0 {
             println!(
                 "  tick {}: PC=0x{:08X}  SIO_OE[16..23]=0x{:02X}  SIO_OUT[16..23]=0x{:02X}  gpio_in=0x{:08X}",
@@ -216,19 +216,19 @@ fn main() -> ExitCode {
     // Sanity test: write8 a byte to SIO_GPIO_OUT and check it landed.
     println!();
     println!("write8 regression check (writes 0xA5 to SIO_GPIO_OUT via write8):");
-    let before = emu.bus.read32(0xD000_0010);
-    emu.bus.write8(0xD000_0010, 0xA5);
-    let after_byte = emu.bus.read32(0xD000_0010);
+    let before = emu.bus.read32(0xD000_0010, 0);
+    emu.bus.write8(0xD000_0010, 0xA5, 0);
+    let after_byte = emu.bus.read32(0xD000_0010, 0);
     println!("  before write8: SIO_GPIO_OUT = 0x{:08X}", before);
     println!("  after  write8: SIO_GPIO_OUT = 0x{:08X}  (expected 0x{:08X} if byte 0 sticks)",
              after_byte, (before & !0xFFu32) | 0xA5);
-    emu.bus.write32(0xD000_0010, before); // restore
+    emu.bus.write32(0xD000_0010, before, 0); // restore
 
     // Now compare to word write:
-    emu.bus.write32(0xD000_0010, 0x0000_00A5);
-    let after_word = emu.bus.read32(0xD000_0010);
+    emu.bus.write32(0xD000_0010, 0x0000_00A5, 0);
+    let after_word = emu.bus.read32(0xD000_0010, 0);
     println!("  after  write32 0xA5: SIO_GPIO_OUT = 0x{:08X}", after_word);
-    emu.bus.write32(0xD000_0010, before);
+    emu.bus.write32(0xD000_0010, before, 0);
 
     // Run FIRST with pure CS1-low stim (no gap drives) — see if OEN
     // gets set once and held.
@@ -238,8 +238,8 @@ fn main() -> ExitCode {
     emu.bus.gpio_external_in = cs1_low_stim;
     for t in 0..200u32 {
         emu.run(1);
-        let oe = emu.bus.read32(0xD000_0030);
-        let out = emu.bus.read32(0xD000_0010);
+        let oe = emu.bus.read32(0xD000_0030, 0);
+        let out = emu.bus.read32(0xD000_0010, 0);
         let pc = emu.core(0).regs.pc();
         // Print every tick for the first 40, then every 10 afterwards.
         if t < 40 || (t % 10) == 0 {
@@ -279,8 +279,8 @@ fn main() -> ExitCode {
         let initial_r0 = emu.core(0).regs.r[0];
         for c in 0..200u32 {
             emu.run(1);
-            let oe = emu.bus.read32(0xD000_0030); // CORRECTED — was reading GPIO_OUT_CLR
-            let out = emu.bus.read32(0xD000_0010);
+            let oe = emu.bus.read32(0xD000_0030, 0); // CORRECTED — was reading GPIO_OUT_CLR
+            let out = emu.bus.read32(0xD000_0010, 0);
             let oe_data = ((oe >> 16) & 0xFF) as u8;
             let out_data = ((out >> 16) & 0xFF) as u8;
             let r0 = emu.core(0).regs.r[0];
@@ -298,8 +298,8 @@ fn main() -> ExitCode {
                 stable_ticks = 0;
             }
         }
-        let oe_final = emu.bus.read32(0xD000_0030);
-        let out_final = emu.bus.read32(0xD000_0010);
+        let oe_final = emu.bus.read32(0xD000_0030, 0);
+        let out_final = emu.bus.read32(0xD000_0010, 0);
         let gpio_in_final = emu.bus.gpio_in;
         let r0_final = emu.core(0).regs.r[0];
         let r1_final = emu.core(0).regs.r[1];
@@ -350,8 +350,8 @@ fn main() -> ExitCode {
 
     // Final snapshot: GPIO_IN/OUT/OEN
     let gpio_in = emu.bus.gpio_in;
-    let gpio_out = emu.bus.read32(0xD000_0010);
-    let gpio_oe = emu.bus.read32(0xD000_0020);
+    let gpio_out = emu.bus.read32(0xD000_0010, 0);
+    let gpio_oe = emu.bus.read32(0xD000_0020, 0);
     println!();
     println!(
         "Final GPIO snapshot: gpio_in=0x{:08X} SIO_OUT=0x{:08X} SIO_OE=0x{:08X}",
