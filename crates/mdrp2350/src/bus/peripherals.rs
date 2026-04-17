@@ -262,49 +262,90 @@ impl Bus {
     //
     // Both PLLs share the same register layout: CS (0x000), PWR (0x004),
     // FBDIV_INT (0x008), PRIM (0x00C). CS[31] (LOCK) is derived from
-    // register image + `pll_*_lock_at_cycle` + `master_cycle` on each read;
-    // writes consult `pll_should_arm_lock` to rearm / drop the arm per
-    // HLD §4. See `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md`.
-    pub(crate) fn pll_sys_read(&self, offset: u32) -> u32 {
+    // register image + `pll_*_lock_at_cycle` + caller-supplied
+    // `master_cycle` on each read; writes consult `pll_should_arm_lock`
+    // to rearm / drop the arm per HLD §4. See
+    // `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md`.
+    //
+    // Phase 3 Stage 4 (LLD V7 §12): the master-cycle snapshot is now a
+    // caller-provided parameter. Single-threaded Bus callers pass
+    // `self.master_cycle`; the future WorkerBus caller snapshots
+    // `SharedState.master_cycle` lock-free with `load(Acquire)` before
+    // calling — the helper then takes the peripherals.clocks lock
+    // without serializing on the coordinator's `fetch_add`.
+    pub(crate) fn pll_sys_read_at(&self, offset: u32, master_cycle: u64) -> u32 {
         pll_read_from(
             &self.pll_sys_regs,
             offset,
             self.pll_sys_lock_at_cycle,
-            self.master_cycle,
+            master_cycle,
         )
     }
 
-    pub(crate) fn pll_sys_write(&mut self, offset: u32, val: u32, alias: u32) {
+    /// Convenience wrapper: single-threaded Bus read that supplies its
+    /// own `self.master_cycle` snapshot. Preserves the legacy call
+    /// shape for `bus/mod.rs` dispatch.
+    pub(crate) fn pll_sys_read(&self, offset: u32) -> u32 {
+        self.pll_sys_read_at(offset, self.master_cycle)
+    }
+
+    pub(crate) fn pll_sys_write_at(
+        &mut self,
+        offset: u32,
+        val: u32,
+        alias: u32,
+        master_cycle: u64,
+    ) {
         let old_regs = self.pll_sys_regs;
         pll_write_into(&mut self.pll_sys_regs, offset, val, alias);
         self.pll_sys_lock_at_cycle = pll_should_arm_lock(
             &old_regs,
             &self.pll_sys_regs,
             self.pll_sys_lock_at_cycle,
-            self.master_cycle,
+            master_cycle,
         );
         self.recompute_clock_tree();
     }
 
-    pub(crate) fn pll_usb_read(&self, offset: u32) -> u32 {
+    pub(crate) fn pll_sys_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let master_cycle = self.master_cycle;
+        self.pll_sys_write_at(offset, val, alias, master_cycle);
+    }
+
+    pub(crate) fn pll_usb_read_at(&self, offset: u32, master_cycle: u64) -> u32 {
         pll_read_from(
             &self.pll_usb_regs,
             offset,
             self.pll_usb_lock_at_cycle,
-            self.master_cycle,
+            master_cycle,
         )
     }
 
-    pub(crate) fn pll_usb_write(&mut self, offset: u32, val: u32, alias: u32) {
+    pub(crate) fn pll_usb_read(&self, offset: u32) -> u32 {
+        self.pll_usb_read_at(offset, self.master_cycle)
+    }
+
+    pub(crate) fn pll_usb_write_at(
+        &mut self,
+        offset: u32,
+        val: u32,
+        alias: u32,
+        master_cycle: u64,
+    ) {
         let old_regs = self.pll_usb_regs;
         pll_write_into(&mut self.pll_usb_regs, offset, val, alias);
         self.pll_usb_lock_at_cycle = pll_should_arm_lock(
             &old_regs,
             &self.pll_usb_regs,
             self.pll_usb_lock_at_cycle,
-            self.master_cycle,
+            master_cycle,
         );
         self.recompute_clock_tree();
+    }
+
+    pub(crate) fn pll_usb_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let master_cycle = self.master_cycle;
+        self.pll_usb_write_at(offset, val, alias, master_cycle);
     }
 
     // --- QMI (0x400D0000) --- QSPI memory interface

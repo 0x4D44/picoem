@@ -14,6 +14,8 @@ pub mod spsc;
 pub mod barrier;
 pub mod sio;
 pub mod pio;
+pub mod peripherals;
+pub mod shared;
 
 pub use atomics::CoreAtomics;
 pub use memory::SharedMemory;
@@ -23,3 +25,7 @@ pub use spsc::SpscQueue;
 pub use barrier::{SpinBarrier, BarrierResult};
 pub use sio::ThreadedSio;
 pub use pio::{ThreadedPio, PioCommand};
+pub use peripherals::{
+    ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
+};
+pub use shared::SharedState;
