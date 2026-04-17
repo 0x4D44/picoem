@@ -36,6 +36,12 @@ pub const DMA_WRITE_CYCLES: u8 = 4;
 /// constant).
 const PIO_BASES: [u32; 3] = [0x5020_0000, 0x5030_0000, 0x5040_0000];
 
+/// Global `CHAN_ABORT` register offset inside the DMA aperture.
+const DMA_CHAN_ABORT: u32 = 0x444;
+
+/// Abort mask: CH0 + CH1 — the two channels the glue pump owns.
+const GLUE_DMA_CHAN_MASK: u32 = (1 << 0) | (1 << 1);
+
 /// Rx FIFO 0 offset inside a PIO block. Reading it **pops**.
 const PIO_RXF0: u32 = 0x020;
 /// Tx FIFO 0 offset — writes push into SM0's TX FIFO. Only used by
@@ -152,10 +158,20 @@ impl GlueDma {
     /// trigger is treated as fresh, the channel config is latched, and
     /// the pump starts.
     ///
-    /// `bus` is accepted for API symmetry with the pre-fix version (and
-    /// in case future logic needs to sample additional registers at
-    /// prime time); the current implementation doesn't read from it.
-    pub fn prime_after_sync(&mut self, _bus: &mut Bus) {
+    /// Also issue `CHAN_ABORT` for CH0/CH1 here. The production oracle
+    /// driver calls `emu.run(1)` **before** `glue.tick(bus)`, so on the
+    /// first post-sync step the emulator's `tick_dma` would otherwise
+    /// see BUSY still latched from firmware's pre-sync CTRL_TRIG write
+    /// and sneak one real-DMA transfer through before the per-`tick`
+    /// abort at the head of [`Self::tick`] lands. Aborting at prime
+    /// time closes that one-cycle window.
+    pub fn prime_after_sync(&mut self, bus: &mut Bus) {
+        // Clear BUSY on CH0/CH1 so the emulator's real DMA engine
+        // cannot progress either channel on the first `emu.run(1)` that
+        // follows this prime. See `tick` for the per-cycle abort that
+        // keeps them inert thereafter.
+        bus.write32(DMA_BASE + DMA_CHAN_ABORT, GLUE_DMA_CHAN_MASK);
+
         for n in 0..2u32 {
             // Ignore the live trigger — reset to zero so `poll_triggers`
             // treats the pre-programmed value as a fresh arm on the
@@ -171,6 +187,16 @@ impl GlueDma {
     /// that step so we see the firmware-produced side effects.
     pub fn tick(&mut self, bus: &mut Bus) {
         self.cycle += 1;
+
+        // Keep the emulator's own DMA peripheral inert on CH0/CH1.  The
+        // glue pump is the sole consumer of the PIO1.RX0 -> SRAM ->
+        // PIO2.TX path; under the V6 CTRL layout
+        // (`mdrp2350::dma` CTRL bit-field map) the real DMA now decodes
+        // the firmware's `TREQ_SEL = DREQ_PIO1_RX0` correctly and
+        // would race the pump for RX words otherwise.  Aborting each
+        // tick is a per-channel BUSY clear — firmware's written CTRL
+        // values remain visible on readback.
+        bus.write32(DMA_BASE + DMA_CHAN_ABORT, GLUE_DMA_CHAN_MASK);
 
         // 1. Poll for fresh CTRL_TRIG writes on each channel.
         self.poll_triggers(bus);
@@ -329,6 +355,41 @@ fn decode_pio_tx_addr(addr: u32) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use mdrp2350::{Config, EmulatorBuilder, Emulator};
+
+    // ----- RP2350 V6 CTRL field positions (mirrors mdrp2350::dma). -----
+    // Pinned here so a future mdrp2350 DMA refactor that shifts fields
+    // fails these tests loudly instead of silently reintroducing the
+    // regression where the real DMA peripheral competes with the glue
+    // pump for PIO1.RX0 DREQs.  See
+    // `crates/mdrp2350/src/dma.rs` CTRL bit-field map.
+    const V6_EN: u32 = 1 << 0;
+    const V6_DATA_SIZE_SHIFT: u32 = 2;
+    const V6_INCR_READ: u32 = 1 << 4;
+    const V6_INCR_WRITE: u32 = 1 << 6;
+    const V6_CHAIN_TO_SHIFT: u32 = 13;
+    const V6_TREQ_SEL_SHIFT: u32 = 17;
+    const V6_BUSY: u32 = 1 << 26;
+
+    /// RP2350 V6 CTRL builder.  Keeps the test independent of mdrp2350's
+    /// internal helper (which is not `pub`) and pins the V6 positions so
+    /// the test fails if dma.rs shifts fields again.
+    fn v6_ctrl(en: bool, data_size: u32, incr_r: bool, incr_w: bool, treq: u8, chain: u32) -> u32 {
+        let mut v = 0u32;
+        if en { v |= V6_EN; }
+        v |= (data_size & 0x3) << V6_DATA_SIZE_SHIFT;
+        if incr_r { v |= V6_INCR_READ; }
+        if incr_w { v |= V6_INCR_WRITE; }
+        v |= (treq as u32 & 0x3F) << V6_TREQ_SEL_SHIFT;
+        v |= (chain & 0xF) << V6_CHAIN_TO_SHIFT;
+        v
+    }
+
+    /// Release the real DMA peripheral from RESETS so `Bus::tick_dma`
+    /// actually advances it.  Mirrors the sequence `mdrp2350::dma`'s own
+    /// test helper uses (RESETS CLR alias at offset 0x3000, bit 2).
+    fn release_dma(bus: &mut Bus) {
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << 2);
+    }
 
     /// Write the CTRL_TRIG helper that also programs the three
     /// upstream registers in the order firmware does. The values are
@@ -614,5 +675,84 @@ mod tests {
              SM0.",
             fstat
         );
+    }
+
+    /// V6 bit positions regression: once the mdrp2350 DMA CTRL layout
+    /// was corrected (INCR_READ_REV [5] + INCR_WRITE_REV [7] shifting
+    /// RING_SIZE/RING_SEL/CHAIN_TO/TREQ_SEL/IRQ_QUIET up by 2), the real
+    /// DMA peripheral began to decode firmware CTRL words correctly and
+    /// raced the glue pump for PIO1.RX0 DREQs.  The pump must be the
+    /// sole consumer of that path; `tick` keeps the real DMA inert by
+    /// aborting CH0/CH1 each cycle.
+    ///
+    /// The test programs CH0 with V6-correct CTRL (EN=1, DATA_SIZE=2,
+    /// TREQ_SEL=FORCE, INCR_READ, INCR_WRITE) and a large `trans_count`,
+    /// primes the glue pump, then drives `tick` 32 cycles.  The real
+    /// DMA must not progress the channel (count unchanged, BUSY clear).
+    /// With the abort removed, FORCE TREQ would empty `trans_count`
+    /// cycle-by-cycle and the test fails loudly.
+    #[test]
+    fn glue_dma_suppresses_real_dma_with_v6_treq_sel_force() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build();
+        let mut dma = GlueDma::new();
+        release_dma(&mut emu.bus);
+
+        let src: u32 = 0x2000_1000;
+        let dst: u32 = 0x2000_2000;
+        for i in 0..4u32 {
+            emu.bus.write32(src + i * 4, 0xDEAD_0000 | i);
+        }
+
+        // V6 CTRL: EN, DATA_SIZE=2 (word), INCR_READ, INCR_WRITE,
+        // TREQ_SEL=63 (FORCE -> always asserted), CHAIN_TO=0 (self).
+        let ctrl = v6_ctrl(true, 2, true, true, 63, 0);
+        // Pin bit positions — if dma.rs ever shifts fields again this
+        // constant catches it before any runtime divergence.
+        assert_eq!(
+            ctrl, 0x007E_0059,
+            "V6 CTRL bit positions drifted: expected 0x007E_0059 for \
+             EN|DSIZE=2|INCR_R|INCR_W|TREQ=63|CHAIN=0"
+        );
+        const COUNT: u32 = 128;
+        program_channel(&mut emu.bus, 0, src, dst, COUNT, ctrl);
+
+        // Prime AFTER firmware has programmed the channel — mirrors the
+        // real oracle flow.  `prime_after_sync` issues the initial
+        // CHAN_ABORT so that the first `emu.run(1)` below cannot clock
+        // the real DMA while BUSY is still latched from the pre-prime
+        // CTRL_TRIG write.
+        dma.prime_after_sync(&mut emu.bus);
+
+        // Alternate `emu.run(1)` + `dma.tick(...)` — matches the OneROM
+        // oracle's per-cycle driver exactly.  The prime-time abort
+        // covers the first step; the per-tick abort at the head of
+        // `tick` keeps the real DMA BUSY=0 for every subsequent step.
+        for _ in 0..32 {
+            emu.run(1);
+            dma.tick(&mut emu.bus);
+        }
+
+        let tcount = emu.bus.read32(DMA_BASE + 0x08);
+        let raddr = emu.bus.read32(DMA_BASE + 0x00);
+        let waddr = emu.bus.read32(DMA_BASE + 0x04);
+        let ctrl_rb = emu.bus.read32(DMA_BASE + 0x0C);
+        assert_eq!(
+            tcount, COUNT,
+            "real DMA consumed {} transfers across 32 ticks; pump failed \
+             to suppress it",
+            COUNT.saturating_sub(tcount)
+        );
+        assert_eq!(raddr, src, "real DMA advanced read_addr");
+        assert_eq!(waddr, dst, "real DMA advanced write_addr");
+        assert_eq!(
+            ctrl_rb & V6_BUSY,
+            0,
+            "real DMA CH0 still BUSY (0x{:08X}); abort not applied",
+            ctrl_rb
+        );
+        // Destination must not have been written by the real DMA.
+        assert_eq!(emu.bus.read32(dst), 0, "real DMA wrote to dst");
     }
 }
