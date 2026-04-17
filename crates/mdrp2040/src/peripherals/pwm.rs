@@ -35,7 +35,9 @@
 //! | `0x08` | `CHn_CTR` | R/W  | Counter. Writes load the counter.    |
 //! | `0x0C` | `CHn_CC`  | R/W  | Channel A (low16) + B (high16) cmp.  |
 //! | `0x10` | `CHn_TOP` | R/W  | Wrap value.                          |
-//! | `0xA0` | `EN`      | R/W  | 8-bit mask; 1 = slice runs.          |
+//! | `0xA0` | `EN`      | R/W  | **Alias** of the eight per-slice     |
+//! |        |           |      | `CHn_CSR.EN` bits — same physical    |
+//! |        |           |      | storage (datasheet §4.5.3.18).       |
 //! | `0xA4` | `INTR`    | W1C  | Per-slice wrap latch.                |
 //! | `0xA8` | `INTE`    | R/W  | Interrupt enable per slice.          |
 //! | `0xAC` | `INTF`    | R/W  | Interrupt force per slice.           |
@@ -134,7 +136,6 @@ impl Default for PwmSlice {
 /// PWM register storage.
 pub struct PwmRegs {
     slices: [PwmSlice; PWM_SLICE_COUNT],
-    en: u8,
     intr: u8,
     inte: u8,
     intf: u8,
@@ -147,7 +148,6 @@ impl PwmRegs {
     pub fn new(nvic_irq: u32) -> Self {
         Self {
             slices: [PwmSlice::new(); PWM_SLICE_COUNT],
-            en: 0,
             intr: 0,
             inte: 0,
             intf: 0,
@@ -160,13 +160,26 @@ impl PwmRegs {
         *self = Self::new(irq);
     }
 
+    /// Synthetic view of the `PWM_EN` register at offset 0xA0. Each bit
+    /// `i` is `CHi_CSR.EN` — the two registers share physical storage
+    /// per datasheet §4.5.3.18. Exposed for tests and internal use.
+    fn pwm_en_view(&self) -> u8 {
+        let mut v: u8 = 0;
+        for (i, s) in self.slices.iter().enumerate() {
+            if (s.csr & CSR_EN) != 0 {
+                v |= 1u8 << i;
+            }
+        }
+        v
+    }
+
     /// True iff no slice is enabled and no wrap-latch is pending.
     /// Phase 3 simplification per HLD V7 §5.3: "idle iff no slice has
-    /// EN == 1". We additionally require INTR is clear so that a
+    /// CSR.EN == 1". We additionally require INTR is clear so that a
     /// latched wrap from before a global disable still surfaces via
     /// the slow path.
     pub fn is_idle(&self) -> bool {
-        self.en == 0 && self.intr == 0 && (self.intf & self.inte) == 0
+        self.pwm_en_view() == 0 && self.intr == 0 && (self.intf & self.inte) == 0
     }
 
     // --- Offset decoding -----------------------------------------------
@@ -211,7 +224,7 @@ impl PwmRegs {
             };
         }
         match offset {
-            EN => self.en as u32,
+            EN => self.pwm_en_view() as u32,
             INTR => self.intr as u32,
             INTE => self.inte as u32,
             INTF => self.intf as u32,
@@ -262,9 +275,21 @@ impl PwmRegs {
         }
         match offset {
             EN => {
-                let mut stored = self.en as u32;
+                // PWM_EN is an alias of the eight CHn_CSR.EN bits
+                // (datasheet §4.5.3.18) — same physical storage. Fan out
+                // the RMW through the per-slice CSRs so that whichever
+                // register firmware touches, the other view updates in
+                // lock-step.
+                let mut stored = self.pwm_en_view() as u32;
                 apply_alias_rmw(&mut stored, value, alias);
-                self.en = stored as u8;
+                let new_en = stored as u8;
+                for i in 0..PWM_SLICE_COUNT {
+                    if (new_en & (1u8 << i)) != 0 {
+                        self.slices[i].csr |= CSR_EN;
+                    } else {
+                        self.slices[i].csr &= !CSR_EN;
+                    }
+                }
                 self.route_irq(irqs);
             }
             INTR => {
@@ -308,10 +333,10 @@ impl PwmRegs {
             return;
         }
         for slice_idx in 0..PWM_SLICE_COUNT {
-            let globally_enabled = (self.en & (1u8 << slice_idx)) != 0;
             let slice = &mut self.slices[slice_idx];
-            let locally_enabled = (slice.csr & CSR_EN) != 0;
-            if !globally_enabled || !locally_enabled {
+            // PWM_EN and CHn_CSR.EN share physical storage (datasheet
+            // §4.5.3.18), so CSR.EN is the single gate here.
+            if (slice.csr & CSR_EN) == 0 {
                 continue;
             }
             let top = slice.top as u64;
@@ -360,7 +385,7 @@ mod tests {
     #[test]
     fn reset_defaults_all_slices_idle() {
         let p = PwmRegs::new(PWM_IRQ);
-        assert_eq!(p.en, 0);
+        assert_eq!(p.pwm_en_view(), 0);
         assert_eq!(p.intr, 0);
         for s in &p.slices {
             assert_eq!(s.csr, 0);
@@ -479,24 +504,40 @@ mod tests {
     fn disabled_slice_does_not_advance() {
         let mut p = PwmRegs::new(PWM_IRQ);
         let mut irqs = 0u32;
-        // CSR enable but EN bit clear → slice doesn't run.
+        // A slice whose CSR.EN is 0 must not run. PWM_EN is an alias of
+        // CSR.EN, so writing 0 to PWM_EN after enabling via CSR should
+        // also clear the slice.
         p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 100, 0, &mut irqs);
-        p.write32(EN, 0, 0, &mut irqs);
+        p.write32(EN, 0, 0, &mut irqs); // clears CSR.EN via the alias
+        assert_eq!(p.slices[0].csr & CSR_EN, 0,
+            "writing 0 to PWM_EN must clear CSR.EN on every slice");
         p.tick(500, &default_tree(), &mut irqs);
         assert_eq!(p.slices[0].ctr, 0);
         assert_eq!(p.intr, 0);
     }
 
     #[test]
-    fn globally_enabled_without_csr_en_does_not_advance() {
+    fn pwm_en_clearing_a_bit_clears_matching_csr_en() {
+        // The old `globally_enabled_without_csr_en_does_not_advance`
+        // test predates datasheet §4.5.3.18 — it asserted that PWM_EN
+        // and CSR.EN were independent gates. Under the alias model
+        // they aren't: writing PWM_EN with a bit clear clears the
+        // matching slice's CSR.EN. Confirm that + the slice then halts.
         let mut p = PwmRegs::new(PWM_IRQ);
         let mut irqs = 0u32;
-        // EN bit set but CSR.EN clear → slice doesn't run.
-        p.write32(EN, 1, 0, &mut irqs);
+        // Enable slice 0 via CSR.
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 100, 0, &mut irqs);
+        p.tick(10, &default_tree(), &mut irqs);
+        assert_eq!(p.slices[0].ctr, 10);
+        // Clear slice 0 via a PWM_EN BITCLR. CSR.EN must mirror.
+        p.write32(EN, 0x01, 3, &mut irqs);
+        assert_eq!(p.slices[0].csr & CSR_EN, 0);
+        let ctr_after_clear = p.slices[0].ctr;
         p.tick(500, &default_tree(), &mut irqs);
-        assert_eq!(p.slices[0].ctr, 0);
+        assert_eq!(p.slices[0].ctr, ctr_after_clear,
+            "slice halts once PWM_EN clears its bit");
     }
 
     // --- INTR W1C -------------------------------------------------------
@@ -579,7 +620,7 @@ mod tests {
         let mut irqs = 0u32;
         p.write32(EN, 0x03, 0, &mut irqs);
         p.write32(EN, 0x0C, 2, &mut irqs); // BITSET
-        assert_eq!(p.en, 0x0F);
+        assert_eq!(p.pwm_en_view(), 0x0F);
     }
 
     #[test]
@@ -588,7 +629,7 @@ mod tests {
         let mut irqs = 0u32;
         p.write32(EN, 0xFF, 0, &mut irqs);
         p.write32(EN, 0xF0, 3, &mut irqs); // BITCLR
-        assert_eq!(p.en, 0x0F);
+        assert_eq!(p.pwm_en_view(), 0x0F);
     }
 
     #[test]
@@ -599,6 +640,33 @@ mod tests {
         p.write32(base + SLICE_CSR, CSR_A_INV, 0, &mut irqs);
         p.write32(base + SLICE_CSR, CSR_B_INV, 2, &mut irqs); // BITSET
         assert_eq!(p.slices[4].csr & (CSR_A_INV | CSR_B_INV), CSR_A_INV | CSR_B_INV);
+    }
+
+    // --- PWM_EN is an alias of the eight CSR.EN bits (datasheet §4.5.3.18) ---
+
+    #[test]
+    fn csr_en_alone_advances_slice_and_mirrors_into_pwm_en() {
+        // Pico-SDK's `pwm_set_enabled()` writes only CSR.EN — not PWM_EN at
+        // 0xA0. Per RP2040 §4.5.3.18 PWM_EN is a *view* of the eight per-
+        // slice CSR.EN bits; writing CSR.EN[4] must therefore be observable
+        // as bit 4 of PWM_EN, and slice 4 must run without any write to
+        // 0xA0.
+        let mut p = PwmRegs::new(PWM_IRQ);
+        let mut irqs = 0u32;
+        let base = 4 * SLICE_STRIDE;
+        // Program slice 4 TOP then enable via CSR only.
+        p.write32(base + SLICE_TOP, 100, 0, &mut irqs);
+        p.write32(base + SLICE_CSR, CSR_EN, 0, &mut irqs);
+        p.tick(50, &default_tree(), &mut irqs);
+        assert_eq!(
+            p.slices[4].ctr, 50,
+            "slice 4 CTR must advance with only CSR.EN set"
+        );
+        assert_eq!(
+            p.read32(EN) & 0xFF,
+            1u32 << 4,
+            "PWM_EN must read back as the OR of the eight CSR.EN bits"
+        );
     }
 
     #[test]
