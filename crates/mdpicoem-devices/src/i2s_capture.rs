@@ -206,6 +206,24 @@ impl I2sCapture {
         self.bit_count += 1;
     }
 
+    /// Override the `sys_clk_hz` used by [`Self::inferred_sample_rate_hz`].
+    ///
+    /// Edge timestamps are stored in cycle-domain, so the sample-rate
+    /// inference is simply `sys_clk_hz * (edges-1) / (2 * (last-first))`.
+    /// When firmware reprograms PLL mid-capture (e.g. PicoGUS goes from
+    /// 125 MHz → 370 MHz early in boot, well before any I2S edges), the
+    /// harness should call this with the post-reprogram clock before
+    /// reporting, otherwise the inferred rate is wrong by the clock
+    /// ratio.
+    pub fn set_sys_clk_hz(&mut self, sys_clk_hz: u32) {
+        self.sys_clk_hz = sys_clk_hz;
+    }
+
+    /// Currently configured `sys_clk_hz` (for diagnostics / tests).
+    pub fn sys_clk_hz(&self) -> u32 {
+        self.sys_clk_hz
+    }
+
     /// The captured stereo frames, in emit order.
     pub fn frames(&self) -> &[(i16, i16)] {
         &self.frames

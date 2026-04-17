@@ -869,6 +869,18 @@ verified. When Stage 6 acceptance runs end-to-end, record the
 specific player used + its version in `wrk_journals/` so the trace
 is reproducible.
 
+### `Emulator::reset()` clobbers the clock tree to ROSC (~6.5 MHz)
+
+`mdrp2040::Emulator::reset()` resets the clock tree to power-on-ROSC
+state, discarding whatever `Config.sys_clk_hz` was seeded with at
+construction. Harness tests that mix `reset()` with cycle-accurate
+timing must follow up with `bus.seed_sys_clk_hz(N)` (see
+`crates/mdpicoem-harness/src/bin/picogus_diff_rp2040.rs` tests
+`replay_advances_emulator_to_target_cycles` / `replay_end_to_end_post_roll_reports_cycles`).
+Consider an `Emulator::reset_at(sys_clk_hz)` helper to avoid the
+copy-paste re-seed pattern, and verify the ROSC-on-warm-reset
+behaviour matches silicon (HLD follow-up).
+
 ## Phase 1 known limitations (mdrp2040 IRQ / TIMER)
 
 Closed-out from Phase 1 Wave 2 (`HLD V7 §5.2`/`§5.3`) code review.

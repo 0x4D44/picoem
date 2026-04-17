@@ -121,10 +121,15 @@ const WRITE_DATA_HOLD: u32 = 25;
 /// Cycles of idle between back-to-back writes.
 const WRITE_IDLE_CYCLES: u32 = 12;
 
-/// Default system clock for cycle math. PicoGUS firmware overclocks to
-/// 366 MHz but our idealised waveform only requires consistent ns→cycle
-/// conversion. 125 MHz matches the HLD's arithmetic ("37 cycles ≈ 300 ns
-/// at 125 MHz sysclk") and keeps the math human-readable.
+/// Initial `clk_sys` seed. Used only at emulator-construction time —
+/// `Config.sys_clk_hz` seeds the clock tree and the `I2sCapture`
+/// divisor at `CapturingSink::new`. Post-replay, the live `clk_sys` is
+/// re-read from `emu.bus.sys_clk_hz()` and pushed into `I2sCapture` via
+/// `set_sys_clk_hz` so sample-rate inference reflects any PLL
+/// reprogramming firmware did during boot (e.g. PicoGUS 125→370 MHz).
+/// The `replay()` loop does not use this constant — it polls
+/// `IsaSink::sys_clk_hz()` per chunk instead, so ns↔cycle cadence
+/// tracks firmware reprogramming live.
 const DEFAULT_SYS_CLK_HZ: u32 = 125_000_000;
 
 // ----------------------------------------------------------------------------
@@ -299,6 +304,87 @@ pub fn ns_to_cycles(ns: u64, sys_clk_hz: u32) -> u64 {
     cycles as u64
 }
 
+/// Convert `cycles` to ns at `sys_clk_hz`. Used by the replay loop to
+/// accumulate simulated wall-clock time across variable-rate sysclk
+/// segments (e.g. a PicoGUS trace crossing the 125→370 MHz boundary).
+#[inline]
+pub fn cycles_to_ns(cycles: u64, sys_clk_hz: u32) -> u64 {
+    if sys_clk_hz == 0 {
+        return 0;
+    }
+    let ns = (cycles as u128) * 1_000_000_000u128 / (sys_clk_hz as u128);
+    ns as u64
+}
+
+/// Fast-forward `sink` by stepping one bounded chunk at a time until
+/// the simulated wall-clock elapsed (carried in `sim_ns`) reaches
+/// `target_ns`. Returns the number of stall events observed (0 or 1 —
+/// at most one per call, since we bail on the first refusal to advance
+/// like the pre-fix code did).
+///
+/// This is the PLL-aware replacement for the old
+/// `target = ns_to_cycles(ev.ns, STATIC_HZ); while sink.cycles() < target`
+/// loop. By re-querying `sink.sys_clk_hz()` per chunk and accumulating
+/// ns from actual cycles stepped at that clock, the loop stays accurate
+/// across firmware PLL reprogramming (e.g. PicoGUS 125→370 MHz).
+///
+/// `sim_ns` is an in/out running total of simulated wall-clock ns — the
+/// caller carries it across events so elapsed time compounds correctly.
+///
+/// `warn_fn` is invoked at most once (by contract with the caller's
+/// dedup) if the sink refuses to advance.
+fn advance_to_sim_ns<S: IsaSink>(
+    sink: &mut S,
+    sim_ns: &mut u64,
+    target_ns: u64,
+    mut warn_fn: impl FnMut(u64),
+) -> usize {
+    let mut stalls = 0usize;
+    while *sim_ns < target_ns {
+        let remaining_ns = target_ns - *sim_ns;
+        let hz = sink.sys_clk_hz();
+        // Guard against a transient `sys_clk_hz == 0` — firmware could
+        // park CLK_SYS briefly while reprogramming PLL. In that window
+        // `cycles_needed` would pin to 1 and `cycles_to_ns(stepped, 0)`
+        // returns 0 (matches the guard in `cycles_to_ns`), so `sim_ns`
+        // would never advance — infinite loop until the sink stalls.
+        // Treat zero as "no progress this chunk": step the sink a small
+        // amount so firmware can reprogram the clock back above zero,
+        // then bail so the caller re-polls on the next event.
+        if hz == 0 {
+            let before = sink.cycles();
+            sink.step(1);
+            if sink.cycles() == before {
+                // Sink truly refused to advance — standard stall path.
+                warn_fn(before);
+                stalls += 1;
+            }
+            break;
+        }
+        // Cycles needed to cover `remaining_ns` at the *current* clock.
+        // Round up so we never fall short and fire the event a fraction
+        // too early. Cap per-call chunk at 64 cycles so a mid-chunk PLL
+        // reprogram is observed promptly.
+        let cycles_needed = (remaining_ns as u128 * hz as u128)
+            .div_ceil(1_000_000_000u128)
+            .max(1) as u64;
+        let chunk = cycles_needed.clamp(1, 64) as u32;
+        let before = sink.cycles();
+        sink.step(chunk);
+        let stepped = sink.cycles().wrapping_sub(before);
+        if stepped == 0 {
+            warn_fn(before);
+            stalls += 1;
+            break;
+        }
+        // Credit the ns actually earned at the clock live during this
+        // chunk. If firmware reprogrammed the PLL mid-chunk, this will
+        // be slightly off for this chunk only (bounded by 64 cycles).
+        *sim_ns = sim_ns.saturating_add(cycles_to_ns(stepped, hz));
+    }
+    stalls
+}
+
 // ----------------------------------------------------------------------------
 // GPIO injection
 // ----------------------------------------------------------------------------
@@ -325,6 +411,25 @@ pub trait IsaSink {
     fn pad_state(&self) -> u32 {
         0
     }
+
+    /// Current `clk_sys` frequency in Hz as observed by the sink *right
+    /// now* (not a snapshot from harness init).
+    ///
+    /// Why this matters: PicoGUS firmware reprograms PLL_SYS from
+    /// 125 MHz → 370 MHz a few ms into boot. The emulator's `ClockTree`
+    /// tracks that reprogram correctly, but if the harness keeps using
+    /// the 125 MHz constant for ns↔cycle conversions, every event
+    /// after the switch fires at the wrong simulated wall-clock time
+    /// (by a factor of 370/125 = 2.96×). The `replay()` fast-forward
+    /// loop polls this per chunk so the ns→cycle cadence tracks the
+    /// firmware's real sysclk across PLL changes.
+    ///
+    /// Default returns 125 MHz — matches the emulator's power-on
+    /// default and keeps mock sinks (which can't observe a clock tree)
+    /// behaving the way the tests expect.
+    fn sys_clk_hz(&self) -> u32 {
+        125_000_000
+    }
 }
 
 impl IsaSink for Emulator {
@@ -344,6 +449,14 @@ impl IsaSink for Emulator {
     #[inline]
     fn pad_state(&self) -> u32 {
         self.bus.gpio_in
+    }
+
+    /// Read the *live* clk_sys from the emulator's `ClockTree`. This
+    /// reflects any PLL / mux reprogramming firmware has done since
+    /// reset — e.g. PicoGUS's 125→370 MHz overclock at ~33M cycles in.
+    #[inline]
+    fn sys_clk_hz(&self) -> u32 {
+        self.bus.sys_clk_hz()
     }
 
     /// Drive the ISA control + address/data bus by populating the Bus's
@@ -445,6 +558,11 @@ impl<S: IsaSink> IsaSink for CapturingSink<S> {
     fn pad_state(&self) -> u32 {
         self.inner.pad_state()
     }
+
+    #[inline]
+    fn sys_clk_hz(&self) -> u32 {
+        self.inner.sys_clk_hz()
+    }
 }
 
 /// One synthetic write cycle: address phase, assert, data phase, deassert.
@@ -528,7 +646,6 @@ pub struct ReplaySummary {
 pub fn replay<S: IsaSink>(
     sink: &mut S,
     events: &[TraceEvent],
-    sys_clk_hz: u32,
     duration_ns: Option<u64>,
     post_roll_ns: Option<u64>,
 ) -> ReplaySummary {
@@ -536,6 +653,13 @@ pub fn replay<S: IsaSink>(
         events_total: events.len(),
         ..Default::default()
     };
+
+    // Running simulated wall-clock in ns. Accumulated from cycles
+    // stepped, using whichever `sys_clk_hz` was live during each chunk
+    // — so the timeline stays aligned with trace timestamps even if
+    // firmware reprograms PLL mid-run (e.g. PicoGUS 125→370 MHz).
+    let mut sim_ns: u64 = 0;
+    let mut stall_warned = summary.stall_events > 0;
 
     for ev in events {
         if let Some(limit) = duration_ns {
@@ -545,33 +669,17 @@ pub fn replay<S: IsaSink>(
             }
         }
 
-        // Step the emulator forward to this event's target cycle.
-        let target = ns_to_cycles(ev.ns, sys_clk_hz);
-        while sink.cycles() < target {
-            let remaining = target - sink.cycles();
-            // Cap per-call step to a reasonable chunk so we don't hand
-            // the emulator absurd `run(n)` values on big gaps — the
-            // emulator's own quantum handling already deals with this
-            // but smaller chunks keep cycle overshoot bounded.
-            let chunk = remaining.clamp(1, 64) as u32;
-            let before = sink.cycles();
-            sink.step(chunk);
-            if sink.cycles() == before {
-                // Sink refused to advance (e.g. emulator locked up with
-                // no firmware loaded, or both cores halted). Bail out of
-                // the fast-forward rather than spin forever — the event
-                // still fires below, just at the stalled cycle count.
-                if summary.stall_events == 0 {
-                    eprintln!(
-                        "warning: emulator stalled at cycle {} \
-                         — subsequent events fire at the stall cycle",
-                        before
-                    );
-                }
-                summary.stall_events += 1;
-                break;
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, ev.ns, |cycle| {
+            if !stall_warned {
+                eprintln!(
+                    "warning: emulator stalled at cycle {} \
+                     — subsequent events fire at the stall cycle",
+                    cycle
+                );
+                stall_warned = true;
             }
-        }
+        });
+        summary.stall_events += stalls;
 
         if ev.kind.is_write() {
             let wide = matches!(ev.kind, TraceKind::Write16);
@@ -586,32 +694,24 @@ pub fn replay<S: IsaSink>(
 
     summary.final_cycles = sink.cycles();
 
-    // Post-roll drain. Step the sink an additional `post_roll_ns` worth
-    // of cycles WITHOUT firing further trace events, so firmware (e.g.
-    // an I2S DMA chain) has wall-time to flush its trailing buffer.
+    // Post-roll drain. Step the sink for an additional `post_roll_ns`
+    // of *simulated* wall-clock time WITHOUT firing further events, so
+    // firmware (e.g. an I2S DMA chain) can flush its trailing buffer.
     if let Some(post_ns) = post_roll_ns {
         if post_ns > 0 {
-            let target_cycles = ns_to_cycles(post_ns, sys_clk_hz);
-            let post_start = sink.cycles();
-            let target = post_start.wrapping_add(target_cycles);
-            while sink.cycles() < target {
-                let remaining = target - sink.cycles();
-                let chunk = remaining.clamp(1, 64) as u32;
-                let before = sink.cycles();
-                sink.step(chunk);
-                if sink.cycles() == before {
-                    // Same stall guard as above — refused to advance.
-                    if summary.stall_events == 0 {
-                        eprintln!(
-                            "warning: emulator stalled at cycle {} during post-roll",
-                            before
-                        );
-                    }
-                    summary.stall_events += 1;
-                    break;
+            let post_start_cycles = sink.cycles();
+            let post_target_ns = sim_ns.saturating_add(post_ns);
+            let stalls = advance_to_sim_ns(sink, &mut sim_ns, post_target_ns, |cycle| {
+                if !stall_warned {
+                    eprintln!(
+                        "warning: emulator stalled at cycle {} during post-roll",
+                        cycle
+                    );
+                    stall_warned = true;
                 }
-            }
-            summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start);
+            });
+            summary.stall_events += stalls;
+            summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start_cycles);
         }
     }
 
@@ -846,7 +946,6 @@ fn decode_push(word: u32) -> (u16, u8) {
 fn replay_with_coverage(
     sink: &mut CapturingSink<Emulator>,
     events: &[TraceEvent],
-    sys_clk_hz: u32,
     duration_ns: Option<u64>,
     post_roll_ns: Option<u64>,
 ) -> (ReplaySummary, CaptureCoverage) {
@@ -855,6 +954,10 @@ fn replay_with_coverage(
         ..Default::default()
     };
     let mut cov = CaptureCoverage::default();
+
+    // Running simulated wall-clock in ns — see `replay()` for rationale.
+    let mut sim_ns: u64 = 0;
+    let mut stall_warned = false;
 
     // Running state for the delta-classifier. `pending` carries the
     // class AND decile of the previous sub-event whose push may still
@@ -894,24 +997,17 @@ fn replay_with_coverage(
             }
         }
 
-        let target = ns_to_cycles(ev.ns, sys_clk_hz);
-        while sink.cycles() < target {
-            let remaining = target - sink.cycles();
-            let chunk = remaining.clamp(1, 64) as u32;
-            let before = sink.cycles();
-            sink.step(chunk);
-            if sink.cycles() == before {
-                if summary.stall_events == 0 {
-                    eprintln!(
-                        "warning: emulator stalled at cycle {} \
-                         — subsequent events fire at the stall cycle",
-                        before
-                    );
-                }
-                summary.stall_events += 1;
-                break;
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, ev.ns, |cycle| {
+            if !stall_warned {
+                eprintln!(
+                    "warning: emulator stalled at cycle {} \
+                     — subsequent events fire at the stall cycle",
+                    cycle
+                );
+                stall_warned = true;
             }
-        }
+        });
+        summary.stall_events += stalls;
 
         if !ev.kind.is_write() {
             summary.reads_skipped += 1;
@@ -983,26 +1079,19 @@ fn replay_with_coverage(
     let autopush_before_post_roll = sink.inner().bus.pio[0].sm[0].autopush_count;
     if let Some(post_ns) = post_roll_ns {
         if post_ns > 0 {
-            let target_cycles = ns_to_cycles(post_ns, sys_clk_hz);
-            let post_start = sink.cycles();
-            let target = post_start.wrapping_add(target_cycles);
-            while sink.cycles() < target {
-                let remaining = target - sink.cycles();
-                let chunk = remaining.clamp(1, 64) as u32;
-                let before = sink.cycles();
-                sink.step(chunk);
-                if sink.cycles() == before {
-                    if summary.stall_events == 0 {
-                        eprintln!(
-                            "warning: emulator stalled at cycle {} during post-roll",
-                            before
-                        );
-                    }
-                    summary.stall_events += 1;
-                    break;
+            let post_start_cycles = sink.cycles();
+            let post_target_ns = sim_ns.saturating_add(post_ns);
+            let stalls = advance_to_sim_ns(sink, &mut sim_ns, post_target_ns, |cycle| {
+                if !stall_warned {
+                    eprintln!(
+                        "warning: emulator stalled at cycle {} during post-roll",
+                        cycle
+                    );
+                    stall_warned = true;
                 }
-            }
-            summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start);
+            });
+            summary.stall_events += stalls;
+            summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start_cycles);
         }
     }
     let autopush_after_post_roll = sink.inner().bus.pio[0].sm[0].autopush_count;
@@ -1322,12 +1411,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (summary, coverage) = replay_with_coverage(
         &mut sink,
         &events,
-        DEFAULT_SYS_CLK_HZ,
         duration_ns,
         Some(post_roll_ns),
     );
     let wall_elapsed = wall_start.elapsed();
-    let (mut emu, capture) = sink.into_parts();
+    let (mut emu, mut capture) = sink.into_parts();
+    // Snapshot the live `clk_sys` for reporting. PicoGUS firmware
+    // reprograms PLL_SYS from 125→370 MHz early in boot; the I2S
+    // capture observes all LRCLK edges in the post-reprogram era, so
+    // inferring their period against the firmware's *current* sysclk
+    // yields the correct sample rate. See the "PicoGUS PLL 370 MHz
+    // Reprogram Diagnosis" note in `wrk_scratch/`.
+    let final_sys_clk_hz = emu.bus.sys_clk_hz();
+    capture.set_sys_clk_hz(final_sys_clk_hz);
     // Core 1 launch check — if `multicore_launch_core1` succeeded, core 1's PC
     // has advanced past its reset state of 0.
     let core1_pc = emu.cores[1].regs.pc();
@@ -2117,8 +2213,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Post-roll:        {} cycles ({:.3} s @ {} Hz)",
         summary.post_roll_cycles,
-        summary.post_roll_cycles as f64 / DEFAULT_SYS_CLK_HZ as f64,
-        DEFAULT_SYS_CLK_HZ
+        summary.post_roll_cycles as f64 / final_sys_clk_hz as f64,
+        final_sys_clk_hz
     );
     println!("Final cycles:     {}", summary.final_cycles + summary.post_roll_cycles);
     println!("Core 1 halted:    {}", core1_halted);
@@ -2582,6 +2678,11 @@ ns,port,value,kind
         rom[8..10].copy_from_slice(&0xe7feu16.to_le_bytes());
         emu.load_image(0x0000_0000, &rom);
         emu.reset();
+        // `reset()` clobbers the clock tree back to ROSC 6.5 MHz.
+        // Re-seed to match the Config so the post-fix PLL-aware replay
+        // loop paces events at 125 MHz (matching the old test's
+        // implicit assumption, now made explicit by the fix).
+        emu.bus.seed_sys_clk_hz(125_000_000);
 
         let events = vec![TraceEvent {
             ns: 1_000_000,
@@ -2590,7 +2691,7 @@ ns,port,value,kind
             kind: TraceKind::Write8,
         }];
 
-        let summary = replay(&mut emu, &events, 125_000_000, None, None);
+        let summary = replay(&mut emu, &events, None, None);
         assert!(
             emu.cycles() >= 125_000,
             "emu cycles {} did not reach 125_000",
@@ -2619,7 +2720,7 @@ ns,port,value,kind
         ];
 
         let mut sink = MockSink::new();
-        let summary = replay(&mut sink, &events, 125_000_000, None, None);
+        let summary = replay(&mut sink, &events, None, None);
         assert_eq!(summary.writes_fired, 1);
         assert_eq!(summary.reads_skipped, 1);
         // MockSink only sees drive_pins during writes; a read emits
@@ -2810,7 +2911,7 @@ ns,port,value,kind
 
         let mut sink = MockSink::new();
         // Cap at 1 s.
-        let summary = replay(&mut sink, &events, 125_000_000, Some(1_000_000_000), None);
+        let summary = replay(&mut sink, &events, Some(1_000_000_000), None);
         assert_eq!(summary.writes_fired, 2);
         assert!(summary.duration_capped);
     }
@@ -2831,7 +2932,6 @@ ns,port,value,kind
         let summary = replay(
             &mut sink,
             &events,
-            125_000_000,
             None,
             Some(1_000_000), // 1 ms
         );
@@ -2865,11 +2965,11 @@ ns,port,value,kind
         }];
 
         let mut sink_zero = MockSink::new();
-        let summary_zero = replay(&mut sink_zero, &events, 125_000_000, None, Some(0));
+        let summary_zero = replay(&mut sink_zero, &events, None, Some(0));
         assert_eq!(summary_zero.post_roll_cycles, 0);
 
         let mut sink_none = MockSink::new();
-        let summary_none = replay(&mut sink_none, &events, 125_000_000, None, None);
+        let summary_none = replay(&mut sink_none, &events, None, None);
         assert_eq!(summary_none.post_roll_cycles, 0);
         assert_eq!(sink_zero.cycles(), sink_none.cycles());
     }
@@ -2916,7 +3016,7 @@ ns,port,value,kind
             },
         ];
         let mut sink = StalledSink { cycles: 0 };
-        let summary = replay(&mut sink, &events, 125_000_000, None, None);
+        let summary = replay(&mut sink, &events, None, None);
         // Each event needed a fast-forward, each stalled — so 3 stalls.
         assert_eq!(summary.stall_events, 3);
         // Writes still fired even though the sink stalled.
@@ -2942,6 +3042,9 @@ ns,port,value,kind
         rom[8..10].copy_from_slice(&0xe7feu16.to_le_bytes());
         emu.load_image(0x0000_0000, &rom);
         emu.reset();
+        // `reset()` clobbers clock tree to ROSC (6.5 MHz); re-seed to
+        // 125 MHz so 1 ms of post-roll = 125_000 cycles.
+        emu.bus.seed_sys_clk_hz(125_000_000);
 
         let events = vec![TraceEvent {
             ns: 1_000_000,
@@ -2953,7 +3056,6 @@ ns,port,value,kind
         let summary = replay(
             &mut emu,
             &events,
-            125_000_000,
             None,
             Some(1_000_000), // 1 ms post-roll
         );
@@ -3737,5 +3839,193 @@ ns,port,value,kind
         let s = disasm_pio_instr(0xc000);
         assert!(s.contains("IRQ"), "got: {s}");
         assert!(s.contains("SET"), "got: {s}");
+    }
+
+    // ------------------------------------------------------------------
+    // Dynamic sys_clk_hz — PLL-reprogram harness time-base fix.
+    //
+    // Regression guard for the bug where the harness used a static
+    // 125 MHz constant for ns↔cycle conversions throughout the replay,
+    // so events fired after firmware's 125→370 MHz PLL switch landed
+    // at the wrong simulated cycle (factor 370/125 = 2.96× off).
+    // See `wrk_scratch/picogus-pll-diagnosis.md`.
+    // ------------------------------------------------------------------
+
+    /// A mock sink with a mutable `sys_clk_hz` so tests can simulate a
+    /// mid-run PLL reprogram. Steps advance `cycles` by the requested
+    /// count; the reported clock can be flipped at any time.
+    struct VariableClockSink {
+        cycles: u64,
+        hz: u32,
+        /// Cycle at which the reported clock flips to `hz_after`.
+        flip_cycle: u64,
+        hz_after: u32,
+    }
+
+    impl VariableClockSink {
+        fn new(initial_hz: u32, flip_cycle: u64, final_hz: u32) -> Self {
+            Self {
+                cycles: 0,
+                hz: initial_hz,
+                flip_cycle,
+                hz_after: final_hz,
+            }
+        }
+    }
+
+    impl IsaSink for VariableClockSink {
+        fn step(&mut self, cycles: u32) {
+            self.cycles = self.cycles.wrapping_add(cycles as u64);
+        }
+        fn cycles(&self) -> u64 {
+            self.cycles
+        }
+        fn drive_pins(&mut self, _iow_low: bool, _ior_low: bool, _ad_bus: u16) {}
+        fn sys_clk_hz(&self) -> u32 {
+            if self.cycles >= self.flip_cycle {
+                self.hz_after
+            } else {
+                self.hz
+            }
+        }
+    }
+
+    #[test]
+    fn replay_adjusts_ns_to_cycles_across_pll_reprogram() {
+        // Scenario: sink starts at 125 MHz, flips to 370 MHz when
+        // sink.cycles reaches 1_000_000 (= 8 ms of simulated wall
+        // time). Two events:
+        //   ev[0].ns =  1_000_000 ns (1 ms) — fires purely in the
+        //               125 MHz era at ~125_000 cycles.
+        //   ev[1].ns = 10_000_000 ns (10 ms) — covers 8 ms pre-flip
+        //               (1_000_000 cycles @ 125 MHz) plus 2 ms post-
+        //               flip (≈740_000 cycles @ 370 MHz), landing at
+        //               ~1_740_000 cycles.
+        //
+        // The old (buggy) harness used a static 125 MHz for ns↔cycle
+        // math, which would have overshot to 10 ms * 125 MHz =
+        // 1_250_000 cycles on ev[1] — i.e. it'd fail to model the
+        // 2.96× sysclk speedup and effectively give firmware ~34% of
+        // the cycles it deserves.
+        let mut sink = VariableClockSink::new(125_000_000, 1_000_000, 370_000_000);
+        let events = vec![
+            TraceEvent {
+                ns: 1_000_000,
+                port: 0x240,
+                value: 0x11,
+                kind: TraceKind::Write8,
+            },
+            TraceEvent {
+                ns: 10_000_000,
+                port: 0x241,
+                value: 0x22,
+                kind: TraceKind::Write8,
+            },
+        ];
+
+        // Post-fix: `replay()` has no sys_clk_hz parameter — the true
+        // cadence comes from `IsaSink::sys_clk_hz()` polled per chunk.
+        let summary = replay(&mut sink, &events, None, None);
+        assert_eq!(summary.writes_fired, 2);
+
+        // Post-fix expected cycles:
+        //   ev[1] target = 8 ms @ 125 MHz + 2 ms @ 370 MHz
+        //                = 1_000_000 + 740_000 = 1_740_000 cycles.
+        // Plus drive_write_cycle overhead (~60 cycles per event).
+        let final_cycles = sink.cycles();
+        let expected_min = 1_700_000u64;
+        let expected_max = 1_800_000u64;
+        assert!(
+            (expected_min..=expected_max).contains(&final_cycles),
+            "expected final_cycles in {expected_min}..={expected_max} (post-fix), \
+             got {final_cycles} — if it's ≈1.25M the static-clock bug has regressed; \
+             if it's ≈3.45M the sim_ns accumulator double-counted"
+        );
+
+        // Extra invariant: the clock-flip matters. If we force the
+        // same test with no flip (stay at 125 MHz the whole time),
+        // ev[1] lands at 10 ms * 125 MHz = 1_250_000 cycles — about
+        // 490k fewer.
+        let mut sink_noflip = VariableClockSink::new(125_000_000, u64::MAX, 125_000_000);
+        let _ = replay(&mut sink_noflip, &events, None, None);
+        let noflip_cycles = sink_noflip.cycles();
+        assert!(
+            noflip_cycles < final_cycles,
+            "a PLL upclock should cost more cycles of emulation per trace ms \
+             (noflip={noflip_cycles}, withflip={final_cycles})"
+        );
+        assert!(
+            (1_240_000..=1_260_000).contains(&noflip_cycles),
+            "no-flip run should be ≈10ms × 125 MHz = 1.25M cycles; got {noflip_cycles}"
+        );
+    }
+
+    #[test]
+    fn replay_stable_at_constant_clock_matches_old_behaviour() {
+        // Single 125 MHz run — the post-fix loop should land within
+        // `drive_write_cycle` overhead of the old fixed-target cycle.
+        let mut sink = VariableClockSink::new(125_000_000, u64::MAX, 125_000_000);
+        let events = vec![TraceEvent {
+            ns: 1_000_000,
+            port: 0x240,
+            value: 0xAB,
+            kind: TraceKind::Write8,
+        }];
+        let summary = replay(&mut sink, &events, None, None);
+        assert_eq!(summary.writes_fired, 1);
+        // 1 ms @ 125 MHz = 125_000 cycles; plus drive_write_cycle
+        // (4 phases × step deltas = 12 + 12 + 25 + 12 = 61 cycles).
+        let final_cycles = sink.cycles();
+        assert!(
+            (125_000..=125_200).contains(&final_cycles),
+            "expected ~125_000 cycles, got {final_cycles}"
+        );
+    }
+
+    #[test]
+    fn i2s_capture_set_sys_clk_hz_rescales_rate() {
+        use mdpicoem_devices::i2s_capture::I2sCapture;
+
+        // Feed 10 synthetic LRCLK edges with a period of 2604 cycles
+        // (= 125M / 48k / 2 × 2 … roughly 48 kHz at 125 MHz). Then
+        // switch sys_clk to 370 MHz and expect the reported rate to
+        // scale by 370/125.
+        let mut cap = I2sCapture::new(125_000_000, 17, 18, 16);
+
+        // Manually script LRCLK edges by toggling the LRCLK pin. We
+        // don't care about data bits; just generate edges to populate
+        // first_lrclk_cycle / last_lrclk_cycle.
+        let half_period: u64 = 1_302; // cycles; 2 × 1302 = 2604 per frame
+        let mut cycle: u64 = 0;
+        let mut lrclk_high = false;
+        for _ in 0..40 {
+            // Toggle LRCLK with BCLK low, DOUT low.
+            let pads = if lrclk_high { 1u32 << 18 } else { 0 };
+            cap.tick(pads, cycle);
+            cycle += 1;
+            // Hold for half_period-1 cycles without toggling.
+            for _ in 1..half_period {
+                cap.tick(pads, cycle);
+                cycle += 1;
+            }
+            lrclk_high = !lrclk_high;
+        }
+
+        let rate_125 = cap
+            .inferred_sample_rate_hz()
+            .expect("edges should produce an inferred rate");
+        // Flip to 370 MHz — capture timestamps unchanged, only the
+        // divisor changes.
+        cap.set_sys_clk_hz(370_000_000);
+        let rate_370 = cap
+            .inferred_sample_rate_hz()
+            .expect("edges still present");
+        let ratio = rate_370 / rate_125;
+        let expected_ratio = 370.0 / 125.0;
+        assert!(
+            (ratio - expected_ratio).abs() < 1e-6,
+            "expected rate to scale by 370/125 = {expected_ratio:.4}, got {ratio:.4} \
+             (rate_125={rate_125:.1} Hz, rate_370={rate_370:.1} Hz)"
+        );
     }
 }
