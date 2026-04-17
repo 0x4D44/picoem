@@ -916,10 +916,14 @@ peripheral module.
   exercises TX. Firmware that reads `UARTFR.RXFE` or attempts
   `UARTDR` reads will see `RXFE=1` forever. Phase 3+ will need a loop-
   back or scripted stimulus hook.
-- **UART modem flow control tied high** — CTS/DCD/DSR/RI bits in
-  `UARTFR` are either hardwired high (CTS) or zero (DCD/DSR/RI);
-  `UARTCR.RTS`/`CTSEn`/`RTSEn` are stored but have no effect on TX
-  gating. Firmware that relies on handshake will run ungated.
+- **UART modem flow control tied high** — `UARTFR` modem-status bits are
+  driven from the nUART* modem pins via IO_BANK0 mux, but the emulator
+  doesn't propagate that. CTS-hardwired-high removed for mdrp2350 in
+  commit `4243695` (silicon oracle drove the fix). DCD/DSR/RI on
+  mdrp2350 + the same CTS/DCD/DSR/RI pattern on mdrp2040 are still
+  hardwired and have not been silicon-validated. `UARTCR.RTS`/
+  `CTSEn`/`RTSEn` are stored but have no effect on TX gating.
+  Firmware that relies on handshake runs ungated.
 - **SPI master-slave arbitration: loopback-only** —
   `crates/mdrp2040/src/peripherals/spi.rs` implements `SSPCR1.LBM=1`
   (master/loopback) to round-trip TX→RX so the `hello_spi` corpus can
@@ -1040,3 +1044,12 @@ design for Phase 4 and documented in the relevant DMA module.
   active use in a future phase, the promotion path must include a
   bit-position assertion test (see `ctrl_busy_is_at_bit_26_not_bit_24` for
   the pattern).
+
+- **`uart0_tx_single_byte` scenario `min_sysclks: 10_000` is below the
+  byte-time floor** — at 150 MHz `clk_peri` and 115200 baud, one byte
+  needs ~13,020 sysclks for the TX shift register to drain. Scenario's
+  comment claims "~13_000 sysclks" but the literal is 10,000. Currently
+  PASSes on silicon by luck (the actual run takes longer than min); will
+  flake or fail under timing variance. Bump to ~20,000 in a follow-up
+  pass. Surfaced by the scenario-fixes agent during the Stage A fidelity
+  fix wave (2026-04-16) but deferred to keep that wave's scope tight.
