@@ -135,6 +135,11 @@ fn main() -> ExitCode {
 
     let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, &flash);
 
+    // Mirror the flash-parsed shadow into SRAM — emulates what the
+    // firmware's `preload_rom_image` DMA would have done. Without this
+    // the glue DMA CH1 reads back 0x00 for every resolved address.
+    oracle.populate_sram_from_shadow(&mut emu.bus);
+
     // Shadow-integrity tripwire (devil's-advocate Attack 2, Stage G.2 +
     // Stage G shadow-source investigation, 2026-04-15):
     // `ServingOracle::new_at_sync` now lifts the shadow from the flash

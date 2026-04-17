@@ -408,6 +408,24 @@ impl ServingOracle {
         self.results.last().unwrap()
     }
 
+    /// Copy the flash-parsed shadow into emulator SRAM at [`SHADOW_BASE`],
+    /// emulating what the firmware's `preload_rom_image` DMA would have
+    /// done. Call exactly once, after [`ServingOracle::new_at_sync`] and
+    /// before running cases — the glue DMA CH1 reads bytes from the bus
+    /// at the PIO1-resolved address, and without this mirror SRAM is
+    /// still zero-filled at sync, so every `observed_byte` collapses to
+    /// 0x00.
+    ///
+    /// Uses alias-0 writes (`SHADOW_BASE = 0x2000_0000`). A future
+    /// refactor must keep the destination on alias 0 — SRAM aliases
+    /// 1..3 are XOR/SET/CLR-on-write, not plain stores, and would
+    /// silently corrupt the populate.
+    pub fn populate_sram_from_shadow(&self, bus: &mut Bus) {
+        for offset in 0..SHADOW_SIZE {
+            bus.write8(SHADOW_BASE + offset as u32, self.rom_shadow[offset]);
+        }
+    }
+
     /// Accessor for the full results vector.
     pub fn results(&self) -> &[CaseResult] {
         &self.results
@@ -1663,5 +1681,67 @@ mod tests {
                 r
             );
         }
+    }
+
+    // --- Phase C tests: `populate_sram_from_shadow` --------------------------
+    //
+    // The oracle's flash-parsed shadow is the ground truth, but the glue DMA
+    // CH1 still reads through the bus at `resolved_addr`. Without mirroring
+    // the shadow into emulator SRAM the bus returns 0x00 for every read —
+    // `observed_byte` collapses to a single uniform value across all 15
+    // cases. These tests pin `populate_sram_from_shadow` as the contract
+    // that publishes the shadow to SRAM at `SHADOW_BASE`.
+
+    use mdrp2350::{Config, EmulatorBuilder};
+
+    fn mk_emu() -> Emulator {
+        EmulatorBuilder::new(Config::default()).build()
+    }
+
+    /// The four walking-1 SDRR A0..A3 offsets must appear in SRAM with the
+    /// shadow's bytes after `populate_sram_from_shadow`. Also asserts the
+    /// non-zero byte at 0x9010 — silent-revert guard, in case a future
+    /// refactor accidentally routes the write through a SRAM alias that
+    /// XOR/SET/CLRs instead of storing the byte verbatim.
+    #[test]
+    fn populate_sram_from_shadow_writes_bus_at_walking_1_offsets() {
+        let mut emu = mk_emu();
+        let mut shadow = empty_shadow();
+        shadow[0x9010] = 0x08;
+        shadow[0x9020] = 0x04;
+        shadow[0x9040] = 0x02;
+        shadow[0x9080] = 0x01;
+        let oracle = ServingOracle::new_with_shadow(shadow);
+
+        oracle.populate_sram_from_shadow(&mut emu.bus);
+
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9010), 0x08);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9020), 0x04);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9040), 0x02);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9080), 0x01);
+        assert_ne!(
+            emu.bus.read8(SHADOW_BASE + 0x9010),
+            0,
+            "silent-revert guard: SHADOW_BASE+0x9010 must not read back 0x00"
+        );
+    }
+
+    /// Off-by-one guard on the populate loop — both ends of the shadow
+    /// range must land in SRAM.
+    #[test]
+    fn populate_sram_from_shadow_covers_full_shadow_range() {
+        let mut emu = mk_emu();
+        let mut shadow = empty_shadow();
+        shadow[0] = 0xAA;
+        shadow[SHADOW_SIZE - 1] = 0x55;
+        let oracle = ServingOracle::new_with_shadow(shadow);
+
+        oracle.populate_sram_from_shadow(&mut emu.bus);
+
+        assert_eq!(emu.bus.read8(SHADOW_BASE), 0xAA);
+        assert_eq!(
+            emu.bus.read8(SHADOW_BASE + SHADOW_SIZE as u32 - 1),
+            0x55
+        );
     }
 }
