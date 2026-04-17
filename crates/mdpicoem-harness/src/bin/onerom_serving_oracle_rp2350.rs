@@ -13,9 +13,9 @@
 //! summary, latency stats, ROM speed class, emulator-bounded caveat)
 //! prints after the sweep completes. Envelope post-processing
 //! (`apply_envelope`) is applied per-case inside
-//! `ServingOracle::run_case`, so a Pass with latency outside the
-//! `11..=14` envelope is reclassified to `LatencyOutOfEnvelope` before
-//! the report renders.
+//! `ServingOracle::run_case`, so anything outside the
+//! `ENVELOPE_CYCLES` window is reclassified to `LatencyOutOfEnvelope`
+//! (see §5.3 in the HLD) before the report renders.
 //!
 //! Design: `wrk_docs/2026.04.15 - HLD - OneROM Serving Oracle (Stage G).md`.
 //!

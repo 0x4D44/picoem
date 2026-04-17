@@ -8721,6 +8721,65 @@ fn gpio_external_mask_zero_is_noop() {
     assert_eq!(emu.bus.gpio_in, 0x0000_005A, "legacy update_gpio path broken");
 }
 
+/// External stimulus written between `step()` calls must be visible to the
+/// cores on the very first cycle after the write — not one quantum later.
+///
+/// Regression: `update_gpio` previously ran only at the *end* of `step()`,
+/// inside `tick_peripherals`. Stimulus set just before `run(1)` was therefore
+/// composed into `bus.gpio_in` only after the first quantum's cores had
+/// already read the stale value. The OneROM serving oracle relies on CS/address
+/// bus stimulus being visible to the CPU on the very next fetch, so a single
+/// cycle of latency silently corrupts its protocol.
+///
+/// This test pins the contract by running a single LDR that reads SIO_GPIO_IN
+/// immediately on wake-up. If external stimulus isn't composed before the
+/// core dispatches, R0 comes back as 0 and the assertion fires.
+#[test]
+fn gpio_external_in_visible_first_cycle_after_write() {
+    use crate::{Config, EmulatorBuilder};
+
+    // Tight quantum keeps the test honest: the LDR is the only
+    // instruction that runs in the first step.
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build();
+
+    // Place `LDR R0, [R1, #0]` at SRAM base. Thumb-16 encoding = 0x6808.
+    emu.bus.memory.sram_write16(0, 0x6808);
+    // Pad with `B .` so if the core overshoots it parks rather than
+    // wandering into uninitialised memory.
+    emu.bus.memory.sram_write16(2, 0xE7FE);
+    emu.bus.invalidate_all();
+
+    // Core 0: PC at the LDR, Thumb bit set, R1 = SIO_GPIO_IN address.
+    // Core 1 halted so only core 0 contributes to the quantum.
+    emu.cores.expect_arm_mut()[0].regs.set_pc(0x2000_0000);
+    emu.cores.expect_arm_mut()[0].regs.xpsr = 1 << 24; // T-bit
+    emu.cores.expect_arm_mut()[0].regs.r[1] = 0xD000_0004; // SIO_GPIO_IN
+    emu.cores.expect_arm_mut()[0].wake();
+    emu.cores.expect_arm_mut()[1].halt();
+
+    // Harness drives bit 3 high via external stimulus AFTER construction
+    // and BEFORE the first step — i.e. the classic "just wrote a pin,
+    // what does the CPU see on the next fetch" scenario.
+    emu.bus.gpio_external_mask = 1 << 3;
+    emu.bus.gpio_external_in = 1 << 3;
+
+    emu.run(1);
+
+    // The LDR must have observed the composed stimulus.
+    let r0 = emu.cores.expect_arm()[0].regs.r[0];
+    assert_eq!(
+        r0 & (1 << 3),
+        1 << 3,
+        "LDR [SIO_GPIO_IN] on first cycle saw stale gpio_in = {:#010x} \
+         (expected bit 3 set because gpio_external_mask/in were written \
+         before run(1)); bus.gpio_in now = {:#010x}",
+        r0,
+        emu.bus.gpio_in,
+    );
+}
+
 // ============================================================================
 // MMIO trace hook — Phase 0b (HLD V5 §4.2.7)
 // ============================================================================

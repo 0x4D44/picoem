@@ -116,6 +116,20 @@ pub struct GlueDma {
     /// because PIO2 happened to land on a stable value at reset".
     ch1_push_count: u32,
 
+    /// Address CH1 **actually read from** when producing the most recent
+    /// push to PIO2.TXF1. Updated atomically with `ch1_push_count` in
+    /// `tick_ch1`, so sampling this the same cycle the serving oracle
+    /// detects a push-count edge yields the address that PRODUCED the
+    /// byte now propagating through PIO2 to D0..D7.
+    ///
+    /// This is the single source of truth for `resolved_addr` in the
+    /// oracle. Reading CH1.READ_ADDR MMIO directly races CH0's writes —
+    /// by the time the oracle loop samples it, CH0 may already have
+    /// deposited the NEXT address, so the MMIO value reports an address
+    /// that never produced the observed byte. See H1 in the Stage G
+    /// fix-wave brief (2026-04-17).
+    last_pushed_read_addr: u32,
+
     /// Cycle counter, incremented each `tick` call (purely for logging).
     cycle: u64,
 }
@@ -138,6 +152,7 @@ impl GlueDma {
             ch1_write_delay: 0,
             ch1_has_pending: false,
             ch1_push_count: 0,
+            last_pushed_read_addr: 0,
             cycle: 0,
         }
     }
@@ -148,6 +163,17 @@ impl GlueDma {
     /// PIO2 reset state.
     pub fn ch1_pushes(&self) -> u32 {
         self.ch1_push_count
+    }
+
+    /// Address CH1 actually read from when producing the most recent
+    /// push to PIO2.TXF1. Paired with [`Self::ch1_pushes`] — sample
+    /// both under the same `tick` to observe a push edge and the
+    /// address that PRODUCED the byte atomically.
+    ///
+    /// Returns 0 before the first push. Callers must gate on a push-
+    /// count edge before treating the value as meaningful.
+    pub fn last_pushed_read_addr(&self) -> u32 {
+        self.last_pushed_read_addr
     }
 
     /// Prime the pump after the harness has confirmed OneROM reached
@@ -294,6 +320,14 @@ impl GlueDma {
                 bus.write32(write_addr, self.ch1_value, 0);
                 self.ch1_has_pending = false;
                 self.ch1_value = 0;
+                // Record the address that PRODUCED this push atomically
+                // with the push-count increment. The serving oracle's
+                // observation loop pairs these two reads on the same
+                // tick to obtain `resolved_addr` that refers to the
+                // same fetch as the byte now propagating through PIO2.
+                // See `last_pushed_read_addr` doc-comment for the race
+                // this field closes.
+                self.last_pushed_read_addr = self.ch1_read_addr;
                 self.ch1_push_count = self.ch1_push_count.saturating_add(1);
             }
             return;
