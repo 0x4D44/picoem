@@ -31,9 +31,9 @@ use super::spsc::SpscQueue;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use std::sync::Mutex;
 
-const PIO_BLOCKS: usize = 3;
-const SMS_PER_BLOCK: usize = 4;
-const PIO_FIFO_DEPTH: u32 = 4;
+pub const PIO_BLOCKS: usize = 3;
+pub const SMS_PER_BLOCK: usize = 4;
+pub const PIO_FIFO_DEPTH: u32 = 4;
 
 pub struct ThreadedPio {
     // TX FIFOs: CPU pushes, PIO thread pops
@@ -125,21 +125,25 @@ impl ThreadedPio {
 
     // --- Atomic control ---
 
+    /// Read the 4-bit state-machine enable mask for `block` (one bit per SM).
     pub fn read_sm_enabled(&self, block: usize) -> u8 {
         debug_assert!(block < PIO_BLOCKS);
         self.sm_enabled[block].load(Relaxed)
     }
 
+    /// Write the 4-bit state-machine enable mask for `block` (one bit per SM).
     pub fn write_sm_enabled(&self, block: usize, mask: u8) {
         debug_assert!(block < PIO_BLOCKS);
         self.sm_enabled[block].store(mask, Relaxed);
     }
 
+    /// Read the 8-bit PIO IRQ-flag register for `block` (4 user IRQs + 4 spare).
     pub fn read_irq_flags(&self, block: usize) -> u8 {
         debug_assert!(block < PIO_BLOCKS);
         self.irq_flags[block].load(Relaxed)
     }
 
+    /// Overwrite the 8-bit PIO IRQ-flag register for `block`.
     pub fn write_irq_flags(&self, block: usize, flags: u8) {
         debug_assert!(block < PIO_BLOCKS);
         self.irq_flags[block].store(flags, Relaxed);
@@ -151,11 +155,13 @@ impl ThreadedPio {
         self.irq_flags[block].fetch_and(!mask, Relaxed);
     }
 
+    /// Read the 8-bit DREQ signal byte for `block` (one bit per TX/RX DREQ).
     pub fn read_dreq(&self, block: usize) -> u8 {
         debug_assert!(block < PIO_BLOCKS);
         self.dreq[block].load(Relaxed)
     }
 
+    /// Overwrite the 8-bit DREQ signal byte for `block`.
     pub fn write_dreq(&self, block: usize, val: u8) {
         debug_assert!(block < PIO_BLOCKS);
         self.dreq[block].store(val, Relaxed);

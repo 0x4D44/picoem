@@ -1,3 +1,11 @@
+//! Threaded primitives for Phase 2 of the dual-core emulation effort.
+//!
+//! Types in this module are standalone building blocks — they will be
+//! composed into `SharedState` by Phase 3's `ThreadedEmulator`. None of
+//! them are wired into the existing serial-interleave step path yet.
+//!
+//! See `wrk_docs/2026.04.17 - LLD - Threaded Dual-Core Phase 2 V4.md`.
+
 pub mod memory;
 pub mod gpio;
 pub mod monitors;

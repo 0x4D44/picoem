@@ -477,16 +477,38 @@ mod tests {
     fn reset_clears_all_state() {
         let sio = ThreadedSio::new();
 
-        // Populate every field.
+        // Push into both FIFOs.
         sio.fifo_push(0, 1);
         sio.fifo_push(1, 2);
-        // Force both sticky flags on core 0.
-        for _ in 0..8 {
+
+        // Explicitly trigger WOF on core 0 by pushing past capacity (8).
+        // Iterate enough times that the FIFO fills and further pushes
+        // set WOF.
+        for _ in 0..20 {
             sio.fifo_push(0, 0);
         }
-        let _ = sio.fifo_push(0, 0); // WOF
-        let _ = sio.fifo_pop(0); // pop the data we pushed on 1->0 side
-        let _ = sio.fifo_pop(0); // now empty → ROE
+        // Explicitly trigger WOF on core 1 the same way.
+        for _ in 0..20 {
+            sio.fifo_push(1, 0);
+        }
+
+        // Trigger ROE on both cores by popping from empty... but since
+        // we've pushed data above, drain first to get to empty. Simpler:
+        // bypass via a direct sticky-flag check after reset. To force
+        // ROE pre-reset, drain both FIFOs then pop again.
+        while sio.fifo_pop(0).is_some() {}
+        while sio.fifo_pop(1).is_some() {}
+        let _ = sio.fifo_pop(0); // empty → ROE on core 0
+        let _ = sio.fifo_pop(1); // empty → ROE on core 1
+
+        // Confirm sticky bits are set pre-reset so we know reset has
+        // real work to do.
+        assert_eq!(sio.fifo_st(0) & FIFO_ST_WOF, FIFO_ST_WOF);
+        assert_eq!(sio.fifo_st(1) & FIFO_ST_WOF, FIFO_ST_WOF);
+        assert_eq!(sio.fifo_st(0) & FIFO_ST_ROE, FIFO_ST_ROE);
+        assert_eq!(sio.fifo_st(1) & FIFO_ST_ROE, FIFO_ST_ROE);
+
+        // Populate the remaining shared state.
         sio.spinlock_claim(3);
         sio.spinlock_claim(17);
         sio.doorbell_set(0, 0xF);
@@ -496,23 +518,13 @@ mod tests {
         sio.mtimecmp_write(0, 111);
         sio.mtimecmp_write(1, 222);
 
+        // Push something back into both FIFOs so reset has data to drop.
+        sio.fifo_push(0, 7);
+        sio.fifo_push(1, 8);
+
         sio.reset();
 
-        assert_eq!(sio.fifo_pop(0), None);
-        // pop of empty FIFO sets ROE after reset — verify reset did leave
-        // sticky flags cleared *before* that pop.
-        let sio = {
-            let s = ThreadedSio::new();
-            s.fifo_push(0, 1);
-            s.spinlock_claim(3);
-            s.doorbell_set(0, 0xF);
-            s.mtime_ctrl_write(1);
-            s.mtime_write(999);
-            s.mtimecmp_write(0, 111);
-            s.reset();
-            s
-        };
-
+        // FIFOs are empty (VLD=0), have room (RDY=1), sticky bits cleared.
         assert_eq!(sio.fifo_st(0), FIFO_ST_RDY, "only RDY is set after reset");
         assert_eq!(sio.fifo_st(1), FIFO_ST_RDY);
         assert_eq!(sio.spinlock_bits(), 0);

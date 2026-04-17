@@ -34,6 +34,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::*};
 
 /// Outcome of a [`SpinBarrier::wait`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarrierResult {
     /// All `parties` arrived; this waiter has been released.
     Released,
@@ -110,7 +111,10 @@ impl SpinBarrier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{
+        AtomicU32, AtomicUsize,
+        Ordering::{self, SeqCst},
+    };
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -186,23 +190,36 @@ mod tests {
     #[test]
     fn poison_breaks_waiters() {
         // 4-party barrier but only 3 waiters: without poisoning they
-        // would spin forever. Main thread sleeps briefly then poisons.
+        // would spin forever. Main thread waits until all three workers
+        // have entered the barrier (observable via `entered`), then
+        // poisons. The small trailing sleep gives each worker time to
+        // reach the spin loop after incrementing the counter — still
+        // technically racy but far more robust than a flat 50ms wait.
         let barrier = Arc::new(SpinBarrier::new(4));
+        let entered = Arc::new(AtomicU32::new(0));
 
         let handles: Vec<_> = (0..3)
             .map(|_| {
                 let b = Arc::clone(&barrier);
-                thread::spawn(move || b.wait())
+                let e = Arc::clone(&entered);
+                thread::spawn(move || {
+                    e.fetch_add(1, Ordering::Release);
+                    b.wait()
+                })
             })
             .collect();
 
-        thread::sleep(Duration::from_millis(50));
+        while entered.load(Ordering::Acquire) < 3 {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(10));
         barrier.poison();
 
         for h in handles {
             let result = h.join().expect("thread panicked");
-            assert!(
-                matches!(result, BarrierResult::Poisoned),
+            assert_eq!(
+                result,
+                BarrierResult::Poisoned,
                 "waiter should have returned Poisoned"
             );
         }
