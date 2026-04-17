@@ -190,6 +190,11 @@ impl ThreadedEmulator {
             last_fetch_addr: _,
             warned_addrs: _,
             watchdog_reset_requested: _,
+            syscfg: _,
+            tbman: _,
+            glitch: _,
+            psm: _,
+            watchdog: _,
         } = bus;
 
         let shared_mem = Arc::new(SharedMemory::from_memory(

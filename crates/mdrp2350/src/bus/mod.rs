@@ -23,13 +23,16 @@ use crate::irq::{
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::{ADC_BASE, AdcRegs};
 use crate::peripherals::i2c::{I2C0_BASE, I2C1_BASE, I2cRegs};
+use crate::peripherals::inert::{GLITCH_DETECTOR_BASE, GlitchDetector, SYSCFG_BASE, SysCfg, TBMAN_BASE, Tbman};
 use crate::peripherals::io_bank0::{IO_BANK0_BASE, IoBank0Regs};
 use crate::peripherals::pads_bank0::{PADS_BANK0_BASE, PadsBank0Regs};
+use crate::peripherals::psm::{PSM_BASE, Psm};
 use crate::peripherals::pwm::{PWM_BASE, PwmRegs};
 use crate::peripherals::spi::{SPI0_BASE, SPI1_BASE, SpiRegs};
 use crate::peripherals::ticks::{TICKS_BASE, TicksRegs};
 use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE, TimerRegs};
 use crate::peripherals::uart::{UART0_BASE, UART1_BASE, UartRegs};
+use crate::peripherals::watchdog::{WATCHDOG_BASE, WatchdogRegs};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
 
@@ -239,6 +242,7 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
         IO_BANK0_BASE => Some(RESET_IO_BANK0),
         PADS_BANK0_BASE => Some(RESET_PADS_BANK0),
         DMA_BASE => Some(RESET_DMA),
+        SYSCFG_BASE => Some(RESET_SYSCFG),
         _ => None,
     }
 }
@@ -295,6 +299,17 @@ pub struct Bus {
     pub(crate) pads_bank0: PadsBank0Regs,
     /// DMA controller — 16 channels (HLD V5 §5.6, Phase 3).
     pub(crate) dma: Dma,
+    /// SYSCFG — storage-only inert peripheral (HLD V5 §7.D.1).
+    pub(crate) syscfg: SysCfg,
+    /// TBMAN — storage-only inert peripheral.
+    pub(crate) tbman: Tbman,
+    /// GLITCH_DETECTOR — storage plus `STATUS.ARM == 0` + TRIG_STATUS W1C.
+    pub(crate) glitch: GlitchDetector,
+    /// PSM — power-on state machine (HLD V5 §7.D.2). Instant handshake
+    /// model: `DONE` mirrors `FRCE_ON`.
+    pub(crate) psm: Psm,
+    /// WATCHDOG — countdown with reset trigger (HLD V5 §7.D.3).
+    pub(crate) watchdog: WatchdogRegs,
     /// Word-aligned MMIO addresses for which an "unmodelled access" warn
     /// has already been emitted. HLD V5 §4.A1 — warn once per address,
     /// per `Bus` instance, so firmware or tests that hammer an
@@ -498,6 +513,11 @@ impl Bus {
             pads_bank0: PadsBank0Regs::new(),
             dma: Dma::new(),
             atomics,
+            syscfg: SysCfg::new(),
+            tbman: Tbman::new(),
+            glitch: GlitchDetector::new(),
+            psm: Psm::new(),
+            watchdog: WatchdogRegs::new(),
             warned_addrs: std::collections::HashSet::new(),
             watchdog_reset_requested: false,
             flash_loaded: false,
@@ -1018,6 +1038,14 @@ impl Bus {
         if !self.is_held_in_reset_bit(RESET_DMA) {
             self.tick_dma();
         }
+
+        // WATCHDOG countdown — one cycle per `tick_peripherals` invocation
+        // (HLD V5 §7.D.3). Simplification: not scaled by `sys_clks`; the
+        // granularity matches the paced step-quantum tick loop closely
+        // enough for the LOAD=100 / fire-within-130-cycles test bound.
+        if self.watchdog.tick() {
+            self.set_watchdog_reset();
+        }
     }
 
     /// Raise the IRQ lines encoded in `bits` via `assert_irq_shared`.
@@ -1376,6 +1404,11 @@ impl Bus {
                         PWM_BASE => self.pwm.read32(offset),
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
                         PADS_BANK0_BASE => self.pads_bank0.read32(offset),
+                        SYSCFG_BASE => self.syscfg.read32(offset),
+                        TBMAN_BASE => self.tbman.read32(offset),
+                        GLITCH_DETECTOR_BASE => self.glitch.read32(offset),
+                        PSM_BASE => self.psm.read32(offset),
+                        WATCHDOG_BASE => self.watchdog.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -1642,6 +1675,42 @@ impl Bus {
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore byte
                         }
+                        SYSCFG_BASE | TBMAN_BASE | GLITCH_DETECTOR_BASE
+                        | PSM_BASE | WATCHDOG_BASE => {
+                            // Inert / PSM / WATCHDOG narrow byte: same
+                            // subword-alias strategy as CLOCKS. WATCHDOG
+                            // TRIGGER write from a byte lane is not a real
+                            // firmware pattern (TRIGGER is bit 31 — lane 3
+                            // MSB) but handled correctly by preserving alias.
+                            let word_addr = canonical & !3;
+                            let byte_idx = (canonical & 3) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    SYSCFG_BASE => self.syscfg.read32(reg_offset),
+                                    TBMAN_BASE => self.tbman.read32(reg_offset),
+                                    GLITCH_DETECTOR_BASE => self.glitch.read32(reg_offset),
+                                    PSM_BASE => self.psm.read32(reg_offset),
+                                    _ => self.watchdog.read32(reg_offset),
+                                };
+                                let mut bytes = old_word.to_le_bytes();
+                                bytes[byte_idx] = val;
+                                (u32::from_le_bytes(bytes), 0u32)
+                            } else {
+                                ((val as u32) << (byte_idx * 8), alias)
+                            };
+                            match base {
+                                SYSCFG_BASE => self.syscfg.write32(reg_offset, word_val, pass_alias),
+                                TBMAN_BASE => self.tbman.write32(reg_offset, word_val, pass_alias),
+                                GLITCH_DETECTOR_BASE => self.glitch.write32(reg_offset, word_val, pass_alias),
+                                PSM_BASE => self.psm.write32(reg_offset, word_val, pass_alias),
+                                _ => {
+                                    if self.watchdog.write32(reg_offset, word_val, pass_alias) {
+                                        self.set_watchdog_reset();
+                                    }
+                                }
+                            }
+                        }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
                         | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
                         | PADS_BANK0_BASE => {
@@ -1864,6 +1933,11 @@ impl Bus {
                         PWM_BASE => self.pwm.read32(offset),
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
                         PADS_BANK0_BASE => self.pads_bank0.read32(offset),
+                        SYSCFG_BASE => self.syscfg.read32(offset),
+                        TBMAN_BASE => self.tbman.read32(offset),
+                        GLITCH_DETECTOR_BASE => self.glitch.read32(offset),
+                        PSM_BASE => self.psm.read32(offset),
+                        WATCHDOG_BASE => self.watchdog.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -2120,6 +2194,40 @@ impl Bus {
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore halfword
                         }
+                        SYSCFG_BASE | TBMAN_BASE | GLITCH_DETECTOR_BASE
+                        | PSM_BASE | WATCHDOG_BASE => {
+                            // Inert / PSM / WATCHDOG halfword path — subword
+                            // alias preservation.
+                            let word_addr = canonical & !3;
+                            let half_idx = ((canonical >> 1) & 1) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    SYSCFG_BASE => self.syscfg.read32(reg_offset),
+                                    TBMAN_BASE => self.tbman.read32(reg_offset),
+                                    GLITCH_DETECTOR_BASE => self.glitch.read32(reg_offset),
+                                    PSM_BASE => self.psm.read32(reg_offset),
+                                    _ => self.watchdog.read32(reg_offset),
+                                };
+                                let mut halves: [u16; 2] =
+                                    [old_word as u16, (old_word >> 16) as u16];
+                                halves[half_idx] = val;
+                                ((halves[0] as u32) | ((halves[1] as u32) << 16), 0u32)
+                            } else {
+                                ((val as u32) << (half_idx * 16), alias)
+                            };
+                            match base {
+                                SYSCFG_BASE => self.syscfg.write32(reg_offset, word_val, pass_alias),
+                                TBMAN_BASE => self.tbman.write32(reg_offset, word_val, pass_alias),
+                                GLITCH_DETECTOR_BASE => self.glitch.write32(reg_offset, word_val, pass_alias),
+                                PSM_BASE => self.psm.write32(reg_offset, word_val, pass_alias),
+                                _ => {
+                                    if self.watchdog.write32(reg_offset, word_val, pass_alias) {
+                                        self.set_watchdog_reset();
+                                    }
+                                }
+                            }
+                        }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
                         | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
                         | PADS_BANK0_BASE => {
@@ -2269,6 +2377,11 @@ impl Bus {
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
                         PADS_BANK0_BASE => self.pads_bank0.read32(offset),
                         DMA_BASE => self.dma.read32(offset),
+                        SYSCFG_BASE => self.syscfg.read32(offset),
+                        TBMAN_BASE => self.tbman.read32(offset),
+                        GLITCH_DETECTOR_BASE => self.glitch.read32(offset),
+                        PSM_BASE => self.psm.read32(offset),
+                        WATCHDOG_BASE => self.watchdog.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -2423,6 +2536,15 @@ impl Bus {
                         IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
                         PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
                         DMA_BASE => self.dma.write32(offset, val, alias),
+                        SYSCFG_BASE => self.syscfg.write32(offset, val, alias),
+                        TBMAN_BASE => self.tbman.write32(offset, val, alias),
+                        GLITCH_DETECTOR_BASE => self.glitch.write32(offset, val, alias),
+                        PSM_BASE => self.psm.write32(offset, val, alias),
+                        WATCHDOG_BASE => {
+                            if self.watchdog.write32(offset, val, alias) {
+                                self.set_watchdog_reset();
+                            }
+                        }
                         0x5020_0000 => self.pio[0].write32(offset, val, alias),
                         0x5030_0000 => self.pio[1].write32(offset, val, alias),
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),

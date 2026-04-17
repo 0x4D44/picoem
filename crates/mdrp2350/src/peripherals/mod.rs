@@ -24,13 +24,16 @@
 
 pub mod adc;
 pub mod i2c;
+pub mod inert;
 pub mod io_bank0;
 pub mod pads_bank0;
+pub mod psm;
 pub mod pwm;
 pub mod spi;
 pub mod ticks;
 pub mod timer;
 pub mod uart;
+pub mod watchdog;
 
 #[cfg(test)]
 mod phase1_tests;

@@ -173,6 +173,11 @@ impl Emulator {
         // irq_pending / RCP / bus-fault. Replaces the per-core clears
         // that pre-Stage-1 touched the now-deleted Bus fields.
         atomics.reset();
+        self.bus.clear_warned_addrs();
+        self.bus.clear_watchdog_reset();
+        // WATCHDOG SCRATCH0..7 survive reset by datasheet (§4.7); the
+        // rest of the block (CTRL / TIME / LOAD / REASON) quiesces.
+        self.bus.watchdog.post_reset();
         // HLD V5 §5.7: post-bootrom RESETS state — peripherals
         // released by pico-sdk `runtime_init_bootrom_reset` start
         // deasserted. The emulator never runs the bootrom; we seed
