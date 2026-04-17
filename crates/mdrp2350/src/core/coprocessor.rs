@@ -1,10 +1,11 @@
+#[cfg(test)]
 use crate::bus::Bus;
 use crate::sio::Sio;
-use super::{CortexM33, Fault};
+use super::{CortexM33, CoreBus, Fault};
 
 impl CortexM33 {
     /// Top-level coprocessor dispatch.
-    pub(crate) fn thumb32_coprocessor(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_coprocessor<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
 
         // Check CPACR (2 bits per coprocessor). Phase 0b.1 Commit B:
@@ -30,7 +31,7 @@ impl CortexM33 {
 
     /// CP0 (GPIOC): GPIO coprocessor — SDK-emitted ops wired to SIO fast-path
     /// and `Bus.gpio_in`. See `cp0_mcr_mrc_family` for the encoding table.
-    fn cp0_gpioc(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    fn cp0_gpioc<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let is_mrc_mcr = (hw0 >> 12) & 0xF == 0xE && hw1 & (1 << 4) != 0;
         if is_mrc_mcr {
             self.cp0_mcr_mrc_family(hw0, hw1, bus)
@@ -80,7 +81,7 @@ impl CortexM33 {
     ///
     /// Undefined op2 on MRC reads as 0; undefined op2 on MCR is silent NOP.
     /// Cycle cost: 1.
-    fn cp0_mcr_mrc_family(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    fn cp0_mcr_mrc_family<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let is_mrc = (hw0 >> 4) & 1 != 0; // L bit
         let opc1 = ((hw0 >> 5) & 0x7) as u8;
         let crn = (hw0 & 0xF) as u8;
@@ -108,9 +109,9 @@ impl CortexM33 {
     }
 
     /// LO OUT bank (opc1=0): bulk lo_out when (CRn=0,CRm=0), else per-bit on pin.
-    fn cp0_lo_out(
+    fn cp0_lo_out<B: CoreBus>(
         &mut self,
-        bus: &mut Bus,
+        bus: &mut B,
         is_mrc: bool,
         is_bulk: bool,
         crn: u8,
@@ -121,28 +122,28 @@ impl CortexM33 {
         if is_bulk {
             if is_mrc {
                 // op2=0 is the documented get; other op2 treated as NOP read 0.
-                self.regs.r[rt] = if op2 == 0 { bus.sio.gpio_lo_out_get() } else { 0 };
+                self.regs.r[rt] = if op2 == 0 { bus.sio_mut().gpio_lo_out_get() } else { 0 };
             } else {
                 let v = self.regs.r[rt];
                 match op2 {
-                    0 => bus.sio.gpio_lo_out_put(v),
-                    1 => bus.sio.gpio_lo_out_set(v),
-                    2 => bus.sio.gpio_lo_out_clr(v),
-                    3 => bus.sio.gpio_lo_out_xor(v),
+                    0 => bus.sio_mut().gpio_lo_out_put(v),
+                    1 => bus.sio_mut().gpio_lo_out_set(v),
+                    2 => bus.sio_mut().gpio_lo_out_clr(v),
+                    3 => bus.sio_mut().gpio_lo_out_xor(v),
                     _ => {}
                 }
             }
         } else {
             let pin = (crn << 4) | crm;
             if is_mrc {
-                let v = if op2 == 0 { bus.sio.gpio_bit_out_get(pin) } else { false };
+                let v = if op2 == 0 { bus.sio_mut().gpio_bit_out_get(pin) } else { false };
                 self.regs.r[rt] = v as u32;
             } else {
                 match op2 {
-                    4 => bus.sio.gpio_bit_out_put(pin, self.regs.r[rt] & 1 != 0),
-                    5 => bus.sio.gpio_bit_out_set(pin),
-                    6 => bus.sio.gpio_bit_out_clr(pin),
-                    7 => bus.sio.gpio_bit_out_xor(pin),
+                    4 => bus.sio_mut().gpio_bit_out_put(pin, self.regs.r[rt] & 1 != 0),
+                    5 => bus.sio_mut().gpio_bit_out_set(pin),
+                    6 => bus.sio_mut().gpio_bit_out_clr(pin),
+                    7 => bus.sio_mut().gpio_bit_out_xor(pin),
                     _ => {}
                 }
             }
@@ -150,9 +151,9 @@ impl CortexM33 {
     }
 
     /// LO OE bank (opc1=1): bulk lo_oe when (CRn=0,CRm=0), else per-bit on pin.
-    fn cp0_lo_oe(
+    fn cp0_lo_oe<B: CoreBus>(
         &mut self,
-        bus: &mut Bus,
+        bus: &mut B,
         is_mrc: bool,
         is_bulk: bool,
         crn: u8,
@@ -162,28 +163,28 @@ impl CortexM33 {
     ) {
         if is_bulk {
             if is_mrc {
-                self.regs.r[rt] = if op2 == 0 { bus.sio.gpio_lo_oe_get() } else { 0 };
+                self.regs.r[rt] = if op2 == 0 { bus.sio_mut().gpio_lo_oe_get() } else { 0 };
             } else {
                 let v = self.regs.r[rt];
                 match op2 {
-                    0 => bus.sio.gpio_lo_oe_put(v),
-                    1 => bus.sio.gpio_lo_oe_set(v),
-                    2 => bus.sio.gpio_lo_oe_clr(v),
-                    3 => bus.sio.gpio_lo_oe_xor(v),
+                    0 => bus.sio_mut().gpio_lo_oe_put(v),
+                    1 => bus.sio_mut().gpio_lo_oe_set(v),
+                    2 => bus.sio_mut().gpio_lo_oe_clr(v),
+                    3 => bus.sio_mut().gpio_lo_oe_xor(v),
                     _ => {}
                 }
             }
         } else {
             let pin = (crn << 4) | crm;
             if is_mrc {
-                let v = if op2 == 0 { bus.sio.gpio_bit_oe_get(pin) } else { false };
+                let v = if op2 == 0 { bus.sio_mut().gpio_bit_oe_get(pin) } else { false };
                 self.regs.r[rt] = v as u32;
             } else {
                 match op2 {
-                    4 => bus.sio.gpio_bit_oe_put(pin, self.regs.r[rt] & 1 != 0),
-                    5 => bus.sio.gpio_bit_oe_set(pin),
-                    6 => bus.sio.gpio_bit_oe_clr(pin),
-                    7 => bus.sio.gpio_bit_oe_xor(pin),
+                    4 => bus.sio_mut().gpio_bit_oe_put(pin, self.regs.r[rt] & 1 != 0),
+                    5 => bus.sio_mut().gpio_bit_oe_set(pin),
+                    6 => bus.sio_mut().gpio_bit_oe_clr(pin),
+                    7 => bus.sio_mut().gpio_bit_oe_xor(pin),
                     _ => {}
                 }
             }
@@ -191,10 +192,10 @@ impl CortexM33 {
     }
 
     /// LO IN bank (opc1=2, read-only): bulk lo_in_get when (CRn=0,CRm=0),
-    /// else per-bit in on pin. Source is `bus.gpio_in`. MCR is a silent NOP.
-    fn cp0_lo_in(
+    /// else per-bit in on pin. Source is `bus.gpio_in()`. MCR is a silent NOP.
+    fn cp0_lo_in<B: CoreBus>(
         &mut self,
-        bus: &mut Bus,
+        bus: &mut B,
         is_mrc: bool,
         is_bulk: bool,
         crn: u8,
@@ -205,10 +206,10 @@ impl CortexM33 {
             return; // writes to the input bank are undefined -> silent NOP.
         }
         if is_bulk {
-            self.regs.r[rt] = bus.gpio_in & Sio::PIN_MASK;
+            self.regs.r[rt] = bus.gpio_in() & Sio::PIN_MASK;
         } else {
             let pin = (crn << 4) | crm;
-            self.regs.r[rt] = if pin < 30 { (bus.gpio_in >> pin) & 1 } else { 0 };
+            self.regs.r[rt] = if pin < 30 { (bus.gpio_in() >> pin) & 1 } else { 0 };
         }
     }
 
@@ -502,7 +503,7 @@ impl CortexM33 {
 
     /// CP7 (RCP): Redundancy coprocessor. Dispatches MCR/MRC (0xEE/0xFE)
     /// and MCRR/MRRC (0xEC/0xFC) encoding families.
-    fn cp7_rcp(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    fn cp7_rcp<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let hw0_high = (hw0 >> 8) & 0xFF;
         match hw0_high {
             0xEE | 0xFE => self.cp7_mcr_mrc_family(hw0, hw1, bus),
@@ -522,7 +523,7 @@ impl CortexM33 {
     /// On assertion failure: `self.pending_fault = Some(Fault::Nmi)`.
     /// The existing `step()`/`deliver_fault` path turns that into an NMI
     /// exception (`enter_exception(2, bus)`).
-    fn cp7_mcr_mrc_family(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    fn cp7_mcr_mrc_family<B: CoreBus>(&mut self, hw0: u16, hw1: u16, _bus: &mut B) -> u32 {
         let is_cdp = hw1 & (1 << 4) == 0;
         if is_cdp {
             return self.cp7_cdp(hw0, hw1);
@@ -542,12 +543,12 @@ impl CortexM33 {
                     // The immediate (CRn<<4)|CRm is a "tag" for SDK
                     // bookkeeping; we ignore it (bootrom pairs get/check
                     // with the same tag and relies only on consistency).
-                    self.regs.r[rt] = bus.atomics.rcp_salt_load(core) ^ 0xDEAD_BEEF;
+                    self.regs.r[rt] = self.atomics.rcp_salt_load(core) ^ 0xDEAD_BEEF;
                 }
                 (1, 0) if rt == 15 => {
                     // rcp_canary_status pc: write NZCV to APSR.
                     // N = salt_valid[core]; Z=0, C=0, V=0.
-                    let n = if bus.atomics.rcp_salt_is_valid(core) { 1u32 << 31 } else { 0 };
+                    let n = if self.atomics.rcp_salt_is_valid(core) { 1u32 << 31 } else { 0 };
                     self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | n;
                 }
                 _ => {} // unrecognized MRC: silent NOP
@@ -568,7 +569,7 @@ impl CortexM33 {
                 // execute its own salt-seeding path — which contains
                 // canary_get/check pairs that would otherwise trip before
                 // the salt is written — and continue to boot through.
-                let expected = bus.atomics.rcp_salt_load(core) ^ 0xDEAD_BEEF;
+                let expected = self.atomics.rcp_salt_load(core) ^ 0xDEAD_BEEF;
                 if self.regs.r[rt] != expected {
                     self.pending_fault = Some(Fault::Nmi);
                 }
@@ -594,12 +595,12 @@ impl CortexM33 {
             }
             (4, 0) => {
                 // rcp_count_init imm — set the redundancy counter to imm.
-                bus.atomics.rcp_count_set(((crn as u32) << 4) | (crm as u32));
+                self.atomics.rcp_count_set(((crn as u32) << 4) | (crm as u32));
             }
             (5, 1) => {
                 // rcp_count_check imm — assert counter == imm, then increment.
                 let expected = ((crn as u32) << 4) | (crm as u32);
-                if bus.atomics.rcp_count_check(expected).is_err() {
+                if self.atomics.rcp_count_check(expected).is_err() {
                     self.pending_fault = Some(Fault::Nmi);
                 }
             }
@@ -634,7 +635,7 @@ impl CortexM33 {
         1
     }
 
-    fn cp7_mcrr_mrrc_family(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    fn cp7_mcrr_mrrc_family<B: CoreBus>(&mut self, hw0: u16, hw1: u16, _bus: &mut B) -> u32 {
         let l_bit = (hw0 >> 4) & 1;
         if l_bit != 0 {
             return 1; // MRRC2 from CP7: not used by bootrom
@@ -658,11 +659,11 @@ impl CortexM33 {
                 match crm {
                     0 => {
                         // rcp_salt_core0
-                        bus.atomics.rcp_salt_set(0, self.regs.r[rt]);
+                        self.atomics.rcp_salt_set(0, self.regs.r[rt]);
                     }
                     1 => {
                         // rcp_salt_core1
-                        bus.atomics.rcp_salt_set(1, self.regs.r[rt]);
+                        self.atomics.rcp_salt_set(1, self.regs.r[rt]);
                     }
                     _ => {} // unrecognized salt CRm: silent NOP
                 }
@@ -737,8 +738,11 @@ mod tests {
 
     #[test]
     fn test_cp7_rcp_salt_roundtrip() {
-        let mut cpu = CortexM33::for_test(0);
-        let mut bus = Bus::default();
+        // Phase 3 Stage 2: share atomics so rcp_canary_get reads the
+        // bus-side salt.
+        let atomics = std::sync::Arc::new(crate::threaded::CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, std::sync::Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
         enable_cp(&mut cpu, 7);
 
         // Poke salt directly via atomics (Phase 3 Stage 1 migration).
@@ -1250,8 +1254,11 @@ mod tests {
 
     /// Convenience: prepare a CPU + Bus with CP7 enabled, salt set, salt valid.
     fn rcp_setup() -> (CortexM33, Bus) {
-        let mut cpu = CortexM33::for_test(0);
-        let bus = Bus::default();
+        // Phase 3 Stage 2: share atomics so coprocessor reads via
+        // `self.atomics` see the test's bus-side salt/counter setup.
+        let atomics = std::sync::Arc::new(crate::threaded::CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, std::sync::Arc::clone(&atomics));
+        let bus = Bus::with_atomics(atomics);
         enable_cp(&mut cpu, 7);
         bus.atomics.rcp_salt_set(0, 0x1234_5678);
         (cpu, bus)

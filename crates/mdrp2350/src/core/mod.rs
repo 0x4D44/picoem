@@ -5,6 +5,7 @@ pub(crate) mod execute_thumb32;
 mod execute_fpu;
 pub(crate) mod exceptions;
 pub(crate) mod coprocessor;
+pub mod bus_trait;
 
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use crate::bus::Bus;
 use crate::bus::ppb::Ppb;
 use crate::threaded::CoreAtomics;
 pub use registers::Registers;
+pub use bus_trait::CoreBus;
 
 /// Synchronous faults raised during instruction execution.
 #[derive(Debug, Clone, Copy)]
@@ -165,11 +167,20 @@ impl CortexM33 {
     /// Execute one instruction atomically, advancing the core's own cycle
     /// count by the instruction's cycle cost (including any exception-entry
     /// cost if a synchronous fault is taken).
-    pub fn step(&mut self, bus: &mut Bus) {
+    ///
+    /// Generic over the [`CoreBus`] surface (Phase 3 Stage 2, LLD V7 §1).
+    /// In Stage 2 the only `impl CoreBus` is for `Bus`; Stage 5 adds
+    /// `WorkerBus`. The Arc-sharing debug trip-wire is enforced here via
+    /// the trait accessor `bus.atomics()` — all direct callers (tests,
+    /// harness, `Emulator::step`) funnel through this method, so the
+    /// invariant is caught regardless of whether the caller went through
+    /// the single-threaded driver or constructed cores + bus by hand.
+    pub fn step<B: CoreBus>(&mut self, bus: &mut B) {
         debug_assert!(
-            Arc::ptr_eq(&self.atomics, &bus.atomics),
-            "CortexM33 and Bus hold disjoint Arc<CoreAtomics> — signals won't route. \
-             Construct via Emulator::new/builder or share the Arc explicitly."
+            Arc::ptr_eq(&self.atomics, bus.atomics()),
+            "CortexM33 and its Bus hold disjoint Arc<CoreAtomics> — \
+             signals won't route. Construct the Bus via Bus::with_atomics(\
+             Arc::clone(&core.atomics)) or share the Arc explicitly."
         );
         let core = self.core_id as usize;
         if self.atomics.is_wfe_waiting(core) {
@@ -207,12 +218,12 @@ impl CortexM33 {
 
         // Synchronous bus fault
         let mut fault_handled = false;
-        if bus.bus_fault(self.core_id as usize) {
+        if bus.bus_fault(self.core_id) {
             fault_handled = true;
             let busfault_ena = self.ppb.shcsr & (1 << 17) != 0;
             self.ppb.cfsr |= (1 << 9) | (1 << 15); // PRECISERR + BFARVALID
-            self.ppb.bfar = bus.bus_fault_addr(self.core_id as usize);
-            bus.clear_bus_fault(self.core_id as usize);
+            self.ppb.bfar = bus.bus_fault_addr(self.core_id);
+            bus.clear_bus_fault(self.core_id);
             if busfault_ena {
                 cycles = self.enter_exception(5, bus);
             } else {
@@ -237,7 +248,7 @@ impl CortexM33 {
 
     /// Debug step: clears halted/wfe_waiting before stepping.
     /// Used by QEMU diff harness so WFI doesn't stall the oracle.
-    pub fn debug_step(&mut self, bus: &mut Bus) {
+    pub fn debug_step<B: CoreBus>(&mut self, bus: &mut B) {
         let core = self.core_id as usize;
         self.atomics.clear_halted(core);
         self.atomics.clear_wfe_waiting(core);
@@ -312,7 +323,7 @@ impl CortexM33 {
     /// Otherwise, enter WFE sleep. Phase 3 Stage 1: the event_flag state
     /// lives on `CoreAtomics`; we consume with an AcqRel swap-to-false
     /// that pairs with `sev_both`'s Release stores.
-    pub(crate) fn wfe(&mut self, _bus: &mut Bus) -> u32 {
+    pub(crate) fn wfe<B: CoreBus>(&mut self, _bus: &mut B) -> u32 {
         let core = self.core_id as usize;
         if self.atomics.event_flag_consume(core) {
             1 // event was pending, consume it, no sleep
@@ -334,11 +345,11 @@ impl CortexM33 {
     // never fetched from PPB, so the extra branch is pure overhead there.
     // -------------------------------------------------------------------
 
-    pub(crate) fn bus_read32(&mut self, addr: u32, bus: &mut Bus) -> u32 {
+    pub(crate) fn bus_read32<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u32 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             let val = self.ppb.read32(addr);
-            if bus.trace_enabled {
+            if bus.trace_enabled() {
                 bus.emit_trace('R', 4, addr, val, self.core_id);
             }
             val
@@ -347,7 +358,7 @@ impl CortexM33 {
         }
     }
 
-    pub(crate) fn bus_write32(&mut self, addr: u32, val: u32, bus: &mut Bus) {
+    pub(crate) fn bus_write32<B: CoreBus>(&mut self, addr: u32, val: u32, bus: &mut B) {
         self.counters.classify_access(addr, true);
         // Phase 0b.2: any data-side write invalidates a peer core's
         // exclusive monitor. `Emulator::step` snoops this flag after the
@@ -356,7 +367,7 @@ impl CortexM33 {
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             self.ppb.write32(addr, val);
             self.sync_nvic_to_irq_pending(addr, bus);
-            if bus.trace_enabled {
+            if bus.trace_enabled() {
                 bus.emit_trace('W', 4, addr, val, self.core_id);
             }
         } else {
@@ -364,7 +375,7 @@ impl CortexM33 {
         }
     }
 
-    pub(crate) fn bus_read16(&mut self, addr: u32, bus: &mut Bus) -> u16 {
+    pub(crate) fn bus_read16<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u16 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // ARMv8-M: halfword PPB accesses are UNPREDICTABLE (word-only
@@ -375,7 +386,7 @@ impl CortexM33 {
             // via a telltale zero.
             let word = self.ppb.read32(addr & !3);
             let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
-            if bus.trace_enabled {
+            if bus.trace_enabled() {
                 bus.emit_trace('R', 2, addr, val as u32, self.core_id);
             }
             val
@@ -384,7 +395,7 @@ impl CortexM33 {
         }
     }
 
-    pub(crate) fn bus_write16(&mut self, addr: u32, val: u16, bus: &mut Bus) {
+    pub(crate) fn bus_write16<B: CoreBus>(&mut self, addr: u32, val: u16, bus: &mut B) {
         self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
@@ -401,7 +412,7 @@ impl CortexM33 {
             };
             self.ppb.write32(addr & !3, new_val);
             self.sync_nvic_to_irq_pending(addr & !3, bus);
-            if bus.trace_enabled {
+            if bus.trace_enabled() {
                 bus.emit_trace('W', 2, addr, val as u32, self.core_id);
             }
         } else {
@@ -409,11 +420,11 @@ impl CortexM33 {
         }
     }
 
-    pub(crate) fn bus_read8(&mut self, addr: u32, bus: &mut Bus) -> u8 {
+    pub(crate) fn bus_read8<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u8 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte reads return 0.
-            if bus.trace_enabled {
+            if bus.trace_enabled() {
                 bus.emit_trace('R', 1, addr, 0, self.core_id);
             }
             0
@@ -422,13 +433,13 @@ impl CortexM33 {
         }
     }
 
-    pub(crate) fn bus_write8(&mut self, addr: u32, val: u8, bus: &mut Bus) {
+    pub(crate) fn bus_write8<B: CoreBus>(&mut self, addr: u32, val: u8, bus: &mut B) {
         self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte writes drop.
-            if bus.trace_enabled {
+            if bus.trace_enabled() {
                 bus.emit_trace('W', 1, addr, val as u32, self.core_id);
             }
         } else {
@@ -446,7 +457,7 @@ impl CortexM33 {
     /// way the architectural latch lives in `nvic_ispr`. `irq_pending`
     /// gates the step-path NVIC walk for cheap short-circuiting, so it
     /// must stay in sync with `nvic_ispr` after each write.
-    fn sync_nvic_to_irq_pending(&self, addr: u32, _bus: &mut Bus) {
+    fn sync_nvic_to_irq_pending<B: CoreBus>(&self, addr: u32, _bus: &mut B) {
         let low = addr & 0xFFFF;
         if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
             let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };

@@ -7,8 +7,7 @@
 //   Register transfer: hw0[15:8]=0xEE, hw1[11:8]=0xA, hw1[4]=1
 //   Load/store:        hw0[15:12]=0xE, hw0[11:9]=0b110, hw1[11:8]=0xA
 
-use crate::bus::Bus;
-use super::CortexM33;
+use super::{CortexM33, CoreBus};
 
 // ============================================================================
 // VFP register extraction
@@ -526,7 +525,7 @@ impl CortexM33 {
 
     /// Execute a VFP instruction. Called from thumb32_coprocessor when
     /// coproc is 10 or 11.
-    pub(crate) fn fpu_execute(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn fpu_execute<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
         if coproc == 11 {
             // Double-precision not present on RP2350
@@ -1087,7 +1086,7 @@ impl CortexM33 {
     //   Sd = (Vd << 1) | D  (first register)
     //   Count = imm8 (number of single registers)
 
-    fn fpu_load_store(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    fn fpu_load_store<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let p = (hw0 >> 8) & 1;
         let u = (hw0 >> 7) & 1;
         let w = (hw0 >> 5) & 1;
@@ -1194,29 +1193,28 @@ impl CortexM33 {
     /// side-channel bus-fault flag (or, in future, the pending MemManage).
     /// Using a unit error avoids fabricating a `Fault::UsageFault` that
     /// is never actually delivered (step() catches the bus flag first).
-    pub(crate) fn flush_lazy_fp_context(
+    pub(crate) fn flush_lazy_fp_context<B: CoreBus>(
         &mut self,
-        bus: &mut Bus,
+        bus: &mut B,
     ) -> Result<(), ()> {
         let base = self.ppb.fpcar;
 
-        let core = self.core_id as usize;
         // S0..S15 → +0..+60.
         for i in 0..16 {
             self.bus_write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits(), bus);
-            if bus.bus_fault(core) {
+            if bus.bus_fault(self.core_id) {
                 self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
                 return Err(());
             }
         }
         // FPSCR → +64; reserved → +68 (write zero per architecture).
         self.bus_write32(base.wrapping_add(64), self.regs.fpscr, bus);
-        if bus.bus_fault(core) {
+        if bus.bus_fault(self.core_id) {
             self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());
         }
         self.bus_write32(base.wrapping_add(68), 0, bus);
-        if bus.bus_fault(core) {
+        if bus.bus_fault(self.core_id) {
             self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());
         }

@@ -41,7 +41,7 @@ const DECODE_CACHE_MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
 ///
 /// See HLD §2.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DecodedOp {
+pub struct DecodedOp {
     /// PC this entry is valid for. Full tag (no shift). `u32::MAX` = empty.
     pub tag: u32,
     /// First halfword (the one at PC).
@@ -965,11 +965,6 @@ impl Bus {
         self.flash_loaded = loaded;
     }
 
-    /// Signal an SEV event to both cores.
-    pub fn signal_sev(&mut self) {
-        self.atomics.sev_both();
-    }
-
     /// Read GPIO_HI_IN (SIO offset 0x008). Returns QSPI pin state.
     /// When flash is loaded, returns noise with bit 29 frequently set.
     /// The bootrom's flash-detect loop reads this 21 times, extracting
@@ -1022,6 +1017,18 @@ impl Bus {
     #[inline(always)]
     pub fn add_extra_wait_states(&mut self, n: u32) {
         self.extra_wait_states += n;
+    }
+
+    /// Return the current extra-wait-states accumulator and reset it to
+    /// zero atomically. Backs the `CoreBus::take_extra_wait_states` trait
+    /// method (Phase 3 Stage 2) — combined drain-and-read semantics are
+    /// cheaper than a `extra_wait_states()` getter followed by
+    /// `reset_extra_wait_states()`.
+    #[inline(always)]
+    pub fn take_extra_wait_states(&mut self) -> u32 {
+        let n = self.extra_wait_states;
+        self.extra_wait_states = 0;
+        n
     }
 
     // --- Decoded-op cache invalidation (see HLD §7) ----------------------
@@ -2272,5 +2279,184 @@ fn sram_bank_wait(addr: u32, burst: bool) -> u32 {
 impl Default for Bus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ===================================================================
+// `CoreBus` impl — Phase 3 Stage 2 (LLD V7 §1).
+//
+// Every method is a one-liner forward to an existing inherent `Bus`
+// method or field. The trait is the generic surface used by
+// `CortexM33::step<B: CoreBus>`; in Stage 2 the only implementor is
+// `Bus`. Stage 5 adds `WorkerBus`.
+// ===================================================================
+
+use crate::core::bus_trait::CoreBus;
+
+impl CoreBus for Bus {
+    #[inline(always)]
+    fn read8(&mut self, addr: u32, core: u8) -> u8 {
+        Bus::read8(self, addr, core)
+    }
+    #[inline(always)]
+    fn read16(&mut self, addr: u32, core: u8) -> u16 {
+        Bus::read16(self, addr, core)
+    }
+    #[inline(always)]
+    fn read32(&mut self, addr: u32, core: u8) -> u32 {
+        Bus::read32(self, addr, core)
+    }
+    #[inline(always)]
+    fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        Bus::write8(self, addr, val, core)
+    }
+    #[inline(always)]
+    fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        Bus::write16(self, addr, val, core)
+    }
+    #[inline(always)]
+    fn write32(&mut self, addr: u32, val: u32, core: u8) {
+        Bus::write32(self, addr, val, core)
+    }
+
+    #[inline(always)]
+    fn set_active_pc(&mut self, pc: u32, core: u8) {
+        Bus::set_active_pc(self, pc, core)
+    }
+
+    #[inline(always)]
+    fn bus_fault(&self, core: u8) -> bool {
+        Bus::bus_fault(self, core as usize)
+    }
+    #[inline(always)]
+    fn bus_fault_addr(&self, core: u8) -> u32 {
+        Bus::bus_fault_addr(self, core as usize)
+    }
+    #[inline(always)]
+    fn clear_bus_fault(&mut self, core: u8) {
+        Bus::clear_bus_fault(self, core as usize)
+    }
+
+    #[inline(always)]
+    fn set_burst_mode(&mut self, on: bool) {
+        if on {
+            Bus::set_burst_mode(self);
+        } else {
+            Bus::clear_burst_mode(self);
+        }
+    }
+
+    #[inline(always)]
+    fn add_extra_wait_states(&mut self, n: u32) {
+        Bus::add_extra_wait_states(self, n)
+    }
+
+    #[inline(always)]
+    fn take_extra_wait_states(&mut self) -> u32 {
+        Bus::take_extra_wait_states(self)
+    }
+
+    // --- TRANSIENT (Stage 2) ------------------------------------------
+
+    #[inline(always)]
+    fn atomics(&self) -> &Arc<crate::threaded::CoreAtomics> {
+        &self.atomics
+    }
+
+    #[inline(always)]
+    fn sio(&self) -> &Sio {
+        &self.sio
+    }
+    #[inline(always)]
+    fn sio_mut(&mut self) -> &mut Sio {
+        &mut self.sio
+    }
+
+    #[inline(always)]
+    fn gpio_in(&self) -> u32 {
+        self.gpio_in
+    }
+
+    #[inline(always)]
+    fn decode_cache_get(&self, slot: usize) -> DecodedOp {
+        self.decode_cache[slot]
+    }
+    #[inline(always)]
+    fn decode_cache_set(&mut self, slot: usize, entry: DecodedOp) {
+        self.decode_cache[slot] = entry;
+    }
+
+    #[inline(always)]
+    fn extra_wait_states(&self) -> u32 {
+        Bus::extra_wait_states(self)
+    }
+    #[inline(always)]
+    fn reset_extra_wait_states(&mut self) {
+        Bus::reset_extra_wait_states(self)
+    }
+
+    #[inline(always)]
+    fn trace_enabled(&self) -> bool {
+        self.trace_enabled
+    }
+    #[inline(always)]
+    fn emit_trace(&mut self, rw: char, size: u32, addr: u32, val: u32, core: u8) {
+        Bus::emit_trace(self, rw, size, addr, val, core)
+    }
+}
+
+#[cfg(test)]
+mod corebus_trait_tests {
+    use super::*;
+    use crate::core::CoreBus;
+
+    /// Compile-time + smoke check that `CoreBus for Bus` covers every
+    /// method the trait declares and that the trait is reachable via a
+    /// `dyn CoreBus` coercion. Phase 3 Stage 2 (LLD V7 §1).
+    #[test]
+    fn bus_core_bus_impl_covers_all_methods() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut bus = Bus::with_atomics(Arc::clone(&atomics));
+
+        // dyn-dispatch path — compile-time check that every trait method
+        // is dyn-safe and reachable through the trait object.
+        let bus_dyn: &mut dyn CoreBus = &mut bus;
+
+        // Canonical 13-method surface.
+        let _ = bus_dyn.read32(0, 0);
+        bus_dyn.write32(0, 0, 0);
+        let _ = bus_dyn.read16(0, 0);
+        bus_dyn.write16(0, 0, 0);
+        let _ = bus_dyn.read8(0, 0);
+        bus_dyn.write8(0, 0, 0);
+        bus_dyn.set_active_pc(0x2000_0000, 0);
+        let _fault = bus_dyn.bus_fault(0);
+        let _addr = bus_dyn.bus_fault_addr(0);
+        bus_dyn.clear_bus_fault(0);
+        bus_dyn.set_burst_mode(true);
+        bus_dyn.set_burst_mode(false);
+        bus_dyn.add_extra_wait_states(3);
+        let n = bus_dyn.take_extra_wait_states();
+        assert_eq!(n, 3, "take_extra_wait_states should return the added 3");
+        assert_eq!(
+            bus_dyn.take_extra_wait_states(),
+            0,
+            "take_extra_wait_states should drain to zero"
+        );
+
+        // Transient accessors (removed in later Phase 3 stages — see
+        // `core/bus_trait.rs` for the teardown schedule).
+        let _atomics: &Arc<CoreAtomics> = bus_dyn.atomics();
+        let _ = bus_dyn.sio();
+        let _ = bus_dyn.sio_mut();
+        let _ = bus_dyn.gpio_in();
+        let empty = bus_dyn.decode_cache_get(0);
+        bus_dyn.decode_cache_set(0, empty);
+        let _ = bus_dyn.extra_wait_states();
+        bus_dyn.reset_extra_wait_states();
+        let _ = bus_dyn.trace_enabled();
+        // emit_trace is a no-op unless trace_enabled is true, but we
+        // still call it to validate the signature.
+        bus_dyn.emit_trace('R', 4, 0x2000_0000, 0, 0);
     }
 }

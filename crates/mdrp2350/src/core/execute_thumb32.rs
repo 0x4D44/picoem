@@ -1,8 +1,7 @@
 // Helpers used by stubs once instructions are implemented in later stages.
 #![allow(dead_code)]
 
-use crate::bus::Bus;
-use super::CortexM33;
+use super::{CortexM33, CoreBus};
 use super::execute::{sign_extend, add_with_carry};
 
 // ============================================================================
@@ -103,7 +102,7 @@ pub(crate) fn barrel_shift(val: u32, shift_type: u8, amount: u32, carry_in: bool
 impl CortexM33 {
     // -- Data processing (modified immediate) --------------------------------
 
-    pub(crate) fn thumb32_dp_modified_imm(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_dp_modified_imm<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let op = ((hw0 >> 5) & 0xF) as u8;
         let s = (hw0 >> 4) & 1 != 0;
         let rn = (hw0 & 0xF) as usize;
@@ -248,7 +247,7 @@ impl CortexM33 {
 
     // -- Data processing (plain binary immediate) ----------------------------
 
-    pub(crate) fn thumb32_dp_plain_imm(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_dp_plain_imm<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let op = ((hw0 >> 4) & 0x1F) as u8;
         let rn = (hw0 & 0xF) as usize;
         let rd = ((hw1 >> 8) & 0xF) as usize;
@@ -377,7 +376,7 @@ impl CortexM33 {
 
     // -- Data processing (shifted register) ----------------------------------
 
-    pub(crate) fn thumb32_dp_shifted_reg(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_dp_shifted_reg<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let op = ((hw0 >> 5) & 0xF) as u8;
         let s = (hw0 >> 4) & 1 != 0;
         let rn = (hw0 & 0xF) as usize;
@@ -523,7 +522,7 @@ impl CortexM33 {
 
     // -- Load/store single ---------------------------------------------------
 
-    pub(crate) fn thumb32_load_store_single(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_load_store_single<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let size = ((hw0 >> 5) & 0x3) as u8;    // hw0[6:5]: 00=byte, 01=half, 10=word
         let load = (hw0 >> 4) & 1 != 0;         // hw0[4]: 1=load, 0=store
         let sign = (hw0 >> 8) & 1 != 0;         // hw0[8]: 1=signed load
@@ -579,9 +578,9 @@ impl CortexM33 {
     /// Perform a single load/store memory access by size and sign.
     /// Returns cycle count: load=2, store=2, undefined=1 (M33 measured).
     #[inline(always)]
-    fn thumb32_ls_single_access(
+    fn thumb32_ls_single_access<B: CoreBus>(
         &mut self, size: u8, sign: bool, load: bool,
-        rt: usize, addr: u32, bus: &mut Bus,
+        rt: usize, addr: u32, bus: &mut B,
     ) -> u32 {
         match (size, sign) {
             (0b00, false) => {
@@ -622,7 +621,7 @@ impl CortexM33 {
 
     // -- Load/store multiple -------------------------------------------------
 
-    pub(crate) fn thumb32_ldm_stm(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_ldm_stm<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let w = (hw0 >> 5) & 1 != 0;
         let load = (hw0 >> 4) & 1 != 0;
         let rn = (hw0 & 0xF) as usize;
@@ -637,14 +636,14 @@ impl CortexM33 {
             _ => return self.thumb32_undefined(hw0, hw1, bus),
         };
 
-        bus.set_burst_mode();
+        bus.set_burst_mode(true);
         for i in 0..16 {
             if reglist & (1 << i) != 0 {
                 if load {
                     let val = self.bus_read32(addr, bus);
                     if i == 15 {
                         if Self::is_exc_return(val) {
-                            bus.clear_burst_mode();
+                            bus.set_burst_mode(false);
                             return self.exit_exception(val, bus);
                         }
                         self.regs.set_pc(val & !1);
@@ -657,7 +656,7 @@ impl CortexM33 {
                 addr = addr.wrapping_add(4);
             }
         }
-        bus.clear_burst_mode();
+        bus.set_burst_mode(false);
 
         // Writeback: if W set AND (for loads) Rn is NOT in reglist
         if w && (!load || reglist & (1 << rn) == 0) {
@@ -675,7 +674,7 @@ impl CortexM33 {
 
     // -- Load/store dual, exclusive, table branch ----------------------------
 
-    pub(crate) fn thumb32_load_store_dual(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_load_store_dual<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         // SG (Secure Gateway): encoding 0xE97F_E97F.
         // When executed from Non-Secure state, transitions to Secure and clears
         // LR bit 0 to mark the return address as Non-Secure.
@@ -830,7 +829,7 @@ impl CortexM33 {
         let offset_addr = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
         let addr = if p { offset_addr } else { base };
 
-        bus.set_burst_mode();
+        bus.set_burst_mode(true);
         if load {
             self.regs.r[rt] = self.bus_read32(addr, bus);
             self.regs.r[rt2] = self.bus_read32(addr.wrapping_add(4), bus);
@@ -838,7 +837,7 @@ impl CortexM33 {
             self.bus_write32(addr, self.regs.r[rt], bus);
             self.bus_write32(addr.wrapping_add(4), self.regs.r[rt2], bus);
         }
-        bus.clear_burst_mode();
+        bus.set_burst_mode(false);
 
         if w && rn != 15 {
             self.regs.r[rn] = offset_addr;
@@ -849,7 +848,7 @@ impl CortexM33 {
 
     // -- Branches and miscellaneous control ----------------------------------
 
-    pub(crate) fn thumb32_branch_misc(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_branch_misc<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         // Sub-dispatch per LLD Section 5.7
         if hw1 & (1 << 14) != 0 {
             // hw1[14] = 1 -> BL
@@ -916,7 +915,7 @@ impl CortexM33 {
 
     // -- Miscellaneous control (MSR, MRS, hints, barriers) ----------------------
 
-    fn thumb32_misc_control(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    fn thumb32_misc_control<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         // Hints: hw0 = 0xF3AF
         if hw0 == 0xF3AF {
             let hint = hw1 & 0xFF;
@@ -930,7 +929,7 @@ impl CortexM33 {
                 0x03 => {
                     // WFI.W: sleep unless there's an enabled pending IRQ
                     let core = self.core_id as usize;
-                    let pending = bus.atomics.irq_pending_load(core);
+                    let pending = self.atomics.irq_pending_load(core);
                     if self.ppb.any_pending_enabled(pending) {
                         1
                     } else {
@@ -938,7 +937,7 @@ impl CortexM33 {
                         1
                     }
                 }
-                0x04 => { bus.signal_sev(); 1 },         // SEV.W
+                0x04 => { self.atomics.sev_both(); 1 },  // SEV.W
                 _ => self.thumb32_undefined(hw0, hw1, bus),
             };
         }
@@ -1105,7 +1104,7 @@ impl CortexM33 {
 
     // -- Multiply (32-bit result) --------------------------------------------
 
-    pub(crate) fn thumb32_multiply(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_multiply<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let op1 = ((hw0 >> 4) & 0x7) as u8;
         let rn = (hw0 & 0xF) as usize;
         let ra = ((hw1 >> 12) & 0xF) as usize;
@@ -1275,7 +1274,7 @@ impl CortexM33 {
 
     // -- Long multiply / divide (64-bit result) ------------------------------
 
-    pub(crate) fn thumb32_long_multiply(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_long_multiply<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let op1 = ((hw0 >> 4) & 0x7) as u8;
         let rn = (hw0 & 0xF) as usize;
         let rd_lo = ((hw1 >> 12) & 0xF) as usize;
@@ -1418,7 +1417,7 @@ impl CortexM33 {
 
     // -- Data processing (register) ------------------------------------------
 
-    pub(crate) fn thumb32_dp_register(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_dp_register<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let rd = ((hw1 >> 8) & 0xF) as usize;
         let rm = (hw1 & 0xF) as usize;
 
@@ -1854,7 +1853,7 @@ impl CortexM33 {
     // -- Undefined 32-bit instruction ----------------------------------------
 
     /// Undefined 32-bit instruction — raises UsageFault.
-    pub(crate) fn thumb32_undefined(&mut self, _hw0: u16, _hw1: u16, _bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb32_undefined<B: CoreBus>(&mut self, _hw0: u16, _hw1: u16, _bus: &mut B) -> u32 {
         self.pending_fault = Some(super::Fault::UsageFault);
         0
     }

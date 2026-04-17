@@ -177,6 +177,10 @@ impl Emulator {
     /// `while` predicate never fires and the core is skipped cheaply.
     pub fn step(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
+        // Phase 3 Stage 2: the Arc-sharing trip-wire lives at the top of
+        // `CortexM33::step` — every caller (tests, harness, this driver)
+        // funnels through it via `bus.atomics()`. No need to duplicate
+        // the check here.
         // Refresh the Bus's view of the master cycle count so any MMIO
         // reads / writes performed during this quantum (notably PLL CS
         // lock bit + lock-arm transitions — see

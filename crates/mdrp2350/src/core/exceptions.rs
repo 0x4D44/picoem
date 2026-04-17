@@ -1,9 +1,8 @@
 use std::sync::atomic::Ordering;
 
-use crate::bus::Bus;
 use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY,
     FPCCR_SPLIMVIOL};
-use super::{CortexM33, Fault};
+use super::{CortexM33, CoreBus, Fault};
 
 /// CONTROL.FPCA bit position (bit 2). Owned exclusively by the three sites
 /// in this file plus `fpu_execute`; see `Ppb` field doc invariants.
@@ -64,7 +63,7 @@ impl CortexM33 {
     /// HardFault handler (IPSR==3), the processor enters lockup state. We
     /// emulate this by halting the core so tests observe the lockup rather
     /// than spinning on a crash loop.
-    pub(crate) fn enter_exception(&mut self, exc_num: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn enter_exception<B: CoreBus>(&mut self, exc_num: u16, bus: &mut B) -> u32 {
         // Publish a sentinel "hardware-triggered exception stacking" PC so
         // the MMIO trace distinguishes the stacking writes from the
         // faulting instruction's own access pattern. Value `0xFFFF_FFFE`
@@ -216,7 +215,7 @@ impl CortexM33 {
     // --- Exception return ---
 
     /// Pop exception frame, restore mode. Returns cycle cost (~12).
-    pub(crate) fn exit_exception(&mut self, exc_return: u32, bus: &mut Bus) -> u32 {
+    pub(crate) fn exit_exception<B: CoreBus>(&mut self, exc_return: u32, bus: &mut B) -> u32 {
         // Publish a sentinel "exception-return unstacking" PC so the
         // MMIO trace distinguishes the unstacking reads from ordinary
         // instruction-driven access. Value `0xFFFF_FFFD` is paired with
@@ -412,7 +411,7 @@ impl CortexM33 {
     /// NMI bypasses PRIMASK/FAULTMASK and never consults `can_preempt`;
     /// every other candidate goes through `can_preempt` so PRIMASK /
     /// BASEPRI / FAULTMASK / active-exception priority all apply.
-    pub(crate) fn try_take_any_pending_exception(&mut self, bus: &mut Bus) -> Option<u32> {
+    pub(crate) fn try_take_any_pending_exception<B: CoreBus>(&mut self, bus: &mut B) -> Option<u32> {
         let icsr = self.ppb.icsr;
 
         // NMI (exc 2, priority -2): non-maskable, highest fixed priority.
@@ -485,7 +484,7 @@ impl CortexM33 {
                 let bit = irq % 32;
                 if word < crate::bus::ppb::NVIC_BIT_WORDS {
                     let core = self.core_id as usize;
-                    bus.atomics.clear_irq(core, irq as u32);
+                    self.atomics.clear_irq(core, irq as u32);
                     self.ppb.nvic_ispr[word].fetch_and(!(1u32 << bit), Ordering::Relaxed);
                 }
                 self.ppb.set_irq_active(irq as u32);
@@ -497,7 +496,7 @@ impl CortexM33 {
     // --- Fault delivery ---
 
     /// Deliver a pending fault. Returns cycle cost.
-    pub(crate) fn deliver_fault(&mut self, fault: Fault, bus: &mut Bus) -> u32 {
+    pub(crate) fn deliver_fault<B: CoreBus>(&mut self, fault: Fault, bus: &mut B) -> u32 {
         match fault {
             Fault::UsageFault => {
                 // Set UFSR.UNDEFINSTR (bit 16 of CFSR)

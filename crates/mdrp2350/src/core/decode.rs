@@ -1,5 +1,5 @@
-use crate::bus::{Bus, DecodedOp, DECODE_CACHE_SIZE, is_cacheable_pc};
-use super::CortexM33;
+use crate::bus::{DecodedOp, DECODE_CACHE_SIZE, is_cacheable_pc};
+use super::{CortexM33, CoreBus};
 
 // Direct-mapped index mask — kept local to avoid crossing `pub(crate)`
 // visibility boundaries for a one-liner.
@@ -241,7 +241,7 @@ impl CortexM33 {
     ///
     /// Slow path (cache miss, or hit on an impure op): identical cycle
     /// semantics to pre-cache behaviour.
-    pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
+    pub(crate) fn decode_execute<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         // Publish the instruction PC on the bus so the MMIO trace
@@ -256,7 +256,7 @@ impl CortexM33 {
         // `bus` survives into dispatch.
         let entry = if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
-            let e = bus.decode_cache[slot];
+            let e = bus.decode_cache_get(slot);
             if e.tag == pc { Some(e) } else { None }
         } else {
             None
@@ -374,7 +374,7 @@ impl CortexM33 {
     /// `decode_execute` call returns).
     #[cold]
     #[inline(never)]
-    fn populate_decode_cache(&mut self, bus: &mut Bus, pc: u32) -> DecodedOp {
+    fn populate_decode_cache<B: CoreBus>(&mut self, bus: &mut B, pc: u32) -> DecodedOp {
         // Reset the accumulator so the fetch's wait-state contribution
         // (sram bank 2/6 = +1, others = 0) can be captured cleanly in
         // `fetch_wait`. The caller (`decode_execute`) will not look at
@@ -382,9 +382,8 @@ impl CortexM33 {
         // `entry.fetch_wait` on both paths.
         bus.reset_extra_wait_states();
 
-        let core = self.core_id as usize;
         let hw0 = bus.read16(pc, self.core_id);
-        if bus.bus_fault(core) {
+        if bus.bus_fault(self.core_id) {
             // Fetch fault — DO NOT cache. Return a minimal entry so the
             // caller's dispatch path can proceed and the post-step fault
             // delivery will fire. `is_pure = false` keeps us on the slow
@@ -400,7 +399,7 @@ impl CortexM33 {
 
         let wide = is_wide(hw0);
         let hw1 = if wide { bus.read16(pc.wrapping_add(2), self.core_id) } else { 0 };
-        if wide && bus.bus_fault(core) {
+        if wide && bus.bus_fault(self.core_id) {
             return DecodedOp {
                 tag: u32::MAX,
                 hw0,
@@ -426,7 +425,7 @@ impl CortexM33 {
 
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
-            bus.decode_cache[slot] = entry;
+            bus.decode_cache_set(slot, entry);
         }
 
         entry
@@ -440,7 +439,7 @@ impl CortexM33 {
     /// Thumb-16 the opcode is the single halfword, so `hw0 = opcode`
     /// and `hw1 = 0`. Prerequisite for fn-pointer dispatch (Stage A of
     /// HLD 2026.04.15).
-    pub(crate) fn execute_thumb16(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn execute_thumb16<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         match opcode >> 11 {
             // Shift (immediate)
             0b00000 => self.thumb16_lsl_imm(opcode, 0, bus),
@@ -500,7 +499,7 @@ impl CortexM33 {
     /// Every arm calls a handler with the uniform signature
     /// `fn(&mut CortexM33, hw0: u16, hw1: u16, &mut Bus) -> u32`.
     /// Prerequisite for fn-pointer dispatch (Stage A of HLD 2026.04.15).
-    pub(crate) fn execute_thumb32(&mut self, hw0: u16, hw1: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn execute_thumb32<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let op1 = (hw0 >> 11) & 0x3;
         let op2 = ((hw0 >> 4) & 0x7F) as u32;
         let op  = (hw1 >> 15) & 0x1;
