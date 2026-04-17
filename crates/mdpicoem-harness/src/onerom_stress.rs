@@ -85,6 +85,12 @@ pub struct Histogram {
     pub p50_ns: u32,
     pub p95_ns: u32,
     pub p99_ns: u32,
+    /// Number of distinct cycle counts observed across `Pass` cases. A
+    /// small value (≤ 3) signals that the per-case latency is
+    /// near-deterministic and percentile rows are a misleading
+    /// "statistical" framing — the report surfaces this so a reader
+    /// doesn't quote `p95` as if it were a tail.
+    pub unique_cycles: usize,
 }
 
 /// Convert a cycle count to nanoseconds via the provided sysclk.
@@ -128,6 +134,7 @@ pub fn compute_histogram(results: &[CaseResult], sys_clk_hz: u32) -> Histogram {
             p50_ns: 0,
             p95_ns: 0,
             p99_ns: 0,
+            unique_cycles: 0,
         };
     }
 
@@ -156,10 +163,12 @@ pub fn compute_histogram(results: &[CaseResult], sys_clk_hz: u32) -> Histogram {
             p50_ns: 0,
             p95_ns: 0,
             p99_ns: 0,
+            unique_cycles: 0,
         };
     }
 
     cycles.sort_unstable();
+    let unique_cycles = cycles.windows(2).filter(|w| w[0] != w[1]).count() + 1;
     let min_cycles = *cycles.first().unwrap();
     let max_cycles = *cycles.last().unwrap();
     // Sum fits in u64: max u32 cycles × 2048 max cases ≪ 2^64.
@@ -189,6 +198,7 @@ pub fn compute_histogram(results: &[CaseResult], sys_clk_hz: u32) -> Histogram {
         p50_ns,
         p95_ns,
         p99_ns,
+        unique_cycles,
     }
 }
 
@@ -282,6 +292,16 @@ pub fn format_report(
     writeln!(out, "  p95    : {:>4}", hist.p95_ns).unwrap();
     writeln!(out, "  p99    : {:>4}", hist.p99_ns).unwrap();
     writeln!(out, "  max    : {:>4}", hist.max_ns).unwrap();
+    writeln!(out, "  unique cycle values: {}", hist.unique_cycles).unwrap();
+    if hist.pass > 0 && hist.unique_cycles <= 3 {
+        writeln!(
+            out,
+            "  (note: near-deterministic distribution — percentiles above \
+             are not meaningful as 'tails', they name the 2–3 steady-state \
+             cycle buckets the emulator exhibits for this fixture)"
+        )
+        .unwrap();
+    }
     writeln!(out).unwrap();
     writeln!(
         out,
@@ -349,6 +369,7 @@ mod tests {
                 p50_ns: 0,
                 p95_ns: 0,
                 p99_ns: 0,
+                unique_cycles: 0,
             }
         );
     }
@@ -458,5 +479,61 @@ mod tests {
             expected,
             "expected byte must match shadow[stimulus_level(0x1802) & 0xFFFF]"
         );
+    }
+
+    /// `unique_cycles` must count distinct cycle buckets across Pass
+    /// cases, so the report can flag near-deterministic distributions
+    /// where percentiles would otherwise be quoted as if they were
+    /// statistical tails. Three hand-picked inputs cover the shapes
+    /// we care about: all-same (bucket count 1), two-bucket step
+    /// function (count 2), continuous (count equals sample count).
+    #[test]
+    fn histogram_unique_cycles_counts_distinct_buckets() {
+        use crate::onerom_serving_oracle::Case;
+        let mk = |label: &'static str, addr: u16, cycles: u32| CaseResult {
+            case: Case::new(label, addr),
+            expected_byte: Some(0),
+            observed_byte: Some(0),
+            resolved_addr: None,
+            latency_cycles: Some(cycles),
+            verdict: Verdict::Pass,
+        };
+
+        // All-same: five passes at 20 cycles → 1 bucket.
+        let h1 = compute_histogram(
+            &[
+                mk("a", 0x1800, 20),
+                mk("b", 0x1801, 20),
+                mk("c", 0x1802, 20),
+                mk("d", 0x1803, 20),
+                mk("e", 0x1804, 20),
+            ],
+            150_000_000,
+        );
+        assert_eq!(h1.unique_cycles, 1);
+
+        // Two-bucket step: alternating 34 and 36 → 2 buckets.
+        let h2 = compute_histogram(
+            &[
+                mk("a", 0x1800, 34),
+                mk("b", 0x1801, 36),
+                mk("c", 0x1802, 34),
+                mk("d", 0x1803, 36),
+            ],
+            150_000_000,
+        );
+        assert_eq!(h2.unique_cycles, 2);
+
+        // Continuous: four distinct cycle counts → 4 buckets.
+        let h3 = compute_histogram(
+            &[
+                mk("a", 0x1800, 10),
+                mk("b", 0x1801, 20),
+                mk("c", 0x1802, 30),
+                mk("d", 0x1803, 40),
+            ],
+            150_000_000,
+        );
+        assert_eq!(h3.unique_cycles, 4);
     }
 }

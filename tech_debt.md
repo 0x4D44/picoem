@@ -1115,3 +1115,12 @@ for the shape). Low-risk change once scoped — ~1 day. Out of scope for
 the initial stress-harness wave (2026-04-17). The stress CPU binary is
 retained as a latent regression target: when the fix lands, it'll flip
 to full 2048/2048 PASS without any binary-side change.
+
+**Caveat on the current 140 "passes":** they are a double-coincidence,
+not real serve-path coverage. Each passing case has (a) a stim pattern
+that incidentally sets GPIO0 high AND (b) an expected shadow byte of
+`0x00`, so the oracle's `ZERO_BYTE_TRUST_TIMEOUT_CPU` fallback declares
+pass after 40 cycles of dead pins. No case currently verifies that the
+CPU actually drove the right byte onto the data pins via the 1541
+serve loop. The pass count should be read as "0 of 2048 cases are real
+serve-path verifications" until the pin-profile fix lands.

@@ -30,11 +30,21 @@
 //! on GPIO13 (per `test-sdrr-0-cpu`'s bake). Net effect at 2048-case
 //! scale: the CPU stays in its wait-loop for stim patterns that don't
 //! happen to set GPIO0 high, reporting `NoResolve` (OEN never asserted).
-//! Current run: ~140/2048 PASS. Fix requires parameterising
-//! `CpuServingOracle` over a per-fixture pin profile (read from flash
-//! metadata); tracked in `tech_debt.md`.  This binary is retained as a
-//! latent regression target that will flip to full PASS once the pin
-//! profile wiring lands.
+//!
+//! Current run: ~140/2048 PASS. **Those 140 are a double-coincidence,
+//! not real serve-path coverage**: they pass only because (a) the stim
+//! pattern incidentally sets GPIO0 high AND (b) the expected shadow
+//! byte is `0x00`, so the oracle's `ZERO_BYTE_TRUST_TIMEOUT_CPU`
+//! fallback declares pass after 40 cycles of dead pins. Cases where
+//! GPIO0 is low never reach the timeout classification; cases where
+//! GPIO0 is high but the expected byte is non-zero would surface as
+//! `NoStableByte`. No case currently verifies that the CPU actually
+//! served the right byte onto the data pins via the 1541 serve loop.
+//!
+//! Fix requires parameterising `CpuServingOracle` over a per-fixture
+//! pin profile (read from flash metadata); tracked in `tech_debt.md`.
+//! This binary is retained as a latent regression target that will
+//! flip to full PASS once the pin profile wiring lands.
 //!
 //! Design: `wrk_docs/2026.04.17 - HLD - OneROM Stress Harness.md`.
 //!
