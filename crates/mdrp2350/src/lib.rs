@@ -164,8 +164,14 @@ impl Emulator {
                     arm[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
                 }
             }
-            Cores::RiscV(_) => {
-                // P1b fills this in per HLD §4.3.
+            Cores::RiscV(cs) => {
+                // HLD §4.3: each hart resets to its §4.3 power-on state
+                // (pc = 0x2000_0000, CSRs zeroed except mtvec / mcountinhibit,
+                // hart_id preserved). Shared bus state resets below, identical
+                // to the Arm arm.
+                for i in 0..2 {
+                    cs[i].reset();
+                }
             }
         }
 
@@ -328,6 +334,15 @@ impl Emulator {
             }
             self.bus.pending_invalidation_regions = 0;
         }
+
+        // Compose external stimulus into `bus.gpio_in` before the cores
+        // dispatch. `update_gpio` also runs at the end of the quantum
+        // (inside `tick_peripherals`); the extra call here catches any
+        // `gpio_external_in` / `gpio_external_mask` writes that landed
+        // between `step()` invocations, so the cores' first MMIO read
+        // of SIO_GPIO_IN in this quantum sees the freshly-composed view
+        // instead of a one-quantum-stale value.
+        self.update_gpio();
 
         match &mut self.cores {
             Cores::Arm(cs) => step_pair_arm(cs, &mut self.bus, target),
@@ -762,7 +777,7 @@ impl EmulatorBuilder {
                 CortexM33::new(0, Arc::clone(&atomics)),
                 CortexM33::new(1, Arc::clone(&atomics)),
             ]),
-            Arch::RiscV => Cores::RiscV([Hazard3::new(), Hazard3::new()]),
+            Arch::RiscV => Cores::RiscV([Hazard3::new(0), Hazard3::new(1)]),
         };
         // Silence unused-atomics warning on RiscV arm (no atomics wired yet).
         let _ = &atomics;
