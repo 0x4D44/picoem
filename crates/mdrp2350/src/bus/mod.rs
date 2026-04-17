@@ -1233,6 +1233,11 @@ impl Bus {
             0xD => {
                 let reg_offset = addr & 0xFFF;
                 let word_offset = reg_offset & !3;
+                debug_assert!(
+                    !crate::core::PerCoreSio::owns_offset(word_offset),
+                    "DIV/INTERP addr 0x{:08X} reached Bus::read8 — use CortexM33::bus_read8 wrapper",
+                    addr
+                );
                 let word = match word_offset {
                     0x004 => self.gpio_in,
                     0x008 => self.read_gpio_hi_in(),
@@ -1257,6 +1262,11 @@ impl Bus {
 
     pub fn write8(&mut self, addr: u32, val: u8, core: u8) {
         let region = addr >> 28;
+        debug_assert!(
+            region != 0xD || !crate::core::PerCoreSio::owns_offset(addr & 0xFFF),
+            "DIV/INTERP addr 0x{:08X} reached Bus::write8 — use CortexM33::bus_write8 wrapper",
+            addr
+        );
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
         self.last_access_cycles = cycles;
@@ -1651,6 +1661,11 @@ impl Bus {
             0xD => {
                 let reg_offset = addr & 0xFFF;
                 let word_offset = reg_offset & !3;
+                debug_assert!(
+                    !crate::core::PerCoreSio::owns_offset(word_offset),
+                    "DIV/INTERP addr 0x{:08X} reached Bus::read16 — use CortexM33::bus_read16 wrapper",
+                    addr
+                );
                 let word = match word_offset {
                     0x004 => self.gpio_in,
                     0x008 => self.read_gpio_hi_in(),
@@ -1679,6 +1694,11 @@ impl Bus {
         debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
             "PPB address 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
             addr);
+        debug_assert!(
+            addr >> 28 != 0xD || !crate::core::PerCoreSio::owns_offset(addr & 0xFFF),
+            "DIV/INTERP addr 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
+            addr
+        );
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -2006,6 +2026,11 @@ impl Bus {
             }
             0xD => {
                 let reg_offset = addr & 0xFFF;
+                debug_assert!(
+                    !crate::core::PerCoreSio::owns_offset(reg_offset),
+                    "DIV/INTERP addr 0x{:08X} reached Bus::read32 — use CortexM33::bus_read32 wrapper",
+                    addr
+                );
                 match reg_offset {
                     0x004 => self.gpio_in,
                     0x008 => self.read_gpio_hi_in(),
@@ -2148,6 +2173,11 @@ impl Bus {
             }
             0xD => {
                 let reg_offset = addr & 0xFFF;
+                debug_assert!(
+                    !crate::core::PerCoreSio::owns_offset(reg_offset),
+                    "DIV/INTERP addr 0x{:08X} reached Bus::write32 — use CortexM33::bus_write32 wrapper",
+                    addr
+                );
                 self.sio.write32(reg_offset, val, core as usize);
                 // FIFO_WR event signaling: set event_flag for receiver core.
                 if let Some(receiver) = self.sio.pending_fifo_event.take() {

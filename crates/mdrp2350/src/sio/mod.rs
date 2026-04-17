@@ -1,9 +1,13 @@
-use mdpicoem_common::{Divider, Fifo};
+use mdpicoem_common::Fifo;
 
 /// Single-cycle IO block.
 ///
-/// GPIO output/OE/input registers + CPUID dispatch.
-/// Phase 5 adds spinlocks, FIFOs, doorbells, divider, interpolators.
+/// GPIO output/OE/input registers + CPUID dispatch, FIFOs, spinlocks,
+/// doorbells, MTIME. Phase 3 Stage 3 (LLD V7 §6): the **per-core**
+/// DIV and INTERP register files have moved off `Sio` onto each
+/// `CortexM33` as `PerCoreSio`, because cores see distinct register
+/// state there. Intercept lives in `CortexM33::bus_read32/write32` at
+/// SIO offsets 0x060..=0x0FC — those offsets never reach `Sio`.
 pub struct Sio {
     /// SIO GPIO output register (offset 0x010).
     pub gpio_out: u32,
@@ -23,8 +27,6 @@ pub struct Sio {
     /// set `event_flag[other_core]`. Value is the receiver core index,
     /// or `None` if no event pending.
     pub pending_fifo_event: Option<usize>,
-    /// Per-core integer divider (§2.4).
-    divider: [Divider; 2],
     /// Doorbell pending bits — 4 bits per core (§2.5).
     pub doorbell_pending: [u8; 2],
     /// 64-bit platform timer counter (§2.6).
@@ -35,9 +37,6 @@ pub struct Sio {
     pub mtimecmp: [u64; 2],
     /// Per-core edge-triggered match flag (§2.6).
     pub mtime_match_asserted: [bool; 2],
-    /// Per-core interpolator register backing store (§2.7).
-    /// 2 cores x 32 words (INTERP0 at 0x080–0x0BC, INTERP1 at 0x0C0–0x0FC).
-    interp: [[u32; 32]; 2],
 }
 
 impl Sio {
@@ -51,17 +50,17 @@ impl Sio {
             fifo_roe: [false; 2],
             spinlock_bits: 0,
             pending_fifo_event: None,
-            divider: [Divider::default(); 2],
             doorbell_pending: [0; 2],
             mtime: 0,
             mtime_ctrl: 0,
             mtimecmp: [0; 2],
             mtime_match_asserted: [false; 2],
-            interp: [[0; 32]; 2],
         }
     }
 
     /// Explicitly reset all SIO state. Called from `Emulator::reset()`.
+    /// Per-core DIV/INTERP state (`PerCoreSio`) is cleared on the
+    /// individual `CortexM33`s in `Emulator::reset` — not here.
     pub fn reset(&mut self) {
         self.gpio_out = 0;
         self.gpio_oe = 0;
@@ -71,17 +70,18 @@ impl Sio {
         self.fifo_roe = [false; 2];
         self.spinlock_bits = 0;
         self.pending_fifo_event = None;
-        self.divider = [Divider::default(); 2];
         self.doorbell_pending = [0; 2];
         self.mtime = 0;
         self.mtime_ctrl = 0;
         self.mtimecmp = [0; 2];
         self.mtime_match_asserted = [false; 2];
-        self.interp = [[0; 32]; 2];
     }
 
     /// 32-bit register read. `offset` is already masked to 12 bits by Bus.
-    /// GPIO_IN (0x004) and GPIO_HI_IN (0x008) are handled by Bus before calling this.
+    /// GPIO_IN (0x004) and GPIO_HI_IN (0x008) are handled by Bus before
+    /// calling this; DIV and INTERP (0x060..=0x0FC) are intercepted on
+    /// `CortexM33` into `sio_local` and never reach here (Phase 3
+    /// Stage 3, LLD V7 §6).
     pub fn read32(&mut self, offset: u32, core: usize) -> u32 {
         match offset {
             0x000 => core as u32,   // CPUID
@@ -92,20 +92,6 @@ impl Sio {
             0x058 => self.fifo_rd(core),
             // Spinlocks
             0x05C => self.spinlock_bits,  // SPINLOCK_ST
-            // Integer divider (0x060–0x078)
-            0x060 | 0x068 => self.divider[core].dividend,  // DIV_UDIVIDEND / DIV_SDIVIDEND
-            0x064 | 0x06C => self.divider[core].divisor,   // DIV_UDIVISOR / DIV_SDIVISOR
-            0x070 | 0x074 => self.divider_result_read(offset, core),
-            0x078 => {  // DIV_CSR
-                let ready = 1u32;
-                let dirty = if self.divider[core].dirty { 2 } else { 0 };
-                ready | dirty
-            }
-            // Interpolators (0x080–0x0FC)
-            0x080..=0x0FC => {
-                let idx = ((offset - 0x080) >> 2) as usize;
-                self.interp[core][idx]
-            }
             0x100..=0x17F => self.spinlock_read(offset),
             // Doorbells
             0x188 => self.doorbell_pending[core] as u32,  // DOORBELL_IN_SET read
@@ -122,6 +108,9 @@ impl Sio {
     }
 
     /// 32-bit register write. `offset` is already masked to 12 bits by Bus.
+    /// DIV and INTERP (0x060..=0x0FC) are intercepted on `CortexM33` and
+    /// never reach here — see [`Self::read32`] for the Phase 3 Stage 3
+    /// split.
     pub fn write32(&mut self, offset: u32, val: u32, core: usize) {
         match offset {
             // GPIO_OUT: RP2350 offsets (8-byte spacing)
@@ -137,15 +126,6 @@ impl Sio {
             // FIFO
             0x050 => self.fifo_st_write(val, core),
             0x054 => self.fifo_wr(val, core),
-            // Integer divider (0x060–0x078)
-            0x060..=0x078 => self.divider_write(offset, val, core),
-            // Interpolators (0x080–0x0FC)
-            0x080..=0x0FC => {
-                let idx = ((offset - 0x080) >> 2) as usize;
-                if idx < 32 {
-                    self.interp[core][idx] = val;
-                }
-            }
             // Spinlocks
             0x100..=0x17F => self.spinlock_write(offset),
             // Doorbells
@@ -388,84 +368,8 @@ impl Sio {
         self.spinlock_bits &= !(1u32 << n);
     }
 
-    // --- Integer divider helpers (§2.4) ---
-
-    /// Read quotient or remainder, advancing the reads_pending counter.
-    /// Clears DIRTY after both quotient and remainder have been read.
-    fn divider_result_read(&mut self, offset: u32, core: usize) -> u32 {
-        let d = &mut self.divider[core];
-        let val = match offset {
-            0x070 => d.quotient,
-            0x074 => d.remainder,
-            _ => return 0,
-        };
-        if d.dirty {
-            d.reads_pending += 1;
-            if d.reads_pending >= 2 {
-                d.dirty = false;
-                d.reads_pending = 0;
-            }
-        }
-        val
-    }
-
-    fn divider_write(&mut self, offset: u32, val: u32, core: usize) {
-        let d = &mut self.divider[core];
-        match offset {
-            0x060 => { // DIV_UDIVIDEND
-                d.dividend = val;
-                d.signed = false;
-            }
-            0x064 => { // DIV_UDIVISOR — triggers unsigned computation
-                d.divisor = val;
-                d.signed = false;
-                Self::compute_division(d);
-            }
-            0x068 => { // DIV_SDIVIDEND
-                d.dividend = val;
-                d.signed = true;
-            }
-            0x06C => { // DIV_SDIVISOR — triggers signed computation
-                d.divisor = val;
-                d.signed = true;
-                Self::compute_division(d);
-            }
-            0x070 => { // DIV_QUOTIENT (direct set)
-                d.quotient = val;
-                d.dirty = true;
-                d.reads_pending = 0;
-            }
-            0x074 => { // DIV_REMAINDER (direct set)
-                d.remainder = val;
-                d.dirty = true;
-                d.reads_pending = 0;
-            }
-            _ => {}
-        }
-    }
-
-    fn compute_division(d: &mut Divider) {
-        if d.divisor == 0 {
-            // Division by zero (RP2350 behavior)
-            if d.signed {
-                let dividend_signed = d.dividend as i32;
-                d.quotient = if dividend_signed < 0 { 1u32 } else { (-1i32) as u32 };
-            } else {
-                d.quotient = 0xFFFF_FFFF;
-            }
-            d.remainder = d.dividend;
-        } else if d.signed {
-            let a = d.dividend as i32;
-            let b = d.divisor as i32;
-            d.quotient = a.wrapping_div(b) as u32;
-            d.remainder = a.wrapping_rem(b) as u32;
-        } else {
-            d.quotient = d.dividend.wrapping_div(d.divisor);
-            d.remainder = d.dividend.wrapping_rem(d.divisor);
-        }
-        d.dirty = true;
-        d.reads_pending = 0;
-    }
+    // Integer divider helpers moved to `core::PerCoreSio` in Phase 3
+    // Stage 3 (LLD V7 §6). See `crates/mdrp2350/src/core/mod.rs`.
 
     // --- MTIME helpers (§2.6) ---
 
@@ -520,111 +424,10 @@ impl Default for Sio {
 mod tests {
     use super::*;
 
-    // ---- Integer divider tests (Stage B3) ----
-
-    #[test]
-    fn divider_unsigned_basic() {
-        let mut sio = Sio::new();
-        let core = 0;
-        // 100 / 7 = 14 remainder 2
-        sio.write32(0x060, 100, core); // DIV_UDIVIDEND
-        sio.write32(0x064, 7, core);   // DIV_UDIVISOR
-        assert_eq!(sio.read32(0x070, core), 14);
-        assert_eq!(sio.read32(0x074, core), 2);
-    }
-
-    #[test]
-    fn divider_signed_basic() {
-        let mut sio = Sio::new();
-        let core = 0;
-        // -100 / 7 = -14 remainder -2
-        sio.write32(0x068, (-100i32) as u32, core); // DIV_SDIVIDEND
-        sio.write32(0x06C, 7, core);                // DIV_SDIVISOR
-        assert_eq!(sio.read32(0x070, core) as i32, -14);
-        assert_eq!(sio.read32(0x074, core) as i32, -2);
-    }
-
-    #[test]
-    fn divider_signed_negative_divisor() {
-        let mut sio = Sio::new();
-        let core = 0;
-        // 100 / -7 = -14 remainder 2
-        sio.write32(0x068, 100, core);
-        sio.write32(0x06C, (-7i32) as u32, core);
-        assert_eq!(sio.read32(0x070, core) as i32, -14);
-        assert_eq!(sio.read32(0x074, core) as i32, 2);
-    }
-
-    #[test]
-    fn divider_unsigned_div_by_zero() {
-        let mut sio = Sio::new();
-        let core = 0;
-        sio.write32(0x060, 42, core); // dividend = 42
-        sio.write32(0x064, 0, core);  // divisor = 0
-        assert_eq!(sio.read32(0x070, core), 0xFFFF_FFFF);
-        assert_eq!(sio.read32(0x074, core), 42);
-    }
-
-    #[test]
-    fn divider_signed_div_by_zero_positive() {
-        let mut sio = Sio::new();
-        let core = 0;
-        sio.write32(0x068, 42, core); // dividend = 42 (positive)
-        sio.write32(0x06C, 0, core);  // divisor = 0
-        // positive dividend / 0 → quotient = -1
-        assert_eq!(sio.read32(0x070, core) as i32, -1);
-        assert_eq!(sio.read32(0x074, core), 42);
-    }
-
-    #[test]
-    fn divider_signed_div_by_zero_negative() {
-        let mut sio = Sio::new();
-        let core = 0;
-        sio.write32(0x068, (-42i32) as u32, core); // dividend = -42
-        sio.write32(0x06C, 0, core);               // divisor = 0
-        // negative dividend / 0 → quotient = 1
-        assert_eq!(sio.read32(0x070, core), 1);
-        assert_eq!(sio.read32(0x074, core), (-42i32) as u32);
-    }
-
-    #[test]
-    fn divider_dirty_flag_clear_after_both_reads() {
-        let mut sio = Sio::new();
-        let core = 0;
-        sio.write32(0x060, 100, core);
-        sio.write32(0x064, 7, core);
-        // CSR should show DIRTY (bit 1) and READY (bit 0)
-        assert_eq!(sio.read32(0x078, core) & 0x3, 0x3);
-        // Read quotient — still dirty
-        sio.read32(0x070, core);
-        assert_eq!(sio.read32(0x078, core) & 0x2, 0x2);
-        // Read remainder — dirty should clear
-        sio.read32(0x074, core);
-        assert_eq!(sio.read32(0x078, core) & 0x2, 0x0);
-        // READY always 1
-        assert_eq!(sio.read32(0x078, core) & 0x1, 0x1);
-    }
-
-    #[test]
-    fn divider_per_core_isolation() {
-        let mut sio = Sio::new();
-        sio.write32(0x060, 100, 0);
-        sio.write32(0x064, 10, 0);
-        sio.write32(0x060, 200, 1);
-        sio.write32(0x064, 20, 1);
-        assert_eq!(sio.read32(0x070, 0), 10);
-        assert_eq!(sio.read32(0x070, 1), 10);
-    }
-
-    #[test]
-    fn divider_direct_write_quotient_remainder() {
-        let mut sio = Sio::new();
-        let core = 0;
-        sio.write32(0x070, 0xDEAD, core);
-        sio.write32(0x074, 0xBEEF, core);
-        assert_eq!(sio.read32(0x070, core), 0xDEAD);
-        assert_eq!(sio.read32(0x074, core), 0xBEEF);
-    }
+    // Integer divider and interpolator tests moved to `core::mod`'s
+    // `tests` module alongside `PerCoreSio` in Phase 3 Stage 3 (LLD V7
+    // §6). DIV / INTERP are now per-core state on `CortexM33`, not
+    // shared SIO state.
 
     // ---- Doorbell tests (Stage C1) ----
 
@@ -749,42 +552,6 @@ mod tests {
         assert_eq!(sio.mtimecmp[1], 0x0000_4444_0000_3333);
     }
 
-    // ---- Interpolator stub tests (Stage C3) ----
-
-    #[test]
-    fn interp_register_round_trip() {
-        let mut sio = Sio::new();
-        let core = 0;
-        // Write to INTERP0_ACCUM0 (offset 0x080)
-        sio.write32(0x080, 0xCAFE_BABE, core);
-        assert_eq!(sio.read32(0x080, core), 0xCAFE_BABE);
-        // Write to last register (offset 0x0FC)
-        sio.write32(0x0FC, 0xDEAD_BEEF, core);
-        assert_eq!(sio.read32(0x0FC, core), 0xDEAD_BEEF);
-        // First register unchanged
-        assert_eq!(sio.read32(0x080, core), 0xCAFE_BABE);
-    }
-
-    #[test]
-    fn interp_per_core_isolation() {
-        let mut sio = Sio::new();
-        sio.write32(0x080, 0x1111, 0);
-        sio.write32(0x080, 0x2222, 1);
-        assert_eq!(sio.read32(0x080, 0), 0x1111);
-        assert_eq!(sio.read32(0x080, 1), 0x2222);
-    }
-
-    #[test]
-    fn interp_all_registers() {
-        let mut sio = Sio::new();
-        let core = 0;
-        // Write all 32 words
-        for i in 0u32..32 {
-            sio.write32(0x080 + i * 4, i + 1, core);
-        }
-        // Read them all back
-        for i in 0u32..32 {
-            assert_eq!(sio.read32(0x080 + i * 4, core), i + 1);
-        }
-    }
+    // Interpolator tests moved to `core::mod`'s `tests` module — see
+    // the head of this test module.
 }

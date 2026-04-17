@@ -9,11 +9,180 @@ pub mod bus_trait;
 
 use std::sync::Arc;
 
+use mdpicoem_common::Divider;
+
 use crate::bus::Bus;
 use crate::bus::ppb::Ppb;
 use crate::threaded::CoreAtomics;
 pub use registers::Registers;
 pub use bus_trait::CoreBus;
+
+/// Per-core interpolator register file (INTERP0 or INTERP1).
+///
+/// 32 words of RP2350 SIO register state. Phase 3 Stage 3 (LLD V7 §6):
+/// the RP2350 `INTERP0` (SIO 0x080–0x0BC) and `INTERP1` (0x0C0–0x0FC)
+/// are per-core — core 0 and core 1 do not share register state. We
+/// model each core's pair of interpolators as two `Interp` instances
+/// on `PerCoreSio`. Only the storage moves off `Sio` onto the core;
+/// semantics (currently a passive register round-trip — see the old
+/// `Sio::read32`/`write32` arms at 0x080..=0x0FC) are unchanged.
+#[derive(Clone, Copy)]
+pub struct Interp(pub [u32; 16]);
+
+impl Default for Interp {
+    fn default() -> Self {
+        Self([0; 16])
+    }
+}
+
+/// Per-core SIO state that cannot be shared across cores — DIV and INTERP
+/// register files. Lives on `CortexM33` so each core has its own copy;
+/// the shared `Sio` owns only truly cross-core state (FIFO, spinlocks,
+/// doorbells, MTIME, GPIO). Phase 3 Stage 3 (LLD V7 §6).
+pub struct PerCoreSio {
+    pub divider: Divider,
+    pub interp: [Interp; 2],
+}
+
+impl Default for PerCoreSio {
+    fn default() -> Self {
+        Self {
+            divider: Divider::default(),
+            interp: [Interp::default(); 2],
+        }
+    }
+}
+
+impl PerCoreSio {
+    /// Read a DIV/INTERP SIO register (offsets 0x060..=0x0FC).
+    /// Caller must pre-mask the SIO offset to 12 bits.
+    ///
+    /// Matches the pre-Stage-3 semantics of `Sio::read32` for the
+    /// DIV/INTERP arms. Non-DIV/INTERP offsets return 0 — the caller
+    /// should have routed them to `Sio` / `Bus` before getting here.
+    pub fn read32(&mut self, offset: u32) -> u32 {
+        match offset {
+            // Integer divider (0x060–0x078)
+            0x060 | 0x068 => self.divider.dividend,
+            0x064 | 0x06C => self.divider.divisor,
+            0x070 | 0x074 => self.divider_result_read(offset),
+            0x078 => {
+                let ready = 1u32;
+                let dirty = if self.divider.dirty { 2 } else { 0 };
+                ready | dirty
+            }
+            // Interpolators (0x080–0x0FC)
+            0x080..=0x0BC => {
+                let idx = ((offset - 0x080) >> 2) as usize;
+                self.interp[0].0[idx]
+            }
+            0x0C0..=0x0FC => {
+                let idx = ((offset - 0x0C0) >> 2) as usize;
+                self.interp[1].0[idx]
+            }
+            _ => 0,
+        }
+    }
+
+    /// Write a DIV/INTERP SIO register.
+    pub fn write32(&mut self, offset: u32, val: u32) {
+        match offset {
+            0x060..=0x078 => self.divider_write(offset, val),
+            0x080..=0x0BC => {
+                let idx = ((offset - 0x080) >> 2) as usize;
+                self.interp[0].0[idx] = val;
+            }
+            0x0C0..=0x0FC => {
+                let idx = ((offset - 0x0C0) >> 2) as usize;
+                self.interp[1].0[idx] = val;
+            }
+            _ => {}
+        }
+    }
+
+    /// True if `offset` (pre-masked to 12 bits) addresses DIV or INTERP.
+    #[inline]
+    pub fn owns_offset(offset: u32) -> bool {
+        (0x060..=0x0FC).contains(&offset)
+    }
+
+    /// Read quotient or remainder, advancing the `reads_pending` counter.
+    /// Clears DIRTY after both quotient and remainder have been read.
+    fn divider_result_read(&mut self, offset: u32) -> u32 {
+        let d = &mut self.divider;
+        let val = match offset {
+            0x070 => d.quotient,
+            0x074 => d.remainder,
+            _ => return 0,
+        };
+        if d.dirty {
+            d.reads_pending += 1;
+            if d.reads_pending >= 2 {
+                d.dirty = false;
+                d.reads_pending = 0;
+            }
+        }
+        val
+    }
+
+    fn divider_write(&mut self, offset: u32, val: u32) {
+        let d = &mut self.divider;
+        match offset {
+            0x060 => { // DIV_UDIVIDEND
+                d.dividend = val;
+                d.signed = false;
+            }
+            0x064 => { // DIV_UDIVISOR — triggers unsigned computation
+                d.divisor = val;
+                d.signed = false;
+                Self::compute_division(d);
+            }
+            0x068 => { // DIV_SDIVIDEND
+                d.dividend = val;
+                d.signed = true;
+            }
+            0x06C => { // DIV_SDIVISOR — triggers signed computation
+                d.divisor = val;
+                d.signed = true;
+                Self::compute_division(d);
+            }
+            0x070 => { // DIV_QUOTIENT (direct set)
+                d.quotient = val;
+                d.dirty = true;
+                d.reads_pending = 0;
+            }
+            0x074 => { // DIV_REMAINDER (direct set)
+                d.remainder = val;
+                d.dirty = true;
+                d.reads_pending = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn compute_division(d: &mut Divider) {
+        if d.divisor == 0 {
+            // Division by zero (RP2350 behavior)
+            if d.signed {
+                let dividend_signed = d.dividend as i32;
+                d.quotient = if dividend_signed < 0 { 1u32 } else { (-1i32) as u32 };
+            } else {
+                d.quotient = 0xFFFF_FFFF;
+            }
+            d.remainder = d.dividend;
+        } else if d.signed {
+            let a = d.dividend as i32;
+            let b = d.divisor as i32;
+            d.quotient = a.wrapping_div(b) as u32;
+            d.remainder = a.wrapping_rem(b) as u32;
+        } else {
+            d.quotient = d.dividend.wrapping_div(d.divisor);
+            d.remainder = d.dividend.wrapping_rem(d.divisor);
+        }
+        d.dirty = true;
+        d.reads_pending = 0;
+    }
+}
 
 /// Synchronous faults raised during instruction execution.
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +296,13 @@ pub struct CortexM33 {
     /// writes do NOT invalidate the local monitor (per ARM semantics).
     /// Phase 0b.2 of the Threaded Dual-Core Emulation plan.
     pub(crate) did_write_this_quantum: bool,
+    /// Per-core SIO state — DIV and INTERP register files. Phase 3
+    /// Stage 3 (LLD V7 §6): moved off `Sio` because each core sees
+    /// its own divider and interpolator state. DIV/INTERP MMIO
+    /// addresses (SIO 0x060..=0x0FC) are intercepted in the
+    /// [`Self::bus_read32`] / [`Self::bus_write32`] wrappers and
+    /// routed here rather than reaching `Bus::read32`/`write32`.
+    pub sio_local: PerCoreSio,
     /// Per-core workload counters (Phase 0a instrumentation).
     pub counters: CoreCounters,
 }
@@ -151,6 +327,7 @@ impl CortexM33 {
             ppb: Ppb::default(),
             exclusive_address: None,
             did_write_this_quantum: false,
+            sio_local: PerCoreSio::default(),
             counters: CoreCounters::default(),
         }
     }
@@ -338,17 +515,34 @@ impl CortexM33 {
     //
     // Data-side bus accesses route through these: PPB addresses
     // (`0xE000_0000..=0xEFFF_FFFF`) resolve against `self.ppb` directly;
-    // everything else (including the boot-RAM carve-out at
+    // SIO DIV/INTERP addresses (`0xD000_0060..=0xD000_00FC`) resolve
+    // against `self.sio_local` — see [`PerCoreSio`] (Phase 3 Stage 3,
+    // LLD V7 §6). Everything else (including the boot-RAM carve-out at
     // `0xEFFF_F000..0xF000_0000`) falls through to `Bus::readN/writeN`.
     //
     // Instruction-fetch path in `decode.rs` bypasses these — opcodes are
-    // never fetched from PPB, so the extra branch is pure overhead there.
+    // never fetched from PPB or SIO, so the extra branches are pure
+    // overhead there.
     // -------------------------------------------------------------------
+
+    /// True when `addr` targets a DIV or INTERP register (SIO
+    /// 0x060..=0x0FC, any 12-KB alias). Helper for the `bus_{read,write}*`
+    /// intercepts.
+    #[inline]
+    fn is_sio_local(addr: u32) -> bool {
+        addr >> 28 == 0xD && PerCoreSio::owns_offset(addr & 0xFFF)
+    }
 
     pub(crate) fn bus_read32<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u32 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             let val = self.ppb.read32(addr);
+            if bus.trace_enabled() {
+                bus.emit_trace('R', 4, addr, val, self.core_id);
+            }
+            val
+        } else if Self::is_sio_local(addr) {
+            let val = self.sio_local.read32(addr & 0xFFF);
             if bus.trace_enabled() {
                 bus.emit_trace('R', 4, addr, val, self.core_id);
             }
@@ -370,6 +564,11 @@ impl CortexM33 {
             if bus.trace_enabled() {
                 bus.emit_trace('W', 4, addr, val, self.core_id);
             }
+        } else if Self::is_sio_local(addr) {
+            self.sio_local.write32(addr & 0xFFF, val);
+            if bus.trace_enabled() {
+                bus.emit_trace('W', 4, addr, val, self.core_id);
+            }
         } else {
             bus.write32(addr, val, self.core_id);
         }
@@ -385,6 +584,15 @@ impl CortexM33 {
             // returns 0 — byte access is more unusual and worth flagging
             // via a telltale zero.
             let word = self.ppb.read32(addr & !3);
+            let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
+            if bus.trace_enabled() {
+                bus.emit_trace('R', 2, addr, val as u32, self.core_id);
+            }
+            val
+        } else if Self::is_sio_local(addr) {
+            // Matches the pre-Stage-3 `Bus::read16` 0xD path: read the
+            // containing 32-bit SIO register and slice the halfword.
+            let word = self.sio_local.read32(addr & 0xFFF & !3);
             let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
             if bus.trace_enabled() {
                 bus.emit_trace('R', 2, addr, val as u32, self.core_id);
@@ -415,6 +623,14 @@ impl CortexM33 {
             if bus.trace_enabled() {
                 bus.emit_trace('W', 2, addr, val as u32, self.core_id);
             }
+        } else if Self::is_sio_local(addr) {
+            // Pre-Stage-3 `Bus::write16` dropped SIO writes silently
+            // (region 0xD had no write16 arm). Preserve that here: drop
+            // the write, but still emit the trace line so observability
+            // is unchanged.
+            if bus.trace_enabled() {
+                bus.emit_trace('W', 2, addr, val as u32, self.core_id);
+            }
         } else {
             bus.write16(addr, val, self.core_id);
         }
@@ -428,6 +644,16 @@ impl CortexM33 {
                 bus.emit_trace('R', 1, addr, 0, self.core_id);
             }
             0
+        } else if Self::is_sio_local(addr) {
+            // Matches the pre-Stage-3 `Bus::read8` 0xD path: read the
+            // containing 32-bit SIO register and slice the byte.
+            let word = self.sio_local.read32(addr & 0xFFF & !3);
+            let byte_idx = (addr & 3) as usize;
+            let val = word.to_le_bytes()[byte_idx];
+            if bus.trace_enabled() {
+                bus.emit_trace('R', 1, addr, val as u32, self.core_id);
+            }
+            val
         } else {
             bus.read8(addr, self.core_id)
         }
@@ -439,6 +665,13 @@ impl CortexM33 {
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte writes drop.
+            if bus.trace_enabled() {
+                bus.emit_trace('W', 1, addr, val as u32, self.core_id);
+            }
+        } else if Self::is_sio_local(addr) {
+            // Pre-Stage-3 `Bus::write8` dropped SIO writes silently
+            // (region 0xD had no write8 arm). Preserve that; see the
+            // matching note in `bus_write16`.
             if bus.trace_enabled() {
                 bus.emit_trace('W', 1, addr, val as u32, self.core_id);
             }
@@ -637,5 +870,257 @@ impl CortexM33 {
 impl Default for CortexM33 {
     fn default() -> Self {
         Self::new(0, Arc::new(CoreAtomics::default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Integer divider tests (Phase 3 Stage 3 — migrated from
+    // `sio::tests` when DIV moved to `PerCoreSio`). These exercise
+    // the storage+compute semantics directly on `PerCoreSio`, matching
+    // the pre-Stage-3 assertions on `Sio::read32/write32`. ----
+
+    #[test]
+    fn divider_unsigned_basic() {
+        let mut s = PerCoreSio::default();
+        // 100 / 7 = 14 remainder 2
+        s.write32(0x060, 100); // DIV_UDIVIDEND
+        s.write32(0x064, 7);   // DIV_UDIVISOR
+        assert_eq!(s.read32(0x070), 14);
+        assert_eq!(s.read32(0x074), 2);
+    }
+
+    #[test]
+    fn divider_signed_basic() {
+        let mut s = PerCoreSio::default();
+        // -100 / 7 = -14 remainder -2
+        s.write32(0x068, (-100i32) as u32); // DIV_SDIVIDEND
+        s.write32(0x06C, 7);                // DIV_SDIVISOR
+        assert_eq!(s.read32(0x070) as i32, -14);
+        assert_eq!(s.read32(0x074) as i32, -2);
+    }
+
+    #[test]
+    fn divider_signed_negative_divisor() {
+        let mut s = PerCoreSio::default();
+        // 100 / -7 = -14 remainder 2
+        s.write32(0x068, 100);
+        s.write32(0x06C, (-7i32) as u32);
+        assert_eq!(s.read32(0x070) as i32, -14);
+        assert_eq!(s.read32(0x074) as i32, 2);
+    }
+
+    #[test]
+    fn divider_unsigned_div_by_zero() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x060, 42); // dividend = 42
+        s.write32(0x064, 0);  // divisor = 0
+        assert_eq!(s.read32(0x070), 0xFFFF_FFFF);
+        assert_eq!(s.read32(0x074), 42);
+    }
+
+    #[test]
+    fn divider_signed_div_by_zero_positive() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x068, 42); // dividend = 42 (positive)
+        s.write32(0x06C, 0);  // divisor = 0
+        // positive dividend / 0 → quotient = -1
+        assert_eq!(s.read32(0x070) as i32, -1);
+        assert_eq!(s.read32(0x074), 42);
+    }
+
+    #[test]
+    fn divider_signed_div_by_zero_negative() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x068, (-42i32) as u32); // dividend = -42
+        s.write32(0x06C, 0);               // divisor = 0
+        // negative dividend / 0 → quotient = 1
+        assert_eq!(s.read32(0x070), 1);
+        assert_eq!(s.read32(0x074), (-42i32) as u32);
+    }
+
+    #[test]
+    fn divider_dirty_flag_clear_after_both_reads() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x060, 100);
+        s.write32(0x064, 7);
+        // CSR should show DIRTY (bit 1) and READY (bit 0)
+        assert_eq!(s.read32(0x078) & 0x3, 0x3);
+        // Read quotient — still dirty
+        s.read32(0x070);
+        assert_eq!(s.read32(0x078) & 0x2, 0x2);
+        // Read remainder — dirty should clear
+        s.read32(0x074);
+        assert_eq!(s.read32(0x078) & 0x2, 0x0);
+        // READY always 1
+        assert_eq!(s.read32(0x078) & 0x1, 0x1);
+    }
+
+    #[test]
+    fn divider_direct_write_quotient_remainder() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x070, 0xDEAD);
+        s.write32(0x074, 0xBEEF);
+        assert_eq!(s.read32(0x070), 0xDEAD);
+        assert_eq!(s.read32(0x074), 0xBEEF);
+    }
+
+    // ---- Interpolator tests (migrated from `sio::tests`) ----
+
+    #[test]
+    fn interp_register_round_trip() {
+        let mut s = PerCoreSio::default();
+        // Write to INTERP0_ACCUM0 (offset 0x080)
+        s.write32(0x080, 0xCAFE_BABE);
+        assert_eq!(s.read32(0x080), 0xCAFE_BABE);
+        // Write to last INTERP1 register (offset 0x0FC)
+        s.write32(0x0FC, 0xDEAD_BEEF);
+        assert_eq!(s.read32(0x0FC), 0xDEAD_BEEF);
+        // First register unchanged
+        assert_eq!(s.read32(0x080), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn interp_all_registers() {
+        let mut s = PerCoreSio::default();
+        // Each INTERP bank exposes 16 words via MMIO:
+        // INTERP0 at 0x080..=0x0BC, INTERP1 at 0x0C0..=0x0FC. Stage 3
+        // split the backing storage into two banks (§6), so i must
+        // stay within the 16-word range of each bank — a larger range
+        // would spill INTERP0 writes into INTERP1 (0x080 + 16*4 = 0x0C0).
+        for i in 0u32..16 {
+            s.write32(0x080 + i * 4, i + 1);
+            s.write32(0x0C0 + i * 4, i + 101);
+        }
+        for i in 0u32..16 {
+            assert_eq!(s.read32(0x080 + i * 4), i + 1);
+            assert_eq!(s.read32(0x0C0 + i * 4), i + 101);
+        }
+    }
+
+    #[test]
+    fn interp0_and_interp1_are_distinct_banks() {
+        let mut s = PerCoreSio::default();
+        // Same sub-offset 0 in INTERP0 (0x080) and INTERP1 (0x0C0)
+        s.write32(0x080, 0x1111_1111);
+        s.write32(0x0C0, 0x2222_2222);
+        assert_eq!(s.read32(0x080), 0x1111_1111);
+        assert_eq!(s.read32(0x0C0), 0x2222_2222);
+    }
+
+    // ---- DIV/INTERP per-core isolation on CortexM33 ----
+
+    /// New Stage-3 regression test. Replaces the pre-Stage-3
+    /// `Sio::divider_per_core_isolation` and `interp_per_core_isolation`
+    /// assertions — now each core carries its own `PerCoreSio`, so the
+    /// check moves from "one `Sio`, two cores" to "two cores, two
+    /// `PerCoreSio`s, shared `CoreAtomics`".
+    ///
+    /// Drives the full MMIO intercept path (`bus_write32` / `bus_read32`
+    /// at `0xD000_00XX`) rather than poking `sio_local` directly — the
+    /// latter would also pass under aliased storage. This proves the
+    /// intercept routes DIV/INTERP accesses to the per-core bank the
+    /// emulator actually uses in production.
+    #[test]
+    fn per_core_sio_is_independent() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut core0 = CortexM33::new(0, Arc::clone(&atomics));
+        let mut core1 = CortexM33::new(1, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(Arc::clone(&atomics));
+
+        // Core 0: 100 / 10 = 10 remainder 0 — all via MMIO.
+        core0.bus_write32(0xD000_0060, 100, &mut bus); // DIV_UDIVIDEND
+        core0.bus_write32(0xD000_0064, 10,  &mut bus); // DIV_UDIVISOR (triggers compute)
+
+        // Core 1 has not touched DIV yet — its quotient must still be
+        // 0 (POR default). If storage were aliased, core 1 would see
+        // core 0's quotient of 10 through the intercept.
+        assert_eq!(
+            core1.bus_read32(0xD000_0070, &mut bus),
+            0,
+            "core 1's quotient must be independent of core 0's divide"
+        );
+
+        // Core 0's MMIO-read quotient / remainder.
+        assert_eq!(core0.bus_read32(0xD000_0070, &mut bus), 10);
+        assert_eq!(core0.bus_read32(0xD000_0074, &mut bus), 0);
+
+        // Core 1 does its own divide via MMIO: 99 / 9 = 11.
+        core1.bus_write32(0xD000_0060, 99, &mut bus);
+        core1.bus_write32(0xD000_0064, 9,  &mut bus);
+        assert_eq!(core1.bus_read32(0xD000_0070, &mut bus), 11);
+
+        // Core 0's quotient is unchanged by core 1's concurrent divide.
+        // (Reads of the DIV result are non-destructive on the value.)
+        assert_eq!(core0.bus_read32(0xD000_0070, &mut bus), 10);
+
+        // Same independence check for INTERP storage, again via MMIO.
+        core0.bus_write32(0xD000_0080, 0xAAAA_AAAA, &mut bus); // INTERP0_ACCUM0 core 0
+        core1.bus_write32(0xD000_0080, 0xBBBB_BBBB, &mut bus); // INTERP0_ACCUM0 core 1
+        assert_eq!(core0.bus_read32(0xD000_0080, &mut bus), 0xAAAA_AAAA);
+        assert_eq!(core1.bus_read32(0xD000_0080, &mut bus), 0xBBBB_BBBB);
+    }
+
+    /// Narrow (8/16-bit) intercept coverage. Proves `bus_read8`,
+    /// `bus_read16`, `bus_write8`, `bus_write16` route DIV/INTERP
+    /// addresses through the per-core intercept and preserve the
+    /// pre-Stage-3 `Bus` semantics for narrow accesses:
+    ///   - read16 / read8 synthesize bytes from the containing 32-bit
+    ///     register (same as `Bus::read16/read8` 0xD arm used to do).
+    ///   - write16 / write8 are silently dropped (matches the pre-Stage-3
+    ///     `Bus` — no 0xD arm existed in `write8`, and `write16`'s 0xD
+    ///     case fell through to `_ => {}`).
+    #[test]
+    fn per_core_sio_width_intercept() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut core = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(Arc::clone(&atomics));
+
+        // Seed a known word at DIV_QUOTIENT via the wide write (direct
+        // port — see `PerCoreSio::divider_write` 0x070 arm). The low
+        // halfword is 0xBEEF, the high halfword 0xDEAD.
+        core.bus_write32(0xD000_0070, 0xDEAD_BEEF, &mut bus);
+
+        // read16: low half at +0 returns 0xBEEF; high half at +2 returns 0xDEAD.
+        assert_eq!(core.bus_read16(0xD000_0070, &mut bus), 0xBEEF);
+        assert_eq!(core.bus_read16(0xD000_0072, &mut bus), 0xDEAD);
+
+        // read8: byte 0..3 of the little-endian word.
+        assert_eq!(core.bus_read8(0xD000_0070, &mut bus), 0xEF);
+        assert_eq!(core.bus_read8(0xD000_0071, &mut bus), 0xBE);
+        assert_eq!(core.bus_read8(0xD000_0072, &mut bus), 0xAD);
+        assert_eq!(core.bus_read8(0xD000_0073, &mut bus), 0xDE);
+
+        // write16: must be silently dropped — the word is unchanged.
+        core.bus_write16(0xD000_0070, 0x1234, &mut bus);
+        assert_eq!(
+            core.bus_read32(0xD000_0070, &mut bus),
+            0xDEAD_BEEF,
+            "bus_write16 at a DIV offset must be silently dropped \
+             (pre-Stage-3 Bus semantics)"
+        );
+
+        // write8: also silently dropped.
+        core.bus_write8(0xD000_0070, 0x42, &mut bus);
+        core.bus_write8(0xD000_0073, 0x99, &mut bus);
+        assert_eq!(
+            core.bus_read32(0xD000_0070, &mut bus),
+            0xDEAD_BEEF,
+            "bus_write8 at a DIV offset must be silently dropped \
+             (pre-Stage-3 Bus semantics)"
+        );
+
+        // Same round-trip for an INTERP register, to confirm the
+        // intercept covers both DIV (0x060..=0x07C) and INTERP
+        // (0x080..=0x0FC) sub-ranges.
+        core.bus_write32(0xD000_0080, 0xCAFE_F00D, &mut bus);
+        assert_eq!(core.bus_read16(0xD000_0080, &mut bus), 0xF00D);
+        assert_eq!(core.bus_read16(0xD000_0082, &mut bus), 0xCAFE);
+        assert_eq!(core.bus_read8(0xD000_0083, &mut bus), 0xCA);
+        core.bus_write16(0xD000_0080, 0xBEEF, &mut bus);
+        core.bus_write8(0xD000_0080, 0x77, &mut bus);
+        assert_eq!(core.bus_read32(0xD000_0080, &mut bus), 0xCAFE_F00D);
     }
 }
