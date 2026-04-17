@@ -87,7 +87,32 @@ const REG_FIFO_LEVELS: u32 = 0x440;
 const REG_CHAN_ABORT: u32 = 0x444;
 const REG_N_CHANNELS: u32 = 0x448;
 
-// CTRL bit fields (RP2350 datasheet §12.6.6).
+// CTRL bit fields (RP2350 datasheet §12.6.6 CH0_CTRL_TRIG).
+//
+// RP2350 adds INCR_READ_REV [5] and INCR_WRITE_REV [7] vs RP2040, which
+// shifts RING_SIZE, RING_SEL, CHAIN_TO, TREQ_SEL, and IRQ_QUIET each up
+// by 2 bits relative to RP2040.  The post-V5 fix below corrects these.
+//
+// Full RP2350 field map:
+//  bit 0      EN
+//  bit 1      HIGH_PRIORITY
+//  bits[3:2]  DATA_SIZE
+//  bit 4      INCR_READ
+//  bit 5      INCR_READ_REV
+//  bit 6      INCR_WRITE
+//  bit 7      INCR_WRITE_REV
+//  bits[11:8] RING_SIZE
+//  bit 12     RING_SEL
+//  bits[16:13] CHAIN_TO
+//  bits[22:17] TREQ_SEL
+//  bit 23     IRQ_QUIET
+//  bit 24     BSWAP
+//  bit 25     SNIFF_EN
+//  bit 26     BUSY (RO)
+//  bits[28:27] reserved
+//  bit 29     WRITE_ERROR (W1C)
+//  bit 30     READ_ERROR  (W1C)
+//  bit 31     AHB_ERROR   (RO, OR of READ_ERROR | WRITE_ERROR)
 const CTRL_EN: u32 = 1 << 0;
 /// `HIGH_PRIORITY` flag — not modelled in V1 (flat priority; HLD V5 §5.6
 /// "Not in V1"). Kept for datasheet fidelity / future promotion.
@@ -96,34 +121,38 @@ const CTRL_HIGH_PRIORITY: u32 = 1 << 1;
 const CTRL_DATA_SIZE_SHIFT: u32 = 2;
 const CTRL_DATA_SIZE_MASK: u32 = 0x3 << CTRL_DATA_SIZE_SHIFT;
 const CTRL_INCR_READ: u32 = 1 << 4;
-const CTRL_INCR_WRITE: u32 = 1 << 5;
-const CTRL_RING_SIZE_SHIFT: u32 = 6;
+/// `INCR_READ_REV` — stored but not modelled in V1 (reverse-increment not
+/// exercised by any V1 corpus scenario).
+#[allow(dead_code)]
+const CTRL_INCR_READ_REV: u32 = 1 << 5;
+const CTRL_INCR_WRITE: u32 = 1 << 6;
+/// `INCR_WRITE_REV` — stored but not modelled in V1.
+#[allow(dead_code)]
+const CTRL_INCR_WRITE_REV: u32 = 1 << 7;
+const CTRL_RING_SIZE_SHIFT: u32 = 8;
 const CTRL_RING_SIZE_MASK: u32 = 0xF << CTRL_RING_SIZE_SHIFT;
-const CTRL_RING_SEL: u32 = 1 << 10;
-const CTRL_CHAIN_TO_SHIFT: u32 = 11;
+const CTRL_RING_SEL: u32 = 1 << 12;
+const CTRL_CHAIN_TO_SHIFT: u32 = 13;
 const CTRL_CHAIN_TO_MASK: u32 = 0xF << CTRL_CHAIN_TO_SHIFT;
-const CTRL_TREQ_SEL_SHIFT: u32 = 15;
+const CTRL_TREQ_SEL_SHIFT: u32 = 17;
 const CTRL_TREQ_SEL_MASK: u32 = 0x3F << CTRL_TREQ_SEL_SHIFT;
-const CTRL_IRQ_QUIET: u32 = 1 << 21;
+const CTRL_IRQ_QUIET: u32 = 1 << 23;
 /// `BSWAP` (byte-swap) flag — not modelled in V1 (HLD V5 §5.6 "Not in
 /// V1"). Stored through CTRL RMW but ignored on transfer.
-// RP2350 datasheet §12.6 CH0_CTRL_TRIG bit positions (V5 fix 2026-04-16):
-// bit 24: BSWAP, bit 25: SNIFF_EN, bit 26: BUSY, bits[28:27]: reserved,
-// bit 29: WRITE_ERROR, bit 30: READ_ERROR, bit 31: AHB_ERROR.
-// Previous values were off by +2 (used bit 22/23/24 instead of 24/25/26).
 #[allow(dead_code)]
 const CTRL_BSWAP: u32 = 1 << 24;
 /// `SNIFF_EN` — not modelled in V1 (no CRC). Stored but ignored.
 #[allow(dead_code)]
 const CTRL_SNIFF_EN: u32 = 1 << 25;
 const CTRL_BUSY: u32 = 1 << 26;
-// Bits [28:27] are reserved.
+// Bits [28:27] are reserved per RP2350 datasheet §12.6.6.
 const CTRL_WRITE_ERROR: u32 = 1 << 29;
 const CTRL_READ_ERROR: u32 = 1 << 30;
 const CTRL_AHB_ERROR: u32 = 1u32 << 31;
-// Mask of writable bits in CTRL (everything except BUSY + the three
-// error bits, which are status-only / W1C).
-const CTRL_WRITABLE_MASK: u32 = !(CTRL_BUSY | CTRL_WRITE_ERROR | CTRL_READ_ERROR | CTRL_AHB_ERROR);
+// Mask of writable bits in CTRL: exclude BUSY (RO), the three error bits
+// (status / W1C), and the reserved bits [28:27].
+const CTRL_WRITABLE_MASK: u32 =
+    !(CTRL_BUSY | CTRL_WRITE_ERROR | CTRL_READ_ERROR | CTRL_AHB_ERROR | (0x3 << 27));
 
 // Channel mask: 16 channels = bits [15:0].
 const CHANNEL_MASK: u32 = 0xFFFF;
@@ -1297,5 +1326,82 @@ mod tests {
         let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(readback & CTRL_BUSY, 0, "BUSY must clear after completion");
         assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0, "INTR bit 0 must latch");
+    }
+
+    // ----------------------------------------------------------------
+    // CTRL field positions: regression against RP2040 bit layout.
+    //
+    // The RP2350 DMA CTRL register adds INCR_READ_REV [5] and
+    // INCR_WRITE_REV [7] vs RP2040, shifting RING_SIZE, RING_SEL,
+    // CHAIN_TO, TREQ_SEL, and IRQ_QUIET each up by 2 bits. If the
+    // emulator reverts to RP2040 positions:
+    //   - TREQ_SEL=63 lands at bits[20:15] instead of [22:17]
+    //   - INCR_WRITE=1 at bit 5 instead of bit 6
+    //   - CHAIN_TO=N at bits[14:11] instead of [16:13]
+    // A CTRL value built with wrong positions would have TREQ_SEL in
+    // the wrong field (e.g. 0x001F_8039 decodes to TREQ_SEL=15 on RP2350),
+    // causing the channel to stall waiting for a peripheral DREQ that
+    // never fires.  Concretely: BUSY never clears, any busy-poll loop spins
+    // forever, which is exactly the silicon hang observed by the silicon
+    // oracle on the Stage C DMA sleds.
+    //
+    // This test builds a correct RP2350 CTRL value via `make_ctrl` (which
+    // uses the named constants), runs a 4-word mem-to-mem transfer, and
+    // asserts both that BUSY clears AND that the correct data was written.
+    // If the constants revert to RP2040 positions, TREQ_SEL will not be
+    // FORCE and the channel will stall — making this test fail.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn ctrl_field_positions_rp2350_not_rp2040() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0A00;
+        let dst: u32 = 0x2000_0B00;
+        for i in 0..4u32 {
+            bus.write32(src + i * 4, 0xF00D_0000 + i);
+        }
+
+        bus.write32(DMA_BASE + 0x00, src);
+        bus.write32(DMA_BASE + 0x04, dst);
+        bus.write32(DMA_BASE + 0x08, 4);
+        // TREQ_SEL=63 (FORCE), CHAIN_TO=0 (ch0=self=no chain on RP2350).
+        // With correct RP2350 positions this should be 0x007E_0059.
+        // With RP2040 positions it would be 0x001F_8039 — TREQ_SEL=15
+        // (PIO0_RX3), which is never asserted, so BUSY would never clear.
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        assert_eq!(
+            ctrl, 0x007E_0059,
+            "make_ctrl must produce RP2350 field positions (not RP2040)"
+        );
+        bus.write32(DMA_BASE + 0x0C, ctrl);
+
+        // With FORCE TREQ, 4 ticks must be enough for 4 transfers.
+        for _ in 0..4 {
+            bus.tick_dma();
+        }
+
+        // Data must have been transferred.
+        for i in 0..4u32 {
+            assert_eq!(
+                bus.read32(dst + i * 4),
+                0xF00D_0000 + i,
+                "word {i} not transferred: TREQ_SEL may be wrong (RP2040 positions?)"
+            );
+        }
+        // BUSY must clear — if TREQ was wrong, channel stalls and BUSY stays.
+        let readback = bus.read32(DMA_BASE + 0x0C);
+        assert_eq!(
+            readback & CTRL_BUSY,
+            0,
+            "BUSY did not clear: likely RP2040 CTRL field positions used instead of RP2350"
+        );
+        // INTR bit 0 must be set (transfer completed).
+        assert_ne!(
+            bus.read32(DMA_BASE + REG_INTR) & 1,
+            0,
+            "INTR bit 0 must latch on completion"
+        );
     }
 }

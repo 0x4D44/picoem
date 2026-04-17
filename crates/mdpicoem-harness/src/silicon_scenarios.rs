@@ -1514,14 +1514,18 @@ pub const DMA_INTR: u32 = DMA_BASE + 0x400;
 // and drives DMA entirely through CPU stores, then busy-polls CTRL_TRIG
 // BUSY (bit 26) until the transfer completes.
 //
-// CTRL_TRIG value breakdown:
+// CTRL_TRIG value breakdown (RP2350 field positions — differs from RP2040):
 //   bit 0      : EN = 1
 //   bits [3:2] : DATA_SIZE = 2 (word)
 //   bit 4      : INCR_READ = 1
-//   bit 5      : INCR_WRITE = 1
-//   bits [20:15]: TREQ_SEL = 63 (0x3F, FORCE)
-//   bits [14:11]: CHAIN_TO = 0 (self)
-//   → 0x001F_8039
+//   bit 5      : INCR_READ_REV = 0  (new in RP2350 vs RP2040)
+//   bit 6      : INCR_WRITE = 1
+//   bit 7      : INCR_WRITE_REV = 0 (new in RP2350 vs RP2040)
+//   bits [11:8] : RING_SIZE = 0
+//   bit 12      : RING_SEL = 0
+//   bits [16:13]: CHAIN_TO = 0 (ch0 = self = no chain, per RP2350 datasheet §12.6.3.2)
+//   bits [22:17]: TREQ_SEL = 63 (0x3F, PERMANENT/FORCE)
+//   → 0x007E_0059
 const S_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
 ];
@@ -1593,11 +1597,22 @@ const SLED_DMA_MEM_TO_MEM_32BIT_HW: [u16; 41] = [
     // ---- program CH0_TRANS_COUNT = 4 ----------------------------------------
     0x2404, //  [28] movs r4, #4
     0x608C, //  [29] str  r4, [r1, #8]      ; CH0_TRANS_COUNT (imm5=2)
-    // ---- program CH0_CTRL_TRIG = 0x001F_8039 (triggers transfer) -----------
-    0xF248, //  [30] movw r4, #0x8039 hw0   (imm4=8,i=0,imm3=0,imm8=39)
-    0x0439, //  [31] movw r4, #0x8039 hw1   (Rd=4)
-    0xF2C0, //  [32] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
-    0x041F, //  [33] movt r4, #0x001F hw1   (Rd=4, imm3=0)
+    // ---- program CH0_CTRL_TRIG = 0x007E_0059 (triggers transfer) -----------
+    // RP2350 CTRL field positions differ from RP2040: INCR_READ_REV [5] and
+    // INCR_WRITE_REV [7] are new, shifting RING_SIZE to [11:8], RING_SEL to
+    // [12], CHAIN_TO to [16:13], TREQ_SEL to [22:17], IRQ_QUIET to [23].
+    // EN=1, DATA_SIZE=2(word), INCR_READ=1[4], INCR_WRITE=1[6],
+    // CHAIN_TO=0[16:13](ch0=self=no chain), TREQ_SEL=63[22:17](FORCE).
+    // 0x0059 = 0000_0000_0101_1001: bit6=1(INCR_WRITE), bit4=1(INCR_READ),
+    //   bit3=0, bit2=1(DATA_SIZE lsb? no: [3:2]=10=2), bit1=0, bit0=1(EN).
+    // Wait: 0x59=0101_1001: bit6=1, bit4=1, bit3=0, bits[3:2]=10, bit0=1. OK.
+    // 0x007E = 0000_0000_0111_1110 = bits[22:17]=0x3F=63 (TREQ_SEL=FORCE).
+    // MOVW r4, #0x0059: imm4=0,i=0,imm3=0,imm8=0x59 → hw0=F240, hw1=0x0459
+    // MOVT r4, #0x007E: imm4=0,i=0,imm3=0,imm8=0x7E → hw0=F2C0, hw1=0x047E
+    0xF240, //  [30] movw r4, #0x0059 hw0   (imm4=0,i=0,imm3=0,imm8=59)
+    0x0459, //  [31] movw r4, #0x0059 hw1   (Rd=4)
+    0xF2C0, //  [32] movt r4, #0x007E hw0   (imm4=0,i=0,imm3=0,imm8=7E)
+    0x047E, //  [33] movt r4, #0x007E hw1   (Rd=4)
     0x60CC, //  [34] str  r4, [r1, #0x0C]   ; CH0_CTRL_TRIG   (imm5=3)
     // ---- build BUSY mask in r3 (bit 26 = 0x0400_0000) ----------------------
     0x2301, //  [35] movs r3, #1
@@ -1623,14 +1638,14 @@ const SLED_DMA_MEM_TO_MEM_32BIT: &[u8] =
 // then programs ch0 CTRL_TRIG (triggers). Poll ch0 BUSY until clear
 // (chain arms ch1 automatically on ch0 completion), then poll ch1 BUSY.
 //
-// Ch0 CTRL_TRIG: EN=1, DATA_SIZE=2, INCR_READ, INCR_WRITE,
-//   TREQ_SEL=63, CHAIN_TO=1.
-//   → 0x001F_8839  (CHAIN_TO=1 in bits [14:11] = 0x0800)
+// Ch0 CTRL_TRIG: EN=1, DATA_SIZE=2, INCR_READ[4], INCR_WRITE[6],
+//   TREQ_SEL=63[22:17], CHAIN_TO=1[16:13] (chain to ch1 on completion).
+//   → 0x007E_2059  (RP2350 field positions)
 //
 // Ch1 AL1_CTRL (non-triggering alias at DMA_BASE+0x050):
-//   EN=1, DATA_SIZE=2, INCR_READ, INCR_WRITE, TREQ_SEL=63, CHAIN_TO=1
-//   (self = no further chain).
-//   → 0x001F_8839
+//   EN=1, DATA_SIZE=2, INCR_READ[4], INCR_WRITE[6], TREQ_SEL=63[22:17],
+//   CHAIN_TO=1[16:13] (ch1=self=no further chain per RP2350 §12.6.3.2).
+//   → 0x007E_2059
 const S_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
 ];
@@ -1676,10 +1691,9 @@ const O_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
 //   0xBBBB_1111: movw r0,#0x1111 / movt r0,#0xBBBB
 //     movw r0,#0x1111: imm4=1,i=0,imm3=1,imm8=11 → hw0=F241, hw1=0x1011
 //     movt r0,#0xBBBB: imm4=B,i=1,imm3=3,imm8=BB → hw0=F6CB, hw1=0x30BB
-//   0x8839: imm4=8,i=1 (bit11 of 0x8839=1000_1000... bit11=1),imm3=0,imm8=39
-//     Verify: 0x8839=1000_1000_0011_1001. bit15..12=1000=8, bit11=1(i), bit10..8=000(imm3=0), bit7..0=0x39
-//     hw0=F240|(1<<10)|8=F648, hw1=(Rd<<8)|0x39
-//   0x001F for movt high: imm4=0,i=0,imm3=0,imm8=1F → hw0=F2C0, hw1=(Rd<<8)|0x1F
+//   CTRL 0x007E_2059 (ch0: CHAIN_TO=1, ch1: CHAIN_TO=1=self=no chain, TREQ=63):
+//     low16=0x2059: imm4=2,i=0,imm3=0,imm8=59 → hw0=F242, hw1=(Rd<<8)|0x59
+//     high16=0x007E: imm4=0,i=0,imm3=0,imm8=7E → hw0=F2C0, hw1=(Rd<<8)|0x7E
 //   str r4,[r1,#0x40] imm5=16: 0x6000|(16<<6)|(1<<3)|4=0x640C
 //   str r4,[r1,#0x44] imm5=17: 0x6000|(17<<6)|(1<<3)|4=0x644C
 //   str r4,[r1,#0x48] imm5=18: 0x6000|(18<<6)|(1<<3)|4=0x648C
@@ -1724,10 +1738,14 @@ const SLED_DMA_CHAIN_TRIGGER_HW: [u16; 64] = [
     0x644C, //  [30] str  r4, [r1, #0x44]   ; CH1_WRITE_ADDR (imm5=17)
     0x2401, //  [31] movs r4, #1            ; ch1 TRANS_COUNT=1
     0x648C, //  [32] str  r4, [r1, #0x48]   ; CH1_TRANS_COUNT (imm5=18)
-    0xF648, //  [33] movw r4, #0x8839 hw0   ; ch1 ctrl: EN,DATA_SIZE=2,INCR,TREQ=63,CHAIN_TO=1
-    0x0439, //  [34] movw r4, #0x8839 hw1   (Rd=4)
-    0xF2C0, //  [35] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
-    0x041F, //  [36] movt r4, #0x001F hw1   (Rd=4, imm3=0)
+    // ch1 CTRL = 0x007E_2059: EN=1, DATA_SIZE=2, INCR_READ=1[4], INCR_WRITE=1[6],
+    // CHAIN_TO=1[16:13](ch1=self=no chain), TREQ_SEL=63[22:17](FORCE).
+    // MOVW r4, #0x2059: imm4=2,i=0,imm3=0,imm8=59 → hw0=F242, hw1=0x0459
+    // MOVT r4, #0x007E: imm4=0,i=0,imm3=0,imm8=7E → hw0=F2C0, hw1=0x047E
+    0xF242, //  [33] movw r4, #0x2059 hw0   ; ch1 ctrl: 0x007E_2059 (RP2350 positions)
+    0x0459, //  [34] movw r4, #0x2059 hw1   (Rd=4)
+    0xF2C0, //  [35] movt r4, #0x007E hw0   (imm4=0,i=0,imm3=0,imm8=7E)
+    0x047E, //  [36] movt r4, #0x007E hw1   (Rd=4)
     0x650C, //  [37] str  r4, [r1, #0x50]   ; CH1_AL1_CTRL   (imm5=20)
     // ---- configure ch0 and trigger (CTRL_TRIG at +0x0C) -------------------
     0xF240, //  [38] movw r4, #0x0400 hw0   ; ch0 READ_ADDR = 0x2000_0400
@@ -1742,10 +1760,13 @@ const SLED_DMA_CHAIN_TRIGGER_HW: [u16; 64] = [
     0x604C, //  [47] str  r4, [r1, #4]      ; CH0_WRITE_ADDR (imm5=1)
     0x2401, //  [48] movs r4, #1            ; ch0 TRANS_COUNT=1
     0x608C, //  [49] str  r4, [r1, #8]      ; CH0_TRANS_COUNT (imm5=2)
-    0xF648, //  [50] movw r4, #0x8839 hw0   ; ch0 ctrl: CHAIN_TO=1
-    0x0439, //  [51] movw r4, #0x8839 hw1   (Rd=4)
-    0xF2C0, //  [52] movt r4, #0x001F hw0   (imm4=0,i=0,imm3=0,imm8=1F)
-    0x041F, //  [53] movt r4, #0x001F hw1   (Rd=4, imm3=0)
+    // ch0 CTRL = 0x007E_2059: EN=1, DATA_SIZE=2, INCR_READ=1[4], INCR_WRITE=1[6],
+    // CHAIN_TO=1[16:13](chains to ch1 on completion), TREQ_SEL=63[22:17](FORCE).
+    // Same encoding as ch1: MOVW r4, #0x2059 / MOVT r4, #0x007E.
+    0xF242, //  [50] movw r4, #0x2059 hw0   ; ch0 ctrl: 0x007E_2059, CHAIN_TO=1
+    0x0459, //  [51] movw r4, #0x2059 hw1   (Rd=4)
+    0xF2C0, //  [52] movt r4, #0x007E hw0   (imm4=0,i=0,imm3=0,imm8=7E)
+    0x047E, //  [53] movt r4, #0x007E hw1   (Rd=4)
     0x60CC, //  [54] str  r4, [r1, #0x0C]   ; CH0_CTRL_TRIG → triggers ch0
     // ---- BUSY mask: r3 = bit 26 (0x0400_0000) ------------------------------
     0x2301, //  [55] movs r3, #1
@@ -1775,14 +1796,18 @@ const SLED_DMA_CHAIN_TRIGGER: &[u8] =
 // (0x5000_0420, X=1/Y=10 → fires every 10 sysclks), configures ch0
 // (TREQ_SEL=59), triggers, and polls BUSY until complete.
 //
-// CTRL_TRIG value breakdown:
+// CTRL_TRIG value breakdown (RP2350 field positions — differs from RP2040):
 //   bit 0      : EN = 1
 //   bits [3:2] : DATA_SIZE = 2 (word)
 //   bit 4      : INCR_READ = 1
-//   bit 5      : INCR_WRITE = 1
-//   bits [20:15]: TREQ_SEL = 59 (0x3B)
-//   bits [14:11]: CHAIN_TO = 0 (self)
-//   → 0x001D_8039
+//   bit 5      : INCR_READ_REV = 0  (new in RP2350 vs RP2040)
+//   bit 6      : INCR_WRITE = 1
+//   bit 7      : INCR_WRITE_REV = 0 (new in RP2350 vs RP2040)
+//   bits [11:8] : RING_SIZE = 0
+//   bit 12      : RING_SEL = 0
+//   bits [16:13]: CHAIN_TO = 0 (ch0 = self = no chain)
+//   bits [22:17]: TREQ_SEL = 59 (0x3B = TIMER0)
+//   → 0x0076_0059
 /// DMA TIMER0 register absolute address (DMA_BASE + 0x420).
 pub const DMA_TIMER0: u32 = DMA_BASE + 0x420;
 const S_DMA_TIMER_PACED: &[(u32, u32)] = &[
@@ -1819,7 +1844,9 @@ const O_DMA_TIMER_PACED: &[(u32, u32)] = &[
 //   0x0B00={imm4=0,i=1,imm3=3,imm8=0x00} → hw0=F640, hw1=(3<<12)|(Rd<<8)
 //   0x0420={imm4=0,i=0,imm3=4,imm8=0x20} → hw0=F240, hw1=(4<<12)|(Rd<<8)|0x20
 //   0xCAFE={imm4=C,i=1,imm3=2,imm8=FE} → hw0=F6CC(MOVT hw0=F2C0+0x0400+0xC), hw1=0x2xFE
-//   0x001D={imm4=0,i=0,imm3=1,imm8=1D} → MOVT hw0=F2C0, hw1=(1<<12)|(Rd<<8)|0x1D
+//   CTRL 0x0076_0059 (TREQ_SEL=59=TIMER0, CHAIN_TO=0=self=no chain, RP2350):
+//     low16=0x0059: imm4=0,i=0,imm3=0,imm8=0x59 → hw0=F240, hw1=(Rd<<8)|0x59
+//     high16=0x0076: imm4=0,i=0,imm3=0,imm8=0x76 → hw0=F2C0, hw1=(Rd<<8)|0x76
 //   DMA_TIMER0 value 0x0001_000A: movs r4,#0x0A; movt r4,#0x0001
 //     movt #0x0001: imm4=0,i=0,imm3=0,imm8=1 → hw0=F2C0, hw1=(Rd<<8)|1
 #[rustfmt::skip]
@@ -1868,11 +1895,18 @@ const SLED_DMA_TIMER_PACED_HW: [u16; 49] = [
     // ---- program CH0_TRANS_COUNT = 4 -----------------------------------------
     0x2404, //  [36] movs r4, #4
     0x608C, //  [37] str  r4, [r1, #8]      ; CH0_TRANS_COUNT (imm5=2)
-    // ---- program CH0_CTRL_TRIG = 0x001D_8039 (TREQ_SEL=59, triggers) -------
-    0xF248, //  [38] movw r4, #0x8039 hw0   (imm4=8,i=0,imm3=0,imm8=39)
-    0x0439, //  [39] movw r4, #0x8039 hw1   (Rd=4)
-    0xF2C0, //  [40] movt r4, #0x001D hw0   (imm4=0,i=0,imm3=1,imm8=1D)
-    0x041D, //  [41] movt r4, #0x001D hw1   (Rd=4)
+    // ---- program CH0_CTRL_TRIG = 0x0076_0059 (TREQ_SEL=59=TIMER0, triggers) --
+    // RP2350 CTRL: EN=1[0], DATA_SIZE=2[3:2], INCR_READ=1[4], INCR_WRITE=1[6],
+    // CHAIN_TO=0[16:13](self=no chain), TREQ_SEL=59[22:17].
+    // 59=0x3B=0011_1011; bits[22:17]=0b0111_0110=0x76 in high byte of low16?
+    // No: TREQ_SEL occupies bits[22:17]: 59<<17=0x0076_0000. With other bits:
+    // 0x0076_0059. Low16=0x0059, high16=0x0076.
+    // MOVW r4, #0x0059: imm4=0,i=0,imm3=0,imm8=0x59 → hw0=F240, hw1=0x0459
+    // MOVT r4, #0x0076: imm4=0,i=0,imm3=0,imm8=0x76 → hw0=F2C0, hw1=0x0476
+    0xF240, //  [38] movw r4, #0x0059 hw0   (imm4=0,i=0,imm3=0,imm8=59)
+    0x0459, //  [39] movw r4, #0x0059 hw1   (Rd=4)
+    0xF2C0, //  [40] movt r4, #0x0076 hw0   (imm4=0,i=0,imm3=0,imm8=76)
+    0x0476, //  [41] movt r4, #0x0076 hw1   (Rd=4)
     0x60CC, //  [42] str  r4, [r1, #0x0C]   ; CH0_CTRL_TRIG → triggers
     // ---- BUSY mask in r3 (bit 26) -------------------------------------------
     0x2301, //  [43] movs r3, #1
@@ -3081,14 +3115,18 @@ mod tests {
             0x0000_0003,
             "DMA INTR bits 0+1",
         );
-        // Neither channel must have RING_SEL set (bit 10). The sled encodes
-        // CTRL=0x001F_8839 which has RING_SIZE=0 and RING_SEL=0; the old hw1
-        // value 0x4439 had imm3=4, reconstructing 0x001F_8C39 which set
-        // RING_SIZE=4, corrupting the ring configuration.
+        // Neither channel must have RING_SEL set (bit 12 on RP2350). The sled
+        // encodes CTRL=0x007E_2059 which has RING_SIZE[11:8]=0 and RING_SEL[12]=0.
+        // This also verifies the RP2350 field positions are used: with the old
+        // RP2040 layout, RING_SEL would have been at bit 10 and CHAIN_TO at [14:11].
         let ch0_ctrl = emu.mmio_read32(DMA_BASE + 0x0C);
         let ch1_ctrl = emu.mmio_read32(DMA_BASE + 0x50);
-        assert_eq!(ch0_ctrl & (1 << 10), 0, "ch0 must not have RING_SEL set");
-        assert_eq!(ch1_ctrl & (1 << 10), 0, "ch1 must not have RING_SEL set");
+        assert_eq!(ch0_ctrl & (1 << 12), 0, "ch0 must not have RING_SEL (bit 12) set");
+        assert_eq!(ch1_ctrl & (1 << 12), 0, "ch1 must not have RING_SEL (bit 12) set");
+        // Also verify TREQ_SEL field is correctly at bits[22:17] (RP2350) not [20:15] (RP2040).
+        // For TREQ_SEL=63: bits[22:17] of 0x007E_2059 = (0x007E_2059 >> 17) & 0x3F = 63.
+        assert_eq!((ch0_ctrl >> 17) & 0x3F, 63, "ch0 TREQ_SEL must be 63 (FORCE) at bits[22:17]");
+        assert_eq!((ch1_ctrl >> 17) & 0x3F, 63, "ch1 TREQ_SEL must be 63 (FORCE) at bits[22:17]");
     }
 
     #[test]
