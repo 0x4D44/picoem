@@ -66,9 +66,13 @@ DMA_INTR = DMA_BASE + 0x400
 
 # CTRL_TRIG value: EN=1, DATA_SIZE=2 (word), INCR_READ=1, INCR_WRITE=1,
 # TREQ_SEL=63 (FORCE), CHAIN_TO=0 (self = no chain).
-# bits: [0]=1, [3:2]=0b10, [4]=1, [5]=1, [20:15]=0b111111, [14:11]=0b0000
-CTRL_TRIG_VALUE = (1 << 0) | (2 << 2) | (1 << 4) | (1 << 5) | (63 << 15)
-# = 0x001F_8039
+#
+# RP2350 bit positions (differ from RP2040 -- INCR_READ_REV at bit 5 and
+# INCR_WRITE_REV at bit 7 push all higher fields up by 2):
+#   [0]=EN, [3:2]=DATA_SIZE, [4]=INCR_READ, [6]=INCR_WRITE,
+#   [22:17]=TREQ_SEL, [16:13]=CHAIN_TO
+CTRL_TRIG_VALUE = (1 << 0) | (2 << 2) | (1 << 4) | (1 << 6) | (63 << 17)
+# = 0x007E_0059
 
 # Source data words.
 SRC_DATA = [0xCAFE_0001, 0xCAFE_0002, 0xCAFE_0003, 0xCAFE_0004]
