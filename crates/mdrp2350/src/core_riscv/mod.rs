@@ -10,15 +10,19 @@ pub(crate) mod decode;
 pub(crate) mod csr;
 pub(crate) mod trap;
 pub(crate) mod execute;
+pub(crate) mod irq;
 
 #[cfg(test)]
 mod tests_p2;
 #[cfg(test)]
 mod tests_p3;
+#[cfg(test)]
+mod tests_p4;
 
 use crate::Bus;
 use regs::CsrFile;
 use trap::cause;
+use irq::Xh3Irq;
 
 /// `misa` hardwired value — MXL=01 (bit 30) + X (bit 23) + I (bit 8) +
 /// M (bit 12) + A (bit 0) + C (bit 2). No U/S/B. Per HLD §4.3.
@@ -48,6 +52,9 @@ pub struct Hazard3 {
     pub(crate) wfi_parked: bool,
     /// M-mode CSR storage.
     pub(crate) csrs: CsrFile,
+    /// Hazard3 external-IRQ controller (Xh3irq CSR window at 0xBE0..0xBE5).
+    /// P4 wires this to drive `mip[11]` (MEIP).
+    pub(crate) xh3irq: Xh3Irq,
 }
 
 impl Hazard3 {
@@ -62,6 +69,7 @@ impl Hazard3 {
             halted: false,
             wfi_parked: false,
             csrs: CsrFile::new(),
+            xh3irq: Xh3Irq::new(),
         }
     }
 
@@ -78,6 +86,62 @@ impl Hazard3 {
         if self.halted || self.wfi_parked {
             return;
         }
+
+        // P4 trap delivery at instruction boundary (HLD §4.6). Interrupts
+        // dispatch only when mstatus.MIE=1 and at least one `mip & mie`
+        // bit is set. RV-priv §3.1.9 priority: MEI > MSI > MTI > internal
+        // > external in general, but Hazard3/RP2350 fixes on the standard
+        // RV-priv relative priorities. We check MEIP/MSIP/MTIP in that
+        // order.
+        let mie_global = (self.csrs.mstatus >> 3) & 1 != 0;
+        let pending = self.csrs.mip & self.csrs.mie;
+        if mie_global && pending != 0 {
+            // Priority: MEIP (bit 11), MSIP (bit 3), MTIP (bit 7). This
+            // matches the Hazard3 csr.adoc "priority order" note — MEI
+            // highest, then MSI, then MTI.
+            //
+            // CRITICAL: MEIP only triggers trap delivery when xh3irq
+            // arbitration produces a winning IRQ. If `mip[11]` is set but
+            // every pending IRQ is masked by `meicontext.ppreempt` (and no
+            // firmware-writable MEIP path exists — see `MIP_MASK`),
+            // `arbitrate()` returns `None`. In that case we must fall
+            // through to MSIP/MTIP/fetch rather than deliver a MEIP trap
+            // with no IRQ context: the handler would see `meinext.noirq=1`,
+            // `mret` back, and re-trigger immediately → infinite loop.
+            let irq_pending = bus.atomics.irq_pending_load(self.hart_id as usize);
+            let meip_arb = if pending & (1 << 11) != 0 {
+                self.xh3irq.arbitrate(irq_pending)
+            } else {
+                None
+            };
+            let chosen: Option<(u32, Option<(u8, u8)>)> = if meip_arb.is_some() {
+                Some((11u32, meip_arb))
+            } else if pending & (1 << 3) != 0 {
+                Some((3u32, None))
+            } else if pending & (1 << 7) != 0 {
+                Some((7u32, None))
+            } else {
+                // MEIP was set but arbitration returned None, and no
+                // MSIP/MTIP pending. Fall through to fetch — equivalent to
+                // no deliverable interrupt this cycle.
+                None
+            };
+            if let Some((cause_code, irq_ctx)) = chosen {
+                // Interrupt cause has bit 31 set.
+                let mcause = 0x8000_0000 | cause_code;
+                // mepc = PC of the *next* instruction that would have run —
+                // the instruction hasn't started. That's the current self.pc.
+                let epc = self.pc;
+                self.enter_trap(mcause, 0, epc, bus);
+                // On MEIP, install preempt level from xh3irq.
+                if let Some((irq, pri)) = irq_ctx {
+                    self.xh3irq.on_ext_irq_entry(irq, pri);
+                }
+                self.cycles = self.cycles.wrapping_add(1);
+                return;
+            }
+        }
+
         let epc = self.pc;
 
         // Instruction-address misalignment. With C-extension PC only needs
@@ -198,6 +262,13 @@ impl Hazard3 {
     #[allow(dead_code)]
     pub(crate) fn mie(&self) -> u32 {
         self.csrs.mie
+    }
+
+    /// Compute the MEIP (`mip[11]`) source bit from the Hazard3 IRQ
+    /// controller's view of `bus.irq_pending[hart] | meifa`, masked by
+    /// `meiea`. HLD §4.6: MEIP = OR-reduce of `(meipa & meiea) | meifa`.
+    pub(crate) fn compute_meip(&self, irq_pending: u64) -> bool {
+        self.xh3irq.meip(irq_pending)
     }
 }
 

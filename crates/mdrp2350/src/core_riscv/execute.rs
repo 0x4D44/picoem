@@ -256,7 +256,7 @@ impl Hazard3 {
                 } else {
                     0 // immediate forms — csr_access uses rs1_or_zimm directly
                 };
-                match csr_access(self, kind, csr, rs1_or_zimm, rs1_val) {
+                match csr_access(self, bus, kind, csr, rs1_or_zimm, rs1_val) {
                     CsrAccess::Ok(old) => self.wr(rd, old),
                     CsrAccess::Trap => {
                         self.enter_trap(cause::ILLEGAL_INSTRUCTION, 0, epc, bus);

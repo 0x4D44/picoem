@@ -15,6 +15,7 @@
 
 use super::Hazard3;
 use super::decode::CsrKind;
+use crate::Bus;
 
 pub(crate) const CSR_MSTATUS:      u16 = 0x300;
 pub(crate) const CSR_MISA:         u16 = 0x301;
@@ -37,6 +38,13 @@ pub(crate) const CSR_MARCHID:      u16 = 0xF12;
 pub(crate) const CSR_MIMPID:       u16 = 0xF13;
 pub(crate) const CSR_MHARTID:      u16 = 0xF14;
 pub(crate) const CSR_MCONFIGPTR:   u16 = 0xF15;
+// Hazard3 Xh3irq external-IRQ controller (P4).
+pub(crate) const CSR_MEIEA:        u16 = 0xBE0;
+pub(crate) const CSR_MEIPA:        u16 = 0xBE1;
+pub(crate) const CSR_MEIFA:        u16 = 0xBE2;
+pub(crate) const CSR_MEIPRA:       u16 = 0xBE3;
+pub(crate) const CSR_MEINEXT:      u16 = 0xBE4;
+pub(crate) const CSR_MEICONTEXT:   u16 = 0xBE5;
 
 /// mstatus writable mask. V1 supports MIE (bit 3), MPIE (bit 7),
 /// MPP (bits [12:11], WARL to 0b11). All other bits (SIE/UIE/MPRV/
@@ -49,11 +57,24 @@ pub(crate) const MSTATUS_WRITE_MASK: u32 = MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_
 /// mie writable mask — only MSIE (3), MTIE (7), MEIE (11). Bits outside
 /// the standard M-mode triple are ignored (V1 is M-only).
 const MIE_MASK: u32 = (1 << 3) | (1 << 7) | (1 << 11);
-/// mip writable mask — firmware can set/clear software-interrupt
-/// visibility and force bits. The hardware side (fan_out_riscv_irqs)
-/// drives MSIP/MTIP directly (HLD §4.6); CSR writes to those bits just
-/// get OR'd in with whatever hardware sourced.
-const MIP_MASK: u32 = (1 << 3) | (1 << 7) | (1 << 11);
+/// mip writable mask. On Hazard3 / RP2350 all three standard M-mode
+/// pending bits are hardware-driven:
+///   * MEIP (bit 11) — driven by the Xh3irq controller
+///     (`compute_meip` / `fan_out_riscv_irqs`).
+///   * MSIP (bit 3)  — driven by SIO's `RISCV_SOFTIRQ` register via
+///     `fan_out_riscv_irqs`.
+///   * MTIP (bit 7)  — driven by SIO's MTIME/MTIMECMP comparator via
+///     `fan_out_riscv_irqs`.
+/// None of these are firmware-writable: any bits a CSR write set would
+/// be stomped within a single quantum by `fan_out_riscv_irqs`, so the
+/// visible effect is zero. Worse, firmware setting MEIP with no matching
+/// `meifa`/`meiea` winner would trap with no arbitration context — see
+/// the MEIP arbitration gate in `mod.rs::step` for the fall-through.
+///
+/// Clean HW/firmware separation: firmware manipulates soft-IRQ via
+/// `SIO.RISCV_SOFTIRQ` and forced ext-IRQs via `meifa`; `mip` itself is
+/// observation-only from firmware's POV.
+const MIP_MASK: u32 = 0;
 
 /// Result of a CSR access. `Trap` indicates the executor must raise
 /// mcause=2 (illegal instruction) at the current PC without updating rd.
@@ -74,6 +95,7 @@ fn is_read_only(csr: u16) -> bool { (csr >> 10) & 0b11 == 0b11 }
 /// for register forms — ignored for immediate forms.
 pub(crate) fn csr_access(
     hart: &mut Hazard3,
+    bus: &Bus,
     kind: CsrKind,
     csr: u16,
     rs1_or_zimm: u8,
@@ -104,7 +126,8 @@ pub(crate) fn csr_access(
     }
 
     // Read old value. Unimplemented CSR -> trap.
-    let old = match read_csr(hart, csr) {
+    let irq_pending = bus.atomics.irq_pending_load(hart.hart_id as usize);
+    let old = match read_csr(hart, csr, irq_pending) {
         Some(v) => v,
         None => return CsrAccess::Trap,
     };
@@ -119,7 +142,7 @@ pub(crate) fn csr_access(
         // write_csr is total over the supported set — unknown CSRs were
         // already caught by read_csr. WARL rounding lives inside the
         // per-CSR write path.
-        write_csr(hart, csr, new);
+        write_csr(hart, csr, new, irq_pending);
     }
 
     CsrAccess::Ok(old)
@@ -127,7 +150,7 @@ pub(crate) fn csr_access(
 
 /// Read a CSR. Returns `None` for unimplemented CSRs (executor turns
 /// into mcause=2).
-fn read_csr(hart: &Hazard3, csr: u16) -> Option<u32> {
+fn read_csr(hart: &Hazard3, csr: u16, irq_pending: u64) -> Option<u32> {
     Some(match csr {
         CSR_MSTATUS       => hart.csrs.mstatus,
         CSR_MISA          => hart.misa(),
@@ -148,13 +171,21 @@ fn read_csr(hart: &Hazard3, csr: u16) -> Option<u32> {
         CSR_MIMPID        => hart.mimpid(),
         CSR_MHARTID       => hart.mhartid(),
         CSR_MCONFIGPTR    => hart.mconfigptr(),
+        // Hazard3 Xh3irq CSRs. `meinext` / `meipa` read from
+        // `bus.irq_pending | meifa` per HLD §4.6.
+        CSR_MEIEA         => hart.xh3irq.read_meiea(),
+        CSR_MEIPA         => hart.xh3irq.read_meipa(irq_pending),
+        CSR_MEIFA         => hart.xh3irq.read_meifa(),
+        CSR_MEIPRA        => hart.xh3irq.read_meipra(),
+        CSR_MEINEXT       => hart.xh3irq.read_meinext(irq_pending),
+        CSR_MEICONTEXT    => hart.xh3irq.read_meicontext(),
         _ => return None,
     })
 }
 
 /// Write a CSR. Caller has already trap-gated read-only access; this
 /// path only sees writable CSRs plus the no-op for hardwired-0 mtval.
-fn write_csr(hart: &mut Hazard3, csr: u16, val: u32) {
+fn write_csr(hart: &mut Hazard3, csr: u16, val: u32, irq_pending: u64) {
     match csr {
         CSR_MSTATUS => {
             // Apply writable mask; round MPP (bits [12:11]) to 0b11 per
@@ -217,6 +248,13 @@ fn write_csr(hart: &mut Hazard3, csr: u16, val: u32) {
         CSR_MINSTRET => hart.csrs.minstret = (hart.csrs.minstret & !0xFFFF_FFFF) | val as u64,
         CSR_MCYCLEH  => hart.csrs.mcycle   = (hart.csrs.mcycle   & 0xFFFF_FFFF) | ((val as u64) << 32),
         CSR_MINSTRETH=> hart.csrs.minstret = (hart.csrs.minstret & 0xFFFF_FFFF) | ((val as u64) << 32),
+        // Hazard3 Xh3irq CSRs.
+        CSR_MEIEA      => hart.xh3irq.write_meiea(val),
+        CSR_MEIPA      => hart.xh3irq.write_meipa(val),
+        CSR_MEIFA      => hart.xh3irq.write_meifa(val),
+        CSR_MEIPRA     => hart.xh3irq.write_meipra(val),
+        CSR_MEINEXT    => hart.xh3irq.write_meinext(val, irq_pending),
+        CSR_MEICONTEXT => hart.xh3irq.write_meicontext(val, &mut hart.csrs.mie),
         // Read-only constants reached only via the RO-no-op read path;
         // write_csr is not called for them.
         _ => debug_assert!(false, "write_csr called for unsupported CSR {:#x}", csr),

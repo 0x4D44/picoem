@@ -85,6 +85,10 @@ impl Hazard3 {
 
     /// `mret`: pop the trap. pc <- mepc; mstatus.MIE <- MPIE; MPIE <- 1;
     /// MPP <- 0b11 (WARL — only M-mode in V1).
+    ///
+    /// P4: if meicontext.mreteirq is set (external IRQ was taken), pop
+    /// the Xh3irq preempt stack so subsequent same-or-lower-priority
+    /// IRQs can fire again.
     pub(crate) fn mret(&mut self) {
         self.pc = self.csrs.mepc;
         let mpie_bit = (self.csrs.mstatus >> 7) & 1;
@@ -97,5 +101,7 @@ impl Hazard3 {
         // MPP <- M-mode. Spec says "set to the least-privileged mode";
         // with only M-mode implemented, the WARL result is 0b11.
         self.csrs.mstatus |= 0b11 << 11;
+        // P4: pop the Hazard3 preempt stack if we were in an ext IRQ.
+        self.xh3irq.on_mret();
     }
 }

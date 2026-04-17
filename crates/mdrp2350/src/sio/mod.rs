@@ -108,6 +108,13 @@ impl Sio {
         self.spinlock_bits
     }
 
+    /// Read the RISCV_SOFTIRQ register state (bits [1:0] = per-hart
+    /// software-interrupt flags). Exposed for P4's `fan_out_riscv_irqs`
+    /// which drives `mip[3]` (MSIP) from these bits — HLD §4.6.
+    pub fn riscv_softirq(&self) -> u32 {
+        self.riscv_softirq & 0x3
+    }
+
     /// Explicitly reset all SIO state. Called from `Emulator::reset()`.
     /// Per-core DIV/INTERP state (`PerCoreSio`) is cleared on the
     /// individual `CortexM33`s in `Emulator::reset` — not here.

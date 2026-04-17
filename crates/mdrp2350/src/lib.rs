@@ -365,8 +365,53 @@ impl Emulator {
         if self.cores.is_arm() {
             self.tick_systick();
         }
+        // P4: fan-out MTIP/MSIP/MEIP into per-hart `mip` before the wake
+        // check. Order matters — `wake_checks` inspects `(mip & mie)` to
+        // clear `wfi_parked`, so it needs a freshly-sourced `mip` first.
+        // HLD §4.1 / §4.6.
+        if self.cores.is_riscv() {
+            self.fan_out_riscv_irqs();
+        }
         self.wake_checks();
         self.clock.cycles
+    }
+
+    /// Drive Hazard3 `mip` bits 3 (MSIP), 7 (MTIP), and 11 (MEIP) from
+    /// the per-hart hardware sources. MTIP is level-sensitive from SIO's
+    /// `mtime_match_asserted`; MSIP is the per-hart bit of
+    /// `SIO.RISCV_SOFTIRQ`; MEIP is computed by the Hazard3 IRQ
+    /// controller from `(bus.irq_pending | meifa) & meiea`. HLD §4.6.
+    ///
+    /// Firmware CSR writes to MSIP/MTIP/MEIP (via `csrrw mip, ...`) are
+    /// stomped here on the next quantum — the hardware source wins, per
+    /// RV-priv §3.1.9 which classes these bits as hardware-owned.
+    fn fan_out_riscv_irqs(&mut self) {
+        let Cores::RiscV(cs) = &mut self.cores else { return; };
+        let sio = &self.bus.sio;
+        for c in 0..2 {
+            let mut mip = cs[c].mip();
+            // MTIP bit 7 — level-sensitive from SIO.
+            if sio.mtime_match_asserted[c] {
+                mip |= 1 << 7;
+            } else {
+                mip &= !(1 << 7);
+            }
+            // MSIP bit 3 — from RISCV_SOFTIRQ per-hart bits.
+            let sw = (sio.riscv_softirq() >> c) & 1;
+            if sw != 0 {
+                mip |= 1 << 3;
+            } else {
+                mip &= !(1 << 3);
+            }
+            // MEIP bit 11 — from Hazard3 IRQ controller (P4).
+            let meip = cs[c].compute_meip(self.bus.atomics.irq_pending_load(c));
+            if meip {
+                mip |= 1 << 11;
+            } else {
+                mip &= !(1 << 11);
+            }
+            cs[c].set_mip(mip);
+        }
     }
 
     /// Run for at least `cycles` virtual cycles. Returns the final
@@ -473,8 +518,17 @@ impl Emulator {
                     }
                 }
             }
-            Cores::RiscV(_) => {
-                // P4 adds `wfi` wake logic per HLD §4.6.
+            Cores::RiscV(cs) => {
+                // HLD §4.6: `wfi` wakes when `(mip & mie) != 0`. The wake
+                // decision ignores `mstatus.MIE` — MIE only gates trap
+                // *delivery*. If MIE=0 the hart wakes and resumes the
+                // next instruction; if MIE=1 the next step() will deliver
+                // the trap at instruction boundary.
+                for c in cs {
+                    if c.wfi_parked && (c.mip() & c.mie()) != 0 {
+                        c.wfi_parked = false;
+                    }
+                }
             }
         }
     }
