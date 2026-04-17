@@ -7,6 +7,7 @@
 // (when / if Hazard3 adds mtval storage in a later silicon rev).
 
 use super::Hazard3;
+use crate::Bus;
 
 /// Trap causes used by the P2 executor. Keeps the call sites readable
 /// and traceable to the HLD §4.5 table.
@@ -32,7 +33,12 @@ impl Hazard3 {
     /// `_tval` is documentation-only on Hazard3: mtval is hardwired 0
     /// (HLD §4.3). Passed in so call sites declare what they *would*
     /// have reported.
-    pub(crate) fn enter_trap(&mut self, cause: u32, _tval: u32, epc: u32) {
+    ///
+    /// `bus` is threaded through so the trap-entry path can clear this
+    /// hart's LR/SC reservation (RISC-V A-extension §8.3 spec
+    /// recommendation: "it is strongly recommended that the reservation
+    /// set be invalidated on exceptions and context switches").
+    pub(crate) fn enter_trap(&mut self, cause: u32, _tval: u32, epc: u32, bus: &mut Bus) {
         // §4.5: mepc captures the PC of the faulting instruction.
         self.csrs.mepc = epc;
 
@@ -54,6 +60,12 @@ impl Hazard3 {
 
         // mtval is hardwired 0 — do NOT store _tval.
         // self.csrs.mtval stays 0.
+
+        // A-extension §8.3: clear this hart's LR/SC reservation on trap
+        // entry. Any outstanding reservation would otherwise survive the
+        // trap and potentially be consumed by a later sc.w in the handler
+        // (a spec-recommended invalidation point).
+        bus.reservation[self.hart_id as usize] = None;
 
         // Set PC: mtvec[0] = mode (0=direct, 1=vectored). Base is bits
         // [31:2] ANDed to word-align. Bit 1 is hardwired 0 (already

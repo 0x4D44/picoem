@@ -481,6 +481,11 @@ pub struct Bus {
     /// via `println!`. Unit tests inject a `Vec<u8>`-backed sink to
     /// capture lines without wrestling with fd 1 redirection.
     pub(crate) mmio_trace_sink: Option<Box<dyn Write>>,
+    /// Per-core LR/SC reservation (RV32A). `Some(addr)` holds a
+    /// word-aligned SRAM address the core has reserved via `lr.w`; any
+    /// write to that word by any master clears the corresponding
+    /// reservation. See HLD §4.7.
+    pub reservation: [Option<u32>; 2],
 }
 
 impl Bus {
@@ -578,6 +583,7 @@ impl Bus {
             mmio_trace_enabled: false,
             active_pc: [0; 2],
             mmio_trace_sink: None,
+            reservation: [None, None],
         }
     }
 
@@ -1096,6 +1102,20 @@ impl Bus {
         }
     }
 
+    /// Invalidate any per-core LR/SC reservation that covers the word
+    /// containing `addr`. Called from every public write path (any master
+    /// writing anywhere in the reservable region breaks the reservation,
+    /// per HLD §4.7 / RV-priv A-extension).
+    #[inline]
+    pub(crate) fn invalidate_reservation_at(&mut self, addr: u32) {
+        let word = addr & !3;
+        for slot in self.reservation.iter_mut() {
+            if *slot == Some(word) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Returns true if a bus fault was detected on `core`'s last access.
     /// Phase 3 Stage 1: bus-fault state migrated to `CoreAtomics` and
     /// gained a per-core `core` arg (LLD V7 §2). Single-threaded callers
@@ -1497,6 +1517,9 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        // RV32A: any write can invalidate an LR/SC reservation on either
+        // core. HLD §4.7.
+        self.invalidate_reservation_at(addr);
         let region = addr >> 28;
         debug_assert!(
             region != 0xD || !crate::core::PerCoreSio::owns_offset(addr & 0xFFF),
@@ -2094,6 +2117,15 @@ impl Bus {
             "DIV/INTERP addr 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
             addr
         );
+        // RV32A: invalidate any LR/SC reservation that covers this word
+        // (a 16-bit write within the word still clears the full-word
+        // reservation). HLD §4.7.
+        self.invalidate_reservation_at(addr);
+        if addr & 3 == 3 {
+            // Crosses a word boundary — also break the next word's
+            // reservation.
+            self.invalidate_reservation_at(addr.wrapping_add(1));
+        }
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);
@@ -2583,6 +2615,9 @@ impl Bus {
         debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
             "PPB address 0x{:08X} reached Bus::write32 — use CortexM33::bus_write32 wrapper",
             addr);
+        // RV32A: invalidate any LR/SC reservation at this word.
+        // HLD §4.7.
+        self.invalidate_reservation_at(addr);
         let region = addr >> 28;
         let alias = (addr >> 12) & 3;
         let (cycles, extra) = Self::write_latency(region);

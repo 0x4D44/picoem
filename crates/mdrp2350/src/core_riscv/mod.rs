@@ -13,6 +13,8 @@ pub(crate) mod execute;
 
 #[cfg(test)]
 mod tests_p2;
+#[cfg(test)]
+mod tests_p3;
 
 use crate::Bus;
 use regs::CsrFile;
@@ -69,20 +71,19 @@ impl Hazard3 {
         *self = Self::new(self.hart_id);
     }
 
-    /// Execute one RV32I instruction. Flat 1-cycle cost (HLD §8 Q5;
-    /// silicon cycle oracle is P5/P6 work). Parked / halted harts are
-    /// no-ops.
+    /// Execute one RV32I[MAC] + Zicsr + Zifencei instruction. Flat
+    /// 1-cycle cost (HLD §8 Q5; silicon cycle oracle is P5/P6 work).
+    /// Parked / halted harts are no-ops.
     pub fn step(&mut self, bus: &mut Bus) {
         if self.halted || self.wfi_parked {
             return;
         }
         let epc = self.pc;
 
-        // Instruction-address misalignment. Without C-extension the
-        // minimum alignment is 4 bytes. HLD §4.5 cause 0. TODO: when C
-        // lands in P3, relax this to (epc & 1) != 0.
-        if epc & 0b11 != 0 {
-            self.enter_trap(cause::INSTR_ADDR_MISALIGNED, epc, epc);
+        // Instruction-address misalignment. With C-extension PC only needs
+        // bit 0 clear; bit 1 is acceptable. HLD §4.5 cause 0.
+        if epc & 1 != 0 {
+            self.enter_trap(cause::INSTR_ADDR_MISALIGNED, epc, epc, bus);
             self.cycles = self.cycles.wrapping_add(1);
             return;
         }
@@ -92,18 +93,30 @@ impl Hazard3 {
         // to the correct PC.
         bus.set_active_pc(epc, self.hart_id);
 
-        // Fetch.
-        let insn = bus.read32(epc, self.hart_id);
+        // Fetch first halfword. Low two bits select 16-vs-32-bit.
+        let hw0 = bus.read16(epc, self.hart_id);
         if bus.bus_fault(self.hart_id as usize) {
             bus.clear_bus_fault(self.hart_id as usize);
-            self.enter_trap(cause::INSTR_ACCESS_FAULT, epc, epc);
+            self.enter_trap(cause::INSTR_ACCESS_FAULT, epc, epc, bus);
             self.cycles = self.cycles.wrapping_add(1);
             return;
         }
-
-        // Decode + dispatch.
-        let op = decode::decode(insn);
-        self.execute(op, bus, epc);
+        let (op, width) = if (hw0 & 0b11) != 0b11 {
+            // Compressed.
+            (decode::decode16(hw0), 2u32)
+        } else {
+            // Base-ISA 32-bit. Fetch the second halfword and combine.
+            let hw1 = bus.read16(epc.wrapping_add(2), self.hart_id);
+            if bus.bus_fault(self.hart_id as usize) {
+                bus.clear_bus_fault(self.hart_id as usize);
+                self.enter_trap(cause::INSTR_ACCESS_FAULT, epc, epc, bus);
+                self.cycles = self.cycles.wrapping_add(1);
+                return;
+            }
+            let insn = (hw0 as u32) | ((hw1 as u32) << 16);
+            (decode::decode(insn), 4u32)
+        };
+        self.execute_sized(op, bus, epc, width);
 
         // Flat-cycle cost. The HLD's M/load mult-cycle budget lands in P3.
         self.cycles = self.cycles.wrapping_add(1);

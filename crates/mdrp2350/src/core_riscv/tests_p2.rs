@@ -357,19 +357,16 @@ fn exec_jalr_rd_eq_rs1_link_wins_over_target_race() {
 }
 
 #[test]
-fn jal_misalign_traps_cause0() {
+fn jal_target_2byte_aligned_ok_with_c() {
+    // With the C extension, 2-byte aligned targets are legal. This was
+    // a misalign trap before P3.
     let (mut c, mut bus) = fresh();
     c.csrs.mtvec = 0x2000_2000;
-    // JAL with imm=2 -> target = epc+2 which is not 4-aligned.
-    // Normally unreachable in RV32I encoding (imm is even), but this
-    // exercises the execute-side guard. Use JALR to produce an odd-2
-    // target instead.
-    c.x[2] = 0x2000_0002; // 2-aligned, not 4-aligned
+    c.x[2] = 0x2000_0002; // 2-aligned, not 4-aligned — legal with C.
     c.execute(Op::Jalr { rd: 1, rs1: 2, imm: 0 }, &mut bus, 0x2000_0000);
-    // low bit clear -> 0x2000_0002, still not 4-aligned -> trap.
-    assert_eq!(c.csrs.mcause, 0);
-    assert_eq!(c.csrs.mepc, 0x2000_0000);
-    assert_eq!(c.pc, 0x2000_2000);
+    assert_eq!(c.csrs.mcause, 0, "no trap — mcause unchanged from reset");
+    assert_eq!(c.pc, 0x2000_0002, "jumped to 2-aligned target");
+    assert_eq!(c.x[1], 0x2000_0004, "link = epc + 4 (instruction width)");
 }
 
 // -----------------------------------------------------------------------
@@ -642,7 +639,7 @@ fn mepc_low_bits_masked() {
         Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MEPC },
         &mut bus, 0,
     );
-    assert_eq!(c.csrs.mepc, 0x2000_0100, "low 2 bits masked (no C in P2)");
+    assert_eq!(c.csrs.mepc, 0x2000_0102, "low bit masked (bit 1 writable with C)");
 }
 
 // -----------------------------------------------------------------------
@@ -665,9 +662,9 @@ fn vectored_mtvec_interrupt_uses_per_cause_slot() {
     // Simulate an interrupt cause by calling enter_trap directly with
     // bit 31 set. P4 will wire the real delivery path; this covers the
     // mtvec vectored branch inside trap.rs.
-    let (mut c, _bus) = fresh();
+    let (mut c, mut _bus) = fresh();
     c.csrs.mtvec = 0x2000_2001;
-    c.enter_trap(0x8000_0007, 0, 0x2000_0000);
+    c.enter_trap(0x8000_0007, 0, 0x2000_0000, &mut _bus);
     assert_eq!(c.pc, 0x2000_2000 + 4 * 7);
     assert_eq!(c.csrs.mcause & 0xF, 7);
     assert_eq!(c.csrs.mcause & 0x8000_0000, 0x8000_0000);

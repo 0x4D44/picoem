@@ -201,6 +201,7 @@ impl ThreadedEmulator {
             powman: _,
             coresight_trace: _,
             warned_clk_enable_clear: _,
+            reservation: _,
         } = bus;
 
         let shared_mem = Arc::new(SharedMemory::from_memory(

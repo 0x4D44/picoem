@@ -180,10 +180,10 @@ fn write_csr(hart: &mut Hazard3, csr: u16, val: u32) {
         }
         CSR_MSCRATCH => hart.csrs.mscratch = val,
         CSR_MEPC => {
-            // mepc low 2 bits hardwired 0 (no C-extension in P2). When C
-            // lands in P3, bit 1 becomes writable and this mask relaxes to
-            // `val & !0b1`.
-            hart.csrs.mepc = val & !0b11;
+            // With C-extension, bit 1 of mepc is writable (any 2-byte
+            // aligned address is a valid resumption point). Only bit 0 is
+            // hardwired 0.
+            hart.csrs.mepc = val & !0b1;
         }
         CSR_MCAUSE => {
             // WARL: keep bit 31 (interrupt flag) + full code field only
