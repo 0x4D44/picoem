@@ -29,7 +29,8 @@ use std::fmt::Write as _;
 use mdrp2350::{Bus, Emulator};
 
 use crate::onerom_glue_dma::{
-    GlueDma, DMA_BASE, DMA_CH_READ_ADDR, DMA_CH_STRIDE,
+    GlueDma, DMA_BASE, DMA_CH_READ_ADDR, DMA_CH_STRIDE, DMA_READ_CYCLES,
+    DMA_WRITE_CYCLES,
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +86,29 @@ const GAP_CYCLES: u32 = 12;
 
 /// Cycle budget per case (envelope is 11..=14; 60 gives ~4× slack).
 const PER_CASE_TIMEOUT: u32 = 60;
+
+/// Minimum sysclks before a CH1 byte-push could POSSIBLY have propagated
+/// to PIO2's output pads. Derived from the glue DMA pipeline depth:
+/// CH0-read (`DMA_READ_CYCLES`) + CH1-read/write (`DMA_WRITE_CYCLES`)
+/// = 4 + 4 = 8 sysclks from CS-low to a fresh byte reaching PIO2.TX0.
+///
+/// This is a STRICT FLOOR: before this cycle, any observed stable run
+/// is definitionally pipeline residue from a prior case whose
+/// `data_byte` happens to match for `MIN_STABLE_CYCLES` consecutive
+/// observations. PIO2 SM1's `OUT PINS, 8` shift adds additional
+/// propagation cycles on top, but those land inside the 11..=14
+/// envelope and are correctly classified by the envelope check — no
+/// benefit to raising the gate past the DMA floor, and doing so would
+/// risk false `NoStableByte` verdicts on correct serves near the
+/// envelope boundary.
+///
+/// Gating stability on `obs.cycle >= MIN_FRESH_ARRIVAL_CYCLE` (alongside
+/// the Phase D.2 `baseline_pushes` edge gate) rejects the pipeline-
+/// propagation-lag false-positive class. See Phase D.2b in
+/// `wrk_journals/2026.04.17 - JRN - OneROM Serving Oracle Fix Wave.md`
+/// for the A7 (case 9) live-sweep trace that motivated this gate.
+const MIN_FRESH_ARRIVAL_CYCLE: u64 =
+    (DMA_READ_CYCLES as u64) + (DMA_WRITE_CYCLES as u64);
 
 /// Data bus base — D0..D7 on GPIO 16..23. Mirrors Stage F.
 const GPIO_DATA_BASE: u8 = 16;
@@ -851,13 +875,32 @@ pub(crate) fn evaluate_case_trace(
     trace: &[Observation],
 ) -> CaseResult {
     let mut state = EvalState::WaitPush;
+    // Baseline push delta at the start of the observation window.
+    // WaitPush only transitions when `obs.ch1_pushes > baseline_pushes`,
+    // i.e. when a push has landed **during** this window rather than
+    // reflecting a prior case's pipeline tail.
+    //
+    // Why: `pushes_before` is snapshotted BEFORE the first
+    // `glue.tick(&mut bus)`, so if a prior case's CH1 transfer is still
+    // in the glue DMA pipeline (read/write sub-phases in `onerom_glue_dma`
+    // total 8 cycles; GAP_CYCLES = 12 gives 4 cycles of slack but any
+    // further mis-timing lets a push complete inside this case's first
+    // tick) the first observation can show `ch1_pushes == 1` with D0..D7
+    // still carrying the prior case's byte at `pad_oe = 0xFF`. Without
+    // this edge gate the evaluator would transition to `WaitStable` at
+    // cycle 0, the 3-cycle stability window would catch the stale byte,
+    // and the verdict would surface as `WrongByte`/`LatencyOutOfEnvelope`.
+    // See Phase D.2 in `wrk_journals/2026.04.17 - JRN - OneROM Serving
+    // Oracle Fix Wave.md` for the A7 failure trace.
+    let baseline_pushes: u32 = trace.first().map(|o| o.ch1_pushes).unwrap_or(0);
 
     for (i, obs) in trace.iter().enumerate() {
         match &mut state {
             EvalState::WaitPush => {
-                if obs.ch1_pushes > 0 {
-                    // ch1_pushes is the delta from pushes_before, so > 0
-                    // means a fresh push landed at or before this cycle.
+                if obs.ch1_pushes > baseline_pushes {
+                    // Edge beyond the window-start baseline: a push
+                    // landed during *this* observation window, not a
+                    // pre-observation pipeline completion.
                     let resolved = obs.resolved_addr;
 
                     if !(SHADOW_BASE..SHADOW_BASE + SHADOW_SIZE as u32).contains(&resolved) {
@@ -894,11 +937,18 @@ pub(crate) fn evaluate_case_trace(
                 stable_run,
             } => {
                 // Stability requires pad_oe=0xFF AND we're strictly after
-                // the push cycle (HLD §4.4 — the residue-rejection rule).
+                // the push cycle (HLD §4.4 — the residue-rejection rule)
+                // AND the observation cycle is past the glue DMA pipeline
+                // floor (Phase D.2b — `MIN_FRESH_ARRIVAL_CYCLE`). The
+                // floor rules out stable runs that form before a fresh
+                // byte could possibly have propagated, which would
+                // otherwise latch stale residue that matches for
+                // MIN_STABLE_CYCLES by coincidence.
                 let after_push = obs.cycle > *push_cycle;
                 let drives_all = obs.pio2_pad_oe_data == 0xFF;
+                let past_pipeline = obs.cycle >= MIN_FRESH_ARRIVAL_CYCLE;
 
-                if after_push && drives_all {
+                if after_push && drives_all && past_pipeline {
                     match stable_run {
                         Some((_start, byte, len)) if *byte == obs.data_byte => {
                             *len += 1;
@@ -942,8 +992,9 @@ pub(crate) fn evaluate_case_trace(
                         }
                     }
                 } else {
-                    // Break the stable run — either pad_oe dropped or
-                    // we're still at/before push_cycle.
+                    // Break the stable run — either pad_oe dropped, we're
+                    // still at/before push_cycle, or we're below the
+                    // fresh-arrival cycle floor.
                     *stable_run = None;
                 }
             }
@@ -1292,20 +1343,20 @@ mod tests {
 
     /// 4. Prior-case residue: data is already 0xAA at cycle 0, but the
     /// push only happens at cycle 5. The stable run must not start at
-    /// cycle 0 — the first_stable_cycle > push_cycle rule forces the
-    /// latency measurement to anchor after cycle 5. The earliest
-    /// stable cycle is 6 (pad_oe=0xFF + cycle > 5), so 3-cycle run
-    /// completes at cycle 8 → stable_cycle=6 → latency=6.
+    /// cycle 0 — the first_stable_cycle > push_cycle rule anchors the
+    /// latency measurement after cycle 5. Post-Phase-D.2b, the
+    /// MIN_FRESH_ARRIVAL_CYCLE=8 floor further delays stability to
+    /// cycle 8 (even though a byte-match run would otherwise form at
+    /// cycle 6), so the 3-cycle run completes at cycle 10 →
+    /// stable_cycle=8 → latency=8.
     ///
     // Validates: residue rejection — the push-anchored latency anchors
-    // after the push cycle, not at cycle 0 of a residual byte.
-    // Does NOT directly validate: the `>` vs `>=` distinction on line 497.
-    // The `continue;` after the WaitPush→WaitStable transition already
-    // prevents the push cycle from entering the WaitStable arm, so either
-    // mutation of that comparator survives this test. The `>` guard is
-    // belt-and-braces alongside the `continue;`. If either the `continue;`
-    // OR the `>` guard is removed the other still protects; remove with
-    // caution.
+    // after the push cycle AND after the fresh-arrival floor, not at
+    // cycle 0 of a residual byte. Does NOT directly validate the `>`
+    // vs `>=` distinction on the push_cycle comparator — the `continue;`
+    // after the WaitPush→WaitStable transition already prevents the
+    // push cycle from entering the WaitStable arm, so that comparator
+    // is belt-and-braces. Remove either with caution.
     #[test]
     fn verdict_rejects_prior_case_residue() {
         let case = mk_case();
@@ -1331,15 +1382,200 @@ mod tests {
         assert_eq!(
             result.verdict,
             Verdict::Pass,
-            "residue rejection should still PASS once anchored after push"
+            "residue rejection should still PASS once anchored after push + floor"
         );
-        // cs_low_cycle = 0; first cycle strictly after push_cycle=5 is
-        // cycle 6; that starts the 3-cycle stable run (6,7,8); stable_cycle=6;
-        // latency = 6 - 0 = 6.
+        // cs_low_cycle = 0; push_cycle=5. Pre-D.2b the run would start at
+        // cycle 6; post-D.2b MIN_FRESH_ARRIVAL_CYCLE=8 defers it to cycle
+        // 8. 3-cycle run (8,9,10); stable_cycle=8; latency = 8 - 0 = 8.
         assert_eq!(
             result.latency_cycles,
-            Some(6),
-            "latency must anchor after push, not at cycle 0 of residual byte"
+            Some(MIN_FRESH_ARRIVAL_CYCLE as u32),
+            "latency must anchor after push AND after fresh-arrival floor"
+        );
+    }
+
+    /// 4b. Stale-byte rejection (Phase D.2): simulates the live-harness
+    /// A7 failure mode where `glue.tick` at the case's first cycle
+    /// completes a prior case's in-flight push, so the `ch1_pushes`
+    /// delta is already `1` at cycle 0 with no 0→1 edge within the
+    /// observation window. The data bus still carries the stale byte
+    /// (`0x20`) at `pad_oe = 0xFF` because PIO2 hasn't drained yet.
+    ///
+    /// Under the broken evaluator, `WaitPush` transitions at cycle 0
+    /// (push_cycle = 0), cycles 1–3 form a stable run at `0x20`, and
+    /// `apply_envelope` surfaces a `WrongByte` (or `LatencyOOE` if
+    /// latency is in-range for the `Pass`→envelope path) — exactly the
+    /// A7 `observed = 0x20` report.
+    ///
+    /// Desired: the evaluator must distinguish "push landed during this
+    /// observation window" from "push delta starts at >0 because of a
+    /// pre-observation pipeline completion". Without a 0→1 edge, the
+    /// verdict is `NoResolve`.
+    #[test]
+    fn stability_rejects_stale_byte_without_fresh_push() {
+        let case = mk_case();
+        let shadow = empty_shadow();
+        // Resolved addr in-range so a buggy evaluator doesn't bail
+        // early on `ResolvedAddrOutOfRange` and mask the real failure.
+        let resolved = SHADOW_BASE + 0xB000;
+
+        // ch1_pushes = 1 from cycle 0 (pipeline residue completed during
+        // the first tick); stale 0x20 held stable at pad_oe=0xFF.
+        let mut trace = Vec::new();
+        for c in 0..(PER_CASE_TIMEOUT as u64) {
+            trace.push(Observation {
+                cycle: c,
+                ch1_pushes: 1,
+                resolved_addr: resolved,
+                data_byte: 0x20,
+                pio2_pad_oe_data: 0xFF,
+            });
+        }
+
+        let result = evaluate_case_trace(case, &shadow, &trace);
+
+        // The 0x20 byte is *not* from this case's push — it's stale.
+        assert!(
+            !matches!(result.verdict, Verdict::WrongByte { observed: 0x20, .. }),
+            "stale byte must not surface as WrongByte(observed=0x20); got {:?}",
+            result.verdict
+        );
+        assert_ne!(
+            result.verdict,
+            Verdict::Pass,
+            "stale byte must not PASS (got observed={:?})",
+            result.observed_byte
+        );
+        assert!(
+            !matches!(result.verdict, Verdict::LatencyOutOfEnvelope { .. }),
+            "stale byte must not surface as LatencyOutOfEnvelope; got {:?}",
+            result.verdict
+        );
+        // No 0→1 edge within the window → `WaitPush` never transitions
+        // → `NoResolve`.
+        assert_eq!(
+            result.verdict,
+            Verdict::NoResolve,
+            "pre-observation residue must resolve as NoResolve (no fresh push edge)"
+        );
+        assert!(result.observed_byte.is_none());
+    }
+
+    /// 4c. All-zero push-count trace: regression guard for the
+    /// pure-residue case (no push at all during the case). Current
+    /// evaluator returns `NoResolve` via the `WaitPush` gate; keep this
+    /// as a backstop so any future refactor that bypasses the gate
+    /// fails loudly.
+    #[test]
+    fn stability_rejects_stale_byte_with_zero_pushes_throughout() {
+        let case = mk_case();
+        let shadow = empty_shadow();
+        let resolved = SHADOW_BASE + 0xB000;
+
+        let mut trace = Vec::new();
+        for c in 0..(PER_CASE_TIMEOUT as u64) {
+            trace.push(Observation {
+                cycle: c,
+                ch1_pushes: 0,
+                resolved_addr: resolved,
+                data_byte: 0x20,
+                pio2_pad_oe_data: 0xFF,
+            });
+        }
+
+        let result = evaluate_case_trace(case, &shadow, &trace);
+        assert_eq!(result.verdict, Verdict::NoResolve);
+        assert!(result.observed_byte.is_none());
+    }
+
+    /// 4d. Early-exit gate (Phase D.2): `try_evaluate_conclusive` must
+    /// not declare a case conclusive while the trace-so-far contains no
+    /// 0→1 push edge. The `run_case` loop must keep ticking until a
+    /// fresh push lands or the per-case budget expires.
+    #[test]
+    fn try_evaluate_conclusive_requires_fresh_push_edge() {
+        let case = mk_case();
+        let shadow = empty_shadow();
+        let resolved = SHADOW_BASE + 0xB000;
+
+        // Pre-observation pipeline residue: delta = 1 from cycle 0.
+        let mut trace = Vec::new();
+        for c in 0..10u64 {
+            trace.push(Observation {
+                cycle: c,
+                ch1_pushes: 1,
+                resolved_addr: resolved,
+                data_byte: 0x20,
+                pio2_pad_oe_data: 0xFF,
+            });
+        }
+        assert!(
+            try_evaluate_conclusive(case, &shadow, &trace).is_none(),
+            "no 0→1 edge → not conclusive"
+        );
+    }
+
+    /// 4e. Fresh-arrival-cycle gate (Phase D.2b): even with a fresh push
+    /// edge inside the window, stability declared before the glue DMA
+    /// pipeline could possibly have delivered the new byte must be
+    /// rejected. Models the live A7 (case 9) failure where CH1 pushes
+    /// advance 0→1 at cycle 0, `data_byte == 0x20` is stale from a prior
+    /// case, and a 3-cycle stable run at cycles 1..=3 erroneously
+    /// surfaces as `WrongByte observed=0x20 cycles=3`. The fresh byte
+    /// cannot have propagated yet — CH0 read (4) + CH1 read/write (4) =
+    /// 8 sysclks of pipeline depth minimum.
+    #[test]
+    fn stability_rejects_stale_byte_under_min_fresh_arrival_cycle() {
+        let case = mk_case();
+        let shadow = empty_shadow();
+        // Resolved addr in-range, expected byte = 0x00 (empty shadow).
+        let resolved = SHADOW_BASE + 0xB000;
+
+        // Cycle 0: baseline observation with ch1_pushes=0.
+        // Cycles 1..N: ch1_pushes=1 (fresh push edge), stale data_byte=0x20,
+        // pad_oe=0xFF throughout. Data byte NEVER changes, so without the
+        // cycle-floor gate the evaluator would form a 3-cycle stable run
+        // at cycles 1,2,3 and report WrongByte(observed=0x20).
+        let mut trace = Vec::new();
+        trace.push(Observation {
+            cycle: 0,
+            ch1_pushes: 0,
+            resolved_addr: resolved,
+            data_byte: 0x20,
+            pio2_pad_oe_data: 0xFF,
+        });
+        for c in 1..(PER_CASE_TIMEOUT as u64) {
+            trace.push(Observation {
+                cycle: c,
+                ch1_pushes: 1,
+                resolved_addr: resolved,
+                data_byte: 0x20,
+                pio2_pad_oe_data: 0xFF,
+            });
+        }
+
+        let result = evaluate_case_trace(case, &shadow, &trace);
+
+        // The key invariant: no latency < MIN_FRESH_ARRIVAL_CYCLE may be
+        // reported, under any verdict. Pre-fix the evaluator produces
+        // WrongByte(observed=0x20) at latency=2; post-fix any WrongByte
+        // that emerges must be at latency >= 8 (or the case times out as
+        // NoStableByte).
+        if let Some(cycles) = result.latency_cycles {
+            assert!(
+                (cycles as u64) >= MIN_FRESH_ARRIVAL_CYCLE,
+                "stable run declared at cycles={} (< MIN_FRESH_ARRIVAL_CYCLE={}); \
+                 verdict={:?}",
+                cycles,
+                MIN_FRESH_ARRIVAL_CYCLE,
+                result.verdict
+            );
+        }
+        // Stale 0x20 must not PASS against expected 0x00.
+        assert_ne!(
+            result.verdict,
+            Verdict::Pass,
+            "stale 0x20 must not PASS against expected 0x00"
         );
     }
 
