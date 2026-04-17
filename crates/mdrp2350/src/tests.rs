@@ -9240,3 +9240,97 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
     assert_eq!(stacked_xpsr & (1 << 9), 0,
         "no alignment padding expected (SP was 8-aligned)");
 }
+
+// ============================================================================
+// SIO GPIO_OUT byte/halfword-write replication (RP2350 hardware behaviour)
+// ============================================================================
+//
+// Real RP2350 silicon replicates sub-word writes to the GPIO_OUT family
+// (GPIO_OUT / GPIO_OUT_SET / GPIO_OUT_CLR / GPIO_OUT_XOR, plus the OE
+// variants) across all 4 byte lanes of the underlying 32-bit register.
+// Firmware (OneROM's CPU-serve loop) relies on this: a single
+// `STRB R1, [R5, #0]` at SIO_GPIO_OUT must drive the same byte on
+// pins 0..7, 8..15, 16..23, and 24..31 simultaneously.
+//
+// The previous behaviour (byte-lane RMW) left pins 16..23 dark when the
+// firmware issued a STRB at offset 0. These tests pin the replication
+// contract for byte and halfword writes, plus confirm that non-GPIO_OUT
+// SIO registers still do ordinary byte-lane RMW.
+
+/// A byte write to SIO_GPIO_OUT must replicate the byte across all four
+/// lanes of the 32-bit register, matching RP2350 silicon.
+#[test]
+fn sio_gpio_out_byte_write_replicates_across_lanes() {
+    use crate::{Emulator, Config};
+
+    let mut emu = Emulator::new(Config::default());
+
+    // Enable OE for all 30 valid pins so `update_gpio` can surface the
+    // replicated output on `gpio_in`.
+    emu.bus.write32(0xD000_0030, 0x3FFF_FFFF);
+
+    // Byte write to SIO_GPIO_OUT offset 0.
+    emu.bus.write8(0xD000_0010, 0xA5);
+
+    // The 32-bit SIO_GPIO_OUT register must hold the byte replicated
+    // across every lane.
+    assert_eq!(
+        emu.bus.read32(0xD000_0010),
+        0xA5A5_A5A5,
+        "byte write to SIO_GPIO_OUT must replicate across all 4 lanes"
+    );
+
+    // Pins 16..23 are the upper byte of the `0xA5` replication. Run a
+    // single step so `update_gpio` composes `gpio_in` from
+    // `sio.gpio_out & sio.gpio_oe`; then verify the byte made it onto
+    // those pins. This is the exact property the OneROM CPU-serve loop
+    // relies on.
+    emu.run(1);
+    // Bits 16..23 reflect `0xA5` — masked against `PIN_MASK` (bits
+    // 0..29), they still span the full byte (16..23 all valid).
+    let pins_16_23 = (emu.bus.gpio_in >> 16) & 0xFF;
+    assert_eq!(
+        pins_16_23, 0xA5,
+        "pins 16..23 must reflect replicated byte 0xA5, got {:#04x}",
+        pins_16_23
+    );
+}
+
+/// A halfword write to SIO_GPIO_OUT must replicate the 16-bit value
+/// across both halves of the 32-bit register.
+#[test]
+fn sio_gpio_out_halfword_write_replicates() {
+    use crate::{Emulator, Config};
+
+    let mut emu = Emulator::new(Config::default());
+
+    emu.bus.write16(0xD000_0010, 0x1234);
+
+    assert_eq!(
+        emu.bus.read32(0xD000_0010),
+        0x1234_1234,
+        "halfword write to SIO_GPIO_OUT must replicate across both halves"
+    );
+}
+
+/// Replication must be GPIO_OUT-family-specific, not blanket across
+/// every SIO register. A byte write to a non-GPIO_OUT register (e.g.
+/// MTIMEL at offset 0x1B0) must still behave as byte-lane RMW.
+#[test]
+fn sio_non_gpio_out_byte_write_still_rmw() {
+    use crate::{Emulator, Config};
+
+    let mut emu = Emulator::new(Config::default());
+
+    // MTIMEL (offset 0x1B0) is a plain storage register on RP2350 SIO
+    // — no side-effect semantics, perfect for verifying the RMW path.
+    emu.bus.write32(0xD000_01B0, 0xFFFF_FFFF);
+    emu.bus.write8(0xD000_01B1, 0xAA);
+
+    // Only byte 1 should have changed.
+    assert_eq!(
+        emu.bus.read32(0xD000_01B0),
+        0xFFFF_AAFF,
+        "non-GPIO_OUT byte write must be byte-lane RMW, not replicated"
+    );
+}

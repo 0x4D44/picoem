@@ -1,0 +1,1160 @@
+//! OneROM serving oracle — CPU-serve mode byte-correctness + timing envelope.
+//!
+//! This is the on-core (CPU-serve) counterpart to [`crate::onerom_serving_oracle`].
+//! The PIO oracle drives a 2-stage PIO + glue-DMA pipeline; this oracle
+//! targets firmware builds that serve ROM from the CPU directly, with
+//! core 0 sitting in a tight 5-instruction loop at
+//! `0x1000_0926..=0x1000_0930` that:
+//! 1. STRBs R1 → SIO_GPIO_OUT (drive data pins)
+//! 2. LDRHs SIO_GPIO_IN → R0 (sample CS + addr pins)
+//! 3. TSTs R0 against the CS1 mask in R9
+//! 4. LDRBs shadow\[R0] → R1 (prefetch next byte from SRAM)
+//! 5. BEQs back if CS1 stayed low
+//!
+//! Key differences from the PIO oracle:
+//! - **No PIO**: PIO1.CTRL and PIO2.CTRL are both 0 for the whole run.
+//!   Sync is detected via the CPU's PC entering the serve loop range.
+//! - **No glue DMA**: the CPU reads SRAM directly and drives pins via
+//!   SIO writes. There is no pipeline to pump and no [`GlueDma`] to
+//!   thread through.
+//! - **Direct pin observation**: the byte we care about is whatever the
+//!   CPU has driven onto `gpio_in[16..23]` via SIO_GPIO_OUT + SIO_GPIO_OE.
+//!   No "resolved address" intermediate — the CPU computes the address
+//!   internally from the sampled pins and looks up the byte from its
+//!   own SRAM shadow.
+//! - **Envelope**: measured empirically; CPU-serve steady-state latency
+//!   differs from PIO pipeline latency.
+//!
+//! Design mirrors [`crate::onerom_serving_oracle`] — we share
+//! [`Case`] / [`DEFAULT_CASES`] / [`SHADOW_BASE`] / [`SHADOW_SIZE`] /
+//! [`ADDR_A11_A12_HIGH`] from there to keep the stimulus catalogue in
+//! exactly one place. Everything that touches PIO/DMA is re-implemented
+//! here for CPU-serve semantics.
+
+use std::fmt::Write as _;
+
+use mdrp2350::{Bus, Emulator};
+
+use crate::onerom_serving_oracle::{
+    lift_shadow_from_flash_pub, stimulus_level_pub, Case, ADDR_A11_A12_HIGH,
+    SHADOW_BASE, SHADOW_SIZE,
+};
+
+// ---------------------------------------------------------------------------
+// Public constants
+// ---------------------------------------------------------------------------
+
+/// Re-export the shared case catalogue at the CPU-oracle path so callers
+/// can use either oracle without reaching back into the PIO module.
+pub use crate::onerom_serving_oracle::DEFAULT_CASES as CPU_DEFAULT_CASES;
+
+/// CPU serve-loop PC range (RP2350, CPU-mode fixture). The hot loop is
+/// five instructions (one 32-bit TST.W plus four 16-bit halfwords),
+/// spanning 10 bytes at `0x1000_0926..=0x1000_0930`. Empirically verified
+/// via `onerom_cpu_probe` (5000-instruction PC histogram, 2026-04-17 run
+/// of `test-sdrr-0-cpu.bin`): 100% of observed PCs land in this range,
+/// with the 5 hot PCs distributing 28/14/14/14/28% — a balanced trace of
+/// the 5-instruction inner loop.
+///
+/// If a future fixture shifts the serve loop, the `onerom_cpu_probe`
+/// diagnostic binary will detect the new range and the constants here
+/// are the single place to update.
+pub const CPU_SERVE_LOOP_PC_LO: u32 = 0x1000_0926;
+pub const CPU_SERVE_LOOP_PC_HI: u32 = 0x1000_0930;
+
+/// Acceptable CS-low-to-stable-byte cycle envelope for CPU-serve mode.
+///
+/// Populated from the empirical wide-envelope run described in the HLD;
+/// CPU latency is shorter than PIO pipeline latency because there's no
+/// DMA pipeline to clock through — the CPU reads a pin, looks up a
+/// byte, and drives it, all in one iteration of a 5-instruction loop.
+///
+/// This window is emulator-bounded (same caveat as the PIO oracle —
+/// silicon-calibrated timing remains a future pass). A case outside
+/// this window but correct byte-wise is reclassified as
+/// [`Verdict::LatencyOutOfEnvelope`] rather than a true FAIL.
+pub const CPU_ENVELOPE_CYCLES: std::ops::RangeInclusive<u32> = 9..=60;
+
+// ---------------------------------------------------------------------------
+// Internal constants
+// ---------------------------------------------------------------------------
+
+/// Minimum consecutive cycles the data byte must hold steady (with OEN
+/// = 0xFF on pins 16..23) to declare the byte "stable".
+const MIN_STABLE_CYCLES: usize = 4;
+
+/// Cycles of gap-level (CS1/CS2/CS3 high, addr=0) we drive at the start
+/// of each case to put the CPU back into the "deselected" state before
+/// applying the case stimulus. Small — the CPU only needs enough cycles
+/// to loop back around and observe CS1 high, exit the inner loop, clear
+/// OEN, and park in the outer wait.
+const GAP_CYCLES: u32 = 40;
+
+/// Cycle budget per case. Must exceed the high end of
+/// [`CPU_ENVELOPE_CYCLES`] by enough slack that a correct serve with
+/// transient latency inflation doesn't spuriously hit the timeout.
+const PER_CASE_TIMEOUT: u32 = 400;
+
+/// Minimum tick (cycles elapsed since stimulus applied) at which the
+/// stability counter may begin counting. The CPU serve loop is 5
+/// Thumb instructions; on RP2350 one full iteration (including the
+/// `STRB` that drives a fresh byte onto the pins) takes on the order
+/// of 6 cycles. Before this floor, any stable run we observe is
+/// definitionally the *previous* byte the CPU happened to be driving
+/// — the CPU simply hasn't yet sampled the new pin state, looked up
+/// the shadow, and issued the fresh STRB. Rejecting these pre-floor
+/// runs is the CPU-oracle analogue of the PIO oracle's
+/// `MIN_FRESH_ARRIVAL_CYCLE` gate; without it, every case locks onto
+/// the stale 0x00 the CPU was driving before stimulus application.
+const MIN_FRESH_ARRIVAL_CYCLE_CPU: u32 = 6;
+
+/// Timeout after which, if no byte transition has been observed since
+/// stimulus application, we trust whatever byte the CPU is holding
+/// steady. This handles the legitimate "expected byte == 0x00" case:
+/// the CPU performs its loop iteration and stores 0x00 (same as the
+/// prior steady-state), so no transition is visible on the wire.
+/// Without this fallback, those cases would time out as
+/// `NoStableByte` despite the CPU serving correctly. The value must
+/// comfortably exceed `MIN_FRESH_ARRIVAL_CYCLE_CPU` plus
+/// `MIN_STABLE_CYCLES` so the fallback only fires after the CPU has
+/// had multiple full loop iterations to act.
+const ZERO_BYTE_TRUST_TIMEOUT_CPU: u32 = 40;
+
+/// Data bus base — D0..D7 on GPIO 16..23. Mirrors the PIO oracle.
+const GPIO_DATA_BASE: u8 = 16;
+
+/// Data-pin mask (bits 16..23). Used by the `data_pin_mask_covers_*`
+/// unit test to pin the pin-range invariant; the `run_case` inner loop
+/// extracts the byte directly via a shift, so this constant is a
+/// test-only artefact.
+#[cfg(test)]
+const GPIO_DATA_MASK: u32 = 0xFF << GPIO_DATA_BASE;
+
+/// CS lanes on the `test-sdrr-0` fixture. Mirrors the PIO oracle.
+const GPIO_CS1: u8 = 13;
+const GPIO_CS2: u8 = 12;
+const GPIO_CS3: u8 = 15;
+
+/// A0..A12 pin map. Mirrors the PIO oracle.
+const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
+
+/// SIO GPIO_OE MMIO (RP2350 8-byte offsets).
+const SIO_GPIO_OE_ADDR: u32 = 0xD000_0030;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Outcome for one case under the CPU-serve oracle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuVerdict {
+    /// Byte observed on D0..D7 matched the SRAM shadow at the stimulus
+    /// address, and the latency was within the documented envelope.
+    Pass,
+    /// Stable byte observed but it does not match the shadow.
+    WrongByte { expected: u8, observed: u8 },
+    /// The CPU never drove the data pins (OEN stayed 0 for the full
+    /// per-case budget). Distinct from `NoStableByte` because it
+    /// diagnoses "CPU is stuck / not serving" rather than "CPU is
+    /// serving but output jitters".
+    DataPinsNotDriven,
+    /// CPU drove OEN but the data byte never held steady for
+    /// [`MIN_STABLE_CYCLES`] consecutive cycles.
+    NoStableByte,
+    /// Stable byte matched the shadow but measured latency fell outside
+    /// [`CPU_ENVELOPE_CYCLES`].
+    LatencyOutOfEnvelope { cycles: u32 },
+}
+
+/// Per-case diagnostic result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuCaseResult {
+    pub case: Case,
+    pub expected_byte: Option<u8>,
+    pub observed_byte: Option<u8>,
+    pub latency_cycles: Option<u32>,
+    pub verdict: CpuVerdict,
+}
+
+/// CPU-serve oracle state.
+pub struct CpuServingOracle {
+    rom_shadow: Box<[u8; SHADOW_SIZE]>,
+    results: Vec<CpuCaseResult>,
+}
+
+impl CpuServingOracle {
+    /// Capture the ROM-table shadow at sync.
+    ///
+    /// On CPU-mode fixtures the firmware actually populates SRAM via a
+    /// CPU copy (no DMA-based preload), so by the time `is_synced_cpu`
+    /// trips SRAM at [`SHADOW_BASE`] is already mirrored. We still lift
+    /// the shadow from flash (not SRAM) because it's the canonical
+    /// ground truth and the implementation is already plumbed in the
+    /// PIO oracle — using flash keeps the two paths symmetric.
+    pub fn new_at_sync(bus: &mut Bus, flash: &[u8]) -> Self {
+        // `sdrr_runtime_info.rom_set_index` offset within SRAM — mirror
+        // of the PIO oracle. Constants from `sdrr/link/common.ld` +
+        // `sdrr_runtime_info_t`.
+        const RUNTIME_INFO_SRAM_OFF: u32 = 0x0008_0000;
+        const ROM_SET_INDEX_OFFSET: u32 = 6;
+        let rom_set_index = bus
+            .memory
+            .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
+
+        let shadow = lift_shadow_from_flash_pub(flash, rom_set_index)
+            .unwrap_or_else(|| Box::new([0u8; SHADOW_SIZE]));
+
+        Self {
+            rom_shadow: shadow,
+            results: Vec::new(),
+        }
+    }
+
+    /// Test-only constructor accepting a pre-built shadow.
+    #[cfg(test)]
+    pub(crate) fn new_with_shadow(shadow: Box<[u8; SHADOW_SIZE]>) -> Self {
+        Self {
+            rom_shadow: shadow,
+            results: Vec::new(),
+        }
+    }
+
+    /// Drive one case end-to-end.
+    ///
+    /// 1. Gap drive: CS1/CS2/CS3 all high (deselected), addr=0, for
+    ///    [`GAP_CYCLES`] cycles. Gets the CPU back into the "deselected"
+    ///    state (outer wait loop + OEN cleared).
+    /// 2. Stimulus drive: CS1 low, CS2/CS3 high (A11=A12=1), addr=case
+    ///    pattern. Step the emulator until either:
+    ///    - the data byte holds steady at the same value for
+    ///      [`MIN_STABLE_CYCLES`] consecutive cycles with OEN=0xFF on
+    ///      data pins → record the byte + latency, compare against
+    ///      shadow, classify verdict.
+    ///    - OEN stays 0 for the full budget → `DataPinsNotDriven`.
+    ///    - OEN goes high but no stable run forms → `NoStableByte`.
+    /// 3. Envelope check: reclassify `Pass` with out-of-envelope latency
+    ///    to `LatencyOutOfEnvelope`.
+    pub fn run_case(&mut self, emu: &mut Emulator, case: Case) -> &CpuCaseResult {
+        debug_assert!(
+            case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
+            "run_case: case.addr_bits must have A11=A12=1"
+        );
+
+        // External-input mask covers CS1/CS2/CS3 and all address pins.
+        // D0..D7 (16..23) are CPU-driven — never mask them.
+        let ext_mask: u32 = (1u32 << GPIO_CS1)
+            | (1u32 << GPIO_CS2)
+            | (1u32 << GPIO_CS3)
+            | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
+        emu.bus.gpio_external_mask = ext_mask;
+
+        // 1. Gap drive — CS1/CS2/CS3 all high, addr=0.
+        let gap_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
+        emu.bus.gpio_external_in = gap_level;
+        for _ in 0..GAP_CYCLES {
+            emu.run(1);
+        }
+
+        // 2. Apply stimulus.
+        let stim_level = stimulus_level_pub(case.addr_bits);
+        emu.bus.gpio_external_in = stim_level;
+
+        // The CPU's serve loop looks up shadow[pins_low_16]. The pins
+        // the CPU samples are the 16-bit pattern the stim applies — which
+        // is just the low 16 bits of `stim_level`. Shadow lookup offset =
+        // pins_low_16.
+        let shadow_offset = (stim_level & 0xFFFF) as usize;
+        let expected_byte = self.rom_shadow[shadow_offset];
+
+        // 3. Tick and observe.
+        let mut state = StabilityState::default();
+        let mut decision: Option<StabilityDecision> = None;
+
+        for tick in 0..PER_CASE_TIMEOUT {
+            emu.run(1);
+
+            let sio_oe = emu.bus.read32(SIO_GPIO_OE_ADDR);
+            let oe_data = ((sio_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
+            // Observe byte from `gpio_in` — this is the composite of
+            // external-input stimulus + SIO/PIO outputs after the
+            // bus's `update_gpio` merge. Data bits 16..23 are CPU-driven
+            // so they reflect whatever the CPU's STRB has pushed via
+            // SIO_GPIO_OUT.
+            let data_byte = ((emu.bus.gpio_in >> GPIO_DATA_BASE) & 0xFF) as u8;
+
+            if let Some(d) = observe_tick(&mut state, tick, oe_data, data_byte) {
+                decision = Some(d);
+                break;
+            }
+        }
+
+        // 4. Map decision → verdict, classifying timeouts as needed.
+        let (verdict, observed_byte, latency_cycles) = match decision {
+            Some(StabilityDecision::Stable { byte, at_tick }) => {
+                let v = if byte == expected_byte {
+                    CpuVerdict::Pass
+                } else {
+                    CpuVerdict::WrongByte {
+                        expected: expected_byte,
+                        observed: byte,
+                    }
+                };
+                (v, Some(byte), Some(at_tick))
+            }
+            None => {
+                // Loop fell off the end without a decision. Diagnose.
+                if !state.oen_ever_set {
+                    (CpuVerdict::DataPinsNotDriven, None, None)
+                } else {
+                    (CpuVerdict::NoStableByte, None, None)
+                }
+            }
+        };
+
+        let raw = CpuCaseResult {
+            case,
+            expected_byte: Some(expected_byte),
+            observed_byte,
+            latency_cycles,
+            verdict,
+        };
+
+        // 5. Envelope post-process.
+        let post = apply_envelope(raw);
+
+        // Leave the bus in gap-level state for the next case.
+        emu.bus.gpio_external_in = gap_level;
+
+        self.results.push(post);
+        self.results.last().unwrap()
+    }
+
+    /// Accessor for the results vector.
+    pub fn results(&self) -> &[CpuCaseResult] {
+        &self.results
+    }
+
+    /// Accessor for the shadow (for tripwire diagnostics in the binary).
+    pub fn shadow(&self) -> &[u8; SHADOW_SIZE] {
+        &self.rom_shadow
+    }
+
+    /// Format the full CPU-serve report (header, per-case table,
+    /// summary, emulator-bounded caveat). Signature mirrors the PIO
+    /// oracle's [`ServingOracle::format_report`] for consistency.
+    pub fn format_report(&self, sys_clk_hz: u32) -> String {
+        let mut out = String::new();
+        let ns_available = sys_clk_hz != 0;
+
+        // --- Header -------------------------------------------------------
+        let _ = writeln!(out, "OneROM CPU-Serve Oracle — Report");
+        if ns_available {
+            let mhz = sys_clk_hz as f64 / 1_000_000.0;
+            let _ = writeln!(out, "sys_clk_hz: {} Hz ({:.3} MHz)", sys_clk_hz, mhz);
+        } else {
+            let _ = writeln!(out, "sys_clk_hz: UNAVAILABLE (PLL not settled at sync)");
+        }
+        let unique_shadow: std::collections::HashSet<u8> =
+            self.rom_shadow.iter().copied().collect();
+        let _ = writeln!(
+            out,
+            "shadow: 0x{:08X} + 0x{:04X} bytes, {} unique",
+            SHADOW_BASE,
+            SHADOW_SIZE,
+            unique_shadow.len()
+        );
+        let _ = writeln!(out, "cases: {}", self.results.len());
+        let _ = writeln!(out);
+
+        // --- Per-case table -----------------------------------------------
+        if ns_available {
+            let _ = writeln!(
+                out,
+                " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6} {:>6}  verdict",
+                "idx", "label", "addr", "expected", "observed", "cycles", "ns"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6}  verdict",
+                "idx", "label", "addr", "expected", "observed", "cycles"
+            );
+        }
+
+        let total = self.results.len();
+        for (i, r) in self.results.iter().enumerate() {
+            let idx = format!("{}/{}", i + 1, total);
+            let addr = format!("0x{:04X}", r.case.addr_bits);
+            let expected = r
+                .expected_byte
+                .map(|b| format!("0x{:02X}", b))
+                .unwrap_or_else(|| "—".to_string());
+            let observed = r
+                .observed_byte
+                .map(|b| format!("0x{:02X}", b))
+                .unwrap_or_else(|| "—".to_string());
+            let cycles = r
+                .latency_cycles
+                .map(|c| format!("{}", c))
+                .unwrap_or_else(|| "—".to_string());
+            let verdict = format_cpu_verdict(&r.verdict);
+            if ns_available {
+                let ns = r
+                    .latency_cycles
+                    .map(|c| format!("{}", cycles_to_ns(c, sys_clk_hz)))
+                    .unwrap_or_else(|| "—".to_string());
+                let _ = writeln!(
+                    out,
+                    " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6} {:>6}  {}",
+                    idx, r.case.label, addr, expected, observed, cycles, ns, verdict
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6}  {}",
+                    idx, r.case.label, addr, expected, observed, cycles, verdict
+                );
+            }
+        }
+        let _ = writeln!(out);
+
+        // --- Summary ------------------------------------------------------
+        let mut pass = 0usize;
+        let mut wrong_byte = 0usize;
+        let mut not_driven = 0usize;
+        let mut no_stable = 0usize;
+        let mut latency_oor = 0usize;
+        let mut pass_latencies: Vec<u32> = Vec::new();
+        for r in &self.results {
+            match r.verdict {
+                CpuVerdict::Pass => {
+                    pass += 1;
+                    if let Some(c) = r.latency_cycles {
+                        pass_latencies.push(c);
+                    }
+                }
+                CpuVerdict::WrongByte { .. } => wrong_byte += 1,
+                CpuVerdict::DataPinsNotDriven => not_driven += 1,
+                CpuVerdict::NoStableByte => no_stable += 1,
+                CpuVerdict::LatencyOutOfEnvelope { .. } => latency_oor += 1,
+            }
+        }
+        let fail = total - pass;
+
+        let _ = writeln!(out, "Summary:");
+        let _ = writeln!(out, "  {} cases total", total);
+        let _ = writeln!(out, "  {} PASS", pass);
+        let _ = writeln!(
+            out,
+            "  {} FAIL  ({} wrong-byte, {} data-pins-not-driven, {} no-stable-byte, {} latency-out-of-envelope)",
+            fail, wrong_byte, not_driven, no_stable, latency_oor
+        );
+
+        if pass_latencies.is_empty() {
+            let _ = writeln!(
+                out,
+                "  latency stats: — no Pass cases, latency stats unavailable"
+            );
+        } else {
+            let min = *pass_latencies.iter().min().unwrap();
+            let max = *pass_latencies.iter().max().unwrap();
+            let sum: u32 = pass_latencies.iter().sum();
+            let mean = sum / pass_latencies.len() as u32;
+            if ns_available {
+                let min_ns = cycles_to_ns(min, sys_clk_hz);
+                let max_ns = cycles_to_ns(max, sys_clk_hz);
+                let mean_ns = cycles_to_ns(mean, sys_clk_hz);
+                let _ = writeln!(
+                    out,
+                    "  latency stats (Pass cases only): min={} max={} mean={} cycles ({} ns / {} ns / {} ns)",
+                    min, max, mean, min_ns, max_ns, mean_ns
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  latency stats (Pass cases only): min={} max={} mean={} cycles (ns unavailable)",
+                    min, max, mean
+                );
+            }
+        }
+
+        let _ = writeln!(out);
+
+        // --- Emulator-bounded caveat (mirrors PIO oracle) -----------------
+        let _ = writeln!(
+            out,
+            "  Latency measured against the emulator's CPU step model;"
+        );
+        let _ = writeln!(
+            out,
+            "  the serve loop is a 5-instruction tight loop at 0x{:08X}..=0x{:08X}.",
+            CPU_SERVE_LOOP_PC_LO, CPU_SERVE_LOOP_PC_HI
+        );
+        let _ = writeln!(
+            out,
+            "  Silicon-calibrated timing remains a future pass via the silicon oracle rig."
+        );
+
+        out
+    }
+}
+
+/// Scan window for picking a shadow-readiness sentinel. We look for
+/// the last non-zero byte within the final `SENTINEL_SCAN_WINDOW`
+/// bytes of the lifted shadow — picked from the tail because the
+/// firmware's SRAM copy runs sequentially from offset 0 upward, so a
+/// non-zero byte near the end is only populated once the copy is
+/// nearly complete. Low-offset bytes (e.g. the first 0x100) showed
+/// empirically coincident matches against early pre-init SRAM state
+/// on `test-sdrr-0-cpu.bin`, firing the tripwire a full ~8 500 cycles
+/// before the shadow was actually populated.
+pub const SENTINEL_SCAN_WINDOW: usize = 256;
+const _: () = assert!(SENTINEL_SCAN_WINDOW <= SHADOW_SIZE);
+
+/// Pick a shadow-readiness sentinel: scan the final
+/// [`SENTINEL_SCAN_WINDOW`] bytes of `shadow` *from the end backward*
+/// for the first non-zero byte and return its (SRAM offset, expected
+/// value). Returns `None` if the scan window is all zeroes — in which
+/// case the caller should fall back to the PC-only sync check (no
+/// tripwire protection is possible when every byte we could probe is
+/// legitimately zero).
+///
+/// Tail-biased: a sentinel near the end of the shadow is only
+/// populated after the firmware's sequential CPU copy has reached
+/// that offset, which is a precise signal that the shadow is (very
+/// nearly) fully in place. Low-offset sentinels were empirically
+/// unreliable — early SRAM state (stack, IVT, runtime_info) can
+/// coincidentally match a low-offset shadow byte and fire the
+/// tripwire before the shadow copy has run.
+///
+/// Used by the binary driver to seed the sync detector's tripwire;
+/// extracted as a pure function so it can be unit-tested without an
+/// `Emulator` or `Bus` in the loop.
+pub fn find_shadow_sentinel(shadow: &[u8; SHADOW_SIZE]) -> Option<(u32, u8)> {
+    let start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
+    // Scan from the end backward so the returned offset is the
+    // highest non-zero index within the window — i.e. the byte
+    // written latest by a sequential CPU copy.
+    for i in (start..SHADOW_SIZE).rev() {
+        if shadow[i] != 0 {
+            return Some((i as u32, shadow[i]));
+        }
+    }
+    None
+}
+
+/// Pure tripwire helper: returns `true` iff the sentinel is `None`
+/// (no tripwire configured → PC check alone decides) or the SRAM byte
+/// at the sentinel offset matches the sentinel value (shadow copy has
+/// reached or passed this offset).
+///
+/// Split out from [`is_synced_cpu`] so it can be unit-tested via a
+/// probe closure without constructing an `Emulator`. `read_sram_u8`
+/// abstracts over the SRAM access — real callers pass a closure over
+/// `bus.memory.sram_read8`; tests pass a closure over a fake map.
+fn shadow_tripwire_ok<F>(sentinel: Option<(u32, u8)>, mut read_sram_u8: F) -> bool
+where
+    F: FnMut(u32) -> u8,
+{
+    match sentinel {
+        None => true,
+        Some((offset, expected)) => read_sram_u8(offset) == expected,
+    }
+}
+
+/// Sync detection for the CPU-serve build: returns `true` once core 0's
+/// PC lands inside the serve loop range
+/// `CPU_SERVE_LOOP_PC_LO..=CPU_SERVE_LOOP_PC_HI` **and** the shadow-
+/// readiness tripwire has tripped.
+///
+/// The PC check alone is not sufficient — the CPU transits the serve-
+/// loop PC range during firmware init *before* the SRAM shadow copy
+/// has finished. On `test-sdrr-0-cpu.bin`, the PC first enters the
+/// range around cycle ~8 400 but the full shadow isn't in place until
+/// ~cycle 17 000; declaring sync at the first PC hit caused every
+/// non-zero-expected byte to read back as 0x00 (the pre-copy SRAM
+/// state).
+///
+/// The tripwire `sentinel` is `(sram_offset, expected_byte)` picked
+/// from the lifted shadow by [`find_shadow_sentinel`]. When the byte
+/// at `sram_offset` matches, the firmware's shadow copy has at least
+/// reached that offset — sufficient proxy for "shadow populated". If
+/// `sentinel` is `None` (scan window was all-zero), we degrade to the
+/// bare PC check.
+///
+/// Takes a whole `&Emulator` (rather than just a `&Bus`) because the
+/// PC lives in the core's register file, not on the bus. The PIO-mode
+/// sibling takes `&mut Bus` because its sync condition is purely
+/// register-level (PIO1.CTRL + PIO2.CTRL both non-zero).
+pub fn is_synced_cpu(emu: &Emulator, sentinel: Option<(u32, u8)>) -> bool {
+    let pc = emu.core(0).regs.pc();
+    if !(CPU_SERVE_LOOP_PC_LO..=CPU_SERVE_LOOP_PC_HI).contains(&pc) {
+        return false;
+    }
+    shadow_tripwire_ok(sentinel, |offset| emu.bus.memory.sram_read8(offset))
+}
+
+// ---------------------------------------------------------------------------
+// Stability state machine (pure — unit-testable without an emulator)
+// ---------------------------------------------------------------------------
+
+/// Accumulator state for the per-tick stability detector.
+///
+/// Kept out of `run_case` so the detector is a pure function
+/// (`observe_tick`) and can be exercised against synthetic traces in
+/// tests without an emulator in the loop.
+#[derive(Debug, Default, Clone, Copy)]
+struct StabilityState {
+    /// Have we *ever* seen `oe_data == 0xFF` since stimulus apply? Used
+    /// to distinguish `DataPinsNotDriven` from `NoStableByte` on
+    /// timeout.
+    oen_ever_set: bool,
+    /// First byte observed with OEN fully asserted (the "starting"
+    /// byte the CPU was driving when we began observing). Used to
+    /// detect a transition — the CPU executing a fresh serve
+    /// iteration after sampling the new pin state.
+    initial_byte: Option<u8>,
+    /// Has the observed byte (with OEN=0xFF) ever differed from
+    /// `initial_byte`? If true, the CPU has executed at least one
+    /// fresh store since stimulus apply, and stability can anchor on
+    /// any subsequent value (including the new steady-state byte).
+    byte_changed_since_stim: bool,
+    /// The byte currently accumulating as a stable-run candidate,
+    /// `None` between runs.
+    last_byte: Option<u8>,
+    /// Tick index (within the per-case observation window) at which
+    /// the current stable-run candidate started. `None` between runs.
+    stable_start_tick: Option<u32>,
+    /// Length of the current stable-run candidate (in cycles).
+    stable_run: u32,
+}
+
+/// Terminal decision from the stability detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StabilityDecision {
+    /// The byte has held steady for `MIN_STABLE_CYCLES` consecutive
+    /// cycles (with OEN fully asserted) after either a transition was
+    /// detected or the zero-byte-trust timeout elapsed.
+    Stable { byte: u8, at_tick: u32 },
+}
+
+/// Pure per-tick stability detector. Returns `Some(decision)` when a
+/// terminal verdict can be declared; `None` means "keep ticking".
+///
+/// Gating rules:
+/// 1. Skip pre-floor ticks (`tick < MIN_FRESH_ARRIVAL_CYCLE_CPU`) —
+///    any stable run formed before the CPU could have executed a
+///    fresh loop iteration is definitionally stale-byte residue.
+/// 2. Allow stability to anchor iff *either* a byte transition has
+///    been observed since stimulus apply (the CPU has demonstrably
+///    executed at least one fresh STRB), *or* the zero-byte trust
+///    timeout has elapsed (handling the legitimate "expected byte is
+///    0x00, no transition visible" case).
+/// 3. Partial OEN (`oe_data != 0xFF`) always resets the stable-run
+///    accumulator.
+///
+/// The detector is a state machine on `StabilityState`; the only
+/// coupling back to `run_case` is the returned `StabilityDecision`.
+fn observe_tick(
+    state: &mut StabilityState,
+    tick: u32,
+    oe_data: u8,
+    data_byte: u8,
+) -> Option<StabilityDecision> {
+    // Partial drive → reset the stable-run accumulator (but preserve
+    // transition/latch state: a mid-case OEN drop shouldn't erase the
+    // fact that we've already witnessed the CPU store a fresh byte).
+    if oe_data != 0xFF {
+        state.last_byte = None;
+        state.stable_start_tick = None;
+        state.stable_run = 0;
+        return None;
+    }
+
+    state.oen_ever_set = true;
+
+    // Capture the "starting" byte (the byte the CPU was driving at the
+    // moment stimulus was applied) and detect transitions against it.
+    match state.initial_byte {
+        None => state.initial_byte = Some(data_byte),
+        Some(initial) if data_byte != initial => state.byte_changed_since_stim = true,
+        _ => {}
+    }
+
+    // Stability may only anchor after the fresh-arrival floor AND
+    // after either a transition has been seen or the zero-byte
+    // timeout has elapsed.
+    let past_floor = tick >= MIN_FRESH_ARRIVAL_CYCLE_CPU;
+    let past_zero_timeout = tick >= ZERO_BYTE_TRUST_TIMEOUT_CPU;
+    let may_anchor = past_floor && (state.byte_changed_since_stim || past_zero_timeout);
+
+    if !may_anchor {
+        // Don't accumulate stable-run state until gating is satisfied —
+        // otherwise a pre-floor run would carry over and declare
+        // stability the instant `may_anchor` flips true.
+        state.last_byte = None;
+        state.stable_start_tick = None;
+        state.stable_run = 0;
+        return None;
+    }
+
+    // Stability tracking proper.
+    if state.last_byte == Some(data_byte) {
+        state.stable_run += 1;
+        if state.stable_run >= MIN_STABLE_CYCLES as u32 {
+            let at_tick = state.stable_start_tick.unwrap_or(tick);
+            return Some(StabilityDecision::Stable {
+                byte: data_byte,
+                at_tick,
+            });
+        }
+    } else {
+        state.last_byte = Some(data_byte);
+        state.stable_start_tick = Some(tick);
+        state.stable_run = 1;
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Envelope post-processing
+// ---------------------------------------------------------------------------
+
+/// Apply the emulator-bounded latency envelope to a [`CpuCaseResult`].
+/// Mirrors the PIO oracle's [`apply_envelope`] contract: a `Pass` with
+/// out-of-envelope latency is reclassified, everything else passes
+/// through.
+pub fn apply_envelope(result: CpuCaseResult) -> CpuCaseResult {
+    match result.verdict {
+        CpuVerdict::Pass => match result.latency_cycles {
+            Some(cycles) if !CPU_ENVELOPE_CYCLES.contains(&cycles) => CpuCaseResult {
+                verdict: CpuVerdict::LatencyOutOfEnvelope { cycles },
+                ..result
+            },
+            _ => result,
+        },
+        _ => result,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Report helpers
+// ---------------------------------------------------------------------------
+
+fn cycles_to_ns(cycles: u32, sys_clk_hz: u32) -> u64 {
+    (cycles as u64) * 1_000_000_000 / (sys_clk_hz as u64)
+}
+
+fn format_cpu_verdict(v: &CpuVerdict) -> String {
+    match v {
+        CpuVerdict::Pass => "Pass".to_string(),
+        CpuVerdict::WrongByte { expected, observed } => {
+            format!("WrongByte(exp=0x{:02X}, obs=0x{:02X})", expected, observed)
+        }
+        CpuVerdict::DataPinsNotDriven => "DataPinsNotDriven".to_string(),
+        CpuVerdict::NoStableByte => "NoStableByte".to_string(),
+        CpuVerdict::LatencyOutOfEnvelope { cycles } => {
+            format!("LatencyOutOfEnvelope({})", cycles)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_shadow() -> Box<[u8; SHADOW_SIZE]> {
+        Box::new([0u8; SHADOW_SIZE])
+    }
+
+    /// Byte-extraction semantics: given a `gpio_in` word whose bits
+    /// 16..23 carry the data byte, the oracle's observation pipeline
+    /// yields exactly those 8 bits. This is the single load-bearing
+    /// observation invariant for the CPU oracle — if someone changes
+    /// the pin range, this test fails loudly.
+    #[test]
+    fn observed_byte_comes_from_gpio_in_bits_16_through_23() {
+        // Walking-1 + known pattern: each byte value appears exactly
+        // once across bits 16..23.
+        for byte in 0..=255u8 {
+            let gpio_in: u32 = (byte as u32) << 16;
+            // Simulate the oracle's extraction line verbatim.
+            let observed = ((gpio_in >> GPIO_DATA_BASE) & 0xFF) as u8;
+            assert_eq!(
+                observed, byte,
+                "byte 0x{:02X}: gpio_in=0x{:08X} extracted=0x{:02X}",
+                byte, gpio_in, observed
+            );
+        }
+
+        // Low bits must NOT leak into the observed byte — set every
+        // bit below 16 and verify the observed byte is still 0.
+        let noise_only: u32 = 0x0000_FFFF;
+        let observed = ((noise_only >> GPIO_DATA_BASE) & 0xFF) as u8;
+        assert_eq!(
+            observed, 0x00,
+            "low-bit noise must not bleed into observed byte"
+        );
+
+        // High bits above 23 must NOT leak either.
+        let high_noise: u32 = 0xFF00_0000;
+        let observed = ((high_noise >> GPIO_DATA_BASE) & 0xFF) as u8;
+        assert_eq!(
+            observed, 0x00,
+            "high-bit noise (bits 24..31) must not bleed into observed byte"
+        );
+    }
+
+    /// OEN-data-mask shape: the oracle rejects partial drive (any
+    /// OEN != 0xFF on data pins). Validate the mask constant matches.
+    #[test]
+    fn data_pin_mask_covers_bits_16_through_23() {
+        assert_eq!(GPIO_DATA_MASK, 0x00FF_0000);
+        // And the "all driven" condition extracts to 0xFF.
+        let all_driven: u32 = 0xFFFF_FFFF;
+        let oe_data = ((all_driven >> GPIO_DATA_BASE) & 0xFF) as u8;
+        assert_eq!(oe_data, 0xFF);
+        // Partial drive (bit 16 only) yields 0x01, which the loop treats
+        // as "not fully driven" and resets the stable tracker.
+        let partial: u32 = 1u32 << 16;
+        let oe_data = ((partial >> GPIO_DATA_BASE) & 0xFF) as u8;
+        assert_eq!(oe_data, 0x01);
+        assert_ne!(oe_data, 0xFF, "partial drive must differ from full drive");
+    }
+
+    /// Envelope pass-through (analogous to PIO oracle test 7).
+    #[test]
+    fn apply_envelope_passes_through_in_range_latency() {
+        let case = Case::new("test", 0x1800);
+        let in_range = *CPU_ENVELOPE_CYCLES.start() + 5;
+        assert!(CPU_ENVELOPE_CYCLES.contains(&in_range));
+        let result = CpuCaseResult {
+            case,
+            expected_byte: Some(0x42),
+            observed_byte: Some(0x42),
+            latency_cycles: Some(in_range),
+            verdict: CpuVerdict::Pass,
+        };
+        let out = apply_envelope(result);
+        assert_eq!(out.verdict, CpuVerdict::Pass);
+        assert_eq!(out.latency_cycles, Some(in_range));
+    }
+
+    /// Envelope rewrite: Pass with out-of-envelope latency is
+    /// reclassified to LatencyOutOfEnvelope.
+    #[test]
+    fn apply_envelope_rewrites_out_of_range_latency() {
+        let case = Case::new("test", 0x1800);
+        let out_of_range = *CPU_ENVELOPE_CYCLES.end() + 50;
+        assert!(!CPU_ENVELOPE_CYCLES.contains(&out_of_range));
+        let result = CpuCaseResult {
+            case,
+            expected_byte: Some(0x42),
+            observed_byte: Some(0x42),
+            latency_cycles: Some(out_of_range),
+            verdict: CpuVerdict::Pass,
+        };
+        let out = apply_envelope(result);
+        assert_eq!(
+            out.verdict,
+            CpuVerdict::LatencyOutOfEnvelope { cycles: out_of_range }
+        );
+        assert_eq!(out.latency_cycles, Some(out_of_range));
+    }
+
+    /// Non-Pass verdicts are never rewritten by the envelope check.
+    #[test]
+    fn apply_envelope_leaves_non_pass_verdicts_alone() {
+        let case = Case::new("test", 0x1800);
+
+        for verdict in [
+            CpuVerdict::WrongByte { expected: 0x42, observed: 0xFF },
+            CpuVerdict::DataPinsNotDriven,
+            CpuVerdict::NoStableByte,
+        ] {
+            let out = apply_envelope(CpuCaseResult {
+                case,
+                expected_byte: Some(0x42),
+                observed_byte: None,
+                latency_cycles: None,
+                verdict,
+            });
+            assert_eq!(out.verdict, verdict, "envelope must not rewrite {:?}", verdict);
+        }
+    }
+
+    /// Default cases are re-exported intact from the PIO oracle — same
+    /// 15-case catalogue, same A11=A12=1 invariant.
+    #[test]
+    fn cpu_default_cases_mirror_pio_default_cases() {
+        use crate::onerom_serving_oracle::DEFAULT_CASES as PIO_DEFAULT_CASES;
+        assert_eq!(CPU_DEFAULT_CASES.len(), PIO_DEFAULT_CASES.len());
+        for (a, b) in CPU_DEFAULT_CASES.iter().zip(PIO_DEFAULT_CASES.iter()) {
+            assert_eq!(a.label, b.label);
+            assert_eq!(a.addr_bits, b.addr_bits);
+        }
+    }
+
+    /// Shadow capture roundtrip via the test-only constructor: verify
+    /// that a byte-value inserted at the expected shadow offset is the
+    /// one the oracle looks up when a case with matching `addr_bits` is
+    /// used. Low-level plumbing check — no emulator in the loop.
+    #[test]
+    fn shadow_lookup_offset_equals_stimulus_low_16() {
+        let mut shadow = empty_shadow();
+        // Case 0x1801 (walk1 A0) → stim_level has bit at ADDR_PINS[0]=pin 7 set + CS2/CS3
+        // Compute expected shadow offset = stim_level_low_16.
+        let case = Case::new("walk1 A0", 0x1801);
+        let stim = stimulus_level_pub(case.addr_bits);
+        let offset = (stim & 0xFFFF) as usize;
+        shadow[offset] = 0xA5;
+
+        let oracle = CpuServingOracle::new_with_shadow(shadow);
+        // The expected byte the oracle will use for this case.
+        assert_eq!(oracle.shadow()[offset], 0xA5);
+    }
+
+    /// Drive a synthetic trace through `observe_tick` and return the
+    /// terminal decision plus the tick at which it fired.
+    fn run_trace(ticks: &[(u8, u8)]) -> Option<(StabilityDecision, u32)> {
+        let mut state = StabilityState::default();
+        for (i, &(oe, byte)) in ticks.iter().enumerate() {
+            if let Some(d) = observe_tick(&mut state, i as u32, oe, byte) {
+                return Some((d, i as u32));
+            }
+        }
+        None
+    }
+
+    /// Premature-lock regression: before the fix, 4+ consecutive 0x00
+    /// bytes with OE=0xFF immediately after stimulus apply would latch
+    /// a stable decision at `at_tick=0` with byte=0x00. With the
+    /// `MIN_FRESH_ARRIVAL_CYCLE_CPU` floor + transition latch, a
+    /// run of zeroes with no subsequent transition must NOT anchor
+    /// before the zero-byte trust timeout.
+    #[test]
+    fn stability_rejects_premature_zero_lock_before_floor() {
+        // 5 cycles of OE=0xFF + byte=0x00 — enough to trip
+        // `MIN_STABLE_CYCLES=4` if the floor weren't enforced.
+        let trace = vec![(0xFFu8, 0x00u8); 5];
+        let out = run_trace(&trace);
+        assert!(
+            out.is_none(),
+            "pre-floor zero run should not declare stability; got {:?}",
+            out
+        );
+    }
+
+    /// Locks on a non-zero byte that arrives after a transition and
+    /// persists for `MIN_STABLE_CYCLES`. The starting byte is 0x00 and
+    /// a fresh store switches it to 0x42 at tick=`MIN_FRESH_ARRIVAL_CYCLE_CPU`.
+    #[test]
+    fn stability_locks_on_nonzero_after_transition() {
+        let floor = MIN_FRESH_ARRIVAL_CYCLE_CPU as usize;
+        let mut trace: Vec<(u8, u8)> = vec![(0xFF, 0x00); floor];
+        // Fresh byte 0x42 held steady for MIN_STABLE_CYCLES cycles.
+        for _ in 0..MIN_STABLE_CYCLES {
+            trace.push((0xFF, 0x42));
+        }
+        let (decision, _fire_tick) = run_trace(&trace).expect("decision expected");
+        match decision {
+            StabilityDecision::Stable { byte, at_tick } => {
+                assert_eq!(byte, 0x42);
+                // at_tick is the first tick of the stable run; the
+                // transition happens at `floor`, the run completes at
+                // `floor + MIN_STABLE_CYCLES - 1`, and at_tick ==
+                // `floor`.
+                assert_eq!(
+                    at_tick, floor as u32,
+                    "at_tick should be the first tick of the stable run"
+                );
+            }
+        }
+    }
+
+    /// All-zero trace: no transition ever happens, so stability can
+    /// only anchor via the zero-byte trust timeout. Once the timeout
+    /// elapses and `MIN_STABLE_CYCLES` further zero cycles accrue,
+    /// the detector must lock on 0x00.
+    #[test]
+    fn stability_times_out_to_zero_when_no_transition() {
+        let trace: Vec<(u8, u8)> = vec![(0xFF, 0x00); PER_CASE_TIMEOUT as usize];
+        let (decision, _fire_tick) =
+            run_trace(&trace).expect("zero-byte timeout should eventually fire");
+        match decision {
+            StabilityDecision::Stable { byte, at_tick } => {
+                assert_eq!(byte, 0x00, "should trust the zero once the timeout elapses");
+                // at_tick must be >= the zero-byte trust timeout (the
+                // earliest cycle at which accumulation is allowed to
+                // begin for an all-zero trace).
+                assert!(
+                    at_tick >= ZERO_BYTE_TRUST_TIMEOUT_CPU,
+                    "at_tick={} should be >= ZERO_BYTE_TRUST_TIMEOUT_CPU={}",
+                    at_tick,
+                    ZERO_BYTE_TRUST_TIMEOUT_CPU
+                );
+            }
+        }
+    }
+
+    /// Partial OEN (oe_data != 0xFF) must reset the stable-run
+    /// accumulator — we never PASS on half-driven output.
+    #[test]
+    fn stability_resets_on_partial_oen() {
+        let floor = MIN_FRESH_ARRIVAL_CYCLE_CPU as usize;
+        // Seed with enough floor cycles + a transition to enable the
+        // latch, then a 3-cycle run of 0x42 (short by one), an OEN
+        // dip, then another 3-cycle run — neither run individually
+        // satisfies MIN_STABLE_CYCLES=4 so no decision should fire.
+        let mut trace: Vec<(u8, u8)> = vec![(0xFF, 0x00); floor];
+        trace.push((0xFF, 0x42)); // transition
+        trace.extend(vec![(0xFF, 0x42); 2]); // 3-cycle run total
+        trace.push((0x0F, 0x42)); // OEN partial — reset
+        trace.extend(vec![(0xFF, 0x42); 3]); // another 3-cycle run
+        let out = run_trace(&trace);
+        assert!(
+            out.is_none(),
+            "two short runs separated by an OEN dip should not anchor; got {:?}",
+            out
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Shadow-readiness tripwire tests
+    //
+    // The false-sync bug: the CPU transits the serve-loop PC range
+    // during firmware init *before* the SRAM shadow copy completes, so
+    // the bare PC check would trip at ~cycle 8 400 (stale SRAM) rather
+    // than ~cycle 17 000 (shadow populated). The fix gates sync on a
+    // sentinel byte within the freshly-copied shadow; these tests pin
+    // the two pure helpers driving that gate.
+    // -------------------------------------------------------------------
+
+    /// `find_shadow_sentinel` scans the tail window from the end and
+    /// returns the highest non-zero index — the latest-written byte
+    /// in a sequential CPU copy.
+    #[test]
+    fn find_shadow_sentinel_returns_last_nonzero_in_tail_window() {
+        let mut shadow = empty_shadow();
+        let tail_start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
+        // Two non-zero bytes within the tail window — the higher-
+        // offset one must win (scan is end-backward).
+        shadow[tail_start + 10] = 0x5A;
+        shadow[tail_start + 200] = 0xA5;
+
+        let out = find_shadow_sentinel(&shadow);
+        assert_eq!(
+            out,
+            Some(((tail_start + 200) as u32, 0xA5)),
+            "sentinel must be the last non-zero byte in the tail window"
+        );
+    }
+
+    /// A non-zero byte *before* the tail window does not count — the
+    /// helper is deliberately tail-biased so the tripwire fires only
+    /// once the firmware's sequential shadow copy has reached near
+    /// the end of `SHADOW_SIZE` (see the `SENTINEL_SCAN_WINDOW`
+    /// doc-comment for the rationale — low-offset sentinels are
+    /// unreliable because early SRAM state can coincidentally match).
+    #[test]
+    fn find_shadow_sentinel_ignores_nonzero_before_tail_window() {
+        let mut shadow = empty_shadow();
+        // Place the non-zero byte one before the tail window starts.
+        let tail_start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
+        shadow[tail_start - 1] = 0xA5;
+
+        let out = find_shadow_sentinel(&shadow);
+        assert_eq!(
+            out, None,
+            "sentinel scan must not see before the tail window"
+        );
+    }
+
+    /// A uniformly-zero scan window yields `None` — the caller must
+    /// degrade to the bare PC check (no tripwire is possible when
+    /// every candidate byte is legitimately zero).
+    #[test]
+    fn find_shadow_sentinel_returns_none_on_all_zero_window() {
+        let shadow = empty_shadow();
+        assert_eq!(find_shadow_sentinel(&shadow), None);
+    }
+
+    /// The very last byte of the shadow is within the tail window,
+    /// and a non-zero byte at `SHADOW_SIZE - 1` wins over any other
+    /// non-zero byte in the window — this is the ideal sentinel for
+    /// a sequential CPU copy.
+    #[test]
+    fn find_shadow_sentinel_picks_shadow_size_minus_one_when_set() {
+        let mut shadow = empty_shadow();
+        let tail_start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
+        // Fill the middle of the tail window and the last byte with
+        // non-zero values; the last must win.
+        shadow[tail_start + 100] = 0x11;
+        shadow[SHADOW_SIZE - 1] = 0x3F;
+
+        let out = find_shadow_sentinel(&shadow);
+        assert_eq!(
+            out,
+            Some(((SHADOW_SIZE - 1) as u32, 0x3F)),
+            "SHADOW_SIZE-1 must win when set"
+        );
+    }
+
+    /// Tripwire: with no sentinel configured, the helper returns
+    /// `true` unconditionally — semantic is "PC check decides alone".
+    #[test]
+    fn shadow_tripwire_ok_returns_true_when_no_sentinel() {
+        let never_called = |_offset: u32| -> u8 {
+            panic!("SRAM probe must not be invoked when sentinel is None");
+        };
+        assert!(shadow_tripwire_ok(None, never_called));
+    }
+
+    /// Tripwire: with a sentinel configured, the helper returns
+    /// `false` while the SRAM byte at the sentinel offset is still 0
+    /// (pre-copy) and flips to `true` once the byte matches the
+    /// expected value (copy has reached or passed the sentinel
+    /// offset). This is the exact false-sync regression gate.
+    #[test]
+    fn shadow_tripwire_gates_on_sentinel_byte_value() {
+        let sentinel = Some((42u32, 0xA5u8));
+
+        // Pre-copy: SRAM probe returns 0 at the sentinel offset. The
+        // tripwire must reject this — PC alone would have mis-declared
+        // sync here. Panic on any other offset so a refactor that
+        // accidentally probes the wrong byte is caught loudly.
+        let pre_copy = |offset: u32| -> u8 {
+            assert_eq!(offset, 42, "tripwire must probe at the sentinel offset");
+            0x00
+        };
+        assert!(
+            !shadow_tripwire_ok(sentinel, pre_copy),
+            "tripwire must reject sync while SRAM at sentinel offset is still 0"
+        );
+
+        // Post-copy: SRAM probe returns the expected sentinel value.
+        let post_copy = |offset: u32| -> u8 {
+            assert_eq!(offset, 42);
+            0xA5
+        };
+        assert!(
+            shadow_tripwire_ok(sentinel, post_copy),
+            "tripwire must accept sync once SRAM at sentinel offset matches"
+        );
+
+        // Wrong-value post-copy: SRAM probe returns a non-zero value
+        // that doesn't match the expected sentinel (e.g. a partial /
+        // misaligned copy). Tripwire must reject — this is the exact
+        // bit-level integrity check the sentinel protocol guarantees.
+        let wrong_value = |_offset: u32| -> u8 { 0x42 };
+        assert!(
+            !shadow_tripwire_ok(sentinel, wrong_value),
+            "tripwire must reject SRAM bytes that don't match the sentinel"
+        );
+    }
+}

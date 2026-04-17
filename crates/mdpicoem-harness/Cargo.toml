@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.28.2"
+version = "0.29.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -98,6 +98,15 @@ name = "onerom_serving_oracle_rp2350"
 path = "src/bin/onerom_serving_oracle_rp2350.rs"
 
 [[bin]]
+name = "onerom_serving_oracle_cpu_rp2350"
+path = "src/bin/onerom_serving_oracle_cpu_rp2350.rs"
+
+[[bin]]
+name = "onerom_cpu_probe"
+path = "src/bin/onerom_cpu_probe.rs"
+test = false
+
+[[bin]]
 name = "silicon_cycle_oracle_rp2350"
 path = "src/bin/silicon_cycle_oracle_rp2350.rs"
 
@@ -120,6 +129,10 @@ path = "src/bin/silicon_isr_diff_rp2350.rs"
 [[bin]]
 name = "smoke_per_core_cyccnt_rp2350"
 path = "src/bin/smoke_per_core_cyccnt_rp2350.rs"
+
+[[bin]]
+name = "riscv_probe_spike"
+path = "src/bin/riscv_probe_spike.rs"
 
 [[bin]]
 name = "mmio_trace_rp2350"

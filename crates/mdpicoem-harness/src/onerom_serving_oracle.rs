@@ -769,6 +769,32 @@ pub(crate) fn lift_shadow_from_flash(
 }
 
 // ---------------------------------------------------------------------------
+// Cross-module re-exports for the CPU-serve oracle + its binary driver.
+//
+// `stimulus_level` and `lift_shadow_from_flash` are `pub(crate)` for
+// internal unit-test use; the CPU-serve oracle (`onerom_serving_oracle_cpu`)
+// and its `src/bin/` driver need them but only see `pub` items across a
+// binary-crate boundary. These shims keep the implementation private to
+// this module while exposing the exact same contract under a distinct
+// `_pub` name — mirrors the pattern used for other cross-module oracle
+// helpers in this crate.
+// ---------------------------------------------------------------------------
+
+/// `pub` shim over [`stimulus_level`] for the CPU-serve oracle.
+pub fn stimulus_level_pub(addr_bits: u16) -> u32 {
+    stimulus_level(addr_bits)
+}
+
+/// `pub` shim over [`lift_shadow_from_flash`] for the CPU-serve oracle
+/// and its binary driver.
+pub fn lift_shadow_from_flash_pub(
+    flash: &[u8],
+    rom_set_index: u8,
+) -> Option<Box<[u8; SHADOW_SIZE]>> {
+    lift_shadow_from_flash(flash, rom_set_index)
+}
+
+// ---------------------------------------------------------------------------
 // Trace-driven verdict evaluator (the testable core of the state machine)
 // ---------------------------------------------------------------------------
 

@@ -738,6 +738,25 @@ impl Bus {
         addr >= 0xEFFF_F000 && addr < 0xF000_0000
     }
 
+    /// True if `reg_offset` (already masked to the SIO 12-bit window)
+    /// is a GPIO_OUT-family register. Sub-word writes to these
+    /// registers are replicated across all lanes on RP2350 silicon,
+    /// rather than doing byte-lane RMW — see the `write8` SIO arm
+    /// for the full rationale and datasheet reference.
+    ///
+    /// Covers GPIO_OUT (0x010), GPIO_OUT_SET/CLR/XOR (0x018/0x020/
+    /// 0x028) and the OE mirrors GPIO_OE / GPIO_OE_SET/CLR/XOR
+    /// (0x030/0x038/0x040/0x048). GPIO_HI_OUT mirrors are not
+    /// modelled on mdrp2350 (see wrk_docs Phase 5 LLD §Known
+    /// Limitations) so this helper does not include their offsets.
+    #[inline]
+    pub fn is_sio_gpio_out_replicating_reg(reg_offset: u32) -> bool {
+        matches!(
+            reg_offset,
+            0x010 | 0x018 | 0x020 | 0x028 | 0x030 | 0x038 | 0x040 | 0x048
+        )
+    }
+
     fn boot_ram_read8(&self, addr: u32) -> u8 {
         let off = (addr - 0xEFFF_F000) as usize;
         self.boot_ram[off]
@@ -1877,6 +1896,54 @@ impl Bus {
                     }
                 }
             }
+            0xD => {
+                // SIO has no APB alias encoding — every access is
+                // alias 0, word-only at the peripheral. Narrow byte
+                // writes are fielded by read-modify-write at the word
+                // level: read the current word, splice in the new
+                // byte at its lane, write back. This matches how the
+                // CORESIGHT_TRACE arm below handles byte writes.
+                //
+                // Without this arm, `STRB Rn, [Rm, #0]` to
+                // SIO_GPIO_OUT (and every other SIO register) fell
+                // through the catch-all and was silently dropped —
+                // blocking OneROM's CPU-serve loop where the final
+                // store that drives the data pins is a byte write.
+                //
+                // GPIO_OUT family (offsets 0x010 / 0x018 / 0x020 /
+                // 0x028 and OE 0x030 / 0x038 / 0x040 / 0x048): real
+                // RP2350 silicon replicates the byte across all 4
+                // lanes of the 32-bit register (the single-cycle IO
+                // fabric latches the full 32-bit bus without
+                // byte-lane enables for the GPIO_OUT path). OneROM's
+                // CPU-serve loop relies on this: a single STRB at
+                // offset 0 lights up pins 16..23 as well as pins 0..7.
+                let word_addr = addr & !3;
+                let reg_offset = word_addr & 0xFFF;
+                if Self::is_sio_gpio_out_replicating_reg(reg_offset) {
+                    let replicated = u32::from(val) * 0x0101_0101;
+                    self.write32(word_addr, replicated);
+                } else {
+                    let byte_idx = (addr & 3) as usize;
+                    let core = self.active_core();
+                    // Read via the low-level SIO path rather than
+                    // `self.read32(word_addr)` so we don't trip the
+                    // GPIO_IN mirror short-circuit — the merged
+                    // write we emit goes back to
+                    // `self.write32(word_addr, ...)`, which
+                    // preserves FIFO_WR / doorbell / softirq
+                    // semantics for any byte-lane access that hits
+                    // a side-effect offset.
+                    let old_word = match reg_offset {
+                        0x004 => self.gpio_in,
+                        0x008 => self.read_gpio_hi_in(),
+                        _ => self.sio.read32(reg_offset, core),
+                    };
+                    let mut bytes = old_word.to_le_bytes();
+                    bytes[byte_idx] = val;
+                    self.write32(word_addr, u32::from_le_bytes(bytes));
+                }
+            }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write8(addr, val),
             0xE if Self::is_coresight_trace(addr) => {
                 // Narrow byte write — pack into the correct lane,
@@ -2457,6 +2524,30 @@ impl Bus {
                             self.peripheral_regs.insert(word_addr, new_word);
                         }
                     }
+                }
+            }
+            0xD => {
+                // SIO narrow halfword write — mirror the `write8` SIO
+                // arm above. See that comment for rationale including
+                // GPIO_OUT-family replication across both halves.
+                let word_addr = addr & !3;
+                let reg_offset = word_addr & 0xFFF;
+                if Self::is_sio_gpio_out_replicating_reg(reg_offset) {
+                    let replicated = u32::from(val) * 0x0001_0001;
+                    self.write32(word_addr, replicated);
+                } else {
+                    let half_idx = ((addr >> 1) & 1) as usize;
+                    let core = self.active_core();
+                    let old_word = match reg_offset {
+                        0x004 => self.gpio_in,
+                        0x008 => self.read_gpio_hi_in(),
+                        _ => self.sio.read32(reg_offset, core),
+                    };
+                    let mut halves: [u16; 2] =
+                        [old_word as u16, (old_word >> 16) as u16];
+                    halves[half_idx] = val;
+                    let merged = (halves[0] as u32) | ((halves[1] as u32) << 16);
+                    self.write32(word_addr, merged);
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write16(addr, val),
