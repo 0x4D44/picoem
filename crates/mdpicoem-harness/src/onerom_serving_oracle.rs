@@ -422,7 +422,7 @@ impl ServingOracle {
     /// silently corrupt the populate.
     pub fn populate_sram_from_shadow(&self, bus: &mut Bus) {
         for offset in 0..SHADOW_SIZE {
-            bus.write8(SHADOW_BASE + offset as u32, self.rom_shadow[offset]);
+            bus.write8(SHADOW_BASE + offset as u32, self.rom_shadow[offset], 0);
         }
     }
 

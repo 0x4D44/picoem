@@ -287,6 +287,17 @@ pub struct Bus {
     pub(crate) pads_bank0: PadsBank0Regs,
     /// DMA controller — 16 channels (HLD V5 §5.6, Phase 3).
     pub(crate) dma: Dma,
+    /// Word-aligned MMIO addresses for which an "unmodelled access" warn
+    /// has already been emitted. HLD V5 §4.A1 — warn once per address,
+    /// per `Bus` instance, so firmware or tests that hammer an
+    /// unmodelled peripheral don't drown the trace.
+    pub(crate) warned_addrs: std::collections::HashSet<u32>,
+    /// Watchdog reset requested flag (HLD V5 §7.D.3). Set by the
+    /// WATCHDOG peripheral when its countdown fires; polled by the CPU
+    /// step loop (wiring lands with the WATCHDOG peripheral itself).
+    /// Kept here so that landing order §10 step 3a does not re-touch
+    /// `Bus`.
+    pub(crate) watchdog_reset_requested: bool,
     /// Whether flash (XIP) content has been loaded.
     pub(crate) flash_loaded: bool,
     /// Suppress per-word SRAM bank wait states during burst transfers
@@ -470,6 +481,8 @@ impl Bus {
             pads_bank0: PadsBank0Regs::new(),
             dma: Dma::new(),
             atomics,
+            warned_addrs: std::collections::HashSet::new(),
+            watchdog_reset_requested: false,
             flash_loaded: false,
             burst_mode: false,
             last_fetch_addr: u32::MAX,
@@ -1014,6 +1027,46 @@ impl Bus {
         self.atomics.clear_bus_fault(core);
     }
 
+    /// Request a system-wide watchdog reset (HLD V5 §7.D.3). Called by
+    /// the WATCHDOG peripheral when its countdown fires. The CPU step
+    /// loop polls [`Self::watchdog_reset_requested`] before instruction
+    /// fetch and reseeds state + jumps to the reset vector on true.
+    pub fn set_watchdog_reset(&mut self) {
+        self.watchdog_reset_requested = true;
+    }
+
+    /// Returns true if a watchdog reset has been requested.
+    pub fn watchdog_reset_requested(&self) -> bool {
+        self.watchdog_reset_requested
+    }
+
+    /// Clear the watchdog-reset flag.
+    pub fn clear_watchdog_reset(&mut self) {
+        self.watchdog_reset_requested = false;
+    }
+
+    /// Clear the warn-once address budget. Call from `Emulator::reset()`
+    /// (and the step-3a watchdog handler) alongside `clear_bus_fault()`
+    /// and `clear_watchdog_reset()` so post-reset firmware sees a fresh
+    /// warn-once slate.
+    pub fn clear_warned_addrs(&mut self) {
+        self.warned_addrs.clear();
+    }
+
+    /// Emit a single `tracing::warn!` per unique word-aligned MMIO
+    /// address for HashMap-fallthrough (unmodelled) accesses. HLD V5
+    /// §4.A1. Returns nothing; callers proceed with the existing
+    /// fallthrough path.
+    #[inline]
+    fn warn_unmodelled_mmio(&mut self, word_addr: u32) {
+        if self.warned_addrs.insert(word_addr) {
+            tracing::warn!(
+                addr = format_args!("{:#010X}", word_addr),
+                "unmodelled MMIO access"
+            );
+        }
+    }
+
     /// Set whether flash (XIP) content has been loaded.
     pub fn set_flash_loaded(&mut self, loaded: bool) {
         self.flash_loaded = loaded;
@@ -1276,7 +1329,10 @@ impl Bus {
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
-                        _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                        _ => {
+                            self.warn_unmodelled_mmio(word_addr);
+                            *self.peripheral_regs.get(&word_addr).unwrap_or(&0)
+                        }
                     }
                 };
                 let byte_idx = (canonical & 3) as usize;
@@ -1554,6 +1610,7 @@ impl Bus {
                         _ => {
                             let word_addr = canonical & !3;
                             let byte_idx = (canonical & 3) as usize;
+                            self.warn_unmodelled_mmio(word_addr);
                             let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
                             let mut bytes = old_word.to_le_bytes();
                             let old_byte = bytes[byte_idx];
@@ -1703,7 +1760,10 @@ impl Bus {
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
-                        _ => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                        _ => {
+                            self.warn_unmodelled_mmio(word_addr);
+                            *self.peripheral_regs.get(&word_addr).unwrap_or(&0)
+                        }
                     }
                 };
                 let half_idx = ((canonical >> 1) & 1) as usize;
@@ -1971,6 +2031,7 @@ impl Bus {
                         _ => {
                             let word_addr = canonical & !3;
                             let half_idx = ((canonical >> 1) & 1) as usize;
+                            self.warn_unmodelled_mmio(word_addr);
                             let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
                             let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
                             let old_half = halves[half_idx];
@@ -2072,7 +2133,10 @@ impl Bus {
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
-                        _ => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
+                        _ => {
+                            self.warn_unmodelled_mmio(canonical);
+                            *self.peripheral_regs.get(&canonical).unwrap_or(&0)
+                        }
                     }
                 }
             }
@@ -2210,6 +2274,7 @@ impl Bus {
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),
                         _ => {
                             // Existing HashMap path with alias logic
+                            self.warn_unmodelled_mmio(canonical);
                             let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
                             let new_val = match alias {
                                 0 => val,
@@ -2589,5 +2654,140 @@ mod corebus_trait_tests {
         // emit_mmio_trace is a no-op unless mmio_trace_enabled is true, but we
         // still call it to validate the signature.
         bus_dyn.emit_mmio_trace('R', 4, 0x2000_0000, 0, 0);
+    }
+}
+
+// ============================================================================
+// Bus observability: warn-once on unmodelled MMIO (HLD V5 §4.A1) +
+// watchdog-reset flag (HLD V5 §7.D.3)
+// ============================================================================
+// ============================================================================
+// Bus observability: warn-once on unmodelled MMIO (HLD V5 §4.A1) +
+// watchdog-reset flag (HLD V5 §7.D.3)
+// ============================================================================
+
+/// Warn-assertion tests use `tracing::subscriber::with_default`, which
+/// installs a *thread-local* subscriber. If future parallel-test
+/// infrastructure shares subscribers across threads, these tests would
+/// need `#[serial]` via the `serial_test` crate.
+#[cfg(test)]
+mod bus_observability {
+    use crate::bus::Bus;
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber};
+    use tracing::span::{Attributes, Id, Record};
+
+    /// Capture `tracing` events (name + level + fields) into a shared
+    /// `Vec<String>` so tests can assert on warn-once semantics.
+    ///
+    /// The subscriber ignores spans (tests only care about events) and
+    /// records each event as `"<LEVEL> <format!(fields)>"`, where the
+    /// fields are flattened into a single string via a one-shot
+    /// `field::Visit`.
+    #[derive(Default)]
+    struct CaptureSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FieldRecorder(String);
+    impl tracing::field::Visit for FieldRecorder {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let _ = write!(self.0, "{}={:?}", field.name(), value);
+        }
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = FieldRecorder(String::new());
+            event.record(&mut visitor);
+            let meta = event.metadata();
+            let line = format!("{} {}", meta.level(), visitor.0);
+            self.events.lock().unwrap().push(line);
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn count_warns_matching(events: &[String], addr_hex: &str) -> usize {
+        events
+            .iter()
+            .filter(|line| line.starts_with("WARN"))
+            .filter(|line| line.contains(addr_hex))
+            .count()
+    }
+
+    #[test]
+    fn unmodelled_mmio_warn_fires_once_per_address_on_repeated_writes() {
+        // HLD V5 §4.A1 testing paragraph: write twice to an unmodelled
+        // address, capture events, assert exactly one WARN fired for
+        // that address. `0x400F_8000` is the SHA-256 base — unmodelled
+        // until step 3b lands.
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut bus = Bus::new();
+            bus.write32(0x400F_8000, 0xDEAD_BEEF, 0);
+            bus.write32(0x400F_8000, 0xCAFE_BABE, 0);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_matching(&events, "0x400F8000");
+        assert_eq!(matches, 1,
+            "expected exactly one WARN for 0x400F_8000; got {} in {:?}",
+            matches, *events);
+    }
+
+    #[test]
+    fn unmodelled_mmio_warn_fires_on_first_read_too() {
+        // Reads at an unmodelled address should also warn-once.
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut bus = Bus::new();
+            let _ = bus.read32(0x400F_8000, 0);
+            let _ = bus.read32(0x400F_8000, 0);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_matching(&events, "0x400F8000");
+        assert_eq!(matches, 1);
+    }
+
+    #[test]
+    fn unmodelled_mmio_warn_fires_once_per_unique_address() {
+        // Two distinct unmodelled addresses → two distinct WARNs.
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut bus = Bus::new();
+            bus.write32(0x400F_8000, 0, 0);
+            bus.write32(0x400F_8004, 0, 0);
+        });
+        let events = captured.lock().unwrap();
+        assert_eq!(count_warns_matching(&events, "0x400F8000"), 1);
+        assert_eq!(count_warns_matching(&events, "0x400F8004"), 1);
+    }
+
+    // --- Watchdog reset request flag (HLD V5 §7.D.3) ---------------------
+
+    #[test]
+    fn watchdog_reset_flag_default_false() {
+        let bus = Bus::new();
+        assert!(!bus.watchdog_reset_requested());
+    }
+
+    #[test]
+    fn watchdog_reset_flag_set_poll_clear() {
+        let mut bus = Bus::new();
+        bus.set_watchdog_reset();
+        assert!(bus.watchdog_reset_requested());
+        bus.clear_watchdog_reset();
+        assert!(!bus.watchdog_reset_requested());
     }
 }

@@ -554,6 +554,20 @@ mod tests {
     }
 
     #[test]
+    fn alias2_at_0x81c_lands_on_timer0_cycles() {
+        // HLD V5 §4.A3 regression guard: the failing silicon scenario
+        // `ticks_timer0_retarget_halves_rate` writes to
+        // `TICKS_BASE + 0x81C` (the alias-2/BITSET form of TIMER0.CYCLES
+        // at base offset 0x1C). The 12-bit APB offset `0x81C` must mask
+        // through `& 0x7F` to `0x1C` so the write lands on TIMER0.CYCLES.
+        let mut t = TicksRegs::new_hardware_reset();
+        // alias=2 (BITSET) with bitmask 24 => CYCLES OR= 24.
+        let invalidates = t.write32(0x81C, 24, 2);
+        assert!(invalidates, "write to TIMER0.CYCLES must invalidate caches");
+        assert_eq!(t.domains[DOMAIN_TIMER0].cycles, 24);
+    }
+
+    #[test]
     fn bitclr_alias_clears_enable() {
         let mut t = TicksRegs::post_bootrom();
         t.domains[DOMAIN_TIMER0].enable = true;

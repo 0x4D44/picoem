@@ -810,16 +810,16 @@ mod tests {
         let mut bus = Bus::new();
         release_dma(&mut bus);
 
-        bus.write32(DMA_BASE + 0x00, 0x2000_0100);
-        bus.write32(DMA_BASE + 0x04, 0x2000_0200);
-        bus.write32(DMA_BASE + 0x08, 1);
-        bus.write32(DMA_BASE + 0x00, 0x2000_0100); // seed source addr
+        bus.write32(DMA_BASE + 0x00, 0x2000_0100, 0);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x00, 0x2000_0100, 0); // seed source addr
         // Write a dummy source word.
-        bus.write32(0x2000_0100, 0xA5A5_A5A5);
+        bus.write32(0x2000_0100, 0xA5A5_A5A5, 0);
         let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
-        bus.write32(DMA_BASE + 0x0C, ctrl); // triggers transfer
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0); // triggers transfer
 
-        let raw = bus.read32(DMA_BASE + 0x0C);
+        let raw = bus.read32(DMA_BASE + 0x0C, 0);
         // BUSY must be asserted immediately after CTRL_TRIG write.
         assert_ne!(raw & (1 << 26), 0, "BUSY is at bit 26");
         // Bit 24 is BSWAP — must not be set (we did not request byte-swap).
@@ -1360,12 +1360,12 @@ mod tests {
         let src: u32 = 0x2000_0A00;
         let dst: u32 = 0x2000_0B00;
         for i in 0..4u32 {
-            bus.write32(src + i * 4, 0xF00D_0000 + i);
+            bus.write32(src + i * 4, 0xF00D_0000 + i, 0);
         }
 
-        bus.write32(DMA_BASE + 0x00, src);
-        bus.write32(DMA_BASE + 0x04, dst);
-        bus.write32(DMA_BASE + 0x08, 4);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
         // TREQ_SEL=63 (FORCE), CHAIN_TO=0 (ch0=self=no chain on RP2350).
         // With correct RP2350 positions this should be 0x007E_0059.
         // With RP2040 positions it would be 0x001F_8039 — TREQ_SEL=15
@@ -1375,7 +1375,7 @@ mod tests {
             ctrl, 0x007E_0059,
             "make_ctrl must produce RP2350 field positions (not RP2040)"
         );
-        bus.write32(DMA_BASE + 0x0C, ctrl);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // With FORCE TREQ, 4 ticks must be enough for 4 transfers.
         for _ in 0..4 {
@@ -1385,13 +1385,13 @@ mod tests {
         // Data must have been transferred.
         for i in 0..4u32 {
             assert_eq!(
-                bus.read32(dst + i * 4),
+                bus.read32(dst + i * 4, 0),
                 0xF00D_0000 + i,
                 "word {i} not transferred: TREQ_SEL may be wrong (RP2040 positions?)"
             );
         }
         // BUSY must clear — if TREQ was wrong, channel stalls and BUSY stays.
-        let readback = bus.read32(DMA_BASE + 0x0C);
+        let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(
             readback & CTRL_BUSY,
             0,
@@ -1399,7 +1399,7 @@ mod tests {
         );
         // INTR bit 0 must be set (transfer completed).
         assert_ne!(
-            bus.read32(DMA_BASE + REG_INTR) & 1,
+            bus.read32(DMA_BASE + REG_INTR, 0) & 1,
             0,
             "INTR bit 0 must latch on completion"
         );

@@ -21,6 +21,7 @@ tracing = { workspace = true }
 # mirrors how `mdpicoem-harness` opts in under its own [dev-dependencies].
 [dev-dependencies]
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
+tracing-subscriber = { workspace = true }
 
 # Threading Phase 3 Stage 6b (LLD V7 §8/§9): Windows thread-affinity
 # pinning for the 4-thread runtime. The `ThreadedEmulator` path is

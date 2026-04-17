@@ -170,7 +170,7 @@ impl GlueDma {
         // cannot progress either channel on the first `emu.run(1)` that
         // follows this prime. See `tick` for the per-cycle abort that
         // keeps them inert thereafter.
-        bus.write32(DMA_BASE + DMA_CHAN_ABORT, GLUE_DMA_CHAN_MASK);
+        bus.write32(DMA_BASE + DMA_CHAN_ABORT, GLUE_DMA_CHAN_MASK, 0);
 
         for n in 0..2u32 {
             // Ignore the live trigger — reset to zero so `poll_triggers`
@@ -196,7 +196,7 @@ impl GlueDma {
         // would race the pump for RX words otherwise.  Aborting each
         // tick is a per-channel BUSY clear — firmware's written CTRL
         // values remain visible on readback.
-        bus.write32(DMA_BASE + DMA_CHAN_ABORT, GLUE_DMA_CHAN_MASK);
+        bus.write32(DMA_BASE + DMA_CHAN_ABORT, GLUE_DMA_CHAN_MASK, 0);
 
         // 1. Poll for fresh CTRL_TRIG writes on each channel.
         self.poll_triggers(bus);
@@ -388,7 +388,7 @@ mod tests {
     /// actually advances it.  Mirrors the sequence `mdrp2350::dma`'s own
     /// test helper uses (RESETS CLR alias at offset 0x3000, bit 2).
     fn release_dma(bus: &mut Bus) {
-        bus.write32(0x4002_0000 + 0x3000, 1u32 << 2);
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << 2, 0);
     }
 
     /// Write the CTRL_TRIG helper that also programs the three
@@ -702,7 +702,7 @@ mod tests {
         let src: u32 = 0x2000_1000;
         let dst: u32 = 0x2000_2000;
         for i in 0..4u32 {
-            emu.bus.write32(src + i * 4, 0xDEAD_0000 | i);
+            emu.bus.write32(src + i * 4, 0xDEAD_0000 | i, 0);
         }
 
         // V6 CTRL: EN, DATA_SIZE=2 (word), INCR_READ, INCR_WRITE,
@@ -734,10 +734,10 @@ mod tests {
             dma.tick(&mut emu.bus);
         }
 
-        let tcount = emu.bus.read32(DMA_BASE + 0x08);
-        let raddr = emu.bus.read32(DMA_BASE + 0x00);
-        let waddr = emu.bus.read32(DMA_BASE + 0x04);
-        let ctrl_rb = emu.bus.read32(DMA_BASE + 0x0C);
+        let tcount = emu.bus.read32(DMA_BASE + 0x08, 0);
+        let raddr = emu.bus.read32(DMA_BASE + 0x00, 0);
+        let waddr = emu.bus.read32(DMA_BASE + 0x04, 0);
+        let ctrl_rb = emu.bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(
             tcount, COUNT,
             "real DMA consumed {} transfers across 32 ticks; pump failed \
@@ -753,6 +753,6 @@ mod tests {
             ctrl_rb
         );
         // Destination must not have been written by the real DMA.
-        assert_eq!(emu.bus.read32(dst), 0, "real DMA wrote to dst");
+        assert_eq!(emu.bus.read32(dst, 0), 0, "real DMA wrote to dst");
     }
 }

@@ -183,6 +183,8 @@ impl ThreadedEmulator {
             pending_cache_invalidations: _,
             pending_invalidation_regions: _,
             last_fetch_addr: _,
+            warned_addrs: _,
+            watchdog_reset_requested: _,
         } = bus;
 
         let shared_mem = Arc::new(SharedMemory::from_memory(
