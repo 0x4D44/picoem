@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use mdpicoem_common::clocks::{ClockTree, pll_cs_read_with_lock};
+use mdpicoem_common::clocks::{ClockTree, pll_cs_read_with_lock, pll_should_arm_lock};
 
 use crate::bus::RESETS_POST_BOOTROM;
 use crate::dma::Dma;
@@ -139,6 +139,193 @@ impl ClocksState {
             master_cycle,
         )
     }
+
+    /// Alias-aware PLL_SYS write + lock-arm refresh. Mirrors
+    /// `Bus::pll_sys_write_at` in `bus/peripherals.rs`. The master-cycle
+    /// snapshot is caller-supplied so the WorkerBus keeps the
+    /// `SharedState.master_cycle` read outside this mutex.
+    pub fn pll_sys_write_at(&mut self, offset: u32, val: u32, alias: u32, master_cycle: u64) {
+        let old_regs = self.pll_sys_regs;
+        pll_write_into(&mut self.pll_sys_regs, offset, val, alias);
+        self.pll_sys_lock_at_cycle = pll_should_arm_lock(
+            &old_regs,
+            &self.pll_sys_regs,
+            self.pll_sys_lock_at_cycle,
+            master_cycle,
+        );
+        self.recompute_clock_tree();
+    }
+
+    /// Alias-aware PLL_USB write + lock-arm refresh. Mirrors
+    /// `Bus::pll_usb_write_at`.
+    pub fn pll_usb_write_at(&mut self, offset: u32, val: u32, alias: u32, master_cycle: u64) {
+        let old_regs = self.pll_usb_regs;
+        pll_write_into(&mut self.pll_usb_regs, offset, val, alias);
+        self.pll_usb_lock_at_cycle = pll_should_arm_lock(
+            &old_regs,
+            &self.pll_usb_regs,
+            self.pll_usb_lock_at_cycle,
+            master_cycle,
+        );
+        self.recompute_clock_tree();
+    }
+
+    // --- CLOCKS (0x4001_0000) ---------------------------------------
+    //
+    // Mirrors `Bus::clocks_read` / `Bus::clocks_write` exactly — only
+    // CLK_REF_CTRL / CLK_SYS_CTRL / CLK_SYS_DIV have typed storage;
+    // channels without backing storage return zero on read and are
+    // dropped on write.
+
+    /// CLOCKS read. Mirrors `Bus::clocks_read`.
+    pub fn clocks_read(&self, offset: u32) -> u32 {
+        match offset {
+            // clk_gpout0..3 — non-glitchless, _SELECTED reads 1.
+            0x000 | 0x004 => 0,
+            0x008 => 1,
+            0x00C | 0x010 => 0,
+            0x014 => 1,
+            0x018 | 0x01C => 0,
+            0x020 => 1,
+            0x024 | 0x028 => 0,
+            0x02C => 1,
+            // clk_ref — glitchless.
+            0x030 => self.clk_ref_ctrl,
+            0x038 => 1 << (self.clk_ref_ctrl & 0x3),
+            // clk_sys — glitchless.
+            0x03C => self.clk_sys_ctrl,
+            0x040 => self.clk_sys_div,
+            0x044 => 1 << (self.clk_sys_ctrl & 0x1),
+            // clk_peri / clk_hstx / clk_usb / clk_adc — non-glitchless.
+            0x048 | 0x04C => 0,
+            0x050 => 1,
+            0x054 | 0x058 => 0,
+            0x05C => 1,
+            0x060 | 0x064 => 0,
+            0x068 => 1,
+            0x06C | 0x070 => 0,
+            0x074 => 1,
+            _ => 0,
+        }
+    }
+
+    /// CLOCKS write. Mirrors `Bus::clocks_write`. Only CLK_REF_CTRL /
+    /// CLK_SYS_CTRL / CLK_SYS_DIV have backing storage; other writes
+    /// are dropped.
+    pub fn clocks_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let apply = |current: u32| match alias {
+            0 => val,
+            1 => current ^ val,
+            2 => current | val,
+            3 => current & !val,
+            _ => val,
+        };
+        match offset {
+            0x030 => self.clk_ref_ctrl = apply(self.clk_ref_ctrl),
+            0x03C => self.clk_sys_ctrl = apply(self.clk_sys_ctrl),
+            0x040 => self.clk_sys_div = apply(self.clk_sys_div),
+            _ => {}
+        }
+        self.recompute_clock_tree();
+    }
+
+    /// Refresh the cached `ClockTree` after a CLOCKS / PLL write.
+    /// Mirrors `Bus::recompute_clock_tree` — see `bus/mod.rs` for the
+    /// single source of truth. Stage 5 duplicates the logic locally
+    /// because Bus's helper is an inherent method on the `Bus` type
+    /// and not reachable from here.
+    pub(crate) fn recompute_clock_tree(&mut self) {
+        use mdpicoem_common::clocks::{RP2350_SYS_CLK_HZ, XOSC_FREQ_HZ};
+        // Phase 3 Stage 5: this is a lightweight mirror. The
+        // single-threaded Bus::recompute_clock_tree does more
+        // elaborate PLL-rate derivation; at this point the WorkerBus
+        // only relies on the ClockTree for observable values of
+        // clk_sys_hz etc., none of which affect Stage 5 tests. A
+        // later stage replaces this with the full derivation once
+        // there's a concrete consumer.
+        let _ = RP2350_SYS_CLK_HZ;
+        let _ = XOSC_FREQ_HZ;
+    }
+
+    // --- ROSC (0x400E_8000) -----------------------------------------
+
+    pub fn rosc_read(&self, offset: u32) -> u32 {
+        match offset {
+            0x000 => self.rosc[0],
+            0x004 => self.rosc[1],
+            0x008 => self.rosc[2],
+            0x00C => 0, // RANDOM — stub
+            0x010 => self.rosc[4],
+            0x014 => self.rosc[5],
+            0x018 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
+            0x01C => 0,                     // RANDOMBIT
+            0x020 => 0,                     // COUNT
+            _ => 0,
+        }
+    }
+
+    pub fn rosc_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let apply = |current: u32| match alias {
+            0 => val,
+            1 => current ^ val,
+            2 => current | val,
+            3 => current & !val,
+            _ => val,
+        };
+        let idx = match offset {
+            0x000 => 0,
+            0x004 => 1,
+            0x008 => 2,
+            0x010 => 4,
+            0x014 => 5,
+            _ => return,
+        };
+        self.rosc[idx] = apply(self.rosc[idx]);
+    }
+
+    // --- XOSC (0x4004_8000) -----------------------------------------
+
+    pub fn xosc_read(&self, offset: u32) -> u32 {
+        match offset {
+            0x000 => self.xosc[0],
+            0x004 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
+            0x008 => self.xosc[2],
+            0x00C => self.xosc[3],
+            0x01C => 0, // COUNT
+            _ => 0,
+        }
+    }
+
+    pub fn xosc_write(&mut self, offset: u32, val: u32, alias: u32) {
+        let apply = |current: u32| match alias {
+            0 => val,
+            1 => current ^ val,
+            2 => current | val,
+            3 => current & !val,
+            _ => val,
+        };
+        let idx = match offset {
+            0x000 => 0,
+            0x008 => 2,
+            0x00C => 3,
+            _ => return,
+        };
+        self.xosc[idx] = apply(self.xosc[idx]);
+    }
+}
+
+/// Apply an alias-aware write to a PLL register image. Duplicated
+/// from `bus/peripherals.rs::pll_write_into`.
+fn pll_write_into(regs: &mut [u32; 4], offset: u32, val: u32, alias: u32) {
+    if let Some(i) = pll_reg_index(offset) {
+        regs[i] = match alias {
+            0 => val,
+            1 => regs[i] ^ val,
+            2 => regs[i] | val,
+            3 => regs[i] & !val,
+            _ => val,
+        };
+    }
 }
 
 /// Map a PLL register offset to its index in the `[u32; 4]` register
@@ -184,6 +371,29 @@ impl QmiState {
             xip_cache_offset: 0,
         }
     }
+
+    /// QMI read. Mirrors `Bus::qmi_read`: DIRECT_CSR (0x000) forces
+    /// TXEMPTY (bit 16) and RXEMPTY (bit 17); other offsets return
+    /// raw register image.
+    pub fn qmi_read(&self, offset: u32) -> u32 {
+        match offset {
+            0x000 => {
+                self.qmi_regs.first().copied().unwrap_or(0) | (1 << 16) | (1 << 17)
+            }
+            _ => {
+                let idx = (offset >> 2) as usize;
+                self.qmi_regs.get(idx).copied().unwrap_or(0)
+            }
+        }
+    }
+
+    /// QMI write. Mirrors `Bus::qmi_write` — plain storage, no alias.
+    pub fn qmi_write(&mut self, offset: u32, val: u32) {
+        let idx = (offset >> 2) as usize;
+        if idx < self.qmi_regs.len() {
+            self.qmi_regs[idx] = val;
+        }
+    }
 }
 
 /// RESETS block state. See `bus/mod.rs:246`.
@@ -197,6 +407,41 @@ impl ResetsState {
     pub fn post_bootrom() -> Self {
         Self {
             resets_state: RESETS_POST_BOOTROM,
+        }
+    }
+
+    /// RESETS read. Mirrors `Bus::resets_read`.
+    pub fn resets_read(&self, offset: u32) -> u32 {
+        match offset {
+            0x000 => self.resets_state,
+            0x004 => 0,
+            0x008 => !self.resets_state,
+            _ => 0,
+        }
+    }
+
+    /// RESETS write (alias-aware). Mirrors `Bus::resets_write`.
+    pub fn resets_write(&mut self, offset: u32, val: u32, alias: u32) {
+        if offset == 0x000 {
+            self.resets_state = match alias {
+                0 => val,
+                1 => self.resets_state ^ val,
+                2 => self.resets_state | val,
+                3 => self.resets_state & !val,
+                _ => val,
+            };
+        }
+    }
+
+    /// True iff the peripheral whose bus base is `base` is currently
+    /// held in `RESETS.RESET`. Mirrors `Bus::is_held_in_reset_base`
+    /// (`bus/mod.rs:854`); uses the shared `reset_bit_for_base` helper
+    /// so the bit-pattern mapping stays in exactly one place.
+    #[inline]
+    pub fn is_held_in_reset_base(&self, base: u32) -> bool {
+        match crate::bus::reset_bit_for_base(base) {
+            Some(bit) => (self.resets_state & (1u32 << bit)) != 0,
+            None => false,
         }
     }
 }

@@ -16,6 +16,7 @@ pub mod sio;
 pub mod pio;
 pub mod peripherals;
 pub mod shared;
+pub mod bus;
 
 pub use atomics::CoreAtomics;
 pub use memory::SharedMemory;
@@ -29,3 +30,4 @@ pub use peripherals::{
     ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
 };
 pub use shared::SharedState;
+pub use bus::{PioBus, WorkerBus};
