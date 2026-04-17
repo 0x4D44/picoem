@@ -9313,6 +9313,22 @@ fn sio_gpio_out_halfword_write_replicates() {
     );
 }
 
+/// GPIO_OE (output-enable) lives in the same replicating family as
+/// GPIO_OUT — a `STRB` to `SIO_GPIO_OE` lights the OE bit across every
+/// byte lane of the underlying 32-bit word. OneROM's CPU-serve loop
+/// relies on this the same way it does for GPIO_OUT: the output-enable
+/// mask `0x04FF_0000` composed by the firmware eventually lands via a
+/// word write, but narrow writes must also replicate to match silicon.
+#[test]
+fn sio_gpio_oe_byte_write_replicates_across_lanes() {
+    use crate::{Config, EmulatorBuilder};
+    let mut emu = EmulatorBuilder::new(Config::default()).build();
+    emu.bus.write8(0xD000_0030, 0xFF);
+    let word = emu.bus.read32(0xD000_0030);
+    assert_eq!(word, 0xFFFF_FFFF,
+        "STRB to SIO_GPIO_OE must replicate byte across all four lanes; got {:#010x}", word);
+}
+
 /// Replication must be GPIO_OUT-family-specific, not blanket across
 /// every SIO register. A byte write to a non-GPIO_OUT register (e.g.
 /// MTIMEL at offset 0x1B0) must still behave as byte-lane RMW.
