@@ -17,6 +17,9 @@ use tracing::info;
 #[cfg(test)]
 mod pio_tests;
 
+#[cfg(test)]
+mod tests_narrow;
+
 pub use self::core::CortexM33;
 pub use self::core::CoreCounters;
 pub use self::core_riscv::Hazard3;
