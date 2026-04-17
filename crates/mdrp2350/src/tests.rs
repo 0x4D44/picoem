@@ -1,14 +1,21 @@
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::core::CortexM33;
 use crate::bus::Bus;
+use crate::threaded::CoreAtomics;
 
 // ============================================================================
 // Helper: build a core + bus, optionally pre-load SRAM
 // ============================================================================
 
 fn core_and_bus() -> (CortexM33, Bus) {
-    (CortexM33::new(), Bus::new())
+    // Phase 3 Stage 1: share one `Arc<CoreAtomics>` so WFI / WFE / IRQ-
+    // pending tests on `core` observe the same state the bus writes to.
+    let atomics = Arc::new(CoreAtomics::default());
+    let core = CortexM33::new(0, Arc::clone(&atomics));
+    let bus = Bus::with_atomics(atomics);
+    (core, bus)
 }
 
 // ============================================================================
@@ -17,7 +24,7 @@ fn core_and_bus() -> (CortexM33, Bus) {
 
 #[test]
 fn lsls_imm_basic() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_0001);
     let cy = c.execute_one(0x00C8); // LSLS R0, R1, #3 → R0 = 1 << 3 = 8
     assert_eq!(c.reg(0), 8);
@@ -29,7 +36,7 @@ fn lsls_imm_basic() {
 
 #[test]
 fn lsls_imm_zero_shift_is_movs() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(2, 42);
     c.regs.set_flag_c(true); // carry should be preserved
     c.execute_one(0x0010); // LSLS R0, R2, #0 → MOVS R0, R2
@@ -39,7 +46,7 @@ fn lsls_imm_zero_shift_is_movs() {
 
 #[test]
 fn lsls_imm_carry_out() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x8000_0000);
     c.execute_one(0x0040); // LSLS R0, R0, #1 → 0, carry = 1
     assert_eq!(c.reg(0), 0);
@@ -49,7 +56,7 @@ fn lsls_imm_carry_out() {
 
 #[test]
 fn lsrs_imm_basic() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x80);
     c.execute_one(0x08C8); // LSRS R0, R1, #3 → 0x80 >> 3 = 0x10
     assert_eq!(c.reg(0), 0x10);
@@ -59,7 +66,7 @@ fn lsrs_imm_basic() {
 
 #[test]
 fn lsrs_imm_shift_32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x8000_0000);
     // LSRS R0, R0, #32 → encoded as imm5=0 → result=0, carry=bit31
     c.execute_one(0x0800); // bits: 00001_00000_000_000
@@ -70,7 +77,7 @@ fn lsrs_imm_shift_32() {
 
 #[test]
 fn asrs_imm_positive() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x40);
     c.execute_one(0x10C8); // ASRS R0, R1, #3 → 0x40 >> 3 = 8
     assert_eq!(c.reg(0), 8);
@@ -79,7 +86,7 @@ fn asrs_imm_positive() {
 
 #[test]
 fn asrs_imm_negative() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xFFFF_FF00u32);
     c.execute_one(0x1108); // ASRS R0, R1, #4 → sign-extended right shift
     assert_eq!(c.reg(0), 0xFFFF_FFF0);
@@ -92,7 +99,7 @@ fn asrs_imm_negative() {
 
 #[test]
 fn adds_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 5);
     c.set_reg(1, 3);
     let cy = c.execute_one(0x1840); // ADDS R0, R0, R1
@@ -106,7 +113,7 @@ fn adds_reg() {
 
 #[test]
 fn adds_reg_overflow() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x7FFF_FFFF);
     c.set_reg(1, 1);
     c.execute_one(0x1840); // ADDS R0, R0, R1
@@ -118,7 +125,7 @@ fn adds_reg_overflow() {
 
 #[test]
 fn subs_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 10);
     c.set_reg(1, 3);
     c.execute_one(0x1A40); // SUBS R0, R0, R1
@@ -130,7 +137,7 @@ fn subs_reg() {
 
 #[test]
 fn subs_reg_borrow() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 3);
     c.set_reg(1, 10);
     c.execute_one(0x1A40); // SUBS R0, R0, R1
@@ -141,7 +148,7 @@ fn subs_reg_borrow() {
 
 #[test]
 fn adds_imm3() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.execute_one(0x1CC8); // ADDS R0, R1, #3
     assert_eq!(c.reg(0), 103);
@@ -149,7 +156,7 @@ fn adds_imm3() {
 
 #[test]
 fn subs_imm3() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.execute_one(0x1EC8); // SUBS R0, R1, #3
     assert_eq!(c.reg(0), 97);
@@ -161,7 +168,7 @@ fn subs_imm3() {
 
 #[test]
 fn movs_imm() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.execute_one(0x202A); // MOVS R0, #42
     assert_eq!(c.reg(0), 42);
     assert!(!c.flag_z());
@@ -170,7 +177,7 @@ fn movs_imm() {
 
 #[test]
 fn movs_imm_zero() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 999);
     c.execute_one(0x2000); // MOVS R0, #0
     assert_eq!(c.reg(0), 0);
@@ -179,7 +186,7 @@ fn movs_imm_zero() {
 
 #[test]
 fn cmp_imm_equal() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 42);
     c.execute_one(0x282A); // CMP R0, #42
     assert!(c.flag_z()); // equal
@@ -189,7 +196,7 @@ fn cmp_imm_equal() {
 
 #[test]
 fn cmp_imm_greater() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 100);
     c.execute_one(0x282A); // CMP R0, #42
     assert!(!c.flag_z());
@@ -199,7 +206,7 @@ fn cmp_imm_greater() {
 
 #[test]
 fn cmp_imm_less() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 10);
     c.execute_one(0x282A); // CMP R0, #42
     assert!(!c.flag_z());
@@ -209,7 +216,7 @@ fn cmp_imm_less() {
 
 #[test]
 fn adds_imm8() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 100);
     c.execute_one(0x3019); // ADDS R0, #25
     assert_eq!(c.reg(0), 125);
@@ -217,7 +224,7 @@ fn adds_imm8() {
 
 #[test]
 fn subs_imm8() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 100);
     c.execute_one(0x3819); // SUBS R0, #25
     assert_eq!(c.reg(0), 75);
@@ -230,7 +237,7 @@ fn subs_imm8() {
 
 #[test]
 fn ands() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFF);
     c.set_reg(1, 0x0F);
     c.execute_one(0x4008); // ANDS R0, R1
@@ -239,7 +246,7 @@ fn ands() {
 
 #[test]
 fn eors() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFF);
     c.set_reg(1, 0xF0);
     c.execute_one(0x4048); // EORS R0, R1
@@ -248,7 +255,7 @@ fn eors() {
 
 #[test]
 fn lsls_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 1);
     c.set_reg(1, 4);
     c.execute_one(0x4088); // LSLS R0, R1 (shift R0 by R1)
@@ -257,7 +264,7 @@ fn lsls_reg() {
 
 #[test]
 fn lsrs_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x100);
     c.set_reg(1, 4);
     c.execute_one(0x40C8); // LSRS R0, R1
@@ -266,7 +273,7 @@ fn lsrs_reg() {
 
 #[test]
 fn adcs() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFFFF_FFFF);
     c.set_reg(1, 0);
     c.regs.set_flag_c(true);
@@ -278,7 +285,7 @@ fn adcs() {
 
 #[test]
 fn sbcs() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 10);
     c.set_reg(1, 3);
     c.regs.set_flag_c(true); // C=1 means no borrow from previous
@@ -289,7 +296,7 @@ fn sbcs() {
 
 #[test]
 fn rors() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x0000_0001);
     c.set_reg(1, 1);
     c.execute_one(0x41C8); // RORS R0, R1 → rotate right by 1
@@ -300,7 +307,7 @@ fn rors() {
 
 #[test]
 fn tst() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFF00);
     c.set_reg(1, 0x00FF);
     c.execute_one(0x4208); // TST R0, R1
@@ -310,7 +317,7 @@ fn tst() {
 
 #[test]
 fn rsbs_neg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0);
     c.set_reg(1, 42);
     c.execute_one(0x4248); // RSBS R0, R1, #0 → 0 - 42
@@ -320,7 +327,7 @@ fn rsbs_neg() {
 
 #[test]
 fn cmp_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 42);
     c.set_reg(1, 42);
     c.execute_one(0x4288); // CMP R0, R1
@@ -330,7 +337,7 @@ fn cmp_reg() {
 
 #[test]
 fn cmn() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 1);
     c.set_reg(1, 0xFFFF_FFFF);
     c.execute_one(0x42C8); // CMN R0, R1 → 1 + 0xFFFFFFFF = 0, carry
@@ -340,7 +347,7 @@ fn cmn() {
 
 #[test]
 fn orrs() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xF0);
     c.set_reg(1, 0x0F);
     c.execute_one(0x4308); // ORRS R0, R1
@@ -349,7 +356,7 @@ fn orrs() {
 
 #[test]
 fn muls() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 7);
     c.set_reg(1, 6);
     c.execute_one(0x4348); // MULS R0, R1
@@ -358,7 +365,7 @@ fn muls() {
 
 #[test]
 fn bics() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFF);
     c.set_reg(1, 0x0F);
     c.execute_one(0x4388); // BICS R0, R1
@@ -367,7 +374,7 @@ fn bics() {
 
 #[test]
 fn mvns() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0);
     c.set_reg(1, 0);
     c.execute_one(0x43C8); // MVNS R0, R1
@@ -381,7 +388,7 @@ fn mvns() {
 
 #[test]
 fn mov_high_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(8, 0xDEAD_BEEF);
     // MOV R0, R8: 01000110_0_1000_000 = 0x4640
     c.execute_one(0x4640);
@@ -390,7 +397,7 @@ fn mov_high_reg() {
 
 #[test]
 fn add_high_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 10);
     c.set_reg(8, 20);
     // ADD R0, R8: 01000100_0_1000_000 = 0x4440
@@ -400,7 +407,7 @@ fn add_high_reg() {
 
 #[test]
 fn bx_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x2000_0001); // bit 0 = Thumb
     c.regs.set_pc(0x1000);
     // BX R0: 0100_0111_0_0000_000 = 0x4700
@@ -410,7 +417,7 @@ fn bx_reg() {
 
 #[test]
 fn bxns_from_secure() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     assert!(c.secure);
     c.regs.msp_ns = 0x2000_4000;
     c.set_reg(1, 0x1000_0001); // target with Thumb bit
@@ -425,7 +432,7 @@ fn bxns_from_secure() {
 
 #[test]
 fn bxns_from_nonsecure() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.secure = false;
     c.set_reg(2, 0x2000_0001); // target with Thumb bit
     let orig_msp = c.regs.msp;
@@ -440,7 +447,7 @@ fn bxns_from_nonsecure() {
 
 #[test]
 fn bxns_msp_ns_setup_pattern() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.msp = 0x2000_8000;
     c.regs.r[13] = c.regs.msp;
     c.regs.msp_ns = 0x2000_1000;
@@ -458,7 +465,7 @@ fn bxns_msp_ns_setup_pattern() {
 
 #[test]
 fn bxns_with_psp_active() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // Secure state using PSP (SPSEL=1)
     c.regs.control = 2; // SPSEL=1
     c.regs.psp = 0x2000_A000;
@@ -590,7 +597,7 @@ fn str_ldr_sp() {
 
 #[test]
 fn adr_pc_relative() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     // ADR R0, #16: 10100_000_00000100 = 0xA004
@@ -601,7 +608,7 @@ fn adr_pc_relative() {
 
 #[test]
 fn add_rd_sp_imm() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(13, 0x2000_1000);
     // ADD R0, SP, #32: 10101_000_00001000 = 0xA808
     c.execute_one(0xA808);
@@ -614,7 +621,7 @@ fn add_rd_sp_imm() {
 
 #[test]
 fn add_sp_imm() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(13, 0x2000_1000);
     // ADD SP, SP, #16: 10110000_0_0000100 = 0xB004
     c.execute_one(0xB004);
@@ -623,7 +630,7 @@ fn add_sp_imm() {
 
 #[test]
 fn sub_sp_imm() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(13, 0x2000_1000);
     // SUB SP, SP, #16: 10110000_1_0000100 = 0xB084
     c.execute_one(0xB084);
@@ -632,7 +639,7 @@ fn sub_sp_imm() {
 
 #[test]
 fn sxth() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_8000); // -32768 as i16
     // SXTH R0, R1: 10110010_00_001_000 = 0xB208
     c.execute_one(0xB208);
@@ -641,7 +648,7 @@ fn sxth() {
 
 #[test]
 fn uxtb() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xDEAD_BEEF);
     // UXTB R0, R1: 10110010_11_001_000 = 0xB2C8
     c.execute_one(0xB2C8);
@@ -650,7 +657,7 @@ fn uxtb() {
 
 #[test]
 fn rev() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x12_34_56_78);
     // REV R0, R1: 10111010_00_001_000 = 0xBA08
     c.execute_one(0xBA08);
@@ -659,7 +666,7 @@ fn rev() {
 
 #[test]
 fn rev16() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x1234_5678);
     // REV16 R0, R1: 10111010_01_001_000 = 0xBA48
     c.execute_one(0xBA48);
@@ -737,7 +744,7 @@ fn stm_ldm() {
 
 #[test]
 fn branch_unconditional() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     // B +8: PC = read_pc() + 8 = 0x1004 + 8 = 0x100C
@@ -748,7 +755,7 @@ fn branch_unconditional() {
 
 #[test]
 fn branch_unconditional_backward() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     // B -4: offset = -4, imm11 = (-4/2) & 0x7FF = 0x7FE
@@ -759,7 +766,7 @@ fn branch_unconditional_backward() {
 
 #[test]
 fn branch_cond_taken() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     c.regs.set_flag_z(true);
@@ -772,7 +779,7 @@ fn branch_cond_taken() {
 
 #[test]
 fn branch_cond_not_taken() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     c.regs.set_flag_z(false);
@@ -784,7 +791,7 @@ fn branch_cond_not_taken() {
 
 #[test]
 fn bl_forward() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     // BL +100: offset = 100
@@ -959,7 +966,7 @@ fn extract_imm12_basic() {
 
 #[test]
 fn cbz_taken() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     c.set_reg(0, 0); // R0 = 0 → CBZ should branch
 
@@ -977,7 +984,7 @@ fn cbz_taken() {
 
 #[test]
 fn cbz_not_taken() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     c.set_reg(0, 1); // R0 = 1 → CBZ should NOT branch
 
@@ -989,7 +996,7 @@ fn cbz_not_taken() {
 
 #[test]
 fn cbnz_not_taken() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     c.set_reg(0, 0); // R0 = 0 → CBNZ should NOT branch
 
@@ -1002,7 +1009,7 @@ fn cbnz_not_taken() {
 
 #[test]
 fn cbnz_taken() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     c.set_reg(0, 5); // R0 = 5 → CBNZ should branch
 
@@ -1017,7 +1024,7 @@ fn cbnz_taken() {
 
 #[test]
 fn thumb32_movw_routes_to_stub() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     // MOVW R0, #0x0000: hw0=0xF240, hw1=0x0000
@@ -1031,7 +1038,7 @@ fn thumb32_movw_routes_to_stub() {
 
 #[test]
 fn thumb32_bl_routes_through_branch_misc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     // BL +100: same encoding as the existing bl_forward test
@@ -1043,7 +1050,7 @@ fn thumb32_bl_routes_through_branch_misc() {
 
 #[test]
 fn thumb32_ldr_w_routes_to_load_store_single() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
 
     // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000
@@ -1091,7 +1098,7 @@ fn adds_w_imm() {
     // imm8 = 0 → val = 0. That's wrong.
     //
     // OK, simplest: use a small constant. #42 = imm12 = 0x2A (mode 00: val=0x2A).
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     let (hw0, hw1) = encode_dp_mod_imm(0b1000, true, 1, 0, 0x2A); // ADDS.W R0, R1, #42
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1106,7 +1113,7 @@ fn adds_w_imm() {
 #[test]
 fn subs_w_imm() {
     // SUBS.W R0, R1, #100
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 150);
     let (hw0, hw1) = encode_dp_mod_imm(0b1101, true, 1, 0, 100); // SUBS.W R0, R1, #100
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1121,7 +1128,7 @@ fn subs_w_imm() {
 #[test]
 fn and_w_imm_no_flags() {
     // AND.W R0, R1, #0xFF (S=0, no flag update)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x1234_5678);
     c.regs.set_flag_n(true); // pre-set flags to verify they don't change
     c.regs.set_flag_z(true);
@@ -1148,7 +1155,7 @@ fn ands_w_imm_carry() {
     // rotation=8: imm12 = (8 << 7) | 0 = 0x400. bits[11:10] = 0b01 → rotation path.
     // unrotated = 0x80, rotation = 8. val = 0x80.rotate_right(8) = 0x80000000.
     // carry = val >> 31 = 1 → true.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xFFFF_FFFF);
     let (hw0, hw1) = encode_dp_mod_imm(0b0000, true, 1, 0, 0x400);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1164,7 +1171,7 @@ fn ands_w_imm_carry() {
 fn mov_w_imm() {
     // MOV.W R0, #imm via ORR with Rn=15, S=0
     // Use imm12 = 0x34 → imm32 = 0x34
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let (hw0, hw1) = encode_dp_mod_imm(0b0010, false, 15, 0, 0x34);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0x34);
@@ -1174,7 +1181,7 @@ fn mov_w_imm() {
 #[test]
 fn mvn_w_imm() {
     // MVN.W R0, #0 → R0 = 0xFFFFFFFF (via ORN with Rn=15, S=0)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let (hw0, hw1) = encode_dp_mod_imm(0b0011, false, 15, 0, 0x00);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0xFFFF_FFFF);
@@ -1184,7 +1191,7 @@ fn mvn_w_imm() {
 #[test]
 fn cmp_w_imm() {
     // CMP.W R0, #50 → SUB with S=1, Rd=15 (discard result, flags only)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 50);
     let (hw0, hw1) = encode_dp_mod_imm(0b1101, true, 0, 15, 50);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1202,7 +1209,7 @@ fn cmp_w_imm() {
 #[test]
 fn tst_w_imm() {
     // TST.W R0, #0xFF → AND with S=1, Rd=15 (discard result, flags only)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x100); // bit 8 set, low byte = 0
     let (hw0, hw1) = encode_dp_mod_imm(0b0000, true, 0, 15, 0xFF);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1223,7 +1230,7 @@ fn orr_w_imm() {
     // imm12 = (24 << 7) | 0x7F = 0xC7F. Check bits: 0xC7F >> 10 = 3 → != 00 → rotation path.
     // rotation = (0xC7F >> 7) & 0x1F = 24. unrotated = 0x80 | 0x7F = 0xFF.
     // val = 0xFF.rotate_right(24) = 0xFF << 8 = 0xFF00. Correct!
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x1234_0000);
     let (hw0, hw1) = encode_dp_mod_imm(0b0010, false, 1, 0, 0xC7F);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1234,7 +1241,7 @@ fn orr_w_imm() {
 #[test]
 fn bic_w_imm() {
     // BIC.W R0, R1, #0x0F → R0 = R1 & ~0x0F (clear low nibble)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xABCD_EF9A);
     let (hw0, hw1) = encode_dp_mod_imm(0b0001, false, 1, 0, 0x0F);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1245,7 +1252,7 @@ fn bic_w_imm() {
 #[test]
 fn adc_w_imm() {
     // ADCS.W R0, R1, #10 with carry-in = 1
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.regs.set_flag_c(true); // carry-in
     let (hw0, hw1) = encode_dp_mod_imm(0b1010, true, 1, 0, 10);
@@ -1263,7 +1270,7 @@ fn sbc_w_imm() {
     // SBCS.W R0, R1, #10 with carry-in = 1 (no borrow)
     // SBC: Rd = Rn + ~imm32 + C
     // 100 + ~10 + 1 = 100 + 0xFFFFFFF5 + 1 = 100 - 10 = 90
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.regs.set_flag_c(true);
     let (hw0, hw1) = encode_dp_mod_imm(0b1011, true, 1, 0, 10);
@@ -1280,7 +1287,7 @@ fn sbc_w_imm() {
 fn rsb_w_imm() {
     // RSBS.W R0, R1, #100 → R0 = 100 - R1 = 100 - 30 = 70
     // RSB: Rd = ~Rn + imm32 + 1
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 30);
     let (hw0, hw1) = encode_dp_mod_imm(0b1110, true, 1, 0, 100);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1295,7 +1302,7 @@ fn rsb_w_imm() {
 #[test]
 fn eor_w_imm() {
     // EOR.W R0, R1, #0xFF (S=0)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xAA);
     let (hw0, hw1) = encode_dp_mod_imm(0b0100, false, 1, 0, 0xFF);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1306,7 +1313,7 @@ fn eor_w_imm() {
 #[test]
 fn orn_w_imm() {
     // ORN.W R0, R1, #0xFF → R0 = R1 | ~0xFF = R1 | 0xFFFFFF00
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_0042);
     let (hw0, hw1) = encode_dp_mod_imm(0b0011, false, 1, 0, 0xFF);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1402,7 +1409,7 @@ fn encode_sbfx(rd: u8, rn: u8, lsb: u8, width: u8) -> (u16, u16) {
 #[test]
 fn movw_basic() {
     // MOVW R0, #0x1234
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let (hw0, hw1) = encode_movw(0, 0x1234);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0x1234);
@@ -1412,7 +1419,7 @@ fn movw_basic() {
 #[test]
 fn movw_all_bits() {
     // MOVW R0, #0xFFFF — all 16 bits set
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let (hw0, hw1) = encode_movw(0, 0xFFFF);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0x0000_FFFF);
@@ -1422,7 +1429,7 @@ fn movw_all_bits() {
 #[test]
 fn movt_basic() {
     // MOVT R0, #0xABCD — set top half, preserve bottom half
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x0000_5678);
     let (hw0, hw1) = encode_movt(0, 0xABCD);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1433,7 +1440,7 @@ fn movt_basic() {
 #[test]
 fn movw_movt_pair() {
     // Load 0xDEADBEEF via MOVW + MOVT
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let (hw0, hw1) = encode_movw(0, 0xBEEF);
     c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0x0000_BEEF);
@@ -1446,7 +1453,7 @@ fn movw_movt_pair() {
 #[test]
 fn addw_basic() {
     // ADDW R0, R1, #4000
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 1000);
     let (hw0, hw1) = encode_addw(0, 1, 4000);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1457,7 +1464,7 @@ fn addw_basic() {
 #[test]
 fn subw_basic() {
     // SUBW R0, R1, #2000
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 5000);
     let (hw0, hw1) = encode_subw(0, 1, 2000);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1469,7 +1476,7 @@ fn subw_basic() {
 fn adr_add() {
     // ADR R0, [PC, #100] — ADDW with Rn=15
     // PC=0x1000, read_pc = 0x1000 + 4 = 0x1004, Align(0x1004, 4) = 0x1004
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     let (hw0, hw1) = encode_addw(0, 15, 100);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1482,7 +1489,7 @@ fn adr_add() {
 #[test]
 fn adr_sub() {
     // ADR R0, [PC, #-100] — SUBW with Rn=15
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     let (hw0, hw1) = encode_subw(0, 15, 100);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1494,7 +1501,7 @@ fn adr_sub() {
 #[test]
 fn bfi_basic() {
     // BFI R0, R1, #4, #8 — insert bits [11:4] from R1 into R0
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFFFF_FFFF);
     c.set_reg(1, 0xAB);       // low 8 bits = 0xAB
     let (hw0, hw1) = encode_bfi(0, 1, 4, 8);
@@ -1509,7 +1516,7 @@ fn bfi_basic() {
 #[test]
 fn bfc_basic() {
     // BFC R0, #8, #4 — clear bits [11:8] (Rn=15)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFFFF_FFFF);
     let (hw0, hw1) = encode_bfi(0, 15, 8, 4);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1522,7 +1529,7 @@ fn bfc_basic() {
 #[test]
 fn ubfx_basic() {
     // UBFX R0, R1, #4, #8 — extract bits [11:4] unsigned
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xDEAD_BEEF);
     let (hw0, hw1) = encode_ubfx(0, 1, 4, 8);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1534,7 +1541,7 @@ fn ubfx_basic() {
 #[test]
 fn sbfx_positive() {
     // SBFX R0, R1, #4, #8 — extract bits [11:4] signed, positive value
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_0750); // bits [11:4] = 0x75 = 0b0111_0101 (positive)
     let (hw0, hw1) = encode_sbfx(0, 1, 4, 8);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1545,7 +1552,7 @@ fn sbfx_positive() {
 #[test]
 fn sbfx_negative() {
     // SBFX R0, R1, #4, #8 — extract bits [11:4] signed, negative value
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_0F50); // bits [11:4] = 0xF5 = 0b1111_0101 (negative in 8-bit)
     let (hw0, hw1) = encode_sbfx(0, 1, 4, 8);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1890,7 +1897,7 @@ fn encode_b_w_uncond(offset: i32) -> (u16, u16) {
 #[test]
 fn b_w_cond_taken() {
     // BEQ.W +100 with Z=1 -> branch taken
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     c.regs.set_flag_z(true); // EQ condition met
     let (hw0, hw1) = encode_b_w_cond(0x0, 100); // cond=0 (EQ), offset=+100
@@ -1903,7 +1910,7 @@ fn b_w_cond_taken() {
 #[test]
 fn b_w_cond_not_taken() {
     // BEQ.W +100 with Z=0 -> not taken
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     c.regs.set_flag_z(false); // EQ condition not met
     let (hw0, hw1) = encode_b_w_cond(0x0, 100); // cond=0 (EQ), offset=+100
@@ -1916,7 +1923,7 @@ fn b_w_cond_not_taken() {
 #[test]
 fn b_w_cond_backward() {
     // BNE.W -50 with Z=0 (NE condition met) -> backward branch taken
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x2000);
     c.regs.set_flag_z(false); // NE condition met
     let (hw0, hw1) = encode_b_w_cond(0x1, -50); // cond=1 (NE), offset=-50
@@ -1933,7 +1940,7 @@ fn b_w_cond_backward() {
 #[test]
 fn b_w_uncond_forward() {
     // B.W +1000 (unconditional forward)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     let (hw0, hw1) = encode_b_w_uncond(1000);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1945,7 +1952,7 @@ fn b_w_uncond_forward() {
 #[test]
 fn b_w_uncond_backward() {
     // B.W -100 (unconditional backward)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x2000);
     let (hw0, hw1) = encode_b_w_uncond(-100);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -1961,7 +1968,7 @@ fn b_w_uncond_backward() {
 #[test]
 fn bl_still_works() {
     // Verify existing BL functionality routes through the new dispatch
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     // BL +100: same encoding as the existing bl_forward test
     let cy = c.execute_one_wide(0xF000, 0xF832);
@@ -1977,7 +1984,7 @@ fn bl_still_works() {
 #[test]
 fn nop_w() {
     // NOP.W: hw0=0xF3AF, hw1=0x8000
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_pc(0x1000);
     let cy = c.execute_one_wide(0xF3AF, 0x8000);
     // PC should advance normally (set by execute_one_wide to 0x1004)
@@ -1987,7 +1994,7 @@ fn nop_w() {
 
 #[test]
 fn dsb_dmb_isb() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
 
     // DSB: hw0=0xF3BF, hw1=0x8F4F (option=0xF, barrier_op=4)
     c.regs.set_pc(0x1000);
@@ -2007,7 +2014,7 @@ fn dsb_dmb_isb() {
 
 #[test]
 fn clrex_is_nop() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let cy = c.execute_one_wide(0xF3BF, 0x8F2F);
     assert_eq!(cy, 1);
 }
@@ -2192,7 +2199,7 @@ fn push_w_pop_w_roundtrip() {
 #[test]
 fn lsl_w_reg() {
     // LSL.W R0, R1, R2: hw0=0xFA01, hw1=0xF002
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_0003);
     c.set_reg(2, 4);
     let cy = c.execute_one_wide(0xFA01, 0xF002);
@@ -2203,7 +2210,7 @@ fn lsl_w_reg() {
 #[test]
 fn lsr_w_reg() {
     // LSR.W R0, R1, R2: hw0=0xFA21, hw1=0xF002
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_FF00);
     c.set_reg(2, 8);
     let cy = c.execute_one_wide(0xFA21, 0xF002);
@@ -2214,7 +2221,7 @@ fn lsr_w_reg() {
 #[test]
 fn asr_w_reg() {
     // ASR.W R0, R1, R2: hw0=0xFA41, hw1=0xF002
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x8000_0000); // negative value
     c.set_reg(2, 4);
     let cy = c.execute_one_wide(0xFA41, 0xF002);
@@ -2225,7 +2232,7 @@ fn asr_w_reg() {
 #[test]
 fn ror_w_reg() {
     // ROR.W R0, R1, R2: hw0=0xFA61, hw1=0xF002
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_00FF);
     c.set_reg(2, 4);
     let cy = c.execute_one_wide(0xFA61, 0xF002);
@@ -2236,7 +2243,7 @@ fn ror_w_reg() {
 #[test]
 fn lsls_w_reg_flags() {
     // LSLS.W R0, R1, R2 (S=1): hw0=0xFA11, hw1=0xF002
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x8000_0001); // bit 31 set
     c.set_reg(2, 1);           // shift left by 1
     let cy = c.execute_one_wide(0xFA11, 0xF002);
@@ -2250,7 +2257,7 @@ fn lsls_w_reg_flags() {
 #[test]
 fn sxth_w() {
     // SXTH R0, R1: hw0=0xFA0F, hw1=0xF081
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_FF80); // halfword 0xFF80 = -128 as i16
     let cy = c.execute_one_wide(0xFA0F, 0xF081);
     assert_eq!(c.reg(0), 0xFFFF_FF80); // sign-extended to 32 bits
@@ -2260,7 +2267,7 @@ fn sxth_w() {
 #[test]
 fn sxtb_w() {
     // SXTB R0, R1: hw0=0xFA4F, hw1=0xF081
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_0090); // byte 0x90 = -112 as i8
     let cy = c.execute_one_wide(0xFA4F, 0xF081);
     assert_eq!(c.reg(0), 0xFFFF_FF90); // sign-extended
@@ -2270,7 +2277,7 @@ fn sxtb_w() {
 #[test]
 fn uxth_w() {
     // UXTH R0, R1: hw0=0xFA1F, hw1=0xF081
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xDEAD_BEEF);
     let cy = c.execute_one_wide(0xFA1F, 0xF081);
     assert_eq!(c.reg(0), 0x0000_BEEF); // zero-extended halfword
@@ -2280,7 +2287,7 @@ fn uxth_w() {
 #[test]
 fn uxtb_w() {
     // UXTB R0, R1: hw0=0xFA5F, hw1=0xF081
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xDEAD_BEEF);
     let cy = c.execute_one_wide(0xFA5F, 0xF081);
     assert_eq!(c.reg(0), 0x0000_00EF); // zero-extended byte
@@ -2290,7 +2297,7 @@ fn uxtb_w() {
 #[test]
 fn rev_w() {
     // REV.W R0, R1: hw0=0xFA91, hw1=0xF081
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x12345678);
     let cy = c.execute_one_wide(0xFA91, 0xF081);
     assert_eq!(c.reg(0), 0x78563412);
@@ -2300,7 +2307,7 @@ fn rev_w() {
 #[test]
 fn rev16_w() {
     // REV16.W R0, R1: hw0=0xFA91, hw1=0xF091
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xAABB_CCDD);
     let cy = c.execute_one_wide(0xFA91, 0xF091);
     assert_eq!(c.reg(0), 0xBBAA_DDCC);
@@ -2310,7 +2317,7 @@ fn rev16_w() {
 #[test]
 fn revsh_w() {
     // REVSH.W R0, R1: hw0=0xFA91, hw1=0xF0B1
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_01FF); // low halfword 0x01FF, byte-swapped = 0xFF01 = -255 as i16
     let cy = c.execute_one_wide(0xFA91, 0xF0B1);
     assert_eq!(c.reg(0), 0xFFFF_FF01); // sign-extended to 32 bits
@@ -2320,7 +2327,7 @@ fn revsh_w() {
 #[test]
 fn rbit_w() {
     // RBIT R0, R1: hw0=0xFA91, hw1=0xF0A1
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x8000_0000); // only bit 31 set
     let cy = c.execute_one_wide(0xFA91, 0xF0A1);
     assert_eq!(c.reg(0), 0x0000_0001); // reversed → only bit 0 set
@@ -2330,7 +2337,7 @@ fn rbit_w() {
 #[test]
 fn clz_w() {
     // CLZ R0, R1: hw0=0xFAB1, hw1=0xF081
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0010_0000); // bit 20 set → 11 leading zeros
     let cy = c.execute_one_wide(0xFAB1, 0xF081);
     assert_eq!(c.reg(0), 11);
@@ -2340,7 +2347,7 @@ fn clz_w() {
 #[test]
 fn clz_zero() {
     // CLZ of 0 → 32
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0);
     let cy = c.execute_one_wide(0xFAB1, 0xF081);
     assert_eq!(c.reg(0), 32);
@@ -2419,7 +2426,7 @@ fn encode_udiv(rd: u8, rn: u8, rm: u8) -> (u16, u16) {
 #[test]
 fn mul_w() {
     // MUL R0, R1, R2: 7 * 6 = 42
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 7);
     c.set_reg(2, 6);
     let (hw0, hw1) = encode_mul_w(0, 1, 2);
@@ -2431,7 +2438,7 @@ fn mul_w() {
 #[test]
 fn mla_w() {
     // MLA R0, R1, R2, R3: 3 * 4 + 5 = 17
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 3);
     c.set_reg(2, 4);
     c.set_reg(3, 5);
@@ -2444,7 +2451,7 @@ fn mla_w() {
 #[test]
 fn mls_w() {
     // MLS R0, R1, R2, R3: 100 - 7 * 6 = 58
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 7);
     c.set_reg(2, 6);
     c.set_reg(3, 100);
@@ -2457,7 +2464,7 @@ fn mls_w() {
 #[test]
 fn smull_basic() {
     // SMULL R0, R1, R2, R3: 100_000 * 200 = 20_000_000
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(2, 100_000);
     c.set_reg(3, 200);
     let (hw0, hw1) = encode_smull(0, 1, 2, 3);
@@ -2470,7 +2477,7 @@ fn smull_basic() {
 #[test]
 fn smull_negative() {
     // SMULL R0, R1, R2, R3: (-3) * 7 = -21
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(2, (-3i32) as u32);
     c.set_reg(3, 7);
     let (hw0, hw1) = encode_smull(0, 1, 2, 3);
@@ -2483,7 +2490,7 @@ fn smull_negative() {
 #[test]
 fn umull_basic() {
     // UMULL R0, R1, R2, R3: 1000 * 2000 = 2_000_000
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(2, 1000);
     c.set_reg(3, 2000);
     let (hw0, hw1) = encode_umull(0, 1, 2, 3);
@@ -2496,7 +2503,7 @@ fn umull_basic() {
 #[test]
 fn umull_large() {
     // UMULL R0, R1, R2, R3: 0xFFFF_FFFF * 2 = 0x1_FFFF_FFFE
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(2, 0xFFFF_FFFF);
     c.set_reg(3, 2);
     let (hw0, hw1) = encode_umull(0, 1, 2, 3);
@@ -2509,7 +2516,7 @@ fn umull_large() {
 #[test]
 fn sdiv_basic() {
     // SDIV R0, R1, R2: 100 / 7 = 14
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.set_reg(2, 7);
     let (hw0, hw1) = encode_sdiv(0, 1, 2);
@@ -2522,7 +2529,7 @@ fn sdiv_basic() {
 #[test]
 fn sdiv_negative() {
     // SDIV R0, R1, R2: -100 / 7 = -14
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, (-100i32) as u32);
     c.set_reg(2, 7);
     let (hw0, hw1) = encode_sdiv(0, 1, 2);
@@ -2535,7 +2542,7 @@ fn sdiv_negative() {
 #[test]
 fn sdiv_by_zero() {
     // SDIV R0, R1, R2: 42 / 0 = 0
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xDEAD_BEEF); // should be overwritten
     c.set_reg(1, 42);
     c.set_reg(2, 0);
@@ -2548,7 +2555,7 @@ fn sdiv_by_zero() {
 #[test]
 fn udiv_basic() {
     // UDIV R0, R1, R2: 100 / 7 = 14
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.set_reg(2, 7);
     let (hw0, hw1) = encode_udiv(0, 1, 2);
@@ -2561,7 +2568,7 @@ fn udiv_basic() {
 #[test]
 fn udiv_by_zero() {
     // UDIV R0, R1, R2: 42 / 0 = 0
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xDEAD_BEEF);
     c.set_reg(1, 42);
     c.set_reg(2, 0);
@@ -2574,7 +2581,7 @@ fn udiv_by_zero() {
 #[test]
 fn smlal_basic() {
     // SMLAL R0, R1, R2, R3: accumulator=1000, product=3*7=21, result=1021
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 1000); // rd_lo (accumulator low)
     c.set_reg(1, 0);    // rd_hi (accumulator high)
     c.set_reg(2, 3);    // rn
@@ -2589,7 +2596,7 @@ fn smlal_basic() {
 #[test]
 fn umlal_basic() {
     // UMLAL R0, R1, R2, R3: accumulator=500, product=100*200=20000, result=20500
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 500);  // rd_lo
     c.set_reg(1, 0);    // rd_hi
     c.set_reg(2, 100);  // rn
@@ -2630,7 +2637,7 @@ fn encode_dp_shifted_reg(
 #[test]
 fn add_w_shifted_reg() {
     // ADD.W R0, R1, R2, LSL #2 → R0 = R1 + (R2 << 2) = 10 + (3 << 2) = 22
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 10);
     c.set_reg(2, 3);
     let (hw0, hw1) = encode_dp_shifted_reg(0b1000, false, 1, 0, 2, 0b00, 2);
@@ -2642,7 +2649,7 @@ fn add_w_shifted_reg() {
 #[test]
 fn sub_w_shifted_reg() {
     // SUB.W R0, R1, R2, LSR #1 → R0 = R1 - (R2 >> 1) = 100 - (20 >> 1) = 90
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.set_reg(2, 20);
     let (hw0, hw1) = encode_dp_shifted_reg(0b1101, false, 1, 0, 2, 0b01, 1);
@@ -2655,7 +2662,7 @@ fn sub_w_shifted_reg() {
 fn and_w_shifted_reg() {
     // AND.W R0, R1, R2 (no shift, LSL #0)
     // R0 = R1 & R2 = 0xFF00_FF00 & 0x00FF_00FF = 0x0000_0000
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xFF00_FF00);
     c.set_reg(2, 0x00FF_00FF);
     let (hw0, hw1) = encode_dp_shifted_reg(0b0000, false, 1, 0, 2, 0b00, 0);
@@ -2669,7 +2676,7 @@ fn cmp_w_shifted_reg() {
     // CMP.W R1, R2, ASR #3 (S=1, Rd=15 → flags only, no write)
     // R1=100, R2=0x80 (128). ASR #3 = 128 >> 3 = 16.
     // 100 - 16 = 84 → positive, no borrow, no overflow.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.set_reg(2, 128);
     let (hw0, hw1) = encode_dp_shifted_reg(0b1101, true, 1, 15, 2, 0b10, 3);
@@ -2685,7 +2692,7 @@ fn cmp_w_shifted_reg() {
 fn mov_w_shift_imm() {
     // LSL.W R0, R1, #4 — encoded as MOV variant: op=0010, Rn=15
     // R0 = R1 << 4 = 0xA << 4 = 0xA0
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xA);
     let (hw0, hw1) = encode_dp_shifted_reg(0b0010, false, 15, 0, 1, 0b00, 4);
     let cy = c.execute_one_wide(hw0, hw1);
@@ -2698,7 +2705,7 @@ fn rrx_w() {
     // RRX R0, R1 — shift_type=11, amount=0 → rotate right through carry
     // R1 = 0x0000_0003, carry_in = 1
     // RRX: result = (1 << 31) | (3 >> 1) = 0x8000_0001, carry_out = bit[0] of 3 = 1
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0000_0003);
     c.regs.set_flag_c(true);
     // MOV variant: op=0010, Rn=15, S=1 to see carry_out
@@ -2717,7 +2724,7 @@ fn orr_w_shifted() {
     // R1 = 0xFF00_0000, R2 = 0x0000_00AB
     // R2 ROR 8 = 0xAB00_0000
     // R0 = 0xFF00_0000 | 0xAB00_0000 = 0xFF00_0000
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xFF00_0000);
     c.set_reg(2, 0x0000_00AB);
     let (hw0, hw1) = encode_dp_shifted_reg(0b0010, false, 1, 0, 2, 0b11, 8);
@@ -2860,7 +2867,7 @@ fn tbh_basic() {
 #[test]
 fn msr_primask() {
     // MSR PRIMASK, R0 — write 1 to PRIMASK, then MRS R1, PRIMASK to read back
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 1);
     // MSR PRIMASK, R0: hw0=0xF380 (Rn=0), hw1=0x8010 (SYSm=16)
     let cy = c.execute_one_wide(0xF380, 0x8010);
@@ -2876,7 +2883,7 @@ fn msr_primask() {
 #[test]
 fn msr_basepri() {
     // MSR BASEPRI, R0 — write 0x40 to BASEPRI
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x40);
     // MSR BASEPRI, R0: hw0=0xF380, hw1=0x8011 (SYSm=17)
     c.execute_one_wide(0xF380, 0x8011);
@@ -2890,7 +2897,7 @@ fn msr_basepri() {
 #[test]
 fn mrs_apsr_flags() {
     // Set NZCV flags, then MRS R0, APSR to read them back
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.set_nzcv(true, false, true, false); // N=1, Z=0, C=1, V=0
     // MRS R0, APSR: hw0=0xF3EF, hw1=0x8000 (Rd=0, SYSm=0)
     let cy = c.execute_one_wide(0xF3EF, 0x8000);
@@ -2902,7 +2909,7 @@ fn mrs_apsr_flags() {
 #[test]
 fn msr_msp() {
     // MSR MSP, R0 — write to MSP, verify R13 changes (default uses MSP)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x2000_1000);
     // MSR MSP, R0: hw0=0xF380, hw1=0x8008 (SYSm=8)
     c.execute_one_wide(0xF380, 0x8008);
@@ -2914,7 +2921,7 @@ fn msr_msp() {
 #[test]
 fn msr_psp() {
     // MSR PSP, R0 — write to PSP (R13 shouldn't change since SPSEL=0)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x2000_2000);
     // MSR PSP, R0: hw0=0xF380, hw1=0x8009 (SYSm=9)
     c.execute_one_wide(0xF380, 0x8009);
@@ -2926,7 +2933,7 @@ fn msr_psp() {
 #[test]
 fn msr_control_spsel() {
     // Write CONTROL.SPSEL=1 to switch from MSP to PSP, verify SP switches
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
 
     // Set up MSP and PSP values
     c.regs.msp = 0x2000_1000;
@@ -2958,7 +2965,7 @@ fn msr_control_spsel() {
 #[test]
 fn mrs_ipsr() {
     // MRS R0, IPSR — should be 0 in thread mode (no exception active)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // MRS R0, IPSR: hw0=0xF3EF, hw1=0x8005 (Rd=0, SYSm=5)
     c.execute_one_wide(0xF3EF, 0x8005);
     assert_eq!(c.reg(0), 0);
@@ -3407,7 +3414,7 @@ fn enc_vcvtt_f32_f16(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0011, 1, sd, 
 
 #[test]
 fn fpu_vadd_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.5;
     c.regs.s[4] = 2.5;
     let (hw0, hw1) = enc_vadd(0, 2, 4); // VADD.F32 S0, S2, S4
@@ -3418,7 +3425,7 @@ fn fpu_vadd_f32() {
 
 #[test]
 fn fpu_vsub_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 10.0;
     c.regs.s[4] = 3.5;
     let (hw0, hw1) = enc_vsub(0, 2, 4); // VSUB.F32 S0, S2, S4
@@ -3428,7 +3435,7 @@ fn fpu_vsub_f32() {
 
 #[test]
 fn fpu_vmul_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 3.0;
     c.regs.s[4] = 4.0;
     let (hw0, hw1) = enc_vmul(0, 2, 4);
@@ -3438,7 +3445,7 @@ fn fpu_vmul_f32() {
 
 #[test]
 fn fpu_vdiv_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 10.0;
     c.regs.s[4] = 3.0;
     let (hw0, hw1) = enc_vdiv(0, 2, 4);
@@ -3450,7 +3457,7 @@ fn fpu_vdiv_f32() {
 
 #[test]
 fn fpu_vneg_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 5.0;
     let (hw0, hw1) = enc_vneg(0, 2); // VNEG.F32 S0, S2
     c.execute_one_wide(hw0, hw1);
@@ -3459,7 +3466,7 @@ fn fpu_vneg_f32() {
 
 #[test]
 fn fpu_vabs_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = -7.5;
     let (hw0, hw1) = enc_vabs(0, 2); // VABS.F32 S0, S2
     c.execute_one_wide(hw0, hw1);
@@ -3468,7 +3475,7 @@ fn fpu_vabs_f32() {
 
 #[test]
 fn fpu_vsqrt_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 4.0;
     let (hw0, hw1) = enc_vsqrt(0, 2); // VSQRT.F32 S0, S2
     let cy = c.execute_one_wide(hw0, hw1);
@@ -3478,7 +3485,7 @@ fn fpu_vsqrt_f32() {
 
 #[test]
 fn fpu_vcmp_f32_equal() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 3.0;
     c.regs.s[2] = 3.0;
     let (hw0, hw1) = enc_vcmp(0, 2); // VCMP.F32 S0, S2
@@ -3489,7 +3496,7 @@ fn fpu_vcmp_f32_equal() {
 
 #[test]
 fn fpu_vcmp_f32_less() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 1.0;
     c.regs.s[2] = 3.0;
     let (hw0, hw1) = enc_vcmp(0, 2);
@@ -3500,7 +3507,7 @@ fn fpu_vcmp_f32_less() {
 
 #[test]
 fn fpu_vcmp_f32_greater() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 5.0;
     c.regs.s[2] = 2.0;
     let (hw0, hw1) = enc_vcmp(0, 2);
@@ -3511,7 +3518,7 @@ fn fpu_vcmp_f32_greater() {
 
 #[test]
 fn fpu_vcmp_f32_nan() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = f32::NAN;
     c.regs.s[2] = 1.0;
     let (hw0, hw1) = enc_vcmp(0, 2);
@@ -3522,7 +3529,7 @@ fn fpu_vcmp_f32_nan() {
 
 #[test]
 fn fpu_vcmp_f32_zero() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 0.0;
     let (hw0, hw1) = enc_vcmp_zero(0); // VCMP.F32 S0, #0.0
     c.execute_one_wide(hw0, hw1);
@@ -3532,7 +3539,7 @@ fn fpu_vcmp_f32_zero() {
 
 #[test]
 fn fpu_vcvt_f32_s32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // Store -42 as raw bits in S2
     c.regs.s[2] = f32::from_bits((-42i32) as u32);
     let (hw0, hw1) = enc_vcvt_f32_s32(0, 2); // VCVT.F32.S32 S0, S2
@@ -3542,7 +3549,7 @@ fn fpu_vcvt_f32_s32() {
 
 #[test]
 fn fpu_vcvt_f32_u32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(100u32);
     let (hw0, hw1) = enc_vcvt_f32_u32(0, 2); // VCVT.F32.U32 S0, S2
     c.execute_one_wide(hw0, hw1);
@@ -3551,7 +3558,7 @@ fn fpu_vcvt_f32_u32() {
 
 #[test]
 fn fpu_vcvt_s32_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = -3.7;
     let (hw0, hw1) = enc_vcvt_s32_f32(0, 2); // VCVT.S32.F32 S0, S2
     c.execute_one_wide(hw0, hw1);
@@ -3561,7 +3568,7 @@ fn fpu_vcvt_s32_f32() {
 
 #[test]
 fn fpu_vcvt_u32_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 7.9;
     let (hw0, hw1) = enc_vcvt_u32_f32(0, 2); // VCVT.U32.F32 S0, S2
     c.execute_one_wide(hw0, hw1);
@@ -3570,7 +3577,7 @@ fn fpu_vcvt_u32_f32() {
 
 #[test]
 fn fpu_vmov_arm_to_fpu() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(3, 0x4048_0000); // 3.125f32.to_bits()
     let (hw0, hw1) = enc_vmov_to_fpu(0, 3); // VMOV S0, R3
     c.execute_one_wide(hw0, hw1);
@@ -3579,7 +3586,7 @@ fn fpu_vmov_arm_to_fpu() {
 
 #[test]
 fn fpu_vmov_fpu_to_arm() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 3.125;
     let (hw0, hw1) = enc_vmov_to_arm(3, 0); // VMOV R3, S0
     c.execute_one_wide(hw0, hw1);
@@ -3588,7 +3595,7 @@ fn fpu_vmov_fpu_to_arm() {
 
 #[test]
 fn fpu_vmrs_fpscr_to_apsr() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // Set up: compare S0 < S2 → FPSCR.N=1
     c.regs.s[0] = 1.0;
     c.regs.s[2] = 5.0;
@@ -3604,7 +3611,7 @@ fn fpu_vmrs_fpscr_to_apsr() {
 
 #[test]
 fn fpu_vmsr_fpscr() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(2, 0x0040_0000); // Set FPSCR.RMode = 01 (round toward +inf)
     let (hw0, hw1) = enc_vmsr(2); // VMSR FPSCR, R2
     c.execute_one_wide(hw0, hw1);
@@ -3690,7 +3697,7 @@ fn fpu_vpush_vpop() {
 
 #[test]
 fn fpu_vmla_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 10.0; // accumulator
     c.regs.s[2] = 3.0;
     c.regs.s[4] = 4.0;
@@ -3702,7 +3709,7 @@ fn fpu_vmla_f32() {
 
 #[test]
 fn fpu_vmls_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 10.0;
     c.regs.s[2] = 3.0;
     c.regs.s[4] = 2.0;
@@ -3713,7 +3720,7 @@ fn fpu_vmls_f32() {
 
 #[test]
 fn fpu_vnmul_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 3.0;
     c.regs.s[4] = 5.0;
     let (hw0, hw1) = enc_vnmul(0, 2, 4); // VNMUL.F32 S0, S2, S4 → S0 = -(3*5) = -15
@@ -3723,7 +3730,7 @@ fn fpu_vnmul_f32() {
 
 #[test]
 fn fpu_vnmla_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 1.0;
     c.regs.s[2] = 2.0;
     c.regs.s[4] = 3.0;
@@ -3734,7 +3741,7 @@ fn fpu_vnmla_f32() {
 
 #[test]
 fn fpu_vnmls_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 1.0;
     c.regs.s[2] = 2.0;
     c.regs.s[4] = 3.0;
@@ -3745,7 +3752,7 @@ fn fpu_vnmls_f32() {
 
 #[test]
 fn fpu_vfma_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 1.0;
     c.regs.s[2] = 2.0;
     c.regs.s[4] = 3.0;
@@ -3757,7 +3764,7 @@ fn fpu_vfma_f32() {
 
 #[test]
 fn fpu_vfms_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 10.0;
     c.regs.s[2] = 2.0;
     c.regs.s[4] = 3.0;
@@ -3768,7 +3775,7 @@ fn fpu_vfms_f32() {
 
 #[test]
 fn fpu_vfnma_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 1.0;
     c.regs.s[2] = 2.0;
     c.regs.s[4] = 3.0;
@@ -3779,7 +3786,7 @@ fn fpu_vfnma_f32() {
 
 #[test]
 fn fpu_vfnms_f32() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[0] = 1.0;
     c.regs.s[2] = 2.0;
     c.regs.s[4] = 3.0;
@@ -3790,7 +3797,7 @@ fn fpu_vfnms_f32() {
 
 #[test]
 fn fpu_vmov_f32_reg() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[4] = 42.0;
     let (hw0, hw1) = enc_vmov_reg(0, 4); // VMOV.F32 S0, S4
     c.execute_one_wide(hw0, hw1);
@@ -3799,7 +3806,7 @@ fn fpu_vmov_f32_reg() {
 
 #[test]
 fn fpu_vmrs_to_register() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = 0x1234_5678;
     let (hw0, hw1) = enc_vmrs(3); // VMRS R3, FPSCR
     c.execute_one_wide(hw0, hw1);
@@ -3808,7 +3815,7 @@ fn fpu_vmrs_to_register() {
 
 #[test]
 fn fpu_vcvtr_s32_f32_round_nearest() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = 0; // RMode=00 → round to nearest
     c.regs.s[2] = 2.5;
     let (hw0, hw1) = enc_vcvtr_s32_f32(0, 2);
@@ -3820,7 +3827,7 @@ fn fpu_vcvtr_s32_f32_round_nearest() {
 #[test]
 fn fpu_high_register_encoding() {
     // Test that high register indices (S16-S31) are correctly encoded/decoded.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[16] = 100.0;
     c.regs.s[20] = 200.0;
     let (hw0, hw1) = enc_vadd(24, 16, 20); // VADD.F32 S24, S16, S20
@@ -3830,7 +3837,7 @@ fn fpu_high_register_encoding() {
 
 #[test]
 fn fpu_vcvt_negative_float_to_unsigned() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = -5.0;
     let (hw0, hw1) = enc_vcvt_u32_f32(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -3840,7 +3847,7 @@ fn fpu_vcvt_negative_float_to_unsigned() {
 
 #[test]
 fn fpu_vcvt_nan_to_int() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::NAN;
     let (hw0, hw1) = enc_vcvt_s32_f32(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -3850,7 +3857,7 @@ fn fpu_vcvt_nan_to_int() {
 #[test]
 fn fpu_vmov_odd_register() {
     // Test VMOV with an odd-numbered S register (S1) to exercise the N/D bit encoding.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xDEAD_BEEF);
     let (hw0, hw1) = enc_vmov_to_fpu(1, 0); // VMOV S1, R0
     c.execute_one_wide(hw0, hw1);
@@ -3867,7 +3874,7 @@ fn fpu_vmov_odd_register() {
 #[test]
 fn fpu_vseleq_true_picks_sn() {
     // Z=1 → condition EQ true → Sd = Sn
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.0;
     c.regs.s[4] = 2.0;
     c.regs.set_flag_z(true);
@@ -3880,7 +3887,7 @@ fn fpu_vseleq_true_picks_sn() {
 #[test]
 fn fpu_vseleq_false_picks_sm() {
     // Z=0 → condition EQ false → Sd = Sm
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.0;
     c.regs.s[4] = 2.0;
     c.regs.set_flag_z(false);
@@ -3892,7 +3899,7 @@ fn fpu_vseleq_false_picks_sm() {
 #[test]
 fn fpu_vselvs_true_picks_sn() {
     // V=1 → condition VS true → Sd = Sn
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 3.0;
     c.regs.s[4] = 4.0;
     c.regs.set_flag_v(true);
@@ -3903,7 +3910,7 @@ fn fpu_vselvs_true_picks_sn() {
 
 #[test]
 fn fpu_vselvs_false_picks_sm() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 3.0;
     c.regs.s[4] = 4.0;
     c.regs.set_flag_v(false);
@@ -3915,7 +3922,7 @@ fn fpu_vselvs_false_picks_sm() {
 #[test]
 fn fpu_vselge_true_picks_sn() {
     // GE: N==V → true
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 5.0;
     c.regs.s[4] = 6.0;
     c.regs.set_flag_n(true);
@@ -3928,7 +3935,7 @@ fn fpu_vselge_true_picks_sn() {
 #[test]
 fn fpu_vselge_false_picks_sm() {
     // N != V → GE false
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 5.0;
     c.regs.s[4] = 6.0;
     c.regs.set_flag_n(true);
@@ -3941,7 +3948,7 @@ fn fpu_vselge_false_picks_sm() {
 #[test]
 fn fpu_vselgt_true_picks_sn() {
     // GT: Z==0 && N==V → true
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 7.0;
     c.regs.s[4] = 8.0;
     c.regs.set_flag_z(false);
@@ -3955,7 +3962,7 @@ fn fpu_vselgt_true_picks_sn() {
 #[test]
 fn fpu_vselgt_false_picks_sm() {
     // Z=1 → GT false (even with N==V)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 7.0;
     c.regs.s[4] = 8.0;
     c.regs.set_flag_z(true);
@@ -3979,7 +3986,7 @@ fn fpu_vsel_gt_all_flag_combos() {
     let (hw0, hw1) = enc_vsel(3, 0, 2, 4); // cc=11 (GT)
 
     // Case: N==V==true → picks Sn
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 7.0;
     c.regs.s[4] = 8.0;
     c.regs.set_flag_z(false);
@@ -3989,7 +3996,7 @@ fn fpu_vsel_gt_all_flag_combos() {
     assert_eq!(c.regs.s[0], 7.0, "N==V==true should select Sn");
 
     // Case: N=1, V=0 → N!=V → picks Sm
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 7.0;
     c.regs.s[4] = 8.0;
     c.regs.set_flag_z(false);
@@ -3999,7 +4006,7 @@ fn fpu_vsel_gt_all_flag_combos() {
     assert_eq!(c.regs.s[0], 8.0, "N!=V (N=1,V=0) should select Sm");
 
     // Case: N=0, V=1 → N!=V → picks Sm
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 7.0;
     c.regs.s[4] = 8.0;
     c.regs.set_flag_z(false);
@@ -4010,7 +4017,7 @@ fn fpu_vsel_gt_all_flag_combos() {
 
     // Case: N==V==false → picks Sn (already covered by fpu_vselgt_true_picks_sn,
     // repeated here to keep the full truth table visible in one place).
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 7.0;
     c.regs.s[4] = 8.0;
     c.regs.set_flag_z(false);
@@ -4026,7 +4033,7 @@ fn fpu_vcvta_is_undefined() {
     // is not dispatched in Phase 7.1 and must fall through to UNDEFINED,
     // raising a UsageFault. This test locks in the boundary — if future
     // dispatch work accidentally routes VCVTA somewhere, this breaks.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.execute_one_wide(0xFEBD, 0x0A40);
     assert!(
         matches!(c.pending_fault, Some(crate::core::Fault::UsageFault)),
@@ -4040,7 +4047,7 @@ fn fpu_vcvta_is_undefined() {
 
 #[test]
 fn fpu_vmaxnm_normal() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.5;
     c.regs.s[4] = 2.5;
     let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
@@ -4052,7 +4059,7 @@ fn fpu_vmaxnm_normal() {
 #[test]
 fn fpu_vmaxnm_nan_returns_other() {
     // IEEE 754-2008 maxNum: NaN operand returns the non-NaN operand.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::NAN;
     c.regs.s[4] = -3.0;
     let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
@@ -4076,7 +4083,7 @@ fn fpu_vmaxnm_nan_returns_other() {
 
 #[test]
 fn fpu_vminnm_normal() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.5;
     c.regs.s[4] = 2.5;
     let (hw0, hw1) = enc_vminnm(0, 2, 4);
@@ -4087,7 +4094,7 @@ fn fpu_vminnm_normal() {
 
 #[test]
 fn fpu_vminnm_nan_returns_other() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::NAN;
     c.regs.s[4] = 4.0;
     let (hw0, hw1) = enc_vminnm(0, 2, 4);
@@ -4105,7 +4112,7 @@ fn fpu_vminnm_nan_returns_other() {
 #[test]
 fn fpu_vmaxnm_zero_signs() {
     // IEEE 754-2008 §5.3.1: maxNum(+0, -0) = +0 in both operand orders.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
 
     // (+0, -0)
     c.regs.s[2] = 0.0f32;
@@ -4125,7 +4132,7 @@ fn fpu_vmaxnm_zero_signs() {
 #[test]
 fn fpu_vminnm_zero_signs() {
     // IEEE 754-2008 §5.3.1: minNum(+0, -0) = -0 in both operand orders.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
 
     // (+0, -0)
     c.regs.s[2] = 0.0f32;
@@ -4160,7 +4167,7 @@ const FPSCR_DN: u32 = 1 << 25;
 #[test]
 fn fpscr_ixc_on_inexact_division() {
     // 1.0 / 3.0 is inexact in f32 → IXC set.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.0;
     c.regs.s[4] = 3.0;
     let (hw0, hw1) = enc_vdiv(0, 2, 4);
@@ -4175,7 +4182,7 @@ fn fpscr_ixc_on_inexact_division() {
 #[test]
 fn fpscr_dzc_on_divide_by_zero() {
     // 1.0 / 0.0 = +inf, DZC set, IOC clear.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.0;
     c.regs.s[4] = 0.0;
     let (hw0, hw1) = enc_vdiv(0, 2, 4);
@@ -4188,7 +4195,7 @@ fn fpscr_dzc_on_divide_by_zero() {
 #[test]
 fn fpscr_ioc_on_zero_divided_by_zero() {
     // 0.0 / 0.0 = NaN, IOC set.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 0.0;
     c.regs.s[4] = 0.0;
     let (hw0, hw1) = enc_vdiv(0, 2, 4);
@@ -4201,7 +4208,7 @@ fn fpscr_ioc_on_zero_divided_by_zero() {
 #[test]
 fn fpscr_ofc_on_multiplication_overflow() {
     // 1e20 * 1e20 = 1e40 which overflows f32 → ±inf, OFC+IXC.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1e20;
     c.regs.s[4] = 1e20;
     let (hw0, hw1) = enc_vmul(0, 2, 4);
@@ -4215,7 +4222,7 @@ fn fpscr_ofc_on_multiplication_overflow() {
 fn fpscr_ufc_on_ftz_flush() {
     // With FZ=1, 1e-20 * 1e-20 (tininess before rounding) flushes to ±0
     // and sets UFC+IXC.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_FZ;
     c.regs.s[2] = 1e-20;
     c.regs.s[4] = 1e-20;
@@ -4229,7 +4236,7 @@ fn fpscr_ufc_on_ftz_flush() {
 #[test]
 fn fpscr_idc_on_denormal_input() {
     // VADD with a denormal input sets IDC (even when FZ=0).
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let denorm = f32::from_bits(0x0000_0001); // smallest positive subnormal
     c.regs.s[2] = denorm;
     c.regs.s[4] = 1.0;
@@ -4241,7 +4248,7 @@ fn fpscr_idc_on_denormal_input() {
 #[test]
 fn fpscr_dn_replaces_nan_with_canonical() {
     // With DN=1, any NaN result becomes 0x7FC0_0000 (no payload preservation).
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_DN;
     // Hand-craft a quiet NaN with a custom payload.
     c.regs.s[2] = f32::from_bits(0x7FC1_2345);
@@ -4259,7 +4266,7 @@ fn fpscr_dn_replaces_nan_with_canonical() {
 #[test]
 fn fpscr_flags_are_sticky_across_ops() {
     // Set IXC by one op, then execute an exact op; IXC must remain set.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.0;
     c.regs.s[4] = 3.0;
     let (hw0, hw1) = enc_vdiv(0, 2, 4); // inexact → IXC
@@ -4279,7 +4286,7 @@ fn fpscr_flags_are_sticky_across_ops() {
 
 #[test]
 fn fpscr_sqrt_negative_sets_ioc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = -4.0;
     let (hw0, hw1) = enc_vsqrt(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4290,7 +4297,7 @@ fn fpscr_sqrt_negative_sets_ioc() {
 #[test]
 fn fpscr_vmaxnm_snan_sets_ioc() {
     // Per DDI0553: VMAXNM/VMINNM set IOC when either input is sNaN.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     let snan = f32::from_bits(0x7F80_0001);
     c.regs.s[2] = snan;
     c.regs.s[4] = 1.0;
@@ -4308,7 +4315,7 @@ fn fpu_vnmul_nan_sign_flipped_dn_off() {
     // sign-bit flip, *including* for NaN. With DN=0 the canonicalized
     // quiet NaN from fp_mul is positive (0x7FC0_0000); negation must make
     // the stored result negative (0xFFC0_0000).
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::NAN;
     c.regs.s[4] = 1.0;
     let (hw0, hw1) = enc_vnmul(0, 2, 4);
@@ -4327,7 +4334,7 @@ fn fpu_vnmul_nan_sign_flipped_dn_off() {
 fn fpu_vnmul_nan_canonical_dn_on() {
     // Same as above but with DN=1: the negated NaN must be re-canonicalized
     // back to the positive canonical quiet NaN 0x7FC0_0000.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_DN;
     c.regs.s[2] = f32::NAN;
     c.regs.s[4] = 1.0;
@@ -4343,7 +4350,7 @@ fn fpu_vnmul_nan_canonical_dn_on() {
 
 #[test]
 fn fpscr_add_inf_minus_inf_sets_ioc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::INFINITY;
     c.regs.s[4] = f32::NEG_INFINITY;
     let (hw0, hw1) = enc_vadd(0, 2, 4);
@@ -4357,7 +4364,7 @@ fn fpscr_add_inf_minus_inf_sets_ioc() {
 #[test]
 fn fpu_vcvtb_f16_f32_roundtrip_bottom() {
     // Round-trip 1.5 through bottom half: f32 -> f16 (bottom of Sd) -> f32.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.5f32;
     // Preserve a known top half so we can verify it survives.
     c.regs.s[0] = f32::from_bits(0xDEAD_0000);
@@ -4377,7 +4384,7 @@ fn fpu_vcvtb_f16_f32_roundtrip_bottom() {
 
 #[test]
 fn fpu_vcvtt_f16_f32_roundtrip_top() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1.5f32;
     // Preserve known bottom half
     c.regs.s[0] = f32::from_bits(0x0000_BEEF);
@@ -4397,7 +4404,7 @@ fn fpu_vcvtt_f16_f32_roundtrip_top() {
 #[test]
 fn fpu_vcvtb_f32_f16_infinity() {
     // Half-precision +infinity is 0x7C00. Converting to f32 should give f32::INFINITY.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(0x0000_7C00); // bottom half = +inf (h)
     let (hw0, hw1) = enc_vcvtb_f32_f16(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4421,7 +4428,7 @@ fn fpu_vcvtb_f32_f16_infinity() {
 #[test]
 fn fpu_vcvtb_f16_f32_overflow() {
     // Values too large to represent in f16 must saturate to +inf (0x7C00).
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1e30_f32;
     // Preserve top half so we can verify only the bottom half is written.
     c.regs.s[0] = f32::from_bits(0xAAAA_0000);
@@ -4434,7 +4441,7 @@ fn fpu_vcvtb_f16_f32_overflow() {
 #[test]
 fn fpu_vcvtb_f16_f32_underflow() {
     // Values smaller than the smallest f16 subnormal must flush to +0 (0x0000).
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 1e-10_f32;
     c.regs.s[0] = f32::from_bits(0x5555_0000);
     let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
@@ -4446,7 +4453,7 @@ fn fpu_vcvtb_f16_f32_underflow() {
 #[test]
 fn fpu_vcvtb_f16_f32_negative_zero_roundtrip() {
     // -0.0f32 → f16 → f32 must preserve the negative-zero sign bit.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = -0.0f32;
     c.regs.s[0] = 0.0f32;
     let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
@@ -4478,7 +4485,7 @@ fn enc_vrintx(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0111, 0, sd, sm) }
 
 #[test]
 fn fpu_vrintx_inexact_sets_ixc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 2.5;
     let (hw0, hw1) = enc_vrintx(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4488,7 +4495,7 @@ fn fpu_vrintx_inexact_sets_ixc() {
 
 #[test]
 fn fpu_vrintr_inexact_no_ixc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 2.5;
     let (hw0, hw1) = enc_vrintr(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4498,7 +4505,7 @@ fn fpu_vrintr_inexact_no_ixc() {
 
 #[test]
 fn fpu_vrintz_inexact_no_ixc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 2.7;
     let (hw0, hw1) = enc_vrintz(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4508,7 +4515,7 @@ fn fpu_vrintz_inexact_no_ixc() {
 
 #[test]
 fn fpu_vrintx_snan_sets_ioc_dn_canonicalizes() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_DN;
     c.regs.s[2] = f32::from_bits(0x7F80_0001); // SNaN
     let (hw0, hw1) = enc_vrintx(0, 2);
@@ -4521,7 +4528,7 @@ fn fpu_vrintx_snan_sets_ioc_dn_canonicalizes() {
 fn fpu_vrintr_qnan_dn_off_quietens_payload() {
     // QNaN input under DN=0: output preserves payload (already quiet).
     // No IOC because input was already quiet.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(0x7FCD_EAD0);
     let (hw0, hw1) = enc_vrintr(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4534,7 +4541,7 @@ fn fpu_vrintx_snan_dn_off_quietens_input() {
     // Under DN=0, VRINTX on an SNaN must (a) raise IOC and (b) return the
     // input with the quiet bit forced — this is the "quieten payload" path
     // we explicitly pinned to avoid relying on host rounding intrinsics.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(0x7F80_1234); // SNaN with payload
     let (hw0, hw1) = enc_vrintx(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4545,7 +4552,7 @@ fn fpu_vrintx_snan_dn_off_quietens_input() {
 
 #[test]
 fn fpu_vrintx_denormal_input_sets_idc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(0x0000_0001); // smallest subnormal
     let (hw0, hw1) = enc_vrintx(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4560,7 +4567,7 @@ fn fpu_vrintx_denormal_input_sets_idc() {
 fn fpu_vrintx_denormal_fz_flushes_to_zero_no_ixc() {
     // Under FZ=1, denormal input flushes to ±0 with IDC. The rounded result
     // (still 0) is exact w.r.t. the flushed input, so no IXC.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_FZ;
     c.regs.s[2] = f32::from_bits(0x0000_0001);
     let (hw0, hw1) = enc_vrintx(0, 2);
@@ -4572,7 +4579,7 @@ fn fpu_vrintx_denormal_fz_flushes_to_zero_no_ixc() {
 
 #[test]
 fn fpu_vrintr_inf_passthrough() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::INFINITY;
     let (hw0, hw1) = enc_vrintr(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4589,7 +4596,7 @@ fn fpu_vrintr_rmode_sweep() {
     //   RM(10) → 1.0 (floor)
     //   RZ(11) → 1.0 (toward zero)
     for (rmode, expected) in [(0u32, 2.0f32), (1, 2.0), (2, 1.0), (3, 1.0)] {
-        let mut c = CortexM33::new();
+        let mut c = CortexM33::for_test(0);
         c.regs.fpscr = rmode << 22;
         c.regs.s[2] = 1.5;
         let (hw0, hw1) = enc_vrintr(0, 2);
@@ -4606,7 +4613,7 @@ fn fpu_vrintr_rmode_sweep() {
 
 #[test]
 fn fpu_vcvtb_f16_f32_snan_sets_ioc_dn_canonicalizes() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_DN;
     c.regs.s[2] = f32::from_bits(0x7F80_1234); // SNaN
     c.regs.s[0] = 0.0;
@@ -4620,7 +4627,7 @@ fn fpu_vcvtb_f16_f32_snan_sets_ioc_dn_canonicalizes() {
 #[test]
 fn fpu_vcvtb_f16_f32_qnan_dn_off_preserves_payload() {
     // QNaN input under DN=0: payload preserved (top 9 bits), no IOC.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(0x7FCD_EAD0); // QNaN with payload
     c.regs.s[0] = 0.0;
     let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
@@ -4634,7 +4641,7 @@ fn fpu_vcvtb_f16_f32_qnan_dn_off_preserves_payload() {
 
 #[test]
 fn fpu_vcvtb_f16_f32_denormal_input_sets_idc() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(0x0000_0001); // f32 denormal
     c.regs.s[0] = 0.0;
     let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
@@ -4645,7 +4652,7 @@ fn fpu_vcvtb_f16_f32_denormal_input_sets_idc() {
 
 #[test]
 fn fpu_vcvtb_f32_f16_snan_sets_ioc_dn_canonicalizes() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_DN;
     // f16 SNaN: exp=11111, frac non-zero, quiet bit (bit 9) clear.
     c.regs.s[2] = f32::from_bits(0x7C01); // bottom half = SNaN
@@ -4659,7 +4666,7 @@ fn fpu_vcvtb_f32_f16_snan_sets_ioc_dn_canonicalizes() {
 fn fpu_vcvtb_f32_f16_qnan_dn_off_preserves_payload() {
     // f16 QNaN with payload, DN=0: f32 result has the payload shifted left
     // by 13 bits with the quiet bit forced. No IOC.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = f32::from_bits(0x7E55); // bottom half = QNaN with payload
     let (hw0, hw1) = enc_vcvtb_f32_f16(0, 2);
     c.execute_one_wide(hw0, hw1);
@@ -4673,7 +4680,7 @@ fn fpu_vcvtb_f32_f16_qnan_dn_off_preserves_payload() {
 fn fpu_vcvtt_f16_f32_snan_dn_canonicalizes_in_top_half() {
     // VCVTT writes to the TOP half of Sd; verify the DN canonicalization
     // path is wired identically for the top variant.
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.fpscr = FPSCR_DN;
     c.regs.s[2] = f32::from_bits(0x7F80_0001); // SNaN
     c.regs.s[0] = f32::from_bits(0x0000_BEEF); // top half is target
@@ -4692,7 +4699,7 @@ fn fpu_vcvtt_f16_f32_snan_dn_canonicalizes_in_top_half() {
 
 #[test]
 fn fpu_vsel_d_bit_set() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.regs.s[2] = 10.0;
     c.regs.s[4] = 20.0;
     c.regs.set_flag_z(true); // EQ true → pick Sn
@@ -4715,7 +4722,7 @@ fn fpu_vsel_d_bit_set() {
 #[test]
 fn ssat_basic() {
     // SSAT R0, #8, R1 — saturate R1 to signed 8-bit range [-128, 127]
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100); // within range
     // hw0 = 0xF301 (op=0b10000, sh=0, Rn=1)
     // hw1 = 0x0007 (imm3=0, Rd=0, imm2=0, sat_imm=7 → sat_bit=8)
@@ -4727,7 +4734,7 @@ fn ssat_basic() {
 #[test]
 fn usat_basic() {
     // USAT R0, #8, R1 — saturate R1 to unsigned 8-bit range [0, 255]
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 300); // above 255
     // hw0 = 0xF381 (op=0b11000, sh=0, Rn=1)
     // hw1 = 0x0008 (sat_bit=8)
@@ -4739,14 +4746,14 @@ fn usat_basic() {
 #[test]
 fn ssat_q_flag() {
     // SSAT R0, #8, R1 with value > 127 should set Q and clamp
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 200); // 200 > 127
     c.execute_one_wide(0xF301, 0x0007);
     assert_eq!(c.reg(0), 127);
     assert!(c.regs.flag_q());
 
     // Negative clamping: R1 = -200 (0xFFFFFF38)
-    let mut c2 = CortexM33::new();
+    let mut c2 = CortexM33::for_test(0);
     c2.set_reg(1, (-200i32) as u32);
     c2.execute_one_wide(0xF301, 0x0007);
     assert_eq!(c2.reg(0) as i32, -128);
@@ -4756,7 +4763,7 @@ fn ssat_q_flag() {
 #[test]
 fn smulbb() {
     // SMULBB R0, R1, R2 — bottom halfword multiply, no accumulate
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x0003_0005); // bottom = 5
     c.set_reg(2, 0x0007_0006); // bottom = 6
     // hw0 = 0xFB11 (op1=001, Rn=R1)
@@ -4765,7 +4772,7 @@ fn smulbb() {
     assert_eq!(c.reg(0), 30); // 5 * 6 = 30
 
     // Signed: bottom of R1 = -3 (0xFFFD), bottom of R2 = 4
-    let mut c2 = CortexM33::new();
+    let mut c2 = CortexM33::for_test(0);
     c2.set_reg(1, 0x0000_FFFD); // -3 as i16
     c2.set_reg(2, 0x0000_0004);
     c2.execute_one_wide(0xFB11, 0xF002);
@@ -4775,7 +4782,7 @@ fn smulbb() {
 #[test]
 fn smlabb() {
     // SMLABB R0, R1, R2, R3 — halfword multiply-accumulate
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 5);     // bottom = 5
     c.set_reg(2, 6);     // bottom = 6
     c.set_reg(3, 100);   // accumulator
@@ -4788,7 +4795,7 @@ fn smlabb() {
 #[test]
 fn smuad() {
     // SMUAD R0, R1, R2 — dual multiply add (no accumulate, Ra=15)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // R1 = packed(hi=3, lo=2), R2 = packed(hi=5, lo=4)
     c.set_reg(1, 0x0003_0002);
     c.set_reg(2, 0x0005_0004);
@@ -4801,7 +4808,7 @@ fn smuad() {
 #[test]
 fn smmul() {
     // SMMUL R0, R1, R2 — most significant word multiply (Ra=15)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x4000_0000); // 2^30 = 1073741824
     c.set_reg(2, 0x4000_0000); // 2^30
     // hw0 = 0xFB51 (op1=101, Rn=R1), hw1 = 0xF002
@@ -4813,7 +4820,7 @@ fn smmul() {
 #[test]
 fn usad8() {
     // USAD8 R0, R1, R2 — sum of absolute byte differences (Ra=15)
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // R1 = bytes [10, 20, 30, 40]
     c.set_reg(1, 0x2814_0A28u32.swap_bytes()); // little-endian: [40,30,20,10]
     c.set_reg(1, (10) | (20 << 8) | (30 << 16) | (40 << 24));
@@ -4828,7 +4835,7 @@ fn usad8() {
 #[test]
 fn sadd16() {
     // SADD16 R0, R1, R2 — parallel signed 16-bit add
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // R1 = packed(hi=100, lo=200)
     c.set_reg(1, (200u32) | (100u32 << 16));
     // R2 = packed(hi=50, lo=55)
@@ -4848,7 +4855,7 @@ fn sadd16() {
 #[test]
 fn uadd8() {
     // UADD8 R0, R1, R2 — parallel unsigned 8-bit add
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x01_02_03_04);
     c.set_reg(2, 0x05_06_07_08);
     // UADD8: par_op1=000 (ADD8), par_op2=100 (unsigned)
@@ -4860,7 +4867,7 @@ fn uadd8() {
     assert_eq!(c.regs.ge_flags(), 0);
 
     // Test with overflow: 0xFF + 0x01 = 0x100 → carry, GE bit set
-    let mut c2 = CortexM33::new();
+    let mut c2 = CortexM33::for_test(0);
     c2.set_reg(1, 0x00_00_00_FF);
     c2.set_reg(2, 0x00_00_00_01);
     c2.execute_one_wide(0xFA81, 0xF042);
@@ -4871,7 +4878,7 @@ fn uadd8() {
 #[test]
 fn qadd() {
     // QADD R0, R1, R2 — saturating signed add
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x7FFF_FFF0); // near max positive
     c.set_reg(2, 0x0000_0010);
     // QADD: hw0 = 0xFA81 (hw0[7:4]=1000, Rn=R1), hw1 = 0xF082 (hw1[7]=1, Rm=R2)
@@ -4880,7 +4887,7 @@ fn qadd() {
     assert!(c.regs.flag_q());
 
     // Non-overflowing case
-    let mut c2 = CortexM33::new();
+    let mut c2 = CortexM33::for_test(0);
     c2.set_reg(1, 100);
     c2.set_reg(2, 200);
     c2.execute_one_wide(0xFA81, 0xF082);
@@ -4891,7 +4898,7 @@ fn qadd() {
 #[test]
 fn sel_basic() {
     // SEL R0, R1, R2 — select bytes based on GE flags
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0xAA_BB_CC_DD);
     c.set_reg(2, 0x11_22_33_44);
     // GE = 0b1010: byte 3 from R1, byte 2 from R2, byte 1 from R1, byte 0 from R2
@@ -4908,7 +4915,7 @@ fn sel_basic() {
 #[test]
 fn sxtb16() {
     // SXTB16 R0, R1 — sign-extend bytes 0 and 2 to packed halfwords
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x00_80_00_FE); // byte0=0xFE(-2), byte2=0x80(-128)
     // SXTB16: hw0 = 0xFA2F (ext=010, Rn=15), hw1 = 0xF081 (Rd=0, rot=0, Rm=1)
     c.execute_one_wide(0xFA2F, 0xF081);
@@ -4920,7 +4927,7 @@ fn sxtb16() {
 #[test]
 fn smlald() {
     // SMLALD RdLo=R4, RdHi=R5, Rn=R1, Rm=R2
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     // R1 = packed(hi=3, lo=2), R2 = packed(hi=5, lo=4)
     c.set_reg(1, 0x0003_0002);
     c.set_reg(2, 0x0005_0004);
@@ -4940,7 +4947,7 @@ fn smlald() {
 #[test]
 fn umaal() {
     // UMAAL RdLo=R4, RdHi=R5, Rn=R1, Rm=R2
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.set_reg(2, 200);
     c.set_reg(4, 50);  // RdLo addend
@@ -5461,9 +5468,12 @@ fn dual_core_extra_wait_states_no_pollution() {
     // Drive each core through `step()` so we exercise the real decode
     // path (which owns the accumulator reset), and probe the bus right
     // after each core's single step.
-    let mut bus = crate::bus::Bus::new();
-    let mut core0 = crate::core::CortexM33::with_id(0);
-    let mut core1 = crate::core::CortexM33::with_id(1);
+    // Phase 3 Stage 1: construct shared atomics so core0/core1/bus all
+    // see the same IRQ pending / halted / event_flag state.
+    let atomics = Arc::new(CoreAtomics::default());
+    let mut bus = crate::bus::Bus::with_atomics(Arc::clone(&atomics));
+    let mut core0 = crate::core::CortexM33::new(0, Arc::clone(&atomics));
+    let mut core1 = crate::core::CortexM33::new(1, atomics);
 
     // NOP (MOV R0, R0 = 0x4600) at two SRAM addresses in different banks.
     let nop: u16 = 0x4600;
@@ -5721,9 +5731,11 @@ fn core0_step(emu: &mut Emulator) {
     // at the `Bus::set_active_core` indirection that no longer exists.
     // Replicate the quantum-boundary merge that `Emulator::step` does so
     // inline-tick-triggered IRQs show up on this manual step.
-    if emu.bus.irq_pending_dirty[0] {
-        emu.cores[0].ppb.merge_irq_pending(emu.bus.irq_pending[0]);
-        emu.bus.irq_pending_dirty[0] = false;
+    // Phase 3 Stage 1 (LLD V7 §2): `take_irq_pending` swaps to zero;
+    // non-zero return replaces the V5 `irq_pending_dirty` flag.
+    let pending = emu.bus.atomics.take_irq_pending(0);
+    if pending != 0 {
+        emu.cores[0].ppb.merge_irq_pending(pending);
     }
     emu.cores[0].step(&mut emu.bus);
 }
@@ -5882,7 +5894,7 @@ fn test_external_irq_pend_plus_enable_enters_handler() {
     // at the TIMER0_IRQ_0 vector slot.
     let mut emu = load_external_irq_emu();
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0); // NVIC_ISER enable IRQ 0
-    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     core0_step(&mut emu);
@@ -5897,7 +5909,7 @@ fn test_external_irq_pend_plus_enable_enters_handler() {
 fn test_external_irq_pending_without_enable_does_not_dispatch() {
     // irq_pending bit is set but NVIC_ISER bit is clear → no dispatch.
     let mut emu = load_external_irq_emu();
-    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
@@ -5912,7 +5924,7 @@ fn test_external_irq_priority_mask_blocks_dispatch() {
     let mut emu = load_external_irq_emu();
     emu.cores[0].regs.primask = 1;
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
-    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
@@ -5928,7 +5940,7 @@ fn test_external_irq_basepri_masks_dispatch() {
     emu.cores[0].regs.basepri = 0x20;
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
     emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
-    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
@@ -5943,7 +5955,7 @@ fn test_external_irq_basepri_zero_is_transparent() {
     emu.cores[0].regs.basepri = 0;
     emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
     emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
-    emu.bus.irq_pending[0] |= 1u64 << 0;
+    emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     core0_step(&mut emu);
@@ -5965,17 +5977,19 @@ fn test_assert_irq_core_targets_receiver() {
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_SIO_IRQ_FIFO; // 25, core-local
     emu.bus.assert_irq_core(1, irq);
-    assert_eq!(emu.bus.irq_pending[0], 0,
+    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed), 0,
         "core 0 irq_pending must remain clear");
-    assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+    assert_ne!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
         "core 1 irq_pending must record the assert");
-    assert!(emu.bus.irq_pending_dirty[1],
-        "core 1 irq_pending_dirty must signal the pending merge");
-    assert!(!emu.bus.irq_pending_dirty[0],
-        "core 0 irq_pending_dirty must remain clear");
+    // Phase 3 Stage 1: the `irq_pending_dirty` flag is gone; the pending
+    // mask itself (non-zero) carries the "needs merge" signal.
+    assert!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) != 0,
+        "core 1 irq_pending must signal the pending merge");
+    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed), 0,
+        "core 0 irq_pending must remain clear");
     // Drive the merge and re-check NVIC_ISPR — core 1 latches, core 0
     // stays clean.
-    emu.cores[1].ppb.merge_irq_pending(emu.bus.irq_pending[1]);
+    emu.cores[1].ppb.merge_irq_pending(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed));
     assert_ne!(emu.cores[1].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 1 must latch after merge");
     assert_eq!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
@@ -5986,11 +6000,11 @@ fn test_assert_irq_core_targets_receiver() {
 fn test_assert_irq_core_silently_drops_oob_args() {
     let mut emu = load_external_irq_emu();
     emu.bus.assert_irq_core(0, 100); // above IRQ_COUNT (52) — guarded by debug_assert
-    assert_eq!(emu.bus.irq_pending[0], 0);
+    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed), 0);
     // core >= 2 with a core-local IRQ — silently drops without latching.
     emu.bus.assert_irq_core(5, crate::irq::IRQ_SIO_IRQ_FIFO);
-    assert_eq!(emu.bus.irq_pending[0], 0);
-    assert_eq!(emu.bus.irq_pending[1], 0);
+    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed), 0);
+    assert_eq!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -6006,14 +6020,16 @@ fn test_assert_irq_shared_latches_on_both_cores() {
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
     emu.bus.assert_irq_shared(irq);
-    assert_ne!(emu.bus.irq_pending[0] & (1u64 << irq), 0,
+    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq), 0,
         "core 0 irq_pending must record the assert");
-    assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+    assert_ne!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
         "core 1 irq_pending must record the assert");
-    assert!(emu.bus.irq_pending_dirty[0] && emu.bus.irq_pending_dirty[1],
-        "both cores' irq_pending_dirty flags must be set");
-    emu.cores[0].ppb.merge_irq_pending(emu.bus.irq_pending[0]);
-    emu.cores[1].ppb.merge_irq_pending(emu.bus.irq_pending[1]);
+    // Phase 3 Stage 1: non-zero `irq_pending` replaces the `irq_pending_dirty` flag.
+    assert!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) != 0
+         && emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) != 0,
+        "both cores' irq_pending must carry the pending signal");
+    emu.cores[0].ppb.merge_irq_pending(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed));
+    emu.cores[1].ppb.merge_irq_pending(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed));
     assert_ne!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 0 must latch after merge");
     assert_ne!(emu.cores[1].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
@@ -6033,9 +6049,9 @@ fn test_clear_irq_core_drops_pending_on_one_core() {
     emu.bus.assert_irq_core(0, irq);
     emu.bus.assert_irq_core(1, irq);
     emu.bus.clear_irq_core(0, irq);
-    assert_eq!(emu.bus.irq_pending[0] & (1u64 << irq), 0,
+    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq), 0,
         "clear_irq_core must drop the pending bit on the named core");
-    assert_ne!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+    assert_ne!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
         "clear_irq_core must not touch the other core");
 }
 
@@ -6049,9 +6065,9 @@ fn test_clear_irq_shared_drops_pending_on_both_cores() {
     let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
     emu.bus.assert_irq_shared(irq);
     emu.bus.clear_irq_shared(irq);
-    assert_eq!(emu.bus.irq_pending[0] & (1u64 << irq), 0,
+    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq), 0,
         "clear_irq_shared must clear core 0's pending bit");
-    assert_eq!(emu.bus.irq_pending[1] & (1u64 << irq), 0,
+    assert_eq!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
         "clear_irq_shared must clear core 1's pending bit");
 }
 
@@ -6067,7 +6083,7 @@ fn test_mmio_nvic_ispr_write_mirrors_into_irq_pending_and_dispatches() {
     // Pend IRQ 0 via MMIO path — this is the case B1 restores.
     emu.mmio_write32(0xE000_E200, 1u32 << 0);
     // After write, bus.irq_pending must reflect the latch.
-    assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
+    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0), 0,
         "NVIC_ISPR MMIO write must mirror into bus.irq_pending[core]");
     // And the dispatch path must enter the handler on next step.
     core0_step(&mut emu);
@@ -6083,10 +6099,10 @@ fn test_mmio_nvic_icpr_write_drops_irq_pending_mirror() {
     let mut emu = load_external_irq_emu();
     // Pend via MMIO (mirrors set bit).
     emu.mmio_write32(0xE000_E200, 1u32 << 0);
-    assert_ne!(emu.bus.irq_pending[0] & (1u64 << 0), 0);
+    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0), 0);
     // Clear via MMIO ICPR.
     emu.mmio_write32(0xE000_E280, 1u32 << 0);
-    assert_eq!(emu.bus.irq_pending[0] & (1u64 << 0), 0,
+    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0), 0,
         "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror");
     assert_eq!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 0), 0,
         "NVIC_ICPR MMIO write must clear the architectural latch");
@@ -6100,7 +6116,7 @@ fn test_mmio_nvic_ispr_word1_write_mirrors_high_half() {
     // in bits 32..=63 of irq_pending.
     let mut emu = load_external_irq_emu();
     emu.mmio_write32(0xE000_E204, 1u32 << (40 - 32));
-    assert_ne!(emu.bus.irq_pending[0] & (1u64 << 40), 0,
+    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 40), 0,
         "NVIC_ISPR1 write for IRQ 40 must mirror into bus.irq_pending[core] bit 40");
 }
 
@@ -6716,7 +6732,7 @@ fn ldrexh_clrex_strexh_fail() {
 
 #[test]
 fn msr_mrs_msplim_roundtrip() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x2000_1000);
     // MSR MSPLIM, R0: hw0=0xF380, hw1=0x880A (Rn=0, SYSm=0x0A, mask=2)
     c.execute_one_wide(0xF380, 0x880A);
@@ -6728,7 +6744,7 @@ fn msr_mrs_msplim_roundtrip() {
 
 #[test]
 fn msr_mrs_psplim_roundtrip() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(2, 0x2000_2008);
     // MSR PSPLIM, R2: hw0=0xF382, hw1=0x880B (Rn=2, SYSm=0x0B, mask=2)
     c.execute_one_wide(0xF382, 0x880B);
@@ -6741,7 +6757,7 @@ fn msr_mrs_psplim_roundtrip() {
 
 #[test]
 fn msplim_alignment() {
-    let mut c = CortexM33::new();
+    let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0x2000_1007); // not 8-byte aligned
     // MSR MSPLIM, R0
     c.execute_one_wide(0xF380, 0x880A);
@@ -7304,23 +7320,23 @@ fn fifo_st_w1c_clears_wof_and_roe() {
 fn fifo_write_sets_event_flag_on_receiver() {
     let mut bus = Bus::new();
     // Event flags start clear
-    assert!(!bus.event_flag[0].load(Ordering::Relaxed));
-    assert!(!bus.event_flag[1].load(Ordering::Relaxed));
+    assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed));
+    assert!(!bus.atomics.event_flag[1].load(Ordering::Relaxed));
 
     // Core 0 writes FIFO_WR -> should set event_flag[1] (receiver = Core 1)
     bus.write32(FIFO_WR, 0x42, 0);
-    assert!(bus.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after Core 0 FIFO write");
-    assert!(!bus.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should NOT be set");
+    assert!(bus.atomics.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after Core 0 FIFO write");
+    assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should NOT be set");
 
     // Clear event flags
-    bus.event_flag[0].store(false, Ordering::Relaxed);
-    bus.event_flag[1].store(false, Ordering::Relaxed);
+    bus.atomics.event_flag[0].store(false, Ordering::Relaxed);
+    bus.atomics.event_flag[1].store(false, Ordering::Relaxed);
 
     // Core 1 writes FIFO_WR -> should set event_flag[0] (receiver = Core 0)
     set_core1(&mut bus);
     bus.write32(FIFO_WR, 0x43, 1);
     set_core0(&mut bus);
-    assert!(bus.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after Core 1 FIFO write");
+    assert!(bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after Core 1 FIFO write");
 }
 
 #[test]
@@ -7331,12 +7347,12 @@ fn fifo_overflow_does_not_set_event_flag() {
         bus.write32(FIFO_WR, i, 0);
     }
     // Clear event flags
-    bus.event_flag[0].store(false, Ordering::Relaxed);
-    bus.event_flag[1].store(false, Ordering::Relaxed);
+    bus.atomics.event_flag[0].store(false, Ordering::Relaxed);
+    bus.atomics.event_flag[1].store(false, Ordering::Relaxed);
 
     // Overflow write should NOT set event flag
     bus.write32(FIFO_WR, 0xDEAD, 0);
-    assert!(!bus.event_flag[1].load(Ordering::Relaxed), "event_flag should NOT be set on overflow write");
+    assert!(!bus.atomics.event_flag[1].load(Ordering::Relaxed), "event_flag should NOT be set on overflow write");
 }
 
 // ============================================================================
@@ -7430,17 +7446,17 @@ fn spinlock_st_bitmask_reflects_state() {
 #[test]
 fn wfe_with_event_pending_consumes_and_continues() {
     let (mut cpu, mut bus) = core_and_bus();
-    bus.event_flag[0].store(true, Ordering::Relaxed);
+    bus.atomics.event_flag[0].store(true, Ordering::Relaxed);
     // WFE Thumb-16 encoding: 0xBF20 (hint op = 0x2, mask = 0)
     cpu.execute_one_with_bus(0xBF20, &mut bus);
-    assert!(!bus.event_flag[0].load(Ordering::Relaxed), "event_flag should be consumed");
+    assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag should be consumed");
     assert!(!cpu.is_wfe_waiting(), "core should NOT be sleeping — event was pending");
 }
 
 #[test]
 fn wfe_without_event_enters_sleep() {
     let (mut cpu, mut bus) = core_and_bus();
-    assert!(!bus.event_flag[0].load(Ordering::Relaxed));
+    assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed));
     cpu.execute_one_with_bus(0xBF20, &mut bus);
     assert!(cpu.is_wfe_waiting(), "core should be sleeping — no event was pending");
 }
@@ -7448,12 +7464,12 @@ fn wfe_without_event_enters_sleep() {
 #[test]
 fn sev_sets_both_event_flags() {
     let (mut cpu, mut bus) = core_and_bus();
-    assert!(!bus.event_flag[0].load(Ordering::Relaxed));
-    assert!(!bus.event_flag[1].load(Ordering::Relaxed));
+    assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed));
+    assert!(!bus.atomics.event_flag[1].load(Ordering::Relaxed));
     // SEV Thumb-16 encoding: 0xBF40 (hint op = 0x4, mask = 0)
     cpu.execute_one_with_bus(0xBF40, &mut bus);
-    assert!(bus.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after SEV");
-    assert!(bus.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after SEV");
+    assert!(bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after SEV");
+    assert!(bus.atomics.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after SEV");
 }
 
 #[test]
@@ -7470,13 +7486,13 @@ fn wake_check_clears_wfe_on_event() {
     emu.reset();
 
     // Manually put core 0 into WFE sleep and set its event flag
-    emu.cores[0].wfe_waiting.store(true, Ordering::Relaxed);
-    emu.bus.event_flag[0].store(true, Ordering::Relaxed);
+    emu.bus.atomics.set_wfe_waiting(0);
+    emu.bus.atomics.event_flag[0].store(true, Ordering::Relaxed);
 
     emu.step();
 
-    assert!(!emu.cores[0].wfe_waiting.load(Ordering::Relaxed), "core should have been woken by event_flag");
-    assert!(!emu.bus.event_flag[0].load(Ordering::Relaxed), "event_flag should have been consumed");
+    assert!(!emu.cores[0].is_wfe_waiting(), "core should have been woken by event_flag");
+    assert!(!emu.bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag should have been consumed");
 }
 
 // ============================================================================
@@ -8773,7 +8789,7 @@ fn trace_exception_entry_publishes_sentinel_fe() {
     use crate::core::CortexM33;
 
     let capture = new_capture();
-    let mut cpu = CortexM33::new();
+    let mut cpu = CortexM33::for_test(0);
     // Place MSP above a usable stack region so the 32-byte basic frame
     // lands in SRAM. SRAM base is 0x20000000; a 0x2000_2000 MSP leaves
     // 8 KB of stack below — more than enough for an SVC frame.
@@ -8839,7 +8855,7 @@ fn trace_exception_exit_publishes_sentinel_fd() {
     use crate::core::CortexM33;
 
     let capture = new_capture();
-    let mut cpu = CortexM33::new();
+    let mut cpu = CortexM33::for_test(0);
     cpu.regs.msp = 0x2000_2000;
     cpu.regs.r[13] = cpu.regs.msp;
 
@@ -8895,10 +8911,10 @@ fn trace_exception_exit_publishes_sentinel_fd() {
 fn wfi_halts_when_no_pending_irq() {
     let (mut core, mut bus) = core_and_bus();
     // WFI via execute_one_with_bus: opcode 0xBF30
-    let pre_halted = core.halted.load(Ordering::Relaxed);
+    let pre_halted = core.is_halted();
     assert!(!pre_halted, "should not be halted before WFI");
     core.execute_one_with_bus(0xBF30, &mut bus);
-    assert!(core.halted.load(Ordering::Relaxed),
+    assert!(core.is_halted(),
         "WFI with no pending IRQ should halt the core");
 }
 
@@ -8908,10 +8924,10 @@ fn wfi_nop_when_enabled_pending_irq() {
     // Enable IRQ 0 in NVIC
     core.ppb.nvic_iser[0].store(1, Ordering::Relaxed);
     // Assert IRQ 0 pending
-    bus.irq_pending[0] = 1;
+    bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     // WFI: 0xBF30
     core.execute_one_with_bus(0xBF30, &mut bus);
-    assert!(!core.halted.load(Ordering::Relaxed),
+    assert!(!core.is_halted(),
         "WFI with enabled pending IRQ should NOT halt (acts as NOP)");
 }
 
@@ -8919,11 +8935,11 @@ fn wfi_nop_when_enabled_pending_irq() {
 fn wfi_halts_when_pending_but_disabled_irq() {
     let (mut core, mut bus) = core_and_bus();
     // IRQ pending but NOT enabled
-    bus.irq_pending[0] = 1;
+    bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     core.ppb.nvic_iser[0].store(0, Ordering::Relaxed);
     // WFI: 0xBF30
     core.execute_one_with_bus(0xBF30, &mut bus);
-    assert!(core.halted.load(Ordering::Relaxed),
+    assert!(core.is_halted(),
         "WFI with pending but disabled IRQ should halt");
 }
 
@@ -8932,14 +8948,14 @@ fn wfi_wake_on_irq_assert() {
     let mut emu = crate::Emulator::new(crate::Config::default());
     emu.load_flash(&[]);
     // Halt core via WFI
-    emu.cores[0].halted.store(true, Ordering::Relaxed);
+    emu.cores[0].halt();
     // Enable IRQ 0
     emu.cores[0].ppb.nvic_iser[0].store(1, Ordering::Relaxed);
     // Assert IRQ 0
-    emu.bus.irq_pending[0] = 1;
+    emu.bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     // Wake check should clear halted
     emu.wake_checks();
-    assert!(!emu.cores[0].halted.load(Ordering::Relaxed),
+    assert!(!emu.cores[0].is_halted(),
         "wake_checks should wake WFI-halted core with enabled pending IRQ");
 }
 
@@ -8947,12 +8963,12 @@ fn wfi_wake_on_irq_assert() {
 fn wfi_stays_halted_without_enabled_irq() {
     let mut emu = crate::Emulator::new(crate::Config::default());
     emu.load_flash(&[]);
-    emu.cores[0].halted.store(true, Ordering::Relaxed);
+    emu.cores[0].halt();
     // IRQ pending but not enabled
-    emu.bus.irq_pending[0] = 1;
+    emu.bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     emu.cores[0].ppb.nvic_iser[0].store(0, Ordering::Relaxed);
     emu.wake_checks();
-    assert!(emu.cores[0].halted.load(Ordering::Relaxed),
+    assert!(emu.cores[0].is_halted(),
         "wake_checks should NOT wake WFI-halted core without enabled IRQ");
 }
 
@@ -8960,11 +8976,11 @@ fn wfi_stays_halted_without_enabled_irq() {
 fn debug_step_clears_halted() {
     let mut emu = crate::Emulator::new(crate::Config::default());
     emu.load_flash(&[]);
-    emu.cores[0].halted.store(true, Ordering::Relaxed);
+    emu.cores[0].halt();
     emu.cores[0].regs.r[15] = 0x2000_0000;
     // NOP instruction
     emu.bus.memory.sram_write16(0, 0xBF00);
     emu.cores[0].debug_step(&mut emu.bus);
-    assert!(!emu.cores[0].halted.load(Ordering::Relaxed),
+    assert!(!emu.cores[0].is_halted(),
         "debug_step should clear halted before stepping");
 }

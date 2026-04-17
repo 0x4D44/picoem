@@ -328,12 +328,12 @@ fn tick_peripherals_alarm_match_raises_irq_via_assert_shared() {
     bus.tick_peripherals(60);
     let irq = crate::irq::IRQ_TIMER0_IRQ_0;
     assert_ne!(
-        bus.irq_pending[0] & (1u64 << irq),
+        bus.atomics.irq_pending_load(0) & (1u64 << irq),
         0,
         "core 0 sees TIMER0 IRQ 0"
     );
     assert_ne!(
-        bus.irq_pending[1] & (1u64 << irq),
+        bus.atomics.irq_pending_load(1) & (1u64 << irq),
         0,
         "core 1 sees TIMER0 IRQ 0 (shared)"
     );
@@ -350,9 +350,9 @@ fn tick_peripherals_timer1_fires_on_its_own_irq_base() {
     bus.write32(TIMER1_BASE + ALARM0_OFFSET, 3, 0);
     bus.tick_peripherals(36);
     let irq1 = crate::irq::IRQ_TIMER1_IRQ_0;
-    assert_ne!(bus.irq_pending[0] & (1u64 << irq1), 0);
+    assert_ne!(bus.atomics.irq_pending_load(0) & (1u64 << irq1), 0);
     let irq0 = crate::irq::IRQ_TIMER0_IRQ_0;
-    assert_eq!(bus.irq_pending[0] & (1u64 << irq0), 0);
+    assert_eq!(bus.atomics.irq_pending_load(0) & (1u64 << irq0), 0);
 }
 
 #[test]

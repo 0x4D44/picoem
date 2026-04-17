@@ -4897,7 +4897,7 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         "Thumb-32 test has hw1 but opcode {:#06x} < 0xE800", tc.opcode
     );
 
-    let mut core = CortexM33::new();
+    let mut core = CortexM33::default();
 
     // Set defaults: R0-R12 = 0, SP = stack, LR = sentinel, PC = slot
     for i in 0..=12 {
@@ -4967,7 +4967,7 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
 /// in the returned `RunState`) — these tests validate semantic correctness,
 /// not exact cycle accounting across multi-instruction sequences.
 pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
-    let mut core = CortexM33::new();
+    let mut core = CortexM33::default();
 
     // Set defaults: R0-R12 = 0, SP = stack, LR = sentinel, PC = slot
     for i in 0..=12 {
@@ -5286,7 +5286,7 @@ pub fn is_fpu_test(tc: &TestCase) -> bool {
 /// sequence (prelude VLDRs + test + epilogue VSTRs), steps through all
 /// instructions, then reads results from FPU_SCRATCH.
 pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
-    let mut core = CortexM33::new();
+    let mut core = CortexM33::default();
 
     // Set defaults: R0-R12 = 0, SP = stack, LR = sentinel, PC = slot
     for i in 0..=12 {
@@ -5398,7 +5398,7 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
 /// reading it back. Returns `Ok(())` if the result matches the expected sum
 /// (4.0 = 1.5 + 2.5), or `Err` with a diagnostic message.
 pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
-    let mut core = CortexM33::new();
+    let mut core = CortexM33::default();
 
     // Use a scratch area for float data. R12 = base pointer.
     let scratch = EMU_TEST_SCRATCH;

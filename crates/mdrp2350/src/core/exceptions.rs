@@ -80,7 +80,7 @@ impl CortexM33 {
         self.exclusive_address = None;
 
         if exc_num == 3 && self.regs.ipsr() == 3 {
-            self.halted.store(true, Ordering::Relaxed);
+            self.atomics.set_halted(self.core_id as usize);
             return 0;
         }
         let use_psp = !self.regs.in_handler_mode() && self.regs.active_sp_is_psp();
@@ -485,7 +485,7 @@ impl CortexM33 {
                 let bit = irq % 32;
                 if word < crate::bus::ppb::NVIC_BIT_WORDS {
                     let core = self.core_id as usize;
-                    bus.irq_pending[core] &= !(1u64 << irq);
+                    bus.atomics.clear_irq(core, irq as u32);
                     self.ppb.nvic_ispr[word].fetch_and(!(1u32 << bit), Ordering::Relaxed);
                 }
                 self.ppb.set_irq_active(irq as u32);
@@ -724,11 +724,14 @@ mod tests {
     /// it so enter_exception lands on a known handler address rather
     /// than reading a zero vector from the default (zero-filled) table.
     fn core_and_bus() -> (CortexM33, Bus) {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         cpu.regs.msp = 0x2000_1000;
         cpu.regs.r[13] = cpu.regs.msp;
 
-        let mut bus = Bus::default();
+        // Phase 3 Stage 1: share the Arc<CoreAtomics> between core and
+        // bus so signal paths (IRQ assert → step consume) route correctly.
+        // The trip-wire in `CortexM33::step` enforces this invariant.
+        let mut bus = Bus::with_atomics(std::sync::Arc::clone(&cpu.atomics));
 
         // Relocate VTOR into writable SRAM and populate vectors for the
         // exceptions exercised by these tests: NMI (2), HardFault (3),
@@ -884,7 +887,7 @@ mod tests {
     /// no R, no RW from the MPU side.
     #[test]
     fn test_tt_mpu_disabled_region() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         // Program region 0 covering 0x2000_0000..0x2000_0FFF, EN=0.
         program_mpu_region(&mut cpu, 0, 0x2000_0000, 0x2000_0FFF, 0, false);
 
@@ -898,7 +901,7 @@ mod tests {
     /// AP[2:1] = 00 (RW for privileged): TT must return R=1 and RW=1.
     #[test]
     fn test_tt_mpu_rw_access() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         // Region 2, AP=0 (RW), enabled.
         program_mpu_region(&mut cpu, 2, 0x2000_0000, 0x2000_0FFF, 0, true);
 
@@ -912,7 +915,7 @@ mod tests {
     /// AP[2:1] = 10 (RO): TT must return R=1 but RW=0.
     #[test]
     fn test_tt_mpu_ro_access() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         // Region 5, AP=2 (RO), enabled.
         program_mpu_region(&mut cpu, 5, 0x2000_1000, 0x2000_1FFF, 2, true);
 
@@ -929,7 +932,7 @@ mod tests {
     /// — the bootrom's MPU self-test assumes first-match semantics.
     #[test]
     fn test_tt_mpu_overlapping_regions_first_match() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         // Region 1: AP=0 (RW), covers 0x2000_0000..0x2000_1FFF.
         program_mpu_region(&mut cpu, 1, 0x2000_0000, 0x2000_1FFF, 0, true);
         // Region 7: AP=2 (RO), covers 0x2000_0000..0x2000_0FFF — overlaps

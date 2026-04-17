@@ -6,10 +6,11 @@ mod execute_fpu;
 pub(crate) mod exceptions;
 pub(crate) mod coprocessor;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::bus::Bus;
 use crate::bus::ppb::Ppb;
+use crate::threaded::CoreAtomics;
 pub use registers::Registers;
 
 /// Synchronous faults raised during instruction execution.
@@ -91,12 +92,13 @@ pub struct CortexM33 {
     pub(crate) dcp_status: u32,
     /// ARM security state. `true` = Secure, `false` = Non-Secure.
     pub(crate) secure: bool,
-    /// Core is halted — will not execute until explicitly woken.
-    /// `AtomicBool` for threading readiness (Phase 0b.3).
-    pub(crate) halted: AtomicBool,
-    /// Core is sleeping on WFE — will resume when event_flag is set.
-    /// `AtomicBool` for threading readiness (Phase 0b.3).
-    pub(crate) wfe_waiting: AtomicBool,
+    /// Cross-core atomic state (halted / wfe_waiting / event_flag /
+    /// irq_pending / RCP / bus_fault). Shared with `Bus.atomics` and,
+    /// in threaded mode, `SharedState.atomics`. Phase 3 Stage 1
+    /// (LLD V7 §2) — `halted`/`wfe_waiting` used to live here as
+    /// `AtomicBool` fields; they are now accessed through
+    /// `self.atomics.is_halted(core)` etc.
+    pub(crate) atomics: Arc<CoreAtomics>,
     /// Per-core Private Peripheral Bus (NVIC, SCB, SysTick, FPCCR, MPU,
     /// SAU, DWT — all per-core M33 architectural state). Moved from
     /// `Bus.ppb: [Ppb; 2]` in Phase 0b.1 Commit B. See
@@ -128,11 +130,11 @@ pub struct CortexM33 {
 }
 
 impl CortexM33 {
-    pub fn new() -> Self {
-        Self::with_id(0)
-    }
-
-    pub fn with_id(core_id: u8) -> Self {
+    /// Construct a core with the given core id and shared atomics.
+    /// Phase 3 Stage 1: atomics are required at construction — no
+    /// setter, no `Option`. Unit tests use [`Self::for_test`] to
+    /// construct a solo core with its own atomics.
+    pub fn new(core_id: u8, atomics: Arc<CoreAtomics>) -> Self {
         Self {
             regs: Registers::new(),
             cycles: 0,
@@ -143,8 +145,7 @@ impl CortexM33 {
             dcp_halves: [0; 16],
             dcp_status: 0,
             secure: true,
-            halted: AtomicBool::new(false),
-            wfe_waiting: AtomicBool::new(false),
+            atomics,
             ppb: Ppb::default(),
             exclusive_address: None,
             did_write_this_quantum: false,
@@ -152,31 +153,41 @@ impl CortexM33 {
         }
     }
 
+    /// Construct a solo core for unit tests. Allocates its own
+    /// `Arc<CoreAtomics>` — callers that also want a `Bus` in this
+    /// core's atomics namespace should use `Bus::with_atomics` with
+    /// `Arc::clone(&core.atomics)`.
+    #[cfg(test)]
+    pub fn for_test(core_id: u8) -> Self {
+        Self::new(core_id, Arc::new(CoreAtomics::default()))
+    }
+
     /// Execute one instruction atomically, advancing the core's own cycle
     /// count by the instruction's cycle cost (including any exception-entry
     /// cost if a synchronous fault is taken).
     pub fn step(&mut self, bus: &mut Bus) {
-        if self.wfe_waiting.load(Ordering::Relaxed) {
+        debug_assert!(
+            Arc::ptr_eq(&self.atomics, &bus.atomics),
+            "CortexM33 and Bus hold disjoint Arc<CoreAtomics> — signals won't route. \
+             Construct via Emulator::new/builder or share the Arc explicitly."
+        );
+        let core = self.core_id as usize;
+        if self.atomics.is_wfe_waiting(core) {
             self.counters.wfe_cycles += 1;
             return;
         }
-        if self.halted.load(Ordering::Relaxed) {
+        if self.atomics.is_halted(core) {
             self.counters.wfi_cycles += 1;
             return;
         }
 
-        // Phase 0b.1 Commit B: merge peripheral-asserted IRQs into this
-        // core's NVIC_ISPR before the dispatch check. `assert_irq_core/shared`
-        // sets the dirty flag when it updates `bus.irq_pending`; we union
-        // those bits into `self.ppb.nvic_ispr` so the inline dispatch path
-        // walks a fresh latch. Cost: one bool load per instruction.
-        // Note: `bus.irq_pending_dirty[core]` is indexed per-core (not
-        // global), so under future threaded execution each core only
-        // reads/clears its own slot — no cross-core race on this flag.
-        let core = self.core_id as usize;
-        if bus.irq_pending_dirty[core] {
-            self.ppb.merge_irq_pending(bus.irq_pending[core]);
-            bus.irq_pending_dirty[core] = false;
+        // Phase 3 Stage 1 (LLD V7 §2): peripheral-asserted IRQs live in
+        // `CoreAtomics::irq_pending`. `take_irq_pending` swaps the mask
+        // to zero — a non-zero return is the consume-and-merge trigger
+        // that replaces the pre-stage-1 `irq_pending_dirty` flag.
+        let pending = self.atomics.take_irq_pending(core);
+        if pending != 0 {
+            self.ppb.merge_irq_pending(pending);
         }
 
         // ARMv8-M §B1.5.8 + §B3.7: take the highest-priority pending
@@ -196,12 +207,12 @@ impl CortexM33 {
 
         // Synchronous bus fault
         let mut fault_handled = false;
-        if bus.bus_fault() {
+        if bus.bus_fault(self.core_id as usize) {
             fault_handled = true;
             let busfault_ena = self.ppb.shcsr & (1 << 17) != 0;
             self.ppb.cfsr |= (1 << 9) | (1 << 15); // PRECISERR + BFARVALID
-            self.ppb.bfar = bus.bus_fault_addr();
-            bus.clear_bus_fault();
+            self.ppb.bfar = bus.bus_fault_addr(self.core_id as usize);
+            bus.clear_bus_fault(self.core_id as usize);
             if busfault_ena {
                 cycles = self.enter_exception(5, bus);
             } else {
@@ -227,8 +238,9 @@ impl CortexM33 {
     /// Debug step: clears halted/wfe_waiting before stepping.
     /// Used by QEMU diff harness so WFI doesn't stall the oracle.
     pub fn debug_step(&mut self, bus: &mut Bus) {
-        self.halted.store(false, Ordering::Relaxed);
-        self.wfe_waiting.store(false, Ordering::Relaxed);
+        let core = self.core_id as usize;
+        self.atomics.clear_halted(core);
+        self.atomics.clear_wfe_waiting(core);
         self.step(bus);
     }
 
@@ -276,35 +288,36 @@ impl CortexM33 {
     /// Halt the core indefinitely — will not execute until explicitly woken.
     /// Used to hold Core 1 during reset.
     pub fn halt(&mut self) {
-        self.halted.store(true, Ordering::Relaxed);
+        self.atomics.set_halted(self.core_id as usize);
         self.pending_fault = None;
     }
 
     /// Resume a halted core. The caller must set PC, SP, and xpsr before
     /// calling this — wake() only clears the halted flag.
     pub fn wake(&mut self) {
-        self.halted.store(false, Ordering::Relaxed);
+        self.atomics.clear_halted(self.core_id as usize);
     }
 
     /// Returns `true` if the core is halted.
     pub fn is_halted(&self) -> bool {
-        self.halted.load(Ordering::Relaxed)
+        self.atomics.is_halted(self.core_id as usize)
     }
 
     /// Returns `true` if the core is sleeping on WFE.
     pub fn is_wfe_waiting(&self) -> bool {
-        self.wfe_waiting.load(Ordering::Relaxed)
+        self.atomics.is_wfe_waiting(self.core_id as usize)
     }
 
     /// Execute WFE hint. If event_flag is pending, consume it and continue.
-    /// Otherwise, enter WFE sleep.
-    pub(crate) fn wfe(&mut self, bus: &mut Bus) -> u32 {
+    /// Otherwise, enter WFE sleep. Phase 3 Stage 1: the event_flag state
+    /// lives on `CoreAtomics`; we consume with an AcqRel swap-to-false
+    /// that pairs with `sev_both`'s Release stores.
+    pub(crate) fn wfe(&mut self, _bus: &mut Bus) -> u32 {
         let core = self.core_id as usize;
-        if bus.event_flag[core].load(Ordering::Acquire) {
-            bus.event_flag[core].store(false, Ordering::Release);
+        if self.atomics.event_flag_consume(core) {
             1 // event was pending, consume it, no sleep
         } else {
-            self.wfe_waiting.store(true, Ordering::Release);
+            self.atomics.set_wfe_waiting(core);
             1
         }
     }
@@ -433,15 +446,24 @@ impl CortexM33 {
     /// way the architectural latch lives in `nvic_ispr`. `irq_pending`
     /// gates the step-path NVIC walk for cheap short-circuiting, so it
     /// must stay in sync with `nvic_ispr` after each write.
-    fn sync_nvic_to_irq_pending(&self, addr: u32, bus: &mut Bus) {
+    fn sync_nvic_to_irq_pending(&self, addr: u32, _bus: &mut Bus) {
         let low = addr & 0xFFFF;
         if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
             let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-            let ispr = self.ppb.nvic_ispr[word].load(Ordering::Relaxed);
+            let ispr = self.ppb.nvic_ispr[word].load(std::sync::atomic::Ordering::Relaxed);
             let mask64 = (ispr as u64) << (word * 32);
             let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
             let core = self.core_id as usize;
-            bus.irq_pending[core] = (bus.irq_pending[core] & keep) | mask64;
+            // Phase 3 Stage 1: `irq_pending` migrated onto `CoreAtomics`.
+            // Preserve the word that isn't being replaced; overwrite the
+            // target word with the post-write ISPR bits.
+            let prev = self.atomics.irq_pending_load(core);
+            let new_val = (prev & keep) | mask64;
+            // Swap to get a precise replacement rather than the ambiguous
+            // union `fetch_or`. A single-threaded race-free model suffices
+            // here (the core that just wrote NVIC_ISPR is the only writer
+            // to its own slot in the single-threaded path).
+            self.atomics.set_irq_pending(core, new_val);
         }
     }
 
@@ -603,6 +625,6 @@ impl CortexM33 {
 
 impl Default for CortexM33 {
     fn default() -> Self {
-        Self::new()
+        Self::new(0, Arc::new(CoreAtomics::default()))
     }
 }

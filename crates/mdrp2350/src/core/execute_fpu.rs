@@ -1200,22 +1200,23 @@ impl CortexM33 {
     ) -> Result<(), ()> {
         let base = self.ppb.fpcar;
 
+        let core = self.core_id as usize;
         // S0..S15 → +0..+60.
         for i in 0..16 {
             self.bus_write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits(), bus);
-            if bus.bus_fault() {
+            if bus.bus_fault(core) {
                 self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
                 return Err(());
             }
         }
         // FPSCR → +64; reserved → +68 (write zero per architecture).
         self.bus_write32(base.wrapping_add(64), self.regs.fpscr, bus);
-        if bus.bus_fault() {
+        if bus.bus_fault(core) {
             self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());
         }
         self.bus_write32(base.wrapping_add(68), 0, bus);
-        if bus.bus_fault() {
+        if bus.bus_fault(core) {
             self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
             return Err(());
         }

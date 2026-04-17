@@ -131,7 +131,7 @@ fn uart0_irq_routed_to_bus_irq_pending() {
     bus.tick_peripherals(100);
     for core in 0..2 {
         assert_ne!(
-            bus.irq_pending[core] & (1u64 << IRQ_UART0_IRQ),
+            bus.atomics.irq_pending_load(core) & (1u64 << IRQ_UART0_IRQ),
             0,
             "UART0 shared IRQ must pend on core {core}"
         );
@@ -238,7 +238,7 @@ fn adc_fifo_irq_routed_when_unmasked() {
     bus.tick_peripherals(500);
     for core in 0..2 {
         assert_ne!(
-            bus.irq_pending[core] & (1u64 << IRQ_ADC_IRQ_FIFO),
+            bus.atomics.irq_pending_load(core) & (1u64 << IRQ_ADC_IRQ_FIFO),
             0,
             "ADC_FIFO shared IRQ must pend on core {core}"
         );
@@ -272,7 +272,7 @@ fn pwm_slice0_inte0_routes_to_wrap0_irq() {
     bus.tick_peripherals(60);
     for core in 0..2 {
         assert_ne!(
-            bus.irq_pending[core] & (1u64 << IRQ_PWM_IRQ_WRAP_0),
+            bus.atomics.irq_pending_load(core) & (1u64 << IRQ_PWM_IRQ_WRAP_0),
             0,
             "PWM_IRQ_WRAP_0 must pend on core {core}"
         );
@@ -430,13 +430,13 @@ fn raise_irqs_u64_drops_software_only_bits() {
     bus.raise_irqs_u64(mask);
     for core in 0..2 {
         assert_ne!(
-            bus.irq_pending[core] & (1u64 << crate::irq::IRQ_TIMER0_IRQ_0),
+            bus.atomics.irq_pending_load(core) & (1u64 << crate::irq::IRQ_TIMER0_IRQ_0),
             0,
             "in-range IRQ_TIMER0_IRQ_0 must pend on core {core}"
         );
         for bit in 46..=51u32 {
             assert_eq!(
-                bus.irq_pending[core] & (1u64 << bit),
+                bus.atomics.irq_pending_load(core) & (1u64 << bit),
                 0,
                 "software-only IRQ bit {bit} must NOT be asserted by \
                  peripheral raise on core {core}"
@@ -449,8 +449,8 @@ fn raise_irqs_u64_drops_software_only_bits() {
 fn raise_irqs_u64_empty_mask_is_noop() {
     let mut bus = Bus::new();
     bus.raise_irqs_u64(0);
-    assert_eq!(bus.irq_pending[0], 0);
-    assert_eq!(bus.irq_pending[1], 0);
+    assert_eq!(bus.atomics.irq_pending_load(0), 0);
+    assert_eq!(bus.atomics.irq_pending_load(1), 0);
 }
 
 #[test]
@@ -461,6 +461,6 @@ fn raise_irqs_u64_all_software_only_is_noop() {
         mask |= 1u64 << bit;
     }
     bus.raise_irqs_u64(mask);
-    assert_eq!(bus.irq_pending[0], 0);
-    assert_eq!(bus.irq_pending[1], 0);
+    assert_eq!(bus.atomics.irq_pending_load(0), 0);
+    assert_eq!(bus.atomics.irq_pending_load(1), 0);
 }

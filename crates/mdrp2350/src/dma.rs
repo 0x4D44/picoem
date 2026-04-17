@@ -549,17 +549,16 @@ impl Dma {
         }
     }
 
-    /// OR DMA IRQ lines into the bus `irq_pending` wire. Call this after
-    /// [`Self::tick`] so the NVIC latches any just-completed transfer.
-    pub fn route_irqs(&self, irq_pending: &mut [u64; 2]) {
+    /// OR DMA IRQ lines into the shared `CoreAtomics` wire. Call this
+    /// after [`Self::tick`] so both cores' NVICs latch any just-completed
+    /// transfer. Phase 3 Stage 1 migrated the storage off `Bus`.
+    pub fn route_irqs(&self, atomics: &crate::threaded::CoreAtomics) {
         if (self.intr | self.intf0) & self.inte0 != 0 {
             // DMA IRQs are shared — both cores see them.
-            irq_pending[0] |= 1u64 << IRQ_DMA_IRQ_0;
-            irq_pending[1] |= 1u64 << IRQ_DMA_IRQ_0;
+            atomics.assert_irq_shared(IRQ_DMA_IRQ_0);
         }
         if (self.intr | self.intf1) & self.inte1 != 0 {
-            irq_pending[0] |= 1u64 << IRQ_DMA_IRQ_1;
-            irq_pending[1] |= 1u64 << IRQ_DMA_IRQ_1;
+            atomics.assert_irq_shared(IRQ_DMA_IRQ_1);
         }
     }
 }
@@ -979,7 +978,7 @@ mod tests {
 
         // irq_pending should have DMA_IRQ_0 set
         assert_ne!(
-            bus.irq_pending[0] & (1u64 << IRQ_DMA_IRQ_0),
+            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_0),
             0,
             "DMA_IRQ_0 must be pending on core 0"
         );
@@ -1008,7 +1007,7 @@ mod tests {
         let ints1 = bus.read32(DMA_BASE + REG_INTS1, 0);
         assert_ne!(ints1, 0, "INTS1 must be set");
         assert_ne!(
-            bus.irq_pending[0] & (1u64 << IRQ_DMA_IRQ_1),
+            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_1),
             0,
             "DMA_IRQ_1 must be pending"
         );

@@ -1,8 +1,6 @@
 // Helpers used by stubs once instructions are implemented in later stages.
 #![allow(dead_code)]
 
-use std::sync::atomic::Ordering;
-
 use crate::bus::Bus;
 use super::CortexM33;
 use super::execute::{sign_extend, add_with_carry};
@@ -931,11 +929,12 @@ impl CortexM33 {
                 // pre-sleep FP state intact.
                 0x03 => {
                     // WFI.W: sleep unless there's an enabled pending IRQ
-                    let pending = bus.irq_pending[self.core_id as usize];
+                    let core = self.core_id as usize;
+                    let pending = bus.atomics.irq_pending_load(core);
                     if self.ppb.any_pending_enabled(pending) {
                         1
                     } else {
-                        self.halted.store(true, Ordering::Release);
+                        self.atomics.set_halted(core);
                         1
                     }
                 }

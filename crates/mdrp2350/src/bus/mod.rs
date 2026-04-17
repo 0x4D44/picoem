@@ -4,9 +4,10 @@ pub mod ppb;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
+use crate::threaded::CoreAtomics;
 use crate::dma::{DMA_BASE, Dma};
 use crate::irq::{
     IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_PWM_IRQ_WRAP_0,
@@ -229,28 +230,12 @@ pub struct Bus {
     /// Keyed by canonical address (alias bits stripped).
     /// TODO: Replace with direct Peripheral trait dispatch when real peripherals are added.
     peripheral_regs: HashMap<u32, u32>,
-    /// Per-core external-IRQ pending mask. Bit N set means IRQ N is
-    /// latched on that core's NVIC; the M33 step loop short-circuits on
-    /// `irq_pending[core] == 0` to skip the NVIC walk on the common no-
-    /// IRQ path. `assert_irq_core(core, irq)` is the peripheral-facing
-    /// setter — peripherals choose the receiver at assert time rather
-    /// than relying on a drain loop fan-out (see HLD V5 §5.3).
-    ///
-    /// 64 bits is sufficient for the 52 NVIC inputs; bits 52..63 are
-    /// never set. `u64` avoids a per-word `u32` pair while staying
-    /// cache-line-friendly (16 bytes / 128 bits for both cores fits in
-    /// the same line as `resets_state` and the downstream flags).
-    ///
-    /// Phase 0a lands the field + helper. Phase 1 wires the drain into
-    /// the per-core NVIC banks on Ppb (ISPR writes).
-    pub(crate) irq_pending: [u64; 2],
-    /// Per-core "needs merge" flag. Set by `assert_irq_core/shared` when
-    /// a peripheral raises a new IRQ. Consumed by `CortexM33::step` (and
-    /// the quantum-boundary merge in `Emulator::step`) which unions
-    /// `irq_pending[core]` into `self.ppb.nvic_ispr`. Keeps the
-    /// zero-latency IRQ visibility the pre-Commit-B code had when
-    /// `Bus::assert_irq_*` wrote both bitmaps inline.
-    pub(crate) irq_pending_dirty: [bool; 2],
+    /// Cross-core atomics (halted/WFE/event_flag/irq_pending/RCP/bus_fault).
+    /// Shared via `Arc` with the two `CortexM33` cores — Phase 3 Stage 1
+    /// (LLD V7 §2). In the single-threaded path, Bus is the sole owner
+    /// of the inner state; the threaded runtime clones this `Arc` onto
+    /// `SharedState` and the CPU workers.
+    pub atomics: Arc<CoreAtomics>,
     /// RESETS peripheral state: bits set = peripheral in reset.
     /// Default [`RESETS_POST_BOOTROM`] — peripherals released by
     /// pico-sdk `runtime_init_bootrom_reset` per HLD V5 §5.7.
@@ -281,10 +266,6 @@ pub struct Bus {
     pub(crate) pads_bank0: PadsBank0Regs,
     /// DMA controller — 16 channels (HLD V5 §5.6, Phase 3).
     pub(crate) dma: Dma,
-    /// Bus fault detected on last access.
-    bus_fault: bool,
-    /// Address that caused the most recent bus fault.
-    bus_fault_addr: u32,
     /// Whether flash (XIP) content has been loaded.
     flash_loaded: bool,
     /// Suppress per-word SRAM bank wait states during burst transfers
@@ -357,18 +338,6 @@ pub struct Bus {
     xip_cache_offset: u32,
     /// Single-cycle IO block (GPIO, CPUID, spinlocks, FIFO, divider, etc.).
     pub sio: Sio,
-    /// Per-core event flag for WFE/SEV protocol.
-    /// `AtomicBool` for threading readiness (Phase 0b.3).
-    pub event_flag: [AtomicBool; 2],
-    /// Per-core RCP salt value (shared state for cross-core writes).
-    pub rcp_salt: [u32; 2],
-    /// Per-core RCP salt validity flag.
-    pub rcp_salt_valid: [bool; 2],
-    /// RCP redundancy counter (Phase 7 Stage E).
-    /// Single shared counter — `rcp_count_set X` initializes; `rcp_count_check Y`
-    /// asserts counter == Y then increments. The bootrom uses a single counter
-    /// across both cores' boot paths, so a single per-chip value suffices.
-    pub rcp_count: u32,
     /// Three PIO blocks (PIO0, PIO1, PIO2).
     pub pio: [PioBlock; 3],
     /// Combined GPIO pin state (readable by SIO and PIO).
@@ -413,7 +382,17 @@ pub struct Bus {
 }
 
 impl Bus {
+    /// Construct a stand-alone `Bus` with its own `CoreAtomics`. The
+    /// returned atomics are not shared with any `CortexM33`; callers
+    /// that build an `Emulator` should use [`Bus::with_atomics`] to
+    /// keep the Bus and cores in the same atomic state.
     pub fn new() -> Self {
+        Self::with_atomics(Arc::new(CoreAtomics::default()))
+    }
+
+    /// Construct a `Bus` that shares the supplied `CoreAtomics` with
+    /// the (to-be-constructed) `CortexM33` cores. Phase 3 Stage 1.
+    pub fn with_atomics(atomics: Arc<CoreAtomics>) -> Self {
         // HLD V5 §5.7: construction alone produces post-bootrom state.
         // `Bus::new()`, `Emulator::new(...)`, and `Emulator::reset()` all
         // land on the same clock / RESETS / TICKS table, so `load_image`
@@ -442,10 +421,7 @@ impl Bus {
             io_bank0: IoBank0Regs::new(),
             pads_bank0: PadsBank0Regs::new(),
             dma: Dma::new(),
-            irq_pending: [0; 2],
-            irq_pending_dirty: [false; 2],
-            bus_fault: false,
-            bus_fault_addr: 0,
+            atomics,
             flash_loaded: false,
             burst_mode: false,
             boot_ram: Box::new([0u8; 4096]),
@@ -465,10 +441,6 @@ impl Bus {
             gpio_hi_noise_state: 0xA5A5_A5A5,
             xip_cache_offset: 0,
             sio: Sio::new(),
-            event_flag: [AtomicBool::new(false), AtomicBool::new(false)],
-            rcp_salt: [0; 2],
-            rcp_salt_valid: [false; 2],
-            rcp_count: 0,
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
             gpio_in: 0,
             gpio_external_in: 0,
@@ -801,11 +773,10 @@ impl Bus {
             "assert_irq_core called with shared IRQ {irq}; use assert_irq_shared(irq)"
         );
         if core < 2 && irq < crate::irq::IRQ_COUNT {
-            self.irq_pending[core] |= 1u64 << irq;
-            // Phase 0b.1 Commit B: the per-core PPB (`nvic_ispr`) now
-            // lives on `CortexM33`. Signal the step path to merge the
-            // new pending bit into its NVIC_ISPR on the next dispatch.
-            self.irq_pending_dirty[core] = true;
+            // Phase 3 Stage 1: irq_pending moved onto `CoreAtomics`. The
+            // non-zero return of `take_irq_pending` on the consumer side
+            // replaces the dropped `irq_pending_dirty` flag.
+            self.atomics.assert_irq(core, irq);
         }
     }
 
@@ -827,12 +798,7 @@ impl Bus {
             "assert_irq_shared called with core-local IRQ {irq}; use assert_irq_core(core, irq)"
         );
         if irq < crate::irq::IRQ_COUNT {
-            for core in 0..2 {
-                self.irq_pending[core] |= 1u64 << irq;
-                // Phase 0b.1 Commit B: signal the step path to union
-                // the new pending bit into each core's NVIC_ISPR.
-                self.irq_pending_dirty[core] = true;
-            }
+            self.atomics.assert_irq_shared(irq);
         }
     }
 
@@ -848,7 +814,7 @@ impl Bus {
     /// `core/exceptions.rs::try_take_any_pending_exception`.
     pub fn clear_irq_core(&mut self, core: usize, irq: u32) {
         if core < 2 && irq < crate::irq::IRQ_COUNT {
-            self.irq_pending[core] &= !(1u64 << irq);
+            self.atomics.clear_irq(core, irq);
         }
     }
 
@@ -857,9 +823,8 @@ impl Bus {
     /// no-ops. No dirty-flag (see [`Self::clear_irq_core`]).
     pub fn clear_irq_shared(&mut self, irq: u32) {
         if irq < crate::irq::IRQ_COUNT {
-            for core in 0..2 {
-                self.irq_pending[core] &= !(1u64 << irq);
-            }
+            self.atomics.clear_irq(0, irq);
+            self.atomics.clear_irq(1, irq);
         }
     }
 
@@ -977,19 +942,22 @@ impl Bus {
         }
     }
 
-    /// Returns true if a bus fault was detected on the last access.
-    pub fn bus_fault(&self) -> bool {
-        self.bus_fault
+    /// Returns true if a bus fault was detected on `core`'s last access.
+    /// Phase 3 Stage 1: bus-fault state migrated to `CoreAtomics` and
+    /// gained a per-core `core` arg (LLD V7 §2). Single-threaded callers
+    /// pass their `self.core_id`.
+    pub fn bus_fault(&self, core: usize) -> bool {
+        self.atomics.is_bus_fault(core)
     }
 
-    /// Returns the address that caused the most recent bus fault.
-    pub fn bus_fault_addr(&self) -> u32 {
-        self.bus_fault_addr
+    /// Returns the address that caused `core`'s most recent bus fault.
+    pub fn bus_fault_addr(&self, core: usize) -> u32 {
+        self.atomics.bus_fault_addr(core)
     }
 
-    /// Clear the bus fault flag.
-    pub fn clear_bus_fault(&mut self) {
-        self.bus_fault = false;
+    /// Clear `core`'s bus-fault flag.
+    pub fn clear_bus_fault(&mut self, core: usize) {
+        self.atomics.clear_bus_fault(core);
     }
 
     /// Set whether flash (XIP) content has been loaded.
@@ -999,8 +967,7 @@ impl Bus {
 
     /// Signal an SEV event to both cores.
     pub fn signal_sev(&mut self) {
-        self.event_flag[0].store(true, Ordering::Release);
-        self.event_flag[1].store(true, Ordering::Release);
+        self.atomics.sev_both();
     }
 
     /// Read GPIO_HI_IN (SIO offset 0x008). Returns QSPI pin state.
@@ -1171,8 +1138,7 @@ impl Bus {
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read8(addr),
             0x1 => {
                 if !self.flash_loaded {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.atomics.set_bus_fault(core as usize, addr);
                     if self.trace_enabled {
                         self.emit_trace('R', 1, addr, 0, core);
                     }
@@ -1272,8 +1238,7 @@ impl Bus {
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read8(addr),
             0xE => 0, // PPB (stub)
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.atomics.set_bus_fault(core as usize, addr);
                 0
             }
         };
@@ -1592,8 +1557,7 @@ impl Bus {
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read16(addr),
             0x1 => {
                 if !self.flash_loaded {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.atomics.set_bus_fault(core as usize, addr);
                     if self.trace_enabled {
                         self.emit_trace('R', 2, addr, 0, core);
                     }
@@ -1692,8 +1656,7 @@ impl Bus {
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read16(addr),
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.atomics.set_bus_fault(core as usize, addr);
                 0
             }
         };
@@ -1983,8 +1946,7 @@ impl Bus {
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read32(addr),
             0x1 => {
                 if !self.flash_loaded {
-                    self.bus_fault = true;
-                    self.bus_fault_addr = addr;
+                    self.atomics.set_bus_fault(core as usize, addr);
                     if self.trace_enabled {
                         self.emit_trace('R', 4, addr, 0, core);
                     }
@@ -2047,8 +2009,7 @@ impl Bus {
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.atomics.set_bus_fault(core as usize, addr);
                 0
             }
         };
@@ -2183,7 +2144,7 @@ impl Bus {
                 self.sio.write32(reg_offset, val, core as usize);
                 // FIFO_WR event signaling: set event_flag for receiver core.
                 if let Some(receiver) = self.sio.pending_fifo_event.take() {
-                    self.event_flag[receiver].store(true, Ordering::Release);
+                    self.atomics.set_event_flag(receiver);
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),
@@ -2191,8 +2152,7 @@ impl Bus {
             // writers (Phase 7 Stage B lazy FP) and other speculative
             // stores see the failure. Mirrors the read32 unmapped path.
             _ => {
-                self.bus_fault = true;
-                self.bus_fault_addr = addr;
+                self.atomics.set_bus_fault(core as usize, addr);
             }
         }
         if self.trace_enabled {
@@ -2282,7 +2242,7 @@ impl Bus {
     pub fn tick_dma(&mut self) {
         let mut dma = std::mem::take(&mut self.dma);
         dma.tick(self);
-        dma.route_irqs(&mut self.irq_pending);
+        dma.route_irqs(&self.atomics);
         self.dma = dma;
     }
 }

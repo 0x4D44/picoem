@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 pub mod core;
 pub mod bus;
@@ -84,20 +84,23 @@ impl Emulator {
         let initial_sp = self.bus.memory.rom_read32(0);
         let reset_vector = self.bus.memory.rom_read32(4);
 
-        // Boot both cores from reset vector. `with_id` already sets
-        // cycles = 0, so cycle counters start fresh for a clean quantum
-        // alignment with the reset clock.
+        // Boot both cores from reset vector. Phase 3 Stage 1: cores
+        // share a single `CoreAtomics` with Bus. Rebuilding the cores
+        // must reuse the existing Arc so post-reset asserts land on
+        // the same state the Bus sees.
+        let atomics = Arc::clone(&self.bus.atomics);
         for i in 0..2 {
-            self.cores[i] = CortexM33::with_id(i as u8);
+            self.cores[i] = CortexM33::new(i as u8, Arc::clone(&atomics));
             self.cores[i].regs.msp = initial_sp;
             self.cores[i].regs.r[13] = initial_sp;
             self.cores[i].regs.set_pc(reset_vector & !1);
             self.cores[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
         }
 
-        // Clear bus state. Per-core PPB is reset via `CortexM33::with_id`
-        // above (Phase 0b.1 Commit B moved PPB onto CortexM33).
-        self.bus.clear_bus_fault();
+        // Clear the shared atomic state — halted / WFE / event_flag /
+        // irq_pending / RCP / bus-fault. Replaces the per-core clears
+        // that pre-Stage-1 touched the now-deleted Bus fields.
+        atomics.reset();
         // HLD V5 §5.7: post-bootrom RESETS state — peripherals
         // released by pico-sdk `runtime_init_bootrom_reset` start
         // deasserted. The emulator never runs the bootrom; we seed
@@ -106,13 +109,6 @@ impl Emulator {
         self.bus.ticks.reset();
         self.bus.timer0.reset();
         self.bus.timer1.reset();
-        self.bus.irq_pending = [0; 2];
-        self.bus.irq_pending_dirty = [false; 2];
-        self.bus.event_flag[0].store(false, Ordering::Relaxed);
-        self.bus.event_flag[1].store(false, Ordering::Relaxed);
-        self.bus.rcp_salt = [0; 2];
-        self.bus.rcp_salt_valid = [false; 2];
-        self.bus.rcp_count = 0;
         self.bus.sio.reset();
         for pio in &mut self.bus.pio {
             pio.reset();
@@ -194,13 +190,13 @@ impl Emulator {
         // indirection is needed.
         for core_id in 0..2 {
             // Quantum-boundary IRQ merge: peripherals in `tick_peripherals`
-            // at the previous quantum raised IRQs via `assert_irq_*`,
-            // which set `irq_pending_dirty[core]`. Union those bits into
-            // this core's NVIC_ISPR before any dispatch check, so the
-            // first instruction of the new quantum sees them.
-            if self.bus.irq_pending_dirty[core_id] {
-                self.cores[core_id].ppb.merge_irq_pending(self.bus.irq_pending[core_id]);
-                self.bus.irq_pending_dirty[core_id] = false;
+            // at the previous quantum raised IRQs via `assert_irq_*`.
+            // Phase 3 Stage 1 (LLD V7 §2) — `take_irq_pending` swaps the
+            // mask to zero; a non-zero return replaces the deleted
+            // `irq_pending_dirty` flag as the consume-and-merge signal.
+            let pending = self.bus.atomics.take_irq_pending(core_id);
+            if pending != 0 {
+                self.cores[core_id].ppb.merge_irq_pending(pending);
             }
 
             while !self.cores[core_id].is_halted()
@@ -298,20 +294,22 @@ impl Emulator {
     /// - WFI: if an enabled pending IRQ exists, wake the core.
     pub(crate) fn wake_checks(&mut self) {
         for i in 0..2 {
-            // WFE wake: event flag clears WFE sleep
-            if self.cores[i].wfe_waiting.load(Ordering::Acquire)
-                && self.bus.event_flag[i].load(Ordering::Acquire)
+            // WFE wake: event flag clears WFE sleep. Consume (AcqRel swap
+            // to false) pairs with `sev_both`'s Release.
+            if self.bus.atomics.is_wfe_waiting(i)
+                && self.bus.atomics.event_flag_consume(i)
             {
-                self.bus.event_flag[i].store(false, Ordering::Release);
-                self.cores[i].wfe_waiting.store(false, Ordering::Release);
+                self.bus.atomics.clear_wfe_waiting(i);
             }
-            // WFI wake: enabled pending IRQ clears WFI sleep
-            if self.cores[i].halted.load(Ordering::Acquire) {
-                let pending = self.bus.irq_pending[i];
+            // WFI wake: enabled pending IRQ clears WFI sleep. The peek is
+            // non-consuming; the next step() will merge via
+            // `take_irq_pending`.
+            if self.bus.atomics.is_halted(i) {
+                let pending = self.bus.atomics.irq_pending_load(i);
                 if pending != 0
                     && self.cores[i].ppb.any_pending_enabled(pending)
                 {
-                    self.cores[i].halted.store(false, Ordering::Release);
+                    self.bus.atomics.clear_halted(i);
                 }
             }
         }
@@ -422,10 +420,12 @@ impl Emulator {
             let low = addr & 0xFFFF;
             if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
                 let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-                let ispr = self.cores[0].ppb.nvic_ispr[word].load(Ordering::Relaxed);
+                let ispr = self.cores[0].ppb.nvic_ispr[word]
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let mask64 = (ispr as u64) << (word * 32);
                 let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
-                self.bus.irq_pending[0] = (self.bus.irq_pending[0] & keep) | mask64;
+                let prev = self.bus.atomics.irq_pending_load(0);
+                self.bus.atomics.set_irq_pending(0, (prev & keep) | mask64);
             }
         } else {
             self.bus.write32(addr, value, 0);
@@ -485,12 +485,21 @@ impl EmulatorBuilder {
         // — overwriting the post-bootrom seed with ROSC for default
         // callers would regress the invariant "Bus::new(), Emulator::new,
         // and Emulator::reset all yield the same clock state".
-        let mut bus = Bus::new();
+        //
+        // Phase 3 Stage 1: construct a single `Arc<CoreAtomics>` and
+        // hand it to Bus plus both cores so cross-core signalling
+        // (SEV/event_flag, IRQ pending, bus-fault, RCP) lands on shared
+        // state.
+        let atomics = Arc::new(crate::threaded::CoreAtomics::default());
+        let mut bus = Bus::with_atomics(Arc::clone(&atomics));
         if self.config.sys_clk_hz != Config::default().sys_clk_hz {
             bus.seed_sys_clk_hz(self.config.sys_clk_hz);
         }
         Emulator {
-            cores: [CortexM33::with_id(0), CortexM33::with_id(1)],
+            cores: [
+                CortexM33::new(0, Arc::clone(&atomics)),
+                CortexM33::new(1, atomics),
+            ],
             bus,
             clock: Clock { cycles: 0 },
             step_quantum: self.step_quantum,

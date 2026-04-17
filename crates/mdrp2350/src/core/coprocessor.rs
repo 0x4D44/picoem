@@ -542,12 +542,12 @@ impl CortexM33 {
                     // The immediate (CRn<<4)|CRm is a "tag" for SDK
                     // bookkeeping; we ignore it (bootrom pairs get/check
                     // with the same tag and relies only on consistency).
-                    self.regs.r[rt] = bus.rcp_salt[core] ^ 0xDEAD_BEEF;
+                    self.regs.r[rt] = bus.atomics.rcp_salt_load(core) ^ 0xDEAD_BEEF;
                 }
                 (1, 0) if rt == 15 => {
                     // rcp_canary_status pc: write NZCV to APSR.
                     // N = salt_valid[core]; Z=0, C=0, V=0.
-                    let n = if bus.rcp_salt_valid[core] { 1u32 << 31 } else { 0 };
+                    let n = if bus.atomics.rcp_salt_is_valid(core) { 1u32 << 31 } else { 0 };
                     self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | n;
                 }
                 _ => {} // unrecognized MRC: silent NOP
@@ -568,7 +568,7 @@ impl CortexM33 {
                 // execute its own salt-seeding path — which contains
                 // canary_get/check pairs that would otherwise trip before
                 // the salt is written — and continue to boot through.
-                let expected = bus.rcp_salt[core] ^ 0xDEAD_BEEF;
+                let expected = bus.atomics.rcp_salt_load(core) ^ 0xDEAD_BEEF;
                 if self.regs.r[rt] != expected {
                     self.pending_fault = Some(Fault::Nmi);
                 }
@@ -594,15 +594,13 @@ impl CortexM33 {
             }
             (4, 0) => {
                 // rcp_count_init imm — set the redundancy counter to imm.
-                bus.rcp_count = ((crn as u32) << 4) | (crm as u32);
+                bus.atomics.rcp_count_set(((crn as u32) << 4) | (crm as u32));
             }
             (5, 1) => {
                 // rcp_count_check imm — assert counter == imm, then increment.
                 let expected = ((crn as u32) << 4) | (crm as u32);
-                if bus.rcp_count != expected {
+                if bus.atomics.rcp_count_check(expected).is_err() {
                     self.pending_fault = Some(Fault::Nmi);
-                } else {
-                    bus.rcp_count = bus.rcp_count.wrapping_add(1);
                 }
             }
             _ => {
@@ -660,13 +658,11 @@ impl CortexM33 {
                 match crm {
                     0 => {
                         // rcp_salt_core0
-                        bus.rcp_salt[0] = self.regs.r[rt];
-                        bus.rcp_salt_valid[0] = true;
+                        bus.atomics.rcp_salt_set(0, self.regs.r[rt]);
                     }
                     1 => {
                         // rcp_salt_core1
-                        bus.rcp_salt[1] = self.regs.r[rt];
-                        bus.rcp_salt_valid[1] = true;
+                        bus.atomics.rcp_salt_set(1, self.regs.r[rt]);
                     }
                     _ => {} // unrecognized salt CRm: silent NOP
                 }
@@ -741,12 +737,12 @@ mod tests {
 
     #[test]
     fn test_cp7_rcp_salt_roundtrip() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 7);
 
-        // Poke salt directly into bus (rcp_salt lives on Bus now)
-        bus.rcp_salt[0] = 42;
+        // Poke salt directly via atomics (Phase 3 Stage 1 migration).
+        bus.atomics.rcp_salt_set(0, 42);
 
         // rcp_canary_get Rt=1, imm=0 — Phase 7 Stage E encoding
         // (MRC2 cp7, opc1=0, opc2=1, CRn=0, CRm=0).
@@ -762,7 +758,7 @@ mod tests {
         // wxma (MCR opc2=0, CRm=0) writes ARM Rt into half A of double 0;
         // rfma (MRC opc2=0, CRm=0) reads it back. Roundtrip locks in the
         // canonical transfer encoding.
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 
@@ -782,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_cpacr_blocks_disabled_cp() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         // CPACR defaults to 0 — all coprocessors disabled
 
@@ -794,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_cpacr_allows_enabled_cp() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 7);
 
@@ -813,7 +809,7 @@ mod tests {
     /// state, and returns cycle count 1.
     #[test]
     fn test_cp0_gpioc_read_matches_sio() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -832,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_out_set() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -845,7 +841,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_out_clr() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
         bus.sio.gpio_out = 0x0000_00FF;
@@ -859,7 +855,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_out_xor() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
         bus.sio.gpio_out = 0b1010;
@@ -873,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_out_put() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -895,7 +891,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_out_get() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -918,7 +914,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_oe_set_clr_xor_put_get() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -956,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_cp0_lo_out_put_then_get() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -975,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_cp0_lo_out_set_clr_xor() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1002,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_cp0_lo_oe_bulk() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1021,7 +1017,7 @@ mod tests {
 
     #[test]
     fn test_cp0_lo_in_get() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1034,7 +1030,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_in_get() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1057,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_cp0_bit_set_pin_30_masked() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1078,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_cp0_lo_out_put_masks_upper_bits() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1094,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_cp0_write_observed_via_mmio() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1120,7 +1116,7 @@ mod tests {
 
     #[test]
     fn test_cp0_cpacr_disabled_faults() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         // CPACR defaults to 0 — CP0 disabled.
 
@@ -1146,7 +1142,7 @@ mod tests {
     /// 30-bit bank, locking out the regression.
     #[test]
     fn test_cp0_hld_lo_out_get_reads_full_bank() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
@@ -1254,11 +1250,10 @@ mod tests {
 
     /// Convenience: prepare a CPU + Bus with CP7 enabled, salt set, salt valid.
     fn rcp_setup() -> (CortexM33, Bus) {
-        let mut cpu = CortexM33::new();
-        let mut bus = Bus::default();
+        let mut cpu = CortexM33::for_test(0);
+        let bus = Bus::default();
         enable_cp(&mut cpu, 7);
-        bus.rcp_salt[0] = 0x1234_5678;
-        bus.rcp_salt_valid[0] = true;
+        bus.atomics.rcp_salt_set(0, 0x1234_5678);
         (cpu, bus)
     }
 
@@ -1360,21 +1355,21 @@ mod tests {
         let (crn, crm) = split_imm8(0xc0);
         let (hw0, hw1) = encode_mcr2_full(7, 4, crn, 0, 0, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(bus.rcp_count, 0xc0);
+        assert_eq!(bus.atomics.rcp_count_load(), 0xc0);
         assert!(cpu.pending_fault.is_none());
 
         // count_check 0xc0 -> pass, increments to 0xc1
         let (hw0, hw1) = encode_mcr2_full(7, 5, crn, 0, 1, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
-        assert_eq!(bus.rcp_count, 0xc1);
+        assert_eq!(bus.atomics.rcp_count_load(), 0xc1);
 
         // count_check 0xc1 -> pass, increments to 0xc2
         let (crn, crm) = split_imm8(0xc1);
         let (hw0, hw1) = encode_mcr2_full(7, 5, crn, 0, 1, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
-        assert_eq!(bus.rcp_count, 0xc2);
+        assert_eq!(bus.atomics.rcp_count_load(), 0xc2);
     }
 
     #[test]
@@ -1487,7 +1482,7 @@ mod tests {
 
     #[test]
     fn test_rcp_canary_status_n_flag_clear_when_salt_invalid() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 7);
         // salt_valid defaults false
@@ -1543,7 +1538,7 @@ mod tests {
     /// bootrom relies on.
     #[test]
     fn test_rcp_canary_get_check_roundtrip_with_zero_salt() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 7);
         // salt is 0, salt_valid is false — bootrom early state.
@@ -1660,7 +1655,7 @@ mod tests {
         // Half A and half B of a double roundtrip through the transfer
         // family independently. Confirms the opc2 bit cleanly discriminates
         // the two halves of a single double.
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 
@@ -1675,7 +1670,7 @@ mod tests {
         // CP5 is a mirror of CP4 per the cp4_5_dcp dispatch. A write via
         // CP5 MCR must be observable via a CP4 MRC (and vice versa) —
         // they share the same register file on `CortexM33`.
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         enable_cp(&mut cpu, 5);
@@ -1694,7 +1689,7 @@ mod tests {
 
     #[test]
     fn test_dcp_dadd_basic() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 
@@ -1710,7 +1705,7 @@ mod tests {
 
     #[test]
     fn test_dcp_dsub_negative_result_sets_neg_bit() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 
@@ -1725,7 +1720,7 @@ mod tests {
 
     #[test]
     fn test_dcp_dmul_cycles_are_five() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 6.0);
@@ -1738,7 +1733,7 @@ mod tests {
 
     #[test]
     fn test_dcp_ddiv_cycles_eighteen() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 10.0);
@@ -1752,7 +1747,7 @@ mod tests {
 
     #[test]
     fn test_dcp_dsqrt_cycles_twentyeight() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 16.0);
@@ -1766,7 +1761,7 @@ mod tests {
 
     #[test]
     fn test_dcp_status_zero_bit() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 3.0);
@@ -1779,7 +1774,7 @@ mod tests {
 
     #[test]
     fn test_dcp_status_negative_zero_bit() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, -0.0);
@@ -1792,7 +1787,7 @@ mod tests {
 
     #[test]
     fn test_dcp_status_infinity_bit() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 1.0);
@@ -1806,7 +1801,7 @@ mod tests {
 
     #[test]
     fn test_dcp_status_nan_bit() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 0.0);
@@ -1825,7 +1820,7 @@ mod tests {
 
     #[test]
     fn test_dcp_status_negative_infinity() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, -1.0);
@@ -1840,7 +1835,7 @@ mod tests {
 
     #[test]
     fn test_dcp_dcmp_eq_true_and_false() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 3.14);
@@ -1856,7 +1851,7 @@ mod tests {
 
     #[test]
     fn test_dcp_dcmp_lt_le_gt_ge() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 1.0);
@@ -1898,7 +1893,7 @@ mod tests {
     #[test]
     fn test_dcp_dcmp_nan_all_false() {
         // IEEE-754: every compare involving a NaN (even eq) returns false.
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, f64::NAN);
@@ -1914,7 +1909,7 @@ mod tests {
 
     #[test]
     fn test_dcp_i2d_then_d2i_roundtrip() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         // Half A of double 0 carries i32 = -42.
@@ -1931,7 +1926,7 @@ mod tests {
 
     #[test]
     fn test_dcp_u2d_then_d2u_roundtrip() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         cpu.dcp_halves[0] = 0x8000_0001_u32;
@@ -1949,7 +1944,7 @@ mod tests {
     fn test_dcp_d2i_rounds_toward_zero() {
         // Rust's `f64 as i32` truncates toward zero. We adopt this as the DCP
         // convention (cheapest, matches the Pico SDK documented semantics).
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 3.9);
@@ -1964,7 +1959,7 @@ mod tests {
 
     #[test]
     fn test_dcp_f2d_then_d2f_roundtrip() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         let original: f32 = 2.71828;
@@ -1984,7 +1979,7 @@ mod tests {
 
     #[test]
     fn test_dcp_ddiv_one_by_zero_plus_inf() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 1.0);
@@ -1997,7 +1992,7 @@ mod tests {
 
     #[test]
     fn test_dcp_ddiv_zero_by_zero_nan() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
         dcp_set_double(&mut cpu, 0, 0.0);
@@ -2014,7 +2009,7 @@ mod tests {
 
     #[test]
     fn test_dcp_status_get_and_clr() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 
@@ -2041,7 +2036,7 @@ mod tests {
 
     #[test]
     fn test_dcp_cpacr_disabled_faults() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         // CPACR defaults to 0 — CP4/5 disabled.
         let (hw0, hw1) = encode_cdp_dcp(0, 0, 0, 0, 1);
@@ -2055,7 +2050,7 @@ mod tests {
     fn test_dcp_unrecognized_cdp_silent_nop() {
         // opc1=7 is not assigned (we use 0..3). Reserved opc2 under a valid
         // opc1 must also silent-NOP and not corrupt doubles.
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 
@@ -2112,7 +2107,7 @@ mod tests {
 
     #[test]
     fn test_dcp_all_eight_doubles_distinct() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 
@@ -2136,7 +2131,7 @@ mod tests {
     /// this test.
     #[test]
     fn test_dcp_d2i_nan_produces_zero_with_nan_status() {
-        let mut cpu = CortexM33::new();
+        let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
 

@@ -6,6 +6,7 @@
 //!
 //! See `wrk_docs/2026.04.17 - LLD - Threaded Dual-Core Phase 2 V4.md`.
 
+pub mod atomics;
 pub mod memory;
 pub mod gpio;
 pub mod monitors;
@@ -14,6 +15,7 @@ pub mod barrier;
 pub mod sio;
 pub mod pio;
 
+pub use atomics::CoreAtomics;
 pub use memory::SharedMemory;
 pub use gpio::AtomicGpio;
 pub use monitors::ExclusiveMonitors;

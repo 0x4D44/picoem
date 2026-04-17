@@ -382,8 +382,9 @@ impl CortexM33 {
         // `entry.fetch_wait` on both paths.
         bus.reset_extra_wait_states();
 
+        let core = self.core_id as usize;
         let hw0 = bus.read16(pc, self.core_id);
-        if bus.bus_fault() {
+        if bus.bus_fault(core) {
             // Fetch fault — DO NOT cache. Return a minimal entry so the
             // caller's dispatch path can proceed and the post-step fault
             // delivery will fire. `is_pure = false` keeps us on the slow
@@ -399,7 +400,7 @@ impl CortexM33 {
 
         let wide = is_wide(hw0);
         let hw1 = if wide { bus.read16(pc.wrapping_add(2), self.core_id) } else { 0 };
-        if wide && bus.bus_fault() {
+        if wide && bus.bus_fault(core) {
             return DecodedOp {
                 tag: u32::MAX,
                 hw0,

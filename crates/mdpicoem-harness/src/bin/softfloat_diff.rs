@@ -273,7 +273,7 @@ fn run_single(
     mode_label: &'static str,
 ) -> Option<Discrepancy> {
     // Emulator side.
-    let mut emu = CortexM33::new();
+    let mut emu = CortexM33::default();
     // Pre-load FPSCR with the control bits for this mode. Cumulative
     // exception flags start zero so we can read them cleanly after the op.
     emu.regs.fpscr = fpscr_mode;
@@ -593,7 +593,7 @@ fn run_one_half(
     f32_in: f32,
     f16_in: u16,
 ) -> bool {
-    let mut emu = CortexM33::new();
+    let mut emu = CortexM33::default();
     emu.regs.fpscr = fpscr_mode;
 
     match dir {
@@ -820,7 +820,7 @@ impl std::fmt::Display for DcpDiscrepancy {
 
 fn run_dcp_single(op: DcpOp, a: f64, b: f64) -> Option<DcpDiscrepancy> {
     // Emulator side — load a, b into d[0], d[1]; execute into d[2].
-    let mut emu = CortexM33::new();
+    let mut emu = CortexM33::default();
     let mut bus = Bus::default();
     enable_cp(&mut emu, 4);
     emu.dcp_set_double(0, a);

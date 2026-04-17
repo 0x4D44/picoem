@@ -9,7 +9,16 @@
 //! through PPB MMIO and call `test_enter_exception` / `test_exit_exception`
 //! to simulate the architecturally-defined paths.
 
+use std::sync::Arc;
 use mdrp2350::{Bus, CortexM33};
+use mdrp2350::threaded::CoreAtomics;
+
+/// Build a `CortexM33` with its own fresh `Arc<CoreAtomics>` for tests
+/// that don't share a bus. Integration-test helper mirroring the
+/// crate-internal `CortexM33::for_test`.
+fn new_core(id: u8) -> CortexM33 {
+    CortexM33::new(id, Arc::new(CoreAtomics::default()))
+}
 
 // ---------------------------------------------------------------------------
 // FPCCR bit positions — duplicated locally to avoid cross-crate coupling.
@@ -33,11 +42,15 @@ const HANDLER_VEC: u32 = HANDLER_ADDR | 1;
 /// default (real silicon resets them disabled, but tests want to observe
 /// the non-escalated fault paths).
 fn fixture() -> (CortexM33, Bus) {
-    let mut cpu = CortexM33::new();
+    // Phase 3 Stage 1: share one Arc<CoreAtomics> between core and bus so
+    // the step-path trip-wire (Arc::ptr_eq) passes. The lazy-flush test
+    // exercises the cross-component bus_fault signal path.
+    let atomics = Arc::new(CoreAtomics::default());
+    let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
     cpu.regs.msp = 0x2000_2000;
     cpu.regs.r[13] = cpu.regs.msp;
 
-    let mut bus = Bus::default();
+    let mut bus = Bus::with_atomics(atomics);
     // Phase 0b.1 Commit B: per-core PPB (VTOR / SHCSR / FPCCR etc.) now
     // lives on CortexM33, not Bus.
     cpu.ppb.vtor = VT_BASE;
@@ -540,11 +553,11 @@ fn core1_fpu_entry_exit_isolated_from_core0() {
     // one Bus. Each has its own register file and its own PPB lane.
     // Exercise FPU activity on Core 1 only and verify the FP frame is
     // taken on Core 1's PPB without leaking onto Core 0.
-    let mut core0 = CortexM33::with_id(0);
+    let mut core0 = new_core(0);
     core0.regs.msp = 0x2000_2000;
     core0.regs.r[13] = core0.regs.msp;
 
-    let mut core1 = CortexM33::with_id(1);
+    let mut core1 = new_core(1);
     core1.regs.msp = 0x2000_3000;
     core1.regs.r[13] = core1.regs.msp;
 
@@ -593,7 +606,7 @@ fn fpccr_reset_matches_architecture() {
     // Phase 0b.1 Commit B: reset value is produced by
     // `CortexM33::with_id` → `Ppb::default()`; check both cores.
     for id in 0..2u8 {
-        let cpu = CortexM33::with_id(id);
+        let cpu = new_core(id);
         let v = cpu.ppb.fpccr;
         assert_eq!(v & FPCCR_ASPEN, FPCCR_ASPEN, "core {}: ASPEN at reset", id);
         assert_eq!(v & FPCCR_LSPEN, FPCCR_LSPEN, "core {}: LSPEN at reset", id);

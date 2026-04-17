@@ -672,11 +672,13 @@ impl Ppb {
     }
 
     /// Union a 64-bit peripheral IRQ-pending bitmap into `nvic_ispr`.
-    /// Phase 0b.1 Commit B: called by the scheduler + step-path when
-    /// `bus.irq_pending_dirty[core]` signals a peripheral has asserted
-    /// a new IRQ. Uses `|=` so firmware self-pends already present in
-    /// `nvic_ispr` survive — the dispatch path clears bits on its own
-    /// (dual-clear invariant at `exceptions.rs` `try_take_any_pending_exception`).
+    /// Phase 0b.1 Commit B + Phase 3 Stage 1: called by the step-path
+    /// when `CoreAtomics::take_irq_pending` returns non-zero — that
+    /// swap-to-zero return is the consume-and-merge trigger that
+    /// replaced the pre-Stage-1 `bus.irq_pending_dirty[core]` flag.
+    /// Uses `|=` so firmware self-pends already present in `nvic_ispr`
+    /// survive — the dispatch path clears bits on its own (dual-clear
+    /// invariant at `exceptions.rs` `try_take_any_pending_exception`).
     pub(crate) fn merge_irq_pending(&mut self, pending: u64) {
         self.nvic_ispr[0].fetch_or(pending as u32, Ordering::Relaxed);
         self.nvic_ispr[1].fetch_or((pending >> 32) as u32, Ordering::Relaxed);
