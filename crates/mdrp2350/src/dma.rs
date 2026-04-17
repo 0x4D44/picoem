@@ -115,8 +115,7 @@ const REG_N_CHANNELS: u32 = 0x448;
 //  bit 31     AHB_ERROR   (RO, OR of READ_ERROR | WRITE_ERROR)
 const CTRL_EN: u32 = 1 << 0;
 /// `HIGH_PRIORITY` flag — not modelled in V1 (flat priority; HLD V5 §5.6
-/// "Not in V1"). Kept for datasheet fidelity / future promotion.
-#[allow(dead_code)]
+/// "Not in V1"). Used by [`Dma::check_inert_ctrl_bits`] for warn-once.
 const CTRL_HIGH_PRIORITY: u32 = 1 << 1;
 const CTRL_DATA_SIZE_SHIFT: u32 = 2;
 const CTRL_DATA_SIZE_MASK: u32 = 0x3 << CTRL_DATA_SIZE_SHIFT;
@@ -138,8 +137,8 @@ const CTRL_TREQ_SEL_SHIFT: u32 = 17;
 const CTRL_TREQ_SEL_MASK: u32 = 0x3F << CTRL_TREQ_SEL_SHIFT;
 const CTRL_IRQ_QUIET: u32 = 1 << 23;
 /// `BSWAP` (byte-swap) flag — not modelled in V1 (HLD V5 §5.6 "Not in
-/// V1"). Stored through CTRL RMW but ignored on transfer.
-#[allow(dead_code)]
+/// V1"). Stored through CTRL RMW but ignored on transfer. Used by
+/// [`Dma::check_inert_ctrl_bits`] for warn-once.
 const CTRL_BSWAP: u32 = 1 << 24;
 /// `SNIFF_EN` — not modelled in V1 (no CRC). Stored but ignored.
 #[allow(dead_code)]
@@ -260,6 +259,16 @@ pub struct Dma {
     timer_dreq_asserted: [bool; 4],
     sniff_ctrl: u32,
     sniff_data: u32,
+    /// Warn-once latch for `CHn_CTRL.BSWAP` bit set on a channel
+    /// (HLD V5 §4.A2 site 1). Byte-swap is not modelled.
+    warned_bswap: [bool; NUM_CHANNELS],
+    /// Warn-once latch for `CHn_CTRL.HIGH_PRIORITY` bit set on a channel
+    /// (HLD V5 §4.A2 site 4). Two-tier priority is not modelled.
+    warned_high_priority: [bool; NUM_CHANNELS],
+    /// Warn-once latch for `SNIFF_CTRL.EN` first set (HLD V5 §4.A2 site 2).
+    warned_sniff_ctrl_en: bool,
+    /// Warn-once latch for first `SNIFF_DATA` write (HLD V5 §4.A2 site 3).
+    warned_sniff_data: bool,
 }
 
 impl Default for Dma {
@@ -283,6 +292,10 @@ impl Dma {
             timer_dreq_asserted: [false; 4],
             sniff_ctrl: 0,
             sniff_data: 0,
+            warned_bswap: [false; NUM_CHANNELS],
+            warned_high_priority: [false; NUM_CHANNELS],
+            warned_sniff_ctrl_en: false,
+            warned_sniff_data: false,
         }
     }
 
@@ -403,8 +416,23 @@ impl Dma {
                     }
                 }
             }
-            REG_SNIFF_CTRL => self.sniff_ctrl = apply_alias(self.sniff_ctrl, value, alias),
-            REG_SNIFF_DATA => self.sniff_data = apply_alias(self.sniff_data, value, alias),
+            REG_SNIFF_CTRL => {
+                let new = apply_alias(self.sniff_ctrl, value, alias);
+                // Warn-once on first SNIFF_CTRL.EN set (HLD V5 §4.A2 site 2).
+                if (new & 1) != 0 && !self.warned_sniff_ctrl_en {
+                    self.warned_sniff_ctrl_en = true;
+                    tracing::warn!("DMA SNIFF_CTRL.EN set; CRC sniff not modelled");
+                }
+                self.sniff_ctrl = new;
+            }
+            REG_SNIFF_DATA => {
+                // Warn-once on first SNIFF_DATA write (HLD V5 §4.A2 site 3).
+                if !self.warned_sniff_data {
+                    self.warned_sniff_data = true;
+                    tracing::warn!("DMA SNIFF_DATA written; CRC sniff not modelled");
+                }
+                self.sniff_data = apply_alias(self.sniff_data, value, alias);
+            }
             REG_CHAN_ABORT => {
                 let mask = apply_alias(0, value, alias) & CHANNEL_MASK;
                 for i in 0..NUM_CHANNELS {
@@ -474,13 +502,38 @@ impl Dma {
             CH_CTRL_TRIG => {
                 let new = apply_alias(self.channels[ch_idx].ctrl, value, alias);
                 self.channels[ch_idx].ctrl = new & CTRL_WRITABLE_MASK;
+                self.check_inert_ctrl_bits(ch_idx, new);
                 self.trigger_channel(ch_idx);
             }
             CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
                 let new = apply_alias(self.channels[ch_idx].ctrl, value, alias);
                 self.channels[ch_idx].ctrl = new & CTRL_WRITABLE_MASK;
+                self.check_inert_ctrl_bits(ch_idx, new);
             }
             _ => {}
+        }
+    }
+
+    /// Warn-once per channel when firmware sets `CTRL.BSWAP` (bit 24)
+    /// or `CTRL.HIGH_PRIORITY` (bit 1) — inert registers inside the
+    /// modelled DMA peripheral (HLD V5 §4.A2 sites 1 & 4). Byte-swap
+    /// and two-tier priority are not modelled; storage round-trips
+    /// but transfer behaviour ignores these bits.
+    #[inline]
+    fn check_inert_ctrl_bits(&mut self, ch_idx: usize, ctrl: u32) {
+        if (ctrl & CTRL_BSWAP) != 0 && !self.warned_bswap[ch_idx] {
+            self.warned_bswap[ch_idx] = true;
+            tracing::warn!(
+                channel = ch_idx,
+                "DMA CHn_CTRL.BSWAP set; byte-swap not modelled"
+            );
+        }
+        if (ctrl & CTRL_HIGH_PRIORITY) != 0 && !self.warned_high_priority[ch_idx] {
+            self.warned_high_priority[ch_idx] = true;
+            tracing::warn!(
+                channel = ch_idx,
+                "DMA CHn_CTRL.HIGH_PRIORITY set; two-tier priority not modelled"
+            );
         }
     }
 
@@ -1403,5 +1456,117 @@ mod tests {
             0,
             "INTR bit 0 must latch on completion"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Inert-register warn-once tests (HLD V5 §4.A2 sites 1..=4).
+    // ----------------------------------------------------------------
+
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber};
+    use tracing::span::{Attributes, Id, Record};
+
+    #[derive(Default)]
+    struct CaptureSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FieldRecorder(String);
+    impl tracing::field::Visit for FieldRecorder {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let _ = write!(self.0, "{}={:?}", field.name(), value);
+        }
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut v = FieldRecorder(String::new());
+            event.record(&mut v);
+            let meta = event.metadata();
+            let line = format!("{} {} {}", meta.level(), meta.target(), v.0);
+            self.events.lock().unwrap().push(line);
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn count_warns_containing(events: &[String], needle: &str) -> usize {
+        events
+            .iter()
+            .filter(|line| line.starts_with("WARN"))
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn bswap_warn_fires_once_per_channel() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut dma = Dma::new();
+            // Two BSWAP-set writes on channel 3 — one warn.
+            dma.write32(3 * 0x40 + CH_AL1_CTRL, CTRL_BSWAP, 0);
+            dma.write32(3 * 0x40 + CH_AL1_CTRL, CTRL_BSWAP, 0);
+            // One BSWAP-set write on channel 7 — separate warn.
+            dma.write32(7 * 0x40 + CH_AL1_CTRL, CTRL_BSWAP, 0);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_containing(&events, "BSWAP");
+        assert_eq!(
+            matches, 2,
+            "expected one BSWAP warn per affected channel; got {} in {:?}",
+            matches, *events
+        );
+    }
+
+    #[test]
+    fn high_priority_warn_fires_once_per_channel() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut dma = Dma::new();
+            dma.write32(2 * 0x40 + CH_AL1_CTRL, CTRL_HIGH_PRIORITY, 0);
+            dma.write32(2 * 0x40 + CH_AL1_CTRL, CTRL_HIGH_PRIORITY, 0);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_containing(&events, "HIGH_PRIORITY");
+        assert_eq!(matches, 1, "got {:?}", *events);
+    }
+
+    #[test]
+    fn sniff_ctrl_en_warn_fires_once() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut dma = Dma::new();
+            // Two SNIFF_CTRL.EN-set writes — one warn.
+            dma.write32(REG_SNIFF_CTRL, 0x1, 0);
+            dma.write32(REG_SNIFF_CTRL, 0x1, 0);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_containing(&events, "SNIFF_CTRL.EN");
+        assert_eq!(matches, 1, "got {:?}", *events);
+    }
+
+    #[test]
+    fn sniff_data_warn_fires_once() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut dma = Dma::new();
+            dma.write32(REG_SNIFF_DATA, 0xDEAD_BEEF, 0);
+            dma.write32(REG_SNIFF_DATA, 0xCAFE_BABE, 0);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_containing(&events, "SNIFF_DATA");
+        assert_eq!(matches, 1, "got {:?}", *events);
     }
 }

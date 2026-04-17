@@ -153,6 +153,13 @@ pub struct PwmRegs {
     nvic_irq_wrap0: u32,
     /// NVIC IRQ for slices 8..=11 (`IRQ_PWM_IRQ_WRAP_1`).
     nvic_irq_wrap1: u32,
+    /// Warn-once latch for PWM DREQ-enable programming per slice
+    /// (HLD V5 §4.A2 site 5). DREQ-enable bits are **not modelled**;
+    /// the PWM → DMA DREQ lines are always deasserted. Firmware that
+    /// configures PWM for DMA pacing will not produce any DMA
+    /// triggers. Routed via [`Self::note_dma_enable`] — see method
+    /// doc for the RP2350 register-map assumption.
+    warned_dma_enable: [bool; PWM_SLICE_COUNT],
 }
 
 impl PwmRegs {
@@ -165,6 +172,33 @@ impl PwmRegs {
             intf: 0,
             nvic_irq_wrap0,
             nvic_irq_wrap1,
+            warned_dma_enable: [false; PWM_SLICE_COUNT],
+        }
+    }
+
+    /// Warn-once hook for PWM DREQ-enable programming on a slice
+    /// (HLD V5 §4.A2 site 5).
+    ///
+    /// **Register-map assumption.** RP2350 pico-sdk
+    /// `hardware/regs/pwm.h` does not expose a `CHn_DMA` register in
+    /// the PWM aperture — per-slice DMA DREQ lines are wired directly
+    /// from PWM wrap events to the DMA DREQ matrix (datasheet §12.6.3
+    /// DREQ table 84..95). If a firmware path or a future datasheet
+    /// revision surfaces a PWM-side DREQ-enable register, route into
+    /// this hook so the warn-once lands on first programming. Current
+    /// `read32`/`write32` dispatch does NOT call this hook — it's
+    /// reserved infrastructure. Exposed for direct test / external
+    /// instrumentation.
+    pub fn note_dma_enable(&mut self, slice: usize, dreq_bits_set: bool) {
+        if !dreq_bits_set || slice >= PWM_SLICE_COUNT {
+            return;
+        }
+        if !self.warned_dma_enable[slice] {
+            self.warned_dma_enable[slice] = true;
+            tracing::warn!(
+                slice,
+                "PWM CHn_DMA DREQ-enable bits set; PWM->DMA pacing not modelled"
+            );
         }
     }
 
@@ -512,5 +546,147 @@ mod tests {
         p.write32(EN, 0x03, 0, &mut irqs);
         p.write32(EN, 0x0C, 2, &mut irqs);
         assert_eq!(p.en, 0x0F);
+    }
+
+    // DIV=0 (raw divisor 0): counter must stay frozen and no panic.
+    #[test]
+    fn div_zero_counter_stops() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        p.write32(SLICE_TOP, 0xFFFF, 0, &mut irqs);
+        p.write32(SLICE_DIV, 0x0000, 0, &mut irqs); // raw divisor 0
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
+        p.write32(EN, 1, 0, &mut irqs);
+        p.tick(100, &default_tree(), &mut irqs);
+        assert_eq!(p.slices[0].ctr, 0, "DIV=0: counter must not advance");
+    }
+
+    // Fractional divisor: DIV=0x0033 (raw=51, i.e. 3.1875 in 8.4 units).
+    // After 64 sys_clks: (0 + 64*16) / 51 = 1024/51 = 20 advances,
+    // residue = 1024 % 51 = 4.
+    #[test]
+    fn fractional_div_non_integer_divisor_rounds_correctly() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        p.write32(SLICE_TOP, 0xFFFF, 0, &mut irqs);
+        p.write32(SLICE_DIV, 0x0033, 0, &mut irqs); // INT=3, FRAC=3, raw=51
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
+        p.write32(EN, 1, 0, &mut irqs);
+        p.tick(64, &default_tree(), &mut irqs);
+        assert_eq!(p.slices[0].ctr, 20, "DIV=0x33: 64 clks / 3.1875 = 20 advances");
+        assert_eq!(p.slices[0].frac_accum, 4, "residue 1024 % 51 = 4");
+    }
+
+    // Mid-run CH_DIV reprogram: stale frac_accum from old divisor must not
+    // corrupt the first tick under the new divisor.
+    // DIV=0x0033 (raw=51), tick 49 cycles → accum=19 (784%51), ctr=15.
+    // Reprogram to DIV=0x0010 (raw=16 = 1.0): accum must clear to 0.
+    // One tick: (0+16)/16 = 1. Stale (19+16)/16 = 2 — detects the bug.
+    #[test]
+    fn fractional_div_reprogram_resets_accumulator() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        p.write32(SLICE_TOP, 0xFFFF, 0, &mut irqs);
+        p.write32(SLICE_DIV, 0x0033, 0, &mut irqs); // raw=51
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
+        p.write32(EN, 1, 0, &mut irqs);
+        // 49 cycles: total=784, advance=15, accum=19 (784%51).
+        p.tick(49, &default_tree(), &mut irqs);
+        assert_eq!(p.slices[0].ctr, 15);
+        assert_eq!(p.slices[0].frac_accum, 19);
+        // Reprogram to DIV=0x0010 (raw=16, i.e. 1.0). Must reset accum to 0.
+        p.write32(SLICE_DIV, 0x0010, 0, &mut irqs);
+        assert_eq!(p.slices[0].frac_accum, 0, "reprogram must clear frac_accum");
+        // One tick: (0+16)/16 = 1; stale (19+16)/16 = 2 → detects the bug.
+        p.tick(1, &default_tree(), &mut irqs);
+        assert_eq!(p.slices[0].ctr, 16, "one tick at divisor 1.0 must advance by 1");
+    }
+
+    // Silicon oracle scenario S_PWM_FRACTIONAL_DIV: TOP=0xFFFF, DIV=0x0020
+    // (INT=2, FRAC=0 → divisor 2.0), EN=1, global EN slice 0 set.
+    // After 200 sys_clks the counter must advance by 100 (200 / 2.0).
+    // Regression: Phase 3.2 had advance = INT * cycles instead of cycles / INT,
+    // causing CTR = 400 instead of 100 for this setup.
+    #[test]
+    fn fractional_div_integer_2_advances_at_half_rate() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        p.write32(SLICE_TOP, 0xFFFF, 0, &mut irqs);
+        p.write32(SLICE_DIV, 0x0020, 0, &mut irqs); // INT=2, FRAC=0
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
+        p.write32(EN, 1, 0, &mut irqs);
+        p.tick(200, &default_tree(), &mut irqs);
+        assert_eq!(p.slices[0].ctr, 100, "divisor 2.0: CTR should be 200/2 = 100");
+    }
+
+    // --- Inert-register warn-once (HLD V5 §4.A2 site 5) ----------------
+
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber};
+    use tracing::span::{Attributes, Id, Record};
+
+    #[derive(Default)]
+    struct CaptureSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FieldRecorder(String);
+    impl tracing::field::Visit for FieldRecorder {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let _ = write!(self.0, "{}={:?}", field.name(), value);
+        }
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut v = FieldRecorder(String::new());
+            event.record(&mut v);
+            let meta = event.metadata();
+            let line = format!("{} {} {}", meta.level(), meta.target(), v.0);
+            self.events.lock().unwrap().push(line);
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn count_warns_containing(events: &[String], needle: &str) -> usize {
+        events
+            .iter()
+            .filter(|line| line.starts_with("WARN"))
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn dma_enable_warn_fires_once_per_slice() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut p = new_pwm();
+            // Two enable calls on slice 5 — one warn.
+            p.note_dma_enable(5, true);
+            p.note_dma_enable(5, true);
+            // Enable on slice 9 — separate warn.
+            p.note_dma_enable(9, true);
+            // "No bits set" on another slice — no warn.
+            p.note_dma_enable(2, false);
+            // Out-of-range slice — no warn, no panic.
+            p.note_dma_enable(12, true);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_containing(&events, "DMA DREQ-enable");
+        assert_eq!(
+            matches, 2,
+            "expected one warn per distinct slice; got {} in {:?}",
+            matches, *events
+        );
     }
 }

@@ -22,11 +22,13 @@ use crate::irq::{
 };
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::{ADC_BASE, AdcRegs};
+use crate::peripherals::coresight_trace::{CORESIGHT_TRACE_BASE, CoresightTraceRegs};
 use crate::peripherals::i2c::{I2C0_BASE, I2C1_BASE, I2cRegs};
 use crate::peripherals::inert::{GLITCH_DETECTOR_BASE, GlitchDetector, SYSCFG_BASE, SysCfg, TBMAN_BASE, Tbman};
 use crate::peripherals::io_bank0::{IO_BANK0_BASE, IoBank0Regs};
 use crate::peripherals::otp::{OTP_DATA_BASE, OTP_DATA_SIZE, Otp};
 use crate::peripherals::pads_bank0::{PADS_BANK0_BASE, PadsBank0Regs};
+use crate::peripherals::powman::{POWMAN_BASE, PowmanRegs};
 use crate::peripherals::psm::{PSM_BASE, Psm};
 use crate::peripherals::pwm::{PWM_BASE, PwmRegs};
 use crate::peripherals::sha256::{SHA256_BASE, Sha256Regs};
@@ -319,6 +321,15 @@ pub struct Bus {
     pub(crate) trng: Trng,
     /// SHA-256 — 16-word block compressor (HLD V5 §7.D.6).
     pub(crate) sha256: Sha256Regs,
+    /// POWMAN — AON timer + VREG + ARCHSEL storage (HLD V5 §8.E.1).
+    /// No tick advancement; warn-once on COUNT/MATCH/non-Arm ARCHSEL.
+    pub(crate) powman: PowmanRegs,
+    /// CORESIGHT_TRACE — storage-only CoreSight block at `0xE004_1000`
+    /// (HLD V5 §8.E.2). No trace data produced.
+    pub(crate) coresight_trace: CoresightTraceRegs,
+    /// Warn-once latch for `CLOCKS.CLK_*_CTRL.ENABLE` clear (HLD V5
+    /// §4.A2 site 9). Keyed on CLOCKS offset of the CTRL register.
+    pub(crate) warned_clk_enable_clear: std::collections::HashSet<u32>,
     /// Word-aligned MMIO addresses for which an "unmodelled access" warn
     /// has already been emitted. HLD V5 §4.A1 — warn once per address,
     /// per `Bus` instance, so firmware or tests that hammer an
@@ -530,6 +541,9 @@ impl Bus {
             otp: Otp::new(),
             trng: Trng::new(),
             sha256: Sha256Regs::new(),
+            powman: PowmanRegs::new(),
+            coresight_trace: CoresightTraceRegs::new(),
+            warned_clk_enable_clear: std::collections::HashSet::new(),
             warned_addrs: std::collections::HashSet::new(),
             watchdog_reset_requested: false,
             flash_loaded: false,
@@ -707,6 +721,13 @@ impl Bus {
     // --- Boot RAM helpers (0xEFFF_F000..0xF000_0000) ---
 
     /// Check if address is in the 4KB boot RAM region.
+    /// Returns true if `addr` lies in the CORESIGHT_TRACE aperture
+    /// (`0xE004_1000..0xE004_2000`). 4 KB window — HLD V5 §8.E.2.
+    #[inline]
+    pub fn is_coresight_trace(addr: u32) -> bool {
+        addr >= CORESIGHT_TRACE_BASE && addr < CORESIGHT_TRACE_BASE + 0x1000
+    }
+
     pub fn is_boot_ram(addr: u32) -> bool {
         addr >= 0xEFFF_F000 && addr < 0xF000_0000
     }
@@ -1427,6 +1448,7 @@ impl Bus {
                         }
                         TRNG_BASE => self.trng.read32(offset),
                         SHA256_BASE => self.sha256.read32(offset),
+                        POWMAN_BASE => self.powman.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -1457,6 +1479,11 @@ impl Bus {
                 word.to_le_bytes()[(addr & 3) as usize]
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read8(addr),
+            0xE if Self::is_coresight_trace(addr) => {
+                let word_off = (addr - CORESIGHT_TRACE_BASE) & !3;
+                let byte_idx = (addr & 3) as usize;
+                self.coresight_trace.read32(word_off).to_le_bytes()[byte_idx]
+            }
             0xE => 0, // PPB (stub)
             _ => {
                 self.atomics.set_bus_fault(core as usize, addr);
@@ -1739,15 +1766,16 @@ impl Bus {
                             let word_val = (val as u32) << (byte_idx * 8);
                             self.otp.write32(otp_word_off, word_val);
                         }
-                        TRNG_BASE | SHA256_BASE => {
-                            // TRNG / SHA narrow byte — subword-alias strategy.
+                        TRNG_BASE | SHA256_BASE | POWMAN_BASE => {
+                            // TRNG / SHA / POWMAN narrow byte — subword-alias strategy.
                             let word_addr = canonical & !3;
                             let byte_idx = (canonical & 3) as usize;
                             let reg_offset = word_addr & 0x0000_0FFF;
                             let (word_val, pass_alias) = if alias == 0 {
                                 let old_word = match base {
                                     TRNG_BASE => self.trng.read32(reg_offset),
-                                    _ => self.sha256.read32(reg_offset),
+                                    SHA256_BASE => self.sha256.read32(reg_offset),
+                                    _ => self.powman.read32(reg_offset),
                                 };
                                 let mut bytes = old_word.to_le_bytes();
                                 bytes[byte_idx] = val;
@@ -1757,7 +1785,8 @@ impl Bus {
                             };
                             match base {
                                 TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
-                                _ => self.sha256.write32(reg_offset, word_val, pass_alias),
+                                SHA256_BASE => self.sha256.write32(reg_offset, word_val, pass_alias),
+                                _ => self.powman.write32(reg_offset, word_val, pass_alias),
                             }
                         }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
@@ -1826,6 +1855,17 @@ impl Bus {
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write8(addr, val),
+            0xE if Self::is_coresight_trace(addr) => {
+                // Narrow byte write — pack into the correct lane,
+                // merge at word granularity.
+                let word_off = (addr - CORESIGHT_TRACE_BASE) & !3;
+                let byte_idx = (addr & 3) as usize;
+                let old = self.coresight_trace.read32(word_off);
+                let mut bytes = old.to_le_bytes();
+                bytes[byte_idx] = val;
+                self.coresight_trace
+                    .write32(word_off, u32::from_le_bytes(bytes), 0);
+            }
             _ => {} // ROM read-only, others unmapped/stub
         }
         if self.mmio_trace_enabled {
@@ -1993,6 +2033,7 @@ impl Bus {
                         }
                         TRNG_BASE => self.trng.read32(offset),
                         SHA256_BASE => self.sha256.read32(offset),
+                        POWMAN_BASE => self.powman.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -2025,6 +2066,12 @@ impl Bus {
                 [word as u16, (word >> 16) as u16][half_idx]
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read16(addr),
+            0xE if Self::is_coresight_trace(addr) => {
+                let word_off = (addr - CORESIGHT_TRACE_BASE) & !3;
+                let word = self.coresight_trace.read32(word_off);
+                let half_idx = ((addr >> 1) & 1) as usize;
+                [word as u16, (word >> 16) as u16][half_idx]
+            }
             _ => {
                 self.atomics.set_bus_fault(core as usize, addr);
                 0
@@ -2292,15 +2339,16 @@ impl Bus {
                             let word_val = (val as u32) << (half_idx * 16);
                             self.otp.write32(otp_word_off, word_val);
                         }
-                        TRNG_BASE | SHA256_BASE => {
-                            // TRNG / SHA halfword path — subword alias.
+                        TRNG_BASE | SHA256_BASE | POWMAN_BASE => {
+                            // TRNG / SHA / POWMAN halfword path — subword alias.
                             let word_addr = canonical & !3;
                             let half_idx = ((canonical >> 1) & 1) as usize;
                             let reg_offset = word_addr & 0x0000_0FFF;
                             let (word_val, pass_alias) = if alias == 0 {
                                 let old_word = match base {
                                     TRNG_BASE => self.trng.read32(reg_offset),
-                                    _ => self.sha256.read32(reg_offset),
+                                    SHA256_BASE => self.sha256.read32(reg_offset),
+                                    _ => self.powman.read32(reg_offset),
                                 };
                                 let mut halves: [u16; 2] =
                                     [old_word as u16, (old_word >> 16) as u16];
@@ -2311,7 +2359,8 @@ impl Bus {
                             };
                             match base {
                                 TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
-                                _ => self.sha256.write32(reg_offset, word_val, pass_alias),
+                                SHA256_BASE => self.sha256.write32(reg_offset, word_val, pass_alias),
+                                _ => self.powman.write32(reg_offset, word_val, pass_alias),
                             }
                         }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
@@ -2379,6 +2428,15 @@ impl Bus {
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write16(addr, val),
+            0xE if Self::is_coresight_trace(addr) => {
+                let word_off = (addr - CORESIGHT_TRACE_BASE) & !3;
+                let half_idx = ((addr >> 1) & 1) as usize;
+                let old = self.coresight_trace.read32(word_off);
+                let mut halves: [u16; 2] = [old as u16, (old >> 16) as u16];
+                halves[half_idx] = val;
+                let merged = (halves[0] as u32) | ((halves[1] as u32) << 16);
+                self.coresight_trace.write32(word_off, merged, 0);
+            }
             _ => {}
         }
         if self.mmio_trace_enabled {
@@ -2478,6 +2536,7 @@ impl Bus {
                         }
                         TRNG_BASE => self.trng.read32(offset),
                         SHA256_BASE => self.sha256.read32(offset),
+                        POWMAN_BASE => self.powman.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -2504,6 +2563,9 @@ impl Bus {
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
+            0xE if Self::is_coresight_trace(addr) => {
+                self.coresight_trace.read32(addr - CORESIGHT_TRACE_BASE)
+            }
             _ => {
                 self.atomics.set_bus_fault(core as usize, addr);
                 0
@@ -2649,6 +2711,7 @@ impl Bus {
                         }
                         TRNG_BASE => self.trng.write32(offset, val, alias),
                         SHA256_BASE => self.sha256.write32(offset, val, alias),
+                        POWMAN_BASE => self.powman.write32(offset, val, alias),
                         0x5020_0000 => self.pio[0].write32(offset, val, alias),
                         0x5030_0000 => self.pio[1].write32(offset, val, alias),
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),
@@ -2682,6 +2745,13 @@ impl Bus {
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),
+            0xE if Self::is_coresight_trace(addr) => {
+                // CORESIGHT_TRACE 4 KB aperture — plain storage
+                // round-trip. No APB alias encoding; writes always
+                // replace the stored word.
+                let offset = addr - CORESIGHT_TRACE_BASE;
+                self.coresight_trace.write32(offset, val, 0);
+            }
             // Unmapped regions raise a precise bus fault so flush-style
             // writers (Phase 7 Stage B lazy FP) and other speculative
             // stores see the failure. Mirrors the read32 unmapped path.

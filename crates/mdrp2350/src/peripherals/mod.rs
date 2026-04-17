@@ -23,11 +23,13 @@
 //! the normalised alias argument already threaded through `Bus::write32`.
 
 pub mod adc;
+pub mod coresight_trace;
 pub mod i2c;
 pub mod inert;
 pub mod io_bank0;
 pub mod otp;
 pub mod pads_bank0;
+pub mod powman;
 pub mod psm;
 pub mod pwm;
 pub mod sha256;

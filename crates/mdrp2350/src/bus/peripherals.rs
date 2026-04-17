@@ -162,6 +162,42 @@ impl Bus {
             3 => current & !val,
             _ => val,
         };
+        // Warn-once on first CLK_*_CTRL write that clears the ENABLE bit
+        // (HLD V5 §4.A2 site 9). ENABLE = bit 11 per RP2350 datasheet
+        // §8.1 CLK_*_CTRL layout (CLK_GPOUT*/CLK_PERI/CLK_HSTX/CLK_USB/
+        // CLK_ADC — the non-glitchless gates). CLK_REF_CTRL (0x030) and
+        // CLK_SYS_CTRL (0x03C) are glitchless and do not expose an
+        // ENABLE bit, so they are excluded here. For these registers,
+        // the current peripherals model silently drops the write — we
+        // still catch the ENABLE=0 semantic from the incoming word.
+        const CLK_CTRL_ENABLE_BIT: u32 = 1 << 11;
+        const GATED_CTRLS: &[u32] = &[
+            0x000, // CLK_GPOUT0_CTRL
+            0x00C, // CLK_GPOUT1_CTRL
+            0x018, // CLK_GPOUT2_CTRL
+            0x024, // CLK_GPOUT3_CTRL
+            0x048, // CLK_PERI_CTRL
+            0x054, // CLK_HSTX_CTRL
+            0x060, // CLK_USB_CTRL
+            0x06C, // CLK_ADC_CTRL
+        ];
+        if GATED_CTRLS.contains(&offset) {
+            // "Clears ENABLE" semantics:
+            //   alias 0 (plain) — incoming word has ENABLE cleared.
+            //   alias 3 (CLR)   — incoming value sets ENABLE (clears it in storage).
+            //   alias 1/2 (XOR/SET) — storage is not modelled, skip.
+            let clears_enable = match alias {
+                0 => (val & CLK_CTRL_ENABLE_BIT) == 0,
+                3 => (val & CLK_CTRL_ENABLE_BIT) != 0,
+                _ => false,
+            };
+            if clears_enable && self.warned_clk_enable_clear.insert(offset) {
+                tracing::warn!(
+                    ctrl_offset = format_args!("{:#05X}", offset),
+                    "CLOCKS CLK_*_CTRL.ENABLE cleared; clock-gate behaviour not modelled"
+                );
+            }
+        }
         match offset {
             0x030 => self.clk_ref_ctrl = apply(self.clk_ref_ctrl),
             0x03C => self.clk_sys_ctrl = apply(self.clk_sys_ctrl),
@@ -441,5 +477,73 @@ mod tests {
         let mut bus = Bus::new();
         // RP2350 CLK_SYS_SELECTED at 0x040_10044.
         assert_eq!(bus.read32(0x4001_0044, 0), 0x1);
+    }
+
+    // --- Inert-register warn: CLK_*_CTRL.ENABLE clear (HLD V5 §4.A2) ---
+
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber};
+    use tracing::span::{Attributes, Id, Record};
+
+    #[derive(Default)]
+    struct CaptureSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FieldRecorder(String);
+    impl tracing::field::Visit for FieldRecorder {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let _ = write!(self.0, "{}={:?}", field.name(), value);
+        }
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut v = FieldRecorder(String::new());
+            event.record(&mut v);
+            let meta = event.metadata();
+            let line = format!("{} {} {}", meta.level(), meta.target(), v.0);
+            self.events.lock().unwrap().push(line);
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn count_warns_containing(events: &[String], needle: &str) -> usize {
+        events
+            .iter()
+            .filter(|line| line.starts_with("WARN"))
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn clk_peri_ctrl_enable_clear_warns_once() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber { events: captured.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            let mut bus = Bus::new();
+            // CLK_PERI_CTRL is at CLOCKS offset 0x048 → 0x4001_0048.
+            // Plain write of 0 (ENABLE cleared) — warn fires.
+            bus.write32(0x4001_0048, 0, 0);
+            // A second plain write with ENABLE cleared — same register,
+            // no second warn.
+            bus.write32(0x4001_0048, 0, 0);
+        });
+        let events = captured.lock().unwrap();
+        let matches = count_warns_containing(&events, "CLK_*_CTRL.ENABLE cleared");
+        assert_eq!(
+            matches, 1,
+            "expected exactly one ENABLE-clear warn; got {} in {:?}",
+            matches, *events
+        );
     }
 }

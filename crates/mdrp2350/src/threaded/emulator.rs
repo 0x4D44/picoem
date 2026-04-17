@@ -198,6 +198,9 @@ impl ThreadedEmulator {
             otp: _,
             trng: _,
             sha256: _,
+            powman: _,
+            coresight_trace: _,
+            warned_clk_enable_clear: _,
         } = bus;
 
         let shared_mem = Arc::new(SharedMemory::from_memory(
