@@ -19,23 +19,16 @@ use crate::threaded::CoreAtomics;
 pub use registers::Registers;
 pub use bus_trait::CoreBus;
 
-/// Per-core interpolator register file (INTERP0 or INTERP1).
-///
-/// 32 words of RP2350 SIO register state. Phase 3 Stage 3 (LLD V7 §6):
-/// the RP2350 `INTERP0` (SIO 0x080–0x0BC) and `INTERP1` (0x0C0–0x0FC)
-/// are per-core — core 0 and core 1 do not share register state. We
-/// model each core's pair of interpolators as two `Interp` instances
-/// on `PerCoreSio`. Only the storage moves off `Sio` onto the core;
-/// semantics (currently a passive register round-trip — see the old
-/// `Sio::read32`/`write32` arms at 0x080..=0x0FC) are unchanged.
-#[derive(Clone, Copy)]
-pub struct Interp(pub [u32; 16]);
-
-impl Default for Interp {
-    fn default() -> Self {
-        Self([0; 16])
-    }
-}
+// Per-core interpolator register file (INTERP0 or INTERP1). Phase 3
+// Stage 3 (LLD V7 §6) moved register storage off `Sio` onto each core's
+// `PerCoreSio`. Step 5 (Coverage Gap Fill, HLD V5 §5 Part B) replaced
+// the passive `[u32; 16]` round-trip with a live arithmetic unit —
+// shift + mask + signed + cross-input/result + add-raw + force-MSB +
+// BLEND (INTERP0) + CLAMP (INTERP1) + sticky OVERF with W1C. The
+// implementation lives in `sio::interp`; we re-export it here so
+// `PerCoreSio::interp` uses the exact same type as any call site going
+// through `sio::interp::Interp`.
+pub use crate::sio::Interp;
 
 /// Per-core SIO state that cannot be shared across cores — DIV and INTERP
 /// register files. Lives on `CortexM33` so each core has its own copy;
@@ -50,7 +43,7 @@ impl Default for PerCoreSio {
     fn default() -> Self {
         Self {
             divider: Divider::default(),
-            interp: [Interp::default(); 2],
+            interp: [Interp::new(), Interp::new()],
         }
     }
 }
@@ -73,14 +66,14 @@ impl PerCoreSio {
                 let dirty = if self.divider.dirty { 2 } else { 0 };
                 ready | dirty
             }
-            // Interpolators (0x080–0x0FC)
+            // Interpolators (0x080–0x0FC) — live arithmetic per §2.7.
             0x080..=0x0BC => {
-                let idx = ((offset - 0x080) >> 2) as usize;
-                self.interp[0].0[idx]
+                let off = offset - 0x080;
+                self.interp[0].read(off, false)
             }
             0x0C0..=0x0FC => {
-                let idx = ((offset - 0x0C0) >> 2) as usize;
-                self.interp[1].0[idx]
+                let off = offset - 0x0C0;
+                self.interp[1].read(off, true)
             }
             _ => 0,
         }
@@ -91,12 +84,14 @@ impl PerCoreSio {
         match offset {
             0x060..=0x078 => self.divider_write(offset, val),
             0x080..=0x0BC => {
-                let idx = ((offset - 0x080) >> 2) as usize;
-                self.interp[0].0[idx] = val;
+                let off = offset - 0x080;
+                // SIO lives in bus region 0xD with no APB alias encoding;
+                // always pass alias = 0.
+                self.interp[0].write(off, val, 0);
             }
             0x0C0..=0x0FC => {
-                let idx = ((offset - 0x0C0) >> 2) as usize;
-                self.interp[1].0[idx] = val;
+                let off = offset - 0x0C0;
+                self.interp[1].write(off, val, 0);
             }
             _ => {}
         }
@@ -1111,35 +1106,22 @@ mod tests {
 
     // ---- Interpolator tests (migrated from `sio::tests`) ----
 
-    #[test]
-    fn interp_register_round_trip() {
-        let mut s = PerCoreSio::default();
-        // Write to INTERP0_ACCUM0 (offset 0x080)
-        s.write32(0x080, 0xCAFE_BABE);
-        assert_eq!(s.read32(0x080), 0xCAFE_BABE);
-        // Write to last INTERP1 register (offset 0x0FC)
-        s.write32(0x0FC, 0xDEAD_BEEF);
-        assert_eq!(s.read32(0x0FC), 0xDEAD_BEEF);
-        // First register unchanged
-        assert_eq!(s.read32(0x080), 0xCAFE_BABE);
-    }
+    // Under live Interp semantics (Step 5), most INTERP register
+    // offsets are NOT passive storage — POP/PEEK have side effects,
+    // RESULT* are computed, CTRL_LANE1 strips OVERF bits on read,
+    // BASE_1AND0 is write-only. Round-trip tests covering every
+    // offset lived under passive storage and are obsolete here.
+    // Arithmetic coverage lives in `sio::interp::tests`.
 
     #[test]
-    fn interp_all_registers() {
+    fn interp_accum_round_trip_via_percoresio() {
         let mut s = PerCoreSio::default();
-        // Each INTERP bank exposes 16 words via MMIO:
-        // INTERP0 at 0x080..=0x0BC, INTERP1 at 0x0C0..=0x0FC. Stage 3
-        // split the backing storage into two banks (§6), so i must
-        // stay within the 16-word range of each bank — a larger range
-        // would spill INTERP0 writes into INTERP1 (0x080 + 16*4 = 0x0C0).
-        for i in 0u32..16 {
-            s.write32(0x080 + i * 4, i + 1);
-            s.write32(0x0C0 + i * 4, i + 101);
-        }
-        for i in 0u32..16 {
-            assert_eq!(s.read32(0x080 + i * 4), i + 1);
-            assert_eq!(s.read32(0x0C0 + i * 4), i + 101);
-        }
+        // ACCUM0 on INTERP0 (offset 0x00 within INTERP0 bank at 0x080).
+        s.write32(0x080, 0xCAFE_BABE);
+        assert_eq!(s.read32(0x080), 0xCAFE_BABE);
+        // ACCUM0 on INTERP1 (bank at 0x0C0).
+        s.write32(0x0C0, 0xDEAD_BEEF);
+        assert_eq!(s.read32(0x0C0), 0xDEAD_BEEF);
     }
 
     #[test]
