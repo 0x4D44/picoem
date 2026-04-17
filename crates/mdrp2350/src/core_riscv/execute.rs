@@ -265,6 +265,7 @@ impl Hazard3 {
             }
 
             Op::Illegal { insn: _ } => {
+                self.undef_count = self.undef_count.wrapping_add(1);
                 self.enter_trap(cause::ILLEGAL_INSTRUCTION, 0, epc, bus);
             }
         }

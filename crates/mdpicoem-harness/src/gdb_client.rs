@@ -694,6 +694,54 @@ impl GdbClient {
         }
     }
 
+    /// Insert a hardware breakpoint at `addr`. `kind` is the target-specific
+    /// kind field from GDB RSP `Z1,addr,kind` — for RV32 and M-profile this
+    /// is the instruction size in bytes (2 or 4). QEMU accepts any kind for
+    /// a hw-breakpoint on our target, but we pass through whatever the
+    /// caller supplies so the wire format is faithful.
+    pub fn set_hw_breakpoint(&mut self, addr: u32, kind: u32) -> io::Result<()> {
+        let reply = self.send_recv(&format!("Z1,{addr:x},{kind}"))?;
+        if reply == "OK" {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Z1 {addr:#010x}: expected 'OK', got '{reply}'"),
+            ))
+        }
+    }
+
+    /// Remove a hardware breakpoint previously installed with
+    /// [`Self::set_hw_breakpoint`]. `kind` must match the install-time value.
+    /// Returns `Ok(())` on `"OK"`; any other reply is mapped to `InvalidData`.
+    pub fn remove_hw_breakpoint(&mut self, addr: u32, kind: u32) -> io::Result<()> {
+        let reply = self.send_recv(&format!("z1,{addr:x},{kind}"))?;
+        if reply == "OK" {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("z1 {addr:#010x}: expected 'OK', got '{reply}'"),
+            ))
+        }
+    }
+
+    /// Continue execution until a stop event (breakpoint hit, trap, etc).
+    /// Uses the vCont-all-threads form (`vCont;c`) so this works regardless
+    /// of whether the target enumerates threads. Returns `Ok(())` on the
+    /// expected `T`/`S` stop reply.
+    pub fn continue_exec(&mut self) -> io::Result<()> {
+        let reply = self.send_recv("vCont;c")?;
+        if reply.starts_with('T') || reply.starts_with('S') {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("vCont;c: expected stop reply (T/S), got '{reply}'"),
+            ))
+        }
+    }
+
     /// Send kill packet. Best-effort — errors are ignored.
     pub fn kill(&mut self) {
         let _ = self.send_packet("k");

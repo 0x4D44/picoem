@@ -55,6 +55,13 @@ pub struct Hazard3 {
     /// Hazard3 external-IRQ controller (Xh3irq CSR window at 0xBE0..0xBE5).
     /// P4 wires this to drive `mip[11]` (MEIP).
     pub(crate) xh3irq: Xh3Irq,
+    /// Monotonic count of `Op::Illegal` dispatches — bumped by the executor
+    /// when the decoder hands back an undefined encoding (the architectural
+    /// illegal-instruction trap still fires; this is an additional oracle
+    /// hook). Fuzz harnesses snapshot this before/after a test case and
+    /// escalate any growth to a test failure (LLD §10 unknown-opcode
+    /// escalation).
+    pub(crate) undef_count: u32,
 }
 
 impl Hazard3 {
@@ -70,6 +77,7 @@ impl Hazard3 {
             wfi_parked: false,
             csrs: CsrFile::new(),
             xh3irq: Xh3Irq::new(),
+            undef_count: 0,
         }
     }
 
@@ -199,6 +207,68 @@ impl Hazard3 {
     /// Per-core cycle count (scheduler view).
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+
+    /// Read one of the 32 integer registers. `x[0]` always reads as zero;
+    /// indices 1..31 read whatever storage currently holds (including
+    /// whatever the harness staged). Intended for harness / test code
+    /// that sets up a pre-state via `set_gpr` and inspects post-state
+    /// after `Emulator::step`.
+    pub fn gpr(&self, index: u8) -> u32 {
+        let i = (index as usize) & 0x1F;
+        if i == 0 {
+            0
+        } else {
+            self.x[i]
+        }
+    }
+
+    /// Write one of the 32 integer registers. Writes to `x[0]` are
+    /// silently dropped (architecturally wired to zero). See [`Self::gpr`].
+    pub fn set_gpr(&mut self, index: u8, value: u32) {
+        let i = (index as usize) & 0x1F;
+        if i != 0 {
+            self.x[i] = value;
+        }
+    }
+
+    /// Current program counter. Read-only view for harness / tests.
+    pub fn pc(&self) -> u32 {
+        self.pc
+    }
+
+    /// Set the program counter directly. Used by harness / test code to
+    /// jump into a staged instruction stream without walking the reset
+    /// vector.
+    pub fn set_pc(&mut self, pc: u32) {
+        self.pc = pc;
+    }
+
+    /// Read `mcause` directly. Harness needs this for trap-handler path
+    /// diffs (Zicsr class).
+    pub fn mcause(&self) -> u32 {
+        self.csrs.mcause
+    }
+
+    /// Set `mtvec` directly. Used by the harness to install a bespoke
+    /// trap-handler stub before running a Zicsr test case. Writes the raw
+    /// 32-bit value (no WARL masking — caller is responsible).
+    pub fn set_mtvec(&mut self, v: u32) {
+        self.csrs.mtvec = v;
+    }
+
+    /// Hart halt flag — observed by `step_pair_riscv`. Setting to `true`
+    /// prevents further dispatch; clearing resumes execution.
+    pub fn set_halted(&mut self, halted: bool) {
+        self.halted = halted;
+    }
+
+    /// Current undefined-instruction counter — the number of `Op::Illegal`
+    /// dispatches since power-on / last `reset`. Fuzz harnesses snapshot
+    /// this before/after each test case and treat any delta as a test
+    /// failure (LLD §10).
+    pub fn undef_count(&self) -> u32 {
+        self.undef_count
     }
 
     /// True when the hart is halted or `wfi`-parked — either condition

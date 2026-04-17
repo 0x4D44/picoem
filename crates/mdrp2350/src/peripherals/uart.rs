@@ -985,27 +985,28 @@ mod tests {
         // Release UART0 (scenario's RESETS_CLR_ALL does this; UART0 is
         // already released post-bootrom on the emulator, but we mirror
         // the silicon setup sequence exactly).
-        bus.write32(RESETS_CLR, 1 << RESET_UART0);
+        bus.write32(RESETS_CLR, 1 << RESET_UART0, 0);
         // Scenario setup sequence (matching silicon_scenarios.rs order).
-        bus.write32(CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE);
-        bus.write32(UART0_BASE + UARTIBRD, 81);
-        bus.write32(UART0_BASE + UARTFBRD, 24);
-        bus.write32(UART0_BASE + UARTLCR_H, UARTLCR_H_FEN | LCR_H_WLEN_8);
+        bus.write32(CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE, 0);
+        bus.write32(UART0_BASE + UARTIBRD, 81, 0);
+        bus.write32(UART0_BASE + UARTFBRD, 24, 0);
+        bus.write32(UART0_BASE + UARTLCR_H, UARTLCR_H_FEN | LCR_H_WLEN_8, 0);
         bus.write32(
             UART0_BASE + UARTCR,
             UARTCR_UARTEN | UARTCR_LBE | UARTCR_RXE | UARTCR_TXE,
+            0,
         );
-        bus.write32(UART0_BASE + UARTDR, 0x42);
+        bus.write32(UART0_BASE + UARTDR, 0x42, 0);
         // Advance 60,000 sysclks (matching the scenario's max_sysclks).
         bus.tick_peripherals(60_000);
-        let fr = bus.read32(UART0_BASE + UARTFR);
+        let fr = bus.read32(UART0_BASE + UARTFR, 0);
         assert_eq!(
             fr, 0x0000_0080,
             "end-to-end EMU UARTFR must be 0x80 (TXFE + RX byte + CTS=0); got 0x{fr:08X}",
         );
         // The looped-back byte must be recoverable — the observable
         // UARTDR mask 0xFF on silicon reads 0x42 after the fix.
-        let dr = bus.read32(UART0_BASE + UARTDR) & 0xFF;
+        let dr = bus.read32(UART0_BASE + UARTDR, 0) & 0xFF;
         assert_eq!(dr, 0x42, "RX FIFO must hold the loopback byte 0x42; got 0x{dr:02X}");
     }
 }
