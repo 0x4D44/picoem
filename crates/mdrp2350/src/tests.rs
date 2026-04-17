@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use crate::core::CortexM33;
 use crate::bus::Bus;
 use crate::threaded::CoreAtomics;
+use crate::Cores;
 
 // ============================================================================
 // Helper: build a core + bus, optionally pre-load SRAM
@@ -5586,13 +5587,13 @@ fn test_reset_loads_sp_and_pc_from_rom() {
     emu.reset();
 
     // Verify initial state
-    assert_eq!(emu.cores[0].regs.msp, 0x2008_0000);
-    assert_eq!(emu.cores[0].regs.r[13], 0x2008_0000);
-    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0100); // bit 0 cleared
-    assert_eq!(emu.cores[0].regs.xpsr & (1 << 24), 1 << 24); // Thumb bit
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.msp, 0x2008_0000);
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.r[13], 0x2008_0000);
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0100); // bit 0 cleared
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.xpsr & (1 << 24), 1 << 24); // Thumb bit
 
     // Core 1 should be at reset vector (same as Core 0 — both boot)
-    assert_eq!(emu.cores[1].regs.pc(), 0x0000_0100);
+    assert_eq!(emu.cores.expect_arm_mut()[1].regs.pc(), 0x0000_0100);
 
     // Run a few cycles - should execute the NOP then hit the infinite loop
     for _ in 0..10 {
@@ -5600,7 +5601,7 @@ fn test_reset_loads_sp_and_pc_from_rom() {
     }
 
     // Should be stuck at the infinite loop (0x102)
-    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0102);
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0102);
 }
 
 #[test]
@@ -5633,9 +5634,9 @@ fn test_svc_exception_round_trip() {
     }
 
     // After SVC -> handler -> return, should be in the infinite loop at 0x102
-    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0102);
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0102);
     // Should be back in thread mode (IPSR = 0)
-    assert_eq!(emu.cores[0].regs.ipsr(), 0);
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0);
 }
 
 #[test]
@@ -5665,9 +5666,9 @@ fn test_busfault_on_unmapped_access() {
     emu.reset();
 
     // Pre-set: R1 = 0x60000000 (unmapped address)
-    emu.cores[0].regs.r[1] = 0x6000_0000;
+    emu.cores.expect_arm_mut()[0].regs.r[1] = 0x6000_0000;
     // Enable BusFault handler in SHCSR (bit 17)
-    emu.cores[0].ppb.shcsr |= 1 << 17;
+    emu.core_mut(0).ppb.shcsr |= 1 << 17;
 
     // Run
     for _ in 0..50 {
@@ -5675,7 +5676,7 @@ fn test_busfault_on_unmapped_access() {
     }
 
     // CFSR should have PRECISERR (bit 9) set
-    assert_ne!(emu.cores[0].ppb.cfsr & (1 << 9), 0, "PRECISERR should be set");
+    assert_ne!(emu.core_mut(0).ppb.cfsr & (1 << 9), 0, "PRECISERR should be set");
 }
 
 /// BKPT must halt the core. The silicon oracles (`silicon_isr_diff_*`,
@@ -5741,9 +5742,10 @@ fn core0_step(emu: &mut Emulator) {
     // non-zero return replaces the V5 `irq_pending_dirty` flag.
     let pending = emu.bus.atomics.take_irq_pending(0);
     if pending != 0 {
-        emu.cores[0].ppb.merge_irq_pending(pending);
+        emu.core_mut(0).ppb.merge_irq_pending(pending);
     }
-    emu.cores[0].step(&mut emu.bus);
+    let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+    arm[0].step(&mut emu.bus);
 }
 
 const ICSR_ADDR: u32 = 0xE000_ED04;
@@ -5758,13 +5760,13 @@ fn test_async_dispatch_pendsv_enters_handler() {
     emu.reset();
 
     for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores[0].regs.ipsr(), 0, "must be in thread mode before pend");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0, "must be in thread mode before pend");
 
-    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
+    emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores[0].regs.ipsr(), 14, "should be in PendSV handler");
-    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0200, "PC at PendSV handler entry");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 14, "should be in PendSV handler");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0200, "PC at PendSV handler entry");
 }
 
 #[test]
@@ -5774,10 +5776,10 @@ fn test_async_dispatch_clears_pending_bit_on_entry() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
+    emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores[0].ppb.icsr & ICSR_PENDSVSET_BIT, 0,
+    assert_eq!(emu.core_mut(0).ppb.icsr & ICSR_PENDSVSET_BIT, 0,
         "SET bit must clear on exception activation (ARMv8-M §B3.2.4)");
 }
 
@@ -5788,12 +5790,12 @@ fn test_async_dispatch_primask_masks_pendsv() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    emu.cores[0].regs.primask = 1;
-    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
+    emu.core_mut(0).regs.primask = 1;
+    emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
 
     for _ in 0..10 { core0_step(&mut emu); }
-    assert_eq!(emu.cores[0].regs.ipsr(), 0, "PRIMASK must block PendSV");
-    assert_ne!(emu.cores[0].ppb.icsr & ICSR_PENDSVSET_BIT, 0, "pending bit must remain set");
+    assert_eq!(emu.core_mut(0).regs.ipsr(), 0, "PRIMASK must block PendSV");
+    assert_ne!(emu.core_mut(0).ppb.icsr & ICSR_PENDSVSET_BIT, 0, "pending bit must remain set");
 }
 
 #[test]
@@ -5803,11 +5805,11 @@ fn test_async_dispatch_pendsvclr_prevents_dispatch() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    emu.cores[0].ppb.write32(ICSR_ADDR, ICSR_PENDSVSET_BIT);
-    emu.cores[0].ppb.write32(ICSR_ADDR, ICSR_PENDSVCLR_BIT);
+    emu.core_mut(0).ppb.write32(ICSR_ADDR, ICSR_PENDSVSET_BIT);
+    emu.core_mut(0).ppb.write32(ICSR_ADDR, ICSR_PENDSVCLR_BIT);
 
     for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores[0].regs.ipsr(), 0, "cleared pend bit must not dispatch");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0, "cleared pend bit must not dispatch");
 }
 
 #[test]
@@ -5817,14 +5819,14 @@ fn test_async_dispatch_pendsv_round_trip() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    let main_pc_before = emu.cores[0].regs.pc();
-    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
+    let main_pc_before = emu.core_mut(0).regs.pc();
+    emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
 
     // Step enough for entry + BX LR + exit: 3 instructions worth.
     for _ in 0..5 { core0_step(&mut emu); }
 
-    assert_eq!(emu.cores[0].regs.ipsr(), 0, "must be back in thread mode");
-    assert_eq!(emu.cores[0].regs.pc(), main_pc_before, "must resume main loop PC");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0, "must be back in thread mode");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), main_pc_before, "must resume main loop PC");
 }
 
 #[test]
@@ -5834,11 +5836,11 @@ fn test_async_dispatch_systick_enters_handler() {
     emu.reset();
     for _ in 0..5 { core0_step(&mut emu); }
 
-    emu.cores[0].ppb.icsr |= ICSR_PENDSTSET_BIT;
+    emu.core_mut(0).ppb.icsr |= ICSR_PENDSTSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores[0].regs.ipsr(), 15, "should be in SysTick handler");
-    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0280, "PC at SysTick handler entry");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 15, "should be in SysTick handler");
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0280, "PC at SysTick handler entry");
 }
 
 // ============================================================================
@@ -5870,26 +5872,26 @@ fn test_tail_chain_pendsv_to_systick_preserves_frame() {
 
     // Step 1: pend PendSV + SysTick simultaneously. PendSV wins dispatch
     // (lower exc number at same priority). Single-step enters PendSV.
-    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT | ICSR_PENDSTSET_BIT;
+    emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT | ICSR_PENDSTSET_BIT;
     core0_step(&mut emu);
-    assert_eq!(emu.cores[0].regs.ipsr(), 14, "PendSV wins arbitration");
-    assert_ne!(emu.cores[0].ppb.icsr & ICSR_PENDSTSET_BIT, 0,
+    assert_eq!(emu.core_mut(0).regs.ipsr(), 14, "PendSV wins arbitration");
+    assert_ne!(emu.core_mut(0).ppb.icsr & ICSR_PENDSTSET_BIT, 0,
         "SysTick must remain pending while PendSV is active");
-    let msp_in_pendsv = emu.cores[0].regs.msp;
+    let msp_in_pendsv = emu.cores.expect_arm_mut()[0].regs.msp;
 
     // Step 2: runs the single BX LR in the handler. exit_exception
     // sees SysTick pending and tail-chains — no unstack, no re-stack.
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores[0].regs.ipsr(), 15,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 15,
         "tail-chain must activate SysTick, not return to thread");
-    assert_eq!(emu.cores[0].regs.msp, msp_in_pendsv,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.msp, msp_in_pendsv,
         "tail-chain must NOT pop the frame — MSP preserved for the new handler");
-    assert_eq!(emu.cores[0].regs.pc(), 0x0000_0280,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0280,
         "PC at SysTick handler entry address");
-    assert_eq!(emu.cores[0].ppb.icsr & ICSR_PENDSTSET_BIT, 0,
+    assert_eq!(emu.core_mut(0).ppb.icsr & ICSR_PENDSTSET_BIT, 0,
         "SysTick pending bit clears on tail-chain activation");
-    assert!(CortexM33::is_exc_return(emu.cores[0].regs.lr()),
+    assert!(CortexM33::is_exc_return(emu.cores.expect_arm_mut()[0].regs.lr()),
         "LR still an EXC_RETURN magic (frame held for eventual thread return)");
 }
 
@@ -6014,15 +6016,15 @@ fn test_external_irq_pend_plus_enable_enters_handler() {
     // Pending + enabled IRQ 0 (TIMER0_IRQ_0) should dispatch; PC lands
     // at the TIMER0_IRQ_0 vector slot.
     let mut emu = load_external_irq_emu();
-    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0); // NVIC_ISER enable IRQ 0
+    emu.core_mut(0).ppb.write32(0xE000_E100, 1u32 << 0); // NVIC_ISER enable IRQ 0
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
-    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
+    emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16 + 0,
         "IPSR must be TIMER0_IRQ_0 (exception 16)");
-    assert_eq!(emu.cores[0].regs.pc(), 0x2000_0200,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x2000_0200,
         "PC at TIMER0 handler entry");
 }
 
@@ -6031,10 +6033,10 @@ fn test_external_irq_pending_without_enable_does_not_dispatch() {
     // irq_pending bit is set but NVIC_ISER bit is clear → no dispatch.
     let mut emu = load_external_irq_emu();
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
-    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
+    emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores[0].regs.ipsr(), 0,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0,
         "pending-without-enable must not dispatch");
 }
 
@@ -6043,13 +6045,13 @@ fn test_external_irq_priority_mask_blocks_dispatch() {
     // PRIMASK=1 blocks all configurable priorities, including external
     // IRQs at priority 0.
     let mut emu = load_external_irq_emu();
-    emu.cores[0].regs.primask = 1;
-    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
+    emu.core_mut(0).regs.primask = 1;
+    emu.core_mut(0).ppb.write32(0xE000_E100, 1u32 << 0);
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
-    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
+    emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores[0].regs.ipsr(), 0,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0,
         "PRIMASK must block external IRQ dispatch");
 }
 
@@ -6058,14 +6060,14 @@ fn test_external_irq_basepri_masks_dispatch() {
     // BASEPRI=0x20 + IRQ priority 0xC0 → IRQ priority is numerically
     // larger (lower priority) than BASEPRI → IRQ is masked.
     let mut emu = load_external_irq_emu();
-    emu.cores[0].regs.basepri = 0x20;
-    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
-    emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.core_mut(0).regs.basepri = 0x20;
+    emu.core_mut(0).ppb.write32(0xE000_E100, 1u32 << 0);
+    emu.core_mut(0).ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
-    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
+    emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores[0].regs.ipsr(), 0,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0,
         "BASEPRI=0x20 must mask IRQ at priority 0xC0");
 }
 
@@ -6073,14 +6075,14 @@ fn test_external_irq_basepri_masks_dispatch() {
 fn test_external_irq_basepri_zero_is_transparent() {
     // BASEPRI=0 (the default) must not mask any IRQ.
     let mut emu = load_external_irq_emu();
-    emu.cores[0].regs.basepri = 0;
-    emu.cores[0].ppb.write32(0xE000_E100, 1u32 << 0);
-    emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.core_mut(0).regs.basepri = 0;
+    emu.core_mut(0).ppb.write32(0xE000_E100, 1u32 << 0);
+    emu.core_mut(0).ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
-    emu.cores[0].ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
+    emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     core0_step(&mut emu);
-    assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16 + 0,
         "BASEPRI=0 is transparent; IRQ 0 must dispatch");
 }
 
@@ -6110,10 +6112,11 @@ fn test_assert_irq_core_targets_receiver() {
         "core 0 irq_pending must remain clear");
     // Drive the merge and re-check NVIC_ISPR — core 1 latches, core 0
     // stays clean.
-    emu.cores[1].ppb.merge_irq_pending(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed));
-    assert_ne!(emu.cores[1].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
+    let pending1 = emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed);
+    emu.core_mut(1).ppb.merge_irq_pending(pending1);
+    assert_ne!(emu.core_mut(1).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 1 must latch after merge");
-    assert_eq!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
+    assert_eq!(emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 0 must remain clear");
 }
 
@@ -6149,11 +6152,13 @@ fn test_assert_irq_shared_latches_on_both_cores() {
     assert!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) != 0
          && emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) != 0,
         "both cores' irq_pending must carry the pending signal");
-    emu.cores[0].ppb.merge_irq_pending(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed));
-    emu.cores[1].ppb.merge_irq_pending(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed));
-    assert_ne!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
+    let pending0 = emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed);
+    emu.core_mut(0).ppb.merge_irq_pending(pending0);
+    let pending1b = emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed);
+    emu.core_mut(1).ppb.merge_irq_pending(pending1b);
+    assert_ne!(emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 0 must latch after merge");
-    assert_ne!(emu.cores[1].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
+    assert_ne!(emu.core_mut(1).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
         "NVIC_ISPR on core 1 must latch after merge");
 }
 
@@ -6208,7 +6213,7 @@ fn test_mmio_nvic_ispr_write_mirrors_into_irq_pending_and_dispatches() {
         "NVIC_ISPR MMIO write must mirror into bus.irq_pending[core]");
     // And the dispatch path must enter the handler on next step.
     core0_step(&mut emu);
-    assert_eq!(emu.cores[0].regs.ipsr(), 16 + 0,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16 + 0,
         "MMIO-pended IRQ 0 must enter exception 16 on next step");
 }
 
@@ -6225,7 +6230,7 @@ fn test_mmio_nvic_icpr_write_drops_irq_pending_mirror() {
     emu.mmio_write32(0xE000_E280, 1u32 << 0);
     assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0), 0,
         "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror");
-    assert_eq!(emu.cores[0].ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 0), 0,
+    assert_eq!(emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 0), 0,
         "NVIC_ICPR MMIO write must clear the architectural latch");
 }
 
@@ -6281,7 +6286,7 @@ fn test_unified_arbitration_external_irq_beats_pendsv() {
     emu.mmio_write32(0xE000_E200, 1u32 << 0); // NVIC_ISPR IRQ 0
     // One step: unified arbitration picks IRQ 0 (priority 0x20 beats 0x80).
     core0_step(&mut emu);
-    assert_eq!(emu.cores[0].regs.ipsr(), 16,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16,
         "unified arbitration must pick IRQ 0 (priority 0x20) over PendSV (priority 0x80)");
 }
 
@@ -6300,7 +6305,7 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
     let mut taken = false;
     for _ in 0..5 {
         core0_step(&mut emu);
-        if emu.cores[0].regs.ipsr() == 16 {
+        if emu.cores.expect_arm_mut()[0].regs.ipsr() == 16 {
             taken = true;
             break;
         }
@@ -6309,7 +6314,7 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
     // Now pend IRQ 1 at higher priority. Must preempt on next step.
     emu.mmio_write32(0xE000_E200, 1u32 << 1);
     core0_step(&mut emu);
-    assert_eq!(emu.cores[0].regs.ipsr(), 17,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 17,
         "IRQ 1 (priority 0x40) must preempt IRQ 0 handler (priority 0xC0)");
 }
 
@@ -6383,12 +6388,12 @@ fn test_execution_priority_basepri_vs_higher_priority_irq() {
     // IRQ at priority 0xC0 (numerically greater than BASEPRI) must be
     // blocked — `can_preempt(0xC0_irq)` should return false.
     let mut emu = load_external_irq_emu();
-    emu.cores[0].regs.basepri = 0x80;
-    let can = emu.cores[0].can_preempt(16 + 0); // IRQ 0 priority 0
+    emu.core_mut(0).regs.basepri = 0x80;
+    let can = emu.core_mut(0).can_preempt(16 + 0); // IRQ 0 priority 0
     assert!(can, "IRQ at priority 0 always beats BASEPRI 0x80");
     // But an IRQ with priority 0xC0 set via NVIC_IPR should NOT preempt.
-    emu.cores[0].ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
-    let can_irq0_at_0xc0 = emu.cores[0].can_preempt(16 + 0);
+    emu.core_mut(0).ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    let can_irq0_at_0xc0 = emu.core_mut(0).can_preempt(16 + 0);
     assert!(!can_irq0_at_0xc0,
         "IRQ 0 at priority 0xC0 must not preempt BASEPRI 0x80");
 }
@@ -6668,31 +6673,37 @@ fn ldrex_peer_write_strex_fail() {
     // write setup. We hand-install `exclusive_address` on core 0 rather
     // than running a LDREX instruction — this test is about the snoop,
     // not the LDREX decode path.
-    emu.cores[0].exclusive_address = Some(addr);
+    emu.core_mut(0).exclusive_address = Some(addr);
     // Core 1 performs a write via the wrapper; this sets its
     // `did_write_this_quantum = true` and writes to memory.
-    emu.cores[1].bus_write32(addr, 0x1234_5678, &mut emu.bus);
-    assert!(emu.cores[1].did_write_this_quantum);
+    {
+        let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+        arm[1].bus_write32(addr, 0x1234_5678, &mut emu.bus);
+    }
+    assert!(emu.core_mut(1).did_write_this_quantum);
 
     // Drive one Emulator::step — both cores are at reset-vector PC (fetch
     // whatever is at ROM 0, likely a NOP-like default), but the only
     // thing we care about is the snoop firing at the quantum boundary.
     // Halt both cores so they don't execute anything and clobber state;
     // the snoop logic runs regardless of execution.
-    emu.cores[0].halt();
-    emu.cores[1].halt();
+    emu.core_mut(0).halt();
+    emu.core_mut(1).halt();
     emu.step();
-    assert_eq!(emu.cores[0].exclusive_address, None,
+    assert_eq!(emu.core_mut(0).exclusive_address, None,
         "peer-core write must invalidate our monitor via the snoop");
-    assert!(!emu.cores[1].did_write_this_quantum,
+    assert!(!emu.core_mut(1).did_write_this_quantum,
         "snoop must clear did_write_this_quantum for the next quantum");
 
     // And STREX from core 0 now fails, completing the scenario.
-    emu.cores[0].wake();
-    emu.cores[0].set_reg(2, addr);
-    emu.cores[0].set_reg(1, 0xBEEF_F00D);
-    emu.cores[0].execute_one_wide_with_bus(0xE842, 0x1000, &mut emu.bus);
-    assert_eq!(emu.cores[0].reg(0), 1, "STREX must fail after peer snoop");
+    emu.core_mut(0).wake();
+    emu.core_mut(0).set_reg(2, addr);
+    emu.core_mut(0).set_reg(1, 0xBEEF_F00D);
+    {
+        let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+        arm[0].execute_one_wide_with_bus(0xE842, 0x1000, &mut emu.bus);
+    }
+    assert_eq!(emu.core_mut(0).reg(0), 1, "STREX must fail after peer snoop");
 }
 
 #[test]
@@ -6737,16 +6748,19 @@ fn ldrex_ldrex_strex_strex_race() {
     }
 
     // Set each core's PC, SP, and working regs.
-    for c in 0..2 {
-        emu.cores[c].regs.msp = 0x2008_0000;
-        emu.cores[c].regs.r[13] = 0x2008_0000;
-        emu.cores[c].regs.r[2] = addr;
-        emu.cores[c].regs.xpsr = 1 << 24; // Thumb
+    {
+        let arm = emu.cores.expect_arm_mut();
+        for c in 0..2 {
+            arm[c].regs.msp = 0x2008_0000;
+            arm[c].regs.r[13] = 0x2008_0000;
+            arm[c].regs.r[2] = addr;
+            arm[c].regs.xpsr = 1 << 24; // Thumb
+        }
     }
-    emu.cores[0].regs.set_pc(0x2000_0000);
-    emu.cores[0].regs.r[1] = 0xAAAA_0000;
-    emu.cores[1].regs.set_pc(0x2000_0100);
-    emu.cores[1].regs.r[1] = 0xBBBB_0000;
+    emu.core_mut(0).regs.set_pc(0x2000_0000);
+    emu.core_mut(0).regs.r[1] = 0xAAAA_0000;
+    emu.core_mut(1).regs.set_pc(0x2000_0100);
+    emu.core_mut(1).regs.r[1] = 0xBBBB_0000;
 
     // Drive enough quanta for both cores to execute LDREX (step 1) then
     // STREX (step 2). LDREX/STREX cost 2 cycles each and `step_quantum=1`,
@@ -6754,19 +6768,19 @@ fn ldrex_ldrex_strex_strex_race() {
     // soon as both cores have executed both instructions (PC advanced by
     // 8 bytes from their program start).
     for _ in 0..64 {
-        if emu.cores[0].regs.pc() >= 0x2000_0008
-            && emu.cores[1].regs.pc() >= 0x2000_0108
+        if emu.core_mut(0).regs.pc() >= 0x2000_0008
+            && emu.core_mut(1).regs.pc() >= 0x2000_0108
         {
             break;
         }
         emu.step();
     }
-    assert_eq!(emu.cores[0].reg(0), 0, "core 0 STREX wins");
-    assert_eq!(emu.cores[1].reg(0), 1, "core 1 STREX loses");
+    assert_eq!(emu.core_mut(0).reg(0), 0, "core 0 STREX wins");
+    assert_eq!(emu.core_mut(1).reg(0), 1, "core 1 STREX loses");
     assert_eq!(emu.bus.read32(addr, 0), 0xAAAA_0000,
         "memory shows the winning store");
-    assert_eq!(emu.cores[0].exclusive_address, None);
-    assert_eq!(emu.cores[1].exclusive_address, None);
+    assert_eq!(emu.core_mut(0).exclusive_address, None);
+    assert_eq!(emu.core_mut(1).exclusive_address, None);
 }
 
 // -- LDREXB / STREXB ---------------------------------------------------------
@@ -6939,29 +6953,26 @@ fn bootrom_diagnostic_run() {
 
     for cycle in 0..1_000_000 {
         emu.step();
-        let pc = emu.cores[0].regs.pc();
+        let pc = emu.cores.expect_arm_mut()[0].regs.pc();
 
         // Trace key bootrom addresses (dedup: skip if same PC as last trace)
         for &(addr, label) in trace_addrs {
             if pc == addr && pc != last_trace_pc {
                 last_trace_pc = pc;
                 eprintln!("[cycle {:>7}] Reached {:#010x}: {}", cycle, addr, label);
+                let c0 = &emu.cores.expect_arm()[0];
                 eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                    emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                    emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
+                    c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]);
                 eprintln!("  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
-                    emu.cores[0].regs.r[4], emu.cores[0].regs.r[5],
-                    emu.cores[0].regs.r[6], emu.cores[0].regs.r[7]);
-                eprintln!("  LR={:#010x} SP={:#010x} secure={}", emu.cores[0].regs.lr(), emu.cores[0].regs.sp(), emu.cores[0].secure);
+                    c0.regs.r[4], c0.regs.r[5], c0.regs.r[6], c0.regs.r[7]);
+                eprintln!("  LR={:#010x} SP={:#010x} secure={}", c0.regs.lr(), c0.regs.sp(), c0.secure);
                 eprintln!("  R8={:#010x} R9={:#010x} R10={:#010x} R11={:#010x} R12={:#010x}",
-                    emu.cores[0].regs.r[8], emu.cores[0].regs.r[9],
-                    emu.cores[0].regs.r[10], emu.cores[0].regs.r[11], emu.cores[0].regs.r[12]);
+                    c0.regs.r[8], c0.regs.r[9], c0.regs.r[10], c0.regs.r[11], c0.regs.r[12]);
                 eprintln!("  MSP={:#010x} MSP_NS={:#010x} PSP={:#010x} PSP_NS={:#010x}",
-                    emu.cores[0].regs.msp, emu.cores[0].regs.msp_ns,
-                    emu.cores[0].regs.psp, emu.cores[0].regs.psp_ns);
+                    c0.regs.msp, c0.regs.msp_ns, c0.regs.psp, c0.regs.psp_ns);
                 // Extra detail at bxns points
                 if addr == 0x0382 || addr == 0x7EA4 {
-                    let target = if addr == 0x0382 { emu.cores[0].regs.r[0] } else { emu.cores[0].regs.lr() };
+                    let target = if addr == 0x0382 { c0.regs.r[0] } else { c0.regs.lr() };
                     eprintln!("  BXNS target={:#010x}", target);
                     // Try to read memory at target
                     let t = target & !1;
@@ -6993,7 +7004,7 @@ fn bootrom_diagnostic_run() {
         }
 
         // Report when we first enter a fault handler
-        let ipsr = emu.cores[0].regs.ipsr();
+        let ipsr = emu.cores.expect_arm_mut()[0].regs.ipsr();
         if ipsr >= 2 && ipsr <= 6 && !fault_reported {
             fault_reported = true;
             let exc_name = match ipsr {
@@ -7005,16 +7016,16 @@ fn bootrom_diagnostic_run() {
                 _ => "Unknown",
             };
             eprintln!("*** {} entered at cycle {} ***", exc_name, cycle);
-            eprintln!("  PC={:#010x} LR={:#010x}", pc, emu.cores[0].regs.lr());
-            eprintln!("  CFSR={:#010x} HFSR={:#010x}", emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
-            eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.cores[0].ppb.bfar, emu.cores[0].ppb.mmfar);
+            let c0 = &emu.cores.expect_arm()[0];
+            eprintln!("  PC={:#010x} LR={:#010x}", pc, c0.regs.lr());
+            eprintln!("  CFSR={:#010x} HFSR={:#010x}", c0.ppb.cfsr, c0.ppb.hfsr);
+            eprintln!("  BFAR={:#010x} MMFAR={:#010x}", c0.ppb.bfar, c0.ppb.mmfar);
             eprintln!("  R0-R3: {:#010x} {:#010x} {:#010x} {:#010x}",
-                emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
-            eprintln!("  SP={:#010x} MSP={:#010x}", emu.cores[0].regs.sp(), emu.cores[0].regs.msp);
+                c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]);
+            eprintln!("  SP={:#010x} MSP={:#010x}", c0.regs.sp(), c0.regs.msp);
             eprintln!("  Max bootrom PC so far={:#010x}", max_pc);
             // Read exception frame from stack
-            let sp = emu.cores[0].regs.msp;
+            let sp = c0.regs.msp;
             let r0 = emu.peek(sp);
             let r1 = emu.peek(sp + 4);
             let r2 = emu.peek(sp + 8);
@@ -7033,19 +7044,19 @@ fn bootrom_diagnostic_run() {
             stuck_count += 1;
             if stuck_count > 100 {
                 eprintln!("Stuck at PC={:#010x} after {} cycles", pc, cycle);
-                eprintln!("  IPSR={}, LR={:#010x}", emu.cores[0].regs.ipsr(), emu.cores[0].regs.lr());
-                eprintln!("  CFSR={:#010x}, HFSR={:#010x}", emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
+                let c0 = &emu.cores.expect_arm()[0];
+                eprintln!("  IPSR={}, LR={:#010x}", c0.regs.ipsr(), c0.regs.lr());
+                eprintln!("  CFSR={:#010x}, HFSR={:#010x}", c0.ppb.cfsr, c0.ppb.hfsr);
                 eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                    emu.cores[0].regs.r[0], emu.cores[0].regs.r[1],
-                    emu.cores[0].regs.r[2], emu.cores[0].regs.r[3]);
+                    c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]);
                 eprintln!("  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
-                    emu.cores[0].regs.r[4], emu.cores[0].regs.r[5],
-                    emu.cores[0].regs.r[6], emu.cores[0].regs.r[7]);
-                eprintln!("  SP={:#010x} MSP={:#010x}", emu.cores[0].regs.sp(), emu.cores[0].regs.msp);
-                eprintln!("  BFAR={:#010x} MMFAR={:#010x}", emu.cores[0].ppb.bfar, emu.cores[0].ppb.mmfar);
+                    c0.regs.r[4], c0.regs.r[5],
+                    c0.regs.r[6], c0.regs.r[7]);
+                eprintln!("  SP={:#010x} MSP={:#010x}", c0.regs.sp(), c0.regs.msp);
+                eprintln!("  BFAR={:#010x} MMFAR={:#010x}", c0.ppb.bfar, c0.ppb.mmfar);
                 eprintln!("  Max bootrom PC reached={:#010x}", max_pc);
                 // Try to read stacked PC from exception frame
-                let sp = emu.cores[0].regs.msp;
+                let sp = c0.regs.msp;
                 if sp >= 0x2000_0000 && sp < 0x2008_0000 {
                     let stacked_pc = emu.peek(sp + 24);
                     let stacked_lr = emu.peek(sp + 20);
@@ -7064,14 +7075,15 @@ fn bootrom_diagnostic_run() {
     }
 
     // For now: just print where we ended up
-    let final_pc = emu.cores[0].regs.pc();
+    let c0 = &emu.cores.expect_arm()[0];
+    let final_pc = c0.regs.pc();
     eprintln!("Final PC={:#010x}, cycles run", final_pc);
     eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
-        emu.cores[0].regs.ipsr(), emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
+        c0.regs.ipsr(), c0.ppb.cfsr, c0.ppb.hfsr);
     eprintln!("  secure={}, LR={:#010x}, SP={:#010x}",
-        emu.cores[0].secure, emu.cores[0].regs.lr(), emu.cores[0].regs.sp());
+        c0.secure, c0.regs.lr(), c0.regs.sp());
     eprintln!("  MSP={:#010x} MSP_NS={:#010x}",
-        emu.cores[0].regs.msp, emu.cores[0].regs.msp_ns);
+        c0.regs.msp, c0.regs.msp_ns);
     eprintln!("  Max bootrom PC={:#010x}", max_pc);
 }
 
@@ -7251,8 +7263,8 @@ fn test_flash_boot_blinky() {
     for cycle in 0..10_000_000u64 {
         emu.step();
         gpio_out_ever |= emu.bus.sio.gpio_out;
-        core1_max_ipsr = core1_max_ipsr.max(emu.cores[1].regs.ipsr());
-        let pc = emu.cores[0].regs.pc();
+        core1_max_ipsr = core1_max_ipsr.max(emu.cores.expect_arm_mut()[1].regs.ipsr());
+        let pc = emu.cores.expect_arm_mut()[0].regs.pc();
 
         // Detect when execution enters flash
         if pc >= 0x1000_0000 && pc < 0x2000_0000 && !entered_flash {
@@ -7266,9 +7278,10 @@ fn test_flash_boot_blinky() {
             if stuck_count > 1000 {
                 eprintln!("Stuck at PC={:#010x} after {} cycles, GPIO_OUT={:#010x}",
                     pc, cycle, emu.bus.sio.gpio_out);
+                let c0 = &emu.cores.expect_arm()[0];
                 eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
-                    emu.cores[0].regs.ipsr(),
-                    emu.cores[0].ppb.cfsr, emu.cores[0].ppb.hfsr);
+                    c0.regs.ipsr(),
+                    c0.ppb.cfsr, c0.ppb.hfsr);
                 break;
             }
         } else {
@@ -7279,7 +7292,7 @@ fn test_flash_boot_blinky() {
 
     let _gpio_out = emu.bus.sio.gpio_out;
     let gpio_oe = emu.bus.sio.gpio_oe;
-    let pc = emu.cores[0].regs.pc();
+    let pc = emu.cores.expect_arm_mut()[0].regs.pc();
 
     // Must have entered flash (bootrom found and jumped to blinky)
     assert!(entered_flash, "Bootrom should have jumped to flash");
@@ -7612,7 +7625,7 @@ fn wake_check_clears_wfe_on_event() {
 
     emu.step();
 
-    assert!(!emu.cores[0].is_wfe_waiting(), "core should have been woken by event_flag");
+    assert!(!emu.core_mut(0).is_wfe_waiting(), "core should have been woken by event_flag");
     assert!(!emu.bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag should have been consumed");
 }
 
@@ -7635,20 +7648,20 @@ fn test_core1_boot_reaches_wfe() {
     for _ in 0..1_000_000 {
         emu.step();
         // Early exit once Core 1 enters WFE sleep
-        if emu.cores[1].is_wfe_waiting() {
+        if emu.cores.expect_arm_mut()[1].is_wfe_waiting() {
             break;
         }
     }
 
-    assert!(emu.cores[1].is_wfe_waiting(),
+    assert!(emu.cores.expect_arm_mut()[1].is_wfe_waiting(),
         "Core 1 should be sleeping in WFE after bootrom init (PC={:#010x})",
-        emu.cores[1].regs.pc());
-    assert_eq!(emu.cores[1].regs.ipsr(), 0,
+        emu.cores.expect_arm_mut()[1].regs.pc());
+    assert_eq!(emu.cores.expect_arm_mut()[1].regs.ipsr(), 0,
         "Core 1 should not be in an exception handler (IPSR={})",
-        emu.cores[1].regs.ipsr());
-    assert!(emu.cores[1].regs.pc() < 0x8000,
+        emu.cores.expect_arm_mut()[1].regs.ipsr());
+    assert!(emu.cores.expect_arm_mut()[1].regs.pc() < 0x8000,
         "Core 1 PC should be in bootrom range (PC={:#010x})",
-        emu.cores[1].regs.pc());
+        emu.cores.expect_arm_mut()[1].regs.pc());
 }
 
 // ============================================================================
@@ -7691,10 +7704,10 @@ fn test_dualcore_launch() {
     assert!(emu.bus.sio.gpio_out & 1 != 0,
         "Core 1 should set GPIO 0 (gpio_out={:#010x})", emu.bus.sio.gpio_out);
     // Core 1 should be running app code (PC >= 0x10000000)
-    assert!(emu.cores[1].regs.pc() >= 0x1000_0000,
-        "Core 1 should be in flash, PC={:#010x}", emu.cores[1].regs.pc());
+    assert!(emu.cores.expect_arm_mut()[1].regs.pc() >= 0x1000_0000,
+        "Core 1 should be in flash, PC={:#010x}", emu.cores.expect_arm_mut()[1].regs.pc());
     // Core 1 should not be WFE-waiting
-    assert!(!emu.cores[1].is_wfe_waiting(),
+    assert!(!emu.cores.expect_arm_mut()[1].is_wfe_waiting(),
         "Core 1 should not be WFE-waiting");
 }
 
@@ -8221,21 +8234,23 @@ fn test_dwt_cyccnt_wired_to_core_cycles() {
     let mut emu = systick_test_emulator();
 
     // Enable DWT: DEMCR.TRCENA then DWT_CTRL.CYCCNTENA
-    emu.cores[0].ppb.write32(0xE000_EDFC, 1 << 24);
-    emu.cores[0].ppb.write32(0xE000_1000, 1);
+    emu.core_mut(0).ppb.write32(0xE000_EDFC, 1 << 24);
+    emu.core_mut(0).ppb.write32(0xE000_1000, 1);
 
     // Publish current cycle count into PPB so the write sees a fresh base.
-    emu.cores[0].ppb.update_latest_cycles(emu.cores[0].cycles());
+    let cyc = emu.core(0).cycles();
+    emu.core_mut(0).ppb.update_latest_cycles(cyc);
     // Zero CYCCNT.
-    emu.cores[0].ppb.write32(0xE000_1004, 0);
+    emu.core_mut(0).ppb.write32(0xE000_1004, 0);
 
-    let cycles_before = emu.cores[0].cycles();
+    let cycles_before = emu.cores.expect_arm_mut()[0].cycles();
     emu.step();
-    let cycles_after = emu.cores[0].cycles();
+    let cycles_after = emu.cores.expect_arm_mut()[0].cycles();
     let delta = (cycles_after - cycles_before) as u32;
 
-    emu.cores[0].ppb.update_latest_cycles(emu.cores[0].cycles());
-    let cyccnt = emu.cores[0].ppb.read_cyccnt(emu.cores[0].cycles());
+    let cyc2 = emu.core(0).cycles();
+    emu.core_mut(0).ppb.update_latest_cycles(cyc2);
+    let cyccnt = emu.core_mut(0).ppb.read_cyccnt(cyc2);
     assert_eq!(cyccnt, delta,
         "After zeroing CYCCNT, read must equal cycles elapsed since write");
 }
@@ -8247,21 +8262,21 @@ fn test_emulator_tick_systick_advances_per_core() {
     let mut emu = systick_test_emulator();
 
     // Enable SysTick on core 0: ENABLE + TICKINT + CLKSOURCE
-    emu.cores[0].ppb.write32(0xE000_E010, 1 | (1 << 1) | (1 << 2));
+    emu.core_mut(0).ppb.write32(0xE000_E010, 1 | (1 << 1) | (1 << 2));
     // RVR = 1 (smallest non-zero period); CVR = 0 (will immediately underflow).
     // Set CVR via field because register writes always clear CVR.
-    emu.cores[0].ppb.write32(0xE000_E014, 1);
-    emu.cores[0].ppb.syst_cvr = 0;
+    emu.core_mut(0).ppb.write32(0xE000_E014, 1);
+    emu.core_mut(0).ppb.syst_cvr = 0;
     // Snapshot last_systick_cycles to the current value so delta is meaningful.
-    emu.cores[0].ppb.last_systick_cycles = emu.cores[0].cycles();
+    emu.core_mut(0).ppb.last_systick_cycles = emu.core_mut(0).cycles();
 
     emu.step();
 
     // Multi-reload within the quantum should have set COUNTFLAG.
-    assert_ne!(emu.cores[0].ppb.syst_csr & (1 << 16), 0,
+    assert_ne!(emu.core_mut(0).ppb.syst_csr & (1 << 16), 0,
         "SysTick must underflow during the quantum");
     // TICKINT=1: ICSR.PENDSTSET must be set.
-    assert_ne!(emu.cores[0].ppb.icsr & (1 << 26), 0,
+    assert_ne!(emu.core_mut(0).ppb.icsr & (1 << 26), 0,
         "TICKINT=1 + underflow must pend SysTick via ICSR.PENDSTSET");
 }
 
@@ -8270,16 +8285,16 @@ fn test_emulator_tick_systick_disabled_core_untouched() {
     // If core 1's SysTick is disabled, tick_systick() must not perturb CVR.
     let mut emu = systick_test_emulator();
     // Core 1 SysTick disabled; core 0 left at defaults (also disabled).
-    emu.cores[1].ppb.write32(0xE000_E010, 1 << 2); // CLKSOURCE only
-    emu.cores[1].ppb.write32(0xE000_E014, 100);
+    emu.core_mut(1).ppb.write32(0xE000_E010, 1 << 2); // CLKSOURCE only
+    emu.core_mut(1).ppb.write32(0xE000_E014, 100);
     // Set CVR via field; a register write would clear it.
-    emu.cores[1].ppb.syst_cvr = 77;
+    emu.core_mut(1).ppb.syst_cvr = 77;
 
     emu.step();
 
-    assert_eq!(emu.cores[1].ppb.syst_cvr, 77,
+    assert_eq!(emu.core_mut(1).ppb.syst_cvr, 77,
         "Disabled SysTick must not tick at quantum end");
-    assert_eq!(emu.cores[1].ppb.syst_csr & (1 << 16), 0,
+    assert_eq!(emu.core_mut(1).ppb.syst_csr & (1 << 16), 0,
         "Disabled SysTick must not set COUNTFLAG");
 }
 
@@ -8396,7 +8411,7 @@ fn decode_cache_invalidation_on_load_flash() {
     assert_ne!(cache_slot(xip_pc), cache_slot(sram_pc),
         "test precondition: the two PCs must hash to distinct slots");
 
-    for core in &mut emu.cores {
+    for core in emu.cores.expect_arm_mut().iter_mut() {
         core.decode_cache[cache_slot(xip_pc)] = crate::bus::DecodedOp {
             tag: xip_pc,
             hw0: 0xDEAD,
@@ -8415,7 +8430,7 @@ fn decode_cache_invalidation_on_load_flash() {
 
     emu.load_flash(&[0x00; 256]);
 
-    for (i, core) in emu.cores.iter().enumerate() {
+    for (i, core) in emu.cores.expect_arm().iter().enumerate() {
         assert_eq!(core.decode_cache[cache_slot(xip_pc)].tag, u32::MAX,
             "core {}: XIP-region entry invalidated by load_flash", i);
         // Region-scoped drain: load_flash only sets the XIP bit, so
@@ -8896,10 +8911,10 @@ fn trace_emulator_step_publishes_pc_via_decode() {
 
     // Core 0 runs the nop at 0x2000_0000. Set Thumb bit, point PC at
     // our nop, halt core 1 so only core 0 traces.
-    emu.cores[0].regs.set_pc(0x2000_0000);
-    emu.cores[0].regs.xpsr = 1 << 24;
-    emu.cores[0].wake();
-    emu.cores[1].halt();
+    emu.cores.expect_arm_mut()[0].regs.set_pc(0x2000_0000);
+    emu.cores.expect_arm_mut()[0].regs.xpsr = 1 << 24;
+    emu.cores.expect_arm_mut()[0].wake();
+    emu.cores.expect_arm_mut()[1].halt();
 
     emu.bus.mmio_trace_enabled = true;
     emu.bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
@@ -9101,14 +9116,14 @@ fn wfi_wake_on_irq_assert() {
     let mut emu = crate::Emulator::new(crate::Config::default());
     emu.load_flash(&[]);
     // Halt core via WFI
-    emu.cores[0].halt();
+    emu.core_mut(0).halt();
     // Enable IRQ 0
-    emu.cores[0].ppb.nvic_iser[0].store(1, Ordering::Relaxed);
+    emu.core_mut(0).ppb.nvic_iser[0].store(1, Ordering::Relaxed);
     // Assert IRQ 0
     emu.bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     // Wake check should clear halted
     emu.wake_checks();
-    assert!(!emu.cores[0].is_halted(),
+    assert!(!emu.core_mut(0).is_halted(),
         "wake_checks should wake WFI-halted core with enabled pending IRQ");
 }
 
@@ -9116,12 +9131,12 @@ fn wfi_wake_on_irq_assert() {
 fn wfi_stays_halted_without_enabled_irq() {
     let mut emu = crate::Emulator::new(crate::Config::default());
     emu.load_flash(&[]);
-    emu.cores[0].halt();
+    emu.core_mut(0).halt();
     // IRQ pending but not enabled
     emu.bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
-    emu.cores[0].ppb.nvic_iser[0].store(0, Ordering::Relaxed);
+    emu.core_mut(0).ppb.nvic_iser[0].store(0, Ordering::Relaxed);
     emu.wake_checks();
-    assert!(emu.cores[0].is_halted(),
+    assert!(emu.core_mut(0).is_halted(),
         "wake_checks should NOT wake WFI-halted core without enabled IRQ");
 }
 
@@ -9129,12 +9144,15 @@ fn wfi_stays_halted_without_enabled_irq() {
 fn debug_step_clears_halted() {
     let mut emu = crate::Emulator::new(crate::Config::default());
     emu.load_flash(&[]);
-    emu.cores[0].halt();
-    emu.cores[0].regs.r[15] = 0x2000_0000;
+    emu.core_mut(0).halt();
+    emu.core_mut(0).regs.r[15] = 0x2000_0000;
     // NOP instruction
     emu.bus.memory.sram_write16(0, 0xBF00);
-    emu.cores[0].debug_step(&mut emu.bus);
-    assert!(!emu.cores[0].is_halted(),
+    {
+        let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+        arm[0].debug_step(&mut emu.bus);
+    }
+    assert!(!emu.core_mut(0).is_halted(),
         "debug_step should clear halted before stepping");
 }
 
@@ -9180,7 +9198,7 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
 
     // After reset, SP starts at 0x2008_0000. After SUB SP, #0x80, r[13]
     // should be 0x2007_FF80. Confirm the SUB executed.
-    let sp_after_sub = emu.cores[0].regs.r[13];
+    let sp_after_sub = emu.cores.expect_arm_mut()[0].regs.r[13];
     assert_eq!(sp_after_sub, 0x2007_FF80,
         "SP after SUB SP, #0x80 should be 0x2007_FF80, got {:#010x}", sp_after_sub);
 
@@ -9190,10 +9208,10 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
     // validates the stacked frame uses the correct SP regardless.)
 
     // Pend PendSV and step to take the exception.
-    emu.cores[0].ppb.icsr |= ICSR_PENDSVSET_BIT;
+    emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores[0].regs.ipsr(), 14,
+    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 14,
         "should be in PendSV handler after step");
 
     // The exception frame should have been pushed at the post-SUB SP value
@@ -9209,9 +9227,10 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
         stacked_return_addr);
 
     // The MSP (banked) should now be the frame SP after entry wrote it back.
-    assert_eq!(emu.cores[0].regs.msp, expected_frame_sp,
+    let core0_msp = emu.cores.expect_arm()[0].regs.msp;
+    assert_eq!(core0_msp, expected_frame_sp,
         "banked MSP after exception entry should be frame_sp={:#010x}, got {:#010x}",
-        expected_frame_sp, emu.cores[0].regs.msp);
+        expected_frame_sp, core0_msp);
 
     // Also verify stacked R0 is readable at the frame base (sanity check
     // that the frame landed at the right address, not at the stale SP).

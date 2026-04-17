@@ -107,7 +107,12 @@ impl ThreadedEmulator {
             clock,
             step_quantum,
         } = emu;
-        let [core0, core1] = cores;
+        // ThreadedEmulator currently only supports the Arm arm — RISC-V
+        // (Hazard3) lives behind the P1a enum but doesn't thread yet.
+        let crate::Cores::Arm(arm) = cores else {
+            panic!("ThreadedEmulator requires Arch::Arm (RISC-V threading is P4+)");
+        };
+        let [core0, core1] = arm;
 
         // Debug-assert that the single-threaded driver has drained any
         // pending decode-cache invalidations before handoff. Dropping
@@ -1251,7 +1256,7 @@ mod tests {
         // Simulate the worker loop's drain step:
         let mut dummy = Emulator::new(Config::default());
         dummy
-            .cores[0]
+            .core_mut(0)
             .invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
         bus.pending_cache_invalidations.clear();
 
@@ -1744,8 +1749,8 @@ mod tests {
     #[test]
     fn tick_systick_fires_in_cpu_worker_phase1() {
         let mut emu = Emulator::new(Config::default());
-        emu.cores[0].ppb.last_systick_cycles = 42;
-        emu.cores[1].ppb.last_systick_cycles = 99;
+        emu.core_mut(0).ppb.last_systick_cycles = 42;
+        emu.core_mut(1).ppb.last_systick_cycles = 99;
 
         let mut threaded = ThreadedEmulator::from_emulator(emu);
         threaded.shared.atomics.set_halted(0);
@@ -1927,10 +1932,10 @@ mod tests {
         // Enable core 0 SysTick (ENABLE=1, RVR=1000, CVR=1000) and
         // pre-seed `last_systick_cycles` so a halted-core call to
         // `systick_advance(0)` yields `delta = 100` via wrapping_sub.
-        emu.cores[0].ppb.syst_csr = 1;
-        emu.cores[0].ppb.syst_rvr = RVR_INIT;
-        emu.cores[0].ppb.syst_cvr = RVR_INIT;
-        emu.cores[0].ppb.last_systick_cycles = u64::MAX - 99;
+        emu.core_mut(0).ppb.syst_csr = 1;
+        emu.core_mut(0).ppb.syst_rvr = RVR_INIT;
+        emu.core_mut(0).ppb.syst_cvr = RVR_INIT;
+        emu.core_mut(0).ppb.last_systick_cycles = u64::MAX - 99;
 
         let mut threaded = ThreadedEmulator::from_emulator(emu);
         // Halt both cores — core 0 stays at cycles=0, so the SysTick

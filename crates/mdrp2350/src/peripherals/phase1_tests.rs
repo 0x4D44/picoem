@@ -358,8 +358,11 @@ fn tick_peripherals_timer1_fires_on_its_own_irq_base() {
 #[test]
 fn emulator_step_calls_tick_peripherals_each_iteration() {
     let mut emu = Emulator::new(crate::Config::default());
-    emu.cores[0].halt();
-    emu.cores[1].halt();
+    {
+        let arm = emu.cores.expect_arm_mut();
+        arm[0].halt();
+        arm[1].halt();
+    }
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
     emu.bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     // step_quantum default = 64 sys_clks. At CYCLES=12:

@@ -768,7 +768,7 @@ pub fn fresh_emulator(seq_bytes: &[u8]) -> Emulator {
     // inside the stub see per-instruction core.cycles via PPB, so cycle
     // accounting is per-instruction regardless of quantum.
     let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
-    emu.cores[1].halt();
+    emu.cores.expect_arm_mut()[1].halt();
 
     let stub_bytes = pack_stub();
     for (i, &b) in stub_bytes.iter().enumerate() {
@@ -789,12 +789,15 @@ pub fn fresh_emulator(seq_bytes: &[u8]) -> Emulator {
     let ctrl = emu.mmio_read32(DWT_CTRL);
     emu.mmio_write32(DWT_CTRL, ctrl | CYCCNTENA);
 
-    emu.cores[0].wake();
-    emu.cores[0].regs.set_pc(STUB_START);
-    emu.cores[0].regs.r[13] = EMU_TEST_STACK;
-    emu.cores[0].regs.msp = EMU_TEST_STACK;
-    emu.cores[0].regs.r[14] = 0xFFFF_FFFF;
-    emu.cores[0].regs.xpsr = 0x0100_0000; // T=1
+    {
+        let c0 = &mut emu.cores.expect_arm_mut()[0];
+        c0.wake();
+        c0.regs.set_pc(STUB_START);
+        c0.regs.r[13] = EMU_TEST_STACK;
+        c0.regs.msp = EMU_TEST_STACK;
+        c0.regs.r[14] = 0xFFFF_FFFF;
+        c0.regs.xpsr = 0x0100_0000; // T=1
+    }
 
     emu
 }

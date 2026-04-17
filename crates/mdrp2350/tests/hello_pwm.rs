@@ -27,12 +27,15 @@ fn prepare_emu() -> Emulator {
         HELLO_PWM_BIN[4], HELLO_PWM_BIN[5],
         HELLO_PWM_BIN[6], HELLO_PWM_BIN[7],
     ]);
-    for i in 0..2 {
-        emu.cores[i].regs.msp = initial_sp;
-        emu.cores[i].regs.r[13] = initial_sp;
-        emu.cores[i].regs.set_pc(reset_vector & !1);
+    {
+        let arm = emu.cores.expect_arm_mut();
+        for i in 0..2 {
+            arm[i].regs.msp = initial_sp;
+            arm[i].regs.r[13] = initial_sp;
+            arm[i].regs.set_pc(reset_vector & !1);
+        }
+        arm[1].halt();
     }
-    emu.cores[1].halt();
     emu
 }
 

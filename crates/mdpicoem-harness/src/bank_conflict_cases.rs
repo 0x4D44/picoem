@@ -28,7 +28,7 @@
 use crate::silicon_oracle::{
     self, enable_cyccnt, read_cyccnt, reset_cyccnt, CaseOutcome, Verdict,
 };
-use mdrp2350::{Config, Emulator, EmulatorBuilder};
+use mdrp2350::{Config, Cores, Emulator, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
 use std::time::Instant;
 
@@ -344,7 +344,7 @@ pub fn compute_diff(hw_median: u32, nop_baseline: u32, emu_cycles: u32) -> (u32,
 /// and the single test instruction primed at `fetch_addr`.
 fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
     let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
-    emu.cores[1].halt();
+    emu.cores.expect_arm_mut()[1].halt();
 
     // Write the instruction (two bytes) at `fetch_addr`. The decoded-op
     // cache is empty at this point so no explicit invalidation is
@@ -367,14 +367,17 @@ fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
         .write32(silicon_oracle::DWT_CTRL_U32, ctrl | silicon_oracle::CYCCNTENA, 0);
 
     // Prime core 0 registers to execute exactly one instruction.
-    emu.cores[0].wake();
-    emu.cores[0].regs.set_pc(fetch_addr);
-    emu.cores[0].regs.r[0] = 0x1234_5678;
-    emu.cores[0].regs.r[1] = data_addr;
-    emu.cores[0].regs.r[13] = crate::EMU_TEST_STACK;
-    emu.cores[0].regs.msp = crate::EMU_TEST_STACK;
-    emu.cores[0].regs.r[14] = 0xFFFF_FFFF;
-    emu.cores[0].regs.xpsr = 0x0100_0000; // T=1
+    {
+        let c0 = &mut emu.cores.expect_arm_mut()[0];
+        c0.wake();
+        c0.regs.set_pc(fetch_addr);
+        c0.regs.r[0] = 0x1234_5678;
+        c0.regs.r[1] = data_addr;
+        c0.regs.r[13] = crate::EMU_TEST_STACK;
+        c0.regs.msp = crate::EMU_TEST_STACK;
+        c0.regs.r[14] = 0xFFFF_FFFF;
+        c0.regs.xpsr = 0x0100_0000; // T=1
+    }
 
     emu
 }
@@ -384,13 +387,14 @@ fn measure_emu_one(instr: u32, fetch_addr: u32, data_addr: u32) -> u32 {
     let mut emu = fresh_emulator(instr, fetch_addr, data_addr);
     // Phase 0b.1 Commit B: no `set_active_core` needed — CortexM33::step
     // takes a `&mut Bus` and self-supplies its core id for bus routing.
-    let before = emu.cores[0].cycles();
+    let before = emu.core(0).cycles();
     // Step exactly one instruction on core 0. We bypass `Emulator::step`
     // (which advances both cores and peripherals) because halt-step cares
     // only about the single-instruction cycle accounting on core 0 —
     // peripheral ticks and clock housekeeping would just add noise.
-    emu.cores[0].step(&mut emu.bus);
-    let after = emu.cores[0].cycles();
+    let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+    arm[0].step(&mut emu.bus);
+    let after = arm[0].cycles();
     (after - before) as u32
 }
 

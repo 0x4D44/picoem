@@ -1715,12 +1715,12 @@ mod tests {
 
         oracle.populate_sram_from_shadow(&mut emu.bus);
 
-        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9010), 0x08);
-        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9020), 0x04);
-        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9040), 0x02);
-        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9080), 0x01);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9010, 0), 0x08);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9020, 0), 0x04);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9040, 0), 0x02);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + 0x9080, 0), 0x01);
         assert_ne!(
-            emu.bus.read8(SHADOW_BASE + 0x9010),
+            emu.bus.read8(SHADOW_BASE + 0x9010, 0),
             0,
             "silent-revert guard: SHADOW_BASE+0x9010 must not read back 0x00"
         );
@@ -1738,9 +1738,9 @@ mod tests {
 
         oracle.populate_sram_from_shadow(&mut emu.bus);
 
-        assert_eq!(emu.bus.read8(SHADOW_BASE), 0xAA);
+        assert_eq!(emu.bus.read8(SHADOW_BASE, 0), 0xAA);
         assert_eq!(
-            emu.bus.read8(SHADOW_BASE + SHADOW_SIZE as u32 - 1),
+            emu.bus.read8(SHADOW_BASE + SHADOW_SIZE as u32 - 1, 0),
             0x55
         );
     }

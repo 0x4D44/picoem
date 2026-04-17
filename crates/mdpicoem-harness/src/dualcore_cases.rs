@@ -464,9 +464,12 @@ fn fresh_emulator_dualcore(
 
     // Core-0 per-case register primes — the stub's BLX passes r0..r3 to
     // seq unmodified.
-    for &(idx, val) in init_core0 {
-        if (idx as usize) < 13 {
-            emu.cores[0].regs.r[idx as usize] = val;
+    {
+        let arm = emu.cores.expect_arm_mut();
+        for &(idx, val) in init_core0 {
+            if (idx as usize) < 13 {
+                arm[0].regs.r[idx as usize] = val;
+            }
         }
     }
 
@@ -477,20 +480,23 @@ fn fresh_emulator_dualcore(
     }
 
     // Core-1 register primes.
-    for &(idx, val) in init_core1 {
-        if (idx as usize) < 13 {
-            emu.cores[1].regs.r[idx as usize] = val;
+    {
+        let c1 = &mut emu.cores.expect_arm_mut()[1];
+        for &(idx, val) in init_core1 {
+            if (idx as usize) < 13 {
+                c1.regs.r[idx as usize] = val;
+            }
         }
-    }
-    emu.cores[1].regs.set_pc(DUALCORE_ANTAGONIST_SLOT);
-    emu.cores[1].regs.r[13] = DUALCORE_CORE1_STACK;
-    emu.cores[1].regs.msp = DUALCORE_CORE1_STACK;
-    emu.cores[1].regs.r[14] = 0xFFFF_FFFF;
-    emu.cores[1].regs.xpsr = 0x0100_0000; // T=1
+        c1.regs.set_pc(DUALCORE_ANTAGONIST_SLOT);
+        c1.regs.r[13] = DUALCORE_CORE1_STACK;
+        c1.regs.msp = DUALCORE_CORE1_STACK;
+        c1.regs.r[14] = 0xFFFF_FFFF;
+        c1.regs.xpsr = 0x0100_0000; // T=1
 
-    // Release core 1. `wake()` only clears the halted flag — caller must
-    // have set PC/SP/xpsr first, which we just did.
-    emu.cores[1].wake();
+        // Release core 1. `wake()` only clears the halted flag — caller must
+        // have set PC/SP/xpsr first, which we just did.
+        c1.wake();
+    }
 
     emu
 }

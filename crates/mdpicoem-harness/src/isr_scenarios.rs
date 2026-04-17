@@ -2589,7 +2589,6 @@ mod tests {
     fn run_scenario_emu_mailbox(sc: &IsrScenario) -> u32 {
         let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
         emu.core_mut(1).halt();
-        emu.bus.set_active_core(0);
 
         // Upload image.
         for chunk_off in (0..sc.image.len()).step_by(4) {
@@ -2639,7 +2638,6 @@ mod tests {
             emu.step();
         }
         emu.core_mut(0).halt();
-        emu.bus.set_active_core(0);
 
         emu.mmio_read32(crate::ISR_MAILBOX_CYCCNT)
     }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 pub mod core;
+pub mod core_riscv;
 pub mod bus;
 pub mod dma;
 pub mod dreq;
@@ -18,6 +19,7 @@ mod pio_tests;
 
 pub use self::core::CortexM33;
 pub use self::core::CoreCounters;
+pub use self::core_riscv::Hazard3;
 pub use self::bus::Bus;
 pub use self::memory::Memory;
 pub use self::sio::Sio;
@@ -61,11 +63,72 @@ impl Default for Config {
 /// firmware-observable timing the emulator currently models.
 pub const DEFAULT_STEP_QUANTUM: u32 = 64;
 
-/// Top-level RP2350 emulator. Owns dual Cortex-M33 cores, bus fabric,
-/// memory, and clock. SIO is owned by Bus. Peripherals and PIO are
-/// injected via builder.
+/// Architecture selector. RP2350 ships both an Arm and a RISC-V
+/// complex; OTP/POWMAN picks one at power-up. V1 only constructs the
+/// Arm path with a real ISA — see
+/// `wrk_docs/2026.04.17 - HLD - RP2350 RISC-V Hazard3 Core Support.md`.
+pub enum Arch {
+    Arm,
+    RiscV,
+}
+
+impl Default for Arch {
+    fn default() -> Self {
+        Arch::Arm
+    }
+}
+
+/// Per-arch core pair. `expect_arm*` / `expect_riscv*` panic on the
+/// wrong arm — documented programmer-error contract for call sites
+/// that the shimmed `Emulator::core(id)` path can't cover.
+pub enum Cores {
+    Arm([CortexM33; 2]),
+    RiscV([Hazard3; 2]),
+}
+
+impl Cores {
+    pub fn expect_arm(&self) -> &[CortexM33; 2] {
+        match self {
+            Cores::Arm(cs) => cs,
+            Cores::RiscV(_) => panic!("expect_arm called on RiscV emulator"),
+        }
+    }
+
+    pub fn expect_arm_mut(&mut self) -> &mut [CortexM33; 2] {
+        match self {
+            Cores::Arm(cs) => cs,
+            Cores::RiscV(_) => panic!("expect_arm_mut called on RiscV emulator"),
+        }
+    }
+
+    pub fn expect_riscv(&self) -> &[Hazard3; 2] {
+        match self {
+            Cores::RiscV(cs) => cs,
+            Cores::Arm(_) => panic!("expect_riscv called on Arm emulator"),
+        }
+    }
+
+    pub fn expect_riscv_mut(&mut self) -> &mut [Hazard3; 2] {
+        match self {
+            Cores::RiscV(cs) => cs,
+            Cores::Arm(_) => panic!("expect_riscv_mut called on Arm emulator"),
+        }
+    }
+
+    pub fn is_arm(&self) -> bool {
+        matches!(self, Cores::Arm(_))
+    }
+
+    pub fn is_riscv(&self) -> bool {
+        matches!(self, Cores::RiscV(_))
+    }
+}
+
+/// Top-level RP2350 emulator. Owns dual cores (Arm or RISC-V), bus
+/// fabric, memory, and clock. SIO is owned by Bus. Peripherals and PIO
+/// are injected via builder.
 pub struct Emulator {
-    pub cores: [CortexM33; 2],
+    pub cores: Cores,
     pub bus: Bus,
     pub clock: Clock,
     /// Cycles advanced per call to [`Self::step`]. See
@@ -86,17 +149,24 @@ impl Emulator {
         let initial_sp = self.bus.memory.rom_read32(0);
         let reset_vector = self.bus.memory.rom_read32(4);
 
-        // Boot both cores from reset vector. Phase 3 Stage 1: cores
-        // share a single `CoreAtomics` with Bus. Rebuilding the cores
-        // must reuse the existing Arc so post-reset asserts land on
-        // the same state the Bus sees.
+        // Boot both cores from reset vector. Phase 3 Stage 1 (Arm arm):
+        // cores share a single `CoreAtomics` with Bus. Rebuilding the
+        // cores must reuse the existing Arc so post-reset asserts land
+        // on the same state the Bus sees.
         let atomics = Arc::clone(&self.bus.atomics);
-        for i in 0..2 {
-            self.cores[i] = CortexM33::new(i as u8, Arc::clone(&atomics));
-            self.cores[i].regs.msp = initial_sp;
-            self.cores[i].regs.r[13] = initial_sp;
-            self.cores[i].regs.set_pc(reset_vector & !1);
-            self.cores[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
+        match &mut self.cores {
+            Cores::Arm(arm) => {
+                for i in 0..2 {
+                    arm[i] = CortexM33::new(i as u8, Arc::clone(&atomics));
+                    arm[i].regs.msp = initial_sp;
+                    arm[i].regs.r[13] = initial_sp;
+                    arm[i].regs.set_pc(reset_vector & !1);
+                    arm[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
+                }
+            }
+            Cores::RiscV(_) => {
+                // P1b fills this in per HLD §4.3.
+            }
         }
 
         // Clear the shared atomic state — halted / WFE / event_flag /
@@ -169,8 +239,10 @@ impl Emulator {
         // observing the invalidation. Phase 3 follow-up #10 + Task #10
         // review fix — region-scoped to avoid cold-cache regressions.
         let regions = self.bus.pending_invalidation_regions;
-        for core in &mut self.cores {
-            core.invalidate_decode_cache_regions(regions);
+        if let Cores::Arm(arm) = &mut self.cores {
+            for core in arm.iter_mut() {
+                core.invalidate_decode_cache_regions(regions);
+            }
         }
         self.bus.pending_invalidation_regions = 0;
     }
@@ -183,8 +255,10 @@ impl Emulator {
     pub fn load_flash(&mut self, data: &[u8]) {
         self.bus.load_flash(data);
         let regions = self.bus.pending_invalidation_regions;
-        for core in &mut self.cores {
-            core.invalidate_decode_cache_regions(regions);
+        if let Cores::Arm(arm) = &mut self.cores {
+            for core in arm.iter_mut() {
+                core.invalidate_decode_cache_regions(regions);
+            }
         }
         self.bus.pending_invalidation_regions = 0;
     }
@@ -238,80 +312,16 @@ impl Emulator {
         // review fix.
         if self.bus.pending_invalidation_regions != 0 {
             let regions = self.bus.pending_invalidation_regions;
-            self.cores[0].invalidate_decode_cache_regions(regions);
-            self.cores[1].invalidate_decode_cache_regions(regions);
+            if let Cores::Arm(arm) = &mut self.cores {
+                arm[0].invalidate_decode_cache_regions(regions);
+                arm[1].invalidate_decode_cache_regions(regions);
+            }
             self.bus.pending_invalidation_regions = 0;
         }
 
-        // Core 0 first, then core 1. Phase 0b.1 Commit B: each PPB is
-        // now owned by its own `CortexM33`, so no `set_active_core`
-        // indirection is needed.
-        for core_id in 0..2 {
-            // Quantum-boundary IRQ merge: peripherals in `tick_peripherals`
-            // at the previous quantum raised IRQs via `assert_irq_*`.
-            // Phase 3 Stage 1 (LLD V7 §2) — `take_irq_pending` swaps the
-            // mask to zero; a non-zero return replaces the deleted
-            // `irq_pending_dirty` flag as the consume-and-merge signal.
-            let pending = self.bus.atomics.take_irq_pending(core_id);
-            if pending != 0 {
-                self.cores[core_id].ppb.merge_irq_pending(pending);
-            }
-
-            while !self.cores[core_id].is_halted()
-                && !self.cores[core_id].is_wfe_waiting()
-                && self.cores[core_id].cycles < target
-            {
-                // Publish the core's cycle count into its PPB before each
-                // instruction so DWT_CYCCNT reads/writes land on a fresh
-                // value. Staleness is bounded by one instruction.
-                self.cores[core_id].ppb.update_latest_cycles(self.cores[core_id].cycles);
-                let bus = &mut self.bus;
-                self.cores[core_id].step(bus);
-
-                // (c) Drain per-instruction cache-invalidation queue
-                // into the core that just ran. Phase 3 follow-up #10 —
-                // the decode cache is per-core; writes during this
-                // step's bus accesses recorded addresses in
-                // `bus.pending_cache_invalidations`. Cross-core SMC
-                // still requires firmware DSB+ISB per V7 spec.
-                if !self.bus.pending_cache_invalidations.is_empty() {
-                    self.cores[core_id].invalidate_decode_cache_entries(
-                        &self.bus.pending_cache_invalidations,
-                    );
-                    self.bus.pending_cache_invalidations.clear();
-                }
-                // If the core executed a bus write that triggered a
-                // region-scoped invalidation (via `Bus::invalidate_all`
-                // or a `load_bootrom`/`load_flash` during a step — rare,
-                // but used by `Emulator::poke` doc and tests), drain
-                // both cores' caches for the affected regions. Same-step
-                // signal so the peer core sees it on its next turn.
-                if self.bus.pending_invalidation_regions != 0 {
-                    let regions = self.bus.pending_invalidation_regions;
-                    self.cores[0].invalidate_decode_cache_regions(regions);
-                    self.cores[1].invalidate_decode_cache_regions(regions);
-                    self.bus.pending_invalidation_regions = 0;
-                }
-            }
-            // Final refresh so any post-quantum inspection (e.g. tests
-            // reading DWT_CYCCNT between steps) sees a current base.
-            self.cores[core_id].ppb.update_latest_cycles(self.cores[core_id].cycles);
-
-            // Phase 0b.2: exclusive-monitor snoop. If the peer core has an
-            // outstanding LDREX address and *this* core performed any
-            // data-side write during its quantum slice, invalidate the
-            // peer's monitor. Same-core writes do NOT invalidate the local
-            // monitor (per ARMv8-M §A3.4). Clear the flag for the next
-            // quantum. Correct under the serial-interleave scheduler
-            // because cores run sequentially within a quantum; threaded
-            // mode (Phase 1+) will require atomic CAS on SharedMemory.
-            let peer = 1 - core_id;
-            if self.cores[peer].exclusive_address.is_some()
-                && self.cores[core_id].did_write_this_quantum
-            {
-                self.cores[peer].exclusive_address = None;
-            }
-            self.cores[core_id].did_write_this_quantum = false;
+        match &mut self.cores {
+            Cores::Arm(cs) => step_pair_arm(cs, &mut self.bus, target),
+            Cores::RiscV(cs) => step_pair_riscv(cs, &mut self.bus, target),
         }
 
         self.clock.advance(self.step_quantum as u64);
@@ -326,7 +336,10 @@ impl Emulator {
         // the ARMv8-M dual-core contention model is disabled here
         // (CLAUDE.md "Bank contention model").
         self.tick_peripherals(self.step_quantum);
-        self.tick_systick();
+        // RISC-V has no SysTick — the SysTick block lives on the M33 PPB.
+        if self.cores.is_arm() {
+            self.tick_systick();
+        }
         self.wake_checks();
         self.clock.cycles
     }
@@ -402,9 +415,10 @@ impl Emulator {
     /// sets `ICSR.PENDSTSET` via `Ppb::pend_systick()` when TICKINT is
     /// enabled.
     fn tick_systick(&mut self) {
+        let arm = self.cores.expect_arm_mut();
         for core_id in 0..2 {
-            let cycles = self.cores[core_id].cycles();
-            self.cores[core_id].ppb.systick_advance(cycles);
+            let cycles = arm[core_id].cycles();
+            arm[core_id].ppb.systick_advance(cycles);
         }
     }
 
@@ -412,24 +426,30 @@ impl Emulator {
     /// - WFE: if event_flag is set, consume it and wake the core.
     /// - WFI: if an enabled pending IRQ exists, wake the core.
     pub(crate) fn wake_checks(&mut self) {
-        for i in 0..2 {
-            // WFE wake: event flag clears WFE sleep. Consume (AcqRel swap
-            // to false) pairs with `sev_both`'s Release.
-            if self.bus.atomics.is_wfe_waiting(i)
-                && self.bus.atomics.event_flag_consume(i)
-            {
-                self.bus.atomics.clear_wfe_waiting(i);
-            }
-            // WFI wake: enabled pending IRQ clears WFI sleep. The peek is
-            // non-consuming; the next step() will merge via
-            // `take_irq_pending`.
-            if self.bus.atomics.is_halted(i) {
-                let pending = self.bus.atomics.irq_pending_load(i);
-                if pending != 0
-                    && self.cores[i].ppb.any_pending_enabled(pending)
-                {
-                    self.bus.atomics.clear_halted(i);
+        match &mut self.cores {
+            Cores::Arm(arm) => {
+                for i in 0..2 {
+                    // WFE wake: event flag clears WFE sleep. Consume
+                    // (AcqRel swap to false) pairs with `sev_both`'s
+                    // Release.
+                    if self.bus.atomics.is_wfe_waiting(i)
+                        && self.bus.atomics.event_flag_consume(i)
+                    {
+                        self.bus.atomics.clear_wfe_waiting(i);
+                    }
+                    // WFI wake: enabled pending IRQ clears WFI sleep.
+                    // The peek is non-consuming; the next step() will
+                    // merge via `take_irq_pending`.
+                    if self.bus.atomics.is_halted(i) {
+                        let pending = self.bus.atomics.irq_pending_load(i);
+                        if pending != 0 && arm[i].ppb.any_pending_enabled(pending) {
+                            self.bus.atomics.clear_halted(i);
+                        }
+                    }
                 }
+            }
+            Cores::RiscV(_) => {
+                // P4 adds `wfi` wake logic per HLD §4.6.
             }
         }
     }
@@ -465,24 +485,30 @@ impl Emulator {
         self.bus.gpio_in as u64
     }
 
-    /// Access core state.
+    /// Access core state. **Panics on a RISC-V emulator** — this is a
+    /// shim for Arm-only call sites (harness, tests). Cross-arch callers
+    /// must dispatch on `cores.is_arm()` first.
     pub fn core(&self, id: usize) -> &CortexM33 {
-        &self.cores[id]
+        &self.cores.expect_arm()[id]
     }
 
+    /// Mutable accessor; same panic contract as [`Self::core`].
     pub fn core_mut(&mut self, id: usize) -> &mut CortexM33 {
-        &mut self.cores[id]
+        &mut self.cores.expect_arm_mut()[id]
     }
 
-    /// Get a reference to a core's workload counters.
+    /// Get a reference to a core's workload counters. Panics on RISC-V
+    /// (Hazard3 has no workload-counters stash yet).
     pub fn core_counters(&self, core_id: usize) -> &CoreCounters {
-        &self.cores[core_id].counters
+        &self.cores.expect_arm()[core_id].counters
     }
 
-    /// Reset all core counters.
+    /// Reset all core counters. No-op on RISC-V.
     pub fn reset_counters(&mut self) {
-        for core in &mut self.cores {
-            core.counters.reset();
+        if let Cores::Arm(arm) = &mut self.cores {
+            for core in arm.iter_mut() {
+                core.counters.reset();
+            }
         }
     }
 
@@ -537,11 +563,11 @@ impl Emulator {
         // Route there directly; mirror any NVIC_ISPR/ICPR writes back to
         // `bus.irq_pending[0]` so the dispatch short-circuit stays in sync.
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            self.cores[0].ppb.write32(addr, value);
+            self.core_mut(0).ppb.write32(addr, value);
             let low = addr & 0xFFFF;
             if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
                 let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-                let ispr = self.cores[0].ppb.nvic_ispr[word]
+                let ispr = self.core(0).ppb.nvic_ispr[word]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let mask64 = (ispr as u64) << (word * 32);
                 let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
@@ -569,9 +595,97 @@ impl Emulator {
         self.bus.master_cycle = self.clock.cycles;
         // Phase 0b.1 Commit B: PPB addresses route to core 0's PPB.
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            self.cores[0].ppb.read32(addr)
+            self.core_mut(0).ppb.read32(addr)
         } else {
             self.bus.read32(addr, 0)
+        }
+    }
+}
+
+/// Advance both Arm cores up to `target` cycles. Mirrors the original
+/// serialised-interleave `step()` body: core 0 first, then core 1. Each
+/// `CortexM33` owns its own PPB (Phase 0b.1 Commit B), so no active-core
+/// indirection is needed. `update_latest_cycles` publishes the core's
+/// cycle counter into its PPB so DWT_CYCCNT reads/writes land on a fresh
+/// value — staleness is bounded by one instruction.
+fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
+    for core_id in 0..2 {
+        // Quantum-boundary IRQ merge: peripherals in `tick_peripherals`
+        // at the previous quantum raised IRQs via `assert_irq_*`.
+        // Phase 3 Stage 1 (LLD V7 §2) — `take_irq_pending` swaps the
+        // mask to zero; a non-zero return replaces the deleted
+        // `irq_pending_dirty` flag as the consume-and-merge signal.
+        let pending = bus.atomics.take_irq_pending(core_id);
+        if pending != 0 {
+            cs[core_id].ppb.merge_irq_pending(pending);
+        }
+
+        while !cs[core_id].is_halted()
+            && !cs[core_id].is_wfe_waiting()
+            && cs[core_id].cycles < target
+        {
+            // Publish the core's cycle count into its PPB before each
+            // instruction so DWT_CYCCNT reads/writes land on a fresh
+            // value. Staleness is bounded by one instruction.
+            let cyc = cs[core_id].cycles;
+            cs[core_id].ppb.update_latest_cycles(cyc);
+            cs[core_id].step(bus);
+
+            // (c) Drain per-instruction cache-invalidation queue into
+            // the core that just ran. Phase 3 follow-up #10 — the
+            // decode cache is per-core; writes during this step's bus
+            // accesses recorded addresses in
+            // `bus.pending_cache_invalidations`. Cross-core SMC still
+            // requires firmware DSB+ISB per V7 spec.
+            if !bus.pending_cache_invalidations.is_empty() {
+                cs[core_id].invalidate_decode_cache_entries(
+                    &bus.pending_cache_invalidations,
+                );
+                bus.pending_cache_invalidations.clear();
+            }
+            // Region-scoped invalidation triggered mid-step (via
+            // `Bus::invalidate_all` or `load_bootrom`/`load_flash`
+            // during a step — rare, but used by `Emulator::poke`
+            // docs and tests). Drain both cores' caches for the
+            // affected regions. Same-step signal so the peer core
+            // sees it on its next turn.
+            if bus.pending_invalidation_regions != 0 {
+                let regions = bus.pending_invalidation_regions;
+                cs[0].invalidate_decode_cache_regions(regions);
+                cs[1].invalidate_decode_cache_regions(regions);
+                bus.pending_invalidation_regions = 0;
+            }
+        }
+        // Final refresh so any post-quantum inspection (e.g. tests
+        // reading DWT_CYCCNT between steps) sees a current base.
+        let cyc = cs[core_id].cycles;
+        cs[core_id].ppb.update_latest_cycles(cyc);
+
+        // Phase 0b.2: exclusive-monitor snoop. If the peer core has an
+        // outstanding LDREX address and *this* core performed any
+        // data-side write during its quantum slice, invalidate the
+        // peer's monitor. Same-core writes do NOT invalidate the local
+        // monitor (per ARMv8-M §A3.4). Clear the flag for the next
+        // quantum. Correct under the serial-interleave scheduler
+        // because cores run sequentially within a quantum; threaded
+        // mode (Phase 1+) will require atomic CAS on SharedMemory.
+        let peer = 1 - core_id;
+        if cs[peer].exclusive_address.is_some() && cs[core_id].did_write_this_quantum {
+            cs[peer].exclusive_address = None;
+        }
+        cs[core_id].did_write_this_quantum = false;
+    }
+}
+
+/// Advance both RISC-V (Hazard3) cores up to `target` cycles. P1a stub:
+/// no per-core PPB stash (RISC-V has no ARMv8-M system-control space),
+/// no WFE (Hazard3 models `wfi` differently — see HLD §4.6, handled in
+/// P4). Just drives the core's own `step` until it halts or hits the
+/// target.
+fn step_pair_riscv(cs: &mut [Hazard3; 2], bus: &mut Bus, target: u64) {
+    for core_id in 0..2 {
+        while !cs[core_id].is_halted() && cs[core_id].cycles() < target {
+            cs[core_id].step(bus);
         }
     }
 }
@@ -580,6 +694,7 @@ impl Emulator {
 pub struct EmulatorBuilder {
     config: Config,
     step_quantum: u32,
+    arch: Arch,
 }
 
 impl EmulatorBuilder {
@@ -587,6 +702,7 @@ impl EmulatorBuilder {
         Self {
             config,
             step_quantum: DEFAULT_STEP_QUANTUM,
+            arch: Arch::default(),
         }
     }
 
@@ -596,6 +712,14 @@ impl EmulatorBuilder {
     pub fn step_quantum(mut self, n: u32) -> Self {
         debug_assert!(n > 0, "step_quantum must be >= 1");
         self.step_quantum = n;
+        self
+    }
+
+    /// Select the CPU architecture. Defaults to [`Arch::Arm`]; pass
+    /// [`Arch::RiscV`] to construct the Hazard3 variant. V1 ships the
+    /// placeholder Hazard3 — real ISA lands in P1b.
+    pub fn arch(mut self, arch: Arch) -> Self {
+        self.arch = arch;
         self
     }
 
@@ -623,11 +747,17 @@ impl EmulatorBuilder {
             sys_clk_hz = bus.sys_clk_hz(),
             "emulator constructed",
         );
-        Emulator {
-            cores: [
+        let cores = match self.arch {
+            Arch::Arm => Cores::Arm([
                 CortexM33::new(0, Arc::clone(&atomics)),
-                CortexM33::new(1, atomics),
-            ],
+                CortexM33::new(1, Arc::clone(&atomics)),
+            ]),
+            Arch::RiscV => Cores::RiscV([Hazard3::new(), Hazard3::new()]),
+        };
+        // Silence unused-atomics warning on RiscV arm (no atomics wired yet).
+        let _ = &atomics;
+        Emulator {
+            cores,
             bus,
             clock: Clock { cycles: 0 },
             step_quantum: self.step_quantum,
