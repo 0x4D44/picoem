@@ -2,6 +2,21 @@
 
 Items discovered during development that need addressing in later phases.
 
+## HLD/LLD alignment
+
+### Test-Oracles HLD V4 §4 Phase 2 — QEMU invocation deviation
+
+Core HLD (`wrk_docs/2026.04.17 - HLD - RP2350 RISC-V Hazard3 Core Support V6.md`
+§6 P2.5) pinned `-kernel <bin>`. Phase 2 LLD
+(`wrk_docs/2026.04.17 - LLD - QEMU Diff RISC-V V1.md` §2) empirically found
+`-kernel` is rejected with `-machine none` ("The -kernel parameter is not
+supported (use the generic 'loader' device instead)") on QEMU 10.2. LLD uses
+`-device loader,file=<bin>,addr=0x20000000,cpu-num=0` instead. Core HLD should
+be amended or superseded with a V7 noting this, or the LLD's resolution should
+be folded back. Not blocking.
+
+Owner: whoever next edits the test-oracles HLD.
+
 ## Corpus reproducibility caveat
 
 First-build binary SHA256s recorded during Phase 0 corpus pinning are NOT
