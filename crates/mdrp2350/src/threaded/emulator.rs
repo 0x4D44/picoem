@@ -195,6 +195,9 @@ impl ThreadedEmulator {
             glitch: _,
             psm: _,
             watchdog: _,
+            otp: _,
+            trng: _,
+            sha256: _,
         } = bus;
 
         let shared_mem = Arc::new(SharedMemory::from_memory(

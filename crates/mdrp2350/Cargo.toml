@@ -15,6 +15,10 @@ test-hooks = ["mdpicoem-common/test-hooks"]
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
 tracing = { workspace = true }
+# SHA-256 block compressor — HLD V5 §7.D.6. `compress` feature exposes
+# the padding-less `compress256` entry point, which matches the RP2350
+# SHA-256 hardware's 16-word block compressor exactly.
+sha2 = { version = "0.10", features = ["compress"] }
 
 # Enable the PIO `test-hooks` feature for in-crate tests so `pop_tx` /
 # `push_rx` are callable without gating the production build. This

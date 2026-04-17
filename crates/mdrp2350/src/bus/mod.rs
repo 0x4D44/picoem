@@ -25,12 +25,15 @@ use crate::peripherals::adc::{ADC_BASE, AdcRegs};
 use crate::peripherals::i2c::{I2C0_BASE, I2C1_BASE, I2cRegs};
 use crate::peripherals::inert::{GLITCH_DETECTOR_BASE, GlitchDetector, SYSCFG_BASE, SysCfg, TBMAN_BASE, Tbman};
 use crate::peripherals::io_bank0::{IO_BANK0_BASE, IoBank0Regs};
+use crate::peripherals::otp::{OTP_DATA_BASE, OTP_DATA_SIZE, Otp};
 use crate::peripherals::pads_bank0::{PADS_BANK0_BASE, PadsBank0Regs};
 use crate::peripherals::psm::{PSM_BASE, Psm};
 use crate::peripherals::pwm::{PWM_BASE, PwmRegs};
+use crate::peripherals::sha256::{SHA256_BASE, Sha256Regs};
 use crate::peripherals::spi::{SPI0_BASE, SPI1_BASE, SpiRegs};
 use crate::peripherals::ticks::{TICKS_BASE, TicksRegs};
 use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE, TimerRegs};
+use crate::peripherals::trng::{TRNG_BASE, Trng};
 use crate::peripherals::uart::{UART0_BASE, UART1_BASE, UartRegs};
 use crate::peripherals::watchdog::{WATCHDOG_BASE, WatchdogRegs};
 use crate::pio::PioBlock;
@@ -310,6 +313,12 @@ pub struct Bus {
     pub(crate) psm: Psm,
     /// WATCHDOG — countdown with reset trigger (HLD V5 §7.D.3).
     pub(crate) watchdog: WatchdogRegs,
+    /// OTP — 16 KB fuse array, OR-only writes (HLD V5 §7.D.4).
+    pub(crate) otp: Otp,
+    /// TRNG — 32-bit counter model (HLD V5 §7.D.5).
+    pub(crate) trng: Trng,
+    /// SHA-256 — 16-word block compressor (HLD V5 §7.D.6).
+    pub(crate) sha256: Sha256Regs,
     /// Word-aligned MMIO addresses for which an "unmodelled access" warn
     /// has already been emitted. HLD V5 §4.A1 — warn once per address,
     /// per `Bus` instance, so firmware or tests that hammer an
@@ -518,6 +527,9 @@ impl Bus {
             glitch: GlitchDetector::new(),
             psm: Psm::new(),
             watchdog: WatchdogRegs::new(),
+            otp: Otp::new(),
+            trng: Trng::new(),
+            sha256: Sha256Regs::new(),
             warned_addrs: std::collections::HashSet::new(),
             watchdog_reset_requested: false,
             flash_loaded: false,
@@ -1409,6 +1421,12 @@ impl Bus {
                         GLITCH_DETECTOR_BASE => self.glitch.read32(offset),
                         PSM_BASE => self.psm.read32(offset),
                         WATCHDOG_BASE => self.watchdog.read32(offset),
+                        OTP_DATA_BASE => {
+                            let word_off = (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
+                            self.otp.read32(word_off)
+                        }
+                        TRNG_BASE => self.trng.read32(offset),
+                        SHA256_BASE => self.sha256.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -1711,6 +1729,37 @@ impl Bus {
                                 }
                             }
                         }
+                        OTP_DATA_BASE => {
+                            // OTP narrow byte write — OR-only fuse
+                            // semantics apply at the word level. Pack
+                            // the byte into the correct lane and OR-merge.
+                            let otp_word_off =
+                                (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
+                            let byte_idx = ((addr - OTP_DATA_BASE) & 3) as usize;
+                            let word_val = (val as u32) << (byte_idx * 8);
+                            self.otp.write32(otp_word_off, word_val);
+                        }
+                        TRNG_BASE | SHA256_BASE => {
+                            // TRNG / SHA narrow byte — subword-alias strategy.
+                            let word_addr = canonical & !3;
+                            let byte_idx = (canonical & 3) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    TRNG_BASE => self.trng.read32(reg_offset),
+                                    _ => self.sha256.read32(reg_offset),
+                                };
+                                let mut bytes = old_word.to_le_bytes();
+                                bytes[byte_idx] = val;
+                                (u32::from_le_bytes(bytes), 0u32)
+                            } else {
+                                ((val as u32) << (byte_idx * 8), alias)
+                            };
+                            match base {
+                                TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
+                                _ => self.sha256.write32(reg_offset, word_val, pass_alias),
+                            }
+                        }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
                         | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
                         | PADS_BANK0_BASE => {
@@ -1938,6 +1987,12 @@ impl Bus {
                         GLITCH_DETECTOR_BASE => self.glitch.read32(offset),
                         PSM_BASE => self.psm.read32(offset),
                         WATCHDOG_BASE => self.watchdog.read32(offset),
+                        OTP_DATA_BASE => {
+                            let word_off = (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
+                            self.otp.read32(word_off)
+                        }
+                        TRNG_BASE => self.trng.read32(offset),
+                        SHA256_BASE => self.sha256.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -2228,6 +2283,37 @@ impl Bus {
                                 }
                             }
                         }
+                        OTP_DATA_BASE => {
+                            // OTP narrow halfword write — OR-only fuse
+                            // semantics at the word level.
+                            let otp_word_off =
+                                (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
+                            let half_idx = (((addr - OTP_DATA_BASE) >> 1) & 1) as usize;
+                            let word_val = (val as u32) << (half_idx * 16);
+                            self.otp.write32(otp_word_off, word_val);
+                        }
+                        TRNG_BASE | SHA256_BASE => {
+                            // TRNG / SHA halfword path — subword alias.
+                            let word_addr = canonical & !3;
+                            let half_idx = ((canonical >> 1) & 1) as usize;
+                            let reg_offset = word_addr & 0x0000_0FFF;
+                            let (word_val, pass_alias) = if alias == 0 {
+                                let old_word = match base {
+                                    TRNG_BASE => self.trng.read32(reg_offset),
+                                    _ => self.sha256.read32(reg_offset),
+                                };
+                                let mut halves: [u16; 2] =
+                                    [old_word as u16, (old_word >> 16) as u16];
+                                halves[half_idx] = val;
+                                ((halves[0] as u32) | ((halves[1] as u32) << 16), 0u32)
+                            } else {
+                                ((val as u32) << (half_idx * 16), alias)
+                            };
+                            match base {
+                                TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
+                                _ => self.sha256.write32(reg_offset, word_val, pass_alias),
+                            }
+                        }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
                         | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
                         | PADS_BANK0_BASE => {
@@ -2382,6 +2468,16 @@ impl Bus {
                         GLITCH_DETECTOR_BASE => self.glitch.read32(offset),
                         PSM_BASE => self.psm.read32(offset),
                         WATCHDOG_BASE => self.watchdog.read32(offset),
+                        // OTP_DATA is a 16 KB flat aperture (HLD V5 §7.D.4).
+                        // No APB aliases — bits 12,13 are real OTP offset
+                        // bits. All four 4 KB sub-windows collapse into the
+                        // same `base` after the `!0x3000` alias strip, so we
+                        // recover the true byte offset from the raw `addr`.
+                        OTP_DATA_BASE => {
+                            self.otp.read32((addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1))
+                        }
+                        TRNG_BASE => self.trng.read32(offset),
+                        SHA256_BASE => self.sha256.read32(offset),
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
@@ -2545,6 +2641,14 @@ impl Bus {
                                 self.set_watchdog_reset();
                             }
                         }
+                        // OTP 16 KB flat aperture (HLD V5 §7.D.4). OR-only
+                        // fuse semantics — alias ignored (see module doc).
+                        OTP_DATA_BASE => {
+                            let otp_off = (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1);
+                            self.otp.write32(otp_off, val);
+                        }
+                        TRNG_BASE => self.trng.write32(offset, val, alias),
+                        SHA256_BASE => self.sha256.write32(offset, val, alias),
                         0x5020_0000 => self.pio[0].write32(offset, val, alias),
                         0x5030_0000 => self.pio[1].write32(offset, val, alias),
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),
@@ -3022,19 +3126,22 @@ mod bus_observability {
     fn unmodelled_mmio_warn_fires_once_per_address_on_repeated_writes() {
         // HLD V5 §4.A1 testing paragraph: write twice to an unmodelled
         // address, capture events, assert exactly one WARN fired for
-        // that address. `0x400F_8000` is the SHA-256 base — unmodelled
-        // until step 3b lands.
+        // that address. HLD V5 §4 originally pointed at `0x400F_8000`
+        // (SHA-256 base); step 3b models SHA-256, so the warn-once
+        // probe moved to `0x4012_0000` — the OTP SBPI controller
+        // aperture, distinct from the OTP_DATA aperture at
+        // `0x4013_0000` that step 3b does model.
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber { events: captured.clone() };
         tracing::subscriber::with_default(subscriber, || {
             let mut bus = Bus::new();
-            bus.write32(0x400F_8000, 0xDEAD_BEEF, 0);
-            bus.write32(0x400F_8000, 0xCAFE_BABE, 0);
+            bus.write32(0x4012_0000, 0xDEAD_BEEF, 0);
+            bus.write32(0x4012_0000, 0xCAFE_BABE, 0);
         });
         let events = captured.lock().unwrap();
-        let matches = count_warns_matching(&events, "0x400F8000");
+        let matches = count_warns_matching(&events, "0x40120000");
         assert_eq!(matches, 1,
-            "expected exactly one WARN for 0x400F_8000; got {} in {:?}",
+            "expected exactly one WARN for 0x4012_0000; got {} in {:?}",
             matches, *events);
     }
 
@@ -3045,27 +3152,29 @@ mod bus_observability {
         let subscriber = CaptureSubscriber { events: captured.clone() };
         tracing::subscriber::with_default(subscriber, || {
             let mut bus = Bus::new();
-            let _ = bus.read32(0x400F_8000, 0);
-            let _ = bus.read32(0x400F_8000, 0);
+            let _ = bus.read32(0x4012_0000, 0);
+            let _ = bus.read32(0x4012_0000, 0);
         });
         let events = captured.lock().unwrap();
-        let matches = count_warns_matching(&events, "0x400F8000");
+        let matches = count_warns_matching(&events, "0x40120000");
         assert_eq!(matches, 1);
     }
 
     #[test]
     fn unmodelled_mmio_warn_fires_once_per_unique_address() {
-        // Two distinct unmodelled addresses → two distinct WARNs.
+        // Two distinct unmodelled addresses → two distinct WARNs. Both
+        // live inside the OTP SBPI controller aperture (unmodelled —
+        // see note above).
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber { events: captured.clone() };
         tracing::subscriber::with_default(subscriber, || {
             let mut bus = Bus::new();
-            bus.write32(0x400F_8000, 0, 0);
-            bus.write32(0x400F_8004, 0, 0);
+            bus.write32(0x4012_0000, 0, 0);
+            bus.write32(0x4012_0004, 0, 0);
         });
         let events = captured.lock().unwrap();
-        assert_eq!(count_warns_matching(&events, "0x400F8000"), 1);
-        assert_eq!(count_warns_matching(&events, "0x400F8004"), 1);
+        assert_eq!(count_warns_matching(&events, "0x40120000"), 1);
+        assert_eq!(count_warns_matching(&events, "0x40120004"), 1);
     }
 
     // --- Watchdog reset request flag (HLD V5 §7.D.3) ---------------------

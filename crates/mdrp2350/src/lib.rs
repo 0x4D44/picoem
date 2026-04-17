@@ -178,6 +178,11 @@ impl Emulator {
         // WATCHDOG SCRATCH0..7 survive reset by datasheet (§4.7); the
         // rest of the block (CTRL / TIME / LOAD / REASON) quiesces.
         self.bus.watchdog.post_reset();
+        // SHA-256 accumulator quiesces on reset (HLD V5 §7.D.6). OTP
+        // fuse state and TRNG counter intentionally persist across reset
+        // — OTP is physical silicon state, and a persistent counter still
+        // yields a unique sequence post-reset.
+        self.bus.sha256.reset();
         // HLD V5 §5.7: post-bootrom RESETS state — peripherals
         // released by pico-sdk `runtime_init_bootrom_reset` start
         // deasserted. The emulator never runs the bootrom; we seed
