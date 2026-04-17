@@ -576,6 +576,16 @@ impl Emulator {
         &mut self.cores.expect_arm_mut()[id]
     }
 
+    /// RISC-V counterpart to [`Self::core`]. **Panics on an Arm emulator.**
+    pub fn core_riscv(&self, id: usize) -> &Hazard3 {
+        &self.cores.expect_riscv()[id]
+    }
+
+    /// Mutable accessor; same panic contract as [`Self::core_riscv`].
+    pub fn core_riscv_mut(&mut self, id: usize) -> &mut Hazard3 {
+        &mut self.cores.expect_riscv_mut()[id]
+    }
+
     /// Get a reference to a core's workload counters. Panics on RISC-V
     /// (Hazard3 has no workload-counters stash yet).
     pub fn core_counters(&self, core_id: usize) -> &CoreCounters {
