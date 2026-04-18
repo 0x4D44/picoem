@@ -303,6 +303,27 @@ pub struct CortexM33 {
     /// [`Self::bus_read32`] / [`Self::bus_write32`] wrappers and
     /// routed here rather than reaching `Bus::read32`/`write32`.
     pub sio_local: PerCoreSio,
+    /// PC-keyed decoded-op cache. Direct-mapped,
+    /// [`crate::bus::DECODE_CACHE_SIZE`] entries × 12 B = 192 KB per
+    /// core. Populated lazily on fetch by
+    /// [`Self::populate_decode_cache`]; invalidated by the driver after
+    /// each `step()` by draining
+    /// [`crate::bus::Bus::pending_cache_invalidations`] (or the
+    /// threaded [`crate::threaded::bus::WorkerBus::pending_cache_invalidations`])
+    /// into [`Self::invalidate_decode_cache_entries`]. Bulk-invalidated
+    /// on `load_bootrom` / `load_flash` / firmware ISB via
+    /// [`Self::invalidate_decode_cache_regions`] (region-scoped) or
+    /// [`Self::invalidate_decode_cache_all`] (everything). Phase 3
+    /// follow-up #10 — moved off `Bus` because each Cortex-M33 has its
+    /// own pipeline and decoder.
+    ///
+    /// Per-core decode cache. ~192 KB × 2 cores = ~384 KB total in a
+    /// dual-core `Emulator` (was 192 KB shared on `Bus` pre-migration).
+    /// Architecturally correct — each M33 has its own pipeline +
+    /// decoder — and enables the threaded runtime where cross-core
+    /// cache coherence would require inter-thread synchronization
+    /// otherwise.
+    pub(crate) decode_cache: Box<[crate::bus::DecodedOp; crate::bus::DECODE_CACHE_SIZE]>,
     /// Per-core workload counters (Phase 0a instrumentation).
     pub counters: CoreCounters,
 }
@@ -313,6 +334,15 @@ impl CortexM33 {
     /// setter, no `Option`. Unit tests use [`Self::for_test`] to
     /// construct a solo core with its own atomics.
     pub fn new(core_id: u8, atomics: Arc<CoreAtomics>) -> Self {
+        use crate::bus::{DECODE_CACHE_SIZE, DecodedOp};
+        // 192 KB heap allocation per core — can't live on the stack.
+        // Every slot starts with `tag = u32::MAX` so lookups never
+        // spuriously hit before the first populate.
+        let decode_cache: Box<[DecodedOp; DECODE_CACHE_SIZE]> =
+            vec![DecodedOp::empty(); DECODE_CACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("length matches DECODE_CACHE_SIZE by construction");
         Self {
             regs: Registers::new(),
             cycles: 0,
@@ -328,6 +358,7 @@ impl CortexM33 {
             exclusive_address: None,
             did_write_this_quantum: false,
             sio_local: PerCoreSio::default(),
+            decode_cache,
             counters: CoreCounters::default(),
         }
     }
@@ -443,56 +474,109 @@ impl CortexM33 {
         self.cycles
     }
 
-    /// Invalidate decode-cache entries for the supplied addresses.
+    /// Invalidate this core's decode-cache entries for the supplied
+    /// addresses.
     ///
-    /// Phase 3 Stage 7 (LLD V7 §9): the threaded worker loop drains
-    /// `WorkerBus::pending_cache_invalidations` every quantum and calls
-    /// this to evict stale entries whose backing halfwords were rewritten
-    /// by the peer core. Decode-cache storage currently lives on the
-    /// bus (per Stage 2 deferral); this method is generic over
-    /// [`CoreBus`] so both `Bus` (single-threaded) and `WorkerBus`
-    /// (threaded) can be driven through the same helper.
+    /// Phase 3 follow-up #10: the single-threaded and threaded drivers
+    /// drain `pending_cache_invalidations` from `Bus` / `WorkerBus`
+    /// after each `core.step()` and call this to evict stale entries
+    /// whose backing halfwords were just rewritten. Mirrors
+    /// [`Self::invalidate_decode_cache_all`] for bulk-load / ISB paths.
     ///
     /// Clears the direct-mapped slot `((addr >> 1) & (DECODE_CACHE_SIZE - 1))`
-    /// for each cacheable address. Non-cacheable addresses (anything outside
-    /// ROM / XIP / SRAM per [`is_cacheable_pc`]) are skipped.
-    pub fn invalidate_decode_cache_entries<B: CoreBus>(&mut self, bus: &mut B, addrs: &[u32]) {
+    /// for each cacheable address, plus the preceding slot (so a wide
+    /// instruction's `hw0` at `addr - 2` whose `hw1` is rewritten gets
+    /// evicted too). Non-cacheable addresses (anything outside ROM / XIP
+    /// / SRAM per `is_cacheable_pc`) are skipped.
+    pub fn invalidate_decode_cache_entries(&mut self, addrs: &[u32]) {
         use crate::bus::{DecodedOp, DECODE_CACHE_SIZE, is_cacheable_pc};
-        let _ = self; // reserved: once decode_cache migrates onto CortexM33
-                      // the per-core bookkeeping lives on `self`.
         const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
         let empty = DecodedOp::empty();
         for &addr in addrs {
             // Invalidate both the slot covering this halfword and the
             // preceding slot (so a wide-instruction hw0 at `addr - 2`
-            // whose hw1 is rewritten at `addr` gets evicted). Parity
-            // with `Bus::invalidate_pc_range` (bus/mod.rs).
+            // whose hw1 is rewritten at `addr` gets evicted).
             let aligned = addr & !1;
             let prev = aligned.wrapping_sub(2);
             if is_cacheable_pc(prev) {
                 let slot = ((prev >> 1) & MASK) as usize;
-                bus.decode_cache_set(slot, empty);
+                self.decode_cache[slot] = empty;
             }
             if is_cacheable_pc(aligned) {
                 let slot = ((aligned >> 1) & MASK) as usize;
-                bus.decode_cache_set(slot, empty);
+                self.decode_cache[slot] = empty;
             }
         }
     }
 
-    /// Invalidate every decode-cache entry. Used by `ISB` and any other
-    /// path that globally invalidates the instruction pipeline.
+    /// Invalidate decode-cache entries that back one or more regions,
+    /// selected by the `regions` bitmask (see
+    /// [`crate::bus::invalidation_regions`]). Unaffected slots stay hot
+    /// — a `load_flash` no longer evicts SRAM-resident code, so
+    /// firmware that reloads flash then runs SRAM code doesn't pay a
+    /// cold-populate tax on every instruction of the next quantum.
     ///
-    /// Phase 3 Stage 7: mirrors `Bus::invalidate_all` but routed through
-    /// the `CoreBus` trait so both the single-threaded and threaded
-    /// bus implementations are covered.
-    #[allow(dead_code)]
-    pub fn invalidate_decode_cache_all<B: CoreBus>(&mut self, bus: &mut B) {
-        use crate::bus::{DecodedOp, DECODE_CACHE_SIZE};
-        let empty = DecodedOp::empty();
-        for slot in 0..DECODE_CACHE_SIZE {
-            bus.decode_cache_set(slot, empty);
+    /// If `regions` has the [`crate::bus::invalidation_regions::BULK`]
+    /// bit set, every slot is cleared regardless of tag — same as
+    /// [`Self::invalidate_decode_cache_all`].
+    ///
+    /// If `regions == 0`, this is a no-op.
+    pub fn invalidate_decode_cache_regions(&mut self, regions: u8) {
+        use crate::bus::{DecodedOp, invalidation_regions::BULK};
+        if regions == 0 {
+            return;
         }
+        let empty = DecodedOp::empty();
+        if regions & BULK != 0 {
+            for slot in self.decode_cache.iter_mut() {
+                *slot = empty;
+            }
+            return;
+        }
+        // Region-scoped sweep: the region of a cached tag is
+        // `(tag >> 28) as u8` (ROM = 0, XIP = 1, SRAM = 2). We keep bit
+        // `n` of the `regions` byte in sync with region `n`, so a test
+        // of `regions & (1 << region_nibble)` picks out exactly the
+        // slots this caller asked to drain. Empty slots (`tag ==
+        // u32::MAX`, nibble = 0xF) never match any valid region bit, so
+        // they're skipped without special-casing.
+        for slot in self.decode_cache.iter_mut() {
+            let nibble = (slot.tag >> 28) as u8;
+            if nibble < 8 && regions & (1 << nibble) != 0 {
+                *slot = empty;
+            }
+        }
+    }
+
+    /// Invalidate every decode-cache entry on this core. Used by `ISB`
+    /// and any other path that globally invalidates the instruction
+    /// pipeline. Equivalent to
+    /// [`Self::invalidate_decode_cache_regions`] with
+    /// [`crate::bus::invalidation_regions::BULK`]; retained as a
+    /// convenience (one-liner at call sites that unconditionally wipe
+    /// everything, such as the `ISB` handler).
+    pub fn invalidate_decode_cache_all(&mut self) {
+        use crate::bus::DecodedOp;
+        let empty = DecodedOp::empty();
+        for slot in self.decode_cache.iter_mut() {
+            *slot = empty;
+        }
+    }
+
+    /// Direct decode-cache lookup (by slot). Used by
+    /// `CortexM33::decode_execute` / `populate_decode_cache`. The
+    /// `DecodedOp` type is `pub(crate)`; external callers never need
+    /// this accessor.
+    #[inline(always)]
+    pub(crate) fn decode_cache_get(&self, slot: usize) -> crate::bus::DecodedOp {
+        self.decode_cache[slot]
+    }
+
+    /// Direct decode-cache store (by slot). Used by
+    /// `CortexM33::populate_decode_cache`.
+    #[inline(always)]
+    pub(crate) fn decode_cache_set(&mut self, slot: usize, entry: crate::bus::DecodedOp) {
+        self.decode_cache[slot] = entry;
     }
 
     /// Swap all banked register pairs between Secure and Non-Secure.

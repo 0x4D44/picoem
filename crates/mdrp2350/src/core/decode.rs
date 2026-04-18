@@ -253,10 +253,11 @@ impl CortexM33 {
         bus.set_active_pc(pc, self.core_id);
 
         // Cache lookup — by-value (`DecodedOp: Copy`), so no borrow on
-        // `bus` survives into dispatch.
+        // `bus` survives into dispatch. Cache lives on `self`
+        // (per-core) since Phase 3 follow-up #10.
         let entry = if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
-            let e = bus.decode_cache_get(slot);
+            let e = self.decode_cache_get(slot);
             if e.tag == pc { Some(e) } else { None }
         } else {
             None
@@ -425,7 +426,7 @@ impl CortexM33 {
 
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
-            bus.decode_cache_set(slot, entry);
+            self.decode_cache_set(slot, entry);
         }
 
         entry

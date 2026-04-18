@@ -98,16 +98,33 @@ impl ThreadedEmulator {
         } = emu;
         let [core0, core1] = cores;
 
+        // Debug-assert that the single-threaded driver has drained any
+        // pending decode-cache invalidations before handoff. Dropping
+        // these on the floor would leave the threaded workers starting
+        // with per-core caches that still carry stale entries pointing
+        // at bytes the single-threaded `Bus` replaced.
+        debug_assert!(
+            bus.pending_cache_invalidations.is_empty()
+                && bus.pending_invalidation_regions == 0,
+            "ThreadedEmulator::from_emulator: Bus has unconsumed decode-cache \
+             invalidations. Call Emulator::step() or Emulator::reset() before \
+             handoff, or the threaded workers will start with stale per-core \
+             caches."
+        );
+
         // Exhaustive destructure — any new `Bus` field forces a compile
         // error here so the threaded path cannot silently drop state.
         // Fields that Stage 6/Stage 7 doesn't yet consume are bound to
         // `_`; the Stage 5 `WorkerBus`/Stage 7 worker bodies will
         // pick them up as needed.
         //
-        // `decode_cache` still lives on the single-threaded `Bus`
-        // today; Stage 10 will migrate it onto each `CortexM33`. For
-        // now we drop the ROM-backed cache — the cores rebuild their
-        // caches lazily on first fetch.
+        // The decode cache now lives on each `CortexM33` (Phase 3
+        // follow-up #10); `pending_cache_invalidations` /
+        // `pending_invalidation_regions` are single-threaded-path
+        // dirty-range queues that the threaded workers don't consume
+        // — `WorkerBus` carries its own per-worker queue. The
+        // debug-assert above guards against handoff with unconsumed
+        // state in either.
         let Bus {
             memory,
             boot_ram,
@@ -152,7 +169,8 @@ impl ThreadedEmulator {
             active_pc: _,
             trace_enabled: _,
             trace_sink: _,
-            decode_cache: _,
+            pending_cache_invalidations: _,
+            pending_invalidation_regions: _,
         } = bus;
 
         let shared_mem = Arc::new(SharedMemory::from_memory(
@@ -475,21 +493,10 @@ fn core_worker_body(
             core.ppb.update_latest_cycles(core.cycles());
             core.step(&mut bus);
             if !bus.pending_cache_invalidations.is_empty() {
-                // `core.step(&mut bus)` borrows `bus` mutably for the call duration,
-                // and `invalidate_decode_cache_entries(&mut self, bus, addrs)` also
-                // needs `&mut bus`. We can't simultaneously borrow
-                // `&bus.pending_cache_invalidations` and pass `&mut bus` — so swap
-                // the Vec out, drain, put it back.
-                //
-                // Happy path: the original 16-cap Vec roundtrips through `addrs` and
-                // gets cleared in place (preserving capacity). If invalidate_...
-                // panics, the cap-0 temporary stays in place and future quanta start
-                // re-allocating from cap 0 until the Vec grows back. This is
-                // acceptable given the panic already escalates to barrier poison +
-                // ThreadedEmulator::poisoned.
-                let addrs = std::mem::take(&mut bus.pending_cache_invalidations);
-                core.invalidate_decode_cache_entries(&mut bus, &addrs);
-                bus.pending_cache_invalidations = addrs;
+                // Decode cache lives on `core` (Phase 3 follow-up #10);
+                // `invalidate_decode_cache_entries` is now inherent on
+                // `CortexM33` and doesn't need `bus`. Drain in place.
+                core.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
                 bus.pending_cache_invalidations.clear();
             }
         }
@@ -1006,12 +1013,10 @@ mod tests {
         );
 
         // Simulate the worker loop's drain step:
-        let addrs = std::mem::take(&mut bus.pending_cache_invalidations);
         let mut dummy = Emulator::new(Config::default());
         dummy
             .cores[0]
-            .invalidate_decode_cache_entries(&mut bus, &addrs);
-        bus.pending_cache_invalidations = addrs;
+            .invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
         bus.pending_cache_invalidations.clear();
 
         assert!(
@@ -1482,6 +1487,7 @@ mod tests {
     /// Release builds still return 0 — this only catches the test path.
     #[test]
     #[should_panic(expected = "PIO ahb_read32 offset")]
+    #[cfg(debug_assertions)]
     fn pio_ahb_read32_unmapped_offset_panics_under_debug() {
         use crate::core::CoreBus;
 

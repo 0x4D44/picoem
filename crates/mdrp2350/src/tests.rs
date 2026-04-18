@@ -8190,6 +8190,9 @@ fn decode_cache_hit_miss_smoke() {
     // After the first decode_execute at a PC, the slot's tag must equal
     // the PC. A second decode_execute at the same PC takes the hit path
     // and observes the same behaviour.
+    //
+    // Post-Phase-3-follow-up-#10: decode_cache lives on the core, not
+    // the bus.
     let (mut core, mut bus) = core_and_bus();
 
     // NOP (MOVS R0, R0 = 0x0000, which decodes to LSLS R0, R0, #0 — pure).
@@ -8199,100 +8202,124 @@ fn decode_cache_hit_miss_smoke() {
     core.regs.set_pc(pc);
 
     let slot = cache_slot(pc);
-    assert_eq!(bus.decode_cache[slot].tag, u32::MAX, "slot starts empty");
+    assert_eq!(core.decode_cache[slot].tag, u32::MAX, "slot starts empty");
 
     // First step — miss, populates.
     core.step(&mut bus);
-    assert_eq!(bus.decode_cache[slot].tag, pc, "populate set tag");
-    assert_eq!(bus.decode_cache[slot].hw0, 0x0000);
-    assert!(bus.decode_cache[slot].is_pure(), "LSLS is classified pure");
+    assert_eq!(core.decode_cache[slot].tag, pc, "populate set tag");
+    assert_eq!(core.decode_cache[slot].hw0, 0x0000);
+    assert!(core.decode_cache[slot].is_pure(), "LSLS is classified pure");
 
     // Second step at pc+2 — populates the next slot too.
     core.step(&mut bus);
     let slot2 = cache_slot(pc + 2);
-    assert_eq!(bus.decode_cache[slot2].tag, pc + 2);
+    assert_eq!(core.decode_cache[slot2].tag, pc + 2);
 
     // Rewind PC and step again — the first slot must be a hit (tag
     // unchanged, no re-population).
     core.regs.set_pc(pc);
-    let tag_before = bus.decode_cache[slot].tag;
+    let tag_before = core.decode_cache[slot].tag;
     core.step(&mut bus);
-    assert_eq!(bus.decode_cache[slot].tag, tag_before,
+    assert_eq!(core.decode_cache[slot].tag, tag_before,
         "second visit is a hit — tag unchanged");
 }
 
 #[test]
 fn decode_cache_invalidation_on_sram_write() {
-    // After caching, a Bus::write16 to the cached halfword must clear
-    // the slot so the next fetch picks up the new bytes.
+    // After caching, a Bus::write16 to the cached halfword must queue
+    // the address; the driver drains the queue into the core, clearing
+    // the slot so the next fetch picks up the new bytes. Phase 3
+    // follow-up #10: Bus no longer invalidates directly.
     let (mut core, mut bus) = core_and_bus();
 
     let pc = 0x2000_0100u32;
     place_hw_in_sram(&mut bus, pc, 0x0000); // LSLS R0,R0,#0 — pure
     core.regs.set_pc(pc);
     core.step(&mut bus);
-    assert_eq!(bus.decode_cache[cache_slot(pc)].tag, pc);
+    assert_eq!(core.decode_cache[cache_slot(pc)].tag, pc);
 
-    // Rewrite the halfword via the bus — must invalidate.
+    // Rewrite the halfword via the bus — must queue an invalidation.
     bus.write16(pc, 0x1C40, 0); // ADDS R0, R0, #1
-    assert_eq!(bus.decode_cache[cache_slot(pc)].tag, u32::MAX,
-        "Bus::write16 to cached PC clears the slot");
+    assert!(
+        !bus.pending_cache_invalidations.is_empty(),
+        "Bus::write16 must queue a cache invalidation"
+    );
+    // Drain the queue into the core (mirrors `Emulator::step`).
+    core.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+    bus.pending_cache_invalidations.clear();
+    assert_eq!(core.decode_cache[cache_slot(pc)].tag, u32::MAX,
+        "drained queue clears the slot");
 
     // Next fetch re-populates with the new bytes.
     core.regs.set_pc(pc);
     core.step(&mut bus);
-    assert_eq!(bus.decode_cache[cache_slot(pc)].hw0, 0x1C40,
+    assert_eq!(core.decode_cache[cache_slot(pc)].hw0, 0x1C40,
         "re-populate picked up the new halfword");
 }
 
 #[test]
 fn decode_cache_invalidation_on_load_flash() {
-    // Populate the cache with an entry whose tag lies in the XIP region,
-    // then load_flash; the entry must be cleared.
-    //
-    // Pick PCs that map to *different* cache slots so the assertions on
-    // the SRAM-region entry's survival aren't confounded by a collision.
-    let mut bus = crate::bus::Bus::new();
+    // After Phase 3 follow-up #10 + Task #10 review fix, `Bus::load_flash`
+    // sets the XIP bit in `pending_invalidation_regions` (not the bulk
+    // bit). `Emulator::load_flash` drains that bitmask on both cores via
+    // `invalidate_decode_cache_regions(regions)`, so only XIP-region
+    // slots are cleared — SRAM / ROM slots stay hot. This restores the
+    // pre-migration `invalidate_region(0x1)` spec intent.
+    use crate::{Config, Emulator};
 
-    // Fake a populated XIP-region entry directly in the cache.
+    let mut emu = Emulator::new(Config::default());
+
+    // Fake populated entries on BOTH cores directly in their caches.
     let xip_pc = 0x1000_0002u32;   // slot 1
     let sram_pc = 0x2000_0008u32;  // slot 4 — different slot
     assert_ne!(cache_slot(xip_pc), cache_slot(sram_pc),
         "test precondition: the two PCs must hash to distinct slots");
 
-    bus.decode_cache[cache_slot(xip_pc)] = crate::bus::DecodedOp {
-        tag: xip_pc,
-        hw0: 0xDEAD,
-        hw1: 0,
-        fetch_wait: 0,
-        flags: crate::bus::DecodedOp::FLAG_PURE,
-    };
-    bus.decode_cache[cache_slot(sram_pc)] = crate::bus::DecodedOp {
-        tag: sram_pc,
-        hw0: 0xBEEF,
-        hw1: 0,
-        fetch_wait: 0,
-        flags: 0,
-    };
+    for core in &mut emu.cores {
+        core.decode_cache[cache_slot(xip_pc)] = crate::bus::DecodedOp {
+            tag: xip_pc,
+            hw0: 0xDEAD,
+            hw1: 0,
+            fetch_wait: 0,
+            flags: crate::bus::DecodedOp::FLAG_PURE,
+        };
+        core.decode_cache[cache_slot(sram_pc)] = crate::bus::DecodedOp {
+            tag: sram_pc,
+            hw0: 0xBEEF,
+            hw1: 0,
+            fetch_wait: 0,
+            flags: 0,
+        };
+    }
 
-    bus.load_flash(&[0x00; 256]);
+    emu.load_flash(&[0x00; 256]);
 
-    assert_eq!(bus.decode_cache[cache_slot(xip_pc)].tag, u32::MAX,
-        "XIP-region entry invalidated by load_flash");
-    assert_eq!(bus.decode_cache[cache_slot(sram_pc)].tag, sram_pc,
-        "SRAM-region entry unaffected");
+    for (i, core) in emu.cores.iter().enumerate() {
+        assert_eq!(core.decode_cache[cache_slot(xip_pc)].tag, u32::MAX,
+            "core {}: XIP-region entry invalidated by load_flash", i);
+        // Region-scoped drain: load_flash only sets the XIP bit, so
+        // the SRAM-resident entry must survive untouched. This is the
+        // perf-critical post-review behaviour — firmware that reloads
+        // flash then runs SRAM code does not pay a cold-cache
+        // repopulate tax on every instruction of the next quantum.
+        assert_eq!(core.decode_cache[cache_slot(sram_pc)].tag, sram_pc,
+            "core {}: SRAM-region slot preserved by XIP-only load_flash", i);
+        assert_eq!(core.decode_cache[cache_slot(sram_pc)].hw0, 0xBEEF,
+            "core {}: SRAM-region hw0 preserved by XIP-only load_flash", i);
+    }
 }
 
 #[test]
 fn decode_cache_wide_boundary_invalidation() {
     // A wide instruction cached at PC=N with its hw1 at N+2. A write
     // targeting N+2 must clear the slot at N (so the next fetch re-reads
-    // both halfwords).
-    let mut bus = crate::bus::Bus::new();
+    // both halfwords). Post-Phase-3-follow-up-#10: the write queues the
+    // invalidation; draining into the core clears both slots.
+    let (mut core, mut bus) = core_and_bus();
 
     let wide_pc = 0x2000_0200u32;
-    // Populate a fake wide entry.
-    bus.decode_cache[cache_slot(wide_pc)] = crate::bus::DecodedOp {
+    // Populate a fake wide entry on the core.
+    core.decode_cache[cache_slot(wide_pc)] = crate::bus::DecodedOp {
         tag: wide_pc,
         hw0: 0xF000, // any wide prefix
         hw1: 0x8000,
@@ -8301,7 +8328,7 @@ fn decode_cache_wide_boundary_invalidation() {
     };
     // Populate a narrow entry at wide_pc+2 too — it should also be
     // cleared (the preceding-slot rule).
-    bus.decode_cache[cache_slot(wide_pc + 2)] = crate::bus::DecodedOp {
+    core.decode_cache[cache_slot(wide_pc + 2)] = crate::bus::DecodedOp {
         tag: wide_pc + 2,
         hw0: 0x2001,
         hw1: 0,
@@ -8309,11 +8336,14 @@ fn decode_cache_wide_boundary_invalidation() {
         flags: crate::bus::DecodedOp::FLAG_PURE,
     };
 
-    // Writing a halfword at wide_pc+2 must clear the wide slot at N.
+    // Writing a halfword at wide_pc+2 must clear the wide slot at N
+    // (after draining).
     bus.write16(wide_pc + 2, 0xAAAA, 0);
-    assert_eq!(bus.decode_cache[cache_slot(wide_pc)].tag, u32::MAX,
+    core.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+    bus.pending_cache_invalidations.clear();
+    assert_eq!(core.decode_cache[cache_slot(wide_pc)].tag, u32::MAX,
         "write at hw1 boundary clears the wide slot at N");
-    assert_eq!(bus.decode_cache[cache_slot(wide_pc + 2)].tag, u32::MAX,
+    assert_eq!(core.decode_cache[cache_slot(wide_pc + 2)].tag, u32::MAX,
         "write to the slot itself also clears");
 }
 
@@ -8347,7 +8377,7 @@ fn decode_cache_bank2_fetch_wait_preserved() {
     assert_eq!(c1, c2,
         "populate and hit must return identical cycle counts for bank-2 SRAM");
     assert!(c1 >= 2, "bank 2 fetch adds a wait state, so cycles >= 1+1");
-    assert_eq!(bus.decode_cache[cache_slot(pc)].fetch_wait, 1,
+    assert_eq!(core.decode_cache[cache_slot(pc)].fetch_wait, 1,
         "fetch_wait for bank 2 is 1");
 }
 
@@ -8368,7 +8398,7 @@ fn decode_cache_pure_path_preserves_accumulator() {
     // First populate the cache so the next step takes the pure hit path.
     core.regs.set_pc(pc);
     core.step(&mut bus);
-    assert!(bus.decode_cache[cache_slot(pc)].is_pure());
+    assert!(core.decode_cache[cache_slot(pc)].is_pure());
 
     // Pollute the accumulator with a direct bank-2 read.
     bus.reset_extra_wait_states();
@@ -8402,7 +8432,7 @@ fn decode_cache_impure_ldr_still_works() {
     assert_eq!(core.reg(0), 0xDEAD_BEEF, "LDR literal loaded expected value");
 
     // Cache entry must be classified impure (LDR literal hits the bus).
-    assert!(!bus.decode_cache[cache_slot(pc)].is_pure(),
+    assert!(!core.decode_cache[cache_slot(pc)].is_pure(),
         "LDR literal is impure");
 
     // A second execution at the same PC still works.
@@ -8414,14 +8444,16 @@ fn decode_cache_impure_ldr_still_works() {
 
 #[test]
 fn decode_cache_invalidate_all_clears_everything() {
-    // invalidate_all() must wipe every slot regardless of tag/region.
-    let mut bus = crate::bus::Bus::new();
+    // CortexM33::invalidate_decode_cache_all() must wipe every slot
+    // regardless of tag/region. Phase 3 follow-up #10: cache lives on
+    // the core now.
+    let (mut core, _bus) = core_and_bus();
 
     // Pre-populate a handful of slots across regions.
     for (i, pc) in [0x0000_0004u32, 0x1000_0008, 0x2000_0010, 0x2080_0020]
         .iter().enumerate()
     {
-        bus.decode_cache[cache_slot(*pc)] = crate::bus::DecodedOp {
+        core.decode_cache[cache_slot(*pc)] = crate::bus::DecodedOp {
             tag: *pc,
             hw0: i as u16,
             hw1: 0,
@@ -8430,11 +8462,11 @@ fn decode_cache_invalidate_all_clears_everything() {
         };
     }
 
-    bus.invalidate_all();
+    core.invalidate_decode_cache_all();
 
     for pc in [0x0000_0004u32, 0x1000_0008, 0x2000_0010, 0x2080_0020] {
-        assert_eq!(bus.decode_cache[cache_slot(pc)].tag, u32::MAX,
-            "invalidate_all cleared slot for PC={:08X}", pc);
+        assert_eq!(core.decode_cache[cache_slot(pc)].tag, u32::MAX,
+            "invalidate_decode_cache_all cleared slot for PC={:08X}", pc);
     }
 }
 

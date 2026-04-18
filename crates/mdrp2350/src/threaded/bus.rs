@@ -46,7 +46,6 @@ use std::sync::atomic::Ordering;
 
 use mdpicoem_common::PioBlock;
 
-use crate::bus::{DECODE_CACHE_SIZE, DecodedOp};
 use crate::core::bus_trait::CoreBus;
 use crate::dma::DMA_BASE;
 use crate::peripherals::adc::ADC_BASE;
@@ -117,12 +116,14 @@ impl PioBus {
 /// local decode cache. Cross-core SMC is the firmware's responsibility
 /// (per ARM spec: `DSB; ISB; IC IVAU`).
 ///
-/// ## Decode cache (transient)
+/// ## Decode cache
 ///
-/// The `CoreBus::decode_cache_get/set` methods still live on the trait
-/// per Stage 2; a later stage migrates the decode cache onto
-/// `CortexM33`. Until then, each `WorkerBus` carries its own
-/// `DECODE_CACHE_SIZE` slots so the trait object covers every method.
+/// The decode cache lives on each [`crate::core::CortexM33`] (Phase 3
+/// follow-up #10). `WorkerBus` only carries the dirty-range log
+/// [`Self::pending_cache_invalidations`]; the worker drains it into the
+/// per-core cache via
+/// [`crate::core::CortexM33::invalidate_decode_cache_entries`] after
+/// each `core.step()`.
 ///
 pub struct WorkerBus {
     core_id: u8,
@@ -133,9 +134,6 @@ pub struct WorkerBus {
     /// SRAM / ROM / XIP write addresses queued this instruction.
     /// Drained by the worker loop after each `core.step`.
     pub pending_cache_invalidations: Vec<u32>,
-
-    // --- Transient Stage-2 trait support (see struct-level docs) ---
-    decode_cache: Box<[DecodedOp]>,
 }
 
 impl WorkerBus {
@@ -150,7 +148,6 @@ impl WorkerBus {
         // See `PENDING_INVALIDATION_CAPACITY` — pre-allocating up front
         // keeps the write hot path allocation-free in steady state.
         let pending_cache_invalidations = Vec::with_capacity(PENDING_INVALIDATION_CAPACITY);
-        let decode_cache = vec![DecodedOp::empty(); DECODE_CACHE_SIZE].into_boxed_slice();
         Self {
             core_id,
             shared,
@@ -158,7 +155,6 @@ impl WorkerBus {
             burst_mode: false,
             extra_wait_states: 0,
             pending_cache_invalidations,
-            decode_cache,
         }
     }
 
@@ -1378,15 +1374,6 @@ impl CoreBus for WorkerBus {
     }
 
     #[inline]
-    fn decode_cache_get(&self, slot: usize) -> DecodedOp {
-        self.decode_cache[slot]
-    }
-    #[inline]
-    fn decode_cache_set(&mut self, slot: usize, entry: DecodedOp) {
-        self.decode_cache[slot] = entry;
-    }
-
-    #[inline]
     fn extra_wait_states(&self) -> u32 {
         self.extra_wait_states
     }
@@ -1667,8 +1654,6 @@ mod tests {
         bus_dyn.gpio_clear_oe(0);
         bus_dyn.gpio_xor_oe(0);
         let _ = bus_dyn.gpio_read_in();
-        let empty = bus_dyn.decode_cache_get(0);
-        bus_dyn.decode_cache_set(0, empty);
         let _ = bus_dyn.extra_wait_states();
         bus_dyn.reset_extra_wait_states();
         let _ = bus_dyn.trace_enabled();

@@ -960,7 +960,7 @@ impl CortexM33 {
                 // (e.g. self-modifying code, cross-core SMC) are re-fetched.
                 0x6 => {
                     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-                    self.invalidate_decode_cache_all(bus);
+                    self.invalidate_decode_cache_all();
                     1
                 }
                 _ => self.thumb32_undefined(hw0, hw1, bus),

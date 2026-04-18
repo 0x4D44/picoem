@@ -31,7 +31,6 @@ use crate::sio::Sio;
 /// Direct-mapped, indexed by `(pc >> 1) & (DECODE_CACHE_SIZE - 1)`.
 /// See HLD `2026.04.14 - HLD - Decoded-Op Cache.md` §3.
 pub(crate) const DECODE_CACHE_SIZE: usize = 16384;
-const DECODE_CACHE_MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
 
 /// One decoded instruction. 12 bytes. `Copy`.
 ///
@@ -41,7 +40,7 @@ const DECODE_CACHE_MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
 ///
 /// See HLD §2.
 #[derive(Clone, Copy, Debug)]
-pub struct DecodedOp {
+pub(crate) struct DecodedOp {
     /// PC this entry is valid for. Full tag (no shift). `u32::MAX` = empty.
     pub tag: u32,
     /// First halfword (the one at PC).
@@ -97,6 +96,26 @@ impl DecodedOp {
 #[inline(always)]
 pub(crate) fn is_cacheable_pc(pc: u32) -> bool {
     matches!(pc >> 28, 0x0 | 0x1 | 0x2)
+}
+
+/// Region bits for [`Bus::pending_invalidation_regions`] /
+/// [`crate::core::CortexM33::invalidate_decode_cache_regions`]. The
+/// meaningful regions are the three cacheable ones (ROM / XIP / SRAM
+/// — see [`is_cacheable_pc`]). `REGION_BULK` is the universal-bulk
+/// escape hatch used when the caller doesn't know (or doesn't care)
+/// which region changed.
+pub mod invalidation_regions {
+    /// Region `0x0` — ROM (the 32 KB bootrom).
+    pub const ROM: u8 = 1 << 0;
+    /// Region `0x1` — XIP / XIP-SRAM (flash window).
+    pub const XIP: u8 = 1 << 1;
+    /// Region `0x2` — on-chip SRAM (all 10 banks).
+    pub const SRAM: u8 = 1 << 2;
+    /// Bulk bit — drain every slot regardless of tag region. Used when
+    /// the caller can't attribute the change to a specific region
+    /// (e.g. `Emulator::poke`, legacy code paths, or an `ISB` that
+    /// must flush the entire decode pipeline).
+    pub const BULK: u8 = 1 << 7;
 }
 
 // --- RESETS bit assignments (RP2350 datasheet §7.5 Table 486) ----------
@@ -352,12 +371,34 @@ pub struct Bus {
     /// `gpio_in[i]`; bit `i` clear = PIO/SIO dictates. Defaults to 0
     /// (no stimulus — legacy behaviour).
     pub gpio_external_mask: u32,
-    /// PC-keyed decoded-op cache. Direct-mapped, `DECODE_CACHE_SIZE`
-    /// entries × 12 B = 192 KB. Populated lazily on fetch by
-    /// `CortexM33::populate_decode_cache`; invalidated on writes to
-    /// executable memory (regions 0x1 / 0x2) and on bulk loads
-    /// (`load_bootrom` / `load_flash`). See HLD §3.
-    pub(crate) decode_cache: Box<[DecodedOp; DECODE_CACHE_SIZE]>,
+    /// Dirty-range log for per-core decode caches. Every SRAM / ROM /
+    /// XIP write pushes the target halfword address(es) here; the driver
+    /// (`Emulator::step` in the single-threaded path) drains this into
+    /// the core that just ran, evicting stale entries from its
+    /// per-core decode cache. Mirrors the threaded
+    /// `WorkerBus::pending_cache_invalidations` pattern (LLD V7 §9).
+    ///
+    /// Width-aware push: `write32` pushes `{addr, addr+2}`, `write16` /
+    /// `write8` push `{addr}`. The drainer also evicts the slot at
+    /// `addr - 2` so a wide instruction whose `hw1` is rewritten is
+    /// evicted along with the narrow slot. Parity with the pre-migration
+    /// `Bus::invalidate_pc_range` which cleared `{addr-2, addr [, addr+2]}`.
+    pub pending_cache_invalidations: Vec<u32>,
+    /// Region-scoped bulk-invalidation bitmask. Set by [`Self::load_bootrom`]
+    /// (bit [`invalidation_regions::ROM`]), [`Self::load_flash`] (bit
+    /// [`invalidation_regions::XIP`]), and [`Self::invalidate_all`] (bit
+    /// [`invalidation_regions::BULK`]) when a write has replaced
+    /// executable bytes wholesale. The driver drains the mask on the
+    /// next observation by calling
+    /// [`crate::core::CortexM33::invalidate_decode_cache_regions`] on
+    /// each core and then resets it to `0`.
+    ///
+    /// Complements [`Self::pending_cache_invalidations`] — that Vec
+    /// covers narrow writes observed per-instruction; this mask covers
+    /// bulk loads that predate any `step()` call and can preserve slots
+    /// outside the touched region (a `load_flash` no longer blows away
+    /// SRAM cache entries — regression fixed after Task #10 review).
+    pub pending_invalidation_regions: u8,
     /// MMIO trace toggle (see `wrk_docs/2026.04.15 - HLD - RP2350 Peripheral
     /// Coverage V5.md` §4 / §4.2.7). When `true`, each byte/half/word bus
     /// access emits one line to [`Self::trace_sink`] (defaults to stdout
@@ -445,13 +486,11 @@ impl Bus {
             gpio_in: 0,
             gpio_external_in: 0,
             gpio_external_mask: 0,
-            // 192 KB heap allocation — can't live on the stack. Every slot
-            // starts with `tag = u32::MAX` so lookups never spuriously hit
-            // before the first populate.
-            decode_cache: vec![DecodedOp::empty(); DECODE_CACHE_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .expect("length matches DECODE_CACHE_SIZE by construction"),
+            // Dirty-range log for per-core decode caches. 16 entries up
+            // front — STM tops out at 13 registers, FPU context push
+            // spills 16 words. Matches `WorkerBus::pending_cache_invalidations`.
+            pending_cache_invalidations: Vec::with_capacity(16),
+            pending_invalidation_regions: 0,
             trace_enabled: false,
             active_pc: [0; 2],
             trace_sink: None,
@@ -984,13 +1023,15 @@ impl Bus {
         self.gpio_hi_noise_state | 0xE000_0000
     }
 
-    /// Load flash data into XIP memory and mark flash as loaded.
-    /// Invalidates any cache entries in the XIP region — flash bytes
-    /// have been replaced wholesale.
+    /// Load flash data into XIP memory and mark flash as loaded. Sets
+    /// the XIP bit in [`Self::pending_invalidation_regions`] so the
+    /// driver drains only XIP-region decode-cache slots before resuming
+    /// execution — flash bytes have been replaced wholesale, but SRAM /
+    /// ROM slots are untouched and stay hot.
     pub fn load_flash(&mut self, data: &[u8]) {
         self.memory.load_flash(data);
         self.flash_loaded = true;
-        self.invalidate_region(0x1);
+        self.pending_invalidation_regions |= invalidation_regions::XIP;
     }
 
     // --- Latency accounting ---
@@ -1033,57 +1074,52 @@ impl Bus {
 
     // --- Decoded-op cache invalidation (see HLD §7) ----------------------
 
-    /// Invalidate the cache slot(s) covering `[addr, addr+len)`.
-    /// Also clears the slot at `addr - 2` so a wide instruction whose
-    /// hw0 lives at `addr - 2` and hw1 at `addr` gets evicted when its
-    /// hw1 is rewritten. `len` is 1, 2, or 4 bytes for the three write
-    /// widths.
+    /// Queue cache invalidations covering `[addr, addr+len)` on the
+    /// per-core decode caches. `len` is 1, 2, or 4 bytes for the three
+    /// write widths. Pushes into [`Self::pending_cache_invalidations`];
+    /// the driver drains it into the core that ran. Mirrors the
+    /// [`crate::threaded::bus::WorkerBus`] pattern (LLD V7 §9).
+    ///
+    /// The drainer
+    /// ([`crate::core::CortexM33::invalidate_decode_cache_entries`])
+    /// evicts both the slot for `addr` and the slot for `addr - 2`
+    /// (covering a wide instruction whose `hw1` landed at `addr`). For
+    /// a 4-byte write we push `{addr, addr+2}` so the combined coverage
+    /// is `{addr-2, addr, addr+2}` — parity with the pre-migration
+    /// `invalidate_pc_range(addr, 4)` sweep.
     #[inline]
     fn invalidate_pc_range(&mut self, addr: u32, len: u8) {
         debug_assert!(len == 1 || len == 2 || len == 4);
-        let start = addr & !1; // align down to halfword
-        let end = (addr.wrapping_add(len as u32 - 1)) & !1;
-        let mut p = start.wrapping_sub(2); // preceding slot covers wide boundary
-        loop {
-            if is_cacheable_pc(p) {
-                let slot = ((p >> 1) & DECODE_CACHE_MASK) as usize;
-                self.decode_cache[slot].tag = u32::MAX;
-            }
-            if p == end {
-                break;
-            }
-            p = p.wrapping_add(2);
-        }
-    }
-
-    /// Invalidate every cache entry whose tag lies in the given 256 MB
-    /// region (`addr >> 28 == region`). Used on bulk loads. Cost is
-    /// `DECODE_CACHE_SIZE` × 4 B reads + compare — small enough for
-    /// once-per-boot paths.
-    #[inline]
-    fn invalidate_region(&mut self, region: u32) {
-        for slot in self.decode_cache.iter_mut() {
-            if slot.tag != u32::MAX && (slot.tag >> 28) == region {
-                slot.tag = u32::MAX;
+        if matches!(addr >> 28, 0x0..=0x2) {
+            self.pending_cache_invalidations.push(addr);
+            if len == 4 {
+                // `write32` spans `{addr-2, addr, addr+2}`; one push only
+                // covers `{addr-2, addr}`. Push `addr+2` to reach the third
+                // slot.
+                self.pending_cache_invalidations.push(addr.wrapping_add(2));
             }
         }
     }
 
-    /// Invalidate every cache entry. Public escape hatch for tools /
-    /// tests that write executable bytes through paths that bypass the
-    /// usual invalidation hooks (e.g. `Emulator::poke` or direct
-    /// `bus.memory.sram_write*`).
+    /// Request a bulk invalidation of both cores' decode caches. Escape
+    /// hatch for tools / tests that write executable bytes through paths
+    /// that bypass the usual invalidation hooks (e.g. `Emulator::poke`,
+    /// direct `bus.memory.sram_write*`). Sets the
+    /// [`invalidation_regions::BULK`] bit so every slot is drained
+    /// regardless of tag region. The driver (`Emulator::step` /
+    /// `Emulator::load_*`) clears [`Self::pending_invalidation_regions`]
+    /// after invalidating both cores.
     pub fn invalidate_all(&mut self) {
-        for slot in self.decode_cache.iter_mut() {
-            slot.tag = u32::MAX;
-        }
+        self.pending_invalidation_regions |= invalidation_regions::BULK;
     }
 
-    /// Load the bootrom (32 KB ROM image at 0x0000_0000) and invalidate
-    /// any cache entries pointing into the ROM region.
+    /// Load the bootrom (32 KB ROM image at 0x0000_0000). Sets the
+    /// [`invalidation_regions::ROM`] bit in
+    /// [`Self::pending_invalidation_regions`] so the driver drains only
+    /// ROM-region decode-cache slots before resuming execution.
     pub fn load_bootrom(&mut self, data: &[u8]) {
         self.memory.load_rom(data);
-        self.invalidate_region(0x0);
+        self.pending_invalidation_regions |= invalidation_regions::ROM;
     }
 
     /// Enable burst mode — suppresses per-word SRAM bank wait states.
@@ -2447,15 +2483,6 @@ impl CoreBus for Bus {
     }
 
     #[inline(always)]
-    fn decode_cache_get(&self, slot: usize) -> DecodedOp {
-        self.decode_cache[slot]
-    }
-    #[inline(always)]
-    fn decode_cache_set(&mut self, slot: usize, entry: DecodedOp) {
-        self.decode_cache[slot] = entry;
-    }
-
-    #[inline(always)]
     fn extra_wait_states(&self) -> u32 {
         Bus::extra_wait_states(self)
     }
@@ -2528,8 +2555,6 @@ mod corebus_trait_tests {
         bus_dyn.gpio_clear_oe(0);
         bus_dyn.gpio_xor_oe(0);
         let _ = bus_dyn.gpio_read_in();
-        let empty = bus_dyn.decode_cache_get(0);
-        bus_dyn.decode_cache_set(0, empty);
         let _ = bus_dyn.extra_wait_states();
         bus_dyn.reset_extra_wait_states();
         let _ = bus_dyn.trace_enabled();

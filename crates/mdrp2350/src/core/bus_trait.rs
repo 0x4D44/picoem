@@ -15,11 +15,15 @@
 //! ## Stage 2 transitional extensions
 //!
 //! Several pieces of per-instruction state still live on `Bus` rather than
-//! on `CortexM33` (decode cache, trace sink, the `sio` sub-block, direct
-//! `gpio_in`, the `atomics` Arc). Later stages of the Phase 3 roadmap move
-//! those onto the core (Stage 3 for DIV/INTERP, a later stage for
-//! `decode_cache`, Stage 5 for SIO/GPIO via `SharedState`), at which point
-//! the trait surface shrinks back to the 13-method canonical shape.
+//! on `CortexM33` (trace sink, the `sio` sub-block, direct `gpio_in`, the
+//! `atomics` Arc). Later stages of the Phase 3 roadmap move those onto
+//! the core (Stage 3 for DIV/INTERP, Stage 5 for SIO/GPIO via
+//! `SharedState`), at which point the trait surface shrinks back to the
+//! 13-method canonical shape. The decode cache already lives on
+//! `CortexM33` (Phase 3 follow-up #10) — writes into executable memory
+//! push halfword addresses into `Bus::pending_cache_invalidations` /
+//! `WorkerBus::pending_cache_invalidations`; the driver drains them into
+//! the per-core cache.
 //!
 //! Until then, generic `<B: CoreBus>` helpers still need to reach those
 //! fields, so this trait carries a handful of transient accessors. They are
@@ -32,7 +36,6 @@
 
 use std::sync::Arc;
 
-use crate::bus::DecodedOp;
 use crate::threaded::CoreAtomics;
 
 pub trait CoreBus {
@@ -107,11 +110,6 @@ pub trait CoreBus {
 
     /// GPIO_IN bulk read. Combined external-pin state as seen by CP0.
     fn gpio_read_in(&self) -> u32;
-
-    /// Decode cache get / set. TRANSIENT: `decode_cache` moves onto
-    /// `CortexM33` in a later stage (V7 §12 final row).
-    fn decode_cache_get(&self, slot: usize) -> DecodedOp;
-    fn decode_cache_set(&mut self, slot: usize, entry: DecodedOp);
 
     /// Wait-state getter / reset. TRANSIENT: used by the decode-execute
     /// fast/slow path and the debug-assert purity check. The canonical

@@ -128,6 +128,12 @@ impl Emulator {
         self.bus.pll_sys_lock_at_cycle = None;
         self.bus.pll_usb_lock_at_cycle = None;
 
+        // Fresh `CortexM33::new` above already produces empty decode
+        // caches; clear any dirty-range state the old Bus was
+        // carrying so it doesn't leak into the next step.
+        self.bus.pending_cache_invalidations.clear();
+        self.bus.pending_invalidation_regions = 0;
+
         // Reset clock. The authoritative sys_clk_hz lives on Bus's
         // clock tree (see bus/clocks.rs), so nothing to preserve here.
         self.clock = Clock { cycles: 0 };
@@ -152,15 +158,33 @@ impl Emulator {
     }
 
     /// Load the bootrom (32 kB at address 0x00000000). Also invalidates
-    /// any decoded-op cache entries that pointed into ROM — the bytes
-    /// have been replaced wholesale.
+    /// the ROM-region decode-cache entries on both cores — the bytes
+    /// have been replaced wholesale. SRAM / XIP slots are preserved.
     pub fn load_bootrom(&mut self, data: &[u8]) {
         self.bus.load_bootrom(data);
+        // Bus set the ROM bit in `pending_invalidation_regions`; drain
+        // it here so harness / app callers don't need to step before
+        // observing the invalidation. Phase 3 follow-up #10 + Task #10
+        // review fix — region-scoped to avoid cold-cache regressions.
+        let regions = self.bus.pending_invalidation_regions;
+        for core in &mut self.cores {
+            core.invalidate_decode_cache_regions(regions);
+        }
+        self.bus.pending_invalidation_regions = 0;
     }
 
-    /// Load flash image (appears at XIP address 0x10000000).
+    /// Load flash image (appears at XIP address 0x10000000). Invalidates
+    /// only the XIP-region decode-cache entries on both cores — SRAM /
+    /// ROM slots stay hot, so firmware that reloads flash then runs
+    /// SRAM code doesn't pay a cold-cache repopulate tax on the next
+    /// quantum.
     pub fn load_flash(&mut self, data: &[u8]) {
         self.bus.load_flash(data);
+        let regions = self.bus.pending_invalidation_regions;
+        for core in &mut self.cores {
+            core.invalidate_decode_cache_regions(regions);
+        }
+        self.bus.pending_invalidation_regions = 0;
     }
 
     /// Advance the system by one quantum. Each core runs atomically —
@@ -177,6 +201,20 @@ impl Emulator {
     /// `while` predicate never fires and the core is skipped cheaply.
     pub fn step(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
+        // Decode-cache invalidation strategy:
+        //   (a) Emulator::load_bootrom/load_flash/reset drain regions
+        //       proactively on both cores so pre-step tests see a clean
+        //       slate.
+        //   (b) Pre-step: drain Bus::pending_invalidation_regions into
+        //       both cores. Covers any external `bus.load_*` /
+        //       `bus.invalidate_all` pokes that happened between step()
+        //       calls without going through Emulator.
+        //   (c) Per-instruction: drain Bus::pending_cache_invalidations
+        //       into the core that just ran. Covers in-step writes to
+        //       executable memory.
+        // Do not remove any layer — the test suite exercises all three
+        // paths.
+        //
         // Phase 3 Stage 2: the Arc-sharing trip-wire lives at the top of
         // `CortexM33::step` — every caller (tests, harness, this driver)
         // funnels through it via `bus.atomics()`. No need to duplicate
@@ -188,6 +226,20 @@ impl Emulator {
         // observe a current cycle. Staleness is bounded by one quantum.
         self.bus.master_cycle = self.clock.cycles;
         let target = self.clock.cycles + self.step_quantum as u64;
+
+        // (b) Pre-step region-scoped drain. Firmware-loading paths
+        // (`load_bootrom`/`load_flash`) and `Bus::invalidate_all` set
+        // bits in `pending_invalidation_regions` on the bus between
+        // steps; drain them here (per-core, region-scoped) so stale
+        // entries can't survive the reload while preserving any slots
+        // outside the touched region. Phase 3 follow-up #10 + Task #10
+        // review fix.
+        if self.bus.pending_invalidation_regions != 0 {
+            let regions = self.bus.pending_invalidation_regions;
+            self.cores[0].invalidate_decode_cache_regions(regions);
+            self.cores[1].invalidate_decode_cache_regions(regions);
+            self.bus.pending_invalidation_regions = 0;
+        }
 
         // Core 0 first, then core 1. Phase 0b.1 Commit B: each PPB is
         // now owned by its own `CortexM33`, so no `set_active_core`
@@ -213,6 +265,31 @@ impl Emulator {
                 self.cores[core_id].ppb.update_latest_cycles(self.cores[core_id].cycles);
                 let bus = &mut self.bus;
                 self.cores[core_id].step(bus);
+
+                // (c) Drain per-instruction cache-invalidation queue
+                // into the core that just ran. Phase 3 follow-up #10 —
+                // the decode cache is per-core; writes during this
+                // step's bus accesses recorded addresses in
+                // `bus.pending_cache_invalidations`. Cross-core SMC
+                // still requires firmware DSB+ISB per V7 spec.
+                if !self.bus.pending_cache_invalidations.is_empty() {
+                    self.cores[core_id].invalidate_decode_cache_entries(
+                        &self.bus.pending_cache_invalidations,
+                    );
+                    self.bus.pending_cache_invalidations.clear();
+                }
+                // If the core executed a bus write that triggered a
+                // region-scoped invalidation (via `Bus::invalidate_all`
+                // or a `load_bootrom`/`load_flash` during a step — rare,
+                // but used by `Emulator::poke` doc and tests), drain
+                // both cores' caches for the affected regions. Same-step
+                // signal so the peer core sees it on its next turn.
+                if self.bus.pending_invalidation_regions != 0 {
+                    let regions = self.bus.pending_invalidation_regions;
+                    self.cores[0].invalidate_decode_cache_regions(regions);
+                    self.cores[1].invalidate_decode_cache_regions(regions);
+                    self.bus.pending_invalidation_regions = 0;
+                }
             }
             // Final refresh so any post-quantum inspection (e.g. tests
             // reading DWT_CYCCNT between steps) sees a current base.
@@ -383,12 +460,14 @@ impl Emulator {
     /// Direct memory write (bypasses bus timing).
     ///
     /// **Cache note:** this bypasses the `Bus::write32` path and does
-    /// NOT invalidate the decoded-op cache. Callers that poke into
-    /// executable memory (ROM / XIP / SRAM) and then `step()` must call
-    /// [`Bus::invalidate_all`] on `self.bus` between the poke and the
-    /// next `step` to avoid executing stale decoded ops. Pre-boot
-    /// pokes (the common case for the harness) happen before any cache
-    /// entries exist and are safe without an explicit invalidation.
+    /// NOT invalidate the per-core decoded-op caches. Callers that poke
+    /// into executable memory (ROM / XIP / SRAM) and then `step()` must
+    /// call [`Bus::invalidate_all`] on `self.bus` between the poke and
+    /// the next `step` to avoid executing stale decoded ops. The flag
+    /// is consumed by the next `Emulator::step` pre-step phase, which
+    /// invalidates both cores' caches. Pre-boot pokes (the common case
+    /// for the harness) happen before any cache entries exist and are
+    /// safe without an explicit invalidation.
     pub fn poke(&mut self, addr: u32, value: u32) {
         if Bus::is_boot_ram(addr) {
             self.bus.boot_ram_write32(addr, value);
