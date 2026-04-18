@@ -33,6 +33,11 @@ bench-*.json.syms.json
 # the overnight drivers — local-only operator state, not source.
 fuzz-runs/deadline
 
+# PID-qualified harness binary copies under fuzz-runs/ (e.g.
+# silicon-soak.220248.exe) — copied in by the overnight drivers to
+# dodge the Windows .exe lock, not source.
+fuzz-runs/**/*.exe
+
 # wrk_scratch/: throwaway analysis scripts (see memory:
 # reference_windows_profiling for the workflow). Local-only.
 wrk_scratch/
