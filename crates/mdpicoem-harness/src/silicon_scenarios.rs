@@ -32,6 +32,7 @@ pub const RESET_PADS_BANK0: u32 = 1 << 9;
 pub const RESET_PIO0: u32 = 1 << 11;
 pub const RESET_PIO1: u32 = 1 << 12;
 pub const RESET_PLL_SYS: u32 = 1 << 14;
+pub const RESET_UART0: u32 = 1 << 26;
 
 // PIO register offsets (identical for all three PIO blocks).
 pub const PIO_CTRL_OFF: u32 = 0x000;
@@ -135,6 +136,10 @@ pub struct PeriphScenario {
 // S1: PIO0 SM0 runs `JMP 0` in a one-instruction loop. Positive
 // control — ADDR never advances past 0, HW and EMU MUST agree.
 const S_PIO0_NOP_LOOP: &[(u32, u32)] = &[
+    // Inlined PREFIX_PIO0_HARD_RESET — wipe instr_mem[], SM state, FIFOs
+    // and irq_flags so a prior PIO scenario's program can't persist
+    // through the Fisher-Yates shuffle. HLD V1 §4.3.
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
     (pio_instr_mem_addr(PIO0_BASE, 0), 0x0000), // JMP 0
     (pio_sm_addr(PIO0_BASE, 0, PIO_SM_CLKDIV_OFF), 0x0001_0000),
@@ -149,6 +154,9 @@ const O_PIO0_NOP_LOOP: &[(u32, u32)] = &[
 // settles at slot 2 (the stall). EXECCTRL is programmed with a
 // non-default WRAP so divergence in wrap-bit storage shows up.
 const S_PIO0_FIXED_CYCLES: &[(u32, u32)] = &[
+    // Inlined PREFIX_PIO0_HARD_RESET — defensive pulse so prior-scenario
+    // instr_mem[] / SM state cannot leak (HLD V1 §5 preventive).
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
     (pio_instr_mem_addr(PIO0_BASE, 0), 0xE03F), // SET X, 31
     (pio_instr_mem_addr(PIO0_BASE, 1), 0x0041), // JMP X-- 1
@@ -169,6 +177,11 @@ const O_PIO0_FIXED_CYCLES: &[(u32, u32)] = &[
 // instruction with side=1 on GPIO0 every cycle. IO_BANK0 / PADS_BANK0
 // configured to route GPIO0 through PIO0.
 const S_PIO0_SIDE_SET_TOGGLE: &[(u32, u32)] = &[
+    // Inlined PREFIX_PIO0_HARD_RESET — defensive pulse prepended ahead
+    // of the IO_BANK0 / PADS_BANK0 release so prior-scenario instr_mem[]
+    // / SM state cannot leak (HLD V1 §5 preventive).
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
+    (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0 | RESET_IO_BANK0 | RESET_PADS_BANK0),
     // PADS_BANK0 GPIO0: IE=1, drive=4 mA (value matches paced_bench_rp2350).
     (PADS_BANK0_GPIO0, 0x0000_0056),
@@ -242,6 +255,11 @@ const O_PIO0_SIDE_SET_TOGGLE: &[(u32, u32)] = &[
 // distinct from any transient running state (tricky on PIO given
 // that ADDR is the only non-FIFO state observable externally).
 const S_PIO0_RESET_GATING_PLACEHOLDER: &[(u32, u32)] = &[
+    // Inlined PREFIX_PIO0_HARD_RESET — defensive pulse so prior-scenario
+    // instr_mem[] / SM state cannot leak before the gating test runs
+    // (HLD V1 §5 preventive). The trailing RESETS_SET below re-slams
+    // PIO0 into reset to probe the gating behaviour itself.
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
     (pio_instr_mem_addr(PIO0_BASE, 0), 0xA042), // NOP (MOV Y, Y)
     (pio_instr_mem_addr(PIO0_BASE, 1), 0x0000), // JMP 0
@@ -367,6 +385,11 @@ const SLED_CLOCK_PLL_SYS_REPROGRAM_MID_RUN: &[u8] =
 // on CLK_SYS_DIV write) and the readback proves the write landed on
 // both sides.
 const S_CLOCK_DIV_CHANGE_PIO_RUNNING: &[(u32, u32)] = &[
+    // Inlined PREFIX_PIO0_HARD_RESET — defensive pulse ahead of the
+    // IO_BANK0 / PADS_BANK0 release so prior-scenario instr_mem[] / SM
+    // state cannot leak (HLD V1 §5 preventive).
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
+    (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0 | RESET_IO_BANK0 | RESET_PADS_BANK0),
     (pio_instr_mem_addr(PIO0_BASE, 0), 0xE03F), // SET X, 31
     (pio_instr_mem_addr(PIO0_BASE, 1), 0x0041), // JMP X-- 1
@@ -850,6 +873,12 @@ const PWM_CSR_EN_BIT: u32 = 1 << 0;
 /// observation `TXFE=1` still holds post-drain.
 const S_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    // Inlined PREFIX_UART0_HARD_RESET — symmetric bidirectional
+    // cleanliness with S_UART0_RX_LOOPBACK so whichever scenario lands
+    // first under Fisher-Yates leaves a clean UART0 for the other.
+    // HLD V1 §4.5.
+    (RESETS_RESET + ALIAS_SET, RESET_UART0),
+    (RESETS_RESET + ALIAS_CLR, RESET_UART0),
     (UART0_UARTLCR_H, UARTLCR_H_FEN),
     (UART0_UARTCR, UARTCR_UARTEN | UARTCR_TXE),
     (UART0_UARTDR, 0x5A),
@@ -884,6 +913,13 @@ const O_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
 ///    a no-op on EMU.
 const S_UART0_RX_LOOPBACK: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    // Inlined PREFIX_UART0_HARD_RESET — pulses RESET_UART0 before the
+    // A.2.2 CLK_PERI / LCR_H / CR sequence so a prior
+    // S_UART0_TX_SINGLE_BYTE cannot leave its 0x5A payload in the RX
+    // FIFO. The assert+clear pair MUST precede the CLK_PERI_CTRL write
+    // so the A.2.2 ordering stays intact. HLD V1 §4.5.
+    (RESETS_RESET + ALIAS_SET, RESET_UART0),
+    (RESETS_RESET + ALIAS_CLR, RESET_UART0),
     (CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE),
     (UART0_UARTIBRD, 81),
     (UART0_UARTFBRD, 24),
@@ -966,8 +1002,18 @@ const O_ADC_ONE_SHOT: &[(u32, u32)] = &[
 /// Silicon at post-bootrom CSR.DIV reset (1.0) matches.
 const S_PWM_WRAP_IRQ: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
-    (PWM_SLICE0_CSR, PWM_CSR_EN_BIT),
+    // Inlined PREFIX_PWM_SLICE0_CLEAN — force slice 0 to a known-zero
+    // state before arming. Without this the silicon CTR carries over
+    // from whichever PWM scenario Fisher-Yates picked last, pre-tripping
+    // the wrap IRQ against a stale TOP. See HLD V1 §4.2.
+    (PWM_EN_OFFSET, 0),
+    (PWM_SLICE0_CSR, 0),
+    (PWM_SLICE0_CTR, 0),
+    (PWM_INTR_OFFSET, 0xF),
+    // TOP must land BEFORE CSR_EN so DAP latency between writes can't
+    // tick the counter against the prior scenario's TOP.
     (PWM_SLICE0_TOP, 100),
+    (PWM_SLICE0_CSR, PWM_CSR_EN_BIT),
     (PWM_EN_OFFSET, 1),
 ];
 const O_PWM_WRAP_IRQ: &[(u32, u32)] = &[
@@ -1035,6 +1081,11 @@ const O_ADC_ROUND_ROBIN_2CH: &[(u32, u32)] = &[
 // 16-bit INTR layout: bits [15:8]=SM7..SM0, [7:4]=TXNFULL, [3:0]=RXNEMPTY).
 // IRQ1_INTS must be 0 because SM0 never asserts IRQ flag 1.
 const S_PIO0_INT_ROUTING_SPLIT: &[(u32, u32)] = &[
+    // Inlined PREFIX_PIO0_HARD_RESET — replaces the prior single-line
+    // release with a set-then-clear pulse pair so SM0.pc starts at 0
+    // rather than inheriting a stale PC from a prior PIO scenario.
+    // HLD V1 §4.4.
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
     // INSTR_MEM[0] = IRQ SET 0 (opcode 0xC000): asserts PIO IRQ flag 0
     (pio_instr_mem_addr(PIO0_BASE, 0), 0xC000),
@@ -1475,6 +1526,42 @@ pub const SIO_GPIO_OE_SET: u32 = 0xD000_0038;
 // constant would bit-rot against datasheet revisions without buying
 // anything the broad CLR doesn't already deliver.
 const RESETS_CLR_ALL: u32 = 0xFFFF_FFFF;
+
+// Per-peripheral clean-state prefixes used by scenario setup tables.
+// Each scenario inlines the tuples below (Rust const-slice concat
+// requires a macro; inline duplication is acceptable at ≤ 8 usages).
+// See `wrk_docs/2026.04.18 - HLD - Silicon Scenario State Reset V1.md`
+// §4.1 — these constants are the canonical anchors the scenarios
+// mirror.
+
+/// Canonical per-slice PWM clean-state prefix for scenario setups.
+/// Gates every slice off, clears per-slice 0 CSR + CTR, and W1C-clears
+/// any latched wrap IRQs so a prior scenario's INTR bit can't leak.
+#[allow(dead_code)]
+const PREFIX_PWM_SLICE0_CLEAN: &[(u32, u32)] = &[
+    (PWM_EN_OFFSET, 0),
+    (PWM_SLICE0_CSR, 0),
+    (PWM_SLICE0_CTR, 0),
+    (PWM_INTR_OFFSET, 0xF),
+];
+
+/// Canonical PIO0 hard-reset pulse for scenario setups. The assert+
+/// clear pair wipes `instr_mem[]`, all SM registers, FIFOs and
+/// `irq_flags` on silicon, leaving a known-zero peripheral.
+#[allow(dead_code)]
+const PREFIX_PIO0_HARD_RESET: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
+    (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
+];
+
+/// Canonical UART0 hard-reset pulse. Wipes the TX / RX FIFOs, shift
+/// registers and CR state so a prior `S_UART0_TX_SINGLE_BYTE` can't
+/// leak its payload into the next scenario's RX FIFO.
+#[allow(dead_code)]
+const PREFIX_UART0_HARD_RESET: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_SET, RESET_UART0),
+    (RESETS_RESET + ALIAS_CLR, RESET_UART0),
+];
 
 // S_R2: red-path TRNG — release every peripheral, observe TRNG_IMR
 // (0x400F_0100). The Rockchip-derived TRNG core has a non-zero reset

@@ -976,6 +976,7 @@ mod tests {
         use crate::bus::RESET_UART0;
         // Scenario constants mirror `silicon_scenarios.rs` by design —
         // mdrp2350 is upstream of the harness, so we can't import them.
+        const RESETS_SET: u32 = 0x4002_0000 + 0x2000;
         const RESETS_CLR: u32 = 0x4002_0000 + 0x3000;
         const CLOCKS_CLK_PERI_CTRL: u32 = 0x4001_0048;
         const CLK_CTRL_ENABLE: u32 = 1 << 11;
@@ -985,6 +986,13 @@ mod tests {
         // Release UART0 (scenario's RESETS_CLR_ALL does this; UART0 is
         // already released post-bootrom on the emulator, but we mirror
         // the silicon setup sequence exactly).
+        bus.write32(RESETS_CLR, 1 << RESET_UART0, 0);
+        // Mirror the PREFIX_UART0_HARD_RESET pulse the scenario now
+        // prepends (HLD "Silicon Scenario State Reset V1" §4.5): slams
+        // UART0 back into reset, then releases it. Must precede the
+        // CLK_PERI / UARTIBRD / UARTLCR_H writes so the A.2.2 ordering
+        // is preserved.
+        bus.write32(RESETS_SET, 1 << RESET_UART0, 0);
         bus.write32(RESETS_CLR, 1 << RESET_UART0, 0);
         // Scenario setup sequence (matching silicon_scenarios.rs order).
         bus.write32(CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE, 0);
