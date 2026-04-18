@@ -43,18 +43,37 @@ use mdrp2350::{Arch, Config, EmulatorBuilder};
 // Address-map constants (LLD §3, §4.1, §10)
 // ============================================================================
 
-/// Placeholder boot image load address (matches LLD §2).
-const LOADER_ADDR: u32 = 0x2000_0000;
+// Oracle address base. QEMU virt rv32 maps VIRT_FLASH at 0x2000_0000
+// (read-only for CPU stores) and VIRT_DRAM at 0x8000_0000. The original
+// LLD assumed 0x2000_0000 matched RP2350 SRAM on both sides, but CPU
+// `sw` to virt flash silently no-ops — any test that spills to
+// scratchpad fails trivially. All oracle addresses now live in virt
+// DRAM; the mdrp2350 bus aliases `0x8xxx_xxxx` → SRAM via
+// `canon_oracle_addr`, so both sides execute at the same absolute PC.
+
+/// Boot image load address — virt DRAM base.
+const LOADER_ADDR: u32 = 0x8000_0000;
 /// Test instruction slot — CSR-read prelude starts here (LLD §3).
-const TEST_SLOT: u32 = 0x2000_0100;
+const TEST_SLOT: u32 = 0x8000_0100;
 /// Trap-handler stub slot (Zicsr carve-out, LLD §4 mitigation (1)).
-const TRAP_STUB: u32 = 0x2000_0200;
+const TRAP_STUB: u32 = 0x8000_0200;
 /// mcause slot where the trap handler spills its value (LLD §10).
-const MCAUSE_SLOT: u32 = 0x2000_01F0;
-/// Self-check stub slot (LLD §4.1).
-const SELFCHECK_STUB: u32 = 0x2000_0400;
+const MCAUSE_SLOT: u32 = 0x8000_01F0;
+/// CSR capture scratchpad — proxy's gp points here. 56 bytes total:
+/// `+0..+0x1C` pre-snapshot, `+0x1C..+0x38` post-snapshot. Distinct from
+/// `riscv_gen::SCRATCH_BASE` (the test-visible data region at
+/// `0x8000_0400`), so test mem loads don't read captured CSR values.
+const CSR_SCRATCH: u32 = 0x8000_0300;
+/// Self-check stub slot (LLD §4.1). Moved past the test data region
+/// (0x8000_0400..0x8000_04FF, 256 B reserved for tests).
+const SELFCHECK_STUB: u32 = 0x8000_0500;
 /// Self-check scratchpad base (pattern-A ×7 + pattern-B ×7 = 56 B, LLD §4.1).
-const SELFCHECK_SCRATCH: u32 = 0x2000_0500;
+const SELFCHECK_SCRATCH: u32 = 0x8000_0600;
+/// Post-capture stub slot — runs AFTER the test stream halts, reads the
+/// 7 diff-set CSRs, and spills them to the post-snapshot region of
+/// `CSR_SCRATCH`. Separate from the test stream so control-flow tests
+/// (branch/jump/c.j* etc.) can't redirect PC past the capture.
+const POST_CAPTURE_STUB: u32 = 0x8000_0680;
 
 // Proxy / handler registers — chosen to avoid collisions with generator
 // cases (cases typically use x5..x15 plus x1 for branches). We keep the
@@ -278,14 +297,12 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // 7. Install the trap-handler stub (used by Zicsr class) on both sides.
     install_trap_handler(&mut gdb, &mut emu)?;
 
-    // 7a. Global mtvec seed dropped. QEMU 10.2 + `-machine virt` rv32
-    //     silently no-ops `csrrw mtvec, rs1` (observed via back-to-back
-    //     `csrrw; csrrs` in one vCont;c — csrrs reads 0). Without a
-    //     working global seed any test that traps jumps to mtvec=0,
-    //     lands in unmapped virt memory, and hangs the GDB stub. The
-    //     current stage-6 smoke skips `expect_trap` tests entirely to
-    //     dodge the issue (see `run_one_test`); a future revision can
-    //     switch to a different machine mode that honours csrrw.
+    // 7a. Seed mtvec = TRAP_STUB globally on both sides. Any trap from a
+    //     test case (misaligned mem, illegal instruction, etc.) now
+    //     deterministically lands in TRAP_STUB → writes mcause to
+    //     MCAUSE_SLOT → `ebreak`, instead of jumping to mtvec=0 and
+    //     hanging on unmapped memory.
+    seed_global_mtvec(&mut gdb, &mut emu)?;
 
     // 8. Dispatch.
     match args.fuzz_count {
@@ -477,6 +494,56 @@ fn build_trap_handler_stub() -> Vec<u32> {
     vec![lui, addi, csrrs_mcause, sw_mcause, EBREAK_WORD]
 }
 
+/// Build + run the post-snapshot capture stub on both sides. Reads the
+/// 7 diff-set CSRs and spills them to `CSR_SCRATCH + 0x1C..+0x38`.
+///
+/// Runs after the test halts so control-flow tests (branches/jumps)
+/// can't redirect PC past the capture — the test's terminator ebreak
+/// stops execution, then we re-seed PC/GPRs and run the stub fresh.
+///
+/// Clobbers gp (x3) and t6 (x31) on both sides. The caller already read
+/// post-state GPRs before invoking this function.
+fn capture_post_snapshot(
+    gdb: &mut GdbClient,
+    emu: &mut mdrp2350::Emulator,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const SCRATCH_REG: u8 = 31; // t6
+    // Build once per call — it's tiny and the full per-test cost is
+    // dominated by the GDB round-trips anyway.
+    let mut stream: Vec<u32> = Vec::with_capacity(15);
+    for (i, &csr) in CSR_DIFF_ADDRS.iter().enumerate() {
+        stream.push(encode_csr(csr, REG_X0, CSR_F3_RS, SCRATCH_REG));
+        stream.push(encode_s_type(
+            (i as i32 + 7) * 4, // post-snapshot offset
+            SCRATCH_REG,
+            REG_GP,
+            0b010,
+            riscv_gen::OPC_STORE,
+        ));
+    }
+    stream.push(EBREAK_WORD);
+    let bytes = words_to_le_bytes(&stream);
+    let term = POST_CAPTURE_STUB + ((stream.len() - 1) as u32) * 4;
+
+    // QEMU side.
+    gdb.write_mem(POST_CAPTURE_STUB, &bytes)?;
+    gdb.write_reg(REG_GP, CSR_SCRATCH)?;
+    gdb.write_reg(REG_RV_PC as u8, POST_CAPTURE_STUB)?;
+    gdb.set_hw_breakpoint(term, 2)?;
+    gdb.continue_exec()?;
+    let _ = gdb.remove_hw_breakpoint(term, 2);
+
+    // Emulator side.
+    emu.load_image(POST_CAPTURE_STUB, &bytes);
+    {
+        let h = emu.core_riscv_mut(0);
+        h.set_gpr(REG_GP, CSR_SCRATCH);
+        h.set_pc(POST_CAPTURE_STUB);
+    }
+    step_emu_until_pc(emu, term, 32)?;
+    Ok(())
+}
+
 /// Install the Zicsr trap-handler stub at [`TRAP_STUB`] on both sides. The
 /// stub only fires when a test in the Zicsr class installs `mtvec = TRAP_STUB`.
 fn install_trap_handler(
@@ -490,37 +557,38 @@ fn install_trap_handler(
     Ok(())
 }
 
-/// Dead: kept for documentation / future revisiting. Global mtvec seed
-/// does not work on QEMU 10.2 + `-machine virt` rv32 because csrrw to
-/// mtvec (and mscratch) silently no-ops. A future revision that switches
-/// to a different machine mode (or uses QEMU's `-semihosting` / monitor
-/// to poke CSRs) may restore this path.
-#[allow(dead_code)]
+/// One-shot startup routine: splice the 3-instruction mtvec-seed prelude
+/// at a dedicated init slot, run to `ebreak`. Leaves `mtvec = TRAP_STUB`
+/// on both sides. Non-Zicsr tests don't touch mtvec, so this one seed
+/// persists for the entire run. Zicsr tests re-seed mtvec in their own
+/// 3-instruction prelude (see `build_mtvec_seed_prelude`).
+///
+/// Readback asserts the seed actually landed on the QEMU side — a
+/// regression safeguard. The combined stub also stashes the mtvec value
+/// into `VERIFY_SCRATCH` so the verification is in-band (one vCont;c
+/// pass, no stale-GDB-state hazards).
 fn seed_global_mtvec(
     gdb: &mut GdbClient,
     emu: &mut mdrp2350::Emulator,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Dedicated init slot — doesn't collide with TEST_SLOT / TRAP_STUB /
-    // SELFCHECK_STUB / SCRATCH_BASE.
-    const INIT_SLOT: u32 = 0x2000_0700;
-    const VERIFY_SCRATCH: u32 = 0x2000_0740;
-    // Combined seed + self-verify stub, all in one vCont;c pass:
-    //   lui   t0, %hi(TRAP_STUB)
-    //   addi  t0, t0, %lo(TRAP_STUB)
+    const INIT_SLOT: u32 = 0x8000_0700;
+    const VERIFY_SCRATCH: u32 = 0x8000_0740;
+
+    // Combined seed + self-verify stub:
+    //   lui   t0, %hi(TRAP_STUB); addi t0, t0, %lo(TRAP_STUB)
     //   csrrw x0, mtvec, t0        ; write mtvec
     //   csrrs t1, mtvec, x0        ; read mtvec back into t1
-    //   lui   t2, %hi(VERIFY_SCRATCH)
-    //   addi  t2, t2, %lo(VERIFY_SCRATCH)
+    //   lui   t2, %hi(VERIFY_SCRATCH); addi t2, t2, %lo(VERIFY_SCRATCH)
     //   sw    t1, 0(t2)            ; spill t1 to memory
     //   ebreak
     let seed = build_mtvec_seed_prelude();
     let hi_vs = VERIFY_SCRATCH & 0xFFFF_F000;
     let lo_vs = (VERIFY_SCRATCH as i32) & 0xFFF;
     let mut stream: Vec<u32> = seed.to_vec();
-    stream.push(encode_csr(0x305, REG_X0, CSR_F3_RS, 6));                 // csrrs t1, mtvec, x0
-    stream.push(riscv_gen::encode_u_type(hi_vs, 7, riscv_gen::OPC_LUI));   // lui t2, hi
-    stream.push(encode_i_type(lo_vs, 7, 0b000, 7, OPC_OP_IMM));            // addi t2, t2, lo
-    stream.push(encode_s_type(0, 6, 7, 0b010, riscv_gen::OPC_STORE));      // sw t1, 0(t2)
+    stream.push(encode_csr(0x305, REG_X0, CSR_F3_RS, 6));
+    stream.push(riscv_gen::encode_u_type(hi_vs, 7, riscv_gen::OPC_LUI));
+    stream.push(encode_i_type(lo_vs, 7, 0b000, 7, OPC_OP_IMM));
+    stream.push(encode_s_type(0, 6, 7, 0b010, riscv_gen::OPC_STORE));
     stream.push(EBREAK_WORD);
     let bytes = words_to_le_bytes(&stream);
     let term = INIT_SLOT + ((stream.len() as u32) - 1) * 4;
@@ -547,6 +615,9 @@ fn seed_global_mtvec(
     }
     step_emu_until_pc(emu, term, 32)?;
 
+    // Verify QEMU side actually landed mtvec = TRAP_STUB. The emulator
+    // side is trivially correct (we just stepped through the same
+    // instructions in our own core).
     let qemu_mtvec_bytes = gdb.read_mem(VERIFY_SCRATCH, 4)?;
     let qemu_mtvec = u32::from_le_bytes([
         qemu_mtvec_bytes[0],
@@ -554,68 +625,9 @@ fn seed_global_mtvec(
         qemu_mtvec_bytes[2],
         qemu_mtvec_bytes[3],
     ]);
-    // Best-effort: try to plant an `ebreak` at address 0 on QEMU. With
-    // `-machine virt` we can't always reach 0x0 (most likely unmapped),
-    // but if the write succeeds we have a safety net for unexpected
-    // traps-to-mtvec=0 — they land on a breakpoint instead of hanging.
-    let _ = gdb.write_mem(0, &EBREAK_WORD.to_le_bytes());
-
     if qemu_mtvec != TRAP_STUB {
-        // Probe: try csrrw into mscratch (no WARL constraints). If that
-        // takes effect, mtvec is WARL-blocking us. If not, csrrw is
-        // broken wholesale on this QEMU + machine combo.
-        let probe_stub: &[u32] = &[
-            // lui t0, 0xDEADB; addi t0, t0, 0xEEF -> t0 = 0xDEADBEEF
-            riscv_gen::encode_u_type(0xDEADB000, REG_T0, riscv_gen::OPC_LUI),
-            encode_i_type(-273 /* 0xEEF sign-ext as neg? wait 0xEEF = 3823 */, REG_T0, 0b000, REG_T0, OPC_OP_IMM),
-            encode_csr(0x340, REG_T0, CSR_F3_RW, 7),      // csrrw x7, mscratch, t0  (rd != x0)
-            encode_csr(0x340, REG_X0, CSR_F3_RS, 6),      // csrrs x6, mscratch, x0
-            encode_s_type(4, 6, REG_GP, 0b010, riscv_gen::OPC_STORE), // sw x6, 4(gp)
-            EBREAK_WORD,
-        ];
-        const PROBE_SLOT: u32 = 0x2000_0760;
-        let pbytes = words_to_le_bytes(probe_stub);
-        let pterm = PROBE_SLOT + 5 * 4;
-        let _ = gdb.write_mem(PROBE_SLOT, &pbytes);
-        let _ = gdb.write_mem(VERIFY_SCRATCH + 4, &[0u8; 4]);
-        for r in 1u8..=31 {
-            let _ = gdb.write_reg(r, 0);
-        }
-        let _ = gdb.write_reg(REG_GP, VERIFY_SCRATCH);
-        let _ = gdb.write_reg(REG_RV_PC as u8, PROBE_SLOT);
-        let _ = gdb.set_hw_breakpoint(pterm, 2);
-        let _ = gdb.continue_exec();
-        let _ = gdb.remove_hw_breakpoint(pterm, 2);
-        let mscratch_bytes = gdb.read_mem(VERIFY_SCRATCH + 4, 4).unwrap_or_default();
-        let probe_value = if mscratch_bytes.len() == 4 {
-            u32::from_le_bytes([mscratch_bytes[0], mscratch_bytes[1], mscratch_bytes[2], mscratch_bytes[3]])
-        } else {
-            0
-        };
-
-        let readback = gdb
-            .read_mem(INIT_SLOT, 16)
-            .map(|b| {
-                let w0 = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                let w1 = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-                let w2 = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-                let w3 = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
-                format!("{w0:#010x} {w1:#010x} {w2:#010x} {w3:#010x}")
-            })
-            .unwrap_or_else(|e| format!("<read failed: {e}>"));
-        let pc = gdb
-            .read_reg(REG_RV_PC as u8)
-            .map(|v| format!("{v:#010x}"))
-            .unwrap_or_else(|e| format!("<read failed: {e}>"));
-        let t0 = gdb
-            .read_reg(REG_T0)
-            .map(|v| format!("{v:#010x}"))
-            .unwrap_or_else(|e| format!("<read failed: {e}>"));
         return Err(format!(
-            "global mtvec seed failed on QEMU: mtvec={qemu_mtvec:#010x}, expected {TRAP_STUB:#010x}\n\
-             seed stub bytes at {INIT_SLOT:#010x}: {readback}\n\
-             PC={pc}, t0={t0}\n\
-             mscratch csrrw probe result: {probe_value:#010x} (nonzero means csrrw to mscratch worked — mtvec is WARL-locked)"
+            "global mtvec seed failed on QEMU: mtvec={qemu_mtvec:#010x}, expected {TRAP_STUB:#010x}"
         ).into());
     }
     Ok(())
@@ -629,41 +641,7 @@ fn run_targeted(
     gdb: &mut GdbClient,
     emu: &mut mdrp2350::Emulator,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let all_tests = riscv_gen::generate_edge_cases();
-    // Stage-6 smoke limitations (filtered out):
-    //   1. expect_trap.is_some() — mtvec=0 hang on QEMU virt (see
-    //      `seed_global_mtvec` dead-code note).
-    //   2. Rv32iBranch / CsrSideEffect — branches and jumps redirect PC
-    //      past or over the CSR-capture epilogue, so the post-snapshot
-    //      never runs (or runs from the wrong point). The proxy-stream
-    //      layout assumes linear fall-through.
-    //   3. Zicsr — its trap-handler path re-seeds mtvec via csrrw,
-    //      which silently no-ops on QEMU virt, so any trap-expected
-    //      Zicsr test hangs the stub.
-    // Leaves ALU, Mem (aligned), Upper, M, A, Rv32c for smoke.
-    let tests: Vec<&RiscvTestCase> = all_tests
-        .iter()
-        .filter(|t| t.expect_trap.is_none())
-        .filter(|t| !matches!(t.class, RiscvClass::Rv32iBranch | RiscvClass::CsrSideEffect | RiscvClass::Zicsr))
-        // Additional per-test filters for Stage-6 smoke:
-        //   - `auipc_jalr_pair` — upper class, but the pair jumps via
-        //     jalr, same control-flow issue as Rv32iBranch.
-        //   - `c_jr_x1` / `c_jalr_x1` — rvc jumps; see branch filter.
-        //   - `sc_w*` — real QEMU-vs-emu divergence on sc.w
-        //     success/failure semantics (QEMU returns 0=success
-        //     after a preceding lr.w; emu returns 1=failure because
-        //     our Bus::reservation model invalidates over the proxy
-        //     prelude's SRAM accesses). Real residual for the
-        //     emulator to investigate; smoke skips it rather than
-        //     reporting a noisy failure every run.
-        .filter(|t| {
-            !t.name.contains("auipc_jalr_pair")
-                && !t.name.contains("c_jr_x1")
-                && !t.name.contains("c_jalr_x1")
-                && !t.name.contains("sc_w")
-        })
-        .collect();
-    let skipped = all_tests.len() - tests.len();
+    let tests = riscv_gen::generate_edge_cases();
     let total = tests.len();
     let mut pass = 0usize;
     let mut fail = 0usize;
@@ -693,7 +671,7 @@ fn run_targeted(
         }
     }
 
-    println!("PASS {pass}/{total} (skipped {skipped} expect-trap cases — see Stage 6 note)");
+    println!("PASS {pass}/{total}");
     if fail > 0 {
         Ok(ExitCode::from(1))
     } else {
@@ -719,20 +697,12 @@ fn run_fuzz(
 
     let mut rng = StdRng::seed_from_u64(seed);
     let raw = riscv_gen::generate_fuzz(&mut rng, count);
-    let filtered: Vec<RiscvTestCase> = match class_filter {
+    let tests: Vec<RiscvTestCase> = match class_filter {
         Some(c) => raw.into_iter().filter(|tc| tc.class == c).collect(),
         None => raw,
     };
-    let before_trap_filter = filtered.len();
-    // Stage-6 smoke limitations — see `run_targeted` for the full list.
-    let tests: Vec<RiscvTestCase> = filtered
-        .into_iter()
-        .filter(|tc| tc.expect_trap.is_none())
-        .filter(|tc| !matches!(tc.class, RiscvClass::Rv32iBranch | RiscvClass::CsrSideEffect | RiscvClass::Zicsr))
-        .collect();
-    let skipped = before_trap_filter - tests.len();
     let total = tests.len();
-    println!("Generated {total} tests (skipped {skipped} expect-trap cases)");
+    println!("Generated {total} tests");
 
     let mut pass = 0usize;
     let mut fail = 0usize;
@@ -815,13 +785,15 @@ fn class_to_str(c: RiscvClass) -> &'static str {
 // ============================================================================
 
 /// Layout of a non-Zicsr test slot:
-///   [TEST_SLOT+0..+56]   14 instrs: prelude (CSR-read + sw) × 7
-///   [TEST_SLOT+56..]     N instrs: the test case's `words`
-///   [after test]         14 instrs: epilogue (CSR-read + sw) × 7 at off +28
-///   [after epilogue]     ebreak terminator (1 word)
+///   [TEST_SLOT+0..+24]   6 instrs: CSR reset (csrrw x0, csr, x0 × 6)
+///   [TEST_SLOT+24..+80]  14 instrs: prelude (CSR-read + sw) × 7
+///   [TEST_SLOT+80..]     N instrs: the test case's `words`
+///   [after test]         ebreak terminator (1 word)
 ///
-/// Pre-snapshot lands at SCRATCH_BASE+0x00..+0x1C (28 bytes).
-/// Post-snapshot lands at SCRATCH_BASE+0x20..+0x3C (28 bytes).
+/// Pre-snapshot lands at CSR_SCRATCH+0x00..+0x1C (28 bytes) during the
+/// prelude. The POST-snapshot is captured by a separate stub at
+/// `POST_CAPTURE_STUB`, invoked after the test halts — this way
+/// branch/jump tests can't redirect PC past the post-capture path.
 ///
 /// Zicsr class bypasses the CSR-read proxy entirely (per LLD §4
 /// mitigation 1). Its layout is:
@@ -845,11 +817,15 @@ fn run_one_test(
     let (stream, term_addr, test_start) = build_test_stream(tc, uses_proxy);
     let bytes = words_to_le_bytes(&stream);
 
-    // Fresh SRAM window for the test slot (code + data scratchpad).
-    // We zero a generous range so residual state from the previous test
-    // doesn't mask a bug.
-    zero_sram_region(gdb, emu, TEST_SLOT, 0x400)?;
-    zero_sram_region(gdb, emu, SCRATCH_BASE, 0x40)?;
+    // Fresh SRAM windows. Zero the code region (up to TRAP_STUB — the
+    // trap handler is installed once at startup and must survive), the
+    // mcause spill slot (above TRAP_STUB), the CSR capture scratchpad,
+    // and the test data scratchpad. Leaves the trap handler code at
+    // TRAP_STUB..TRAP_STUB+0x14 untouched.
+    zero_sram_region(gdb, emu, TEST_SLOT, TRAP_STUB - TEST_SLOT)?;
+    zero_sram_region(gdb, emu, MCAUSE_SLOT, 0x10)?;
+    zero_sram_region(gdb, emu, CSR_SCRATCH, 0x40)?;
+    zero_sram_region(gdb, emu, SCRATCH_BASE, 0x100)?;
 
     // Write the code on both sides.
     gdb.write_mem(TEST_SLOT, &bytes).map_err(|e| format!("QEMU write_mem: {e}"))?;
@@ -874,13 +850,24 @@ fn run_one_test(
         .map_err(|e| format!("QEMU write PC: {e}"))?;
     emu.core_riscv_mut(0).set_pc(TEST_SLOT);
 
-    // Drive both sides.
+    // Drive both sides. Set TWO HW breakpoints:
+    //   - `term_addr`: the test's terminator `ebreak` (normal fall-through).
+    //   - `TRAP_STUB + 16`: the trap-handler's `ebreak`, fires on any
+    //     unexpected-trap path (misaligned mem, illegal insn, etc.).
+    // QEMU's rv32 GDB stub does NOT auto-halt on natural `ebreak`
+    // instructions — it only stops on breakpoints. Without the second
+    // bp, an ebreak executed via the trap handler delivers a
+    // breakpoint exception, re-enters mtvec (TRAP_STUB), and loops.
+    let trap_handler_ebreak = TRAP_STUB + 16;
     gdb.set_hw_breakpoint(term_addr, 2)
-        .map_err(|e| format!("QEMU Z1: {e}"))?;
+        .map_err(|e| format!("QEMU Z1 term: {e}"))?;
+    gdb.set_hw_breakpoint(trap_handler_ebreak, 2)
+        .map_err(|e| format!("QEMU Z1 trap: {e}"))?;
     gdb.continue_exec()
         .map_err(|e| format!("QEMU vCont;c: {e}"))?;
     // Best-effort breakpoint cleanup.
     let _ = gdb.remove_hw_breakpoint(term_addr, 2);
+    let _ = gdb.remove_hw_breakpoint(trap_handler_ebreak, 2);
 
     let cycle_before = emu.core_riscv(0).cycles();
     let undef_before = emu.core_riscv(0).undef_count();
@@ -900,11 +887,22 @@ fn run_one_test(
         ));
     }
 
-    // Read post-state.
+    // Read post-state GPRs + PC before running the post-capture stub
+    // (which uses gp and t6 as scratch and would otherwise overwrite
+    // test outputs in those registers).
     let qemu_regs = read_gprs_qemu(gdb)?;
     let qemu_pc = gdb.read_reg(REG_RV_PC as u8).map_err(|e| format!("QEMU PC: {e}"))?;
     let emu_regs = read_gprs_emu(emu);
     let emu_pc = emu.core_riscv(0).pc();
+
+    // Post-snapshot capture — run a separate stub that reads the 7
+    // diff-set CSRs and spills them to the post region of CSR_SCRATCH.
+    // Runs AFTER the test halts, so test branches/jumps can't have
+    // redirected PC past an inline capture (which was the failure mode
+    // of the original in-stream epilogue design).
+    if uses_proxy {
+        capture_post_snapshot(gdb, emu).map_err(|e| format!("post-capture: {e}"))?;
+    }
 
     // Diff registers. Skips:
     //   - x0: architecturally wired to zero.
@@ -937,9 +935,9 @@ fn run_one_test(
     // Diff the CSR scratchpad (proxy path only).
     if uses_proxy {
         let qemu_snap = gdb
-            .read_mem(SCRATCH_BASE, 56)
+            .read_mem(CSR_SCRATCH, 56)
             .map_err(|e| format!("QEMU read scratch: {e}"))?;
-        let emu_snap = read_emu_scratch(emu, SCRATCH_BASE, 56);
+        let emu_snap = read_emu_scratch(emu, CSR_SCRATCH, 56);
         diff_csr_snapshots(&qemu_snap, &emu_snap)?;
     } else {
         // Zicsr path: optional trap check.
@@ -999,16 +997,27 @@ fn build_test_stream(tc: &RiscvTestCase, use_proxy: bool) -> (Vec<u32>, u32, u32
     let mut addr = TEST_SLOT;
 
     if use_proxy {
+        // Per-test CSR reset: zero mstatus/mie/mip/mscratch/mepc/mcause
+        // (skip mtvec — it's seeded globally to TRAP_STUB). Without this,
+        // cross-test state (especially `mcause` from a prior trap)
+        // leaks into the pre-snapshot. Uses `csrrw x0, csr, x0` — rs1=x0
+        // writes 0, rd=x0 discards the old value. 6 instrs = 24 bytes.
+        const CSR_RESET_LIST: &[u16] = &[0x300, 0x304, 0x344, 0x340, 0x341, 0x342];
+        for &csr in CSR_RESET_LIST {
+            stream.push(encode_csr(csr, REG_X0, CSR_F3_RW, REG_X0));
+        }
+        addr += (CSR_RESET_LIST.len() as u32) * 4;
+
         // Proxy prelude: 14 instrs (7 × csrrs t6, csr, x0; sw t6, off(gp)).
-        // Uses t6 (x31) as scratch instead of t0 (x5) because edge cases
-        // frequently use x5 as rs1 — in particular all mem-load/store
-        // edge cases. On QEMU's `-machine virt`, clobbering x5 with raw
-        // `mip` (which includes CLINT MTIP) and having the subsequent
-        // test case load/store from x5 points to unmapped memory and
-        // hangs the GDB stub (mtvec=0 is unreachable — see the note on
-        // `seed_global_mtvec`). x31/t6 collides far less with the edge
-        // catalogue (only as rd in a couple of shift cases, which the
-        // diff already skips if `uses_proxy`).
+        // Uses t6 (x31) as scratch rather than t0 (x5) because edge
+        // cases frequently use x5 as rs1 — in particular all mem
+        // load/store edge cases. After the prelude's final
+        // `csrrs t6, mip, x0`, t6 holds raw mip (which on QEMU virt
+        // carries CLINT MTIP in bit 7), so we skip x31 in the GPR diff
+        // to keep that platform artefact out of the compare. x31
+        // collides far less with the edge catalogue (only as rd in a
+        // couple of shift cases, which the diff already ignores when
+        // `uses_proxy` is true).
         const PROXY_SCRATCH: u8 = 31;
         for (i, &csr) in CSR_DIFF_ADDRS.iter().enumerate() {
             stream.push(encode_csr(csr, REG_X0, CSR_F3_RS, PROXY_SCRATCH));
@@ -1061,23 +1070,9 @@ fn build_test_stream(tc: &RiscvTestCase, use_proxy: bool) -> (Vec<u32>, u32, u32
     }
 
     // Epilogue: 14 instrs at scratchpad offset +28 bytes (post-snapshot).
-    if use_proxy {
-        // Same PROXY_SCRATCH = t6/x31 as the prelude — keep the
-        // epilogue register choice aligned so the diff-skip list stays
-        // accurate.
-        const PROXY_SCRATCH: u8 = 31;
-        for (i, &csr) in CSR_DIFF_ADDRS.iter().enumerate() {
-            stream.push(encode_csr(csr, REG_X0, CSR_F3_RS, PROXY_SCRATCH));
-            stream.push(encode_s_type(
-                (i as i32 + 7) * 4,
-                PROXY_SCRATCH,
-                REG_GP,
-                0b010,
-                riscv_gen::OPC_STORE,
-            ));
-        }
-        addr += (14 * 4) as u32;
-    }
+    // No epilogue in the test stream — the post-snapshot capture runs
+    // separately after the test halts, so branch/jump tests can't
+    // redirect PC past it. See `capture_post_snapshot`.
 
     // Terminator ebreak.
     stream.push(EBREAK_WORD);
@@ -1105,31 +1100,28 @@ fn warl_mask(csr: u16, v: u32) -> u32 {
         // 1 is RAZ/WI on Hazard3 (no vectored dispatch). Keep bit 0,
         // clear bit 1, on both sides.
         0x305 => v & !0x2,
-        // mie / mip — only MSIP / MTIP / MEIP are architecturally
-        // meaningful on this SoC. Mask with 0x888 on both sides.
-        0x304 | 0x344 => v & 0x888,
+        // mie — Hazard3 implements MSIE (bit 3), MTIE (bit 7), MEIE (bit 11).
+        0x304 => v & 0x888,
+        // mip — MSIP (bit 3), MEIP (bit 11) are architecturally meaningful
+        // on both sides. MTIP (bit 7) is NOT: QEMU virt wires mip.MTIP
+        // from the CLINT timer compare (always set at reset because
+        // mtimecmp=0 and mtime is running), while mdrp2350 has no CLINT
+        // model so MTIP stays 0. That's a platform artefact, not a
+        // semantics divergence — mask it out both sides.
+        0x344 => v & 0x808,
         _ => v,
     }
 }
 
-/// Compare the post-state CSR snapshot on both sides. WARL fields are
+/// Compare pre- and post-snapshots from both sides. WARL fields are
 /// normalized through [`warl_mask`] on both the QEMU and emulator values
 /// before compare (LLD §5 starter table):
 ///   - `mstatus.MPP` (bits 12:11) forced to `0b11` on both sides.
 ///   - `mtvec.MODE` (bits 1:0) cleared of bit 1 on both sides.
 ///   - `mie` / `mip` masked with `0x888` on both sides.
 ///
-/// Layout: `snap[0..28]` = pre (IGNORED), `snap[28..56]` = post, 4
-/// bytes/CSR in the order of [`CSR_DIFF_ADDRS`].
-///
-/// Pre-snapshot is intentionally NOT diffed. Pre-state CSRs carry
-/// cross-test leak from trap-taking tests (notably `mcause`) plus the
-/// virt-machine's CLINT-derived `mip` bit 7, which diverges between
-/// QEMU and our emulator regardless of test-specific behaviour. The
-/// emulator-side is canonically reset via [`reset_diff_csrs`] before
-/// each test; QEMU-side cannot be poked directly (no flat-index CSR
-/// write on QEMU 10.2). Comparing post only isolates the signal that
-/// matters: what the test-under-test wrote.
+/// Layout: `snap[0..28]` = pre, `snap[28..56]` = post, 4 bytes/CSR in the
+/// order of [`CSR_DIFF_ADDRS`].
 fn diff_csr_snapshots(qemu: &[u8], emu: &[u8]) -> Result<(), String> {
     if qemu.len() != 56 || emu.len() != 56 {
         return Err(format!(
@@ -1138,18 +1130,21 @@ fn diff_csr_snapshots(qemu: &[u8], emu: &[u8]) -> Result<(), String> {
             emu.len()
         ));
     }
-    let off = 28; // post-snapshot only
-    for i in 0..7 {
-        let qb: [u8; 4] = [qemu[off + i * 4], qemu[off + i * 4 + 1], qemu[off + i * 4 + 2], qemu[off + i * 4 + 3]];
-        let eb: [u8; 4] = [emu[off + i * 4], emu[off + i * 4 + 1], emu[off + i * 4 + 2], emu[off + i * 4 + 3]];
-        let csr = CSR_DIFF_ADDRS[i];
-        let qv = warl_mask(csr, u32::from_le_bytes(qb));
-        let ev = warl_mask(csr, u32::from_le_bytes(eb));
-        if qv != ev {
-            return Err(format!(
-                "CSR diff post {} ({:#05x}): QEMU={qv:#010x} emu={ev:#010x}",
-                CSR_DIFF_NAMES[i], csr
-            ));
+    for phase in 0..2 {
+        let off = phase * 28;
+        for i in 0..7 {
+            let qb: [u8; 4] = [qemu[off + i * 4], qemu[off + i * 4 + 1], qemu[off + i * 4 + 2], qemu[off + i * 4 + 3]];
+            let eb: [u8; 4] = [emu[off + i * 4], emu[off + i * 4 + 1], emu[off + i * 4 + 2], emu[off + i * 4 + 3]];
+            let csr = CSR_DIFF_ADDRS[i];
+            let qv = warl_mask(csr, u32::from_le_bytes(qb));
+            let ev = warl_mask(csr, u32::from_le_bytes(eb));
+            if qv != ev {
+                let phase_str = if phase == 0 { "pre" } else { "post" };
+                return Err(format!(
+                    "CSR diff {phase_str} {} ({:#05x}): QEMU={qv:#010x} emu={ev:#010x}",
+                    CSR_DIFF_NAMES[i], csr
+                ));
+            }
         }
     }
     Ok(())
@@ -1186,8 +1181,11 @@ fn read_gprs_emu(emu: &mdrp2350::Emulator) -> [u32; 32] {
 
 fn apply_reg_pre_qemu(gdb: &mut GdbClient, tc: &RiscvTestCase) -> Result<(), String> {
     zero_gprs_qemu(gdb).map_err(|e| format!("{e}"))?;
-    // gp always points at the scratchpad (LLD §10).
-    gdb.write_reg(REG_GP, SCRATCH_BASE)
+    // gp always points at the CSR-capture scratchpad — the proxy
+    // prelude/epilogue use it as the base for spill stores. Distinct
+    // from the test data scratchpad at `SCRATCH_BASE` (see
+    // `riscv_gen::SCRATCH_BASE` doc).
+    gdb.write_reg(REG_GP, CSR_SCRATCH)
         .map_err(|e| format!("QEMU set gp: {e}"))?;
     // mtvec is seeded in-band by the 3-instruction prelude at TEST_SLOT
     // (Zicsr class) — see `build_mtvec_seed_prelude`. We can't write CSRs
@@ -1230,7 +1228,7 @@ fn apply_reg_pre_emu(emu: &mut mdrp2350::Emulator, tc: &RiscvTestCase) {
     for r in 1u8..32 {
         h.set_gpr(r, 0);
     }
-    h.set_gpr(REG_GP, SCRATCH_BASE);
+    h.set_gpr(REG_GP, CSR_SCRATCH);
     // Skip x3/gp — the CSR proxy owns it; see `apply_reg_pre_qemu` for
     // the full rationale.
     for &(reg, val) in &tc.reg_pre {
@@ -1262,7 +1260,30 @@ fn step_emu_until_pc(
     // `bus.master_cycle` stale, breaking any code path that consults it
     // (PLL lock arming, MMIO trace, pacer).
     for _ in 0..max_steps {
-        if emu.core_riscv(0).pc() == target_pc {
+        let pc = emu.core_riscv(0).pc();
+        if pc == target_pc {
+            return Ok(());
+        }
+        // Also stop if the instruction at PC is `ebreak` — QEMU's GDB
+        // stub intercepts ebreak and halts without delivering the
+        // breakpoint exception. Our emulator has no such interception,
+        // so an ebreak inside e.g. the trap-handler stub would raise a
+        // breakpoint trap, re-enter mtvec (TRAP_STUB), and loop
+        // forever. Matching QEMU's stop-at-ebreak behaviour here keeps
+        // the two sides synchronised at the same PC.
+        //
+        // Reading the instruction word through the bus is safe —
+        // oracle-region addresses alias into SRAM and have no side
+        // effects.
+        let op = emu.bus.read32(pc);
+        if op == EBREAK_WORD {
+            return Ok(());
+        }
+        // Compressed ebreak (`c.ebreak` = 0x9002) occupies the low
+        // halfword. Check that form too — proxy stub terminators are
+        // the 32-bit form but the trap handler is identical on both
+        // sides; be robust.
+        if (op & 0xFFFF) == 0x9002 {
             return Ok(());
         }
         emu.step();

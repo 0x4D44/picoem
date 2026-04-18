@@ -94,55 +94,65 @@ be folded back. Not blocking.
 
 Owner: whoever next edits the test-oracles HLD.
 
-## RISC-V QEMU oracle Stage-6 residuals (2026-04-17)
+## RISC-V QEMU oracle — Stage 6 residuals (2026-04-18, superseding prior entry)
 
-Stage 6 smoke of `test_qemu_diff_riscv32` landed at 100/100 on the targeted
-edge-case suite after filtering several classes of test. The filtered
-classes surface real limitations in QEMU 10.2 + `-machine virt` rv32, plus
-real emulator bugs that need separate fixes. Full discovery log:
-`wrk_journals/2026.04.17 - JRN - RISC-V Hazard3 Test Oracles Implementation.md`
-"Stage 6 complete (with explicit residuals)".
+**The previous entry claimed csrrw silently no-ops on QEMU virt rv32. That was
+wrong** — the actual fault was that QEMU's `-machine virt` maps `VIRT_FLASH` at
+`0x2000_0000` (the address the oracle originally used to match the RP2350's
+native SRAM base). CFI flash accepts GDB `M`-packet writes (debugger bypass)
+but silently drops CPU `sw` instructions that don't do the CFI unlock dance.
+Every "csrrw no-op" observation was actually `csrrw` working fine then the
+subsequent `sw t1, 0(gp)` spill dropping the result into the flash bit bucket.
+Proof: a minimal `csrrw mtvec, t0; csrrs t1, mtvec, x0; sw t1, off(gp);
+ebreak` probe showed `misa = 0x00000000`, which is impossible on a running
+rv32 CPU (misa is hardwired). Moving the same probe to `0x8000_0000` (virt
+DRAM) immediately returned misa = 0x40141185 and showed csrrw taking effect
+on mscratch / mtvec / mepc. Diagnostic tool:
+`crates/mdpicoem-harness/src/bin/probe_csrrw_riscv32.rs`.
 
-Five residuals:
+**Fix landed**: test-mode alias in `mdrp2350::bus::canon_oracle_addr` that
+maps `0x8xxx_xxxx` → the existing SRAM backing. All oracle addresses moved
+to `0x8000_0000`-based so QEMU virt's DRAM and the emulator run at the same
+absolute PC. Stage-6 class filters (`Rv32iBranch`, `CsrSideEffect`, `Zicsr`,
+`sc_w*`, etc.) REMOVED — they were hiding this root cause, not solving it.
 
-1. **csrrw to mtvec / mscratch silently no-ops on QEMU 10.2 + `-machine
-   virt` rv32.** Verified via in-band `csrrw x0, mtvec, t0; csrrs t1,
-   mtvec, x0; sw t1, ...` — PC advances but csrrs reads 0. Same no-op
-   with `rd=x7` (nonzero) and on mscratch. Blocks any CSR poke from
-   the GDB attach flow. Workaround: dropped the global mtvec seed and
-   filtered trap-expecting test classes.
+**Genuine residuals now visible** (these were hidden before because the bug
+masked them as "all zeros == all zeros"):
 
-2. **Dropped global mtvec seed.** `seed_global_mtvec()` kept as
-   `#[allow(dead_code)]` with a note. Blocks Zicsr + expect_trap tests
-   from running under the oracle — no controlled trap-handler landing
-   site is reachable. Revisit with a different QEMU machine mode or a
-   monitor-based CSR poke.
+1. **Misaligned mem tests** (11 edge cases + ~4% of mem fuzz at seed 42).
+   QEMU virt rv32 handles misaligned accesses transparently; Hazard3 traps
+   with mcause=4/6 per HLD §4.5. **This is HLD §11-declared silicon-only
+   scope** — the QEMU oracle cannot validate these, they're the silicon
+   oracle's job. Consider adding a `Platform::SiliconOnly` marker on the
+   `RiscvTestCase` so the QEMU runner skips them cleanly rather than
+   reporting noisy diffs.
 
-3. **Filtered test classes:** `Rv32iBranch`, `CsrSideEffect`, `Zicsr`
-   + per-name `auipc_jalr_pair`, `c_jr_x1`, `c_jalr_x1`. Control-flow
-   tests can't work with the proxy's linear prelude/test/epilogue
-   stream layout — a redesign to single-step per instruction (like
-   `qemu_diff_m33`) would cover them. 111 cases filtered total at
-   Stage 6 close.
+2. **Far branches / JAL with out-of-RAM targets** (~8 edge cases).
+   Branch/jump targets land outside virt's DRAM region. QEMU reads 0 from
+   unmapped → illegal-inst trap, mcause=2. Emulator reads 0 with bus_fault
+   → access-fault trap, mcause=1. Both implementations are spec-legal
+   (different trap priority interpretation); neither is wrong.
 
-4. **Two real ALU fuzz divergences** (seed 42):
-   - `fuzz_alu_107`: x26 low-byte diff — QEMU=0x460d416b emu=0x460d41eb.
-   - `fuzz_alu_129`: x19 = 0x80 on QEMU, 0x00 on emu (possibly an mip
-     leak into a downstream compute — worth tracing).
-   Reproduce: `test_qemu_diff_riscv32 --fuzz 500 --seed 42 --class
-   rv32i-alu`. Investigate on the emulator side.
+3. **sc.w without preceding lr.w**. `sc_w_plain` / `sc_w_aqrl` diff:
+   QEMU=0 (success) vs emu=1 (failure). Emu is spec-correct — a `sc.w`
+   with no reservation must fail. QEMU's generic rv32 appears to be
+   lenient here. Real QEMU quirk, not an emulator bug.
 
-5. **sc.w reservation-model divergence.** `sc_w_plain` and `sc_w_aqrl`
-   edge cases diff QEMU=0 (success) vs emu=1 (failure). Current
-   hypothesis: `Bus::reservation` invalidates over the proxy
-   prelude's SRAM accesses so by the time `sc.w` runs, the reservation
-   is gone. Filtered via `!name.contains("sc_w")`. Fix candidate:
-   whitelist the CSR-proxy's memory window in the reservation
-   tracker.
+4. **`rvc_c_jr_x1` / `c_jalr_x1`**. Jump to x1=0 → PC=0 → unmapped fetch
+   → same unmapped-fetch divergence as (2). Not a core bug.
 
-Owner for (1), (2), (3): whoever next picks up the RISC-V oracle. Owner
-for (4), (5): Hazard3 core/bus developers (real emulator bugs, not
-infrastructure).
+5. **Two ALU fuzz divergences at seed 42** (`fuzz_alu_107`: x26 low-byte
+   `0x6b` vs `0xeb`, `fuzz_alu_129`: x19 `0x80` vs `0x00`). Previously
+   listed as residuals; STILL present after the fix. Real emulator bugs
+   worth investigating — the fix just uncovered them, didn't cause them.
+
+6. **Handful of rv32m multiply/div and rv32a atomic fuzz divergences**
+   at seed 42 (~5 failures per 100 tests). Real emulator bugs in
+   overflow/corner-case semantics.
+
+Owner for (1): QEMU oracle maintainer (annotate test cases; follow HLD §11).
+Owner for (2), (3), (4): documentation (platform-divergence notes in the
+LLD). Owner for (5), (6): Hazard3 core developers.
 
 ## Corpus reproducibility caveat
 

@@ -134,13 +134,15 @@ impl QemuProfile {
     /// F/D removes the FPR block from the GDB register map so the `g`/`G`
     /// packet stays at 132 bytes (33 × u32 = GPRs + PC).
     pub const RISCV32_RP2350: Self = Self {
-        // `-machine virt` — `-machine none` does not automatically map any
-        // RAM, and QEMU 10.2's `-device loader,file=...` does not create a
-        // memory region either: writes to `0x2000_0000` return `E14`
-        // (unmapped). The `virt` machine's RAM region is large enough to
-        // cover both its default base (`0x8000_0000`) and our chosen splice
-        // point (`0x2000_0000`) via the stub's fallback-to-RAM semantics, so
-        // splicing the test stream at `0x2000_0100` works cleanly.
+        // `-machine virt` — only writable RAM region is VIRT_DRAM at
+        // 0x8000_0000. Earlier iterations tried 0x2000_0000 (to match
+        // RP2350's native SRAM address), but that address is VIRT_FLASH
+        // on virt: GDB writes land on the backing store (debugger
+        // bypass), but CPU `sw` instructions quietly no-op through the
+        // CFI-flash write path. So the oracle loads its boot stub and
+        // test stream at 0x8000_0000. The mdrp2350 bus aliases
+        // `0x8xxx_xxxx` back onto its SRAM via `canon_oracle_addr` so
+        // both sides run at the same absolute PC.
         //
         // `zfa=false` is required with `f=false` on QEMU 10.2 — the Zfa
         // extension defaults to true and otherwise trips "Zfa extension
@@ -149,7 +151,7 @@ impl QemuProfile {
         cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,f=false,d=false,zfa=false",
         gdb_port: 3335,
         bios: Some("none"),
-        loader_addr: Some(0x2000_0000),
+        loader_addr: Some(0x8000_0000),
     };
 
     /// Formatted `tcp::<port>` string for the `-gdb` argument.

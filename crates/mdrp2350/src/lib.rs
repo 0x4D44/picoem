@@ -237,12 +237,19 @@ impl Emulator {
     }
 
     /// Load a raw binary at the given address.
+    ///
+    /// Supports the RP2350-native SRAM region (`0x2xxx_xxxx`) and the
+    /// test-only oracle alias (`0x8xxx_xxxx`) added for the QEMU rv32
+    /// differential oracle. See `Bus::canon_oracle_addr` for the
+    /// rationale — QEMU virt rv32's only writable RAM lives at
+    /// `0x8000_0000`, so the oracle lands code there on both sides.
     pub fn load_image(&mut self, addr: u32, data: &[u8]) {
         for (i, &byte) in data.iter().enumerate() {
             let a = addr.wrapping_add(i as u32);
             match a >> 28 {
                 0x0 => {} // ROM is loaded via load_bootrom
                 0x2 => self.bus.memory.sram_write8(a & 0x0FFF_FFFF, byte),
+                0x8 => self.bus.memory.sram_write8(a & 0x0FFF_FFFF, byte),
                 _ => {}
             }
         }

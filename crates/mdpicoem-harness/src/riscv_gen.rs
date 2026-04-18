@@ -108,7 +108,21 @@ impl RiscvClass {
 /// Scratchpad base — memory / atomics cases pre-load an x-register with
 /// this so the encoded instruction's 12-bit immediate covers a known
 /// safe offset range.
-pub const SCRATCH_BASE: u32 = 0x2000_0300;
+/// Test-writable data region for mem/atomic/branch cases that use
+/// `addr_regs` to preload a base register. Distinct from the
+/// binary-internal CSR capture scratchpad at `0x8000_0300` so the
+/// proxy's pre-snapshot reads don't leak CSR values into memory that
+/// tests then load from (CSR values diverge between Hazard3 and QEMU
+/// virt on several fields — mstatus.MPP is forced 0b11 on M-only
+/// Hazard3 but QEMU virt is S+U-aware, etc. — and the WARL mask
+/// normalises the CSR diff but not ordinary memory loads).
+///
+/// Relocated from `0x2000_0300` (RP2350 SRAM) to `0x8000_0400` (QEMU
+/// virt DRAM) — virt maps VIRT_FLASH at `0x2000_0000`, which quietly
+/// drops CPU `sw` instructions. The mdrp2350 bus aliases `0x8xxx_xxxx`
+/// onto SRAM via `canon_oracle_addr`, so both sides run at the same
+/// absolute address.
+pub const SCRATCH_BASE: u32 = 0x8000_0400;
 
 /// Reservable SRAM range (RP2350 §2.1.6.2) — atomics must be in this
 /// window or Hazard3 traps. Keep atomics strictly inside it.

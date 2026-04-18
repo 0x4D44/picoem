@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.31.0"
+version = "0.33.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -150,6 +150,12 @@ path = "src/bin/riscv_probe_spike.rs"
 [[bin]]
 name = "qemu_diff_riscv32"
 path = "src/bin/qemu_diff_riscv32.rs"
+
+# Throwaway diagnostic: does `csrrw` write CSRs on QEMU 10.2 virt rv32?
+# Used to pin down the Stage-6 claim before committing to any fix.
+[[bin]]
+name = "probe_csrrw_riscv32"
+path = "src/bin/probe_csrrw_riscv32.rs"
 
 [[bin]]
 name = "mmio_trace_rp2350"

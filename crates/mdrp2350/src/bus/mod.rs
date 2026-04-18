@@ -109,7 +109,7 @@ impl DecodedOp {
 /// not worth caching.
 #[inline(always)]
 pub(crate) fn is_cacheable_pc(pc: u32) -> bool {
-    matches!(pc >> 28, 0x0 | 0x1 | 0x2)
+    matches!(canon_oracle_addr(pc) >> 28, 0x0 | 0x1 | 0x2)
 }
 
 /// Region bits for [`Bus::pending_invalidation_regions`] /
@@ -145,6 +145,22 @@ pub mod invalidation_regions {
 // block that silicon does not put behind a reset line. Pico-SDK runtime
 // init programs TICKS before any TIMER use without touching RESETS for
 // it.
+
+/// Canonicalise a QEMU-RV32 oracle address into the native RP2350 map.
+///
+/// QEMU `virt` places SRAM at `0x8000_0000`; RP2350 silicon places SRAM
+/// at `0x2000_0000`. Firmware exercised by the RV32 fuzz oracle issues
+/// `0x8xxx_xxxx` addresses; this helper remaps region 0x8 onto the
+/// existing SRAM backing so both sides of the oracle resolve to the
+/// same bytes. No-op outside region 0x8.
+#[inline(always)]
+pub fn canon_oracle_addr(addr: u32) -> u32 {
+    if (addr >> 28) == 0x8 {
+        (addr & 0x0FFF_FFFF) | 0x2000_0000
+    } else {
+        addr
+    }
+}
 
 /// RESETS bit for ADC (datasheet §7.5).
 pub const RESET_ADC: u8 = 0;
@@ -1367,6 +1383,7 @@ impl Bus {
     // --- 8-bit access ---
 
     pub fn read8(&mut self, addr: u32, core: u8) -> u8 {
+        let addr = canon_oracle_addr(addr);
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -1545,6 +1562,7 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        let addr = canon_oracle_addr(addr);
         // RV32A: any write can invalidate an LR/SC reservation on either
         // core. HLD §4.7.
         self.invalidate_reservation_at(addr);
@@ -1998,6 +2016,7 @@ impl Bus {
     // --- 16-bit access ---
 
     pub fn read16(&mut self, addr: u32, core: u8) -> u16 {
+        let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses route through
         // `CortexM33::bus_read16`. Bus-level read16 is still reachable
         // from decode.rs (opcode fetch) and non-PPB tests.
@@ -2183,6 +2202,7 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses route through
         // `CortexM33::bus_write16`.
         debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
@@ -2579,6 +2599,7 @@ impl Bus {
     // --- 32-bit access ---
 
     pub fn read32(&mut self, addr: u32, core: u8) -> u32 {
+        let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses are routed through
         // `CortexM33::bus_read32` before reaching here. Anything at
         // `0xE0..0xEF` that is not boot RAM is a caller bug.
@@ -2710,6 +2731,7 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32, core: u8) {
+        let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses are routed through
         // `CortexM33::bus_write32` before reaching here.
         debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
