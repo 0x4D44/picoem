@@ -11,11 +11,11 @@
 // GPRs + PC + scratchpad CSR snapshots.
 //
 // Usage:
-//   test_qemu_diff_riscv32                          Targeted edge-case suite (default)
-//   test_qemu_diff_riscv32 --fuzz N                 N fuzz tests (distributed by LLD §6 weights)
-//   test_qemu_diff_riscv32 --fuzz N --seed S        Deterministic fuzz
-//   test_qemu_diff_riscv32 --fuzz N --class <name>  Filter fuzz to one RiscvClass
-//   test_qemu_diff_riscv32 --proxy-self-check-only  Run §4.1 proxy self-check and exit
+//   qemu_diff_riscv32                          Targeted edge-case suite (default)
+//   qemu_diff_riscv32 --fuzz N                 N fuzz tests (distributed by LLD §6 weights)
+//   qemu_diff_riscv32 --fuzz N --seed S        Deterministic fuzz
+//   qemu_diff_riscv32 --fuzz N --class <name>  N fuzz tests of that RiscvClass (pre-dispatch, not post-filter)
+//   qemu_diff_riscv32 --proxy-self-check-only  Run §4.1 proxy self-check and exit
 //
 // Class names for --class:
 //   rv32i-alu rv32i-mem rv32i-misaligned rv32i-branch rv32i-upper
@@ -240,11 +240,11 @@ fn parse_args() -> Result<Args, String> {
 fn print_help() {
     println!(
         "Usage:\n  \
-         test_qemu_diff_riscv32                               Run targeted edge-case suite (default)\n  \
-         test_qemu_diff_riscv32 --fuzz N                      Run N fuzz tests (distributed per class weights)\n  \
-         test_qemu_diff_riscv32 --fuzz N --seed S             Deterministic fuzz\n  \
-         test_qemu_diff_riscv32 --fuzz N --class <name>       Filter fuzz to one class\n  \
-         test_qemu_diff_riscv32 --proxy-self-check-only       Run §4.1 proxy self-check and exit\n\n\
+         qemu_diff_riscv32                               Run targeted edge-case suite (default)\n  \
+         qemu_diff_riscv32 --fuzz N                      Run N fuzz tests (distributed per class weights)\n  \
+         qemu_diff_riscv32 --fuzz N --seed S             Deterministic fuzz\n  \
+         qemu_diff_riscv32 --fuzz N --class <name>       Run N fuzz tests of that class (pre-dispatch)\n  \
+         qemu_diff_riscv32 --proxy-self-check-only       Run §4.1 proxy self-check and exit\n\n\
          Class names:\n  \
          rv32i-alu | rv32i-mem | rv32i-misaligned | rv32i-branch | rv32i-upper |\n  \
          rv32m | rv32a | rv32c | zicsr | zifencei | csr-sideeffect"
@@ -717,10 +717,14 @@ fn run_fuzz(
     println!("Fuzz mode: {count} tests, seed={seed}, classes={class_str}");
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let raw = riscv_gen::generate_fuzz(&mut rng, count);
+    // `--fuzz N` (no `--class`) keeps the weight-distributed mixed stream —
+    // byte-identical to the pre-change behaviour for a given seed (the
+    // regression-gate workflow depends on this).
+    // `--fuzz N --class X` now dispatches the per-class generator directly
+    // for exactly N cases of class X (was ~N·weight_bp/10000 pre-change).
     let tests: Vec<RiscvTestCase> = match class_filter {
-        Some(c) => raw.into_iter().filter(|tc| tc.class == c).collect(),
-        None => raw,
+        Some(c) => dispatch_per_class(c, &mut rng, count),
+        None => riscv_gen::generate_fuzz(&mut rng, count),
     };
     let total = tests.len();
     println!("Generated {total} tests");
@@ -782,6 +786,30 @@ fn run_fuzz(
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Route `--fuzz N --class X` to the per-class generator so exactly `count`
+/// cases of class `c` come out (HLD 2026.04.18 Fuzz `--class` Filter UX V1,
+/// Option A). Every `RiscvClass` variant has a matching `pub fn gen_fuzz_*`
+/// in `riscv_gen.rs`; this is a pure dispatch — no new public API.
+fn dispatch_per_class(
+    c: RiscvClass,
+    rng: &mut StdRng,
+    count: usize,
+) -> Vec<RiscvTestCase> {
+    match c {
+        RiscvClass::Rv32iAlu => riscv_gen::gen_fuzz_rv32i_alu(rng, count),
+        RiscvClass::Rv32iMem => riscv_gen::gen_fuzz_rv32i_mem(rng, count),
+        RiscvClass::Rv32iMisalignedMem => riscv_gen::gen_fuzz_rv32i_misaligned(rng, count),
+        RiscvClass::Rv32iBranch => riscv_gen::gen_fuzz_rv32i_branch(rng, count),
+        RiscvClass::Rv32iUpper => riscv_gen::gen_fuzz_rv32i_upper(rng, count),
+        RiscvClass::Rv32m => riscv_gen::gen_fuzz_rv32m(rng, count),
+        RiscvClass::Rv32aReservable => riscv_gen::gen_fuzz_rv32a(rng, count),
+        RiscvClass::Rv32c => riscv_gen::gen_fuzz_rv32c(rng, count),
+        RiscvClass::Zicsr => riscv_gen::gen_fuzz_zicsr(rng, count),
+        RiscvClass::Zifencei => riscv_gen::gen_fuzz_zifencei(rng, count),
+        RiscvClass::CsrSideEffect => riscv_gen::gen_fuzz_csr_side_effect(rng, count),
     }
 }
 

@@ -64,6 +64,8 @@ cargo run -p mdpicoem-harness --release --bin qemu_diff_m0plus          # edge c
 
 When asked to "fuzz test" or "do some fuzzing", default to `--fuzz 100000` unless a different count or duration is specified. For time-based requests ("fuzz for 2 hours"), estimate iterations from prior run throughput and adjust.
 
+On `test_rp2350_qemu_diff_riscv32`, `--fuzz N --class X` now means "N cases of class X" (pre-dispatch); pre-2026-04-18 it meant "N mixed cases post-filtered to class X" (so low-weight classes produced far fewer than N). Seed reproducibility for `--fuzz N` without `--class` (the regression-gate path) is byte-identical across this change.
+
 ### Handling failures
 
 When the harness reports a mismatch:
