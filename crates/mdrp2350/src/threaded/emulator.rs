@@ -1,12 +1,12 @@
 //! `ThreadedEmulator` — 4-thread runtime entry point for Phase 3.
 //!
 //! Phase 3 Stage 7 (LLD V7 §9): real core / PIO / coordinator worker
-//! bodies. Each quantum the four workers rendezvous on the shared
-//! `SpinBarrier` twice — once at the top (execution phase start) and
-//! once at the bottom (peripheral-tick phase end). The coordinator
-//! publishes `master_cycle` and ticks shared peripherals between the
-//! two barriers; the CPU and PIO workers execute during the first
-//! phase and are idle in the second.
+//! bodies. Phase 4 Stage C (HLD V7 §5) collapsed the two-barrier
+//! rendezvous to a single barrier per iteration: each worker performs
+//! its phase work then rendezvouses once at the tail of the loop. CPU
+//! phase-1 of quantum N now runs in parallel with coord phase-2 of
+//! quantum N; the `2 × step_quantum` staleness ceiling that overlap
+//! implies is accepted per HLD V7 §5.2.
 //!
 //! Gated behind `#[cfg(all(target_arch = "x86_64", target_os =
 //! "windows"))]` because the thread-pinning path uses Win32
@@ -448,11 +448,12 @@ fn pin_to_host_core(host_core: usize) {
 // Stage 7 worker bodies (LLD V7 §9)
 // =======================================================================
 //
-// Each body owns its loop over `n` quanta. Within a quantum, the CPU
-// and PIO workers do their work then double-`barrier.wait()` (once to
-// let the coordinator advance `master_cycle` / tick peripherals, once
-// to re-synchronise before the next quantum). The coordinator's
-// loop is the mirror: it waits first, advances state, then waits again.
+// Each body owns its loop over `n` quanta. Within a quantum, every
+// worker performs its phase work and then rendezvouses on the shared
+// `SpinBarrier` exactly once at the tail (HLD V7 §5.1). This overlaps
+// CPU/PIO phase-1 of quantum N with coord phase-2 of quantum N, at
+// the cost of a `2 × step_quantum` staleness ceiling on peripheral
+// state observed by CPU workers (HLD V7 §5.2).
 //
 // A poisoned barrier (any worker panicked) returns the owned `CortexM33`
 // / `[PioBlock; 3]` / `()` immediately so the caller can flip the
@@ -516,9 +517,9 @@ fn core_worker_body(
         // `Ppb::systick_advance`, matching serial.
         core.ppb.systick_advance(core.cycles());
 
-        if barrier.wait() == BarrierResult::Poisoned {
-            return core;
-        }
+        // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
+        // after phase work. Overlaps with coord phase-2 of this
+        // quantum. Poison propagation per §5.4.
         if barrier.wait() == BarrierResult::Poisoned {
             return core;
         }
@@ -579,9 +580,9 @@ fn pio_worker_body(
             shared.pio.write_pads(block_idx, block.pad_out, block.pad_oe);
         }
 
-        if barrier.wait() == BarrierResult::Poisoned {
-            return blocks;
-        }
+        // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
+        // after phase work. Overlaps with coord phase-2 of this
+        // quantum. Poison propagation per §5.4.
         if barrier.wait() == BarrierResult::Poisoned {
             return blocks;
         }
@@ -652,11 +653,12 @@ fn apply_pio_command(
     }
 }
 
-/// Coordinator worker. Advances `master_cycle` + MTIME then ticks the
-/// coordinator-owned peripherals between the two barriers. The
-/// `fetch_add(Release)` on `master_cycle` pairs with every CPU
-/// worker's `load(Acquire)` in `bus/peripherals.rs`'s PLL CS read
-/// path (LLD V7 §3, §9).
+/// Coordinator worker. Merges GPIO, advances `master_cycle` + MTIME,
+/// then ticks the coordinator-owned peripherals, and rendezvouses on
+/// the shared barrier at the tail of each quantum (Phase 4 Stage C,
+/// HLD V7 §5.1). The `fetch_add(Release)` on `master_cycle` pairs
+/// with every CPU worker's `load(Acquire)` in `bus/peripherals.rs`'s
+/// PLL CS read path (LLD V7 §3, §9).
 fn coordinator_worker_body(
     shared: SharedState,
     barrier: Arc<SpinBarrier>,
@@ -664,10 +666,6 @@ fn coordinator_worker_body(
     step_q: u32,
 ) {
     for _ in 0..n {
-        if barrier.wait() == BarrierResult::Poisoned {
-            return;
-        }
-
         // Phase 4 Stage B (HLD V7 §4.2): merge SIO + PIO pad state into
         // `gpio_in` first, mirroring serial's PIO step → update_gpio →
         // mtime → APB tick chain. Serial's PIO step is on the PIO
@@ -681,6 +679,9 @@ fn coordinator_worker_body(
 
         tick_peripherals(&shared, step_q);
 
+        // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
+        // after phase work. Overlaps with CPU/PIO phase-1 of this
+        // quantum. Poison propagation per §5.4.
         if barrier.wait() == BarrierResult::Poisoned {
             return;
         }
@@ -877,15 +878,16 @@ mod tests {
     /// TIMER0 (TICKS.TIMER0 enabled, ALARM0=5, INTE=1) via serial MMIO
     /// before handoff, then runs the threaded coordinator a few quanta
     /// with both cores halted. The coordinator's `tick_peripherals`
-    /// must drive TICKS → TIMER0 edges → alarm match → shared IRQ
-    /// assertion on `IRQ_TIMER0_IRQ_0`. Before Stage A this path was a
-    /// no-op stub, so the assertion here is what makes the port real.
+    /// must drive TICKS → TIMER0 edges → alarm match. We observe
+    /// `TIMER0.INTR` (latched on poll_alarms match, cleared only by
+    /// explicit W1C — stable under Stage C overlap, unlike the
+    /// atomic IRQ wire which CPU workers swap-to-zero each quantum).
     #[test]
     fn tick_peripherals_fires_timer0_alarm0_shared_irq() {
         use crate::peripherals::ticks::{
             CTRL_ENABLE, DOMAIN_STRIDE, DOMAIN_TIMER0, TICKS_BASE,
         };
-        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET, TIMER0_BASE};
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET, INTR_OFFSET, TIMER0_BASE};
 
         let mut emu = Emulator::new(Config::default());
         // TIMER0 is released post-bootrom already; enable the TICKS
@@ -904,16 +906,16 @@ mod tests {
         // Two quanta (≥10 µs) is comfortably past the ALARM0=5 target.
         threaded.run_quanta(2);
 
-        let irq_bit = 1u64 << crate::irq::IRQ_TIMER0_IRQ_0;
+        // TIMER0.INTR bit 0 latches on ALARM0 match and stays set
+        // until an ISR W1Cs it. Observable post-run regardless of
+        // whether CPU worker take_irq_pending raced ahead of coord's
+        // assert_irq_shared in the final quantum (Stage C overlap).
+        let timer0_intr = threaded.shared.peripherals.timers.lock().unwrap()
+            .timer0.read32(INTR_OFFSET);
         assert_ne!(
-            threaded.shared.atomics.irq_pending_load(0) & irq_bit,
+            timer0_intr & 0x1,
             0,
-            "core 0 must see IRQ_TIMER0_IRQ_0 after ALARM0 match (shared)"
-        );
-        assert_ne!(
-            threaded.shared.atomics.irq_pending_load(1) & irq_bit,
-            0,
-            "core 1 must see IRQ_TIMER0_IRQ_0 after ALARM0 match (shared)"
+            "TIMER0 ALARM0 INTR must be latched after tick_peripherals drove count_us past ALARM0",
         );
     }
 
