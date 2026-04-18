@@ -880,8 +880,13 @@ fn run_one_test(
     // to test failure. In targeted-edge-case mode we let these pass (they
     // may be intentional — e.g. checking the illegal-instruction trap
     // path); in fuzz the generator is probabilistic and an unknown
-    // opcode almost always signals a decoder gap.
-    if fuzz_mode && undef_after != undef_before {
+    // opcode almost always signals a decoder gap. The one documented
+    // exception is a fuzz case whose generator set `expect_trap = Some(2)`
+    // — that case is specifically probing the illegal-instruction path
+    // (e.g. Zcmp Q2 collision tripwire), where an `Op::Illegal` dispatch
+    // is the intended outcome and the `undef_count` tick is expected.
+    let expecting_illegal = tc.expect_trap == Some(2);
+    if fuzz_mode && !expecting_illegal && undef_after != undef_before {
         return Err(format!(
             "emulator emitted unknown-opcode warn (undef_count: {undef_before} → {undef_after})"
         ));
@@ -900,7 +905,13 @@ fn run_one_test(
     // Runs AFTER the test halts, so test branches/jumps can't have
     // redirected PC past an inline capture (which was the failure mode
     // of the original in-stream epilogue design).
-    if uses_proxy {
+    // Skip the misaligned-access class: the emulator traps (mcause=4/6
+    // per Hazard3 datasheet §3.8.1) and PC is sitting inside the trap
+    // handler, so the CSR-read prelude's scratchpad pointer (gp) is not
+    // valid for a clean post-snapshot. The class has its own emu-only
+    // mcause check below — no proxy snapshot is required.
+    let qemu_oracle_valid = tc.class != RiscvClass::Rv32iMisalignedMem;
+    if uses_proxy && qemu_oracle_valid {
         capture_post_snapshot(gdb, emu).map_err(|e| format!("post-capture: {e}"))?;
     }
 
@@ -916,30 +927,89 @@ fn run_one_test(
     //     checks).
     //   - x3/gp: proxy's scratchpad pointer; pre-seeded, never observed
     //     by the test case (generator debug_assert forbids it).
+    //
+    // The `qemu_oracle_valid` gate disables the QEMU cross-check for
+    // classes where QEMU's virt rv32 platform behaves differently to
+    // Hazard3 by design (e.g. misaligned accesses — QEMU virt rv32 has
+    // no `misaligned-access=trap` CPU/machine flag in 10.2, so QEMU
+    // completes the access while Hazard3 traps). For those classes we
+    // fall back to verifying `tc.expect_trap` on the emu side below.
+    // Work out whether the test's first word is a CSR-read instruction
+    // that lands its result in a specific rd/csr pair. If so, the rd
+    // value on that register must be compared through `warl_mask` on
+    // both sides — Hazard3 forces `mstatus.MPP = 0b11` (M-mode only)
+    // and the emu mirrors this, while QEMU virt rv32 is M+S+U and
+    // accepts `MPP = 0b00`. The CLINT-wired `mip.MTIP` platform
+    // artefact is the other major culprit. Both are already in
+    // `warl_mask`; we just need to route the comparison through it.
+    // Applies to both the Zicsr class (single CSR instr) and the
+    // CsrSideEffect class (CSR instr followed by a branch).
+    let csr_rd_hint: Option<(u8, u16)> = if matches!(
+        tc.class,
+        RiscvClass::Zicsr | RiscvClass::CsrSideEffect
+    ) && !tc.words.is_empty()
+    {
+        let w = tc.words[0];
+        let opcode = w & 0x7F;
+        if opcode == 0x73 {
+            let funct3 = (w >> 12) & 0b111;
+            if funct3 != 0 && funct3 != 0b100 {
+                let rd = ((w >> 7) & 0x1F) as u8;
+                let csr = ((w >> 20) & 0xFFF) as u16;
+                Some((rd, csr))
+            } else { None }
+        } else { None }
+    } else { None };
+
     const PROXY_SCRATCH: u8 = 31;
-    for r in 1u8..32 {
-        if uses_proxy && (r == PROXY_SCRATCH || r == REG_GP) {
-            continue;
+    if qemu_oracle_valid {
+        for r in 1u8..32 {
+            if uses_proxy && (r == PROXY_SCRATCH || r == REG_GP) {
+                continue;
+            }
+            let (q, e) = if let Some((rd, csr)) = csr_rd_hint {
+                if rd == r {
+                    (warl_mask(csr, qemu_regs[r as usize]),
+                     warl_mask(csr, emu_regs[r as usize]))
+                } else {
+                    (qemu_regs[r as usize], emu_regs[r as usize])
+                }
+            } else {
+                (qemu_regs[r as usize], emu_regs[r as usize])
+            };
+            if q != e {
+                return Err(format!(
+                    "x{r} diff: QEMU={q:#010x} emu={e:#010x}"
+                ));
+            }
         }
-        if qemu_regs[r as usize] != emu_regs[r as usize] {
-            return Err(format!(
-                "x{r} diff: QEMU={:#010x} emu={:#010x}",
-                qemu_regs[r as usize], emu_regs[r as usize]
-            ));
+        if qemu_pc != emu_pc {
+            return Err(format!("PC diff: QEMU={qemu_pc:#010x} emu={emu_pc:#010x}"));
         }
-    }
-    if qemu_pc != emu_pc {
-        return Err(format!("PC diff: QEMU={qemu_pc:#010x} emu={emu_pc:#010x}"));
     }
 
-    // Diff the CSR scratchpad (proxy path only).
-    if uses_proxy {
+    // Diff the CSR scratchpad (proxy path only, when QEMU is a valid
+    // oracle for this class).
+    if uses_proxy && qemu_oracle_valid {
         let qemu_snap = gdb
             .read_mem(CSR_SCRATCH, 56)
             .map_err(|e| format!("QEMU read scratch: {e}"))?;
         let emu_snap = read_emu_scratch(emu, CSR_SCRATCH, 56);
         diff_csr_snapshots(&qemu_snap, &emu_snap)?;
-    } else {
+    } else if !qemu_oracle_valid {
+        // Emulator-only verification: the generator declares the expected
+        // trap cause, and the emu's `mcause` must match. This is the only
+        // cross-check for classes where QEMU is not a valid oracle.
+        if let Some(expected) = tc.expect_trap {
+            let emu_mcause = emu.core_riscv(0).mcause();
+            if emu_mcause != expected {
+                return Err(format!(
+                    "emu-only mcause diff: emu={emu_mcause:#010x} expected={expected:#010x}"
+                ));
+            }
+        }
+    }
+    if !uses_proxy {
         // Zicsr path: optional trap check.
         if let Some(expected) = tc.expect_trap {
             let qemu_mcause = u32::from_le_bytes(
@@ -966,7 +1036,9 @@ fn run_one_test(
     Ok(cycle_after - cycle_before)
 }
 
-/// Build the 3-instruction mtvec-seed prelude used by the Zicsr path:
+/// Build the 3-instruction mtvec-seed prelude used by the Zicsr path
+/// (and by [`seed_global_mtvec`] at startup):
+///
 ///   lui   t0, %hi(TRAP_STUB)      ; t0 = 0x2000_0000
 ///   addi  t0, t0, %lo(TRAP_STUB)  ; t0 = 0x2000_0200
 ///   csrrw x0, mtvec, t0           ; mtvec = t0 (discard old value)
@@ -977,13 +1049,22 @@ fn run_one_test(
 /// CSR-read proxy is not in use on the Zicsr path so there's no
 /// collision.
 fn build_mtvec_seed_prelude() -> [u32; 3] {
+    build_mtvec_seed_prelude_with(REG_T0)
+}
+
+/// Variant that names the scratch register explicitly. The proxy path
+/// passes `x31` (`t6`) because it also clobbers it in the 14-instr CSR-
+/// read snapshot below, so the two clobbers coalesce into one reserved
+/// register. The Zicsr path and the one-shot [`seed_global_mtvec`]
+/// routine both pass `x5` (`t0`) via the no-arg [`build_mtvec_seed_prelude`]
+/// wrapper above — they run outside any proxy-prelude context and x5 is
+/// not observed by the caller.
+fn build_mtvec_seed_prelude_with(scratch: u8) -> [u32; 3] {
     let hi = TRAP_STUB & 0xFFFF_F000;
     let lo = (TRAP_STUB as i32) & 0xFFF;
-    let lui = riscv_gen::encode_u_type(hi, REG_T0, riscv_gen::OPC_LUI);
-    let addi = encode_i_type(lo, REG_T0, 0b000, REG_T0, OPC_OP_IMM);
-    // csrrw x0, mtvec, t0 — rs1=t0 provides the new value, rd=x0 drops
-    // the old one (so we don't clobber any caller-visible register).
-    let csrw = encode_csr(0x305, REG_T0, CSR_F3_RW, REG_X0);
+    let lui = riscv_gen::encode_u_type(hi, scratch, riscv_gen::OPC_LUI);
+    let addi = encode_i_type(lo, scratch, 0b000, scratch, OPC_OP_IMM);
+    let csrw = encode_csr(0x305, scratch, CSR_F3_RW, REG_X0);
     [lui, addi, csrw]
 }
 
@@ -998,15 +1079,30 @@ fn build_test_stream(tc: &RiscvTestCase, use_proxy: bool) -> (Vec<u32>, u32, u32
 
     if use_proxy {
         // Per-test CSR reset: zero mstatus/mie/mip/mscratch/mepc/mcause
-        // (skip mtvec — it's seeded globally to TRAP_STUB). Without this,
-        // cross-test state (especially `mcause` from a prior trap)
-        // leaks into the pre-snapshot. Uses `csrrw x0, csr, x0` — rs1=x0
-        // writes 0, rd=x0 discards the old value. 6 instrs = 24 bytes.
+        // and re-seed mtvec = TRAP_STUB. QEMU's mtvec drifts to 0 across
+        // the run even without any test writing it (we've not pinned
+        // down the exact mechanism, but the "first vCont;c timeout" in
+        // `branch_*_neg_off` and `upper_lui_zero` leaves QEMU in a state
+        // where the next pre-snapshot reads mtvec as 0 regardless of
+        // prior writes, cascading into tens of downstream "CSR diff pre
+        // mtvec" failures). Re-seeding mtvec in every proxy prelude
+        // keeps both sides aligned per test. Without this reset, cross-
+        // test state — especially `mcause` from a prior trap — leaks
+        // into the pre-snapshot. Uses `csrrw x0, csr, x0` — rs1=x0
+        // writes 0, rd=x0 discards the old value. 6 CSR resets + 3-instr
+        // mtvec seed = 9 instrs = 36 bytes.
         const CSR_RESET_LIST: &[u16] = &[0x300, 0x304, 0x344, 0x340, 0x341, 0x342];
         for &csr in CSR_RESET_LIST {
             stream.push(encode_csr(csr, REG_X0, CSR_F3_RW, REG_X0));
         }
-        addr += (CSR_RESET_LIST.len() as u32) * 4;
+        // Use x31 (t6) as the seed scratch so the 14-instr proxy prelude
+        // below — which also clobbers x31 — folds the two clobbers into
+        // one reserved register. Picking the default x5 would clobber
+        // the ALU/mem edge catalogue's rs1 staging.
+        for &w in &build_mtvec_seed_prelude_with(31) {
+            stream.push(w);
+        }
+        addr += (CSR_RESET_LIST.len() as u32 + 3) * 4;
 
         // Proxy prelude: 14 instrs (7 × csrrs t6, csr, x0; sw t6, off(gp)).
         // Uses t6 (x31) as scratch rather than t0 (x5) because edge
@@ -1031,11 +1127,19 @@ fn build_test_stream(tc: &RiscvTestCase, use_proxy: bool) -> (Vec<u32>, u32, u32
         }
         addr += (14 * 4) as u32;
     } else {
-        // Zicsr mtvec-seed prelude: 3 instrs = 12 bytes.
+        // Zicsr prelude: 6-instr CSR reset (zero the volatile diff-set
+        // CSRs so QEMU's drifted state doesn't bleed into the fuzz
+        // rd result — the emu side does this via `reset_diff_csrs`
+        // but GDB has no flat-index CSR write on QEMU 10.2) + 3-instr
+        // mtvec seed = 9 instrs = 36 bytes.
+        const CSR_RESET_LIST: &[u16] = &[0x300, 0x304, 0x344, 0x340, 0x341, 0x342];
+        for &csr in CSR_RESET_LIST {
+            stream.push(encode_csr(csr, REG_X0, CSR_F3_RW, REG_X0));
+        }
         for &w in &build_mtvec_seed_prelude() {
             stream.push(w);
         }
-        addr += 12;
+        addr += (CSR_RESET_LIST.len() as u32 + 3) * 4;
     }
 
     let test_start = addr;
@@ -1092,10 +1196,17 @@ fn build_test_stream(tc: &RiscvTestCase, use_proxy: bool) -> (Vec<u32>, u32, u32
 /// silently passing because only one side was normalized.
 fn warl_mask(csr: u16, v: u32) -> u32 {
     match csr {
-        // mstatus.MPP (bits 12:11) — M-mode-only harts report 0b11. Force
-        // both sides so any transient XS/FS/etc differences don't mask a
-        // real MPP bug.
-        0x300 => (v & !(0b11 << 11)) | (0b11 << 11),
+        // mstatus — Hazard3 V1 implements only MIE (bit 3), MPIE (bit 7),
+        // MPP (bits [12:11], WARL to 0b11 for M-mode-only). Every other
+        // mstatus bit is RAZ/WI on Hazard3, but QEMU's rv32 virt CPU has
+        // the full M+S+U privilege set and holds live values in SIE (1),
+        // SPIE (5), SPP (8), FS (14:13), MPRV (17), SUM (18), MXR (19),
+        // TVM (20), TW (21), TSR (22), etc. Mask both sides down to the
+        // Hazard3-visible bits and force MPP = 0b11.
+        0x300 => {
+            const HAZARD3_MSTATUS_VISIBLE: u32 = (1 << 3) | (1 << 7) | (0b11 << 11);
+            (v & HAZARD3_MSTATUS_VISIBLE) | (0b11 << 11)
+        }
         // mtvec.MODE — bit 0 is the mode select (direct vs vectored); bit
         // 1 is RAZ/WI on Hazard3 (no vectored dispatch). Keep bit 0,
         // clear bit 1, on both sides.
@@ -1109,6 +1220,22 @@ fn warl_mask(csr: u16, v: u32) -> u32 {
         // model so MTIP stays 0. That's a platform artefact, not a
         // semantics divergence — mask it out both sides.
         0x344 => v & 0x808,
+        // mcause — Hazard3 WARL-rounds writes to the set of implemented
+        // causes: exceptions {0..=7, 11} and interrupts {3, 7, 11}. Any
+        // illegal pattern folds to 0 (preserving the interrupt bit is
+        // irrelevant because the legal_code gate on each side of the
+        // interrupt/exception split already zeros the code). QEMU accepts
+        // arbitrary values on writes, so apply the Hazard3 rounding to
+        // both sides before compare (LLD §5). Keeps zicsr / csr-sideeffect
+        // fuzz from flagging every random write to mcause as a divergence.
+        0x342 => {
+            let interrupt = v & 0x8000_0000;
+            let code = v & 0x7FFF_FFFF;
+            let legal_code = if interrupt != 0 {
+                if matches!(code, 3 | 7 | 11) { code } else { 0 }
+            } else if code <= 7 || code == 11 { code } else { 0 };
+            interrupt | legal_code
+        }
         _ => v,
     }
 }

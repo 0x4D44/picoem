@@ -1015,14 +1015,17 @@ pub fn gen_csr_side_effect_edge_cases() -> Vec<RiscvTestCase> {
 // ============================================================================
 
 fn rand_gpr<R: Rng>(rng: &mut R) -> u8 {
-    // x1..x31, but skip x3 (gp) — the QEMU-diff harness reserves it as the
-    // CSR-proxy scratchpad pointer and any test writing x3 corrupts the
-    // epilogue's store address. x5/t0 is still in play: the harness zeros
-    // it after the CSR-read prelude (see the `mv x5, x0` slot in
-    // `build_test_stream`) so both sides enter the test with x5 == 0.
+    // x1..x31, but skip x3 (gp) and x31 (t6) — the QEMU-diff proxy path
+    // reserves both as scratch. x3 holds the CSR-capture scratchpad pointer
+    // and x31 is clobbered by the 7-CSR read prelude (landing on raw `mip`,
+    // which on QEMU virt carries CLINT MTIP in bit 7 while mdrp2350 has no
+    // CLINT, so any fuzz case that uses x31 as rs1/rs2 produces a spurious
+    // divergence from a platform artefact rather than a real emulator bug).
+    // x5/t0 is still in play: the harness zeros it after the CSR-read
+    // prelude so both sides enter the test with x5 == 0.
     loop {
         let r = rng.gen_range(1..32_u8);
-        if r != 3 {
+        if r != 3 && r != 31 {
             return r;
         }
     }
@@ -1187,39 +1190,54 @@ pub fn gen_fuzz_rv32i_misaligned<R: Rng>(
     out
 }
 
-/// Fuzz generator: RV32I branches + JAL / JALR.
+/// Fuzz generator: RV32I branches + JAL (JALR omitted — untargetable
+/// without knowing test_start at encode time).
+///
+/// Every test has the form `[branch-or-jump, NOP × 16]`. The branch offset
+/// is restricted to `{4, 8, .., 64}` (forward only, 4-byte aligned) so
+/// both sides — whether the branch is taken or falls through — land on
+/// a NOP inside the sled and coast to the terminator ebreak that the
+/// harness appends after `tc.words`. Random offsets would otherwise jump
+/// into unmapped memory on the emulator (mcause=1) vs. into valid-but-
+/// garbage memory on QEMU virt (mcause=2), producing a platform-layout
+/// divergence that tells us nothing about branch semantics.
+///
+/// The `rand_gpr` selection of rs1/rs2 already skips x3 (gp) and x31 (t6),
+/// which are reserved for the CSR-proxy prelude.
 pub fn gen_fuzz_rv32i_branch<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
+    const NOP_SLED_LEN: usize = 16;
+    const NOP_WORD: u32 = 0x0000_0013; // addi x0, x0, 0
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let choice = rng.gen_range(0..3_u32);
-        let w = match choice {
+        let choice = rng.gen_range(0..2_u32);
+        // Forward offset in `{4, 8, .., NOP_SLED_LEN*4}` — 4-byte aligned so
+        // the sled has only full NOPs to land on.
+        let offset: i32 = (rng.gen_range(1..=NOP_SLED_LEN) * 4) as i32;
+        let head = match choice {
             0 => {
-                // Conditional branch
                 let funct3 = [0_u32, 1, 4, 5, 6, 7][rng.gen_range(0..6)];
                 let rs1 = rand_gpr(rng);
                 let rs2 = rand_gpr(rng);
-                // Aligned 13-bit signed offset. Hazard3 V1 accepts bit 0 = 0;
-                // we force-align.
-                let raw: i32 = rng.gen_range(-4_096..4_096) & !1_i32;
-                encode_b_type(raw, rs2, rs1, funct3, OPC_BRANCH)
-            }
-            1 => {
-                // JAL
-                let rd = rng.gen_range(0..32_u8);
-                let raw: i32 = rng.gen_range(-(1 << 20)..(1 << 20)) & !1_i32;
-                encode_j_type(raw, rd, OPC_JAL)
+                encode_b_type(offset, rs2, rs1, funct3, OPC_BRANCH)
             }
             _ => {
-                // JALR
-                let rd = rng.gen_range(0..32_u8);
-                let rs1 = rand_gpr(rng);
-                let imm: i32 = rng.gen_range(-2_048..2_048);
-                encode_i_type(imm, rs1, 0, rd, OPC_JALR)
+                let rd = loop {
+                    // Same reservation as `rand_gpr` (skip gp/t6) plus x0 is
+                    // fine (JAL to x0 = no link).
+                    let r = rng.gen_range(0..32_u8);
+                    if r != 3 && r != 31 { break r; }
+                };
+                encode_j_type(offset, rd, OPC_JAL)
             }
         };
+        let mut words = Vec::with_capacity(1 + NOP_SLED_LEN);
+        words.push(head);
+        for _ in 0..NOP_SLED_LEN {
+            words.push(NOP_WORD);
+        }
         out.push(RiscvTestCase {
             name: format!("fuzz_branch_{i}"),
-            words: vec![w],
+            words,
             reg_pre: vec![],
             addr_regs: vec![],
             expect_trap: None,
@@ -1289,13 +1307,29 @@ pub fn gen_fuzz_rv32a<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
         // lr.w requires rs2 = 0 per spec; others take rs2 in x1..x31.
         let rs2 = if op5 == 0b00010 { 0 } else { rand_gpr(rng) };
         let w = encode_r_type(funct7, rs2, rs1, 0b010, rd, OPC_AMO);
+        let mut words = Vec::with_capacity(2);
+        // SC.W (op5 = 0b00011) in isolation reads the hart's outstanding
+        // load-reservation register, which is architecturally undefined
+        // without a preceding LR.W to the same address — Hazard3 silicon
+        // and mdrp2350 fail SC (rd=1), while QEMU's TCG single-step can
+        // carry a stale reservation from an earlier test's LR and succeed
+        // (rd=0). Establish a fresh reservation on both sides so the test
+        // exercises the "SC should succeed" path, which is the meaningful
+        // check (the mismatch was noise about the reservation window, not
+        // about SC.W semantics themselves). We use rd = x0 on the seed LR
+        // so its result never pollutes the GPR diff.
+        if op5 == 0b00011 {
+            let lr_funct7 = (0b00010 << 2) | aqrl;
+            words.push(encode_r_type(lr_funct7, /*rs2*/ 0, rs1, 0b010, /*rd*/ 0, OPC_AMO));
+        }
+        words.push(w);
         let mut reg_pre = vec![(rs1, SCRATCH_BASE)];
         if rs2 != 0 && rs2 != rs1 {
             reg_pre.push((rs2, rng.next_u32()));
         }
         out.push(RiscvTestCase {
             name: format!("fuzz_rv32a_{i}"),
-            words: vec![w],
+            words,
             reg_pre,
             addr_regs: vec![rs1],
             expect_trap: None,
@@ -1305,33 +1339,42 @@ pub fn gen_fuzz_rv32a<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     out
 }
 
-/// Fuzz generator: RV32C + sporadic Zcmp quadrant-2 bit patterns.
+/// Fuzz generator: RV32C — arithmetic subset + sporadic Zcmp quadrant-2
+/// bit patterns.
+///
+/// We deliberately exclude compressed load/store/branch/jump encodings
+/// from the fuzz pool:
+///
+///   * Loads/stores need a valid `rs1'` value plus a known-mapped
+///     4-byte-aligned address, and C.LW/C.SW use `rs1'` ∈ {x8..x15}
+///     — none of which the harness pre-seeds. Without setup they
+///     dereference whatever happens to be in the register (usually 0,
+///     which is inside the bootrom on the emu and inside VIRT_FLASH
+///     on QEMU — the two sides read different backing stores and
+///     disagree).
+///
+///   * Branches/jumps have the same target-landing problem as
+///     `gen_fuzz_rv32i_branch`: random offsets leave QEMU executing
+///     valid-but-garbage bytes in virt DRAM while the emu bus-faults
+///     at the SRAM edge. The dedicated branch fuzz already covers
+///     well-formed compressed C.J / C.JAL via a NOP sled if desired,
+///     but this path keeps it simple and skips them.
+///
+/// What remains is the arithmetic/ALU subset of C, which is pure
+/// register-file work and diffs cleanly against QEMU. Zcmp quadrant-2
+/// stays because the collision tripwire (HLD §4.8) needs hot coverage.
 pub fn gen_fuzz_rv32c<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        // 10% of the fuzz RV32C stream is Zcmp-quadrant-2 to keep the collision
-        // tripwire hot.
+        // 10% Zcmp Q2 (known-illegal on Hazard3 — expect mcause=2).
         let is_zcmp = rng.gen_bool(0.1);
         let enc: u16 = if is_zcmp {
-            // funct3=101, quadrant=10 (Q2). On RV32 without the D
-            // extension — Hazard3's configuration — this whole space is
-            // reserved (the Zcmp extension colonises it with cm.push /
-            // cm.pop / cm.popret / cm.popretz at funct6_low ∈ {4,5,6,7},
-            // cm.mvsa01 / cm.mva01s at funct6_low=3).  We pick from the
-            // unambiguously Zcmp-reserved values {4,5,6,7} to guarantee no
-            // collision with c.jr / c.jalr / c.mv / c.add, which live at
-            // funct3=100 (not 101) in Q2.  See the RISC-V Zc spec §1.3
-            // (Zcmp quadrant-2 encoding table).
             const F6_LOW_ZCMP: [u16; 4] = [4, 5, 6, 7];
             let f6_low = F6_LOW_ZCMP[rng.gen_range(0..4)];
             let mid = rng.next_u32() as u16 & 0x03FF;
             0b101 << 13 | f6_low << 10 | (mid & 0x03FC) | 0b10
         } else {
-            // RV32C — generate a plausible compressed instruction. Quadrants
-            // 0/1/2; ensure c[1:0] != 0b11 (that's a 32-bit instruction).
-            let q = rng.gen_range(0..3_u16);
-            let payload = rng.next_u32() as u16 & 0xFFFC;
-            payload | q
+            gen_rv32c_arith(rng)
         };
         let expect_trap = if is_zcmp { Some(2) } else { None };
         out.push(RiscvTestCase {
@@ -1344,6 +1387,154 @@ pub fn gen_fuzz_rv32c<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
         });
     }
     out
+}
+
+/// Build a well-formed RV32C arithmetic encoding. Every returned
+/// halfword decodes to exactly one `Op` variant that the executor
+/// handles without touching memory or redirecting PC, and the operand
+/// constraints (non-zero shamts, non-zero rd where the spec requires,
+/// nzimm != 0 for ADDI4SPN / ADDI16SP / LUI) mean the emulator's
+/// legitimate "illegal HINT" rejections don't fire.
+///
+/// rs1/rs2/rd never land on x3 (gp) or x31 (t6) — both are the
+/// CSR-proxy scratch and would corrupt the scratchpad pointer or clobber
+/// the post-snapshot capture. The compressed operand fields with
+/// 3-bit register selects (creg3) map to {x8..x15}, which naturally
+/// avoids both reserved slots, so those paths are always safe.
+fn gen_rv32c_arith<R: Rng>(rng: &mut R) -> u16 {
+    // Pick a 5-bit GPR avoiding x0, x3, x31 (x0 must be x1..x31; proxy
+    // reserves x3 and x31). Used for the 5-bit-wide rd/rs2 encodings
+    // (C.MV, C.ADD, C.SLLI, C.LI, C.ADDI).
+    let pick_gpr_nz = |rng: &mut R| -> u16 {
+        loop {
+            let r = rng.gen_range(1_u16..32);
+            if r != 3 && r != 31 {
+                return r;
+            }
+        }
+    };
+    // Creg3 picks one of {x8..x15}. All 8 options are safe (no overlap
+    // with x3/x31). Stored as the 3-bit selector.
+    let pick_creg3 = |rng: &mut R| -> u16 { rng.gen_range(0_u16..8) };
+
+    let choice = rng.gen_range(0..11_u32);
+    match choice {
+        0 => {
+            // C.ADDI rd, nzimm[5:0] — rd != 0 (rd=0 imm=0 is C.NOP, but
+            // rd=0 imm!=0 is HINT; keep rd != 0 to avoid both corner
+            // cases that have no architectural observable).
+            let rd = pick_gpr_nz(rng);
+            let imm_raw = loop {
+                let v = rng.gen_range(0_u16..64);
+                if v != 0 {
+                    break v;
+                }
+            };
+            let b5 = (imm_raw >> 5) & 1;
+            let b4_0 = imm_raw & 0x1F;
+            0b000 << 13 | b5 << 12 | rd << 7 | b4_0 << 2 | 0b01
+        }
+        1 => {
+            // C.LI rd, imm — rd != 0 (rd=0 is HINT).
+            let rd = pick_gpr_nz(rng);
+            let imm_raw = rng.gen_range(0_u16..64);
+            let b5 = (imm_raw >> 5) & 1;
+            let b4_0 = imm_raw & 0x1F;
+            0b010 << 13 | b5 << 12 | rd << 7 | b4_0 << 2 | 0b01
+        }
+        2 => {
+            // C.SLLI rd, shamt — rd != 0, shamt != 0 (both illegal per
+            // spec and the emu decoder rejects them).
+            let rd = pick_gpr_nz(rng);
+            let shamt = rng.gen_range(1_u16..32);
+            let b5 = 0; // RV32: shamt[5] must be 0
+            let b4_0 = shamt & 0x1F;
+            0b000 << 13 | b5 << 12 | rd << 7 | b4_0 << 2 | 0b10
+        }
+        3 => {
+            // C.MV rd, rs2 — rd != 0, rs2 != 0.
+            let rd = pick_gpr_nz(rng);
+            let rs2 = pick_gpr_nz(rng);
+            0b100 << 13 | 0 << 12 | rd << 7 | rs2 << 2 | 0b10
+        }
+        4 => {
+            // C.ADD rd, rs2 — rd != 0, rs2 != 0.
+            let rd = pick_gpr_nz(rng);
+            let rs2 = pick_gpr_nz(rng);
+            0b100 << 13 | 1 << 12 | rd << 7 | rs2 << 2 | 0b10
+        }
+        5 => {
+            // C.SRLI rd', shamt — creg3 operand, shamt != 0.
+            let rd_p = pick_creg3(rng);
+            let shamt = rng.gen_range(1_u16..32);
+            let b5 = 0;
+            let b4_0 = shamt & 0x1F;
+            0b100 << 13 | b5 << 12 | 0b00 << 10 | rd_p << 7 | b4_0 << 2 | 0b01
+        }
+        6 => {
+            // C.SRAI rd', shamt.
+            let rd_p = pick_creg3(rng);
+            let shamt = rng.gen_range(1_u16..32);
+            let b5 = 0;
+            let b4_0 = shamt & 0x1F;
+            0b100 << 13 | b5 << 12 | 0b01 << 10 | rd_p << 7 | b4_0 << 2 | 0b01
+        }
+        7 => {
+            // C.ANDI rd', imm[5:0].
+            let rd_p = pick_creg3(rng);
+            let imm_raw = rng.gen_range(0_u16..64);
+            let b5 = (imm_raw >> 5) & 1;
+            let b4_0 = imm_raw & 0x1F;
+            0b100 << 13 | b5 << 12 | 0b10 << 10 | rd_p << 7 | b4_0 << 2 | 0b01
+        }
+        8 => {
+            // C.SUB / C.XOR / C.OR / C.AND — Q1 funct3=100, bits[11:10]=11.
+            // bit12 = 0 on RV32 (bit12=1 is C.SUBW/C.ADDW for RV64).
+            let rd_p = pick_creg3(rng);
+            let rs2_p = pick_creg3(rng);
+            let sel = rng.gen_range(0_u16..4); // SUB/XOR/OR/AND
+            0b100 << 13 | 0 << 12 | 0b11 << 10 | rd_p << 7 | sel << 5 | rs2_p << 2 | 0b01
+        }
+        9 => {
+            // C.LUI rd, nzimm[17:12] — rd != 0, rd != 2, nzimm != 0.
+            let rd = loop {
+                let r = pick_gpr_nz(rng);
+                if r != 2 {
+                    break r;
+                }
+            };
+            let nzimm_raw = loop {
+                let v = rng.gen_range(0_u16..64);
+                if v != 0 {
+                    break v;
+                }
+            };
+            let b17 = (nzimm_raw >> 5) & 1;
+            let b16_12 = nzimm_raw & 0x1F;
+            0b011 << 13 | b17 << 12 | rd << 7 | b16_12 << 2 | 0b01
+        }
+        _ => {
+            // C.ADDI16SP nzimm[9:4]<<4 — rd=2, nzimm != 0 (scaled by 16).
+            // nzimm[9|4|6|8:7|5] go into bits[12|6|5|4:3|2]. Only bits
+            // [9:4] of the raw value are encoded; bits [3:0] are lost in
+            // the encoding. Guard on the encoded bits, not the raw value,
+            // or we emit `nzimm_encoded == 0` (reserved per spec) for any
+            // nzimm_raw with only low bits set.
+            let nzimm_raw = loop {
+                let v = rng.gen_range(0_u16..0x400);
+                if v & 0x3F0 != 0 {
+                    break v;
+                }
+            };
+            let b9 = (nzimm_raw >> 9) & 1;
+            let b8_7 = (nzimm_raw >> 7) & 0b11;
+            let b6 = (nzimm_raw >> 6) & 1;
+            let b5 = (nzimm_raw >> 5) & 1;
+            let b4 = (nzimm_raw >> 4) & 1;
+            0b011 << 13 | b9 << 12 | 2 << 7
+                | b4 << 6 | b6 << 5 | b8_7 << 3 | b5 << 2 | 0b01
+        }
+    }
 }
 
 /// Fuzz generator: Zicsr.
@@ -1408,7 +1599,44 @@ pub fn gen_fuzz_csr_side_effect<R: Rng>(
     count: usize,
 ) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
-    const CSRS: &[u16] = &[0x300, 0x304, 0x305, 0x340, 0x341, 0x342, 0x344];
+    // Fuzz-relevant M-mode CSRs. `mtvec` (0x305) is deliberately omitted:
+    // writing a random value to the trap vector isn't a meaningful test
+    // (no firmware deliberately scrambles its own handler address), and
+    // QEMU 10.2 virt rv32 exhibits a WARL behaviour on mtvec writes that
+    // we cannot match cheaply — it silently keeps the *prior* mtvec value
+    // when the incoming value doesn't meet some internal alignment /
+    // mode-legality constraint, regardless of the value's bit pattern.
+    // The zicsr/csr-sideeffect edge-case catalogues still exercise
+    // mtvec semantics through curated bit patterns; the fuzz pool drops
+    // it to stay noise-free.
+    const CSRS: &[u16] = &[0x300, 0x304, 0x340, 0x341, 0x342, 0x344];
+    // NOP pad between branch and terminator: the branch offset is +8
+    // bytes from the branch's own PC, so the taken path needs a safe
+    // landing slot one word ahead of the not-taken path. Without the
+    // NOP the branch jumps past the harness's terminator `ebreak` into
+    // whatever follows — on QEMU that's valid VIRT_DRAM (execution
+    // wanders until a non-decodable word, meanwhile the harness times
+    // out on vCont;c); on the emu it's an access fault past the SRAM
+    // writable window. A NOP slot makes both sides converge on the
+    // terminator regardless of which direction the branch goes.
+    const NOP_WORD: u32 = 0x0000_0013;
+    // Safe values for rs1 that exercise CSR side-effect semantics without
+    // dropping QEMU's rv32 virt into a live interrupt cascade. A random
+    // 32-bit value written to `mstatus` with MIE set, combined with QEMU's
+    // always-asserted `mip.MTIP` (CLINT timer compare running), can fire
+    // machine timer interrupts that re-enter the trap handler before the
+    // HW breakpoint can halt it — surfacing as a `vCont;c` connection
+    // timeout rather than a clean divergence. The 16-value pool below
+    // covers: all-zero, single bits, small sparse patterns, and a few
+    // whole-field fills. Enough variety to catch the "did the CSR see
+    // the write" side effect the class is probing, without burning
+    // pathological whole-register random bit patterns into mstatus/mip.
+    const SAFE_VALUES: [u32; 16] = [
+        0x0000_0000, 0x0000_0001, 0x0000_0002, 0x0000_0004,
+        0x0000_0008, 0x0000_0080, 0x0000_0800, 0x0000_1800,
+        0x0000_00FF, 0x0000_0FFF, 0x0000_8888, 0x8000_0000,
+        0x8000_0003, 0x8000_0007, 0x8000_000B, 0x0000_1888,
+    ];
     for i in 0..count {
         let csr = CSRS[rng.gen_range(0..CSRS.len())];
         let rd = rand_gpr(rng);
@@ -1417,10 +1645,11 @@ pub fn gen_fuzz_csr_side_effect<R: Rng>(
         // Follow-up branch conditional on rd.
         let funct3 = if rng.gen_bool(0.5) { 0 } else { 1 };
         let branch = encode_b_type(8, 0, rd, funct3, OPC_BRANCH);
+        let rs1_val = SAFE_VALUES[rng.gen_range(0..SAFE_VALUES.len())];
         out.push(RiscvTestCase {
             name: format!("fuzz_csrside_{i}"),
-            words: vec![csrrw, branch],
-            reg_pre: vec![(rs1, rng.next_u32())],
+            words: vec![csrrw, branch, NOP_WORD],
+            reg_pre: vec![(rs1, rs1_val)],
             addr_regs: vec![],
             expect_trap: None,
             class: RiscvClass::CsrSideEffect,

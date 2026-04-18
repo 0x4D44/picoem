@@ -8,6 +8,7 @@
 // with the taken target; trap entry overwrites with mtvec.
 
 use crate::Bus;
+use crate::bus::canon_oracle_addr;
 
 use super::Hazard3;
 use super::csr::{csr_access, CsrAccess};
@@ -25,7 +26,12 @@ const RESERVABLE_HI: u32 = 0x2008_2000;
 
 #[inline]
 fn in_reservable(addr: u32) -> bool {
-    addr >= RESERVABLE_LO && addr < RESERVABLE_HI
+    // The QEMU oracle alias (region 0x8) canonicalises to 0x2 at bus entry;
+    // the reservable-region predicate must see the same canonical address
+    // or LR/SC/AMO silently fail (or trap mcause=7) on addresses that the
+    // bus happily reads and writes as SRAM.
+    let a = canon_oracle_addr(addr);
+    a >= RESERVABLE_LO && a < RESERVABLE_HI
 }
 
 impl Hazard3 {
@@ -299,12 +305,19 @@ impl Hazard3 {
         bus: &mut Bus,
         epc: u32,
     ) {
-        let addr = self.rd_x(rs1);
-        let core = (self.hart_id as usize);
+        // Canonicalise the reservation address up-front so the value we
+        // store in `bus.reservation[core]` lives in the same address space
+        // as the value `invalidate_reservation_at` sees (which is always
+        // post-canonicalisation — every bus write path canonicalises first,
+        // then invalidates). Trap mtval still reports the architectural
+        // (raw) address firmware issued, so we keep that around too.
+        let raw_addr = self.rd_x(rs1);
+        let addr = canon_oracle_addr(raw_addr);
+        let core = self.hart_id as usize;
         match kind {
             AmoKind::Lr => {
                 if addr & 3 != 0 {
-                    self.enter_trap(cause::LOAD_ADDR_MISALIGNED, addr, epc, bus);
+                    self.enter_trap(cause::LOAD_ADDR_MISALIGNED, raw_addr, epc, bus);
                     return;
                 }
                 if !in_reservable(addr) {
@@ -316,7 +329,7 @@ impl Hazard3 {
                 let val = bus.read32(addr, self.hart_id);
                 if bus.bus_fault(self.hart_id as usize) {
                     bus.clear_bus_fault(self.hart_id as usize);
-                    self.enter_trap(cause::LOAD_ACCESS_FAULT, addr, epc, bus);
+                    self.enter_trap(cause::LOAD_ACCESS_FAULT, raw_addr, epc, bus);
                     return;
                 }
                 bus.reservation[core] = Some(addr);
@@ -324,7 +337,7 @@ impl Hazard3 {
             }
             AmoKind::Sc => {
                 if addr & 3 != 0 {
-                    self.enter_trap(cause::STORE_ADDR_MISALIGNED, addr, epc, bus);
+                    self.enter_trap(cause::STORE_ADDR_MISALIGNED, raw_addr, epc, bus);
                     return;
                 }
                 if !in_reservable(addr) {
@@ -351,7 +364,7 @@ impl Hazard3 {
                     // leak a stale reservation if the invalidation hook
                     // ever changes.
                     bus.reservation[core] = None;
-                    self.enter_trap(cause::STORE_ACCESS_FAULT, addr, epc, bus);
+                    self.enter_trap(cause::STORE_ACCESS_FAULT, raw_addr, epc, bus);
                     return;
                 }
                 // The `write32` call above already invalidated every
@@ -368,17 +381,17 @@ impl Hazard3 {
                 // mcause=7 (datasheet §2.1.6.2 distinguishes AMO from
                 // lr/sc).
                 if addr & 3 != 0 {
-                    self.enter_trap(cause::STORE_ADDR_MISALIGNED, addr, epc, bus);
+                    self.enter_trap(cause::STORE_ADDR_MISALIGNED, raw_addr, epc, bus);
                     return;
                 }
                 if !in_reservable(addr) {
-                    self.enter_trap(cause::STORE_ACCESS_FAULT, addr, epc, bus);
+                    self.enter_trap(cause::STORE_ACCESS_FAULT, raw_addr, epc, bus);
                     return;
                 }
                 let old = bus.read32(addr, self.hart_id);
                 if bus.bus_fault(self.hart_id as usize) {
                     bus.clear_bus_fault(self.hart_id as usize);
-                    self.enter_trap(cause::STORE_ACCESS_FAULT, addr, epc, bus);
+                    self.enter_trap(cause::STORE_ACCESS_FAULT, raw_addr, epc, bus);
                     return;
                 }
                 let src = self.rd_x(rs2);
@@ -397,7 +410,7 @@ impl Hazard3 {
                 bus.write32(addr, new, self.hart_id);
                 if bus.bus_fault(self.hart_id as usize) {
                     bus.clear_bus_fault(self.hart_id as usize);
-                    self.enter_trap(cause::STORE_ACCESS_FAULT, addr, epc, bus);
+                    self.enter_trap(cause::STORE_ACCESS_FAULT, raw_addr, epc, bus);
                     return;
                 }
                 self.wr(rd, old);
