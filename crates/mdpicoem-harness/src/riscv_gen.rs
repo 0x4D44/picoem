@@ -2328,12 +2328,17 @@ mod tests {
     fn edge_cases_rv32a() {
         let cs = gen_rv32a_reservable_edge_cases();
         check_class(&cs, RiscvClass::Rv32aReservable, false);
+        // Mirror mdrp2350::bus::canon_oracle_addr so the 0x8xxx_xxxx alias
+        // resolves to its SRAM image before the window check — matches the
+        // runtime's in_reservable() semantics.
+        let canon = |a: u32| if (a >> 28) == 0x8 { (a & 0x0FFF_FFFF) | 0x2000_0000 } else { a };
         for tc in &cs {
             for reg in &tc.addr_regs {
                 let v = tc.reg_pre.iter().find(|(r, _)| r == reg).map(|(_, v)| *v).unwrap();
+                let v_canon = canon(v);
                 assert!(
-                    (RESERVABLE_LO..RESERVABLE_HI).contains(&v),
-                    "atomic address out of reservable window: 0x{v:08X}"
+                    (RESERVABLE_LO..RESERVABLE_HI).contains(&v_canon),
+                    "atomic address out of reservable window: raw=0x{v:08X} canon=0x{v_canon:08X}"
                 );
             }
         }
