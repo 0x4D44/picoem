@@ -68,17 +68,19 @@ impl Bus {
     // lockstep.
     pub(crate) fn sysinfo_read(&self, offset: u32) -> u32 {
         match offset {
-            // CHIP_ID: assembled from the SDK-authoritative field layout
-            // above. JEP-106 encoding places the JEDEC continuation "stop
-            // bit" at [0]; the RPi JEDEC code 0x926 occupies [11:1].
-            //   REVISION[31:28] = 0    (blank — Stage 5 fills nibble)
-            //   PART[27:12]     = 0x4  (PART_RP4; pico-sdk platform.c)
-            //   MANUFACTURER[11:1] = 0x926 (MANUFACTURER_RPI; same file)
-            //   STOP_BIT[0]     = 1    (SYSINFO_CHIP_ID_STOP_BIT_RESET)
-            // => (0x4 << 12) | (0x926 << 1) | 0x1 = 0x0000_524D.
-            // The silicon-scenario observe mask on this word is 0x0FFF_FFFF
-            // so that the REV nibble is ignored until Stage 5 pre-flight.
-            0x000 => 0x0000_524D,
+            // CHIP_ID: live RP2354 silicon value, measured V11 Stage 6
+            // (`wrk_journals/2026.04.17 - JRN - Coverage Gap Fill V11
+            // Supervisor.md`, "Stage 6 — Silicon validation"). V11
+            // Stage 1 composed 0x524D from SDK field constants by
+            // erroneously shifting MANUFACTURER; pico-sdk's own decode
+            // (`platform.c`) does not shift MANUFACTURER — it reads
+            // `chip_id & 0x0FFE` direct.
+            //   REVISION[31:28]    = 0      (masked by silicon scenario)
+            //   PART[27:12]        = 0x0004 (RP2354)
+            //   MANUFACTURER[11:0] = 0x927  (Raspberry Pi)
+            // => 0x0004_0927. Silicon-scenario observe mask 0x0FFF_FFFF
+            // continues to drop the REV nibble (varies by die).
+            0x000 => 0x0004_0927,
             // PACKAGE_SEL: RP2350A (Pico 2 baseline). Datasheet §12.11.2
             // and SDK `SYSINFO_PACKAGE_SEL_RESET = 0x0`.
             0x004 => 0x0000_0000,

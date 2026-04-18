@@ -9400,12 +9400,12 @@ fn mtime_stays_zero_at_post_reset_matches_silicon() {
 #[test]
 fn sysinfo_reads_hardcoded_readonly_fields() {
     let (_, mut bus) = core_and_bus();
-    // CHIP_ID: REV=0 (blank — Stage 5 pre-flight fills nibble),
-    //          PART=0x4 (PART_RP4), MAN=0x926 (MANUFACTURER_RPI),
-    //          STOP_BIT=1. Assembled: (0x4<<12)|(0x926<<1)|0x1 = 0x0000_524D.
-    assert_eq!(bus.read32(0x4000_0000, 0), 0x0000_524D,
-        "SYSINFO.CHIP_ID: expected PART_RP4 | MANUFACTURER_RPI | STOP_BIT \
-         (REV=0, Stage 5 pre-flight confirms REV nibble)");
+    // CHIP_ID: live RP2354 silicon value (V11 Stage 6, journal at
+    // wrk_journals/2026.04.17 - JRN - Coverage Gap Fill V11 Supervisor.md).
+    // PART=0x0004 (RP2354), MAN=0x927 (Raspberry Pi), REV=0 (masked).
+    assert_eq!(bus.read32(0x4000_0000, 0), 0x0004_0927,
+        "SYSINFO.CHIP_ID: expected PART=0x0004 | MAN=0x927 \
+         (REV nibble masked by silicon scenario)");
     // PACKAGE_SEL: 0 = RP2350A QFN60 (Pico 2 baseline).
     assert_eq!(bus.read32(0x4000_0004, 0), 0x0000_0000,
         "SYSINFO.PACKAGE_SEL: RP2350A");

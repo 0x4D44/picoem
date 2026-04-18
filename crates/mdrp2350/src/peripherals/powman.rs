@@ -336,22 +336,30 @@ mod tests {
         );
     }
 
+    /// Tripwire fires exactly once on the first non-Arm ARCHSEL write.
+    /// Renamed from `archsel_non_arm_warns_once` — the event is now
+    /// trace-level (silicon has no ARCHSEL register; see module doc),
+    /// so "warn" no longer matches the level. The behaviour is still a
+    /// one-shot tripwire latched by the `warned_archsel` struct flag.
+    ///
+    /// Tests only the struct flag (not the emitted `trace!` event) —
+    /// `trace!` is compiled out in `--release` by the workspace's
+    /// `release_max_level_info` setting, so a capture-based assertion
+    /// would green in debug and red in release.
     #[test]
-    fn archsel_non_arm_warns_once() {
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
-        tracing::subscriber::with_default(subscriber, || {
-            let mut p = PowmanRegs::new();
-            // Two non-Arm writes: one warn.
-            p.write32(ARCHSEL_OFFSET, 1, 0);
-            p.write32(ARCHSEL_OFFSET, 2, 0);
-            assert_eq!(p.read32(ARCHSEL_OFFSET), 2);
-        });
-        let events = captured.lock().unwrap();
-        assert_eq!(
-            count_warns_containing(&events, "ARCHSEL"),
-            1,
-            "expected exactly one ARCHSEL warn; got {:?}", *events
+    fn powman_archsel_non_arm_write_fires_tripwire_once() {
+        let mut p = PowmanRegs::new();
+        assert!(!p.warned_archsel, "tripwire must start latched-low");
+        p.write32(ARCHSEL_OFFSET, 1, 0);
+        assert!(
+            p.warned_archsel,
+            "first non-Arm write must latch the tripwire"
+        );
+        p.write32(ARCHSEL_OFFSET, 2, 0);
+        assert_eq!(p.read32(ARCHSEL_OFFSET), 2);
+        assert!(
+            p.warned_archsel,
+            "tripwire stays latched on subsequent non-Arm writes"
         );
     }
 
