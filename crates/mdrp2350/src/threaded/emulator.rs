@@ -48,6 +48,7 @@ use super::{
 use super::peripherals::{
     ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
 };
+use super::timings::{PerWorkerTimings, RunTimings, TimingRecorder};
 
 /// 4-thread runtime handle over a seeded `SharedState` and both CPU
 /// cores. See module-level docs for the Stage 6b → Stage 7 split.
@@ -59,6 +60,16 @@ pub struct ThreadedEmulator {
     step_quantum: u32,
     thread_mask: [usize; 4],
     poisoned: bool,
+    /// Per-worker per-quantum timing instrumentation. Off by default so
+    /// production `run_quanta` calls stay on the zero-`Instant::now()`
+    /// hot path. Flip with [`ThreadedEmulator::set_timing_enabled`]
+    /// before calling `run_quanta`; read via
+    /// [`ThreadedEmulator::last_run_timings`] after.
+    timing_enabled: bool,
+    /// Raw timings from the most recent `run_quanta`. `None` until the
+    /// first call or after a call with `timing_enabled == false`.
+    /// Each call resets this — no cross-call accumulation.
+    last_run_timings: Option<RunTimings>,
 }
 
 impl ThreadedEmulator {
@@ -284,6 +295,8 @@ impl ThreadedEmulator {
             step_quantum,
             thread_mask: [0, 1, 2, 3],
             poisoned: false,
+            timing_enabled: false,
+            last_run_timings: None,
         }
     }
 
@@ -302,6 +315,34 @@ impl ThreadedEmulator {
     /// [`coordinator_worker_body`].
     pub fn master_cycle(&self) -> u64 {
         self.shared.master_cycle.load(Ordering::Acquire)
+    }
+
+    /// Enable or disable per-worker per-quantum timing instrumentation
+    /// for subsequent `run_quanta` calls. When enabled, each worker
+    /// records `(phase_work_ns, barrier_wait_ns)` per quantum and the
+    /// aggregate is available via [`Self::last_run_timings`] after
+    /// `run_quanta` returns.
+    ///
+    /// Off by default. The hot path pays no `Instant::now()` cost while
+    /// disabled. Used by `paced_bench_rp2350`'s `--timing` flag to
+    /// diagnose barrier-wait balance on dual-core workloads.
+    ///
+    /// Enabled-path overhead: expect roughly 30-40% throughput drop at
+    /// `step_quantum=64`, shrinking at larger quanta as the two
+    /// `Instant::now()` bracketing calls per quantum amortise. On a
+    /// panicked `run_quanta`, timings are discarded and
+    /// [`Self::last_run_timings`] returns whatever the previous
+    /// successful call populated (or `None`).
+    pub fn set_timing_enabled(&mut self, enabled: bool) {
+        self.timing_enabled = enabled;
+    }
+
+    /// Raw timings from the most recent [`Self::run_quanta`] call.
+    /// `None` before the first call, or after a call made while
+    /// `timing_enabled == false`. Reset at the start of each call —
+    /// no cross-call accumulation.
+    pub fn last_run_timings(&self) -> Option<&RunTimings> {
+        self.last_run_timings.as_ref()
     }
 
     /// Run `n` quanta. Spawns four workers, joins, and — on panic —
@@ -329,22 +370,28 @@ impl ThreadedEmulator {
         let shared = self.shared.clone();
         let step_q = self.step_quantum;
         let mask = self.thread_mask;
+        let timing = self.timing_enabled;
+
+        // Reset per-run timings. Enabled runs repopulate this from the
+        // joined workers below; disabled runs leave it `None` so
+        // stale data from a prior enabled run doesn't mislead.
+        self.last_run_timings = None;
 
         let h0 = spawn_worker(mask[0], barrier.clone(), {
             let s = shared.clone();
-            move |b| core_worker_body(0, core0, s, b, n, step_q)
+            move |b| core_worker_body(0, core0, s, b, n, step_q, timing)
         });
         let h1 = spawn_worker(mask[1], barrier.clone(), {
             let s = shared.clone();
-            move |b| core_worker_body(1, core1, s, b, n, step_q)
+            move |b| core_worker_body(1, core1, s, b, n, step_q, timing)
         });
         let hp = spawn_worker(mask[2], barrier.clone(), {
             let s = shared.clone();
-            move |b| pio_worker_body(blocks, s, b, n, step_q)
+            move |b| pio_worker_body(blocks, s, b, n, step_q, timing)
         });
         let hc = spawn_worker(mask[3], barrier.clone(), {
             let s = shared.clone();
-            move |b| coordinator_worker_body(s, b, n, step_q)
+            move |b| coordinator_worker_body(s, b, n, step_q, timing)
         });
 
         let r0 = h0.join();
@@ -364,17 +411,32 @@ impl ThreadedEmulator {
         // flag that follows rejects any further call into this
         // instance anyway, so the `None` is observable only via a
         // `run_quanta` re-entry that panics with a clear message.
-        if let Ok(c) = r0 {
+        //
+        // When timing is enabled, each Ok payload carries a
+        // `PerWorkerTimings` trailer; gather them into a `RunTimings`
+        // below. A worker that panicked contributes `None`, which
+        // `RunTimings` turns into an empty per-worker vec.
+        let mut t0 = PerWorkerTimings::default();
+        let mut t1 = PerWorkerTimings::default();
+        let mut tp = PerWorkerTimings::default();
+        let mut tc = PerWorkerTimings::default();
+
+        if let Ok((c, t)) = r0 {
             self.core0 = Some(c);
+            t0 = t;
         }
-        if let Ok(c) = r1 {
+        if let Ok((c, t)) = r1 {
             self.core1 = Some(c);
+            t1 = t;
         }
-        if let Ok(b) = rp {
+        if let Ok((b, t)) = rp {
             self.pio_blocks = Some(b);
+            tp = t;
         }
-        // Coordinator worker returns `()`; nothing to reclaim.
-        let _ = rc;
+        // Coordinator worker returns `((), PerWorkerTimings)`.
+        if let Ok(((), t)) = rc {
+            tc = t;
+        }
 
         let panicked: Vec<&str> = [
             ("core0", r0_err),
@@ -388,6 +450,15 @@ impl ThreadedEmulator {
         if !panicked.is_empty() {
             self.poisoned = true;
             panic!("worker thread(s) panicked: {}", panicked.join(", "));
+        }
+
+        if timing {
+            self.last_run_timings = Some(RunTimings {
+                core0: t0,
+                core1: t1,
+                pio: tp,
+                coord: tc,
+            });
         }
     }
 }
@@ -470,10 +541,16 @@ fn core_worker_body(
     barrier: Arc<SpinBarrier>,
     n: u64,
     step_q: u32,
-) -> CortexM33 {
+    timing_enabled: bool,
+) -> (CortexM33, PerWorkerTimings) {
     let mut bus = WorkerBus::new(core_id, shared.clone());
     let mut target: u64 = 0;
     let idx = core_id as usize;
+    let mut rec = TimingRecorder::new(n, timing_enabled);
+    // Quantum 0's phase_work_ns is measured from worker entry, so it
+    // includes thread-spawn residue. Intentional — it makes the first
+    // quantum identifiable in summaries as "entry+phase_work".
+    rec.on_worker_entry();
 
     for _ in 0..n {
         target = target.wrapping_add(step_q as u64);
@@ -520,11 +597,14 @@ fn core_worker_body(
         // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
         // after phase work. Overlaps with coord phase-2 of this
         // quantum. Poison propagation per §5.4.
-        if barrier.wait() == BarrierResult::Poisoned {
-            return core;
+        rec.on_wait_entry();
+        let result = barrier.wait();
+        rec.on_wait_return();
+        if result == BarrierResult::Poisoned {
+            return (core, rec.take());
         }
     }
-    core
+    (core, rec.take())
 }
 
 /// PIO worker. Drains CPU-queued commands (INSTR_MEM / CLKDIV writes),
@@ -539,7 +619,11 @@ fn pio_worker_body(
     barrier: Arc<SpinBarrier>,
     n: u64,
     step_q: u32,
-) -> [PioBlock; 3] {
+    timing_enabled: bool,
+) -> ([PioBlock; 3], PerWorkerTimings) {
+    let mut rec = TimingRecorder::new(n, timing_enabled);
+    rec.on_worker_entry();
+
     for _ in 0..n {
         for cmd in shared.pio.drain_commands() {
             apply_pio_command(&mut blocks, &shared.pio, cmd);
@@ -583,11 +667,14 @@ fn pio_worker_body(
         // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
         // after phase work. Overlaps with coord phase-2 of this
         // quantum. Poison propagation per §5.4.
-        if barrier.wait() == BarrierResult::Poisoned {
-            return blocks;
+        rec.on_wait_entry();
+        let result = barrier.wait();
+        rec.on_wait_return();
+        if result == BarrierResult::Poisoned {
+            return (blocks, rec.take());
         }
     }
-    blocks
+    (blocks, rec.take())
 }
 
 /// Apply a CPU-queued [`PioCommand`] to the PIO worker's local
@@ -664,7 +751,11 @@ fn coordinator_worker_body(
     barrier: Arc<SpinBarrier>,
     n: u64,
     step_q: u32,
-) {
+    timing_enabled: bool,
+) -> ((), PerWorkerTimings) {
+    let mut rec = TimingRecorder::new(n, timing_enabled);
+    rec.on_worker_entry();
+
     for _ in 0..n {
         // Phase 4 Stage B (HLD V7 §4.2): merge SIO + PIO pad state into
         // `gpio_in` first, mirroring serial's PIO step → update_gpio →
@@ -682,10 +773,14 @@ fn coordinator_worker_body(
         // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
         // after phase work. Overlaps with CPU/PIO phase-1 of this
         // quantum. Poison propagation per §5.4.
-        if barrier.wait() == BarrierResult::Poisoned {
-            return;
+        rec.on_wait_entry();
+        let result = barrier.wait();
+        rec.on_wait_return();
+        if result == BarrierResult::Poisoned {
+            return ((), rec.take());
         }
     }
+    ((), rec.take())
 }
 
 /// Coordinator-owned GPIO merge. Ports `Emulator::update_gpio`
@@ -1718,6 +1813,82 @@ mod tests {
         assert_eq!(threaded.shared.pio.read_pads(0), (0xAAAA_0000, 0xFFFF_0000));
         assert_eq!(threaded.shared.pio.read_pads(1), (0x0000_5555, 0x0000_FFFF));
         assert_eq!(threaded.shared.pio.read_pads(2), (0x1234_5678, 0x8765_4321));
+    }
+
+    // ----- Per-worker timing instrumentation ----------------------------
+
+    /// When timing is disabled (default), `run_quanta` must not populate
+    /// `last_run_timings`. Guards the zero-overhead contract — a consumer
+    /// that forgets the flag sees `None` rather than stale data.
+    #[test]
+    fn timings_disabled_by_default_yields_none() {
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        threaded.run_quanta(5);
+        assert!(
+            threaded.last_run_timings().is_none(),
+            "disabled timings must leave last_run_timings = None"
+        );
+    }
+
+    /// When timing is enabled, `run_quanta(n)` must populate all four
+    /// workers' raw vecs with exactly `n` samples each (one per
+    /// quantum).
+    #[test]
+    fn timings_enabled_records_n_samples_per_worker() {
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+        threaded.set_timing_enabled(true);
+
+        let n: u64 = 10;
+        threaded.run_quanta(n);
+
+        let rt = threaded
+            .last_run_timings()
+            .expect("enabled run must populate last_run_timings");
+        assert_eq!(rt.samples(), n as usize);
+        for s in rt.summary() {
+            assert_eq!(
+                s.samples, n as usize,
+                "worker {} must record n samples",
+                s.name().as_str()
+            );
+            // Every quantum did *some* work — at minimum the barrier
+            // wait itself took nonzero nanoseconds. On busy hosts the
+            // Instant resolution floor (~100ns on Windows) means the
+            // phase-work can round to 0 for the trivial halted-cores
+            // case, so we only assert the total is monotonic, not
+            // strictly positive.
+            assert!(s.phase_work_total_ns >= s.phase_work_max_ns);
+            assert!(s.barrier_wait_total_ns >= s.barrier_wait_max_ns);
+        }
+    }
+
+    /// Re-running with timing disabled after an enabled run must reset
+    /// `last_run_timings` to `None`. Prevents the stale-data trap
+    /// where a consumer sees a non-`None` from the *previous* run.
+    #[test]
+    fn timings_reset_when_disabled_between_runs() {
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        threaded.set_timing_enabled(true);
+        threaded.run_quanta(3);
+        assert!(threaded.last_run_timings().is_some());
+
+        threaded.set_timing_enabled(false);
+        threaded.run_quanta(3);
+        assert!(
+            threaded.last_run_timings().is_none(),
+            "disabled second run must reset last_run_timings to None"
+        );
     }
 
     /// End-to-end integration: a single `run_quanta` call must drive all

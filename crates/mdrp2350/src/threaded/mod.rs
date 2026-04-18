@@ -23,6 +23,11 @@ pub mod bus;
 // `Emulator::run` path.
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub mod emulator;
+// Per-worker per-quantum timing instrumentation (HLD V7 §8 follow-up).
+// Gated to the same target as `emulator` because only the threaded
+// runtime produces timings.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub mod timings;
 
 pub use atomics::CoreAtomics;
 pub use memory::SharedMemory;
@@ -39,3 +44,5 @@ pub use shared::SharedState;
 pub use bus::{PioBus, WorkerBus};
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub use emulator::ThreadedEmulator;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub use timings::{RunTimings, WorkerName, WorkerSummary};

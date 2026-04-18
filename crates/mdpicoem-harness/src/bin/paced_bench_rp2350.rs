@@ -23,8 +23,33 @@
 //!                      stress, fpu-heavy. Core count is implied by the
 //!                      workload: basic / peripheral / fpu-heavy are
 //!                      single-core, contention / stress are dual-core.
+//!   --threaded         Route execution through `ThreadedEmulator` (4
+//!                      pinned workers: core0, core1, PIO, coordinator)
+//!                      instead of the serial-interleave `Emulator::run`
+//!                      path. Windows x86_64 only — matches the
+//!                      `#[cfg]` gate on the threaded module. Workload
+//!                      setup, pacing, stats and output format are
+//!                      identical to the serial path so A/B diffs are
+//!                      direct.
+//!   --step-quantum N   Cycles per emulator step (default
+//!                      `DEFAULT_STEP_QUANTUM` = 64). In threaded mode
+//!                      this is also the cycles-per-barrier-rendezvous,
+//!                      so coarser values (e.g. 1024) amortise the
+//!                      4-thread barrier cost. For A/B comparability
+//!                      between serial and threaded, both paths honour
+//!                      the same value.
+//!   --timing           Threaded-mode only. Enable per-worker
+//!                      per-quantum timing instrumentation and print
+//!                      a summary table at end of run showing, for
+//!                      each of core0/core1/pio/coord, mean/p50/p99/
+//!                      max phase_work_ns (work done before the
+//!                      barrier) and barrier_wait_ns (time blocked
+//!                      waiting for peers). Off by default; when off
+//!                      the workers skip every `Instant::now()` call.
 
-use mdrp2350::{Config, Emulator, Pacer, PacerStats};
+use mdrp2350::{Config, DEFAULT_STEP_QUANTUM, Emulator, EmulatorBuilder, Pacer, PacerStats};
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+use mdrp2350::threaded::ThreadedEmulator;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -415,6 +440,37 @@ mod win {
     }
 }
 
+/// Execution backend. The serial path stays unchanged from the
+/// pre-`--threaded` binary; the threaded variant consumes the same
+/// `Emulator` after workload setup and replaces `emu.run(cycles)` with
+/// `ThreadedEmulator::run_quanta(n)`. Quanta count derives from the
+/// emulator's `step_quantum` so both backends advance identical
+/// cycle counts per pacing interval — no accounting drift between A/B
+/// runs.
+enum Runtime {
+    Serial(Emulator),
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    Threaded { inner: ThreadedEmulator, step_q: u32 },
+}
+
+impl Runtime {
+    /// Advance the emulator by at least `cycles` virtual cycles,
+    /// matching the serial `Emulator::run` overshoot contract.
+    fn run(&mut self, cycles: u64) {
+        match self {
+            Runtime::Serial(emu) => {
+                emu.run(cycles);
+            }
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            Runtime::Threaded { inner, step_q } => {
+                let sq = *step_q as u64;
+                let n = cycles.div_ceil(sq);
+                inner.run_quanta(n);
+            }
+        }
+    }
+}
+
 fn main() {
     let seconds = parse_arg("--seconds").unwrap_or(5);
     let cycles_target = parse_arg_u64("--cycles");
@@ -423,10 +479,23 @@ fn main() {
     let sys_clk_hz = clock_mhz * 1_000_000;
     let core = parse_arg("--core").unwrap_or(2) as usize;
     let unpaced = std::env::args().any(|a| a == "--unpaced");
+    let threaded = std::env::args().any(|a| a == "--threaded");
+    let timing = std::env::args().any(|a| a == "--timing");
+    let step_quantum = parse_arg("--step-quantum").unwrap_or(DEFAULT_STEP_QUANTUM);
     let workload = parse_workload().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    if threaded {
+        eprintln!(
+            "error: --threaded requires x86_64 Windows (ThreadedEmulator is \
+             #[cfg]-gated to that target — pin_to_host_core uses \
+             SetThreadAffinityMask)"
+        );
+        std::process::exit(1);
+    }
 
     // `--dual-core` was removed in the workload-spread refactor: core
     // count is now a property of the workload (Basic/Peripheral/FpuHeavy
@@ -445,8 +514,34 @@ fn main() {
         eprintln!("error: --seconds and --clock-mhz must be > 0");
         std::process::exit(1);
     }
+    if step_quantum == 0 {
+        eprintln!("error: --step-quantum must be > 0");
+        std::process::exit(1);
+    }
     if cycles_target.is_some() && !unpaced {
         eprintln!("error: --cycles requires --unpaced (paced mode is duration-driven)");
+        std::process::exit(1);
+    }
+    // `--threaded` spawns 4 pinned workers per `run_quanta` call. Driving
+    // it at 150-cycle pacer granularity would burn the entire budget on
+    // thread spawn/join — measured at ~0 MHz during bring-up. Paced-mode
+    // real-time accounting is also undefined for a model that rendezvous
+    // on a barrier across cores. Require --unpaced so the threaded run
+    // uses a single large `run_quanta` call and the MHz figure is
+    // comparable against the serial --unpaced baseline.
+    if threaded && !unpaced {
+        eprintln!(
+            "error: --threaded requires --unpaced (thread-spawn overhead per \
+             pacer quantum would dominate; a single large run_quanta call \
+             is the intended use — compare against serial --unpaced)"
+        );
+        std::process::exit(1);
+    }
+    if timing && !threaded {
+        eprintln!(
+            "error: --timing requires --threaded (the flag surfaces per-worker \
+             barrier timings; the serial path has no workers to instrument)"
+        );
         std::process::exit(1);
     }
 
@@ -461,11 +556,42 @@ fn main() {
     let _ = core;
 
     // --- Set up emulator + selected workload ---
-    let mut emu = Emulator::new(Config {
+    let mut emu = EmulatorBuilder::new(Config {
         sys_clk_hz,
         ..Default::default()
-    });
+    })
+    .step_quantum(step_quantum)
+    .build();
     setup(&mut emu, workload);
+
+    // Promote into threaded mode after setup — `ThreadedEmulator::from_emulator`
+    // consumes the `Emulator`, so every workload poke / mmio_write32 must run
+    // on the serial handle first. Workload setup uses only `poke` (memory,
+    // bypasses cache-invalidation) and `mmio_write32` to non-executable
+    // peripheral addresses, so the `from_emulator` debug-assert on drained
+    // pending_cache_invalidations / pending_invalidation_regions is
+    // trivially satisfied — no step or manual invalidate needed.
+    #[allow(unused_mut)]
+    let mut runtime = {
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        {
+            if threaded {
+                let step_q = emu.step_quantum;
+                let mut inner = ThreadedEmulator::from_emulator(emu);
+                inner.set_timing_enabled(timing);
+                Runtime::Threaded { inner, step_q }
+            } else {
+                Runtime::Serial(emu)
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+        {
+            // `threaded` guaranteed false by the earlier non-Windows
+            // rejection above.
+            let _ = threaded;
+            Runtime::Serial(emu)
+        }
+    };
 
     // --- Set up pacer ---
     let mut pacer = Pacer::with_quantum(sys_clk_hz, quantum.into());
@@ -473,9 +599,10 @@ fn main() {
 
     let core_mode = if workload.is_dual_core() { "dual-core" } else { "single-core" };
     let pio_mode = if workload.needs_pio() { " + PIO0 SM0 wrap" } else { "" };
+    let runtime_mode = if threaded { "threaded" } else { "serial" };
     println!(
-        "mdrp2350 paced benchmark — target {} MHz, quantum {} cycles, {}, workload {}{}",
-        clock_mhz, quantum, core_mode, workload.as_str(), pio_mode,
+        "mdrp2350 paced benchmark — target {} MHz, quantum {} cycles, step_quantum {}, {}, workload {}{}, runtime {}",
+        clock_mhz, quantum, step_quantum, core_mode, workload.as_str(), pio_mode, runtime_mode,
     );
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
     println!("{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
@@ -503,6 +630,13 @@ fn main() {
         } else {
             println!("(unpaced mode — running flat-out, no real-time pacing)");
         }
+        // Threaded batch size. `ThreadedEmulator::run_quanta` spawns 4
+        // pinned workers per call, so we amortise that startup cost over
+        // a large chunk. 1 second of emulated time at the target clock
+        // (150 MHz default) is ~150M cycles — well above the few-hundred-
+        // microsecond spawn cost, while still letting duration-mode
+        // re-check `start.elapsed()` every ~1 virtual second.
+        let threaded_chunk_cycles: u64 = sys_clk_hz as u64;
         let mut n: u64 = 0;
         loop {
             if let Some(target) = cycles_target {
@@ -510,14 +644,25 @@ fn main() {
             } else if start.elapsed() >= duration {
                 break;
             }
-            emu.run(qc);
-            n += qc;
+            let chunk = if threaded {
+                // Final iteration under --cycles: shrink the chunk so we
+                // don't over-run the target by an entire virtual second.
+                if let Some(target) = cycles_target {
+                    threaded_chunk_cycles.min(target - n)
+                } else {
+                    threaded_chunk_cycles
+                }
+            } else {
+                qc
+            };
+            runtime.run(chunk);
+            n += chunk;
         }
         n
     } else {
         while start.elapsed() < duration {
             pacer.begin_quantum();
-            emu.run(qc);
+            runtime.run(qc);
             pacer.end_quantum();
         }
         0 // unused
@@ -562,6 +707,17 @@ fn main() {
                      host_cycles_per_emu);
         }
         println!("Verdict:        UNPACED (profiling mode)");
+
+        // Threaded-mode --timing table. Runtime must outlive the
+        // `last_run_timings()` borrow, so we print before `return`.
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        if timing {
+            if let Runtime::Threaded { ref inner, .. } = runtime {
+                if let Some(rt) = inner.last_run_timings() {
+                    print_timing_summary(rt);
+                }
+            }
+        }
         return;
     }
 
@@ -649,5 +805,54 @@ fn match_workload(s: &str) -> Result<Workload, String> {
         other => Err(format!(
             "invalid --workload '{other}' (expected basic|peripheral|contention|stress|fpu-heavy)"
         )),
+    }
+}
+
+/// Print the per-worker per-quantum timing table populated by
+/// `ThreadedEmulator::run_quanta` under `--timing`. Two rows per worker:
+/// phase_work (time doing actual phase-1 work before the barrier) and
+/// barrier_wait (time blocked in `barrier.wait()`). Ratio column shows
+/// barrier_wait / (phase_work + barrier_wait) — high values imply the
+/// worker finished early and was waiting for peers.
+///
+/// Quantum 0's phase_work includes thread-spawn residue (the first
+/// `on_wait_entry` closes the span started at worker entry); over a
+/// multi-million-quantum run the distortion is noise, but be aware for
+/// very short runs.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn print_timing_summary(rt: &mdrp2350::threaded::RunTimings) {
+    println!("\n--- per-worker timings (ns) ---");
+    println!(
+        "{:>7} {:>9} {:>10} {:>10} {:>10} {:>10} {:>14} {:>8}",
+        "worker", "samples", "mean", "p50", "p99", "max", "total_ns", "wait%"
+    );
+    for s in rt.summary() {
+        let sum = s.phase_work_total_ns + s.barrier_wait_total_ns;
+        let wait_pct = if sum > 0 {
+            100.0 * s.barrier_wait_total_ns as f64 / sum as f64
+        } else {
+            0.0
+        };
+        println!(
+            "{:>7} {:>9} {:>10} {:>10} {:>10} {:>10} {:>14}",
+            format!("{}:work", s.name().as_str()),
+            s.samples,
+            s.phase_work_mean_ns,
+            s.phase_work_p50_ns,
+            s.phase_work_p99_ns,
+            s.phase_work_max_ns,
+            s.phase_work_total_ns,
+        );
+        println!(
+            "{:>7} {:>9} {:>10} {:>10} {:>10} {:>10} {:>14} {:>7.1}%",
+            format!("{}:wait", s.name().as_str()),
+            s.samples,
+            s.barrier_wait_mean_ns,
+            s.barrier_wait_p50_ns,
+            s.barrier_wait_p99_ns,
+            s.barrier_wait_max_ns,
+            s.barrier_wait_total_ns,
+            wait_pct,
+        );
     }
 }
