@@ -247,9 +247,18 @@ impl ThreadedEmulator {
         // the first quantum — without this, the enable-mask check at
         // the top of `pio_worker_body` would zero-skip those blocks
         // until a fresh WriteCtrl came in over the command queue.
+        //
+        // Also seed `pads` so coord's first `update_gpio` (HLD V7 §4.3)
+        // sees the live `(pad_out, pad_oe)` rather than zero — without
+        // this, PIO output drops for one quantum during handover.
+        //
+        // Stage C prerequisite: under single-barrier overlap, coord's
+        // first update_gpio reads pads before PIO worker publishes. The
+        // seed prevents a first-quantum PIO-output drop. Do not remove.
         let threaded_pio = ThreadedPio::new();
         for (idx, block) in pio.iter().enumerate() {
             threaded_pio.write_sm_enabled(idx, block.sm_enabled_mask());
+            threaded_pio.write_pads(idx, block.pad_out, block.pad_oe);
         }
 
         let shared = SharedState {
@@ -502,6 +511,11 @@ fn core_worker_body(
         }
         core.ppb.update_latest_cycles(core.cycles());
 
+        // Phase 4 Stage B (HLD V7 §4.1): per-core SysTick advance.
+        // Halted cores produce a zero delta via the snapshot in
+        // `Ppb::systick_advance`, matching serial.
+        core.ppb.systick_advance(core.cycles());
+
         if barrier.wait() == BarrierResult::Poisoned {
             return core;
         }
@@ -555,6 +569,14 @@ fn pio_worker_body(
             // PIO→NVIC assertion is Phase-later scope (see function
             // doc); we only publish the bits here.
             shared.pio.write_irq_flags(block_idx, block.pending_irqs() as u8);
+        }
+
+        // Phase 4 Stage B (HLD V7 §4.3): publish every block's pad
+        // state — including disabled blocks, whose pads may still carry
+        // a non-zero latch from the last active tick — so coord's
+        // `update_gpio` sees a coherent snapshot.
+        for (block_idx, block) in blocks.iter().enumerate() {
+            shared.pio.write_pads(block_idx, block.pad_out, block.pad_oe);
         }
 
         if barrier.wait() == BarrierResult::Poisoned {
@@ -646,6 +668,12 @@ fn coordinator_worker_body(
             return;
         }
 
+        // Phase 4 Stage B (HLD V7 §4.2): merge SIO + PIO pad state into
+        // `gpio_in` first, mirroring serial's PIO step → update_gpio →
+        // mtime → APB tick chain. Serial's PIO step is on the PIO
+        // worker under Phase 4, so coord picks up the chain here.
+        update_gpio(&shared);
+
         // Advance master_cycle BEFORE ticking peripherals so CPU
         // workers' next-quantum PLL reads observe the fresh timeline.
         shared.master_cycle.fetch_add(step_q as u64, Ordering::Release);
@@ -657,6 +685,22 @@ fn coordinator_worker_body(
             return;
         }
     }
+}
+
+/// Coordinator-owned GPIO merge. Ports `Emulator::update_gpio`
+/// (`lib.rs:406-415`): start with SIO pads (`out & oe`, bank 0), fold
+/// each PIO block's `(pad_out, pad_oe)` overlay in block order, then
+/// apply the external-stimulus overlay last.
+fn update_gpio(shared: &SharedState) {
+    let sio_out = shared.gpio.read_out(0);
+    let sio_oe = shared.gpio.read_oe(0);
+    let mut merged = sio_out & sio_oe;
+    for block_idx in 0..3 {
+        let (pad_out, pad_oe) = shared.pio.read_pads(block_idx);
+        merged = (merged & !pad_oe) | (pad_out & pad_oe);
+    }
+    let (ext_val, ext_mask) = shared.gpio.read_external();
+    shared.gpio.write_in((merged & !ext_mask) | (ext_val & ext_mask));
 }
 
 /// Coordinator-owned peripheral tick. Phase 4 Stage A port of
@@ -1588,5 +1632,166 @@ mod tests {
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
         // FSTAT at 0x5020_0004 — not yet wired.
         let _ = bus.read32(0x5020_0004, 0);
+    }
+
+    // ----- Phase 4 Stage B (HLD V7 §4) ----------------------------------
+
+    /// Each CPU worker's phase-1 tail must call `ppb.systick_advance(cycles)`.
+    /// Halted cores advance no cycles, so the observable side-effect is
+    /// that `last_systick_cycles` snaps to the core's current `cycles`
+    /// on the first call. Seed `last_systick_cycles = 42` pre-handoff so
+    /// the first post-quantum read proves the hook fired.
+    #[test]
+    fn tick_systick_fires_in_cpu_worker_phase1() {
+        let mut emu = Emulator::new(Config::default());
+        emu.cores[0].ppb.last_systick_cycles = 42;
+        emu.cores[1].ppb.last_systick_cycles = 99;
+
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        threaded.run_quanta(1);
+
+        // Halted cores stay at cycles=0, so systick_advance(0) must have
+        // rewritten last_systick_cycles from (42, 99) to (0, 0).
+        assert_eq!(
+            threaded.core0.as_ref().unwrap().ppb.last_systick_cycles, 0,
+            "core0 phase-1 must call systick_advance"
+        );
+        assert_eq!(
+            threaded.core1.as_ref().unwrap().ppb.last_systick_cycles, 0,
+            "core1 phase-1 must call systick_advance"
+        );
+    }
+
+    /// Coordinator's phase-2 `update_gpio` must fold SIO pads + PIO pad
+    /// snapshots + external stimulus into `gpio.in` mirroring serial.
+    /// Exercised against the `update_gpio` function directly (the PIO
+    /// worker republishes pads every quantum, so `run_quanta` would
+    /// overwrite the seeded pad state before coord reads it).
+    #[test]
+    fn update_gpio_merges_sio_pio_and_external() {
+        let threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+
+        // SIO drives bit 0 (out & oe).
+        threaded.shared.gpio.write_out(0, 0x0000_0001);
+        threaded.shared.gpio.write_oe(0, 0x0000_0001);
+        // PIO block 2 drives bit 4 high and bit 0 low via pad_oe
+        // (higher-indexed blocks overlay lower ones per §4.2).
+        threaded.shared.pio.write_pads(2, 0x0000_0010, 0x0000_0011);
+        // External stimulus forces bit 8 high.
+        threaded.shared.gpio.write_external(0x0000_0100, 0x0000_0100);
+
+        update_gpio(&threaded.shared);
+
+        // SIO bit 0 overridden by PIO block 2's pad_oe bit 0 (pad_out=0),
+        // block 2's bit 4 high, external bit 8 high.
+        assert_eq!(
+            threaded.shared.gpio.read_in(),
+            0x0000_0110,
+            "update_gpio must overlay PIO then external on top of SIO"
+        );
+    }
+
+    /// `from_emulator` must seed `ThreadedPio::pads` from each incoming
+    /// `PioBlock.pad_out` / `pad_oe`. Without the seed, coord's first
+    /// `update_gpio` reads zero and drops PIO output for one quantum.
+    ///
+    /// Regression guard: removing the seed loop in `from_emulator` (at
+    /// the `threaded_pio.write_pads(...)` call) fails this test.
+    #[test]
+    fn from_emulator_seeds_pio_pads() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.pio[0].pad_out = 0xAAAA_0000;
+        emu.bus.pio[0].pad_oe = 0xFFFF_0000;
+        emu.bus.pio[1].pad_out = 0x0000_5555;
+        emu.bus.pio[1].pad_oe = 0x0000_FFFF;
+        emu.bus.pio[2].pad_out = 0x1234_5678;
+        emu.bus.pio[2].pad_oe = 0x8765_4321;
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+
+        assert_eq!(threaded.shared.pio.read_pads(0), (0xAAAA_0000, 0xFFFF_0000));
+        assert_eq!(threaded.shared.pio.read_pads(1), (0x0000_5555, 0x0000_FFFF));
+        assert_eq!(threaded.shared.pio.read_pads(2), (0x1234_5678, 0x8765_4321));
+    }
+
+    /// End-to-end integration: a single `run_quanta` call must drive all
+    /// three phase-2 pieces at once — SIO pad state merged into GPIO_IN,
+    /// external stimulus overlaid on top, per-core SysTick advanced, and
+    /// master_cycle advanced by the coordinator. PIO is covered directly
+    /// by `update_gpio_merges_sio_pio_and_external` (the PIO worker
+    /// republishes pads every quantum, which makes a pre-quantum
+    /// `write_pads` seed a poor integration signal here).
+    ///
+    /// Both cores are halted: core 0's SysTick `last_systick_cycles` is
+    /// pre-seeded to `u64::MAX - 99` so the `wrapping_sub` on phase-1's
+    /// `systick_advance(0)` synthesises a delta of 100 — enough to drive
+    /// CVR below its initial RVR without running firmware.
+    #[test]
+    fn run_quanta_integrates_sio_external_and_systick() {
+        const SIO_BIT: u32 = 1 << 25; // GPIO25, LED on Pico 2
+        const EXT_BIT: u32 = 1 << 8;
+        const RVR_INIT: u32 = 1000;
+
+        let mut emu = Emulator::new(Config::default());
+
+        // SIO drives GPIO25 OUT=1, OE=1 pre-handoff. `AtomicGpio::seed`
+        // lifts these into `shared.gpio.{out,oe}`.
+        emu.bus.sio.gpio_out = SIO_BIT;
+        emu.bus.sio.gpio_oe = SIO_BIT;
+
+        // Harness-style external stimulus forces bit 8 high. Seeded into
+        // the packed `external` AtomicU64 by `AtomicGpio::seed`.
+        emu.bus.gpio_external_in = EXT_BIT;
+        emu.bus.gpio_external_mask = EXT_BIT;
+
+        // Enable core 0 SysTick (ENABLE=1, RVR=1000, CVR=1000) and
+        // pre-seed `last_systick_cycles` so a halted-core call to
+        // `systick_advance(0)` yields `delta = 100` via wrapping_sub.
+        emu.cores[0].ppb.syst_csr = 1;
+        emu.cores[0].ppb.syst_rvr = RVR_INIT;
+        emu.cores[0].ppb.syst_cvr = RVR_INIT;
+        emu.cores[0].ppb.last_systick_cycles = u64::MAX - 99;
+
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        // Halt both cores — core 0 stays at cycles=0, so the SysTick
+        // advance comes purely from the pre-seeded wrapping delta.
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        assert_eq!(threaded.master_cycle(), 0);
+
+        threaded.run_quanta(2);
+
+        // (1) GPIO merge ran — both SIO bit 25 and external bit 8
+        // appear in `gpio.read_in()`. SIO is applied first, external
+        // last; distinct bits mean both survive.
+        let gpio_in = threaded.shared.gpio.read_in();
+        assert_eq!(
+            gpio_in & (SIO_BIT | EXT_BIT),
+            SIO_BIT | EXT_BIT,
+            "update_gpio must merge SIO + external into gpio_in"
+        );
+
+        // (2) Core 0 SysTick advanced. First quantum: delta=100 via
+        // wrapping_sub, CVR drops from 1000 to 900. Second quantum:
+        // delta=0, CVR stays at 900.
+        let cvr = threaded.core0.as_ref().unwrap().ppb.syst_cvr;
+        assert!(
+            cvr < RVR_INIT,
+            "core 0 systick_cvr must decrement below RVR after run_quanta (cvr={cvr})"
+        );
+
+        // (3) Coord's phase-2 ran — master_cycle advanced by
+        // 2 * step_quantum.
+        let step_q = threaded.step_quantum as u64;
+        assert_eq!(
+            threaded.master_cycle(),
+            2 * step_q,
+            "coordinator phase-2 must advance master_cycle each quantum"
+        );
     }
 }

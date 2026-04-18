@@ -4,28 +4,39 @@
 //! - Bank 0: pins 0..31
 //! - Bank 1: pins 32..47
 //!
-//! All operations use `Relaxed` ordering — GPIO pins are observed
+//! Most operations use `Relaxed` ordering — GPIO pins are observed
 //! asynchronously by the outside world, so no acquire/release
-//! fencing is needed.
+//! fencing is needed. The `external` stimulus field is a packed
+//! `(val, mask)` pair that crosses between the harness writer and the
+//! coordinator's `update_gpio` reader, so it carries a multi-field
+//! invariant and uses `Acquire`/`Release` to preserve atomicity.
 
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU32, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 
 /// Thread-safe GPIO output and output-enable state.
 ///
 /// Two 32-bit banks cover the full 48-pin space.  Bank 1 bits 16..31
 /// are unused on current silicon but allocated per the HLD.
 ///
-/// `in_`, `external_in`, and `external_mask` carry the single-threaded
-/// `Bus::gpio_in` / `Bus::gpio_external_in` / `Bus::gpio_external_mask`
-/// fields into the threaded runtime. Only bank 0 (the low 32 pins) is
-/// represented today — that matches the single-threaded shape on
-/// `Bus` and keeps the seed path straight.
+/// `in_` and `external` carry the single-threaded `Bus::gpio_in` /
+/// `Bus::gpio_external_in` / `Bus::gpio_external_mask` fields into the
+/// threaded runtime. Only bank 0 (the low 32 pins) is represented
+/// today — that matches the single-threaded shape on `Bus` and keeps
+/// the seed path straight.
+///
+/// `external` packs `(val, mask)` as `(high32 = val, low32 = mask)` so
+/// the harness writer and coord's `update_gpio` reader see an atomic
+/// pair — two independent `AtomicU32`s would allow a torn read where
+/// `val` and `mask` come from different writes.
 pub struct AtomicGpio {
     out: [AtomicU32; 2],
     oe: [AtomicU32; 2],
     in_: AtomicU32,
-    external_in: AtomicU32,
-    external_mask: AtomicU32,
+    /// Packed external stimulus: `(val << 32) | mask`.
+    external: AtomicU64,
 }
 
 impl AtomicGpio {
@@ -34,8 +45,7 @@ impl AtomicGpio {
             out: [AtomicU32::new(0), AtomicU32::new(0)],
             oe: [AtomicU32::new(0), AtomicU32::new(0)],
             in_: AtomicU32::new(0),
-            external_in: AtomicU32::new(0),
-            external_mask: AtomicU32::new(0),
+            external: AtomicU64::new(0),
         }
     }
 
@@ -57,12 +67,12 @@ impl AtomicGpio {
         gpio_external_in: u32,
         gpio_external_mask: u32,
     ) -> Self {
+        let external = ((gpio_external_in as u64) << 32) | (gpio_external_mask as u64);
         Self {
             out: [AtomicU32::new(gpio_out), AtomicU32::new(0)],
             oe: [AtomicU32::new(gpio_oe), AtomicU32::new(0)],
             in_: AtomicU32::new(gpio_in),
-            external_in: AtomicU32::new(gpio_external_in),
-            external_mask: AtomicU32::new(gpio_external_mask),
+            external: AtomicU64::new(external),
         }
     }
 
@@ -83,28 +93,27 @@ impl AtomicGpio {
 
     // ---- External-input stimulus (harness pin forcing) ---------------------
 
-    /// Read the external-input stimulus value.
+    /// Read the external-input stimulus `(val, mask)` atomically.
+    ///
+    /// Uses `Acquire` ordering — this carries a multi-field invariant
+    /// across threads (harness writer → coord's `update_gpio` reader),
+    /// unlike the Relaxed accessors on `out`/`oe`/`in_`.
     #[inline]
-    pub fn read_external_in(&self) -> u32 {
-        self.external_in.load(Relaxed)
+    pub fn read_external(&self) -> (u32, u32) {
+        let packed = self.external.load(Acquire);
+        let val = (packed >> 32) as u32;
+        let mask = packed as u32;
+        (val, mask)
     }
 
-    /// Overwrite the external-input stimulus value.
+    /// Overwrite the external-input stimulus `(val, mask)` atomically.
+    ///
+    /// Uses `Release` ordering — pairs with `read_external`'s
+    /// `Acquire` load so the coordinator sees a coherent pair.
     #[inline]
-    pub fn write_external_in(&self, val: u32) {
-        self.external_in.store(val, Relaxed);
-    }
-
-    /// Read the external-input mask.
-    #[inline]
-    pub fn read_external_mask(&self) -> u32 {
-        self.external_mask.load(Relaxed)
-    }
-
-    /// Overwrite the external-input mask.
-    #[inline]
-    pub fn write_external_mask(&self, val: u32) {
-        self.external_mask.store(val, Relaxed);
+    pub fn write_external(&self, val: u32, mask: u32) {
+        let packed = ((val as u64) << 32) | (mask as u64);
+        self.external.store(packed, Release);
     }
 
     // ---- OUT (output value) ------------------------------------------------

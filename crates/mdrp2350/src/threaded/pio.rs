@@ -28,7 +28,7 @@
 //! arbitrarily through the Mutex, which matches real hardware semantics.
 
 use super::spsc::SpscQueue;
-use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 
 pub const PIO_BLOCKS: usize = 3;
@@ -46,6 +46,10 @@ pub struct ThreadedPio {
     sm_enabled: [AtomicU8; PIO_BLOCKS],
     irq_flags: [AtomicU8; PIO_BLOCKS],
     dreq: [AtomicU8; PIO_BLOCKS],
+
+    // Packed pad snapshot: high32 = pad_out, low32 = pad_oe. PIO worker
+    // publishes once per quantum; coordinator reads in `update_gpio`.
+    pads: [AtomicU64; PIO_BLOCKS],
 
     // Cold-path command queue (CPU → PIO thread)
     commands: Mutex<Vec<PioCommand>>,
@@ -103,6 +107,7 @@ impl ThreadedPio {
             sm_enabled: std::array::from_fn(|_| AtomicU8::new(0)),
             irq_flags: std::array::from_fn(|_| AtomicU8::new(0)),
             dreq: std::array::from_fn(|_| AtomicU8::new(0)),
+            pads: std::array::from_fn(|_| AtomicU64::new(0)),
             // Preallocate for the common setup-heavy case (INSTR_MEM 32
             // slots × up to 3 blocks = 96 writes + per-SM setup). Keeps
             // the first-quantum firmware init path from thrashing the
@@ -202,6 +207,20 @@ impl ThreadedPio {
         self.dreq[block].store(val, Relaxed);
     }
 
+    /// Publish the PIO block's `(pad_out, pad_oe)` pair as a single
+    /// atomic so the coordinator never observes a torn snapshot.
+    pub fn write_pads(&self, block: usize, out: u32, oe: u32) {
+        debug_assert!(block < PIO_BLOCKS);
+        self.pads[block].store(((out as u64) << 32) | oe as u64, Release);
+    }
+
+    /// Read the `(pad_out, pad_oe)` snapshot for `block`.
+    pub fn read_pads(&self, block: usize) -> (u32, u32) {
+        debug_assert!(block < PIO_BLOCKS);
+        let p = self.pads[block].load(Acquire);
+        ((p >> 32) as u32, p as u32)
+    }
+
     // --- Command queue ---
 
     /// Queue a cold-path command for the PIO thread to drain. Used for
@@ -243,6 +262,7 @@ impl ThreadedPio {
             self.sm_enabled[block].store(0, Relaxed);
             self.irq_flags[block].store(0, Relaxed);
             self.dreq[block].store(0, Relaxed);
+            self.pads[block].store(0, Release);
         }
         self.commands
             .lock()
