@@ -1802,8 +1802,9 @@ const SLED_DMA_CHAIN_TRIGGER: &[u8] =
 //
 // CPU-bus sled rearchitecture (same rationale as S_DMA1). Setup table
 // releases DMA from reset only. Sled seeds SRAM, programs DMA_TIMER0
-// (0x5000_0420, X=1/Y=10 → fires every 10 sysclks), configures ch0
-// (TREQ_SEL=59), triggers, and polls BUSY until complete.
+// (0x5000_0440 per RP2350 §12.6.6 — not 0x5000_0420 which is the RP2040
+// offset, see Residual C.2.1), with X=1/Y=10 → fires every 10 sysclks,
+// configures ch0 (TREQ_SEL=59), triggers, and polls BUSY until complete.
 //
 // CTRL_TRIG value breakdown (RP2350 field positions — differs from RP2040):
 //   bit 0      : EN = 1
@@ -1817,8 +1818,15 @@ const SLED_DMA_CHAIN_TRIGGER: &[u8] =
 //   bits [16:13]: CHAIN_TO = 0 (ch0 = self = no chain)
 //   bits [22:17]: TREQ_SEL = 59 (0x3B = TIMER0)
 //   → 0x0076_0059
-/// DMA TIMER0 register absolute address (DMA_BASE + 0x420).
-pub const DMA_TIMER0: u32 = DMA_BASE + 0x420;
+/// DMA TIMER0 register absolute address (RP2350 §12.6.6 — `DMA_BASE + 0x440`).
+///
+/// RP2350 inserts INTE2/INTF2/INTS2 (0x424..0x42C) and INTE3/INTF3/INTS3
+/// (0x434..0x43C) into the global-register block, shifting TIMER0..3 from
+/// 0x420..0x42C (RP2040) up by 0x20 bytes to 0x440..0x44C.  Writing to
+/// `DMA_BASE + 0x420` on RP2350 lands in reserved padding (harmless RAZ/WI),
+/// which masked the Residual C.2.1 bug on the emulator before the 2026-04-17
+/// register-offset fix.
+pub const DMA_TIMER0: u32 = DMA_BASE + 0x440;
 const S_DMA_TIMER_PACED: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
 ];
@@ -1842,16 +1850,16 @@ const O_DMA_TIMER_PACED: &[(u32, u32)] = &[
 //   r4 — config / address scratch
 //   r5 — source SRAM address (0x2000_0A00)
 //
-// DMA_TIMER0 = 0x5000_0420 — cannot reach with a simple [r1,#imm5*4]
-// (0x420/4=264 > imm5_max=31), so we build the address in r2 explicitly
-// and use str r4,[r2,#0].
+// DMA_TIMER0 = 0x5000_0440 (RP2350 §12.6.6) — cannot reach with a simple
+// [r1,#imm5*4] (0x440/4=272 > imm5_max=31), so we build the address in r2
+// explicitly and use str r4,[r2,#0].
 //
 // Key encodings:
 //   MOVW T3: imm16={imm4,i,imm3,imm8}; hw0=F240|(i<<10)|imm4, hw1=(imm3<<12)|(Rd<<8)|imm8
 //   hw1 bit15 MUST be 0; values ≥0x0800 set i=1 in hw0 (→0xF640+imm4).
 //   0x0A00={imm4=0,i=1,imm3=2,imm8=0x00} → hw0=F640, hw1=(2<<12)|(Rd<<8)
 //   0x0B00={imm4=0,i=1,imm3=3,imm8=0x00} → hw0=F640, hw1=(3<<12)|(Rd<<8)
-//   0x0420={imm4=0,i=0,imm3=4,imm8=0x20} → hw0=F240, hw1=(4<<12)|(Rd<<8)|0x20
+//   0x0440={imm4=0,i=0,imm3=4,imm8=0x40} → hw0=F240, hw1=(4<<12)|(Rd<<8)|0x40
 //   0xCAFE={imm4=C,i=1,imm3=2,imm8=FE} → hw0=F6CC(MOVT hw0=F2C0+0x0400+0xC), hw1=0x2xFE
 //   CTRL 0x0076_0059 (TREQ_SEL=59=TIMER0, CHAIN_TO=0=self=no chain, RP2350):
 //     low16=0x0059: imm4=0,i=0,imm3=0,imm8=0x59 → hw0=F240, hw1=(Rd<<8)|0x59
@@ -1880,9 +1888,13 @@ const SLED_DMA_TIMER_PACED_HW: [u16; 49] = [
     0x0100, //  [15] movw r1, #0x0000 hw1
     0xF2C5, //  [16] movt r1, #0x5000 hw0
     0x0100, //  [17] movt r1, #0x5000 hw1
-    // ---- write DMA_TIMER0 = 0x0001_000A (r2 = 0x5000_0420) ---------------
-    0xF240, //  [18] movw r2, #0x0420 hw0   (imm3=4,imm8=0x20)
-    0x4220, //  [19] movw r2, #0x0420 hw1   (Rd=2)
+    // ---- write DMA_TIMER0 = 0x0001_000A (r2 = 0x5000_0440) ---------------
+    // RP2350 §12.6.6: DMA_TIMER0 is at DMA_BASE+0x440, not 0x420 (RP2040).
+    // MOVW r2, #0x0440: imm4=0,i=0,imm3=4,imm8=0x40
+    //   hw0 = 0xF240 | (0<<10) | 0 = 0xF240
+    //   hw1 = (4<<12) | (2<<8) | 0x40 = 0x4240
+    0xF240, //  [18] movw r2, #0x0440 hw0   (imm3=4,imm8=0x40)
+    0x4240, //  [19] movw r2, #0x0440 hw1   (Rd=2)
     0xF2C5, //  [20] movt r2, #0x5000 hw0
     0x0200, //  [21] movt r2, #0x5000 hw1   (Rd=2)
     0x240A, //  [22] movs r4, #0x0A         ; r4 low = 10 (Y=10)
@@ -3140,6 +3152,20 @@ mod tests {
         assert_eq!(emu.mmio_read32(0x2000_0B0C), 0xCAFE_0004, "word 3");
         // DMA INTR bit 0 must be set.
         assert_ne!(emu.mmio_read32(DMA_INTR) & 0x0000_0001, 0, "DMA INTR bit 0");
+        // Residual C.2.1: verify the sled programmed TIMER0 at the correct
+        // RP2350 offset (0x440), not the RP2040 legacy offset (0x420).  Pre-fix
+        // both the sled and the emulator matched at 0x420, masking the silicon
+        // failure — this is the test pin that catches a revert.
+        assert_eq!(
+            emu.mmio_read32(0x5000_0440),
+            (1u32 << 16) | 10,
+            "sled must programme TIMER0 at RP2350 offset 0x440 (X=1,Y=10)"
+        );
+        assert_eq!(
+            emu.mmio_read32(0x5000_0420),
+            0,
+            "RP2040 legacy TIMER0 offset must remain unmapped (read-as-zero on RP2350)"
+        );
     }
 
     /// Drive every red-path scenario through the same EMU-side

@@ -69,23 +69,43 @@ const CH_AL3_READ_ADDR_TRIG: u32 = 0x3C;
 const CH_DBG_CTDREQ_OFFSET: u32 = 0x800;
 
 // Global registers (RP2350 datasheet §12.6.6).
+//
+// RP2350 inserts two new IRQ groups vs RP2040 — INTE2/INTF2/INTS2 at
+// 0x424..0x42C and INTE3/INTF3/INTS3 at 0x434..0x43C — which shifts
+// every register from 0x420 onward up by 0x20 bytes relative to the
+// RP2040 layout.  Pre-fix this file inherited the RP2040 offsets
+// wholesale (commit 4cc7906) and `dma_timer_paced` ran green on the
+// emulator while failing on silicon: the sled's write to 0x5000_0420
+// hit reserved padding, the real TIMER0 at 0x5000_0440 stayed at
+// reset, DREQ_TIMER0 never asserted, BUSY never cleared (Residual
+// C.2.1, 2026-04-17).
 const REG_INTR: u32 = 0x400;
 const REG_INTE0: u32 = 0x404;
 const REG_INTF0: u32 = 0x408;
 const REG_INTS0: u32 = 0x40C;
+// 0x410 reserved.
 const REG_INTE1: u32 = 0x414;
 const REG_INTF1: u32 = 0x418;
 const REG_INTS1: u32 = 0x41C;
-const REG_TIMER0: u32 = 0x420;
-const REG_TIMER1: u32 = 0x424;
-const REG_TIMER2: u32 = 0x428;
-const REG_TIMER3: u32 = 0x42C;
-const REG_MULTI_CHAN_TRIGGER: u32 = 0x430;
-const REG_SNIFF_CTRL: u32 = 0x434;
-const REG_SNIFF_DATA: u32 = 0x438;
-const REG_FIFO_LEVELS: u32 = 0x440;
-const REG_CHAN_ABORT: u32 = 0x444;
-const REG_N_CHANNELS: u32 = 0x448;
+// 0x420 reserved (RP2040 TIMER0 lived here — shifted to 0x440 on RP2350).
+const REG_INTE2: u32 = 0x424;
+const REG_INTF2: u32 = 0x428;
+const REG_INTS2: u32 = 0x42C;
+// 0x430 reserved.
+const REG_INTE3: u32 = 0x434;
+const REG_INTF3: u32 = 0x438;
+const REG_INTS3: u32 = 0x43C;
+const REG_TIMER0: u32 = 0x440;
+const REG_TIMER1: u32 = 0x444;
+const REG_TIMER2: u32 = 0x448;
+const REG_TIMER3: u32 = 0x44C;
+const REG_MULTI_CHAN_TRIGGER: u32 = 0x450;
+const REG_SNIFF_CTRL: u32 = 0x454;
+const REG_SNIFF_DATA: u32 = 0x458;
+// 0x45C reserved.
+const REG_FIFO_LEVELS: u32 = 0x460;
+const REG_CHAN_ABORT: u32 = 0x464;
+const REG_N_CHANNELS: u32 = 0x468;
 
 // CTRL bit fields (RP2350 datasheet §12.6.6 CH0_CTRL_TRIG).
 //
@@ -249,6 +269,14 @@ pub struct Dma {
     inte1: u32,
     intf0: u32,
     intf1: u32,
+    /// INTE2/INTF2/INTE3/INTF3: storage-only per Residual C.2.1.  Reads
+    /// of INTS2/INTS3 return `(intr | intfN) & inteN` so firmware's
+    /// read-modify-write sequences round-trip correctly.  **Not** routed
+    /// to NVIC IRQ_DMA_IRQ_2 / IRQ_DMA_IRQ_3 — tracked in `tech_debt.md`.
+    inte2: u32,
+    inte3: u32,
+    intf2: u32,
+    intf3: u32,
     timer: [u32; 4],
     /// Fractional accumulators for the four DMA-internal pacing timers
     /// (TREQ 59..62). Each timer's register is `X[31:16]:Y[15:0]`;
@@ -287,6 +315,10 @@ impl Dma {
             inte1: 0,
             intf0: 0,
             intf1: 0,
+            inte2: 0,
+            inte3: 0,
+            intf2: 0,
+            intf3: 0,
             timer: [0; 4],
             timer_accum: [0; 4],
             timer_dreq_asserted: [false; 4],
@@ -345,6 +377,16 @@ impl Dma {
             REG_INTF1 => self.intf1,
             REG_INTS0 => (self.intr | self.intf0) & self.inte0,
             REG_INTS1 => (self.intr | self.intf1) & self.inte1,
+            // IRQ2/IRQ3: storage-only (Residual C.2.1).  Read-side
+            // produces the same pattern as IRQ0/IRQ1 so firmware
+            // read-modify-write sequences round-trip, but route_irqs
+            // does not fan these out to NVIC (tracked in tech_debt.md).
+            REG_INTE2 => self.inte2,
+            REG_INTE3 => self.inte3,
+            REG_INTF2 => self.intf2,
+            REG_INTF3 => self.intf3,
+            REG_INTS2 => (self.intr | self.intf2) & self.inte2,
+            REG_INTS3 => (self.intr | self.intf3) & self.inte3,
             REG_TIMER0 => self.timer[0],
             REG_TIMER1 => self.timer[1],
             REG_TIMER2 => self.timer[2],
@@ -401,6 +443,21 @@ impl Dma {
                 self.intr &= !bits;
             }
             REG_INTS1 => {
+                let bits = apply_alias(0, value, alias);
+                self.intr &= !bits;
+            }
+            // IRQ2/IRQ3 storage-only writes (Residual C.2.1).  Same RMW
+            // semantics as IRQ0/IRQ1 so firmware round-trips but no
+            // NVIC fan-out (tracked in tech_debt.md).
+            REG_INTE2 => self.inte2 = apply_alias(self.inte2, value, alias) & CHANNEL_MASK,
+            REG_INTE3 => self.inte3 = apply_alias(self.inte3, value, alias) & CHANNEL_MASK,
+            REG_INTF2 => self.intf2 = apply_alias(self.intf2, value, alias) & CHANNEL_MASK,
+            REG_INTF3 => self.intf3 = apply_alias(self.intf3, value, alias) & CHANNEL_MASK,
+            REG_INTS2 => {
+                let bits = apply_alias(0, value, alias);
+                self.intr &= !bits;
+            }
+            REG_INTS3 => {
                 let bits = apply_alias(0, value, alias);
                 self.intr &= !bits;
             }
@@ -762,6 +819,44 @@ mod tests {
         // DATA_SIZE=3 -> fallback 4
         ch.ctrl = 3 << CTRL_DATA_SIZE_SHIFT;
         assert_eq!(ch.transfer_size(), 4);
+    }
+
+    // ----------------------------------------------------------------
+    // RP2350 DMA global-register offsets: regression guard.
+    //
+    // RP2350 §12.6.6 shifts the entire global-register block up by
+    // 0x20 bytes vs RP2040 because it inserts INTE2/INTF2/INTS2 at
+    // 0x424..0x42C and INTE3/INTF3/INTS3 at 0x434..0x43C.  TIMER0..3
+    // therefore moves from `0x420..0x42C` (RP2040) to `0x440..0x44C`
+    // (RP2350), MULTI_CHAN_TRIGGER from 0x430 to 0x450, and so on.
+    //
+    // Pre-fix the emulator inherited the RP2040 offsets wholesale
+    // during Phase 3 (commit 4cc7906), which made `dma_timer_paced`
+    // run green here while failing on silicon (BKPT timeout with
+    // BUSY never clearing, because the sled's write to 0x5000_0420
+    // landed in reserved padding and the real TIMER0 at 0x5000_0440
+    // stayed at reset 0).  Residual C.2.1 (2026-04-17).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn dma_timer0_register_is_at_rp2350_offset_not_rp2040() {
+        assert_eq!(REG_TIMER0, 0x440, "TIMER0 must be at RP2350 offset 0x440");
+        assert_eq!(REG_TIMER1, 0x444);
+        assert_eq!(REG_TIMER2, 0x448);
+        assert_eq!(REG_TIMER3, 0x44C);
+        assert_eq!(REG_MULTI_CHAN_TRIGGER, 0x450);
+        assert_eq!(REG_SNIFF_CTRL, 0x454);
+        assert_eq!(REG_SNIFF_DATA, 0x458);
+        assert_eq!(REG_FIFO_LEVELS, 0x460);
+        assert_eq!(REG_CHAN_ABORT, 0x464);
+        assert_eq!(REG_N_CHANNELS, 0x468);
+        // New RP2350 IRQ2/IRQ3 slots: storage-only in the V1 model.
+        assert_eq!(REG_INTE2, 0x424);
+        assert_eq!(REG_INTF2, 0x428);
+        assert_eq!(REG_INTS2, 0x42C);
+        assert_eq!(REG_INTE3, 0x434);
+        assert_eq!(REG_INTF3, 0x438);
+        assert_eq!(REG_INTS3, 0x43C);
     }
 
     // ----------------------------------------------------------------
@@ -1345,8 +1440,24 @@ mod tests {
             bus.write32(src + i * 4, 0xF000_0000 + i, 0);
         }
 
+        // Residual C.2.1 regression guard: the RP2040 legacy TIMER0 offset
+        // (0x420) must be inert on RP2350.  A write there must not programme
+        // any pacing timer, and the canonical TIMER0 at 0x440 must still read
+        // back zero until explicitly programmed.
+        bus.write32(DMA_BASE + 0x420, 0xDEAD_BEEF, 0);
+        assert_eq!(
+            bus.read32(DMA_BASE + REG_TIMER0, 0),
+            0,
+            "write to RP2040-legacy offset 0x420 must not leak into RP2350 TIMER0 at 0x440"
+        );
+
         // Program DMA TIMER0: X=1, Y=10 → fires every 10 sysclks.
         bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 10, 0);
+        assert_eq!(
+            bus.read32(DMA_BASE + REG_TIMER0, 0),
+            (1u32 << 16) | 10,
+            "TIMER0 at RP2350 offset 0x440 must take the programmed value"
+        );
 
         bus.write32(DMA_BASE + 0x00, src, 0);
         bus.write32(DMA_BASE + 0x04, dst, 0);

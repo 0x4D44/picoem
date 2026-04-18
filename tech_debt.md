@@ -2,6 +2,33 @@
 
 Items discovered during development that need addressing in later phases.
 
+## RP2350 DMA IRQ2/IRQ3 routing not modelled
+
+**Context:** Residual C.2.1 (`wrk_docs/2026.04.17 - HLD - Residual C.2.1 DMA
+Timer Paced Fix.md`) shifted the DMA global-register block to the correct
+RP2350 offsets and added `INTE2/INTF2/INTS2` and `INTE3/INTF3/INTS3` as
+read/write storage in `crates/mdrp2350/src/dma.rs`. Reads return the same
+pattern as IRQ0/IRQ1 (`(intr | intfN) & inteN`) so firmware read-modify-write
+sequences round-trip, but the controller does **not** fan these out to the
+NVIC lines `IRQ_DMA_IRQ_2` (12) / `IRQ_DMA_IRQ_3` (13) — `Dma::route_irqs`
+still only dispatches IRQ0 and IRQ1.
+
+**Risk:** any firmware that enables `INTE2` / `INTE3` will silently never
+observe the corresponding NVIC pend. No V1 corpus scenario uses IRQ2/IRQ3
+(`qemu_diff_m33`, silicon oracles, and OneROM glue all route via IRQ0), so
+there is no current test signal. The existing `dma_timer_paced_transfer` /
+sibling DMA silicon scenarios exercise the storage-side (reads/writes
+round-trip) but nothing verifies the NVIC fan-out.
+
+**Fix sketch:** extend `Dma::route_irqs` to pend `IRQ_DMA_IRQ_2` when
+`(intr | intf2) & inte2 != 0` and `IRQ_DMA_IRQ_3` when
+`(intr | intf3) & inte3 != 0`, mirroring the IRQ0/IRQ1 pattern.  Add a
+unit test paralleling `irq_routing_dma_irq0` / `irq_routing_dma_irq1`.
+
+**Status:** deferred. The storage-only stance keeps the blast radius
+bounded for Residual C.2.1 (scope: pacing-timer offset only).  Land this
+alongside the first scenario that actually wires IRQ2/IRQ3.
+
 ## Silicon oracle scenario `pwm_fractional_div` — self-gated sled design
 fails silicon verify (Residual A.2.3 incomplete)
 

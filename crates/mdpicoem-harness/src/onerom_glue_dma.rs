@@ -37,7 +37,11 @@ pub const DMA_WRITE_CYCLES: u8 = 4;
 const PIO_BASES: [u32; 3] = [0x5020_0000, 0x5030_0000, 0x5040_0000];
 
 /// Global `CHAN_ABORT` register offset inside the DMA aperture.
-const DMA_CHAN_ABORT: u32 = 0x444;
+///
+/// RP2350 §12.6.6: CHAN_ABORT is at 0x464, not 0x444 (RP2040). The block
+/// shift comes from the new IRQ2/IRQ3 groups inserted at 0x424..0x42C and
+/// 0x434..0x43C — see Residual C.2.1 (2026-04-17).
+const DMA_CHAN_ABORT: u32 = 0x464;
 
 /// Abort mask: CH0 + CH1 — the two channels the glue pump owns.
 const GLUE_DMA_CHAN_MASK: u32 = (1 << 0) | (1 << 1);
