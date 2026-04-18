@@ -19,7 +19,7 @@
 //
 // Class names for --class:
 //   rv32i-alu rv32i-mem rv32i-misaligned rv32i-branch rv32i-upper
-//   rv32m rv32a rv32c zicsr zifencei csr-sideeffect
+//   rv32m rv32a rv32c zicsr zifencei csr-sideeffect pmp
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -164,10 +164,12 @@ fn parse_class(s: &str) -> Result<RiscvClass, String> {
         "zicsr" => Ok(RiscvClass::Zicsr),
         "zifencei" => Ok(RiscvClass::Zifencei),
         "csr-sideeffect" => Ok(RiscvClass::CsrSideEffect),
+        "pmp" => Ok(RiscvClass::Pmp),
         other => Err(format!(
             "invalid --class value '{other}' (expected one of: \
              rv32i-alu | rv32i-mem | rv32i-misaligned | rv32i-branch | \
-             rv32i-upper | rv32m | rv32a | rv32c | zicsr | zifencei | csr-sideeffect)"
+             rv32i-upper | rv32m | rv32a | rv32c | zicsr | zifencei | \
+             csr-sideeffect | pmp)"
         )),
     }
 }
@@ -247,7 +249,7 @@ fn print_help() {
          qemu_diff_riscv32 --proxy-self-check-only       Run §4.1 proxy self-check and exit\n\n\
          Class names:\n  \
          rv32i-alu | rv32i-mem | rv32i-misaligned | rv32i-branch | rv32i-upper |\n  \
-         rv32m | rv32a | rv32c | zicsr | zifencei | csr-sideeffect"
+         rv32m | rv32a | rv32c | zicsr | zifencei | csr-sideeffect | pmp"
     );
 }
 
@@ -810,6 +812,7 @@ fn dispatch_per_class(
         RiscvClass::Zicsr => riscv_gen::gen_fuzz_zicsr(rng, count),
         RiscvClass::Zifencei => riscv_gen::gen_fuzz_zifencei(rng, count),
         RiscvClass::CsrSideEffect => riscv_gen::gen_fuzz_csr_side_effect(rng, count),
+        RiscvClass::Pmp => riscv_gen::gen_fuzz_pmp(rng, count),
     }
 }
 
@@ -826,6 +829,7 @@ fn class_to_str(c: RiscvClass) -> &'static str {
         RiscvClass::Zicsr => "zicsr",
         RiscvClass::Zifencei => "zifencei",
         RiscvClass::CsrSideEffect => "csr-sideeffect",
+        RiscvClass::Pmp => "pmp",
     }
 }
 
@@ -1004,14 +1008,36 @@ fn run_one_test(
     // accepts `MPP = 0b00`. The CLINT-wired `mip.MTIP` platform
     // artefact is the other major culprit. Both are already in
     // `warl_mask`; we just need to route the comparison through it.
-    // Applies to both the Zicsr class (single CSR instr) and the
-    // CsrSideEffect class (CSR instr followed by a branch).
+    // Applies to the Zicsr class (single CSR instr), the CsrSideEffect
+    // class (CSR instr followed by a branch), and the Pmp class (CSR
+    // write often followed by a read-back csrrs). For Pmp the primary
+    // divergence catcher is actually the second instruction's rd (the
+    // read-back), so we produce an additional hint below for the second
+    // word when it's a csrrs.
     let csr_rd_hint: Option<(u8, u16)> = if matches!(
         tc.class,
-        RiscvClass::Zicsr | RiscvClass::CsrSideEffect
+        RiscvClass::Zicsr | RiscvClass::CsrSideEffect | RiscvClass::Pmp
     ) && !tc.words.is_empty()
     {
         let w = tc.words[0];
+        let opcode = w & 0x7F;
+        if opcode == 0x73 {
+            let funct3 = (w >> 12) & 0b111;
+            if funct3 != 0 && funct3 != 0b100 {
+                let rd = ((w >> 7) & 0x1F) as u8;
+                let csr = ((w >> 20) & 0xFFF) as u16;
+                Some((rd, csr))
+            } else { None }
+        } else { None }
+    } else { None };
+
+    // Secondary hint: if this is a Pmp write-then-read-back pair, also
+    // route the second word's rd through `warl_mask`. The read-back
+    // `csrrs` returns the WARL-stored value (which on the emu side is
+    // post-rounded, on the QEMU side is raw) — without this extra hint,
+    // fuzz diverges on reserved bits and W=1/R=0 patterns.
+    let csr_rd_hint2: Option<(u8, u16)> = if tc.class == RiscvClass::Pmp && tc.words.len() >= 2 {
+        let w = tc.words[1];
         let opcode = w & 0x7F;
         if opcode == 0x73 {
             let funct3 = (w >> 12) & 0b111;
@@ -1029,13 +1055,15 @@ fn run_one_test(
             if uses_proxy && (r == PROXY_SCRATCH || r == REG_GP) {
                 continue;
             }
-            let (q, e) = if let Some((rd, csr)) = csr_rd_hint {
-                if rd == r {
-                    (warl_mask(csr, qemu_regs[r as usize]),
-                     warl_mask(csr, emu_regs[r as usize]))
-                } else {
-                    (qemu_regs[r as usize], emu_regs[r as usize])
-                }
+            // Pick the first applicable CSR hint for this register.
+            // Pmp's secondary hint routes the read-back rd through
+            // `warl_mask`; all other classes only have the primary.
+            let applied = csr_rd_hint
+                .filter(|(rd, _)| *rd == r)
+                .or_else(|| csr_rd_hint2.filter(|(rd, _)| *rd == r));
+            let (q, e) = if let Some((_, csr)) = applied {
+                (warl_mask(csr, qemu_regs[r as usize]),
+                 warl_mask(csr, emu_regs[r as usize]))
             } else {
                 (qemu_regs[r as usize], emu_regs[r as usize])
             };
@@ -1314,6 +1342,32 @@ fn warl_mask(csr: u16, v: u32) -> u32 {
                 if matches!(code, 3 | 7 | 11) { code } else { 0 }
             } else if code <= 7 || code == 11 { code } else { 0 };
             interrupt | legal_code
+        }
+        // PMP — phase-1 (NUM_ENTRIES=1). pmpcfg byte per-byte WARL: mask
+        // reserved bits [6:5] on both sides; round W=1,R=0 → W=0,R=0; zero
+        // out bytes for entries beyond the synthesised count. QEMU virt
+        // rv32 synthesises 16 entries so its side otherwise holds the
+        // written values for bytes 1..; zeroing symmetrically keeps both
+        // sides clean. See `wrk_docs/2026.04.18 - HLD - RISC-V PMP
+        // Coverage V1.md` §4.2.
+        0x3A0..=0x3A3 => {
+            let mut out = 0u32;
+            for byte in 0..4 {
+                let entry_idx = (csr - 0x3A0) as usize * 4 + byte;
+                let b = (v >> (byte * 8)) & 0xFF;
+                let masked = if entry_idx >= 1 { 0 } else { b & 0x9F };
+                // W=1,R=0 is WARL-rounded to W=0,R=0
+                let masked = if (masked & 0b11) == 0b10 { masked & !0b11 } else { masked };
+                out |= masked << (byte * 8);
+            }
+            out
+        }
+        // pmpaddr — entries 1..15 are RAZ on Hazard3 under phase-1
+        // (NUM_ENTRIES=1); QEMU virt holds the written value. Mask both
+        // sides to 0 for those entries.
+        0x3B0..=0x3BF => {
+            let entry_idx = (csr - 0x3B0) as usize;
+            if entry_idx >= 1 { 0 } else { v }
         }
         _ => v,
     }

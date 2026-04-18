@@ -64,11 +64,18 @@ pub enum RiscvClass {
     Zicsr,
     Zifencei,
     CsrSideEffect,
+    /// Physical Memory Protection CSR surface — phase-1 models pmpcfg0
+    /// byte 0 + pmpaddr0 only (NUM_ENTRIES=1). Other pmpcfg/pmpaddr
+    /// addresses are RAZ/WI in both the emu and (via `warl_mask`) the
+    /// QEMU-side read. See
+    /// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md`.
+    Pmp,
 }
 
 impl RiscvClass {
-    /// All eleven variants in a fixed order (matches the LLD §6 table).
-    pub const ALL: [RiscvClass; 11] = [
+    /// All twelve variants in a fixed order (matches the LLD §6 table +
+    /// phase-1 PMP addition).
+    pub const ALL: [RiscvClass; 12] = [
         RiscvClass::Rv32iAlu,
         RiscvClass::Rv32iMem,
         RiscvClass::Rv32iMisalignedMem,
@@ -80,10 +87,19 @@ impl RiscvClass {
         RiscvClass::Zicsr,
         RiscvClass::Zifencei,
         RiscvClass::CsrSideEffect,
+        RiscvClass::Pmp,
     ];
 
     /// Fuzz weight in basis points (sums to 10_000). Per LLD §6 "Fuzz
     /// weight (per `--fuzz N`)".
+    ///
+    /// **Phase-1 scope reduction (2026-04-18):** `Pmp` is weighted at 0 bp
+    /// in the default mixed-class fuzz mix. The CSR model, unit tests, and
+    /// edge cases remain fully wired and the class is still reachable via
+    /// `--class pmp` for phase-2 bring-up / debugging. See the V2 addendum
+    /// in `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` for the
+    /// empirical divergences (pmp_gran granule-masking, L-bit sticky-trap
+    /// fuzz contamination) that motivated the descope.
     pub fn weight_bp(self) -> u32 {
         match self {
             RiscvClass::Rv32iAlu => 3000,
@@ -97,6 +113,8 @@ impl RiscvClass {
             RiscvClass::Zicsr => 800,
             RiscvClass::Zifencei => 200,
             RiscvClass::CsrSideEffect => 300,
+            // Phase-2 scope (see module doc above). Reachable via --class pmp.
+            RiscvClass::Pmp => 0,
         }
     }
 }
@@ -1152,6 +1170,51 @@ pub fn gen_csr_side_effect_edge_cases() -> Vec<RiscvTestCase> {
     out
 }
 
+/// PMP CSR surface (phase-1: pmpcfg0 byte 0 + pmpaddr0). Each edge case
+/// is a single write-then-read-back so the diff lands on `rd` of both
+/// instructions (the read-back is the primary divergence catcher; the
+/// write-side `rd` is the old value). See
+/// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` §4.2.
+///
+/// The phase-1 value pool deliberately excludes L-bit-set patterns: once
+/// L=1 is latched in silicon, only a system reset clears it, and the
+/// emulator's phase-1 model does not implement L-bit handling (deferred
+/// to phase-2).
+pub fn gen_pmp_edge_cases() -> Vec<RiscvTestCase> {
+    let mut out = Vec::with_capacity(16);
+    // Phase-1 WARL probe set. Mirrors the emu-side unit tests in
+    // `core_riscv/tests_p2.rs`.
+    let patterns: &[(&str, u16, u32)] = &[
+        ("pmpcfg0_zero",        0x3A0, 0x0000_0000),
+        ("pmpcfg0_rwx",         0x3A0, 0x0000_0007),
+        ("pmpcfg0_napot",       0x3A0, 0x0000_0018),
+        ("pmpcfg0_napot_rwx",   0x3A0, 0x0000_001F),
+        ("pmpcfg0_tor",         0x3A0, 0x0000_0008),
+        ("pmpcfg0_na4",         0x3A0, 0x0000_0010),
+        ("pmpcfg0_reserved",    0x3A0, 0x0000_0060),
+        ("pmpcfg0_bad_rw",      0x3A0, 0x0000_0002),
+        ("pmpcfg1_unsynth",     0x3A1, 0x0000_00FF),
+        ("pmpaddr0_zero",       0x3B0, 0x0000_0000),
+        ("pmpaddr0_ones",       0x3B0, 0xFFFF_FFFF),
+        ("pmpaddr0_napot_16b",  0x3B0, 0x0008_0007),
+        ("pmpaddr7_unsynth",    0x3B7, 0xDEAD_BEEF),
+    ];
+    for (name, csr, val) in patterns {
+        // csrrw x10, <csr>, x6  ; csrrs x11, <csr>, x0
+        let csrrw = encode_csr(*csr, 6, 1, 10);
+        let csrrs = encode_csr(*csr, 0, 2, 11);
+        out.push(RiscvTestCase {
+            name: format!("pmp_{name}"),
+            words: vec![csrrw, csrrs],
+            reg_pre: vec![(6, *val)],
+            addr_regs: vec![],
+            expect_trap: None,
+            class: RiscvClass::Pmp,
+        });
+    }
+    out
+}
+
 // ============================================================================
 // Fuzz generators
 // ============================================================================
@@ -2063,6 +2126,96 @@ pub fn gen_fuzz_csr_side_effect<R: Rng>(
     out
 }
 
+/// Fuzz generator: PMP (phase-1).
+///
+/// Two instruction patterns per HLD §4.2:
+///   1. Single-CSR write (`csrrw rd, pmp_csr, rs1`)
+///   2. Write-then-read-back (`csrrw rd1, csr, rs1; csrrs rd2, csr, x0`)
+///      — primary divergence catcher; `rd2` must match after WARL
+///      normalisation in `warl_mask`.
+///
+/// Value pool covers all-zeros, all-ones, the RV-priv §3.7.1 valid and
+/// reserved R/W/X cross-product packed into one byte, the reserved-bit
+/// probe, and the illegal W=1/R=0 combination. No L-bit pattern — phase-1
+/// explicitly excludes L (sticky-trap rationale in HLD §5.1).
+///
+/// CSR targets span pmpcfg0..3 and pmpaddr0..7 so the divergence oracle
+/// exercises both synthesised and unsynthesised slots (the latter diff
+/// clean after `warl_mask` zeros both sides).
+pub fn gen_fuzz_pmp<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
+    let mut out = Vec::with_capacity(count);
+    // pmpcfg0..3 (0x3A0..0x3A3) + pmpaddr0..7 (0x3B0..0x3B7).
+    const CSRS: &[u16] = &[
+        0x3A0, 0x3A1, 0x3A2, 0x3A3,
+        0x3B0, 0x3B1, 0x3B2, 0x3B3, 0x3B4, 0x3B5, 0x3B6, 0x3B7,
+    ];
+    // Interesting bit patterns for rs1. Phase-1 hard constraint (HLD
+    // §5.1 Risk 1 + team-lead review clarification 4): **no L-bit (bit 7
+    // of any pmpcfg byte) ever**. Once L=1 is latched the silicon side
+    // drops every subsequent pmpaddr0/pmpcfg0 write — QEMU virt models
+    // this faithfully, so a single stray L=1 pattern early in the fuzz
+    // stream would sink the remaining tests in the run. Emu phase-1
+    // doesn't model L at all, so the divergence is massive and
+    // meaningless. Each value below has bit 7 and bit 15 and bit 23 and
+    // bit 31 clear on every byte (`& 0x7F7F_7F7F`). pmpaddr values are
+    // unconstrained because pmpaddr L-gating is cross-entry via pmpcfg
+    // and phase-1 never touches pmpcfg with L=1.
+    const VALUES: &[u32] = &[
+        0x0000_0000, // all zeros
+        0x7F7F_7F7F, // all-ones with L cleared on every byte
+        0x0000_0007, // R=W=X=1, A=OFF, L=0
+        0x0000_0002, // W=1, R=0 — illegal; WARL rounds to 0
+        0x0000_0060, // reserved bits [6:5]
+        0x0000_0018, // A=NAPOT (11), L=0
+        0x0000_0010, // A=NA4 (10)
+        0x0000_0008, // A=TOR (01)
+        0x0000_001F, // NAPOT + R/W/X
+        0x0000_0067, // reserved + R/W/X probe
+        0x0F0F_0F0F, // 4-byte pmpcfg cross pattern (no L bits set)
+        0x1818_1818, // NAPOT × 4 bytes (no L bits set)
+        0x0800_0000, // typical NAPOT base (pmpaddr)
+        0x2000_0000, // SRAM base (typical bootrom-early pmpaddr)
+        0xDEAD_BEEF, // chaotic pmpaddr
+        0xCAFE_BABE, // chaotic pmpaddr
+        0x0000_007F, // low byte fill without L — pmpcfg0 byte 0 full range
+        0x0000_7F7F, // low half fill without L (bytes 0 and 1)
+    ];
+    for i in 0..count {
+        let csr = CSRS[rng.gen_range(0..CSRS.len())];
+        let val = VALUES[rng.gen_range(0..VALUES.len())];
+        // Mix: 40 % single-CSR write, 60 % write-then-read-back (primary
+        // divergence catcher per HLD §4.2 pattern 2).
+        let read_back = rng.gen_range(0..100_u32) >= 40;
+        let rd1 = rand_gpr(rng);
+        let rs1 = rand_gpr(rng);
+        let csrrw = encode_csr(csr, rs1, 1, rd1);
+        let words = if read_back {
+            // rs1==x0 guarantees csrrs is read-only (no stomping of the
+            // just-written value), and rd2 holds the WARL-normalised view
+            // of what was actually stored.
+            let rd2 = loop {
+                let r = rand_gpr(rng);
+                // Avoid collision with rd1 so both write-old and read-back
+                // values show up in distinct GPR slots.
+                if r != rd1 { break r; }
+            };
+            let csrrs = encode_csr(csr, 0, 2, rd2);
+            vec![csrrw, csrrs]
+        } else {
+            vec![csrrw]
+        };
+        out.push(RiscvTestCase {
+            name: format!("fuzz_pmp_{i}"),
+            words,
+            reg_pre: vec![(rs1, val)],
+            addr_regs: vec![],
+            expect_trap: None,
+            class: RiscvClass::Pmp,
+        });
+    }
+    out
+}
+
 // ============================================================================
 // Top-level composition
 // ============================================================================
@@ -2081,6 +2234,7 @@ pub fn generate_edge_cases() -> Vec<RiscvTestCase> {
     out.extend(gen_zicsr_edge_cases());
     out.extend(gen_zifencei_edge_cases());
     out.extend(gen_csr_side_effect_edge_cases());
+    out.extend(gen_pmp_edge_cases());
     out
 }
 
@@ -2111,6 +2265,7 @@ pub fn generate_fuzz<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
             RiscvClass::Zicsr => gen_fuzz_zicsr(rng, n),
             RiscvClass::Zifencei => gen_fuzz_zifencei(rng, n),
             RiscvClass::CsrSideEffect => gen_fuzz_csr_side_effect(rng, n),
+            RiscvClass::Pmp => gen_fuzz_pmp(rng, n),
         };
         out.extend(chunk);
     }
@@ -2368,6 +2523,27 @@ mod tests {
         check_class(&cs, RiscvClass::CsrSideEffect, false);
     }
 
+    #[test]
+    fn edge_cases_pmp() {
+        let cs = gen_pmp_edge_cases();
+        check_class(&cs, RiscvClass::Pmp, false);
+        // Every PMP edge case is a two-word write-then-read-back pair
+        // (`csrrw` + `csrrs`). Confirm both words hit OPC_SYSTEM and that
+        // the CSR addr falls into the pmpcfg (0x3A0..=0x3A3) or pmpaddr
+        // (0x3B0..=0x3BF) range.
+        for tc in &cs {
+            assert_eq!(tc.words.len(), 2, "pmp edge case must be a write-then-read pair: {}", tc.name);
+            for &w in &tc.words {
+                assert_eq!(w & 0x7F, OPC_SYSTEM, "pmp word not OPC_SYSTEM in {}: 0x{w:08X}", tc.name);
+                let csr = (w >> 20) & 0xFFF;
+                assert!(
+                    (0x3A0..=0x3A3).contains(&csr) || (0x3B0..=0x3BF).contains(&csr),
+                    "pmp csr out of range in {}: 0x{csr:03x}", tc.name
+                );
+            }
+        }
+    }
+
     // --------------------------------------------------------------------
     // New RV32C memory / control-flow fuzz generators (Stage-6 expansion).
     // --------------------------------------------------------------------
@@ -2585,6 +2761,7 @@ mod tests {
         eprintln!("ZICSR={}", gen_zicsr_edge_cases().len());
         eprintln!("ZIFENCEI={}", gen_zifencei_edge_cases().len());
         eprintln!("CSR_SIDE={}", gen_csr_side_effect_edge_cases().len());
+        eprintln!("PMP={}", gen_pmp_edge_cases().len());
         eprintln!("TOTAL={}", generate_edge_cases().len());
     }
 
@@ -2728,6 +2905,9 @@ mod tests {
                 // below handles both.
                 decoded == "zicsr" || decoded == "branch" || decoded == "alu"
             }
+            // PMP fuzz cases are single `csrrw` or paired `csrrw; csrrs`
+            // — both words are zicsr-family per the decoder.
+            RiscvClass::Pmp => decoded == "zicsr",
             // Rv32c words take the `is_compressed` branch in the property
             // test and never reach `class_compatible`, so this arm is
             // unreachable by construction.

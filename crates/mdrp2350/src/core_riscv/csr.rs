@@ -46,6 +46,25 @@ pub(crate) const CSR_MEIPRA:       u16 = 0xBE3;
 pub(crate) const CSR_MEINEXT:      u16 = 0xBE4;
 pub(crate) const CSR_MEICONTEXT:   u16 = 0xBE5;
 
+// Physical Memory Protection (`pmpcfg0..3`, `pmpaddr0..15`) per RV-priv
+// 1.12 §3.7. Phase-1 models the Hazard3 PMP as a CSR register bank only —
+// writes and reads are WARL-modelled but no access-fault enforcement is
+// wired to fetch/load/store (Hazard3 V1 is M-mode only, so PMP enforcement
+// is architecturally a no-op even when set; see
+// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md`).
+//
+// `PMP_NUM_ENTRIES = 1` pins phase-1 to a single synthesised entry
+// (pmpcfg0 byte 0 + pmpaddr0); every other PMP CSR index reads 0 and
+// silently drops writes.
+pub(crate) const CSR_PMPCFG0:   u16 = 0x3A0;
+pub(crate) const CSR_PMPCFG3:   u16 = 0x3A3;
+pub(crate) const CSR_PMPADDR0:  u16 = 0x3B0;
+pub(crate) const CSR_PMPADDR15: u16 = 0x3BF;
+pub(crate) const PMP_NUM_ENTRIES: usize = 1;
+/// pmpcfg reserved bits [6:5] per byte (Smepmp, not implemented by Hazard3)
+/// — masked to zero on write.
+const PMPCFG_RESERVED_BITS: u8 = 0b0110_0000;
+
 /// mstatus writable mask. V1 supports MIE (bit 3), MPIE (bit 7),
 /// MPP (bits [12:11], WARL to 0b11). All other bits (SIE/UIE/MPRV/
 /// Secure-extension bits) read as 0 and ignore writes.
@@ -179,8 +198,27 @@ fn read_csr(hart: &Hazard3, csr: u16, irq_pending: u64) -> Option<u32> {
         CSR_MEIPRA        => hart.xh3irq.read_meipra(),
         CSR_MEINEXT       => hart.xh3irq.read_meinext(irq_pending),
         CSR_MEICONTEXT    => hart.xh3irq.read_meicontext(),
+        // PMP register bank — phase-1 (NUM_ENTRIES=1). Unsynthesised
+        // slots read as 0; synthesised slots return stored (already
+        // WARL-masked) value. See `write_pmp_csr` for WARL rules.
+        csr @ CSR_PMPCFG0..=CSR_PMPCFG3 => read_pmp_cfg(hart, csr),
+        csr @ CSR_PMPADDR0..=CSR_PMPADDR15 => read_pmp_addr(hart, csr),
         _ => return None,
     })
+}
+
+/// Read a `pmpcfg*` CSR. For phase-1 (NUM_ENTRIES=1), only entry 0
+/// (byte 0 of pmpcfg0) is live; all other bytes return 0.
+fn read_pmp_cfg(hart: &Hazard3, csr: u16) -> u32 {
+    let idx = (csr - CSR_PMPCFG0) as usize;
+    hart.csrs.pmpcfg[idx]
+}
+
+/// Read a `pmpaddr*` CSR. For phase-1 (NUM_ENTRIES=1), only index 0 is
+/// live; all others return 0.
+fn read_pmp_addr(hart: &Hazard3, csr: u16) -> u32 {
+    let idx = (csr - CSR_PMPADDR0) as usize;
+    hart.csrs.pmpaddr[idx]
 }
 
 /// Write a CSR. Caller has already trap-gated read-only access; this
@@ -255,8 +293,58 @@ fn write_csr(hart: &mut Hazard3, csr: u16, val: u32, irq_pending: u64) {
         CSR_MEIPRA     => hart.xh3irq.write_meipra(val),
         CSR_MEINEXT    => hart.xh3irq.write_meinext(val, irq_pending),
         CSR_MEICONTEXT => hart.xh3irq.write_meicontext(val, &mut hart.csrs.mie),
+        // PMP register bank — phase-1 (NUM_ENTRIES=1). Writes to any
+        // unsynthesised slot are silently dropped; writes to pmpcfg0
+        // apply per-byte WARL rules (reserved [6:5] cleared, W=1/R=0
+        // rounded to W=0/R=0). pmpaddr0 is fully writable (G=0).
+        csr @ CSR_PMPCFG0..=CSR_PMPCFG3 => write_pmp_cfg(hart, csr, val),
+        csr @ CSR_PMPADDR0..=CSR_PMPADDR15 => write_pmp_addr(hart, csr, val),
         // Read-only constants reached only via the RO-no-op read path;
         // write_csr is not called for them.
         _ => debug_assert!(false, "write_csr called for unsupported CSR {:#x}", csr),
     }
+}
+
+/// Write a `pmpcfg*` CSR. Per HLD §4.1 phase-1:
+///   * entries >= PMP_NUM_ENTRIES — byte write silently dropped (stored
+///     stays zero),
+///   * bits [6:5] cleared (Smepmp reserved, unimplemented by Hazard3),
+///   * W=1,R=0 rounded to W=0,R=0 per vendor spec and RV-priv §3.7.1 (a
+///     write-without-read region is architecturally meaningless).
+///
+/// No L-bit handling in phase-1 (see HLD §4.3 / §5.1 — sticky-trap
+/// deferral).
+fn write_pmp_cfg(hart: &mut Hazard3, csr: u16, val: u32) {
+    let cfg_idx = (csr - CSR_PMPCFG0) as usize;
+    let mut out: u32 = 0;
+    for byte in 0..4 {
+        let entry = cfg_idx * 4 + byte;
+        if entry >= PMP_NUM_ENTRIES {
+            continue; // unsynthesised — leave byte zero
+        }
+        let raw = ((val >> (byte * 8)) & 0xFF) as u8;
+        let masked = warl_pmpcfg_byte(raw);
+        out |= (masked as u32) << (byte * 8);
+    }
+    hart.csrs.pmpcfg[cfg_idx] = out;
+}
+
+/// WARL mask for one pmpcfg byte: clear reserved bits [6:5], then round
+/// W=1,R=0 → W=0,R=0. Idempotent.
+#[inline]
+fn warl_pmpcfg_byte(b: u8) -> u8 {
+    let v = b & !PMPCFG_RESERVED_BITS;
+    // Bits [1:0] = R,W (R=bit0, W=bit1 per RV-priv §3.7.1). Illegal
+    // combination W=1,R=0 → clear both.
+    if (v & 0b11) == 0b10 { v & !0b11 } else { v }
+}
+
+/// Write a `pmpaddr*` CSR. Entries >= PMP_NUM_ENTRIES are silently
+/// dropped. For synthesised entries, G=0 means every bit is writable.
+fn write_pmp_addr(hart: &mut Hazard3, csr: u16, val: u32) {
+    let idx = (csr - CSR_PMPADDR0) as usize;
+    if idx >= PMP_NUM_ENTRIES {
+        return; // unsynthesised — drop
+    }
+    hart.csrs.pmpaddr[idx] = val;
 }

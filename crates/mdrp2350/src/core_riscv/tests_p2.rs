@@ -643,6 +643,99 @@ fn mepc_low_bits_masked() {
 }
 
 // -----------------------------------------------------------------------
+// PMP — phase-1 WARL (NUM_ENTRIES=1; pmpcfg0 byte 0 + pmpaddr0 only).
+// See `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` §6.1.
+// -----------------------------------------------------------------------
+
+const CSR_PMPCFG0_ADDR: u16 = 0x3A0;
+const CSR_PMPCFG1_ADDR: u16 = 0x3A1;
+const CSR_PMPADDR0_ADDR: u16 = 0x3B0;
+const CSR_PMPADDR7_ADDR: u16 = 0x3B7;
+
+#[test]
+fn pmpcfg0_byte0_roundtrip() {
+    let (mut c, mut bus) = fresh();
+    // 0x0F = L=0, A=OFF (00), X=1, W=1, R=1 — valid combination.
+    c.x[1] = 0x0000_000F;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[0], 0x0000_000F, "byte 0 roundtrips a legal R/W/X pattern");
+}
+
+#[test]
+fn pmpcfg0_reserved_bits_raz() {
+    let (mut c, mut bus) = fresh();
+    // 0x60 = bits [6:5] set (Smepmp reserved, RAZ/WI on Hazard3).
+    c.x[1] = 0x0000_0060;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[0], 0, "reserved bits [6:5] mask to zero");
+}
+
+#[test]
+fn pmpcfg0_invalid_rw_rounded() {
+    let (mut c, mut bus) = fresh();
+    // 0x02 = W=1, R=0 — illegal per RV-priv §3.7.1; WARL rounds to 0.
+    c.x[1] = 0x0000_0002;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[0], 0, "W=1,R=0 rounds to W=0,R=0");
+}
+
+#[test]
+fn pmpcfg0_mode_napot_preserved() {
+    let (mut c, mut bus) = fresh();
+    // 0x18 = A=NAPOT (11), L=0, no R/W/X.
+    c.x[1] = 0x0000_0018;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[0], 0x0000_0018, "A=NAPOT pattern preserved");
+}
+
+#[test]
+fn pmpaddr0_full_width_writable() {
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0xFFFF_FFFF;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPADDR0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpaddr[0], 0xFFFF_FFFF, "G=0: all 32 bits writable");
+}
+
+#[test]
+fn pmpcfg1_unsynthesised_wi() {
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0x0000_00FF;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPCFG1_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[1], 0, "unsynthesised pmpcfg1 byte 0 is WI");
+    assert_eq!(c.x[2], 0, "read-side returns 0 for unsynthesised slot");
+}
+
+#[test]
+fn pmpaddr7_unsynthesised_wi() {
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0xDEAD_BEEF;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPADDR7_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpaddr[7], 0, "unsynthesised pmpaddr7 is WI");
+    assert_eq!(c.x[2], 0, "read-side returns 0 for unsynthesised slot");
+}
+
+// -----------------------------------------------------------------------
 // Vectored mtvec
 // -----------------------------------------------------------------------
 
