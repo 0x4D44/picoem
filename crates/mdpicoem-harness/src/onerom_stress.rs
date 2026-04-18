@@ -14,6 +14,7 @@
 //! Design: `wrk_docs/2026.04.17 - HLD - OneROM Stress Harness.md`.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use crate::onerom_serving_oracle::{
     stimulus_level_pub, Case, CaseResult, Verdict, SHADOW_SIZE,
@@ -103,8 +104,9 @@ fn cycles_to_ns(cycles: u32, sys_clk_hz: u32) -> u64 {
 ///
 /// Picks index `ceil(p * n / 100) - 1` clamped to `[0, n - 1]`. `p` is
 /// the percentile in `0..=100`. Caller must ensure `sorted` is not
-/// empty.
-fn nearest_rank(sorted: &[u32], p: u32) -> u32 {
+/// empty. Generic so both cycle counts (`u32`) and wall-clock
+/// nanosecond samples (`u64`) share the same rank logic.
+fn nearest_rank<T: Copy + Ord>(sorted: &[T], p: u32) -> T {
     let n = sorted.len();
     debug_assert!(n > 0, "nearest_rank: empty slice");
     // ceil(p * n / 100) via integer math: (p*n + 99) / 100.
@@ -203,6 +205,100 @@ pub fn compute_histogram(results: &[CaseResult], sys_clk_hz: u32) -> Histogram {
 }
 
 // ---------------------------------------------------------------------------
+// Wall-clock aggregator
+// ---------------------------------------------------------------------------
+
+/// Host wall-clock stats over one sweep.
+///
+/// Unlike [`Histogram`]'s `*_ns` fields — which are *model predictions*
+/// derived from emulated cycle counts × (1 / `sys_clk_hz`) — these are
+/// measurements of the host clock via `Instant::now()` around each
+/// `run_case`. They answer "is this emulator fast enough to drive a
+/// real bus in real time on this machine?", not "would real silicon
+/// meet the ROM's timing envelope?".
+///
+/// All cases contribute regardless of verdict: a failing case still
+/// spent host time and belongs in the throughput denominator. That
+/// differs from [`Histogram`], where only `Verdict::Pass` contributes
+/// (a WrongByte case has no meaningful emulated latency to aggregate,
+/// but it absolutely has wall-clock cost).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WallClockStats {
+    pub count: usize,
+    /// Sum of per-case host durations. Used as the throughput
+    /// denominator; also rendered as "total" in the report.
+    pub total_ns: u64,
+    pub min_ns: u64,
+    pub max_ns: u64,
+    pub mean_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+}
+
+impl WallClockStats {
+    /// Cases per second of host wall-clock, from `count / total_ns`.
+    ///
+    /// Returned as `f64` because the natural scale spans several orders
+    /// of magnitude (fast host: 1e4+ cases/sec; slow emulator: single
+    /// digits). Callers that want an integer render should round.
+    #[must_use]
+    pub fn cases_per_sec(&self) -> f64 {
+        if self.total_ns == 0 {
+            return 0.0;
+        }
+        (self.count as f64) * 1e9 / (self.total_ns as f64)
+    }
+}
+
+/// Aggregate per-case host durations into a [`WallClockStats`].
+///
+/// Empty input returns an all-zero struct. `Duration::as_nanos()`
+/// returns `u128`; we saturate to `u64` — a single case running for
+/// >584 years is not a realistic failure mode, but the saturation
+/// keeps the type narrow for the percentile sort.
+#[must_use]
+pub fn compute_wall_clock_stats(durations: &[Duration]) -> WallClockStats {
+    let count = durations.len();
+    if count == 0 {
+        return WallClockStats {
+            count: 0,
+            total_ns: 0,
+            min_ns: 0,
+            max_ns: 0,
+            mean_ns: 0,
+            p50_ns: 0,
+            p95_ns: 0,
+            p99_ns: 0,
+        };
+    }
+
+    let mut ns: Vec<u64> = durations
+        .iter()
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .collect();
+    let total_ns: u64 = ns.iter().fold(0u64, |acc, &v| acc.saturating_add(v));
+    ns.sort_unstable();
+    let min_ns = *ns.first().unwrap();
+    let max_ns = *ns.last().unwrap();
+    let mean_ns = total_ns / count as u64;
+    let p50_ns = nearest_rank(&ns, 50);
+    let p95_ns = nearest_rank(&ns, 95);
+    let p99_ns = nearest_rank(&ns, 99);
+
+    WallClockStats {
+        count,
+        total_ns,
+        min_ns,
+        max_ns,
+        mean_ns,
+        p50_ns,
+        p95_ns,
+        p99_ns,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Report formatter
 // ---------------------------------------------------------------------------
 
@@ -273,6 +369,7 @@ pub fn format_report(
     rom_set: u8,
     sys_clk_hz: u32,
     hist: &Histogram,
+    wall: &WallClockStats,
     first_fails: &[CaseResult],
 ) -> String {
     let mut out = String::new();
@@ -285,7 +382,10 @@ pub fn format_report(
     writeln!(out, "pass     : {}", hist.pass).unwrap();
     writeln!(out, "fail     : {}", hist.fail).unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "latency (ns):").unwrap();
+    // Model-predicted latency: emulated cycles × 1/sysclk. Only trustworthy
+    // to the extent our cycle model matches silicon — this tool does not
+    // calibrate that, `test_silicon_cycle_oracle_rp2350` does.
+    writeln!(out, "emulated latency (model: cycles x 1/sysclk, uncalibrated) (ns):").unwrap();
     writeln!(out, "  min    : {:>4}", hist.min_ns).unwrap();
     writeln!(out, "  p50    : {:>4}", hist.p50_ns).unwrap();
     writeln!(out, "  mean   : {:>4}", hist.mean_ns).unwrap();
@@ -303,9 +403,41 @@ pub fn format_report(
         .unwrap();
     }
     writeln!(out).unwrap();
+    // Host wall-clock: this is what Instant::now() actually measured on
+    // the machine that ran the sweep. Tells you how close (or far) this
+    // emulator is to real-time, independent of the cycle model.
+    writeln!(out, "wall-clock per case (host-measured, this run) (us):").unwrap();
+    writeln!(out, "  min    : {:>9.3}", ns_to_us_f64(wall.min_ns)).unwrap();
+    writeln!(out, "  p50    : {:>9.3}", ns_to_us_f64(wall.p50_ns)).unwrap();
+    writeln!(out, "  mean   : {:>9.3}", ns_to_us_f64(wall.mean_ns)).unwrap();
+    writeln!(out, "  p95    : {:>9.3}", ns_to_us_f64(wall.p95_ns)).unwrap();
+    writeln!(out, "  p99    : {:>9.3}", ns_to_us_f64(wall.p99_ns)).unwrap();
+    writeln!(out, "  max    : {:>9.3}", ns_to_us_f64(wall.max_ns)).unwrap();
     writeln!(
         out,
-        "ROM speed class: {} (mean {} ns)",
+        "  total  : {:.3} s, throughput: {:.0} cases/sec",
+        (wall.total_ns as f64) / 1e9,
+        wall.cases_per_sec()
+    )
+    .unwrap();
+    // Honesty footer: relate the two blocks so a reader can see at a
+    // glance whether this emulator could replace silicon in real-time.
+    // Ratio > 1 means host is slower than real silicon; ratio < 1 would
+    // mean faster-than-real-time (rare for a cycle-accurate emulator).
+    if hist.pass > 0 && hist.mean_ns > 0 {
+        let ratio = (wall.mean_ns as f64) / (hist.mean_ns as f64);
+        writeln!(
+            out,
+            "  (host is {:.0}x slower than the emulated-model mean; \
+             real-time capability requires ratio ~= 1)",
+            ratio
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "ROM speed class: {} (mean {} ns, model — not calibrated to silicon)",
         rom_speed_class(hist.mean_ns),
         hist.mean_ns
     )
@@ -326,6 +458,14 @@ pub fn format_report(
     }
 
     out
+}
+
+/// Render a nanosecond count as microseconds with f64 precision, for
+/// the wall-clock block. Kept as a tiny helper so the formatter's
+/// arithmetic doesn't sprawl inline.
+#[inline]
+fn ns_to_us_f64(ns: u64) -> f64 {
+    (ns as f64) / 1_000.0
 }
 
 // ---------------------------------------------------------------------------
@@ -535,5 +675,72 @@ mod tests {
             150_000_000,
         );
         assert_eq!(h3.unique_cycles, 4);
+    }
+
+    /// Wall-clock aggregator: empty input → all-zero stats. No
+    /// divide-by-zero, no panic, `cases_per_sec()` returns 0.0 when
+    /// total_ns is 0.
+    #[test]
+    fn wall_clock_stats_of_empty_is_zeroed() {
+        let wc = compute_wall_clock_stats(&[]);
+        assert_eq!(
+            wc,
+            WallClockStats {
+                count: 0,
+                total_ns: 0,
+                min_ns: 0,
+                max_ns: 0,
+                mean_ns: 0,
+                p50_ns: 0,
+                p95_ns: 0,
+                p99_ns: 0,
+            }
+        );
+        assert_eq!(wc.cases_per_sec(), 0.0);
+    }
+
+    /// Wall-clock aggregator: 5 samples at 100/200/300/400/500 ns. Mean
+    /// = 300, total = 1500, throughput = 5 / 1.5 μs = 3 333 333 cases/s.
+    /// p50 via ceil(0.5*5)-1 = idx 2 → 300; p95/p99 → idx 4 → 500.
+    #[test]
+    fn wall_clock_stats_percentiles_nearest_rank() {
+        let durations = vec![
+            Duration::from_nanos(100),
+            Duration::from_nanos(200),
+            Duration::from_nanos(300),
+            Duration::from_nanos(400),
+            Duration::from_nanos(500),
+        ];
+        let wc = compute_wall_clock_stats(&durations);
+        assert_eq!(wc.count, 5);
+        assert_eq!(wc.total_ns, 1500);
+        assert_eq!(wc.min_ns, 100);
+        assert_eq!(wc.max_ns, 500);
+        assert_eq!(wc.mean_ns, 300);
+        assert_eq!(wc.p50_ns, 300);
+        assert_eq!(wc.p95_ns, 500);
+        assert_eq!(wc.p99_ns, 500);
+        // 5 cases / 1.5 μs = 3 333 333.33 cases/sec. Allow a loose
+        // epsilon for f64 rounding.
+        let cps = wc.cases_per_sec();
+        assert!((cps - 3_333_333.33).abs() < 1.0, "cps was {}", cps);
+    }
+
+    /// Wall-clock aggregator: unsorted input must be sorted before
+    /// percentile lookup — feed a reverse-ordered set and check that
+    /// min/max/p50 come out right anyway.
+    #[test]
+    fn wall_clock_stats_sorts_before_percentiles() {
+        let durations = vec![
+            Duration::from_nanos(500),
+            Duration::from_nanos(100),
+            Duration::from_nanos(400),
+            Duration::from_nanos(200),
+            Duration::from_nanos(300),
+        ];
+        let wc = compute_wall_clock_stats(&durations);
+        assert_eq!(wc.min_ns, 100, "min is the smallest, regardless of input order");
+        assert_eq!(wc.max_ns, 500);
+        assert_eq!(wc.p50_ns, 300, "p50 is the middle of the *sorted* set");
     }
 }

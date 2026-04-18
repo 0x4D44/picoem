@@ -16,6 +16,7 @@
 //!   cargo run -p mdpicoem-harness --bin onerom_stress_pio_rp2350 --release
 
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use mdpicoem_harness::{
     onerom_glue_dma, onerom_serving_oracle, onerom_stress, onerom_sync,
@@ -133,15 +134,23 @@ fn main() -> ExitCode {
     // Silent sweep: 2048 cases, no per-case output.
     // `run_case` accumulates into `oracle.results()` — the per-call
     // return value is just a convenience reference we don't need here.
+    // Wall-clock is measured per case via `Instant::now()` so the
+    // report can show host elapsed time alongside the emulated-cycle
+    // model latency. Both cases contribute to the throughput
+    // denominator (failing cases still consume host time).
     let cases = onerom_stress::generate_sweep_cases();
+    let mut wall_durations: Vec<Duration> = Vec::with_capacity(cases.len());
     for case in &cases {
+        let t0 = Instant::now();
         let _ = oracle.run_case(&mut emu, &mut glue, *case);
+        wall_durations.push(t0.elapsed());
     }
 
     // Histogram + first-N failures.
     let sys_clk_hz = emu.bus.sys_clk_hz();
     let results = oracle.results();
     let hist = onerom_stress::compute_histogram(results, sys_clk_hz);
+    let wall = onerom_stress::compute_wall_clock_stats(&wall_durations);
 
     let fails: Vec<onerom_serving_oracle::CaseResult> = results
         .iter()
@@ -158,6 +167,7 @@ fn main() -> ExitCode {
             ROM_SET_INDEX,
             sys_clk_hz,
             &hist,
+            &wall,
             &fails,
         )
     );
