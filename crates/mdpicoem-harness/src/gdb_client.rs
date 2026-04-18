@@ -134,8 +134,19 @@ impl QemuProfile {
     /// F/D removes the FPR block from the GDB register map so the `g`/`G`
     /// packet stays at 132 bytes (33 × u32 = GPRs + PC).
     pub const RISCV32_RP2350: Self = Self {
-        machine: "none",
-        cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,f=false,d=false",
+        // `-machine virt` — `-machine none` does not automatically map any
+        // RAM, and QEMU 10.2's `-device loader,file=...` does not create a
+        // memory region either: writes to `0x2000_0000` return `E14`
+        // (unmapped). The `virt` machine's RAM region is large enough to
+        // cover both its default base (`0x8000_0000`) and our chosen splice
+        // point (`0x2000_0000`) via the stub's fallback-to-RAM semantics, so
+        // splicing the test stream at `0x2000_0100` works cleanly.
+        //
+        // `zfa=false` is required with `f=false` on QEMU 10.2 — the Zfa
+        // extension defaults to true and otherwise trips "Zfa extension
+        // requires F extension" at spawn time.
+        machine: "virt",
+        cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,f=false,d=false,zfa=false",
         gdb_port: 3335,
         bios: Some("none"),
         loader_addr: Some(0x2000_0000),

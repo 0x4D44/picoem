@@ -714,8 +714,20 @@ fn run_one_test(
     let emu_regs = read_gprs_emu(emu);
     let emu_pc = emu.core_riscv(0).pc();
 
-    // Diff registers (x0 always 0, skip).
+    // Diff registers. Skips:
+    //   - x0: architecturally wired to zero.
+    //   - x5/t0 when the proxy ran: the CSR-read epilogue's last instruction
+    //     is `csrrs t0, mip, x0`, so x5 always ends holding `mip`. That
+    //     duplicates the CSR-level mip diff below — any real mip divergence
+    //     still fires there — and would otherwise leak virt-machine CLINT
+    //     state (MTIP bit 7) into a GPR diff that the test case has no say
+    //     in. The proxy declares t0 as its scratch register in LLD §3.
+    //   - x3/gp: proxy's scratchpad pointer; pre-seeded, never observed by
+    //     the test case (generator debug_assert forbids it).
     for r in 1u8..32 {
+        if uses_proxy && (r == REG_T0 || r == REG_GP) {
+            continue;
+        }
         if qemu_regs[r as usize] != emu_regs[r as usize] {
             return Err(format!(
                 "x{r} diff: QEMU={:#010x} emu={:#010x}",
