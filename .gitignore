@@ -19,6 +19,9 @@ third_party/picogus/*.uf2
 third_party/picogus/*.bin
 third_party/picogus/*.exe
 third_party/picogus/UPSTREAM_README.md
+# upstream/ is a local git clone of the PicoGUS source for reference
+# during firmware-diff sessions — not redistributed, local-only.
+third_party/picogus/upstream/
 
 # samply / profiling scratch output: keep these out of git regardless of
 # location so a stray run in repo root doesn't pollute commits.
