@@ -45,11 +45,52 @@ fn pll_write_into(regs: &mut [u32; 4], offset: u32, val: u32, alias: u32) {
 
 impl Bus {
     // --- SYSINFO (0x40000000) — read-only ---
+    //
+    // RP2350 datasheet §12.11. Four documented read-only registers. Field
+    // layout and the `MANUFACTURER_RPI` / `PART_RP4` constants below are
+    // lifted verbatim from the pico-sdk master headers:
+    //
+    //   https://raw.githubusercontent.com/raspberrypi/pico-sdk/master/src/
+    //       rp2350/hardware_regs/include/hardware/regs/sysinfo.h
+    //   https://raw.githubusercontent.com/raspberrypi/pico-sdk/master/src/
+    //       rp2350/pico_platform/platform.c   (rp2350_chip_version)
+    //
+    //   0x00 CHIP_ID      — REVISION[31:28] | PART[27:12]
+    //                       | MANUFACTURER[11:1] | STOP_BIT[0]
+    //   0x04 PACKAGE_SEL  — 0 = RP2350A (QFN60), 1 = RP2350B (QFN80)
+    //   0x08 PLATFORM     — bit 0 = FPGA, bit 1 = ASIC
+    //   0x14 GITREF_RP2350 — 32-bit git-sha prefix (chip-revision-specific)
+    //
+    // The REVISION nibble and GITREF word are chip-revision-specific and
+    // not captured in the SDK headers; Stage 5 silicon pre-flight per
+    // Coverage Gap Fill V11 HLD §3.1/§8 reads them from Arthur's RP2354
+    // and updates this match arm + the matching silicon scenario mask in
+    // lockstep.
     pub(crate) fn sysinfo_read(&self, offset: u32) -> u32 {
         match offset {
-            0x000 => 0x0000_0002, // CHIP_ID: RP2350
-            0x004 => 0x0000_0000, // PACKAGE_SEL: RP2350A (QFN60)
-            0x008 => 0x0000_0001, // PLATFORM: ASIC
+            // CHIP_ID: assembled from the SDK-authoritative field layout
+            // above. JEP-106 encoding places the JEDEC continuation "stop
+            // bit" at [0]; the RPi JEDEC code 0x926 occupies [11:1].
+            //   REVISION[31:28] = 0    (blank — Stage 5 fills nibble)
+            //   PART[27:12]     = 0x4  (PART_RP4; pico-sdk platform.c)
+            //   MANUFACTURER[11:1] = 0x926 (MANUFACTURER_RPI; same file)
+            //   STOP_BIT[0]     = 1    (SYSINFO_CHIP_ID_STOP_BIT_RESET)
+            // => (0x4 << 12) | (0x926 << 1) | 0x1 = 0x0000_524D.
+            // The silicon-scenario observe mask on this word is 0x0FFF_FFFF
+            // so that the REV nibble is ignored until Stage 5 pre-flight.
+            0x000 => 0x0000_524D,
+            // PACKAGE_SEL: RP2350A (Pico 2 baseline). Datasheet §12.11.2
+            // and SDK `SYSINFO_PACKAGE_SEL_RESET = 0x0`.
+            0x004 => 0x0000_0000,
+            // PLATFORM: value from LLD drafts 2026-04-13; pre-flight in
+            // Stage 5 will confirm against silicon. Datasheet §12.11.3.
+            // Note: SDK header `SYSINFO_PLATFORM_RESET = 0x0`, but that's
+            // the register-description reset, not the silicon-observed
+            // value — real ASIC silicon is expected to read bit 1 set.
+            0x008 => 0x0000_0001,
+            // GITREF_RP2350: placeholder until Stage 5 silicon pre-flight.
+            // Datasheet §12.11.4. SDK header does not define a RESET macro.
+            0x014 => 0x0000_0000,
             _ => 0,
         }
     }
@@ -407,18 +448,6 @@ impl Bus {
 #[cfg(test)]
 mod tests {
     use crate::bus::Bus;
-
-    #[test]
-    fn test_sysinfo_chip_id() {
-        let mut bus = Bus::new();
-        assert_eq!(bus.read32(0x4000_0000, 0), 0x0000_0002);
-    }
-
-    #[test]
-    fn test_sysinfo_platform() {
-        let mut bus = Bus::new();
-        assert_eq!(bus.read32(0x4000_0008, 0), 0x0000_0001);
-    }
 
     #[test]
     fn test_resets_default_post_bootrom_state() {

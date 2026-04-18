@@ -9373,3 +9373,49 @@ fn mtime_stays_zero_at_post_reset_matches_silicon() {
         "MTIME must not advance without TICKS.RISCV configuration \
          (silicon reads 0 at this scenario gate)");
 }
+
+// ============================================================================
+// SYSINFO read-only register readback
+// ============================================================================
+//
+// RP2350 datasheet §12.11 SYSINFO. Four documented read-only registers.
+// Field layout and constants from pico-sdk master
+// (src/rp2350/hardware_regs/include/hardware/regs/sysinfo.h +
+//  src/rp2350/pico_platform/platform.c):
+//
+//   0x00 CHIP_ID      — REVISION[31:28] | PART[27:12]
+//                       | MANUFACTURER[11:1] | STOP_BIT[0]
+//   0x04 PACKAGE_SEL  — 0 = RP2350A QFN60, 1 = RP2350B QFN80
+//   0x08 PLATFORM     — bit 0 = FPGA, bit 1 = ASIC
+//   0x14 GITREF_RP2350 — 32-bit git-sha prefix baked into silicon
+//
+// SYSINFO sits at APB base 0x4000_0000. It is not reset-gated at the bus
+// fabric (see `reset_bit_for_base`) so a fresh `Bus` exposes the values
+// immediately. The matching silicon scenario (`sysinfo_readonly_fields`
+// in `silicon_scenarios.rs`) captures the same words against real silicon
+// and diffs — CHIP_ID's REV nibble is masked on that path until Stage 5
+// pre-flight records the chip-revision-specific value per the Coverage
+// Gap Fill V11 HLD §3.1 / §8.
+
+#[test]
+fn sysinfo_reads_hardcoded_readonly_fields() {
+    let (_, mut bus) = core_and_bus();
+    // CHIP_ID: REV=0 (blank — Stage 5 pre-flight fills nibble),
+    //          PART=0x4 (PART_RP4), MAN=0x926 (MANUFACTURER_RPI),
+    //          STOP_BIT=1. Assembled: (0x4<<12)|(0x926<<1)|0x1 = 0x0000_524D.
+    assert_eq!(bus.read32(0x4000_0000), 0x0000_524D,
+        "SYSINFO.CHIP_ID: expected PART_RP4 | MANUFACTURER_RPI | STOP_BIT \
+         (REV=0, Stage 5 pre-flight confirms REV nibble)");
+    // PACKAGE_SEL: 0 = RP2350A QFN60 (Pico 2 baseline).
+    assert_eq!(bus.read32(0x4000_0004), 0x0000_0000,
+        "SYSINFO.PACKAGE_SEL: RP2350A");
+    // PLATFORM: value from LLD drafts 2026-04-13; Stage 5 pre-flight
+    // will confirm against silicon.
+    assert_eq!(bus.read32(0x4000_0008), 0x0000_0001,
+        "SYSINFO.PLATFORM: LLD-draft value (pre-flight pending)");
+    // GITREF_RP2350: chip-revision-specific 32-bit constant. Emulator
+    // exposes 0 as a placeholder; Stage 5 silicon pre-flight records the
+    // true value and re-adds the silicon-scenario observe entry.
+    assert_eq!(bus.read32(0x4000_0014), 0x0000_0000,
+        "SYSINFO.GITREF_RP2350: placeholder (silicon pre-flight pending)");
+}

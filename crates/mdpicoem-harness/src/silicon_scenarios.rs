@@ -133,6 +133,41 @@ pub struct PeriphScenario {
 // Scenarios
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// SYSINFO read-only fields (Coverage Gap Fill V11 §3.1 Bucket A item 1)
+// ---------------------------------------------------------------------------
+//
+// RP2350 datasheet §12.11. Read each documented SYSINFO u32 at reset and
+// diff against the emulator's hardcoded values in `sysinfo_read`
+// (`crates/mdrp2350/src/bus/peripherals.rs:48`). SYSINFO is not reset-
+// gated on either side, so no setup is required beyond the oracle's
+// `release_common_resets` baseline.
+//
+// Observed words:
+//   0x00 CHIP_ID        — mask 0x0FFF_FFFF covers MANUFACTURER+PART+STOP_BIT
+//                          from pico-sdk master; REV nibble [31:28] is
+//                          masked out until Stage 5 pre-flight captures
+//                          the chip-revision-specific value from Arthur's
+//                          RP2354 (V11 HLD §8).
+//   0x04 PACKAGE_SEL    — full u32.
+//   0x08 PLATFORM       — full u32 (bits 0 FPGA, 1 ASIC).
+//   GITREF not observed — Stage 5 pre-flight adds the entry with the
+//                          chip-specific value and a full mask.
+pub const SYSINFO_BASE: u32 = 0x4000_0000;
+pub const SYSINFO_CHIP_ID_OFF: u32 = 0x00;
+pub const SYSINFO_PACKAGE_SEL_OFF: u32 = 0x04;
+pub const SYSINFO_PLATFORM_OFF: u32 = 0x08;
+pub const SYSINFO_GITREF_RP2350_OFF: u32 = 0x14;
+
+// No setup needed: SYSINFO is not reset-gated; release_common_resets() is sufficient.
+const S_SYSINFO_READONLY_FIELDS: &[(u32, u32)] = &[];
+const O_SYSINFO_READONLY_FIELDS: &[(u32, u32)] = &[
+    // REV nibble [31:28] masked out until Stage 5 pre-flight.
+    (SYSINFO_BASE + SYSINFO_CHIP_ID_OFF, 0x0FFF_FFFF),
+    (SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFF, 0xFFFF_FFFF),
+    (SYSINFO_BASE + SYSINFO_PLATFORM_OFF, 0xFFFF_FFFF),
+];
+
 // S1: PIO0 SM0 runs `JMP 0` in a one-instruction loop. Positive
 // control — ADDR never advances past 0, HW and EMU MUST agree.
 const S_PIO0_NOP_LOOP: &[(u32, u32)] = &[
@@ -1395,6 +1430,19 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         setup: S_PIO0_INT_ROUTING_SPLIT,
         max_sysclks: 100,
         observe: O_PIO0_INT_ROUTING_SPLIT,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Coverage Gap Fill V11 §3.1 Bucket A item 1 — SYSINFO read-only
+    // fields. Four documented u32s; no setup beyond the runner's
+    // baseline `release_common_resets`. The countdown sled only needs
+    // enough cycles to cover the 4 register probes; pick a small budget.
+    PeriphScenario {
+        name: "sysinfo_readonly_fields",
+        setup: S_SYSINFO_READONLY_FIELDS,
+        max_sysclks: 100,
+        observe: O_SYSINFO_READONLY_FIELDS,
         observe_pins: 0,
         custom_sled: None,
         min_sysclks: 0,
