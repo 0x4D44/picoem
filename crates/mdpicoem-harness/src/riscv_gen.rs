@@ -124,6 +124,13 @@ impl RiscvClass {
 /// absolute address.
 pub const SCRATCH_BASE: u32 = 0x8000_0400;
 
+/// Trap-handler stub slot (see harness LLD §4 / test_rp2350_qemu_diff_riscv32).
+/// The handler occupies `TRAP_STUB..TRAP_STUB+0x14` (5 instrs); its
+/// terminal `ebreak` sits at `TRAP_STUB + 16`. Edge-case generators that
+/// want to land a JALR on a known-trapping target read this value rather
+/// than hard-coding it, so the binary and the generator cannot drift.
+pub const TRAP_STUB: u32 = 0x8000_0200;
+
 /// Reservable SRAM range (RP2350 §2.1.6.2) — atomics must be in this
 /// window or Hazard3 traps. Keep atomics strictly inside it.
 pub const RESERVABLE_LO: u32 = 0x2000_0000;
@@ -489,37 +496,72 @@ pub fn gen_rv32i_misaligned_mem_edge_cases() -> Vec<RiscvTestCase> {
     out
 }
 
-/// 10% fuzz weight; ~25 edge cases. All 6 conditional branches + JAL /
-/// JALR at near/far offsets.
+/// 10% fuzz weight; ~25 edge cases. All 6 conditional branches + JAL at
+/// short offsets. Out-of-test-body targets have two failure modes the
+/// harness cannot oracle cleanly:
+///
+/// - Short backward offsets (e.g. −8) naive layout: target lands inside
+///   the proxy prelude's CSR-read epilogue. Those instructions don't
+///   trap, so control flow re-enters the branch and loops forever until
+///   the GDB read timeout fires.
+/// - Large offsets: target lands in uninitialised memory, whose fetch
+///   behaviour differs between QEMU virt (unmapped → cause 1) and mdrp2350
+///   (SRAM alias fetches 0 → c.illegal → cause 2). Platform-layout
+///   divergence, not a branch-semantics bug.
+///
+/// Forward-branch tests use a NOP sled of length `FWD_SLED` after the
+/// branch so a forward-taken branch coasts down to the terminator ebreak
+/// the harness appends. Backward-branch tests use a different layout:
+/// an explicit `ebreak` word is planted at offset 0 and the branch sits
+/// `|imm|` bytes further in, so `branch − |imm|` lands on the ebreak and
+/// the test halts immediately (via the trap-handler hw-breakpoint). JAL
+/// cases are identical in structure to BEQ cases.
+///
+/// JALR edge coverage: two cases probe encoding bits not exercised by
+/// the `upper_auipc_jalr_pair` case (which fixes imm=0, rd=1). `jalr_off4`
+/// drives a nonzero `imm[11:0]` field; `jalr_rdx0` drives `rd=0` (no-link
+/// semantics, WARL x0 stays zero). Both pre-seed `x2` such that
+/// `(x2 + imm) & ~1 == TRAP_STUB + 16` — the jump lands directly on the
+/// trap handler's ebreak (guaranteed present by harness startup) and the
+/// test halts via the harness's `trap_handler_ebreak` hw-breakpoint.
+/// Random-offset JALR fuzz is still omitted — the generator can't pick a
+/// safe arbitrary target without harness-side plumbing.
 pub fn gen_rv32i_branch_edge_cases() -> Vec<RiscvTestCase> {
+    const FWD_SLED: usize = 4;
+    const NOP: u32 = 0x0000_0013; // addi x0, x0, 0
+    const EBREAK: u32 = 0x0010_0073; // ebreak (32-bit)
+
     let mut out = Vec::with_capacity(28);
 
-    // Conditional branches — always taken / never taken permutations.
-    // funct3: BEQ=0, BNE=1, BLT=4, BGE=5, BLTU=6, BGEU=7
-    let branches: &[(&str, u32, i32, u8, u8, u32, u32)] = &[
-        ("beq_eq", 0, 8, 1, 2, 0x10, 0x10),
-        ("beq_ne", 0, 8, 1, 2, 0x10, 0x11),
-        ("bne_ne", 1, 8, 3, 4, 1, 2),
-        ("bne_eq", 1, 8, 3, 4, 1, 1),
-        ("blt_pos", 4, 8, 5, 6, 1_i32 as u32, 2_i32 as u32),
-        ("blt_neg", 4, 8, 5, 6, (-1_i32) as u32, 0),
-        ("bge_pos", 5, 8, 7, 8, 2, 1),
-        ("bge_neg", 5, 8, 7, 8, 0, (-1_i32) as u32),
-        ("bltu_carry", 6, 8, 9, 10, 0, 0xFFFF_FFFF),
-        ("bgeu_eq", 7, 8, 11, 12, 5, 5),
-        ("beq_neg_off", 0, -8, 13, 14, 3, 3),
-        ("beq_far", 0, 0xFFE, 15, 16, 0, 0), // near max positive imm13 (aligned)
-        ("beq_far_neg", 0, -0x1000, 17, 18, 0, 0),
+    // Forward-taken + never-taken branches. Layout:
+    //   [branch, NOP × FWD_SLED, terminator-ebreak-appended-by-harness]
+    // Forward imm ∈ {4, 8, .., FWD_SLED*4} so the taken target lands on
+    // a NOP in the sled, then coasts down to the terminator.
+    let forward: &[(&str, u32, i32, u8, u8, u32, u32)] = &[
+        ("beq_eq", 0, 4, 1, 2, 0x10, 0x10),
+        ("beq_ne", 0, 4, 1, 2, 0x10, 0x11),
+        ("bne_ne", 1, 4, 3, 4, 1, 2),
+        ("bne_eq", 1, 4, 3, 4, 1, 1),
+        ("blt_pos", 4, 4, 5, 6, 1_i32 as u32, 2_i32 as u32),
+        ("blt_neg", 4, 4, 5, 6, (-1_i32) as u32, 0),
+        ("bge_pos", 5, 4, 7, 8, 2, 1),
+        ("bge_neg", 5, 4, 7, 8, 0, (-1_i32) as u32),
+        ("bltu_carry", 6, 4, 9, 10, 0, 0xFFFF_FFFF),
+        ("bgeu_eq", 7, 4, 11, 12, 5, 5),
     ];
-    for &(name, funct3, imm, rs1, rs2, v1, v2) in branches {
+    for &(name, funct3, imm, rs1, rs2, v1, v2) in forward {
         let w = encode_b_type(imm, rs2, rs1, funct3, OPC_BRANCH);
         let mut regs = vec![(rs1, v1), (rs2, v2)];
         regs.sort_by_key(|r| r.0);
         regs.dedup_by_key(|r| r.0);
         regs.retain(|(r, _)| *r != 0);
+        let mut words = vec![w];
+        for _ in 0..FWD_SLED {
+            words.push(NOP);
+        }
         out.push(RiscvTestCase {
             name: format!("branch_{name}"),
-            words: vec![w],
+            words,
             reg_pre: regs,
             addr_regs: vec![],
             expect_trap: None,
@@ -527,19 +569,61 @@ pub fn gen_rv32i_branch_edge_cases() -> Vec<RiscvTestCase> {
         });
     }
 
-    // JAL: near, far, rd=x0, rd=x1 (link).
-    let jal_cases: &[(&str, i32, u8)] = &[
-        ("jal_near_pos", 8, 1),
-        ("jal_near_neg", -8, 1),
-        ("jal_far_pos", 0x4_0000, 1),
-        ("jal_far_neg", -0x4_0000, 1),
-        ("jal_rdx0", 8, 0),
+    // Backward-taken branches. Layout:
+    //   [ebreak, NOP × (|imm|/4 - 1), branch(imm), NOP × FWD_SLED]
+    // The branch sits at offset `|imm|` from the test body start; taking
+    // it with `imm = -|imm|` lands PC at offset 0 — the planted ebreak.
+    // The ebreak traps to TRAP_STUB, which hits the harness's trap-
+    // handler hw breakpoint and halts. Not-taken path flows forward
+    // through the trailing NOPs to the terminator. imm must be a 4-byte
+    // multiple and ≥ 8 (need at least `[ebreak, NOP, branch]`).
+    let backward: &[(&str, u32, i32, u8, u8, u32, u32)] = &[
+        ("beq_neg_off", 0, -8, 13, 14, 3, 3),
+        ("beq_near_neg", 0, -16, 17, 18, 0, 0),
     ];
-    for &(name, imm, rd) in jal_cases {
-        let w = encode_j_type(imm, rd, OPC_JAL);
+    for &(name, funct3, imm, rs1, rs2, v1, v2) in backward {
+        debug_assert!(imm <= -8 && imm % 4 == 0, "bad backward imm {imm}");
+        let w = encode_b_type(imm, rs2, rs1, funct3, OPC_BRANCH);
+        let mut regs = vec![(rs1, v1), (rs2, v2)];
+        regs.sort_by_key(|r| r.0);
+        regs.dedup_by_key(|r| r.0);
+        regs.retain(|(r, _)| *r != 0);
+        let slots = (-imm / 4) as usize; // 2 for imm=-8, 4 for imm=-16
+        let mut words = Vec::with_capacity(slots + 1 + FWD_SLED);
+        words.push(EBREAK);
+        for _ in 0..(slots - 1) {
+            words.push(NOP);
+        }
+        words.push(w);
+        for _ in 0..FWD_SLED {
+            words.push(NOP);
+        }
         out.push(RiscvTestCase {
             name: format!("branch_{name}"),
-            words: vec![w],
+            words,
+            reg_pre: regs,
+            addr_regs: vec![],
+            expect_trap: None,
+            class: RiscvClass::Rv32iBranch,
+        });
+    }
+
+    // JAL near-forward with sled (same as conditional branch forward
+    // layout), plus one backward case (same as backward layout above).
+    // `jal_rdx0` is forward imm = 4, rd = 0 (no link).
+    let jal_forward: &[(&str, i32, u8)] = &[
+        ("jal_near_pos", 4, 1),
+        ("jal_rdx0", 4, 0),
+    ];
+    for &(name, imm, rd) in jal_forward {
+        let w = encode_j_type(imm, rd, OPC_JAL);
+        let mut words = vec![w];
+        for _ in 0..FWD_SLED {
+            words.push(NOP);
+        }
+        out.push(RiscvTestCase {
+            name: format!("branch_{name}"),
+            words,
             reg_pre: vec![],
             addr_regs: vec![],
             expect_trap: None,
@@ -547,18 +631,57 @@ pub fn gen_rv32i_branch_edge_cases() -> Vec<RiscvTestCase> {
         });
     }
 
-    // JALR: offset 0, offset 4, rd=x0 vs rd=x1.
-    let jalr_cases: &[(&str, i32, u8, u8)] = &[
-        ("jalr_off0", 0, 2, 1),
-        ("jalr_off4", 4, 2, 1),
-        ("jalr_rdx0", 0, 2, 0),
+    // Backward JAL: jumps back to a planted ebreak; link register (x1)
+    // ends up holding PC+4 of the JAL, which the GPR diff catches.
+    {
+        let imm = -16_i32;
+        debug_assert!(imm <= -8 && imm % 4 == 0);
+        let w = encode_j_type(imm, 1, OPC_JAL);
+        let slots = (-imm / 4) as usize;
+        let mut words = Vec::with_capacity(slots + 1 + FWD_SLED);
+        words.push(EBREAK);
+        for _ in 0..(slots - 1) {
+            words.push(NOP);
+        }
+        words.push(w);
+        for _ in 0..FWD_SLED {
+            words.push(NOP);
+        }
+        out.push(RiscvTestCase {
+            name: "branch_jal_near_neg".into(),
+            words,
+            reg_pre: vec![],
+            addr_regs: vec![],
+            expect_trap: None,
+            class: RiscvClass::Rv32iBranch,
+        });
+    }
+
+    // JALR: target address lives in a GPR, not in the encoding. The
+    // `upper_auipc_jalr_pair` case already covers the common (imm=0, rd=1)
+    // form via PC-relative address build. The two cases below fill the
+    // encoding gaps it leaves:
+    //   * `jalr_off4` — nonzero `imm[11:0]` (= 4). rs1 = TRAP_EBREAK - 4
+    //     so `(rs1 + 4) & !1 == TRAP_EBREAK`.
+    //   * `jalr_rdx0`  — rd = 0 (no link; x0 must stay zero, WARL). rs1 =
+    //     TRAP_EBREAK directly (imm = 0).
+    // Both land directly on the trap handler's ebreak (installed at startup,
+    // see `install_trap_stub`), so the harness's `trap_handler_ebreak` hw
+    // breakpoint halts both sides at the same PC without executing any
+    // unmapped fetch. Random-offset JALR fuzz is still off the table — the
+    // generator can't construct an arbitrary safe target at encode time.
+    const TRAP_EBREAK: u32 = TRAP_STUB + 16;
+    let jalr_cases: &[(&str, i32, u8, u8, u32)] = &[
+        // (name, imm12, rs1, rd, rs1_preload)
+        ("jalr_off4", 4, 2, 1, TRAP_EBREAK.wrapping_sub(4)),
+        ("jalr_rdx0", 0, 2, 0, TRAP_EBREAK),
     ];
-    for &(name, imm, rs1, rd) in jalr_cases {
+    for &(name, imm, rs1, rd, rs1_val) in jalr_cases {
         let w = encode_i_type(imm, rs1, 0, rd, OPC_JALR);
         out.push(RiscvTestCase {
             name: format!("branch_{name}"),
             words: vec![w],
-            reg_pre: vec![(rs1, SCRATCH_BASE.wrapping_add(0x100))],
+            reg_pre: vec![(rs1, rs1_val)],
             addr_regs: vec![],
             expect_trap: None,
             class: RiscvClass::Rv32iBranch,
@@ -749,24 +872,43 @@ pub fn gen_rv32c_edge_cases() -> Vec<RiscvTestCase> {
     // Quadrant 0 (c[1:0]=00):
     //   c.addi4spn → funct3=0, non-zero imm, rd'=x8..x15
     //   encoding: 000 _ nzimm[5:4|9:6|2|3] _ rd'[2:0] _ 00
-    let plain: &[(&str, u16)] = &[
-        ("c_addi4spn", 0b0_0000_0001_0010_0000), // addi4spn rd'=x8, nzimm=small
-        ("c_nop", 0x0001),                                  // c.addi x0, 0 (canonical nop)
-        ("c_addi_1", 0x0085),                               // c.addi x1, 1
-        ("c_li", 0x4085),                                   // c.li x1, 1 (imm[4:0]=00001)
-        ("c_lui", 0x6105),                                  // c.lui x2, 1  (imm nonzero)
-        ("c_andi", 0x8805),                                 // c.andi x8, 1
-        ("c_jr_x1", 0x8082),                                // c.jr x1 (quadrant 2)
-        ("c_jalr_x1", 0x9082),                              // c.jalr x1
-        ("c_slli", 0x0086),                                 // c.slli x1, 1
-        ("c_lwsp", 0x4082),                                 // c.lwsp x1, 0(sp)
-        ("c_swsp", 0xc006),                                 // c.swsp x1, 0(sp)
+    // Encoded as (name, enc, extra_reg_pre). `extra_reg_pre` is merged
+    // with the default `(x2, SCRATCH_BASE)` stack-pointer seeding. For
+    // c.jr / c.jalr we override x1 so the jump target is known-valid on
+    // both sides — without this the default x1 = 0 lands PC at the
+    // unmapped 0x0, and QEMU (reports mcause = 1 "instruction access
+    // fault") and mdrp2350 (SRAM alias returns 0 → c.illegal → mcause =
+    // 2) diverge on a platform-layout artefact rather than on the jump
+    // decode itself. Pointing x1 at `TRAP_STUB + 16` (the trap handler's
+    // ebreak) sidesteps the fetch step entirely — the harness halts the
+    // moment that ebreak is hit, which is the same outcome both sides
+    // reach via any other trapping path.
+    const TRAP_EBREAK: u32 = TRAP_STUB + 16;
+    let plain: &[(&str, u16, Option<(u8, u32)>)] = &[
+        ("c_addi4spn", 0b0_0000_0001_0010_0000, None), // addi4spn rd'=x8, nzimm=small
+        ("c_nop", 0x0001, None),                           // c.addi x0, 0 (canonical nop)
+        ("c_addi_1", 0x0085, None),                        // c.addi x1, 1
+        ("c_li", 0x4085, None),                            // c.li x1, 1 (imm[4:0]=00001)
+        ("c_lui", 0x6105, None),                           // c.lui x2, 1  (imm nonzero)
+        ("c_andi", 0x8805, None),                          // c.andi x8, 1
+        // c.jr / c.jalr rs1 = x1; seed x1 to TRAP_EBREAK so the jump
+        // lands on the handler's ebreak — avoids the x1 = 0 fetch-fault
+        // divergence (QEMU mcause 1 vs emu mcause 2).
+        ("c_jr_x1", 0x8082, Some((1, TRAP_EBREAK))),       // c.jr x1
+        ("c_jalr_x1", 0x9082, Some((1, TRAP_EBREAK))),     // c.jalr x1
+        ("c_slli", 0x0086, None),                          // c.slli x1, 1
+        ("c_lwsp", 0x4082, None),                          // c.lwsp x1, 0(sp)
+        ("c_swsp", 0xc006, None),                          // c.swsp x1, 0(sp)
     ];
-    for &(name, enc) in plain {
+    for &(name, enc, extra) in plain {
+        let mut reg_pre = vec![(2, SCRATCH_BASE)]; // sp in scratchpad for stack cases
+        if let Some(r) = extra {
+            reg_pre.push(r);
+        }
         out.push(RiscvTestCase {
             name: format!("rvc_{name}"),
             words: vec![u32::from(enc)],
-            reg_pre: vec![(2, SCRATCH_BASE)], // sp in scratchpad for stack cases
+            reg_pre,
             addr_regs: vec![2],
             expect_trap: None,
             class: RiscvClass::Rv32c,
@@ -2094,7 +2236,14 @@ mod tests {
         match tc {
             RiscvClass::Rv32iAlu => decoded == "alu",
             RiscvClass::Rv32iMem | RiscvClass::Rv32iMisalignedMem => decoded == "mem",
-            RiscvClass::Rv32iBranch => decoded == "branch",
+            // Branch cases ship with NOP / EBREAK sleds that absorb taken
+            // targets without leaving the test body. `decoded == "alu"`
+            // covers `addi x0, x0, 0` (NOP); `decoded == "misc"` covers
+            // the planted ebreak used by backward-taken layouts. Both
+            // are harness scaffolding, not branch instructions under test.
+            RiscvClass::Rv32iBranch => {
+                decoded == "branch" || decoded == "alu" || decoded == "misc"
+            }
             RiscvClass::Rv32iUpper => decoded == "upper" || decoded == "alu",
             RiscvClass::Rv32m => decoded == "rv32m",
             RiscvClass::Rv32aReservable => decoded == "rv32a",
@@ -2141,6 +2290,14 @@ mod tests {
         let mut verified_compressed_sentinel = 0usize;
         let mut compressed_unhandled = 0usize;
         for tc in &cases {
+            // Per-case: did at least one word decode as a genuine branch /
+            // JAL / JALR? The `Rv32iBranch` class-compat arm accepts `alu`
+            // (NOP sled) and `misc` (planted ebreak) alongside `branch` so
+            // the layout scaffolding doesn't trip class-mismatch — but we
+            // still need to prove the case actually contains a branch
+            // instruction. Without this, a case containing only sled + ebreak
+            // and a corrupted branch-slot would silently pass.
+            let mut case_has_branch_word = false;
             for &word in &tc.words {
                 // F/D tripwire — every word, every class, always.
                 if !is_compressed(word) {
@@ -2196,6 +2353,9 @@ mod tests {
                             tc.name,
                             tc.class
                         );
+                        if decoded == "branch" {
+                            case_has_branch_word = true;
+                        }
                         verified_32bit += 1;
                     }
                     Err(e) => {
@@ -2208,6 +2368,15 @@ mod tests {
                         );
                     }
                 }
+            }
+            if tc.class == RiscvClass::Rv32iBranch {
+                assert!(
+                    case_has_branch_word,
+                    "Rv32iBranch case {} contains no branch/JAL/JALR word — \
+                     class-compat allows alu/misc scaffolding but the real \
+                     branch encoding appears to be missing or corrupt",
+                    tc.name
+                );
             }
         }
         // Floors: with the LLD §6 weight table we expect ~800+ 32-bit words
@@ -2228,10 +2397,17 @@ mod tests {
              compressed_sentinel={verified_compressed_sentinel} \
              compressed_unhandled={compressed_unhandled}"
         );
+        // Rv32c weight is 500 bp → ~50 rv32c cases in a 1000-case fuzz.
+        // `gen_fuzz_rv32c` biases 10 % of those toward known-illegal Zcmp
+        // Q2 encodings (expect_trap = 2), so expected sentinel hits
+        // average ~5. `rv32c_arith` may also happen to emit Q2/Zcmp bit
+        // patterns by chance, adding a handful more. Floor of 3 is a
+        // conservative lower bound that still guarantees the Zcmp path
+        // is non-trivially exercised.
         assert!(
-            verified_compressed_sentinel >= 10,
+            verified_compressed_sentinel >= 3,
             "too few compressed words hit the Zcmp sentinel: \
-             {verified_compressed_sentinel} (expected >= 10); \
+             {verified_compressed_sentinel} (expected >= 3); \
              compressed_unhandled = {compressed_unhandled}"
         );
     }

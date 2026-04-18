@@ -558,6 +558,13 @@ impl Drop for QemuProcess {
 pub struct GdbClient {
     stream: TcpStream,
     buf: Vec<u8>,
+    /// Set of HW-breakpoint addresses we've installed but haven't observed
+    /// a successful remove for. QEMU's rv32 virt GDB stub occasionally
+    /// replies `"OK"` to `z1,addr,kind` but retains the breakpoint,
+    /// causing it to fire on a later `vCont;c` at a different `addr`.
+    /// Used by [`Self::clear_all_hw_breakpoints`] to retry every known
+    /// address at once, which works around the stub bug.
+    hw_bps: std::collections::BTreeSet<u32>,
 }
 
 impl GdbClient {
@@ -578,6 +585,7 @@ impl GdbClient {
                     return Ok(Self {
                         stream,
                         buf: Vec::with_capacity(1024),
+                        hw_bps: std::collections::BTreeSet::new(),
                     });
                 }
                 Err(e) => {
@@ -715,6 +723,12 @@ impl GdbClient {
     pub fn set_hw_breakpoint(&mut self, addr: u32, kind: u32) -> io::Result<()> {
         let reply = self.send_recv(&format!("Z1,{addr:x},{kind}"))?;
         if reply == "OK" {
+            // Remember every set address for the lifetime of the client —
+            // `remove_hw_breakpoint` on QEMU's rv32 virt stub occasionally
+            // returns "OK" without actually removing, so a later `vCont;c`
+            // at a fresh term_addr can trip the stale one. See
+            // [`Self::clear_all_hw_breakpoints`] for the recovery path.
+            self.hw_bps.insert(addr);
             Ok(())
         } else {
             Err(io::Error::new(
@@ -727,6 +741,12 @@ impl GdbClient {
     /// Remove a hardware breakpoint previously installed with
     /// [`Self::set_hw_breakpoint`]. `kind` must match the install-time value.
     /// Returns `Ok(())` on `"OK"`; any other reply is mapped to `InvalidData`.
+    ///
+    /// NB: see [`Self::clear_all_hw_breakpoints`] — QEMU's rv32 virt GDB
+    /// stub sometimes replies `"OK"` to `z1` without actually clearing the
+    /// breakpoint. Callers that need a clean slate between test cases
+    /// should use `clear_all_hw_breakpoints` instead of (or as well as)
+    /// paired `remove_hw_breakpoint` calls.
     pub fn remove_hw_breakpoint(&mut self, addr: u32, kind: u32) -> io::Result<()> {
         let reply = self.send_recv(&format!("z1,{addr:x},{kind}"))?;
         if reply == "OK" {
@@ -737,6 +757,26 @@ impl GdbClient {
                 format!("z1 {addr:#010x}: expected 'OK', got '{reply}'"),
             ))
         }
+    }
+
+    /// Re-issue `z1,addr,kind` for every address this client has ever
+    /// installed a HW breakpoint at during its lifetime. Works around a
+    /// QEMU rv32 virt GDB-stub bug where `z1` replies `"OK"` but the
+    /// breakpoint persists, firing on the next `vCont;c` even at an
+    /// address the test is not expecting. Errors from individual removes
+    /// are ignored (best-effort flush). `kind` applies to every remove;
+    /// pass 2 for RV32-sized breakpoints. Intended to be called between
+    /// test cases — it clears the tracking set afterwards, so the next
+    /// round starts from a known-empty pool.
+    pub fn clear_all_hw_breakpoints(&mut self, kind: u32) {
+        // Collect first — the mutable borrow on self from the iterator
+        // would conflict with the remove call. The known-address pool is
+        // tiny (≤ handful entries per test) so the alloc is negligible.
+        let addrs: Vec<u32> = self.hw_bps.iter().copied().collect();
+        for addr in addrs {
+            let _ = self.send_recv(&format!("z1,{addr:x},{kind}"));
+        }
+        self.hw_bps.clear();
     }
 
     /// Continue execution until a stop event (breakpoint hit, trap, etc).

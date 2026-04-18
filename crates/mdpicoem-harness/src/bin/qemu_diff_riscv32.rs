@@ -34,7 +34,7 @@ use mdpicoem_harness::gdb_client::{
 };
 use mdpicoem_harness::riscv_gen::{
     self, encode_csr, encode_i_type, encode_s_type, OPC_OP_IMM, OPC_SYSTEM, RiscvClass,
-    RiscvTestCase, SCRATCH_BASE,
+    RiscvTestCase, SCRATCH_BASE, TRAP_STUB,
 };
 
 use mdrp2350::{Arch, Config, EmulatorBuilder};
@@ -55,8 +55,10 @@ use mdrp2350::{Arch, Config, EmulatorBuilder};
 const LOADER_ADDR: u32 = 0x8000_0000;
 /// Test instruction slot — CSR-read prelude starts here (LLD §3).
 const TEST_SLOT: u32 = 0x8000_0100;
-/// Trap-handler stub slot (Zicsr carve-out, LLD §4 mitigation (1)).
-const TRAP_STUB: u32 = 0x8000_0200;
+// Trap-handler stub slot (Zicsr carve-out, LLD §4 mitigation (1)) lives at
+// `riscv_gen::TRAP_STUB` — imported above so generator-side edge cases
+// (e.g. `branch_jalr_off4`/`rdx0`, `rvc_c_jr_x1`) can land JALR targets on
+// the handler ebreak at `TRAP_STUB + 16` without duplicating the constant.
 /// mcause slot where the trap handler spills its value (LLD §10).
 const MCAUSE_SLOT: u32 = 0x8000_01F0;
 /// CSR capture scratchpad — proxy's gp points here. 56 bytes total:
@@ -303,6 +305,25 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     //     MCAUSE_SLOT → `ebreak`, instead of jumping to mtvec=0 and
     //     hanging on unmapped memory.
     seed_global_mtvec(&mut gdb, &mut emu)?;
+
+    // 7b. Zero the one-shot startup stubs we no longer need. The self-
+    //     check stub (SELFCHECK_STUB = 0x8000_0500) and the mtvec-seed
+    //     stub (INIT_SLOT = 0x8000_0700) both contain `csrrw` writes
+    //     that zero CSRs including mtvec — so if any edge-case branch/
+    //     jump test lands PC inside one of these regions (e.g. the
+    //     `branch_jalr_*` cases that jump to x2 = SCRATCH_BASE + 0x100
+    //     = 0x8000_0500 = SELFCHECK_STUB), the stub re-runs, zeroes
+    //     mtvec, then its terminal ebreak traps to mtvec = 0 → loops
+    //     forever inside QEMU. The HLD's 10 s read timeout catches this
+    //     but burns a fail. Zeroing the stubs means the branch target
+    //     fetches 0x0000_0000 → decodes as c.illegal → traps cleanly to
+    //     TRAP_STUB → ebreak → harness halts. `SELFCHECK_STUB` is 0x500..
+    //     0x580 (29 instrs × 4 = 116 bytes); `INIT_SLOT` is 0x700..0x740
+    //     (9 instrs × 4 = 36 bytes). Overshooting the zero-out is fine —
+    //     all of 0x8000_0500..0x8000_07FF is free scratch between
+    //     structured regions. POST_CAPTURE_STUB (0x8000_0680) is rewritten
+    //     fresh on every test so zeroing it here is a no-op.
+    zero_sram_region(&mut gdb, &mut emu, SELFCHECK_STUB, 0x300)?;
 
     // 8. Dispatch.
     match args.fuzz_count {
@@ -859,13 +880,26 @@ fn run_one_test(
     // bp, an ebreak executed via the trap handler delivers a
     // breakpoint exception, re-enters mtvec (TRAP_STUB), and loops.
     let trap_handler_ebreak = TRAP_STUB + 16;
+    // Defensive HW-breakpoint flush — works around a QEMU rv32 virt
+    // GDB-stub bug where `z1,addr,kind` replies "OK" without actually
+    // removing the breakpoint. Without this flush, a stale bp from a
+    // shorter prior test (term_addr = 0x8000_0160) fires on the current
+    // test's `vCont;c` and halts execution one instruction early, before
+    // the second test word is retired. Symptom observed on
+    // `upper_auipc_addi_pair` / `upper_auipc_jalr_pair` after a run of
+    // single-instruction `upper_auipc_*` cases.
+    gdb.clear_all_hw_breakpoints(2);
     gdb.set_hw_breakpoint(term_addr, 2)
         .map_err(|e| format!("QEMU Z1 term: {e}"))?;
     gdb.set_hw_breakpoint(trap_handler_ebreak, 2)
         .map_err(|e| format!("QEMU Z1 trap: {e}"))?;
     gdb.continue_exec()
         .map_err(|e| format!("QEMU vCont;c: {e}"))?;
-    // Best-effort breakpoint cleanup.
+    // Best-effort breakpoint cleanup. The real flush happens at the top
+    // of the next test via [`GdbClient::clear_all_hw_breakpoints`], which
+    // is what works around QEMU's stale-bp bug — but paired removes keep
+    // the stub's internal table tidy in the common case, so a runaway
+    // set grows slowly.
     let _ = gdb.remove_hw_breakpoint(term_addr, 2);
     let _ = gdb.remove_hw_breakpoint(trap_handler_ebreak, 2);
 
@@ -1102,7 +1136,24 @@ fn build_test_stream(tc: &RiscvTestCase, use_proxy: bool) -> (Vec<u32>, u32, u32
         for &w in &build_mtvec_seed_prelude_with(31) {
             stream.push(w);
         }
-        addr += (CSR_RESET_LIST.len() as u32 + 3) * 4;
+        // mstatus seed: force MPP = 0b11 (bits [12:11] = 0x1800) on both
+        // sides. Hazard3 is M-mode only and WARLs MPP back to 0b11 on
+        // every write, so the emulator reads 0x1800 after the csrrw x0
+        // reset above. QEMU virt rv32 has M+S+U and accepts MPP = 0b00,
+        // so its mstatus stays at 0. Tests that read-then-derive from
+        // mstatus (e.g. `csrside_mstatus_use_old` where x7 = old mstatus
+        // + 1) diverge in a downstream GPR that `csr_rd_hint` WARL
+        // masking does not cover — the mask applies to the immediate rd
+        // only. Seeding 0x1800 here makes the pre-test mstatus match on
+        // both sides so downstream derivations also match.
+        //
+        // `addi x31, x0, 3; slli x31, x31, 11` → x31 = 0x0000_1800.
+        // `csrrw x0, mstatus, x31` then writes 0x1800 (MPP = 0b11) into
+        // mstatus on both sides. 3 extra instrs = 12 bytes.
+        stream.push(encode_i_type(3, 0, 0b000, 31, OPC_OP_IMM)); // addi x31, x0, 3
+        stream.push(encode_i_type(11, 31, 0b001, 31, OPC_OP_IMM)); // slli x31, x31, 11
+        stream.push(encode_csr(0x300, 31, CSR_F3_RW, REG_X0)); // csrrw x0, mstatus, x31
+        addr += (CSR_RESET_LIST.len() as u32 + 3 + 3) * 4;
 
         // Proxy prelude: 14 instrs (7 × csrrs t6, csr, x0; sw t6, off(gp)).
         // Uses t6 (x31) as scratch rather than t0 (x5) because edge
@@ -1378,6 +1429,15 @@ fn step_emu_until_pc(
     target_pc: u32,
     max_steps: u32,
 ) -> Result<(), String> {
+    step_emu_until_pc_pair(emu, target_pc, TRAP_STUB + 16, max_steps)
+}
+
+fn step_emu_until_pc_pair(
+    emu: &mut mdrp2350::Emulator,
+    target_pc: u32,
+    alt_target_pc: u32,
+    max_steps: u32,
+) -> Result<(), String> {
     // `step_quantum=1` plus a halted core 1 means each `Emulator::step`
     // retires one Hazard3 instruction on core 0 and ticks the clock +
     // peripherals by a single sysclk — matching QEMU single-step
@@ -1386,37 +1446,29 @@ fn step_emu_until_pc(
     // implementation hand-rolled the core dispatch and left
     // `bus.master_cycle` stale, breaking any code path that consults it
     // (PLL lock arming, MMIO trace, pacer).
+    //
+    // Halts on two target PCs so the emu and QEMU end at the same PC for
+    // both fall-through (terminator ebreak) and trap (trap-handler
+    // ebreak) paths. QEMU installs a hw breakpoint at each; we use
+    // explicit pc-equality checks here.
+    //
+    // Historical note: previous revision also halted whenever the
+    // instruction at PC was an ebreak, because a non-HW-breakpointed
+    // ebreak would trap, re-enter mtvec, and the trap handler's own
+    // ebreak would loop forever. That's no longer true — the harness
+    // installs a hw-breakpoint at `trap_handler_ebreak` on QEMU and
+    // lists its PC here for the emu side, so an in-body ebreak properly
+    // traps, runs the handler, and halts at `alt_target_pc` on both
+    // sides.
     for _ in 0..max_steps {
         let pc = emu.core_riscv(0).pc();
-        if pc == target_pc {
-            return Ok(());
-        }
-        // Also stop if the instruction at PC is `ebreak` — QEMU's GDB
-        // stub intercepts ebreak and halts without delivering the
-        // breakpoint exception. Our emulator has no such interception,
-        // so an ebreak inside e.g. the trap-handler stub would raise a
-        // breakpoint trap, re-enter mtvec (TRAP_STUB), and loop
-        // forever. Matching QEMU's stop-at-ebreak behaviour here keeps
-        // the two sides synchronised at the same PC.
-        //
-        // Reading the instruction word through the bus is safe —
-        // oracle-region addresses alias into SRAM and have no side
-        // effects.
-        let op = emu.bus.read32(pc, 0);
-        if op == EBREAK_WORD {
-            return Ok(());
-        }
-        // Compressed ebreak (`c.ebreak` = 0x9002) occupies the low
-        // halfword. Check that form too — proxy stub terminators are
-        // the 32-bit form but the trap handler is identical on both
-        // sides; be robust.
-        if (op & 0xFFFF) == 0x9002 {
+        if pc == target_pc || pc == alt_target_pc {
             return Ok(());
         }
         emu.step();
     }
     Err(format!(
-        "emulator did not reach terminator {target_pc:#010x} within {max_steps} steps (pc={:#010x})",
+        "emulator did not reach terminator {target_pc:#010x} (or alt {alt_target_pc:#010x}) within {max_steps} steps (pc={:#010x})",
         emu.core_riscv(0).pc()
     ))
 }
