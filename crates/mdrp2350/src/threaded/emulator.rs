@@ -651,7 +651,7 @@ fn coordinator_worker_body(
         shared.master_cycle.fetch_add(step_q as u64, Ordering::Release);
         shared.sio.mtime_advance(step_q as u64);
 
-        tick_peripherals(&shared, step_q as u64);
+        tick_peripherals(&shared, step_q);
 
         if barrier.wait() == BarrierResult::Poisoned {
             return;
@@ -659,30 +659,76 @@ fn coordinator_worker_body(
     }
 }
 
-/// Coordinator-owned peripheral tick. Stage 7 minimal implementation —
-/// full per-peripheral integration (DMA progress, TIMER0/1 alarm arm
-/// checks, UART TX/RX FIFO drain, ADC FIFO, PWM wrap) lands alongside
-/// the corresponding migration from the single-threaded Bus tick path.
-///
-/// Until those peripherals publish their per-quantum effects through
-/// `Peripherals` (Phase 4/5), this function is intentionally a no-op —
-/// the `shared.master_cycle` + `shared.sio.mtime_advance` already done
-/// in the coordinator body cover the clock-tree visibility contract
-/// the CPU workers rely on.
-fn tick_peripherals(shared: &SharedState, cycles: u64) {
-    // TODO(Phase 4): TIMER0 / TIMER1 alarm fire checks — see
-    //   `Bus::tick_peripherals` in `crates/mdrp2350/src/bus/mod.rs` for
-    //   the single-threaded implementation, which drains alarm-match
-    //   IRQs into `CoreAtomics::assert_irq_shared`.
-    // TODO(Phase 4): DMA tick — advance channel progress, raise
-    //   DMA_IRQ_0/1 via `shared.atomics.assert_irq_shared`.
-    // TODO(Phase 5): UART TX/RX FIFO drain + ADC FIFO + PWM wrap.
-    //
-    // All of the above will compose cleanly with the existing
-    // `Peripherals` mutex layout — the coordinator is the only
-    // writer of these states so contention is only with CPU-worker
-    // MMIO reads against the APB surface.
-    let _ = (shared, cycles);
+/// Coordinator-owned peripheral tick. Phase 4 Stage A port of
+/// `Bus::tick_peripherals` (`bus/mod.rs:915`) minus DMA — DMA lands in
+/// Phase 5 alongside PIO-DREQ wiring (HLD V7 §2.2).
+fn tick_peripherals(shared: &SharedState, cycles: u32) {
+    use crate::bus::{
+        RESET_ADC, RESET_I2C0, RESET_PWM, RESET_SPI0, RESET_TIMER0, RESET_TIMER1, RESET_UART0,
+    };
+
+    // RESETS snapshot — single acquire, reused for all five gates this
+    // quantum. A mid-quantum CPU-worker RESETS write takes effect next
+    // quantum (HLD V7 §3.2).
+    let resets_state = shared.peripherals.resets.lock().unwrap().resets_state;
+    let held = |bit: u8| (resets_state & (1u32 << bit)) != 0;
+
+    // Clock-tree snapshot (Copy) — released before the APB tick block.
+    let tree = shared.peripherals.clocks.lock().unwrap().clock_tree;
+
+    let mut ext_irqs = 0u64;
+
+    // Steps 1–3 under a single timers-lock acquire (HLD V7 §3.1).
+    {
+        let mut timers = shared.peripherals.timers.lock().unwrap();
+        timers.ticks.advance_all(cycles);
+
+        if !held(RESET_TIMER0) {
+            let edges = timers.ticks.take_timer0_edges();
+            if edges > 0 {
+                timers.timer0.advance_us(edges);
+            }
+            ext_irqs |= timers.timer0.poll_alarms();
+        }
+
+        if !held(RESET_TIMER1) {
+            let edges = timers.ticks.take_timer1_edges();
+            if edges > 0 {
+                timers.timer1.advance_us(edges);
+            }
+            ext_irqs |= timers.timer1.poll_alarms();
+        }
+    }
+
+    // Phase-2 APB peripherals — each advances per sys_clk unless held.
+    {
+        let mut apb = shared.peripherals.apb.lock().unwrap();
+        if !held(RESET_UART0) {
+            apb.uart0.tick(cycles, &tree, &mut ext_irqs);
+        }
+        if !held(RESET_SPI0) {
+            apb.spi0.tick(cycles, &tree, &mut ext_irqs);
+        }
+        if !held(RESET_I2C0) {
+            apb.i2c0.tick(cycles, &tree, &mut ext_irqs);
+        }
+        if !held(RESET_ADC) {
+            apb.adc.tick(cycles, &tree, &mut ext_irqs);
+        }
+        if !held(RESET_PWM) {
+            apb.pwm.tick(cycles, &tree, &mut ext_irqs);
+        }
+    }
+
+    // `Peripherals::dma` intentionally deferred to Phase 5 (HLD V7 §2.2).
+
+    // IRQ dispatch — drop software-only bits 46..=51, assert shared.
+    let mut mask = ext_irqs & crate::irq::PERIPH_IRQ_MASK;
+    while mask != 0 {
+        let bit = mask.trailing_zeros();
+        shared.atomics.assert_irq_shared(bit);
+        mask &= mask - 1;
+    }
 }
 
 // =======================================================================
@@ -778,6 +824,52 @@ mod tests {
             threaded.master_cycle(),
             101 * step_q,
             "master_cycle must advance by step_quantum each quantum"
+        );
+    }
+
+    // ----- Stage A: tick_peripherals fires TIMER0 ALARM0 end-to-end -----
+
+    /// Smoke test for Phase 4 Stage A `tick_peripherals` port. Programs
+    /// TIMER0 (TICKS.TIMER0 enabled, ALARM0=5, INTE=1) via serial MMIO
+    /// before handoff, then runs the threaded coordinator a few quanta
+    /// with both cores halted. The coordinator's `tick_peripherals`
+    /// must drive TICKS → TIMER0 edges → alarm match → shared IRQ
+    /// assertion on `IRQ_TIMER0_IRQ_0`. Before Stage A this path was a
+    /// no-op stub, so the assertion here is what makes the port real.
+    #[test]
+    fn tick_peripherals_fires_timer0_alarm0_shared_irq() {
+        use crate::peripherals::ticks::{
+            CTRL_ENABLE, DOMAIN_STRIDE, DOMAIN_TIMER0, TICKS_BASE,
+        };
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET, TIMER0_BASE};
+
+        let mut emu = Emulator::new(Config::default());
+        // TIMER0 is released post-bootrom already; enable the TICKS
+        // TIMER0 domain so sys_clk cycles turn into TIMER0 µs edges,
+        // then arm ALARM0 with INTE to route the match to NVIC.
+        let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
+        emu.bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
+        emu.bus.write32(TIMER0_BASE + INTE_OFFSET, 0x1, 0);
+        emu.bus.write32(TIMER0_BASE + ALARM0_OFFSET, 5, 0);
+
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        // step_quantum=64 sys_clks, TIMER0 CYCLES=12 ⇒ 5 edges/quantum.
+        // Two quanta (≥10 µs) is comfortably past the ALARM0=5 target.
+        threaded.run_quanta(2);
+
+        let irq_bit = 1u64 << crate::irq::IRQ_TIMER0_IRQ_0;
+        assert_ne!(
+            threaded.shared.atomics.irq_pending_load(0) & irq_bit,
+            0,
+            "core 0 must see IRQ_TIMER0_IRQ_0 after ALARM0 match (shared)"
+        );
+        assert_ne!(
+            threaded.shared.atomics.irq_pending_load(1) & irq_bit,
+            0,
+            "core 1 must see IRQ_TIMER0_IRQ_0 after ALARM0 match (shared)"
         );
     }
 
