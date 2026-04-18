@@ -51,14 +51,44 @@ pub struct ThreadedPio {
     commands: Mutex<Vec<PioCommand>>,
 }
 
-/// Cold-path commands sent from CPU workers to the PIO thread. Phase 2
-/// implements only the two variants exercised by tests; Phase 3 will add
-/// the remaining variants (SetExecCtrl, SetShiftCtrl, SetPinCtrl, ForceExec,
-/// SmRestart, ClkdivRestart) as MMIO dispatch demands them.
+/// Cold-path commands sent from CPU workers to the PIO thread.
+///
+/// Phase 2 seeded the queue with `WriteInstrMem` / `SetClkDiv`; Phase 3
+/// task #11 added `WriteCtrl` (SM enable / restart / clkdiv-restart —
+/// the critical unblocker so `ThreadedPio::read_sm_enabled` reflects
+/// firmware-programmed state) and a general-purpose `WriteReg` arm that
+/// covers every remaining PIO register offset the single-threaded
+/// `Bus::write32` hands to `PioBlock::write32`: TXF0..TXF3, FDEBUG,
+/// IRQ, IRQ_FORCE, INPUT_SYNC_BYPASS, per-SM EXECCTRL/SHIFTCTRL/
+/// INSTR/PINCTRL.
+///
+/// `WriteInstrMem` and `SetClkDiv` are kept as purpose-built variants
+/// for backward compatibility with existing tests and for the slightly
+/// cheaper dispatch path (no sub-offset decode in the worker). The
+/// generic `WriteReg` variant is the fallback used by `WorkerBus` for
+/// anything outside those two fast paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PioCommand {
-    WriteInstrMem { block: u8, addr: u8, value: u16 },
-    SetClkDiv { block: u8, sm: u8, int_div: u16, frac_div: u8 },
+    /// INSTR_MEM slot write. `alias` (0=normal, 1=XOR, 2=OR, 3=AND-NOT)
+    /// is propagated to `PioBlock::write32` so firmware that uses the
+    /// aliased MMIO regions (e.g. SET/CLR/XOR ROM patching) produces
+    /// the same memory contents as the single-threaded `Bus` path.
+    WriteInstrMem { block: u8, addr: u8, value: u16, alias: u8 },
+    /// SMn_CLKDIV write. `alias` is propagated through to
+    /// `PioBlock::write32` for parity with the single-threaded `Bus`
+    /// path, which forwards the 2-bit alias encoded in the upper MMIO
+    /// address bits to `PioBlock::write32` unconditionally.
+    SetClkDiv { block: u8, sm: u8, int_div: u16, frac_div: u8, alias: u8 },
+    /// CTRL (0x000) write: SM_ENABLE / SM_RESTART / CLKDIV_RESTART.
+    /// After applying, the PIO worker publishes the resulting
+    /// `sm_enabled_mask` onto `ThreadedPio::sm_enabled` so CPU-side
+    /// reads observe the new state.
+    WriteCtrl { block: u8, val: u32, alias: u8 },
+    /// Generic register write — dispatched to `PioBlock::write32` as-is.
+    /// Covers TXF0..TXF3, FDEBUG, IRQ, IRQ_FORCE, INPUT_SYNC_BYPASS,
+    /// per-SM EXECCTRL / SHIFTCTRL / INSTR / PINCTRL, and any PIO offset
+    /// the two purpose-built variants above do not route.
+    WriteReg { block: u8, offset: u16, val: u32, alias: u8 },
 }
 
 impl ThreadedPio {
@@ -73,7 +103,12 @@ impl ThreadedPio {
             sm_enabled: std::array::from_fn(|_| AtomicU8::new(0)),
             irq_flags: std::array::from_fn(|_| AtomicU8::new(0)),
             dreq: std::array::from_fn(|_| AtomicU8::new(0)),
-            commands: Mutex::new(Vec::new()),
+            // Preallocate for the common setup-heavy case (INSTR_MEM 32
+            // slots × up to 3 blocks = 96 writes + per-SM setup). Keeps
+            // the first-quantum firmware init path from thrashing the
+            // allocator through the push path. Subsequent quanta recycle
+            // this capacity via `drain_commands`.
+            commands: Mutex::new(Vec::with_capacity(64)),
         }
     }
 
@@ -181,9 +216,18 @@ impl ThreadedPio {
 
     /// Drain all pending commands. Intended for the PIO thread to call
     /// during the coordinator phase.
+    ///
+    /// Preserves the queue's allocated capacity across drains: `mem::take`
+    /// would replace the guarded `Vec` with `Vec::new()` (cap 0), which
+    /// makes the next quantum's push path reallocate from scratch. For
+    /// firmware doing heavy setup (INSTR_MEM 32×3 = 96 writes plus per-SM
+    /// configuration) the reallocation cost adds up — `mem::replace` with
+    /// a same-capacity `Vec` recycles the prior allocation so the push
+    /// path is steady-state allocation-free after the first warm-up.
     pub fn drain_commands(&self) -> Vec<PioCommand> {
         let mut guard = self.commands.lock().expect("PIO command mutex poisoned");
-        std::mem::take(&mut *guard)
+        let cap = guard.capacity();
+        std::mem::replace(&mut *guard, Vec::with_capacity(cap))
     }
 
     // --- Reset ---
@@ -279,12 +323,14 @@ mod tests {
             block: 0,
             addr: 5,
             value: 0x1234,
+            alias: 0,
         });
         pio.send_command(PioCommand::SetClkDiv {
             block: 1,
             sm: 2,
             int_div: 100,
             frac_div: 7,
+            alias: 0,
         });
 
         let drained = pio.drain_commands();
@@ -295,6 +341,7 @@ mod tests {
                 block: 0,
                 addr: 5,
                 value: 0x1234,
+                alias: 0,
             }
         );
         assert_eq!(
@@ -304,6 +351,7 @@ mod tests {
                 sm: 2,
                 int_div: 100,
                 frac_div: 7,
+                alias: 0,
             }
         );
 
@@ -316,5 +364,38 @@ mod tests {
         let pio = ThreadedPio::new();
         let drained = pio.drain_commands();
         assert!(drained.is_empty());
+    }
+
+    /// `drain_commands` must preserve the queue's allocated capacity —
+    /// `mem::take` would replace with `Vec::new()` (cap 0), forcing the
+    /// next quantum to reallocate from scratch. Setup-heavy firmware
+    /// (INSTR_MEM 32×3 + per-SM config) pushes 100+ commands per quantum,
+    /// so this matters for steady-state performance.
+    #[test]
+    fn drain_preserves_capacity() {
+        let pio = ThreadedPio::new();
+        // Push enough commands to force at least one grow past the initial
+        // Vec::with_capacity(64). The actual capacity can be >= 128 after
+        // grow — we only care that drain doesn't reset it to 0.
+        for i in 0..128u32 {
+            pio.send_command(PioCommand::WriteReg {
+                block: 0,
+                offset: 0x010,
+                val: i,
+                alias: 0,
+            });
+        }
+        let cap_before = pio.commands.lock().unwrap().capacity();
+        assert!(cap_before >= 128, "capacity should have grown to hold 128 entries");
+
+        let drained = pio.drain_commands();
+        assert_eq!(drained.len(), 128);
+
+        let cap_after = pio.commands.lock().unwrap().capacity();
+        assert_eq!(
+            cap_after, cap_before,
+            "drain must preserve capacity ({} -> {})",
+            cap_before, cap_after
+        );
     }
 }

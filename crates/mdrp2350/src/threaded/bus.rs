@@ -59,6 +59,7 @@ use crate::peripherals::ticks::TICKS_BASE;
 use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE};
 use crate::peripherals::uart::UART0_BASE;
 use crate::threaded::CoreAtomics;
+use crate::threaded::PioCommand;
 use crate::threaded::SharedState;
 
 /// Capacity bound for [`WorkerBus::pending_cache_invalidations`]: STM
@@ -451,13 +452,36 @@ impl WorkerBus {
                 .unwrap()
                 .dma
                 .read32(offset),
-            // PIO register reads go through the shared command queue
-            // path in Stage 7 (register-image reflection is Stage 7's
-            // job once the PIO worker is running). For Stage 5, return
-            // zero to keep the dyn-cover test clean. Firmware that
-            // reads PIO registers before Stage 7 will see 0, matching
-            // a freshly reset PIO block.
-            0x5020_0000 | 0x5030_0000 | 0x5040_0000 => 0,
+            // PIO register reads: the `PioBlock`s themselves live on
+            // the PIO worker thread, so the CPU worker can only observe
+            // the atomics `ThreadedPio` publishes — today that's
+            // CTRL.SM_ENABLE (0x000) and IRQ (0x030). RX FIFO pops and
+            // per-SM register reads need a read-through channel (not
+            // yet wired — Phase 4/5 scope) and return 0 for now, which
+            // matches a freshly reset block.
+            0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {
+                // PIO blocks are 0x10_0000 bytes apart (0x502/0x503/0x504).
+                let block = ((base - 0x5020_0000) >> 20) as usize;
+                match offset {
+                    0x000 => self.shared.pio.read_sm_enabled(block) as u32,
+                    0x030 => self.shared.pio.read_irq_flags(block) as u32,
+                    _ => {
+                        // FSTAT / FLEVEL / RXFn / DBG_* / per-SM
+                        // reads need a read-through channel to the PIO
+                        // worker's local `PioBlock`s (Phase 4/5 scope).
+                        // Surface the gap loudly under `cargo test`,
+                        // keep release behaviour as 0 for forward
+                        // compatibility with firmware that polls these
+                        // before they're wired.
+                        debug_assert!(
+                            false,
+                            "PIO ahb_read32 offset {:#05X} not yet wired (Phase 4/5)",
+                            offset,
+                        );
+                        0
+                    }
+                }
+            }
             _ => {
                 self.shared
                     .peripherals
@@ -490,24 +514,69 @@ impl WorkerBus {
                 .dma
                 .write32(offset, val, alias),
             0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {
-                // PIO MMIO routing is Stage 7's responsibility;
-                // intermediate writes drop silently (reads return 0 in
-                // `ahb_read32`) to avoid false-pass in readback tests.
-                // Storing in `legacy` would let a readback return the
-                // written value while the PIO never actually gets
-                // programmed — masking missing Stage 7 wiring in any
-                // smoke test that writes then reads back INSTR_MEM.
+                // CPU→PIO writes are one-quantum-delayed: the command
+                // queues here, and the PIO worker drains + applies at
+                // the TOP of the NEXT quantum. Firmware that writes
+                // CTRL then reads back inline will see the pre-update
+                // value. Spec: V7 HLD §5 "One-quantum delay on CPU→PIO
+                // writes". Firmware must issue DMB + yield one quantum
+                // for the writeback to be visible.
                 //
-                // TODO(stage8): PIO CTRL / INSTR_MEM / CLKDIV writes
-                // currently drop silently. Real routing requires:
-                //   1. Extending `PioCommand` with `SetSmEnabled { block, mask }` +
-                //      `WriteCtrl { block, reg, val, alias }`.
-                //   2. ahb_write32 pushing these commands via `shared.pio.send_command`.
-                //   3. PIO worker's `apply_pio_command` dispatching them into PioBlock
-                //      state (including `PioBlock::set_enabled_mask`).
-                // Until wired, PIO is stepable only via state directly configured in
-                // the single-threaded Bus before `from_emulator` is called.
-                let _ = (canonical, alias, val); // consumed in Stage 7
+                // PIO MMIO routing (Phase 3 task #11): queue a
+                // PioCommand onto `shared.pio` for the PIO worker to
+                // apply against its locally-owned `PioBlock`s.
+                //
+                // Dispatch breakdown:
+                //   - CTRL (0x000) → WriteCtrl (worker also republishes
+                //     the post-write sm_enabled_mask onto `ThreadedPio`
+                //     so CPU-side reads observe the new enable bits).
+                //   - INSTR_MEM0..31 (0x048-0x0C4) → WriteInstrMem.
+                //   - SMn_CLKDIV (0x0C8 + sm*0x18) → SetClkDiv (decodes
+                //     the INT/FRAC fields so the command carries the
+                //     wire-format ints the worker passes back through
+                //     `PioBlock::write32`).
+                //   - Everything else (TXF0..TXF3, IRQ, FDEBUG,
+                //     INPUT_SYNC_BYPASS, per-SM EXECCTRL/SHIFTCTRL/
+                //     INSTR/PINCTRL) → WriteReg, which the worker
+                //     hands straight to `PioBlock::write32`.
+                //
+                // `alias` (the 2 bits encoded in address[13:12]) is
+                // propagated on every variant — the single-threaded
+                // `Bus::write32` forwards it unconditionally to
+                // `PioBlock::write32`, so dropping it here would make
+                // aliased writes (SET/CLR/XOR) diverge between modes.
+                // PIO blocks are 0x10_0000 bytes apart (0x502/0x503/0x504).
+                let block = ((base - 0x5020_0000) >> 20) as u8;
+                let off12 = offset as u16;
+                let cmd = match off12 {
+                    0x000 => PioCommand::WriteCtrl { block, val, alias: alias as u8 },
+                    0x048..=0x0C4 => {
+                        let addr = ((off12 - 0x048) >> 2) as u8;
+                        PioCommand::WriteInstrMem {
+                            block,
+                            addr,
+                            value: val as u16,
+                            alias: alias as u8,
+                        }
+                    }
+                    // SMn_CLKDIV: 0x0C8, 0x0E0, 0x0F8, 0x110. Stride 0x18.
+                    0x0C8 | 0x0E0 | 0x0F8 | 0x110 => {
+                        let sm = ((off12 - 0x0C8) / 0x18) as u8;
+                        // CLKDIV layout: INT<<16, FRAC<<8 — see
+                        // `PioBlock::write_sm_reg` / `sm.write_clkdiv`.
+                        let int_div = ((val >> 16) & 0xFFFF) as u16;
+                        let frac_div = ((val >> 8) & 0xFF) as u8;
+                        PioCommand::SetClkDiv {
+                            block,
+                            sm,
+                            int_div,
+                            frac_div,
+                            alias: alias as u8,
+                        }
+                    }
+                    _ => PioCommand::WriteReg { block, offset: off12, val, alias: alias as u8 },
+                };
+                self.shared.pio.send_command(cmd);
             }
             _ => {
                 let mut legacy = self.shared.peripherals.legacy.lock().unwrap();

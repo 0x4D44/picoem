@@ -1,6 +1,6 @@
 [package]
 name = "mdrp2350"
-version = "1.1.0"
+version = "1.3.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,12 @@ test-hooks = ["mdpicoem-common/test-hooks"]
 
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
+
+# Enable the PIO `test-hooks` feature for in-crate tests so `pop_tx` /
+# `push_rx` are callable without gating the production build. This
+# mirrors how `mdpicoem-harness` opts in under its own [dev-dependencies].
+[dev-dependencies]
+mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
 
 # Threading Phase 3 Stage 6b (LLD V7 §8/§9): Windows thread-affinity
 # pinning for the 4-thread runtime. The `ThreadedEmulator` path is

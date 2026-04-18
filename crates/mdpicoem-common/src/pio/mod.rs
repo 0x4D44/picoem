@@ -79,6 +79,16 @@ impl PioBlock {
         self.sm_enabled_mask != 0
     }
 
+    /// 4-bit enable mask — bit `i` set iff SM `i` is enabled. Parity
+    /// with the bit layout of the CTRL register's SM_ENABLE field.
+    /// Used by the threaded runtime to republish the post-CTRL-write
+    /// enable state onto `ThreadedPio::sm_enabled` so CPU workers see
+    /// the correct mask without reaching into `pub(crate)` fields.
+    #[inline]
+    pub fn sm_enabled_mask(&self) -> u8 {
+        self.sm_enabled_mask
+    }
+
     /// The 8-bit PIO IRQ-flag register as a `u32` (upper bits zero).
     ///
     /// PIO maintains 8 internal IRQ flags (`IRQ[7:0]`); flags 0..3
