@@ -103,8 +103,24 @@ impl CoreAtomics {
 
     /// Swap-to-zero consume of the pending mask — non-zero return
     /// replaces the V5 `irq_pending_dirty` flag.
+    ///
+    /// Load-first fast path: called every CPU emu-step, and the
+    /// steady-state case is "no IRQ pending". A plain Acquire load on
+    /// the shared cache line costs ~1 clock; only when the mask is
+    /// non-zero do we pay the `LOCK XCHG` to atomically clear it.
+    /// Skipping the RMW in the zero case avoids the per-instruction
+    /// cache-line invalidation between CPU workers.
+    ///
+    /// Race behaviour: if a writer (coord's `assert_irq_shared` or a
+    /// peer `sev`) stores non-zero between our load and a
+    /// subsequent step's observation, the new bits are picked up on
+    /// the next step — at most one emu-step of IRQ latency jitter,
+    /// within the threaded-mode tolerance from HLD V7 §5.2.
     #[inline]
     pub fn take_irq_pending(&self, core: usize) -> u64 {
+        if self.irq_pending[core].load(Ordering::Acquire) == 0 {
+            return 0;
+        }
         self.irq_pending[core].swap(0, Ordering::AcqRel)
     }
 
