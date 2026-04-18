@@ -272,6 +272,31 @@ impl Hazard3 {
         self.csrs.mcause = 0;
     }
 
+    /// Clear the PMP CSR bank — companion to [`Self::reset_diff_csrs`]
+    /// for phase-2 PMP fuzzing. On silicon the L-bit is sticky across
+    /// all resets short of a system reset; the emulator's fuzz harness
+    /// calls this between test cases to model the "fresh hart" state
+    /// each case would see if it were running in isolation. QEMU's side
+    /// still accumulates L-locked state — phase-2 fuzz patterns avoid
+    /// L=1 in the value pool to stay within the matchable window (see
+    /// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` V2 §A.6).
+    pub fn reset_pmp_csrs(&mut self) {
+        self.csrs.pmpcfg = [0; 4];
+        self.csrs.pmpaddr = [0; 16];
+    }
+
+    /// Borrow the full PMP cfg bank (4 × u32 packed bytes — entry i config
+    /// in byte i%4 of `pmpcfg[i/4]`). Exposed for diagnostic dumps in the
+    /// diff harness; phase-2 uses this to print per-test state on divergence.
+    pub fn pmpcfg(&self) -> [u32; 4] {
+        self.csrs.pmpcfg
+    }
+
+    /// Borrow the full PMP addr bank (16 × u32). Entries 8..15 are RAZ/WI.
+    pub fn pmpaddr(&self) -> [u32; 16] {
+        self.csrs.pmpaddr
+    }
+
     /// Hart halt flag — observed by `step_pair_riscv`. Setting to `true`
     /// prevents further dispatch; clearing resumes execution.
     pub fn set_halted(&mut self, halted: bool) {

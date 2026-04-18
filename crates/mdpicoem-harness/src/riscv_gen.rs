@@ -64,11 +64,12 @@ pub enum RiscvClass {
     Zicsr,
     Zifencei,
     CsrSideEffect,
-    /// Physical Memory Protection CSR surface — phase-1 models pmpcfg0
-    /// byte 0 + pmpaddr0 only (NUM_ENTRIES=1). Other pmpcfg/pmpaddr
-    /// addresses are RAZ/WI in both the emu and (via `warl_mask`) the
-    /// QEMU-side read. See
-    /// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md`.
+    /// Physical Memory Protection CSR surface — phase-2 models pmpcfg0/1
+    /// and pmpaddr0..7 (NUM_ENTRIES=8, matching RP2350 datasheet §3.8
+    /// dynamic-region count). L-bit sticky-lock + TOR cross-entry lock
+    /// are modelled on the emu side; entries 8..15 are RAZ/WI on both
+    /// sides (via `warl_mask` for QEMU). See
+    /// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` V2 §A.
     Pmp,
 }
 
@@ -1170,20 +1171,19 @@ pub fn gen_csr_side_effect_edge_cases() -> Vec<RiscvTestCase> {
     out
 }
 
-/// PMP CSR surface (phase-1: pmpcfg0 byte 0 + pmpaddr0). Each edge case
-/// is a single write-then-read-back so the diff lands on `rd` of both
-/// instructions (the read-back is the primary divergence catcher; the
-/// write-side `rd` is the old value). See
-/// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` §4.2.
+/// PMP CSR surface (phase-2: NUM_ENTRIES=8 covering pmpcfg0..1 and
+/// pmpaddr0..7). Each edge case is a single write-then-read-back so the
+/// diff lands on `rd` of both instructions (the read-back is the primary
+/// divergence catcher; the write-side `rd` is the old value). See
+/// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` §4.2 +
+/// V2 §A.6.
 ///
-/// The phase-1 value pool deliberately excludes L-bit-set patterns: once
-/// L=1 is latched in silicon, only a system reset clears it, and the
-/// emulator's phase-1 model does not implement L-bit handling (deferred
-/// to phase-2).
+/// The edge-case value pool excludes L-bit patterns: QEMU cannot be
+/// reset between tests, so any L=1 latch on QEMU side leaks into
+/// subsequent PMP edge cases. L-bit semantics are covered exhaustively
+/// by the emulator-only unit tests in `core_riscv/tests_p2.rs`.
 pub fn gen_pmp_edge_cases() -> Vec<RiscvTestCase> {
-    let mut out = Vec::with_capacity(16);
-    // Phase-1 WARL probe set. Mirrors the emu-side unit tests in
-    // `core_riscv/tests_p2.rs`.
+    let mut out = Vec::with_capacity(20);
     let patterns: &[(&str, u16, u32)] = &[
         ("pmpcfg0_zero",        0x3A0, 0x0000_0000),
         ("pmpcfg0_rwx",         0x3A0, 0x0000_0007),
@@ -1193,11 +1193,17 @@ pub fn gen_pmp_edge_cases() -> Vec<RiscvTestCase> {
         ("pmpcfg0_na4",         0x3A0, 0x0000_0010),
         ("pmpcfg0_reserved",    0x3A0, 0x0000_0060),
         ("pmpcfg0_bad_rw",      0x3A0, 0x0000_0002),
-        ("pmpcfg1_unsynth",     0x3A1, 0x0000_00FF),
+        // Phase-2: pmpcfg1 byte 0 is now synthesised (entry 4).
+        ("pmpcfg1_entry4_rwx",  0x3A1, 0x0000_000F),
+        // Phase-2: entry 8 stays WI — boundary probe.
+        ("pmpcfg2_unsynth",     0x3A2, 0x0000_00FF),
         ("pmpaddr0_zero",       0x3B0, 0x0000_0000),
         ("pmpaddr0_ones",       0x3B0, 0xFFFF_FFFF),
         ("pmpaddr0_napot_16b",  0x3B0, 0x0008_0007),
-        ("pmpaddr7_unsynth",    0x3B7, 0xDEAD_BEEF),
+        // Phase-2: pmpaddr7 now writable — readback verifies full width.
+        ("pmpaddr7_writable",   0x3B7, 0xDEAD_BEEF),
+        // Phase-2: entry 8 pmpaddr stays WI — boundary probe.
+        ("pmpaddr8_unsynth",    0x3B8, 0xDEAD_BEEF),
     ];
     for (name, csr, val) in patterns {
         // csrrw x10, <csr>, x6  ; csrrs x11, <csr>, x0
@@ -2144,22 +2150,29 @@ pub fn gen_fuzz_csr_side_effect<R: Rng>(
 /// clean after `warl_mask` zeros both sides).
 pub fn gen_fuzz_pmp<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
-    // pmpcfg0..3 (0x3A0..0x3A3) + pmpaddr0..7 (0x3B0..0x3B7).
+    // pmpcfg0..3 (0x3A0..0x3A3) + pmpaddr0..7 (0x3B0..0x3B7). pmpcfg2/3
+    // (entries 8..15) exercise the WARL boundary where QEMU virt
+    // synthesises 16 regions but phase-2 emu caps at 8; the harness's
+    // `warl_mask` zero-arms for entries ≥ 8 keep rd1/rd2 readbacks
+    // clean on both sides. Kept in the pool because `--class pmp`
+    // callers generally want the full CSR surface exercised.
     const CSRS: &[u16] = &[
         0x3A0, 0x3A1, 0x3A2, 0x3A3,
         0x3B0, 0x3B1, 0x3B2, 0x3B3, 0x3B4, 0x3B5, 0x3B6, 0x3B7,
     ];
-    // Interesting bit patterns for rs1. Phase-1 hard constraint (HLD
-    // §5.1 Risk 1 + team-lead review clarification 4): **no L-bit (bit 7
-    // of any pmpcfg byte) ever**. Once L=1 is latched the silicon side
-    // drops every subsequent pmpaddr0/pmpcfg0 write — QEMU virt models
-    // this faithfully, so a single stray L=1 pattern early in the fuzz
-    // stream would sink the remaining tests in the run. Emu phase-1
-    // doesn't model L at all, so the divergence is massive and
-    // meaningless. Each value below has bit 7 and bit 15 and bit 23 and
-    // bit 31 clear on every byte (`& 0x7F7F_7F7F`). pmpaddr values are
-    // unconstrained because pmpaddr L-gating is cross-entry via pmpcfg
-    // and phase-1 never touches pmpcfg with L=1.
+    // Interesting bit patterns for rs1. Phase-2 hard constraint (HLD
+    // §5.1 Risk 1 + V2 §A.6): **no L-bit (bit 7 of any pmpcfg byte)
+    // ever**. Once L=1 is latched in silicon / QEMU, only a system reset
+    // clears it. The emulator now correctly models L-sticky, but the
+    // harness cannot reset QEMU's CSR bank between tests — so a single
+    // L=1 write early in a fuzz run would make every subsequent pmpcfg
+    // write on QEMU drop, while the emulator's per-test `reset_pmp_csrs`
+    // desynchronises it (see `run_one_test` reset site).
+    //
+    // Each value below has bit 7, 15, 23, 31 clear on every byte
+    // (`& 0x7F7F_7F7F`). pmpaddr values are unconstrained because the
+    // L-gating on pmpaddr is via pmpcfg state which the fuzz stream
+    // never sets L on.
     const VALUES: &[u32] = &[
         0x0000_0000, // all zeros
         0x7F7F_7F7F, // all-ones with L cleared on every byte
@@ -2182,7 +2195,16 @@ pub fn gen_fuzz_pmp<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     ];
     for i in 0..count {
         let csr = CSRS[rng.gen_range(0..CSRS.len())];
-        let val = VALUES[rng.gen_range(0..VALUES.len())];
+        // Force L=0 on every byte. The VALUES pool has two "chaotic"
+        // patterns (0xDEAD_BEEF, 0xCAFE_BABE) intended for pmpaddr that
+        // would land L=1 if picked for a pmpcfg CSR — phase-2 emu and
+        // QEMU disagree on L-sticky propagation across the fuzz run
+        // (QEMU lacks the harness-side reset ritual), so this pool-wide
+        // mask keeps the stream within the L=0 window that both sides
+        // model identically. Pmpaddr writes are unaffected — they do
+        // not interpret bit 7 — so the chaotic patterns still serve
+        // their original purpose there with three fewer bits of entropy.
+        let val = VALUES[rng.gen_range(0..VALUES.len())] & 0x7F7F_7F7F;
         // Mix: 40 % single-CSR write, 60 % write-then-read-back (primary
         // divergence catcher per HLD §4.2 pattern 2).
         let read_back = rng.gen_range(0..100_u32) >= 40;

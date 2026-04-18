@@ -47,23 +47,44 @@ pub(crate) const CSR_MEINEXT:      u16 = 0xBE4;
 pub(crate) const CSR_MEICONTEXT:   u16 = 0xBE5;
 
 // Physical Memory Protection (`pmpcfg0..3`, `pmpaddr0..15`) per RV-priv
-// 1.12 §3.7. Phase-1 models the Hazard3 PMP as a CSR register bank only —
-// writes and reads are WARL-modelled but no access-fault enforcement is
-// wired to fetch/load/store (Hazard3 V1 is M-mode only, so PMP enforcement
-// is architecturally a no-op even when set; see
-// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md`).
+// 1.12 §3.7. Phase-2 models the Hazard3 PMP as a CSR register bank only —
+// writes and reads are WARL-modelled (including L-bit sticky-lock and
+// TOR cross-entry lock) but no access-fault enforcement is wired to
+// fetch/load/store (Hazard3 V1 is M-mode only, so PMP enforcement is
+// architecturally a no-op even when set). See
+// `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` (phase-1) and
+// the V2 addendum that opens phase-2.
 //
-// `PMP_NUM_ENTRIES = 1` pins phase-1 to a single synthesised entry
-// (pmpcfg0 byte 0 + pmpaddr0); every other PMP CSR index reads 0 and
-// silently drops writes.
+// `PMP_NUM_ENTRIES = 8` matches RP2350 datasheet §3.8 (Hazard3 synthesis
+// parameter `PMP_REGIONS = 11`, of which entries 0..7 are dynamically
+// configurable; entries 8..10 are "hardwired" — configured by the RP2350
+// bootrom at boot, not silicon-const — and entries 11..15 are hardwired
+// OFF). Phase-2 emulator models only the 8 dynamic entries; 8..15 are
+// RAZ/WI, which matches QEMU at cold reset (no bootrom).
+//
+// Granule: G=0 in the emulator. Silicon ships G=3 (32-byte granule) per
+// datasheet §3.8, but QEMU 10.2 rv32 defaults to G=0 and does NOT expose
+// `pmp-grain` as a CPU property — so matching silicon here would diverge
+// from QEMU on every pmpaddr readback. G=3 is deferred until a silicon
+// RISC-V diff oracle exists (no such oracle today — `test_rp2350_probe_*`
+// covers ARM only). See HLD V2 §A.5.
 pub(crate) const CSR_PMPCFG0:   u16 = 0x3A0;
 pub(crate) const CSR_PMPCFG3:   u16 = 0x3A3;
 pub(crate) const CSR_PMPADDR0:  u16 = 0x3B0;
 pub(crate) const CSR_PMPADDR15: u16 = 0x3BF;
-pub(crate) const PMP_NUM_ENTRIES: usize = 1;
+pub(crate) const PMP_NUM_ENTRIES: usize = 8;
 /// pmpcfg reserved bits [6:5] per byte (Smepmp, not implemented by Hazard3)
 /// — masked to zero on write.
 const PMPCFG_RESERVED_BITS: u8 = 0b0110_0000;
+/// pmpcfg L bit (bit 7). Once set, the byte itself and its paired pmpaddr
+/// are locked until system reset (RV-priv §3.7.1). Phase-2 models this.
+const PMPCFG_L_BIT: u8 = 0b1000_0000;
+/// pmpcfg A field (bits [4:3]) mask.
+const PMPCFG_A_MASK: u8 = 0b0001_1000;
+/// A-field value for TOR (top-of-range) — entry i's range uses
+/// `pmpaddr[i-1]` as its lower bound, so locking entry i with A=TOR also
+/// locks entry i-1's pmpaddr.
+const PMPCFG_A_TOR: u8 = 0b0000_1000;
 
 /// mstatus writable mask. V1 supports MIE (bit 3), MPIE (bit 7),
 /// MPP (bits [12:11], WARL to 0b11). All other bits (SIE/UIE/MPRV/
@@ -305,32 +326,39 @@ fn write_csr(hart: &mut Hazard3, csr: u16, val: u32, irq_pending: u64) {
     }
 }
 
-/// Write a `pmpcfg*` CSR. Per HLD §4.1 phase-1:
+/// Write a `pmpcfg*` CSR. Per HLD V2 phase-2:
 ///   * entries >= PMP_NUM_ENTRIES — byte write silently dropped (stored
 ///     stays zero),
+///   * if the currently-stored byte has L=1, the entire byte write is
+///     dropped (sticky-lock; cleared only by `reset_pmp_csrs()` on
+///     emulator, by system reset on silicon),
 ///   * bits [6:5] cleared (Smepmp reserved, unimplemented by Hazard3),
 ///   * W=1,R=0 rounded to W=0,R=0 per vendor spec and RV-priv §3.7.1 (a
 ///     write-without-read region is architecturally meaningless).
-///
-/// No L-bit handling in phase-1 (see HLD §4.3 / §5.1 — sticky-trap
-/// deferral).
 fn write_pmp_cfg(hart: &mut Hazard3, csr: u16, val: u32) {
     let cfg_idx = (csr - CSR_PMPCFG0) as usize;
-    let mut out: u32 = 0;
+    let cur = hart.csrs.pmpcfg[cfg_idx];
+    let mut out: u32 = cur; // keep current; overwrite only unlocked bytes
     for byte in 0..4 {
         let entry = cfg_idx * 4 + byte;
         if entry >= PMP_NUM_ENTRIES {
-            continue; // unsynthesised — leave byte zero
+            continue; // unsynthesised — byte stays 0
+        }
+        let cur_byte = ((cur >> (byte * 8)) & 0xFF) as u8;
+        if (cur_byte & PMPCFG_L_BIT) != 0 {
+            continue; // locked — drop this byte's write, keep cur_byte
         }
         let raw = ((val >> (byte * 8)) & 0xFF) as u8;
         let masked = warl_pmpcfg_byte(raw);
-        out |= (masked as u32) << (byte * 8);
+        out = (out & !(0xFFu32 << (byte * 8))) | ((masked as u32) << (byte * 8));
     }
     hart.csrs.pmpcfg[cfg_idx] = out;
 }
 
 /// WARL mask for one pmpcfg byte: clear reserved bits [6:5], then round
-/// W=1,R=0 → W=0,R=0. Idempotent.
+/// W=1,R=0 → W=0,R=0. L bit (7) is preserved in the write value — the
+/// caller gates the entire byte on the *previously stored* L, so the
+/// new L bit in the raw input is the "first-write" latch. Idempotent.
 #[inline]
 fn warl_pmpcfg_byte(b: u8) -> u8 {
     let v = b & !PMPCFG_RESERVED_BITS;
@@ -340,11 +368,44 @@ fn warl_pmpcfg_byte(b: u8) -> u8 {
 }
 
 /// Write a `pmpaddr*` CSR. Entries >= PMP_NUM_ENTRIES are silently
-/// dropped. For synthesised entries, G=0 means every bit is writable.
+/// dropped. For synthesised entries, G=0 means every bit is writable,
+/// modulo the L-bit gates per RV-priv §3.7.1:
+///   * if entry i's own pmpcfg byte has L=1, pmpaddr[i] is locked,
+///   * if entry i+1's pmpcfg byte has L=1 AND A=TOR, pmpaddr[i] is
+///     locked (because entry i+1's TOR range uses pmpaddr[i] as its
+///     lower bound).
 fn write_pmp_addr(hart: &mut Hazard3, csr: u16, val: u32) {
     let idx = (csr - CSR_PMPADDR0) as usize;
     if idx >= PMP_NUM_ENTRIES {
         return; // unsynthesised — drop
     }
+    if pmpaddr_is_locked(hart, idx) {
+        return;
+    }
     hart.csrs.pmpaddr[idx] = val;
+}
+
+/// Check both L-bit gates for `pmpaddr[idx]`.
+fn pmpaddr_is_locked(hart: &Hazard3, idx: usize) -> bool {
+    // Own-entry gate.
+    if (pmpcfg_byte(hart, idx) & PMPCFG_L_BIT) != 0 {
+        return true;
+    }
+    // TOR cross-entry gate: entry idx+1 with A=TOR locks pmpaddr[idx].
+    let nxt = idx + 1;
+    if nxt < PMP_NUM_ENTRIES {
+        let nxt_byte = pmpcfg_byte(hart, nxt);
+        if (nxt_byte & PMPCFG_L_BIT) != 0 && (nxt_byte & PMPCFG_A_MASK) == PMPCFG_A_TOR {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract pmpcfg byte for entry `idx`. `idx` must be < 16 (all CSR-addressable
+/// positions); callers pre-gate on `PMP_NUM_ENTRIES` where relevant.
+#[inline]
+fn pmpcfg_byte(hart: &Hazard3, idx: usize) -> u8 {
+    let cfg_word = hart.csrs.pmpcfg[idx / 4];
+    ((cfg_word >> ((idx % 4) * 8)) & 0xFF) as u8
 }

@@ -643,14 +643,19 @@ fn mepc_low_bits_masked() {
 }
 
 // -----------------------------------------------------------------------
-// PMP — phase-1 WARL (NUM_ENTRIES=1; pmpcfg0 byte 0 + pmpaddr0 only).
-// See `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` §6.1.
+// PMP — phase-2 WARL (NUM_ENTRIES=8; L-bit sticky; TOR cross-entry lock).
+// See `wrk_docs/2026.04.18 - HLD - RISC-V PMP Coverage V1.md` §6.1 (phase-1)
+// and V2 §A.6 (phase-2 additions).
 // -----------------------------------------------------------------------
 
 const CSR_PMPCFG0_ADDR: u16 = 0x3A0;
 const CSR_PMPCFG1_ADDR: u16 = 0x3A1;
+const CSR_PMPCFG2_ADDR: u16 = 0x3A2;
 const CSR_PMPADDR0_ADDR: u16 = 0x3B0;
+const CSR_PMPADDR1_ADDR: u16 = 0x3B1;
+const CSR_PMPADDR6_ADDR: u16 = 0x3B6;
 const CSR_PMPADDR7_ADDR: u16 = 0x3B7;
+const CSR_PMPADDR8_ADDR: u16 = 0x3B8;
 
 #[test]
 fn pmpcfg0_byte0_roundtrip() {
@@ -712,27 +717,160 @@ fn pmpaddr0_full_width_writable() {
 }
 
 #[test]
-fn pmpcfg1_unsynthesised_wi() {
+fn pmpcfg1_byte0_writable_phase2() {
+    // Phase-2: NUM_ENTRIES=8, so pmpcfg1 byte 0 (= entry 4) is synthesised.
     let (mut c, mut bus) = fresh();
-    c.x[1] = 0x0000_00FF;
+    c.x[1] = 0x0000_000F;
     c.execute(
         Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPCFG1_ADDR },
         &mut bus, 0,
     );
-    assert_eq!(c.csrs.pmpcfg[1], 0, "unsynthesised pmpcfg1 byte 0 is WI");
-    assert_eq!(c.x[2], 0, "read-side returns 0 for unsynthesised slot");
+    assert_eq!(c.csrs.pmpcfg[1], 0x0000_000F, "entry 4 is writable under phase-2");
+    assert_eq!(c.x[2], 0, "read-side prior value is zero");
 }
 
 #[test]
-fn pmpaddr7_unsynthesised_wi() {
+fn pmpaddr7_writable_phase2() {
+    // Phase-2: NUM_ENTRIES=8, so pmpaddr7 is synthesised (entry 7).
     let (mut c, mut bus) = fresh();
     c.x[1] = 0xDEAD_BEEF;
     c.execute(
         Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPADDR7_ADDR },
         &mut bus, 0,
     );
-    assert_eq!(c.csrs.pmpaddr[7], 0, "unsynthesised pmpaddr7 is WI");
-    assert_eq!(c.x[2], 0, "read-side returns 0 for unsynthesised slot");
+    assert_eq!(c.csrs.pmpaddr[7], 0xDEAD_BEEF, "entry 7 is fully writable");
+}
+
+#[test]
+fn pmpcfg2_unsynthesised_wi_phase2() {
+    // Phase-2 still caps at 8 entries, so pmpcfg2 byte 0 (entry 8) is WI.
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0x0000_00FF;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPCFG2_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[2], 0, "entry 8 unsynthesised — byte WI");
+    assert_eq!(c.x[2], 0, "read-side 0 for unsynthesised entry");
+}
+
+#[test]
+fn pmpaddr8_unsynthesised_wi_phase2() {
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0xDEAD_BEEF;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPADDR8_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpaddr[8], 0, "entry 8 unsynthesised — pmpaddr WI");
+    assert_eq!(c.x[2], 0, "read-side 0 for unsynthesised entry");
+}
+
+// --- Phase-2 L-bit sticky-lock tests -----------------------------------
+
+#[test]
+fn pmpcfg0_lock_write_protects() {
+    // Set L=1 on pmpcfg0 byte 0, then attempt to clear it. The clear must
+    // be silently dropped and the byte stays locked.
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0x0000_0080; // L=1, rest zero
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[0], 0x0000_0080, "L latched");
+    // Attempt to clear — should be dropped because L=1 already stored.
+    c.x[2] = 0;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[0], 0x0000_0080, "locked byte resists clear");
+}
+
+#[test]
+fn pmpaddr0_locked_by_own_l() {
+    // Set L=1 on pmpcfg0 byte 0, then pmpaddr0 writes should be dropped.
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0x0000_0080; // L=1
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    c.x[2] = 0xFFFF_FFFF;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPADDR0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpaddr[0], 0, "pmpaddr0 locked by own pmpcfg0.L");
+}
+
+#[test]
+fn pmpaddr0_locked_by_entry1_tor() {
+    // Set pmpcfg0 byte 1 (entry 1) = L=1 ∧ A=TOR; pmpaddr0 writes dropped.
+    // 0x88 = L=1 | A=TOR (bit 3) — bits [4:3] = 0b01, so 0x08 for A=TOR.
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0x0000_8800; // byte 1 = 0x88 = L|TOR
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!((c.csrs.pmpcfg[0] >> 8) & 0xFF, 0x88, "byte 1 latched L|TOR");
+    c.x[2] = 0x1234_5678;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPADDR0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpaddr[0], 0, "pmpaddr0 locked by entry 1 TOR+L");
+    // But pmpaddr1 (entry 1's own addr) is *also* locked by its own L.
+    c.x[3] = 0x1234_5678;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 3, csr: CSR_PMPADDR1_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpaddr[1], 0, "pmpaddr1 locked by own L");
+}
+
+#[test]
+fn pmpaddr6_not_locked_by_entry7_non_tor() {
+    // Entry 7 locked but A=NAPOT (not TOR) — pmpaddr6 stays writable.
+    // 0x98 = L=1 | A=NAPOT (0b11 << 3 = 0x18).
+    let (mut c, mut bus) = fresh();
+    // pmpcfg1 byte 3 = entry 7. 0x98 << 24.
+    c.x[1] = 0x9800_0000;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG1_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!((c.csrs.pmpcfg[1] >> 24) & 0xFF, 0x98, "entry 7 L|NAPOT latched");
+    c.x[2] = 0xABCD_0000;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPADDR6_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpaddr[6], 0xABCD_0000, "pmpaddr6 free — entry 7 not TOR");
+}
+
+#[test]
+fn reset_pmp_csrs_clears_lock() {
+    // Reset_pmp_csrs clears a previously latched L.
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 0x0000_00FF; // L=1, NAPOT, XWR
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_ne!(c.csrs.pmpcfg[0] & 0x80, 0, "L latched pre-reset");
+    c.reset_pmp_csrs();
+    assert_eq!(c.csrs.pmpcfg[0], 0, "pmpcfg0 cleared");
+    assert_eq!(c.csrs.pmpaddr[0], 0, "pmpaddr0 cleared");
+    // After reset, a fresh write succeeds.
+    c.x[2] = 0x0000_000F;
+    c.execute(
+        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPCFG0_ADDR },
+        &mut bus, 0,
+    );
+    assert_eq!(c.csrs.pmpcfg[0], 0x0000_000F, "post-reset write lands");
 }
 
 // -----------------------------------------------------------------------

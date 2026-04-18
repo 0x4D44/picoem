@@ -43,14 +43,15 @@ pub(crate) struct CsrFile {
     /// `mcountinhibit.IR`.
     pub minstret: u64,
     /// Packed PMP cfg bytes — entry i config lives in byte (i%4) of
-    /// pmpcfg[i/4]. Hazard3 ships a configurable entry count at synthesis
-    /// time; phase-1 pins this to `PMP_NUM_ENTRIES = 1` (pmpcfg0 byte 0 +
-    /// pmpaddr0 only). All remaining pmpcfg bytes / pmpaddr slots are
-    /// RAZ/WI. Storage shape is kept at 4 × u32 / 16 × u32 so phase-2 can
-    /// raise `PMP_NUM_ENTRIES` without disturbing layout.
+    /// pmpcfg[i/4]. Phase-2 pins `PMP_NUM_ENTRIES = 8` (matches RP2350
+    /// datasheet §3.8 — 8 dynamically configurable entries; entries 8..15
+    /// are hardwired and RAZ/WI at cold reset on both emulator and QEMU).
+    /// L-bit (bit 7) write-protects the byte and its paired pmpaddr per
+    /// RV-priv §3.7.1; `Hazard3::reset_pmp_csrs()` clears L between fuzz
+    /// cases.
     pub pmpcfg:  [u32; 4],
     /// Per-entry PMP address. `pmpaddr[i]` for `i >= PMP_NUM_ENTRIES` is
-    /// RAZ/WI.
+    /// RAZ/WI. Phase-2 models L-bit gating (own-L + entry i+1 TOR-lock).
     pub pmpaddr: [u32; 16],
 }
 

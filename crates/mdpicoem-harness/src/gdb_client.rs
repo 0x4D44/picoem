@@ -148,7 +148,14 @@ impl QemuProfile {
         // extension defaults to true and otherwise trips "Zfa extension
         // requires F extension" at spawn time.
         machine: "virt",
-        cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,f=false,d=false,zfa=false",
+        // `pmp=true` is explicit — QEMU 10.2's generic `rv32` CPU defaults
+        // this but wraps it in a `sstatus`/`pmp`-is-legal deprecation path
+        // that silently drops writes whose bit [11:7] picks a W=1/R=0
+        // pair. Matching Hazard3 on RP2350 means modelling PMP storage
+        // actively; phase-2 requires QEMU to do the same so the diff
+        // lines up rather than trapping. Confirmed accepted as property
+        // by QEMU 10.2 (probed 2026-04-18).
+        cpu: "rv32,a=true,m=true,c=true,zicsr=true,zifencei=true,f=false,d=false,zfa=false,pmp=true",
         gdb_port: 3335,
         bios: Some("none"),
         loader_addr: Some(0x8000_0000),

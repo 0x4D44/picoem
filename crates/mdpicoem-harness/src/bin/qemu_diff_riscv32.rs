@@ -893,6 +893,14 @@ fn run_one_test(
     // the harness compensates by skipping the pre-snapshot diff entirely
     // and only comparing the post-snapshot (see `diff_csr_snapshots`).
     emu.core_riscv_mut(0).reset_diff_csrs();
+    // Note: PMP CSRs are *not* reset between tests. Both sides must
+    // accumulate identical WARL-normalised state across the run — the
+    // csrrw write side of each test reads the *previous* value into
+    // rd, so resetting one side desyncs that read. The fuzz value pool
+    // excludes L=1 on generation (HLD V2 §A.6) to prevent sticky-lock
+    // from sinking the run; edge cases are L-free for the same reason.
+    // The `reset_pmp_csrs()` helper on Hazard3 exists for unit tests
+    // that need a fresh bank, not for per-test isolation here.
 
     // Seed pre-state on both sides.
     apply_reg_pre_qemu(gdb, tc)?;
@@ -1343,31 +1351,37 @@ fn warl_mask(csr: u16, v: u32) -> u32 {
             } else if code <= 7 || code == 11 { code } else { 0 };
             interrupt | legal_code
         }
-        // PMP — phase-1 (NUM_ENTRIES=1). pmpcfg byte per-byte WARL: mask
-        // reserved bits [6:5] on both sides; round W=1,R=0 → W=0,R=0; zero
-        // out bytes for entries beyond the synthesised count. QEMU virt
-        // rv32 synthesises 16 entries so its side otherwise holds the
-        // written values for bytes 1..; zeroing symmetrically keeps both
-        // sides clean. See `wrk_docs/2026.04.18 - HLD - RISC-V PMP
-        // Coverage V1.md` §4.2.
+        // PMP — phase-2 (NUM_ENTRIES=8). pmpcfg byte per-byte WARL: mask
+        // reserved bits [6:5]; round W=1,R=0 → W=0,R=0; zero out bytes
+        // for entries beyond the synthesised count. QEMU virt rv32
+        // synthesises 16 entries, so entries 8..15 otherwise hold the
+        // written value there; zeroing symmetrically keeps both sides
+        // clean. L-bit (bit 7) is preserved in the mask — phase-2 models
+        // L on the emulator and QEMU also models L, so both sides latch
+        // identical sticky state across writes. Phase-2 fuzz pool still
+        // excludes L=1 from the *generator* (HLD V2 §A.6) to keep the
+        // readback surface usable across the run; the L mask here only
+        // matters for edge cases that exercise lock patterns.
         0x3A0..=0x3A3 => {
             let mut out = 0u32;
             for byte in 0..4 {
                 let entry_idx = (csr - 0x3A0) as usize * 4 + byte;
                 let b = (v >> (byte * 8)) & 0xFF;
-                let masked = if entry_idx >= 1 { 0 } else { b & 0x9F };
+                let masked = if entry_idx >= 8 { 0 } else { b & 0x9F };
                 // W=1,R=0 is WARL-rounded to W=0,R=0
                 let masked = if (masked & 0b11) == 0b10 { masked & !0b11 } else { masked };
                 out |= masked << (byte * 8);
             }
             out
         }
-        // pmpaddr — entries 1..15 are RAZ on Hazard3 under phase-1
-        // (NUM_ENTRIES=1); QEMU virt holds the written value. Mask both
-        // sides to 0 for those entries.
+        // pmpaddr — entries 8..15 are RAZ on Hazard3 (NUM_ENTRIES=8);
+        // QEMU virt holds the written value. Mask both sides to 0 for
+        // those entries. Entries 0..7 pass through verbatim (G=0
+        // emulator — see HLD V2 §A.5 for why silicon G=3 is not modelled
+        // at the CSR interface yet).
         0x3B0..=0x3BF => {
             let entry_idx = (csr - 0x3B0) as usize;
-            if entry_idx >= 1 { 0 } else { v }
+            if entry_idx >= 8 { 0 } else { v }
         }
         _ => v,
     }
