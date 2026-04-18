@@ -188,6 +188,9 @@ pub const RESET_PLL_SYS: u8 = 14;
 pub const RESET_PLL_USB: u8 = 15;
 /// RESETS bit for PWM.
 pub const RESET_PWM: u8 = 16;
+/// RESETS bit for POWMAN (RP2350 datasheet §2.14.3 RESETS_RESET table —
+/// slot between RESET_PWM = 16 and RESET_SPI0 = 18).
+pub const RESET_POWMAN: u8 = 17;
 /// RESETS bit for SPI0.
 pub const RESET_SPI0: u8 = 18;
 /// RESETS bit for SPI1.
@@ -264,6 +267,7 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
         PADS_BANK0_BASE => Some(RESET_PADS_BANK0),
         DMA_BASE => Some(RESET_DMA),
         SYSCFG_BASE => Some(RESET_SYSCFG),
+        POWMAN_BASE => Some(RESET_POWMAN),
         _ => None,
     }
 }
@@ -1114,6 +1118,11 @@ impl Bus {
         }
         if !self.is_held_in_reset_bit(RESET_PWM) {
             self.pwm.tick(sys_clks, &self.clock_tree, &mut ext_irqs);
+        }
+        // POWMAN — AON timer; advance COUNT and pend TIMER IRQ on match.
+        // HLD "2026.04.17 - HLD - RP2350 Coverage Gap Fill V11.md" §3.2.
+        if !self.is_held_in_reset_bit(RESET_POWMAN) {
+            ext_irqs |= self.powman.advance(sys_clks, &self.clock_tree);
         }
         self.raise_irqs_u64(ext_irqs);
 

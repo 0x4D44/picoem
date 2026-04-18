@@ -1212,6 +1212,187 @@ const IMAGE_IRQ_PRIORITY_PREEMPT: [u8; IRQ_IMAGE_SIZE] =
         HANDLER_IRQ_PREEMPT, HANDLER_IRQ_LOW_PRIO, MAIN_IRQ_PRIORITY_PREEMPT, MODESET_IRQ_PREEMPT);
 
 // ---------------------------------------------------------------------------
+// POWMAN TIMER IRQ scenario (Coverage Gap Fill V11 §3.2)
+// ---------------------------------------------------------------------------
+//
+// `powman_match_irq_timer_line_45` — release POWMAN from reset, program
+// AON alarm = 100, enable `TIMER.RUN | TIMER.ALARM_ENAB`, enable NVIC
+// line 45 (bank 1 bit 13). Handler writes `0xCAFE_BABE` to
+// `ISR_MAILBOX_CYCCNT` (pre-seeded to 0 by the runner — see
+// `run_one_scenario`'s `write_word_32(ISR_MAILBOX_CYCCNT, 0)` and
+// `mmio_write32(ISR_MAILBOX_CYCCNT, 0)` calls) and BKPT #0. The HLD
+// suggests a `0xDEAD_BEEF` sentinel, but the existing oracle runner
+// uses 0; a post-run read of 0 means the handler never ran.
+//
+// Vector slot math: 16 + 45 = 61 → byte offset 61 * 4 = 0xF4. Below
+// `IRQ_IMAGE_SIZE`'s 64-slot vector table (0x100 bytes), so no layout
+// change needed. `MODESET_IRQ_POWMAN` populates the slot.
+//
+// NVIC line 45 is in bank 1: ISER1 at 0xE000_E104, bit (45 - 32) = 13.
+// Value 1 << 13 = 0x2000.
+
+const MODESET_IRQ_POWMAN: &[VectorSlot] = &[
+    VectorSlot::new(61, IRQ_HANDLER_OFFSET),
+];
+
+/// POWMAN handler — write `0xCAFE_BABE` to mailbox and BKPT #0. Same
+/// shape as `HANDLER_IRQ_CYCCNT` but stores a fixed sentinel instead
+/// of the CYCCNT snapshot, so the observable is trivially diffable.
+///
+/// Handler body at `IRQ_HANDLER_OFFSET = 0x104`. PC-relative LDR on
+/// Thumb resolves its target as `Align(PC+4, 4) + imm8*4`, where PC
+/// is the address of the current instruction. Because hw[1] sits at
+/// a *non-word-aligned* offset (0x106), its PC of 0x10A aligns DOWN
+/// to 0x108 before the imm8 offset is applied — so the imm8 needed
+/// for hw[1] differs from the one needed for hw[0].
+///
+/// Resolution table for this handler:
+///
+/// * `hw[0]` at 0x104: PC=0x108, Align=0x108, target hw[6]=0x110
+///   (= 0xCAFE_BABE). imm8=2 → `0x4802` (`ldr r0, [pc, #8]`).
+/// * `hw[1]` at 0x106: PC=0x10A, Align=0x108, target hw[8]=0x114
+///   (= ISR_MAILBOX_CYCCNT). imm8=3 → `0x4903` (`ldr r1, [pc, #12]`).
+///
+/// ```text
+///   [0] ldr r0, [pc, #8]     ; r0 = 0xCAFEBABE (from hw[6..7])
+///   [1] ldr r1, [pc, #12]    ; r1 = ISR_MAILBOX_CYCCNT (from hw[8..9])
+///   [2] str r0, [r1]         ; mailbox = sentinel
+///   [3] bkpt #0              ; halt
+///   [4] bkpt #0              ; padding
+///   [5] bkpt #0              ; padding
+///   [6..7] lit: 0xCAFEBABE
+///   [8..9] lit: ISR_MAILBOX_CYCCNT
+/// ```
+const HANDLER_POWMAN_SENTINEL: [u16; 10] = [
+    0x4802, //  [0] ldr r0, [pc, #8]    — r0 = 0xCAFE_BABE
+    0x4903, //  [1] ldr r1, [pc, #12]   — r1 = ISR_MAILBOX_CYCCNT
+    0x6008, //  [2] str r0, [r1]
+    0xBE00, //  [3] bkpt #0             — halt for host readback
+    0xBE00, //  [4] bkpt #0             — padding
+    0xBE00, //  [5] bkpt #0             — padding
+    0xBABE, //  [6] lit: 0xCAFEBABE low
+    0xCAFE, //  [7] lit: 0xCAFEBABE high
+    0x3FF8, //  [8] lit: ISR_MAILBOX_CYCCNT low  = 0x2000_3FF8 & 0xFFFF
+    0x2000, //  [9] lit: ISR_MAILBOX_CYCCNT high = 0x2000_3FF8 >> 16
+];
+
+/// POWMAN scenario main — release POWMAN, program alarm = 100, enable
+/// TIMER.RUN | TIMER.ALARM_ENAB, enable NVIC IRQ 45.
+///
+/// **POWMAN password requirement.** Per pico-sdk at the pinned commit
+/// `a1438dff1d38bd9c65dbd693f0e5db4b9ae91779` (`powman.h`), every
+/// password-gated POWMAN register (including ALARM_TIME_* and TIMER)
+/// silently drops writes unless bits [31:16] equal `0x5AFE`; a wrong
+/// password also latches `BADPASSWD`. The literal-pool values for
+/// ALARM=100 and TIMER=RUN|ALARM_ENAB therefore bake `0x5AFE` into
+/// the upper halfword: `0x5AFE_0064` and `0x5AFE_0012`. On silicon
+/// POWMAN stores only the low 16 bits; the emulator mirrors this by
+/// masking password-gated writes to `value & 0xFFFF` (see
+/// `peripherals::powman::PowmanRegs::write32`). RESETS and NVIC writes
+/// do NOT require the password.
+///
+/// All constants live in the literal pool starting at halfword [16]
+/// (= `IRQ_MAIN_OFFSET + 32` = 0x1A0). Each `ldr` uses PC-relative
+/// addressing; the encoding is offset-agnostic (PC-rel LDR opcodes
+/// depend only on *relative* position, not the absolute main offset).
+///
+/// ```text
+///   [ 0] ldr  r4, [pc, #56]      ; r4 = 1 << 17  (RESET_POWMAN)
+///   [ 1] ldr  r5, [pc, #56]      ; r5 = RESETS_RESET_CLR = 0x4002_3000
+///   [ 2] str  r4, [r5]           ; release POWMAN
+///   [ 3] ldr  r4, [pc, #56]      ; r4 = 100
+///   [ 4] ldr  r5, [pc, #56]      ; r5 = POWMAN_ALARM_TIME_15TO0
+///   [ 5] str  r4, [r5]           ; ALARM = 100
+///   [ 6] ldr  r4, [pc, #56]      ; r4 = RUN | ALARM_ENAB = 0x12
+///   [ 7] ldr  r5, [pc, #56]      ; r5 = POWMAN_TIMER
+///   [ 8] str  r4, [r5]           ; TIMER = RUN | ALARM_ENAB
+///   [ 9] ldr  r4, [pc, #56]      ; r4 = 1 << 13 = 0x2000
+///   [10] ldr  r5, [pc, #56]      ; r5 = NVIC_ISER1
+///   [11] str  r4, [r5]           ; enable IRQ 45
+///   [12] b    .                  ; busy-wait
+///   [13] bkpt #0                 ; safety (unreachable if IRQ fires)
+///   [14] nop                     ; padding
+///   [15] nop                     ; padding
+///   [16..17] lit: 1 << 17                  0x0002_0000
+///   [18..19] lit: RESETS_RESET_CLR         0x4002_3000
+///   [20..21] lit: 100 + POWMAN password    0x5AFE_0064
+///   [22..23] lit: POWMAN_ALARM_TIME_15TO0  0x4010_0084
+///   [24..25] lit: RUN|ALARM_ENAB + pwd     0x5AFE_0012
+///   [26..27] lit: POWMAN_TIMER             0x4010_0088
+///   [28..29] lit: 1 << 13                  0x0000_2000
+///   [30..31] lit: NVIC_ISER1               0xE000_E104
+/// ```
+///
+/// Literal-pool math at `IRQ_MAIN_OFFSET = 0x180`:
+///   hw[ 0] at 0x180: PC=0x184, Align=0x184, target hw[16]=0x1A0
+///          → offset 0x1C = 28 → imm8=7 → `0x4C07`
+///   hw[ 1] at 0x182: PC=0x186, Align=0x184, target hw[18]=0x1A4
+///          → offset 0x20 = 32 → imm8=8 → `0x4D08`
+///   hw[ 3] at 0x186: PC=0x18A, Align=0x188, target hw[20]=0x1A8
+///          → offset 0x20 = 32 → imm8=8 → `0x4C08`
+///   hw[ 4] at 0x188: PC=0x18C, Align=0x18C, target hw[22]=0x1AC
+///          → offset 0x20 = 32 → imm8=8 → `0x4D08`
+///   hw[ 6] at 0x18C: PC=0x190, Align=0x190, target hw[24]=0x1B0
+///          → offset 0x20 = 32 → imm8=8 → `0x4C08`
+///   hw[ 7] at 0x18E: PC=0x192, Align=0x190, target hw[26]=0x1B4
+///          → offset 0x24 = 36 → imm8=9 → `0x4D09`
+///   hw[ 9] at 0x192: PC=0x196, Align=0x194, target hw[28]=0x1B8
+///          → offset 0x24 = 36 → imm8=9 → `0x4C09`
+///   hw[10] at 0x194: PC=0x198, Align=0x198, target hw[30]=0x1BC
+///          → offset 0x24 = 36 → imm8=9 → `0x4D09`
+const MAIN_IRQ_POWMAN: [u16; 32] = [
+    0x4C07, // [ 0] ldr  r4, [pc, #28]    — r4 = 1 << 17
+    0x4D08, // [ 1] ldr  r5, [pc, #32]    — r5 = RESETS_RESET_CLR
+    0x602C, // [ 2] str  r4, [r5]         — release POWMAN
+    0x4C08, // [ 3] ldr  r4, [pc, #32]    — r4 = 100
+    0x4D08, // [ 4] ldr  r5, [pc, #32]    — r5 = POWMAN_ALARM_TIME_15TO0
+    0x602C, // [ 5] str  r4, [r5]
+    0x4C08, // [ 6] ldr  r4, [pc, #32]    — r4 = RUN | ALARM_ENAB
+    0x4D09, // [ 7] ldr  r5, [pc, #36]    — r5 = POWMAN_TIMER
+    0x602C, // [ 8] str  r4, [r5]
+    0x4C09, // [ 9] ldr  r4, [pc, #36]    — r4 = 1 << 13
+    0x4D09, // [10] ldr  r5, [pc, #36]    — r5 = NVIC_ISER1
+    0x602C, // [11] str  r4, [r5]
+    0xE7FE, // [12] b    .                — busy-wait
+    0xBE00, // [13] bkpt #0               — safety
+    0xBF00, // [14] nop
+    0xBF00, // [15] nop
+    0x0000, // [16] lit: 1 << 17 low  = 0x0002_0000 & 0xFFFF
+    0x0002, // [17] lit: 1 << 17 high = 0x0002_0000 >> 16
+    0x3000, // [18] lit: RESETS_RESET_CLR low  = 0x4002_3000 & 0xFFFF
+    0x4002, // [19] lit: RESETS_RESET_CLR high
+    0x0064, // [20] lit: (100 | POWMAN password) low  = 0x5AFE_0064 & 0xFFFF
+    0x5AFE, // [21] lit: (100 | POWMAN password) high = 0x5AFE_0064 >> 16
+    0x0084, // [22] lit: POWMAN_ALARM_TIME_15TO0 low
+    0x4010, // [23] lit: POWMAN_ALARM_TIME_15TO0 high
+    0x0012, // [24] lit: (RUN | ALARM_ENAB | POWMAN password) low  = 0x5AFE_0012 & 0xFFFF
+    0x5AFE, // [25] lit: (RUN | ALARM_ENAB | POWMAN password) high = 0x5AFE_0012 >> 16
+    0x0088, // [26] lit: POWMAN_TIMER low
+    0x4010, // [27] lit: POWMAN_TIMER high
+    0x2000, // [28] lit: 1 << 13 low
+    0x0000, // [29] lit: high
+    0xE104, // [30] lit: NVIC_ISER1 low
+    0xE000, // [31] lit: NVIC_ISER1 high
+];
+
+const IMAGE_IRQ_POWMAN: [u8; IRQ_IMAGE_SIZE] =
+    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
+        HANDLER_POWMAN_SENTINEL, HANDLER_NONE, MAIN_IRQ_POWMAN, MODESET_IRQ_POWMAN);
+
+// -- Scenario: powman_match_irq_timer_line_45 (Coverage Gap Fill V11 §3.2) --
+const INIT_IRQ_POWMAN: &[(IsrReg, u32)] = &[
+    (IsrReg::Vtor, ISR_IMAGE_BASE),
+];
+const OBS_IRQ_POWMAN: &[(&str, IsrObservable)] = &[
+    // CycleDelta slot carries the 0xCAFE_BABE sentinel the handler
+    // wrote. Runner pre-seeds ISR_MAILBOX_CYCCNT = 0 (not the
+    // HLD-prescribed 0xDEAD_BEEF — kept consistent with the existing
+    // runner infrastructure); a post-run read of 0 means the handler
+    // never ran, 0xCAFE_BABE means it did.
+    ("mailbox_sentinel", IsrObservable::CycleDelta),
+];
+
+// ---------------------------------------------------------------------------
 // Observables + init_regs per scenario
 // ---------------------------------------------------------------------------
 
@@ -1436,6 +1617,30 @@ pub const SCENARIOS: &[IsrScenario] = &[
         init_regs: INIT_EXT_IRQ_PRIORITY_PREEMPT,
         max_sysclks: 2000,
         observe: OBS_EXT_IRQ_PRIORITY_PREEMPT,
+    },
+    // Coverage Gap Fill V11 §3.2: POWMAN AON match fires IRQ 45. Main
+    // releases POWMAN from reset, programs ALARM=100 + TIMER.{RUN,
+    // ALARM_ENAB}, enables NVIC line 45 in bank 1. Handler writes
+    // 0xCAFE_BABE to ISR_MAILBOX_CYCCNT (pre-seeded 0 by the runner —
+    // see the HANDLER_POWMAN_SENTINEL docs). The scenario also runs on
+    // live RP2354 via `test_rp2350_silicon_isr_diff`.
+    //
+    // `max_sysclks = 100 * POWMAN_SYS_PER_TICK + 500 = 5500`. At the
+    // default clock tree (sys=150 MHz, POWMAN=3 MHz) this covers the
+    // 100-tick count-up plus exception entry + handler prologue.
+    // Stage 5 pre-flight (`smoke_powman_pacing_rp2350`) measures the
+    // real ratio; update if silicon disagrees.
+    // Name prefixed with `isr_` per the orchestrator's substring-
+    // uniqueness contract (see `test_rp2350_silicon.rs`); the
+    // informative suffix `powman_match_timer_line_45` traces back to
+    // HLD V11 §3.2's logical scenario name.
+    IsrScenario {
+        name: "isr_powman_match_timer_line_45",
+        image: &IMAGE_IRQ_POWMAN,
+        entry_offset: IRQ_MAIN_OFFSET,
+        init_regs: INIT_IRQ_POWMAN,
+        max_sysclks: 5500,
+        observe: OBS_IRQ_POWMAN,
     },
 ];
 
@@ -2000,8 +2205,8 @@ mod tests {
     //     prefix.
     #[test]
     fn test_catalogue_size_and_prefix() {
-        assert_eq!(SCENARIOS.len(), 7,
-            "catalogue must carry v1 (4) + Phase 0a (3) = 7 scenarios");
+        assert_eq!(SCENARIOS.len(), 8,
+            "catalogue must carry v1 (4) + Phase 0a (3) + POWMAN (1) = 8 scenarios");
         for s in SCENARIOS {
             assert!(
                 s.name.starts_with("isr_"),
@@ -2454,6 +2659,49 @@ mod tests {
         }
     }
 
+    /// POWMAN handler literal-pool strengthening: the value loaded for
+    /// r0 must be `0xCAFE_BABE` and the value loaded for r1 must equal
+    /// `ISR_MAILBOX_CYCCNT`. Regression guard for the original
+    /// `0x4902` (`ldr r1, [pc, #8]`) bug — because hw[1] sits at a
+    /// non-word-aligned offset (0x106), imm8=2 resolved to hw[6] (the
+    /// `0xCAFE_BABE` sentinel) rather than hw[8] (the mailbox address),
+    /// so the handler silently stored 0xCAFE_BABE into 0xCAFEBABE and
+    /// faulted. The correct encoding is `0x4903` (imm8=3), which
+    /// resolves to hw[8]. This test locks that in.
+    #[test]
+    fn test_handler_powman_sentinel_literals_are_mailbox_and_sentinel() {
+        let sc = SCENARIOS
+            .iter()
+            .find(|s| s.name == "isr_powman_match_timer_line_45")
+            .expect("POWMAN scenario must exist in the catalogue");
+        let layout = layout_for(sc);
+        let loads = collect_ldr_literal_loads(
+            sc.image,
+            layout.handler_offset as usize,
+            layout.main_offset as usize,
+        );
+        let r0_word = loads
+            .iter()
+            .find(|(_, rd, _, _)| *rd == 0)
+            .map(|(_, _, _, w)| *w)
+            .expect("POWMAN handler must contain an LDR targeting r0");
+        let r1_word = loads
+            .iter()
+            .find(|(_, rd, _, _)| *rd == 1)
+            .map(|(_, _, _, w)| *w)
+            .expect("POWMAN handler must contain an LDR targeting r1");
+        assert_eq!(
+            r0_word, 0xCAFE_BABE,
+            "POWMAN handler r0 literal must be 0xCAFE_BABE; got 0x{r0_word:08X}",
+        );
+        assert_eq!(
+            r1_word, crate::ISR_MAILBOX_CYCCNT,
+            "POWMAN handler r1 literal must be ISR_MAILBOX_CYCCNT \
+             (= 0x{:08X}); got 0x{r1_word:08X}",
+            crate::ISR_MAILBOX_CYCCNT,
+        );
+    }
+
     /// Every PC-relative LDR in the main body of a **baseline** scenario
     /// must resolve to one of the three v1 literals (DWT_CYCCNT_ADDR,
     /// SCB_ICSR_ADDR, ICSR_PENDSVSET). This is the specific regression
@@ -2528,14 +2776,27 @@ mod tests {
     /// address or to DWT_CYCCNT_ADDR.
     #[test]
     fn test_ext_irq_main_literals_resolve_inside_pool() {
-        // Accept the five NVIC + CYCCNT addresses the external-IRQ
-        // scenarios use. Any other word indicates an off-by-one imm8.
+        // Accept the addresses/constants the external-IRQ scenarios
+        // use. Any other word indicates an off-by-one imm8.
         const EXPECTED_WORDS: &[u32] = &[
             0xE000_1004, // DWT_CYCCNT_ADDR
             0xE000_E100, // NVIC_ISER0
+            0xE000_E104, // NVIC_ISER1 (POWMAN IRQ 45 sits in bank 1)
             0xE000_E200, // NVIC_ISPR0
             0xE000_E400, // NVIC_IPR0 addr
             0x0000_40C0, // packed priorities: IRQ0=0xC0, IRQ1=0x40
+            // POWMAN scenario literals — Coverage Gap Fill V11 §3.2.
+            // Password-gated POWMAN writes carry `0x5AFE` in bits [31:16]
+            // per pico-sdk `powman.h` (commit a1438dff); silicon drops
+            // writes without it and the emulator masks bits [31:16] off
+            // on store. RESETS/NVIC writes are not password-gated.
+            0x0002_0000, // 1 << RESET_POWMAN (bit 17)
+            0x4002_3000, // RESETS_RESET_CLR alias
+            0x5AFE_0064, // ALARM value (100 dec) + POWMAN password
+            0x4010_0084, // POWMAN_ALARM_TIME_15TO0
+            0x5AFE_0012, // TIMER.RUN | TIMER.ALARM_ENAB + POWMAN password
+            0x4010_0088, // POWMAN_TIMER
+            0x0000_2000, // 1 << 13 (NVIC IRQ 45 bit in bank 1)
         ];
 
         for sc in SCENARIOS {

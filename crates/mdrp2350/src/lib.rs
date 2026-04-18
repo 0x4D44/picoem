@@ -197,6 +197,10 @@ impl Emulator {
         // other registers return to 0. Re-seeds the backing HashMap via
         // `Self::new()`.
         self.bus.glitch.reset();
+        // POWMAN quiesces on warm reset — COUNT/MATCH/TIMER/INTR all
+        // return to post-power-on zero. Mirrors the Stage 3
+        // GLITCH_DETECTOR pattern.
+        self.bus.powman.reset();
         // Threading: PPB is per-core (not on the bus); the `cs[i].reset()`
         // / `CortexM33::new` path above already resets both cores' PPBs.
         // HLD V5 §5.7: post-bootrom RESETS state — peripherals

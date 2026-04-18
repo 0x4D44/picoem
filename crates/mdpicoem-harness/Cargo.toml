@@ -157,6 +157,13 @@ path = "src/bin/qemu_diff_riscv32.rs"
 name = "probe_csrrw_riscv32"
 path = "src/bin/probe_csrrw_riscv32.rs"
 
+# POWMAN pacing pre-flight (HLD V11 §8) — measures sys_clks/POWMAN-tick
+# on real RP2354 silicon. Scaffolding, not a permanent oracle.
+[[bin]]
+name = "smoke_powman_pacing_rp2350"
+path = "src/bin/smoke_powman_pacing_rp2350.rs"
+test = false
+
 [[bin]]
 name = "mmio_trace_rp2350"
 path = "src/bin/mmio_trace_rp2350.rs"
