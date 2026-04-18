@@ -9400,19 +9400,19 @@ fn mtime_stays_zero_at_post_reset_matches_silicon() {
 #[test]
 fn sysinfo_reads_hardcoded_readonly_fields() {
     let (_, mut bus) = core_and_bus();
-    // CHIP_ID: live RP2354 silicon value (V11 Stage 6, journal at
-    // wrk_journals/2026.04.17 - JRN - Coverage Gap Fill V11 Supervisor.md).
-    // PART=0x0004 (RP2354), MAN=0x927 (Raspberry Pi), REV=0 (masked).
-    assert_eq!(bus.read32(0x4000_0000, 0), 0x0004_0927,
-        "SYSINFO.CHIP_ID: expected PART=0x0004 | MAN=0x927 \
+    // CHIP_ID: live RP2354 silicon value (V12 Stage 3, probe
+    // E46410955F614129). PART=0x0004 (RP2354) occupies bits [14:12]
+    // → 0x4 << 12 = 0x4000; MAN=0x927 (Raspberry Pi); REV=0 (masked).
+    assert_eq!(bus.read32(0x4000_0000, 0), 0x0000_4927,
+        "SYSINFO.CHIP_ID: expected PART<<12 | MAN = 0x4000 | 0x927 \
          (REV nibble masked by silicon scenario)");
     // PACKAGE_SEL: 0 = RP2350A QFN60 (Pico 2 baseline).
     assert_eq!(bus.read32(0x4000_0004, 0), 0x0000_0000,
         "SYSINFO.PACKAGE_SEL: RP2350A");
-    // PLATFORM: value from LLD drafts 2026-04-13; Stage 5 pre-flight
-    // will confirm against silicon.
-    assert_eq!(bus.read32(0x4000_0008, 0), 0x0000_0001,
-        "SYSINFO.PLATFORM: LLD-draft value (pre-flight pending)");
+    // PLATFORM: live RP2354 silicon reads 0 (V12 Stage 3, probe
+    // E46410955F614129).
+    assert_eq!(bus.read32(0x4000_0008, 0), 0x0000_0000,
+        "SYSINFO.PLATFORM: silicon-measured value");
     // GITREF_RP2350: chip-revision-specific 32-bit constant. Emulator
     // exposes 0 as a placeholder; Stage 5 silicon pre-flight records the
     // true value and re-adds the silicon-scenario observe entry.

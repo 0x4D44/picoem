@@ -68,28 +68,34 @@ impl Bus {
     // lockstep.
     pub(crate) fn sysinfo_read(&self, offset: u32) -> u32 {
         match offset {
-            // CHIP_ID: live RP2354 silicon value, measured V11 Stage 6
-            // (`wrk_journals/2026.04.17 - JRN - Coverage Gap Fill V11
-            // Supervisor.md`, "Stage 6 — Silicon validation"). V11
-            // Stage 1 composed 0x524D from SDK field constants by
-            // erroneously shifting MANUFACTURER; pico-sdk's own decode
-            // (`platform.c`) does not shift MANUFACTURER — it reads
-            // `chip_id & 0x0FFE` direct.
+            // CHIP_ID: live RP2354 silicon value, measured V12 Stage 3
+            // against probe E46410955F614129 — register reads
+            // 0x0000_4927.
+            //
             //   REVISION[31:28]    = 0      (masked by silicon scenario)
             //   PART[27:12]        = 0x0004 (RP2354)
+            //                        — occupies register bits [14:12],
+            //                          contributing 0x4 << 12 = 0x4000
             //   MANUFACTURER[11:0] = 0x927  (Raspberry Pi)
-            // => 0x0004_0927. Silicon-scenario observe mask 0x0FFF_FFFF
-            // continues to drop the REV nibble (varies by die).
-            0x000 => 0x0004_0927,
+            // => 0x0000_4927.
+            //
+            // V11 Stage 1 composed 0x524D from SDK field constants by
+            // shifting MANUFACTURER (wrong); V12 Stage 1 then over-
+            // corrected to 0x0004_0927 by mis-placing PART at bit 16
+            // instead of bit 12. The differential measurement is the
+            // ground truth — there is no header literal to source.
+            // Silicon-scenario observe mask 0x0FFF_FFFF drops the REV
+            // nibble (varies by die).
+            0x000 => 0x0000_4927,
             // PACKAGE_SEL: RP2350A (Pico 2 baseline). Datasheet §12.11.2
             // and SDK `SYSINFO_PACKAGE_SEL_RESET = 0x0`.
             0x004 => 0x0000_0000,
-            // PLATFORM: value from LLD drafts 2026-04-13; pre-flight in
-            // Stage 5 will confirm against silicon. Datasheet §12.11.3.
-            // Note: SDK header `SYSINFO_PLATFORM_RESET = 0x0`, but that's
-            // the register-description reset, not the silicon-observed
-            // value — real ASIC silicon is expected to read bit 1 set.
-            0x008 => 0x0000_0001,
+            // PLATFORM: live RP2354 silicon reads 0 (V12 Stage 3,
+            // probe E46410955F614129). The pico-sdk header
+            // `SYSINFO_PLATFORM_RESET = 0x0` was right all along; V11
+            // Stage 1's "ASIC silicon expected to read bit 1" guess
+            // was unsourced and silicon disproved it.
+            0x008 => 0x0000_0000,
             // GITREF_RP2350: placeholder until Stage 5 silicon pre-flight.
             // Datasheet §12.11.4. SDK header does not define a RESET macro.
             0x014 => 0x0000_0000,

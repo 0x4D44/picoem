@@ -48,6 +48,12 @@ const POWMAN_TIMER: u64 = POWMAN_BASE + 0x88;
 // latch BADPASSWD.
 const POWMAN_PASSWD: u32 = 0x5AFE_0000;
 const TIMER_RUN_BIT: u32 = 1 << 1;
+// Per pico-sdk powman.h: TIMER.USE_LPOSC = bit 8 (0x0100). Selecting a
+// clock source is mandatory for COUNT to advance — bare TIMER.RUN
+// without USE_LPOSC / USE_XOSC leaves the timer with no input clock
+// and the bus access to READ_TIME_* faults (V11 Stage 6 smoke
+// reproduced this with `An ARM specific error occurred`).
+const TIMER_USE_LPOSC_BIT: u32 = 1 << 8;
 
 // Pacing: sample loop budget. `READ_TIME_LOWER` ticks at ~3 MHz
 // (XOSC/4 = 12 MHz / 4). Each loop iteration costs one probe read
@@ -139,9 +145,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     core.write_word_32(RESETS_RESET_CLR, RESET_POWMAN_BIT)?;
     println!("Released POWMAN from reset; starting timer.");
 
-    // Start POWMAN timer: TIMER.RUN = 1 (bit 1); ALARM_ENAB left clear
-    // so we just free-run COUNT. Password required on POWMAN writes.
-    core.write_word_32(POWMAN_TIMER, POWMAN_PASSWD | TIMER_RUN_BIT)?;
+    // Start POWMAN timer: USE_LPOSC = 1 (bit 8) selects the LPOSC
+    // clock source — without it COUNT has no input clock and READ_TIME
+    // bus accesses fault. RUN = 1 (bit 1) starts counting. ALARM_ENAB
+    // left clear so we just free-run COUNT. Password required.
+    core.write_word_32(
+        POWMAN_TIMER,
+        POWMAN_PASSWD | TIMER_USE_LPOSC_BIT | TIMER_RUN_BIT,
+    )?;
 
     // Release the core so CYCCNT ticks; we'll read both CYCCNT and
     // POWMAN COUNT via SWD while the core is running. probe-rs handles
