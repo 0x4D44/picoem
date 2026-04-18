@@ -628,6 +628,32 @@ mod tests {
         assert_eq!(p.slices[0].ctr, 100, "divisor 2.0: CTR should be 200/2 = 100");
     }
 
+    // Per-cycle dispatch companion to the bulk-tick test above. Pinned for
+    // Residual A.2.3 (`pwm_fractional_div` silicon scenario): the silicon
+    // oracle runs with `step_quantum=1`, calling `tick(1, ...)` once per
+    // sysclk. The closed-form fractional accumulator must produce the same
+    // CTR under per-cycle dispatch as under bulk dispatch — without this
+    // test, a future change that broke the per-cycle path while keeping
+    // bulk correct (e.g. forgetting to handle `cycles=1` specially) would
+    // not regress any existing test.
+    #[test]
+    fn fractional_div_integer_2_per_cycle_dispatch_matches_bulk() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        p.write32(SLICE_TOP, 0xFFFF, 0, &mut irqs);
+        p.write32(SLICE_DIV, 0x0020, 0, &mut irqs);
+        p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
+        p.write32(EN, 1, 0, &mut irqs);
+        for _ in 0..152 {
+            p.tick(1, &default_tree(), &mut irqs);
+        }
+        assert_eq!(
+            p.slices[0].ctr, 76,
+            "per-cycle dispatch: 152 sysclks / divisor 2.0 = 76 advances"
+        );
+        assert_eq!(p.slices[0].frac_accum, 0);
+    }
+
     // --- Inert-register warn-once (HLD V5 §4.A2 site 5) ----------------
 
     use std::sync::{Arc, Mutex};
