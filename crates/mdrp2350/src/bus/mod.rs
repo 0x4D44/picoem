@@ -1864,7 +1864,10 @@ impl Bus {
                             match base {
                                 TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
                                 SHA256_BASE => self.sha256.write32(reg_offset, word_val, pass_alias),
-                                _ => self.powman.write32(reg_offset, word_val, pass_alias),
+                                _ => {
+                                    let mask = self.powman.write32(reg_offset, word_val, pass_alias);
+                                    self.raise_irqs_u64(mask);
+                                }
                             }
                         }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
@@ -2497,7 +2500,10 @@ impl Bus {
                             match base {
                                 TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
                                 SHA256_BASE => self.sha256.write32(reg_offset, word_val, pass_alias),
-                                _ => self.powman.write32(reg_offset, word_val, pass_alias),
+                                _ => {
+                                    let mask = self.powman.write32(reg_offset, word_val, pass_alias);
+                                    self.raise_irqs_u64(mask);
+                                }
                             }
                         }
                         UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
@@ -2877,7 +2883,15 @@ impl Bus {
                         }
                         TRNG_BASE => self.trng.write32(offset, val, alias),
                         SHA256_BASE => self.sha256.write32(offset, val, alias),
-                        POWMAN_BASE => self.powman.write32(offset, val, alias),
+                        POWMAN_BASE => {
+                            // POWMAN write32 returns a NVIC raise mask
+                            // when a write transitions level-sensitive
+                            // INTS.TIMER from 0 → 1 (e.g. enabling
+                            // INTE.TIMER while INTR.TIMER is already
+                            // latched). V12 §3.2 INTE-gating fix.
+                            let mask = self.powman.write32(offset, val, alias);
+                            self.raise_irqs_u64(mask);
+                        }
                         0x5020_0000 => self.pio[0].write32(offset, val, alias),
                         0x5030_0000 => self.pio[1].write32(offset, val, alias),
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),

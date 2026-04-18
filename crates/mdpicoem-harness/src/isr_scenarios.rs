@@ -1291,88 +1291,113 @@ const HANDLER_POWMAN_SENTINEL: [u16; 10] = [
 /// `peripherals::powman::PowmanRegs::write32`). RESETS and NVIC writes
 /// do NOT require the password.
 ///
-/// All constants live in the literal pool starting at halfword [16]
-/// (= `IRQ_MAIN_OFFSET + 32` = 0x1A0). Each `ldr` uses PC-relative
+/// All constants live in the literal pool starting at halfword [20]
+/// (= `IRQ_MAIN_OFFSET + 40` = 0x1A8). Each `ldr` uses PC-relative
 /// addressing; the encoding is offset-agnostic (PC-rel LDR opcodes
 /// depend only on *relative* position, not the absolute main offset).
 ///
+/// V12 §3.2: silicon gates NVIC line 45 on `INTE.TIMER`. Three
+/// instructions added at hw[9..11] write `POWMAN_INTE = 0x5AFE_0002`
+/// before the NVIC ISER1 enable. Existing pre-NVIC instruction slots
+/// hw[0..8] are unchanged in shape; their LDR `imm8` fields are
+/// recomputed because the literal pool shifted by 4 halfwords (from
+/// hw[16..31] to hw[20..35]). New literals append at hw[36..39].
+///
 /// ```text
-///   [ 0] ldr  r4, [pc, #56]      ; r4 = 1 << 17  (RESET_POWMAN)
-///   [ 1] ldr  r5, [pc, #56]      ; r5 = RESETS_RESET_CLR = 0x4002_3000
+///   [ 0] ldr  r4, [pc, #36]      ; r4 = 1 << 17  (RESET_POWMAN)
+///   [ 1] ldr  r5, [pc, #40]      ; r5 = RESETS_RESET_CLR = 0x4002_3000
 ///   [ 2] str  r4, [r5]           ; release POWMAN
-///   [ 3] ldr  r4, [pc, #56]      ; r4 = 100
-///   [ 4] ldr  r5, [pc, #56]      ; r5 = POWMAN_ALARM_TIME_15TO0
+///   [ 3] ldr  r4, [pc, #40]      ; r4 = 100 | password = 0x5AFE_0064
+///   [ 4] ldr  r5, [pc, #40]      ; r5 = POWMAN_ALARM_TIME_15TO0
 ///   [ 5] str  r4, [r5]           ; ALARM = 100
-///   [ 6] ldr  r4, [pc, #56]      ; r4 = RUN | ALARM_ENAB = 0x12
-///   [ 7] ldr  r5, [pc, #56]      ; r5 = POWMAN_TIMER
+///   [ 6] ldr  r4, [pc, #40]      ; r4 = RUN|ALARM_ENAB|pwd = 0x5AFE_0012
+///   [ 7] ldr  r5, [pc, #44]      ; r5 = POWMAN_TIMER
 ///   [ 8] str  r4, [r5]           ; TIMER = RUN | ALARM_ENAB
-///   [ 9] ldr  r4, [pc, #56]      ; r4 = 1 << 13 = 0x2000
-///   [10] ldr  r5, [pc, #56]      ; r5 = NVIC_ISER1
-///   [11] str  r4, [r5]           ; enable IRQ 45
-///   [12] b    .                  ; busy-wait
-///   [13] bkpt #0                 ; safety (unreachable if IRQ fires)
-///   [14] nop                     ; padding
-///   [15] nop                     ; padding
-///   [16..17] lit: 1 << 17                  0x0002_0000
-///   [18..19] lit: RESETS_RESET_CLR         0x4002_3000
-///   [20..21] lit: 100 + POWMAN password    0x5AFE_0064
-///   [22..23] lit: POWMAN_ALARM_TIME_15TO0  0x4010_0084
-///   [24..25] lit: RUN|ALARM_ENAB + pwd     0x5AFE_0012
-///   [26..27] lit: POWMAN_TIMER             0x4010_0088
-///   [28..29] lit: 1 << 13                  0x0000_2000
-///   [30..31] lit: NVIC_ISER1               0xE000_E104
+///   [ 9] ldr  r4, [pc, #52]      ; r4 = INT_TIMER_BIT|pwd = 0x5AFE_0002 (NEW)
+///   [10] ldr  r5, [pc, #52]      ; r5 = POWMAN_INTE = 0x4010_00E4 (NEW)
+///   [11] str  r4, [r5]           ; INTE.TIMER = 1                     (NEW)
+///   [12] ldr  r4, [pc, #40]      ; r4 = 1 << 13 = 0x2000
+///   [13] ldr  r5, [pc, #40]      ; r5 = NVIC_ISER1
+///   [14] str  r4, [r5]           ; enable IRQ 45
+///   [15] b    .                  ; busy-wait
+///   [16] bkpt #0                 ; safety (unreachable if IRQ fires)
+///   [17..19] nop                 ; padding (keep literal pool word-
+///                                ;          aligned at hw[20] = 0x1A8)
+///   [20..21] lit: 1 << 17                  0x0002_0000
+///   [22..23] lit: RESETS_RESET_CLR         0x4002_3000
+///   [24..25] lit: 100 + POWMAN password    0x5AFE_0064
+///   [26..27] lit: POWMAN_ALARM_TIME_15TO0  0x4010_0084
+///   [28..29] lit: RUN|ALARM_ENAB + pwd     0x5AFE_0012
+///   [30..31] lit: POWMAN_TIMER             0x4010_0088
+///   [32..33] lit: 1 << 13                  0x0000_2000
+///   [34..35] lit: NVIC_ISER1               0xE000_E104
+///   [36..37] lit: INT_TIMER_BIT + pwd      0x5AFE_0002 (NEW)
+///   [38..39] lit: POWMAN_INTE              0x4010_00E4 (NEW)
 /// ```
 ///
-/// Literal-pool math at `IRQ_MAIN_OFFSET = 0x180`:
-///   hw[ 0] at 0x180: PC=0x184, Align=0x184, target hw[16]=0x1A0
-///          → offset 0x1C = 28 → imm8=7 → `0x4C07`
-///   hw[ 1] at 0x182: PC=0x186, Align=0x184, target hw[18]=0x1A4
-///          → offset 0x20 = 32 → imm8=8 → `0x4D08`
-///   hw[ 3] at 0x186: PC=0x18A, Align=0x188, target hw[20]=0x1A8
-///          → offset 0x20 = 32 → imm8=8 → `0x4C08`
-///   hw[ 4] at 0x188: PC=0x18C, Align=0x18C, target hw[22]=0x1AC
-///          → offset 0x20 = 32 → imm8=8 → `0x4D08`
-///   hw[ 6] at 0x18C: PC=0x190, Align=0x190, target hw[24]=0x1B0
-///          → offset 0x20 = 32 → imm8=8 → `0x4C08`
-///   hw[ 7] at 0x18E: PC=0x192, Align=0x190, target hw[26]=0x1B4
-///          → offset 0x24 = 36 → imm8=9 → `0x4D09`
-///   hw[ 9] at 0x192: PC=0x196, Align=0x194, target hw[28]=0x1B8
-///          → offset 0x24 = 36 → imm8=9 → `0x4C09`
-///   hw[10] at 0x194: PC=0x198, Align=0x198, target hw[30]=0x1BC
-///          → offset 0x24 = 36 → imm8=9 → `0x4D09`
-const MAIN_IRQ_POWMAN: [u16; 32] = [
-    0x4C07, // [ 0] ldr  r4, [pc, #28]    — r4 = 1 << 17
-    0x4D08, // [ 1] ldr  r5, [pc, #32]    — r5 = RESETS_RESET_CLR
+/// Literal-pool math at `IRQ_MAIN_OFFSET = 0x180`. Each LDR (T1)
+/// encodes `imm8 = (target - (PC & ~3)) / 4` where PC = inst_addr + 4.
+///   hw[ 0] at 0x180: PC=0x184, Align=0x184, target hw[20]=0x1A8
+///          → offset 0x24 = 36 → imm8=9  → `0x4C09`
+///   hw[ 1] at 0x182: PC=0x186, Align=0x184, target hw[22]=0x1AC
+///          → offset 0x28 = 40 → imm8=10 → `0x4D0A`
+///   hw[ 3] at 0x186: PC=0x18A, Align=0x188, target hw[24]=0x1B0
+///          → offset 0x28 = 40 → imm8=10 → `0x4C0A`
+///   hw[ 4] at 0x188: PC=0x18C, Align=0x18C, target hw[26]=0x1B4
+///          → offset 0x28 = 40 → imm8=10 → `0x4D0A`
+///   hw[ 6] at 0x18C: PC=0x190, Align=0x190, target hw[28]=0x1B8
+///          → offset 0x28 = 40 → imm8=10 → `0x4C0A`
+///   hw[ 7] at 0x18E: PC=0x192, Align=0x190, target hw[30]=0x1BC
+///          → offset 0x2C = 44 → imm8=11 → `0x4D0B`
+///   hw[ 9] at 0x192: PC=0x196, Align=0x194, target hw[36]=0x1C8 (NEW)
+///          → offset 0x34 = 52 → imm8=13 → `0x4C0D`
+///   hw[10] at 0x194: PC=0x198, Align=0x198, target hw[38]=0x1CC (NEW)
+///          → offset 0x34 = 52 → imm8=13 → `0x4D0D`
+///   hw[12] at 0x198: PC=0x19C, Align=0x19C, target hw[32]=0x1C0
+///          → offset 0x24 = 36 → imm8=9  → `0x4C09`
+///   hw[13] at 0x19A: PC=0x19E, Align=0x19C, target hw[34]=0x1C4
+///          → offset 0x28 = 40 → imm8=10 → `0x4D0A`
+const MAIN_IRQ_POWMAN: [u16; 40] = [
+    0x4C09, // [ 0] ldr  r4, [pc, #36]    — r4 = 1 << 17
+    0x4D0A, // [ 1] ldr  r5, [pc, #40]    — r5 = RESETS_RESET_CLR
     0x602C, // [ 2] str  r4, [r5]         — release POWMAN
-    0x4C08, // [ 3] ldr  r4, [pc, #32]    — r4 = 100
-    0x4D08, // [ 4] ldr  r5, [pc, #32]    — r5 = POWMAN_ALARM_TIME_15TO0
+    0x4C0A, // [ 3] ldr  r4, [pc, #40]    — r4 = 100 | pwd
+    0x4D0A, // [ 4] ldr  r5, [pc, #40]    — r5 = POWMAN_ALARM_TIME_15TO0
     0x602C, // [ 5] str  r4, [r5]
-    0x4C08, // [ 6] ldr  r4, [pc, #32]    — r4 = RUN | ALARM_ENAB
-    0x4D09, // [ 7] ldr  r5, [pc, #36]    — r5 = POWMAN_TIMER
+    0x4C0A, // [ 6] ldr  r4, [pc, #40]    — r4 = RUN | ALARM_ENAB | pwd
+    0x4D0B, // [ 7] ldr  r5, [pc, #44]    — r5 = POWMAN_TIMER
     0x602C, // [ 8] str  r4, [r5]
-    0x4C09, // [ 9] ldr  r4, [pc, #36]    — r4 = 1 << 13
-    0x4D09, // [10] ldr  r5, [pc, #36]    — r5 = NVIC_ISER1
-    0x602C, // [11] str  r4, [r5]
-    0xE7FE, // [12] b    .                — busy-wait
-    0xBE00, // [13] bkpt #0               — safety
-    0xBF00, // [14] nop
-    0xBF00, // [15] nop
-    0x0000, // [16] lit: 1 << 17 low  = 0x0002_0000 & 0xFFFF
-    0x0002, // [17] lit: 1 << 17 high = 0x0002_0000 >> 16
-    0x3000, // [18] lit: RESETS_RESET_CLR low  = 0x4002_3000 & 0xFFFF
-    0x4002, // [19] lit: RESETS_RESET_CLR high
-    0x0064, // [20] lit: (100 | POWMAN password) low  = 0x5AFE_0064 & 0xFFFF
-    0x5AFE, // [21] lit: (100 | POWMAN password) high = 0x5AFE_0064 >> 16
-    0x0084, // [22] lit: POWMAN_ALARM_TIME_15TO0 low
-    0x4010, // [23] lit: POWMAN_ALARM_TIME_15TO0 high
-    0x0012, // [24] lit: (RUN | ALARM_ENAB | POWMAN password) low  = 0x5AFE_0012 & 0xFFFF
-    0x5AFE, // [25] lit: (RUN | ALARM_ENAB | POWMAN password) high = 0x5AFE_0012 >> 16
-    0x0088, // [26] lit: POWMAN_TIMER low
-    0x4010, // [27] lit: POWMAN_TIMER high
-    0x2000, // [28] lit: 1 << 13 low
-    0x0000, // [29] lit: high
-    0xE104, // [30] lit: NVIC_ISER1 low
-    0xE000, // [31] lit: NVIC_ISER1 high
+    0x4C0D, // [ 9] ldr  r4, [pc, #52]    — r4 = INT_TIMER_BIT | pwd  (NEW)
+    0x4D0D, // [10] ldr  r5, [pc, #52]    — r5 = POWMAN_INTE          (NEW)
+    0x602C, // [11] str  r4, [r5]         — INTE.TIMER = 1            (NEW)
+    0x4C09, // [12] ldr  r4, [pc, #36]    — r4 = 1 << 13
+    0x4D0A, // [13] ldr  r5, [pc, #40]    — r5 = NVIC_ISER1
+    0x602C, // [14] str  r4, [r5]
+    0xE7FE, // [15] b    .                — busy-wait
+    0xBE00, // [16] bkpt #0               — safety
+    0xBF00, // [17] nop
+    0xBF00, // [18] nop
+    0xBF00, // [19] nop                   — pad to keep hw[20] word-aligned
+    0x0000, // [20] lit: 1 << 17 low  = 0x0002_0000 & 0xFFFF
+    0x0002, // [21] lit: 1 << 17 high = 0x0002_0000 >> 16
+    0x3000, // [22] lit: RESETS_RESET_CLR low  = 0x4002_3000 & 0xFFFF
+    0x4002, // [23] lit: RESETS_RESET_CLR high
+    0x0064, // [24] lit: (100 | POWMAN password) low  = 0x5AFE_0064 & 0xFFFF
+    0x5AFE, // [25] lit: (100 | POWMAN password) high = 0x5AFE_0064 >> 16
+    0x0084, // [26] lit: POWMAN_ALARM_TIME_15TO0 low
+    0x4010, // [27] lit: POWMAN_ALARM_TIME_15TO0 high
+    0x0012, // [28] lit: (RUN | ALARM_ENAB | POWMAN password) low  = 0x5AFE_0012 & 0xFFFF
+    0x5AFE, // [29] lit: (RUN | ALARM_ENAB | POWMAN password) high = 0x5AFE_0012 >> 16
+    0x0088, // [30] lit: POWMAN_TIMER low
+    0x4010, // [31] lit: POWMAN_TIMER high
+    0x2000, // [32] lit: 1 << 13 low
+    0x0000, // [33] lit: 1 << 13 high
+    0xE104, // [34] lit: NVIC_ISER1 low
+    0xE000, // [35] lit: NVIC_ISER1 high
+    0x0002, // [36] lit: (INT_TIMER_BIT | POWMAN password) low  = 0x5AFE_0002 & 0xFFFF (NEW)
+    0x5AFE, // [37] lit: (INT_TIMER_BIT | POWMAN password) high = 0x5AFE_0002 >> 16    (NEW)
+    0x00E4, // [38] lit: POWMAN_INTE = 0x4010_00E4 low                                  (NEW)
+    0x4010, // [39] lit: POWMAN_INTE = 0x4010_00E4 high                                 (NEW)
 ];
 
 const IMAGE_IRQ_POWMAN: [u8; IRQ_IMAGE_SIZE] =
@@ -2702,6 +2727,65 @@ mod tests {
         );
     }
 
+    /// V12 §3.2 regression: the POWMAN main routine's INTE write must
+    /// load `0x5AFE_0002` (`INT_TIMER_BIT | POWMAN password`) into r4
+    /// and `0x4010_00E4` (`POWMAN_INTE` address) into r5, then store.
+    /// These are at hw[9..11] in [`MAIN_IRQ_POWMAN`] and were appended
+    /// in V12 to gate NVIC line 45 — a wrong literal would silently
+    /// either (a) miss the password and store nothing on silicon, or
+    /// (b) write the wrong bit and never enable INTE.TIMER, so the
+    /// scenario would TIMEOUT exactly as it did under V11. Lock the
+    /// literal-pool offsets in by walking the assembled image.
+    #[test]
+    fn test_main_powman_inte_literals_are_inte_addr_and_value() {
+        let sc = SCENARIOS
+            .iter()
+            .find(|s| s.name == "isr_powman_match_timer_line_45")
+            .expect("POWMAN scenario must exist in the catalogue");
+        let layout = layout_for(sc);
+        let main_off = layout.main_offset as usize;
+
+        // The new INTE write triple is hw[9], hw[10], hw[11] in
+        // MAIN_IRQ_POWMAN. In the assembled image those land at
+        // main_off + 18, main_off + 20, main_off + 22.
+        let inte_val_load_off = main_off + 9 * 2;
+        let inte_addr_load_off = main_off + 10 * 2;
+
+        let loads = collect_ldr_literal_loads(
+            sc.image,
+            main_off,
+            sc.image.len(),
+        );
+        let r4_inte_word = loads
+            .iter()
+            .find(|(addr, rd, _, _)| *addr == inte_val_load_off && *rd == 4)
+            .map(|(_, _, _, w)| *w)
+            .expect(
+                "POWMAN main hw[9] must be `ldr r4, [pc, #X]` resolving \
+                 to the INTE write value",
+            );
+        let r5_inte_addr_word = loads
+            .iter()
+            .find(|(addr, rd, _, _)| *addr == inte_addr_load_off && *rd == 5)
+            .map(|(_, _, _, w)| *w)
+            .expect(
+                "POWMAN main hw[10] must be `ldr r5, [pc, #X]` resolving \
+                 to the POWMAN_INTE register address",
+            );
+
+        assert_eq!(
+            r4_inte_word, 0x5AFE_0002,
+            "POWMAN main r4 INTE write value must be \
+             `INT_TIMER_BIT | POWMAN password` = 0x5AFE_0002; \
+             got 0x{r4_inte_word:08X}",
+        );
+        assert_eq!(
+            r5_inte_addr_word, 0x4010_00E4,
+            "POWMAN main r5 INTE address must be POWMAN_INTE = \
+             0x4010_00E4; got 0x{r5_inte_addr_word:08X}",
+        );
+    }
+
     /// Every PC-relative LDR in the main body of a **baseline** scenario
     /// must resolve to one of the three v1 literals (DWT_CYCCNT_ADDR,
     /// SCB_ICSR_ADDR, ICSR_PENDSVSET). This is the specific regression
@@ -2797,6 +2881,11 @@ mod tests {
             0x5AFE_0012, // TIMER.RUN | TIMER.ALARM_ENAB + POWMAN password
             0x4010_0088, // POWMAN_TIMER
             0x0000_2000, // 1 << 13 (NVIC IRQ 45 bit in bank 1)
+            // V12 §3.2: silicon gates NVIC line 45 on `INTE.TIMER`.
+            // Scenario writes `INTE = INT_TIMER_BIT | password` before
+            // the NVIC enable.
+            0x5AFE_0002, // INT_TIMER_BIT (= 1 << 1) + POWMAN password
+            0x4010_00E4, // POWMAN_INTE
         ];
 
         for sc in SCENARIOS {

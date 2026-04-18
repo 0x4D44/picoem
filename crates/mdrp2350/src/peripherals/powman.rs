@@ -74,11 +74,21 @@
 //!
 //! When [`advance`] observes `count >= alarm` **and** `TIMER.ALARM_ENAB`
 //! is set, it:
-//! 1. Sets `INTR.TIMER` (bit 1) and `TIMER.ALARM` (bit 6).
+//! 1. Sets `INTR.TIMER` (bit 1) and `TIMER.ALARM` (bit 6) **un-
+//!    conditionally** — these are silicon's latch behaviour regardless
+//!    of `INTE`.
 //! 2. Clears `TIMER.ALARM_ENAB` so the alarm is one-shot per HLD.
-//! 3. Returns the NVIC raise mask for [`IRQ_POWMAN_IRQ_TIMER`].
+//! 3. Returns the NVIC raise mask for [`IRQ_POWMAN_IRQ_TIMER`] **only
+//!    if** `INTE.TIMER` is also set. Silicon gates the NVIC line on
+//!    `(INTR & INTE) | INTF` (the `INTS` view); without `INTE.TIMER`
+//!    the alarm latches in `INTR` but the NVIC line never asserts.
 //!
-//! The `Bus::tick_peripherals` caller folds the mask into
+//! Because `INTS` is level-sensitive on silicon, firmware that sets
+//! `INTE.TIMER` *after* `INTR.TIMER` has latched must see the NVIC
+//! line re-assert. [`PowmanRegs::write32`] returns the same NVIC raise
+//! mask when a write to `INTE` (or `INTF`) transitions
+//! `(intr & inte) | intf` from 0 to non-zero on the TIMER bit; the
+//! `Bus::tick_peripherals` caller folds the mask into
 //! `assert_irq_shared` via `raise_irqs_u64`. `POWMAN_IRQ_POW` (line
 //! 44) is never driven by the emulator.
 
@@ -198,10 +208,13 @@ pub struct PowmanRegs {
     /// `TIMER` control register (RUN, ALARM_ENAB, ALARM, + plain-storage
     /// bits). `TIMER.ALARM_ENAB` is HLD §3.2 `MATCH_EN`.
     timer: u32,
-    /// `INTE` — interrupt enable. Currently unused by the emulator IRQ
-    /// path (we gate on `TIMER.ALARM_ENAB` directly, matching silicon's
-    /// behaviour of also setting `INTR.TIMER` but routing NVIC via a
-    /// separate path); kept here for firmware round-trip.
+    /// `INTE` — interrupt enable. Gates the NVIC raise: [`PowmanRegs::
+    /// advance`] sets `INTR.TIMER` unconditionally on alarm match but
+    /// only returns the NVIC raise mask if `INTE.TIMER` is also set.
+    /// Writes via [`PowmanRegs::write32`] also re-pend NVIC if they
+    /// transition `(intr & inte) | intf` from 0 → 1 on the TIMER bit
+    /// (level-sensitive `INTS` semantics). See module doc § "Alarm
+    /// semantics".
     inte: u32,
     /// `INTF` — force-interrupt. Plain storage; not routed to NVIC.
     intf: u32,
@@ -272,7 +285,19 @@ impl PowmanRegs {
     /// XOR) extracted by the caller via the standard 0x2000/0x3000 alias
     /// bits. All register paths use [`apply_alias_rmw`] so SET/CLR
     /// semantics match silicon.
-    pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
+    ///
+    /// Returns a NVIC raise mask (`1u64 << IRQ_POWMAN_IRQ_TIMER`) when a
+    /// write transitions the level-sensitive `INTS` view of the TIMER
+    /// bit from 0 → 1 — i.e. enabling `INTE.TIMER` while `INTR.TIMER`
+    /// is already latched, or setting `INTF.TIMER`. Returns 0 for all
+    /// other writes. Caller folds the mask into
+    /// [`crate::bus::Bus::raise_irqs_u64`].
+    #[must_use]
+    pub fn write32(&mut self, offset: u32, value: u32, alias: u32) -> u64 {
+        // Snapshot the pre-write INTS.TIMER state so we can detect a
+        // 0 → 1 transition for INTE / INTF writes.
+        let pre_ints_timer = self.ints_timer_asserted();
+
         match offset {
             CTRL_OFFSET => apply_alias_rmw(&mut self.ctrl, value, alias),
             VREG_CTRL_OFFSET => apply_alias_rmw(&mut self.vreg_ctrl, value, alias),
@@ -393,8 +418,20 @@ impl PowmanRegs {
                     self.timer &= !TIMER_ALARM_BIT;
                 }
             }
-            INTE_OFFSET => apply_alias_rmw(&mut self.inte, value, alias),
-            INTF_OFFSET => apply_alias_rmw(&mut self.intf, value, alias),
+            // INTE/INTF are password-gated like TIMER and SET_TIME_*: silicon
+            // drops the upper-16 0x5AFE before storing, so a firmware read
+            // observes only the low-16. Strip here so emulator round-trip
+            // reads match silicon. Defined fields are bit 1 (TIMER) only;
+            // upper-16 storage would otherwise confuse `INTS` reads via a
+            // password write side-channel.
+            INTE_OFFSET => {
+                let stripped = value & 0xFFFF;
+                apply_alias_rmw(&mut self.inte, stripped, alias);
+            }
+            INTF_OFFSET => {
+                let stripped = value & 0xFFFF;
+                apply_alias_rmw(&mut self.intf, stripped, alias);
+            }
             INTS_OFFSET => {
                 // Read-only on silicon — ignore writes.
             }
@@ -404,6 +441,28 @@ impl PowmanRegs {
                 apply_alias_rmw(stored, value, alias);
             }
         }
+
+        // Level-sensitive INTS: any write that transitions the TIMER
+        // bit of `(INTR & INTE) | INTF` from 0 → 1 must (re-)assert
+        // NVIC line 45. In practice this catches:
+        //   * `INTE.TIMER` set while `INTR.TIMER` is already latched.
+        //   * `INTF.TIMER` directly forcing the line.
+        // Writes that lower INTS (INTR W1C, INTE clear) do not return
+        // a mask — NVIC pending bits stick until the handler runs.
+        let post_ints_timer = self.ints_timer_asserted();
+        if post_ints_timer && !pre_ints_timer {
+            1u64 << IRQ_POWMAN_IRQ_TIMER
+        } else {
+            0
+        }
+    }
+
+    /// True iff the TIMER bit of the level-sensitive `INTS` view —
+    /// `(INTR & INTE) | INTF` — is currently asserted. Helper for
+    /// detecting write-induced transitions in [`PowmanRegs::write32`].
+    #[inline]
+    fn ints_timer_asserted(&self) -> bool {
+        ((self.intr & self.inte) | self.intf) & INT_TIMER_BIT != 0
     }
 
     /// Advance AON COUNT by `sys_clks` sys-clocks and, if the alarm
@@ -457,10 +516,19 @@ impl PowmanRegs {
                 alarm = self.aon_match,
                 "POWMAN alarm fired"
             );
+            // INTR.TIMER and TIMER.ALARM latch unconditionally —
+            // silicon raises these regardless of INTE. ALARM_ENAB
+            // self-clears (one-shot per HLD §3.2).
             self.timer &= !TIMER_ALARM_ENAB_BIT;
             self.timer |= TIMER_ALARM_BIT;
             self.intr |= INT_TIMER_BIT;
-            return 1u64 << IRQ_POWMAN_IRQ_TIMER;
+            // Only raise NVIC if INTE.TIMER is set. Without INTE, the
+            // event latches in INTR but the NVIC line stays low —
+            // matching silicon's `INTS = (INTR & INTE) | INTF` gating
+            // (V11 Stage 6 silicon finding; V12 §3.2).
+            if (self.inte & INT_TIMER_BIT) != 0 {
+                return 1u64 << IRQ_POWMAN_IRQ_TIMER;
+            }
         }
 
         0
@@ -546,19 +614,28 @@ mod tests {
         events.iter().filter(|line| line.contains(needle)).count()
     }
 
+    /// Helper: arm POWMAN with `INTE.TIMER` enabled so `advance` will
+    /// raise NVIC line 45 on alarm match. Most tests want this; the
+    /// INTE-gating tests below intentionally skip it.
+    fn arm_for_nvic_raise(p: &mut PowmanRegs, alarm_low16: u32) {
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, alarm_low16, 0);
+        let _ = p.write32(INTE_OFFSET, INT_TIMER_BIT, 0);
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+    }
+
     #[test]
     fn ctrl_roundtrip() {
         let mut p = PowmanRegs::new();
-        p.write32(CTRL_OFFSET, 0xDEAD_BEEF, 0);
+        let _ = p.write32(CTRL_OFFSET, 0xDEAD_BEEF, 0);
         assert_eq!(p.read32(CTRL_OFFSET), 0xDEAD_BEEF);
     }
 
     #[test]
     fn vreg_roundtrip() {
         let mut p = PowmanRegs::new();
-        p.write32(VREG_CTRL_OFFSET, 0xA5A5_A5A5, 0);
+        let _ = p.write32(VREG_CTRL_OFFSET, 0xA5A5_A5A5, 0);
         assert_eq!(p.read32(VREG_CTRL_OFFSET), 0xA5A5_A5A5);
-        p.write32(VREG_OFFSET, 0x12_3456, 0);
+        let _ = p.write32(VREG_OFFSET, 0x12_3456, 0);
         assert_eq!(p.read32(VREG_OFFSET), 0x12_3456);
     }
 
@@ -576,7 +653,7 @@ mod tests {
         let mut tree = ClockTree::default();
         // Force sys_clk = 150 MHz so sys_per_tick = 50.
         tree.sys_clk_hz = 150_000_000;
-        p.write32(TIMER_OFFSET, TIMER_RUN_BIT, 0);
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT, 0);
         // Exactly 50 sys_clks => 1 POWMAN tick.
         let _ = p.advance(50, &tree);
         assert_eq!(p.read32(READ_TIME_LOWER_OFFSET), 1);
@@ -593,8 +670,9 @@ mod tests {
         let mut p = PowmanRegs::new();
         let mut tree = ClockTree::default();
         tree.sys_clk_hz = 150_000_000;
-        p.write32(ALARM_TIME_15TO0_OFFSET, 2, 0);
-        p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        // INTE.TIMER must be set for the NVIC raise to propagate; see
+        // V12 §3.2 INTE-gating fix.
+        arm_for_nvic_raise(&mut p, 2);
         // 100 sys_clks = 2 POWMAN ticks = count reaches 2.
         let mask = p.advance(100, &tree);
         assert_eq!(mask, 1u64 << IRQ_POWMAN_IRQ_TIMER);
@@ -614,14 +692,93 @@ mod tests {
         let mut p = PowmanRegs::new();
         let mut tree = ClockTree::default();
         tree.sys_clk_hz = 150_000_000;
-        p.write32(ALARM_TIME_15TO0_OFFSET, 1, 0);
-        p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        arm_for_nvic_raise(&mut p, 1);
         let _ = p.advance(50, &tree);
         assert_ne!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
         // W1C via TIMER.ALARM
-        p.write32(TIMER_OFFSET, TIMER_ALARM_BIT, 0);
+        let _ = p.write32(TIMER_OFFSET, TIMER_ALARM_BIT, 0);
         assert_eq!(p.read32(TIMER_OFFSET) & TIMER_ALARM_BIT, 0);
         assert_eq!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
+    }
+
+    /// V12 §3.2: with `INTE.TIMER = 0`, an alarm match must STILL latch
+    /// `INTR.TIMER` and `TIMER.ALARM` (silicon's unconditional latch
+    /// behaviour) but must NOT raise the NVIC line (silicon gates the
+    /// line on `(INTR & INTE) | INTF`).
+    #[test]
+    fn powman_match_does_not_pend_nvic_when_inte_timer_clear() {
+        let mut p = PowmanRegs::new();
+        let mut tree = ClockTree::default();
+        tree.sys_clk_hz = 150_000_000;
+        // No INTE write — INTE.TIMER stays 0.
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, 2, 0);
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+
+        let mask = p.advance(100, &tree);
+        assert_eq!(mask, 0, "INTE.TIMER clear must suppress NVIC raise");
+
+        // INTR.TIMER and TIMER.ALARM still latch unconditionally.
+        assert_eq!(
+            p.read32(INTR_OFFSET) & INT_TIMER_BIT,
+            INT_TIMER_BIT,
+            "INTR.TIMER must latch even when INTE.TIMER is clear"
+        );
+        assert_eq!(
+            p.read32(TIMER_OFFSET) & TIMER_ALARM_BIT,
+            TIMER_ALARM_BIT,
+            "TIMER.ALARM must latch even when INTE.TIMER is clear"
+        );
+    }
+
+    /// V12 §3.2: with `INTE.TIMER = 1` set BEFORE alarm match, the NVIC
+    /// raise mask must equal `1u64 << 45`.
+    #[test]
+    fn powman_match_pends_nvic_when_inte_timer_set() {
+        let mut p = PowmanRegs::new();
+        let mut tree = ClockTree::default();
+        tree.sys_clk_hz = 150_000_000;
+        // Enable INTE.TIMER first, then arm and run TIMER.
+        let _ = p.write32(INTE_OFFSET, INT_TIMER_BIT, 0);
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, 2, 0);
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+
+        let mask = p.advance(100, &tree);
+        assert_eq!(
+            mask,
+            1u64 << IRQ_POWMAN_IRQ_TIMER,
+            "alarm match with INTE.TIMER set must raise NVIC line 45"
+        );
+    }
+
+    /// V12 §3.2: late-enable case. Drive alarm fire with INTE clear (no
+    /// NVIC raise from `advance`); then write `INTE.TIMER = 1` and
+    /// assert the write itself returns the NVIC raise mask. This models
+    /// silicon's level-sensitive `INTS` view re-asserting NVIC line 45
+    /// the moment the gate opens.
+    #[test]
+    fn powman_inte_set_after_intr_re_pends_nvic() {
+        let mut p = PowmanRegs::new();
+        let mut tree = ClockTree::default();
+        tree.sys_clk_hz = 150_000_000;
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, 2, 0);
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+
+        let advance_mask = p.advance(100, &tree);
+        assert_eq!(advance_mask, 0, "INTE clear: advance must not raise");
+        assert_eq!(
+            p.read32(INTR_OFFSET) & INT_TIMER_BIT,
+            INT_TIMER_BIT,
+            "INTR.TIMER must be latched after the alarm match"
+        );
+
+        // Late INTE enable — the write itself should re-pend NVIC 45
+        // because INTS.TIMER transitions 0 → 1.
+        let write_mask = p.write32(INTE_OFFSET, INT_TIMER_BIT, 0);
+        assert_eq!(
+            write_mask,
+            1u64 << IRQ_POWMAN_IRQ_TIMER,
+            "INTE.TIMER set with INTR.TIMER latched must (re-)raise NVIC 45"
+        );
     }
 
     #[test]
@@ -631,7 +788,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let mut p = PowmanRegs::new();
             assert_eq!(p.read32(ARCHSEL_OFFSET), ARCHSEL_ARM);
-            p.write32(ARCHSEL_OFFSET, ARCHSEL_ARM, 0);
+            let _ = p.write32(ARCHSEL_OFFSET, ARCHSEL_ARM, 0);
             assert!(
                 !p.warned_archsel,
                 "writing Arm default must not fire the tripwire"
@@ -660,12 +817,12 @@ mod tests {
     fn powman_archsel_non_arm_write_fires_tripwire_once() {
         let mut p = PowmanRegs::new();
         assert!(!p.warned_archsel, "tripwire must start latched-low");
-        p.write32(ARCHSEL_OFFSET, 1, 0);
+        let _ = p.write32(ARCHSEL_OFFSET, 1, 0);
         assert!(
             p.warned_archsel,
             "first non-Arm write must latch the tripwire"
         );
-        p.write32(ARCHSEL_OFFSET, 2, 0);
+        let _ = p.write32(ARCHSEL_OFFSET, 2, 0);
         assert_eq!(p.read32(ARCHSEL_OFFSET), 2);
         assert!(
             p.warned_archsel,
@@ -676,7 +833,7 @@ mod tests {
     #[test]
     fn unknown_offset_roundtrip() {
         let mut p = PowmanRegs::new();
-        p.write32(0xF00, 0x1234_5678, 0);
+        let _ = p.write32(0xF00, 0x1234_5678, 0);
         assert_eq!(p.read32(0xF00), 0x1234_5678);
         assert_eq!(p.read32(0xF04), 0);
     }

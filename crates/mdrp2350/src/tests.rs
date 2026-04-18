@@ -9628,8 +9628,8 @@ fn powman_count_advances_at_expected_rate() {
 #[ignore = "threading: PPB writes (NVIC ISER/ISPR) must go through CortexM33::bus_write32 wrapper — test writes direct via Bus"]
 fn powman_match_pends_nvic_line_45() {
     use crate::peripherals::powman::{
-        ALARM_TIME_15TO0_OFFSET, IRQ_POWMAN_IRQ_TIMER, POWMAN_BASE, POWMAN_SYS_PER_TICK,
-        TIMER_ALARM_ENAB_BIT, TIMER_OFFSET, TIMER_RUN_BIT,
+        ALARM_TIME_15TO0_OFFSET, INT_TIMER_BIT, INTE_OFFSET, IRQ_POWMAN_IRQ_TIMER, POWMAN_BASE,
+        POWMAN_SYS_PER_TICK, TIMER_ALARM_ENAB_BIT, TIMER_OFFSET, TIMER_RUN_BIT,
     };
 
     let mut emu = Emulator::new(Config::default());
@@ -9639,6 +9639,14 @@ fn powman_match_pends_nvic_line_45() {
     // is irrelevant here (it only gates dispatch, not latching), so we
     // don't bother setting it.
     emu.bus.write32(0x4002_3000, 1u32 << 17, 0); // RESETS_CLR, RESET_POWMAN
+
+    // V12 §3.2: emulator now mirrors silicon's INTE gating — the NVIC
+    // line raise is conditional on `INTE.TIMER`. Enable it BEFORE
+    // arming the alarm. `0x5AFE_0000` adds the POWMAN write password
+    // bus-side; the `INT_TIMER_BIT` (= 1 << 1) is the level-sensitive
+    // gate for IRQ 45.
+    emu.bus
+        .write32(POWMAN_BASE + INTE_OFFSET, 0x5AFE_0000 | INT_TIMER_BIT, 0);
 
     // Program MATCH = 100 and enable alarm + run.
     emu.bus.write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 100, 0);
@@ -9668,8 +9676,8 @@ fn powman_match_pends_nvic_line_45() {
 #[ignore = "threading: PPB writes (NVIC ISER, VTOR) must go through CortexM33::bus_write32 wrapper — test writes direct via Bus"]
 fn powman_match_enters_emulator_handler() {
     use crate::peripherals::powman::{
-        ALARM_TIME_15TO0_OFFSET, IRQ_POWMAN_IRQ_TIMER, POWMAN_BASE, POWMAN_SYS_PER_TICK,
-        TIMER_ALARM_ENAB_BIT, TIMER_OFFSET, TIMER_RUN_BIT,
+        ALARM_TIME_15TO0_OFFSET, INT_TIMER_BIT, INTE_OFFSET, IRQ_POWMAN_IRQ_TIMER, POWMAN_BASE,
+        POWMAN_SYS_PER_TICK, TIMER_ALARM_ENAB_BIT, TIMER_OFFSET, TIMER_RUN_BIT,
     };
 
     let mut emu = Emulator::new(Config::default());
@@ -9720,8 +9728,11 @@ fn powman_match_enters_emulator_handler() {
     emu.core_mut(1).regs.set_pc(MAIN_LOOP_ADDR);
     emu.core_mut(1).regs.xpsr = 1 << 24;
 
-    // Program MATCH = 100, enable POWMAN TIMER alarm, enable NVIC 45.
+    // Program MATCH = 100, enable INTE.TIMER (V12 §3.2 silicon gate),
+    // enable POWMAN TIMER alarm, enable NVIC 45.
     emu.bus.write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 100, 0);
+    emu.bus
+        .write32(POWMAN_BASE + INTE_OFFSET, 0x5AFE_0000 | INT_TIMER_BIT, 0);
     emu.bus.write32(
         POWMAN_BASE + TIMER_OFFSET,
         TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
