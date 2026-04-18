@@ -1481,54 +1481,291 @@ pub fn gen_fuzz_rv32a<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     out
 }
 
-/// Fuzz generator: RV32C — arithmetic subset + sporadic Zcmp quadrant-2
-/// bit patterns.
+/// Fuzz generator: RV32C — arithmetic + compressed memory + compressed
+/// control-flow + sporadic Zcmp quadrant-2 bit patterns.
 ///
-/// We deliberately exclude compressed load/store/branch/jump encodings
-/// from the fuzz pool:
+/// Mix (per-case uniform draw):
+///   * 10 % Zcmp Q2 (known-illegal on Hazard3 — expect mcause=2).
+///     Collision tripwire (HLD §4.8).
+///   * 25 % compressed memory (C.LW / C.LWSP / C.SW / C.SWSP) — rs1' seeded
+///     to `SCRATCH_BASE`, x2 seeded to `SCRATCH_BASE` for sp-relative
+///     variants, offsets 4-byte aligned and inside the scratchpad window.
+///   * 15 % compressed control flow (C.J / C.JAL / C.BEQZ / C.BNEZ).
+///     Targets coast through a compressed NOP sled to the terminator
+///     ebreak on both taken and not-taken paths; C.JR / C.JALR are
+///     excluded (edge-case `rvc_c_jr_x1` / `c_jalr_x1` cover them — the
+///     generator can't construct a safe arbitrary register target at
+///     encode time).
+///   * Remainder (~50 %): arithmetic subset.
 ///
-///   * Loads/stores need a valid `rs1'` value plus a known-mapped
-///     4-byte-aligned address, and C.LW/C.SW use `rs1'` ∈ {x8..x15}
-///     — none of which the harness pre-seeds. Without setup they
-///     dereference whatever happens to be in the register (usually 0,
-///     which is inside the bootrom on the emu and inside VIRT_FLASH
-///     on QEMU — the two sides read different backing stores and
-///     disagree).
-///
-///   * Branches/jumps have the same target-landing problem as
-///     `gen_fuzz_rv32i_branch`: random offsets leave QEMU executing
-///     valid-but-garbage bytes in virt DRAM while the emu bus-faults
-///     at the SRAM edge. The dedicated branch fuzz already covers
-///     well-formed compressed C.J / C.JAL via a NOP sled if desired,
-///     but this path keeps it simple and skips them.
-///
-/// What remains is the arithmetic/ALU subset of C, which is pure
-/// register-file work and diffs cleanly against QEMU. Zcmp quadrant-2
-/// stays because the collision tripwire (HLD §4.8) needs hot coverage.
+/// Prior revision deliberately skipped mem/branch because without harness
+/// plumbing random targets land in unmapped memory (platform-layout
+/// divergence). The new mem path pre-seeds all base registers and keeps
+/// offsets inside `SCRATCH_BASE..SCRATCH_BASE+0x200`; the new branch path
+/// mirrors `gen_fuzz_rv32i_branch`'s NOP-sled trick using packed
+/// compressed nops.
 pub fn gen_fuzz_rv32c<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        // 10% Zcmp Q2 (known-illegal on Hazard3 — expect mcause=2).
-        let is_zcmp = rng.gen_bool(0.1);
-        let enc: u16 = if is_zcmp {
+        let mix = rng.gen_range(0..100_u32);
+        let tc = if mix < 10 {
+            // Zcmp Q2 sweep — known-illegal (mcause=2).
             const F6_LOW_ZCMP: [u16; 4] = [4, 5, 6, 7];
             let f6_low = F6_LOW_ZCMP[rng.gen_range(0..4)];
             let mid = rng.next_u32() as u16 & 0x03FF;
-            0b101 << 13 | f6_low << 10 | (mid & 0x03FC) | 0b10
+            let enc: u16 = 0b101 << 13 | f6_low << 10 | (mid & 0x03FC) | 0b10;
+            RiscvTestCase {
+                name: format!("fuzz_rvc_{i}"),
+                words: vec![u32::from(enc)],
+                reg_pre: vec![(2, SCRATCH_BASE)],
+                addr_regs: vec![2],
+                expect_trap: Some(2),
+                class: RiscvClass::Rv32c,
+            }
+        } else if mix < 35 {
+            // Compressed memory subset.
+            gen_rvc_mem_case(rng, i)
+        } else if mix < 50 {
+            // Compressed control-flow subset.
+            gen_rvc_branch_case(rng, i)
         } else {
-            gen_rv32c_arith(rng)
+            // Arithmetic subset (original behaviour).
+            let enc = gen_rv32c_arith(rng);
+            RiscvTestCase {
+                name: format!("fuzz_rvc_{i}"),
+                words: vec![u32::from(enc)],
+                reg_pre: vec![(2, SCRATCH_BASE)],
+                addr_regs: vec![2],
+                expect_trap: None,
+                class: RiscvClass::Rv32c,
+            }
         };
-        let expect_trap = if is_zcmp { Some(2) } else { None };
-        out.push(RiscvTestCase {
-            name: format!("fuzz_rvc_{i}"),
-            words: vec![u32::from(enc)],
-            reg_pre: vec![(2, SCRATCH_BASE)],
-            addr_regs: vec![2],
-            expect_trap,
-            class: RiscvClass::Rv32c,
-        });
+        out.push(tc);
     }
     out
+}
+
+/// Pack two compressed 16-bit instructions into a single u32 with the
+/// first (earlier-PC) in the low half and the second in the high half.
+/// The harness's `build_test_stream` does the same packing for padding
+/// purposes; generators that emit multiple compressed ops in sequence
+/// must do the equivalent up-front or the high halfword fetches as
+/// `0x0000` = c.illegal and traps mid-body.
+#[inline]
+fn pack_rvc_pair(lo: u16, hi: u16) -> u32 {
+    u32::from(lo) | (u32::from(hi) << 16)
+}
+
+/// Compressed c.nop (c.addi x0, 0 — canonical RV32C no-op).
+const RVC_NOP: u16 = 0x0001;
+
+/// Build one compressed memory test: C.LW / C.LWSP / C.SW / C.SWSP.
+/// Pre-seeds the base register so the effective address is inside
+/// `SCRATCH_BASE..SCRATCH_BASE+0x200`. C.LW/C.SW use rs1' ∈ {x8..x15};
+/// C.LWSP/C.SWSP use x2 (sp).
+fn gen_rvc_mem_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
+    // C.LW / C.SW use creg3 for rs1', rd' (or rs2') — all in {x8..x15},
+    // which never collides with x3/gp or x31/t6. Offsets for C.LW/C.SW
+    // encode bits {6, 5:3, 2} (zero-extended, word-aligned), range 0..=124.
+    // We keep offsets inside 0x00..=0x7C so the effective address stays
+    // in the lower half of the 0x200-byte scratchpad.
+    let variant = rng.gen_range(0..4_u32);
+    let (enc, reg_pre): (u16, Vec<(u8, u32)>) = match variant {
+        0 => {
+            // C.LW rd', uimm(rs1') — Q0, f3=010.
+            // imm bits [5:3|2|6] in [12:10|6|5].
+            let rs1p = rng.gen_range(0_u16..8); // selector for x8..x15
+            let rdp = rng.gen_range(0_u16..8);
+            let uimm = (rng.gen_range(0_u16..32)) << 2; // 0..=124, word-aligned
+            let b5_3 = (uimm >> 3) & 0b111;
+            let b2 = (uimm >> 2) & 0b1;
+            let b6 = (uimm >> 6) & 0b1;
+            let enc = 0b010_u16 << 13
+                | b5_3 << 10
+                | rs1p << 7
+                | b2 << 6
+                | b6 << 5
+                | rdp << 2
+                | 0b00;
+            let rs1 = (rs1p + 8) as u8;
+            (enc, vec![(rs1, SCRATCH_BASE)])
+        }
+        1 => {
+            // C.SW rs2', uimm(rs1') — Q0, f3=110.
+            let rs1p = rng.gen_range(0_u16..8);
+            let rs2p = rng.gen_range(0_u16..8);
+            let uimm = (rng.gen_range(0_u16..32)) << 2;
+            let b5_3 = (uimm >> 3) & 0b111;
+            let b2 = (uimm >> 2) & 0b1;
+            let b6 = (uimm >> 6) & 0b1;
+            let enc = 0b110_u16 << 13
+                | b5_3 << 10
+                | rs1p << 7
+                | b2 << 6
+                | b6 << 5
+                | rs2p << 2
+                | 0b00;
+            let rs1 = (rs1p + 8) as u8;
+            let rs2 = (rs2p + 8) as u8;
+            let mut reg_pre = vec![(rs1, SCRATCH_BASE)];
+            if rs2 != rs1 {
+                reg_pre.push((rs2, rng.next_u32()));
+            }
+            (enc, reg_pre)
+        }
+        2 => {
+            // C.LWSP rd, uimm(x2) — Q2, f3=010. rd != 0 (rd=0 reserved).
+            // imm bits [5|4:2|7:6] in [12|6:4|3:2].
+            // rd ∈ x1..x31 but skip x3 (gp) and x31 (t6) — the harness proxy
+            // reserves both. Picking from {x8..x15} keeps us safely away
+            // from any proxy scratch register.
+            let rd = rng.gen_range(8_u16..16);
+            let uimm = (rng.gen_range(0_u16..64)) << 2; // 0..=252
+            let b5 = (uimm >> 5) & 0b1;
+            let b4_2 = (uimm >> 2) & 0b111;
+            let b7_6 = (uimm >> 6) & 0b11;
+            let enc = 0b010_u16 << 13
+                | b5 << 12
+                | rd << 7
+                | b4_2 << 4
+                | b7_6 << 2
+                | 0b10;
+            (enc, vec![(2, SCRATCH_BASE)])
+        }
+        _ => {
+            // C.SWSP rs2, uimm(x2) — Q2, f3=110.
+            // imm bits [5:2|7:6] in [12:9|8:7].
+            let rs2 = rng.gen_range(8_u16..16);
+            let uimm = (rng.gen_range(0_u16..64)) << 2;
+            let b5_2 = (uimm >> 2) & 0b1111;
+            let b7_6 = (uimm >> 6) & 0b11;
+            let enc = 0b110_u16 << 13
+                | b5_2 << 9
+                | b7_6 << 7
+                | rs2 << 2
+                | 0b10;
+            (enc, vec![(2, SCRATCH_BASE), (rs2 as u8, rng.next_u32())])
+        }
+    };
+    // reg_pre already carries the SCRATCH_BASE seed for the active base
+    // reg; addr_regs would duplicate it (harness applies reg_pre first).
+    RiscvTestCase {
+        name: format!("fuzz_rvc_mem_{i}"),
+        words: vec![u32::from(enc)],
+        reg_pre,
+        addr_regs: vec![],
+        expect_trap: None,
+        class: RiscvClass::Rv32c,
+    }
+}
+
+/// Build one compressed control-flow test: C.J / C.JAL / C.BEQZ / C.BNEZ.
+/// Layout: `[branch || c.nop, c.nop || c.nop, ...]` packed so every
+/// halfword is either the branch or a c.nop. Forward offsets stay in
+/// `{4, 8, ..., SLED_BYTES}` (4 is the smallest positive c-branch
+/// immediate; 2 would land on the 2nd halfword of the first slot, which
+/// is already a c.nop). Both taken and not-taken paths coast through the
+/// sled to the terminator ebreak appended by the harness.
+fn gen_rvc_branch_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
+    // Sled byte length — multiple of 4 so an even number of halfword slots
+    // exist. 16 bytes = 8 c.nops after the branch, plus the packing nop
+    // that sits in the high half of the branch's own u32 slot.
+    const SLED_BYTES: i32 = 16;
+
+    let variant = rng.gen_range(0..4_u32);
+    let (enc, reg_pre): (u16, Vec<(u8, u32)>) = match variant {
+        0 => {
+            // C.J imm — Q1, f3=101. No link.
+            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            (encode_c_j(imm, 0b101), vec![])
+        }
+        1 => {
+            // C.JAL imm — Q1, f3=001. Links to x1.
+            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            (encode_c_j(imm, 0b001), vec![])
+        }
+        2 => {
+            // C.BEQZ rs1', imm — Q1, f3=110.
+            let rs1p = rng.gen_range(0_u16..8);
+            let rs1 = (rs1p + 8) as u8;
+            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            // Seed the test register to a mix of zero (taken) and non-zero
+            // (not-taken) across the fuzz batch so both paths get coverage.
+            let val: u32 = if rng.gen_bool(0.5) { 0 } else { rng.next_u32() | 1 };
+            (encode_c_beqz(imm, rs1p, 0b110), vec![(rs1, val)])
+        }
+        _ => {
+            // C.BNEZ rs1', imm — Q1, f3=111.
+            let rs1p = rng.gen_range(0_u16..8);
+            let rs1 = (rs1p + 8) as u8;
+            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            let val: u32 = if rng.gen_bool(0.5) { 0 } else { rng.next_u32() | 1 };
+            (encode_c_beqz(imm, rs1p, 0b111), vec![(rs1, val)])
+        }
+    };
+
+    // Pack the branch + c.nop sled into u32 words. First u32: branch
+    // (low) + c.nop (high). Subsequent u32s: c.nop | c.nop.
+    let sled_slots = (SLED_BYTES / 4) as usize; // each slot = 2 halfwords = 4 bytes
+    let mut words = Vec::with_capacity(1 + sled_slots);
+    words.push(pack_rvc_pair(enc, RVC_NOP));
+    for _ in 0..sled_slots {
+        words.push(pack_rvc_pair(RVC_NOP, RVC_NOP));
+    }
+
+    RiscvTestCase {
+        name: format!("fuzz_rvc_br_{i}"),
+        words,
+        reg_pre,
+        addr_regs: vec![],
+        expect_trap: None,
+        class: RiscvClass::Rv32c,
+    }
+}
+
+/// Encode C.J / C.JAL. `f3` selects which (0b101 = C.J, 0b001 = C.JAL).
+/// imm[11|4|9:8|10|6|7|3:1|5] in bits[12|11|10:9|8|7|6|5:3|2].
+fn encode_c_j(imm: i32, f3: u16) -> u16 {
+    debug_assert!(imm & 1 == 0, "c.j imm must be 2-byte aligned: {imm}");
+    let raw = (imm as u32) & 0x0FFF; // 12-bit signed, zero-extended for bit extraction
+    let b11 = ((raw >> 11) & 1) as u16;
+    let b10 = ((raw >> 10) & 1) as u16;
+    let b9_8 = ((raw >> 8) & 0b11) as u16;
+    let b7 = ((raw >> 7) & 1) as u16;
+    let b6 = ((raw >> 6) & 1) as u16;
+    let b5 = ((raw >> 5) & 1) as u16;
+    let b4 = ((raw >> 4) & 1) as u16;
+    let b3_1 = ((raw >> 1) & 0b111) as u16;
+    f3 << 13
+        | b11 << 12
+        | b4 << 11
+        | b9_8 << 9
+        | b10 << 8
+        | b6 << 7
+        | b7 << 6
+        | b3_1 << 3
+        | b5 << 2
+        | 0b01
+}
+
+/// Encode C.BEQZ / C.BNEZ. `f3` selects (0b110 = BEQZ, 0b111 = BNEZ).
+/// imm[8|4:3|7:6|2:1|5] in bits[12|11:10|6:5|4:3|2].
+fn encode_c_beqz(imm: i32, rs1p: u16, f3: u16) -> u16 {
+    debug_assert!(imm & 1 == 0, "c.beqz imm must be 2-byte aligned: {imm}");
+    let raw = (imm as u32) & 0x01FF; // 9-bit signed
+    let b8 = ((raw >> 8) & 1) as u16;
+    let b7_6 = ((raw >> 6) & 0b11) as u16;
+    let b5 = ((raw >> 5) & 1) as u16;
+    let b4_3 = ((raw >> 3) & 0b11) as u16;
+    let b2_1 = ((raw >> 1) & 0b11) as u16;
+    f3 << 13
+        | b8 << 12
+        | b4_3 << 10
+        | rs1p << 7
+        | b7_6 << 5
+        | b2_1 << 3
+        | b5 << 2
+        | 0b01
 }
 
 /// Build a well-formed RV32C arithmetic encoding. Every returned
@@ -1707,26 +1944,52 @@ pub fn gen_fuzz_zicsr<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
 }
 
 /// Fuzz generator: Zifencei.
+///
+/// FENCE.I and FENCE are architecturally no-ops for register state on
+/// both Hazard3 and QEMU virt rv32 (they're instruction-stream
+/// synchronisation barriers; there's no data-path side effect we can
+/// observe on a single-hart single-step harness). This class is a
+/// decode-coverage test — we assert that following a FENCE.I with an
+/// arbitrary register-modifying instruction produces the same post-state
+/// on both sides, i.e. the FENCE.I doesn't mis-decode, clobber state,
+/// or perturb the subsequent instruction's execution.
+///
+/// Each case emits either
+///   - `FENCE.I` alone (30 % — standalone decode coverage),
+///   - `FENCE` alone (20 % — sibling decode),
+///   - `FENCE.I; addi rd, rs1, imm` (50 % — ensures the fence does not
+///     disturb register bank updates on the next instruction).
 pub fn gen_fuzz_zifencei<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        // Alternate between FENCE.I (funct3=1) and FENCE (funct3=0).
-        // Keep rs1/rd/imm fields at zero — the spec says non-zero values
-        // are "reserved for future use", and the external decoder used
-        // by the property test enforces that.  Hazard3 is lenient but
-        // we encode spec-clean bit patterns.
-        let is_fencei = rng.gen_bool(0.7);
-        let w = if is_fencei {
-            encode_i_type(0, 0, 1, 0, OPC_MISC_MEM)
-        } else {
-            // FENCE with pred/succ bits set (low 8 bits of imm12 = fm+pred+succ).
+        let mix = rng.gen_range(0..100_u32);
+        let (words, reg_pre) = if mix < 30 {
+            // Standalone FENCE.I.
+            (vec![encode_i_type(0, 0, 1, 0, OPC_MISC_MEM)], vec![])
+        } else if mix < 50 {
+            // Standalone FENCE (non-`.i` sibling — a tripwire for decode-
+            // ordering bugs that might swap the two funct3 values).
             let flags = rng.gen_range(0..256_u32) as i32;
-            encode_i_type(flags, 0, 0, 0, OPC_MISC_MEM)
+            (vec![encode_i_type(flags, 0, 0, 0, OPC_MISC_MEM)], vec![])
+        } else {
+            // FENCE.I followed by a register-modifying instruction. If
+            // FENCE.I mis-decodes on either side, `rd` will drift and
+            // the standard GPR diff catches it. If FENCE.I is decoded
+            // correctly on both sides, `rd` ends up with the same ADDI
+            // result regardless of the preceding fence.
+            let fence_i = encode_i_type(0, 0, 1, 0, OPC_MISC_MEM);
+            let rd = rand_gpr(rng);
+            let rs1 = rand_gpr(rng);
+            let imm_raw = rng.next_u32() as i32;
+            let imm = (imm_raw << 20) >> 20; // sign-extend 12-bit
+            let addi = encode_i_type(imm, rs1, 0, rd, OPC_OP_IMM);
+            let rs1_val = rng.next_u32();
+            (vec![fence_i, addi], vec![(rs1, rs1_val)])
         };
         out.push(RiscvTestCase {
             name: format!("fuzz_fencei_{i}"),
-            words: vec![w],
-            reg_pre: vec![],
+            words,
+            reg_pre,
             addr_regs: vec![],
             expect_trap: None,
             class: RiscvClass::Zifencei,
@@ -2101,6 +2364,205 @@ mod tests {
     }
 
     // --------------------------------------------------------------------
+    // New RV32C memory / control-flow fuzz generators (Stage-6 expansion).
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rvc_mem_encodings_decode_and_reach_scratchpad() {
+        // Drive the mem path exclusively by picking `mix` in [10, 35). We
+        // can't force the sub-generator from outside without a seed search,
+        // so we fuzz a 200-case batch and filter — the mix weights make mem
+        // ~25 % of the RV32C pool, so a batch of 200 yields ~50 mem cases.
+        let mut rng = StdRng::seed_from_u64(0xC0DE_BA5E);
+        let cases = gen_fuzz_rv32c(&mut rng, 200);
+        let mem_cases: Vec<&RiscvTestCase> =
+            cases.iter().filter(|tc| tc.name.contains("_mem_")).collect();
+        assert!(
+            mem_cases.len() >= 20,
+            "fuzz_rvc_{{mem}} sampled too rarely: {}/200",
+            mem_cases.len()
+        );
+        for tc in mem_cases {
+            // Must be a single 16-bit compressed encoding.
+            assert_eq!(tc.words.len(), 1, "rvc_mem multi-word: {}", tc.name);
+            let w = tc.words[0];
+            assert!(
+                is_compressed(w),
+                "rvc_mem emitted non-compressed word 0x{w:08X} in {}",
+                tc.name
+            );
+            // Every base-register pre-seed must point into the scratchpad
+            // (or be x2/sp pointing at the scratchpad) — not random GPR
+            // junk. For C.LW/C.SW the base is rs1' ∈ {x8..x15}; for
+            // C.LWSP/C.SWSP the base is x2. Either way at least one reg_pre
+            // entry must equal SCRATCH_BASE.
+            assert!(
+                tc.reg_pre.iter().any(|(_, v)| *v == SCRATCH_BASE),
+                "rvc_mem missing SCRATCH_BASE seed: {} {:?}",
+                tc.name,
+                tc.reg_pre
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_rvc_branch_encodings_well_formed() {
+        let mut rng = StdRng::seed_from_u64(0xBABE_F00D);
+        let cases = gen_fuzz_rv32c(&mut rng, 200);
+        let br_cases: Vec<&RiscvTestCase> =
+            cases.iter().filter(|tc| tc.name.contains("_br_")).collect();
+        assert!(
+            br_cases.len() >= 10,
+            "fuzz_rvc_{{br}} sampled too rarely: {}/200",
+            br_cases.len()
+        );
+        for tc in br_cases {
+            // First halfword (low 16 bits of first u32) must be a Q1
+            // compressed control-flow instruction. funct3 ∈ {001, 101,
+            // 110, 111} (C.JAL / C.J / C.BEQZ / C.BNEZ).
+            let first = tc.words[0] as u16;
+            assert_eq!(first & 0x3, 0b01, "rvc_br head not Q1: {}", tc.name);
+            let f3 = (first >> 13) & 0x7;
+            assert!(
+                matches!(f3, 0b001 | 0b101 | 0b110 | 0b111),
+                "rvc_br head f3={f3:#05b} not C.JAL/C.J/C.BEQZ/C.BNEZ: {}",
+                tc.name
+            );
+            // High half of first u32 and both halves of every subsequent
+            // u32 must be c.nop (0x0001) — the sled.
+            let first_hi = (tc.words[0] >> 16) as u16;
+            assert_eq!(
+                first_hi, RVC_NOP,
+                "rvc_br first-word high half not c.nop: {}",
+                tc.name
+            );
+            for &w in &tc.words[1..] {
+                assert_eq!(
+                    w & 0xFFFF,
+                    u32::from(RVC_NOP),
+                    "rvc_br sled low half not c.nop: {} word=0x{w:08X}",
+                    tc.name
+                );
+                assert_eq!(
+                    (w >> 16) & 0xFFFF,
+                    u32::from(RVC_NOP),
+                    "rvc_br sled high half not c.nop: {} word=0x{w:08X}",
+                    tc.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_zifencei_two_word_cases_present() {
+        let mut rng = StdRng::seed_from_u64(0xFE_EDCAFE);
+        let cases = gen_fuzz_zifencei(&mut rng, 200);
+        let two_word = cases.iter().filter(|tc| tc.words.len() == 2).count();
+        assert!(
+            two_word >= 40,
+            "fuzz_zifencei two-word cases too rare: {two_word}/200"
+        );
+        // Every two-word case starts with FENCE.I.
+        for tc in cases.iter().filter(|tc| tc.words.len() == 2) {
+            let w = tc.words[0];
+            assert_eq!(w & 0x7F, OPC_MISC_MEM, "zifencei head not MISC-MEM: {}", tc.name);
+            assert_eq!((w >> 12) & 0x7, 1, "zifencei head not FENCE.I: {}", tc.name);
+            // Second word must be an ADDI (OP-IMM, funct3=0).
+            let w2 = tc.words[1];
+            assert_eq!(w2 & 0x7F, OPC_OP_IMM, "zifencei tail not OP-IMM: {}", tc.name);
+            assert_eq!((w2 >> 12) & 0x7, 0, "zifencei tail not ADDI: {}", tc.name);
+        }
+    }
+
+    #[test]
+    fn encode_c_j_roundtrip() {
+        // C.J +4 — spec example: imm=4 → bit 5 set in encoded word (bit 2
+        // of instruction encoding per layout). Verify a handful of known
+        // points against an independent reconstruction.
+        // imm=0 → encoding has f3=101, quadrant=01, all imm bits clear
+        // (but imm=0 is a legal c.j target).
+        let w = encode_c_j(0, 0b101);
+        assert_eq!(w & 0x3, 0b01, "c.j quadrant");
+        assert_eq!((w >> 13) & 0x7, 0b101, "c.j f3");
+        // Re-extract and check imm reproduces.
+        for imm in [4_i32, 8, -4, -8, 2046, -2048, 16, -16] {
+            let w = encode_c_j(imm, 0b101);
+            let decoded = c_jimm_extract(w);
+            assert_eq!(
+                decoded, imm,
+                "c.j imm round-trip mismatch: enc=0x{w:04X} wanted {imm} got {decoded}"
+            );
+        }
+        // C.JAL variant must carry f3=001.
+        let w = encode_c_j(4, 0b001);
+        assert_eq!((w >> 13) & 0x7, 0b001, "c.jal f3");
+    }
+
+    #[test]
+    fn encode_c_beqz_roundtrip() {
+        // C.BEQZ — verify imm extracts cleanly and f3/quadrant are set.
+        for imm in [4_i32, 8, -4, -8, 254, -256, 16, -16] {
+            let w = encode_c_beqz(imm, /*rs1p*/ 3, 0b110);
+            assert_eq!(w & 0x3, 0b01, "c.beqz quadrant imm={imm}");
+            assert_eq!((w >> 13) & 0x7, 0b110, "c.beqz f3 imm={imm}");
+            assert_eq!((w >> 7) & 0x7, 3, "c.beqz rs1' imm={imm}");
+            let decoded = c_bimm_extract(w);
+            assert_eq!(
+                decoded, imm,
+                "c.beqz imm round-trip mismatch: enc=0x{w:04X} wanted {imm} got {decoded}"
+            );
+        }
+        // BNEZ form.
+        let w = encode_c_beqz(4, 0, 0b111);
+        assert_eq!((w >> 13) & 0x7, 0b111, "c.bnez f3");
+    }
+
+    // Local extraction helpers — independent reconstruction of the
+    // decoder logic in `mdrp2350::core_riscv::decode`. If both encoders
+    // and extractors were buggy in the same direction the roundtrip would
+    // pass deceptively, so the extraction is written from scratch from
+    // the RV-C spec §16.8 immediate layout tables.
+    fn c_jimm_extract(w: u16) -> i32 {
+        let b11 = ((w >> 12) & 1) as u32;
+        let b4 = ((w >> 11) & 1) as u32;
+        let b9_8 = ((w >> 9) & 0b11) as u32;
+        let b10 = ((w >> 8) & 1) as u32;
+        let b6 = ((w >> 7) & 1) as u32;
+        let b7 = ((w >> 6) & 1) as u32;
+        let b3_1 = ((w >> 3) & 0b111) as u32;
+        let b5 = ((w >> 2) & 1) as u32;
+        let raw = (b11 << 11)
+            | (b10 << 10)
+            | (b9_8 << 8)
+            | (b7 << 7)
+            | (b6 << 6)
+            | (b5 << 5)
+            | (b4 << 4)
+            | (b3_1 << 1);
+        // Sign-extend from bit 11.
+        if raw & (1 << 11) != 0 {
+            (raw | !0xFFF) as i32
+        } else {
+            raw as i32
+        }
+    }
+
+    fn c_bimm_extract(w: u16) -> i32 {
+        let b8 = ((w >> 12) & 1) as u32;
+        let b4_3 = ((w >> 10) & 0b11) as u32;
+        let b7_6 = ((w >> 5) & 0b11) as u32;
+        let b2_1 = ((w >> 3) & 0b11) as u32;
+        let b5 = ((w >> 2) & 1) as u32;
+        let raw = (b8 << 8) | (b7_6 << 6) | (b5 << 5) | (b4_3 << 3) | (b2_1 << 1);
+        // Sign-extend from bit 8.
+        if raw & (1 << 8) != 0 {
+            (raw | !0x1FF) as i32
+        } else {
+            raw as i32
+        }
+    }
+
+    // --------------------------------------------------------------------
     // Total counts sanity + global F/D tripwire.
     // --------------------------------------------------------------------
 
@@ -2248,7 +2710,13 @@ mod tests {
             RiscvClass::Rv32m => decoded == "rv32m",
             RiscvClass::Rv32aReservable => decoded == "rv32a",
             RiscvClass::Zicsr => decoded == "zicsr",
-            RiscvClass::Zifencei => decoded == "fencei" || decoded == "fence",
+            // Zifencei fuzz 2-word cases (FENCE.I; ADDI) emit both a
+            // fence-family word and a subsequent arithmetic word. The
+            // class is still "fence-family under test"; the trailing ADDI
+            // is scaffolding exercising the post-fence register bank.
+            RiscvClass::Zifencei => {
+                decoded == "fencei" || decoded == "fence" || decoded == "alu"
+            }
             RiscvClass::CsrSideEffect => {
                 // Multi-instruction: the first word is a csrrw/csrrs etc.,
                 // the second a branch or arithmetic.  The per-word check
@@ -2298,6 +2766,12 @@ mod tests {
             // instruction. Without this, a case containing only sled + ebreak
             // and a corrupted branch-slot would silently pass.
             let mut case_has_branch_word = false;
+            // Per-case: did at least one word decode as a fence/fence.i?
+            // `Zifencei` class-compat admits `alu` so the trailing ADDI
+            // scaffolding doesn't trip class-mismatch; without this tripwire
+            // a case containing only ADDI (missing FENCE.I entirely) would
+            // silently pass.
+            let mut case_has_fence_word = false;
             for &word in &tc.words {
                 // F/D tripwire — every word, every class, always.
                 if !is_compressed(word) {
@@ -2356,6 +2830,9 @@ mod tests {
                         if decoded == "branch" {
                             case_has_branch_word = true;
                         }
+                        if decoded == "fencei" || decoded == "fence" {
+                            case_has_fence_word = true;
+                        }
                         verified_32bit += 1;
                     }
                     Err(e) => {
@@ -2375,6 +2852,15 @@ mod tests {
                     "Rv32iBranch case {} contains no branch/JAL/JALR word — \
                      class-compat allows alu/misc scaffolding but the real \
                      branch encoding appears to be missing or corrupt",
+                    tc.name
+                );
+            }
+            if tc.class == RiscvClass::Zifencei {
+                assert!(
+                    case_has_fence_word,
+                    "Zifencei case {} contains no FENCE/FENCE.I word — \
+                     class-compat allows alu scaffolding but the real \
+                     fence encoding appears to be missing or corrupt",
                     tc.name
                 );
             }
