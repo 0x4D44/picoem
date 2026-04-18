@@ -1,5 +1,5 @@
 // RISC-V instruction encoder + test-case generators for the
-// `qemu_diff_riscv32` differential oracle.
+// `test_qemu_diff_riscv32` differential oracle.
 //
 // Stage 4 of the RISC-V Hazard3 test-oracles plan; see
 // `wrk_docs/2026.04.17 - LLD - QEMU Diff RISC-V V1.md` §6 (fuzz classes),
@@ -300,9 +300,11 @@ pub fn gen_rv32i_alu_edge_cases() -> Vec<RiscvTestCase> {
             0xDEAD_BEEF,
         ));
     }
-    // Register-register OP (funct7 = 0 for base, 0x20 for sub/sra)
+    // Register-register OP (funct7 = 0 for base, 0x20 for sub/sra).
+    // rd != x3 — x3/gp is the CSR-proxy scratchpad pointer and writing it
+    // corrupts the epilogue's store address.
     let r_cases: &[(&str, u32, u32, u8, u8, u8)] = &[
-        ("add_basic", 0, 0, 1, 2, 3),
+        ("add_basic", 0, 0, 1, 2, 4),
         ("add_alias_rd_rs1", 0, 0, 1, 2, 1),
         ("add_alias_rd_rs2", 0, 0, 1, 2, 2),
         ("add_alias_all", 0, 0, 5, 5, 5),
@@ -315,7 +317,7 @@ pub fn gen_rv32i_alu_edge_cases() -> Vec<RiscvTestCase> {
         ("srl_full", 5, 0, 23, 24, 25),
         ("sra_full", 5, 0x20, 26, 27, 28),
         ("or_mixed", 6, 0, 29, 30, 31),
-        ("and_pattern", 7, 0, 1, 2, 3),
+        ("and_pattern", 7, 0, 1, 2, 4),
     ];
     for &(name, funct3, funct7, rs1, rs2, rd) in r_cases {
         let w = encode_r_type(funct7, rs2, rs1, funct3, rd, OPC_OP);
@@ -558,7 +560,8 @@ pub fn gen_rv32i_upper_edge_cases() -> Vec<RiscvTestCase> {
     let cases: &[(&str, u32, u32, u8)] = &[
         ("lui_zero", OPC_LUI, 0, 1),
         ("lui_one", OPC_LUI, 0x0000_1000, 2),
-        ("lui_neg", OPC_LUI, 0xFFFF_F000, 3),
+        // rd != x3 — see r_cases note above.
+        ("lui_neg", OPC_LUI, 0xFFFF_F000, 4),
         ("lui_pattern", OPC_LUI, 0x5555_5000, 4),
         ("lui_rd0", OPC_LUI, 0x1234_5000, 0),
         ("auipc_zero", OPC_AUIPC, 0, 5),
@@ -612,7 +615,8 @@ pub fn gen_rv32m_edge_cases() -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(26);
     // funct7 = 0x01 for all RV32M, opcode = OP.
     let cases: &[(&str, u32, u32, u32, u8, u8, u8)] = &[
-        ("mul_basic", 0, 0x01, 0x00010001, 1, 2, 3),
+        // rd=3 would clobber x3/gp (CSR-proxy pointer) — moved to rd=4.
+        ("mul_basic", 0, 0x01, 0x00010001, 1, 2, 4),
         ("mul_neg", 0, 0x01, 0xFFFF_FFFF, 4, 5, 6),
         ("mulh_highbit", 1, 0x01, 0x8000_0000, 7, 8, 9),
         ("mulhsu_mixed", 2, 0x01, 0x8000_0000, 10, 11, 12),
@@ -997,8 +1001,17 @@ pub fn gen_csr_side_effect_edge_cases() -> Vec<RiscvTestCase> {
 // ============================================================================
 
 fn rand_gpr<R: Rng>(rng: &mut R) -> u8 {
-    // x1..x31 (avoid x0 for destination/source to keep cases interesting).
-    rng.gen_range(1..32)
+    // x1..x31, but skip x3 (gp) — the QEMU-diff harness reserves it as the
+    // CSR-proxy scratchpad pointer and any test writing x3 corrupts the
+    // epilogue's store address. x5/t0 is still in play: the harness zeros
+    // it after the CSR-read prelude (see the `mv x5, x0` slot in
+    // `build_test_stream`) so both sides enter the test with x5 == 0.
+    loop {
+        let r = rng.gen_range(1..32_u8);
+        if r != 3 {
+            return r;
+        }
+    }
 }
 
 /// Fuzz generator: RV32I ALU. Register-immediate + register-register mix.

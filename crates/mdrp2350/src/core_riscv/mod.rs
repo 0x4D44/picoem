@@ -257,6 +257,21 @@ impl Hazard3 {
         self.csrs.mtvec = v;
     }
 
+    /// Reset the subset of M-mode CSRs the QEMU diff oracle snapshots so
+    /// cross-test state (notably `mcause` set by a trap in a prior test)
+    /// does not leak into the next pre-snapshot. `mtvec` is intentionally
+    /// preserved — the harness seeds it once at startup (global trap
+    /// handler) and expects both sides' mtvec to stay matching across
+    /// all non-Zicsr tests.
+    pub fn reset_diff_csrs(&mut self) {
+        self.csrs.mstatus = 0;
+        self.csrs.mie = 0;
+        self.csrs.mip = 0;
+        self.csrs.mscratch = 0;
+        self.csrs.mepc = 0;
+        self.csrs.mcause = 0;
+    }
+
     /// Hart halt flag — observed by `step_pair_riscv`. Setting to `true`
     /// prevents further dispatch; clearing resumes execution.
     pub fn set_halted(&mut self, halted: bool) {
