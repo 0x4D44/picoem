@@ -168,6 +168,37 @@ const O_SYSINFO_READONLY_FIELDS: &[(u32, u32)] = &[
     (SYSINFO_BASE + SYSINFO_PLATFORM_OFF, 0xFFFF_FFFF),
 ];
 
+// ---------------------------------------------------------------------------
+// TBMAN PLATFORM selector (Coverage Gap Fill V11 §3.4 Bucket A item 4)
+// ---------------------------------------------------------------------------
+//
+// TBMAN (`0x4016_0000`) is the RP2350 test-bench manager. Its PLATFORM
+// register at offset 0x00 reports whether the design is running on ASIC,
+// FPGA, or HDL simulation. On real RP2354 silicon the reset value is
+// `TBMAN_PLATFORM_ASIC_BITS = 0x1` per pico-sdk:
+//
+//   https://raw.githubusercontent.com/raspberrypi/pico-sdk/a1438dff1d38bd9c65dbd693f0e5db4b9ae91779/src/rp2350/hardware_regs/include/hardware/regs/tbman.h
+//
+//   #define TBMAN_PLATFORM_RESET       _u(0x00000001)
+//   #define TBMAN_PLATFORM_BITS        _u(0x00000007)
+//
+// Matches HLD V11 §3.4 assumption `0b01`. TBMAN is not reset-gated
+// (see `reset_bit_for_base` in `crates/mdrp2350/src/bus/mod.rs`) so no
+// setup beyond the oracle's `release_common_resets` baseline is required.
+// The emulator override landed in `crates/mdrp2350/src/peripherals/inert.rs`
+// (`Tbman::read32`, offset 0x00).
+pub const TBMAN_BASE: u32 = 0x4016_0000;
+// PLATFORM offset is re-exported from the emulator module so the oracle
+// and the emulator can't drift on what address is being diffed.
+use mdrp2350::peripherals::inert::TBMAN_PLATFORM_OFFSET;
+
+const S_TBMAN_PLATFORM: &[(u32, u32)] = &[];
+const O_TBMAN_PLATFORM: &[(u32, u32)] = &[
+    // PLATFORM is a 3-bit field; probe with full-word mask so any
+    // stray upper-bit divergence on silicon also fails.
+    (TBMAN_BASE + TBMAN_PLATFORM_OFFSET, 0xFFFF_FFFF),
+];
+
 // S1: PIO0 SM0 runs `JMP 0` in a one-instruction loop. Positive
 // control — ADDR never advances past 0, HW and EMU MUST agree.
 const S_PIO0_NOP_LOOP: &[(u32, u32)] = &[
@@ -1443,6 +1474,18 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         setup: S_SYSINFO_READONLY_FIELDS,
         max_sysclks: 100,
         observe: O_SYSINFO_READONLY_FIELDS,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Coverage Gap Fill V11 §3.4 Bucket A item 4 — TBMAN PLATFORM
+    // selector. Single-read scenario; TBMAN is not reset-gated so the
+    // runner's baseline `release_common_resets` is sufficient.
+    PeriphScenario {
+        name: "tbman_platform_reads_silicon_value",
+        setup: S_TBMAN_PLATFORM,
+        max_sysclks: 100,
+        observe: O_TBMAN_PLATFORM,
         observe_pins: 0,
         custom_sled: None,
         min_sysclks: 0,

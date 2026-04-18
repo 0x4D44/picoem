@@ -18,11 +18,15 @@
 //!
 //! # Storage model
 //!
-//! Each struct carries a `HashMap<u32, u32>` keyed by canonical word
-//! offset (alias bits stripped). Write path uses
-//! [`super::apply_alias_rmw`] so SET / CLR / XOR land consistently.
-//! Read path returns the stored value unless a register has special
+//! `SysCfg` and `GlitchDetector` each carry a `HashMap<u32, u32>` keyed
+//! by canonical word offset (alias bits stripped); their write path uses
+//! [`super::apply_alias_rmw`] so SET / CLR / XOR land consistently, and
+//! their read path returns the stored value unless a register has special
 //! semantics (see below).
+//!
+//! `Tbman` is storage-free: the pico-sdk header documents exactly one
+//! register (`PLATFORM` at 0x00, a silicon strap — architecturally RO),
+//! so reads dispatch directly on `offset` and writes are no-ops.
 //!
 //! # Special semantics
 //!
@@ -45,6 +49,22 @@ pub const SYSCFG_BASE: u32 = 0x4000_8000;
 pub const TBMAN_BASE: u32 = 0x4016_0000;
 /// GLITCH_DETECTOR base — HLD V5 §7.D.1 pick. See module-level caveat.
 pub const GLITCH_DETECTOR_BASE: u32 = 0x4015_8000;
+
+/// TBMAN.PLATFORM offset. Register layout per pico-sdk
+/// `src/rp2350/hardware_regs/include/hardware/regs/tbman.h`
+/// (`TBMAN_PLATFORM_OFFSET`). `pub` so the harness (`silicon_scenarios`)
+/// can import the same symbol instead of redeclaring.
+pub const TBMAN_PLATFORM_OFFSET: u32 = 0x00;
+/// TBMAN.PLATFORM reset value on real RP2354 silicon: ASIC bit (bit 0)
+/// set, FPGA (bit 1) and HDLSIM (bit 2) clear. Source:
+///
+///   https://raw.githubusercontent.com/raspberrypi/pico-sdk/a1438dff1d38bd9c65dbd693f0e5db4b9ae91779/src/rp2350/hardware_regs/include/hardware/regs/tbman.h
+///
+///   #define TBMAN_PLATFORM_RESET       _u(0x00000001)
+///   #define TBMAN_PLATFORM_ASIC_BITS   _u(0x00000001)
+///
+/// Matches HLD Coverage Gap Fill V11 §3.4 "assumption 0b01".
+const TBMAN_PLATFORM_RESET: u32 = 0x0000_0001;
 
 /// GLITCH_DETECTOR register offsets. Layout assumption — see module doc.
 const GLITCH_STATUS_OFFSET: u32 = 0x00;
@@ -84,23 +104,40 @@ impl Default for SysCfg {
     }
 }
 
-/// TBMAN — test-bench manager, storage-only at `0x4016_0000`.
-pub struct Tbman {
-    regs: HashMap<u32, u32>,
-}
+/// TBMAN — test-bench manager at `0x4016_0000`. The pico-sdk header
+/// documents exactly one register (`PLATFORM` at offset 0x00, a 3-bit
+/// RO selector distinguishing ASIC / FPGA / HDLSIM). Every other offset
+/// in the block is unmapped fabric and reads as 0 on real silicon.
+///
+/// Storage-free: reads dispatch directly on `offset`, writes are no-ops.
+/// PLATFORM is architecturally read-only (silicon strap, not a register),
+/// so accepting writes anywhere in the TBMAN window would diverge from
+/// hardware and there's no meaningful state to retain.
+pub struct Tbman;
 
 impl Tbman {
     pub fn new() -> Self {
-        Self { regs: HashMap::new() }
+        Self
     }
 
+    /// Read a word. `PLATFORM` (offset 0x00) returns the silicon-observed
+    /// reset value — pico-sdk `TBMAN_PLATFORM_RESET = 0x1` (ASIC bit set,
+    /// FPGA + HDLSIM clear). All other offsets read 0 (unmapped fabric).
     pub fn read32(&self, offset: u32) -> u32 {
-        *self.regs.get(&offset).unwrap_or(&0)
+        if offset == TBMAN_PLATFORM_OFFSET {
+            TBMAN_PLATFORM_RESET
+        } else {
+            0
+        }
     }
 
-    pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
-        let stored = self.regs.entry(offset).or_insert(0);
-        apply_alias_rmw(stored, value, alias);
+    /// Write a word. TBMAN has no writable state on real silicon —
+    /// PLATFORM is a strap, not a register — so all writes are silently
+    /// discarded. `_alias` is accepted to match the peripheral dispatch
+    /// contract (`Bus::write32` always passes the alias bits) but has
+    /// no effect.
+    pub fn write32(&mut self, _offset: u32, _value: u32, _alias: u32) {
+        // No-op: TBMAN exposes no writable state.
     }
 }
 
@@ -172,13 +209,27 @@ mod tests {
     }
 
     #[test]
-    fn tbman_roundtrip() {
+    fn tbman_platform_reads_silicon_reset() {
+        // PLATFORM (offset 0x00) returns `TBMAN_PLATFORM_RESET = 0x1`
+        // from pico-sdk's tbman.h — ASIC bit set, FPGA + HDLSIM clear.
+        // Writes anywhere in the TBMAN window are no-ops, so writing
+        // garbage to PLATFORM *and* to a non-PLATFORM offset must leave
+        // both the silicon-reset override and the unmapped-reads-as-0
+        // contract intact.
         let mut t = Tbman::new();
-        t.write32(0x00, 0x0000_0001, 0);
-        assert_eq!(t.read32(0x00), 0x0000_0001);
-        t.write32(0x00, 0x0000_0003, 1); // XOR
-        assert_eq!(t.read32(0x00), 0x0000_0001 ^ 0x0000_0003);
-        assert_eq!(t.read32(0x10), 0);
+        assert_eq!(t.read32(TBMAN_PLATFORM_OFFSET), TBMAN_PLATFORM_RESET);
+        // PLATFORM is architecturally RO — write must not alter read.
+        t.write32(TBMAN_PLATFORM_OFFSET, 0xFFFF_FFFF, 0);
+        assert_eq!(
+            t.read32(TBMAN_PLATFORM_OFFSET),
+            TBMAN_PLATFORM_RESET,
+            "PLATFORM is silicon-RO; write must not alter read value"
+        );
+        // Unmapped offsets must read 0 regardless of prior writes — no
+        // stray state leaks from `write32` into subsequent reads.
+        t.write32(0x04, 0xDEAD_BEEF, 0);
+        assert_eq!(t.read32(0x04), 0, "unmapped TBMAN offsets read 0");
+        assert_eq!(t.read32(0x10), 0, "unmapped TBMAN offsets read 0");
     }
 
     #[test]

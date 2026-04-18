@@ -9419,3 +9419,37 @@ fn sysinfo_reads_hardcoded_readonly_fields() {
     assert_eq!(bus.read32(0x4000_0014), 0x0000_0000,
         "SYSINFO.GITREF_RP2350: placeholder (silicon pre-flight pending)");
 }
+
+// ============================================================================
+// TBMAN PLATFORM selector (Coverage Gap Fill V11 §3.4 Bucket A item 4)
+// ============================================================================
+//
+// TBMAN_BASE + 0x00 (PLATFORM) is a read-only register distinguishing
+// ASIC / FPGA / HDLSIM targets. Silicon reset value per the authoritative
+// pico-sdk header:
+//
+//   https://raw.githubusercontent.com/raspberrypi/pico-sdk/master/src/rp2350/hardware_regs/include/hardware/regs/tbman.h
+//
+//   #define TBMAN_PLATFORM_RESET       _u(0x00000001)
+//   #define TBMAN_PLATFORM_BITS        _u(0x00000007)  // 3-bit field
+//   #define TBMAN_PLATFORM_ASIC_BITS   _u(0x00000001)  // bit 0 -- ASIC
+//   #define TBMAN_PLATFORM_FPGA_BITS   _u(0x00000002)  // bit 1 -- FPGA
+//   #define TBMAN_PLATFORM_HDLSIM_BITS _u(0x00000004)  // bit 2 -- HDLSIM
+//
+// So real RP2354 silicon exposes PLATFORM = 0x1 (ASIC bit set), which
+// matches HLD V11 §3.4's "assumption 0b01". The silicon scenario
+// `tbman_platform_reads_silicon_value` in `silicon_scenarios.rs` diffs
+// the same word against the attached RP2354.
+
+#[test]
+fn tbman_platform_reads_silicon_value() {
+    let (_, mut bus) = core_and_bus();
+    // TBMAN_BASE = 0x4016_0000; PLATFORM offset = 0x00.
+    // Expected value: TBMAN_PLATFORM_ASIC_BITS = 0x1.
+    assert_eq!(
+        bus.read32(0x4016_0000),
+        0x0000_0001,
+        "TBMAN.PLATFORM: ASIC bit (bit 0) set per pico-sdk \
+         TBMAN_PLATFORM_RESET"
+    );
+}
