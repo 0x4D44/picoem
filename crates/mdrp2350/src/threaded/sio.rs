@@ -63,6 +63,15 @@ pub struct ThreadedSio {
     mtime: AtomicU64,
     mtime_ctrl: AtomicU32, // bit 0 = enable
     mtimecmp: [AtomicU64; 2],
+
+    /// Per-core edge-triggered MTIMECMP match latch.
+    ///
+    /// Phase 3 seeds this from `Sio::mtime_match_asserted` so the edge
+    /// state survives the single → threaded handoff, but does **not**
+    /// consume it — MTIMECMP → IRQ wiring is deferred to Phase 5 per
+    /// LLD V7 §14. Exposed via `mtime_match_asserted_load` /
+    /// `_store` for the forthcoming Phase 5 coordinator tick.
+    mtime_match_asserted: [AtomicBool; 2],
 }
 
 impl ThreadedSio {
@@ -78,7 +87,22 @@ impl ThreadedSio {
             mtime: AtomicU64::new(0),
             mtime_ctrl: AtomicU32::new(0),
             mtimecmp: [AtomicU64::new(0), AtomicU64::new(0)],
+            mtime_match_asserted: [AtomicBool::new(false), AtomicBool::new(false)],
         }
+    }
+
+    /// Read the per-core MTIMECMP match-latch flag. Phase 5 coordinator
+    /// tick will observe this; Phase 3 only seeds the initial bit.
+    pub fn mtime_match_asserted_load(&self, core: usize) -> bool {
+        debug_assert!(core < 2);
+        self.mtime_match_asserted[core].load(Relaxed)
+    }
+
+    /// Write the per-core MTIMECMP match-latch flag. Phase 3 uses this
+    /// only during `seed`; Phase 5 wires it to the coordinator.
+    pub fn mtime_match_asserted_store(&self, core: usize, val: bool) {
+        debug_assert!(core < 2);
+        self.mtime_match_asserted[core].store(val, Relaxed);
     }
 
     // --- FIFO ---
@@ -263,10 +287,49 @@ impl ThreadedSio {
             self.fifo_wof[i].store(false, Relaxed);
             self.doorbells[i].store(0, Relaxed);
             self.mtimecmp[i].store(0, Relaxed);
+            self.mtime_match_asserted[i].store(false, Relaxed);
         }
         self.spinlocks.store(0, Relaxed);
         self.mtime.store(0, Relaxed);
         self.mtime_ctrl.store(0, Relaxed);
+    }
+}
+
+impl ThreadedSio {
+    /// Seed a fresh `ThreadedSio` from an existing single-threaded
+    /// `Sio` — copying FIFO contents, sticky FIFO-error flags, the 32
+    /// spinlock claim bitmask, per-core doorbell pending bits, MTIME /
+    /// MTIME_CTRL / both MTIMECMP. Does NOT seed `gpio_out` / `gpio_oe`
+    /// — those live on `AtomicGpio` in the threaded runtime.
+    ///
+    /// Phase 3 Stage 6b (LLD V7 §6/§8): called from
+    /// `ThreadedEmulator::from_emulator` so cross-core state survives
+    /// the single → threaded-runtime handoff.
+    pub fn seed(sio: &crate::sio::Sio) -> Self {
+        let out = Self::new();
+        // FIFOs: re-push the single-threaded Fifo contents (head→tail
+        // order) into the SPSC rings. The snapshots are bounded by the
+        // 8-entry `Fifo` capacity so the pushes cannot overflow the
+        // SPSC queues (which are the same capacity).
+        for val in sio.fifo_0to1_snapshot() {
+            let _ = out.fifo_0to1.try_push(val);
+        }
+        for val in sio.fifo_1to0_snapshot() {
+            let _ = out.fifo_1to0.try_push(val);
+        }
+        for core in 0..2 {
+            out.fifo_wof[core].store(sio.fifo_wof(core), Relaxed);
+            out.fifo_roe[core].store(sio.fifo_roe(core), Relaxed);
+            out.doorbells[core].store(sio.doorbell_pending[core] as u32, Relaxed);
+            out.mtimecmp[core].store(sio.mtimecmp[core], Relaxed);
+            // Phase 3 preserves the edge-latch state for the Phase 5
+            // MTIMECMP → IRQ wiring (LLD V7 §14); not consumed yet.
+            out.mtime_match_asserted[core].store(sio.mtime_match_asserted[core], Relaxed);
+        }
+        out.spinlocks.store(sio.spinlock_bits(), Relaxed);
+        out.mtime.store(sio.mtime, Relaxed);
+        out.mtime_ctrl.store(sio.mtime_ctrl, Relaxed);
+        out
     }
 }
 

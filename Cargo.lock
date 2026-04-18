@@ -1420,9 +1420,10 @@ dependencies = [
 
 [[package]]
 name = "mdrp2350"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "mdpicoem-common",
+ "winapi",
 ]
 
 [[package]]

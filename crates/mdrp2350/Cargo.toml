@@ -1,6 +1,6 @@
 [package]
 name = "mdrp2350"
-version = "1.0.0"
+version = "1.0.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -14,3 +14,10 @@ test-hooks = ["mdpicoem-common/test-hooks"]
 
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
+
+# Threading Phase 3 Stage 6b (LLD V7 §8/§9): Windows thread-affinity
+# pinning for the 4-thread runtime. The `ThreadedEmulator` path is
+# `#[cfg]`-gated to x86_64 Windows, and `winapi` is gated to the same
+# target so the dependency stays off Linux/macOS builds entirely.
+[target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }

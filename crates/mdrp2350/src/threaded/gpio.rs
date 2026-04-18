@@ -14,9 +14,18 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 ///
 /// Two 32-bit banks cover the full 48-pin space.  Bank 1 bits 16..31
 /// are unused on current silicon but allocated per the HLD.
+///
+/// `in_`, `external_in`, and `external_mask` carry the single-threaded
+/// `Bus::gpio_in` / `Bus::gpio_external_in` / `Bus::gpio_external_mask`
+/// fields into the threaded runtime. Only bank 0 (the low 32 pins) is
+/// represented today — that matches the single-threaded shape on
+/// `Bus` and keeps the seed path straight.
 pub struct AtomicGpio {
     out: [AtomicU32; 2],
     oe: [AtomicU32; 2],
+    in_: AtomicU32,
+    external_in: AtomicU32,
+    external_mask: AtomicU32,
 }
 
 impl AtomicGpio {
@@ -24,7 +33,78 @@ impl AtomicGpio {
         Self {
             out: [AtomicU32::new(0), AtomicU32::new(0)],
             oe: [AtomicU32::new(0), AtomicU32::new(0)],
+            in_: AtomicU32::new(0),
+            external_in: AtomicU32::new(0),
+            external_mask: AtomicU32::new(0),
         }
+    }
+
+    /// Seed a freshly-allocated `AtomicGpio` with values lifted from an
+    /// existing single-threaded `Bus`.
+    ///
+    /// Phase 3 Stage 6b (LLD V7 §6/§8): `ThreadedEmulator::from_emulator`
+    /// calls this to carry the live GPIO OUT/OE/IN + harness-controlled
+    /// external-stimulus state into the threaded runtime. Consumes the
+    /// plain `u32` snapshots — callers take them out of the Bus
+    /// destructure.
+    ///
+    /// Only bank 0 (low 32 pins) is seeded. Bank 1 starts at zero,
+    /// matching post-reset silicon state.
+    pub fn seed(
+        gpio_out: u32,
+        gpio_oe: u32,
+        gpio_in: u32,
+        gpio_external_in: u32,
+        gpio_external_mask: u32,
+    ) -> Self {
+        Self {
+            out: [AtomicU32::new(gpio_out), AtomicU32::new(0)],
+            oe: [AtomicU32::new(gpio_oe), AtomicU32::new(0)],
+            in_: AtomicU32::new(gpio_in),
+            external_in: AtomicU32::new(gpio_external_in),
+            external_mask: AtomicU32::new(gpio_external_mask),
+        }
+    }
+
+    // ---- GPIO_IN (merged pin state) ----------------------------------------
+
+    /// Read the merged GPIO_IN value (low 32 pins).
+    #[inline]
+    pub fn read_in(&self) -> u32 {
+        self.in_.load(Relaxed)
+    }
+
+    /// Overwrite GPIO_IN. Stage 7 wires this to the GPIO-merge step
+    /// that runs at the quantum boundary (coordinator-owned).
+    #[inline]
+    pub fn write_in(&self, val: u32) {
+        self.in_.store(val, Relaxed);
+    }
+
+    // ---- External-input stimulus (harness pin forcing) ---------------------
+
+    /// Read the external-input stimulus value.
+    #[inline]
+    pub fn read_external_in(&self) -> u32 {
+        self.external_in.load(Relaxed)
+    }
+
+    /// Overwrite the external-input stimulus value.
+    #[inline]
+    pub fn write_external_in(&self, val: u32) {
+        self.external_in.store(val, Relaxed);
+    }
+
+    /// Read the external-input mask.
+    #[inline]
+    pub fn read_external_mask(&self) -> u32 {
+        self.external_mask.load(Relaxed)
+    }
+
+    /// Overwrite the external-input mask.
+    #[inline]
+    pub fn write_external_mask(&self, val: u32) {
+        self.external_mask.store(val, Relaxed);
     }
 
     // ---- OUT (output value) ------------------------------------------------

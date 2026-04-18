@@ -948,6 +948,18 @@ impl CoreBus for WorkerBus {
     // --- Canonical 13-method surface --------------------------------
 
     fn read8(&mut self, addr: u32, core: u8) -> u8 {
+        // Boot RAM (0xEFFF_F000..0xF000_0000) and XIP SRAM
+        // (0x1C00_0000..0x1C00_4000) live at addresses the generic
+        // `0x0..=0x2` arm would either miss (boot RAM is 0xE) or
+        // absorb as empty flash XIP (xip_sram is inside 0x1). Route
+        // them before the generic memory arm so both regions are
+        // backed by the per-word atomic storage on `SharedMemory`.
+        if is_boot_ram_addr(addr) {
+            return self.shared.memory.read_boot_ram8(addr);
+        }
+        if is_xip_sram_addr(addr) {
+            return self.shared.memory.read_xip_sram8(addr);
+        }
         match addr >> 28 {
             0x0..=0x2 => self.shared.memory.read8(addr),
             0x4 | 0x5 => {
@@ -979,6 +991,12 @@ impl CoreBus for WorkerBus {
     }
 
     fn read16(&mut self, addr: u32, core: u8) -> u16 {
+        if is_boot_ram_addr(addr) {
+            return self.shared.memory.read_boot_ram16(addr);
+        }
+        if is_xip_sram_addr(addr) {
+            return self.shared.memory.read_xip_sram16(addr);
+        }
         match addr >> 28 {
             0x0..=0x2 => self.shared.memory.read16(addr),
             0x4 | 0x5 => {
@@ -1009,6 +1027,12 @@ impl CoreBus for WorkerBus {
     }
 
     fn read32(&mut self, addr: u32, core: u8) -> u32 {
+        if is_boot_ram_addr(addr) {
+            return self.shared.memory.read_boot_ram32(addr);
+        }
+        if is_xip_sram_addr(addr) {
+            return self.shared.memory.read_xip_sram32(addr);
+        }
         match addr >> 28 {
             0x0..=0x2 => self.shared.memory.read32(addr),
             0x4 => self.apb_read32(addr),
@@ -1025,6 +1049,16 @@ impl CoreBus for WorkerBus {
     /// `shared.memory.cas32` + `shared.monitors.snoop` directly per
     /// LLD V7 §4.
     fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        if is_boot_ram_addr(addr) {
+            self.shared.memory.write_boot_ram8(addr, val);
+            self.shared.monitors.snoop(addr);
+            return;
+        }
+        if is_xip_sram_addr(addr) {
+            self.shared.memory.write_xip_sram8(addr, val);
+            self.shared.monitors.snoop(addr);
+            return;
+        }
         match addr >> 28 {
             0x0..=0x2 => {
                 self.shared.memory.write8(addr, val);
@@ -1073,6 +1107,16 @@ impl CoreBus for WorkerBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        if is_boot_ram_addr(addr) {
+            self.shared.memory.write_boot_ram16(addr, val);
+            self.shared.monitors.snoop(addr);
+            return;
+        }
+        if is_xip_sram_addr(addr) {
+            self.shared.memory.write_xip_sram16(addr, val);
+            self.shared.monitors.snoop(addr);
+            return;
+        }
         match addr >> 28 {
             0x0..=0x2 => {
                 self.shared.memory.write16(addr, val);
@@ -1118,6 +1162,16 @@ impl CoreBus for WorkerBus {
     /// `shared.memory.cas32` + `shared.monitors.snoop` directly per
     /// LLD V7 §4.
     fn write32(&mut self, addr: u32, val: u32, core: u8) {
+        if is_boot_ram_addr(addr) {
+            self.shared.memory.write_boot_ram32(addr, val);
+            self.shared.monitors.snoop(addr);
+            return;
+        }
+        if is_xip_sram_addr(addr) {
+            self.shared.memory.write_xip_sram32(addr, val);
+            self.shared.monitors.snoop(addr);
+            return;
+        }
         match addr >> 28 {
             0x0..=0x2 => {
                 self.shared.memory.write32(addr, val);
@@ -1261,6 +1315,20 @@ impl CoreBus for WorkerBus {
 // =======================================================================
 // Helpers
 // =======================================================================
+
+/// True when `addr` lies inside the 4 KB boot RAM scratchpad
+/// (`0xEFFF_F000..0xF000_0000`). Mirrors `Bus::is_boot_ram`.
+#[inline]
+fn is_boot_ram_addr(addr: u32) -> bool {
+    (0xEFFF_F000..0xF000_0000).contains(&addr)
+}
+
+/// True when `addr` lies inside the 16 KB XIP SRAM scratchpad
+/// (`0x1C00_0000..0x1C00_4000`). Mirrors `Bus::is_xip_sram`.
+#[inline]
+fn is_xip_sram_addr(addr: u32) -> bool {
+    (0x1C00_0000..0x1C00_4000).contains(&addr)
+}
 
 /// SYSINFO (0x4000_0000) — read-only. Mirrors `Bus::sysinfo_read`.
 /// Free function so we don't need to lock any mutex for this.
@@ -1627,6 +1695,49 @@ mod tests {
             "capacity must be >= PENDING_INVALIDATION_CAPACITY (STM 13 regs + headroom)"
         );
         assert_eq!(bus.core_id(), 0);
+    }
+
+    // --- Fix 3: boot_ram / xip_sram routed through WorkerBus ---
+
+    #[test]
+    fn worker_bus_boot_ram_roundtrip() {
+        let shared = fresh_shared();
+        let mut bus = WorkerBus::new(0, shared);
+        let addr = 0xEFFF_F100;
+        bus.write32(addr, 0xDEAD_BEEF, 0);
+        assert_eq!(bus.read32(addr, 0), 0xDEAD_BEEF);
+        // Halfword + byte stay consistent with the 32-bit view.
+        assert_eq!(bus.read16(addr, 0), 0xBEEF);
+        assert_eq!(bus.read16(addr + 2, 0), 0xDEAD);
+        assert_eq!(bus.read8(addr, 0), 0xEF);
+        // Writes do NOT queue decode-cache invalidations — boot RAM is
+        // outside the 0x0..=0x2 executable-memory regions.
+        let ci = bus.pending_cache_invalidations.len();
+        bus.write32(addr, 0x1234_5678, 0);
+        assert_eq!(
+            bus.pending_cache_invalidations.len(),
+            ci,
+            "boot RAM writes must not queue cache invalidations"
+        );
+    }
+
+    #[test]
+    fn worker_bus_xip_sram_roundtrip() {
+        let shared = fresh_shared();
+        let mut bus = WorkerBus::new(0, shared);
+        let addr = 0x1C00_0200;
+        bus.write32(addr, 0xAABB_CCDD, 0);
+        assert_eq!(bus.read32(addr, 0), 0xAABB_CCDD);
+        assert_eq!(bus.read16(addr, 0), 0xCCDD);
+        assert_eq!(bus.read8(addr, 0), 0xDD);
+        // Same invariant: no cache invalidation for xip_sram writes.
+        let ci = bus.pending_cache_invalidations.len();
+        bus.write8(addr, 0x00, 0);
+        assert_eq!(
+            bus.pending_cache_invalidations.len(),
+            ci,
+            "xip_sram writes must not queue cache invalidations"
+        );
     }
 
     #[test]

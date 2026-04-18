@@ -56,6 +56,21 @@ impl Fifo {
     pub fn len(&self) -> u8 {
         self.count
     }
+
+    /// Non-consuming snapshot of the FIFO contents in head → tail order.
+    ///
+    /// Used by `mdrp2350::threaded::ThreadedSio::seed` to copy the
+    /// single-threaded inter-core FIFO state into the SPSC ring without
+    /// mutating the source.
+    pub fn snapshot(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.count as usize);
+        let mut idx = self.head as usize;
+        for _ in 0..self.count {
+            out.push(self.buf[idx]);
+            idx = (idx + 1) % 8;
+        }
+        out
+    }
 }
 
 impl Default for Fifo {

@@ -58,6 +58,38 @@ impl Sio {
         }
     }
 
+    /// Non-consuming snapshot of the `core0 → core1` FIFO in head→tail
+    /// order. Used by `threaded::ThreadedSio::seed` to carry the
+    /// single-threaded inter-core FIFO state into the threaded SPSC
+    /// ring. Empty when the FIFO is empty.
+    pub fn fifo_0to1_snapshot(&self) -> Vec<u32> {
+        self.fifo_to_core1.snapshot()
+    }
+
+    /// Non-consuming snapshot of the `core1 → core0` FIFO in head→tail
+    /// order. See [`Self::fifo_0to1_snapshot`].
+    pub fn fifo_1to0_snapshot(&self) -> Vec<u32> {
+        self.fifo_to_core0.snapshot()
+    }
+
+    /// Read the sticky FIFO write-overflow flag for `core`.
+    pub fn fifo_wof(&self, core: usize) -> bool {
+        debug_assert!(core < 2);
+        self.fifo_wof[core]
+    }
+
+    /// Read the sticky FIFO read-underflow flag for `core`.
+    pub fn fifo_roe(&self, core: usize) -> bool {
+        debug_assert!(core < 2);
+        self.fifo_roe[core]
+    }
+
+    /// Read the 32-lock spinlock claim bitmask. Bit N set = SPINLOCK<N>
+    /// is currently claimed.
+    pub fn spinlock_bits(&self) -> u32 {
+        self.spinlock_bits
+    }
+
     /// Explicitly reset all SIO state. Called from `Emulator::reset()`.
     /// Per-core DIV/INTERP state (`PerCoreSio`) is cleared on the
     /// individual `CortexM33`s in `Emulator::reset` — not here.

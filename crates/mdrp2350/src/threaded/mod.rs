@@ -17,6 +17,12 @@ pub mod pio;
 pub mod peripherals;
 pub mod shared;
 pub mod bus;
+// Stage 6b (LLD V7 §8/§9): `ThreadedEmulator` pins one thread per
+// worker via `SetThreadAffinityMask`, so the whole module is gated to
+// x86_64 Windows. Non-Windows callers continue on the serial
+// `Emulator::run` path.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub mod emulator;
 
 pub use atomics::CoreAtomics;
 pub use memory::SharedMemory;
@@ -31,3 +37,5 @@ pub use peripherals::{
 };
 pub use shared::SharedState;
 pub use bus::{PioBus, WorkerBus};
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub use emulator::ThreadedEmulator;

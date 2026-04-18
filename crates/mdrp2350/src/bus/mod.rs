@@ -222,14 +222,14 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
 pub struct Bus {
     pub memory: Memory,
     /// Total cycles of the most recent bus access (for testing/debug).
-    last_access_cycles: u32,
+    pub(crate) last_access_cycles: u32,
     /// Accumulated extra wait states beyond 1-cycle baseline during current instruction.
     /// Reset by decode_execute before dispatch, added to cycle count after.
-    extra_wait_states: u32,
+    pub(crate) extra_wait_states: u32,
     /// Stub backing store for peripheral registers (APB + AHB).
     /// Keyed by canonical address (alias bits stripped).
     /// TODO: Replace with direct Peripheral trait dispatch when real peripherals are added.
-    peripheral_regs: HashMap<u32, u32>,
+    pub(crate) peripheral_regs: HashMap<u32, u32>,
     /// Cross-core atomics (halted/WFE/event_flag/irq_pending/RCP/bus_fault).
     /// Shared via `Arc` with the two `CortexM33` cores — Phase 3 Stage 1
     /// (LLD V7 §2). In the single-threaded path, Bus is the sole owner
@@ -267,20 +267,20 @@ pub struct Bus {
     /// DMA controller — 16 channels (HLD V5 §5.6, Phase 3).
     pub(crate) dma: Dma,
     /// Whether flash (XIP) content has been loaded.
-    flash_loaded: bool,
+    pub(crate) flash_loaded: bool,
     /// Suppress per-word SRAM bank wait states during burst transfers
     /// (STM/LDM/PUSH/POP). The SRAM controller handles sequential word
     /// accesses without per-word bank penalties.
-    burst_mode: bool,
+    pub(crate) burst_mode: bool,
     /// 4 KB boot RAM at 0xEFFF_F000..0xF000_0000.
     /// RP2350 maps this as the secure boot stack (USB DPRAM secure alias).
     /// Initial SP = 0xF000_0000 (top of this region).
-    boot_ram: Box<[u8; 4096]>,
+    pub(crate) boot_ram: Box<[u8; 4096]>,
     /// 16 KB XIP SRAM at 0x1C00_0000..0x1C00_3FFF.
     /// RP2350 XIP cache memory accessible as SRAM.
-    xip_sram: Box<[u8; 16384]>,
+    pub(crate) xip_sram: Box<[u8; 16384]>,
     /// QMI register backing store (offsets 0x000..0x06C, 28 words).
-    qmi_regs: [u32; 28],
+    pub(crate) qmi_regs: [u32; 28],
     /// CLK_REF_CTRL register (CLOCKS offset 0x030).
     pub(crate) clk_ref_ctrl: u32,
     /// CLK_SYS_CTRL register (CLOCKS offset 0x060).
@@ -332,10 +332,10 @@ pub struct Bus {
     /// SIO GPIO_HI_IN (offset 0x008). Upper QSPI GPIO pins.
     /// When flash is loaded, returns pseudo-random noise to simulate
     /// QSPI pin activity (the bootrom samples this to detect flash).
-    gpio_hi_noise_state: u32,
+    pub(crate) gpio_hi_noise_state: u32,
     /// XIP cache window offset: maps XIP SRAM reads (0x1C00_0000)
     /// to flash content at this byte offset. Set by QMI M0_RFMT writes.
-    xip_cache_offset: u32,
+    pub(crate) xip_cache_offset: u32,
     /// Single-cycle IO block (GPIO, CPUID, spinlocks, FIFO, divider, etc.).
     pub sio: Sio,
     /// Three PIO blocks (PIO0, PIO1, PIO2).

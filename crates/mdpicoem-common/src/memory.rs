@@ -226,6 +226,14 @@ impl Memory {
             _ => {} // ROM and XIP are read-only, others unmapped
         }
     }
+
+    /// Consume the backing store, yielding `(rom, sram, xip)` Vec<u8>
+    /// triples. Used by the threading runtime (`mdrp2350::threaded`) to
+    /// seed a `SharedMemory` from an existing `Emulator`'s `Bus::memory`
+    /// without bulk-reading every byte through the scalar accessors.
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (self.rom, self.sram, self.xip)
+    }
 }
 
 impl Default for Memory {
