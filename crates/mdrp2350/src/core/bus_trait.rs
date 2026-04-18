@@ -33,7 +33,6 @@
 use std::sync::Arc;
 
 use crate::bus::DecodedOp;
-use crate::sio::Sio;
 use crate::threaded::CoreAtomics;
 
 pub trait CoreBus {
@@ -70,14 +69,44 @@ pub trait CoreBus {
     /// `CortexM33` directly, not through this accessor.
     fn atomics(&self) -> &Arc<CoreAtomics>;
 
-    /// CP0 GPIO register-file access. TRANSIENT: moves to `SharedState`
-    /// in Stage 5 along with the rest of SIO.
-    fn sio(&self) -> &Sio;
-    fn sio_mut(&mut self) -> &mut Sio;
+    // --- GPIO OUT / OE / IN (Phase 3 Stage 6a) -----------------------
+    //
+    // Typed accessors for bank-0 GPIO state (RP2354A only exposes bank 0
+    // through SIO). Both `Bus` and `WorkerBus` implement these:
+    //
+    // - `Bus` forwards to `self.sio.gpio_out` / `gpio_oe` / `self.gpio_in`.
+    // - `WorkerBus` forwards to `self.shared.gpio.*` — so CP0 GPIOC
+    //   writes on the threaded path land on the live `AtomicGpio` and
+    //   not on a dummy placeholder.
+    //
+    // These replaced the CP0 GPIOC call sites in `core/coprocessor.rs`
+    // that previously reached through `bus.sio_mut()`, which was a
+    // placeholder on `WorkerBus`.
 
-    /// Current combined GPIO_IN value. TRANSIENT: moves to
-    /// `AtomicGpio` in Stage 5.
-    fn gpio_in(&self) -> u32;
+    /// GPIO_OUT bulk read.
+    fn gpio_read_out(&self) -> u32;
+    /// GPIO_OUT bulk write.
+    fn gpio_write_out(&mut self, val: u32);
+    /// GPIO_OUT_SET: atomic OR.
+    fn gpio_set_out(&mut self, mask: u32);
+    /// GPIO_OUT_CLR: atomic AND-NOT.
+    fn gpio_clear_out(&mut self, mask: u32);
+    /// GPIO_OUT_XOR: atomic XOR.
+    fn gpio_xor_out(&mut self, mask: u32);
+
+    /// GPIO_OE bulk read.
+    fn gpio_read_oe(&self) -> u32;
+    /// GPIO_OE bulk write.
+    fn gpio_write_oe(&mut self, val: u32);
+    /// GPIO_OE_SET.
+    fn gpio_set_oe(&mut self, mask: u32);
+    /// GPIO_OE_CLR.
+    fn gpio_clear_oe(&mut self, mask: u32);
+    /// GPIO_OE_XOR.
+    fn gpio_xor_oe(&mut self, mask: u32);
+
+    /// GPIO_IN bulk read. Combined external-pin state as seen by CP0.
+    fn gpio_read_in(&self) -> u32;
 
     /// Decode cache get / set. TRANSIENT: `decode_cache` moves onto
     /// `CortexM33` in a later stage (V7 §12 final row).

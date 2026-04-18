@@ -2393,17 +2393,56 @@ impl CoreBus for Bus {
         &self.atomics
     }
 
+    // --- GPIO OUT / OE / IN (Phase 3 Stage 6a) -----------------------
+    //
+    // Forward straight to the inherent `Sio` fields and the Bus-level
+    // `gpio_in` so the `Bus` path behaves identically to the direct
+    // `bus.sio.gpio_out = x` accesses the call sites used before.
+
     #[inline(always)]
-    fn sio(&self) -> &Sio {
-        &self.sio
+    fn gpio_read_out(&self) -> u32 {
+        self.sio.gpio_out
     }
     #[inline(always)]
-    fn sio_mut(&mut self) -> &mut Sio {
-        &mut self.sio
+    fn gpio_write_out(&mut self, val: u32) {
+        self.sio.gpio_out = val;
+    }
+    #[inline(always)]
+    fn gpio_set_out(&mut self, mask: u32) {
+        self.sio.gpio_out |= mask;
+    }
+    #[inline(always)]
+    fn gpio_clear_out(&mut self, mask: u32) {
+        self.sio.gpio_out &= !mask;
+    }
+    #[inline(always)]
+    fn gpio_xor_out(&mut self, mask: u32) {
+        self.sio.gpio_out ^= mask;
     }
 
     #[inline(always)]
-    fn gpio_in(&self) -> u32 {
+    fn gpio_read_oe(&self) -> u32 {
+        self.sio.gpio_oe
+    }
+    #[inline(always)]
+    fn gpio_write_oe(&mut self, val: u32) {
+        self.sio.gpio_oe = val;
+    }
+    #[inline(always)]
+    fn gpio_set_oe(&mut self, mask: u32) {
+        self.sio.gpio_oe |= mask;
+    }
+    #[inline(always)]
+    fn gpio_clear_oe(&mut self, mask: u32) {
+        self.sio.gpio_oe &= !mask;
+    }
+    #[inline(always)]
+    fn gpio_xor_oe(&mut self, mask: u32) {
+        self.sio.gpio_oe ^= mask;
+    }
+
+    #[inline(always)]
+    fn gpio_read_in(&self) -> u32 {
         self.gpio_in
     }
 
@@ -2477,9 +2516,18 @@ mod corebus_trait_tests {
         // Transient accessors (removed in later Phase 3 stages — see
         // `core/bus_trait.rs` for the teardown schedule).
         let _atomics: &Arc<CoreAtomics> = bus_dyn.atomics();
-        let _ = bus_dyn.sio();
-        let _ = bus_dyn.sio_mut();
-        let _ = bus_dyn.gpio_in();
+        // GPIO OUT/OE/IN typed accessors (Phase 3 Stage 6a).
+        let _ = bus_dyn.gpio_read_out();
+        bus_dyn.gpio_write_out(0);
+        bus_dyn.gpio_set_out(0);
+        bus_dyn.gpio_clear_out(0);
+        bus_dyn.gpio_xor_out(0);
+        let _ = bus_dyn.gpio_read_oe();
+        bus_dyn.gpio_write_oe(0);
+        bus_dyn.gpio_set_oe(0);
+        bus_dyn.gpio_clear_oe(0);
+        bus_dyn.gpio_xor_oe(0);
+        let _ = bus_dyn.gpio_read_in();
         let empty = bus_dyn.decode_cache_get(0);
         bus_dyn.decode_cache_set(0, empty);
         let _ = bus_dyn.extra_wait_states();

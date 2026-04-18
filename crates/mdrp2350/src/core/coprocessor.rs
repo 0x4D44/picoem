@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::bus::Bus;
 use crate::sio::Sio;
 use super::{CortexM33, CoreBus, Fault};
 
@@ -122,28 +120,41 @@ impl CortexM33 {
         if is_bulk {
             if is_mrc {
                 // op2=0 is the documented get; other op2 treated as NOP read 0.
-                self.regs.r[rt] = if op2 == 0 { bus.sio_mut().gpio_lo_out_get() } else { 0 };
+                self.regs.r[rt] = if op2 == 0 { bus.gpio_read_out() & Sio::PIN_MASK } else { 0 };
             } else {
-                let v = self.regs.r[rt];
+                let v = self.regs.r[rt] & Sio::PIN_MASK;
                 match op2 {
-                    0 => bus.sio_mut().gpio_lo_out_put(v),
-                    1 => bus.sio_mut().gpio_lo_out_set(v),
-                    2 => bus.sio_mut().gpio_lo_out_clr(v),
-                    3 => bus.sio_mut().gpio_lo_out_xor(v),
+                    0 => bus.gpio_write_out(v),
+                    1 => bus.gpio_set_out(v),
+                    2 => bus.gpio_clear_out(v),
+                    3 => bus.gpio_xor_out(v),
                     _ => {}
                 }
             }
         } else {
             let pin = (crn << 4) | crm;
             if is_mrc {
-                let v = if op2 == 0 { bus.sio_mut().gpio_bit_out_get(pin) } else { false };
+                // Per-bit read: pin >= 30 masks to 0 (parity with
+                // `Sio::gpio_bit_out_get`).
+                let v = if op2 == 0 && pin < 30 {
+                    (bus.gpio_read_out() >> pin) & 1 != 0
+                } else {
+                    false
+                };
                 self.regs.r[rt] = v as u32;
-            } else {
+            } else if pin < 30 {
+                let mask = 1u32 << pin;
                 match op2 {
-                    4 => bus.sio_mut().gpio_bit_out_put(pin, self.regs.r[rt] & 1 != 0),
-                    5 => bus.sio_mut().gpio_bit_out_set(pin),
-                    6 => bus.sio_mut().gpio_bit_out_clr(pin),
-                    7 => bus.sio_mut().gpio_bit_out_xor(pin),
+                    4 => {
+                        if self.regs.r[rt] & 1 != 0 {
+                            bus.gpio_set_out(mask);
+                        } else {
+                            bus.gpio_clear_out(mask);
+                        }
+                    }
+                    5 => bus.gpio_set_out(mask),
+                    6 => bus.gpio_clear_out(mask),
+                    7 => bus.gpio_xor_out(mask),
                     _ => {}
                 }
             }
@@ -163,28 +174,39 @@ impl CortexM33 {
     ) {
         if is_bulk {
             if is_mrc {
-                self.regs.r[rt] = if op2 == 0 { bus.sio_mut().gpio_lo_oe_get() } else { 0 };
+                self.regs.r[rt] = if op2 == 0 { bus.gpio_read_oe() & Sio::PIN_MASK } else { 0 };
             } else {
-                let v = self.regs.r[rt];
+                let v = self.regs.r[rt] & Sio::PIN_MASK;
                 match op2 {
-                    0 => bus.sio_mut().gpio_lo_oe_put(v),
-                    1 => bus.sio_mut().gpio_lo_oe_set(v),
-                    2 => bus.sio_mut().gpio_lo_oe_clr(v),
-                    3 => bus.sio_mut().gpio_lo_oe_xor(v),
+                    0 => bus.gpio_write_oe(v),
+                    1 => bus.gpio_set_oe(v),
+                    2 => bus.gpio_clear_oe(v),
+                    3 => bus.gpio_xor_oe(v),
                     _ => {}
                 }
             }
         } else {
             let pin = (crn << 4) | crm;
             if is_mrc {
-                let v = if op2 == 0 { bus.sio_mut().gpio_bit_oe_get(pin) } else { false };
+                let v = if op2 == 0 && pin < 30 {
+                    (bus.gpio_read_oe() >> pin) & 1 != 0
+                } else {
+                    false
+                };
                 self.regs.r[rt] = v as u32;
-            } else {
+            } else if pin < 30 {
+                let mask = 1u32 << pin;
                 match op2 {
-                    4 => bus.sio_mut().gpio_bit_oe_put(pin, self.regs.r[rt] & 1 != 0),
-                    5 => bus.sio_mut().gpio_bit_oe_set(pin),
-                    6 => bus.sio_mut().gpio_bit_oe_clr(pin),
-                    7 => bus.sio_mut().gpio_bit_oe_xor(pin),
+                    4 => {
+                        if self.regs.r[rt] & 1 != 0 {
+                            bus.gpio_set_oe(mask);
+                        } else {
+                            bus.gpio_clear_oe(mask);
+                        }
+                    }
+                    5 => bus.gpio_set_oe(mask),
+                    6 => bus.gpio_clear_oe(mask),
+                    7 => bus.gpio_xor_oe(mask),
                     _ => {}
                 }
             }
@@ -192,7 +214,7 @@ impl CortexM33 {
     }
 
     /// LO IN bank (opc1=2, read-only): bulk lo_in_get when (CRn=0,CRm=0),
-    /// else per-bit in on pin. Source is `bus.gpio_in()`. MCR is a silent NOP.
+    /// else per-bit in on pin. Source is `bus.gpio_read_in()`. MCR is a silent NOP.
     fn cp0_lo_in<B: CoreBus>(
         &mut self,
         bus: &mut B,
@@ -206,10 +228,10 @@ impl CortexM33 {
             return; // writes to the input bank are undefined -> silent NOP.
         }
         if is_bulk {
-            self.regs.r[rt] = bus.gpio_in() & Sio::PIN_MASK;
+            self.regs.r[rt] = bus.gpio_read_in() & Sio::PIN_MASK;
         } else {
             let pin = (crn << 4) | crm;
-            self.regs.r[rt] = if pin < 30 { (bus.gpio_in() >> pin) & 1 } else { 0 };
+            self.regs.r[rt] = if pin < 30 { (bus.gpio_read_in() >> pin) & 1 } else { 0 };
         }
     }
 

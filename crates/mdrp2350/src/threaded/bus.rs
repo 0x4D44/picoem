@@ -58,7 +58,6 @@ use crate::peripherals::spi::SPI0_BASE;
 use crate::peripherals::ticks::TICKS_BASE;
 use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE};
 use crate::peripherals::uart::UART0_BASE;
-use crate::sio::Sio;
 use crate::threaded::CoreAtomics;
 use crate::threaded::SharedState;
 
@@ -124,15 +123,6 @@ impl PioBus {
 /// `CortexM33`. Until then, each `WorkerBus` carries its own
 /// `DECODE_CACHE_SIZE` slots so the trait object covers every method.
 ///
-/// ## Sio placeholder (transient)
-///
-/// Similarly, `CoreBus::sio() / sio_mut() / gpio_in()` still live on
-/// the trait per Stage 2. `WorkerBus` carries a standalone `Sio`
-/// instance as a placeholder so these accessors compile — that `Sio`
-/// is **not** coherent with `shared.sio`. Stage 7's `core_worker_body`
-/// rewires the CortexM33 callers away from these methods before PIO
-/// and SIO paths hit the worker. Harness-use of WorkerBus before Stage
-/// 7 is not supported.
 pub struct WorkerBus {
     core_id: u8,
     shared: SharedState,
@@ -145,7 +135,6 @@ pub struct WorkerBus {
 
     // --- Transient Stage-2 trait support (see struct-level docs) ---
     decode_cache: Box<[DecodedOp]>,
-    sio_placeholder: Sio,
 }
 
 impl WorkerBus {
@@ -169,7 +158,6 @@ impl WorkerBus {
             extra_wait_states: 0,
             pending_cache_invalidations,
             decode_cache,
-            sio_placeholder: Sio::new(),
         }
     }
 
@@ -1184,21 +1172,59 @@ impl CoreBus for WorkerBus {
         &self.shared.atomics
     }
 
-    /// Transient placeholder — not coherent with `shared.sio`. See
-    /// struct docs; Stage 7 rewires CortexM33 away from this.
+    // --- GPIO OUT / OE / IN (Phase 3 Stage 6a) -----------------------
+    //
+    // Forward to `shared.gpio` bank 0 — RP2354 SIO only exposes bank 0
+    // on the CP0 GPIOC path. Stage 7 wires the GPIO_IN column on
+    // `AtomicGpio`; until then, `gpio_read_in` returns 0 (matching the
+    // single-threaded `Bus::gpio_in` default on fresh construction).
+
     #[inline]
-    fn sio(&self) -> &Sio {
-        &self.sio_placeholder
+    fn gpio_read_out(&self) -> u32 {
+        self.shared.gpio.read_out(0)
     }
     #[inline]
-    fn sio_mut(&mut self) -> &mut Sio {
-        &mut self.sio_placeholder
+    fn gpio_write_out(&mut self, val: u32) {
+        self.shared.gpio.write_out(0, val);
+    }
+    #[inline]
+    fn gpio_set_out(&mut self, mask: u32) {
+        self.shared.gpio.set_out(0, mask);
+    }
+    #[inline]
+    fn gpio_clear_out(&mut self, mask: u32) {
+        self.shared.gpio.clear_out(0, mask);
+    }
+    #[inline]
+    fn gpio_xor_out(&mut self, mask: u32) {
+        self.shared.gpio.xor_out(0, mask);
     }
 
     #[inline]
-    fn gpio_in(&self) -> u32 {
-        // AtomicGpio has no GPIO_IN column; Stage 7 wires external pin
-        // state there. Stage 5 returns 0 to stay dyn-covering.
+    fn gpio_read_oe(&self) -> u32 {
+        self.shared.gpio.read_oe(0)
+    }
+    #[inline]
+    fn gpio_write_oe(&mut self, val: u32) {
+        self.shared.gpio.write_oe(0, val);
+    }
+    #[inline]
+    fn gpio_set_oe(&mut self, mask: u32) {
+        self.shared.gpio.set_oe(0, mask);
+    }
+    #[inline]
+    fn gpio_clear_oe(&mut self, mask: u32) {
+        self.shared.gpio.clear_oe(0, mask);
+    }
+    #[inline]
+    fn gpio_xor_oe(&mut self, mask: u32) {
+        self.shared.gpio.xor_oe(0, mask);
+    }
+
+    #[inline]
+    fn gpio_read_in(&self) -> u32 {
+        // AtomicGpio has no GPIO_IN column yet; Stage 7 wires external
+        // pin state. Until then return 0, matching `gpio_in()`.
         0
     }
 
@@ -1455,9 +1481,18 @@ mod tests {
         // Transient accessors (removed in later Phase 3 stages —
         // see `core/bus_trait.rs`).
         let _a: &Arc<CoreAtomics> = bus_dyn.atomics();
-        let _ = bus_dyn.sio();
-        let _ = bus_dyn.sio_mut();
-        let _ = bus_dyn.gpio_in();
+        // GPIO OUT/OE/IN typed accessors (Phase 3 Stage 6a).
+        let _ = bus_dyn.gpio_read_out();
+        bus_dyn.gpio_write_out(0);
+        bus_dyn.gpio_set_out(0);
+        bus_dyn.gpio_clear_out(0);
+        bus_dyn.gpio_xor_out(0);
+        let _ = bus_dyn.gpio_read_oe();
+        bus_dyn.gpio_write_oe(0);
+        bus_dyn.gpio_set_oe(0);
+        bus_dyn.gpio_clear_oe(0);
+        bus_dyn.gpio_xor_oe(0);
+        let _ = bus_dyn.gpio_read_in();
         let empty = bus_dyn.decode_cache_get(0);
         bus_dyn.decode_cache_set(0, empty);
         let _ = bus_dyn.extra_wait_states();
