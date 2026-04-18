@@ -948,9 +948,21 @@ impl CortexM33 {
             return match barrier_op {
                 // CLREX: clear the local exclusive monitor (Phase 0b.2).
                 0x2 => { self.exclusive_address = None; 1 }
-                0x4 => 1, // DSB
-                0x5 => 1, // DMB
-                0x6 => 1, // ISB
+                // DSB / DMB: ARMv8-M memory barrier. V7 LLD §10 maps these
+                // to a SeqCst fence so the emulator's semantics are correct
+                // under weaker host memory models (e.g. Loom, aarch64 host).
+                0x4 | 0x5 => {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    1
+                }
+                // ISB: in addition to the SeqCst fence, flush the decode
+                // cache so that any instruction writes made before this ISB
+                // (e.g. self-modifying code, cross-core SMC) are re-fetched.
+                0x6 => {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    self.invalidate_decode_cache_all(bus);
+                    1
+                }
                 _ => self.thumb32_undefined(hw0, hw1, bus),
             };
         }

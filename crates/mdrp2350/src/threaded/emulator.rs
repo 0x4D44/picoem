@@ -910,6 +910,13 @@ mod tests {
     /// next instruction's decode goes through a fresh fetch. We test
     /// (a)+(b) here; (c) is covered end-to-end by full-firmware tests
     /// in later phases.
+    ///
+    /// V7 LLD §10 closure (2026-04-17): the `ISB` instruction now emits
+    /// a `SeqCst` fence and calls `CortexM33::invalidate_decode_cache_all`
+    /// on the bus, so the observing core's cache is flushed on the ISB
+    /// in addition to the per-write queue drained below. That semantics
+    /// layer is exercised by the in-crate `core::tests`/`decode` cache
+    /// tests — this test remains focused on the WorkerBus plumbing.
     #[test]
     fn cross_core_smc_dsb_isb_fetches_new_insn() {
         // Plumbing validation only: confirms WorkerBus::write32 pushes
