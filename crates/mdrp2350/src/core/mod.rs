@@ -443,6 +443,58 @@ impl CortexM33 {
         self.cycles
     }
 
+    /// Invalidate decode-cache entries for the supplied addresses.
+    ///
+    /// Phase 3 Stage 7 (LLD V7 §9): the threaded worker loop drains
+    /// `WorkerBus::pending_cache_invalidations` every quantum and calls
+    /// this to evict stale entries whose backing halfwords were rewritten
+    /// by the peer core. Decode-cache storage currently lives on the
+    /// bus (per Stage 2 deferral); this method is generic over
+    /// [`CoreBus`] so both `Bus` (single-threaded) and `WorkerBus`
+    /// (threaded) can be driven through the same helper.
+    ///
+    /// Clears the direct-mapped slot `((addr >> 1) & (DECODE_CACHE_SIZE - 1))`
+    /// for each cacheable address. Non-cacheable addresses (anything outside
+    /// ROM / XIP / SRAM per [`is_cacheable_pc`]) are skipped.
+    pub fn invalidate_decode_cache_entries<B: CoreBus>(&mut self, bus: &mut B, addrs: &[u32]) {
+        use crate::bus::{DecodedOp, DECODE_CACHE_SIZE, is_cacheable_pc};
+        let _ = self; // reserved: once decode_cache migrates onto CortexM33
+                      // the per-core bookkeeping lives on `self`.
+        const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
+        let empty = DecodedOp::empty();
+        for &addr in addrs {
+            // Invalidate both the slot covering this halfword and the
+            // preceding slot (so a wide-instruction hw0 at `addr - 2`
+            // whose hw1 is rewritten at `addr` gets evicted). Parity
+            // with `Bus::invalidate_pc_range` (bus/mod.rs).
+            let aligned = addr & !1;
+            let prev = aligned.wrapping_sub(2);
+            if is_cacheable_pc(prev) {
+                let slot = ((prev >> 1) & MASK) as usize;
+                bus.decode_cache_set(slot, empty);
+            }
+            if is_cacheable_pc(aligned) {
+                let slot = ((aligned >> 1) & MASK) as usize;
+                bus.decode_cache_set(slot, empty);
+            }
+        }
+    }
+
+    /// Invalidate every decode-cache entry. Used by `ISB` and any other
+    /// path that globally invalidates the instruction pipeline.
+    ///
+    /// Phase 3 Stage 7: mirrors `Bus::invalidate_all` but routed through
+    /// the `CoreBus` trait so both the single-threaded and threaded
+    /// bus implementations are covered.
+    #[allow(dead_code)]
+    pub fn invalidate_decode_cache_all<B: CoreBus>(&mut self, bus: &mut B) {
+        use crate::bus::{DecodedOp, DECODE_CACHE_SIZE};
+        let empty = DecodedOp::empty();
+        for slot in 0..DECODE_CACHE_SIZE {
+            bus.decode_cache_set(slot, empty);
+        }
+    }
+
     /// Swap all banked register pairs between Secure and Non-Secure.
     fn swap_security_banks(&mut self) {
         self.regs.sync_sp_to_banked();

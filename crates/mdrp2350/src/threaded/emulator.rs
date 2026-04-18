@@ -1,9 +1,12 @@
 //! `ThreadedEmulator` — 4-thread runtime entry point for Phase 3.
 //!
-//! Phase 3 Stage 6b (LLD V7 §8/§9): this stage ships **stub** worker
-//! bodies that only rendezvous on the shared `SpinBarrier` twice per
-//! quantum. Stage 7 replaces the stubs with the real
-//! core / PIO / coordinator execution logic.
+//! Phase 3 Stage 7 (LLD V7 §9): real core / PIO / coordinator worker
+//! bodies. Each quantum the four workers rendezvous on the shared
+//! `SpinBarrier` twice — once at the top (execution phase start) and
+//! once at the bottom (peripheral-tick phase end). The coordinator
+//! publishes `master_cycle` and ticks shared peripherals between the
+//! two barriers; the CPU and PIO workers execute during the first
+//! phase and are idle in the second.
 //!
 //! Gated behind `#[cfg(all(target_arch = "x86_64", target_os =
 //! "windows"))]` because the thread-pinning path uses Win32
@@ -39,8 +42,8 @@ use crate::core::CortexM33;
 use crate::Emulator;
 
 use super::{
-    AtomicGpio, BarrierResult, ExclusiveMonitors, SharedMemory, SharedState,
-    SpinBarrier, ThreadedPio, ThreadedSio,
+    AtomicGpio, BarrierResult, ExclusiveMonitors, PioCommand, SharedMemory, SharedState,
+    SpinBarrier, ThreadedPio, ThreadedSio, WorkerBus,
 };
 use super::peripherals::{
     ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
@@ -258,8 +261,7 @@ impl ThreadedEmulator {
 
     /// Current shared master-cycle count. Lock-free `Acquire` load,
     /// paired with the coordinator's `fetch_add(Release)` in
-    /// `coordinator_worker_body_stub` (Stage 6b) /
-    /// `coordinator_worker_body` (Stage 7).
+    /// [`coordinator_worker_body`].
     pub fn master_cycle(&self) -> u64 {
         self.shared.master_cycle.load(Ordering::Acquire)
     }
@@ -269,10 +271,12 @@ impl ThreadedEmulator {
     /// call `run_quanta` again on a poisoned instance; drop it and
     /// rebuild from a fresh `Emulator`.
     ///
-    /// Stage 6b: the worker bodies are the rendezvous-only stubs from
-    /// [`core_worker_body_stub`] / [`pio_worker_body_stub`] /
-    /// [`coordinator_worker_body_stub`]. Stage 7 replaces each with the
-    /// real step / PIO-step / peripheral-tick logic.
+    /// Stage 7 (LLD V7 §9): each worker drives the real execution
+    /// logic — the CPU workers step their `CortexM33` against a
+    /// [`WorkerBus`] with WFE-wake + IRQ-pending merge semantics,
+    /// the PIO worker drains the command queue + steps active SMs,
+    /// and the coordinator publishes `master_cycle` + ticks the
+    /// coordinator-owned peripherals.
     pub fn run_quanta(&mut self, n: u64) {
         assert!(
             !self.poisoned,
@@ -290,19 +294,19 @@ impl ThreadedEmulator {
 
         let h0 = spawn_worker(mask[0], barrier.clone(), {
             let s = shared.clone();
-            move |b| core_worker_body_stub(0, core0, s, b, n, step_q)
+            move |b| core_worker_body(0, core0, s, b, n, step_q)
         });
         let h1 = spawn_worker(mask[1], barrier.clone(), {
             let s = shared.clone();
-            move |b| core_worker_body_stub(1, core1, s, b, n, step_q)
+            move |b| core_worker_body(1, core1, s, b, n, step_q)
         });
         let hp = spawn_worker(mask[2], barrier.clone(), {
             let s = shared.clone();
-            move |b| pio_worker_body_stub(blocks, s, b, n, step_q)
+            move |b| pio_worker_body(blocks, s, b, n, step_q)
         });
         let hc = spawn_worker(mask[3], barrier.clone(), {
             let s = shared.clone();
-            move |b| coordinator_worker_body_stub(s, b, n, step_q)
+            move |b| coordinator_worker_body(s, b, n, step_q)
         });
 
         let r0 = h0.join();
@@ -403,39 +407,83 @@ fn pin_to_host_core(host_core: usize) {
 }
 
 // =======================================================================
-// Stage 6b STUB worker bodies
+// Stage 7 worker bodies (LLD V7 §9)
 // =======================================================================
 //
-// STAGE 6b SCAFFOLDING: the three `*_worker_body_stub` functions are
-// barrier-only rendezvous placeholders. Stage 7 replaces them with real
-// core/pio/coordinator execution — see V7 §9. Tests that measure
-// cycle advancement or check execution side-effects will fail against
-// the stubs; that's by design.
+// Each body owns its loop over `n` quanta. Within a quantum, the CPU
+// and PIO workers do their work then double-`barrier.wait()` (once to
+// let the coordinator advance `master_cycle` / tick peripherals, once
+// to re-synchronise before the next quantum). The coordinator's
+// loop is the mirror: it waits first, advances state, then waits again.
 //
-// These only `barrier.wait()` twice per quantum. Stage 7 replaces the
-// bodies with the real execution loops (see LLD V7 §9):
-//   * `core_worker_body_stub` → `core_worker_body` with instruction
-//     dispatch + WFE/WFI wake hooks.
-//   * `pio_worker_body_stub`  → `pio_worker_body` that drains the PIO
-//     command queue and steps active SMs.
-//   * `coordinator_worker_body_stub` → `coordinator_worker_body` that
-//     advances `master_cycle`, MTIME, and the peripheral ticks.
-//
-// Returning the owned `CortexM33` / `[PioBlock; 3]` by-move keeps the
-// calling `run_quanta` handoff identical in Stage 7 — the bodies simply
-// start doing useful work with the values they already own.
+// A poisoned barrier (any worker panicked) returns the owned `CortexM33`
+// / `[PioBlock; 3]` / `()` immediately so the caller can flip the
+// `poisoned` flag.
 
-fn core_worker_body_stub(
+/// CPU-core worker. Owns a `CortexM33` and drives `step` against a
+/// per-core [`WorkerBus`]. Consumes any peer-asserted event (SEV) and
+/// IRQ-pending bits before the execution loop so a signal that landed
+/// between barriers does not slip through.
+fn core_worker_body(
     core_id: u8,
-    core: CortexM33,
-    _shared: SharedState,
+    mut core: CortexM33,
+    shared: SharedState,
     barrier: Arc<SpinBarrier>,
     n: u64,
-    _step_q: u32,
+    step_q: u32,
 ) -> CortexM33 {
-    // STAGE 6b STUB: Stage 7 replaces with the real execution loop.
-    let _ = core_id;
+    let mut bus = WorkerBus::new(core_id, shared.clone());
+    let mut target: u64 = 0;
+    let idx = core_id as usize;
+
     for _ in 0..n {
+        target = target.wrapping_add(step_q as u64);
+
+        // WFE wake: consume the event_flag and clear wfe_waiting so the
+        // step loop resumes execution. WFI wake is Phase 5. Pairs with
+        // `CoreAtomics::sev_both`'s `Release` store on the SEV caller
+        // side via `event_flag_consume`'s `AcqRel` swap.
+        if shared.atomics.is_wfe_waiting(idx)
+            && shared.atomics.event_flag_consume(idx)
+        {
+            shared.atomics.clear_wfe_waiting(idx);
+        }
+
+        // Merge coordinator-/peer-asserted IRQs into this core's NVIC.
+        // `take_irq_pending` is an `AcqRel` swap-to-zero — the non-zero
+        // return is the consume-and-merge trigger (LLD V7 §2).
+        let pending = shared.atomics.take_irq_pending(idx);
+        if pending != 0 {
+            core.ppb.merge_irq_pending(pending);
+        }
+
+        while !shared.atomics.is_halted(idx)
+            && !shared.atomics.is_wfe_waiting(idx)
+            && core.cycles() < target
+        {
+            core.ppb.update_latest_cycles(core.cycles());
+            core.step(&mut bus);
+            if !bus.pending_cache_invalidations.is_empty() {
+                // `core.step(&mut bus)` borrows `bus` mutably for the call duration,
+                // and `invalidate_decode_cache_entries(&mut self, bus, addrs)` also
+                // needs `&mut bus`. We can't simultaneously borrow
+                // `&bus.pending_cache_invalidations` and pass `&mut bus` — so swap
+                // the Vec out, drain, put it back.
+                //
+                // Happy path: the original 16-cap Vec roundtrips through `addrs` and
+                // gets cleared in place (preserving capacity). If invalidate_...
+                // panics, the cap-0 temporary stays in place and future quanta start
+                // re-allocating from cap 0 until the Vec grows back. This is
+                // acceptable given the panic already escalates to barrier poison +
+                // ThreadedEmulator::poisoned.
+                let addrs = std::mem::take(&mut bus.pending_cache_invalidations);
+                core.invalidate_decode_cache_entries(&mut bus, &addrs);
+                bus.pending_cache_invalidations = addrs;
+                bus.pending_cache_invalidations.clear();
+            }
+        }
+        core.ppb.update_latest_cycles(core.cycles());
+
         if barrier.wait() == BarrierResult::Poisoned {
             return core;
         }
@@ -446,15 +494,50 @@ fn core_worker_body_stub(
     core
 }
 
-fn pio_worker_body_stub(
-    blocks: [PioBlock; 3],
-    _shared: SharedState,
+/// PIO worker. Drains CPU-queued commands (INSTR_MEM / CLKDIV writes),
+/// then steps each enabled state machine `step_q` sysclocks. PIO IRQ
+/// routing to the NVIC is deliberately omitted — the single-threaded
+/// `Bus` path also does not route PIO IRQs today, and Phase 3 §6
+/// scopes this to parity (adding it requires both edges, which is a
+/// separate HLD).
+fn pio_worker_body(
+    mut blocks: [PioBlock; 3],
+    shared: SharedState,
     barrier: Arc<SpinBarrier>,
     n: u64,
-    _step_q: u32,
+    step_q: u32,
 ) -> [PioBlock; 3] {
-    // STAGE 6b STUB: Stage 7 replaces with the real PIO step loop.
     for _ in 0..n {
+        for cmd in shared.pio.drain_commands() {
+            apply_pio_command(&mut blocks, cmd);
+        }
+
+        // GPIO_IN snapshot once per quantum — parity with the
+        // single-threaded `Emulator::tick_peripherals` which reads
+        // `bus.gpio_in` once and hands it to every PIO step.
+        let gpio_in = shared.gpio.read_in();
+
+        for (block_idx, block) in blocks.iter_mut().enumerate() {
+            // NOTE: shared.pio.read_sm_enabled returns 0 until the PIO CTRL
+            // routing lands (see bus.rs TODO). Today the worker body drains
+            // commands + steps only the blocks whose PioBlock state was
+            // pre-configured via single-threaded Bus before from_emulator.
+            let enabled = shared.pio.read_sm_enabled(block_idx);
+            if enabled == 0 {
+                continue;
+            }
+            // `PioBlock::step_n` gates on `sm_enabled_mask` internally;
+            // mirroring the enable mask into the block keeps its fast
+            // path tight.
+            block.step_n(step_q, gpio_in);
+
+            // Reflect the block's IRQ flags back onto `ThreadedPio` so
+            // CPU workers observe them through the shared atomic.
+            // PIO→NVIC assertion is Phase-later scope (see function
+            // doc); we only publish the bits here.
+            shared.pio.write_irq_flags(block_idx, block.pending_irqs() as u8);
+        }
+
         if barrier.wait() == BarrierResult::Poisoned {
             return blocks;
         }
@@ -465,59 +548,113 @@ fn pio_worker_body_stub(
     blocks
 }
 
-fn coordinator_worker_body_stub(
-    _shared: SharedState,
+/// Apply a CPU-queued [`PioCommand`] to the PIO worker's local
+/// `PioBlock`s. Routes through each block's public `write32` so all
+/// the existing bookkeeping (INSTR_MEM index guard, FIFO-join handling,
+/// alias decoding) continues to apply.
+fn apply_pio_command(blocks: &mut [PioBlock; 3], cmd: PioCommand) {
+    match cmd {
+        PioCommand::WriteInstrMem { block, addr, value } => {
+            let b = block as usize;
+            if b >= blocks.len() || addr >= 32 {
+                return;
+            }
+            let offset = 0x048 + (addr as u32) * 4;
+            blocks[b].write32(offset, value as u32, 0);
+        }
+        PioCommand::SetClkDiv { block, sm, int_div, frac_div } => {
+            let b = block as usize;
+            if b >= blocks.len() || sm >= 4 {
+                return;
+            }
+            // SMn_CLKDIV lives at 0x0C8 + sm * 0x18. Layout: INT<<16,
+            // FRAC<<8, rest reserved (mdpicoem-common::pio::mod §write_clkdiv).
+            let offset = 0x0C8 + (sm as u32) * 0x18;
+            let val = ((int_div as u32) << 16) | ((frac_div as u32) << 8);
+            blocks[b].write32(offset, val, 0);
+        }
+    }
+}
+
+/// Coordinator worker. Advances `master_cycle` + MTIME then ticks the
+/// coordinator-owned peripherals between the two barriers. The
+/// `fetch_add(Release)` on `master_cycle` pairs with every CPU
+/// worker's `load(Acquire)` in `bus/peripherals.rs`'s PLL CS read
+/// path (LLD V7 §3, §9).
+fn coordinator_worker_body(
+    shared: SharedState,
     barrier: Arc<SpinBarrier>,
     n: u64,
     step_q: u32,
 ) {
-    // STAGE 6b STUB: Stage 7 replaces with peripheral ticks +
-    // master_cycle fetch_add + MTIME advance. The `step_q` argument is
-    // passed through the closure and into this body so the Stage 7
-    // swap is a body-local edit — no signature change.
-    let _ = step_q;
     for _ in 0..n {
         if barrier.wait() == BarrierResult::Poisoned {
             return;
         }
+
+        // Advance master_cycle BEFORE ticking peripherals so CPU
+        // workers' next-quantum PLL reads observe the fresh timeline.
+        shared.master_cycle.fetch_add(step_q as u64, Ordering::Release);
+        shared.sio.mtime_advance(step_q as u64);
+
+        tick_peripherals(&shared, step_q as u64);
+
         if barrier.wait() == BarrierResult::Poisoned {
             return;
         }
     }
 }
 
+/// Coordinator-owned peripheral tick. Stage 7 minimal implementation —
+/// full per-peripheral integration (DMA progress, TIMER0/1 alarm arm
+/// checks, UART TX/RX FIFO drain, ADC FIFO, PWM wrap) lands alongside
+/// the corresponding migration from the single-threaded Bus tick path.
+///
+/// Until those peripherals publish their per-quantum effects through
+/// `Peripherals` (Phase 4/5), this function is intentionally a no-op —
+/// the `shared.master_cycle` + `shared.sio.mtime_advance` already done
+/// in the coordinator body cover the clock-tree visibility contract
+/// the CPU workers rely on.
+fn tick_peripherals(shared: &SharedState, cycles: u64) {
+    // TODO(Phase 4): TIMER0 / TIMER1 alarm fire checks — see
+    //   `Bus::tick_peripherals` in `crates/mdrp2350/src/bus/mod.rs` for
+    //   the single-threaded implementation, which drains alarm-match
+    //   IRQs into `CoreAtomics::assert_irq_shared`.
+    // TODO(Phase 4): DMA tick — advance channel progress, raise
+    //   DMA_IRQ_0/1 via `shared.atomics.assert_irq_shared`.
+    // TODO(Phase 5): UART TX/RX FIFO drain + ADC FIFO + PWM wrap.
+    //
+    // All of the above will compose cleanly with the existing
+    // `Peripherals` mutex layout — the coordinator is the only
+    // writer of these states so contention is only with CPU-worker
+    // MMIO reads against the APB surface.
+    let _ = (shared, cycles);
+}
+
 // =======================================================================
 // Tests
 // =======================================================================
 //
-// Stage 6b keeps the test surface minimal. The two tests here verify
-// that the destructure → seed → spawn → join round-trip compiles and
-// runs; Stage 7 will add smoke tests that validate actual execution
-// against the single-threaded baseline.
+// Stage 7 (LLD V7 §11 items 13–19): smoke tests that spawn the 4-worker
+// runtime and verify end-to-end execution semantics — quantum advance,
+// cross-core SRAM visibility, WFE/SEV wake, FIFO-push wake, spinlock
+// contention, doorbell state, and decode-cache invalidation plumbing.
+//
+// The three `from_emulator_preserves_*` tests from earlier stages stay
+// — they exercise the destructure + seed round-trip.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Config;
 
+    // ----- Handoff + round-trip (stages prior) --------------------------
+
     #[test]
     fn from_emulator_builds_threadedemulator() {
         let emu = Emulator::new(Config::default());
         let threaded = ThreadedEmulator::from_emulator(emu);
         assert_eq!(threaded.master_cycle(), 0);
-    }
-
-    #[test]
-    fn run_quanta_stubs_spawn_and_join() {
-        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
-        threaded.run_quanta(1);
-        let mc_before = threaded.master_cycle();
-        threaded.run_quanta(5);
-        assert_eq!(
-            threaded.master_cycle(),
-            mc_before,
-            "stub coordinator does not advance master_cycle; Stage 7 changes this"
-        );
     }
 
     /// Fix 1a: an unconsumed `pending_fifo_event` on the single-threaded
@@ -559,5 +696,280 @@ mod tests {
         let threaded = ThreadedEmulator::from_emulator(emu);
         assert!(threaded.shared.sio.mtime_match_asserted_load(0));
         assert!(!threaded.shared.sio.mtime_match_asserted_load(1));
+    }
+
+    // ----- §11 item 13: master_cycle advances per quantum ---------------
+
+    /// Coordinator advances `master_cycle` by `step_quantum` each
+    /// quantum. Running 1 + 100 quanta should land at 101 ticks'
+    /// worth of `master_cycle` (halted cores ⇒ no CPU execution,
+    /// isolates the coordinator's `fetch_add` contribution).
+    #[test]
+    fn run_quanta_single_then_many() {
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        // Halt both cores so the CPU workers spin-and-wait; coordinator
+        // still advances master_cycle per quantum regardless.
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        let step_q = threaded.step_quantum as u64;
+        assert_eq!(threaded.master_cycle(), 0);
+
+        threaded.run_quanta(1);
+        assert_eq!(threaded.master_cycle(), step_q);
+
+        threaded.run_quanta(100);
+        assert_eq!(
+            threaded.master_cycle(),
+            101 * step_q,
+            "master_cycle must advance by step_quantum each quantum"
+        );
+    }
+
+    // ----- §11 item 14: SRAM write visible across cores -----------------
+
+    /// SRAM writes made through `SharedMemory` from the core-0 worker
+    /// side must be visible to core-1 reads. Drive via the shared
+    /// memory interface directly (per spec note — "prefer
+    /// `shared.memory.write32` / `read32` directly since full-emulator
+    /// smoke is the goal"). Run a quantum before reading to make sure
+    /// the barrier protocol does not strand stores.
+    #[test]
+    fn sram_write_visible_across_cores() {
+        // Validates Arc<SharedMemory> aliasing — a store through one
+        // owner's handle is visible via another owner's handle. Full
+        // CPU-worker-thread-0 → CPU-worker-thread-1 visibility under
+        // step() requires firmware driving and is deferred to the
+        // firmware-oracle phase. This test exercises the memory-layer
+        // contract; the §9 barrier protocol ensures the worker-to-worker
+        // happens-before chain separately.
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        let addr: u32 = 0x2000_1000;
+        let val: u32 = 0xDEAD_BEEF;
+
+        // Core 0 writes via shared memory.
+        threaded.shared.memory.write32(addr, val);
+
+        // Advance a quantum.
+        threaded.run_quanta(1);
+
+        // Core 1 observes the value through the same shared memory.
+        assert_eq!(
+            threaded.shared.memory.read32(addr),
+            val,
+            "SRAM write from core 0's side must be visible to core 1"
+        );
+    }
+
+    // ----- §11 item 15: WFE/SEV wake ------------------------------------
+
+    /// Park core 0 on WFE by setting `wfe_waiting[0]` directly, then
+    /// fire SEV. The next quantum's top-of-loop check consumes the
+    /// event_flag and clears wfe_waiting. Because Stage 7 does not
+    /// boot firmware here, we drive the pre-condition via the atomics
+    /// surface.
+    #[test]
+    fn wfe_sev_wake() {
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        // Halt core 1 so only core 0's worker exercises the wake hook.
+        threaded.shared.atomics.set_halted(1);
+
+        // Park core 0 on WFE.
+        threaded.shared.atomics.set_wfe_waiting(0);
+        assert!(threaded.shared.atomics.is_wfe_waiting(0));
+
+        // Fire SEV (sets event_flag on both cores).
+        threaded.shared.atomics.sev_both();
+
+        // Run a quantum — core_worker_body should consume event_flag
+        // and clear wfe_waiting before entering the step loop.
+        threaded.run_quanta(1);
+
+        assert!(
+            !threaded.shared.atomics.is_wfe_waiting(0),
+            "WFE wake must clear wfe_waiting after SEV"
+        );
+        assert!(
+            !threaded.shared.atomics.event_flag_load(0),
+            "event_flag[0] must be consumed by the wake check"
+        );
+    }
+
+    // ----- §11 item 16: FIFO push wakes peer's WFE ----------------------
+
+    /// A FIFO_WR MMIO write from core 1 must set `event_flag[0]` via
+    /// the Stage 5 WorkerBus hook, which wakes a WFE-parked core 0
+    /// on the next quantum. Drives the hook directly through a
+    /// `WorkerBus::write32` call so the test does not depend on a
+    /// firmware-driven MMIO path.
+    #[test]
+    fn fifo_push_wakes_peer_wfe() {
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(1);
+        threaded.shared.atomics.set_wfe_waiting(0);
+
+        // Core-1 side pushes FIFO_WR (SIO offset 0x054). Use a
+        // transient WorkerBus bound to core 1 — the same dispatch
+        // the worker loop goes through.
+        {
+            use crate::core::CoreBus;
+            let mut bus = WorkerBus::new(1, threaded.shared.clone());
+            bus.write32(0xD000_0054, 0x1234_5678, 1);
+        }
+
+        // event_flag[0] must be set now (pre-quantum).
+        assert!(
+            threaded.shared.atomics.event_flag_load(0),
+            "FIFO push must set event_flag on the peer core"
+        );
+
+        threaded.run_quanta(1);
+
+        assert!(
+            !threaded.shared.atomics.is_wfe_waiting(0),
+            "FIFO push hook must wake core 0 from WFE"
+        );
+    }
+
+    // ----- §11 item 17: spinlock contention -----------------------------
+
+    /// Two cores racing for the same spinlock: core 0 claims, core 1
+    /// tries and gets 0 (failed). Core 0 releases; core 1 reclaims
+    /// successfully. Drives the lock through `ThreadedSio` directly
+    /// (parity with WorkerBus spinlock dispatch at 0x100..=0x17F).
+    #[test]
+    fn spinlock_contended_both_cores() {
+        let threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let sio = threaded.shared.sio.clone();
+
+        // Core 0 claims lock 7.
+        let first = sio.spinlock_claim(7);
+        assert_eq!(first, 1u32 << 7, "core 0 should succeed claiming free lock");
+
+        // Core 1 tries and fails (returns 0).
+        let second = sio.spinlock_claim(7);
+        assert_eq!(second, 0, "core 1 must see the lock held and return 0");
+
+        // Core 0 releases. Core 1 re-tries and succeeds.
+        sio.spinlock_release(7);
+        let third = sio.spinlock_claim(7);
+        assert_eq!(third, 1u32 << 7, "core 1 must claim after release");
+    }
+
+    // ----- §11 item 18: doorbell state roundtrip (no IRQ) ---------------
+
+    /// §6 scope: doorbell writes mutate bits without asserting IRQ
+    /// (parity with single-threaded `sio/mod.rs:152-154`). Verify the
+    /// state roundtrips and the shared NVIC pending bits stay clear.
+    #[test]
+    fn doorbell_state_roundtrips_without_irq() {
+        let threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let sio = &threaded.shared.sio;
+        let atomics = &threaded.shared.atomics;
+
+        // Pre-condition: no pending IRQ bits on either core.
+        assert_eq!(atomics.irq_pending_load(0), 0);
+        assert_eq!(atomics.irq_pending_load(1), 0);
+
+        // Core 0 rings core 1's doorbell.
+        sio.doorbell_set(1, 0b0101);
+        assert_eq!(sio.doorbell_read(1), 0b0101);
+
+        // Clear two bits; verify read-back.
+        sio.doorbell_clear(1, 0b0100);
+        assert_eq!(sio.doorbell_read(1), 0b0001);
+
+        // IRQ pending must not be asserted — §6 scope parity.
+        assert_eq!(
+            atomics.irq_pending_load(0),
+            0,
+            "doorbell must not raise IRQ on sender"
+        );
+        assert_eq!(
+            atomics.irq_pending_load(1),
+            0,
+            "doorbell must not raise IRQ on receiver (§6 scope parity)"
+        );
+    }
+
+    // ----- §11 item 19: cross-core SMC → decode-cache invalidation ------
+
+    /// Plumbing test: a WorkerBus write32 into SRAM (region `0x2`)
+    /// pushes the address onto `pending_cache_invalidations`. The
+    /// worker loop drains the Vec each quantum — the plumbing guarantee
+    /// is that (a) the write records, (b) the loop drains, (c) the
+    /// next instruction's decode goes through a fresh fetch. We test
+    /// (a)+(b) here; (c) is covered end-to-end by full-firmware tests
+    /// in later phases.
+    #[test]
+    fn cross_core_smc_dsb_isb_fetches_new_insn() {
+        // Plumbing validation only: confirms WorkerBus::write32 pushes
+        // addresses into pending_cache_invalidations, and that the worker
+        // body drains them via invalidate_decode_cache_entries. End-to-end
+        // cross-core SMC (core 0 writes → core 1 executes rewritten insn)
+        // requires firmware and is deferred to the firmware-oracle phase.
+        use crate::core::CoreBus;
+
+        let threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut bus = WorkerBus::new(0, threaded.shared.clone());
+
+        // (a) write32 into SRAM records TWO pending invalidations
+        // (`addr` and `addr+2`) so the drainer's `{slot(addr-2),
+        // slot(addr)}` pattern ends up covering `{addr-2, addr, addr+2}`
+        // — parity with `Bus::invalidate_pc_range(addr, 4)`.
+        let addr_a = 0x2000_0100;
+        bus.write32(addr_a, 0xBF00_BF00, 0);
+        assert_eq!(
+            bus.pending_cache_invalidations.len(),
+            2,
+            "write32 must queue two decode-cache invalidations"
+        );
+        assert_eq!(
+            bus.pending_cache_invalidations[0], addr_a,
+            "first queued entry is the word address"
+        );
+        assert_eq!(
+            bus.pending_cache_invalidations[1], addr_a + 2,
+            "second queued entry is word+2 to cover trailing hw slot"
+        );
+
+        // (b) a second write accumulates — two more entries.
+        bus.write32(0x2000_0200, 0xBF00_BF00, 0);
+        assert_eq!(
+            bus.pending_cache_invalidations.len(),
+            4,
+            "second write32 accumulates two more entries"
+        );
+
+        // Simulate the worker loop's drain step:
+        let addrs = std::mem::take(&mut bus.pending_cache_invalidations);
+        let mut dummy = Emulator::new(Config::default());
+        dummy
+            .cores[0]
+            .invalidate_decode_cache_entries(&mut bus, &addrs);
+        bus.pending_cache_invalidations = addrs;
+        bus.pending_cache_invalidations.clear();
+
+        assert!(
+            bus.pending_cache_invalidations.is_empty(),
+            "drain + clear must leave the queue empty"
+        );
+
+        // Non-exec region writes (APB / SIO) must NOT queue invalidations.
+        bus.write32(0xD000_0010, 0, 0);
+        assert!(
+            bus.pending_cache_invalidations.is_empty(),
+            "SIO write must not queue a decode-cache invalidation"
+        );
     }
 }

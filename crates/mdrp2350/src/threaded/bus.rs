@@ -497,6 +497,16 @@ impl WorkerBus {
                 // written value while the PIO never actually gets
                 // programmed — masking missing Stage 7 wiring in any
                 // smoke test that writes then reads back INSTR_MEM.
+                //
+                // TODO(stage8): PIO CTRL / INSTR_MEM / CLKDIV writes
+                // currently drop silently. Real routing requires:
+                //   1. Extending `PioCommand` with `SetSmEnabled { block, mask }` +
+                //      `WriteCtrl { block, reg, val, alias }`.
+                //   2. ahb_write32 pushing these commands via `shared.pio.send_command`.
+                //   3. PIO worker's `apply_pio_command` dispatching them into PioBlock
+                //      state (including `PioBlock::set_enabled_mask`).
+                // Until wired, PIO is stepable only via state directly configured in
+                // the single-threaded Bus before `from_emulator` is called.
                 let _ = (canonical, alias, val); // consumed in Stage 7
             }
             _ => {
@@ -932,10 +942,26 @@ impl WorkerBus {
 
     /// Queue a post-write cache invalidation for any write that could
     /// have landed in executable memory (ROM/XIP/SRAM).
+    ///
+    /// `len` is the write width in bytes (1, 2, or 4). The drainer
+    /// ([`CortexM33::invalidate_decode_cache_entries`]) evicts two slots
+    /// per queued address (`addr-2` and `addr`), so for a 4-byte write we
+    /// push **two** entries (`addr` and `addr+2`) to match the coverage
+    /// of the single-threaded [`Bus::invalidate_pc_range(addr, 4)`],
+    /// which clears `{addr-2, addr, addr+2}`. For 1/2-byte writes a
+    /// single entry suffices (coverage `{addr-2, addr}`); the extra
+    /// `addr-2` entry for byte writes is a safe over-invalidation.
     #[inline]
-    fn queue_cache_invalidation(&mut self, addr: u32) {
+    fn queue_cache_invalidation(&mut self, addr: u32, len: u8) {
+        debug_assert!(len == 1 || len == 2 || len == 4);
         if matches!(addr >> 28, 0x0..=0x2) {
             self.pending_cache_invalidations.push(addr);
+            if len == 4 {
+                // write32 spans {addr-2, addr, addr+2} — one push only
+                // covers {addr-2, addr}. Push addr+2 to get the third
+                // slot.
+                self.pending_cache_invalidations.push(addr.wrapping_add(2));
+            }
         }
     }
 }
@@ -1062,7 +1088,7 @@ impl CoreBus for WorkerBus {
         match addr >> 28 {
             0x0..=0x2 => {
                 self.shared.memory.write8(addr, val);
-                self.queue_cache_invalidation(addr);
+                self.queue_cache_invalidation(addr, 1);
             }
             0x4 => {
                 // Narrow-write dispatch for side-effect registers
@@ -1120,7 +1146,7 @@ impl CoreBus for WorkerBus {
         match addr >> 28 {
             0x0..=0x2 => {
                 self.shared.memory.write16(addr, val);
-                self.queue_cache_invalidation(addr);
+                self.queue_cache_invalidation(addr, 2);
             }
             0x4 => {
                 // Narrow-write dispatch — same rationale as write8.
@@ -1175,7 +1201,7 @@ impl CoreBus for WorkerBus {
         match addr >> 28 {
             0x0..=0x2 => {
                 self.shared.memory.write32(addr, val);
-                self.queue_cache_invalidation(addr);
+                self.queue_cache_invalidation(addr, 4);
             }
             0x4 => self.apb_write32(addr, val),
             0x5 => self.ahb_write32(addr, val),
@@ -1455,16 +1481,27 @@ mod tests {
             bus.write32(base + i * 4, i, 0);
         }
 
+        // Each write32 pushes TWO entries (`addr` and `addr+2`) so that
+        // the drainer — which invalidates `addr-2` and `addr` slots per
+        // queued address — covers the full `{addr-2, addr, addr+2}`
+        // range expected by the single-threaded
+        // `Bus::invalidate_pc_range(addr, 4)`. 8 writes × 2 = 16.
         assert_eq!(
             bus.pending_cache_invalidations.len(),
-            8,
-            "one entry per SRAM write"
+            16,
+            "two entries per SRAM write32 (addr, addr+2)"
         );
         for i in 0..8u32 {
+            let word_addr = base + i * 4;
             assert_eq!(
-                bus.pending_cache_invalidations[i as usize],
-                base + i * 4,
-                "address recorded verbatim"
+                bus.pending_cache_invalidations[i as usize * 2],
+                word_addr,
+                "first entry records word base"
+            );
+            assert_eq!(
+                bus.pending_cache_invalidations[i as usize * 2 + 1],
+                word_addr + 2,
+                "second entry records word+2 to cover trailing hw slot"
             );
         }
     }
