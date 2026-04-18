@@ -2,6 +2,56 @@
 
 Items discovered during development that need addressing in later phases.
 
+## Silicon oracle scenario `pwm_fractional_div` — self-gated sled design
+fails silicon verify (Residual A.2.3 incomplete)
+
+**Context:** Residual A.2.3 attempted to close `pwm_fractional_div` on RP2354
+silicon (HLD: `wrk_docs/2026.04.17 - HLD - Residual A.2.3 PWM Fractional
+Divider Fix.md`). The HLD's diagnosis is sound: the emulator's fractional
+divider formula is correct for the declared scenario window
+(152 sysclks / divisor 2.0 = 76 = 0x4C, unit test
+`fractional_div_integer_2_per_cycle_dispatch_matches_bulk` pins this), and
+the divergence is a scenario-design defect (measurement-window asymmetry
+between silicon's DAP-open window and emulator's `actual_sysclks` window).
+
+**Proposed fix (attempted, reverted):** custom sled that flips `CSR_EN=1`
+as its first instruction and `CSR_EN=0` before BKPT, plus observe mask
+widened from broken `0x64` (non-contiguous) to `0xFFFF`. Cross-executed
+correctly on emulator (post-sled CTR = 76). **Silicon FAILs**:
+`HW=0x0000FE82 EMU=0x0000004C` (xor=0xFECE). HW=65154 implies silicon's
+PWM-enabled window is ~130k sysclks, not 152 — the self-gated sled is
+not actually stopping the counter on silicon.
+
+**Hypotheses not yet disproven** (needs empirical silicon probing):
+1. Silicon's `CSR_EN=0` write via Thumb STR doesn't propagate before BKPT
+   halts the core (unlikely — APB writes complete before next-instr retire).
+2. Silicon holds PWM-enabled state across the `gate_peripheral_hw` →
+   CTR readback path that occurs after BKPT, with the DAP-readback latency
+   contributing to the high HW count.
+3. Split-storage tech-debt in emulator (Table 1137 says CSR_EN / EN are
+   one physical bit; emulator stores them as two independent fields)
+   interacts with sled ordering in a way that the emulator's `AND` model
+   masks but silicon exposes.
+4. Something in the scenario runner's post-halt sequence re-enables PWM
+   (unlikely — no gate_peripheral_hw PWM branch exists; setup table no
+   longer writes enable).
+
+**Recommended next steps:**
+1. Add a diagnostic scenario variant that reads `PWM_SLICE0_CSR` and
+   `PWM_EN_OFFSET` post-BKPT — confirms whether enable bits are actually
+   0 at observe time.
+2. Consider adding a PWM branch to `gate_peripheral_hw` that writes
+   `CSR_EN=0` to all active slices before readback — belt-and-braces.
+3. Audit what silicon does between BKPT-reached and CTR-read. If
+   non-trivial PWM ticking happens there, the fix needs to be at the
+   runner level, not the sled.
+
+**Status:** Residual A.2.3 open pending follow-up wave. Residual leaves
+the scenario as it was before the wave (setup-time `CSR_EN=1` + default
+countdown sled + broken `0x64` observe mask + HW=0x64 EMU=0x44 coincidence-
+PASS-style fail). Emulator fractional-divider formula from commit `5eac6a1`
+remains correct and protected by existing unit tests; no regression risk.
+
 ## HLD/LLD alignment
 
 ### Test-Oracles HLD V4 §4 Phase 2 — QEMU invocation deviation
