@@ -1275,7 +1275,7 @@ fn step_emu_until_pc(
         // Reading the instruction word through the bus is safe —
         // oracle-region addresses alias into SRAM and have no side
         // effects.
-        let op = emu.bus.read32(pc);
+        let op = emu.bus.read32(pc, 0);
         if op == EBREAK_WORD {
             return Ok(());
         }
