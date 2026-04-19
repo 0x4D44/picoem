@@ -464,6 +464,71 @@ impl CortexM33 {
         self.step(bus);
     }
 
+    /// Threaded-worker fast path: like [`Self::step`] but skips the
+    /// per-step atomic loads (`is_wfe_waiting`, `is_halted`,
+    /// `take_irq_pending`) that the caller has already handled at
+    /// quantum boundaries. In the threaded runtime those atomics land
+    /// on cache lines shared with the coordinator worker, and when the
+    /// coordinator writes to `irq_pending` between quanta the core's
+    /// per-step load turns into a ~30 ns cache-line bounce — tripling
+    /// the cost of a single-cycle ALU instruction.
+    ///
+    /// Contract (upheld by `threaded::core_worker_body`):
+    ///   - `!is_halted(core)` at the call site
+    ///   - `!is_wfe_waiting(core)` at the call site (post-step WFE sets
+    ///     are observed by the worker before the next call)
+    ///   - Any pending IRQs were taken and merged into `ppb` at the
+    ///     top of the quantum
+    ///
+    /// The arc-sharing trip-wire and the exception-entry + fault paths
+    /// still run inside; only the cross-thread atomics on `CoreAtomics`
+    /// are elided.
+    pub fn step_no_atomics<B: CoreBus>(&mut self, bus: &mut B) {
+        debug_assert!(
+            Arc::ptr_eq(&self.atomics, bus.atomics()),
+            "CortexM33 and its Bus hold disjoint Arc<CoreAtomics>"
+        );
+        debug_assert!(!self.atomics.is_halted(self.core_id as usize));
+        debug_assert!(!self.atomics.is_wfe_waiting(self.core_id as usize));
+
+        if let Some(cost) = self.try_take_any_pending_exception(bus) {
+            self.cycles = self.cycles.wrapping_add(cost as u64);
+            return;
+        }
+
+        let mut cycles = self.decode_execute(bus);
+
+        let mut fault_handled = false;
+        if bus.bus_fault(self.core_id) {
+            fault_handled = true;
+            let busfault_ena = self.ppb.shcsr & (1 << 17) != 0;
+            self.ppb.cfsr |= (1 << 9) | (1 << 15);
+            self.ppb.bfar = bus.bus_fault_addr(self.core_id);
+            bus.clear_bus_fault(self.core_id);
+            if busfault_ena {
+                cycles = self.enter_exception(5, bus);
+            } else {
+                info!(
+                    pc = format_args!("{:#010x}", self.current_instr_addr),
+                    "HardFault escalation from BusFault",
+                );
+                self.ppb.hfsr |= 1 << 30;
+                cycles = self.enter_exception(3, bus);
+            }
+        }
+
+        if !fault_handled {
+            if let Some(fault) = self.pending_fault.take() {
+                cycles = self.deliver_fault(fault, bus);
+            }
+        } else {
+            self.pending_fault = None;
+        }
+
+        self.counters.decode_execute_cycles += cycles as u64;
+        self.cycles = self.cycles.wrapping_add(cycles as u64);
+    }
+
     /// Returns the core ID (0 or 1).
     pub fn id(&self) -> u8 {
         self.core_id

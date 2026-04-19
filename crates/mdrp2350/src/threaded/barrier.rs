@@ -1,4 +1,4 @@
-//! Flat spin barrier for worker-thread synchronisation.
+//! Hybrid spin+park barrier for worker-thread synchronisation.
 //!
 //! A fixed-party rendezvous point: each `wait()` caller blocks until
 //! `parties` threads have arrived, then all release simultaneously and
@@ -10,21 +10,26 @@
 //! ## Mechanism
 //!
 //! A generation counter distinguishes barrier rounds. The last arriver
-//! resets `count` and bumps `generation`; earlier arrivers spin until
-//! they observe a new generation. There is no fallback to futexes —
-//! callers are worker threads that will hit the barrier within
-//! microseconds, so wasted spinning is bounded.
+//! resets `count`, bumps `generation`, and broadcasts via `Condvar`.
+//! Earlier arrivers first spin for a short budget (`SPIN_BUDGET`) — the
+//! fast path when all workers converge within a few hundred ns — and
+//! only then fall back to `Condvar::wait` so they don't burn CPU while
+//! one productive worker runs a long quantum alone. This matters under
+//! single-core workloads where three of four workers have nothing to
+//! do: the pure-spin variant had them pegging `pause` for the entire
+//! quantum, bouncing cache lines against the productive core.
 //!
 //! ## Poisoning
 //!
 //! If a worker panics before reaching the barrier, the remaining
-//! threads would spin forever. The coordinator catches the panic
+//! threads would wait forever. The coordinator catches the panic
 //! (Phase 4) and calls [`SpinBarrier::poison`], which unblocks all
-//! current and future waiters with [`BarrierResult::Poisoned`]. Phase 2
-//! provides the primitive; the `catch_unwind` wiring lands in Phase 4.
+//! current and future waiters with [`BarrierResult::Poisoned`] via the
+//! same `Condvar` broadcast.
 //!
-//! Phase 0c measured ~425 ns mean round-trip (4-way), within the
-//! <500 ns threshold.
+//! Phase 0c measured ~425 ns mean round-trip (4-way) on the pure-spin
+//! variant; the hybrid keeps that fast path when all workers arrive in
+//! close succession.
 //!
 //! ## Cross-chip reuse
 //!
@@ -32,6 +37,17 @@
 //! Phase 3 when the RP2040 threaded path lands.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::*};
+use std::sync::{Condvar, Mutex};
+
+/// Spin iterations before falling back to `Condvar::wait`. Tuned so
+/// all-workers-arrive-together stays on the fast path (~425 ns for a
+/// 4-way round) while one-worker-running-long transitions a waiter to
+/// sleep within a couple of microseconds. `spin_loop()` hints take
+/// ~20 ns on current x86; 128 iterations is ~2.5 μs — comfortably
+/// above the <500 ns target-arrival window, and short enough that
+/// single-core workloads where one worker runs 100 μs+ of emulated
+/// work per quantum don't burn 40 μs of pure spin every barrier.
+const SPIN_BUDGET: u32 = 128;
 
 /// Outcome of a [`SpinBarrier::wait`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,16 +58,23 @@ pub enum BarrierResult {
     Poisoned,
 }
 
-/// Fixed-party flat barrier with panic-safe poisoning.
+/// Fixed-party hybrid barrier with panic-safe poisoning.
 ///
 /// Constructed once and shared (typically behind an `Arc`) across the
 /// worker threads. Both `wait()` and `poison()` take `&self`, so no
-/// external locking is needed.
+/// external locking is needed. Name retained from the Phase 0c
+/// spin-only prototype (`SpinBarrier`) for call-site compatibility;
+/// the implementation is now spin-then-park.
 pub struct SpinBarrier {
     generation: AtomicU32,
     count: AtomicU32,
     parties: u32,
     poisoned: AtomicBool,
+    /// Held briefly by the last arriver (around the `generation` store)
+    /// and by earlier arrivers once their spin budget is exhausted
+    /// (across a `Condvar::wait`). Uncontended in the fast path.
+    park_mu: Mutex<()>,
+    park_cv: Condvar,
 }
 
 impl SpinBarrier {
@@ -66,6 +89,8 @@ impl SpinBarrier {
             count: AtomicU32::new(0),
             parties,
             poisoned: AtomicBool::new(false),
+            park_mu: Mutex::new(()),
+            park_cv: Condvar::new(),
         }
     }
 
@@ -81,30 +106,61 @@ impl SpinBarrier {
         let cur_gen = self.generation.load(Acquire);
         let n = self.count.fetch_add(1, AcqRel) + 1;
         if n == self.parties {
-            // Last arrival: reset count and bump generation, releasing
-            // all earlier arrivals in one Release store.
-            self.count.store(0, Relaxed);
-            self.generation.store(cur_gen.wrapping_add(1), Release);
-        } else {
-            loop {
-                if self.poisoned.load(Acquire) {
-                    return BarrierResult::Poisoned;
-                }
-                if self.generation.load(Acquire) != cur_gen {
-                    break;
-                }
-                std::hint::spin_loop();
+            // Last arrival: bump generation under the park mutex so any
+            // waiter currently inside `park_cv.wait_while` — which holds
+            // `park_mu` around its predicate check — linearises on the
+            // old-gen side or the new-gen side, never in a window that
+            // could miss the broadcast.
+            {
+                let _g = self.park_mu.lock().unwrap();
+                self.count.store(0, Relaxed);
+                self.generation.store(cur_gen.wrapping_add(1), Release);
             }
+            self.park_cv.notify_all();
+            return BarrierResult::Released;
         }
-        BarrierResult::Released
+
+        // Earlier arriver — spin briefly on the fast path.
+        for _ in 0..SPIN_BUDGET {
+            if self.poisoned.load(Acquire) {
+                return BarrierResult::Poisoned;
+            }
+            if self.generation.load(Acquire) != cur_gen {
+                return BarrierResult::Released;
+            }
+            std::hint::spin_loop();
+        }
+
+        // Fast path exhausted — sleep on the condvar. Idle-for-most-of-
+        // the-quantum workers hit this path and stop burning CPU cycles
+        // that the productive worker would otherwise lose to cache-
+        // coherence traffic on the shared barrier lines.
+        let mut g = self.park_mu.lock().unwrap();
+        while !self.poisoned.load(Acquire) && self.generation.load(Acquire) == cur_gen {
+            g = self.park_cv.wait(g).unwrap();
+        }
+        if self.poisoned.load(Acquire) {
+            BarrierResult::Poisoned
+        } else {
+            BarrierResult::Released
+        }
     }
 
     /// Abort all current and future waiters with [`BarrierResult::Poisoned`].
     ///
     /// One-way switch: once poisoned, the barrier stays poisoned for
     /// its lifetime. Intended for use by a panic-recovery coordinator.
+    /// Broadcasts on the park condvar so any sleeping waiter wakes up
+    /// immediately rather than on the next timeout.
     pub fn poison(&self) {
-        self.poisoned.store(true, Release);
+        // Take/drop the mutex to linearise with `park_cv.wait` predicate
+        // checks on the sleeping-waiter side, same reasoning as the
+        // generation store in `wait`.
+        {
+            let _g = self.park_mu.lock().unwrap();
+            self.poisoned.store(true, Release);
+        }
+        self.park_cv.notify_all();
     }
 }
 

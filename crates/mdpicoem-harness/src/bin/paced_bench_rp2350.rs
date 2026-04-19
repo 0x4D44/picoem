@@ -469,6 +469,19 @@ impl Runtime {
             }
         }
     }
+
+    /// Per-core cycle counters `(c0, c1)`. Reads the real work done
+    /// by each CPU core; halted cores stay at 0 across a run, and in
+    /// threaded mode this is independent of the coordinator-driven
+    /// `master_cycle`. Used by the bench to compute "Avg MHz" from
+    /// instructions-executed rather than cycles-requested.
+    fn core_cycles(&self) -> (u64, u64) {
+        match self {
+            Runtime::Serial(emu) => (emu.core(0).cycles(), emu.core(1).cycles()),
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            Runtime::Threaded { inner, .. } => (inner.core_cycles(0), inner.core_cycles(1)),
+        }
+    }
 }
 
 fn main() {
@@ -615,6 +628,14 @@ fn main() {
     let monitor = std::thread::spawn(move || monitor_loop(mon_stats));
 
     // --- Execution ---
+    // Snapshot per-core cycle counters *before* the run so the bench
+    // can report "Avg MHz" from real instruction work rather than
+    // cycles-requested. The threaded coordinator advances
+    // `master_cycle` by `step_q` per quantum regardless of whether
+    // cores execute (`threaded::emulator::run_quanta_single_then_many`
+    // demonstrates this with both cores halted), so requested-based
+    // MHz is unreliable at large `--step-quantum`.
+    let (c0_start, c1_start) = runtime.core_cycles();
     let start = Instant::now();
     let duration = Duration::from_secs(seconds.into());
     let qc = pacer.quantum_cycles();
@@ -671,6 +692,7 @@ fn main() {
 
     stats.set_running(false);
     monitor.join().unwrap();
+    let (c0_end, c1_end) = runtime.core_cycles();
 
     // --- Summary ---
     let wall_secs = start.elapsed().as_secs_f64();
@@ -679,14 +701,28 @@ fn main() {
     println!("Workload:       {}", workload.as_str());
 
     if unpaced {
-        let mhz = unpaced_cycles as f64 / wall_secs / 1_000_000.0;
+        // "Cycles executed" = max of per-core deltas. Single-core
+        // workloads halt core 1, so its delta is 0 and max reduces to
+        // the running core's rate. Dual-core workloads run both cores
+        // to roughly the same cycle count, so max ≈ either. This is
+        // the real-time gate signal ("can a core sustain 150 MHz?"),
+        // not an aggregate throughput number — use `c0+c1` if you
+        // want aggregate.
+        let c0_delta = c0_end.saturating_sub(c0_start);
+        let c1_delta = c1_end.saturating_sub(c1_start);
+        let executed = c0_delta.max(c1_delta);
+        let requested = unpaced_cycles;
+        let mhz = executed as f64 / wall_secs / 1_000_000.0;
+        let mhz_requested = requested as f64 / wall_secs / 1_000_000.0;
         // Host TSC ticks are a reasonable proxy for host core cycles on modern
         // x86_64 (invariant TSC runs at a fixed base close to the CPU nominal
         // clock). Under HIGH_PRIORITY_CLASS / TIME_CRITICAL this gives a
         // stable-enough signal for the HLD §12 budget gate.
-        let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / unpaced_cycles as f64;
-        println!("Total cycles:   {}", unpaced_cycles);
-        println!("Avg MHz:        {:.1}", mhz);
+        let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
+        println!("Executed cyc:   {} (c0={}, c1={})", executed, c0_delta, c1_delta);
+        println!("Requested cyc:  {} (coord-tick advancement; not a perf signal in threaded)", requested);
+        println!("Avg MHz:        {:.1}  (per-core peak, from executed cycles)", mhz);
+        println!("Requested MHz:  {:.1}  (informational — what the run loop asked for)", mhz_requested);
         // HLD §12's <33 host-cycles/emu-cycle budget was calibrated
         // against `basic` and `fpu-heavy`. The peripheral / contention /
         // stress workloads deliberately do more work per master cycle

@@ -337,6 +337,23 @@ impl ThreadedEmulator {
         self.shared.master_cycle.load(Ordering::Acquire)
     }
 
+    /// Cycle counter for core `idx` (0 or 1). Reads the owned
+    /// `CortexM33::cycles()`; returns 0 while a `run_quanta` is in
+    /// flight (cores are `take`n into worker threads). Callers must
+    /// snapshot between `run_quanta` calls. Halted cores stay at
+    /// whatever cycle they reached when halted — their counter does
+    /// not advance during run loops, unlike `master_cycle` which the
+    /// coordinator fetch-adds per quantum regardless. Exposed for
+    /// `paced_bench_rp2350` so "Avg MHz" can be computed from real
+    /// instruction work rather than coordinator ticks.
+    pub fn core_cycles(&self, idx: u8) -> u64 {
+        match idx {
+            0 => self.core0.as_ref().map_or(0, |c| c.cycles()),
+            1 => self.core1.as_ref().map_or(0, |c| c.cycles()),
+            _ => panic!("ThreadedEmulator::core_cycles: idx must be 0 or 1"),
+        }
+    }
+
     /// Enable or disable per-worker per-quantum timing instrumentation
     /// for subsequent `run_quanta` calls. When enabled, each worker
     /// records `(phase_work_ns, barrier_wait_ns)` per quantum and the
@@ -593,18 +610,35 @@ fn core_worker_body(
             core.ppb.merge_irq_pending(pending);
         }
 
-        while !shared.atomics.is_halted(idx)
-            && !shared.atomics.is_wfe_waiting(idx)
-            && core.cycles() < target
-        {
-            core.ppb.update_latest_cycles(core.cycles());
-            core.step(&mut bus);
-            if !bus.pending_cache_invalidations.is_empty() {
-                // Decode cache lives on `core` (Phase 3 follow-up #10);
-                // `invalidate_decode_cache_entries` is now inherent on
-                // `CortexM33` and doesn't need `bus`. Drain in place.
-                core.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
-                bus.pending_cache_invalidations.clear();
+        // Hoist the cross-thread atomic loads out of the inner hot path.
+        // `is_halted` only changes when a peer worker calls `set_halted`,
+        // and `is_wfe_waiting` is written *by the core itself* when it
+        // executes a WFE instruction — so the inner loop only needs to
+        // re-check the WFE flag *after* each step, and `is_halted` can
+        // be sampled once per quantum. Peer-driven halts now land one
+        // quantum late; that matches the existing IRQ-delivery latency
+        // ceiling documented in HLD §5.2 (2× step_quantum).
+        //
+        // `step_no_atomics` skips the redundant per-step WFE / halt /
+        // irq_pending atomic loads inside `CortexM33::step` — the worker
+        // already handled those at the top of the quantum. On single-
+        // core workloads the coord-written `irq_pending` line bounces
+        // into core 0's cache on every step otherwise, tripling the
+        // per-instruction cost.
+        if !shared.atomics.is_halted(idx) {
+            while core.cycles() < target {
+                core.ppb.update_latest_cycles(core.cycles());
+                core.step_no_atomics(&mut bus);
+                if !bus.pending_cache_invalidations.is_empty() {
+                    // Decode cache lives on `core` (Phase 3 follow-up #10);
+                    // `invalidate_decode_cache_entries` is now inherent on
+                    // `CortexM33` and doesn't need `bus`. Drain in place.
+                    core.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+                    bus.pending_cache_invalidations.clear();
+                }
+                if shared.atomics.is_wfe_waiting(idx) {
+                    break;
+                }
             }
         }
         core.ppb.update_latest_cycles(core.cycles());
