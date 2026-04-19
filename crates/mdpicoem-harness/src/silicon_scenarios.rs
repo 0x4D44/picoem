@@ -199,6 +199,91 @@ const O_TBMAN_PLATFORM: &[(u32, u32)] = &[
     (TBMAN_BASE + TBMAN_PLATFORM_OFFSET, 0xFFFF_FFFF),
 ];
 
+// ---------------------------------------------------------------------------
+// GLITCH_DETECTOR ARM readback (Coverage Gap Fill V11 §3.3 Bucket A item 3)
+// ---------------------------------------------------------------------------
+//
+// GLITCH_DETECTOR (`0x4015_8000`) is the RP2350 on-chip glitch-detector
+// controller. Its ARM register at offset 0x00 is a 16-bit RW sentinel —
+// `ARM_VALUE_NO = 0x5bad` means "do not force the detectors to be
+// armed", any other value force-arms. Reset value is `ARM_RESET = 0x5bad`
+// (= VALUE_NO). Per pico-sdk:
+//
+//   https://raw.githubusercontent.com/raspberrypi/pico-sdk/a1438dff1d38bd9c65dbd693f0e5db4b9ae91779/src/rp2350/hardware_regs/include/hardware/regs/glitch_detector.h
+//
+//   #define GLITCH_DETECTOR_ARM_OFFSET     _u(0x00000000)
+//   #define GLITCH_DETECTOR_ARM_RESET      _u(0x00005bad)
+//   #define GLITCH_DETECTOR_ARM_VALUE_NO   _u(0x5bad)
+//   #define GLITCH_DETECTOR_ARM_VALUE_YES  _u(0x0000)
+//
+//   #define GLITCH_DETECTOR_TRIG_STATUS_OFFSET _u(0x00000010)
+//   #define GLITCH_DETECTOR_TRIG_STATUS_RESET  _u(0x00000000)
+//
+// HLD V11 §3.3 target: writing ARM = "force YES" must round-trip on
+// readback; TRIG_STATUS must stay 0 because no glitch fires.
+//
+// Setup: write ARM = 0x1234 so the diff sees a distinctive non-reset
+// value that both force-arms (any non-0x5bad value force-arms) AND
+// proves the write round-tripped. 0x1234 is chosen deliberately:
+//   - distinctive: not 0x0000 (pre-power RAM default / probe stub read
+//     failure / masked-read zero) and not 0x5bad (ARM_RESET sentinel),
+//     so a readback of 0x1234 can only come from the write landing;
+//   - not sentinel-coincident: != ARM_VALUE_NO (0x5bad) so the write
+//     force-arms the detectors (= ARM_VALUE_YES semantics on silicon);
+//   - not reset-coincident: a read that returns 0x5bad after this
+//     setup indicates the write was dropped (emulator bug or silicon
+//     sinking to masked / locked / not-Secure fabric) — with 0x0000
+//     as the prior value, the reset-zero and write-zero cases are
+//     indistinguishable;
+//   - in the ARM bit-field range: 0x1234 fits in `ARM_BITS = 0x0000_FFFF`
+//     so the upper-half mask doesn't elide the discriminator bits.
+// GLITCH_DETECTOR is not in `reset_bit_for_base`, so
+// `release_common_resets` is sufficient.
+//
+// Observed words:
+//   ARM          mask 0x0000_FFFF — the 16-bit register field; upper
+//                halves on silicon are unimplemented/zero.
+//   TRIG_STATUS  mask 0x0000_000F — four DETn bits, must all be 0.
+//
+// The emulator override landed in
+// `crates/mdrp2350/src/peripherals/inert.rs` (`GlitchDetector::new()`
+// seeds ARM = RESET; `write32` / `read32` round-trip ARM and keep
+// TRIG_STATUS's read-as-zero override).
+pub const GLITCH_DETECTOR_BASE: u32 = 0x4015_8000;
+// Offsets + reset / sentinel values are re-exported from the emulator
+// module so the oracle and the emulator can't drift on addresses or
+// magic values.
+use mdrp2350::peripherals::inert::{
+    GLITCH_DETECTOR_ARM_MASK, GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_TRIG_STATUS_OFFSET,
+};
+
+/// Distinctive ARM discriminator for the silicon diff — see the
+/// scenario comment above for the selection rationale. Any value that
+/// is not `ARM_VALUE_NO = 0x5bad` force-arms the detectors on silicon.
+const GLITCH_DETECTOR_ARM_DISCRIMINATOR: u32 = 0x0000_1234;
+
+const S_GLITCH_DETECTOR_ARM_READBACK: &[(u32, u32)] = &[
+    // Write ARM = 0x1234 — force-arm with a distinctive discriminator
+    // so the readback proves the write landed (vs. reset-zero or
+    // reset-0x5bad collisions).
+    (
+        GLITCH_DETECTOR_BASE + GLITCH_DETECTOR_ARM_OFFSET,
+        GLITCH_DETECTOR_ARM_DISCRIMINATOR,
+    ),
+];
+const O_GLITCH_DETECTOR_ARM_READBACK: &[(u32, u32)] = &[
+    // ARM register — mask to the 16-bit field defined by ARM_BITS.
+    (
+        GLITCH_DETECTOR_BASE + GLITCH_DETECTOR_ARM_OFFSET,
+        GLITCH_DETECTOR_ARM_MASK,
+    ),
+    // TRIG_STATUS — 4-bit W1C field; must be 0 (no glitch fires).
+    (
+        GLITCH_DETECTOR_BASE + GLITCH_DETECTOR_TRIG_STATUS_OFFSET,
+        0x0000_000F,
+    ),
+];
+
 // S1: PIO0 SM0 runs `JMP 0` in a one-instruction loop. Positive
 // control — ADDR never advances past 0, HW and EMU MUST agree.
 const S_PIO0_NOP_LOOP: &[(u32, u32)] = &[
@@ -1486,6 +1571,22 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         setup: S_TBMAN_PLATFORM,
         max_sysclks: 100,
         observe: O_TBMAN_PLATFORM,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Coverage Gap Fill V11 §3.3 Bucket A item 3 — GLITCH_DETECTOR ARM
+    // readback. Setup writes ARM = VALUE_YES (0x0000); observe confirms
+    // the write stuck and TRIG_STATUS reads 0. GLITCH_DETECTOR is not
+    // reset-gated so the runner's `release_common_resets` baseline is
+    // sufficient. ARM is marked "Secure read/write only" in silicon —
+    // this scenario runs from Secure state, matching the oracle's
+    // default execution context.
+    PeriphScenario {
+        name: "glitch_detector_arm_readback_tracks_ctrl",
+        setup: S_GLITCH_DETECTOR_ARM_READBACK,
+        max_sysclks: 100,
+        observe: O_GLITCH_DETECTOR_ARM_READBACK,
         observe_pins: 0,
         custom_sled: None,
         min_sysclks: 0,

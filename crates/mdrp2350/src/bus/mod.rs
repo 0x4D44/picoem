@@ -324,7 +324,7 @@ pub struct Bus {
     pub(crate) syscfg: SysCfg,
     /// TBMAN — storage-only inert peripheral.
     pub(crate) tbman: Tbman,
-    /// GLITCH_DETECTOR — storage plus `STATUS.ARM == 0` + TRIG_STATUS W1C.
+    /// GLITCH_DETECTOR — ARM RW-with-0x5bad-reset + TRIG_STATUS reads-as-zero / W1C.
     pub(crate) glitch: GlitchDetector,
     /// PSM — power-on state machine (HLD V5 §7.D.2). Instant handshake
     /// model: `DONE` mirrors `FRCE_ON`.

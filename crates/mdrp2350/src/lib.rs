@@ -192,6 +192,13 @@ impl Emulator {
         // — OTP is physical silicon state, and a persistent counter still
         // yields a unique sequence post-reset.
         self.bus.sha256.reset();
+        // GLITCH_DETECTOR quiesces on warm reset (pico-sdk
+        // `glitch_detector.h`): ARM returns to `ARM_RESET = 0x5bad` and
+        // other registers return to 0. Re-seeds the backing HashMap via
+        // `Self::new()`.
+        self.bus.glitch.reset();
+        // Threading: PPB is per-core (not on the bus); the `cs[i].reset()`
+        // / `CortexM33::new` path above already resets both cores' PPBs.
         // HLD V5 §5.7: post-bootrom RESETS state — peripherals
         // released by pico-sdk `runtime_init_bootrom_reset` start
         // deasserted. The emulator never runs the bootrom; we seed

@@ -9403,20 +9403,20 @@ fn sysinfo_reads_hardcoded_readonly_fields() {
     // CHIP_ID: REV=0 (blank — Stage 5 pre-flight fills nibble),
     //          PART=0x4 (PART_RP4), MAN=0x926 (MANUFACTURER_RPI),
     //          STOP_BIT=1. Assembled: (0x4<<12)|(0x926<<1)|0x1 = 0x0000_524D.
-    assert_eq!(bus.read32(0x4000_0000), 0x0000_524D,
+    assert_eq!(bus.read32(0x4000_0000, 0), 0x0000_524D,
         "SYSINFO.CHIP_ID: expected PART_RP4 | MANUFACTURER_RPI | STOP_BIT \
          (REV=0, Stage 5 pre-flight confirms REV nibble)");
     // PACKAGE_SEL: 0 = RP2350A QFN60 (Pico 2 baseline).
-    assert_eq!(bus.read32(0x4000_0004), 0x0000_0000,
+    assert_eq!(bus.read32(0x4000_0004, 0), 0x0000_0000,
         "SYSINFO.PACKAGE_SEL: RP2350A");
     // PLATFORM: value from LLD drafts 2026-04-13; Stage 5 pre-flight
     // will confirm against silicon.
-    assert_eq!(bus.read32(0x4000_0008), 0x0000_0001,
+    assert_eq!(bus.read32(0x4000_0008, 0), 0x0000_0001,
         "SYSINFO.PLATFORM: LLD-draft value (pre-flight pending)");
     // GITREF_RP2350: chip-revision-specific 32-bit constant. Emulator
     // exposes 0 as a placeholder; Stage 5 silicon pre-flight records the
     // true value and re-adds the silicon-scenario observe entry.
-    assert_eq!(bus.read32(0x4000_0014), 0x0000_0000,
+    assert_eq!(bus.read32(0x4000_0014, 0), 0x0000_0000,
         "SYSINFO.GITREF_RP2350: placeholder (silicon pre-flight pending)");
 }
 
@@ -9447,9 +9447,127 @@ fn tbman_platform_reads_silicon_value() {
     // TBMAN_BASE = 0x4016_0000; PLATFORM offset = 0x00.
     // Expected value: TBMAN_PLATFORM_ASIC_BITS = 0x1.
     assert_eq!(
-        bus.read32(0x4016_0000),
+        bus.read32(0x4016_0000, 0),
         0x0000_0001,
         "TBMAN.PLATFORM: ASIC bit (bit 0) set per pico-sdk \
          TBMAN_PLATFORM_RESET"
+    );
+}
+
+// ============================================================================
+// GLITCH_DETECTOR — ARM readback (Coverage Gap Fill V11 §3.3 Bucket A item 3)
+// ============================================================================
+//
+// Per pico-sdk `glitch_detector.h` (pinned to commit
+// a1438dff1d38bd9c65dbd693f0e5db4b9ae91779):
+//
+//   https://raw.githubusercontent.com/raspberrypi/pico-sdk/a1438dff1d38bd9c65dbd693f0e5db4b9ae91779/src/rp2350/hardware_regs/include/hardware/regs/glitch_detector.h
+//
+//   ARM         offset 0x00, RW 16-bit, RESET 0x5bad (= VALUE_NO).
+//                 VALUE_NO  = 0x5bad  -- do not force-arm
+//                 VALUE_YES = 0x0000  -- any non-NO value force-arms
+//   TRIG_STATUS offset 0x10, W1C 4-bit. Reads 0 in emulation.
+//
+// HLD V11 §3.3 describes the contract in terms of "CTRL.ARM" /
+// "STATUS.ARM" — this is shorthand. On silicon there is a single RW
+// register, ARM, which reads back whatever was last written. So "ARM
+// readback tracks CTRL" reduces to "write N to ARM, next read returns
+// N". The emulator's `GlitchDetector::new()` seeds offset 0x00 with
+// `ARM_RESET = 0x5bad` so the first read (before any firmware write)
+// matches silicon too.
+//
+// TRIG_STATUS has no emulator-side trigger path (no glitch ever fires),
+// so it must read 0 at all times. The silicon scenario
+// `glitch_detector_arm_readback_tracks_ctrl` in `silicon_scenarios.rs`
+// diffs the same pair of words against attached RP2354 hardware.
+
+#[test]
+fn glitch_detector_arm_readback_tracks_ctrl() {
+    use crate::peripherals::inert::{
+        GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_RESET,
+        GLITCH_DETECTOR_ARM_VALUE_NO, GLITCH_DETECTOR_ARM_VALUE_YES,
+        GLITCH_DETECTOR_BASE, GLITCH_DETECTOR_TRIG_STATUS_OFFSET,
+    };
+
+    let (_, mut bus) = core_and_bus();
+    let arm_addr = GLITCH_DETECTOR_BASE + GLITCH_DETECTOR_ARM_OFFSET;
+    let trig_status_addr = GLITCH_DETECTOR_BASE + GLITCH_DETECTOR_TRIG_STATUS_OFFSET;
+
+    // Before any write, ARM reads the silicon reset value 0x5bad.
+    assert_eq!(
+        bus.read32(arm_addr, 0),
+        GLITCH_DETECTOR_ARM_RESET,
+        "ARM must read `ARM_RESET = 0x5bad` (= VALUE_NO) before any write"
+    );
+    // TRIG_STATUS reads 0 at reset.
+    assert_eq!(
+        bus.read32(trig_status_addr, 0),
+        0,
+        "TRIG_STATUS must read 0 in emulation (no glitch fires)"
+    );
+
+    // Write ARM = 0x0000 (force-arm YES); read back unchanged.
+    bus.write32(arm_addr, GLITCH_DETECTOR_ARM_VALUE_YES, 0);
+    assert_eq!(
+        bus.read32(arm_addr, 0),
+        GLITCH_DETECTOR_ARM_VALUE_YES,
+        "ARM readback must track CTRL write: 0x0000 (VALUE_YES)"
+    );
+    assert_eq!(
+        bus.read32(trig_status_addr, 0),
+        0,
+        "TRIG_STATUS must stay 0 regardless of ARM state"
+    );
+
+    // Write ARM = 0x5bad (force-arm NO); read back unchanged.
+    bus.write32(arm_addr, GLITCH_DETECTOR_ARM_VALUE_NO, 0);
+    assert_eq!(
+        bus.read32(arm_addr, 0),
+        GLITCH_DETECTOR_ARM_VALUE_NO,
+        "ARM readback must track CTRL write: 0x5bad (VALUE_NO)"
+    );
+    assert_eq!(
+        bus.read32(trig_status_addr, 0),
+        0,
+        "TRIG_STATUS must still read 0"
+    );
+}
+
+// GLITCH_DETECTOR — warm-reset ARM quiesce (devil's-advocate audit)
+//
+// On real silicon a watchdog-driven warm reset returns ARM to
+// `ARM_RESET = 0x5bad` (= VALUE_NO) regardless of what firmware last
+// wrote. Without a peripheral-level `reset()` hook the emulator would
+// preserve the firmware-written ARM value across `Emulator::reset()` —
+// e.g. ARM = 0x0000 (force-arm YES) would survive reset and silently
+// diverge from silicon. This test guards the hook wired through
+// `Emulator::reset` -> `Bus::glitch.reset()` -> `GlitchDetector::reset`.
+#[test]
+fn glitch_detector_arm_resets_to_arm_value_no_on_warm_reset() {
+    use crate::peripherals::inert::{
+        GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_RESET,
+        GLITCH_DETECTOR_ARM_VALUE_YES, GLITCH_DETECTOR_BASE,
+    };
+
+    let mut emu = Emulator::new(Config::default());
+    let arm_addr = GLITCH_DETECTOR_BASE + GLITCH_DETECTOR_ARM_OFFSET;
+
+    // Write ARM = 0x0000 (force-arm YES) — a non-reset value that must
+    // not survive a warm reset on silicon.
+    emu.bus.write32(arm_addr, GLITCH_DETECTOR_ARM_VALUE_YES, 0);
+    assert_eq!(
+        emu.bus.read32(arm_addr, 0),
+        GLITCH_DETECTOR_ARM_VALUE_YES,
+        "pre-reset sanity: ARM readback tracks the force-arm YES write"
+    );
+
+    // Warm reset — the watchdog / chip-reset path on silicon returns
+    // ARM to its reset value.
+    emu.reset();
+
+    assert_eq!(
+        emu.bus.read32(arm_addr, 0),
+        GLITCH_DETECTOR_ARM_RESET,
+        "ARM must return to ARM_RESET (= 0x5bad, VALUE_NO) after warm reset"
     );
 }
