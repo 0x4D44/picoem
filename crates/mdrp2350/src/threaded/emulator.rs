@@ -581,7 +581,14 @@ fn core_worker_body(
     timing_enabled: bool,
 ) -> (CortexM33, PerWorkerTimings) {
     let mut bus = WorkerBus::new(core_id, shared.clone());
-    let mut target: u64 = 0;
+    // Seed target from the core's current cycle count so successive
+    // `run_quanta` calls (each spawns a fresh worker) keep advancing
+    // the core from where it left off. A persistent `core.cycles()`
+    // with a per-call `target = 0` makes the `core.cycles() < target`
+    // guard immediately false and the executor skips work entirely
+    // — reproduced by `paced_bench_rp2350` logging `runtime.run`
+    // drop from 540 ms on call 1 to ~30 ms on calls 2..N (2026-04-20).
+    let mut target: u64 = core.cycles();
     let idx = core_id as usize;
     let mut rec = TimingRecorder::new(n, timing_enabled);
     // Quantum 0's phase_work_ns is measured from worker entry, so it
