@@ -66,6 +66,14 @@ pub struct PioBlock {
     /// above. Seeded on construction/reset so the first step's
     /// comparison is against the reset value (0).
     pub(crate) prev_pad_out_diag: u32,
+
+    /// Cached: true iff at least one SM has SIDESET_COUNT > 0
+    /// (PINCTRL bits [31:29]). When false,
+    /// [`Self::merge_pin_outputs`] skips the per-SM side-set loop
+    /// entirely — saves ~16% of `step_n` throughput on programs that
+    /// don't use side-set (which is most). Recomputed by
+    /// [`Self::recompute_any_sideset`] after every PINCTRL write.
+    pub(crate) any_sideset_programmed: bool,
 }
 
 impl PioBlock {
@@ -99,6 +107,7 @@ impl PioBlock {
             pad_out_sck_toggles: 0,
             pad_out_mosi_writes_of_1: 0,
             prev_pad_out_diag: 0,
+            any_sideset_programmed: false,
         }
     }
 
@@ -125,6 +134,8 @@ impl PioBlock {
         self.pad_out_sck_toggles = 0;
         self.pad_out_mosi_writes_of_1 = 0;
         self.prev_pad_out_diag = 0;
+        // SM reset above sets pinctrl back to default (SIDESET_COUNT=0).
+        self.any_sideset_programmed = false;
     }
 
     /// True iff at least one SM in the block is enabled. Chip-side
@@ -323,6 +334,7 @@ impl PioBlock {
             }
         }
         self.merge_pin_outputs();
+        #[cfg(feature = "pio-pad-diag")]
         self.bump_pad_out_diag();
     }
 
@@ -355,6 +367,28 @@ impl PioBlock {
         }
         let mut out: u32 = self.shared_pin_values;
         let mut oe: u32 = self.shared_pin_dirs;
+        // Short-circuit: when no SM has SIDESET_COUNT > 0, the per-SM
+        // loop produces no overlay — the shared latches ARE the merge
+        // result. Saves ~16% of `step_n` cost on common (no-side-set)
+        // programs. See `wrk_journals/2026.04.20 - JRN - PIO step_n
+        // Profiling.md` §R2.
+        if !self.any_sideset_programmed {
+            // Trace! comparison kept here for symmetry with the full
+            // merge path — release builds optimise the dead branch.
+            if out != self.pad_out || oe != self.pad_oe {
+                tracing::trace!(
+                    target: "mdpicoem_common::pio",
+                    old_out = format_args!("0x{:08x}", self.pad_out),
+                    new_out = format_args!("0x{:08x}", out),
+                    old_oe = format_args!("0x{:08x}", self.pad_oe),
+                    new_oe = format_args!("0x{:08x}", oe),
+                    "pad_change",
+                );
+            }
+            self.pad_out = out;
+            self.pad_oe = oe;
+            return;
+        }
         for sm in &self.sm {
             if !sm.enabled {
                 continue;
@@ -419,6 +453,12 @@ impl PioBlock {
     /// of any downstream device model's own edge counts so the three
     /// numbers can be compared (SM PC visits ↔ pad_out transitions ↔
     /// PSRAM model edges) to localise gaps.
+    ///
+    /// Gated behind the `pio-pad-diag` feature: the per-sysclk diff +
+    /// counter bumps cost ~9% of `step_n` throughput on a 1-SM clkdiv=1
+    /// program. Enable when running PicoGUS-style PSRAM-SPI diff work
+    /// that needs the counters.
+    #[cfg(feature = "pio-pad-diag")]
     #[inline]
     fn bump_pad_out_diag(&mut self) {
         let prev = self.prev_pad_out_diag;
@@ -812,9 +852,22 @@ impl PioBlock {
                 let mut current = self.sm[sm_idx].pinctrl;
                 Self::apply_alias_rmw(&mut current, val, alias);
                 self.sm[sm_idx].pinctrl = current;
+                self.recompute_any_sideset();
             }
             _ => {}
         }
+    }
+
+    /// Refresh the `any_sideset_programmed` cache by scanning all 4
+    /// SMs' PINCTRL.SIDESET_COUNT (bits [31:29]). Called after any
+    /// PINCTRL write through [`Self::write32`]; tests that bypass
+    /// `write32` to set `sm[i].pinctrl` directly must call this
+    /// themselves before stepping if they expect side-set behaviour.
+    pub fn recompute_any_sideset(&mut self) {
+        self.any_sideset_programmed = self
+            .sm
+            .iter()
+            .any(|s| ((s.pinctrl >> 29) & 7) != 0);
     }
 
     /// Apply APB alias semantics to a stored register field.
@@ -1234,6 +1287,7 @@ mod tests {
         pio
     }
 
+    #[cfg(feature = "pio-pad-diag")]
     #[test]
     fn pad_out_cs_fall_counter_bumps_on_1_to_0() {
         // First step: SET PINS, 2 → pad bit 1 goes 0 → 1 (a rise).
@@ -1250,6 +1304,7 @@ mod tests {
         assert_eq!(pio.pad_out_cs_falls, 1, "one 1→0 transition on bit 1");
     }
 
+    #[cfg(feature = "pio-pad-diag")]
     #[test]
     fn pad_out_cs_rise_counter_independent() {
         // Same program; after the first step we expect exactly one rise
@@ -2018,6 +2073,7 @@ mod tests {
         let pinctrl = (1u32 << 29) | (7u32 << 10); // sideset_count=1, sideset_base=7
         let mut pio = make_pio_with_program(&[0xF321, 0xE022]);
         pio.sm[0].pinctrl = pinctrl;
+        pio.recompute_any_sideset();
 
         step_n(&mut pio, 1, 0); // Execute SET X, 1 [side 1] [delay 3]
         assert_eq!(pio.sm[0].x, 1);
@@ -2117,6 +2173,7 @@ mod tests {
         let mut pio = PioBlock::new();
         // PINCTRL: SIDESET_COUNT=1, SIDESET_BASE=0
         pio.sm[0].pinctrl = 1u32 << 29;
+        pio.recompute_any_sideset();
         // EXECCTRL: SIDE_EN=0, SIDE_PINDIR=0 (value-drive)
         pio.sm[0].execctrl = 0;
         // JMP 0, side 1 (side-set bit in [12]=1, delay 0, JMP addr=0)
@@ -2148,6 +2205,7 @@ mod tests {
         // unchanged by the fix.
         let mut pio = PioBlock::new();
         pio.sm[0].pinctrl = 1u32 << 29; // SIDESET_COUNT=1
+        pio.recompute_any_sideset();
         pio.sm[0].execctrl = 1u32 << 29; // SIDE_PINDIR=1
         pio.instr_mem[0] = 0x1000; // JMP 0, side 1
         pio.set_sm_enabled(0, true);
@@ -2196,6 +2254,7 @@ mod tests {
         // PINCTRL: SIDESET_COUNT=1, SIDESET_BASE=0,
         //          SET_COUNT=1, SET_BASE=0
         pio.sm[0].pinctrl = (1u32 << 29) | (1u32 << 26);
+        pio.recompute_any_sideset();
         // EXECCTRL: SIDE_EN=0, SIDE_PINDIR=0, WRAP_TOP=31 (default-style
         // full-memory wrap so PC advances 0→1 between ticks instead of
         // wrapping back to 0).

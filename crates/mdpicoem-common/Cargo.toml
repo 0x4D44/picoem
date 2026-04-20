@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-common"
-version = "0.12.3"
+version = "0.13.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,16 @@ rust-version.workspace = true
 # push) for cross-crate unit tests. NOT part of the production API —
 # enabling this in a non-test build is a misconfiguration.
 test-hooks = []
+
+# PIO PSRAM-SPI pad-edge diagnostic counters
+# (`pad_out_cs_falls`/`_rises`/`pad_out_sck_toggles`/
+# `pad_out_mosi_writes_of_1`). Bumped from `PioBlock::step` per sysclk.
+# Pure observation — no effect on emulation. Costs ~9% of `step_n`
+# throughput on a 1-SM clkdiv=1 program (see
+# `wrk_journals/2026.04.20 - JRN - PIO step_n Profiling.md`).
+# Off by default; enable when running PicoGUS-style PSRAM-SPI diff
+# work that needs the per-edge counters.
+pio-pad-diag = []
 
 [dependencies]
 tracing = { workspace = true }
