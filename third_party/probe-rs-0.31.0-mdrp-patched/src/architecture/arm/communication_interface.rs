@@ -471,6 +471,29 @@ impl ArmCommunicationInterface {
                 s.set_addr(((address >> 4) & 0xFFFF_FFFF) as u32);
                 s1.set_addr((address >> 32) as u32);
             }
+            // mdrp-patched workaround — see:
+            //   https://github.com/probe-rs/probe-rs/issues/3872
+            //   wrk_docs/2026.04.21 - HLD - Track A Probe-rs Attach Fix.md
+            //
+            // Recovers from the initial DPIDR read reporting a pre-DPv3 version
+            // on an ADIv6 target (RP2354 is the observed case; #3257 reports
+            // the same symptom on nRF9151). Upstream panics via `unreachable!()`
+            // here; instead, upgrade the cache to DPv3 in place and proceed
+            // with the V2 path. The outer `previous_select != current_select`
+            // check below will flush the new SELECT / SELECT1 registers to the
+            // DP on this same call.
+            (ApAddress::V2(base), cache @ SelectCache::DPv1(_)) => {
+                tracing::warn!(
+                    "ApV2 access on DPv1 cache; upgrading to DPv3 (mdrp-patched workaround)"
+                );
+                *cache = SelectCache::DPv3(SelectV3(0), Select1(0));
+                let SelectCache::DPv3(s, s1) = cache else {
+                    unreachable!("cache was just set to DPv3 above")
+                };
+                let address = base.0.unwrap_or(0) + ap_register_address;
+                s.set_addr(((address >> 4) & 0xFFFF_FFFF) as u32);
+                s1.set_addr((address >> 32) as u32);
+            }
             _ => unreachable!(
                 "Did not expect to be called with {ap:x?}. This is a bug, please report it."
             ),
