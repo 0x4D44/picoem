@@ -45,3 +45,10 @@ debug = 2
 strip = false
 lto = false
 
+# Routes probe-rs through a small in-tree fork carrying the (V2, DPv1)
+# cache-upgrade workaround for upstream issue #3872. Drop this block
+# once probe-rs ships a fix and we can bump to the released version.
+# See wrk_docs/2026.04.21 - HLD - Track A Probe-rs Attach Fix.md.
+[patch.crates-io]
+probe-rs = { path = "third_party/probe-rs-0.31.0-mdrp-patched" }
+
