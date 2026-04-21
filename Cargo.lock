@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "mdpicoem-common"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "tracing",
 ]
@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "mdpicoem-harness"
-version = "0.35.0"
+version = "0.35.1"
 dependencies = [
  "chrono",
  "ctrlc",

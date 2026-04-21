@@ -40,8 +40,8 @@ const SET_PINS_0: u32 = 0xE000;
 
 fn install_program(block: &mut PioBlock) {
     // INSTR_MEM[0] = SET PINS,1 ; INSTR_MEM[1] = SET PINS,0
-    block.write32(INSTR_MEM0 + 0 * 4, SET_PINS_1, 0);
-    block.write32(INSTR_MEM0 + 1 * 4, SET_PINS_0, 0);
+    block.write32(INSTR_MEM0, SET_PINS_1, 0);
+    block.write32(INSTR_MEM0 + 4, SET_PINS_0, 0);
 }
 
 fn configure_sm(block: &mut PioBlock, sm: u32) {

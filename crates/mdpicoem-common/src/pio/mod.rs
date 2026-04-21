@@ -29,6 +29,15 @@ pub struct PioBlock {
     /// [`Self::set_sm_enabled`]; direct writes to `sm[i].enabled` must not
     /// be reintroduced on the production path.
     sm_enabled_mask: u8,
+    /// Cached: true iff at least one SM has SIDESET_COUNT > 0
+    /// (PINCTRL bits [31:29]). When false,
+    /// [`Self::merge_pin_outputs`] skips the per-SM side-set loop
+    /// entirely — saves ~16% of `step_n` throughput on programs that
+    /// don't use side-set (which is most). Recomputed by
+    /// [`Self::recompute_any_sideset`] after every PINCTRL write.
+    /// Placed next to `sm_enabled_mask` so both fast-path flags share
+    /// the same cache line as `shared_pin_values`/`shared_pin_dirs`.
+    pub(crate) any_sideset_programmed: bool,
     /// IRQ0_INTE — 16-bit interrupt enable mask for NVIC line 0.
     /// Bits [15:8] = SM7..SM0 IRQ flags, [7:4] = SM3..SM0 TXNFULL,
     /// [3:0] = SM3..SM0 RXNEMPTY. RP2350 datasheet offset 0x170.
@@ -66,14 +75,6 @@ pub struct PioBlock {
     /// above. Seeded on construction/reset so the first step's
     /// comparison is against the reset value (0).
     pub(crate) prev_pad_out_diag: u32,
-
-    /// Cached: true iff at least one SM has SIDESET_COUNT > 0
-    /// (PINCTRL bits [31:29]). When false,
-    /// [`Self::merge_pin_outputs`] skips the per-SM side-set loop
-    /// entirely — saves ~16% of `step_n` throughput on programs that
-    /// don't use side-set (which is most). Recomputed by
-    /// [`Self::recompute_any_sideset`] after every PINCTRL write.
-    pub(crate) any_sideset_programmed: bool,
 }
 
 impl PioBlock {
@@ -98,6 +99,7 @@ impl PioBlock {
             pad_out: 0,
             pad_oe: 0,
             sm_enabled_mask: 0,
+            any_sideset_programmed: false,
             int0_inte: 0,
             int0_intf: 0,
             int1_inte: 0,
@@ -107,7 +109,6 @@ impl PioBlock {
             pad_out_sck_toggles: 0,
             pad_out_mosi_writes_of_1: 0,
             prev_pad_out_diag: 0,
-            any_sideset_programmed: false,
         }
     }
 
@@ -359,6 +360,7 @@ impl PioBlock {
     /// When every SM in the block is disabled, the PIO block isn't
     /// driving any pin (even if a prior program left pindir bits set);
     /// this is the property `disable_clears_pin_outputs` relies on.
+    #[inline]
     fn merge_pin_outputs(&mut self) {
         if self.sm_enabled_mask == 0 {
             self.pad_out = 0;
@@ -373,8 +375,9 @@ impl PioBlock {
         // programs. See `wrk_journals/2026.04.20 - JRN - PIO step_n
         // Profiling.md` §R2.
         if !self.any_sideset_programmed {
-            // Trace! comparison kept here for symmetry with the full
-            // merge path — release builds optimise the dead branch.
+            // The `trace!` macro itself is elided in release builds
+            // (`release_max_level_info`); the `!=` comparison that
+            // guards it is what the optimiser has to fold away.
             if out != self.pad_out || oe != self.pad_oe {
                 tracing::trace!(
                     target: "mdpicoem_common::pio",
