@@ -582,9 +582,12 @@ mod tests {
         let mut pacer = Pacer::new(150_000_000);
         pacer.begin_quantum();
         // Do a tiny bit of work so emulation_ns is non-zero.
+        // `black_box` must be INSIDE the loop: LLVM will otherwise fold
+        // the running sum to a closed-form arithmetic series and the
+        // burn evaporates in release.
         let mut dummy = 0u64;
         for i in 0..1000 {
-            dummy = dummy.wrapping_add(i);
+            dummy = std::hint::black_box(dummy.wrapping_add(i));
         }
         std::hint::black_box(dummy);
         pacer.end_quantum();
@@ -602,9 +605,13 @@ mod tests {
         let mut pacer = Pacer::new(u32::MAX);
         pacer.begin_quantum();
         // Burn some time.
+        // `black_box` must be INSIDE the loop: LLVM will otherwise fold
+        // the running sum to a closed-form arithmetic series, collapsing
+        // the burn to ~25 ns (two rdtscp calls) — below the ~78-tick
+        // threshold for a u32::MAX-sysclk Pacer, so behind_count stays 0.
         let mut dummy = 0u64;
         for i in 0..10_000 {
-            dummy = dummy.wrapping_add(i);
+            dummy = std::hint::black_box(dummy.wrapping_add(i));
         }
         std::hint::black_box(dummy);
         pacer.end_quantum();
