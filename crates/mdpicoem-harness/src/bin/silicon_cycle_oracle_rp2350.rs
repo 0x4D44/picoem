@@ -143,11 +143,16 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // per-case diagnostic output the standalone binary has always produced;
     // `cycle_cases::run_against` is the same path but returns only
     // `CaseOutcome` (used by the orchestrator).
+    //
+    // "tol" column shows the effective budget (max of per-case and CLI).
+    // "verdict" column annotates known-delta passes per the Track B Cycle
+    // Oracle Fidelity HLD — tolerance is a floor, not a silencer, so the
+    // hw/emu/delta columns still surface any drift.
     println!(
-        "{:<36} {:>10} {:>10} {:>10} {:>10} {:>6} {:>6}",
+        "{:<36} {:>10} {:>10} {:>10} {:>10} {:>6}  {}",
         "case", "HW/iter", "EMU/iter", "delta", "baseline", "tol", "verdict",
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(108));
 
     // Prepare the stub + mailbox once — `run_cycle_case` assumes they are
     // resident. `run_against` does this internally; here we mirror it so
@@ -175,15 +180,24 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             Verdict::Pass => pass += 1,
             Verdict::Fail => fail += 1,
         }
+        // HLD §6.2 + lead addendum: when a case passes only due to
+        // non-zero effective tolerance, print `PASS (known Δ=<delta>,
+        // tol=<N>)`. The full hw/emu/delta columns are still emitted
+        // above so any drift remains visible.
+        let verdict_str = if r.known_delta_pass {
+            format!("PASS (known Δ={:+}, tol={})", r.delta, r.effective_tolerance)
+        } else {
+            r.verdict.as_str().to_string()
+        };
         println!(
-            "{:<36} {:>10} {:>10} {:>+10} {:>10} {:>6} {:>6}",
+            "{:<36} {:>10} {:>10} {:>+10} {:>10} {:>6}  {}",
             r.name,
             r.hw_per_iter,
             r.emu_per_iter,
             r.delta,
             r.emu_baseline,
-            args.tolerance,
-            r.verdict.as_str(),
+            r.effective_tolerance,
+            verdict_str,
         );
         if r.emu_per_iter != r.emu_baseline {
             println!(

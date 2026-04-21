@@ -30,10 +30,19 @@
 /// (the previous recorded baseline for this case). The runner prints the
 /// emulator's live value on every invocation so drifts are visible; update
 /// this field when a case's emulator value legitimately changes.
+///
+/// `tolerance` is a per-case known-delta budget (in cycles). The case passes
+/// when `|hw - emu| <= max(case.tolerance, args.tolerance)` — i.e. the CLI
+/// `--tolerance <N>` override acts as a floor, never a ceiling. Non-zero
+/// per-case tolerances encode pipeline-overlap effects the emulator
+/// structurally cannot model without a Phase-2 pipeline-model refactor; see
+/// `wrk_docs/2026.04.21 - HLD - Track B Cycle Oracle Fidelity.md` for the
+/// rationale and the per-case doc comments in `CASES` for the specifics.
 pub struct CycleCase {
     pub name: &'static str,
     pub seq: &'static [u16],
     pub emu_baseline: u32,
+    pub tolerance: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,23 +363,66 @@ const SEQ_BACK_TO_BACK_ALU: &[u16] = &[
 pub const CASES: &[CycleCase] = &[
     // Positive control FIRST — if this fails at tol=0, everything below is
     // noise until the bias is tracked down.
-    CycleCase { name: "nop_chain_8", seq: SEQ_NOP_CHAIN_8, emu_baseline: 14 },
-    CycleCase { name: "push_2_min_cost", seq: SEQ_PUSH_2, emu_baseline: 12 },
-    CycleCase { name: "backward_branch_small", seq: SEQ_BACKWARD_SMALL, emu_baseline: 13 },
-    CycleCase { name: "backward_branch_large", seq: SEQ_BACKWARD_LARGE, emu_baseline: 13 },
+    //
+    // `nop_chain_8` — known-delta positive control. HW=11 EMU=14 Δ=−3 on
+    // 2026-04-21. The delta is structural: M33 folds consecutive NOPs into
+    // the prefetch stream (≈−1 to −2) AND silicon absorbs the stub's
+    // BLX/BX-LR framing into its prefetch state in a way our binary
+    // "sequential vs non-sequential" abstraction cannot represent (≈−1).
+    // Closing at tol=0 would require an M33 fetch/issue pipeline model we
+    // have deliberately declined to build (broad blast radius across the
+    // emulator + ~2388 unit tests for a 3-cycle microbench residual). See
+    // `wrk_docs/2026.04.21 - HLD - Track B Cycle Oracle Fidelity.md` §3.2
+    // and §5 for the full rationale; the printed hw/emu/delta columns
+    // still surface any future drift even when the case passes.
+    CycleCase { name: "nop_chain_8", seq: SEQ_NOP_CHAIN_8, emu_baseline: 14, tolerance: 3 },
+    // `push_2_min_cost` — known-delta. HW=10 EMU=12 Δ=−2. Silicon holds
+    // the two PUSH stores in the M33 write buffer; when the POP loads
+    // arrive targeting the same addresses, they're satisfied from the
+    // write buffer at 1 cycle each (partial store-to-load forwarding),
+    // giving ≈4-cycle body cost vs. our 6. Requires a write-buffer state
+    // model with address/forwarding tracking — see HLD §3.3.
+    CycleCase { name: "push_2_min_cost", seq: SEQ_PUSH_2, emu_baseline: 12, tolerance: 2 },
+    CycleCase {
+        name: "backward_branch_small",
+        seq: SEQ_BACKWARD_SMALL,
+        emu_baseline: 13,
+        tolerance: 0,
+    },
+    CycleCase {
+        name: "backward_branch_large",
+        seq: SEQ_BACKWARD_LARGE,
+        emu_baseline: 13,
+        tolerance: 0,
+    },
+    // `bank_contention_fetch_data_same` — known-delta Δ=−1. Not
+    // contention-sourced: silicon exhibits no observable bank-contention
+    // penalty at sequence-in-loop scale and we do not model it on RP2350
+    // by design. The residual is LDR→LDR load-to-use forwarding: silicon
+    // forwards the first LDR's result to the second LDR's address phase,
+    // saving one cycle. See HLD §3.4.
     CycleCase {
         name: "bank_contention_fetch_data_same",
         seq: SEQ_BANK_CONTENTION_SAME,
         emu_baseline: 10,
+        tolerance: 1,
     },
+    // `bank_contention_fetch_data_diff` — same root cause as `_same`
+    // above. HLD §3.4.
     CycleCase {
         name: "bank_contention_fetch_data_diff",
         seq: SEQ_BANK_CONTENTION_DIFF,
         emu_baseline: 10,
+        tolerance: 1,
     },
-    CycleCase { name: "ldm_8_reg", seq: SEQ_LDM_8_REG, emu_baseline: 17 },
-    CycleCase { name: "single_adds", seq: SEQ_SINGLE_ADDS, emu_baseline: 7 },
-    CycleCase { name: "back_to_back_alu", seq: SEQ_BACK_TO_BACK_ALU, emu_baseline: 14 },
+    CycleCase { name: "ldm_8_reg", seq: SEQ_LDM_8_REG, emu_baseline: 17, tolerance: 0 },
+    CycleCase { name: "single_adds", seq: SEQ_SINGLE_ADDS, emu_baseline: 7, tolerance: 0 },
+    CycleCase {
+        name: "back_to_back_alu",
+        seq: SEQ_BACK_TO_BACK_ALU,
+        emu_baseline: 14,
+        tolerance: 0,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -587,6 +639,13 @@ impl Default for CycleArgs {
 }
 
 /// Per-case richer result used by the standalone binary's table output.
+///
+/// `effective_tolerance` is `max(case.tolerance, args.tolerance)` — the
+/// budget actually applied to decide PASS/FAIL. `known_delta_pass` is
+/// `true` iff the case passed only because that effective tolerance was
+/// non-zero (i.e. `delta != 0 && verdict == Pass`). The standalone
+/// binary uses these two fields to print the `PASS (known Δ=<delta>, tol=<N>)`
+/// annotation mandated by the HLD; see its lead-sign-off addendum.
 #[derive(Debug)]
 pub struct CycleCaseResult {
     pub name: &'static str,
@@ -599,22 +658,30 @@ pub struct CycleCaseResult {
     pub emu_baseline: u32,
     pub delta: i64,
     pub verdict: Verdict,
+    pub effective_tolerance: u32,
+    pub known_delta_pass: bool,
     pub elapsed_ms: u32,
 }
 
 impl CycleCaseResult {
     /// Convert this per-case result into a `CaseOutcome` for the unified
     /// report.
+    ///
+    /// **Note — canonical path is `run_against`.** This helper is kept for
+    /// callers that hold a `CycleCaseResult` directly, but it does NOT
+    /// emit the `known Δ=… tol=…` detail that `run_against` attaches to
+    /// PASS outcomes when `known_delta_pass == true`. If you need that
+    /// annotation in orchestrator output, go through `run_against`.
+    /// Currently no in-tree caller depends on this helper (2026-04-21);
+    /// merging the two code paths is deferred until a second caller
+    /// appears.
     pub fn to_outcome(&self) -> CaseOutcome {
         if self.verdict == Verdict::Pass {
             CaseOutcome::pass("cycle", self.name, self.elapsed_ms)
         } else {
             let detail = format!(
                 "hw={} emu={} delta={:+} tol={}",
-                self.hw_per_iter, self.emu_per_iter, self.delta,
-                // tolerance not stored on the result struct; callers that
-                // want it in-detail can format themselves.
-                0,
+                self.hw_per_iter, self.emu_per_iter, self.delta, self.effective_tolerance,
             );
             CaseOutcome::fail("cycle", self.name, detail, self.elapsed_ms)
         }
@@ -624,12 +691,20 @@ impl CycleCaseResult {
 /// Run a single case end-to-end (HW + EMU) and produce a `CycleCaseResult`.
 /// Separate from `to_outcome` so the standalone binary can keep its rich
 /// per-case table.
+///
+/// `cli_tolerance` is the CLI `--tolerance <N>` floor (from `CycleArgs`);
+/// the effective budget is `max(case.tolerance, cli_tolerance)`. Per-case
+/// tolerances (see `CASES` doc comments + the Track B Cycle Oracle Fidelity
+/// HLD) encode pipeline-effect residuals that are not accounting bugs; the
+/// CLI floor still lets operators tighten the oracle with `--tolerance 0`
+/// to surface those known deltas in CI-style output, or loosen it
+/// uniformly for exploratory sweeps.
 pub fn run_cycle_case(
     core: &mut Core,
     case: &CycleCase,
     iter_low: u32,
     iter_high: u32,
-    tolerance: u32,
+    cli_tolerance: u32,
 ) -> Result<CycleCaseResult, Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let seq_bytes = pack_seq(case.seq);
@@ -647,11 +722,15 @@ pub fn run_cycle_case(
     let emu_per_iter = (emu_high - emu_low) / (iter_high - iter_low);
 
     let delta = hw_per_iter as i64 - emu_per_iter as i64;
-    let verdict = if (delta.unsigned_abs() as u32) <= tolerance {
+    let effective_tolerance = case.tolerance.max(cli_tolerance);
+    let verdict = if (delta.unsigned_abs() as u32) <= effective_tolerance {
         Verdict::Pass
     } else {
         Verdict::Fail
     };
+    // "Known-delta pass": passed, but only because tolerance absorbed a
+    // non-zero delta. tol=0 perfect matches don't trip this flag.
+    let known_delta_pass = verdict == Verdict::Pass && delta != 0;
 
     let elapsed_ms = t0.elapsed().as_millis().min(u32::MAX as u128) as u32;
     Ok(CycleCaseResult {
@@ -665,6 +744,8 @@ pub fn run_cycle_case(
         emu_baseline: case.emu_baseline,
         delta,
         verdict,
+        effective_tolerance,
+        known_delta_pass,
         elapsed_ms,
     })
 }
@@ -738,13 +819,21 @@ pub fn run_against(
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
     for case in selected {
         let r = run_cycle_case(core, case, args.iter_low, args.iter_high, args.tolerance)?;
-        let detail = if r.verdict == Verdict::Pass {
-            String::new()
-        } else {
-            format!(
+        let detail = match r.verdict {
+            // Distinguish PASS (exact match) from PASS (known Δ absorbed by
+            // per-case tolerance). Plain PASS keeps an empty detail so the
+            // orchestrator's summary output stays tidy; known-delta PASS
+            // carries the Δ + tol so soak-run forensics don't have to
+            // re-read the standalone binary's table.
+            Verdict::Pass if r.known_delta_pass => format!(
+                "known Δ={:+} tol={}",
+                r.delta, r.effective_tolerance,
+            ),
+            Verdict::Pass => String::new(),
+            Verdict::Fail => format!(
                 "hw={} emu={} delta={:+} tol={}",
-                r.hw_per_iter, r.emu_per_iter, r.delta, args.tolerance,
-            )
+                r.hw_per_iter, r.emu_per_iter, r.delta, r.effective_tolerance,
+            ),
         };
         outcomes.push(CaseOutcome {
             oracle: "cycle",
@@ -945,5 +1034,54 @@ mod tests {
             p12 <= 20,
             "per_iter={p12} is implausibly high for BLX+ADDS+BXLR+loop",
         );
+    }
+
+    /// Verifies the effective-tolerance rule mandated by the Track B
+    /// Cycle Oracle Fidelity HLD §6.1: `effective = max(case.tolerance,
+    /// cli.tolerance)`. CLI `--tolerance <N>` must remain a floor (can
+    /// widen but never tighten a per-case budget), so the pass/fail
+    /// decision uses the larger of the two.
+    ///
+    /// This test is pure data-level (no probe-rs, no emulator path) — it
+    /// exercises the `max()` rule directly by building `CycleCase`
+    /// instances with known tolerances and asserting the effective
+    /// budget matches expectations for three representative scenarios.
+    #[test]
+    fn test_per_case_tolerance_overrides_cli_tolerance() {
+        // The rule under test. Kept as a local closure so the test
+        // documents the effective-tolerance formula rather than indirectly
+        // asserting via `run_cycle_case` (which needs a live probe).
+        fn effective_tolerance(case_tol: u32, cli_tol: u32) -> u32 {
+            case_tol.max(cli_tol)
+        }
+
+        // Scenario 1: case.tolerance=3, cli.tolerance=0 → 3 (per-case
+        // survives when CLI is silent). A delta of 3 must still pass.
+        let eff = effective_tolerance(3, 0);
+        assert_eq!(eff, 3, "case.tolerance=3 must survive cli=0");
+        let delta: i64 = -3;
+        assert!(
+            (delta.unsigned_abs() as u32) <= eff,
+            "delta={delta} must pass at eff={eff}",
+        );
+
+        // Scenario 2: case.tolerance=0, cli.tolerance=5 → 5 (CLI floor
+        // widens a zero-tol case; useful for exploratory sweeps).
+        let eff = effective_tolerance(0, 5);
+        assert_eq!(eff, 5, "cli.tolerance=5 must widen case=0");
+        let delta: i64 = 4;
+        assert!(
+            (delta.unsigned_abs() as u32) <= eff,
+            "delta={delta} must pass at eff={eff}",
+        );
+
+        // Scenario 3: case.tolerance=2, cli.tolerance=5 → 5 (the larger
+        // wins; neither value alone is the answer).
+        let eff = effective_tolerance(2, 5);
+        assert_eq!(eff, 5, "max(2,5)=5 — larger wins");
+        // And confirm the per-case value is NOT the answer when CLI is
+        // larger (this was the pre-HLD behaviour, intentionally kept
+        // visible here in case a future refactor regresses it).
+        assert_ne!(eff, 2, "cli.tolerance=5 floor must not be tightened to 2");
     }
 }

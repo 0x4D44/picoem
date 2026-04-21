@@ -798,90 +798,79 @@ Measured on the RP2354 attached via Pico debug probe, 2026-04-15,
 with per-case emu baselines seeded from the current mdrp2350 cycle
 model.
 
-### Positive-control case — nop_chain_8 FAIL
+### Resolved (known-delta) — Cycle Oracle per-case tolerances (2026-04-21)
 
-Case: 8× Thumb NOP (`0xBF00`) inside the BLX/BX LR frame. At
-per-iter=8 this would indicate HW and EMU agree on "1-cycle NOP
-plus frame overhead that matches". They do NOT agree.
+Four sequence-in-loop cases previously FAIL at tol=0 are now PASS under
+per-case tolerances that encode the known pipeline-overlap residuals.
+See `wrk_docs/2026.04.21 - HLD - Track B Cycle Oracle Fidelity.md` for
+the full root-cause analysis, option comparison (Option A: emulator
+cycle-accounting fixes vs. Option B: tolerance widening), and lead
+sign-off. Option B (Track B) landed.
 
-HW per-iter: 11    EMU per-iter: 16    delta: −5
+Current deltas (2026-04-21) and per-case tolerances:
 
-Measured as BLX / 8×NOP / BX LR round-trip in a steady-state loop
-— NOT directly comparable to the halt-step per-instruction
-entries above.
+| case                             | HW/iter | EMU/iter | delta | tol | verdict |
+|----------------------------------|--------:|---------:|------:|----:|:--------|
+| nop_chain_8                      |      11 |       14 |    −3 |   3 | known Δ |
+| push_2_min_cost                  |      10 |       12 |    −2 |   2 | known Δ |
+| backward_branch_small            |      13 |       13 |     0 |   0 | PASS    |
+| backward_branch_large            |      13 |       13 |     0 |   0 | PASS    |
+| bank_contention_fetch_data_same  |       9 |       10 |    −1 |   1 | known Δ |
+| bank_contention_fetch_data_diff  |       9 |       10 |    −1 |   1 | known Δ |
+| ldm_8_reg                        |      17 |       17 |     0 |   0 | PASS    |
+| single_adds                      |       7 |        7 |     0 |   0 | PASS    |
+| back_to_back_alu                 |      14 |       14 |     0 |   0 | PASS    |
 
-Interpretation options (unresolved — flagged for Arthur):
+Root causes per case (full analysis in the HLD §3):
 
-1. Emulator's pipeline model is pessimistic on the per-iter
-   framing overhead: BLX (emu 2) + BX LR (emu 2) + SUBS (1) +
-   BNE-taken (emu 3) = 8 cycles of overhead, on top of 8 cycles of
-   NOPs, matches the observed EMU=16. Silicon folds some of this
-   into the pipeline (likely branch prediction on BX LR and the
-   BNE) and observes 11.
-2. The oracle's per-iter definition (BLX round-trip included) does
-   not isolate "NOP cost" — the author's expectation that HW==EMU
-   at per-iter=8 silently assumed zero framing overhead, which
-   does not match either side.
+- **`nop_chain_8` (Δ=−3, tol=3 — positive control)**: M33 folds
+  consecutive NOPs in the prefetch/issue path (≈−1 to −2) + silicon
+  absorbs the stub's BLX/BX-LR framing into prefetch state in a way our
+  "sequential vs non-sequential" fetch abstraction cannot model (≈−1).
+- **`push_2_min_cost` (Δ=−2, tol=2)**: M33 write buffer partially
+  forwards the two PUSH stores to the subsequent POP loads at the same
+  addresses, collapsing the 6-cycle body to ≈4.
+- **`bank_contention_fetch_data_same` / `_diff` (Δ=−1, tol=1)**:
+  not contention-sourced — silicon exhibits no observable bank
+  contention at sequence-in-loop scale. The residual is LDR→LDR
+  load-to-use forwarding (first LDR's result forwarded to second LDR's
+  address phase, saving one cycle).
 
-Either way, **do not infer from this that every delta below is
-"5 cycles of bias" and subtract it**. The framing overhead is real
-on both sides and genuinely models differently in HW vs EMU; this
-is an emulator-fidelity finding, not an oracle-calibration finding.
+All four were explicitly flagged as "Phase-2 future work" in the prior
+2026.04.16 HLD; this HLD formalises the tolerance-widening approach the
+earlier HLD already recommended. The previous "Positive-control case —
+nop_chain_8 FAIL" and "Sequence-in-loop deltas per case" sub-entries
+are replaced by the table above; the `emu_baseline` column constants in
+`cycle_cases.rs` were already updated to match today's EMU per-iter
+values before Track B landed, so `NOTE: emu per-iter differs from
+emu_baseline` no longer fires on these cases.
 
-### Sequence-in-loop deltas per case
+### Phase-2 pipeline-model roadmap
 
-All nine cases at tol=0. HW is the silicon measurement; EMU is the
-mdrp2350 cycle model's measurement through the same stub. `measured
-as BLX / seq / BX LR round-trip in a steady-state loop — NOT
-directly comparable to the halt-step per-instruction entries above`
-applies to every row.
+The route to tightening tolerance back to 0 on the four known-delta
+cases requires emulator-side pipeline state. All three features were
+considered and deferred by the Track B Cycle Oracle Fidelity HLD (§4
+Option A, §5) because the 1–3 cycle residuals do not justify the 2–3
+week engineering cost + wide unit-test blast radius. If a future phase
+revisits this, the features are:
 
-| case                             | HW/iter | EMU/iter | delta |
-|----------------------------------|--------:|---------:|------:|
-| nop_chain_8                      |      11 |       16 |    −5 |
-| push_2_min_cost                  |      10 |       13 |    −3 |
-| backward_branch_small            |      13 |       11 |    +2 |
-| backward_branch_large            |      13 |       14 |    −1 |
-| bank_contention_fetch_data_same  |       9 |       11 |    −2 |
-| bank_contention_fetch_data_diff  |       9 |       11 |    −2 |
-| ldm_8_reg                        |      17 |       18 |    −1 |
-| single_adds                      |       7 |        7 |     0 |
-| back_to_back_alu                 |      14 |       16 |    −2 |
+1. **NOP fold heuristic** — detect runs of `BF00` at fetch
+   classification time and charge `ceil(N * 0.75)` instead of `N`.
+   Covers `nop_chain_8`'s body contribution (≈−1 to −2 cycles).
+2. **Write-buffer forwarding** — track a small write-buffer state on
+   `Bus` (address + data of last ≤2 stores); when a load matches a
+   pending store's address, return 1-cycle load cost instead of 2.
+   Covers `push_2_min_cost`.
+3. **Load-to-use forwarding** — track destination register of the
+   most-recent LDR on `CortexM33`; when the next instruction uses that
+   register as an address base, credit −1 cycle to the LDR's cost.
+   Covers `bank_contention_fetch_data_same/diff`.
 
-Notable observations:
-
-- `single_adds` is the only PASS at tol=0. Whatever the emulator's
-  per-iter framing cost is, it matches silicon exactly for the
-  1-instruction case. That constrains option (1) above: the framing
-  overhead is the *same* on HW and EMU for a minimal sequence body,
-  and the HW−EMU divergence in other cases grows with the specific
-  instructions in the body.
-- `bank_contention_fetch_data_same` (bank 0 fetch vs bank 0 data)
-  and `bank_contention_fetch_data_diff` (bank 0 fetch vs bank 1
-  data) measure *identically* on both HW (9) and EMU (11). No
-  observable bank-contention signal in this measurement mode.
-  This does not invalidate the halt-step "SRAM Bank Contention"
-  entry above — that measures the contention on a single instruction
-  in isolation, and the effect may be masked at sequence-in-loop
-  scale by other pipeline effects. Treat the halt-step entry as
-  authoritative for its own context.
-- `backward_branch_large` (302-byte span) and `backward_branch_small`
-  (22-byte span) measure *identically* on HW (13 each). No
-  observable large-branch penalty in this measurement mode.
-  Again, this does not invalidate the halt-step "Backward Branch
-  Pipeline Penalty" entry above; that was measured at isolation,
-  not in a tight loop where branch target buffering has warmed up.
-
-### What this does not do
-
-- Does not close any of the halt-step entries above. Sequence-in-
-  loop and halt-step are disjoint measurement modalities; closing a
-  halt-step entry requires a halt-step measurement confirming the
-  emulator matches silicon in that mode.
-- Does not confirm or refute individual instruction cycle costs. It
-  diffs *bundle* costs only.
-- Does not resolve the `nop_chain_8` positive-control failure.
-  Flagged for Arthur.
+Blast radius: feature (3) is the riskiest — dozens of `last_access_cycles`/
+`extra_wait_states` unit-test sites in `crates/mdrp2350/src/tests.rs` rely
+on single-instruction isolation that inter-instruction state tracking
+would break. Features (1) and (2) are narrower but still touch the
+fetch-classification / bus hot path.
 
 ## PicoGUS Integration — Stage 6 follow-ups
 
@@ -1155,13 +1144,16 @@ design for Phase 4 and documented in the relevant DMA module.
 
 ### test_silicon residual failures (2026-04-16 baseline)
 
-- **Cycle timing residuals (3 cases)**: `push_2_min_cost` (delta=-2),
-  `bank_contention_fetch_data_same` and `_diff` (delta=-1 each).  All
-  are pipeline-overlap effects: M33 store-buffer drain overlapping with
-  POP loads (PUSH case), and load-use latency hiding where LDR costs 1
-  when the next instruction doesn't consume the loaded register (bank
-  contention cases).  Requires register-dependency tracking between
-  consecutive instructions — Phase 2 pipeline model work.
+- ~~**Cycle timing residuals (3 cases)**: `push_2_min_cost` (delta=-2),
+  `bank_contention_fetch_data_same` and `_diff` (delta=-1 each).~~
+  **Resolved (known-delta, 2026-04-21)** — accepted as bounded pipeline
+  residuals with per-case tolerances in
+  `crates/mdpicoem-harness/src/cycle_cases.rs`. See
+  `wrk_docs/2026.04.21 - HLD - Track B Cycle Oracle Fidelity.md` and the
+  "Resolved (known-delta) — Cycle Oracle per-case tolerances
+  (2026-04-21)" section above. Closing these at tol=0 requires Phase-2
+  pipeline-model work (write-buffer forwarding + load-to-use forwarding);
+  deferred.
 
 - **TICKS TIMER0 CYCLES readback**: `ticks_timer0_retarget_halves_rate`
   fails with EMU=0x18 (correctly accepts aliased write), HW=0x00.
