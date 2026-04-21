@@ -31,13 +31,20 @@
 //!                      setup, pacing, stats and output format are
 //!                      identical to the serial path so A/B diffs are
 //!                      direct.
-//!   --step-quantum N   Cycles per emulator step (default
-//!                      `DEFAULT_STEP_QUANTUM` = 64). In threaded mode
+//!   --step-quantum N   Cycles per emulator step (default 256 — see
+//!                      `BENCH_DEFAULT_STEP_QUANTUM`). In threaded mode
 //!                      this is also the cycles-per-barrier-rendezvous,
-//!                      so coarser values (e.g. 1024) amortise the
-//!                      4-thread barrier cost. For A/B comparability
-//!                      between serial and threaded, both paths honour
-//!                      the same value.
+//!                      so larger values amortise the 4-thread barrier
+//!                      cost while smaller values improve inter-worker
+//!                      latency (PIO seeing a CPU TX FIFO write etc.).
+//!                      256 sits at the knee: peripheral/stress PIO
+//!                      workloads plateau here and larger values buy
+//!                      no further throughput — just 16× worse latency
+//!                      at sq=4096. See
+//!                      `wrk_journals/2026.04.20 - JRN - PIO step_n
+//!                      Profiling.md`. For A/B comparability between
+//!                      serial and threaded, both paths honour the
+//!                      same value.
 //!   --timing           Threaded-mode only. Enable per-worker
 //!                      per-quantum timing instrumentation and print
 //!                      a summary table at end of run showing, for
@@ -47,7 +54,17 @@
 //!                      waiting for peers). Off by default; when off
 //!                      the workers skip every `Instant::now()` call.
 
-use mdrp2350::{Config, DEFAULT_STEP_QUANTUM, Emulator, EmulatorBuilder, Pacer, PacerStats};
+use mdrp2350::{Config, Emulator, EmulatorBuilder, Pacer, PacerStats};
+
+/// Bench CLI default for `--step-quantum`. Diverges from the library
+/// `DEFAULT_STEP_QUANTUM = 64` because the bench is overwhelmingly
+/// run in threaded mode, where the library default makes the barrier
+/// dominate. 256 hits the peripheral/stress plateau with ~1.7 μs
+/// inter-worker latency at 150 MHz sys_clk — larger values buy no
+/// throughput, smaller values cost it. Serial runs honour this too
+/// for A/B comparability; the serial path is insensitive to quantum
+/// size in this range so there's no downside.
+const BENCH_DEFAULT_STEP_QUANTUM: u32 = 256;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 use mdrp2350::threaded::ThreadedEmulator;
 use std::sync::Arc;
@@ -495,7 +512,7 @@ fn main() {
     let unpaced = std::env::args().any(|a| a == "--unpaced");
     let threaded = std::env::args().any(|a| a == "--threaded");
     let timing = std::env::args().any(|a| a == "--timing");
-    let step_quantum = parse_arg("--step-quantum").unwrap_or(DEFAULT_STEP_QUANTUM);
+    let step_quantum = parse_arg("--step-quantum").unwrap_or(BENCH_DEFAULT_STEP_QUANTUM);
     let workload = parse_workload().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
