@@ -1,0 +1,2998 @@
+name: STM32F1 Series
+manufacturer:
+  id: 0x20
+  cc: 0x0
+generated_from_pack: true
+pack_file_release: 2.4.1
+variants:
+- name: STM32F100C4
+  package_variants:
+  - STM32F100C4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100C6
+  package_variants:
+  - STM32F100C6Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100C8
+  package_variants:
+  - STM32F100C8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100CB
+  package_variants:
+  - STM32F100CBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100R4
+  package_variants:
+  - STM32F100R4Hx
+  - STM32F100R4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100R6
+  package_variants:
+  - STM32F100R6Hx
+  - STM32F100R6Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100R8
+  package_variants:
+  - STM32F100R8Hx
+  - STM32F100R8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100RB
+  package_variants:
+  - STM32F100RBHx
+  - STM32F100RBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100RC
+  package_variants:
+  - STM32F100RCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20006000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100RD
+  package_variants:
+  - STM32F100RDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100RE
+  package_variants:
+  - STM32F100RETx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100V8
+  package_variants:
+  - STM32F100V8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100VB
+  package_variants:
+  - STM32F100VBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F100VC
+  package_variants:
+  - STM32F100VCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20006000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100VD
+  package_variants:
+  - STM32F100VDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100VE
+  package_variants:
+  - STM32F100VETx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100ZC
+  package_variants:
+  - STM32F100ZCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20006000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100ZD
+  package_variants:
+  - STM32F100ZDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F100ZE
+  package_variants:
+  - STM32F100ZETx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101C4
+  package_variants:
+  - STM32F101C4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101C6
+  package_variants:
+  - STM32F101C6Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101C8
+  package_variants:
+  - STM32F101C8Tx
+  - STM32F101C8Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101CB
+  package_variants:
+  - STM32F101CBTx
+  - STM32F101CBUx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101R4
+  package_variants:
+  - STM32F101R4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101R6
+  package_variants:
+  - STM32F101R6Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101R8
+  package_variants:
+  - STM32F101R8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101RB
+  package_variants:
+  - STM32F101RBHx
+  - STM32F101RBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101RC
+  package_variants:
+  - STM32F101RCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101RD
+  package_variants:
+  - STM32F101RDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101RE
+  package_variants:
+  - STM32F101RETx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101RF
+  package_variants:
+  - STM32F101RFTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x80c0000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20014000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F101RG
+  package_variants:
+  - STM32F101RGTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x8100000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20014000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F101T4
+  package_variants:
+  - STM32F101T4Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101T6
+  package_variants:
+  - STM32F101T6Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101T8
+  package_variants:
+  - STM32F101T8Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101TB
+  package_variants:
+  - STM32F101TBUx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101V8
+  package_variants:
+  - STM32F101V8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101VB
+  package_variants:
+  - STM32F101VBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F101VC
+  package_variants:
+  - STM32F101VCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101VD
+  package_variants:
+  - STM32F101VDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101VE
+  package_variants:
+  - STM32F101VETx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101VF
+  package_variants:
+  - STM32F101VFTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x80c0000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20014000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F101VG
+  package_variants:
+  - STM32F101VGTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x8100000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20014000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F101ZC
+  package_variants:
+  - STM32F101ZCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101ZD
+  package_variants:
+  - STM32F101ZDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101ZE
+  package_variants:
+  - STM32F101ZETx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F101ZF
+  package_variants:
+  - STM32F101ZFTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x80c0000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20014000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F101ZG
+  package_variants:
+  - STM32F101ZGTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x8100000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20014000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F102C4
+  package_variants:
+  - STM32F102C4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F102C6
+  package_variants:
+  - STM32F102C6Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F102C8
+  package_variants:
+  - STM32F102C8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F102CB
+  package_variants:
+  - STM32F102CBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F102R4
+  package_variants:
+  - STM32F102R4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F102R6
+  package_variants:
+  - STM32F102R6Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F102R8
+  package_variants:
+  - STM32F102R8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F102RB
+  package_variants:
+  - STM32F102RBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103C4
+  package_variants:
+  - STM32F103C4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103C6
+  package_variants:
+  - STM32F103C6Tx
+  - STM32F103C6Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103C8
+  package_variants:
+  - STM32F103C8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103CB
+  package_variants:
+  - STM32F103CBTx
+  - STM32F103CBUx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103R4
+  package_variants:
+  - STM32F103R4Hx
+  - STM32F103R4Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103R6
+  package_variants:
+  - STM32F103R6Hx
+  - STM32F103R6Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103R8
+  package_variants:
+  - STM32F103R8Hx
+  - STM32F103R8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103RB
+  package_variants:
+  - STM32F103RBTx
+  - STM32F103RBHx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103RC
+  package_variants:
+  - STM32F103RCTx
+  - STM32F103RCYx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103RD
+  package_variants:
+  - STM32F103RDTx
+  - STM32F103RDYx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103RE
+  package_variants:
+  - STM32F103RETx
+  - STM32F103REYx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103RF
+  package_variants:
+  - STM32F103RFTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x80c0000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20018000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F103RG
+  package_variants:
+  - STM32F103RGTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x8100000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20018000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F103T4
+  package_variants:
+  - STM32F103T4Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8004000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20001800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103T6
+  package_variants:
+  - STM32F103T6Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8008000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20002800
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103T8
+  package_variants:
+  - STM32F103T8Ux
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103TB
+  package_variants:
+  - STM32F103TBUx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103V8
+  package_variants:
+  - STM32F103V8Hx
+  - STM32F103V8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103VB
+  package_variants:
+  - STM32F103VBIx
+  - STM32F103VBHx
+  - STM32F103VBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20005000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_128
+  - stm32f10x_opt
+- name: STM32F103VC
+  package_variants:
+  - STM32F103VCHx
+  - STM32F103VCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103VD
+  package_variants:
+  - STM32F103VDHx
+  - STM32F103VDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103VE
+  package_variants:
+  - STM32F103VEHx
+  - STM32F103VETx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103VF
+  package_variants:
+  - STM32F103VFTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x80c0000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20018000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F103VG
+  package_variants:
+  - STM32F103VGTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x8100000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20018000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F103ZC
+  package_variants:
+  - STM32F103ZCHx
+  - STM32F103ZCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x2000c000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103ZD
+  package_variants:
+  - STM32F103ZDHx
+  - STM32F103ZDTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8060000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103ZE
+  package_variants:
+  - STM32F103ZETx
+  - STM32F103ZEHx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F103ZF
+  package_variants:
+  - STM32F103ZFHx
+  - STM32F103ZFTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x80c0000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20018000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F103ZG
+  package_variants:
+  - STM32F103ZGHx
+  - STM32F103ZGTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8080000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Nvm
+    name: BANK_2
+    range:
+      start: 0x8080000
+      end: 0x8100000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20018000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_1024
+  - stm32f10x_opt
+- name: STM32F105R8
+  package_variants:
+  - STM32F105R8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F105RB
+  package_variants:
+  - STM32F105RBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F105RC
+  package_variants:
+  - STM32F105RCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F105V8
+  package_variants:
+  - STM32F105V8Hx
+  - STM32F105V8Tx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8010000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F105VB
+  package_variants:
+  - STM32F105VBHx
+  - STM32F105VBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F105VC
+  package_variants:
+  - STM32F105VCHx
+  - STM32F105VCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F107RB
+  package_variants:
+  - STM32F107RBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F107RC
+  package_variants:
+  - STM32F107RCTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F107VB
+  package_variants:
+  - STM32F107VBHx
+  - STM32F107VBTx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8020000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+- name: STM32F107VC
+  package_variants:
+  - STM32F107VCTx
+  - STM32F107VCHx
+  cores:
+  - name: main
+    type: armv7m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    name: BANK_1
+    range:
+      start: 0x8000000
+      end: 0x8040000
+    cores:
+    - main
+    access:
+      write: false
+      boot: true
+  - !Ram
+    name: SRAM
+    range:
+      start: 0x20000000
+      end: 0x20010000
+    cores:
+    - main
+  flash_algorithms:
+  - stm32f10x_512
+  - stm32f10x_opt
+flash_algorithms:
+- name: stm32f10x_128
+  description: STM32F10x Med-density Flash
+  default: true
+  instructions: ELUDRgAgREwgYERIYGBESGBgIEbAaRDwBA8I0UXyVVBATCBgBiBgYED2/3CgYAAgEL0BRjhIAGlA8IAANkoQYQAgcEc0SABpQPAEADJJCGEIRgBpQPBAAAhhA+BK9qogMEkIYCxIwGgQ8AEP9tEqSABpIPAEAChJCGEAIHBHAUYlSABpQPACACNKEGEQRkFhAGlA8EAAEGED4Er2qiAhShBgHUjAaBDwAQ/20RpIAGkg8AIAGEoQYQAgcEcQtQNGSBwg8AEBIuATSABpQPABABFMIGEQiBiAAL8PSMBoEPABD/rRDEgAaSDwAQAKTCBhIEbAaBDwFA8G0CBGwGhA8BQA4GABIBC9mxySHIkeACna0QAg9+cAAAAgAkAjAWdFq4nvzQAwAEAAAAAA
+  pc_init: 0x1
+  pc_uninit: 0x33
+  pc_program_page: 0xbd
+  pc_erase_sector: 0x7f
+  pc_erase_all: 0x45
+  data_section_offset: 0x128
+  flash_properties:
+    address_range:
+      start: 0x8000000
+      end: 0x8020000
+    page_size: 0x400
+    erased_byte_value: 0xff
+    program_page_timeout: 100
+    erase_sector_timeout: 500
+    sectors:
+    - size: 0x400
+      address: 0x0
+- name: stm32f10x_opt
+  description: STM32F10x Flash Options
+  instructions: ELUDRgAgXkwgYF5IYGBeSGBgXEigYFxIoGAgRsBpEPAEDwjRRfJVUFhMIGAGIGBgQPb/cKBgACAQvQFGUEgAaSD0gHBOShBhEEYAaUDwgAAQYQAgcEdKSABpQPAgAEhJCGEIRgBpQPBAAAhhA+BK9qogRkkIYEJIwGgQ8AEP9tE/SABpIPAgAD1JCGEIRgBpQPAQAAhhRfalID1JCIAD4Er2qiA5SQhgNUjAaBDwAQ/20TNIAGkg8BAAMUkIYQhGwGgQ8BQPBtAIRsBoQPAUAMhgASBwRwAg/OcBRihIAGlA8CAAJkoQYRBGAGlA8EAAEGED4Er2qiAkShBgIEjAaBDwAQ/20R5IAGkg8CAAHEoQYQAgcEcDRgEgcEcQtQNGSBwg8AEBJuAVSABpQPAQABNMIGEQiBiAA+BK9qogE0wgYA9IwGgQ8AEP9tEMSABpIPAQAApMIGEgRsBoEPAUDwbQIEbAaEDwFADgYAEgEL2bHJIciR4AKdbRACD35wAAACACQCMBZ0Wrie/NADAAQAD4/x8AAAAA
+  pc_init: 0x1
+  pc_uninit: 0x3b
+  pc_program_page: 0x11d
+  pc_erase_sector: 0xdb
+  pc_erase_all: 0x57
+  data_section_offset: 0x194
+  flash_properties:
+    address_range:
+      start: 0x1ffff800
+      end: 0x1ffff810
+    page_size: 0x10
+    erased_byte_value: 0xff
+    program_page_timeout: 3000
+    erase_sector_timeout: 3000
+    sectors:
+    - size: 0x10
+      address: 0x0
+- name: stm32f10x_512
+  description: STM32F10x High-density Flash
+  default: true
+  instructions: ELUDRgAgREwgYERIYGBESGBgIEbAaRDwBA8I0UXyVVBATCBgBiBgYED2/3CgYAAgEL0BRjhIAGlA8IAANkoQYQAgcEc0SABpQPAEADJJCGEIRgBpQPBAAAhhA+BK9qogMEkIYCxIwGgQ8AEP9tEqSABpIPAEAChJCGEAIHBHAUYlSABpQPACACNKEGEQRkFhAGlA8EAAEGED4Er2qiAhShBgHUjAaBDwAQ/20RpIAGkg8AIAGEoQYQAgcEcQtQNGSBwg8AEBIuATSABpQPABABFMIGEQiBiAAL8PSMBoEPABD/rRDEgAaSDwAQAKTCBhIEbAaBDwFA8G0CBGwGhA8BQA4GABIBC9mxySHIkeACna0QAg9+cAAAAgAkAjAWdFq4nvzQAwAEAAAAAA
+  pc_init: 0x1
+  pc_uninit: 0x33
+  pc_program_page: 0xbd
+  pc_erase_sector: 0x7f
+  pc_erase_all: 0x45
+  data_section_offset: 0x128
+  flash_properties:
+    address_range:
+      start: 0x8000000
+      end: 0x8080000
+    page_size: 0x400
+    erased_byte_value: 0xff
+    program_page_timeout: 100
+    erase_sector_timeout: 500
+    sectors:
+    - size: 0x800
+      address: 0x0
+- name: stm32f10x_1024
+  description: STM32F10x XL-density Flash
+  default: true
+  instructions: ELUDRtgMwASATExEIGAAIH9MIGB/SGBgf0hgYH1IYGR9SGBkIEbAaRDwBA8I0UXyVVB6TCBgBiBgYED2/3CgYAAgEL0BRnJIAGlA8IAAcEoQYRBGAG1A8IAAEGUAIHBHa0gAaUDwBABpSQhhCEYAaUDwQAAIYQPgSvaqIGdJCGBjSMBoEPABD/bRYUgAaSDwBABfSQhhCEYAbUDwBAAIZQhGAG1A8EAACGUD4Er2qiBaSQhgVkjAbBDwAQ/20VRIAG0g8AQAUkkIZQAgcEcBRk5ISEQAaAD1ACCBQhzSTEgAaUDwAgBKShBhEEZBYQBpQPBAABBhA+BK9qogR0oQYENIwGgQ8AEP9tFBSABpIPACAD9KEGEb4D1IAG1A8AIAO0oQZRBGQWUAbUDwQAAQZQPgSvaqIDlKEGA1SMBsEPABD/bRMkgAbSDwAgAwShBlACBwRxC1A0ZIHCDwAQErSEhEAGgA9QAgg0Im0iLgKEgAaUDwAQAmTCBhEIgYgAC/I0jAaBDwAQ/60SFIAGkg8AEAH0wgYSBGwGgQ8BQPBtAgRsBoQPAUAOBgASAQvZsckhyJHgAp2tEl4CLgFEgAbUDwAQASTCBlEIgYgAC/EEjAbBDwAQ/60Q1IAG0g8AEAC0wgZSBGwGwQ8BQPBtAgRsBsQPAUAOBkASDX55sckhyJHgAp2tEAINDnAAAEAAAAACACQCMBZ0Wrie/NADAAQAAAAAAAAAAA
+  pc_init: 0x1
+  pc_uninit: 0x45
+  pc_program_page: 0x155
+  pc_erase_sector: 0xcf
+  pc_erase_all: 0x61
+  data_section_offset: 0x220
+  flash_properties:
+    address_range:
+      start: 0x8000000
+      end: 0x8100000
+    page_size: 0x400
+    erased_byte_value: 0xff
+    program_page_timeout: 100
+    erase_sector_timeout: 500
+    sectors:
+    - size: 0x800
+      address: 0x0

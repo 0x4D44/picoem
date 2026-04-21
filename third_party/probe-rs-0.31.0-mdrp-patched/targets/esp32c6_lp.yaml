@@ -1,0 +1,41 @@
+name: esp32c6_lp
+manufacturer:
+  id: 0x12
+  cc: 0xc
+variants:
+- name: esp32c6_lp
+  cores:
+  - name: lp
+    type: riscv
+    core_access_options: !Riscv
+      hart_id: 1
+  memory_map:
+  - !Nvm
+    name: 16 Mb Max addressable Flash
+    range:
+      start: 0x0
+      end: 0x1000000
+    cores:
+    - lp
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x40800000
+      end: 0x40880000
+    cores:
+    - lp
+  - !Nvm
+    name: External flash (Read Only)
+    range:
+      start: 0x42000000
+      end: 0x43000000
+    cores:
+    - lp
+    is_alias: true
+  - !Ram
+    range:
+      start: 0x50000000
+      end: 0x50004000
+    cores:
+    - lp

@@ -1,0 +1,126 @@
+name: esp32
+manufacturer:
+  id: 0x12
+  cc: 0xc
+chip_detection:
+- !Espressif
+  idcode: 0x120034e5
+  variants:
+    0xf01d83: esp32
+variants:
+- name: esp32
+  cores:
+  - name: main
+    type: xtensa
+    core_access_options: !Xtensa
+      jtag_tap: 0
+  - name: app
+    type: xtensa
+    core_access_options: !Xtensa
+      jtag_tap: 1
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x1000000
+    cores:
+    - main
+    - app
+    access:
+      boot: true
+  - !Nvm
+    name: External data bus
+    range:
+      start: 0x3f400000
+      end: 0x3fc00000
+    cores:
+    - main
+    - app
+    is_alias: true
+  - !Generic
+    name: ROM1, Data bus
+    range:
+      start: 0x3ff90000
+      end: 0x3ffa0000
+    cores:
+    - main
+    - app
+  - !Ram
+    name: SRAM2, Data bus
+    range:
+      start: 0x3ffae000
+      end: 0x3ffe0000
+    cores:
+    - main
+    - app
+  - !Ram
+    name: SRAM1, Data bus
+    range:
+      start: 0x3ffe0000
+      end: 0x40000000
+    cores:
+    - main
+    - app
+  - !Generic
+    name: ROM0
+    range:
+      start: 0x40000000
+      end: 0x40060000
+    cores:
+    - main
+    - app
+  - !Ram
+    name: SRAM0, Instruction bus
+    range:
+      start: 0x40080000
+      end: 0x400c0000
+    cores:
+    - main
+    - app
+  - !Nvm
+    name: External instruction bus
+    range:
+      start: 0x400c2000
+      end: 0x40c00000
+    cores:
+    - main
+    - app
+    is_alias: true
+  flash_algorithms:
+  - esp32-flashloader
+  default_binary_format: idf
+flash_algorithms:
+- name: esp32-flashloader
+  description: A flash loader for the esp32.
+  default: true
+  instructions: AID/PwysAAAwgf4/DKsAANguBkAMrAAAMIH+PxQsBkAMrAAAMIH+PyMCCkA8CwpAaAwKQPQBCkBMLAZADKwAADCB/j8cIPQ/AAAAkCQg9D+fAABwBCD0Pywg9D+AIPQ/ACD0PwAABABsAgpAEAMKQAAA/j9ALf8/XAIKQDwLCkA8AgpAGAsKQAyg9T8UoPU/fGD2PygDCkArAgpAaAwKQPQBCkD41ABAyNUAQNDVAEBr1gBAMIH+PwysAAAAqwAA/KoAAPiqAAAEqwAAPADwPwirAABwgPQ/////5wAAAAhYhgBAbCoGQAAAAAEAAAEAABAAAABAAAD//wAAODIGQAysAAAwgf4/9QEKQDwLCkAbAgpAaAwKQOsBCkD0AQpArAoKQNgICkAMrAAAMIH+P/UBCkA8CwpAEAIKQGgMCkDrAQpA9AEKQPwKCkAMrAAAMIH+PwirAABwgPQ/BKsAADwA8D+wIQZADKwAADCB/j/1AQpAPAsKQOQBCkBoDApA6wEKQPQBCkA4CgpA2AgKQDCB/j/8qgAA+KoAAACrAAAAgAAA+CoAADDvBUBg8P///AoKQFAtBkBg8P//AAD+PwAAAEDYLgZAAIH+P0wCCkDQCgpAYQIKQACA/j8BAQEBPAsKQFZFUklGWSAgYnl0ZXMgQCAKRVJST1IgYnVmIG5vdCB3b3JkIGFsaWduZWQKUkVBRCBGTEFTSCBQUk9HUkFNIEVSQVNFIEAgQ2hpcCByZXZpc2lvbjogAAAOAAAACAAAAAgAAAAIAAAAAAAAAAAAVFRSIFJFR0dFU0lOSVQKVGVybWluYWwAAAAAAAQAAAAIAAAAEAAAACAAAABAAAAAgAAAAAABAAAAAgAAAAQAAAAIAAAAEP///////////////wAAAAQAAAAIAAAAEP///////////////////////////////////////////////////////////////////////////////wAABAAAAAgAAAAQAAAAIAAAAEAAAACAAAAAAAEAAAACAAAABAAACAAAABAAAAAgAAAAQAAAAIAAAAAAAWQAAAAAAAAAyAAAAAAAAAAAAAAAAAAAACwBAAARL/9tAn0DjQQVCQAtBvBBAAAAABEq/1URAC0G8EEAABEn/20CVRIALQbwQQAAAAARI/+VFQAtBvBBAAARIP9t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
+  load_address: 0x400a0000
+  data_load_address: 0x3ffe0000
+  pc_init: 0x380
+  pc_uninit: 0x3bc
+  pc_program_page: 0x394
+  pc_erase_sector: 0x364
+  pc_erase_all: 0x358
+  pc_verify: 0x3cc
+  pc_blank_check: 0x344
+  pc_read: 0x3a8
+  pc_flash_size: 0x374
+  data_section_offset: 0xcb4
+  rtt_location: 0x3ffe8100
+  rtt_poll_interval: 500
+  flash_properties:
+    address_range:
+      start: 0x0
+      end: 0x1000000
+    page_size: 0x4000
+    erased_byte_value: 0xff
+    program_page_timeout: 1000
+    erase_sector_timeout: 2000
+    sectors:
+    - size: 0x10000
+      address: 0x0
+  cores:
+  - main
+  - app
+  stack_overflow_check: false
+  transfer_encoding: miniz

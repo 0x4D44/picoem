@@ -1,0 +1,404 @@
+name: nRF51 Series
+manufacturer:
+  id: 0x44
+  cc: 0x2
+chip_detection:
+- !NordicConfigId
+  configid_address: 0x1000005c
+  hwid:
+    0x1d: nRF51822_xxAA
+    0x1e: nRF51422_xxAA
+    0x20: nRF51822_xxAA
+    0x21: nRF51822_xxAA
+    0x22: nRF51822_xxAA
+    0x23: nRF51822_xxAA
+    0x24: nRF51422_xxAA
+    0x26: nRF51822_xxAB
+    0x27: nRF51822_xxAB
+    0x28: nRF51822_xxAA
+    0x29: nRF51822_xxAA
+    0x2a: nRF51822_xxAA
+    0x2b: nRF51822_xxAA
+    0x2c: nRF51822_xxAA
+    0x2d: nRF51422_xxAA
+    0x2e: nRF51422_xxAA
+    0x2f: nRF51822_xxAA
+    0x30: nRF51822_xxAA
+    0x31: nRF51422_xxAA
+    0x32: nRF51422_xxAA
+    0x33: nRF51922_xxAA
+    0x34: nRF51822_xxAA
+    0x38: nRF51822_xxAA
+    0x39: nRF51822_xxAA
+    0x3a: nRF51822_xxAB
+    0x3b: nRF51822_xxAB
+    0x3c: nRF51822_xxAA
+    0x3d: nRF51822_xxAA
+    0x3e: nRF51822_xxAA
+    0x3f: nRF51922_xxAA
+    0x40: nRF51822_xxAA
+    0x41: nRF51822_xxAA
+    0x42: nRF51822_xxAA
+    0x43: nRF51822_xxAA
+    0x44: nRF51822_xxAA
+    0x45: nRF51822_xxAA
+    0x46: nRF51822_xxAA
+    0x47: nRF51822_xxAA
+    0x48: nRF51822_xxAA
+    0x49: nRF51822_xxAA
+    0x4a: nRF51822_xxAA
+    0x4b: nRF51922_xxAA
+    0x4c: nRF51822_xxAB
+    0x4d: nRF51822_xxAA
+    0x4e: nRF51822_xxAA
+    0x4f: nRF51822_xxAA
+    0x50: nRF51422_xxAA
+    0x54: nRF51822_xxAA
+    0x56: nRF51822_xxAB
+    0x57: nRF51822_xxAA
+    0x58: nRF51822_xxAA
+    0x59: nRF51822_xxAA
+    0x5a: nRF51822_xxAA
+    0x5b: nRF51822_xxAA
+    0x5c: nRF51422_xxAA
+    0x5d: nRF51822_xxAA
+    0x5e: nRF51422_xxAA
+    0x5f: nRF51822_xxAB
+    0x60: nRF51822_xxAB
+    0x61: nRF51422_xxAB
+    0x63: nRF51422_xxAA
+    0x64: nRF51822_xxAB
+    0x65: nRF51422_xxAB
+    0x66: nRF51422_xxAB
+    0x67: nRF51822_xxAB
+    0x68: nRF51422_xxAB
+    0x6a: nRF51822_xxAA
+    0x6b: nRF51822_xxAA
+    0x6c: nRF51822_xxAC
+    0x6d: nRF51422_xxAC
+    0x6e: nRF51822_xxAC
+    0x6f: nRF51822_xxAA
+    0x70: nRF51822_xxAA
+    0x71: nRF51422_xxAC
+    0x72: nRF51822_xxAA
+    0x73: nRF51422_xxAA
+    0x74: nRF51822_xxAC
+    0x75: nRF51422_xxAC
+    0x76: nRF51822_xxAB
+    0x77: nRF51822_xxAA
+    0x79: nRF51822_xxAA
+    0x7a: nRF51422_xxAA
+    0x7b: nRF51822_xxAB
+    0x7c: nRF51422_xxAB
+    0x7d: nRF51822_xxAB
+    0x80: nRF51822_xxAA
+    0x82: nRF51822_xxAC
+    0x83: nRF51822_xxAC
+    0x84: nRF51822_xxAC
+    0x85: nRF51422_xxAC
+    0x86: nRF51422_xxAC
+    0x87: nRF51822_xxAC
+    0x88: nRF51422_xxAC
+    0x8a: nRF51802_xxAA
+    0x8b: nRF51832_xxAA
+    0x8c: nRF51822_xx00
+    0x8e: nRF51822_xxAA
+    0x8f: nRF51822_xxAA
+    0x91: nRF51822_xxAC
+    0x92: nRF51822_xxAQ
+    0x93: nRF51822_xx00
+    0x94: nRF51802_xxAA
+variants:
+- name: nRF51422_xxAA
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x40000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51422_xxAB
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x20000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51422_xxAC
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x40000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51801_xxAB
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x30000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51802_xxAA
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x40000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51822_xxAA
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x40000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51822_xxAB
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x20000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51822_xxAC
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x40000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20008000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+- name: nRF51824_xxAA
+  cores:
+  - name: main
+    type: armv6m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x40000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20004000
+    cores:
+    - main
+  flash_algorithms:
+  - nrf51xxx
+  - nrf51xxx_sde
+  - nrf51xxx_ecb
+flash_algorithms:
+- name: nrf51xxx_sde
+  description: nRF51xxx SoftDevice Erase
+  default: true
+  instructions: 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
+  pc_init: 0x1
+  pc_uninit: 0x41
+  pc_program_page: 0x12d
+  pc_erase_sector: 0xc5
+  pc_erase_all: 0x89
+  data_section_offset: 0x660
+  flash_properties:
+    address_range:
+      start: 0x0
+      end: 0x200000
+    page_size: 0x400
+    erased_byte_value: 0xff
+    program_page_timeout: 1000
+    erase_sector_timeout: 3000
+    sectors:
+    - size: 0x400
+      address: 0x0
+  cores:
+  - main
+- name: nrf51xxx
+  description: nRF51xxx
+  instructions: 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
+  pc_init: 0x1
+  pc_uninit: 0x41
+  pc_program_page: 0x1c5
+  pc_erase_sector: 0x135
+  pc_erase_all: 0x89
+  data_section_offset: 0x820
+  flash_properties:
+    address_range:
+      start: 0x0
+      end: 0x200000
+    page_size: 0x400
+    erased_byte_value: 0xff
+    program_page_timeout: 1000
+    erase_sector_timeout: 3000
+    sectors:
+    - size: 0x400
+      address: 0x0
+  cores:
+  - main
+- name: nrf51xxx_ecb
+  description: nRF51xxx External Connectivity Board
+  instructions: QLpwR8C6cEdVSAEjASoF0AIqBdADKgXQASBwRwIhAuBDYAHgACFBYE5IAWgAKfzQTUiDYAAgcEdJSQAgSGBJSAFoACn80AAgcEdFSQEgyGBESAFoACn80AAgcEdwtQElLQcERilpAPCB+AApBNEoaWlpSEOgQgHYASBwvThIhGA4SAFoACn80AAgcL1wtYMHFtGLBxTRASMbBxxpXWlsQ4RCDdkcaVtpXENDGJxCB9MAIyxMjQgL4JkARlh2HAHQASBwvVZYRlAhaAAp/NBbHJ1C8dgAIHC9cLUERoMHEdGLBw/RASMbBx1pXml1Q4VCCNkdaV5pQBh1Q4VCA9IYaVlpSENwvQAjjQgI4JkAZlhRWI5CAtCYAAAZcL1bHJ1C9NhwvTC1gwcT0YsHEdEBIxsHHGldaWxDhEIK2RxpW2lcQ0MYnEIE0wAjBeDEXJRCAdABIDC9WxyLQvfTACAwvQDlAUAA5AFAAAYAQAAiAwmLQizTAwqLQhHTACOcRk7gA0YLQzzUACJDCItCMdMDCYtCHNMDCotCAdOURj/gwwmLQgHTywHAGlJBgwmLQgHTiwHAGlJBQwmLQgHTSwHAGlJBAwmLQgHTCwHAGlJBwwiLQgHTywDAGlJBgwiLQgHTiwDAGlJBQwiLQgHTSwDAGlJBQRoA0gFGUkEQRnBHXeDKDwDQSUIDEADTQEJTQAAinEYDCYtCLdMDCotCEtP8IokBEroDCotCDNOJAZIRi0II04kBkhGLQgTTiQE60JIRAOCJCcMJi0IB08sBwBpSQYMJi0IB04sBwBpSQUMJi0IB00sBwBpSQQMJi0IB0wsBwBpSQcMIi0IB08sAwBpSQYMIi0IB04sAwBpSQdnSQwiLQgHTSwDAGlJBQRoA0gFGY0ZSQVsQEEYB00BCACsA1UlCcEdjRlsQANNAQgG1ACDARsBGAr0AAAAAAAA=
+  pc_init: 0x9
+  pc_uninit: 0x39
+  pc_program_page: 0x8d
+  pc_erase_sector: 0x5d
+  pc_erase_all: 0x4b
+  data_section_offset: 0x2c8
+  flash_properties:
+    address_range:
+      start: 0x0
+      end: 0x200000
+    page_size: 0x400
+    erased_byte_value: 0xff
+    program_page_timeout: 1000
+    erase_sector_timeout: 3000
+    sectors:
+    - size: 0x400
+      address: 0x0
+  cores:
+  - main

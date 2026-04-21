@@ -1,0 +1,41 @@
+name: OpenTitan
+manufacturer:
+  id: 0x6F
+  cc: 0xC
+variants:
+- name: earlgrey
+  cores:
+  - name: ibex
+    type: riscv
+    core_access_options: !Riscv
+  memory_map:
+  - !Nvm
+    name: ROM
+    range:
+      start: 0x8000
+      end: 0x10000
+    cores:
+    - ibex
+    access:
+      boot: true
+  - !Ram
+    name: Main SRAM
+    range:
+      start: 0x10000000
+      end: 0x10020000
+    cores:
+    - ibex
+  - !Nvm
+    name: Flash
+    range:
+      start: 0x20000000
+      end: 0x20100000
+    cores:
+    - ibex
+  - !Ram
+    name: AON Retention SRAM
+    range:
+      start: 0x40600000
+      end: 0x40601000
+    cores:
+    - ibex
