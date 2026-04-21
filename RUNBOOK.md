@@ -218,3 +218,48 @@ After attach:
   §2 for the implication.
 - Two-probe + two-board setups can run Arm and RV in parallel; the
   POWMAN override is a one-board recipe.
+
+## probe-rs patch notes
+
+### Patched path
+
+`third_party/probe-rs-0.31.0-mdrp-patched/` — a verbatim copy of
+probe-rs 0.31.0 (MIT OR Apache-2.0) with one surgical change in
+`src/architecture/arm/communication_interface.rs::select_ap_and_ap_bank`.
+The workspace `Cargo.toml` pins it via `[patch.crates-io]`. Harness code
+is unchanged.
+
+### What the patch does
+
+Adds a new match arm for `(ApAddress::V2, SelectCache::DPv1)` that
+upgrades the DP state cache to `DPv3` in place and performs the
+ADIv6 V2 register write, instead of hitting the upstream
+`unreachable!()`. This recovers RP2354 silicon oracles from a
+first-DPIDR-read version glitch — see upstream issues
+[#3872](https://github.com/probe-rs/probe-rs/issues/3872) and
+[#3257](https://github.com/probe-rs/probe-rs/issues/3257), and
+`wrk_docs/2026.04.21 - HLD - Track A Probe-rs Attach Fix.md`.
+
+### Sentinel WARN to watch for
+
+```
+WARN ... ApV2 access on DPv1 cache; upgrading to DPv3 (mdrp-patched workaround)
+```
+
+Expected: **at most once per session** when the initial DPIDR read
+mis-reports the DP version. If you see this line firing repeatedly
+within a single oracle run, the patch is masking a deeper DP state
+bug — stop and escalate rather than ignoring it.
+
+### When bumping probe-rs
+
+1. Check whether the new release contains a fix for issue #3872
+   (the `unreachable!()` at `select_ap_and_ap_bank`).
+2. If fixed upstream: drop `third_party/probe-rs-0.31.0-mdrp-patched/`
+   and the `[patch.crates-io]` entry, then rerun the silicon oracle
+   catalogue (`probe_verify_rp2350`, `silicon_periph_diff_rp2350`,
+   `test_silicon`) to confirm the panic no longer reproduces.
+3. If not fixed upstream: re-vendor at the new version, re-apply the
+   patch to `select_ap_and_ap_bank`, and smoke-test the same
+   oracles. Keep the sentinel WARN text identical so dashboards that
+   grep for it keep working.

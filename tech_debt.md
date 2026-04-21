@@ -2,6 +2,41 @@
 
 Items discovered during development that need addressing in later phases.
 
+## Vendored probe-rs fork for issue #3872 (Track A workaround)
+
+**Context:** `third_party/probe-rs-0.31.0-mdrp-patched/` carries a single
+surgical patch to `select_ap_and_ap_bank` in
+`src/architecture/arm/communication_interface.rs` to recover from a
+first-DPIDR-read version glitch that trips probe-rs's `unreachable!()`
+panic on RP2354 silicon oracles (`silicon_periph_diff_rp2350`,
+`silicon_isr_diff_rp2350`, `silicon_dualcore_diff_rp2350`,
+`bank_conflict_test_rp2350`, `probe_verify_rp2350`, and
+`test_silicon` when any of the above runs). Routed via
+`[patch.crates-io]` in the workspace `Cargo.toml`. See
+`wrk_docs/2026.04.21 - HLD - Track A Probe-rs Attach Fix.md` and
+`RUNBOOK.md` → "probe-rs patch notes".
+
+**Upstream issue:** [probe-rs/probe-rs#3872](https://github.com/probe-rs/probe-rs/issues/3872)
+(open; companion report #3257 open since April 2025). Master still
+contains the `unreachable!()` at the equivalent location as of
+2026-04-21. A PR draft targeting #3872 lives at
+`wrk_docs/2026.04.21 - DRAFT - probe-rs PR body.md`.
+
+**Risk:** every probe-rs bump needs the patch re-ported until upstream
+merges a fix; our `Cargo.lock` also unpins the crates.io checksum for
+`probe-rs` for as long as the patch is live. The sentinel WARN
+(`ApV2 access on DPv1 cache; upgrading to DPv3 (mdrp-patched
+workaround)`) is expected at most once per session; if it fires
+repeatedly, the patch is masking a deeper DP bug and should be
+escalated rather than ignored.
+
+**Fix:** drop the vendored fork and the `[patch.crates-io]` entry once
+upstream ships a release we can bump to. Smoke-test the silicon
+oracle catalogue on the bump commit to confirm the panic no longer
+reproduces.
+
+**Status:** live workaround; tracked until upstream resolves #3872.
+
 ## RP2350 DMA IRQ2/IRQ3 routing not modelled
 
 **Context:** Residual C.2.1 (`wrk_docs/2026.04.17 - HLD - Residual C.2.1 DMA
