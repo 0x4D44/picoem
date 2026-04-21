@@ -20,9 +20,14 @@
 //!                      host-cycles-per-emulated-cycle figure for the HLD §12
 //!                      performance budget check.
 //!   --workload <name>  One of: basic (default), peripheral, contention,
-//!                      stress, fpu-heavy. Core count is implied by the
-//!                      workload: basic / peripheral / fpu-heavy are
-//!                      single-core, contention / stress are dual-core.
+//!                      stress, fpu-heavy, onerom. Core count is implied
+//!                      by the workload: basic / peripheral / fpu-heavy /
+//!                      onerom are single-core, contention / stress are
+//!                      dual-core. `onerom` configures PIO1 (1 SM) +
+//!                      PIO2 (2 SMs) — no PIO0 — to mirror Pier's
+//!                      OneROM block/SM enable mask; used to decide
+//!                      whether splitting our single PIO worker thread
+//!                      into per-block workers would help.
 //!   --threaded         Route execution through `ThreadedEmulator` (4
 //!                      pinned workers: core0, core1, PIO, coordinator)
 //!                      instead of the serial-interleave `Emulator::run`
@@ -95,6 +100,18 @@ enum Workload {
     /// FPU-heavy: VADD/VMUL/VDIV/VSQRT loop exercising the FPU hot path.
     /// Used by the HLD §12 performance budget check.
     FpuHeavy,
+    /// OneROM-shape: no PIO0 activity, PIO1 with 1 SM enabled (address
+    /// reader analogue), PIO2 with 2 SMs enabled (data writer + CS
+    /// handler analogues). Mirrors the block/SM enable mask Pier's
+    /// OneROM firmware programs — see agent analysis in
+    /// `wrk_journals/2026.04.20 - JRN - PIO step_n Profiling.md`.
+    /// Core 0 runs the peripheral loop to keep CPU-side MMIO traffic
+    /// on the hot path; core 1 halted (OneROM is single-core).
+    /// Does NOT reproduce real serving semantics (emulator DMA is
+    /// stubbed and the harness `GlueDma` helper can't hook into
+    /// threaded mode) — the point is to measure whether PIO or CPU
+    /// is the critical-path worker under the OneROM block/SM shape.
+    Onerom,
 }
 
 impl Workload {
@@ -103,7 +120,10 @@ impl Workload {
     }
 
     fn needs_pio(self) -> bool {
-        matches!(self, Workload::Peripheral | Workload::Stress)
+        matches!(
+            self,
+            Workload::Peripheral | Workload::Stress | Workload::Onerom
+        )
     }
 
     fn as_str(self) -> &'static str {
@@ -113,6 +133,7 @@ impl Workload {
             Workload::Contention => "contention",
             Workload::Stress => "stress",
             Workload::FpuHeavy => "fpu-heavy",
+            Workload::Onerom => "onerom",
         }
     }
 }
@@ -173,6 +194,19 @@ const SIO_GPIO_OE_SET: u32 = SIO_BASE + 0x038;
 const SIO_GPIO_OUT_XOR: u32 = SIO_BASE + 0x028;
 
 const PIO0_BASE: u32 = 0x5020_0000;
+const PIO1_BASE: u32 = 0x5030_0000;
+const PIO2_BASE: u32 = 0x5040_0000;
+/// RESETS.RESET bits for PIO1/PIO2 on RP2350 (see `mdrp2350/src/bus/mod.rs`
+/// `RESET_PIO1`/`RESET_PIO2`). PIO0 bit in the existing
+/// `RESETS_PIO0_BIT = 1 << 15` is wrong per the datasheet (the correct
+/// bit is 11) but harmless — the emulator doesn't gate PIO activity on
+/// RESETS. Left unchanged here to avoid scope creep.
+const RESETS_PIO1_BIT: u32 = 1 << 12;
+const RESETS_PIO2_BIT: u32 = 1 << 13;
+/// FUNCSEL values for PIO1/PIO2. PIO0 uses 6 per `FUNCSEL_PIO0`; PIO1
+/// is 7, PIO2 is 8 on RP2350.
+const FUNCSEL_PIO1: u8 = 7;
+const FUNCSEL_PIO2: u8 = 8;
 const PIO_CTRL: u32 = 0x000;
 const PIO_INSTR_MEM0: u32 = 0x048;
 const PIO_SM0_CLKDIV: u32 = 0x0C8;
@@ -264,6 +298,66 @@ fn setup_pio0_sm0_wrap(emu: &mut Emulator, pin: u8) {
 
     // CTRL.SM_ENABLE bit 0 — enable SM0.
     emu.mmio_write32(PIO0_BASE + PIO_CTRL, 0x1);
+}
+
+/// SM register stride (SMx_CLKDIV at SM0_CLKDIV + x*0x18, etc.).
+const PIO_SM_STRIDE: u32 = 0x18;
+
+/// Program one SM on a given PIO block with the minimal 2-instruction
+/// wrap loop, CLKDIV=1, no pin output. Used by the OneROM-shape
+/// workload to keep N SMs saturating `step_n` without FIFO stalls.
+/// Program content is irrelevant to per-sysclk dispatch cost — all
+/// that matters is which SMs are enabled.
+fn program_sm_wrap_no_pins(emu: &mut Emulator, pio_base: u32, sm: u32) {
+    let off = sm * PIO_SM_STRIDE;
+    // INSTR_MEM[2*sm] = SET X, 0 (0xE020); INSTR_MEM[2*sm+1] = SET X, 1
+    // (0xE021). Independent wrap window per SM so they don't collide.
+    let prog_base = PIO_INSTR_MEM0 + (2 * sm) * 4;
+    emu.mmio_write32(pio_base + prog_base, 0xE020);
+    emu.mmio_write32(pio_base + prog_base + 4, 0xE021);
+    // EXECCTRL: WRAP_TOP=2*sm+1, WRAP_BOTTOM=2*sm.
+    let wrap_top = 2 * sm + 1;
+    let wrap_bottom = 2 * sm;
+    let execctrl = (wrap_top << 12) | (wrap_bottom << 7);
+    emu.mmio_write32(pio_base + PIO_SM0_EXECCTRL + off, execctrl);
+    // SHIFTCTRL: reset defaults.
+    emu.mmio_write32(pio_base + PIO_SM0_SHIFTCTRL + off, 0x000C_0000);
+    // CLKDIV: INT=1, FRAC=0 (1 SM cycle per sys_clk).
+    emu.mmio_write32(pio_base + PIO_SM0_CLKDIV + off, 1u32 << 16);
+    // Force PC to the SM's wrap window so it starts executing immediately.
+    // JMP to wrap_bottom: JMP = 0x0000 | addr (5 bits).
+    let jmp = wrap_bottom & 0x1F;
+    emu.mmio_write32(pio_base + PIO_SM0_INSTR + off, jmp);
+}
+
+/// Set up the OneROM block/SM shape: PIO1 with SM0 only, PIO2 with
+/// SM0 + SM1. PIO0 is left untouched (unused in OneROM serving mode).
+/// All SMs run a minimal wrap loop at CLKDIV=1 — program content is
+/// irrelevant to the per-sysclk dispatch cost we're measuring.
+fn setup_pio1_pio2_onerom_shape(emu: &mut Emulator) {
+    // RESETS de-assert for PIO1 and PIO2 via APB CLR alias (+0x3000).
+    // Matches real firmware bring-up; the emulator doesn't currently
+    // gate PIO activity on RESETS so this is a formality.
+    emu.mmio_write32(
+        RESETS_BASE + RESETS_RESET_OFFSET + 0x3000,
+        RESETS_PIO1_BIT | RESETS_PIO2_BIT,
+    );
+    // Route GPIOs for each block — again formality, but matches
+    // real-firmware bring-up sequencing. GPIO numbers match OneROM's
+    // observed pin assignment (agent analysis, not verified against
+    // silicon — purely for MMIO-write symmetry).
+    setup_gpio_output(emu, 10, FUNCSEL_PIO1); // PIO1 address-reader pin stand-in
+    setup_gpio_output(emu, 16, FUNCSEL_PIO2); // PIO2 D0-D7 stand-in
+    setup_gpio_output(emu, 17, FUNCSEL_PIO2); // PIO2 CS-handler stand-in
+
+    // PIO1: SM0 only.
+    program_sm_wrap_no_pins(emu, PIO1_BASE, 0);
+    emu.mmio_write32(PIO1_BASE + PIO_CTRL, 0x1);
+
+    // PIO2: SM0 + SM1.
+    program_sm_wrap_no_pins(emu, PIO2_BASE, 0);
+    program_sm_wrap_no_pins(emu, PIO2_BASE, 1);
+    emu.mmio_write32(PIO2_BASE + PIO_CTRL, 0x3);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +501,18 @@ fn setup(emu: &mut Emulator, workload: Workload) {
         }
         Workload::FpuHeavy => {
             setup_fpu_heavy_core0(emu);
+            emu.core_mut(1).halt();
+        }
+        Workload::Onerom => {
+            // Core 0 runs the peripheral loop (STR to GPIO_OUT_XOR) — same
+            // CPU-side shape as `Peripheral` so the CPU worker does real
+            // MMIO work every quantum, mirroring OneROM's CPU doing bus
+            // stimulus alongside its PIO pipeline.
+            setup_peripheral_core0(emu);
+            setup_gpio_output(emu, SIO_TOGGLE_PIN, 5);
+            emu.mmio_write32(SIO_GPIO_OE_SET, 1u32 << SIO_TOGGLE_PIN);
+            // PIO1 (1 SM) + PIO2 (2 SMs) — the OneROM shape.
+            setup_pio1_pio2_onerom_shape(emu);
             emu.core_mut(1).halt();
         }
     }
@@ -842,7 +948,7 @@ fn parse_workload() -> Result<Workload, String> {
         if a == "--workload" {
             let v = args
                 .get(i + 1)
-                .ok_or("--workload requires basic|peripheral|contention|stress|fpu-heavy")?;
+                .ok_or("--workload requires basic|peripheral|contention|stress|fpu-heavy|onerom")?;
             return match_workload(v);
         }
     }
@@ -856,8 +962,9 @@ fn match_workload(s: &str) -> Result<Workload, String> {
         "contention" => Ok(Workload::Contention),
         "stress" => Ok(Workload::Stress),
         "fpu-heavy" => Ok(Workload::FpuHeavy),
+        "onerom" => Ok(Workload::Onerom),
         other => Err(format!(
-            "invalid --workload '{other}' (expected basic|peripheral|contention|stress|fpu-heavy)"
+            "invalid --workload '{other}' (expected basic|peripheral|contention|stress|fpu-heavy|onerom)"
         )),
     }
 }
