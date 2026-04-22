@@ -25,6 +25,7 @@
 //!   before we look up `expected_byte`. Outside → `ResolvedAddrOutOfRange`.
 
 use std::fmt::Write as _;
+use std::sync::atomic::Ordering;
 
 use mdrp2350::{Bus, Emulator};
 
@@ -400,7 +401,7 @@ impl ServingOracle {
         // 1. init seed (first call only).
         if !self.seed_done {
             let seed_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-            emu.bus.gpio_external_in = seed_level;
+            emu.bus.gpio_external_in.store(seed_level, Ordering::Relaxed);
             self.tick_cycles(emu, glue, SEED_CYCLES);
             self.seed_done = true;
         }
@@ -418,13 +419,13 @@ impl ServingOracle {
         // short fixed-duration gap is sufficient to seed CS-high before
         // stimulus.
         let gap_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-        emu.bus.gpio_external_in = gap_level;
+        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
         self.tick_cycles(emu, glue, GAP_CYCLES);
 
         // 3. cs_assert: apply the case stimulus.
         let stim_level = stimulus_level(case.addr_bits);
         let expected_pin_bits: u16 = (stim_level & 0xFFFF) as u16;
-        emu.bus.gpio_external_in = stim_level;
+        emu.bus.gpio_external_in.store(stim_level, Ordering::Relaxed);
 
         // Snapshot the push counter *before* stimulus-time ticks.
         // The observation loop records ch1_pushes as a delta relative
@@ -453,7 +454,8 @@ impl ServingOracle {
             // never produced the observed byte. See H1 in the Stage G
             // fix-wave brief (2026-04-17).
             let resolved = glue.last_pushed_read_addr();
-            let data_byte = ((emu.bus.gpio_in >> GPIO_DATA_BASE) & 0xFF) as u8;
+            let data_byte =
+                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
             let pad_oe = ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
 
             trace.push(Observation {
@@ -474,7 +476,7 @@ impl ServingOracle {
                 &trace,
             ) {
                 // Leave the bus in gap-level state for the next case.
-                emu.bus.gpio_external_in = gap_level;
+                emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
 
                 self.results.push(apply_envelope(result));
                 return self.results.last().unwrap();
@@ -486,7 +488,7 @@ impl ServingOracle {
         //    machine stopped.
         let result = evaluate_case_trace(case, &self.rom_shadow, expected_pin_bits, &trace);
 
-        emu.bus.gpio_external_in = gap_level;
+        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
 
         self.results.push(apply_envelope(result));
         self.results.last().unwrap()

@@ -10,6 +10,8 @@
 //! Tests that exercise only `PioBlock`/`StateMachine` internals stay
 //! co-located with the primitive under `mdpicoem-common/src/pio/mod.rs`.
 
+use std::sync::atomic::Ordering;
+
 use crate::bus::Bus;
 use crate::{Config, Emulator, EmulatorBuilder};
 
@@ -101,7 +103,7 @@ fn test_ctrl_alias_xor() {
 #[test]
 fn test_gpio_in_moved_to_bus() {
     let mut bus = Bus::new();
-    bus.gpio_in = 0xFF;
+    bus.gpio_in.store(0xFF, Ordering::Relaxed);
 
     // Read SIO GPIO_IN via bus at 0xD000_0004
     let val = bus.read32(0xD000_0004, 0);
@@ -121,7 +123,11 @@ fn test_gpio_merge_pio_overrides_sio() {
     emu.bus.pio[0].pad_out = 0; // pin 5 = 0
 
     emu.update_gpio();
-    assert_eq!(emu.bus.gpio_in & (1 << 5), 0, "PIO overrides SIO on pin 5");
+    assert_eq!(
+        emu.bus.gpio_in.load(Ordering::Relaxed) & (1 << 5),
+        0,
+        "PIO overrides SIO on pin 5"
+    );
 }
 
 #[test]
@@ -136,8 +142,9 @@ fn test_gpio_merge_independent_pins() {
     emu.bus.pio[0].pad_out = 1 << 5;
 
     emu.update_gpio();
-    assert_ne!(emu.bus.gpio_in & (1 << 5), 0, "PIO pin 5 appears");
-    assert_ne!(emu.bus.gpio_in & (1 << 10), 0, "SIO pin 10 appears");
+    let gpio_in = emu.bus.gpio_in.load(Ordering::Relaxed);
+    assert_ne!(gpio_in & (1 << 5), 0, "PIO pin 5 appears");
+    assert_ne!(gpio_in & (1 << 10), 0, "SIO pin 10 appears");
 }
 
 // ====================================================================

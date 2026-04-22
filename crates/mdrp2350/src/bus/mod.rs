@@ -5,6 +5,7 @@ pub mod ppb;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::debug;
 
@@ -441,13 +442,23 @@ pub struct Bus {
     /// Three PIO blocks (PIO0, PIO1, PIO2).
     pub pio: [PioBlock; 3],
     /// Combined GPIO pin state (readable by SIO and PIO).
-    pub gpio_in: u32,
+    ///
+    /// Atomic so a dedicated host measurement thread (Phase 2 of the
+    /// OneROM CPU Speed-Grade Oracle) can sample it concurrently with
+    /// the serial/threaded emulator writing it via `update_gpio`. All
+    /// accesses use `Ordering::Relaxed` — single-writer-per-location
+    /// discipline plus x86_64's plain-`mov` emission means no ordering
+    /// cost on the emulator hot path.
+    pub gpio_in: AtomicU32,
     /// External-input stimulus value. Bits selected by
     /// [`Self::gpio_external_mask`] are forced to the corresponding
     /// bits of this value after `update_gpio` merges SIO/PIO outputs.
     /// Lets the harness drive pins (CS, address bus, etc.) that the
     /// emulator otherwise recomputes every tick. Defaults to 0.
-    pub gpio_external_in: u32,
+    ///
+    /// Atomic for the same reason as [`Self::gpio_in`]: a measurement
+    /// thread writes new stimulus while the emulator runs.
+    pub gpio_external_in: AtomicU32,
     /// External-input stimulus mask. Bit `i` set = the harness dictates
     /// `gpio_in[i]`; bit `i` clear = PIO/SIO dictates. Defaults to 0
     /// (no stimulus — legacy behaviour).
@@ -592,8 +603,8 @@ impl Bus {
             xip_cache_offset: 0,
             sio: Sio::new(),
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
-            gpio_in: 0,
-            gpio_external_in: 0,
+            gpio_in: AtomicU32::new(0),
+            gpio_external_in: AtomicU32::new(0),
             gpio_external_mask: 0,
             // Dirty-range log for per-core decode caches. 16 entries up
             // front — STM tops out at 13 registers, FPU context push
@@ -1544,7 +1555,7 @@ impl Bus {
                     addr
                 );
                 let word = match word_offset {
-                    0x004 => self.gpio_in,
+                    0x004 => self.gpio_in.load(Ordering::Relaxed),
                     0x008 => self.read_gpio_hi_in(),
                     _ => {
                         self.sio.read32(word_offset, core as usize)
@@ -1974,7 +1985,7 @@ impl Bus {
                     // semantics for any byte-lane access that hits
                     // a side-effect offset.
                     let old_word = match reg_offset {
-                        0x004 => self.gpio_in,
+                        0x004 => self.gpio_in.load(Ordering::Relaxed),
                         0x008 => self.read_gpio_hi_in(),
                         _ => self.sio.read32(reg_offset, core as usize),
                     };
@@ -2186,7 +2197,7 @@ impl Bus {
                     addr
                 );
                 let word = match word_offset {
-                    0x004 => self.gpio_in,
+                    0x004 => self.gpio_in.load(Ordering::Relaxed),
                     0x008 => self.read_gpio_hi_in(),
                     _ => {
                         self.sio.read32(word_offset, core as usize)
@@ -2583,7 +2594,7 @@ impl Bus {
                     let half_idx = ((addr >> 1) & 1) as usize;
                     // core is the outer write8/16/32 param
                     let old_word = match reg_offset {
-                        0x004 => self.gpio_in,
+                        0x004 => self.gpio_in.load(Ordering::Relaxed),
                         0x008 => self.read_gpio_hi_in(),
                         _ => self.sio.read32(reg_offset, core as usize),
                     };
@@ -2723,7 +2734,7 @@ impl Bus {
                     addr
                 );
                 match reg_offset {
-                    0x004 => self.gpio_in,
+                    0x004 => self.gpio_in.load(Ordering::Relaxed),
                     0x008 => self.read_gpio_hi_in(),
                     _ => {
                         self.sio.read32(reg_offset, core as usize)
@@ -3211,7 +3222,7 @@ impl CoreBus for Bus {
 
     #[inline(always)]
     fn gpio_read_in(&self) -> u32 {
-        self.gpio_in
+        self.gpio_in.load(Ordering::Relaxed)
     }
 
     #[inline(always)]

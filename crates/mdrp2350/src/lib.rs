@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub mod core;
 pub mod core_riscv;
@@ -215,12 +216,12 @@ impl Emulator {
         for pio in &mut self.bus.pio {
             pio.reset();
         }
-        self.bus.gpio_in = 0;
+        self.bus.gpio_in.store(0, Ordering::Relaxed);
         // External-input stimulus (harness-owned pin forcing) survives
         // reset only if the harness re-applies it post-reset. Clearing
         // here matches the real-silicon model: any host stimulus must
         // be re-asserted after a chip reset.
-        self.bus.gpio_external_in = 0;
+        self.bus.gpio_external_in.store(0, Ordering::Relaxed);
         self.bus.gpio_external_mask = 0;
 
         // Drop PLL lock-arm state so a post-reset power-up re-arms the
@@ -450,7 +451,7 @@ impl Emulator {
     /// Advance peripherals by `cycles` virtual cycles. Called once at the
     /// end of each quantum.
     fn tick_peripherals(&mut self, cycles: u32) {
-        let gpio_in = self.bus.gpio_in;
+        let gpio_in = self.bus.gpio_in.load(Ordering::Relaxed);
         let resets = self.bus.resets_state;
         // PIO0/1/2 are gated by their RESETS bits — real hardware holds
         // PIO inert while its reset line is asserted. RESET_PIO0..2 are
@@ -570,13 +571,15 @@ impl Emulator {
             out = (out & !pio_mask) | (pio.pad_out & pio_mask);
         }
         let ext_mask = self.bus.gpio_external_mask;
-        let ext_val = self.bus.gpio_external_in;
-        self.bus.gpio_in = (out & !ext_mask) | (ext_val & ext_mask);
+        let ext_val = self.bus.gpio_external_in.load(Ordering::Relaxed);
+        self.bus
+            .gpio_in
+            .store((out & !ext_mask) | (ext_val & ext_mask), Ordering::Relaxed);
     }
 
     /// Read a GPIO pin from the merged pin state.
     pub fn gpio_read(&self, pin: u8) -> bool {
-        (self.bus.gpio_in >> pin) & 1 != 0
+        (self.bus.gpio_in.load(Ordering::Relaxed) >> pin) & 1 != 0
     }
 
     /// Write a GPIO pin (stub for Phase 1).
@@ -584,7 +587,7 @@ impl Emulator {
 
     /// Read all GPIO pins as a bitmask (lower 32 bits).
     pub fn gpio_read_all(&self) -> u64 {
-        self.bus.gpio_in as u64
+        self.bus.gpio_in.load(Ordering::Relaxed) as u64
     }
 
     /// Access core state. **Panics on a RISC-V emulator** — this is a

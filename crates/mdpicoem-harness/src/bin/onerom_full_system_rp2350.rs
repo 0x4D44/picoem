@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
 use mdpicoem_harness::{onerom_glue_dma, onerom_snapshot_fmt, onerom_sync};
 use mdrp2350::{Config, EmulatorBuilder};
@@ -316,7 +317,7 @@ fn main() -> ExitCode {
                 | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
             let stim_level = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
             emu.bus.gpio_external_mask = stim_mask;
-            emu.bus.gpio_external_in = stim_level;
+            emu.bus.gpio_external_in.store(stim_level, Ordering::Relaxed);
         }
 
         // Post-sync: pump the glue DMA and log observations (F.4).
@@ -324,7 +325,8 @@ fn main() -> ExitCode {
             glue_dma.tick(&mut emu.bus);
 
             let rel_cycle = after_cycles.saturating_sub(sync_cycle);
-            let data_byte = ((emu.bus.gpio_in >> GPIO_DATA_BASE) & 0xFF) as u8;
+            let data_byte =
+                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
             let pio2_drives_data =
                 ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
             obs_log.push((rel_cycle, data_byte, pio2_drives_data));

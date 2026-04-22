@@ -8680,21 +8680,22 @@ fn gpio_external_stimulus_overlays_masked_bits() {
 
     // Harness claims bit 5 and bit 10 (drive HIGH) and bit 12 (drive LOW).
     emu.bus.gpio_external_mask = (1 << 5) | (1 << 10) | (1 << 12);
-    emu.bus.gpio_external_in = (1 << 5) | (1 << 10); // bit 12 low
+    emu.bus.gpio_external_in.store((1 << 5) | (1 << 10), Ordering::Relaxed); // bit 12 low
 
     // One step. Single-quantum is fine — `update_gpio` runs inside it.
     emu.run(1);
 
+    let gpio_in = emu.bus.gpio_in.load(Ordering::Relaxed);
     // Bit 0: PIO-driven high.
-    assert_eq!(emu.bus.gpio_in & (1 << 0), 1 << 0, "PIO bit lost");
+    assert_eq!(gpio_in & (1 << 0), 1 << 0, "PIO bit lost");
     // Bits 5, 10: external stimulus high.
-    assert_eq!(emu.bus.gpio_in & (1 << 5), 1 << 5, "ext bit 5 lost");
-    assert_eq!(emu.bus.gpio_in & (1 << 10), 1 << 10, "ext bit 10 lost");
+    assert_eq!(gpio_in & (1 << 5), 1 << 5, "ext bit 5 lost");
+    assert_eq!(gpio_in & (1 << 10), 1 << 10, "ext bit 10 lost");
     // Bit 12: masked to 0 regardless of what SIO/PIO say.
-    assert_eq!(emu.bus.gpio_in & (1 << 12), 0, "ext bit 12 forced low");
+    assert_eq!(gpio_in & (1 << 12), 0, "ext bit 12 forced low");
     // Untouched bits stay 0.
     assert_eq!(
-        emu.bus.gpio_in & !((1 << 0) | (1 << 5) | (1 << 10) | (1 << 12)),
+        gpio_in & !((1 << 0) | (1 << 5) | (1 << 10) | (1 << 12)),
         0,
         "unexpected bits set in gpio_in"
     );
@@ -8714,11 +8715,15 @@ fn gpio_external_mask_zero_is_noop() {
 
     // No external stimulus.
     emu.bus.gpio_external_mask = 0;
-    emu.bus.gpio_external_in = 0xFFFF_FFFF; // set but masked out
+    emu.bus.gpio_external_in.store(0xFFFF_FFFF, Ordering::Relaxed); // set but masked out
 
     emu.run(1);
 
-    assert_eq!(emu.bus.gpio_in, 0x0000_005A, "legacy update_gpio path broken");
+    assert_eq!(
+        emu.bus.gpio_in.load(Ordering::Relaxed),
+        0x0000_005A,
+        "legacy update_gpio path broken"
+    );
 }
 
 /// External stimulus written between `step()` calls must be visible to the
@@ -8763,7 +8768,7 @@ fn gpio_external_in_visible_first_cycle_after_write() {
     // and BEFORE the first step — i.e. the classic "just wrote a pin,
     // what does the CPU see on the next fetch" scenario.
     emu.bus.gpio_external_mask = 1 << 3;
-    emu.bus.gpio_external_in = 1 << 3;
+    emu.bus.gpio_external_in.store(1 << 3, Ordering::Relaxed);
 
     emu.run(1);
 
@@ -8776,7 +8781,7 @@ fn gpio_external_in_visible_first_cycle_after_write() {
          (expected bit 3 set because gpio_external_mask/in were written \
          before run(1)); bus.gpio_in now = {:#010x}",
         r0,
-        emu.bus.gpio_in,
+        emu.bus.gpio_in.load(Ordering::Relaxed),
     );
 }
 
@@ -9347,7 +9352,7 @@ fn sio_gpio_out_byte_write_replicates_across_lanes() {
     emu.run(1);
     // Bits 16..23 reflect `0xA5` — masked against `PIN_MASK` (bits
     // 0..29), they still span the full byte (16..23 all valid).
-    let pins_16_23 = (emu.bus.gpio_in >> 16) & 0xFF;
+    let pins_16_23 = (emu.bus.gpio_in.load(Ordering::Relaxed) >> 16) & 0xFF;
     assert_eq!(
         pins_16_23, 0xA5,
         "pins 16..23 must reflect replicated byte 0xA5, got {:#04x}",

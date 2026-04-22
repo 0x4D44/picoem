@@ -203,11 +203,16 @@ impl ThreadedEmulator {
             xip_sram,
             flash_loaded,
         ));
+        // `gpio_in` and `gpio_external_in` are `AtomicU32` on `Bus`
+        // (Phase 2 of the OneROM CPU speed-grade oracle). The threaded
+        // `AtomicGpio` carries its own atomics, so lift the current
+        // values out at handoff with `Ordering::Relaxed` — consistent
+        // with every other reader/writer of these fields.
         let shared_gpio = Arc::new(AtomicGpio::seed(
             sio.gpio_out,
             sio.gpio_oe,
-            gpio_in,
-            gpio_external_in,
+            gpio_in.load(Ordering::Relaxed),
+            gpio_external_in.load(Ordering::Relaxed),
             gpio_external_mask,
         ));
         let shared_sio = Arc::new(ThreadedSio::seed(&sio));
@@ -2077,7 +2082,7 @@ mod tests {
 
         // Harness-style external stimulus forces bit 8 high. Seeded into
         // the packed `external` AtomicU64 by `AtomicGpio::seed`.
-        emu.bus.gpio_external_in = EXT_BIT;
+        emu.bus.gpio_external_in.store(EXT_BIT, Ordering::Relaxed);
         emu.bus.gpio_external_mask = EXT_BIT;
 
         // Enable core 0 SysTick (ENABLE=1, RVR=1000, CVR=1000) and

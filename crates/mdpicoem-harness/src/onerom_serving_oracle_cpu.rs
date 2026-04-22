@@ -32,6 +32,7 @@
 //! here for CPU-serve semantics.
 
 use std::fmt::Write as _;
+use std::sync::atomic::Ordering;
 
 use mdrp2350::{Bus, Emulator};
 
@@ -256,14 +257,14 @@ impl CpuServingOracle {
 
         // 1. Gap drive — CS1/CS2/CS3 all high, addr=0.
         let gap_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-        emu.bus.gpio_external_in = gap_level;
+        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
         for _ in 0..GAP_CYCLES {
             emu.run(1);
         }
 
         // 2. Apply stimulus.
         let stim_level = stimulus_level_pub(case.addr_bits);
-        emu.bus.gpio_external_in = stim_level;
+        emu.bus.gpio_external_in.store(stim_level, Ordering::Relaxed);
 
         // The CPU's serve loop looks up shadow[pins_low_16]. The pins
         // the CPU samples are the 16-bit pattern the stim applies — which
@@ -286,7 +287,8 @@ impl CpuServingOracle {
             // bus's `update_gpio` merge. Data bits 16..23 are CPU-driven
             // so they reflect whatever the CPU's STRB has pushed via
             // SIO_GPIO_OUT.
-            let data_byte = ((emu.bus.gpio_in >> GPIO_DATA_BASE) & 0xFF) as u8;
+            let data_byte =
+                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
 
             if let Some(d) = observe_tick(&mut state, tick, oe_data, data_byte) {
                 decision = Some(d);
@@ -329,7 +331,7 @@ impl CpuServingOracle {
         let post = apply_envelope(raw);
 
         // Leave the bus in gap-level state for the next case.
-        emu.bus.gpio_external_in = gap_level;
+        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
 
         self.results.push(post);
         self.results.last().unwrap()
@@ -913,7 +915,10 @@ pub fn force_rom_set_index_via_sel_pins(
     // are shared bus fields and a future caller may stage other pins
     // alongside).
     emu.bus.gpio_external_mask |= mask;
-    emu.bus.gpio_external_in = (emu.bus.gpio_external_in & !mask) | (value & mask);
+    let prev = emu.bus.gpio_external_in.load(Ordering::Relaxed);
+    emu.bus
+        .gpio_external_in
+        .store((prev & !mask) | (value & mask), Ordering::Relaxed);
     Ok(())
 }
 
@@ -1399,7 +1404,7 @@ mod tests {
                 "mask for index {}", index
             );
             assert_eq!(
-                emu.bus.gpio_external_in, expected_val,
+                emu.bus.gpio_external_in.load(Ordering::Relaxed), expected_val,
                 "value for index {}", index
             );
         }

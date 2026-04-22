@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
 use mdrp2350::{Config, EmulatorBuilder};
 
@@ -80,7 +81,7 @@ fn main() -> ExitCode {
     // Baseline stimulus: CS1 low, CS2/CS3 high (A11=A12=1), all low bits 0.
     let stim: u32 = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
     emu.bus.gpio_external_mask = ext_mask;
-    emu.bus.gpio_external_in = stim;
+    emu.bus.gpio_external_in.store(stim, Ordering::Relaxed);
 
     // Run until PIO1/PIO2 CTRL stay 0 AND PC is circulating in a narrow
     // range for many instructions. Track OEN transitions to surface
@@ -193,7 +194,7 @@ fn main() -> ExitCode {
     println!();
     println!("Applying CS1-low stim (0x1800 baseline)...");
     let stim_level_cs1_low: u32 = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3); // CS1 at bit 13 clear
-    emu.bus.gpio_external_in = stim_level_cs1_low;
+    emu.bus.gpio_external_in.store(stim_level_cs1_low, Ordering::Relaxed);
     for n in 0..500u64 {
         emu.run(1);
         let oe = emu.bus.read32(0xD000_0020, 0);
@@ -205,7 +206,7 @@ fn main() -> ExitCode {
                 emu.core(0).regs.pc(),
                 (oe >> 16) & 0xFF,
                 (out >> 16) & 0xFF,
-                emu.bus.gpio_in,
+                emu.bus.gpio_in.load(Ordering::Relaxed),
             );
             break;
         }
@@ -235,7 +236,7 @@ fn main() -> ExitCode {
     println!();
     println!("Steady-state CS1-low stim for 200 ticks (tracking OEN + PC + OUT):");
     let cs1_low_stim: u32 = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-    emu.bus.gpio_external_in = cs1_low_stim;
+    emu.bus.gpio_external_in.store(cs1_low_stim, Ordering::Relaxed);
     for t in 0..200u32 {
         emu.run(1);
         let oe = emu.bus.read32(0xD000_0030, 0);
@@ -253,7 +254,7 @@ fn main() -> ExitCode {
                 out,
                 r0,
                 r1 & 0xFF,
-                emu.bus.gpio_in,
+                emu.bus.gpio_in.load(Ordering::Relaxed),
             );
         }
     }
@@ -270,7 +271,7 @@ fn main() -> ExitCode {
             }
         }
         // CS1 stays low (bit 13 clear); CS2/CS3 high are already set by A11/A12 in addr.
-        emu.bus.gpio_external_in = stim;
+        emu.bus.gpio_external_in.store(stim, Ordering::Relaxed);
         // Tick until output stabilises (or give up after 200 cycles).
         let mut last_byte = 0u8;
         let mut stable_ticks = 0u32;
@@ -300,7 +301,7 @@ fn main() -> ExitCode {
         }
         let oe_final = emu.bus.read32(0xD000_0030, 0);
         let out_final = emu.bus.read32(0xD000_0010, 0);
-        let gpio_in_final = emu.bus.gpio_in;
+        let gpio_in_final = emu.bus.gpio_in.load(Ordering::Relaxed);
         let r0_final = emu.core(0).regs.r[0];
         let r1_final = emu.core(0).regs.r[1];
         println!(
@@ -317,7 +318,7 @@ fn main() -> ExitCode {
         );
         // De-assert CS1 between cases.
         let cs_high = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-        emu.bus.gpio_external_in = cs_high;
+        emu.bus.gpio_external_in.store(cs_high, Ordering::Relaxed);
         for _ in 0..12 {
             emu.run(1);
         }
@@ -349,7 +350,7 @@ fn main() -> ExitCode {
     }
 
     // Final snapshot: GPIO_IN/OUT/OEN
-    let gpio_in = emu.bus.gpio_in;
+    let gpio_in = emu.bus.gpio_in.load(Ordering::Relaxed);
     let gpio_out = emu.bus.read32(0xD000_0010, 0);
     let gpio_oe = emu.bus.read32(0xD000_0020, 0);
     println!();

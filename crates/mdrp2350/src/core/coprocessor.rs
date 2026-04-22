@@ -702,6 +702,8 @@ impl CortexM33 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use crate::bus::Bus;
     use crate::core::CortexM33;
     use crate::core::Fault;
@@ -1047,7 +1049,7 @@ mod tests {
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
-        bus.gpio_in = 0xA5A5_A5A5;
+        bus.gpio_in.store(0xA5A5_A5A5, Ordering::Relaxed);
         // opc1=2 (IN bank), CRn=0, CRm=0 -> lo_in_get, MRC into r8.
         let (hw0, hw1) = encode_mrc_full(0, 2, 0, 8, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
@@ -1060,7 +1062,7 @@ mod tests {
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 0);
 
-        bus.gpio_in = 0xA5A5_A5A5;
+        bus.gpio_in.store(0xA5A5_A5A5, Ordering::Relaxed);
         // 0xA5 = 1010 0101: bit 2 = 1, bit 3 = 0, bit 5 = 1.
         // Pin 0 is unreachable per-bit under the HLD encoding (CRn=0,CRm=0
         // is the bulk slot), so exercise pins 2 and 3 instead.
