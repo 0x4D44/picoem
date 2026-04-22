@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use mdpicoem_harness::{onerom_serving_oracle, onerom_serving_oracle_cpu};
 use mdrp2350::{Config, EmulatorBuilder};
@@ -263,8 +264,12 @@ fn main() -> ExitCode {
 
     // Per-case sweep.
     let total = onerom_serving_oracle_cpu::CPU_DEFAULT_CASES.len();
+    let mut wall_us: Vec<f64> = Vec::with_capacity(total);
     for (idx, case) in onerom_serving_oracle_cpu::CPU_DEFAULT_CASES.iter().enumerate() {
+        let t0 = Instant::now();
         let result = oracle.run_case(&mut emu, *case);
+        let elapsed_us = t0.elapsed().as_nanos() as f64 / 1000.0;
+        wall_us.push(elapsed_us);
         let verdict_str = format_verdict_short(&result.verdict);
         let expected = result
             .expected_byte
@@ -279,7 +284,7 @@ fn main() -> ExitCode {
             .map(|c| format!("{}", c))
             .unwrap_or_else(|| "—".to_string());
         println!(
-            "[{:>2}/{:>2}] {:<16} addr=0x{:04X} verdict={:<18} expected={} observed={} cycles={}",
+            "[{:>2}/{:>2}] {:<16} addr=0x{:04X} verdict={:<18} expected={} observed={} cycles={} wall={:.3} us",
             idx + 1,
             total,
             result.case.label,
@@ -288,6 +293,7 @@ fn main() -> ExitCode {
             expected,
             observed,
             cycles,
+            elapsed_us,
         );
     }
 
@@ -295,6 +301,19 @@ fn main() -> ExitCode {
     println!();
     let sys_clk_hz = emu.bus.sys_clk_hz();
     print!("{}", oracle.format_report(sys_clk_hz));
+
+    // Wall-clock summary.
+    let n = wall_us.len() as f64;
+    let total_us: f64 = wall_us.iter().sum();
+    let mean_us = total_us / n;
+    let min_us = wall_us.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_us = wall_us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    println!();
+    println!("wall-clock per case (host-measured, this run) (us):");
+    println!("  min  : {:>8.3}", min_us);
+    println!("  mean : {:>8.3}", mean_us);
+    println!("  max  : {:>8.3}", max_us);
+    println!("  total: {:.3} ms over {} cases", total_us / 1000.0, total);
 
     // Exit code: pass iff every case is Pass.
     let results = oracle.results();
