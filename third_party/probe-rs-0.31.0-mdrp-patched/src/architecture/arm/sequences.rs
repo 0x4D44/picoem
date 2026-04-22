@@ -21,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    ArmError, DapAccess, FullyQualifiedApAddress, Pins,
+    AdiVersion, ArmError, DapAccess, FullyQualifiedApAddress, Pins,
     ap::AccessPortError,
     armv6m::Demcr,
     communication_interface::DapProbe,
@@ -445,6 +445,20 @@ pub(crate) fn cortex_m_wait_for_reset(
 ///
 /// Should be implemented on a custom handle for chips that require special sequence code.
 pub trait ArmDebugSequence: Send + Sync + Debug {
+    /// Return the ADI (Arm Debug Interface) architecture version this target implements.
+    ///
+    /// The default is [`AdiVersion::V5`], which preserves upstream behaviour for all
+    /// targets that previously relied on DPIDR-derived version detection. Vendor
+    /// sequences override this to return [`AdiVersion::V6`] on targets that require
+    /// ADIv6 (V2-AP) addressing regardless of DPIDR.version — matching OpenOCD's
+    /// `dap create ... -adiv6` Tcl declaration model.
+    ///
+    /// See `wrk_docs/2026.04.22 - HLD - Track A.2c Refined — DPv2 V2-AP addressing.md`
+    /// §2 for the motivation.
+    fn adi_version(&self) -> AdiVersion {
+        AdiVersion::V5
+    }
+
     /// Assert a system-wide reset line nRST. This is based on the
     /// `ResetHardwareAssert` function from the [ARM SVD Debug Description].
     ///

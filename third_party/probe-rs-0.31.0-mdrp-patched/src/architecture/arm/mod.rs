@@ -185,3 +185,32 @@ pub fn valid_32bit_arm_address(address: u64) -> Result<u32, ArmError> {
         .try_into()
         .map_err(|_| ArmError::AddressOutOf32BitAddressSpace)
 }
+
+/// Target-declared ADI (Arm Debug Interface) architecture version.
+///
+/// Declared by a vendor [`ArmDebugSequence`](crate::architecture::arm::sequences::ArmDebugSequence)
+/// implementation and used by the communication interface to decide how to address
+/// access ports — independently of the DPIDR-reported `DebugPortVersion`.
+///
+/// This mirrors OpenOCD's `dap create ... -adiv6` Tcl declaration (see
+/// `wrk_docs/2026.04.22 - HLD - Track A.2c Refined — DPv2 V2-AP addressing.md` §2.1),
+/// where ADIv6 is a user-config flag, not inferred from DPIDR. Needed on targets
+/// (e.g. RP2354) where the DP mis-reports its version on the first read but
+/// expects ADIv6 SELECT encoding for V2-AP access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdiVersion {
+    /// ADIv5 — DPv0/DPv1/DPv2 with V1-shaped APs.
+    #[default]
+    V5,
+    /// ADIv6 — DPv3 with V2-shaped APs (32-bit AP base addresses).
+    V6,
+}
+
+impl std::fmt::Display for AdiVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdiVersion::V5 => f.write_str("ADIv5"),
+            AdiVersion::V6 => f.write_str("ADIv6"),
+        }
+    }
+}
