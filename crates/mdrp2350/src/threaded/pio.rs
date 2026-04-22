@@ -79,8 +79,10 @@ pub struct ThreadedPio {
     // cached line.
     pads: [Aligned<AtomicU64>; PIO_BLOCKS],
 
-    // Cold-path command queue (CPU → PIO thread)
-    commands: Mutex<Vec<PioCommand>>,
+    // Cold-path command queue (CPU → PIO thread). Per-block so the
+    // Stage B PIO worker split drains its own queue without contending
+    // on a shared mutex against the other two PIO workers.
+    commands: [Mutex<Vec<PioCommand>>; PIO_BLOCKS],
 }
 
 /// Cold-path commands sent from CPU workers to the PIO thread.
@@ -121,6 +123,29 @@ pub enum PioCommand {
     /// per-SM EXECCTRL / SHIFTCTRL / INSTR / PINCTRL, and any PIO offset
     /// the two purpose-built variants above do not route.
     WriteReg { block: u8, offset: u16, val: u32, alias: u8 },
+    /// Test-only panic-injection variant (HLD V5 §2.2). The
+    /// `apply_pio_command` arm for this variant unconditionally panics
+    /// with a message containing `pio{block}` so the Stage B.2 per-block
+    /// worker split's panic-naming + reassembly tests (§4 item 5) can
+    /// route a panic to a specific PIO worker via the block field.
+    #[cfg(test)]
+    TestPanic { block: u8 },
+}
+
+impl PioCommand {
+    /// Which PIO block this command targets. `send_command` uses this
+    /// to route into the per-block command queue so each Stage B.2 PIO
+    /// worker drains only the commands addressed to its own block.
+    pub fn block(&self) -> u8 {
+        match *self {
+            PioCommand::WriteInstrMem { block, .. }
+            | PioCommand::SetClkDiv { block, .. }
+            | PioCommand::WriteCtrl { block, .. }
+            | PioCommand::WriteReg { block, .. } => block,
+            #[cfg(test)]
+            PioCommand::TestPanic { block } => block,
+        }
+    }
 }
 
 impl ThreadedPio {
@@ -137,11 +162,12 @@ impl ThreadedPio {
             dreq: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
             pads: std::array::from_fn(|_| Aligned(AtomicU64::new(0))),
             // Preallocate for the common setup-heavy case (INSTR_MEM 32
-            // slots × up to 3 blocks = 96 writes + per-SM setup). Keeps
-            // the first-quantum firmware init path from thrashing the
-            // allocator through the push path. Subsequent quanta recycle
-            // this capacity via `drain_commands`.
-            commands: Mutex::new(Vec::with_capacity(64)),
+            // slots per block + per-SM setup). Keeps the first-quantum
+            // firmware init path from thrashing the allocator through
+            // the push path. Subsequent quanta recycle this capacity
+            // via `drain_commands`. Per-block so the Stage B.2 PIO
+            // worker split drains its own queue uncontended.
+            commands: std::array::from_fn(|_| Mutex::new(Vec::with_capacity(64))),
         }
     }
 
@@ -253,26 +279,33 @@ impl ThreadedPio {
 
     /// Queue a cold-path command for the PIO thread to drain. Used for
     /// firmware setup operations (instr memory writes, clock divider
-    /// reprogramming).
+    /// reprogramming). Routes to the per-block queue addressed by
+    /// `cmd.block()` so each Stage B.2 PIO worker drains only its own
+    /// traffic.
     pub fn send_command(&self, cmd: PioCommand) {
-        self.commands
+        debug_assert!((cmd.block() as usize) < PIO_BLOCKS, "PioCommand.block out of range");
+        let block_idx = cmd.block() as usize;
+        self.commands[block_idx]
             .lock()
             .expect("PIO command mutex poisoned")
             .push(cmd);
     }
 
-    /// Drain all pending commands. Intended for the PIO thread to call
-    /// during the coordinator phase.
+    /// Drain all pending commands for one PIO block. Intended for each
+    /// per-block PIO worker (Stage B.2) to call at quantum entry.
     ///
     /// Preserves the queue's allocated capacity across drains: `mem::take`
     /// would replace the guarded `Vec` with `Vec::new()` (cap 0), which
     /// makes the next quantum's push path reallocate from scratch. For
-    /// firmware doing heavy setup (INSTR_MEM 32×3 = 96 writes plus per-SM
-    /// configuration) the reallocation cost adds up — `mem::replace` with
-    /// a same-capacity `Vec` recycles the prior allocation so the push
-    /// path is steady-state allocation-free after the first warm-up.
-    pub fn drain_commands(&self) -> Vec<PioCommand> {
-        let mut guard = self.commands.lock().expect("PIO command mutex poisoned");
+    /// firmware doing heavy setup (INSTR_MEM 32 writes plus per-SM
+    /// configuration per block) the reallocation cost adds up — `mem::replace`
+    /// with a same-capacity `Vec` recycles the prior allocation so the
+    /// push path is steady-state allocation-free after the first warm-up.
+    pub fn drain_commands(&self, block_idx: usize) -> Vec<PioCommand> {
+        debug_assert!(block_idx < PIO_BLOCKS);
+        let mut guard = self.commands[block_idx]
+            .lock()
+            .expect("PIO command mutex poisoned");
         let cap = guard.capacity();
         std::mem::replace(&mut *guard, Vec::with_capacity(cap))
     }
@@ -291,11 +324,11 @@ impl ThreadedPio {
             self.irq_flags[block].store(0, Relaxed);
             self.dreq[block].store(0, Relaxed);
             self.pads[block].store(0, Release);
+            self.commands[block]
+                .lock()
+                .expect("PIO command mutex poisoned")
+                .clear();
         }
-        self.commands
-            .lock()
-            .expect("PIO command mutex poisoned")
-            .clear();
     }
 }
 
@@ -367,6 +400,8 @@ mod tests {
     #[test]
     fn command_send_drain() {
         let pio = ThreadedPio::new();
+        // Both commands target block 0 so they land in the same per-block
+        // queue and retain their relative ordering on drain.
         pio.send_command(PioCommand::WriteInstrMem {
             block: 0,
             addr: 5,
@@ -374,14 +409,14 @@ mod tests {
             alias: 0,
         });
         pio.send_command(PioCommand::SetClkDiv {
-            block: 1,
+            block: 0,
             sm: 2,
             int_div: 100,
             frac_div: 7,
             alias: 0,
         });
 
-        let drained = pio.drain_commands();
+        let drained = pio.drain_commands(0);
         assert_eq!(drained.len(), 2);
         assert_eq!(
             drained[0],
@@ -395,7 +430,7 @@ mod tests {
         assert_eq!(
             drained[1],
             PioCommand::SetClkDiv {
-                block: 1,
+                block: 0,
                 sm: 2,
                 int_div: 100,
                 frac_div: 7,
@@ -404,14 +439,124 @@ mod tests {
         );
 
         // After drain, queue is empty.
-        assert!(pio.drain_commands().is_empty());
+        assert!(pio.drain_commands(0).is_empty());
     }
 
     #[test]
     fn drain_empty() {
         let pio = ThreadedPio::new();
-        let drained = pio.drain_commands();
+        let drained = pio.drain_commands(0);
         assert!(drained.is_empty());
+    }
+
+    /// HLD V5 §4 — `send_command` must route each command into the
+    /// queue addressed by `cmd.block()` so each per-block PIO worker
+    /// (Stage B.2) drains only its own traffic.
+    #[test]
+    fn send_routes_by_block() {
+        let pio = ThreadedPio::new();
+        pio.send_command(PioCommand::WriteInstrMem {
+            block: 0,
+            addr: 0,
+            value: 0x0001,
+            alias: 0,
+        });
+        pio.send_command(PioCommand::WriteInstrMem {
+            block: 0,
+            addr: 1,
+            value: 0x0002,
+            alias: 0,
+        });
+        pio.send_command(PioCommand::WriteInstrMem {
+            block: 2,
+            addr: 0,
+            value: 0x0003,
+            alias: 0,
+        });
+
+        assert_eq!(pio.drain_commands(0).len(), 2);
+        assert_eq!(pio.drain_commands(1).len(), 0);
+        assert_eq!(pio.drain_commands(2).len(), 1);
+    }
+
+    /// HLD V5 §4 — each per-block queue must independently preserve its
+    /// allocated capacity across drains. The existing
+    /// `drain_preserves_capacity` covers block 0; this exercises 1 and 2.
+    #[test]
+    fn drain_preserves_capacity_per_block() {
+        for block_idx in [1usize, 2] {
+            let pio = ThreadedPio::new();
+            // Push enough to force at least one grow past the initial 64.
+            for i in 0..128u32 {
+                pio.send_command(PioCommand::WriteReg {
+                    block: block_idx as u8,
+                    offset: 0x010,
+                    val: i,
+                    alias: 0,
+                });
+            }
+            let cap_before = pio.commands[block_idx].lock().unwrap().capacity();
+            assert!(
+                cap_before >= 128,
+                "block {block_idx}: capacity should have grown to hold 128 entries"
+            );
+
+            let drained = pio.drain_commands(block_idx);
+            assert_eq!(drained.len(), 128);
+
+            let cap_after = pio.commands[block_idx].lock().unwrap().capacity();
+            assert_eq!(
+                cap_after, cap_before,
+                "block {block_idx}: drain must preserve capacity ({cap_before} -> {cap_after})",
+            );
+        }
+    }
+
+    /// HLD V5 §4 — `reset` must clear every per-block queue, not just
+    /// block 0.
+    #[test]
+    fn reset_clears_all_block_queues() {
+        let pio = ThreadedPio::new();
+        for block in 0..PIO_BLOCKS as u8 {
+            pio.send_command(PioCommand::WriteReg {
+                block,
+                offset: 0x010,
+                val: u32::from(block),
+                alias: 0,
+            });
+        }
+        // Pre-reset: each queue has one command.
+        for block_idx in 0..PIO_BLOCKS {
+            assert_eq!(
+                pio.commands[block_idx].lock().unwrap().len(),
+                1,
+                "block {block_idx} should have one queued command pre-reset"
+            );
+        }
+
+        pio.reset();
+
+        for block_idx in 0..PIO_BLOCKS {
+            assert!(
+                pio.drain_commands(block_idx).is_empty(),
+                "block {block_idx} queue must be empty after reset"
+            );
+        }
+    }
+
+    /// HLD V5 §4 — `PioCommand::block()` must report the target block
+    /// for every production variant.
+    #[test]
+    fn pio_command_block_accessor() {
+        let cases = [
+            PioCommand::WriteInstrMem { block: 7, addr: 0, value: 0, alias: 0 },
+            PioCommand::SetClkDiv { block: 7, sm: 0, int_div: 1, frac_div: 0, alias: 0 },
+            PioCommand::WriteCtrl { block: 7, val: 0, alias: 0 },
+            PioCommand::WriteReg { block: 7, offset: 0, val: 0, alias: 0 },
+        ];
+        for cmd in &cases {
+            assert_eq!(cmd.block(), 7, "block() accessor must return 7 for {cmd:?}");
+        }
     }
 
     /// HLD V5 §4 item 11 — regression guard for the `Aligned<T>`
@@ -450,13 +595,13 @@ mod tests {
                 alias: 0,
             });
         }
-        let cap_before = pio.commands.lock().unwrap().capacity();
+        let cap_before = pio.commands[0].lock().unwrap().capacity();
         assert!(cap_before >= 128, "capacity should have grown to hold 128 entries");
 
-        let drained = pio.drain_commands();
+        let drained = pio.drain_commands(0);
         assert_eq!(drained.len(), 128);
 
-        let cap_after = pio.commands.lock().unwrap().capacity();
+        let cap_after = pio.commands[0].lock().unwrap().capacity();
         assert_eq!(
             cap_after, cap_before,
             "drain must preserve capacity ({} -> {})",

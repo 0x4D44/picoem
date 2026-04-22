@@ -686,8 +686,14 @@ fn pio_worker_body(
     rec.on_worker_entry();
 
     for _ in 0..n {
-        for cmd in shared.pio.drain_commands() {
-            apply_pio_command(&mut blocks, &shared.pio, cmd);
+        // Stage B.1: per-block command queues. Drain each block's queue
+        // and dispatch through the existing `apply_pio_command` routing.
+        // Stage B.2 will split this loop across three per-block worker
+        // threads; until then one worker owns all three blocks.
+        for block_idx in 0..super::pio::PIO_BLOCKS {
+            for cmd in shared.pio.drain_commands(block_idx) {
+                apply_pio_command(&mut blocks, &shared.pio, cmd);
+            }
         }
 
         // GPIO_IN snapshot once per quantum — parity with the
@@ -797,6 +803,17 @@ fn apply_pio_command(
             // future `PioBlock::write32` extension ends up toggling
             // `enabled` outside CTRL.
             shared_pio.write_sm_enabled(b, blocks[b].sm_enabled_mask());
+        }
+        // Stage B.2 panic-injection hook (HLD V5 §2.2 / §4 item 5). The
+        // `pio{block}` substring is load-bearing — the worker-split tests
+        // assert on it to prove the panic surfaced on the specific PIO
+        // worker addressed by the command's block field. `#[cfg(test)]`
+        // keeps the arm — and therefore the `panic!` — out of release
+        // builds, so `PioCommand`'s exhaustive match compiles clean in
+        // production.
+        #[cfg(test)]
+        PioCommand::TestPanic { block } => {
+            panic!("PioCommand::TestPanic fired from pio{}", block);
         }
     }
 }
@@ -1361,7 +1378,7 @@ mod tests {
 
         // Drain + apply as the PIO worker would at quantum entry.
         let mut blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
-        for cmd in threaded.shared.pio.drain_commands() {
+        for cmd in threaded.shared.pio.drain_commands(0) {
             apply_pio_command(&mut blocks, &threaded.shared.pio, cmd);
         }
 
@@ -1374,6 +1391,20 @@ mod tests {
         // Other blocks unaffected.
         assert_eq!(threaded.shared.pio.read_sm_enabled(1), 0);
         assert_eq!(threaded.shared.pio.read_sm_enabled(2), 0);
+    }
+
+    /// Smoke test that the `#[cfg(test)]` `TestPanic` arm in
+    /// `apply_pio_command` panics with the `pio{block}` substring the
+    /// Stage B.2 / B.4 end-to-end worker-split tests rely on. Catches
+    /// format-string regressions before the worker-panic integration
+    /// tests land.
+    #[test]
+    #[should_panic(expected = "pio1")]
+    fn apply_pio_command_test_panic_arm_fires() {
+        let pio = super::ThreadedPio::new();
+        let mut blocks: [PioBlock; 3] =
+            [PioBlock::new(), PioBlock::new(), PioBlock::new()];
+        apply_pio_command(&mut blocks, &pio, PioCommand::TestPanic { block: 1 });
     }
 
     /// A CTRL write landing through `WorkerBus::ahb_write32` must
@@ -1393,7 +1424,7 @@ mod tests {
         bus.write32(0x5030_0000, 0b1010, 0);
 
         // Command must be queued (not dropped silently).
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(1);
         assert_eq!(pending.len(), 1, "CTRL write must queue exactly one command");
         assert_eq!(
             pending[0],
@@ -1425,7 +1456,7 @@ mod tests {
         let insn: u32 = 0x0000_E080; // arbitrary PIO opcode-shaped word
         bus.write32(0x5020_0064, insn, 0);
 
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(0);
         assert_eq!(pending.len(), 1, "INSTR_MEM write must queue one command");
         assert_eq!(
             pending[0],
@@ -1459,7 +1490,7 @@ mod tests {
         let val = ((int_div as u32) << 16) | ((frac_div as u32) << 8);
         bus.write32(0x5040_0110, val, 0);
 
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(2);
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0],
@@ -1483,7 +1514,7 @@ mod tests {
         // PIO0 IRQ at 0x5020_0030 (W1C, alias 0).
         bus.write32(0x5020_0030, 0x0000_000F, 0);
 
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(0);
         assert_eq!(pending.len(), 2, "two non-fast-path writes → two commands");
         assert_eq!(
             pending[0],
@@ -1578,7 +1609,7 @@ mod tests {
         let set_alias_addr = 0x5020_0064 + 0x2000;
         bus.write32(set_alias_addr, 0x0000_DEAD, 0);
 
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(0);
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0],
@@ -1609,7 +1640,7 @@ mod tests {
         let val = ((int_div as u32) << 16) | ((frac_div as u32) << 8);
         bus.write32(xor_alias_addr, val, 0);
 
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(0);
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0],
@@ -1642,7 +1673,7 @@ mod tests {
             bus.write32(0x5020_0000, 0b0001, 0);
         }
         let mut blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
-        for cmd in threaded.shared.pio.drain_commands() {
+        for cmd in threaded.shared.pio.drain_commands(0) {
             apply_pio_command(&mut blocks, &threaded.shared.pio, cmd);
         }
         assert_eq!(blocks[0].sm_enabled_mask(), 0b0001);
@@ -1654,7 +1685,7 @@ mod tests {
             let mut bus = WorkerBus::new(0, threaded.shared.clone());
             bus.write32(0x5020_0000 + 0x2000, 0b0100, 0);
         }
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(0);
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0],
@@ -1743,7 +1774,7 @@ mod tests {
             bus.write32(0x5020_0030, 0x0000_0001, 0);
         }
 
-        let pending = threaded.shared.pio.drain_commands();
+        let pending = threaded.shared.pio.drain_commands(0);
         assert_eq!(pending.len(), 5, "five MMIO writes → five commands");
         assert_eq!(
             pending[0],
