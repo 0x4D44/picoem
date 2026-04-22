@@ -413,6 +413,40 @@ fn run_one_emu_m0plus(tc: &TestCase, bus: &mut M0Bus) -> RunState {
 // Main runner
 // ============================================================================
 
+/// Attach to the target with a bounded retry loop.
+///
+/// Track A.1 Phase 2 Option F (defensive posture — see
+/// `wrk_docs/2026.04.22 - HLD - Track A.1 RP2040 Attach Fix.md` §6). The
+/// original "ARM specific error" bug was not reproducing at dispatch time;
+/// this wrapper is belt-and-braces against residual flakiness. If every
+/// attempt fails, the last error is returned unchanged so the Phase 0b
+/// source-chain walker in `main()` still surfaces the concrete variant.
+fn attach_with_retry(
+    chip: &str,
+    selector: Option<&DebugProbeSelector>,
+    max_attempts: usize,
+) -> Result<Session, probe_rs::Error> {
+    let mut last_err: Option<probe_rs::Error> = None;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            tracing::info!("attach retry {attempt}/{max_attempts}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let result = match selector {
+            None => Session::auto_attach(chip, SessionConfig::default()),
+            Some(sel) => Lister::new()
+                .open(sel.clone())
+                .map_err(probe_rs::Error::from)
+                .and_then(|p| p.attach(chip, Permissions::default())),
+        };
+        match result {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("attach_with_retry: max_attempts must be >= 1"))
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
 
@@ -422,13 +456,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Attach to target via probe-rs. With --probe, route through the
     // explicit selector to disambiguate multiple attached probes (see HLD
     // §2.1 — `auto_attach` just picks the first-enumerated probe).
-    let mut session = match args.probe.as_ref() {
-        None => Session::auto_attach("rp2040", SessionConfig::default())?,
-        Some(selector) => {
-            let probe = Lister::new().open(selector.clone())?;
-            probe.attach("rp2040", Permissions::default())?
-        }
-    };
+    //
+    // Bounded retry as defensive posture against residual attach flakiness.
+    // See wrk_docs/2026.04.22 - HLD - Track A.1 RP2040 Attach Fix.md §6
+    // Option F. If retries exhaust, the final error is returned unchanged so
+    // the Phase 0b source-chain walker in `main()` surfaces the real variant.
+    let mut session = attach_with_retry("rp2040", args.probe.as_ref(), 3)?;
     let mut core = session.core(0)?;
     println!("Attached to target, using core 0");
 
