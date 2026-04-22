@@ -2454,4 +2454,94 @@ mod tests {
             );
         }
     }
+
+    // ----- HLD V5 §4 item 6: OneROM-shape soak ---------------------------
+
+    /// HLD V5 §4 item 6 — `ThreadedEmulator` runs an OneROM-shape workload
+    /// (PIO0 idle, PIO1 SM0 enabled, PIO2 SM0+SM1 enabled) for
+    /// `min(60 s wall, 10^8 quanta)` with `debug_assertions` on, under
+    /// the bench default `step_quantum = 256` (§8 gates on the throughput
+    /// regime, not the barrier-dominated `sq=64` regime). The runtime
+    /// must complete without panicking and without poisoning the instance.
+    ///
+    /// Termination: whichever of wall-clock 60 s or 10^8 quanta fires
+    /// first, checked once per `CHUNK_QUANTA`-sized `run_quanta` call.
+    /// Final output (printed for journal capture):
+    ///  - elapsed wall time,
+    ///  - quanta completed,
+    ///  - effective throughput (`quanta * step_quantum / elapsed`).
+    #[test]
+    #[ignore = "60s stress; run explicitly via cargo test -- --ignored stress_onerom"]
+    fn stress_onerom_60s() {
+        use std::time::{Duration, Instant};
+
+        const STEP_QUANTUM: u32 = 256;
+        const MAX_QUANTA: u64 = 100_000_000;
+        const WALL_LIMIT: Duration = Duration::from_secs(60);
+        const CHUNK_QUANTA: u64 = 10_000;
+
+        // Pin per-SM programs on blocks 1 and 2 (block 0 stays idle). The
+        // existing `queue_pio_blinky_setup` helper enables SM0 only, which
+        // matches the HLD shape for PIO1. For PIO2 we additionally enable
+        // SM1 by OR-ing into the CTRL mask — the blinky helper already
+        // loaded a valid wrap-loop program at addr 0/1 that SM1 can also
+        // execute (SM1 and SM0 share instruction memory on each block).
+        let emu = crate::EmulatorBuilder::new(Config::default())
+            .step_quantum(STEP_QUANTUM)
+            .build();
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        // PIO1: SM0 enabled, driving pin 10.
+        queue_pio_blinky_setup(&threaded.shared, 1, 10);
+
+        // PIO2: SM0 enabled via the helper, driving pin 20. Then a second
+        // CTRL write enables SM1 alongside SM0 (0b0011) — SM1 re-uses
+        // the instruction memory loaded by the helper and will spin the
+        // same wrap loop. PIO2 thus runs with two SMs enabled, matching
+        // the HLD's "PIO2 with SM0 + SM1 enabled" shape.
+        queue_pio_blinky_setup(&threaded.shared, 2, 20);
+        threaded.shared.pio.send_command(PioCommand::WriteCtrl {
+            block: 2,
+            val: 0b0011,
+            alias: 0,
+        });
+
+        let start = Instant::now();
+        let mut quanta: u64 = 0;
+        loop {
+            threaded.run_quanta(CHUNK_QUANTA);
+            quanta += CHUNK_QUANTA;
+
+            let elapsed = start.elapsed();
+            if elapsed >= WALL_LIMIT || quanta >= MAX_QUANTA {
+                break;
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Contract: the runtime is not poisoned. If any worker had
+        // panicked, `run_quanta` itself would have re-raised the payload
+        // (test would already have failed); this is the belt-and-braces
+        // check that the poison flag never got flipped silently.
+        assert!(
+            !threaded.poisoned,
+            "ThreadedEmulator poisoned after OneROM-shape stress run",
+        );
+
+        let elapsed_secs = elapsed.as_secs_f64();
+        let sysclks = quanta.saturating_mul(STEP_QUANTUM as u64);
+        let throughput_hz = if elapsed_secs > 0.0 {
+            sysclks as f64 / elapsed_secs
+        } else {
+            0.0
+        };
+        println!(
+            "stress_onerom_60s: elapsed={elapsed_secs:.3}s quanta={quanta} \
+             step_quantum={STEP_QUANTUM} sysclks={sysclks} \
+             throughput={:.3} MHz",
+            throughput_hz / 1.0e6,
+        );
+    }
 }
