@@ -595,6 +595,32 @@ impl WorkerBus {
         }
     }
 
+    /// Read GPIO_IN with the freshest external-stimulus overlay.
+    ///
+    /// The coordinator's `update_gpio` merges SIO pads, PIO pad
+    /// overlays, and external stimulus into `AtomicGpio::in_` at each
+    /// quantum boundary — so between quanta, the cached `in_` is stale
+    /// w.r.t. any external-stim writes a host thread has issued in the
+    /// meantime. For OneROM-style oracles the measurement thread drives
+    /// `gpio_external_in` at sub-µs cadence while the CPU tight-loops
+    /// in its serve path; the CPU must observe those updates within a
+    /// single instruction, not wait for the next merge.
+    ///
+    /// We rebuild the overlay at read time: the non-masked bits of
+    /// `in_` carry the quantum-coherent SIO+PIO pad state (those don't
+    /// change between quanta in these workloads), and we apply the
+    /// fresh `(ext_val, ext_mask)` on top. Correct when the external
+    /// mask is stable across the read window — which holds for every
+    /// oracle that pins the same set of pads for the duration of a
+    /// sweep. If the mask changed between quanta, stale `ext_val` bits
+    /// outside the new mask can leak; no current caller trips that.
+    #[inline]
+    fn gpio_in_fresh(&self) -> u32 {
+        let base = self.shared.gpio.read_in();
+        let (ext_val, ext_mask) = self.shared.gpio.read_external();
+        (base & !ext_mask) | (ext_val & ext_mask)
+    }
+
     /// SIO (`0xD`) read32. DIV/INTERP (offsets 0x060..=0x0FC) are
     /// intercepted on `CortexM33` and never reach here.
     fn sio_read32(&mut self, addr: u32, core: u8) -> u32 {
@@ -607,8 +633,8 @@ impl WorkerBus {
 
         match reg_offset {
             0x000 => core as u32,                  // CPUID
-            0x004 => 0,                            // GPIO_IN — Stage 7 wires external pin state
-            0x008 => 0,                            // GPIO_HI_IN — ditto
+            0x004 => self.gpio_in_fresh(),         // GPIO_IN — SIO+PIO from last quantum + fresh external
+            0x008 => 0,                            // GPIO_HI_IN — bank 1 not modelled yet
             0x010 => self.shared.gpio.read_out(0), // GPIO_OUT
             0x030 => self.shared.gpio.read_oe(0),  // GPIO_OE
             // FIFO
@@ -1189,12 +1215,28 @@ impl CoreBus for WorkerBus {
                 self.ahb_write32(aligned, new_word);
             }
             0xD => {
+                // SIO GPIO_OUT family (0x010/0x018/0x020/0x028) and
+                // GPIO_OE family (0x030/0x038/0x040/0x048) replicate a
+                // narrow write across all four lanes on real RP2350
+                // silicon — the single-cycle IO fabric latches the
+                // full 32-bit bus without byte-lane enables. OneROM's
+                // CPU-serve loop relies on this: `STRB Rn, [Rm, #0]`
+                // at SIO_GPIO_OUT lights up the data pins regardless
+                // of which byte of the word the store targets. Serial
+                // `Bus::write8` mirrors this at `bus/mod.rs:1973` —
+                // keep the two paths in sync via the shared predicate.
                 let aligned = addr & !3;
-                let word = self.sio_read32(aligned, core);
-                let shift = (addr & 3) * 8;
-                let masked = word & !(0xFFu32 << shift);
-                let new_word = masked | ((val as u32) << shift);
-                self.sio_write32(aligned, new_word, core);
+                let reg_offset = aligned & 0xFFF;
+                if crate::bus::Bus::is_sio_gpio_out_replicating_reg(reg_offset) {
+                    let replicated = u32::from(val) * 0x0101_0101;
+                    self.sio_write32(aligned, replicated, core);
+                } else {
+                    let word = self.sio_read32(aligned, core);
+                    let shift = (addr & 3) * 8;
+                    let masked = word & !(0xFFu32 << shift);
+                    let new_word = masked | ((val as u32) << shift);
+                    self.sio_write32(aligned, new_word, core);
+                }
             }
             _ => {
                 self.shared.atomics.set_bus_fault(core as usize, addr);
@@ -1241,12 +1283,21 @@ impl CoreBus for WorkerBus {
                 self.ahb_write32(aligned, new_word);
             }
             0xD => {
+                // Halfword mirror of the write8 SIO arm — see the
+                // comment above. GPIO_OUT-family halfword writes
+                // replicate across both 16-bit lanes of the word.
                 let aligned = addr & !3;
-                let word = self.sio_read32(aligned, core);
-                let shift = (addr & 2) * 8;
-                let masked = word & !(0xFFFFu32 << shift);
-                let new_word = masked | ((val as u32) << shift);
-                self.sio_write32(aligned, new_word, core);
+                let reg_offset = aligned & 0xFFF;
+                if crate::bus::Bus::is_sio_gpio_out_replicating_reg(reg_offset) {
+                    let replicated = u32::from(val) * 0x0001_0001;
+                    self.sio_write32(aligned, replicated, core);
+                } else {
+                    let word = self.sio_read32(aligned, core);
+                    let shift = (addr & 2) * 8;
+                    let masked = word & !(0xFFFFu32 << shift);
+                    let new_word = masked | ((val as u32) << shift);
+                    self.sio_write32(aligned, new_word, core);
+                }
             }
             _ => {
                 self.shared.atomics.set_bus_fault(core as usize, addr);
@@ -1326,9 +1377,10 @@ impl CoreBus for WorkerBus {
     // --- GPIO OUT / OE / IN (Phase 3 Stage 6a) -----------------------
     //
     // Forward to `shared.gpio` bank 0 — RP2354 SIO only exposes bank 0
-    // on the CP0 GPIOC path. Stage 7 wires the GPIO_IN column on
-    // `AtomicGpio`; until then, `gpio_read_in` returns 0 (matching the
-    // single-threaded `Bus::gpio_in` default on fresh construction).
+    // on the CP0 GPIOC path. The GPIO_IN column is merged each quantum
+    // by the coordinator's `update_gpio` (SIO pads + per-block PIO pads
+    // + external stimulus), so CPU workers read the freshest merged
+    // state here.
 
     #[inline]
     fn gpio_read_out(&self) -> u32 {
@@ -1374,9 +1426,11 @@ impl CoreBus for WorkerBus {
 
     #[inline]
     fn gpio_read_in(&self) -> u32 {
-        // AtomicGpio has no GPIO_IN column yet; Stage 7 wires external
-        // pin state. Until then return 0, matching `gpio_in()`.
-        0
+        // Same semantics as `sio_read32(0x004)` — take the
+        // quantum-boundary SIO/PIO merge and re-overlay the external
+        // stimulus at read time so host threads driving
+        // `gpio_external_in` get sub-quantum visibility to the CPU.
+        self.gpio_in_fresh()
     }
 
     #[inline]

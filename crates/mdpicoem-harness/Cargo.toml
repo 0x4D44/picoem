@@ -111,6 +111,10 @@ name = "onerom_stress_cpu_rp2350"
 path = "src/bin/onerom_stress_cpu_rp2350.rs"
 
 [[bin]]
+name = "onerom_cpu_speed_grade_rp2350"
+path = "src/bin/onerom_cpu_speed_grade_rp2350.rs"
+
+[[bin]]
 name = "onerom_stress_pio_rp2350"
 path = "src/bin/onerom_stress_pio_rp2350.rs"
 

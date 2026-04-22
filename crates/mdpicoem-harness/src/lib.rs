@@ -48,6 +48,7 @@ pub mod gdb_client;
 pub mod ieee754_ref;
 pub mod isr_scenarios;
 pub mod isr_scenarios_rp2040;
+pub mod onerom_cpu_speed_grade;
 pub mod onerom_glue_dma;
 pub mod onerom_serving_oracle;
 pub mod onerom_serving_oracle_cpu;

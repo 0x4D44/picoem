@@ -352,6 +352,31 @@ impl ThreadedEmulator {
         }
     }
 
+    /// Program counter for core `idx` (0 or 1), read between
+    /// `run_quanta` calls. Returns `None` while a `run_quanta` is in
+    /// flight (cores are `take`n into worker threads) or if the core
+    /// was lost to a worker panic. Useful for post-run assertions like
+    /// "serve-loop PC is still in range" in OneROM speed-grade
+    /// oracles.
+    pub fn core_pc(&self, idx: u8) -> Option<u32> {
+        match idx {
+            0 => self.core0.as_ref().map(|c| c.regs.pc()),
+            1 => self.core1.as_ref().map(|c| c.regs.pc()),
+            _ => panic!("ThreadedEmulator::core_pc: idx must be 0 or 1"),
+        }
+    }
+
+    /// Borrow the `SharedState`. Exposed so harness threads can write
+    /// external pin stimulus (`shared.gpio.write_external`) and read
+    /// the merged `gpio_in` (`shared.gpio.read_in`) concurrently with
+    /// the worker threads inside `run_quanta`. Both endpoints on
+    /// [`AtomicGpio`] are internally synchronized (Release/Acquire for
+    /// `external`, Relaxed for `in_`), so the harness driving stimulus
+    /// does not need to pause the runtime.
+    pub fn shared(&self) -> &SharedState {
+        &self.shared
+    }
+
     /// Enable or disable per-worker per-quantum timing instrumentation
     /// for subsequent `run_quanta` calls. When enabled, each worker
     /// records `(phase_work_ns, barrier_wait_ns)` per quantum and the
