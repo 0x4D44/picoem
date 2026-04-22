@@ -1,6 +1,6 @@
 use crate::MemoryInterface;
 use crate::architecture::arm::{
-    ArmDebugInterface, DapAccess, FullyQualifiedApAddress, RawDapAccess, SwoAccess,
+    AdiVersion, ArmDebugInterface, DapAccess, FullyQualifiedApAddress, RawDapAccess, SwoAccess,
     ap::{
         self, AccessPortType, AddressIncrement, CSW, DataSize,
         memory_ap::{MemoryAp, MemoryApType},
@@ -107,7 +107,15 @@ impl BlackMagicProbeArmDebug {
         if let hash_map::Entry::Vacant(entry) = self.dps.entry(dp) {
             let sequence = self.sequence.clone();
 
-            entry.insert(DpState::new());
+            // Seed DpState with the target-declared ADI version (see HLD 2026.04.22 A.2c §2).
+            let adi_version = sequence.adi_version();
+            if adi_version == AdiVersion::V6 {
+                tracing::info!(
+                    "Target declared ADIv6 addressing (vendor sequence override); \
+                     SELECT cache initialised as DPv3 regardless of DPIDR.version"
+                );
+            }
+            entry.insert(DpState::new(adi_version));
 
             let start_span = tracing::debug_span!("debug_port_start").entered();
             sequence.debug_port_start(self, dp)?;
@@ -126,9 +134,10 @@ impl BlackMagicProbeArmDebug {
 
             let idr: DebugPortId = self.read_dp_register::<DPIDR>(dp)?.into();
             tracing::info!(
-                "Debug Port version: {} MinDP: {:?}",
+                "Debug Port version: {} MinDP: {:?} (target adi_version: {})",
                 idr.version,
-                idr.min_dp_support
+                idr.min_dp_support,
+                adi_version
             );
 
             let state = self
@@ -136,7 +145,9 @@ impl BlackMagicProbeArmDebug {
                 .get_mut(&dp)
                 .expect("This DP State was inserted earlier in this function");
             state.debug_port_version = idr.version;
-            if idr.version == DebugPortVersion::DPv3 {
+            if idr.version == DebugPortVersion::DPv3
+                && !matches!(state.current_select, SelectCache::DPv3(_, _))
+            {
                 state.current_select = SelectCache::DPv3(SelectV3(0), Select1(0));
             }
         } else if switched_dp {
@@ -208,12 +219,19 @@ impl ArmDebugInterface for BlackMagicProbeArmDebug {
         dp: DpAddress,
     ) -> Result<BTreeSet<FullyQualifiedApAddress>, ArmError> {
         let state = self.select_dp(dp)?;
-        match state.debug_port_version {
-            DebugPortVersion::DPv0 | DebugPortVersion::DPv1 | DebugPortVersion::DPv2 => {
-                Ok(ap::v1::valid_access_ports(self, dp).into_iter().collect())
-            }
-            DebugPortVersion::DPv3 => ap::v2::enumerate_access_ports(self, dp),
-            DebugPortVersion::Unsupported(_) => unreachable!(),
+        // Dispatch on the target-declared AdiVersion, not DPIDR.version — see
+        // HLD 2026.04.22 Track A.2c §6.
+        let adi_version = state.adi_version;
+        let debug_port_version = state.debug_port_version;
+        match adi_version {
+            AdiVersion::V6 => ap::v2::enumerate_access_ports(self, dp),
+            AdiVersion::V5 => match debug_port_version {
+                DebugPortVersion::DPv0 | DebugPortVersion::DPv1 | DebugPortVersion::DPv2 => {
+                    Ok(ap::v1::valid_access_ports(self, dp).into_iter().collect())
+                }
+                DebugPortVersion::DPv3 => ap::v2::enumerate_access_ports(self, dp),
+                DebugPortVersion::Unsupported(_) => unreachable!(),
+            },
         }
     }
 

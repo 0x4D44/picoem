@@ -1,8 +1,8 @@
 use crate::{
     CoreStatus,
     architecture::arm::{
-        ApAddress, ArmError, DapAccess, FullyQualifiedApAddress, RawDapAccess, RegisterAddress,
-        SwoAccess, SwoConfig, ap,
+        AdiVersion, ApAddress, ArmError, DapAccess, FullyQualifiedApAddress, RawDapAccess,
+        RegisterAddress, SwoAccess, SwoConfig, ap,
         dp::{
             Ctrl, DPIDR, DebugPortId, DebugPortVersion, DpAccess, DpAddress, DpRegisterAddress,
             Select1, SelectV1, SelectV3,
@@ -149,14 +149,30 @@ impl SelectCache {
 pub(crate) struct DpState {
     pub debug_port_version: DebugPortVersion,
 
+    /// Target-declared ADI version, sourced from `ArmDebugSequence::adi_version()`.
+    ///
+    /// Drives SELECT-cache initialisation and AP enumeration independently of
+    /// `debug_port_version` (which is derived from the DPIDR read and may
+    /// mis-report on some silicon — see HLD 2026.04.22 Track A.2c).
+    pub adi_version: AdiVersion,
+
     pub(crate) current_select: SelectCache,
 }
 
 impl DpState {
-    pub fn new() -> Self {
+    pub fn new(adi_version: AdiVersion) -> Self {
+        // When the target declares ADIv6 up-front, seed the SELECT cache as DPv3 so
+        // the first AP access emits standard ADIv6 wire bytes, regardless of what the
+        // subsequent DPIDR read reports. For ADIv5 targets, start as DPv1 and let
+        // `select_dp` upgrade the cache on DPv3 DPIDR observation (upstream behaviour).
+        let current_select = match adi_version {
+            AdiVersion::V5 => SelectCache::DPv1(SelectV1(0)),
+            AdiVersion::V6 => SelectCache::DPv3(SelectV3(0), Select1(0)),
+        };
         Self {
             debug_port_version: DebugPortVersion::Unsupported(0xFF),
-            current_select: SelectCache::DPv1(SelectV1(0)),
+            adi_version,
+            current_select,
         }
     }
 }
@@ -281,12 +297,23 @@ impl ArmDebugInterface for ArmCommunicationInterface {
         &mut self,
         dp: DpAddress,
     ) -> Result<BTreeSet<FullyQualifiedApAddress>, ArmError> {
-        match self.select_dp(dp).map(|state| state.debug_port_version)? {
-            DebugPortVersion::DPv0 | DebugPortVersion::DPv1 | DebugPortVersion::DPv2 => {
-                Ok(ap::v1::valid_access_ports(self, dp).into_iter().collect())
-            }
-            DebugPortVersion::DPv3 => ap::v2::enumerate_access_ports(self, dp),
-            DebugPortVersion::Unsupported(_) => unreachable!(),
+        let state = self.select_dp(dp)?;
+        // Dispatch on the target-declared AdiVersion, not DPIDR.version — see
+        // HLD 2026.04.22 Track A.2c §6. This lets an ADIv6-declared target use
+        // V2-AP enumeration even when the DP reports DPv2 in its DPIDR (e.g.
+        // RP2354 silicon). Non-declaring targets fall through to the
+        // upstream DPIDR-driven path.
+        let adi_version = state.adi_version;
+        let debug_port_version = state.debug_port_version;
+        match adi_version {
+            AdiVersion::V6 => ap::v2::enumerate_access_ports(self, dp),
+            AdiVersion::V5 => match debug_port_version {
+                DebugPortVersion::DPv0 | DebugPortVersion::DPv1 | DebugPortVersion::DPv2 => {
+                    Ok(ap::v1::valid_access_ports(self, dp).into_iter().collect())
+                }
+                DebugPortVersion::DPv3 => ap::v2::enumerate_access_ports(self, dp),
+                DebugPortVersion::Unsupported(_) => unreachable!(),
+            },
         }
     }
 
@@ -370,7 +397,18 @@ impl ArmCommunicationInterface {
         if let hash_map::Entry::Vacant(entry) = self.dps.entry(dp) {
             let sequence = self.sequence.clone();
 
-            entry.insert(DpState::new());
+            // Seed DpState with the target-declared ADI version. For ADIv6 targets this
+            // starts the SELECT cache as DPv3 before any DPIDR read happens, so the
+            // first AP access emits standard ADIv6 wire bytes — matching OpenOCD's
+            // `dap create ... -adiv6` model (see HLD 2026.04.22 Track A.2c §2).
+            let adi_version = sequence.adi_version();
+            if adi_version == AdiVersion::V6 {
+                tracing::info!(
+                    "Target declared ADIv6 addressing (vendor sequence override); \
+                     SELECT cache initialised as DPv3 regardless of DPIDR.version"
+                );
+            }
+            entry.insert(DpState::new(adi_version));
 
             let start_span = tracing::debug_span!("debug_port_start").entered();
             sequence.debug_port_start(self, dp)?;
@@ -389,9 +427,10 @@ impl ArmCommunicationInterface {
 
             let idr: DebugPortId = self.read_dp_register::<DPIDR>(dp)?.into();
             tracing::info!(
-                "Debug Port version: {} MinDP: {:?}",
+                "Debug Port version: {} MinDP: {:?} (target adi_version: {})",
                 idr.version,
-                idr.min_dp_support
+                idr.min_dp_support,
+                adi_version
             );
 
             let state = self
@@ -399,7 +438,13 @@ impl ArmCommunicationInterface {
                 .get_mut(&dp)
                 .expect("This DP State was inserted earlier in this function");
             state.debug_port_version = idr.version;
-            if idr.version == DebugPortVersion::DPv3 {
+            // Upgrade cache to DPv3 if the DPIDR reports DPv3 (upstream behaviour,
+            // preserved for ADIv5 targets whose DP turns out to be ADIv6-capable).
+            // For ADIv6-declared targets the cache is already DPv3 from DpState::new,
+            // so this is a no-op on them.
+            if idr.version == DebugPortVersion::DPv3
+                && !matches!(state.current_select, SelectCache::DPv3(_, _))
+            {
                 state.current_select = SelectCache::DPv3(SelectV3(0), Select1(0));
             }
         } else if switched_dp {
@@ -471,6 +516,10 @@ impl ArmCommunicationInterface {
                 s.set_addr(((address >> 4) & 0xFFFF_FFFF) as u32);
                 s1.set_addr((address >> 32) as u32);
             }
+            // FIXME(A.2c): dead code under AdiVersion::V6 target declaration.
+            //              Remove once Gate 3 (Option A end-to-end IDR read success)
+            //              passes on hardware. See HLD 2026.04.22 Track A.2c §6.2.
+            //
             // mdrp-patched workaround — see:
             //   https://github.com/probe-rs/probe-rs/issues/3872
             //   wrk_docs/2026.04.21 - HLD - Track A Probe-rs Attach Fix.md
@@ -482,6 +531,11 @@ impl ArmCommunicationInterface {
             // with the V2 path. The outer `previous_select != current_select`
             // check below will flush the new SELECT / SELECT1 registers to the
             // DP on this same call.
+            //
+            // Under Option A (AdiVersion::V6 declared by vendor sequence), the
+            // SELECT cache starts as DPv3 from DpState::new and never enters
+            // this arm during normal operation. Kept as belt-and-braces until
+            // Gate 3 confirms on hardware.
             (ApAddress::V2(base), cache @ SelectCache::DPv1(_)) => {
                 tracing::warn!(
                     "ApV2 access on DPv1 cache; upgrading to DPv3 (mdrp-patched workaround)"
