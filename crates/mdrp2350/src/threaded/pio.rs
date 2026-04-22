@@ -35,6 +35,30 @@ pub const PIO_BLOCKS: usize = 3;
 pub const SMS_PER_BLOCK: usize = 4;
 pub const PIO_FIFO_DEPTH: u32 = 4;
 
+/// Cache-line-aligned wrapper for per-block atomics.
+///
+/// HLD V5 §2.3 — once the PIO worker splits into three per-block
+/// workers (Stage B), each block's `pads` / `irq_flags` / `sm_enabled`
+/// / `dreq` byte would otherwise share a cache line with its siblings,
+/// creating a textbook 3-writer false-sharing hotspot on hot atomics.
+/// Aligning each element to 64 bytes puts each block's atomic on its
+/// own line; `Deref` keeps existing accessor bodies
+/// (`self.pads[block].store(...)`) unchanged — the atomic methods all
+/// take `&self`, so no `DerefMut` is needed.
+///
+/// Stage A applies the padding up-front while the worker split is
+/// still in flight; any perf delta observed with the single PIO worker
+/// is pure false-sharing win from the coord↔worker `pads` line bounce.
+#[repr(align(64))]
+pub(super) struct Aligned<T>(T);
+
+impl<T> std::ops::Deref for Aligned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 pub struct ThreadedPio {
     // TX FIFOs: CPU pushes, PIO thread pops
     tx: [[SpscQueue; SMS_PER_BLOCK]; PIO_BLOCKS],
@@ -42,14 +66,18 @@ pub struct ThreadedPio {
     // RX FIFOs: PIO thread pushes, CPU pops
     rx: [[SpscQueue; SMS_PER_BLOCK]; PIO_BLOCKS],
 
-    // Atomic control
-    sm_enabled: [AtomicU8; PIO_BLOCKS],
-    irq_flags: [AtomicU8; PIO_BLOCKS],
-    dreq: [AtomicU8; PIO_BLOCKS],
+    // Atomic control — each block's byte on its own cache line so the
+    // three PIO workers (post-split) don't false-share.
+    sm_enabled: [Aligned<AtomicU8>; PIO_BLOCKS],
+    irq_flags: [Aligned<AtomicU8>; PIO_BLOCKS],
+    dreq: [Aligned<AtomicU8>; PIO_BLOCKS],
 
     // Packed pad snapshot: high32 = pad_out, low32 = pad_oe. PIO worker
     // publishes once per quantum; coordinator reads in `update_gpio`.
-    pads: [AtomicU64; PIO_BLOCKS],
+    // Padded onto its own line per block: coord reads all three
+    // sequentially, so cross-block writes must not invalidate a peer's
+    // cached line.
+    pads: [Aligned<AtomicU64>; PIO_BLOCKS],
 
     // Cold-path command queue (CPU → PIO thread)
     commands: Mutex<Vec<PioCommand>>,
@@ -104,10 +132,10 @@ impl ThreadedPio {
             rx: std::array::from_fn(|_| {
                 std::array::from_fn(|_| SpscQueue::new(PIO_FIFO_DEPTH))
             }),
-            sm_enabled: std::array::from_fn(|_| AtomicU8::new(0)),
-            irq_flags: std::array::from_fn(|_| AtomicU8::new(0)),
-            dreq: std::array::from_fn(|_| AtomicU8::new(0)),
-            pads: std::array::from_fn(|_| AtomicU64::new(0)),
+            sm_enabled: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
+            irq_flags: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
+            dreq: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
+            pads: std::array::from_fn(|_| Aligned(AtomicU64::new(0))),
             // Preallocate for the common setup-heavy case (INSTR_MEM 32
             // slots × up to 3 blocks = 96 writes + per-SM setup). Keeps
             // the first-quantum firmware init path from thrashing the
@@ -384,6 +412,23 @@ mod tests {
         let pio = ThreadedPio::new();
         let drained = pio.drain_commands();
         assert!(drained.is_empty());
+    }
+
+    /// HLD V5 §4 item 11 — regression guard for the `Aligned<T>`
+    /// padding applied to `pads` / `irq_flags` / `sm_enabled` / `dreq`.
+    /// Catches a future "let's drop the padding or the Deref" mistake.
+    /// The Deref smoke at the bottom proves existing accessor bodies
+    /// (`self.pads[block].store(...)`) still compile unchanged.
+    #[test]
+    fn aligned_pio_atomics_on_own_lines() {
+        use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+        assert_eq!(std::mem::align_of::<Aligned<AtomicU64>>(), 64);
+        assert_eq!(std::mem::size_of::<[Aligned<AtomicU8>; 3]>(), 192);
+        // Deref-path smoke — proves the accessor pattern still compiles
+        // and the forwarded method call works.
+        let a = Aligned(AtomicU8::new(0));
+        a.store(7, Ordering::Relaxed);
+        assert_eq!(a.load(Ordering::Relaxed), 7);
     }
 
     /// `drain_commands` must preserve the queue's allocated capacity —

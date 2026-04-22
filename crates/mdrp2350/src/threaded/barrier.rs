@@ -39,15 +39,33 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::*};
 use std::sync::{Condvar, Mutex};
 
-/// Spin iterations before falling back to `Condvar::wait`. Tuned so
-/// all-workers-arrive-together stays on the fast path (~425 ns for a
-/// 4-way round) while one-worker-running-long transitions a waiter to
-/// sleep within a couple of microseconds. `spin_loop()` hints take
-/// ~20 ns on current x86; 128 iterations is ~2.5 μs — comfortably
-/// above the <500 ns target-arrival window, and short enough that
-/// single-core workloads where one worker runs 100 μs+ of emulated
-/// work per quantum don't burn 40 μs of pure spin every barrier.
-const SPIN_BUDGET: u32 = 128;
+/// Spin iterations before falling back to `Condvar::wait`. `spin_loop()`
+/// hints take ~20 ns on current x86, so 512 iterations is ~10 μs of
+/// spin headroom. The previous value (128, ~2.5 μs) was tuned for a
+/// general-purpose rendezvous where early arrivers should yield
+/// quickly to the productive worker. That tuning is wrong for the
+/// ThreadedEmulator's actual per-quantum shape: on OneROM-class
+/// peripheral-heavy workloads, worker-to-worker arrival stagger
+/// routinely hits 2 μs+ (PIO2 finishes ~2.5 μs after PIO0/core0 in
+/// the §1.1 critical-path model), so a 2.5 μs budget forces every
+/// barrier round through `park_cv.wait` / `notify_all` — a pair of
+/// kernel transitions costing several microseconds each and erasing
+/// the win from parallelising the blocks in the first place.
+///
+/// At 512 iterations (~10 μs) no parking occurs in realistic OneROM
+/// workloads — measured via `threading_micro` §9 late-arriver sampler:
+/// p50 400-600 ns, p99 ≤ 1000 ns round-trip. The cost ceiling rises
+/// symmetrically: worst-case burn is ~160 μs per barrier if every
+/// worker is idle while one runs 100 μs+ alone. On the dedicated
+/// pinned host cores the ThreadedEmulator targets (§2.5), that burn
+/// is dissipating host CPU that nothing else wants; on a general-
+/// purpose host sharing cores with other workloads, 160 μs of hot
+/// spin per quantum would be unacceptable, but that configuration is
+/// out of scope for this runtime.
+///
+/// See `wrk_journals/2026.04.22 - JRN - Threaded PIO Split
+/// Implementation.md` for the measurement data backing these numbers.
+const SPIN_BUDGET: u32 = 512;
 
 /// Outcome of a [`SpinBarrier::wait`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
