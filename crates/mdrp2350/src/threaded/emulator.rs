@@ -1,4 +1,4 @@
-//! `ThreadedEmulator` — 4-thread runtime entry point for Phase 3.
+//! `ThreadedEmulator` — 6-thread runtime entry point for Phase 3.
 //!
 //! Phase 3 Stage 7 (LLD V7 §9): real core / PIO / coordinator worker
 //! bodies. Phase 4 Stage C (HLD V7 §5) collapsed the two-barrier
@@ -6,7 +6,10 @@
 //! its phase work then rendezvouses once at the tail of the loop. CPU
 //! phase-1 of quantum N now runs in parallel with coord phase-2 of
 //! quantum N; the `2 × step_quantum` staleness ceiling that overlap
-//! implies is accepted per HLD V7 §5.2.
+//! implies is accepted per HLD V7 §5.2. Stage B.2 of the 2026-04-22
+//! threaded-PIO HLD V5 split the single PIO worker into three per-block
+//! workers (pio0, pio1, pio2) so the emulator stops serialising what
+//! the hardware runs in parallel.
 //!
 //! Gated behind `#[cfg(all(target_arch = "x86_64", target_os =
 //! "windows"))]` because the thread-pinning path uses Win32
@@ -19,9 +22,9 @@
 //!    ROM / flash, reset, seed GPIO stimulus, etc.).
 //! 2. `ThreadedEmulator::from_emulator(emu)` destructures the Bus into
 //!    the shared state bundle and per-core CPUs.
-//! 3. `run_quanta(n)` spawns four workers (core 0, core 1, PIO,
-//!    coordinator), joins, and surfaces panics via the `poisoned` flag
-//!    so the instance cannot be reused after a worker panic.
+//! 3. `run_quanta(n)` spawns six workers (core 0, core 1, pio0, pio1,
+//!    pio2, coordinator), joins, and surfaces panics via the `poisoned`
+//!    flag so the instance cannot be reused after a worker panic.
 //!
 //! The master-cycle counter lives on `SharedState.master_cycle` (an
 //! `Arc<AtomicU64>`) so the coordinator's `fetch_add(Release)` pairs
@@ -50,15 +53,17 @@ use super::peripherals::{
 };
 use super::timings::{PerWorkerTimings, RunTimings, TimingRecorder};
 
-/// 4-thread runtime handle over a seeded `SharedState` and both CPU
-/// cores. See module-level docs for the Stage 6b → Stage 7 split.
+/// 6-thread runtime handle over a seeded `SharedState` and both CPU
+/// cores. See module-level docs for the Stage 6b → Stage 7 split, and
+/// the 2026-04-22 Threaded PIO Per-Block Workers HLD V5 for the
+/// per-block PIO worker topology.
 pub struct ThreadedEmulator {
     shared: SharedState,
     core0: Option<CortexM33>,
     core1: Option<CortexM33>,
     pio_blocks: Option<[PioBlock; 3]>,
     step_quantum: u32,
-    thread_mask: [usize; 4],
+    thread_mask: [usize; 6],
     poisoned: bool,
     /// Per-worker per-quantum timing instrumentation. Off by default so
     /// production `run_quanta` calls stay on the zero-`Instant::now()`
@@ -78,28 +83,16 @@ impl ThreadedEmulator {
     /// shared `SharedState`.
     ///
     /// Panics if `std::thread::available_parallelism()` reports fewer
-    /// than 4 host cores — the runtime pins one thread per core and a
-    /// 4-core host cannot satisfy that without OS contention. On
-    /// exactly 4 cores, emits an `eprintln!` advising >= 5.
+    /// than 6 host cores — the runtime pins one thread per core and a
+    /// host with fewer cores cannot satisfy that without OS contention.
     pub fn from_emulator(emu: Emulator) -> Self {
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         assert!(
-            n >= 4,
-            "ThreadedEmulator requires >= 4 host cores (found {n})"
+            n >= 6,
+            "ThreadedEmulator requires >= 6 host cores (found {n})"
         );
-        if n == 4 {
-            // TODO: migrate to tracing::warn! once mdrp2350 pulls
-            // tracing directly (workspace-wide dep rollout tracked
-            // alongside the tracing infra HLD). Until then, a one-shot
-            // stderr advisory is better than silently letting the
-            // 4-core case degrade under OS contention.
-            eprintln!(
-                "ThreadedEmulator: exactly 4 host cores — workers will \
-                 contend with OS / other processes; >= 5 recommended"
-            );
-        }
 
         let Emulator {
             cores,
@@ -313,7 +306,7 @@ impl ThreadedEmulator {
             core1: Some(core1),
             pio_blocks: Some(pio),
             step_quantum,
-            thread_mask: [0, 1, 2, 3],
+            thread_mask: [0, 1, 2, 3, 4, 5],
             poisoned: false,
             timing_enabled: false,
             last_run_timings: None,
@@ -321,11 +314,11 @@ impl ThreadedEmulator {
     }
 
     /// Override the default host-core pinning mask. The supplied mask
-    /// maps worker index (0=core0, 1=core1, 2=PIO, 3=coordinator) to
-    /// host logical-CPU id. Useful on SMT / hyperthreaded hosts where
-    /// the default dense `[0, 1, 2, 3]` mapping would share physical
-    /// cores with the other three workers.
-    pub fn with_thread_mask(mut self, mask: [usize; 4]) -> Self {
+    /// maps worker index (0=core0, 1=core1, 2=pio0, 3=pio1, 4=pio2,
+    /// 5=coordinator) to host logical-CPU id. Useful on SMT /
+    /// hyperthreaded hosts where the default dense `[0, 1, 2, 3, 4, 5]`
+    /// mapping would share physical cores with the other five workers.
+    pub fn with_thread_mask(mut self, mask: [usize; 6]) -> Self {
         self.thread_mask = mask;
         self
     }
@@ -382,16 +375,17 @@ impl ThreadedEmulator {
         self.last_run_timings.as_ref()
     }
 
-    /// Run `n` quanta. Spawns four workers, joins, and — on panic —
+    /// Run `n` quanta. Spawns six workers, joins, and — on panic —
     /// flips the `poisoned` flag so the next call panics early. Do not
     /// call `run_quanta` again on a poisoned instance; drop it and
     /// rebuild from a fresh `Emulator`.
     ///
-    /// Stage 7 (LLD V7 §9): each worker drives the real execution
-    /// logic — the CPU workers step their `CortexM33` against a
-    /// [`WorkerBus`] with WFE-wake + IRQ-pending merge semantics,
-    /// the PIO worker drains the command queue + steps active SMs,
-    /// and the coordinator publishes `master_cycle` + ticks the
+    /// Stage 7 (LLD V7 §9) + HLD V5 Stage B.2: each worker drives the
+    /// real execution logic — the CPU workers step their `CortexM33`
+    /// against a [`WorkerBus`] with WFE-wake + IRQ-pending merge
+    /// semantics, each PIO worker owns one `PioBlock` and drains its
+    /// per-block command queue + steps its active SMs, and the
+    /// coordinator publishes `master_cycle` + ticks the
     /// coordinator-owned peripherals.
     pub fn run_quanta(&mut self, n: u64) {
         assert!(
@@ -401,9 +395,14 @@ impl ThreadedEmulator {
 
         let core0 = self.core0.take().expect("run_quanta reentry");
         let core1 = self.core1.take().expect("run_quanta reentry");
-        let blocks = self.pio_blocks.take().expect("run_quanta reentry");
+        // Destructure the three-block array so each PIO worker can own
+        // exactly one `PioBlock`. Happy-path reassembly below rebuilds
+        // the array; any PIO worker panic drops all three blocks per
+        // HLD V5 §2.7 — the poisoned instance cannot be reused.
+        let [block0, block1, block2] =
+            self.pio_blocks.take().expect("run_quanta reentry");
 
-        let barrier = Arc::new(SpinBarrier::new(4));
+        let barrier = Arc::new(SpinBarrier::new(6));
         let shared = self.shared.clone();
         let step_q = self.step_quantum;
         let mask = self.thread_mask;
@@ -422,26 +421,39 @@ impl ThreadedEmulator {
             let s = shared.clone();
             move |b| core_worker_body(1, core1, s, b, n, step_q, timing)
         });
-        let hp = spawn_worker(mask[2], barrier.clone(), {
+        let hp0 = spawn_worker(mask[2], barrier.clone(), {
             let s = shared.clone();
-            move |b| pio_worker_body(blocks, s, b, n, step_q, timing)
+            move |b| pio_block_worker_body(0, block0, s, b, n, step_q, timing)
         });
-        let hc = spawn_worker(mask[3], barrier.clone(), {
+        let hp1 = spawn_worker(mask[3], barrier.clone(), {
+            let s = shared.clone();
+            move |b| pio_block_worker_body(1, block1, s, b, n, step_q, timing)
+        });
+        let hp2 = spawn_worker(mask[4], barrier.clone(), {
+            let s = shared.clone();
+            move |b| pio_block_worker_body(2, block2, s, b, n, step_q, timing)
+        });
+        let hc = spawn_worker(mask[5], barrier.clone(), {
             let s = shared.clone();
             move |b| coordinator_worker_body(s, b, n, step_q, timing)
         });
 
         let r0 = h0.join();
         let r1 = h1.join();
-        let rp = hp.join();
+        let rp0 = hp0.join();
+        let rp1 = hp1.join();
+        let rp2 = hp2.join();
         let rc = hc.join();
 
         // Track which workers panicked before consuming the Ok payloads
         // so the panic message can enumerate the culprits.
         let r0_err = r0.is_err();
         let r1_err = r1.is_err();
-        let rp_err = rp.is_err();
+        let rp0_err = rp0.is_err();
+        let rp1_err = rp1.is_err();
+        let rp2_err = rp2.is_err();
         let rc_err = rc.is_err();
+        let any_pio_err = rp0_err || rp1_err || rp2_err;
 
         // Restore owned state on the happy path. Any side that panicked
         // loses its core / block value for this run — the `poisoned`
@@ -455,7 +467,9 @@ impl ThreadedEmulator {
         // `RunTimings` turns into an empty per-worker vec.
         let mut t0 = PerWorkerTimings::default();
         let mut t1 = PerWorkerTimings::default();
-        let mut tp = PerWorkerTimings::default();
+        let mut tp0 = PerWorkerTimings::default();
+        let mut tp1 = PerWorkerTimings::default();
+        let mut tp2 = PerWorkerTimings::default();
         let mut tc = PerWorkerTimings::default();
 
         if let Ok((c, t)) = r0 {
@@ -466,9 +480,39 @@ impl ThreadedEmulator {
             self.core1 = Some(c);
             t1 = t;
         }
-        if let Ok((b, t)) = rp {
-            self.pio_blocks = Some(b);
-            tp = t;
+
+        // HLD V5 §2.7: on any PIO worker panic, drop all three Ok
+        // blocks too (the instance is poisoned and cannot be reused).
+        // Unpack each join result exactly once and stash the blocks into
+        // `Option<PioBlock>`; if any worker panicked, the Ok blocks
+        // simply go out of scope at end of function (drop site).
+        let ok0 = rp0.ok();
+        let ok1 = rp1.ok();
+        let ok2 = rp2.ok();
+        let (bl0, tpe0) = split_ok(ok0);
+        let (bl1, tpe1) = split_ok(ok1);
+        let (bl2, tpe2) = split_ok(ok2);
+        if let Some(t) = tpe0 {
+            tp0 = t;
+        }
+        if let Some(t) = tpe1 {
+            tp1 = t;
+        }
+        if let Some(t) = tpe2 {
+            tp2 = t;
+        }
+        if !any_pio_err {
+            // All three PIO workers returned Ok; reassemble the array.
+            self.pio_blocks = Some([
+                bl0.expect("pio0 Ok but block missing"),
+                bl1.expect("pio1 Ok but block missing"),
+                bl2.expect("pio2 Ok but block missing"),
+            ]);
+        } else {
+            // At least one PIO worker panicked — drop all three blocks
+            // (including any Ok returns) per HLD V5 §2.7.
+            drop((bl0, bl1, bl2));
+            self.pio_blocks = None;
         }
         // Coordinator worker returns `((), PerWorkerTimings)`.
         if let Ok(((), t)) = rc {
@@ -478,8 +522,10 @@ impl ThreadedEmulator {
         let panicked: Vec<&str> = [
             ("core0", r0_err),
             ("core1", r1_err),
-            ("pio", rp_err),
-            ("coordinator", rc_err),
+            ("pio0", rp0_err),
+            ("pio1", rp1_err),
+            ("pio2", rp2_err),
+            ("coord", rc_err),
         ]
         .into_iter()
         .filter_map(|(name, err)| if err { Some(name) } else { None })
@@ -493,7 +539,9 @@ impl ThreadedEmulator {
             self.last_run_timings = Some(RunTimings {
                 core0: t0,
                 core1: t1,
-                pio: tp,
+                pio0: tp0,
+                pio1: tp1,
+                pio2: tp2,
                 coord: tc,
             });
         }
@@ -504,13 +552,27 @@ impl ThreadedEmulator {
 // Worker-thread plumbing
 // =======================================================================
 
+/// Helper for `run_quanta`'s PIO-worker join handling: split an
+/// `Option<(PioBlock, PerWorkerTimings)>` into its two halves so the
+/// block and its timings can be moved into different places (happy-path
+/// reassembly vs. drop-on-panic) without a partial-move borrow-checker
+/// fight.
+fn split_ok(
+    ok: Option<(PioBlock, PerWorkerTimings)>,
+) -> (Option<PioBlock>, Option<PerWorkerTimings>) {
+    match ok {
+        Some((b, t)) => (Some(b), Some(t)),
+        None => (None, None),
+    }
+}
+
 /// Spawn a worker thread pinned to `host_core` running `body`. Catches
 /// panics from `body` and poisons the shared barrier before re-raising
 /// the panic so the remaining workers drop out of their spin loops.
 ///
 /// Generic over the body's return type so the three different body
-/// signatures (`CortexM33` / `[PioBlock; 3]` / `()`) share the same
-/// spawn path without a trait object.
+/// signatures (`CortexM33` / `PioBlock` / `()`) share the same spawn
+/// path without a trait object.
 fn spawn_worker<F, R>(
     host_core: usize,
     barrier: Arc<SpinBarrier>,
@@ -564,7 +626,7 @@ fn pin_to_host_core(host_core: usize) {
 // state observed by CPU workers (HLD V7 §5.2).
 //
 // A poisoned barrier (any worker panicked) returns the owned `CortexM33`
-// / `[PioBlock; 3]` / `()` immediately so the caller can flip the
+// / `PioBlock` / `()` immediately so the caller can flip the
 // `poisoned` flag.
 
 /// CPU-core worker. Owns a `CortexM33` and drives `step` against a
@@ -668,32 +730,33 @@ fn core_worker_body(
     (core, rec.take())
 }
 
-/// PIO worker. Drains CPU-queued commands (INSTR_MEM / CLKDIV writes),
-/// then steps each enabled state machine `step_q` sysclocks. PIO IRQ
-/// routing to the NVIC is deliberately omitted — the single-threaded
-/// `Bus` path also does not route PIO IRQs today, and Phase 3 §6
-/// scopes this to parity (adding it requires both edges, which is a
-/// separate HLD).
-fn pio_worker_body(
-    mut blocks: [PioBlock; 3],
+/// Per-block PIO worker. Owns a single [`PioBlock`] (addressed by
+/// `block_idx`), drains CPU-queued commands for that block, then steps
+/// its enabled state machines for `step_q` sysclocks. PIO IRQ routing
+/// to the NVIC is deliberately omitted — the single-threaded `Bus`
+/// path also does not route PIO IRQs today, and Phase 3 §6 scopes this
+/// to parity (adding it requires both edges, which is a separate HLD).
+///
+/// HLD V5 §2.1: three workers run concurrently, one per PIO block, so
+/// the emulator's thread boundary matches the hardware's PIO-block
+/// boundary. Each worker publishes its pad state unconditionally each
+/// quantum (§2.1) — even disabled blocks must publish their current
+/// pad latch so coord's `update_gpio` sees a coherent snapshot.
+fn pio_block_worker_body(
+    block_idx: usize,
+    mut block: PioBlock,
     shared: SharedState,
     barrier: Arc<SpinBarrier>,
     n: u64,
     step_q: u32,
     timing_enabled: bool,
-) -> ([PioBlock; 3], PerWorkerTimings) {
+) -> (PioBlock, PerWorkerTimings) {
     let mut rec = TimingRecorder::new(n, timing_enabled);
     rec.on_worker_entry();
 
     for _ in 0..n {
-        // Stage B.1: per-block command queues. Drain each block's queue
-        // and dispatch through the existing `apply_pio_command` routing.
-        // Stage B.2 will split this loop across three per-block worker
-        // threads; until then one worker owns all three blocks.
-        for block_idx in 0..super::pio::PIO_BLOCKS {
-            for cmd in shared.pio.drain_commands(block_idx) {
-                apply_pio_command(&mut blocks, &shared.pio, cmd);
-            }
+        for cmd in shared.pio.drain_commands(block_idx) {
+            apply_pio_command(&mut block, block_idx, &shared.pio, cmd);
         }
 
         // GPIO_IN snapshot once per quantum — parity with the
@@ -701,21 +764,13 @@ fn pio_worker_body(
         // `bus.gpio_in` once and hands it to every PIO step.
         let gpio_in = shared.gpio.read_in();
 
-        for (block_idx, block) in blocks.iter_mut().enumerate() {
-            // `shared.pio.read_sm_enabled` reflects the last-applied
-            // CTRL write's SM_ENABLE mask (`apply_pio_command::WriteCtrl`
-            // republishes it after each CTRL write). A zero mask means
-            // no SM in this block can make progress this quantum, so
-            // skip the per-SM stepping loop entirely.
-            let enabled = shared.pio.read_sm_enabled(block_idx);
-            if enabled == 0 {
-                continue;
-            }
-            // `PioBlock::step_n` gates on `sm_enabled_mask` internally;
-            // mirroring the enable mask into the block keeps its fast
-            // path tight.
+        // `shared.pio.read_sm_enabled` reflects the last-applied CTRL
+        // write's SM_ENABLE mask (`apply_pio_command::WriteCtrl`
+        // republishes it after each CTRL write). A zero mask means no
+        // SM in this block can make progress this quantum, so skip the
+        // per-SM stepping loop entirely.
+        if shared.pio.read_sm_enabled(block_idx) != 0 {
             block.step_n(step_q, gpio_in);
-
             // Reflect the block's IRQ flags back onto `ThreadedPio` so
             // CPU workers observe them through the shared atomic.
             // PIO→NVIC assertion is Phase-later scope (see function
@@ -723,13 +778,11 @@ fn pio_worker_body(
             shared.pio.write_irq_flags(block_idx, block.pending_irqs() as u8);
         }
 
-        // Phase 4 Stage B (HLD V7 §4.3): publish every block's pad
-        // state — including disabled blocks, whose pads may still carry
-        // a non-zero latch from the last active tick — so coord's
-        // `update_gpio` sees a coherent snapshot.
-        for (block_idx, block) in blocks.iter().enumerate() {
-            shared.pio.write_pads(block_idx, block.pad_out, block.pad_oe);
-        }
+        // HLD V5 §2.1: publish pad state unconditionally — even a
+        // disabled block must publish its current pad latch so coord's
+        // `update_gpio` sees a coherent snapshot. Mirrors the
+        // pre-split per-block publish loop.
+        shared.pio.write_pads(block_idx, block.pad_out, block.pad_oe);
 
         // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
         // after phase work. Overlaps with coord phase-2 of this
@@ -738,79 +791,83 @@ fn pio_worker_body(
         let result = barrier.wait();
         rec.on_wait_return();
         if result == BarrierResult::Poisoned {
-            return (blocks, rec.take());
+            return (block, rec.take());
         }
     }
-    (blocks, rec.take())
+    (block, rec.take())
 }
 
-/// Apply a CPU-queued [`PioCommand`] to the PIO worker's local
-/// `PioBlock`s. Routes through each block's public `write32` so all
-/// the existing bookkeeping (INSTR_MEM index guard, FIFO-join handling,
-/// alias decoding, SM enable-mask invariant) continues to apply.
+/// Apply a CPU-queued [`PioCommand`] to the owning PIO worker's local
+/// `PioBlock`. Routes through `PioBlock::write32` so all the existing
+/// bookkeeping (INSTR_MEM index guard, FIFO-join handling, alias
+/// decoding, SM enable-mask invariant) continues to apply.
 ///
-/// After `WriteCtrl`, the post-write `sm_enabled_mask` is republished
-/// onto `ThreadedPio::sm_enabled` so CPU-side reads of CTRL.SM_ENABLE
-/// and the `pio_worker_body` enable-gate check see the new state on
-/// the next quantum. `WriteReg` republishes the mask too — on the
-/// chance a generic write touches per-SM state that flips an SM's
-/// enable (belt-and-braces; today no per-SM register toggles enable,
-/// but this keeps the invariant local to this function regardless of
-/// future `PioBlock::write32` extensions).
+/// `block_idx` is the index of the worker's owned block; since each
+/// per-block command queue only delivers commands matching its own
+/// `block_idx` (§2.2 routing contract), `cmd.block() as usize` always
+/// equals `block_idx` here — asserted under `debug_assertions`. The
+/// `WriteCtrl` / `WriteReg` arms use `block_idx` to publish the
+/// post-write `sm_enabled_mask` onto `ThreadedPio::sm_enabled` so
+/// CPU-side reads of CTRL.SM_ENABLE and the `pio_block_worker_body`
+/// enable-gate check see the new state on the next quantum.
+/// `WriteReg` republishes the mask too — on the chance a generic
+/// write touches per-SM state that flips an SM's enable
+/// (belt-and-braces; today no per-SM register toggles enable, but this
+/// keeps the invariant local to this function regardless of future
+/// `PioBlock::write32` extensions).
 fn apply_pio_command(
-    blocks: &mut [PioBlock; 3],
+    block: &mut PioBlock,
+    block_idx: usize,
     shared_pio: &super::ThreadedPio,
     cmd: PioCommand,
 ) {
+    debug_assert_eq!(
+        cmd.block() as usize,
+        block_idx,
+        "PioCommand.block must match the owning worker's block_idx (§2.2 routing)"
+    );
     match cmd {
-        PioCommand::WriteInstrMem { block, addr, value, alias } => {
-            let b = block as usize;
-            if b >= blocks.len() || addr >= 32 {
+        PioCommand::WriteInstrMem { block: _, addr, value, alias } => {
+            if addr >= 32 {
                 return;
             }
             let offset = 0x048 + (addr as u32) * 4;
-            blocks[b].write32(offset, value as u32, alias as u32);
+            block.write32(offset, value as u32, alias as u32);
         }
-        PioCommand::SetClkDiv { block, sm, int_div, frac_div, alias } => {
-            let b = block as usize;
-            if b >= blocks.len() || sm >= 4 {
+        PioCommand::SetClkDiv { block: _, sm, int_div, frac_div, alias } => {
+            if sm >= 4 {
                 return;
             }
             // SMn_CLKDIV lives at 0x0C8 + sm * 0x18. Layout: INT<<16,
             // FRAC<<8, rest reserved (mdpicoem-common::pio::mod §write_clkdiv).
             let offset = 0x0C8 + (sm as u32) * 0x18;
             let val = ((int_div as u32) << 16) | ((frac_div as u32) << 8);
-            blocks[b].write32(offset, val, alias as u32);
+            block.write32(offset, val, alias as u32);
         }
-        PioCommand::WriteCtrl { block, val, alias } => {
-            let b = block as usize;
-            if b >= blocks.len() {
-                return;
-            }
-            blocks[b].write32(0x000, val, alias as u32);
+        PioCommand::WriteCtrl { block: _, val, alias } => {
+            block.write32(0x000, val, alias as u32);
             // Republish the post-write enable mask so CPU-side readers
             // (including the PIO worker's own step-loop enable gate)
             // observe it next quantum.
-            shared_pio.write_sm_enabled(b, blocks[b].sm_enabled_mask());
+            shared_pio.write_sm_enabled(block_idx, block.sm_enabled_mask());
         }
-        PioCommand::WriteReg { block, offset, val, alias } => {
-            let b = block as usize;
-            if b >= blocks.len() {
-                return;
-            }
-            blocks[b].write32(offset as u32, val, alias as u32);
+        PioCommand::WriteReg { block: _, offset, val, alias } => {
+            block.write32(offset as u32, val, alias as u32);
             // Conservative republish: keeps the mask coherent even if a
             // future `PioBlock::write32` extension ends up toggling
             // `enabled` outside CTRL.
-            shared_pio.write_sm_enabled(b, blocks[b].sm_enabled_mask());
+            shared_pio.write_sm_enabled(block_idx, block.sm_enabled_mask());
         }
         // Stage B.2 panic-injection hook (HLD V5 §2.2 / §4 item 5). The
         // `pio{block}` substring is load-bearing — the worker-split tests
         // assert on it to prove the panic surfaced on the specific PIO
-        // worker addressed by the command's block field. `#[cfg(test)]`
-        // keeps the arm — and therefore the `panic!` — out of release
-        // builds, so `PioCommand`'s exhaustive match compiles clean in
-        // production.
+        // worker addressed by the command's block field. The panic
+        // message uses `cmd.block()` (i.e. the command's target), not
+        // `block_idx`, so it stays accurate under the §2.2 contract
+        // (they are equal, but the command-field form documents intent).
+        // `#[cfg(test)]` keeps the arm — and therefore the `panic!` —
+        // out of release builds, so `PioCommand`'s exhaustive match
+        // compiles clean in production.
         #[cfg(test)]
         PioCommand::TestPanic { block } => {
             panic!("PioCommand::TestPanic fired from pio{}", block);
@@ -963,7 +1020,7 @@ fn tick_peripherals(shared: &SharedState, cycles: u32) {
 // Tests
 // =======================================================================
 //
-// Stage 7 (LLD V7 §11 items 13–19): smoke tests that spawn the 4-worker
+// Stage 7 (LLD V7 §11 items 13–19): smoke tests that spawn the 6-worker
 // runtime and verify end-to-end execution semantics — quantum advance,
 // cross-core SRAM visibility, WFE/SEV wake, FIFO-push wake, spinlock
 // contention, doorbell state, and decode-cache invalidation plumbing.
@@ -1379,7 +1436,7 @@ mod tests {
         // Drain + apply as the PIO worker would at quantum entry.
         let mut blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
         for cmd in threaded.shared.pio.drain_commands(0) {
-            apply_pio_command(&mut blocks, &threaded.shared.pio, cmd);
+            apply_pio_command(&mut blocks[0], 0, &threaded.shared.pio, cmd);
         }
 
         assert_eq!(
@@ -1402,9 +1459,8 @@ mod tests {
     #[should_panic(expected = "pio1")]
     fn apply_pio_command_test_panic_arm_fires() {
         let pio = super::ThreadedPio::new();
-        let mut blocks: [PioBlock; 3] =
-            [PioBlock::new(), PioBlock::new(), PioBlock::new()];
-        apply_pio_command(&mut blocks, &pio, PioCommand::TestPanic { block: 1 });
+        let mut block = PioBlock::new();
+        apply_pio_command(&mut block, 1, &pio, PioCommand::TestPanic { block: 1 });
     }
 
     /// A CTRL write landing through `WorkerBus::ahb_write32` must
@@ -1433,7 +1489,7 @@ mod tests {
 
         // Apply + verify the republish lands on ThreadedPio.
         let mut blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
-        apply_pio_command(&mut blocks, &threaded.shared.pio, pending[0]);
+        apply_pio_command(&mut blocks[1], 1, &threaded.shared.pio, pending[0]);
         assert_eq!(threaded.shared.pio.read_sm_enabled(1), 0b1010);
         assert_eq!(blocks[1].sm_enabled_mask(), 0b1010);
     }
@@ -1465,7 +1521,7 @@ mod tests {
 
         // Apply and verify it reached instr_mem[7].
         let mut blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
-        apply_pio_command(&mut blocks, &threaded.shared.pio, pending[0]);
+        apply_pio_command(&mut blocks[0], 0, &threaded.shared.pio, pending[0]);
         assert_eq!(blocks[0].instr_mem()[7], insn as u16);
         // Neighbours untouched.
         assert_eq!(blocks[0].instr_mem()[6], 0);
@@ -1674,7 +1730,7 @@ mod tests {
         }
         let mut blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
         for cmd in threaded.shared.pio.drain_commands(0) {
-            apply_pio_command(&mut blocks, &threaded.shared.pio, cmd);
+            apply_pio_command(&mut blocks[0], 0, &threaded.shared.pio, cmd);
         }
         assert_eq!(blocks[0].sm_enabled_mask(), 0b0001);
 
@@ -1691,7 +1747,7 @@ mod tests {
             pending[0],
             PioCommand::WriteCtrl { block: 0, val: 0b0100, alias: 2 },
         );
-        apply_pio_command(&mut blocks, &threaded.shared.pio, pending[0]);
+        apply_pio_command(&mut blocks[0], 0, &threaded.shared.pio, pending[0]);
 
         assert_eq!(
             blocks[0].sm_enabled_mask(),
@@ -1736,7 +1792,8 @@ mod tests {
         // production behaviour (unobservable from outside the worker).
         let mut scratch = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
         apply_pio_command(
-            &mut scratch,
+            &mut scratch[0],
+            0,
             &threaded.shared.pio,
             PioCommand::WriteReg {
                 block: 0,
@@ -1806,7 +1863,7 @@ mod tests {
         // Apply all and verify observable end-state matches the write sequence.
         let mut blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
         for cmd in pending {
-            apply_pio_command(&mut blocks, &threaded.shared.pio, cmd);
+            apply_pio_command(&mut blocks[0], 0, &threaded.shared.pio, cmd);
         }
         assert_eq!(blocks[0].sm_enabled_mask(), 0b0011);
         assert_eq!(blocks[0].instr_mem()[3], 0x1234);

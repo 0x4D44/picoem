@@ -1,4 +1,4 @@
-//! Per-worker per-quantum timing instrumentation for the 4-thread runtime.
+//! Per-worker per-quantum timing instrumentation for the 6-thread runtime.
 //!
 //! When enabled on a [`super::ThreadedEmulator`] via
 //! [`super::ThreadedEmulator::set_timing_enabled`], each worker records
@@ -13,7 +13,7 @@
 //!
 //! Interpretation: the highest `phase_work_ns` each quantum is the
 //! bottleneck worker; a worker with high `barrier_wait_ns` finished
-//! early and was waiting for a peer. If all four workers show high
+//! early and was waiting for a peer. If all six workers show high
 //! `barrier_wait_ns` at once, the barrier spin-wait itself is where
 //! the cycles are going.
 //!
@@ -26,14 +26,17 @@
 
 use std::time::Instant;
 
-/// Which of the four worker threads the timings belong to. Matches the
+/// Which of the six worker threads the timings belong to. Matches the
 /// worker-index convention used elsewhere in `emulator.rs` (core0 is
-/// worker 0, core1 is worker 1, PIO is worker 2, coord is worker 3).
+/// worker 0, core1 is worker 1, pio0/pio1/pio2 are workers 2..=4, coord
+/// is worker 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerName {
     Core0,
     Core1,
-    Pio,
+    Pio0,
+    Pio1,
+    Pio2,
     Coord,
 }
 
@@ -44,7 +47,9 @@ impl WorkerName {
         match self {
             WorkerName::Core0 => "core0",
             WorkerName::Core1 => "core1",
-            WorkerName::Pio => "pio",
+            WorkerName::Pio0 => "pio0",
+            WorkerName::Pio1 => "pio1",
+            WorkerName::Pio2 => "pio2",
             WorkerName::Coord => "coord",
         }
     }
@@ -108,46 +113,52 @@ pub struct WorkerSummary {
 impl WorkerSummary {
     /// Resolve the worker this summary belongs to from its ordinal.
     pub fn name(&self) -> WorkerName {
-        debug_assert!(self.name_idx < 4, "WorkerSummary.name_idx out of range");
+        debug_assert!(self.name_idx < 6, "WorkerSummary.name_idx out of range");
         match self.name_idx {
             0 => WorkerName::Core0,
             1 => WorkerName::Core1,
-            2 => WorkerName::Pio,
+            2 => WorkerName::Pio0,
+            3 => WorkerName::Pio1,
+            4 => WorkerName::Pio2,
             _ => WorkerName::Coord,
         }
     }
 }
 
-/// All four workers' raw timings from the most recent `run_quanta`.
+/// All six workers' raw timings from the most recent `run_quanta`.
 /// Constructed on [`super::ThreadedEmulator::run_quanta`] completion;
 /// read via [`super::ThreadedEmulator::last_run_timings`].
 ///
 /// The raw vecs are private. Consumers call [`RunTimings::summary`] to
-/// get the four per-worker [`WorkerSummary`] entries in fixed order
-/// `[core0, core1, pio, coord]`.
+/// get the six per-worker [`WorkerSummary`] entries in fixed order
+/// `[core0, core1, pio0, pio1, pio2, coord]`.
 #[derive(Debug)]
 pub struct RunTimings {
     pub(super) core0: PerWorkerTimings,
     pub(super) core1: PerWorkerTimings,
-    pub(super) pio: PerWorkerTimings,
+    pub(super) pio0: PerWorkerTimings,
+    pub(super) pio1: PerWorkerTimings,
+    pub(super) pio2: PerWorkerTimings,
     pub(super) coord: PerWorkerTimings,
 }
 
 impl RunTimings {
     /// Compute mean / p50 / p99 / max / total for each worker. Returned
-    /// in fixed `[core0, core1, pio, coord]` order so callers can index
-    /// by [`WorkerName`] as-is.
-    pub fn summary(&self) -> [WorkerSummary; 4] {
+    /// in fixed `[core0, core1, pio0, pio1, pio2, coord]` order so
+    /// callers can index by [`WorkerName`] as-is.
+    pub fn summary(&self) -> [WorkerSummary; 6] {
         [
             summarise(0, &self.core0),
             summarise(1, &self.core1),
-            summarise(2, &self.pio),
-            summarise(3, &self.coord),
+            summarise(2, &self.pio0),
+            summarise(3, &self.pio1),
+            summarise(4, &self.pio2),
+            summarise(5, &self.coord),
         ]
     }
 
     /// Number of quanta recorded. Uses the core0 worker's count; every
-    /// worker records one sample per quantum so all four are equal.
+    /// worker records one sample per quantum so all six are equal.
     /// Zero when timing was disabled for the run.
     pub fn samples(&self) -> usize {
         self.core0.phase_work_ns.len()
@@ -342,7 +353,9 @@ mod tests {
                 barrier_wait_ns: vec![4, 5, 6],
             },
             core1: PerWorkerTimings::default(),
-            pio: PerWorkerTimings::default(),
+            pio0: PerWorkerTimings::default(),
+            pio1: PerWorkerTimings::default(),
+            pio2: PerWorkerTimings::default(),
             coord: PerWorkerTimings::default(),
         };
         assert_eq!(rt.samples(), 3);
@@ -352,7 +365,9 @@ mod tests {
     fn worker_name_labels_are_stable() {
         assert_eq!(WorkerName::Core0.as_str(), "core0");
         assert_eq!(WorkerName::Core1.as_str(), "core1");
-        assert_eq!(WorkerName::Pio.as_str(), "pio");
+        assert_eq!(WorkerName::Pio0.as_str(), "pio0");
+        assert_eq!(WorkerName::Pio1.as_str(), "pio1");
+        assert_eq!(WorkerName::Pio2.as_str(), "pio2");
         assert_eq!(WorkerName::Coord.as_str(), "coord");
     }
 }
