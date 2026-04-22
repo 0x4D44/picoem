@@ -58,6 +58,17 @@ fn main() {
     mdpicoem_harness::harness_tracing_init();
     if let Err(e) = run() {
         eprintln!("fatal: {e}");
+        // Walk the source() chain so the concrete probe-rs variant (e.g.
+        // `Arm(DebugPort(NoAcknowledge))`) is visible on a single re-run.
+        // `Error::Arm(#[source] ArmError)` hides the inner variant from
+        // `{e}` formatting; manual iteration is unconditionally correct
+        // regardless of which derive macro the outer enum uses.
+        // See wrk_docs/2026.04.22 - HLD - Track A.1 RP2040 Attach Fix.md §4.
+        let mut source = std::error::Error::source(&*e);
+        while let Some(s) = source {
+            eprintln!("  caused by: {s}");
+            source = s.source();
+        }
         std::process::exit(2);
     }
 }
