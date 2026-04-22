@@ -17,20 +17,37 @@
 //!      exercising the spin-budget-exhaustion → `Condvar::wait` → `notify_all`
 //!      path that OneROM's real-workload pattern triggers (PIO2 finishes
 //!      well after the rest). Mean / p50 / p99 round-trip.
+//!   8. Parameterised-SPIN_BUDGET barrier sweep — the same 6-way
+//!      asymmetric-2µs case repeated across SPIN_BUDGET ∈ {128, 256, 512,
+//!      1024, 2048, 4096, 8192} to locate the knee where early arrivers
+//!      stay on the spin path through the 2 µs stagger and nobody parks.
+//!      Uses a local `ParamSpinBarrier` (logic cloned from the production
+//!      `SpinBarrier` minus the poison path) because the real primitive's
+//!      SPIN_BUDGET is a `const`.
+//!   9. Late-arriver tail sweep — same 6-way asymmetric-2µs pattern and
+//!      SPIN_BUDGET sweep as §8, but the sampled thread is now the *late*
+//!      arriver rather than an early arriver. This measures pure release
+//!      propagation (no stagger, no park on the sampler's side) — the
+//!      metric that actually bounds per-quantum throughput in the
+//!      ThreadedEmulator, since a round cannot finish until the late
+//!      arriver's `wait()` returns.
 //!
-//! Sections 6–7 back the §7 pre-implementation measurement gate in
+//! Sections 6–9 back the §7 pre-implementation measurement gate in
 //! `wrk_docs/2026.04.22 - HLD - Threaded PIO Per-Block Workers V5.md`.
 //! They use the production hybrid (spin-then-park) barrier from
 //! `mdrp2350::threaded::barrier` — not the local spin-only shim used by
 //! sections 1–5 — because the §7 asymmetric case depends on the parked-
 //! waiter wakeup path that only the production primitive implements.
-//! Threads are intentionally **not pinned** in sections 6–7: we want to
+//! Section 8 uses a local clone of the production barrier so SPIN_BUDGET
+//! can be parameterised at runtime; the clone mirrors the production
+//! fences and park path exactly (see `ParamSpinBarrier`).
+//! Threads are intentionally **not pinned** in sections 6–8: we want to
 //! measure the barrier primitive, not the OS scheduler overlay, and the
 //! HLD's §1.1 model captures scheduler effects separately via its
 //! conservative band.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use mdrp2350::threaded::SpinBarrier as ProdSpinBarrier;
@@ -775,19 +792,358 @@ fn bench_prod_barrier_asymmetric(
     }
 }
 
-fn print_barrier_stats_table(all: &[BarrierStats]) {
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Parameterised-SPIN_BUDGET barrier sweep (6-way asymmetric 2µs)
+//
+// The production `SpinBarrier` in `mdrp2350::threaded::barrier` has a
+// hardcoded `const SPIN_BUDGET: u32 = 128`. Section 7 showed the 6-way
+// asymmetric-2µs case exhausts that budget in five of six workers and
+// pays the park → `notify_all` wake cost. To find the knee where everyone
+// stays on the spin path through a 2 µs stagger, we clone the production
+// barrier's essential logic here with a runtime-parameterised budget.
+//
+// The clone mirrors the production barrier *exactly* on the hot path:
+//
+//   - Same Release/Acquire pairing on `generation` and `count` so the
+//     last-arriver's reset (count=0; gen+=1) publishes "ahead of" the
+//     early arrivers' spin-loop gen load.
+//   - Same `park_mu` held around the generation store on the last-
+//     arriver branch so any worker already inside `park_cv.wait` linearises
+//     on old-gen or new-gen sides — never in a window that could miss
+//     the broadcast.
+//   - Same park-on-budget-exhaust path: re-check under `park_mu` and
+//     `wait()` on the condvar.
+//   - Same `notify_all()` outside the lock.
+//
+// The poison path is omitted (bench doesn't panic; no coordinator). The
+// `poisoned` load inside the spin loop is also removed since there's
+// nothing to poison it from — this shaves one atomic load per spin
+// iteration but does not change the timing the sweep is trying to
+// measure (budget-exhaust vs stay-on-spin). Everything else is a
+// line-for-line mirror of `SpinBarrier::wait`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Local clone of the production `SpinBarrier` with a runtime-parameterised
+/// spin budget. See module-level §8 comment for semantics guarantee.
+struct ParamSpinBarrier {
+    generation: AtomicU32,
+    count: AtomicU32,
+    parties: u32,
+    spin_budget: u32,
+    park_mu: Mutex<()>,
+    park_cv: Condvar,
+}
+
+impl ParamSpinBarrier {
+    fn new(parties: u32, spin_budget: u32) -> Self {
+        assert!(parties >= 2);
+        Self {
+            generation: AtomicU32::new(0),
+            count: AtomicU32::new(0),
+            parties,
+            spin_budget,
+            park_mu: Mutex::new(()),
+            park_cv: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let cur_gen = self.generation.load(Acquire);
+        let n = self.count.fetch_add(1, AcqRel) + 1;
+        if n == self.parties {
+            // Last arriver — bump generation under park_mu so any sleeper
+            // linearises cleanly with its predicate re-check.
+            {
+                let _g = self.park_mu.lock().unwrap();
+                self.count.store(0, Relaxed);
+                self.generation.store(cur_gen.wrapping_add(1), Release);
+            }
+            self.park_cv.notify_all();
+            return;
+        }
+
+        // Early arriver — spin budget.
+        for _ in 0..self.spin_budget {
+            if self.generation.load(Acquire) != cur_gen {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+
+        // Budget exhausted — park on condvar.
+        let mut g = self.park_mu.lock().unwrap();
+        while self.generation.load(Acquire) == cur_gen {
+            g = self.park_cv.wait(g).unwrap();
+        }
+    }
+}
+
+/// One row of the §8 sweep — a single SPIN_BUDGET configuration under the
+/// 6-way asymmetric-2µs pattern.
+struct SweepStats {
+    spin_budget: u32,
+    mean_ns: f64,
+    p50_ns: u64,
+    p99_ns: u64,
+    samples: usize,
+}
+
+/// Asymmetric-arrival benchmark on `ParamSpinBarrier`. Same thread-id
+/// convention as `bench_prod_barrier_asymmetric`: tid 0 samples, tid
+/// `parties-1` busy-waits `late_delay`, others are plain early arrivers.
+fn bench_param_barrier_asymmetric(
+    parties: u32,
+    rounds: usize,
+    late_delay: Duration,
+    spin_budget: u32,
+) -> SweepStats {
+    assert!(parties >= 3, "asymmetric case needs ≥ sampler + late + peer");
+    let barrier = Arc::new(ParamSpinBarrier::new(parties, spin_budget));
+
+    // Warmup — prime OS scheduler and caches.
+    {
+        let warm = Arc::new(ParamSpinBarrier::new(parties, spin_budget));
+        let handles: Vec<_> = (0..parties)
+            .map(|_| {
+                let b = Arc::clone(&warm);
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        b.wait();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    let samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::with_capacity(rounds)));
+    let late_id = parties - 1;
+
+    let mut handles = Vec::with_capacity(parties as usize);
+    for tid in 0..parties {
+        let b = Arc::clone(&barrier);
+        let s = Arc::clone(&samples);
+        handles.push(std::thread::spawn(move || {
+            if tid == 0 {
+                let mut local = Vec::with_capacity(rounds);
+                for _ in 0..rounds {
+                    let t0 = Instant::now();
+                    b.wait();
+                    local.push(t0.elapsed().as_nanos() as u64);
+                }
+                let mut g = s.lock().unwrap();
+                *g = local;
+            } else if tid == late_id {
+                for _ in 0..rounds {
+                    busy_wait_approx(late_delay);
+                    b.wait();
+                }
+            } else {
+                for _ in 0..rounds {
+                    b.wait();
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let mut samples = Arc::try_unwrap(samples)
+        .ok()
+        .expect("sampler arc should have only one strong ref after join")
+        .into_inner()
+        .unwrap();
+    samples.sort_unstable();
+
+    let total: u64 = samples.iter().sum();
+    let mean_ns = total as f64 / samples.len() as f64;
+    let p50_ns = percentile_ns(&samples, 50.0);
+    let p99_ns = percentile_ns(&samples, 99.0);
+
+    SweepStats {
+        spin_budget,
+        mean_ns,
+        p50_ns,
+        p99_ns,
+        samples: samples.len(),
+    }
+}
+
+fn print_sweep_table(rows: &[SweepStats]) {
+    println!("   {:>11} {:>10} {:>10} {:>10} {:>10}", "spin_budget", "mean_ns", "p50_ns", "p99_ns", "samples");
+    println!("   {}", "-".repeat(11 + 1 + 10 + 1 + 10 + 1 + 10 + 1 + 10));
+    for r in rows {
+        println!(
+            "   {:>11} {:>10.0} {:>10} {:>10} {:>10}",
+            r.spin_budget, r.mean_ns, r.p50_ns, r.p99_ns, r.samples
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Late-arriver tail sweep (6-way asymmetric 2µs)
+//
+// §§7-8 sample an *early* arriver's `wait()` — that's `stagger +
+// release_propagation`, which is useful for understanding the parked-
+// waiter wake cost but over-reports what actually bounds round-trip
+// throughput. The ThreadedEmulator can't end a quantum until the slowest
+// worker's `wait()` returns, so what we need is the *late* arriver's wait
+// tail: the interval from when the last-arriving thread calls `wait()` to
+// when that same thread's `wait()` returns.
+//
+// For the late arriver this is pure release propagation. It never parks
+// on its own side (it's the last arriver — it takes the `n == parties`
+// branch, bumps the generation, and returns immediately). Its cost is
+// dominated by the `notify_all()` kernel call that has to wake up to
+// `parties-1` parked threads before `wait()` can return — so at b=128
+// (everyone parked), we pay `notify_all` on 5 threads; at b=1024+
+// (nobody parks), notify_all is a near-free no-op path.
+//
+// Thread-id convention (mirrors §8 but swaps sampler ↔ late):
+//   tid == 0            : late arriver / sampler — busy-waits `late_delay`,
+//                         then times its own `wait()`.
+//   tid == 1..parties-1 : early arrivers, no sampling, no stagger.
+//
+// Everything else (warmup, percentile math, barrier, round count) mirrors
+// §8 exactly so the two sweeps are comparable side-by-side.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Late-arriver asymmetric benchmark on `ParamSpinBarrier`. The sampled
+/// thread is the *late* arriver — it busy-waits `late_delay` then times
+/// its own `wait()` call. That timing window is pure release propagation
+/// (no stagger inside it, and this thread never parks).
+fn bench_param_barrier_late_tail(
+    parties: u32,
+    rounds: usize,
+    late_delay: Duration,
+    spin_budget: u32,
+) -> SweepStats {
+    assert!(parties >= 3, "late-tail case needs ≥ late + 2 peers");
+    let barrier = Arc::new(ParamSpinBarrier::new(parties, spin_budget));
+
+    // Warmup — prime OS scheduler and caches (same shape as §8).
+    {
+        let warm = Arc::new(ParamSpinBarrier::new(parties, spin_budget));
+        let handles: Vec<_> = (0..parties)
+            .map(|_| {
+                let b = Arc::clone(&warm);
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        b.wait();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    let samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::with_capacity(rounds)));
+
+    let mut handles = Vec::with_capacity(parties as usize);
+    for tid in 0..parties {
+        let b = Arc::clone(&barrier);
+        let s = Arc::clone(&samples);
+        handles.push(std::thread::spawn(move || {
+            if tid == 0 {
+                // Late arriver *and* sampler. Stagger happens OUTSIDE the
+                // timed window, so the sample is pure release propagation.
+                let mut local = Vec::with_capacity(rounds);
+                for _ in 0..rounds {
+                    busy_wait_approx(late_delay);
+                    let t0 = Instant::now();
+                    b.wait();
+                    local.push(t0.elapsed().as_nanos() as u64);
+                }
+                let mut g = s.lock().unwrap();
+                *g = local;
+            } else {
+                // Early arrivers — no stagger, no sampling.
+                for _ in 0..rounds {
+                    b.wait();
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let mut samples = Arc::try_unwrap(samples)
+        .ok()
+        .expect("sampler arc should have only one strong ref after join")
+        .into_inner()
+        .unwrap();
+    samples.sort_unstable();
+
+    let total: u64 = samples.iter().sum();
+    let mean_ns = total as f64 / samples.len() as f64;
+    let p50_ns = percentile_ns(&samples, 50.0);
+    let p99_ns = percentile_ns(&samples, 99.0);
+
+    SweepStats {
+        spin_budget,
+        mean_ns,
+        p50_ns,
+        p99_ns,
+        samples: samples.len(),
+    }
+}
+
+fn print_barrier_stats_table(
+    all: &[BarrierStats],
+    sweep_early: &[SweepStats],
+    sweep_late: &[SweepStats],
+) {
     println!();
     println!("=== Production SpinBarrier sweep (HLD §7 gate) ===");
     println!(
-        "{:<16} {:>7} {:>10} {:>9} {:>10} {:>10}",
-        "config", "parties", "mean_ns", "p50_ns", "p99_ns", "samples"
+        "{:<22} {:>7} {:>7} {:>10} {:>9} {:>10} {:>10}",
+        "config", "parties", "arriver", "mean_ns", "p50_ns", "p99_ns", "samples"
     );
-    println!("{}", "-".repeat(16 + 1 + 7 + 1 + 10 + 1 + 9 + 1 + 10 + 1 + 10));
+    println!(
+        "{}",
+        "-".repeat(22 + 1 + 7 + 1 + 7 + 1 + 10 + 1 + 9 + 1 + 10 + 1 + 10)
+    );
     for s in all {
+        // §§6-7 all sample an early arriver.
         println!(
-            "{:<16} {:>7} {:>10.0} {:>9} {:>10} {:>10}",
-            s.config, s.parties, s.mean_ns, s.p50_ns, s.p99_ns, s.samples
+            "{:<22} {:>7} {:>7} {:>10.0} {:>9} {:>10} {:>10}",
+            s.config, s.parties, "early", s.mean_ns, s.p50_ns, s.p99_ns, s.samples
         );
+    }
+    // Append §§8-9 sweep rows so the gate decision is visible in one place.
+    // `parties` is always 6 for the sweeps (the asymmetric-2µs case).
+    // Print each budget's early row followed immediately by its late row
+    // so the two are directly comparable. The two sweeps may cover
+    // slightly different budget sets (§8 includes 8192 for the historical
+    // knee search; §9 stops at 4096 per the HLD gate's target range), so
+    // print the union keyed by budget.
+    let mut budgets: Vec<u32> = sweep_early
+        .iter()
+        .map(|r| r.spin_budget)
+        .chain(sweep_late.iter().map(|r| r.spin_budget))
+        .collect();
+    budgets.sort_unstable();
+    budgets.dedup();
+    for b in budgets {
+        let label = format!("sweep-b={}", b);
+        if let Some(e) = sweep_early.iter().find(|r| r.spin_budget == b) {
+            println!(
+                "{:<22} {:>7} {:>7} {:>10.0} {:>9} {:>10} {:>10}",
+                label, 6u32, "early", e.mean_ns, e.p50_ns, e.p99_ns, e.samples
+            );
+        }
+        if let Some(l) = sweep_late.iter().find(|r| r.spin_budget == b) {
+            println!(
+                "{:<22} {:>7} {:>7} {:>10.0} {:>9} {:>10} {:>10}",
+                label, 6u32, "late", l.mean_ns, l.p50_ns, l.p99_ns, l.samples
+            );
+        }
     }
 }
 
@@ -880,7 +1236,47 @@ fn main() {
     );
     results.push(asym);
 
-    print_barrier_stats_table(&results);
+    // --- Section 8: SPIN_BUDGET sweep under the same 6-way asymmetric-2µs
+    // pattern, on a local parameterised-budget clone of the production
+    // barrier. Goal: locate the knee where early arrivers stay on the
+    // spin path through the 2 µs stagger and nobody parks.
+    println!("\n8. Parameterised SpinBarrier SPIN_BUDGET sweep (6-way asymmetric 2µs, EARLY sampler)");
+    let mut sweep_early: Vec<SweepStats> = Vec::new();
+    for &budget in &[128u32, 256, 512, 1024, 2048, 4096, 8192] {
+        let row = bench_param_barrier_asymmetric(
+            6,
+            GATE_ROUNDS,
+            Duration::from_micros(2),
+            budget,
+        );
+        sweep_early.push(row);
+    }
+    print_sweep_table(&sweep_early);
+
+    // --- Section 9: late-arriver tail sweep. Same 6-way asymmetric-2µs
+    // pattern and SPIN_BUDGET axis as §8, but the sampled thread is now
+    // the late arriver. Its timed window is pure release propagation —
+    // no stagger, no park on its side — which is the metric that
+    // actually bounds per-quantum throughput in the ThreadedEmulator.
+    //
+    // Expected shape: at b=128 every peer parks, so the late arriver's
+    // wait() pays notify_all-on-5-parked (~1-3 µs mean). At b=1024+ no
+    // peer has parked — they're all on the spin path waiting for the
+    // generation store — and notify_all is essentially free.
+    println!("\n9. Parameterised SpinBarrier SPIN_BUDGET sweep (6-way asymmetric 2µs, LATE sampler)");
+    let mut sweep_late: Vec<SweepStats> = Vec::new();
+    for &budget in &[128u32, 256, 512, 1024, 2048, 4096] {
+        let row = bench_param_barrier_late_tail(
+            6,
+            GATE_ROUNDS,
+            Duration::from_micros(2),
+            budget,
+        );
+        sweep_late.push(row);
+    }
+    print_sweep_table(&sweep_late);
+
+    print_barrier_stats_table(&results, &sweep_early, &sweep_late);
 
     // --- Go / No-Go ---
     println!("\n=== Go/No-Go ===");
