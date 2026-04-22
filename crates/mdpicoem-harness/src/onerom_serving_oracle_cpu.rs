@@ -73,7 +73,13 @@ pub const CPU_SERVE_LOOP_PC_HI: u32 = 0x1000_0930;
 /// silicon-calibrated timing remains a future pass). A case outside
 /// this window but correct byte-wise is reclassified as
 /// [`Verdict::LatencyOutOfEnvelope`] rather than a true FAIL.
-pub const CPU_ENVELOPE_CYCLES: std::ops::RangeInclusive<u32> = 9..=60;
+///
+/// Floor widened from 9 to 7 after the image_sel helper unblocked the
+/// `onerom_stress_cpu_rp2350` sweep: across 2045 legitimate serves, the
+/// minimum observed was 7 cycles (3 cases, correct byte), matching the
+/// theoretical best-path through the 5-instruction loop when CS is
+/// already low on loop entry.
+pub const CPU_ENVELOPE_CYCLES: std::ops::RangeInclusive<u32> = 7..=60;
 
 // ---------------------------------------------------------------------------
 // Internal constants
@@ -761,6 +767,157 @@ fn format_cpu_verdict(v: &CpuVerdict) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Boot-time image_sel forcing helper
+// ---------------------------------------------------------------------------
+
+/// Offset of `sdrr_pins_t` within the OneROM firmware flash image.
+/// Matches the constant documented at the top of
+/// `onerom_full_system_rp2350.rs` and the journal's hand-decode of the
+/// fixtures. All SDRR bakes for the RP2350 family land this struct here;
+/// the firmware does not relocate it.
+const SDRR_PINS_FLASH_OFFSET: usize = 0x80FC;
+
+/// Offset of `sel[MAX_IMG_SEL_PINS]` within `sdrr_pins_t` (see
+/// `sdrr/include/config_base.h`). The array holds up to 7 sel-pin
+/// GPIO numbers, with 0xFF (== `INVALID_PIN`) marking unused entries;
+/// the entry index is the bit position in the decoded `image_sel`
+/// value (entry 0 → bit 0, entry 1 → bit 1, etc.).
+const SDRR_PINS_SEL_OFFSET: usize = 52;
+
+/// Maximum number of image-select pins supported by SDRR firmware,
+/// mirroring `MAX_IMG_SEL_PINS` in `sdrr/include/config_base.h`.
+const MAX_IMG_SEL_PINS: usize = 7;
+
+/// Offset of `sel_jumper_pull` (bit field, LSB = pin 0) within
+/// `sdrr_pins_t`. Each bit indicates the direction of the jumper pull
+/// when closed for that pin: `1` → jumper-to-high, `0` → jumper-to-low.
+/// See `setup_sel_pins` / `get_sel_value` in `sdrr/src/rp235x.c`: the
+/// firmware applies the *opposite* pull via the pad, then XORs the
+/// sampled GPIOs with a per-pin flip-bits mask so that "closed"
+/// always decodes as `1`.
+const SDRR_PINS_SEL_JUMPER_PULL_OFFSET: usize = 59;
+
+/// Sentinel value in `sel[]` indicating "pin not wired".
+const SEL_INVALID_PIN: u8 = 0xFF;
+
+/// Upper bound on valid GPIO pin numbers for the RP2350A MCU bake
+/// (`MAX_USED_GPIOS` in `sdrr/include/reg-rp235x.h`). Pins at or above
+/// this value are rejected by the firmware and by this helper.
+const MAX_USED_GPIOS_RP2350A: u8 = 30;
+
+/// Parse `sdrr_pins_t.sel[]` and `sel_jumper_pull` out of a OneROM
+/// firmware image and return the list of valid (gpio_pin, pull_dir)
+/// tuples in the order the firmware reads them. `pull_dir == true`
+/// means the jumper pulls the pin high when closed (firmware applies
+/// pull-down; raw HIGH decodes to `1`). `pull_dir == false` means the
+/// jumper pulls low when closed (firmware applies pull-up; raw LOW
+/// decodes to `1`).
+///
+/// Returns `None` if the flash image is too short to contain the
+/// struct. Returns an empty vec if the fixture declares no sel pins
+/// (all entries `INVALID_PIN`).
+fn parse_sel_pins(flash: &[u8]) -> Option<Vec<(u8, bool)>> {
+    let end = SDRR_PINS_FLASH_OFFSET
+        .checked_add(SDRR_PINS_SEL_JUMPER_PULL_OFFSET + 1)?;
+    if flash.len() < end {
+        return None;
+    }
+    let sel_base = SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_OFFSET;
+    let pull_bits = flash[SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_JUMPER_PULL_OFFSET];
+    let mut pins = Vec::with_capacity(MAX_IMG_SEL_PINS);
+    for ii in 0..MAX_IMG_SEL_PINS {
+        let pin = flash[sel_base + ii];
+        if pin == SEL_INVALID_PIN || pin >= MAX_USED_GPIOS_RP2350A {
+            continue;
+        }
+        let pull_dir = (pull_bits >> ii) & 1 != 0;
+        pins.push((pin, pull_dir));
+    }
+    Some(pins)
+}
+
+/// Force the SDRR firmware to boot into `rom_set_index` by driving the
+/// image-select GPIOs via the emulator's external-input stimulus path
+/// before the firmware samples them at boot.
+///
+/// Why this exists. SDRR picks its active ROM set from jumpers at boot:
+/// `check_sel_pins()` reads the sel-pin GPIOs, XORs them against a
+/// per-pin `flip_bits` mask (so "jumper closed" always decodes to `1`),
+/// and the resulting value modulo `rom_set_count` selects the ROM set.
+/// The fire-24-a RP2350 board wires sel pins to GPIO 27/28/29 with all
+/// pulls configured so firmware-applied pull-ups and XOR-flip give
+/// `sel_value == 7` when the jumpers float; on a 4-set fixture (1541)
+/// that lands on index 3, a 27C301 EPROM image with a different pin
+/// layout than ROM set 0. The shared [`CpuServingOracle`] library
+/// hardcodes ROM-set-0 pin constants — so the sweep needs set 0.
+///
+/// The emulator does not model pad pull-up/pull-down resistors, so
+/// floating sel pins read as `0` in raw GPIO (not as the pulled-up `1`
+/// they'd read on silicon). Under the firmware's XOR-flip that decodes
+/// to `sel_value == 7` regardless, same wrong outcome.
+///
+/// Fix: for each sel pin, compute the raw GPIO level the firmware has
+/// to see to decode the target bit of `rom_set_index`, then pin that
+/// level externally via `gpio_external_in` / `gpio_external_mask`
+/// before the firmware reads the pins. The firmware's `disable_sel_pins`
+/// call later in boot doesn't conflict — it only clears pad pulls;
+/// leaving the external stimulus engaged through sync is harmless
+/// because `CpuServingOracle::run_case` rewrites the mask to its own
+/// CS+ADDR set once per case.
+///
+/// Return `Err` if the flash image is malformed, the fixture declares
+/// no sel pins (no way to force via this mechanism — firmware would
+/// fall through to its default ROM 0 anyway, so caller should skip),
+/// or the requested index exceeds what the sel pin count can encode.
+///
+/// Call **after** `emu.reset()` (which zeros the external stimulus) and
+/// **before** any `emu.run(...)` that lets the firmware reach
+/// `check_sel_pins()`.
+pub fn force_rom_set_index_via_sel_pins(
+    emu: &mut Emulator,
+    flash: &[u8],
+    rom_set_index: u32,
+) -> Result<(), String> {
+    let pins = parse_sel_pins(flash)
+        .ok_or_else(|| "flash image too short to contain sdrr_pins_t".to_string())?;
+    if pins.is_empty() {
+        return Err("fixture declares no image-select pins".to_string());
+    }
+    let max_encodable: u64 = 1u64 << pins.len();
+    if (rom_set_index as u64) >= max_encodable {
+        return Err(format!(
+            "rom_set_index {} exceeds range of {} sel pin(s) (max {})",
+            rom_set_index,
+            pins.len(),
+            max_encodable - 1
+        ));
+    }
+
+    let mut mask: u32 = 0;
+    let mut value: u32 = 0;
+    for (ii, &(pin, pull_dir)) in pins.iter().enumerate() {
+        mask |= 1u32 << pin;
+        // `flip_bits` bit is set iff pull_dir == 0 (firmware applied
+        // pull-up because jumper pulls low). The decoded bit is
+        // `(raw >> pin) ^ flip_bit`; we want that to equal
+        // `(rom_set_index >> ii) & 1`, so the raw bit we drive is
+        // `decoded ^ flip_bit`.
+        let flip_bit = if pull_dir { 0 } else { 1 };
+        let decoded_bit = ((rom_set_index >> ii) & 1) as u32;
+        let raw_bit = decoded_bit ^ flip_bit;
+        value |= raw_bit << pin;
+    }
+
+    // OR into existing stimulus rather than replace — keeps this helper
+    // composable with any prior setup (none today, but `gpio_external_*`
+    // are shared bus fields and a future caller may stage other pins
+    // alongside).
+    emu.bus.gpio_external_mask |= mask;
+    emu.bus.gpio_external_in = (emu.bus.gpio_external_in & !mask) | (value & mask);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1156,5 +1313,112 @@ mod tests {
             !shadow_tripwire_ok(sentinel, wrong_value),
             "tripwire must reject SRAM bytes that don't match the sentinel"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // image_sel helper tests — pure, no emulator in the loop.
+    //
+    // The helper's job is: given a OneROM firmware image, compute the
+    // raw GPIO level required on each sel pin so the firmware decodes
+    // `rom_set_index`. These tests pin the encoding math against the
+    // fire-24-a sel layout (pins 27/28/29, all pull_dir=0), which
+    // matches both the test-sdrr-0 and 1541 fixtures bundled in the
+    // crate.
+    // -------------------------------------------------------------------
+
+    /// Build a synthetic flash image just large enough to expose
+    /// `sdrr_pins_t.sel[]` + `sel_jumper_pull`.
+    fn synth_pins_flash(sel: &[u8], pull_bits: u8) -> Vec<u8> {
+        let mut flash =
+            vec![0u8; SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_JUMPER_PULL_OFFSET + 1];
+        let base = SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_OFFSET;
+        // Fill all MAX_IMG_SEL_PINS entries, padding with INVALID_PIN.
+        for ii in 0..MAX_IMG_SEL_PINS {
+            flash[base + ii] = sel.get(ii).copied().unwrap_or(SEL_INVALID_PIN);
+        }
+        flash[SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_JUMPER_PULL_OFFSET] = pull_bits;
+        flash
+    }
+
+    #[test]
+    fn parse_sel_pins_decodes_fire_24_a_layout() {
+        // Matches the fire-24-a.json pin config and both bundled
+        // fixtures' bake: sel = [27, 28, 29, INVALID...], pulls all 0.
+        let flash = synth_pins_flash(&[27, 28, 29], 0);
+        let pins = parse_sel_pins(&flash).expect("parse");
+        assert_eq!(pins, vec![(27, false), (28, false), (29, false)]);
+    }
+
+    #[test]
+    fn parse_sel_pins_skips_invalid_and_out_of_range() {
+        // sel[1] = INVALID_PIN, sel[2] = out of range → both dropped.
+        // The remaining two pins keep their original array position for
+        // bit-assignment purposes (the caller uses iter-index as the
+        // encoded bit).
+        let flash = synth_pins_flash(&[5, SEL_INVALID_PIN, 99, 10], 0b1010);
+        let pins = parse_sel_pins(&flash).expect("parse");
+        // Pin 5 at array index 0 → pull_bits bit 0 = 0 → pull_dir=false.
+        // Pin 10 at array index 3 → pull_bits bit 3 = 1 → pull_dir=true.
+        assert_eq!(pins, vec![(5, false), (10, true)]);
+    }
+
+    #[test]
+    fn parse_sel_pins_returns_none_for_short_flash() {
+        assert!(parse_sel_pins(&[0u8; 100]).is_none());
+    }
+
+    /// Encoding math: with sel=[27,28,29] and pull_dir=false on each,
+    /// `flip_bit=1` on all. The raw GPIO we drive must be
+    /// `decoded_bit ^ 1`; i.e. to get `sel_value = rom_set_index`, raw
+    /// pin `i` should be `!bit(i, rom_set_index)`.
+    ///
+    /// Uses an `EmulatorBuilder` so we exercise the exact Bus fields
+    /// the production call site writes.
+    #[test]
+    fn force_rom_set_index_sets_bus_fields_correctly() {
+        use mdrp2350::{Config, EmulatorBuilder};
+
+        // Each case: (rom_set_index, expected raw value on pins 27/28/29).
+        // pull_dir=false on all three → raw = !decoded.
+        // index 0 → decoded 000 → raw 111 → bits 27|28|29 all set.
+        // index 3 → decoded 011 → raw 100 → only bit 29 set.
+        let flash = synth_pins_flash(&[27, 28, 29], 0);
+        let expected_mask = (1u32 << 27) | (1u32 << 28) | (1u32 << 29);
+        let cases = [
+            (0u32, expected_mask),               // raw 111
+            (1u32, (1u32 << 28) | (1u32 << 29)), // raw 110
+            (3u32, 1u32 << 29),                  // raw 100
+            (7u32, 0u32),                         // raw 000
+        ];
+        for (index, expected_val) in cases {
+            let mut emu = EmulatorBuilder::new(Config::default()).build();
+            force_rom_set_index_via_sel_pins(&mut emu, &flash, index)
+                .expect("force");
+            assert_eq!(
+                emu.bus.gpio_external_mask, expected_mask,
+                "mask for index {}", index
+            );
+            assert_eq!(
+                emu.bus.gpio_external_in, expected_val,
+                "value for index {}", index
+            );
+        }
+    }
+
+    #[test]
+    fn force_rom_set_index_rejects_out_of_range() {
+        use mdrp2350::{Config, EmulatorBuilder};
+        // 3 sel pins → max encodable index = 7.
+        let flash = synth_pins_flash(&[27, 28, 29], 0);
+        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        assert!(force_rom_set_index_via_sel_pins(&mut emu, &flash, 8).is_err());
+    }
+
+    #[test]
+    fn force_rom_set_index_rejects_no_sel_pins() {
+        use mdrp2350::{Config, EmulatorBuilder};
+        let flash = synth_pins_flash(&[], 0);
+        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        assert!(force_rom_set_index_via_sel_pins(&mut emu, &flash, 0).is_err());
     }
 }

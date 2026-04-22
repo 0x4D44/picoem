@@ -24,29 +24,30 @@
 //! Hardcoded fixture path + `ROM_SET_INDEX` — change and recompile to
 //! target a different fixture or ROM set.
 //!
-//! **Known limitation — library pin-map hardcoded**. The 1541 CPU-mode
-//! firmware was metadata-baked with its "chip select" wired to GPIO0;
-//! the shared [`onerom_serving_oracle_cpu::CpuServingOracle`] drives CS
-//! on GPIO13 (per `test-sdrr-0-cpu`'s bake). Net effect at 2048-case
-//! scale: the CPU stays in its wait-loop for stim patterns that don't
-//! happen to set GPIO0 high, reporting `NoResolve` (OEN never asserted).
+//! **Boot-time ROM-set forcing**. The 1541 CPU-mode fixture bundles four
+//! ROM sets. With floating image-select jumpers the firmware decodes
+//! `sel_value = 7` (a combination of pad pull-ups and per-pin flip bits)
+//! and picks `7 % 4 = 3` — a 27C301 EPROM image with a completely
+//! different pin layout (CS on GPIO0, data on GPIO26) from what the
+//! shared [`onerom_serving_oracle_cpu::CpuServingOracle`] library
+//! drives. Pre-fix runs reported ~140/2048 PASS, and those 140 were
+//! spurious: the emulator was watching ROM set 3's idle pins while the
+//! stim happened to produce an `expected == 0x00` shadow lookup that
+//! the oracle's `ZERO_BYTE_TRUST_TIMEOUT_CPU` fallback trusted.
 //!
-//! Current run: ~140/2048 PASS. **Those 140 are a double-coincidence,
-//! not real serve-path coverage**: they pass only because (a) the stim
-//! pattern incidentally sets GPIO0 high AND (b) the expected shadow
-//! byte is `0x00`, so the oracle's `ZERO_BYTE_TRUST_TIMEOUT_CPU`
-//! fallback declares pass after 40 cycles of dead pins. Cases where
-//! GPIO0 is low never reach the timeout classification; cases where
-//! GPIO0 is high but the expected byte is non-zero would surface as
-//! `NoStableByte`. No case currently verifies that the CPU actually
-//! served the right byte onto the data pins via the 1541 serve loop.
+//! ROM set 0 of this fixture is `1541-e000.901229-06AA.bin` — a 2364
+//! mask ROM with `CS1=GPIO13`, identical to `test-sdrr-0-cpu`'s
+//! default set and matching the library's hardcoded pin constants. We
+//! therefore force the firmware to boot ROM set 0 by driving the
+//! image-select GPIOs via
+//! [`onerom_serving_oracle_cpu::force_rom_set_index_via_sel_pins`]
+//! before the first emulator step, and run the sweep against set 0
+//! without touching the library constants.
 //!
-//! Fix requires parameterising `CpuServingOracle` over a per-fixture
-//! pin profile (read from flash metadata); tracked in `tech_debt.md`.
-//! This binary is retained as a latent regression target that will
-//! flip to full PASS once the pin profile wiring lands.
-//!
-//! Design: `wrk_docs/2026.04.17 - HLD - OneROM Stress Harness.md`.
+//! Design: `wrk_docs/2026.04.17 - HLD - OneROM Stress Harness.md`
+//! (original); `wrk_docs/2026.04.22 - HLD - OneROM CPU Speed Grade
+//! Oracle.md` §Phase 1' for the image_sel forcing helper that unblocks
+//! this binary.
 //!
 //! Usage:
 //!   cargo run -p mdpicoem-harness --bin onerom_stress_cpu_rp2350 --release
@@ -81,16 +82,24 @@ const BOOT_CYCLE_CAP: u64 = 10_000_000;
 /// First N failures to inline in the report (HLD §Output format).
 const FIRST_FAILS_CAP: usize = 20;
 
-/// CPU serve-loop PC range for the **1541** fixture. Differs from
-/// [`onerom_serving_oracle_cpu::CPU_SERVE_LOOP_PC_LO`] because the 1541
-/// firmware was built with a different ROM config; the 5-instruction
-/// tight loop lives at a different offset. Empirically discovered via
-/// `verify_1541_cpu` (PC histogram on the patched 1541 fixture, 37.5/
-/// 25/12.5/12.5/12.5% distribution matching the 5-instruction loop
-/// shape). Updating this is Stage 3's workaround for HLD §Risk 1 —
-/// we don't touch the shipped oracle constants for test-sdrr-0.
-const SERVE_LOOP_PC_LO_1541: u32 = 0x1000_09A4;
-const SERVE_LOOP_PC_HI_1541: u32 = 0x1000_09B0;
+/// CPU serve-loop PC range for the 1541 fixture's **ROM set 0** (2364
+/// mask ROM, `1541-e000.901229-06AA.bin`). With ROM set 0 forced at
+/// boot via the image_sel helper, the 5-instruction tight loop lives
+/// at the same offsets as the `test-sdrr-0` fixture's default set —
+/// both are 2364 bakes, so they share the serve-loop code layout.
+/// Empirically verified with `_probe_1541_cpu_romset0` (PC histogram
+/// 28.57/28.57/14.28/14.28/14.28% = the expected 5-instruction loop
+/// distribution).
+///
+/// Aliases [`onerom_serving_oracle_cpu::CPU_SERVE_LOOP_PC_LO`]/`_HI`
+/// today; kept as local constants rather than `use`-imports so that
+/// if a future 1541 fixture bake shifts the serve loop, the two can
+/// diverge without touching the shared library. The pre-Phase-1' value
+/// (`0x1000_09A4..=0x1000_09B0`) corresponded to the 1541 fixture's
+/// floating-jumper default (ROM set 3, a 27C301 image with a different
+/// serve loop); forcing ROM set 0 brings this back in line with set 0.
+const SERVE_LOOP_PC_LO_1541: u32 = 0x1000_0926;
+const SERVE_LOOP_PC_HI_1541: u32 = 0x1000_0930;
 
 fn main() -> ExitCode {
     mdpicoem_harness::harness_tracing_init();
@@ -141,6 +150,21 @@ fn main() -> ExitCode {
 
     // CPU-serve mode is single-core.
     emu.core_mut(1).halt();
+
+    // Pin the image-select GPIOs so the firmware's `check_sel_pins()`
+    // decodes `rom_set_index = ROM_SET_INDEX` instead of its default
+    // floating-jumper fallback (which lands on ROM set 3 in this
+    // 4-set fixture — a 27C301 image with an incompatible pin layout).
+    // Must happen after `emu.reset()` (which clears external stimulus)
+    // and before the first run-step below.
+    if let Err(e) = onerom_serving_oracle_cpu::force_rom_set_index_via_sel_pins(
+        &mut emu,
+        &flash,
+        ROM_SET_INDEX as u32,
+    ) {
+        eprintln!("failed to force rom_set_index {}: {}", ROM_SET_INDEX, e);
+        return ExitCode::from(2);
+    }
 
     // Two-phase sync (mirrors `onerom_serving_oracle_cpu_rp2350`):
     // phase 1 waits for core 0's PC to enter the 1541-specific serve
