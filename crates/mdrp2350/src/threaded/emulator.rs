@@ -2126,4 +2126,332 @@ mod tests {
             "coordinator phase-2 must advance master_cycle each quantum"
         );
     }
+
+    // ----- HLD V5 Stage B.4 §4 items 2-5: end-to-end per-block split -----
+
+    /// Build a minimal blinky-style PIO program on the target `block_idx`
+    /// that drives a single GPIO pin (`set_pin`) high forever via a
+    /// `SET PINS, 1` / `JMP 0` loop. Queues all setup through
+    /// `send_command` (no direct `PioBlock` mutation) so the drive path
+    /// matches real firmware's MMIO-only interface.
+    ///
+    /// After one-or-more `run_quanta` calls, `shared.pio.read_pads(block_idx)`
+    /// reports `(1 << set_pin, 1 << set_pin)` (pad_out, pad_oe).
+    fn queue_pio_blinky_setup(
+        shared: &SharedState,
+        block_idx: u8,
+        set_pin: u8,
+    ) {
+        // Program: addr 0 = SET PINS, 1; addr 1 = JMP 0.
+        let set_pins_1: u16 = 0xE001;
+        let jmp_0: u16 = 0x0000;
+        shared.pio.send_command(PioCommand::WriteInstrMem {
+            block: block_idx,
+            addr: 0,
+            value: set_pins_1,
+            alias: 0,
+        });
+        shared.pio.send_command(PioCommand::WriteInstrMem {
+            block: block_idx,
+            addr: 1,
+            value: jmp_0,
+            alias: 0,
+        });
+
+        // SM0_PINCTRL (0x0DC): set_base=set_pin (bits[9:5]), set_count=1
+        // (bits[28:26]).
+        let pinctrl = (1u32 << 26) | ((set_pin as u32) << 5);
+        shared.pio.send_command(PioCommand::WriteReg {
+            block: block_idx,
+            offset: 0x0DC,
+            val: pinctrl,
+            alias: 0,
+        });
+
+        // SM0_EXECCTRL (0x0CC): wrap_top=1 (bits[16:12]), wrap_bottom=0.
+        let execctrl = 1u32 << 12;
+        shared.pio.send_command(PioCommand::WriteReg {
+            block: block_idx,
+            offset: 0x0CC,
+            val: execctrl,
+            alias: 0,
+        });
+
+        // SM0_INSTR (0x0D8): force-execute SET PINDIRS, 1 so the pin
+        // is configured for output before the program drives it.
+        // SET PINDIRS, 1 = 0xE081.
+        shared.pio.send_command(PioCommand::WriteReg {
+            block: block_idx,
+            offset: 0x0D8,
+            val: 0xE081,
+            alias: 0,
+        });
+
+        // CTRL (0x000): enable SM0.
+        shared.pio.send_command(PioCommand::WriteCtrl {
+            block: block_idx,
+            val: 0b0001,
+            alias: 0,
+        });
+    }
+
+    /// §4 item 2 — per-block concurrent integration. Two different
+    /// blinky programs run simultaneously on PIO1 (pin 10) and PIO2
+    /// (pin 20). After a burst of quanta, each block's pad snapshot
+    /// reflects its own program independently — the pre-split single
+    /// PIO worker could not have expressed concurrent per-block pad
+    /// state in the same quantum.
+    ///
+    /// The assertion checks `pad_oe` bits (the driven pins) per block,
+    /// not `pad_out` — `pad_out` can carry undriven-high bits from the
+    /// block's `merge_pin_outputs` compositing; `pad_oe` is the clean
+    /// per-block independence signal. What matters for independence is
+    /// that block 1's driven bit is pin 10 and block 2's is pin 20,
+    /// with no crosstalk.
+    ///
+    /// All `send_command` calls happen on the test thread (no cross-
+    /// core TXF traffic), dodging the pre-existing SPSC-MPSC hazard
+    /// called out in the HLD.
+    #[test]
+    fn per_block_concurrent_pio1_and_pio2_independent_pads() {
+        const PIN_A: u8 = 10;
+        const PIN_B: u8 = 20;
+
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        // Halt both cores — we only care about the PIO workers.
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        queue_pio_blinky_setup(&threaded.shared, 1, PIN_A);
+        queue_pio_blinky_setup(&threaded.shared, 2, PIN_B);
+
+        threaded.run_quanta(10);
+
+        let (out1, oe1) = threaded.shared.pio.read_pads(1);
+        let (out2, oe2) = threaded.shared.pio.read_pads(2);
+
+        // Block 1 drives pin PIN_A only; block 2 drives pin PIN_B only.
+        assert_eq!(
+            oe1,
+            1u32 << PIN_A,
+            "PIO1 pad_oe must drive pin {PIN_A} exclusively (got {oe1:#x})",
+        );
+        assert_eq!(
+            oe2,
+            1u32 << PIN_B,
+            "PIO2 pad_oe must drive pin {PIN_B} exclusively (got {oe2:#x})",
+        );
+        // And the driven bit on each side must be high (SET PINS, 1 ran).
+        assert_ne!(out1 & (1u32 << PIN_A), 0, "PIO1 pad_out bit PIN_A must be 1");
+        assert_ne!(out2 & (1u32 << PIN_B), 0, "PIO2 pad_out bit PIN_B must be 1");
+        // Cross-check: PIO1 did not drive PIO2's pin and vice versa.
+        assert_eq!(oe1 & (1u32 << PIN_B), 0, "PIO1 must not drive PIO2's pin");
+        assert_eq!(oe2 & (1u32 << PIN_A), 0, "PIO2 must not drive PIO1's pin");
+
+        // PIO0 untouched — its worker still ran but drained no commands
+        // and has no enabled SMs, so its pad snapshot stays at 0.
+        assert_eq!(
+            threaded.shared.pio.read_pads(0),
+            (0, 0),
+            "PIO0 pads must remain zero — no program was queued for it",
+        );
+    }
+
+    /// §4 item 3 — cross-block command ordering smoke. A single-thread
+    /// burst of three `WriteCtrl` commands with different block targets
+    /// and different SM_ENABLE masks lands on the three per-block
+    /// queues; one `run_quanta(1)` drains and applies all three. After
+    /// the quantum, each block's `read_sm_enabled` reflects its own
+    /// mask — proving per-block routing preserves per-block semantics
+    /// across the barrier boundary.
+    #[test]
+    fn cross_block_writectrl_burst_reaches_each_block() {
+        // Disjoint single-bit masks so a mis-routing that delivers all
+        // three commands to block 0 (in sequence) cannot accidentally
+        // pass — each block must end with its exclusive bit set.
+        const ENABLE_SM_MASK_0: u32 = 0b0001;
+        const ENABLE_SM_MASK_1: u32 = 0b0010;
+        const ENABLE_SM_MASK_2: u32 = 0b0100;
+
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        threaded.shared.pio.send_command(PioCommand::WriteCtrl {
+            block: 0,
+            val: ENABLE_SM_MASK_0,
+            alias: 0,
+        });
+        threaded.shared.pio.send_command(PioCommand::WriteCtrl {
+            block: 1,
+            val: ENABLE_SM_MASK_1,
+            alias: 0,
+        });
+        threaded.shared.pio.send_command(PioCommand::WriteCtrl {
+            block: 2,
+            val: ENABLE_SM_MASK_2,
+            alias: 0,
+        });
+
+        threaded.run_quanta(1);
+
+        assert_eq!(
+            threaded.shared.pio.read_sm_enabled(0) as u32,
+            ENABLE_SM_MASK_0,
+            "PIO0 SM_ENABLE must reflect its WriteCtrl",
+        );
+        assert_eq!(
+            threaded.shared.pio.read_sm_enabled(1) as u32,
+            ENABLE_SM_MASK_1,
+            "PIO1 SM_ENABLE must reflect its WriteCtrl",
+        );
+        assert_eq!(
+            threaded.shared.pio.read_sm_enabled(2) as u32,
+            ENABLE_SM_MASK_2,
+            "PIO2 SM_ENABLE must reflect its WriteCtrl",
+        );
+    }
+
+    /// §4 item 4 — idle-block pad-publish semantics. The HLD's invariant
+    /// is that an idle PIO worker *still publishes* every quantum (HLD
+    /// V5 §2.1 unconditional `write_pads`), so coord's `update_gpio`
+    /// always sees a coherent pad snapshot per block. The concrete
+    /// post-disable latch value is whatever `PioBlock::write_ctrl`
+    /// happens to leave behind — `set_sm_enabled(false)` calls
+    /// `merge_pin_outputs`, which zeroes pad_out/pad_oe when the last
+    /// SM drops out (mirrors `mdpicoem_common::pio::tests::
+    /// disable_clears_pin_outputs`). So "latched" here means "stable":
+    /// whatever the first post-disable quantum publishes must survive
+    /// unchanged across subsequent idle quanta.
+    ///
+    /// The test sequence: enable PIO1 → latch a non-zero pad_oe →
+    /// disable → snapshot the published value → run 10 more idle quanta
+    /// → assert the snapshot is unchanged. Stability, not non-zero.
+    #[test]
+    fn disabled_block_still_publishes_stable_pads() {
+        const PIN: u8 = 15;
+
+        let mut threaded =
+            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        // Phase 1: enable + run so pads latch to a non-zero pad_oe.
+        queue_pio_blinky_setup(&threaded.shared, 1, PIN);
+        threaded.run_quanta(10);
+        let active_pads = threaded.shared.pio.read_pads(1);
+        assert_eq!(
+            active_pads.1,
+            1u32 << PIN,
+            "PIO1 pad_oe must drive pin {PIN} while SM0 is enabled (got {:#x})",
+            active_pads.1,
+        );
+
+        // Phase 2: disable SM0 and run one quantum so the CTRL write
+        // drains + applies + the worker publishes the resulting pads.
+        threaded.shared.pio.send_command(PioCommand::WriteCtrl {
+            block: 1,
+            val: 0,
+            alias: 0,
+        });
+        threaded.run_quanta(1);
+        assert_eq!(
+            threaded.shared.pio.read_sm_enabled(1),
+            0,
+            "SM0 should be disabled after the WriteCtrl with val=0",
+        );
+        let idle_pads = threaded.shared.pio.read_pads(1);
+
+        // Phase 3: run 10 more idle quanta — the published pads must
+        // not drift. The worker still runs, drains its (empty) queue,
+        // skips step_n (enable gate), and publishes pad state every
+        // quantum; the value published is stable because nothing mutates
+        // `block.pad_out / pad_oe` once the SM is disabled and step_n
+        // is skipped.
+        threaded.run_quanta(10);
+        assert_eq!(
+            threaded.shared.pio.read_pads(1),
+            idle_pads,
+            "idle PIO1 must keep publishing the same pad snapshot every quantum",
+        );
+
+        // Other blocks unaffected — their workers publish their own
+        // (zero) pad state independently.
+        assert_eq!(threaded.shared.pio.read_pads(0), (0, 0));
+        assert_eq!(threaded.shared.pio.read_pads(2), (0, 0));
+    }
+
+    /// §4 item 5 — per-PIO panic-naming + reassembly end-to-end.
+    /// Parameterised over `{pio0, pio1, pio2}`: `TestPanic { block }`
+    /// routes through `send_command` into the per-block queue, the
+    /// matching PIO worker drains + `apply_pio_command` panics with
+    /// `pio{block}` in the message, `spawn_worker` poisons the barrier,
+    /// the remaining workers exit cleanly, and `run_quanta` panics on
+    /// the main thread with an enumeration of the panicked worker(s).
+    ///
+    /// Post-panic, the ThreadedEmulator is poisoned: `pio_blocks` is
+    /// `None` (HLD V5 §2.7) and the next `run_quanta` call panics with
+    /// the `poisoned by prior worker panic` message.
+    #[test]
+    fn test_panic_on_pio_worker_poisons_emulator_and_names_block() {
+        for block in 0..3u8 {
+            let mut threaded =
+                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+
+            threaded
+                .shared
+                .pio
+                .send_command(PioCommand::TestPanic { block });
+
+            let expected_name = format!("pio{block}");
+            let result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| threaded.run_quanta(1)),
+            );
+            let payload = result.expect_err(
+                "run_quanta must panic when a PIO worker panics",
+            );
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                msg.contains(&expected_name),
+                "panic message must name the specific worker ({expected_name}); got: {msg}",
+            );
+
+            // HLD V5 §2.7: poisoned instance — pio_blocks dropped, flag set.
+            assert!(
+                threaded.poisoned,
+                "block {block}: poisoned flag must be set after PIO worker panic",
+            );
+            assert!(
+                threaded.pio_blocks.is_none(),
+                "block {block}: pio_blocks must be None after PIO worker panic",
+            );
+
+            // Contract: a second `run_quanta` on the poisoned instance
+            // panics early with the "poisoned" assertion — proving the
+            // instance cannot be reused.
+            let reuse = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| threaded.run_quanta(1)),
+            );
+            let reuse_err = reuse.expect_err(
+                "reuse of a poisoned ThreadedEmulator must panic",
+            );
+            let reuse_msg = reuse_err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| reuse_err.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                reuse_msg.contains("poisoned"),
+                "reuse panic must cite poisoning; got: {reuse_msg}",
+            );
+        }
+    }
 }

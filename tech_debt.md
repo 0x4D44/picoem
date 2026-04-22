@@ -1311,3 +1311,28 @@ pass after 40 cycles of dead pins. No case currently verifies that the
 CPU actually drove the right byte onto the data pins via the 1541
 serve loop. The pass count should be read as "0 of 2048 cases are real
 serve-path verifications" until the pin-profile fix lands.
+
+## No watchdog on ThreadedEmulator SpinBarrier::wait (2026-04-22)
+
+**Context:** `crates/mdrp2350/src/threaded/barrier.rs` `SpinBarrier::wait`
+has no timeout. If a worker never arrives at the barrier (e.g. a
+PioBlock whose INSTR_MEM was corrupted into an infinite `JMP` loop, or
+a CortexM33 core that gets stuck spinning on an MMIO read that never
+resolves), the other 5 workers spin through SPIN_BUDGET and then park
+on `park_cv.wait` forever. `cargo test` hangs; `paced_bench_rp2350`
+hangs.
+
+Surfaced during Stage B.4 devil's-advocate review of the threaded
+PIO per-block workers HLD. The poisoning path (`SpinBarrier::poison`)
+handles panicking workers, but nothing handles stuck-but-not-panicking
+workers.
+
+**Fix sketch:** add an optional `wait_timeout(Duration)` variant that
+returns a `Timeout` result, and wire a sentinel timeout into
+`run_quanta` (e.g. `step_quantum * 256 * 100` ns — ~100× the
+expected per-quantum wall). On timeout, call `poison()` and propagate.
+Not high-urgency — no stuck-worker incident has occurred in practice —
+but worth having before any live-mode threaded deployment.
+
+Related: `crates/mdrp2350/src/threaded/emulator.rs` `run_quanta` has
+no overall wall-clock ceiling either.

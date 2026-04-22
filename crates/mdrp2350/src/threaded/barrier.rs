@@ -261,6 +261,94 @@ mod tests {
         );
     }
 
+    /// HLD V5 §4 item 12 — `ThreadedEmulator` now rendezvouses six
+    /// workers (core0, core1, pio0, pio1, pio2, coord) per quantum, so
+    /// the primitive's own unit-test surface should cover that arity
+    /// explicitly. Sibling of `multiple_rounds` with `PARTIES = 6`.
+    #[test]
+    fn multiple_rounds_6way() {
+        const PARTIES: u32 = 6;
+        const ROUNDS: u32 = 10;
+
+        let barrier = Arc::new(SpinBarrier::new(PARTIES));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..PARTIES)
+            .map(|_| {
+                let b = Arc::clone(&barrier);
+                let c = Arc::clone(&counter);
+                thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        match b.wait() {
+                            BarrierResult::Released => {
+                                c.fetch_add(1, SeqCst);
+                            }
+                            BarrierResult::Poisoned => panic!("unexpected poison"),
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(
+            counter.load(SeqCst),
+            (PARTIES * ROUNDS) as usize,
+            "counter should equal parties * rounds"
+        );
+    }
+
+    /// Asymmetric-arrival sibling to `multiple_rounds_6way`. One worker
+    /// busy-waits ~2 μs past the others before entering `wait()`. With
+    /// `SPIN_BUDGET=512` (~10 μs spin ceiling) no worker should park.
+    /// A regression that lowers `SPIN_BUDGET` below the ~2 μs stagger
+    /// ceiling would cause `Condvar::wait`/`notify_all` cycles —
+    /// measurable as a huge p99 spike in the microbench but previously
+    /// undetected by `cargo test`.
+    ///
+    /// This test doesn't measure timing; it just confirms 10 rounds
+    /// complete (no deadlock, no poison), exercising the late-arriver
+    /// code path that pure-symmetric `multiple_rounds` misses.
+    #[test]
+    fn parties_6_asymmetric_arrival_does_not_park() {
+        const PARTIES: u32 = 6;
+        const ROUNDS: u32 = 10;
+        let barrier = Arc::new(SpinBarrier::new(PARTIES));
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let handles: Vec<_> = (0..PARTIES)
+            .map(|tid| {
+                let b = Arc::clone(&barrier);
+                let c = Arc::clone(&counter);
+                thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        if tid == PARTIES - 1 {
+                            // Late arriver busy-waits ~2 μs.
+                            let t0 = std::time::Instant::now();
+                            while t0.elapsed() < Duration::from_micros(2) {
+                                std::hint::spin_loop();
+                            }
+                        }
+                        match b.wait() {
+                            BarrierResult::Released => {
+                                c.fetch_add(1, SeqCst);
+                            }
+                            BarrierResult::Poisoned => panic!("unexpected poison"),
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+        assert_eq!(counter.load(SeqCst), PARTIES * ROUNDS);
+    }
+
     #[test]
     fn poison_breaks_waiters() {
         // 4-party barrier but only 3 waiters: without poisoning they
