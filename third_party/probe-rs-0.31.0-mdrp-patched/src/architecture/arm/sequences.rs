@@ -540,21 +540,6 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         // the SWD version 2 sequence.
         let mut has_dormant = matches!(dp, DpAddress::Multidrop(_));
 
-        fn alert_sequence(interface: &mut dyn DapProbe) -> Result<(), ArmError> {
-            tracing::trace!("Sending Selection Alert sequence");
-
-            // Ensure target is not in the middle of detecting a selection alert
-            interface.swj_sequence(8, 0xFF)?;
-
-            // Alert Sequence Bits  0.. 63
-            interface.swj_sequence(64, 0x86852D956209F392)?;
-
-            // Alert Sequence Bits 64..127
-            interface.swj_sequence(64, 0x19BC0EA2E3DDAFE9)?;
-
-            Ok(())
-        }
-
         // TODO: Use atomic block
 
         let mut result = Ok(());
@@ -1175,11 +1160,43 @@ pub trait DebugEraseSequence: Send + Sync {
 /// Perform a SWD line reset (SWDIO high for 50 clock cycles)
 ///
 /// After the line reset, SWDIO will be kept low for `swdio_low_cycles` cycles.
-fn swd_line_reset(interface: &mut dyn DapProbe, swdio_low_cycles: u8) -> Result<(), ArmError> {
+///
+/// Visibility promoted to `pub(crate)` so vendor-sequence overrides (e.g. the
+/// RP235x ADIv6 dormant-wake path) can reuse the helper.
+/// See `wrk_docs/2026.04.22 - HLD - Track A.2d Dormant-wake gap.md` §7.1.
+pub(crate) fn swd_line_reset(
+    interface: &mut dyn DapProbe,
+    swdio_low_cycles: u8,
+) -> Result<(), ArmError> {
     assert!(swdio_low_cycles + 51 <= 64);
 
     tracing::debug!("Performing SWD line reset");
     interface.swj_sequence(51 + swdio_low_cycles, 0x0007_FFFF_FFFF_FFFF)?;
+
+    Ok(())
+}
+
+/// Send the 128-bit JEDEC Selection Alert sequence used to wake a target
+/// from its dormant state (ARM IHI 0074C §B4.3.3).
+///
+/// Emits an 8-bit `0xFF` guard followed by the two 64-bit alert halves.
+/// The caller is responsible for issuing the 12-bit activation code
+/// (`0x1A0` for SWD, `0x0A0` for JTAG) afterwards.
+///
+/// Visibility promoted to `pub(crate)` so vendor-sequence overrides (e.g. the
+/// RP235x ADIv6 dormant-wake path) can reuse the helper.
+/// See `wrk_docs/2026.04.22 - HLD - Track A.2d Dormant-wake gap.md` §7.1.
+pub(crate) fn alert_sequence(interface: &mut dyn DapProbe) -> Result<(), ArmError> {
+    tracing::trace!("Sending Selection Alert sequence");
+
+    // Ensure target is not in the middle of detecting a selection alert
+    interface.swj_sequence(8, 0xFF)?;
+
+    // Alert Sequence Bits  0.. 63
+    interface.swj_sequence(64, 0x86852D956209F392)?;
+
+    // Alert Sequence Bits 64..127
+    interface.swj_sequence(64, 0x19BC0EA2E3DDAFE9)?;
 
     Ok(())
 }
