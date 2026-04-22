@@ -2,10 +2,15 @@
 
 use crate::MemoryMappedRegister;
 use crate::architecture::arm::armv6m::{Aircr, Demcr};
+use crate::architecture::arm::communication_interface::DapProbe;
 use crate::architecture::arm::dp::{Ctrl, DpAddress, DpRegister};
 use crate::architecture::arm::memory::ArmMemoryInterface;
-use crate::architecture::arm::sequences::{ArmDebugSequence, cortex_m_wait_for_reset};
+use crate::architecture::arm::sequences::{
+    ArmDebugSequence, ArmDebugSequenceError, alert_sequence, cortex_m_wait_for_reset,
+    swd_line_reset,
+};
 use crate::architecture::arm::{AdiVersion, ApV2Address, ArmError, FullyQualifiedApAddress};
+use crate::probe::WireProtocol;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -113,6 +118,76 @@ impl ArmDebugSequence for Rp235x {
     /// reports DPIDR = 0x10212927 (see HLD 2026.04.22 Track A.2c §2.5).
     fn adi_version(&self) -> AdiVersion {
         AdiVersion::V6
+    }
+
+    /// RP235x ADIv6 dormant-wake override.
+    ///
+    /// The stock `ArmDebugSequence::debug_port_setup` only sends the
+    /// dormant-to-SWD wake sequence after the first `debug_port_connect`
+    /// attempt *fails*. On RP2354 silicon the initial JTAG-to-SWD
+    /// (`0xE79E`) attempt succeeds in reading DPIDR, but returns
+    /// `0x10212927` — the DP's power-on/legacy identity, not its
+    /// ADIv6/DPv3 identity. The retry-gated dormant fallback therefore
+    /// never fires, and subsequent V2-AP reads return 0 because the DP
+    /// is routed to the wrong internal register.
+    ///
+    /// OpenOCD's `dap create ... -adiv6` branch sends the 128-bit JEDEC
+    /// selection alert + `0x1A` SWD activation on every attach, which
+    /// transitions the DP into its ADIv6 identity (DPIDR `0x4c013477`,
+    /// V2 MEM-AP at `0x2000` reads `0x34770008`).
+    ///
+    /// This override mirrors the OpenOCD behaviour: unconditionally send
+    /// SWD→Dormant + alert + activation on every retry. RP235x does not
+    /// support JTAG attach in this fork; attempts with the wrong active
+    /// protocol return an error immediately.
+    ///
+    /// See `wrk_docs/2026.04.22 - HLD - Track A.2d Dormant-wake gap.md`
+    /// §2 and §4.1 for wire-level rationale.
+    fn debug_port_setup(
+        &self,
+        interface: &mut dyn DapProbe,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        tracing::info!(
+            "Rp235x::debug_port_setup: ADIv6 dormant-wake path (matches OpenOCD -adiv6); dp={dp:x?}"
+        );
+
+        if interface.active_protocol() != Some(WireProtocol::Swd) {
+            return Err(ArmDebugSequenceError::SequenceSpecific(
+                "Rp235x requires SWD (JTAG attach not supported by this vendor sequence)".into(),
+            )
+            .into());
+        }
+
+        // Retry count matches the upstream default (`NUM_RETRIES = 5`).
+        const NUM_RETRIES: usize = 5;
+        let mut result = Ok(());
+        for _ in 0..NUM_RETRIES {
+            // Ensure current debug interface is in reset state.
+            swd_line_reset(interface, 0)?;
+
+            // SWD → Dormant (31-bit `0x33BBBBBA`). Safe from any prior
+            // state per the ARM IHI 0074C commentary; matches the
+            // upstream dormant branch at sequences.rs §debug_port_setup.
+            tracing::debug!("RP235x: SWD → Dormant (0x33BBBBBA, 31 bits)");
+            interface.swj_sequence(31, 0x33BBBBBA)?;
+
+            // 128-bit JEDEC selection alert (two 64-bit halves + 8-bit
+            // guard prefix). The shared helper was promoted to
+            // pub(crate) in Commit 1 for vendor reuse.
+            alert_sequence(interface)?;
+
+            // 4 cycles SWDIO low + 8-bit SWD activation code `0x1A`.
+            interface.swj_sequence(12, 0x1A0)?;
+
+            // Attempt DPIDR read (this does its own swd_line_reset + read).
+            result = self.debug_port_connect(interface, dp);
+            if result.is_ok() {
+                break;
+            }
+        }
+
+        result
     }
 
     fn reset_system(
