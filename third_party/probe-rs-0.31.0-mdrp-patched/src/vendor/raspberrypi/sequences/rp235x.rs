@@ -5,7 +5,7 @@ use crate::architecture::arm::armv6m::{Aircr, Demcr};
 use crate::architecture::arm::dp::{Ctrl, DpAddress, DpRegister};
 use crate::architecture::arm::memory::ArmMemoryInterface;
 use crate::architecture::arm::sequences::{ArmDebugSequence, cortex_m_wait_for_reset};
-use crate::architecture::arm::{ApV2Address, ArmError, FullyQualifiedApAddress};
+use crate::architecture::arm::{AdiVersion, ApV2Address, ArmError, FullyQualifiedApAddress};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,10 @@ pub struct Rp235x {}
 impl Rp235x {
     /// Create a debug sequencer for a Raspberry Pi RP235x
     pub fn create() -> Arc<Self> {
+        tracing::info!(
+            "RP235x debug sequence constructed; declaring ADIv6 for V2-AP addressing \
+             (matches OpenOCD `dap create ... -adiv6`, see HLD 2026.04.22 Track A.2c)"
+        );
         Arc::new(Rp235x {})
     }
 
@@ -101,6 +105,16 @@ impl Rp235x {
 }
 
 impl ArmDebugSequence for Rp235x {
+    /// RP235x uses ADIv6 with V2-shaped APs at 32-bit base addresses
+    /// (core 0 at 0x2000, core 1 at 0x4000, RP-AP at 0x80000).
+    /// Declared up-front as a target property regardless of DPIDR.version,
+    /// matching OpenOCD's `dap create ... -adiv6` Tcl model. Without this
+    /// override, probe-rs would misroute V2-AP accesses on silicon that
+    /// reports DPIDR = 0x10212927 (see HLD 2026.04.22 Track A.2c §2.5).
+    fn adi_version(&self) -> AdiVersion {
+        AdiVersion::V6
+    }
+
     fn reset_system(
         &self,
         core: &mut dyn ArmMemoryInterface,
