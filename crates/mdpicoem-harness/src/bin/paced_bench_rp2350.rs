@@ -58,6 +58,19 @@
 //!                      barrier) and barrier_wait_ns (time blocked
 //!                      waiting for peers). Off by default; when off
 //!                      the workers skip every `Instant::now()` call.
+//!   --runs N           Repeat the full bench N+1 times: one warm-up
+//!                      run (output labelled, but discarded from
+//!                      stats) plus N measured runs. Prints a per-run
+//!                      table of throughput (Avg MHz) and a summary
+//!                      line reporting `mean / stdev / cv% / p50 /
+//!                      p99 / min / max` across the N measured runs.
+//!                      `cv%` (= 100 * stdev / mean) is the
+//!                      machine-readable noise floor for the HLD V5
+//!                      §4 item 8 ±3 % regression check. Default
+//!                      (flag omitted) is the pre-existing single-run
+//!                      behaviour. `--runs 1` degenerates to
+//!                      warm-up-only with zero stats runs; falls
+//!                      back silently to single-run mode.
 
 use mdrp2350::{Config, Emulator, EmulatorBuilder, Pacer, PacerStats};
 
@@ -607,6 +620,21 @@ impl Runtime {
     }
 }
 
+/// Parsed CLI state, shared across all runs in a `--runs N` session so
+/// each run is configured identically.
+struct RunConfig {
+    seconds: u32,
+    cycles_target: Option<u64>,
+    quantum: u32,
+    clock_mhz: u32,
+    sys_clk_hz: u32,
+    unpaced: bool,
+    threaded: bool,
+    timing: bool,
+    step_quantum: u32,
+    workload: Workload,
+}
+
 fn main() {
     mdpicoem_harness::harness_tracing_init();
     let seconds = parse_arg("--seconds").unwrap_or(5);
@@ -619,6 +647,7 @@ fn main() {
     let threaded = std::env::args().any(|a| a == "--threaded");
     let timing = std::env::args().any(|a| a == "--timing");
     let step_quantum = parse_arg("--step-quantum").unwrap_or(BENCH_DEFAULT_STEP_QUANTUM);
+    let runs_arg = parse_arg("--runs");
     let workload = parse_workload().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -691,6 +720,86 @@ fn main() {
     }
     #[cfg(not(target_os = "windows"))]
     let _ = core;
+
+    let cfg = RunConfig {
+        seconds,
+        cycles_target,
+        quantum,
+        clock_mhz,
+        sys_clk_hz,
+        unpaced,
+        threaded,
+        timing,
+        step_quantum,
+        workload,
+    };
+
+    // `--runs N`: repeat the bench N+1 times (1 warmup discarded + N
+    // measured). Default (flag absent) is the historical single-run
+    // behaviour. `--runs 1` degenerates to warmup-only with zero
+    // measured runs — fall back silently to single-run mode so the
+    // user doesn't wait for a warmup they can't do stats on.
+    let measured_runs: u32 = match runs_arg {
+        None => 0,
+        Some(n) if n <= 1 => {
+            if n == 1 {
+                println!(
+                    "(note: --runs 1 degenerates to warmup-only; falling back to single-run mode)"
+                );
+            }
+            0
+        }
+        Some(n) => n,
+    };
+
+    if measured_runs == 0 {
+        run_once(&cfg);
+        return;
+    }
+
+    let total_runs = measured_runs + 1;
+    println!(
+        "[bench] --runs {} ({} warmup + {} measured){}{}{} --workload {}",
+        measured_runs,
+        1,
+        measured_runs,
+        if cfg.threaded { " --threaded" } else { "" },
+        if cfg.unpaced { " --unpaced" } else { "" },
+        if cfg.timing { " --timing" } else { "" },
+        cfg.workload.as_str(),
+    );
+
+    let mut throughputs: Vec<f64> = Vec::with_capacity(measured_runs as usize);
+    for run_idx in 1..=total_runs {
+        let label = if run_idx == 1 { "warmup" } else { "run" };
+        println!("\n=== run {}/{} ({}) ===", run_idx, total_runs, label);
+        let mhz = run_once(&cfg);
+        if run_idx == 1 {
+            println!("(run {}: {:.1} MHz — warmup, discarded from stats)", run_idx, mhz);
+        } else {
+            println!("(run {}: {:.1} MHz)", run_idx, mhz);
+            throughputs.push(mhz);
+        }
+    }
+
+    print_runs_summary(&cfg, &throughputs);
+}
+
+/// Run the full bench once with the given configuration. Returns the
+/// headline throughput (Avg MHz): in unpaced mode this is the
+/// executed-cycles-per-wall-second figure (per-core peak); in paced
+/// mode this is `PacerStats::emulated_mhz()`.
+fn run_once(cfg: &RunConfig) -> f64 {
+    let seconds = cfg.seconds;
+    let cycles_target = cfg.cycles_target;
+    let quantum = cfg.quantum;
+    let clock_mhz = cfg.clock_mhz;
+    let sys_clk_hz = cfg.sys_clk_hz;
+    let unpaced = cfg.unpaced;
+    let threaded = cfg.threaded;
+    let timing = cfg.timing;
+    let step_quantum = cfg.step_quantum;
+    let workload = cfg.workload;
 
     // --- Set up emulator + selected workload ---
     let mut emu = EmulatorBuilder::new(Config {
@@ -869,7 +978,7 @@ fn main() {
         println!("Verdict:        UNPACED (profiling mode)");
 
         // Threaded-mode --timing table. Runtime must outlive the
-        // `last_run_timings()` borrow, so we print before `return`.
+        // `last_run_timings()` borrow, so we print before returning.
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         if timing {
             if let Runtime::Threaded { ref inner, .. } = runtime {
@@ -878,7 +987,7 @@ fn main() {
                 }
             }
         }
-        return;
+        return mhz;
     }
 
     let snap = stats.snapshot();
@@ -901,6 +1010,72 @@ fn main() {
         println!("Verdict:        CANNOT SUSTAIN REAL-TIME ({:.1}% of target, {:.2}% behind)",
                  mhz_ratio * 100.0, behind_rate * 100.0);
     }
+
+    snap.emulated_mhz()
+}
+
+/// Print the `--runs N` per-run table + summary line (mean / stdev /
+/// cv% / p50 / p99 / min / max). Stats are computed across the
+/// measured runs only; the warmup throughput is printed for
+/// transparency but excluded from the aggregate.
+fn print_runs_summary(_cfg: &RunConfig, throughputs: &[f64]) {
+    let n = throughputs.len();
+    if n == 0 {
+        return;
+    }
+
+    println!("\n=== per-run table ===");
+    println!("{:>4} {:>8} {:>10}", "run", "label", "MHz");
+    println!("{:>4} {:>8} {:>10}", 1, "warmup", "(see above)");
+    for (i, mhz) in throughputs.iter().enumerate() {
+        println!(
+            "{:>4} {:>8} {:>10.1}",
+            i + 2,
+            "run",
+            mhz,
+        );
+    }
+
+    let mean = throughputs.iter().copied().sum::<f64>() / n as f64;
+    let variance = if n > 1 {
+        // Population variance — n, not n-1. The bench is measuring an
+        // already-averaged per-run throughput; treating the N samples
+        // as the population of "runs we decided to do" matches the
+        // HLD's cv% noise-floor usage. For N ≥ 10 the difference is
+        // under 5 %; at N=3 Bessel's correction would bias the
+        // reported spread upward by 22 %, hiding low-noise runs.
+        throughputs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64
+    } else {
+        0.0
+    };
+    let stdev = variance.sqrt();
+    let cv_pct = if mean > 0.0 { 100.0 * stdev / mean } else { 0.0 };
+
+    let mut sorted = throughputs.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Nearest-rank percentile: ceil(p/100 * n), clamped to [1, n],
+    // then subtract 1 for zero-based indexing. Simple and sufficient
+    // for the small-N regime the HLD's cv% check lives in.
+    let pct_idx = |p: f64| -> usize {
+        let r = (p / 100.0 * n as f64).ceil() as usize;
+        r.clamp(1, n) - 1
+    };
+    let p50 = sorted[pct_idx(50.0)];
+    let p99 = sorted[pct_idx(99.0)];
+    let min = sorted[0];
+    let max = sorted[n - 1];
+
+    println!("\n=== summary (n={} measured runs, warmup excluded) ===", n);
+    println!("mean:  {:>7.1} MHz", mean);
+    println!("stdev: {:>7.1} MHz  (cv%: {:.2}%)", stdev, cv_pct);
+    println!("p50:   {:>7.1} MHz", p50);
+    if n < 100 {
+        println!("p99:   {:>7.1} MHz  (n < 100 — approximates max)", p99);
+    } else {
+        println!("p99:   {:>7.1} MHz", p99);
+    }
+    println!("min:   {:>7.1} MHz", min);
+    println!("max:   {:>7.1} MHz", max);
 }
 
 fn monitor_loop(stats: Arc<PacerStats>) {
