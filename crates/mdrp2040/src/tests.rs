@@ -3291,3 +3291,540 @@ mod phase2_uart_spi_i2c {
         assert!(bus.spi0.is_idle());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 1 — branch-coverage gap fill for `core/execute.rs` and
+// `core/execute_wide.rs`. Targets the specific branch arms the regression
+// suite left unexercised (see `wrk_docs/2026.04.23 - CC - Coverage
+// Improvement Plan.md` §Stage 1). One test per gap so a future coverage
+// regression names the exact encoding.
+// ---------------------------------------------------------------------------
+
+mod stage1_execute_coverage {
+    use super::*;
+
+    // --- thumb16_data_processing: shift-by-register variants ------------
+
+    #[test]
+    fn lsls_reg_shift_in_middle_range() {
+        // LSLS Rdn, Rm with shift in 1..32 (the `else if shift < 32` arm).
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x8000_0001;
+        cpu.regs.r[1] = 4;
+        cpu.execute_one(0x4088); // LSLS r0, r1
+        assert_eq!(cpu.regs.r[0], 0x0000_0010);
+        // Last bit shifted out came from bit (32-4)=28; that was 0 here,
+        // so carry clears.
+        assert!(!cpu.flag_c());
+    }
+
+    #[test]
+    fn lsls_reg_shift_exactly_32() {
+        // LSLS Rdn, Rm with shift == 32 — result is 0, carry = bit 0 of a.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x0000_0001;
+        cpu.regs.r[1] = 32;
+        cpu.execute_one(0x4088); // LSLS r0, r1
+        assert_eq!(cpu.regs.r[0], 0);
+        assert!(cpu.flag_c(), "bit 0 of a is now the carry-out");
+        assert!(cpu.flag_z());
+    }
+
+    #[test]
+    fn lsrs_reg_shift_by_zero_preserves_carry() {
+        // LSRS Rdn, Rm with shift == 0 — result = a, carry preserved.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x1234;
+        cpu.regs.r[1] = 0;
+        cpu.regs.set_flag_c(true);
+        cpu.execute_one(0x40C8); // LSRS r0, r1
+        assert_eq!(cpu.regs.r[0], 0x1234);
+        assert!(cpu.flag_c());
+    }
+
+    #[test]
+    fn lsrs_reg_shift_in_middle_range() {
+        // LSRS Rdn, Rm with shift in 1..32 (the `else if shift < 32` arm).
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x0000_0010;
+        cpu.regs.r[1] = 2;
+        cpu.execute_one(0x40C8); // LSRS r0, r1
+        assert_eq!(cpu.regs.r[0], 0x0000_0004);
+    }
+
+    #[test]
+    fn lsrs_reg_shift_greater_than_32_clears() {
+        // LSRS Rdn, Rm with shift > 32 — result = 0, carry = 0.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0xFFFF_FFFF;
+        cpu.regs.r[1] = 40;
+        cpu.execute_one(0x40C8); // LSRS r0, r1
+        assert_eq!(cpu.regs.r[0], 0);
+        assert!(!cpu.flag_c());
+    }
+
+    #[test]
+    fn asrs_reg_shift_by_zero_preserves_carry() {
+        // ASRS Rdn, Rm with shift == 0 — a unchanged, carry preserved.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x8000_0000;
+        cpu.regs.r[1] = 0;
+        cpu.regs.set_flag_c(true);
+        cpu.execute_one(0x4108); // ASRS r0, r1
+        assert_eq!(cpu.regs.r[0], 0x8000_0000);
+        assert!(cpu.flag_c());
+    }
+
+    #[test]
+    fn asrs_reg_shift_in_middle_range() {
+        // ASRS Rdn, Rm with shift in 1..32 (the `else if shift < 32` arm).
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0xFFFF_FFFE;
+        cpu.regs.r[1] = 1;
+        cpu.execute_one(0x4108); // ASRS r0, r1
+        assert_eq!(cpu.regs.r[0], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn rors_reg_shift_by_zero_preserves_carry() {
+        // RORS Rdn, Rm with shift == 0 — a unchanged, carry preserved.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x1234_5678;
+        cpu.regs.r[1] = 0;
+        cpu.regs.set_flag_c(true);
+        cpu.execute_one(0x41C8); // RORS r0, r1
+        assert_eq!(cpu.regs.r[0], 0x1234_5678);
+        assert!(cpu.flag_c());
+    }
+
+    #[test]
+    fn rors_reg_shift_multiple_of_32_leaves_a() {
+        // RORS Rdn, Rm with shift != 0 but (shift & 31) == 0 — the `eff==0`
+        // arm: a unchanged, carry = bit 31 of a.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x8000_0001;
+        cpu.regs.r[1] = 32;
+        cpu.execute_one(0x41C8); // RORS r0, r1
+        assert_eq!(cpu.regs.r[0], 0x8000_0001);
+        assert!(cpu.flag_c(), "MSB of a becomes carry-out");
+    }
+
+    // --- thumb16_special_data_bx: high-register PC operands -------------
+
+    #[test]
+    fn add_high_reg_with_rm_is_r15_reads_pc() {
+        // ADD Rd, R15: rm==15 arm. Encoding op=00, D=0, Rm=1111, Rd=000
+        // → 0x4478. read_pc() returns current_instr_addr+4.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.set_pc(0x1000);
+        cpu.regs.r[0] = 0x10;
+        cpu.execute_one(0x4478); // ADD r0, r15
+        // read_pc = 0x1000 + 4 = 0x1004; r0 = 0x10 + 0x1004 = 0x1014.
+        assert_eq!(cpu.regs.r[0], 0x1014);
+    }
+
+    #[test]
+    fn cmp_high_reg_with_n_is_r15_reads_pc() {
+        // CMP R15, R0: n==15 arm. Encoding op=01, D=1, Rm=0000, Rd=111
+        // → 0x4587.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.set_pc(0x1000);
+        cpu.regs.r[0] = 0x1004; // equals read_pc()
+        cpu.execute_one(0x4587);
+        assert!(cpu.flag_z(), "CMP PC, R0 with matching values sets Z");
+    }
+
+    #[test]
+    fn cmp_high_reg_with_rm_is_r15_reads_pc() {
+        // CMP R0, R15: rm==15 arm. Encoding op=01, D=0, Rm=1111, Rd=000
+        // → 0x4578.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.set_pc(0x2000);
+        cpu.regs.r[0] = 0x2004; // equals read_pc()
+        cpu.execute_one(0x4578);
+        assert!(cpu.flag_z());
+    }
+
+    #[test]
+    fn mov_high_reg_with_rm_is_r15_reads_pc() {
+        // MOV Rd, R15: rm==15 arm. Encoding op=10, D=0, Rm=1111, Rd=000
+        // → 0x4678.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.set_pc(0x2000);
+        cpu.execute_one(0x4678); // MOV r0, r15
+        // read_pc() = current_instr_addr + 4 = 0x2004.
+        assert_eq!(cpu.regs.r[0], 0x2004);
+    }
+
+    #[test]
+    fn bx_with_rm_is_r15_reads_pc() {
+        // BX R15: rm==15 arm. Encoding 0b010001_11_L_Rm_000 with L=0,
+        // Rm=1111 → 0x4778. read_pc() returns instr_addr+4, LSB is 0 so
+        // this path fails the Thumb-bit check → InvalidEpsr fault.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.set_pc(0x1000);
+        cpu.execute_one_with_bus(0x4778, &mut bus);
+        // read_pc() yields 0x1004 (T=0) → fault path.
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn bx_in_handler_mode_to_non_exc_return_branches() {
+        // ARMv8-M / ARMv6-M: BX while in handler mode to a value that is
+        // NOT an EXC_RETURN magic must fall through to the normal branch
+        // path (testing `is_exc_return(target) == false` with short-circuit
+        // True on the first conjunct).
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.xpsr |= 11; // IPSR = 11 → handler mode
+        cpu.regs.r[1] = 0x2000_1001; // regular Thumb address, T=1
+        cpu.execute_one_with_bus(0x4708, &mut bus); // BX r1
+        assert!(!cpu.has_pending_fault());
+        assert_eq!(cpu.regs.pc(), 0x2000_1000);
+    }
+
+    // --- thumb16_load_store_reg: register-offset unaligned faults -------
+
+    #[test]
+    fn str_reg_unaligned_raises_fault() {
+        // STR (reg) at misaligned address — opc=0b000 unaligned arm.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0xDEAD_BEEF;
+        cpu.regs.r[1] = 0x2000_0000;
+        cpu.regs.r[2] = 1; // addr = 0x2000_0001 — misaligned for word
+        cpu.execute_one_with_bus(0x5088, &mut bus); // STR r0, [r1, r2]
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn strh_reg_unaligned_raises_fault() {
+        // STRH (reg) opc=0b001 unaligned arm.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0xCAFE;
+        cpu.regs.r[1] = 0x2000_0000;
+        cpu.regs.r[2] = 1; // addr = 0x2000_0001 — misaligned for hw
+        cpu.execute_one_with_bus(0x5288, &mut bus); // STRH r0, [r1, r2]
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn ldr_reg_unaligned_raises_fault() {
+        // LDR (reg) opc=0b100 unaligned arm.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[1] = 0x2000_0000;
+        cpu.regs.r[2] = 3; // addr = 0x2000_0003 — misaligned for word
+        cpu.execute_one_with_bus(0x5888, &mut bus); // LDR r0, [r1, r2]
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn ldrh_reg_unaligned_raises_fault() {
+        // LDRH (reg) opc=0b101 unaligned arm.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[1] = 0x2000_0000;
+        cpu.regs.r[2] = 1; // addr = 0x2000_0001 — misaligned for hw
+        cpu.execute_one_with_bus(0x5A88, &mut bus); // LDRH r0, [r1, r2]
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn ldrsh_reg_unaligned_raises_fault() {
+        // LDRSH (reg) opc=0b111 unaligned arm.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[1] = 0x2000_0000;
+        cpu.regs.r[2] = 1; // addr = 0x2000_0001 — misaligned for hw
+        cpu.execute_one_with_bus(0x5E88, &mut bus); // LDRSH r0, [r1, r2]
+        assert!(cpu.has_pending_fault());
+    }
+
+    // --- STR/LDR immediate + STRH/LDRH + SP-relative unaligned ----------
+
+    #[test]
+    fn strh_imm_unaligned_raises_fault() {
+        // STRH (imm) unaligned arm.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0xCAFE;
+        cpu.regs.r[1] = 0x2000_0001; // base odd → addr = 0x2000_0001
+        cpu.execute_one_with_bus(0x8008, &mut bus); // STRH r0, [r1, #0]
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn str_sp_unaligned_raises_fault() {
+        // STR [SP, #imm] unaligned — SP itself misaligned.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0xDEAD_BEEF;
+        cpu.regs.r[13] = 0x2000_0002; // SP misaligned
+        cpu.execute_one_with_bus(0x9000, &mut bus); // STR r0, [SP, #0]
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn ldr_sp_unaligned_raises_fault() {
+        // LDR [SP, #imm] unaligned — SP itself misaligned.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[13] = 0x2000_0002;
+        cpu.execute_one_with_bus(0x9800, &mut bus); // LDR r0, [SP, #0]
+        assert!(cpu.has_pending_fault());
+    }
+
+    // --- PUSH / POP unaligned + POP EXC_RETURN in handler mode ----------
+
+    #[test]
+    fn push_misaligned_base_raises_fault() {
+        // PUSH where `sp - count*4` is not 4-aligned (SP itself misaligned
+        // by 1 here so base = 0x2000_0FFD).
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0xDEAD_BEEF;
+        cpu.regs.r[13] = 0x2000_1001;
+        cpu.execute_one_with_bus(0xB401, &mut bus); // PUSH {r0}
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn pop_misaligned_sp_raises_fault() {
+        // POP where SP itself is misaligned.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[13] = 0x2000_0001;
+        cpu.execute_one_with_bus(0xBC01, &mut bus); // POP {r0}
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn pop_pc_in_handler_mode_with_exc_return_unwinds() {
+        // POP {PC} in handler mode where the popped value is an EXC_RETURN
+        // magic → exit_exception path (True arm of the handler_mode check
+        // on line 810).
+        let (mut bus, _) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        cpu.regs.set_pc(0x1000);
+        cpu.test_enter_exception(11, &mut bus);
+        // Enter_exception set up the stack frame. We now need to push an
+        // EXC_RETURN onto a fresh stack cell and POP {PC} from it so the
+        // popped value is the EXC_RETURN magic, not the stacked PC slot.
+        let sp_before = cpu.regs.sp();
+        let cell = sp_before.wrapping_sub(4);
+        bus.write32(cell, 0xFFFF_FFF9); // EXC_RETURN Thread+MSP
+        cpu.regs.set_sp(cell);
+        cpu.execute_one_with_bus(0xBD00, &mut bus); // POP {PC}
+        // exit_exception returned to thread mode.
+        assert_eq!(cpu.regs.ipsr(), 0);
+    }
+
+    #[test]
+    fn pop_pc_in_handler_mode_to_regular_address_branches() {
+        // POP {PC} in handler mode where the popped value is NOT an
+        // EXC_RETURN magic → exercises the False arm of `is_exc_return`
+        // on line 810 col 55. Popped value has the Thumb bit set so the
+        // branch path writes PC directly (no fault).
+        let (mut bus, _) = make_test_bus_with_vector_table();
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        cpu.regs.set_pc(0x1000);
+        cpu.test_enter_exception(11, &mut bus);
+        // Stage a stack cell holding a plain Thumb address (not an
+        // EXC_RETURN pattern).
+        let sp_before = cpu.regs.sp();
+        let cell = sp_before.wrapping_sub(4);
+        bus.write32(cell, 0x2000_2001); // ordinary Thumb PC, T=1
+        cpu.regs.set_sp(cell);
+        cpu.execute_one_with_bus(0xBD00, &mut bus); // POP {PC}
+        // Still in handler mode (no unwind), PC updated to popped value.
+        assert_eq!(cpu.regs.ipsr(), 11);
+        assert_eq!(cpu.regs.pc(), 0x2000_2000);
+        assert!(!cpu.has_pending_fault());
+    }
+
+    // --- STM unaligned --------------------------------------------------
+
+    #[test]
+    fn stm_unaligned_base_raises_fault() {
+        // STMIA Rn!, {r0}: base Rn is misaligned.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        cpu.regs.r[0] = 0x1234;
+        cpu.regs.r[4] = 0x2000_0002;
+        cpu.execute_one_with_bus(0xC401, &mut bus); // STMIA r4!, {r0}
+        assert!(cpu.has_pending_fault());
+    }
+
+    // ================================================================
+    // execute_wide.rs — Thumb-32 branch gaps
+    // ================================================================
+
+    #[test]
+    fn execute_wide_barrier_prefix_with_wrong_hw1_is_undefined() {
+        // hw0 == 0xF3BF (matches the barrier prefix) but hw1 high byte
+        // is not 0x8F* — falls off the barrier branch and proceeds to the
+        // MSR/MRS checks, eventually landing in the undefined arm. This
+        // exercises the `(hw1 & 0xFF00) == 0x8F00` False side of line 93.
+        let mut cpu = CortexM0Plus::new();
+        // hw1 high byte 0x80 → misc-control group but not a barrier, and
+        // not a valid MRS/MSR encoding → undefined.
+        cpu.execute_one_wide(0xF3BF, 0x8000);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn execute_wide_bl_not_taken_falls_through_to_misc_control() {
+        // Force hw1 with bits[15:14]=10 and bit 12=0 so `(hw1 & 0xD000)
+        // == 0xD000` is False (BL not taken) and `(hw1 & 0xD000) ==
+        // 0x8000` is True (misc-control branch). The barriers block
+        // routes through DSB on hw0=0xF3BF, hw1=0x8F4F — already covered
+        // — so keep this as an explicit "not-BL" check: craft a non-BL,
+        // non-misc-control wide opcode. hw1=0x9000 has bits[15:14]=10
+        // but [13]=1 and [12]=1; `0x9000 & 0xD000 = 0x9000` ≠ 0xD000 so
+        // BL not taken, and `& 0xD000 != 0x8000` either → falls through
+        // to undefined.
+        let mut cpu = CortexM0Plus::new();
+        cpu.execute_one_wide(0xF000, 0x9000);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn msr_with_bit4_set_in_hw0_is_accepted() {
+        // MSR encoding with bit 4 set in hw0 — op_field == 0b0111001.
+        // hw0 = 0xF390 (bit4=1) with Rn=0 → Rn=0; hw1 = 0x8810 (mask=1000,
+        // SYSm=0x10 PRIMASK).
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0xFFFF_FFFF;
+        cpu.execute_one_wide(0xF390, 0x8810);
+        assert_eq!(cpu.regs.primask, 1);
+    }
+
+    #[test]
+    fn msr_with_bad_hw1_mask_is_undefined() {
+        // op_field matches MSR (0b0111000) but hw1 high byte != 0x88 →
+        // fails line 108's right-hand conjunct; falls through to MRS
+        // checks (op_field mismatch) then to undefined.
+        let mut cpu = CortexM0Plus::new();
+        cpu.execute_one_wide(0xF380, 0x8700);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn mrs_op_field_mismatch_is_undefined() {
+        // op_field neither 0b0111110 nor 0b0111111 and not MSR either —
+        // exercises the False arm of line 113. hw0 = 0xF350 bits[10:4]
+        // = 0b0110101 → op_field = 0x35.
+        let mut cpu = CortexM0Plus::new();
+        cpu.execute_one_wide(0xF350, 0x8000);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn mrs_with_bit4_set_in_hw0_is_accepted() {
+        // MRS encoding with bit 4 set in hw0 — op_field == 0b0111111.
+        // hw0 = 0xF3FF, hw1 = 0x8010 (Rd=0, SYSm=PRIMASK). Forces the
+        // short-circuit OR's right conjunct on line 113 to evaluate.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.primask = 1;
+        cpu.execute_one_wide(0xF3FF, 0x8010);
+        assert_eq!(cpu.regs.r[0], 1);
+    }
+
+    #[test]
+    fn mrs_low_nibble_not_f_is_undefined() {
+        // hw0 op_field matches 0b0111110 but hw0 low nibble != 0xF.
+        // hw0 = 0xF3EE — bits[10:4] = 0b0111110 but low 4 bits = 0xE.
+        let mut cpu = CortexM0Plus::new();
+        cpu.execute_one_wide(0xF3EE, 0x8000);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn mrs_hw1_top_nibble_not_8_is_undefined() {
+        // hw0 = 0xF3EF (valid MRS prefix) but hw1 bits[15:12] != 0b1000 so
+        // line 115's False arm is exercised.
+        //
+        // hw1 must still satisfy `(hw1 & 0xD000) == 0x8000` (line 38's
+        // dispatch) so the misc-control leg runs at all. That leaves
+        // top nibble = 0xA (bits [15:14] = 10, bit 13 = 1, bit 12 = 0).
+        let mut cpu = CortexM0Plus::new();
+        cpu.execute_one_wide(0xF3EF, 0xA000);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn msr_msp_updates_banked_stack_pointer() {
+        // MSR MSP, Rn — SYSm=8. Currently active SP is MSP (thread mode,
+        // SPSEL=0) so the branch on line 153 (`!active_sp_is_psp()`)
+        // takes the True arm: r[13] must reflect the written MSP.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x2000_1000;
+        cpu.regs.r[13] = 0x2000_2000;
+        // hw0 = 0xF380 (Rn=0), hw1 = 0x8808 (mask=1000, SYSm=8 = MSP).
+        cpu.execute_one_wide(0xF380, 0x8808);
+        assert_eq!(cpu.regs.msp, 0x2000_1000);
+        assert_eq!(cpu.regs.r[13], 0x2000_1000, "active SP tracked MSP write");
+    }
+
+    #[test]
+    fn msr_msp_with_psp_active_does_not_touch_r13() {
+        // Same MSR MSP but active SP is PSP — False arm of line 153:
+        // msp field updates but r[13] must not change.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.control = 0x2; // Thread mode, SPSEL=1 → PSP active
+        cpu.regs.r[0] = 0x2000_1000;
+        cpu.regs.r[13] = 0x2000_4000; // PSP value
+        cpu.regs.psp = 0x2000_4000;
+        cpu.execute_one_wide(0xF380, 0x8808); // MSR MSP, r0
+        assert_eq!(cpu.regs.msp, 0x2000_1000);
+        assert_eq!(cpu.regs.r[13], 0x2000_4000, "PSP-active r[13] untouched");
+    }
+
+    #[test]
+    fn msr_psp_with_psp_active_updates_r13() {
+        // MSR PSP, Rn with SPSEL=1 (PSP active) — True arm of line 160.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.control = 0x2;
+        cpu.regs.r[0] = 0x2000_5000;
+        cpu.regs.r[13] = 0x2000_4000;
+        cpu.regs.psp = 0x2000_4000;
+        // hw1 = 0x8809 (mask=1000, SYSm=9 = PSP).
+        cpu.execute_one_wide(0xF380, 0x8809);
+        assert_eq!(cpu.regs.psp, 0x2000_5000);
+        assert_eq!(cpu.regs.r[13], 0x2000_5000);
+    }
+
+    #[test]
+    fn msr_psp_with_msp_active_does_not_touch_r13() {
+        // MSR PSP, Rn with SPSEL=0 (MSP active) — False arm of line 160.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.r[0] = 0x2000_5000;
+        cpu.regs.r[13] = 0x2000_2000;
+        cpu.execute_one_wide(0xF380, 0x8809);
+        assert_eq!(cpu.regs.psp, 0x2000_5000);
+        assert_eq!(cpu.regs.r[13], 0x2000_2000, "MSP-active r[13] untouched");
+    }
+
+    #[test]
+    fn msr_control_in_handler_mode_ignores_spsel() {
+        // MSR CONTROL, Rn while in handler mode — SPSEL is RAZ/WI so
+        // the written SPSEL bit must not take effect. True arm of
+        // line 172.
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.xpsr |= 11; // IPSR = 11 (handler mode)
+        cpu.regs.control = 0x0; // pre-state: SPSEL=0, nPRIV=0
+        cpu.regs.r[0] = 0x3; // attempt to set both SPSEL and nPRIV
+        // hw0 = 0xF380 (Rn=0), hw1 = 0x8814 (mask=1000, SYSm=20=CONTROL).
+        cpu.execute_one_wide(0xF380, 0x8814);
+        // SPSEL (bit 1) must remain clear; nPRIV (bit 0) was written.
+        assert_eq!(cpu.regs.control & 0x2, 0x0, "handler mode: SPSEL frozen");
+        assert_eq!(cpu.regs.control & 0x1, 0x1, "nPRIV updated");
+    }
+}
