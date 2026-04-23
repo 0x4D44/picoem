@@ -9676,8 +9676,10 @@ fn powman_count_advances_at_expected_rate() {
     // Release POWMAN from reset via the CLR alias (+0x3000).
     let resets_clr = 0x4002_0000 | 0x3000;
     emu.bus.write32(resets_clr, 1u32 << 17, 0); // RESET_POWMAN
-    // Set TIMER.RUN so COUNT advances.
-    emu.bus.write32(POWMAN_BASE + TIMER_OFFSET, TIMER_RUN_BIT, 0);
+    // Set TIMER.RUN so COUNT advances. POWMAN password in bits [31:16]
+    // — V13 Stage 1 enforces the password on every password-gated write.
+    emu.bus
+        .write32(POWMAN_BASE + TIMER_OFFSET, 0x5AFE_0000 | TIMER_RUN_BIT, 0);
     // Run enough sys_clks for exactly 10 POWMAN ticks.
     let n = 10 * POWMAN_SYS_PER_TICK as u32;
     emu.bus.tick_peripherals(n);
@@ -9712,11 +9714,12 @@ fn powman_match_pends_nvic_line_45() {
     emu.bus
         .write32(POWMAN_BASE + INTE_OFFSET, 0x5AFE_0000 | INT_TIMER_BIT, 0);
 
-    // Program MATCH = 100 and enable alarm + run.
-    emu.bus.write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 100, 0);
+    // Program MATCH = 100 and enable alarm + run. Password in [31:16].
+    emu.bus
+        .write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 0x5AFE_0000 | 100, 0);
     emu.bus.write32(
         POWMAN_BASE + TIMER_OFFSET,
-        TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+        0x5AFE_0000 | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
         0,
     );
 
@@ -9794,12 +9797,13 @@ fn powman_match_enters_emulator_handler() {
 
     // Program MATCH = 100, enable INTE.TIMER (V12 §3.2 silicon gate),
     // enable POWMAN TIMER alarm, enable NVIC 45.
-    emu.bus.write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 100, 0);
+    emu.bus
+        .write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 0x5AFE_0000 | 100, 0);
     emu.bus
         .write32(POWMAN_BASE + INTE_OFFSET, 0x5AFE_0000 | INT_TIMER_BIT, 0);
     emu.bus.write32(
         POWMAN_BASE + TIMER_OFFSET,
-        TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+        0x5AFE_0000 | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
         0,
     );
     emu.bus.write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32), 0);
@@ -9848,13 +9852,19 @@ fn powman_state_resets_on_emulator_reset() {
     emu.bus.write32(0x4002_3000, 1u32 << 17, 0);
 
     // Seed non-default state: COUNT=1000 via SET_TIME_*, MATCH=100,
-    // TIMER = RUN | ALARM_ENAB.
-    emu.bus.write32(POWMAN_BASE + SET_TIME_15TO0_OFFSET, 1000 & 0xFFFF, 0);
-    emu.bus.write32(POWMAN_BASE + SET_TIME_31TO16_OFFSET, 0, 0);
-    emu.bus.write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 100, 0);
+    // TIMER = RUN | ALARM_ENAB. Password in [31:16] on every write.
+    emu.bus.write32(
+        POWMAN_BASE + SET_TIME_15TO0_OFFSET,
+        0x5AFE_0000 | (1000 & 0xFFFF),
+        0,
+    );
+    emu.bus
+        .write32(POWMAN_BASE + SET_TIME_31TO16_OFFSET, 0x5AFE_0000, 0);
+    emu.bus
+        .write32(POWMAN_BASE + ALARM_TIME_15TO0_OFFSET, 0x5AFE_0000 | 100, 0);
     emu.bus.write32(
         POWMAN_BASE + TIMER_OFFSET,
-        TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+        0x5AFE_0000 | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
         0,
     );
     // Sanity: pre-reset state looks as seeded.
@@ -9924,4 +9934,1047 @@ fn powman_archsel_non_arm_write_fires_tripwire_once() {
     // `powman_archsel_non_arm_write_fires_tripwire_once` test in
     // `crates/mdrp2350/src/peripherals/powman.rs` (uses a capture
     // subscriber — out of place in the integration-style tests.rs).
+}
+
+// ============================================================================
+// Stage 1 — execute.rs branch coverage top-up
+//
+// These tests target specific uncovered branches in
+// `crates/mdrp2350/src/core/execute.rs` listed in the Coverage Improvement
+// Plan (§Stage 1). Each test names the source line it pins.
+// ============================================================================
+
+mod stage1_execute_coverage {
+    use super::*;
+    use crate::core::Fault;
+
+    // ---- Shift-by-register edge branches (LSLS/LSRS/ASRS/RORS) ----
+
+    // line 216: LSLS Rdn, Rm with shift amount == 0 — carry preserved.
+    #[test]
+    fn lsls_reg_shift_zero_preserves_carry() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0xABCD_1234);
+        c.set_reg(1, 0); // shift amount = 0
+        c.regs.set_flag_c(true);
+        c.execute_one(0x4088); // LSLS R0, R1
+        assert_eq!(c.reg(0), 0xABCD_1234, "value unchanged when shift=0");
+        assert!(c.flag_c(), "carry preserved when shift=0");
+    }
+
+    // line 218: LSLS with shift in 1..32 (non-edge carry-out path).
+    #[test]
+    fn lsls_reg_shift_lt_32_carry_out() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x4000_0000);
+        c.set_reg(1, 2); // shift amount = 2 → bit 30 shifts into carry
+        c.execute_one(0x4088); // LSLS R0, R1
+        assert_eq!(c.reg(0), 0);
+        assert!(c.flag_c());
+        assert!(c.flag_z());
+    }
+
+    // line 220: LSLS with shift == 32 — result 0, carry = bit 0 of a.
+    #[test]
+    fn lsls_reg_shift_eq_32() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x0000_0001); // bit 0 set
+        c.set_reg(1, 32);
+        c.execute_one(0x4088); // LSLS R0, R1
+        assert_eq!(c.reg(0), 0);
+        assert!(c.flag_c(), "carry = LSB of operand when shift == 32");
+    }
+
+    // line 223 (implicit else): shift > 32 — result 0, carry 0.
+    #[test]
+    fn lsls_reg_shift_gt_32() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0xFFFF_FFFF);
+        c.set_reg(1, 33);
+        c.regs.set_flag_c(true);
+        c.execute_one(0x4088);
+        assert_eq!(c.reg(0), 0);
+        assert!(!c.flag_c());
+    }
+
+    // line 232: LSRS Rdn, Rm shift == 0 — carry preserved.
+    #[test]
+    fn lsrs_reg_shift_zero_preserves_carry() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x1234_5678);
+        c.set_reg(1, 0);
+        c.regs.set_flag_c(true);
+        c.execute_one(0x40C8); // LSRS R0, R1
+        assert_eq!(c.reg(0), 0x1234_5678);
+        assert!(c.flag_c());
+    }
+
+    // line 234: LSRS with shift in 1..32.
+    #[test]
+    fn lsrs_reg_shift_lt_32_carry_out() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x0000_0003); // bit 0 == 1, bit 1 == 1
+        c.set_reg(1, 1);
+        c.execute_one(0x40C8);
+        assert_eq!(c.reg(0), 1);
+        assert!(c.flag_c(), "bit 0 shifted out");
+    }
+
+    // line 236: LSRS shift == 32 — result 0, carry = bit 31.
+    #[test]
+    fn lsrs_reg_shift_eq_32() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x8000_0000);
+        c.set_reg(1, 32);
+        c.execute_one(0x40C8);
+        assert_eq!(c.reg(0), 0);
+        assert!(c.flag_c());
+    }
+
+    // line 239 (implicit else): shift > 32 — result 0, carry 0.
+    #[test]
+    fn lsrs_reg_shift_gt_32() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0xFFFF_FFFF);
+        c.set_reg(1, 33);
+        c.regs.set_flag_c(true);
+        c.execute_one(0x40C8);
+        assert_eq!(c.reg(0), 0);
+        assert!(!c.flag_c());
+    }
+
+    // line 249: ASRS Rdn, Rm shift == 0 — carry preserved.
+    #[test]
+    fn asrs_reg_shift_zero_preserves_carry() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0xFFFF_FFFF);
+        c.set_reg(1, 0);
+        c.regs.set_flag_c(true);
+        c.execute_one(0x4108); // ASRS R0, R1
+        assert_eq!(c.reg(0), 0xFFFF_FFFF);
+        assert!(c.flag_c());
+    }
+
+    // line 251: ASRS shift in 1..32 — arithmetic shift with carry-out.
+    #[test]
+    fn asrs_reg_shift_lt_32_negative() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0xFFFF_FFF0u32);
+        c.set_reg(1, 4);
+        c.execute_one(0x4108); // ASRS R0, R1
+        assert_eq!(c.reg(0), 0xFFFF_FFFF, "sign-extended right shift");
+        assert!(c.flag_n());
+        assert!(!c.flag_c(), "bit 3 was 0 before shift");
+    }
+
+    // Covers the shift >= 32 else arm in ASRS reg.
+    #[test]
+    fn asrs_reg_shift_ge_32_sign_extends() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x8000_0000);
+        c.set_reg(1, 32);
+        c.execute_one(0x4108);
+        assert_eq!(c.reg(0), 0xFFFF_FFFF, "sign-extended to all-ones");
+        assert!(c.flag_c(), "carry = sign bit");
+    }
+
+    // line 276: RORS shift == 0 — carry preserved, value unchanged.
+    #[test]
+    fn rors_reg_shift_zero_preserves_carry() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x1234_5678);
+        c.set_reg(1, 0);
+        c.regs.set_flag_c(true);
+        c.execute_one(0x41C8); // RORS R0, R1
+        assert_eq!(c.reg(0), 0x1234_5678);
+        assert!(c.flag_c());
+    }
+
+    // line 280: RORS shift that is a nonzero multiple of 32 — value unchanged,
+    // carry = bit 31. `shift & 31 == 0` but `shift != 0`.
+    #[test]
+    fn rors_reg_shift_multiple_of_32() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x8000_0000); // bit 31 set
+        c.set_reg(1, 32);
+        c.execute_one(0x41C8);
+        assert_eq!(c.reg(0), 0x8000_0000, "value unchanged on rotate-by-32");
+        assert!(c.flag_c(), "carry = bit 31 of operand");
+        assert!(c.flag_n());
+    }
+
+    // ---- Immediate-shift edge branches (LSRS/ASRS imm5 == 0) ----
+
+    // line 39: LSLS imm with imm5 != 0 (normal path, carry-out branch).
+    #[test]
+    fn lsls_imm_nonzero_shift_sets_carry() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0xC000_0000);
+        c.execute_one(0x0048); // LSLS R0, R1, #1 (imm5=1) → 0x80000000, carry = bit 31
+        assert_eq!(c.reg(0), 0x8000_0000);
+        assert!(c.flag_c());
+        assert!(c.flag_n());
+    }
+
+    // line 61: LSRS imm with imm5 != 0 (normal path) — covered by lsrs_imm_basic,
+    // but also pin the shift==32 (imm5=0) carry=0 case for completeness.
+    #[test]
+    fn lsrs_imm_shift_32_carry_zero_when_bit31_clear() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x7FFF_FFFF); // bit 31 clear
+        c.execute_one(0x0800); // LSRS R0, R0, #32 (imm5=0)
+        assert_eq!(c.reg(0), 0);
+        assert!(!c.flag_c());
+        assert!(c.flag_z());
+    }
+
+    // line 81: ASRS imm with imm5 == 0 (shift-by-32) — positive input variant.
+    #[test]
+    fn asrs_imm_shift_32_positive_input() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x7FFF_FFFF);
+        c.execute_one(0x1000); // ASRS R0, R0, #32 (imm5=0)
+        assert_eq!(c.reg(0), 0);
+        assert!(!c.flag_c(), "carry = sign bit (0)");
+        assert!(c.flag_z());
+    }
+
+    // Mirror negative input case to ensure both arms of `val < 0` at line 84 hit.
+    #[test]
+    fn asrs_imm_shift_32_negative_input() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0x8000_0000);
+        c.execute_one(0x1000); // ASRS R0, R0, #32
+        assert_eq!(c.reg(0), 0xFFFF_FFFF);
+        assert!(c.flag_c(), "carry = sign bit (1)");
+        assert!(c.flag_n());
+    }
+
+    // ---- Special data / high-register / BX / BLX paths ----
+
+    // line 358: ADD high regs with Rm == 15 (PC).
+    #[test]
+    fn add_high_reg_rm_is_pc() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.set_reg(0, 0x10);
+        // ADD R0, PC: bits[15:10]=010001, op=00, D=0, Rm=1111, Rd=000
+        // = 0b0100_0100_0_1111_000 = 0x4478
+        c.execute_one(0x4478);
+        // read_pc() = current_instr_addr + 4 = 0x1000 + 4 = 0x1004
+        // result = R0 + read_pc() = 0x10 + 0x1004 = 0x1014
+        assert_eq!(c.reg(0), 0x1014);
+    }
+
+    // line 359: ADD high regs with Rd == 15 (PC), no pipeline flush yet —
+    // exercises the rd_val load from read_pc branch.
+    #[test]
+    fn add_high_reg_rd_is_pc_pipeline_flush() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.set_reg(0, 0x10);
+        // ADD PC, R0: op=00, D=1, Rm=0000, Rd_low=111 → 0x4487? Let me recompute.
+        // bits: 0100_0100_D_MMMM_RRR with D=1, Rm=0, Rd_low=7 → 0100_0100_1_0000_111
+        //     = 0x4487
+        let cy = c.execute_one(0x4487);
+        // result = read_pc() + R0 = 0x1004 + 0x10 = 0x1014; set_pc masks bit 0.
+        assert_eq!(c.regs.pc(), 0x1014 & !1);
+        assert_eq!(cy, 3, "pipeline flush cost");
+    }
+
+    // line 361 / 362: ADD high regs with Rd == 15 AND Rm == 15 (PC+PC).
+    // Pins the combined Rm==15 true branch on line 358 together with the
+    // Rd==15 true branch on 361.
+    #[test]
+    fn add_high_reg_rd_and_rm_are_pc() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        // ADD PC, PC: D=1, Rm=1111, Rd_low=111 → 0100_0100_1_1111_111 = 0x44FF
+        let cy = c.execute_one(0x44FF);
+        // read_pc() = 0x1004 → result = 0x1004 + 0x1004 = 0x2008
+        assert_eq!(c.regs.pc(), 0x2008 & !1);
+        assert_eq!(cy, 3);
+    }
+
+    // line 372: CMP high regs with Rn == 15 (PC).
+    #[test]
+    fn cmp_high_reg_rn_is_pc() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.set_reg(0, 0x1004); // equals read_pc()
+        // CMP PC, R0: op=01, D=1 (Rn top bit), Rm=0 (bits[6:3]), Rn_low=7 (bits[2:0]).
+        //   0100_0101_1_0000_111 = 0x4587
+        c.execute_one(0x4587);
+        assert!(c.flag_z(), "PC == R0 so CMP sets Z");
+    }
+
+    // line 373: CMP high regs with Rm == 15 (PC).
+    #[test]
+    fn cmp_high_reg_rm_is_pc() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.set_reg(0, 0x1004); // equals read_pc()
+        // CMP R0, PC: op=01, D=0, Rm=15, Rd_low=000 → 0100_0101_0_1111_000 = 0x4578
+        c.execute_one(0x4578);
+        assert!(c.flag_z());
+    }
+
+    // line 382: MOV high regs with Rm == 15 (PC).
+    #[test]
+    fn mov_high_reg_rm_is_pc() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        // MOV R0, PC: op=10, D=0, Rm=1111, Rd_low=000 → 0100_0110_0_1111_000 = 0x4678
+        c.execute_one(0x4678);
+        assert_eq!(c.reg(0), 0x1004, "read_pc()");
+    }
+
+    // line 383/387: MOV PC, Rm with val NOT an EXC_RETURN magic (plain branch).
+    #[test]
+    fn mov_high_reg_rd_is_pc_plain_branch() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.set_reg(0, 0x2000_0101); // Thumb-tagged target, not EXC_RETURN
+        // MOV PC, R0: op=10, D=1, Rm=0, Rd_low=7 → 0100_0110_1_0000_111 = 0x4687
+        let cy = c.execute_one(0x4687);
+        assert_eq!(c.regs.pc(), 0x2000_0100);
+        assert_eq!(cy, 3, "pipeline flush");
+    }
+
+    // line 384: MOV PC, Rm where Rm contains an EXC_RETURN magic value.
+    // We enter an exception so there is a valid frame to unstack.
+    #[test]
+    fn mov_pc_rm_with_exc_return_triggers_exit() {
+        let mut bus = Bus::new();
+        let mut cpu = CortexM33::new(0, bus.atomics.clone());
+        cpu.regs.msp = 0x2000_2000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        bus.write32(vtor + 14 * 4, 0x2000_0200 | 1, 0); // PendSV
+        cpu.test_enter_exception(14, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 14);
+        cpu.set_reg(0, 0xFFFF_FFF9); // thread / MSP / no FP
+        // MOV PC, R0 — value matches EXC_RETURN pattern → exit_exception.
+        cpu.execute_one_with_bus(0x4687, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0, "returned to thread mode");
+    }
+
+    // line 396: BX/BLX path — Rm == 15 (PC) for BX.
+    #[test]
+    fn bx_rm_is_pc() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        // BX PC: op=11, bit7=0, Rm=1111, Rd_low=000 → 0100_0111_0_1111_000 = 0x4778
+        c.execute_one(0x4778);
+        // PC = read_pc() & !1 = 0x1004
+        assert_eq!(c.regs.pc(), 0x1004);
+    }
+
+    // line 398: BLX Rm path — link flag set, LR updated.
+    #[test]
+    fn blx_reg_link_updates_lr() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.set_reg(0, 0x2000_0001); // Thumb-tagged target
+        // BLX R0: op=11, bit7=1, Rm=0000, Rd_low=000 → 0100_0111_1_0000_000 = 0x4780
+        c.execute_one(0x4780);
+        assert_eq!(c.regs.pc(), 0x2000_0000);
+        // LR = next_instr (post-execute-one PC, which = 0x1002) | 1 = 0x1003
+        assert_eq!(c.regs.lr(), 0x1003);
+    }
+
+    // line 402: BLX target is EXC_RETURN magic — exit_exception.
+    #[test]
+    fn blx_with_exc_return_target_triggers_exit() {
+        let mut bus = Bus::new();
+        let mut cpu = CortexM33::new(0, bus.atomics.clone());
+        cpu.regs.msp = 0x2000_2000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        bus.write32(vtor + 14 * 4, 0x2000_0200 | 1, 0);
+        cpu.test_enter_exception(14, &mut bus);
+        cpu.set_reg(0, 0xFFFF_FFF9);
+        // BLX R0: 0x4780
+        cpu.execute_one_with_bus(0x4780, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0, "BLX with EXC_RETURN magic hit exit path");
+    }
+
+    // line 406: BX target is EXC_RETURN magic — exit_exception via BX.
+    #[test]
+    fn bx_with_exc_return_target_triggers_exit() {
+        let mut bus = Bus::new();
+        let mut cpu = CortexM33::new(0, bus.atomics.clone());
+        cpu.regs.msp = 0x2000_2000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        bus.write32(vtor + 14 * 4, 0x2000_0200 | 1, 0);
+        cpu.test_enter_exception(14, &mut bus);
+        // LR holds the EXC_RETURN magic after enter_exception.
+        assert!(CortexM33::is_exc_return(cpu.regs.lr()));
+        // BX LR: op=11, bit7=0, Rm=1110, Rd_low=000 → 0100_0111_0_1110_000 = 0x4770
+        cpu.execute_one_with_bus(0x4770, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0, "BX LR at exception return unstacks");
+    }
+
+    // line 413: BXNS from Secure state (transition). Covered by existing
+    // `bxns_from_secure` already, but pin an explicit assertion here too.
+    #[test]
+    fn bxns_transitions_to_nonsecure_explicit() {
+        let mut c = CortexM33::for_test(0);
+        assert!(c.secure);
+        c.regs.msp_ns = 0x2000_4000;
+        c.set_reg(0, 0x1000_0001);
+        // BXNS R0: 0100_0111_0_0000_100 = 0x4704
+        c.execute_one(0x4704);
+        assert!(!c.secure, "transition_to_nonsecure taken");
+    }
+
+    // ---- SIO-address cycle-cost branches for load/store instructions ----
+    //
+    // STR/STRH/STRB/STR_imm/STRB_imm/STRH_imm/STR_sp all have an
+    // `if addr >> 28 == 0xD { 1 } else { 2 }` cost tail. Existing tests only
+    // exercise SRAM (0x2000_...), so the SIO arm (cost=1) is uncovered.
+
+    // line 453: STR Rt, [Rn, Rm] with SIO address.
+    #[test]
+    fn str_reg_sio_costs_one_cycle() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xAABB_CCDD);
+        c.set_reg(1, 0xD000_0000); // SIO base
+        c.set_reg(2, 0x10);        // GPIO_OUT offset
+        // STR R0, [R1, R2]: 0101_000_010_001_000 = 0x5088
+        let cy = c.execute_one_with_bus(0x5088, &mut bus);
+        assert_eq!(cy, 1, "SIO store is single-cycle");
+    }
+
+    // line 458: STRH Rt, [Rn, Rm] SIO path.
+    #[test]
+    fn strh_reg_sio_costs_one_cycle() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xDEAD);
+        c.set_reg(1, 0xD000_0000);
+        c.set_reg(2, 0x10);
+        // STRH R0, [R1, R2]: 0101_001_010_001_000 = 0x5288
+        let cy = c.execute_one_with_bus(0x5288, &mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    // line 463: STRB Rt, [Rn, Rm] SIO path.
+    #[test]
+    fn strb_reg_sio_costs_one_cycle() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xAB);
+        c.set_reg(1, 0xD000_0000);
+        c.set_reg(2, 0x10);
+        // STRB R0, [R1, R2]: 0101_010_010_001_000 = 0x5488
+        let cy = c.execute_one_with_bus(0x5488, &mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    // Also exercise load-register-reg arms (LDRSB, LDR, LDRH, LDRB, LDRSH)
+    // so the match arms at 465–491 have all arms taken at least once.
+    #[test]
+    fn ldrh_reg_exercises_arm() {
+        let (mut c, mut bus) = core_and_bus();
+        bus.write16(0x2000_0004, 0xBEEF, 0);
+        c.set_reg(1, 0x2000_0000);
+        c.set_reg(2, 4);
+        // LDRH R0, [R1, R2]: 0101_101_010_001_000 = 0x5A88
+        c.execute_one_with_bus(0x5A88, &mut bus);
+        assert_eq!(c.reg(0), 0xBEEF);
+    }
+
+    #[test]
+    fn ldrsh_reg_exercises_arm() {
+        let (mut c, mut bus) = core_and_bus();
+        bus.write16(0x2000_0000, 0x8000, 0);
+        c.set_reg(1, 0x2000_0000);
+        c.set_reg(2, 0);
+        // LDRSH R0, [R1, R2]: 0101_111_010_001_000 = 0x5E88
+        c.execute_one_with_bus(0x5E88, &mut bus);
+        assert_eq!(c.reg(0), 0xFFFF_8000);
+    }
+
+    // line 506: STR Rt, [Rn, #imm5*4] SIO path.
+    #[test]
+    fn str_imm_sio_costs_one_cycle() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xAA);
+        c.set_reg(1, 0xD000_0010);
+        // STR R0, [R1, #0]: 01100_00000_001_000 = 0x6008
+        let cy = c.execute_one_with_bus(0x6008, &mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    // line 526: STRB Rt, [Rn, #imm5] SIO path.
+    #[test]
+    fn strb_imm_sio_costs_one_cycle() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xAB);
+        c.set_reg(1, 0xD000_0010);
+        // STRB R0, [R1, #0]: 01110_00000_001_000 = 0x7008
+        let cy = c.execute_one_with_bus(0x7008, &mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    // line 546: STRH Rt, [Rn, #imm5*2] SIO path.
+    #[test]
+    fn strh_imm_sio_costs_one_cycle() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xBEEF);
+        c.set_reg(1, 0xD000_0010);
+        // STRH R0, [R1, #0]: 10000_00000_001_000 = 0x8008
+        let cy = c.execute_one_with_bus(0x8008, &mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    // line 569: STR Rt, [SP, #imm8*4] SIO path — SP pointing into SIO.
+    #[test]
+    fn str_sp_sio_costs_one_cycle() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(13, 0xD000_0010);
+        c.set_reg(0, 0x1234_5678);
+        // STR R0, [SP, #0]: 10010_000_00000000 = 0x9000
+        let cy = c.execute_one_with_bus(0x9000, &mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    // ---- Misc group: Adjust SP ADD/SUB ----
+
+    // line 614: ADD SP, SP, #imm (bit 7 clear) — covered by `add_sp_imm`.
+    // Pin the SUB SP variant separately for symmetry.
+    #[test]
+    fn sub_sp_imm_pins_negative_branch() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(13, 0x2000_1000);
+        // SUB SP, SP, #16: 10110000_1_0000100 = 0xB084
+        c.execute_one(0xB084);
+        assert_eq!(c.regs.sp(), 0x2000_0FF0);
+    }
+
+    // ---- PUSH reglist iteration / LR bit branches ----
+
+    // line 639: PUSH without LR (bit 8 clear) — complements push_lr_pop_pc.
+    #[test]
+    fn push_without_lr_bit() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(13, 0x2000_1000);
+        c.set_reg(0, 0xCAFE);
+        c.set_reg(1, 0xBABE);
+        // PUSH {R0,R1}: 1011_0100_00000011 = 0xB403 (bit 8 clear → no LR)
+        c.execute_one_with_bus(0xB403, &mut bus);
+        assert_eq!(c.regs.sp(), 0x2000_0FF8);
+        assert_eq!(bus.read32(0x2000_0FF8, 0), 0xCAFE);
+        assert_eq!(bus.read32(0x2000_0FFC, 0), 0xBABE);
+    }
+
+    // line 647: PUSH reglist iteration — regs NOT in the list are skipped.
+    // Push {R0, R7} with non-contiguous set.
+    #[test]
+    fn push_noncontiguous_reglist() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(13, 0x2000_1000);
+        c.set_reg(0, 0x1111);
+        c.set_reg(7, 0x7777);
+        // PUSH {R0, R7}: reglist = 0b1000_0001 = 0x81 → 0xB481
+        c.execute_one_with_bus(0xB481, &mut bus);
+        assert_eq!(c.regs.sp(), 0x2000_0FF8, "2 regs pushed");
+        assert_eq!(bus.read32(0x2000_0FF8, 0), 0x1111);
+        assert_eq!(bus.read32(0x2000_0FFC, 0), 0x7777);
+    }
+
+    // ---- CPS / PRIMASK / FAULTMASK ----
+
+    // line 662: CPS affect_i branch (bit 0 set). CPSIE I (im=0, affect I).
+    #[test]
+    fn cpsie_i_clears_primask() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.primask = 1;
+        // CPSIE I: bit 4 = 0 (enable → im=0), bit 0 = 1.
+        // Base 0xB660 | 0x01 = 0xB661
+        c.execute_one(0xB661);
+        assert_eq!(c.regs.primask, 0, "CPSIE clears PRIMASK");
+    }
+
+    #[test]
+    fn cpsid_i_sets_primask() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.primask = 0;
+        // CPSID I: bit 4 = 1 (im=1), bit 0 = 1.
+        // Base 0xB660 | 0x10 | 0x01 = 0xB671
+        c.execute_one(0xB671);
+        assert_eq!(c.regs.primask, 1);
+    }
+
+    // line 665: CPS affect_f branch (bit 1 set). CPSIE F / CPSID F.
+    #[test]
+    fn cpsie_f_clears_faultmask() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.faultmask = 1;
+        // CPSIE F: bit 4 = 0, bit 1 = 1. 0xB660 | 0x02 = 0xB662
+        c.execute_one(0xB662);
+        assert_eq!(c.regs.faultmask, 0);
+    }
+
+    #[test]
+    fn cpsid_f_sets_faultmask() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.faultmask = 0;
+        // CPSID F: bit 4 = 1, bit 1 = 1. 0xB660 | 0x10 | 0x02 = 0xB672
+        c.execute_one(0xB672);
+        assert_eq!(c.regs.faultmask, 1);
+    }
+
+    // CPS with neither bit set — hits both `if` false arms.
+    #[test]
+    fn cps_no_affect_bits() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.primask = 1;
+        c.regs.faultmask = 1;
+        // CPSID with neither I nor F: 0xB660 | 0x10 = 0xB670
+        c.execute_one(0xB670);
+        assert_eq!(c.regs.primask, 1, "primask untouched when affect_i=0");
+        assert_eq!(c.regs.faultmask, 1, "faultmask untouched when affect_f=0");
+    }
+
+    // ---- POP reglist / PC / EXC_RETURN paths ----
+
+    // line 694: POP without PC bit (bit 8 clear).
+    #[test]
+    fn pop_without_pc_bit() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(13, 0x2000_0FF8);
+        bus.write32(0x2000_0FF8, 0xAAAA, 0);
+        bus.write32(0x2000_0FFC, 0xBBBB, 0);
+        // POP {R0, R1}: 1011_1100_00000011 = 0xBC03 (bit 8 clear)
+        c.execute_one_with_bus(0xBC03, &mut bus);
+        assert_eq!(c.reg(0), 0xAAAA);
+        assert_eq!(c.reg(1), 0xBBBB);
+        assert_eq!(c.regs.sp(), 0x2000_1000);
+    }
+
+    // line 701/703: POP reglist with PC-load (i == 15) AND value is NOT
+    // an EXC_RETURN — the `else` arm of `is_exc_return(val)` at line 704.
+    #[test]
+    fn pop_pc_plain_target() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(13, 0x2000_0FF8);
+        bus.write32(0x2000_0FF8, 0xCAFE, 0);
+        bus.write32(0x2000_0FFC, 0x2000_0101, 0); // PC (Thumb-tagged)
+        // POP {R0, PC}: 1011_1101_00000001 = 0xBD01
+        let cy = c.execute_one_with_bus(0xBD01, &mut bus);
+        assert_eq!(c.reg(0), 0xCAFE);
+        assert_eq!(c.regs.pc(), 0x2000_0100, "bit 0 cleared");
+        assert_eq!(c.regs.sp(), 0x2000_1000);
+        // line 719: POP with pop_pc true → cost = 1 + count + 3.
+        // count = 2 (R0 + PC). Expected = 1 + 2 + 3 = 6.
+        assert_eq!(cy, 6);
+    }
+
+    // line 704: POP where the popped PC value IS an EXC_RETURN — exit path.
+    #[test]
+    fn pop_pc_with_exc_return() {
+        let mut bus = Bus::new();
+        let mut cpu = CortexM33::new(0, bus.atomics.clone());
+        cpu.regs.msp = 0x2000_2000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        bus.write32(vtor + 14 * 4, 0x2000_0200 | 1, 0);
+        cpu.test_enter_exception(14, &mut bus);
+        // Stack a frame that ends with EXC_RETURN as the "PC slot" to be popped.
+        // Place EXC_RETURN where POP will read it.
+        let sp = cpu.regs.r[13];
+        bus.write32(sp, 0xFFFF_FFF9, 0); // the PC slot for POP {PC}
+        // POP {PC}: 1011_1101_00000000 = 0xBD00
+        cpu.execute_one_with_bus(0xBD00, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 0, "EXC_RETURN via POP unstacks to thread mode");
+    }
+
+    // line 719 else arm: POP without PC → cost = 1 + count (no +3).
+    #[test]
+    fn pop_without_pc_cycle_cost() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(13, 0x2000_0FF8);
+        bus.write32(0x2000_0FF8, 0, 0);
+        bus.write32(0x2000_0FFC, 0, 0);
+        // POP {R0, R1}: 0xBC03, count = 2 → expected cycles = 1 + 2 = 3.
+        let cy = c.execute_one_with_bus(0xBC03, &mut bus);
+        assert_eq!(cy, 3);
+    }
+
+    // ---- IT encoding vs hint encoding (line 731 branch) ----
+
+    // line 731 false arm: `mask == 0` → hint instruction (WFI/WFE/SEV/NOP/YIELD).
+    // NOP (0xBF00) — covered by step path indirectly. Pin here directly.
+    #[test]
+    fn misc_1111_mask_zero_is_hint_nop() {
+        let (mut c, mut bus) = core_and_bus();
+        c.regs.set_pc(0x1000);
+        let cy = c.execute_one_with_bus(0xBF00, &mut bus); // NOP
+        assert_eq!(cy, 1);
+        assert_eq!(c.it_state(), 0, "NOP must not set IT state");
+    }
+
+    #[test]
+    fn misc_1111_mask_zero_yield() {
+        let (mut c, mut bus) = core_and_bus();
+        let cy = c.execute_one_with_bus(0xBF10, &mut bus); // YIELD (hint_op=1)
+        assert_eq!(cy, 1);
+    }
+
+    #[test]
+    fn misc_1111_hint_reserved_is_nop() {
+        let (mut c, mut bus) = core_and_bus();
+        // hint_op = 5 (reserved). 0xBF00 | (5<<4) = 0xBF50
+        let cy = c.execute_one_with_bus(0xBF50, &mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    // line 733 true: IT with mask != 0 — covered by IT tests, but pin here.
+    #[test]
+    fn misc_1111_mask_nonzero_is_it() {
+        let mut c = CortexM33::for_test(0);
+        // IT EQ: firstcond=0000, mask=1000 → 0xBF08
+        c.execute_one(0xBF08);
+        assert_eq!(c.it_state(), 0x08);
+    }
+
+    // ---- CBZ / CBNZ match arm (line 760) and condition (line 767) ----
+
+    // CBZ condition NOT taken: rn != 0 AND nonzero == false (CBZ flavor).
+    // line 767 else arm, already covered by cbz_not_taken. Add CBNZ nonzero
+    // with rn==0 flavor — also the else. Add a CBZ taken with large imm.
+    #[test]
+    fn cbz_with_i_bit_set_offset() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.set_reg(0, 0);
+        // CBZ R0 with i=1, imm5=0 → offset = (1<<6)|0 = 0x40 (64 bytes)
+        // Encoding: 1011_0_0_1_1_00000_000 = 0xB300
+        let cy = c.execute_one(0xB300);
+        // target = read_pc() + offset = 0x1004 + 0x40 = 0x1044
+        assert_eq!(c.regs.pc(), 0x1044);
+        assert_eq!(cy, 2);
+    }
+
+    // ---- STM iteration / writeback (line 792) ----
+
+    // Empty reglist? STM with a sparse reglist — ensures the false arm of
+    // `reglist & (1 << i) != 0` is exercised for many i values.
+    #[test]
+    fn stm_sparse_reglist() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(4, 0x2000_0100);
+        c.set_reg(0, 0xAA);
+        c.set_reg(7, 0x77);
+        // STM R4!, {R0, R7}: reglist = 0b1000_0001 = 0x81 → 0xC481
+        c.execute_one_with_bus(0xC481, &mut bus);
+        assert_eq!(bus.read32(0x2000_0100, 0), 0xAA);
+        assert_eq!(bus.read32(0x2000_0104, 0), 0x77);
+        assert_eq!(c.reg(4), 0x2000_0108, "writeback after 2 regs");
+    }
+
+    // ---- LDM iteration + writeback suppression (line 813, 820) ----
+
+    // line 820: LDM Rn!, {reglist} where Rn IS in reglist → NO writeback.
+    #[test]
+    fn ldm_with_base_in_reglist_skips_writeback() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0x2000_0100); // base AND target register
+        bus.write32(0x2000_0100, 0xABCD_1234, 0);
+        bus.write32(0x2000_0104, 0xDEAD_BEEF, 0);
+        // LDM R0!, {R0, R1}: bits[10:8]=000 (Rn=R0), reglist=0x03 → 0xC803
+        c.execute_one_with_bus(0xC803, &mut bus);
+        assert_eq!(c.reg(0), 0xABCD_1234, "R0 loaded (was base) — no writeback");
+        assert_eq!(c.reg(1), 0xDEAD_BEEF);
+    }
+
+    // line 820 complement: Rn NOT in reglist → writeback happens.
+    #[test]
+    fn ldm_with_base_not_in_reglist_writes_back() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(5, 0x2000_0100); // base
+        bus.write32(0x2000_0100, 0x11, 0);
+        bus.write32(0x2000_0104, 0x22, 0);
+        // LDM R5!, {R0, R1}: bits[10:8]=101, reglist=0x03 → 0xCD03
+        c.execute_one_with_bus(0xCD03, &mut bus);
+        assert_eq!(c.reg(0), 0x11);
+        assert_eq!(c.reg(1), 0x22);
+        assert_eq!(c.reg(5), 0x2000_0108, "writeback");
+    }
+
+    // ---- Conditional branch (line 844) and its untaken arm ----
+
+    // Already covered by branch_cond_taken / branch_cond_not_taken, but add
+    // a condition that is definitely-not-taken under a specific flag setup
+    // to pin both arms again (covers different cond encodings too).
+    #[test]
+    fn bgt_not_taken_when_le() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.regs.set_flag_z(true); // Z=1 means LE → GT is false
+        // BGT +6: cond=1100, imm8=3 → 1101_1100_00000011 = 0xDC03
+        let cy = c.execute_one(0xDC03);
+        assert_eq!(c.regs.pc(), 0x1002, "branch not taken — PC stays at post-execute value");
+        assert_eq!(cy, 1);
+    }
+
+    #[test]
+    fn bls_taken() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        c.regs.set_flag_c(false); // C=0 or Z=1 makes LS true
+        // BLS +8: cond=1001, imm8=4 → 1101_1001_00000100 = 0xD904
+        let cy = c.execute_one(0xD904);
+        assert_eq!(c.regs.pc(), 0x100C);
+        assert_eq!(cy, 1);
+    }
+
+    // ---- UDF (cond == 0xE) triggers UsageFault ----
+    #[test]
+    fn udf_raises_usage_fault() {
+        let (mut c, mut bus) = core_and_bus();
+        // UDF #0: cond=1110, imm8=0 → 1101_1110_00000000 = 0xDE00
+        c.execute_one_with_bus(0xDE00, &mut bus);
+        assert!(
+            matches!(c.pending_fault, Some(Fault::UsageFault)),
+            "UDF must set UsageFault; got {:?}",
+            c.pending_fault
+        );
+    }
+
+    // ---- Unconditional branch cycle-cost tiers (line 874, 876) ----
+
+    // line 874: forward / zero offset → cycle cost 1.
+    #[test]
+    fn b_unconditional_forward_cost_1() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        // B +8: imm11 = 4 → 0xE004
+        let cy = c.execute_one(0xE004);
+        assert_eq!(cy, 1, "forward B steady-state cost");
+        assert_eq!(c.regs.pc(), 0x100C);
+    }
+
+    // line 876: small backward (-256 <= signed < 0) → cycle cost 3.
+    #[test]
+    fn b_unconditional_small_backward_cost_3() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        // B -4: imm11 = 0x7FE → 0xE7FE. offset = -4.
+        let cy = c.execute_one(0xE7FE);
+        assert_eq!(cy, 3, "small backward cost");
+    }
+
+    // Large backward (signed < -256) → cost 5.
+    #[test]
+    fn b_unconditional_large_backward_cost_5() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.set_pc(0x1000);
+        // offset = -512 (0xFE00). imm11 field = offset/2 = -256 = 0x700 (11-bit signed).
+        // Two's complement in 11 bits: -256 = 2048 - 256 = 1792 = 0x700.
+        // Encoding: 11100_100_00000000 + ... wait 0xE700? Let me re-derive.
+        // B imm11: opcode = 11100_imm11 → 0xE000 | (imm11 & 0x7FF).
+        // For imm11 = 0x700 (representing signed -256 * 2 = -512 bytes offset).
+        // So opcode = 0xE000 | 0x700 = 0xE700.
+        let cy = c.execute_one(0xE700);
+        assert_eq!(cy, 5, "large backward cost");
+    }
+
+    // ---- SVC raises exception 11 (cond == 0xF) ----
+    #[test]
+    fn svc_enters_exception_11() {
+        let mut bus = Bus::new();
+        let mut cpu = CortexM33::new(0, bus.atomics.clone());
+        cpu.regs.msp = 0x2000_2000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        bus.write32(vtor + 11 * 4, 0x2000_0300 | 1, 0); // SVC handler
+        cpu.regs.set_pc(0x2000_0000);
+        // SVC #0: cond=1111, imm8=0 → 1101_1111_00000000 = 0xDF00
+        cpu.execute_one_with_bus(0xDF00, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 11, "SVC entered exception 11");
+    }
+
+    // ---- BKPT halts the core ----
+    #[test]
+    fn bkpt_halts_core() {
+        let (mut c, mut bus) = core_and_bus();
+        assert!(!c.is_halted());
+        // BKPT #0: 0xBE00
+        c.execute_one_with_bus(0xBE00, &mut bus);
+        assert!(c.is_halted(), "BKPT halts the core");
+    }
+
+    // ---- REVSH narrow (0b11 arm of REV dispatch) ----
+    #[test]
+    fn revsh_narrow() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_1234);
+        // REVSH R0, R1: 10111010_11_001_000 = 0xBAC8
+        c.execute_one(0xBAC8);
+        // swap_bytes(0x1234) = 0x3412, sign-extended from i16: 0x0000_3412
+        assert_eq!(c.reg(0), 0x0000_3412);
+    }
+
+    // Negative REVSH case — sign-extension non-trivial.
+    #[test]
+    fn revsh_narrow_negative() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_0080);
+        // REVSH R0, R1 → swap_bytes(0x0080) = 0x8000, sign-extended = 0xFFFF_8000
+        c.execute_one(0xBAC8);
+        assert_eq!(c.reg(0), 0xFFFF_8000);
+    }
+
+    // Reserved 0b10 arm of REV dispatch — executes as NOP.
+    #[test]
+    fn rev_reserved_dispatch_is_nop() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0xDEAD_BEEF);
+        c.set_reg(1, 0x1234_5678);
+        // 10111010_10_001_000 = 0xBA88 — REV dispatch bits[7:6] = 0b10 → undefined arm.
+        c.execute_one(0xBA88);
+        assert_eq!(c.reg(0), 0xDEAD_BEEF, "Rd unchanged on reserved REV dispatch");
+    }
+
+    // ---- Sign/zero-extend dispatch (SXTB, UXTH) — pin remaining sub-arms ----
+    #[test]
+    fn sxtb_narrow() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_0080); // -128 as i8
+        // SXTB R0, R1: 10110010_01_001_000 = 0xB248
+        c.execute_one(0xB248);
+        assert_eq!(c.reg(0), 0xFFFF_FF80);
+    }
+
+    #[test]
+    fn uxth_narrow() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0xDEAD_BEEF);
+        // UXTH R0, R1: 10110010_10_001_000 = 0xB288
+        c.execute_one(0xB288);
+        assert_eq!(c.reg(0), 0x0000_BEEF);
+    }
+
+    // ---- Load literal (PC-relative) ----
+    #[test]
+    fn ldr_literal_reads_aligned_pc_plus_imm() {
+        let (mut c, mut bus) = core_and_bus();
+        c.regs.set_pc(0x2000_0000);
+        bus.write32(0x2000_0010, 0xAABB_CCDD, 0);
+        // LDR R0, [PC, #12]: 01001_000_00000011 = 0x4803 (imm8=3 → offset = 12)
+        // Align(read_pc(), 4) = 0x2000_0004, + 12 = 0x2000_0010.
+        let cy = c.execute_one_with_bus(0x4803, &mut bus);
+        assert_eq!(c.reg(0), 0xAABB_CCDD);
+        assert_eq!(cy, 2, "LDR literal 2-cycle SRAM cost");
+    }
+
+    // ---- RSBS / CMP / CMN / MVNS / BICS / TST / ORRS / AND / EOR / MULS flag sets ----
+    // Many of these are already covered; add a couple more negative/zero
+    // flag cases for the MULS path to ensure the M33 2-cycle return arm is hit.
+    #[test]
+    fn muls_cycle_cost_is_two() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 3);
+        c.set_reg(1, 7);
+        let cy = c.execute_one(0x4348); // MULS R0, R1
+        assert_eq!(c.reg(0), 21);
+        assert_eq!(cy, 2, "M33 MULS 2-cycle cost");
+    }
+
+    // STRH reg with a plain SRAM (non-SIO) address to pin the False arm
+    // of `addr >> 28 == 0xD` at line 458.
+    #[test]
+    fn strh_reg_sram_costs_two_cycles() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xBEEF);
+        c.set_reg(1, 0x2000_0000); // SRAM
+        c.set_reg(2, 4);
+        // STRH R0, [R1, R2]: 0x5288
+        let cy = c.execute_one_with_bus(0x5288, &mut bus);
+        assert_eq!(cy, 2, "SRAM store is 2-cycle");
+        assert_eq!(bus.read16(0x2000_0004, 0), 0xBEEF);
+    }
+
+    // STRB reg SRAM path — pins the False arm at line 463 for another
+    // monomorphization instance.
+    #[test]
+    fn strb_reg_sram_costs_two_cycles() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0xAB);
+        c.set_reg(1, 0x2000_0000);
+        c.set_reg(2, 1);
+        let cy = c.execute_one_with_bus(0x5488, &mut bus);
+        assert_eq!(cy, 2);
+        assert_eq!(bus.read8(0x2000_0001, 0), 0xAB);
+    }
+
+    // STR reg SRAM path — pin False arm at line 453 for the with_bus path.
+    #[test]
+    fn str_reg_sram_costs_two_cycles() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0x1234_5678);
+        c.set_reg(1, 0x2000_0000);
+        c.set_reg(2, 0x10);
+        let cy = c.execute_one_with_bus(0x5088, &mut bus);
+        assert_eq!(cy, 2);
+        assert_eq!(bus.read32(0x2000_0010, 0), 0x1234_5678);
+    }
+
+    // BLX Rm with bit 2 set — pins the `!link` False arm at line 413.
+    // With `link=true`, the BXNS transition guard cannot trigger, so the
+    // `self.secure` inner check is short-circuited out. Important boundary:
+    // bit 2 on BLX must NOT perform a Secure→NS transition.
+    #[test]
+    fn blx_with_bit2_set_does_not_transition() {
+        let mut c = CortexM33::for_test(0);
+        assert!(c.secure);
+        c.regs.set_pc(0x1000);
+        c.set_reg(1, 0x2000_0001);
+        // BLX R1 with bit 2 set: bit 7 = 1 (BLX), bits[6:3]=0001 (R1),
+        // bits[2:0]=100 → 0100_0111_1000_1100 = 0x478C
+        c.execute_one(0x478C);
+        assert!(c.secure, "BLX must NOT trigger Secure→NS transition");
+        assert_eq!(c.regs.pc(), 0x2000_0000);
+    }
+
+    // LSLS imm with a larger imm5 for a second monomorphization. The
+    // primary monomorphization already covers both arms; this targets
+    // the `execute_one_with_bus` path directly so its branch counter sees
+    // both arms too.
+    #[test]
+    fn lsls_imm_nonzero_via_with_bus_path() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(1, 0x1);
+        // LSLS R0, R1, #5 → imm5=5. bits: 00000_00101_001_000 = 0x0148
+        c.execute_one_with_bus(0x0148, &mut bus);
+        assert_eq!(c.reg(0), 0x20);
+    }
+
+    #[test]
+    fn lsls_imm_zero_via_with_bus_path() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(2, 42);
+        c.regs.set_flag_c(true);
+        c.execute_one_with_bus(0x0010, &mut bus); // LSLS R0, R2, #0 (MOVS)
+        assert_eq!(c.reg(0), 42);
+        assert!(c.flag_c());
+    }
+
+    // LDRB imm has zero line coverage currently — add a direct test.
+    #[test]
+    fn ldrb_imm_basic() {
+        let (mut c, mut bus) = core_and_bus();
+        bus.write8(0x2000_0003, 0xA5, 0);
+        c.set_reg(1, 0x2000_0000);
+        // LDRB R0, [R1, #3]: 01111_00011_001_000 = 0x78C8
+        c.execute_one_with_bus(0x78C8, &mut bus);
+        assert_eq!(c.reg(0), 0xA5);
+    }
 }
