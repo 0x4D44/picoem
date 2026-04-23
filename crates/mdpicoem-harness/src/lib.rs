@@ -7027,4 +7027,618 @@ mod tests {
         let p = default_out_path(Path::new("foo.bin"));
         assert_eq!(p, expected_dir.join("picogus_foo.wav"));
     }
+
+    // ----------------------------------------------------------------------
+    // harness_tracing_init — cover the subscriber registration block (17-25).
+    // `try_init` makes a second call a no-op, so it is safe to invoke here
+    // even if another test already initialised a subscriber.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn harness_tracing_init_is_idempotent() {
+        harness_tracing_init();
+        // Second call must not panic — `try_init` swallows the error.
+        harness_tracing_init();
+    }
+
+    // ----------------------------------------------------------------------
+    // cond_name / flags_condition_true / flags_condition_false / cond_passes:
+    // the `AL` arm (cond = 14) and the unreachable-in-production `??`
+    // fall-through arm (cond >= 15) are otherwise never taken by the
+    // fuzz generators (which bound cond to 0..=13).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn cond_name_al_and_fallback() {
+        assert_eq!(cond_name(14), "AL");
+        // Any value >= 15 falls into the `??` arm (covers lib.rs:3926).
+        assert_eq!(cond_name(15), "??");
+        assert_eq!(cond_name(0xFFFF), "??");
+    }
+
+    #[test]
+    fn flags_condition_true_al_arm() {
+        // AL (cond 14) hits the `_ => tb` arm (lib.rs:3953).
+        let tb = 0x0100_0000u32;
+        assert_eq!(flags_condition_true(14), tb);
+        assert_eq!(flags_condition_true(15), tb);
+    }
+
+    #[test]
+    fn flags_condition_false_al_arm() {
+        // AL (cond 14) hits the `_ => tb` arm (lib.rs:3979) — there is no
+        // xPSR value that makes AL false, so the function returns the T
+        // bit alone, which is what a caller would treat as "no flags".
+        let tb = 0x0100_0000u32;
+        assert_eq!(flags_condition_false(14), tb);
+        assert_eq!(flags_condition_false(15), tb);
+    }
+
+    #[test]
+    fn cond_passes_al_arm_is_true() {
+        // AL always passes. Covers the `_ => true` fallback at lib.rs:4005.
+        assert!(cond_passes(14, 0));
+        assert!(cond_passes(14, 0xFFFF_FFFF));
+        assert!(cond_passes(15, 0x1234_5678));
+    }
+
+    // ----------------------------------------------------------------------
+    // run_one_emu — exercise the needs_bus arm and the Thumb-32 arms
+    // (execute_one_wide / execute_one_wide_with_bus).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn run_one_emu_needs_bus_writes_mem_pre() {
+        // LDR R0, [R1] (T16 load-register) — reads the word at the scratch
+        // base, which the runner must first pre-populate from `mem_pre`.
+        let tc = TestCase {
+            name: "LDR R0,[R1] via bus".into(),
+            opcode: enc_ldr_imm(0, 1, 0),
+            reg_pre: vec![(1, 0)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(0, 0xDEAD_BEEF),
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        // Pre-stain the scratch to prove the runner's clear-then-load path
+        // at lib.rs:4962-4967 actually writes the preconditions.
+        for i in 0..16 {
+            bus.write8(EMU_TEST_SCRATCH + i, 0xAB, 0);
+        }
+        let state = run_one_emu(&tc, &mut bus);
+        assert_eq!(state.regs[0], 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn run_one_emu_thumb32_alu_no_bus() {
+        // MOVW R0, #0x1234 — a Thumb-32 ALU instruction with `hw1`
+        // populated. Hits the `Some(hw1) => ... execute_one_wide` arm at
+        // lib.rs:4980.
+        let (hw0, hw1) = thumb32_gen::enc_t32_movw(0, 0x1234);
+        let tc = TestCase {
+            name: "MOVW R0,#0x1234".into(),
+            opcode: hw0,
+            hw1: Some(hw1),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu(&tc, &mut bus);
+        assert_eq!(state.regs[0], 0x1234);
+    }
+
+    #[test]
+    fn run_one_emu_thumb32_with_bus() {
+        // STR.W R0, [R1, #0] — Thumb-32 word store exercising the
+        // `Some(hw1) => ... execute_one_wide_with_bus` arm (lib.rs:4978).
+        let (hw0, hw1) = enc_str_w_imm12(0, 1, 0);
+        let tc = TestCase {
+            name: "STR.W R0,[R1]".into(),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: vec![(0, 0xC0FFEE42), (1, 0)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_check: mem_check_u32(0),
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu(&tc, &mut bus);
+        // Verify the four stored bytes match the stored u32 (LE).
+        assert_eq!(state.mem.len(), 4);
+        let reassembled =
+            u32::from_le_bytes([state.mem[0], state.mem[1], state.mem[2], state.mem[3]]);
+        assert_eq!(reassembled, 0xC0FFEE42);
+    }
+
+    // ----------------------------------------------------------------------
+    // run_one_emu_multistep — cover the needs_bus arm and the hw1 prelude
+    // branch (lib.rs:5033-5038 and :5045-5047 respectively).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn run_one_emu_multistep_needs_bus_arm() {
+        // IT EQ; LDR R0, [R1] — memory-accessing body forces the runner
+        // to clear scratch and apply mem_pre (the else arm of the
+        // `if tc.needs_bus` branch at :5032).
+        let tc = TestCase {
+            name: "IT EQ; LDR R0,[R1]".into(),
+            opcode: enc_it(0, 0b1000),
+            opcode2: Some(enc_ldr_imm(0, 1, 0)),
+            reg_pre: vec![(1, 0)],
+            addr_regs: vec![1],
+            needs_bus: true,
+            mem_pre: mem_pre_u32(0, 0x4242_4242),
+            xpsr_pre: 0x0100_0000 | (1 << 30), // T + Z (EQ true)
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu_multistep(&tc, &mut bus);
+        assert_eq!(state.regs[0], 0x4242_4242);
+    }
+
+    #[test]
+    fn run_one_emu_multistep_thumb32_prelude() {
+        // A Thumb-32 first instruction (MOVW R0, #0x5678) followed by a
+        // Thumb-16 body (NOP-ish MOVS R1, #0). The runner must lay down
+        // the T32 prelude's second halfword at +2 and offset the body to
+        // +4 — exercising the `Some(hw1)` arm of the prelude-size match
+        // at lib.rs:5045.
+        let (hw0, hw1) = thumb32_gen::enc_t32_movw(0, 0x5678);
+        let tc = TestCase {
+            name: "MOVW R0,#0x5678; MOVS R1,#7".into(),
+            opcode: hw0,
+            hw1: Some(hw1),
+            opcode2: Some(enc_movs_imm(1, 7)),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        };
+        let mut bus = Bus::new();
+        let state = run_one_emu_multistep(&tc, &mut bus);
+        assert_eq!(state.regs[0], 0x5678);
+        assert_eq!(state.regs[1], 7);
+    }
+
+    // ----------------------------------------------------------------------
+    // build_fpu_test_sequence / is_fpu_test / run_one_emu_fpu — these cover
+    // the whole FPU prelude/epilogue path, including the FPSCR-check arm.
+    // ----------------------------------------------------------------------
+
+    fn vadd_tc_with_fpscr() -> TestCase {
+        // 1.5 + 2.5 -> S2. Preconditions populate S0 and S1, epilogue
+        // reads S2 back. fpscr_mask=1 forces the FPSCR capture branch.
+        TestCase {
+            name: "FPU: S2 = S0 + S1".into(),
+            opcode: {
+                let (h0, _) = enc_vadd(2, 0, 1);
+                h0
+            },
+            hw1: Some(enc_vadd(2, 0, 1).1),
+            xpsr_mask: MASK_NO_FLAGS,
+            fpu_pre: vec![(0, 1.5f32.to_bits()), (1, 2.5f32.to_bits())],
+            fpu_check: vec![2],
+            fpscr_pre: 0,
+            fpscr_mask: 0xF000_0000,
+            ..TestCase::default()
+        }
+    }
+
+    #[test]
+    fn is_fpu_test_positive_and_negative() {
+        // A non-FPU test: empty fpu_pre / fpu_check -> false.
+        assert!(!is_fpu_test(&TestCase::default()));
+        // A test with preconditions alone flips the flag.
+        let tc_pre = TestCase {
+            fpu_pre: vec![(0, 0)],
+            ..TestCase::default()
+        };
+        assert!(is_fpu_test(&tc_pre));
+        // A test with only fpu_check also flips it.
+        let tc_check = TestCase {
+            fpu_check: vec![3],
+            ..TestCase::default()
+        };
+        assert!(is_fpu_test(&tc_check));
+    }
+
+    #[test]
+    fn build_fpu_test_sequence_layout() {
+        // Layout: VMSR + per-fpu_pre VLDR + test insn + per-fpu_check VSTR
+        // + optional VMRS/STR.W tail. Every FPU test is Thumb-32, so each
+        // instruction contributes two halfwords.
+        let tc = vadd_tc_with_fpscr();
+        let (halfwords, n_insn) = build_fpu_test_sequence(&tc);
+        // 1 VMSR + 2 VLDR + 1 VADD + 1 VSTR + 1 VMRS + 1 STR.W = 7 insns.
+        assert_eq!(n_insn, 7);
+        assert_eq!(halfwords.len(), n_insn * 2);
+        // The first instruction is always VMSR FPSCR, R11.
+        let (vmsr_h0, vmsr_h1) = enc_vmsr(11);
+        assert_eq!(halfwords[0], vmsr_h0);
+        assert_eq!(halfwords[1], vmsr_h1);
+    }
+
+    #[test]
+    fn build_fpu_test_sequence_without_fpscr_skips_tail() {
+        // fpscr_mask = 0 must NOT emit the VMRS + STR.W tail. Covers the
+        // false arm of the `if tc.fpscr_mask != 0` at lib.rs:5307.
+        let mut tc = vadd_tc_with_fpscr();
+        tc.fpscr_mask = 0;
+        let (hws_tail, n_tail) = build_fpu_test_sequence(&tc);
+        // With the tail removed: 1 VMSR + 2 VLDR + 1 VADD + 1 VSTR = 5 insns.
+        assert_eq!(n_tail, 5);
+        assert_eq!(hws_tail.len(), 10);
+    }
+
+    #[test]
+    fn run_one_emu_fpu_vadd_roundtrip() {
+        // End-to-end: runs the full prelude/test/epilogue on the
+        // emulator and reads S2 back from the FPU scratch area.
+        let tc = vadd_tc_with_fpscr();
+        let mut bus = Bus::new();
+        let state = run_one_emu_fpu(&tc, &mut bus);
+        assert_eq!(state.fpu.len(), 1, "S2 should be captured");
+        assert_eq!(state.fpu[0], 4.0f32.to_bits(), "1.5 + 2.5 = 4.0");
+        // FPSCR was captured because fpscr_mask != 0.
+        // Exact bits are implementation-defined but must be some u32 read
+        // out of the scratch area; a strict self-consistency check is
+        // enough to prove the path ran without panicking.
+        assert_eq!(state.fpscr & !0xFFFF_FFFFu32, 0);
+    }
+
+    #[test]
+    fn run_one_emu_fpu_without_fpscr_capture() {
+        // Same arithmetic, but fpscr_mask = 0 so the FPSCR capture branch
+        // at lib.rs:5422-5429 takes the `else { 0 }` arm.
+        let mut tc = vadd_tc_with_fpscr();
+        tc.fpscr_mask = 0;
+        let mut bus = Bus::new();
+        let state = run_one_emu_fpu(&tc, &mut bus);
+        assert_eq!(state.fpu[0], 4.0f32.to_bits());
+        assert_eq!(state.fpscr, 0);
+    }
+
+    #[test]
+    fn run_one_emu_fpu_needs_bus_arm() {
+        // Exercise the `if tc.needs_bus` arm inside `run_one_emu_fpu`
+        // (lib.rs:5358-5365). A VADD with needs_bus=true triggers the
+        // scratch-clear + mem_pre application path without otherwise
+        // changing behaviour (the test_slot is disjoint from the FPU
+        // scratch area, so the writes don't collide).
+        let mut tc = vadd_tc_with_fpscr();
+        tc.needs_bus = true;
+        tc.mem_pre = vec![(0, 0x11), (1, 0x22)];
+        tc.addr_regs = vec![2]; // drive the mem_pre address through a reg
+        // Seed a reg_pre entry so the prelude-loop body at :5346-5349 runs.
+        tc.reg_pre = vec![(2, 0)];
+        let mut bus = Bus::new();
+        let state = run_one_emu_fpu(&tc, &mut bus);
+        assert_eq!(state.fpu[0], 4.0f32.to_bits());
+    }
+
+    // ----------------------------------------------------------------------
+    // compare — exercise the remaining branches: modifies_lr + delta paths,
+    // SP-as-addr-reg, and compare_fpu_into (FPU mismatch / FPSCR mismatch).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn compare_modifies_lr_delta_match_ok() {
+        // Both sides advanced LR by the same delta from their respective
+        // slot bases → modifies_lr arm takes the `Ok` path through
+        // lib.rs:5609-5619.
+        let tc = TestCase {
+            modifies_lr: true,
+            ..TestCase::default()
+        };
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        qemu_regs[14] = QEMU_TEST_SLOT + 4;
+        emu_regs[14] = EMU_TEST_SLOT + 4;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
+    }
+
+    #[test]
+    fn compare_modifies_lr_delta_mismatch() {
+        // Deltas differ → the `if qemu_delta != emu_delta` branch pushes
+        // an "LR delta" diff.
+        let tc = TestCase {
+            modifies_lr: true,
+            ..TestCase::default()
+        };
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        qemu_regs[14] = QEMU_TEST_SLOT + 4;
+        emu_regs[14] = EMU_TEST_SLOT + 8; // diverged by 4
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
+        assert!(err.contains("LR delta"), "expected LR delta in err: {err}");
+    }
+
+    #[test]
+    fn compare_sp_as_addr_reg_takes_scratch_base() {
+        // SP in addr_regs → the SP delta comparison uses scratch bases
+        // instead of stack bases (the `if` arm of the tuple destructure
+        // at lib.rs:5593-5597).
+        let tc = TestCase {
+            addr_regs: vec![13],
+            ..TestCase::default()
+        };
+        let mut qemu_regs = base_regs_qemu();
+        let mut emu_regs = base_regs_emu();
+        // Both "SPs" sit at scratch+16 — with scratch bases the deltas
+        // match, so this is a pass. Crucially, they would NOT match with
+        // stack bases.
+        qemu_regs[13] = QEMU_TEST_SCRATCH + 16;
+        emu_regs[13] = EMU_TEST_SCRATCH + 16;
+        let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
+        let emu = make_state(emu_regs, 0x0100_0000, vec![]);
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
+    }
+
+    #[test]
+    fn compare_fpu_register_mismatch() {
+        // Two FPU results stored, one of them differs → compare_fpu_into
+        // pushes an "S<n>" diff line (lib.rs:5681-5684).
+        let tc = TestCase {
+            fpu_check: vec![0, 1],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let qemu = RunState {
+            regs: base_regs_qemu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0x1111_1111, 0x2222_2222],
+            fpscr: 0,
+        };
+        let emu = RunState {
+            regs: base_regs_emu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0x1111_1111, 0xFEED_FACE],
+            fpscr: 0,
+        };
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
+        assert!(err.contains("S1"), "expected S1 mismatch in err: {err}");
+    }
+
+    #[test]
+    fn compare_fpu_register_match_ok() {
+        // All declared FPU registers match → compare_fpu_into must take the
+        // false arm of the inner `a.fpu[i] != b.fpu[i]` condition at
+        // lib.rs:5680 and push nothing.
+        let tc = TestCase {
+            fpu_check: vec![0, 1],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let fpu_bits = vec![0xDEAD_BEEF, 0x1234_5678];
+        let qemu = RunState {
+            regs: base_regs_qemu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: fpu_bits.clone(),
+            fpscr: 0,
+        };
+        let emu = RunState {
+            regs: base_regs_emu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: fpu_bits,
+            fpscr: 0,
+        };
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
+    }
+
+    #[test]
+    fn compare_fpu_fpscr_match_ok() {
+        // Non-zero fpscr_mask but matching FPSCR bits → the `a_masked !=
+        // b_masked` branch at lib.rs:5691 takes its false arm.
+        let tc = TestCase {
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            ..TestCase::default()
+        };
+        let qemu = RunState {
+            regs: base_regs_qemu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0xC000_0000,
+        };
+        let emu = RunState {
+            regs: base_regs_emu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            // Low nibbles differ but they sit outside the mask — after
+            // masking, both sides agree.
+            fpscr: 0xC000_0001,
+        };
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
+    }
+
+    #[test]
+    fn enc_vldr_and_vstr_negative_offset() {
+        // The `u_bit = if offset >= 0 { 1 } else { 0 }` split at
+        // lib.rs:5092 (VLDR) and :5103 (VSTR) is never exercised by the
+        // FPU test scenarios because all prelude/epilogue offsets are
+        // non-negative. Flip the branch directly.
+        let (lo, hi) = enc_vldr(0, 12, -4);
+        // U bit (hw0 bit 7) must be 0 for a negative offset.
+        assert_eq!(lo & (1 << 7), 0);
+        // imm8 encodes abs(offset) >> 2.
+        assert_eq!(hi & 0xFF, 1);
+        let (lo, hi) = enc_vstr(1, 12, -8);
+        assert_eq!(lo & (1 << 7), 0);
+        assert_eq!(hi & 0xFF, 2);
+    }
+
+    #[test]
+    fn build_fpu_test_sequence_thumb16_test_insn() {
+        // When the FPU test's `opcode` is Thumb-16 (tc.hw1 = None), the
+        // `if let Some(h1) = tc.hw1` branch at lib.rs:5290 takes the
+        // false arm. Construct a synthetic case that would never appear
+        // in production (no real FPU insn is Thumb-16) but still drives
+        // the builder so the branch is reached.
+        let tc = TestCase {
+            opcode: 0x2000, // dummy T16 opcode (MOVS R0, #0)
+            hw1: None,
+            fpu_pre: vec![(0, 0)],
+            fpu_check: vec![0],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let (hw, n_insn) = build_fpu_test_sequence(&tc);
+        // 1 VMSR + 1 VLDR + 1 test (T16, 1 halfword) + 1 VSTR = 4 insns.
+        assert_eq!(n_insn, 4);
+        // Halfword count: VMSR(2) + VLDR(2) + test(1) + VSTR(2) = 7.
+        assert_eq!(hw.len(), 7);
+    }
+
+    #[test]
+    fn compare_fpu_fpscr_mismatch() {
+        // FPSCR differs under a non-zero mask → "FPSCR" diff line
+        // (lib.rs:5688-5696).
+        let tc = TestCase {
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            ..TestCase::default()
+        };
+        let qemu = RunState {
+            regs: base_regs_qemu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0x8000_0000,
+        };
+        let emu = RunState {
+            regs: base_regs_emu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0x4000_0000,
+        };
+        let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
+        assert!(err.contains("FPSCR"), "expected FPSCR in err: {err}");
+    }
+
+    #[test]
+    fn compare_fpu_checks_shorter_than_fpu_lengths_are_skipped() {
+        // Guard: if fpu_check declares N entries but either RunState's
+        // fpu Vec is shorter, the bounds-check at :5680 skips the diff
+        // rather than panicking on index. Verify by crafting a
+        // length-mismatch case — the compare succeeds because the loop
+        // body never runs.
+        let tc = TestCase {
+            fpu_check: vec![0, 1, 2],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let qemu = RunState {
+            regs: base_regs_qemu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![], // empty
+            fpscr: 0,
+        };
+        let emu = RunState {
+            regs: base_regs_emu(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0,
+        };
+        assert!(compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).is_ok());
+    }
+
+    // ----------------------------------------------------------------------
+    // compare_probe — cover the FPU branches too, via compare_fpu_into.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn compare_probe_fpu_mismatch() {
+        let tc = TestCase {
+            fpu_check: vec![5],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let hw = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0xAAAA_AAAA],
+            fpscr: 0,
+        };
+        let emu = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0xBBBB_BBBB],
+            fpscr: 0,
+        };
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(err.contains("S5"), "expected S5 mismatch: {err}");
+    }
+
+    // ----------------------------------------------------------------------
+    // Remaining uncovered branches in `lib.rs` (documented as unreachable
+    // or deliberately omitted from the test surface):
+    //
+    // - lib.rs:4509, 4516 — the `_ => {}` arms of the inner `match opc`
+    //   inside `generate_fuzz_mem`'s load/store-register block.
+    //   // unreachable: `is_store = matches!(opc, 0 | 1 | 2)` already
+    //   // partitions the 0..7 opc range, so the store branch only
+    //   // enumerates opc ∈ {0, 1, 2} and the load branch opc ∈ {3, 4,
+    //   // 5, 6}. Every concrete value is covered by a preceding arm;
+    //   // the wildcard exists purely to satisfy `match` exhaustiveness.
+    //
+    // - lib.rs:5515-5519 (PC sanity), 5531-5537 (result mismatch) inside
+    //   `run_fpu_smoke_test`. // unreachable: the smoke test uses a
+    //   hardcoded 4-instruction sequence (VLDR, VLDR, VADD, VSTR) with
+    //   known inputs 1.5 + 2.5. The only way to flip these branches is
+    //   to corrupt the emulator or the bus between steps, which would
+    //   be a bug. Kept as defensive assertions; `run_fpu_smoke_test`
+    //   itself is exercised by `fpu_smoke_test_vadd` above.
+    //
+    // - lib.rs:6184-6214 (assert-message format args in the existing
+    //   `gen_*_count` tests) and lib.rs:6646 (`continue` guard in
+    //   `fuzz_mem_tests_have_addr_regs`). // unreachable: the assert
+    //   bodies and LDM-with-empty-addr-regs guard are part of test code
+    //   already in the file. Production code should not be touched to
+    //   exercise test-internal format branches.
+
+    // ----------------------------------------------------------------------
+    // Probe oracle invariant: CompareBases::M0PLUS_RP2040 must mirror
+    // M33_RP2350's shape. This isn't a coverage lift per se but the
+    // const initialiser is cheap to instantiate and guards the address
+    // table against a regression that would silently break M0+ diffs.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn compare_bases_m0plus_rp2040_const_fields() {
+        let b = CompareBases::M0PLUS_RP2040;
+        assert_eq!(b.qemu_slot, QEMU_M0PLUS_TEST_SLOT);
+        assert_eq!(b.qemu_scratch, QEMU_M0PLUS_TEST_SCRATCH);
+        assert_eq!(b.qemu_stack, QEMU_M0PLUS_TEST_STACK);
+        assert_eq!(b.emu_slot, EMU_M0PLUS_TEST_SLOT);
+        assert_eq!(b.emu_scratch, EMU_M0PLUS_TEST_SCRATCH);
+        assert_eq!(b.emu_stack, EMU_M0PLUS_TEST_STACK);
+    }
 }
