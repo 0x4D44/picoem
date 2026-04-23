@@ -41,3 +41,9 @@ fuzz-runs/**/*.exe
 # wrk_scratch/: throwaway analysis scripts (see memory:
 # reference_windows_profiling for the workflow). Local-only.
 wrk_scratch/
+
+# rustc internal-compiler-error dumps. cargo +nightly llvm-cov with
+# incremental compilation has a known ICE on this workspace (set
+# CARGO_INCREMENTAL=0 to avoid). The dumps drop into the repo root;
+# they're diagnostic output, not source.
+rustc-ice-*.txt
