@@ -666,4 +666,132 @@ mod tests {
         let _ = fs::create_dir_all(&base);
         base
     }
+
+    // ---- Stage 8b branch-coverage additions ---------------------------------
+
+    /// Covers:
+    ///   * line 181 `else` branch (`bit_count < 16` → `pending_left = None`);
+    ///   * line 206 false branch (`new_lrclk == false` → `Channel::Left`);
+    ///   * line 209 false branch (second+ LRCLK edge keeps `first_lrclk_cycle`);
+    ///   * line 216 true branch of `on_bclk_rising` (over-16 shift ignored).
+    #[test]
+    fn lrclk_without_full_word_clears_pending_left() {
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
+        let mut cycle: u64 = 0;
+        // Clock 16 bits of a left-channel sample so `pending_left` fills.
+        clock_word(&mut cap, &mut cycle, false, 0xBEEF);
+        // LRCLK edge to high → finalises the left sample into `pending_left`
+        // and flips `current_channel` to Right. Also seeds
+        // `first_lrclk_cycle` → covers the true branch of line 209.
+        cap.tick(pads(false, true, false), cycle);
+        cycle += 1;
+        // Now clock only 4 bits on the right half-frame (< 16) then force a
+        // drop-back to LRCLK low. Hits the `else` branch at line 181 which
+        // clears `pending_left`, and exercises line 206's `false` arm
+        // (new_lrclk=false → Channel::Left) plus line 209's false branch
+        // (`first_lrclk_cycle.is_none()` is false on the second edge).
+        for _ in 0..4 {
+            cap.tick(pads(false, true, false), cycle);
+            cycle += 1;
+            cap.tick(pads(true, true, false), cycle);
+            cycle += 1;
+        }
+        cap.tick(pads(false, false, false), cycle);
+        cycle += 1;
+        // No frame should have been emitted: the right side never reached 16.
+        assert_eq!(cap.frames().len(), 0);
+
+        // Also hit the line 216 guard: clock MORE than 16 bits on the
+        // current (low) half-frame. The extra BCLKs are ignored because
+        // `bit_count >= 16` — branch `return` covered.
+        clock_word(&mut cap, &mut cycle, false, 0x1234);
+        // Clock 8 extra bits after the full 16 → exercises the early
+        // return at line 216.
+        for _ in 0..8 {
+            cap.tick(pads(false, false, true), cycle);
+            cycle += 1;
+            cap.tick(pads(true, false, true), cycle);
+            cycle += 1;
+        }
+        // Flush.
+        cap.tick(pads(false, true, false), cycle);
+        cycle += 1;
+        clock_word(&mut cap, &mut cycle, true, 0x5678);
+        cap.tick(pads(false, false, false), cycle);
+
+        // The new left/right pair must survive despite the extra BCLKs.
+        let last = *cap.frames().last().expect("one frame emitted");
+        assert_eq!(last, (0x1234i16, 0x5678i16));
+    }
+
+    /// Covers line 277 (edges == 1 → `None`) and line 292 (`rate == 0`
+    /// fallback branch when the fallback is zero).
+    #[test]
+    fn duration_secs_zero_fallback_returns_zero() {
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
+        // Drive exactly one LRCLK edge so edges == 1 → the `< 2` guard
+        // short-circuits with `None` (line 277 true branch).
+        cap.tick(pads(false, false, false), 0);
+        cap.tick(pads(false, true, false), 1);
+        assert_eq!(cap.lrclk_edge_count(), 1);
+        assert!(cap.inferred_sample_rate_hz().is_none());
+        // With a zero fallback the `rate <= 0.0` guard returns 0.0.
+        assert_eq!(cap.duration_secs(0), 0.0);
+    }
+
+    /// Covers line 277's `last <= first` branch (both stamps are equal
+    /// → return `None`).
+    #[test]
+    fn inferred_rate_zero_elapsed_returns_none() {
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
+        // Drive three LRCLK edges all at cycle 0 — edges ≥ 2 but
+        // `last == first` triggers the second clause of the guard.
+        cap.tick(pads(false, false, false), 0);
+        cap.tick(pads(false, true, false), 0);
+        cap.tick(pads(false, false, false), 0);
+        cap.tick(pads(false, true, false), 0);
+        assert!(cap.lrclk_edge_count() >= 2);
+        assert!(cap.inferred_sample_rate_hz().is_none());
+    }
+
+    /// `write_wav` with a bare filename (no parent directory component)
+    /// must succeed — covers the `None` arm of `path.parent()` (free
+    /// function, line 324 false branch) and the `parent.as_os_str()` empty
+    /// check at line 327.
+    #[test]
+    fn write_wav_bare_filename_no_parent_creation() {
+        // Chdir to a temp dir so we don't pollute the workspace root.
+        let dir = tmp_dir().join("bare_name");
+        let _ = fs::create_dir_all(&dir);
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("chdir into tmp");
+        // Plain file name, no path separator → `Path::parent` yields
+        // Some("") (empty parent component). Hits line 327's empty-parent
+        // branch instead of `fs::create_dir_all`.
+        let bare = Path::new("i2s_bare.wav");
+        let res = write_wav(bare, 22_050, &[(1, 2)]);
+        // Restore cwd BEFORE asserting so a failure doesn't leave the
+        // test process in a strange directory.
+        std::env::set_current_dir(&prev).expect("restore cwd");
+        res.expect("bare filename should succeed");
+        let bytes = fs::read(dir.join("i2s_bare.wav")).expect("read");
+        assert_eq!(bytes.len(), WAV_HEADER_BYTES + 4);
+        let _ = fs::remove_file(dir.join("i2s_bare.wav"));
+    }
+
+    /// Covers `set_sys_clk_hz` / `sys_clk_hz` / `I2sCapture::write_wav`
+    /// method wrapper — otherwise only exercised via the free function.
+    #[test]
+    fn set_sys_clk_hz_and_method_write_wav() {
+        let mut cap = I2sCapture::new(100_000_000, BCLK, LRCLK, DOUT);
+        assert_eq!(cap.sys_clk_hz(), 100_000_000);
+        cap.set_sys_clk_hz(125_000_000);
+        assert_eq!(cap.sys_clk_hz(), 125_000_000);
+
+        let tmp = tmp_dir().join("i2s_method.wav");
+        cap.write_wav(&tmp, 48_000).expect("method write");
+        let bytes = fs::read(&tmp).expect("read");
+        assert_eq!(bytes.len(), WAV_HEADER_BYTES);
+        let _ = fs::remove_file(&tmp);
+    }
 }
