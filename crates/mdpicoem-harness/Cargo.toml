@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-mdpicoem-common = { path = "../mdpicoem-common" }
+mdpicoem-common = { path = "../mdpicoem-common", features = ["pio-pad-diag"] }
 mdpicoem-devices = { path = "../mdpicoem-devices" }
 mdrp2350 = { path = "../mdrp2350" }
 mdrp2040 = { path = "../mdrp2040" }

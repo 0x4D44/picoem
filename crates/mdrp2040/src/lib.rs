@@ -700,6 +700,12 @@ impl Emulator {
         self.bus.master_cycle = self.clock.cycles;
         self.bus.read32(addr)
     }
+
+    /// Harness-only diagnostic: drain every byte firmware has written to
+    /// UART0 `DR` since the previous call. Returns empty if idle.
+    pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
+        self.bus.drain_uart0_tx_log()
+    }
 }
 
 /// Builder for assembling the emulator. Seeds the Bus clock tree from

@@ -108,8 +108,8 @@ pub struct Psram {
 
     /// Byte counters — used by write buffer overflow detection. Not
     /// strictly required by the firmware but handy for debugging.
-    bytes_written: u64,
-    bytes_read: u64,
+    pub bytes_written: u64,
+    pub bytes_read: u64,
 
     /// Number of times [`Psram::tick`] has been invoked. Useful for
     /// chain-of-life diagnostics in the harness when PSRAM appears

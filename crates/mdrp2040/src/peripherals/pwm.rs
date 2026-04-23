@@ -303,8 +303,15 @@ impl PwmRegs {
             }
             INTE => {
                 let mut stored = self.inte as u32;
+                let before = stored;
                 apply_alias_rmw(&mut stored, value, alias);
                 self.inte = stored as u8;
+                if std::env::var("MDPIO_PWM_TRACE").is_ok() {
+                    eprintln!(
+                        "[pwm] INTE write alias={} val=0x{:02x} {:#04x} -> {:#04x}",
+                        alias, value, before, stored
+                    );
+                }
                 self.route_irq(irqs);
             }
             INTF => {

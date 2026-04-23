@@ -14,20 +14,22 @@
 //! instruction (multi-cycle) per tick. See [`Self::tick`] for details.
 //!
 //! The capture observes BCLK and LRCLK edges and assembles 16-bit PCM
-//! samples MSB first. On each LRCLK edge, the in-flight sample is
-//! finalised and assigned to either the left or right channel based on
-//! LRCLK's new level (standard Philips I2S: LRCLK low = left, LRCLK
-//! high = right — see
-//! `pico-extras/src/rp2_common/pico_audio_i2s/audio_i2s.pio`).
+//! samples MSB first. Channel mapping follows `pico-extras/src/rp2_common/
+//! pico_audio_i2s/audio_i2s.pio`: the program's entry-point window sends
+//! bits 31..16 of the 32-bit FIFO word under LRCLK=1 and bits 15..0 under
+//! LRCLK=0, and PicoGUS firmware packs `(RIGHT << 16) | LEFT`. So the
+//! data clocked in under LRCLK=1 is the RIGHT sample, LRCLK=0 is LEFT.
 //!
-//! Philips I2S also specifies a one-BCLK delay between the LRCLK edge
-//! and the first data bit of the new word. That is handled by simply
-//! starting with a fresh `accumulator` and ignoring the first BCLK
-//! rising edge after an LRCLK transition — in practice, the standard
-//! 32-bit-per-word stereo frame already shifts in 16 data bits followed
-//! by 16 junk bits, so by the time LRCLK toggles we have a complete
-//! 16-bit word stored. See [`I2sCapture::on_bclk_rising`] for the
-//! detail.
+//! **Philips one-BCLK delay.** The PIO aligns each 16-bit word across
+//! an LRCLK edge: 15 MSBs are latched on one LRCLK side, and the
+//! remaining LSB is latched on the NEXT BCLK rising edge after the
+//! LRCLK transition. A naive "16 bits per LRCLK window" receiver would
+//! mis-align by exactly 1 bit — observed as `0xFF` pushed →
+//! `L=127, R=-32768` (= `0xFF>>1` and `1<<15`). This decoder therefore
+//! holds the 15-bit accumulator across the LRCLK edge, latches the
+//! 16th (LSB) bit on the first BCLK rising after the edge, and commits
+//! the completed word to the channel whose LRCLK level was active during
+//! the 15 MSBs (see [`I2sCapture::on_bclk_rising`]).
 //!
 //! No dependency on an external WAV crate — the file format is
 //! documented at <https://soundfile.sapp.org/doc/WaveFormat/>; we write
@@ -66,24 +68,40 @@ pub struct I2sCapture {
     prev_bclk: bool,
     prev_lrclk: bool,
 
-    // In-flight sample: MSB-first shift register (16 bits).
+    // In-flight sample: MSB-first shift register.
     accumulator: u16,
-    /// Number of data bits already shifted in for the current sample.
-    /// I2S words are always clocked with at least 16 BCLKs per half-
-    /// frame; once we've latched 16 bits we stop appending, and the
-    /// remaining BCLKs in the half-frame are ignored until LRCLK
-    /// toggles.
+    /// Number of data bits already shifted in for the current
+    /// channel's word. In steady state, rises to 15 over the current
+    /// LRCLK window, then an LRCLK edge transfers the 15-bit
+    /// accumulator into "finalizing" state and the 16th (LSB) bit is
+    /// latched by the first BCLK rising after the edge.
     bit_count: u8,
 
-    /// Channel of the sample currently in `accumulator`. Determined by
-    /// the LRCLK level after the most recent LRCLK edge.
+    /// Channel of the bits currently accumulating (i.e., the new side
+    /// after the most recent LRCLK edge). The word being *finalized*
+    /// on any pending LSB belongs to the channel in
+    /// [`Self::finalizing_channel`], not this field.
     current_channel: Channel,
+
+    /// After an LRCLK edge, the 15-bit `accumulator` holds the MSBs of
+    /// the *previous* channel's 16-bit word. The next BCLK rising edge
+    /// latches that word's LSB and commits it. `None` between edges
+    /// (normal accumulation phase) and at startup before the first
+    /// edge has been seen.
+    finalizing_channel: Option<Channel>,
 
     /// Frames emitted so far. Order is insertion-order: each frame is
     /// `(left, right)`.
     frames: Vec<(i16, i16)>,
-    /// Left-channel sample waiting for its matching right sample.
+    /// Half-frame buffers: whichever channel arrives first is parked
+    /// here until its mate lands, at which point a frame is emitted.
+    /// `pico-extras/audio_i2s.pio` sends RIGHT first per FIFO word
+    /// (bits 31..16 under LRCLK=1), so in practice `pending_right`
+    /// fills then the subsequent LEFT commit emits. Tracking both
+    /// makes the decoder tolerant of the opposite ordering and of
+    /// mid-stream resyncs.
     pending_left: Option<i16>,
+    pending_right: Option<i16>,
 
     // Wall-clock / sample-rate inference.
     /// Cycle index at which the first LRCLK edge was observed. Sourced
@@ -117,7 +135,9 @@ impl I2sCapture {
             accumulator: 0,
             bit_count: 0,
             current_channel: Channel::Left,
+            finalizing_channel: None,
             frames: Vec::new(),
+            pending_right: None,
             pending_left: None,
             first_lrclk_cycle: None,
             last_lrclk_cycle: None,
@@ -173,36 +193,29 @@ impl I2sCapture {
             "lrclk_edge",
         );
 
-        // Finalise the sample that was being shifted in under the
-        // *previous* LRCLK level. Only emit if we actually clocked in
-        // 16 bits — fractional words are ignored (the very first half-
-        // frame after capture start typically has bit_count < 16 since
-        // we missed the leading BCLK edges).
-        if self.bit_count >= 16 {
-            let sample = self.accumulator as i16;
-            match self.current_channel {
-                Channel::Left => {
-                    self.pending_left = Some(sample);
-                }
-                Channel::Right => {
-                    let left = self.pending_left.take().unwrap_or(0);
-                    self.frames.push((left, sample));
-                }
-            }
+        // Philips one-BCLK delay: the 15 MSBs of the previous channel's
+        // 16-bit word are in `accumulator` now; the LSB arrives on the
+        // next BCLK rising edge. Mark the word as finalizing and stash
+        // which channel it belongs to (the channel active during those
+        // 15 MSBs, i.e., the current channel BEFORE this edge).
+        if self.bit_count == 15 {
+            self.finalizing_channel = Some(self.current_channel);
+            // Keep `accumulator` — its 15 MSBs are needed for the LSB
+            // shift-in below.
         } else {
-            // First (or dropped) half-frame — discard any orphaned
-            // left sample so we resync cleanly.
+            // First edge (priming), malformed frame, or a transmitter
+            // that doesn't match the PIO timing — drop any in-flight
+            // data and resync cleanly.
+            self.finalizing_channel = None;
+            self.accumulator = 0;
             self.pending_left = None;
+            self.pending_right = None;
         }
-
-        // Reset accumulator for the new half-frame. The Philips I2S
-        // one-BCLK delay after LRCLK is handled implicitly: after this
-        // edge, `bit_count` is 0 and the next BCLK rising edge will
-        // latch DOUT as bit 15. In practice the very first data bit
-        // after an LRCLK edge lands one BCLK later, so the first BCLK
-        // rising that follows is the MSB of the new word.
-        self.accumulator = 0;
         self.bit_count = 0;
+
+        // The new side of LRCLK becomes the current channel. Actual
+        // commit of the finalizing word happens on the next BCLK
+        // rising edge (which latches that word's LSB).
         self.current_channel = if new_lrclk { Channel::Right } else { Channel::Left };
 
         self.lrclk_edges = self.lrclk_edges.saturating_add(1);
@@ -213,18 +226,54 @@ impl I2sCapture {
     }
 
     fn on_bclk_rising(&mut self, dout: bool) {
-        if self.bit_count >= 16 {
-            // Already captured a full word for this half-frame — ignore
-            // any further BCLKs until LRCLK toggles.
+        // Philips one-BCLK delay: if a previous channel's word is
+        // awaiting its LSB, this BCLK rising edge provides it.
+        if let Some(finalize) = self.finalizing_channel.take() {
+            self.accumulator = (self.accumulator << 1) | (dout as u16);
+            let sample = self.accumulator as i16;
+            trace!(
+                target: "mdpicoem_devices::i2s_capture",
+                dout,
+                channel = ?finalize,
+                committed = format_args!("0x{:04x}", sample as u16),
+                "philips_lsb_commit",
+            );
+            // Pair the commit against whichever channel is already
+            // parked in the half-frame buffer; otherwise stash this
+            // one and wait for its mate. Works for either
+            // RIGHT-then-LEFT (the pico-audio PIO ordering) or the
+            // reverse.
+            match finalize {
+                Channel::Left => {
+                    if let Some(right) = self.pending_right.take() {
+                        self.frames.push((sample, right));
+                    } else {
+                        self.pending_left = Some(sample);
+                    }
+                }
+                Channel::Right => {
+                    if let Some(left) = self.pending_left.take() {
+                        self.frames.push((left, sample));
+                    } else {
+                        self.pending_right = Some(sample);
+                    }
+                }
+            }
+            // Reset accumulator for the new channel. `bit_count` stays
+            // at 0 because this BCLK was consumed for the finalizing
+            // LSB, not for a new-channel MSB.
+            self.accumulator = 0;
             return;
         }
-        // MSB first: bit 15 shifted in first, bit 0 last.
+
+        // Normal accumulation: at most 15 bits per LRCLK window. The
+        // 16th bit (LSB) arrives on the first BCLK rising after the
+        // LRCLK edge via the `finalizing_channel` branch above.
+        if self.bit_count >= 15 {
+            return;
+        }
         self.accumulator = (self.accumulator << 1) | (dout as u16);
         self.bit_count += 1;
-        // Diagnostic trace per latched bit. `trace!` (very high
-        // frequency: BCLK is ~1.5 MHz at 44 kHz stereo) so production
-        // release builds compile this to nothing. Useful when the WAV
-        // is silent and we need to confirm DOUT=1 ever shows up at all.
         trace!(
             target: "mdpicoem_devices::i2s_capture",
             dout,
@@ -401,72 +450,91 @@ mod tests {
         p
     }
 
-    /// Emit one BCLK period for each of the 16 bits of `word` (MSB
-    /// first), while `lrclk` is held constant. Each bit takes two ticks
-    /// (low half, high half) so BCLK has a visible rising edge. The
-    /// caller's mutable cycle counter is bumped one per tick so edge
-    /// timestamps remain monotonic across consecutive `clock_word`
-    /// calls.
-    fn clock_word(cap: &mut I2sCapture, cycle: &mut u64, lrclk_high: bool, word: u16) {
-        for i in (0..16).rev() {
-            let bit = (word >> i) & 1 != 0;
-            // BCLK low, data presented by transmitter.
-            cap.tick(pads(false, lrclk_high, bit), *cycle);
+    /// Emit one 32-bit FIFO frame using `pico-extras/audio_i2s.pio`
+    /// bit timing. Order (MSB first from the FIFO word
+    /// `(right << 16) | left`):
+    ///   - bits 31..17 under LRCLK=1 (top 15 bits of RIGHT)
+    ///   - bit 16 under LRCLK=0 (LSB of RIGHT — LRCLK falling)
+    ///   - bits 15..1 under LRCLK=0 (top 15 bits of LEFT)
+    ///   - bit 0 under LRCLK=1 (LSB of LEFT — LRCLK rising)
+    /// 32 BCLK rising edges per frame, so `cycle` advances by 64.
+    fn clock_philips_frame(cap: &mut I2sCapture, cycle: &mut u64, left: u16, right: u16) {
+        // 15 bits of RIGHT (bit 15 down to bit 1) with LRCLK=1.
+        for i in (1..=15).rev() {
+            let bit = (right >> i) & 1 != 0;
+            cap.tick(pads(false, true, bit), *cycle);
             *cycle += 1;
-            // BCLK high — rising edge latches `bit` into the shift
-            // register.
-            cap.tick(pads(true, lrclk_high, bit), *cycle);
+            cap.tick(pads(true, true, bit), *cycle);
             *cycle += 1;
         }
+        // LSB of RIGHT with LRCLK=0 (LRCLK falling edge on first tick).
+        let bit = right & 1 != 0;
+        cap.tick(pads(false, false, bit), *cycle);
+        *cycle += 1;
+        cap.tick(pads(true, false, bit), *cycle);
+        *cycle += 1;
+        // 15 bits of LEFT (bit 15 down to bit 1) with LRCLK=0.
+        for i in (1..=15).rev() {
+            let bit = (left >> i) & 1 != 0;
+            cap.tick(pads(false, false, bit), *cycle);
+            *cycle += 1;
+            cap.tick(pads(true, false, bit), *cycle);
+            *cycle += 1;
+        }
+        // LSB of LEFT with LRCLK=1 (LRCLK rising edge on first tick).
+        let bit = left & 1 != 0;
+        cap.tick(pads(false, true, bit), *cycle);
+        *cycle += 1;
+        cap.tick(pads(true, true, bit), *cycle);
+        *cycle += 1;
     }
 
     #[test]
     fn decodes_known_square_wave() {
-        // Encode left = 0x1234, right = 0x5678. Standard Philips I2S:
-        // LRCLK low = left channel; LRCLK high = right channel. At
-        // startup the capture sees LRCLK as 0 (prev_lrclk=false, no
-        // edge on the first tick).
-        //
-        // The first half-frame (LRCLK=0) primes the decoder — because
-        // we need an LRCLK edge to finalise a sample, the very first
-        // word we clock in is discarded. So encode: discard-left,
-        // right=unused, left=0x1234, right=0x5678, then a trailing
-        // LRCLK edge to flush the last right sample.
+        // Feed three frames using pico-audio-i2s.pio timing and check
+        // they decode 1:1. The decoder starts with `prev_lrclk=false`,
+        // so the helper's first tick (LRCLK=1) triggers a priming edge
+        // that clears accumulator state — frame 0 still decodes because
+        // the priming happens before any bits are shifted.
         let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
         let mut cycle: u64 = 0;
 
-        // Prime: LRCLK low, clock 16 bits of junk (discarded).
-        clock_word(&mut cap, &mut cycle, false, 0xAAAA);
-        // Edge to LRCLK high — finalises the junk word (as left, since
-        // current_channel was initialised to Left). Since bit_count=16,
-        // it is written to pending_left. This is the contamination we
-        // flush below.
-        cap.tick(pads(false, true, false), cycle);
-        cycle += 1;
-        // Clock 16 bits under LRCLK high (right channel).
-        clock_word(&mut cap, &mut cycle, true, 0xBBBB);
-        // Edge back to LRCLK low — finalises the junk word as right,
-        // emitting frame (junk_left, junk_right).
-        cap.tick(pads(false, false, false), cycle);
-        cycle += 1;
+        clock_philips_frame(&mut cap, &mut cycle, 0x1234, 0x5678);
+        clock_philips_frame(&mut cap, &mut cycle, 0x0001, 0x0002);
+        clock_philips_frame(&mut cap, &mut cycle, 0xC000 /* -0x4000 as u16 */, 0x7FFF);
 
-        let baseline_frames = cap.frames().len();
-
-        // Now the real data.
-        clock_word(&mut cap, &mut cycle, false, 0x1234);
-        // Edge LRCLK high — finalises 0x1234 as left.
-        cap.tick(pads(false, true, false), cycle);
-        cycle += 1;
-        clock_word(&mut cap, &mut cycle, true, 0x5678);
-        // Edge LRCLK low — finalises 0x5678 as right, pushes frame.
-        cap.tick(pads(false, false, false), cycle);
-
-        let new_frames: Vec<_> = cap.frames()[baseline_frames..].to_vec();
         assert_eq!(
-            new_frames,
-            vec![(0x1234i16, 0x5678i16)],
-            "expected one frame (0x1234, 0x5678), got {:?}",
-            new_frames
+            cap.frames(),
+            &[
+                (0x1234i16, 0x5678i16),
+                (0x0001, 0x0002),
+                (-0x4000i16, 0x7FFFi16),
+            ],
+            "Philips timing decode mismatch: frames = {:?}",
+            cap.frames()
+        );
+    }
+
+    /// Exact reproduction of the stub-1 observation from the
+    /// 2026-04-23 journal: PicoGUS firmware pushed `0x000000FF` to
+    /// TXF constantly, and the naive receiver saw `L=127, R=-32768`.
+    /// With the Philips-aware fix, a PIO-accurate transmission of
+    /// that same value must decode as `L=0x00FF, R=0x0000`.
+    #[test]
+    fn stub1_constant_0xff_decodes_correctly() {
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
+        let mut cycle: u64 = 0;
+        // FIFO word 0x000000FF = (right=0 << 16) | (left=0x00FF).
+        for _ in 0..4 {
+            clock_philips_frame(&mut cap, &mut cycle, 0x00FF, 0x0000);
+        }
+        let last = *cap.frames().last().expect("expected frames emitted");
+        assert_eq!(
+            last,
+            (0x00FFi16, 0x0000i16),
+            "Philips decoder must recover L=0x00FF, R=0x0000 from PIO \
+             output of (right<<16)|left = 0x000000FF; got {:?}",
+            last,
         );
     }
 
@@ -667,61 +735,97 @@ mod tests {
         base
     }
 
-    // ---- Stage 8b branch-coverage additions ---------------------------------
+    // ---- Branch-coverage additions (Philips-aware) ---------------------------
 
-    /// Covers:
-    ///   * line 181 `else` branch (`bit_count < 16` → `pending_left = None`);
-    ///   * line 206 false branch (`new_lrclk == false` → `Channel::Left`);
-    ///   * line 209 false branch (second+ LRCLK edge keeps `first_lrclk_cycle`);
-    ///   * line 216 true branch of `on_bclk_rising` (over-16 shift ignored).
+    /// Covers the resync path in `on_lrclk_edge`: if an LRCLK edge
+    /// arrives with `bit_count != 15`, the decoder drops in-flight
+    /// state and waits for the next clean frame. Also exercises the
+    /// `bit_count >= 15` guard in `on_bclk_rising` (extra BCLKs after
+    /// 15 are ignored until the LRCLK edge transfers to finalizing).
     #[test]
-    fn lrclk_without_full_word_clears_pending_left() {
+    fn short_window_drops_state_then_resyncs() {
         let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
         let mut cycle: u64 = 0;
-        // Clock 16 bits of a left-channel sample so `pending_left` fills.
-        clock_word(&mut cap, &mut cycle, false, 0xBEEF);
-        // LRCLK edge to high → finalises the left sample into `pending_left`
-        // and flips `current_channel` to Right. Also seeds
-        // `first_lrclk_cycle` → covers the true branch of line 209.
-        cap.tick(pads(false, true, false), cycle);
-        cycle += 1;
-        // Now clock only 4 bits on the right half-frame (< 16) then force a
-        // drop-back to LRCLK low. Hits the `else` branch at line 181 which
-        // clears `pending_left`, and exercises line 206's `false` arm
-        // (new_lrclk=false → Channel::Left) plus line 209's false branch
-        // (`first_lrclk_cycle.is_none()` is false on the second edge).
-        for _ in 0..4 {
+
+        // First: establish a normal frame so pending/buffer logic is
+        // warmed up.
+        clock_philips_frame(&mut cap, &mut cycle, 0x0AAA, 0x0BBB);
+        assert_eq!(cap.frames().len(), 1);
+
+        // Now drive a corrupted window: LRCLK high with only 3 BCLK
+        // edges, then an LRCLK edge. This triggers the `bit_count !=
+        // 15` branch of on_lrclk_edge: finalizing stays None, any
+        // half-pair is dropped.
+        for _ in 0..3 {
             cap.tick(pads(false, true, false), cycle);
             cycle += 1;
             cap.tick(pads(true, true, false), cycle);
             cycle += 1;
         }
-        cap.tick(pads(false, false, false), cycle);
+        cap.tick(pads(false, false, false), cycle); // LRCLK 1→0 edge, bit_count=3
         cycle += 1;
-        // No frame should have been emitted: the right side never reached 16.
-        assert_eq!(cap.frames().len(), 0);
 
-        // Also hit the line 216 guard: clock MORE than 16 bits on the
-        // current (low) half-frame. The extra BCLKs are ignored because
-        // `bit_count >= 16` — branch `return` covered.
-        clock_word(&mut cap, &mut cycle, false, 0x1234);
-        // Clock 8 extra bits after the full 16 → exercises the early
-        // return at line 216.
-        for _ in 0..8 {
-            cap.tick(pads(false, false, true), cycle);
+        // Resync: drive a clean frame. It must decode correctly.
+        clock_philips_frame(&mut cap, &mut cycle, 0x0123, 0x4567);
+        // Extra BCLKs DURING the second clean frame's LRCLK=0 window
+        // (more than 15 bits presented) must be ignored per the
+        // `bit_count >= 15` early return in on_bclk_rising.
+        clock_philips_frame(&mut cap, &mut cycle, 0x00FF, 0x7F00);
+
+        let frames = cap.frames();
+        assert_eq!(frames.len(), 3, "got {} frames, expected 3", frames.len());
+        assert_eq!(frames[0], (0x0AAAi16, 0x0BBBi16));
+        assert_eq!(frames[1], (0x0123i16, 0x4567i16));
+        assert_eq!(frames[2], (0x00FFi16, 0x7F00i16));
+    }
+
+    /// Covers `on_bclk_rising`'s `bit_count >= 15` early-return branch
+    /// by injecting extra BCLK rising edges within a single LRCLK
+    /// window (more than the 15 the Philips protocol expects).
+    #[test]
+    fn extra_bclks_within_window_are_ignored() {
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
+        let mut cycle: u64 = 0;
+
+        // One warm-up frame, then an intentionally over-long LRCLK=1
+        // window (25 BCLK edges instead of 15 + 1-edge-at-bound).
+        clock_philips_frame(&mut cap, &mut cycle, 0, 0);
+
+        // Over-long RIGHT window: 25 BCLK ticks (all DOUT=1) with
+        // LRCLK=1. Only the first 15 should land in the accumulator;
+        // the rest hit the `bit_count >= 15` guard.
+        for _ in 0..25 {
+            cap.tick(pads(false, true, true), cycle);
             cycle += 1;
-            cap.tick(pads(true, false, true), cycle);
+            cap.tick(pads(true, true, true), cycle);
             cycle += 1;
         }
-        // Flush.
-        cap.tick(pads(false, true, false), cycle);
+        // Abort with an LRCLK edge → bit_count is 15 (not 25), so
+        // finalizing takes effect. Shift in the LSB with LRCLK=0.
+        cap.tick(pads(false, false, true), cycle); // edge 1→0
         cycle += 1;
-        clock_word(&mut cap, &mut cycle, true, 0x5678);
-        cap.tick(pads(false, false, false), cycle);
+        cap.tick(pads(true, false, true), cycle);  // LSB of RIGHT = 1
+        cycle += 1;
 
-        // The new left/right pair must survive despite the extra BCLKs.
-        let last = *cap.frames().last().expect("one frame emitted");
-        assert_eq!(last, (0x1234i16, 0x5678i16));
+        // Close the frame with a 15-bit LEFT=0 and LSB under LRCLK=1.
+        for _ in 0..15 {
+            cap.tick(pads(false, false, false), cycle);
+            cycle += 1;
+            cap.tick(pads(true, false, false), cycle);
+            cycle += 1;
+        }
+        cap.tick(pads(false, true, false), cycle); // edge 0→1
+        cycle += 1;
+        cap.tick(pads(true, true, false), cycle);  // LSB of LEFT = 0
+
+        // RIGHT was 15 1-bits + 1 LSB=1 = 0xFFFF. LEFT was all zero.
+        let last = *cap.frames().last().expect("frame emitted");
+        assert_eq!(
+            last,
+            (0x0000i16, -1i16),
+            "over-long window must still decode to (0x0000, 0xFFFF=-1), got {:?}",
+            last,
+        );
     }
 
     /// Covers line 277 (edges == 1 → `None`) and line 292 (`rate == 0`

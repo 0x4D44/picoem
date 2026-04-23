@@ -445,6 +445,20 @@ pub trait IsaSink {
     fn sys_clk_hz(&self) -> u32 {
         125_000_000
     }
+
+    /// Number of words currently in PIO0 SM0's RX FIFO (the ISA-IOW
+    /// capture FIFO). Default returns 0 — mock sinks that don't model
+    /// PIO report empty, disabling backpressure.
+    fn pio0_sm0_rx_fifo_level(&self) -> u8 {
+        0
+    }
+
+    /// Cumulative count of PIO0 SM0 RX FIFO overflow drops. Default
+    /// returns 0 — mock sinks don't track overflow. Real emulator
+    /// returns the underlying SM's `rx_fifo_drops()`.
+    fn pio0_sm0_rx_fifo_drops(&self) -> u64 {
+        0
+    }
 }
 
 impl IsaSink for Emulator {
@@ -472,6 +486,16 @@ impl IsaSink for Emulator {
     #[inline]
     fn sys_clk_hz(&self) -> u32 {
         self.bus.sys_clk_hz()
+    }
+
+    #[inline]
+    fn pio0_sm0_rx_fifo_level(&self) -> u8 {
+        self.bus.pio[0].sm[0].rx_fifo_level()
+    }
+
+    #[inline]
+    fn pio0_sm0_rx_fifo_drops(&self) -> u64 {
+        self.bus.pio[0].sm[0].rx_fifo_drops()
     }
 
     /// Drive the ISA control + address/data bus by populating the Bus's
@@ -533,6 +557,10 @@ impl<S: IsaSink> CapturingSink<S> {
         &self.inner
     }
 
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
     pub fn into_parts(self) -> (S, I2sCapture) {
         (self.inner, self.capture)
     }
@@ -578,16 +606,69 @@ impl<S: IsaSink> IsaSink for CapturingSink<S> {
     fn sys_clk_hz(&self) -> u32 {
         self.inner.sys_clk_hz()
     }
+
+    #[inline]
+    fn pio0_sm0_rx_fifo_level(&self) -> u8 {
+        self.inner.pio0_sm0_rx_fifo_level()
+    }
+
+    #[inline]
+    fn pio0_sm0_rx_fifo_drops(&self) -> u64 {
+        self.inner.pio0_sm0_rx_fifo_drops()
+    }
 }
 
 /// One synthetic write cycle: address phase, assert, data phase, deassert.
 /// Blocking — returns after idling. Called once per write event.
+///
+/// Phase timings default to `WRITE_IDLE_CYCLES` / `WRITE_ADDR_HOLD` /
+/// `WRITE_DATA_HOLD` but can be overridden at runtime via env vars
+/// `PICOGUS_IDLE_CYCLES`, `PICOGUS_ADDR_HOLD`, `PICOGUS_DATA_HOLD` —
+/// useful for probing whether the PIO ISA-bus capture is losing
+/// events at the default timings.
 pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: bool) {
     let addr_bits = port & ((1u16 << ADDR_BITS) - 1);
 
+    let idle: u32 = std::env::var("PICOGUS_IDLE_CYCLES")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(WRITE_IDLE_CYCLES);
+    let addr_hold: u32 = std::env::var("PICOGUS_ADDR_HOLD")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(WRITE_ADDR_HOLD);
+    let data_hold: u32 = std::env::var("PICOGUS_DATA_HOLD")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(WRITE_DATA_HOLD);
+
+    // Backpressure: on real ISA hardware the PIO asserts IOCHRDY low when
+    // its RX FIFO is full, stretching the bus cycle until firmware drains.
+    // We don't model IOCHRDY feedback here, so instead we poll the FIFO
+    // level before firing and step the sink until space is available. This
+    // mirrors real-hardware backpressure with zero firmware-side changes.
+    //
+    // Tunables:
+    //   PICOGUS_BACKPRESSURE_THRESHOLD  (default 2 of 4) — drain if level ≥ this
+    //   PICOGUS_BACKPRESSURE_STEP       (default 256) — cycles per drain tick
+    //   PICOGUS_BACKPRESSURE_MAX        (default 200_000) — give-up cap per event
+    let bp_threshold: u8 = std::env::var("PICOGUS_BACKPRESSURE_THRESHOLD")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let bp_step: u32 = std::env::var("PICOGUS_BACKPRESSURE_STEP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+    let bp_max: u64 = std::env::var("PICOGUS_BACKPRESSURE_MAX")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    if bp_threshold > 0 {
+        let start_cycles = sink.cycles();
+        while sink.pio0_sm0_rx_fifo_level() >= bp_threshold {
+            let before = sink.cycles();
+            sink.step(bp_step);
+            if sink.cycles() == before {
+                break; // emulator stalled; don't spin forever
+            }
+            if sink.cycles().wrapping_sub(start_cycles) > bp_max {
+                break;
+            }
+        }
+    }
+
     // Phase 0: idle. Address on the bus, IOW high, IOR high.
     sink.drive_pins(false, false, addr_bits);
-    sink.step(WRITE_IDLE_CYCLES);
+    sink.step(idle);
 
     // Phase 1: assert IOW low with address on the bus. The PIO fires
     // on the IOW falling edge, reads 10 address bits via `in pins, 10`,
@@ -596,18 +677,18 @@ pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: b
     // model this by switching the bus to data after WRITE_ADDR_HOLD
     // cycles — enough time for the PIO to have captured the address.
     sink.drive_pins(true, false, addr_bits);
-    sink.step(WRITE_ADDR_HOLD);
+    sink.step(addr_hold);
 
     // Phase 2: data onto the bus, IOW still asserted. The PIO's
     // `in pins, 8` reads data from the same GPIO pins after a NOP
     // delay. This must happen before the PIO executes its data read.
     let data_lo = data & ((1u16 << DATA_BITS) - 1);
     sink.drive_pins(true, false, data_lo);
-    sink.step(WRITE_DATA_HOLD);
+    sink.step(data_hold);
 
     // Phase 3: deassert IOW, release the bus. Idle.
     sink.drive_pins(false, false, 0);
-    sink.step(WRITE_IDLE_CYCLES);
+    sink.step(idle);
 
     if wide {
         // Second 8-bit cycle for the high byte at port+1.
@@ -615,13 +696,13 @@ pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: b
         let data_hi = (data >> 8) & ((1u16 << DATA_BITS) - 1);
 
         sink.drive_pins(false, false, addr2);
-        sink.step(WRITE_IDLE_CYCLES);
+        sink.step(idle);
         sink.drive_pins(true, false, addr2);
-        sink.step(WRITE_ADDR_HOLD);
+        sink.step(addr_hold);
         sink.drive_pins(true, false, data_hi);
-        sink.step(WRITE_DATA_HOLD);
+        sink.step(data_hold);
         sink.drive_pins(false, false, 0);
-        sink.step(WRITE_IDLE_CYCLES);
+        sink.step(idle);
     }
 }
 
@@ -991,7 +1072,18 @@ fn replay_with_coverage(
     post_roll_ns: Option<u64>,
     pre_roll_ns: u64,
     trace_stretch: f64,
+    uart_drain: &mut UartDrain,
+    replay_pokes: &[(u32, u8)],
 ) -> (ReplaySummary, CaptureCoverage) {
+    let apply_replay_pokes = |emu: &mut mdrp2040::Emulator, pokes: &[(u32, u8)]| {
+        for &(a, v) in pokes {
+            let word_addr = a & !3;
+            let shift = (a & 3) * 8;
+            let w = emu.peek(word_addr);
+            let w_new = (w & !(0xff << shift)) | ((v as u32) << shift);
+            emu.poke(word_addr, w_new);
+        }
+    };
     let mut summary = ReplaySummary {
         events_total: events.len(),
         ..Default::default()
@@ -1013,6 +1105,7 @@ fn replay_with_coverage(
             }
         });
         summary.stall_events += stalls;
+        uart_drain.drain_emu(sink.inner_mut());
     }
 
     // Running state for the delta-classifier. `pending` carries the
@@ -1065,6 +1158,10 @@ fn replay_with_coverage(
             }
         });
         summary.stall_events += stalls;
+        uart_drain.drain_emu(sink.inner_mut());
+        if !replay_pokes.is_empty() {
+            apply_replay_pokes(sink.inner_mut(), replay_pokes);
+        }
 
         if !ev.kind.is_write() {
             summary.reads_skipped += 1;
@@ -1149,6 +1246,7 @@ fn replay_with_coverage(
             });
             summary.stall_events += stalls;
             summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start_cycles);
+            uart_drain.drain_emu(sink.inner_mut());
         }
     }
     let autopush_after_post_roll = sink.inner().bus.pio[0].sm[0].autopush_count;
@@ -1376,6 +1474,74 @@ fn print_usage() {
     );
 }
 
+/// Line-buffering drain for the emulator's UART0 TX FIFO. PicoGUS uses
+/// UART0 on GPIO 28 (230400 baud) for `stdio_init_all` / `puts`. Every
+/// byte the firmware writes to `UARTDR` is captured in
+/// `Emulator::drain_uart0_tx_log`; we accumulate bytes here until a
+/// newline lands, then flush a full line to stderr prefixed with `[uart]`
+/// so it's unambiguous against the harness's own eprintln output.
+pub struct UartDrain {
+    line: Vec<u8>,
+    total_bytes: u64,
+}
+
+impl UartDrain {
+    pub fn new() -> Self {
+        Self { line: Vec::with_capacity(128), total_bytes: 0 }
+    }
+
+    pub fn drain_emu(&mut self, emu: &mut mdrp2040::Emulator) {
+        let bytes = emu.drain_uart0_tx_log();
+        if bytes.is_empty() {
+            return;
+        }
+        self.total_bytes += bytes.len() as u64;
+        for b in bytes {
+            if b == b'\n' {
+                self.flush_line();
+            } else if b == b'\r' {
+                // stdio's crlf translation often emits CR+LF; swallow the CR.
+                continue;
+            } else {
+                self.line.push(b);
+            }
+        }
+    }
+
+    pub fn flush_line(&mut self) {
+        if self.line.is_empty() {
+            eprintln!("[uart]");
+            return;
+        }
+        // Replace non-ASCII / control bytes so a misrouted byte doesn't
+        // scramble the terminal.
+        let rendered: String = self
+            .line
+            .iter()
+            .map(|&b| {
+                if (0x20..=0x7e).contains(&b) || b == b'\t' {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        eprintln!("[uart] {rendered}");
+        self.line.clear();
+    }
+
+    pub fn finish(&mut self) {
+        if !self.line.is_empty() {
+            self.flush_line();
+        }
+        eprintln!("[uart] total bytes drained: {}", self.total_bytes);
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
+
 fn main() {
     mdpicoem_harness::harness_tracing_init();
     if let Err(e) = run() {
@@ -1424,6 +1590,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.flash(flash_bytes);
     }
     let mut emu = builder.build();
+
+    // PSRAM pre-seed (diagnostic): fill the entire 8 MB buffer with a
+    // triangle-wave pattern so voices reading at arbitrary DRAM
+    // addresses (beyond what the trace itself uploaded) still receive
+    // non-zero sample data. Use this to prove out the I2S output chain
+    // end-to-end when the trace's DRAM upload is incomplete.
+    if std::env::var("PICOGUS_PSRAM_PRESEED").is_ok() {
+        if let Some(ref mut psram) = emu.bus.psram {
+            for (i, byte) in psram.buffer.iter_mut().enumerate() {
+                // 8-bit triangle wave, period 256. Signed view:
+                // -127..+127 rising, then +127..-127 falling.
+                let phase = (i & 0xFF) as i32;
+                let sample = if phase < 128 { phase - 64 } else { 192 - phase };
+                *byte = (sample & 0xFF) as u8;
+            }
+            eprintln!(
+                "PSRAM pre-seeded with 8-bit triangle wave (PICOGUS_PSRAM_PRESEED set)"
+            );
+        }
+    }
 
     // Load the RP2040 bootrom before calling reset(): reset() reads SP
     // and the reset vector from ROM word 0 / word 4, so the ROM must be
@@ -1485,15 +1671,365 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Patch SRAM after runtime_init so .data copy is in place.
     // test_psram takes ~1 hour to complete; stub it to return 0.
+    //
+    // Address defaults to the stock `picogus-v4.0.0.bin` layout
+    // (`0x20012FA4`). Override via `PICOGUS_STUB_TEST_PSRAM=0x<addr>` for
+    // other builds, or `=0` to skip the patch entirely (letting the real
+    // PSRAM test run — useful when debugging PSRAM itself).
+    let stub_addr: u32 = match std::env::var("PICOGUS_STUB_TEST_PSRAM") {
+        Ok(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
+            .unwrap_or_else(|_| panic!("PICOGUS_STUB_TEST_PSRAM must be hex, got {s:?}")),
+        Err(_) => 0x2001_2FA4,
+    };
+    let mut uart_drain = UartDrain::new();
     {
         let old_q = emu.step_quantum;
         emu.step_quantum = 64;
-        for _ in 0..200_000u64 {
+        for i in 0..200_000u64 {
             if emu.step() == 0 { break; }
+            // Poll the UART every 256 iterations so early-boot puts()
+            // are visible interleaved with the warm-up timeline.
+            if i & 0xff == 0 {
+                uart_drain.drain_emu(&mut emu);
+            }
         }
-        emu.bus.write32(0x2001_2FA4, 0x4770_2000); // MOVS R0,#0; BX LR
+        uart_drain.drain_emu(&mut emu);
+        if stub_addr != 0 {
+            emu.bus.write32(stub_addr, 0x4770_2000); // MOVS R0,#0; BX LR
+            eprintln!("patched SRAM 0x{stub_addr:08X}: test_psram -> return 0");
+        } else {
+            eprintln!("PICOGUS_STUB_TEST_PSRAM=0: test_psram left live");
+        }
+
+        // Diagnostic stub: replace `GUS_sample_stereo` with a constant
+        // non-zero return. Used to isolate whether the WAV-silence bug
+        // is inside `GUS_sample_stereo` vs. between the function return
+        // and the TXF store in `audio_sample_handler`. When enabled, if
+        // the WAV contains the constant sample value, the ISR → TXF →
+        // I2S path is healthy and the bug is inside GUS_sample_stereo.
+        // If the WAV is still silent, the audio chain itself is broken.
+        //
+        // `PICOGUS_STUB_GUS_SAMPLE_STEREO=0x<addr>`: address of the
+        // function (`0x20000cac` in the rebuild v1 ELF). `=0` disables.
+        //
+        // Patch = `MOVS R0, #0xFF; BX LR` (returns 0xFF → 16-bit signed
+        // int +255 on left channel, 0 on right). Audible DC offset.
+        let stub_gss_addr: u32 = match std::env::var("PICOGUS_STUB_GUS_SAMPLE_STEREO") {
+            Ok(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                .unwrap_or_else(|_| panic!("PICOGUS_STUB_GUS_SAMPLE_STEREO must be hex, got {s:?}")),
+            Err(_) => 0,
+        };
+        if stub_gss_addr != 0 {
+            // 0x4770_20FF = BX LR (0x4770 at offset +2) | MOVS R0,#0xFF (0x20FF at +0)
+            // little-endian halfword order in a word write: low-half first.
+            emu.bus.write32(stub_gss_addr, 0x4770_20FF);
+            eprintln!(
+                "patched SRAM 0x{stub_gss_addr:08X}: GUS_sample_stereo -> return 0xFF"
+            );
+        }
+
+        // Diagnostic: stack read/write roundtrip. Writes #77 to [sp, #0],
+        // clobbers R0, reads it back, returns. If WAV LEFT = 38 (77>>1),
+        // stack at SP+0 works in core 1 IRQ context. If 0, stack broken.
+        //
+        // `PICOGUS_STUB_STACK_TEST=0x<func_addr>`
+        //  +0  SUB sp,#8     (0xB082)
+        //  +2  MOVS R0,#77   (0x204D)
+        //  +4  STR R0,[sp,#0](0x9000)
+        //  +6  MOVS R0,#0    (0x2000)   ; clobber
+        //  +8  LDR R0,[sp,#0](0x9800)
+        //  +10 ADD sp,#8     (0xB002)
+        //  +12 BX LR         (0x4770)
+        //  +14 NOP           (0xBF00)
+        if let Ok(s) = std::env::var("PICOGUS_STUB_STACK_TEST") {
+            let f = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap();
+            emu.bus.write32(f +  0, (0xB082u32) | (0x204Du32 << 16));
+            emu.bus.write32(f +  4, (0x9000u32) | (0x2000u32 << 16));
+            emu.bus.write32(f +  8, (0x9800u32) | (0xB002u32 << 16));
+            emu.bus.write32(f + 12, (0x4770u32) | (0xBF00u32 << 16));
+            eprintln!(
+                "patched SRAM 0x{f:08X}: GUS_sample_stereo -> stack roundtrip #77"
+            );
+        }
+
+        // Diagnostic: stack-based accumulator loop. Sum (VolLeft * 100)
+        // over N voices but keep the accumulator on the stack at [sp, #4].
+        // Expected: same as PICOGUS_STUB_SUM_MUL_VL (1100 for voice 1).
+        // If 0 while STACK_TEST passes → stack writes inside loop drop.
+        //
+        // `PICOGUS_STUB_STACK_ACCUM=0x<func_addr>:0x<guschan_addr>:<count>`
+        //  +0  SUB sp,#8          (0xB082)
+        //  +2  MOVS R0,#0         (0x2000)
+        //  +4  STR R0,[sp,#4]     (0x9001)  ; init accum on stack
+        //  +6  LDR R2,[PC,#24]    (0x4A06)  ; &guschan  (pc+28 aligned)
+        //  +8  MOVS R1,#n         (0x2100|n)
+        //  +10 MOVS R4,#100       (0x2464)
+        //  loop:
+        //  +12 LDMIA R2!,{R3}     (0xCA08)
+        //  +14 LDR R3,[R3,#52]    (0x6B5B)
+        //  +16 MULS R3,R4         (0x4363)
+        //  +18 LDR R0,[sp,#4]     (0x9801)
+        //  +20 ADDS R0,R0,R3      (0x18C0)
+        //  +22 STR R0,[sp,#4]     (0x9001)
+        //  +24 SUBS R1,#1         (0x3901)
+        //  +26 BNE loop           (0xD1F7) ; offset = 12 - (26+4) = -18; imm8=-9=0xF7
+        //  +28 LDR R0,[sp,#4]     (0x9801)
+        //  +30 ADD sp,#8          (0xB002)
+        //  +32 BX LR              (0x4770)
+        //  +34 NOP                (0xBF00)
+        //  +36 .word &guschan
+        if let Ok(s) = std::env::var("PICOGUS_STUB_STACK_ACCUM") {
+            let p: Vec<&str> = s.split(':').collect();
+            if p.len() == 3 {
+                let f = u32::from_str_radix(p[0].trim_start_matches("0x"), 16).unwrap();
+                let g = u32::from_str_radix(p[1].trim_start_matches("0x"), 16).unwrap();
+                let n: u16 = p[2].parse().unwrap();
+                assert!(n <= 255);
+                // Compute literal position. The LDR R2,[PC,#imm] at offset +6
+                // has pc = (f+6+4) & !3 = (f+10)&!3. We want the literal at
+                // f+36. So imm = ((f+36) - ((f+10)&!3)).
+                // If f is word-aligned, f+10 → pc-align → f+8; imm = 28.
+                // 0x4A07: Rd=2, imm8 = 28/4 = 7.
+                // Ah, I initially put 0x4A06 which is imm8=6 → pc+24 = f+32.
+                // Need imm8=7 for pc+28 = f+36.
+                let ldr_r2 = 0x4A07u32;
+                emu.bus.write32(f +  0, 0x2000_B082);                 // SUB sp,#8 ; MOVS R0,#0
+                emu.bus.write32(f +  4, (0x9001u32) | (ldr_r2 << 16)); // STR R0,[sp,#4] ; LDR R2,[PC,#28]
+                emu.bus.write32(f +  8, (0x2100u32 | n as u32) | (0x2464u32 << 16)); // MOVS R1,#n ; MOVS R4,#100
+                emu.bus.write32(f + 12, 0x6B5B_CA08);                 // LDMIA R2!,{R3} ; LDR R3,[R3,#52]
+                emu.bus.write32(f + 16, 0x9801_4363);                 // MULS R3,R4 ; LDR R0,[sp,#4]
+                emu.bus.write32(f + 20, 0x9001_18C0);                 // ADDS R0,R0,R3 ; STR R0,[sp,#4]
+                emu.bus.write32(f + 24, 0xD1F7_3901);                 // SUBS R1,#1 ; BNE loop
+                emu.bus.write32(f + 28, 0xB002_9801);                 // LDR R0,[sp,#4] ; ADD sp,#8
+                emu.bus.write32(f + 32, 0xBF00_4770);                 // BX LR ; NOP
+                emu.bus.write32(f + 36, g);                           // literal
+                eprintln!(
+                    "patched SRAM 0x{f:08X}: GUS_sample_stereo -> stack accum sum(VolLeft*100) over {n}"
+                );
+            }
+        }
+
+        // Diagnostic: sum (VolLeft * 100) over 27 voices — simulates the
+        // real mixer's `tmpsamp * VolLeft` accumulate, with a constant
+        // tmpsamp=100 replacing the PSRAM read. Expected: 100*21 = 2100
+        // (voice 1 only). WAV LEFT should be 1050 after 1-bit shift.
+        //
+        // `PICOGUS_STUB_SUM_MUL_VL=0x<func_addr>:0x<guschan_addr>:<count>`
+        if let Ok(s) = std::env::var("PICOGUS_STUB_SUM_MUL_VL") {
+            let p: Vec<&str> = s.split(':').collect();
+            if p.len() == 3 {
+                let f = u32::from_str_radix(p[0].trim_start_matches("0x"), 16).unwrap();
+                let g = u32::from_str_radix(p[1].trim_start_matches("0x"), 16).unwrap();
+                let n: u16 = p[2].parse().unwrap();
+                // Instructions:
+                //  +0  MOVS R0,#0      (0x2000)  // accum
+                //  +2  LDR  R2,[PC,#20] (0x4A05) // &guschan
+                //  +4  MOVS R1,#n      (0x2100|n)
+                //  +6  MOVS R4,#100    (0x2464)  // const sample
+                //  +8  LDMIA R2!,{R3}  (0xCA08)
+                //  +10 LDR  R3,[R3,#52](0x6B5B)  // VolLeft
+                //  +12 MULS R3,R4      (0x4363)
+                //  +14 ADDS R0,R0,R3   (0x18C0)
+                //  +16 SUBS R1,#1      (0x3901)
+                //  +18 BNE -14         (0xD1F9)
+                //  +20 BX LR           (0x4770)
+                //  +22 NOP             (0xBF00)
+                //  +24 .word &guschan
+                emu.bus.write32(f +  0, 0x4A05_2000);
+                emu.bus.write32(f +  4, 0x2464_2100u32 | n as u32);
+                emu.bus.write32(f +  8, 0x6B5B_CA08);
+                emu.bus.write32(f + 12, 0x18C0_4363);
+                emu.bus.write32(f + 16, 0xD1F9_3901);
+                emu.bus.write32(f + 20, 0xBF00_4770);
+                emu.bus.write32(f + 24, g);
+                eprintln!(
+                    "patched SRAM 0x{f:08X}: GUS_sample_stereo -> sum(VolLeft*100) over {n} voices"
+                );
+            }
+        }
+
+        // Diagnostic: sum VolLeft over all 27 voices via `guschan[c]->VolLeft`.
+        // Closest single-step approximation of the real mixing loop.
+        // Expected result ~ 21 (only voice 1 has non-zero VolLeft at end).
+        //
+        // `PICOGUS_STUB_SUM_VOLLEFTS=0x<func_addr>:0x<guschan_addr>:<count>`
+        //  MOVS R0,#0 ; LDR R2,=&guschan[0] ; MOVS R1,#count
+        //  loop: LDMIA R2!,{R3} ; LDR R3,[R3,#52] ; ADDS R0,R0,R3 ; SUBS R1,#1 ; BNE loop
+        //  BX LR
+        if let Ok(s) = std::env::var("PICOGUS_STUB_SUM_VOLLEFTS") {
+            let p: Vec<&str> = s.split(':').collect();
+            if p.len() == 3 {
+                let f = u32::from_str_radix(p[0].trim_start_matches("0x"), 16).unwrap();
+                let g = u32::from_str_radix(p[1].trim_start_matches("0x"), 16).unwrap();
+                let n: u16 = p[2].parse().unwrap();
+                assert!(n <= 255);
+                let movs_r0 = 0x2000u16;
+                let ldr_r2 = 0x4A04u16;                // LDR R2,[PC,#16]
+                let movs_r1 = 0x2100u16 | n;            // MOVS R1,#n
+                let ldmia = 0xCA08u16;                  // LDMIA R2!,{R3}
+                let ldr_vl = 0x6B5Bu16;                 // LDR R3,[R3,#52]
+                let adds = 0x18C0u16;                   // ADDS R0,R0,R3
+                let subs = 0x3901u16;                   // SUBS R1,#1
+                let bne = 0xD1FAu16;                    // BNE -12
+                let bx_lr = 0x4770u16;
+                let nop = 0xBF00u16;
+                emu.bus.write32(f + 0,  (movs_r0 as u32) | ((ldr_r2 as u32) << 16));
+                emu.bus.write32(f + 4,  (movs_r1 as u32) | ((ldmia as u32) << 16));
+                emu.bus.write32(f + 8,  (ldr_vl as u32) | ((adds as u32) << 16));
+                emu.bus.write32(f + 12, (subs as u32)   | ((bne as u32) << 16));
+                emu.bus.write32(f + 16, (bx_lr as u32)  | ((nop as u32) << 16));
+                emu.bus.write32(f + 20, g);
+                eprintln!(
+                    "patched SRAM 0x{f:08X}: GUS_sample_stereo -> sum(guschan[0..{n}]->VolLeft)"
+                );
+            }
+        }
+
+        // Diagnostic: 27-iteration loop sum (1+2+...+27 = 378). Tests
+        // whether a tight `ADDS/SUBS/BNE` loop runs correctly on core 1
+        // within an IRQ. If WAV shows 378 (or 189 after our 1-bit shift),
+        // loop mechanics work.
+        //
+        // `PICOGUS_STUB_LOOP_TEST=0x<func_addr>`
+        //   MOVS R0, #0
+        //   MOVS R1, #27
+        // loop:
+        //   ADDS R0, R0, R1
+        //   SUBS R1, #1
+        //   BNE loop
+        //   BX LR
+        if let Ok(s) = std::env::var("PICOGUS_STUB_LOOP_TEST") {
+            let f = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap();
+            // word 0: MOVS R0,#0 (0x2000) | MOVS R1,#27 (0x211B) → 0x211B_2000
+            emu.bus.write32(f, 0x211B_2000);
+            // word 1: ADDS R0,R0,R1 (0x1840) | SUBS R1,#1 (0x3901) → 0x3901_1840
+            emu.bus.write32(f + 4, 0x3901_1840);
+            // word 2: BNE -8 (0xD1FC) | BX LR (0x4770) → 0x4770_D1FC
+            emu.bus.write32(f + 8, 0x4770_D1FC);
+            eprintln!(
+                "patched SRAM 0x{f:08X}: GUS_sample_stereo -> sum(1..27) = 378"
+            );
+        }
+
+        // Diagnostic: chain-deref stub.
+        // `PICOGUS_STUB_CHAIN=<func>:<literal>:<off1>:<off2>` — stub at
+        // `func` loads `literal` (4-byte word), dereferences [+off1],
+        // dereferences [+off2], returns result. Lets us probe e.g.
+        // `guschan[1]->VolLeft` without touching firmware.
+        //
+        // Example: `0x20000cac:0x20017c3c:4:52` →
+        //   LDR R0, =0x20017c3c
+        //   LDR R0, [R0, #4]   ; guschan[1]
+        //   LDR R0, [R0, #52]  ; ->VolLeft
+        //   BX LR
+        if let Ok(s) = std::env::var("PICOGUS_STUB_CHAIN") {
+            let p: Vec<&str> = s.split(':').collect();
+            if p.len() == 4 {
+                let f = u32::from_str_radix(p[0].trim_start_matches("0x"), 16).unwrap();
+                let lit = u32::from_str_radix(p[1].trim_start_matches("0x"), 16).unwrap();
+                let off1: u32 = p[2].parse().unwrap();
+                let off2: u32 = p[3].parse().unwrap();
+                assert!(off1 < 128 && off1 % 4 == 0, "off1 must be 0..128, mult 4");
+                assert!(off2 < 128 && off2 % 4 == 0, "off2 must be 0..128, mult 4");
+                let imm5_1 = (off1 / 4) as u16;
+                let imm5_2 = (off2 / 4) as u16;
+                // LDR R0,[R0,#imm5<<2]: 01101 imm5 000 000 = 0x6800 | (imm5 << 6)
+                let ldr1 = 0x6800 | (imm5_1 << 6);
+                let ldr2 = 0x6800 | (imm5_2 << 6);
+                // LDR R0,[PC,#4] = 0x4801 (PC_aligned + 4)
+                let ldr_lit: u16 = 0x4801;
+                let bx_lr: u16 = 0x4770;
+                // word @ f: (ldr_lit | ldr1<<16)
+                emu.bus.write32(f, (ldr_lit as u32) | ((ldr1 as u32) << 16));
+                // word @ f+4: (ldr2 | bx_lr<<16)
+                emu.bus.write32(f + 4, (ldr2 as u32) | ((bx_lr as u32) << 16));
+                // word @ f+8: literal
+                emu.bus.write32(f + 8, lit);
+                eprintln!(
+                    "patched SRAM 0x{f:08X}: GUS_sample_stereo -> *(u32*)((*(u32*)0x{lit:08X} +{off1})+{off2})"
+                );
+            }
+        }
+
+        // Diagnostic: stub GUS_sample_stereo to return the product of
+        // two constants (21 * 127 = 2667). Verifies that MULS works
+        // on core 1 inside an IRQ handler context. If WAV shows 2667
+        // (or 1333 = 2667>>1 with our capture's 1-bit shift), MULS is
+        // fine. If shows 0, MULS is broken.
+        //
+        // `PICOGUS_STUB_MULT_TEST=0x<func_addr>` — patch address.
+        // Patch: MOVS R0,#21 ; MOVS R1,#127 ; MULS R0,R1 ; BX LR
+        if let Ok(s) = std::env::var("PICOGUS_STUB_MULT_TEST") {
+            let f = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap();
+            // word 0: MOVS R0,#21 (0x2015) | MOVS R1,#127 (0x217F)  → 0x217F_2015
+            emu.bus.write32(f, 0x217F_2015);
+            // word 1: MULS R0,R1 (0x4348)  | BX LR (0x4770)          → 0x4770_4348
+            emu.bus.write32(f + 4, 0x4770_4348);
+            eprintln!(
+                "patched SRAM 0x{f:08X}: GUS_sample_stereo -> return 21 * 127 = 2667"
+            );
+        }
+
+        // Diagnostic: replace GUS_sample_stereo with a stub that returns
+        // `myGUS.ActiveChannels` (as u32). If the WAV then shows sample
+        // value 27 (= ActiveChannels), core 1 is reading SRAM correctly
+        // from within GUS_sample_stereo. If it shows 0, core 1 can't
+        // see core-0 writes to myGUS.
+        //
+        // `PICOGUS_STUB_RET_ACTIVE=0x<func_addr>:0x<activech_addr>`
+        // Writes a 3-word stub at func_addr and a literal pointing to
+        // activech_addr.
+        //
+        // Patch layout at func_addr:
+        //   +00: LDR R0, [PC, #4]  (0x4801)      → load literal
+        //   +02: LDRB R0, [R0, #0] (0x7800)      → load byte *R0
+        //   +04: BX LR             (0x4770)
+        //   +06: NOP               (0xBF00)
+        //   +08: .word activech_addr
+        if let Ok(s) = std::env::var("PICOGUS_STUB_RET_ACTIVE") {
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() == 2 {
+                let f = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16).unwrap();
+                let a = u32::from_str_radix(parts[1].trim_start_matches("0x"), 16).unwrap();
+                emu.bus.write32(f, 0x7800_4801);     // LDR R0,[PC,#4] ; LDRB R0,[R0]
+                emu.bus.write32(f + 4, 0xBF00_4770); // BX LR ; NOP
+                emu.bus.write32(f + 8, a);           // literal
+                eprintln!(
+                    "patched SRAM 0x{f:08X}: GUS_sample_stereo -> return *(u8*)0x{a:08X} (zext)"
+                );
+            }
+        }
+
+        // Diagnostic: bypass the `(GUS_reset_reg & 0x03) != 0x03` early
+        // return inside GUS_sample_stereo by NOP'ing the branch at the
+        // failure arm (addr 0x20000cc6 in rebuild v1). Falls through to
+        // the normal mixing loop regardless of reset_reg value.
+        //
+        // `PICOGUS_PATCH_BYPASS_GATE=0x<addr>` — address of the
+        // `b.n 20001036` instruction (0x20000cc6 in rebuild v1). `=0`
+        // disables. Writes NOP (0xBF00) halfword.
+        if let Ok(s) = std::env::var("PICOGUS_PATCH_BYPASS_GATE") {
+            let addr = u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                .unwrap_or_else(|_| panic!("PICOGUS_PATCH_BYPASS_GATE must be hex, got {s:?}"));
+            if addr != 0 {
+                // 16-bit halfword write: keep the next halfword at +2 intact
+                // by reading it, then writing as a 32-bit word with low=0xBF00,
+                // high=original_next_halfword.
+                let existing = emu.bus.read32(addr & !3);
+                // If addr is halfword-aligned (even), we need to write the low
+                // halfword. Compute new word preserving the other half.
+                let new_word = if addr & 2 == 0 {
+                    (existing & 0xFFFF_0000) | 0x0000_BF00
+                } else {
+                    (existing & 0x0000_FFFF) | 0xBF00_0000
+                };
+                emu.bus.write32(addr & !3, new_word);
+                eprintln!(
+                    "patched SRAM 0x{addr:08X}: b.n 20001036 -> NOP (bypass GUS_reset_reg gate)"
+                );
+            }
+        }
         emu.step_quantum = old_q;
-        eprintln!("patched SRAM 0x20012FA4: test_psram -> return 0");
     }
 
     let duration_ns = args
@@ -1517,6 +2053,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let wall_start = Instant::now();
     let mut sink = CapturingSink::new(emu, DEFAULT_SYS_CLK_HZ);
+    // If PICOGUS_POKE_DURING_REPLAY=1, reuse the PICOGUS_POKE list
+    // to force the gate open after every trace-event advance. Keeps
+    // `GUS_reset_reg` at 0x07 as MIDI events program and trigger
+    // voices mid-replay — otherwise voices stay silent because
+    // `GUSReset` lands `0x01` (emulator bug; see journal Finding 10).
+    let replay_pokes: Vec<(u32, u8)> =
+        if std::env::var("PICOGUS_POKE_DURING_REPLAY").ok().as_deref() == Some("1") {
+            std::env::var("PICOGUS_POKE")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .filter_map(|item| {
+                    let (a, v) = item.trim().split_once('=')?;
+                    let a = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+                    let v = u8::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()?;
+                    Some((a, v))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    if !replay_pokes.is_empty() {
+        eprintln!(
+            "PICOGUS_POKE_DURING_REPLAY: applying {} poke(s) after every trace event",
+            replay_pokes.len()
+        );
+    }
     let (summary, coverage) = replay_with_coverage(
         &mut sink,
         &events,
@@ -1524,9 +2087,115 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(post_roll_ns),
         pre_roll_ns,
         trace_stretch,
+        &mut uart_drain,
+        &replay_pokes,
     );
+    // --- experimental poke + extra post-roll ---
+    // Format: PICOGUS_POKE=0xADDR=0xVAL[,...]  PICOGUS_EXTRA_POSTROLL=<secs>
+    // Applies the list of byte pokes to SRAM AFTER the trace-driven
+    // replay but BEFORE an optional extra sim-time window during which
+    // I2S capture continues. Used to confirm candidate addresses for
+    // GUS_reset_reg — poke the candidate to 0x07 and check whether the
+    // extra-postroll WAV contains audio.
+    let extra_postroll_secs: f64 = std::env::var("PICOGUS_EXTRA_POSTROLL")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let poke_spec = std::env::var("PICOGUS_POKE").unwrap_or_default();
+    if !poke_spec.is_empty() || extra_postroll_secs > 0.0 {
+        eprintln!("=== poke + extra post-roll phase ===");
+        // Parse poke list once.
+        let pokes: Vec<(u32, u8)> = poke_spec
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .filter_map(|item| {
+                let (a, v) = item.trim().split_once('=')?;
+                let a = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+                let v = u8::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()?;
+                Some((a, v))
+            })
+            .collect();
+        // Apply byte pokes via read-modify-write on the 32-bit word.
+        let apply_pokes = |emu: &mut mdrp2040::Emulator, pokes: &[(u32, u8)]| {
+            for &(a, v) in pokes {
+                let word_addr = a & !3;
+                let shift = (a & 3) * 8;
+                let w = emu.peek(word_addr);
+                let w_new = (w & !(0xff << shift)) | ((v as u32) << shift);
+                emu.poke(word_addr, w_new);
+            }
+        };
+        for &(a, v) in &pokes {
+            let word_addr = a & !3;
+            let shift = (a & 3) * 8;
+            let w = sink.inner_mut().peek(word_addr);
+            let w_new = (w & !(0xff << shift)) | ((v as u32) << shift);
+            sink.inner_mut().poke(word_addr, w_new);
+            eprintln!(
+                "  poke 0x{a:08x} byte = 0x{v:02x} (word 0x{word_addr:08x}: 0x{w:08x} -> 0x{w_new:08x}) [initial]"
+            );
+        }
+        if extra_postroll_secs > 0.0 {
+            // Re-poke every N steps to survive firmware overwrites.
+            let repoke = std::env::var("PICOGUS_REPOKE").ok().as_deref() == Some("1");
+            // Step granularity for extra-postroll (default 64).
+            let postroll_step: u32 = std::env::var("PICOGUS_POSTROLL_STEP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64);
+            // Optional: watch a specific SRAM byte — log transitions.
+            let watch_addr: Option<u32> = std::env::var("PICOGUS_WATCH")
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+            eprintln!(
+                "  extra post-roll: {extra_postroll_secs:.3} s  re-poke={repoke}  step={postroll_step}"
+            );
+            let hz = sink.sys_clk_hz() as u64;
+            let extra_cycles = (extra_postroll_secs * hz as f64) as u64;
+            let target = sink.cycles().saturating_add(extra_cycles);
+            let mut last_watch: Option<u8> = watch_addr.map(|a| {
+                let w = sink.inner_mut().peek(a & !3);
+                ((w >> ((a & 3) * 8)) & 0xff) as u8
+            });
+            let mut transitions = 0u64;
+            while sink.cycles() < target {
+                let before = sink.cycles();
+                sink.step(postroll_step);
+                if sink.cycles() == before {
+                    break;
+                }
+                if let Some(a) = watch_addr {
+                    let w = sink.inner_mut().peek(a & !3);
+                    let cur = ((w >> ((a & 3) * 8)) & 0xff) as u8;
+                    if last_watch != Some(cur) {
+                        if transitions < 40 {
+                            eprintln!(
+                                "  [watch] cycle {} byte 0x{:08x}: 0x{:02x} -> 0x{:02x}",
+                                sink.cycles(), a, last_watch.unwrap_or(0), cur
+                            );
+                        }
+                        transitions += 1;
+                        last_watch = Some(cur);
+                    }
+                }
+                if repoke {
+                    apply_pokes(sink.inner_mut(), &pokes);
+                }
+                uart_drain.drain_emu(sink.inner_mut());
+            }
+            if watch_addr.is_some() {
+                eprintln!("  [watch] total transitions: {transitions}");
+            }
+        }
+    }
+
     let wall_elapsed = wall_start.elapsed();
     let (mut emu, mut capture) = sink.into_parts();
+    // Flush any bytes firmware wrote in the final step, then print the
+    // running total so the grand total shows up even if the final line
+    // didn't end in '\n'.
+    uart_drain.drain_emu(&mut emu);
+    uart_drain.finish();
     // Snapshot the live `clk_sys` for reporting. PicoGUS firmware
     // reprograms PLL_SYS from 125→370 MHz early in boot; the I2S
     // capture observes all LRCLK edges in the post-reprogram era, so
@@ -1547,6 +2216,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!();
         println!("--- PSRAM diagnostics ---");
         println!("Non-zero bytes:    {} / {}", nz, psram.buffer.len());
+        println!("Bytes written:     {}", psram.bytes_written);
+        println!("Bytes read:        {}", psram.bytes_read);
         println!(
             "Pin assignment:    MISO=GPIO{}  CS=GPIO{}  SCK=GPIO{}  MOSI=GPIO{}",
             psram.pin_miso(),
@@ -1968,6 +2639,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         emu.bus.nvics[1].pending,
     );
 
+    // PWM slice 4 state — this slice drives GUS_sample rate on PicoGUS.
+    // `audio_sample_handler` runs on PWM_IRQ_WRAP (NVIC line 4) and pushes
+    // the next sample to the I2S PIO TXF. If slice 4 isn't enabled or
+    // wrapping, no audio samples are produced regardless of voice state.
+    // PWM register offsets (RP2040 datasheet §4.5.3):
+    //   EN=0xA0, INTR=0xA4, INTE=0xA8, INTF=0xAC, INTS=0xB0
+    let pwm_slice4 = 0x4005_0000u32 + 0x14 * 4;
+    let pwm_csr4 = emu.bus.read32(pwm_slice4 + 0x00);
+    let pwm_div4 = emu.bus.read32(pwm_slice4 + 0x04);
+    let pwm_ctr4 = emu.bus.read32(pwm_slice4 + 0x08);
+    let pwm_top4 = emu.bus.read32(pwm_slice4 + 0x10);
+    let pwm_en = emu.bus.read32(0x4005_00A0);
+    let pwm_intr = emu.bus.read32(0x4005_00A4);
+    let pwm_inte = emu.bus.read32(0x4005_00A8);
+    let pwm_ints = emu.bus.read32(0x4005_00B0);
+    println!(
+        "PWM slice4 CSR:   0x{:08x}  EN={} PH_CORRECT={}",
+        pwm_csr4,
+        pwm_csr4 & 1,
+        (pwm_csr4 >> 1) & 1
+    );
+    println!(
+        "PWM slice4 DIV:   0x{:08x}  CTR: 0x{:04x}  TOP: 0x{:04x}",
+        pwm_div4, pwm_ctr4, pwm_top4
+    );
+    println!(
+        "PWM EN:           0x{:02x}  INTR: 0x{:02x}  INTE: 0x{:02x}  INTS: 0x{:02x}",
+        pwm_en, pwm_intr, pwm_inte, pwm_ints
+    );
+
     // ------------------------------------------------------------------
     // PIO0 SM0 deep-dive — investigates why the IOW capture program
     // never pushes into RX FIFO despite SM0 being enabled.
@@ -2308,6 +3009,284 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "fired sub-events: {}  writes_fired: {}",
         coverage.fired_sub_events, summary.writes_fired,
     );
+    // PIO0 SM0 RX FIFO overflow drops — if non-zero, the harness
+    // was firing ISA events faster than the firmware could drain
+    // and the trace replay is incomplete. With PICOGUS_IDLE_CYCLES
+    // tuned high enough this should stay at 0.
+    println!(
+        "pio0 sm0 rx fifo drops: {}",
+        emu.bus.pio[0].sm[0].rx_fifo_drops()
+    );
+
+    // --- SRAM scan: byte candidates for GUS_reset_reg ----------------
+    // GUS_reset_reg is a static uint8_t in the PicoGUS firmware
+    // (gus-x.cpp). After the init sequence in the Monkey Island trace
+    // it should be 0x07. We don't have symbols, so scan SRAM for bytes
+    // equal to 0x07 and 0x01 to give ourselves candidate addresses.
+    // This is diagnostic only — gated on PICOGUS_SRAM_SCAN=1.
+    // Probe specific addresses (comma-separated hex list in PICOGUS_PROBE).
+    if let Ok(list) = std::env::var("PICOGUS_PROBE") {
+        eprintln!("=== probe list ===");
+        for tok in list.split(',') {
+            let tok = tok.trim().trim_start_matches("0x");
+            if let Ok(a) = u32::from_str_radix(tok, 16) {
+                let w = emu.peek(a & !3);
+                let b = ((w >> ((a & 3) * 8)) & 0xFF) as u8;
+                eprintln!("probe  0x{:08x} = 0x{:02x} (word 0x{:08x}: 0x{:08x})", a, b, a & !3, w);
+            }
+        }
+    }
+    // Structured GUS state dump using symbol addresses from
+    // wrk_scratch/picogus-rebuild/pg-gus.elf (rebuild v1, 2026-04-22).
+    // Gated on PICOGUS_DUMP_GUS=1. Addresses are build-specific —
+    // bump them after every firmware rebuild via
+    // `arm-none-eabi-nm --defined-only pg-gus.elf | grep -E 'GUS_reset_reg|myGUS|guschan'`
+    // and the DWARF member offsets if the class layout changes.
+    if std::env::var("PICOGUS_DUMP_GUS").ok().as_deref() == Some("1") {
+        // Byte read helper: peek word and slice the byte at `addr`.
+        let peek_u8 = |addr: u32| -> u8 {
+            let w = emu.peek(addr & !3);
+            ((w >> ((addr & 3) * 8)) & 0xff) as u8
+        };
+        let peek_u16 = |addr: u32| -> u16 {
+            let lo = peek_u8(addr) as u16;
+            let hi = peek_u8(addr + 1) as u16;
+            lo | (hi << 8)
+        };
+        let peek_u32 = |addr: u32| -> u32 {
+            // For aligned u32 reads this is a single word peek; the
+            // guschan[] pointers and the GUSChannels u32 fields are
+            // aligned on 4 in the ELF layout, so this is safe.
+            emu.peek(addr)
+        };
+
+        const GUS_RESET_REG: u32 = 0x2001_d976;
+        const MYGUS_BASE: u32 = 0x2001_7688;
+        // GFGus struct offsets (from DWARF, pg-gus.elf rebuild v1):
+        const MYGUS_GCURCHANNEL_OFF: u32 = 12; // u16
+        const MYGUS_MIXCONTROL_OFF: u32 = 35;  // u8
+        const MYGUS_ACTIVE_CHANNELS_OFF: u32 = 36; // u8
+        const MYGUS_IRQSTATUS_OFF: u32 = 100;  // u8
+        const GUSCHAN_BASE: u32 = 0x2001_7c3c;
+        // volctrl_t struct at 0x20016ba8; `.gus` member at offset 32.
+        const VOLUME_BASE: u32 = 0x2001_6ba8;
+        const VOLUME_GUS_OFF: u32 = 32;
+
+        eprintln!();
+        eprintln!("=== GUS state dump (PICOGUS_DUMP_GUS=1) ===");
+        let reset = peek_u8(GUS_RESET_REG);
+        let active = peek_u8(MYGUS_BASE + MYGUS_ACTIVE_CHANNELS_OFF);
+        let cur_chan = peek_u16(MYGUS_BASE + MYGUS_GCURCHANNEL_OFF);
+        let mix_ctrl = peek_u8(MYGUS_BASE + MYGUS_MIXCONTROL_OFF);
+        let irq_status = peek_u8(MYGUS_BASE + MYGUS_IRQSTATUS_OFF);
+        let volume_gus = peek_u32(VOLUME_BASE + VOLUME_GUS_OFF);
+        eprintln!(
+            "GUS_reset_reg @ 0x{:08x} = 0x{:02x}  (needs 0x03 set for non-silent output; 0x07 = reset+DAC+IRQ)",
+            GUS_RESET_REG, reset,
+        );
+        eprintln!(
+            "myGUS.ActiveChannels @ 0x{:08x} = {} (0x{:02x})",
+            MYGUS_BASE + MYGUS_ACTIVE_CHANNELS_OFF,
+            active,
+            active,
+        );
+        eprintln!(
+            "myGUS.gCurChannel @ 0x{:08x} = {} (0x{:04x})   (last voice-select write)",
+            MYGUS_BASE + MYGUS_GCURCHANNEL_OFF,
+            cur_chan,
+            cur_chan,
+        );
+        eprintln!(
+            "myGUS.mixControl @ 0x{:08x} = 0x{:02x}",
+            MYGUS_BASE + MYGUS_MIXCONTROL_OFF,
+            mix_ctrl,
+        );
+        eprintln!(
+            "myGUS.IRQStatus @ 0x{:08x} = 0x{:02x}",
+            MYGUS_BASE + MYGUS_IRQSTATUS_OFF,
+            irq_status,
+        );
+        eprintln!(
+            "volume.gus @ 0x{:08x} = 0x{:08x} ({})    (0 → mixer output forced silent)",
+            VOLUME_BASE + VOLUME_GUS_OFF,
+            volume_gus,
+            volume_gus as i32,
+        );
+        let gate_open = (reset & 0x03) == 0x03;
+        eprintln!(
+            "  → audio gate (reset_reg & 0x03 == 0x03): {}",
+            if gate_open { "OPEN" } else { "CLOSED — GUS_sample_stereo() returns 0" },
+        );
+
+        // Voice 0..3 — enough to catch the Monkey Island config
+        // (trace only activates a handful of voices in the first
+        // seconds past t=3.486 s). Expand to 32 by adjusting the range.
+        let voice_count = std::env::var("PICOGUS_DUMP_GUS_VOICES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4);
+        for c in 0..voice_count.min(32) {
+            let slot = GUSCHAN_BASE + c * 4;
+            let ptr = peek_u32(slot);
+            eprintln!();
+            eprintln!("voice {}: guschan[{}] @ 0x{:08x} = 0x{:08x}", c, c, slot, ptr);
+            if ptr < 0x2000_0000 || ptr >= 0x2004_2000 {
+                eprintln!("  (pointer not in SRAM range — voice not constructed)");
+                continue;
+            }
+            // GUSChannels struct members (byte_size = 100)
+            let wave_start  = peek_u32(ptr + 0);
+            let wave_end    = peek_u32(ptr + 4);
+            let wave_addr   = peek_u32(ptr + 8);
+            let wave_add    = peek_u32(ptr + 12);
+            let wave_ctrl   = peek_u16(ptr + 16);
+            let wave_freq   = peek_u16(ptr + 18);
+            let ramp_start  = peek_u32(ptr + 20);
+            let ramp_end    = peek_u32(ptr + 24);
+            let ramp_vol    = peek_u32(ptr + 28);
+            let ramp_add    = peek_u32(ptr + 32);
+            let ramp_rate   = peek_u8(ptr + 36);
+            let ramp_ctrl   = peek_u8(ptr + 37);
+            let pan_pot     = peek_u8(ptr + 38);
+            let channum     = peek_u8(ptr + 39);
+            let pan_left    = peek_u32(ptr + 44);
+            let pan_right   = peek_u32(ptr + 48);
+            let vol_left    = peek_u32(ptr + 52);
+            let vol_right   = peek_u32(ptr + 56);
+            // useAddr = WaveAddr >> WAVE_FRACT(10); same for start/end
+            let use_addr  = wave_addr  >> 10;
+            let use_start = wave_start >> 10;
+            let use_end   = wave_end   >> 10;
+            eprintln!(
+                "  WaveCtrl=0x{:02x}  RampCtrl=0x{:02x}  channum={}  PanPot=0x{:02x}",
+                wave_ctrl as u8, ramp_ctrl, channum, pan_pot,
+            );
+            eprintln!(
+                "  WaveCtrl bits: 0x{:04x} (bit0=stopped? bit1=stop_on_end bit6=loop bit7=data_sample16)",
+                wave_ctrl,
+            );
+            eprintln!(
+                "  WaveStart=0x{:08x} (useStart=0x{:05x})  WaveEnd=0x{:08x} (useEnd=0x{:05x})",
+                wave_start, use_start, wave_end, use_end,
+            );
+            eprintln!(
+                "  WaveAddr =0x{:08x} (useAddr =0x{:05x})  WaveAdd=0x{:08x}  WaveFreq=0x{:04x}",
+                wave_addr, use_addr, wave_add, wave_freq,
+            );
+            eprintln!(
+                "  RampStart=0x{:08x}  RampEnd=0x{:08x}  RampVol=0x{:08x} (idx>>10={})",
+                ramp_start, ramp_end, ramp_vol, ramp_vol >> 10,
+            );
+            eprintln!(
+                "  RampAdd=0x{:08x}  RampRate=0x{:02x}",
+                ramp_add, ramp_rate,
+            );
+            eprintln!(
+                "  PanLeft=0x{:08x}  PanRight=0x{:08x}  VolLeft=0x{:08x}  VolRight=0x{:08x}",
+                pan_left, pan_right, vol_left, vol_right,
+            );
+            // Readable "why silent?" classifier.
+            // Per gus-x.cpp:613 GUSChannels::generateSample, the voice
+            // ALWAYS contributes `tmpsamp * VolLeft/VolRight` to the
+            // output accumulator — there is no early-return on stopped.
+            // So if both VolLeft and VolRight are zero, the voice can
+            // not contribute a non-zero sample regardless of PSRAM data.
+            let wave_stopped = (wave_ctrl & 0x01) != 0;
+            let ramp_halted = (ramp_ctrl & 0x01) != 0;
+            let in_range = use_addr >= use_start && use_addr <= use_end;
+            let vol_zero = vol_left == 0 && vol_right == 0;
+            eprintln!(
+                "  state: wave_stopped(WaveCtrl&1)={}  ramp_halted(RampCtrl&1)={}  addr_in_range={}",
+                wave_stopped, ramp_halted, in_range,
+            );
+            if vol_zero {
+                eprintln!(
+                    "  SILENT: VolLeft=VolRight=0  (volume.gus might be 0, or RampVol-PanX clamped to 0, or vol16bit[idx]=0)",
+                );
+            }
+            // sample_cache at offset 60 in GUSChannels:
+            //   data[32] at +0, addr (uint32) at +32, addr_next (uint32) at +36.
+            // If the voice is actively reading PSRAM, data[] should hold the
+            // last 32 bytes of sample data pulled for that voice. If it's all
+            // zeros despite PSRAM preseed, the PSRAM read path itself is
+            // returning zeros and that's the silence cause.
+            let sc_base = ptr + 60;
+            let sc_addr = peek_u32(sc_base + 32);
+            let sc_addr_next = peek_u32(sc_base + 36);
+            let mut data = [0u8; 32];
+            for i in 0..32 {
+                data[i] = peek_u8(sc_base + i as u32);
+            }
+            let nz = data.iter().filter(|&&b| b != 0).count();
+            eprintln!(
+                "  sample_cache.addr=0x{:08x} addr_next=0x{:08x}  data[0..16]: {}",
+                sc_addr as i32, sc_addr_next as i32,
+                data[..16]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            eprintln!(
+                "  sample_cache.data non-zero: {}/32",
+                nz,
+            );
+        }
+        eprintln!();
+    }
+
+    if std::env::var("PICOGUS_SRAM_SCAN").ok().as_deref() == Some("1") {
+        eprintln!();
+        eprintln!("=== SRAM scan (PICOGUS_SRAM_SCAN=1) ===");
+        let mut count_by_value: [u32; 256] = [0; 256];
+        let mut sevens: Vec<u32> = Vec::new();
+        let mut ones: Vec<u32> = Vec::new();
+        let sram_base = 0x2000_0000u32;
+        let sram_end = 0x2004_2000u32;
+        let mut addr = sram_base;
+        while addr < sram_end {
+            let w = emu.peek(addr);
+            for i in 0..4u32 {
+                let b = ((w >> (i * 8)) & 0xff) as u8;
+                count_by_value[b as usize] += 1;
+                if b == 0x07 {
+                    sevens.push(addr + i);
+                }
+                if b == 0x01 {
+                    ones.push(addr + i);
+                }
+            }
+            addr += 4;
+        }
+        eprintln!(
+            "SRAM scan: 0x00 count={}  0x01 count={}  0x07 count={}  total bytes={}",
+            count_by_value[0x00], count_by_value[0x01], count_by_value[0x07],
+            (sram_end - sram_base) as u64
+        );
+        // Dump candidate address lists to files for easy diffing.
+        let dump_path = std::env::var("PICOGUS_SRAM_DUMP")
+            .unwrap_or_else(|_| "/tmp/pgd_sram_scan.txt".to_string());
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::File::create(&dump_path) {
+                writeln!(f, "# value=0x07 count={}", sevens.len()).ok();
+                for a in &sevens {
+                    writeln!(f, "07  0x{:08x}", a).ok();
+                }
+                writeln!(f, "# value=0x01 count={}", ones.len()).ok();
+                for a in &ones {
+                    writeln!(f, "01  0x{:08x}", a).ok();
+                }
+            }
+            eprintln!("SRAM scan dumped to {dump_path}");
+        }
+        // First 32 of each for stderr readability.
+        let shown = sevens.len().min(32);
+        eprintln!("first {shown} addrs with byte=0x07:");
+        for a in sevens.iter().take(shown) {
+            eprintln!("  0x{:08x}", a);
+        }
+    }
 
     println!();
     println!("=== picogus_diff_rp2040 summary ===");

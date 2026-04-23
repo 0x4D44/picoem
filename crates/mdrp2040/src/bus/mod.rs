@@ -612,6 +612,12 @@ impl Bus {
         self.last_access_cycles
     }
 
+    /// Harness-only diagnostic: drain every byte firmware has written to
+    /// `UART0.DR` since the previous call. See `UartRegs::drain_tx_log`.
+    pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
+        self.uart0.drain_tx_log()
+    }
+
     /// Base read latency for an address region (cycles).
     #[inline]
     fn read_latency(region: u32) -> u32 {

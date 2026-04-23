@@ -188,6 +188,10 @@ pub struct UartRegs {
     /// NVIC IRQ number this UART raises into `bus.irq_pending`
     /// (UART0=20, UART1=21).
     nvic_irq: u32,
+    /// Diagnostic tap — every byte firmware writes to `UARTDR` (after the
+    /// enable gate) is appended here so harnesses can mirror the wire to
+    /// stderr. Drained by `drain_tx_log`. Invisible to guest software.
+    tx_wire_log: VecDeque<u8>,
 }
 
 impl UartRegs {
@@ -210,7 +214,15 @@ impl UartRegs {
             rx_fifo: VecDeque::with_capacity(UART_FIFO_DEPTH),
             tx_cycle_accum: 0,
             nvic_irq,
+            tx_wire_log: VecDeque::new(),
         }
+    }
+
+    /// Drain every byte firmware has written to `UARTDR` since the last
+    /// call. Harness-only diagnostic; returns empty if nothing was
+    /// written. Does not affect the real TX FIFO / baud-rate model.
+    pub fn drain_tx_log(&mut self) -> Vec<u8> {
+        self.tx_wire_log.drain(..).collect()
     }
 
     /// Reset every field to post-init defaults.
@@ -511,6 +523,9 @@ impl UartRegs {
         if !self.is_tx_enabled() {
             return;
         }
+        // Tap the byte before the overflow check so the diagnostic log
+        // captures firmware *intent* even under simulated FIFO drops.
+        self.tx_wire_log.push_back(byte);
         let cap = self.tx_capacity();
         if self.tx_fifo.len() >= cap {
             // Overflow drops the byte. The PL011 also latches an
