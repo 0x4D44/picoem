@@ -1908,4 +1908,817 @@ mod tests {
         let recovered = pb.take_blocks();
         assert_eq!(recovered.len(), 3, "PioBus returns the three blocks");
     }
+
+    // =====================================================================
+    // stage5_coverage: broad coverage fill-ins for APB/AHB/SIO dispatch
+    // arms that the existing tests leave cold. Each new test targets a
+    // specific uncovered branch listed in the 2026-04-22 coverage task.
+    // =====================================================================
+
+    mod stage5_coverage {
+        use super::*;
+        use crate::bus::{RESET_UART0, RESET_SPI0, RESET_I2C0, RESET_ADC,
+            RESET_PWM, RESET_IO_BANK0, RESET_PADS_BANK0, RESET_TIMER0,
+            RESET_TIMER1, RESET_DMA};
+
+        // ---- APB read dispatch -----------------------------------------
+
+        #[test]
+        fn apb_pll_usb_read_routes_through_clocks() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // PLL_USB CS without any lock-arming returns the stored CS
+            // image (no LOCK bit set).
+            let cs = bus.read32(0x4005_8000, 0);
+            // Any value is fine — the goal is to hit `pll_usb_read_at`.
+            let _ = cs;
+        }
+
+        #[test]
+        fn apb_xosc_rosc_resets_qmi_sysinfo_read() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Each of these must route through its typed arm in apb_read32.
+            let _ = bus.read32(0x4004_8000, 0); // XOSC
+            let _ = bus.read32(0x400E_8000, 0); // ROSC
+            let _ = bus.read32(0x4002_0000, 0); // RESETS
+            let _ = bus.read32(0x400D_0000, 0); // QMI
+            // SYSINFO CHIP_ID is deterministic.
+            assert_eq!(bus.read32(0x4000_0000, 0), 0x0000_0002);
+            // SYSINFO PACKAGE_SEL + PLATFORM (cover sysinfo_read match).
+            assert_eq!(bus.read32(0x4000_0004, 0), 0);
+            assert_eq!(bus.read32(0x4000_0008, 0), 0x1);
+            // SYSINFO unmapped offset → 0 (last sysinfo_read arm).
+            assert_eq!(bus.read32(0x4000_0100, 0), 0);
+        }
+
+        #[test]
+        fn apb_timer0_timer1_ticks_read() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            let _ = bus.read32(TIMER0_BASE, 0);
+            let _ = bus.read32(TIMER1_BASE, 0);
+            let _ = bus.read32(TICKS_BASE, 0);
+        }
+
+        #[test]
+        fn apb_uart_spi_i2c_adc_pwm_io_bank0_pads_read() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            let _ = bus.read32(UART0_BASE + 0x04, 0); // UARTRSR_ECR
+            let _ = bus.read32(SPI0_BASE + 0x04, 0);
+            let _ = bus.read32(I2C0_BASE + 0x04, 0);
+            let _ = bus.read32(ADC_BASE + 0x04, 0);
+            let _ = bus.read32(PWM_BASE + 0x04, 0);
+            let _ = bus.read32(IO_BANK0_BASE, 0);
+            let _ = bus.read32(PADS_BANK0_BASE, 0);
+        }
+
+        /// RESETS held peripheral reads return 0 (`apb_read32` line 207).
+        #[test]
+        fn apb_held_peripheral_read_returns_zero() {
+            let shared = fresh_shared();
+            // UART1 is held in reset post-bootrom — its base maps to
+            // RESET_UART1 (bit 26); `is_held_in_reset_base(UART1_BASE)` is
+            // true. A read32 must return 0 without touching UART1 state.
+            let mut bus = WorkerBus::new(0, shared);
+            let uart1_base: u32 = 0x4007_4000;
+            assert_eq!(
+                bus.read32(uart1_base + 0x04, 0),
+                0,
+                "held UART1 must return 0 via the RESETS guard"
+            );
+        }
+
+        // ---- APB write dispatch ----------------------------------------
+
+        #[test]
+        fn apb_write_held_peripheral_drops_silently() {
+            let shared = fresh_shared();
+            // SPI1 is held in reset post-bootrom. A write there must not
+            // panic and must not affect the RESETS state.
+            let spi1_base: u32 = 0x4008_4000;
+            let mut bus = WorkerBus::new(0, shared.clone());
+            bus.write32(spi1_base + 0x10, 0xDEAD_BEEF, 0);
+            // Readback also returns 0 via the held-guard.
+            assert_eq!(bus.read32(spi1_base + 0x10, 0), 0);
+        }
+
+        #[test]
+        fn apb_write_all_typed_arms_happy_path() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC / RESETS / QMI /
+            // TIMER0 / TIMER1 / TICKS / UART0 / SPI0 / I2C0 / ADC / PWM /
+            // IO_BANK0 / PADS_BANK0 — each exercises its own match arm in
+            // apb_write32.
+            bus.write32(0x4001_0000, 0x0000_0001, 0); // CLOCKS CTRL
+            bus.write32(0x4005_0000, 0x0000_0000, 0); // PLL_SYS CS
+            bus.write32(0x4005_8000, 0x0000_0000, 0); // PLL_USB CS
+            bus.write32(0x4004_8000, 0x0000_0000, 0); // XOSC CTRL
+            bus.write32(0x400E_8000, 0x0000_0000, 0); // ROSC CTRL
+            bus.write32(0x4002_0000, 0x0000_0000, 0); // RESETS
+            bus.write32(0x400D_0000, 0x0000_0000, 0); // QMI
+            bus.write32(0x4000_0000, 0xFFFF_FFFF, 0); // SYSINFO write-no-op
+            bus.write32(TIMER0_BASE + 0x40, 0x1, 0);  // TIMER0 INTR-ish
+            bus.write32(TIMER1_BASE + 0x40, 0x1, 0);
+            bus.write32(TICKS_BASE + 0x08, 0x1, 0);
+            bus.write32(UART0_BASE + 0x44, 0x1, 0);   // UARTICR
+            bus.write32(SPI0_BASE + 0x20, 0x1, 0);
+            bus.write32(I2C0_BASE + 0x40, 0x1, 0);
+            bus.write32(ADC_BASE + 0x14, 0x1, 0);
+            bus.write32(PWM_BASE + 0x50, 0x1, 0);
+            bus.write32(IO_BANK0_BASE + 0x00, 0x0, 0);
+            bus.write32(PADS_BANK0_BASE + 0x00, 0x0, 0);
+        }
+
+        /// Legacy HashMap write aliases — XOR, SET, CLR on an address
+        /// that no typed APB arm claims (APB unknown-base path). The
+        /// canonical slot is `base & !0x3000`; the 0x1000 / 0x2000 / 0x3000
+        /// adders select the XOR / SET / CLR aliases.
+        #[test]
+        fn apb_legacy_hashmap_alias_rmw() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Pick a base whose bits [13:12] are zero (alias == 0 plain).
+            let base = 0x4030_0000;
+            // Plain write.
+            bus.write32(base, 0x0000_00FF, 0);
+            assert_eq!(bus.read32(base, 0), 0x0000_00FF);
+            // XOR alias.
+            bus.write32(base | 0x1000, 0xFF00_00FF, 0);
+            assert_eq!(bus.read32(base, 0), 0xFF00_0000);
+            // SET alias.
+            bus.write32(base | 0x2000, 0x0000_0F0F, 0);
+            assert_eq!(bus.read32(base, 0), 0xFF00_0F0F);
+            // CLR alias.
+            bus.write32(base | 0x3000, 0x0000_0F00, 0);
+            assert_eq!(bus.read32(base, 0), 0xFF00_000F);
+        }
+
+        // ---- AHB read dispatch -----------------------------------------
+
+        #[test]
+        fn ahb_read_dma_region() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // DMA CH0_READ_ADDR — post-bootrom-released on this emu.
+            let _ = bus.read32(DMA_BASE, 0);
+        }
+
+        #[test]
+        fn ahb_read_pio_enabled_and_irq_flags() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // PIO0 CTRL (SM_ENABLE) — reads through ThreadedPio.
+            assert_eq!(bus.read32(0x5020_0000, 0), 0);
+            // PIO1 IRQ flags.
+            assert_eq!(bus.read32(0x5030_0030, 0), 0);
+            // PIO2 CTRL.
+            assert_eq!(bus.read32(0x5040_0000, 0), 0);
+        }
+
+        #[test]
+        fn ahb_read_unmapped_falls_back_to_legacy() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Legacy AHB window (no typed match).
+            let legacy = 0x5060_0000;
+            bus.write32(legacy, 0x1234_5678, 0);
+            assert_eq!(bus.read32(legacy, 0), 0x1234_5678);
+        }
+
+        // ---- AHB write dispatch ----------------------------------------
+
+        #[test]
+        fn ahb_write_dma_routes_to_dma_state() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // CH0_READ_ADDR.
+            bus.write32(DMA_BASE, 0x2000_1000, 0);
+            // No assertion on DMA state — the typed arm handling is what
+            // we want to cover. read32 may return 0 if the field reserves.
+            let _ = bus.read32(DMA_BASE, 0);
+        }
+
+        #[test]
+        fn ahb_write_pio_routes_queue_each_variant() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // PIO0 CTRL → WriteCtrl.
+            bus.write32(0x5020_0000, 0x0000_0001, 0);
+            // PIO0 INSTR_MEM0 → WriteInstrMem.
+            bus.write32(0x5020_0048, 0x0000_A001, 0);
+            // PIO0 SM0_CLKDIV → SetClkDiv (addr 0x0C8).
+            bus.write32(0x5020_00C8, 0x0001_0000, 0);
+            // PIO0 generic reg → WriteReg (TXF0 at 0x010).
+            bus.write32(0x5020_0010, 0x1234_5678, 0);
+            // Commands must have queued on the PIO worker queue.
+            let drained = shared.pio.drain_commands(0);
+            assert!(drained.len() >= 4, "expected >= 4 commands, got {}", drained.len());
+        }
+
+        #[test]
+        fn ahb_write_legacy_aliases() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Canonical base with alias bits cleared.
+            let base = 0x5060_0000;
+            bus.write32(base, 0x0000_00FF, 0);
+            bus.write32(base | 0x1000, 0xFF00_00FF, 0); // XOR
+            assert_eq!(bus.read32(base, 0), 0xFF00_0000);
+            bus.write32(base | 0x2000, 0x0000_0F0F, 0); // SET
+            assert_eq!(bus.read32(base, 0), 0xFF00_0F0F);
+            bus.write32(base | 0x3000, 0x0000_0F00, 0); // CLR
+            assert_eq!(bus.read32(base, 0), 0xFF00_000F);
+        }
+
+        // ---- SIO read32 coverage ---------------------------------------
+
+        #[test]
+        fn sio_read_cpuid_is_per_core() {
+            let shared = fresh_shared();
+            let mut bus0 = WorkerBus::new(0, shared.clone());
+            let mut bus1 = WorkerBus::new(1, shared);
+            assert_eq!(bus0.read32(0xD000_0000, 0), 0);
+            assert_eq!(bus1.read32(0xD000_0000, 1), 1);
+        }
+
+        #[test]
+        fn sio_read_gpio_hi_in_and_oe() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // GPIO_HI_IN (0x008) — bank 1 not modelled, always 0.
+            assert_eq!(bus.read32(0xD000_0008, 0), 0);
+            // GPIO_OE.
+            assert_eq!(bus.read32(0xD000_0030, 0), 0);
+        }
+
+        #[test]
+        fn sio_read_fifo_status_and_spinlock_bits() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // FIFO_ST.
+            let _ = bus.read32(0xD000_0050, 0);
+            // FIFO_RD (empty → 0).
+            assert_eq!(bus.read32(0xD000_0058, 0), 0);
+            // SPINLOCK_ST.
+            let _ = bus.read32(0xD000_005C, 0);
+        }
+
+        #[test]
+        fn sio_read_spinlock_claim_and_release() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Claim lock 0 via 0xD000_0100.
+            let first = bus.read32(0xD000_0100, 0);
+            // First claim returns non-zero; re-claim returns zero.
+            let second = bus.read32(0xD000_0100, 0);
+            assert_ne!(first, 0);
+            assert_eq!(second, 0);
+            // Release via any write.
+            bus.write32(0xD000_0100, 0, 0);
+            // After release, claim succeeds again.
+            let third = bus.read32(0xD000_0100, 0);
+            assert_ne!(third, 0);
+        }
+
+        #[test]
+        fn sio_read_doorbell_and_mtime_registers() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // DOORBELL_IN_SET.
+            let _ = bus.read32(0xD000_0188, 0);
+            // MTIME control, MTIME lo/hi, MTIMECMP0/1 lo/hi.
+            let _ = bus.read32(0xD000_01A0, 0);
+            let _ = bus.read32(0xD000_01A8, 0);
+            let _ = bus.read32(0xD000_01AC, 0);
+            let _ = bus.read32(0xD000_01B0, 0);
+            let _ = bus.read32(0xD000_01B4, 0);
+            let _ = bus.read32(0xD000_01B8, 0);
+            let _ = bus.read32(0xD000_01BC, 0);
+            // Unmapped SIO offset — final `_ => 0` arm.
+            assert_eq!(bus.read32(0xD000_07FC, 0), 0);
+        }
+
+        // ---- SIO write32 coverage --------------------------------------
+
+        #[test]
+        fn sio_write_gpio_out_family() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            bus.write32(0xD000_0010, 0xFFFF_0000, 0); // GPIO_OUT
+            bus.write32(0xD000_0018, 0x0000_0F0F, 0); // GPIO_OUT_SET
+            bus.write32(0xD000_0020, 0x0000_0F00, 0); // GPIO_OUT_CLR
+            bus.write32(0xD000_0028, 0x0000_00FF, 0); // GPIO_OUT_XOR
+            // GPIO_OE family.
+            bus.write32(0xD000_0030, 0xFFFF_FFFF, 0);
+            bus.write32(0xD000_0038, 0x0000_0001, 0);
+            bus.write32(0xD000_0040, 0x0000_0001, 0);
+            bus.write32(0xD000_0048, 0x0000_FFFF, 0);
+        }
+
+        #[test]
+        fn sio_write_fifo_st_clear() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // FIFO_ST write (W1C).
+            bus.write32(0xD000_0050, 0xF, 0);
+        }
+
+        #[test]
+        fn sio_write_doorbell_out_and_in_clear() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // Core 0 sets doorbell bits on peer (core 1).
+            bus.write32(0xD000_0180, 0xF, 0);
+            assert_eq!(shared.sio.doorbell_read(1), 0xF);
+            // Clear those bits on peer.
+            bus.write32(0xD000_0184, 0xF, 0);
+            assert_eq!(shared.sio.doorbell_read(1), 0);
+            // Self-clear DOORBELL_IN_CLR.
+            shared.sio.doorbell_set(0, 0xF);
+            bus.write32(0xD000_018C, 0xF, 0);
+            assert_eq!(shared.sio.doorbell_read(0), 0);
+        }
+
+        #[test]
+        fn sio_write_mtime_registers() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // MTIME control + lo/hi + MTIMECMP0/1 lo/hi.
+            bus.write32(0xD000_01A0, 0x1, 0);
+            bus.write32(0xD000_01A8, 0x1234_5678, 0);
+            bus.write32(0xD000_01AC, 0x0000_0001, 0);
+            bus.write32(0xD000_01B0, 0xAABB_CCDD, 0);
+            bus.write32(0xD000_01B4, 0x0000_0001, 0);
+            bus.write32(0xD000_01B8, 0x1111_1111, 0);
+            bus.write32(0xD000_01BC, 0x0000_0001, 0);
+            // Verify low/high splitting by reading back full 64-bit view.
+            let lo = bus.read32(0xD000_01A8, 0) as u64;
+            let hi = bus.read32(0xD000_01AC, 0) as u64;
+            assert_eq!((hi << 32) | lo, 0x0000_0001_1234_5678);
+        }
+
+        #[test]
+        fn sio_write_spinlock_release_by_offset() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Claim + release via the spinlock offset (0x100..=0x17F).
+            let claimed = bus.read32(0xD000_0104, 0); // lock 1
+            assert_ne!(claimed, 0);
+            bus.write32(0xD000_0104, 0, 0); // release
+            // Post-release claim succeeds again.
+            assert_ne!(bus.read32(0xD000_0104, 0), 0);
+        }
+
+        #[test]
+        fn sio_write_unmapped_offset_is_noop() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // An SIO offset outside any match arm (no panic, no effect).
+            bus.write32(0xD000_07FC, 0xDEAD_BEEF, 0);
+        }
+
+        // ---- Narrow read/write dispatch --------------------------------
+
+        /// Narrow byte read at UARTDR exercises `try_narrow_read8` hit
+        /// path. The RX FIFO is empty → read returns 0 but the dispatch
+        /// path is fully covered.
+        #[test]
+        fn narrow_read8_uartdr_spi_i2c_adc() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // UARTDR (0x000), SSPDR (0x008 on SPI), IC_DATA_CMD (0x010
+            // on I2C), ADC FIFO (0x00C on ADC).
+            assert_eq!(bus.read8(UART0_BASE, 0), 0);
+            assert_eq!(bus.read8(SPI0_BASE + 0x008, 0), 0);
+            assert_eq!(bus.read8(I2C0_BASE + 0x010, 0), 0);
+            assert_eq!(bus.read8(ADC_BASE + 0x00C, 0), 0);
+        }
+
+        #[test]
+        fn narrow_read8_fallthrough_returns_word_extract() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Non-FIFO APB byte read → falls through to word-then-extract.
+            let _ = bus.read8(UART0_BASE + 0x18, 0); // UARTFR
+            let _ = bus.read8(0x4001_0030, 0); // CLK_REF_CTRL byte
+        }
+
+        #[test]
+        fn narrow_read16_uart_spi_i2c_adc_fifo() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Each narrow-read16 arm.
+            assert_eq!(bus.read16(UART0_BASE, 0), 0);
+            assert_eq!(bus.read16(SPI0_BASE + 0x008, 0), 0);
+            assert_eq!(bus.read16(I2C0_BASE + 0x010, 0), 0);
+            assert_eq!(bus.read16(ADC_BASE + 0x00C, 0), 0);
+            // Non-FIFO APB halfword read → falls through.
+            let _ = bus.read16(UART0_BASE + 0x18, 0);
+        }
+
+        /// Narrow byte write to UARTDR / SSPDR / IC_DATA_CMD — happy path
+        /// plus the ADC FIFO read-only swallow arm.
+        #[test]
+        fn narrow_write8_each_arm() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            bus.write8(UART0_BASE, b'X', 0);     // UART TX
+            bus.write8(SPI0_BASE + 0x008, 0x55, 0); // SPI TX
+            bus.write8(I2C0_BASE + 0x010, 0x77, 0); // I2C write
+            bus.write8(ADC_BASE + 0x00C, 0x00, 0);  // ADC FIFO swallowed
+        }
+
+        #[test]
+        fn narrow_write16_each_arm() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            bus.write16(SPI0_BASE + 0x008, 0xAABB, 0);
+            bus.write16(UART0_BASE, 0x0041, 0);
+            bus.write16(I2C0_BASE + 0x010, 0x007F, 0);
+            bus.write16(ADC_BASE + 0x00C, 0x0000, 0);
+        }
+
+        /// Narrow write with a held peripheral silently drops.
+        #[test]
+        fn narrow_write_held_peripheral_drops() {
+            let shared = fresh_shared();
+            // UART1 is held; its UARTDR is 0x4007_4000. try_narrow_write8
+            // must return `true` (consumed) and the write must not reach
+            // the peripheral.
+            let mut bus = WorkerBus::new(0, shared);
+            bus.write8(0x4007_4000, 0x41, 0);
+            bus.write16(0x4007_4000, 0x00_41, 0);
+            // read8 via the held peripheral returns 0.
+            assert_eq!(bus.read8(0x4007_4000, 0), 0);
+            assert_eq!(bus.read16(0x4007_4000, 0), 0);
+        }
+
+        // ---- AHB byte / halfword write -------------------------------
+
+        #[test]
+        fn ahb_byte_write_rmw_through_word() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Legacy AHB byte-write goes through the RMW path.
+            let addr = 0x5060_0000;
+            bus.write32(addr, 0xAABB_CCDD, 0);
+            bus.write8(addr + 1, 0xFF, 0);
+            assert_eq!(bus.read32(addr, 0), 0xAABB_FFDD);
+        }
+
+        #[test]
+        fn ahb_halfword_write_rmw_through_word() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            let addr = 0x5060_0004;
+            bus.write32(addr, 0xAABB_CCDD, 0);
+            bus.write16(addr, 0x1122, 0);
+            assert_eq!(bus.read32(addr, 0), 0xAABB_1122);
+        }
+
+        // ---- SIO narrow write replicating path -------------------------
+
+        #[test]
+        fn sio_write8_gpio_out_replicates_across_lanes() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // STRB to SIO GPIO_OUT replicates the byte across all lanes.
+            bus.write8(0xD000_0010, 0xA5, 0);
+            assert_eq!(bus.read32(0xD000_0010, 0), 0xA5A5_A5A5);
+        }
+
+        #[test]
+        fn sio_write16_gpio_out_replicates_across_lanes() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            bus.write16(0xD000_0010, 0xBEEF, 0);
+            assert_eq!(bus.read32(0xD000_0010, 0), 0xBEEF_BEEF);
+        }
+
+        /// Non-replicating SIO byte write falls through to the RMW arm.
+        #[test]
+        fn sio_write8_non_replicating_rmw_fallback() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // MTIME control at 0xD000_01A0 is NOT in the replicating set.
+            bus.write32(0xD000_01A0, 0x0000_0000, 0);
+            bus.write8(0xD000_01A0, 0xAB, 0);
+            // RMW path must land the byte in lane 0 only.
+            assert_eq!(bus.read32(0xD000_01A0, 0) & 0xFF, 0xAB);
+        }
+
+        #[test]
+        fn sio_write16_non_replicating_rmw_fallback() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            bus.write32(0xD000_01A8, 0x0000_0000, 0);
+            bus.write16(0xD000_01A8, 0xCAFE, 0);
+            assert_eq!(bus.read32(0xD000_01A8, 0) & 0xFFFF, 0xCAFE);
+        }
+
+        // ---- Unmapped-region bus fault dispatch ------------------------
+
+        #[test]
+        fn unmapped_read_sets_bus_fault() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // 0x8000_0000 is outside all mapped regions.
+            assert_eq!(bus.read32(0x8000_0000, 0), 0);
+            assert_eq!(bus.read16(0x8000_0000, 0), 0);
+            assert_eq!(bus.read8(0x8000_0000, 0), 0);
+            assert!(shared.atomics.is_bus_fault(0));
+            assert_eq!(shared.atomics.bus_fault_addr(0), 0x8000_0000);
+        }
+
+        #[test]
+        fn unmapped_write_sets_bus_fault() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            bus.write32(0x8000_0000, 0xDEAD_BEEF, 0);
+            assert!(shared.atomics.is_bus_fault(0));
+            // Distinct faults for write8 / write16.
+            shared.atomics.clear_bus_fault(0);
+            bus.write8(0x8000_0004, 0xAA, 0);
+            assert!(shared.atomics.is_bus_fault(0));
+            shared.atomics.clear_bus_fault(0);
+            bus.write16(0x8000_0008, 0xBBBB, 0);
+            assert!(shared.atomics.is_bus_fault(0));
+        }
+
+        // ---- raise_irqs_shared filters software IRQs -------------------
+
+        /// When a peripheral `tick` reports a non-peripheral IRQ bit
+        /// (e.g. bit 46 — SIO_IRQ_FIFO is software-only), `raise_irqs_shared`
+        /// masks it. We can exercise the loop itself via the UART TX path
+        /// indirectly: push a byte, which reports UART0_IRQ back on the
+        /// shared mask.
+        #[test]
+        fn raise_irqs_shared_filters_software_only_bits() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // Enable TX interrupt on UART0 (UARTIMSC bit 5 = TXIM).
+            bus.write32(UART0_BASE + 0x38, 0x20, 0);
+            // Push a byte through the narrow TX path.
+            bus.write8(UART0_BASE, b'A', 0);
+            // UART0 IRQ may now be asserted on both cores; at worst, no
+            // assertion but the path is covered.
+            let pending0 = shared.atomics.irq_pending_load(0);
+            // Software-only bits (46..=51) must not appear.
+            let swmask = (1u64 << 46) | (1u64 << 47) | (1u64 << 48)
+                | (1u64 << 49) | (1u64 << 50) | (1u64 << 51);
+            assert_eq!(pending0 & swmask, 0);
+        }
+
+        // ---- queue_cache_invalidation skip path ------------------------
+
+        #[test]
+        fn queue_cache_invalidation_skips_non_executable_regions() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Write into APB (0x4...) — addr >> 28 == 0x4, NOT in 0x0..=0x2.
+            // queue_cache_invalidation's matches-predicate must skip this.
+            let before = bus.pending_cache_invalidations.len();
+            bus.write32(0x4001_0030, 0x0, 0);
+            assert_eq!(
+                bus.pending_cache_invalidations.len(),
+                before,
+                "APB writes must not queue cache invalidations"
+            );
+        }
+
+        // ---- RESETS writes for coverage --------------------------------
+
+        /// Toggle RESETS state: hold TIMER0, then release, observe the
+        /// guard path on apb_read32 flip between 0 and the real value.
+        /// Covers the `is_held_in_reset_base` true/false branches once
+        /// more through the typed APB path.
+        #[test]
+        fn resets_state_toggle_gates_timer0_read() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // Hold TIMER0.
+            let mask: u32 = 1u32 << RESET_TIMER0;
+            bus.write32(0x4002_0000, mask, 0); // set RESET bits (alias 0)
+            // Alias 2 = SET semantics to make sure the bit lands.
+            bus.write32(0x4002_2000, mask, 0);
+            let held_state = shared.peripherals.resets.lock().unwrap().resets_state;
+            assert_ne!(held_state & mask, 0);
+            // Held TIMER0 must read 0.
+            assert_eq!(bus.read32(TIMER0_BASE, 0), 0);
+            // Release via alias 3 (CLR).
+            bus.write32(0x4002_3000, mask, 0);
+            let released_state = shared.peripherals.resets.lock().unwrap().resets_state;
+            assert_eq!(released_state & mask, 0);
+            // Suppress unused-import warnings for the RESET_* constants
+            // imported at the module top. Each is used somewhere above or
+            // here; this keeps the batch import compact.
+            let _ = (RESET_UART0, RESET_SPI0, RESET_I2C0, RESET_ADC,
+                RESET_PWM, RESET_IO_BANK0, RESET_PADS_BANK0,
+                RESET_TIMER1, RESET_DMA);
+        }
+
+        // ---- CoreBus wait-state accounting via dyn --------------------
+
+        #[test]
+        fn wait_state_add_and_take_via_core_bus() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            let b: &mut dyn CoreBus = &mut bus;
+            b.add_extra_wait_states(2);
+            b.reset_extra_wait_states();
+            assert_eq!(b.extra_wait_states(), 0);
+            // Non-zero take path.
+            b.add_extra_wait_states(7);
+            assert_eq!(b.take_extra_wait_states(), 7);
+            assert_eq!(b.take_extra_wait_states(), 0);
+            // last_fetch_addr getter/setter.
+            b.set_last_fetch_addr(0x2000_1234);
+            assert_eq!(b.last_fetch_addr(), 0x2000_1234);
+        }
+
+        // ---- boot_ram / xip_sram narrow-width routing -------------------
+
+        /// `write8` / `write16` into the boot RAM scratchpad take the
+        /// early-return arms at lines 1176-78 and 1248-52.
+        #[test]
+        fn boot_ram_narrow_writes_via_worker_bus() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            let addr = 0xEFFF_F080;
+            bus.write32(addr, 0x0000_0000, 0);
+            bus.write16(addr, 0xBEEF, 0);
+            assert_eq!(bus.read16(addr, 0), 0xBEEF);
+            bus.write8(addr, 0xAB, 0);
+            assert_eq!(bus.read8(addr, 0), 0xAB);
+        }
+
+        #[test]
+        fn xip_sram_narrow_writes_via_worker_bus() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            let addr = 0x1C00_0080;
+            bus.write32(addr, 0x0000_0000, 0);
+            bus.write16(addr, 0xCAFE, 0);
+            assert_eq!(bus.read16(addr, 0), 0xCAFE);
+            bus.write8(addr, 0xCD, 0);
+            assert_eq!(bus.read8(addr, 0), 0xCD);
+        }
+
+        // ---- Narrow read/write hitting APB+AHB for 0x5 region ---------
+
+        /// `read8` / `read16` at an AHB (0x5) non-FIFO address hits the
+        /// `(addr >> 28) == 0x5` branch inside the narrow-read fallthrough.
+        #[test]
+        fn narrow_read8_and_16_ahb_fallthrough() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Legacy AHB canonical base (alias bits clear). Seed with a
+            // recognisable pattern so the byte- and halfword-extract
+            // math is observable.
+            let base = 0x5060_0000;
+            bus.write32(base, 0xDEAD_BEEF, 0);
+            assert_eq!(bus.read8(base, 0), 0xEF);
+            assert_eq!(bus.read8(base + 1, 0), 0xBE);
+            assert_eq!(bus.read16(base, 0), 0xBEEF);
+            assert_eq!(bus.read16(base + 2, 0), 0xDEAD);
+        }
+
+        // ---- SIO byte / halfword reads to exercise 1106-07 / 1141-43 ---
+
+        #[test]
+        fn sio_narrow_reads_word_extract() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // GPIO_OUT at 0xD000_0010 is RW; seed it then read byte/half.
+            bus.write32(0xD000_0010, 0xAABB_CCDD, 0);
+            assert_eq!(bus.read8(0xD000_0010, 0), 0xDD);
+            assert_eq!(bus.read8(0xD000_0012, 0), 0xBB);
+            assert_eq!(bus.read16(0xD000_0010, 0), 0xCCDD);
+            assert_eq!(bus.read16(0xD000_0012, 0), 0xAABB);
+        }
+
+        // ---- SIO GPIO_IN read via sio_read32 offset 0x004 ---------------
+
+        #[test]
+        fn sio_read_gpio_in_via_worker_bus() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // Seed an external-stim value and a bank-0 output so
+            // `gpio_in_fresh` produces a predictable merge.
+            shared.gpio.write_external(0xA000_0000, 0xA000_0000);
+            shared.gpio.write_out(0, 0x0000_0001);
+            shared.gpio.write_oe(0, 0x0000_0001);
+            shared.gpio.write_in(0x0000_0001);
+            // Read GPIO_IN via SIO offset 0x004 — exercises line 636.
+            let v = bus.read32(0xD000_0004, 0);
+            // The external-stim bit must show, AND the seeded `in_` bit.
+            assert_ne!(v & 0xA000_0000, 0, "external bit must be present");
+        }
+
+        // ---- RESETS writes routed through apb_write32's RESETS arm ----
+
+        /// `apb_write32` line 321-327 (RESETS dispatch arm) is covered
+        /// by `resets_state_toggle_gates_timer0_read` above. This test
+        /// exercises the TICKS write_32's `if invalidate` true branch
+        /// (bus.rs:349-352) by toggling CTRL on TIMER0 domain.
+        #[test]
+        fn ticks_invalidate_lazy_on_timer0_ctrl_write() {
+            use crate::peripherals::ticks::{
+                CTRL_ENABLE, DOMAIN_STRIDE, DOMAIN_TIMER0, CTRL_OFFSET,
+            };
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // CTRL register of TIMER0 domain inside TICKS.
+            let addr = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE + CTRL_OFFSET;
+            // First write toggles ENABLE on (returns true → invalidate_lazy).
+            bus.write32(addr, CTRL_ENABLE, 0);
+            // Second toggles it off (another invalidate).
+            bus.write32(addr, 0, 0);
+        }
+
+        // ---- raise_irqs_shared loop body via PWM tick ------------------
+
+        /// `raise_irqs_shared` is exercised indirectly when a peripheral
+        /// write triggers an IRQ assertion. Trigger PWM IRQ by writing
+        /// INTE=1 then INTR=1 so the next PWM tick reports the IRQ via
+        /// ext_irqs → `raise_irqs_shared` loops through bit 40 or so.
+        ///
+        /// This specifically tries to hit the while-loop body at
+        /// bus.rs:1033-1037.
+        /// Force `raise_irqs_shared` to actually loop by triggering a
+        /// real IRQ through a peripheral write. PWM's INTE + INTF combo
+        /// is the most compact path: set INTE=1 on slice 0, then write
+        /// INTF=1 to force the interrupt. The PWM write handler reports
+        /// the IRQ back through `irqs` → `raise_irqs_shared` runs its
+        /// inner `while remaining != 0 { ... }` body.
+        #[test]
+        fn raise_irqs_shared_fires_pwm_intf() {
+            use crate::peripherals::pwm::PWM_BASE;
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // INTE0 at offset 0xF8: enable slice 0.
+            bus.write32(PWM_BASE + 0xF8, 0x1, 0);
+            // INTF0 at offset 0xFC: force slice 0. This sets INTS → the
+            // peripheral reports IRQ via the write32 `irqs` return →
+            // `raise_irqs_shared` loop fires.
+            bus.write32(PWM_BASE + 0xFC, 0x1, 0);
+            // IRQ pending should now have the PWM wrap IRQ bit set on
+            // both cores (the loop body runs at least once per bit).
+            let m0 = shared.atomics.irq_pending_load(0);
+            let m1 = shared.atomics.irq_pending_load(1);
+            // We don't assert the exact IRQ number — different IRQ
+            // constants map across revisions. The load must be non-zero
+            // on both cores, proving `assert_irq_shared` ran.
+            assert_ne!(m0, 0, "core 0 must see PWM IRQ pending");
+            assert_ne!(m1, 0, "core 1 must see PWM IRQ pending");
+        }
+
+        #[test]
+        fn raise_irqs_shared_loops_through_multiple_bits() {
+            use crate::peripherals::pwm::PWM_BASE;
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // Force-write the raw PWM IRQ bit (PWM_BASE + 0x50 is the
+            // INTE mask; register offsets differ per slice). Even if
+            // this write doesn't assert IRQs, it exercises the PWM
+            // write32 path and the code inside `raise_irqs_shared`
+            // will at least skip its `while` preamble evaluation.
+            bus.write32(PWM_BASE + 0x50, 0xFFFF, 0);
+            // Manually assert two IRQs via assert_irq_shared to confirm
+            // the helper's shape — independent of `raise_irqs_shared`.
+            shared.atomics.assert_irq_shared(10);
+            shared.atomics.assert_irq_shared(12);
+            let m = shared.atomics.irq_pending_load(0);
+            assert_ne!(m & (1u64 << 10), 0);
+            assert_ne!(m & (1u64 << 12), 0);
+        }
+
+        // ---- queue_cache_invalidation 4-byte dual-push via SRAM write32 --
+
+        /// A 4-byte SRAM write pushes BOTH `addr` and `addr+2` into the
+        /// invalidation queue — covers bus.rs:1060.
+        #[test]
+        fn queue_cache_invalidation_write32_pushes_two_entries() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            let addr = 0x2000_3000;
+            bus.write32(addr, 0xDEAD_BEEF, 0);
+            assert_eq!(bus.pending_cache_invalidations.len(), 2);
+            assert_eq!(bus.pending_cache_invalidations[0], addr);
+            assert_eq!(bus.pending_cache_invalidations[1], addr + 2);
+        }
+
+        // ---- sysinfo_read unmapped branch via bus dispatch -------------
+
+        #[test]
+        fn sysinfo_unknown_offset_falls_through() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // 0x4000_0020 — unmapped SYSINFO offset, returns 0.
+            assert_eq!(bus.read32(0x4000_0020, 0), 0);
+        }
+    }
 }

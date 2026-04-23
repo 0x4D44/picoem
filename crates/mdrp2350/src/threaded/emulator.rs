@@ -2500,6 +2500,313 @@ mod tests {
     ///  - elapsed wall time,
     ///  - quanta completed,
     ///  - effective throughput (`quanta * step_quantum / elapsed`).
+    // =====================================================================
+    // stage5_coverage: accessor / lifecycle / error-path coverage
+    // =====================================================================
+
+    mod stage5_coverage {
+        use super::*;
+
+        /// `with_thread_mask` overrides the default pin mask and the
+        /// `run_quanta` path uses it. We only assert on the stored mask;
+        /// observable side-effects are Win32 affinity, not test-visible.
+        #[test]
+        fn with_thread_mask_sets_mask_and_chain_returns_self() {
+            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let mask: [usize; 6] = [5, 4, 3, 2, 1, 0];
+            let after = threaded.with_thread_mask(mask);
+            assert_eq!(after.thread_mask, mask);
+        }
+
+        /// `core_cycles(0)` / `core_cycles(1)` on a freshly-built runtime
+        /// return 0 (matching each core's pre-execution cycle count).
+        #[test]
+        fn core_cycles_returns_zero_on_fresh_emulator() {
+            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            assert_eq!(threaded.core_cycles(0), 0);
+            assert_eq!(threaded.core_cycles(1), 0);
+        }
+
+        /// `core_cycles(idx)` panics on idx >= 2.
+        #[test]
+        #[should_panic(expected = "idx must be 0 or 1")]
+        fn core_cycles_invalid_idx_panics() {
+            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let _ = threaded.core_cycles(2);
+        }
+
+        /// `core_pc(0)` / `core_pc(1)` return Some(_) on a freshly-built
+        /// runtime.
+        #[test]
+        fn core_pc_returns_some_on_fresh_emulator() {
+            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            assert!(threaded.core_pc(0).is_some());
+            assert!(threaded.core_pc(1).is_some());
+        }
+
+        /// `core_pc(idx)` panics on idx >= 2.
+        #[test]
+        #[should_panic(expected = "idx must be 0 or 1")]
+        fn core_pc_invalid_idx_panics() {
+            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let _ = threaded.core_pc(2);
+        }
+
+        /// `shared()` returns a reference that can observe atomics set
+        /// through the original runtime.
+        #[test]
+        fn shared_accessor_exposes_atomics() {
+            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let s = threaded.shared();
+            // Write a bit via the reference; observe via the original.
+            s.atomics.assert_irq(0, 3);
+            assert_eq!(threaded.shared.atomics.irq_pending_load(0), 1u64 << 3);
+        }
+
+        /// `master_cycle()` returns 0 before any run.
+        #[test]
+        fn master_cycle_zero_on_fresh_emulator() {
+            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            assert_eq!(threaded.master_cycle(), 0);
+        }
+
+        /// `apply_pio_command` early-return for addr >= 32 on WriteInstrMem
+        /// (line 861-863). After the call, INSTR_MEM read-back through
+        /// the block reports the unchanged post-reset value.
+        #[test]
+        fn apply_pio_command_instrmem_out_of_range_skips() {
+            let pio = ThreadedPio::new();
+            let mut block = PioBlock::new();
+            // Pre-seed slot 0 so we can confirm the skipped high-index
+            // write does not reach it.
+            block.write32(0x048, 0x1234, 0); // INSTR_MEM0
+            let before = block.read32(0x048);
+            apply_pio_command(&mut block, 0, &pio, PioCommand::WriteInstrMem {
+                block: 0,
+                addr: 33, // >= 32, skipped
+                value: 0xABCD,
+                alias: 0,
+            });
+            // No panic, no effect.
+            assert_eq!(block.read32(0x048), before);
+        }
+
+        /// `apply_pio_command` early-return for sm >= 4 on SetClkDiv
+        /// (line 868-870).
+        #[test]
+        fn apply_pio_command_setclkdiv_out_of_range_skips() {
+            let pio = ThreadedPio::new();
+            let mut block = PioBlock::new();
+            apply_pio_command(&mut block, 0, &pio, PioCommand::SetClkDiv {
+                block: 0,
+                sm: 4, // >= 4, skipped
+                int_div: 100,
+                frac_div: 0,
+                alias: 0,
+            });
+            // No panic — SM0 CLKDIV at 0x0C8 stays at its post-reset value.
+            // We only assert absence of panic; the specific post-reset
+            // value is implementation detail that may change.
+        }
+
+        /// `tick_peripherals` held-peripheral branches: lock every
+        /// optional peripheral in RESETS and run a quantum. Each
+        /// `if !held(RESET_*)` arm takes its false branch.
+        #[test]
+        fn tick_peripherals_held_peripherals_skip_advance() {
+            use crate::bus::{
+                RESET_ADC, RESET_I2C0, RESET_I2C1, RESET_PWM, RESET_SPI0,
+                RESET_SPI1, RESET_TIMER0, RESET_TIMER1, RESET_UART0, RESET_UART1,
+            };
+
+            let mut threaded =
+                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+
+            // Hold every peripheral tick_peripherals gates on. Post-bootrom
+            // RESETS already has UART1/SPI1/I2C1 held; add TIMER0/TIMER1/
+            // UART0/SPI0/I2C0/ADC/PWM.
+            {
+                let mut r = threaded.shared.peripherals.resets.lock().unwrap();
+                r.resets_state |= (1u32 << RESET_TIMER0)
+                    | (1u32 << RESET_TIMER1)
+                    | (1u32 << RESET_UART0)
+                    | (1u32 << RESET_UART1)
+                    | (1u32 << RESET_SPI0)
+                    | (1u32 << RESET_SPI1)
+                    | (1u32 << RESET_I2C0)
+                    | (1u32 << RESET_I2C1)
+                    | (1u32 << RESET_ADC)
+                    | (1u32 << RESET_PWM);
+            }
+
+            // Run a single quantum. tick_peripherals must take every
+            // `held()` true arm without panicking.
+            threaded.run_quanta(1);
+
+            // No IRQs should have fired — sanity check.
+            assert_eq!(threaded.shared.atomics.irq_pending_load(0), 0);
+        }
+
+        /// `from_emulator` on an RISC-V-armed emulator panics with the
+        /// explicit message before hoisting state (line 106).
+        #[test]
+        #[should_panic(expected = "ThreadedEmulator requires Arch::Arm")]
+        fn from_emulator_riscv_panics() {
+            use crate::{Arch, EmulatorBuilder};
+            let emu = EmulatorBuilder::new(Config::default())
+                .arch(Arch::RiscV)
+                .build();
+            let _ = ThreadedEmulator::from_emulator(emu);
+        }
+
+        /// Running the core-worker body with a halted core lets the
+        /// `if !shared.atomics.is_halted(idx)` branch take its false arm
+        /// (line 727); with the wake-on-event pattern it exercises the
+        /// top-of-quantum consume path (line 698-702). Both cores halted
+        /// during `run_quanta` above covers line 727; this test covers
+        /// the `wfe_waiting` early-wake branch.
+        #[test]
+        fn wfe_waiting_early_wake_via_event_flag() {
+            let mut threaded =
+                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+            // Put core 0 into WFE-waiting, then pre-arm the event flag —
+            // the first quantum's top-of-loop drain clears both.
+            threaded.shared.atomics.set_wfe_waiting(0);
+            threaded.shared.atomics.event_flag[0].store(
+                true,
+                std::sync::atomic::Ordering::Release,
+            );
+            threaded.run_quanta(1);
+            assert!(
+                !threaded.shared.atomics.is_wfe_waiting(0),
+                "WFE should have cleared on event_flag_consume"
+            );
+        }
+
+        /// Release UART1 / SPI1 / I2C1 (held post-bootrom) before
+        /// running, so `tick_peripherals`' `!held(RESET_*)` arms take
+        /// their true branch for those peripherals too.
+        #[test]
+        fn tick_peripherals_all_released_drives_every_arm() {
+            use crate::bus::{RESET_UART1, RESET_SPI1, RESET_I2C1, RESET_TIMER1};
+
+            let mut threaded =
+                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+
+            // Release UART1 / SPI1 / I2C1 / TIMER1 so their `!held()`
+            // arms inside `tick_peripherals` take the true branch.
+            {
+                let mut r = threaded.shared.peripherals.resets.lock().unwrap();
+                r.resets_state &= !((1u32 << RESET_UART1)
+                    | (1u32 << RESET_SPI1)
+                    | (1u32 << RESET_I2C1)
+                    | (1u32 << RESET_TIMER1));
+            }
+
+            threaded.run_quanta(1);
+
+            // Post-run, the runtime must not be poisoned. That's the
+            // observable contract; each tick call took its unheld branch.
+            assert!(!threaded.poisoned);
+        }
+
+        /// Run a real stepping core for several quanta to exercise
+        /// `core_worker_body`'s inner loop (lines 727-741):
+        ///   - `if !shared.atomics.is_halted(idx)` true arm
+        ///   - `while core.cycles() < target` body
+        ///   - `core.step_no_atomics(...)` call
+        ///   - `if !bus.pending_cache_invalidations.is_empty()` branch
+        ///   - post-step `if shared.atomics.is_wfe_waiting(idx) { break; }`
+        ///
+        /// We seed a minimal Thumb program into SRAM:
+        ///   0x2000_0000: STR R0, [R1]   (queues cache invalidation)
+        ///   0x2000_0002: B .-2          (branch to self, idle loop)
+        /// and point the reset vector + SP at the start.
+        #[test]
+        fn core_worker_inner_loop_steps_and_drains_invalidations() {
+            let mut emu = Emulator::new(Config::default());
+            // Minimal Thumb program at 0x2000_0100:
+            //  STR R0, [R1]    (Thumb-16 encoding 0x6008)
+            //  B .-2           (Thumb-16 encoding 0xE7FE)
+            // Pad with NOPs to keep a nominally valid instruction window.
+            let prog: [u8; 8] = [
+                0x08, 0x60, // STR R0, [R1]
+                0xFE, 0xE7, // B . (branch to self)
+                0x00, 0xBF, // NOP
+                0x00, 0xBF, // NOP
+            ];
+            emu.load_image(0x2000_0100, &prog);
+            // Vector table in SRAM at 0x2000_0000: init SP + reset vector.
+            // Bytes: SP lo...hi, reset PC lo...hi (with Thumb bit set).
+            let sp: u32 = 0x2001_0000;
+            let reset_pc: u32 = 0x2000_0101; // Thumb bit
+            let vectors: [u8; 8] = [
+                (sp & 0xFF) as u8, (sp >> 8 & 0xFF) as u8,
+                (sp >> 16 & 0xFF) as u8, (sp >> 24 & 0xFF) as u8,
+                (reset_pc & 0xFF) as u8, (reset_pc >> 8 & 0xFF) as u8,
+                (reset_pc >> 16 & 0xFF) as u8, (reset_pc >> 24 & 0xFF) as u8,
+            ];
+            emu.load_image(0x2000_0000, &vectors);
+            // Point core 0 at the reset vector. Bypass bootrom by setting
+            // PC/SP directly. Also point R1 at a valid SRAM word so the
+            // STR drops into memory rather than faulting.
+            emu.core_mut(0).regs.set_pc(0x2000_0100);
+            emu.core_mut(0).regs.set_sp(sp);
+            emu.core_mut(0).regs.r[1] = 0x2000_2000;
+
+            let mut threaded = ThreadedEmulator::from_emulator(emu);
+            // Halt core 1; core 0 runs.
+            threaded.shared.atomics.set_halted(1);
+            // Run enough quanta for many inner-loop iterations.
+            threaded.run_quanta(2);
+            assert!(!threaded.poisoned);
+        }
+
+        /// Enable TICKS TIMER1 domain so `tick_peripherals` at line
+        /// 1003 runs `timers.timer1.advance_us(edges)` with `edges > 0`.
+        #[test]
+        fn tick_peripherals_timer1_advances_us() {
+            use crate::peripherals::ticks::{
+                CTRL_ENABLE, DOMAIN_STRIDE, DOMAIN_TIMER1, TICKS_BASE,
+            };
+            let mut emu = Emulator::new(Config::default());
+            // Enable TIMER1 TICKS domain (CTRL.ENABLE).
+            let ctrl = TICKS_BASE + DOMAIN_TIMER1 as u32 * DOMAIN_STRIDE;
+            emu.bus.write32(ctrl, CTRL_ENABLE, 0);
+
+            let mut threaded = ThreadedEmulator::from_emulator(emu);
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+
+            // Two quanta: TIMER CYCLES=12 default, step_quantum=64 sysclks
+            // → ~5 edges per quantum → `advance_us(edges)` hit >0 times.
+            threaded.run_quanta(2);
+            assert!(!threaded.poisoned);
+        }
+
+        /// Running a single quantum with a pre-set IRQ pending mask
+        /// exercises `core_worker_body`'s `if pending != 0` arm —
+        /// the merge branch.
+        #[test]
+        fn core_worker_merges_pending_irq() {
+            let mut threaded =
+                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+            threaded.shared.atomics.assert_irq(0, 7);
+            threaded.run_quanta(1);
+            // take_irq_pending is swap-to-zero; after the quantum the
+            // worker consumed the bit into the core's NVIC.
+            assert_eq!(threaded.shared.atomics.irq_pending_load(0), 0);
+        }
+    }
+
     #[test]
     #[ignore = "60s stress; run explicitly via cargo test -- --ignored stress_onerom"]
     fn stress_onerom_60s() {

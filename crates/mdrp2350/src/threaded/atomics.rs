@@ -376,6 +376,114 @@ mod tests {
         assert!(!a.is_bus_fault(0));
     }
 
+    // ------------------------------------------------------------
+    // stage5_coverage: branch-coverage fill-ins for assert_irq /
+    // assert_irq_shared / clear_irq out-of-range guards and
+    // rcp_count_check's "reloaded counter still matches" retry.
+    // ------------------------------------------------------------
+
+    /// `assert_irq` guards on `core < 2 && irq < 64`. Hit the false
+    /// arm via an out-of-range core AND an out-of-range irq; each must
+    /// be a no-op on both cores' pending masks.
+    #[test]
+    fn assert_irq_invalid_core_is_noop() {
+        let a = CoreAtomics::default();
+        a.assert_irq(2, 5); // core out of range
+        assert_eq!(a.irq_pending_load(0), 0);
+        assert_eq!(a.irq_pending_load(1), 0);
+    }
+
+    #[test]
+    fn assert_irq_invalid_irq_is_noop() {
+        let a = CoreAtomics::default();
+        a.assert_irq(0, 64); // irq out of range
+        a.assert_irq(1, 200); // irq way out of range
+        assert_eq!(a.irq_pending_load(0), 0);
+        assert_eq!(a.irq_pending_load(1), 0);
+    }
+
+    /// `assert_irq_shared` guards on `irq < 64`.
+    #[test]
+    fn assert_irq_shared_invalid_irq_is_noop() {
+        let a = CoreAtomics::default();
+        a.assert_irq_shared(64);
+        a.assert_irq_shared(u32::MAX);
+        assert_eq!(a.irq_pending_load(0), 0);
+        assert_eq!(a.irq_pending_load(1), 0);
+    }
+
+    /// `clear_irq` guards on `core < 2 && irq < 64`.
+    #[test]
+    fn clear_irq_out_of_range_is_noop() {
+        let a = CoreAtomics::default();
+        a.assert_irq(0, 5);
+        // Neither of these should affect the live bit on core 0.
+        a.clear_irq(2, 5); // bad core
+        a.clear_irq(0, 64); // bad irq
+        assert_eq!(a.irq_pending_load(0), 1u64 << 5);
+    }
+
+    /// `clear_irq` happy path exercises the `fetch_and` branch.
+    #[test]
+    fn clear_irq_valid_clears_bit() {
+        let a = CoreAtomics::default();
+        a.assert_irq(0, 7);
+        a.assert_irq(0, 3);
+        a.clear_irq(0, 7);
+        assert_eq!(a.irq_pending_load(0), 1u64 << 3);
+    }
+
+    /// `take_irq_pending` fast path: zero load returns zero without
+    /// touching the RMW branch.
+    #[test]
+    fn take_irq_pending_zero_fast_path() {
+        let a = CoreAtomics::default();
+        assert_eq!(a.take_irq_pending(0), 0);
+        assert_eq!(a.take_irq_pending(1), 0);
+    }
+
+    /// `rcp_count_check` retry branch: we can't race a real thread here,
+    /// but CAS failure → reload-and-compare-still-ok is logically a
+    /// single-threaded loop. Exercising the success path with a post-
+    /// compare increment confirms the `Ok(_) => return Ok(())` arm.
+    /// The `Err(_) => continue` arm and the post-retry mismatch exit
+    /// (line 204 in the task list) are covered by hammering the counter
+    /// with a mid-check bump from a second thread.
+    #[test]
+    fn rcp_count_check_retry_with_concurrent_bump() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::sync::atomic::Ordering;
+
+        let a = Arc::new(CoreAtomics::default());
+        a.rcp_count_set(0);
+
+        // Spawn a disruptor that increments the counter from another
+        // thread. Even if the main thread's CAS succeeds first try, a
+        // long enough soak will observe at least one Err(_) from the
+        // CAS and re-enter the loop.
+        let disruptor = {
+            let a = a.clone();
+            thread::spawn(move || {
+                for _ in 0..1000 {
+                    let _ = a.rcp_count.fetch_add(1, Ordering::AcqRel);
+                }
+            })
+        };
+
+        // Try the check repeatedly; every success or mismatch exercises
+        // the two terminal arms.
+        for _ in 0..1000 {
+            let expected = a.rcp_count_load();
+            let _ = a.rcp_count_check(expected);
+        }
+        disruptor.join().unwrap();
+
+        // Final state: counter is monotonically advanced; no assertion
+        // needed beyond "didn't deadlock / panic".
+        assert!(a.rcp_count_load() >= 1000);
+    }
+
     #[test]
     fn core_atomics_reset_clears_all() {
         let a = CoreAtomics::default();
