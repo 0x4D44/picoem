@@ -101,16 +101,29 @@ mod windows_main {
     /// quantum, so `step_quantum` is the ultimate ceiling on the
     /// achievable ns ladder rung.
     ///
-    /// At 150 MHz emulated and `step_quantum=64`, one quantum ≈ 427 ns
-    /// emulated time. Wall-clock pace at current throughput (~100-180
-    /// MHz emulated) is ~350–640 ns per quantum; the 500 ns top rung
-    /// is thus borderline even at sq=64, and the lower rungs
-    /// realistically exercise "does the emulator win the merge race"
-    /// rather than "how fast can the emulator serve". The
-    /// pre-measurement throughput probe (§10) surfaces the actual
-    /// wall-clock per-emul-cycle so the report interprets results
-    /// honestly.
-    const THREADED_STEP_QUANTUM: u32 = 64;
+    /// Default step_quantum for the threaded runtime.
+    ///
+    /// 1024 empirically chosen — a sq-sweep across {64, 256, 1024,
+    /// 4096} on the 2000..40 ns ladder showed:
+    ///
+    /// - sq=64:   67 MHz throughput, 500 ns rung 2.5% effective error.
+    ///   Barrier cost (~447 ns) dominates each 660 ns quantum.
+    /// - sq=256:  144 MHz throughput, 500 ns 0.37%. Barrier amortizing.
+    /// - sq=1024: 177 MHz throughput, 500 ns 0.12%, clean top rungs.
+    ///   Serve-path-dominated.
+    /// - sq=4096: 157 MHz throughput, most samples stall (quantum >
+    ///   target), data too noisy to interpret.
+    ///
+    /// 1024 lands firmly in the "serve path, not barrier" regime while
+    /// staying below the stall threshold for targets down to ~300 ns.
+    /// The 90-ns silicon floor still isn't reachable via wall-clock on
+    /// a multithreaded host — that needs the serial oracle (measures
+    /// simulated-cycle serve time directly, ~10-13 cycles).
+    ///
+    /// Overridable via `--step-quantum <u32>`. Smaller values expose
+    /// barrier-amortization bottleneck; larger values expose stall
+    /// (quantum > target) bottleneck.
+    const DEFAULT_THREADED_STEP_QUANTUM: u32 = 1024;
 
     /// Minimum master-cycle advance during a sample's wait window
     /// for the observation to be counted against the emulator.
@@ -251,6 +264,7 @@ mod windows_main {
         ladder: Vec<LadderRung>,
         sweeps_per_threshold: u32,
         run_all_rungs: bool,
+        step_quantum: u32,
     }
 
     fn print_help() {
@@ -266,8 +280,10 @@ mod windows_main {
              \u{20}\u{20}--ladder <csv>               ns targets, comma-separated\n\
              \u{20}\u{20}                             (default 500,400,300,250,200,150,120,100).\n\
              \u{20}\u{20}--sweeps-per-threshold <n>   Sweeps per rung (default 3).\n\
+             \u{20}\u{20}--step-quantum <u32>         Threaded CPU cycles per barrier (default {}).\n\
+             \u{20}\u{20}--all-rungs                  Continue past first failing rung.\n\
              \u{20}\u{20}--help                       Print this message.\n",
-            DEFAULT_SEED
+            DEFAULT_SEED, DEFAULT_THREADED_STEP_QUANTUM
         );
     }
 
@@ -277,6 +293,7 @@ mod windows_main {
         let mut ladder_csv: Option<String> = None;
         let mut sweeps_per_threshold = DEFAULT_SWEEPS_PER_THRESHOLD;
         let mut run_all_rungs = false;
+        let mut step_quantum = DEFAULT_THREADED_STEP_QUANTUM;
 
         let mut i = 0;
         while i < args.len() {
@@ -309,6 +326,18 @@ mod windows_main {
                 }
                 "--all-rungs" => {
                     run_all_rungs = true;
+                }
+                "--step-quantum" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .ok_or("--step-quantum requires a value")?;
+                    step_quantum = v
+                        .parse::<u32>()
+                        .map_err(|e| format!("--step-quantum: {}", e))?;
+                    if step_quantum == 0 {
+                        return Err("--step-quantum must be >= 1".to_string());
+                    }
                 }
                 other => return Err(format!("unknown argument: {}", other)),
             }
@@ -351,6 +380,7 @@ mod windows_main {
             ladder,
             sweeps_per_threshold,
             run_all_rungs,
+            step_quantum,
         })
     }
 
@@ -788,7 +818,7 @@ mod windows_main {
         // Update step_quantum for the threaded phase. The library
         // destructures this field; setting it before handoff keeps
         // the coordinator's quantum wiring on the tuned value.
-        emu.step_quantum = THREADED_STEP_QUANTUM;
+        emu.step_quantum = cli.step_quantum;
 
         // Seed gpio_external_mask up front so the mask is visible as
         // soon as the threaded runtime starts. Every walk step has
