@@ -25,7 +25,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use mdpicoem_harness::{
-    onerom_serving_oracle, onerom_serving_oracle_cpu::{self, CpuServingOracle}, onerom_stress,
+    onerom_serving_oracle,
+    onerom_serving_oracle_cpu::{self, CpuServingOracle, CpuVerdict},
+    onerom_stress,
 };
 use mdrp2350::{Config, Emulator, EmulatorBuilder};
 
@@ -326,16 +328,29 @@ fn main() -> ExitCode {
     let cases = onerom_stress::generate_sweep_cases();
     let mut latencies: Vec<u32> = Vec::with_capacity(cases.len());
     let mut wedged: u32 = 0;
+    let mut wrong_byte: u32 = 0;
+    let mut out_of_envelope: u32 = 0;
     for case in &cases {
         // `run_case` returns a borrow into the oracle's internal results
-        // vec; copy the u32 out before the next call invalidates it.
-        let latency_cycles = {
+        // vec; copy the fields out before the next call invalidates it.
+        // Only `CpuVerdict::Pass` counts as "served" for the ladder —
+        // `WrongByte` and `LatencyOutOfEnvelope` also carry a
+        // `latency_cycles: Some(_)` but must be treated as errors at
+        // every rung (a fast-but-wrong byte is still a regression).
+        let (verdict, latency_cycles) = {
             let result = oracle.run_case(&mut emu, *case);
-            result.latency_cycles
+            (result.verdict, result.latency_cycles)
         };
-        match latency_cycles {
-            Some(cy) => latencies.push(cy),
-            None => wedged += 1,
+        match verdict {
+            CpuVerdict::Pass => match latency_cycles {
+                Some(cy) => latencies.push(cy),
+                // Defensive: Pass with no latency should not occur, but
+                // bucket as wedged rather than silently dropping.
+                None => wedged += 1,
+            },
+            CpuVerdict::WrongByte { .. } => wrong_byte += 1,
+            CpuVerdict::LatencyOutOfEnvelope { .. } => out_of_envelope += 1,
+            CpuVerdict::DataPinsNotDriven | CpuVerdict::NoStableByte => wedged += 1,
         }
     }
 
@@ -344,7 +359,7 @@ fn main() -> ExitCode {
 
     // -------------------- Report (HLD §4.6) -------------------------------
     println!(
-        "OneROM CPU Serial Speed-Grade Oracle - 1541 $E000 kernal (ROM set {})",
+        "OneROM CPU Serial Speed-Grade Oracle — 1541 $E000 kernal (ROM set {})",
         ROM_SET_INDEX
     );
     println!("fixture:  {}", FLASH_PATH);
@@ -358,22 +373,22 @@ fn main() -> ExitCode {
     println!();
 
     let mut top_rung_errors: Option<u32> = None;
-    let mut stopped_early = false;
     for (i, &rung) in cli.ladder.iter().enumerate() {
-        if stopped_early {
-            break;
-        }
         let served_in_rung = latencies.iter().filter(|&&cy| cy <= rung).count();
-        // Wedged cases fail at every rung (no measurement = can't prove
-        // it met any threshold).
+        // Only `Pass` entries populate `latencies`, so wedged /
+        // wrong-byte / out-of-envelope cases inherently count as errors
+        // at every rung (latencies.len() <= total_cases).
         let errors = (total_cases - served_in_rung) as u32;
-        let verdict = if errors == 0 { "PASS" } else { "FAIL" };
-        println!("   {:>8}   {:>8}     {}", rung, errors, verdict);
+        // Capture the top-rung result BEFORE deciding whether to break,
+        // so a future refactor can't accidentally exit early without
+        // recording the exit-code-relevant verdict.
         if i == 0 {
             top_rung_errors = Some(errors);
         }
-        if errors != 0 && !cli.all_rungs {
-            stopped_early = true;
+        let verdict = if errors == 0 { "PASS" } else { "FAIL" };
+        println!("   {:>8}   {:>8}     {}", rung, errors, verdict);
+        if !cli.all_rungs && errors != 0 {
+            break;
         }
     }
 
@@ -388,6 +403,14 @@ fn main() -> ExitCode {
     println!(
         "wedged:                   {} (cases with no latency_cycles measurable)",
         wedged
+    );
+    println!(
+        "wrong-byte:               {} (cases that produced an incorrect byte — counted as FAIL)",
+        wrong_byte
+    );
+    println!(
+        "out-of-envelope:          {} (cases served outside CPU_ENVELOPE_CYCLES — counted as FAIL)",
+        out_of_envelope
     );
     println!();
     println!("elapsed: {:.1} s wall-clock", elapsed.as_secs_f64());
