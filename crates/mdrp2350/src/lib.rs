@@ -885,3 +885,6 @@ impl EmulatorBuilder {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_stage3_thumb32;
