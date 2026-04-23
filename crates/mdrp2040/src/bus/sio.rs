@@ -198,10 +198,29 @@ impl Sio {
                 let dirty = if self.divider[core].dirty { 2 } else { 0 };
                 ready | dirty
             }
-            // Interpolators (0x080-0x0FC).
+            // Interpolators (0x080-0x0FC). Each interpolator (INTERP0 at
+            // 0x080, INTERP1 at 0x0C0) has its own register block. ACCUM
+            // and BASE reads return the backing store; PEEK_LANE0/1,
+            // PEEK_FULL, POP_LANE0/1, POP_FULL are computed on read from
+            // CTRL/ACCUM/BASE per datasheet §2.3.1 (SHIFT, MASK, SIGNED,
+            // CLAMP [INTERP1 L0], BLEND [INTERP0 L1]).
             0x080..=0x0FC => {
-                let idx = ((offset - 0x080) >> 2) as usize;
-                self.interp[core][idx]
+                let interp_idx = if offset < 0x0C0 { 0usize } else { 1usize };
+                let reg_idx = ((offset - 0x080) >> 2) as usize;
+                // Sub-offset within the INTERP block (0x00..=0x3C).
+                let sub = (offset - 0x080) % 0x40;
+                match sub {
+                    // POP_LANE0/1/FULL, PEEK_LANE0/1/FULL → compute.
+                    // NOTE: POP is the same as PEEK for now (we don't yet
+                    // model the cross_input/cross_result accumulator
+                    // side-effects — not needed for the PicoGUS use case,
+                    // and the only POP consumers in currently-supported
+                    // firmware use simple CLAMP/SHIFT lane outputs).
+                    0x14 | 0x20 => self.interp_lane_peek(core, interp_idx, 0),
+                    0x18 | 0x24 => self.interp_lane_peek(core, interp_idx, 1),
+                    0x1C | 0x28 => self.interp_full_peek(core, interp_idx),
+                    _ => self.interp[core][reg_idx],
+                }
             }
             // Spinlock bank status at 0x05C (RP2040 specific).
             0x05C => self.spinlock_bits,
@@ -240,6 +259,124 @@ impl Sio {
             0x100..=0x17F => self.spinlock_write(offset),
             _ => {}
         }
+    }
+
+    // --- Interpolator PEEK/POP compute ------------------------------------
+    //
+    // Indices within `self.interp[core][...]` for INTERP{0,1}:
+    //   0x080+offset/4 for INTERP0 (indices 0..15),
+    //   0x0C0+offset/4 for INTERP1 (indices 16..31).
+    //
+    // Per-interp register layout (relative offsets, datasheet §2.3.1):
+    //   +0x00 ACCUM0         +0x20 PEEK_LANE0
+    //   +0x04 ACCUM1         +0x24 PEEK_LANE1
+    //   +0x08 BASE0          +0x28 PEEK_FULL
+    //   +0x0C BASE1          +0x2C CTRL_LANE0
+    //   +0x10 BASE2          +0x30 CTRL_LANE1
+    //   +0x14 POP_LANE0      +0x34 ACCUM0_ADD  (w: masked-add accum0)
+    //   +0x18 POP_LANE1      +0x38 ACCUM1_ADD
+    //   +0x1C POP_FULL       +0x3C BASE_1AND0  (w: base0=lo16, base1=hi16)
+    //
+    // CTRL bits relevant here (§2.3.1.7.6, INTERP0 and INTERP1 differ in a
+    // few higher bits but share the core shape):
+    //   [0:4]   SHIFT
+    //   [5:9]   MASK_LSB
+    //   [10:14] MASK_MSB
+    //   [15]    SIGNED      (arithmetic shift + sign-extend from MASK_MSB)
+    //   [16]    CROSS_INPUT (not modelled — not used by PicoGUS)
+    //   [17]    CROSS_RESULT (not modelled — not used by PicoGUS)
+    //   [18]    ADD_RAW
+    //   [19:20] FORCE_MSB   (not modelled)
+    //   [21]    BLEND       (INTERP0 lane 1 only — not modelled)
+    //   [22]    CLAMP       (INTERP1 lane 0 only)
+    //   [23:25] overflow sticky flags (RO; not modelled)
+    //
+    // Lane output = (accum[cross ? other : own] masked/shifted/sign-ext) + BASE[L]
+    // except when CLAMP: BASE add is bypassed and the pre-base value is
+    // clamped between signed(BASE0) and signed(BASE1).
+    #[inline]
+    fn interp_reg(&self, core: usize, which: usize, sub_word: usize) -> u32 {
+        let base = if which == 0 { 0 } else { 16 };
+        self.interp[core][base + sub_word]
+    }
+
+    fn interp_lane_peek(&self, core: usize, which: usize, lane: usize) -> u32 {
+        debug_assert!(which < 2 && lane < 2);
+        let accum0 = self.interp_reg(core, which, 0);
+        let base0 = self.interp_reg(core, which, 2);
+        let base1 = self.interp_reg(core, which, 3);
+        let base_l = self.interp_reg(core, which, 2 + lane);
+        let ctrl = self.interp_reg(core, which, 11 + lane);
+
+        let shift = (ctrl & 0x1F) as u32;
+        let mask_lsb = ((ctrl >> 5) & 0x1F) as u32;
+        let mask_msb = ((ctrl >> 10) & 0x1F) as u32;
+        let signed = (ctrl >> 15) & 1 != 0;
+        let add_raw = (ctrl >> 18) & 1 != 0;
+        let clamp = which == 1 && lane == 0 && (ctrl >> 22) & 1 != 0;
+
+        // Raw → shifted (arithmetic shift when SIGNED).
+        let raw = accum0;
+        let shifted: u32 = if shift >= 32 {
+            if signed { ((raw as i32) >> 31) as u32 } else { 0 }
+        } else if signed {
+            ((raw as i32) >> shift) as u32
+        } else {
+            raw >> shift
+        };
+
+        // Mask to [mask_lsb..=mask_msb]. When SIGNED, sign-extend from mask_msb.
+        let mask: u64 = if mask_msb >= mask_lsb {
+            let hi = if mask_msb >= 31 {
+                0xFFFF_FFFFu64
+            } else {
+                (1u64 << (mask_msb + 1)) - 1
+            };
+            let lo = (1u64 << mask_lsb) - 1;
+            hi & !lo
+        } else {
+            0
+        };
+        let masked = (shifted as u64) & mask;
+        let mut value: u32 = if signed && mask_msb < 31 && mask_msb >= mask_lsb {
+            let sign_bit = 1u32 << mask_msb;
+            if (masked as u32) & sign_bit != 0 {
+                (masked as u32) | (!(mask as u32))
+            } else {
+                masked as u32
+            }
+        } else {
+            masked as u32
+        };
+
+        // Unused in simple lane path — ADD_RAW only affects POP's accumulator
+        // update, not the lane output itself.
+        let _ = add_raw;
+
+        // Lane output: masked + base[L], unless CLAMP suppresses.
+        if clamp {
+            let v_signed = value as i32;
+            let b0 = base0 as i32;
+            let b1 = base1 as i32;
+            value = if v_signed < b0 {
+                base0
+            } else if v_signed > b1 {
+                base1
+            } else {
+                value
+            };
+        } else {
+            value = value.wrapping_add(base_l);
+        }
+        value
+    }
+
+    fn interp_full_peek(&self, core: usize, which: usize) -> u32 {
+        // Datasheet §2.3.1.2: FULL = lane0_result + lane1_result + BASE2.
+        let lane0 = self.interp_lane_peek(core, which, 0);
+        let lane1 = self.interp_lane_peek(core, which, 1);
+        let base2 = self.interp_reg(core, which, 4);
+        lane0.wrapping_add(lane1).wrapping_add(base2)
     }
 
     // --- GPIO bulk helpers (RP2040 has 30 valid GPIOs) --------------------
@@ -627,5 +764,38 @@ mod tests {
         sio.write32(0x080, 0xBB, 1);
         assert_eq!(sio.read32(0x080, 0), 0xAA);
         assert_eq!(sio.read32(0x080, 1), 0xBB);
+    }
+
+    /// INTERP1 configured as a signed 16-bit clamp (the PicoGUS audio
+    /// mixer's use-case): SHIFT=14, SIGNED, CLAMP, BASE0=-32768, BASE1=+32767.
+    /// PEEK_LANE0 should clamp (accum0 >> 14) to the [-32768, 32767] range.
+    #[test]
+    fn interp1_signed_clamp_lane0() {
+        let mut sio = Sio::new();
+        // CTRL_LANE0 @ 0x0EC = SHIFT=14 | MASK_LSB=0 | MASK_MSB=17 | SIGNED | CLAMP.
+        sio.write32(0x0EC, 0x0040_C40E, 0);
+        sio.write32(0x0C8, 0xFFFF_8000, 0); // BASE0 = -32768
+        sio.write32(0x0CC, 0x0000_7FFF, 0); // BASE1 = +32767
+
+        // Small positive: accum0 = 100_000. (100_000 >> 14) = 6. In range.
+        sio.write32(0x0C0, 100_000, 0);
+        assert_eq!(sio.read32(0x0E0, 0) as i32, 6);
+
+        // Large positive: accum0 = 1_000_000_000. (>> 14) ≈ 61035. Clamp
+        // to +32767.
+        sio.write32(0x0C0, 1_000_000_000, 0);
+        assert_eq!(sio.read32(0x0E0, 0), 0x0000_7FFF);
+
+        // Large negative: accum0 = -1_000_000_000. Clamp to -32768.
+        sio.write32(0x0C0, (-1_000_000_000i32) as u32, 0);
+        assert_eq!(sio.read32(0x0E0, 0), 0xFFFF_8000);
+
+        // Small negative: accum0 = -100_000. (>> 14) = -7 (arith shift).
+        // In range; sign-extended to 32 bits.
+        sio.write32(0x0C0, (-100_000i32) as u32, 0);
+        assert_eq!(sio.read32(0x0E0, 0) as i32, -7);
+
+        // Per-core isolation: core 1 should be independent.
+        assert_eq!(sio.read32(0x0E0, 1), 0);
     }
 }

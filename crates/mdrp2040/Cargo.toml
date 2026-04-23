@@ -1,6 +1,6 @@
 [package]
 name = "mdrp2040"
-version = "0.15.2"
+version = "0.15.3"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
