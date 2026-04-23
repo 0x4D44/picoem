@@ -674,6 +674,21 @@ impl PioBlock {
                     occupancy = self.sm[3].tx_fifo.level(),
                     "txf_write",
                 );
+                if std::env::var("MDPIO_TXF_TRACE").is_ok() {
+                    static COUNTER: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    static MAX_VAL: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    MAX_VAL.fetch_max(val, std::sync::atomic::Ordering::Relaxed);
+                    if val != 0 || n < 5 || (n % 10000 == 0) {
+                        eprintln!(
+                            "[pio] sm=3 txf_write #{} val=0x{:08x} push_ok={} max_seen=0x{:08x}",
+                            n, val, ok,
+                            MAX_VAL.load(std::sync::atomic::Ordering::Relaxed)
+                        );
+                    }
+                }
             }
             // RXF0-3: read-only
             0x020..=0x02C => {}
@@ -931,7 +946,19 @@ impl PioBlock {
             _ => {}
         }
 
-        // SM_RESTART: self-clearing action (reset SM state)
+        // SM_RESTART: self-clearing action (reset SM state).
+        //
+        // Shift counters use the same "empty" convention as `StateMachine::new`:
+        //   - `isr_count = 0` → ISR empty, zero bits since last push.
+        //   - `osr_count = 32` → OSR "empty" (fully consumed), autopull fires on
+        //     the next OUT. Matches epio and real RP2040/RP2350: the SDK's
+        //     `pio_sm_init` calls `pio_sm_restart` immediately before
+        //     firmware pushes its first DMA byte, and the program assumes
+        //     the first OUT reads byte 1 via autopull (not OSR=0). The
+        //     rp2040-psram driver (`begin: out x, 8`) is the canonical
+        //     case — with `osr_count=0`, the first reset command
+        //     mis-aligns as `x=0`, `y=first_byte`, cascading across every
+        //     subsequent command and breaking PSRAM entirely.
         for i in 0..4 {
             if (sm_restart_bits >> i) & 1 != 0 {
                 self.sm[i].pc = 0;
@@ -940,7 +967,7 @@ impl PioBlock {
                 self.sm[i].isr = 0;
                 self.sm[i].osr = 0;
                 self.sm[i].isr_count = 0;
-                self.sm[i].osr_count = 0;
+                self.sm[i].osr_count = 32;
                 self.sm[i].delay_count = 0;
                 self.sm[i].stalled = false;
                 self.sm[i].pending_exec = None;
@@ -2245,6 +2272,664 @@ mod tests {
             0,
             "SET PINDIRS, 1 with SET_BASE=0 must drive pad_oe bit 0"
         );
+    }
+
+    // ====================================================================
+    // Branch-coverage top-up for `pio/mod.rs` — see Stage 4 of
+    // `wrk_docs/2026.04.23 - CC - Coverage Improvement Plan.md`.
+    // ====================================================================
+
+    /// DREQ helpers return false for out-of-range SM indices (line 258/268).
+    #[test]
+    fn dreq_helpers_reject_out_of_range_sm() {
+        let pio = PioBlock::new();
+        assert!(!pio.tx_dreq(4));
+        assert!(!pio.tx_dreq(100));
+        assert!(!pio.rx_dreq(4));
+        assert!(!pio.rx_dreq(100));
+        // In-range sanity: fresh SM has TX room and empty RX.
+        assert!(pio.tx_dreq(0));
+        assert!(!pio.rx_dreq(0)); // empty RX → no data to drain
+    }
+
+    /// `raw_intr_rp2040` / `raw_intr_rp2350`: exercise RXNEMPTY and TXNFULL
+    /// on each SM index so every loop iteration's branches are visited
+    /// (lines 192/195 and 214/217).
+    #[test]
+    fn raw_intr_covers_all_sm_fifo_states() {
+        let mut pio = PioBlock::new();
+        // SM0: RX has data. SM1: RX empty. SM2: TX full. SM3: TX empty.
+        assert!(pio.sm[0].rx_fifo.push(0xAA));
+        for _ in 0..4 {
+            assert!(pio.sm[2].tx_fifo.push(0));
+        }
+        let intr40 = pio.raw_intr_rp2040();
+        // RXNEMPTY at bits [7:4].
+        assert_ne!(intr40 & (1 << 4), 0, "SM0 RXNEMPTY");
+        assert_eq!(intr40 & (1 << 5), 0, "SM1 RX still empty");
+        // TXNFULL at bits [11:8].
+        assert_eq!(intr40 & (1 << 10), 0, "SM2 TX full → TXNFULL=0");
+        assert_ne!(intr40 & (1 << 11), 0, "SM3 TX has room → TXNFULL=1");
+
+        let intr35 = pio.raw_intr_rp2350();
+        // RP2350: RXNEMPTY at [3:0], TXNFULL at [7:4].
+        assert_ne!(intr35 & 0b0001, 0, "SM0 RXNEMPTY (RP2350)");
+        assert_eq!(intr35 & 0b0010, 0, "SM1 RX empty (RP2350)");
+        assert_eq!(intr35 & (1 << 6), 0, "SM2 TX full (RP2350)");
+        assert_ne!(intr35 & (1 << 7), 0, "SM3 TX has room (RP2350)");
+    }
+
+    /// `fstat` covers every RX-full and TX-full arm (lines 497/503) by
+    /// filling SM1's RX FIFO and SM3's TX FIFO.
+    #[test]
+    fn fstat_covers_rx_and_tx_full_arms() {
+        let mut pio = PioBlock::new();
+        for _ in 0..4 {
+            assert!(pio.sm[1].rx_fifo.push(0xAA));
+            assert!(pio.sm[3].tx_fifo.push(0xBB));
+        }
+        let fstat = pio.read32(0x004);
+        // RXFULL at bits [3:0] → SM1 bit set.
+        assert_ne!(fstat & (1 << 1), 0, "SM1 RXFULL");
+        // TXFULL at bits [19:16] → SM3 bit set.
+        assert_ne!(fstat & (1 << 19), 0, "SM3 TXFULL");
+        // Inverse RXEMPTY/TXEMPTY confirms the full arms fired.
+        assert_eq!(fstat & (1 << 9), 0, "SM1 RX not empty");
+        assert_eq!(fstat & (1 << 27), 0, "SM3 TX not empty");
+    }
+
+    /// `apply_fifo_join` FJOIN_RX branch (line 531): RX grows to depth 8,
+    /// TX shrinks to 0.
+    #[test]
+    fn apply_fifo_join_rx_grows_rx_depth() {
+        let mut pio = PioBlock::new();
+        // Set FJOIN_RX (bit 31) in SHIFTCTRL for SM0.
+        pio.write32(0x0D0, 1 << 31, 0);
+        // RX FIFO should now accept 8 values.
+        for v in 0..8u32 {
+            assert!(pio.sm[0].rx_fifo.push(v));
+        }
+        assert!(pio.sm[0].rx_fifo.is_full());
+        // TX FIFO is depth 0 — push drops.
+        assert!(!pio.sm[0].tx_fifo.push(0xDEAD));
+    }
+
+    /// `apply_fifo_join` default-arm (line 535): clearing FJOIN bits
+    /// restores 4/4 depth even if we previously set FJOIN_TX.
+    #[test]
+    fn apply_fifo_join_default_restores_balanced_depth() {
+        let mut pio = PioBlock::new();
+        // First force FJOIN_TX.
+        pio.write32(0x0D0, 1 << 30, 0);
+        for v in 0..8u32 {
+            assert!(pio.sm[0].tx_fifo.push(v));
+        }
+        // Now clear both FJOIN bits — apply_fifo_join runs the `else` arm.
+        pio.write32(0x0D0, 0, 0);
+        // Depth-4: two pushes OK, fifth drops.
+        for v in 0..4u32 {
+            assert!(pio.sm[0].tx_fifo.push(v));
+        }
+        assert!(!pio.sm[0].tx_fifo.push(99));
+        // RX depth also restored to 4.
+        for v in 0..4u32 {
+            assert!(pio.sm[0].rx_fifo.push(v));
+        }
+        assert!(!pio.sm[0].rx_fifo.push(99));
+    }
+
+    /// SHIFTCTRL alias write that doesn't change FJOIN: covers the
+    /// `old_join == new_join` false arm of line 846.
+    #[test]
+    fn shiftctrl_write_without_join_change_skips_apply_fifo_join() {
+        let mut pio = PioBlock::new();
+        // Set up FJOIN_TX initially.
+        pio.write32(0x0D0, 1 << 30, 0);
+        // Push 8 values (depth=8) and pop 3 so we can distinguish from
+        // a "flush-to-4" reset.
+        for v in 0..8u32 {
+            assert!(pio.sm[0].tx_fifo.push(v));
+        }
+        assert_eq!(pio.sm[0].tx_fifo.pop(), Some(0));
+        assert_eq!(pio.sm[0].tx_fifo.pop(), Some(1));
+        assert_eq!(pio.sm[0].tx_fifo.pop(), Some(2));
+        assert_eq!(pio.sm[0].tx_fifo.level(), 5);
+        // Write SHIFTCTRL with FJOIN_TX still set — no join change.
+        pio.write32(0x0D0, (1 << 30) | (1 << 17), 0);
+        // apply_fifo_join must NOT have been called (fifo not flushed).
+        assert_eq!(pio.sm[0].tx_fifo.level(), 5, "join-preserving write must not flush");
+    }
+
+    /// SMn_EXECCTRL read with SM stalled: bit 31 (EXEC_STALLED) must
+    /// reflect `stalled || delay > 0` (line 792 true arm).
+    #[test]
+    fn execctrl_read_shows_stalled_bit_when_sm_stalled() {
+        let mut pio = PioBlock::new();
+        // Force SM0 into a stalled state.
+        pio.sm[0].stalled = true;
+        let v = pio.read32(0x0CC); // SM0 EXECCTRL
+        assert_ne!(v & 0x8000_0000, 0, "EXEC_STALLED must appear when stalled");
+        // Clear stall, set delay_count>0 — still reports stalled.
+        pio.sm[0].stalled = false;
+        pio.sm[0].delay_count = 5;
+        let v = pio.read32(0x0CC);
+        assert_ne!(v & 0x8000_0000, 0, "EXEC_STALLED must appear when delaying");
+    }
+
+    /// Read / write of the per-SM ADDR register. ADDR is read-only so
+    /// the write path must not store (line 851 `{}` arm) and the read
+    /// returns the current PC.
+    #[test]
+    fn per_sm_addr_register_is_read_only_and_reports_pc() {
+        let mut pio = PioBlock::new();
+        pio.sm[0].pc = 9;
+        assert_eq!(pio.read32(0x0D4), 9, "SMn_ADDR reads current PC");
+        // Write to ADDR is a no-op (read-only).
+        pio.write32(0x0D4, 22, 0);
+        assert_eq!(pio.sm[0].pc, 9, "write to ADDR must be ignored");
+    }
+
+    /// Read of per-SM reserved region (reg = 0x18 would be out of
+    /// range; we use an offset whose `reg` lands inside 0x18 — but
+    /// since 0x0C8..=0x127 covers exactly 4 × 0x18, any offset
+    /// inside the range has `reg` in 0..0x18). For safety we exercise
+    /// the unaligned access directly: write32 with sm_offset % 0x18
+    /// landing on a reserved reg (the wildcard `_` arm) is not
+    /// possible via the public range — however, read/write of the
+    /// unmodeled 0x128..=0x168 range exercises the surrounding
+    /// wildcards.
+    #[test]
+    fn unmodeled_intblock_range_reads_zero_and_ignores_writes() {
+        let mut pio = PioBlock::new();
+        // 0x134 is inside the unmodeled `0x128..=0x168` range.
+        assert_eq!(pio.read32(0x134), 0);
+        pio.write32(0x134, 0xDEAD_BEEF, 0);
+        assert_eq!(pio.read32(0x134), 0);
+        // Out-of-range upper offset hits the wildcard `_ => 0`.
+        assert_eq!(pio.read32(0x200), 0);
+        // Wildcard write is a no-op.
+        pio.write32(0x200, 0xFFFF_FFFF, 0);
+        assert_eq!(pio.read32(0x200), 0);
+    }
+
+    /// CTRL write alias=1 (XOR) toggles selected SMs.
+    #[test]
+    fn ctrl_xor_alias_toggles_enable_bits() {
+        let mut pio = PioBlock::new();
+        // Enable SM0 and SM2 via plain write.
+        pio.write32(0x000, 0b0101, 0);
+        assert!(pio.sm[0].enabled);
+        assert!(!pio.sm[1].enabled);
+        assert!(pio.sm[2].enabled);
+        // XOR with 0b0011: flip SM0 and SM1.
+        pio.write32(0x000, 0b0011, 1);
+        assert!(!pio.sm[0].enabled, "XOR toggled SM0 off");
+        assert!(pio.sm[1].enabled, "XOR toggled SM1 on");
+        assert!(pio.sm[2].enabled, "SM2 untouched");
+    }
+
+    /// CTRL write alias=2 (SET/OR) enables selected SMs without
+    /// disturbing others.
+    #[test]
+    fn ctrl_set_alias_enables_indicated_sms() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x000, 0b0001, 0); // enable SM0
+        pio.write32(0x000, 0b0100, 2); // SET alias: add SM2 to enabled
+        assert!(pio.sm[0].enabled);
+        assert!(pio.sm[2].enabled);
+        assert!(!pio.sm[1].enabled);
+    }
+
+    /// CTRL write alias=3 (CLR) disables selected SMs only.
+    #[test]
+    fn ctrl_clr_alias_disables_indicated_sms() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x000, 0b1111, 0); // all four enabled
+        pio.write32(0x000, 0b1010, 3); // CLR SM1 and SM3
+        assert!(pio.sm[0].enabled);
+        assert!(!pio.sm[1].enabled);
+        assert!(pio.sm[2].enabled);
+        assert!(!pio.sm[3].enabled);
+    }
+
+    /// CTRL SM_RESTART sets per-SM restart on SMs 1..3 too (not just SM0).
+    /// Visits line 963 for each of bits 4..7 set in sm_restart_bits.
+    #[test]
+    fn ctrl_restart_clears_state_for_all_sms() {
+        let mut pio = PioBlock::new();
+        for i in 0..4 {
+            pio.sm[i].pc = 5;
+            pio.sm[i].x = 0xABCD;
+            pio.sm[i].y = 0xDEAD;
+            pio.sm[i].osr_count = 0;
+        }
+        // SM_RESTART bits [7:4] = all set.
+        pio.write32(0x000, 0xF0, 0);
+        for i in 0..4 {
+            assert_eq!(pio.sm[i].pc, 0);
+            assert_eq!(pio.sm[i].x, 0);
+            assert_eq!(pio.sm[i].y, 0);
+            assert_eq!(pio.sm[i].osr_count, 32, "osr_count reset to 32");
+        }
+    }
+
+    /// CTRL CLKDIV_RESTART bit: covers line 980 `clkdiv_restart_bits`
+    /// arm for each SM.
+    #[test]
+    fn ctrl_clkdiv_restart_clears_accumulator() {
+        let mut pio = PioBlock::new();
+        // Stuff non-zero accumulators.
+        for i in 0..4 {
+            pio.sm[i].clkdiv_acc = 0x1000 + i as u32;
+        }
+        // CLKDIV_RESTART bits [11:8] = all set.
+        pio.write32(0x000, 0xF00, 0);
+        for i in 0..4 {
+            assert_eq!(pio.sm[i].clkdiv_acc, 0, "SM{i} clkdiv_acc cleared");
+        }
+    }
+
+    /// `merge_pin_outputs` side-set path with SIDE_EN=1 (line 403) and
+    /// actual_ss_pins > 0 (line 408). Also exercises the side_pindir=1
+    /// direction arm (line 418) and the pad-change trace (line 436).
+    #[test]
+    fn merge_pin_outputs_side_en_and_side_pindir_arms() {
+        let mut pio = PioBlock::new();
+        // PINCTRL SM0: SIDESET_COUNT=2 (bits[31:29]=010), SIDESET_BASE=3
+        // (bits[14:10]=3).
+        pio.sm[0].pinctrl = (2u32 << 29) | (3u32 << 10);
+        pio.recompute_any_sideset();
+        // EXECCTRL: SIDE_EN=1 (bit 30), SIDE_PINDIR=1 (bit 29).
+        pio.sm[0].execctrl = (1u32 << 30) | (1u32 << 29);
+        // Pre-set sideset_dirs so the merge sees a non-zero overlay.
+        pio.sm[0].sideset_dirs = 0b11 << 3;
+        pio.set_sm_enabled(0, true);
+
+        pio.step(0);
+
+        // actual_ss_pins = SIDESET_COUNT - 1 = 1 when SIDE_EN=1. One pin
+        // at SIDESET_BASE=3 → bit 3 of pad_oe must be driven by
+        // sideset_dirs.
+        assert_ne!(pio.pad_oe & (1 << 3), 0, "SIDE_PINDIR=1 drives oe via sideset_dirs");
+    }
+
+    /// `merge_pin_outputs` SIDESET_COUNT=5 (max) side-set-value path hits
+    /// the actual_ss_pins >= 32 check falsely (path to line 413 else arm).
+    /// SIDESET_COUNT caps at 5, which never reaches 32, so the `>=32`
+    /// mask-arm is unreachable from the public API — we instead exercise
+    /// actual_ss_pins=3 side-value drive by encoding a MOV Y,Y with
+    /// side-set field = 0b101 into [12:8], so the instruction itself
+    /// puts 0b101 into sideset_pins[4:2] via apply_sideset and the
+    /// subsequent merge overlays it into pad_out.
+    #[test]
+    fn merge_pin_outputs_value_drive_with_multi_bit_sideset() {
+        let mut pio = PioBlock::new();
+        pio.sm[0].pinctrl = (3u32 << 29) | (2u32 << 10); // count=3, base=2
+        pio.recompute_any_sideset();
+        pio.sm[0].execctrl = 0; // SIDE_EN=0, SIDE_PINDIR=0
+        // MOV Y,Y (0xA042) with delay/sideset field [12:8] = 0b10100:
+        // delay_bits = 5-3 = 2, top 3 bits are the side-set value = 0b101,
+        // bottom 2 are the delay = 0b00 → field = 0b10100 = 0x14.
+        // insn = 0xA042 | (0x14 << 8) = 0xB442.
+        pio.instr_mem[0] = 0xB442;
+        pio.set_sm_enabled(0, true);
+
+        pio.step(0);
+
+        // Value-drive overlays side-set=0b101 into pad_out bits [4:2].
+        assert_eq!(
+            pio.pad_out & (0b111 << 2),
+            0b101 << 2,
+            "side-set bits 0b101 land at pad_out[4:2]"
+        );
+        // pad_oe untouched by value-drive side-set.
+        assert_eq!(pio.pad_oe, 0);
+    }
+
+    /// FDEBUG W1C / XOR / SET / CLR alias arms. Covers each alias match
+    /// arm of the FDEBUG dispatcher.
+    #[test]
+    fn fdebug_alias_arms() {
+        let mut pio = PioBlock::new();
+        pio.fdebug = 0xFF;
+        // alias=0 (W1C) → clear bits.
+        pio.write32(0x008, 0x0F, 0);
+        assert_eq!(pio.fdebug, 0xF0);
+        // alias=1 (XOR).
+        pio.write32(0x008, 0xAA, 1);
+        assert_eq!(pio.fdebug, 0xF0 ^ 0xAA);
+        // alias=2 (SET).
+        pio.fdebug = 0x10;
+        pio.write32(0x008, 0x0F, 2);
+        assert_eq!(pio.fdebug, 0x1F);
+        // alias=3 (CLR).
+        pio.fdebug = 0xFF;
+        pio.write32(0x008, 0x11, 3);
+        assert_eq!(pio.fdebug, 0xEE);
+    }
+
+    /// IRQ W1C / XOR / SET / CLR alias dispatcher (line 697–703).
+    #[test]
+    fn irq_flags_alias_arms() {
+        let mut pio = PioBlock::new();
+        pio.irq_flags = 0xFF;
+        pio.write32(0x030, 0x0F, 0); // W1C
+        assert_eq!(pio.irq_flags, 0xF0);
+        pio.write32(0x030, 0x33, 1); // XOR
+        assert_eq!(pio.irq_flags, 0xF0 ^ 0x33);
+        pio.irq_flags = 0;
+        pio.write32(0x030, 0x05, 2); // SET (OR)
+        assert_eq!(pio.irq_flags, 0x05);
+        pio.write32(0x030, 0x01, 3); // CLR
+        assert_eq!(pio.irq_flags, 0x04);
+    }
+
+    /// IRQ0_INTE / IRQ0_INTF / IRQ1_INTE / IRQ1_INTF alias dispatcher
+    /// (lines 729/731/733, 740/743/745, 753/755/757, 765/767/769).
+    #[test]
+    fn int_inte_intf_alias_arms() {
+        let mut pio = PioBlock::new();
+        // int0_inte
+        pio.write32(0x170, 0x00FF, 0); // plain
+        assert_eq!(pio.int0_inte, 0x00FF);
+        pio.write32(0x170, 0x00F0, 1); // XOR
+        assert_eq!(pio.int0_inte, 0x00FF ^ 0x00F0);
+        pio.write32(0x170, 0x0F00, 2); // SET
+        assert_eq!(pio.int0_inte & 0x0F00, 0x0F00);
+        pio.write32(0x170, 0x000F, 3); // CLR
+        assert_eq!(pio.int0_inte & 0x000F, 0);
+
+        // int0_intf through its own alias arms.
+        pio.write32(0x174, 0x0011, 0);
+        pio.write32(0x174, 0x0010, 1);
+        pio.write32(0x174, 0x1000, 2);
+        pio.write32(0x174, 0x0001, 3);
+
+        // int1_inte / int1_intf XOR / SET / CLR — identical shape.
+        pio.write32(0x17C, 0x1234, 0);
+        pio.write32(0x17C, 0x000F, 1);
+        pio.write32(0x17C, 0xF000, 2);
+        pio.write32(0x17C, 0x0004, 3);
+
+        pio.write32(0x180, 0x5678, 0);
+        pio.write32(0x180, 0x00FF, 1);
+        pio.write32(0x180, 0x0F00, 2);
+        pio.write32(0x180, 0x0010, 3);
+    }
+
+    /// INPUT_SYNC_BYPASS register round-trip (covers its read/write arms).
+    #[test]
+    fn input_sync_bypass_roundtrip() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x038, 0xDEAD_BEEF, 0);
+        assert_eq!(pio.read32(0x038), 0xDEAD_BEEF);
+    }
+
+    /// DBG_PADOUT / DBG_PADOE read-only arms: read returns current
+    /// pad state; writes ignored.
+    #[test]
+    fn dbg_padout_padoe_are_read_only() {
+        let mut pio = PioBlock::new();
+        pio.pad_out = 0x11;
+        pio.pad_oe = 0x22;
+        assert_eq!(pio.read32(0x03C), 0x11);
+        assert_eq!(pio.read32(0x040), 0x22);
+        pio.write32(0x03C, 0xFFFF_FFFF, 0);
+        pio.write32(0x040, 0xFFFF_FFFF, 0);
+        assert_eq!(pio.pad_out, 0x11, "DBG_PADOUT write ignored");
+        assert_eq!(pio.pad_oe, 0x22, "DBG_PADOE write ignored");
+    }
+
+    /// INT0_INTS / INT1_INTS are read-only (read computes, write is a no-op).
+    #[test]
+    fn ints_registers_are_read_only() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x170, 0xFFFF, 0); // enable everything
+        pio.irq_flags = 0x01; // set IRQ flag 0
+        // INTS computes (INTR & INTE) | INTF — with irq_flags bit 0 set and
+        // the RP2350 layout mapping IRQ flag 0 to bit 8 …
+        let ints0 = pio.read32(0x178);
+        assert_ne!(ints0 & 0x100, 0);
+        // Write ignored.
+        pio.write32(0x178, 0xDEAD, 0);
+        assert_eq!(pio.read32(0x178), ints0, "INTS read unchanged after write");
+    }
+
+    /// step_n runs multiple PIO cycles when SMs are enabled. Covers the
+    /// loop body (line 352) — the fast-path `if sm_enabled_mask == 0`
+    /// false arm. Slot 0 runs SET X, 1 and slot 1 is implicit JMP 0
+    /// (instr_mem default zero = JMP always to 0), so 10 cycles alternate.
+    #[test]
+    fn step_n_with_enabled_sm_runs_all_cycles() {
+        let mut pio = PioBlock::new();
+        pio.instr_mem[0] = 0xE021; // SET X, 1
+        pio.set_sm_enabled(0, true);
+        pio.step_n(10, 0);
+        assert_eq!(pio.sm[0].x, 1);
+        // 10 alternating cycles: slot 0 and slot 1 each visited 5 times.
+        assert_eq!(pio.sm[0].pc_visits[0], 5);
+        assert_eq!(pio.sm[0].pc_visits[1], 5);
+    }
+
+    /// TXF write to SM1/SM2 paths (lines 645/656) — the existing
+    /// `test_fifo_push_pop` only exercises SM0's 0x010.
+    #[test]
+    fn txf_push_through_every_sm_offset() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x010, 0x11, 0);
+        pio.write32(0x014, 0x22, 0);
+        pio.write32(0x018, 0x33, 0);
+        pio.write32(0x01C, 0x44, 0);
+        assert_eq!(pio.sm[0].tx_fifo.level(), 1);
+        assert_eq!(pio.sm[1].tx_fifo.level(), 1);
+        assert_eq!(pio.sm[2].tx_fifo.level(), 1);
+        assert_eq!(pio.sm[3].tx_fifo.level(), 1);
+        // And RXF read through each SM's offset.
+        pio.sm[1].rx_fifo.push(0xA1);
+        pio.sm[2].rx_fifo.push(0xA2);
+        pio.sm[3].rx_fifo.push(0xA3);
+        assert_eq!(pio.read32(0x024), 0xA1);
+        assert_eq!(pio.read32(0x028), 0xA2);
+        assert_eq!(pio.read32(0x02C), 0xA3);
+    }
+
+    /// Per-SM CLKDIV alias write: covers the alias-RMW branch on the
+    /// CLKDIV path.
+    #[test]
+    fn per_sm_clkdiv_alias_rmw() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x0C8, 0x0001_0000, 0); // SM0 CLKDIV = 1.0 (default)
+        pio.write32(0x0C8, 0x0002_0000, 1); // XOR int field → 1 ^ 2 = 3
+        assert_eq!(pio.read32(0x0C8), 0x0003_0000);
+    }
+
+    /// Per-SM INSTR alias write: force-executes the aliased result
+    /// (line 857 — write path covers `force_execute` from alias).
+    #[test]
+    fn per_sm_instr_alias_write_force_executes() {
+        let mut pio = PioBlock::new();
+        // Pre-condition last_insn so the XOR has something to RMW against.
+        pio.sm[0].last_insn = 0xE025; // SET X, 5
+        // XOR with 0 — insn stays 0xE025, force-executes SET X, 5.
+        pio.write32(0x0D8, 0, 1);
+        assert_eq!(pio.sm[0].x, 5);
+    }
+
+    /// `any_sm_enabled` returns false on a fresh block and true after
+    /// enabling an SM.
+    #[test]
+    fn any_sm_enabled_tracks_mask() {
+        let mut pio = PioBlock::new();
+        assert!(!pio.any_sm_enabled());
+        assert_eq!(pio.sm_enabled_mask(), 0);
+        pio.set_sm_enabled(2, true);
+        assert!(pio.any_sm_enabled());
+        assert_eq!(pio.sm_enabled_mask(), 0b0100);
+        pio.set_sm_enabled(2, false);
+        assert!(!pio.any_sm_enabled());
+    }
+
+    /// `set_sm_enabled` with `prev == enabled` short-circuits (no mask
+    /// change, no merge).
+    #[test]
+    fn set_sm_enabled_no_change_is_noop() {
+        let mut pio = PioBlock::new();
+        // Already disabled — setting disabled is a no-op.
+        pio.set_sm_enabled(0, false);
+        assert_eq!(pio.sm_enabled_mask(), 0);
+        pio.set_sm_enabled(0, true);
+        let mask_before = pio.sm_enabled_mask();
+        // Setting enabled again — no change.
+        pio.set_sm_enabled(0, true);
+        assert_eq!(pio.sm_enabled_mask(), mask_before);
+    }
+
+    /// `instr_mem` accessor returns the backing array.
+    #[test]
+    fn instr_mem_accessor_exposes_backing_array() {
+        let mut pio = PioBlock::new();
+        pio.instr_mem[7] = 0xBEEF;
+        assert_eq!(pio.instr_mem()[7], 0xBEEF);
+    }
+
+    /// Test-only helpers `push_rx` / `pop_tx` round-trip.
+    #[test]
+    fn push_rx_and_pop_tx_test_hooks() {
+        let mut pio = PioBlock::new();
+        assert!(pio.push_rx(1, 0xCAFE));
+        assert_eq!(pio.sm[1].rx_fifo.pop(), Some(0xCAFE));
+        pio.sm[2].tx_fifo.push(0xBABE);
+        assert_eq!(pio.pop_tx(2), Some(0xBABE));
+    }
+
+    /// Exercise every iteration of CTRL's per-SM read loop with a
+    /// mix of enabled states (covers each `self.sm[i].enabled` branch
+    /// at line 547 for i in 0..4).
+    #[test]
+    fn ctrl_read_visits_each_sm_enable_bit() {
+        let mut pio = PioBlock::new();
+        // Enable alternating: SM0, SM2 on; SM1, SM3 off.
+        pio.set_sm_enabled(0, true);
+        pio.set_sm_enabled(2, true);
+        assert_eq!(pio.read32(0x000) & 0xF, 0b0101);
+        // Flip: SM1, SM3 on; SM0, SM2 off.
+        pio.set_sm_enabled(0, false);
+        pio.set_sm_enabled(2, false);
+        pio.set_sm_enabled(1, true);
+        pio.set_sm_enabled(3, true);
+        assert_eq!(pio.read32(0x000) & 0xF, 0b1010);
+        // All on.
+        pio.set_sm_enabled(0, true);
+        pio.set_sm_enabled(2, true);
+        assert_eq!(pio.read32(0x000) & 0xF, 0b1111);
+    }
+
+    /// Read-only register reads that aren't exercised elsewhere:
+    /// covers the bare `=> self.field` match arms at offsets 0x008
+    /// (FDEBUG), 0x034 (IRQ_FORCE write-only → 0 read), 0x170/0x174/
+    /// 0x17C/0x180 (INTE/INTF registers), and 0x010..=0x01C (TXF
+    /// write-only → 0 read).
+    #[test]
+    fn read_only_and_write_only_offsets_round_trip() {
+        let mut pio = PioBlock::new();
+        pio.fdebug = 0x1234_5678;
+        pio.int0_inte = 0x0000_BEEF;
+        pio.int0_intf = 0x0000_F00D;
+        pio.int1_inte = 0x0000_CAFE;
+        pio.int1_intf = 0x0000_BABE;
+        assert_eq!(pio.read32(0x008), 0x1234_5678, "FDEBUG read");
+        assert_eq!(pio.read32(0x034), 0, "IRQ_FORCE reads as 0");
+        assert_eq!(pio.read32(0x170), 0x0000_BEEF, "int0_inte read");
+        assert_eq!(pio.read32(0x174), 0x0000_F00D, "int0_intf read");
+        assert_eq!(pio.read32(0x17C), 0x0000_CAFE, "int1_inte read");
+        assert_eq!(pio.read32(0x180), 0x0000_BABE, "int1_intf read");
+        // TXF read-only range returns 0.
+        for off in [0x010u32, 0x014, 0x018, 0x01C] {
+            assert_eq!(pio.read32(off), 0);
+        }
+        // Write to read-only offsets is a no-op.
+        let fstat_before = pio.read32(0x004);
+        pio.write32(0x004, 0xFFFF_FFFF, 0);
+        assert_eq!(pio.read32(0x004), fstat_before, "FSTAT is read-only");
+        let flevel_before = pio.read32(0x00C);
+        pio.write32(0x00C, 0xFFFF_FFFF, 0);
+        assert_eq!(pio.read32(0x00C), flevel_before, "FLEVEL is read-only");
+        // INTR / INTS are read-only.
+        let intr_before = pio.read32(0x16C);
+        pio.write32(0x16C, 0, 0);
+        assert_eq!(pio.read32(0x16C), intr_before, "INTR is read-only");
+        let ints_before = pio.read32(0x178);
+        pio.write32(0x178, 0, 0);
+        assert_eq!(pio.read32(0x178), ints_before, "INT0_INTS is read-only");
+        let ints1_before = pio.read32(0x184);
+        pio.write32(0x184, 0, 0);
+        assert_eq!(pio.read32(0x184), ints1_before, "INT1_INTS is read-only");
+    }
+
+    /// RXF read drains per-SM RX FIFOs for each SM offset (0x020..=0x02C).
+    /// Existing tests only exercise SM0's 0x020 and SM3's implicitly —
+    /// this round-trips each of SM1 and SM2 via their offsets.
+    #[test]
+    fn rxf_read_drains_per_sm_fifo_offsets() {
+        let mut pio = PioBlock::new();
+        assert!(pio.sm[1].rx_fifo.push(0xB1));
+        assert!(pio.sm[2].rx_fifo.push(0xB2));
+        assert_eq!(pio.read32(0x024), 0xB1);
+        assert_eq!(pio.read32(0x028), 0xB2);
+        // Empty FIFO drains to 0.
+        assert_eq!(pio.read32(0x024), 0);
+        assert_eq!(pio.read32(0x028), 0);
+    }
+
+    /// `step` on an idle block (sm_enabled_mask==0) short-circuits (line
+    /// 323 true arm). Complements the step_n variant which short-circuits
+    /// at its own guard and never calls `step`.
+    #[test]
+    fn step_on_idle_block_short_circuits() {
+        let mut pio = PioBlock::new();
+        let pad_before = pio.pad_out;
+        pio.step(0);
+        assert_eq!(pio.pad_out, pad_before, "idle step is a no-op");
+    }
+
+    /// `merge_pin_outputs` with SIDE_EN=1 and SIDESET_COUNT=1: actual_ss_pins
+    /// collapses to 0, so the inner write block (line 408 false arm) is
+    /// skipped.
+    #[test]
+    fn merge_pin_outputs_side_en_collapses_to_zero_pins() {
+        let mut pio = PioBlock::new();
+        // PINCTRL: SIDESET_COUNT=1 (bits[31:29]=001).
+        pio.sm[0].pinctrl = 1u32 << 29;
+        pio.recompute_any_sideset();
+        // EXECCTRL: SIDE_EN=1 (bit 30), SIDE_PINDIR=0.
+        pio.sm[0].execctrl = 1u32 << 30;
+        pio.set_sm_enabled(0, true);
+        // Run one step — any_sideset_programmed takes us down the
+        // per-SM loop; for SM0 actual_ss_pins = 1-1 = 0 → inner block
+        // skipped. For SM1..3 ss_count==0 → also skipped. pad_out/pad_oe
+        // fall back to shared latches (0).
+        pio.step(0);
+        // shared_pin_values resets to u32::MAX (weak-pullup); with no
+        // side-set overlay, pad_out mirrors that default.
+        assert_eq!(pio.pad_out, u32::MAX, "pad_out passes through shared_pin_values");
+        assert_eq!(pio.pad_oe, 0, "no PINDIRS ever set, oe stays clear");
+    }
+
+    /// int0_ints_rp2040 / int1_ints_rp2040 surface the (INTR & INTE) | INTF
+    /// computation for the RP2040 layout.
+    #[test]
+    fn int_ints_rp2040_layout_computes_from_inte_intf() {
+        let mut pio = PioBlock::new();
+        // IRQ flag 0 set → RP2040 INTR bit 0.
+        pio.write32(0x034, 0x01, 0); // IRQ_FORCE
+        pio.int0_inte = 0x001;
+        pio.int0_intf = 0x002;
+        let v0 = pio.int0_ints_rp2040();
+        assert_eq!(v0 & 0x003, 0x003, "bit 0 via INTE, bit 1 via INTF");
+        pio.int1_inte = 0x004;
+        pio.int1_intf = 0x008;
+        let v1 = pio.int1_ints_rp2040();
+        assert_eq!(v1 & 0x008, 0x008, "INTF sets bit 3 on IRQ1 line");
     }
 
     #[test]

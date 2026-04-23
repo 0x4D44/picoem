@@ -202,6 +202,24 @@ impl StateMachine {
         self.rx_fifo.is_empty()
     }
 
+    /// Diagnostic: number of words currently in this SM's RX FIFO (0..4
+    /// for unmerged, 0..8 for merged). Used by the PicoGUS harness to
+    /// apply bus-cycle backpressure when the PIO's ISA-IOW capture
+    /// FIFO is approaching full — real hardware asserts IOCHRDY low at
+    /// that point; the harness doesn't model IOCHRDY feedback, so it
+    /// polls this instead.
+    pub fn rx_fifo_level(&self) -> u8 {
+        self.rx_fifo.level()
+    }
+
+    /// Cumulative count of `push` calls that found the RX FIFO full and
+    /// dropped the value. Non-zero means the PIO autopushed faster than
+    /// the CPU could drain — in the PicoGUS context this is the ISA
+    /// bus-cycle "IOCHRDY should have been asserted" moment.
+    pub fn rx_fifo_drops(&self) -> u64 {
+        self.rx_fifo.push_drop
+    }
+
     /// Diagnostic: number of successful TX FIFO pushes (FIFO had room).
     /// Pure observation; never read by execution. Surfaced by the
     /// PicoGUS DMA-dispatch diagnostic to confirm DMA→TXF actually
@@ -664,7 +682,37 @@ impl StateMachine {
     }
 
     /// IN instruction.
+    ///
+    /// Per RP2040 datasheet §3.5.4: an IN instruction with autopush
+    /// enabled must STALL before shifting when there is a pending
+    /// autopush (`isr_count >= threshold`) and the RX FIFO is full.
+    /// Shifting while stalled would destroy the per-byte alignment the
+    /// consumer (DMA, blocking CPU reads) depends on, silently dropping
+    /// data. Earlier revisions retained ISR without stalling — good for
+    /// one-shot tests, fatal for the rp2040-psram SPI driver which
+    /// starves its `dma_channel_wait_for_finish_blocking` because DMA
+    /// only ever gets one 32-bit word instead of N discrete bytes.
     fn exec_in(&mut self, source: u8, bit_count: u8, gpio_in: u32) {
+        // Pending autopush check BEFORE shifting: if the ISR already
+        // holds >= threshold bits, flush it to RX now. A full RX FIFO
+        // stalls this instruction (real-HW back-pressure); the stall
+        // resolves when a consumer drains RX.
+        if self.is_autopush_enabled() {
+            let threshold = self.push_threshold();
+            if self.isr_count >= threshold {
+                if self.rx_fifo.is_full() {
+                    self.stalled = true;
+                    self.stall_kind = StallKind::Push;
+                    return;
+                }
+                self.rx_fifo.push(self.isr);
+                self.last_autopush_word = self.isr;
+                self.isr = 0;
+                self.isr_count = 0;
+                self.autopush_count = self.autopush_count.wrapping_add(1);
+            }
+        }
+
         let in_shiftdir_right = (self.shiftctrl >> 18) & 1 != 0;
 
         let src_val = match source {
@@ -696,21 +744,19 @@ impl StateMachine {
 
         self.isr_count = (self.isr_count + bit_count).min(32);
 
-        // Autopush: push ISR to RX FIFO when threshold reached
+        // Post-shift autopush: if this IN just pushed the ISR over the
+        // threshold AND the RX FIFO has room, push immediately.
+        // (The pre-shift pending-autopush check handles the
+        // threshold-already-reached case — this arm handles threshold
+        // freshly reached on this instruction.)
         if self.is_autopush_enabled() {
             let threshold = self.push_threshold();
-            if self.isr_count >= threshold {
-                if !self.rx_fifo.is_full() {
-                    self.rx_fifo.push(self.isr);
-                    // Mirror the just-pushed word for downstream
-                    // diagnostics. Paired with `autopush_count`; stays
-                    // unchanged when the FIFO is full (no bump).
-                    self.last_autopush_word = self.isr;
-                    self.isr = 0;
-                    self.isr_count = 0;
-                    self.autopush_count = self.autopush_count.wrapping_add(1);
-                }
-                // If RX FIFO is full, ISR retains its value (no stall for autopush)
+            if self.isr_count >= threshold && !self.rx_fifo.is_full() {
+                self.rx_fifo.push(self.isr);
+                self.last_autopush_word = self.isr;
+                self.isr = 0;
+                self.isr_count = 0;
+                self.autopush_count = self.autopush_count.wrapping_add(1);
             }
         }
     }
@@ -1155,5 +1201,829 @@ mod tests {
         assert_eq!(sm.pc, 1, "PC must advance past the JMP, not jump to 5");
         assert_eq!(sm.pc_visits[0], 1);
         assert_eq!(sm.pc_visits[5], 0, "target slot 5 must not have been visited");
+    }
+
+    // ====================================================================
+    // Branch-coverage top-up: tests targeting each of the uncovered arms
+    // listed in `2026.04.23 - CC - Coverage Improvement Plan.md` Stage 4.
+    // ====================================================================
+
+    /// Covers `clock_tick` with `clkdiv_int == 0` (threshold=256): this is
+    /// the documented "divide-by-256" fast-path used by firmware that
+    /// programs a zero integer divisor.
+    #[test]
+    fn clock_tick_treats_int_zero_as_256() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        sm.clkdiv_int = 0;
+        sm.clkdiv_frac = 0;
+        // With threshold=256 and +256 per tick, every call returns true.
+        for _ in 0..4 {
+            assert!(sm.clock_tick());
+        }
+    }
+
+    /// Covers the `enabled = false` short-circuit in `clock_tick`.
+    #[test]
+    fn clock_tick_returns_false_when_disabled() {
+        let mut sm = StateMachine::new();
+        assert!(!sm.enabled);
+        assert!(!sm.clock_tick());
+    }
+
+    /// Covers `clock_tick` with `clkdiv_acc < threshold` (false arm
+    /// returning false without advance).
+    #[test]
+    fn clock_tick_below_threshold_returns_false() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        sm.clkdiv_int = 2;
+        sm.clkdiv_frac = 0;
+        // First tick: acc goes 0→256 < 512, returns false.
+        assert!(!sm.clock_tick());
+        // Second tick: acc 256→512 >= 512, returns true.
+        assert!(sm.clock_tick());
+    }
+
+    /// Covers the `fetched_pc == 0x19` arm in the stalled-cycle counter
+    /// (line 327). Freshly stalled at pc=0x19 must bump
+    /// `cycles_stalled_at_pc_0x19`.
+    #[test]
+    fn stall_at_pc_0x19_bumps_dedicated_counter() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        sm.pc = 0x19;
+        let mut instr_mem = [0u16; 32];
+        // PULL block (0x80A0) at slot 0x19; TX FIFO empty → stall.
+        instr_mem[0x19] = 0x80A0;
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // First cycle: execute, stall kind set, counter bumps for
+        // "freshly-stalled-this-cycle" branch (line 388).
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(sm.stalled);
+        assert_eq!(sm.cycles_stalled_at_pc_0x19, 1);
+        assert_eq!(sm.stall_cycles, 1);
+        // Second cycle: `check_stall` path re-evaluates and stays stalled
+        // — bumps via line 327 branch.
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.cycles_stalled_at_pc_0x19, 2);
+        assert_eq!(sm.stall_cycles, 2);
+    }
+
+    /// JMP Y-- with Y!=0 must jump AND decrement (line 612 `was_nonzero`
+    /// branch). Mirror of the X-- test but exercising the Y arm's
+    /// decrement path directly.
+    #[test]
+    fn jmp_y_minus_minus_with_y_nonzero_decrements_and_takes_jump() {
+        let mut sm = StateMachine::new();
+        sm.y = 5;
+        // cond=4 (Y--), address=3 → take and decrement
+        let taken = sm.exec_jmp(4, 3, 0);
+        assert!(taken);
+        assert_eq!(sm.y, 4);
+        assert_eq!(sm.pc, 3);
+    }
+
+    /// `apply_sideset` with SIDE_EN=1 and SIDESET_COUNT=1 collapses to
+    /// `actual_pins == 0` (one bit is the enable, zero left for value).
+    /// Covers lines 471 (`side_en` true arm) and 476 (early-return).
+    #[test]
+    fn sideset_side_en_one_count_one_is_enable_only() {
+        let mut sm = StateMachine::new();
+        // PINCTRL: SIDESET_COUNT=1 at bits[31:29].
+        sm.pinctrl = 1u32 << 29;
+        // EXECCTRL: SIDE_EN=1 at bit 30.
+        sm.execctrl = 1u32 << 30;
+        let mut instr_mem = [0u16; 32];
+        // NOP (MOV Y,Y = 0xA042) with delay/sideset field high bit=1
+        // enabling the side-set. With count=1 and enable=1 there is
+        // zero value-bit side-set → apply_sideset hits the early return.
+        // delay_bits=5-1=4, field = [1 0000] = 0x10.
+        instr_mem[0] = 0xA042 | 0x1000; // insert 0x10 into [12:8]
+        let before_pins = sm.sideset_pins;
+        let before_dirs = sm.sideset_dirs;
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.enabled = true;
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        // actual_pins=0 → the early-return path touches nothing.
+        assert_eq!(sm.sideset_pins, before_pins);
+        assert_eq!(sm.sideset_dirs, before_dirs);
+    }
+
+    /// Side-set with SIDE_PINDIR=1 writes to `sideset_dirs` (line 481).
+    #[test]
+    fn sideset_with_side_pindir_updates_sideset_dirs() {
+        let mut sm = StateMachine::new();
+        // PINCTRL: SIDESET_COUNT=1, SIDESET_BASE=4.
+        sm.pinctrl = (1u32 << 29) | (4u32 << 10);
+        // EXECCTRL: SIDE_PINDIR=1 (bit 29).
+        sm.execctrl = 1u32 << 29;
+        let decoded = crate::pio::decode::decode(
+            // MOV Y,Y + side=1, no delay. delay_bits=4, field=[1 0000]=0x10.
+            0xA042 | 0x1000,
+            sm.pinctrl,
+            sm.execctrl,
+        );
+        sm.apply_sideset(&decoded);
+        assert_ne!(sm.sideset_dirs & (1 << 4), 0, "sideset_dirs bit 4 set");
+        assert_eq!(sm.sideset_pins, u32::MAX, "sideset_pins untouched");
+    }
+
+    /// `write_pin_field` with count==0 early-returns (line 495).
+    /// Also exercises the count==32 branch (line 498 `u32::MAX`) via the
+    /// public OUT/MOV PINS paths below in `out_mov_pins_count_ge_32`.
+    #[test]
+    fn write_pin_field_count_zero_is_noop() {
+        let mut sm = StateMachine::new();
+        // PINCTRL: SET_COUNT=0 → SET PINS writes nothing.
+        sm.pinctrl = 0;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // SET PINS, 0x1F with SET_COUNT=0: the inner write_pin_field
+        // takes the count==0 early-return.
+        sm.exec_set(0, 0x1F, &mut pins, &mut dirs);
+        assert_eq!(pins, 0);
+        assert_eq!(dirs, 0);
+    }
+
+    /// `pull_threshold` returning 32 for stored-value=0 (line 517 true
+    /// arm), and the same for `push_threshold` (line 533 true arm).
+    #[test]
+    fn pull_and_push_thresholds_treat_zero_as_32() {
+        // Default shiftctrl is 0x000C_0000 → pull_threshold/push_threshold
+        // fields are both zero which must mean 32.
+        let sm = StateMachine::new();
+        assert_eq!(sm.pull_threshold(), 32);
+        assert_eq!(sm.push_threshold(), 32);
+    }
+
+    /// `pull_threshold` and `push_threshold` return the stored value
+    /// when non-zero (line 517/533 false arm).
+    #[test]
+    fn pull_and_push_thresholds_pass_through_nonzero_value() {
+        let mut sm = StateMachine::new();
+        // pull_threshold field is bits [29:25]; push_threshold is [24:20].
+        sm.shiftctrl = (7u32 << 25) | (11u32 << 20);
+        assert_eq!(sm.pull_threshold(), 7);
+        assert_eq!(sm.push_threshold(), 11);
+    }
+
+    /// WAIT PIN (source=1) with pin low stalls (line 659 if-block).
+    #[test]
+    fn wait_pin_source_one_stalls_when_pin_low() {
+        let mut sm = StateMachine::new();
+        // IN_BASE at bits[19:15] in PINCTRL; keep at 0 so pin index is
+        // absolute.
+        sm.pinctrl = 0;
+        let mut irq = 0u8;
+        // Wait polarity=1, source=PIN (1), index=3 with gpio_in=0 → stall.
+        sm.exec_wait(true, 1, 3, &mut irq, 0);
+        assert!(sm.stalled);
+        match sm.stall_kind {
+            StallKind::WaitPin { polarity, index } => {
+                assert!(polarity);
+                assert_eq!(index, 3);
+            }
+            _ => panic!("expected WaitPin"),
+        }
+        // Now unstall by providing pin high and re-evaluating.
+        sm.stalled = false;
+        sm.stall_kind = StallKind::None;
+        sm.exec_wait(true, 1, 3, &mut irq, 1 << 3);
+        assert!(!sm.stalled);
+    }
+
+    /// WAIT IRQ (source=2) with flag mismatch stalls (line 668 else arm).
+    #[test]
+    fn wait_irq_source_two_stalls_when_condition_unmet() {
+        let mut sm = StateMachine::new();
+        let mut irq = 0u8;
+        // Waiting for IRQ 3 to be SET while it is clear → stall.
+        sm.exec_wait(true, 2, 3, &mut irq, 0);
+        assert!(sm.stalled);
+        match sm.stall_kind {
+            StallKind::WaitIrq { polarity, index } => {
+                assert!(polarity);
+                assert_eq!(index, 3);
+            }
+            _ => panic!("expected WaitIrq"),
+        }
+        // IRQ flag reset so we can confirm the matching path auto-clears
+        // the flag without stalling.
+        sm.stalled = false;
+        sm.stall_kind = StallKind::None;
+        irq = 1 << 3;
+        sm.exec_wait(true, 2, 3, &mut irq, 0);
+        assert!(!sm.stalled);
+        assert_eq!(irq & (1 << 3), 0, "match arm auto-clears IRQ");
+    }
+
+    /// WAIT source 3 (JMPPIN stub on RP2350) is a NOP (covers the
+    /// wildcard `_` arm of `exec_wait`).
+    #[test]
+    fn wait_source_three_is_nop() {
+        let mut sm = StateMachine::new();
+        let mut irq = 0u8;
+        sm.exec_wait(true, 3, 0, &mut irq, 0);
+        assert!(!sm.stalled);
+    }
+
+    /// IN with autopush enabled, ISR already at threshold, RX FIFO full →
+    /// stall before shift (covers lines 700/702/703 pre-shift autopush).
+    #[test]
+    fn in_with_pending_autopush_and_full_fifo_stalls() {
+        let mut sm = StateMachine::new();
+        // Autopush on, threshold=8.
+        sm.shiftctrl = (1u32 << 16) | (8u32 << 20);
+        sm.isr = 0xFF;
+        sm.isr_count = 8; // already at threshold
+        // Fill RX FIFO.
+        for v in 0..4u32 {
+            assert!(sm.rx_fifo.push(v));
+        }
+        sm.exec_in(1, 4, 0);
+        assert!(sm.stalled, "must stall on pending autopush + full FIFO");
+        match sm.stall_kind {
+            StallKind::Push => {}
+            _ => panic!("expected Push stall"),
+        }
+        // ISR untouched (stall happens BEFORE shifting).
+        assert_eq!(sm.isr, 0xFF);
+        assert_eq!(sm.isr_count, 8);
+    }
+
+    /// IN with bit_count >= 32 shift-right path: ISR replaced entirely
+    /// (covers line 729 `bc >= 32` data path, 733 shift-right bc>=32,
+    /// 734 post-write bc<32 branch via a second cycle at bc=16).
+    #[test]
+    fn in_shift_right_bit_count_32_replaces_isr() {
+        let mut sm = StateMachine::new();
+        // IN_SHIFTDIR=right (bit 18 set).
+        sm.shiftctrl = 1u32 << 18;
+        sm.x = 0xDEAD_BEEF;
+        // IN X, 32 — src=1, bc=32.
+        sm.exec_in(1, 32, 0);
+        assert_eq!(sm.isr, 0xDEAD_BEEF, "shift-right with bc=32 replaces ISR");
+        assert_eq!(sm.isr_count, 32);
+    }
+
+    /// IN shift-left with bit_count==32 clears then ORs full value
+    /// (covers line 741 `bc >= 32` left-shift branch).
+    #[test]
+    fn in_shift_left_bit_count_32_replaces_isr() {
+        let mut sm = StateMachine::new();
+        // IN_SHIFTDIR=left (bit 18 clear — default).
+        sm.shiftctrl = 0;
+        sm.x = 0x1234_5678;
+        sm.exec_in(1, 32, 0);
+        assert_eq!(sm.isr, 0x1234_5678);
+        assert_eq!(sm.isr_count, 32);
+    }
+
+    /// IN with fresh post-shift autopush on a non-full FIFO (covers
+    /// lines 752/754 post-shift autopush arms).
+    #[test]
+    fn in_post_shift_autopush_fires_when_threshold_reached() {
+        let mut sm = StateMachine::new();
+        // Autopush on, threshold=8, shift-left.
+        sm.shiftctrl = (1u32 << 16) | (8u32 << 20);
+        sm.x = 0xAA;
+        sm.exec_in(1, 8, 0);
+        assert_eq!(sm.isr_count, 0, "cleared after autopush");
+        assert_eq!(sm.autopush_count, 1);
+        assert_eq!(sm.last_autopush_word, 0xAA);
+    }
+
+    /// OUT with autopull + empty TX FIFO stalls (covers line 775 empty
+    /// arm and line 782 stall).
+    #[test]
+    fn out_autopull_empty_fifo_stalls() {
+        let mut sm = StateMachine::new();
+        // Autopull on (bit 17).
+        sm.shiftctrl = 1u32 << 17;
+        sm.osr_count = 32; // exhausted
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        let pc_set = sm.exec_out(3, 8, &mut pins, &mut dirs); // OUT NULL, 8
+        assert!(!pc_set);
+        assert!(sm.stalled);
+        match sm.stall_kind {
+            StallKind::Pull => {}
+            _ => panic!("expected Pull stall"),
+        }
+    }
+
+    /// OUT bit_count=32 shift-right (line 794 bc>=32 data path, line 795
+    /// OSR cleared).
+    #[test]
+    fn out_shift_right_bit_count_32_clears_osr() {
+        let mut sm = StateMachine::new();
+        // Shift-right (bit 19 set).
+        sm.shiftctrl = 1u32 << 19;
+        sm.osr = 0xF00D_D00D;
+        sm.osr_count = 0;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // OUT NULL, 32 → src=3, bc=32.
+        sm.exec_out(3, 32, &mut pins, &mut dirs);
+        assert_eq!(sm.osr, 0);
+        assert_eq!(sm.osr_count, 32);
+    }
+
+    /// OUT bit_count=32 shift-left (line 799 bc>=32 data path, line 800
+    /// OSR cleared).
+    #[test]
+    fn out_shift_left_bit_count_32_clears_osr() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 0; // shift-left
+        sm.osr = 0xF00D_D00D;
+        sm.osr_count = 0;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_out(3, 32, &mut pins, &mut dirs);
+        assert_eq!(sm.osr, 0);
+        assert_eq!(sm.osr_count, 32);
+    }
+
+    /// OUT PC (destination=5) sets PC directly and returns true (covers
+    /// `pc_set = destination == 5` return plus the `5 => self.pc = …` arm).
+    #[test]
+    fn out_pc_sets_pc_and_signals_pc_set() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 1u32 << 19; // shift-right
+        sm.osr = 0x0000_0007;
+        sm.osr_count = 0;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        let pc_set = sm.exec_out(5, 8, &mut pins, &mut dirs);
+        assert!(pc_set);
+        assert_eq!(sm.pc, 7);
+    }
+
+    /// OUT EXEC (destination=7) latches `pending_exec`.
+    #[test]
+    fn out_exec_latches_pending_exec() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 1u32 << 19;
+        sm.osr = 0x0000_ABCD;
+        sm.osr_count = 0;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_out(7, 16, &mut pins, &mut dirs);
+        assert_eq!(sm.pending_exec, Some(0xABCD));
+    }
+
+    /// PUSH into a full RX FIFO with `if_full=true` is a no-op (line 845
+    /// if_full=true arm after the FIFO-full check).
+    #[test]
+    fn push_if_full_on_full_fifo_is_noop() {
+        let mut sm = StateMachine::new();
+        for v in 0..4u32 {
+            assert!(sm.rx_fifo.push(v));
+        }
+        sm.isr = 0x9999;
+        sm.isr_count = 32;
+        sm.exec_push(true, true); // if_full=true, block=true
+        assert!(!sm.stalled);
+        assert_eq!(sm.isr, 0x9999, "ISR untouched on if_full no-op");
+        assert_eq!(sm.isr_count, 32);
+    }
+
+    /// PUSH blocking into a full RX FIFO stalls (line 850 block arm).
+    #[test]
+    fn push_block_on_full_fifo_stalls() {
+        let mut sm = StateMachine::new();
+        for v in 0..4u32 {
+            assert!(sm.rx_fifo.push(v));
+        }
+        sm.isr = 0x1;
+        sm.isr_count = 32;
+        sm.exec_push(false, true); // if_full=false, block=true
+        assert!(sm.stalled);
+        match sm.stall_kind {
+            StallKind::Push => {}
+            _ => panic!("expected Push stall"),
+        }
+    }
+
+    /// PUSH non-blocking non-if_full into a full FIFO silently drops
+    /// (covers the fall-through after lines 845/850).
+    #[test]
+    fn push_nonblock_not_if_full_drops_on_full_fifo() {
+        let mut sm = StateMachine::new();
+        for v in 0..4u32 {
+            assert!(sm.rx_fifo.push(v));
+        }
+        sm.isr = 0xDEAD;
+        sm.isr_count = 32;
+        sm.exec_push(false, false); // nonblocking, not if_full → drop
+        assert!(!sm.stalled, "non-blocking push must not stall");
+        // FIFO drop counter bumped; ISR still cleared (PUSH always clears).
+        assert_eq!(sm.rx_fifo.push_drop, 1);
+        assert_eq!(sm.isr, 0);
+    }
+
+    /// PULL on empty TX FIFO with `if_empty=true` copies X into OSR
+    /// (line 865 → 866 if_empty arm).
+    #[test]
+    fn pull_if_empty_copies_x_to_osr() {
+        let mut sm = StateMachine::new();
+        sm.x = 0xFEED_FACE;
+        sm.exec_pull(true, true); // if_empty=true, block=true
+        assert_eq!(sm.osr, 0xFEED_FACE);
+        assert_eq!(sm.osr_count, 0);
+        assert!(!sm.stalled);
+    }
+
+    /// PULL blocking on empty FIFO stalls (line 872 block arm).
+    #[test]
+    fn pull_block_on_empty_fifo_stalls() {
+        let mut sm = StateMachine::new();
+        sm.exec_pull(false, true); // not if_empty, blocking, empty FIFO
+        assert!(sm.stalled);
+        match sm.stall_kind {
+            StallKind::Pull => {}
+            _ => panic!("expected Pull stall"),
+        }
+    }
+
+    /// MOV src=PINS with IN_COUNT == 0 (line 902 true arm — count zero
+    /// means "use full 32-bit read").
+    #[test]
+    fn mov_src_pins_in_count_zero_passes_full_32_bits() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 0; // IN_COUNT at bits[4:0] = 0 → full width
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // MOV Y, PINS (dst=Y=2, op=none=0, src=PINS=0) — value from gpio_in.
+        sm.exec_mov(2, 0, 0, 0xFFFF_FFFF, &mut pins, &mut dirs);
+        assert_eq!(sm.y, 0xFFFF_FFFF);
+    }
+
+    /// MOV src=PINS with IN_COUNT >= 32 (line 902 or-arm — 32 also
+    /// passes full width).
+    #[test]
+    fn mov_src_pins_in_count_32_passes_full_width() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 32; // IN_COUNT = 32 hits the `in_count >= 32` arm
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_mov(2, 0, 0, 0xFFFF_FFFF, &mut pins, &mut dirs);
+        assert_eq!(sm.y, 0xFFFF_FFFF);
+    }
+
+    /// MOV src=PINS with 0 < IN_COUNT < 32 (the `else` arm — masks).
+    #[test]
+    fn mov_src_pins_in_count_masks_to_bit_width() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 4; // IN_COUNT=4 → mask to low 4 bits
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_mov(2, 0, 0, 0xFFFF_FFFF, &mut pins, &mut dirs);
+        assert_eq!(sm.y, 0xF);
+    }
+
+    /// MOV src=STATUS — both RX and TX level paths (line 914 status_sel
+    /// true/false arms), and level-below vs at/above threshold (line 919).
+    #[test]
+    fn mov_src_status_rx_tx_and_level_compare() {
+        let mut sm = StateMachine::new();
+        // STATUS_SEL=0 (TX level), STATUS_N=1.
+        sm.execctrl = 1; // STATUS_N=1, STATUS_SEL=0 (bit 4 clear)
+        // TX FIFO empty (level=0), level < 1 → STATUS = 0xFFFFFFFF.
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_mov(2, 0, 5, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.y, u32::MAX, "TX empty: level<N → all-ones");
+        // Fill TX FIFO so level >= N → STATUS = 0.
+        sm.tx_fifo.push(0);
+        sm.exec_mov(2, 0, 5, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.y, 0, "TX level>=N → zero");
+        // STATUS_SEL=1 (RX level).
+        sm.execctrl = (1u32 << 4) | 1; // STATUS_SEL=1, STATUS_N=1
+        // RX empty.
+        sm.exec_mov(2, 0, 5, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.y, u32::MAX, "RX empty: level<N → all-ones");
+        sm.rx_fifo.push(0);
+        sm.exec_mov(2, 0, 5, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.y, 0, "RX level>=N → zero");
+    }
+
+    /// MOV destination = EXEC (dst=4) latches pending_exec.
+    #[test]
+    fn mov_dst_exec_latches_pending_exec() {
+        let mut sm = StateMachine::new();
+        sm.x = 0xCAFE;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_mov(4, 0, 1, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.pending_exec, Some(0xCAFE));
+    }
+
+    /// MOV destination = PC sets PC directly (covers `destination == 5`
+    /// arm in the MOV dispatch).
+    #[test]
+    fn mov_dst_pc_sets_pc_directly() {
+        let mut sm = StateMachine::new();
+        sm.x = 0x17; // 0x17 & 0x1F = 0x17
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        let pc_set = sm.exec_mov(5, 0, 1, 0, &mut pins, &mut dirs);
+        assert!(pc_set);
+        assert_eq!(sm.pc, 0x17);
+    }
+
+    /// MOV destination=PINDIRS (3) writes shared_pin_dirs.
+    #[test]
+    fn mov_dst_pindirs_writes_shared_pin_dirs() {
+        let mut sm = StateMachine::new();
+        // OUT_BASE=2, OUT_COUNT=4 (bits[25:20]=4, [4:0]=2).
+        sm.pinctrl = (4u32 << 20) | 2;
+        sm.x = 0xF;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_mov(3, 0, 1, 0, &mut pins, &mut dirs);
+        // 4 bits of value 0xF rotated into base 2 → bits[5:2] set.
+        assert_eq!(dirs & (0xF << 2), 0xF << 2);
+    }
+
+    /// IRQ clear bit (line 970 `clear=true` arm).
+    #[test]
+    fn irq_clear_drops_flag() {
+        let mut sm = StateMachine::new();
+        let mut irq = 0b0000_1111u8;
+        sm.exec_irq(true, false, 2, &mut irq);
+        assert_eq!(irq, 0b0000_1011, "bit 2 cleared");
+    }
+
+    /// IRQ set with wait=true stalls (line 974).
+    #[test]
+    fn irq_set_with_wait_stalls() {
+        let mut sm = StateMachine::new();
+        let mut irq = 0u8;
+        sm.exec_irq(false, true, 4, &mut irq);
+        assert_eq!(irq & (1 << 4), 1 << 4);
+        assert!(sm.stalled);
+        match sm.stall_kind {
+            StallKind::IrqWait { index } => assert_eq!(index, 4),
+            _ => panic!("expected IrqWait"),
+        }
+    }
+
+    /// `resolve_irq_index` with relative bit set maps through sm_id
+    /// (line 1011 relative arm).
+    #[test]
+    fn resolve_irq_index_relative() {
+        let mut sm = StateMachine::new();
+        sm.sm_id = 2;
+        // index = 0x10 (rel flag), lower 2 bits=0, preserve bit 2=0.
+        // (0 + 2) % 4 = 2 → resolved index is 2.
+        assert_eq!(sm.resolve_irq_index(0x10), 2);
+        // index = 0x14 (rel flag with bit 2 set).
+        // Lower 2 bits=0 → (0 + 2) % 4 = 2; OR with (0x14 & 4)=4 → 6.
+        assert_eq!(sm.resolve_irq_index(0x14), 6);
+    }
+
+    /// SET destination=PINDIRS routes through write_pin_field with SET_BASE
+    /// and SET_COUNT. Covers the PINDIRS arm (destination=4) alongside the
+    /// PINS arm exercised by existing tests.
+    #[test]
+    fn set_pindirs_writes_shared_pin_dirs() {
+        let mut sm = StateMachine::new();
+        // SET_BASE=1 (bits[9:5]), SET_COUNT=3 (bits[28:26]).
+        sm.pinctrl = (3u32 << 26) | (1u32 << 5);
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_set(4, 0b111, &mut pins, &mut dirs);
+        assert_eq!(dirs & (0b111 << 1), 0b111 << 1);
+    }
+
+    /// SET with unknown destination (wildcard) is a no-op.
+    #[test]
+    fn set_unknown_destination_is_noop() {
+        let mut sm = StateMachine::new();
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // Dest=3 (not mapped on SET) — NOP.
+        sm.exec_set(3, 0xFF, &mut pins, &mut dirs);
+        assert_eq!(pins, 0);
+        assert_eq!(dirs, 0);
+    }
+
+    /// Force-execute clears any prior stall and runs the supplied insn.
+    /// Covers `force_execute`'s stall-clear path (stalled=true → false).
+    #[test]
+    fn force_execute_clears_stall_and_runs() {
+        let mut sm = StateMachine::new();
+        sm.stalled = true;
+        sm.stall_kind = StallKind::Pull;
+        sm.delay_count = 7;
+        let instr_mem = [0u16; 32];
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // Force SET X, 1 = 0xE021.
+        sm.force_execute(0xE021, &instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(!sm.stalled);
+        assert_eq!(sm.delay_count, 0);
+        assert_eq!(sm.x, 1);
+    }
+
+    /// `reset` preserves sm_id but zeroes everything else.
+    #[test]
+    fn reset_preserves_sm_id() {
+        let mut sm = StateMachine::new();
+        sm.sm_id = 3;
+        sm.x = 0xDEAD;
+        sm.pc = 15;
+        sm.reset();
+        assert_eq!(sm.sm_id, 3);
+        assert_eq!(sm.x, 0);
+        assert_eq!(sm.pc, 0);
+    }
+
+    /// Delay-countdown path in `execute_cycle` (`delay_count > 0` early
+    /// return), paired with the post-delay resumption.
+    #[test]
+    fn delay_countdown_decrements_and_resumes() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        sm.delay_count = 2;
+        let instr_mem = [0u16; 32]; // all zeros = JMP 0 always
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.delay_count, 1);
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.delay_count, 0);
+    }
+
+    /// read_clkdiv / write_clkdiv roundtrip exercises both accessors.
+    #[test]
+    fn clkdiv_register_roundtrip_at_sm_level() {
+        let mut sm = StateMachine::new();
+        sm.write_clkdiv(0x1234_5600);
+        assert_eq!(sm.read_clkdiv(), 0x1234_5600);
+        assert_eq!(sm.clkdiv_int, 0x1234);
+        assert_eq!(sm.clkdiv_frac, 0x56);
+    }
+
+    /// `check_stall` WaitIrq re-evaluation: the condition-not-met arm
+    /// (line 439 false branch). Induce a genuine stall via `exec_wait`,
+    /// then call `execute_cycle` while the flag is still unset so the
+    /// re-check runs and stays stalled.
+    #[test]
+    fn check_stall_wait_irq_stays_stalled_when_flag_still_mismatched() {
+        let mut sm = StateMachine::new();
+        sm.enabled = true;
+        // WAIT 1 IRQ 3 at slot 0 = opcode 001, polarity=1, source=2, index=3.
+        // operand = 0b1_10_00011 = 0xC3 → insn = 0b001_00000_11000011 = 0x20C3.
+        let mut instr_mem = [0u16; 32];
+        instr_mem[0] = 0x20C3;
+        let mut irq = 0u8;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(sm.stalled);
+        // Re-evaluate: IRQ flag 3 is still clear → stays stalled.
+        sm.execute_cycle(&instr_mem, &mut irq, 0, &mut pins, &mut dirs);
+        assert!(sm.stalled, "check_stall mismatch arm keeps SM stalled");
+        assert_eq!(sm.stall_cycles, 2);
+    }
+
+    /// OUT PINS with bit_count=32 and OUT_COUNT=32 drives `write_pin_field`
+    /// with count=32, exercising the `count >= 32` mask arm (line 498).
+    #[test]
+    fn out_pins_count_32_hits_write_pin_field_mask_all_ones() {
+        let mut sm = StateMachine::new();
+        // PINCTRL: OUT_COUNT=32 at bits[25:20]=0b100000=32.
+        sm.pinctrl = 32u32 << 20;
+        // shiftctrl shift-right (bit 19 set).
+        sm.shiftctrl = 1u32 << 19;
+        sm.osr = 0xDEAD_BEEF;
+        sm.osr_count = 0;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_out(0, 32, &mut pins, &mut dirs);
+        // With count=32 the mask is u32::MAX and the value (0xDEAD_BEEF)
+        // lands unshifted in shared_pin_values.
+        assert_eq!(pins, 0xDEAD_BEEF, "32-wide OUT lands full word in pad_out");
+    }
+
+    /// Post-shift autopush when ISR is freshly at threshold and RX FIFO
+    /// has room (line 703 false arm of `is_full`).
+    #[test]
+    fn autopush_post_shift_with_room_pushes() {
+        // Covered via `in_post_shift_autopush_fires_when_threshold_reached`
+        // already — re-assert here to name the branch: pre-shift hits
+        // `isr_count >= threshold` FALSE (isr_count=0 initially),
+        // post-shift the threshold is reached and RX FIFO has room.
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = (1u32 << 16) | (8u32 << 20); // autopush, threshold=8
+        sm.x = 0xCC;
+        sm.exec_in(1, 8, 0);
+        assert_eq!(sm.autopush_count, 1, "RX FIFO had room → autopush fires");
+        assert!(!sm.rx_fifo.is_empty());
+    }
+
+    /// IN shift-right with bit_count < 32 takes the `isr >>= bc` path
+    /// (line 733/734 false arm of `bc >= 32`).
+    #[test]
+    fn in_shift_right_bit_count_less_than_32() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 1u32 << 18; // IN_SHIFTDIR=right
+        sm.x = 0x0F;
+        // Pre-seed ISR so we can observe the shift-right behaviour.
+        sm.isr = 0x0000_00F0;
+        sm.isr_count = 8;
+        sm.exec_in(1, 4, 0);
+        // ISR shifted right by 4: 0x0000_000F; then data (0x0F) placed
+        // at MSB side (0xF << 28 = 0xF000_0000) → combined 0xF000_000F.
+        assert_eq!(sm.isr, 0xF000_000F);
+        assert_eq!(sm.isr_count, 12);
+    }
+
+    /// OUT autopull with osr_count < threshold: the autopull guard
+    /// (line 775) takes its FALSE arm — OUT shifts from the existing OSR
+    /// without a refill.
+    #[test]
+    fn out_autopull_below_threshold_does_not_refill() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 1u32 << 17; // AUTOPULL on, threshold=32 (default)
+        sm.osr = 0x0000_00FF;
+        sm.osr_count = 16; // below threshold
+        sm.tx_fifo.push(0xBEEF_CAFE); // a value we expect NOT to be loaded
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        let pc_set = sm.exec_out(3, 8, &mut pins, &mut dirs); // OUT NULL, 8
+        assert!(!pc_set);
+        assert!(!sm.stalled, "osr_count below threshold — no autopull refill");
+        // OSR must still hold its pre-OUT value shifted, not 0xBEEF_CAFE.
+        // Default shift-direction (right, bit 19 unaltered from above):
+        // we set shiftctrl=1<<17 only, so bit 19 is 0 → shift LEFT here;
+        // with bc=8 and bc<32, osr <<= 8 → 0x0000_FF00.
+        assert_eq!(sm.osr, 0x0000_FF00);
+        assert_eq!(sm.tx_fifo.level(), 1, "TX FIFO untouched");
+    }
+
+    /// OUT shift-left with bit_count < 32 (lines 799/800 false arms of
+    /// `bc >= 32`).
+    #[test]
+    fn out_shift_left_bit_count_less_than_32() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 0; // shift-left
+        sm.osr = 0xAABB_CCDD;
+        sm.osr_count = 0;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_out(3, 8, &mut pins, &mut dirs); // OUT NULL, 8
+        // Shift-left with bc=8: data = osr >> 24 = 0xAA; osr <<= 8 = 0xBBCC_DD00.
+        assert_eq!(sm.osr, 0xBBCC_DD00);
+    }
+
+    /// MOV src=PINS with in_count=1 (not 0 and not >= 32) takes the
+    /// masked `else` arm of line 902. Complements
+    /// `mov_src_pins_in_count_masks_to_bit_width` (in_count=4) by
+    /// hitting the 0 < in_count < 32 boundary at in_count=1.
+    #[test]
+    fn mov_src_pins_in_count_one_masks_to_single_bit() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 1;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_mov(2, 0, 0, 0xFFFF_FFFF, &mut pins, &mut dirs);
+        assert_eq!(sm.y, 1, "in_count=1 masks to single bit");
+    }
+
+    /// Accessors `enabled`, `pc`, `isr_value`, `isr_shift_count`,
+    /// `tx_fifo_full`, `rx_fifo_empty`, `rx_fifo_level`, `rx_fifo_drops`,
+    /// `tx_push_success`, `tx_push_drop`, `rx_push_success`, `rx_push_drop`,
+    /// `pc_visits`, `stall_cycles`, `cycles_stalled_at_pc_0x19` are
+    /// read-only surfaces exercised here for completeness.
+    #[test]
+    fn diagnostic_accessors_round_trip_internal_state() {
+        let mut sm = StateMachine::new();
+        assert!(!sm.enabled());
+        assert_eq!(sm.pc(), 0);
+        sm.isr = 0x55;
+        sm.isr_count = 5;
+        assert_eq!(sm.isr_value(), 0x55);
+        assert_eq!(sm.isr_shift_count(), 5);
+        assert!(!sm.tx_fifo_full());
+        assert!(sm.rx_fifo_empty());
+        assert_eq!(sm.rx_fifo_level(), 0);
+        assert_eq!(sm.rx_fifo_drops(), 0);
+        assert_eq!(sm.tx_push_success(), 0);
+        assert_eq!(sm.tx_push_drop(), 0);
+        assert_eq!(sm.rx_push_success(), 0);
+        assert_eq!(sm.rx_push_drop(), 0);
+        assert_eq!(sm.pc_visits().iter().sum::<u64>(), 0);
+        assert_eq!(sm.stall_cycles(), 0);
+        assert_eq!(sm.cycles_stalled_at_pc_0x19(), 0);
     }
 }

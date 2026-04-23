@@ -145,4 +145,39 @@ mod tests {
         assert_eq!(fifo.push_success, 6);
         assert_eq!(fifo.push_drop, 1);
     }
+
+    /// `is_full` returns false for a depth=0 FIFO (the "joined-away" side
+    /// of a FIFO-join pair — see `PioBlock::apply_fifo_join`). Covers the
+    /// short-circuit left arm of `depth > 0 && count >= depth` at line 59.
+    #[test]
+    fn is_full_is_false_on_depth_zero_fifo() {
+        let mut fifo = PioFifo::new(0);
+        assert!(!fifo.is_full(), "depth=0 FIFO must not report full");
+        assert!(fifo.is_empty(), "depth=0 FIFO is trivially empty");
+        // And push on a depth=0 FIFO always drops (covers line 36 drop arm).
+        assert!(!fifo.push(0xAA));
+        assert_eq!(fifo.push_drop, 1);
+        assert_eq!(fifo.push_success, 0);
+        // pop returns None — covers the count==0 guard of `pop`.
+        assert_eq!(fifo.pop(), None);
+    }
+
+    /// Cover `set_depth` and `flush`: after expanding depth the FIFO is
+    /// usable; after `flush` it drops buffered entries and reports empty.
+    #[test]
+    fn set_depth_flushes_and_allows_reuse() {
+        let mut fifo = PioFifo::new(4);
+        assert!(fifo.push(1));
+        assert!(fifo.push(2));
+        assert_eq!(fifo.level(), 2);
+        fifo.flush();
+        assert!(fifo.is_empty());
+        assert_eq!(fifo.level(), 0);
+        // Grow to 8 (FJOIN case) — push 5 values succeeds.
+        fifo.set_depth(8);
+        for v in 0..5u32 {
+            assert!(fifo.push(v));
+        }
+        assert_eq!(fifo.level(), 5);
+    }
 }
