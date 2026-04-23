@@ -21,28 +21,35 @@
 //! # Register map (pico-sdk pinned commit
 //! `a1438dff1d38bd9c65dbd693f0e5db4b9ae91779` — `powman.h`)
 //!
-//! | Offset  | Name                    | Access | Notes                    |
-//! |---------|-------------------------|--------|--------------------------|
-//! | `0x00`  | `BADPASSWD` (= `CTRL`*) | R/W    | Plain storage            |
-//! | `0x04`  | `VREG_CTRL`             | R/W    | Plain storage            |
-//! | `0x08`  | `VREG_STS`              | R/W    | Plain storage            |
-//! | `0x0C`  | `VREG`                  | R/W    | Plain storage            |
-//! | `0x60..0x6C` | `SET_TIME_*`      | W      | Writes seed 64-bit COUNT |
-//! | `0x70`  | `READ_TIME_UPPER`       | R      | High 32 of running COUNT |
-//! | `0x74`  | `READ_TIME_LOWER`       | R      | Low  32 of running COUNT |
-//! | `0x78..0x84` | `ALARM_TIME_*`    | R/W    | 64-bit match target      |
-//! | `0x88`  | `TIMER`                 | R/W    | RUN (bit 1), ALARM_ENAB  |
-//! |         |                         |        | (bit 4), ALARM W1C (6)   |
-//! | `0xE0`  | `INTR`                  | RO     | TIMER = bit 1            |
-//! | `0xE4`  | `INTE`                  | R/W    | TIMER = bit 1            |
-//! | `0xE8`  | `INTF`                  | R/W    | TIMER = bit 1            |
-//! | `0xEC`  | `INTS`                  | RO     | `(INTR & INTE) | INTF`   |
-//! | `0x20`  | `ARCHSEL` (emu-only)    | R/W    | Warn-once on non-Arm (§10) |
-//! | other   | —                       | R/W    | HashMap fallthrough      |
+//! | Offset  | Name                  | Access | Notes                      |
+//! |---------|-----------------------|--------|----------------------------|
+//! | `0x00`  | `BADPASSWD`           | R/W1C  | Bit 0 sticky latch (§V13)  |
+//! | `0x04`  | `VREG_CTRL`           | R/W    | Plain storage              |
+//! | `0x08`  | `VREG_STS`            | R/W    | Plain storage              |
+//! | `0x0C`  | `VREG`                | R/W    | Plain storage              |
+//! | `0x60..0x6C` | `SET_TIME_*`    | W      | Writes seed 64-bit COUNT   |
+//! | `0x70`  | `READ_TIME_UPPER`     | R      | High 32 of running COUNT   |
+//! | `0x74`  | `READ_TIME_LOWER`     | R      | Low  32 of running COUNT   |
+//! | `0x78..0x84` | `ALARM_TIME_*`  | R/W    | 64-bit match target        |
+//! | `0x88`  | `TIMER`               | R/W    | RUN (bit 1), ALARM_ENAB    |
+//! |         |                       |        | (bit 4), ALARM W1C (6)     |
+//! | `0xE0`  | `INTR`                | RO     | TIMER = bit 1              |
+//! | `0xE4`  | `INTE`                | R/W    | TIMER = bit 1              |
+//! | `0xE8`  | `INTF`                | R/W    | TIMER = bit 1              |
+//! | `0xEC`  | `INTS`                | RO     | `(INTR & INTE) | INTF`     |
+//! | `0x20`  | `ARCHSEL` (emu-only)  | R/W    | Warn-once on non-Arm (§10) |
+//! | other   | —                     | R/W    | HashMap fallthrough        |
 //!
-//! *Offset 0x00 is `BADPASSWD` on silicon but `CTRL` in the Stage 1
-//! model; it is plain-storage for firmware round-trip and never observed
-//! by the IRQ path. The `ctrl` field retains the Stage 1 name.
+//! # Password protection (V13 Stage 1)
+//!
+//! Password-gated offsets require bits [31:16] == `0x5AFE` on every
+//! write. Currently gated: `SET_TIME_*`, `ALARM_TIME_*`, `TIMER`,
+//! `INTE`, `INTF`. A wrong-password write is dropped (no target
+//! register mutation) and latches `BADPASSWD` bit 0 at offset 0x00.
+//! `BADPASSWD` is itself not password-gated: any write with bit 0 set
+//! clears the latch (W1C), any other write is inert. V13 scope does
+//! not gate `VREG_CTRL`/`VREG_STS`/`VREG`/`ARCHSEL` — see `tech_debt.md`
+//! for the broader password-audit follow-up.
 //!
 //! # HLD §3.2 logical-name mapping
 //!
@@ -103,8 +110,23 @@ use super::apply_alias_rmw;
 /// pinned commit: `POWMAN_BASE = 0x4010_0000`.
 pub const POWMAN_BASE: u32 = 0x4010_0000;
 
-/// POWMAN `BADPASSWD` / stage-1 CTRL storage slot.
+/// POWMAN `BADPASSWD` status/W1C slot (V13 Stage 1). Bit 0 latches on
+/// any wrong-password write to a password-gated offset. Writing 1 to
+/// bit 0 clears the latch. V11 aliased this offset to a plain-storage
+/// `CTRL` slot; V13 replaces that with the silicon-correct BADPASSWD
+/// semantics. The constant name is retained for call-site stability.
 pub const CTRL_OFFSET: u32 = 0x00;
+/// Alias for [`CTRL_OFFSET`] — the silicon name of offset 0x00.
+pub const BADPASSWD_OFFSET: u32 = CTRL_OFFSET;
+/// Sticky bit set on wrong-password writes; W1C to clear.
+pub const BADPASSWD_BIT: u32 = 1 << 0;
+
+/// Password value required in bits [31:16] of every password-gated
+/// write. Silicon drops the target mutation on mismatch and latches
+/// [`BADPASSWD_BIT`] at [`BADPASSWD_OFFSET`].
+pub const POWMAN_PASSWORD: u32 = 0x5AFE_0000;
+/// Mask covering the password field.
+pub const POWMAN_PASSWORD_MASK: u32 = 0xFFFF_0000;
 /// POWMAN `VREG_CTRL`.
 pub const VREG_CTRL_OFFSET: u32 = 0x04;
 /// POWMAN `VREG_STS`.
@@ -191,8 +213,9 @@ const POWMAN_TICK_HZ: u32 = XOSC_FREQ_HZ / 4;
 
 /// POWMAN register block.
 pub struct PowmanRegs {
-    /// Plain-storage `BADPASSWD`/CTRL slot.
-    ctrl: u32,
+    /// `BADPASSWD` status/W1C latch at offset 0x00 (V13 Stage 1). Bit 0
+    /// set on any wrong-password write to a password-gated offset.
+    badpasswd: u32,
     /// `VREG_CTRL` storage.
     vreg_ctrl: u32,
     /// `VREG_STS` storage.
@@ -235,7 +258,7 @@ pub struct PowmanRegs {
 impl PowmanRegs {
     pub fn new() -> Self {
         Self {
-            ctrl: 0,
+            badpasswd: 0,
             vreg_ctrl: 0,
             vreg_sts: 0,
             vreg: 0,
@@ -255,7 +278,7 @@ impl PowmanRegs {
     /// Read a POWMAN register word.
     pub fn read32(&self, offset: u32) -> u32 {
         match offset {
-            CTRL_OFFSET => self.ctrl,
+            CTRL_OFFSET => self.badpasswd,
             VREG_CTRL_OFFSET => self.vreg_ctrl,
             VREG_STS_OFFSET => self.vreg_sts,
             VREG_OFFSET => self.vreg,
@@ -294,12 +317,33 @@ impl PowmanRegs {
     /// [`crate::bus::Bus::raise_irqs_u64`].
     #[must_use]
     pub fn write32(&mut self, offset: u32, value: u32, alias: u32) -> u64 {
+        // V13 Stage 1 — password check. Password-gated offsets drop the
+        // target write on mismatch and latch BADPASSWD. Handled up-front
+        // so each storage branch below can assume either (a) this offset
+        // is not password-gated, or (b) the password is correct.
+        if is_password_gated(offset)
+            && (value & POWMAN_PASSWORD_MASK) != POWMAN_PASSWORD
+        {
+            self.badpasswd |= BADPASSWD_BIT;
+            trace!(
+                offset = format_args!("{:#X}", offset),
+                value = format_args!("{:#X}", value),
+                "POWMAN BADPASSWD latch — wrong-password write"
+            );
+            return 0;
+        }
+
         // Snapshot the pre-write INTS.TIMER state so we can detect a
         // 0 → 1 transition for INTE / INTF writes.
         let pre_ints_timer = self.ints_timer_asserted();
 
         match offset {
-            CTRL_OFFSET => apply_alias_rmw(&mut self.ctrl, value, alias),
+            // BADPASSWD W1C — any set bit in bit 0 clears the latch.
+            // Not password-gated. Bits [31:1] are ignored on write
+            // (register is 1 bit wide on silicon).
+            CTRL_OFFSET => {
+                self.badpasswd &= !(value & BADPASSWD_BIT);
+            }
             VREG_CTRL_OFFSET => apply_alias_rmw(&mut self.vreg_ctrl, value, alias),
             VREG_STS_OFFSET => apply_alias_rmw(&mut self.vreg_sts, value, alias),
             VREG_OFFSET => apply_alias_rmw(&mut self.vreg, value, alias),
@@ -548,6 +592,29 @@ impl Default for PowmanRegs {
     }
 }
 
+/// Offsets requiring the POWMAN password in bits [31:16] (V13 Stage 1).
+/// Writes with a wrong password to these offsets are silently dropped
+/// and latch [`BADPASSWD_BIT`]. V13 scope is conservative — only the
+/// offsets previously masking off their upper 16 bits are gated. A
+/// future stage can widen this to VREG / ARCHSEL once silicon confirms.
+#[inline]
+fn is_password_gated(offset: u32) -> bool {
+    matches!(
+        offset,
+        SET_TIME_15TO0_OFFSET
+            | SET_TIME_31TO16_OFFSET
+            | SET_TIME_47TO32_OFFSET
+            | SET_TIME_63TO48_OFFSET
+            | ALARM_TIME_15TO0_OFFSET
+            | ALARM_TIME_31TO16_OFFSET
+            | ALARM_TIME_47TO32_OFFSET
+            | ALARM_TIME_63TO48_OFFSET
+            | TIMER_OFFSET
+            | INTE_OFFSET
+            | INTF_OFFSET
+    )
+}
+
 /// Sys-clocks per POWMAN tick, derived from the live clock tree. Returns
 /// [`POWMAN_SYS_PER_TICK`] for the default configuration (sys_clk =
 /// 150 MHz, POWMAN tick = XOSC/4 = 3 MHz).
@@ -616,18 +683,16 @@ mod tests {
 
     /// Helper: arm POWMAN with `INTE.TIMER` enabled so `advance` will
     /// raise NVIC line 45 on alarm match. Most tests want this; the
-    /// INTE-gating tests below intentionally skip it.
+    /// INTE-gating tests below intentionally skip it. V13 Stage 1 —
+    /// password required on every gated write.
     fn arm_for_nvic_raise(p: &mut PowmanRegs, alarm_low16: u32) {
-        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, alarm_low16, 0);
-        let _ = p.write32(INTE_OFFSET, INT_TIMER_BIT, 0);
-        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
-    }
-
-    #[test]
-    fn ctrl_roundtrip() {
-        let mut p = PowmanRegs::new();
-        let _ = p.write32(CTRL_OFFSET, 0xDEAD_BEEF, 0);
-        assert_eq!(p.read32(CTRL_OFFSET), 0xDEAD_BEEF);
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | alarm_low16, 0);
+        let _ = p.write32(INTE_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
+        let _ = p.write32(
+            TIMER_OFFSET,
+            POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+            0,
+        );
     }
 
     #[test]
@@ -653,7 +718,7 @@ mod tests {
         let mut tree = ClockTree::default();
         // Force sys_clk = 150 MHz so sys_per_tick = 50.
         tree.sys_clk_hz = 150_000_000;
-        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT, 0);
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT, 0);
         // Exactly 50 sys_clks => 1 POWMAN tick.
         let _ = p.advance(50, &tree);
         assert_eq!(p.read32(READ_TIME_LOWER_OFFSET), 1);
@@ -695,8 +760,8 @@ mod tests {
         arm_for_nvic_raise(&mut p, 1);
         let _ = p.advance(50, &tree);
         assert_ne!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
-        // W1C via TIMER.ALARM
-        let _ = p.write32(TIMER_OFFSET, TIMER_ALARM_BIT, 0);
+        // W1C via TIMER.ALARM (password required)
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_ALARM_BIT, 0);
         assert_eq!(p.read32(TIMER_OFFSET) & TIMER_ALARM_BIT, 0);
         assert_eq!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
     }
@@ -711,8 +776,12 @@ mod tests {
         let mut tree = ClockTree::default();
         tree.sys_clk_hz = 150_000_000;
         // No INTE write — INTE.TIMER stays 0.
-        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, 2, 0);
-        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 2, 0);
+        let _ = p.write32(
+            TIMER_OFFSET,
+            POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+            0,
+        );
 
         let mask = p.advance(100, &tree);
         assert_eq!(mask, 0, "INTE.TIMER clear must suppress NVIC raise");
@@ -738,9 +807,13 @@ mod tests {
         let mut tree = ClockTree::default();
         tree.sys_clk_hz = 150_000_000;
         // Enable INTE.TIMER first, then arm and run TIMER.
-        let _ = p.write32(INTE_OFFSET, INT_TIMER_BIT, 0);
-        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, 2, 0);
-        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        let _ = p.write32(INTE_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 2, 0);
+        let _ = p.write32(
+            TIMER_OFFSET,
+            POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+            0,
+        );
 
         let mask = p.advance(100, &tree);
         assert_eq!(
@@ -760,8 +833,12 @@ mod tests {
         let mut p = PowmanRegs::new();
         let mut tree = ClockTree::default();
         tree.sys_clk_hz = 150_000_000;
-        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, 2, 0);
-        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 2, 0);
+        let _ = p.write32(
+            TIMER_OFFSET,
+            POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+            0,
+        );
 
         let advance_mask = p.advance(100, &tree);
         assert_eq!(advance_mask, 0, "INTE clear: advance must not raise");
@@ -773,7 +850,7 @@ mod tests {
 
         // Late INTE enable — the write itself should re-pend NVIC 45
         // because INTS.TIMER transitions 0 → 1.
-        let write_mask = p.write32(INTE_OFFSET, INT_TIMER_BIT, 0);
+        let write_mask = p.write32(INTE_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
         assert_eq!(
             write_mask,
             1u64 << IRQ_POWMAN_IRQ_TIMER,
@@ -836,5 +913,107 @@ mod tests {
         let _ = p.write32(0xF00, 0x1234_5678, 0);
         assert_eq!(p.read32(0xF00), 0x1234_5678);
         assert_eq!(p.read32(0xF04), 0);
+    }
+
+    // --- V13 Stage 1 — BADPASSWD semantics --------------------------
+    //
+    // On silicon, every password-gated POWMAN register (SET_TIME_*,
+    // ALARM_TIME_*, TIMER, INTE, INTF) requires bits [31:16] == 0x5AFE.
+    // A wrong-password write silently drops the target mutation AND
+    // latches BADPASSWD at offset 0x00 (sticky W1C, bit 0). Reads of
+    // offset 0x00 return the latch state.
+    //
+    // These tests are the red contract for V13. The layout (bit 0, W1C)
+    // is silicon-plausible but unverified — future silicon-diff runs
+    // may require a bit-position adjustment here; fix in-stage (V12
+    // Stage 1 CHIP_ID precedent).
+
+    #[test]
+    fn badpasswd_wrong_password_timer_write_is_dropped() {
+        let mut p = PowmanRegs::new();
+        // Upper16 = 0x0000 is *not* 0x5AFE — write must be dropped.
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT, 0);
+        assert_eq!(
+            p.read32(TIMER_OFFSET) & TIMER_RUN_BIT,
+            0,
+            "wrong-password TIMER write must not mutate TIMER"
+        );
+    }
+
+    #[test]
+    fn badpasswd_wrong_password_latches_status_bit() {
+        let mut p = PowmanRegs::new();
+        assert_eq!(
+            p.read32(CTRL_OFFSET) & 0x1,
+            0,
+            "BADPASSWD must be latched-low after reset"
+        );
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT, 0);
+        assert_eq!(
+            p.read32(CTRL_OFFSET) & 0x1,
+            0x1,
+            "wrong-password write must latch BADPASSWD bit 0"
+        );
+    }
+
+    #[test]
+    fn badpasswd_w1c_clears_latch() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(TIMER_OFFSET, TIMER_RUN_BIT, 0);
+        assert_eq!(p.read32(CTRL_OFFSET) & 0x1, 0x1);
+        // W1C — writing 1 to bit 0 clears the latch. Password not
+        // required for the clear itself (BADPASSWD is a status latch,
+        // not itself password-gated).
+        let _ = p.write32(CTRL_OFFSET, 0x1, 0);
+        assert_eq!(
+            p.read32(CTRL_OFFSET) & 0x1,
+            0,
+            "BADPASSWD must clear via W1C"
+        );
+    }
+
+    #[test]
+    fn badpasswd_correct_password_does_not_latch() {
+        let mut p = PowmanRegs::new();
+        // Correct-password write: upper16 = 0x5AFE, low16 carries RUN.
+        let _ = p.write32(TIMER_OFFSET, 0x5AFE_0000 | TIMER_RUN_BIT, 0);
+        assert_eq!(
+            p.read32(CTRL_OFFSET) & 0x1,
+            0,
+            "correct-password writes must not latch BADPASSWD"
+        );
+        assert_eq!(
+            p.read32(TIMER_OFFSET) & TIMER_RUN_BIT,
+            TIMER_RUN_BIT,
+            "correct-password TIMER write must apply"
+        );
+    }
+
+    #[test]
+    fn badpasswd_wrong_password_on_alarm_time_dropped() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, 0x1234, 0);
+        assert_eq!(
+            p.read32(ALARM_TIME_15TO0_OFFSET),
+            0,
+            "wrong-password ALARM_TIME_15TO0 write must be dropped"
+        );
+        assert_eq!(
+            p.read32(CTRL_OFFSET) & 0x1,
+            0x1,
+            "wrong-password ALARM_TIME write must latch BADPASSWD"
+        );
+    }
+
+    #[test]
+    fn badpasswd_wrong_password_on_inte_dropped() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(INTE_OFFSET, INT_TIMER_BIT, 0);
+        assert_eq!(
+            p.read32(INTE_OFFSET) & INT_TIMER_BIT,
+            0,
+            "wrong-password INTE write must be dropped"
+        );
+        assert_eq!(p.read32(CTRL_OFFSET) & 0x1, 0x1);
     }
 }
