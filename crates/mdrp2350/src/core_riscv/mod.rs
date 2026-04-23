@@ -18,6 +18,8 @@ mod tests_p2;
 mod tests_p3;
 #[cfg(test)]
 mod tests_p4;
+#[cfg(test)]
+mod tests_p5;
 
 use crate::Bus;
 use regs::CsrFile;
