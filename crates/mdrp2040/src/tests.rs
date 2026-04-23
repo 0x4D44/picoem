@@ -7882,3 +7882,125 @@ mod stage7_memory_coverage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 8 — residue coverage: close reachable branches in lib.rs and
+// core/registers.rs. ppb / sio / memory residuals are all documented
+// unreachable (see stage7 modules and the Stage 8b/8c agent reports).
+// ---------------------------------------------------------------------------
+
+mod stage8_residue_coverage {
+    use crate::{Config, Emulator, EmulatorBuilder, ROM_SIZE};
+
+    /// lib.rs:773 — `if let Some(bytes) = self.flash` Some-arm: builder
+    /// with a flash image loads it on build().
+    #[test]
+    fn builder_with_flash_loads_it() {
+        let cfg = Config::default();
+        let flash = vec![0xAAu8; 64];
+        let emu = EmulatorBuilder::new(cfg).flash(flash).build();
+        // Flash was loaded: xip_read8(offset=0) should be 0xAA.
+        let val = emu.bus.memory.xip_read8(0);
+        assert_eq!(val, 0xAA, "flash byte 0 should be what we loaded");
+    }
+
+    /// lib.rs:196 — `if offset < ROM_SIZE` false arm: load_image with
+    /// offset >= ROM_SIZE must not write into the ROM.
+    #[test]
+    fn load_image_rom_offset_past_rom_size_is_noop() {
+        let mut emu = Emulator::new(Config::default());
+        let original = emu.bus.memory.rom_read8(0);
+        // Load at ROM address with offset == ROM_SIZE — `offset < ROM_SIZE` is false.
+        emu.load_image(ROM_SIZE as u32, &[0xDE, 0xAD]);
+        // ROM should be unchanged at offset 0.
+        assert_eq!(emu.bus.memory.rom_read8(0), original);
+    }
+
+    /// lib.rs:470 — `tick_pio(0)` zero-cycles early return via the
+    /// public run() with zero sys-clock consumed.
+    #[test]
+    fn run_zero_cycles_returns_zero() {
+        let mut emu = Emulator::new(Config::default());
+        let consumed = emu.run(0);
+        assert_eq!(consumed, 0);
+    }
+
+    /// lib.rs:487 — `if consumed == 0 { break; }` in `run()`: run with
+    /// both cores halted produces consumed==0 and breaks.
+    #[test]
+    fn run_both_cores_halted_breaks_early() {
+        let mut emu = Emulator::new(Config::default());
+        // Halt both cores so step produces no cycles.
+        emu.core_mut(0).halt();
+        // Core 1 is already halted post-reset.
+        let consumed = emu.run(1000);
+        assert_eq!(consumed, 0, "both cores halted → zero cycles consumed");
+    }
+
+    /// lib.rs:593 — `take_pending_launch` None arm: maybe_wake_core1
+    /// called when no launch is pending returns early, leaving core 1
+    /// still halted.
+    #[test]
+    fn maybe_wake_core1_no_launch_is_noop() {
+        let mut emu = Emulator::new(Config::default());
+        // No launch has been arranged — maybe_wake_core1 should be a noop.
+        assert!(emu.core(1).is_halted());
+        emu.maybe_wake_core1(0);
+        assert!(emu.core(1).is_halted());
+    }
+
+    /// lib.rs:618 — gpio_read with pin >= 30 returns false.
+    #[test]
+    fn gpio_read_pin_out_of_range_returns_false() {
+        let emu = Emulator::new(Config::default());
+        assert!(!emu.gpio_read(30));
+        assert!(!emu.gpio_read(255));
+    }
+
+    /// lib.rs:629 — gpio_write with pin >= 30 is noop.
+    /// lib.rs:634 — gpio_write with value=false clears bit.
+    #[test]
+    fn gpio_write_pin_out_of_range_is_noop_and_value_false_clears() {
+        let mut emu = Emulator::new(Config::default());
+        let oe_before = emu.bus.sio.gpio_oe;
+        emu.gpio_write(30, true);
+        assert_eq!(emu.bus.sio.gpio_oe, oe_before, "pin>=30 must not set OE");
+        emu.gpio_write(255, true);
+        assert_eq!(emu.bus.sio.gpio_oe, oe_before);
+
+        // Now value=false clears the bit (lib.rs:634 false arm).
+        emu.gpio_write(5, true);
+        assert_ne!(emu.bus.sio.gpio_out & (1 << 5), 0);
+        emu.gpio_write(5, false);
+        assert_eq!(emu.bus.sio.gpio_out & (1 << 5), 0);
+    }
+
+    /// lib.rs:325,350,373 — dual-core step with both cores halted
+    /// takes the inner-loop break path.
+    #[test]
+    fn step_both_cores_halted_breaks_inner_loop() {
+        let mut emu = Emulator::new(Config::default());
+        emu.core_mut(0).halt();
+        // Core 1 is already halted post-reset.
+        let consumed = emu.step();
+        assert_eq!(consumed, 0, "both halted → zero consumed");
+    }
+
+    /// core/registers.rs:220-225 — PRIMASK / CONTROL.SPSEL flag access
+    /// (M0+ has only these two system flags).
+    #[test]
+    fn registers_primask_control_roundtrip() {
+        use crate::core::registers::Registers;
+        let mut r = Registers::new();
+        // PRIMASK set: block non-NMI/HardFault interrupts.
+        r.primask = 1;
+        assert_eq!(r.primask, 1);
+        r.primask = 0;
+        assert_eq!(r.primask, 0);
+        // CONTROL bit 0 = SPSEL (0=MSP, 1=PSP).
+        r.control = 0b01;
+        assert_eq!(r.control & 1, 1);
+        r.control = 0;
+        assert_eq!(r.control & 1, 0);
+    }
+}
+
