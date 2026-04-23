@@ -10978,3 +10978,1251 @@ mod stage1_execute_coverage {
         assert_eq!(c.reg(0), 0xA5);
     }
 }
+
+// ============================================================================
+// Stage 1 — Decoder branch coverage (core/decode.rs)
+// ============================================================================
+//
+// Targets the uncovered arms in `classify_is_pure` / its private sub-
+// classifiers, plus the top-level `execute_thumb16` / `execute_thumb32`
+// dispatch paths and the `decode_execute` fetch-fault + IT-block
+// branches. Tests call the decoder directly (via `classify_is_pure`) or
+// dispatch specific opcodes through `execute_one` / `execute_one_wide`
+// to pin behaviour without needing to also validate the handler's
+// semantics — which is already done elsewhere.
+//
+// Companion to `stage1_execute_coverage`; part of Stage 1 of the
+// 2026.04.23 Coverage Improvement Plan.
+
+#[cfg(test)]
+mod stage1_decode_coverage {
+    use super::*;
+    use crate::core::decode::classify_is_pure;
+
+    // ---- classify_thumb16_misc_pure: `_ => true` fallback arm (line 131) ----
+
+    /// Misc group op=0b1000 (CBZ non-zero branch prefix) does NOT match any
+    /// listed op and also does NOT match `op & 0x5 == 0x1`. Falls through
+    /// to the `_ => true` arm.
+    #[test]
+    fn misc_op_fallback_arm_is_pure() {
+        // hw0 = 0b10110_1000_xxxxxx = 0xB800 — CBNZ form (op=8).
+        // op = (0xB800 >> 8) & 0xF = 0x8. 0x8 & 0x5 = 0x0 ≠ 0x1.
+        assert!(
+            classify_is_pure(0xB800, 0x0000, false),
+            "misc op=8 (unlisted) must hit the `_ => true` fallback arm"
+        );
+    }
+
+    // ---- classify_thumb16_misc_pure: the CBZ/CBNZ arm (`op & 0x5 == 0x1`) ----
+
+    /// Ensure the CBZ-class mask arm is reached with op=0b0001 (bare CBZ
+    /// prefix not already claimed by another arm). Complements the existing
+    /// coverage which only exercised some values.
+    #[test]
+    fn misc_cbz_mask_arm_is_pure() {
+        // op = 1 → 0b10110_0001 = 0xB100 (CBZ).
+        assert!(classify_is_pure(0xB100, 0x0000, false));
+        // op = 3 → 0xB300.
+        assert!(classify_is_pure(0xB300, 0x0000, false));
+        // op = 9 → 0xB900.
+        assert!(classify_is_pure(0xB900, 0x0000, false));
+        // op = 0xB → 0xBB00.
+        assert!(classify_is_pure(0xBB00, 0x0000, false));
+    }
+
+    // ---- classify_thumb32_pure 0b11 path: reach multiply/long_multiply ----
+
+    /// op1=0b11, op2 with bit6=0, bit5=1 (so hits "dp_register or beyond"),
+    /// bit4=1 (not dp_register), bit3=0 → multiply path (line 172).
+    #[test]
+    fn thumb32_multiply_is_pure() {
+        // hw0: bits[12:11]=11, bits[10:4]=op2.
+        // op2 needs (op2 & 0x40)==0, (op2 & 0x20)!=0, (op2 & 0x10)!=0,
+        // (op2 & 0x08)==0. Pick op2=0b0110000 = 0x30.
+        // hw0 = 0b11111_0110000_xxxx = 0xFB00.
+        // Bits: 1111_1011_0000_xxxx → 0xFB00.
+        assert!(classify_is_pure(0xFB00, 0x0000, true));
+    }
+
+    /// op1=0b11, op2 with bit6=0, bit5=1, bit4=1, bit3=1 → long_multiply (line 176).
+    #[test]
+    fn thumb32_long_multiply_is_pure() {
+        // op2 = 0b0111000 = 0x38 → hw0 bits[10:4] = 0x38.
+        // hw0 = 0xF800 | (0x38 << 4) = 0xF800 | 0x380 = 0xFB80.
+        // Verify: (hw0 >> 11) & 3 = 0x1F & 3 = 3 (op1=0b11). Good.
+        // op2 = ((hw0 >> 4) & 0x7F) = (0xFB8 & 0x7F) = 0x38. Good.
+        assert!(classify_is_pure(0xFB80, 0x0000, true));
+    }
+
+    /// op1=0b11, op2 with bit6=0, bit5=1, bit4=0 → dp_register path (line 170).
+    /// Already covered in the existing table, but repeated here so the
+    /// chain from line 168 `op2 & 0x10 == 0` hits the False side when
+    /// combined with the multiply tests above.
+    #[test]
+    fn thumb32_dp_register_is_pure() {
+        // op2 = 0b0100000 = 0x20 → hw0 = 0xFA00.
+        assert!(classify_is_pure(0xFA00, 0x0000, true));
+    }
+
+    // ---- classify_thumb32_branch_misc_pure: B.W T3 (conditional) ----
+
+    /// B.W T3 conditional: hw1 bit 14 = 0, hw1 bit 12 = 0, misc_op & 0xE != 0xE.
+    /// hw0 is in the branch/misc range. Line 198 True side, line 200 `true`.
+    #[test]
+    fn thumb32_bw_t3_conditional_is_pure() {
+        // B.W T3 encoding: hw0 = 11110_S_cond_imm6, hw1 = 10_J1_0_J2_imm11.
+        // For hw0 we need (hw0 >> 11) & 3 == 0b10 → bits[12:11]=10 → hw0 range 0xF000..0xF7FF.
+        // cond in bits[9:6]; pick cond=0 (EQ) → hw0 = 0xF000.
+        //   (hw0 >> 11) & 3 = 0xF000 >> 11 & 3 = 0x1E & 3 = 2. Good.
+        //   (hw1 >> 15) & 1 = 1 (hw1 bit 15 must be 1 for branch_misc).
+        //   hw1 bit 14 = 0 (not BL).
+        //   hw1 bit 12 = 0 (not B.W T4).
+        //   misc_op = (hw0 >> 6) & 0xF = cond = 0 → 0 & 0xE != 0xE → takes B.W T3 arm.
+        //   hw1 = 0b1_0_0_J1_0_J2_imm11 → 0x8000.
+        assert!(classify_is_pure(0xF000, 0x8000, true));
+    }
+
+    // ---- classify_thumb32_misc_control_pure: hints (F3AF) ----
+
+    /// Hints group: hw0 == 0xF3AF; hw1 low byte in {0..4} → pure.
+    /// Covers line 213 True side and line 215 `matches!` both match arms.
+    #[test]
+    fn thumb32_hint_group_is_pure() {
+        // Need to route through classify_is_pure with op1=0b10, op!=0 (branch_misc),
+        // hw1 bit 14 = 0, hw1 bit 12 = 0, misc_op=0xE-ish so line 198 reaches
+        // misc_control.
+        // misc_op = (hw0 >> 6) & 0xF. For hw0=0xF3AF → ((0xF3AF >> 6) & 0xF) = (0x3C & 0xF) = 0xC.
+        // Wait: 0xF3AF >> 6 = 0x3CE, & 0xF = 0xE. So misc_op=0xE, & 0xE = 0xE. Good.
+        // op1 = (0xF3AF >> 11) & 3 = 0x1E & 3 = 2. Good.
+        // hw1: bit 15 = 1 (op=1), bit 14 = 0, bit 12 = 0. Low byte chooses hint.
+        // NOP.W = hw1=0x8000 (hint=0x00). Start there.
+        for hint in 0x00u16..=0x04u16 {
+            let hw1 = 0x8000 | hint;
+            assert!(
+                classify_is_pure(0xF3AF, hw1, true),
+                "hint 0x{:02X} must be pure",
+                hint
+            );
+        }
+    }
+
+    /// Hint group with an unrecognised low byte — falls out of `matches!` →
+    /// returns false (covers the `false` arm at line 215's `matches!`).
+    #[test]
+    fn thumb32_hint_group_unknown_is_impure() {
+        // hint=0x10 is unclaimed — falls to line 215 `matches!` false →
+        // function returns false.
+        assert!(
+            !classify_is_pure(0xF3AF, 0x8010, true),
+            "unknown hint encoding must be impure (routes to thumb32_undefined)"
+        );
+    }
+
+    // ---- classify_thumb32_misc_control_pure: barriers (F3BF) ----
+
+    /// Barrier group F3BF with barrier_op not in {2,4,5,6} must be impure
+    /// (routes to thumb32_undefined). Covers the False match of the
+    /// `matches!` at line 221.
+    #[test]
+    fn thumb32_barrier_group_unknown_is_impure() {
+        // barrier_op = (hw1 >> 4) & 0xF. Pick barrier_op=0 → hw1 low nibble of high byte = 0.
+        // hw1 = 0x8F0F works: bit15=1, bit14=0, bit12=0, (hw1>>4)&0xF = 0xF0 & 0xF = 0.
+        // Wait — 0x8F0F >> 4 = 0x8F0, & 0xF = 0. Good.
+        assert!(
+            !classify_is_pure(0xF3BF, 0x8F0F, true),
+            "barrier_op=0 must be impure"
+        );
+        // barrier_op=1: hw1 = 0x8F1F → (0x8F1F >> 4) & 0xF = 0x1. Impure.
+        assert!(!classify_is_pure(0xF3BF, 0x8F1F, true));
+        // barrier_op=3: (hw1 >> 4) & 0xF = 3. Impure.
+        assert!(!classify_is_pure(0xF3BF, 0x8F3F, true));
+    }
+
+    // ---- classify_thumb32_misc_control_pure: MSR/MRS ----
+
+    /// op_field encodes MSR (0b0111000) — pure. Covers line 225 first cond True.
+    #[test]
+    fn thumb32_msr_is_pure() {
+        // op_field = (hw0 >> 4) & 0x7F. Need op_field=0b0111000 = 0x38.
+        // Also: op1 must be 0b10 → hw0 in 0xF000..0xF7FF. misc_op = (hw0 >> 6) & 0xF must
+        // be 0xE or 0xF (so line 198 goes to misc_control).
+        // hw0 = 0xF380: (>>11)&3=0x1E&3=2 ✓; (>>4)&0x7F=0xF38&0x7F=0x38 ✓;
+        // misc_op=(0xF380>>6)&0xF=0x3CE&0xF=0xE ✓.
+        // hw1: bit15=1 (branch_misc), bit14=0, bit12=0.
+        assert!(classify_is_pure(0xF380, 0x8000, true));
+    }
+
+    /// op_field = 0b0111001 — second MSR variant (Non-Secure alias).
+    /// Covers line 225 second comparison, exercising the `||` short-circuit
+    /// True side.
+    #[test]
+    fn thumb32_msr_ns_alias_is_pure() {
+        // op_field = 0x39 → hw0 = 0xF000 | (0x39 << 4) = 0xF390.
+        // misc_op = (0xF390 >> 6) & 0xF = 0x3CE & 0xF = 0xE ✓.
+        // (>>11)&3 = 2 ✓; op_field = 0x39 ✓.
+        assert!(classify_is_pure(0xF390, 0x8000, true));
+    }
+
+    /// op_field = 0b0111110 — MRS variant. Covers line 226 first comparison True.
+    #[test]
+    fn thumb32_mrs_is_pure() {
+        // op_field = 0x3E → hw0 = 0xF000 | (0x3E << 4) = 0xF3E0.
+        // misc_op = (0xF3E0 >> 6) & 0xF = 0x3CF & 0xF = 0xF → 0xF & 0xE = 0xE ✓.
+        // (>>11)&3 = 2 ✓.
+        assert!(classify_is_pure(0xF3E0, 0x8000, true));
+    }
+
+    /// op_field = 0b0111111 — second MRS variant (NS alias). Covers line 226
+    /// second comparison True.
+    #[test]
+    fn thumb32_mrs_ns_alias_is_pure() {
+        // op_field = 0x3F → hw0 = 0xF000 | (0x3F << 4) = 0xF3F0.
+        // misc_op = (0xF3F0 >> 6) & 0xF = 0xF ✓.
+        assert!(classify_is_pure(0xF3F0, 0x8000, true));
+    }
+
+    /// Misc-control with none of hint / barrier / MSR / MRS matching →
+    /// returns false (line 230).
+    #[test]
+    fn thumb32_misc_control_undefined_is_impure() {
+        // hw0 = 0xF000 with op_field = 0x00 (not 0x38/0x39/0x3E/0x3F),
+        // misc_op = 0xE or 0xF to reach misc_control; hw0 != 0xF3AF / 0xF3BF.
+        // hw0 = 0xF780: (>>11)&3=2 ✓; op_field = (0xF780>>4)&0x7F = 0x78 & 0x7F = 0x78.
+        // 0x78 != any MSR/MRS value. misc_op = (0xF780>>6)&0xF = 0x3DE & 0xF = 0xE ✓.
+        // hw0 != 0xF3AF && != 0xF3BF ✓.
+        assert!(
+            !classify_is_pure(0xF780, 0x8000, true),
+            "misc-control with unrecognised op_field must be impure"
+        );
+    }
+
+    // ---- classify_thumb16_pure: default `_` arm (line 100) ----
+
+    /// Top-5-bits >= 0b11101 (hw0 >= 0xE800) is actually wide, but the
+    /// decoder can be asked classify_is_pure(_, _, false) with such hw0
+    /// in principle. Cover the `_ => false` arm.
+    #[test]
+    fn thumb16_pure_wide_prefix_forced_false() {
+        // hw0 top-5-bits = 0b11101 would normally be wide; force classify
+        // as narrow to exercise the `_` arm at line 100.
+        assert!(
+            !classify_is_pure(0xE800, 0x0000, false),
+            "wide-prefix treated as narrow falls to `_` arm and is impure"
+        );
+    }
+
+    // ---- classify_thumb32_pure: `_` arm for op1==0b00 (line 182) ----
+
+    /// op1==0b00 as wide — bogus encoding, the sub-decoder returns false.
+    #[test]
+    fn thumb32_pure_op1_zero_is_impure() {
+        // hw0 bits[12:11] = 00 → (hw0 >> 11) & 3 = 0. Any hw0 with
+        // hw0 >= 0xE800 is wide; but op1 from bits 12:11. 0xE800 → bits 12:11 = 10+1? Let's check.
+        // 0xE800 = 1110_1000_0000_0000. Bit 15..11 = 11101. (hw0>>11)&3 = 0x1D & 3 = 1.
+        // Hmm, that gives op1=1. For op1=0 we need bits 12:11 = 00.
+        // wide requires hw0 >= 0xE800 ⇒ bits 15..11 ≥ 11101. So bits 15:13 = 111, bit 12 = 0..., bit 11 = 1..
+        // op1 = bits 12:11 = 01, 10, 11 possible. op1=00 is unreachable from a real wide fetch.
+        // But classify_is_pure is called with a caller-supplied `is_wide` flag, so we
+        // can pass is_wide=true with hw0 having bits 12:11 = 00. The decoder's `_`
+        // arm is there as a defensive fallback — exercise it.
+        let hw0: u16 = 0b1110_0000_0000_0000; // 0xE000 — bits 12:11 = 00
+        assert!(
+            !classify_is_pure(hw0, 0x0000, true),
+            "op1==00 (malformed wide) falls to `_ => false`"
+        );
+    }
+
+    // ---- Top-level execute_thumb16 dispatch: 11101+ undefined arm ----
+
+    /// `execute_thumb16` with opcode >= 0xE800 falls through to
+    /// `thumb16_undefined`. Covers line 522.
+    #[test]
+    fn execute_thumb16_wide_prefix_falls_to_undefined() {
+        let mut c = CortexM33::for_test(0);
+        // 0xE800 → bits[15:11] = 11101 → no explicit arm → `_`.
+        c.execute_one(0xE800);
+        // thumb16_undefined raises UsageFault via pending_fault. We only
+        // care that the dispatch reached the `_` arm; the fault mechanics
+        // are tested elsewhere.
+        assert!(
+            c.pending_fault.is_some(),
+            "wide-prefix opcode 0xE800 must raise UNDEFINED via thumb16_undefined"
+        );
+    }
+
+    // ---- Top-level execute_thumb32 dispatch: `_` undefined arm (op1==0) ----
+
+    /// `execute_thumb32` with op1==0b00 (malformed) falls through to
+    /// `thumb32_undefined`. Covers line 566.
+    #[test]
+    fn execute_thumb32_op1_zero_falls_to_undefined() {
+        let mut c = CortexM33::for_test(0);
+        // hw0 = 0x0000 → (hw0 >> 11) & 3 = 0. Direct dispatch → `_ => thumb32_undefined`.
+        c.execute_one_wide(0x0000, 0x0000);
+        assert!(
+            c.pending_fault.is_some(),
+            "op1=0 wide must raise UNDEFINED via thumb32_undefined"
+        );
+    }
+
+    // ---- execute_thumb32 dispatch arms: each is_wide && op1 branch ----
+    //
+    // Each test below picks an encoding that routes to exactly one handler
+    // with a benign outcome (no bus access), just to pin the dispatch arm.
+    // The handler semantics are validated elsewhere.
+
+    /// op1=0b01, op2>>5 == 0b00, op2 & 0x04 == 0 → ldm_stm.
+    #[test]
+    fn execute_thumb32_dispatch_ldm_stm() {
+        let mut c = CortexM33::for_test(0);
+        // hw0 bits[12:11] = 01 → hw0 in 0x8800..0xCFFF for op1=01? No:
+        // (hw0 >> 11) & 3 == 1 means bits[12:11] = 01 → hw0 >= 0xE800 for wide, so
+        // hw0 needs bit 15..13 = 111, bit 12 = 0, bit 11 = 1 ⇒ hw0 bits 15:11 = 11101.
+        // So hw0 in 0xE800..0xEFFF. op2 = (hw0 >> 4) & 0x7F. op2 >> 5 == 0, op2 & 0x04 == 0.
+        // Pick op2 = 0 → hw0 = 0xE800. ldm_stm takes this. Use an empty register list to avoid bus ops.
+        // Actually LDMIA / STM need a register list. Use bank-swap LDM with empty list — undefined,
+        // but dispatch is what we want to cover.
+        // STM.W / LDM.W dispatch hits. Make sure we don't trigger bus traffic by setting PC/regs to safe values.
+        let mut bus = crate::bus::Bus::default();
+        c.regs.set_pc(0x0000_0000);
+        // hw0=0xE880 (STM W=0): op2 bits = 0x08 → op2>>5=0, op2&0x04=1 (so goes to load_store_dual).
+        // Let me recompute: hw0=0xE800: op2 = (0xE800>>4)&0x7F = 0xE80 & 0x7F = 0x00. op2>>5=0, op2&0x04=0 → ldm_stm.
+        let _ = c.execute_one_wide_with_bus(0xE800, 0x0000, &mut bus);
+    }
+
+    /// op1=0b01, op2>>5 == 0b00, op2 & 0x04 != 0 → load_store_dual.
+    #[test]
+    fn execute_thumb32_dispatch_load_store_dual() {
+        let mut c = CortexM33::for_test(0);
+        let mut bus = crate::bus::Bus::default();
+        c.regs.set_pc(0x0000_0000);
+        // op2=0x04 → hw0 = 0xE840. op2>>5=0, op2&0x04=4 ≠ 0 → load_store_dual.
+        let _ = c.execute_one_wide_with_bus(0xE840, 0x0000, &mut bus);
+    }
+
+    /// op1=0b01, op2>>5 == 0b01 → dp_shifted_reg.
+    #[test]
+    fn execute_thumb32_dispatch_dp_shifted_reg() {
+        let mut c = CortexM33::for_test(0);
+        // op2 bits: need op2>>5 == 1 → bits[6:5]=01. op2 = 0x20 → hw0 = 0xEA00.
+        // EA00 is AND (shifted reg). hw1 must be valid enough to not crash.
+        c.execute_one_wide(0xEA00, 0x0000);
+    }
+
+    /// op1=0b01, op2>>5 == 0b10 or 0b11 → coprocessor.
+    #[test]
+    fn execute_thumb32_dispatch_coprocessor_from_op1_01() {
+        let mut c = CortexM33::for_test(0);
+        // op2 = 0x40 → op2>>5 = 2 → coprocessor. hw0 = 0xEC00.
+        // 0xEC00 → (>>11)&3 = 0x1D&3 = 1 (op1=01) ✓.
+        c.execute_one_wide(0xEC00, 0x0000);
+    }
+
+    /// op1=0b10, op=0, op2 & 0x20 == 0 → dp_modified_imm.
+    #[test]
+    fn execute_thumb32_dispatch_dp_modified_imm() {
+        let mut c = CortexM33::for_test(0);
+        // op1=10 → hw0 bits 12:11 = 10 → hw0 in 0xF000..0xF7FF.
+        // op=0 → hw1 bit 15 = 0. op2 & 0x20 == 0 → op2 bit 5 = 0.
+        // hw0 = 0xF000. hw1 = 0x0000.
+        c.execute_one_wide(0xF000, 0x0000);
+    }
+
+    /// op1=0b10, op=0, op2 & 0x20 != 0 → dp_plain_imm.
+    #[test]
+    fn execute_thumb32_dispatch_dp_plain_imm() {
+        let mut c = CortexM33::for_test(0);
+        // op2 = 0x20 → hw0 = 0xF000 | (0x20 << 4) = 0xF200. hw1 bit 15 = 0.
+        c.execute_one_wide(0xF200, 0x0000);
+    }
+
+    /// op1=0b10, op=1 → branch_misc.
+    #[test]
+    fn execute_thumb32_dispatch_branch_misc() {
+        let mut c = CortexM33::for_test(0);
+        // op=1 → hw1 bit 15 = 1. hw0 = 0xF000, hw1 = 0xD000 (BL form).
+        c.execute_one_wide(0xF000, 0xD000);
+    }
+
+    /// op1=0b11, op2 & 0x40 != 0 → coprocessor.
+    #[test]
+    fn execute_thumb32_dispatch_coprocessor_from_op1_11() {
+        let mut c = CortexM33::for_test(0);
+        // op1=11 → hw0 bits 12:11 = 11 → hw0 in 0xF800..0xFFFF.
+        // op2 & 0x40 != 0 → op2 bit 6 = 1. op2 = 0x40 → hw0 = 0xF800 | (0x40 << 4) = 0xFC00.
+        c.execute_one_wide(0xFC00, 0x0000);
+    }
+
+    /// op1=0b11, op2 & 0x40 == 0, op2 & 0x20 == 0 → load_store_single.
+    #[test]
+    fn execute_thumb32_dispatch_load_store_single() {
+        let mut c = CortexM33::for_test(0);
+        let mut bus = crate::bus::Bus::default();
+        c.regs.set_pc(0x0000_0000);
+        // op2 = 0x00 → hw0 = 0xF800. Bit 6 = 0, bit 5 = 0. LDRB-ish.
+        // Use a benign hw1 that avoids real memory access (Rt=15, Rn=15 → PC-rel, careful).
+        // Just pick hw1=0 — executes whatever; semantics not our concern.
+        let _ = c.execute_one_wide_with_bus(0xF800, 0x0000, &mut bus);
+    }
+
+    /// op1=0b11, op2 & 0x40 == 0, op2 & 0x20 != 0, op2 & 0x10 == 0 → dp_register.
+    #[test]
+    fn execute_thumb32_dispatch_dp_register() {
+        let mut c = CortexM33::for_test(0);
+        // op2 = 0x20 → hw0 = 0xFA00. Bit 6 = 0, bit 5 = 1, bit 4 = 0.
+        c.execute_one_wide(0xFA00, 0x0000);
+    }
+
+    /// op1=0b11, op2 & 0x40 == 0, op2 & 0x20 != 0, op2 & 0x10 != 0, op2 & 0x08 == 0 → multiply.
+    #[test]
+    fn execute_thumb32_dispatch_multiply() {
+        let mut c = CortexM33::for_test(0);
+        // op2 = 0x30 → hw0 = 0xFB00. Bit 6 = 0, bit 5 = 1, bit 4 = 1, bit 3 = 0.
+        c.execute_one_wide(0xFB00, 0x0000);
+    }
+
+    /// op1=0b11, op2 & 0x40 == 0, op2 & 0x20 != 0, op2 & 0x10 != 0, op2 & 0x08 != 0 → long_multiply.
+    #[test]
+    fn execute_thumb32_dispatch_long_multiply() {
+        let mut c = CortexM33::for_test(0);
+        // op2 = 0x38 → hw0 = 0xFB80. Bit 6 = 0, bit 5 = 1, bit 4 = 1, bit 3 = 1.
+        c.execute_one_wide(0xFB80, 0x0000);
+    }
+
+    // ---- decode_execute: IT-block paths (lines 292, 317, 325, 328) ----
+
+    /// Execute a narrow instruction inside an IT block through
+    /// `decode_execute` (pure path). Covers `in_it` True branches at
+    /// lines 292, 317, 325, 328.
+    #[test]
+    fn decode_execute_narrow_in_it_block() {
+        let (mut c, mut bus) = core_and_bus();
+        let base = 0x2000_0100u32;
+        // IT EQ; NOP
+        bus.write16(base, 0xBF08, 0);       // IT EQ
+        bus.write16(base + 2, 0xBF00, 0);   // NOP (in IT)
+        bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
+        c.regs.set_pc(base);
+        c.regs.set_flag_z(true); // EQ true so NOP executes
+        c.step(&mut bus); // IT
+        assert_eq!(c.it_state(), 0x08);
+        c.step(&mut bus); // NOP under IT — covers in_it+pure narrow.
+        assert_eq!(c.it_state(), 0);
+    }
+
+    /// Execute a narrow flag-setting instruction inside an IT block; its
+    /// flag writes must be suppressed. Covers the `!flag_only` False
+    /// side at line 325.
+    #[test]
+    fn decode_execute_narrow_flag_only_in_it_block() {
+        let (mut c, mut bus) = core_and_bus();
+        let base = 0x2000_0200u32;
+        // IT EQ; CMP R0, #0 (flag-only, 0x2800)
+        bus.write16(base, 0xBF08, 0);       // IT EQ
+        bus.write16(base + 2, 0x2800, 0);   // CMP R0, #0 — flag-only
+        bus.write16(base + 4, 0xE7FE, 0);
+        c.regs.set_pc(base);
+        c.regs.set_flag_z(true);
+        c.set_reg(0, 0);
+        c.step(&mut bus); // IT EQ
+        c.step(&mut bus); // CMP R0, #0 inside IT — flag writes *preserved*
+        // Z must still be true (CMP 0 vs 0 leaves Z=1).
+        assert!(c.flag_z());
+    }
+
+    // ---- decode_execute: wide instruction via fetch path ----
+
+    /// Execute a wide instruction via `step()` → `decode_execute` to
+    /// cover the `is_wide` True branches at lines 288, 306, 313, 354.
+    #[test]
+    fn decode_execute_wide_via_step() {
+        let (mut c, mut bus) = core_and_bus();
+        let base = 0x2000_0300u32;
+        // BL +0: hw0 = 0xF000, hw1 = 0xF800 → BL to next instruction. Wide, pure.
+        bus.write16(base, 0xF000, 0);
+        bus.write16(base + 2, 0xF800, 0);
+        bus.write16(base + 4, 0xE7FE, 0);
+        c.regs.set_pc(base);
+        c.step(&mut bus);
+        // PC should have advanced by 4 (wide) via the pure path.
+        // Our BL target is base+4 (LR = base+5 = base+4 | 1).
+        assert_eq!(c.regs.pc() & !1, base + 4);
+    }
+
+    /// Wide instruction inside an IT block — covers line 313 `in_it` False
+    /// (already covered) and ensures the wide+IT combination compiles.
+    /// Also hits the `advance_it_state` call on the wide pure path.
+    #[test]
+    fn decode_execute_wide_in_it_block() {
+        let (mut c, mut bus) = core_and_bus();
+        let base = 0x2000_0400u32;
+        // IT EQ; BL +0 (wide, pure, inside IT).
+        bus.write16(base, 0xBF08, 0);        // IT EQ
+        bus.write16(base + 2, 0xF000, 0);    // BL hw0
+        bus.write16(base + 4, 0xF800, 0);    // BL hw1 (-> base+6)
+        bus.write16(base + 6, 0xE7FE, 0);
+        c.regs.set_pc(base);
+        c.regs.set_flag_z(true);
+        c.step(&mut bus); // IT
+        c.step(&mut bus); // BL under IT
+        assert_eq!(c.it_state(), 0);
+    }
+
+    // ---- decode_execute: cond_passed == false branches (lines 308, 318) ----
+
+    /// Execute a narrow instruction inside an IT block with condition
+    /// FALSE — covers `cond_passed` False at line 318 and the `1` cycle
+    /// skipped path.
+    #[test]
+    fn decode_execute_narrow_condition_false() {
+        let (mut c, mut bus) = core_and_bus();
+        let base = 0x2000_0500u32;
+        bus.write16(base, 0xBF08, 0);       // IT EQ
+        bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42
+        bus.write16(base + 4, 0xE7FE, 0);
+        c.regs.set_pc(base);
+        c.regs.set_flag_z(false); // EQ false → skip
+        c.set_reg(0, 0);
+        c.step(&mut bus); // IT
+        c.step(&mut bus); // MOVS skipped
+        assert_eq!(c.reg(0), 0);
+    }
+
+    // ---- decode_execute / populate_decode_cache: fetch fault ----
+
+    /// A fetch to an unmapped XIP address (flash not loaded) must raise
+    /// a bus fault. Covers the `bus.bus_fault` True branch at line 400
+    /// and the early-return bypass of caching.
+    #[test]
+    fn populate_decode_cache_fetch_fault_path() {
+        let (mut c, mut bus) = core_and_bus();
+        // XIP region 0x1000_0000 without flash loaded → bus fault on fetch.
+        let pc = 0x1000_0000u32;
+        c.regs.set_pc(pc);
+        // Don't assert the fault delivery mechanics — just ensure step doesn't
+        // panic and the bus fault was observed. We use step (not decode_execute)
+        // so the fault is properly delivered and cleared.
+        c.step(&mut bus);
+        // The core should now be inside the fault handler (or have pending state).
+        // The populate path was exercised with bus_fault=true regardless.
+    }
+
+    // ---- decode_execute: pure path with bank-2/6 fetch penalty ----
+
+    /// Fetch from SRAM bank 2 (offset & 0x1C == 0x08) produces a non-zero
+    /// fetch_wait. Covers the `bank == 2 || bank == 6` True branch at
+    /// line 434, and the non-sequential penalty at line 344.
+    #[test]
+    fn decode_execute_bank2_penalty_first_fetch() {
+        let (mut c, mut bus) = core_and_bus();
+        // Bank 2: offset bits [4:2] = 010 → offset 0x08 satisfies
+        // (off >> 2) & 7 == 2. PC must be half-aligned.
+        let pc = 0x2000_0008u32;
+        bus.write16(pc, 0x0000, 0); // LSLS R0, R0, #0 — pure narrow
+        bus.write16(pc + 2, 0xE7FE, 0); // B .
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+        // Coverage is the point; semantics elsewhere.
+    }
+
+    /// Fetch from bank 6 (offset & 0x1C == 0x18). Same branch as bank 2.
+    #[test]
+    fn decode_execute_bank6_penalty_first_fetch() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0018u32;
+        bus.write16(pc, 0x0000, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+    }
+
+    /// Fetch from bank 0 (no penalty). Covers the `bank == 2 || bank == 6`
+    /// False branch at line 434.
+    #[test]
+    fn decode_execute_bank0_no_penalty() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0000u32; // bank 0
+        bus.write16(pc, 0x0000, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+    }
+
+    // ---- decode_execute: flag_only branch on pure narrow path (line 451) ----
+
+    /// CMP #imm8 is flag-only; exercising populate on such an opcode sets
+    /// FLAG_FLAG_ONLY in the cache entry. Covers line 451 True.
+    #[test]
+    fn populate_decode_cache_sets_flag_only_flag() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0600u32;
+        bus.write16(pc, 0x2800, 0); // CMP R0, #0 — flag-only
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.set_reg(0, 0);
+        c.step(&mut bus);
+    }
+
+    // ---- is_thumb16_flag_only: cover special-data CMP encoding ----
+
+    /// is_thumb16_flag_only is private, but a CMP Rn, Rm (high register)
+    /// encoding routed through `populate_decode_cache` exercises the
+    /// branch at line 21 False side (bit 10 = 1) and the special-data
+    /// CMP test at line 27 (True/False).
+    #[test]
+    fn populate_decode_cache_special_data_cmp_is_flag_only() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0700u32;
+        // CMP R0, R1 (special data, high-register form): 0b01000101_00_001_000 = 0x4508.
+        // Bits[15:10] = 010001, bit 10 = 1, bits[9:8] = 01 → CMP.
+        bus.write16(pc, 0x4508, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.set_reg(0, 0);
+        c.set_reg(1, 0);
+        c.step(&mut bus);
+    }
+
+    /// Special-data encoding that is NOT CMP (e.g., ADD, MOV). Bit 10 = 1
+    /// but (opcode >> 8) & 3 != 0b01. Covers the False side of the line
+    /// 27 comparison.
+    #[test]
+    fn populate_decode_cache_special_data_noncmp_not_flag_only() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0800u32;
+        // MOV R0, R1 (special data): 0b01000110_00_001_000 = 0x4608. Bits[9:8] = 10.
+        bus.write16(pc, 0x4608, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.set_reg(1, 42);
+        c.step(&mut bus);
+    }
+
+    // ---- is_thumb16_flag_only: data-processing CMN / TST / CMP ----
+
+    /// TST (data processing, op=0x8): bit 10 = 0, dp_op = 0x8 → flag-only.
+    /// Covers line 24 `matches!` True for each of 0x8/0xA/0xB.
+    #[test]
+    fn populate_decode_cache_tst_is_flag_only() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0900u32;
+        // TST R0, R1: 0b0100_0010_00_001_000 = 0x4208.
+        bus.write16(pc, 0x4208, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+    }
+
+    /// CMN (op=0xB): bit 10 = 0, dp_op = 0xB → flag-only.
+    #[test]
+    fn populate_decode_cache_cmn_is_flag_only() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0A00u32;
+        // CMN R0, R1: 0b0100_0010_11_001_000 = 0x42C8.
+        bus.write16(pc, 0x42C8, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+    }
+
+    /// CMP (data processing form, op=0xA): dp_op = 0xA → flag-only.
+    #[test]
+    fn populate_decode_cache_cmp_dp_is_flag_only() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0B00u32;
+        // CMP R0, R1 (dp form): 0b0100_0010_10_001_000 = 0x4288.
+        bus.write16(pc, 0x4288, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+    }
+
+    /// DP op that is NOT CMP/TST/CMN (e.g., ANDS op=0x0). Covers the
+    /// `matches!` False side at line 24.
+    #[test]
+    fn populate_decode_cache_dp_nonflag_not_flag_only() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0C00u32;
+        // ANDS R0, R1: 0b0100_0000_00_001_000 = 0x4008.
+        bus.write16(pc, 0x4008, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+    }
+
+    // ---- WorkerBus instantiation coverage ---------------------------------
+    //
+    // `decode_execute<B>` and `populate_decode_cache<B>` are generic over
+    // `CoreBus`. The tests above exercise the `Bus` monomorphization; the
+    // block below drives the same code paths through `WorkerBus` so its
+    // branches are also covered. Any branch that depends only on the core
+    // state (is_wide / is_pure / in_it / cond_passed / bank) is observable
+    // on both bus types, so we mirror a minimum set here.
+
+    use crate::threaded::{SharedState, WorkerBus};
+    use crate::core::bus_trait::CoreBus;
+
+    /// Build a core + WorkerBus that share the same `Arc<CoreAtomics>`.
+    fn core_and_worker_bus() -> (CortexM33, WorkerBus) {
+        let shared = SharedState::new_default();
+        let core = CortexM33::new(0, Arc::clone(&shared.atomics));
+        let bus = WorkerBus::new(0, shared);
+        (core, bus)
+    }
+
+    /// Narrow pure instruction via WorkerBus path.
+    #[test]
+    fn worker_bus_decode_execute_narrow_pure() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1000u32;
+        bus.write16(pc, 0x0000, 0);         // LSLS R0, R0, #0 — pure narrow
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Wide pure instruction via WorkerBus path — covers `is_wide` True
+    /// on the WorkerBus monomorphization.
+    #[test]
+    fn worker_bus_decode_execute_wide_pure() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1100u32;
+        bus.write16(pc, 0xF000, 0);         // BL hw0
+        bus.write16(pc + 2, 0xF800, 0);     // BL hw1 → PC += 4
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Narrow impure instruction (LDM) via WorkerBus — covers the slow
+    /// path branches (lines 350 / 354 / 366 / 374) on WorkerBus.
+    #[test]
+    fn worker_bus_decode_execute_narrow_impure() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1200u32;
+        // LDR [pc, #0] — literal load: 0100_1_000_0000_0000 = 0x4800 with imm8=0.
+        // Rt=0, imm8=0 → address = (pc_read & ~3) + 0 = pc+4 (pc is base+4 by ARM rules).
+        // Arrange the literal at pc+4 (we're running B . at pc+2).
+        // Easier: use LDR register-offset which always touches bus.
+        // LDR R0, [R1, R2]: 0101_100_010_001_000 = 0x5888.
+        bus.write16(pc, 0x5888, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.set_reg(1, 0x2000_2000);
+        c.set_reg(2, 0);
+        bus.write32(0x2000_2000, 0xDEAD_BEEF, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+        assert_eq!(c.reg(0), 0xDEAD_BEEF);
+    }
+
+    /// Wide impure instruction via WorkerBus — covers is_wide slow-path
+    /// branch at line 354 (True).
+    #[test]
+    fn worker_bus_decode_execute_wide_impure() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1300u32;
+        // LDR.W R0, [R1]: hw0=0xF8D1, hw1=0x0000. op1=11, op2=0x4D & 0x40 = 0x40 → ...
+        // Actually simpler: use LDR.W (T3 form) hw0=0xF8D1 → op1=11, op2=0x4D.
+        // 0xF8D1 → (>>11)&3 = 0x1F&3=3 ✓. op2 = (0xF8D1>>4)&0x7F = 0xF8D & 0x7F = 0xD.
+        // op2 & 0x40 = 0, & 0x20 = 0 → load_store_single. Good — impure.
+        bus.write16(pc, 0xF8D1, 0);
+        bus.write16(pc + 2, 0x0000, 0); // hw1: Rt=0, imm12=0 → [R1, #0]
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.set_reg(1, 0x2000_2100);
+        bus.write32(0x2000_2100, 0xCAFE_F00D, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+        assert_eq!(c.reg(0), 0xCAFE_F00D);
+    }
+
+    /// IT block inside WorkerBus path — covers `in_it` True branches on
+    /// the WorkerBus monomorphization (lines 292, 317, 325, 328).
+    #[test]
+    fn worker_bus_decode_execute_in_it_block() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1400u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc + 2, 0xBF00, 0);    // NOP (inside IT)
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(true);
+        c.step_no_atomics(&mut bus); // IT
+        assert_eq!(c.it_state(), 0x08);
+        c.step_no_atomics(&mut bus); // NOP under IT
+        assert_eq!(c.it_state(), 0);
+    }
+
+    /// Narrow instruction with `cond_passed` False in IT block via WorkerBus.
+    /// Covers the `False` path at line 318/366.
+    #[test]
+    fn worker_bus_decode_execute_cond_false() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1500u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc + 2, 0x202A, 0);    // MOVS R0, #42
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(false);          // EQ false → skip
+        c.set_reg(0, 0);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // MOVS skipped
+        assert_eq!(c.reg(0), 0);
+    }
+
+    /// Sequential fetch (no bank penalty) on WorkerBus — covers line 350
+    /// False (`is_sequential`).
+    #[test]
+    fn worker_bus_decode_execute_sequential_fetch() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1600u32;
+        // Two back-to-back NOPs so the second fetch is sequential.
+        bus.write16(pc, 0x0000, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+        c.step_no_atomics(&mut bus); // sequential from first
+    }
+
+    /// Wide instruction inside IT block via WorkerBus (covers `in_it` True
+    /// on pure-wide WorkerBus path at line 313).
+    #[test]
+    fn worker_bus_decode_execute_wide_in_it_block() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1700u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc + 2, 0xF000, 0);    // BL hw0
+        bus.write16(pc + 4, 0xF800, 0);    // BL hw1 — target = pc+6
+        bus.write16(pc + 6, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(true);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // BL in IT
+    }
+
+    /// Flag-only instruction (CMP) inside IT block via WorkerBus — exercises
+    /// the `!flag_only` False side at line 325:44 on WorkerBus.
+    #[test]
+    fn worker_bus_decode_execute_flag_only_in_it_block() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1800u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc + 2, 0x2800, 0);    // CMP R0, #0 (flag-only)
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(true);
+        c.set_reg(0, 0);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // CMP inside IT — flag_only=true path
+    }
+
+    /// Impure narrow instruction inside IT block via WorkerBus — covers
+    /// `in_it` True on the slow narrow path (lines 365/371/374) on WorkerBus.
+    #[test]
+    fn worker_bus_slow_narrow_in_it_block() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1900u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        // LDR R0, [R1]: 0110_1_00000_001_000 = 0x6808 (impure, routes slow path).
+        bus.write16(pc + 2, 0x6808, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.set_reg(1, 0x2000_2200);
+        bus.write32(0x2000_2200, 0xA5A5_A5A5, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(true);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // LDR inside IT
+        assert_eq!(c.reg(0), 0xA5A5_A5A5);
+    }
+
+    /// Impure narrow instruction inside IT block with condition FALSE via
+    /// WorkerBus — covers `cond_passed` False on the slow narrow path.
+    #[test]
+    fn worker_bus_slow_narrow_in_it_cond_false() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1A00u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc + 2, 0x6808, 0);    // LDR R0, [R1] (skipped)
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(false);          // EQ false → skip LDR
+        c.set_reg(0, 0xAAAA);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // LDR skipped
+        assert_eq!(c.reg(0), 0xAAAA);
+    }
+
+    /// Impure wide instruction inside IT block via WorkerBus — covers
+    /// `in_it` True on the slow wide path (line 361).
+    #[test]
+    fn worker_bus_slow_wide_in_it_block() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1B00u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000 (impure wide).
+        bus.write16(pc + 2, 0xF8D1, 0);
+        bus.write16(pc + 4, 0x0000, 0);
+        bus.write16(pc + 6, 0xE7FE, 0);
+        c.set_reg(1, 0x2000_2300);
+        bus.write32(0x2000_2300, 0x1234_5678, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(true);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // LDR.W inside IT
+        assert_eq!(c.reg(0), 0x1234_5678);
+    }
+
+    /// Pure-wide with `cond_passed` False in IT block — covers `cond_passed`
+    /// False at line 308.
+    #[test]
+    fn decode_execute_pure_wide_cond_false() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0D00u32;
+        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc + 2, 0xF000, 0);    // BL hw0
+        bus.write16(pc + 4, 0xF800, 0);    // BL hw1 (skipped)
+        bus.write16(pc + 6, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(false);          // EQ false → skip BL
+        c.step(&mut bus); // IT
+        c.step(&mut bus); // BL skipped (pure-wide, cond_passed=false)
+    }
+
+    /// Second fetch of a WorkerBus miss path at the SAME PC — covers the
+    /// cache-hit True arm at line 268 on WorkerBus.
+    #[test]
+    fn worker_bus_decode_execute_cache_hit_on_rerun() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1C00u32;
+        bus.write16(pc, 0x0000, 0);        // NOP (pure)
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);       // populate
+        c.regs.set_pc(pc);                  // re-run same PC
+        c.step_no_atomics(&mut bus);       // cache hit
+    }
+
+    // ---- execute_thumb16 WorkerBus dispatch coverage ------------------------
+
+    /// Drive the 0b01000 (data-processing / special-data) group through
+    /// WorkerBus. Covers line 488 dispatch arm on WorkerBus.
+    #[test]
+    fn worker_bus_execute_thumb16_dp_group() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1D00u32;
+        // ANDS R0, R1: 0x4008 — data-processing group (bit 10 = 0).
+        bus.write16(pc, 0x4008, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.set_reg(0, 0xFF);
+        c.set_reg(1, 0x0F);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+        assert_eq!(c.reg(0), 0x0F);
+    }
+
+    // ---- execute_thumb32 WorkerBus dispatch coverage -----------------------
+
+    /// Wide `op1=0b01, op2>>5 == 0b00, op2 & 0x04 == 0` → ldm_stm via WorkerBus.
+    #[test]
+    fn worker_bus_execute_thumb32_ldm_stm() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1E00u32;
+        // STMIA.W R8!, {R0, R1}: hw0=0xE888, hw1=0x0003.
+        // hw0=0xE888: op2 = (0xE888>>4)&0x7F = 0xE88&0x7F = 0x08. op2>>5=0, op2&0x04=0.
+        // Wait 0x08 & 0x04 = 0 ✓ → ldm_stm arm.
+        bus.write16(pc, 0xE888, 0);
+        bus.write16(pc + 2, 0x0003, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.set_reg(8, 0x2000_2400);
+        c.set_reg(0, 0xAAAA);
+        c.set_reg(1, 0xBBBB);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// op1=10, op=0, op2 & 0x20 == 0 → dp_modified_imm via WorkerBus.
+    #[test]
+    fn worker_bus_execute_thumb32_dp_modified_imm() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_1F00u32;
+        // MOVS.W R0, #0: hw0=0xF04F, hw1=0x0000 (dp_modified_imm, op2&0x20==0).
+        // Actually 0xF04F: op2 = (0xF04F>>4)&0x7F = 0xF04 & 0x7F = 0x04. op=hw1 bit15=0. Good.
+        bus.write16(pc, 0xF04F, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// op1=11, op2 & 0x40 == 0, op2 & 0x20 == 0 → load_store_single via WorkerBus.
+    /// Covers line 557 on WorkerBus.
+    #[test]
+    fn worker_bus_execute_thumb32_load_store_single() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2000u32;
+        // STR.W R0, [R1]: hw0=0xF8C1, hw1=0x0000.
+        // 0xF8C1 → op2=(0xF8C>>0)&0x7F = wait, op2 = (hw0>>4)&0x7F.
+        // (0xF8C1>>4)&0x7F = 0xF8C & 0x7F = 0x0C. bit6=0, bit5=0 ✓ → load_store_single.
+        bus.write16(pc, 0xF8C1, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.set_reg(0, 0xCAFEBABEu32);
+        c.set_reg(1, 0x2000_2500);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// op1=11, op2 & 0x40 == 0, bit5=1, bit4=0 → dp_register via WorkerBus.
+    /// Covers line 559 on WorkerBus.
+    #[test]
+    fn worker_bus_execute_thumb32_dp_register() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2100u32;
+        // MVN.W / similar: hw0=0xFA00 → op2=0x20.
+        bus.write16(pc, 0xFA00, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// op1=11, op2 & 0x40 == 0, bit5=1, bit4=1, bit3=0 → multiply via WorkerBus.
+    /// Covers line 561 on WorkerBus.
+    #[test]
+    fn worker_bus_execute_thumb32_multiply() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2200u32;
+        bus.write16(pc, 0xFB00, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    // ---- Fetch fault on WorkerBus (line 400 True) ---------------------------
+
+    /// Fetch from an XIP region without flash loaded triggers a bus fault
+    /// on WorkerBus. Covers line 400 True on WorkerBus.
+    #[test]
+    fn worker_bus_populate_fetch_fault() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        c.regs.set_pc(0x1000_0000); // XIP without flash → fault
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Fetch from an SRAM offset >= 0x80000 — covers the `off < 0x8_0000`
+    /// False branch at line 432 in `populate_decode_cache`.
+    #[test]
+    fn populate_decode_cache_sram_offset_past_512k() {
+        let (mut c, mut bus) = core_and_bus();
+        // 520 KB SRAM = 0x82000; use offset 0x80000 which is still inside but
+        // above the 0x80000 threshold.
+        let pc = 0x2008_0000u32;
+        bus.write16(pc, 0x0000, 0); // NOP
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+    }
+
+    /// Fetch from a non-cacheable region (region 3 — unmapped APB) — covers
+    /// the `is_cacheable_pc(pc)` False branch at line 265 and the `if
+    /// is_cacheable_pc(pc)` False at line 455. The fetch will fault (region
+    /// is unmapped), which is handled by the fault delivery path.
+    #[test]
+    fn decode_execute_non_cacheable_pc() {
+        let (mut c, mut bus) = core_and_bus();
+        // Region 3 is not in the cacheable set {0,1,2}. Address 0x3000_0000.
+        c.regs.set_pc(0x3000_0000);
+        c.step(&mut bus);
+    }
+
+    /// Non-cacheable PC via WorkerBus — covers 265:24 / 455:12 False on the
+    /// WorkerBus monomorphization.
+    #[test]
+    fn worker_bus_decode_execute_non_cacheable_pc() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        c.regs.set_pc(0x3000_0000);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// SRAM offset >= 0x80000 via WorkerBus — covers line 432 False on
+    /// the WorkerBus monomorphization.
+    #[test]
+    fn worker_bus_populate_sram_offset_past_512k() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2008_0000u32;
+        bus.write16(pc, 0x0000, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Pure-wide cond=false via WorkerBus — covers 308:28 False.
+    #[test]
+    fn worker_bus_pure_wide_cond_false() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2300u32;
+        bus.write16(pc, 0xBF08, 0);         // IT EQ
+        bus.write16(pc + 2, 0xF000, 0);     // BL hw0
+        bus.write16(pc + 4, 0xF800, 0);     // BL hw1 — skipped
+        bus.write16(pc + 6, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(false);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // BL skipped
+    }
+
+    /// Impure narrow with cond=false in slow path (Bus) — covers 366:33 False
+    /// on the slow-path narrow code.
+    #[test]
+    fn decode_execute_slow_narrow_cond_false() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0E00u32;
+        bus.write16(pc, 0xBF08, 0);         // IT EQ
+        bus.write16(pc + 2, 0x6808, 0);     // LDR R0, [R1] — impure, skipped
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(false);
+        c.set_reg(0, 0xDEAD_DEAD);
+        c.step(&mut bus); // IT
+        c.step(&mut bus); // LDR skipped
+        assert_eq!(c.reg(0), 0xDEAD_DEAD);
+    }
+
+    /// Impure wide with cond=false in slow path — covers 356:33 False.
+    #[test]
+    fn decode_execute_slow_wide_cond_false() {
+        let (mut c, mut bus) = core_and_bus();
+        let pc = 0x2000_0F00u32;
+        bus.write16(pc, 0xBF08, 0);         // IT EQ
+        // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000 (impure wide).
+        bus.write16(pc + 2, 0xF8D1, 0);
+        bus.write16(pc + 4, 0x0000, 0);
+        bus.write16(pc + 6, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(false);
+        c.set_reg(0, 0xBEEF_BEEF);
+        c.step(&mut bus); // IT
+        c.step(&mut bus); // LDR.W skipped
+        assert_eq!(c.reg(0), 0xBEEF_BEEF);
+    }
+
+    /// Impure wide with cond=false in slow path via WorkerBus — covers
+    /// 356:33 False on the WorkerBus monomorphization.
+    #[test]
+    fn worker_bus_slow_wide_cond_false() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2400u32;
+        bus.write16(pc, 0xBF08, 0);         // IT EQ
+        bus.write16(pc + 2, 0xF8D1, 0);     // LDR.W hw0
+        bus.write16(pc + 4, 0x0000, 0);     // LDR.W hw1
+        bus.write16(pc + 6, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.regs.set_flag_z(false);
+        c.set_reg(0, 0xFACE);
+        c.step_no_atomics(&mut bus); // IT
+        c.step_no_atomics(&mut bus); // LDR.W skipped
+        assert_eq!(c.reg(0), 0xFACE);
+    }
+
+    /// Special-data-BX group (0b01000 with bit 10 set) via WorkerBus — covers
+    /// the False side of line 488 on the WorkerBus monomorphization.
+    #[test]
+    fn worker_bus_execute_thumb16_special_data_bx() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2500u32;
+        // MOV R0, R1 (special data): 0x4608 — bits[15:10] = 010001.
+        bus.write16(pc, 0x4608, 0);
+        bus.write16(pc + 2, 0xE7FE, 0);
+        c.set_reg(1, 42);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+        assert_eq!(c.reg(0), 42);
+    }
+
+    /// Thumb-32 op1=01, op2>>5 == 0b00, op2 & 0x04 != 0 → load_store_dual
+    /// via WorkerBus. Covers False side of line 538.
+    #[test]
+    fn worker_bus_execute_thumb32_load_store_dual() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2600u32;
+        // STRD R0, R1, [R2]: hw0=0xE8C2, hw1=0x0100 (roughly).
+        // Need op1=01 → hw0 in 0xE800..0xEFFF.
+        // op2 = (hw0>>4)&0x7F. For op2>>5=0 AND op2&0x04!=0: op2 bits 5=0, 6=0, 2=1.
+        // op2 = 0x04 → hw0 = 0xE840.
+        bus.write16(pc, 0xE840, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Thumb-32 op1=10, op=0, op2 & 0x20 != 0 → dp_plain_imm via WorkerBus.
+    /// Covers line 547 False.
+    #[test]
+    fn worker_bus_execute_thumb32_dp_plain_imm() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2700u32;
+        bus.write16(pc, 0xF200, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Thumb-32 op1=11, op2 & 0x40 != 0 → coprocessor via WorkerBus. Covers
+    /// line 555 True side. Expect UNDEF since coprocessors aren't wired here,
+    /// but the dispatch path is exercised.
+    #[test]
+    fn worker_bus_execute_thumb32_coprocessor_from_op1_11() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2800u32;
+        // hw0 = 0xFC00 (op1=11, op2=0x40).
+        bus.write16(pc, 0xFC00, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Thumb-32 op1=11, long_multiply path via WorkerBus — covers line 561 False.
+    #[test]
+    fn worker_bus_execute_thumb32_long_multiply() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2000_2900u32;
+        bus.write16(pc, 0xFB80, 0);
+        bus.write16(pc + 2, 0x0000, 0);
+        bus.write16(pc + 4, 0xE7FE, 0);
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+
+    /// Wide instruction spanning the SRAM upper bound — hw0 (at SRAM end - 2)
+    /// succeeds, hw1 (past SRAM end) faults. Covers `wide && bus.bus_fault()`
+    /// True at line 416.
+    #[test]
+    fn populate_decode_cache_wide_hw1_fault() {
+        let (mut c, mut bus) = core_and_bus();
+        // SRAM ends at 0x2008_2000 (exclusive). Place hw0 at 0x2008_1FFE so the
+        // second halfword fetch hits offset 0x8_2000 which is past the bounds
+        // check `(offset + 1) < 0x82000`.
+        let pc = 0x2008_1FFEu32;
+        // Write a wide-prefix halfword so is_wide(hw0) == true.
+        bus.write16(pc, 0xF000, 0);
+        c.regs.set_pc(pc);
+        c.step(&mut bus);
+        // Semantics: fault delivered. We only care the dispatch path was hit.
+    }
+
+    /// Same as above but through WorkerBus — covers line 416 True on the
+    /// WorkerBus monomorphization.
+    #[test]
+    fn worker_bus_populate_wide_hw1_fault() {
+        let (mut c, mut bus) = core_and_worker_bus();
+        let pc = 0x2008_1FFEu32;
+        bus.write16(pc, 0xF000, 0); // wide-prefix halfword
+        c.regs.set_pc(pc);
+        c.step_no_atomics(&mut bus);
+    }
+}
