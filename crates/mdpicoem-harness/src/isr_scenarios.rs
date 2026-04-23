@@ -1235,45 +1235,62 @@ const MODESET_IRQ_POWMAN: &[VectorSlot] = &[
     VectorSlot::new(61, IRQ_HANDLER_OFFSET),
 ];
 
-/// POWMAN handler — write `0xCAFE_BABE` to mailbox and BKPT #0. Same
-/// shape as `HANDLER_IRQ_CYCCNT` but stores a fixed sentinel instead
-/// of the CYCCNT snapshot, so the observable is trivially diffable.
+/// POWMAN handler — V13 Stage 2. Captures CYCCNT into
+/// `ISR_MAILBOX_CYCCNT` (for the `cyccnt_delta` observable) *and*
+/// stores the `0xCAFE_BABE` sentinel into `ISR_MAILBOX_RESERVED` (for
+/// the deterministic `mailbox_sentinel` observable), then `bkpt #0`.
+///
+/// Two mailbox slots so pass/fail and timing drift are diffed
+/// independently: the sentinel is exact-compared (HW = EMU =
+/// 0xCAFE_BABE), while CYCCNT values differ modulo XOSC/sys_clk phase
+/// and are inspected as an informational delta in the oracle's FAIL
+/// output. The single-slot V12 handler couldn't carry both signals.
 ///
 /// Handler body at `IRQ_HANDLER_OFFSET = 0x104`. PC-relative LDR on
-/// Thumb resolves its target as `Align(PC+4, 4) + imm8*4`, where PC
-/// is the address of the current instruction. Because hw[1] sits at
-/// a *non-word-aligned* offset (0x106), its PC of 0x10A aligns DOWN
-/// to 0x108 before the imm8 offset is applied — so the imm8 needed
-/// for hw[1] differs from the one needed for hw[0].
+/// Thumb resolves its target as `Align(PC+4, 4) + imm8*4`. All three
+/// literal loads in this handler sit at *word-aligned* instruction
+/// offsets (hw[0], hw[2], hw[4] at 0x104/0x108/0x10C), so PC aligns
+/// cleanly and each picks up the 0x4800 | 3 encoding.
 ///
-/// Resolution table for this handler:
+/// Resolution table:
 ///
-/// * `hw[0]` at 0x104: PC=0x108, Align=0x108, target hw[6]=0x110
-///   (= 0xCAFE_BABE). imm8=2 → `0x4802` (`ldr r0, [pc, #8]`).
-/// * `hw[1]` at 0x106: PC=0x10A, Align=0x108, target hw[8]=0x114
-///   (= ISR_MAILBOX_CYCCNT). imm8=3 → `0x4903` (`ldr r1, [pc, #12]`).
+/// * `hw[0]` at 0x104: PC=0x108, Align=0x108, target hw[8]=0x114
+///   (= DWT_CYCCNT_ADDR). imm8=3 → `0x4803` (`ldr r0, [pc, #12]`).
+/// * `hw[2]` at 0x108: PC=0x10C, Align=0x10C, target hw[10]=0x118
+///   (= ISR_MAILBOX_BASE). imm8=3 → `0x4903` (`ldr r1, [pc, #12]`).
+/// * `hw[4]` at 0x10C: PC=0x110, Align=0x110, target hw[12]=0x11C
+///   (= 0xCAFE_BABE). imm8=3 → `0x4803` (`ldr r0, [pc, #12]`).
+/// * `hw[5]` is `str r0, [r1, #4]` (0x6048) — stores the sentinel at
+///   `ISR_MAILBOX_BASE + 4 = ISR_MAILBOX_RESERVED`.
 ///
 /// ```text
-///   [0] ldr r0, [pc, #8]     ; r0 = 0xCAFEBABE (from hw[6..7])
-///   [1] ldr r1, [pc, #12]    ; r1 = ISR_MAILBOX_CYCCNT (from hw[8..9])
-///   [2] str r0, [r1]         ; mailbox = sentinel
-///   [3] bkpt #0              ; halt
-///   [4] bkpt #0              ; padding
-///   [5] bkpt #0              ; padding
-///   [6..7] lit: 0xCAFEBABE
-///   [8..9] lit: ISR_MAILBOX_CYCCNT
+///   [0] ldr r0, [pc, #12]    ; r0 = DWT_CYCCNT_ADDR (hw[8..9])
+///   [1] ldr r0, [r0]         ; r0 = *CYCCNT
+///   [2] ldr r1, [pc, #12]    ; r1 = ISR_MAILBOX_BASE (hw[10..11])
+///   [3] str r0, [r1]         ; mailbox_cyccnt = CYCCNT
+///   [4] ldr r0, [pc, #12]    ; r0 = 0xCAFEBABE (hw[12..13])
+///   [5] str r0, [r1, #4]     ; mailbox_reserved = sentinel
+///   [6] bkpt #0              ; halt
+///   [7] bkpt #0              ; padding (keep literal pool aligned)
+///   [8..9]   lit: DWT_CYCCNT_ADDR
+///   [10..11] lit: ISR_MAILBOX_BASE
+///   [12..13] lit: 0xCAFEBABE
 /// ```
-const HANDLER_POWMAN_SENTINEL: [u16; 10] = [
-    0x4802, //  [0] ldr r0, [pc, #8]    — r0 = 0xCAFE_BABE
-    0x4903, //  [1] ldr r1, [pc, #12]   — r1 = ISR_MAILBOX_CYCCNT
-    0x6008, //  [2] str r0, [r1]
-    0xBE00, //  [3] bkpt #0             — halt for host readback
-    0xBE00, //  [4] bkpt #0             — padding
-    0xBE00, //  [5] bkpt #0             — padding
-    0xBABE, //  [6] lit: 0xCAFEBABE low
-    0xCAFE, //  [7] lit: 0xCAFEBABE high
-    0x3FF8, //  [8] lit: ISR_MAILBOX_CYCCNT low  = 0x2000_3FF8 & 0xFFFF
-    0x2000, //  [9] lit: ISR_MAILBOX_CYCCNT high = 0x2000_3FF8 >> 16
+const HANDLER_POWMAN_SENTINEL: [u16; 14] = [
+    0x4803, //  [ 0] ldr r0, [pc, #12]  — r0 = DWT_CYCCNT_ADDR
+    0x6800, //  [ 1] ldr r0, [r0]       — r0 = *CYCCNT
+    0x4903, //  [ 2] ldr r1, [pc, #12]  — r1 = ISR_MAILBOX_BASE
+    0x6008, //  [ 3] str r0, [r1]       — mailbox_cyccnt = CYCCNT
+    0x4803, //  [ 4] ldr r0, [pc, #12]  — r0 = 0xCAFEBABE
+    0x6048, //  [ 5] str r0, [r1, #4]   — mailbox_reserved = sentinel
+    0xBE00, //  [ 6] bkpt #0            — halt for host readback
+    0xBE00, //  [ 7] bkpt #0            — padding
+    0x1004, //  [ 8] lit: DWT_CYCCNT_ADDR low  = 0xE000_1004 & 0xFFFF
+    0xE000, //  [ 9] lit: DWT_CYCCNT_ADDR high = 0xE000_1004 >> 16
+    0x3FF8, //  [10] lit: ISR_MAILBOX_BASE low  = 0x2000_3FF8 & 0xFFFF
+    0x2000, //  [11] lit: ISR_MAILBOX_BASE high = 0x2000_3FF8 >> 16
+    0xBABE, //  [12] lit: 0xCAFEBABE low
+    0xCAFE, //  [13] lit: 0xCAFEBABE high
 ];
 
 /// POWMAN scenario main — release POWMAN, program alarm = 100, enable
@@ -1409,12 +1426,23 @@ const INIT_IRQ_POWMAN: &[(IsrReg, u32)] = &[
     (IsrReg::Vtor, ISR_IMAGE_BASE),
 ];
 const OBS_IRQ_POWMAN: &[(&str, IsrObservable)] = &[
-    // CycleDelta slot carries the 0xCAFE_BABE sentinel the handler
-    // wrote. Runner pre-seeds ISR_MAILBOX_CYCCNT = 0 (not the
-    // HLD-prescribed 0xDEAD_BEEF — kept consistent with the existing
-    // runner infrastructure); a post-run read of 0 means the handler
-    // never ran, 0xCAFE_BABE means it did.
-    ("mailbox_sentinel", IsrObservable::CycleDelta),
+    // V13 Stage 2 — two observables in parallel:
+    //
+    // `cyccnt_delta` — reads ISR_MAILBOX_CYCCNT, which the handler
+    //   populates with the CYCCNT snapshot at entry. HW and EMU
+    //   CYCCNT values differ modulo XOSC-to-sys_clk phase (POWMAN
+    //   ticks on XOSC/4 while exception entry timing is sys_clk-
+    //   domain), so the oracle reports both so timing drift is
+    //   visible even when the exact compare fails.
+    // `mailbox_sentinel` — reads ISR_MAILBOX_RESERVED, a deterministic
+    //   `0xCAFE_BABE` proof that the handler ran and reached the
+    //   sentinel store. HW = EMU = 0xCAFE_BABE; this is the primary
+    //   pass/fail signal.
+    ("cyccnt_delta", IsrObservable::CycleDelta),
+    (
+        "mailbox_sentinel",
+        IsrObservable::Mmio(crate::ISR_MAILBOX_RESERVED, !0),
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -2684,15 +2712,17 @@ mod tests {
         }
     }
 
-    /// POWMAN handler literal-pool strengthening: the value loaded for
-    /// r0 must be `0xCAFE_BABE` and the value loaded for r1 must equal
-    /// `ISR_MAILBOX_CYCCNT`. Regression guard for the original
-    /// `0x4902` (`ldr r1, [pc, #8]`) bug — because hw[1] sits at a
-    /// non-word-aligned offset (0x106), imm8=2 resolved to hw[6] (the
-    /// `0xCAFE_BABE` sentinel) rather than hw[8] (the mailbox address),
-    /// so the handler silently stored 0xCAFE_BABE into 0xCAFEBABE and
-    /// faulted. The correct encoding is `0x4903` (imm8=3), which
-    /// resolves to hw[8]. This test locks that in.
+    /// POWMAN handler literal-pool strengthening (V13 Stage 2 layout).
+    /// The handler must load three literals — `DWT_CYCCNT_ADDR` (into
+    /// r0 at hw[0]), `ISR_MAILBOX_BASE` (into r1 at hw[2]), and
+    /// `0xCAFE_BABE` (into r0 at hw[4]) — to populate both mailbox
+    /// slots. Originally guarded the V11 `0x4902` bug (imm8=2 was
+    /// mis-aligned past a non-word-aligned LDR at hw[1], pointing at
+    /// the sentinel literal instead of the mailbox address); V13
+    /// restructures the handler so all three LDRs sit at word-aligned
+    /// positions and imm8 is uniformly 3, but keeps the same "walk the
+    /// assembled image and assert literal targets" shape so a future
+    /// encoding regression can't silently ship.
     #[test]
     fn test_handler_powman_sentinel_literals_are_mailbox_and_sentinel() {
         let sc = SCENARIOS
@@ -2705,25 +2735,42 @@ mod tests {
             layout.handler_offset as usize,
             layout.main_offset as usize,
         );
-        let r0_word = loads
+
+        // V13 Stage 2: three literal loads in order — r0=DWT_CYCCNT_ADDR,
+        // r1=ISR_MAILBOX_BASE, r0=0xCAFE_BABE. Match by address so the
+        // `find` calls bind to specific instruction offsets, not just
+        // "first LDR r0".
+        const DWT_CYCCNT_ADDR: u32 = 0xE000_1004;
+        let r0_loads: Vec<u32> = loads
             .iter()
-            .find(|(_, rd, _, _)| *rd == 0)
+            .filter(|(_, rd, _, _)| *rd == 0)
             .map(|(_, _, _, w)| *w)
-            .expect("POWMAN handler must contain an LDR targeting r0");
-        let r1_word = loads
+            .collect();
+        let r1_loads: Vec<u32> = loads
             .iter()
-            .find(|(_, rd, _, _)| *rd == 1)
+            .filter(|(_, rd, _, _)| *rd == 1)
             .map(|(_, _, _, w)| *w)
-            .expect("POWMAN handler must contain an LDR targeting r1");
-        assert_eq!(
-            r0_word, 0xCAFE_BABE,
-            "POWMAN handler r0 literal must be 0xCAFE_BABE; got 0x{r0_word:08X}",
+            .collect();
+
+        assert!(
+            r0_loads.iter().any(|w| *w == DWT_CYCCNT_ADDR),
+            "POWMAN handler must LDR r0 ← DWT_CYCCNT_ADDR (0x{:08X}); \
+             got r0 loads: {:X?}",
+            DWT_CYCCNT_ADDR,
+            r0_loads,
         );
-        assert_eq!(
-            r1_word, crate::ISR_MAILBOX_CYCCNT,
-            "POWMAN handler r1 literal must be ISR_MAILBOX_CYCCNT \
-             (= 0x{:08X}); got 0x{r1_word:08X}",
-            crate::ISR_MAILBOX_CYCCNT,
+        assert!(
+            r0_loads.iter().any(|w| *w == 0xCAFE_BABE),
+            "POWMAN handler must LDR r0 ← 0xCAFE_BABE sentinel; got \
+             r0 loads: {:X?}",
+            r0_loads,
+        );
+        assert!(
+            r1_loads.iter().any(|w| *w == crate::ISR_MAILBOX_BASE),
+            "POWMAN handler must LDR r1 ← ISR_MAILBOX_BASE \
+             (= 0x{:08X}); got r1 loads: {:X?}",
+            crate::ISR_MAILBOX_BASE,
+            r1_loads,
         );
     }
 
@@ -3021,5 +3068,75 @@ mod tests {
         // Sanity-check both scenarios actually reached their handler.
         assert!(cold_mbx > 0, "cold scenario never wrote mailbox");
         assert!(tail_mbx > 0, "tail-chain scenario never wrote mailbox");
+    }
+
+    // --- V13 Stage 2 — POWMAN scenario CYCCNT observable -----------
+    //
+    // Red test: the POWMAN scenario must surface both observables —
+    // a deterministic sentinel (so handler-ran is binary-clear) AND a
+    // CYCCNT delta (so timing drift between HW and EMU is visible in
+    // the oracle output, even if not a pass/fail discriminator in its
+    // own right). V11/V12 only surfaced the sentinel, mapped through
+    // the CycleDelta slot; that loses the timing signal.
+
+    #[test]
+    fn powman_scenario_exposes_both_cyccnt_and_sentinel_observables() {
+        use crate::{ISR_MAILBOX_CYCCNT, ISR_MAILBOX_RESERVED};
+
+        let sc = SCENARIOS
+            .iter()
+            .find(|s| s.name == "isr_powman_match_timer_line_45")
+            .expect("POWMAN scenario must exist in the catalogue");
+
+        let cyccnt_obs = sc
+            .observe
+            .iter()
+            .find(|(name, _)| *name == "cyccnt_delta")
+            .map(|(_, obs)| *obs)
+            .expect(
+                "POWMAN scenario must expose a `cyccnt_delta` observable \
+                 (V13 Stage 2)",
+            );
+        match cyccnt_obs {
+            IsrObservable::CycleDelta => {
+                // CycleDelta reads ISR_MAILBOX_CYCCNT; the handler
+                // must mailbox its CYCCNT reading there.
+            }
+            other => panic!(
+                "POWMAN `cyccnt_delta` must be the CycleDelta variant \
+                 (reads ISR_MAILBOX_CYCCNT = {:#010X}); got {:?}",
+                ISR_MAILBOX_CYCCNT, other
+            ),
+        }
+
+        let sentinel_obs = sc
+            .observe
+            .iter()
+            .find(|(name, _)| *name == "mailbox_sentinel")
+            .map(|(_, obs)| *obs)
+            .expect(
+                "POWMAN scenario must expose a `mailbox_sentinel` \
+                 observable (V13 Stage 2)",
+            );
+        match sentinel_obs {
+            IsrObservable::Mmio(addr, mask) => {
+                assert_eq!(
+                    addr, ISR_MAILBOX_RESERVED,
+                    "POWMAN `mailbox_sentinel` must read ISR_MAILBOX_RESERVED \
+                     ({:#010X}) — the sentinel slot moved off the CYCCNT \
+                     mailbox when cyccnt_delta was added (V13 Stage 2)",
+                    ISR_MAILBOX_RESERVED,
+                );
+                assert_eq!(
+                    mask, !0,
+                    "sentinel compare must be full-word (exact 0xCAFE_BABE)",
+                );
+            }
+            other => panic!(
+                "POWMAN `mailbox_sentinel` must be the Mmio variant at \
+                 ISR_MAILBOX_RESERVED; got {:?}",
+                other
+            ),
+        }
     }
 }
