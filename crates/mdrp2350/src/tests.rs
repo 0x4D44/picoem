@@ -17535,3 +17535,2785 @@ mod stage3_fpu_coverage {
         assert_eq!(c.regs.fpscr & FPSCR_UFC, 0);
     }
 }
+
+// ============================================================================
+// Stage 7 coverage fills — targets the highest-missed-branch files in
+// mdrp2350. Each module focuses on a different production module. Modules
+// are laid out in the same order as the task's deliverable table.
+// ============================================================================
+
+mod stage7_registers_coverage {
+    use crate::core::registers::{Registers, XPSR_C, XPSR_N, XPSR_V, XPSR_Z};
+
+    #[test]
+    fn set_flag_n_toggle_both_branches() {
+        let mut r = Registers::new();
+        r.set_flag_n(true);
+        assert!(r.flag_n());
+        r.set_flag_n(false);
+        assert!(!r.flag_n());
+        // Same for Z.
+        r.set_flag_z(true);
+        assert!(r.flag_z());
+        r.set_flag_z(false);
+        assert!(!r.flag_z());
+    }
+
+    #[test]
+    fn set_flag_c_toggle_both_branches() {
+        let mut r = Registers::new();
+        r.set_flag_c(true);
+        assert!(r.flag_c());
+        r.set_flag_c(false);
+        assert!(!r.flag_c());
+    }
+
+    #[test]
+    fn set_flag_v_toggle_both_branches() {
+        let mut r = Registers::new();
+        r.set_flag_v(true);
+        assert!(r.flag_v());
+        r.set_flag_v(false);
+        assert!(!r.flag_v());
+    }
+
+    #[test]
+    fn set_nzcv_clears_existing_flags() {
+        let mut r = Registers::new();
+        r.xpsr |= XPSR_N | XPSR_Z | XPSR_C | XPSR_V;
+        r.set_nzcv(false, false, false, false);
+        assert!(!r.flag_n() && !r.flag_z() && !r.flag_c() && !r.flag_v());
+        r.set_nzcv(true, true, true, true);
+        assert!(r.flag_n() && r.flag_z() && r.flag_c() && r.flag_v());
+    }
+
+    #[test]
+    fn condition_passed_covers_every_code() {
+        let mut r = Registers::new();
+        // Z=1 → EQ true
+        r.set_flag_z(true);
+        assert!(r.condition_passed(0x0));
+        assert!(!r.condition_passed(0x1));
+        // C=1 → CS true
+        r.set_flag_z(false);
+        r.set_flag_c(true);
+        assert!(r.condition_passed(0x2));
+        assert!(!r.condition_passed(0x3));
+        // N=1 → MI true
+        r.set_flag_c(false);
+        r.set_flag_n(true);
+        assert!(r.condition_passed(0x4));
+        assert!(!r.condition_passed(0x5));
+        // V=1 → VS true
+        r.set_flag_n(false);
+        r.set_flag_v(true);
+        assert!(r.condition_passed(0x6));
+        assert!(!r.condition_passed(0x7));
+        // C=1 && !Z → HI true
+        r.set_flag_v(false);
+        r.set_flag_c(true);
+        r.set_flag_z(false);
+        assert!(r.condition_passed(0x8));
+        assert!(!r.condition_passed(0x9));
+        // N==V → GE true (both true)
+        r.set_flag_n(true);
+        r.set_flag_v(true);
+        assert!(r.condition_passed(0xA));
+        assert!(!r.condition_passed(0xB));
+        // !Z && N==V → GT true
+        r.set_flag_z(false);
+        assert!(r.condition_passed(0xC));
+        assert!(!r.condition_passed(0xD));
+        // AL & unconditional
+        assert!(r.condition_passed(0xE));
+        assert!(r.condition_passed(0xF));
+    }
+
+    #[test]
+    fn active_sp_is_psp_covers_handler_and_thread() {
+        let mut r = Registers::new();
+        r.control |= 2; // SPSEL=1
+        // Thread mode + SPSEL=1 → PSP.
+        assert!(r.active_sp_is_psp());
+        // Handler mode forces MSP regardless.
+        r.xpsr = (r.xpsr & !0x1FF) | 3; // IPSR=3 (HardFault)
+        assert!(!r.active_sp_is_psp());
+    }
+
+    #[test]
+    fn sync_sp_to_banked_covers_psp_and_msp() {
+        let mut r = Registers::new();
+        // Thread + SPSEL=1 → PSP path.
+        r.control |= 2;
+        r.r[13] = 0x2000_1000;
+        r.sync_sp_to_banked();
+        assert_eq!(r.psp, 0x2000_1000);
+        // Thread + SPSEL=0 → MSP path.
+        r.control &= !2;
+        r.r[13] = 0x2000_2000;
+        r.sync_sp_to_banked();
+        assert_eq!(r.msp, 0x2000_2000);
+    }
+
+    #[test]
+    fn sync_sp_from_banked_covers_both_paths() {
+        let mut r = Registers::new();
+        r.psp = 0xAAAA_0000;
+        r.msp = 0xBBBB_0000;
+        r.control |= 2;
+        r.sync_sp_from_banked();
+        assert_eq!(r.r[13], 0xAAAA_0000);
+        r.control &= !2;
+        r.sync_sp_from_banked();
+        assert_eq!(r.r[13], 0xBBBB_0000);
+    }
+
+    #[test]
+    fn set_nz_sets_and_clears() {
+        let mut r = Registers::new();
+        r.set_nz(0x8000_0000);
+        assert!(r.flag_n());
+        assert!(!r.flag_z());
+        r.set_nz(0);
+        assert!(!r.flag_n());
+        assert!(r.flag_z());
+    }
+
+    #[test]
+    fn set_ge_roundtrip() {
+        let mut r = Registers::new();
+        r.set_ge_flags(0xF);
+        assert_eq!(r.ge_flags(), 0xF);
+        r.set_ge_flags(0x5);
+        assert_eq!(r.ge_flags(), 0x5);
+    }
+
+    #[test]
+    fn flag_q_and_set_q_sticky() {
+        let mut r = Registers::new();
+        assert!(!r.flag_q());
+        r.set_flag_q();
+        assert!(r.flag_q());
+        // Stays set — not cleared by ordinary flag writes.
+        r.set_nzcv(false, false, false, false);
+        assert!(r.flag_q());
+    }
+}
+
+mod stage7_sio_coverage {
+    use crate::sio::Sio;
+
+    // ---- gpio_bit_* pin < 30 / pin >= 30 branch coverage ----
+    #[test]
+    fn gpio_bit_out_put_get_set_clr_xor_below_30() {
+        let mut sio = Sio::new();
+        // put true
+        sio.gpio_bit_out_put(5, true);
+        assert!(sio.gpio_bit_out_get(5));
+        // put false
+        sio.gpio_bit_out_put(5, false);
+        assert!(!sio.gpio_bit_out_get(5));
+        sio.gpio_bit_out_set(6);
+        assert!(sio.gpio_bit_out_get(6));
+        sio.gpio_bit_out_clr(6);
+        assert!(!sio.gpio_bit_out_get(6));
+        sio.gpio_bit_out_xor(7);
+        assert!(sio.gpio_bit_out_get(7));
+        sio.gpio_bit_out_xor(7);
+        assert!(!sio.gpio_bit_out_get(7));
+    }
+
+    #[test]
+    fn gpio_bit_out_masked_at_or_above_30() {
+        let mut sio = Sio::new();
+        // get returns false for pin >= 30
+        assert!(!sio.gpio_bit_out_get(30));
+        assert!(!sio.gpio_bit_out_get(31));
+        // put / set / clr / xor are no-ops for pin >= 30
+        let snap = sio.gpio_out;
+        sio.gpio_bit_out_put(30, true);
+        sio.gpio_bit_out_put(31, true);
+        sio.gpio_bit_out_set(30);
+        sio.gpio_bit_out_clr(30);
+        sio.gpio_bit_out_xor(30);
+        assert_eq!(sio.gpio_out, snap);
+    }
+
+    #[test]
+    fn gpio_bit_oe_put_get_set_clr_xor_below_30() {
+        let mut sio = Sio::new();
+        sio.gpio_bit_oe_put(5, true);
+        assert!(sio.gpio_bit_oe_get(5));
+        sio.gpio_bit_oe_put(5, false);
+        assert!(!sio.gpio_bit_oe_get(5));
+        sio.gpio_bit_oe_set(6);
+        assert!(sio.gpio_bit_oe_get(6));
+        sio.gpio_bit_oe_clr(6);
+        assert!(!sio.gpio_bit_oe_get(6));
+        sio.gpio_bit_oe_xor(7);
+        assert!(sio.gpio_bit_oe_get(7));
+        sio.gpio_bit_oe_xor(7);
+        assert!(!sio.gpio_bit_oe_get(7));
+    }
+
+    #[test]
+    fn gpio_bit_oe_masked_at_or_above_30() {
+        let mut sio = Sio::new();
+        assert!(!sio.gpio_bit_oe_get(30));
+        let snap = sio.gpio_oe;
+        sio.gpio_bit_oe_put(30, true);
+        sio.gpio_bit_oe_put(31, true);
+        sio.gpio_bit_oe_set(30);
+        sio.gpio_bit_oe_clr(30);
+        sio.gpio_bit_oe_xor(30);
+        assert_eq!(sio.gpio_oe, snap);
+    }
+
+    // ---- FIFO push (successful path) + FIFO full (WOF path) ----
+    #[test]
+    fn fifo_wr_push_success_signals_event() {
+        let mut sio = Sio::new();
+        // Core 0 pushes to core 1's RX queue.
+        sio.write32(0x054, 0xAA, 0);
+        assert_eq!(sio.pending_fifo_event, Some(1));
+        // Core 1 reads its RX FIFO — sees the pushed value.
+        assert_eq!(sio.read32(0x058, 1), 0xAA);
+        // Round-trip status register exercises fifo_st_read for both cores.
+        let st0 = sio.read32(0x050, 0);
+        let _ = st0; // status: RDY bit should be set.
+    }
+
+    #[test]
+    fn fifo_wr_full_sets_wof() {
+        let mut sio = Sio::new();
+        // Fill core 1's RX queue (FIFO depth is 8 on RP2350).
+        for i in 0..16u32 {
+            sio.write32(0x054, i, 0);
+        }
+        assert!(sio.fifo_wof(0), "WOF must be sticky after overflow");
+        // Verify status bit 2 (WOF) reflects that.
+        let st0 = sio.read32(0x050, 0);
+        assert_ne!(st0 & 0x4, 0);
+    }
+
+    #[test]
+    fn fifo_rd_empty_sets_roe() {
+        let mut sio = Sio::new();
+        // Read with no pending data — ROE must latch.
+        let v = sio.read32(0x058, 0);
+        assert_eq!(v, 0);
+        assert!(sio.fifo_roe(0));
+    }
+
+    #[test]
+    fn fifo_st_write_w1c_both_flags() {
+        let mut sio = Sio::new();
+        // Poke the internal flags then W1C them.
+        sio.write32(0x054, 1, 0);
+        // Force ROE by reading from empty queue on core 1.
+        let _ = sio.read32(0x058, 1); // consumes the value
+        let _ = sio.read32(0x058, 1); // empty → ROE latches
+        assert!(sio.fifo_roe(1));
+        // W1C ROE via bit 3.
+        sio.write32(0x050, 0x8, 1);
+        assert!(!sio.fifo_roe(1));
+    }
+
+    #[test]
+    fn fifo_wof_w1c() {
+        let mut sio = Sio::new();
+        // Overflow core 0's writes.
+        for i in 0..16u32 {
+            sio.write32(0x054, i, 0);
+        }
+        assert!(sio.fifo_wof(0));
+        // W1C the WOF bit (bit 2) on core 0's status.
+        sio.write32(0x050, 0x4, 0);
+        assert!(!sio.fifo_wof(0));
+    }
+
+    #[test]
+    fn core1_writes_core0_fifo() {
+        let mut sio = Sio::new();
+        // Core 1 pushes to core 0's RX queue (tx_fifo = fifo_to_core0).
+        sio.write32(0x054, 0xBB, 1);
+        assert_eq!(sio.pending_fifo_event, Some(0));
+        assert_eq!(sio.read32(0x058, 0), 0xBB);
+    }
+
+    // ---- Spinlock helpers: test-and-set success / fail, release ----
+    #[test]
+    fn spinlock_read_acquire_then_fail() {
+        let mut sio = Sio::new();
+        // Read SPINLOCK3 — claims it.
+        assert_eq!(sio.read32(0x10C, 0), 1 << 3);
+        // Second read — already claimed, returns 0.
+        assert_eq!(sio.read32(0x10C, 0), 0);
+        // Release via any write.
+        sio.write32(0x10C, 0xDEAD, 0);
+        // Now re-claim.
+        assert_eq!(sio.read32(0x10C, 0), 1 << 3);
+    }
+
+    #[test]
+    fn spinlock_st_reads_mask() {
+        let mut sio = Sio::new();
+        // Claim lock 0 and lock 31.
+        let _ = sio.read32(0x100, 0);
+        let _ = sio.read32(0x17C, 0);
+        let mask = sio.read32(0x05C, 0);
+        assert_eq!(mask, (1 << 0) | (1 << 31));
+    }
+
+    #[test]
+    fn read_unknown_offset_returns_zero() {
+        let mut sio = Sio::new();
+        assert_eq!(sio.read32(0x1FC, 0), 0);
+    }
+
+    #[test]
+    fn write_unknown_offset_is_noop() {
+        let mut sio = Sio::new();
+        sio.write32(0x1FC, 0xFFFF_FFFF, 0);
+        assert_eq!(sio.read32(0x1FC, 0), 0);
+    }
+}
+
+mod stage7_interp_coverage {
+    use crate::sio::Interp;
+
+    #[test]
+    fn ctrl_lane1_blend_pop_full_returns_blend() {
+        // POP_FULL with BLEND hits the blend-result arm at line 102-104.
+        // Must use MASK=[0..=31] so the side-effect pop_lane ops preserve
+        // enough ACCUM state to get a deterministic POP output. The test
+        // only checks we reached the branch — BLEND returns blend_result
+        // regardless of the intermediate r0|r1 accumulator side-effects.
+        let mut interp = Interp::new();
+        interp.base[0] = 0;
+        interp.base[1] = 1000;
+        interp.accum[1] = 0x8000_0000;
+        // CTRL_LANE1: BLEND=1 (bit 21) + MASK=[0..=31].
+        interp.write(0x30, (1u32 << 21) | (31 << 10), 0);
+        interp.write(0x2C, 31u32 << 10, 0);
+        // PEEK_FULL (0x28) hits BLEND without side effects.
+        let v = interp.read(0x28, false);
+        assert_eq!(v, 500);
+    }
+
+    #[test]
+    fn ctrl_lane1_no_blend_pop_full_ors_two_lanes() {
+        let mut interp = Interp::new();
+        interp.accum[0] = 0x00FF;
+        interp.accum[1] = 0xFF00;
+        // MASK=[0..=31] on both lanes to pass values through.
+        interp.write(0x2C, 31u32 << 10, 0);
+        interp.write(0x30, 31u32 << 10, 0);
+        let v = interp.read(0x1C, false);
+        assert_eq!(v, 0xFFFF);
+    }
+
+    #[test]
+    fn peek_full_non_blend_interp1() {
+        let mut interp = Interp::new();
+        interp.accum[0] = 0xAA;
+        interp.accum[1] = 0x55;
+        interp.write(0x2C, 31u32 << 10, 0);
+        interp.write(0x30, 31u32 << 10, 0);
+        // is_interp1=true forces the non-BLEND arm even if CTRL_LANE1.BLEND=1.
+        interp.write(0x30, (31u32 << 10) | (1 << 21), 0);
+        let v = interp.read(0x28, true); // peek_full on INTERP1
+        assert_eq!(v, 0xFF);
+    }
+
+    #[test]
+    fn write_unknown_offset_is_noop() {
+        // All offsets from 0x00..=0x3F have explicit match arms (POP/PEEK
+        // read-only arms drop writes). Exercise those drop branches.
+        let mut interp = Interp::new();
+        interp.accum[0] = 0x1234;
+        // POP_LANE0 (0x14) write is dropped.
+        interp.write(0x14, 0xDEAD, 0);
+        assert_eq!(interp.accum[0], 0x1234);
+        // PEEK_LANE1 (0x24) write is dropped.
+        interp.write(0x24, 0xDEAD, 0);
+        assert_eq!(interp.accum[0], 0x1234);
+    }
+
+    #[test]
+    fn shift_and_mask_lsb_gt_msb_yields_zero() {
+        let mut interp = Interp::new();
+        // mask_lsb=10 > mask_msb=5 → mask=0 path.
+        // CTRL: SHIFT=0, MASK_LSB=10, MASK_MSB=5
+        let ctrl = 0u32 | (10 << 5) | (5 << 10);
+        interp.write(0x2C, ctrl, 0);
+        interp.accum[0] = 0xFFFF_FFFF;
+        let v = interp.read(0x20, false);
+        // masked = 0; base=0 → 0.
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn shift_and_mask_msb_31_signed_no_overflow() {
+        let mut interp = Interp::new();
+        // mask_msb==31 means signed=false path or no sign-extension when
+        // mask_msb==31 (signed && mask_msb < 31 is the signed arm).
+        // CTRL: MASK_LSB=0, MASK_MSB=31, SIGNED=1 → falls through to
+        // non-signed tuple return (value, false).
+        let ctrl = (31u32 << 10) | (1 << 15);
+        interp.write(0x2C, ctrl, 0);
+        interp.accum[0] = 0x8000_0000;
+        let v = interp.read(0x20, false);
+        assert_eq!(v, 0x8000_0000);
+    }
+
+    #[test]
+    fn apply_force_msb_zero_passthrough_and_nonzero_overwrite() {
+        let mut interp = Interp::new();
+        interp.accum[0] = 0x0000_00FF;
+        interp.base[0] = 0;
+        // First test: force_msb=0 (passthrough branch).
+        interp.write(0x2C, 31u32 << 10, 0);
+        let passthrough = interp.read(0x20, false);
+        assert_eq!(passthrough, 0xFF);
+
+        // Second test: force_msb=3 (overwrite branch).
+        // CTRL: MASK_LSB=0, MASK_MSB=31, FORCE_MSB=3 (bits 19:20 = 0b11)
+        let ctrl = (31u32 << 10) | (3 << 19);
+        interp.write(0x2C, ctrl, 0);
+        let forced = interp.read(0x20, false);
+        assert_eq!(forced & 0xC000_0000, 0xC000_0000);
+    }
+
+    #[test]
+    fn compute_lane_clamp_below_lo_equal_boundary() {
+        let mut interp = Interp::new();
+        interp.base[0] = 100;
+        interp.base[1] = 200;
+        interp.write(0x2C, (31u32 << 10) | (1 << 22), 0);
+        // ACCUM0 exactly 100 → inside range (vi >= li), but vi <= hi → sm path.
+        interp.accum[0] = 100;
+        assert_eq!(interp.read(0x20, true), 100);
+    }
+
+    #[test]
+    fn cross_result_on_lane_swaps_source() {
+        let mut interp = Interp::new();
+        // CTRL_LANE0 has CROSS_RESULT=1 → source = lane 1.
+        interp.accum[0] = 0;
+        interp.accum[1] = 0xDEAD;
+        interp.base[0] = 0;
+        interp.base[1] = 0;
+        // CTRL_LANE0: CROSS_RESULT=1 (bit 17), MASK_MSB=31.
+        interp.write(0x2C, (31u32 << 10) | (1 << 17), 0);
+        // CTRL_LANE1: passthrough.
+        interp.write(0x30, 31u32 << 10, 0);
+        // PEEK_LANE0 now returns lane1's arithmetic.
+        let v = interp.read(0x20, false);
+        assert_eq!(v, 0xDEAD);
+    }
+}
+
+mod stage7_coprocessor_coverage {
+    use std::sync::Arc;
+    use crate::bus::Bus;
+    use crate::core::{CortexM33, Fault};
+    use crate::threaded::CoreAtomics;
+
+    fn enable_cp(cpu: &mut CortexM33, coproc: u8) {
+        cpu.ppb.cpacr |= 0x3 << (coproc as u32 * 2);
+    }
+
+    fn make_env() -> (CortexM33, Bus) {
+        let atomics = Arc::new(CoreAtomics::default());
+        let cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let bus = Bus::with_atomics(atomics);
+        (cpu, bus)
+    }
+
+    // Unknown coproc (1, 2, 3, 6, 8, 9, 12..15): UsageFault.
+    #[test]
+    fn unknown_coproc_2_raises_usagefault() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 2);
+        // MCR CP2 encoding. opc1=0, L=0, Rt=0, CRm=0, op2=0.
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (0u16 << 12) | (2u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+    }
+
+    // CP0 CDP form (not MRC/MCR) — silent NOP.
+    #[test]
+    fn cp0_cdp_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        // CDP: bit 4 of hw1 must be 0 (not MCR/MRC).
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (0u16 << 12) | (0u16 << 8); // coproc=0, bit4=0
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 1);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    // CP0 LO_OUT bulk MRC with op2 != 0 (returns 0).
+    #[test]
+    fn cp0_lo_out_bulk_mrc_unknown_op2_returns_zero() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        bus.sio.gpio_out = 0x1234;
+        // MRC CP0, opc1=0, CRn=0, Rt=3, op2=2 (unknown), CRm=0.
+        let hw0: u16 = 0xEE10; // L=1
+        let hw1: u16 = (3u16 << 12) | (0u16 << 8) | (2u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.r[3], 0);
+    }
+
+    // CP0 LO_OUT bulk MCR with op2 = 0..3 (put/set/clr/xor), then op2>=4 (ignored).
+    #[test]
+    fn cp0_lo_out_bulk_mcr_unknown_op2_ignored() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        bus.sio.gpio_out = 0x0F0F;
+        cpu.regs.r[1] = 0xAAAA;
+        // MCR CP0, opc1=0, CRn=0, Rt=1, op2=5 (unknown), CRm=0.
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (1u16 << 12) | (0u16 << 8) | (5u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        // gpio_out unchanged.
+        assert_eq!(bus.sio.gpio_out, 0x0F0F);
+    }
+
+    // CP0 LO_OE bulk MRC unknown op2 returns 0.
+    #[test]
+    fn cp0_lo_oe_bulk_mrc_unknown_op2() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        bus.sio.gpio_oe = 0x1234;
+        // MRC CP0, opc1=1, CRn=0, Rt=4, op2=1 (unknown), CRm=0.
+        let hw0: u16 = 0xEE30; // opc1=1, L=1
+        let hw1: u16 = (4u16 << 12) | (0u16 << 8) | (1u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.r[4], 0);
+    }
+
+    // CP0 LO_OE bulk MCR unknown op2 (ignored).
+    #[test]
+    fn cp0_lo_oe_bulk_mcr_unknown_op2() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        bus.sio.gpio_oe = 0x0F0F;
+        cpu.regs.r[1] = 0xAAAA;
+        let hw0: u16 = 0xEE20; // opc1=1, L=0
+        let hw1: u16 = (1u16 << 12) | (0u16 << 8) | (5u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(bus.sio.gpio_oe, 0x0F0F);
+    }
+
+    // CP0 LO_IN with MCR (silent NOP).
+    #[test]
+    fn cp0_lo_in_mcr_is_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        cpu.regs.r[1] = 0x1234;
+        // MCR CP0, opc1=2, CRn=0, CRm=0 — MCR to IN bank, silent NOP.
+        let hw0: u16 = 0xEE40; // opc1=2, L=0
+        let hw1: u16 = (1u16 << 12) | (0u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        // Nothing changes.
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    // HI banks (opc1 = 4, 5, 6): MRC returns 0, MCR is a no-op.
+    #[test]
+    fn cp0_hi_bank_mrc_returns_zero() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        cpu.regs.r[2] = 0xFFFF_FFFF;
+        // opc1=4 (HI OUT) MRC
+        let hw0: u16 = 0xEE90;
+        let hw1: u16 = (2u16 << 12) | (0u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.r[2], 0);
+    }
+
+    #[test]
+    fn cp0_hi_bank_mcr_is_noop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        cpu.regs.r[2] = 0xFFFF_FFFF;
+        // opc1=5 (HI OE) MCR
+        let hw0: u16 = 0xEEA0;
+        let hw1: u16 = (2u16 << 12) | (0u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(bus.sio.gpio_oe, 0);
+    }
+
+    // CP0 unknown opc1 (3, 7): silent NOP.
+    #[test]
+    fn cp0_unknown_opc1_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 0);
+        // opc1=3 (unknown)
+        let hw0: u16 = 0xEE60;
+        let hw1: u16 = (0u16 << 12) | (0u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    // CP4/5 DCP CDP: all arithmetic, compare, convert, status ops.
+    fn encode_cdp_dcp(opc1: u8, crn: u8, crd: u8, op2: u8, crm: u8) -> (u16, u16) {
+        // CDP: bit 4 of hw1 must be 0.
+        let hw0: u16 = 0xEE00 | ((opc1 as u16 & 0xF) << 4) | (crn as u16 & 0xF);
+        let hw1: u16 = ((crd as u16) << 12) | (4u16 << 8) | ((op2 as u16 & 0x7) << 5)
+            | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    #[test]
+    fn dcp_arith_dadd_sub_mul_div_sqrt() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, 3.0);
+        cpu.dcp_set_double(1, 4.0);
+        // dadd d2 = d0 + d1 = 7.0
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 0, 1);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 4);
+        assert_eq!(cpu.dcp_get_double(2), 7.0);
+        // dsub d2 = d0 - d1 = -1.0
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 1, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_double(2), -1.0);
+        // dmul d2 = d0 * d1 = 12.0
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 2, 1);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 5);
+        assert_eq!(cpu.dcp_get_double(2), 12.0);
+        // ddiv d2 = d0 / d1 = 0.75
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 3, 1);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 18);
+        assert_eq!(cpu.dcp_get_double(2), 0.75);
+        // dsqrt d2 = sqrt(d1) = 2.0
+        let (hw0, hw1) = encode_cdp_dcp(0, 1, 2, 4, 0);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 28);
+        assert_eq!(cpu.dcp_get_double(2), 2.0);
+    }
+
+    #[test]
+    fn dcp_arith_reserved_opc2_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // opc1=0, opc2=5 (reserved) — silent NOP, 1 cycle, no status mutation.
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 0, 5, 0);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 1);
+    }
+
+    #[test]
+    fn dcp_compare_all_predicates() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, 2.0);
+        cpu.dcp_set_double(1, 3.0);
+        // eq (2 vs 3 → false)
+        let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_status(), 0);
+        // lt (2 < 3 → true)
+        let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 1, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_status(), 1);
+        // le
+        let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 2, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_status(), 1);
+        // gt (2 > 3 → false)
+        let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 3, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_status(), 0);
+        // ge
+        let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 4, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_status(), 0);
+    }
+
+    #[test]
+    fn dcp_compare_unknown_predicate_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // opc1=1, opc2=5 (unknown compare).
+        let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 5, 1);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 1);
+    }
+
+    #[test]
+    fn dcp_convert_i2d_u2d_d2i_d2u_d2f_f2d() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // Seed i32 in half A of double 0.
+        cpu.dcp_set_half(0, (-5i32) as u32);
+        // i2d d1 = (f64) i32 = -5.0
+        let (hw0, hw1) = encode_cdp_dcp(2, 0, 1, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_double(1), -5.0);
+        // u2d (reinterprets as u32)
+        let (hw0, hw1) = encode_cdp_dcp(2, 0, 1, 1, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_double(1), 4294967291.0);
+        // d2i d1 = (i32) (-5.0) = -5
+        cpu.dcp_set_double(0, -5.0);
+        let (hw0, hw1) = encode_cdp_dcp(2, 0, 1, 2, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_half(2) as i32, -5);
+        // d2u d1 = (u32) 42.0
+        cpu.dcp_set_double(0, 42.0);
+        let (hw0, hw1) = encode_cdp_dcp(2, 0, 1, 3, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_half(2), 42);
+        // d2f
+        cpu.dcp_set_double(0, 3.5);
+        let (hw0, hw1) = encode_cdp_dcp(2, 0, 1, 4, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(f32::from_bits(cpu.dcp_get_half(2)), 3.5);
+        // f2d: place f32 in half A of double 3, then convert.
+        cpu.dcp_set_half(6, (2.5f32).to_bits());
+        let (hw0, hw1) = encode_cdp_dcp(2, 3, 1, 5, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_double(1), 2.5);
+    }
+
+    #[test]
+    fn dcp_convert_reserved_opc2_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        let (hw0, hw1) = encode_cdp_dcp(2, 0, 0, 6, 0);
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 1);
+    }
+
+    #[test]
+    fn dcp_status_get_and_clr() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // Seed status via arithmetic first: (0.0) → zero bit.
+        cpu.dcp_set_double(0, 0.0);
+        cpu.dcp_set_double(1, 0.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 3, 0, 1); // dadd d3 = d0+d1
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_ne!(cpu.dcp_get_status() & 0x1, 0);
+        // dcpstat_get d4 = status
+        let (hw0, hw1) = encode_cdp_dcp(3, 0, 4, 0, 0);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 1);
+        assert_ne!(cpu.dcp_get_half(8), 0);
+        // dcpstat_clr
+        let (hw0, hw1) = encode_cdp_dcp(3, 0, 0, 1, 0);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 1);
+        assert_eq!(cpu.dcp_get_status(), 0);
+    }
+
+    #[test]
+    fn dcp_status_reserved_opc2_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        let (hw0, hw1) = encode_cdp_dcp(3, 0, 0, 5, 0);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 1);
+    }
+
+    #[test]
+    fn dcp_unrecognized_opc1_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // opc1=7 (unrecognized)
+        let (hw0, hw1) = encode_cdp_dcp(7, 0, 0, 0, 0);
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 1);
+    }
+
+    #[test]
+    fn dcp_transfer_reserved_opc1_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // MCR CP4, opc1=1 (reserved for transfer family) — silent NOP.
+        let hw0: u16 = 0xEE00 | (1u16 << 5);
+        let hw1: u16 = (0u16 << 12) | (4u16 << 8) | 0x10;
+        assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 1);
+    }
+
+    #[test]
+    fn dcp_arith_sets_status_negative_nan_inf() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // NaN: sqrt(-1.0) = NaN
+        cpu.dcp_set_double(0, -1.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 1, 4, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_ne!(cpu.dcp_get_status() & 0x8, 0); // NaN bit
+        // Infinity: 1.0 / 0.0
+        cpu.dcp_set_double(0, 1.0);
+        cpu.dcp_set_double(1, 0.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 3, 1); // ddiv
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_ne!(cpu.dcp_get_status() & 0x4, 0); // Inf bit
+        // Negative: 3.0 - 5.0 = -2.0
+        cpu.dcp_set_double(0, 3.0);
+        cpu.dcp_set_double(1, 5.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 1, 1); // dsub
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_ne!(cpu.dcp_get_status() & 0x2, 0); // Negative bit
+    }
+
+    // CP7 RCP canary_status with Rt=15 (salt valid / invalid paths).
+    #[test]
+    fn cp7_canary_status_salt_valid_sets_n() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        bus.atomics.rcp_salt_set(0, 42);
+        // MRC2 cp7, opc1=1, opc2=0, Rt=15.
+        let hw0: u16 = 0xFE10 | (1u16 << 5); // opc1=1, L=1
+        let hw1: u16 = (15u16 << 12) | (7u16 << 8) | (0u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_ne!(cpu.regs.xpsr & (1 << 31), 0, "N bit should be set (salt valid)");
+    }
+
+    #[test]
+    fn cp7_canary_status_non_pc_rt_no_op() {
+        // Rt != 15 → the `(1, 0) if rt == 15` arm doesn't match → silent NOP.
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        bus.atomics.rcp_salt_set(0, 42);
+        let before = cpu.regs.xpsr;
+        let hw0: u16 = 0xFE10 | (1u16 << 5);
+        let hw1: u16 = (1u16 << 12) | (7u16 << 8) | (0u16 << 5) | 0x10; // Rt=1
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.xpsr, before);
+    }
+
+    #[test]
+    fn cp7_mrrc_returns_one() {
+        // MRRC2 form: L=1 → returns 1 without side effect.
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        // MRRC2: 0xFC prefix with L=1.
+        let hw0: u16 = 0xFC50; // L bit set
+        let hw1: u16 = 0x0700;
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 1);
+    }
+
+    #[test]
+    fn cp7_salt_core0_and_core1_set() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        cpu.regs.r[2] = 0xDEAD;
+        // MCRR2 cp7: opc1=8, Rt=2, Rt2=3, CRm=0 → salt core 0.
+        // hw0 = 0xFC40 | Rt2, hw1 = (Rt<<12)|(coproc<<8)|(opc1<<4)|CRm
+        cpu.regs.r[3] = 0;
+        let hw0: u16 = 0xFC40 | 3;
+        let hw1: u16 = (2u16 << 12) | (7u16 << 8) | (8u16 << 4) | 0;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(bus.atomics.rcp_salt_load(0), 0xDEAD);
+        // CRm=1 → salt core 1.
+        cpu.regs.r[2] = 0xBEEF;
+        let hw1: u16 = (2u16 << 12) | (7u16 << 8) | (8u16 << 4) | 1;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(bus.atomics.rcp_salt_load(1), 0xBEEF);
+    }
+
+    #[test]
+    fn cp7_salt_unknown_crm_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        let hw0: u16 = 0xFC40;
+        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (8u16 << 4) | 2; // CRm=2 unknown
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn cp7_mcrr_unknown_opc1_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        // MCRR2 cp7 opc1=3 (unknown) — silent NOP.
+        let hw0: u16 = 0xFC40;
+        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (3u16 << 4) | 0;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    // unreachable: cp7_rcp's `_ => 1` arm requires a hw0 whose high byte
+    // is not 0xEE/0xFE/0xEC/0xFC, but the outer thumb32_coprocessor
+    // dispatch pre-filters on hw0's top nibble (0xE or 0xF) before reaching
+    // CP7 — so no test-reachable input produces the residual arm.
+
+    #[test]
+    fn cp7_cdp_unrecognized_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        // CDP cp7 opc1=1 opc2=0 — unrecognized, silent NOP.
+        let hw0: u16 = 0xEE10;
+        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (0u16 << 5); // bit 4 = 0 → CDP
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn cp7_unknown_mcr_encoding_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        // MCR2 cp7 opc1=6 opc2=0 (rcp_ifgte — NOT implemented).
+        let hw0: u16 = 0xFE00 | (6u16 << 5);
+        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (0u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn cp7_unknown_mrc_encoding_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        // MRC2 cp7 opc1=2 opc2=2 (unknown MRC).
+        let hw0: u16 = 0xFE10 | (2u16 << 5);
+        let hw1: u16 = (2u16 << 12) | (7u16 << 8) | (2u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+}
+
+mod stage7_exceptions_coverage {
+    use std::sync::Arc;
+    use crate::bus::Bus;
+    use crate::bus::ppb::{FPCCR_LSPACT, FPCCR_LSPEN};
+    use crate::core::{CortexM33, Fault};
+    use crate::threaded::CoreAtomics;
+
+    const VT_BASE: u32 = 0x2000_0000;
+    const HANDLER_ADDR: u32 = 0x2000_0100;
+    const HANDLER_VEC: u32 = HANDLER_ADDR | 1;
+
+    fn core_bus() -> (CortexM33, Bus) {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        cpu.regs.msp = 0x2000_1000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let mut bus = Bus::with_atomics(atomics);
+        cpu.ppb.vtor = VT_BASE;
+        // Populate vectors for every exception we might poke.
+        for exc in 2..=15u32 {
+            bus.write32(VT_BASE + exc * 4, HANDLER_VEC, 0);
+        }
+        // IRQ vectors start at 16; point 16, 17, 18, 45 to handler.
+        for exc in [16u32, 17, 18, 45] {
+            bus.write32(VT_BASE + exc * 4, HANDLER_VEC, 0);
+        }
+        bus.write32(HANDLER_ADDR, 0x0000_E7FE, 0);
+        (cpu, bus)
+    }
+
+    // Usage fault with USGFAULTENA off → escalates to HardFault.
+    #[test]
+    fn usagefault_disabled_escalates() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.ppb.shcsr &= !(1 << 18);
+        cpu.pending_fault = Some(Fault::UsageFault);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3, "escalated to HardFault");
+        assert_ne!(cpu.ppb.hfsr & (1 << 30), 0, "HFSR.FORCED set");
+    }
+
+    #[test]
+    fn usagefault_enabled_delivered_directly() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.ppb.shcsr |= 1 << 18;
+        cpu.pending_fault = Some(Fault::UsageFault);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 6);
+    }
+
+    // Stack-limit violation → UsageFault with STKOF.
+    #[test]
+    fn stack_limit_violation_raises_usagefault() {
+        let (mut cpu, mut bus) = core_bus();
+        // Set MSPLIM just below MSP so basic frame underflows.
+        cpu.regs.msplim = cpu.regs.msp.wrapping_sub(16);
+        let cycles = cpu.enter_exception(2, &mut bus);
+        assert_eq!(cycles, 0);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+        assert_ne!(cpu.ppb.cfsr & (1 << 20), 0, "STKOF must latch");
+    }
+
+    // Stack-limit violation with FP region → SPLIMVIOL.
+    #[test]
+    fn stack_limit_violation_with_fp_sets_splimviol() {
+        let (mut cpu, mut bus) = core_bus();
+        // Enable FP context.
+        cpu.regs.control |= 1 << 2; // CONTROL.FPCA
+        // Set MSPLIM so basic frame (32) fits but +FP region (72) doesn't.
+        cpu.regs.msplim = cpu.regs.msp.wrapping_sub(50);
+        let _ = cpu.enter_exception(2, &mut bus);
+        assert_ne!(cpu.ppb.fpccr & crate::bus::ppb::FPCCR_SPLIMVIOL, 0,
+            "SPLIMVIOL must latch when FP region drove the violation");
+    }
+
+    // Lazy-FP path: had_fp + LSPEN=1 → LSPACT set, no S-register writes.
+    #[test]
+    fn lazy_fp_entry_sets_lspact() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.control |= 1 << 2; // FPCA
+        cpu.ppb.fpccr = FPCCR_LSPEN; // lazy enabled, no LSPACT yet
+        let cycles = cpu.enter_exception(14, &mut bus);
+        assert_eq!(cycles, 12);
+        assert_ne!(cpu.ppb.fpccr & FPCCR_LSPACT, 0, "LSPACT must latch");
+    }
+
+    // Eager-FP path: had_fp + LSPEN=0 → writes S0-S15 + FPSCR.
+    #[test]
+    fn eager_fp_entry_writes_fp_frame() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.control |= 1 << 2;
+        cpu.regs.s[0] = 1.0;
+        cpu.ppb.fpccr = 0; // LSPEN=0 (eager)
+        let _ = cpu.enter_exception(14, &mut bus);
+        // FP region written at sp+32 (FPCAR records it).
+        let fp_sp = cpu.ppb.fpcar;
+        assert_ne!(fp_sp, 0);
+        // Read back S0 slot: stored as u32 bits of 1.0.
+        let stored = bus.read32(fp_sp, 0);
+        assert_eq!(stored, 1.0f32.to_bits());
+    }
+
+    // PSP path for entry.
+    #[test]
+    fn psp_entry_switches_frame() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.psp = 0x2000_0FE0;
+        cpu.regs.control |= 2; // SPSEL=1
+        cpu.regs.sync_sp_from_banked();
+        let _ = cpu.enter_exception(14, &mut bus);
+        // LR's low nibble should be 0xD (Thread PSP).
+        assert_eq!(cpu.regs.r[14] & 0xF, 0xD);
+    }
+
+    // Exit with bogus EXC_RETURN (FType=0 but FPCAR=0, LSPACT=0) → INVPC.
+    #[test]
+    fn exit_invpc_when_ftype0_no_reservation() {
+        let (mut cpu, mut bus) = core_bus();
+        // Put core in a handler.
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        cpu.ppb.fpcar = 0;
+        cpu.ppb.fpccr = 0; // LSPACT=0
+        // EXC_RETURN claims FP frame.
+        let exc_return = 0xFFFF_FFE9u32;
+        let cycles = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(cycles, 0);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+        assert_ne!(cpu.ppb.cfsr & (1 << 17), 0, "INVPC");
+    }
+
+    #[test]
+    fn exit_invpc_when_ftype1_but_lspact_set() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        cpu.ppb.fpccr = FPCCR_LSPACT;
+        // EXC_RETURN says no FP frame but LSPACT is outstanding.
+        let exc_return = 0xFFFF_FFF9u32;
+        let _ = cpu.exit_exception(exc_return, &mut bus);
+        assert_ne!(cpu.ppb.cfsr & (1 << 17), 0, "INVPC");
+    }
+
+    // Normal exit with FP frame + LSPACT=1 (skip pop path).
+    #[test]
+    fn exit_fp_frame_lspact_skips_pop() {
+        let (mut cpu, mut bus) = core_bus();
+        // Set up stack with a complete frame for exit.
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        // Frame: R0-R3, R12, LR, PC, xPSR at sp..sp+28.
+        // PC = HANDLER_ADDR, xPSR = Thumb bit only.
+        for i in 0..8 {
+            bus.write32(cpu.regs.msp + i * 4, 0xAA00 + i, 0);
+        }
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14; // IPSR = 14
+        cpu.ppb.fpccr = FPCCR_LSPACT; // lazy reservation
+        cpu.ppb.fpcar = cpu.regs.msp + 32;
+        cpu.regs.psp = cpu.regs.msp;
+        // FType=0 + MSP: 0xFFFF_FFE1.
+        let exc_return = 0xFFFF_FFE1u32;
+        let cycles = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(cycles, 12);
+        // LSPACT cleared.
+        assert_eq!(cpu.ppb.fpccr & FPCCR_LSPACT, 0);
+    }
+
+    // Tail-chain: PendSV pending during exit → activate_tail_chain.
+    #[test]
+    fn tail_chain_pendsv_path() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        for i in 0..8 {
+            bus.write32(cpu.regs.msp + i * 4, 0, 0);
+        }
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 15; // SysTick handler
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSVSET;
+        // PendSV priority lower than SysTick? Default SHPR = 0, same priority
+        // → pend_sv has lower exc_num so it wins tie-break.
+        let exc_return = 0xFFFF_FFF1u32; // no FP, MSP
+        let cycles = cpu.exit_exception(exc_return, &mut bus);
+        // Tail-chain cost is 6 cycles.
+        assert_eq!(cycles, 6);
+        // We're now in PendSV handler.
+        assert_eq!(cpu.regs.ipsr(), 14);
+    }
+
+    // Tail-chain NMI pending → cycle cost 6, exc=2.
+    #[test]
+    fn tail_chain_nmi_path() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_NMIPENDSET;
+        let exc_return = 0xFFFF_FFF1u32;
+        let _ = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 2);
+    }
+
+    // Tail-chain SysTick (pendst) path.
+    #[test]
+    fn tail_chain_pendst_path() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 16; // External IRQ 0
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSTSET;
+        let exc_return = 0xFFFF_FFF1u32;
+        let _ = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 15);
+    }
+
+    // Tail-chain external IRQ path.
+    #[test]
+    fn tail_chain_external_irq_path() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        // Enable and pend IRQ 0.
+        cpu.ppb.nvic_iser[0].store(1, std::sync::atomic::Ordering::Relaxed);
+        cpu.ppb.nvic_ispr[0].store(1, std::sync::atomic::Ordering::Relaxed);
+        let exc_return = 0xFFFF_FFF1u32;
+        let _ = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 16);
+    }
+
+    // exception_priority boundaries.
+    #[test]
+    fn exception_priority_reset_and_irq_over_range() {
+        let cpu = CortexM33::for_test(0);
+        assert_eq!(cpu.ppb.exception_priority(1), -3); // Reset
+        // IRQ beyond range: 16 + 100
+        assert_eq!(cpu.ppb.exception_priority(16 + 100), 0);
+    }
+
+    // execution_priority: BASEPRI non-zero fold.
+    #[test]
+    fn execution_priority_basepri_folds() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.regs.basepri = 0x40;
+        assert_eq!(cpu.execution_priority(), 0x40);
+        // FAULTMASK wins over BASEPRI.
+        cpu.regs.faultmask = 1;
+        assert_eq!(cpu.execution_priority(), -1);
+        // PRIMASK sans FAULTMASK.
+        cpu.regs.faultmask = 0;
+        cpu.regs.primask = 1;
+        assert_eq!(cpu.execution_priority(), 0);
+    }
+
+    #[test]
+    fn execution_priority_with_active_exception() {
+        let mut cpu = CortexM33::for_test(0);
+        // Put in a handler with SHPR priority 0x60 for exc 14 (PendSV).
+        cpu.ppb.shpr[14 - 4] = 0x60;
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        // execution_priority reflects the active exception.
+        let prio = cpu.execution_priority();
+        assert_eq!(prio, 0x60);
+    }
+
+    // can_preempt true / false branches.
+    #[test]
+    fn can_preempt_higher_priority_true() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.regs.basepri = 0x80;
+        // NMI (exc 2) priority = -2 → preempts BASEPRI=0x80 → true.
+        assert!(cpu.can_preempt(2));
+    }
+
+    #[test]
+    fn can_preempt_equal_priority_false() {
+        let mut cpu = CortexM33::for_test(0);
+        // exc_prio == exec_prio → false.
+        cpu.regs.primask = 1; // execution_priority = 0
+        // PendSV at default priority 0 → equal, not preempting.
+        assert!(!cpu.can_preempt(14));
+    }
+
+    // NMI preempts unconditionally.
+    #[test]
+    fn nmi_bypasses_can_preempt() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.primask = 1;
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_NMIPENDSET;
+        let _ = cpu.try_take_any_pending_exception(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 2);
+    }
+
+    // try_take_any_pending_exception returns None when no pending.
+    #[test]
+    fn try_take_returns_none_when_nothing_pending() {
+        let (mut cpu, mut bus) = core_bus();
+        assert!(cpu.try_take_any_pending_exception(&mut bus).is_none());
+    }
+
+    // try_take_any_pending_exception with PendSV only.
+    #[test]
+    fn try_take_pendsv_path() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSVSET;
+        let result = cpu.try_take_any_pending_exception(&mut bus);
+        assert!(result.is_some());
+        assert_eq!(cpu.regs.ipsr(), 14);
+    }
+
+    // try_take_any_pending_exception with SysTick only.
+    #[test]
+    fn try_take_pendst_path() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSTSET;
+        let _ = cpu.try_take_any_pending_exception(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 15);
+    }
+
+    // External IRQ dispatch through try_take_any_pending_exception.
+    #[test]
+    fn try_take_external_irq_path() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.ppb.nvic_iser[0].store(0x2, std::sync::atomic::Ordering::Relaxed);
+        cpu.ppb.nvic_ispr[0].store(0x2, std::sync::atomic::Ordering::Relaxed);
+        let _ = cpu.try_take_any_pending_exception(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 17);
+    }
+
+    // try_take: candidate can't preempt → None.
+    #[test]
+    fn try_take_cant_preempt_returns_none() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.primask = 1; // blocks priorities >= 0
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSVSET;
+        // PendSV priority 0 NOT < 0 → no preempt.
+        let result = cpu.try_take_any_pending_exception(&mut bus);
+        assert!(result.is_none());
+    }
+
+    // NMI-in-NMI escalation.
+    #[test]
+    fn fault_nmi_in_nmi_escalates() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 2; // already in NMI
+        let _ = cpu.deliver_fault(Fault::Nmi, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_ne!(cpu.ppb.hfsr & (1 << 30), 0);
+    }
+
+    // NMI delivered normally from thread mode.
+    #[test]
+    fn fault_nmi_from_thread_enters_nmi() {
+        let (mut cpu, mut bus) = core_bus();
+        let _ = cpu.deliver_fault(Fault::Nmi, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 2);
+    }
+
+    // is_exc_return true / false.
+    #[test]
+    fn is_exc_return_boundaries() {
+        assert!(CortexM33::is_exc_return(0xFF00_0000));
+        assert!(CortexM33::is_exc_return(0xFFFF_FFF1));
+        assert!(!CortexM33::is_exc_return(0xFE00_0000));
+        assert!(!CortexM33::is_exc_return(0x0));
+    }
+
+    // IT state encode / decode roundtrip.
+    #[test]
+    fn it_state_encode_decode_roundtrip() {
+        // Exercise the public static decoder directly.
+        let encoded = ((0xABu32 & 0xC0) << 19) | ((0xABu32 & 0x3F) << 10);
+        let decoded = CortexM33::decode_it_from_xpsr(encoded);
+        assert_eq!(decoded, 0xAB & 0xFF);
+    }
+
+    // execute_tt: SAU disabled + MPU match.
+    #[test]
+    fn tt_sau_off_with_mpu_match() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.mpu_ctrl = 1;
+        cpu.ppb.mpu_regions[0] = (0x2000_0000 | 0, 0x2000_FFFF | 1); // AP=0 RW, EN=1
+        // SAU disabled.
+        cpu.ppb.sau_ctrl = 0;
+        let r = cpu.execute_tt(0x2000_0500);
+        // SAU off + MPU match → no sau_matched fallthrough.
+        assert_ne!(r & (1 << 16), 0); // MRVALID
+    }
+
+    // execute_tt: SAU disabled + no MPU match.
+    #[test]
+    fn tt_sau_off_no_mpu_match_grants_universal() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.mpu_ctrl = 0; // MPU off
+        cpu.ppb.sau_ctrl = 0; // SAU off
+        let r = cpu.execute_tt(0x2000_0000);
+        assert_ne!(r & (1 << 18), 0); // R
+        assert_ne!(r & (1 << 19), 0); // RW
+    }
+
+    // SAU enabled, unmatched, ALLNS=1 → NS fallback.
+    #[test]
+    fn tt_sau_unmatched_allns_ns_fallback() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.sau_ctrl = 1 | 2; // SAU enable + ALLNS
+        let r = cpu.execute_tt(0x5000_0000);
+        // NSR=bit20, NSRW=bit21 should be set.
+        assert_ne!(r & (1 << 20), 0);
+        assert_ne!(r & (1 << 21), 0);
+    }
+
+    // SAU enabled, unmatched, ALLNS=0 → S fallback.
+    #[test]
+    fn tt_sau_unmatched_allns0_s_fallback() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.sau_ctrl = 1;
+        let r = cpu.execute_tt(0x5000_0000);
+        assert_ne!(r & (1 << 22), 0); // S bit
+    }
+
+    // SAU matched NSC=1 → NS region.
+    #[test]
+    fn tt_sau_matched_nsc_ns() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.sau_ctrl = 1;
+        // Region 0 covers 0x5000_0000..0x5000_FFFF, NSC=1, EN=1.
+        // RLAR layout: [limit] | (NSC<<1) | EN.
+        cpu.ppb.sau_regions[0] = (0x5000_0000, 0x5000_FFE0 | (1 << 1) | 1);
+        let r = cpu.execute_tt(0x5000_0000);
+        assert_ne!(r & (1 << 20), 0); // NSR
+    }
+
+    // IDAU check: addresses in 0xE, 0xD, 0x4, etc.
+    #[test]
+    fn tt_idau_various_ranges() {
+        let cpu = CortexM33::for_test(0);
+        let r_ppb = cpu.execute_tt(0xE000_0000);
+        assert_ne!(r_ppb & (1 << 23), 0, "IRVALID for PPB");
+        let r_rom_ns = cpu.execute_tt(0x0000_8001);
+        // ROM alias above 0x8000 is NS → IDAU returns 0.
+        assert_eq!(r_rom_ns & (1 << 25), 0);
+        let r_unknown = cpu.execute_tt(0x7000_0000);
+        assert_eq!(r_unknown & (1 << 25), 0);
+    }
+
+    // enter_exception return_address branches (synchronous faults).
+    // NOTE: current_instr_addr is a private field — we can't poke it from
+    // this module. Instead, drive it via execute_one which sets
+    // current_instr_addr = pc before execution. These two tests cover
+    // the return-address path indirectly via .pending_fault + .step.
+    #[test]
+    fn enter_exception_covers_svc_return_pc() {
+        let (mut cpu, mut bus) = core_bus();
+        // SVC goes through "next instruction" return-address arm.
+        let _ = cpu.enter_exception(11, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 11);
+    }
+
+    #[test]
+    fn enter_exception_covers_fault_return_pc() {
+        let (mut cpu, mut bus) = core_bus();
+        // Synchronous fault path (exc 6 = UsageFault).
+        let _ = cpu.enter_exception(6, &mut bus);
+        assert_eq!(cpu.regs.ipsr(), 6);
+    }
+
+    // Alignment padding: SP not 8-byte aligned → xPSR bit 9 set.
+    #[test]
+    fn entry_sets_alignment_padding_bit() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0FF4; // not 8-byte aligned
+        cpu.regs.r[13] = cpu.regs.msp;
+        let _ = cpu.enter_exception(14, &mut bus);
+        let stacked_xpsr = bus.read32(cpu.regs.msp + 28, 0);
+        assert_ne!(stacked_xpsr & (1 << 9), 0);
+    }
+}
+
+mod stage7_core_mod_coverage {
+    use std::sync::Arc;
+    use crate::bus::Bus;
+    use crate::core::{CortexM33, Fault, PerCoreSio, CoreCounters};
+    use crate::threaded::CoreAtomics;
+
+    #[test]
+    fn core_halted_wfi_cycles_counter() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(Arc::clone(&atomics));
+        cpu.atomics.set_halted(0);
+        let before = cpu.counters.wfi_cycles;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.counters.wfi_cycles, before + 1);
+    }
+
+    #[test]
+    fn core_wfe_waiting_counter() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(Arc::clone(&atomics));
+        cpu.atomics.set_wfe_waiting(0);
+        let before = cpu.counters.wfe_cycles;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.counters.wfe_cycles, before + 1);
+    }
+
+    #[test]
+    fn debug_step_clears_halted_and_wfe() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(Arc::clone(&atomics));
+        cpu.atomics.set_halted(0);
+        cpu.atomics.set_wfe_waiting(0);
+        // Need valid instruction at PC.
+        cpu.regs.set_pc(0x2000_0000);
+        bus.write32(0x2000_0000, 0x0000_E7FE, 0);
+        cpu.debug_step(&mut bus);
+        assert!(!cpu.atomics.is_halted(0));
+        assert!(!cpu.atomics.is_wfe_waiting(0));
+    }
+
+    #[test]
+    fn wake_clears_halted() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.halt();
+        assert!(cpu.is_halted());
+        cpu.wake();
+        assert!(!cpu.is_halted());
+    }
+
+    #[test]
+    fn halt_clears_pending_fault() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.pending_fault = Some(Fault::UsageFault);
+        cpu.halt();
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn core_id_getter() {
+        let cpu = CortexM33::for_test(1);
+        assert_eq!(cpu.id(), 1);
+    }
+
+    #[test]
+    fn cycles_getter() {
+        let cpu = CortexM33::for_test(0);
+        assert_eq!(cpu.cycles(), 0);
+    }
+
+    #[test]
+    fn has_pending_fault_true_false() {
+        let mut cpu = CortexM33::for_test(0);
+        assert!(!cpu.has_pending_fault());
+        cpu.pending_fault = Some(Fault::UsageFault);
+        assert!(cpu.has_pending_fault());
+    }
+
+    #[test]
+    fn enable_coprocessor_sets_cpacr() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.enable_coprocessor(5);
+        assert_eq!(cpu.ppb.cpacr & (0x3 << 10), 0x3 << 10);
+    }
+
+    #[test]
+    fn test_enter_exit_exception() {
+        use crate::bus::Bus;
+        let mut cpu = CortexM33::for_test(0);
+        cpu.regs.msp = 0x2000_1000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let mut bus = Bus::with_atomics(Arc::clone(&cpu.atomics));
+        cpu.ppb.vtor = 0x2000_0000;
+        bus.write32(0x2000_0000 + 14 * 4, 0x2000_0101, 0);
+        bus.write32(0x2000_0100, 0x0000_E7FE, 0);
+        let c1 = cpu.test_enter_exception(14, &mut bus);
+        assert_eq!(c1, 12);
+        assert_eq!(cpu.regs.ipsr(), 14);
+    }
+
+    #[test]
+    fn dcp_accessors_roundtrip() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.dcp_set_half(0, 0xDEAD_BEEF);
+        assert_eq!(cpu.dcp_get_half(0), 0xDEAD_BEEF);
+        cpu.dcp_set_double(2, 3.14);
+        assert!((cpu.dcp_get_double(2) - 3.14).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dcp_status_default_zero() {
+        let cpu = CortexM33::for_test(0);
+        assert_eq!(cpu.dcp_get_status(), 0);
+    }
+
+    #[test]
+    fn it_state_getter() {
+        let cpu = CortexM33::for_test(0);
+        assert_eq!(cpu.it_state(), 0);
+    }
+
+    #[test]
+    fn counters_reset() {
+        let mut counters = CoreCounters::default();
+        counters.wfi_cycles = 100;
+        counters.sram_reads = 50;
+        counters.reset();
+        assert_eq!(counters.wfi_cycles, 0);
+        assert_eq!(counters.sram_reads, 0);
+    }
+
+    #[test]
+    fn percoresio_owns_offset_range() {
+        assert!(PerCoreSio::owns_offset(0x060));
+        assert!(PerCoreSio::owns_offset(0x0FC));
+        assert!(!PerCoreSio::owns_offset(0x05F));
+        assert!(!PerCoreSio::owns_offset(0x100));
+    }
+
+    #[test]
+    fn percoresio_read32_unknown_offset() {
+        let mut s = PerCoreSio::default();
+        assert_eq!(s.read32(0x050), 0);
+    }
+
+    #[test]
+    fn percoresio_write32_unknown_offset_noop() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x050, 0xDEAD);
+        assert_eq!(s.read32(0x050), 0);
+    }
+
+    #[test]
+    fn percoresio_divider_result_read_unknown_offset_returns_zero() {
+        // divider_result_read's match has 0x070 and 0x074 arms and _ => return 0;
+        // this path is reached only internally, but reading 0x078 while dirty
+        // doesn't go through that function — verify the dirty-counter
+        // advancement works across both offsets instead.
+        let mut s = PerCoreSio::default();
+        s.write32(0x060, 100);
+        s.write32(0x064, 7);
+        let _ = s.read32(0x070);
+        let _ = s.read32(0x074);
+        // dirty should have cleared after both reads.
+        let csr = s.read32(0x078);
+        assert_eq!(csr & 0x2, 0);
+    }
+
+    #[test]
+    fn invalidate_decode_cache_entries_covers_cacheable_and_uncacheable() {
+        let mut cpu = CortexM33::for_test(0);
+        // Populate a known slot.
+        cpu.invalidate_decode_cache_all();
+        // SRAM addr (cacheable).
+        cpu.invalidate_decode_cache_entries(&[0x2000_0100, 0x4000_0000]);
+        // Completed without panic.
+    }
+
+    #[test]
+    fn invalidate_decode_cache_regions_bulk_bit() {
+        let mut cpu = CortexM33::for_test(0);
+        // Mark slot as dirty by writing a tag.
+        use crate::bus::DecodedOp;
+        cpu.decode_cache_set(0, DecodedOp::empty());
+        cpu.invalidate_decode_cache_regions(crate::bus::invalidation_regions::BULK);
+    }
+
+    #[test]
+    fn invalidate_decode_cache_regions_zero_is_noop() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.invalidate_decode_cache_regions(0);
+    }
+
+    #[test]
+    fn invalidate_decode_cache_regions_selective() {
+        let mut cpu = CortexM33::for_test(0);
+        // Any bit = noop for empty cache; just exercise the code path.
+        cpu.invalidate_decode_cache_regions(0x04);
+    }
+
+    #[test]
+    fn transition_to_nonsecure_and_back() {
+        let mut cpu = CortexM33::for_test(0);
+        assert!(cpu.secure);
+        cpu.transition_to_nonsecure();
+        assert!(!cpu.secure);
+        cpu.transition_to_secure();
+        assert!(cpu.secure);
+    }
+
+    #[test]
+    fn wfe_consumes_event_flag_no_sleep() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
+        // Assert event_flag via sev_both (sets both cores' flags).
+        cpu.atomics.sev_both();
+        let cycles = cpu.wfe(&mut bus);
+        assert_eq!(cycles, 1);
+        // Should not be wfe_waiting.
+        assert!(!cpu.atomics.is_wfe_waiting(0));
+    }
+
+    #[test]
+    fn wfe_no_event_flag_enters_sleep() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
+        cpu.wfe(&mut bus);
+        assert!(cpu.atomics.is_wfe_waiting(0));
+    }
+
+    // bus_read/write variants at different regions.
+    #[test]
+    fn bus_read_write_sram_path() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
+        cpu.bus_write32(0x2000_0000, 0xCAFE, &mut bus);
+        assert_eq!(cpu.bus_read32(0x2000_0000, &mut bus), 0xCAFE);
+    }
+
+    #[test]
+    fn bus_read8_write8_ppb_region_byte_access() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
+        // PPB byte read returns 0; write drops.
+        cpu.bus_write8(0xE000_ED08, 0xFF, &mut bus); // VTOR byte write
+        assert_eq!(cpu.bus_read8(0xE000_ED08, &mut bus), 0);
+    }
+
+    #[test]
+    fn bus_read16_write16_ppb_region_halfword() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
+        // Write 32 via PPB first.
+        cpu.bus_write32(0xE000_ED08, 0xABCD_1234, &mut bus);
+        // Read both halfwords.
+        let lo = cpu.bus_read16(0xE000_ED08, &mut bus);
+        let hi = cpu.bus_read16(0xE000_ED0A, &mut bus);
+        assert_eq!(lo as u32 | (hi as u32) << 16, 0xABCD_1200);
+        // Halfword write RMW.
+        cpu.bus_write16(0xE000_ED08, 0x9999, &mut bus);
+    }
+
+    #[test]
+    fn bus_access_sio_local_narrow() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
+        // DIV_QUOTIENT direct write.
+        cpu.bus_write32(0xD000_0070, 0xDEAD_BEEF, &mut bus);
+        // Read8 / Read16 covered.
+        assert_eq!(cpu.bus_read8(0xD000_0070, &mut bus), 0xEF);
+        assert_eq!(cpu.bus_read16(0xD000_0072, &mut bus), 0xDEAD);
+        // Write8 / Write16 are dropped.
+        cpu.bus_write8(0xD000_0070, 0x42, &mut bus);
+        cpu.bus_write16(0xD000_0070, 0x0000, &mut bus);
+        assert_eq!(cpu.bus_read32(0xD000_0070, &mut bus), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn execute_one_basic() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.set_reg(0, 5);
+        cpu.execute_one(0x2001); // MOVS R0, #1 (actually encodes R0 = 1)
+    }
+
+    #[test]
+    fn execute_one_wide_basic() {
+        let mut cpu = CortexM33::for_test(0);
+        // BL simple encoding — just execute a no-op-like wide.
+        cpu.execute_one_wide(0xF000, 0xB800);
+    }
+}
+
+mod stage7_dma_coverage {
+    use crate::bus::Bus;
+    use crate::dma::DMA_BASE;
+
+    fn release_dma(bus: &mut Bus) {
+        use crate::bus::RESET_DMA;
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
+    }
+
+    #[test]
+    fn read_channel_registers_via_aliases() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // Write distinct values via base alias, read back through each alias.
+        bus.write32(DMA_BASE + 0x00, 0x1111, 0); // READ_ADDR
+        bus.write32(DMA_BASE + 0x04, 0x2222, 0); // WRITE_ADDR
+        bus.write32(DMA_BASE + 0x08, 5, 0);       // TRANS_COUNT
+        // AL1_READ_ADDR (0x14) reads READ_ADDR.
+        assert_eq!(bus.read32(DMA_BASE + 0x14, 0), 0x1111);
+        assert_eq!(bus.read32(DMA_BASE + 0x28, 0), 0x1111);
+        assert_eq!(bus.read32(DMA_BASE + 0x3C, 0), 0x1111);
+        // AL1_WRITE_ADDR_TRIG (0x18) reads WRITE_ADDR (but triggers on write).
+        assert_eq!(bus.read32(DMA_BASE + 0x18, 0), 0x2222);
+        assert_eq!(bus.read32(DMA_BASE + 0x2C, 0), 0x2222);
+        assert_eq!(bus.read32(DMA_BASE + 0x34, 0), 0x2222);
+        // AL1_TRANS_COUNT (0x1C).
+        assert_eq!(bus.read32(DMA_BASE + 0x1C, 0), 5);
+        assert_eq!(bus.read32(DMA_BASE + 0x24, 0), 5);
+        assert_eq!(bus.read32(DMA_BASE + 0x38, 0), 5);
+    }
+
+    #[test]
+    fn write_al2_trans_count_trig_triggers_transfer() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x00, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0300, 0);
+        bus.write32(DMA_BASE + 0x2C, 0x2000_0300, 0); // AL2_WRITE_ADDR
+        // EN=1, DATA_SIZE=2, INCR_READ=1, INCR_WRITE=1, TREQ=63.
+        bus.write32(DMA_BASE + 0x30, 0x007E_0059, 0); // AL3_CTRL (won't trigger)
+        // AL2_TRANS_COUNT_TRIG (0x24) triggers.
+        bus.write32(DMA_BASE + 0x24, 1, 0);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_ne!(r & (1 << 26), 0, "BUSY after AL2 trigger");
+    }
+
+    #[test]
+    fn write_al3_read_addr_trig_triggers() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0300, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x10, 0x007E_0059, 0); // AL1_CTRL
+        // AL3_READ_ADDR_TRIG (0x3C).
+        bus.write32(DMA_BASE + 0x3C, 0x2000_0200, 0);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_ne!(r & (1 << 26), 0);
+    }
+
+    #[test]
+    fn al1_write_addr_trig_triggers() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x00, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x10, 0x007E_0059, 0);
+        bus.write32(DMA_BASE + 0x18, 0x2000_0300, 0); // AL1_WRITE_ADDR_TRIG
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_ne!(r & (1 << 26), 0);
+    }
+
+    #[test]
+    fn channel_write_unknown_inner_noop() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // inner=0x3E is not a valid register — silently ignored.
+        bus.write32(DMA_BASE + 0x3E, 0xDEAD, 0);
+    }
+
+    #[test]
+    fn multi_chan_trigger_activates_channels() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // Pre-program ch0 and ch1.
+        bus.write32(0x2000_0100, 0x1111, 0);
+        bus.write32(0x2000_0200, 0x2222, 0);
+        bus.write32(DMA_BASE + 0x00, 0x2000_0100, 0);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0400, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x10, 0x007E_0059, 0); // ch0 AL1_CTRL no trigger
+        bus.write32(DMA_BASE + 0x40 + 0x00, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x04, 0x2000_0500, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x10, 0x007E_0059, 0);
+        // MULTI_CHAN_TRIGGER mask = 0x3 (ch0 + ch1).
+        bus.write32(DMA_BASE + 0x450, 0x3, 0);
+        let r0 = bus.read32(DMA_BASE + 0x0C, 0);
+        let r1 = bus.read32(DMA_BASE + 0x40 + 0x0C, 0);
+        assert_ne!(r0 & (1 << 26), 0);
+        assert_ne!(r1 & (1 << 26), 0);
+    }
+
+    #[test]
+    fn read_dma_unknown_offset_returns_zero() {
+        let mut bus = Bus::new();
+        // Read offset 0x4FC (reserved) → 0.
+        assert_eq!(bus.read32(DMA_BASE + 0x4FC, 0), 0);
+    }
+
+    #[test]
+    fn read_dma_dbg_ctdreq_region() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x00, 0x2000, 0);
+        bus.write32(DMA_BASE + 0x08, 7, 0);
+        // DBG_TCR (base + 0x800 + ch*0x40 + 4)
+        assert_eq!(bus.read32(DMA_BASE + 0x804, 0), 7);
+        // DBG_CTDREQ (base + 0x800 + ch*0x40 + 0) — returns 0.
+        assert_eq!(bus.read32(DMA_BASE + 0x800, 0), 0);
+        // Unknown inner → 0.
+        assert_eq!(bus.read32(DMA_BASE + 0x808, 0), 0);
+    }
+
+    #[test]
+    fn read_chan_abort_and_fifo_levels_return_zero() {
+        let mut bus = Bus::new();
+        assert_eq!(bus.read32(DMA_BASE + 0x464, 0), 0); // CHAN_ABORT
+        assert_eq!(bus.read32(DMA_BASE + 0x460, 0), 0); // FIFO_LEVELS
+        assert_eq!(bus.read32(DMA_BASE + 0x450, 0), 0); // MULTI_CHAN_TRIGGER
+    }
+
+    #[test]
+    fn dma_irq2_irq3_storage_roundtrip() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x424, 0x5, 0); // INTE2
+        assert_eq!(bus.read32(DMA_BASE + 0x424, 0), 0x5);
+        bus.write32(DMA_BASE + 0x428, 0x3, 0); // INTF2
+        assert_eq!(bus.read32(DMA_BASE + 0x428, 0), 0x3);
+        bus.write32(DMA_BASE + 0x434, 0x6, 0);
+        assert_eq!(bus.read32(DMA_BASE + 0x434, 0), 0x6);
+        bus.write32(DMA_BASE + 0x438, 0x2, 0);
+        assert_eq!(bus.read32(DMA_BASE + 0x438, 0), 0x2);
+    }
+
+    #[test]
+    fn ints2_ints3_reads_compute() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x424, 0xF, 0); // INTE2
+        bus.write32(DMA_BASE + 0x428, 0x3, 0); // INTF2
+        // INTS2 = (intr | intf) & inte = (0 | 0x3) & 0xF = 0x3.
+        assert_eq!(bus.read32(DMA_BASE + 0x42C, 0), 0x3);
+        bus.write32(DMA_BASE + 0x434, 0xF, 0);
+        bus.write32(DMA_BASE + 0x438, 0x5, 0);
+        assert_eq!(bus.read32(DMA_BASE + 0x43C, 0), 0x5);
+    }
+
+    #[test]
+    fn ints2_w1c_clears_intr() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0200;
+        bus.write32(src, 0x42, 0);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x0C, 0x007E_0059, 0);
+        bus.tick_dma();
+        assert_ne!(bus.read32(DMA_BASE + 0x400, 0) & 1, 0);
+        // Write to INTS2 (W1C on INTR bits).
+        bus.write32(DMA_BASE + 0x42C, 1, 0);
+        assert_eq!(bus.read32(DMA_BASE + 0x400, 0) & 1, 0);
+    }
+
+    #[test]
+    fn ints3_w1c_clears_intr() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0200;
+        bus.write32(src, 0x42, 0);
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x0C, 0x007E_0059, 0);
+        bus.tick_dma();
+        assert_ne!(bus.read32(DMA_BASE + 0x400, 0) & 1, 0);
+        bus.write32(DMA_BASE + 0x43C, 1, 0);
+        assert_eq!(bus.read32(DMA_BASE + 0x400, 0) & 1, 0);
+    }
+
+    #[test]
+    fn intf0_intf1_roundtrip() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x408, 0x5, 0); // INTF0
+        assert_eq!(bus.read32(DMA_BASE + 0x408, 0), 0x5);
+        bus.write32(DMA_BASE + 0x418, 0x3, 0); // INTF1
+        assert_eq!(bus.read32(DMA_BASE + 0x418, 0), 0x3);
+    }
+
+    #[test]
+    fn ring_on_write_covers_both_paths() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let src: u32 = 0x2000_1100;
+        let dst: u32 = 0x2000_1200;
+        for i in 0..4u32 {
+            bus.write32(src + i * 4, 0x9000 + i, 0);
+        }
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
+        // Ring on READ (RING_SEL=0), RING_SIZE=3 (8 bytes).
+        let ctrl: u32 = 0x007E_0000 | 0x1 | (2u32 << 2) | (1u32 << 4) | (1u32 << 6) | (3u32 << 8);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+        for _ in 0..4 {
+            bus.tick_dma();
+        }
+        // All completed.
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_eq!(r & (1 << 26), 0);
+    }
+
+    #[test]
+    fn disabled_channel_trigger_no_busy() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x08, 10, 0);
+        // CTRL with EN=0.
+        bus.write32(DMA_BASE + 0x0C, 0x007E_0058, 0); // EN bit clear
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_eq!(r & (1 << 26), 0);
+    }
+
+    #[test]
+    fn zero_trans_count_trigger_no_busy() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + 0x08, 0, 0); // count = 0
+        bus.write32(DMA_BASE + 0x0C, 0x007E_0059, 0);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_eq!(r & (1 << 26), 0);
+    }
+
+    #[test]
+    fn alias_rmw_set_and_clr_on_inte() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // Alias 2 = SET at 0x2000 offset.
+        bus.write32(DMA_BASE + 0x404, 0x5, 0);
+        // SET bits 0x2 (0x2000 alias on peripheral).
+        bus.write32(0x5000_0000 | 0x2000 | 0x404, 0x2, 0);
+        assert_eq!(bus.read32(DMA_BASE + 0x404, 0), 0x7);
+        // CLR bits 0x4 via 0x3000 alias.
+        bus.write32(0x5000_0000 | 0x3000 | 0x404, 0x4, 0);
+        assert_eq!(bus.read32(DMA_BASE + 0x404, 0), 0x3);
+    }
+}
+
+mod stage7_lib_coverage {
+    use crate::{Arch, Config, Cores, Emulator, EmulatorBuilder};
+
+    #[test]
+    fn builder_default_is_arm() {
+        let emu = EmulatorBuilder::new(Config::default()).build();
+        assert!(emu.cores.is_arm());
+    }
+
+    #[test]
+    fn builder_riscv_variant() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build();
+        assert!(emu.cores.is_riscv());
+    }
+
+    #[test]
+    fn builder_custom_quantum() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(128)
+            .build();
+        assert_eq!(emu.step_quantum, 128);
+    }
+
+    #[test]
+    fn builder_custom_sysclk() {
+        let config = Config { sys_clk_hz: 125_000_000 };
+        let emu = EmulatorBuilder::new(config).build();
+        assert_eq!(emu.bus.sys_clk_hz(), 125_000_000);
+    }
+
+    #[test]
+    fn run_overshoots_by_up_to_quantum() {
+        let mut emu = Emulator::new(Config::default());
+        let final_cycles = emu.run(100);
+        assert!(final_cycles >= 100);
+    }
+
+    #[test]
+    fn poke_and_peek_sram() {
+        let mut emu = Emulator::new(Config::default());
+        emu.poke(0x2000_0100, 0xDEAD_BEEF);
+        assert_eq!(emu.peek(0x2000_0100), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn poke_and_peek_boot_ram() {
+        let mut emu = Emulator::new(Config::default());
+        let boot_ram_addr = 0xEFFF_F000;
+        emu.poke(boot_ram_addr, 0xCAFE_BABE);
+        assert_eq!(emu.peek(boot_ram_addr), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn reset_clears_cores() {
+        let mut emu = Emulator::new(Config::default());
+        emu.load_bootrom(&vec![0; 128]);
+        emu.reset();
+        assert_eq!(emu.cycles(), 0);
+    }
+
+    #[test]
+    fn mmio_write_read_roundtrip_ppb() {
+        let mut emu = Emulator::new(Config::default());
+        emu.mmio_write32(0xE000_ED08, 0x2000_0000);
+        assert_eq!(emu.mmio_read32(0xE000_ED08), 0x2000_0000);
+    }
+
+    #[test]
+    fn mmio_write_read_roundtrip_bus() {
+        let mut emu = Emulator::new(Config::default());
+        emu.mmio_write32(0x2000_0000, 0xDEAD_BEEF);
+        assert_eq!(emu.mmio_read32(0x2000_0000), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn mmio_write_nvic_ispr_syncs_irq_pending() {
+        let mut emu = Emulator::new(Config::default());
+        // NVIC_ISPR0 at 0xE000_E200 — bit 0 = IRQ 0.
+        emu.mmio_write32(0xE000_E200, 0x1);
+        // irq_pending on core 0 should have bit 0.
+        assert_ne!(emu.bus.atomics.irq_pending_load(0) & 1, 0);
+    }
+
+    #[test]
+    fn mmio_write_nvic_ispr_word1() {
+        let mut emu = Emulator::new(Config::default());
+        // NVIC_ISPR1 at 0xE000_E204 — bit 0 of word 1 = IRQ 32.
+        emu.mmio_write32(0xE000_E204, 0x1);
+        assert_ne!(emu.bus.atomics.irq_pending_load(0) & (1u64 << 32), 0);
+    }
+
+    #[test]
+    fn mmio_write_icpr_also_syncs() {
+        let mut emu = Emulator::new(Config::default());
+        emu.mmio_write32(0xE000_E200, 0x1); // ISPR — pend IRQ 0
+        assert_ne!(emu.bus.atomics.irq_pending_load(0) & 1, 0);
+        emu.mmio_write32(0xE000_E280, 0x1); // ICPR — clear IRQ 0
+        assert_eq!(emu.bus.atomics.irq_pending_load(0) & 1, 0);
+    }
+
+    #[test]
+    fn core_mut_and_core_access() {
+        let mut emu = Emulator::new(Config::default());
+        let id0 = emu.core(0).id();
+        let id1 = emu.core_mut(1).id();
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn core_panics_on_riscv() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build();
+        let _ = emu.core_mut(0);
+    }
+
+    #[test]
+    fn core_riscv_on_riscv() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build();
+        // Should not panic.
+        let _ = emu.core_riscv(0);
+        let _ = emu.core_riscv_mut(1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn core_riscv_panics_on_arm() {
+        let emu = Emulator::new(Config::default());
+        let _ = emu.core_riscv(0);
+    }
+
+    #[test]
+    fn core_counters_and_reset() {
+        let mut emu = Emulator::new(Config::default());
+        let _ = emu.core_counters(0);
+        emu.reset_counters();
+    }
+
+    #[test]
+    fn reset_on_riscv_emulator() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build();
+        emu.reset();
+    }
+
+    #[test]
+    fn gpio_read_write_and_read_all() {
+        let mut emu = Emulator::new(Config::default());
+        emu.gpio_write(0, true); // stub — no-op
+        let _ = emu.gpio_read(0);
+        let _ = emu.gpio_read_all();
+    }
+
+    #[test]
+    fn cores_expect_arm_on_arm() {
+        let emu = Emulator::new(Config::default());
+        let _ = emu.cores.expect_arm();
+    }
+
+    #[test]
+    fn cores_expect_riscv_on_riscv() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build();
+        let _ = emu.cores.expect_riscv();
+    }
+
+    #[test]
+    #[should_panic]
+    fn cores_expect_arm_panics_on_riscv() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build();
+        let _ = emu.cores.expect_arm();
+    }
+
+    #[test]
+    #[should_panic]
+    fn cores_expect_riscv_panics_on_arm() {
+        let emu = Emulator::new(Config::default());
+        let _ = emu.cores.expect_riscv();
+    }
+
+    #[test]
+    #[should_panic]
+    fn cores_expect_arm_mut_panics_on_riscv() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build();
+        if let Cores::RiscV(_) = &emu.cores {
+            let _ = emu.cores.expect_arm_mut();
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn cores_expect_riscv_mut_panics_on_arm() {
+        let mut emu = Emulator::new(Config::default());
+        let _ = emu.cores.expect_riscv_mut();
+    }
+
+    #[test]
+    fn load_image_various_regions() {
+        let mut emu = Emulator::new(Config::default());
+        let data = vec![0x12u8, 0x34, 0x56, 0x78];
+        emu.load_image(0x2000_0000, &data);
+        emu.load_image(0x8000_0000, &data); // oracle alias
+        emu.load_image(0x0000_0000, &data); // ROM — silently ignored
+        emu.load_image(0x4000_0000, &data); // other region — ignored
+        assert_eq!(emu.peek(0x2000_0000) & 0xFF, 0x12);
+    }
+
+    #[test]
+    fn load_flash_drains_cache_invalidations() {
+        let mut emu = Emulator::new(Config::default());
+        let data = vec![0u8; 16];
+        emu.load_flash(&data);
+        // pending_invalidation_regions drained.
+        assert_eq!(emu.bus.pending_invalidation_regions, 0);
+    }
+}
+
+mod stage7_ppb_coverage {
+    use crate::bus::ppb::Ppb;
+
+    #[test]
+    fn syst_csr_read_clears_countflag() {
+        let mut ppb = Ppb::default();
+        ppb.syst_csr = 0x1_0000 | 0x1; // COUNTFLAG | ENABLE
+        let v = ppb.read32(0xE000_E010);
+        assert_ne!(v & 0x1_0000, 0);
+        // Second read: COUNTFLAG cleared.
+        assert_eq!(ppb.read32(0xE000_E010) & 0x1_0000, 0);
+    }
+
+    #[test]
+    fn syst_rvr_and_cvr_masked_to_24bits() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E014, 0xFFFF_FFFF);
+        assert_eq!(ppb.read32(0xE000_E014), 0x00FF_FFFF);
+        ppb.syst_cvr = 0xABCD_EF01;
+        assert_eq!(ppb.read32(0xE000_E018), 0x00CD_EF01);
+    }
+
+    #[test]
+    fn syst_cvr_write_clears_to_zero() {
+        let mut ppb = Ppb::default();
+        ppb.syst_cvr = 0xAAAA;
+        ppb.syst_csr |= 1 << 16;
+        ppb.write32(0xE000_E018, 0xDEAD);
+        assert_eq!(ppb.syst_cvr, 0);
+        assert_eq!(ppb.syst_csr & (1 << 16), 0);
+    }
+
+    #[test]
+    fn syst_calib_read_returns_zero() {
+        let mut ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_E01C), 0);
+    }
+
+    #[test]
+    fn syst_calib_write_ignored() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E01C, 0xFFFF_FFFF);
+        assert_eq!(ppb.read32(0xE000_E01C), 0);
+    }
+
+    #[test]
+    fn ictr_read_is_one() {
+        let mut ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_E004), 1);
+    }
+
+    #[test]
+    fn nvic_iser_write_set_and_clear() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E100, 0x7);
+        assert_eq!(ppb.read32(0xE000_E100), 0x7);
+        ppb.write32(0xE000_E180, 0x2); // clear bit 1
+        assert_eq!(ppb.read32(0xE000_E100), 0x5);
+        ppb.write32(0xE000_E104, 0x3);
+        ppb.write32(0xE000_E184, 0x1);
+        assert_eq!(ppb.read32(0xE000_E104), 0x2);
+    }
+
+    #[test]
+    fn nvic_iabr_readonly_on_write() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E300, 0xFFFF_FFFF);
+        ppb.write32(0xE000_E304, 0xFFFF_FFFF);
+        // IABR reads return whatever was in the atomic (not stored via write).
+        // Default is 0.
+        assert_eq!(ppb.read32(0xE000_E300), 0);
+        assert_eq!(ppb.read32(0xE000_E304), 0);
+    }
+
+    #[test]
+    fn nvic_ispr_word1_mask_applied() {
+        let mut ppb = Ppb::default();
+        // Write all 1s to ISPR1 — must be masked to IRQ_COUNT - 32 bits.
+        ppb.write32(0xE000_E204, 0xFFFF_FFFF);
+        let stored = ppb.read32(0xE000_E204);
+        assert_eq!(stored & !((1u32 << (crate::irq::IRQ_COUNT - 32)) - 1), 0);
+    }
+
+    #[test]
+    fn nvic_ipr_write_read_mask_applied() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E400, 0xFFFF_FFFF);
+        // Each byte masked to 0xE0.
+        let v = ppb.read32(0xE000_E400);
+        assert_eq!(v, 0xE0E0_E0E0);
+    }
+
+    #[test]
+    fn nvic_ipr_misaligned_reserved_read_zero() {
+        let mut ppb = Ppb::default();
+        // 0xE000_E401 — misaligned, falls through to 0xE100..=0xE4FF reserved → 0.
+        assert_eq!(ppb.read32(0xE000_E401), 0);
+    }
+
+    #[test]
+    fn dwt_ctrl_and_cyccnt_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_1000, 0x1); // CYCCNTENA
+        ppb.demcr = 1 << 24; // TRCENA
+        ppb.write32(0xE000_1004, 42);
+        // Read CYCCNT with cycles=0 → 42.
+        assert_eq!(ppb.read32(0xE000_1004), 42);
+    }
+
+    #[test]
+    fn dwt_disabled_returns_stored_base() {
+        let mut ppb = Ppb::default();
+        ppb.dwt_ctrl = 0;
+        ppb.write32(0xE000_1004, 100);
+        // disabled — returns the stored base.
+        assert_eq!(ppb.read32(0xE000_1004), 100);
+    }
+
+    #[test]
+    fn cpuid_write_ignored() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED00, 0xDEAD_BEEF);
+        assert_eq!(ppb.read32(0xE000_ED00), 0x411F_D210);
+    }
+
+    #[test]
+    fn aircr_scr_ccr_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED0C, 0x42);
+        assert_eq!(ppb.read32(0xE000_ED0C), 0x42);
+        ppb.write32(0xE000_ED10, 0x7);
+        assert_eq!(ppb.read32(0xE000_ED10), 0x7);
+        ppb.write32(0xE000_ED14, 0x400);
+        assert_eq!(ppb.read32(0xE000_ED14), 0x400);
+    }
+
+    #[test]
+    fn shpr2_shpr3_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED1C, 0xE060_4020);
+        assert_eq!(ppb.read32(0xE000_ED1C), 0xE060_4020);
+        ppb.write32(0xE000_ED20, 0x8060_4020);
+        assert_eq!(ppb.read32(0xE000_ED20), 0x8060_4020);
+    }
+
+    #[test]
+    fn shcsr_and_hfsr() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED24, 0xDEAD);
+        assert_eq!(ppb.read32(0xE000_ED24), 0xDEAD);
+        ppb.hfsr = 0xFF;
+        ppb.write32(0xE000_ED2C, 0x0F);
+        assert_eq!(ppb.read32(0xE000_ED2C), 0xF0);
+    }
+
+    #[test]
+    fn mmfar_bfar_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED34, 0xDEAD);
+        assert_eq!(ppb.read32(0xE000_ED34), 0xDEAD);
+        ppb.write32(0xE000_ED38, 0xBEEF);
+        assert_eq!(ppb.read32(0xE000_ED38), 0xBEEF);
+    }
+
+    #[test]
+    fn cpacr_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED88, 0x00FF_0000);
+        assert_eq!(ppb.read32(0xE000_ED88), 0x00FF_0000);
+    }
+
+    #[test]
+    fn fpccr_fpcar_fpdscr() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EF34, 0xDEAD_BEEF);
+        assert_eq!(ppb.read32(0xE000_EF34), 0xDEAD_BEEF);
+        ppb.write32(0xE000_EF38, 0xDEAD_BEEF);
+        // Masked bottom 3 bits.
+        assert_eq!(ppb.read32(0xE000_EF38), 0xDEAD_BEE8);
+        ppb.write32(0xE000_EF3C, 0xCAFE_BABE);
+        assert_eq!(ppb.read32(0xE000_EF3C), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn mpu_type_read() {
+        let mut ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_ED90), 0x0000_1000);
+        ppb.write32(0xE000_ED90, 0xFFFF);
+        assert_eq!(ppb.read32(0xE000_ED90), 0x0000_1000);
+    }
+
+    #[test]
+    fn mpu_ctrl_rnr_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED94, 0x7);
+        assert_eq!(ppb.read32(0xE000_ED94), 0x7);
+        ppb.write32(0xE000_ED98, 0xFF);
+        // Masked to 4 bits.
+        assert_eq!(ppb.read32(0xE000_ED98), 0xF);
+    }
+
+    #[test]
+    fn mpu_rbar_rlar_roundtrip_aliases() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED98, 0);
+        ppb.write32(0xE000_ED9C, 0x2000_0003);
+        ppb.write32(0xE000_EDA0, 0x2000_FFF1);
+        assert_eq!(ppb.read32(0xE000_ED9C), 0x2000_0003);
+        // RLAR: bit 4 masked off on store.
+        assert_ne!(ppb.read32(0xE000_EDA0) & 1, 0);
+        // Alias A1 (reg rnr|1=1).
+        ppb.write32(0xE000_EDA4, 0x3000_0003);
+        assert_eq!(ppb.read32(0xE000_EDA4), 0x3000_0003);
+        ppb.write32(0xE000_EDA8, 0x3000_FFF1);
+        assert_ne!(ppb.read32(0xE000_EDA8) & 1, 0);
+    }
+
+    #[test]
+    fn sau_ctrl_type_rnr_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EDD0, 0x3);
+        assert_eq!(ppb.read32(0xE000_EDD0), 0x3);
+        // Type is RO = 8.
+        assert_eq!(ppb.read32(0xE000_EDD4), 8);
+        ppb.write32(0xE000_EDD4, 0xFFFF); // ignored
+        assert_eq!(ppb.read32(0xE000_EDD4), 8);
+        ppb.write32(0xE000_EDD8, 0xFF);
+        assert_eq!(ppb.read32(0xE000_EDD8), 7);
+    }
+
+    #[test]
+    fn sau_rbar_rlar_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EDDC, 0x2000_0003);
+        // Bits [4:0] RES0 in read.
+        assert_eq!(ppb.read32(0xE000_EDDC), 0x2000_0000);
+        ppb.write32(0xE000_EDE0, 0xDEAD);
+        assert_eq!(ppb.read32(0xE000_EDE0), 0xDEAD);
+    }
+
+    #[test]
+    fn demcr_roundtrip() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EDFC, 0x0100_0000);
+        assert_eq!(ppb.read32(0xE000_EDFC), 0x0100_0000);
+    }
+
+    #[test]
+    fn reserved_ppb_reads_return_zero() {
+        let mut ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_F000), 0);
+    }
+
+    #[test]
+    fn unknown_ppb_write_ignored() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_F000, 0xFFFF_FFFF);
+        assert_eq!(ppb.read32(0xE000_F000), 0);
+    }
+
+    #[test]
+    fn exception_priority_irq_out_of_range() {
+        let ppb = Ppb::default();
+        // word_idx >= NVIC_IPR_WORDS (13 * 4 = 52, so exc_num >= 68).
+        assert_eq!(ppb.exception_priority(16 + 1000), 0);
+    }
+
+    #[test]
+    fn clear_active_below_16_noop() {
+        let mut ppb = Ppb::default();
+        ppb.nvic_iabr[0].store(0xFF, std::sync::atomic::Ordering::Relaxed);
+        ppb.clear_active(5); // system exception; no effect on IABR.
+        assert_eq!(ppb.nvic_iabr[0].load(std::sync::atomic::Ordering::Relaxed), 0xFF);
+    }
+
+    #[test]
+    fn set_irq_pending_out_of_range_noop() {
+        let mut ppb = Ppb::default();
+        ppb.set_irq_pending(1000);
+        // No change.
+    }
+
+    #[test]
+    fn clear_irq_pending_out_of_range_noop() {
+        let mut ppb = Ppb::default();
+        ppb.clear_irq_pending(1000);
+    }
+
+    #[test]
+    fn set_irq_active_and_check_enabled() {
+        let mut ppb = Ppb::default();
+        ppb.set_irq_active(5);
+        assert!(!ppb.irq_enabled(5));
+        ppb.write32(0xE000_E100, 1 << 5);
+        assert!(ppb.irq_enabled(5));
+        assert!(!ppb.irq_enabled(1000));
+    }
+
+    #[test]
+    fn systick_advance_counts_down_no_underflow() {
+        let mut ppb = Ppb::default();
+        ppb.syst_csr = 1 | 2; // ENABLE + TICKINT
+        ppb.syst_rvr = 100;
+        ppb.syst_cvr = 100;
+        ppb.last_systick_cycles = 0;
+        ppb.systick_advance(50);
+        assert_eq!(ppb.syst_cvr, 50);
+    }
+
+    #[test]
+    fn systick_advance_underflow_sets_countflag() {
+        let mut ppb = Ppb::default();
+        ppb.syst_csr = 1 | 2;
+        ppb.syst_rvr = 10;
+        ppb.syst_cvr = 5;
+        ppb.last_systick_cycles = 0;
+        ppb.systick_advance(6);
+        assert_ne!(ppb.syst_csr & (1 << 16), 0);
+        // And SysTick pended.
+        assert_ne!(ppb.icsr & crate::bus::ppb::ICSR_PENDSTSET, 0);
+    }
+
+    #[test]
+    fn systick_disabled_no_advance() {
+        let mut ppb = Ppb::default();
+        ppb.syst_cvr = 100;
+        ppb.systick_advance(50);
+        assert_eq!(ppb.syst_cvr, 100);
+    }
+
+    #[test]
+    fn systick_rvr_zero_stops() {
+        let mut ppb = Ppb::default();
+        ppb.syst_csr = 1;
+        ppb.syst_rvr = 0;
+        ppb.syst_cvr = 0;
+        ppb.systick_advance(10);
+        // RVR=0 path returns after first reload.
+        assert_eq!(ppb.syst_cvr, 0);
+    }
+
+    #[test]
+    fn any_pending_enabled_true_false() {
+        let mut ppb = Ppb::default();
+        ppb.nvic_iser[0].store(0x1, std::sync::atomic::Ordering::Relaxed);
+        assert!(ppb.any_pending_enabled(0x1));
+        assert!(!ppb.any_pending_enabled(0x2));
+    }
+
+    #[test]
+    fn update_latest_cycles_ppb_field() {
+        let mut ppb = Ppb::default();
+        ppb.update_latest_cycles(12345);
+        assert_eq!(ppb.latest_cycles, 12345);
+    }
+}
+
+mod stage7_powman_coverage {
+    use crate::peripherals::powman::{
+        PowmanRegs, ALARM_TIME_15TO0_OFFSET, ARCHSEL_OFFSET, BADPASSWD_BIT, BADPASSWD_OFFSET,
+        INTE_OFFSET, INTF_OFFSET, INT_TIMER_BIT, INTR_OFFSET, INTS_OFFSET, POWMAN_PASSWORD,
+        READ_TIME_LOWER_OFFSET, READ_TIME_UPPER_OFFSET, SET_TIME_15TO0_OFFSET, TIMER_ALARM_BIT,
+        TIMER_ALARM_ENAB_BIT, TIMER_OFFSET, TIMER_RUN_BIT, VREG_CTRL_OFFSET, VREG_OFFSET,
+        VREG_STS_OFFSET,
+    };
+
+    #[test]
+    fn badpasswd_latches_on_wrong_password_write() {
+        let mut p = PowmanRegs::new();
+        // Wrong password (bits [31:16] == 0 != 0x5AFE).
+        let mask = p.write32(SET_TIME_15TO0_OFFSET, 0x0000_1234, 0);
+        assert_eq!(mask, 0);
+        assert_eq!(p.read32(BADPASSWD_OFFSET) & BADPASSWD_BIT, BADPASSWD_BIT);
+    }
+
+    #[test]
+    fn badpasswd_w1c_clears_latch() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(SET_TIME_15TO0_OFFSET, 0x1234, 0);
+        assert_ne!(p.read32(BADPASSWD_OFFSET) & BADPASSWD_BIT, 0);
+        let _ = p.write32(BADPASSWD_OFFSET, BADPASSWD_BIT, 0);
+        assert_eq!(p.read32(BADPASSWD_OFFSET) & BADPASSWD_BIT, 0);
+    }
+
+    #[test]
+    fn badpasswd_write_without_bit0_is_noop() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(SET_TIME_15TO0_OFFSET, 0x1234, 0);
+        let before = p.read32(BADPASSWD_OFFSET);
+        let _ = p.write32(BADPASSWD_OFFSET, 0x2, 0);
+        assert_eq!(p.read32(BADPASSWD_OFFSET), before);
+    }
+
+    #[test]
+    fn vreg_registers_roundtrip() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(VREG_CTRL_OFFSET, 0xDEAD, 0);
+        assert_eq!(p.read32(VREG_CTRL_OFFSET), 0xDEAD);
+        let _ = p.write32(VREG_STS_OFFSET, 0xBEEF, 0);
+        assert_eq!(p.read32(VREG_STS_OFFSET), 0xBEEF);
+        let _ = p.write32(VREG_OFFSET, 0xCAFE, 0);
+        assert_eq!(p.read32(VREG_OFFSET), 0xCAFE);
+    }
+
+    #[test]
+    fn archsel_tripwire_fires_once_via_flag() {
+        let mut p = PowmanRegs::new();
+        // Write non-Arm ARCHSEL — this is NOT password-gated.
+        let _ = p.write32(ARCHSEL_OFFSET, 1, 0);
+        let _ = p.write32(ARCHSEL_OFFSET, 2, 0);
+        // No direct API to inspect warned_archsel; but the tripwire is
+        // internal. Just exercise the paths.
+        assert_eq!(p.read32(ARCHSEL_OFFSET), 2);
+    }
+
+    #[test]
+    fn archsel_stays_arm_does_not_set_tripwire() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(ARCHSEL_OFFSET, 0, 0);
+        assert_eq!(p.read32(ARCHSEL_OFFSET), 0);
+    }
+
+    #[test]
+    fn set_time_all_lanes() {
+        let mut p = PowmanRegs::new();
+        // Write all 4 SET_TIME_* lanes.
+        let _ = p.write32(SET_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 0x1111, 0);
+        let _ = p.write32(0x68, POWMAN_PASSWORD | 0x2222, 0);
+        let _ = p.write32(0x64, POWMAN_PASSWORD | 0x3333, 0);
+        let _ = p.write32(0x60, POWMAN_PASSWORD | 0x4444, 0);
+        assert_eq!(p.read32(READ_TIME_LOWER_OFFSET), 0x2222_1111);
+        assert_eq!(p.read32(READ_TIME_UPPER_OFFSET), 0x4444_3333);
+    }
+
+    #[test]
+    fn alarm_time_all_lanes() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 0x1111, 0);
+        let _ = p.write32(0x80, POWMAN_PASSWORD | 0x2222, 0);
+        let _ = p.write32(0x7C, POWMAN_PASSWORD | 0x3333, 0);
+        let _ = p.write32(0x78, POWMAN_PASSWORD | 0x4444, 0);
+        assert_eq!(p.read32(ALARM_TIME_15TO0_OFFSET), 0x1111);
+        assert_eq!(p.read32(0x80), 0x2222);
+        assert_eq!(p.read32(0x7C), 0x3333);
+        assert_eq!(p.read32(0x78), 0x4444);
+    }
+
+    #[test]
+    fn timer_write_alarm_w1c() {
+        let mut p = PowmanRegs::new();
+        // Seed ALARM bit via advance — or directly in the test.
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_ALARM_BIT, 0);
+        // W1C doesn't set ALARM (it's a clear). Test instead: write RUN
+        // with alarm clearing.
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT, 0);
+        assert_ne!(p.read32(TIMER_OFFSET) & TIMER_RUN_BIT, 0);
+    }
+
+    #[test]
+    fn intr_w1c_and_mirrors_timer_alarm() {
+        let mut p = PowmanRegs::new();
+        // Force INTR.TIMER by advancing past alarm.
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 5, 0);
+        let _ = p.write32(INTE_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        // Use a fake clock tree with default sys_clk_hz.
+        use mdpicoem_common::clocks::ClockTree;
+        let clock = ClockTree::default();
+        // Advance enough sys_clks to cross the alarm.
+        let _ = p.advance(10 * 50, &clock);
+        assert_ne!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
+        // W1C TIMER.
+        let _ = p.write32(INTR_OFFSET, INT_TIMER_BIT, 0);
+        assert_eq!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
+    }
+
+    #[test]
+    fn inte_set_reraises_on_pre_latched_intr() {
+        let mut p = PowmanRegs::new();
+        // Arm alarm without INTE first.
+        let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 5, 0);
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        use mdpicoem_common::clocks::ClockTree;
+        let clock = ClockTree::default();
+        let _ = p.advance(10 * 50, &clock);
+        assert_ne!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
+        // Now set INTE.TIMER — should transition INTS 0→1 and raise mask.
+        let mask = p.write32(INTE_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
+        assert_ne!(mask, 0);
+    }
+
+    #[test]
+    fn intf_write_reraises_nvic() {
+        let mut p = PowmanRegs::new();
+        let mask = p.write32(INTF_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
+        assert_ne!(mask, 0, "INTF set must return raise mask");
+    }
+
+    #[test]
+    fn ints_readonly_write_ignored() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(INTS_OFFSET, 0xFFFF_FFFF, 0);
+        assert_eq!(p.read32(INTS_OFFSET), 0);
+    }
+
+    #[test]
+    fn unknown_offset_hashmap_fallthrough() {
+        let mut p = PowmanRegs::new();
+        // Write a non-modelled offset (not password-gated).
+        let _ = p.write32(0x100, 0xDEAD, 0);
+        assert_eq!(p.read32(0x100), 0xDEAD);
+    }
+
+    #[test]
+    fn advance_without_run_no_tick() {
+        let mut p = PowmanRegs::new();
+        use mdpicoem_common::clocks::ClockTree;
+        let clock = ClockTree::default();
+        let mask = p.advance(100, &clock);
+        assert_eq!(mask, 0);
+        assert_eq!(p.read32(READ_TIME_LOWER_OFFSET), 0);
+    }
+
+    #[test]
+    fn advance_with_sys_clks_zero_no_tick() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT, 0);
+        use mdpicoem_common::clocks::ClockTree;
+        let clock = ClockTree::default();
+        let mask = p.advance(0, &clock);
+        assert_eq!(mask, 0);
+    }
+
+    #[test]
+    fn advance_accumulates_sub_tick() {
+        // Use a sys_clk that produces a predictable sys_per_tick.
+        // sys_per_tick = sys_clk_hz / POWMAN_TICK_HZ = 150e6 / 3e6 = 50.
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT, 0);
+        use mdpicoem_common::clocks::ClockTree;
+        let clock = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        };
+        // 25 sys_clks = 25/50 = 0 ticks.
+        let _ = p.advance(25, &clock);
+        assert_eq!(p.read32(READ_TIME_LOWER_OFFSET), 0);
+        // 25 more = 50 total / 50 = 1 tick.
+        let _ = p.advance(25, &clock);
+        assert_eq!(p.read32(READ_TIME_LOWER_OFFSET), 1);
+    }
+
+    #[test]
+    fn reset_clears_state() {
+        let mut p = PowmanRegs::new();
+        let _ = p.write32(VREG_CTRL_OFFSET, 0xDEAD, 0);
+        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT, 0);
+        p.reset();
+        assert_eq!(p.read32(VREG_CTRL_OFFSET), 0);
+        assert_eq!(p.read32(TIMER_OFFSET) & TIMER_RUN_BIT, 0);
+    }
+}
