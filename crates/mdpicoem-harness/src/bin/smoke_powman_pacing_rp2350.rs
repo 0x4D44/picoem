@@ -1,37 +1,29 @@
-// smoke_powman_pacing_rp2350 — Stage 5 pre-flight for POWMAN on RP2354.
+// smoke_powman_pacing_rp2350 — POWMAN pre-flight for RP2354 (V13 Stage 3).
 //
-// Purpose (HLD V11 §8): validate the XOSC/4 assumption baked into
-// `PowmanRegs::advance` by measuring the real sys_clks-per-POWMAN-tick
-// ratio on Arthur's RP2354 silicon. Emits raw (CYCCNT, COUNT) sample
-// pairs across ~5–10 COUNT transitions, prints the derived ratio, and
-// dumps `POWMAN_BASE + 0x00..0x24` for cross-verification with the
-// pico-sdk / datasheet.
+// Purpose (HLD V11 §8 / V13 Stage 3): validate the XOSC/4 assumption baked
+// into `PowmanRegs::advance` by measuring POWMAN's tick rate on Arthur's
+// RP2354 silicon. V11/V12 wrote this as a run-mode smoke
+// (`core.run()` + probe-rs `read_word_32` in a loop), which faulted on
+// RP2354 with "An ARM specific error occurred" — see V12 journal §3.
+// V13 reworks the smoke to stay halted throughout: POWMAN COUNT
+// advances from XOSC/4, independent of core run state, so halted reads
+// are sufficient to derive its frequency.
 //
-// Differentiator design: the emulator computes `sys_per_tick` from
+// Design differentiator: the emulator computes `sys_per_tick` from
 // `ClockTree::sys_clk_hz / (XOSC_FREQ_HZ / 4) = 150e6 / 3e6 = 50`. If
-// silicon reports a materially different ratio, the constant (and the
-// ISR_SCENARIOS MATCH budget that inherits it) needs re-scoping before
-// POWMAN ships. A compile-only "it built" result is not closure.
+// silicon reports a materially different POWMAN tick rate, the constant
+// (and the ISR_SCENARIOS MATCH budget that inherits it) needs re-scoping
+// before POWMAN ships. The smoke prints the derived rate in Hz — an
+// operator compares to the expected ~3 MHz for XOSC/4 @ 12 MHz.
 //
-// Stage 5 scaffolding — re-run if the clock tree changes; otherwise
-// leave in `src/bin/` as precedent (mirrors `test_rp2350_smoke_per_core_cyccnt`).
-//
-// Precedent: follows the probe-attach / core-halt / memory-read/write
-// pattern of `test_rp2350_smoke_per_core_cyccnt.rs` and the `--probe
-// VID:PID:SERIAL` option of `test_rp2350_probe_diff.rs` (disambiguates
-// when both the RP2354 and RP2040 probes are attached to one host).
+// Not for CI — requires a Pico debug probe attached to an RP2354 board.
+// Precedent: follows the `--probe VID:PID:SERIAL` pattern of
+// `probe_diff_rp2350.rs` and the halted-read pattern of the
+// silicon_periph_diff / silicon_isr_diff oracles.
 
 use probe_rs::probe::{list::Lister, DebugProbeSelector};
 use probe_rs::{MemoryInterface, Permissions, Session, SessionConfig};
-use std::time::Duration;
-
-// DWT cycle counter — sys_clk reference clock (1 sys_clk per CYCCNT tick
-// while the core is running at sys_clk).
-const DEMCR: u64 = 0xE000_EDFC;
-const DWT_CTRL: u64 = 0xE000_1000;
-const DWT_CYCCNT: u64 = 0xE000_1004;
-const TRCENA: u32 = 1 << 24;
-const CYCCNTENA: u32 = 1 << 0;
+use std::time::{Duration, Instant};
 
 // RESETS_RESET alias addresses. Base = 0x4002_0000; ALIAS_CLR = +0x3000.
 // `RESET_POWMAN = 17` per pico-sdk `resets.h`.
@@ -45,22 +37,21 @@ const POWMAN_READ_TIME_LOWER: u64 = POWMAN_BASE + 0x74;
 const POWMAN_TIMER: u64 = POWMAN_BASE + 0x88;
 // POWMAN password-protected writes require upper 16 bits = 0x5AFE on
 // every write; bare writes (no password) are silently dropped and
-// latch BADPASSWD.
+// latch BADPASSWD (V13 Stage 1 emulator semantics; silicon parity).
 const POWMAN_PASSWD: u32 = 0x5AFE_0000;
 const TIMER_RUN_BIT: u32 = 1 << 1;
 // Per pico-sdk powman.h: TIMER.USE_LPOSC = bit 8 (0x0100). Selecting a
 // clock source is mandatory for COUNT to advance — bare TIMER.RUN
-// without USE_LPOSC / USE_XOSC leaves the timer with no input clock
-// and the bus access to READ_TIME_* faults (V11 Stage 6 smoke
-// reproduced this with `An ARM specific error occurred`).
+// without USE_LPOSC / USE_XOSC leaves the timer with no input clock.
 const TIMER_USE_LPOSC_BIT: u32 = 1 << 8;
 
-// Pacing: sample loop budget. `READ_TIME_LOWER` ticks at ~3 MHz
-// (XOSC/4 = 12 MHz / 4). Each loop iteration costs one probe read
-// round-trip (~ms scale over SWD @ default clock), so a modest
-// iteration cap easily observes 5–10 COUNT transitions.
-const MAX_SAMPLES: usize = 2000;
+// Sampling budget. Each iteration does one halted `read_word_32` (few
+// hundred µs over SWD) plus a short host-side sleep; POWMAN ticks at
+// ~3 MHz, so even a sparse sampling cadence observes dozens of
+// transitions per second.
+const SAMPLE_ITERATIONS: usize = 200;
 const TARGET_TRANSITIONS: usize = 10;
+const INTER_SAMPLE_SLEEP: Duration = Duration::from_micros(500);
 const HALT_TIMEOUT: Duration = Duration::from_millis(500);
 
 // Default probe selector (CLAUDE.md — "hard-wired probe serial → DUT
@@ -113,7 +104,7 @@ fn parse_args() -> Result<Args, String> {
 fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let args = parse_args()?;
 
-    println!("POWMAN pre-flight — sys_clks/tick ratio measurement");
+    println!("POWMAN pre-flight — tick rate measurement (halted-read mode)");
     match args.probe.as_ref() {
         None => println!("Probe: auto_attach"),
         Some(sel) => println!("Probe: {sel}"),
@@ -131,102 +122,85 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut core = session.core(0)?;
     core.reset_and_halt(HALT_TIMEOUT)?;
 
-    // Enable DWT CYCCNT — our sys_clk reference. 1 CYCCNT tick = 1
-    // sys_clk while the core runs.
-    let demcr = core.read_word_32(DEMCR)?;
-    core.write_word_32(DEMCR, demcr | TRCENA)?;
-    let ctrl = core.read_word_32(DWT_CTRL)?;
-    core.write_word_32(DWT_CTRL, ctrl | CYCCNTENA)?;
-    core.write_word_32(DWT_CYCCNT, 0)?;
-
     // Release POWMAN from reset (RESETS_RESET_CLR = RESET_POWMAN bit).
-    // No password required on RESETS — this is the RESETS peripheral,
-    // not POWMAN itself.
+    // RESETS is not password-gated; plain write is fine.
     core.write_word_32(RESETS_RESET_CLR, RESET_POWMAN_BIT)?;
     println!("Released POWMAN from reset; starting timer.");
 
     // Start POWMAN timer: USE_LPOSC = 1 (bit 8) selects the LPOSC
-    // clock source — without it COUNT has no input clock and READ_TIME
-    // bus accesses fault. RUN = 1 (bit 1) starts counting. ALARM_ENAB
-    // left clear so we just free-run COUNT. Password required.
+    // clock source, RUN = 1 (bit 1) starts counting. Password
+    // required in bits [31:16]. ALARM_ENAB left clear so COUNT
+    // free-runs. Writing with the core halted is safe in probe-rs.
     core.write_word_32(
         POWMAN_TIMER,
         POWMAN_PASSWD | TIMER_USE_LPOSC_BIT | TIMER_RUN_BIT,
     )?;
 
-    // Release the core so CYCCNT ticks; we'll read both CYCCNT and
-    // POWMAN COUNT via SWD while the core is running. probe-rs handles
-    // the halt/resume under the hood on each memory access.
-    core.run()?;
-
-    // Reference sys_clk from DWT: measure by spinning a fixed
-    // wall-clock interval and seeing how much CYCCNT advanced. Uses
-    // the probe-read of CYCCNT as the reference since we don't have
-    // another timebase here; the ratio printed below is sys_clks per
-    // POWMAN tick regardless of absolute sys_clk_hz.
+    // -- Sampling --------------------------------------------------
     //
-    // Sample: poll (CYCCNT, COUNT) until we've seen TARGET_TRANSITIONS
-    // or hit MAX_SAMPLES. Print only the first pair per unique COUNT
-    // value — "first CYCCNT at which COUNT == n" — which is what the
-    // sys_per_tick derivation needs.
-    println!("Sample pairs (CYCCNT, COUNT):");
-
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    // POWMAN's COUNT advances on XOSC/4 regardless of core run state,
+    // so halted-reads suffice. Each iteration reads COUNT + captures a
+    // host `Instant`; we only record a pair when COUNT has changed so
+    // the reported span is tick-bounded. This avoids the V11/V12
+    // fault: run-mode probe reads on RP2354 throw "An ARM specific
+    // error occurred" on the first `read_word_32` after `core.run()`.
+    // Staying halted sidesteps the issue entirely.
+    println!("Sample pairs (µs since first sample, COUNT):");
+    let mut pairs: Vec<(Instant, u32)> = Vec::new();
     let mut last_count: Option<u32> = None;
-    for _ in 0..MAX_SAMPLES {
-        let cyccnt = core.read_word_32(DWT_CYCCNT)?;
+    for _ in 0..SAMPLE_ITERATIONS {
         let count = core.read_word_32(POWMAN_READ_TIME_LOWER)?;
+        let now = Instant::now();
         if Some(count) != last_count {
-            // First CYCCNT at which we saw this COUNT value.
-            pairs.push((cyccnt, count));
+            pairs.push((now, count));
             last_count = Some(count);
             if pairs.len() > TARGET_TRANSITIONS {
                 break;
             }
         }
+        std::thread::sleep(INTER_SAMPLE_SLEEP);
     }
 
     if pairs.len() < 2 {
         println!(
             "  (only {} unique COUNT value(s) observed in {} samples; \
-             probe round-trip may be slower than POWMAN tick — increase \
-             MAX_SAMPLES or slow sys_clk to recover)",
+             probe read cadence is slower than the POWMAN tick — \
+             unexpected at default clocks, investigate reset release)",
             pairs.len(),
-            MAX_SAMPLES
+            SAMPLE_ITERATIONS
         );
     } else {
-        let mut last_c: Option<u32> = None;
-        for (i, (cyccnt, count)) in pairs.iter().enumerate() {
-            match last_c {
-                None => println!("  {i}: cyccnt={cyccnt} count={count}"),
-                Some(prev) => {
-                    let d = cyccnt.wrapping_sub(prev);
-                    println!("  {i}: cyccnt={cyccnt} count={count}  →  ΔCYCCNT = {d}");
-                }
-            }
-            last_c = Some(*cyccnt);
+        let t0 = pairs[0].0;
+        for (i, (t, count)) in pairs.iter().enumerate() {
+            let dt_us = t.duration_since(t0).as_micros();
+            println!("  {i:3}: t=+{dt_us:7} µs  count={count}");
         }
 
-        // Derive sys_clks/tick from the first-to-last span rather than
-        // a single interval — single intervals are vulnerable to probe
-        // read-back noise. total_cyccnt_delta / total_tick_delta.
-        let (first_cyccnt, first_count) = pairs[0];
-        let (last_cyccnt, last_count) = *pairs.last().unwrap();
-        let d_cyc = last_cyccnt.wrapping_sub(first_cyccnt) as u64;
-        let d_count = last_count.wrapping_sub(first_count) as u64;
-        if d_count == 0 {
-            println!("Derived: insufficient tick spread to compute ratio.");
+        // Derive tick rate from first-to-last span. Single intervals
+        // are vulnerable to probe read-back noise; the wide span
+        // integrates over many ticks.
+        let (t_first, c_first) = pairs[0];
+        let (t_last, c_last) = *pairs.last().unwrap();
+        let dt_s = t_last.duration_since(t_first).as_secs_f64();
+        let dc = c_last.wrapping_sub(c_first) as f64;
+        if dt_s <= 0.0 || dc == 0.0 {
+            println!("Derived: insufficient span to compute rate.");
         } else {
-            let ratio = d_cyc / d_count;
+            let hz = dc / dt_s;
+            let ratio_vs_3mhz = hz / 3_000_000.0;
             println!(
-                "Derived: sys_clks per POWMAN tick ≈ {ratio} \
-                 (expected 50 if XOSC/4@3MHz & sys@150MHz)"
+                "Derived: POWMAN tick rate ≈ {hz:.0} Hz — \
+                 {ratio_vs_3mhz:.3}× the XOSC/4 @ 12 MHz expected \
+                 value (3 MHz). Note: sampling via SWD caps the \
+                 observable rate; an under-read here does not imply \
+                 POWMAN is actually slow, only that the probe \
+                 round-trip integrates multiple ticks."
             );
         }
     }
 
-    // Dump POWMAN_BASE + 0x00..0x24 for cross-verification. Writing
-    // through the POWMAN password filter is not needed for reads.
+    // Dump POWMAN_BASE + 0x00..0x24 for cross-verification with the
+    // pico-sdk / datasheet.
     println!("Register dump POWMAN_BASE + 0x00..0x24:");
     for off in (0x00u64..0x24).step_by(4) {
         let v = core.read_word_32(POWMAN_BASE + off)?;
