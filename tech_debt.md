@@ -1374,3 +1374,32 @@ but worth having before any live-mode threaded deployment.
 
 Related: `crates/mdrp2350/src/threaded/emulator.rs` `run_quanta` has
 no overall wall-clock ceiling either.
+
+## Stage 2 dual-model test gap: no cross-core IRQ routing test (2026-04-24)
+
+`crates/mdrp2350/tests/dual_model.rs` has 19 tests but none of them
+assert that Core 0 IRQ routes to its NVIC while Core 1's NVIC stays
+clean (or vice versa). Cross-core IRQ delivery is dual-core-specific
+scheduler behaviour; Threaded quantum boundaries could silently drift
+on this without oracle coverage. The existing
+`nvic_pre_run_enable_write_accepted` test only covers the enable-
+write accept path, not post-IRQ routing asymmetry.
+
+Pick up in Stage 3/4 or a follow-up `dual_model.rs` extension. Risk:
+low — unit-level NVIC tests cover per-core routing in isolation
+(`crates/mdrp2350/src/tests.rs` covers `assert_irq_*` → ISPR/NVIC_PEND
+for each core individually), but the Threaded scheduler could in
+principle introduce ordering violations (e.g. an IRQ asserted on
+core 0 becoming visible to core 1's `merge_irq_pending` first) that
+single-core oracles wouldn't detect. Landing a dual-model test for
+this fills the gap.
+
+Sketch: seed an IRQ-handler stub in SRAM for both cores, program
+NVIC_ISER to enable a vector on only core 0, assert the IRQ via
+`Bus::assert_irq_*` from the harness, run one quantum, and diff
+`core(0).ppb.nvic_ispr` vs `core(1).ppb.nvic_ispr` — the former
+must flip, the latter must stay zero — on both Serial and Threaded.
+The Serial-only assertions (PPB reads debug-assert `not_placeholder`)
+mean the observable has to be captured via a scoped pre/post
+`both_models_compare` pattern, or through the ThreadedEmulator's
+`shared()` state on the Threaded branch.

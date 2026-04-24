@@ -20,14 +20,19 @@
 //!                      host-cycles-per-emulated-cycle figure for the HLD §12
 //!                      performance budget check.
 //!   --workload <name>  One of: basic (default), peripheral, contention,
-//!                      stress, fpu-heavy, onerom. Core count is implied
-//!                      by the workload: basic / peripheral / fpu-heavy /
-//!                      onerom are single-core, contention / stress are
-//!                      dual-core. `onerom` configures PIO1 (1 SM) +
-//!                      PIO2 (2 SMs) — no PIO0 — to mirror Pier's
-//!                      OneROM block/SM enable mask; used to decide
-//!                      whether splitting our single PIO worker thread
-//!                      into per-block workers would help.
+//!                      stress, fpu-heavy, onerom-shape. Core count is
+//!                      implied by the workload: basic / peripheral /
+//!                      fpu-heavy / onerom-shape are single-core,
+//!                      contention / stress are dual-core. `onerom-shape`
+//!                      configures PIO1 (1 SM) + PIO2 (2 SMs) — no PIO0
+//!                      — to mirror Pier's OneROM block/SM enable mask;
+//!                      used to decide whether splitting our single PIO
+//!                      worker thread into per-block workers would help.
+//!                      NB: `onerom-shape` is a topology mirror, NOT the
+//!                      real OneROM CPU-mode serve pipeline — the real
+//!                      benchmark lives at `onerom_cpu_speed_grade_*`.
+//!                      The legacy `onerom` spelling is still accepted
+//!                      as a deprecated alias.
 //!   --threaded         Route execution through `ThreadedEmulator` (4
 //!                      pinned workers: core0, core1, PIO, coordinator)
 //!                      instead of the serial-interleave `Emulator::run`
@@ -71,6 +76,20 @@
 //!                      behaviour. `--runs 1` degenerates to
 //!                      warm-up-only with zero stats runs; falls
 //!                      back silently to single-run mode.
+//!   --model <name>     Dual-execution HLD V1 Stage 2 A/B harness.
+//!                      One of `serial|threaded|both`. `serial` is
+//!                      the default; `threaded` is equivalent to the
+//!                      legacy `--threaded` flag; `both` runs N reps
+//!                      on each model and prints a comparative
+//!                      Serial-vs-Threaded table with median MHz,
+//!                      IQR, delta% and per-workload verdict. `both`
+//!                      implies `--unpaced` per HLD V1 §7.3. Paired
+//!                      with `--reps`.
+//!   --reps N           Replication count for `--model both` (also
+//!                      for `--model serial|threaded` stats).
+//!                      Default 5 (HLD V1 §7.3 minimum). One warm-up
+//!                      rep per model is run and discarded; N
+//!                      measured reps follow.
 
 use mdrp2350::{Config, Emulator, EmulatorBuilder, Pacer, PacerStats};
 
@@ -124,7 +143,15 @@ enum Workload {
     /// stubbed and the harness `GlueDma` helper can't hook into
     /// threaded mode) — the point is to measure whether PIO or CPU
     /// is the critical-path worker under the OneROM block/SM shape.
-    Onerom,
+    ///
+    /// **Name note:** this variant is `OneromShape` (CLI token
+    /// `onerom-shape`), not bare `onerom`, to distinguish it from
+    /// the real OneROM CPU-mode benchmark at
+    /// `onerom_cpu_speed_grade_rp2350.rs`. Arthur's real-OneROM
+    /// Serial>Threaded observation anchors HLD §1; this shape mirror
+    /// is a different data point and the two are not expected to
+    /// agree on the Serial-vs-Threaded verdict.
+    OneromShape,
 }
 
 impl Workload {
@@ -135,7 +162,7 @@ impl Workload {
     fn needs_pio(self) -> bool {
         matches!(
             self,
-            Workload::Peripheral | Workload::Stress | Workload::Onerom
+            Workload::Peripheral | Workload::Stress | Workload::OneromShape
         )
     }
 
@@ -146,7 +173,7 @@ impl Workload {
             Workload::Contention => "contention",
             Workload::Stress => "stress",
             Workload::FpuHeavy => "fpu-heavy",
-            Workload::Onerom => "onerom",
+            Workload::OneromShape => "onerom-shape",
         }
     }
 }
@@ -516,7 +543,7 @@ fn setup(emu: &mut Emulator, workload: Workload) {
             setup_fpu_heavy_core0(emu);
             emu.core_mut(1).halt();
         }
-        Workload::Onerom => {
+        Workload::OneromShape => {
             // Core 0 runs the peripheral loop (STR to GPIO_OUT_XOR) — same
             // CPU-side shape as `Peripheral` so the CPU worker does real
             // MMIO work every quantum, mirroring OneROM's CPU doing bus
@@ -621,7 +648,10 @@ impl Runtime {
 }
 
 /// Parsed CLI state, shared across all runs in a `--runs N` session so
-/// each run is configured identically.
+/// each run is configured identically. All fields are `Copy`, so this
+/// derives `Copy`; the A/B harness uses struct-update (`..base`) on
+/// the value rather than a hand-rolled `clone_cfg`.
+#[derive(Clone, Copy)]
 struct RunConfig {
     seconds: u32,
     cycles_target: Option<u64>,
@@ -643,23 +673,45 @@ fn main() {
     let clock_mhz = parse_arg("--clock-mhz").unwrap_or(150);
     let sys_clk_hz = clock_mhz * 1_000_000;
     let core = parse_arg("--core").unwrap_or(2) as usize;
-    let unpaced = std::env::args().any(|a| a == "--unpaced");
-    let threaded = std::env::args().any(|a| a == "--threaded");
+    let unpaced_flag = std::env::args().any(|a| a == "--unpaced");
+    let threaded_flag = std::env::args().any(|a| a == "--threaded");
     let timing = std::env::args().any(|a| a == "--timing");
     let step_quantum = parse_arg("--step-quantum").unwrap_or(BENCH_DEFAULT_STEP_QUANTUM);
     let runs_arg = parse_arg("--runs");
+    let model = parse_model().unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let reps = parse_arg("--reps").unwrap_or(5);
     let workload = parse_workload().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
 
+    // `--model` reconciliation with legacy `--threaded`: when `--model`
+    // is explicitly set, it wins. Legacy `--threaded` still maps to
+    // `Model::Threaded`. `--model both` is the new A/B mode; it
+    // implies `--unpaced` per HLD V1 §7.3.
+    let unpaced = unpaced_flag || matches!(model, ModelSel::Both);
+    let threaded = match model {
+        ModelSel::Legacy => threaded_flag,
+        ModelSel::Serial => false,
+        ModelSel::Threaded => true,
+        ModelSel::Both => false, // per-rep override inside A/B loop
+    };
+
     #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
-    if threaded {
+    if threaded || matches!(model, ModelSel::Threaded | ModelSel::Both) {
         eprintln!(
-            "error: --threaded requires x86_64 Windows (ThreadedEmulator is \
-             #[cfg]-gated to that target — pin_to_host_core uses \
-             SetThreadAffinityMask)"
+            "error: --threaded / --model threaded|both requires x86_64 Windows \
+             (ThreadedEmulator is #[cfg]-gated to that target — pin_to_host_core \
+             uses SetThreadAffinityMask)"
         );
+        std::process::exit(1);
+    }
+
+    if reps == 0 {
+        eprintln!("error: --reps must be > 0");
         std::process::exit(1);
     }
 
@@ -733,6 +785,25 @@ fn main() {
         step_quantum,
         workload,
     };
+
+    // A/B harness: `--model both` runs `reps` measured reps per model
+    // (+ 1 warm-up per model, discarded) and prints a comparative
+    // table. HLD V1 §7.3: declare a winner only when the delta
+    // magnitude exceeds `max(3 × IQR/median_serial, 5%)`.
+    if matches!(model, ModelSel::Both) {
+        run_ab_harness(&cfg, reps);
+        return;
+    }
+
+    // Single-model reps: `--model serial|threaded` with `--reps` runs
+    // N measured reps (+ 1 discarded warm-up) on the selected model
+    // and prints a stats-only table (no delta / verdict). Preserves
+    // the A/B methodology's replication protocol for single-model
+    // regression capture.
+    if matches!(model, ModelSel::Serial | ModelSel::Threaded) {
+        run_single_model_reps(&cfg, reps);
+        return;
+    }
 
     // `--runs N`: repeat the bench N+1 times (1 warmup discarded + N
     // measured). Default (flag absent) is the historical single-run
@@ -1053,15 +1124,8 @@ fn print_runs_summary(_cfg: &RunConfig, throughputs: &[f64]) {
 
     let mut sorted = throughputs.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // Nearest-rank percentile: ceil(p/100 * n), clamped to [1, n],
-    // then subtract 1 for zero-based indexing. Simple and sufficient
-    // for the small-N regime the HLD's cv% check lives in.
-    let pct_idx = |p: f64| -> usize {
-        let r = (p / 100.0 * n as f64).ceil() as usize;
-        r.clamp(1, n) - 1
-    };
-    let p50 = sorted[pct_idx(50.0)];
-    let p99 = sorted[pct_idx(99.0)];
+    let p50 = sorted[pct_idx(n, 50)];
+    let p99 = sorted[pct_idx(n, 99)];
     let min = sorted[0];
     let max = sorted[n - 1];
 
@@ -1123,7 +1187,7 @@ fn parse_workload() -> Result<Workload, String> {
         if a == "--workload" {
             let v = args
                 .get(i + 1)
-                .ok_or("--workload requires basic|peripheral|contention|stress|fpu-heavy|onerom")?;
+                .ok_or("--workload requires basic|peripheral|contention|stress|fpu-heavy|onerom-shape")?;
             return match_workload(v);
         }
     }
@@ -1137,11 +1201,204 @@ fn match_workload(s: &str) -> Result<Workload, String> {
         "contention" => Ok(Workload::Contention),
         "stress" => Ok(Workload::Stress),
         "fpu-heavy" => Ok(Workload::FpuHeavy),
-        "onerom" => Ok(Workload::Onerom),
+        // `onerom-shape` is the canonical form; `onerom` is accepted
+        // as a deprecated alias so pre-2026-04-24 scripts still run,
+        // but emit a warning to stderr pointing at the new name.
+        "onerom-shape" => Ok(Workload::OneromShape),
+        "onerom" => {
+            eprintln!(
+                "warning: --workload onerom is deprecated; use onerom-shape. \
+                 This variant is a block/SM topology mirror of OneROM, NOT \
+                 the real OneROM CPU-mode serve pipeline."
+            );
+            Ok(Workload::OneromShape)
+        }
         other => Err(format!(
-            "invalid --workload '{other}' (expected basic|peripheral|contention|stress|fpu-heavy|onerom)"
+            "invalid --workload '{other}' (expected basic|peripheral|contention|stress|fpu-heavy|onerom-shape)"
         )),
     }
+}
+
+/// Execution-model selector parsed from `--model`. `Legacy` is the
+/// sentinel for "flag absent — defer to the legacy `--threaded`
+/// flag". When explicitly set, Serial / Threaded / Both override any
+/// `--threaded` presence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSel {
+    Legacy,
+    Serial,
+    Threaded,
+    Both,
+}
+
+fn parse_model() -> Result<ModelSel, String> {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix("--model=") {
+            return match_model(v);
+        }
+        if a == "--model" {
+            let v = args
+                .get(i + 1)
+                .ok_or("--model requires serial|threaded|both")?;
+            return match_model(v);
+        }
+    }
+    Ok(ModelSel::Legacy)
+}
+
+fn match_model(s: &str) -> Result<ModelSel, String> {
+    match s {
+        "serial" => Ok(ModelSel::Serial),
+        "threaded" => Ok(ModelSel::Threaded),
+        "both" => Ok(ModelSel::Both),
+        other => Err(format!(
+            "invalid --model '{other}' (expected serial|threaded|both)"
+        )),
+    }
+}
+
+/// A/B harness: run `reps` measured reps on Serial, then on Threaded,
+/// and print a comparative table with median MHz / IQR / delta% /
+/// verdict (HLD V1 §7.3). One warm-up rep per model is run and
+/// discarded. Winner declared only when `|delta| > max(3 * IQR /
+/// median_serial, 5%)` — anything inside the noise floor is "TIED".
+fn run_ab_harness(base_cfg: &RunConfig, reps: u32) {
+    println!(
+        "[A/B bench] reps={} (+1 warmup/model discarded) --unpaced --workload {} --step-quantum {}",
+        reps,
+        base_cfg.workload.as_str(),
+        base_cfg.step_quantum,
+    );
+
+    let serial_cfg = RunConfig { threaded: false, ..*base_cfg };
+    let threaded_cfg = RunConfig { threaded: true, ..*base_cfg };
+
+    println!("\n=== Serial reps ===");
+    let serial_mhz = collect_reps(&serial_cfg, reps);
+    println!("\n=== Threaded reps ===");
+    let threaded_mhz = collect_reps(&threaded_cfg, reps);
+
+    let s_stats = Stats::from(&serial_mhz);
+    let t_stats = Stats::from(&threaded_mhz);
+    let delta_pct = if s_stats.median > 0.0 {
+        100.0 * (t_stats.median - s_stats.median) / s_stats.median
+    } else {
+        0.0
+    };
+    // Noise floor per HLD V1 §7.3: max(3 × IQR/median_serial, 5%).
+    let iqr_ratio = if s_stats.median > 0.0 {
+        100.0 * (s_stats.p75 - s_stats.p25) / s_stats.median
+    } else {
+        0.0
+    };
+    let noise_floor = (3.0 * iqr_ratio).max(5.0);
+    let verdict = if delta_pct.abs() <= noise_floor {
+        "TIED (within noise)".to_string()
+    } else if delta_pct > 0.0 {
+        format!("WINNER: Threaded (+{:.1}%)", delta_pct)
+    } else {
+        format!("WINNER: Serial ({:.1}%)", delta_pct)
+    };
+
+    println!("\n=== A/B summary — workload: {} ===", base_cfg.workload.as_str());
+    println!(
+        "{:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "model", "median", "p25", "p75", "min", "max"
+    );
+    print_stats_row("serial", &s_stats);
+    print_stats_row("threaded", &t_stats);
+    println!(
+        "\ndelta: {:+.1}% (noise floor: ±{:.1}%)",
+        delta_pct, noise_floor
+    );
+    println!("verdict: {}", verdict);
+}
+
+/// Single-model replication harness: `--model serial|threaded` plus
+/// `--reps N` runs N measured reps (+ 1 discarded warm-up) and prints
+/// a stats-only table with no delta / verdict (single-model mode has
+/// no opposite to compare against).
+fn run_single_model_reps(cfg: &RunConfig, reps: u32) {
+    let label = if cfg.threaded { "threaded" } else { "serial" };
+    println!(
+        "[single-model bench] reps={} (+1 warmup discarded) --model {} --workload {} --step-quantum {}",
+        reps,
+        label,
+        cfg.workload.as_str(),
+        cfg.step_quantum,
+    );
+    let samples = collect_reps(cfg, reps);
+    let s = Stats::from(&samples);
+    println!("\n=== stats — workload: {} (model: {}) ===", cfg.workload.as_str(), label);
+    println!(
+        "{:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "model", "median", "p25", "p75", "min", "max"
+    );
+    print_stats_row(label, &s);
+}
+
+/// Run `reps` measured reps (+ 1 discarded warm-up) under `cfg` and
+/// return the measured MHz values.
+fn collect_reps(cfg: &RunConfig, reps: u32) -> Vec<f64> {
+    let mut out = Vec::with_capacity(reps as usize);
+    for i in 0..=reps {
+        let tag = if i == 0 { "warmup" } else { "rep" };
+        println!("\n--- {} {}/{} ---", tag, i, reps);
+        let mhz = run_once(cfg);
+        if i == 0 {
+            println!("(warmup: {:.1} MHz, discarded)", mhz);
+        } else {
+            out.push(mhz);
+        }
+    }
+    out
+}
+
+/// Nearest-rank percentile index for a sorted population of size
+/// `n`: `ceil(pct/100 * n)` clamped to `[1, n]` then converted to a
+/// zero-based index. Shared by `Stats::from` and
+/// `print_runs_summary` so the two can't drift. `pct` is an integer
+/// 0–100; callers pass literals like 25, 50, 75, 99.
+fn pct_idx(n: usize, pct: u8) -> usize {
+    debug_assert!(n > 0, "pct_idx: n must be > 0");
+    debug_assert!(pct <= 100, "pct_idx: pct must be in 0..=100");
+    let r = ((pct as f64) / 100.0 * n as f64).ceil() as usize;
+    r.clamp(1, n) - 1
+}
+
+/// Summary stats for a `Vec<f64>`: median, 25th/75th percentile, min,
+/// max. Nearest-rank percentiles — simple and sufficient for N≥5.
+struct Stats {
+    median: f64,
+    p25: f64,
+    p75: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Stats {
+    fn from(samples: &[f64]) -> Self {
+        assert!(!samples.is_empty(), "Stats::from: empty samples");
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let pct = |p: u8| -> f64 { sorted[pct_idx(n, p)] };
+        Self {
+            median: pct(50),
+            p25: pct(25),
+            p75: pct(75),
+            min: sorted[0],
+            max: sorted[n - 1],
+        }
+    }
+}
+
+fn print_stats_row(label: &str, s: &Stats) {
+    println!(
+        "{:>9} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
+        label, s.median, s.p25, s.p75, s.min, s.max
+    );
 }
 
 /// Print the per-worker per-quantum timing table populated by

@@ -61,3 +61,12 @@ winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }
 [[test]]
 name = "execution_model"
 required-features = ["testing"]
+
+# Dual-execution HLD V1 Stage 2: curated dual-model smoke tests that
+# run identical scenarios on Serial and Threaded and assert end-state
+# equality where observable (HLD V1 §7.1 / §7.2). Requires the
+# `threading` feature so `ExecutionModel::Threaded` is selectable at
+# build time.
+[[test]]
+name = "dual_model"
+required-features = ["threading"]
