@@ -24,6 +24,13 @@ pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
+// Dual-execution HLD V1 (Stage 3b.2) — threaded runtime scaffolding.
+// The module file internally `#![cfg]`-gates to x86_64 Windows + the
+// `threading` cargo feature, so non-Windows and `--no-default-features`
+// builds compile an empty module and the serial path is unaffected.
+#[cfg(feature = "threading")]
+pub mod threaded;
+
 // -----------------------------------------------------------------------
 // Dual-execution HLD V1 (Stage 3b.1) — public types.
 //
