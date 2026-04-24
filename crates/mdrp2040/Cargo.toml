@@ -1,15 +1,25 @@
 [package]
 name = "mdrp2040"
-version = "0.15.3"
+version = "0.16.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [features]
+default = ["threading"]
 # Forward the PIO `test-hooks` feature to `mdpicoem-common`. Enables
 # cross-crate unit tests to pop TX FIFO words via `PioBlock::pop_tx`
 # and push RX FIFO words via `PioBlock::push_rx`.
 test-hooks = ["mdpicoem-common/test-hooks"]
+# Dual-execution HLD V1 (Stage 3b.1): feature-gates the threaded
+# runtime arriving in Stage 3b.2. Default on; disable for Serial-only
+# builds on non-x86_64 targets. Stage 3b.1 ships the types only — the
+# feature is a no-op until Stage 3b.2 lands the `threaded/` module.
+threading = []
+# Dual-execution HLD V1 (Stage 3b.1): opt-in surface for test-only
+# panic-injection APIs arriving with Stage 3b.4. Mirrors the RP2350
+# `testing` feature; NOT in `default` on purpose.
+testing = []
 
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
@@ -18,3 +28,15 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
+
+# Dual-execution HLD V1 (Stage 3b.1): integration-test file registrations
+# land now so later sub-stages can add tests without editing Cargo.toml.
+# The files don't exist yet — Cargo only complains when the test is
+# actually requested (`cargo test --test execution_model`).
+[[test]]
+name = "execution_model"
+required-features = ["threading", "testing"]
+
+[[test]]
+name = "dual_model"
+required-features = ["threading"]

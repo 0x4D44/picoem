@@ -19,8 +19,7 @@
 
 use tracing::debug;
 
-use crate::bus::Bus;
-use super::{CortexM0Plus, Fault};
+use super::{CoreBus, CortexM0Plus, Fault};
 
 impl CortexM0Plus {
     /// Returns `true` if `val` matches the ARMv6-M EXC_RETURN magic
@@ -52,7 +51,7 @@ impl CortexM0Plus {
     /// apply the 8-byte-alignment pad per ARMv6-M ARM §B1.5.6.
     ///
     /// Cycle cost: ~16 (M0+ TRM).
-    pub(crate) fn enter_exception(&mut self, exc_num: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn enter_exception<B: CoreBus>(&mut self, exc_num: u16, bus: &mut B) -> u32 {
         // Publish a sentinel "hardware-triggered exception stacking" PC so
         // the MMIO trace distinguishes the 8 stacking writes from the
         // faulting instruction's own access pattern. Value `0xFFFF_FFFE`
@@ -117,7 +116,8 @@ impl CortexM0Plus {
         };
 
         // Vector fetch.
-        let vtor = bus.ppb[bus.active_core()].vtor;
+        let active_core = bus.active_core();
+        let vtor = bus.ppb(active_core).vtor;
         let vector = bus.read32(vtor.wrapping_add((exc_num as u32) * 4));
 
         // Architecturally, vector entries must have the T bit set.
@@ -147,11 +147,12 @@ impl CortexM0Plus {
         self.regs.control &= !0x2; // handler always uses MSP
         self.regs.sync_sp_from_banked();
 
-        bus.ppb[bus.active_core()].mark_active(exc_num);
+        let priority_label = bus.ppb(active_core).exception_priority(exc_num);
+        bus.ppb_mut(active_core).mark_active(exc_num);
 
         debug!(
             exception_num = exc_num,
-            priority = %bus.ppb[bus.active_core()].exception_priority(exc_num),
+            priority = %priority_label,
             pc = format_args!("{:#010x}", vector & !1),
             lr = format_args!("{:#010x}", self.regs.lr()),
             "exception entry"
@@ -169,7 +170,7 @@ impl CortexM0Plus {
     /// Called when a branch-to-PC instruction (BX, POP {PC}, LDM-to-PC)
     /// writes a value with the EXC_RETURN pattern. Validates the magic
     /// and selects the target stack.
-    pub(crate) fn exit_exception(&mut self, exc_return: u32, bus: &mut Bus) -> u32 {
+    pub(crate) fn exit_exception<B: CoreBus>(&mut self, exc_return: u32, bus: &mut B) -> u32 {
         // Publish a sentinel "exception-return unstacking" PC so the
         // MMIO trace distinguishes the 8 unstacking reads from ordinary
         // instruction-driven access. Value `0xFFFF_FFFD` is paired with
@@ -205,7 +206,8 @@ impl CortexM0Plus {
         // Integrity: returning to Handler mode requires another active
         // exception (otherwise IPSR would become 0 but we're still in
         // Handler mode per EXC_RETURN[3:0] = 0x1). ARMv6-M ARM §B1.5.8.
-        if return_to_handler && !bus.ppb[bus.active_core()].any_active() {
+        let active_core = bus.active_core();
+        if return_to_handler && !bus.ppb(active_core).any_active() {
             self.pending_fault = Some(Fault::InvalidExcReturn);
             return 0;
         }
@@ -248,7 +250,7 @@ impl CortexM0Plus {
         self.regs.sync_sp_from_banked();
 
         // Drop the outgoing exception from the active set.
-        bus.ppb[bus.active_core()].clear_active(active_exc as u16);
+        bus.ppb_mut(active_core).clear_active(active_exc as u16);
 
         debug!(
             exc_return = format_args!("{:#010x}", exc_return),
@@ -265,7 +267,7 @@ impl CortexM0Plus {
 
     /// Deliver a pending synchronous fault by entering the appropriate
     /// exception handler. Returns cycle cost (entry ≈ 16).
-    pub(crate) fn deliver_fault(&mut self, fault: Fault, bus: &mut Bus) -> u32 {
+    pub(crate) fn deliver_fault<B: CoreBus>(&mut self, fault: Fault, bus: &mut B) -> u32 {
         match fault {
             // SVCall lands in its own vector — but only if it can actually
             // preempt. Per ARMv6-M ARM §B1.5.8, if PRIMASK blocks SVCall

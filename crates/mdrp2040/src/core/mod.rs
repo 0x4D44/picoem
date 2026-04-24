@@ -18,10 +18,12 @@ mod execute;
 mod execute_wide;
 pub(crate) mod exceptions;
 pub mod nvic;
+pub mod bus_trait;
 
 use tracing::info;
 
 use crate::bus::Bus;
+pub use bus_trait::CoreBus;
 pub use nvic::Nvic;
 pub use registers::Registers;
 
@@ -217,7 +219,7 @@ impl CortexM0Plus {
     ///
     /// Returns the cycle count consumed (instruction + any exception
     /// entry on fault delivery).
-    pub fn step(&mut self, bus: &mut Bus) -> u32 {
+    pub fn step<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         if self.halted {
             return 0;
         }
@@ -275,7 +277,7 @@ impl CortexM0Plus {
     ///
     /// Returns the cycle count of exception entry (non-zero on dispatch,
     /// `0` otherwise).
-    fn maybe_dispatch_external_irq(&mut self, bus: &mut Bus) -> u32 {
+    fn maybe_dispatch_external_irq<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         // PRIMASK blocks everything below NMI/HardFault priority. Per
         // ARMv6-M M0+, configurable priorities are 0x00..0xC0; PRIMASK=1
         // effectively sets the "current execution priority floor" to 0,
@@ -294,7 +296,7 @@ impl CortexM0Plus {
         }
 
         let core_idx = self.core_id as usize;
-        let candidates = bus.nvics[core_idx].pending_and_enabled();
+        let candidates = bus.nvic(core_idx).pending_and_enabled();
         if candidates == 0 {
             return 0;
         }
@@ -304,14 +306,17 @@ impl CortexM0Plus {
         // 0..26 but the NVIC itself is 32 lines wide).
         let mut best_irq: Option<u8> = None;
         let mut best_prio: u8 = 0xFF;
-        for irq in 0u8..32 {
-            if candidates & (1u32 << irq) == 0 {
-                continue;
-            }
-            let p = bus.nvics[core_idx].priority[irq as usize];
-            if best_irq.is_none() || p < best_prio {
-                best_irq = Some(irq);
-                best_prio = p;
+        {
+            let nvic = bus.nvic(core_idx);
+            for irq in 0u8..32 {
+                if candidates & (1u32 << irq) == 0 {
+                    continue;
+                }
+                let p = nvic.priority[irq as usize];
+                if best_irq.is_none() || p < best_prio {
+                    best_irq = Some(irq);
+                    best_prio = p;
+                }
             }
         }
         let Some(irq) = best_irq else { return 0 };
@@ -320,7 +325,7 @@ impl CortexM0Plus {
         // 16 + irq. The NVIC pending bit stays clear until the source
         // re-asserts (level peripheral) or firmware writes NVIC_ISPR
         // (software-set).
-        bus.nvics[core_idx].clear_pending(irq);
+        bus.nvic_mut(core_idx).clear_pending(irq);
         self.enter_exception(16u16 + irq as u16, bus)
     }
 

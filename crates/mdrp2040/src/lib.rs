@@ -24,6 +24,132 @@ pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
+// -----------------------------------------------------------------------
+// Dual-execution HLD V1 (Stage 3b.1) — public types.
+//
+// Introduces the `ExecutionModel` selector, `ConfigError`, `WorkerName`,
+// and `EmulatorError` to mirror the RP2350 crate. Stage 3b.1 ships the
+// types + the `CoreBus` trait port so later sub-stages (3b.2: threaded/
+// module, 3b.4: builder wiring) can land against a stable surface. The
+// Emulator dispatch path stays Serial-only in 3b.1.
+// -----------------------------------------------------------------------
+
+/// Execution model for an [`Emulator`]. Selected at construction via
+/// [`EmulatorBuilder::execution`]; cannot be switched post-build.
+///
+/// - `Serial` — oracle-validated reference path (QEMU + silicon
+///   differentials). Single-threaded, per-instruction interleave.
+///   Always available.
+/// - `Threaded` — multi-thread runtime; opt-in throughput optimization
+///   on x86_64 Windows hosts with the `threading` cargo feature on.
+///   Not validated against QEMU/silicon oracles. Not yet wired into
+///   [`Emulator::step`] — arrives with Stage 3b.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionModel {
+    Serial,
+    Threaded,
+}
+
+impl Default for ExecutionModel {
+    fn default() -> Self {
+        ExecutionModel::Serial
+    }
+}
+
+/// Errors returned by [`EmulatorBuilder::build`] once the Stage 3b.4
+/// wiring lands. The only non-trivial variant today is
+/// `ThreadingUnavailable`, returned when the caller selects
+/// [`ExecutionModel::Threaded`] but the host platform or build
+/// configuration cannot satisfy it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `ExecutionModel::Threaded` selected but the current build does
+    /// not include a threaded runtime — either the `threading` cargo
+    /// feature is off, or the host is not one of the supported
+    /// platforms (currently x86_64 Windows only).
+    ThreadingUnavailable,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::ThreadingUnavailable => write!(
+                f,
+                "ExecutionModel::Threaded is unavailable (requires x86_64 Windows \
+                 with the `threading` cargo feature enabled)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Identifier for a worker thread in the threaded runtime. RP2040
+/// uses a three-worker layout (core0, core1, coordinator) — smaller
+/// than RP2350's six-worker layout because M0+ has no PIO-as-worker
+/// split in the Stage 3b plan. mdrp2350's `Pio0`/`Pio1`/`Pio2` worker
+/// variants are intentionally omitted here; if PIO becomes a
+/// bottleneck the enum can gain those variants in a follow-up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerName {
+    Core0,
+    Core1,
+    Coord,
+}
+
+impl WorkerName {
+    /// Short label for summary tables / error messages. Kept stable so
+    /// harness tooling can scrape diagnostic output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkerName::Core0 => "core0",
+            WorkerName::Core1 => "core1",
+            WorkerName::Coord => "coord",
+        }
+    }
+}
+
+/// Errors returned by post-construction [`Emulator`] methods once the
+/// Stage 3b.4 wiring lands. Surfaces runtime-model mismatches and
+/// worker panics (dual-execution HLD V1 §5.5).
+///
+/// `WorkerPanicked` is sticky: once an [`Emulator`] observes a worker
+/// panic, every subsequent call on that instance returns the same
+/// error without re-attempting the workers (one-shot-after-panic, HLD
+/// §5.5 item 5). Drop the instance and rebuild from a fresh
+/// [`EmulatorBuilder`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EmulatorError {
+    /// Called a Serial-only method on a Threaded emulator, e.g.
+    /// `step()` — Threaded runs in quanta, not single-step. HLD §5.4.
+    NotSupportedInThreadedMode,
+    /// One of the worker threads panicked. The `Emulator` is sticky-
+    /// poisoned after this; drop and rebuild. Only produced on the
+    /// Threaded path.
+    WorkerPanicked {
+        which: WorkerName,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for EmulatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmulatorError::NotSupportedInThreadedMode => write!(
+                f,
+                "operation not supported on a Threaded Emulator (Serial-only)"
+            ),
+            EmulatorError::WorkerPanicked { which, message } => write!(
+                f,
+                "worker {} panicked: {message}",
+                which.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EmulatorError {}
+
 #[cfg(test)]
 mod tests;
 

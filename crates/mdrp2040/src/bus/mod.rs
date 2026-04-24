@@ -1750,6 +1750,87 @@ impl Default for Bus {
     }
 }
 
+// ===================================================================
+// `CoreBus` implementation — dual-execution HLD V1 Stage 3b.1.
+//
+// Every method forwards directly to an inherent `Bus` method or field.
+// Monomorphization against this impl reproduces the pre-refactor
+// codegen on the Serial hot path. Stage 3b.2 will add a
+// `impl CoreBus for WorkerBus` in the `threaded/` module once that
+// module lands.
+// ===================================================================
+
+use crate::core::CoreBus;
+
+impl CoreBus for Bus {
+    #[inline(always)]
+    fn read8(&mut self, addr: u32) -> u8 {
+        Bus::read8(self, addr)
+    }
+    #[inline(always)]
+    fn read16(&mut self, addr: u32) -> u16 {
+        Bus::read16(self, addr)
+    }
+    #[inline(always)]
+    fn read32(&mut self, addr: u32) -> u32 {
+        Bus::read32(self, addr)
+    }
+
+    #[inline(always)]
+    fn write8(&mut self, addr: u32, val: u8) {
+        Bus::write8(self, addr, val)
+    }
+    #[inline(always)]
+    fn write16(&mut self, addr: u32, val: u16) {
+        Bus::write16(self, addr, val)
+    }
+    #[inline(always)]
+    fn write32(&mut self, addr: u32, val: u32) {
+        Bus::write32(self, addr, val)
+    }
+
+    #[inline(always)]
+    fn set_active_pc(&mut self, pc: u32) {
+        Bus::set_active_pc(self, pc)
+    }
+
+    #[inline(always)]
+    fn bus_fault(&self) -> bool {
+        Bus::bus_fault(self)
+    }
+    #[inline(always)]
+    fn bus_fault_addr(&self) -> u32 {
+        Bus::bus_fault_addr(self)
+    }
+    #[inline(always)]
+    fn clear_bus_fault(&mut self) {
+        Bus::clear_bus_fault(self)
+    }
+
+    #[inline(always)]
+    fn ppb(&self, core: usize) -> &ppb::Ppb {
+        &self.ppb[core]
+    }
+    #[inline(always)]
+    fn ppb_mut(&mut self, core: usize) -> &mut ppb::Ppb {
+        &mut self.ppb[core]
+    }
+
+    #[inline(always)]
+    fn nvic(&self, core: usize) -> &Nvic {
+        &self.nvics[core]
+    }
+    #[inline(always)]
+    fn nvic_mut(&mut self, core: usize) -> &mut Nvic {
+        &mut self.nvics[core]
+    }
+
+    #[inline(always)]
+    fn active_core(&self) -> usize {
+        Bus::active_core(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

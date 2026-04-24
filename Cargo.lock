@@ -1480,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2040"
-version = "0.15.3"
+version = "0.16.0"
 dependencies = [
  "mdpicoem-common",
  "mdpicoem-devices",

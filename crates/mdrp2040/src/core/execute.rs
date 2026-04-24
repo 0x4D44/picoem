@@ -11,8 +11,7 @@
 //! does not yet have a bus-timing model — the Phase 5 RP2040 bus will
 //! recalibrate against real-silicon measurements when it lands.
 
-use super::{CortexM0Plus, Fault};
-use crate::bus::Bus;
+use super::{CoreBus, CortexM0Plus, Fault};
 
 // ============================================================================
 // Helpers
@@ -365,7 +364,7 @@ impl CortexM0Plus {
     ///
     /// ADD and MOV do NOT update flags (unlike low-register variants).
     /// CMP updates flags. BX/BLX transfer control via register.
-    pub(crate) fn thumb16_special_data_bx(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_special_data_bx<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let op = (opcode >> 8) & 0x3;
         match op {
             0b00 => {
@@ -458,7 +457,7 @@ impl CortexM0Plus {
     // ========================================================================
 
     /// LDR Rt, [PC, #imm8*4] (`01001_Rt_imm8`).
-    pub(crate) fn thumb16_ldr_literal(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_ldr_literal<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let base = self.read_pc() & !3;
@@ -477,7 +476,7 @@ impl CortexM0Plus {
 
     /// STR/STRH/STRB/LDRSB/LDR/LDRH/LDRB/LDRSH with register offset.
     /// Encoding: `0101_opc_Rm_Rn_Rt`.
-    pub(crate) fn thumb16_load_store_reg(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_load_store_reg<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let rm = ((opcode >> 6) & 0x7) as usize;
@@ -548,7 +547,7 @@ impl CortexM0Plus {
     // ========================================================================
 
     /// STR Rt, [Rn, #imm5*4] (`01100_imm5_Rn_Rt`).
-    pub(crate) fn thumb16_str_imm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_str_imm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -562,7 +561,7 @@ impl CortexM0Plus {
     }
 
     /// LDR Rt, [Rn, #imm5*4] (`01101_imm5_Rn_Rt`).
-    pub(crate) fn thumb16_ldr_imm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_ldr_imm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -576,7 +575,7 @@ impl CortexM0Plus {
     }
 
     /// STRB Rt, [Rn, #imm5] (`01110_imm5_Rn_Rt`).
-    pub(crate) fn thumb16_strb_imm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_strb_imm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -586,7 +585,7 @@ impl CortexM0Plus {
     }
 
     /// LDRB Rt, [Rn, #imm5] (`01111_imm5_Rn_Rt`).
-    pub(crate) fn thumb16_ldrb_imm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_ldrb_imm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -596,7 +595,7 @@ impl CortexM0Plus {
     }
 
     /// STRH Rt, [Rn, #imm5*2] (`10000_imm5_Rn_Rt`).
-    pub(crate) fn thumb16_strh_imm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_strh_imm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -610,7 +609,7 @@ impl CortexM0Plus {
     }
 
     /// LDRH Rt, [Rn, #imm5*2] (`10001_imm5_Rn_Rt`).
-    pub(crate) fn thumb16_ldrh_imm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_ldrh_imm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -628,7 +627,7 @@ impl CortexM0Plus {
     // ========================================================================
 
     /// STR Rt, [SP, #imm8*4] (`10010_Rt_imm8`).
-    pub(crate) fn thumb16_str_sp(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_str_sp<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
@@ -641,7 +640,7 @@ impl CortexM0Plus {
     }
 
     /// LDR Rt, [SP, #imm8*4] (`10011_Rt_imm8`).
-    pub(crate) fn thumb16_ldr_sp(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_ldr_sp<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
@@ -690,7 +689,7 @@ impl CortexM0Plus {
     ///
     /// Encodings that decode to CBZ/CBNZ on M33 are undefined on M0+
     /// and are routed through [`Self::thumb16_undefined`].
-    pub(crate) fn thumb16_misc(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_misc<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let op = (opcode >> 8) & 0xF;
         match op {
             0b0000 => {
@@ -855,7 +854,7 @@ impl CortexM0Plus {
     // ========================================================================
 
     /// STM Rn!, {reglist} (`11000_Rn_reglist`).
-    pub(crate) fn thumb16_stm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_stm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rn = ((opcode >> 8) & 0x7) as usize;
         let reglist = (opcode & 0xFF) as u32;
         let count = reglist.count_ones();
@@ -877,7 +876,7 @@ impl CortexM0Plus {
 
     /// LDM Rn!, {reglist} (`11001_Rn_reglist`).
     /// Writeback only when Rn is NOT in the register list.
-    pub(crate) fn thumb16_ldm(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn thumb16_ldm<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         let rn = ((opcode >> 8) & 0x7) as usize;
         let reglist = (opcode & 0xFF) as u32;
         let count = reglist.count_ones();

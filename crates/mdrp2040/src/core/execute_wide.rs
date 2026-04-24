@@ -15,13 +15,12 @@
 //! pattern-recognition but drops everything outside the M0+ subset (no
 //! wide data-processing, no LDRD, no coprocessor, no IT-block awareness).
 
-use super::{CortexM0Plus, Fault};
-use crate::bus::Bus;
+use super::{CoreBus, CortexM0Plus, Fault};
 
 impl CortexM0Plus {
     /// Top-level Thumb-32 dispatch. `hw0` is the first halfword (with
     /// the `0b11110` prefix already validated by the decoder).
-    pub(crate) fn execute_thumb32(&mut self, hw0: u16, hw1: u16, _bus: &mut Bus) -> u32 {
+    pub(crate) fn execute_thumb32<B: CoreBus>(&mut self, hw0: u16, hw1: u16, _bus: &mut B) -> u32 {
         // Bits [15:11] are `0b11110`. The op[2] bit is hw1[15]; op[1:0]
         // from hw1[13:12]. On ARMv6-M only the BL / misc-control
         // encodings are defined (ARM DDI 0419 §A6.3).

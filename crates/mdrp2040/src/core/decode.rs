@@ -13,8 +13,7 @@
 //!   other two M33 wide prefixes (`0b11101`, `0b11111`) decode as
 //!   undefined on M0+.
 
-use super::CortexM0Plus;
-use crate::bus::Bus;
+use super::{CortexM0Plus, CoreBus};
 
 /// Returns true iff the first halfword is the Thumb-32 prefix defined
 /// for ARMv6-M (`0b11110xxx xxxxxxxx`). M0+ supports exactly one wide
@@ -30,7 +29,7 @@ impl CortexM0Plus {
     /// Phase 4.B: the Thumb-32 path routes BL / MRS / MSR / DSB / DMB /
     /// ISB through [`Self::execute_thumb32`]; any other wide encoding
     /// raises HardFault via [`super::Fault::Undefined`].
-    pub(crate) fn decode_execute(&mut self, bus: &mut Bus) -> u32 {
+    pub(crate) fn decode_execute<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
         // Publish the instruction PC on the bus so the MMIO trace
@@ -52,7 +51,7 @@ impl CortexM0Plus {
 
     /// Top-level Thumb-16 dispatch. Routes to instruction-group handlers
     /// in execute.rs based on bits [15:11].
-    pub(crate) fn execute_thumb16(&mut self, opcode: u16, bus: &mut Bus) -> u32 {
+    pub(crate) fn execute_thumb16<B: CoreBus>(&mut self, opcode: u16, bus: &mut B) -> u32 {
         match opcode >> 11 {
             // Shift (immediate)
             0b00000 => self.thumb16_lsl_imm(opcode),
