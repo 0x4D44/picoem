@@ -22,10 +22,42 @@
 //!                      Core count is implied by the workload: basic and
 //!                      peripheral are single-core, contention and stress are
 //!                      dual-core.
+//!   --step-quantum N   Cycles per emulator step (default 256 — see
+//!                      `BENCH_DEFAULT_STEP_QUANTUM`). In threaded mode
+//!                      this is the cycles-per-barrier-rendezvous, so
+//!                      larger values amortise the 3-thread barrier
+//!                      cost. Serial runs honour this too for A/B
+//!                      comparability (serial path is insensitive to
+//!                      quantum size in this range).
+//!   --model <name>     Dual-execution HLD V1 Stage 4 A/B harness.
+//!                      One of `serial|threaded|both`. `serial` is the
+//!                      default; `threaded` selects
+//!                      `ExecutionModel::Threaded`; `both` runs N reps
+//!                      on each model and prints a comparative
+//!                      Serial-vs-Threaded table with median MHz, IQR,
+//!                      delta% and per-workload verdict. `both` implies
+//!                      `--unpaced` per HLD V1 §7.3. Paired with
+//!                      `--reps`.
+//!   --reps N           Replication count for `--model both` (also for
+//!                      `--model serial|threaded` stats). Default 5
+//!                      (HLD V1 §7.3 minimum). One warm-up rep per
+//!                      model is run and discarded; N measured reps
+//!                      follow.
 
-use mdrp2040::{Config, Emulator, Pacer, PacerStats};
+use mdrp2040::{
+    Config, ConfigError, Emulator, EmulatorBuilder, EmulatorError, ExecutionModel, Pacer,
+    PacerStats,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Bench CLI default for `--step-quantum`. Diverges from the library
+/// `DEFAULT_STEP_QUANTUM = 64` because larger values amortise the
+/// threaded-barrier cost over more useful work. Matches the RP2350
+/// bench default for A/B comparability across chips. Serial runs
+/// honour this too for within-chip Serial-vs-Threaded A/B diffing;
+/// the serial path is insensitive to quantum size in this range.
+const BENCH_DEFAULT_STEP_QUANTUM: u32 = 256;
 
 // ---------------------------------------------------------------------------
 // Workload selection
@@ -343,6 +375,24 @@ mod win {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parsed CLI state — shared across the A/B and single-model reps paths
+// so each rep is configured identically.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct RunConfig {
+    seconds: u32,
+    cycles_target: Option<u64>,
+    quantum: u32,
+    clock_mhz: u32,
+    sys_clk_hz: u32,
+    unpaced: bool,
+    step_quantum: u32,
+    workload: Workload,
+    model: ExecutionModel,
+}
+
 fn main() {
     mdpicoem_harness::harness_tracing_init();
     let seconds = parse_arg("--seconds").unwrap_or(5);
@@ -351,11 +401,22 @@ fn main() {
     let clock_mhz = parse_arg("--clock-mhz").unwrap_or(125);
     let sys_clk_hz = clock_mhz * 1_000_000;
     let core = parse_arg("--core").unwrap_or(2) as usize;
-    let unpaced = std::env::args().any(|a| a == "--unpaced");
+    let unpaced_flag = std::env::args().any(|a| a == "--unpaced");
+    let step_quantum = parse_arg("--step-quantum").unwrap_or(BENCH_DEFAULT_STEP_QUANTUM);
+    let model_sel = parse_model().unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let reps = parse_arg("--reps").unwrap_or(5);
     let workload = parse_workload().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
+
+    // `--model both` implies `--unpaced` per HLD V1 §7.3 — paced mode
+    // measures real-time sustainability, which is only defined for a
+    // single model at a time.
+    let unpaced = unpaced_flag || matches!(model_sel, ModelSel::Both);
 
     // `--dual-core` was removed in the workload-spread refactor: core
     // count is now a property of the workload (Basic/Peripheral → single
@@ -374,9 +435,30 @@ fn main() {
         eprintln!("error: --seconds and --clock-mhz must be > 0");
         std::process::exit(1);
     }
+    if step_quantum == 0 {
+        eprintln!("error: --step-quantum must be > 0");
+        std::process::exit(1);
+    }
+    if reps == 0 {
+        eprintln!("error: --reps must be > 0");
+        std::process::exit(1);
+    }
     if cycles_target.is_some() && !unpaced {
         eprintln!("error: --cycles requires --unpaced (paced mode is duration-driven)");
         std::process::exit(1);
+    }
+
+    // Threading-availability preflight. Mirrors the RP2350 bench's
+    // guard: on non-Windows / non-x86_64 the threaded `build()` returns
+    // `Err(ConfigError::ThreadingUnavailable)`. Per task brief, print a
+    // skip message + exit 0 rather than failing.
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    if matches!(model_sel, ModelSel::Threaded | ModelSel::Both) {
+        println!(
+            "(skip) --model threaded|both requires x86_64 Windows with the \
+             `threading` cargo feature enabled; exiting cleanly."
+        );
+        std::process::exit(0);
     }
 
     // Raise priority and pin to a specific core to minimise OS preemption.
@@ -389,8 +471,78 @@ fn main() {
     #[cfg(not(target_os = "windows"))]
     let _ = core;
 
+    // `--model both` A/B harness: N reps per model, print comparative
+    // table with median / IQR / delta% / verdict.
+    if matches!(model_sel, ModelSel::Both) {
+        let base_cfg = RunConfig {
+            seconds,
+            cycles_target,
+            quantum,
+            clock_mhz,
+            sys_clk_hz,
+            unpaced,
+            step_quantum,
+            workload,
+            model: ExecutionModel::Serial, // per-rep override inside A/B loop
+        };
+        run_ab_harness(&base_cfg, reps);
+        return;
+    }
+
+    // `--model serial|threaded`: single-model replication with stats.
+    let exec_model = match model_sel {
+        ModelSel::Serial => ExecutionModel::Serial,
+        ModelSel::Threaded => ExecutionModel::Threaded,
+        ModelSel::Both => unreachable!("handled above"),
+    };
+    let cfg = RunConfig {
+        seconds,
+        cycles_target,
+        quantum,
+        clock_mhz,
+        sys_clk_hz,
+        unpaced,
+        step_quantum,
+        workload,
+        model: exec_model,
+    };
+    run_single_model_reps(&cfg, reps);
+}
+
+/// Run the full bench once with the given configuration. Returns the
+/// headline throughput (Avg MHz): in unpaced mode this is the
+/// executed-cycles-per-wall-second figure (per-core peak); in paced
+/// mode this is `PacerStats::emulated_mhz()`.
+fn run_once(cfg: &RunConfig) -> f64 {
+    let seconds = cfg.seconds;
+    let cycles_target = cfg.cycles_target;
+    let quantum = cfg.quantum;
+    let clock_mhz = cfg.clock_mhz;
+    let sys_clk_hz = cfg.sys_clk_hz;
+    let unpaced = cfg.unpaced;
+    let step_quantum = cfg.step_quantum;
+    let workload = cfg.workload;
+    let model = cfg.model;
+
     // --- Set up emulator + selected workload ---
-    let mut emu = Emulator::new(Config { sys_clk_hz });
+    // Workload setup must run on the Serial handle regardless — every
+    // `mmio_write32` / `poke` / `core_mut` touch is cheap-and-direct on
+    // the serial path, and the threaded path lazily promotes on the
+    // first `run(cycles)` call (see `lib.rs` §Emulator::run).
+    let mut emu = match EmulatorBuilder::new(Config { sys_clk_hz })
+        .step_quantum(step_quantum)
+        .execution(model)
+        .build()
+    {
+        Ok(emu) => emu,
+        Err(ConfigError::ThreadingUnavailable) => {
+            eprintln!(
+                "error: ExecutionModel::Threaded unavailable in this build \
+                 (requires x86_64 Windows + `threading` feature)"
+            );
+            std::process::exit(1);
+        }
+    };
     setup(&mut emu, workload);
 
     // --- Set up pacer ---
@@ -399,9 +551,13 @@ fn main() {
 
     let core_mode = if workload.is_dual_core() { "dual-core" } else { "single-core" };
     let pio_mode = if workload.needs_pio() { " + PIO0 SM0 wrap" } else { "" };
+    let runtime_mode = match model {
+        ExecutionModel::Serial => "serial",
+        ExecutionModel::Threaded => "threaded",
+    };
     println!(
-        "mdrp2040 paced benchmark — target {} MHz, quantum {} cycles, {}, workload {}{}",
-        clock_mhz, quantum, core_mode, workload.as_str(), pio_mode,
+        "mdrp2040 paced benchmark — target {} MHz, quantum {} cycles, step_quantum {}, {}, workload {}{}, runtime {}",
+        clock_mhz, quantum, step_quantum, core_mode, workload.as_str(), pio_mode, runtime_mode,
     );
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
     println!("{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
@@ -413,11 +569,28 @@ fn main() {
     let monitor = std::thread::spawn(move || monitor_loop(mon_stats));
 
     // --- Execution ---
+    // Snapshot per-core cycle counters *before* the run so the bench
+    // can report "Avg MHz" from real instruction work rather than
+    // cycles-requested. In threaded mode `Emulator::run` advances the
+    // requested cycle budget regardless of whether cores execute (a
+    // halted core stays at 0), so requested-based MHz would mis-report
+    // dual-core workloads where only one core is active.
+    let c0_start = emu.core_cycles(0);
+    let c1_start = emu.core_cycles(1);
     let start = Instant::now();
     let duration = Duration::from_secs(seconds.into());
     let qc = pacer.quantum_cycles();
 
-    let unpaced_cycles: u64 = if unpaced {
+    // Threaded chunk size: `run(cycles)` in threaded mode dispatches
+    // one barrier rendezvous per `step_quantum` cycles. Pacing at the
+    // 125-cycle `--quantum` default would burn the budget on barrier
+    // overhead. Use 1 virtual second per chunk in unpaced mode (like
+    // RP2350), and honour `--quantum` in paced mode (the threaded path
+    // is not recommended for paced — it's legal, just inefficient).
+    let threaded_chunk_cycles: u64 = sys_clk_hz as u64;
+
+    let mut unpaced_cycles: u64 = 0;
+    if unpaced {
         if let Some(target) = cycles_target {
             println!(
                 "(unpaced mode — running flat-out until {} emulated cycles)",
@@ -426,43 +599,68 @@ fn main() {
         } else {
             println!("(unpaced mode — running flat-out, no real-time pacing)");
         }
-        let mut n: u64 = 0;
         loop {
             if let Some(target) = cycles_target {
-                if n >= target { break; }
+                if unpaced_cycles >= target { break; }
             } else if start.elapsed() >= duration {
                 break;
             }
-            let consumed = emu.run(qc).expect("Serial run is infallible");
-            n += consumed;
+            let chunk = if matches!(model, ExecutionModel::Threaded) {
+                // Final iteration under --cycles: shrink the chunk so we
+                // don't over-run the target by an entire virtual second.
+                if let Some(target) = cycles_target {
+                    threaded_chunk_cycles.min(target - unpaced_cycles)
+                } else {
+                    threaded_chunk_cycles
+                }
+            } else {
+                qc
+            };
+            let consumed = run_with_model(&mut emu, chunk);
+            unpaced_cycles += consumed;
         }
-        n
     } else {
         while start.elapsed() < duration {
             pacer.begin_quantum();
-            emu.run(qc).expect("Serial run is infallible");
+            let _ = run_with_model(&mut emu, qc);
             pacer.end_quantum();
         }
-        0 // unused
-    };
+    }
 
     stats.set_running(false);
     monitor.join().unwrap();
+    let c0_end = emu.core_cycles(0);
+    let c1_end = emu.core_cycles(1);
 
     // --- Summary ---
     let wall_secs = start.elapsed().as_secs_f64();
     println!("\n--- summary ---");
     println!("Duration:       {:.1} s", wall_secs);
     println!("Workload:       {}", workload.as_str());
+    println!("Runtime:        {}", runtime_mode);
 
     if unpaced {
-        let mhz = unpaced_cycles as f64 / wall_secs / 1_000_000.0;
-        let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / unpaced_cycles as f64;
-        println!("Total cycles:   {}", unpaced_cycles);
-        println!("Avg MHz:        {:.1}", mhz);
+        // "Cycles executed" = max of per-core deltas. Single-core
+        // workloads halt core 1, so its delta is 0 and max reduces to
+        // the running core's rate. Dual-core workloads run both cores
+        // to roughly the same cycle count, so max ≈ either. This is
+        // the real-time gate signal ("can a core sustain 125 MHz?"),
+        // not an aggregate throughput number.
+        let c0_delta = c0_end.saturating_sub(c0_start);
+        let c1_delta = c1_end.saturating_sub(c1_start);
+        let executed = c0_delta.max(c1_delta);
+        let mhz = executed as f64 / wall_secs / 1_000_000.0;
+        let host_cycles_per_emu =
+            pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
+        println!(
+            "Executed cyc:   {} (c0={}, c1={})",
+            executed, c0_delta, c1_delta
+        );
+        println!("Requested cyc:  {}", unpaced_cycles);
+        println!("Avg MHz:        {:.1} (per-core peak, from executed cycles)", mhz);
         println!("Host/emu cycle: {:.2}", host_cycles_per_emu);
         println!("Verdict:        UNPACED (profiling mode)");
-        return;
+        return mhz;
     }
 
     let snap = stats.snapshot();
@@ -484,6 +682,32 @@ fn main() {
     } else {
         println!("Verdict:        CANNOT SUSTAIN REAL-TIME ({:.1}% of target, {:.2}% behind)",
                  mhz_ratio * 100.0, behind_rate * 100.0);
+    }
+
+    snap.emulated_mhz()
+}
+
+/// Advance the emulator by at least `cycles` virtual cycles. Serial
+/// `run` is infallible (panics on internal bug); Threaded `run` can
+/// return `Err(EmulatorError::WorkerPanicked)` which we surface as a
+/// hard bench failure — a worker panic is not a valid perf data point.
+fn run_with_model(emu: &mut Emulator, cycles: u64) -> u64 {
+    match emu.execution_model() {
+        ExecutionModel::Serial => emu.run(cycles).expect("Serial run is infallible"),
+        ExecutionModel::Threaded => match emu.run(cycles) {
+            Ok(n) => n,
+            Err(EmulatorError::WorkerPanicked { which, message }) => {
+                eprintln!(
+                    "fatal: threaded worker '{:?}' panicked: {}",
+                    which, message
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fatal: threaded run failed: {}", e);
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -548,4 +772,191 @@ fn match_workload(s: &str) -> Result<Workload, String> {
             "invalid --workload '{other}' (expected basic|peripheral|contention|stress)"
         )),
     }
+}
+
+/// Execution-model selector parsed from `--model`. Defaults to
+/// `Serial` when absent (bench-historical behaviour on RP2040).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSel {
+    Serial,
+    Threaded,
+    Both,
+}
+
+fn parse_model() -> Result<ModelSel, String> {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix("--model=") {
+            return match_model(v);
+        }
+        if a == "--model" {
+            let v = args
+                .get(i + 1)
+                .ok_or("--model requires serial|threaded|both")?;
+            return match_model(v);
+        }
+    }
+    Ok(ModelSel::Serial)
+}
+
+fn match_model(s: &str) -> Result<ModelSel, String> {
+    match s {
+        "serial" => Ok(ModelSel::Serial),
+        "threaded" => Ok(ModelSel::Threaded),
+        "both" => Ok(ModelSel::Both),
+        other => Err(format!(
+            "invalid --model '{other}' (expected serial|threaded|both)"
+        )),
+    }
+}
+
+/// A/B harness: run `reps` measured reps on Serial, then on Threaded,
+/// and print a comparative table with median MHz / IQR / delta% /
+/// verdict (HLD V1 §7.3). One warm-up rep per model is run and
+/// discarded. Winner declared only when `|delta| > max(3 * IQR /
+/// median_serial, 5%)` — anything inside the noise floor is "TIED".
+fn run_ab_harness(base_cfg: &RunConfig, reps: u32) {
+    println!(
+        "[A/B bench] reps={} (+1 warmup/model discarded) --unpaced --workload {} --step-quantum {}",
+        reps,
+        base_cfg.workload.as_str(),
+        base_cfg.step_quantum,
+    );
+
+    let serial_cfg = RunConfig { model: ExecutionModel::Serial, ..*base_cfg };
+    let threaded_cfg = RunConfig { model: ExecutionModel::Threaded, ..*base_cfg };
+
+    println!("\n=== Serial reps ===");
+    let serial_mhz = collect_reps(&serial_cfg, reps);
+    println!("\n=== Threaded reps ===");
+    let threaded_mhz = collect_reps(&threaded_cfg, reps);
+
+    let s_stats = Stats::from(&serial_mhz);
+    let t_stats = Stats::from(&threaded_mhz);
+    let delta_pct = if s_stats.median > 0.0 {
+        100.0 * (t_stats.median - s_stats.median) / s_stats.median
+    } else {
+        0.0
+    };
+    // Noise floor per HLD V1 §7.3: max(3 × IQR/median_serial, 5%).
+    let iqr_ratio = if s_stats.median > 0.0 {
+        100.0 * (s_stats.p75 - s_stats.p25) / s_stats.median
+    } else {
+        0.0
+    };
+    let noise_floor = (3.0 * iqr_ratio).max(5.0);
+    let verdict = if delta_pct.abs() <= noise_floor {
+        "TIED (within noise)".to_string()
+    } else if delta_pct > 0.0 {
+        format!("WINNER: Threaded (+{:.1}%)", delta_pct)
+    } else {
+        format!("WINNER: Serial ({:.1}%)", delta_pct)
+    };
+
+    println!(
+        "\n=== A/B summary — workload: {} ===",
+        base_cfg.workload.as_str()
+    );
+    println!(
+        "{:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "model", "median", "p25", "p75", "min", "max"
+    );
+    print_stats_row("serial", &s_stats);
+    print_stats_row("threaded", &t_stats);
+    println!(
+        "\ndelta: {:+.1}% (noise floor: ±{:.1}%)",
+        delta_pct, noise_floor
+    );
+    println!("verdict: {}", verdict);
+}
+
+/// Single-model replication harness: `--model serial|threaded` plus
+/// `--reps N` runs N measured reps (+ 1 discarded warm-up) and prints
+/// a stats-only table with no delta / verdict (single-model mode has
+/// no opposite to compare against).
+fn run_single_model_reps(cfg: &RunConfig, reps: u32) {
+    let label = match cfg.model {
+        ExecutionModel::Serial => "serial",
+        ExecutionModel::Threaded => "threaded",
+    };
+    println!(
+        "[single-model bench] reps={} (+1 warmup discarded) --model {} --workload {} --step-quantum {}",
+        reps,
+        label,
+        cfg.workload.as_str(),
+        cfg.step_quantum,
+    );
+    let samples = collect_reps(cfg, reps);
+    let s = Stats::from(&samples);
+    println!(
+        "\n=== stats — workload: {} (model: {}) ===",
+        cfg.workload.as_str(),
+        label
+    );
+    println!(
+        "{:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "model", "median", "p25", "p75", "min", "max"
+    );
+    print_stats_row(label, &s);
+}
+
+/// Run `reps` measured reps (+ 1 discarded warm-up) under `cfg` and
+/// return the measured MHz values.
+fn collect_reps(cfg: &RunConfig, reps: u32) -> Vec<f64> {
+    let mut out = Vec::with_capacity(reps as usize);
+    for i in 0..=reps {
+        let tag = if i == 0 { "warmup" } else { "rep" };
+        println!("\n--- {} {}/{} ---", tag, i, reps);
+        let mhz = run_once(cfg);
+        if i == 0 {
+            println!("(warmup: {:.1} MHz, discarded)", mhz);
+        } else {
+            out.push(mhz);
+        }
+    }
+    out
+}
+
+/// Nearest-rank percentile index for a sorted population of size
+/// `n`: `ceil(pct/100 * n)` clamped to `[1, n]` then converted to a
+/// zero-based index.
+fn pct_idx(n: usize, pct: u8) -> usize {
+    debug_assert!(n > 0, "pct_idx: n must be > 0");
+    debug_assert!(pct <= 100, "pct_idx: pct must be in 0..=100");
+    let r = ((pct as f64) / 100.0 * n as f64).ceil() as usize;
+    r.clamp(1, n) - 1
+}
+
+/// Summary stats for a `Vec<f64>`: median, 25th/75th percentile, min,
+/// max. Nearest-rank percentiles — simple and sufficient for N≥5.
+struct Stats {
+    median: f64,
+    p25: f64,
+    p75: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Stats {
+    fn from(samples: &[f64]) -> Self {
+        assert!(!samples.is_empty(), "Stats::from: empty samples");
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let pct = |p: u8| -> f64 { sorted[pct_idx(n, p)] };
+        Self {
+            median: pct(50),
+            p25: pct(25),
+            p75: pct(75),
+            min: sorted[0],
+            max: sorted[n - 1],
+        }
+    }
+}
+
+fn print_stats_row(label: &str, s: &Stats) {
+    println!(
+        "{:>9} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
+        label, s.median, s.p25, s.p75, s.min, s.max
+    );
 }
