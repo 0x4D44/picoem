@@ -1403,3 +1403,30 @@ The Serial-only assertions (PPB reads debug-assert `not_placeholder`)
 mean the observable has to be captured via a scoped pre/post
 `both_models_compare` pattern, or through the ThreadedEmulator's
 `shared()` state on the Threaded branch.
+
+## Stage 3b.3: RP2040 threaded UART/SPI/I2C/ADC/PWM/DMA route through legacy HashMap (2026-04-24)
+
+Serial `Bus::peripheral_write32` dispatches UART / SPI / I2C / ADC / PWM
+/ DMA through typed peripheral modules (`self.uart0.write32(..., &mut
+self.irq_pending)` etc.) with register-level side effects — IRQ RIS
+bits for UART/SPI/I2C, trigger-channel transfer kickoff for DMA. Stage
+3b.3 routes these same regions through
+`SharedState.peripherals.legacy: Mutex<HashMap<u32, u32>>` as raw
+register storage, preserving RAW (read-after-write) semantics through
+the alias-aware update rule (plain / XOR / OR / AND-NOT) but losing the
+side effects.
+
+Risk: firmware using these peripherals on the threaded path sees an
+IRQ-less UART / SPI / I2C and a non-ticking DMA. pico-sdk code that
+polls for TX-fifo-ready via bit-bash will still work (the register
+round-trips); code that waits on an ISR will hang.
+
+Mitigation for Stage 4 crossover measurement: treat these peripherals
+as Serial-only. `paced_bench_rp2040 --model serial` remains the path
+for any firmware that exercises UART/SPI/I2C/DMA. If Stage 4 benchmarks
+demand threaded coverage of these peripherals, follow up with typed
+state on `Peripherals` (same pattern as the TIMER fix in Stage 3b.3 —
+reuse the existing serial type inside a thin `Mutex<...>` wrapper).
+
+TIMER is already typed on the threaded path — the TIMELR→TIMEHR read-
+latching side effect cannot be modelled by the HashMap.

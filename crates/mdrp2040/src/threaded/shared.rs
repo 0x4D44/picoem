@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use mdpicoem_common::threaded::SpscQueue;
 
 use crate::WorkerName;
-use crate::threaded::{CoreAtomics, SharedMemory};
+use crate::threaded::{CoreAtomics, Peripherals, SharedMemory, ThreadedPio};
 
 /// Arc-bundled shared state handed to every worker in the threaded
 /// runtime. Cloning is cheap (refcount bumps + bundle copy).
@@ -29,9 +29,15 @@ use crate::threaded::{CoreAtomics, SharedMemory};
 pub struct SharedState {
     /// Shared SRAM / ROM memory (atomic words + read-only byte slice).
     pub memory: Arc<SharedMemory>,
-    /// Per-core atomics (halted / WFE / event_flag / irq_pending /
-    /// bus_fault).
-    pub atomics: [Arc<CoreAtomics>; 2],
+    /// Cross-core atomics (halted / WFE / event_flag / irq_pending /
+    /// bus_fault). `CoreAtomics` itself carries per-core arrays
+    /// internally, so one `Arc` is sufficient — the previous
+    /// `[Arc<CoreAtomics>; 2]` shape would have routed peer-core
+    /// publishes to a sibling Arc instance that held the same per-core
+    /// bits, which worked by accident when producer + consumer agreed
+    /// on which slot to index. Collapsed to a single Arc after Stage
+    /// 3b.3 review.
+    pub atomics: Arc<CoreAtomics>,
     /// Inter-core FIFO: core 0 pushes, core 1 pops.
     pub sio_fifo_0_to_1: Arc<SpscQueue>,
     /// Inter-core FIFO: core 1 pushes, core 0 pops.
@@ -50,6 +56,14 @@ pub struct SharedState {
     /// read lock-free by the CPU workers (PLL LOCK timing, TIMER match,
     /// etc.).
     pub master_cycle: Arc<AtomicU64>,
+    /// Mutex-guarded bundle of cold-path peripheral registers (CLOCKS /
+    /// PLL / XOSC / ROSC / RESETS / IO_BANK0 / PADS_BANK0 / legacy
+    /// HashMap). See [`Peripherals`] for the layout.
+    pub peripherals: Arc<Peripherals>,
+    /// PIO shared state: per-block command queues + coordinator-refreshed
+    /// register snapshot + `sm_enabled` atomics. Stage 3b.3 populates the
+    /// queue write path; Stage 3b.4 wires the coordinator drain.
+    pub pio: Arc<ThreadedPio>,
     /// Sticky panic flag. Set by the first worker to unwind; subsequent
     /// workers observe it and exit their quantum early.
     pub poisoned: Arc<AtomicBool>,
@@ -72,10 +86,7 @@ impl SharedState {
 
         Self {
             memory: Arc::new(SharedMemory::new_zero()),
-            atomics: [
-                Arc::new(CoreAtomics::default()),
-                Arc::new(CoreAtomics::default()),
-            ],
+            atomics: Arc::new(CoreAtomics::default()),
             // Capacity 8 matches mdrp2350 / RP2040 SIO FIFO depth.
             sio_fifo_0_to_1: Arc::new(SpscQueue::new(8)),
             sio_fifo_1_to_0: Arc::new(SpscQueue::new(8)),
@@ -83,6 +94,8 @@ impl SharedState {
             gpio_out: Arc::new(AtomicU32::new(0)),
             gpio_oe: Arc::new(AtomicU32::new(0)),
             master_cycle: Arc::new(AtomicU64::new(0)),
+            peripherals: Arc::new(Peripherals::new_default()),
+            pio: Arc::new(ThreadedPio::new()),
             poisoned: Arc::new(AtomicBool::new(false)),
             panic_info: Arc::new(Mutex::new(None)),
         }
@@ -116,7 +129,7 @@ mod tests {
         assert_eq!(b.master_cycle.load(Ordering::Acquire), 42);
         assert!(Arc::ptr_eq(&a.master_cycle, &b.master_cycle));
         assert!(Arc::ptr_eq(&a.memory, &b.memory));
-        assert!(Arc::ptr_eq(&a.atomics[0], &b.atomics[0]));
+        assert!(Arc::ptr_eq(&a.atomics, &b.atomics));
         assert!(Arc::ptr_eq(&a.sio_fifo_0_to_1, &b.sio_fifo_0_to_1));
         assert!(Arc::ptr_eq(&a.spinlocks, &b.spinlocks));
     }

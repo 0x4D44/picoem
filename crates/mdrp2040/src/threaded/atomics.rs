@@ -39,6 +39,14 @@ pub struct CoreAtomics {
     pub bus_fault: [AtomicBool; 2],
     /// Per-core address that triggered the most recent bus fault.
     pub bus_fault_addr: [AtomicU32; 2],
+    /// FIFO_ST.WOF — write-on-full sticky, one per sender core. Set when
+    /// this core pushes to `sio_fifo_*` and the queue is full. Cleared
+    /// by writing 1 to FIFO_ST bit 2 (W1C).
+    pub fifo_wof: [AtomicBool; 2],
+    /// FIFO_ST.ROE — read-on-empty sticky, one per reader core. Set
+    /// when this core pops from the incoming `sio_fifo_*` while empty.
+    /// Cleared by writing 1 to FIFO_ST bit 3 (W1C).
+    pub fifo_roe: [AtomicBool; 2],
 }
 
 impl Default for CoreAtomics {
@@ -50,6 +58,8 @@ impl Default for CoreAtomics {
             irq_pending: [AtomicU32::new(0), AtomicU32::new(0)],
             bus_fault: [AtomicBool::new(false), AtomicBool::new(false)],
             bus_fault_addr: [AtomicU32::new(0), AtomicU32::new(0)],
+            fifo_wof: [AtomicBool::new(false), AtomicBool::new(false)],
+            fifo_roe: [AtomicBool::new(false), AtomicBool::new(false)],
         }
     }
 }
@@ -189,6 +199,62 @@ impl CoreAtomics {
         self.bus_fault_addr[core].load(Ordering::Acquire)
     }
 
+    // --- FIFO sticky flags (FIFO_ST WOF/ROE) ---
+
+    /// Latch the FIFO_ST.WOF (write-on-full) sticky for `core`. Set when
+    /// `core` pushed to a full SIO FIFO.
+    #[inline]
+    pub fn set_fifo_wof(&self, core: usize) {
+        if core < 2 {
+            self.fifo_wof[core].store(true, Ordering::Release);
+        }
+    }
+
+    /// Latch the FIFO_ST.ROE (read-on-empty) sticky for `core`. Set when
+    /// `core` popped from an empty SIO FIFO.
+    #[inline]
+    pub fn set_fifo_roe(&self, core: usize) {
+        if core < 2 {
+            self.fifo_roe[core].store(true, Ordering::Release);
+        }
+    }
+
+    /// Read the FIFO_ST.WOF sticky for `core`.
+    #[inline]
+    pub fn fifo_wof(&self, core: usize) -> bool {
+        if core < 2 {
+            self.fifo_wof[core].load(Ordering::Acquire)
+        } else {
+            false
+        }
+    }
+
+    /// Read the FIFO_ST.ROE sticky for `core`.
+    #[inline]
+    pub fn fifo_roe(&self, core: usize) -> bool {
+        if core < 2 {
+            self.fifo_roe[core].load(Ordering::Acquire)
+        } else {
+            false
+        }
+    }
+
+    /// Clear the FIFO_ST.WOF sticky for `core` (W1C from FIFO_ST write).
+    #[inline]
+    pub fn clear_fifo_wof(&self, core: usize) {
+        if core < 2 {
+            self.fifo_wof[core].store(false, Ordering::Release);
+        }
+    }
+
+    /// Clear the FIFO_ST.ROE sticky for `core` (W1C from FIFO_ST write).
+    #[inline]
+    pub fn clear_fifo_roe(&self, core: usize) {
+        if core < 2 {
+            self.fifo_roe[core].store(false, Ordering::Release);
+        }
+    }
+
     // --- Bulk / setup helpers ---
 
     /// Reset all per-core state. Coordinator-phase only — not safe while
@@ -201,6 +267,8 @@ impl CoreAtomics {
             self.irq_pending[c].store(0, Ordering::Release);
             self.bus_fault[c].store(false, Ordering::Release);
             self.bus_fault_addr[c].store(0, Ordering::Release);
+            self.fifo_wof[c].store(false, Ordering::Release);
+            self.fifo_roe[c].store(false, Ordering::Release);
         }
     }
 }
