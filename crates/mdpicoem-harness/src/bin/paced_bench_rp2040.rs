@@ -433,14 +433,14 @@ fn main() {
             } else if start.elapsed() >= duration {
                 break;
             }
-            let consumed = emu.run(qc);
+            let consumed = emu.run(qc).expect("Serial run is infallible");
             n += consumed;
         }
         n
     } else {
         while start.elapsed() < duration {
             pacer.begin_quantum();
-            emu.run(qc);
+            emu.run(qc).expect("Serial run is infallible");
             pacer.end_quantum();
         }
         0 // unused

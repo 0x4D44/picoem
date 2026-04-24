@@ -60,7 +60,7 @@ mod bus_integration {
     fn bus_hook_write_round_trip() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build();
+            .build().expect("Serial build is infallible");
         // Idle: CS high.
         drive_pins(&mut emu, true, false, false);
 
@@ -81,7 +81,7 @@ mod bus_integration {
     fn bus_hook_miso_drives_gpio_in_bit_zero() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build();
+            .build().expect("Serial build is infallible");
         // Seed the buffer so read returns a known non-zero byte.
         emu.bus.psram.as_mut().unwrap().buffer[0x00] = 0xFF; // all 1s — every MISO bit is 1
 
@@ -111,7 +111,7 @@ mod bus_integration {
         // wins.
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build();
+            .build().expect("Serial build is infallible");
         emu.bus.psram.as_mut().unwrap().buffer[0x00] = 0xAA;
 
         // PIO1 drives a different pin (not GPIO0) — ensure no collision.
@@ -135,7 +135,7 @@ mod bus_integration {
     fn bus_hook_reset_clears_psram_state() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build();
+            .build().expect("Serial build is infallible");
         // Get the PSRAM into a non-idle state.
         drive_pins(&mut emu, true, false, false);
         drive_pins(&mut emu, false, false, false);
@@ -292,7 +292,7 @@ mod pio_integration {
             // real master samples on the current rising edge.
             let miso = ((emu.bus.gpio_in >> PIN_MISO) & 1) as u8;
             miso_byte = (miso_byte << 1) | miso;
-            emu.step();
+            emu.step().expect("Serial step is infallible");
         }
         miso_byte
     }
@@ -301,13 +301,13 @@ mod pio_integration {
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(STEP_QUANTUM)
             .psram(Psram::picogus())
-            .build();
+            .build().expect("Serial build is infallible");
         configure_sio_bits(&mut emu);
         install_sck_toggler(&mut emu);
         park_core0_on_nops(&mut emu);
         // Let initial pin state propagate through one step before SM runs,
         // so the PSRAM's prev_cs latches to CS=high.
-        emu.step();
+        emu.step().expect("Serial step is infallible");
         emu
     }
 
@@ -335,7 +335,7 @@ mod pio_integration {
         clock_out_byte(&mut emu, 0xEF);
 
         sio_set_cs(&mut emu, true);
-        emu.step(); // propagate CS-rise to PSRAM.
+        emu.step().expect("Serial step is infallible"); // propagate CS-rise to PSRAM.
 
         assert_eq!(
             &emu.bus.psram.as_ref().unwrap().buffer[0x100..0x104],
@@ -371,7 +371,7 @@ mod pio_integration {
         let b3 = clock_out_byte(&mut emu, 0x00);
 
         sio_set_cs(&mut emu, true);
-        emu.step();
+        emu.step().expect("Serial step is infallible");
 
         assert_eq!([b0, b1, b2, b3], [0x11, 0x22, 0x33, 0x44],
             "PIO-driven fast-read must return the seeded buffer bytes — \

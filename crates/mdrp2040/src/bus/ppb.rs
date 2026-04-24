@@ -31,6 +31,7 @@ pub(crate) const PRIO_NMI: i16 = -2;
 pub(crate) const PRIO_HARDFAULT: i16 = -1;
 
 /// Private Peripheral Bus state — exception-relevant fields only.
+#[derive(Clone)]
 pub struct Ppb {
     /// Vector Table Offset Register. Must be aligned to 128 bytes
     /// (implementation-defined on M0+, typically a power-of-two ≥ table

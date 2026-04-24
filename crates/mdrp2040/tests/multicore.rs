@@ -72,7 +72,7 @@ fn plant_entry_self_loop(emu: &mut mdrp2040::Emulator, entry: u32) {
 fn t1_handshake_wakes_core1_at_entry() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
     assert!(
         emu.cores[1].is_halted(),
         "core 1 should be halted at boot"
@@ -86,7 +86,7 @@ fn t1_handshake_wakes_core1_at_entry() {
     seed_core0_nop(&mut emu);
     plant_entry_self_loop(&mut emu, TEST_ENTRY);
 
-    emu.step();
+    emu.step().expect("Serial step is infallible");
 
     assert!(
         !emu.cores[1].is_halted(),
@@ -118,7 +118,7 @@ fn t1_handshake_wakes_core1_at_entry() {
 fn t2_restart_on_mismatch_at_seq2() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     // Push {0, 0, 0x42}: third word triggers restart to seq=0.
     armed_push_expect_echo(&mut emu, 0, 0);
@@ -136,7 +136,7 @@ fn t2_restart_on_mismatch_at_seq2() {
     seed_core0_nop(&mut emu);
     plant_entry_self_loop(&mut emu, TEST_ENTRY);
 
-    emu.step();
+    emu.step().expect("Serial step is infallible");
 
     assert!(!emu.cores[1].is_halted());
     assert_eq!(emu.cores[1].regs.pc(), TEST_ENTRY & !1);
@@ -152,7 +152,7 @@ fn t2_restart_on_mismatch_at_seq2() {
 fn t3_restart_on_zero_at_seq3() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     // Push {0, 0, 1, 0}: at seq=3 a zero word resets to seq=0.
     armed_push_expect_echo(&mut emu, 0, 0);
@@ -162,7 +162,7 @@ fn t3_restart_on_zero_at_seq3() {
 
     seed_core0_nop(&mut emu);
 
-    emu.step();
+    emu.step().expect("Serial step is infallible");
 
     assert!(
         emu.cores[1].is_halted(),
@@ -178,7 +178,7 @@ fn t3_restart_on_zero_at_seq3() {
 fn t4_vtor_captured_independently_of_entry() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     // Pre-seed a distinctly wrong VTOR so we can prove the handshake
     // overwrites it.
@@ -192,7 +192,7 @@ fn t4_vtor_captured_independently_of_entry() {
     seed_core0_nop(&mut emu);
     plant_entry_self_loop(&mut emu, TEST_ENTRY);
 
-    emu.step();
+    emu.step().expect("Serial step is infallible");
 
     assert_eq!(
         emu.bus.ppb[1].vtor, TEST_VTOR,
@@ -209,7 +209,7 @@ fn t4_vtor_captured_independently_of_entry() {
 fn t5_second_launch_after_rehalt() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     // First launch (same as T1).
     let seq1 = [0u32, 0, 1, TEST_VTOR, TEST_SP, TEST_ENTRY];
@@ -218,7 +218,7 @@ fn t5_second_launch_after_rehalt() {
     }
     seed_core0_nop(&mut emu);
     plant_entry_self_loop(&mut emu, TEST_ENTRY);
-    emu.step();
+    emu.step().expect("Serial step is infallible");
     assert!(!emu.cores[1].is_halted());
 
     // Rehalt core 1 via the wrapper — re-arms FSM.
@@ -244,7 +244,7 @@ fn t5_second_launch_after_rehalt() {
     }
 
     plant_entry_self_loop(&mut emu, entry2);
-    emu.step();
+    emu.step().expect("Serial step is infallible");
 
     assert!(!emu.cores[1].is_halted(), "second launch must wake core 1");
     assert_eq!(emu.cores[1].regs.pc(), entry2 & !1);
@@ -276,7 +276,7 @@ fn t5_second_launch_after_rehalt() {
 fn t6_handshake_while_awake_is_pass_through() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     // Wake core 1 via the wrapper — FSM disarms.
     emu.wake_core1();
@@ -335,7 +335,7 @@ fn t6_handshake_while_awake_is_pass_through() {
 fn t7_echo_visible_on_vld_before_next_instruction() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     let seq = [0u32, 0, 1, TEST_VTOR, TEST_SP, TEST_ENTRY];
     emu.bus.set_active_core(0);
@@ -360,7 +360,7 @@ fn t7_echo_visible_on_vld_before_next_instruction() {
 fn t8_fsm_state_resets_on_emulator_reset() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     // Advance FSM to seq=2.
     armed_push_expect_echo(&mut emu, 0, 0);
@@ -387,7 +387,7 @@ fn t8_fsm_state_resets_on_emulator_reset() {
     seed_core0_nop(&mut emu);
     plant_entry_self_loop(&mut emu, TEST_ENTRY);
 
-    emu.step();
+    emu.step().expect("Serial step is infallible");
     assert!(!emu.cores[1].is_halted());
     assert_eq!(emu.cores[1].regs.pc(), TEST_ENTRY & !1);
 }
@@ -400,7 +400,7 @@ fn t8_fsm_state_resets_on_emulator_reset() {
 fn t9_scripted_sdk_sender_algorithm() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
     // Seed core 0 with a NOP so future `emu.step()` inside the VLD
     // poll loop can execute without faulting. (Forward-compat for
@@ -432,7 +432,7 @@ fn t9_scripted_sdk_sender_algorithm() {
         // pop_blocking: poll VLD then read. Keep emu.step() inside the
         // loop per §3.2 / HLD comment (forward-compat for WFE-aware).
         while emu.bus.read32(FIFO_ST) & VLD == 0 {
-            emu.step();
+            emu.step().expect("Serial step is infallible");
             assert!(guard < 10_000, "VLD poll overran guard");
             guard += 1;
         }
@@ -440,7 +440,7 @@ fn t9_scripted_sdk_sender_algorithm() {
         seq = if cmd == response { seq + 1 } else { 0 };
     }
 
-    emu.step(); // consume pending_launch
+    emu.step().expect("Serial step is infallible"); // consume pending_launch
     assert!(!emu.cores[1].is_halted());
     assert_eq!(emu.cores[1].regs.pc(), TEST_ENTRY & !1);
     assert_eq!(emu.cores[1].regs.msp, TEST_SP);

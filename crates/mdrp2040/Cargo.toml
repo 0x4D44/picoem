@@ -1,6 +1,6 @@
 [package]
 name = "mdrp2040"
-version = "0.16.0"
+version = "0.17.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -28,6 +28,13 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
+
+# Dual-execution HLD V1 (Stage 3b.4): Windows thread-affinity pinning for
+# the 3-thread runtime. `ThreadedEmulator` is `#[cfg]`-gated to x86_64
+# Windows, and `winapi` is gated to the same target so the dependency
+# stays off Linux/macOS builds entirely.
+[target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }
 
 # Dual-execution HLD V1 (Stage 3b.1): integration-test file registrations
 # land now so later sub-stages can add tests without editing Cargo.toml.

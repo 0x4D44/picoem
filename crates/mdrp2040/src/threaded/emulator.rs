@@ -1,0 +1,851 @@
+//! `ThreadedEmulator` — 3-thread runtime entry point for the RP2040
+//! dual-execution path (Stage 3b.4).
+//!
+//! Mirrors the mdrp2350 shape but simpler: three threads (core0, core1,
+//! coordinator) instead of six, because RP2040 has no separate PIO-per-
+//! block split — PIO steps on the coordinator in Stage 3b.4. If Stage 4
+//! benchmarks find PIO to be a bottleneck, the coordinator can be
+//! further split into per-block PIO workers.
+//!
+//! Gated behind `#[cfg(all(target_arch = "x86_64", target_os =
+//! "windows"))]` (via the parent `threaded/mod.rs`) because the
+//! thread-pinning path uses Win32 `SetThreadAffinityMask`. Non-Windows
+//! callers stay on the existing single-threaded `Emulator::run` path.
+//!
+//! Lifecycle at a glance:
+//!
+//! 1. Caller drives an existing `Emulator` to the pre-run state (load
+//!    ROM / flash, reset, seed GPIO stimulus, etc.).
+//! 2. `ThreadedEmulator::from_emulator(emu)` destructures the serial
+//!    `Bus` into the shared state bundle and takes ownership of both
+//!    CPU cores and the two `PioBlock`s.
+//! 3. `run_quanta_checked(n)` spawns three workers (core 0, core 1,
+//!    coordinator), joins them, and surfaces panics via the `poisoned`
+//!    flag so the instance cannot be reused after a worker panic.
+
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+
+use mdpicoem_common::PioBlock;
+use tracing::{error, warn};
+
+use crate::bus::Bus;
+use crate::core::CortexM0Plus;
+use crate::{Emulator, WorkerName};
+
+use super::{
+    BarrierResult, CoreAtomics, Peripherals, PioCommand, SharedMemory, SharedState, SpinBarrier,
+    ThreadedPio,
+};
+use super::memory as tmem;
+use super::peripherals::{ClocksState, IoState, ResetsState, TimerState};
+
+// =======================================================================
+// ThreadedEmulator
+// =======================================================================
+
+/// 3-thread runtime handle over a seeded `SharedState` and both CPU
+/// cores. Construction is via [`Self::from_emulator`].
+pub struct ThreadedEmulator {
+    shared: Arc<SharedState>,
+    core0: Option<CortexM0Plus>,
+    core1: Option<CortexM0Plus>,
+    /// Coordinator-owned PIO blocks. CPU workers enqueue commands onto
+    /// `shared.pio`; the coordinator drains them and steps the blocks.
+    pio_blocks: Option<[PioBlock; 2]>,
+    step_quantum: u32,
+    thread_mask: [usize; 3],
+    poisoned: bool,
+    /// Test-only panic injection target. Consumed on the next
+    /// `run_quanta_checked` entry: the matching worker panics on its
+    /// first barrier wait.
+    #[cfg(feature = "testing")]
+    pending_panic_inject: Option<WorkerName>,
+}
+
+impl ThreadedEmulator {
+    /// Consume a single-threaded `Emulator` and return a
+    /// `ThreadedEmulator` with every piece of state hoisted onto the
+    /// shared `SharedState`.
+    ///
+    /// Panics if `std::thread::available_parallelism()` reports fewer
+    /// than 3 host cores — the runtime pins one thread per core.
+    pub fn from_emulator(emu: Emulator) -> Self {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert!(
+            n >= 3,
+            "ThreadedEmulator requires >= 3 host cores (found {n})"
+        );
+
+        let Emulator {
+            cores,
+            bus,
+            clock,
+            step_quantum,
+            // Diagnostic counters are serial-path only — drop on handoff.
+            pio_tick_count: _,
+            pio_tick_iow_low_count: _,
+            pio0_sm0_max_pc: _,
+            pio0_sm0_pc_advances: _,
+            pio0_sm0_last_pc: _,
+            execution_model: _,
+            threaded: _,
+            panic_info: _,
+            #[cfg(feature = "testing")]
+                pending_panic_inject: _,
+            bus_is_placeholder: _,
+        } = emu;
+
+        let [core0, core1] = cores;
+
+        // PSRAM is not modelled on the threaded path — the PicoGUS
+        // harness that uses it should stay on Serial (HLD §6.4 + Stage
+        // 3b.3 tech_debt). Warn loudly if the caller attached one;
+        // silent drop would strip the MISO feedback from `update_gpio`
+        // and deadlock a PSRAM-reading firmware.
+        if bus.psram.is_some() {
+            warn!(
+                "ThreadedEmulator::from_emulator: attached PSRAM device dropped \
+                 — threaded path does not model sub-quantum SPI edge timing. \
+                 Use ExecutionModel::Serial for PSRAM-driven firmware."
+            );
+        }
+
+        // Build the shared memory by copying ROM + SRAM contents out of
+        // the serial `Memory` struct. ROM is sealed read-only after this;
+        // SRAM becomes atomic-word storage shared across workers.
+        let shared_memory = Arc::new(clone_memory(&bus));
+
+        // Seed `gpio_out` / `gpio_oe` from the SIO registers. The
+        // coordinator overwrites these each quantum with the merged
+        // (SIO | PIO) pin view, so this seed is only observed until the
+        // first quantum's merge completes. External GPIO injection
+        // (harness pokes to `Bus::external_gpio_in_{override,mask}`) is
+        // carried on its own atomics below and applied in the WorkerBus
+        // SIO_GPIO_IN read path. PSRAM MISO feedback is not modelled on
+        // the threaded path — see warn above.
+        let gpio_out = Arc::new(std::sync::atomic::AtomicU32::new(bus.sio.gpio_out));
+        let gpio_oe = Arc::new(std::sync::atomic::AtomicU32::new(bus.sio.gpio_oe));
+        // Carry `Bus::external_gpio_in_override` / `..._mask` onto the
+        // threaded shared state so `picogus_diff_rp2040`-style harnesses
+        // keep driving pins post-promotion.
+        let external_gpio_in_override = Arc::new(std::sync::atomic::AtomicU32::new(
+            bus.external_gpio_in_override,
+        ));
+        let external_gpio_in_mask = Arc::new(std::sync::atomic::AtomicU32::new(
+            bus.external_gpio_in_mask,
+        ));
+
+        // CoreAtomics bundle — seeded with the serial bus's IRQ pending
+        // mask broadcast to both cores, WFE / halted state, bus fault
+        // state.
+        let atomics = Arc::new(CoreAtomics::default());
+        for c in 0..2usize {
+            // Serial path uses a single `bus.irq_pending` — broadcast to
+            // both cores so firmware that poked NVIC_ISPR pre-run sees
+            // the pending bit on whichever core consumes it first.
+            if bus.irq_pending != 0 {
+                atomics.set_irq_pending(c, bus.irq_pending);
+            }
+            if bus.event_flag[c] {
+                atomics.set_event_flag(c);
+            }
+        }
+        // Halted state follows the cores themselves after `take`; mirror
+        // their `halted` flags now so the atomic view matches the core's
+        // own bool.
+        if core0.is_halted() {
+            atomics.set_halted(0);
+        }
+        if core1.is_halted() {
+            atomics.set_halted(1);
+        }
+
+        // Peripherals — take a ClocksState / ResetsState / IoState /
+        // TimerState populated from the serial Bus's typed fields so the
+        // first worker MMIO read sees firmware's pre-run pokes.
+        let peripherals = Arc::new(Peripherals {
+            clocks: std::sync::Mutex::new(ClocksState {
+                clocks_regs: bus.clocks_regs,
+                xosc_regs: bus.xosc_regs,
+                rosc_regs: bus.rosc_regs,
+                pll_sys_regs: bus.pll_sys_regs,
+                pll_usb_regs: bus.pll_usb_regs,
+                pll_sys_lock_at_cycle: bus.pll_sys_lock_at_cycle,
+                pll_usb_lock_at_cycle: bus.pll_usb_lock_at_cycle,
+                clock_tree: bus.clock_tree,
+            }),
+            resets: std::sync::Mutex::new(ResetsState { resets: bus.resets }),
+            io: std::sync::Mutex::new(IoState {
+                io_bank0: bus.io_bank0,
+                pads_bank0: bus.pads_bank0,
+            }),
+            timer: std::sync::Mutex::new(TimerState { regs: bus.timer }),
+            legacy: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        // Seed ThreadedPio sm_enabled from the incoming PioBlocks so a
+        // caller that programmed CTRL.SM_ENABLE through the serial Bus
+        // before `from_emulator` is honoured from the first quantum.
+        let threaded_pio = Arc::new(ThreadedPio::new());
+        let pio_blocks: [PioBlock; 2] = bus.pio;
+        for (idx, block) in pio_blocks.iter().enumerate() {
+            threaded_pio.publish_sm_enabled(idx, block.sm_enabled_mask());
+        }
+
+        // Seed the SPSC cross-core FIFOs from the serial SIO FIFO
+        // snapshots so pre-run pushes (harness setup) survive the
+        // handoff. Ordering matches `mdrp2350::threaded::ThreadedSio::
+        // seed`: head → tail. Capacity 8 on both ends, so the snapshot
+        // (≤ 8 entries) cannot overflow. Also propagate the sticky
+        // WOF / ROE flags onto `CoreAtomics` so FIFO_ST reads match
+        // the serial behaviour from the first quantum.
+        let sio_fifo_0_to_1 = Arc::new(mdpicoem_common::threaded::SpscQueue::new(8));
+        let sio_fifo_1_to_0 = Arc::new(mdpicoem_common::threaded::SpscQueue::new(8));
+        for val in bus.sio.fifo_0to1_snapshot() {
+            let _ = sio_fifo_0_to_1.try_push(val);
+        }
+        for val in bus.sio.fifo_1to0_snapshot() {
+            let _ = sio_fifo_1_to_0.try_push(val);
+        }
+        for core in 0..2 {
+            if bus.sio.fifo_wof(core) {
+                atomics.set_fifo_wof(core);
+            }
+            if bus.sio.fifo_roe(core) {
+                atomics.set_fifo_roe(core);
+            }
+        }
+
+        // Seed the 32 spinlock cells from the serial `Sio::spinlock_bits`
+        // claim bitmap so harnesses that pre-claim a lock see the held
+        // state from the first threaded quantum. Each cell stores 0
+        // (unlocked) or a non-zero token (lock 1..=32 maps to token N+1
+        // to avoid aliasing against a zero 'unlocked' default).
+        let spinlocks_array: [std::sync::atomic::AtomicU32; 32] =
+            std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0));
+        let sl_bits = bus.sio.spinlock_bits();
+        for n in 0..32 {
+            if sl_bits & (1u32 << n) != 0 {
+                spinlocks_array[n].store(n as u32 + 1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let spinlocks = Arc::new(spinlocks_array);
+
+        // Carry the serial `Bus::ppb` (VTOR / SHPR / ICSR / active
+        // bitmap) into `SharedState.initial_ppb`. WorkerBus::new()
+        // consumes its slot on construction (see `take_initial_ppb`).
+        let initial_ppb = Arc::new(std::sync::Mutex::new(Some([
+            bus.ppb[0].clone(),
+            bus.ppb[1].clone(),
+        ])));
+
+        let shared = Arc::new(SharedState {
+            memory: shared_memory,
+            atomics,
+            sio_fifo_0_to_1,
+            sio_fifo_1_to_0,
+            spinlocks,
+            gpio_out,
+            gpio_oe,
+            external_gpio_in_override,
+            external_gpio_in_mask,
+            master_cycle: Arc::new(AtomicU64::new(clock.cycles.max(bus.master_cycle))),
+            peripherals,
+            pio: threaded_pio,
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            panic_info: Arc::new(std::sync::Mutex::new(None)),
+            initial_ppb,
+        });
+
+        Self {
+            shared,
+            core0: Some(core0),
+            core1: Some(core1),
+            pio_blocks: Some(pio_blocks),
+            step_quantum,
+            thread_mask: [0, 1, 2],
+            poisoned: false,
+            #[cfg(feature = "testing")]
+            pending_panic_inject: None,
+        }
+    }
+
+    /// Override the default host-core pinning mask. The supplied mask
+    /// maps worker index (0=core0, 1=core1, 2=coordinator) to host
+    /// logical-CPU id.
+    #[allow(dead_code)]
+    pub fn with_thread_mask(mut self, mask: [usize; 3]) -> Self {
+        self.thread_mask = mask;
+        self
+    }
+
+    /// Current shared master-cycle count. Lock-free `Acquire` load.
+    pub fn master_cycle(&self) -> u64 {
+        self.shared.master_cycle.load(Ordering::Acquire)
+    }
+
+    /// Cycle counter for core `idx` (0 or 1). Returns 0 while a
+    /// `run_quanta_checked` call is in flight (cores are `take`n into
+    /// worker threads).
+    pub fn core_cycles(&self, idx: u8) -> u64 {
+        match idx {
+            0 => self.core0.as_ref().map_or(0, |c| c.cycles()),
+            1 => self.core1.as_ref().map_or(0, |c| c.cycles()),
+            _ => panic!("ThreadedEmulator::core_cycles: idx must be 0 or 1"),
+        }
+    }
+
+    /// Borrow the `SharedState` for harness-side inspection (e.g. GPIO
+    /// pin reads, shared-memory peeks).
+    pub fn shared(&self) -> &Arc<SharedState> {
+        &self.shared
+    }
+
+    /// Test-only: arm a panic injection for the next `run_quanta_checked`
+    /// call. Panics the named worker on its first barrier entry.
+    #[cfg(feature = "testing")]
+    pub fn inject_panic_for_testing(&mut self, which: WorkerName) {
+        self.pending_panic_inject = Some(which);
+    }
+
+    /// Run `n` quanta and surface worker panics as structured
+    /// `Err((which, message))` instead of re-raising. On `Err`, the
+    /// instance is poisoned — drop it and rebuild.
+    pub fn run_quanta_checked(
+        &mut self,
+        n: u64,
+    ) -> Result<(), (WorkerName, String)> {
+        assert!(
+            !self.poisoned,
+            "ThreadedEmulator poisoned by prior worker panic; drop and rebuild"
+        );
+
+        let core0 = self.core0.take().expect("run_quanta reentry");
+        let core1 = self.core1.take().expect("run_quanta reentry");
+        let [block0, block1] = self
+            .pio_blocks
+            .take()
+            .expect("run_quanta reentry (pio_blocks)");
+
+        let barrier = Arc::new(SpinBarrier::new(3));
+        let shared = Arc::clone(&self.shared);
+        let step_q = self.step_quantum;
+        let mask = self.thread_mask;
+
+        // Test-only panic injection — each worker body checks a local
+        // `inject` flag captured at spawn time.
+        #[cfg(feature = "testing")]
+        let (inject_core0, inject_core1, inject_coord) = match self.pending_panic_inject.take() {
+            Some(WorkerName::Core0) => (true, false, false),
+            Some(WorkerName::Core1) => (false, true, false),
+            Some(WorkerName::Coord) => (false, false, true),
+            None => (false, false, false),
+        };
+        #[cfg(not(feature = "testing"))]
+        let (inject_core0, inject_core1, inject_coord) = (false, false, false);
+
+        let h0 = spawn_worker(mask[0], barrier.clone(), {
+            let s = Arc::clone(&shared);
+            move |b| core_worker_body(0, core0, s, b, n, step_q, inject_core0)
+        });
+        let h1 = spawn_worker(mask[1], barrier.clone(), {
+            let s = Arc::clone(&shared);
+            move |b| core_worker_body(1, core1, s, b, n, step_q, inject_core1)
+        });
+        let hc = spawn_worker(mask[2], barrier.clone(), {
+            let s = Arc::clone(&shared);
+            move |b| coordinator_worker_body(s, [block0, block1], b, n, step_q, inject_coord)
+        });
+
+        let r0 = h0.join();
+        let r1 = h1.join();
+        let rc = hc.join();
+
+        let msg0 = panic_message(r0.as_ref().err());
+        let msg1 = panic_message(r1.as_ref().err());
+        let msgc = panic_message(rc.as_ref().err());
+
+        let r0_err = r0.is_err();
+        let r1_err = r1.is_err();
+        let rc_err = rc.is_err();
+
+        // Restore owned state on the happy path.
+        if let Ok(c) = r0 {
+            self.core0 = Some(c);
+        }
+        if let Ok(c) = r1 {
+            self.core1 = Some(c);
+        }
+        if !rc_err {
+            if let Ok([b0, b1]) = rc {
+                self.pio_blocks = Some([b0, b1]);
+            }
+        } else {
+            // Coordinator panicked — drop the blocks (they're lost to
+            // the joined Err payload anyway). The poisoned flag below
+            // rejects further calls.
+            self.pio_blocks = None;
+        }
+
+        // First panicked worker wins attribution, scanning in worker-
+        // index order (core0, core1, coord).
+        let first_panic: Option<(WorkerName, String)> = [
+            (WorkerName::Core0, r0_err, msg0),
+            (WorkerName::Core1, r1_err, msg1),
+            (WorkerName::Coord, rc_err, msgc),
+        ]
+        .into_iter()
+        .find_map(|(name, err, msg)| if err { Some((name, msg)) } else { None });
+
+        if let Some((which, message)) = first_panic {
+            self.poisoned = true;
+            // Mirror into shared.panic_info so parallel reads see it.
+            match self.shared.panic_info.lock() {
+                Ok(mut guard) => {
+                    *guard = Some((which, message.clone()));
+                }
+                Err(_) => {
+                    // A prior panic already poisoned the mutex; the
+                    // structured attribution is lost for this round but
+                    // the sticky `self.poisoned` still rejects further
+                    // use. Log once at `error!` level so the mismatch
+                    // between a user-visible WorkerPanicked error and
+                    // an empty `shared.panic_info` is diagnosable.
+                    error!(
+                        which = which.as_str(),
+                        "panic_info mutex poisoned during panic handling — \
+                         structured attribution lost; emulator remains \
+                         sticky-poisoned"
+                    );
+                }
+            }
+            self.shared
+                .poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err((which, message));
+        }
+
+        Ok(())
+    }
+}
+
+// =======================================================================
+// Memory cloner — copies bytes out of serial Memory into SharedMemory.
+// =======================================================================
+
+/// Clone a serial `Bus`'s `memory` field into a fresh `SharedMemory`.
+/// ROM contents become the read-only byte slice; SRAM contents become
+/// atomic-word storage.
+fn clone_memory(bus: &Bus) -> SharedMemory {
+    let mut rom_bytes = vec![0u8; tmem::ROM_SIZE as usize];
+    for i in 0..tmem::ROM_SIZE {
+        rom_bytes[i as usize] = bus.memory.rom_read8(i);
+    }
+    let rom: Arc<[u8]> = rom_bytes.into();
+
+    let mut sram_words: Vec<std::sync::atomic::AtomicU32> =
+        Vec::with_capacity(tmem::SRAM_WORDS);
+    for i in 0..tmem::SRAM_WORDS {
+        let w = bus.memory.sram_read32((i as u32) * 4);
+        sram_words.push(std::sync::atomic::AtomicU32::new(w));
+    }
+    let sram: Arc<[std::sync::atomic::AtomicU32]> = sram_words.into();
+    SharedMemory::new(rom, sram)
+}
+
+// =======================================================================
+// Worker-thread plumbing
+// =======================================================================
+
+/// Extract a human-readable message from a `JoinHandle::join()` Err
+/// payload.
+fn panic_message(err: Option<&Box<dyn std::any::Any + Send>>) -> String {
+    match err {
+        Some(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+        None => String::new(),
+    }
+}
+
+/// Spawn a worker thread pinned to `host_core` running `body`. Catches
+/// panics from `body` and poisons the shared barrier before re-raising
+/// the panic so the remaining workers drop out of their spin loops.
+fn spawn_worker<F, R>(
+    host_core: usize,
+    barrier: Arc<SpinBarrier>,
+    body: F,
+) -> JoinHandle<R>
+where
+    F: FnOnce(Arc<SpinBarrier>) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    thread::spawn(move || {
+        pin_to_host_core(host_core);
+        let b_for_body = barrier.clone();
+        match std::panic::catch_unwind(AssertUnwindSafe(move || body(b_for_body))) {
+            Ok(r) => r,
+            Err(payload) => {
+                barrier.poison();
+                std::panic::resume_unwind(payload);
+            }
+        }
+    })
+}
+
+/// Pin the current thread to the supplied host logical-CPU id via
+/// `SetThreadAffinityMask`. Windows-only (the whole module is gated to
+/// Windows anyway).
+fn pin_to_host_core(host_core: usize) {
+    use winapi::um::processthreadsapi::GetCurrentThread;
+    use winapi::um::winbase::SetThreadAffinityMask;
+    assert!(
+        host_core < usize::BITS as usize,
+        "host_core {host_core} exceeds processor-mask bit width"
+    );
+    let h = unsafe { GetCurrentThread() };
+    let mask = 1usize << host_core;
+    let prev = unsafe { SetThreadAffinityMask(h, mask) };
+    assert!(
+        prev != 0,
+        "SetThreadAffinityMask failed for host core {host_core}"
+    );
+}
+
+// =======================================================================
+// Worker bodies
+// =======================================================================
+
+/// CPU-core worker. Owns a `CortexM0Plus` and drives `step` against a
+/// per-core `WorkerBus`.
+fn core_worker_body(
+    core_id: usize,
+    mut core: CortexM0Plus,
+    shared: Arc<SharedState>,
+    barrier: Arc<SpinBarrier>,
+    n: u64,
+    step_q: u32,
+    inject_panic: bool,
+) -> CortexM0Plus {
+    use super::WorkerBus;
+    let mut bus = WorkerBus::new(Arc::clone(&shared), core_id);
+    let mut target: u64 = core.cycles();
+
+    for quantum in 0..n {
+        // Test-only panic injection — panic on the first quantum so the
+        // attribution test sees a deterministic panic point.
+        if inject_panic && quantum == 0 {
+            if core_id == 0 {
+                panic!("core0 test panic");
+            } else {
+                panic!("core1 test panic");
+            }
+        }
+
+        // WFE wake: consume event_flag and clear wfe_waiting.
+        if shared.atomics.is_wfe_waiting(core_id)
+            && shared.atomics.event_flag_consume(core_id)
+        {
+            shared.atomics.clear_wfe_waiting(core_id);
+        }
+
+        // Drain cross-core IRQ pending bits into the local NVIC at the
+        // top of the quantum so peer-asserted IRQs (FIFO push,
+        // peripheral drive) become visible before the first step.
+        bus.drain_cross_core_irqs();
+
+        target = target.wrapping_add(step_q as u64);
+        if !shared.atomics.is_halted(core_id) {
+            while core.cycles() < target && !core.is_halted() {
+                core.step(&mut bus);
+                // Drain any mid-step cross-core IRQ arrivals so the
+                // next instruction observes them.
+                bus.drain_cross_core_irqs();
+                if shared.atomics.is_wfe_waiting(core_id) {
+                    break;
+                }
+            }
+        }
+
+        let result = barrier.wait();
+        if result == BarrierResult::Poisoned {
+            return core;
+        }
+    }
+    core
+}
+
+/// Coordinator worker. Owns the `PioBlock`s, drains CPU-queued PIO
+/// commands, steps the blocks, merges GPIO, and advances the shared
+/// master-cycle counter. Rendezvouses on the shared barrier at the tail
+/// of each quantum.
+fn coordinator_worker_body(
+    shared: Arc<SharedState>,
+    mut pio_blocks: [PioBlock; 2],
+    barrier: Arc<SpinBarrier>,
+    n: u64,
+    step_q: u32,
+    inject_panic: bool,
+) -> [PioBlock; 2] {
+    for quantum in 0..n {
+        if inject_panic && quantum == 0 {
+            panic!("coord test panic");
+        }
+
+        // 1. Drain per-block PIO commands and apply them.
+        for block_idx in 0..2 {
+            let commands = shared.pio.drain_commands(block_idx);
+            for cmd in commands {
+                apply_pio_command(&mut pio_blocks[block_idx], cmd);
+            }
+        }
+
+        // 2. Advance PIO state machines for `step_q` sysclocks. PIO sees
+        //    the latest merged GPIO pin state (initial value for quantum 0
+        //    comes from from_emulator's seed; subsequent quanta see the
+        //    previous quantum's merge result).
+        let gpio_snapshot = shared.gpio_out.load(Ordering::Acquire)
+            & shared.gpio_oe.load(Ordering::Acquire);
+        for block_idx in 0..2 {
+            if shared.pio.sm_enabled(block_idx) != 0 {
+                pio_blocks[block_idx].step_n(step_q, gpio_snapshot);
+            }
+            shared
+                .pio
+                .publish_sm_enabled(block_idx, pio_blocks[block_idx].sm_enabled_mask());
+        }
+
+        // 3. Merge SIO + PIO outputs into gpio_out / gpio_oe atomics so
+        //    worker-side GPIO_IN reads observe the post-merge state.
+        //    SIO output is already in `shared.gpio_out`; PIO pad_oe/
+        //    pad_out overrides it where a PIO block drives.
+        {
+            let sio_out = shared.gpio_out.load(Ordering::Acquire);
+            let sio_oe = shared.gpio_oe.load(Ordering::Acquire);
+            let mut merged_out = sio_out & sio_oe;
+            let mut merged_oe = sio_oe;
+            for block in &pio_blocks {
+                let pio_mask = block.pad_oe;
+                merged_out = (merged_out & !pio_mask) | (block.pad_out & pio_mask);
+                merged_oe |= pio_mask;
+            }
+            // Mask to 30 GPIO pins (RP2040 has 0..29).
+            merged_out &= 0x3FFF_FFFF;
+            merged_oe &= 0x3FFF_FFFF;
+            // Publish merged state back for worker SIO_GPIO_IN reads.
+            // We overwrite gpio_out/gpio_oe with the merged view so the
+            // WorkerBus SIO_GPIO_IN path (which uses `out & oe`) sees
+            // the correct merged pin state. SIO writes that come in
+            // during the next quantum stamp back onto these atomics.
+            shared.gpio_out.store(merged_out, Ordering::Release);
+            shared.gpio_oe.store(merged_oe, Ordering::Release);
+        }
+
+        // 4. Advance master_cycle by step_quantum. Release ordering
+        //    pairs with CPU workers' Acquire load on the next quantum.
+        let new_master = shared
+            .master_cycle
+            .fetch_add(step_q as u64, Ordering::Release)
+            .wrapping_add(step_q as u64);
+
+        // 5. Poll TIMER alarms against the freshly-advanced master
+        //    cycle and route any latched IRQs onto both cores'
+        //    cross-core pending mask (TIMER occupies NVIC lines 0..3,
+        //    shared across cores on RP2040 silicon).
+        //
+        //    Stage 3b.4 scope: TIMER only. Other peripherals with
+        //    per-cycle ticks (UART/SPI/I2C/ADC/PWM) remain un-advanced
+        //    on the threaded path — tech_debt.md covers the escape
+        //    for firmware that depends on them.
+        {
+            let sys_hz = {
+                let clocks = shared
+                    .peripherals
+                    .clocks
+                    .lock()
+                    .expect("clocks mutex poisoned");
+                clocks.clock_tree.sys_clk_hz
+            };
+            let nvic_bits = {
+                let mut timer = shared
+                    .peripherals
+                    .timer
+                    .lock()
+                    .expect("timer mutex poisoned");
+                timer.regs.poll_alarms(new_master, sys_hz) & 0xF
+            };
+            if nvic_bits != 0 {
+                shared.atomics.set_irq_pending(0, nvic_bits);
+                shared.atomics.set_irq_pending(1, nvic_bits);
+            }
+        }
+
+        let result = barrier.wait();
+        if result == BarrierResult::Poisoned {
+            return pio_blocks;
+        }
+    }
+    pio_blocks
+}
+
+/// Apply a CPU-queued `PioCommand` to the coordinator's owned PioBlock.
+fn apply_pio_command(block: &mut PioBlock, cmd: PioCommand) {
+    match cmd {
+        PioCommand::WriteCtrl { block: _, val, alias } => {
+            block.write32(0x000, val, alias as u32);
+        }
+        PioCommand::WriteInstrMem {
+            block: _,
+            addr,
+            value,
+            alias,
+        } => {
+            if addr < 32 {
+                let offset = 0x048 + (addr as u32) * 4;
+                block.write32(offset, value as u32, alias as u32);
+            }
+        }
+        PioCommand::SetClkDiv {
+            block: _,
+            sm,
+            int_div,
+            frac_div,
+            alias,
+        } => {
+            if sm < 4 {
+                // RP2040 SMn_CLKDIV: stride 0x18 starting at 0x0C8.
+                let offset = 0x0C8 + (sm as u32) * 0x18;
+                let val = ((int_div as u32) << 16) | ((frac_div as u32) << 8);
+                block.write32(offset, val, alias as u32);
+            }
+        }
+        PioCommand::WriteReg {
+            block: _,
+            offset,
+            val,
+            alias,
+        } => {
+            block.write32(offset as u32, val, alias as u32);
+        }
+    }
+}
+
+// =======================================================================
+// Tests
+// =======================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Config, EmulatorBuilder};
+
+    #[test]
+    fn from_emulator_builds_threaded() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        // master_cycle starts at 0 for a fresh Emulator.
+        assert_eq!(threaded.master_cycle(), 0);
+    }
+
+    #[test]
+    fn run_quanta_halted_cores_advances_master_cycle() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        // Both cores default halted (core 1) / soon halted (core 0).
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        let step_q = threaded.step_quantum as u64;
+        assert_eq!(threaded.master_cycle(), 0);
+
+        threaded
+            .run_quanta_checked(1)
+            .expect("run_quanta_checked(1)");
+        assert_eq!(threaded.master_cycle(), step_q);
+
+        threaded
+            .run_quanta_checked(5)
+            .expect("run_quanta_checked(5)");
+        assert_eq!(threaded.master_cycle(), 6 * step_q);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn run_quanta_core0_panic_surfaces() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.inject_panic_for_testing(WorkerName::Core0);
+
+        let result = threaded.run_quanta_checked(1);
+        match result {
+            Err((WorkerName::Core0, msg)) => {
+                assert!(msg.contains("core0"), "message should name core0: {msg}");
+            }
+            other => panic!("expected Err((Core0, _)), got {other:?}"),
+        }
+    }
+
+    /// Proof that the serial → threaded handoff carries
+    /// `Bus::external_gpio_in_override` and `external_gpio_in_mask`
+    /// forward. Without this transfer, harness pin injection
+    /// (e.g. `picogus_diff_rp2040`) vanishes at promotion.
+    #[test]
+    fn from_emulator_preserves_external_gpio_override() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        emu.bus.external_gpio_in_override = 0xA5A5_0000;
+        emu.bus.external_gpio_in_mask = 0xFFFF_0000;
+        // Halt both cores so `run_quanta_checked` terminates cleanly
+        // without running instructions (no program loaded).
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        assert_eq!(
+            threaded
+                .shared
+                .external_gpio_in_mask
+                .load(Ordering::Acquire),
+            0xFFFF_0000
+        );
+        assert_eq!(
+            threaded
+                .shared
+                .external_gpio_in_override
+                .load(Ordering::Acquire),
+            0xA5A5_0000
+        );
+
+        // Run one quantum — both cores halted, coordinator merges GPIO.
+        threaded
+            .run_quanta_checked(1)
+            .expect("run_quanta_checked(1)");
+
+        // Read GPIO_IN through a fresh WorkerBus and confirm the
+        // override bits win over the SIO merge (which is all zeros in
+        // this fresh emulator).
+        use crate::core::bus_trait::CoreBus;
+        use crate::threaded::WorkerBus;
+        let mut probe = WorkerBus::new(Arc::clone(&threaded.shared), 0);
+        let gpio_in = probe.read32(0xD000_0004);
+        assert_eq!(
+            gpio_in & 0xFFFF_0000,
+            0xA5A5_0000,
+            "external override must survive from_emulator + one quantum"
+        );
+    }
+}

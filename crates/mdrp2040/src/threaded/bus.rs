@@ -114,12 +114,22 @@ pub struct WorkerBus {
 impl WorkerBus {
     /// Construct a new `WorkerBus` for `core_id` with the given
     /// [`SharedState`] bundle.
+    ///
+    /// Seeds this worker's PPB slot from
+    /// [`SharedState::take_initial_ppb`] so pre-run pokes to VTOR,
+    /// ICSR (PENDSV/PENDST), and SHPR priorities are carried through
+    /// the serial → threaded handoff. The peer core's slot is left at
+    /// the default (never read by this worker — `ppb[peer]` is an
+    /// inert placeholder kept for indexing parity with the serial
+    /// `Bus`).
     pub fn new(shared: Arc<SharedState>, core_id: usize) -> Self {
         debug_assert!(core_id < 2, "core_id must be 0 or 1");
+        let mut ppb = [Ppb::new(), Ppb::new()];
+        ppb[core_id] = shared.take_initial_ppb(core_id);
         Self {
             core_id,
             shared,
-            ppb: [Ppb::new(), Ppb::new()],
+            ppb,
             nvic: [Nvic::new(), Nvic::new()],
             bus_fault: false,
             bus_fault_addr: 0,
@@ -211,15 +221,23 @@ impl WorkerBus {
         match offset {
             // CPUID returns this core's id.
             0x000 => self.core_id as u32,
-            // GPIO_IN: the coordinator merges SIO + PIO outputs; Stage
-            // 3b.3 has no coordinator wired yet, so we expose
-            // `gpio_out & gpio_oe` as an approximation (output pins
-            // drive back to the input on real silicon when pads loop
-            // through). Stage 3b.4 replaces this with the coordinator
-            // snapshot.
+            // GPIO_IN: the coordinator merges SIO + PIO outputs into
+            // `gpio_out`/`gpio_oe` each quantum. We compute the effective
+            // pin view as `out & oe` then apply the external-GPIO
+            // override mask so harness pokes to
+            // `Bus::external_gpio_in_override` (e.g. PicoGUS ISA
+            // waveforms) survive the merge — parity with the serial
+            // `Emulator::update_gpio` final override step.
             0x004 => {
-                self.shared.gpio_out.load(Ordering::Acquire)
-                    & self.shared.gpio_oe.load(Ordering::Acquire)
+                let merged = self.shared.gpio_out.load(Ordering::Acquire)
+                    & self.shared.gpio_oe.load(Ordering::Acquire);
+                let ext_mask = self.shared.external_gpio_in_mask.load(Ordering::Acquire);
+                if ext_mask == 0 {
+                    merged
+                } else {
+                    let ext_val = self.shared.external_gpio_in_override.load(Ordering::Acquire);
+                    (merged & !ext_mask) | (ext_val & ext_mask)
+                }
             }
             // GPIO_OUT / SET / CLR / XOR all read the same register.
             0x010 | 0x014 | 0x018 | 0x01C => self.shared.gpio_out.load(Ordering::Acquire),

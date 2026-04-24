@@ -15,17 +15,17 @@
 
 pub mod atomics;
 pub mod bus;
+pub mod emulator;
 pub mod memory;
 pub mod peripherals;
 pub mod pio;
 pub mod shared;
 
-// Stage 3b.4 will add emulator.rs (runtime).
-
 pub use mdpicoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
 
 pub use atomics::CoreAtomics;
 pub use bus::WorkerBus;
+pub use emulator::ThreadedEmulator;
 pub use memory::SharedMemory;
 pub use peripherals::{ClocksState, IoState, Peripherals, ResetsState, TimerState};
 pub use pio::{PioCommand, ThreadedPio};

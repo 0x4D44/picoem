@@ -844,7 +844,7 @@ fn run_one_scenario(
 
     // ---- EMU side ----------------------------------------------------
 
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
     emu.core_mut(1).halt();
     emu.bus.set_active_core(0);
 
@@ -889,7 +889,7 @@ fn run_one_scenario(
     // so the EMU side has at least as many cycles to dispatch as HW.
     let cycles_per_ms = (Config::default().sys_clk_hz as u64) / 1000;
     let budget_cycles = (sc.max_millis as u64).saturating_mul(cycles_per_ms);
-    emu.run(budget_cycles);
+    emu.run(budget_cycles).expect("Serial run is infallible");
     emu.core_mut(0).halt();
     emu.bus.set_active_core(0);
 

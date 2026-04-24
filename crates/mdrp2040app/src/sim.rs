@@ -49,7 +49,7 @@ pub fn run(
 
     while !shutdown.load(Ordering::Relaxed) {
         pacer.begin_quantum();
-        emu.run(qc);
+        let _ = emu.run(qc); // Serial-mode app: infallible
         pacer.end_quantum();
 
         // Follow firmware clock reconfiguration (PLL bring-up, mux

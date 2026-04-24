@@ -467,7 +467,7 @@ impl IsaSink for Emulator {
         if cycles == 0 {
             return;
         }
-        self.run(cycles as u64);
+        self.run(cycles as u64).expect("Serial run is infallible");
     }
 
     #[inline]
@@ -1589,7 +1589,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         builder = builder.flash(flash_bytes);
     }
-    let mut emu = builder.build();
+    let mut emu = builder.build().expect("Serial build is infallible");
 
     // PSRAM pre-seed (diagnostic): fill the entire 8 MB buffer with a
     // triangle-wave pattern so voices reading at arbitrary DRAM
@@ -1686,7 +1686,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let old_q = emu.step_quantum;
         emu.step_quantum = 64;
         for i in 0..200_000u64 {
-            if emu.step() == 0 { break; }
+            if emu.step().expect("Serial step is infallible") == 0 { break; }
             // Poll the UART every 256 iterations so early-boot puts()
             // are visible interleaved with the warm-up timeline.
             if i & 0xff == 0 {

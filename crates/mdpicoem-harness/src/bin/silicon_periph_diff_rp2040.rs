@@ -528,7 +528,7 @@ fn run_scenario(
 
     // Emulator side — fresh builder per scenario so PRIMASK/CONTROL/
     // pending-fault state cannot leak between cases.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
     emu.core_mut(1).halt();
     for &(addr, val) in sc.setup {
         emu.mmio_write32(addr, val);
@@ -552,7 +552,7 @@ fn run_scenario(
         while emu.core(0).regs.pc() != bkpt_pc
             && emu.cycles().saturating_sub(start) < budget
         {
-            emu.step();
+            emu.step().expect("Serial step is infallible");
         }
         let overshot = emu.core(0).regs.pc() != bkpt_pc;
         if overshot && verbose {
@@ -570,7 +570,7 @@ fn run_scenario(
         // Default path: halt cores, advance bus/peripheral state by the
         // HW-measured window so both sides see the same cycle count.
         emu.core_mut(0).halt();
-        emu.run(window_sysclks as u64);
+        emu.run(window_sysclks as u64).expect("Serial run is infallible");
     }
 
     let emu_obs: Vec<u32> =
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn assemble_sled_converges_to_bkpt() {
         let sled = assemble_sled(40); // N = ceil(40/4) = 10 iterations
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
         emu.core_mut(1).halt();
         emu.load_image(SILICON_RUN_SLED, &sled);
         {
@@ -979,7 +979,7 @@ mod tests {
         let start = emu.cycles();
         while emu.core(0).regs.pc() != bkpt_pc && emu.cycles().saturating_sub(start) < budget
         {
-            emu.step();
+            emu.step().expect("Serial step is infallible");
         }
         assert_eq!(
             emu.core(0).regs.pc(),

@@ -4,18 +4,26 @@ Items discovered during development that need addressing in later phases.
 
 ## Emulator direct-field access is Serial-only but not type-enforced (2026-04-24)
 
-**Current state:** `mdrp2350::Emulator` exposes `pub cores: Cores`,
-`pub bus: Bus`, and `pub clock: Clock`. After a Threaded run
-(`run_quantum` / `run` on an `ExecutionModel::Threaded` builder), the
-dual-execution HLD V1 Stage 1b `promote_to_threaded` path moves the
-live state into `self.threaded` and replaces the flat fields with
-zero-cost placeholders. A `pub(crate) bus_is_placeholder` flag plus
-`Self::assert_not_placeholder()` debug_asserts on the typed accessors
-(`core`, `core_mut`, `core_riscv`, `core_riscv_mut`, `core_counters`,
-`reset_counters`, `gpio_read`, `gpio_read_all`, `peek`, `poke`,
-`cycles`, `mmio_write32`, `mmio_read32`) fire a clear panic when a
-caller reaches through a guarded API in debug builds. Release builds
-elide the assertion entirely.
+**Current state:** `mdrp2350::Emulator` and `mdrp2040::Emulator`
+expose `pub cores`, `pub bus: Bus`, and (on mdrp2350) `pub clock:
+Clock`. After a Threaded run (`run_quantum` / `run` on an
+`ExecutionModel::Threaded` builder), the dual-execution HLD V1 Stage
+1b / 3b.4 `promote_to_threaded` path moves the live state into
+`self.threaded` and replaces the flat fields with zero-cost
+placeholders. A `pub(crate) bus_is_placeholder` flag plus
+`Self::assert_not_placeholder()` debug_asserts fire a clear panic
+when a caller reaches through a guarded API in debug builds. Release
+builds elide the assertion entirely.
+
+Guarded accessors (Stage 3b.4 added the mutators):
+
+- Read-side (both crates): `core`, `core_mut`, `peek`, `gpio_read`,
+  `gpio_read_all`, `cycles`, `mmio_read32` (+ mdrp2350-only:
+  `core_riscv`, `core_riscv_mut`, `core_counters`, `reset_counters`).
+- Write-side / construction-time (mdrp2040): `reset`, `load_image`,
+  `load_bootrom`, `load_flash`, `direct_boot_from_flash`,
+  `gpio_write`, `halt_core1`, `wake_core1`, `drain_uart0_tx_log`,
+  `mmio_write32`, `poke`.
 
 **Known escape:** raw field access — `emu.bus.sio.gpio_out`,
 `emu.cores[0].regs.r[0] = 42`, `emu.clock.cycles` — bypasses the
@@ -39,6 +47,53 @@ direct `.bus.` / `.cores[` / `.clock.` reaches.
 
 **Status:** guards in place; wider migration deferred to a future
 stage of the dual-execution rollout.
+
+## Stage 3b.4: RP2040 Threaded — PSRAM MISO not modelled (2026-04-24)
+
+`mdrp2040::threaded::emulator::ThreadedEmulator::from_emulator` emits
+a `tracing::warn!` when the source `Bus::psram` is attached and drops
+the device. The threaded coordinator has no sub-quantum SPI edge
+model — SIO / PIO writes publish their merged pad state to
+`shared.gpio_out`/`gpio_oe` at the end of each quantum, so a PSRAM
+device driven by PIO-toggled SCK would see only the quantum-end pin
+snapshot. That is always wrong for PSRAM reads (MISO feedback into
+GPIO0 would miss every SCK rising edge inside the quantum).
+
+**Mitigation:** harnesses using PSRAM — notably `picogus_diff_rp2040`
+— must build with `ExecutionModel::Serial`. The Serial path still
+exercises the per-cycle `update_gpio` interleave that feeds every
+pin edge to the PSRAM.
+
+**Fix (Stage 4+):** either model PSRAM as a coordinator-resident
+device ticked per cycle inside the merge loop, or split the PSRAM
+timing onto a dedicated worker with its own quantum cadence. Both
+options need dual-model oracle coverage because the current Serial
+behaviour is the ground truth.
+
+## Stage 3b.4: RP2040 Threaded — coordinator peripheral ticks limited to TIMER (2026-04-24)
+
+`mdrp2040::threaded::emulator::coordinator_worker_body` polls
+`TimerRegs::poll_alarms` each quantum and routes bits 0..3 onto
+`CoreAtomics.irq_pending` for both cores. Other peripherals with
+per-cycle tick methods — UART0/UART1, SPI0/SPI1, I2C0/I2C1, ADC,
+PWM, DMA — are **not** advanced on the threaded path. Their state
+lives in `SharedState.peripherals.legacy` (HashMap) from Stage 3b.3
+and is only read/written through MMIO. Firmware that depends on
+TX shift-register drains (UART flush IRQs), ADC conversion timing,
+PWM wrap IRQs, or DMA transfer completion will diverge between
+models.
+
+**Mitigation:** Stage 4 dual-model tests that hit those peripherals
+should run Serial-only until the corresponding advance path lands.
+Firmware-level harnesses (`paced_bench_rp2040`, overnight fuzz)
+should pick `--model serial` for peripheral-heavy workloads.
+
+**Fix (Stage 4):** promote each typed peripheral into
+`SharedState.peripherals.<name>: Mutex<..State>` (mirroring the
+existing TIMER) and tick them in the coordinator loop. Audit each
+peripheral's `tick` method for Send-safety under Mutex first — some
+reach back into the Bus for IRQ OR-in; that coupling must be
+factored out before the threaded wiring is safe.
 
 ## Vendored probe-rs fork for issue #3872 (Track A workaround)
 

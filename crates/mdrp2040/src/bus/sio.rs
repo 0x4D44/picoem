@@ -176,6 +176,36 @@ impl Sio {
         self.handshake.pending_launch.take()
     }
 
+    /// Non-consuming snapshot of the core-0 → core-1 FIFO contents in
+    /// head → tail order. Used by `threaded::ThreadedEmulator::
+    /// from_emulator` to copy serial inter-core FIFO state into the
+    /// threaded SPSC rings without mutating the source.
+    pub fn fifo_0to1_snapshot(&self) -> Vec<u32> {
+        self.fifo_to_core1.snapshot()
+    }
+
+    /// Non-consuming snapshot of the core-1 → core-0 FIFO contents in
+    /// head → tail order. Counterpart to [`Self::fifo_0to1_snapshot`].
+    pub fn fifo_1to0_snapshot(&self) -> Vec<u32> {
+        self.fifo_to_core0.snapshot()
+    }
+
+    /// Read FIFO_ST.WOF (write-on-full sticky) for the given core.
+    pub fn fifo_wof(&self, core: usize) -> bool {
+        self.fifo_wof[core]
+    }
+
+    /// Read FIFO_ST.ROE (read-on-empty sticky) for the given core.
+    pub fn fifo_roe(&self, core: usize) -> bool {
+        self.fifo_roe[core]
+    }
+
+    /// Read the current 32-bit spinlock claim bitmask. Bit N = 1 iff
+    /// SPINLOCK<N> is currently held.
+    pub fn spinlock_bits(&self) -> u32 {
+        self.spinlock_bits
+    }
+
     /// 32-bit register read. `offset` is masked to 12 bits by Bus. GPIO_IN
     /// (0x004) is handled on Bus before this is called (merges SIO output
     /// with PIO output — Phase 5.B wires PIO in).

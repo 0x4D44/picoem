@@ -42,7 +42,7 @@ fn main() {
     let mut emu = EmulatorBuilder::new(Config { sys_clk_hz: 125_000_000 })
         .flash(flash_bytes)
         .step_quantum(64)
-        .build();
+        .build().expect("Serial build is infallible");
     emu.load_bootrom(&bootrom_bytes);
     emu.reset();
     emu.direct_boot_from_flash(0x100);
@@ -58,7 +58,7 @@ fn main() {
     // to return 0 (success) immediately so we can debug downstream init.
     emu.step_quantum = 64;
     for _ in 0..200_000u64 {
-        if emu.step() == 0 { break; }
+        if emu.step().expect("Serial step is infallible") == 0 { break; }
     }
     // Patch: MOVS R0, #0 (0x2000) + BX LR (0x4770) at test_psram entry
     emu.bus.write32(0x2001_2FA4, 0x4770_2000);
@@ -95,7 +95,7 @@ fn main() {
         let before_lr = emu.cores[0].regs.lr();
         let before_sp = emu.cores[0].regs.sp();
         let r = emu.cores[0].regs.r;
-        let consumed = emu.step();
+        let consumed = emu.step().expect("Serial step is infallible");
         let after_pc = emu.cores[0].regs.pc();
         let after_lr = emu.cores[0].regs.lr();
         // BL/BLX detection: LR changed AND new LR points just past the
@@ -190,7 +190,7 @@ fn main() {
     let mut last_pc = 0u32;
     let mut same_pc_count = 0u64;
     while steps < total_steps {
-        let consumed = emu.step();
+        let consumed = emu.step().expect("Serial step is infallible");
         if consumed == 0 {
             eprintln!(
                 "HALTED at step {steps}, cycles={}, core0 pc={:#010x} halted={} core1 halted={}",

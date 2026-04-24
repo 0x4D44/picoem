@@ -41,7 +41,7 @@ fn assemble_gpio_blink() -> Vec<u8> {
 fn gpio_blink_program_drives_pin0_high() {
     // Use step_quantum=1 so each step advances by one instruction —
     // the loop count below counts instructions, not quanta.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
     let prog = assemble_gpio_blink();
     let load_addr = 0x2000_0000u32;
     emu.load_image(load_addr, &prog);
@@ -56,7 +56,7 @@ fn gpio_blink_program_drives_pin0_high() {
     // Run a handful of instructions — the program hits its B . self-loop
     // after 4 instructions (MOVS, LDR, STR, STR, then B).
     for _ in 0..16 {
-        emu.step();
+        emu.step().expect("Serial step is infallible");
     }
 
     // Confirm GPIO_OUT bit 0 is set via the raw SIO register.
@@ -97,7 +97,7 @@ fn core1_stays_halted_until_fifo_wake() {
     // handshake does.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
     assert!(emu.cores[1].is_halted(), "core 1 should be halted at boot");
 
     // Pre-seed core 0 with a NOP so step() never faults during the probe.
@@ -112,7 +112,7 @@ fn core1_stays_halted_until_fifo_wake() {
     // resets seq to 0 and echoes a 0, BUT does not produce a launch.
     emu.bus.set_active_core(0);
     emu.bus.write32(SIO_BASE + 0x054, 0xAA);
-    emu.step();
+    emu.step().expect("Serial step is infallible");
     assert!(
         emu.cores[1].is_halted(),
         "single non-zero push must not wake core 1 — placeholder semantics gone"
@@ -135,7 +135,7 @@ fn core1_stays_halted_until_fifo_wake() {
     // instruction in the same quantum, PC stays pinned to entry for
     // the asserts below.
     emu.bus.write16(ENTRY & !1, 0xE7FE);
-    emu.step();
+    emu.step().expect("Serial step is infallible");
     assert!(
         !emu.cores[1].is_halted(),
         "full 6-word handshake must wake core 1"
@@ -183,7 +183,7 @@ fn emulator_builder_flash_seeds_xip() {
     // before `build()`, matching the stage-1 CLI pattern
     // `--flash <blinky.bin>`.
     let flash = vec![0xDE, 0xAD, 0xBE, 0xEF];
-    let emu = EmulatorBuilder::new(Config::default()).flash(flash).build();
+    let emu = EmulatorBuilder::new(Config::default()).flash(flash).build().expect("Serial build is infallible");
     // Builder seeds before reset; bus peek observes the bytes directly.
     assert_eq!(emu.bus.peek32(0x1000_0000), 0xEFBEADDE);
 }
@@ -232,7 +232,7 @@ fn adc_init_sdk_pattern_exits_ready_poll() {
     const RESETS_BASE: u32 = 0x4000_C000;
     const RESETS_CLR_ALIAS: u32 = 0x3000;
 
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
     let prog = assemble_adc_init_poll();
     let load_addr = 0x2000_0000u32;
     emu.load_image(load_addr, &prog);
@@ -246,7 +246,7 @@ fn adc_init_sdk_pattern_exits_ready_poll() {
     emu.cores[0].regs.xpsr = 1 << 24; // Thumb bit
 
     for _ in 0..64 {
-        emu.step();
+        emu.step().expect("Serial step is infallible");
     }
 
     assert_eq!(

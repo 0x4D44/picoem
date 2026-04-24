@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use mdpicoem_common::threaded::SpscQueue;
 
 use crate::WorkerName;
+use crate::bus::ppb::Ppb;
 use crate::threaded::{CoreAtomics, Peripherals, SharedMemory, ThreadedPio};
 
 /// Arc-bundled shared state handed to every worker in the threaded
@@ -52,6 +53,17 @@ pub struct SharedState {
     /// GPIO output-enable state (low 30 bits). Same ownership pattern
     /// as `gpio_out`.
     pub gpio_oe: Arc<AtomicU32>,
+    /// External GPIO input override value, mirrors
+    /// `Bus::external_gpio_in_override`. Bits set in
+    /// [`Self::external_gpio_in_mask`] take their value from this field
+    /// in the coordinator's post-merge GPIO_IN snapshot. Harness drivers
+    /// (e.g. `picogus_diff_rp2040`) store here to inject synthetic ISA
+    /// bus waveforms.
+    pub external_gpio_in_override: Arc<AtomicU32>,
+    /// Mask of GPIO input bits driven externally, mirrors
+    /// `Bus::external_gpio_in_mask`. Zero means the SIO + PIO merge
+    /// drives every pin.
+    pub external_gpio_in_mask: Arc<AtomicU32>,
     /// Monotonic master-cycle counter published by the coordinator and
     /// read lock-free by the CPU workers (PLL LOCK timing, TIMER match,
     /// etc.).
@@ -71,6 +83,14 @@ pub struct SharedState {
     /// is written on the cold panic path, read once by the coordinator
     /// at join time.
     pub panic_info: Arc<Mutex<Option<(WorkerName, String)>>>,
+    /// Initial per-core PPB state carried from `from_emulator` into the
+    /// CPU workers' `WorkerBus`. Seeded once under the mutex by
+    /// `from_emulator`; each core worker calls
+    /// [`Self::take_initial_ppb`] on its first quantum entry to consume
+    /// its slot. Wrapped in a `Mutex<Option<...>>` to avoid widening the
+    /// `spawn_worker` signature while still preserving pre-run pokes
+    /// (VTOR, NVIC pending/enable via ICSR, SHPR priorities).
+    pub initial_ppb: Arc<Mutex<Option<[Ppb; 2]>>>,
 }
 
 impl SharedState {
@@ -93,11 +113,31 @@ impl SharedState {
             spinlocks: Arc::new(spinlocks_array),
             gpio_out: Arc::new(AtomicU32::new(0)),
             gpio_oe: Arc::new(AtomicU32::new(0)),
+            external_gpio_in_override: Arc::new(AtomicU32::new(0)),
+            external_gpio_in_mask: Arc::new(AtomicU32::new(0)),
             master_cycle: Arc::new(AtomicU64::new(0)),
             peripherals: Arc::new(Peripherals::new_default()),
             pio: Arc::new(ThreadedPio::new()),
             poisoned: Arc::new(AtomicBool::new(false)),
             panic_info: Arc::new(Mutex::new(None)),
+            initial_ppb: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Take a clone of the initial per-core PPB seed for `core_id`.
+    /// Returns [`Ppb::new()`] if no seed was populated. The slot is
+    /// populated by [`crate::threaded::ThreadedEmulator::from_emulator`]
+    /// when the serial `Bus` carries non-default PPB state (VTOR,
+    /// NVIC enable/pending via ICSR, SHPR priorities). Both workers
+    /// may call this on their first quantum entry — the snapshot is
+    /// shared (cheap `Clone`) and only cleared after both cores have
+    /// read their slot by the caller choosing to `*guard = None`.
+    pub fn take_initial_ppb(&self, core_id: usize) -> Ppb {
+        debug_assert!(core_id < 2);
+        let guard = self.initial_ppb.lock().expect("initial_ppb poisoned");
+        match &*guard {
+            Some(pair) => pair[core_id].clone(),
+            None => Ppb::new(),
         }
     }
 }

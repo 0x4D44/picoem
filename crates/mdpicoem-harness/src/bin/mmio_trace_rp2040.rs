@@ -194,7 +194,7 @@ fn run() -> Result<(), String> {
     })
     .step_quantum(1)
     .flash(flash_bytes)
-    .build();
+    .build().expect("Serial build is infallible");
 
     // Load a bootrom if we can find one — SDK-style images need it to
     // resolve `rom_func_lookup` at runtime. Missing bootrom is only fatal
@@ -244,7 +244,7 @@ fn run() -> Result<(), String> {
         args.cycles
     );
     emu.bus.mmio_trace_enabled = true;
-    let ran = emu.run(args.cycles);
+    let ran = emu.run(args.cycles).expect("Serial run is infallible");
     emu.bus.mmio_trace_enabled = false;
     eprintln!("mmio_trace_rp2040: ran {} cycles (requested {})", ran, args.cycles);
 

@@ -195,6 +195,15 @@ pub const DEFAULT_STEP_QUANTUM: u32 = 64;
 
 /// Top-level RP2040 emulator. Owns dual Cortex-M0+ cores, bus fabric,
 /// memory, and clock.
+///
+/// Dual-execution HLD V1: an `Emulator` has a fixed [`ExecutionModel`]
+/// picked at construction time via [`EmulatorBuilder::execution`]. In
+/// Serial mode (default) the `cores` / `bus` / `clock` fields are the
+/// authoritative state and the existing per-instruction interleave
+/// applies. In Threaded mode those fields retain their post-seed
+/// snapshot until the first `run_quantum` promotes them into the
+/// threaded runtime; afterwards the flat fields are zero-cost
+/// placeholders and typed accessors fire a debug-assert if touched.
 pub struct Emulator {
     pub cores: [CortexM0Plus; 2],
     pub bus: Bus,
@@ -224,13 +233,88 @@ pub struct Emulator {
     /// [`Self::tick_pio_and_route_irqs_single`] to decide whether the
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
-    pio0_sm0_last_pc: u8,
+    pub(crate) pio0_sm0_last_pc: u8,
+    /// Execution model chosen at build time; cannot change
+    /// post-construction. Dispatch for [`Self::step`] / [`Self::run`] /
+    /// [`Self::run_quantum`] branches on this. Defaults to
+    /// [`ExecutionModel::Serial`].
+    pub execution_model: ExecutionModel,
+    /// Live 3-thread runtime when `execution_model == Threaded` and the
+    /// first `run` / `run_quantum` has fired. Takes ownership of the
+    /// pre-seeded cores / bus / clock during lazy `promote_to_threaded`.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    pub(crate) threaded: Option<threaded::ThreadedEmulator>,
+    /// Sticky panic record from a Threaded worker. Set once when
+    /// `run_quantum` / `run` observes a worker panic; every subsequent
+    /// call returns this cached error without re-attempting workers.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    pub(crate) panic_info: Option<(WorkerName, String)>,
+    /// Test-only panic injector. Armed via
+    /// [`Self::inject_panic_for_testing`]; consumed on the next
+    /// `run_quantum` / `run` call which forwards to
+    /// [`threaded::ThreadedEmulator::inject_panic_for_testing`].
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        target_os = "windows"
+    ))]
+    pub(crate) pending_panic_inject: Option<WorkerName>,
+    /// `true` once `promote_to_threaded` has moved the seeded state
+    /// into `self.threaded` — the flat `cores` / `bus` / `clock` fields
+    /// now hold zero-cost placeholders. Typed accessors
+    /// (`core`, `core_mut`, `peek`, `gpio_read`, …) `debug_assert!` on
+    /// this flag so Serial-only callers trip loudly if they reach for
+    /// the flat fields after a Threaded run.
+    ///
+    /// Known escape: raw field access (`emu.bus.*`) bypasses the
+    /// guarded accessors — documented in `tech_debt.md`.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    pub(crate) bus_is_placeholder: bool,
 }
 
 impl Emulator {
-    /// Create a new emulator with the given configuration.
+    /// Create a new Serial-mode emulator with the given configuration.
+    /// Infallible shim: Serial builds always succeed. For Threaded
+    /// construction or to surface `ConfigError` explicitly, use
+    /// [`EmulatorBuilder`] directly.
     pub fn new(config: Config) -> Self {
-        EmulatorBuilder::new(config).build()
+        EmulatorBuilder::new(config)
+            .build()
+            .expect("Serial build is infallible")
+    }
+
+    /// Currently selected execution model. Set at build time; does not
+    /// change post-construction.
+    pub fn execution_model(&self) -> ExecutionModel {
+        self.execution_model
+    }
+
+    /// Cycle counter for core `idx` (0 or 1). Serial reads directly
+    /// from the flat `cores[idx]`; Threaded reads the worker-thread
+    /// snapshot (valid between `run_quantum` calls). Returns 0 on
+    /// Threaded before the first `run_quantum` (cores not yet taken).
+    pub fn core_cycles(&self, idx: u8) -> u64 {
+        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        if let Some(t) = &self.threaded {
+            return t.core_cycles(idx);
+        }
+        self.cores[idx as usize].cycles()
+    }
+
+    /// Placeholder-guard message shared by the typed accessors below.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    const PLACEHOLDER_GUARD_MSG: &'static str =
+        "direct field access on cores/bus/clock is Serial-only; emulator is in \
+         Threaded mode — use typed accessors like core_cycles(), master_cycle(), \
+         gpio_read() instead";
+
+    /// Debug-only placeholder assertion. No-op on non-threading
+    /// platforms and in release builds.
+    #[inline(always)]
+    fn assert_not_placeholder(&self) {
+        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        debug_assert!(!self.bus_is_placeholder, "{}", Self::PLACEHOLDER_GUARD_MSG);
     }
 
     /// Reset the emulator:
@@ -240,6 +324,7 @@ impl Emulator {
     ///   wake sequence through the SIO FIFO; `step` calls
     ///   [`Self::wake_checks`] each quantum to observe the handshake.
     pub fn reset(&mut self) {
+        self.assert_not_placeholder();
         let initial_sp = self.bus.memory.rom_read32(0);
         let reset_vector = self.bus.memory.rom_read32(4);
 
@@ -313,6 +398,7 @@ impl Emulator {
     /// (test seeding path); SRAM writes land in the SRAM backing store;
     /// XIP loads use [`Self::load_flash`].
     pub fn load_image(&mut self, addr: u32, data: &[u8]) {
+        self.assert_not_placeholder();
         match addr >> 28 {
             0x0 => {
                 // ROM: bootrom-style loads happen via `load_bootrom`.
@@ -343,11 +429,13 @@ impl Emulator {
 
     /// Load the 16 KB RP2040 bootrom at address `0x0000_0000`.
     pub fn load_bootrom(&mut self, data: &[u8]) {
+        self.assert_not_placeholder();
         self.bus.load_bootrom(data);
     }
 
     /// Load an XIP flash image (appears at XIP address `0x1000_0000`).
     pub fn load_flash(&mut self, data: &[u8]) {
+        self.assert_not_placeholder();
         self.bus.load_flash(data);
     }
 
@@ -382,6 +470,7 @@ impl Emulator {
     /// `rom_data_lookup`). Call **after** `load_bootrom` + `load_flash`
     /// + `reset`.
     pub fn direct_boot_from_flash(&mut self, vtor_offset: u32) {
+        self.assert_not_placeholder();
         let sp = self.bus.memory.xip_read32(vtor_offset);
         let pc = self.bus.memory.xip_read32(vtor_offset + 4) & !1;
         let vtor_addr = bus::XIP_FLASH_BASE + vtor_offset;
@@ -443,7 +532,23 @@ impl Emulator {
     /// Differs from `mdrp2350::Emulator::step`'s quantum-end peripheral
     /// tick — mdrp2040 has the external PSRAM which is sensitive to
     /// sub-quantum edge timing; mdrp2350 has no equivalent peripheral.
-    pub fn step(&mut self) -> u64 {
+    pub fn step(&mut self) -> Result<u64, EmulatorError> {
+        if self.execution_model == ExecutionModel::Threaded {
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            if let Some((which, message)) = &self.panic_info {
+                return Err(EmulatorError::WorkerPanicked {
+                    which: *which,
+                    message: message.clone(),
+                });
+            }
+            return Err(EmulatorError::NotSupportedInThreadedMode);
+        }
+        Ok(self.step_serial())
+    }
+
+    /// Serial-mode single-quantum step. Shared by [`Self::step`] and
+    /// [`Self::run_quantum`] on the Serial path.
+    fn step_serial(&mut self) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
         // Refresh the Bus's view of the master cycle count so any MMIO
         // reads / writes performed during this quantum (notably PLL CS
@@ -613,15 +718,160 @@ impl Emulator {
     /// cycles actually executed. May overshoot by up to `step_quantum - 1`
     /// cycles (one quantum's worth), matching the documented overshoot
     /// behaviour of [`Self::step`].
-    pub fn run(&mut self, cycles: u64) -> u64 {
-        let start = self.clock.cycles;
-        while self.clock.cycles.wrapping_sub(start) < cycles {
-            let consumed = self.step();
-            if consumed == 0 {
-                break;
+    ///
+    /// Dispatches to the selected [`ExecutionModel`]. In Threaded mode
+    /// this rounds up to the nearest quantum boundary (HLD V1 §5.4)
+    /// and returns `Err(EmulatorError::WorkerPanicked)` sticky on
+    /// worker panic.
+    pub fn run(&mut self, cycles: u64) -> Result<u64, EmulatorError> {
+        if self.execution_model == ExecutionModel::Serial {
+            let start = self.clock.cycles;
+            while self.clock.cycles.wrapping_sub(start) < cycles {
+                let consumed = self.step_serial();
+                if consumed == 0 {
+                    break;
+                }
+            }
+            return Ok(self.clock.cycles.wrapping_sub(start));
+        }
+        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        {
+            if let Some((which, message)) = &self.panic_info {
+                return Err(EmulatorError::WorkerPanicked {
+                    which: *which,
+                    message: message.clone(),
+                });
+            }
+            if self.threaded.is_none() {
+                self.promote_to_threaded();
+            }
+            self.apply_pending_panic_inject();
+            let step_q = self.step_quantum as u64;
+            let quanta = cycles.div_ceil(step_q.max(1));
+            let threaded = self
+                .threaded
+                .as_mut()
+                .expect("threaded promoted above");
+            match threaded.run_quanta_checked(quanta) {
+                Ok(()) => Ok(quanta.saturating_mul(step_q)),
+                Err((which, message)) => {
+                    self.panic_info = Some((which, message.clone()));
+                    Err(EmulatorError::WorkerPanicked { which, message })
+                }
             }
         }
-        self.clock.cycles.wrapping_sub(start)
+        #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+        {
+            let _ = cycles;
+            Err(EmulatorError::NotSupportedInThreadedMode)
+        }
+    }
+
+    /// Advance the emulator by exactly one quantum (`step_quantum`
+    /// cycles). Primary entry point for the Threaded path; on Serial
+    /// this is the same as [`Self::step`] and returns the cycles
+    /// consumed. HLD V1 §5.4.
+    ///
+    /// Returns `Err(EmulatorError::WorkerPanicked)` sticky on worker
+    /// panic in Threaded mode. One-shot-after-panic: subsequent calls
+    /// return the cached error without re-attempting workers.
+    pub fn run_quantum(&mut self) -> Result<u64, EmulatorError> {
+        match self.execution_model {
+            ExecutionModel::Serial => Ok(self.step_serial()),
+            ExecutionModel::Threaded => self.run_quantum_threaded(),
+        }
+    }
+
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    fn run_quantum_threaded(&mut self) -> Result<u64, EmulatorError> {
+        if let Some((which, message)) = &self.panic_info {
+            return Err(EmulatorError::WorkerPanicked {
+                which: *which,
+                message: message.clone(),
+            });
+        }
+        if self.threaded.is_none() {
+            self.promote_to_threaded();
+        }
+        self.apply_pending_panic_inject();
+        let step_q = self.step_quantum as u64;
+        let threaded = self.threaded.as_mut().expect("threaded promoted above");
+        match threaded.run_quanta_checked(1) {
+            Ok(()) => Ok(step_q),
+            Err((which, message)) => {
+                self.panic_info = Some((which, message.clone()));
+                Err(EmulatorError::WorkerPanicked { which, message })
+            }
+        }
+    }
+
+    #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+    fn run_quantum_threaded(&mut self) -> Result<u64, EmulatorError> {
+        Err(EmulatorError::NotSupportedInThreadedMode)
+    }
+
+    /// Forward any pending `inject_panic_for_testing` target into the
+    /// live `ThreadedEmulator`. No-op on non-testing builds.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[inline]
+    fn apply_pending_panic_inject(&mut self) {
+        #[cfg(feature = "testing")]
+        if let Some(which) = self.pending_panic_inject.take() {
+            if let Some(t) = self.threaded.as_mut() {
+                t.inject_panic_for_testing(which);
+            }
+        }
+    }
+
+    /// Move the seeded Serial state into a fresh `ThreadedEmulator`.
+    /// Called lazily on the first `run_quantum` / `run` so harness
+    /// setup that poked `emu.bus` / `emu.core_mut(...)` pre-run is
+    /// carried over. After promotion, the top-level `cores` / `bus` /
+    /// `clock` fields hold zero-cost placeholders and must not be
+    /// inspected mid-run.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    fn promote_to_threaded(&mut self) {
+        let placeholder_bus = Bus::new();
+        let placeholder_cores = [CortexM0Plus::with_id(0), CortexM0Plus::with_id(1)];
+        let seeded_bus = std::mem::replace(&mut self.bus, placeholder_bus);
+        let seeded_cores = std::mem::replace(&mut self.cores, placeholder_cores);
+        let seeded_clock = std::mem::replace(&mut self.clock, Clock { cycles: 0 });
+        let seeded = Emulator {
+            cores: seeded_cores,
+            bus: seeded_bus,
+            clock: seeded_clock,
+            step_quantum: self.step_quantum,
+            pio_tick_count: self.pio_tick_count,
+            pio_tick_iow_low_count: self.pio_tick_iow_low_count,
+            pio0_sm0_max_pc: self.pio0_sm0_max_pc,
+            pio0_sm0_pc_advances: self.pio0_sm0_pc_advances,
+            pio0_sm0_last_pc: self.pio0_sm0_last_pc,
+            execution_model: ExecutionModel::Serial,
+            threaded: None,
+            panic_info: None,
+            #[cfg(feature = "testing")]
+            pending_panic_inject: None,
+            bus_is_placeholder: false,
+        };
+        self.threaded = Some(threaded::ThreadedEmulator::from_emulator(seeded));
+        self.bus_is_placeholder = true;
+    }
+
+    /// Test-only: arm a panic injection for the next `run_quantum` /
+    /// `run` call. The matching worker panics on its first barrier
+    /// entry; the emulator surfaces `Err(EmulatorError::WorkerPanicked)`
+    /// and becomes sticky-poisoned.
+    ///
+    /// Feature-gated behind `testing` so release consumers cannot brick
+    /// their emulator by calling an internal hook.
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        target_os = "windows"
+    ))]
+    pub fn inject_panic_for_testing(&mut self, which: WorkerName) {
+        self.pending_panic_inject = Some(which);
     }
 
     /// Merge SIO and PIO GPIO outputs into `bus.gpio_in`.
@@ -686,6 +936,7 @@ impl Emulator {
     /// sync and will silently drift the FSM state against the core's
     /// actual halt status. See HLD 2026.04.16 §5 (invariants).
     pub fn halt_core1(&mut self) {
+        self.assert_not_placeholder();
         self.cores[1].halt();
         self.bus.sio.set_handshake_armed(true);
     }
@@ -703,6 +954,7 @@ impl Emulator {
     /// re-halt) must call [`CortexM0Plus::reset_control_for_launch`]
     /// before this.
     pub fn wake_core1(&mut self) {
+        self.assert_not_placeholder();
         self.cores[1].wake();
         self.bus.sio.set_handshake_armed(false);
     }
@@ -746,8 +998,10 @@ impl Emulator {
         self.wake_core1();
     }
 
-    /// Read a GPIO pin from the merged pin state.
+    /// Read a GPIO pin from the merged pin state. Debug-only: asserts
+    /// the emulator has not been promoted into Threaded mode.
     pub fn gpio_read(&self, pin: u8) -> bool {
+        self.assert_not_placeholder();
         if pin >= 30 {
             return false;
         }
@@ -759,6 +1013,7 @@ impl Emulator {
     /// Useful as a test-shim to inject a pin level without hand-rolling
     /// the SIO register poking.
     pub fn gpio_write(&mut self, pin: u8, value: bool) {
+        self.assert_not_placeholder();
         if pin >= 30 {
             return;
         }
@@ -772,32 +1027,47 @@ impl Emulator {
         self.update_gpio();
     }
 
-    /// Read all GPIO pins as a bitmask.
+    /// Read all GPIO pins as a bitmask. Debug-only: asserts the
+    /// emulator has not been promoted into Threaded mode.
     pub fn gpio_read_all(&self) -> u64 {
+        self.assert_not_placeholder();
         self.bus.gpio_in as u64
     }
 
-    /// Access core state.
+    /// Access core state. Debug-only: asserts the emulator has not
+    /// been promoted into Threaded mode (the flat `cores` field would
+    /// be a placeholder).
     pub fn core(&self, id: usize) -> &CortexM0Plus {
+        self.assert_not_placeholder();
         &self.cores[id]
     }
 
+    /// Mutable accessor; same debug-only placeholder assertion.
     pub fn core_mut(&mut self, id: usize) -> &mut CortexM0Plus {
+        self.assert_not_placeholder();
         &mut self.cores[id]
     }
 
-    /// Direct memory read (bypasses bus timing).
+    /// Direct memory read (bypasses bus timing). Debug-only: asserts
+    /// the emulator has not been promoted into Threaded mode.
     pub fn peek(&self, addr: u32) -> u32 {
+        self.assert_not_placeholder();
         self.bus.peek32(addr)
     }
 
-    /// Direct memory write (bypasses bus timing).
+    /// Direct memory write (bypasses bus timing). Debug-only: asserts
+    /// the emulator has not been promoted into Threaded mode.
     pub fn poke(&mut self, addr: u32, value: u32) {
+        self.assert_not_placeholder();
         self.bus.poke32(addr, value);
     }
 
-    /// Current master cycle count.
+    /// Current master cycle count. Debug-only: asserts the emulator
+    /// has not been promoted into Threaded mode — Threaded callers
+    /// read the live master cycle via the value returned from
+    /// [`Self::run_quantum`] / [`Self::run`].
     pub fn cycles(&self) -> u64 {
+        self.assert_not_placeholder();
         self.clock.cycles
     }
 
@@ -810,6 +1080,7 @@ impl Emulator {
     /// INSTR_MEM, configuring SIO GPIO_OE/_OUT, releasing RESETS bits,
     /// etc., without hand-rolling the bus machinery.
     pub fn mmio_write32(&mut self, addr: u32, value: u32) {
+        self.assert_not_placeholder();
         // Mirror the `step()` stash so PLL write-time lock-arm transitions
         // observe the current cycle count when the harness pokes MMIO
         // outside the step path. See HLD §6 P2.
@@ -828,6 +1099,7 @@ impl Emulator {
     /// are for confirmation only and should be chosen carefully to avoid
     /// disturbing the peripheral's state.
     pub fn mmio_read32(&mut self, addr: u32) -> u32 {
+        self.assert_not_placeholder();
         // Mirror the `step()` stash so PLL CS reads observe the current
         // cycle count when the harness reads MMIO outside the step path.
         self.bus.master_cycle = self.clock.cycles;
@@ -837,6 +1109,7 @@ impl Emulator {
     /// Harness-only diagnostic: drain every byte firmware has written to
     /// UART0 `DR` since the previous call. Returns empty if idle.
     pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
+        self.assert_not_placeholder();
         self.bus.drain_uart0_tx_log()
     }
 }
@@ -849,6 +1122,7 @@ pub struct EmulatorBuilder {
     step_quantum: u32,
     flash: Option<Vec<u8>>,
     psram: Option<mdpicoem_devices::Psram>,
+    execution: ExecutionModel,
 }
 
 impl EmulatorBuilder {
@@ -858,6 +1132,7 @@ impl EmulatorBuilder {
             step_quantum: DEFAULT_STEP_QUANTUM,
             flash: None,
             psram: None,
+            execution: ExecutionModel::default(),
         }
     }
 
@@ -884,7 +1159,32 @@ impl EmulatorBuilder {
         self
     }
 
-    pub fn build(self) -> Emulator {
+    /// Select the runtime [`ExecutionModel`]. Defaults to
+    /// `ExecutionModel::Serial` (the oracle-validated reference path).
+    /// `ExecutionModel::Threaded` requires the `threading` cargo feature
+    /// and an x86_64 Windows host; otherwise [`Self::build`] returns
+    /// `Err(ConfigError::ThreadingUnavailable)`.
+    pub fn execution(mut self, model: ExecutionModel) -> Self {
+        self.execution = model;
+        self
+    }
+
+    pub fn build(self) -> Result<Emulator, ConfigError> {
+        // Threading availability gate — dual-execution HLD V1 §5.2.
+        if self.execution == ExecutionModel::Threaded {
+            #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+            return Err(ConfigError::ThreadingUnavailable);
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            {
+                let n = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                if n < 3 {
+                    return Err(ConfigError::ThreadingUnavailable);
+                }
+            }
+        }
+
         let mut bus = Bus::new();
         bus.seed_sys_clk_hz(self.config.sys_clk_hz);
         bus.psram = self.psram;
@@ -898,6 +1198,20 @@ impl EmulatorBuilder {
             pio0_sm0_max_pc: 0,
             pio0_sm0_pc_advances: 0,
             pio0_sm0_last_pc: 0xFF,
+            execution_model: self.execution,
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            threaded: None,
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            panic_info: None,
+            #[cfg(all(
+                feature = "testing",
+                feature = "threading",
+                target_arch = "x86_64",
+                target_os = "windows"
+            ))]
+            pending_panic_inject: None,
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            bus_is_placeholder: false,
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         // Route through the wrapper so the SIO handshake FSM `armed`
@@ -911,9 +1225,10 @@ impl EmulatorBuilder {
             sram_size = SRAM_SIZE,
             step_quantum = self.step_quantum,
             sys_clk_hz = self.config.sys_clk_hz,
+            execution = ?self.execution,
             "emulator constructed"
         );
-        emu
+        Ok(emu)
     }
 }
 
