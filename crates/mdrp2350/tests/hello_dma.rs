@@ -62,7 +62,7 @@ fn hello_dma_firmware_completes_transfer() {
     // Run enough cycles for the firmware to program DMA, transfer 4
     // words, poll BUSY, and write the marker. The firmware is ~50
     // instructions; 100k cycles is generous headroom.
-    emu.run(100_000);
+    emu.run(100_000).unwrap();
 
     let counter = emu.peek(COUNTER_ADDR);
     assert_eq!(

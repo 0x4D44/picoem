@@ -10,9 +10,7 @@
 //! on the same workload with a far simpler shell, the gap is in
 //! `core.step` / bus path, not in pacing overhead.
 
-use mdrp2350::{Config, DEFAULT_STEP_QUANTUM, Emulator, EmulatorBuilder};
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use mdrp2350::threaded::ThreadedEmulator;
+use mdrp2350::{Config, DEFAULT_STEP_QUANTUM, Emulator, EmulatorBuilder, ExecutionModel};
 use std::time::Instant;
 
 #[cfg(target_os = "windows")]
@@ -78,15 +76,15 @@ fn main() {
 
     // --- Serial ---
     {
-        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
         setup_basic_core0(&mut emu);
         emu.core_mut(1).halt();
 
         // Warm up decode cache
-        emu.run(10_000);
+        emu.run(10_000).expect("Serial run is infallible");
         let c0_start = emu.core(0).cycles();
         let t0 = Instant::now();
-        emu.run(target_cycles);
+        emu.run(target_cycles).expect("Serial run is infallible");
         let wall_ns = t0.elapsed().as_nanos() as u64;
         let c0_delta = emu.core(0).cycles() - c0_start;
         let mhz = (c0_delta as f64) / (wall_ns as f64) * 1000.0;
@@ -100,23 +98,24 @@ fn main() {
     // --- Threaded (Windows x86_64 only) ---
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     {
-        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build on x86_64 Windows");
         setup_basic_core0(&mut emu);
         emu.core_mut(1).halt();
 
         let step_q = DEFAULT_STEP_QUANTUM as u64;
-        let mut threaded = ThreadedEmulator::from_emulator(emu);
 
         // Warm up decode cache + pay thread-spawn startup
-        threaded.run_quanta(10_000 / step_q + 1);
+        emu.run(step_q * (10_000 / step_q + 1))
+            .expect("Threaded warm-up run");
 
-        let c0_start = threaded.core_cycles(0);
+        let c0_start = emu.core_cycles(0);
         let t0 = Instant::now();
-        // Match serial's cycle budget.
-        let n = target_cycles.div_ceil(step_q);
-        threaded.run_quanta(n);
+        emu.run(target_cycles).expect("Threaded run");
         let wall_ns = t0.elapsed().as_nanos() as u64;
-        let c0_delta = threaded.core_cycles(0) - c0_start;
+        let c0_delta = emu.core_cycles(0) - c0_start;
         let mhz = (c0_delta as f64) / (wall_ns as f64) * 1000.0;
         let ns_per_cyc = (wall_ns as f64) / (c0_delta as f64);
         println!(
@@ -124,28 +123,29 @@ fn main() {
             c0_delta, wall_ns, mhz, ns_per_cyc, step_q
         );
 
-        // Also a large-step_q variant — must set step_quantum on the
-        // builder BEFORE building; ThreadedEmulator inherits it from the
-        // Emulator and keeps it for all `run_quanta` calls.
-        // Variants: cold (no warmup) vs warm (one run_quanta warmup
-        // to populate decode cache + amortise first thread spawn).
+        // Large-step_q variants — must set step_quantum on the builder
+        // BEFORE building; the Threaded runtime inherits it from the
+        // Emulator and keeps it for all `run` calls.
+        // Variants: cold (no warmup) vs warm (one run warmup to
+        // populate decode cache + amortise first thread spawn).
         for &sq in &[256u32, 1024, 4096, 16384] {
             for warm in &[false, true] {
                 let mut emu = EmulatorBuilder::new(Config::default())
                     .step_quantum(sq)
-                    .build();
+                    .execution(ExecutionModel::Threaded)
+                    .build()
+                    .expect("Threaded build on x86_64 Windows");
                 setup_basic_core0(&mut emu);
                 emu.core_mut(1).halt();
-                let mut threaded = ThreadedEmulator::from_emulator(emu);
                 if *warm {
-                    threaded.run_quanta(10_000u64 / sq as u64 + 1);
+                    emu.run(sq as u64 * (10_000u64 / sq as u64 + 1))
+                        .expect("Threaded warm-up run");
                 }
-                let c0_start = threaded.core_cycles(0);
+                let c0_start = emu.core_cycles(0);
                 let t0 = Instant::now();
-                let n = target_cycles.div_ceil(sq as u64);
-                threaded.run_quanta(n);
+                emu.run(target_cycles).expect("Threaded run");
                 let wall_ns = t0.elapsed().as_nanos() as u64;
-                let c0_delta = threaded.core_cycles(0) - c0_start;
+                let c0_delta = emu.core_cycles(0) - c0_start;
                 let mhz = (c0_delta as f64) / (wall_ns as f64) * 1000.0;
                 let tag = if *warm { "warm" } else { "cold" };
                 println!(

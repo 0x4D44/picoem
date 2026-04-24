@@ -733,7 +733,7 @@ mod tests {
     fn glue_dma_suppresses_real_dma_with_v6_treq_sel_force() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(1)
-            .build();
+            .build().unwrap();
         let mut dma = GlueDma::new();
         release_dma(&mut emu.bus);
 

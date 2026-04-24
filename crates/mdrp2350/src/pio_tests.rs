@@ -174,7 +174,7 @@ fn pio_write(emu: &mut Emulator, offset: u32, val: u32) {
 fn pio_test_emulator() -> Emulator {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
     // De-assert PIO0's RESETS bit via the CLR alias.
     emu.bus.resets_state &= !(1u32 << crate::bus::RESET_PIO0);
     emu
@@ -238,7 +238,7 @@ fn test_pio_blinky_gpio25() {
 
     let mut actual = Vec::new();
     for _ in 0..12 {
-        emu.step();
+        emu.step().unwrap();
         actual.push(emu.gpio_read(25));
     }
 
@@ -319,7 +319,7 @@ fn test_pio_uart_tx_0x55() {
     let total_steps = 19;
     let mut pin_trace = Vec::new();
     for _ in 0..total_steps {
-        emu.step();
+        emu.step().unwrap();
         pin_trace.push(emu.gpio_read(0));
     }
 
@@ -418,7 +418,7 @@ fn test_pio_spi_clk_mosi() {
     let mut clk_trace = Vec::new();
     let mut mosi_trace = Vec::new();
     for _ in 0..total_steps {
-        emu.step();
+        emu.step().unwrap();
         clk_trace.push(emu.gpio_read(1));
         mosi_trace.push(emu.gpio_read(0));
     }
@@ -526,8 +526,8 @@ fn test_pio_onerom_sm1_out_pins_8_autopull_drives_pad_out() {
     // the OSR, OUT PINS, 8 drops one byte per step, so the new value is
     // latched by `merge_pin_outputs` on the very first step.
     pio_write(&mut emu, 0x014, word); // TXF1 (SM1's TX FIFO)
-    emu.step();
-    emu.step();
+    emu.step().unwrap();
+    emu.step().unwrap();
 
     // Helpers default to PIO0; read the same block here.
     let pad_out = emu.bus.pio[0].pad_out;
@@ -565,7 +565,7 @@ fn test_pio_resets_gating() {
     // from reset — the default `RESETS_POST_BOOTROM` holds PIO0/1/2.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
 
     // Confirm PIO0 is held in reset.
     assert_ne!(
@@ -601,7 +601,7 @@ fn test_pio_resets_gating() {
     // Tick several cycles — PIO0 is held in reset, so SM0's PC must
     // not advance.
     for _ in 0..10 {
-        emu.step();
+        emu.step().unwrap();
     }
 
     assert_eq!(
@@ -621,7 +621,7 @@ fn test_pio_resets_gating() {
     // Now tick — SM0 should execute and its PC should advance.
     let pc_after_release = emu.bus.read32(PIO0_BASE + 0x0D4, 0);
     for _ in 0..5 {
-        emu.step();
+        emu.step().unwrap();
     }
 
     assert_ne!(

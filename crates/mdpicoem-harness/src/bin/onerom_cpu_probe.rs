@@ -50,7 +50,7 @@ fn main() -> ExitCode {
 
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
     let mut oe_change_count = 0u32;
     while emu.cycles() < warm_up_cap {
         let before = emu.cycles();
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         if emu.cycles() == before {
             eprintln!("cycle stalled at {}", before);
             return ExitCode::FAILURE;
@@ -128,7 +128,7 @@ fn main() -> ExitCode {
     for _ in 0..PROFILE_INSTRUCTIONS {
         let p = emu.core(0).regs.pc();
         *hist.entry(p).or_insert(0) += 1;
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
     }
 
     // Disassemble a wider range around the serve loop. Print every halfword
@@ -196,7 +196,7 @@ fn main() -> ExitCode {
     let stim_level_cs1_low: u32 = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3); // CS1 at bit 13 clear
     emu.bus.gpio_external_in.store(stim_level_cs1_low, Ordering::Relaxed);
     for n in 0..500u64 {
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let oe = emu.bus.read32(0xD000_0020, 0);
         let out = emu.bus.read32(0xD000_0010, 0);
         if (oe >> 16) & 0xFF != 0 || (out >> 16) & 0xFF != 0 {
@@ -238,7 +238,7 @@ fn main() -> ExitCode {
     let cs1_low_stim: u32 = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
     emu.bus.gpio_external_in.store(cs1_low_stim, Ordering::Relaxed);
     for t in 0..200u32 {
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let oe = emu.bus.read32(0xD000_0030, 0);
         let out = emu.bus.read32(0xD000_0010, 0);
         let pc = emu.core(0).regs.pc();
@@ -279,7 +279,7 @@ fn main() -> ExitCode {
         let mut first_r0_change_at: Option<(u32, u32)> = None;
         let initial_r0 = emu.core(0).regs.r[0];
         for c in 0..200u32 {
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
             let oe = emu.bus.read32(0xD000_0030, 0); // CORRECTED — was reading GPIO_OUT_CLR
             let out = emu.bus.read32(0xD000_0010, 0);
             let oe_data = ((oe >> 16) & 0xFF) as u8;
@@ -320,7 +320,7 @@ fn main() -> ExitCode {
         let cs_high = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
         emu.bus.gpio_external_in.store(cs_high, Ordering::Relaxed);
         for _ in 0..12 {
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
         }
     }
 

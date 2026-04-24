@@ -856,7 +856,7 @@ pub fn fresh_emulator(seq_bytes: &[u8]) -> Emulator {
     // step_quantum(1) — the stub + seq all run on core 0; the DWT reads
     // inside the stub see per-instruction core.cycles via PPB, so cycle
     // accounting is per-instruction regardless of quantum.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
     emu.cores.expect_arm_mut()[1].halt();
 
     let stub_bytes = pack_stub();
@@ -910,7 +910,7 @@ pub fn measure_emu(emu: &mut Emulator, seq_start: u32, k: u32) -> Result<u32, St
     let budget: u64 = 1_000_000u64.max((k as u64) * 200);
     let start_cycles = emu.cycles();
     loop {
-        emu.step();
+        emu.step().expect("Serial step is infallible");
         let done = emu.bus.read32(CYCLE_MAILBOX_BASE + MBX_DONE, 0);
         if done == 1 {
             break;

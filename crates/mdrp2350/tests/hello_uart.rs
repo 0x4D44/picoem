@@ -62,7 +62,7 @@ fn hello_uart_firmware_increments_counter() {
     // sysclks per byte. One loop iteration = byte-write +
     // TX-drain-poll + counter-increment. 500k cycles gives plenty of
     // headroom for at least one iteration.
-    emu.run(500_000);
+    emu.run(500_000).unwrap();
 
     let counter = emu.peek(COUNTER_ADDR);
     assert!(
@@ -74,7 +74,7 @@ fn hello_uart_firmware_increments_counter() {
 #[test]
 fn hello_uart_firmware_loops_many_times() {
     let mut emu = prepare_emu();
-    emu.run(2_000_000);
+    emu.run(2_000_000).unwrap();
     let counter = emu.peek(COUNTER_ADDR);
     assert!(
         counter >= 10,

@@ -76,7 +76,7 @@ fn main() {
     // Run
     let start = Instant::now();
     for _ in 0..RUN_QUANTA {
-        emu.step();
+        emu.step().unwrap();
     }
     let elapsed = start.elapsed();
 

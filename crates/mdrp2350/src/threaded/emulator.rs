@@ -99,6 +99,12 @@ impl ThreadedEmulator {
             bus,
             clock,
             step_quantum,
+            execution_model: _,
+            threaded: _,
+            panic_info: _,
+            #[cfg(feature = "testing")]
+                pending_panic_inject: _,
+            bus_is_placeholder: _,
         } = emu;
         // ThreadedEmulator currently only supports the Arm arm — RISC-V
         // (Hazard3) lives behind the P1a enum but doesn't thread yet.
@@ -405,10 +411,10 @@ impl ThreadedEmulator {
         self.last_run_timings.as_ref()
     }
 
-    /// Run `n` quanta. Spawns six workers, joins, and — on panic —
-    /// flips the `poisoned` flag so the next call panics early. Do not
-    /// call `run_quanta` again on a poisoned instance; drop it and
-    /// rebuild from a fresh `Emulator`.
+    /// Run `n` quanta. Wraps [`Self::run_quanta_checked`] and panics
+    /// the main thread on any worker panic (preserving the legacy
+    /// contract for callers that expect the classic panic-on-mismatch
+    /// semantics).
     ///
     /// Stage 7 (LLD V7 §9) + HLD V5 Stage B.2: each worker drives the
     /// real execution logic — the CPU workers step their `CortexM33`
@@ -418,6 +424,20 @@ impl ThreadedEmulator {
     /// coordinator publishes `master_cycle` + ticks the
     /// coordinator-owned peripherals.
     pub fn run_quanta(&mut self, n: u64) {
+        if let Err((which, message)) = self.run_quanta_checked(n) {
+            panic!("worker {} panicked: {message}", which.as_str());
+        }
+    }
+
+    /// Run `n` quanta and surface worker panics as structured
+    /// `Err((which, message))` instead of re-raising. Used by the
+    /// dual-execution HLD V1 Stage 1b `EmulatorError::WorkerPanicked`
+    /// wiring (§5.5 item 4). On `Err`, the instance is poisoned: drop
+    /// it and rebuild.
+    pub fn run_quanta_checked(
+        &mut self,
+        n: u64,
+    ) -> Result<(), (super::WorkerName, String)> {
         assert!(
             !self.poisoned,
             "ThreadedEmulator poisoned by prior worker panic; drop and rebuild"
@@ -474,6 +494,16 @@ impl ThreadedEmulator {
         let rp1 = hp1.join();
         let rp2 = hp2.join();
         let rc = hc.join();
+
+        // Extract panic message (if any) from each JoinHandle::join()
+        // Err payload before consuming the Ok payloads. Mirrors the
+        // downcast pattern used in the in-crate panic assertion tests.
+        let msg0 = panic_message(r0.as_ref().err());
+        let msg1 = panic_message(r1.as_ref().err());
+        let msgp0 = panic_message(rp0.as_ref().err());
+        let msgp1 = panic_message(rp1.as_ref().err());
+        let msgp2 = panic_message(rp2.as_ref().err());
+        let msgc = panic_message(rc.as_ref().err());
 
         // Track which workers panicked before consuming the Ok payloads
         // so the panic message can enumerate the culprits.
@@ -549,20 +579,25 @@ impl ThreadedEmulator {
             tc = t;
         }
 
-        let panicked: Vec<&str> = [
-            ("core0", r0_err),
-            ("core1", r1_err),
-            ("pio0", rp0_err),
-            ("pio1", rp1_err),
-            ("pio2", rp2_err),
-            ("coord", rc_err),
+        // First panicked worker wins attribution — the barrier-poison
+        // pathway means every other waiter exits via `Poisoned` and
+        // doesn't carry a real panic payload. Scanning in worker-index
+        // order (core0, core1, pio0, pio1, pio2, coord) matches the
+        // legacy enumeration order in the test suite.
+        let first_panic: Option<(super::WorkerName, String)> = [
+            (super::WorkerName::Core0, r0_err, msg0),
+            (super::WorkerName::Core1, r1_err, msg1),
+            (super::WorkerName::Pio0, rp0_err, msgp0),
+            (super::WorkerName::Pio1, rp1_err, msgp1),
+            (super::WorkerName::Pio2, rp2_err, msgp2),
+            (super::WorkerName::Coord, rc_err, msgc),
         ]
         .into_iter()
-        .filter_map(|(name, err)| if err { Some(name) } else { None })
-        .collect();
-        if !panicked.is_empty() {
+        .find_map(|(name, err, msg)| if err { Some((name, msg)) } else { None });
+
+        if let Some((which, message)) = first_panic {
             self.poisoned = true;
-            panic!("worker thread(s) panicked: {}", panicked.join(", "));
+            return Err((which, message));
         }
 
         if timing {
@@ -575,12 +610,28 @@ impl ThreadedEmulator {
                 coord: tc,
             });
         }
+        Ok(())
     }
 }
 
 // =======================================================================
 // Worker-thread plumbing
 // =======================================================================
+
+/// Extract a human-readable message from a `JoinHandle::join()` Err
+/// payload. Falls back to a fixed string if the payload is neither a
+/// `String` nor a `&'static str` — matches the downcast pattern used in
+/// the in-crate panic-assertion tests.
+fn panic_message(err: Option<&Box<dyn std::any::Any + Send>>) -> String {
+    match err {
+        Some(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+        None => String::new(),
+    }
+}
 
 /// Helper for `run_quanta`'s PIO-worker join handling: split an
 /// `Option<(PioBlock, PerWorkerTimings)>` into its two halves so the
@@ -895,10 +946,12 @@ fn apply_pio_command(
         // message uses `cmd.block()` (i.e. the command's target), not
         // `block_idx`, so it stays accurate under the §2.2 contract
         // (they are equal, but the command-field form documents intent).
-        // `#[cfg(test)]` keeps the arm — and therefore the `panic!` —
-        // out of release builds, so `PioCommand`'s exhaustive match
-        // compiles clean in production.
-        #[cfg(test)]
+        // `#[cfg(feature = "testing")]` keeps the arm — and therefore
+        // the `panic!` — out of release builds (Stage 1b review
+        // REQUIRED #2), so `PioCommand`'s exhaustive match compiles
+        // clean in production. Matches the variant gating in
+        // `threaded/pio.rs`.
+        #[cfg(feature = "testing")]
         PioCommand::TestPanic { block } => {
             panic!("PioCommand::TestPanic fired from pio{}", block);
         }
@@ -1480,11 +1533,12 @@ mod tests {
         assert_eq!(threaded.shared.pio.read_sm_enabled(2), 0);
     }
 
-    /// Smoke test that the `#[cfg(test)]` `TestPanic` arm in
-    /// `apply_pio_command` panics with the `pio{block}` substring the
-    /// Stage B.2 / B.4 end-to-end worker-split tests rely on. Catches
-    /// format-string regressions before the worker-panic integration
-    /// tests land.
+    /// Smoke test that the `#[cfg(feature = "testing")]` `TestPanic`
+    /// arm in `apply_pio_command` panics with the `pio{block}`
+    /// substring the Stage B.2 / B.4 end-to-end worker-split tests
+    /// rely on. Catches format-string regressions before the
+    /// worker-panic integration tests land.
+    #[cfg(feature = "testing")]
     #[test]
     #[should_panic(expected = "pio1")]
     fn apply_pio_command_test_panic_arm_fires() {
@@ -2424,6 +2478,7 @@ mod tests {
     /// Post-panic, the ThreadedEmulator is poisoned: `pio_blocks` is
     /// `None` (HLD V5 §2.7) and the next `run_quanta` call panics with
     /// the `poisoned by prior worker panic` message.
+    #[cfg(feature = "testing")]
     #[test]
     fn test_panic_on_pio_worker_poisons_emulator_and_names_block() {
         for block in 0..3u8 {
@@ -2657,7 +2712,8 @@ mod tests {
             use crate::{Arch, EmulatorBuilder};
             let emu = EmulatorBuilder::new(Config::default())
                 .arch(Arch::RiscV)
-                .build();
+                .build()
+                .unwrap();
             let _ = ThreadedEmulator::from_emulator(emu);
         }
 
@@ -2825,7 +2881,8 @@ mod tests {
         // execute (SM1 and SM0 share instruction memory on each block).
         let emu = crate::EmulatorBuilder::new(Config::default())
             .step_quantum(STEP_QUANTUM)
-            .build();
+            .build()
+            .unwrap();
         let mut threaded = ThreadedEmulator::from_emulator(emu);
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);

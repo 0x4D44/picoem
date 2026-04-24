@@ -50,7 +50,7 @@ pub fn run(
 
     while !shutdown.load(Ordering::Relaxed) {
         pacer.begin_quantum();
-        emu.run(qc);
+        emu.run(qc).expect("Serial run is infallible");
         pacer.end_quantum();
 
         // Follow firmware clock reconfiguration (PLL bring-up, mux

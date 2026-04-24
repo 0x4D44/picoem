@@ -20,13 +20,15 @@ pub mod bus;
 // Stage 6b (LLD V7 §8/§9): `ThreadedEmulator` pins one thread per
 // worker via `SetThreadAffinityMask`, so the whole module is gated to
 // x86_64 Windows. Non-Windows callers continue on the serial
-// `Emulator::run` path.
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+// `Emulator::run` path. Dual-execution HLD V1 (Stage 1b) layered the
+// `threading` cargo feature on top: both gates must be satisfied for
+// the threaded runtime to exist.
+#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
 pub mod emulator;
 // Per-worker per-quantum timing instrumentation (HLD V7 §8 follow-up).
 // Gated to the same target as `emulator` because only the threaded
 // runtime produces timings.
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
 pub mod timings;
 
 pub use atomics::CoreAtomics;
@@ -42,7 +44,7 @@ pub use peripherals::{
 };
 pub use shared::SharedState;
 pub use bus::{PioBus, WorkerBus};
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
 pub use emulator::ThreadedEmulator;
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
 pub use timings::{RunTimings, WorkerName, WorkerSummary};

@@ -1,16 +1,35 @@
 [package]
 name = "mdrp2350"
-version = "1.18.0"
+version = "2.0.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [features]
+default = ["threading"]
 # Forward the PIO `test-hooks` feature to `mdpicoem-common`. Enables
 # cross-crate unit tests to push RX FIFO words via `PioBlock::push_rx`.
 # (Consumed by mdpicoem-harness [dev-dependencies] — removing this
 # breaks the concurrent PicoGUS / silicon-oracle test harness.)
 test-hooks = ["mdpicoem-common/test-hooks"]
+# Dual-execution HLD V1 (Stage 1b): feature-gates the threaded runtime.
+# Default on; disable for Serial-only builds on non-x86_64 targets or in
+# consumer projects that never want the 6-thread worker pool. Gating is
+# layered with the existing `cfg(all(target_arch = "x86_64", target_os =
+# "windows"))` guard on `threaded::{emulator,timings}` so the feature
+# flag controls the module's *exposure* while the platform cfg still
+# governs whether `ThreadedEmulator` itself compiles.
+threading = []
+# Dual-execution HLD V1 Stage 1b review (REQUIRED #2): opt-in surface
+# for test-only panic-injection APIs (`Emulator::inject_panic_for_testing`,
+# `threaded::PioCommand::TestPanic`). These exist solely to prove
+# panic-containment in the `tests/execution_model.rs` integration
+# suite; hiding them behind a feature flag keeps the release crate's
+# public surface from shipping a "brick your emulator" hook. NOT in
+# `default` on purpose — integration tests that need the injector
+# declare `required-features = ["testing"]`. Callers outside of the
+# test tree should never enable this.
+testing = []
 
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common" }
@@ -33,3 +52,12 @@ tracing-subscriber = { workspace = true }
 # target so the dependency stays off Linux/macOS builds entirely.
 [target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies]
 winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }
+
+# Dual-execution HLD V1 Stage 1b review (REQUIRED #2): the
+# `execution_model` integration test exercises `Emulator::
+# inject_panic_for_testing` and `PioCommand::TestPanic`, both of
+# which are gated behind the `testing` feature. Run with
+# `cargo test -p mdrp2350 --features testing`.
+[[test]]
+name = "execution_model"
+required-features = ["testing"]

@@ -29,7 +29,7 @@ const LED_PIN: u8 = 25;
 fn prepare_emu() -> Emulator {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build();
+        .build().unwrap();
     emu.load_image(LOAD_BASE, BLINKY_RISCV_BIN);
     emu.reset();
     emu
@@ -54,7 +54,7 @@ fn blinky_riscv_toggles_led_pin() {
     let wall_deadline = Instant::now() + Duration::from_millis(2000);
 
     while emu.cycles() < cycle_budget {
-        emu.step();
+        emu.step().unwrap();
 
         let high = emu.gpio_read(LED_PIN);
         if high {
@@ -98,7 +98,7 @@ fn blinky_riscv_multiple_toggles() {
     let mut rising_edges = 0u32;
 
     while emu.cycles() < cycle_budget {
-        emu.step();
+        emu.step().unwrap();
         let cur = emu.gpio_read(LED_PIN);
         if cur && !last {
             rising_edges += 1;

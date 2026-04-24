@@ -1431,7 +1431,7 @@ fn mod_csr_read_minstret_and_mtvec() {
 fn mod_emu_builder_defaults_hart_ids() {
     let emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build();
+        .build().unwrap();
     let Cores::RiscV(cs) = &emu.cores else {
         panic!("expected RiscV cores")
     };

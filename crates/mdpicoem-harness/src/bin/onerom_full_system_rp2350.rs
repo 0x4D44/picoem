@@ -117,7 +117,7 @@ fn main() -> ExitCode {
     // diagnosing where main() returns early.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -209,7 +209,7 @@ fn main() -> ExitCode {
 
     while emu.cycles() < BOOT_CYCLE_CAP {
         let before_cycles = emu.cycles();
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let after_cycles = emu.cycles();
         let pc = emu.core(0).regs.pc();
 

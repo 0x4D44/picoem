@@ -406,7 +406,7 @@ mod windows_main {
     fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(1)
-            .build();
+            .build().unwrap();
         emu.load_bootrom(bootrom);
         emu.load_flash(flash);
         emu.reset();
@@ -433,7 +433,7 @@ mod windows_main {
         let mut phase1_cycle: Option<u64> = None;
         while emu.cycles() < BOOT_CYCLE_CAP {
             let before = emu.cycles();
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
             let after = emu.cycles();
             if after == before {
                 return Err(format!("cycle counter stalled at {}", before));
@@ -471,7 +471,7 @@ mod windows_main {
         let mut synced = is_in_serve_loop(&emu) && sentinel_ok(&emu);
         while !synced && emu.cycles() < BOOT_CYCLE_CAP {
             let before = emu.cycles();
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
             let after = emu.cycles();
             if after == before {
                 return Err(format!("cycle counter stalled at {}", before));
@@ -843,7 +843,7 @@ mod windows_main {
                 let sample = &plan[idx];
                 emu.bus.gpio_external_in.store(sample.gpio_stim, ordering);
                 for _ in 0..200 {
-                    emu.run(1);
+                    emu.run(1).expect("Serial run is infallible");
                 }
                 let merged = emu.bus.gpio_in.load(ordering);
                 let serial_observed = ((merged >> GPIO_DATA_BASE) & 0xFF) as u8;
@@ -857,7 +857,7 @@ mod windows_main {
                 .gpio_external_in
                 .store(plan[0].gpio_stim, ordering);
             for _ in 0..100 {
-                emu.run(1);
+                emu.run(1).expect("Serial run is infallible");
             }
         }
         println!(

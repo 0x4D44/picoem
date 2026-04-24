@@ -287,7 +287,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
         .step_quantum(1)
-        .build();
+        .build().unwrap();
     emu.core_riscv_mut(1).set_halted(true);
 
     // 6. §4.1 proxy self-check — runs on both sides before any test.
@@ -1561,7 +1561,7 @@ fn step_emu_until_pc_pair(
         if pc == target_pc || pc == alt_target_pc {
             return Ok(());
         }
-        emu.step();
+        emu.step().unwrap();
     }
     Err(format!(
         "emulator did not reach terminator {target_pc:#010x} (or alt {alt_target_pc:#010x}) within {max_steps} steps (pc={:#010x})",

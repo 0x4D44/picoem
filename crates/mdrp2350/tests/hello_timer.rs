@@ -71,7 +71,7 @@ fn hello_timer_firmware_increments_counter() {
     // the firmware's 1000 µs alarm wait = 12_000 sys_clks. Allow 1M
     // sys_clks — enough for ~80 alarm fires with generous headroom for
     // the setup block + poll-loop overhead.
-    emu.run(1_000_000);
+    emu.run(1_000_000).unwrap();
 
     let counter = emu.peek(COUNTER_ADDR);
     assert!(
@@ -89,7 +89,7 @@ fn hello_timer_firmware_alarm_fires_multiple_times() {
 
     // Run 5M sys_clks → ~400 alarm fires at 12_000 sys_clks/fire. We
     // assert >= 5 to leave huge headroom for any scheduling overhead.
-    emu.run(5_000_000);
+    emu.run(5_000_000).unwrap();
 
     let counter = emu.peek(COUNTER_ADDR);
     assert!(

@@ -438,7 +438,7 @@ impl ServingOracle {
         //    recording an Observation per cycle.
         let mut trace: Vec<Observation> = Vec::with_capacity(PER_CASE_TIMEOUT as usize);
         for c in 0..PER_CASE_TIMEOUT {
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
             glue.tick(&mut emu.bus);
 
             // Plain subtraction — `glue.ch1_pushes()` is monotonic on a
@@ -729,7 +729,7 @@ impl ServingOracle {
     /// observations.
     fn tick_cycles(&self, emu: &mut Emulator, glue: &mut GlueDma, n: u32) {
         for _ in 0..n {
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
             glue.tick(&mut emu.bus);
         }
     }

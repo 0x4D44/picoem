@@ -221,7 +221,7 @@ fn run() -> Result<(), String> {
         args.cycles,
     );
     emu.bus.mmio_trace_enabled = true;
-    let ran = emu.run(args.cycles);
+    let ran = emu.run(args.cycles).expect("Serial run is infallible");
     emu.bus.mmio_trace_enabled = false;
     eprintln!(
         "mmio_trace_rp2350: ran {} cycles (requested {})",

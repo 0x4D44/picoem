@@ -72,7 +72,7 @@ fn main() -> ExitCode {
     // check to work (HLD §4.4).
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -99,7 +99,7 @@ fn main() -> ExitCode {
 
     while emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let after = emu.cycles();
         if after == before {
             eprintln!("cycle counter stalled at {}", before);

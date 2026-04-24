@@ -447,7 +447,7 @@ mod tests {
     fn emulator_reset_riscv_calls_hazard3_reset() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
 
         // Mutate both harts away from §4.3 defaults.
         {

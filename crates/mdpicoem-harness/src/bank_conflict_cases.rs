@@ -343,7 +343,7 @@ pub fn compute_diff(hw_median: u32, nop_baseline: u32, emu_cycles: u32) -> (u32,
 /// Build a fresh emulator with `step_quantum=1`, core 1 halted, DWT on,
 /// and the single test instruction primed at `fetch_addr`.
 fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
     emu.cores.expect_arm_mut()[1].halt();
 
     // Write the instruction (two bytes) at `fetch_addr`. The decoded-op

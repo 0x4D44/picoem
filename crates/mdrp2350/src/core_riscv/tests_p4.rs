@@ -244,7 +244,7 @@ fn p4_meip_cleared_when_pending_clears() {
 fn build_emu_parked(mie: u32, mie_global: bool) -> crate::Emulator {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build();
+        .build().unwrap();
     if let Cores::RiscV(cs) = &mut emu.cores {
         cs[0].wfi_parked = true;
         cs[0].csrs.mie = mie;
@@ -282,11 +282,11 @@ fn p4_wfi_wake_from_mtip_mie1_delivers_trap() {
     }
     plant_wfi_handler(&mut emu.bus, 0x2000_1000);
     emu.bus.sio.mtime_match_asserted[0] = true;
-    emu.step();
+    emu.step().unwrap();
     assert!(!emu.cores.expect_riscv()[0].wfi_parked, "wake cleared wfi_parked");
     // Step again — trap should deliver (MIE=1, mip.MTIP=1, mie.MTIE=1).
     // Handler is `wfi` so the hart re-parks after trap entry.
-    emu.step();
+    emu.step().unwrap();
     let c = &emu.cores.expect_riscv()[0];
     assert_eq!(c.csrs.mcause, 0x8000_0007, "mcause = interrupt-bit + MTIP");
     // pc is the handler's next-sequential after the `wfi` that self-parked
@@ -304,9 +304,9 @@ fn p4_wfi_wake_from_msip_mie1_delivers_trap() {
     }
     plant_wfi_handler(&mut emu.bus, 0x2000_2000);
     emu.bus.sio.write32(0x1A0, 0x1, 0);
-    emu.step();
+    emu.step().unwrap();
     assert!(!emu.cores.expect_riscv()[0].wfi_parked);
-    emu.step();
+    emu.step().unwrap();
     assert_eq!(emu.cores.expect_riscv()[0].csrs.mcause, 0x8000_0003);
 }
 
@@ -320,9 +320,9 @@ fn p4_wfi_wake_from_meip_mie1_delivers_trap() {
     }
     plant_wfi_handler(&mut emu.bus, 0x2000_3000);
     emu.bus.atomics.set_irq_pending(0, 1 << 5);
-    emu.step();
+    emu.step().unwrap();
     assert!(!emu.cores.expect_riscv()[0].wfi_parked);
-    emu.step();
+    emu.step().unwrap();
     assert_eq!(emu.cores.expect_riscv()[0].csrs.mcause, 0x8000_000B);
     let ctx = emu.cores.expect_riscv()[0].xh3irq.meicontext;
     assert_eq!((ctx >> 16) & 0xF, 1, "priority 0 + 1 => preempt=1");
@@ -343,9 +343,9 @@ fn p4_wfi_wake_mie_global_zero_no_trap() {
     }
     plant_wfi_handler(&mut emu.bus, 0x2000_4000);
     emu.bus.sio.mtime_match_asserted[0] = true;
-    emu.step();
+    emu.step().unwrap();
     assert!(!emu.cores.expect_riscv()[0].wfi_parked, "wfi wakes regardless of MIE");
-    emu.step();
+    emu.step().unwrap();
     // With MIE=0 global, the hart executes the `wfi` at pc=0x2000_4000
     // and parks again. mcause stays at reset value 0 — no trap.
     let mcause = emu.cores.expect_riscv()[0].csrs.mcause;
@@ -367,7 +367,7 @@ fn p4_wfi_wake_mie_bit_clear_no_wake() {
         cs[0].csrs.mtvec = 0x2000_1000;
     }
     emu.bus.sio.mtime_match_asserted[0] = true;
-    emu.step();
+    emu.step().unwrap();
     assert!(emu.cores.expect_riscv()[0].wfi_parked,
         "mie.MTIE=0 -> predicate zero -> no wake");
 }
@@ -495,7 +495,7 @@ fn p4_nested_preempt_two_levels_unwinds_correctly() {
 fn p4_fan_out_drives_mip_from_hw_sources() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build();
+        .build().unwrap();
     // Default mtimecmp=0 means the MTIP match-asserts as soon as the
     // mtime tick fires; freeze MTIME to assert per-core manually below.
     emu.bus.sio.mtime_ctrl = 0;
@@ -516,7 +516,7 @@ fn p4_fan_out_drives_mip_from_hw_sources() {
     emu.bus.atomics.set_irq_pending(1, 0);
 
     // Step — fan_out_riscv_irqs runs at quantum end.
-    emu.step();
+    emu.step().unwrap();
 
     let c0_mip = emu.cores.expect_riscv()[0].mip();
     assert_eq!(c0_mip & (1 << 7), 1 << 7, "MTIP set");
@@ -557,7 +557,7 @@ fn plant_insn(bus: &mut Bus, addr: u32, insn: u32) {
 fn p4_mret_to_wfi_parks_then_new_irq_wakes() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build();
+        .build().unwrap();
     freeze_mtime(&mut emu.bus);
     let wfi_pc = 0x2000_5000u32;
     plant_insn(&mut emu.bus, wfi_pc, 0x1050_0073); // wfi
@@ -584,14 +584,14 @@ fn p4_mret_to_wfi_parks_then_new_irq_wakes() {
     }
 
     // Step once — executes wfi and parks.
-    emu.step();
+    emu.step().unwrap();
     assert!(emu.cores.expect_riscv()[0].wfi_parked,
         "wfi parked the hart after mret landed on it");
 
     // Fire a new MTIP source. fan_out_riscv_irqs lifts mip[7]; wake_checks
     // clears wfi_parked.
     emu.bus.sio.mtime_match_asserted[0] = true;
-    emu.step();
+    emu.step().unwrap();
     assert!(!emu.cores.expect_riscv()[0].wfi_parked,
         "new pending IRQ wakes the hart parked at wfi");
 }
@@ -606,7 +606,7 @@ fn p4_mret_to_wfi_immediately_woken_if_irq_already_pending() {
     // iterations don't drift into zeroed SRAM) runs.
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build();
+        .build().unwrap();
     freeze_mtime(&mut emu.bus);
     let wfi_pc = 0x2000_5100u32;
     let handler_pc = 0x2000_6100u32;
@@ -633,12 +633,12 @@ fn p4_mret_to_wfi_immediately_woken_if_irq_already_pending() {
 
     // One step: executes wfi (parks), then wake_checks un-parks because
     // (mip & mie) != 0.
-    emu.step();
+    emu.step().unwrap();
     assert!(!emu.cores.expect_riscv()[0].wfi_parked,
         "pre-pending IRQ wakes immediately");
     // Next step delivers the MTIP trap; the self-loop keeps the hart at
     // handler_pc without further traps.
-    emu.step();
+    emu.step().unwrap();
     let c = &emu.cores.expect_riscv()[0];
     assert_eq!(c.csrs.mcause, 0x8000_0007,
         "MTIP trap delivered after wake");

@@ -48,7 +48,7 @@ fn hello_pwm_firmware_increments_counter() {
     // ~5 instructions. After enable, the first wrap should latch
     // within ~200 sys_clks. 100_000 sys_clks gives ~1000 wraps of
     // headroom.
-    emu.run(100_000);
+    emu.run(100_000).unwrap();
 
     let counter = emu.peek(COUNTER_ADDR);
     assert!(
@@ -60,7 +60,7 @@ fn hello_pwm_firmware_increments_counter() {
 #[test]
 fn hello_pwm_firmware_multiple_wraps() {
     let mut emu = prepare_emu();
-    emu.run(1_000_000);
+    emu.run(1_000_000).unwrap();
     let counter = emu.peek(COUNTER_ADDR);
     assert!(
         counter >= 10,

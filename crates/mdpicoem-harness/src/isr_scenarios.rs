@@ -1983,7 +1983,7 @@ fn run_one_scenario(
     // EMU side — fresh emulator so scenarios don't interfere.
     // --------------------------------------------------------------
 
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
     emu.core_mut(1).halt();
 
     // Phase 0b.1 Commit B: per-core PPB (SCB, NVIC, SysTick, FPCCR,
@@ -2048,7 +2048,7 @@ fn run_one_scenario(
     let budget = sc.max_sysclks as u64;
     let start_cycles = emu.cycles();
     while !emu.core(0).is_halted() && emu.cycles().saturating_sub(start_cycles) < budget {
-        emu.step();
+        emu.step().expect("Serial step is infallible");
     }
     // Force-halt regardless — if the budget ran out without a BKPT,
     // the observables below will register a divergence (mailbox=0,
@@ -2984,7 +2984,7 @@ mod tests {
     ///
     /// Mirrors the EMU-side half of `run_one_scenario` but skips HW.
     fn run_scenario_emu_mailbox(sc: &IsrScenario) -> u32 {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
         emu.core_mut(1).halt();
 
         // Upload image.
@@ -3032,7 +3032,7 @@ mod tests {
         let budget = sc.max_sysclks as u64;
         let start_cycles = emu.cycles();
         while !emu.core(0).is_halted() && emu.cycles().saturating_sub(start_cycles) < budget {
-            emu.step();
+            emu.step().expect("Serial step is infallible");
         }
         emu.core_mut(0).halt();
 

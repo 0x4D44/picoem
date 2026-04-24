@@ -369,14 +369,14 @@ fn emulator_step_calls_tick_peripherals_each_iteration() {
     //   step 1: acc=0,  +64 → 64, 64/12 = 5 edges rem 4 → TIMER0 = 5
     //   step 2: acc=4,  +64 → 68, 68/12 = 5 edges rem 8 → TIMER0 = 10
     //   step 3: acc=8,  +64 → 72, 72/12 = 6 edges rem 0 → TIMER0 = 16
-    emu.step();
+    emu.step().unwrap();
     assert_eq!(
         emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         5,
         "1 step × 64 sys_clks / 12 = 5 edges on TIMER0"
     );
-    emu.step();
-    emu.step();
+    emu.step().unwrap();
+    emu.step().unwrap();
     assert_eq!(
         emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0),
         16,

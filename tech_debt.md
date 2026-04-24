@@ -2,6 +2,44 @@
 
 Items discovered during development that need addressing in later phases.
 
+## Emulator direct-field access is Serial-only but not type-enforced (2026-04-24)
+
+**Current state:** `mdrp2350::Emulator` exposes `pub cores: Cores`,
+`pub bus: Bus`, and `pub clock: Clock`. After a Threaded run
+(`run_quantum` / `run` on an `ExecutionModel::Threaded` builder), the
+dual-execution HLD V1 Stage 1b `promote_to_threaded` path moves the
+live state into `self.threaded` and replaces the flat fields with
+zero-cost placeholders. A `pub(crate) bus_is_placeholder` flag plus
+`Self::assert_not_placeholder()` debug_asserts on the typed accessors
+(`core`, `core_mut`, `core_riscv`, `core_riscv_mut`, `core_counters`,
+`reset_counters`, `gpio_read`, `gpio_read_all`, `peek`, `poke`,
+`cycles`, `mmio_write32`, `mmio_read32`) fire a clear panic when a
+caller reaches through a guarded API in debug builds. Release builds
+elide the assertion entirely.
+
+**Known escape:** raw field access — `emu.bus.sio.gpio_out`,
+`emu.cores[0].regs.r[0] = 42`, `emu.clock.cycles` — bypasses the
+guarded accessors and silently reads/writes the dead placeholder
+state with no diagnostic in debug or release. Grep of the workspace
+as of this write confirms no live caller does this after
+`promote_to_threaded`, but the footgun is primed for any future
+caller.
+
+**Recommended follow-up:** migrate `cores` / `bus` / `clock` to
+`pub(crate)` with typed accessors in a dedicated stage. Estimated
+cost: ~1287 call-site updates across roughly 40 files. The debug
+guard today only covers the typed API surface, so the compiler will
+not surface raw-field regressions.
+
+**Risk if deferred:** new code added to `ExecutionModel::Threaded`
+paths may silently corrupt state by poking the placeholder fields
+instead of the live worker state. The current guards catch every
+typed-API caller, which is the majority of the workspace, but not
+direct `.bus.` / `.cores[` / `.clock.` reaches.
+
+**Status:** guards in place; wider migration deferred to a future
+stage of the dual-execution rollout.
+
 ## Vendored probe-rs fork for issue #3872 (Track A workaround)
 
 **Context:** `third_party/probe-rs-0.31.0-mdrp-patched/` carries a single

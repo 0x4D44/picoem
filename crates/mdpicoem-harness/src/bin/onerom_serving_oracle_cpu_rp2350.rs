@@ -71,7 +71,7 @@ fn main() -> ExitCode {
     // step_quantum=1 for per-cycle observation fidelity.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -116,7 +116,7 @@ fn main() -> ExitCode {
     let mut phase1_cycle: Option<u64> = None;
     while emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let after = emu.cycles();
         if after == before {
             eprintln!("cycle counter stalled at {}", before);
@@ -193,7 +193,7 @@ fn main() -> ExitCode {
     };
     while sync_cycle.is_none() && emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let after = emu.cycles();
         if after == before {
             eprintln!("cycle counter stalled at {}", before);

@@ -2528,7 +2528,7 @@ pub fn run_scenario(
         None
     };
 
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
     // Core 1 stays halted throughout; scenarios are single-core only.
     emu.core_mut(1).halt();
     for &(addr, val) in sc.setup {
@@ -2572,7 +2572,7 @@ pub fn run_scenario(
         while emu.core(0).regs.pc() != bkpt_pc
             && emu.cycles().saturating_sub(start) < budget
         {
-            emu.step();
+            emu.step().expect("Serial step is infallible");
         }
         let overshot = emu.core(0).regs.pc() != bkpt_pc;
         if overshot && verbose {
@@ -2592,7 +2592,7 @@ pub fn run_scenario(
         // state after N cycles" — the sled's job on HW is just to burn
         // N cycles, not to mutate MMIO.
         emu.core_mut(0).halt();
-        emu.run(actual_sysclks as u64);
+        emu.run(actual_sysclks as u64).expect("Serial run is infallible");
     }
     gate_peripheral_emu(&mut emu, sc.name);
 
@@ -3353,7 +3353,7 @@ mod tests {
         use mdrp2350::{Config, EmulatorBuilder};
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(1)
-            .build();
+            .build().unwrap();
         // Apply the RESETS CLR so DMA is out of reset (mirrors setup table).
         emu.mmio_write32(RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT);
         // Load and run the sled.
@@ -3371,7 +3371,7 @@ mod tests {
         while emu.core(0).regs.pc() != bkpt_pc
             && emu.cycles().saturating_sub(start) < budget
         {
-            emu.step();
+            emu.step().expect("Serial step is infallible");
         }
         assert_eq!(
             emu.core(0).regs.pc(),
@@ -3466,13 +3466,13 @@ mod tests {
         for sc in RED_PATH_SCENARIOS {
             let mut emu = EmulatorBuilder::new(Config::default())
                 .step_quantum(1)
-                .build();
+                .build().unwrap();
             emu.core_mut(0).halt();
             emu.core_mut(1).halt();
             for &(addr, val) in sc.setup {
                 emu.mmio_write32(addr, val);
             }
-            emu.run(sc.max_sysclks as u64);
+            emu.run(sc.max_sysclks as u64).expect("Serial run is infallible");
             for &(addr, mask) in sc.observe {
                 let got = emu.mmio_read32(addr) & mask;
                 assert_eq!(

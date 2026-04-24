@@ -595,7 +595,7 @@ impl Runtime {
     fn run(&mut self, cycles: u64) {
         match self {
             Runtime::Serial(emu) => {
-                emu.run(cycles);
+                emu.run(cycles).expect("Serial run is infallible");
             }
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             Runtime::Threaded { inner, step_q } => {
@@ -807,7 +807,7 @@ fn run_once(cfg: &RunConfig) -> f64 {
         ..Default::default()
     })
     .step_quantum(step_quantum)
-    .build();
+    .build().unwrap();
     setup(&mut emu, workload);
 
     // Promote into threaded mode after setup — `ThreadedEmulator::from_emulator`

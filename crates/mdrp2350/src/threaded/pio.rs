@@ -123,12 +123,19 @@ pub enum PioCommand {
     /// per-SM EXECCTRL / SHIFTCTRL / INSTR / PINCTRL, and any PIO offset
     /// the two purpose-built variants above do not route.
     WriteReg { block: u8, offset: u16, val: u32, alias: u8 },
-    /// Test-only panic-injection variant (HLD V5 §2.2). The
-    /// `apply_pio_command` arm for this variant unconditionally panics
-    /// with a message containing `pio{block}` so the Stage B.2 per-block
-    /// worker split's panic-naming + reassembly tests (§4 item 5) can
-    /// route a panic to a specific PIO worker via the block field.
-    #[cfg(test)]
+    /// Test-only panic-injection variant (HLD V5 §2.2 + dual-
+    /// execution HLD V1 §5.5). The `apply_pio_command` arm for this
+    /// variant unconditionally panics with a message containing
+    /// `pio{block}` so Stage B.2 per-block worker split tests and the
+    /// dual-execution Stage 1b `worker_panic_surfaces_as_error`
+    /// integration test can route a panic to a specific PIO worker
+    /// via the block field.
+    ///
+    /// Feature-gated behind `testing` (Stage 1b review REQUIRED #2);
+    /// callers should use [`crate::Emulator::inject_panic_for_testing`]
+    /// — itself `testing`-gated — to arm the injection, rather than
+    /// constructing this variant directly.
+    #[cfg(feature = "testing")]
     TestPanic { block: u8 },
 }
 
@@ -142,7 +149,7 @@ impl PioCommand {
             | PioCommand::SetClkDiv { block, .. }
             | PioCommand::WriteCtrl { block, .. }
             | PioCommand::WriteReg { block, .. } => block,
-            #[cfg(test)]
+            #[cfg(feature = "testing")]
             PioCommand::TestPanic { block } => block,
         }
     }

@@ -259,7 +259,7 @@ impl CpuServingOracle {
         let gap_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
         emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
         for _ in 0..GAP_CYCLES {
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
         }
 
         // 2. Apply stimulus.
@@ -278,7 +278,7 @@ impl CpuServingOracle {
         let mut decision: Option<StabilityDecision> = None;
 
         for tick in 0..PER_CASE_TIMEOUT {
-            emu.run(1);
+            emu.run(1).expect("Serial run is infallible");
 
             let sio_oe = emu.bus.read32(SIO_GPIO_OE_ADDR, 0);
             let oe_data = ((sio_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
@@ -1396,7 +1396,7 @@ mod tests {
             (7u32, 0u32),                         // raw 000
         ];
         for (index, expected_val) in cases {
-            let mut emu = EmulatorBuilder::new(Config::default()).build();
+            let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
             force_rom_set_index_via_sel_pins(&mut emu, &flash, index)
                 .expect("force");
             assert_eq!(
@@ -1415,7 +1415,7 @@ mod tests {
         use mdrp2350::{Config, EmulatorBuilder};
         // 3 sel pins → max encodable index = 7.
         let flash = synth_pins_flash(&[27, 28, 29], 0);
-        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
         assert!(force_rom_set_index_via_sel_pins(&mut emu, &flash, 8).is_err());
     }
 
@@ -1423,7 +1423,7 @@ mod tests {
     fn force_rom_set_index_rejects_no_sel_pins() {
         use mdrp2350::{Config, EmulatorBuilder};
         let flash = synth_pins_flash(&[], 0);
-        let mut emu = EmulatorBuilder::new(Config::default()).build();
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
         assert!(force_rom_set_index_via_sel_pins(&mut emu, &flash, 0).is_err());
     }
 }

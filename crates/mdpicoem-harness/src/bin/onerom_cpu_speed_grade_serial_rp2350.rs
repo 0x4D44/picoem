@@ -154,7 +154,7 @@ fn parse_cli() -> Result<Cli, String> {
 fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
     emu.load_bootrom(bootrom);
     emu.load_flash(flash);
     emu.reset();
@@ -181,7 +181,7 @@ fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
     let mut phase1_cycle: Option<u64> = None;
     while emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let after = emu.cycles();
         if after == before {
             return Err(format!("cycle counter stalled at {}", before));
@@ -219,7 +219,7 @@ fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
     let mut synced = is_in_serve_loop(&emu) && sentinel_ok(&emu);
     while !synced && emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
-        emu.run(1);
+        emu.run(1).expect("Serial run is infallible");
         let after = emu.cycles();
         if after == before {
             return Err(format!("cycle counter stalled at {}", before));

@@ -5597,7 +5597,7 @@ fn test_reset_loads_sp_and_pc_from_rom() {
 
     // Run a few cycles - should execute the NOP then hit the infinite loop
     for _ in 0..10 {
-        emu.step();
+        emu.step().unwrap();
     }
 
     // Should be stuck at the infinite loop (0x102)
@@ -5630,7 +5630,7 @@ fn test_svc_exception_round_trip() {
 
     // Run enough cycles for: SVC entry (~12) + BX LR return (~12) + settling
     for _ in 0..50 {
-        emu.step();
+        emu.step().unwrap();
     }
 
     // After SVC -> handler -> return, should be in the infinite loop at 0x102
@@ -5672,7 +5672,7 @@ fn test_busfault_on_unmapped_access() {
 
     // Run
     for _ in 0..50 {
-        emu.step();
+        emu.step().unwrap();
     }
 
     // CFSR should have PRECISERR (bit 9) set
@@ -6689,7 +6689,7 @@ fn ldrex_peer_write_strex_fail() {
     // the snoop logic runs regardless of execution.
     emu.core_mut(0).halt();
     emu.core_mut(1).halt();
-    emu.step();
+    emu.step().unwrap();
     assert_eq!(emu.core_mut(0).exclusive_address, None,
         "peer-core write must invalidate our monitor via the snoop");
     assert!(!emu.core_mut(1).did_write_this_quantum,
@@ -6717,7 +6717,7 @@ fn ldrex_ldrex_strex_strex_race() {
     // then the snoop fires at the quantum boundary.
     let mut emu = crate::EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
 
     // Minimal ROM — reset vector points at 0x2000_0000 (SRAM). We drive
     // state directly via the registers so we don't need a full vector
@@ -6773,7 +6773,7 @@ fn ldrex_ldrex_strex_strex_race() {
         {
             break;
         }
-        emu.step();
+        emu.step().unwrap();
     }
     assert_eq!(emu.core_mut(0).reg(0), 0, "core 0 STREX wins");
     assert_eq!(emu.core_mut(1).reg(0), 1, "core 1 STREX loses");
@@ -6952,7 +6952,7 @@ fn bootrom_diagnostic_run() {
     let mut last_trace_pc = 0u32;
 
     for cycle in 0..1_000_000 {
-        emu.step();
+        emu.step().unwrap();
         let pc = emu.cores.expect_arm_mut()[0].regs.pc();
 
         // Trace key bootrom addresses (dedup: skip if same PC as last trace)
@@ -7261,7 +7261,7 @@ fn test_flash_boot_blinky() {
     let mut core1_max_ipsr = 0u32;
 
     for cycle in 0..10_000_000u64 {
-        emu.step();
+        emu.step().unwrap();
         gpio_out_ever |= emu.bus.sio.gpio_out;
         core1_max_ipsr = core1_max_ipsr.max(emu.cores.expect_arm_mut()[1].regs.ipsr());
         let pc = emu.cores.expect_arm_mut()[0].regs.pc();
@@ -7623,7 +7623,7 @@ fn wake_check_clears_wfe_on_event() {
     emu.bus.atomics.set_wfe_waiting(0);
     emu.bus.atomics.event_flag[0].store(true, Ordering::Relaxed);
 
-    emu.step();
+    emu.step().unwrap();
 
     assert!(!emu.core_mut(0).is_wfe_waiting(), "core should have been woken by event_flag");
     assert!(!emu.bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag should have been consumed");
@@ -7646,7 +7646,7 @@ fn test_core1_boot_reaches_wfe() {
     emu.reset();
 
     for _ in 0..1_000_000 {
-        emu.step();
+        emu.step().unwrap();
         // Early exit once Core 1 enters WFE sleep
         if emu.cores.expect_arm_mut()[1].is_wfe_waiting() {
             break;
@@ -7690,7 +7690,7 @@ fn test_dualcore_launch() {
 
     // Run for up to 10M cycles
     for _ in 0..10_000_000u64 {
-        emu.step();
+        emu.step().unwrap();
         // Early exit if both GPIO pins set
         if emu.bus.sio.gpio_out & (1 << 25) != 0 && emu.bus.sio.gpio_out & 1 != 0 {
             break;
@@ -8212,7 +8212,7 @@ fn test_config_sys_clk_hz_seeds_bus() {
 /// at a steady rate so the SysTick tick_systick() call sees deltas.
 fn systick_test_emulator() -> crate::Emulator {
     use crate::{Config, EmulatorBuilder};
-    let mut emu = EmulatorBuilder::new(Config::default()).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
     // Minimal bootrom: SP @ 0x2000_0100, PC @ reset vector 0x0000_0100
     // with a NOP-equivalent `B .` loop so the core just keeps stepping.
     let mut rom = vec![0u8; 32 * 1024];
@@ -8244,7 +8244,7 @@ fn test_dwt_cyccnt_wired_to_core_cycles() {
     emu.core_mut(0).ppb.write32(0xE000_1004, 0);
 
     let cycles_before = emu.cores.expect_arm_mut()[0].cycles();
-    emu.step();
+    emu.step().unwrap();
     let cycles_after = emu.cores.expect_arm_mut()[0].cycles();
     let delta = (cycles_after - cycles_before) as u32;
 
@@ -8270,7 +8270,7 @@ fn test_emulator_tick_systick_advances_per_core() {
     // Snapshot last_systick_cycles to the current value so delta is meaningful.
     emu.core_mut(0).ppb.last_systick_cycles = emu.core_mut(0).cycles();
 
-    emu.step();
+    emu.step().unwrap();
 
     // Multi-reload within the quantum should have set COUNTFLAG.
     assert_ne!(emu.core_mut(0).ppb.syst_csr & (1 << 16), 0,
@@ -8290,7 +8290,7 @@ fn test_emulator_tick_systick_disabled_core_untouched() {
     // Set CVR via field; a register write would clear it.
     emu.core_mut(1).ppb.syst_cvr = 77;
 
-    emu.step();
+    emu.step().unwrap();
 
     assert_eq!(emu.core_mut(1).ppb.syst_cvr, 77,
         "Disabled SysTick must not tick at quantum end");
@@ -8683,7 +8683,7 @@ fn gpio_external_stimulus_overlays_masked_bits() {
     emu.bus.gpio_external_in.store((1 << 5) | (1 << 10), Ordering::Relaxed); // bit 12 low
 
     // One step. Single-quantum is fine — `update_gpio` runs inside it.
-    emu.run(1);
+    emu.run(1).unwrap();
 
     let gpio_in = emu.bus.gpio_in.load(Ordering::Relaxed);
     // Bit 0: PIO-driven high.
@@ -8717,7 +8717,7 @@ fn gpio_external_mask_zero_is_noop() {
     emu.bus.gpio_external_mask = 0;
     emu.bus.gpio_external_in.store(0xFFFF_FFFF, Ordering::Relaxed); // set but masked out
 
-    emu.run(1);
+    emu.run(1).unwrap();
 
     assert_eq!(
         emu.bus.gpio_in.load(Ordering::Relaxed),
@@ -8747,7 +8747,7 @@ fn gpio_external_in_visible_first_cycle_after_write() {
     // instruction that runs in the first step.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build();
+        .build().unwrap();
 
     // Place `LDR R0, [R1, #0]` at SRAM base. Thumb-16 encoding = 0x6808.
     emu.bus.memory.sram_write16(0, 0x6808);
@@ -8770,7 +8770,7 @@ fn gpio_external_in_visible_first_cycle_after_write() {
     emu.bus.gpio_external_mask = 1 << 3;
     emu.bus.gpio_external_in.store(1 << 3, Ordering::Relaxed);
 
-    emu.run(1);
+    emu.run(1).unwrap();
 
     // The LDR must have observed the composed stimulus.
     let r0 = emu.cores.expect_arm()[0].regs.r[0];
@@ -8982,7 +8982,7 @@ fn trace_emulator_step_publishes_pc_via_decode() {
 
     emu.bus.mmio_trace_enabled = true;
     emu.bus.set_mmio_trace_sink(Some(Box::new(capture.clone())));
-    emu.step();
+    emu.step().unwrap();
     emu.bus.mmio_trace_enabled = false;
 
     let captured = capture.0.lock().unwrap();
@@ -9349,7 +9349,7 @@ fn sio_gpio_out_byte_write_replicates_across_lanes() {
     // `sio.gpio_out & sio.gpio_oe`; then verify the byte made it onto
     // those pins. This is the exact property the OneROM CPU-serve loop
     // relies on.
-    emu.run(1);
+    emu.run(1).unwrap();
     // Bits 16..23 reflect `0xA5` — masked against `PIN_MASK` (bits
     // 0..29), they still span the full byte (16..23 all valid).
     let pins_16_23 = (emu.bus.gpio_in.load(Ordering::Relaxed) >> 16) & 0xFF;
@@ -9386,7 +9386,7 @@ fn sio_gpio_out_halfword_write_replicates() {
 #[test]
 fn sio_gpio_oe_byte_write_replicates_across_lanes() {
     use crate::{Config, EmulatorBuilder};
-    let mut emu = EmulatorBuilder::new(Config::default()).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
     emu.bus.write8(0xD000_0030, 0xFF, 0);
     let word = emu.bus.read32(0xD000_0030, 0);
     assert_eq!(word, 0xFFFF_FFFF,
@@ -9424,14 +9424,14 @@ fn sio_non_gpio_out_byte_write_still_rmw() {
 #[test]
 fn mtime_stays_zero_at_post_reset_matches_silicon() {
     use crate::{Config, EmulatorBuilder};
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build();
+    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
     emu.core_mut(0).halt();
     emu.core_mut(1).halt();
     // Post-reset MTIME_CTRL is 0x0D (EN + DBGPAUSE_CORE0 + DBGPAUSE_CORE1,
     // FULLSPEED=0); write EN=1 explicitly so the test survives a future
     // reset-default change.
     emu.mmio_write32(0xD000_01A4, 0x01);
-    emu.run(200);
+    emu.run(200).unwrap();
     let mtime_lo = emu.mmio_read32(0xD000_01B0);
     assert_eq!(mtime_lo, 0,
         "MTIME must not advance without TICKS.RISCV configuration \
@@ -9811,7 +9811,7 @@ fn powman_match_enters_emulator_handler() {
     // Run long enough for alarm to fire and IRQ to dispatch. 100 ticks
     // of POWMAN plus margin for exception-entry cycles.
     let budget = (100 * POWMAN_SYS_PER_TICK as u64) + 500;
-    emu.run(budget);
+    emu.run(budget).unwrap();
 
     // Core 0 should have entered the handler. PC lands at HANDLER_ADDR
     // on entry, then BKPT #0 executes and advances PC by 2. Either
@@ -19530,7 +19530,7 @@ mod stage7_lib_coverage {
 
     #[test]
     fn builder_default_is_arm() {
-        let emu = EmulatorBuilder::new(Config::default()).build();
+        let emu = EmulatorBuilder::new(Config::default()).build().unwrap();
         assert!(emu.cores.is_arm());
     }
 
@@ -19538,7 +19538,7 @@ mod stage7_lib_coverage {
     fn builder_riscv_variant() {
         let emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
         assert!(emu.cores.is_riscv());
     }
 
@@ -19546,21 +19546,21 @@ mod stage7_lib_coverage {
     fn builder_custom_quantum() {
         let emu = EmulatorBuilder::new(Config::default())
             .step_quantum(128)
-            .build();
+            .build().unwrap();
         assert_eq!(emu.step_quantum, 128);
     }
 
     #[test]
     fn builder_custom_sysclk() {
         let config = Config { sys_clk_hz: 125_000_000 };
-        let emu = EmulatorBuilder::new(config).build();
+        let emu = EmulatorBuilder::new(config).build().unwrap();
         assert_eq!(emu.bus.sys_clk_hz(), 125_000_000);
     }
 
     #[test]
     fn run_overshoots_by_up_to_quantum() {
         let mut emu = Emulator::new(Config::default());
-        let final_cycles = emu.run(100);
+        let final_cycles = emu.run(100).unwrap();
         assert!(final_cycles >= 100);
     }
 
@@ -19641,7 +19641,7 @@ mod stage7_lib_coverage {
     fn core_panics_on_riscv() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
         let _ = emu.core_mut(0);
     }
 
@@ -19649,7 +19649,7 @@ mod stage7_lib_coverage {
     fn core_riscv_on_riscv() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
         // Should not panic.
         let _ = emu.core_riscv(0);
         let _ = emu.core_riscv_mut(1);
@@ -19673,7 +19673,7 @@ mod stage7_lib_coverage {
     fn reset_on_riscv_emulator() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
         emu.reset();
     }
 
@@ -19695,7 +19695,7 @@ mod stage7_lib_coverage {
     fn cores_expect_riscv_on_riscv() {
         let emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
         let _ = emu.cores.expect_riscv();
     }
 
@@ -19704,7 +19704,7 @@ mod stage7_lib_coverage {
     fn cores_expect_arm_panics_on_riscv() {
         let emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
         let _ = emu.cores.expect_arm();
     }
 
@@ -19720,7 +19720,7 @@ mod stage7_lib_coverage {
     fn cores_expect_arm_mut_panics_on_riscv() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build();
+            .build().unwrap();
         if let Cores::RiscV(_) = &emu.cores {
             let _ = emu.cores.expect_arm_mut();
         }
