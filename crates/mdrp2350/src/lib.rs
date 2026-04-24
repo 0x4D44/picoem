@@ -87,6 +87,21 @@ pub enum EmulatorError {
         which: threaded::WorkerName,
         message: String,
     },
+    /// The shared [`mdpicoem_common::SpinBarrier`] watchdog fired
+    /// because a worker failed to arrive at the rendezvous within
+    /// [`mdpicoem_common::threaded::DEFAULT_DEADLINE`]. The `Emulator`
+    /// is sticky-poisoned after this; drop and rebuild. HLD V1 §6.6.
+    ///
+    /// Only produced on the Threaded path. `which` is the first worker
+    /// that returned `TimedOut` at its barrier; since the barrier
+    /// cannot identify *which* worker failed to arrive, this field
+    /// names an observer rather than the culprit. `elapsed_ms` is the
+    /// reporting waiter's own wall-clock elapsed time at expiry.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    BarrierTimeout {
+        which: threaded::WorkerName,
+        elapsed_ms: u32,
+    },
 }
 
 impl std::fmt::Display for EmulatorError {
@@ -101,6 +116,13 @@ impl std::fmt::Display for EmulatorError {
                 f,
                 "worker {} panicked: {message}",
                 which.as_str()
+            ),
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            EmulatorError::BarrierTimeout { which, elapsed_ms } => write!(
+                f,
+                "barrier watchdog fired (observed by worker {}) after {}ms",
+                which.as_str(),
+                elapsed_ms
             ),
         }
     }
@@ -258,6 +280,12 @@ pub struct Emulator {
     /// touched on the Serial path.
     #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
     panic_info: Option<(threaded::WorkerName, String)>,
+    /// Sticky watchdog-timeout record from a Threaded run. Set once
+    /// when `run_quantum` / `run` observes a barrier timeout and
+    /// returned on every subsequent call (HLD V1 §6.6 Stage 5). Not
+    /// touched on the Serial path.
+    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    timeout_info: Option<(threaded::WorkerName, u32)>,
     /// Test-only panic injector: arm by calling
     /// [`Self::inject_panic_for_testing`]. The next `run_quantum` /
     /// `run` queues a `PioCommand::TestPanic` so the matching PIO
@@ -504,6 +532,10 @@ impl Emulator {
                     message: message.clone(),
                 });
             }
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            if let Some((which, elapsed_ms)) = self.timeout_info {
+                return Err(EmulatorError::BarrierTimeout { which, elapsed_ms });
+            }
             return Err(EmulatorError::NotSupportedInThreadedMode);
         }
         Ok(self.step_serial())
@@ -665,6 +697,9 @@ impl Emulator {
                     message: message.clone(),
                 });
             }
+            if let Some((which, elapsed_ms)) = self.timeout_info {
+                return Err(EmulatorError::BarrierTimeout { which, elapsed_ms });
+            }
             if self.threaded.is_none() {
                 self.promote_to_threaded();
             }
@@ -676,9 +711,13 @@ impl Emulator {
                 .expect("threaded promoted above");
             match threaded.run_quanta_checked(quanta) {
                 Ok(()) => Ok(threaded.master_cycle()),
-                Err((which, message)) => {
+                Err(threaded::RunError::Panic { which, message }) => {
                     self.panic_info = Some((which, message.clone()));
                     Err(EmulatorError::WorkerPanicked { which, message })
+                }
+                Err(threaded::RunError::Timeout { which, elapsed_ms }) => {
+                    self.timeout_info = Some((which, elapsed_ms));
+                    Err(EmulatorError::BarrierTimeout { which, elapsed_ms })
                 }
             }
         }
@@ -706,13 +745,16 @@ impl Emulator {
 
     #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
     fn run_quantum_threaded(&mut self) -> Result<u64, EmulatorError> {
-        // One-shot: any cached panic short-circuits without touching
-        // worker state. HLD V1 §5.5 item 5.
+        // One-shot: any cached panic / watchdog timeout short-circuits
+        // without touching worker state. HLD V1 §5.5 item 5 / §6.6.
         if let Some((which, message)) = &self.panic_info {
             return Err(EmulatorError::WorkerPanicked {
                 which: *which,
                 message: message.clone(),
             });
+        }
+        if let Some((which, elapsed_ms)) = self.timeout_info {
+            return Err(EmulatorError::BarrierTimeout { which, elapsed_ms });
         }
         // Lazy promotion: first run_quantum / run moves the seeded
         // cores / bus / clock into a fresh ThreadedEmulator so harness
@@ -748,9 +790,13 @@ impl Emulator {
         }
         match threaded.run_quanta_checked(1) {
             Ok(()) => Ok(threaded.master_cycle()),
-            Err((which, message)) => {
+            Err(threaded::RunError::Panic { which, message }) => {
                 self.panic_info = Some((which, message.clone()));
                 Err(EmulatorError::WorkerPanicked { which, message })
+            }
+            Err(threaded::RunError::Timeout { which, elapsed_ms }) => {
+                self.timeout_info = Some((which, elapsed_ms));
+                Err(EmulatorError::BarrierTimeout { which, elapsed_ms })
             }
         }
     }
@@ -785,6 +831,7 @@ impl Emulator {
             execution_model: ExecutionModel::Serial,
             threaded: None,
             panic_info: None,
+            timeout_info: None,
             #[cfg(feature = "testing")]
             pending_panic_inject: None,
             bus_is_placeholder: false,
@@ -1342,6 +1389,8 @@ impl EmulatorBuilder {
             threaded: None,
             #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
             panic_info: None,
+            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            timeout_info: None,
             #[cfg(all(
                 feature = "testing",
                 feature = "threading",

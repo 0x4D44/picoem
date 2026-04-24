@@ -2,6 +2,46 @@
 
 Items discovered during development that need addressing in later phases.
 
+## SpinBarrier watchdog tuning follow-ups (2026-04-24, Stage 5)
+
+Stage 5 added a wall-clock watchdog to `SpinBarrier::wait` in
+`crates/mdpicoem-common/src/threaded/barrier.rs` with a flat 5 s
+default deadline. Several refinements deferred:
+
+1. **Deadline formula.** HLD §6.6 prescribed
+   `quantum_cycles × 256 / min_clock_hz + 5 s`. Stage 5 shipped a
+   flat 5 s for simplicity. Edge case: a test-constructed 1 kHz
+   clock with `step_quantum = 1_000_000` → one quantum = 1000 s wall
+   time, watchdog misfires. No such config exists today; add the
+   formula when a user hits it.
+2. **`threading_micro` per-wait overhead ~6% (HLD target was <2%).**
+   Source: single `Instant::now()` at `wait()` entry (~25 ns per
+   QPC call on Windows). Fast-path fix: lazy-capture on first spin-
+   stride check instead of wait-entry. Most spins complete before
+   SPIN_BUDGET=512 iterations, so `Instant::now()` would rarely be
+   called. Measured vs documented-target mismatch acknowledged;
+   correctness > 4 % perf for v1.
+3. **`WATCHDOG_STRIDE = 1024` > `SPIN_BUDGET = 512`.** The spin-path
+   watchdog check `i & (WATCHDOG_STRIDE-1) == 0` never triggers
+   because SPIN_BUDGET elapses first and we transition to condvar
+   park. Condvar path does check the deadline, so correctness is
+   fine; spin-path check is dead code. Either lower stride to 256
+   or delete the spin-path check and document the condvar-path-only
+   semantics.
+4. **`EmulatorError::BarrierTimeout { which }` attributes to first
+   observer, not culprit.** The barrier cannot identify the
+   never-arriving worker (no arrival signal). `which` is currently
+   hardcoded `WorkerName::Coord` at both chip coordinators. Misleading
+   for a reader. Fix: either drop `which`, or plumb `WorkerName` into
+   `SpinBarrier::wait` so the first tripper records itself.
+5. **`EmulatorError::BarrierTimeout` cfg-gate asymmetry.** mdrp2350
+   cfg-gates the variant on `all(feature = "threading", x86_64,
+   windows)`; mdrp2040 defines it unconditionally (field
+   `timeout_info` IS cfg-gated). Align.
+
+None block Stage 6; all are polish. Low priority — file a cleanup
+pass when touching `barrier.rs` next.
+
 ## Emulator direct-field access is Serial-only but not type-enforced (2026-04-24)
 
 **Current state:** `mdrp2350::Emulator` and `mdrp2040::Emulator`
@@ -1404,31 +1444,6 @@ pass after 40 cycles of dead pins. No case currently verifies that the
 CPU actually drove the right byte onto the data pins via the 1541
 serve loop. The pass count should be read as "0 of 2048 cases are real
 serve-path verifications" until the pin-profile fix lands.
-
-## No watchdog on ThreadedEmulator SpinBarrier::wait (2026-04-22)
-
-**Context:** `crates/mdrp2350/src/threaded/barrier.rs` `SpinBarrier::wait`
-has no timeout. If a worker never arrives at the barrier (e.g. a
-PioBlock whose INSTR_MEM was corrupted into an infinite `JMP` loop, or
-a CortexM33 core that gets stuck spinning on an MMIO read that never
-resolves), the other 5 workers spin through SPIN_BUDGET and then park
-on `park_cv.wait` forever. `cargo test` hangs; `paced_bench_rp2350`
-hangs.
-
-Surfaced during Stage B.4 devil's-advocate review of the threaded
-PIO per-block workers HLD. The poisoning path (`SpinBarrier::poison`)
-handles panicking workers, but nothing handles stuck-but-not-panicking
-workers.
-
-**Fix sketch:** add an optional `wait_timeout(Duration)` variant that
-returns a `Timeout` result, and wire a sentinel timeout into
-`run_quanta` (e.g. `step_quantum * 256 * 100` ns — ~100× the
-expected per-quantum wall). On timeout, call `poison()` and propagate.
-Not high-urgency — no stuck-worker incident has occurred in practice —
-but worth having before any live-mode threaded deployment.
-
-Related: `crates/mdrp2350/src/threaded/emulator.rs` `run_quanta` has
-no overall wall-clock ceiling either.
 
 ## Stage 2 dual-model test gap: no cross-core IRQ routing test (2026-04-24)
 

@@ -46,6 +46,31 @@ use super::peripherals::{ClocksState, IoState, ResetsState, TimerState};
 // ThreadedEmulator
 // =======================================================================
 
+/// Runtime-error payload returned from [`ThreadedEmulator::run_quanta_checked`].
+/// Distinguishes a worker panic from a barrier-watchdog timeout so the
+/// outer [`crate::EmulatorError`] surface can expose the two cases as
+/// separate variants (HLD V1 §6.6 Stage 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunError {
+    /// One of the worker threads panicked. `message` is the downcast
+    /// payload text; `which` is the first worker to return `Err` from
+    /// `JoinHandle::join` scanning in worker-index order.
+    Panic {
+        which: WorkerName,
+        message: String,
+    },
+    /// The shared barrier's wall-clock deadline elapsed before all
+    /// workers arrived. `which` names the first worker whose barrier
+    /// call returned `TimedOut` (an observer, not the culprit); the
+    /// barrier cannot identify the missing worker on its own.
+    /// `elapsed_ms` is the wall-clock elapsed time recorded by the
+    /// first waiter to trip the watchdog.
+    Timeout {
+        which: WorkerName,
+        elapsed_ms: u32,
+    },
+}
+
 /// 3-thread runtime handle over a seeded `SharedState` and both CPU
 /// cores. Construction is via [`Self::from_emulator`].
 pub struct ThreadedEmulator {
@@ -95,6 +120,7 @@ impl ThreadedEmulator {
             execution_model: _,
             threaded: _,
             panic_info: _,
+            timeout_info: _,
             #[cfg(feature = "testing")]
                 pending_panic_inject: _,
             bus_is_placeholder: _,
@@ -316,10 +342,7 @@ impl ThreadedEmulator {
     /// Run `n` quanta and surface worker panics as structured
     /// `Err((which, message))` instead of re-raising. On `Err`, the
     /// instance is poisoned — drop it and rebuild.
-    pub fn run_quanta_checked(
-        &mut self,
-        n: u64,
-    ) -> Result<(), (WorkerName, String)> {
+    pub fn run_quanta_checked(&mut self, n: u64) -> Result<(), RunError> {
         assert!(
             !self.poisoned,
             "ThreadedEmulator poisoned by prior worker panic; drop and rebuild"
@@ -427,7 +450,24 @@ impl ThreadedEmulator {
             self.shared
                 .poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
-            return Err((which, message));
+            return Err(RunError::Panic { which, message });
+        }
+
+        // Stage 5 (HLD V1 §6.6): watchdog-fired barrier exits all
+        // workers cleanly via `TimedOut`, so no `JoinHandle::join`
+        // returns Err. Inspect the barrier directly to distinguish a
+        // timeout from an ordinary clean return. `WorkerName::Coord` is
+        // the observer attribution — the barrier cannot identify the
+        // missing worker.
+        if barrier.timed_out() {
+            self.poisoned = true;
+            self.shared
+                .poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(RunError::Timeout {
+                which: WorkerName::Coord,
+                elapsed_ms: barrier.timeout_elapsed_ms(),
+            });
         }
 
         Ok(())
@@ -575,7 +615,10 @@ fn core_worker_body(
         }
 
         let result = barrier.wait();
-        if result == BarrierResult::Poisoned {
+        if matches!(
+            result,
+            BarrierResult::Poisoned | BarrierResult::TimedOut { .. }
+        ) {
             return core;
         }
     }
@@ -688,7 +731,10 @@ fn coordinator_worker_body(
         }
 
         let result = barrier.wait();
-        if result == BarrierResult::Poisoned {
+        if matches!(
+            result,
+            BarrierResult::Poisoned | BarrierResult::TimedOut { .. }
+        ) {
             return pio_blocks;
         }
     }
@@ -791,10 +837,16 @@ mod tests {
 
         let result = threaded.run_quanta_checked(1);
         match result {
-            Err((WorkerName::Core0, msg)) => {
-                assert!(msg.contains("core0"), "message should name core0: {msg}");
+            Err(RunError::Panic {
+                which: WorkerName::Core0,
+                ref message,
+            }) => {
+                assert!(
+                    message.contains("core0"),
+                    "message should name core0: {message}"
+                );
             }
-            other => panic!("expected Err((Core0, _)), got {other:?}"),
+            other => panic!("expected Err(RunError::Panic{{Core0,...}}), got {other:?}"),
         }
     }
 

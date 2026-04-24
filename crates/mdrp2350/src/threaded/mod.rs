@@ -49,6 +49,6 @@ pub use peripherals::{
 pub use shared::SharedState;
 pub use bus::{PioBus, WorkerBus};
 #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
-pub use emulator::ThreadedEmulator;
+pub use emulator::{RunError, ThreadedEmulator};
 #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
 pub use timings::{RunTimings, WorkerName, WorkerSummary};

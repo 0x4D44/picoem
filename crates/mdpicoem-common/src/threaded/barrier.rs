@@ -27,6 +27,22 @@
 //! current and future waiters with [`BarrierResult::Poisoned`] via the
 //! same `Condvar` broadcast.
 //!
+//! ## Watchdog (Stage 5, HLD V1 §6.6)
+//!
+//! A worker that deadlocks *without* panicking — a PIO block stuck in
+//! an infinite `JMP` loop, a CPU core polling an MMIO read that never
+//! resolves — leaves the poison path untouched. Every `wait` call
+//! therefore carries its own wall-clock deadline
+//! ([`DEFAULT_DEADLINE`] unless constructed via [`SpinBarrier::with_deadline`]).
+//! The spin loop checks `Instant::now()` every [`WATCHDOG_STRIDE`]
+//! iterations and the park loop uses
+//! [`Condvar::wait_timeout`](std::sync::Condvar::wait_timeout) with the
+//! remaining budget, so expiry is detected promptly on both the hot
+//! and cold paths. On expiry, the first waiter records the elapsed
+//! time, flips [`SpinBarrier::timed_out`], and calls
+//! [`SpinBarrier::poison`] so peer waiters wake into a
+//! [`BarrierResult::TimedOut`] exit instead of a latent hang.
+//!
 //! Phase 0c measured ~425 ns mean round-trip (4-way) on the pure-spin
 //! variant; the hybrid keeps that fast path when all workers arrive in
 //! close succession.
@@ -36,8 +52,9 @@
 //! This type is chip-agnostic and may move to `mdpicoem-common` in
 //! Phase 3 when the RP2040 threaded path lands.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Spin iterations before falling back to `Condvar::wait`. `spin_loop()`
 /// hints take ~20 ns on current x86, so 512 iterations is ~10 μs of
@@ -67,6 +84,23 @@ use std::sync::{Condvar, Mutex};
 /// Implementation.md` for the measurement data backing these numbers.
 const SPIN_BUDGET: u32 = 512;
 
+/// Watchdog wall-clock check cadence. The spin loop re-reads `Instant::now()`
+/// every `WATCHDOG_STRIDE` iterations to bound per-iteration overhead. At
+/// `~20 ns` per spin hint, `1024` iterations is `~20 μs` between checks —
+/// comfortably below the default 5-second deadline but cheap enough to
+/// keep the fast path clean (see `threading_micro` regression target
+/// <2%). The stride is a power of two so the test is a bitwise `and`.
+const WATCHDOG_STRIDE: u32 = 1024;
+
+/// Default wall-clock deadline for [`SpinBarrier::wait`]. Picked as a
+/// simple upper bound that catches pathological deadlocks without firing
+/// on any realistic per-quantum rendezvous (Phase 0c measured p99 ≤ 1 μs
+/// for a 4-way barrier; the ThreadedEmulator's 6-way case runs quanta
+/// well under a millisecond even on slow hosts). HLD V1 §6.6 suggested a
+/// clock-derived formula (`quantum_cycles × 256 / min_clock_hz + 5 s`);
+/// a fixed 5 s is strictly simpler and leaves room to refine later.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Outcome of a [`SpinBarrier::wait`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarrierResult {
@@ -74,6 +108,13 @@ pub enum BarrierResult {
     Released,
     /// The barrier was poisoned before release; caller should unwind.
     Poisoned,
+    /// The per-barrier wall-clock deadline expired before all `parties`
+    /// arrived. The waiter that observes this value has already poisoned
+    /// the barrier so the remaining waiters wake on their next check.
+    /// `elapsed_ms` is the wall-clock time between the waiter's own
+    /// [`SpinBarrier::wait`] entry and the expiry detection, for
+    /// diagnostics only (capped at `u32::MAX` ms ≈ 49 days).
+    TimedOut { elapsed_ms: u32 },
 }
 
 /// Fixed-party hybrid barrier with panic-safe poisoning.
@@ -88,6 +129,21 @@ pub struct SpinBarrier {
     count: AtomicU32,
     parties: u32,
     poisoned: AtomicBool,
+    /// Set when any waiter observes deadline expiry (distinct from
+    /// ordinary panic-triggered poisoning). The watchdog sets this
+    /// flag *and* calls [`Self::poison`] so other waiters wake out of
+    /// park, but the coordinator can distinguish a watchdog-fired exit
+    /// from a panic-fired exit by reading [`Self::timed_out`].
+    timed_out: AtomicBool,
+    /// Elapsed milliseconds from the first timing-out waiter's entry to
+    /// its detection of expiry. Written once by the first waiter to
+    /// trip the watchdog, zero otherwise. Surfaced to callers via the
+    /// `TimedOut { elapsed_ms }` variant and a getter.
+    timeout_elapsed_ms: AtomicU64,
+    /// Wall-clock deadline applied to every waiter individually (not a
+    /// shared round deadline). Each [`Self::wait`] call times from its
+    /// own entry.
+    deadline: Duration,
     /// Held briefly by the last arriver (around the `generation` store)
     /// and by earlier arrivers once their spin budget is exhausted
     /// (across a `Condvar::wait`). Uncontended in the fast path.
@@ -97,16 +153,29 @@ pub struct SpinBarrier {
 
 impl SpinBarrier {
     /// Create a barrier that releases when `parties` threads arrive.
+    /// Uses the default wall-clock deadline ([`DEFAULT_DEADLINE`]).
     ///
     /// Panics if `parties < 2` — a single-party barrier is degenerate
     /// and almost always indicates a bug at the call site.
     pub fn new(parties: u32) -> Self {
+        Self::with_deadline(parties, DEFAULT_DEADLINE)
+    }
+
+    /// Create a barrier with an explicit per-waiter wall-clock deadline.
+    ///
+    /// Primarily intended for tests that need a short deadline to
+    /// exercise the watchdog path; production code should use
+    /// [`Self::new`] and inherit [`DEFAULT_DEADLINE`].
+    pub fn with_deadline(parties: u32, deadline: Duration) -> Self {
         assert!(parties >= 2);
         Self {
             generation: AtomicU32::new(0),
             count: AtomicU32::new(0),
             parties,
             poisoned: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
+            timeout_elapsed_ms: AtomicU64::new(0),
+            deadline,
             park_mu: Mutex::new(()),
             park_cv: Condvar::new(),
         }
@@ -114,12 +183,17 @@ impl SpinBarrier {
 
     /// Block until all `parties` threads have arrived at this barrier.
     ///
-    /// Returns [`BarrierResult::Released`] on normal release, or
+    /// Returns [`BarrierResult::Released`] on normal release,
     /// [`BarrierResult::Poisoned`] if [`Self::poison`] was called
-    /// while this thread was waiting (or before it entered `wait`).
+    /// while this thread was waiting (or before it entered `wait`),
+    /// or [`BarrierResult::TimedOut`] if the per-waiter wall-clock
+    /// deadline elapsed before all parties arrived. On timeout the
+    /// observing waiter poisons the barrier so remaining waiters exit
+    /// promptly; the barrier is single-use after that.
     pub fn wait(&self) -> BarrierResult {
+        let start = Instant::now();
         if self.poisoned.load(Acquire) {
-            return BarrierResult::Poisoned;
+            return self.poisoned_or_timed_out_result(start);
         }
         let cur_gen = self.generation.load(Acquire);
         let n = self.count.fetch_add(1, AcqRel) + 1;
@@ -138,30 +212,115 @@ impl SpinBarrier {
             return BarrierResult::Released;
         }
 
-        // Earlier arriver — spin briefly on the fast path.
+        // Earlier arriver — spin briefly on the fast path. The watchdog
+        // check is amortised across `WATCHDOG_STRIDE` iterations so the
+        // fast-path cost of reading `Instant::now()` lands well under
+        // 1% of the per-barrier-round figure measured by
+        // `threading_micro`.
+        let mut i: u32 = 0;
         for _ in 0..SPIN_BUDGET {
             if self.poisoned.load(Acquire) {
-                return BarrierResult::Poisoned;
+                return self.poisoned_or_timed_out_result(start);
             }
             if self.generation.load(Acquire) != cur_gen {
                 return BarrierResult::Released;
             }
+            i = i.wrapping_add(1);
+            if i & (WATCHDOG_STRIDE - 1) == 0 && start.elapsed() >= self.deadline {
+                return self.trip_watchdog(start);
+            }
             std::hint::spin_loop();
         }
 
-        // Fast path exhausted — sleep on the condvar. Idle-for-most-of-
-        // the-quantum workers hit this path and stop burning CPU cycles
-        // that the productive worker would otherwise lose to cache-
-        // coherence traffic on the shared barrier lines.
+        // Fast path exhausted — sleep on the condvar with a remaining-
+        // budget timeout so the watchdog still fires even if every
+        // waiter parked before expiry. Idle-for-most-of-the-quantum
+        // workers hit this path and stop burning CPU cycles that the
+        // productive worker would otherwise lose to cache-coherence
+        // traffic on the shared barrier lines.
         let mut g = self.park_mu.lock().unwrap();
-        while !self.poisoned.load(Acquire) && self.generation.load(Acquire) == cur_gen {
-            g = self.park_cv.wait(g).unwrap();
+        loop {
+            // Check release first so a late-spin-path generation bump
+            // we missed still exits as `Released` rather than falling
+            // into the poisoned-or-timed-out result path.
+            if self.generation.load(Acquire) != cur_gen {
+                return BarrierResult::Released;
+            }
+            if self.poisoned.load(Acquire) {
+                return self.poisoned_or_timed_out_result(start);
+            }
+            let remaining = self.deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                drop(g);
+                return self.trip_watchdog(start);
+            }
+            let (gg, _timeout) = self.park_cv.wait_timeout(g, remaining).unwrap();
+            g = gg;
+            // The top-of-loop predicate handles both the "notified"
+            // and the "spurious / timeout" returns uniformly, so we
+            // don't need to branch on `timeout.timed_out()` here.
         }
-        if self.poisoned.load(Acquire) {
-            BarrierResult::Poisoned
+    }
+
+    /// Return either `Poisoned` or `TimedOut` depending on whether the
+    /// poisoning was caused by watchdog expiry. Shared by every early-
+    /// exit path in `wait`. `start` is only consulted when the calling
+    /// waiter is reporting its own elapsed time and no prior waiter has
+    /// written `timeout_elapsed_ms`.
+    #[inline]
+    fn poisoned_or_timed_out_result(&self, start: Instant) -> BarrierResult {
+        if self.timed_out.load(Acquire) {
+            let recorded = self.timeout_elapsed_ms.load(Acquire);
+            let elapsed_ms = if recorded != 0 {
+                recorded.min(u32::MAX as u64) as u32
+            } else {
+                start.elapsed().as_millis().min(u32::MAX as u128) as u32
+            };
+            BarrierResult::TimedOut { elapsed_ms }
         } else {
-            BarrierResult::Released
+            BarrierResult::Poisoned
         }
+    }
+
+    /// First waiter to detect deadline expiry records the elapsed time,
+    /// flips `timed_out`, and poisons the barrier so other waiters wake
+    /// up immediately. Subsequent callers re-enter via
+    /// [`Self::poisoned_or_timed_out_result`] and observe the recorded
+    /// elapsed time.
+    #[inline]
+    fn trip_watchdog(&self, start: Instant) -> BarrierResult {
+        let elapsed = start.elapsed();
+        let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
+        // Race: two waiters can both elapse before the first CAS. The
+        // first to store wins; the second observes the recorded value
+        // via `poisoned_or_timed_out_result`.
+        let _ = self.timeout_elapsed_ms.compare_exchange(
+            0,
+            elapsed_ms as u64,
+            AcqRel,
+            Acquire,
+        );
+        self.timed_out.store(true, Release);
+        self.poison();
+        BarrierResult::TimedOut { elapsed_ms }
+    }
+
+    /// `true` if the barrier has transitioned to the timed-out state
+    /// (any waiter observed the deadline expire). Distinct from
+    /// ordinary [`Self::poison`] so the coordinator can attribute a
+    /// runtime exit to a watchdog rather than a panic.
+    pub fn timed_out(&self) -> bool {
+        self.timed_out.load(Acquire)
+    }
+
+    /// Elapsed-milliseconds snapshot recorded when the watchdog first
+    /// fired; zero if the barrier never timed out. `u32` because a
+    /// `Duration` isn't `Clone`-friendly inside the emulator error
+    /// variant that surfaces this value.
+    pub fn timeout_elapsed_ms(&self) -> u32 {
+        self.timeout_elapsed_ms
+            .load(Acquire)
+            .min(u32::MAX as u64) as u32
     }
 
     /// Abort all current and future waiters with [`BarrierResult::Poisoned`].
@@ -211,6 +370,7 @@ mod tests {
                     match b.wait() {
                         BarrierResult::Released => f.store(1, SeqCst),
                         BarrierResult::Poisoned => panic!("unexpected poison"),
+                        BarrierResult::TimedOut { .. } => panic!("unexpected timeout"),
                     }
                 })
             })
@@ -244,6 +404,7 @@ mod tests {
                                 c.fetch_add(1, SeqCst);
                             }
                             BarrierResult::Poisoned => panic!("unexpected poison"),
+                            BarrierResult::TimedOut { .. } => panic!("unexpected timeout"),
                         }
                     }
                 })
@@ -284,6 +445,7 @@ mod tests {
                                 c.fetch_add(1, SeqCst);
                             }
                             BarrierResult::Poisoned => panic!("unexpected poison"),
+                            BarrierResult::TimedOut { .. } => panic!("unexpected timeout"),
                         }
                     }
                 })
@@ -337,6 +499,7 @@ mod tests {
                                 c.fetch_add(1, SeqCst);
                             }
                             BarrierResult::Poisoned => panic!("unexpected poison"),
+                            BarrierResult::TimedOut { .. } => panic!("unexpected timeout"),
                         }
                     }
                 })
@@ -385,5 +548,62 @@ mod tests {
                 "waiter should have returned Poisoned"
             );
         }
+    }
+
+    /// Stage 5 (HLD V1 §6.6): a stalled worker must no longer deadlock
+    /// the rendezvous. Two parties, only one arrives; the other waiter
+    /// must observe `TimedOut` within the configured deadline + a small
+    /// wake-up cushion. Uses a short 150 ms deadline so the test runs
+    /// in well under a second; the production default is 5 s.
+    #[test]
+    fn barrier_watchdog_fires_when_worker_stalls() {
+        const DEADLINE: Duration = Duration::from_millis(150);
+        let barrier = Arc::new(SpinBarrier::with_deadline(2, DEADLINE));
+        let b = Arc::clone(&barrier);
+
+        let start = std::time::Instant::now();
+        let handle = thread::spawn(move || b.wait());
+        // Main thread never arrives — the spawned waiter should trip
+        // the watchdog all by itself.
+        let result = handle.join().expect("worker panicked");
+
+        let elapsed = start.elapsed();
+        // Watchdog should fire between the deadline and the deadline
+        // plus a generous host-scheduler cushion. The lower bound is
+        // the interesting correctness check; the upper bound catches
+        // regressions where the stride-based check forgets to also
+        // honour the condvar-timeout path.
+        assert!(
+            elapsed >= DEADLINE,
+            "watchdog fired too early: {elapsed:?} < {DEADLINE:?}"
+        );
+        assert!(
+            elapsed < DEADLINE + Duration::from_millis(500),
+            "watchdog took too long: {elapsed:?} > {:?}",
+            DEADLINE + Duration::from_millis(500)
+        );
+
+        match result {
+            BarrierResult::TimedOut { elapsed_ms } => {
+                assert!(
+                    elapsed_ms >= DEADLINE.as_millis() as u32,
+                    "reported elapsed_ms {elapsed_ms} < deadline {}",
+                    DEADLINE.as_millis()
+                );
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+
+        // One-shot poison semantics: every subsequent wait returns the
+        // same variant without blocking. Without this property a
+        // panicking coordinator could re-enter a watchdog-fired barrier
+        // and hang again.
+        let reentry = barrier.wait();
+        match reentry {
+            BarrierResult::TimedOut { .. } => {}
+            other => panic!("re-entry after timeout should yield TimedOut, got {other:?}"),
+        }
+        assert!(barrier.timed_out());
+        assert!(barrier.timeout_elapsed_ms() >= DEADLINE.as_millis() as u32);
     }
 }

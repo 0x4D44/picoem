@@ -25,7 +25,7 @@ pub use mdpicoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
 
 pub use atomics::CoreAtomics;
 pub use bus::WorkerBus;
-pub use emulator::ThreadedEmulator;
+pub use emulator::{RunError, ThreadedEmulator};
 pub use memory::SharedMemory;
 pub use peripherals::{ClocksState, IoState, Peripherals, ResetsState, TimerState};
 pub use pio::{PioCommand, ThreadedPio};

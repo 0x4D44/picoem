@@ -53,6 +53,31 @@ use super::peripherals::{
 };
 use super::timings::{PerWorkerTimings, RunTimings, TimingRecorder};
 
+/// Runtime-error payload returned from [`ThreadedEmulator::run_quanta_checked`].
+/// Distinguishes a worker panic from a barrier-watchdog timeout so the
+/// outer [`crate::EmulatorError`] surface can expose the two cases as
+/// separate variants (HLD V1 §6.6 Stage 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunError {
+    /// One of the worker threads panicked. `message` is the downcast
+    /// payload text; `which` is the first worker to return `Err` from
+    /// `JoinHandle::join` scanning in worker-index order.
+    Panic {
+        which: super::WorkerName,
+        message: String,
+    },
+    /// The shared barrier's wall-clock deadline elapsed before all
+    /// workers arrived. `which` names the first worker whose barrier
+    /// call returned `TimedOut` (an observer, not the culprit); the
+    /// barrier cannot identify the missing worker on its own.
+    /// `elapsed_ms` is the wall-clock elapsed time recorded by the
+    /// first waiter to trip the watchdog.
+    Timeout {
+        which: super::WorkerName,
+        elapsed_ms: u32,
+    },
+}
+
 /// 6-thread runtime handle over a seeded `SharedState` and both CPU
 /// cores. See module-level docs for the Stage 6b → Stage 7 split, and
 /// the 2026-04-22 Threaded PIO Per-Block Workers HLD V5 for the
@@ -102,6 +127,7 @@ impl ThreadedEmulator {
             execution_model: _,
             threaded: _,
             panic_info: _,
+            timeout_info: _,
             #[cfg(feature = "testing")]
                 pending_panic_inject: _,
             bus_is_placeholder: _,
@@ -424,20 +450,28 @@ impl ThreadedEmulator {
     /// coordinator publishes `master_cycle` + ticks the
     /// coordinator-owned peripherals.
     pub fn run_quanta(&mut self, n: u64) {
-        if let Err((which, message)) = self.run_quanta_checked(n) {
-            panic!("worker {} panicked: {message}", which.as_str());
+        match self.run_quanta_checked(n) {
+            Ok(()) => {}
+            Err(RunError::Panic { which, message }) => {
+                panic!("worker {} panicked: {message}", which.as_str());
+            }
+            Err(RunError::Timeout { which, elapsed_ms }) => {
+                panic!(
+                    "barrier watchdog fired (observed by worker {}) after {}ms",
+                    which.as_str(),
+                    elapsed_ms
+                );
+            }
         }
     }
 
-    /// Run `n` quanta and surface worker panics as structured
-    /// `Err((which, message))` instead of re-raising. Used by the
-    /// dual-execution HLD V1 Stage 1b `EmulatorError::WorkerPanicked`
-    /// wiring (§5.5 item 4). On `Err`, the instance is poisoned: drop
-    /// it and rebuild.
-    pub fn run_quanta_checked(
-        &mut self,
-        n: u64,
-    ) -> Result<(), (super::WorkerName, String)> {
+    /// Run `n` quanta and surface worker panics / barrier-watchdog
+    /// timeouts as a structured [`RunError`] instead of re-raising. Used
+    /// by the dual-execution HLD V1 Stage 1b
+    /// `EmulatorError::WorkerPanicked` wiring (§5.5 item 4) and the
+    /// Stage 5 `EmulatorError::BarrierTimeout` wiring (§6.6). On `Err`,
+    /// the instance is poisoned: drop it and rebuild.
+    pub fn run_quanta_checked(&mut self, n: u64) -> Result<(), RunError> {
         assert!(
             !self.poisoned,
             "ThreadedEmulator poisoned by prior worker panic; drop and rebuild"
@@ -597,7 +631,20 @@ impl ThreadedEmulator {
 
         if let Some((which, message)) = first_panic {
             self.poisoned = true;
-            return Err((which, message));
+            return Err(RunError::Panic { which, message });
+        }
+
+        // Stage 5 (HLD V1 §6.6): watchdog-fired barrier exits all workers
+        // cleanly via `TimedOut`, so no `JoinHandle::join` returns Err.
+        // Inspect the barrier directly to distinguish a timeout from an
+        // ordinary clean return. `WorkerName::Coord` is the observer
+        // attribution — the barrier cannot identify the missing worker.
+        if barrier.timed_out() {
+            self.poisoned = true;
+            return Err(RunError::Timeout {
+                which: super::WorkerName::Coord,
+                elapsed_ms: barrier.timeout_elapsed_ms(),
+            });
         }
 
         if timing {
@@ -804,7 +851,10 @@ fn core_worker_body(
         rec.on_wait_entry();
         let result = barrier.wait();
         rec.on_wait_return();
-        if result == BarrierResult::Poisoned {
+        if matches!(
+            result,
+            BarrierResult::Poisoned | BarrierResult::TimedOut { .. }
+        ) {
             return (core, rec.take());
         }
     }
@@ -871,7 +921,10 @@ fn pio_block_worker_body(
         rec.on_wait_entry();
         let result = barrier.wait();
         rec.on_wait_return();
-        if result == BarrierResult::Poisoned {
+        if matches!(
+            result,
+            BarrierResult::Poisoned | BarrierResult::TimedOut { .. }
+        ) {
             return (block, rec.take());
         }
     }
@@ -994,7 +1047,10 @@ fn coordinator_worker_body(
         rec.on_wait_entry();
         let result = barrier.wait();
         rec.on_wait_return();
-        if result == BarrierResult::Poisoned {
+        if matches!(
+            result,
+            BarrierResult::Poisoned | BarrierResult::TimedOut { .. }
+        ) {
             return ((), rec.take());
         }
     }
