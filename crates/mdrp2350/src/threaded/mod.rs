@@ -10,8 +10,10 @@ pub mod atomics;
 pub mod memory;
 pub mod gpio;
 pub mod monitors;
-pub mod spsc;
-pub mod barrier;
+// `barrier` + `spsc` were promoted to `mdpicoem-common::threaded` as
+// Stage 3a of the dual-execution HLD V1 (§6.4 step 1). The re-exports
+// below keep every existing `crate::threaded::{SpinBarrier, SpscQueue,
+// BarrierResult}` call site source-compatible.
 pub mod sio;
 pub mod pio;
 pub mod peripherals;
@@ -35,8 +37,10 @@ pub use atomics::CoreAtomics;
 pub use memory::SharedMemory;
 pub use gpio::AtomicGpio;
 pub use monitors::ExclusiveMonitors;
-pub use spsc::SpscQueue;
-pub use barrier::{SpinBarrier, BarrierResult};
+// Re-exported from `mdpicoem-common::threaded` (Stage 3a). Chip-local
+// call sites keep using `crate::threaded::{SpinBarrier, BarrierResult,
+// SpscQueue}` unchanged.
+pub use mdpicoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
 pub use sio::ThreadedSio;
 pub use pio::{ThreadedPio, PioCommand};
 pub use peripherals::{

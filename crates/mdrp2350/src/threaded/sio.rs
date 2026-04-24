@@ -26,7 +26,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 
-use super::spsc::SpscQueue;
+use super::SpscQueue;
 
 /// Inter-core FIFO depth on real RP2350 silicon.
 const FIFO_CAPACITY: u32 = 8;

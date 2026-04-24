@@ -27,7 +27,7 @@
 //! concurrent writes to the same PIO register from two cores serialize
 //! arbitrarily through the Mutex, which matches real hardware semantics.
 
-use super::spsc::SpscQueue;
+use super::SpscQueue;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 

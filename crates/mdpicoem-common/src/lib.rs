@@ -12,6 +12,10 @@ pub mod fifo;
 pub mod memory;
 pub mod pacer;
 pub mod pio;
+// Thread-coordination primitives (Dual-execution HLD V1 §6.4 step 1).
+// Inner `#![cfg(...)]` on `threaded/mod.rs` gates the platform surface;
+// the submodule declaration itself is unconditional.
+pub mod threaded;
 
 pub use self::clock::Clock;
 pub use self::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
