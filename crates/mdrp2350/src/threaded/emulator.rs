@@ -101,6 +101,14 @@ pub struct ThreadedEmulator {
     /// first call or after a call with `timing_enabled == false`.
     /// Each call resets this — no cross-call accumulation.
     last_run_timings: Option<RunTimings>,
+    /// Latched true once either CPU worker observed the bootrom mask-ROM
+    /// hook fire (HLD V5 §"Component 3"). Drained from each
+    /// `CortexM33::bootrom_hook_fired` at the post-`run_quanta_checked`
+    /// join, so it survives across calls and is visible to the host via
+    /// [`Self::shutdown_requested`]. Mirrors the serial drain in
+    /// `lib.rs:707-717` — without this, worker-side latches never reach
+    /// `Emulator::shutdown_requested` and the host loops forever.
+    bootrom_hook_fired: bool,
 }
 
 impl ThreadedEmulator {
@@ -132,6 +140,7 @@ impl ThreadedEmulator {
             #[cfg(feature = "testing")]
                 pending_panic_inject: _,
             bus_is_placeholder: _,
+            shutdown_requested,
         } = emu;
         // ThreadedEmulator currently only supports the Arm arm — RISC-V
         // (Hazard3) lives behind the P1a enum but doesn't thread yet.
@@ -350,7 +359,19 @@ impl ThreadedEmulator {
             poisoned: false,
             timing_enabled: false,
             last_run_timings: None,
+            // Carry the seeded `Emulator::shutdown_requested` across the
+            // hand-off so a hook fired on the serial path before
+            // promotion is not silently dropped.
+            bootrom_hook_fired: shutdown_requested,
         }
+    }
+
+    /// Latched bootrom mask-ROM hook flag (HLD V5 §"Component 3").
+    /// Set true once either CPU worker observed `pc == bootrom_reboot_hook_pc_*`
+    /// during any past `run_quanta_checked`. Surfaced to the host via
+    /// `Emulator::shutdown_requested` so the run loop can exit cleanly.
+    pub fn shutdown_requested(&self) -> bool {
+        self.bootrom_hook_fired
     }
 
     /// Override the default host-core pinning mask. The supplied mask
@@ -570,10 +591,20 @@ impl ThreadedEmulator {
         let mut tc = PerWorkerTimings::default();
 
         if let Ok((c, t)) = r0 {
+            // Drain the bootrom-hook latch into the host-visible flag
+            // before re-storing the core (mirrors the serial drain in
+            // `lib.rs:707-717`). Hook is terminate-only / sticky, so a
+            // single OR-into is correct across calls.
+            if c.bootrom_hook_fired {
+                self.bootrom_hook_fired = true;
+            }
             self.core0 = Some(c);
             t0 = t;
         }
         if let Ok((c, t)) = r1 {
+            if c.bootrom_hook_fired {
+                self.bootrom_hook_fired = true;
+            }
             self.core1 = Some(c);
             t1 = t;
         }

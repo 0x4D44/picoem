@@ -323,6 +323,28 @@ pub struct CortexM33 {
     pub(crate) decode_cache: Box<[crate::bus::DecodedOp; crate::bus::DECODE_CACHE_SIZE]>,
     /// Per-core workload counters (Phase 0a instrumentation).
     pub counters: CoreCounters,
+    /// Bootrom `reboot` hook PC in **Secure** state (HLD V5 §"Component
+    /// 3 — Bootrom mask-ROM"). Populated by [`crate::Emulator::load_bootrom`]
+    /// from [`crate::bootrom_hooks::resolve_bootrom_hooks`]; `None` when no
+    /// bootrom has been loaded or the binary lacks the `RB` table entry.
+    ///
+    /// When the per-step PC equals this value the hook fires
+    /// terminate-only — see [`Self::bootrom_hook_fired`].
+    pub bootrom_reboot_hook_pc_s: Option<u32>,
+    /// Bootrom `reboot` hook PC at the **Non-Secure** alias (`+0x8000`)
+    /// per RP2350 IDAU. Same population path as `_pc_s`. NS firmware
+    /// fetching the bootrom via the NS alias resolves to this PC and
+    /// must also fire the hook.
+    pub bootrom_reboot_hook_pc_ns: Option<u32>,
+    /// Latched flag set by the per-step bootrom-hook check when
+    /// `pc == bootrom_reboot_hook_pc_{s,ns}`. The outer scheduler
+    /// (`Emulator::step_serial`, threaded core-worker) snapshots this
+    /// flag each quantum and propagates it to
+    /// [`crate::Emulator::shutdown_requested`]; once set, the core is
+    /// halted via `atomics.set_halted(core)` so it never re-enters
+    /// `decode_execute`. Terminate-only contract — never cleared by the
+    /// core itself.
+    pub bootrom_hook_fired: bool,
 }
 
 impl CortexM33 {
@@ -357,6 +379,9 @@ impl CortexM33 {
             sio_local: PerCoreSio::default(),
             decode_cache,
             counters: CoreCounters::default(),
+            bootrom_reboot_hook_pc_s: None,
+            bootrom_reboot_hook_pc_ns: None,
+            bootrom_hook_fired: false,
         }
     }
 
@@ -416,6 +441,22 @@ impl CortexM33 {
         // step's top-of-loop check sees the still-pending exception.
         if let Some(cost) = self.try_take_any_pending_exception(bus) {
             self.cycles = self.cycles.wrapping_add(cost as u64);
+            return;
+        }
+
+        // Bootrom mask-ROM hook (HLD V5 §"Component 3"). Terminate-only
+        // — when PC matches the resolved RB entry-point (Secure or
+        // Non-Secure alias) we latch `bootrom_hook_fired`, halt the
+        // core via `atomics.set_halted`, and return without dispatching
+        // the instruction. The outer scheduler observes the halt at
+        // the quantum boundary and propagates `shutdown_requested` on
+        // the `Emulator`.
+        let pc = self.regs.pc();
+        if Some(pc) == self.bootrom_reboot_hook_pc_s
+            || Some(pc) == self.bootrom_reboot_hook_pc_ns
+        {
+            self.bootrom_hook_fired = true;
+            self.atomics.set_halted(core);
             return;
         }
 
@@ -493,6 +534,17 @@ impl CortexM33 {
 
         if let Some(cost) = self.try_take_any_pending_exception(bus) {
             self.cycles = self.cycles.wrapping_add(cost as u64);
+            return;
+        }
+
+        // Bootrom mask-ROM hook — same shape as `Self::step`, see HLD
+        // V5 §"Component 3 — Bootrom mask-ROM" / "Hook check placement".
+        let pc = self.regs.pc();
+        if Some(pc) == self.bootrom_reboot_hook_pc_s
+            || Some(pc) == self.bootrom_reboot_hook_pc_ns
+        {
+            self.bootrom_hook_fired = true;
+            self.atomics.set_halted(self.core_id as usize);
             return;
         }
 

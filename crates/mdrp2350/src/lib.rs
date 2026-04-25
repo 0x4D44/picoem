@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+pub mod bootrom_hooks;
 pub mod core;
 pub mod core_riscv;
 pub mod bus;
@@ -161,6 +162,60 @@ pub enum StopReason {
 /// Re-exported from [`bus::clocks`] for backward compatibility.
 pub use self::bus::clocks::ROSC_FREQ_HZ;
 
+/// Loads the pinned silicon-derived RP2354 bootrom from the in-tree
+/// `roms/rp2350/bootrom-combined.bin`, verifies it against the sibling
+/// `bootrom-combined.bin.sha256`, and returns the raw bytes.
+///
+/// HLD V5 §"Component 3 — Bootrom mask-ROM": all callers wanting the
+/// real silicon binary (mdrp2350app, harness oracles, future
+/// integration tests) funnel through this helper so the SHA256 pin is
+/// enforced at one site. Synthetic-ROM unit tests in this crate
+/// continue to call [`Emulator::load_bootrom`] directly with hand-
+/// crafted bytes — the assert lives here, not in `load_bootrom`, so
+/// that path stays open.
+///
+/// On hash mismatch the function returns
+/// `io::Error::new(io::ErrorKind::InvalidData, ...)` rather than
+/// panicking — callers may want to handle pin drift gracefully (e.g.
+/// to print a refresh hint and exit cleanly).
+pub fn load_pinned_silicon_bootrom() -> std::io::Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    // CARGO_MANIFEST_DIR points at `crates/mdrp2350`; project root is
+    // two parents up.
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.pop(); // crates
+    root.pop(); // workspace root
+    let bin_path = root.join("roms").join("rp2350").join("bootrom-combined.bin");
+    let sha_path = root
+        .join("roms")
+        .join("rp2350")
+        .join("bootrom-combined.bin.sha256");
+
+    let bytes = std::fs::read(&bin_path)?;
+    let expected_hex = std::fs::read_to_string(&sha_path)?;
+    let expected_hex = expected_hex.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let actual_hex = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+    if actual_hex != expected_hex {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bootrom SHA256 mismatch: expected {}, got {} (refresh \
+                 roms/rp2350/bootrom-combined.bin.sha256 if the binary was \
+                 intentionally updated)",
+                expected_hex, actual_hex
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Emulator configuration.
 pub struct Config {
     /// System clock frequency in Hz. Default: ROSC (~6.5 MHz).
@@ -315,6 +370,14 @@ pub struct Emulator {
     /// type-enforced (2026-04-24)".
     #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
     pub(crate) bus_is_placeholder: bool,
+    /// Latched true once the bootrom `reboot` mask-ROM hook fires on
+    /// either core (HLD V5 §"Component 3"). Terminate-only: once set,
+    /// the cores are halted and the host is expected to drop the
+    /// emulator instance. Drained from
+    /// [`CortexM33::bootrom_hook_fired`] inside `step_serial` /
+    /// `run_quantum`'s post-step path. Soft-reboot scenarios that need
+    /// to re-init must rebuild the emulator from scratch.
+    pub shutdown_requested: bool,
 }
 
 impl Emulator {
@@ -363,6 +426,19 @@ impl Emulator {
         // cores must reuse the existing Arc so post-reset asserts land
         // on the same state the Bus sees.
         let atomics = Arc::clone(&self.bus.atomics);
+        // Bootrom hook PCs are derived from the loaded ROM bytes.
+        // `CortexM33::new` clears the fields, so re-resolve here from
+        // the live `Memory` so the hook survives `reset`. HLD V5
+        // §"Component 3 — Soft-reboot / reload".
+        let (hook_s, hook_ns) = {
+            // Read the first 32 KB of ROM into a scratch buffer; the
+            // resolver only needs offsets 0x14 and ≥0x7cd4.
+            let mut rom_bytes = vec![0u8; crate::memory::ROM_SIZE];
+            for (i, b) in rom_bytes.iter_mut().enumerate() {
+                *b = self.bus.memory.rom_read8(i as u32);
+            }
+            bootrom_hooks::resolve_bootrom_hooks(&rom_bytes, b"RB")
+        };
         match &mut self.cores {
             Cores::Arm(arm) => {
                 for i in 0..2 {
@@ -371,6 +447,8 @@ impl Emulator {
                     arm[i].regs.r[13] = initial_sp;
                     arm[i].regs.set_pc(reset_vector & !1);
                     arm[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
+                    arm[i].bootrom_reboot_hook_pc_s = hook_s;
+                    arm[i].bootrom_reboot_hook_pc_ns = hook_ns;
                 }
             }
             Cores::RiscV(cs) => {
@@ -451,6 +529,10 @@ impl Emulator {
         // pico-sdk post-`runtime_init_clocks` state (clk_sys = 150 MHz,
         // clk_ref = 12 MHz, clk_peri = clk_sys).
         self.bus.seed_post_bootrom_clocks();
+
+        // Bootrom hook latch — clear so a post-reset run doesn't see
+        // a stale `shutdown_requested` from the prior life.
+        self.shutdown_requested = false;
     }
 
     /// Load a raw binary at the given address.
@@ -475,6 +557,20 @@ impl Emulator {
     /// Load the bootrom (32 kB at address 0x00000000). Also invalidates
     /// the ROM-region decode-cache entries on both cores — the bytes
     /// have been replaced wholesale. SRAM / XIP slots are preserved.
+    ///
+    /// Bootrom mask-ROM hook PCs (HLD V5 §"Component 3") are recomputed
+    /// from the freshly-loaded bytes and written into both cores'
+    /// `bootrom_reboot_hook_pc_s` / `_pc_ns` fields. Soft-reboot
+    /// scenarios that re-call this function get fresh hook PCs.
+    ///
+    /// **Mid-run reload caveat (threaded mode).** In Threaded mode each
+    /// `CortexM33` is moved by value into a worker thread at spawn
+    /// (`threaded::core_worker_body`); a mid-run reload would not
+    /// reach the worker-owned core. The current `Emulator` API has no
+    /// "join workers, reload, respawn" entry point — mid-run reload is
+    /// not a supported use case. The pre-spawn population path (call
+    /// `load_bootrom` before the first `run`/`run_quantum`) is fully
+    /// supported and exercised by the unit tests.
     pub fn load_bootrom(&mut self, data: &[u8]) {
         self.bus.load_bootrom(data);
         // Bus set the ROM bit in `pending_invalidation_regions`; drain
@@ -483,8 +579,15 @@ impl Emulator {
         // review fix — region-scoped to avoid cold-cache regressions.
         let regions = self.bus.pending_invalidation_regions;
         if let Cores::Arm(arm) = &mut self.cores {
+            // Resolve the bootrom `RB` (reboot) hook PCs and seed both
+            // cores. `data` is the same buffer we just gave the bus —
+            // resolving from it directly avoids a redundant memory
+            // re-read.
+            let (s, ns) = bootrom_hooks::resolve_bootrom_hooks(data, b"RB");
             for core in arm.iter_mut() {
                 core.invalidate_decode_cache_regions(regions);
+                core.bootrom_reboot_hook_pc_s = s;
+                core.bootrom_reboot_hook_pc_ns = ns;
             }
         }
         self.bus.pending_invalidation_regions = 0;
@@ -601,6 +704,18 @@ impl Emulator {
             Cores::RiscV(cs) => step_pair_riscv(cs, &mut self.bus, target),
         }
 
+        // Drain bootrom-hook latches into `shutdown_requested` (HLD V5
+        // §"Component 3"). The hook check inside
+        // `CortexM33::step{,_no_atomics}` halts the core and sets
+        // `bootrom_hook_fired`; surface that to the host on the
+        // Emulator. Cheap — two byte-loads per quantum, off the
+        // per-instruction hot path.
+        if let Cores::Arm(cs) = &mut self.cores {
+            if cs[0].bootrom_hook_fired || cs[1].bootrom_hook_fired {
+                self.shutdown_requested = true;
+            }
+        }
+
         self.clock.advance(self.step_quantum as u64);
         // S4: peripherals tick the full quantum, not `consumed` (bytes
         // the cores actually executed). V5 §5.5 prescribes an
@@ -710,7 +825,15 @@ impl Emulator {
                 .as_mut()
                 .expect("threaded promoted above");
             match threaded.run_quanta_checked(quanta) {
-                Ok(()) => Ok(threaded.master_cycle()),
+                Ok(()) => {
+                    // Drain bootrom-hook latch to the host-visible field
+                    // (HLD V5 §"Component 3"). Mirrors the serial drain
+                    // at line 707 above.
+                    if threaded.shutdown_requested() {
+                        self.shutdown_requested = true;
+                    }
+                    Ok(threaded.master_cycle())
+                }
                 Err(threaded::RunError::Panic { which, message }) => {
                     self.panic_info = Some((which, message.clone()));
                     Err(EmulatorError::WorkerPanicked { which, message })
@@ -789,7 +912,15 @@ impl Emulator {
             threaded.shared().atomics.set_halted(1);
         }
         match threaded.run_quanta_checked(1) {
-            Ok(()) => Ok(threaded.master_cycle()),
+            Ok(()) => {
+                // Drain bootrom-hook latch to the host-visible field
+                // (HLD V5 §"Component 3"). Mirrors the serial drain
+                // at line 707 in `step_serial`'s post-quantum block.
+                if threaded.shutdown_requested() {
+                    self.shutdown_requested = true;
+                }
+                Ok(threaded.master_cycle())
+            }
             Err(threaded::RunError::Panic { which, message }) => {
                 self.panic_info = Some((which, message.clone()));
                 Err(EmulatorError::WorkerPanicked { which, message })
@@ -835,6 +966,7 @@ impl Emulator {
             #[cfg(feature = "testing")]
             pending_panic_inject: None,
             bus_is_placeholder: false,
+            shutdown_requested: self.shutdown_requested,
         };
         self.threaded = Some(threaded::ThreadedEmulator::from_emulator(seeded));
         // Mark the flat fields as dead state — they now hold
@@ -1400,6 +1532,7 @@ impl EmulatorBuilder {
             pending_panic_inject: None,
             #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
             bus_is_placeholder: false,
+            shutdown_requested: false,
         };
         Ok(emu)
     }

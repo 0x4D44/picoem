@@ -53,6 +53,15 @@ pub fn run(
         emu.run(qc).expect("Serial run is infallible");
         pacer.end_quantum();
 
+        // Honour the bootrom mask-ROM hook (HLD V5 §"Component 3"): a
+        // firmware call into the bootrom `reboot` entry latches
+        // `shutdown_requested` and halts both cores. Exit the run loop
+        // cleanly so the TUI can return to its outer shell instead of
+        // spinning on a halted emulator forever.
+        if emu.shutdown_requested {
+            return Ok(());
+        }
+
         // Follow firmware clock reconfiguration (PLL bring-up, mux
         // switches). Zero-cost when sys_clk_hz is unchanged — see
         // LLD V2 §4.7.
