@@ -682,6 +682,11 @@ pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: b
     // Phase 2: data onto the bus, IOW still asserted. The PIO's
     // `in pins, 8` reads data from the same GPIO pins after a NOP
     // delay. This must happen before the PIO executes its data read.
+    //
+    // PICOGUS_WRITE16_SWAP: experimental byte-order swap for write16
+    // events. When set, the HIGH byte goes to the LOW port first and
+    // the LOW byte goes to the HIGH port second. Tests the theory that
+    // the trace's `val` encoding differs from the x86 OUTW byte order.
     let data_lo = data & ((1u16 << DATA_BITS) - 1);
     sink.drive_pins(true, false, data_lo);
     sink.step(data_hold);
@@ -782,6 +787,19 @@ pub fn replay<S: IsaSink>(
         summary.stall_events += stalls;
     }
 
+    // PICOGUS_R44_SWAP: targeted byte-swap for write16 events that
+    // update GUS register 0x44 (DRAM address MSW). When enabled, we
+    // track the most recently selected register (via write8 to port
+    // 0x343) and if a write16 to 0x344 lands while r0x44 is selected,
+    // we deliver `val` with its two bytes swapped — testing the
+    // theory that the trace's 16-bit val encoding doesn't match the
+    // x86 OUTW byte order picogus expects.
+    let r44_swap_enabled = std::env::var("PICOGUS_R44_SWAP").is_ok();
+    if r44_swap_enabled {
+        eprintln!("[diag] PICOGUS_R44_SWAP enabled — swapping write16 bytes when r0x44 selected");
+    }
+    let mut current_reg_select: u16 = 0;
+
     for ev in events {
         if let Some(limit) = duration_ns {
             if ev.ns > limit {
@@ -805,7 +823,24 @@ pub fn replay<S: IsaSink>(
 
         if ev.kind.is_write() {
             let wide = matches!(ev.kind, TraceKind::Write16);
-            drive_write_cycle(sink, ev.port, ev.value, wide);
+
+            // Track gRegSelect via writes to port 0x343.
+            if ev.port == 0x343 && !wide {
+                current_reg_select = ev.value;
+            }
+
+            // Targeted r0x44 swap.
+            let data_to_send = if r44_swap_enabled
+                && wide
+                && ev.port == 0x344
+                && current_reg_select == 0x44
+            {
+                ((ev.value >> 8) & 0xFF) | ((ev.value & 0xFF) << 8)
+            } else {
+                ev.value
+            };
+
+            drive_write_cycle(sink, ev.port, data_to_send, wide);
             summary.writes_fired += 1;
         } else {
             summary.reads_skipped += 1;
@@ -1138,6 +1173,15 @@ fn replay_with_coverage(
 
     let mut fired_so_far: u64 = 0;
 
+    // PICOGUS_R44_SWAP: targeted byte-swap for write16 events updating
+    // GUS r0x44. See the standalone `replay` for rationale.
+    let r44_swap_enabled = std::env::var("PICOGUS_R44_SWAP").is_ok();
+    if r44_swap_enabled {
+        eprintln!("[diag] PICOGUS_R44_SWAP enabled (replay_with_coverage)");
+    }
+    let mut current_reg_select: u16 = 0;
+    let mut r44_swap_hits: u64 = 0;
+
     for ev in events {
         if let Some(limit) = duration_ns {
             if ev.ns > limit {
@@ -1169,15 +1213,32 @@ fn replay_with_coverage(
             continue;
         }
 
+        // Track current register select via write8 to port 0x343.
+        if !matches!(ev.kind, TraceKind::Write16) && ev.port == 0x343 {
+            current_reg_select = ev.value;
+        }
+
         let is_wide = matches!(ev.kind, TraceKind::Write16);
         let sub_count = if is_wide { 2usize } else { 1 };
+
+        // Apply targeted r0x44 byte swap.
+        let effective_value = if r44_swap_enabled
+            && is_wide
+            && ev.port == 0x344
+            && current_reg_select == 0x44
+        {
+            r44_swap_hits += 1;
+            ((ev.value >> 8) & 0xFF) | ((ev.value & 0xFF) << 8)
+        } else {
+            ev.value
+        };
 
         for sub_idx in 0..sub_count {
             let fired_port = ev.port.wrapping_add(sub_idx as u16);
             let fired_data = if sub_idx == 0 {
-                (ev.value & 0xFF) as u8
+                (effective_value & 0xFF) as u8
             } else {
-                ((ev.value >> 8) & 0xFF) as u8
+                ((effective_value >> 8) & 0xFF) as u8
             };
             let class = classify_sub_event(ev.port, ev.value, is_wide, sub_idx);
 
@@ -1272,6 +1333,10 @@ fn replay_with_coverage(
                 cov.post_roll_orphans += post_roll_delta;
             }
         }
+    }
+
+    if r44_swap_enabled {
+        eprintln!("[diag] r0x44 swap hits: {}", r44_swap_hits);
     }
 
     (summary, cov)
@@ -1607,6 +1672,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             eprintln!(
                 "PSRAM pre-seeded with 8-bit triangle wave (PICOGUS_PSRAM_PRESEED set)"
+            );
+        }
+    }
+
+    // Preseed PSRAM from a binary file containing raw DRAM bytes.
+    // Byte 0 of the file lands at PSRAM offset 0 (= GUS DRAM address 0).
+    // Overrides / follows PICOGUS_PSRAM_PRESEED if both are set.
+    // Use `wrk_scratch/extract_dram_from_trace.py` to produce a file
+    // from a captured picogus-tap trace.
+    if let Ok(path) = std::env::var("PICOGUS_PSRAM_LOAD") {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("PICOGUS_PSRAM_LOAD: reading {path}: {e}"))?;
+        if let Some(ref mut psram) = emu.bus.psram {
+            let n = bytes.len().min(psram.buffer.len());
+            psram.buffer[..n].copy_from_slice(&bytes[..n]);
+            let nz = psram.buffer[..n].iter().filter(|&&b| b != 0).count();
+            eprintln!(
+                "PSRAM pre-loaded {n} bytes from {path} (nonzero={nz})"
             );
         }
     }
@@ -2227,6 +2310,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("tick() calls:      {}", psram.tick_count);
         println!("CS# falling edges: {}  (== SPI frames started)", psram.cs_falling_count);
+
+        // DRAM-upload signature probe (2026-04-24 investigation). Three
+        // bytes at expected bank-1 locations (addr 65536, 65540, 65544).
+        // Under picogus' literal interpretation (val>>8 → dram_high) the
+        // game's bank-1 writes collapse onto bank 0 and these bytes stay
+        // zero. Under swapped delivery (or a correct r44 interpretation)
+        // they hold the game's 16-bit PCM data.
+        let buf = &psram.buffer;
+        let n = buf.len();
+        let probe = |a: usize| if a < n { Some(buf[a]) } else { None };
+        println!();
+        println!("--- DRAM bank-1 signature probe ---");
+        println!(
+            "bytes [65532..65544] = {:?}",
+            (65532..65544).map(probe).collect::<Vec<_>>()
+        );
+        println!(
+            "bytes [65536..65568] = {:?}",
+            (65536..65568).map(probe).collect::<Vec<_>>()
+        );
+        let bank1_nz = (65536..102_898).filter_map(probe).filter(|&b| b != 0).count();
+        println!(
+            "nonzero bytes in [65536..102898]: {}/37362",
+            bank1_nz
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3752,7 +3860,7 @@ ns,port,value,kind
         let mut emu = EmulatorBuilder::new(Config {
             sys_clk_hz: 125_000_000,
         })
-        .build();
+        .build().expect("Serial build is infallible");
 
         // Seed ROM with a minimal vector table + self-branch loop so
         // reset brings core 0 up running instructions (rather than
@@ -3894,7 +4002,7 @@ ns,port,value,kind
         let mut emu = EmulatorBuilder::new(Config {
             sys_clk_hz: 125_000_000,
         })
-        .build();
+        .build().expect("Serial build is infallible");
         emu.reset();
 
         // Use a thin wrapper that exposes gpio_in between phases.
@@ -4182,7 +4290,7 @@ ns,port,value,kind
             sys_clk_hz: 125_000_000,
         })
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
         // Same minimal vector + B-to-self loop as
         // replay_advances_emulator_to_target_cycles.
@@ -4385,7 +4493,7 @@ ns,port,value,kind
             sys_clk_hz: 125_000_000,
         })
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
 
         let mut rom = vec![0u8; 16];
         // Initial SP at top of SRAM
@@ -4403,7 +4511,7 @@ ns,port,value,kind
         // taken branch = 3 sysclks.
         let mut reference_cycles: Vec<u64> = Vec::new();
         for _ in 0..8 {
-            emu.step();
+            emu.step().expect("Serial step is infallible");
             reference_cycles.push(emu.cycles());
         }
         assert_eq!(
@@ -4420,7 +4528,7 @@ ns,port,value,kind
             sys_clk_hz: 125_000_000,
         })
         .step_quantum(1)
-        .build();
+        .build().expect("Serial build is infallible");
         emu2.load_image(0x0000_0000, &rom);
         emu2.reset();
         let mut sink = CapturingSink::new(emu2, 125_000_000);
@@ -4526,7 +4634,7 @@ ns,port,value,kind
         })
         .step_quantum(1)
         .flash(CHIME_FIRMWARE.to_vec())
-        .build();
+        .build().expect("Serial build is infallible");
         emu.load_bootrom(&minimal_bootrom_for_flash_entry());
         emu.reset();
 
