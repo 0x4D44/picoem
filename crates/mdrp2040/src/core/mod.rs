@@ -224,12 +224,13 @@ impl CortexM0Plus {
             return 0;
         }
 
-        // IRQ poll + dispatch (before instruction fetch). Returns the
-        // cycle cost of exception entry if one was taken; `0` otherwise.
-        let irq_cycles = self.maybe_dispatch_external_irq(bus);
-        if irq_cycles != 0 {
-            self.cycles = self.cycles.wrapping_add(irq_cycles as u64);
-            return irq_cycles;
+        // Pre-fetch exception poll + dispatch (PendSV / SysTick / external
+        // IRQ, all arbitrated in one pass). Returns the cycle cost of
+        // exception entry if one was taken; `0` otherwise.
+        let exc_cycles = self.try_take_any_pending_exception(bus);
+        if exc_cycles != 0 {
+            self.cycles = self.cycles.wrapping_add(exc_cycles as u64);
+            return exc_cycles;
         }
 
         let mut cycles = self.decode_execute(bus);
@@ -258,75 +259,85 @@ impl CortexM0Plus {
         cycles
     }
 
-    /// Poll the per-core NVIC for a dispatchable external IRQ.
+    /// Poll all pending exception sources (PendSV via ICSR.PENDSVSET,
+    /// SysTick via ICSR.PENDSTSET, and per-core NVIC IRQs) and dispatch
+    /// the highest-priority candidate. HLD V5 §5.3.
     ///
-    /// Selection rule (HLD V7 §5.2, adapted for M0+'s 4-level priority):
-    /// 1. Mask to pending AND enabled (`nvic.pending_and_enabled()`).
-    /// 2. If PRIMASK is set, dispatch no external IRQ (PRIMASK raises
-    ///    execution priority to 0, which ties all configurable IRQ
-    ///    priorities).
-    /// 3. Otherwise pick the lowest-numerical-priority IRQ (lower value
-    ///    = architecturally higher priority); tie-break by lowest IRQ
-    ///    number (ARMv6-M ARM §B1.5.10).
-    /// 4. Require the candidate's priority to be strictly less (higher)
-    ///    than the current execution priority. Current execution
-    ///    priority is 0 when we're already in any handler (we simplify:
-    ///    any in-progress exception has priority 0 on M0+, so external
-    ///    IRQs with configurable priority never preempt — tail-chaining
-    ///    still works because it runs from `exit_exception` not here).
+    /// Selection rule:
+    /// 1. PRIMASK=1 masks every configurable-priority exception, so we
+    ///    return 0 immediately. NMI/HardFault are not driven through
+    ///    this path — they enter via `deliver_fault`.
+    /// 2. Candidates are PendSV (#14, priority via SHPR3 byte 2),
+    ///    SysTick (#15, priority via SHPR3 byte 3), and the
+    ///    highest-priority pending+enabled NVIC IRQ.
+    /// 3. Lower numerical priority value wins; tie-break by lower
+    ///    exception number (ARMv6-M ARM §B1.5.10 — system exceptions
+    ///    sit below external IRQs in the tie-break order because their
+    ///    exception numbers are lower).
+    /// 4. `can_dispatch_now` gates the dispatch — V1 keeps the existing
+    ///    "no preemption" rule (see doc comment).
     ///
-    /// Returns the cycle count of exception entry (non-zero on dispatch,
-    /// `0` otherwise).
-    fn maybe_dispatch_external_irq<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
-        // PRIMASK blocks everything below NMI/HardFault priority. Per
-        // ARMv6-M M0+, configurable priorities are 0x00..0xC0; PRIMASK=1
-        // effectively sets the "current execution priority floor" to 0,
-        // masking all external IRQs.
+    /// On dispatch we clear the latch for the chosen candidate
+    /// (`ICSR.PENDSVSET`/`PENDSTSET` for system exceptions, NVIC pending
+    /// bit for external IRQs) and run `enter_exception`. Returns the
+    /// cycle count of exception entry (non-zero on dispatch, 0 otherwise).
+    fn try_take_any_pending_exception<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         if self.regs.primask & 1 != 0 {
             return 0;
         }
 
-        // If already in a handler, don't preempt for an external IRQ.
-        // M0+ has coarse priority and our model collapses handler
-        // priority to "higher than any configurable". Tail-chain flows
-        // through `exit_exception`; this path only dispatches from
-        // thread mode.
-        if self.regs.in_handler_mode() {
+        let core = self.core_id as usize;
+        let icsr = bus.ppb(core).icsr;
+        let pendsv = icsr & (1 << 28) != 0;
+        let pendst = icsr & (1 << 26) != 0;
+
+        // (priority, exception_number); lower priority value wins,
+        // tie-break by lower exception number.
+        let mut best: Option<(u8, u16)> = None;
+
+        if pendsv {
+            best = Some((bus.ppb(core).exception_priority(14) as u8, 14));
+        }
+        if pendst {
+            let p = bus.ppb(core).exception_priority(15) as u8;
+            best = match best {
+                None => Some((p, 15)),
+                Some((bp, be)) if p < bp || (p == bp && 15 < be) => Some((p, 15)),
+                other => other,
+            };
+        }
+        if let Some((irq, p)) = bus.nvic(core).highest_priority_pending() {
+            let exc = 16u16 + irq as u16;
+            best = match best {
+                None => Some((p, exc)),
+                Some((bp, be)) if p < bp || (p == bp && exc < be) => Some((p, exc)),
+                other => other,
+            };
+        }
+
+        let Some((_, candidate)) = best else { return 0 };
+        if !self.can_dispatch_now(bus) {
             return 0;
         }
 
-        let core_idx = self.core_id as usize;
-        let candidates = bus.nvic(core_idx).pending_and_enabled();
-        if candidates == 0 {
-            return 0;
+        match candidate {
+            14 => bus.ppb_mut(core).icsr &= !(1 << 28),
+            15 => bus.ppb_mut(core).icsr &= !(1 << 26),
+            e => bus.nvic_mut(core).clear_pending((e - 16) as u8),
         }
+        self.enter_exception(candidate, bus)
+    }
 
-        // Scan for lowest priority value, tie-break by lowest IRQ
-        // number. Only look at implemented IRQs (0..32; RP2040 uses
-        // 0..26 but the NVIC itself is 32 lines wide).
-        let mut best_irq: Option<u8> = None;
-        let mut best_prio: u8 = 0xFF;
-        {
-            let nvic = bus.nvic(core_idx);
-            for irq in 0u8..32 {
-                if candidates & (1u32 << irq) == 0 {
-                    continue;
-                }
-                let p = nvic.priority[irq as usize];
-                if best_irq.is_none() || p < best_prio {
-                    best_irq = Some(irq);
-                    best_prio = p;
-                }
-            }
-        }
-        let Some(irq) = best_irq else { return 0 };
-
-        // Dispatch: clear pending, run exception entry against vector
-        // 16 + irq. The NVIC pending bit stays clear until the source
-        // re-asserts (level peripheral) or firmware writes NVIC_ISPR
-        // (software-set).
-        bus.nvic_mut(core_idx).clear_pending(irq);
-        self.enter_exception(16u16 + irq as u16, bus)
+    /// V1 dispatch gate: `true` iff no exception is currently active.
+    ///
+    /// This is **stricter** than ARMv6-M ARM §B1.5.4, which permits a
+    /// higher-priority exception to preempt a lower-priority handler.
+    /// V1 follows the existing `maybe_dispatch_external_irq` behaviour
+    /// because the V1 oracle scenarios don't exercise preemption (all
+    /// dispatches enter from thread mode). Tracked as deferred follow-up
+    /// in HLD §9.2.
+    fn can_dispatch_now<B: CoreBus>(&self, bus: &B) -> bool {
+        !bus.ppb(self.core_id as usize).any_active()
     }
 
     /// Test helper — direct exception entry without synthesising an

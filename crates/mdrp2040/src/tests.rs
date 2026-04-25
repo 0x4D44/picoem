@@ -2863,15 +2863,20 @@ mod phase1_wave2 {
     #[test]
     fn handler_mode_does_not_preempt_for_external_irq() {
         // If we're already in a handler, an external IRQ must not
-        // preempt on our simplified M0+ priority model.
+        // preempt on our simplified M0+ priority model. HLD V5 §5.3:
+        // `can_dispatch_now` checks `ppb.any_active()`, so the test
+        // sets BOTH IPSR (for handler-mode reads inside the step path)
+        // and the PPB active bit (the actual dispatch gate).
         let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
         let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
         emu.bus.ppb[0].vtor = 0x2000_0000;
         emu.cores[0].regs.set_pc(main_addr);
         emu.cores[0].regs.msp = 0x2002_0000;
         emu.cores[0].regs.r[13] = emu.cores[0].regs.msp;
-        // Fake handler-mode: IPSR = exception 11 (SVCall).
+        // Fake handler-mode: IPSR = exception 11 (SVCall), and mark
+        // exception 11 active on the PPB so `any_active()` trips.
         emu.cores[0].regs.xpsr = (emu.cores[0].regs.xpsr & !0x1FF) | 11;
+        emu.bus.ppb[0].mark_active(11);
         emu.bus.nvics[0].set_enabled(IRQ_TIMER_IRQ_0 as u8);
         emu.bus.nvics[0].set_pending(IRQ_TIMER_IRQ_0 as u8);
         emu.step().expect("Serial step is infallible");

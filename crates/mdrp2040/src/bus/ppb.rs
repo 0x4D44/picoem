@@ -72,6 +72,10 @@ impl Ppb {
     #[inline]
     #[allow(dead_code)] // used starting Phase 5 NVIC wiring
     pub fn exception_priority(&self, exc_num: u16) -> i16 {
+        debug_assert!(
+            exc_num < 16,
+            "exception_priority is for system exceptions only; use Nvic::priority for external IRQs"
+        );
         match exc_num {
             1 => PRIO_RESET,
             2 => PRIO_NMI,

@@ -147,7 +147,15 @@ impl CortexM0Plus {
         self.regs.control &= !0x2; // handler always uses MSP
         self.regs.sync_sp_from_banked();
 
-        let priority_label = bus.ppb(active_core).exception_priority(exc_num);
+        // Priority lookup splits on whether this is a system exception or
+        // an external IRQ — `Ppb::exception_priority` is for system
+        // exceptions only (its debug_assert enforces this); external IRQ
+        // priorities live in `Nvic::priority`.
+        let priority_label: i16 = if exc_num < 16 {
+            bus.ppb(active_core).exception_priority(exc_num)
+        } else {
+            bus.nvic(active_core).get_priority((exc_num - 16) as u8) as i16
+        };
         bus.ppb_mut(active_core).mark_active(exc_num);
 
         debug!(
@@ -258,7 +266,20 @@ impl CortexM0Plus {
             "exception return"
         );
 
-        12
+        // Tail-chain poll: if any exception is still pending and
+        // dispatchable now that we've exited handler mode, take it
+        // without unwinding back to thread mode. Mirrors mdrp2350's
+        // exit-path idiom (HLD V5 §5.3).
+        //
+        // Order matters on two counts:
+        //   (a) we run *after* the SP unstack — so a tail-chain entry
+        //       stacks onto a fresh thread-mode stack, not on top of
+        //       the outgoing frame; and
+        //   (b) we run *after* the active-flag clear above — so
+        //       `can_dispatch_now` sees the outgoing handler as no
+        //       longer active and permits the new dispatch.
+        let chained = self.try_take_any_pending_exception(bus);
+        12 + chained
     }
 
     // -------------------------------------------------------------------
@@ -288,5 +309,254 @@ impl CortexM0Plus {
             | Fault::InvalidExcReturn
             | Fault::InvalidEpsr => self.enter_exception(3, bus),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the unified exception dispatcher
+    //! `try_take_any_pending_exception` and the tail-chain poll inside
+    //! `exit_exception`. HLD V5 §5.3.
+
+    use crate::bus::Bus;
+    use crate::core::CortexM0Plus;
+
+    /// Plant a simple vector table at `0x2000_0000` with all vectors
+    /// pointing at distinct handler addresses (`0x2000_1000 + N*32`).
+    /// Returns `(bus, handlers)` so callers can assert PC after entry.
+    fn make_bus_with_vectors() -> (Bus, [u32; 17]) {
+        let mut bus = Bus::default();
+        let vtor: u32 = 0x2000_0000;
+        let mut handlers = [0u32; 17];
+        for i in 0..17 {
+            let handler = 0x2000_1000 + (i as u32) * 32;
+            bus.write32(vtor + (i as u32) * 4, handler | 1);
+            handlers[i] = handler;
+        }
+        bus.ppb[0].vtor = vtor;
+        (bus, handlers)
+    }
+
+    /// Build a CPU with stack pointer / PC primed for thread-mode entry.
+    fn fresh_cpu() -> CortexM0Plus {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        // PC at a NOP slide so any non-dispatching step decodes cleanly.
+        cpu.regs.set_pc(0x2000_4000);
+        cpu
+    }
+
+    /// Plant a `B .` (self-loop) at the given address so a `step()` that
+    /// does NOT dispatch an exception executes a benign instruction.
+    fn plant_self_loop(bus: &mut Bus, addr: u32) {
+        bus.write16(addr, 0xE7FE);
+    }
+
+    // -------------------------------------------------------------------
+    // PendSV dispatch
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn pendsv_dispatches_when_pending_and_primask_clear() {
+        // ICSR.PENDSVSET (bit 28) latched, PRIMASK clear, no handler
+        // active. The pre-fetch poll inside `step` must dispatch
+        // exception #14 and leave the latch cleared.
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        bus.ppb[0].icsr |= 1 << 28;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.regs.ipsr(), 14, "PendSV (#14) must dispatch");
+        assert_eq!(cpu.regs.pc(), handlers[14], "PC at PendSV handler");
+        assert_eq!(
+            bus.ppb[0].icsr & (1 << 28),
+            0,
+            "PENDSVSET latch cleared on dispatch"
+        );
+    }
+
+    #[test]
+    fn pendsv_blocked_by_primask() {
+        // PENDSVSET latched but PRIMASK=1 — dispatcher must defer; the
+        // CPU executes the instruction at PC (the self-loop) instead.
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        cpu.regs.primask = 1;
+        bus.ppb[0].icsr |= 1 << 28;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.regs.ipsr(), 0, "PRIMASK=1 must keep us in thread mode");
+        assert_ne!(
+            bus.ppb[0].icsr & (1 << 28),
+            0,
+            "PRIMASK leaves PENDSVSET latched"
+        );
+    }
+
+    #[test]
+    fn pendsv_blocked_by_active_handler() {
+        // V1 limitation pinned: an already-active handler blocks
+        // dispatch even if the new candidate is higher priority.
+        // `can_dispatch_now` is stricter than ARMv6-M ARM §B1.5.4.
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        // Mark an exception as active without entering it.
+        bus.ppb[0].mark_active(11); // SVCall active
+        // Fake handler-mode IPSR so a step inside the handler is a no-op
+        // execute (PC at self-loop is fine; this test asserts the
+        // dispatcher doesn't fire, not what runs instead).
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 11;
+        bus.ppb[0].icsr |= 1 << 28;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            cpu.regs.ipsr(),
+            11,
+            "active handler must block PendSV dispatch"
+        );
+        assert_ne!(
+            bus.ppb[0].icsr & (1 << 28),
+            0,
+            "PENDSVSET stays latched when blocked by active handler"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Priority arbitration across system + external exceptions
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn external_irq_priority_above_pendsv_when_lower_value() {
+        // PendSV configured priority 0xC0; IRQ 0 priority 0x40. Lower
+        // numerical value wins, so IRQ 0 (#16) must dispatch before
+        // PendSV (#14) even though 14 < 16 in the tie-break order.
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        // SHPR3 byte 2 → PendSV priority 0xC0.
+        bus.ppb[0].shpr[10] = 0xC0;
+        // IRQ 0 priority 0x40, enabled and pending.
+        bus.nvics[0].set_priority(0, 0x40);
+        bus.nvics[0].set_enabled(0);
+        bus.nvics[0].set_pending(0);
+        bus.ppb[0].icsr |= 1 << 28;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.regs.ipsr(), 16, "IRQ 0 (priority 0x40) wins over PendSV (0xC0)");
+        assert_eq!(cpu.regs.pc(), handlers[16]);
+        assert!(
+            !bus.nvics[0].is_pending(0),
+            "dispatch clears the NVIC pending bit"
+        );
+        assert_ne!(
+            bus.ppb[0].icsr & (1 << 28),
+            0,
+            "PENDSVSET stays latched — only the chosen candidate clears"
+        );
+    }
+
+    #[test]
+    fn pendsv_priority_above_systick_when_equal_tie_break_by_number() {
+        // PendSV and SysTick both priority 0x40; both pending. Tie-break
+        // rule: lower exception number wins → PendSV (#14) over
+        // SysTick (#15).
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        bus.ppb[0].shpr[10] = 0x40; // PendSV
+        bus.ppb[0].shpr[11] = 0x40; // SysTick
+        bus.ppb[0].icsr |= (1 << 28) | (1 << 26);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.regs.ipsr(), 14, "tie-break by lower exception number → PendSV");
+        assert_eq!(cpu.regs.pc(), handlers[14]);
+        assert_eq!(bus.ppb[0].icsr & (1 << 28), 0, "PENDSVSET cleared");
+        assert_ne!(
+            bus.ppb[0].icsr & (1 << 26),
+            0,
+            "PENDSTSET stays latched — the loser remains pending"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Tail-chain
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn pendsv_systick_tail_chain_skips_thread_mode_resume() {
+        // Both PendSV and SysTick pending. Step #1 dispatches the
+        // higher-priority pair member (default priorities both 0 →
+        // PendSV wins by tie-break). After the handler returns, the
+        // tail-chain poll must dispatch SysTick *without* unwinding to
+        // thread mode.
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        bus.ppb[0].icsr |= (1 << 28) | (1 << 26);
+
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 14, "first step dispatches PendSV");
+        assert_eq!(cpu.regs.pc(), handlers[14]);
+        // Active flag for PendSV is set.
+        assert_ne!(bus.ppb[0].active & (1 << 14), 0);
+
+        // Simulate the handler exiting via EXC_RETURN to Thread+MSP.
+        cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
+
+        // Tail-chain must have fired SysTick during exit_exception.
+        assert_eq!(
+            cpu.regs.ipsr(),
+            15,
+            "tail-chain dispatched SysTick without thread-mode resume"
+        );
+        assert_eq!(cpu.regs.pc(), handlers[15]);
+        // PENDSTSET cleared by the tail-chain dispatch.
+        assert_eq!(bus.ppb[0].icsr & (1 << 26), 0);
+        // SysTick is now active; PendSV no longer active.
+        assert_ne!(bus.ppb[0].active & (1 << 15), 0, "SysTick active");
+        assert_eq!(bus.ppb[0].active & (1 << 14), 0, "PendSV no longer active");
+    }
+
+    // -------------------------------------------------------------------
+    // IPSR write-back invariants for system exceptions
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn pendsv_handler_observes_ipsr_equals_14() {
+        // Cheap insurance against a code path that special-cases
+        // `exc_num >= 16` for the IPSR writeback. The oracle's
+        // HANDLER_TAIL routine reads IPSR via `MRS r2, IPSR; cmp r2, #14`
+        // to disambiguate PendSV from SysTick — if PendSV ever leaves
+        // IPSR at 0, that branch always falls through to the SysTick
+        // increment and ctr_pendsv stays at 0 with no diagnostic.
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        cpu.test_enter_exception(14, &mut bus);
+        assert_eq!(
+            cpu.regs.xpsr & 0x1FF,
+            14,
+            "PendSV handler must see IPSR == 14"
+        );
+    }
+
+    #[test]
+    fn systick_handler_observes_ipsr_equals_15() {
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        cpu.test_enter_exception(15, &mut bus);
+        assert_eq!(
+            cpu.regs.xpsr & 0x1FF,
+            15,
+            "SysTick handler must see IPSR == 15"
+        );
     }
 }

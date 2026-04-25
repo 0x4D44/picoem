@@ -178,6 +178,42 @@ impl Nvic {
     pub fn pending_and_enabled(&self) -> u32 {
         self.pending & self.enabled
     }
+
+    /// Returns `(irq, priority)` for the highest-priority pending+enabled
+    /// IRQ. Lowest priority value wins; tie-break by lowest IRQ number.
+    /// Returns `None` if no IRQ is both pending and enabled.
+    ///
+    /// HLD V5 §5.3 hoist: previously inlined in
+    /// `CortexM0Plus::maybe_dispatch_external_irq`; lifted here so
+    /// `try_take_any_pending_exception` can fold the priority lookup
+    /// into the candidate-arbitration path without re-reading
+    /// `priority[irq]` at the call site.
+    #[inline]
+    pub fn highest_priority_pending(&self) -> Option<(u8, u8)> {
+        let candidates = self.pending_and_enabled();
+        if candidates == 0 {
+            return None;
+        }
+        let mut best_irq: u8 = 0;
+        let mut best_prio: u8 = 0xFF;
+        let mut found = false;
+        for irq in 0u8..32 {
+            if candidates & (1u32 << irq) == 0 {
+                continue;
+            }
+            let p = self.priority[irq as usize];
+            if !found || p < best_prio {
+                best_irq = irq;
+                best_prio = p;
+                found = true;
+            }
+        }
+        if found {
+            Some((best_irq, best_prio))
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
