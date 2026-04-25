@@ -604,7 +604,29 @@ fn core_worker_body(
         target = target.wrapping_add(step_q as u64);
         if !shared.atomics.is_halted(core_id) {
             while core.cycles() < target && !core.is_halted() {
-                core.step(&mut bus);
+                let consumed = core.step(&mut bus);
+                // HLD V5 §5.2: tick this worker's SysTick once per
+                // master cycle, mirroring the serial slow-path tick at
+                // lib.rs ~665. The threaded path has no per-cycle
+                // `tick_peripherals` analogue (peripherals are bulk-
+                // handled at the quantum boundary by the coordinator),
+                // so this fires immediately after `core.step` and
+                // before `drain_cross_core_irqs` so a SysTick-asserted
+                // ICSR.PENDSTSET aligns with this cycle. Each worker
+                // only ticks its own `systicks[core_id]` slot and ORs
+                // into its own `ppb[core_id].icsr`.
+                //
+                // `core.step` returns the cycle count consumed by the
+                // instruction (e.g. `LDM r0, {r1-r7}` = 8, `BL` = 4);
+                // tick once per master cycle so SysTick rate stays
+                // coupled to the master clock and matches the serial
+                // path's per-cycle tick.
+                let cid = bus.core_id;
+                for _ in 0..consumed {
+                    if bus.systicks[cid].tick() {
+                        bus.ppb[cid].icsr |= 1 << 26;
+                    }
+                }
                 // Drain any mid-step cross-core IRQ arrivals so the
                 // next instruction observes them.
                 bus.drain_cross_core_irqs();

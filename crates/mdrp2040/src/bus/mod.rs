@@ -24,6 +24,7 @@ pub mod peripheral_dispatch;
 pub mod ppb;
 pub mod resets;
 pub mod sio;
+pub mod systick;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -54,6 +55,7 @@ use pads_bank0::PadsBank0;
 use ppb::Ppb;
 use resets::Resets;
 use sio::Sio;
+use systick::SysTick;
 
 /// Peripheral base addresses (see RP2040 datasheet §2.2).
 pub const APB_BASE: u32 = 0x4000_0000;
@@ -304,6 +306,11 @@ pub struct Bus {
     /// by [`crate::Emulator::drain_pending_irqs_to_cores`], polled by
     /// [`crate::core::CortexM0Plus::step`] for dispatch.
     pub nvics: [Nvic; 2],
+    /// Per-core SysTick (24-bit countdown timer mapped at
+    /// `0xE000_E010..0xE000_E01F`). HLD V5 §5.2: ticked once per master
+    /// cycle for the active core only; on a TICKINT-arm underflow the
+    /// caller ORs `ICSR.PENDSTSET` (bit 26) onto the active-core PPB.
+    pub(crate) systicks: [SysTick; 2],
     /// Off-chip 8 MB SPI PSRAM (PicoGUS v2 hardware). `None` when no
     /// PSRAM is attached (e.g. non-PicoGUS boards). Observed via
     /// [`crate::Emulator::update_gpio`] on the device's pin assignments
@@ -399,6 +406,7 @@ impl Bus {
             dma: Dma::new(),
             irq_pending: 0,
             nvics: [Nvic::new(), Nvic::new()],
+            systicks: [SysTick::new(), SysTick::new()],
             psram: None,
             external_gpio_in_override: 0,
             external_gpio_in_mask: 0,
@@ -1005,9 +1013,13 @@ impl Bus {
             }
             0xE => {
                 let w32 = addr & !3;
-                let word = self
-                    .nvic_mmio_read32(w32)
-                    .unwrap_or_else(|| self.ppb[self.active_core].read32(w32));
+                let word = if let Some(v) = self.nvic_mmio_read32(w32) {
+                    v
+                } else if let Some(v) = self.systick_mmio_read32(w32) {
+                    v
+                } else {
+                    self.ppb[self.active_core].read32(w32)
+                };
                 word.to_le_bytes()[(addr & 3) as usize]
             }
             _ => {
@@ -1058,9 +1070,13 @@ impl Bus {
             }
             0xE => {
                 let w32 = addr & !3;
-                let word = self
-                    .nvic_mmio_read32(w32)
-                    .unwrap_or_else(|| self.ppb[self.active_core].read32(w32));
+                let word = if let Some(v) = self.nvic_mmio_read32(w32) {
+                    v
+                } else if let Some(v) = self.systick_mmio_read32(w32) {
+                    v
+                } else {
+                    self.ppb[self.active_core].read32(w32)
+                };
                 let half = ((addr >> 1) & 1) as usize;
                 [word as u16, (word >> 16) as u16][half]
             }
@@ -1097,6 +1113,8 @@ impl Bus {
             0xD => self.sio_read32(addr),
             0xE => {
                 if let Some(w) = self.nvic_mmio_read32(addr) {
+                    w
+                } else if let Some(w) = self.systick_mmio_read32(addr) {
                     w
                 } else {
                     self.ppb[self.active_core].read32(addr)
@@ -1190,13 +1208,21 @@ impl Bus {
             0xE => {
                 let word_addr = addr & !3;
                 let byte_idx = (addr & 3) as usize;
-                let old = self
-                    .nvic_mmio_read32(word_addr)
-                    .unwrap_or_else(|| self.ppb[self.active_core].read32(word_addr));
+                let old = if let Some(v) = self.nvic_mmio_read32(word_addr) {
+                    v
+                } else if let Some(v) = self.systick_mmio_read32(word_addr) {
+                    v
+                } else {
+                    self.ppb[self.active_core].read32(word_addr)
+                };
                 let mut bytes = old.to_le_bytes();
                 bytes[byte_idx] = val;
                 let new_word = u32::from_le_bytes(bytes);
-                if !self.nvic_mmio_write32(word_addr, new_word) {
+                if self.nvic_mmio_write32(word_addr, new_word) {
+                    // handled
+                } else if self.systick_mmio_write32(word_addr, new_word) {
+                    // handled
+                } else {
                     self.ppb[self.active_core].write32(word_addr, new_word);
                 }
             }
@@ -1280,13 +1306,21 @@ impl Bus {
             0xE => {
                 let word_addr = addr & !3;
                 let half_idx = ((addr >> 1) & 1) as usize;
-                let old = self
-                    .nvic_mmio_read32(word_addr)
-                    .unwrap_or_else(|| self.ppb[self.active_core].read32(word_addr));
+                let old = if let Some(v) = self.nvic_mmio_read32(word_addr) {
+                    v
+                } else if let Some(v) = self.systick_mmio_read32(word_addr) {
+                    v
+                } else {
+                    self.ppb[self.active_core].read32(word_addr)
+                };
                 let mut halves: [u16; 2] = [old as u16, (old >> 16) as u16];
                 halves[half_idx] = val;
                 let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
-                if !self.nvic_mmio_write32(word_addr, new_word) {
+                if self.nvic_mmio_write32(word_addr, new_word) {
+                    // handled
+                } else if self.systick_mmio_write32(word_addr, new_word) {
+                    // handled
+                } else {
                     self.ppb[self.active_core].write32(word_addr, new_word);
                 }
             }
@@ -1334,7 +1368,11 @@ impl Bus {
             }
             0xD => self.sio_write32(addr, val),
             0xE => {
-                if !self.nvic_mmio_write32(addr, val) {
+                if self.nvic_mmio_write32(addr, val) {
+                    // handled
+                } else if self.systick_mmio_write32(addr, val) {
+                    // handled
+                } else {
                     self.ppb[self.active_core].write32(addr, val);
                 }
             }
@@ -1450,6 +1488,34 @@ impl Bus {
                         n.priority[irq] = byte & crate::core::nvic::PRIORITY_MASK;
                     }
                 }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // --- SysTick MMIO dispatch -------------------------------------------
+    //
+    // HLD V5 §5.2: SysTick lives at `0xE000_E010..0xE000_E01F`. Per-core
+    // banked register set; reads/writes target `systicks[active_core]`.
+    // Note `systick_mmio_read32` is `&mut self` — `SYST_CSR` reads clear
+    // `COUNTFLAG` per ARMv6-M ARM §B3.3.2.
+
+    /// Intercept SysTick MMIO before the PPB sees it. Returns
+    /// `Some(word)` when `addr` lies in the SysTick range, `None`
+    /// otherwise so the caller can fall through.
+    fn systick_mmio_read32(&mut self, addr: u32) -> Option<u32> {
+        match addr & 0xFFFF {
+            0xE010..=0xE01F => Some(self.systicks[self.active_core].read32(addr)),
+            _ => None,
+        }
+    }
+
+    /// Intercept SysTick MMIO writes. Returns `true` when handled.
+    fn systick_mmio_write32(&mut self, addr: u32, val: u32) -> bool {
+        match addr & 0xFFFF {
+            0xE010..=0xE01F => {
+                self.systicks[self.active_core].write32(addr, val);
                 true
             }
             _ => false,
@@ -2452,5 +2518,38 @@ mod tests {
         // to zero only once.
         let _ = bus.read8(ADC_BASE + crate::peripherals::adc::FIFO);
         assert_eq!(bus.adc.fifo_len(), 0, "byte read pops exactly once");
+    }
+
+    /// HLD V5 §5.2: a SysTick underflow must set `ICSR.PENDSTSET` (bit
+    /// 26) only on the active core's PPB. Tick the active-core SysTick
+    /// directly here — the per-cycle tick wired into `Emulator::step`
+    /// is exercised end-to-end by §6.2's integration test, but the
+    /// active-core-only invariant is testable purely at the bus level.
+    #[test]
+    fn tick_underflow_sets_icsr_pendst_on_active_core_only() {
+        let mut bus = Bus::new();
+        // Run from core 0's perspective so MMIO writes target
+        // `systicks[0]`.
+        bus.set_active_core(0);
+        // Enable SysTick with TICKINT and CLKSOURCE=processor; CVR=0
+        // so the very first tick fires.
+        bus.write32(0xE000_E018, 0); // CVR
+        bus.write32(0xE000_E014, 0); // RVR (period 1)
+        bus.write32(0xE000_E010, 0b111); // CSR: ENABLE | TICKINT | CLKSOURCE
+        let fired = bus.systicks[0].tick();
+        assert!(fired, "TICKINT-armed first tick must fire");
+        if fired {
+            bus.ppb[0].icsr |= 1 << 26;
+        }
+        assert_ne!(
+            bus.ppb[0].icsr & (1 << 26),
+            0,
+            "PENDSTSET must latch on active-core PPB"
+        );
+        assert_eq!(
+            bus.ppb[1].icsr & (1 << 26),
+            0,
+            "PENDSTSET must NOT latch on the other core"
+        );
     }
 }

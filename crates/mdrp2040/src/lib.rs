@@ -638,7 +638,18 @@ impl Emulator {
         let peri_idle = self.bus.all_peripherals_idle();
         let dma_idle = self.bus.dma.is_idle();
         let any_irq = self.bus.irq_pending != 0;
-        if pio_idle && peri_idle && dma_idle && !any_irq {
+        // SysTick fires by ORing into `bus.ppb[active].icsr` — NOT by
+        // setting `bus.irq_pending` — so the `any_irq` check above does
+        // not gate the fast path on SysTick activity. With SysTick
+        // enabled and no peripheral activity (e.g. the V5 §5.2
+        // tail-chain scenario's `b .` busy-wait after preamble), the
+        // fast path would otherwise trigger and SysTick would never
+        // tick. Drop to the slow path whenever SysTick is enabled on
+        // the active core; SysTick-disabled workloads (almost
+        // everything) keep their fast-path eligibility.
+        let systick_idle =
+            !self.bus.systicks[self.bus.active_core()].is_enabled();
+        if pio_idle && peri_idle && dma_idle && systick_idle && !any_irq {
             self.tick_pio(consumed as u32);
             // Advance lazy-scheduled peripherals (TIMER alarms) by the
             // same window the cores consumed. Any alarm matching inside
@@ -657,6 +668,15 @@ impl Emulator {
                 // snapshot would quietly postpone the IRQ.
                 self.bus.master_cycle = self.bus.master_cycle.wrapping_add(1);
                 self.bus.tick_peripherals();
+                // HLD V5 §5.2: tick the active-core SysTick once per
+                // master cycle, after `tick_peripherals` (so peripheral
+                // side-effects from this cycle are visible) and before
+                // `drain_pending_irqs_to_cores` (so a SysTick-asserted
+                // ICSR.PENDSTSET observation aligns with this cycle).
+                let active = self.bus.active_core();
+                if self.bus.systicks[active].tick() {
+                    self.bus.ppb[active].icsr |= 1 << 26;
+                }
                 self.tick_pio_and_route_irqs_single();
                 self.update_gpio();
                 self.drain_pending_irqs_to_cores();

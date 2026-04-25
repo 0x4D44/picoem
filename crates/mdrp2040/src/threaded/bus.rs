@@ -46,6 +46,7 @@ use std::sync::Arc;
 use mdpicoem_common::clocks::ClockTree;
 
 use crate::bus::ppb::Ppb;
+use crate::bus::systick::SysTick;
 use crate::core::Nvic;
 use crate::core::bus_trait::CoreBus;
 use crate::threaded::pio::PioCommand;
@@ -88,15 +89,20 @@ const SSI_BASE: u32 = 0x1800_0000;
 /// directly on `Bus`.
 pub struct WorkerBus {
     /// Core ID this worker drives (0 or 1).
-    core_id: usize,
+    pub(crate) core_id: usize,
     /// Shared state bundle (cheap Arc clone per worker).
     shared: Arc<SharedState>,
     /// Per-core PPB. Only `[core_id]` is actually touched by this
     /// worker's core; the other slot is an inert placeholder so the
     /// trait's `&ppb[core]` indexing maps 1:1 with the serial `Bus`.
-    ppb: [Ppb; 2],
+    pub(crate) ppb: [Ppb; 2],
     /// Per-core NVIC. Same layout + placeholder convention as `ppb`.
     nvic: [Nvic; 2],
+    /// Per-core SysTick (HLD V5 §5.2). Same layout + placeholder
+    /// convention as `ppb` and `nvic`: only `[core_id]` is touched by
+    /// this worker; the other slot is an inert placeholder so per-core
+    /// indexing matches the serial `Bus`.
+    pub(crate) systicks: [SysTick; 2],
     /// Sticky bus-fault flag.
     bus_fault: bool,
     /// Address that raised the most recent bus fault.
@@ -131,6 +137,7 @@ impl WorkerBus {
             shared,
             ppb,
             nvic: [Nvic::new(), Nvic::new()],
+            systicks: [SysTick::new(), SysTick::new()],
             bus_fault: false,
             bus_fault_addr: 0,
             active_pc: 0,
@@ -771,8 +778,14 @@ impl WorkerBus {
     // `crates/mdrp2040/src/bus/mod.rs::nvic_mmio_read32` / `_write32`,
     // indexing the per-worker `nvic[core_id]` field.
 
-    fn ppb_read32(&self, addr: u32) -> u32 {
+    /// `&mut self` because SysTick MMIO reads have a side-effect:
+    /// reading `SYST_CSR` clears `COUNTFLAG` per ARMv6-M ARM §B3.3.2.
+    /// HLD V5 §5.2 calls out the signature extension explicitly.
+    fn ppb_read32(&mut self, addr: u32) -> u32 {
         if let Some(v) = self.nvic_mmio_read32(addr) {
+            return v;
+        }
+        if let Some(v) = self.systick_mmio_read32(addr) {
             return v;
         }
         self.ppb[self.core_id].read32(addr)
@@ -782,7 +795,30 @@ impl WorkerBus {
         if self.nvic_mmio_write32(addr, val) {
             return;
         }
+        if self.systick_mmio_write32(addr, val) {
+            return;
+        }
         self.ppb[self.core_id].write32(addr, val);
+    }
+
+    /// HLD V5 §5.2: SysTick lives at `0xE000_E010..0xE000_E01F`.
+    /// Per-core; the worker only ever touches its own
+    /// `systicks[self.core_id]` slot.
+    fn systick_mmio_read32(&mut self, addr: u32) -> Option<u32> {
+        match addr & 0xFFFF {
+            0xE010..=0xE01F => Some(self.systicks[self.core_id].read32(addr)),
+            _ => None,
+        }
+    }
+
+    fn systick_mmio_write32(&mut self, addr: u32, val: u32) -> bool {
+        match addr & 0xFFFF {
+            0xE010..=0xE01F => {
+                self.systicks[self.core_id].write32(addr, val);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Intercept NVIC MMIO before the PPB sees it (V5 HLD §5.1).
