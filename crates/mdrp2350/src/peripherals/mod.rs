@@ -38,6 +38,7 @@ pub mod ticks;
 pub mod timer;
 pub mod trng;
 pub mod uart;
+pub mod usb;
 pub mod watchdog;
 
 #[cfg(test)]

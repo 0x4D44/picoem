@@ -38,6 +38,7 @@ use crate::peripherals::ticks::{TICKS_BASE, TicksRegs};
 use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE, TimerRegs};
 use crate::peripherals::trng::{TRNG_BASE, Trng};
 use crate::peripherals::uart::{UART0_BASE, UART1_BASE, UartRegs};
+use crate::peripherals::usb::{USBCTRL_DPRAM_BASE, USBCTRL_DPRAM_SIZE, USBCTRL_REGS_BASE, UsbCtrl};
 use crate::peripherals::watchdog::{WATCHDOG_BASE, WatchdogRegs};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
@@ -269,6 +270,7 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
         DMA_BASE => Some(RESET_DMA),
         SYSCFG_BASE => Some(RESET_SYSCFG),
         POWMAN_BASE => Some(RESET_POWMAN),
+        USBCTRL_REGS_BASE | USBCTRL_DPRAM_BASE => Some(RESET_USBCTRL),
         _ => None,
     }
 }
@@ -348,6 +350,11 @@ pub struct Bus {
     /// CORESIGHT_TRACE — storage-only CoreSight block at `0xE004_1000`
     /// (HLD V5 §8.E.2). No trace data produced.
     pub(crate) coresight_trace: CoresightTraceRegs,
+    /// USBCTRL — register-surface stub (HLD V5 §Component 1). Covers
+    /// regs at `USBCTRL_REGS_BASE` and DPRAM at `USBCTRL_DPRAM_BASE`.
+    /// Held in reset post-bootrom; firmware must release `RESET_USBCTRL`
+    /// before any access lands.
+    pub(crate) usbctrl: UsbCtrl,
     /// Warn-once latch for `CLOCKS.CLK_*_CTRL.ENABLE` clear (HLD V5
     /// §4.A2 site 9). Keyed on CLOCKS offset of the CTRL register.
     pub(crate) warned_clk_enable_clear: std::collections::HashSet<u32>,
@@ -579,6 +586,7 @@ impl Bus {
             sha256: Sha256Regs::new(),
             powman: PowmanRegs::new(),
             coresight_trace: CoresightTraceRegs::new(),
+            usbctrl: UsbCtrl::new(),
             warned_clk_enable_clear: std::collections::HashSet::new(),
             warned_addrs: std::collections::HashSet::new(),
             watchdog_reset_requested: false,
@@ -1537,6 +1545,19 @@ impl Bus {
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
+                        // USBCTRL regs word-only: byte read collapses
+                        // to the full word and the byte-select runs
+                        // below. DPRAM accepts byte reads directly.
+                        USBCTRL_REGS_BASE => self.usbctrl.read32(offset),
+                        USBCTRL_DPRAM_BASE => {
+                            let dpram_off =
+                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            let v = self.usbctrl.read_dpram(dpram_off, 1) as u8;
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 1, addr, v as u32, core);
+                            }
+                            return v;
+                        }
                         _ => {
                             self.warn_unmodelled_mmio(word_addr);
                             *self.peripheral_regs.get(&word_addr).unwrap_or(&0)
@@ -1927,6 +1948,14 @@ impl Bus {
                             self.raise_irqs_u64(ext_irqs);
                         }
                         0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
+                        // USBCTRL regs word-only — drop byte writes.
+                        // DPRAM is plain memory and accepts byte writes.
+                        USBCTRL_REGS_BASE => {}
+                        USBCTRL_DPRAM_BASE => {
+                            let dpram_off =
+                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            self.usbctrl.write_dpram(dpram_off, val as u32, 1);
+                        }
                         _ => {
                             let word_addr = canonical & !3;
                             let byte_idx = (canonical & 3) as usize;
@@ -2178,6 +2207,21 @@ impl Bus {
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
+                        // USBCTRL regs are word-only: halfword reads
+                        // collapse to the underlying word and the
+                        // half-select happens below. DPRAM accepts
+                        // narrow reads at the exact byte offset.
+                        USBCTRL_REGS_BASE => self.usbctrl.read32(offset),
+                        USBCTRL_DPRAM_BASE => {
+                            let dpram_off =
+                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            // Narrow halfword read direct from DPRAM.
+                            let v = self.usbctrl.read_dpram(dpram_off & !1, 2);
+                            if self.mmio_trace_enabled {
+                                self.emit_mmio_trace('R', 2, addr, v, core);
+                            }
+                            return v as u16;
+                        }
                         _ => {
                             self.warn_unmodelled_mmio(word_addr);
                             *self.peripheral_regs.get(&word_addr).unwrap_or(&0)
@@ -2561,6 +2605,15 @@ impl Bus {
                             self.raise_irqs_u64(ext_irqs);
                         }
                         0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {} // PIO: 32-bit access only
+                        // USBCTRL regs are word-only; halfword writes are
+                        // dropped (matches PIO policy). DPRAM accepts
+                        // narrow halfword writes directly.
+                        USBCTRL_REGS_BASE => {}
+                        USBCTRL_DPRAM_BASE => {
+                            let dpram_off =
+                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            self.usbctrl.write_dpram(dpram_off & !1, val as u32, 2);
+                        }
                         _ => {
                             let word_addr = canonical & !3;
                             let half_idx = ((canonical >> 1) & 1) as usize;
@@ -2719,6 +2772,15 @@ impl Bus {
                         0x5020_0000 => self.pio[0].read32(offset),
                         0x5030_0000 => self.pio[1].read32(offset),
                         0x5040_0000 => self.pio[2].read32(offset),
+                        USBCTRL_REGS_BASE => self.usbctrl.read32(offset),
+                        USBCTRL_DPRAM_BASE => {
+                            // DPRAM is plain 4 KB AHB-Lite RAM — no APB
+                            // alias semantics. Recover the raw byte offset
+                            // from `addr` (the canonical mask above strips
+                            // alias bits 12/13 that don't apply here).
+                            let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            self.usbctrl.read_dpram(dpram_off & !3, 4)
+                        }
                         _ => {
                             self.warn_unmodelled_mmio(canonical);
                             *self.peripheral_regs.get(&canonical).unwrap_or(&0)
@@ -2906,6 +2968,16 @@ impl Bus {
                         0x5020_0000 => self.pio[0].write32(offset, val, alias),
                         0x5030_0000 => self.pio[1].write32(offset, val, alias),
                         0x5040_0000 => self.pio[2].write32(offset, val, alias),
+                        USBCTRL_REGS_BASE => {
+                            let mut ext_irqs = 0u64;
+                            self.usbctrl.write32(offset, val, alias, &mut ext_irqs);
+                            self.raise_irqs_u64(ext_irqs);
+                        }
+                        USBCTRL_DPRAM_BASE => {
+                            let dpram_off =
+                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            self.usbctrl.write_dpram(dpram_off & !3, val, 4);
+                        }
                         _ => {
                             // Existing HashMap path with alias logic
                             self.warn_unmodelled_mmio(canonical);

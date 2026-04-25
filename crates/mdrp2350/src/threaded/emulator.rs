@@ -50,6 +50,7 @@ use super::{
 };
 use super::peripherals::{
     ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
+    UsbState,
 };
 use super::timings::{PerWorkerTimings, RunTimings, TimingRecorder};
 
@@ -225,6 +226,7 @@ impl ThreadedEmulator {
             sha256: _,
             powman: _,
             coresight_trace: _,
+            usbctrl,
             warned_clk_enable_clear: _,
             reservation: _,
         } = bus;
@@ -299,6 +301,7 @@ impl ThreadedEmulator {
                 timer1,
             }),
             dma: Mutex::new(DmaState { dma }),
+            usb: Mutex::new(UsbState { usbctrl }),
             legacy: Mutex::new(peripheral_regs),
         });
 

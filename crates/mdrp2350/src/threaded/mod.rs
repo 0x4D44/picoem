@@ -45,6 +45,7 @@ pub use sio::ThreadedSio;
 pub use pio::{ThreadedPio, PioCommand};
 pub use peripherals::{
     ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
+    UsbState,
 };
 pub use shared::SharedState;
 pub use bus::{PioBus, WorkerBus};

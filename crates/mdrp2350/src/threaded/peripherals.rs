@@ -52,6 +52,7 @@ use crate::peripherals::spi::SpiRegs;
 use crate::peripherals::ticks::TicksRegs;
 use crate::peripherals::timer::TimerRegs;
 use crate::peripherals::uart::UartRegs;
+use crate::peripherals::usb::UsbCtrl;
 
 // =======================================================================
 // Component state structs
@@ -534,6 +535,21 @@ impl DmaState {
     }
 }
 
+/// USB controller state — register-surface stub at `0x5011_0000` with
+/// 4 KB DPRAM at `0x5010_0000`. See `peripherals/usb.rs` and HLD V5
+/// §Component 1.
+pub struct UsbState {
+    /// USB control-register + DPRAM stub.
+    pub usbctrl: UsbCtrl,
+}
+
+impl UsbState {
+    /// Mirror `Bus::new()` — fresh stub in post-reset state.
+    pub fn post_bootrom() -> Self {
+        Self { usbctrl: UsbCtrl::new() }
+    }
+}
+
 // =======================================================================
 // Peripherals aggregate
 // =======================================================================
@@ -541,7 +557,7 @@ impl DmaState {
 /// Mutex-guarded bundle of peripheral state shared across worker
 /// threads. Instances live behind an `Arc` on `SharedState`.
 ///
-/// Lock order: `clocks < qmi < resets < apb < timers < dma < legacy`.
+/// Lock order: `clocks < qmi < resets < apb < timers < dma < usb < legacy`.
 pub struct Peripherals {
     pub clocks: Mutex<ClocksState>,
     pub qmi: Mutex<QmiState>,
@@ -549,6 +565,7 @@ pub struct Peripherals {
     pub apb: Mutex<ApbState>,
     pub timers: Mutex<TimersState>,
     pub dma: Mutex<DmaState>,
+    pub usb: Mutex<UsbState>,
     /// Legacy untyped register HashMap. Mirrors `Bus::peripheral_regs`
     /// (9–11 live call sites in `bus/mod.rs`). Phase 5 migrates the
     /// remaining sites and deletes this field.
@@ -570,6 +587,7 @@ impl Peripherals {
             apb: Mutex::new(ApbState::post_bootrom()),
             timers: Mutex::new(TimersState::post_bootrom()),
             dma: Mutex::new(DmaState::post_bootrom()),
+            usb: Mutex::new(UsbState::post_bootrom()),
             legacy: Mutex::new(HashMap::new()),
         }
     }
@@ -596,6 +614,7 @@ mod tests {
         assert!(p.apb.lock().is_ok());
         assert!(p.timers.lock().is_ok());
         assert!(p.dma.lock().is_ok());
+        assert!(p.usb.lock().is_ok());
         assert!(p.legacy.lock().is_ok());
     }
 

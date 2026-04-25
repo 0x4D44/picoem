@@ -57,6 +57,7 @@ use crate::peripherals::spi::SPI0_BASE;
 use crate::peripherals::ticks::TICKS_BASE;
 use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE};
 use crate::peripherals::uart::UART0_BASE;
+use crate::peripherals::usb::{USBCTRL_DPRAM_BASE, USBCTRL_DPRAM_SIZE, USBCTRL_REGS_BASE};
 use crate::threaded::CoreAtomics;
 use crate::threaded::PioCommand;
 use crate::threaded::SharedState;
@@ -454,6 +455,46 @@ impl WorkerBus {
                 .unwrap()
                 .dma
                 .read32(offset),
+            // USBCTRL regs + DPRAM (HLD V5 §Component 1). RESETS guard
+            // mirrors the serial Bus: held peripherals read as 0
+            // (`bus/mod.rs:1656`, `2332`).
+            USBCTRL_REGS_BASE => {
+                if self
+                    .shared
+                    .peripherals
+                    .resets
+                    .lock()
+                    .unwrap()
+                    .is_held_in_reset_base(base)
+                {
+                    return 0;
+                }
+                self.shared.peripherals.usb.lock().unwrap().usbctrl.read32(offset)
+            }
+            USBCTRL_DPRAM_BASE => {
+                if self
+                    .shared
+                    .peripherals
+                    .resets
+                    .lock()
+                    .unwrap()
+                    .is_held_in_reset_base(base)
+                {
+                    return 0;
+                }
+                // DPRAM is plain 4 KB AHB-Lite RAM — no APB alias
+                // semantics. Recover the raw byte offset from `addr`
+                // (the canonical mask above strips alias bits 12/13
+                // that don't apply here). Mirrors `bus/mod.rs:2776`.
+                let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                self.shared
+                    .peripherals
+                    .usb
+                    .lock()
+                    .unwrap()
+                    .usbctrl
+                    .read_dpram(dpram_off & !3, 4)
+            }
             // PIO register reads: the `PioBlock`s themselves live on
             // the PIO worker thread, so the CPU worker can only observe
             // the atomics `ThreadedPio` publishes — today that's
@@ -515,6 +556,50 @@ impl WorkerBus {
                 .unwrap()
                 .dma
                 .write32(offset, val, alias),
+            // USBCTRL regs + DPRAM (HLD V5 §Component 1). RESETS guard
+            // mirrors the serial Bus: held peripherals drop writes
+            // silently (`bus/mod.rs:2730`, `2872`).
+            USBCTRL_REGS_BASE => {
+                if self
+                    .shared
+                    .peripherals
+                    .resets
+                    .lock()
+                    .unwrap()
+                    .is_held_in_reset_base(base)
+                {
+                    return;
+                }
+                let mut ext_irqs = 0u64;
+                self.shared
+                    .peripherals
+                    .usb
+                    .lock()
+                    .unwrap()
+                    .usbctrl
+                    .write32(offset, val, alias, &mut ext_irqs);
+                self.raise_irqs_shared(ext_irqs);
+            }
+            USBCTRL_DPRAM_BASE => {
+                if self
+                    .shared
+                    .peripherals
+                    .resets
+                    .lock()
+                    .unwrap()
+                    .is_held_in_reset_base(base)
+                {
+                    return;
+                }
+                let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                self.shared
+                    .peripherals
+                    .usb
+                    .lock()
+                    .unwrap()
+                    .usbctrl
+                    .write_dpram(dpram_off & !3, val, 4);
+            }
             0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {
                 // CPU→PIO writes are one-quantum-delayed: the command
                 // queues here, and the PIO worker drains + applies at
@@ -2116,6 +2201,70 @@ mod tests {
             // Commands must have queued on the PIO worker queue.
             let drained = shared.pio.drain_commands(0);
             assert!(drained.len() >= 4, "expected >= 4 commands, got {}", drained.len());
+        }
+
+        // ---- AHB USBCTRL dispatch --------------------------------------
+        //
+        // Mirrors the serial-Bus tests in `peripherals/usb.rs` so the
+        // two paths produce identical observable behaviour for USB MMIO
+        // accesses (HLD V5 §Component 1).
+
+        /// Helper: release USBCTRL from RESETS so reads can return
+        /// non-zero values. Mirrors `release_usbctrl` in usb.rs tests.
+        fn release_usbctrl(bus: &mut WorkerBus) {
+            use crate::bus::RESET_USBCTRL;
+            // RESETS_BASE = 0x4002_0000, CLR alias = +0x3000.
+            bus.write32(0x4002_3000, 1u32 << RESET_USBCTRL, 0);
+        }
+
+        #[test]
+        fn ahb_usbctrl_regs_round_trip_at_canonical_alias() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            release_usbctrl(&mut bus);
+            // MAIN_CTRL at offset 0x040.
+            bus.write32(USBCTRL_REGS_BASE + 0x040, 0x0000_0001, 0);
+            assert_eq!(bus.read32(USBCTRL_REGS_BASE + 0x040, 0), 0x0000_0001);
+        }
+
+        #[test]
+        fn ahb_usbctrl_sie_status_writes_drop_silently() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            release_usbctrl(&mut bus);
+            // SIE_STATUS at offset 0x050 — write via APB BITSET alias
+            // (+0x2000); stub still reads 0.
+            bus.write32(USBCTRL_REGS_BASE + 0x050 + 0x2000, (1 << 19) | (1 << 18), 0);
+            assert_eq!(bus.read32(USBCTRL_REGS_BASE + 0x050, 0), 0);
+        }
+
+        #[test]
+        fn ahb_usbctrl_dpram_word_round_trip() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            release_usbctrl(&mut bus);
+            bus.write32(USBCTRL_DPRAM_BASE + 0x200, 0xDEAD_BEEF, 0);
+            assert_eq!(bus.read32(USBCTRL_DPRAM_BASE + 0x200, 0), 0xDEAD_BEEF);
+        }
+
+        #[test]
+        fn ahb_usbctrl_held_in_reset_reads_zero_writes_drop() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared);
+            // Don't release USBCTRL; writes drop, reads must return 0.
+            bus.write32(USBCTRL_REGS_BASE + 0x040, 0x1, 0);
+            assert_eq!(
+                bus.read32(USBCTRL_REGS_BASE + 0x040, 0),
+                0,
+                "writes dropped + reads return 0 while USBCTRL held in reset",
+            );
+            // Same for DPRAM.
+            bus.write32(USBCTRL_DPRAM_BASE + 0x100, 0xCAFE_F00D, 0);
+            assert_eq!(
+                bus.read32(USBCTRL_DPRAM_BASE + 0x100, 0),
+                0,
+                "DPRAM access dropped + reads 0 while USBCTRL held in reset",
+            );
         }
 
         #[test]
