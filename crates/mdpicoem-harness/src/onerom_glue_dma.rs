@@ -440,7 +440,7 @@ mod tests {
     }
 
     fn new_emu() -> Emulator {
-        EmulatorBuilder::new(Config::default()).build()
+        EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible")
     }
 
     /// Channel latches its three regs + ctrl on a non-zero CTRL_TRIG write.

@@ -24,7 +24,8 @@
 // until the Phase 1 IRQ plumbing (`Bus::irq_pending` +
 // `tick_peripherals` + pending-exception dispatch in `CortexM0Plus::
 // step`) lands. This is the same posture the RP2350 oracle takes
-// against `tech_debt.md:295`; the oracle is the surfacing tool.
+// against `tech_debt.md` § "Exception entry/exit not differentially
+// validated"; the oracle is the surfacing tool.
 
 use crate::isr_scenarios::{
     ICSR_PENDSVSET, MAIN_OFFSET as M33_MAIN_OFFSET, NVIC_ICPR0_ADDR,
@@ -92,6 +93,11 @@ pub const MAIN_OFFSET: u32 = 0x100;
 // Sanity-check that we didn't drift from the M33's main offset (the
 // literal-pool offsets in `MAIN_BASELINE_M0` depend on it).
 const _: () = assert!(MAIN_OFFSET == M33_MAIN_OFFSET);
+
+const _: () = assert!(
+    (HANDLER_OFFSET as usize) + HANDLER_TAIL.len() * 2 <= MAIN_OFFSET as usize,
+    "HANDLER_TAIL must fit between HANDLER_OFFSET and MAIN_OFFSET",
+);
 
 /// Number of vector-table entries this oracle allocates. 17 covers
 /// everything the scenarios use: [0..15] = standard M-profile + [16] =
@@ -353,7 +359,7 @@ const HANDLER_TIMER: [u16; 14] = [
 ///     T2 encoding: 0b11100_00000000001 = 0xE001. (This is `b .+2` in
 ///     the standard ARM "relative to PC" notation — PC already includes
 ///     the pipeline offset.)
-const HANDLER_TAIL: [u16; 20] = [
+const HANDLER_TAIL: [u16; 22] = [
     0xF3EF, // [ 0] mrs r2, IPSR — hw0
     0x8205, // [ 1] mrs r2, IPSR — hw1 (Rd=2, SYSm=5)
     0x2A0E, // [ 2] cmp r2, #14   — PendSV number
@@ -365,16 +371,25 @@ const HANDLER_TAIL: [u16; 20] = [
     0x6801, // [ 8] ldr r1, [r0]  — common increment
     0x3101, // [ 9] adds r1, #1
     0x6001, // [10] str r1, [r0]
-    0x4770, // [11] bx  lr
-    0xBF00, // [12] nop           — padding to keep literals 4-aligned
-    0xBF00, // [13] nop
-    0xBF00, // [14] nop
-    0xBF00, // [15] nop
+    0x4B04, // [11] ldr r3, [pc, #16] — SYST_CSR_ADDR
+    0x2400, // [12] movs r4, #0
+    0x601C, // [13] str r4, [r3]   — *SYST_CSR = 0
+    0x4770, // [14] bx  lr
+    0xBF00, // [15] nop padding
     0x3FE4, // [16] lit: CTR_PENDSV_ADDR low
     0x2000, // [17] lit: CTR_PENDSV_ADDR high
     0x3FE8, // [18] lit: CTR_SYSTICK_ADDR low
     0x2000, // [19] lit: CTR_SYSTICK_ADDR high
+    0xE010, // [20] lit: SYST_CSR_ADDR low
+    0xE000, // [21] lit: SYST_CSR_ADDR high
 ];
+
+// Pin byte offset of SYST_CSR_ADDR literal pair to keep
+// hw[11]'s ldr [pc, #16] math stable.
+const _: () = assert!(
+    HANDLER_TAIL[20] == 0xE010 && HANDLER_TAIL[21] == 0xE000,
+    "SYST_CSR_ADDR literal must remain at hw[20..=21] for hw[11] ldr math",
+);
 
 // ---------------------------------------------------------------------------
 // Hand-assembled main routines

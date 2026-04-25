@@ -2097,7 +2097,7 @@ mod tests {
     use mdrp2350::{Config, EmulatorBuilder};
 
     fn mk_emu() -> Emulator {
-        EmulatorBuilder::new(Config::default()).build()
+        EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible")
     }
 
     /// The four walking-1 SDRR A0..A3 offsets must appear in SRAM with the

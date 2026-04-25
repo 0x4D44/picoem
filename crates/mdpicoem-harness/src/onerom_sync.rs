@@ -135,7 +135,7 @@ mod tests {
     fn new_bus() -> mdrp2350::Emulator {
         // Build an emulator so we can use its `Bus` — the bus alone can't
         // be constructed directly from outside the crate.
-        EmulatorBuilder::new(Config::default()).build()
+        EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible")
     }
 
     fn release_pio_reset(bus: &mut Bus) {
