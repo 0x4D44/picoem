@@ -106,7 +106,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X}",
     );
     println!(
-        "NOTE: v1 expected to FAIL on EMU until Phase 1 IRQ plumbing lands (V7 §4.4).",
+        "NOTE: V5 IRQ plumbing is complete (NVIC MMIO + SysTick + unified exception dispatcher); EMU-side scenarios should pass.",
     );
     println!();
 

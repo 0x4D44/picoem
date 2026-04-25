@@ -168,6 +168,14 @@ impl CortexM0Plus {
         self.pending_fault.is_some()
     }
 
+    /// True iff the CPU is currently executing the HardFault handler,
+    /// i.e. IPSR == 3. Used by harness integration tests to distinguish
+    /// a misdispatch (HardFault) from a regular FAIL (counter mismatch).
+    #[inline]
+    pub fn is_in_hardfault(&self) -> bool {
+        (self.regs.xpsr & 0x1FF) == 3
+    }
+
     /// Execute a single 16-bit Thumb instruction directly (bypasses
     /// fetch / bus timing). Advances PC by 2 before execution — matching
     /// the ARM architectural definition of "read PC = instr_addr + 4".

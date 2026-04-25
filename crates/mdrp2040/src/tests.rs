@@ -1680,6 +1680,37 @@ mod exceptions {
             "step() cleared the sticky bus_fault flag"
         );
     }
+
+    /// HLD V5 §6.2 / Final step: harness integration tests probe
+    /// `is_in_hardfault()` between chunks to distinguish a misdispatch
+    /// from a regular FAIL. Pin the wrapper's contract: true iff
+    /// IPSR == 3, with no other xPSR bit influencing the result.
+    #[test]
+    fn is_in_hardfault_returns_true_when_ipsr_is_3() {
+        let mut cpu = CortexM0Plus::new();
+        // Fresh core: T-bit set, IPSR=0 → not in hardfault.
+        assert!(!cpu.is_in_hardfault());
+        // Force IPSR=3 (HardFault), keep T-bit set so xPSR is otherwise
+        // architecturally well-formed.
+        cpu.regs.xpsr = (1 << 24) | 3;
+        assert!(cpu.is_in_hardfault());
+        // Other IPSR values (e.g. 11 = SVCall, 14 = PendSV, 15 = SysTick,
+        // 16 = first external IRQ) must not register as hardfault.
+        for ipsr in [0u32, 1, 2, 11, 14, 15, 16, 32, 0x1FE] {
+            cpu.regs.xpsr = (1 << 24) | ipsr;
+            assert_eq!(
+                cpu.is_in_hardfault(),
+                ipsr == 3,
+                "is_in_hardfault wrongly classified IPSR={}",
+                ipsr,
+            );
+        }
+        // High xPSR bits (NZCV) must not pollute the IPSR check.
+        cpu.regs.xpsr = 0xF100_0003; // NZCV all set, T-bit, IPSR=3
+        assert!(cpu.is_in_hardfault());
+        cpu.regs.xpsr = 0xF100_0004; // NZCV set, IPSR=4
+        assert!(!cpu.is_in_hardfault());
+    }
 }
 
 // ---------------------------------------------------------------------------

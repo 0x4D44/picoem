@@ -240,6 +240,17 @@ pub const DUALCORE_CORE1_STACK: u32 = 0x2003_E000;
 /// VTOR writes pointing here are always well-formed.
 pub const ISR_IMAGE_BASE: u32 = 0x2000_2000;
 
+// HLD V5 §9.5: ARMv8-M / ARMv6-M VTOR requires the vector table to be
+// aligned to a power-of-two boundary at least as large as the table
+// itself. The RP2040 ISR oracle's 17-entry table fits in 68 bytes, but
+// the spec mandates a 128-byte minimum alignment for VTOR (low 7 bits
+// must be zero). Compile-time assert keeps a future bump to
+// ISR_IMAGE_BASE from silently violating this.
+const _: () = assert!(
+    ISR_IMAGE_BASE & 0x7F == 0,
+    "ISR_IMAGE_BASE must be 128-byte aligned for ARMv6-M VTOR",
+);
+
 /// ISR oracle stack top. Reset vector word 0 (initial MSP) is
 /// programmed to this address; all scenarios start in Thread mode on
 /// MSP with SP = ISR_STACK_TOP. 4 KB above `ISR_IMAGE_BASE` leaves

@@ -263,80 +263,131 @@ pub const CTR_SYSTICK_ADDR: u32 = 0x2000_3FE8;
 
 /// Handler for the TIMER_IRQ_0 scenario.
 ///
-/// ```text
-///   [ 0] ldr  r0, [pc, #16]   ; r0 = CTR_TIMER_ADDR           (lit [10])
-///   [ 1] ldr  r1, [r0]        ; r1 = *counter
-///   [ 2] adds r1, r1, #1      ; r1 = count + 1
-///   [ 3] str  r1, [r0]        ; *counter = r1
-///   [ 4] ldr  r0, [pc, #12]   ; r0 = TIMER_INTR_ADDR          (lit [12])
-///   [ 5] movs r1, #1          ; r1 = 1 (ALARM0 bit)
-///   [ 6] str  r1, [r0]        ; TIMER.INTR = 1 — W1C ALARM0
-///   [ 7] bx   lr              ; EXC_RETURN back to main
-///   [ 8..9] padding (kept halfword-even)
-///   [10..11] lit: CTR_TIMER_ADDR
-///   [12..13] lit: TIMER_INTR_ADDR
-/// ```
+/// **Order matters** (mirroring pico-sdk's standard timer-ISR pattern):
+///   1. W1C TIMER.INTR — drops the peripheral's level-asserted line
+///      so `poll_alarms`'s level re-assert path stops re-pending NVIC.
+///   2. W1C NVIC_ICPR0 bit 0 — clears any NVIC.pending state set by
+///      the level re-assert during the handler's pre-W1C prefix
+///      (~3 instr × 1-2 cycles = several slow-path ticks where
+///      `tick_peripherals` re-OR'd `1<<IRQ_TIMER_IRQ_0` into
+///      `bus.irq_pending`).
+///   3. Counter increment — observable.
+///   4. `BX LR` — return via EXC_RETURN.
 ///
-/// Literal math:
-///   `ldr r0, [pc, #16]` at hw[0] (addr 0x04C): PC=0x050, Align=0x050,
-///   target = 0x050 + 16 = 0x060 → hw (0x060 - 0x04C)/2 = 10. imm8 = 4.
-///   Encoding: 0x4804.
+/// Without steps 1+2, `exit_exception`'s tail-chain poll sees
+/// NVIC.pending bit 0 still set from level re-assertion during
+/// the handler body, and re-dispatches the same alarm — making
+/// the V1 oracle's `ctr_timer == 1` assertion unsatisfiable. Real
+/// RP2040 silicon has the same level-pending semantics; this
+/// pattern mirrors `pico-sdk/src/rp2_common/hardware_timer/timer.c`.
 ///
-///   `ldr r0, [pc, #12]` at hw[4] (addr 0x054): PC=0x058, Align=0x058,
-///   target = 0x058 + 12 = 0x064 → hw (0x064 - 0x04C)/2 = 12. imm8 = 3.
-///   Encoding: 0x4803.
-const HANDLER_TIMER: [u16; 14] = [
-    0x4804, // [ 0] ldr  r0, [pc, #16]  — CTR_TIMER_ADDR
-    0x6801, // [ 1] ldr  r1, [r0]
-    0x3101, // [ 2] adds r1, #1
-    0x6001, // [ 3] str  r1, [r0]
-    0x4803, // [ 4] ldr  r0, [pc, #12]  — TIMER_INTR_ADDR
-    0x2101, // [ 5] movs r1, #1
-    0x6001, // [ 6] str  r1, [r0]
-    0x4770, // [ 7] bx   lr             — EXC_RETURN
-    0xBF00, // [ 8] nop                 — padding
-    0xBF00, // [ 9] nop
-    0x3FE0, // [10] lit: CTR_TIMER_ADDR low  = 0x2000_3FE0 & 0xFFFF
-    0x2000, // [11] lit: CTR_TIMER_ADDR high = 0x2000_3FE0 >> 16
-    0x4034, // [12] lit: TIMER_INTR_ADDR low  = 0x4005_4034 & 0xFFFF
-    0x4005, // [13] lit: TIMER_INTR_ADDR high = 0x4005_4034 >> 16
+/// Encoding: hw[0/3/5] are all `ldr r0, [pc, #28]` (different
+/// instruction PCs but the same literal-pool offset of 0x1C from
+/// the post-fetch aligned PC). Verified literal math below.
+const HANDLER_TIMER: [u16; 22] = [
+    // Phase 1: W1C TIMER.INTR (drops level immediately)
+    0x4807, // [ 0] ldr  r0, [pc, #28]   — TIMER_INTR_ADDR (lit hw[16])
+    0x2101, // [ 1] movs r1, #1
+    0x6001, // [ 2] str  r1, [r0]        — TIMER.INTR = 1 (W1C bit 0)
+    // Phase 2: W1C NVIC_ICPR0 bit 0 (clears stale pending from
+    // level re-assertions during phase 1's prefix)
+    0x4807, // [ 3] ldr  r0, [pc, #28]   — NVIC_ICPR0_ADDR (lit hw[18])
+    0x6001, // [ 4] str  r1, [r0]        — NVIC_ICPR0 = 1 (r1 still 1)
+    // Phase 3: Increment counter
+    0x4807, // [ 5] ldr  r0, [pc, #28]   — CTR_TIMER_ADDR (lit hw[20])
+    0x6801, // [ 6] ldr  r1, [r0]
+    0x3101, // [ 7] adds r1, #1
+    0x6001, // [ 8] str  r1, [r0]
+    // Phase 4: Return via EXC_RETURN
+    0x4770, // [ 9] bx   lr
+    0xBF00, // [10] nop padding
+    0xBF00, // [11] nop padding
+    0xBF00, // [12] nop padding
+    0xBF00, // [13] nop padding
+    0xBF00, // [14] nop padding
+    0xBF00, // [15] nop padding
+    0x4034, // [16] lit: TIMER_INTR_ADDR  low  (0x4005_4034)
+    0x4005, // [17] lit: TIMER_INTR_ADDR  high
+    0xE280, // [18] lit: NVIC_ICPR0_ADDR  low  (0xE000_E280)
+    0xE000, // [19] lit: NVIC_ICPR0_ADDR  high
+    0x3FE0, // [20] lit: CTR_TIMER_ADDR   low  (0x2000_3FE0)
+    0x2000, // [21] lit: CTR_TIMER_ADDR   high
 ];
+
+// Pin literal-pool byte offsets to keep hw[0/3/5] ldr math stable.
+const _: () = assert!(
+    HANDLER_TIMER[16] == 0x4034 && HANDLER_TIMER[17] == 0x4005,
+    "TIMER_INTR_ADDR literal must remain at hw[16..=17]",
+);
+const _: () = assert!(
+    HANDLER_TIMER[18] == 0xE280 && HANDLER_TIMER[19] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at hw[18..=19]",
+);
+const _: () = assert!(
+    HANDLER_TIMER[20] == 0x3FE0 && HANDLER_TIMER[21] == 0x2000,
+    "CTR_TIMER_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    (HANDLER_OFFSET as usize) + HANDLER_TIMER.len() * 2 <= MAIN_OFFSET as usize,
+    "HANDLER_TIMER must fit between HANDLER_OFFSET and MAIN_OFFSET",
+);
 
 /// Shared handler for PendSV + SysTick in the tail-chain scenario.
 ///
 /// Dispatch on IPSR — on M0+ `mrs rD, IPSR` reads the low 9 bits of
 /// xPSR. PendSV = 14, SysTick = 15. The handler increments whichever
-/// counter matches and returns via `BX LR`.
+/// counter matches, disables SysTick, clears any pending PendSV +
+/// SysTick bits in ICSR, and returns via `BX LR`.
+///
+/// The ICSR pend-clear is load-bearing: SysTick will re-fire during
+/// the ~22-cycle handler before the SYST_CSR=0 disable lands at hw[13],
+/// latching PENDSTSET. Without an explicit W1C clear, `exit_exception`'s
+/// tail-chain poll would dispatch SysTick a second time and the
+/// `ctr_systick == 1` invariant would fail. PENDSTCLR (bit 25) +
+/// PENDSVCLR (bit 27) → mask 0x0A00_0000.
 ///
 /// ```text
 ///   [ 0] mrs  r2, IPSR       ; r2 = exception number  (hw0=0xF3EF, hw1=0x8205)
 ///   [ 2] cmp  r2, #14        ; PendSV?
 ///   [ 3] bne  hw[6]          ; skip PendSV increment if r2 != 14
-///   [ 4] ldr  r0, [pc, #20]  ; r0 = CTR_PENDSV_ADDR    (lit [16])
+///   [ 4] ldr  r0, [pc, #32]  ; r0 = CTR_PENDSV_ADDR    (lit [22])
 ///   [ 5] b    hw[8]          ; jump to common increment
-///   [ 6] ldr  r0, [pc, #20]  ; r0 = CTR_SYSTICK_ADDR   (lit [18])
+///   [ 6] ldr  r0, [pc, #32]  ; r0 = CTR_SYSTICK_ADDR   (lit [24])
 ///   [ 7] nop                 ; alignment padding
 ///   [ 8] ldr  r1, [r0]       ; common increment
 ///   [ 9] adds r1, #1
 ///   [10] str  r1, [r0]
-///   [11] bx   lr
-///   [12..15] padding
-///   [16..17] lit: CTR_PENDSV_ADDR
-///   [18..19] lit: CTR_SYSTICK_ADDR
+///   [11] ldr  r3, [pc, #28]  ; r3 = SYST_CSR_ADDR      (lit [26])
+///   [12] movs r4, #0
+///   [13] str  r4, [r3]       ; *SYST_CSR = 0 (disable SysTick)
+///   [14] ldr  r3, [pc, #24]  ; r3 = ICSR_ADDR          (lit [28])
+///   [15] ldr  r4, [pc, #28]  ; r4 = PENDST/PENDSV clear mask (lit [30])
+///   [16] str  r4, [r3]       ; *ICSR = PENDSTCLR | PENDSVCLR
+///   [17] bx   lr
+///   [18..21] padding
+///   [22..23] lit: CTR_PENDSV_ADDR
+///   [24..25] lit: CTR_SYSTICK_ADDR
+///   [26..27] lit: SYST_CSR_ADDR
+///   [28..29] lit: ICSR_ADDR (0xE000_ED04)
+///   [30..31] lit: ICSR clear mask (0x0A00_0000)
 /// ```
 ///
 /// Wide instruction: `mrs r2, IPSR` = hw0=0xF3EF, hw1=0x8205 (Rd=2,
 /// SYSm=5 for IPSR).
 ///
 /// Literal math — `ldr rD, [pc, #imm8*4]` on ARMv6-M uses PC rounded
-/// down to a 4-byte boundary (already 4-aligned here) plus imm8*4:
-///   hw[4] `ldr r0, [pc, #20]`: instr_addr = 0x054, PC = 0x058,
-///   target = hw[16] at 0x06C. imm8*4 = 0x06C - 0x058 = 0x14 → imm8 = 5.
-///   Encoding: 0x4805.
+/// down to a 4-byte boundary plus imm8*4. hw[i] byte = 0x04C + 2*i:
 ///
-///   hw[6] `ldr r0, [pc, #20]`: instr_addr = 0x058, PC = 0x05C,
-///   target = hw[18] at 0x070. imm8*4 = 0x070 - 0x05C = 0x14 → imm8 = 5.
-///   Encoding: 0x4805.
+///   hw[4]  `ldr r0, [pc, #32]`: instr 0x054, PC 0x058, Align 0x058,
+///     target hw[22] at 0x078 → imm8*4 = 32 → imm8 = 8. Encoding 0x4808.
+///   hw[6]  `ldr r0, [pc, #32]`: instr 0x058, PC 0x05C, Align 0x05C,
+///     target hw[24] at 0x07C → imm8*4 = 32 → imm8 = 8. Encoding 0x4808.
+///   hw[11] `ldr r3, [pc, #28]`: instr 0x062, PC 0x066, Align 0x064,
+///     target hw[26] at 0x080 → imm8*4 = 28 → imm8 = 7. Encoding 0x4B07.
+///   hw[14] `ldr r3, [pc, #24]`: instr 0x068, PC 0x06C, Align 0x06C,
+///     target hw[28] at 0x084 → imm8*4 = 24 → imm8 = 6. Encoding 0x4B06.
+///   hw[15] `ldr r4, [pc, #28]`: instr 0x06A, PC 0x06E, Align 0x06C,
+///     target hw[30] at 0x088 → imm8*4 = 28 → imm8 = 7. Encoding 0x4C07.
 ///
 /// Branches on ARMv6-M — ARMv6-M T1 `bne` uses signed imm8 scaled by 2,
 /// target = PC + imm8*2, with PC = branch_addr + 4 (the usual ARM rule).
@@ -359,36 +410,54 @@ const HANDLER_TIMER: [u16; 14] = [
 ///     T2 encoding: 0b11100_00000000001 = 0xE001. (This is `b .+2` in
 ///     the standard ARM "relative to PC" notation — PC already includes
 ///     the pipeline offset.)
-const HANDLER_TAIL: [u16; 22] = [
+const HANDLER_TAIL: [u16; 32] = [
     0xF3EF, // [ 0] mrs r2, IPSR — hw0
     0x8205, // [ 1] mrs r2, IPSR — hw1 (Rd=2, SYSm=5)
     0x2A0E, // [ 2] cmp r2, #14   — PendSV number
     0xD101, // [ 3] bne hw[6]    — skip PendSV ldr/b if not PendSV
-    0x4805, // [ 4] ldr r0, [pc, #20] — CTR_PENDSV_ADDR
+    0x4808, // [ 4] ldr r0, [pc, #32] — CTR_PENDSV_ADDR
     0xE001, // [ 5] b   .+2       — jump to common [8]
-    0x4805, // [ 6] ldr r0, [pc, #20] — CTR_SYSTICK_ADDR
+    0x4808, // [ 6] ldr r0, [pc, #32] — CTR_SYSTICK_ADDR
     0xBF00, // [ 7] nop           — alignment padding
     0x6801, // [ 8] ldr r1, [r0]  — common increment
     0x3101, // [ 9] adds r1, #1
     0x6001, // [10] str r1, [r0]
-    0x4B04, // [11] ldr r3, [pc, #16] — SYST_CSR_ADDR
+    0x4B07, // [11] ldr r3, [pc, #28] — SYST_CSR_ADDR
     0x2400, // [12] movs r4, #0
-    0x601C, // [13] str r4, [r3]   — *SYST_CSR = 0
-    0x4770, // [14] bx  lr
-    0xBF00, // [15] nop padding
-    0x3FE4, // [16] lit: CTR_PENDSV_ADDR low
-    0x2000, // [17] lit: CTR_PENDSV_ADDR high
-    0x3FE8, // [18] lit: CTR_SYSTICK_ADDR low
-    0x2000, // [19] lit: CTR_SYSTICK_ADDR high
-    0xE010, // [20] lit: SYST_CSR_ADDR low
-    0xE000, // [21] lit: SYST_CSR_ADDR high
+    0x601C, // [13] str r4, [r3]   — *SYST_CSR = 0 (disable SysTick)
+    0x4B06, // [14] ldr r3, [pc, #24] — ICSR_ADDR
+    0x4C07, // [15] ldr r4, [pc, #28] — PENDST/PENDSV clear mask
+    0x601C, // [16] str r4, [r3]   — *ICSR = PENDSTCLR | PENDSVCLR
+    0x4770, // [17] bx  lr
+    0xBF00, // [18] nop padding
+    0xBF00, // [19] nop padding
+    0xBF00, // [20] nop padding
+    0xBF00, // [21] nop padding
+    0x3FE4, // [22] lit: CTR_PENDSV_ADDR low
+    0x2000, // [23] lit: CTR_PENDSV_ADDR high
+    0x3FE8, // [24] lit: CTR_SYSTICK_ADDR low
+    0x2000, // [25] lit: CTR_SYSTICK_ADDR high
+    0xE010, // [26] lit: SYST_CSR_ADDR low
+    0xE000, // [27] lit: SYST_CSR_ADDR high
+    0xED04, // [28] lit: ICSR_ADDR low (0xE000_ED04)
+    0xE000, // [29] lit: ICSR_ADDR high
+    0x0000, // [30] lit: ICSR clear mask low (0x0A00_0000)
+    0x0A00, // [31] lit: ICSR clear mask high
 ];
 
-// Pin byte offset of SYST_CSR_ADDR literal pair to keep
-// hw[11]'s ldr [pc, #16] math stable.
+// Pin byte offset of the literal-pool entries that hw[11], hw[14], and
+// hw[15]'s `ldr [pc, #imm]` math depend on.
 const _: () = assert!(
-    HANDLER_TAIL[20] == 0xE010 && HANDLER_TAIL[21] == 0xE000,
-    "SYST_CSR_ADDR literal must remain at hw[20..=21] for hw[11] ldr math",
+    HANDLER_TAIL[26] == 0xE010 && HANDLER_TAIL[27] == 0xE000,
+    "SYST_CSR_ADDR literal must remain at hw[26..=27] for hw[11] ldr math",
+);
+const _: () = assert!(
+    HANDLER_TAIL[28] == 0xED04 && HANDLER_TAIL[29] == 0xE000,
+    "ICSR_ADDR literal must remain at hw[28..=29] for hw[14] ldr math",
+);
+const _: () = assert!(
+    HANDLER_TAIL[30] == 0x0000 && HANDLER_TAIL[31] == 0x0A00,
+    "ICSR clear mask must remain at hw[30..=31] for hw[15] ldr math",
 );
 
 // ---------------------------------------------------------------------------
@@ -780,6 +849,163 @@ fn reset_scenario_state_emu(emu: &mut mdrp2040::Emulator) {
     emu.mmio_write32(TIMER_INTE_ADDR, 0);
 }
 
+/// Result of running a scenario's EMU half. Per HLD V5 §6.2.
+#[derive(Debug)]
+pub enum EmuOutcome {
+    /// Run completed; observables collected per `sc.observe`.
+    Completed(Vec<u32>),
+    /// CPU entered HardFault during the run — distinct failure class
+    /// so a misdispatch surfaces clearly vs a generic counter mismatch.
+    HardFault { pc: u32, ipsr: u8 },
+    /// Cycle budget exhausted with no observable progress.
+    Timeout,
+}
+
+/// Pick the primary success observable for a scenario. The runner
+/// polls this address every chunk; once it's non-zero, one extra
+/// chunk runs (so the tail-chain scenario can fire its second
+/// exception) and the run returns `Completed`.
+fn primary_observable_addr(name: &str) -> u32 {
+    match name {
+        "isr_m0_timer_cold" => CTR_TIMER_ADDR,
+        "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
+        other => panic!("primary_observable_addr: unknown scenario '{other}'; add it to this match"),
+    }
+}
+
+/// Set up an `Emulator` for an ISR scenario: image upload, scenario-
+/// state reset, init regs, scenario preamble, DWT/CYCCNT priming, and
+/// core-0 thread-mode register init. No probe-rs.
+///
+/// Caller is responsible for building the `Emulator`, halting core 1
+/// (M0+ V1 oracle assumes single-core), and setting the active core
+/// to 0 before calling this helper.
+pub fn setup_emulator_image(emu: &mut mdrp2040::Emulator, sc: &IsrScenario) {
+    // Bus::new() defaults all peripherals to held-in-reset, but real
+    // RP2040 silicon releases TIMER + WATCHDOG via bootrom before user
+    // code runs. Mirror that here so MAIN_TIMER's writes to ALARM0 /
+    // INTE / NVIC_ISER0 actually land. Address 0x4000_F000 is the
+    // RESETS_CLR alias (offset 0x3000 from RESETS_BASE 0x4000_C000);
+    // W1S clears the named bits per `Bus::resets_clr_deasserts` test
+    // at bus/mod.rs:1937.
+    emu.mmio_write32(
+        0x4000_F000,
+        (1 << 21)   // RESET_TIMER
+            | (1 << 24), // RESET_WATCHDOG  (TIMER's 1µs tick counts watchdog ticks)
+    );
+
+    // Upload the image word-by-word.
+    debug_assert_eq!(sc.image.len() % 4, 0, "image must be word-aligned");
+    for chunk_off in (0..sc.image.len()).step_by(4) {
+        let word = u32::from_le_bytes([
+            sc.image[chunk_off],
+            sc.image[chunk_off + 1],
+            sc.image[chunk_off + 2],
+            sc.image[chunk_off + 3],
+        ]);
+        emu.poke(ISR_IMAGE_BASE + chunk_off as u32, word);
+    }
+
+    reset_scenario_state_emu(emu);
+    apply_init_regs_emu(emu, sc.init_regs);
+    scenario_preamble_emu(emu, sc.name);
+
+    // Parity with the HW side: enable DWT CYCCNT if modelled. M0+
+    // typically has no DWT, but the emulator may model it; the writes
+    // are harmless either way.
+    let demcr = emu.mmio_read32(silicon_oracle::DEMCR_U32);
+    emu.mmio_write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA);
+    let dwt_ctrl = emu.mmio_read32(silicon_oracle::DWT_CTRL_U32);
+    emu.mmio_write32(silicon_oracle::DWT_CTRL_U32, dwt_ctrl | silicon_oracle::CYCCNTENA);
+    emu.mmio_write32(silicon_oracle::DWT_CYCCNT_ADDR, 0);
+
+    // Prime core-0 thread-mode state. T-bit set, MSP at stack top, LR
+    // sentinel, PRIMASK/CONTROL = 0 (privileged thread mode on MSP,
+    // IRQs un-masked).
+    let c = emu.core_mut(0);
+    c.wake();
+    c.regs.set_pc(ISR_IMAGE_BASE + sc.entry_offset);
+    c.regs.xpsr = 0x0100_0000;
+    c.regs.r[13] = ISR_STACK_TOP;
+    c.regs.msp = ISR_STACK_TOP;
+    c.regs.r[14] = 0xFFFF_FFFF;
+    c.regs.control = 0;
+    c.regs.primask = 0;
+}
+
+/// Run the EMU side of a scenario forward. Returns observable readouts
+/// per `sc.observe` once the primary observable advances past zero, plus
+/// a status flag distinguishing normal completion, HardFault, and
+/// timeout. Per HLD V5 §6.2:
+///
+/// * Stepped in chunks of `cycles_per_ms / 4`; after each chunk the
+///   primary observable is checked and `is_in_hardfault()` is polled.
+/// * On primary observable progress (> 0) one extra chunk runs (so
+///   tail-chain has a window to fire the second exception), then the
+///   run breaks and returns `Completed`.
+/// * On `is_in_hardfault()` true, the run returns `HardFault { pc,
+///   ipsr }` immediately — bails on first divergence.
+/// * If the cycle budget (`sc.max_millis * cycles_per_ms`) exhausts
+///   with no progress, returns `Timeout`.
+pub fn run_emu_scenario(emu: &mut mdrp2040::Emulator, sc: &IsrScenario) -> EmuOutcome {
+    let cycles_per_ms = (Config::default().sys_clk_hz as u64) / 1000;
+    let chunk_cycles = (cycles_per_ms / 4).max(1);
+    let total_budget = (sc.max_millis as u64).saturating_mul(cycles_per_ms);
+    let primary_addr = primary_observable_addr(sc.name);
+
+    let mut spent: u64 = 0;
+    let mut saw_progress = false;
+
+    while spent < total_budget {
+        let this_chunk = chunk_cycles.min(total_budget - spent);
+        emu.run(this_chunk).expect("Serial run is infallible");
+        spent = spent.saturating_add(this_chunk);
+
+        // HardFault check: between chunks, before observable poll, so a
+        // misdispatched IRQ landing on the default-handler `bkpt #1`
+        // path (which also escalates to HardFault) surfaces here as a
+        // distinct failure class.
+        if emu.core(0).is_in_hardfault() {
+            let pc = emu.core(0).regs.pc();
+            let ipsr = (emu.core(0).regs.xpsr & 0x1FF) as u8;
+            return EmuOutcome::HardFault { pc, ipsr };
+        }
+
+        let primary = emu.peek(primary_addr);
+        if primary > 0 {
+            saw_progress = true;
+            // Run one more chunk so tail-chain has a window to fire its
+            // second exception, then break.
+            let extra = chunk_cycles.min(total_budget.saturating_sub(spent));
+            if extra > 0 {
+                emu.run(extra).expect("Serial run is infallible");
+                if emu.core(0).is_in_hardfault() {
+                    let pc = emu.core(0).regs.pc();
+                    let ipsr = (emu.core(0).regs.xpsr & 0x1FF) as u8;
+                    return EmuOutcome::HardFault { pc, ipsr };
+                }
+            }
+            break;
+        }
+    }
+
+    // If we exited via budget exhaustion without progress, that's
+    // Timeout. A run that *did* see progress counts as Completed — the
+    // primary observable is non-zero and we collect whatever the
+    // secondary observables read.
+    if !saw_progress {
+        return EmuOutcome::Timeout;
+    }
+
+    let obs: Vec<u32> = sc
+        .observe
+        .iter()
+        .map(|(_, o)| read_observable_emu(emu, *o))
+        .collect();
+
+    EmuOutcome::Completed(obs)
+}
+
 /// Run one scenario end-to-end (HW + EMU) and produce the outcome.
 ///
 /// HW halt strategy. Unlike the RP2350 oracle, this one doesn't rely
@@ -859,62 +1085,41 @@ fn run_one_scenario(
 
     // ---- EMU side ----------------------------------------------------
 
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
     emu.core_mut(1).halt();
     emu.bus.set_active_core(0);
 
-    // Upload the image.
-    debug_assert_eq!(sc.image.len() % 4, 0, "image must be word-aligned");
-    for chunk_off in (0..sc.image.len()).step_by(4) {
-        let word = u32::from_le_bytes([
-            sc.image[chunk_off],
-            sc.image[chunk_off + 1],
-            sc.image[chunk_off + 2],
-            sc.image[chunk_off + 3],
-        ]);
-        emu.poke(ISR_IMAGE_BASE + chunk_off as u32, word);
-    }
-
-    reset_scenario_state_emu(&mut emu);
-    apply_init_regs_emu(&mut emu, sc.init_regs);
-    scenario_preamble_emu(&mut emu, sc.name);
-
-    // Parity with the HW side: enable DWT CYCCNT if modelled.
-    let demcr = emu.mmio_read32(silicon_oracle::DEMCR_U32);
-    emu.mmio_write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA);
-    let dwt_ctrl = emu.mmio_read32(silicon_oracle::DWT_CTRL_U32);
-    emu.mmio_write32(silicon_oracle::DWT_CTRL_U32, dwt_ctrl | silicon_oracle::CYCCNTENA);
-    emu.mmio_write32(silicon_oracle::DWT_CYCCNT_ADDR, 0);
-
-    // Prime core-0 state.
-    {
-        let c = emu.core_mut(0);
-        c.wake();
-        c.regs.set_pc(ISR_IMAGE_BASE + sc.entry_offset);
-        c.regs.xpsr = 0x0100_0000;
-        c.regs.r[13] = ISR_STACK_TOP;
-        c.regs.msp = ISR_STACK_TOP;
-        c.regs.r[14] = 0xFFFF_FFFF;
-        c.regs.control = 0;
-        c.regs.primask = 0;
-    }
-
-    // EMU budget: millis → cycles at the default clock. Config::default()
-    // seeds sys_clk_hz at ROSC (~6.5 MHz); run for the wall-clock budget
-    // so the EMU side has at least as many cycles to dispatch as HW.
-    let cycles_per_ms = (Config::default().sys_clk_hz as u64) / 1000;
-    let budget_cycles = (sc.max_millis as u64).saturating_mul(cycles_per_ms);
-    emu.run(budget_cycles).expect("Serial run is infallible");
+    setup_emulator_image(&mut emu, sc);
+    let outcome = run_emu_scenario(&mut emu, sc);
     emu.core_mut(0).halt();
     emu.bus.set_active_core(0);
 
-    let emu_obs: Vec<u32> = sc
-        .observe
-        .iter()
-        .map(|(_, o)| read_observable_emu(&mut emu, *o))
-        .collect();
-
     // ---- Diff --------------------------------------------------------
+    //
+    // HardFault and Timeout are distinct failure classes — they short-
+    // circuit the per-observable diff so a regression points directly
+    // at the misdispatch / hang instead of looking like a generic
+    // counter-mismatch.
+    let emu_obs: Vec<u32> = match &outcome {
+        EmuOutcome::Completed(obs) => obs.clone(),
+        EmuOutcome::HardFault { pc, ipsr } => {
+            let msg = format!("EMU hardfault at pc=0x{pc:08X} ipsr={ipsr}");
+            if verbose {
+                println!("    FAIL {msg}");
+            }
+            return Ok((Verdict::Fail, Some(msg), t0.elapsed()));
+        }
+        EmuOutcome::Timeout => {
+            let msg = "EMU cycle budget exhausted before primary observable advanced".to_string();
+            if verbose {
+                println!("    FAIL {msg}");
+            }
+            return Ok((Verdict::Fail, Some(msg), t0.elapsed()));
+        }
+    };
 
     let mut first_div: Option<String> = None;
     for (i, (label, obs)) in sc.observe.iter().enumerate() {
