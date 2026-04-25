@@ -36,6 +36,15 @@ use super::apply_alias_rmw;
 /// `TICK` register offset within the WATCHDOG block (datasheet §4.7.3).
 pub const TICK_OFFSET: u32 = 0x2C;
 
+/// SCRATCH0 offset within the WATCHDOG block. The pico-sdk header
+/// `rp2040/hardware_structs/include/hardware/structs/watchdog.h` lays
+/// out `watchdog_hw_t` as `{ ctrl, load, reason, scratch[8], tick }`,
+/// so SCRATCH0 starts at offset 0x0C and SCRATCH3 (used by the PicoGUS
+/// multifw bootloader to pick a firmware slot) sits at 0x18.
+pub const SCRATCH0_OFFSET: u32 = 0x0C;
+/// One past the last SCRATCH register (SCRATCH7 at 0x28).
+const SCRATCH_END_OFFSET: u32 = SCRATCH0_OFFSET + 8 * 4;
+
 /// Reset value for `CYCLES` — 12 cycles of `clk_ref` per microsecond.
 /// pico-sdk writes this explicitly but real silicon resets to 0; the
 /// default models the post-init state so a freshly-built [`Bus`] can
@@ -59,6 +68,11 @@ pub struct WatchdogTickRegs {
     /// field so a future cycle-accurate model can drop the collapse
     /// without refactoring callers.
     pub running: bool,
+    /// SCRATCH0..SCRATCH7 — eight 32-bit RW scratch registers at
+    /// offsets 0x0C..0x28. Plain RW: writes store, reads return the
+    /// last value. The PicoGUS multifw bootloader reads SCRATCH3 to
+    /// pick a firmware slot.
+    pub scratch: [u32; 8],
 }
 
 impl WatchdogTickRegs {
@@ -68,14 +82,17 @@ impl WatchdogTickRegs {
             cycles: CYCLES_RESET,
             enable: false,
             running: false,
+            scratch: [0; 8],
         }
     }
 
     /// Reset to power-on defaults. Called from `Emulator::reset()`.
+    /// Clears scratch — `Emulator::reset()` is a cold-boot equivalent.
     pub fn reset(&mut self) {
         self.cycles = CYCLES_RESET;
         self.enable = false;
         self.running = false;
+        self.scratch = [0; 8];
     }
 
     /// Read a register by canonical offset within the watchdog block.
@@ -93,6 +110,11 @@ impl WatchdogTickRegs {
                 }
                 v
             }
+            o if (SCRATCH0_OFFSET..SCRATCH_END_OFFSET).contains(&o)
+                && (o & 0x3) == 0 =>
+            {
+                self.scratch[((o - SCRATCH0_OFFSET) >> 2) as usize]
+            }
             _ => 0,
         }
     }
@@ -107,6 +129,13 @@ impl WatchdogTickRegs {
     /// sufficient for firmware that polls `RUNNING` after `ENABLE`
     /// (there's no corpus binary distinguishing the two cadences).
     pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
+        if (SCRATCH0_OFFSET..SCRATCH_END_OFFSET).contains(&offset)
+            && (offset & 0x3) == 0
+        {
+            let idx = ((offset - SCRATCH0_OFFSET) >> 2) as usize;
+            apply_alias_rmw(&mut self.scratch[idx], value, alias);
+            return;
+        }
         if offset != TICK_OFFSET {
             return;
         }
@@ -220,5 +249,31 @@ mod tests {
         assert_eq!(t.cycles, CYCLES_RESET);
         assert!(!t.enable);
         assert!(!t.running);
+    }
+
+    #[test]
+    fn scratch_registers_roundtrip_and_clear_on_reset() {
+        let mut t = WatchdogTickRegs::new();
+        // SCRATCH7 is zero after construction.
+        assert_eq!(t.read32(SCRATCH0_OFFSET + 7 * 4), 0);
+
+        // Write CAFEBABE to SCRATCH2 (offset 0x14), read back.
+        t.write32(SCRATCH0_OFFSET + 2 * 4, 0xCAFE_BABE, 0);
+        assert_eq!(t.read32(SCRATCH0_OFFSET + 2 * 4), 0xCAFE_BABE);
+        assert_eq!(t.scratch[2], 0xCAFE_BABE);
+
+        // Write 5 to SCRATCH3 (offset 0x18 — the slot the bootloader reads).
+        t.write32(SCRATCH0_OFFSET + 3 * 4, 5, 0);
+        assert_eq!(t.read32(SCRATCH0_OFFSET + 3 * 4), 5);
+        assert_eq!(t.scratch[3], 5);
+
+        // Other scratch slots remain untouched.
+        assert_eq!(t.scratch[0], 0);
+        assert_eq!(t.scratch[7], 0);
+
+        // Reset clears scratch.
+        t.reset();
+        assert_eq!(t.scratch, [0; 8]);
+        assert_eq!(t.read32(SCRATCH0_OFFSET + 3 * 4), 0);
     }
 }

@@ -1355,6 +1355,7 @@ struct Args {
     pre_roll_secs: f64,
     trace_stretch: f64,
     out: Option<PathBuf>,
+    firmware_mode: Option<u32>,
 }
 
 /// Default location searched for a real RP2040 bootrom when `--flash` is
@@ -1377,6 +1378,7 @@ fn parse_args() -> Result<Args, String> {
     let mut pre_roll_secs: f64 = 0.0;
     let mut trace_stretch: f64 = 1.0;
     let mut out = None;
+    let mut firmware_mode: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1455,6 +1457,21 @@ fn parse_args() -> Result<Args, String> {
                 }
                 out = Some(PathBuf::from(&args[i]));
             }
+            "--firmware-mode" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--firmware-mode requires a slot index".into());
+                }
+                let raw = &args[i];
+                let parsed = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                    u32::from_str_radix(hex, 16)
+                } else {
+                    raw.parse::<u32>()
+                };
+                firmware_mode = Some(
+                    parsed.map_err(|e| format!("invalid --firmware-mode '{raw}': {e}"))?,
+                );
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -1476,6 +1493,7 @@ fn parse_args() -> Result<Args, String> {
         pre_roll_secs,
         trace_stretch,
         out,
+        firmware_mode,
     })
 }
 
@@ -1535,7 +1553,12 @@ fn print_usage() {
                       keep up with back-to-back ISA writes. Applied in\n              \
                       trace-domain and summed with pre-roll in sim-domain.\n\
          --out        Optional. Path for the captured I2S WAV. Default:\n              \
-                      crates/mdpicoem-harness/oracles/picogus_<trace_stem>.wav."
+                      crates/mdpicoem-harness/oracles/picogus_<trace_stem>.wav.\n\
+         --firmware-mode N\n              \
+                      Optional. After emu.reset(), write N (u32, dec or 0x..)\n              \
+                      to watchdog SCRATCH3 (0x4005_8018) so the PicoGUS multifw\n              \
+                      bootloader picks slot N instead of falling through to its\n              \
+                      flash-settings default."
     );
 }
 
@@ -1718,6 +1741,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     emu.reset();
+
+    // PicoGUS multifw bootloader reads watchdog scratch[3] at boot to
+    // select a firmware slot. SCRATCH0 is at WATCHDOG_BASE + 0x0C per
+    // pico-sdk `watchdog_hw_t`, so SCRATCH3 sits at +0x18.
+    if let Some(slot) = args.firmware_mode {
+        let addr = mdrp2040::bus::WATCHDOG_BASE + 0x18;
+        eprintln!(
+            "[diag] firmware-mode: direct-field write of slot {slot} to watchdog scratch[3] @ {addr:#x} (bypasses RESETS gate)"
+        );
+        emu.bus.watchdog_tick.scratch[3] = slot;
+    }
 
     // If flash looks like a pico-sdk image (boot2 at 0x000 + vector
     // table at 0x100 with SP in SRAM and PC in flash), direct-boot into

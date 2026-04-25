@@ -257,7 +257,7 @@ pub struct Bus {
     /// WATCHDOG_TICK register model (Phase 1 scope — HLD V7 §5.5). Only
     /// the `TICK` register at offset `0x2C` is modelled today; the rest
     /// of the WATCHDOG block reads as 0.
-    pub(crate) watchdog_tick: WatchdogTickRegs,
+    pub watchdog_tick: WatchdogTickRegs,
     /// TIMER register model (Phase 1 Wave 2 — HLD V7 §5.3). Lazy
     /// microsecond counter + four alarms; `advance_lazy_scheduled`
     /// polls `poll_alarms` on every step tail to surface alarm-match

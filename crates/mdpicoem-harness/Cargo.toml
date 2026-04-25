@@ -205,6 +205,10 @@ name = "picogus_diff_rp2040"
 path = "src/bin/picogus_diff_rp2040.rs"
 
 [[bin]]
+name = "fm_trace_gen"
+path = "src/bin/fm_trace_gen.rs"
+
+[[bin]]
 name = "mmio_trace_rp2040"
 path = "src/bin/mmio_trace_rp2040.rs"
 
