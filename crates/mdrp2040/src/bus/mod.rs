@@ -2262,6 +2262,29 @@ mod tests {
     }
 
     #[test]
+    fn nvic_iser_then_icer_clears() {
+        // V5 §5.1 audit shape: write 0xFFFF to ISER0, then 0x00FF to
+        // ICER0; ISER0 readback must be 0xFF00 (high half preserved,
+        // low half cleared by W1C).
+        let mut bus = Bus::new();
+        bus.write32(0xE000_E100, 0x0000_FFFF);
+        bus.write32(0xE000_E180, 0x0000_00FF);
+        assert_eq!(bus.read32(0xE000_E100), 0x0000_FF00);
+        // ICPR mirrors ISPR for pending — analogous shape covered by
+        // `nvic_ispr0_write_sets_pending_read_back` above.
+    }
+
+    #[test]
+    fn nvic_ipr_top_two_bits_significant() {
+        // V5 §5.1 audit shape: writing 0xC5 to a priority byte must
+        // mask to 0xC0 (only bits [7:6] are implemented on M0+).
+        let mut bus = Bus::new();
+        // IPR0 lane 0 covers IRQ 0.
+        bus.write32(0xE000_E400, 0xC5);
+        assert_eq!(bus.read32(0xE000_E400), 0xC0);
+    }
+
+    #[test]
     fn nvic_is_per_core_banked() {
         // ARMv6-M banks the SCS per-core. Active core = 0: writes land
         // on nvics[0] only; active core = 1 sees independent state.

@@ -765,13 +765,103 @@ impl WorkerBus {
     // ----------------------------------------------------------------
     // PPB dispatch (region 0xE) — per-core local, same as serial Bus.
     // ----------------------------------------------------------------
+    //
+    // NVIC MMIO is intercepted before falling through to the inert PPB
+    // (V5 HLD §5.1 — Component A). Mirrors the serial path at
+    // `crates/mdrp2040/src/bus/mod.rs::nvic_mmio_read32` / `_write32`,
+    // indexing the per-worker `nvic[core_id]` field.
 
     fn ppb_read32(&self, addr: u32) -> u32 {
+        if let Some(v) = self.nvic_mmio_read32(addr) {
+            return v;
+        }
         self.ppb[self.core_id].read32(addr)
     }
 
     fn ppb_write32(&mut self, addr: u32, val: u32) {
+        if self.nvic_mmio_write32(addr, val) {
+            return;
+        }
         self.ppb[self.core_id].write32(addr, val);
+    }
+
+    /// Intercept NVIC MMIO before the PPB sees it (V5 HLD §5.1).
+    /// Returns `Some(word)` when `addr` lies inside the NVIC ISER0 /
+    /// ICER0 / ISPR0 / ICPR0 / IPR0..7 range, `None` otherwise so the
+    /// caller can fall through to the PPB dispatch.
+    ///
+    /// 1:1 port of the serial `Bus::nvic_mmio_read32`. The field is
+    /// `nvic: [Nvic; 2]` (same shape as the serial `nvics`), but each
+    /// worker only ever touches its own `nvic[self.core_id]` slot —
+    /// the other slot is an unused placeholder on this worker.
+    fn nvic_mmio_read32(&self, addr: u32) -> Option<u32> {
+        let low = addr & 0xFFFF;
+        let n = &self.nvic[self.core_id];
+        match low {
+            // NVIC_ISER0 / NVIC_ICER0 both READ the enable mask.
+            0xE100 | 0xE180 => Some(n.enabled),
+            // NVIC_ISPR0 / NVIC_ICPR0 both READ the pending mask.
+            0xE200 | 0xE280 => Some(n.pending),
+            // NVIC_IPR0..7 at 0xE400 + 4N. Each word holds 4 × 8-bit
+            // priority bytes for IRQs [N*4..N*4+4].
+            0xE400..=0xE41F => {
+                let word_idx = ((low - 0xE400) >> 2) as usize;
+                let base_irq = word_idx * 4;
+                let mut w = 0u32;
+                for lane in 0..4 {
+                    let irq = base_irq + lane;
+                    if irq < 32 {
+                        w |= (n.priority[irq] as u32) << (lane * 8);
+                    }
+                }
+                Some(w)
+            }
+            _ => None,
+        }
+    }
+
+    /// Intercept NVIC MMIO writes. Returns `true` when handled. All
+    /// four register families are per-core. 1:1 port of the serial
+    /// `Bus::nvic_mmio_write32`.
+    fn nvic_mmio_write32(&mut self, addr: u32, val: u32) -> bool {
+        let low = addr & 0xFFFF;
+        let n = &mut self.nvic[self.core_id];
+        match low {
+            // NVIC_ISER0: write-1-to-SET the enable bit.
+            0xE100 => {
+                n.enabled |= val;
+                true
+            }
+            // NVIC_ICER0: write-1-to-CLEAR the enable bit.
+            0xE180 => {
+                n.enabled &= !val;
+                true
+            }
+            // NVIC_ISPR0: write-1-to-SET the pending bit.
+            0xE200 => {
+                n.pending |= val;
+                true
+            }
+            // NVIC_ICPR0: write-1-to-CLEAR the pending bit.
+            0xE280 => {
+                n.pending &= !val;
+                true
+            }
+            // NVIC_IPR0..7: 4×u8 priority bytes, masked to bits [7:6].
+            0xE400..=0xE41F => {
+                let word_idx = ((low - 0xE400) >> 2) as usize;
+                let base_irq = word_idx * 4;
+                for lane in 0..4 {
+                    let irq = base_irq + lane;
+                    if irq < 32 {
+                        let byte = ((val >> (lane * 8)) & 0xFF) as u8;
+                        n.priority[irq] = byte & crate::core::nvic::PRIORITY_MASK;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     // ----------------------------------------------------------------
@@ -1580,5 +1670,80 @@ mod tests {
         assert_eq!(bus.bus_fault_addr(), 0);
 
         bus.set_active_pc(0x1000_0200);
+    }
+
+    // --- NVIC MMIO interception (V5 HLD §5.1 — Component A) -----------------
+    //
+    // Mirrors the serial `Bus::nvic_mmio_*` audit at
+    // `crates/mdrp2040/src/bus/mod.rs::tests` — confirms that NVIC writes
+    // routed through `WorkerBus::write32(0xE000_E1xx)` land in the
+    // per-worker `nvic[core_id]` and not in the inert PPB. Load-bearing
+    // for §6.4: the existing dual-model parity tests do not exercise NVIC
+    // MMIO writes.
+
+    #[test]
+    fn nvic_iser_through_workerbus_enables_in_per_worker_nvic() {
+        let (_s0, mut b0) = fresh_worker(0);
+        let (_s1, b1) = fresh_worker(1);
+        // Write to NVIC_ISER0 from core 0's WorkerBus — must land in
+        // this worker's nvic[0] only, not in the placeholder nvic[1]
+        // and certainly not in core 1's WorkerBus.
+        b0.write32(0xE000_E100, 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
+        assert_eq!(
+            b0.nvic[0].enabled,
+            1u32 << crate::irq::IRQ_TIMER_IRQ_0,
+            "ISER0 write must land in per-worker nvic[0].enabled"
+        );
+        assert_eq!(
+            b0.nvic[1].enabled, 0,
+            "placeholder nvic[1] must remain untouched on a core-0 worker"
+        );
+        // Read-back through the bus returns the same mask.
+        assert_eq!(
+            b0.read32(0xE000_E100),
+            1u32 << crate::irq::IRQ_TIMER_IRQ_0
+        );
+        // ICER0 read aliases the same enabled mask.
+        assert_eq!(
+            b0.read32(0xE000_E180),
+            1u32 << crate::irq::IRQ_TIMER_IRQ_0
+        );
+        // Negative control against hidden globals: `b1` is built from a
+        // separate `SharedState::new_default()` (see `fresh_worker`) so
+        // these are unrelated emulators, not peer workers in the same
+        // emulator. If `b1.nvic[0].enabled` were nonzero here, NVIC
+        // state would be leaking through some process-wide static.
+        assert_eq!(
+            b1.nvic[0].enabled, 0,
+            "no global NVIC state — independent WorkerBus must read zero"
+        );
+    }
+
+    #[test]
+    fn nvic_ispr_through_workerbus_pends_dispatchable_irq() {
+        let (_s0, mut b0) = fresh_worker(0);
+        // Set IRQ pending via NVIC_ISPR0.
+        b0.write32(0xE000_E200, 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
+        assert!(
+            b0.nvic[0].is_pending(crate::irq::IRQ_TIMER_IRQ_0 as u8),
+            "ISPR0 write must set the per-worker nvic[0].pending bit"
+        );
+        // Read-back returns the pending mask via either ISPR or ICPR
+        // alias.
+        assert_eq!(
+            b0.read32(0xE000_E200),
+            1u32 << crate::irq::IRQ_TIMER_IRQ_0
+        );
+        assert_eq!(
+            b0.read32(0xE000_E280),
+            1u32 << crate::irq::IRQ_TIMER_IRQ_0
+        );
+        // W1C via ICPR0 clears the pending bit.
+        b0.write32(0xE000_E280, 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
+        assert!(
+            !b0.nvic[0].is_pending(crate::irq::IRQ_TIMER_IRQ_0 as u8),
+            "ICPR0 write must clear the pending bit"
+        );
+        assert_eq!(b0.read32(0xE000_E200), 0);
     }
 }
