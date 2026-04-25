@@ -1500,3 +1500,98 @@ reuse the existing serial type inside a thin `Mutex<...>` wrapper).
 
 TIMER is already typed on the threaded path — the TIMELR→TIMEHR read-
 latching side effect cannot be modelled by the HashMap.
+
+## RP2040 SysTick CLKSOURCE simplification (2026-04-25, V5 §9.1)
+
+V1 of the RP2040 IRQ Plumbing oracle (`silicon_isr_diff_rp2040`) ticks
+SysTick once per master cycle for both `SYST_CSR.CLKSOURCE=0` (external
+1-µs watchdog tick on real silicon) and `CLKSOURCE=1` (processor clock).
+The V1 oracle scenarios all program `CLKSOURCE=1`, so the model is
+exact for the cases under test. A future scenario relying on the 1-µs
+external cadence will see CLKSOURCE=0 ticking faster on EMU than on
+silicon by a factor of `sys_hz / 1_000_000` (≈125× at the default
+125 MHz sysclk).
+
+Mitigation: small change to `crates/mdrp2040/src/bus/systick.rs::tick`
+(or its threaded sibling) to consult `CLKSOURCE` and gate the master-
+cycle tick against the 1-µs boundary derived from the WATCHDOG_TICK
+divider. Revisit when the first such scenario surfaces — no firmware in
+the V1 corpus exercises CLKSOURCE=0.
+
+## RP2040 no-preemption rule + asymmetric multi-core SysTick (2026-04-25, V5 §9.2)
+
+Two related simplifications in the V1 RP2040 IRQ plumbing, neither
+exercised by V1 oracle scenarios:
+
+1. **No-preemption rule.** `try_take_any_pending_exception::can_
+   dispatch_now` (in `crates/mdrp2040/src/core/exceptions.rs`) returns
+   `true` iff `!ppb.any_active()` — i.e. it refuses to preempt *any*
+   running handler, regardless of priority. This is stricter than
+   ARMv6-M ARM §B1.5.4, which permits a higher-priority pending
+   exception to preempt a lower-priority active handler. V1 oracle
+   scenarios all dispatch from thread mode (no nested handlers), so
+   the gap is invisible today.
+
+2. **Asymmetric multi-core SysTick.** V1 ticks SysTick on the active
+   core only — i.e. `bus.systick.tick(core_id, ...)` advances the per-
+   core CVR for whichever core is currently executing in
+   `Emulator::step`. Correct when at most one core is unhalted (the V1
+   oracle case) OR when both cores' SysTicks are programmed
+   identically. Asymmetric multi-core SysTick programming (different
+   RVRs, different CLKSOURCEs, or only one core's SysTick enabled)
+   would tick the secondary core's SysTick at half-rate relative to
+   silicon, since the primary core consumes half the wall-clock cycles
+   and only its CVR ticks during that window.
+
+Mitigation: when the first scenario needs preemption or asymmetric
+multi-core SysTick, wire priority-aware preemption into
+`can_dispatch_now` (compare pending exception priority against the
+active-handler-stack top in PPB) and per-core SysTick scheduling (tick
+both cores' CVRs every master cycle, gated by per-core enable).
+
+## RP2040 step_quantum boundary effects with NVIC MMIO (2026-04-25, V5 §9.4)
+
+The V1 oracle integration test (`crates/mdpicoem-harness/tests/
+isr_scenarios_rp2040_emu.rs`) pins `step_quantum=1` to force a clean
+per-cycle dispatch decision. The existing dual_model parity test at
+`crates/mdrp2040/tests/dual_model.rs:444` uses default quantum (64) but
+does not touch NVIC MMIO during its pacing window — its IRQ source is
+the SIO FIFO, which dispatches via the bus tick path rather than via
+software-driven `ISER`/`ISPR` writes. So no exposure today.
+
+A future scenario combining `step_quantum > 1` + threaded execution +
+NVIC MMIO writes (e.g. firmware that pends an IRQ via `ISPR` and
+expects single-cycle latency) may surface a quantum-boundary IRQ-drain
+race: the NVIC write lands mid-quantum, but the dispatch check only
+fires at the quantum boundary, so observable IRQ latency depends on
+where in the quantum the write landed.
+
+Mitigation: add such a scenario when motivated. Likely fix is to make
+the threaded-path NVIC MMIO write trigger a same-tick re-check of
+`try_take_any_pending_exception` rather than waiting for the next
+quantum boundary. Verify behaviour against silicon (`probe_diff_rp2040`
+or a new `silicon_isr_diff_rp2040` scenario) before changing the
+production path.
+
+## RP2040 NVIC ISER/ISPR/ICER/ICPR bits 26..31 latch instead of RAZ/WI (2026-04-25, V5 §9.6)
+
+The current NVIC MMIO write path
+(`crates/mdrp2040/src/bus/mod.rs:1422-1439`) has no mask on `n.enabled
+|= val` / `n.pending |= val`, so a write of `0xFFFF_FFFF` to ISER0 /
+ISPR0 latches all 32 enable / pending bits. Only IPR is gated by the
+`if irq < 32` check at `bus/mod.rs:1448`, which on M0+ is a no-op
+since the NVIC array is 32-wide anyway.
+
+Bits beyond IRQ 25 are unobservable in normal operation: no peripheral
+source asserts them, and no exception vector slot exists for them
+(the RP2040 vector table tops out at IRQ 25 / vector index 41), so
+they cannot dispatch through `try_take_any_pending_exception`. V1
+keeps this behaviour intentionally — masking writes adds cost on the
+hot path for no observable correctness gain in any V1 scenario.
+
+Mitigation: on real RP2040 silicon, bits 26..31 may be RAZ/WI per the
+ARMv6-M ARM (implementation-defined for unimplemented IRQ slots). If
+`probe_diff_rp2040` later proves silicon RAZ/WI's those bits, the fix
+is a one-line `& 0x03FF_FFFF` mask in `nvic_mmio_write32` and the
+threaded sibling. Documented here so a future probe-diff failure can
+be triaged quickly.
