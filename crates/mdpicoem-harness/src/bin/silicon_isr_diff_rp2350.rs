@@ -103,7 +103,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X} mailbox=0x{ISR_MAILBOX_CYCCNT:08X}",
     );
     println!(
-        "NOTE: ICSR dispatch is wired; remaining FAILs surface real divergences (tech_debt.md:314)",
+        "NOTE: ICSR dispatch is wired; remaining FAILs surface real divergences (tech_debt.md § \"Exception entry/exit not differentially validated\")",
     );
     println!();
 

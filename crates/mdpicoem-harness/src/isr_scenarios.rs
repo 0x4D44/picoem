@@ -21,8 +21,8 @@
 // exception. ICSR W1S/W1C write semantics are also implemented
 // (ppb.rs:454-465). Remaining scenario FAILs surface real divergences
 // in stacked-frame layout, FPCCR state, or CYCCNT delta — not a
-// missing dispatch path. See tech_debt.md:314 ("Exception entry/exit
-// not differentially validated") for the broader validation roadmap.
+// missing dispatch path. See `tech_debt.md` § "Exception entry/exit
+// not differentially validated" for the broader validation roadmap.
 
 // ---------------------------------------------------------------------------
 // Absolute MMIO constants (RP2350 M33)
