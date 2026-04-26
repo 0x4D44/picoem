@@ -1356,7 +1356,27 @@ struct Args {
     trace_stretch: f64,
     out: Option<PathBuf>,
     firmware_mode: Option<u32>,
+    step_quantum: u32,
 }
+
+/// Default `step_quantum` used when constructing the emulator.
+///
+/// 4 was selected on 2026-04-26 after a quantum sweep against the
+/// Monkey Island AdLib trace. Per-quantum results (3 trials each,
+/// 2.5 s sim, mode 5):
+///
+/// | quantum |  wall median | speedup vs q=1 | cake-gate              |
+/// |--------:|-------------:|---------------:|------------------------|
+/// |       1 |       93.0 s |       baseline | PASS                   |
+/// |       4 |       80.9 s |        −13.0 % | PASS — top-5 peaks ≡ 1 |
+/// |      16 |       79.6 s |        −14.4 % | PASS but FFT detunes   |
+/// |      64 |       67.0 s |        −28.0 % | FAIL — silent          |
+///
+/// q=4 is spectrally indistinguishable from q=1 (top-5 FFT peaks
+/// match exactly, peak/RMS within 0.1 dB) while the ISA-overshoot
+/// bound (≤4 cycles) stays well below the 37-cycle ISA write window.
+/// `--step-quantum 1` remains available for ISA-edge debugging.
+const DEFAULT_STEP_QUANTUM: u32 = 4;
 
 /// Default location searched for a real RP2040 bootrom when `--flash` is
 /// supplied and `--bootrom` is absent. Provenance in
@@ -1379,6 +1399,7 @@ fn parse_args() -> Result<Args, String> {
     let mut trace_stretch: f64 = 1.0;
     let mut out = None;
     let mut firmware_mode: Option<u32> = None;
+    let mut step_quantum: u32 = DEFAULT_STEP_QUANTUM;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1472,6 +1493,19 @@ fn parse_args() -> Result<Args, String> {
                     parsed.map_err(|e| format!("invalid --firmware-mode '{raw}': {e}"))?,
                 );
             }
+            "--step-quantum" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--step-quantum requires a positive integer".into());
+                }
+                let n: u32 = args[i]
+                    .parse()
+                    .map_err(|e| format!("invalid --step-quantum '{}': {e}", args[i]))?;
+                if n == 0 {
+                    return Err("--step-quantum must be >= 1".into());
+                }
+                step_quantum = n;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -1494,6 +1528,7 @@ fn parse_args() -> Result<Args, String> {
         trace_stretch,
         out,
         firmware_mode,
+        step_quantum,
     })
 }
 
@@ -1558,7 +1593,14 @@ fn print_usage() {
                       Optional. After emu.reset(), write N (u32, dec or 0x..)\n              \
                       to watchdog SCRATCH3 (0x4005_8018) so the PicoGUS multifw\n              \
                       bootloader picks slot N instead of falling through to its\n              \
-                      flash-settings default."
+                      flash-settings default.\n\
+         --step-quantum N\n              \
+                      Optional (default 4). Master-clock cycles per emulator\n              \
+                      step() call. q=4 was validated against the Monkey Island\n              \
+                      AdLib trace (top-5 FFT peaks match q=1 exactly, 13% wall\n              \
+                      reduction). q=1 bounds ISA-waveform overshoot to a single\n              \
+                      cycle for ISA-edge debugging. q=16 starts spectral detune;\n              \
+                      q=64 silences the WAV — verify with the audio cake-gate."
     );
 }
 
@@ -1657,16 +1699,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Construct emulator. Seed the clock tree so ns→cycle math matches
     // what firmware (once booted) will eventually see.
     //
-    // step_quantum(1) — per-cycle precision is required for ISA waveform
-    // timing. With the default quantum (64), each `sink.step(chunk)` can
-    // run up to 63 cycles past the requested target, which can span a
-    // full ISA write cycle (37 cycles asserted). Per-cycle stepping
-    // bounds overshoot to one cycle, ensuring drive_pins() transitions
-    // line up with PIO sampling on the cycle they were issued.
+    // step_quantum: defaults to 4 since the 2026-04-26 quantum sweep
+    // (see DEFAULT_STEP_QUANTUM doc comment). q=4 keeps ISA-overshoot
+    // ≤4 cycles (well below the 37-cycle ISA write window) and is
+    // spectrally identical to q=1 on the Monkey Island AdLib trace.
+    // Pass `--step-quantum 1` to restore single-cycle precision when
+    // debugging ISA-edge alignment; larger values trade audio fidelity
+    // for throughput.
     let mut builder = EmulatorBuilder::new(Config {
         sys_clk_hz: DEFAULT_SYS_CLK_HZ,
     })
-    .step_quantum(1)
+    .step_quantum(args.step_quantum)
     .psram(Psram::picogus());
     if let Some(path) = &args.flash {
         let flash_bytes = load_flash(path)?;

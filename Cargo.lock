@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "mdpicoem-harness"
-version = "0.37.0"
+version = "0.37.1"
 dependencies = [
  "chrono",
  "ctrlc",
