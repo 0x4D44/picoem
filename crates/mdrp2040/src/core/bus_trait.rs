@@ -100,4 +100,27 @@ pub trait CoreBus {
     /// `Bus::active_core` — set by the dual-core scheduler before
     /// dispatching a step.
     fn active_core(&self) -> usize;
+
+    // --- WFE / SEV wake protocol --------------------------------------
+    //
+    // WFE/WFI/SEV wake mechanics. See `wrk_docs/2026.04.26 - HLD - RP2040
+    // WFE-SEV Wake Mechanics V1.md`.
+
+    /// Non-consuming peek at the per-core event flag. Used by `wfe()` to
+    /// decide between consume-and-fall-through and park.
+    fn event_flag(&self, core: usize) -> bool;
+
+    /// Consume the per-core event flag (atomic swap-to-false). Returns
+    /// the prior value: `true` means an event was latched and is now
+    /// cleared.
+    fn consume_event_flag(&mut self, core: usize) -> bool;
+
+    /// Park or un-park a core on WFE. `true` = parked (will not execute
+    /// until woken); `false` = un-park.
+    fn set_wfe_waiting(&mut self, core: usize, val: bool);
+
+    /// SEV broadcast: set both cores' event_flag. The issuing core's
+    /// own flag is set too — its next WFE consumes the latch and falls
+    /// through, matching ARMv6-M ARM B1.5.18.
+    fn signal_sev(&mut self);
 }

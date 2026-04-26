@@ -835,10 +835,35 @@ impl CortexM0Plus {
                 match hint_op {
                     0x0 => 1, // NOP
                     0x1 => 1, // YIELD
-                    0x2 => 1, // WFE — Phase 5 will wire up the SEV/WFE event flag
-                    0x3 => 1, // WFI
-                    0x4 => 1, // SEV
-                    _ => 1,   // Reserved hints: execute as NOP
+                    0x2 => {
+                        // WFE: consume a latched event_flag, else park
+                        // the core via wfe_waiting (CoreBus trait). See
+                        // `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV
+                        // Wake Mechanics V1.md` §4.2.
+                        self.wfe(bus);
+                        1
+                    }
+                    0x3 => {
+                        // WFI: if any pending+enabled IRQ exists for the
+                        // active core, fall through as a NOP. Otherwise
+                        // halt the core; `Emulator::wake_checks` will
+                        // un-halt on the next pending+enabled IRQ.
+                        // PRIMASK is intentionally not consulted for the
+                        // wake decision (ARMv6-M ARM B1.5.18).
+                        let core = self.core_id as usize;
+                        if bus.nvic(core).pending_and_enabled() == 0 {
+                            self.halt();
+                        }
+                        1
+                    }
+                    0x4 => {
+                        // SEV: broadcast event_flag to both cores. The
+                        // issuing core's own next WFE will consume the
+                        // latch and fall through.
+                        bus.signal_sev();
+                        1
+                    }
+                    _ => 1, // Reserved hints: execute as NOP
                 }
             }
             _ => {

@@ -574,3 +574,53 @@ fn nvic_pre_run_enable_write_accepted() {
             .unwrap_or_else(|e| panic!("run failed on {model:?}: {e:?}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// WFE / SEV cross-mode parity (1 test) — HLD §5 test 13
+// ---------------------------------------------------------------------------
+
+/// Test 13 (HLD §5): WFE/SEV handshake parity across Serial and
+/// Threaded. Two tiny inline-blob programs:
+///
+/// Core 0 @ SRAM_BASE         (4 bytes)
+///     SEV       ; 0xBF40 — broadcast event_flag to both cores
+///     B   .-2   ; 0xE7FD — branch back to SEV (tight loop)
+///
+/// Core 1 @ SRAM_BASE+0x40    (4 bytes)
+///     WFE       ; 0xBF20 — consume event_flag or park
+///     B   .-2   ; 0xE7FD — branch back to WFE (re-park each iter)
+///
+/// Without the WFE/SEV wake mechanics wired (the V0 baseline), both
+/// cores would burn synthetic cycles at full rate. With WFE/SEV
+/// wired, core 1 parks on each WFE and is woken by core 0's SEV
+/// latching the event_flag — both cores still advance, but the
+/// shape-of-advance must match across models. Per HLD V1 §7.1 we
+/// only assert the (c0>0, c1>0) tuple, not the exact cycle counts.
+///
+/// Inline blob preferred per supervisor (HLD §8 Q4).
+#[test]
+fn wfe_sev_handshake_parity() {
+    both_models_compare(
+        RUN_CYCLES,
+        |emu| {
+            // Core 0: SEV ; B .-2 (loops forever broadcasting SEV).
+            // Two halfwords packed little-endian into a single word
+            // poke: low half = SEV (0xBF40), high half = B .-2 (0xE7FD).
+            emu.core_mut(0).regs.msp = STACK_TOP;
+            emu.core_mut(0).regs.r[13] = STACK_TOP;
+            emu.poke(SRAM_BASE, 0xE7FD_BF40);
+            emu.core_mut(0).regs.set_pc(SRAM_BASE);
+            emu.core_mut(0).regs.xpsr = 1 << 24;
+
+            // Core 1: WFE ; B .-2 (loops forever, parks on each WFE
+            // until a SEV from core 0 latches event_flag[1]).
+            emu.core_mut(1).regs.msp = STACK_TOP_CORE1;
+            emu.core_mut(1).regs.r[13] = STACK_TOP_CORE1;
+            emu.poke(SRAM_BASE + 0x40, 0xE7FD_BF20);
+            emu.core_mut(1).regs.set_pc(SRAM_BASE + 0x40);
+            emu.core_mut(1).regs.xpsr = 1 << 24;
+            emu.core_mut(1).wake();
+        },
+        |_emu, c0, c1| (c0 > 0, c1 > 0),
+    );
+}

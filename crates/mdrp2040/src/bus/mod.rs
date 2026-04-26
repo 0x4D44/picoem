@@ -333,6 +333,12 @@ pub struct Bus {
     pub external_gpio_in_mask: u32,
     /// Per-core event flag for WFE/SEV / FIFO event protocol.
     pub event_flag: [bool; 2],
+    /// Per-core WFE-park flag. `true` means the core is sleeping on
+    /// WFE and will not execute until [`Self::event_flag`] for that
+    /// core is consumed at a quantum boundary by
+    /// `Emulator::wake_checks`. See `wrk_docs/2026.04.26 - HLD - RP2040
+    /// WFE-SEV Wake Mechanics V1.md` §4.1.
+    pub wfe_waiting: [bool; 2],
     /// Which core is currently executing on the bus.
     active_core: usize,
     /// Cycle cost of the most recent bus access.
@@ -411,6 +417,7 @@ impl Bus {
             external_gpio_in_override: 0,
             external_gpio_in_mask: 0,
             event_flag: [false; 2],
+            wfe_waiting: [false; 2],
             active_core: 0,
             last_access_cycles: 0,
             bus_fault: false,
@@ -1894,6 +1901,30 @@ impl CoreBus for Bus {
     #[inline(always)]
     fn active_core(&self) -> usize {
         Bus::active_core(self)
+    }
+
+    // --- WFE / SEV wake protocol --------------------------------------
+
+    #[inline(always)]
+    fn event_flag(&self, core: usize) -> bool {
+        self.event_flag[core]
+    }
+
+    #[inline(always)]
+    fn consume_event_flag(&mut self, core: usize) -> bool {
+        let prior = self.event_flag[core];
+        self.event_flag[core] = false;
+        prior
+    }
+
+    #[inline(always)]
+    fn set_wfe_waiting(&mut self, core: usize, val: bool) {
+        self.wfe_waiting[core] = val;
+    }
+
+    #[inline(always)]
+    fn signal_sev(&mut self) {
+        Bus::signal_sev(self)
     }
 }
 

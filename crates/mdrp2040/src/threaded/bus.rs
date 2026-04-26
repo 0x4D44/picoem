@@ -1167,6 +1167,33 @@ impl CoreBus for WorkerBus {
     fn active_core(&self) -> usize {
         self.core_id
     }
+
+    // --- WFE / SEV wake protocol --------------------------------------
+    //
+    // Backed by `CoreAtomics` so cross-thread visibility holds. Pairs
+    // with the worker body's quantum-top WFE wake check at
+    // `threaded/emulator.rs:592-597`. See `wrk_docs/2026.04.26 - HLD -
+    // RP2040 WFE-SEV Wake Mechanics V1.md` §4.5.
+
+    fn event_flag(&self, core: usize) -> bool {
+        self.shared.atomics.event_flag_load(core)
+    }
+
+    fn consume_event_flag(&mut self, core: usize) -> bool {
+        self.shared.atomics.event_flag_consume(core)
+    }
+
+    fn set_wfe_waiting(&mut self, core: usize, val: bool) {
+        if val {
+            self.shared.atomics.set_wfe_waiting(core);
+        } else {
+            self.shared.atomics.clear_wfe_waiting(core);
+        }
+    }
+
+    fn signal_sev(&mut self) {
+        self.shared.atomics.sev_both();
+    }
 }
 
 #[cfg(test)]

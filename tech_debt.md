@@ -1656,3 +1656,54 @@ ignored one.
 Re-enable as soon as the W1C peripheral path lands. Until then, the
 narrow-write paths into IO_BANK0 INTR are tested only by the bus-side
 mask, which is not equivalent to silicon W1C.
+
+## Master clock does not advance when both cores are WFE/WFI-blocked (RP2040 + RP2350) (2026-04-26)
+
+`crates/mdrp2040/src/lib.rs:595-625` (post-WFE/SEV wiring) and
+`crates/mdrp2350/src/lib.rs:1339-1342` both use the same step-loop
+shape: each core that is `is_halted() || is_wfe_waiting()` contributes
+zero cycles to the quantum. When both cores are blocked the loop body
+hits `if c0 == 0 && c1 == 0 { break; }` and the master clock does not
+advance.
+
+**The gap.** On real silicon, with both cores in WFI, a TIMER alarm
+can still fire and assert IRQ on the NVIC; the wake propagates via
+`wake_checks` → `pending_and_enabled() != 0` → `cores[c].wake()`,
+unblocking the WFI'd core for the next quantum. In the emulator that
+chain is intact for the *wake* — `wake_checks` runs at the quantum
+tail unconditionally — but the *trigger* is missing: lazy peripherals
+(TIMER alarms) advance through `Bus::advance_lazy_scheduled(consumed)`
+where `consumed` is the per-quantum delta. Both-cores-blocked → zero
+delta → no alarm tick → no IRQ assert → no wake.
+
+**Same shape on mdrp2350.** The `step_pair_arm` skip predicate at
+`crates/mdrp2350/src/lib.rs:1339-1342` exhibits the same behaviour:
+`while !cs[core_id].is_halted() && !cs[core_id].is_wfe_waiting() && cs[core_id].cycles < target`
+guarantees the cycle counter doesn't advance, and the higher-level
+clock counter follows the cores. SysTick on M33 runs off the same
+master cycle — same shape, same gap.
+
+**Risk classification.** Theoretical. No current corpus scenario
+exercises a "both cores enter WFI together, expect TIMER alarm to
+wake one" pattern. The Pico SDK's `multicore_launch_core1` waits
+core 1 with WFE on a SIO event (covered by the FIFO-rx event wake
+path). The closest real-firmware shape would be a power-management
+RTOS that idles both cores into WFI between time-slices and relies
+on a TIMER tick to schedule next — but that pattern isn't in the
+PicoGUS / MonkeyIsland / blinky / multicore-bench workloads we run
+today.
+
+**Resolution path when the scenario lands.** Two options:
+1. Detect "both blocked + clock would otherwise stall" in the step
+   loop, advance the clock by the lesser of `step_quantum` or "time
+   to the next scheduled lazy event" (TIMER alarm match), then call
+   `advance_lazy_scheduled` once to fire any IRQs in that window,
+   then re-run `wake_checks` to unblock cores. Symmetric on both
+   chips.
+2. Accept the gap and document it as "WFI-blocked cores resume only
+   on cross-core IRQ, not on internal-peripheral IRQ" — viable if
+   a future user-space contract treats this as a feature rather
+   than a bug.
+
+Linked HLD: `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV Wake
+Mechanics V1.md` §8 Q3 (deferred per supervisor adjudication).

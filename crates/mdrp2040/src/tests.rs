@@ -8040,3 +8040,285 @@ mod stage8_residue_coverage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WFE / SEV / WFI wake mechanics
+// ---------------------------------------------------------------------------
+//
+// See `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV Wake Mechanics V1.md`
+// §5 for the full test plan; these are tests 1-12 from that section.
+// Test 13 lives in `crates/mdrp2040/tests/dual_model.rs` and test 14 in
+// `crates/mdrp2040/src/threaded/emulator.rs`'s `tests` module.
+
+#[cfg(test)]
+mod wfe_sev_tests {
+    use crate::bus::Bus;
+    use crate::core::CortexM0Plus;
+    use crate::{Config, EmulatorBuilder};
+
+    // Thumb-16 hint encodings (ARMv6-M ARM A6.7.2).
+    const WFE: u16 = 0xBF20;
+    const WFI: u16 = 0xBF30;
+    const SEV: u16 = 0xBF40;
+
+    /// Test 1: WFE with no latched event parks the core.
+    #[test]
+    fn wfe_no_event_parks_core() {
+        let mut bus = Bus::new();
+        let mut core = CortexM0Plus::with_id(0);
+        assert!(!bus.event_flag[0]);
+        assert!(!bus.wfe_waiting[0]);
+        let cycles = core.execute_one_with_bus(WFE, &mut bus);
+        assert_eq!(cycles, 1);
+        assert!(bus.wfe_waiting[0], "WFE with no event must park core 0");
+        assert!(!bus.event_flag[0], "event_flag[0] must remain unset");
+    }
+
+    /// Test 2: WFE with a latched event consumes it and falls through.
+    #[test]
+    fn wfe_with_latched_event_falls_through() {
+        let mut bus = Bus::new();
+        let mut core = CortexM0Plus::with_id(0);
+        bus.event_flag[0] = true;
+        let cycles = core.execute_one_with_bus(WFE, &mut bus);
+        assert_eq!(cycles, 1);
+        assert!(!bus.wfe_waiting[0], "consumed event must not park core");
+        assert!(!bus.event_flag[0], "event_flag must be consumed");
+    }
+
+    /// Test 3: SEV-then-WFE on the same core latches the event and
+    /// the next WFE consumes the latch instead of parking. Both flags
+    /// are set by SEV; WFE on core 0 only consumes the local one.
+    #[test]
+    fn sev_then_wfe_on_same_core_no_sleep() {
+        let mut bus = Bus::new();
+        let mut core = CortexM0Plus::with_id(0);
+        // SEV — broadcasts to both event flags.
+        let c1 = core.execute_one_with_bus(SEV, &mut bus);
+        assert_eq!(c1, 1);
+        assert!(bus.event_flag[0] && bus.event_flag[1]);
+        // WFE — consumes core 0's flag and falls through.
+        let c2 = core.execute_one_with_bus(WFE, &mut bus);
+        assert_eq!(c2, 1);
+        assert!(!bus.wfe_waiting[0]);
+        assert!(!bus.event_flag[0]);
+        // Core 1's flag is untouched (still latched, awaiting that
+        // core's own WFE).
+        assert!(bus.event_flag[1]);
+    }
+
+    /// Test 4: SEV from core 1 wakes a parked core 0 at the next
+    /// quantum-end wake_checks. Drives the full Emulator step path.
+    #[test]
+    fn sev_from_core1_wakes_core0_from_wfe() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+        // Manually park core 0 on WFE; halt core 1 so it doesn't run.
+        emu.bus.wfe_waiting[0] = true;
+        emu.cores[1].halt();
+        // Simulate a SEV from elsewhere (core 1 / harness).
+        emu.bus.signal_sev();
+        // One quantum: step_serial sees both cores ineligible (core 0
+        // wfe_waiting, core 1 halted), then wake_checks lifts the WFE
+        // park on the latched event.
+        let _ = emu.step().expect("Serial step is infallible");
+        assert!(!emu.bus.wfe_waiting[0], "WFE wake must un-park core 0");
+        assert!(!emu.bus.event_flag[0], "consumed event flag");
+    }
+
+    /// Test 5: WFI with no pending IRQ halts the core.
+    #[test]
+    fn wfi_with_no_pending_irq_halts() {
+        let mut bus = Bus::new();
+        let mut core = CortexM0Plus::with_id(0);
+        let cycles = core.execute_one_with_bus(WFI, &mut bus);
+        assert_eq!(cycles, 1);
+        assert!(core.is_halted(), "WFI with no IRQ must halt core");
+    }
+
+    /// Test 6: WFI with a pending+enabled IRQ falls through as a NOP.
+    #[test]
+    fn wfi_with_pending_enabled_irq_falls_through() {
+        let mut bus = Bus::new();
+        let mut core = CortexM0Plus::with_id(0);
+        bus.nvics[0].set_enabled(5);
+        bus.nvics[0].set_pending(5);
+        let cycles = core.execute_one_with_bus(WFI, &mut bus);
+        assert_eq!(cycles, 1);
+        assert!(!core.is_halted(), "pending+enabled IRQ must keep core running");
+    }
+
+    /// Test 7: A core halted by WFI wakes when an IRQ is later
+    /// asserted. Drives the full Emulator step path so wake_checks
+    /// runs.
+    #[test]
+    fn wfi_wakes_on_subsequent_irq_assert() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+        // Halt core 1 so only core 0 matters.
+        emu.cores[1].halt();
+        // Place a WFI at SRAM_BASE and run one step to halt core 0.
+        let prog = 0x2000_0000u32;
+        emu.bus.write16(prog, WFI);
+        emu.cores[0].regs.set_pc(prog);
+        let _ = emu.step().expect("Serial step is infallible");
+        assert!(emu.cores[0].is_halted(), "WFI must halt core 0");
+        // Assert and enable an IRQ on core 0.
+        emu.bus.nvics[0].set_enabled(7);
+        emu.bus.nvics[0].set_pending(7);
+        // Step: the loop body skips halted core, wake_checks at the
+        // tail un-halts.
+        let _ = emu.step().expect("Serial step is infallible");
+        assert!(!emu.cores[0].is_halted(), "WFI wake on IRQ assert");
+    }
+
+    /// Test 8: WFI ignores PRIMASK for the wake decision (ARMv6-M ARM
+    /// B1.5.18). With PRIMASK=1 the core still un-halts when a
+    /// pending+enabled IRQ arrives, but exception entry is gated until
+    /// PRIMASK clears.
+    #[test]
+    fn wfi_ignores_primask_for_wake_decision() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+        emu.cores[1].halt();
+        // PRIMASK=1 — masks all configurable-priority exceptions.
+        emu.cores[0].regs.primask = 1;
+        let prog = 0x2000_0000u32;
+        emu.bus.write16(prog, WFI);
+        emu.cores[0].regs.set_pc(prog);
+        let _ = emu.step().expect("Serial step is infallible");
+        assert!(emu.cores[0].is_halted());
+        // Assert IRQ; PRIMASK should not block the wake.
+        emu.bus.nvics[0].set_enabled(3);
+        emu.bus.nvics[0].set_pending(3);
+        let _ = emu.step().expect("Serial step is infallible");
+        assert!(!emu.cores[0].is_halted(), "PRIMASK must not block WFI wake");
+        // But the IRQ has not been dispatched (try_take_any_pending_exception
+        // returns 0 under PRIMASK=1) — IPSR must still be 0 (thread mode).
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            0,
+            "PRIMASK must defer exception entry"
+        );
+    }
+
+    /// Test 9: A FIFO write from core 0 wakes core 1 from WFE. The
+    /// SIO write32 path drains `Sio::pending_fifo_event` into
+    /// `event_flag[1]`; wake_checks lifts core 1's park.
+    #[test]
+    fn fifo_write_from_core0_wakes_core1_from_wfe() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+        // Wake core 1 via the sanctioned wrapper so the multicore-
+        // launch FSM disarms; FIFO_WR from core 0 will then route to
+        // the unarmed-path FIFO push instead of the handshake FSM.
+        emu.wake_core1();
+        // Park core 1 on WFE; halt core 0 so only the harness drives.
+        emu.bus.wfe_waiting[1] = true;
+        emu.cores[0].halt();
+        // Harness pushes onto FIFO from core 0's perspective via MMIO.
+        // FIFO_WR = 0xD000_0054. Writing as core 0 routes the event
+        // to receiver = core 1.
+        emu.bus.set_active_core(0);
+        emu.bus.write32(0xD000_0054, 0xCAFE_BABE);
+        // event_flag[1] must be set immediately after the SIO write.
+        assert!(
+            emu.bus.event_flag[1],
+            "FIFO push must set receiver event_flag"
+        );
+        // One quantum tail wakes core 1.
+        let _ = emu.step().expect("Serial step is infallible");
+        assert!(!emu.bus.wfe_waiting[1], "WFE wake from FIFO event");
+        assert!(!emu.bus.event_flag[1], "event consumed by wake");
+    }
+
+    /// Test 10: The step loop skips a WFE-blocked core. Core 0 is
+    /// parked; core 1 runs a NOP loop. Core 0 must charge zero cycles
+    /// while core 1 advances.
+    #[test]
+    fn emulator_step_skips_wfe_blocked_core() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(8)
+            .build()
+            .expect("Serial build is infallible");
+        // Park core 0; awaken & program core 1 with a NOP-loop:
+        // NOP (0xBF00) ; B .-2 (0xE7FD)
+        let prog = 0x2000_1000u32;
+        emu.bus.write16(prog, 0xBF00);
+        emu.bus.write16(prog + 2, 0xE7FD);
+        emu.cores[1].regs.set_pc(prog);
+        emu.cores[1].regs.msp = 0x2003_8000;
+        emu.cores[1].regs.r[13] = 0x2003_8000;
+        emu.cores[1].wake();
+        emu.bus.wfe_waiting[0] = true;
+        let c0_before = emu.cores[0].cycles;
+        let c1_before = emu.cores[1].cycles;
+        let _ = emu.step().expect("Serial step is infallible");
+        assert_eq!(
+            emu.cores[0].cycles, c0_before,
+            "wfe_waiting core must not advance"
+        );
+        assert!(
+            emu.cores[1].cycles > c1_before,
+            "non-blocked core must advance"
+        );
+    }
+
+    /// Test 11 (regression): wake_checks must not clear a latched
+    /// event_flag when no waiter is parked. Directly verifies the
+    /// removal of the unconditional `event_flag[0] = false` clear at
+    /// the previous `lib.rs:995`. The SEV-before-WFE idiom relies on
+    /// the latch surviving until consumed.
+    #[test]
+    fn wake_checks_does_not_clear_unobserved_event_flag() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+        emu.cores[0].halt();
+        // core 1 already halted by builder.
+        emu.bus.signal_sev();
+        assert!(emu.bus.event_flag[0] && emu.bus.event_flag[1]);
+        let _ = emu.step().expect("Serial step is infallible");
+        // Both flags survive — no waiter was parked, so the latch
+        // must not be cleared.
+        assert!(
+            emu.bus.event_flag[0],
+            "regression: event_flag[0] must survive wake_checks without a waiter",
+        );
+        assert!(
+            emu.bus.event_flag[1],
+            "regression: event_flag[1] must survive wake_checks without a waiter",
+        );
+    }
+
+    /// Test 12: With both cores WFE-blocked, one step quantum
+    /// terminates cleanly without panic or infinite loop. Both cores
+    /// charge zero cycles.
+    #[test]
+    fn both_cores_wfe_blocked_quantum_breaks_cleanly() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(8)
+            .build()
+            .expect("Serial build is infallible");
+        // Wake core 1 (so the eligibility predicate doesn't short-
+        // circuit on `is_halted`), then park both on WFE.
+        emu.cores[1].wake();
+        emu.bus.wfe_waiting[0] = true;
+        emu.bus.wfe_waiting[1] = true;
+        let c0_before = emu.cores[0].cycles;
+        let c1_before = emu.cores[1].cycles;
+        let consumed = emu.step().expect("Serial step is infallible");
+        assert_eq!(consumed, 0, "both blocked → no cycles consumed");
+        assert_eq!(emu.cores[0].cycles, c0_before);
+        assert_eq!(emu.cores[1].cycles, c1_before);
+    }
+}
+

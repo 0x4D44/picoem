@@ -113,6 +113,22 @@ impl CortexM0Plus {
         self.halted = false;
     }
 
+    /// Execute a WFE hint. If the per-core event flag is latched,
+    /// consume it (atomic swap-to-false) and fall through; otherwise
+    /// park the core by setting `wfe_waiting`. Mirrors the mdrp2350
+    /// `CortexM33::wfe` helper but routes through the [`CoreBus`]
+    /// trait because `CortexM0Plus` does not own an `Arc<CoreAtomics>`.
+    /// See `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV Wake Mechanics
+    /// V1.md` §4.2.
+    pub(crate) fn wfe<B: CoreBus>(&mut self, bus: &mut B) {
+        let core = self.core_id as usize;
+        if bus.consume_event_flag(core) {
+            // Latched event consumed; do not park.
+        } else {
+            bus.set_wfe_waiting(core, true);
+        }
+    }
+
     /// Reset thread-mode architectural state before a multicore-launch
     /// wake. Mirrors `Emulator::reset`'s per-core init (`lib.rs:83-96`),
     /// but scoped to the fields that could leak across a halt/launch

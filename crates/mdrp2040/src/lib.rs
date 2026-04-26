@@ -409,6 +409,7 @@ impl Emulator {
         self.bus.clear_bus_fault();
         self.bus.ppb = [Default::default(), Default::default()];
         self.bus.event_flag = [false; 2];
+        self.bus.wfe_waiting = [false; 2];
         self.bus.gpio_in = 0;
         self.bus.external_gpio_in_override = 0;
         self.bus.external_gpio_in_mask = 0;
@@ -595,7 +596,7 @@ impl Emulator {
         while self.clock.cycles < target
             && (!self.cores[0].is_halted() || !self.cores[1].is_halted())
         {
-            let c0 = if !self.cores[0].is_halted() {
+            let c0 = if !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] {
                 self.bus.set_active_core(0);
                 let c = self.cores[0].step(&mut self.bus) as u64;
                 self.maybe_wake_core1(0);
@@ -604,7 +605,7 @@ impl Emulator {
                 0
             };
 
-            let c1 = if !self.cores[1].is_halted() {
+            let c1 = if !self.cores[1].is_halted() && !self.bus.wfe_waiting[1] {
                 self.bus.set_active_core(1);
                 self.bus.begin_core1_step();
                 let c = self.cores[1].step(&mut self.bus) as u64;
@@ -985,16 +986,43 @@ impl Emulator {
         self.bus.gpio_in = out;
     }
 
-    /// WFE/SEV wake check. Phase 5.A doesn't yet model WFE on M0+;
-    /// this is kept as a stub so the quantum-end plumbing lands where
-    /// Phase 6 (QEMU-diff validation) can hook in. For now, halted
-    /// core 1 is woken by `maybe_wake_core1` consuming the SDK
-    /// handshake launch token (HLD 2026.04.16).
+    /// WFE/SEV / WFI quantum-end wake check. See `wrk_docs/2026.04.26
+    /// - HLD - RP2040 WFE-SEV Wake Mechanics V1.md` §4.4.
+    ///
+    /// Per-core:
+    /// - **WFE wake** — if the core is parked on `wfe_waiting` and an
+    ///   `event_flag` is latched, consume the latch and un-park. The
+    ///   latch is intentionally preserved (one-shot wake) when no
+    ///   waiter is parked: the SEV-before-WFE idiom requires the latch
+    ///   to survive until the next WFE consumes it.
+    /// - **WFI wake** — if the core is halted and an enabled+pending
+    ///   IRQ exists on its NVIC, un-halt. The pending bit is consumed
+    ///   on the next `step()` via `try_take_any_pending_exception`. The
+    ///   `halted` flag is shared with BKPT/debug halt by design (matches
+    ///   mdrp2350 precedent).
+    ///
+    /// Crucially: this function no longer unconditionally clears
+    /// `event_flag[0]`. A latched event with no waiter survives until
+    /// the next WFE on that core consumes it. The launch consumer's
+    /// explicit `event_flag[1] = false` reset (`maybe_wake_core1`) is
+    /// preserved verbatim — that's an intentional clean-launch reset,
+    /// not part of the WFE/SEV protocol.
     fn wake_checks(&mut self) {
-        // Consume any unhandled event flags so they don't latch forever.
-        self.bus.event_flag[0] = false;
-        // event_flag[1] is consumed by the launch consumer below; no
-        // latch-clear required here.
+        for core in 0..2 {
+            // WFE wake: parked core + latched event = consume + un-park.
+            if self.bus.wfe_waiting[core] && self.bus.event_flag[core] {
+                self.bus.event_flag[core] = false;
+                self.bus.wfe_waiting[core] = false;
+            }
+            // WFI wake: halted core + pending+enabled IRQ = un-halt.
+            // Reuses `halted` so this also wakes a BKPT-halted core if
+            // an IRQ asserts; matches the mdrp2350 design wart.
+            if self.cores[core].is_halted()
+                && self.bus.nvics[core].pending_and_enabled() != 0
+            {
+                self.cores[core].wake();
+            }
+        }
     }
 
     /// Halt core 1 and synchronously re-arm the multicore-launch FSM.

@@ -180,6 +180,13 @@ impl ThreadedEmulator {
             if bus.event_flag[c] {
                 atomics.set_event_flag(c);
             }
+            // WFE-park state survives promotion — see
+            // `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV Wake Mechanics
+            // V1.md` §4.5. Without this, a core that parked in Serial
+            // mode would silently un-park on promotion.
+            if bus.wfe_waiting[c] {
+                atomics.set_wfe_waiting(c);
+            }
         }
         // Halted state follows the cores themselves after `take`; mirror
         // their `halted` flags now so the atomic view matches the core's
@@ -870,6 +877,33 @@ mod tests {
             }
             other => panic!("expected Err(RunError::Panic{{Core0,...}}), got {other:?}"),
         }
+    }
+
+    /// Test 14 (HLD §5): the serial → threaded handoff must lift
+    /// `Bus::wfe_waiting[c]` into `CoreAtomics::wfe_waiting[c]`.
+    /// Without this, a core parked on WFE in Serial mode would
+    /// silently un-park on promotion. See
+    /// `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV Wake Mechanics
+    /// V1.md` §4.5.
+    #[test]
+    fn from_emulator_preserves_wfe_waiting() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        emu.bus.wfe_waiting[1] = true;
+        // Halt both cores so `from_emulator` can take ownership cleanly.
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        assert!(
+            threaded.shared.atomics.is_wfe_waiting(1),
+            "wfe_waiting[1] must be lifted into CoreAtomics on promotion"
+        );
+        assert!(
+            !threaded.shared.atomics.is_wfe_waiting(0),
+            "wfe_waiting[0] must remain false (Serial bus had it false)"
+        );
     }
 
     /// Proof that the serial → threaded handoff carries
