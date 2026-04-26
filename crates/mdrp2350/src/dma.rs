@@ -39,7 +39,7 @@
 
 use crate::bus::Bus;
 use crate::dreq::{DREQ_FORCE, DREQ_TIMER0, DREQ_TIMER3};
-use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1};
+use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1, IRQ_DMA_IRQ_2, IRQ_DMA_IRQ_3};
 
 /// Total number of DMA channels on RP2350 (datasheet §12.6.1).
 pub const NUM_CHANNELS: usize = 16;
@@ -269,10 +269,9 @@ pub struct Dma {
     inte1: u32,
     intf0: u32,
     intf1: u32,
-    /// INTE2/INTF2/INTE3/INTF3: storage-only per Residual C.2.1.  Reads
-    /// of INTS2/INTS3 return `(intr | intfN) & inteN` so firmware's
-    /// read-modify-write sequences round-trip correctly.  **Not** routed
-    /// to NVIC IRQ_DMA_IRQ_2 / IRQ_DMA_IRQ_3 — tracked in `tech_debt.md`.
+    /// INTE2/INTF2/INTE3/INTF3: added by Residual C.2.1.  Reads of
+    /// INTS2/INTS3 return `(intr | intfN) & inteN` so firmware's
+    /// read-modify-write sequences round-trip correctly.
     inte2: u32,
     inte3: u32,
     intf2: u32,
@@ -377,10 +376,9 @@ impl Dma {
             REG_INTF1 => self.intf1,
             REG_INTS0 => (self.intr | self.intf0) & self.inte0,
             REG_INTS1 => (self.intr | self.intf1) & self.inte1,
-            // IRQ2/IRQ3: storage-only (Residual C.2.1).  Read-side
-            // produces the same pattern as IRQ0/IRQ1 so firmware
-            // read-modify-write sequences round-trip, but route_irqs
-            // does not fan these out to NVIC (tracked in tech_debt.md).
+            // IRQ2/IRQ3 (Residual C.2.1).  Read-side produces the
+            // same pattern as IRQ0/IRQ1 so firmware read-modify-write
+            // sequences round-trip.
             REG_INTE2 => self.inte2,
             REG_INTE3 => self.inte3,
             REG_INTF2 => self.intf2,
@@ -733,6 +731,12 @@ impl Dma {
         }
         if (self.intr | self.intf1) & self.inte1 != 0 {
             atomics.assert_irq_shared(IRQ_DMA_IRQ_1);
+        }
+        if (self.intr | self.intf2) & self.inte2 != 0 {
+            atomics.assert_irq_shared(IRQ_DMA_IRQ_2);
+        }
+        if (self.intr | self.intf3) & self.inte3 != 0 {
+            atomics.assert_irq_shared(IRQ_DMA_IRQ_3);
         }
     }
 }
@@ -1248,6 +1252,110 @@ mod tests {
             bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_1),
             0,
             "DMA_IRQ_1 must be pending"
+        );
+    }
+
+    #[test]
+    fn irq_routing_dma_irq2() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0200;
+        bus.write32(src, 0xCAFE_0002, 0);
+
+        // Enable INTE2 bit 0
+        bus.write32(DMA_BASE + REG_INTE2, 0x0001, 0);
+
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        bus.tick_dma();
+
+        let ints2 = bus.read32(DMA_BASE + REG_INTS2, 0);
+        assert_ne!(ints2, 0, "INTS2 must be set");
+        assert_ne!(
+            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_2),
+            0,
+            "DMA_IRQ_2 must be pending"
+        );
+    }
+
+    #[test]
+    fn irq_routing_dma_irq3() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0200;
+        bus.write32(src, 0xCAFE_0003, 0);
+
+        // Enable INTE3 bit 0
+        bus.write32(DMA_BASE + REG_INTE3, 0x0001, 0);
+
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        bus.tick_dma();
+
+        let ints3 = bus.read32(DMA_BASE + REG_INTS3, 0);
+        assert_ne!(ints3, 0, "INTS3 must be set");
+        assert_ne!(
+            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_3),
+            0,
+            "DMA_IRQ_3 must be pending"
+        );
+    }
+
+    #[test]
+    fn irq_routing_dma_all_four_lines() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0200;
+        bus.write32(src, 0xDEAD_BEEF, 0);
+
+        // Enable bit 0 in all four INTE registers simultaneously
+        bus.write32(DMA_BASE + REG_INTE0, 0x0001, 0);
+        bus.write32(DMA_BASE + REG_INTE1, 0x0001, 0);
+        bus.write32(DMA_BASE + REG_INTE2, 0x0001, 0);
+        bus.write32(DMA_BASE + REG_INTE3, 0x0001, 0);
+
+        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        bus.tick_dma();
+
+        let pending = bus.atomics.irq_pending_load(0);
+        assert_ne!(
+            pending & (1u64 << IRQ_DMA_IRQ_0),
+            0,
+            "DMA_IRQ_0 must be pending"
+        );
+        assert_ne!(
+            pending & (1u64 << IRQ_DMA_IRQ_1),
+            0,
+            "DMA_IRQ_1 must be pending"
+        );
+        assert_ne!(
+            pending & (1u64 << IRQ_DMA_IRQ_2),
+            0,
+            "DMA_IRQ_2 must be pending"
+        );
+        assert_ne!(
+            pending & (1u64 << IRQ_DMA_IRQ_3),
+            0,
+            "DMA_IRQ_3 must be pending"
         );
     }
 
