@@ -29,6 +29,9 @@ bench-*.json
 bench-*.json.gz
 bench-*.json.syms.json
 
+# cargo-mutants run output (per-mutant logs, missed.txt, caught.txt, etc.).
+mutants.out/
+
 # fuzz-runs/deadline is the runtime epoch handshake between Arthur and
 # the overnight drivers — local-only operator state, not source.
 fuzz-runs/deadline
