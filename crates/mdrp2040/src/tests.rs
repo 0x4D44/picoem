@@ -8040,3 +8040,233 @@ mod stage8_residue_coverage {
     }
 }
 
+// ===========================================================================
+// Decode-cache (per-core PC-keyed direct-mapped cache).
+// Modelled on the mdrp2350 cache (commit `0c31479`); see HLD
+// `2026.04.14 - HLD - Decoded-Op Cache.md` for design rationale.
+// ===========================================================================
+
+mod decode_cache {
+    use crate::bus::{Bus, DECODE_CACHE_SIZE, DecodedOp, invalidation_regions};
+    use crate::core::CortexM0Plus;
+
+    /// Helper — populate SRAM with a tight 2-instruction loop and step
+    /// the core enough times that the cache must be hit on the second
+    /// pass. Returns the (cpu, bus) pair for further assertion.
+    fn run_hot_loop(iterations: u32) -> (CortexM0Plus, Bus) {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        // ADDS r0, r0, #1 at 0x2000_0000 (encoding 0x3001)
+        bus.write16(0x2000_0000, 0x3001);
+        // B .-2 at 0x2000_0002 (target = 0x2000_0000)
+        // hw0 = 0xE7FD = unconditional B with imm11=-2 (offset = 4 + (-2*2))
+        bus.write16(0x2000_0002, 0xE7FD);
+        cpu.regs.set_pc(0x2000_0000);
+        for _ in 0..iterations {
+            cpu.decode_execute(&mut bus);
+        }
+        (cpu, bus)
+    }
+
+    #[test]
+    fn populates_then_hits_on_second_pass() {
+        let (cpu, _bus) = run_hot_loop(4);
+        // Both PCs should be cached now.
+        let slot0 = ((0x2000_0000u32 >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        let slot1 = ((0x2000_0002u32 >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(cpu.decode_cache[slot0].tag, 0x2000_0000);
+        assert_eq!(cpu.decode_cache[slot0].hw0, 0x3001);
+        assert!(!cpu.decode_cache[slot0].is_wide());
+        assert_eq!(cpu.decode_cache[slot1].tag, 0x2000_0002);
+        assert_eq!(cpu.decode_cache[slot1].hw0, 0xE7FD);
+    }
+
+    #[test]
+    fn empty_slot_does_not_match() {
+        let cpu = CortexM0Plus::new();
+        // Every slot starts empty.
+        for slot in cpu.decode_cache.iter() {
+            assert_eq!(slot.tag, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn tag_collision_is_a_miss() {
+        // Two PCs that hash to the same slot — `slot = (pc >> 1) & (N-1)`.
+        // A colliding PC is `pc + (N << 1)` bytes away.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        let pc_a = 0x2000_0000u32;
+        let pc_b = pc_a + ((DECODE_CACHE_SIZE as u32) << 1);
+        bus.write16(pc_a, 0x3001); // ADDS r0, r0, #1
+        bus.write16(pc_b, 0x3002); // ADDS r0, r0, #2
+        // Populate slot at PC_A.
+        cpu.regs.set_pc(pc_a);
+        cpu.decode_execute(&mut bus);
+        let slot = ((pc_a >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(cpu.decode_cache[slot].tag, pc_a);
+        // Step at PC_B — same slot, different tag. Slow-path repopulate
+        // overwrites; no false hit.
+        cpu.regs.set_pc(pc_b);
+        cpu.decode_execute(&mut bus);
+        assert_eq!(cpu.decode_cache[slot].tag, pc_b);
+        assert_eq!(cpu.decode_cache[slot].hw0, 0x3002);
+    }
+
+    #[test]
+    fn write_to_sram_invalidates_slot() {
+        let (mut cpu, mut bus) = run_hot_loop(4);
+        let slot = ((0x2000_0000u32 >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(cpu.decode_cache[slot].tag, 0x2000_0000);
+        // SMC: rewrite the byte at 0x2000_0000.
+        bus.write16(0x2000_0000, 0x3005);
+        // The Bus pushed addr = 0x2000_0000 onto the queue.
+        assert!(!bus.pending_cache_invalidations.is_empty());
+        cpu.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+        bus.pending_cache_invalidations.clear();
+        assert_eq!(cpu.decode_cache[slot].tag, u32::MAX);
+        // Next fetch picks up the new bytes.
+        cpu.regs.set_pc(0x2000_0000);
+        cpu.decode_execute(&mut bus);
+        assert_eq!(cpu.decode_cache[slot].hw0, 0x3005);
+    }
+
+    #[test]
+    fn region_invalidate_clears_only_target_region() {
+        let mut cpu = CortexM0Plus::new();
+        // Pick PCs whose `(pc >> 1) & MASK` values are distinct so the
+        // three sentinels don't share slots — collision would let one
+        // region's sweep accidentally clear another region's tag.
+        let mk = |pc: u32| DecodedOp {
+            tag: pc,
+            hw0: 0,
+            hw1: 0,
+            flags: 0,
+        };
+        let pc_rom = 0x0000_0010u32; // slot 8
+        let pc_xip = 0x1000_0020u32; // slot 16
+        let pc_sram = 0x2000_0030u32; // slot 24
+        let mask = DECODE_CACHE_SIZE as u32 - 1;
+        let s_rom = ((pc_rom >> 1) & mask) as usize;
+        let s_xip = ((pc_xip >> 1) & mask) as usize;
+        let s_sram = ((pc_sram >> 1) & mask) as usize;
+        assert_ne!(s_rom, s_xip);
+        assert_ne!(s_rom, s_sram);
+        assert_ne!(s_xip, s_sram);
+        cpu.decode_cache[s_rom] = mk(pc_rom);
+        cpu.decode_cache[s_xip] = mk(pc_xip);
+        cpu.decode_cache[s_sram] = mk(pc_sram);
+        // Invalidate XIP only.
+        cpu.invalidate_decode_cache_regions(invalidation_regions::XIP);
+        assert_eq!(cpu.decode_cache[s_rom].tag, pc_rom);
+        assert_eq!(cpu.decode_cache[s_xip].tag, u32::MAX);
+        assert_eq!(cpu.decode_cache[s_sram].tag, pc_sram);
+    }
+
+    #[test]
+    fn bulk_invalidate_clears_everything() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.decode_cache[10].tag = 0x2000_0014;
+        cpu.decode_cache[20].tag = 0x1000_0028;
+        cpu.invalidate_decode_cache_regions(invalidation_regions::BULK);
+        assert_eq!(cpu.decode_cache[10].tag, u32::MAX);
+        assert_eq!(cpu.decode_cache[20].tag, u32::MAX);
+    }
+
+    #[test]
+    fn invalidate_all_clears_everything() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.decode_cache[10].tag = 0x2000_0014;
+        cpu.invalidate_decode_cache_all();
+        assert_eq!(cpu.decode_cache[10].tag, u32::MAX);
+    }
+
+    #[test]
+    fn non_cacheable_pc_does_not_populate() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        // Region 0xE (PPB) — not cacheable. PC won't actually fetch
+        // executable bytes here, but the cache lookup must reject the
+        // address before it touches the slot.
+        let pc = 0xE000_0010u32;
+        cpu.regs.set_pc(pc);
+        // We don't care about the side effects; just verify the cache
+        // wasn't poisoned.
+        let slot = ((pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        let before = cpu.decode_cache[slot].tag;
+        let _ = cpu.decode_execute(&mut bus);
+        // Slot tag must remain unchanged (still empty in this fresh
+        // core).
+        assert_eq!(cpu.decode_cache[slot].tag, before);
+    }
+
+    #[test]
+    fn wide_instruction_caches_both_halfwords() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        // BL +0  (encoding: 0xF000 0xF800 → branches to next instruction)
+        let pc = 0x2000_0000u32;
+        bus.write16(pc, 0xF000);
+        bus.write16(pc + 2, 0xF800);
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus);
+        let slot = ((pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(cpu.decode_cache[slot].tag, pc);
+        assert!(cpu.decode_cache[slot].is_wide());
+        assert_eq!(cpu.decode_cache[slot].hw0, 0xF000);
+        assert_eq!(cpu.decode_cache[slot].hw1, 0xF800);
+    }
+
+    #[test]
+    fn write_to_hw1_evicts_preceding_wide_slot() {
+        // A wide instruction at PC=N has its hw1 at PC=N+2. A write to
+        // N+2 must evict the slot at N (the wide entry's tag) so the
+        // next fetch re-decodes from fresh bytes.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        let pc = 0x2000_0000u32;
+        bus.write16(pc, 0xF000);
+        bus.write16(pc + 2, 0xF800);
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus);
+        let slot = ((pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(cpu.decode_cache[slot].tag, pc);
+        // Rewrite hw1 — bus pushes addr = pc+2 onto the queue.
+        bus.write16(pc + 2, 0xF801);
+        cpu.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+        bus.pending_cache_invalidations.clear();
+        assert_eq!(cpu.decode_cache[slot].tag, u32::MAX);
+    }
+
+    #[test]
+    fn region_zero_invalidate_is_noop() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.decode_cache[5].tag = 0x2000_000A;
+        cpu.invalidate_decode_cache_regions(0);
+        assert_eq!(cpu.decode_cache[5].tag, 0x2000_000A);
+    }
+
+    #[test]
+    fn isb_invalidates_cache() {
+        // hw0 = 0xF3BF, hw1 = 0x8F6F → ISB #0xF (option ignored).
+        // Place at SRAM, populate, then watch the ISB execution wipe
+        // every slot.
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        let pc = 0x2000_0000u32;
+        bus.write16(pc, 0xF3BF);
+        bus.write16(pc + 2, 0x8F6F);
+        cpu.regs.set_pc(pc);
+        // Populate by stepping once.
+        cpu.decode_execute(&mut bus);
+        // Cache is populated for `pc`. Sprinkle a sentinel elsewhere too.
+        cpu.decode_cache[42].tag = 0x2000_1000;
+        // Re-execute — second pass hits the cached entry, which is the
+        // ISB itself, and the handler invalidates the whole cache.
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus);
+        for slot in cpu.decode_cache.iter() {
+            assert_eq!(slot.tag, u32::MAX);
+        }
+    }
+}

@@ -442,27 +442,56 @@ impl Emulator {
                     rom_buf[offset..end].copy_from_slice(&data[..end - offset]);
                     self.bus.memory.load_rom(&rom_buf);
                 }
+                self.invalidate_decode_caches_region(
+                    crate::bus::invalidation_regions::ROM,
+                );
             }
             0x2 => {
                 for (i, &byte) in data.iter().enumerate() {
                     let a = addr.wrapping_add(i as u32);
                     self.bus.memory.sram_write8(a & 0x00FF_FFFF, byte);
                 }
+                self.invalidate_decode_caches_region(
+                    crate::bus::invalidation_regions::SRAM,
+                );
             }
             _ => {}
         }
+    }
+
+    /// Bulk-invalidate both cores' decode caches for the given region
+    /// bitmask. Used by `load_image` (which writes directly to the
+    /// memory backing store, bypassing `Bus::write*`'s automatic
+    /// per-write invalidation queue) to keep the caches coherent with
+    /// the new bytes. Caller passes a single region bit (ROM / XIP /
+    /// SRAM) or BULK to drain everything.
+    fn invalidate_decode_caches_region(&mut self, region: u8) {
+        self.cores[0].invalidate_decode_cache_regions(region);
+        self.cores[1].invalidate_decode_cache_regions(region);
     }
 
     /// Load the 16 KB RP2040 bootrom at address `0x0000_0000`.
     pub fn load_bootrom(&mut self, data: &[u8]) {
         self.assert_not_placeholder();
         self.bus.load_bootrom(data);
+        // Drain the region bit `Bus::load_bootrom` set so the next
+        // `step` doesn't see a stale ROM region flag.
+        let regions = std::mem::take(&mut self.bus.pending_invalidation_regions);
+        if regions != 0 {
+            self.cores[0].invalidate_decode_cache_regions(regions);
+            self.cores[1].invalidate_decode_cache_regions(regions);
+        }
     }
 
     /// Load an XIP flash image (appears at XIP address `0x1000_0000`).
     pub fn load_flash(&mut self, data: &[u8]) {
         self.assert_not_placeholder();
         self.bus.load_flash(data);
+        let regions = std::mem::take(&mut self.bus.pending_invalidation_regions);
+        if regions != 0 {
+            self.cores[0].invalidate_decode_cache_regions(regions);
+            self.cores[1].invalidate_decode_cache_regions(regions);
+        }
     }
 
     /// Direct-boot into an SDK-style firmware by emulating the boot2 →
@@ -576,6 +605,35 @@ impl Emulator {
         Ok(self.step_serial())
     }
 
+    /// Drain the bus's pending decode-cache invalidations into both
+    /// cores' caches and reset the buffers. Called after each
+    /// `core.step` in [`Self::step_serial`] (mirroring the mdrp2350
+    /// drain at lib.rs:1356-1373, commit `0c31479`).
+    ///
+    /// Per-instruction queue (`pending_cache_invalidations`) drains
+    /// only into the core that just ran — the runner that wrote the
+    /// bytes is the one most likely to refetch them, and the peer
+    /// core's executable bytes haven't moved this step. Region-scoped
+    /// bulk invalidations (`pending_invalidation_regions`, set by ISB
+    /// inside an instruction or by a mid-step `Bus::load_*`) drain to
+    /// BOTH cores so cross-core SMC observers get evicted on their
+    /// next turn.
+    #[inline]
+    fn drain_cache_invalidations(bus: &mut Bus, cores: &mut [CortexM0Plus; 2]) {
+        if !bus.pending_cache_invalidations.is_empty() {
+            let active = bus.active_core();
+            cores[active]
+                .invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+            bus.pending_cache_invalidations.clear();
+        }
+        if bus.pending_invalidation_regions != 0 {
+            let regions = bus.pending_invalidation_regions;
+            cores[0].invalidate_decode_cache_regions(regions);
+            cores[1].invalidate_decode_cache_regions(regions);
+            bus.pending_invalidation_regions = 0;
+        }
+    }
+
     /// Serial-mode single-quantum step. Shared by [`Self::step`] and
     /// [`Self::run_quantum`] on the Serial path.
     fn step_serial(&mut self) -> u64 {
@@ -595,6 +653,13 @@ impl Emulator {
             let c0 = if !self.cores[0].is_halted() {
                 self.bus.set_active_core(0);
                 let c = self.cores[0].step(&mut self.bus) as u64;
+                // Drain decode-cache invalidations recorded by writes
+                // during this step into the core that just ran.
+                // Region-scoped bulk invalidations (load_*) reach BOTH
+                // cores so a peer core fetching from the same region
+                // sees the eviction next quantum. Mirrors mdrp2350
+                // (commit 0c31479, lib.rs §lookup-and-drain).
+                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
                 self.maybe_wake_core1(0);
                 c
             } else {
@@ -605,6 +670,7 @@ impl Emulator {
                 self.bus.set_active_core(1);
                 self.bus.begin_core1_step();
                 let c = self.cores[1].step(&mut self.bus) as u64;
+                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
                 self.bus.end_core1_step();
                 self.maybe_wake_core1(1);
                 c
@@ -1125,6 +1191,17 @@ impl Emulator {
     pub fn poke(&mut self, addr: u32, value: u32) {
         self.assert_not_placeholder();
         self.bus.poke32(addr, value);
+        // poke32 bypasses the Bus::write* invalidation hooks
+        // (memory.sram_write32 / xip_sram direct slice). Conservative
+        // bulk invalidation here keeps the cache coherent with any
+        // pre-step `poke` of executable bytes, with negligible overhead
+        // (callers typically poke before the first step).
+        self.bus.pending_invalidation_regions |=
+            crate::bus::invalidation_regions::BULK;
+        self.cores[0].invalidate_decode_cache_all();
+        self.cores[1].invalidate_decode_cache_all();
+        self.bus.pending_invalidation_regions = 0;
+        self.bus.pending_cache_invalidations.clear();
     }
 
     /// Current master cycle count. Debug-only: asserts the emulator

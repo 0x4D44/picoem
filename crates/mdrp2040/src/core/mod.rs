@@ -69,6 +69,18 @@ pub struct CortexM0Plus {
     pub(crate) pending_fault: Option<Fault>,
     /// Core is halted — will not execute until explicitly woken.
     halted: bool,
+    /// PC-keyed decoded-op cache. Direct-mapped,
+    /// [`crate::bus::DECODE_CACHE_SIZE`] entries × 12 B = 96 KB per
+    /// core. Populated lazily on fetch by
+    /// [`Self::populate_decode_cache`]; invalidated by the driver after
+    /// each `step()` by draining
+    /// [`crate::bus::Bus::pending_cache_invalidations`] into
+    /// [`Self::invalidate_decode_cache_entries`]. Bulk-invalidated by
+    /// `load_bootrom` / `load_flash` / `load_image` / firmware ISB via
+    /// [`Self::invalidate_decode_cache_regions`] (region-scoped) or
+    /// [`Self::invalidate_decode_cache_all`] (everything). Modelled on
+    /// the mdrp2350 per-core cache (commit `0c31479`).
+    pub(crate) decode_cache: Box<[crate::bus::DecodedOp; crate::bus::DECODE_CACHE_SIZE]>,
 }
 
 impl CortexM0Plus {
@@ -77,6 +89,15 @@ impl CortexM0Plus {
     }
 
     pub fn with_id(core_id: u8) -> Self {
+        use crate::bus::{DECODE_CACHE_SIZE, DecodedOp};
+        // 96 KB heap allocation per core — can't live on the stack.
+        // Every slot starts with `tag = u32::MAX` so lookups never
+        // spuriously hit before the first populate.
+        let decode_cache: Box<[DecodedOp; DECODE_CACHE_SIZE]> =
+            vec![DecodedOp::empty(); DECODE_CACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("length matches DECODE_CACHE_SIZE by construction");
         Self {
             regs: Registers::new(),
             cycles: 0,
@@ -84,6 +105,7 @@ impl CortexM0Plus {
             current_instr_addr: 0,
             pending_fault: None,
             halted: false,
+            decode_cache,
         }
     }
 
@@ -367,6 +389,85 @@ impl CortexM0Plus {
     #[inline(always)]
     pub(crate) fn read_pc(&self) -> u32 {
         self.current_instr_addr.wrapping_add(4)
+    }
+
+    // --- Decode cache invalidation ---------------------------------------
+    //
+    // Modelled on the mdrp2350 helpers (commit 0c31479). Same shape, no
+    // `flag_only` flag, no `fetch_wait` — the M0+ entry has only `tag`,
+    // `hw0`, `hw1`, `flags`.
+
+    /// Invalidate this core's decode-cache entries for the supplied
+    /// addresses. Drained from `Bus::pending_cache_invalidations` after
+    /// each `core.step()` by `Emulator::step_serial`.
+    ///
+    /// Clears the direct-mapped slot
+    /// `((addr >> 1) & (DECODE_CACHE_SIZE - 1))` for each cacheable
+    /// address, plus the preceding slot (so a wide instruction's `hw0`
+    /// at `addr - 2` whose `hw1` is rewritten gets evicted too).
+    /// Non-cacheable addresses are skipped.
+    pub fn invalidate_decode_cache_entries(&mut self, addrs: &[u32]) {
+        use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
+        const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
+        let empty = DecodedOp::empty();
+        for &addr in addrs {
+            let aligned = addr & !1;
+            let prev = aligned.wrapping_sub(2);
+            if is_cacheable_pc(prev) {
+                let slot = ((prev >> 1) & MASK) as usize;
+                self.decode_cache[slot] = empty;
+            }
+            if is_cacheable_pc(aligned) {
+                let slot = ((aligned >> 1) & MASK) as usize;
+                self.decode_cache[slot] = empty;
+            }
+        }
+    }
+
+    /// Invalidate decode-cache entries that back one or more regions,
+    /// selected by `regions` (see
+    /// [`crate::bus::invalidation_regions`]). Unaffected slots stay hot
+    /// — `load_flash` no longer evicts SRAM-resident code, so firmware
+    /// that reloads flash then runs SRAM code doesn't pay a cold tax.
+    ///
+    /// If `regions` has the [`crate::bus::invalidation_regions::BULK`]
+    /// bit set, every slot is cleared regardless of tag — same as
+    /// [`Self::invalidate_decode_cache_all`].
+    ///
+    /// If `regions == 0`, this is a no-op.
+    pub fn invalidate_decode_cache_regions(&mut self, regions: u8) {
+        use crate::bus::{DecodedOp, invalidation_regions::BULK};
+        if regions == 0 {
+            return;
+        }
+        let empty = DecodedOp::empty();
+        if regions & BULK != 0 {
+            for slot in self.decode_cache.iter_mut() {
+                *slot = empty;
+            }
+            return;
+        }
+        // Region-scoped sweep: the region of a cached tag is
+        // `(tag >> 28) as u8` (ROM = 0, XIP = 1, SRAM = 2). Bit `n` of
+        // `regions` matches region `n`. Empty slots
+        // (`tag == u32::MAX`, nibble = 0xF) never match a valid region
+        // bit, so they're skipped without special-casing.
+        for slot in self.decode_cache.iter_mut() {
+            let nibble = (slot.tag >> 28) as u8;
+            if nibble < 8 && regions & (1 << nibble) != 0 {
+                *slot = empty;
+            }
+        }
+    }
+
+    /// Invalidate every decode-cache entry on this core. Used by `ISB`
+    /// and any path that globally invalidates the instruction pipeline.
+    pub fn invalidate_decode_cache_all(&mut self) {
+        use crate::bus::DecodedOp;
+        let empty = DecodedOp::empty();
+        for slot in self.decode_cache.iter_mut() {
+            *slot = empty;
+        }
     }
 }
 

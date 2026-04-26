@@ -94,7 +94,14 @@ impl CortexM0Plus {
             return match barrier_op {
                 0x4 => 1, // DSB
                 0x5 => 1, // DMB
-                0x6 => 1, // ISB
+                // ISB: flush the per-core decode cache so any
+                // self-modifying or cross-core writes that landed
+                // before this barrier are re-fetched. Mirrors the
+                // mdrp2350 ISB handler (commit 0c31479).
+                0x6 => {
+                    self.invalidate_decode_cache_all();
+                    1
+                }
                 _ => self.thumb32_undefined(hw0, hw1),
             };
         }
