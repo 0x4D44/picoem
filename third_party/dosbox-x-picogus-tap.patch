@@ -1,52 +1,116 @@
 From: mdpicoem PicoGUS Integration <martingdavidson@gmail.com>
-Date: 2026-04-14
-Subject: [PATCH] gus: optional CSV tap of GUS port I/O for mdpicoem replayer
+Date: 2026-04-25
+Subject: [PATCH] gus+adlib: optional CSV tap of GUS and OPL3 port I/O
 
-Adds a lightweight, env-gated hook to DOSBox-X's GUS read/write paths
-that logs every port access to a CSV file. Used by the mdpicoem
-`picogus_diff_rp2040` harness to drive PicoGUS firmware inside the
-RP2040 emulator.
+Adds a lightweight, env-gated hook to DOSBox-X's GUS and OPL3/Adlib
+read/write paths that logs every port access to a CSV file. Used by
+the mdpicoem `picogus_diff_rp2040` harness to drive PicoGUS firmware
+inside the RP2040 emulator, and (Phase E) PicoGUS-FM firmware that
+also responds to OPL3 port writes.
 
 Activation: set PICOGUS_TAP_FILE=<path> in the environment before
-launching DOSBox-X. If unset, no tap; the GUS code is unchanged at
-runtime.
+launching DOSBox-X. If unset, no tap; both code paths are unchanged
+at runtime. A single trace captures both buses, time-sorted by ns.
 
 Format (one event per line, matching HLD Stage 3):
 
     # picogus-tap v1
     ns,port,value,kind
     0,0x243,0x00,write8
-    1234567,0x240,0xff,write8
+    1234567,0x388,0x20,write8
+    1234890,0x389,0x01,write8
 
 `ns` is derived from PIC_FullIndex() (milliseconds * 1e6), `port` is
 the full 12-bit decoded ISA port, `value` is 0x%02x for width-1 or
 0x%04x for width-2, `kind` is write8|write16|read8|read16.
 
-The file is fopen'd once lazily on the first access, fflushed per
-line, and closed at process exit (via its static lifetime). Single-
-file diff against src/hardware/gus.cpp.
+Files touched:
+  - src/hardware/gus.cpp  : tap helpers (file-scope state) + GUS hooks.
+                            picogus_tap_log() is non-static so adlib.cpp
+                            can call it; other helpers stay file-local.
+  - src/hardware/adlib.cpp: extern decl of picogus_tap_log + log calls
+                            in OPL_Read (post-PortRead) and OPL_Write
+                            (post-PC98 port-shift). Adlib registers with
+                            IO_MB only, so iolen is 1 in practice; the
+                            ternary mirrors the GUS hook's wider invariant.
+                            No reentrancy guard needed -- Module::PortRead
+                            does not decompose 16-bit reads.
 
-Hunk headers use approximate line offsets from upstream commit
-f43ce61 (2026-04-14). Apply with GNU `patch -p1 -F5 --no-backup-if-mismatch`
-or `git apply --3way` so fuzzy matching can absorb minor upstream drift.
-See third_party/README.md for details.
+The file is fopen'd once lazily on the first access (from either bus),
+fflushed per line, and closed at process exit (via static lifetime).
+
+Apply with `git apply third_party/dosbox-x-picogus-tap.patch` or
+`patch -p1 -F5 --no-backup-if-mismatch`.
 
 ---
- src/hardware/gus.cpp | 104 ++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 103 insertions(+), 1 deletion(-)
+ src/hardware/adlib.cpp |  26 ++++++++-
+ src/hardware/gus.cpp   | 147 +++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 162 insertions(+), 11 deletions(-)
 
+diff --git a/src/hardware/adlib.cpp b/src/hardware/adlib.cpp
+index 036093b..f1b0438 100644
+--- a/src/hardware/adlib.cpp
++++ b/src/hardware/adlib.cpp
+@@ -1345,6 +1345,14 @@ void Module::Init( Mode m ) {
+ 
+ static Adlib::Module * module = nullptr;
+ 
++/* mdpicoem PicoGUS tap: defined in src/hardware/gus.cpp. The same env-gated
++ * CSV trace captures both GUS (port 0x2xx range) and Adlib/OPL3 (0x388-0x38b)
++ * I/O so a single capture run covers both buses, time-sorted by ns. The log
++ * function early-returns when PICOGUS_TAP_FILE is unset; no overhead in the
++ * common case. State (FILE*, init flag) lives in gus.cpp; only the logger
++ * is shared. */
++extern void picogus_tap_log(const char* kind, Bitu port, Bitu val, Bitu iolen);
++
+ static void OPL_CallBack(Bitu len) {
+ 	module->handler->Generate( module->mixerChan, len );
+ 	//Disable the sound generation after 30 seconds of silence
+@@ -1365,7 +1373,15 @@ static Bitu OPL_Read(Bitu port,Bitu iolen) {
+ 	// help games that try to play digitized speech through the FM chip
+ 	if (!(port&1)) module->mixerChan->FillUp();
+ 
+-	return module->PortRead( port, iolen );
++	Bitu _picogus_tap_ret = module->PortRead( port, iolen );
++
++	/* mdpicoem PicoGUS tap: log Adlib/OPL3 reads. Adlib registers with IO_MB
++	 * only, so iolen is 1 in practice (16-bit reads on 0x388 fall through to
++	 * IO_ReadSlowPath rather than reaching this handler), and PortRead does
++	 * not recurse -- no reentrancy guard needed. The logged value is the
++	 * post-read return so it correlates with what the guest CPU observed. */
++	picogus_tap_log(iolen == 2 ? "read16" : "read8", port, _picogus_tap_ret, iolen);
++	return _picogus_tap_ret;
+ }
+ 
+ pic_tickindex_t last_opl_write = 0;
+@@ -1373,6 +1389,14 @@ pic_tickindex_t last_opl_write = 0;
+ void OPL_Write(Bitu port,Bitu val,Bitu iolen) {
+ 	if (IS_PC98_ARCH) port >>= 8u; // C8D2h -> C8h, C9D2h -> C9h, OPL emulation looks only at bit 0.
+ 
++	/* mdpicoem PicoGUS tap: log Adlib/OPL3 writes. Logged after the PC98
++	 * port-shift so the value matches the OPL chip's view of the access
++	 * (mirroring the gus.cpp placement after the 0xFFF port mask). Adlib
++	 * registers with IO_MB only -> iolen is 1 in practice; the ternary
++	 * preserves the GUS hook's wider invariant in case the install mask
++	 * is ever widened. */
++	picogus_tap_log(iolen == 2 ? "write16" : "write8", port, val, iolen);
++
+ 	// if writing the data port, assume a change in OPL state that should be reflected immediately.
+ 	// this is a way to render "sample accurate" without needing "sample accurate" mode in the mixer.
+ 	// CHGOLF's Adlib digital audio hack works fine with this hack.
 diff --git a/src/hardware/gus.cpp b/src/hardware/gus.cpp
+index c26c950..01a929b 100644
 --- a/src/hardware/gus.cpp
 +++ b/src/hardware/gus.cpp
-@@ -1,6 +1,7 @@
+@@ -18,6 +18,7 @@
+ 
  #include <assert.h>
  #include <string.h>
 +#include <stdlib.h>
  #include <iomanip>
  #include <sstream>
  #include "dosbox.h"
- #include "inout.h"
-@@ -14,6 +15,86 @@
+@@ -32,6 +33,95 @@
  #include "bitop.h"
  #include "math.h"
  #include "regs.h"
@@ -70,16 +134,23 @@ diff --git a/src/hardware/gus.cpp b/src/hardware/gus.cpp
 +    if (picogus_tap_initialized) return;
 +    picogus_tap_initialized = true;
 +    const char* path = getenv("PICOGUS_TAP_FILE");
++    fprintf(stderr, "[DIAG] tap_init: PICOGUS_TAP_FILE=%s\n",
++            path ? path : "(null)");
++    fflush(stderr);
 +    if (path == NULL || path[0] == '\0') {
 +        picogus_tap_enabled = false;
 +        return;
 +    }
 +    picogus_tap_fp = fopen(path, "wb");
 +    if (picogus_tap_fp == NULL) {
++        fprintf(stderr, "[DIAG] tap_init: fopen('%s') FAILED errno=%d\n", path, errno);
++        fflush(stderr);
 +        LOG_MSG("PicoGUS tap: fopen(\"%s\") failed, tap disabled", path);
 +        picogus_tap_enabled = false;
 +        return;
 +    }
++    fprintf(stderr, "[DIAG] tap_init: opened '%s' successfully\n", path);
++    fflush(stderr);
 +    picogus_tap_enabled = true;
 +    fprintf(picogus_tap_fp, "# picogus-tap v1\n");
 +    fprintf(picogus_tap_fp, "ns,port,value,kind\n");
@@ -101,7 +172,9 @@ diff --git a/src/hardware/gus.cpp b/src/hardware/gus.cpp
 +    return ns;
 +}
 +
-+static inline void picogus_tap_log(const char* kind, Bitu port, Bitu val, Bitu iolen) {
++/* picogus_tap_log: not static -- also called from src/hardware/adlib.cpp
++ * (declared extern there). Keeps a single trace file across both buses. */
++void picogus_tap_log(const char* kind, Bitu port, Bitu val, Bitu iolen) {
 +    if (!picogus_tap_initialized) picogus_tap_init();
 +    if (!picogus_tap_enabled) return;
 +    /* Recursion guard: read_gus recurses with iolen==1 for 16-bit
@@ -130,10 +203,13 @@ diff --git a/src/hardware/gus.cpp b/src/hardware/gus.cpp
 +    fflush(picogus_tap_fp);
 +}
 +/* ---------------- mdpicoem PicoGUS tap (end) ------------------ */
-
- static GUS* test = NULL;
-
-@@ -1935,5 +1998,21 @@ static Bitu read_gus(Bitu port,Bitu iolen) {
+ using namespace std;
+ 
+ #if defined(_MSC_VER)
+@@ -1503,10 +1593,26 @@ static Bitu read_gus(Bitu port,Bitu iolen) {
+ 	 * See write_gus() for explanation. */
+ 	if (iolen == 2) {
+ 		if ((port - GUS_BASE) != 0x304) {
 -			return (read_gus(port,1) & 0xFF) + (read_gus(port+1,1) << 8u);
 +			/* mdpicoem PicoGUS tap: log the outer 16-bit read once
 +			 * and suppress the two recursive 8-bit sub-reads by
@@ -147,23 +223,99 @@ diff --git a/src/hardware/gus.cpp b/src/hardware/gus.cpp
 +			return _picogus_tap_r16;
  		}
  	}
-+
+ 
 +	/* mdpicoem PicoGUS tap: log the 8-bit read entry (and any 16-bit
 +	 * path that fell through without recursing). Logged before
 +	 * dispatch so timestamps correlate with the ISA cycle the DOS
 +	 * program issued. Value is unknown at entry -- log 0 for reads;
 +	 * the replayer ignores reads (see HLD Stage 3 / Stage 4). */
 +	picogus_tap_log(iolen == 2 ? "read16" : "read8", port, 0, iolen);
-
- 	switch (port - GUS_BASE) {
-@@ -2070,5 +2138,10 @@ static void write_gus(Bitu port,Bitu val,Bitu iolen) {
++
+ 	switch(port - GUS_BASE) {
+ 		case 0x206:
+ 			if (myGUS.clearTCIfPollingIRQStatus) {
+@@ -1605,14 +1711,25 @@ static Bitu read_gus(Bitu port,Bitu iolen) {
+ }
+ 
+ 
++static int write_gus_diag_count = 0;
+ static void write_gus(Bitu port,Bitu val,Bitu iolen) {
+-	//	LOG_MSG("Write gus port %x val %x",port,val);
++	if (write_gus_diag_count < 5) {
++		fprintf(stderr, "[DIAG] write_gus: port=0x%lx val=0x%lx iolen=%lu\n",
++			(unsigned long)port, (unsigned long)val, (unsigned long)iolen);
++		fflush(stderr);
++		write_gus_diag_count++;
++	}
+ 
+ 	/* 12-bit ISA decode (FIXME: Check GUS MAX ISA card to confirm)
  	 *
  	 * More than 10 bits must be decoded in order for GUS MAX extended registers at 7xx to work */
  	port &= 0xFFF;
-+
+ 
 +	/* mdpicoem PicoGUS tap: log the decoded write. Placed after the
 +	 * 12-bit port mask so the logged port matches the GUS's internal
 +	 * view of the access. */
 +	picogus_tap_log(iolen == 2 ? "write16" : "write8", port, val, iolen);
-
++
  	/* Ok, so get this: There's a demoscene entry, 1997 demo "Atlantis, Deep Like A Sea", with code
+ 	 * that does a 16-bit I/O write to port 3x2. Why? Well, if you notice how this switch statement
+ 	 * is done, and how DOSBox SVN registers I/O ports, most of these I/O ports are meant for 8-bit
+@@ -2258,10 +2375,17 @@ static IO_ReadHandler* gus_cb_port_r(IO_CalloutObject &co,Bitu port,Bitu iolen)
+ 	return read_gus;
+ }
+ 
++static int cb_port_w_diag = 0;
+ static IO_WriteHandler* gus_cb_port_w(IO_CalloutObject &co,Bitu port,Bitu iolen) {
+ 	(void)co;
+ 	(void)iolen;
+ 
++	if (cb_port_w_diag < 3) {
++		fprintf(stderr, "[DIAG] gus_cb_port_w called: port=0x%lx\n", (unsigned long)port);
++		fflush(stderr);
++		cb_port_w_diag++;
++	}
++
+ 	/* 10-bit ISA decode.
+ 	 * NOTE that the I/O handlers still need more than 10 bits to handle GUS MAX/Interwave registers at 0x7xx. */
+ 	port &= 0x3FF;
+@@ -2276,10 +2400,10 @@ static IO_WriteHandler* gus_cb_port_w(IO_CalloutObject &co,Bitu port,Bitu iolen)
+ 
+ class GUS:public Module_base{
+ 	private:
+-		//	IO_ReadHandleObject ReadHandler[12];
+-		//	IO_WriteHandleObject WriteHandler[12];
+-		//	IO_ReadHandleObject ReadCS4231Handler[4];
+-		//	IO_WriteHandleObject WriteCS4231Handler[4];
++		IO_ReadHandleObject ReadHandler[12];
++		IO_WriteHandleObject WriteHandler[12];
++		IO_ReadHandleObject ReadCS4231Handler[4];
++		IO_WriteHandleObject WriteCS4231Handler[4];
+ #if !defined(OSFREE)
+ 		AutoexecObject autoexecline[3];
+ #endif
+@@ -2414,6 +2538,9 @@ class GUS:public Module_base{
+ 			// FIXME: HUH?? Read the port number and subtract 0x200, then use GUS_BASE
+ 			// in other parts of the code to compare against 0x200 and 0x300? That's confusing. Fix!
+ 			myGUS.portbase = (unsigned int)section->Get_hex("gusbase") - 0x200u;
++			fprintf(stderr, "[DIAG] GUS init: portbase=0x%x gusbase=0x%x\n",
++				myGUS.portbase, myGUS.portbase + 0x200u);
++			fflush(stderr);
+ 
+ 			// TODO: so, if the GUS ULTRASND variable actually mentions two DMA and two IRQ channels,
+ 			//       shouldn't we offer the ability to specify them independently? especially when
+@@ -2471,10 +2598,10 @@ class GUS:public Module_base{
+ 				IO_PutCallout(obj);
+ 			}
+ 
+-#if 0
+-			// We'll leave the MIDI interface to the MPU-401 
+-			// Ditto for the Joystick 
+-			// GF1 Synthesizer 
++#if 1 /* mdpicoem: enable direct I/O handlers — callout system not dispatching */
++			// We'll leave the MIDI interface to the MPU-401
++			// Ditto for the Joystick
++			// GF1 Synthesizer
+ 			ReadHandler[0].Install(0x302 + GUS_BASE,read_gus,IO_MB);
+ 			WriteHandler[0].Install(0x302 + GUS_BASE,write_gus,IO_MB);
+ 
