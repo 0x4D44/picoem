@@ -1595,3 +1595,64 @@ ARMv6-M ARM (implementation-defined for unimplemented IRQ slots). If
 is a one-line `& 0x03FF_FFFF` mask in `nvic_mmio_write32` and the
 threaded sibling. Documented here so a future probe-diff failure can
 be triaged quickly.
+
+## TrustZone EXC_RETURN missing the S bit (2026-04-26)
+
+`crates/mdrp2350/src/core/exceptions.rs:191` carries an in-source
+FIXME(trustzone): the EXC_RETURN value pushed on exception entry does
+not encode the Secure / Non-Secure (S) bit. Non-Secure exceptions
+will therefore claim a Secure return on resume, mismatching the
+ARMv8-M Mainline behaviour described in the master HLD §2 (TrustZone
+non-goals).
+
+Status: not yet observed because no current oracle exercises a NS
+exception entry path — `silicon_isr_diff_rp2350` runs in Secure
+state. Surfacing here so the next NS-state work has the gap on its
+radar; promote to a sized fix when Phase 8 (TrustZone) lands.
+
+## SysTick CLKSOURCE=0 ref-clock scaling not modelled (2026-04-26)
+
+Two TODO sites: `crates/mdrp2350/src/bus/ppb.rs:392` (write path) and
+`:772` (`systick_advance`). Both note that all cycles tick the
+SysTick counter regardless of `SYST_CSR.CLKSOURCE`. Real silicon
+divides the reference clock when `CLKSOURCE=0`; the current model
+treats it as `CLKSOURCE=1` (processor clock).
+
+Risk: any firmware that reprograms SysTick to use the reference clock
+(rare on RP2350 in practice — bootrom and most SDK paths use the
+processor clock) will see incorrect interrupt cadence. No oracle
+catches this today.
+
+Fix path: when `SYST_CSR.CLKSOURCE` becomes 0, scale the delta in
+`systick_advance` by the cached `clk_ref / clk_sys` ratio from
+`ClockTree`. ~10 LOC; gated on `SYST_CSR.CLKSOURCE`.
+
+## FPSCR.AHP not honoured in f16 conversions (2026-04-26)
+
+Two TODO(phase-7.1) sites in `crates/mdrp2350/src/core/execute_fpu.rs`:
+`:1378` (`f16_bits_to_f32`) and `:1429` (`f32_to_f16_bits`). Both
+ignore `FPSCR.AHP` (Alternative Half-Precision encoding). When AHP=1,
+ARMv8-M uses the alternative-half-precision encoding (no Inf/NaN; max
+exp encodes large normals); when AHP=0 (default), it uses IEEE 754-2008
+half-precision.
+
+Current behaviour: always IEEE 754-2008. Firmware that flips
+`FPSCR.AHP` to use the alternative encoding will produce incorrect
+half-float results on the boundary cases (Inf, NaN, max-exp normals).
+
+No oracle catches this; AHP is rarely used in practice. Fix is
+localised to the two functions and gated on a single FPSCR bit.
+
+## tests_narrow.rs IO_BANK0 INTR W1C tests #[ignore]'d (2026-04-26)
+
+`crates/mdrp2350/src/tests_narrow.rs:1005` (`s65_io_bank0_intr0_byte_write_no_fault`)
+and `:1020` (`s65_io_bank0_intr5_byte_write_no_fault`) are marked
+`#[ignore]` until `io_bank0` INTR W1C semantics land per HLD §4.7.
+Current model is plain RW storage at `peripherals/io_bank0.rs:192-200`
+("W1C is a future enhancement"); a no-fault-only test would not
+distinguish correct from broken behaviour and was deemed worse than an
+ignored one.
+
+Re-enable as soon as the W1C peripheral path lands. Until then, the
+narrow-write paths into IO_BANK0 INTR are tested only by the bus-side
+mask, which is not equivalent to silicon W1C.

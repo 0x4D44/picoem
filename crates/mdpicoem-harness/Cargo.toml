@@ -77,6 +77,9 @@ path = "src/bin/probe_diff_rp2350.rs"
 name = "bank_conflict_test_rp2350"
 path = "src/bin/bank_conflict_test_rp2350.rs"
 
+# Integration smoke / paced throughput driver — exercises long firmware
+# runs end-to-end. Not a `cargo test` target (covered by chip unit tests
+# and silicon oracles instead).
 [[bin]]
 name = "full_test_rp2350"
 path = "src/bin/full_test_rp2350.rs"
@@ -126,6 +129,7 @@ path = "src/bin/onerom_stress_pio_rp2350.rs"
 name = "onerom_pio_speed_grade_serial_rp2350"
 path = "src/bin/onerom_pio_speed_grade_serial_rp2350.rs"
 
+# Silicon-only — drives the OneROM rig over SWD; cannot run in CI.
 [[bin]]
 name = "onerom_cpu_probe"
 path = "src/bin/onerom_cpu_probe.rs"
@@ -228,6 +232,7 @@ path = "src/bin/silicon_isr_diff_rp2040.rs"
 name = "threading_micro"
 path = "src/bin/threading_micro.rs"
 
+# PIO host-side microbenchmark — perf signal, not a correctness check.
 [[bin]]
 name = "pio_microbench"
 path = "src/bin/pio_microbench.rs"

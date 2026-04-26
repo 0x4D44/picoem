@@ -286,9 +286,12 @@ pub struct Bus {
     /// Accumulated extra wait states beyond 1-cycle baseline during current instruction.
     /// Reset by decode_execute before dispatch, added to cycle count after.
     pub(crate) extra_wait_states: u32,
-    /// Stub backing store for peripheral registers (APB + AHB).
-    /// Keyed by canonical address (alias bits stripped).
-    /// TODO: Replace with direct Peripheral trait dispatch when real peripherals are added.
+    /// Backing store for the small set of MMIO registers handled by
+    /// generic stub dispatch (chiefly the inert APB holes in
+    /// `peripherals/inert.rs`). Keyed by canonical address (alias bits
+    /// stripped). Real peripherals route through inherent methods on
+    /// `Bus` per HLD `2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md`
+    /// §5.1; this map is the catch-all for the rest.
     pub(crate) peripheral_regs: HashMap<u32, u32>,
     /// Cross-core atomics (halted/WFE/event_flag/irq_pending/RCP/bus_fault).
     /// Shared via `Arc` with the two `CortexM33` cores — Phase 3 Stage 1
