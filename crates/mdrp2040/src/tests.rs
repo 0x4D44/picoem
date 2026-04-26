@@ -8270,3 +8270,98 @@ mod decode_cache {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// HLD V5 §8.4 — positive dual-core SysTick test.
+//
+// Today's slow path at `lib.rs:730-749` ticks `systicks[active_core()]` once
+// per master cycle, but the dispatch above sets `active_core = 1` last when
+// both cores are running. Result: `systicks[0]` never advances under
+// dual-core load → `ppb[0].icsr.PENDSTSET` (bit 26) stays 0. This test arms
+// SysTick on both cores with `RVR=0` (period 1 — the very first tick fires
+// because `CVR=0` at reset triggers reload+TICKINT), runs a quantum where
+// both cores execute infinite-loop `B .` (so neither halts), and asserts
+// PENDSTSET on BOTH cores' PPB. It MUST FAIL on current code.
+//
+// Stage 2 of the chunked-peripheral-advance refactor fixes the bug; the
+// Stage 1 commit lands this test alone, intentionally red.
+// ---------------------------------------------------------------------------
+
+mod systick_dual_core_tests {
+    use crate::{Config, EmulatorBuilder};
+
+    /// SRAM addresses for each core's infinite-loop body.
+    const CORE0_PC: u32 = 0x2000_0000;
+    const CORE1_PC: u32 = 0x2000_0040;
+    /// Stack tops near the top of SRAM (264 KB total, base 0x2000_0000).
+    const CORE0_SP: u32 = 0x2004_0000;
+    const CORE1_SP: u32 = 0x2003_8000;
+    /// SysTick MMIO offsets from the PPB base.
+    const SYST_CSR: u32 = 0xE000_E010;
+    const SYST_RVR: u32 = 0xE000_E014;
+    const SYST_CVR: u32 = 0xE000_E018;
+
+    /// Arm `systicks[core]` with `RVR=0` (period 1, fires every cycle) and
+    /// `ENABLE | TICKINT | CLKSOURCE`. Banked by `active_core`, so we flip
+    /// the selector around each programming step.
+    fn arm_systick(emu: &mut crate::Emulator, core: usize) {
+        emu.bus.set_active_core(core);
+        emu.bus.write32(SYST_RVR, 0);
+        emu.bus.write32(SYST_CVR, 0);
+        emu.bus.write32(SYST_CSR, 0b111);
+    }
+
+    #[test]
+    fn both_cores_systick_advance_when_both_running() {
+        // Default `step_quantum` (64) is enough for the SysTick `RVR=0`
+        // case: every cycle of the dual-core slow-path interleave should
+        // tick the active core's SysTick. With both cores armed, both
+        // cores' PENDSTSET must latch within the first quantum.
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build is infallible");
+
+        // Place identical `B .` (0xE7FE = branch to self) at each core's
+        // PC so neither core halts during the quantum.
+        emu.poke(CORE0_PC, 0xE7FE_E7FE);
+        emu.poke(CORE1_PC, 0xE7FE_E7FE);
+
+        // Seed core 0.
+        emu.core_mut(0).regs.msp = CORE0_SP;
+        emu.core_mut(0).regs.r[13] = CORE0_SP;
+        emu.core_mut(0).regs.set_pc(CORE0_PC);
+        emu.core_mut(0).regs.xpsr = 1 << 24; // Thumb bit
+        // Seed core 1.
+        emu.core_mut(1).regs.msp = CORE1_SP;
+        emu.core_mut(1).regs.r[13] = CORE1_SP;
+        emu.core_mut(1).regs.set_pc(CORE1_PC);
+        emu.core_mut(1).regs.xpsr = 1 << 24;
+        emu.core_mut(1).wake();
+
+        // Arm SysTick on both cores. This drops the fast-path gate (the
+        // gate's `systick_idle` check sees an enabled SysTick on the
+        // active core), so the slow path is taken — exactly where the
+        // bug lives.
+        arm_systick(&mut emu, 0);
+        arm_systick(&mut emu, 1);
+
+        // Run a single quantum.
+        let _ = emu.step();
+
+        let icsr0 = emu.bus.ppb[0].icsr;
+        let icsr1 = emu.bus.ppb[1].icsr;
+        let pendst0 = icsr0 & (1 << 26) != 0;
+        let pendst1 = icsr1 & (1 << 26) != 0;
+
+        // Both cores ran non-halted for at least one slow-path cycle, so
+        // both SysTicks must have ticked and latched PENDSTSET.
+        assert!(
+            pendst0,
+            "core 0 PENDSTSET must latch (icsr0 = {icsr0:#010x})",
+        );
+        assert!(
+            pendst1,
+            "core 1 PENDSTSET must latch (icsr1 = {icsr1:#010x})",
+        );
+    }
+}
