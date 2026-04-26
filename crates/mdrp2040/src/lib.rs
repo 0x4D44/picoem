@@ -231,8 +231,10 @@ pub struct Emulator {
     /// Cycles advanced per call to [`Self::step`].
     pub step_quantum: u32,
     /// Total PIO ticks performed in the slow path
-    /// (`tick_pio_and_route_irqs_single`). Diagnostic-only — used by the
+    /// (`tick_pio_and_route_irqs`). Diagnostic-only — used by the
     /// PicoGUS harness to confirm PIO is actually being driven.
+    /// Bumps by `cycles` per quantum after HLD 2026.04.26 V5 chunked
+    /// refactor (per-quantum granularity is acceptable).
     pub pio_tick_count: u64,
     /// Subset of [`Self::pio_tick_count`] where bit 4 (IOW for PicoGUS)
     /// of `bus.gpio_in` was low at the moment of the tick. If this stays
@@ -250,7 +252,7 @@ pub struct Emulator {
     /// previous-tick value (advanced or jumped). Slow-path-only.
     pub pio0_sm0_pc_advances: u64,
     /// Last observed PC of PIO0 SM0 — internal scratch used by
-    /// [`Self::tick_pio_and_route_irqs_single`] to decide whether the
+    /// [`Self::tick_pio_and_route_irqs`] to decide whether the
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
     pub(crate) pio0_sm0_last_pc: u8,
@@ -446,27 +448,56 @@ impl Emulator {
                     rom_buf[offset..end].copy_from_slice(&data[..end - offset]);
                     self.bus.memory.load_rom(&rom_buf);
                 }
+                self.invalidate_decode_caches_region(
+                    crate::bus::invalidation_regions::ROM,
+                );
             }
             0x2 => {
                 for (i, &byte) in data.iter().enumerate() {
                     let a = addr.wrapping_add(i as u32);
                     self.bus.memory.sram_write8(a & 0x00FF_FFFF, byte);
                 }
+                self.invalidate_decode_caches_region(
+                    crate::bus::invalidation_regions::SRAM,
+                );
             }
             _ => {}
         }
+    }
+
+    /// Bulk-invalidate both cores' decode caches for the given region
+    /// bitmask. Used by `load_image` (which writes directly to the
+    /// memory backing store, bypassing `Bus::write*`'s automatic
+    /// per-write invalidation queue) to keep the caches coherent with
+    /// the new bytes. Caller passes a single region bit (ROM / XIP /
+    /// SRAM) or BULK to drain everything.
+    fn invalidate_decode_caches_region(&mut self, region: u8) {
+        self.cores[0].invalidate_decode_cache_regions(region);
+        self.cores[1].invalidate_decode_cache_regions(region);
     }
 
     /// Load the 16 KB RP2040 bootrom at address `0x0000_0000`.
     pub fn load_bootrom(&mut self, data: &[u8]) {
         self.assert_not_placeholder();
         self.bus.load_bootrom(data);
+        // Drain the region bit `Bus::load_bootrom` set so the next
+        // `step` doesn't see a stale ROM region flag.
+        let regions = std::mem::take(&mut self.bus.pending_invalidation_regions);
+        if regions != 0 {
+            self.cores[0].invalidate_decode_cache_regions(regions);
+            self.cores[1].invalidate_decode_cache_regions(regions);
+        }
     }
 
     /// Load an XIP flash image (appears at XIP address `0x1000_0000`).
     pub fn load_flash(&mut self, data: &[u8]) {
         self.assert_not_placeholder();
         self.bus.load_flash(data);
+        let regions = std::mem::take(&mut self.bus.pending_invalidation_regions);
+        if regions != 0 {
+            self.cores[0].invalidate_decode_cache_regions(regions);
+            self.cores[1].invalidate_decode_cache_regions(regions);
+        }
     }
 
     /// Direct-boot into an SDK-style firmware by emulating the boot2 →
@@ -580,6 +611,35 @@ impl Emulator {
         Ok(self.step_serial())
     }
 
+    /// Drain the bus's pending decode-cache invalidations into both
+    /// cores' caches and reset the buffers. Called after each
+    /// `core.step` in [`Self::step_serial`] (mirroring the mdrp2350
+    /// drain at lib.rs:1356-1373, commit `0c31479`).
+    ///
+    /// Per-instruction queue (`pending_cache_invalidations`) drains
+    /// only into the core that just ran — the runner that wrote the
+    /// bytes is the one most likely to refetch them, and the peer
+    /// core's executable bytes haven't moved this step. Region-scoped
+    /// bulk invalidations (`pending_invalidation_regions`, set by ISB
+    /// inside an instruction or by a mid-step `Bus::load_*`) drain to
+    /// BOTH cores so cross-core SMC observers get evicted on their
+    /// next turn.
+    #[inline]
+    fn drain_cache_invalidations(bus: &mut Bus, cores: &mut [CortexM0Plus; 2]) {
+        if !bus.pending_cache_invalidations.is_empty() {
+            let active = bus.active_core();
+            cores[active]
+                .invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+            bus.pending_cache_invalidations.clear();
+        }
+        if bus.pending_invalidation_regions != 0 {
+            let regions = bus.pending_invalidation_regions;
+            cores[0].invalidate_decode_cache_regions(regions);
+            cores[1].invalidate_decode_cache_regions(regions);
+            bus.pending_invalidation_regions = 0;
+        }
+    }
+
     /// Serial-mode single-quantum step. Shared by [`Self::step`] and
     /// [`Self::run_quantum`] on the Serial path.
     fn step_serial(&mut self) -> u64 {
@@ -593,12 +653,27 @@ impl Emulator {
         let start = self.clock.cycles;
         let target = start.wrapping_add(self.step_quantum as u64);
 
+        // Per HLD 2026.04.26 V5 §5.2.3: accumulate per-core cycle counts
+        // across the inner loop so the slow-branch SysTick advance
+        // mirrors per-core hardware semantics (each core's SysTick
+        // decrements on its own consumed cycles, not on the active-core
+        // shared register).
+        let mut c0_total: u64 = 0;
+        let mut c1_total: u64 = 0;
+
         while self.clock.cycles < target
             && (!self.cores[0].is_halted() || !self.cores[1].is_halted())
         {
             let c0 = if !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] {
                 self.bus.set_active_core(0);
                 let c = self.cores[0].step(&mut self.bus) as u64;
+                // Drain decode-cache invalidations recorded by writes
+                // during this step into the core that just ran.
+                // Region-scoped bulk invalidations (load_*) reach BOTH
+                // cores so a peer core fetching from the same region
+                // sees the eviction next quantum. Mirrors mdrp2350
+                // (commit 0c31479, lib.rs §lookup-and-drain).
+                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
                 self.maybe_wake_core1(0);
                 c
             } else {
@@ -609,6 +684,7 @@ impl Emulator {
                 self.bus.set_active_core(1);
                 self.bus.begin_core1_step();
                 let c = self.cores[1].step(&mut self.bus) as u64;
+                Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
                 self.bus.end_core1_step();
                 self.maybe_wake_core1(1);
                 c
@@ -622,6 +698,8 @@ impl Emulator {
             if c0 == 0 && c1 == 0 {
                 break;
             }
+            c0_total = c0_total.wrapping_add(c0);
+            c1_total = c1_total.wrapping_add(c1);
             self.clock.cycles = self.clock.cycles.wrapping_add(c0.max(c1));
         }
 
@@ -665,26 +743,21 @@ impl Emulator {
             self.drain_pending_irqs_to_cores();
             self.update_gpio();
         } else {
-            for _ in 0..consumed {
-                // Advance the master-cycle cache one tick so per-cycle
-                // `tick_peripherals` sees a fresh `now` each iteration;
-                // TIMER's alarm poll only fires on >= match so a stale
-                // snapshot would quietly postpone the IRQ.
-                self.bus.master_cycle = self.bus.master_cycle.wrapping_add(1);
-                self.bus.tick_peripherals();
-                // HLD V5 §5.2: tick the active-core SysTick once per
-                // master cycle, after `tick_peripherals` (so peripheral
-                // side-effects from this cycle are visible) and before
-                // `drain_pending_irqs_to_cores` (so a SysTick-asserted
-                // ICSR.PENDSTSET observation aligns with this cycle).
-                let active = self.bus.active_core();
-                if self.bus.systicks[active].tick() {
-                    self.bus.ppb[active].icsr |= 1 << 26;
-                }
-                self.tick_pio_and_route_irqs_single();
-                self.update_gpio();
-                self.drain_pending_irqs_to_cores();
-            }
+            // Per HLD 2026.04.26 V5 §5.3: chunked once-per-quantum slow
+            // branch. `master_cycle` advances by `consumed` BEFORE
+            // `tick_peripherals` so TIMER's alarm `>=` poll sees the
+            // window's end-of-quantum cycle. SysTick advances per-core
+            // by each core's actual consumed cycle count (mirrors M0+
+            // hardware: SysTick is per-core, decremented on the cycles
+            // the owning core consumes — see §5.2.3). PIO and IRQ drain
+            // run once at quantum end; net IRQ-delivery latency grows
+            // from ≤1 cycle to ≤step_quantum-1 cycles (see §5.4).
+            self.bus.master_cycle = self.bus.master_cycle.wrapping_add(consumed);
+            self.bus.tick_peripherals(consumed as u32);
+            self.tick_systick(c0_total as u32, c1_total as u32);
+            self.tick_pio_and_route_irqs(consumed as u32);
+            self.update_gpio();
+            self.drain_pending_irqs_to_cores();
         }
         self.wake_checks();
         consumed
@@ -711,8 +784,28 @@ impl Emulator {
         }
     }
 
-    /// Step both PIO blocks by exactly one system clock and route
-    /// their IRQ flags into [`Bus::irq_pending`].
+    /// Per HLD 2026.04.26 V5 §5.2.3: advance each core's SysTick by
+    /// its own consumed cycle count for this quantum. Mirrors M0+
+    /// hardware semantics — SysTick is per-core, the active-core
+    /// `Bus` field is just a banked-MMIO selector, not a tick gate.
+    /// PENDSTSET (`ICSR[26]`) latches per-core; `drain_pending_irqs_to_cores`
+    /// runs after this call so the SysTick handler is taken on the
+    /// next quantum boundary.
+    fn tick_systick(&mut self, c0: u32, c1: u32) {
+        for _ in 0..c0 {
+            if self.bus.systicks[0].tick() {
+                self.bus.ppb[0].icsr |= 1 << 26;
+            }
+        }
+        for _ in 0..c1 {
+            if self.bus.systicks[1].tick() {
+                self.bus.ppb[1].icsr |= 1 << 26;
+            }
+        }
+    }
+
+    /// Step both PIO blocks by `cycles` system clocks and route their
+    /// IRQ flags into [`Bus::irq_pending`].
     ///
     /// Per HLD V7 §5.5 + Appendix B, each PIO block has 8 internal
     /// Per-block 12-bit raw status (`IRQ[3:0]` + RXNEMPTY[3:0] +
@@ -722,14 +815,20 @@ impl Emulator {
     /// at NVIC #7/#8 and PIO1_IRQ_0/1 at NVIC #9/#10. PicoGUS firmware
     /// enables `RXNEMPTY_SM0` on PIO0 INT0_INTE so its ISA handler
     /// fires when an autopushed event lands in PIO0 SM0's RX FIFO.
-    fn tick_pio_and_route_irqs_single(&mut self) {
+    ///
+    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum.
+    fn tick_pio_and_route_irqs(&mut self, cycles: u32) {
         let gpio_in = self.bus.gpio_in;
-        self.pio_tick_count = self.pio_tick_count.wrapping_add(1);
+        // Diagnostic counters bump by `cycles` (per-quantum granularity is
+        // acceptable per HLD 2026.04.26 V5 §7 risk row "Per-cycle
+        // observation diagnostics under-count by quantum factor").
+        self.pio_tick_count = self.pio_tick_count.wrapping_add(cycles as u64);
         if gpio_in & (1u32 << 4) == 0 {
-            self.pio_tick_iow_low_count = self.pio_tick_iow_low_count.wrapping_add(1);
+            self.pio_tick_iow_low_count =
+                self.pio_tick_iow_low_count.wrapping_add(cycles as u64);
         }
-        self.bus.pio[0].step_n(1, gpio_in);
-        self.bus.pio[1].step_n(1, gpio_in);
+        self.bus.pio[0].step_n(cycles, gpio_in);
+        self.bus.pio[1].step_n(cycles, gpio_in);
         // Observe PIO0 SM0's PC after the step. Tracks max PC and the
         // number of times the PC differs from the prior observation
         // (counts both linear advances and jumps; sequential same-PC
@@ -1156,6 +1255,17 @@ impl Emulator {
     pub fn poke(&mut self, addr: u32, value: u32) {
         self.assert_not_placeholder();
         self.bus.poke32(addr, value);
+        // poke32 bypasses the Bus::write* invalidation hooks
+        // (memory.sram_write32 / xip_sram direct slice). Conservative
+        // bulk invalidation here keeps the cache coherent with any
+        // pre-step `poke` of executable bytes, with negligible overhead
+        // (callers typically poke before the first step).
+        self.bus.pending_invalidation_regions |=
+            crate::bus::invalidation_regions::BULK;
+        self.cores[0].invalidate_decode_cache_all();
+        self.cores[1].invalidate_decode_cache_all();
+        self.bus.pending_invalidation_regions = 0;
+        self.bus.pending_cache_invalidations.clear();
     }
 
     /// Current master cycle count. Debug-only: asserts the emulator

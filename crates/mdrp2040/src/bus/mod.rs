@@ -199,6 +199,95 @@ pub const DMA_BASE: u32 = 0x5000_0000;
 /// XIP SRAM size (16 KB on RP2040 — the cache RAM exposed as scratch).
 pub const XIP_SRAM_SIZE: usize = 16 * 1024;
 
+/// Number of entries in the per-core PC-keyed decoded-op cache.
+/// Direct-mapped, indexed by `(pc >> 1) & (DECODE_CACHE_SIZE - 1)`.
+/// 8192 entries × 12 B = 96 KB per core. Modelled on the RP2350 cache
+/// (mdrp2350 commit 0c31479) but sized down: RP2040 hot loops are well
+/// under 1 KB and total executable space (16 KB ROM + 16 KB XIP-SRAM +
+/// 264 KB SRAM + 2 MB XIP flash) hashes to 8K slots without meaningful
+/// conflict pressure for the workloads we measure.
+pub(crate) const DECODE_CACHE_SIZE: usize = 8192;
+
+/// One decoded ARMv6-M instruction. 12 bytes (4 + 2 + 2 + 1 + 3 pad),
+/// `Copy`.
+///
+/// Populated lazily on a cache miss by
+/// [`crate::core::CortexM0Plus::populate_decode_cache`]. An entry with
+/// `tag == u32::MAX` is empty (that value is odd and cannot match a
+/// halfword-aligned PC).
+///
+/// Differs from the mdrp2350 [`crate::bus::DecodedOp`] equivalent by
+/// dropping `fetch_wait` (RP2040 has no `extra_wait_states` accumulator
+/// — `Bus::read16` writes `last_access_cycles` but the core path does
+/// not consume it) and `is_thumb16_flag_only` (ARMv6-M has no IT
+/// blocks).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DecodedOp {
+    /// PC this entry is valid for. Full tag (no shift). `u32::MAX` =
+    /// empty.
+    pub tag: u32,
+    /// First halfword (the one at PC).
+    pub hw0: u16,
+    /// Second halfword (at PC+2). Zero for narrow instructions.
+    pub hw1: u16,
+    /// Packed flags.
+    ///   bit 0 — `is_wide`
+    ///   bit 1 — `is_pure` (handler does not touch the bus and does not
+    ///           raise a synchronous fault). Reserved here; unused on
+    ///           the M0+ fast path until iter7 wires the skip.
+    ///   bits 2..7 — reserved
+    pub flags: u8,
+}
+
+impl DecodedOp {
+    pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
+    pub(crate) const FLAG_PURE: u8 = 0b0000_0010;
+
+    #[inline(always)]
+    pub(crate) fn empty() -> Self {
+        Self { tag: u32::MAX, hw0: 0, hw1: 0, flags: 0 }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_wide(&self) -> bool {
+        self.flags & Self::FLAG_WIDE != 0
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // wired into iter7 fast-path skip
+    pub(crate) fn is_pure(&self) -> bool {
+        self.flags & Self::FLAG_PURE != 0
+    }
+}
+
+/// True if `pc` lies in an executable region the cache may index.
+/// Only ROM (`0x0`), XIP / XIP-SRAM (`0x1`), and SRAM (`0x2`) qualify.
+/// Everything else (peripherals, SIO, PPB) either cannot legitimately
+/// contain code or is dynamic and not worth caching.
+#[inline(always)]
+pub(crate) fn is_cacheable_pc(pc: u32) -> bool {
+    matches!(pc >> 28, 0x0 | 0x1 | 0x2)
+}
+
+/// Region bits for [`Bus::pending_invalidation_regions`] /
+/// [`crate::core::CortexM0Plus::invalidate_decode_cache_regions`]. The
+/// meaningful regions are the three cacheable ones (see
+/// [`is_cacheable_pc`]). `BULK` is the universal escape hatch used when
+/// the caller doesn't know (or doesn't care) which region changed.
+pub mod invalidation_regions {
+    /// Region `0x0` — boot ROM (16 KB).
+    pub const ROM: u8 = 1 << 0;
+    /// Region `0x1` — XIP / XIP-SRAM (flash window + cache scratch).
+    pub const XIP: u8 = 1 << 1;
+    /// Region `0x2` — on-chip SRAM (264 KB across 4 striped + 2 scratch
+    /// banks).
+    pub const SRAM: u8 = 1 << 2;
+    /// Bulk bit — drain every slot regardless of tag region. Used by
+    /// `ISB` and any path that can't attribute the change to a specific
+    /// region (e.g. `Emulator::poke`, legacy bypass writes).
+    pub const BULK: u8 = 1 << 7;
+}
+
 /// RP2040 AHB-Lite bus fabric.
 pub struct Bus {
     pub memory: Memory,
@@ -373,6 +462,21 @@ pub struct Bus {
     /// via `println!`. Unit tests inject a `Vec<u8>`-backed sink to
     /// capture lines without wrestling with fd 1 redirection.
     pub(crate) mmio_trace_sink: Option<Box<dyn Write>>,
+    /// Dirty-range log for the per-core decode caches. Every SRAM /
+    /// XIP-SRAM write pushes the target halfword address(es) here; the
+    /// driver (`Emulator::step_serial`) drains this into the core that
+    /// just ran, evicting stale entries. Mirrors the mdrp2350
+    /// `Bus::pending_cache_invalidations` mechanism (commit 0c31479).
+    pub pending_cache_invalidations: Vec<u32>,
+    /// Region-scoped bulk-invalidation bitmask. Set by
+    /// [`Self::load_bootrom`] (bit [`invalidation_regions::ROM`]),
+    /// [`Self::load_flash`] (bit [`invalidation_regions::XIP`]), and ISB
+    /// execution (bit [`invalidation_regions::BULK`]) when a write has
+    /// replaced executable bytes wholesale. The driver drains the mask
+    /// by calling
+    /// [`crate::core::CortexM0Plus::invalidate_decode_cache_regions`] on
+    /// each core and then resets it to `0`.
+    pub pending_invalidation_regions: u8,
 }
 
 impl Bus {
@@ -427,6 +531,10 @@ impl Bus {
             mmio_trace_enabled: false,
             active_pc: [0; 2],
             mmio_trace_sink: None,
+            // 16 entries up front — STM tops out at 13 registers; 16
+            // covers a worst-case STM PC-rewrite without reallocation.
+            pending_cache_invalidations: Vec::with_capacity(16),
+            pending_invalidation_regions: 0,
         }
     }
 
@@ -557,6 +665,10 @@ impl Bus {
     /// is always 2 MB so reads past the image length return 0.
     pub fn load_flash(&mut self, data: &[u8]) {
         self.memory.load_flash(data);
+        // XIP / XIP-SRAM share region nibble 0x1 in the cache region
+        // mask, so a flash reload invalidates any cached entry that
+        // tagged into either window.
+        self.pending_invalidation_regions |= invalidation_regions::XIP;
     }
 
     // --- Bus-fault plumbing -----------------------------------------------
@@ -618,6 +730,30 @@ impl Bus {
 
     pub fn load_bootrom(&mut self, data: &[u8]) {
         self.memory.load_rom(data);
+        self.pending_invalidation_regions |= invalidation_regions::ROM;
+    }
+
+    /// Queue cache invalidations covering `[addr, addr+len)` on the
+    /// per-core decode caches. `len` is 1, 2, or 4 bytes. Pushes into
+    /// [`Self::pending_cache_invalidations`]; the driver
+    /// (`Emulator::step_serial`) drains it into the core that just ran.
+    /// Mirrors the mdrp2350 pattern (commit 0c31479).
+    ///
+    /// The drainer
+    /// ([`crate::core::CortexM0Plus::invalidate_decode_cache_entries`])
+    /// evicts both the slot for `addr` and the slot for `addr - 2`
+    /// (covering a wide instruction whose `hw1` landed at `addr`). For
+    /// a 4-byte write we push `{addr, addr+2}` so the combined
+    /// per-slot coverage is `{addr-2, addr, addr+2}`.
+    #[inline]
+    fn invalidate_pc_range(&mut self, addr: u32, len: u8) {
+        debug_assert!(len == 1 || len == 2 || len == 4);
+        if matches!(addr >> 28, 0x0..=0x2) {
+            self.pending_cache_invalidations.push(addr);
+            if len == 4 {
+                self.pending_cache_invalidations.push(addr.wrapping_add(2));
+            }
+        }
     }
 
     // --- Latency helpers --------------------------------------------------
@@ -1147,6 +1283,7 @@ impl Bus {
         match region {
             0x1 if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END => {
                 self.xip_sram_write(addr, val as u32, 1);
+                self.invalidate_pc_range(addr, 1);
             }
             0x2 => {
                 let off = addr & 0x00FF_FFFF;
@@ -1157,6 +1294,7 @@ impl Bus {
                     // §2.1.2 calls out alias bits [25:24] as bank-striping
                     // flavours for DMA, not peripheral XOR/SET/CLR.
                     self.memory.sram_write8(off, val);
+                    self.invalidate_pc_range(addr, 1);
                 } else {
                     self.set_bus_fault(addr);
                 }
@@ -1251,6 +1389,7 @@ impl Bus {
         match region {
             0x1 if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END => {
                 self.xip_sram_write(addr, val as u32, 2);
+                self.invalidate_pc_range(addr, 2);
             }
             0x2 => {
                 let off = addr & 0x00FF_FFFF;
@@ -1259,6 +1398,7 @@ impl Bus {
                     // All four SRAM alias windows map to the same storage
                     // (RP2040 datasheet §2.1.2).
                     self.memory.sram_write16(off, val);
+                    self.invalidate_pc_range(addr, 2);
                 } else {
                     self.set_bus_fault(addr);
                 }
@@ -1347,6 +1487,7 @@ impl Bus {
         match region {
             0x1 if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END => {
                 self.xip_sram_write(addr, val, 4);
+                self.invalidate_pc_range(addr, 4);
             }
             0x1 => {
                 // Region 0x1 at XIP_CTRL (0x1400_0000) or SSI (0x1800_0000).
@@ -1365,6 +1506,7 @@ impl Bus {
                     // All four SRAM alias windows map to the same storage
                     // (RP2040 datasheet §2.1.2).
                     self.memory.sram_write32(off, val);
+                    self.invalidate_pc_range(addr, 4);
                 } else {
                     self.set_bus_fault(addr);
                 }
@@ -1753,16 +1895,21 @@ impl Bus {
         self.dma = dma;
     }
 
-    /// Advance every stateful peripheral by one system-clock cycle.
+    /// Advance every stateful peripheral by `cycles` system-clock cycles.
     ///
-    /// Called from the slow-path loop in [`crate::Emulator::step`]
+    /// Called from the slow-path branch in [`crate::Emulator::step`]
     /// whenever the fast-path gate opens (PIO active, DMA live, or an
     /// IRQ already pending). TIMER alarms are polled here for lazy-
     /// fire at match. UART/SPI/I2C advance their TX shift registers
-    /// by one sysclk via `tick(1, clock_tree, irqs)` and OR any
-    /// level-driven IRQs into `irq_pending`.
+    /// by `cycles` sysclks via `tick(cycles, clock_tree, irqs)` and OR
+    /// any level-driven IRQs into `irq_pending`.
+    ///
+    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum advance
+    /// replaces the previous per-cycle interleave. `tick_dma` still
+    /// runs once per quantum at the tail to preserve the "peripherals
+    /// produce DREQ, then DMA consumes the snapshot" ordering.
     #[inline]
-    pub fn tick_peripherals(&mut self) {
+    pub fn tick_peripherals(&mut self, cycles: u32) {
         // TIMER alarms are lazy-fire at match: `poll_alarms` is cheap
         // (four armed-bit checks) and we run it here so firmware
         // stepping in the slow path observes alarm-match IRQs on the
@@ -1772,19 +1919,20 @@ impl Bus {
             .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
         // TIMER IRQs occupy NVIC lines 0..3.
         self.irq_pending |= nvic_bits & 0xF;
-        // UART / SPI / I2C: per-cycle TX drain + IRQ route.
-        self.uart0.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.uart1.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.spi0.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.spi1.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.i2c0.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.i2c1.tick(1, &self.clock_tree, &mut self.irq_pending);
+        // UART / SPI / I2C: chunked TX drain + IRQ route.
+        self.uart0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.uart1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.spi0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.spi1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.i2c0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.i2c1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // ADC: fixed-point clk_adc accumulator advances via tick.
-        self.adc.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.adc.tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // PWM: per-slice counter advance + wrap-IRQ latch.
-        self.pwm.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.pwm.tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // DMA ticks LAST per HLD V7 §5.6 ordering contract — peripherals
-        // produce DREQ on this cycle, DMA snapshots + consumes.
+        // produce DREQ on this cycle, DMA snapshots + consumes. Stays
+        // once per quantum; mirrors RP2350.
         self.tick_dma();
     }
 
