@@ -1,0 +1,90 @@
+#!/bin/bash
+# Overnight hardware probe fuzz driver against real RP2040 silicon (Pico V1).
+# No --cycles analogue exists on this target: M0+ has no DWT CYCCNT, so the
+# probe_diff_rp2040 binary is ISA-state-only by construction.
+#
+# Optional argument $1: probe selector (VID:PID:SERIAL) for when two probes
+# are attached. When omitted, auto_attach picks the only visible probe.
+#
+# Exit-code handling (HLD: 2026.04.26 - HLD - Probe Driver Hardening V1.md §4):
+#   rc=0 — clean batch, continue, reset CONSEC.
+#   rc=1 — real failure ([FAIL] context already in log), continue, reset CONSEC.
+#   rc=2 — probe attach failed at startup. Back off 30s. Bumps CONSEC.
+#   rc=3 — degraded batch (>=25% transport-skip). Back off 60s. Bumps CONSEC.
+#   other — unexpected (signal, panic). Logged, no back-off, no CONSEC bump.
+# Cap: 5 consecutive transport-faults (rc=2 or rc=3) → driver exits FATAL.
+LOG="fuzz-runs/m0plus-probe.log"
+BATCH=0
+CONSEC=0
+: > "$LOG"
+# Read deadline once at start. If the file vanishes mid-run we still
+# keep going for the full window we captured here.
+DEADLINE="$(cat "fuzz-runs/deadline" 2>/dev/null)"
+if [ -z "$DEADLINE" ]; then
+  DEADLINE=$(( $(date +%s) + 28800 ))
+fi
+PROBE_ARGS=()
+if [ -n "$1" ]; then
+  PROBE_ARGS=(--probe "$1")
+fi
+echo "=== PROBE driver deadline=$DEADLINE ($(date -d @$DEADLINE -Iseconds)) ===" >> "$LOG"
+# Run from a PID-qualified copy so concurrent cargo builds can still
+# overwrite target/release/probe_diff_rp2040.exe while we fuzz (Windows
+# holds an exclusive lock on a running .exe).
+#
+# BIN may be overridden via env (used only by wrk_scratch/test_driver_rc_handling.sh
+# to point at a stub binary); when overridden, skip the cp+trap.
+if [ -n "${BIN:-}" ]; then
+  : "BIN provided externally — skip stage copy"
+else
+  BIN="fuzz-runs/probe_diff_rp2040.$$.exe"
+  cp -f target/release/probe_diff_rp2040.exe "$BIN" || {
+    echo "=== FATAL: target/release/probe_diff_rp2040.exe missing or unreadable ===" >> "$LOG"
+    exit 1
+  }
+  trap 'rm -f "$BIN"' EXIT
+fi
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  BATCH=$((BATCH+1))
+  SEED="$RANDOM$RANDOM$RANDOM"
+  {
+    echo ""
+    echo "=== PROBE batch=$BATCH seed=$SEED start=$(date -Iseconds) ==="
+  } >> "$LOG"
+  "$BIN" \
+    --fuzz 200 --seed "$SEED" "${PROBE_ARGS[@]}" >> "$LOG" 2>&1
+  rc=$?
+  echo "=== PROBE batch=$BATCH seed=$SEED end=$(date -Iseconds) rc=$rc ===" >> "$LOG"
+
+  # Track consecutive transport-related rcs (2 or 3). Reset on rc=0 / rc=1.
+  case "$rc" in
+    0)
+      CONSEC=0
+      ;;
+    1)
+      # Real failure — leave loop policy unchanged (binary already exited
+      # with the [FAIL] context; failure-monitor will catch it).
+      CONSEC=0
+      ;;
+    2)
+      CONSEC=$((CONSEC + 1))
+      echo "=== PROBE rc=2 (probe attach failed) backoff=30s consec=$CONSEC at $(date -Iseconds) ===" >> "$LOG"
+      sleep 30
+      ;;
+    3)
+      CONSEC=$((CONSEC + 1))
+      echo "=== PROBE rc=3 (degraded batch) backoff=60s consec=$CONSEC at $(date -Iseconds) ===" >> "$LOG"
+      sleep 60
+      ;;
+    *)
+      # Anything else is unexpected; log and continue, do not back off.
+      echo "=== PROBE rc=$rc (unexpected) consec=$CONSEC at $(date -Iseconds) ===" >> "$LOG"
+      ;;
+  esac
+
+  if [ "$CONSEC" -ge 5 ]; then
+    echo "=== PROBE FATAL: consec=$CONSEC transport-faults; aborting driver at $(date -Iseconds) ===" >> "$LOG"
+    exit 1
+  fi
+done
+echo "=== PROBE deadline reached at $(date -Iseconds), batches=$BATCH ===" >> "$LOG"

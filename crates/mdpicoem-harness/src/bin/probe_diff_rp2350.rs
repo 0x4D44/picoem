@@ -407,6 +407,7 @@ fn run_targeted(
                 );
             }
             Err(DiffError::ProbeError(e)) => {
+                // counter directly drives rc=3 — do not increment from filter rejections; funnel those through a new variant or pre-loop drop.
                 skip += 1;
                 eprintln!("[SKIP] {}: probe-rs error: {e}", tc.name);
             }
@@ -416,8 +417,16 @@ fn run_targeted(
     let elapsed = t0.elapsed();
     print_summary("targeted", pass, fail, skip, cycle_mismatches, args.cycles, elapsed);
 
-    if fail > 0 {
-        std::process::exit(1);
+    let rc = rc_for(pass, fail, skip);
+    if rc == 3 {
+        let attempted = pass + fail + skip;
+        let pct = (skip * 100) / attempted;
+        eprintln!(
+            "=== DEGRADED: {skip}/{attempted} cases skipped ({pct}%); probe transport unstable, exiting rc=3 ==="
+        );
+    }
+    if rc != 0 {
+        std::process::exit(rc);
     }
     Ok(())
 }
@@ -471,6 +480,7 @@ fn run_fuzz(
                 );
             }
             Err(DiffError::ProbeError(e)) => {
+                // counter directly drives rc=3 — do not increment from filter rejections; funnel those through a new variant or pre-loop drop.
                 skip += 1;
                 eprintln!("[SKIP] {}: probe-rs error: {e}", tc.name);
             }
@@ -486,8 +496,16 @@ fn run_fuzz(
         }
     }
 
-    if fail > 0 {
-        std::process::exit(1);
+    let rc = rc_for(pass, fail, skip);
+    if rc == 3 {
+        let attempted = pass + fail + skip;
+        let pct = (skip * 100) / attempted;
+        eprintln!(
+            "=== DEGRADED: {skip}/{attempted} cases skipped ({pct}%); probe transport unstable, exiting rc=3 ==="
+        );
+    }
+    if rc != 0 {
+        std::process::exit(rc);
     }
     Ok(())
 }
@@ -548,6 +566,20 @@ fn run_one_diff(
 // ============================================================================
 // Summary
 // ============================================================================
+
+/// Map post-run counters to a process exit code.
+///
+/// Order of precedence: rc=1 (any failure) > rc=3 (degraded transport) > rc=0.
+/// rc=3 fires only when at least 20 cases were attempted AND at least 25% of
+/// them ended in `[SKIP]` (probe-rs transport errors). See HLD §3.
+fn rc_for(pass: usize, fail: usize, skip: usize) -> i32 {
+    if fail > 0 { return 1; }
+    let attempted = pass + fail + skip;
+    if attempted >= 20 && (skip * 100) / attempted >= 25 {
+        return 3;
+    }
+    0
+}
 
 fn print_summary(
     mode: &str,
@@ -618,5 +650,46 @@ mod tests {
     fn probe_flag_absent_leaves_probe_none() {
         let args = parse(&["--fuzz", "10"]).expect("parse");
         assert!(args.probe.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // rc_for — degraded-mode exit-code mapping
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rc_for_clean_run_returns_zero() {
+        assert_eq!(rc_for(8000, 0, 0), 0);
+    }
+
+    #[test]
+    fn rc_for_any_failures_returns_one() {
+        // A single failure dominates a sea of passes.
+        assert_eq!(rc_for(7999, 1, 0), 1);
+        // Failure beats degraded — 6000 skips and 0 passes still rc=1 if any fail.
+        assert_eq!(rc_for(0, 1, 6000), 1);
+    }
+
+    #[test]
+    fn rc_for_high_skip_returns_three() {
+        // 2026-04-25 08:51 incident: 1885 passed, 0 failed, 6115 skipped (~76%).
+        assert_eq!(rc_for(1885, 0, 6115), 3);
+    }
+
+    #[test]
+    fn rc_for_borderline_skip_below_threshold() {
+        // Cascade-2 trigger batch: 7169 passed, 0 failed, 831 skipped (~10.4%) — below 25%.
+        assert_eq!(rc_for(7169, 0, 831), 0);
+    }
+
+    #[test]
+    fn rc_for_small_attempted_does_not_trip() {
+        // Sanity floor: < 20 attempted cases never trips rc=3.
+        assert_eq!(rc_for(0, 0, 5), 0);
+    }
+
+    #[test]
+    fn rc_for_exactly_at_threshold() {
+        // 75 + 0 + 25 = 100 attempted; 25/100 = 25% — boundary inclusive.
+        assert_eq!(rc_for(75, 0, 25), 3);
     }
 }

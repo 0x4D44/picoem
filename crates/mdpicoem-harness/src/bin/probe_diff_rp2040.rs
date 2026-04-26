@@ -516,6 +516,7 @@ fn run_targeted(core: &mut Core) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             Err(DiffError::ProbeError(e)) => {
+                // counter directly drives rc=3 — do not increment from filter rejections; funnel those through a new variant or pre-loop drop.
                 skip += 1;
                 eprintln!("[SKIP] {}: probe-rs error: {e}", tc.name);
             }
@@ -532,8 +533,16 @@ fn run_targeted(core: &mut Core) -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = t0.elapsed();
     print_summary("targeted", pass, fail, skip, undef, elapsed);
 
-    if fail > 0 || undef > 0 {
-        std::process::exit(1);
+    let rc = rc_for(pass, fail, skip, undef);
+    if rc == 3 {
+        let attempted = pass + fail + skip + undef;
+        let pct = (skip * 100) / attempted;
+        eprintln!(
+            "=== DEGRADED: {skip}/{attempted} cases skipped ({pct}%); probe transport unstable, exiting rc=3 ==="
+        );
+    }
+    if rc != 0 {
+        std::process::exit(rc);
     }
     Ok(())
 }
@@ -589,6 +598,7 @@ fn run_fuzz(
                 );
             }
             Err(DiffError::ProbeError(e)) => {
+                // counter directly drives rc=3 — do not increment from filter rejections; funnel those through a new variant or pre-loop drop.
                 skip += 1;
                 eprintln!("[SKIP] {}: probe-rs error: {e}", tc.name);
             }
@@ -605,9 +615,22 @@ fn run_fuzz(
     let elapsed = t0.elapsed();
     print_summary("fuzz", pass, fail, skip, undef, elapsed);
     println!("Seed: {seed}");
-    if fail > 0 || undef > 0 {
+    // Preserve pre-existing semantics: any UNDEF-on-silicon escalates to rc=1
+    // (filter-gap is treated as a hard failure, since it indicates the M0+
+    // safety filter let an unsupported encoding through to silicon).
+    let rc = if undef > 0 { 1 } else { rc_for(pass, fail, skip, undef) };
+    if rc == 1 {
         println!("Reproduce: probe_diff_rp2040 --fuzz {count_per_class} --seed {seed}");
-        std::process::exit(1);
+    }
+    if rc == 3 {
+        let attempted = pass + fail + skip + undef;
+        let pct = (skip * 100) / attempted;
+        eprintln!(
+            "=== DEGRADED: {skip}/{attempted} cases skipped ({pct}%); probe transport unstable, exiting rc=3 ==="
+        );
+    }
+    if rc != 0 {
+        std::process::exit(rc);
     }
     Ok(())
 }
@@ -653,6 +676,26 @@ fn run_one_diff(
 // ============================================================================
 // Summary
 // ============================================================================
+
+/// Map post-run counters to a process exit code.
+///
+/// Order of precedence: rc=1 (any failure or UNDEF-on-silicon) > rc=3
+/// (degraded transport) > rc=0. UNDEF-on-silicon is treated as a hard
+/// failure here because it indicates the M0+ safety filter let an
+/// unsupported encoding through to silicon — a filter-gap signal, not a
+/// transport-stability signal. `attempted` includes `undef` so the rc=3
+/// percentage is over the full set of probe steps, but the threshold
+/// numerator uses `skip` only. rc=3 fires only when at least 20 cases were
+/// attempted AND at least 25% of them ended in `[SKIP]` (probe-rs transport
+/// errors). At exactly 25%, rc=3 trips (e.g. 25/100 → rc=3). See HLD §3.
+fn rc_for(pass: usize, fail: usize, skip: usize, undef: usize) -> i32 {
+    if fail > 0 || undef > 0 { return 1; }
+    let attempted = pass + fail + skip + undef;
+    if attempted >= 20 && (skip * 100) / attempted >= 25 {
+        return 3;
+    }
+    0
+}
 
 fn print_summary(
     mode: &str,
@@ -952,6 +995,55 @@ mod tests {
         // POP {PC} with stack garbage lands at some non-bootrom address;
         // let `compare_probe` flag it semantically rather than UNDEF-classify.
         assert_eq!(classify_post_step_pc(EMU_M0PLUS_TEST_STACK + 0x100), None);
+    }
+
+    // -----------------------------------------------------------------
+    // rc_for — degraded-mode exit-code mapping
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rc_for_clean_run_returns_zero() {
+        assert_eq!(rc_for(8000, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn rc_for_any_failures_returns_one() {
+        // A single failure dominates a sea of passes.
+        assert_eq!(rc_for(7999, 1, 0, 0), 1);
+        // Failure beats degraded — 6000 skips and 0 passes still rc=1 if any fail.
+        assert_eq!(rc_for(0, 1, 6000, 0), 1);
+    }
+
+    #[test]
+    fn rc_for_undef_returns_one() {
+        // UNDEF-on-silicon is filter-gap escape — treated as hard failure.
+        assert_eq!(rc_for(0, 0, 0, 5), 1);
+        // Even alongside high skip, undef wins (rc=1 dominates).
+        assert_eq!(rc_for(1000, 0, 6000, 1), 1);
+    }
+
+    #[test]
+    fn rc_for_high_skip_returns_three() {
+        // 2026-04-25 08:51 incident: 1885 passed, 0 failed, 6115 skipped (~76%).
+        assert_eq!(rc_for(1885, 0, 6115, 0), 3);
+    }
+
+    #[test]
+    fn rc_for_borderline_skip_below_threshold() {
+        // Cascade-2 trigger batch: 7169 passed, 0 failed, 831 skipped (~10.4%) — below 25%.
+        assert_eq!(rc_for(7169, 0, 831, 0), 0);
+    }
+
+    #[test]
+    fn rc_for_small_attempted_does_not_trip() {
+        // Sanity floor: < 20 attempted cases never trips rc=3.
+        assert_eq!(rc_for(0, 0, 5, 0), 0);
+    }
+
+    #[test]
+    fn rc_for_exactly_at_threshold() {
+        // 75 + 0 + 25 = 100 attempted; 25/100 = 25% — boundary inclusive.
+        assert_eq!(rc_for(75, 0, 25, 0), 3);
     }
 
     #[test]

@@ -39,5 +39,13 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     --fuzz 200 --seed "$SEED" "${PROBE_ARGS[@]}" >> "$LOG" 2>&1
   rc=$?
   echo "=== PROBE batch=$BATCH seed=$SEED end=$(date -Iseconds) rc=$rc ===" >> "$LOG"
+  # rc=2 means probe creation failed — almost always a transient WinUSB
+  # endpoint-busy state after a USB blip. Retrying instantly burns dozens
+  # of seeds per minute through dead attaches, so back off and let the
+  # endpoint clear before the next attempt.
+  if [ "$rc" -eq 2 ]; then
+    echo "=== PROBE rc=2 detected; backing off 30s before next batch ===" >> "$LOG"
+    sleep 30
+  fi
 done
 echo "=== PROBE deadline reached at $(date -Iseconds), batches=$BATCH ===" >> "$LOG"
