@@ -17,17 +17,7 @@ use crate::{Arch, Bus, Config, Cores, EmulatorBuilder};
 
 // ---------- helpers ----------
 
-fn fresh() -> (Hazard3, Bus) {
-    (Hazard3::new(0), Bus::new())
-}
-
-fn write_insn(bus: &mut Bus, sram_offset: u32, insn: u32) {
-    bus.memory.sram_write32(sram_offset, insn);
-}
-
-fn write_hw(bus: &mut Bus, sram_offset: u32, hw: u16) {
-    bus.memory.sram_write16(sram_offset, hw);
-}
+use super::tests_common::{fresh, write_hw, write_insn};
 
 // =====================================================================
 // decode.rs branch coverage

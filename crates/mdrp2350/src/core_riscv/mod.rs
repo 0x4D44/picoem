@@ -13,6 +13,8 @@ pub(crate) mod execute;
 pub(crate) mod irq;
 
 #[cfg(test)]
+mod tests_common;
+#[cfg(test)]
 mod tests_p2;
 #[cfg(test)]
 mod tests_p3;

@@ -57,10 +57,7 @@ struct Args {
     probe: Option<DebugProbeSelector>,
 }
 
-fn parse_probe_selector(s: &str) -> Result<DebugProbeSelector, String> {
-    DebugProbeSelector::try_from(s)
-        .map_err(|e| format!("invalid probe selector '{s}': {e}"))
-}
+use mdpicoem_harness::cli::parse_probe_selector;
 
 fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     let args: Vec<String> = argv.into_iter().collect();

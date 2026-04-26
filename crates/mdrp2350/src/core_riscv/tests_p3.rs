@@ -26,17 +26,7 @@ use crate::Bus;
 
 // ---------- helpers ----------
 
-fn fresh() -> (Hazard3, Bus) {
-    (Hazard3::new(0), Bus::new())
-}
-
-fn write_insn(bus: &mut Bus, sram_offset: u32, insn: u32) {
-    bus.memory.sram_write32(sram_offset, insn);
-}
-
-fn write_hw(bus: &mut Bus, sram_offset: u32, hw: u16) {
-    bus.memory.sram_write16(sram_offset, hw);
-}
+use super::tests_common::{fresh, write_hw, write_insn};
 
 // R-type encoder — matches tests_p2.
 fn enc_r(opcode: u32, rd: u8, f3: u32, rs1: u8, rs2: u8, f7: u32) -> u32 {

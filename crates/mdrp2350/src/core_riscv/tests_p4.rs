@@ -22,9 +22,7 @@ use crate::{Arch, Bus, Config, Cores, EmulatorBuilder};
 
 // ---------- helpers ----------
 
-fn fresh() -> (Hazard3, Bus) {
-    (Hazard3::new(0), Bus::new())
-}
+use super::tests_common::fresh;
 
 /// CSR-write a CSR via the `Op::Csr` path (csrrw; rs1 register set to rv).
 fn csr_write(c: &mut Hazard3, bus: &mut Bus, csr: u16, val: u32) {

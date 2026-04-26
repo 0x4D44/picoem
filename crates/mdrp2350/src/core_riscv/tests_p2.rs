@@ -11,18 +11,7 @@ use super::decode::{self, AluImmKind, AluKind, BranchKind, CsrKind, LoadKind, Op
 use super::Hazard3;
 use crate::Bus;
 
-// Helper: construct a Hazard3 and a Bus with SRAM seeded at 0x2000_0000.
-// The executor tests load instruction words into SRAM and step the
-// hart with its reset PC still pointing at 0x2000_0000.
-fn fresh() -> (Hazard3, Bus) {
-    (Hazard3::new(0), Bus::new())
-}
-
-// Write a 32-bit instruction into SRAM at `sram_offset` (offset from
-// 0x2000_0000 / SRAM base).
-fn write_insn(bus: &mut Bus, sram_offset: u32, insn: u32) {
-    bus.memory.sram_write32(sram_offset, insn);
-}
+use super::tests_common::{fresh, write_insn};
 
 // Encode an R-type.
 fn enc_r(opcode: u32, rd: u8, f3: u32, rs1: u8, rs2: u8, f7: u32) -> u32 {

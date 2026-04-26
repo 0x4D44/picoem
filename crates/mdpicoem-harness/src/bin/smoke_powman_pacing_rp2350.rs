@@ -62,9 +62,7 @@ struct Args {
     probe: Option<DebugProbeSelector>,
 }
 
-fn parse_probe_selector(s: &str) -> Result<DebugProbeSelector, String> {
-    DebugProbeSelector::try_from(s).map_err(|e| format!("invalid probe selector '{s}': {e}"))
-}
+use mdpicoem_harness::cli::parse_probe_selector;
 
 fn parse_args() -> Result<Args, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();

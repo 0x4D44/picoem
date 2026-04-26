@@ -42,6 +42,7 @@ pub fn default_out_path(trace: &Path) -> PathBuf {
 }
 
 pub mod bank_conflict_cases;
+pub mod cli;
 pub mod cycle_cases;
 pub mod dualcore_cases;
 pub mod gdb_client;

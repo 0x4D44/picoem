@@ -325,7 +325,10 @@ impl Emulator {
         if let Some(t) = &self.threaded {
             return t.core_cycles(idx);
         }
-        self.cores[idx as usize].cycles()
+        match idx {
+            0 | 1 => self.cores[idx as usize].cycles(),
+            _ => panic!("core_cycles: idx must be 0 or 1"),
+        }
     }
 
     /// Placeholder-guard message shared by the typed accessors below.
