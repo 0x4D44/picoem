@@ -1888,16 +1888,21 @@ impl Bus {
         self.dma = dma;
     }
 
-    /// Advance every stateful peripheral by one system-clock cycle.
+    /// Advance every stateful peripheral by `cycles` system-clock cycles.
     ///
-    /// Called from the slow-path loop in [`crate::Emulator::step`]
+    /// Called from the slow-path branch in [`crate::Emulator::step`]
     /// whenever the fast-path gate opens (PIO active, DMA live, or an
     /// IRQ already pending). TIMER alarms are polled here for lazy-
     /// fire at match. UART/SPI/I2C advance their TX shift registers
-    /// by one sysclk via `tick(1, clock_tree, irqs)` and OR any
-    /// level-driven IRQs into `irq_pending`.
+    /// by `cycles` sysclks via `tick(cycles, clock_tree, irqs)` and OR
+    /// any level-driven IRQs into `irq_pending`.
+    ///
+    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum advance
+    /// replaces the previous per-cycle interleave. `tick_dma` still
+    /// runs once per quantum at the tail to preserve the "peripherals
+    /// produce DREQ, then DMA consumes the snapshot" ordering.
     #[inline]
-    pub fn tick_peripherals(&mut self) {
+    pub fn tick_peripherals(&mut self, cycles: u32) {
         // TIMER alarms are lazy-fire at match: `poll_alarms` is cheap
         // (four armed-bit checks) and we run it here so firmware
         // stepping in the slow path observes alarm-match IRQs on the
@@ -1907,19 +1912,20 @@ impl Bus {
             .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
         // TIMER IRQs occupy NVIC lines 0..3.
         self.irq_pending |= nvic_bits & 0xF;
-        // UART / SPI / I2C: per-cycle TX drain + IRQ route.
-        self.uart0.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.uart1.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.spi0.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.spi1.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.i2c0.tick(1, &self.clock_tree, &mut self.irq_pending);
-        self.i2c1.tick(1, &self.clock_tree, &mut self.irq_pending);
+        // UART / SPI / I2C: chunked TX drain + IRQ route.
+        self.uart0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.uart1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.spi0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.spi1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.i2c0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.i2c1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // ADC: fixed-point clk_adc accumulator advances via tick.
-        self.adc.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.adc.tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // PWM: per-slice counter advance + wrap-IRQ latch.
-        self.pwm.tick(1, &self.clock_tree, &mut self.irq_pending);
+        self.pwm.tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // DMA ticks LAST per HLD V7 §5.6 ordering contract — peripherals
-        // produce DREQ on this cycle, DMA snapshots + consumes.
+        // produce DREQ on this cycle, DMA snapshots + consumes. Stays
+        // once per quantum; mirrors RP2350.
         self.tick_dma();
     }
 

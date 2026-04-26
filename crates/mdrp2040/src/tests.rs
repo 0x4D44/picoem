@@ -4815,7 +4815,7 @@ mod stage2_bus_coverage {
         bus.seed_sys_clk_hz(125_000_000);
         // Advance peripherals a bit to let ADC produce a sample.
         for _ in 0..500 {
-            bus.tick_peripherals();
+            bus.tick_peripherals(1);
         }
 
         // Push into each peripheral's RX to drive rx_dreq bits.

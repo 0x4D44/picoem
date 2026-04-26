@@ -231,8 +231,10 @@ pub struct Emulator {
     /// Cycles advanced per call to [`Self::step`].
     pub step_quantum: u32,
     /// Total PIO ticks performed in the slow path
-    /// (`tick_pio_and_route_irqs_single`). Diagnostic-only — used by the
+    /// (`tick_pio_and_route_irqs`). Diagnostic-only — used by the
     /// PicoGUS harness to confirm PIO is actually being driven.
+    /// Bumps by `cycles` per quantum after HLD 2026.04.26 V5 chunked
+    /// refactor (per-quantum granularity is acceptable).
     pub pio_tick_count: u64,
     /// Subset of [`Self::pio_tick_count`] where bit 4 (IOW for PicoGUS)
     /// of `bus.gpio_in` was low at the moment of the tick. If this stays
@@ -250,7 +252,7 @@ pub struct Emulator {
     /// previous-tick value (advanced or jumped). Slow-path-only.
     pub pio0_sm0_pc_advances: u64,
     /// Last observed PC of PIO0 SM0 — internal scratch used by
-    /// [`Self::tick_pio_and_route_irqs_single`] to decide whether the
+    /// [`Self::tick_pio_and_route_irqs`] to decide whether the
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
     pub(crate) pio0_sm0_last_pc: u8,
@@ -647,6 +649,14 @@ impl Emulator {
         let start = self.clock.cycles;
         let target = start.wrapping_add(self.step_quantum as u64);
 
+        // Per HLD 2026.04.26 V5 §5.2.3: accumulate per-core cycle counts
+        // across the inner loop so the slow-branch SysTick advance
+        // mirrors per-core hardware semantics (each core's SysTick
+        // decrements on its own consumed cycles, not on the active-core
+        // shared register).
+        let mut c0_total: u64 = 0;
+        let mut c1_total: u64 = 0;
+
         while self.clock.cycles < target
             && (!self.cores[0].is_halted() || !self.cores[1].is_halted())
         {
@@ -684,6 +694,8 @@ impl Emulator {
             if c0 == 0 && c1 == 0 {
                 break;
             }
+            c0_total = c0_total.wrapping_add(c0);
+            c1_total = c1_total.wrapping_add(c1);
             self.clock.cycles = self.clock.cycles.wrapping_add(c0.max(c1));
         }
 
@@ -727,26 +739,21 @@ impl Emulator {
             self.drain_pending_irqs_to_cores();
             self.update_gpio();
         } else {
-            for _ in 0..consumed {
-                // Advance the master-cycle cache one tick so per-cycle
-                // `tick_peripherals` sees a fresh `now` each iteration;
-                // TIMER's alarm poll only fires on >= match so a stale
-                // snapshot would quietly postpone the IRQ.
-                self.bus.master_cycle = self.bus.master_cycle.wrapping_add(1);
-                self.bus.tick_peripherals();
-                // HLD V5 §5.2: tick the active-core SysTick once per
-                // master cycle, after `tick_peripherals` (so peripheral
-                // side-effects from this cycle are visible) and before
-                // `drain_pending_irqs_to_cores` (so a SysTick-asserted
-                // ICSR.PENDSTSET observation aligns with this cycle).
-                let active = self.bus.active_core();
-                if self.bus.systicks[active].tick() {
-                    self.bus.ppb[active].icsr |= 1 << 26;
-                }
-                self.tick_pio_and_route_irqs_single();
-                self.update_gpio();
-                self.drain_pending_irqs_to_cores();
-            }
+            // Per HLD 2026.04.26 V5 §5.3: chunked once-per-quantum slow
+            // branch. `master_cycle` advances by `consumed` BEFORE
+            // `tick_peripherals` so TIMER's alarm `>=` poll sees the
+            // window's end-of-quantum cycle. SysTick advances per-core
+            // by each core's actual consumed cycle count (mirrors M0+
+            // hardware: SysTick is per-core, decremented on the cycles
+            // the owning core consumes — see §5.2.3). PIO and IRQ drain
+            // run once at quantum end; net IRQ-delivery latency grows
+            // from ≤1 cycle to ≤step_quantum-1 cycles (see §5.4).
+            self.bus.master_cycle = self.bus.master_cycle.wrapping_add(consumed);
+            self.bus.tick_peripherals(consumed as u32);
+            self.tick_systick(c0_total as u32, c1_total as u32);
+            self.tick_pio_and_route_irqs(consumed as u32);
+            self.update_gpio();
+            self.drain_pending_irqs_to_cores();
         }
         self.wake_checks();
         consumed
@@ -773,8 +780,28 @@ impl Emulator {
         }
     }
 
-    /// Step both PIO blocks by exactly one system clock and route
-    /// their IRQ flags into [`Bus::irq_pending`].
+    /// Per HLD 2026.04.26 V5 §5.2.3: advance each core's SysTick by
+    /// its own consumed cycle count for this quantum. Mirrors M0+
+    /// hardware semantics — SysTick is per-core, the active-core
+    /// `Bus` field is just a banked-MMIO selector, not a tick gate.
+    /// PENDSTSET (`ICSR[26]`) latches per-core; `drain_pending_irqs_to_cores`
+    /// runs after this call so the SysTick handler is taken on the
+    /// next quantum boundary.
+    fn tick_systick(&mut self, c0: u32, c1: u32) {
+        for _ in 0..c0 {
+            if self.bus.systicks[0].tick() {
+                self.bus.ppb[0].icsr |= 1 << 26;
+            }
+        }
+        for _ in 0..c1 {
+            if self.bus.systicks[1].tick() {
+                self.bus.ppb[1].icsr |= 1 << 26;
+            }
+        }
+    }
+
+    /// Step both PIO blocks by `cycles` system clocks and route their
+    /// IRQ flags into [`Bus::irq_pending`].
     ///
     /// Per HLD V7 §5.5 + Appendix B, each PIO block has 8 internal
     /// Per-block 12-bit raw status (`IRQ[3:0]` + RXNEMPTY[3:0] +
@@ -784,14 +811,20 @@ impl Emulator {
     /// at NVIC #7/#8 and PIO1_IRQ_0/1 at NVIC #9/#10. PicoGUS firmware
     /// enables `RXNEMPTY_SM0` on PIO0 INT0_INTE so its ISA handler
     /// fires when an autopushed event lands in PIO0 SM0's RX FIFO.
-    fn tick_pio_and_route_irqs_single(&mut self) {
+    ///
+    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum.
+    fn tick_pio_and_route_irqs(&mut self, cycles: u32) {
         let gpio_in = self.bus.gpio_in;
-        self.pio_tick_count = self.pio_tick_count.wrapping_add(1);
+        // Diagnostic counters bump by `cycles` (per-quantum granularity is
+        // acceptable per HLD 2026.04.26 V5 §7 risk row "Per-cycle
+        // observation diagnostics under-count by quantum factor").
+        self.pio_tick_count = self.pio_tick_count.wrapping_add(cycles as u64);
         if gpio_in & (1u32 << 4) == 0 {
-            self.pio_tick_iow_low_count = self.pio_tick_iow_low_count.wrapping_add(1);
+            self.pio_tick_iow_low_count =
+                self.pio_tick_iow_low_count.wrapping_add(cycles as u64);
         }
-        self.bus.pio[0].step_n(1, gpio_in);
-        self.bus.pio[1].step_n(1, gpio_in);
+        self.bus.pio[0].step_n(cycles, gpio_in);
+        self.bus.pio[1].step_n(cycles, gpio_in);
         // Observe PIO0 SM0's PC after the step. Tracks max PC and the
         // number of times the PC differs from the prior observation
         // (counts both linear advances and jumps; sequential same-PC
