@@ -124,7 +124,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "{:<40} {:>8} {:>8}  {}",
         "scenario", "elapsed", "verdict", "first_divergence",
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(102));
 
     {
         let mut core = session.core(0)?;

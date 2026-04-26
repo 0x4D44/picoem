@@ -1729,7 +1729,13 @@ const RESETS_CLR_ALL: u32 = 0xFFFF_FFFF;
 /// Canonical per-slice PWM clean-state prefix for scenario setups.
 /// Gates every slice off, clears per-slice 0 CSR + CTR, and W1C-clears
 /// any latched wrap IRQs so a prior scenario's INTR bit can't leak.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "documentation anchor — scenarios inline the tuple sequence \
+             (Rust const-slice concat requires a macro). HLD V1 §4.1 names \
+             this constant as the canonical reference; scenario comments \
+             cite it by name."
+)]
 const PREFIX_PWM_SLICE0_CLEAN: &[(u32, u32)] = &[
     (PWM_EN_OFFSET, 0),
     (PWM_SLICE0_CSR, 0),
@@ -1740,7 +1746,12 @@ const PREFIX_PWM_SLICE0_CLEAN: &[(u32, u32)] = &[
 /// Canonical PIO0 hard-reset pulse for scenario setups. The assert+
 /// clear pair wipes `instr_mem[]`, all SM registers, FIFOs and
 /// `irq_flags` on silicon, leaving a known-zero peripheral.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "documentation anchor — scenarios inline the tuple sequence. \
+             HLD V1 §4.1 names this constant as the canonical reference; \
+             scenario comments cite it by name."
+)]
 const PREFIX_PIO0_HARD_RESET: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_SET, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
@@ -1749,7 +1760,12 @@ const PREFIX_PIO0_HARD_RESET: &[(u32, u32)] = &[
 /// Canonical UART0 hard-reset pulse. Wipes the TX / RX FIFOs, shift
 /// registers and CR state so a prior `S_UART0_TX_SINGLE_BYTE` can't
 /// leak its payload into the next scenario's RX FIFO.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "documentation anchor — scenarios inline the tuple sequence. \
+             HLD V1 §4.1 names this constant as the canonical reference; \
+             scenario comments cite it by name."
+)]
 const PREFIX_UART0_HARD_RESET: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_SET, RESET_UART0),
     (RESETS_RESET + ALIAS_CLR, RESET_UART0),

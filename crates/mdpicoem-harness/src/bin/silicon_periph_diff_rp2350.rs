@@ -131,7 +131,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut core = session.core(0)?;
 
     println!(
-        "{:<32} {:>6} {:>10} {:>7}  {}",
+        "{:<40} {:>6} {:>10} {:>7}  {}",
         "scenario", "sysclk", "runtime_ms", "verdict", "first_divergence",
     );
     println!("{}", "-".repeat(102));
@@ -146,7 +146,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             Verdict::Fail => fail += 1,
         }
         println!(
-            "{:<32} {:>6} {:>10.1} {:>7}  {}",
+            "{:<40} {:>6} {:>10.1} {:>7}  {}",
             r.name,
             r.actual_sysclks,
             r.elapsed.as_secs_f64() * 1000.0,

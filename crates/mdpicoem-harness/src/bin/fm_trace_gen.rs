@@ -385,9 +385,10 @@ mod tests {
             assert_eq!(cols.len(), 4, "line {lineno}: bad column count: {line}");
 
             // Column 0: u64 timestamp.
-            cols[0]
-                .parse::<u64>()
-                .unwrap_or_else(|_| panic!("line {lineno}: ns parse: {}", cols[0]));
+            cols[0].parse::<u64>().unwrap_or_else(|_| {
+                eprintln!("error: line {lineno}: ns parse: {}", cols[0]);
+                std::process::exit(2);
+            });
 
             // Column 1: 0x prefix, lowercase hex, exactly 3 digits.
             let port = cols[1];

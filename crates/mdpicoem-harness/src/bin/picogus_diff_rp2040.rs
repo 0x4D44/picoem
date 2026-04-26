@@ -1794,8 +1794,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // other builds, or `=0` to skip the patch entirely (letting the real
     // PSRAM test run — useful when debugging PSRAM itself).
     let stub_addr: u32 = match std::env::var("PICOGUS_STUB_TEST_PSRAM") {
-        Ok(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
-            .unwrap_or_else(|_| panic!("PICOGUS_STUB_TEST_PSRAM must be hex, got {s:?}")),
+        Ok(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+            eprintln!("error: PICOGUS_STUB_TEST_PSRAM must be hex, got {s:?}");
+            std::process::exit(2);
+        }),
         Err(_) => 0x2001_2FA4,
     };
     let mut uart_drain = UartDrain::new();
@@ -1832,8 +1834,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Patch = `MOVS R0, #0xFF; BX LR` (returns 0xFF → 16-bit signed
         // int +255 on left channel, 0 on right). Audible DC offset.
         let stub_gss_addr: u32 = match std::env::var("PICOGUS_STUB_GUS_SAMPLE_STEREO") {
-            Ok(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16)
-                .unwrap_or_else(|_| panic!("PICOGUS_STUB_GUS_SAMPLE_STEREO must be hex, got {s:?}")),
+            Ok(s) => u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+                eprintln!("error: PICOGUS_STUB_GUS_SAMPLE_STEREO must be hex, got {s:?}");
+                std::process::exit(2);
+            }),
             Err(_) => 0,
         };
         if stub_gss_addr != 0 {
@@ -2126,8 +2130,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // `b.n 20001036` instruction (0x20000cc6 in rebuild v1). `=0`
         // disables. Writes NOP (0xBF00) halfword.
         if let Ok(s) = std::env::var("PICOGUS_PATCH_BYPASS_GATE") {
-            let addr = u32::from_str_radix(s.trim_start_matches("0x"), 16)
-                .unwrap_or_else(|_| panic!("PICOGUS_PATCH_BYPASS_GATE must be hex, got {s:?}"));
+            let addr = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+                eprintln!("error: PICOGUS_PATCH_BYPASS_GATE must be hex, got {s:?}");
+                std::process::exit(2);
+            });
             if addr != 0 {
                 // 16-bit halfword write: keep the next halfword at +2 intact
                 // by reading it, then writing as a 32-bit word with low=0xBF00,

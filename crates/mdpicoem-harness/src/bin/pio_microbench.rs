@@ -73,7 +73,10 @@ fn parse_args() -> (u64, u32, u32) {
                 assert!((1..=4).contains(&sms), "--sms must be 1..=4");
                 i += 2;
             }
-            other => panic!("unknown arg: {other}"),
+            other => {
+                eprintln!("error: unknown arg: {other}");
+                std::process::exit(2);
+            }
         }
     }
     (cycles, step_q, sms)

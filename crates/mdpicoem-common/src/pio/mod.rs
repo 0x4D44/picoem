@@ -674,7 +674,7 @@ impl PioBlock {
                     occupancy = self.sm[3].tx_fifo.level(),
                     "txf_write",
                 );
-                if std::env::var("MDPIO_TXF_TRACE").is_ok() {
+                {
                     static COUNTER: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     static MAX_VAL: std::sync::atomic::AtomicU32 =
@@ -682,10 +682,14 @@ impl PioBlock {
                     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     MAX_VAL.fetch_max(val, std::sync::atomic::Ordering::Relaxed);
                     if val != 0 || n < 5 || (n % 10000 == 0) {
-                        eprintln!(
-                            "[pio] sm=3 txf_write #{} val=0x{:08x} push_ok={} max_seen=0x{:08x}",
-                            n, val, ok,
-                            MAX_VAL.load(std::sync::atomic::Ordering::Relaxed)
+                        tracing::debug!(
+                            target: "mdpicoem_common::pio::txf_sample",
+                            sm = 3u8,
+                            n,
+                            push_ok = ok,
+                            "txf_write sample val=0x{:08x} max_seen=0x{:08x}",
+                            val,
+                            MAX_VAL.load(std::sync::atomic::Ordering::Relaxed),
                         );
                     }
                 }

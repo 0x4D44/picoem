@@ -306,12 +306,12 @@ impl PwmRegs {
                 let before = stored;
                 apply_alias_rmw(&mut stored, value, alias);
                 self.inte = stored as u8;
-                if std::env::var("MDPIO_PWM_TRACE").is_ok() {
-                    eprintln!(
-                        "[pwm] INTE write alias={} val=0x{:02x} {:#04x} -> {:#04x}",
-                        alias, value, before, stored
-                    );
-                }
+                tracing::debug!(
+                    target: "mdrp2040::peripherals::pwm",
+                    alias,
+                    "INTE write val=0x{:02x} {:#04x} -> {:#04x}",
+                    value, before, stored,
+                );
                 self.route_irq(irqs);
             }
             INTF => {

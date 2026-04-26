@@ -70,7 +70,7 @@ Seven crates under `crates/`:
 - **`mdpicoem-harness`** — all differential and hardware-in-the-loop test binaries. Binaries are chip-suffixed (`qemu_diff_m33` / `qemu_diff_m0plus`, `probe_diff_rp2350` / `probe_diff_rp2040`, etc.).
 - **`mdpicoem-debug`** — GDB RSP server and trace tooling. Stubbed.
 
-The top-level `src/main.rs` is a one-line sanity binary that prints config; the real UIs are `mdrp2350app` and `mdrp2040app`.
+The real UIs are `mdrp2350app` and `mdrp2040app`; run them with `cargo run -p mdrp2350app` or `cargo run -p mdrp2040app`. The workspace has no top-level binary.
 
 ## Testing
 
