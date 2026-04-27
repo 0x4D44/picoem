@@ -4920,8 +4920,8 @@ mod stage2_bus_coverage {
         let _b: Bus = Default::default();
     }
 
-    /// UART0/UART1 RX DREQ arms (bus/mod.rs:1638, 1644). RX is not
-    /// otherwise stimulated, but uart's `rx_dreq` fires iff enabled +
+    // UART0/UART1 RX DREQ arms (bus/mod.rs:1638, 1644). RX is not
+    // otherwise stimulated, but uart's `rx_dreq` fires iff enabled +
     // rx_fifo non-empty — the `is_enabled()` check alone means both
     // false arms already run for disabled UARTs, and the true path
     // requires RX stimulus we don't model in Phase 2. So the true arm
@@ -5175,7 +5175,7 @@ mod stage2_i2c_coverage {
         // START_DET + STOP_DET. Then drain each CLR in turn.
         i.write32(IC_TAR, 0x55, 0, &mut 0);
         i.write32(IC_ENABLE, 1, 0, &mut 0);
-        i.write32(IC_DATA_CMD, (1 << 9), 0, &mut 0);
+        i.write32(IC_DATA_CMD, 1 << 9, 0, &mut 0);
         // CLR_INTR composite read.
         let _ = i.read32(IC_CLR_INTR);
         // Each specific CLR read (post-composite these are mostly no-ops
@@ -5333,8 +5333,8 @@ mod stage2_i2c_coverage {
 
 mod stage2_spi_coverage {
     use crate::peripherals::spi::{
-        SSP_INT_ROR, SSP_INT_RT, SSP_INT_RX, SSPCPSR, SSPCR0, SSPCR1, SSPDMACR, SSPDR, SSPIMSC,
-        SSPPCELLID3, SSPPERIPHID3, SpiRegs,
+        SSP_INT_ROR, SSP_INT_RT, SSP_INT_RX, SSPCPSR, SSPCR0, SSPCR1, SSPDMACR, SSPDR, SSPICR,
+        SSPIMSC, SSPPCELLID3, SSPPERIPHID3, SpiRegs,
     };
 
     const IRQ: u32 = 18;
@@ -5345,7 +5345,7 @@ mod stage2_spi_coverage {
     fn is_idle_reflects_ris_only() {
         let mut s = SpiRegs::new(IRQ);
         assert!(s.is_idle());
-        s.write32(SSPICR_OFFSET(), 0, 0, &mut 0); // no-op
+        s.write32(SSPICR, 0, 0, &mut 0); // no-op
         // Direct poke via private `ris` is not exposed; trigger by
         // overflowing loopback RX.
         let mut irqs = 0;
@@ -5356,10 +5356,6 @@ mod stage2_spi_coverage {
         }
         // FIFO now full → ROR IRQ bit latched via loopback overrun.
         assert!(!s.is_idle());
-    }
-    #[inline]
-    fn SSPICR_OFFSET() -> u32 {
-        0x020
     }
 
     /// `tx_dreq` / `rx_dreq` false when disabled (spi.rs:159, 165).
