@@ -49,3 +49,123 @@ Raspberry Pi RP2350 Bootrom
     CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
     POSSIBILITY OF SUCH DAMAGE.
+
+Raspberry Pi RP2040 B2 Bootrom
+    File:      roms/rp2040/bootrom-rp2040-b2.bin
+    Source:    https://github.com/raspberrypi/pico-bootrom-rp2040
+    License:   BSD-3-Clause; local copy in roms/rp2040/bootrom-rp2040-LICENSE.txt
+    Copyright: Copyright 2020 (c) 2020 Raspberry Pi (Trading) Ltd.
+
+    Note from upstream: the BSD-3-Clause grant covers the whole
+    pico-bootrom-rp2040 repository EXCEPT the files
+    bootrom/mufplib.S and bootrom/mufplib-double.S, which the upstream
+    repository documents as separately licensed. The bootrom binary
+    we redistribute (bootrom-rp2040-b2.bin) is the linked image; the
+    upstream LICENSE file as published is preserved verbatim at
+    roms/rp2040/bootrom-rp2040-LICENSE.txt.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    3. Neither the name of the copyright holder nor the names of its
+       contributors may be used to endorse or promote products derived from
+       this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+probe-rs (vendored fork)
+    Files:     third_party/probe-rs-0.31.0-mdrp-patched/  (entire subtree)
+    Upstream:  https://github.com/probe-rs/probe-rs
+    Version:   0.31.0 (crates.io release of 2026-01-17), with a small
+               local patch documented in
+               third_party/probe-rs-0.31.0-mdrp-patched/PATCHES.md
+    License:   MIT OR Apache-2.0 (dual-licensed); upstream license texts
+               travel with the source at
+               third_party/probe-rs-0.31.0-mdrp-patched/LICENSE-MIT
+               and ...-patched/LICENSE-APACHE.
+    Copyright: The probe-rs authors and contributors.
+
+    The fork carries a single workaround for upstream issue #3872 (an
+    `unreachable!()` panic when an ADIv6 V2 AP access is attempted while
+    the SelectCache is still DPv1). It is wired in from the workspace
+    root via `[patch.crates-io]`. Our local modifications are dual-
+    licensed MIT OR Apache-2.0 under the same terms as upstream and the
+    rest of `mdpicoem`. See the PATCHES.md file referenced above for
+    the full change description and a removal plan once upstream merges
+    a fix.
+
+DOSBox-X port-tap (derivative source patch)
+    File:      third_party/dosbox-x-picogus-tap.patch
+    Upstream:  https://github.com/joncampbell123/dosbox-x
+    License:   GNU General Public License version 2 (GPL-2.0-only),
+               as inherited from the DOSBox-X upstream codebase.
+    Copyright: The DOSBox-X authors and contributors.
+
+    `dosbox-x-picogus-tap.patch` is a unified diff against the DOSBox-X
+    source tree that adds CSV logging of GUS port writes (0x240..0x24f)
+    and OPL3/Adlib port reads/writes (0x388..0x38b). Because the patch
+    contains context lines drawn from the GPLv2-licensed DOSBox-X
+    codebase, the patch file is itself a GPLv2-derivative work and is
+    redistributed here under the same terms. The patch is provided
+    as-is for researchers reproducing our PicoGUS audio fixtures; see
+    `third_party/picogus-demo-runbook.md` and
+    `crates/mdpicoem-harness/fixtures/` for the consuming workflow.
+
+PicoGUS Firmware (v4.0.0)
+    Files:     third_party/picogus/picogus.uf2
+               third_party/picogus/pg-ne2k.uf2
+               third_party/picogus/pgusinit.exe
+               third_party/picogus/picogus-v4.0.0.bin
+               third_party/picogus/picogus-v4.0.0.zip
+               third_party/picogus/picogus-v4.0.0-patched.bin
+               third_party/picogus/UPSTREAM_README.md
+    Source:    https://github.com/polpo/picogus
+    Release:   v4.0.0 (tag), 2026-04-06
+    License:   GNU General Public License version 2 or later
+               (GPL-2.0-or-later); local copy in
+               third_party/picogus/LICENSE-PICOGUS-GPL-2.0.txt
+    Copyright: Copyright (c) Ian Scott (polpo) and contributors
+
+    The PicoGUS sw/ and pgusinit/ collections are GPLv2; the hardware
+    portions (hw/) are CERN OHL v2 and not redistributed here. We
+    redistribute the published v4.0.0 binaries unmodified plus one local
+    variant (`picogus-v4.0.0-patched.bin`) whose four-byte delta from stock
+    is documented in
+    third_party/picogus/picogus-v4.0.0-test_psram-fastpath.md.
+
+--------------------------------------------------------------------------------
+
+Test fixtures (not third-party redistribution):
+
+`crates/mdpicoem-harness/fixtures/monkey_island_adlib.trace` and
+`crates/mdpicoem-harness/fixtures/monkey_island_theme.trace` are CSV
+captures of the externally-observable port-write traffic that an
+unmodified retail copy of *The Secret of Monkey Island* generates while
+running under DOSBox-X with our `dosbox-x-picogus-tap.patch` applied.
+The captures record only timestamps, port numbers, and byte values
+emitted at the ISA bus interface — analogous to recording the MIDI
+output of a musical performance rather than its acoustic signal. No
+game code, audio samples, ROM data, or other copyrighted Lucasfilm
+material is redistributed here. *Monkey Island* is a trademark of
+Lucasfilm Entertainment Company Ltd. LLC; the captures use the name
+solely to identify their provenance.
+
+See `crates/mdpicoem-harness/fixtures/README.md` for the full set of
+test fixtures and their roles.

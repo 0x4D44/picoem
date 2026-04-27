@@ -12,15 +12,16 @@ env/
 # roms/: tracked binaries (blinky.bin, bootrom-combined.bin, lcd_demo.bin)
 # are whitelisted by roms/.gitignore. Other build artefacts under roms/
 # are still ignored by that file's rules.
-# third_party/picogus/: firmware artefacts are fetched at demo time.
-# Keep the VERSION pin + README in git, ignore the downloaded blobs.
-third_party/picogus/*.zip
-third_party/picogus/*.uf2
-third_party/picogus/*.bin
-third_party/picogus/*.exe
-third_party/picogus/UPSTREAM_README.md
+# third_party/picogus/: firmware redistributed under GPL-2.0-or-later.
+# See third_party/picogus/README.md for licensing and provenance, and
+# third_party/picogus/LICENSE-PICOGUS-GPL-2.0.txt for the upstream
+# license text. Binaries are committed alongside a `.patch` text file
+# documenting any local modifications (see test_psram-bypass.patch).
+#
 # upstream/ is a local git clone of the PicoGUS source for reference
-# during firmware-diff sessions — not redistributed, local-only.
+# during firmware-diff sessions — not redistributed, local-only. The
+# pinned `VERSION` file + upstream URL satisfy GPL-2.0's source-pointer
+# requirement.
 third_party/picogus/upstream/
 
 # samply / profiling scratch output: keep these out of git regardless of
@@ -44,6 +45,13 @@ fuzz-runs/**/*.exe
 # wrk_scratch/: throwaway analysis scripts (see memory:
 # reference_windows_profiling for the workflow). Local-only.
 wrk_scratch/
+
+# wrk_debug/: scratch directory for ad-hoc diagnostic logs and one-off
+# debug captures. Today's contents are all `.log` files which are also
+# matched by the global `*.log` rule above; gitignoring the directory
+# explicitly keeps any non-`.log` debug artefact (raw register dumps,
+# memory snapshots, etc.) from being accidentally tracked.
+wrk_debug/
 
 # rustc internal-compiler-error dumps. cargo +nightly llvm-cov with
 # incremental compilation has a known ICE on this workspace (set

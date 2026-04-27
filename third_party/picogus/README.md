@@ -1,86 +1,47 @@
 # PicoGUS firmware (vendored)
 
-This directory holds the PicoGUS firmware binary consumed by the
-Stage 4+ `picogus_diff_rp2040` harness. The firmware is **not
-redistributed** here by default — see Licensing below — and is
-downloaded from the upstream GitHub release by the demo script.
+This directory contains PicoGUS firmware redistributed under
+GPL-2.0-or-later. The upstream project is
+<https://github.com/polpo/picogus>; these files are pinned to version
+`v4.0.0`, release tag `v4.0.0`.
 
 ## Files
 
-| File                       | Origin                                 | Purpose                                                                |
-|----------------------------|----------------------------------------|------------------------------------------------------------------------|
-| `VERSION`                  | committed                              | Pinned release, expected SHA256, asset manifest.                       |
-| `README.md`                | committed                              | This file.                                                             |
-| `UPSTREAM_README.md`       | extracted from zip                     | Upstream PicoGUS README (pgusinit usage, mode switching).              |
-| `picogus-v4.0.0.zip`       | downloaded (or manually placed)        | Upstream release archive, as published on GitHub.                      |
-| `picogus.uf2`              | extracted from zip                     | Upstream UF2 firmware image (multi-mode: GUS/SB16/MPU/Adlib/PSG/USB).  |
-| `pg-ne2k.uf2`              | extracted from zip                     | NE2000/WiFi variant — not used by this harness, kept for completeness. |
-| `pgusinit.exe`             | extracted from zip                     | DOS-side init utility — not used by this harness.                      |
-| `picogus-v4.0.0.bin`       | derived from `picogus.uf2` (UF2→bin)   | What `picogus_diff_rp2040 --flash` consumes.                           |
-
-## How to stage the firmware
-
-### Option A: automated (recommended)
-
-Run the demo script once. It downloads the upstream zip, verifies the
-expected SHA256, extracts it, and converts `picogus.uf2` to a raw
-XIP-offset-0 `.bin`:
-
-```sh
-bash scripts/picogus_demo.sh --prepare
-```
-
-(The same script without `--prepare` runs the full
-trace-replay-to-WAV pipeline, assuming a trace already exists — see
-`third_party/picogus-demo-runbook.md`.)
-
-### Option B: manual
-
-1. Download the release archive from
-   <https://github.com/polpo/picogus/releases/tag/v4.0.0> — asset
-   `picogus-v4.0.0.zip`.
-2. Verify the SHA256 matches the value in `VERSION`.
-3. Extract it into this directory. You should end up with
-   `picogus.uf2`, `pg-ne2k.uf2`, `pgusinit.exe`, and the upstream
-   `README.md` (which we rename to `UPSTREAM_README.md` to avoid
-   collision with this one).
-4. Convert `picogus.uf2` to raw flash format. Any UF2 extractor works;
-   `picotool uf2 convert` (part of the Pico SDK) is the canonical
-   option. `scripts/picogus_demo.sh` has an inline Python fallback
-   that does the same conversion with no external deps.
-
-The harness expects `picogus-v4.0.0.bin` as a flat image starting at
-UF2 target address `0x10000000` (the RP2040 XIP flash base). Drop the
-base-address offset; write the raw bytes linearly from flash offset 0.
+| File                                      | Origin                                  | Purpose                                                                |
+|-------------------------------------------|-----------------------------------------|------------------------------------------------------------------------|
+| `VERSION`                                 | committed                               | Pinned release, expected SHA256, asset manifest.                       |
+| `README.md`                               | committed                               | This file.                                                             |
+| `UPSTREAM_README.md`                      | redistributed under GPL-2.0-or-later    | Upstream PicoGUS README (pgusinit usage, mode switching).              |
+| `picogus-v4.0.0.zip`                      | redistributed under GPL-2.0-or-later    | Upstream release archive, as published on GitHub.                      |
+| `picogus.uf2`                             | redistributed under GPL-2.0-or-later    | Upstream UF2 firmware image (multi-mode: GUS/SB16/MPU/Adlib/PSG/USB).  |
+| `pg-ne2k.uf2`                             | redistributed under GPL-2.0-or-later    | NE2000/WiFi variant - not used by this harness, kept for completeness. |
+| `pgusinit.exe`                            | redistributed under GPL-2.0-or-later    | DOS-side init utility - not used by this harness.                      |
+| `picogus-v4.0.0.bin`                      | redistributed under GPL-2.0-or-later    | What `picogus_diff_rp2040 --flash` consumes.                           |
+| `picogus-v4.0.0-patched.bin`              | local variant under GPL-2.0-or-later    | Emulator-oriented variant of `picogus-v4.0.0.bin`.                     |
+| `picogus-v4.0.0-test_psram-fastpath.md`   | committed                               | Local-modification documentation for `picogus-v4.0.0-patched.bin`.     |
+| `LICENSE-PICOGUS-GPL-2.0.txt`             | committed                               | Local copy of the GNU GPL version 2 license text.                      |
 
 ## Licensing
 
-PicoGUS is released under the GPL-2.0-or-later licence (see
-<https://github.com/polpo/picogus/blob/main/LICENSE>). The upstream
-archive is freely redistributable provided the licence travels with
-it.
+The PicoGUS software artefacts redistributed here are licensed under
+GPL-2.0-or-later. A local copy of the GNU GPL version 2 text is in
+`LICENSE-PICOGUS-GPL-2.0.txt`.
 
-We deliberately **do not commit** the UF2 / binary / zip under git by
-default:
+For the local variant binary, `picogus-v4.0.0-patched.bin`, the
+corresponding source is the combination of the stock
+`picogus-v4.0.0.bin` and the four-byte change documented in
+`picogus-v4.0.0-test_psram-fastpath.md`.
 
-- The main firmware (`picogus.uf2`, ~1.8 MB) would bloat the
-  repository on every upgrade.
-- Pinning the upstream release + SHA256 in `VERSION` is reproducible
-  without vendoring the bytes — the demo script fetches and validates
-  on demand.
-- If you need air-gapped builds, drop the zip into this directory
-  yourself (see Option B above).
-
-If future work requires vendoring the binary (e.g. CI reproducibility
-without external fetch), add it here alongside a copy of the
-upstream `LICENSE` and update this note.
+The demo script (`scripts/picogus_demo.sh`) still works for users who
+want to re-fetch the upstream release archive and verify its SHA256
+against `VERSION`.
 
 ## What `picogus_diff_rp2040` actually boots
 
 **Important caveat**: our `mdrp2040` emulator does not ship with the
 real Raspberry Pi RP2040 bootrom. The `roms/rp2040/bootrom.bin`
 checked into this workspace is a synthetic 8-byte stub generated by
-`gen_blinky.py` — it materialises an initial SP + reset vector that
+`gen_blinky.py` - it materialises an initial SP + reset vector that
 jumps straight to flash. It does **not** run the stock RP2040 boot2
 sequence (XIP_SSI configuration, stage2 copy-from-flash-to-SRAM, etc)
 and does not provide the SDK bootrom function tables.
@@ -93,13 +54,14 @@ audio.
 
 Unblocking this is a Phase 8 task (vendor the real RP2040 bootrom,
 or a compatible free reimplementation, and have the harness
-automatically load it alongside `--flash`). Tracked under `tech_debt.md`.
+automatically load it alongside `--flash`). Tracked under
+`tech_debt.md`.
 
 ## Upgrading the pin
 
 1. Update `VERSION` with the new release tag, upstream URL, and
    expected SHA256 of the new zip.
-2. Rebuild any trace captures made against the previous firmware —
+2. Rebuild any trace captures made against the previous firmware -
    PicoGUS's ISA protocol is stable across minor versions but not
    guaranteed across majors.
 3. Re-read `crates/mdpicoem-harness/src/picogus_pins.rs` against the

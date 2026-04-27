@@ -36,6 +36,22 @@ Open cycle-timing gaps and post-Phase-7 residuals are tracked in `tech_debt.md`.
 
 ## Quick Start
 
+Clone with submodules — the workspace member `epio-sys` references vendored
+upstream sources via git submodules. A normal clone works for everything else,
+but `cargo build -p epio-sys` requires submodules to be initialised:
+
+```bash
+git clone --recursive https://github.com/0x4D44/mdpicoem.git
+# or, after a non-recursive clone:
+git submodule update --init
+```
+
+`epio-sys` is excluded from the workspace's `default-members` and additionally
+requires `clang` to be on `PATH`, so a plain `cargo build --release` at the
+workspace root works on hosts without `clang` or initialised submodules — opt
+in explicitly with `cargo build -p epio-sys` once those prerequisites are in
+place.
+
 ```bash
 # Build everything (release profile is strongly recommended — debug is slow)
 cargo build --release
@@ -166,6 +182,22 @@ Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall
 be dual licensed as above, without any additional terms or conditions.
 
-This repository also redistributes the Raspberry Pi RP2350 bootrom
-(`roms/rp2350/bootrom-combined.bin`) under BSD-3-Clause — see [NOTICE](NOTICE) for
-attribution.
+This repository redistributes third-party content under their respective
+licenses — Raspberry Pi RP2350 and RP2040 bootroms (BSD-3-Clause), the
+PicoGUS firmware (GPL-2.0-or-later), and a vendored fork of probe-rs
+(MIT OR Apache-2.0). See [NOTICE](NOTICE) for the full list and attribution.
+
+## Trademarks
+
+*Raspberry Pi*, *RP2350*, *RP2354*, *RP2040*, and *Pico* are trademarks
+of Raspberry Pi Ltd. *Arm*, *Cortex-M0+*, *Cortex-M33*, *Armv6-M*,
+*Armv8-M*, and *NEON* are trademarks or registered trademarks of Arm
+Limited (or its subsidiaries) in the US and/or elsewhere. *Sound
+Blaster* is a trademark of Creative Technology Ltd. *AdLib*, *Gravis
+Ultrasound*, and *MT-32* are trademarks of their respective owners.
+*Monkey Island* is a trademark of Lucasfilm Entertainment Company Ltd.
+LLC.
+
+This project is an independent emulator and is not affiliated with,
+endorsed by, or sponsored by any of the above trademark holders. All
+trademarks are used for identification purposes only.
