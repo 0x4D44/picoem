@@ -58,15 +58,15 @@ fn classify_is_pure(hw0: u16, hw1: u16, wide: bool) -> bool {
 fn classify_thumb16_pure(opcode: u16) -> bool {
     match opcode >> 11 {
         // Shifts / add/sub / mov-cmp-add-sub imm — pure ALU.
-        0b00000 | 0b00001 | 0b00010 | 0b00011 => true,
-        0b00100 | 0b00101 | 0b00110 | 0b00111 => true,
+        0b00000..=0b00011 => true,
+        0b00100..=0b00111 => true,
         // Data processing (bit10=0) is pure; special-data / BX (bit10=1)
         // is impure (BX/BLX may dispatch exception return).
         0b01000 => opcode & (1 << 10) == 0,
         // Loads / stores — impure.
         0b01001 => false,
         0b01010 | 0b01011 => false,
-        0b01100 | 0b01101 | 0b01110 | 0b01111 | 0b10000 | 0b10001 => false,
+        0b01100..=0b10001 => false,
         0b10010 | 0b10011 => false,
         // ADR / ADD SP imm — pure.
         0b10100 | 0b10101 => true,
@@ -123,7 +123,7 @@ fn classify_thumb32_pure(hw0: u16, hw1: u16) -> bool {
     if (hw1 & 0xD000) == 0x8000 {
         if hw0 == 0xF3BF && (hw1 & 0xFF00) == 0x8F00 {
             let barrier_op = (hw1 >> 4) & 0xF;
-            return matches!(barrier_op, 0x4 | 0x5 | 0x6);
+            return matches!(barrier_op, 0x4..=0x6);
         }
         let op_field = (hw0 >> 4) & 0x7F;
         if (op_field == 0b0111000 || op_field == 0b0111001) && (hw1 & 0xFF00) == 0x8800 {

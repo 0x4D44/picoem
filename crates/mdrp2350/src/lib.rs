@@ -27,16 +27,11 @@ use tracing::info;
 ///   x86_64 Windows hosts with the `threading` cargo feature on.
 ///   Not validated against QEMU/silicon oracles — see dual-execution
 ///   HLD V1 §3.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ExecutionModel {
+    #[default]
     Serial,
     Threaded,
-}
-
-impl Default for ExecutionModel {
-    fn default() -> Self {
-        ExecutionModel::Serial
-    }
 }
 
 /// Errors returned by [`EmulatorBuilder::build`]. The only non-trivial
@@ -83,7 +78,11 @@ pub enum EmulatorError {
     /// One of the worker threads panicked. The `Emulator` is sticky-
     /// poisoned after this; drop and rebuild. Only produced on the
     /// Threaded path.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     WorkerPanicked {
         which: threaded::WorkerName,
         message: String,
@@ -98,7 +97,11 @@ pub enum EmulatorError {
     /// cannot identify *which* worker failed to arrive, this field
     /// names an observer rather than the culprit. `elapsed_ms` is the
     /// reporting waiter's own wall-clock elapsed time at expiry.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     BarrierTimeout {
         which: threaded::WorkerName,
         elapsed_ms: u32,
@@ -112,11 +115,19 @@ impl std::fmt::Display for EmulatorError {
                 f,
                 "operation not supported on a Threaded Emulator (Serial-only)"
             ),
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             EmulatorError::WorkerPanicked { which, message } => {
                 write!(f, "worker {} panicked: {message}", which.as_str())
             }
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             EmulatorError::BarrierTimeout { which, elapsed_ms } => write!(
                 f,
                 "barrier watchdog fired (observed by worker {}) after {}ms",
@@ -249,15 +260,11 @@ pub const DEFAULT_STEP_QUANTUM: u32 = 64;
 /// complex; OTP/POWMAN picks one at power-up. V1 only constructs the
 /// Arm path with a real ISA — see
 /// `wrk_docs/2026.04.17 - HLD - RP2350 RISC-V Hazard3 Core Support.md`.
+#[derive(Default)]
 pub enum Arch {
+    #[default]
     Arm,
     RiscV,
-}
-
-impl Default for Arch {
-    fn default() -> Self {
-        Arch::Arm
-    }
 }
 
 /// Per-arch core pair. `expect_arm*` / `expect_riscv*` panic on the
@@ -335,19 +342,31 @@ pub struct Emulator {
     /// `build()`; the top-level fields retain their seed snapshot so
     /// harness setup code can inspect pre-run state but must not rely
     /// on them mid-run.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     threaded: Option<threaded::ThreadedEmulator>,
     /// Sticky panic record from a Threaded worker. Set once when
     /// `run_quantum` / `run` observes a worker panic and returned on
     /// every subsequent call (one-shot, HLD V1 §5.5 item 5). Not
     /// touched on the Serial path.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     panic_info: Option<(threaded::WorkerName, String)>,
     /// Sticky watchdog-timeout record from a Threaded run. Set once
     /// when `run_quantum` / `run` observes a barrier timeout and
     /// returned on every subsequent call (HLD V1 §6.6 Stage 5). Not
     /// touched on the Serial path.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     timeout_info: Option<(threaded::WorkerName, u32)>,
     /// Test-only panic injector: arm by calling
     /// [`Self::inject_panic_for_testing`]. The next `run_quantum` /
@@ -359,7 +378,7 @@ pub struct Emulator {
         feature = "testing",
         feature = "threading",
         target_arch = "x86_64",
-        target_os = "windows"
+        any(target_os = "windows", target_os = "linux")
     ))]
     pending_panic_inject: Option<threaded::WorkerName>,
     /// Set to `true` by [`Self::promote_to_threaded`] when the seeded
@@ -376,7 +395,11 @@ pub struct Emulator {
     /// guarded accessors; see `tech_debt.md` entry
     /// "Emulator direct-field access is Serial-only but not
     /// type-enforced (2026-04-24)".
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     pub(crate) bus_is_placeholder: bool,
     /// Latched true once the bootrom `reboot` mask-ROM hook fires on
     /// either core (HLD V5 §"Component 3"). Terminate-only: once set,
@@ -410,7 +433,11 @@ impl Emulator {
     /// inspection is racy). Returns 0 on Threaded before the first
     /// `run_quantum` call (cores not yet taken into worker threads).
     pub fn core_cycles(&self, idx: u8) -> u64 {
-        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         if let Some(t) = &self.threaded {
             return t.core_cycles(idx);
         }
@@ -636,14 +663,22 @@ impl Emulator {
     /// `while` predicate never fires and the core is skipped cheaply.
     pub fn step(&mut self) -> Result<u64, EmulatorError> {
         if self.execution_model == ExecutionModel::Threaded {
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             if let Some((which, message)) = &self.panic_info {
                 return Err(EmulatorError::WorkerPanicked {
                     which: *which,
                     message: message.clone(),
                 });
             }
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             if let Some((which, elapsed_ms)) = self.timeout_info {
                 return Err(EmulatorError::BarrierTimeout { which, elapsed_ms });
             }
@@ -718,10 +753,10 @@ impl Emulator {
         // `bootrom_hook_fired`; surface that to the host on the
         // Emulator. Cheap — two byte-loads per quantum, off the
         // per-instruction hot path.
-        if let Cores::Arm(cs) = &mut self.cores {
-            if cs[0].bootrom_hook_fired || cs[1].bootrom_hook_fired {
-                self.shutdown_requested = true;
-            }
+        if let Cores::Arm(cs) = &mut self.cores
+            && (cs[0].bootrom_hook_fired || cs[1].bootrom_hook_fired)
+        {
+            self.shutdown_requested = true;
         }
 
         self.clock.advance(self.step_quantum as u64);
@@ -808,7 +843,11 @@ impl Emulator {
             }
             return Ok(self.clock.cycles);
         }
-        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         {
             // Threaded: round up to nearest quantum boundary and drive
             // all quanta inside one `run_quanta_checked` batch so the
@@ -851,7 +890,11 @@ impl Emulator {
                 }
             }
         }
-        #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+        #[cfg(not(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
         {
             let _ = cycles;
             Err(EmulatorError::NotSupportedInThreadedMode)
@@ -873,7 +916,11 @@ impl Emulator {
         }
     }
 
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     fn run_quantum_threaded(&mut self) -> Result<u64, EmulatorError> {
         // One-shot: any cached panic / watchdog timeout short-circuits
         // without touching worker state. HLD V1 §5.5 item 5 / §6.6.
@@ -937,7 +984,11 @@ impl Emulator {
         }
     }
 
-    #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+    #[cfg(not(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
     fn run_quantum_threaded(&mut self) -> Result<u64, EmulatorError> {
         Err(EmulatorError::NotSupportedInThreadedMode)
     }
@@ -948,7 +999,11 @@ impl Emulator {
     /// carried over. After promotion, the top-level `cores` / `bus` /
     /// `clock` fields hold zero-cost placeholders and must not be
     /// inspected mid-run.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     fn promote_to_threaded(&mut self) {
         let atomics = Arc::new(crate::threaded::CoreAtomics::default());
         let placeholder_bus = Bus::with_atomics(Arc::clone(&atomics));
@@ -994,7 +1049,7 @@ impl Emulator {
         feature = "testing",
         feature = "threading",
         target_arch = "x86_64",
-        target_os = "windows"
+        any(target_os = "windows", target_os = "linux")
     ))]
     pub fn inject_panic_for_testing(&mut self, which: threaded::WorkerName) {
         debug_assert!(
@@ -1158,7 +1213,11 @@ impl Emulator {
     /// Placeholder-guard message shared by the typed accessors below.
     /// Central so the string stays consistent between tests and the
     /// REQUIRED #1 contract documented in `tech_debt.md`.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     const PLACEHOLDER_GUARD_MSG: &'static str = "direct field access on cores/bus/clock is Serial-only; emulator is in \
          Threaded mode — use typed accessors like core_cycles(), master_cycle(), \
          gpio_get() instead";
@@ -1167,7 +1226,11 @@ impl Emulator {
     /// non-threading platforms — the field does not exist there.
     #[inline(always)]
     fn assert_not_placeholder(&self) {
-        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         debug_assert!(!self.bus_is_placeholder, "{}", Self::PLACEHOLDER_GUARD_MSG);
     }
 
@@ -1466,14 +1529,18 @@ impl EmulatorBuilder {
             #[cfg(not(all(
                 feature = "threading",
                 target_arch = "x86_64",
-                target_os = "windows"
+                any(target_os = "windows", target_os = "linux")
             )))]
             return Err(ConfigError::ThreadingUnavailable);
         }
         // ThreadedEmulator pins one worker per host core; reject early
         // when the host cannot satisfy that, instead of panicking
         // later inside `ThreadedEmulator::from_emulator`.
-        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         if self.execution == ExecutionModel::Threaded {
             let n = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -1526,20 +1593,36 @@ impl EmulatorBuilder {
             clock: Clock { cycles: 0 },
             step_quantum: self.step_quantum,
             execution_model: self.execution,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             threaded: None,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             panic_info: None,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             timeout_info: None,
             #[cfg(all(
                 feature = "testing",
                 feature = "threading",
                 target_arch = "x86_64",
-                target_os = "windows"
+                any(target_os = "windows", target_os = "linux")
             ))]
             pending_panic_inject: None,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             bus_is_placeholder: false,
             shutdown_requested: false,
         };

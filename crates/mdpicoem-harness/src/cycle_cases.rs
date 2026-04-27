@@ -1004,7 +1004,7 @@ mod tests {
         let instr_addr_hw = 19;
         let pc_hw = instr_addr_hw + 2; // PC = instr+4 bytes = +2 halfwords
         let target_hw: i32 = 2; // poll label
-        let imm11_hw = target_hw - pc_hw as i32; // signed halfword offset
+        let imm11_hw = target_hw - pc_hw; // signed halfword offset
         let encoded = 0xE000u16 | ((imm11_hw as i16) as u16 & 0x07FF);
         assert_eq!(
             MEASUREMENT_STUB[19], encoded,

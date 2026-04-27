@@ -468,7 +468,7 @@ pub fn ref_vcvt_f32_from_f16(h: u16, fpscr_in: u32) -> (f32, u32) {
             // biased f32 exponent is `(9 - lz) - 24 + 127 = 112 - lz`.
             let lz = (frac as u16).leading_zeros() - 6;
             let mantissa = (frac << (lz + 1)) & 0x3FF;
-            let exp32 = (112 - lz) as u32;
+            let exp32 = 112 - lz;
             sign | (exp32 << 23) | (mantissa << 13)
         }
     } else if exp == 0x1F {

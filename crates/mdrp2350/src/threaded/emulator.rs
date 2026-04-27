@@ -11,10 +11,12 @@
 //! workers (pio0, pio1, pio2) so the emulator stops serialising what
 //! the hardware runs in parallel.
 //!
-//! Gated behind `#[cfg(all(target_arch = "x86_64", target_os =
-//! "windows"))]` because the thread-pinning path uses Win32
-//! `SetThreadAffinityMask`. Non-Windows callers stay on the existing
-//! single-threaded `Emulator::run` path.
+//! Gated behind `#[cfg(all(target_arch = "x86_64", any(target_os =
+//! "windows", target_os = "linux")))]` because the thread-pinning
+//! path uses `SetThreadAffinityMask` on Windows and
+//! `pthread_setaffinity_np` on Linux. Other UNIX hosts stay on the
+//! existing single-threaded `Emulator::run` path until
+//! `pin_to_host_core` grows a port.
 //!
 //! Lifecycle at a glance:
 //!
@@ -754,23 +756,50 @@ where
     })
 }
 
-/// Pin the current thread to the supplied host logical-CPU id via
-/// `SetThreadAffinityMask`. Windows-only (the whole module is gated to
-/// Windows anyway; this is the call site that needs the Win32 handle).
+/// Pin the current thread to the supplied host logical-CPU id.
+///
+/// Per-OS backends:
+/// - Windows: `SetThreadAffinityMask` (single-bit mask).
+/// - Linux: `pthread_setaffinity_np` with a one-bit `cpu_set_t`.
+///
+/// The whole module is gated to those two operating systems, so the
+/// `cfg` arms below are exhaustive on supported builds.
 fn pin_to_host_core(host_core: usize) {
-    use winapi::um::processthreadsapi::GetCurrentThread;
-    use winapi::um::winbase::SetThreadAffinityMask;
     assert!(
         host_core < usize::BITS as usize,
         "host_core {host_core} exceeds processor-mask bit width"
     );
-    let h = unsafe { GetCurrentThread() };
-    let mask = 1usize << host_core;
-    let prev = unsafe { SetThreadAffinityMask(h, mask) };
-    assert!(
-        prev != 0,
-        "SetThreadAffinityMask failed for host core {host_core}"
-    );
+    #[cfg(target_os = "windows")]
+    {
+        use winapi::um::processthreadsapi::GetCurrentThread;
+        use winapi::um::winbase::SetThreadAffinityMask;
+        let h = unsafe { GetCurrentThread() };
+        let mask = 1usize << host_core;
+        let prev = unsafe { SetThreadAffinityMask(h, mask) };
+        assert!(
+            prev != 0,
+            "SetThreadAffinityMask failed for host core {host_core}"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(host_core, &mut set);
+        }
+        let rc = unsafe {
+            libc::pthread_setaffinity_np(
+                libc::pthread_self(),
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set,
+            )
+        };
+        assert!(
+            rc == 0,
+            "pthread_setaffinity_np failed for host core {host_core}: errno={rc}"
+        );
+    }
 }
 
 // =======================================================================

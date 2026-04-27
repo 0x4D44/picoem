@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 const RESETS_BASE: u32 = 0x4000_C000;
-const RESETS_RESET: u32 = RESETS_BASE + 0x00;
+const RESETS_RESET: u32 = RESETS_BASE;
 
 /// APB alias offset. `+0x3000` = CLR (AND NOT). SET (`+0x2000`) is
 /// unused by Phase 0 — only RESETS *release* (CLR) matters here.
@@ -70,7 +70,7 @@ const TIMER_TIMERAWL: u32 = TIMER_BASE + 0x28;
 /// XOSC block. `CTRL` at offset 0, writable by firmware — used by the
 /// `SMOKE_XOSC_CTRL_WRITE_ROUND_TRIP` scenario.
 const XOSC_BASE: u32 = 0x4002_4000;
-const XOSC_CTRL: u32 = XOSC_BASE + 0x00;
+const XOSC_CTRL: u32 = XOSC_BASE;
 
 /// SysTick (ARMv6-M SCS). The same PPB constants apply on M0+ and M33.
 /// `_CSR.CLKSOURCE|ENABLE` = bit 2 | bit 0; TICKINT intentionally off so
@@ -751,8 +751,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut core = session.core(0)?;
 
     println!(
-        "{:<40} {:>6} {:>10} {:>7}  {}",
-        "scenario", "sysclk", "runtime_ms", "verdict", "first_divergence",
+        "{:<40} {:>6} {:>10} {:>7}  first_divergence",
+        "scenario", "sysclk", "runtime_ms", "verdict",
     );
     println!("{}", "-".repeat(102));
 

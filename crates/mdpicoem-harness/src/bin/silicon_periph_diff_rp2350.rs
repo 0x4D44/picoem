@@ -32,18 +32,10 @@ Options:
 /// selector. Kept local to this binary so the shared `PeriphArgs`
 /// struct in `silicon_scenarios` doesn't leak a red-path-specific
 /// field into the `test_silicon` orchestrator.
+#[derive(Default)]
 struct Args {
     inner: PeriphArgs,
     red_path: bool,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            inner: PeriphArgs::default(),
-            red_path: false,
-        }
-    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -136,8 +128,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut core = session.core(0)?;
 
     println!(
-        "{:<40} {:>6} {:>10} {:>7}  {}",
-        "scenario", "sysclk", "runtime_ms", "verdict", "first_divergence",
+        "{:<40} {:>6} {:>10} {:>7}  first_divergence",
+        "scenario", "sysclk", "runtime_ms", "verdict",
     );
     println!("{}", "-".repeat(102));
 

@@ -113,6 +113,12 @@ pub(crate) enum StallKind {
     IrqWait { index: u8 },
 }
 
+impl Default for StateMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StateMachine {
     pub fn new() -> Self {
         Self {
@@ -444,8 +450,8 @@ impl StateMachine {
             }
             StallKind::IrqWait { index } => {
                 // Wait until the flag we set is cleared by someone else
-                let flag_set = (*irq_flags >> (index & 7)) & 1 != 0;
-                flag_set
+
+                (*irq_flags >> (index & 7)) & 1 != 0
             }
         }
     }
@@ -934,7 +940,7 @@ impl StateMachine {
             0 => {
                 // PINS — RP2350 masks by IN_COUNT
                 let raw = self.read_pins(gpio_in);
-                let in_count = (self.shiftctrl & 0x1F) as u32;
+                let in_count = self.shiftctrl & 0x1F;
                 if in_count == 0 || in_count >= 32 {
                     raw
                 } else {
@@ -1047,7 +1053,7 @@ impl StateMachine {
     fn resolve_irq_index(&self, index: u8) -> u8 {
         if index & 0x10 != 0 {
             // Relative: offset lower 2 bits by SM id, preserve bit 2
-            ((index & 3) + self.sm_id) % 4 | (index & 4)
+            (((index & 3) + self.sm_id) % 4) | (index & 4)
         } else {
             index & 7
         }

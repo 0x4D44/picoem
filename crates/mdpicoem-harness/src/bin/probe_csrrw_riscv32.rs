@@ -231,7 +231,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Read back the probe bytes too, to rule out "QEMU silently dropped
     // our memory write" (unlikely given proxy self-check works — but
     // belt and braces for a definitive answer).
-    let prog_readback = gdb.read_mem(PROBE_SLOT, (prog.len() * 4) as usize)?;
+    let prog_readback = gdb.read_mem(PROBE_SLOT, prog.len() * 4)?;
 
     println!();
     println!("=== csrrw probe result ===");

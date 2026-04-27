@@ -160,8 +160,8 @@ pub fn should_exclude(name: &str, exclude: Option<&str>) -> bool {
 /// - Both: apply filter first, then subtract any that match exclude.
 ///
 /// Returns `(selected_indices, n_skipped_by_filter, n_skipped_by_exclude)`.
-pub fn select_by_name<'a>(
-    names: &[&'a str],
+pub fn select_by_name(
+    names: &[&str],
     filter: Option<&str>,
     exclude: Option<&str>,
 ) -> (Vec<usize>, usize, usize) {

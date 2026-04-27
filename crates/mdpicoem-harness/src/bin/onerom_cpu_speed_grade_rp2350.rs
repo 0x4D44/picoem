@@ -1076,16 +1076,15 @@ mod windows_main {
         let elapsed = run_t0.elapsed();
 
         // Post-sweep PC check (§12) — reassembled core holds the PC.
-        if let Some(ref t) = threaded {
-            if let Some(pc) = t.core_pc(0) {
-                if !(SERVE_LOOP_PC_LO..=SERVE_LOOP_PC_HI).contains(&pc) {
-                    eprintln!(
-                        "warning: core 0 PC 0x{:08X} left the serve-loop range \
+        if let Some(ref t) = threaded
+            && let Some(pc) = t.core_pc(0)
+            && !(SERVE_LOOP_PC_LO..=SERVE_LOOP_PC_HI).contains(&pc)
+        {
+            eprintln!(
+                "warning: core 0 PC 0x{:08X} left the serve-loop range \
                          0x{:08X}..=0x{:08X} by end of run — results may be tainted",
-                        pc, SERVE_LOOP_PC_LO, SERVE_LOOP_PC_HI
-                    );
-                }
-            }
+                pc, SERVE_LOOP_PC_LO, SERVE_LOOP_PC_HI
+            );
         }
         if watchdog_fired {
             eprintln!(

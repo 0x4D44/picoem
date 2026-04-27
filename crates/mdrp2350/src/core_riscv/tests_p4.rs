@@ -60,7 +60,7 @@ fn csr_read(c: &mut Hazard3, bus: &mut Bus, csr: u16) -> u32 {
 fn p4_csr_meiea_roundtrip() {
     let (mut c, mut bus) = fresh();
     // Window 0, bits 0 + 3 + 15 enabled.
-    csr_write(&mut c, &mut bus, CSR_MEIEA, (0x8009u32 << 16) | 0);
+    csr_write(&mut c, &mut bus, CSR_MEIEA, 0x8009u32 << 16);
     let got = csr_read(&mut c, &mut bus, CSR_MEIEA);
     assert_eq!(got >> 16, 0x8009);
     assert_eq!(got & 0x1F, 0);
@@ -69,7 +69,7 @@ fn p4_csr_meiea_roundtrip() {
 #[test]
 fn p4_csr_meipa_shows_enabled_pending() {
     let (mut c, mut bus) = fresh();
-    csr_write(&mut c, &mut bus, CSR_MEIEA, (0x0003u32 << 16) | 0);
+    csr_write(&mut c, &mut bus, CSR_MEIEA, 0x0003u32 << 16);
     bus.atomics.set_irq_pending(0, 0b111);
     let got = csr_read(&mut c, &mut bus, CSR_MEIPA);
     // Only bits 0, 1 visible after enable mask.
@@ -82,7 +82,7 @@ fn p4_csr_meifa_w1c() {
     c.xh3irq.force_set(3);
     c.xh3irq.force_set(5);
     // Write-1 to bit 3 clears only bit 3.
-    csr_write(&mut c, &mut bus, CSR_MEIFA, (0b1000u32 << 16) | 0);
+    csr_write(&mut c, &mut bus, CSR_MEIFA, 0b1000u32 << 16);
     let got = csr_read(&mut c, &mut bus, CSR_MEIFA);
     assert_eq!(got >> 16, 0b0010_0000);
 }
@@ -90,7 +90,7 @@ fn p4_csr_meifa_w1c() {
 #[test]
 fn p4_csr_meipra_roundtrip() {
     let (mut c, mut bus) = fresh();
-    csr_write(&mut c, &mut bus, CSR_MEIPRA, (0x050Au32 << 16) | 0);
+    csr_write(&mut c, &mut bus, CSR_MEIPRA, 0x050Au32 << 16);
     let got = csr_read(&mut c, &mut bus, CSR_MEIPRA);
     assert_eq!(got >> 16, 0x050A);
     assert_eq!(c.xh3irq.meipra[0], 0xA);
@@ -197,10 +197,10 @@ fn p4_meifa_ack_via_meinext_update() {
 #[test]
 fn p4_meipra_change_at_rest() {
     let (mut c, mut bus) = fresh();
-    csr_write(&mut c, &mut bus, CSR_MEIPRA, (0x000A_u32 << 16) | 0);
+    csr_write(&mut c, &mut bus, CSR_MEIPRA, 0x000A_u32 << 16);
     assert_eq!(c.xh3irq.meipra[0], 0xA);
     // Overwrite IRQ 0 priority.
-    csr_write(&mut c, &mut bus, CSR_MEIPRA, (0x0005_u32 << 16) | 0);
+    csr_write(&mut c, &mut bus, CSR_MEIPRA, 0x0005_u32 << 16);
     assert_eq!(c.xh3irq.meipra[0], 0x5);
     // IRQ 1..3 default still 0.
     assert_eq!(c.xh3irq.meipra[1], 0);
@@ -233,13 +233,13 @@ fn p4_meip_raised_by_enable_bit() {
         "disabled -> no MEIP"
     );
     // Enable IRQ 4 via window 0.
-    csr_write(&mut c, &mut bus, CSR_MEIEA, (0x0010_u32 << 16) | 0);
+    csr_write(&mut c, &mut bus, CSR_MEIEA, 0x0010_u32 << 16);
     assert!(c.compute_meip(bus.atomics.irq_pending_load(0)));
 }
 
 #[test]
 fn p4_meip_cleared_when_pending_clears() {
-    let (mut c, mut bus) = fresh();
+    let (mut c, bus) = fresh();
     c.xh3irq.meiea = 1 << 4;
     bus.atomics.set_irq_pending(0, 1 << 4);
     assert!(c.compute_meip(bus.atomics.irq_pending_load(0)));

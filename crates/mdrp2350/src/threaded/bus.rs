@@ -2159,8 +2159,8 @@ mod tests {
             bus.write32(I2C0_BASE + 0x40, 0x1, 0);
             bus.write32(ADC_BASE + 0x14, 0x1, 0);
             bus.write32(PWM_BASE + 0x50, 0x1, 0);
-            bus.write32(IO_BANK0_BASE + 0x00, 0x0, 0);
-            bus.write32(PADS_BANK0_BASE + 0x00, 0x0, 0);
+            bus.write32(IO_BANK0_BASE, 0x0, 0);
+            bus.write32(PADS_BANK0_BASE, 0x0, 0);
         }
 
         /// Legacy HashMap write aliases — XOR, SET, CLR on an address

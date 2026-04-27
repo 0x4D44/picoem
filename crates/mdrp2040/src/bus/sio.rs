@@ -338,9 +338,9 @@ impl Sio {
         let base_l = self.interp_reg(core, which, 2 + lane);
         let ctrl = self.interp_reg(core, which, 11 + lane);
 
-        let shift = (ctrl & 0x1F) as u32;
-        let mask_lsb = ((ctrl >> 5) & 0x1F) as u32;
-        let mask_msb = ((ctrl >> 10) & 0x1F) as u32;
+        let shift = ctrl & 0x1F;
+        let mask_lsb = (ctrl >> 5) & 0x1F;
+        let mask_msb = (ctrl >> 10) & 0x1F;
         let signed = (ctrl >> 15) & 1 != 0;
         let add_raw = (ctrl >> 18) & 1 != 0;
         let clamp = which == 1 && lane == 0 && (ctrl >> 22) & 1 != 0;
@@ -570,7 +570,7 @@ impl Sio {
     // --- Spinlock helpers --------------------------------------------------
 
     fn spinlock_read(&mut self, offset: u32) -> u32 {
-        let n = ((offset - 0x100) >> 2) as u32;
+        let n = (offset - 0x100) >> 2;
         debug_assert!(n < 32);
         let mask = 1u32 << n;
         if self.spinlock_bits & mask == 0 {
@@ -583,7 +583,7 @@ impl Sio {
     }
 
     fn spinlock_write(&mut self, offset: u32) {
-        let n = ((offset - 0x100) >> 2) as u32;
+        let n = (offset - 0x100) >> 2;
         debug_assert!(n < 32);
         self.spinlock_bits &= !(1u32 << n);
         trace!(lock_id = n, "spinlock released");

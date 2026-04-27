@@ -102,7 +102,10 @@ use mdrp2350::{Config, Emulator, EmulatorBuilder, Pacer, PacerStats};
 /// for A/B comparability; the serial path is insensitive to quantum
 /// size in this range so there's no downside.
 const BENCH_DEFAULT_STEP_QUANTUM: u32 = 256;
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 use mdrp2350::threaded::ThreadedEmulator;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -615,7 +618,10 @@ mod win {
 /// runs.
 enum Runtime {
     Serial(Emulator),
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     Threaded {
         inner: ThreadedEmulator,
         step_q: u32,
@@ -630,7 +636,10 @@ impl Runtime {
             Runtime::Serial(emu) => {
                 emu.run(cycles).expect("Serial run is infallible");
             }
-            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             Runtime::Threaded { inner, step_q } => {
                 let sq = *step_q as u64;
                 let n = cycles.div_ceil(sq);
@@ -647,7 +656,10 @@ impl Runtime {
     fn core_cycles(&self) -> (u64, u64) {
         match self {
             Runtime::Serial(emu) => (emu.core(0).cycles(), emu.core(1).cycles()),
-            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             Runtime::Threaded { inner, .. } => (inner.core_cycles(0), inner.core_cycles(1)),
         }
     }
@@ -706,12 +718,15 @@ fn main() {
         ModelSel::Both => false, // per-rep override inside A/B loop
     };
 
-    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
     if threaded || matches!(model, ModelSel::Threaded | ModelSel::Both) {
         eprintln!(
-            "error: --threaded / --model threaded|both requires x86_64 Windows \
-             (ThreadedEmulator is #[cfg]-gated to that target — pin_to_host_core \
-             uses SetThreadAffinityMask)"
+            "error: --threaded / --model threaded|both requires x86_64 Windows or \
+             Linux (ThreadedEmulator is #[cfg]-gated to those targets — \
+             pin_to_host_core uses SetThreadAffinityMask / pthread_setaffinity_np)"
         );
         std::process::exit(1);
     }
@@ -903,7 +918,10 @@ fn run_once(cfg: &RunConfig) -> f64 {
     // trivially satisfied — no step or manual invalidate needed.
     #[allow(unused_mut)]
     let mut runtime = {
-        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         {
             if threaded {
                 let step_q = emu.step_quantum;
@@ -914,7 +932,10 @@ fn run_once(cfg: &RunConfig) -> f64 {
                 Runtime::Serial(emu)
             }
         }
-        #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
         {
             // `threaded` guaranteed false by the earlier non-Windows
             // rejection above.
@@ -1101,13 +1122,15 @@ fn run_once(cfg: &RunConfig) -> f64 {
 
         // Threaded-mode --timing table. Runtime must outlive the
         // `last_run_timings()` borrow, so we print before returning.
-        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-        if timing {
-            if let Runtime::Threaded { ref inner, .. } = runtime {
-                if let Some(rt) = inner.last_run_timings() {
-                    print_timing_summary(rt);
-                }
-            }
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if timing
+            && let Runtime::Threaded { ref inner, .. } = runtime
+            && let Some(rt) = inner.last_run_timings()
+        {
+            print_timing_summary(rt);
         }
         return mhz;
     }
@@ -1487,7 +1510,10 @@ fn print_stats_row(label: &str, s: &Stats) {
 /// `on_wait_entry` closes the span started at worker entry); over a
 /// multi-million-quantum run the distortion is noise, but be aware for
 /// very short runs.
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 fn print_timing_summary(rt: &mdrp2350::threaded::RunTimings) {
     println!("\n--- per-worker timings (ns) ---");
     println!(

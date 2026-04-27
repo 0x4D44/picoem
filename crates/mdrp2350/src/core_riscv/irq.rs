@@ -320,14 +320,14 @@ impl Xh3Irq {
     /// back the read value (common pattern: `csrrw x0, meinext, x5` to
     /// ack) gets the ack.
     pub(crate) fn write_meinext(&mut self, v: u32, irq_pending: u64) {
-        if (v & 1) != 0 {
-            if let Some((irq, _)) = self.arbitrate(irq_pending) {
-                // Clear the force bit for the acked IRQ. Hardware-
-                // sourced pending bits are owned by bus.irq_pending —
-                // meifa-clear only affects the force side.
-                if irq < 64 {
-                    self.meifa &= !(1u64 << irq);
-                }
+        if (v & 1) != 0
+            && let Some((irq, _)) = self.arbitrate(irq_pending)
+        {
+            // Clear the force bit for the acked IRQ. Hardware-
+            // sourced pending bits are owned by bus.irq_pending —
+            // meifa-clear only affects the force side.
+            if irq < 64 {
+                self.meifa &= !(1u64 << irq);
             }
         }
     }
@@ -477,7 +477,7 @@ mod tests {
     fn meiea_window_roundtrip() {
         let mut x = Xh3Irq::new();
         // Window 0 (IRQs 0..15): enable IRQs 0, 3, 15.
-        x.write_meiea((0x8009u32 << 16) | 0);
+        x.write_meiea(0x8009u32 << 16);
         assert_eq!(x.meiea & 0xFFFF, 0x8009);
         // Read it back.
         let r = x.read_meiea();
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn meipa_pending_masked_by_enable() {
         let mut x = Xh3Irq::new();
-        x.write_meiea((0x0003u32 << 16) | 0); // enable 0, 1
+        x.write_meiea(0x0003u32 << 16); // enable 0, 1
         let pending: u64 = 0b111; // 0, 1, 2 pending
         // meipa window 0 should show only 0, 1 (enable-masked).
         let r = x.read_meipa(pending);
@@ -507,7 +507,7 @@ mod tests {
         x.force_set(3);
         x.force_set(5);
         // Clear bit 3 via W1C write.
-        x.write_meifa((0b1000u32 << 16) | 0);
+        x.write_meifa(0b1000u32 << 16);
         assert_eq!(x.meifa & 0b0011_1000, 0b0010_0000); // bit 5 remains
     }
 
@@ -515,7 +515,7 @@ mod tests {
     fn meipra_window_roundtrip() {
         let mut x = Xh3Irq::new();
         // Window 0: 4 IRQs (0..3). Set pri=0xA for IRQ 0, 0x5 for IRQ 2.
-        x.write_meipra((0x050A_u32 << 16) | 0);
+        x.write_meipra(0x050A_u32 << 16);
         assert_eq!(x.meipra[0], 0xA);
         assert_eq!(x.meipra[2], 0x5);
         let r = x.read_meipra();

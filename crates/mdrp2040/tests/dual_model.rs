@@ -10,10 +10,14 @@
 //!   exception-entry stacked-frame layout, per-instruction interleave.
 //!
 //! This test binary requires the `threading` feature. It is gated to
-//! x86_64 Windows — the only host where `ThreadedEmulator` is compiled
-//! in today.
+//! x86_64 Windows + x86_64 Linux — the hosts where `ThreadedEmulator`
+//! is compiled in today.
 
-#![cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+#![cfg(all(
+    feature = "threading",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 
 use mdrp2040::{Config, Emulator, EmulatorBuilder, ExecutionModel};
 

@@ -420,10 +420,8 @@ fn main() {
             any_fail = true;
         }
     }
-    if args.mode == Mode::Dcp || args.mode == Mode::All {
-        if !run_dcp(args.fuzz_count, seed) {
-            any_fail = true;
-        }
+    if (args.mode == Mode::Dcp || args.mode == Mode::All) && !run_dcp(args.fuzz_count, seed) {
+        any_fail = true;
     }
     if any_fail {
         std::process::exit(1);
@@ -605,7 +603,7 @@ fn half_edge_cases_f32() -> Vec<f32> {
         -65504.0,
         65536.0,                     // overflows to f16 inf
         f32::from_bits(0x387F_C000), // largest f16 subnormal as f32
-        6.103515625e-5,              // smallest f16 normal (2^-14)
+        6.103_515_6e-5,              // smallest f16 normal (2^-14)
         f32::from_bits(0x33800000),  // smallest f16 subnormal (2^-24)
         1.0 / 3.0,                   // inexact
     ]

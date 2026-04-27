@@ -101,7 +101,7 @@ impl CortexM33 {
             // ---- HI banks (pins 30..47) — RP2354A has no pins here.
             // Reads RAZ, writes WI. Preserve any Rt value on MRC by writing 0;
             // no SIO mutation on MCR.
-            4 | 5 | 6 => {
+            4..=6 => {
                 if is_mrc {
                     self.regs.r[rt] = 0;
                 }

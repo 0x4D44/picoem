@@ -176,7 +176,7 @@ impl WatchdogRegs {
     fn is_scratch(offset: u32) -> bool {
         offset >= SCRATCH0_OFFSET
             && offset < SCRATCH0_OFFSET + 4 * SCRATCH_COUNT as u32
-            && (offset - SCRATCH0_OFFSET) % 4 == 0
+            && (offset - SCRATCH0_OFFSET).is_multiple_of(4)
     }
 
     #[inline]

@@ -1039,10 +1039,10 @@ fn soak_loop(
         // core; it deliberately does NOT reset between oracles within
         // one iteration so the soak loop still exposes cross-oracle
         // state-leakage bugs (that's the whole point of soak mode).
-        if let Some(ref mut session) = session_opt {
-            if let Ok(mut core) = session.core(0) {
-                let _ = core.reset_and_halt(Duration::from_millis(500));
-            }
+        if let Some(ref mut session) = session_opt
+            && let Ok(mut core) = session.core(0)
+        {
+            let _ = core.reset_and_halt(Duration::from_millis(500));
         }
 
         // Heartbeat.

@@ -54,7 +54,7 @@ fn setup_pio(trace: &Trace) -> PioBlock {
     for sm in 0..4u32 {
         let reg = &trace.regs[sm as usize];
         let base = 0x0C8 + sm * 0x18;
-        pio.write32(base + 0x00, reg.clkdiv, 0);
+        pio.write32(base, reg.clkdiv, 0);
         pio.write32(base + 0x04, reg.execctrl, 0);
         pio.write32(base + 0x08, reg.shiftctrl, 0);
         pio.write32(base + 0x14, reg.pinctrl, 0);
@@ -64,7 +64,7 @@ fn setup_pio(trace: &Trace) -> PioBlock {
     pio.write32(0x014, SM1_TXF_PRELOAD, 0);
 
     // SM1: replay pre-init instructions from `APIO_SM_EXEC_INSTR`.
-    let sm1_instr_offset = 0x0C8 + 1 * 0x18 + 0x10;
+    let sm1_instr_offset = 0x0C8 + 0x18 + 0x10;
     for &insn in SM1_PRE_INSTRS {
         pio.write32(sm1_instr_offset, insn as u32, 0);
     }

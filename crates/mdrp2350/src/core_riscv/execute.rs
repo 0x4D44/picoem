@@ -31,7 +31,7 @@ fn in_reservable(addr: u32) -> bool {
     // or LR/SC/AMO silently fail (or trap mcause=7) on addresses that the
     // bus happily reads and writes as SRAM.
     let a = canon_oracle_addr(addr);
-    a >= RESERVABLE_LO && a < RESERVABLE_HI
+    (RESERVABLE_LO..RESERVABLE_HI).contains(&a)
 }
 
 impl Hazard3 {
@@ -128,15 +128,9 @@ impl Hazard3 {
                 }
                 // Issue the access.
                 let val: u32 = match kind {
-                    LoadKind::Lb => {
-                        let v = bus.read8(addr, self.hart_id) as i8 as i32 as u32;
-                        v
-                    }
+                    LoadKind::Lb => bus.read8(addr, self.hart_id) as i8 as i32 as u32,
                     LoadKind::Lbu => bus.read8(addr, self.hart_id) as u32,
-                    LoadKind::Lh => {
-                        let v = bus.read16(addr, self.hart_id) as i16 as i32 as u32;
-                        v
-                    }
+                    LoadKind::Lh => bus.read16(addr, self.hart_id) as i16 as i32 as u32,
                     LoadKind::Lhu => bus.read16(addr, self.hart_id) as u32,
                     LoadKind::Lw => bus.read32(addr, self.hart_id),
                 };
@@ -174,7 +168,6 @@ impl Hazard3 {
                 if bus.bus_fault(self.hart_id as usize) {
                     bus.clear_bus_fault(self.hart_id as usize);
                     self.enter_trap(cause::STORE_ACCESS_FAULT, addr, epc, bus);
-                    return;
                 }
             }
 

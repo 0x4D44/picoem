@@ -437,7 +437,7 @@ impl Bus {
     pub(crate) fn qmi_read(&self, offset: u32) -> u32 {
         match offset {
             // DIRECT_CSR: force TXEMPTY (bit 16) + RXEMPTY (bit 17) always set
-            0x000 => self.qmi_regs.get(0).copied().unwrap_or(0) | (1 << 16) | (1 << 17),
+            0x000 => self.qmi_regs.first().copied().unwrap_or(0) | (1 << 16) | (1 << 17),
             _ => {
                 let idx = (offset >> 2) as usize;
                 self.qmi_regs.get(idx).copied().unwrap_or(0)

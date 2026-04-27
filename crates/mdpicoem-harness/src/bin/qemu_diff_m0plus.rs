@@ -228,7 +228,7 @@ fn run_fuzz(
     for bucket in [&alu, &mem] {
         for tc in bucket {
             done += 1;
-            if done % 1000 == 0 {
+            if done.is_multiple_of(1000) {
                 eprintln!("[{done}/{total}] {fail} failures...");
                 if shutdown_requested() {
                     eprintln!("interrupted (Ctrl-C); exiting cleanly");

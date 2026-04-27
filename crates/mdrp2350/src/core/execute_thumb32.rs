@@ -349,7 +349,7 @@ impl CortexM33 {
                 let mask = ((1u32 << width) - 1) << lsb;
                 if rn == 15 {
                     // BFC: clear bits
-                    self.regs.r[rd] = self.regs.r[rd] & !mask;
+                    self.regs.r[rd] &= !mask;
                 } else {
                     // BFI: insert bits from Rn
                     self.regs.r[rd] = (self.regs.r[rd] & !mask) | ((self.regs.r[rn] << lsb) & mask);
@@ -1075,7 +1075,7 @@ impl CortexM33 {
 
         match sysm {
             // APSR — write NZCVQ flags (mask[1] controls NZCVQ group)
-            0 | 1 | 2 | 3 | 4 => {
+            0..=4 => {
                 if mask & 2 != 0 {
                     self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | (val & 0xF800_0000);
                 }
@@ -1084,7 +1084,7 @@ impl CortexM33 {
                 }
             }
             // IPSR (5), EPSR (6), IEPSR (7) — read-only, ignore writes
-            5 | 6 | 7 => {}
+            5..=7 => {}
             // MSP
             8 => {
                 self.regs.msp = val;
@@ -1158,7 +1158,7 @@ impl CortexM33 {
 
         self.regs.r[rd] = match sysm {
             // APSR / IAPSR / EAPSR / XPSR / combined variants — NZCVQ flags
-            0 | 1 | 2 | 3 | 4 => self.regs.xpsr & 0xF80F_0000,
+            0..=4 => self.regs.xpsr & 0xF80F_0000,
             // IPSR — exception number
             5 => self.regs.xpsr & 0x1FF,
             // EPSR — execution state not readable
@@ -1560,7 +1560,7 @@ impl CortexM33 {
                 self.regs.r[rd_hi] = (result >> 32) as u32;
                 2 // M33 measured: 2 cycles (multiplier)
             }
-            _ => return self.thumb32_undefined(hw0, hw1, bus),
+            _ => self.thumb32_undefined(hw0, hw1, bus),
         }
     }
 
@@ -1930,10 +1930,10 @@ impl CortexM33 {
         sat: bool,
         halving: bool,
     ) -> u32 {
-        let a_lo = (a & 0xFFFF) as u32;
-        let a_hi = (a >> 16) as u32;
-        let b_lo = (b & 0xFFFF) as u32;
-        let b_hi = (b >> 16) as u32;
+        let a_lo = a & 0xFFFF;
+        let a_hi = a >> 16;
+        let b_lo = b & 0xFFFF;
+        let b_hi = b >> 16;
         // Use i32 for subtraction results to handle borrow
         let (r_lo_i, r_hi_i): (i32, i32) = match op {
             0b001 => (a_lo as i32 + b_lo as i32, a_hi as i32 + b_hi as i32), // ADD16
@@ -2038,8 +2038,8 @@ impl CortexM33 {
         let mut result = 0u32;
         let mut ge = 0u32;
         for i in 0..4u32 {
-            let a_byte = ((a >> (i * 8)) & 0xFF) as u32;
-            let b_byte = ((b >> (i * 8)) & 0xFF) as u32;
+            let a_byte = (a >> (i * 8)) & 0xFF;
+            let b_byte = (b >> (i * 8)) & 0xFF;
             let r: i32 = match op {
                 0b000 => (a_byte + b_byte) as i32,
                 0b100 => a_byte as i32 - b_byte as i32,

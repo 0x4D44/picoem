@@ -55,14 +55,14 @@ const DMA_INTR: u32 = DMA_BASE + 0x400;
 const DMA_INTS0: u32 = DMA_BASE + 0x40C;
 const DMA_INTS1: u32 = DMA_BASE + 0x41C;
 const DMA_CH0_CTRL: u32 = DMA_BASE + 0x0C;
-const DMA_CH0_READ_ADDR: u32 = DMA_BASE + 0x00;
+const DMA_CH0_READ_ADDR: u32 = DMA_BASE;
 const IO_BANK0_INTR0: u32 = 0x4002_8230;
 const IO_BANK0_INTR5: u32 = 0x4002_8244;
 const SIO_FIFO_ST: u32 = 0xD000_0050;
 const SIO_INTERP0_CTRL_LANE0: u32 = 0xD000_00AC;
 const SIO_INTERP1_CTRL_LANE0: u32 = 0xD000_00EC;
 const GLITCH_TRIG_STATUS: u32 = 0x4015_8010;
-const SHA256_CSR: u32 = SHA256_BASE + 0x00;
+const SHA256_CSR: u32 = SHA256_BASE;
 const SHA256_WDATA: u32 = SHA256_BASE + 0x04;
 const ADC_FCS: u32 = ADC_BASE + 0x08;
 const ADC_FIFO: u32 = ADC_BASE + 0x0C;
@@ -116,7 +116,7 @@ fn s61_rom_read8_returns_correct_lane() {
     bus.memory.load_rom(&rom);
 
     // Byte 0 = 0xDD, byte 1 = 0xCC, byte 2 = 0xBB, byte 3 = 0xAA.
-    assert_eq!(bus.read8(ROM_BASE + 0, 0), 0xDD);
+    assert_eq!(bus.read8(ROM_BASE, 0), 0xDD);
     assert_eq!(bus.read8(ROM_BASE + 1, 0), 0xCC);
     assert_eq!(bus.read8(ROM_BASE + 2, 0), 0xBB);
     assert_eq!(bus.read8(ROM_BASE + 3, 0), 0xAA);
@@ -128,7 +128,7 @@ fn s61_rom_read16_returns_correct_halfword() {
     let mut rom = vec![0u8; 16];
     rom[0..4].copy_from_slice(&0xAABBCCDDu32.to_le_bytes());
     bus.memory.load_rom(&rom);
-    assert_eq!(bus.read16(ROM_BASE + 0, 0), 0xCCDD);
+    assert_eq!(bus.read16(ROM_BASE, 0), 0xCCDD);
     assert_eq!(bus.read16(ROM_BASE + 2, 0), 0xAABB);
 }
 
@@ -151,7 +151,7 @@ fn s61_rom_write16_is_dropped() {
     let mut rom = vec![0u8; 16];
     rom[0..4].copy_from_slice(&0xAABBCCDDu32.to_le_bytes());
     bus.memory.load_rom(&rom);
-    bus.write16(ROM_BASE + 0, 0x1111, 0);
+    bus.write16(ROM_BASE, 0x1111, 0);
     bus.write16(ROM_BASE + 2, 0x2222, 0);
     assert_eq!(bus.read32(ROM_BASE, 0), 0xAABBCCDD);
 }
@@ -242,11 +242,11 @@ fn s61_sram_matrix_per_lane() {
 fn s61_sram_read_extract_per_lane() {
     let mut bus = Bus::new();
     bus.write32(SRAM_BASE + 0x200, 0xAABBCCDD, 0);
-    assert_eq!(bus.read8(SRAM_BASE + 0x200 + 0, 0), 0xDD);
+    assert_eq!(bus.read8(SRAM_BASE + 0x200, 0), 0xDD);
     assert_eq!(bus.read8(SRAM_BASE + 0x200 + 1, 0), 0xCC);
     assert_eq!(bus.read8(SRAM_BASE + 0x200 + 2, 0), 0xBB);
     assert_eq!(bus.read8(SRAM_BASE + 0x200 + 3, 0), 0xAA);
-    assert_eq!(bus.read16(SRAM_BASE + 0x200 + 0, 0), 0xCCDD);
+    assert_eq!(bus.read16(SRAM_BASE + 0x200, 0), 0xCCDD);
     assert_eq!(bus.read16(SRAM_BASE + 0x200 + 2, 0), 0xAABB);
 }
 
@@ -668,7 +668,7 @@ fn s62_adc_fifo_byte_write_is_swallowed() {
     // Seed FCS with a known pattern so we can detect spill-over.
     bus.write32(ADC_FCS, 0x1122_3344, 0);
     let fcs_before = bus.read32(ADC_FCS, 0);
-    bus.write8(ADC_FIFO + 0, 0x42, 0);
+    bus.write8(ADC_FIFO, 0x42, 0);
     bus.write8(ADC_FIFO + 1, 0x42, 0);
     bus.write8(ADC_FIFO + 2, 0x42, 0);
     bus.write8(ADC_FIFO + 3, 0x42, 0);

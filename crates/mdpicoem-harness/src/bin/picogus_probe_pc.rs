@@ -263,7 +263,7 @@ fn main() {
             break;
         }
         steps += 1;
-        if steps % sample_every == 0 {
+        if steps.is_multiple_of(sample_every) {
             let pc = emu.cores[0].regs.pc();
             let cycles = emu.cycles();
             let dc = cycles - last_sample_cycles;
@@ -442,7 +442,7 @@ fn main() {
     // PINCTRL }, instruction memory INSTR_MEM[0..32].
     for (label, base) in [("PIO0", PIO0_BASE), ("PIO1", PIO1_BASE)] {
         eprintln!("-- {label} @ {base:#010x}");
-        let ctrl = emu.bus.read32(base + 0x000);
+        let ctrl = emu.bus.read32(base);
         let fstat = emu.bus.read32(base + 0x004);
         let fdebug = emu.bus.read32(base + 0x008);
         let flevel = emu.bus.read32(base + 0x00c);
@@ -467,7 +467,7 @@ fn main() {
         // PINCTRL). These start at 0x0c8 for SM0, stride 0x018.
         for sm in 0u32..4 {
             let base_sm = base + 0x0c8 + sm * 0x018;
-            let clkdiv = emu.bus.read32(base_sm + 0x00);
+            let clkdiv = emu.bus.read32(base_sm);
             let execctrl = emu.bus.read32(base_sm + 0x04);
             let shiftctrl = emu.bus.read32(base_sm + 0x08);
             let addr = emu.bus.read32(base_sm + 0x0c);
@@ -491,7 +491,7 @@ fn main() {
     eprintln!("-- DMA @ 0x50000000 (peripheral_regs pass-through; no simulation)");
     for ch in 0u32..2 {
         let base_ch = 0x5000_0000u32 + ch * 0x40;
-        let read_addr = emu.bus.read32(base_ch + 0x00);
+        let read_addr = emu.bus.read32(base_ch);
         let write_addr = emu.bus.read32(base_ch + 0x04);
         let trans_count = emu.bus.read32(base_ch + 0x08);
         let ctrl_trig = emu.bus.read32(base_ch + 0x0c);

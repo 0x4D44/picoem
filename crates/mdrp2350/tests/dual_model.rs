@@ -12,11 +12,14 @@
 //! This test binary requires the `threading` feature (for
 //! `ExecutionModel::Threaded`); it does NOT require the `testing`
 //! feature (no panic injection is used here). The file-level `#[cfg]`
-//! below also gates it to x86_64 Windows — the only host where
-//! `ThreadedEmulator` is compiled in today (see `execution_model.rs`
-//! for the same pattern).
+//! below also gates it to x86_64 Windows / x86_64 Linux — the hosts
+//! where `ThreadedEmulator` is compiled in today (see
+//! `execution_model.rs` for the same pattern).
 
-#![cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#![cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 
 use mdrp2350::{Config, Emulator, EmulatorBuilder, ExecutionModel};
 

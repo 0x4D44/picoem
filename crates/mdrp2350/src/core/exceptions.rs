@@ -49,7 +49,7 @@ impl CortexM33 {
     fn return_address(&self, exc_num: u16) -> u32 {
         match exc_num {
             // Synchronous faults (incl. escalated HardFault): retry the faulting instruction
-            3 | 4 | 5 | 6 | 7 => self.current_instr_addr,
+            3..=7 => self.current_instr_addr,
             // SVC (11), PendSV (14), SysTick (15), external IRQs (16+): next instruction
             _ => self.regs.pc(),
         }

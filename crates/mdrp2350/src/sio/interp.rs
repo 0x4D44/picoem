@@ -447,7 +447,7 @@ mod tests {
         let mut interp = Interp::new();
         interp.accum[0] = 0xAAAA_AAAA;
         // CTRL_LANE0: SHIFT=4, MASK_LSB=0, MASK_MSB=31
-        let ctrl = 4u32 | (0 << 5) | (31 << 10);
+        let ctrl = 4u32 | (31 << 10);
         interp.write(0x2C, ctrl, 0);
         assert_eq!(interp.read(0x14, false), 0x0AAA_AAAA);
     }
@@ -458,7 +458,7 @@ mod tests {
     fn test2_shift_and_mask() {
         let mut interp = Interp::new();
         interp.accum[0] = 0xAAAA_AAAA;
-        let ctrl = 4u32 | (0 << 5) | (7 << 10);
+        let ctrl = 4u32 | (7 << 10);
         interp.write(0x2C, ctrl, 0);
         assert_eq!(interp.read(0x14, false), 0xAA);
     }
@@ -470,7 +470,7 @@ mod tests {
         let mut interp = Interp::new();
         interp.accum[0] = 0x0000_0080;
         // SHIFT=0, MASK_LSB=0, MASK_MSB=7, SIGNED=1.
-        let ctrl = 0u32 | (0 << 5) | (7 << 10) | (1 << 15);
+        let ctrl = (7 << 10) | (1 << 15);
         interp.write(0x2C, ctrl, 0);
         assert_eq!(interp.read(0x14, false), 0xFFFF_FF80);
     }
@@ -482,7 +482,7 @@ mod tests {
         interp.accum[0] = 0x1234_5678;
         interp.accum[1] = 0xDEAD_BEEF; // should be ignored by lane 1
         // CTRL_LANE1: CROSS_INPUT=1, SHIFT=0, MASK_LSB=0, MASK_MSB=31
-        let ctrl = 0u32 | (0 << 5) | (31 << 10) | (1 << 16);
+        let ctrl = (31 << 10) | (1 << 16);
         interp.write(0x30, ctrl, 0);
         // PEEK_LANE1 should read from ACCUM0.
         assert_eq!(interp.read(0x24, false), 0x1234_5678);
@@ -496,7 +496,7 @@ mod tests {
         interp.accum[0] = 0x0000_0100;
         interp.base[0] = 0x0000_0010;
         // SHIFT=4, MASK_LSB=0, MASK_MSB=31, ADD_RAW=1.
-        let ctrl = 4u32 | (0 << 5) | (31 << 10) | (1 << 18);
+        let ctrl = 4u32 | (31 << 10) | (1 << 18);
         interp.write(0x2C, ctrl, 0);
         // Pre-POP: raw=0x100, shifted=0x10, shifted+masked=0x10.
         // POP's returned value: BASE0 + (shifted+masked) = 0x10 + 0x10 = 0x20.

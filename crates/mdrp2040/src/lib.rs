@@ -51,16 +51,11 @@ pub mod threaded;
 ///   on x86_64 Windows hosts with the `threading` cargo feature on.
 ///   Not validated against QEMU/silicon oracles. Not yet wired into
 ///   [`Emulator::step`] — arrives with Stage 3b.4.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ExecutionModel {
+    #[default]
     Serial,
     Threaded,
-}
-
-impl Default for ExecutionModel {
-    fn default() -> Self {
-        ExecutionModel::Serial
-    }
 }
 
 /// Errors returned by [`EmulatorBuilder::build`] once the Stage 3b.4
@@ -256,18 +251,30 @@ pub struct Emulator {
     /// Live 3-thread runtime when `execution_model == Threaded` and the
     /// first `run` / `run_quantum` has fired. Takes ownership of the
     /// pre-seeded cores / bus / clock during lazy `promote_to_threaded`.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     pub(crate) threaded: Option<threaded::ThreadedEmulator>,
     /// Sticky panic record from a Threaded worker. Set once when
     /// `run_quantum` / `run` observes a worker panic; every subsequent
     /// call returns this cached error without re-attempting workers.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     pub(crate) panic_info: Option<(WorkerName, String)>,
     /// Sticky watchdog-timeout record from a Threaded run. Set once
     /// when `run_quantum` / `run` observes a barrier timeout; every
     /// subsequent call returns this cached error without re-attempting
     /// workers. HLD V1 §6.6 Stage 5.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     pub(crate) timeout_info: Option<(WorkerName, u32)>,
     /// Test-only panic injector. Armed via
     /// [`Self::inject_panic_for_testing`]; consumed on the next
@@ -277,7 +284,7 @@ pub struct Emulator {
         feature = "testing",
         feature = "threading",
         target_arch = "x86_64",
-        target_os = "windows"
+        any(target_os = "windows", target_os = "linux")
     ))]
     pub(crate) pending_panic_inject: Option<WorkerName>,
     /// `true` once `promote_to_threaded` has moved the seeded state
@@ -289,7 +296,11 @@ pub struct Emulator {
     ///
     /// Known escape: raw field access (`emu.bus.*`) bypasses the
     /// guarded accessors — documented in `tech_debt.md`.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     pub(crate) bus_is_placeholder: bool,
 }
 
@@ -315,7 +326,11 @@ impl Emulator {
     /// snapshot (valid between `run_quantum` calls). Returns 0 on
     /// Threaded before the first `run_quantum` (cores not yet taken).
     pub fn core_cycles(&self, idx: u8) -> u64 {
-        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         if let Some(t) = &self.threaded {
             return t.core_cycles(idx);
         }
@@ -326,7 +341,11 @@ impl Emulator {
     }
 
     /// Placeholder-guard message shared by the typed accessors below.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     const PLACEHOLDER_GUARD_MSG: &'static str = "direct field access on cores/bus/clock is Serial-only; emulator is in \
          Threaded mode — use typed accessors like core_cycles(), master_cycle(), \
          gpio_read() instead";
@@ -335,7 +354,11 @@ impl Emulator {
     /// platforms and in release builds.
     #[inline(always)]
     fn assert_not_placeholder(&self) {
-        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         debug_assert!(!self.bus_is_placeholder, "{}", Self::PLACEHOLDER_GUARD_MSG);
     }
 
@@ -582,14 +605,22 @@ impl Emulator {
     /// sub-quantum edge timing; mdrp2350 has no equivalent peripheral.
     pub fn step(&mut self) -> Result<u64, EmulatorError> {
         if self.execution_model == ExecutionModel::Threaded {
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             if let Some((which, message)) = &self.panic_info {
                 return Err(EmulatorError::WorkerPanicked {
                     which: *which,
                     message: message.clone(),
                 });
             }
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             if let Some((which, elapsed_ms)) = self.timeout_info {
                 return Err(EmulatorError::BarrierTimeout { which, elapsed_ms });
             }
@@ -871,7 +902,11 @@ impl Emulator {
             }
             return Ok(self.clock.cycles.wrapping_sub(start));
         }
-        #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+        #[cfg(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         {
             if let Some((which, message)) = &self.panic_info {
                 return Err(EmulatorError::WorkerPanicked {
@@ -901,7 +936,11 @@ impl Emulator {
                 }
             }
         }
-        #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+        #[cfg(not(all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
         {
             let _ = cycles;
             Err(EmulatorError::NotSupportedInThreadedMode)
@@ -923,7 +962,11 @@ impl Emulator {
         }
     }
 
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     fn run_quantum_threaded(&mut self) -> Result<u64, EmulatorError> {
         if let Some((which, message)) = &self.panic_info {
             return Err(EmulatorError::WorkerPanicked {
@@ -953,14 +996,22 @@ impl Emulator {
         }
     }
 
-    #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+    #[cfg(not(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
     fn run_quantum_threaded(&mut self) -> Result<u64, EmulatorError> {
         Err(EmulatorError::NotSupportedInThreadedMode)
     }
 
     /// Forward any pending `inject_panic_for_testing` target into the
     /// live `ThreadedEmulator`. No-op on non-testing builds.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     #[inline]
     fn apply_pending_panic_inject(&mut self) {
         #[cfg(feature = "testing")]
@@ -977,7 +1028,11 @@ impl Emulator {
     /// carried over. After promotion, the top-level `cores` / `bus` /
     /// `clock` fields hold zero-cost placeholders and must not be
     /// inspected mid-run.
-    #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     fn promote_to_threaded(&mut self) {
         let placeholder_bus = Bus::new();
         let placeholder_cores = [CortexM0Plus::with_id(0), CortexM0Plus::with_id(1)];
@@ -1017,7 +1072,7 @@ impl Emulator {
         feature = "testing",
         feature = "threading",
         target_arch = "x86_64",
-        target_os = "windows"
+        any(target_os = "windows", target_os = "linux")
     ))]
     pub fn inject_panic_for_testing(&mut self, which: WorkerName) {
         self.pending_panic_inject = Some(which);
@@ -1052,12 +1107,12 @@ impl Emulator {
             out = (out & !pio_mask) | (pio.pad_out & pio_mask);
         }
         out &= 0x3FFF_FFFF;
-        if let Some(ref mut psram) = self.bus.psram {
-            if let Some(miso) = psram.tick(out) {
-                let pin = psram.pin_miso();
-                let mask = 1u32 << pin;
-                out = (out & !mask) | ((miso as u32) << pin);
-            }
+        if let Some(ref mut psram) = self.bus.psram
+            && let Some(miso) = psram.tick(out)
+        {
+            let pin = psram.pin_miso();
+            let mask = 1u32 << pin;
+            out = (out & !mask) | ((miso as u32) << pin);
         }
         let ext_mask = self.bus.external_gpio_in_mask;
         if ext_mask != 0 {
@@ -1359,10 +1414,14 @@ impl EmulatorBuilder {
             #[cfg(not(all(
                 feature = "threading",
                 target_arch = "x86_64",
-                target_os = "windows"
+                any(target_os = "windows", target_os = "linux")
             )))]
             return Err(ConfigError::ThreadingUnavailable);
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             {
                 let n = std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -1387,20 +1446,36 @@ impl EmulatorBuilder {
             pio0_sm0_pc_advances: 0,
             pio0_sm0_last_pc: 0xFF,
             execution_model: self.execution,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             threaded: None,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             panic_info: None,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             timeout_info: None,
             #[cfg(all(
                 feature = "testing",
                 feature = "threading",
                 target_arch = "x86_64",
-                target_os = "windows"
+                any(target_os = "windows", target_os = "linux")
             ))]
             pending_panic_inject: None,
-            #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
             bus_is_placeholder: false,
         };
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.

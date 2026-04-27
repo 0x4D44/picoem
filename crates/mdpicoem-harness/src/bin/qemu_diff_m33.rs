@@ -291,7 +291,7 @@ fn run_fuzz(
     for (_label, bucket) in &buckets {
         for tc in *bucket {
             done += 1;
-            if done % 1000 == 0 {
+            if done.is_multiple_of(1000) {
                 eprintln!("[{done}/{total}] {fail} failures...");
                 // Cheap check at the existing heartbeat — keeps Ctrl-C
                 // latency under ~1 s without touching the per-instruction

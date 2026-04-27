@@ -1357,7 +1357,7 @@ fn encode_addw(rd: u8, rn: u8, imm12: u16) -> (u16, u16) {
     let i = (imm12 >> 11) & 1;
     let imm3 = (imm12 >> 8) & 0x7;
     let imm8 = imm12 & 0xFF;
-    let hw0: u16 = 0xF200 | ((0b00000u16) << 4) | (i << 10) | (rn as u16);
+    let hw0: u16 = 0xF200 | (i << 10) | (rn as u16);
     let hw1: u16 = (imm3 << 12) | ((rd as u16) << 8) | imm8;
     (hw0, hw1)
 }
@@ -3383,7 +3383,7 @@ fn enc_vldr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
     let d = sd & 1;
     let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
-    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    let imm8 = offset.unsigned_abs() >> 2;
     // hw0: 1110_110P_UD_W_L_Rn, P=1, W=0, L=1 → bits = 1101_U_D_01
     let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | (1 << 4) | rn;
     let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
@@ -3395,7 +3395,7 @@ fn enc_vstr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
     let d = sd & 1;
     let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
-    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    let imm8 = offset.unsigned_abs() >> 2;
     // P=1, W=0, L=0 → bits = 1101_U_D_00
     let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | rn;
     let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
@@ -5101,8 +5101,6 @@ fn umaal() {
 // Tests marked "Phase 2 API" require new methods/structs that don't exist yet.
 // They are #[ignore]d so the test suite compiles but clearly shows gaps.
 
-use crate::memory::Memory;
-
 // ============================================================================
 // 2.1 Address Decode Routing
 // ============================================================================
@@ -5366,7 +5364,7 @@ fn atomic_alias_normal_write() {
     // Base+0x0000: normal write replaces the value.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000; // APB peripheral base (generic, not a stub peripheral)
-    bus.write32(base + 0x0000, 0xFF00_FF00, 0);
+    bus.write32(base, 0xFF00_FF00, 0);
     assert_eq!(bus.read32(base, 0), 0xFF00_FF00);
 }
 
@@ -5375,7 +5373,7 @@ fn atomic_alias_xor_write() {
     // Base+0x1000: XOR — new_val = old_val ^ written_val.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
-    bus.write32(base + 0x0000, 0xFF00_FF00, 0); // seed value
+    bus.write32(base, 0xFF00_FF00, 0); // seed value
     bus.write32(base + 0x1000, 0x0F0F_0F0F, 0); // XOR alias
     assert_eq!(bus.read32(base, 0), 0xF00F_F00F);
 }
@@ -5385,7 +5383,7 @@ fn atomic_alias_set_write() {
     // Base+0x2000: SET — new_val = old_val | written_val.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
-    bus.write32(base + 0x0000, 0x0000_00FF, 0); // seed value
+    bus.write32(base, 0x0000_00FF, 0); // seed value
     bus.write32(base + 0x2000, 0x0000_FF00, 0); // SET alias
     assert_eq!(bus.read32(base, 0), 0x0000_FFFF);
 }
@@ -5395,7 +5393,7 @@ fn atomic_alias_clr_write() {
     // Base+0x3000: CLR — new_val = old_val & ~written_val.
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
-    bus.write32(base + 0x0000, 0xFFFF_FFFF, 0); // seed value
+    bus.write32(base, 0xFFFF_FFFF, 0); // seed value
     bus.write32(base + 0x3000, 0x00FF_00FF, 0); // CLR alias
     assert_eq!(bus.read32(base, 0), 0xFF00_FF00);
 }
@@ -5406,7 +5404,7 @@ fn atomic_alias_read_ignores_alias_bits() {
     let (_, mut bus) = core_and_bus();
     let base = 0x4006_0000;
     bus.write32(base, 0xBEEF_CAFE, 0);
-    assert_eq!(bus.read32(base + 0x0000, 0), 0xBEEF_CAFE);
+    assert_eq!(bus.read32(base, 0), 0xBEEF_CAFE);
     assert_eq!(bus.read32(base + 0x1000, 0), 0xBEEF_CAFE); // XOR alias read
     assert_eq!(bus.read32(base + 0x2000, 0), 0xBEEF_CAFE); // SET alias read
     assert_eq!(bus.read32(base + 0x3000, 0), 0xBEEF_CAFE); // CLR alias read
@@ -6285,7 +6283,7 @@ fn test_external_irq_pend_plus_enable_enters_handler() {
 
     assert_eq!(
         emu.cores.expect_arm_mut()[0].regs.ipsr(),
-        16 + 0,
+        16,
         "IPSR must be TIMER0_IRQ_0 (exception 16)"
     );
     assert_eq!(
@@ -6370,7 +6368,7 @@ fn test_external_irq_basepri_zero_is_transparent() {
     core0_step(&mut emu);
     assert_eq!(
         emu.cores.expect_arm_mut()[0].regs.ipsr(),
-        16 + 0,
+        16,
         "BASEPRI=0 is transparent; IRQ 0 must dispatch"
     );
 }
@@ -6550,7 +6548,7 @@ fn test_mmio_nvic_ispr_write_mirrors_into_irq_pending_and_dispatches() {
     core0_step(&mut emu);
     assert_eq!(
         emu.cores.expect_arm_mut()[0].regs.ipsr(),
-        16 + 0,
+        16,
         "MMIO-pended IRQ 0 must enter exception 16 on next step"
     );
 }
@@ -6755,13 +6753,13 @@ fn test_execution_priority_basepri_vs_higher_priority_irq() {
     // blocked — `can_preempt(0xC0_irq)` should return false.
     let mut emu = load_external_irq_emu();
     emu.core_mut(0).regs.basepri = 0x80;
-    let can = emu.core_mut(0).can_preempt(16 + 0); // IRQ 0 priority 0
+    let can = emu.core_mut(0).can_preempt(16); // IRQ 0 priority 0
     assert!(can, "IRQ at priority 0 always beats BASEPRI 0x80");
     // But an IRQ with priority 0xC0 set via NVIC_IPR should NOT preempt.
     emu.core_mut(0)
         .ppb
         .write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
-    let can_irq0_at_0xc0 = emu.core_mut(0).can_preempt(16 + 0);
+    let can_irq0_at_0xc0 = emu.core_mut(0).can_preempt(16);
     assert!(
         !can_irq0_at_0xc0,
         "IRQ 0 at priority 0xC0 must not preempt BASEPRI 0x80"
@@ -7433,7 +7431,7 @@ fn bootrom_diagnostic_run() {
 
         // Report when we first enter a fault handler
         let ipsr = emu.cores.expect_arm_mut()[0].regs.ipsr();
-        if ipsr >= 2 && ipsr <= 6 && !fault_reported {
+        if (2..=6).contains(&ipsr) && !fault_reported {
             fault_reported = true;
             let exc_name = match ipsr {
                 2 => "NMI",
@@ -7494,7 +7492,7 @@ fn bootrom_diagnostic_run() {
                 eprintln!("  Max bootrom PC reached={:#010x}", max_pc);
                 // Try to read stacked PC from exception frame
                 let sp = c0.regs.msp;
-                if sp >= 0x2000_0000 && sp < 0x2008_0000 {
+                if (0x2000_0000..0x2008_0000).contains(&sp) {
                     let stacked_pc = emu.peek(sp + 24);
                     let stacked_lr = emu.peek(sp + 20);
                     let stacked_xpsr = emu.peek(sp + 28);
@@ -7719,7 +7717,7 @@ fn test_flash_boot_blinky() {
         let pc = emu.cores.expect_arm_mut()[0].regs.pc();
 
         // Detect when execution enters flash
-        if pc >= 0x1000_0000 && pc < 0x2000_0000 && !entered_flash {
+        if (0x1000_0000..0x2000_0000).contains(&pc) && !entered_flash {
             entered_flash = true;
             eprintln!("[cycle {:>8}] Entered flash at PC={:#010x}", cycle, pc);
         }
@@ -7756,7 +7754,7 @@ fn test_flash_boot_blinky() {
 
     // PC should be in the blinky's delay loop (0x100000B8-0x100000BA)
     assert!(
-        pc >= 0x1000_0060 && pc < 0x1000_0100,
+        (0x1000_0060..0x1000_0100).contains(&pc),
         "PC should be in blinky code region (PC={:#010x})",
         pc
     );
@@ -10591,7 +10589,7 @@ fn powman_match_enters_emulator_handler() {
 
     // Vector table: slot 0 = initial MSP, slot 1 = reset handler
     // (never taken; we manually set PC). Slot 61 = POWMAN timer.
-    emu.bus.write32(VT_BASE + 0, STACK_TOP, 0);
+    emu.bus.write32(VT_BASE, STACK_TOP, 0);
     // Reset vector — irrelevant for this test but well-formed.
     emu.bus.write32(VT_BASE + 4, (VT_BASE + 0x100) | 1, 0);
     // Slot 61 = IRQ 45 handler (Thumb LSB set).
@@ -10641,7 +10639,7 @@ fn powman_match_enters_emulator_handler() {
 
     // Run long enough for alarm to fire and IRQ to dispatch. 100 ticks
     // of POWMAN plus margin for exception-entry cycles.
-    let budget = (100 * POWMAN_SYS_PER_TICK as u64) + 500;
+    let budget = (100 * POWMAN_SYS_PER_TICK) + 500;
     emu.run(budget).unwrap();
 
     // Core 0 should have entered the handler. PC lands at HANDLER_ADDR
@@ -14275,7 +14273,7 @@ mod stage2_bus_coverage {
         );
         let _ = bus.read8(crate::peripherals::i2c::I2C1_BASE + 0x70, 0);
         // ADC — read CS (non-FIFO).
-        let _ = bus.read8(crate::peripherals::adc::ADC_BASE + 0x00, 0);
+        let _ = bus.read8(crate::peripherals::adc::ADC_BASE, 0);
         // PWM — read EN.
         let _ = bus.read8(crate::peripherals::pwm::PWM_BASE + 0xF0, 0);
         // IO_BANK0 / PADS_BANK0.
@@ -14474,13 +14472,13 @@ mod stage2_bus_coverage {
         );
         // Halfword writes with alias=SET (0x2000). Drives the `alias != 0`
         // half-shift arm on every Phase 2 base.
-        bus.write16(uart::UART0_BASE + uart::UARTIBRD | 0x2000, 0x01, 0);
-        bus.write16(uart::UART1_BASE + uart::UARTIBRD | 0x2000, 0x01, 0);
-        bus.write16(spi::SPI0_BASE + spi::SSPCPSR | 0x2000, 0x10, 0);
-        bus.write16(spi::SPI1_BASE + spi::SSPCPSR | 0x2000, 0x10, 0);
-        bus.write16(i2c::I2C0_BASE + i2c::IC_SS_SCL_HCNT | 0x2000, 0x11, 0);
-        bus.write16(i2c::I2C1_BASE + i2c::IC_SS_SCL_HCNT | 0x2000, 0x11, 0);
-        bus.write16(adc::ADC_BASE + adc::CS | 0x2000, 0x01, 0);
+        bus.write16((uart::UART0_BASE + uart::UARTIBRD) | 0x2000, 0x01, 0);
+        bus.write16((uart::UART1_BASE + uart::UARTIBRD) | 0x2000, 0x01, 0);
+        bus.write16((spi::SPI0_BASE + spi::SSPCPSR) | 0x2000, 0x10, 0);
+        bus.write16((spi::SPI1_BASE + spi::SSPCPSR) | 0x2000, 0x10, 0);
+        bus.write16((i2c::I2C0_BASE + i2c::IC_SS_SCL_HCNT) | 0x2000, 0x11, 0);
+        bus.write16((i2c::I2C1_BASE + i2c::IC_SS_SCL_HCNT) | 0x2000, 0x11, 0);
+        bus.write16((adc::ADC_BASE + adc::CS) | 0x2000, 0x01, 0);
         bus.write16(pwm::PWM_BASE | 0x2000, 0x01, 0);
         bus.write16(io_bank0::IO_BANK0_BASE | 0x2000, 0x01, 0);
         bus.write16(pads_bank0::PADS_BANK0_BASE | 0x2000, 0x01, 0);
@@ -14498,7 +14496,7 @@ mod stage2_bus_coverage {
         );
         // UART0/1 IBRD byte/half alias 0 (RMW) and alias 2 (SET).
         bus.write8(uart::UART0_BASE + uart::UARTIBRD, 0x11, 0);
-        bus.write8(uart::UART0_BASE + uart::UARTIBRD | 0x2000, 0x01, 0);
+        bus.write8((uart::UART0_BASE + uart::UARTIBRD) | 0x2000, 0x01, 0);
         bus.write16(uart::UART0_BASE + uart::UARTIBRD, 0x1122, 0);
         bus.write8(uart::UART1_BASE + uart::UARTIBRD, 0x11, 0);
         bus.write16(uart::UART1_BASE + uart::UARTIBRD, 0x1122, 0);
@@ -14545,7 +14543,7 @@ mod stage2_bus_coverage {
         bus.write32(otp::OTP_DATA_BASE, 0x12345678, 0);
         // TRNG / SHA256.
         bus.write32(trng::TRNG_BASE + 0x08, 1, 0);
-        bus.write32(sha256::SHA256_BASE + 0x00, 0x01, 0);
+        bus.write32(sha256::SHA256_BASE, 0x01, 0);
         // POWMAN.
         bus.write32(crate::peripherals::powman::POWMAN_BASE + 0x04, 1, 0);
     }
@@ -14558,7 +14556,7 @@ mod stage2_bus_coverage {
         // CTRL ENABLE = bit 30, LOAD = offset 0x8, LOAD takes 24-bit value.
         // Program LOAD first, then enable (CTRL.ENABLE = 1 << 30).
         bus.write32(wb + 0x8, 5, 0);
-        bus.write32(wb + 0x0, 1 << 30, 0);
+        bus.write32(wb, 1 << 30, 0);
         for _ in 0..10 {
             bus.tick_peripherals(1);
             if bus.watchdog_reset_requested() {
@@ -14573,7 +14571,7 @@ mod stage2_bus_coverage {
     fn watchdog_ctrl_trigger_write_arms_reset_immediately() {
         let wb = crate::peripherals::watchdog::WATCHDOG_BASE;
         let mut bus = Bus::new();
-        bus.write32(wb + 0x0, 1 << 31, 0);
+        bus.write32(wb, 1 << 31, 0);
         assert!(bus.watchdog_reset_requested());
         bus.clear_watchdog_reset();
     }
@@ -15060,7 +15058,7 @@ mod stage2_spi_coverage {
         s.write32(SSPCPSR, 2, 0, &mut irqs);
         s.write32(SSPDR, 0xAA, 0, &mut irqs);
         s.tick(0, &tree(), &mut irqs);
-        assert_eq!(s.tx_dreq(), true); // FIFO has room
+        assert!(s.tx_dreq()); // FIFO has room
     }
 
     #[test]
@@ -15705,12 +15703,12 @@ mod stage2_pwm_coverage {
         let mut irqs = 0u64;
         // Slice 2 CSR/DIV/CTR/CC/TOP via 0x00/0x04/0x08/0x0C/0x10.
         let base = 2 * SLICE_STRIDE;
-        p.write32(base + 0x00, CSR_EN, 0, &mut irqs);
+        p.write32(base, CSR_EN, 0, &mut irqs);
         p.write32(base + 0x04, 0x0020, 0, &mut irqs);
         p.write32(base + 0x08, 0x1234, 0, &mut irqs);
         p.write32(base + 0x0C, 0x5678, 0, &mut irqs);
         p.write32(base + 0x10, 0x9ABC, 0, &mut irqs);
-        assert_eq!(p.read32(base + 0x00) & CSR_EN, CSR_EN);
+        assert_eq!(p.read32(base) & CSR_EN, CSR_EN);
         assert_eq!(p.read32(base + 0x04), 0x0020);
         assert_eq!(p.read32(base + 0x08), 0x1234);
         assert_eq!(p.read32(base + 0x0C), 0x5678);
@@ -15765,7 +15763,7 @@ mod stage2_pwm_coverage {
         p.write32(0x00, CSR_EN, 0, &mut irqs); // slice 0 local-enabled
         p.write32(0x10, 100, 0, &mut irqs); // slice 0 TOP = 100
         p.write32(EN, 1, 0, &mut irqs); // slice 0 globally enabled
-        p.write32(SLICE_STRIDE + 0x00, CSR_EN, 0, &mut irqs); // slice 1 local
+        p.write32(SLICE_STRIDE, CSR_EN, 0, &mut irqs); // slice 1 local
         p.write32(SLICE_STRIDE + 0x10, 100, 0, &mut irqs);
         // slice 1 NOT globally enabled — `continue` arm.
         p.tick(1_000, &tree(), &mut irqs);
@@ -16606,7 +16604,7 @@ mod stage3_fpu_coverage {
         let vm = (sm >> 1) & 0xF;
         let m = sm & 1;
         let hw0 = 0xEE00 | (1 << 7) | (d << 6) | (0b11 << 4) | 0b1100;
-        let hw1 = (vd << 12) | 0x0A00 | (0 << 7) | (1 << 6) | (m << 5) | vm;
+        let hw1 = ((vd << 12) | 0x0A00) | (1 << 6) | (m << 5) | vm;
         (hw0, hw1)
     }
 
@@ -16997,7 +16995,7 @@ mod stage3_fpu_coverage {
         c.regs.s[0] = 2.0;
         c.regs.s[2] = 2.0;
         let hw0: u16 = 0xEE00 | (1 << 7) | (0b11 << 4) | 0b0100;
-        let hw1: u16 = 0x0A00 | (1 << 7) | (1 << 6) | (0 << 5) | 1;
+        let hw1: u16 = (0x0A00 | (1 << 7) | (1 << 6)) | 1;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.fpscr & 0xF000_0000, 0x6000_0000);
     }
@@ -17076,8 +17074,8 @@ mod stage3_fpu_coverage {
         let (mut c, mut bus) = core_and_bus();
         c.set_reg(0, 0x2000_0100);
         // P=0 U=1 W=0 L=0 Rn=0, Vd=0 imm8=0 → VSTMIA R0, {none}
-        let hw0: u16 = 0xEC00 | (1 << 7) | 0; // P=0, U=1, W=0, L=0, D=0, Rn=0
-        let hw1: u16 = 0x0A00 | 0; // imm8=0
+        let hw0: u16 = 0xEC00 | (1 << 7); // P=0, U=1, W=0, L=0, D=0, Rn=0
+        let hw1: u16 = 0x0A00; // imm8=0
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(cy, 0);
     }
@@ -17091,7 +17089,7 @@ mod stage3_fpu_coverage {
         c.regs.s[0] = 1.5;
         c.regs.s[1] = 2.5;
         // P=0 U=1 D=0 W=0 L=0 Rn=0, Vd=0 imm8=2
-        let hw0: u16 = 0xEC00 | (1 << 7) | 0; // P=0, U=1, W=0, L=0
+        let hw0: u16 = 0xEC00 | (1 << 7); // P=0, U=1, W=0, L=0
         let hw1: u16 = 0x0A00 | 2;
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(f32::from_bits(bus.read32(base, 0)), 1.5);
@@ -17109,7 +17107,7 @@ mod stage3_fpu_coverage {
         bus.write32(base, 3.25f32.to_bits(), 0);
         bus.write32(base + 4, 6.5f32.to_bits(), 0);
         // P=0 U=1 D=0 W=0 L=1 Rn=0, Vd=0 imm8=2
-        let hw0: u16 = 0xEC00 | (1 << 7) | (1 << 4) | 0;
+        let hw0: u16 = 0xEC00 | (1 << 7) | (1 << 4);
         let hw1: u16 = 0x0A00 | 2;
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.regs.s[0], 3.25);
@@ -17125,7 +17123,7 @@ mod stage3_fpu_coverage {
         c.set_reg(0, base);
         bus.write32(base - 8, 7.0f32.to_bits(), 0);
         bus.write32(base - 4, 8.0f32.to_bits(), 0);
-        let hw0: u16 = 0xED00 | (1 << 5) | (1 << 4) | 0; // P=1 U=0 W=1 L=1
+        let hw0: u16 = 0xED00 | (1 << 5) | (1 << 4); // P=1 U=0 W=1 L=1
         let hw1: u16 = 0x0A00 | 2;
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.regs.s[0], 7.0);
@@ -18025,7 +18023,7 @@ mod stage3_fpu_coverage {
         c.regs.s[1] = 2.0;
         c.regs.s[2] = 3.0;
         c.regs.s[3] = 4.0;
-        let hw0: u16 = 0xEC00 | (1 << 7) | 0;
+        let hw0: u16 = 0xEC00 | (1 << 7);
         let hw1: u16 = 0x0A00 | 4;
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(cy, 4);
@@ -18038,9 +18036,9 @@ mod stage3_fpu_coverage {
         let base = 0x2000_0800u32;
         c.set_reg(0, base);
         for i in 0..4 {
-            bus.write32(base + 4 * i, (i + 10) as u32, 0);
+            bus.write32(base + 4 * i, i + 10, 0);
         }
-        let hw0: u16 = 0xEC00 | (1 << 7) | (1 << 4) | 0;
+        let hw0: u16 = 0xEC00 | (1 << 7) | (1 << 4);
         let hw1: u16 = 0x0A00 | 4;
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(cy, 5);
@@ -18057,7 +18055,7 @@ mod stage3_fpu_coverage {
         bus.write32(base + 8, 9.0f32.to_bits(), 0);
         bus.write32(base + 12, 10.0f32.to_bits(), 0);
         // VLDMIA with D=1,Vd=15 → Sd = 31. count=4.
-        let hw0: u16 = 0xEC00 | (1 << 7) | (1 << 6) | (1 << 4) | 0; // D=1
+        let hw0: u16 = 0xEC00 | (1 << 7) | (1 << 6) | (1 << 4); // D=1
         let hw1: u16 = (15 << 12) | 0x0A00 | 4;
         let _cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.regs.s[31], 7.0);
@@ -18964,7 +18962,7 @@ mod stage7_interp_coverage {
         let mut interp = Interp::new();
         // mask_lsb=10 > mask_msb=5 → mask=0 path.
         // CTRL: SHIFT=0, MASK_LSB=10, MASK_MSB=5
-        let ctrl = 0u32 | (10 << 5) | (5 << 10);
+        let ctrl = (10 << 5) | (5 << 10);
         interp.write(0x2C, ctrl, 0);
         interp.accum[0] = 0xFFFF_FFFF;
         let v = interp.read(0x20, false);
@@ -19057,7 +19055,7 @@ mod stage7_coprocessor_coverage {
         enable_cp(&mut cpu, 2);
         // MCR CP2 encoding. opc1=0, L=0, Rt=0, CRm=0, op2=0.
         let hw0: u16 = 0xEE00;
-        let hw1: u16 = (0u16 << 12) | (2u16 << 8) | 0x10;
+        let hw1: u16 = (2u16 << 8) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
     }
@@ -19069,7 +19067,7 @@ mod stage7_coprocessor_coverage {
         enable_cp(&mut cpu, 0);
         // CDP: bit 4 of hw1 must be 0 (not MCR/MRC).
         let hw0: u16 = 0xEE00;
-        let hw1: u16 = (0u16 << 12) | (0u16 << 8); // coproc=0, bit4=0
+        let hw1: u16 = 0u16 << 8; // coproc=0, bit4=0
         let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cycles, 1);
         assert!(cpu.pending_fault.is_none());
@@ -19083,7 +19081,7 @@ mod stage7_coprocessor_coverage {
         bus.sio.gpio_out = 0x1234;
         // MRC CP0, opc1=0, CRn=0, Rt=3, op2=2 (unknown), CRm=0.
         let hw0: u16 = 0xEE10; // L=1
-        let hw1: u16 = (3u16 << 12) | (0u16 << 8) | (2u16 << 5) | 0x10;
+        let hw1: u16 = (3u16 << 12) | (2u16 << 5) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cpu.regs.r[3], 0);
     }
@@ -19097,7 +19095,7 @@ mod stage7_coprocessor_coverage {
         cpu.regs.r[1] = 0xAAAA;
         // MCR CP0, opc1=0, CRn=0, Rt=1, op2=5 (unknown), CRm=0.
         let hw0: u16 = 0xEE00;
-        let hw1: u16 = (1u16 << 12) | (0u16 << 8) | (5u16 << 5) | 0x10;
+        let hw1: u16 = (1u16 << 12) | (5u16 << 5) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         // gpio_out unchanged.
         assert_eq!(bus.sio.gpio_out, 0x0F0F);
@@ -19111,7 +19109,7 @@ mod stage7_coprocessor_coverage {
         bus.sio.gpio_oe = 0x1234;
         // MRC CP0, opc1=1, CRn=0, Rt=4, op2=1 (unknown), CRm=0.
         let hw0: u16 = 0xEE30; // opc1=1, L=1
-        let hw1: u16 = (4u16 << 12) | (0u16 << 8) | (1u16 << 5) | 0x10;
+        let hw1: u16 = (4u16 << 12) | (1u16 << 5) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cpu.regs.r[4], 0);
     }
@@ -19124,7 +19122,7 @@ mod stage7_coprocessor_coverage {
         bus.sio.gpio_oe = 0x0F0F;
         cpu.regs.r[1] = 0xAAAA;
         let hw0: u16 = 0xEE20; // opc1=1, L=0
-        let hw1: u16 = (1u16 << 12) | (0u16 << 8) | (5u16 << 5) | 0x10;
+        let hw1: u16 = (1u16 << 12) | (5u16 << 5) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(bus.sio.gpio_oe, 0x0F0F);
     }
@@ -19137,7 +19135,7 @@ mod stage7_coprocessor_coverage {
         cpu.regs.r[1] = 0x1234;
         // MCR CP0, opc1=2, CRn=0, CRm=0 — MCR to IN bank, silent NOP.
         let hw0: u16 = 0xEE40; // opc1=2, L=0
-        let hw1: u16 = (1u16 << 12) | (0u16 << 8) | 0x10;
+        let hw1: u16 = (1u16 << 12) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         // Nothing changes.
         assert!(cpu.pending_fault.is_none());
@@ -19151,7 +19149,7 @@ mod stage7_coprocessor_coverage {
         cpu.regs.r[2] = 0xFFFF_FFFF;
         // opc1=4 (HI OUT) MRC
         let hw0: u16 = 0xEE90;
-        let hw1: u16 = (2u16 << 12) | (0u16 << 8) | 0x10;
+        let hw1: u16 = (2u16 << 12) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cpu.regs.r[2], 0);
     }
@@ -19163,7 +19161,7 @@ mod stage7_coprocessor_coverage {
         cpu.regs.r[2] = 0xFFFF_FFFF;
         // opc1=5 (HI OE) MCR
         let hw0: u16 = 0xEEA0;
-        let hw1: u16 = (2u16 << 12) | (0u16 << 8) | 0x10;
+        let hw1: u16 = (2u16 << 12) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(bus.sio.gpio_oe, 0);
     }
@@ -19175,7 +19173,7 @@ mod stage7_coprocessor_coverage {
         enable_cp(&mut cpu, 0);
         // opc1=3 (unknown)
         let hw0: u16 = 0xEE60;
-        let hw1: u16 = (0u16 << 12) | (0u16 << 8) | 0x10;
+        let hw1: u16 = 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
     }
@@ -19353,7 +19351,7 @@ mod stage7_coprocessor_coverage {
         enable_cp(&mut cpu, 4);
         // MCR CP4, opc1=1 (reserved for transfer family) — silent NOP.
         let hw0: u16 = 0xEE00 | (1u16 << 5);
-        let hw1: u16 = (0u16 << 12) | (4u16 << 8) | 0x10;
+        let hw1: u16 = (4u16 << 8) | 0x10;
         assert_eq!(cpu.thumb32_coprocessor(hw0, hw1, &mut bus), 1);
     }
 
@@ -19388,7 +19386,7 @@ mod stage7_coprocessor_coverage {
         bus.atomics.rcp_salt_set(0, 42);
         // MRC2 cp7, opc1=1, opc2=0, Rt=15.
         let hw0: u16 = 0xFE10 | (1u16 << 5); // opc1=1, L=1
-        let hw1: u16 = (15u16 << 12) | (7u16 << 8) | (0u16 << 5) | 0x10;
+        let hw1: u16 = ((15u16 << 12) | (7u16 << 8)) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_ne!(
             cpu.regs.xpsr & (1 << 31),
@@ -19405,7 +19403,7 @@ mod stage7_coprocessor_coverage {
         bus.atomics.rcp_salt_set(0, 42);
         let before = cpu.regs.xpsr;
         let hw0: u16 = 0xFE10 | (1u16 << 5);
-        let hw1: u16 = (1u16 << 12) | (7u16 << 8) | (0u16 << 5) | 0x10; // Rt=1
+        let hw1: u16 = ((1u16 << 12) | (7u16 << 8)) | 0x10; // Rt=1
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cpu.regs.xpsr, before);
     }
@@ -19431,7 +19429,7 @@ mod stage7_coprocessor_coverage {
         // hw0 = 0xFC40 | Rt2, hw1 = (Rt<<12)|(coproc<<8)|(opc1<<4)|CRm
         cpu.regs.r[3] = 0;
         let hw0: u16 = 0xFC40 | 3;
-        let hw1: u16 = (2u16 << 12) | (7u16 << 8) | (8u16 << 4) | 0;
+        let hw1: u16 = (2u16 << 12) | (7u16 << 8) | (8u16 << 4);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(bus.atomics.rcp_salt_load(0), 0xDEAD);
         // CRm=1 → salt core 1.
@@ -19446,7 +19444,7 @@ mod stage7_coprocessor_coverage {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 7);
         let hw0: u16 = 0xFC40;
-        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (8u16 << 4) | 2; // CRm=2 unknown
+        let hw1: u16 = (7u16 << 8) | (8u16 << 4) | 2; // CRm=2 unknown
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
     }
@@ -19457,7 +19455,7 @@ mod stage7_coprocessor_coverage {
         enable_cp(&mut cpu, 7);
         // MCRR2 cp7 opc1=3 (unknown) — silent NOP.
         let hw0: u16 = 0xFC40;
-        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (3u16 << 4) | 0;
+        let hw1: u16 = (7u16 << 8) | (3u16 << 4);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
     }
@@ -19473,7 +19471,7 @@ mod stage7_coprocessor_coverage {
         enable_cp(&mut cpu, 7);
         // CDP cp7 opc1=1 opc2=0 — unrecognized, silent NOP.
         let hw0: u16 = 0xEE10;
-        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (0u16 << 5); // bit 4 = 0 → CDP
+        let hw1: u16 = 7u16 << 8; // bit 4 = 0 → CDP
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
     }
@@ -19484,7 +19482,7 @@ mod stage7_coprocessor_coverage {
         enable_cp(&mut cpu, 7);
         // MCR2 cp7 opc1=6 opc2=0 (rcp_ifgte — NOT implemented).
         let hw0: u16 = 0xFE00 | (6u16 << 5);
-        let hw1: u16 = (0u16 << 12) | (7u16 << 8) | (0u16 << 5) | 0x10;
+        let hw1: u16 = (7u16 << 8) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
     }
@@ -19884,7 +19882,7 @@ mod stage7_exceptions_coverage {
         // Exercise the public static decoder directly.
         let encoded = ((0xABu32 & 0xC0) << 19) | ((0xABu32 & 0x3F) << 10);
         let decoded = CortexM33::decode_it_from_xpsr(encoded);
-        assert_eq!(decoded, 0xAB & 0xFF);
+        assert_eq!(decoded, 0xAB);
     }
 
     // execute_tt: SAU disabled + MPU match.
@@ -19892,7 +19890,7 @@ mod stage7_exceptions_coverage {
     fn tt_sau_off_with_mpu_match() {
         let mut cpu = CortexM33::for_test(0);
         cpu.ppb.mpu_ctrl = 1;
-        cpu.ppb.mpu_regions[0] = (0x2000_0000 | 0, 0x2000_FFFF | 1); // AP=0 RW, EN=1
+        cpu.ppb.mpu_regions[0] = (0x2000_0000, 0x2000_FFFF | 1); // AP=0 RW, EN=1
         // SAU disabled.
         cpu.ppb.sau_ctrl = 0;
         let r = cpu.execute_tt(0x2000_0500);
@@ -20303,7 +20301,7 @@ mod stage7_dma_coverage {
         let mut bus = Bus::new();
         release_dma(&mut bus);
         // Write distinct values via base alias, read back through each alias.
-        bus.write32(DMA_BASE + 0x00, 0x1111, 0); // READ_ADDR
+        bus.write32(DMA_BASE, 0x1111, 0); // READ_ADDR
         bus.write32(DMA_BASE + 0x04, 0x2222, 0); // WRITE_ADDR
         bus.write32(DMA_BASE + 0x08, 5, 0); // TRANS_COUNT
         // AL1_READ_ADDR (0x14) reads READ_ADDR.
@@ -20324,7 +20322,7 @@ mod stage7_dma_coverage {
     fn write_al2_trans_count_trig_triggers_transfer() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        bus.write32(DMA_BASE + 0x00, 0x2000_0200, 0);
+        bus.write32(DMA_BASE, 0x2000_0200, 0);
         bus.write32(DMA_BASE + 0x04, 0x2000_0300, 0);
         bus.write32(DMA_BASE + 0x2C, 0x2000_0300, 0); // AL2_WRITE_ADDR
         // EN=1, DATA_SIZE=2, INCR_READ=1, INCR_WRITE=1, TREQ=63.
@@ -20352,7 +20350,7 @@ mod stage7_dma_coverage {
     fn al1_write_addr_trig_triggers() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        bus.write32(DMA_BASE + 0x00, 0x2000_0200, 0);
+        bus.write32(DMA_BASE, 0x2000_0200, 0);
         bus.write32(DMA_BASE + 0x08, 1, 0);
         bus.write32(DMA_BASE + 0x10, 0x007E_0059, 0);
         bus.write32(DMA_BASE + 0x18, 0x2000_0300, 0); // AL1_WRITE_ADDR_TRIG
@@ -20375,11 +20373,11 @@ mod stage7_dma_coverage {
         // Pre-program ch0 and ch1.
         bus.write32(0x2000_0100, 0x1111, 0);
         bus.write32(0x2000_0200, 0x2222, 0);
-        bus.write32(DMA_BASE + 0x00, 0x2000_0100, 0);
+        bus.write32(DMA_BASE, 0x2000_0100, 0);
         bus.write32(DMA_BASE + 0x04, 0x2000_0400, 0);
         bus.write32(DMA_BASE + 0x08, 1, 0);
         bus.write32(DMA_BASE + 0x10, 0x007E_0059, 0); // ch0 AL1_CTRL no trigger
-        bus.write32(DMA_BASE + 0x40 + 0x00, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + 0x40, 0x2000_0200, 0);
         bus.write32(DMA_BASE + 0x40 + 0x04, 0x2000_0500, 0);
         bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0);
         bus.write32(DMA_BASE + 0x40 + 0x10, 0x007E_0059, 0);
@@ -20402,7 +20400,7 @@ mod stage7_dma_coverage {
     fn read_dma_dbg_ctdreq_region() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        bus.write32(DMA_BASE + 0x00, 0x2000, 0);
+        bus.write32(DMA_BASE, 0x2000, 0);
         bus.write32(DMA_BASE + 0x08, 7, 0);
         // DBG_TCR (base + 0x800 + ch*0x40 + 4)
         assert_eq!(bus.read32(DMA_BASE + 0x804, 0), 7);
@@ -20454,7 +20452,7 @@ mod stage7_dma_coverage {
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
         bus.write32(src, 0x42, 0);
-        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE, src, 0);
         bus.write32(DMA_BASE + 0x04, dst, 0);
         bus.write32(DMA_BASE + 0x08, 1, 0);
         bus.write32(DMA_BASE + 0x0C, 0x007E_0059, 0);
@@ -20472,7 +20470,7 @@ mod stage7_dma_coverage {
         let src: u32 = 0x2000_0100;
         let dst: u32 = 0x2000_0200;
         bus.write32(src, 0x42, 0);
-        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE, src, 0);
         bus.write32(DMA_BASE + 0x04, dst, 0);
         bus.write32(DMA_BASE + 0x08, 1, 0);
         bus.write32(DMA_BASE + 0x0C, 0x007E_0059, 0);
@@ -20501,7 +20499,7 @@ mod stage7_dma_coverage {
         for i in 0..4u32 {
             bus.write32(src + i * 4, 0x9000 + i, 0);
         }
-        bus.write32(DMA_BASE + 0x00, src, 0);
+        bus.write32(DMA_BASE, src, 0);
         bus.write32(DMA_BASE + 0x04, dst, 0);
         bus.write32(DMA_BASE + 0x08, 4, 0);
         // Ring on READ (RING_SEL=0), RING_SIZE=3 (8 bytes).
@@ -20612,7 +20610,7 @@ mod stage7_lib_coverage {
     #[test]
     fn reset_clears_cores() {
         let mut emu = Emulator::new(Config::default());
-        emu.load_bootrom(&vec![0; 128]);
+        emu.load_bootrom(&[0; 128]);
         emu.reset();
         assert_eq!(emu.cycles(), 0);
     }
@@ -21136,7 +21134,7 @@ mod stage7_ppb_coverage {
 
     #[test]
     fn any_pending_enabled_true_false() {
-        let mut ppb = Ppb::default();
+        let ppb = Ppb::default();
         ppb.nvic_iser[0].store(0x1, std::sync::atomic::Ordering::Relaxed);
         assert!(ppb.any_pending_enabled(0x1));
         assert!(!ppb.any_pending_enabled(0x2));

@@ -675,7 +675,7 @@ impl WorkerBus {
 
     fn ahb_read32(&mut self, addr: u32) -> u32 {
         let canonical = addr & !0x3000;
-        let base = canonical & 0xFFFF_F000;
+        let _base = canonical & 0xFFFF_F000;
         let offset = canonical & 0x0000_0FFF;
         // PIO blocks are 0x10_0000 bytes apart; mask the block bit out
         // to get the per-block base.
@@ -693,9 +693,7 @@ impl WorkerBus {
             return self.shared.pio.snapshot_read32(block, offset);
         }
         // DMA, XIP_CTRL, SSI all fall through to legacy HashMap.
-        match base {
-            _ => self.legacy_read(canonical),
-        }
+        self.legacy_read(canonical)
     }
 
     fn ahb_write32(&mut self, addr: u32, val: u32) {

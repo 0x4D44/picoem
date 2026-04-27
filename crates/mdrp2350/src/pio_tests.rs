@@ -212,7 +212,7 @@ fn test_pio_blinky_gpio25() {
     pio_write(&mut emu, 0x0DC, pinctrl);
 
     // SM0_EXECCTRL: wrap_top=2, wrap_bottom=0
-    let execctrl = (2u32 << 12) | (0u32 << 7);
+    let execctrl = 2u32 << 12;
     pio_write(&mut emu, 0x0CC, execctrl);
 
     // Force-execute SET PINDIRS, 1 to enable output on pin 25.
@@ -281,7 +281,7 @@ fn test_pio_uart_tx_0x55() {
     pio_write(&mut emu, 0x0DC, pinctrl);
 
     // SM0_EXECCTRL: wrap_top=4, wrap_bottom=0
-    let execctrl = (4u32 << 12) | (0u32 << 7);
+    let execctrl = 4u32 << 12;
     pio_write(&mut emu, 0x0CC, execctrl);
 
     // SM0_SHIFTCTRL: OUT_SHIFTDIR=1 (shift right, LSB first).
@@ -399,13 +399,11 @@ fn test_pio_spi_clk_mosi() {
     let pinctrl = (1u32 << 29)   // sideset_count=1
                 | (2u32 << 26)   // set_count=2
                 | (1u32 << 20)   // out_count=1
-                | (1u32 << 10)   // sideset_base=1
-                | (0u32 << 5)    // set_base=0
-                | (0u32); // out_base=0
+                | (1u32 << 10); // out_base=0
     pio_write(&mut emu, 0x0DC, pinctrl);
 
     // SM0_EXECCTRL: wrap_top=4, wrap_bottom=0, SIDE_EN=0
-    let execctrl = (4u32 << 12) | (0u32 << 7);
+    let execctrl = 4u32 << 12;
     pio_write(&mut emu, 0x0CC, execctrl);
 
     // Force-execute SET PINDIRS, 3 — bits[1:0] drive the direction
@@ -447,7 +445,7 @@ fn test_pio_spi_clk_mosi() {
     let expected_clk: Vec<bool> = (0..total_steps)
         .map(|i| {
             // OUT steps at 0-indexed: 2, 4, 6, 8, 10, 12, 14, 16
-            i >= 2 && i <= 16 && i % 2 == 0
+            (2..=16).contains(&i) && i % 2 == 0
         })
         .collect();
 
@@ -617,13 +615,12 @@ fn test_pio_resets_gating() {
     emu.bus.write32(PIO0_BASE + 0x04C, jmp_0 as u32, 0);
 
     // SM0_EXECCTRL: wrap_top=1, wrap_bottom=0.
-    emu.bus
-        .write32(PIO0_BASE + 0x0CC, (1u32 << 12) | (0u32 << 7), 0);
+    emu.bus.write32(PIO0_BASE + 0x0CC, 1u32 << 12, 0);
     // SM0_CLKDIV: integer=1, frac=0 (one instruction per system clock).
     emu.bus.write32(PIO0_BASE + 0x0C8, 1u32 << 16, 0);
 
     // Enable SM0 via CTRL.
-    emu.bus.write32(PIO0_BASE + 0x000, 0x1, 0);
+    emu.bus.write32(PIO0_BASE, 0x1, 0);
 
     // Read SM0_ADDR (PC) via the bus register path at PIO offset
     // 0x0C8 (SM0 base) + 0x0C (ADDR within SM) = 0x0D4.

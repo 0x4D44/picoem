@@ -1665,8 +1665,7 @@ fn gen_rvc_mem_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let b5_3 = (uimm >> 3) & 0b111;
             let b2 = (uimm >> 2) & 0b1;
             let b6 = (uimm >> 6) & 0b1;
-            let enc =
-                0b010_u16 << 13 | b5_3 << 10 | rs1p << 7 | b2 << 6 | b6 << 5 | rdp << 2 | 0b00;
+            let enc = 0b010_u16 << 13 | b5_3 << 10 | rs1p << 7 | b2 << 6 | b6 << 5 | rdp << 2;
             let rs1 = (rs1p + 8) as u8;
             (enc, vec![(rs1, SCRATCH_BASE)])
         }
@@ -1678,8 +1677,7 @@ fn gen_rvc_mem_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let b5_3 = (uimm >> 3) & 0b111;
             let b2 = (uimm >> 2) & 0b1;
             let b6 = (uimm >> 6) & 0b1;
-            let enc =
-                0b110_u16 << 13 | b5_3 << 10 | rs1p << 7 | b2 << 6 | b6 << 5 | rs2p << 2 | 0b00;
+            let enc = 0b110_u16 << 13 | b5_3 << 10 | rs1p << 7 | b2 << 6 | b6 << 5 | rs2p << 2;
             let rs1 = (rs1p + 8) as u8;
             let rs2 = (rs2p + 8) as u8;
             let mut reg_pre = vec![(rs1, SCRATCH_BASE)];
@@ -1742,19 +1740,19 @@ fn gen_rvc_branch_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
     let (enc, reg_pre): (u16, Vec<(u8, u32)>) = match variant {
         0 => {
             // C.J imm — Q1, f3=101. No link.
-            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            let imm = rng.gen_range(1..=(SLED_BYTES / 2)) * 2;
             (encode_c_j(imm, 0b101), vec![])
         }
         1 => {
             // C.JAL imm — Q1, f3=001. Links to x1.
-            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            let imm = rng.gen_range(1..=(SLED_BYTES / 2)) * 2;
             (encode_c_j(imm, 0b001), vec![])
         }
         2 => {
             // C.BEQZ rs1', imm — Q1, f3=110.
             let rs1p = rng.gen_range(0_u16..8);
             let rs1 = (rs1p + 8) as u8;
-            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            let imm = rng.gen_range(1..=(SLED_BYTES / 2)) * 2;
             // Seed the test register to a mix of zero (taken) and non-zero
             // (not-taken) across the fuzz batch so both paths get coverage.
             let val: u32 = if rng.gen_bool(0.5) {
@@ -1768,7 +1766,7 @@ fn gen_rvc_branch_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             // C.BNEZ rs1', imm — Q1, f3=111.
             let rs1p = rng.gen_range(0_u16..8);
             let rs1 = (rs1p + 8) as u8;
-            let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
+            let imm = rng.gen_range(1..=(SLED_BYTES / 2)) * 2;
             let val: u32 = if rng.gen_bool(0.5) {
                 0
             } else {
@@ -1878,7 +1876,7 @@ fn gen_rv32c_arith<R: Rng>(rng: &mut R) -> u16 {
             };
             let b5 = (imm_raw >> 5) & 1;
             let b4_0 = imm_raw & 0x1F;
-            0b000 << 13 | b5 << 12 | rd << 7 | b4_0 << 2 | 0b01
+            (b5 << 12) | rd << 7 | b4_0 << 2 | 0b01
         }
         1 => {
             // C.LI rd, imm — rd != 0 (rd=0 is HINT).
@@ -1895,13 +1893,13 @@ fn gen_rv32c_arith<R: Rng>(rng: &mut R) -> u16 {
             let shamt = rng.gen_range(1_u16..32);
             let b5 = 0; // RV32: shamt[5] must be 0
             let b4_0 = shamt & 0x1F;
-            0b000 << 13 | b5 << 12 | rd << 7 | b4_0 << 2 | 0b10
+            (b5 << 12) | rd << 7 | b4_0 << 2 | 0b10
         }
         3 => {
             // C.MV rd, rs2 — rd != 0, rs2 != 0.
             let rd = pick_gpr_nz(rng);
             let rs2 = pick_gpr_nz(rng);
-            0b100 << 13 | 0 << 12 | rd << 7 | rs2 << 2 | 0b10
+            (0b100 << 13) | rd << 7 | rs2 << 2 | 0b10
         }
         4 => {
             // C.ADD rd, rs2 — rd != 0, rs2 != 0.
@@ -1915,7 +1913,7 @@ fn gen_rv32c_arith<R: Rng>(rng: &mut R) -> u16 {
             let shamt = rng.gen_range(1_u16..32);
             let b5 = 0;
             let b4_0 = shamt & 0x1F;
-            0b100 << 13 | b5 << 12 | 0b00 << 10 | rd_p << 7 | b4_0 << 2 | 0b01
+            (0b100 << 13 | b5 << 12) | rd_p << 7 | b4_0 << 2 | 0b01
         }
         6 => {
             // C.SRAI rd', shamt.
@@ -1939,7 +1937,7 @@ fn gen_rv32c_arith<R: Rng>(rng: &mut R) -> u16 {
             let rd_p = pick_creg3(rng);
             let rs2_p = pick_creg3(rng);
             let sel = rng.gen_range(0_u16..4); // SUB/XOR/OR/AND
-            0b100 << 13 | 0 << 12 | 0b11 << 10 | rd_p << 7 | sel << 5 | rs2_p << 2 | 0b01
+            (0b100 << 13) | 0b11 << 10 | rd_p << 7 | sel << 5 | rs2_p << 2 | 0b01
         }
         9 => {
             // C.LUI rd, nzimm[17:12] — rd != 0, rd != 2, nzimm != 0.

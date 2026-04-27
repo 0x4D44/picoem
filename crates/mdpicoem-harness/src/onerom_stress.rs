@@ -108,7 +108,7 @@ fn nearest_rank<T: Copy + Ord>(sorted: &[T], p: u32) -> T {
     let n = sorted.len();
     debug_assert!(n > 0, "nearest_rank: empty slice");
     // ceil(p * n / 100) via integer math: (p*n + 99) / 100.
-    let raw = ((p as usize) * n + 99) / 100;
+    let raw = ((p as usize) * n).div_ceil(100);
     let idx = raw.saturating_sub(1).min(n - 1);
     sorted[idx]
 }
@@ -257,7 +257,7 @@ impl WallClockStats {
 /// Empty input returns an all-zero struct. `Duration::as_nanos()`
 /// returns `u128`; we saturate to `u64` — a single case running for
 /// >584 years is not a realistic failure mode, but the saturation
-/// keeps the type narrow for the percentile sort.
+/// > keeps the type narrow for the percentile sort.
 #[must_use]
 pub fn compute_wall_clock_stats(durations: &[Duration]) -> WallClockStats {
     let count = durations.len();

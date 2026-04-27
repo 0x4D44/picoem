@@ -288,7 +288,7 @@ impl CortexM0Plus {
                 let (result, carry) = if shift == 0 {
                     (a, self.regs.flag_c())
                 } else {
-                    let eff = (shift & 31) as u32;
+                    let eff = shift & 31;
                     if eff == 0 {
                         (a, a >> 31 != 0)
                     } else {

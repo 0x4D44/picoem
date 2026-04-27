@@ -124,8 +124,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut fail = 0usize;
 
     println!(
-        "{:<40} {:>8} {:>8}  {}",
-        "scenario", "elapsed", "verdict", "first_divergence",
+        "{:<40} {:>8} {:>8}  first_divergence",
+        "scenario", "elapsed", "verdict",
     );
     println!("{}", "-".repeat(96));
 

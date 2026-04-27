@@ -2770,20 +2770,20 @@ mod tests {
             .collect();
 
         assert!(
-            r0_loads.iter().any(|w| *w == DWT_CYCCNT_ADDR),
+            r0_loads.contains(&DWT_CYCCNT_ADDR),
             "POWMAN handler must LDR r0 ← DWT_CYCCNT_ADDR (0x{:08X}); \
              got r0 loads: {:X?}",
             DWT_CYCCNT_ADDR,
             r0_loads,
         );
         assert!(
-            r0_loads.iter().any(|w| *w == 0xCAFE_BABE),
+            r0_loads.contains(&0xCAFE_BABE),
             "POWMAN handler must LDR r0 ← 0xCAFE_BABE sentinel; got \
              r0 loads: {:X?}",
             r0_loads,
         );
         assert!(
-            r1_loads.iter().any(|w| *w == crate::ISR_MAILBOX_BASE),
+            r1_loads.contains(&crate::ISR_MAILBOX_BASE),
             "POWMAN handler must LDR r1 ← ISR_MAILBOX_BASE \
              (= 0x{:08X}); got r1 loads: {:X?}",
             crate::ISR_MAILBOX_BASE,

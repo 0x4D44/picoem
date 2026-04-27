@@ -669,7 +669,6 @@ fn bench_prod_barrier_symmetric(parties: u32, rounds: usize) -> BarrierStats {
     }
 
     let mut samples = Arc::try_unwrap(samples)
-        .ok()
         .expect("sampler arc should have only one strong ref after join")
         .into_inner()
         .unwrap();
@@ -768,7 +767,6 @@ fn bench_prod_barrier_asymmetric(
     }
 
     let mut samples = Arc::try_unwrap(samples)
-        .ok()
         .expect("sampler arc should have only one strong ref after join")
         .into_inner()
         .unwrap();
@@ -952,7 +950,6 @@ fn bench_param_barrier_asymmetric(
     }
 
     let mut samples = Arc::try_unwrap(samples)
-        .ok()
         .expect("sampler arc should have only one strong ref after join")
         .into_inner()
         .unwrap();
@@ -1077,7 +1074,6 @@ fn bench_param_barrier_late_tail(
     }
 
     let mut samples = Arc::try_unwrap(samples)
-        .ok()
         .expect("sampler arc should have only one strong ref after join")
         .into_inner()
         .unwrap();

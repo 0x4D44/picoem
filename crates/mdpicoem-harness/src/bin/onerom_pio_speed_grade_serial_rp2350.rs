@@ -252,8 +252,8 @@ fn compute_stats(latencies: &[u32]) -> Option<CycleStats> {
     let min = sorted[0];
     let max = sorted[n - 1];
     // Nearest-rank percentile (ceil): index = ceil(p * n) - 1, clamped.
-    let p50_idx = ((50 * n + 99) / 100).saturating_sub(1).min(n - 1);
-    let p95_idx = ((95 * n + 99) / 100).saturating_sub(1).min(n - 1);
+    let p50_idx = (50 * n).div_ceil(100).saturating_sub(1).min(n - 1);
+    let p95_idx = (95 * n).div_ceil(100).saturating_sub(1).min(n - 1);
     let p50 = sorted[p50_idx];
     let p95 = sorted[p95_idx];
     // Mean as plain integer (truncating).

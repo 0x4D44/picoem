@@ -5012,7 +5012,7 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
     // GE = 0b1010: select bytes 1,3 from Rn; bytes 0,2 from Rm
     {
         let hw0 = 0xFAA0 | 1; // Rn=R1
-        let hw1: u16 = 0xF080 | (0 << 8) | 2; // Rd=R0, Rm=R2
+        let hw1: u16 = 0xF080 | 2; // Rd=R0, Rm=R2
         // GE[3:0] stored in xPSR bits [19:16]
         let ge_flags = 0b1010u32;
         t.push(TestCase {
@@ -5028,7 +5028,7 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
     // GE = 0b1111: all bytes from Rn
     {
         let hw0 = 0xFAA0 | 3;
-        let hw1: u16 = 0xF080 | (0 << 8) | 4;
+        let hw1: u16 = 0xF080 | 4;
         t.push(TestCase {
             name: "SEL R0,R3,R4 (GE=0b1111, all from Rn)".into(),
             opcode: hw0,
@@ -5042,13 +5042,13 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
     // GE = 0b0000: all bytes from Rm
     {
         let hw0 = 0xFAA0 | 3;
-        let hw1: u16 = 0xF080 | (0 << 8) | 4;
+        let hw1: u16 = 0xF080 | 4;
         t.push(TestCase {
             name: "SEL R0,R3,R4 (GE=0b0000, all from Rm)".into(),
             opcode: hw0,
             hw1: Some(hw1),
             reg_pre: vec![(3, 0xDEAD_BEEF), (4, 0x1234_5678)],
-            xpsr_pre: tb | (0x0 << 16),
+            xpsr_pre: tb,
             xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });

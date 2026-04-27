@@ -73,8 +73,8 @@ fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     let n = sn & 1;
     let vm = (sm >> 1) & 0xF;
     let m = sm & 1;
-    let hw0 = 0xEE00 | (0 << 7) | (d << 6) | (0b11 << 4) | vn;
-    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (0 << 6) | (m << 5) | vm;
+    let hw0 = 0xEE00 | (d << 6) | (0b11 << 4) | vn;
+    let hw1 = ((vd << 12) | 0x0A00 | (n << 7)) | (m << 5) | vm;
     (hw0, hw1)
 }
 

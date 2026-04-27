@@ -2143,7 +2143,7 @@ mod quantum_contract {
         // Force SET PINDIRS, 1 so the output pin becomes driven.
         emu.bus.write32(PIO0_BASE + 0x0D8, 0xE081);
         // Enable SM0.
-        emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+        emu.bus.write32(PIO0_BASE, 0x1);
 
         seed_nop_program(&mut emu);
         emu
@@ -2747,7 +2747,7 @@ mod phase1_wave1 {
         // Enable PIO0 SM0 so `pio_all_idle()` returns false and the
         // slow path runs IRQ routing each cycle. Mirrors the PicoGUS
         // production case (ISA IOW SM is always enabled).
-        emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+        emu.bus.write32(PIO0_BASE, 0x1);
         emu.bus.write32(PIO0_BASE + 0x130, 0x001);
         emu.step().expect("Serial step is infallible");
         assert!(
@@ -2807,7 +2807,7 @@ mod phase1_wave1 {
         // 0x0001_0000 (one PIO cycle per system cycle).
         emu.bus.write32(PIO0_BASE + 0x0C8, 0x0001_0000);
         // CTRL (PIO0_BASE + 0x000): SM_ENABLE bit 0 → enable SM0.
-        emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+        emu.bus.write32(PIO0_BASE, 0x1);
 
         // ---- Drive IOW high via the harness's external override path ----
         // This is the exact same pattern `Emulator::drive_pins` uses
@@ -4087,7 +4087,7 @@ mod stage2_bus_coverage {
     fn pio_offset_translator_covers_all_ranges() {
         let mut bus = Bus::new();
         bus.write32(0x4000_F000, 1u32 << 11);
-        let _ = bus.read32(PIO1_BASE + 0x000); // below 0x128
+        let _ = bus.read32(PIO1_BASE); // below 0x128
         let _ = bus.read32(PIO1_BASE + 0x0D4); // below 0x128
         let _ = bus.read32(PIO1_BASE + 0x200); // above 0x140
         // Also cover a write to an offset > 0x140 to hit the write path
@@ -4197,8 +4197,8 @@ mod stage2_bus_coverage {
             DMA_BASE,
         ] {
             // Writes drop silently; reads return 0.
-            bus.write32(base + 0x00, 0xDEAD_BEEF);
-            assert_eq!(bus.read32(base + 0x00), 0, "base {:#x} must RAZ held", base);
+            bus.write32(base, 0xDEAD_BEEF);
+            assert_eq!(bus.read32(base), 0, "base {:#x} must RAZ held", base);
         }
     }
 
@@ -4209,11 +4209,11 @@ mod stage2_bus_coverage {
     fn narrow_read_write_while_held_in_reset_is_nopped() {
         let mut bus = Bus::new();
         // UART0 held → narrow byte read of UARTDR returns 0.
-        assert_eq!(bus.read8(UART0_BASE + 0x000), 0);
+        assert_eq!(bus.read8(UART0_BASE), 0);
         // UART0 narrow write is dropped.
-        bus.write8(UART0_BASE + 0x000, 0x42);
+        bus.write8(UART0_BASE, 0x42);
         // Still held → still reads 0.
-        assert_eq!(bus.read8(UART0_BASE + 0x000), 0);
+        assert_eq!(bus.read8(UART0_BASE), 0);
 
         // SPI0 held → narrow halfword read of SSPDR returns 0.
         assert_eq!(bus.read16(SPI0_BASE + 0x008), 0);
@@ -4235,7 +4235,7 @@ mod stage2_bus_coverage {
         bus.write32(0x4000_8000, 0);
         bus.write32(PLL_SYS_BASE + 0x08, 100); // FBDIV (true arm)
         bus.write32(PLL_SYS_BASE + 0x04, 0); // PWR=0
-        bus.write32(PLL_USB_BASE + 0x00, 0x01);
+        bus.write32(PLL_USB_BASE, 0x01);
         // Unknown PLL offset (> 0x0C) — pll_write returns false.
         bus.write32(PLL_SYS_BASE + 0x20, 0);
         bus.write32(PLL_USB_BASE + 0x30, 0);
@@ -4363,11 +4363,11 @@ mod stage2_bus_coverage {
 
         // PIO1 non-TXF byte write (e.g. CTRL at 0x000) — dropped.
         bus.write32(0x4000_F000, 1u32 << 11); // release PIO1
-        bus.write8(PIO1_BASE + 0x000, 0xFF);
+        bus.write8(PIO1_BASE, 0xFF);
 
         // PIO0 TXF byte write — replicated into word and pushed.
         bus.write32(0x4000_F000, 1u32 << 10); // release PIO0
-        bus.write32(PIO0_BASE + 0x000, 0x1); // enable SM0
+        bus.write32(PIO0_BASE, 0x1); // enable SM0
         bus.write8(PIO0_BASE + 0x010, 0x42);
         assert_eq!(
             bus.pio[0].pop_tx(0),
@@ -4382,7 +4382,7 @@ mod stage2_bus_coverage {
         bus.write32(UART0_BASE + 0x02C, 1 << 4); // LCR_H: FEN
         bus.write32(UART0_BASE + 0x030, 0x101); // CR: UARTEN|TXE
         // A byte write to UART0 DR goes through the narrow path (1161).
-        bus.write8(UART0_BASE + 0x000, 0x30);
+        bus.write8(UART0_BASE, 0x30);
 
         // A byte write to a non-narrow UART register at alias=2 (BITSET)
         // takes the shifted-alias arm (1174). Write to UART_IMSC offset
@@ -4398,21 +4398,21 @@ mod stage2_bus_coverage {
         assert_eq!(bus.read16(XIP_SRAM_BASE + 0x200), 0xBEEF);
 
         // SRAM halfword past end.
-        let _ = bus.write16(0x2010_0000, 0x1234);
+        bus.write16(0x2010_0000, 0x1234);
         assert!(bus.bus_fault(), "SRAM write16 past end must fault");
         bus.clear_bus_fault();
 
         // PIO1 non-TXF halfword — dropped.
         bus.write32(0x4000_F000, 1u32 << 11);
-        bus.write16(PIO1_BASE + 0x000, 0x5555);
+        bus.write16(PIO1_BASE, 0x5555);
 
         // PIO1 TXF halfword — replicated.
-        bus.write32(PIO1_BASE + 0x000, 0x1); // enable SM0
+        bus.write32(PIO1_BASE, 0x1); // enable SM0
         bus.write16(PIO1_BASE + 0x010, 0xABCD);
         assert_eq!(bus.pio[1].pop_tx(0), Some(0xABCDABCD));
         // PIO0 TXF halfword — ternary False arm (base == PIO0_BASE).
         bus.write32(0x4000_F000, 1u32 << 10); // release PIO0
-        bus.write32(PIO0_BASE + 0x000, 0x1);
+        bus.write32(PIO0_BASE, 0x1);
         bus.write16(PIO0_BASE + 0x010, 0x1234);
         assert_eq!(bus.pio[0].pop_tx(0), Some(0x12341234));
 
@@ -4542,7 +4542,7 @@ mod stage2_bus_coverage {
         bus.write32(0x4000_F000, 1u32 << 22);
         bus.write32(UART0_BASE + 0x02C, 1 << 4);
         bus.write32(UART0_BASE + 0x030, 0x101);
-        bus.write32(UART0_BASE + 0x000, 0xA5);
+        bus.write32(UART0_BASE, 0xA5);
         assert!(!bus.all_peripherals_idle());
 
         // UART1 busy (TIMER idle, UART0 idle by not releasing).
@@ -4550,13 +4550,13 @@ mod stage2_bus_coverage {
         bus.write32(0x4000_F000, 1u32 << 23);
         bus.write32(UART1_BASE + 0x02C, 1 << 4);
         bus.write32(UART1_BASE + 0x030, 0x101);
-        bus.write32(UART1_BASE + 0x000, 0xA5);
+        bus.write32(UART1_BASE, 0xA5);
         assert!(!bus.all_peripherals_idle());
 
         // SPI0 busy.
         let mut bus = Bus::new();
         bus.write32(0x4000_F000, 1u32 << 16);
-        bus.write32(SPI0_BASE + 0x000, 0x07);
+        bus.write32(SPI0_BASE, 0x07);
         bus.write32(SPI0_BASE + 0x004, 0x02);
         bus.write32(SPI0_BASE + 0x008, 0x42);
         assert!(!bus.all_peripherals_idle());
@@ -4564,7 +4564,7 @@ mod stage2_bus_coverage {
         // SPI1 busy.
         let mut bus = Bus::new();
         bus.write32(0x4000_F000, 1u32 << 17);
-        bus.write32(SPI1_BASE + 0x000, 0x07);
+        bus.write32(SPI1_BASE, 0x07);
         bus.write32(SPI1_BASE + 0x004, 0x02);
         bus.write32(SPI1_BASE + 0x008, 0x42);
         assert!(!bus.all_peripherals_idle());
@@ -4588,7 +4588,7 @@ mod stage2_bus_coverage {
         // ADC busy — in-flight conversion.
         let mut bus = Bus::new();
         bus.write32(0x4000_F000, 1);
-        bus.write32(ADC_BASE + 0x00, 1 | (1 << 2)); // EN + START_ONCE
+        bus.write32(ADC_BASE, 1 | (1 << 2)); // EN + START_ONCE
         assert!(!bus.all_peripherals_idle());
 
         // PWM busy.
@@ -4613,7 +4613,7 @@ mod stage2_bus_coverage {
         assert!(bus.pio_all_idle(), "fresh bus has no SM enabled");
         // Release PIO0 + enable SM0.
         bus.write32(0x4000_F000, 1u32 << 10);
-        bus.write32(PIO0_BASE + 0x000, 0x1);
+        bus.write32(PIO0_BASE, 0x1);
         assert!(!bus.pio_all_idle(), "SM0 enabled → PIO not idle");
     }
 
@@ -4649,8 +4649,8 @@ mod stage2_bus_coverage {
                 | (1u32 << 4)  // I2C1
                 | 1u32, // ADC
         );
-        let _ = bus.read8(UART0_BASE + 0x000);
-        let _ = bus.read8(UART1_BASE + 0x000);
+        let _ = bus.read8(UART0_BASE);
+        let _ = bus.read8(UART1_BASE);
         let _ = bus.read8(SPI0_BASE + 0x008);
         let _ = bus.read8(SPI1_BASE + 0x008);
         let _ = bus.read8(I2C0_BASE + 0x010);
@@ -4672,8 +4672,8 @@ mod stage2_bus_coverage {
                 | (1u32 << 4)
                 | 1u32,
         );
-        let _ = bus.read16(UART0_BASE + 0x000);
-        let _ = bus.read16(UART1_BASE + 0x000);
+        let _ = bus.read16(UART0_BASE);
+        let _ = bus.read16(UART1_BASE);
         let _ = bus.read16(SPI0_BASE + 0x008);
         let _ = bus.read16(SPI1_BASE + 0x008);
         let _ = bus.read16(I2C0_BASE + 0x010);
@@ -4705,16 +4705,16 @@ mod stage2_bus_coverage {
         bus.write32(SPI0_BASE + 0x004, 0x02);
         bus.write32(SPI1_BASE + 0x004, 0x02);
         // byte writes to DR
-        bus.write8(UART0_BASE + 0x000, 0x11);
-        bus.write8(UART1_BASE + 0x000, 0x22);
+        bus.write8(UART0_BASE, 0x11);
+        bus.write8(UART1_BASE, 0x22);
         bus.write8(SPI0_BASE + 0x008, 0x33);
         bus.write8(SPI1_BASE + 0x008, 0x44);
         bus.write8(I2C0_BASE + 0x010, 0x55);
         bus.write8(I2C1_BASE + 0x010, 0x66);
         bus.write8(ADC_BASE + 0x00C, 0x77);
         // halfword writes to DR
-        bus.write16(UART0_BASE + 0x000, 0xAAAA);
-        bus.write16(UART1_BASE + 0x000, 0xBBBB);
+        bus.write16(UART0_BASE, 0xAAAA);
+        bus.write16(UART1_BASE, 0xBBBB);
         bus.write16(SPI0_BASE + 0x008, 0xCCCC);
         bus.write16(SPI1_BASE + 0x008, 0xDDDD);
         bus.write16(I2C0_BASE + 0x010, 0xEEEE);
@@ -4899,7 +4899,7 @@ mod stage2_bus_coverage {
         let mut bus = Bus::new();
         assert_eq!(bus.read32(SSI_BASE + 0x28) & 0x5, 0x5);
         // Other SSI offsets default to 0.
-        let _ = bus.read32(SSI_BASE + 0x00);
+        let _ = bus.read32(SSI_BASE);
     }
 
     /// advance_lazy_scheduled (bus/mod.rs:1728 — should fire alarm).
@@ -4936,7 +4936,7 @@ mod stage2_bus_coverage {
     fn collect_dreqs_pio_tx_full_bit_clear() {
         let mut bus = Bus::new();
         bus.write32(0x4000_F000, (1u32 << 10) | (1u32 << 11));
-        bus.write32(PIO0_BASE + 0x000, 0x1);
+        bus.write32(PIO0_BASE, 0x1);
         // Push 4 words via word write to TXF0 (offset 0x010).
         for _ in 0..4 {
             bus.write32(PIO0_BASE + 0x010, 0x42);
@@ -4973,8 +4973,8 @@ mod stage2_bus_coverage {
                 | 1u32, // ADC
         );
         // Enable PIO SM0 in both blocks to trigger tx_dreq.
-        bus.write32(PIO0_BASE + 0x000, 0x1);
-        bus.write32(PIO1_BASE + 0x000, 0x1);
+        bus.write32(PIO0_BASE, 0x1);
+        bus.write32(PIO1_BASE, 0x1);
 
         // Enable UART0/UART1 so their tx_dreq returns true.
         bus.write32(UART0_BASE + 0x030, 0x101);
@@ -4987,7 +4987,7 @@ mod stage2_bus_coverage {
         bus.write32(I2C1_BASE + 0x06C, 1);
         // Enable ADC (FCS.EN=1, DREQ_EN=1, CS.EN=1, queue samples to assert dreq).
         bus.write32(ADC_BASE + 0x08, 1 | (1u32 << 3) | (1u32 << 24)); // FCS_EN | DREQ_EN | THRESH=1
-        bus.write32(ADC_BASE + 0x00, 1 | (1u32 << 3)); // CS_EN, CS_START_MANY
+        bus.write32(ADC_BASE, 1 | (1u32 << 3)); // CS_EN, CS_START_MANY
         // Tick so FIFO accumulates a sample.
         bus.master_cycle = 0;
         bus.seed_sys_clk_hz(125_000_000);
@@ -4998,10 +4998,10 @@ mod stage2_bus_coverage {
 
         // Push into each peripheral's RX to drive rx_dreq bits.
         // SPI0/1 RX via loopback:
-        bus.write32(SPI0_BASE + 0x000, 0x07); // DSS=8-bit
+        bus.write32(SPI0_BASE, 0x07); // DSS=8-bit
         bus.write32(SPI0_BASE + 0x004, 0x02 | 0x01); // SSE | LBM
         bus.write32(SPI0_BASE + 0x008, 0x42);
-        bus.write32(SPI1_BASE + 0x000, 0x07);
+        bus.write32(SPI1_BASE, 0x07);
         bus.write32(SPI1_BASE + 0x004, 0x02 | 0x01);
         bus.write32(SPI1_BASE + 0x008, 0x42);
         // I2C0/1 RX via read-cmd to ACK slave 0x3C.
@@ -5016,8 +5016,8 @@ mod stage2_bus_coverage {
 
         // Enable more SMs on each PIO block to cover the loop bodies
         // 1..4 (bus/mod.rs:1613, 1619).
-        bus.write32(PIO0_BASE + 0x000, 0xF); // all 4 SMs enabled
-        bus.write32(PIO1_BASE + 0x000, 0xF);
+        bus.write32(PIO0_BASE, 0xF); // all 4 SMs enabled
+        bus.write32(PIO1_BASE, 0xF);
         let dreqs = bus.collect_dreqs();
         // Every lane we drove should produce at least one bit.
         // PIO0 TX0 (bit 0), PIO1 TX0 (bit 8). UART TX / SPI TX / I2C
@@ -5175,7 +5175,7 @@ mod stage2_i2c_coverage {
         // START_DET + STOP_DET. Then drain each CLR in turn.
         i.write32(IC_TAR, 0x55, 0, &mut 0);
         i.write32(IC_ENABLE, 1, 0, &mut 0);
-        i.write32(IC_DATA_CMD, 0 | (1 << 9), 0, &mut 0);
+        i.write32(IC_DATA_CMD, (1 << 9), 0, &mut 0);
         // CLR_INTR composite read.
         let _ = i.read32(IC_CLR_INTR);
         // Each specific CLR read (post-composite these are mostly no-ops

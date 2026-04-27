@@ -150,8 +150,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     // Oracle Fidelity HLD — tolerance is a floor, not a silencer, so the
     // hw/emu/delta columns still surface any drift.
     println!(
-        "{:<36} {:>10} {:>10} {:>10} {:>10} {:>6}  {}",
-        "case", "HW/iter", "EMU/iter", "delta", "baseline", "tol", "verdict",
+        "{:<36} {:>10} {:>10} {:>10} {:>10} {:>6}  verdict",
+        "case", "HW/iter", "EMU/iter", "delta", "baseline", "tol",
     );
     println!("{}", "-".repeat(108));
 

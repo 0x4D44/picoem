@@ -119,7 +119,7 @@ impl DecodedOp {
 /// not worth caching.
 #[inline(always)]
 pub(crate) fn is_cacheable_pc(pc: u32) -> bool {
-    matches!(canon_oracle_addr(pc) >> 28, 0x0 | 0x1 | 0x2)
+    matches!(canon_oracle_addr(pc) >> 28, 0x0..=0x2)
 }
 
 /// Region bits for [`Bus::pending_invalidation_regions`] /
@@ -740,7 +740,7 @@ impl Bus {
     // --- XIP SRAM helpers (0x1C00_0000..0x1C00_3FFF) ---
 
     fn is_xip_sram(addr: u32) -> bool {
-        addr >= 0x1C00_0000 && addr < 0x1C00_4000
+        (0x1C00_0000..0x1C00_4000).contains(&addr)
     }
 
     fn xip_sram_read8(&self, addr: u32) -> u8 {
@@ -783,11 +783,11 @@ impl Bus {
     /// (`0xE004_1000..0xE004_2000`). 4 KB window — HLD V5 §8.E.2.
     #[inline]
     pub fn is_coresight_trace(addr: u32) -> bool {
-        addr >= CORESIGHT_TRACE_BASE && addr < CORESIGHT_TRACE_BASE + 0x1000
+        (CORESIGHT_TRACE_BASE..CORESIGHT_TRACE_BASE + 0x1000).contains(&addr)
     }
 
     pub fn is_boot_ram(addr: u32) -> bool {
-        addr >= 0xEFFF_F000 && addr < 0xF000_0000
+        (0xEFFF_F000..0xF000_0000).contains(&addr)
     }
 
     /// True if `reg_offset` (already masked to the SIO 12-bit window)
@@ -1451,10 +1451,9 @@ impl Bus {
                 self.memory.xip_read8(offset)
             }
             0x2 if offset < SRAM_SIZE as u32 => {
-                let v = self.memory.sram_read8(offset);
                 // sram_bank_wait removed: bank 2/6 penalty is modeled on
                 // instruction fetch only (in decode.rs), not data accesses.
-                v
+                self.memory.sram_read8(offset)
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -1690,50 +1689,42 @@ impl Bus {
                         I2C1_BASE => Some(1),
                         _ => None,
                     };
-                    if let Some(idx) = uart_instance {
-                        if word_offset_for_narrow == crate::peripherals::uart::UARTDR {
-                            let mut ext_irqs = 0u64;
-                            self.uart[idx].write8(
-                                crate::peripherals::uart::UARTDR,
-                                val,
-                                &mut ext_irqs,
-                            );
-                            self.raise_irqs_u64(ext_irqs);
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
-                            }
-                            return;
+                    if let Some(idx) = uart_instance
+                        && word_offset_for_narrow == crate::peripherals::uart::UARTDR
+                    {
+                        let mut ext_irqs = 0u64;
+                        self.uart[idx].write8(crate::peripherals::uart::UARTDR, val, &mut ext_irqs);
+                        self.raise_irqs_u64(ext_irqs);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 1, addr, val as u32, core);
                         }
+                        return;
                     }
-                    if let Some(idx) = spi_instance {
-                        if word_offset_for_narrow == crate::peripherals::spi::SSPDR {
-                            let mut ext_irqs = 0u64;
-                            self.spi[idx].write8(
-                                crate::peripherals::spi::SSPDR,
-                                val,
-                                &mut ext_irqs,
-                            );
-                            self.raise_irqs_u64(ext_irqs);
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
-                            }
-                            return;
+                    if let Some(idx) = spi_instance
+                        && word_offset_for_narrow == crate::peripherals::spi::SSPDR
+                    {
+                        let mut ext_irqs = 0u64;
+                        self.spi[idx].write8(crate::peripherals::spi::SSPDR, val, &mut ext_irqs);
+                        self.raise_irqs_u64(ext_irqs);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 1, addr, val as u32, core);
                         }
+                        return;
                     }
-                    if let Some(idx) = i2c_instance {
-                        if word_offset_for_narrow == crate::peripherals::i2c::IC_DATA_CMD {
-                            let mut ext_irqs = 0u64;
-                            self.i2c[idx].write8(
-                                crate::peripherals::i2c::IC_DATA_CMD,
-                                val,
-                                &mut ext_irqs,
-                            );
-                            self.raise_irqs_u64(ext_irqs);
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
-                            }
-                            return;
+                    if let Some(idx) = i2c_instance
+                        && word_offset_for_narrow == crate::peripherals::i2c::IC_DATA_CMD
+                    {
+                        let mut ext_irqs = 0u64;
+                        self.i2c[idx].write8(
+                            crate::peripherals::i2c::IC_DATA_CMD,
+                            val,
+                            &mut ext_irqs,
+                        );
+                        self.raise_irqs_u64(ext_irqs);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 1, addr, val as u32, core);
                         }
+                        return;
                     }
                     match (base, word_offset_for_narrow) {
                         // ADC FIFO is a side-effect register: `adc.read32(FIFO)`
@@ -2163,9 +2154,8 @@ impl Bus {
                 self.memory.xip_read16(offset)
             }
             0x2 if (offset + 1) < SRAM_SIZE as u32 => {
-                let v = self.memory.sram_read16(offset);
                 // sram_bank_wait removed: bank penalty on instruction fetch only.
-                v
+                self.memory.sram_read16(offset)
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;
@@ -2181,14 +2171,14 @@ impl Bus {
                         SPI1_BASE => Some(1),
                         _ => None,
                     };
-                    if let Some(idx) = spi_idx {
-                        if offset == crate::peripherals::spi::SSPDR {
-                            let v = self.spi[idx].read16(crate::peripherals::spi::SSPDR);
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('R', 2, addr, v as u32, core);
-                            }
-                            return v;
+                    if let Some(idx) = spi_idx
+                        && offset == crate::peripherals::spi::SSPDR
+                    {
+                        let v = self.spi[idx].read16(crate::peripherals::spi::SSPDR);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
                         }
+                        return v;
                     }
                     // UARTDR and IC_DATA_CMD: halfword read collapses to
                     // byte via narrow path (zero-extended).
@@ -2197,29 +2187,28 @@ impl Bus {
                         UART1_BASE => Some(1),
                         _ => None,
                     };
-                    if let Some(idx) = uart_idx {
-                        if offset == crate::peripherals::uart::UARTDR {
-                            let v = self.uart[idx].read8(crate::peripherals::uart::UARTDR) as u16;
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('R', 2, addr, v as u32, core);
-                            }
-                            return v;
+                    if let Some(idx) = uart_idx
+                        && offset == crate::peripherals::uart::UARTDR
+                    {
+                        let v = self.uart[idx].read8(crate::peripherals::uart::UARTDR) as u16;
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
                         }
+                        return v;
                     }
                     let i2c_idx: Option<usize> = match base {
                         I2C0_BASE => Some(0),
                         I2C1_BASE => Some(1),
                         _ => None,
                     };
-                    if let Some(idx) = i2c_idx {
-                        if offset == crate::peripherals::i2c::IC_DATA_CMD {
-                            let v =
-                                self.i2c[idx].read32(crate::peripherals::i2c::IC_DATA_CMD) as u16;
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('R', 2, addr, v as u32, core);
-                            }
-                            return v;
+                    if let Some(idx) = i2c_idx
+                        && offset == crate::peripherals::i2c::IC_DATA_CMD
+                    {
+                        let v = self.i2c[idx].read32(crate::peripherals::i2c::IC_DATA_CMD) as u16;
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('R', 2, addr, v as u32, core);
                         }
+                        return v;
                     }
                     if (base, offset) == (ADC_BASE, crate::peripherals::adc::FIFO) {
                         let v = self.adc.read16(crate::peripherals::adc::FIFO);
@@ -2410,51 +2399,47 @@ impl Bus {
                         I2C1_BASE => Some(1),
                         _ => None,
                     };
-                    if let Some(idx) = uart_instance {
-                        if word_offset_for_narrow == crate::peripherals::uart::UARTDR {
-                            let mut ext_irqs = 0u64;
-                            self.uart[idx].write8(
-                                crate::peripherals::uart::UARTDR,
-                                val as u8,
-                                &mut ext_irqs,
-                            );
-                            self.raise_irqs_u64(ext_irqs);
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
-                            }
-                            return;
+                    if let Some(idx) = uart_instance
+                        && word_offset_for_narrow == crate::peripherals::uart::UARTDR
+                    {
+                        let mut ext_irqs = 0u64;
+                        self.uart[idx].write8(
+                            crate::peripherals::uart::UARTDR,
+                            val as u8,
+                            &mut ext_irqs,
+                        );
+                        self.raise_irqs_u64(ext_irqs);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 2, addr, val as u32, core);
                         }
+                        return;
                     }
-                    if let Some(idx) = spi_instance {
-                        if word_offset_for_narrow == crate::peripherals::spi::SSPDR {
-                            let mut ext_irqs = 0u64;
-                            self.spi[idx].write16(
-                                crate::peripherals::spi::SSPDR,
-                                val,
-                                &mut ext_irqs,
-                            );
-                            self.raise_irqs_u64(ext_irqs);
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
-                            }
-                            return;
+                    if let Some(idx) = spi_instance
+                        && word_offset_for_narrow == crate::peripherals::spi::SSPDR
+                    {
+                        let mut ext_irqs = 0u64;
+                        self.spi[idx].write16(crate::peripherals::spi::SSPDR, val, &mut ext_irqs);
+                        self.raise_irqs_u64(ext_irqs);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 2, addr, val as u32, core);
                         }
+                        return;
                     }
-                    if let Some(idx) = i2c_instance {
-                        if word_offset_for_narrow == crate::peripherals::i2c::IC_DATA_CMD {
-                            let mut ext_irqs = 0u64;
-                            self.i2c[idx].write32(
-                                crate::peripherals::i2c::IC_DATA_CMD,
-                                val as u32,
-                                0,
-                                &mut ext_irqs,
-                            );
-                            self.raise_irqs_u64(ext_irqs);
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
-                            }
-                            return;
+                    if let Some(idx) = i2c_instance
+                        && word_offset_for_narrow == crate::peripherals::i2c::IC_DATA_CMD
+                    {
+                        let mut ext_irqs = 0u64;
+                        self.i2c[idx].write32(
+                            crate::peripherals::i2c::IC_DATA_CMD,
+                            val as u32,
+                            0,
+                            &mut ext_irqs,
+                        );
+                        self.raise_irqs_u64(ext_irqs);
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 2, addr, val as u32, core);
                         }
+                        return;
                     }
                     match (base, word_offset_for_narrow) {
                         // ADC FIFO read-only: see matching comment in
@@ -2823,9 +2808,8 @@ impl Bus {
                 self.memory.xip_read32(offset)
             }
             0x2 if (offset + 3) < SRAM_SIZE as u32 => {
-                let v = self.memory.sram_read32(offset);
                 // sram_bank_wait removed: bank penalty on instruction fetch only.
-                v
+                self.memory.sram_read32(offset)
             }
             0x4 | 0x5 => {
                 let canonical = addr & !0x3000;

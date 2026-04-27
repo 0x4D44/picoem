@@ -258,7 +258,7 @@ impl DmaChannel {
     fn mark_if_pio1_txf(&mut self, addr: u32) {
         const PIO1_TXF_BASE: u32 = 0x5030_0010;
         const PIO1_TXF_LAST: u32 = 0x5030_001C;
-        if addr >= PIO1_TXF_BASE && addr <= PIO1_TXF_LAST && (addr & 3) == 0 {
+        if (PIO1_TXF_BASE..=PIO1_TXF_LAST).contains(&addr) && (addr & 3) == 0 {
             let n = ((addr - PIO1_TXF_BASE) >> 2) & 0x3;
             self.ever_wrote_pio1_txf_mask |= 1u8 << n;
         }

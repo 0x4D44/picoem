@@ -34,18 +34,10 @@ pub use crate::sio::Interp;
 /// register files. Lives on `CortexM33` so each core has its own copy;
 /// the shared `Sio` owns only truly cross-core state (FIFO, spinlocks,
 /// doorbells, MTIME, GPIO). Phase 3 Stage 3 (LLD V7 §6).
+#[derive(Default)]
 pub struct PerCoreSio {
     pub divider: Divider,
     pub interp: [Interp; 2],
-}
-
-impl Default for PerCoreSio {
-    fn default() -> Self {
-        Self {
-            divider: Divider::default(),
-            interp: [Interp::new(), Interp::new()],
-        }
-    }
 }
 
 impl PerCoreSio {

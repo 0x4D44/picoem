@@ -456,7 +456,7 @@ impl Sio {
 
     /// Read SPINLOCK<N>: test-and-set. Returns 1<<N on success, 0 if already claimed.
     fn spinlock_read(&mut self, offset: u32) -> u32 {
-        let n = ((offset - 0x100) >> 2) as u32;
+        let n = (offset - 0x100) >> 2;
         debug_assert!(n < 32);
         let mask = 1u32 << n;
         if self.spinlock_bits & mask == 0 {
@@ -470,7 +470,7 @@ impl Sio {
 
     /// Write SPINLOCK<N>: release (clear bit N, any value).
     fn spinlock_write(&mut self, offset: u32) {
-        let n = ((offset - 0x100) >> 2) as u32;
+        let n = (offset - 0x100) >> 2;
         debug_assert!(n < 32);
         self.spinlock_bits &= !(1u32 << n);
         trace!(lock_id = n, "spinlock released");

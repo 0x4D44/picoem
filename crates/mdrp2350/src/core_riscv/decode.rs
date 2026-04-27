@@ -1276,7 +1276,6 @@ mod tests {
     fn decodes_rv32a_lr_w_and_sc_w() {
         // LR.W x5, (x6)  — funct5=00010, rs2=0, funct3=010, opcode=0101111 (AMO)
         let insn = (0b00010u32 << 27)
-            | (0u32 << 20)
             | (6u32 << 15)
             | (0b010 << 12)
             | (5u32 << 7)
@@ -1317,13 +1316,8 @@ mod tests {
     #[test]
     fn decodes_rv32a_amoadd_w() {
         // AMOADD.W x5, x7, (x6)  — funct5=00000
-        let insn = (0b00000u32 << 27)
-            | (7u32 << 20)
-            | (6u32 << 15)
-            | (0b010 << 12)
-            | (5u32 << 7)
-            | (OPCODE_AMO << 2)
-            | 0b11;
+        let insn =
+            (7u32 << 20) | (6u32 << 15) | (0b010 << 12) | (5u32 << 7) | (OPCODE_AMO << 2) | 0b11;
         assert_eq!(
             decode(insn),
             Op::Amo {

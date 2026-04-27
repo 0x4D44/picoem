@@ -4216,7 +4216,7 @@ fn generate_fuzz_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         t.push(TestCase {
             name: format!("FUZZ:SHIFT:{i} {name_prefix} R{rd},R{rm},#{imm_desc}"),
             opcode,
-            reg_pre: regs.drain(..).collect(),
+            reg_pre: std::mem::take(&mut regs),
             xpsr_pre: rand_flags(rng),
             ..TestCase::default()
         });
@@ -4511,7 +4511,7 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             }
         };
 
-        let is_store = matches!(opc, 0 | 1 | 2);
+        let is_store = matches!(opc, 0..=2);
         let mut reg_pre: Vec<(u8, u32)> = Vec::new();
         // Set all low regs to random values
         for r in 0..8u8 {
@@ -5203,7 +5203,7 @@ pub(crate) fn enc_vldr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
     let d = sd & 1;
     let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
-    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    let imm8 = offset.unsigned_abs() >> 2;
     let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | (1 << 4) | rn;
     let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
     (hw0, hw1)
@@ -5214,7 +5214,7 @@ pub(crate) fn enc_vstr(sd: u16, rn: u16, offset: i16) -> (u16, u16) {
     let vd = (sd >> 1) & 0xF;
     let d = sd & 1;
     let u_bit = if offset >= 0 { 1u16 } else { 0u16 };
-    let imm8 = (offset.unsigned_abs() >> 2) as u16;
+    let imm8 = offset.unsigned_abs() >> 2;
     let hw0 = 0xED00 | (u_bit << 7) | (d << 6) | rn;
     let hw1 = (vd << 12) | 0x0A00 | (imm8 & 0xFF);
     (hw0, hw1)

@@ -62,11 +62,11 @@ pub(crate) fn classify_is_pure(hw0: u16, hw1: u16, is_wide: bool) -> bool {
 fn classify_thumb16_pure(opcode: u16) -> bool {
     match opcode >> 11 {
         // 00000 LSL imm / 00001 LSR imm / 00010 ASR imm — pure ALU, no bus.
-        0b00000 | 0b00001 | 0b00010 => true,
+        0b00000..=0b00010 => true,
         // 00011 ADD/SUB reg / imm3 — pure.
         0b00011 => true,
         // 00100..00111 MOV/CMP/ADD/SUB imm8 — pure.
-        0b00100 | 0b00101 | 0b00110 | 0b00111 => true,
+        0b00100..=0b00111 => true,
         // 01000 — bit 10 discriminates data-processing (pure) from
         // special-data/BX (impure; BX/BLX/MOV-PC may hit exit_exception).
         0b01000 => opcode & (1 << 10) == 0,
@@ -75,7 +75,7 @@ fn classify_thumb16_pure(opcode: u16) -> bool {
         // 01010 / 01011 LDR/STR register offset — impure.
         0b01010 | 0b01011 => false,
         // 01100..10001 LDR/STR immediate offset (six handlers) — impure.
-        0b01100 | 0b01101 | 0b01110 | 0b01111 | 0b10000 | 0b10001 => false,
+        0b01100..=0b10001 => false,
         // 10010 / 10011 LDR/STR SP-relative — impure.
         0b10010 | 0b10011 => false,
         // 10100 ADR — pure.
@@ -212,7 +212,7 @@ fn classify_thumb32_misc_control_pure(hw0: u16, hw1: u16) -> bool {
     // Any unrecognised hint falls into `thumb32_undefined` — impure.
     if hw0 == 0xF3AF {
         let hint = hw1 & 0xFF;
-        return matches!(hint, 0x00 | 0x01 | 0x02 | 0x03 | 0x04);
+        return matches!(hint, 0x00..=0x04);
     }
     // Barriers (hw0 == 0xF3BF): CLREX / DSB / DMB / ISB all pure; others
     // fall into `thumb32_undefined`.

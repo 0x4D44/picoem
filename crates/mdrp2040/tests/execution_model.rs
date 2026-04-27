@@ -26,7 +26,11 @@ fn build_with_serial_succeeds() {
     );
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "windows", feature = "threading"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux"),
+    feature = "threading"
+))]
 #[test]
 fn build_with_threaded_succeeds_on_supported_platform() {
     let result = EmulatorBuilder::new(Config::default())
@@ -59,7 +63,11 @@ fn build_with_threaded_returns_err_when_feature_off() {
 /// as `EmulatorError::WorkerPanicked`, the panic message carries the
 /// worker identifier, and subsequent calls are one-shot (return the
 /// cached error without re-entering worker threads).
-#[cfg(all(target_arch = "x86_64", target_os = "windows", feature = "threading"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux"),
+    feature = "threading"
+))]
 #[test]
 fn worker_panic_surfaces_as_error() {
     use mdrp2040::{EmulatorError, WorkerName};
@@ -130,7 +138,11 @@ fn serial_step_quantum_matches_run_step_quantum() {
 
 /// `step()` is a Serial-only entry point; on a Threaded emulator it
 /// must return `Err(EmulatorError::NotSupportedInThreadedMode)`.
-#[cfg(all(target_arch = "x86_64", target_os = "windows", feature = "threading"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux"),
+    feature = "threading"
+))]
 #[test]
 fn threaded_step_returns_not_supported() {
     use mdrp2040::EmulatorError;
@@ -153,7 +165,7 @@ fn threaded_step_returns_not_supported() {
 #[cfg(all(
     debug_assertions,
     target_arch = "x86_64",
-    target_os = "windows",
+    any(target_os = "windows", target_os = "linux"),
     feature = "threading"
 ))]
 #[test]

@@ -190,17 +190,17 @@ impl TimerRegs {
             // `busy_wait_us` semantics hold. Wrap-around across the
             // 32-bit ALARM boundary is a Phase 2+ concern (see the
             // module doc).
-            if let Some(fc) = self.alarm_fire_cycle[n] {
-                if master_cycle >= fc {
-                    self.intr |= 1 << n;
-                    self.armed &= !(1 << n);
-                    self.alarm_fire_cycle[n] = None;
-                    // Only fire the NVIC line if INTE has this alarm enabled.
-                    // INTF allows firmware to force the line without an actual
-                    // alarm match.
-                    if (self.inte | self.intf) & (1 << n) != 0 {
-                        nvic_bits |= 1u32 << n;
-                    }
+            if let Some(fc) = self.alarm_fire_cycle[n]
+                && master_cycle >= fc
+            {
+                self.intr |= 1 << n;
+                self.armed &= !(1 << n);
+                self.alarm_fire_cycle[n] = None;
+                // Only fire the NVIC line if INTE has this alarm enabled.
+                // INTF allows firmware to force the line without an actual
+                // alarm match.
+                if (self.inte | self.intf) & (1 << n) != 0 {
+                    nvic_bits |= 1u32 << n;
                 }
             }
         }

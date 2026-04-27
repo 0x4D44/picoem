@@ -698,8 +698,8 @@ mod tests {
         // Must not affect state.
         let (mut psram, mut pins) = fresh();
         for _ in 0..16 {
-            *(&mut pins) ^= 1 << PIN_SCK;
-            *(&mut pins) ^= 1 << PIN_MOSI;
+            pins ^= 1 << PIN_SCK;
+            pins ^= 1 << PIN_MOSI;
             let drive = psram.tick(pins);
             assert!(drive.is_none());
         }

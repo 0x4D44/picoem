@@ -13,7 +13,7 @@ use super::decode::{
     self, AluImmKind, AluKind, AmoKind, CsrKind, LoadKind, MulDivKind, Op, StoreKind,
 };
 use super::irq::{CTX_MRETEIRQ, CTX_NOIRQ, Xh3Irq};
-use crate::{Arch, Bus, Config, Cores, EmulatorBuilder};
+use crate::{Arch, Config, Cores, EmulatorBuilder};
 
 // ---------- helpers ----------
 
@@ -774,7 +774,7 @@ fn exec_rem_int_min_by_nontrivial_divisor() {
         0,
     );
     // i32::MIN % 3 = (i32::MIN).wrapping_rem(3).
-    assert_eq!(c.x[3], ((i32::MIN as i32).wrapping_rem(3)) as u32);
+    assert_eq!(c.x[3], (i32::MIN.wrapping_rem(3)) as u32);
 }
 
 // execute.rs line 464:16 False-arm: Remu with b != 0.

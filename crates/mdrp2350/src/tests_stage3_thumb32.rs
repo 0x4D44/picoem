@@ -283,7 +283,7 @@ mod data_processing_immediate {
         let op: u16 = 0b10000;
         let hw0 = 0xF200u16 | (op << 4) | 1; // Rn=1
         // sat_bit field = hw1[4:0] = 7 means saturate to (1<<7)-1 = 127
-        let hw1: u16 = 0x0000 | (0 << 12) | (0 << 8) | (0 << 6) | 7; // Rd=0, sh=0, imm2=0, widthm1=7
+        let hw1: u16 = 7; // Rd=0, sh=0, imm2=0, widthm1=7
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 127);
         assert!(c.regs.flag_q());
@@ -310,7 +310,7 @@ mod data_processing_immediate {
         // ASR #2 => -4; fits in 8-bit signed.
         let hw0 = 0xF200u16 | (0b10010u16 << 4) | 1;
         // shift_n = (imm3<<2)|imm2; imm3=0, imm2=2 → shift_n=2
-        let hw1: u16 = (0 << 12) | (0 << 8) | (2 << 6) | 7;
+        let hw1: u16 = (2 << 6) | 7;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0) as i32, -4);
     }
@@ -322,7 +322,7 @@ mod data_processing_immediate {
         c.set_reg(1, (-1i32) as u32); // negative
         // USAT Rd, #8, Rn — op=11000
         let hw0 = 0xF200u16 | (0b11000u16 << 4) | 1;
-        let hw1: u16 = (0 << 12) | (0 << 8) | (0 << 6) | 8; // sat_bit=8
+        let hw1: u16 = 8; // sat_bit=8
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0);
         assert!(c.regs.flag_q());
@@ -347,7 +347,7 @@ mod data_processing_immediate {
         c.set_reg(1, 0x40);
         let hw0 = 0xF200u16 | (0b11010u16 << 4) | 1;
         // shift_n=2; 0x40 >> 2 = 0x10
-        let hw1: u16 = (0 << 12) | (0 << 8) | (2 << 6) | 8;
+        let hw1: u16 = (2 << 6) | 8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x10);
     }
@@ -359,7 +359,7 @@ mod data_processing_immediate {
         c.regs.set_pc(0x1000);
         // encode_subw(Rd=0, Rn=15, imm12=16)
         let hw0: u16 = 0xF200 | (0b01010u16 << 4) | 15;
-        let hw1: u16 = (0 << 12) | (0 << 8) | 16;
+        let hw1: u16 = 16;
         c.execute_one_wide(hw0, hw1);
         // read_pc = 0x1004, align = 0x1004, result = 0x1004 - 16 = 0xFF4
         assert_eq!(c.reg(0), 0x0FF4);
@@ -371,7 +371,7 @@ mod data_processing_immediate {
         let mut c = CortexM33::for_test(0);
         c.regs.set_pc(0x1000);
         // op = 0b11011 (unused)
-        let hw0: u16 = 0xF200 | (0b11011u16 << 4) | 0;
+        let hw0: u16 = 0xF200 | (0b11011u16 << 4);
         let hw1: u16 = 0;
         c.execute_one_wide(hw0, hw1);
         assert!(c.pending_fault.is_some());
@@ -689,7 +689,7 @@ mod load_store_single {
         c.set_reg(1, 0x2000_0000);
         // LDRSB.W R15, [R1, #0] — sign=1, size=00, Rt=15 → PLI hint
         let hw0: u16 = 0xF990 | 1; // size=00, load=1, sign=1, Rn=1
-        let hw1: u16 = (15 << 12) | 0;
+        let hw1: u16 = 15 << 12;
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(cy, 1);
     }
@@ -706,7 +706,7 @@ mod load_store_single {
         // Use the rn==15 branch: base = PC&!3; if U=0: base - imm12.
         // 0x2000_1004 - 0x08 = 0x2000_0FFC.
         let hw0: u16 = 0xF85F; // size=10, load=1, sign=0, hw0[7]=0(?) actually need bit7 set
-        let hw1: u16 = (0 << 12) | 0x008; // Rt=0, imm12=8
+        let hw1: u16 = 0x008; // Rt=0, imm12=8
         // For PC-relative: the code checks rn==15 regardless of hw0[7]. Let me
         // use hw0=0xF85F: size=10, load=1, sign=0, hw0[7]=0, Rn=1111.
         // hw0 bits: 1111_1000_0101_1111 = 0xF85F.
@@ -739,7 +739,7 @@ mod load_store_single {
         // With no exception active the exit_exception path will likely set a
         // fault. We still execute the path for coverage.
         let hw0: u16 = 0xF8D0 | 1;
-        let hw1: u16 = (15u16 << 12) | 0;
+        let hw1: u16 = 15u16 << 12;
         let _ = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         // Either the exit path ran or pending_fault was set; both exercise
         // the is_exc_return branch, which is what we need.
@@ -752,7 +752,7 @@ mod load_store_single {
         c.set_reg(1, 0x2000_0000);
         // Use the `_ => return 1` branch via size=11. hw0[6:5]=11, load=1, sign=0:
         let hw0: u16 = 0xF8F0 | 1; // size=11
-        let hw1: u16 = (0 << 12) | 0x000;
+        let hw1: u16 = 0x000;
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(cy, 1);
     }
@@ -898,7 +898,7 @@ mod load_store_dual_and_exclusive {
         c.set_reg(2, base);
         // LDRD R0, R1, [R2, #8]!: P=1, U=1, W=1, L=1
         let hw0: u16 = 0xE800 | (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5) | (1 << 4) | 2;
-        let hw1: u16 = (0 << 12) | (1 << 8) | 2; // Rt=0, Rt2=1, imm8=2 → offset=8
+        let hw1: u16 = (1 << 8) | 2; // Rt=0, Rt2=1, imm8=2 → offset=8
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.reg(0), 0xAAAA);
         assert_eq!(c.reg(1), 0xBBBB);
@@ -916,7 +916,7 @@ mod load_store_dual_and_exclusive {
         // STREX Rd, Rt, [Rn, #0]: hw0=0xE840 | Rn=1, hw1[15:12]=Rt=0,
         // hw1[11:8]=Rd=2, hw1[7:0]=imm8=0.
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = (0 << 12) | (2 << 8) | 0;
+        let hw1: u16 = 2 << 8;
         let cy = c.execute_one_wide(hw0, hw1);
         // SIO store → 1 cycle
         assert_eq!(cy, 1);
@@ -930,14 +930,14 @@ mod load_store_dual_and_exclusive {
         c.set_reg(1, 0x2000_0010);
         // LDREX R0, [R1, #0]
         let hw0: u16 = 0xE850 | 1;
-        let hw1: u16 = (0 << 12) | 0;
+        let hw1: u16 = 0;
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.exclusive_address, Some(0x2000_0010));
 
         // STREX R2, R3, [R1, #0] — success
         c.set_reg(3, 0xBEEF);
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = (3 << 12) | (2 << 8) | 0;
+        let hw1: u16 = (3 << 12) | (2 << 8);
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.reg(2), 0); // success code
         assert_eq!(bus.read32(0x2000_0010, 0), 0xBEEF);
@@ -946,7 +946,7 @@ mod load_store_dual_and_exclusive {
         // STREX again without intervening LDREX → monitor is clear → fail (1).
         c.set_reg(3, 0xDEAD);
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = (3 << 12) | (2 << 8) | 0;
+        let hw1: u16 = (3 << 12) | (2 << 8);
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.reg(2), 1); // fail
         // Store should not have occurred.
@@ -961,7 +961,7 @@ mod load_store_dual_and_exclusive {
         bus.write8(0x2000_0020, 0x42, 0);
         // LDREXB R0, [R1]: hw0 = 0xE8D0 | Rn, hw1 = Rt | 0xF4F (size=00 byte).
         let hw0: u16 = 0xE8D0 | 1;
-        let hw1: u16 = (0u16 << 12) | 0x0F4F;
+        let hw1: u16 = 0x0F4F;
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.reg(0), 0x42);
 
@@ -981,7 +981,7 @@ mod load_store_dual_and_exclusive {
         c.set_reg(1, 0x2000_0030);
         bus.write16(0x2000_0030, 0xABCD, 0);
         let hw0: u16 = 0xE8D0 | 1;
-        let hw1: u16 = (0u16 << 12) | 0x0F5F;
+        let hw1: u16 = 0x0F5F;
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.reg(0), 0xABCD);
 
@@ -1026,7 +1026,7 @@ mod load_store_dual_and_exclusive {
         c.set_reg(1, 0x2000_0000);
         // TT Rd, [Rn]: hw0 = 0xE840 | Rn, hw1 = (Rd << 8) | 0xF000
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = 0xF000 | (0 << 8);
+        let hw1: u16 = 0xF000;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -1038,7 +1038,7 @@ mod load_store_dual_and_exclusive {
         c.set_reg(1, 0xD000_0000);
         // No prior LDREX → monitor clear → fail branch, still 1-cycle SIO.
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = (3u16 << 12) | (2 << 8) | 0;
+        let hw1: u16 = (3u16 << 12) | (2 << 8);
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -1052,8 +1052,8 @@ mod load_store_dual_and_exclusive {
         c.set_reg(1, 0xB);
         c.set_reg(2, 0x2000_0080);
         // P=0, U=1, W=1 (post-index), L=0
-        let hw0: u16 = 0xE800 | (0 << 8) | (1 << 7) | (1 << 6) | (1 << 5) | (0 << 4) | 2;
-        let hw1: u16 = (0 << 12) | (1 << 8) | 4; // imm8=4 → 16
+        let hw0: u16 = (0xE800 | (1 << 7) | (1 << 6) | (1 << 5)) | 2;
+        let hw1: u16 = (1 << 8) | 4; // imm8=4 → 16
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         // Post-index: stored at base, then R2 += 16.
         assert_eq!(c.reg(2), 0x2000_0090);
@@ -1166,7 +1166,7 @@ mod multiply {
         c.set_reg(3, 5);
         // MLA R0, R1, R2, R3
         let hw0: u16 = 0xFB00u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 3 * 4 + 5);
     }
@@ -1179,7 +1179,7 @@ mod multiply {
         c.set_reg(2, 0x0000_0004);
         // op1=001, op2=00, Ra=15
         let hw0: u16 = 0xFB10u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 12);
     }
@@ -1192,7 +1192,7 @@ mod multiply {
         c.set_reg(2, 0x0004_0000); // top half = 4
         let hw0: u16 = 0xFB10u16 | 1;
         // op2=01 → bottom_n=true, bottom_m=false.
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 12);
     }
@@ -1205,7 +1205,7 @@ mod multiply {
         c.set_reg(2, 0x0000_0004);
         let hw0: u16 = 0xFB10u16 | 1;
         // op2=10 → bottom_n=false, bottom_m=true.
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (2 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | (2 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 12);
     }
@@ -1218,7 +1218,7 @@ mod multiply {
         c.set_reg(2, 0x0000_7FFF); // 32767 → product = 0x3FFF_0001
         c.set_reg(3, 0x7FFF_FFFF); // will overflow with product
         let hw0: u16 = 0xFB10u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -1231,7 +1231,7 @@ mod multiply {
         c.set_reg(2, (3u16 as u32) | ((4u16 as u32) << 16)); // lo=3, hi=4
         // op1=010, op2=00 → cross=false
         let hw0: u16 = 0xFB20u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         // (1*3) + (2*4) = 11
         assert_eq!(c.reg(0), 11);
@@ -1245,7 +1245,7 @@ mod multiply {
         c.set_reg(2, (3u16 as u32) | ((4u16 as u32) << 16));
         c.set_reg(3, 100);
         let hw0: u16 = 0xFB20u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 111);
     }
@@ -1258,7 +1258,7 @@ mod multiply {
         c.set_reg(2, (3u16 as u32) | ((4u16 as u32) << 16));
         // op2=01 → cross=true. rm_lo=4 (high of rm), rm_hi=3.
         let hw0: u16 = 0xFB20u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         // (1*4) + (2*3) = 10
         assert_eq!(c.reg(0), 10);
@@ -1281,7 +1281,7 @@ mod multiply {
         // p2 = same
         // sum = 0x8000_0000 → ov1 (sign overflow)
         let hw0: u16 = 0xFB20u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -1294,7 +1294,7 @@ mod multiply {
         c.set_reg(2, (3u16 as u32) | ((4u16 as u32) << 16));
         c.set_reg(3, 0x7FFF_FFFF);
         let hw0: u16 = 0xFB20u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -1306,7 +1306,7 @@ mod multiply {
         c.set_reg(1, 0x0002_0000); // rn as i32 = 131072
         c.set_reg(2, 0x0000_0010); // bottom = 16
         let hw0: u16 = 0xFB30u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         // (131072 * 16) >> 16 = 2097152 >> 16 = 32
         assert_eq!(c.reg(0), 32);
@@ -1321,7 +1321,7 @@ mod multiply {
         c.set_reg(3, 100);
         let hw0: u16 = 0xFB30u16 | 1;
         // op2=01 → bottom_m=false
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 132);
     }
@@ -1334,7 +1334,7 @@ mod multiply {
         c.set_reg(2, 0x0000_7FFF);
         c.set_reg(3, 0x7FFF_FFFF); // large acc → overflow
         let hw0: u16 = 0xFB30u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -1346,7 +1346,7 @@ mod multiply {
         c.set_reg(1, (5u16 as u32) | ((7u16 as u32) << 16));
         c.set_reg(2, (2u16 as u32) | ((3u16 as u32) << 16));
         let hw0: u16 = 0xFB40u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         // cross=true: rm_lo=3, rm_hi=2. p1=5*3=15, p2=7*2=14, diff=1.
         assert_eq!(c.reg(0), 1);
@@ -1360,7 +1360,7 @@ mod multiply {
         c.set_reg(2, 0x0001_0001); // 1 each
         c.set_reg(3, 0x7FFF_FFFF);
         let hw0: u16 = 0xFB40u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -1373,7 +1373,7 @@ mod multiply {
         c.set_reg(2, 0x10_000_000);
         // op1=101 (0b101), op2=00 → no rounding, Ra=15
         let hw0: u16 = 0xFB50u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         // (0x10_000_000 * 0x10_000_000) >> 32 = 0x0100_0000
         assert_eq!(c.reg(0), 0x0100_0000);
@@ -1387,7 +1387,7 @@ mod multiply {
         c.set_reg(2, 0x0000_0002);
         let hw0: u16 = 0xFB50u16 | 1;
         // op2=01 → round=true.
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         // Product ≈ 0xFFFFFFFE, round adds 0x8000_0000 → exercises that branch.
     }
@@ -1400,7 +1400,7 @@ mod multiply {
         c.set_reg(2, 0x10_000_000);
         c.set_reg(3, 5);
         let hw0: u16 = 0xFB50u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         // (5 << 32 + prod) >> 32 = 5 + 0x0100_0000 = 0x0500_0001 - but MSB only:
         // (acc<<32 + prod) >> 32 = acc + prod_hi = 5 + 0x0100_0000
@@ -1416,7 +1416,7 @@ mod multiply {
         c.set_reg(3, 5);
         let hw0: u16 = 0xFB60u16 | 1;
         // op2=01 → round=true.
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -1428,7 +1428,7 @@ mod multiply {
         c.set_reg(1, 0x0A0B_0C0D);
         c.set_reg(2, 0x0109_0403);
         let hw0: u16 = 0xFB70u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         // |A-B|: (0x0D-0x03)+(0x0C-0x04)+(0x0B-0x09)+(0x0A-0x01) = 10+8+2+9=29
         assert_eq!(c.reg(0), 29);
@@ -1442,7 +1442,7 @@ mod multiply {
         c.set_reg(2, 0x0109_0403);
         c.set_reg(3, 100);
         let hw0: u16 = 0xFB70u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 129);
     }
@@ -1454,7 +1454,7 @@ mod multiply {
         c.set_reg(1, 7);
         c.set_reg(2, 6);
         let hw0: u16 = 0xFB00u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 42);
     }
@@ -1469,8 +1469,8 @@ mod multiply {
         // The only undefined case here is (op1, op2) outside the listed matrix,
         // but (op1=0b000, op2=11) is not listed; let's try that.
         // MUL matches (000, 00), MLA matches (000, 00). (000, 11) is not listed.
-        let hw0: u16 = 0xFB00u16 | 0;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (3 << 4) | 2;
+        let hw0: u16 = 0xFB00u16;
+        let hw1: u16 = (15u16 << 12) | (3 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.pending_fault.is_some());
     }
@@ -1488,7 +1488,7 @@ mod long_multiply {
         c.set_reg(1, 0);
         c.set_reg(2, 1);
         let hw0: u16 = 0xFB90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0 << 8) | 0x00F0 | 2;
+        let hw1: u16 = 0xF000u16 | 0x00F0 | 2;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 5);
     }
@@ -1500,7 +1500,7 @@ mod long_multiply {
         c.set_reg(1, 0x0010_0000); // 2^20, bits=21
         c.set_reg(2, 1);
         let hw0: u16 = 0xFB90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0 << 8) | 0x00F0 | 2;
+        let hw1: u16 = 0xF000u16 | 0x00F0 | 2;
         let cy = c.execute_one_wide(hw0, hw1);
         // bits=21, cycles = 5 + (21-20)*7/11 = 5 + 0 = 5 (truncated).
         // bits=21 gives 5+(1*7/11)=5. Try larger.
@@ -1514,7 +1514,7 @@ mod long_multiply {
         c.set_reg(1, 0);
         c.set_reg(2, 1);
         let hw0: u16 = 0xFBB0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0 << 8) | 0x00F0 | 2;
+        let hw1: u16 = 0xF000u16 | 0x00F0 | 2;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 5);
     }
@@ -1526,7 +1526,7 @@ mod long_multiply {
         c.set_reg(1, 0xFFFF_FFFF);
         c.set_reg(2, 1);
         let hw0: u16 = 0xFBB0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0 << 8) | 0x00F0 | 2;
+        let hw1: u16 = 0xF000u16 | 0x00F0 | 2;
         let cy = c.execute_one_wide(hw0, hw1);
         assert!(cy > 5);
     }
@@ -1541,7 +1541,7 @@ mod long_multiply {
         c.set_reg(3, 0x0000_0004); // Rm bottom = 4
         let hw0: u16 = 0xFBC0u16 | 2;
         // op2=1000 → bottom_n=true, bottom_m=true
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (8 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (8 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 12);
     }
@@ -1553,7 +1553,7 @@ mod long_multiply {
         c.set_reg(2, 0x0000_0003);
         c.set_reg(3, 0x0004_0000);
         let hw0: u16 = 0xFBC0u16 | 2;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (9 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (9 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 12);
     }
@@ -1565,7 +1565,7 @@ mod long_multiply {
         c.set_reg(2, 0x0003_0000);
         c.set_reg(3, 0x0000_0004);
         let hw0: u16 = 0xFBC0u16 | 2;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (10 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (10 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 12);
     }
@@ -1577,7 +1577,7 @@ mod long_multiply {
         c.set_reg(2, (1u16 as u32) | ((2u16 as u32) << 16));
         c.set_reg(3, (3u16 as u32) | ((4u16 as u32) << 16));
         let hw0: u16 = 0xFBC0u16 | 2;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (0b1100 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         // 1*3 + 2*4 = 11
         assert_eq!(c.reg(0), 11);
@@ -1590,7 +1590,7 @@ mod long_multiply {
         c.set_reg(2, (1u16 as u32) | ((2u16 as u32) << 16));
         c.set_reg(3, (3u16 as u32) | ((4u16 as u32) << 16));
         let hw0: u16 = 0xFBC0u16 | 2;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (0b1101 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (0b1101 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         // cross: rm_lo=4, rm_hi=3 → 1*4 + 2*3 = 10
         assert_eq!(c.reg(0), 10);
@@ -1603,7 +1603,7 @@ mod long_multiply {
         c.set_reg(2, (5u16 as u32) | ((7u16 as u32) << 16));
         c.set_reg(3, (2u16 as u32) | ((3u16 as u32) << 16));
         let hw0: u16 = 0xFBD0u16 | 2;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (0b1100 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         // p1=5*2=10, p2=7*3=21, diff=-11
         assert_eq!(c.reg(0) as i32, -11);
@@ -1616,7 +1616,7 @@ mod long_multiply {
         c.set_reg(2, (5u16 as u32) | ((7u16 as u32) << 16));
         c.set_reg(3, (2u16 as u32) | ((3u16 as u32) << 16));
         let hw0: u16 = 0xFBD0u16 | 2;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (0b1101 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (0b1101 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         // cross: rm_lo=3, rm_hi=2 → p1=5*3=15, p2=7*2=14, diff=1
         assert_eq!(c.reg(0), 1);
@@ -1631,7 +1631,7 @@ mod long_multiply {
         c.set_reg(2, 3);
         c.set_reg(3, 4);
         let hw0: u16 = 0xFBE0u16 | 2;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (0b0110 << 4) | 3;
+        let hw1: u16 = (1 << 8) | (0b0110 << 4) | 3;
         c.execute_one_wide(hw0, hw1);
         // 3*4 + 10 + 20 = 42
         assert_eq!(c.reg(0), 42);
@@ -1644,7 +1644,7 @@ mod long_multiply {
         c.regs.set_pc(0x1000);
         // op1=111 (unused), op2=0000
         let hw0: u16 = 0xFBF0u16 | 1;
-        let hw1: u16 = (0u16 << 12) | (1 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (1 << 8) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.pending_fault.is_some());
     }
@@ -1662,8 +1662,8 @@ mod mrs_msr {
         c.set_reg(0, 0xF000_0000);
         // MSR APSR, R0: hw0=0xF380, hw1 = 0x8800 (mask=10, SYSm=0, Rd=8 in hw1)
         // Fields in hw1: bits[11:10]=mask, bits[7:0]=SYSm, bits[15:12]=0b1000.
-        let hw0 = 0xF380u16 | 0;
-        let hw1 = 0x8800u16 | 0; // mask=10 → bit11=1, bit10=0 = 0x0800
+        let hw0 = 0xF380u16;
+        let hw1 = 0x8800u16; // mask=10 → bit11=1, bit10=0 = 0x0800
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.xpsr & 0xF000_0000, 0xF000_0000);
     }
@@ -1674,8 +1674,8 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x000F_0000);
         // mask = 01 → bit10=1.
-        let hw0 = 0xF380u16 | 0;
-        let hw1 = 0x8400u16 | 0;
+        let hw0 = 0xF380u16;
+        let hw1 = 0x8400u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.ge_flags(), 0xF);
     }
@@ -1686,7 +1686,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         let before = c.regs.xpsr;
         c.set_reg(0, 0x1234);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 5;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.xpsr, before);
@@ -1697,7 +1697,7 @@ mod mrs_msr {
     fn msr_msplim() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x2000_1008);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 10;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.msplim, 0x2000_1008);
@@ -1708,7 +1708,7 @@ mod mrs_msr {
     fn msr_psplim() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x2000_2008);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 11;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.psplim, 0x2000_2008);
@@ -1719,7 +1719,7 @@ mod mrs_msr {
     fn msr_faultmask() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 1);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 19;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.faultmask, 1);
@@ -1731,7 +1731,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.basepri = 0x80;
         c.set_reg(0, 0x40);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 18;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.basepri, 0x40);
@@ -1743,7 +1743,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.basepri = 0x40;
         c.set_reg(0, 0x80);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 18;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.basepri, 0x40);
@@ -1755,7 +1755,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.basepri = 0;
         c.set_reg(0, 0x40);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 18;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.basepri, 0x40);
@@ -1774,7 +1774,7 @@ mod mrs_msr {
         c.regs.sync_sp_from_banked();
         // Now MSR PSP, R0 with SPSEL=1 → R13 should be updated.
         c.set_reg(0, 0x2000_3000);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 9;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.psp, 0x2000_3000);
@@ -1786,7 +1786,7 @@ mod mrs_msr {
     fn msr_msp_active() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x2000_5000);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.msp, 0x2000_5000);
@@ -1798,7 +1798,7 @@ mod mrs_msr {
     fn msr_msp_ns() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x2000_6000);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x88;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.msp_ns, 0x2000_6000);
@@ -1809,7 +1809,7 @@ mod mrs_msr {
     fn msr_psp_ns() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x2000_7000);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x89;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.psp_ns, 0x2000_7000);
@@ -1820,7 +1820,7 @@ mod mrs_msr {
     fn msr_msplim_ns() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x2000_8008);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x8A;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.msplim_ns, 0x2000_8008);
@@ -1831,7 +1831,7 @@ mod mrs_msr {
     fn msr_psplim_ns() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x2000_9008);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x8B;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.psplim_ns, 0x2000_9008);
@@ -1842,7 +1842,7 @@ mod mrs_msr {
     fn msr_primask_ns() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 1);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x90;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.primask_ns, 1);
@@ -1853,7 +1853,7 @@ mod mrs_msr {
     fn msr_basepri_ns() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0x40);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x91;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.basepri_ns, 0x40);
@@ -1864,7 +1864,7 @@ mod mrs_msr {
     fn msr_faultmask_ns() {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 1);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x93;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.faultmask_ns, 1);
@@ -1876,7 +1876,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.control_ns = 0x4; // FPCA set
         c.set_reg(0, 0x3);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x94;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.control_ns, 0x3 | 0x4);
@@ -1888,7 +1888,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         let before = c.regs.xpsr;
         c.set_reg(0, 0xFFFF_FFFF);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 0x30; // reserved SYSm
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.xpsr, before);
@@ -1901,7 +1901,7 @@ mod mrs_msr {
     fn mrs_epsr_zero() {
         let mut c = CortexM33::for_test(0);
         let hw0 = 0xF3EFu16;
-        let hw1 = 0x8000u16 | (0 << 8) | 6;
+        let hw1 = 0x8000u16 | 6;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0);
     }
@@ -1911,7 +1911,7 @@ mod mrs_msr {
     fn mrs_iepsr() {
         let mut c = CortexM33::for_test(0);
         let hw0 = 0xF3EFu16;
-        let hw1 = 0x8000u16 | (0 << 8) | 7;
+        let hw1 = 0x8000u16 | 7;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -1922,7 +1922,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.msp = 0x2000_ABCD;
         let hw0 = 0xF3EFu16;
-        let hw1 = 0x8000u16 | (0 << 8) | 8;
+        let hw1 = 0x8000u16 | 8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x2000_ABCD);
     }
@@ -1933,7 +1933,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.psp = 0x2000_1234;
         let hw0 = 0xF3EFu16;
-        let hw1 = 0x8000u16 | (0 << 8) | 9;
+        let hw1 = 0x8000u16 | 9;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x2000_1234);
     }
@@ -1945,7 +1945,7 @@ mod mrs_msr {
         c.regs.msplim = 0xAAAA;
         c.regs.psplim = 0xBBBB;
         // MSPLIM = SYSm=10
-        c.execute_one_wide(0xF3EFu16, 0x8000u16 | (0 << 8) | 10);
+        c.execute_one_wide(0xF3EFu16, 0x8000u16 | 10);
         assert_eq!(c.reg(0), 0xAAAA);
         c.execute_one_wide(0xF3EFu16, 0x8000u16 | (1 << 8) | 11);
         assert_eq!(c.reg(1), 0xBBBB);
@@ -1957,7 +1957,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.faultmask = 1;
         let hw0 = 0xF3EFu16;
-        let hw1 = 0x8000u16 | (0 << 8) | 19;
+        let hw1 = 0x8000u16 | 19;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 1);
     }
@@ -1968,7 +1968,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.regs.control = 0x7;
         let hw0 = 0xF3EFu16;
-        let hw1 = 0x8000u16 | (0 << 8) | 20;
+        let hw1 = 0x8000u16 | 20;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x7);
     }
@@ -2008,7 +2008,7 @@ mod mrs_msr {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 0xDEAD);
         let hw0 = 0xF3EFu16;
-        let hw1 = 0x8000u16 | (0 << 8) | 0x30;
+        let hw1 = 0x8000u16 | 0x30;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0);
     }
@@ -2064,7 +2064,7 @@ mod bfi_ubfx_sbfx {
         let imm3 = (lsb >> 2) & 0x7;
         let imm2 = lsb & 0x3;
         let hw0: u16 = 0xF200 | (0b10110u16 << 4) | 1;
-        let hw1: u16 = (imm3 << 12) | (0u16 << 8) | (imm2 << 6) | msb;
+        let hw1: u16 = (imm3 << 12) | (imm2 << 6) | msb;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 1 << 5);
     }
@@ -2079,7 +2079,7 @@ mod bfi_ubfx_sbfx {
         c.set_reg(1, 0x7FFF_FFFF);
         // lsb=0, msb=30 → width=31
         let hw0: u16 = 0xF200 | (0b10110u16 << 4) | 1;
-        let hw1: u16 = (0u16 << 12) | (0u16 << 8) | (0u16 << 6) | 30u16;
+        let hw1: u16 = 30u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x7FFF_FFFF);
     }
@@ -2094,7 +2094,7 @@ mod bfi_ubfx_sbfx {
         let imm3 = (lsb >> 2) & 0x7;
         let imm2 = lsb & 0x3;
         let hw0: u16 = 0xF200 | (0b11100u16 << 4) | 1;
-        let hw1: u16 = (imm3 << 12) | (0u16 << 8) | (imm2 << 6) | 7u16;
+        let hw1: u16 = (imm3 << 12) | (imm2 << 6) | 7u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0xAA);
     }
@@ -2109,7 +2109,7 @@ mod bfi_ubfx_sbfx {
         let imm3 = (lsb >> 2) & 0x7;
         let imm2 = lsb & 0x3;
         let hw0: u16 = 0xF200 | (0b10100u16 << 4) | 1;
-        let hw1: u16 = (imm3 << 12) | (0u16 << 8) | (imm2 << 6) | 0u16;
+        let hw1: u16 = (imm3 << 12) | (imm2 << 6);
         c.execute_one_wide(hw0, hw1);
         // width=1, value=1, sign_extend to -1
         assert_eq!(c.reg(0), 0xFFFF_FFFF);
@@ -2128,7 +2128,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x0080_0080u32); // both bytes = 0x80 (sign bit)
         // SXTB16: hw0 = 0xFA2F (ext=010, Rn=15), hw1 = 0xF000 | (Rd<<8) | 0x80 | Rm.
         let hw0: u16 = 0xFA2Fu16;
-        let hw1: u16 = (0u16 << 12) | 0x0080u16 | 1u16; // bits[7]=1 for extend path
+        let hw1: u16 = 0x0080u16 | 1u16; // bits[7]=1 for extend path
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0xFF80_FF80u32);
     }
@@ -2153,7 +2153,7 @@ mod dp_register_misc {
         c.set_reg(2, 0xFFFF);
         // SXTAH: ext=000, Rn=1 (non-15)
         let hw0: u16 = 0xFA01u16;
-        let hw1: u16 = (0u16 << 12) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // 0xFFFF as i16 = -1; 10 + (-1) = 9.
         assert_eq!(c.reg(0), 9);
@@ -2167,7 +2167,7 @@ mod dp_register_misc {
         c.set_reg(2, 0xFFFF);
         // ext=001 → hw0[6:4]=001 → 0xFA11.
         let hw0: u16 = 0xFA11u16;
-        let hw1: u16 = (0u16 << 12) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // 0xFFFF zero-ext = 65535; 10 + 65535 = 65545.
         assert_eq!(c.reg(0), 65545);
@@ -2180,7 +2180,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x0001_0002);
         c.set_reg(2, 0x0080_0080);
         let hw0: u16 = 0xFA21u16;
-        let hw1: u16 = (0u16 << 12) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // lo: 0x0002 + (-128) = -126 & 0xFFFF = 0xFF82
         // hi: 0x0001 + (-128) = -127 & 0xFFFF = 0xFF81
@@ -2194,7 +2194,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x0001_0002);
         c.set_reg(2, 0x0080_0080);
         let hw0: u16 = 0xFA31u16;
-        let hw1: u16 = (0u16 << 12) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // lo = 2 + 128 = 130 = 0x0082
         // hi = 1 + 128 = 129 = 0x0081
@@ -2208,7 +2208,7 @@ mod dp_register_misc {
         c.regs.set_pc(0x1000);
         // ext=110 → unsupported for plain extend
         let hw0: u16 = 0xFA6Fu16;
-        let hw1: u16 = (0u16 << 12) | 0x0080u16 | 1u16;
+        let hw1: u16 = 0x0080u16 | 1u16;
         c.execute_one_wide(hw0, hw1);
         assert!(c.pending_fault.is_some());
     }
@@ -2219,7 +2219,7 @@ mod dp_register_misc {
         let mut c = CortexM33::for_test(0);
         c.regs.set_pc(0x1000);
         let hw0: u16 = 0xFA61u16;
-        let hw1: u16 = (0u16 << 12) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert!(c.pending_fault.is_some());
     }
@@ -2235,7 +2235,7 @@ mod dp_register_misc {
         // hw0 = 0xFA8x | Rn (hw0[6:5]=00 → 0xFA80 | Rn)
         let hw0: u16 = 0xFA80u16 | 1;
         // hw1 = 1111_Rd_1000_Rm. op2_54=00 (bits 5:4 = 00) but hw1[7] must be 1.
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0) as i32, i32::MAX);
         assert!(c.regs.flag_q());
@@ -2249,7 +2249,7 @@ mod dp_register_misc {
         c.set_reg(2, 0);
         let hw0: u16 = 0xFA80u16 | 1;
         // op2_54=01 → QDADD
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x0090u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x0090u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -2262,7 +2262,7 @@ mod dp_register_misc {
         c.set_reg(2, 0x8000_0000u32); // Rm = i32::MIN
         let hw0: u16 = 0xFA80u16 | 1;
         // op2_54=10 → QSUB: Rd = sat(Rm - Rn) = sat(i32::MIN - 1) → saturates to i32::MIN.
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x00A0u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x00A0u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0) as i32, i32::MIN);
         assert!(c.regs.flag_q());
@@ -2276,7 +2276,7 @@ mod dp_register_misc {
         c.set_reg(2, 0);
         let hw0: u16 = 0xFA80u16 | 1;
         // op2_54=11 → QDSUB
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x00B0u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x00B0u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -2291,7 +2291,7 @@ mod dp_register_misc {
         // hw0[6:5]=01 → 0xFAA0 | Rn
         let hw0: u16 = 0xFAA0u16 | 1;
         // op2_54=00, hw1[7]=1
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0xBBAA_BBAAu32);
     }
@@ -2303,7 +2303,7 @@ mod dp_register_misc {
         c.regs.set_pc(0x1000);
         // op1_65=10 (unused)
         let hw0: u16 = 0xFAC0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert!(c.pending_fault.is_some());
     }
@@ -2318,7 +2318,7 @@ mod dp_register_misc {
         // par_op1=001 (ADD16), par_op2=000 (signed).
         // hw0 = 0xFA9x | Rn where bit4 is part of par_op1=001 → 0xFA90|Rn (ext=001).
         let hw0: u16 = 0xFA90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // lo: 2+4=6, hi: 1+3=4 → 0x0004_0006
         assert_eq!(c.reg(0), 0x0004_0006);
@@ -2332,7 +2332,7 @@ mod dp_register_misc {
         c.set_reg(2, 0x0002_0003);
         // par_op1=010 → ASX
         let hw0: u16 = 0xFAA0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // lo: a_lo - b_hi = 0x10 - 2 = 0x0E; hi: a_hi + b_lo = 1 + 3 = 4
         assert_eq!(c.reg(0), 0x0004_000E);
@@ -2346,7 +2346,7 @@ mod dp_register_misc {
         c.set_reg(2, 0x10_20_30_40);
         // par_op1=000 → ADD8
         let hw0: u16 = 0xFA80u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x11_22_33_44u32);
     }
@@ -2359,7 +2359,7 @@ mod dp_register_misc {
         c.set_reg(2, 0x0001_0003);
         // par_op1=110 → SAX
         let hw0: u16 = 0xFAE0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -2372,7 +2372,7 @@ mod dp_register_misc {
         c.set_reg(2, 0x0002_0002);
         // par_op1=101 → SUB16
         let hw0: u16 = 0xFAD0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -2385,7 +2385,7 @@ mod dp_register_misc {
         c.set_reg(2, 0x0002_0004);
         let hw0: u16 = 0xFA90u16 | 1;
         // par_op2=110 → hw1[6:4]=110 → 0x0060
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b110 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b110 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -2397,7 +2397,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x7FFF_0000);
         c.set_reg(2, 0x0001_0000);
         let hw0: u16 = 0xFA90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b001 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b001 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -2409,7 +2409,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x0004_0008);
         c.set_reg(2, 0x0002_0004);
         let hw0: u16 = 0xFA90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b010 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b010 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -2421,7 +2421,7 @@ mod dp_register_misc {
         c.set_reg(1, 0xFFFF_0000);
         c.set_reg(2, 0x0001_0000);
         let hw0: u16 = 0xFA90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b101 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b101 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -2433,7 +2433,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x10_10_10_10);
         c.set_reg(2, 0x01_02_03_04);
         let hw0: u16 = 0xFAC0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b100 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b100 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x0F_0E_0D_0C);
     }
@@ -2446,7 +2446,7 @@ mod dp_register_misc {
         c.set_reg(2, 0);
         // par_op1=011 → invalid for signed group
         let hw0: u16 = 0xFAB0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -2458,7 +2458,7 @@ mod dp_register_misc {
         c.set_reg(1, 0);
         c.set_reg(2, 0);
         let hw0: u16 = 0xFAB0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b100 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b100 << 4) | 2u16;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -2471,7 +2471,7 @@ mod dp_register_misc {
         c.set_reg(2, 0);
         // par_op2 = 011 (reserved)
         let hw0: u16 = 0xFA90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b011 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b011 << 4) | 2u16;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -2484,7 +2484,7 @@ mod dp_register_misc {
         c.set_reg(2, 0);
         // par_op1=011 (invalid for signed-16 group, routes via Q modifier)
         let hw0: u16 = 0xFAB0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b001 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b001 << 4) | 2u16;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -2497,7 +2497,7 @@ mod dp_register_misc {
         c.set_reg(2, 0);
         // par_op1=011 unsigned
         let hw0: u16 = 0xFAB0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b101 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b101 << 4) | 2u16;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -2510,7 +2510,7 @@ mod dp_register_misc {
         c.set_reg(2, 0);
         // par_op1=011 for signed-8 group (only 000/100 valid)
         let hw0: u16 = 0xFAB0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         let cy = c.execute_one_wide(hw0, hw1);
         assert_eq!(cy, 1);
     }
@@ -2522,7 +2522,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x10_10_10_10);
         c.set_reg(2, 0x01_02_03_04);
         let hw0: u16 = 0xFAC0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x0F_0E_0D_0C);
     }
@@ -2534,7 +2534,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x10_20_30_40);
         c.set_reg(2, 0x01_02_03_04);
         let hw0: u16 = 0xFA80u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b100 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b100 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x11_22_33_44);
     }
@@ -2546,7 +2546,7 @@ mod dp_register_misc {
         c.set_reg(1, 0x0008_0010);
         c.set_reg(2, 0x0004_0008);
         let hw0: u16 = 0xFAD0u16 | 1; // par_op1=101 SUB16
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b110 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b110 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
         let _ = c.reg(0);
     }
@@ -2626,7 +2626,7 @@ mod more_coverage {
         bus.write32(0x2000_100C, 0xBBBB, 0);
         // LDRD R0, R1, [PC, #8]! would have W=1 but Rn=15 prevents writeback.
         let hw0: u16 = 0xE800 | (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5) | (1 << 4) | 15;
-        let hw1: u16 = (0 << 12) | (1 << 8) | 1; // imm8=1 → offset=4; addr=0x2000_1008
+        let hw1: u16 = (1 << 8) | 1; // imm8=1 → offset=4; addr=0x2000_1008
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.reg(0), 0xAAAA);
         assert_eq!(c.reg(1), 0xBBBB);
@@ -2653,7 +2653,7 @@ mod more_coverage {
         // The low nibble is ignored for MRS (hw1 carries Rd/SYSm).
         // hw0 = 0xF3E0 has bits[10:4] = 0111110.
         let hw0: u16 = 0xF3E0;
-        let hw1: u16 = 0x8000u16 | (0 << 8) | 16; // MRS R0, PRIMASK
+        let hw1: u16 = 0x8000u16 | 16; // MRS R0, PRIMASK
         c.execute_one_wide(hw0, hw1);
     }
 
@@ -2663,7 +2663,7 @@ mod more_coverage {
         let mut c = CortexM33::for_test(0);
         c.regs.basepri = 0x40;
         c.set_reg(0, 0);
-        let hw0 = 0xF380u16 | 0;
+        let hw0 = 0xF380u16;
         let hw1 = 0x8800u16 | 18;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.basepri, 0x40); // not changed when val == 0
@@ -2679,7 +2679,7 @@ mod more_coverage {
         c.set_reg(3, 1);
         // SMLAD
         let hw0: u16 = 0xFB20u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -2704,7 +2704,7 @@ mod more_coverage {
         // acc = 0x7000_0000
         // result = 0x3FFF_0001 + 0x7000_0000 = 0xAFFF_0001 → overflow (negative sign).
         let hw0: u16 = 0xFB40u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.flag_q());
     }
@@ -2718,7 +2718,7 @@ mod more_coverage {
         c.set_reg(3, 5);
         let hw0: u16 = 0xFB50u16 | 1;
         // op2=01 → round=true, Ra=3 (not 15)
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
     }
 
@@ -2730,7 +2730,7 @@ mod more_coverage {
         c.set_reg(2, 0x10_000_000);
         c.set_reg(3, 5);
         let hw0: u16 = 0xFB60u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
     }
 
@@ -2758,7 +2758,7 @@ mod more_coverage {
         c.set_reg(1, 1);
         c.set_reg(2, 2);
         let hw0: u16 = 0xFA80u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x0080u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x0080u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 3);
         // Q should be whatever it was — clean test state, not set.
@@ -2771,7 +2771,7 @@ mod more_coverage {
         c.set_reg(1, 1);
         c.set_reg(2, 5);
         let hw0: u16 = 0xFA80u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x0090u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x0090u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // saturate(1+1)=2; 5+2=7
         assert_eq!(c.reg(0), 7);
@@ -2784,7 +2784,7 @@ mod more_coverage {
         c.set_reg(1, 3);
         c.set_reg(2, 10);
         let hw0: u16 = 0xFA80u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x00A0u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x00A0u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // Rm - Rn = 10 - 3 = 7
         assert_eq!(c.reg(0), 7);
@@ -2797,7 +2797,7 @@ mod more_coverage {
         c.set_reg(1, 2);
         c.set_reg(2, 10);
         let hw0: u16 = 0xFA80u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | 0x00B0u16 | 2u16;
+        let hw1: u16 = 0xF000u16 | 0x00B0u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         // saturate(2+2)=4; Rm - saturate = 10 - 4 = 6
         assert_eq!(c.reg(0), 6);
@@ -2811,7 +2811,7 @@ mod more_coverage {
         c.set_reg(2, 0x0002_0004);
         // par_op1=001 (ADD16), par_op2=110 (halving unsigned)
         let hw0: u16 = 0xFA90u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b110 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b110 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
     }
 
@@ -2822,7 +2822,7 @@ mod more_coverage {
         c.set_reg(1, 0x0004_0010);
         c.set_reg(2, 0x0002_0008);
         let hw0: u16 = 0xFAE0u16 | 1; // par_op1=110 SAX
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b110 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b110 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
     }
 
@@ -2833,7 +2833,7 @@ mod more_coverage {
         c.set_reg(1, 0x0010_0004);
         c.set_reg(2, 0x0008_0002);
         let hw0: u16 = 0xFAA0u16 | 1; // par_op1=010 ASX
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b110 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b110 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
     }
 
@@ -2848,7 +2848,7 @@ mod more_coverage {
         // Actually we already test this. Let's try to hit line 1829:
         // `match op { 0b000 => ..., _ => ... }` default-path when op=100.
         let hw0: u16 = 0xFAC0u16 | 1; // par_op1=100 SUB8
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b100 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b100 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
     }
 
@@ -2888,7 +2888,7 @@ mod more_coverage {
         let imm3 = (imm16 >> 8) & 0x7;
         let imm8 = imm16 & 0xFF;
         let hw0: u16 = 0xF200 | ((0b01100u16) << 4) | (i << 10) | imm4;
-        let hw1: u16 = (imm3 << 12) | (0 << 8) | imm8;
+        let hw1: u16 = (imm3 << 12) | imm8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0xABCD_5678);
     }
@@ -2904,7 +2904,7 @@ mod more_coverage {
         let imm3 = (imm16 >> 8) & 0x7;
         let imm8 = imm16 & 0xFF;
         let hw0: u16 = 0xF200 | ((0b00100u16) << 4) | (i << 10) | imm4;
-        let hw1: u16 = (imm3 << 12) | (0 << 8) | imm8;
+        let hw1: u16 = (imm3 << 12) | imm8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0x1234);
     }
@@ -2919,8 +2919,8 @@ mod more_coverage {
         let i = ((imm12 >> 11) & 1) as u16;
         let imm3 = ((imm12 >> 8) & 0x7) as u16;
         let imm8 = (imm12 & 0xFF) as u16;
-        let hw0: u16 = 0xF200 | ((0b00000u16) << 4) | (i << 10) | 1;
-        let hw1: u16 = (imm3 << 12) | (0 << 8) | imm8;
+        let hw0: u16 = 0xF200 | (i << 10) | 1;
+        let hw1: u16 = (imm3 << 12) | imm8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 5000);
     }
@@ -2935,7 +2935,7 @@ mod more_coverage {
         let imm3 = ((imm12 >> 8) & 0x7) as u16;
         let imm8 = (imm12 & 0xFF) as u16;
         let hw0: u16 = 0xF200 | ((0b01010u16) << 4) | (i << 10) | 1;
-        let hw1: u16 = (imm3 << 12) | (0 << 8) | imm8;
+        let hw1: u16 = (imm3 << 12) | imm8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 3000);
     }
@@ -3009,7 +3009,7 @@ mod more_coverage {
         c.set_reg(1, 0x01_01_01_01);
         c.set_reg(2, 0x02_02_02_02);
         let hw0: u16 = 0xFAC0u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | 2u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 0xFF_FF_FF_FF);
     }
@@ -3022,7 +3022,7 @@ mod more_coverage {
         c.set_reg(1, 0x00_00_01_FF);
         c.set_reg(2, 0x00_00_01_02);
         let hw0: u16 = 0xFA80u16 | 1;
-        let hw1: u16 = 0xF000u16 | (0u16 << 8) | (0b100 << 4) | 2u16;
+        let hw1: u16 = 0xF000u16 | (0b100 << 4) | 2u16;
         c.execute_one_wide(hw0, hw1);
     }
 }
@@ -3192,8 +3192,8 @@ mod more_misses {
         let i = ((imm12 >> 11) & 1) as u16;
         let imm3 = ((imm12 >> 8) & 0x7) as u16;
         let imm8 = (imm12 & 0xFF) as u16;
-        let hw0: u16 = 0xF200 | ((0b00000u16) << 4) | (i << 10) | 1;
-        let hw1: u16 = (imm3 << 12) | (0 << 8) | imm8;
+        let hw0: u16 = 0xF200 | (i << 10) | 1;
+        let hw1: u16 = (imm3 << 12) | imm8;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 5000);
     }
@@ -3257,7 +3257,7 @@ mod more_misses {
         c.set_reg(1, 0x2000_2000);
         bus.write32(0x2000_2000, 0x0000_1001, 0); // Thumb-bit
         let hw0: u16 = 0xF8D0 | 1;
-        let hw1: u16 = (15u16 << 12) | 0;
+        let hw1: u16 = 15u16 << 12;
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(cy, 5);
     }
@@ -3334,7 +3334,7 @@ mod more_misses {
         c.exclusive_address = Some(0x2000_0064); // different addr
         c.set_reg(3, 0xDEAD);
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = (3u16 << 12) | (2 << 8) | 0;
+        let hw1: u16 = (3u16 << 12) | (2 << 8);
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(c.reg(2), 1); // failure
     }
@@ -3347,7 +3347,7 @@ mod more_misses {
         c.set_reg(1, 0x2000_0070);
         c.exclusive_address = None;
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = (3u16 << 12) | (2 << 8) | 0;
+        let hw1: u16 = (3u16 << 12) | (2 << 8);
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
         assert_eq!(cy, 2);
     }
@@ -3383,7 +3383,7 @@ mod more_misses {
         c.set_reg(1, (5u16 as u32) | ((7u16 as u32) << 16));
         c.set_reg(2, (2u16 as u32) | ((3u16 as u32) << 16));
         let hw0: u16 = 0xFB40u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0) as i32, 5 * 2 - 7 * 3);
     }
@@ -3396,7 +3396,7 @@ mod more_misses {
         c.set_reg(2, (2u16 as u32) | ((3u16 as u32) << 16));
         c.set_reg(3, 100);
         let hw0: u16 = 0xFB40u16 | 1;
-        let hw1: u16 = (3u16 << 12) | (0 << 8) | (1 << 4) | 2;
+        let hw1: u16 = (3u16 << 12) | (1 << 4) | 2;
         c.execute_one_wide(hw0, hw1);
         // cross: rm_lo=3, rm_hi=2 → p1=5*3=15, p2=7*2=14, diff=1, +100=101
         assert_eq!(c.reg(0), 101);
@@ -3491,7 +3491,7 @@ mod more_misses {
         c.set_reg(1, 3);
         c.set_reg(2, 4);
         let hw0: u16 = 0xFB00u16 | 1;
-        let hw1: u16 = (15u16 << 12) | (0 << 8) | (0 << 4) | 2;
+        let hw1: u16 = (15u16 << 12) | 2;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0), 12);
     }
@@ -3845,35 +3845,35 @@ mod worker_bus_exec {
         bus.write32(0x2000_4004, 0x1234_5678, 0);
 
         // LDR.W R0, [R1, #0]
-        run_wide(&mut c, &mut bus, pc, 0xF8D0u16 | 1, (0u16 << 12) | 0);
+        run_wide(&mut c, &mut bus, pc, 0xF8D0u16 | 1, 0);
         pc += 0x100;
 
         // STR.W R0, [R1, #4]
         c.set_reg(0, 0xCAFE);
-        run_wide(&mut c, &mut bus, pc, 0xF8C0u16 | 1, (0u16 << 12) | 4);
+        run_wide(&mut c, &mut bus, pc, 0xF8C0u16 | 1, 4);
         pc += 0x100;
 
         // LDRB.W R0, [R1, #0]
-        run_wide(&mut c, &mut bus, pc, 0xF890u16 | 1, (0u16 << 12) | 0);
+        run_wide(&mut c, &mut bus, pc, 0xF890u16 | 1, 0);
         pc += 0x100;
 
         // PLD (rt=15, byte load) — line 534 True.
-        run_wide(&mut c, &mut bus, pc, 0xF890u16 | 1, (15u16 << 12) | 0);
+        run_wide(&mut c, &mut bus, pc, 0xF890u16 | 1, 15u16 << 12);
         pc += 0x100;
 
         // LDRSH.W R0, [R1, #2]
         bus.write16(0x2000_4002, 0x8000, 0);
-        run_wide(&mut c, &mut bus, pc, 0xF9B0u16 | 1, (0u16 << 12) | 2);
+        run_wide(&mut c, &mut bus, pc, 0xF9B0u16 | 1, 2);
         pc += 0x100;
 
         // LDRSB.W R0, [R1, #0]
-        run_wide(&mut c, &mut bus, pc, 0xF990u16 | 1, (0u16 << 12) | 0);
+        run_wide(&mut c, &mut bus, pc, 0xF990u16 | 1, 0);
         pc += 0x100;
 
         // STR.W to SIO — single-cycle (line 619 False).
         c.set_reg(3, 0xD000_0000);
         c.set_reg(0, 0x99);
-        run_wide(&mut c, &mut bus, pc, 0xF8C0u16 | 3, (0u16 << 12) | 0);
+        run_wide(&mut c, &mut bus, pc, 0xF8C0u16 | 3, 0);
         pc += 0x100;
 
         // LDMIA.W R1!, {R0, R2}
@@ -3886,50 +3886,44 @@ mod worker_bus_exec {
 
         // LDRD R0, R2, [R1, #0]
         let hw0: u16 = 0xE800 | (1 << 8) | (1 << 7) | (1 << 6) | (1 << 4) | 1;
-        run_wide(&mut c, &mut bus, pc, hw0, (0 << 12) | (2 << 8) | 0);
+        run_wide(&mut c, &mut bus, pc, hw0, 2 << 8);
         pc += 0x100;
 
         // STRD R0, R2, [R1, #0]
         let hw0: u16 = 0xE800 | (1 << 8) | (1 << 7) | (1 << 6) | 1;
-        run_wide(&mut c, &mut bus, pc, hw0, (0 << 12) | (2 << 8) | 0);
+        run_wide(&mut c, &mut bus, pc, hw0, 2 << 8);
         pc += 0x100;
 
         // LDR.W post-index (p=0, w=1).
         c.set_reg(4, 0x2000_4000);
         let hw0: u16 = 0xF850 | 4;
-        let hw1: u16 = (0u16 << 12) | 0x800 | 0x200 | 0x100 | 4; // p=0, u=1, w=1, imm8=4
+        let hw1: u16 = 0x800 | 0x200 | 0x100 | 4; // p=0, u=1, w=1, imm8=4
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
         // LDR.W pre-index no writeback (p=1, w=0) — exercises `w || !p`
         // with w=false, evaluates !p → False arm of 563:21 via WorkerBus.
         c.set_reg(4, 0x2000_4000);
-        let hw1: u16 = (0u16 << 12) | 0x800 | 0x400 | 0x200 | 4;
+        let hw1: u16 = 0x800 | 0x400 | 0x200 | 4;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
         // LDR.W post-index with w=0 (p=0, w=0) — True arm of !p.
-        let hw1: u16 = (0u16 << 12) | 0x800 | 0x200 | 4;
+        let hw1: u16 = 0x800 | 0x200 | 4;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
         // LDREX / STREX (success)
         c.set_reg(5, 0x2000_4020);
         bus.write32(0x2000_4020, 0xABCD, 0);
-        run_wide(&mut c, &mut bus, pc, 0xE850u16 | 5, (0u16 << 12) | 0);
+        run_wide(&mut c, &mut bus, pc, 0xE850u16 | 5, 0);
         pc += 0x100;
         c.set_reg(6, 0x1234);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xE840u16 | 5,
-            (6u16 << 12) | (7 << 8) | 0,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xE840u16 | 5, (6u16 << 12) | (7 << 8));
         pc += 0x100;
 
         // LDREXB / STREXB
-        run_wide(&mut c, &mut bus, pc, 0xE8D0u16 | 5, (0u16 << 12) | 0x0F4F);
+        run_wide(&mut c, &mut bus, pc, 0xE8D0u16 | 5, 0x0F4F);
         pc += 0x100;
         run_wide(
             &mut c,
@@ -3941,7 +3935,7 @@ mod worker_bus_exec {
         pc += 0x100;
 
         // LDREXH / STREXH
-        run_wide(&mut c, &mut bus, pc, 0xE8D0u16 | 5, (0u16 << 12) | 0x0F5F);
+        run_wide(&mut c, &mut bus, pc, 0xE8D0u16 | 5, 0x0F5F);
         pc += 0x100;
         run_wide(
             &mut c,
@@ -3971,164 +3965,62 @@ mod worker_bus_exec {
         c.set_reg(2, 4);
 
         // MUL
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB00u16 | 1,
-            (15u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB00u16 | 1, (15u16 << 12) | 2);
         pc += 0x100;
         // MLA
         c.set_reg(3, 5);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB00u16 | 1,
-            (3u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB00u16 | 1, (3u16 << 12) | 2);
         pc += 0x100;
         // SMULBB
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB10u16 | 1,
-            (15u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB10u16 | 1, (15u16 << 12) | 2);
         pc += 0x100;
         // SMLABB
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB10u16 | 1,
-            (3u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB10u16 | 1, (3u16 << 12) | 2);
         pc += 0x100;
         // SMUAD
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB20u16 | 1,
-            (15u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB20u16 | 1, (15u16 << 12) | 2);
         pc += 0x100;
         // SMULWB
         c.set_reg(1, 0x0002_0000);
         c.set_reg(2, 0x0000_0010);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB30u16 | 1,
-            (15u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB30u16 | 1, (15u16 << 12) | 2);
         pc += 0x100;
         // SMUSD
         c.set_reg(1, (5u16 as u32) | ((7u16 as u32) << 16));
         c.set_reg(2, (2u16 as u32) | ((3u16 as u32) << 16));
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB40u16 | 1,
-            (15u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB40u16 | 1, (15u16 << 12) | 2);
         pc += 0x100;
         // SMMUL
         c.set_reg(1, 0x0100_0000);
         c.set_reg(2, 0x0100_0000);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB50u16 | 1,
-            (15u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB50u16 | 1, (15u16 << 12) | 2);
         pc += 0x100;
         // SMMLS
         c.set_reg(3, 5);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB60u16 | 1,
-            (3u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB60u16 | 1, (3u16 << 12) | 2);
         pc += 0x100;
         // USAD8
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB70u16 | 1,
-            (15u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB70u16 | 1, (15u16 << 12) | 2);
         pc += 0x100;
 
         // SMULL / UMULL / SMLAL / UMLAL
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB80u16 | 1,
-            (0u16 << 12) | (1 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB80u16 | 1, (1 << 8) | 2);
         pc += 0x100;
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFBA0u16 | 1,
-            (0u16 << 12) | (1 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFBA0u16 | 1, (1 << 8) | 2);
         pc += 0x100;
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFBC0u16 | 1,
-            (0u16 << 12) | (1 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFBC0u16 | 1, (1 << 8) | 2);
         pc += 0x100;
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFBE0u16 | 1,
-            (0u16 << 12) | (1 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFBE0u16 | 1, (1 << 8) | 2);
         pc += 0x100;
 
         // SDIV / UDIV
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB90u16 | 1,
-            0xF000 | (0 << 8) | 0x00F0 | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB90u16 | 1, 0xF000 | 0x00F0 | 2);
         pc += 0x100;
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFBB0u16 | 1,
-            0xF000 | (0 << 8) | 0x00F0 | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFBB0u16 | 1, 0xF000 | 0x00F0 | 2);
         pc += 0x100;
 
         // SMLALBB
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFBC0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (8 << 4) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFBC0u16 | 1, (1 << 8) | (8 << 4) | 2);
         pc += 0x100;
 
         // SMLALD
@@ -4137,7 +4029,7 @@ mod worker_bus_exec {
             &mut bus,
             pc,
             0xFBC0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 2,
+            (1 << 8) | (0b1100 << 4) | 2,
         );
         pc += 0x100;
 
@@ -4147,7 +4039,7 @@ mod worker_bus_exec {
             &mut bus,
             pc,
             0xFBD0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 2,
+            (1 << 8) | (0b1100 << 4) | 2,
         );
         pc += 0x100;
 
@@ -4157,7 +4049,7 @@ mod worker_bus_exec {
             &mut bus,
             pc,
             0xFBE0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (0b0110 << 4) | 2,
+            (1 << 8) | (0b0110 << 4) | 2,
         );
         pc += 0x100;
 
@@ -4192,10 +4084,10 @@ mod worker_bus_exec {
         pc += 0x100;
 
         // MRS PRIMASK.
-        run_wide(&mut c, &mut bus, pc, 0xF3EFu16, 0x8000u16 | (0 << 8) | 16);
+        run_wide(&mut c, &mut bus, pc, 0xF3EFu16, 0x8000u16 | 16);
         pc += 0x100;
         // MRS APSR.
-        run_wide(&mut c, &mut bus, pc, 0xF3EFu16, 0x8000u16 | (0 << 8) | 0);
+        run_wide(&mut c, &mut bus, pc, 0xF3EFu16, 0x8000u16);
         pc += 0x100;
 
         // Barriers and hints.
@@ -4247,17 +4139,17 @@ mod worker_bus_exec {
 
         // LSR.W #32 (shift_type=01, shift_n=0)
         let hw0: u16 = 0xEA00 | (0b0010 << 5) | 15;
-        let hw1: u16 = (0 << 12) | (0 << 8) | (0 << 6) | (0b01 << 4) | 1;
+        let hw1: u16 = (0b01 << 4) | 1;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
         // ASR.W #32.
-        let hw1: u16 = (0 << 12) | (0 << 8) | (0 << 6) | (0b10 << 4) | 1;
+        let hw1: u16 = (0b10 << 4) | 1;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
         // RRX (shift_type=11, amount=0).
-        let hw1: u16 = (0 << 12) | (0 << 8) | (0 << 6) | (0b11 << 4) | 1;
+        let hw1: u16 = (0b11 << 4) | 1;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
 
         let _ = pc;
@@ -4372,7 +4264,7 @@ mod worker_bus_exec {
         // ADDW R0, R1, #100 (Rn != 15)
         c.set_reg(1, 1000);
         let hw0: u16 = 0xF200 | 1;
-        let hw1: u16 = (0 << 12) | (0 << 8) | 100;
+        let hw1: u16 = 100;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
@@ -4393,7 +4285,7 @@ mod worker_bus_exec {
         let imm3 = (lsb >> 2) & 0x7;
         let imm2 = lsb & 0x3;
         let hw0: u16 = 0xF200 | (0b10110u16 << 4) | 1;
-        let hw1: u16 = (imm3 << 12) | (0 << 8) | (imm2 << 6) | msb;
+        let hw1: u16 = (imm3 << 12) | (imm2 << 6) | msb;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
@@ -4405,7 +4297,7 @@ mod worker_bus_exec {
         // UBFX R0, R1, #4, #8
         let widthm1 = 7u16;
         let hw0: u16 = 0xF200 | (0b11100u16 << 4) | 1;
-        let hw1: u16 = (imm3 << 12) | (0 << 8) | (imm2 << 6) | widthm1;
+        let hw1: u16 = (imm3 << 12) | (imm2 << 6) | widthm1;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
@@ -4424,7 +4316,7 @@ mod worker_bus_exec {
         // SSAT (ASR)
         c.set_reg(1, (-200i32) as u32);
         let hw0: u16 = 0xF200 | (0b10010u16 << 4) | 1;
-        let hw1: u16 = (0 << 12) | (0 << 8) | (2 << 6) | 7;
+        let hw1: u16 = (2 << 6) | 7;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
@@ -4448,7 +4340,7 @@ mod worker_bus_exec {
         let imm3_t = (imm16 >> 8) & 0x7;
         let imm8 = imm16 & 0xFF;
         let hw0: u16 = 0xF200 | ((0b01100u16) << 4) | (i << 10) | imm4;
-        let hw1: u16 = (imm3_t << 12) | (0 << 8) | imm8;
+        let hw1: u16 = (imm3_t << 12) | imm8;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
 
         let _ = pc;
@@ -4523,14 +4415,14 @@ mod worker_bus_exec {
         bus.write32(0x2000_D408, 0xAAAA, 0);
         bus.write32(0x2000_D40C, 0xBBBB, 0);
         let hw0: u16 = 0xE800 | (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5) | (1 << 4) | 1;
-        let hw1: u16 = (0 << 12) | (2 << 8) | 2;
+        let hw1: u16 = (2 << 8) | 2;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
         // TT instruction via WorkerBus.
         c.set_reg(1, 0x2000_D500);
         let hw0: u16 = 0xE840 | 1;
-        let hw1: u16 = 0xF000 | (0 << 8);
+        let hw1: u16 = 0xF000;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
 
         let _ = pc;
@@ -4545,7 +4437,7 @@ mod worker_bus_exec {
         // LDR.W via PC-relative literal (rn=15, line 544/539)
         bus.write32(0x2000_F010, 0xDEAD_BEEF, 0);
         let hw0: u16 = 0xF8DF;
-        let hw1: u16 = (0u16 << 12) | 8; // imm12=8; addr = (PC+4) & !3 + 8
+        let hw1: u16 = 8; // imm12=8; addr = (PC+4) & !3 + 8
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
@@ -4555,39 +4447,21 @@ mod worker_bus_exec {
         c.set_reg(1, 0x8000_8000);
         c.set_reg(2, 0x8000_8000);
         c.set_reg(3, 0x7FFF_FFFF);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB20u16 | 1,
-            (3u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB20u16 | 1, (3u16 << 12) | 2);
         pc += 0x100;
 
         // Overflow in SMLAW (line 1206)
         c.set_reg(1, 0x7FFF_FFFF);
         c.set_reg(2, 0x0000_7FFF);
         c.set_reg(3, 0x7FFF_FFFF);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB30u16 | 1,
-            (3u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB30u16 | 1, (3u16 << 12) | 2);
         pc += 0x100;
 
         // Overflow in SMLSD (line 1228)
         c.set_reg(1, 0x0001_7FFF);
         c.set_reg(2, 0x0000_7FFF);
         c.set_reg(3, 0x7000_0000);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB40u16 | 1,
-            (3u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB40u16 | 1, (3u16 << 12) | 2);
         pc += 0x100;
 
         // SMMLAR / SMMULR (line 1245)
@@ -4598,7 +4472,7 @@ mod worker_bus_exec {
             &mut bus,
             pc,
             0xFB50u16 | 1,
-            (15u16 << 12) | (0 << 8) | (1 << 4) | 2,
+            (15u16 << 12) | (1 << 4) | 2,
         );
         pc += 0x100;
         c.set_reg(3, 5);
@@ -4607,7 +4481,7 @@ mod worker_bus_exec {
             &mut bus,
             pc,
             0xFB50u16 | 1,
-            (3u16 << 12) | (0 << 8) | (1 << 4) | 2,
+            (3u16 << 12) | (1 << 4) | 2,
         );
         pc += 0x100;
 
@@ -4617,25 +4491,25 @@ mod worker_bus_exec {
         pc += 0x100;
 
         // MRS encoding 0x3E (line 977 True LHS)
-        run_wide(&mut c, &mut bus, pc, 0xF3E0u16, 0x8000u16 | (0 << 8) | 16);
+        run_wide(&mut c, &mut bus, pc, 0xF3E0u16, 0x8000u16 | 16);
         pc += 0x100;
 
         // MRS encoding 0x3F (line 977 True RHS via ||)
-        run_wide(&mut c, &mut bus, pc, 0xF3F0u16, 0x8000u16 | (0 << 8) | 16);
+        run_wide(&mut c, &mut bus, pc, 0xF3F0u16, 0x8000u16 | 16);
         pc += 0x100;
 
         // LDR rt=15 with non-EXC_RETURN value (line 606 False path)
         c.set_reg(1, 0x2000_F500);
         bus.write32(0x2000_F500, 0x2000_F000 | 1, 0);
         let hw0: u16 = 0xF8D0 | 1;
-        let hw1: u16 = (15u16 << 12) | 0;
+        let hw1: u16 = 15u16 << 12;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
         // LDM with PC and non-EXC_RETURN value (line 645)
         c.set_reg(4, 0x2000_F600);
         bus.write32(0x2000_F600, 0x2000_F000 | 1, 0);
-        let hw0: u16 = 0xE890 | (0 << 5) | 4;
+        let hw0: u16 = 0xE890 | 4;
         let hw1: u16 = 0x8000;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
@@ -4653,7 +4527,7 @@ mod worker_bus_exec {
         c.set_reg(0, 0xBEEF);
         c.set_reg(1, 0x2000_F800);
         let hw0: u16 = 0xF8A0 | 1; // STRH.W: size=01, load=0, sign=0, hw0[7]=1
-        let hw1: u16 = (0u16 << 12) | 4;
+        let hw1: u16 = 4;
         run_wide(&mut c, &mut bus, pc, hw0, hw1);
         pc += 0x100;
 
@@ -4687,13 +4561,7 @@ mod worker_bus_exec {
         c.set_reg(1, 0x7FFF_0000);
         c.set_reg(2, 0x7FFF_7FFF);
         c.set_reg(3, 1);
-        run_wide(
-            &mut c,
-            &mut bus,
-            pc,
-            0xFB20u16 | 1,
-            (3u16 << 12) | (0 << 8) | 2,
-        );
+        run_wide(&mut c, &mut bus, pc, 0xFB20u16 | 1, (3u16 << 12) | 2);
         pc += 0x100;
 
         let _ = pc;

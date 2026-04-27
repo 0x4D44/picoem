@@ -320,7 +320,7 @@ impl CortexM33 {
                 let (result, carry) = if shift == 0 {
                     (a, self.regs.flag_c())
                 } else {
-                    let eff = (shift & 31) as u32;
+                    let eff = shift & 31;
                     if eff == 0 {
                         // Rotate by 32 (or multiple of 32): result unchanged, carry = bit 31
                         (a, a >> 31 != 0)

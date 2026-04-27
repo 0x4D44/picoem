@@ -20,17 +20,26 @@ pub mod pio;
 pub mod shared;
 pub mod sio;
 // Stage 6b (LLD V7 §8/§9): `ThreadedEmulator` pins one thread per
-// worker via `SetThreadAffinityMask`, so the whole module is gated to
-// x86_64 Windows. Non-Windows callers continue on the serial
-// `Emulator::run` path. Dual-execution HLD V1 (Stage 1b) layered the
-// `threading` cargo feature on top: both gates must be satisfied for
-// the threaded runtime to exist.
-#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+// worker via the host's affinity API (`SetThreadAffinityMask` on
+// Windows; `pthread_setaffinity_np` on Linux). Other UNIX hosts
+// (macOS, FreeBSD, …) stay on the serial `Emulator::run` path until
+// `pin_to_host_core` grows a port. Dual-execution HLD V1 (Stage 1b)
+// layered the `threading` cargo feature on top: both gates must be
+// satisfied for the threaded runtime to exist.
+#[cfg(all(
+    feature = "threading",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 pub mod emulator;
 // Per-worker per-quantum timing instrumentation (HLD V7 §8 follow-up).
 // Gated to the same target as `emulator` because only the threaded
 // runtime produces timings.
-#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(
+    feature = "threading",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 pub mod timings;
 
 pub use atomics::CoreAtomics;
@@ -41,7 +50,11 @@ pub use monitors::ExclusiveMonitors;
 // call sites keep using `crate::threaded::{SpinBarrier, BarrierResult,
 // SpscQueue}` unchanged.
 pub use bus::{PioBus, WorkerBus};
-#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(
+    feature = "threading",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 pub use emulator::{RunError, ThreadedEmulator};
 pub use mdpicoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
 pub use peripherals::{
@@ -50,5 +63,9 @@ pub use peripherals::{
 pub use pio::{PioCommand, ThreadedPio};
 pub use shared::SharedState;
 pub use sio::ThreadedSio;
-#[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
+#[cfg(all(
+    feature = "threading",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 pub use timings::{RunTimings, WorkerName, WorkerSummary};

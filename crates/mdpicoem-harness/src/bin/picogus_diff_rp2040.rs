@@ -264,12 +264,12 @@ pub fn parse_trace(text: &str) -> Result<Vec<TraceEvent>, String> {
             ));
         }
 
-        if let Some(prev) = last_ns {
-            if ns < prev {
-                return Err(format!(
-                    "line {line_no}: non-monotonic timestamp {ns} < {prev}"
-                ));
-            }
+        if let Some(prev) = last_ns
+            && ns < prev
+        {
+            return Err(format!(
+                "line {line_no}: non-monotonic timestamp {ns} < {prev}"
+            ));
         }
         last_ns = Some(ns);
 
@@ -813,11 +813,11 @@ pub fn replay<S: IsaSink>(
     let mut current_reg_select: u16 = 0;
 
     for ev in events {
-        if let Some(limit) = duration_ns {
-            if ev.ns > limit {
-                summary.duration_capped = true;
-                break;
-            }
+        if let Some(limit) = duration_ns
+            && ev.ns > limit
+        {
+            summary.duration_capped = true;
+            break;
         }
 
         let target_ns = stretched_target_ns(ev.ns, pre_roll_ns, trace_stretch);
@@ -863,22 +863,22 @@ pub fn replay<S: IsaSink>(
     // Post-roll drain. Step the sink for an additional `post_roll_ns`
     // of *simulated* wall-clock time WITHOUT firing further events, so
     // firmware (e.g. an I2S DMA chain) can flush its trailing buffer.
-    if let Some(post_ns) = post_roll_ns {
-        if post_ns > 0 {
-            let post_start_cycles = sink.cycles();
-            let post_target_ns = sim_ns.saturating_add(post_ns);
-            let stalls = advance_to_sim_ns(sink, &mut sim_ns, post_target_ns, |cycle| {
-                if !stall_warned {
-                    eprintln!(
-                        "warning: emulator stalled at cycle {} during post-roll",
-                        cycle
-                    );
-                    stall_warned = true;
-                }
-            });
-            summary.stall_events += stalls;
-            summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start_cycles);
-        }
+    if let Some(post_ns) = post_roll_ns
+        && post_ns > 0
+    {
+        let post_start_cycles = sink.cycles();
+        let post_target_ns = sim_ns.saturating_add(post_ns);
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, post_target_ns, |cycle| {
+            if !stall_warned {
+                eprintln!(
+                    "warning: emulator stalled at cycle {} during post-roll",
+                    cycle
+                );
+                stall_warned = true;
+            }
+        });
+        summary.stall_events += stalls;
+        summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start_cycles);
     }
 
     summary
@@ -1169,10 +1169,10 @@ fn replay_with_coverage(
     // so decile bucket math works without two passes.
     let mut total_to_fire: u64 = 0;
     for ev in events {
-        if let Some(limit) = duration_ns {
-            if ev.ns > limit {
-                break;
-            }
+        if let Some(limit) = duration_ns
+            && ev.ns > limit
+        {
+            break;
         }
         if !ev.kind.is_write() {
             continue;
@@ -1196,11 +1196,11 @@ fn replay_with_coverage(
     let mut r44_swap_hits: u64 = 0;
 
     for ev in events {
-        if let Some(limit) = duration_ns {
-            if ev.ns > limit {
-                summary.duration_capped = true;
-                break;
-            }
+        if let Some(limit) = duration_ns
+            && ev.ns > limit
+        {
+            summary.duration_capped = true;
+            break;
         }
 
         let target_ns = stretched_target_ns(ev.ns, pre_roll_ns, trace_stretch);
@@ -1296,23 +1296,23 @@ fn replay_with_coverage(
     // Post-roll drain — mirror `replay()` but also reconcile any final
     // trailing push by decode match.
     let autopush_before_post_roll = sink.inner().bus.pio[0].sm[0].autopush_count;
-    if let Some(post_ns) = post_roll_ns {
-        if post_ns > 0 {
-            let post_start_cycles = sink.cycles();
-            let post_target_ns = sim_ns.saturating_add(post_ns);
-            let stalls = advance_to_sim_ns(sink, &mut sim_ns, post_target_ns, |cycle| {
-                if !stall_warned {
-                    eprintln!(
-                        "warning: emulator stalled at cycle {} during post-roll",
-                        cycle
-                    );
-                    stall_warned = true;
-                }
-            });
-            summary.stall_events += stalls;
-            summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start_cycles);
-            uart_drain.drain_emu(sink.inner_mut());
-        }
+    if let Some(post_ns) = post_roll_ns
+        && post_ns > 0
+    {
+        let post_start_cycles = sink.cycles();
+        let post_target_ns = sim_ns.saturating_add(post_ns);
+        let stalls = advance_to_sim_ns(sink, &mut sim_ns, post_target_ns, |cycle| {
+            if !stall_warned {
+                eprintln!(
+                    "warning: emulator stalled at cycle {} during post-roll",
+                    cycle
+                );
+                stall_warned = true;
+            }
+        });
+        summary.stall_events += stalls;
+        summary.post_roll_cycles = sink.cycles().wrapping_sub(post_start_cycles);
+        uart_drain.drain_emu(sink.inner_mut());
     }
     let autopush_after_post_roll = sink.inner().bus.pio[0].sm[0].autopush_count;
     let post_roll_delta = autopush_after_post_roll.wrapping_sub(autopush_before_post_roll);
@@ -1620,6 +1620,12 @@ pub struct UartDrain {
     total_bytes: u64,
 }
 
+impl Default for UartDrain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UartDrain {
     pub fn new() -> Self {
         Self {
@@ -1689,9 +1695,8 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_args().map_err(|e| {
+    let args = parse_args().inspect_err(|_e| {
         print_usage();
-        e
     })?;
 
     let trace_text = std::fs::read_to_string(&args.trace)
@@ -1735,17 +1740,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // addresses (beyond what the trace itself uploaded) still receive
     // non-zero sample data. Use this to prove out the I2S output chain
     // end-to-end when the trace's DRAM upload is incomplete.
-    if std::env::var("PICOGUS_PSRAM_PRESEED").is_ok() {
-        if let Some(ref mut psram) = emu.bus.psram {
-            for (i, byte) in psram.buffer.iter_mut().enumerate() {
-                // 8-bit triangle wave, period 256. Signed view:
-                // -127..+127 rising, then +127..-127 falling.
-                let phase = (i & 0xFF) as i32;
-                let sample = if phase < 128 { phase - 64 } else { 192 - phase };
-                *byte = (sample & 0xFF) as u8;
-            }
-            eprintln!("PSRAM pre-seeded with 8-bit triangle wave (PICOGUS_PSRAM_PRESEED set)");
+    if std::env::var("PICOGUS_PSRAM_PRESEED").is_ok()
+        && let Some(ref mut psram) = emu.bus.psram
+    {
+        for (i, byte) in psram.buffer.iter_mut().enumerate() {
+            // 8-bit triangle wave, period 256. Signed view:
+            // -127..+127 rising, then +127..-127 falling.
+            let phase = (i & 0xFF) as i32;
+            let sample = if phase < 128 { phase - 64 } else { 192 - phase };
+            *byte = (sample & 0xFF) as u8;
         }
+        eprintln!("PSRAM pre-seeded with 8-bit triangle wave (PICOGUS_PSRAM_PRESEED set)");
     }
 
     // Preseed PSRAM from a binary file containing raw DRAM bytes.
@@ -1914,7 +1919,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         //  +14 NOP           (0xBF00)
         if let Ok(s) = std::env::var("PICOGUS_STUB_STACK_TEST") {
             let f = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap();
-            emu.bus.write32(f + 0, (0xB082u32) | (0x204Du32 << 16));
+            emu.bus.write32(f, (0xB082u32) | (0x204Du32 << 16));
             emu.bus.write32(f + 4, (0x9000u32) | (0x2000u32 << 16));
             emu.bus.write32(f + 8, (0x9800u32) | (0xB002u32 << 16));
             emu.bus.write32(f + 12, (0x4770u32) | (0xBF00u32 << 16));
@@ -1962,7 +1967,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Ah, I initially put 0x4A06 which is imm8=6 → pc+24 = f+32.
                 // Need imm8=7 for pc+28 = f+36.
                 let ldr_r2 = 0x4A07u32;
-                emu.bus.write32(f + 0, 0x2000_B082); // SUB sp,#8 ; MOVS R0,#0
+                emu.bus.write32(f, 0x2000_B082); // SUB sp,#8 ; MOVS R0,#0
                 emu.bus.write32(f + 4, (0x9001u32) | (ldr_r2 << 16)); // STR R0,[sp,#4] ; LDR R2,[PC,#28]
                 emu.bus
                     .write32(f + 8, (0x2100u32 | n as u32) | (0x2464u32 << 16)); // MOVS R1,#n ; MOVS R4,#100
@@ -2005,7 +2010,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 //  +20 BX LR           (0x4770)
                 //  +22 NOP             (0xBF00)
                 //  +24 .word &guschan
-                emu.bus.write32(f + 0, 0x4A05_2000);
+                emu.bus.write32(f, 0x4A05_2000);
                 emu.bus.write32(f + 4, 0x2464_2100u32 | n as u32);
                 emu.bus.write32(f + 8, 0x6B5B_CA08);
                 emu.bus.write32(f + 12, 0x18C0_4363);
@@ -2044,7 +2049,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let bx_lr = 0x4770u16;
                 let nop = 0xBF00u16;
                 emu.bus
-                    .write32(f + 0, (movs_r0 as u32) | ((ldr_r2 as u32) << 16));
+                    .write32(f, (movs_r0 as u32) | ((ldr_r2 as u32) << 16));
                 emu.bus
                     .write32(f + 4, (movs_r1 as u32) | ((ldmia as u32) << 16));
                 emu.bus
@@ -2102,8 +2107,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let lit = u32::from_str_radix(p[1].trim_start_matches("0x"), 16).unwrap();
                 let off1: u32 = p[2].parse().unwrap();
                 let off2: u32 = p[3].parse().unwrap();
-                assert!(off1 < 128 && off1 % 4 == 0, "off1 must be 0..128, mult 4");
-                assert!(off2 < 128 && off2 % 4 == 0, "off2 must be 0..128, mult 4");
+                assert!(
+                    off1 < 128 && off1.is_multiple_of(4),
+                    "off1 must be 0..128, mult 4"
+                );
+                assert!(
+                    off2 < 128 && off2.is_multiple_of(4),
+                    "off2 must be 0..128, mult 4"
+                );
                 let imm5_1 = (off1 / 4) as u16;
                 let imm5_2 = (off2 / 4) as u16;
                 // LDR R0,[R0,#imm5<<2]: 01101 imm5 000 000 = 0x6800 | (imm5 << 6)
@@ -2516,7 +2527,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "PIO1 pad_oe:       0x{:08x}  bit0(MISO)={} bit1(CS)={} bit2(SCK)={} bit3(MOSI)={}",
         p1_pad_oe,
-        (p1_pad_oe >> 0) & 1,
+        p1_pad_oe & 1,
         (p1_pad_oe >> 1) & 1,
         (p1_pad_oe >> 2) & 1,
         (p1_pad_oe >> 3) & 1,
@@ -2524,7 +2535,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "PIO1 pad_out:      0x{:08x}  bit0(MISO)={} bit1(CS)={} bit2(SCK)={} bit3(MOSI)={}",
         p1_pad_out,
-        (p1_pad_out >> 0) & 1,
+        p1_pad_out & 1,
         (p1_pad_out >> 1) & 1,
         (p1_pad_out >> 2) & 1,
         (p1_pad_out >> 3) & 1,
@@ -2642,7 +2653,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut served_channels: Vec<usize> = Vec::new();
     for ch in 0..12usize {
         let base = DMA_BASE_DIAG + (ch as u32) * 0x40;
-        let read_addr = emu.bus.read32(base + 0x00);
+        let read_addr = emu.bus.read32(base);
         let write_addr = emu.bus.read32(base + 0x04);
         let trans_count = emu.bus.read32(base + 0x08);
         let ctrl = emu.bus.read32(base + 0x0C);
@@ -2857,7 +2868,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // PWM register offsets (RP2040 datasheet §4.5.3):
     //   EN=0xA0, INTR=0xA4, INTE=0xA8, INTF=0xAC, INTS=0xB0
     let pwm_slice4 = 0x4005_0000u32 + 0x14 * 4;
-    let pwm_csr4 = emu.bus.read32(pwm_slice4 + 0x00);
+    let pwm_csr4 = emu.bus.read32(pwm_slice4);
     let pwm_div4 = emu.bus.read32(pwm_slice4 + 0x04);
     let pwm_ctr4 = emu.bus.read32(pwm_slice4 + 0x08);
     let pwm_top4 = emu.bus.read32(pwm_slice4 + 0x10);
@@ -2951,7 +2962,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // (NB: prompt's bit map was approximate; this matches the impl in
     //  mdpicoem-common/src/pio/mod.rs::fstat().)
     let fstat = emu.bus.read32(0x5020_0000 + 0x004);
-    let sm0_rxfull = (fstat >> 0) & 1;
+    let sm0_rxfull = fstat & 1;
     let sm0_rxempty = (fstat >> 8) & 1;
     let sm0_txfull = (fstat >> 16) & 1;
     let sm0_txempty = (fstat >> 24) & 1;
@@ -3352,12 +3363,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "voice {}: guschan[{}] @ 0x{:08x} = 0x{:08x}",
                 c, c, slot, ptr
             );
-            if ptr < 0x2000_0000 || ptr >= 0x2004_2000 {
+            if !(0x2000_0000..0x2004_2000).contains(&ptr) {
                 eprintln!("  (pointer not in SRAM range — voice not constructed)");
                 continue;
             }
             // GUSChannels struct members (byte_size = 100)
-            let wave_start = peek_u32(ptr + 0);
+            let wave_start = peek_u32(ptr);
             let wave_end = peek_u32(ptr + 4);
             let wave_addr = peek_u32(ptr + 8);
             let wave_add = peek_u32(ptr + 12);

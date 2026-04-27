@@ -107,7 +107,7 @@ fn capture_block(bus: &mut Bus, block: u8) -> PioSnapshot {
         sms[sm as usize] = SmSnapshot {
             block,
             sm,
-            clkdiv: bus.read32(sm_base + 0x00, 0),
+            clkdiv: bus.read32(sm_base, 0),
             execctrl: bus.read32(sm_base + 0x04, 0),
             shiftctrl: bus.read32(sm_base + 0x08, 0),
             addr: bus.read32(sm_base + 0x0C, 0),
@@ -187,7 +187,7 @@ mod tests {
         // SM0 configuration.
         let sm_base = PIO_BASES[1] + SM_BASE;
         let clkdiv_val = (1302u32 << 16) | (128u32 << 8); // int=1302, frac=128
-        emu.bus.write32(sm_base + 0x00, clkdiv_val, 0);
+        emu.bus.write32(sm_base, clkdiv_val, 0);
         let pinctrl_val = (5u32 << 26) | (3u32 << 20); // SET_COUNT=5, OUT_COUNT=3
         emu.bus.write32(sm_base + 0x14, pinctrl_val, 0);
 

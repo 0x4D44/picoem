@@ -446,14 +446,17 @@ fn main() {
     }
 
     // Threading-availability preflight. Mirrors the RP2350 bench's
-    // guard: on non-Windows / non-x86_64 the threaded `build()` returns
-    // `Err(ConfigError::ThreadingUnavailable)`. Per task brief, print a
-    // skip message + exit 0 rather than failing.
-    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    // guard: on non-Windows / non-Linux / non-x86_64 the threaded
+    // `build()` returns `Err(ConfigError::ThreadingUnavailable)`. Per
+    // task brief, print a skip message + exit 0 rather than failing.
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
     if matches!(model_sel, ModelSel::Threaded | ModelSel::Both) {
         println!(
-            "(skip) --model threaded|both requires x86_64 Windows with the \
-             `threading` cargo feature enabled; exiting cleanly."
+            "(skip) --model threaded|both requires x86_64 Windows or Linux with \
+             the `threading` cargo feature enabled; exiting cleanly."
         );
         std::process::exit(0);
     }

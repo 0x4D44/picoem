@@ -287,7 +287,7 @@ impl GlueDma {
         // New read trigger: if PIO1 SM0 has an address word waiting, pop it
         // and start the 4-cycle read pipeline.
         let fstat = bus.read32(PIO_BASES[1] + PIO_FSTAT, 0);
-        let sm0_rx_empty = (fstat >> (FSTAT_RXEMPTY_SM0 + 0)) & 1 != 0;
+        let sm0_rx_empty = (fstat >> FSTAT_RXEMPTY_SM0) & 1 != 0;
         if !sm0_rx_empty {
             self.ch0_pending_addr = bus.read32(PIO_BASES[1] + PIO_RXF0, 0);
             self.ch0_read_delay = DMA_READ_CYCLES;
@@ -547,7 +547,7 @@ mod tests {
         // Pop PIO2 SM0 TX FIFO by reading it indirectly: TXF is write-only,
         // but the FSTAT TXEMPTY bit (bit 24+sm) reports non-empty after a push.
         let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT, 0);
-        let tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
+        let tx_empty = (fstat >> FSTAT_TXEMPTY_SM0) & 1 != 0;
         assert!(
             !tx_empty,
             "expected PIO2 SM0 TX FIFO non-empty after 8 latency cycles; \
@@ -668,7 +668,7 @@ mod tests {
 
         // PIO2 SM0 TX FIFO must now report non-empty.
         let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT, 0);
-        let tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
+        let tx_empty = (fstat >> FSTAT_TXEMPTY_SM0) & 1 != 0;
         assert!(
             !tx_empty,
             "PIO2 SM0 TX empty after chain push; FSTAT=0x{:08X}",
@@ -723,7 +723,7 @@ mod tests {
         );
 
         let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT, 0);
-        let sm0_tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
+        let sm0_tx_empty = (fstat >> FSTAT_TXEMPTY_SM0) & 1 != 0;
         let sm1_tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 1)) & 1 != 0;
 
         // The byte must have landed in SM1's TX FIFO, not SM0's.
@@ -802,7 +802,7 @@ mod tests {
         }
 
         let tcount = emu.bus.read32(DMA_BASE + 0x08, 0);
-        let raddr = emu.bus.read32(DMA_BASE + 0x00, 0);
+        let raddr = emu.bus.read32(DMA_BASE, 0);
         let waddr = emu.bus.read32(DMA_BASE + 0x04, 0);
         let ctrl_rb = emu.bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(

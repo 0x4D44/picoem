@@ -621,7 +621,7 @@ mod tests {
         i.write32(IC_TAR, 0x3C, 0, &mut irqs);
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
         // Write data with STOP bit set.
-        i.write32(IC_DATA_CMD, 0x00 | DATA_CMD_STOP, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, DATA_CMD_STOP, 0, &mut irqs);
         assert!(
             i.raw_intr_stat & INT_STOP_DET != 0,
             "STOP_DET must latch after writing to ACK address"
@@ -639,7 +639,7 @@ mod tests {
         // Program TAR=0x55 (not in ACK list).
         i.write32(IC_TAR, 0x55, 0, &mut irqs);
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
-        i.write32(IC_DATA_CMD, 0x00 | DATA_CMD_STOP, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, DATA_CMD_STOP, 0, &mut irqs);
         assert!(
             i.raw_intr_stat & INT_TX_ABRT != 0,
             "TX_ABRT must latch for NACKing slave"
@@ -665,7 +665,7 @@ mod tests {
         con |= IC_CON_10BIT_ADDR_MASTER;
         i.write32(IC_CON, con, 0, &mut irqs);
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
-        i.write32(IC_DATA_CMD, 0x00 | DATA_CMD_STOP, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, DATA_CMD_STOP, 0, &mut irqs);
         assert!(
             i.raw_intr_stat & INT_TX_ABRT != 0,
             "TX_ABRT must latch under unsupported 10-bit mode"

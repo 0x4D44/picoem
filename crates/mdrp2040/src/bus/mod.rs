@@ -271,7 +271,7 @@ impl DecodedOp {
 /// contain code or is dynamic and not worth caching.
 #[inline(always)]
 pub(crate) fn is_cacheable_pc(pc: u32) -> bool {
-    matches!(pc >> 28, 0x0 | 0x1 | 0x2)
+    matches!(pc >> 28, 0x0..=0x2)
 }
 
 /// Region bits for [`Bus::pending_invalidation_regions`] /
@@ -706,7 +706,7 @@ impl Bus {
         if (addr >> 28) == 0x2 {
             // SRAM
             self.memory.sram_read32(addr & 0x00FF_FFFF)
-        } else if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END {
+        } else if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&addr) {
             let off = (addr - XIP_SRAM_BASE) as usize;
             u32::from_le_bytes([
                 self.xip_sram[off],
@@ -722,7 +722,7 @@ impl Bus {
     pub fn poke32(&mut self, addr: u32, value: u32) {
         if (addr >> 28) == 0x2 {
             self.memory.sram_write32(addr & 0x00FF_FFFF, value);
-        } else if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END {
+        } else if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&addr) {
             let off = (addr - XIP_SRAM_BASE) as usize;
             let bytes = value.to_le_bytes();
             self.xip_sram[off..off + 4].copy_from_slice(&bytes);
@@ -1294,7 +1294,7 @@ impl Bus {
         let region = addr >> 28;
         self.last_access_cycles = Self::write_latency(region);
         match region {
-            0x1 if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END => {
+            0x1 if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&addr) => {
                 self.xip_sram_write(addr, val as u32, 1);
                 self.invalidate_pc_range(addr, 1);
             }
@@ -1400,7 +1400,7 @@ impl Bus {
         let region = addr >> 28;
         self.last_access_cycles = Self::write_latency(region);
         match region {
-            0x1 if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END => {
+            0x1 if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&addr) => {
                 self.xip_sram_write(addr, val as u32, 2);
                 self.invalidate_pc_range(addr, 2);
             }
@@ -1498,7 +1498,7 @@ impl Bus {
         let region = addr >> 28;
         self.last_access_cycles = Self::write_latency(region);
         match region {
-            0x1 if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END => {
+            0x1 if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&addr) => {
                 self.xip_sram_write(addr, val, 4);
                 self.invalidate_pc_range(addr, 4);
             }
@@ -1548,7 +1548,7 @@ impl Bus {
     // --- Region 0x1 read dispatch (XIP flash / XIP SRAM / XIP_CTRL / SSI)
 
     fn region1_read(&mut self, addr: u32, width: usize) -> u32 {
-        if addr >= XIP_SRAM_BASE && addr < XIP_SRAM_END {
+        if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&addr) {
             return self.xip_sram_read(addr, width);
         }
         let base = addr & 0xFFFF_F000;
@@ -2527,7 +2527,7 @@ mod tests {
         // Write IPR1 (covers IRQs 4..=7). Priority 0xC0 on IRQ 4 (lane 0),
         // 0x80 on IRQ 5 (lane 1), 0x40 on IRQ 6 (lane 2), 0x00 on IRQ 7
         // (lane 3).
-        let word = 0xC0u32 | (0x80u32 << 8) | (0x40u32 << 16) | (0x00u32 << 24);
+        let word = 0xC0u32 | (0x80u32 << 8) | (0x40u32 << 16);
         bus.write32(0xE000_E404, word);
         assert_eq!(bus.read32(0xE000_E404), word);
         // Non-implemented bits of a priority byte must be masked — write
@@ -2645,7 +2645,7 @@ mod tests {
         // Release PIO1 from reset (RESETS bit 11).
         bus.write32(0x4000_F000, 1u32 << 11);
         // Enable PIO1 SM0 via CTRL.SM_ENABLE bit 0.
-        bus.write32(PIO1_BASE + 0x000, 0x1);
+        bus.write32(PIO1_BASE, 0x1);
         // Byte write to PIO1 TXF0.
         bus.write8(PIO1_BASE + 0x010, 0x42);
         // FSTAT: TXEMPTY bit 24 for SM0 must be cleared.
@@ -2669,7 +2669,7 @@ mod tests {
         // Release PIO1 from reset.
         bus.write32(0x4000_F000, 1u32 << 11);
         // Enable PIO1 SM0.
-        bus.write32(PIO1_BASE + 0x000, 0x1);
+        bus.write32(PIO1_BASE, 0x1);
         // Halfword write to PIO1 TXF0.
         bus.write16(PIO1_BASE + 0x010, 0x1234);
         // FSTAT: TXEMPTY bit 24 for SM0 must be cleared.
@@ -2693,11 +2693,11 @@ mod tests {
         // Release PIO1 from reset.
         bus.write32(0x4000_F000, 1u32 << 11);
         // Write CTRL to enable SM0 (known baseline).
-        bus.write32(PIO1_BASE + 0x000, 0x1);
-        let ctrl_before = bus.read32(PIO1_BASE + 0x000);
+        bus.write32(PIO1_BASE, 0x1);
+        let ctrl_before = bus.read32(PIO1_BASE);
         // Byte write to PIO1 CTRL (offset 0x000) — must be silently dropped.
-        bus.write8(PIO1_BASE + 0x000, 0xFF);
-        let ctrl_after = bus.read32(PIO1_BASE + 0x000);
+        bus.write8(PIO1_BASE, 0xFF);
+        let ctrl_after = bus.read32(PIO1_BASE);
         assert_eq!(
             ctrl_before, ctrl_after,
             "byte write to non-TXF PIO register must be dropped"

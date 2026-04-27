@@ -44,9 +44,9 @@ pub fn bank_for_address(addr: u32) -> Option<u8> {
     if offset < STRIPED_END {
         // Striped region: 4-way word stripe.
         Some(((offset >> 2) & 3) as u8)
-    } else if offset >= SRAM4_START && offset < SRAM5_START {
+    } else if (SRAM4_START..SRAM5_START).contains(&offset) {
         Some(4)
-    } else if offset >= SRAM5_START && offset < SRAM5_END {
+    } else if (SRAM5_START..SRAM5_END).contains(&offset) {
         Some(5)
     } else {
         None

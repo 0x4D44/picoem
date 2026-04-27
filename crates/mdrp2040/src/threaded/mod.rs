@@ -1,4 +1,8 @@
-#![cfg(all(target_arch = "x86_64", target_os = "windows", feature = "threading"))]
+#![cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux"),
+    feature = "threading"
+))]
 //! RP2040 threaded dual-core execution runtime.
 //!
 //! Mirrors the mdrp2350 threaded tree but adapted for M0+ — no FPU, no

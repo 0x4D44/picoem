@@ -1297,7 +1297,7 @@ fn build_test_stream(tc: &RiscvTestCase, use_proxy: bool) -> (Vec<u32>, u32, u32
     // instructions). The stream is u32-aligned so if the last test word
     // was 16-bit compressed we insert a c.nop (0x0001) half-word. We pack
     // two halfwords into one u32 in this case.
-    if addr % 4 != 0 {
+    if !addr.is_multiple_of(4) {
         // If the last pushed u32 held a single 16-bit compressed instr
         // in its low half, pack a c.nop into the high half.
         if let Some(last) = stream.last_mut() {

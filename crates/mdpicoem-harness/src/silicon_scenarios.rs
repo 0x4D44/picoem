@@ -15,7 +15,7 @@ pub const PIO1_BASE: u32 = 0x5030_0000;
 pub const PLL_SYS_BASE: u32 = 0x4005_0000;
 
 pub const RESETS_BASE: u32 = 0x4002_0000;
-pub const RESETS_RESET: u32 = RESETS_BASE + 0x00;
+pub const RESETS_RESET: u32 = RESETS_BASE;
 /// RESET_DONE: each bit reads 1 once the corresponding peripheral has
 /// fully exited reset.  Polling this after a RESETS_CLR write ensures
 /// the peripheral's register file is accessible before we touch it.
@@ -953,7 +953,7 @@ const O_TIMER1_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] =
 
 /// UART0 base and UARTFR / UARTLCR_H / UARTCR / UARTDR offsets.
 const UART0_UARTFR: u32 = UART0_BASE + 0x18;
-const UART0_UARTDR: u32 = UART0_BASE + 0x00;
+const UART0_UARTDR: u32 = UART0_BASE;
 const UART0_UARTLCR_H: u32 = UART0_BASE + 0x2C;
 const UART0_UARTCR: u32 = UART0_BASE + 0x30;
 const UARTLCR_H_FEN: u32 = 1 << 4;
@@ -972,7 +972,7 @@ const UART0_UARTFBRD: u32 = UART0_BASE + 0x28;
 const UARTFR_TXFE_BIT: u32 = 1 << 7;
 
 /// SPI0 SSPCR0/SSPCR1/SSPDR offsets.
-const SPI0_SSPCR0: u32 = SPI0_BASE + 0x00;
+const SPI0_SSPCR0: u32 = SPI0_BASE;
 const SPI0_SSPCR1: u32 = SPI0_BASE + 0x04;
 const SPI0_SSPDR: u32 = SPI0_BASE + 0x08;
 const SSPCR1_SSE: u32 = 1 << 1;
@@ -995,7 +995,7 @@ const IC_DATA_CMD_STOP: u32 = 1 << 9;
 const IC_DATA_CMD_READ_BIT: u32 = 1 << 8;
 
 /// ADC CS register offset.
-const ADC_CS_RP2350: u32 = ADC_BASE + 0x00;
+const ADC_CS_RP2350: u32 = ADC_BASE;
 const CS_EN_BIT: u32 = 1 << 0;
 const CS_START_ONCE_BIT: u32 = 1 << 2;
 /// CS.READY (bit 8) — silicon asserts after one-shot completes. The
@@ -1005,7 +1005,7 @@ const ADC_CS_READY_BIT: u32 = 1 << 8;
 /// PWM (RP2350 `0x400A_8000`) — slice 0 CSR/TOP/CC/CTR offsets (stride
 /// 0x14), plus global EN/INTR at `+0xF0` / `+0xF4`.
 pub const PWM_BASE_RP2350: u32 = 0x400A_8000;
-const PWM_SLICE0_CSR: u32 = PWM_BASE_RP2350 + 0x00;
+const PWM_SLICE0_CSR: u32 = PWM_BASE_RP2350;
 const PWM_SLICE0_DIV: u32 = PWM_BASE_RP2350 + 0x04;
 const PWM_SLICE0_CTR: u32 = PWM_BASE_RP2350 + 0x08;
 const PWM_SLICE0_TOP: u32 = PWM_BASE_RP2350 + 0x10;
@@ -1694,7 +1694,7 @@ pub const TRNG_IMR: u32 = TRNG_BASE + 0x100;
 pub const SHA256_BASE: u32 = 0x400F_8000;
 /// SHA256_CSR at +0x00. WFIFO_READY (bit 2) is asserted at reset — the
 /// FIFO is empty and ready to accept writes. EMU HashMap returns 0.
-pub const SHA256_CSR: u32 = SHA256_BASE + 0x00;
+pub const SHA256_CSR: u32 = SHA256_BASE;
 /// SHA256_CSR.WFIFO_READY (bit 2).
 pub const SHA256_CSR_WFIFO_READY: u32 = 1 << 2;
 

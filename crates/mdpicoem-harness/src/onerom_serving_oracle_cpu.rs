@@ -906,7 +906,7 @@ pub fn force_rom_set_index_via_sel_pins(
         // `(rom_set_index >> ii) & 1`, so the raw bit we drive is
         // `decoded ^ flip_bit`.
         let flip_bit = if pull_dir { 0 } else { 1 };
-        let decoded_bit = ((rom_set_index >> ii) & 1) as u32;
+        let decoded_bit = (rom_set_index >> ii) & 1;
         let raw_bit = decoded_bit ^ flip_bit;
         value |= raw_bit << pin;
     }

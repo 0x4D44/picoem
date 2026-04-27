@@ -95,13 +95,16 @@ fn main() {
         );
     }
 
-    // --- Threaded (Windows x86_64 only) ---
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    // --- Threaded (Windows + Linux x86_64) ---
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     {
         let mut emu = EmulatorBuilder::new(Config::default())
             .execution(ExecutionModel::Threaded)
             .build()
-            .expect("Threaded build on x86_64 Windows");
+            .expect("Threaded build on x86_64 Windows / Linux");
         setup_basic_core0(&mut emu);
         emu.core_mut(1).halt();
 

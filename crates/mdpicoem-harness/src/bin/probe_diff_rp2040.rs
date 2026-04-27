@@ -601,7 +601,7 @@ fn run_fuzz(
 
     for tc in alu.iter().chain(mem.iter()) {
         done += 1;
-        if done % 100 == 0 {
+        if done.is_multiple_of(100) {
             eprintln!("[{done}/{total}] {fail} failures...");
         }
 
