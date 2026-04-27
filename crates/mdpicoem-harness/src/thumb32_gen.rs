@@ -4,6 +4,11 @@
 // `execute_thumb32` dispatch will route to the correct handler.  Every bit
 // layout was verified against the decoder in `execute_thumb32.rs` and
 // `decode.rs`.
+//
+// Underscore positions inside binary literals here document Thumb-32
+// instruction-encoding bit-fields (op:Rn:S:imm), not 4-bit visual groups
+// — clippy's uniform-grouping suggestion would erase that documentation.
+#![allow(clippy::unusual_byte_groupings)]
 
 #[allow(dead_code)]
 

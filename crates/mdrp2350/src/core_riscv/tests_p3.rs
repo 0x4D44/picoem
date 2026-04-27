@@ -1,3 +1,9 @@
+// Underscore positions inside binary literals here document RISC-V
+// instruction-encoding bit-fields (e.g. `0b000_1_00101_11111_01` is
+// f3:imm5:rd:imm4_0:op for C.ADDI), not 4-bit visual groups — clippy's
+// uniform-grouping suggestion would erase that documentation.
+#![allow(clippy::unusual_byte_groupings)]
+
 // P3 per-op semantic tests. Covers RV32M (mul/div), RV32A (atomics),
 // and RV32C (compressed). The RV32I + Zicsr + Zifencei baseline stays
 // in `tests_p2.rs`.

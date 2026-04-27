@@ -937,8 +937,10 @@ mod tests {
 
     #[test]
     fn test_cfsr_write_one_to_clear() {
-        let mut ppb = Ppb::default();
-        ppb.cfsr = 0xFF;
+        let mut ppb = Ppb {
+            cfsr: 0xFF,
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_ED28, 0x0F);
         assert_eq!(ppb.read32(0xE000_ED28), 0xF0);
     }
@@ -954,8 +956,10 @@ mod tests {
 
     #[test]
     fn test_icsr_write_zero_preserves_set_bit() {
-        let mut ppb = Ppb::default();
-        ppb.icsr = ICSR_PENDSVSET;
+        let mut ppb = Ppb {
+            icsr: ICSR_PENDSVSET,
+            ..Ppb::default()
+        };
         // Writing 0 to PENDSVSET must NOT clear it (W1S — write 0 ignored).
         ppb.write32(0xE000_ED04, 0);
         assert_ne!(ppb.read32(0xE000_ED04) & ICSR_PENDSVSET, 0);
@@ -963,8 +967,10 @@ mod tests {
 
     #[test]
     fn test_icsr_pendsv_clr_clears_set() {
-        let mut ppb = Ppb::default();
-        ppb.icsr = ICSR_PENDSVSET;
+        let mut ppb = Ppb {
+            icsr: ICSR_PENDSVSET,
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_ED04, ICSR_PENDSVCLR);
         assert_eq!(ppb.read32(0xE000_ED04) & ICSR_PENDSVSET, 0);
     }
@@ -978,8 +984,10 @@ mod tests {
 
     #[test]
     fn test_icsr_pendst_clr_clears_set() {
-        let mut ppb = Ppb::default();
-        ppb.icsr = ICSR_PENDSTSET;
+        let mut ppb = Ppb {
+            icsr: ICSR_PENDSTSET,
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_ED04, ICSR_PENDSTCLR);
         assert_eq!(ppb.read32(0xE000_ED04) & ICSR_PENDSTSET, 0);
     }

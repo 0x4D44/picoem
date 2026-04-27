@@ -794,32 +794,48 @@ mod tests {
 
     #[test]
     fn chain_to_zero_means_no_chain_when_self() {
-        let mut ch = DmaChannel::default();
-        ch.ctrl = 0; // CHAIN_TO field = 0 — "chain to self" = no chain.
+        // CHAIN_TO field = 0 — "chain to self" = no chain.
+        let ch = DmaChannel {
+            ctrl: 0,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.chain_to(), 0);
     }
 
     #[test]
     fn treq_force_is_sixty_three() {
-        let mut ch = DmaChannel::default();
-        ch.ctrl = 0x3F << CTRL_TREQ_SEL_SHIFT;
+        let ch = DmaChannel {
+            ctrl: 0x3F << CTRL_TREQ_SEL_SHIFT,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.treq_sel(), DREQ_FORCE);
     }
 
     #[test]
     fn transfer_size_decodes_correctly() {
-        let mut ch = DmaChannel::default();
         // DATA_SIZE=0 -> 1 byte
-        ch.ctrl = 0 << CTRL_DATA_SIZE_SHIFT;
+        let ch = DmaChannel {
+            ctrl: 0 << CTRL_DATA_SIZE_SHIFT,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.transfer_size(), 1);
         // DATA_SIZE=1 -> 2 bytes
-        ch.ctrl = 1 << CTRL_DATA_SIZE_SHIFT;
+        let ch = DmaChannel {
+            ctrl: 1 << CTRL_DATA_SIZE_SHIFT,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.transfer_size(), 2);
         // DATA_SIZE=2 -> 4 bytes
-        ch.ctrl = 2 << CTRL_DATA_SIZE_SHIFT;
+        let ch = DmaChannel {
+            ctrl: 2 << CTRL_DATA_SIZE_SHIFT,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.transfer_size(), 4);
         // DATA_SIZE=3 -> fallback 4
-        ch.ctrl = 3 << CTRL_DATA_SIZE_SHIFT;
+        let ch = DmaChannel {
+            ctrl: 3 << CTRL_DATA_SIZE_SHIFT,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.transfer_size(), 4);
     }
 

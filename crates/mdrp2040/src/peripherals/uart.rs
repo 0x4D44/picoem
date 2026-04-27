@@ -587,11 +587,11 @@ mod tests {
     const SYS_HZ: u32 = 125_000_000;
 
     fn tree(peri: u32) -> ClockTree {
-        let mut t = ClockTree::default();
-        t.sys_clk_hz = SYS_HZ;
-        t.peri_clk_hz = peri;
-        t.ref_clk_hz = SYS_HZ;
-        t
+        ClockTree {
+            sys_clk_hz: SYS_HZ,
+            peri_clk_hz: peri,
+            ref_clk_hz: SYS_HZ,
+        }
     }
 
     // --- reset / defaults ---------------------------------------------

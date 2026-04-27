@@ -3,6 +3,13 @@
 // Validates Thumb-2 instruction semantics by executing identical instructions
 // in both QEMU (Cortex-M33 model) and our emulator, then diffing state.
 
+// The encoder helpers (`enc_*`) intentionally group binary literals along
+// instruction-field boundaries (`0b10110010_00 << 6`, where `10110010` is
+// the 8-bit opcode and `00` the 2-bit sub-opcode), not 4-bit visual
+// blocks. clippy's uniform-grouping suggestion would erase that
+// documentation, so suppress the lint for this lib.
+#![allow(clippy::unusual_byte_groupings)]
+
 // ============================================================================
 // Subscriber init — call once at the top of every harness `main()`.
 // ============================================================================

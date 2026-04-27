@@ -6,6 +6,11 @@
 // after the production file it exercises. Where a branch is truly
 // unreachable from unit-test scope (e.g. `unreachable!()` panics that only
 // fire on hardware UB), the section explains why it is left alone.
+//
+// Underscore positions inside binary literals here document RISC-V
+// instruction-encoding bit-fields, not 4-bit visual groups — clippy's
+// uniform-grouping suggestion would erase that documentation.
+#![allow(clippy::unusual_byte_groupings)]
 
 use super::Hazard3;
 use super::csr::{CSR_MHARTID, CSR_MINSTRET, CSR_MIP, CSR_MSCRATCH, CSR_MTVAL, CSR_MTVEC};

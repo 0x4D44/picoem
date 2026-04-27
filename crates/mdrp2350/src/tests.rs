@@ -20112,9 +20112,11 @@ mod stage7_core_mod_coverage {
 
     #[test]
     fn counters_reset() {
-        let mut counters = CoreCounters::default();
-        counters.wfi_cycles = 100;
-        counters.sram_reads = 50;
+        let mut counters = CoreCounters {
+            wfi_cycles: 100,
+            sram_reads: 50,
+            ..CoreCounters::default()
+        };
         counters.reset();
         assert_eq!(counters.wfi_cycles, 0);
         assert_eq!(counters.sram_reads, 0);
@@ -20793,8 +20795,10 @@ mod stage7_ppb_coverage {
 
     #[test]
     fn syst_csr_read_clears_countflag() {
-        let mut ppb = Ppb::default();
-        ppb.syst_csr = 0x1_0000 | 0x1; // COUNTFLAG | ENABLE
+        let mut ppb = Ppb {
+            syst_csr: 0x1_0000 | 0x1, // COUNTFLAG | ENABLE
+            ..Ppb::default()
+        };
         let v = ppb.read32(0xE000_E010);
         assert_ne!(v & 0x1_0000, 0);
         // Second read: COUNTFLAG cleared.
@@ -20803,18 +20807,23 @@ mod stage7_ppb_coverage {
 
     #[test]
     fn syst_rvr_and_cvr_masked_to_24bits() {
-        let mut ppb = Ppb::default();
+        let mut ppb = Ppb {
+            syst_cvr: 0xABCD_EF01,
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_E014, 0xFFFF_FFFF);
         assert_eq!(ppb.read32(0xE000_E014), 0x00FF_FFFF);
-        ppb.syst_cvr = 0xABCD_EF01;
+        // CVR read masks to 24 bits regardless of how it was written.
         assert_eq!(ppb.read32(0xE000_E018), 0x00CD_EF01);
     }
 
     #[test]
     fn syst_cvr_write_clears_to_zero() {
-        let mut ppb = Ppb::default();
-        ppb.syst_cvr = 0xAAAA;
-        ppb.syst_csr |= 1 << 16;
+        let mut ppb = Ppb {
+            syst_cvr: 0xAAAA,
+            syst_csr: 1 << 16,
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_E018, 0xDEAD);
         assert_eq!(ppb.syst_cvr, 0);
         assert_eq!(ppb.syst_csr & (1 << 16), 0);
@@ -20899,8 +20908,10 @@ mod stage7_ppb_coverage {
 
     #[test]
     fn dwt_disabled_returns_stored_base() {
-        let mut ppb = Ppb::default();
-        ppb.dwt_ctrl = 0;
+        let mut ppb = Ppb {
+            dwt_ctrl: 0,
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_1004, 100);
         // disabled — returns the stored base.
         assert_eq!(ppb.read32(0xE000_1004), 100);
@@ -21091,22 +21102,26 @@ mod stage7_ppb_coverage {
 
     #[test]
     fn systick_advance_counts_down_no_underflow() {
-        let mut ppb = Ppb::default();
-        ppb.syst_csr = 1 | 2; // ENABLE + TICKINT
-        ppb.syst_rvr = 100;
-        ppb.syst_cvr = 100;
-        ppb.last_systick_cycles = 0;
+        let mut ppb = Ppb {
+            syst_csr: 1 | 2, // ENABLE + TICKINT
+            syst_rvr: 100,
+            syst_cvr: 100,
+            last_systick_cycles: 0,
+            ..Ppb::default()
+        };
         ppb.systick_advance(50);
         assert_eq!(ppb.syst_cvr, 50);
     }
 
     #[test]
     fn systick_advance_underflow_sets_countflag() {
-        let mut ppb = Ppb::default();
-        ppb.syst_csr = 1 | 2;
-        ppb.syst_rvr = 10;
-        ppb.syst_cvr = 5;
-        ppb.last_systick_cycles = 0;
+        let mut ppb = Ppb {
+            syst_csr: 1 | 2,
+            syst_rvr: 10,
+            syst_cvr: 5,
+            last_systick_cycles: 0,
+            ..Ppb::default()
+        };
         ppb.systick_advance(6);
         assert_ne!(ppb.syst_csr & (1 << 16), 0);
         // And SysTick pended.
@@ -21115,18 +21130,22 @@ mod stage7_ppb_coverage {
 
     #[test]
     fn systick_disabled_no_advance() {
-        let mut ppb = Ppb::default();
-        ppb.syst_cvr = 100;
+        let mut ppb = Ppb {
+            syst_cvr: 100,
+            ..Ppb::default()
+        };
         ppb.systick_advance(50);
         assert_eq!(ppb.syst_cvr, 100);
     }
 
     #[test]
     fn systick_rvr_zero_stops() {
-        let mut ppb = Ppb::default();
-        ppb.syst_csr = 1;
-        ppb.syst_rvr = 0;
-        ppb.syst_cvr = 0;
+        let mut ppb = Ppb {
+            syst_csr: 1,
+            syst_rvr: 0,
+            syst_cvr: 0,
+            ..Ppb::default()
+        };
         ppb.systick_advance(10);
         // RVR=0 path returns after first reload.
         assert_eq!(ppb.syst_cvr, 0);

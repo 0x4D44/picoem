@@ -735,15 +735,20 @@ mod tests {
 
     #[test]
     fn chain_to_zero_means_no_chain_when_self() {
-        let mut ch = DmaChannel::default();
-        ch.ctrl = 0; // CHAIN_TO field = 0 — "chain to self" = no chain.
+        // CHAIN_TO field = 0 — "chain to self" = no chain.
+        let ch = DmaChannel {
+            ctrl: 0,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.chain_to(), 0);
     }
 
     #[test]
     fn treq_force_is_sixty_three() {
-        let mut ch = DmaChannel::default();
-        ch.ctrl = 0x3F << CTRL_TREQ_SEL_SHIFT;
+        let ch = DmaChannel {
+            ctrl: 0x3F << CTRL_TREQ_SEL_SHIFT,
+            ..DmaChannel::default()
+        };
         assert_eq!(ch.treq_sel(), DREQ_FORCE);
     }
 

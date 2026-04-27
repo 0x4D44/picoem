@@ -5271,9 +5271,11 @@ mod stage2_i2c_coverage {
     fn tick_with_no_irq_pending() {
         let mut i = I2cRegs::new(IRQ);
         let mut irqs = 0;
-        let mut tree = mdpicoem_common::clocks::ClockTree::default();
-        tree.sys_clk_hz = 125_000_000;
-        tree.peri_clk_hz = 125_000_000;
+        let tree = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 125_000_000,
+            peri_clk_hz: 125_000_000,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         i.tick(10, &tree, &mut irqs);
     }
 
@@ -5408,9 +5410,11 @@ mod stage2_spi_coverage {
         let _ = s.read32(SSPDR); // pop
         let _ = s.read32(SSPDR); // pop
         // Force refresh by another tiny push then drain — a direct tick.
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 125_000_000;
-        t.peri_clk_hz = 125_000_000;
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 125_000_000,
+            peri_clk_hz: 125_000_000,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         s.tick(1000, &t, &mut irqs);
     }
 
@@ -5456,9 +5460,11 @@ mod stage2_spi_coverage {
         let mut s = SpiRegs::new(IRQ);
         let mut irqs = 0;
         // Very low peri clock + SCR=0 + CPSDVSR=2 → bits_per_sec may be 0.
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 1;
-        t.peri_clk_hz = 1; // tiny
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 1,
+            peri_clk_hz: 1,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        }; // tiny
         s.write32(SSPCR0, 0x0F | (255 << 8), 0, &mut irqs); // max SCR
         s.write32(SSPCPSR, 0xFE, 0, &mut irqs);
         s.write32(SSPCR1, 0x02, 0, &mut irqs); // SSE
@@ -5496,9 +5502,11 @@ mod stage2_spi_coverage {
         s.write32(SSPCR0, 0x07, 0, &mut irqs);
         s.write32(SSPCR1, 0x02, 0, &mut irqs);
         s.write32(SSPDR, 0x11, 0, &mut irqs);
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 125_000_000;
-        t.peri_clk_hz = 125_000_000;
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 125_000_000,
+            peri_clk_hz: 125_000_000,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         s.tick(0, &t, &mut irqs);
     }
 
@@ -5525,9 +5533,11 @@ mod stage2_spi_coverage {
         // Push one byte → tx=1, rx=1 (loopback).
         s.write32(SSPDR, 0x55, 0, &mut irqs);
         // Drain tx via tick (fast rate) but leave rx.
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 125_000_000;
-        t.peri_clk_hz = 125_000_000;
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 125_000_000,
+            peri_clk_hz: 125_000_000,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         s.tick(10_000, &t, &mut irqs);
         // Now tx empty, rx non-empty. is_idle evaluates 152:36 False arm.
         assert!(!s.is_idle());
@@ -5551,9 +5561,11 @@ mod stage2_spi_coverage {
             let _ = s.read32(SSPDR);
         }
         // Drain TX FIFO via tick.
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 125_000_000;
-        t.peri_clk_hz = 125_000_000;
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 125_000_000,
+            peri_clk_hz: 125_000_000,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         // Program a fast rate.
         s.write32(SSPCPSR, 2, 0, &mut irqs);
         s.tick(1_000_000, &t, &mut irqs);
@@ -5576,9 +5588,11 @@ mod stage2_spi_coverage {
             s.write32(SSPDR, i, 0, &mut irqs);
         }
         // Drain TX via tick (fast rate) but don't drain RX.
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 125_000_000;
-        t.peri_clk_hz = 125_000_000;
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 125_000_000,
+            peri_clk_hz: 125_000_000,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         s.tick(1_000_000, &t, &mut irqs);
         // Now TX empty, RX full. Push one more → hits line 241 False arm.
         s.write32(SSPDR, 0x42, 0, &mut irqs);
@@ -5596,9 +5610,11 @@ mod stage2_spi_coverage {
         s.write32(SSPCPSR, 2, 0, &mut irqs);
         s.write32(SSPCR1, 0x02, 0, &mut irqs); // SSE
         s.write32(SSPDR, 0x42, 0, &mut irqs);
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 125_000_000;
-        t.peri_clk_hz = 125_000_000;
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 125_000_000,
+            peri_clk_hz: 125_000_000,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         // Ludicrous cycle count so tx_cycle_accum dwarfs spw; loop body
         // drains the one word then is_empty=true exits.
         s.tick(u32::MAX, &t, &mut irqs);
@@ -5661,10 +5677,11 @@ mod stage2_uart_coverage {
     const SYS: u32 = 125_000_000;
 
     fn tree() -> mdpicoem_common::clocks::ClockTree {
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = SYS;
-        t.peri_clk_hz = SYS;
-        t
+        mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: SYS,
+            peri_clk_hz: SYS,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        }
     }
 
     /// `is_idle` / `tx_dreq` / `rx_dreq` false arms (uart.rs:238, 246, 254).
@@ -5746,9 +5763,11 @@ mod stage2_uart_coverage {
         u.write32(UARTIBRD, 0xFFFF, 0, &mut irqs);
         u.write32(UARTFBRD, 0x3F, 0, &mut irqs);
         u.write32(UARTDR, 0x42, 0, &mut irqs);
-        let mut t = mdpicoem_common::clocks::ClockTree::default();
-        t.sys_clk_hz = 1;
-        t.peri_clk_hz = 1;
+        let t = mdpicoem_common::clocks::ClockTree {
+            sys_clk_hz: 1,
+            peri_clk_hz: 1,
+            ..mdpicoem_common::clocks::ClockTree::default()
+        };
         u.tick(10, &t, &mut irqs);
     }
 

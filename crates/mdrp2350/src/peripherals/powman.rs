@@ -713,9 +713,11 @@ mod tests {
     #[test]
     fn count_advances_one_tick_per_fifty_sys_clks_at_default_clocks() {
         let mut p = PowmanRegs::new();
-        let mut tree = ClockTree::default();
         // Force sys_clk = 150 MHz so sys_per_tick = 50.
-        tree.sys_clk_hz = 150_000_000;
+        let tree = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ..ClockTree::default()
+        };
         let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT, 0);
         // Exactly 50 sys_clks => 1 POWMAN tick.
         let _ = p.advance(50, &tree);
@@ -731,8 +733,10 @@ mod tests {
     #[test]
     fn alarm_fires_and_is_one_shot() {
         let mut p = PowmanRegs::new();
-        let mut tree = ClockTree::default();
-        tree.sys_clk_hz = 150_000_000;
+        let tree = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ..ClockTree::default()
+        };
         // INTE.TIMER must be set for the NVIC raise to propagate; see
         // V12 §3.2 INTE-gating fix.
         arm_for_nvic_raise(&mut p, 2);
@@ -753,8 +757,10 @@ mod tests {
     #[test]
     fn alarm_w1c_clears_status() {
         let mut p = PowmanRegs::new();
-        let mut tree = ClockTree::default();
-        tree.sys_clk_hz = 150_000_000;
+        let tree = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ..ClockTree::default()
+        };
         arm_for_nvic_raise(&mut p, 1);
         let _ = p.advance(50, &tree);
         assert_ne!(p.read32(INTR_OFFSET) & INT_TIMER_BIT, 0);
@@ -771,8 +777,10 @@ mod tests {
     #[test]
     fn powman_match_does_not_pend_nvic_when_inte_timer_clear() {
         let mut p = PowmanRegs::new();
-        let mut tree = ClockTree::default();
-        tree.sys_clk_hz = 150_000_000;
+        let tree = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ..ClockTree::default()
+        };
         // No INTE write — INTE.TIMER stays 0.
         let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 2, 0);
         let _ = p.write32(
@@ -802,8 +810,10 @@ mod tests {
     #[test]
     fn powman_match_pends_nvic_when_inte_timer_set() {
         let mut p = PowmanRegs::new();
-        let mut tree = ClockTree::default();
-        tree.sys_clk_hz = 150_000_000;
+        let tree = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ..ClockTree::default()
+        };
         // Enable INTE.TIMER first, then arm and run TIMER.
         let _ = p.write32(INTE_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
         let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 2, 0);
@@ -829,8 +839,10 @@ mod tests {
     #[test]
     fn powman_inte_set_after_intr_re_pends_nvic() {
         let mut p = PowmanRegs::new();
-        let mut tree = ClockTree::default();
-        tree.sys_clk_hz = 150_000_000;
+        let tree = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ..ClockTree::default()
+        };
         let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 2, 0);
         let _ = p.write32(
             TIMER_OFFSET,

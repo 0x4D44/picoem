@@ -1,6 +1,11 @@
 // RISC-V instruction encoder + test-case generators for the
 // `test_qemu_diff_riscv32` differential oracle.
 //
+// Underscore positions inside binary literals document RISC-V
+// instruction-encoding bit-fields, not 4-bit visual groups — clippy's
+// uniform-grouping suggestion would erase that documentation.
+#![allow(clippy::unusual_byte_groupings)]
+//
 // Stage 4 of the RISC-V Hazard3 test-oracles plan; see
 // `wrk_docs/2026.04.17 - LLD - QEMU Diff RISC-V V1.md` §6 (fuzz classes),
 // §7 (encoder API), §8 (property test) and
