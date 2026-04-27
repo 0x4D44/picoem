@@ -1317,18 +1317,15 @@ impl Bus {
                 let base = canonical & 0xFFFF_F000;
                 if base == PIO0_BASE || base == PIO1_BASE {
                     let pio_offset = canonical & 0x0000_0FFF;
-                    match pio_offset {
-                        // TXF0-3: byte-replicate (ARM AHB-Lite HSIZE=0
-                        // replication) and push to the TX FIFO.
-                        0x010..=0x01C => {
-                            let replicated = (val as u32) * 0x0101_0101;
-                            let idx = if base == PIO0_BASE { 0 } else { 1 };
-                            self.pio[idx].write32(pio_offset, replicated, 0);
-                        }
-                        // All other PIO registers: 32-bit access only.
-                        // Byte writes would trigger spurious RXF pops via
-                        // the RMW read. Silently ignore.
-                        _ => {}
+                    // TXF0-3: byte-replicate (ARM AHB-Lite HSIZE=0
+                    // replication) and push to the TX FIFO. All other
+                    // PIO registers: 32-bit access only — byte writes
+                    // would trigger spurious RXF pops via the RMW read,
+                    // so silently ignore.
+                    if (0x010..=0x01C).contains(&pio_offset) {
+                        let replicated = (val as u32) * 0x0101_0101;
+                        let idx = if base == PIO0_BASE { 0 } else { 1 };
+                        self.pio[idx].write32(pio_offset, replicated, 0);
                     }
                     return;
                 }
@@ -1421,16 +1418,13 @@ impl Bus {
                 let base = canonical & 0xFFFF_F000;
                 if base == PIO0_BASE || base == PIO1_BASE {
                     let pio_offset = canonical & 0x0000_0FFF;
-                    match pio_offset {
-                        // TXF0-3: halfword-replicate (ARM AHB-Lite HSIZE=1
-                        // replication) and push to the TX FIFO.
-                        0x010..=0x01C => {
-                            let replicated = (val as u32) | ((val as u32) << 16);
-                            let idx = if base == PIO0_BASE { 0 } else { 1 };
-                            self.pio[idx].write32(pio_offset, replicated, 0);
-                        }
-                        // All other PIO registers: 32-bit access only.
-                        _ => {}
+                    // TXF0-3: halfword-replicate (ARM AHB-Lite HSIZE=1
+                    // replication) and push to the TX FIFO. All other
+                    // PIO registers: 32-bit access only.
+                    if (0x010..=0x01C).contains(&pio_offset) {
+                        let replicated = (val as u32) | ((val as u32) << 16);
+                        let idx = if base == PIO0_BASE { 0 } else { 1 };
+                        self.pio[idx].write32(pio_offset, replicated, 0);
                     }
                     return;
                 }

@@ -569,7 +569,7 @@ fn setup(emu: &mut Emulator, workload: Workload) {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 mod win {
     use std::os::raw::c_void;
 

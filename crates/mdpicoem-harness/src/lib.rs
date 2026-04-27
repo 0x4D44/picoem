@@ -3,12 +3,29 @@
 // Validates Thumb-2 instruction semantics by executing identical instructions
 // in both QEMU (Cortex-M33 model) and our emulator, then diffing state.
 
-// The encoder helpers (`enc_*`) intentionally group binary literals along
-// instruction-field boundaries (`0b10110010_00 << 6`, where `10110010` is
-// the 8-bit opcode and `00` the 2-bit sub-opcode), not 4-bit visual
-// blocks. clippy's uniform-grouping suggestion would erase that
-// documentation, so suppress the lint for this lib.
-#![allow(clippy::unusual_byte_groupings)]
+// Module-level lint suppressions:
+//
+// * `clippy::unusual_byte_groupings` — the `enc_*` encoders intentionally
+//   group binary literals along instruction-field boundaries (e.g.
+//   `0b10110010_00 << 6`, where `10110010` is the 8-bit opcode and `00`
+//   the 2-bit sub-opcode); clippy's uniform-grouping suggestion would
+//   erase that documentation.
+//
+// * `clippy::too_many_arguments` — encoder helpers and test-case
+//   factories take one parameter per instruction field (8–10 fields is
+//   normal for Thumb-32). Bundling them into a struct just adds a
+//   one-shot type that hurts call-site readability.
+//
+// * `clippy::vec_init_then_push` — the `gen_*` corpus builders use
+//   `let mut t = Vec::new(); t.push(TestCase{..}); t.push(..);` for
+//   hundreds of cases with inline section comments. Collapsing into a
+//   single `vec![..]` macro span loses the comment placement; the
+//   allocator cost difference is irrelevant in test-case factories.
+#![allow(
+    clippy::unusual_byte_groupings,
+    clippy::too_many_arguments,
+    clippy::vec_init_then_push
+)]
 
 // ============================================================================
 // Subscriber init — call once at the top of every harness `main()`.

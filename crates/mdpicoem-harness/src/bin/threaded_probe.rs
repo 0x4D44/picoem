@@ -14,7 +14,7 @@ use mdrp2350::{Config, DEFAULT_STEP_QUANTUM, Emulator, EmulatorBuilder, Executio
 use std::time::Instant;
 
 #[cfg(target_os = "windows")]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 mod win {
     use std::os::raw::c_void;
     type HANDLE = *mut c_void;

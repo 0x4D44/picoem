@@ -7,6 +7,13 @@
 //! The helpers intentionally duplicate the small `core_and_bus()` shim in
 //! `tests.rs` — we don't want to make that private helper `pub(crate)`
 //! just for a sibling test module. Keeps the diff narrow.
+//!
+//! `clippy::too_many_arguments` is suppressed: encoder helpers like
+//! `encode_ls_imm8_puw` take one parameter per Thumb-32 instruction
+//! field (8–9 fields is normal for these encodings). Bundling them into
+//! a struct only adds a one-shot type that hurts call-site readability.
+
+#![allow(clippy::too_many_arguments)]
 
 use std::sync::Arc;
 

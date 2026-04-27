@@ -57,10 +57,9 @@ use mdrp2350::threaded::SpinBarrier as ProdSpinBarrier;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 mod affinity {
-    #[allow(non_camel_case_types)]
     type HANDLE = *mut std::ffi::c_void;
-    #[allow(non_camel_case_types)]
     type DWORD_PTR = usize;
 
     unsafe extern "system" {

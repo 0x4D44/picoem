@@ -669,12 +669,10 @@ impl CortexM33 {
     fn cp7_cdp(&mut self, hw0: u16, hw1: u16) -> u32 {
         let opc1 = ((hw0 >> 4) & 0xF) as u8;
         let opc2 = ((hw1 >> 5) & 0x7) as u8;
-        match (opc1, opc2) {
-            (0, 1) => {
-                // rcp_panic — unconditional NMI (bootrom encoding 0xEE00_0720).
-                self.pending_fault = Some(Fault::Nmi);
-            }
-            _ => {} // unrecognized CDP: silent NOP (HLD §8.4)
+        // unrecognized CDP: silent NOP (HLD §8.4)
+        if (opc1, opc2) == (0, 1) {
+            // rcp_panic — unconditional NMI (bootrom encoding 0xEE00_0720).
+            self.pending_fault = Some(Fault::Nmi);
         }
         1
     }

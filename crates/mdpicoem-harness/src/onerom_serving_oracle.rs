@@ -1169,7 +1169,14 @@ fn format_verdict_full(v: &Verdict) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+// The numbered-list comment style used inside this test module
+// (`/// 1. foo bar...\n/// continuation...`) trips clippy's
+// `doc_lazy_continuation` lint when the wrapped continuation lacks the
+// 3-space indent under the bullet. The continuation is intentional
+// prose, not list-continuation markdown — this module's docs render
+// nowhere (it's a `#[cfg(test)]` block) so the lint is pure noise here.
 #[cfg(test)]
+#[allow(clippy::doc_lazy_continuation)]
 mod tests {
     use super::*;
 

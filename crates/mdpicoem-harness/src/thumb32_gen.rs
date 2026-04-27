@@ -5,10 +5,21 @@
 // layout was verified against the decoder in `execute_thumb32.rs` and
 // `decode.rs`.
 //
-// Underscore positions inside binary literals here document Thumb-32
-// instruction-encoding bit-fields (op:Rn:S:imm), not 4-bit visual groups
-// — clippy's uniform-grouping suggestion would erase that documentation.
-#![allow(clippy::unusual_byte_groupings)]
+// Module-level lint suppressions:
+//
+// * `clippy::unusual_byte_groupings` — underscore positions inside
+//   binary literals document Thumb-32 instruction-encoding bit-fields
+//   (op:Rn:S:imm), not 4-bit visual groups; clippy's uniform-grouping
+//   suggestion would erase that documentation.
+// * `clippy::too_many_arguments` — encoder helpers take one parameter
+//   per instruction field (Thumb-32 forms have 8–9 fields).
+// * `clippy::vec_init_then_push` — the corpus builders use the
+//   `Vec::new(); push;` pattern with inline comments per case.
+#![allow(
+    clippy::unusual_byte_groupings,
+    clippy::too_many_arguments,
+    clippy::vec_init_then_push
+)]
 
 #[allow(dead_code)]
 

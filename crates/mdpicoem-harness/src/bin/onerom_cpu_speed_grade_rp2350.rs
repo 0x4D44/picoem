@@ -184,7 +184,7 @@ mod windows_main {
     // Windows thread-priority + affinity shims
     // -----------------------------------------------------------------------
 
-    #[allow(non_camel_case_types)]
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
     mod win {
         use std::os::raw::c_void;
 

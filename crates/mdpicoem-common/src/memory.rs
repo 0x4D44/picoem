@@ -205,9 +205,9 @@ impl Memory {
     }
 
     pub fn poke8(&mut self, addr: u32, val: u8) {
-        match addr >> 28 {
-            0x2 => self.sram_write8(addr & 0x00FF_FFFF, val),
-            _ => {} // ROM and XIP are read-only, others unmapped
+        // ROM and XIP are read-only, others unmapped.
+        if addr >> 28 == 0x2 {
+            self.sram_write8(addr & 0x00FF_FFFF, val);
         }
     }
 
@@ -221,9 +221,9 @@ impl Memory {
     }
 
     pub fn poke32(&mut self, addr: u32, val: u32) {
-        match addr >> 28 {
-            0x2 => self.sram_write32(addr & 0x00FF_FFFF, val),
-            _ => {} // ROM and XIP are read-only, others unmapped
+        // ROM and XIP are read-only, others unmapped.
+        if addr >> 28 == 0x2 {
+            self.sram_write32(addr & 0x00FF_FFFF, val);
         }
     }
 

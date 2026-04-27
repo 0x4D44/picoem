@@ -1726,25 +1726,22 @@ impl Bus {
                         }
                         return;
                     }
-                    match (base, word_offset_for_narrow) {
-                        // ADC FIFO is a side-effect register: `adc.read32(FIFO)`
-                        // pops a sample. A byte write through the RMW path
-                        // would read-then-write-back and silently pop the
-                        // FIFO. The FIFO has no architected narrow-write
-                        // semantics on real silicon (datasheet §12.4.5 lists
-                        // FIFO as read-only) — swallow the access. Mirrors
-                        // the RP2040 `narrow_peripheral_write8` ADC arm
-                        // (`crates/mdrp2040/src/bus/mod.rs:877-878`). Note:
-                        // byte lanes >0 within other narrow registers will
-                        // also pop via the RMW path — silicon firmware
-                        // doesn't hit this; matches RP2040 idiom.
-                        (ADC_BASE, crate::peripherals::adc::FIFO) => {
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 1, addr, val as u32, core);
-                            }
-                            return;
+                    // ADC FIFO is a side-effect register: `adc.read32(FIFO)`
+                    // pops a sample. A byte write through the RMW path
+                    // would read-then-write-back and silently pop the
+                    // FIFO. The FIFO has no architected narrow-write
+                    // semantics on real silicon (datasheet §12.4.5 lists
+                    // FIFO as read-only) — swallow the access. Mirrors
+                    // the RP2040 `narrow_peripheral_write8` ADC arm
+                    // (`crates/mdrp2040/src/bus/mod.rs:877-878`). Note:
+                    // byte lanes >0 within other narrow registers will
+                    // also pop via the RMW path — silicon firmware
+                    // doesn't hit this; matches RP2040 idiom.
+                    if (base, word_offset_for_narrow) == (ADC_BASE, crate::peripherals::adc::FIFO) {
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 1, addr, val as u32, core);
                         }
-                        _ => {}
+                        return;
                     }
                     match base {
                         0x4000_0000 => {
@@ -2441,17 +2438,14 @@ impl Bus {
                         }
                         return;
                     }
-                    match (base, word_offset_for_narrow) {
-                        // ADC FIFO read-only: see matching comment in
-                        // `write8` above. Swallow halfword writes so the
-                        // RMW path doesn't silently pop a sample.
-                        (ADC_BASE, crate::peripherals::adc::FIFO) => {
-                            if self.mmio_trace_enabled {
-                                self.emit_mmio_trace('W', 2, addr, val as u32, core);
-                            }
-                            return;
+                    // ADC FIFO read-only: see matching comment in
+                    // `write8` above. Swallow halfword writes so the
+                    // RMW path doesn't silently pop a sample.
+                    if (base, word_offset_for_narrow) == (ADC_BASE, crate::peripherals::adc::FIFO) {
+                        if self.mmio_trace_enabled {
+                            self.emit_mmio_trace('W', 2, addr, val as u32, core);
                         }
-                        _ => {}
+                        return;
                     }
                     match base {
                         0x4000_0000 => {
