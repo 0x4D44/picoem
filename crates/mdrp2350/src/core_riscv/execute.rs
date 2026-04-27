@@ -271,10 +271,16 @@ impl Hazard3 {
                 // Feel free to toggle this constant to `true` once the
                 // cache path wires invalidation.
                 const RISCV_DECODE_CACHE_EXISTS: bool = false;
-                debug_assert!(
-                    !RISCV_DECODE_CACHE_EXISTS,
-                    "fence.i is no-op; wire invalidation first (HLD §4.8)"
-                );
+                // The lint here would be correct in general, but the whole
+                // point of this tripwire is to assert on a constant value
+                // that will be flipped in a future PR.
+                #[allow(clippy::assertions_on_constants)]
+                {
+                    debug_assert!(
+                        !RISCV_DECODE_CACHE_EXISTS,
+                        "fence.i is no-op; wire invalidation first (HLD §4.8)"
+                    );
+                }
             }
 
             Op::Ecall => {

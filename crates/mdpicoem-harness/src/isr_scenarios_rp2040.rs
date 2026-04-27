@@ -1346,16 +1346,18 @@ mod tests {
     fn counter_addresses_inside_mailbox_page() {
         // Counters live in the mailbox page (0x2000_3000..0x2000_4000)
         // so the scenario image and stack never collide with them.
-        assert!(CTR_TIMER_ADDR >= ISR_STACK_TOP);
-        assert!(CTR_TIMER_ADDR < ISR_STACK_TOP + 0x1000);
-        assert!(CTR_PENDSV_ADDR >= ISR_STACK_TOP);
-        assert!(CTR_PENDSV_ADDR < ISR_STACK_TOP + 0x1000);
-        assert!(CTR_SYSTICK_ADDR >= ISR_STACK_TOP);
-        assert!(CTR_SYSTICK_ADDR < ISR_STACK_TOP + 0x1000);
-        // And clear of the mailbox words themselves.
-        assert!(CTR_TIMER_ADDR < ISR_MAILBOX_CYCCNT);
-        assert!(CTR_PENDSV_ADDR < ISR_MAILBOX_CYCCNT);
-        assert!(CTR_SYSTICK_ADDR < ISR_MAILBOX_CYCCNT);
+        const _: () = {
+            assert!(CTR_TIMER_ADDR >= ISR_STACK_TOP);
+            assert!(CTR_TIMER_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(CTR_PENDSV_ADDR >= ISR_STACK_TOP);
+            assert!(CTR_PENDSV_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(CTR_SYSTICK_ADDR >= ISR_STACK_TOP);
+            assert!(CTR_SYSTICK_ADDR < ISR_STACK_TOP + 0x1000);
+            // And clear of the mailbox words themselves.
+            assert!(CTR_TIMER_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(CTR_PENDSV_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(CTR_SYSTICK_ADDR < ISR_MAILBOX_CYCCNT);
+        };
     }
 
     /// Decode the T1 `bne` in HANDLER_TAIL and assert the branch target

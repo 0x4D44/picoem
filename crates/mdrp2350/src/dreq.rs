@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn dreq_force_fits_six_bit_treq_sel() {
         // CTRL.TREQ_SEL is 6 bits (bits [20:15]); 63 is the maximum.
-        assert!(DREQ_FORCE <= 0x3F);
+        const _: () = assert!(DREQ_FORCE <= 0x3F);
     }
 
     #[test]

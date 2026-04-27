@@ -2544,21 +2544,22 @@ mod tests {
     //     below ISR_STACK_TOP; mailbox sits above the stack window.
     #[test]
     fn test_image_constants_layout() {
-        assert!(
-            ISR_IMAGE_BASE + ISR_IMAGE_SIZE as u32 <= ISR_STACK_TOP,
-            "image must end at or below ISR_STACK_TOP",
-        );
-        assert!(
-            ISR_MAILBOX_CYCCNT >= ISR_STACK_TOP,
-            "mailbox must live above the stack window",
-        );
-        // VTOR alignment — RP2350 M33 requires 128-byte alignment
-        // (low 7 bits clear).
-        assert_eq!(
-            ISR_IMAGE_BASE & 0x7F,
-            0,
-            "ISR_IMAGE_BASE must be 128-byte aligned for VTOR",
-        );
+        const _: () = {
+            assert!(
+                ISR_IMAGE_BASE + ISR_IMAGE_SIZE as u32 <= ISR_STACK_TOP,
+                "image must end at or below ISR_STACK_TOP",
+            );
+            assert!(
+                ISR_MAILBOX_CYCCNT >= ISR_STACK_TOP,
+                "mailbox must live above the stack window",
+            );
+            // VTOR alignment — RP2350 M33 requires 128-byte alignment
+            // (low 7 bits clear).
+            assert!(
+                ISR_IMAGE_BASE & 0x7F == 0,
+                "ISR_IMAGE_BASE must be 128-byte aligned for VTOR",
+            );
+        };
     }
 
     // (7) StackedReg offsets match the basic-frame layout.

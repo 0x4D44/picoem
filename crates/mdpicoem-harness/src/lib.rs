@@ -6028,14 +6028,18 @@ mod tests {
 
     #[test]
     fn qemu_addresses_non_overlapping() {
-        assert!(QEMU_TEST_SLOT < QEMU_TEST_SCRATCH);
-        assert!(QEMU_TEST_STACK > QEMU_TEST_SCRATCH);
+        const _: () = {
+            assert!(QEMU_TEST_SLOT < QEMU_TEST_SCRATCH);
+            assert!(QEMU_TEST_STACK > QEMU_TEST_SCRATCH);
+        };
     }
 
     #[test]
     fn emu_addresses_non_overlapping() {
-        assert!(EMU_TEST_SLOT < EMU_TEST_SCRATCH);
-        assert!(EMU_TEST_STACK > EMU_TEST_SCRATCH);
+        const _: () = {
+            assert!(EMU_TEST_SLOT < EMU_TEST_SCRATCH);
+            assert!(EMU_TEST_STACK > EMU_TEST_SCRATCH);
+        };
     }
 
     #[test]
@@ -6054,9 +6058,11 @@ mod tests {
 
     #[test]
     fn emu_addresses_in_sram() {
-        assert!(EMU_TEST_SLOT >= 0x2000_0000);
-        assert!(EMU_TEST_STACK >= 0x2000_0000);
-        assert!(EMU_TEST_SCRATCH >= 0x2000_0000);
+        const _: () = {
+            assert!(EMU_TEST_SLOT >= 0x2000_0000);
+            assert!(EMU_TEST_STACK >= 0x2000_0000);
+            assert!(EMU_TEST_SCRATCH >= 0x2000_0000);
+        };
     }
 
     #[test]
