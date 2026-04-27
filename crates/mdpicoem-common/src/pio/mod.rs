@@ -1667,7 +1667,7 @@ mod tests {
         // EXECCTRL: wrap_top[16:12]=00010, wrap_bottom[11:7]=00000
         // wrap_top=2 => bits[16:12] = 0b00010 => 0x2000
         // wrap_bottom=0 => bits[11:7] = 0
-        let execctrl = (2u32 << 12);
+        let execctrl = 2u32 << 12;
         // NOP-like instructions: SET X, 1; SET X, 2; SET X, 3
         let mut pio = make_pio_with_program(&[0xE021, 0xE022, 0xE023]);
         pio.sm[0].execctrl = execctrl;
@@ -1801,7 +1801,7 @@ mod tests {
         // bit 19 = 1. So shift right (data from LSB side).
         pio.sm[0].tx_fifo.push(0x0000_000F); // bottom 4 bits = 1111
         // Set OUT_COUNT to 4 and OUT_BASE to 0 in pinctrl
-        let pinctrl = (4u32 << 20); // out_count=4, out_base=0
+        let pinctrl = 4u32 << 20; // out_count=4, out_base=0
         pio.sm[0].pinctrl = pinctrl;
         step_n(&mut pio, 1, 0); // PULL => osr = 0x0000_000F
         step_n(&mut pio, 1, 0); // OUT PINS, 4 => shifts 4 LSBs out
@@ -2351,7 +2351,7 @@ mod tests {
         let mut pio = PioBlock::new();
         pio.set_sm_enabled(0, true);
         // PINCTRL: SET_COUNT=1, SET_BASE=0
-        pio.sm[0].pinctrl = (1u32 << 26);
+        pio.sm[0].pinctrl = 1u32 << 26;
         // SET PINDIRS, 1  (opcode=111, dest=100, data=00001) = 0xE081
         pio.write32(0x0D8, 0xE081, 0);
 

@@ -900,13 +900,10 @@ fn run_once(cfg: &RunConfig) -> f64 {
     let workload = cfg.workload;
 
     // --- Set up emulator + selected workload ---
-    let mut emu = EmulatorBuilder::new(Config {
-        sys_clk_hz,
-        ..Default::default()
-    })
-    .step_quantum(step_quantum)
-    .build()
-    .unwrap();
+    let mut emu = EmulatorBuilder::new(Config { sys_clk_hz })
+        .step_quantum(step_quantum)
+        .build()
+        .unwrap();
     setup(&mut emu, workload);
 
     // Promote into threaded mode after setup — `ThreadedEmulator::from_emulator`

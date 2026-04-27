@@ -8830,7 +8830,6 @@ fn test_config_sys_clk_hz_seeds_bus() {
     // Before any register writes, the Bus should report the seed value.
     let emu = Emulator::new(Config {
         sys_clk_hz: 12_345_678,
-        ..Default::default()
     });
     assert_eq!(
         emu.bus.sys_clk_hz(),

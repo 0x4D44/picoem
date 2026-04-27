@@ -156,7 +156,7 @@ fn benchmark_trace_phase_transitions() {
 
     let max_cycles: u64 = 50_000_000;
     for _ in 0..max_cycles {
-        emu.step();
+        emu.step().expect("emu.step() failed mid-smoke");
         let phase = emu.peek(phase_addr);
         if phase != last_phase {
             let cycle = emu.cycles();

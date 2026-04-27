@@ -1373,11 +1373,11 @@ impl Bus {
                 let mut bytes = old.to_le_bytes();
                 bytes[byte_idx] = val;
                 let new_word = u32::from_le_bytes(bytes);
-                if self.nvic_mmio_write32(word_addr, new_word) {
-                    // handled
-                } else if self.systick_mmio_write32(word_addr, new_word) {
-                    // handled
-                } else {
+                // NVIC and SysTick both consume the write fully when they
+                // claim it; PPB takes the rest.
+                if !self.nvic_mmio_write32(word_addr, new_word)
+                    && !self.systick_mmio_write32(word_addr, new_word)
+                {
                     self.ppb[self.active_core].write32(word_addr, new_word);
                 }
             }
@@ -1470,11 +1470,11 @@ impl Bus {
                 let mut halves: [u16; 2] = [old as u16, (old >> 16) as u16];
                 halves[half_idx] = val;
                 let new_word = (halves[0] as u32) | ((halves[1] as u32) << 16);
-                if self.nvic_mmio_write32(word_addr, new_word) {
-                    // handled
-                } else if self.systick_mmio_write32(word_addr, new_word) {
-                    // handled
-                } else {
+                // NVIC and SysTick both consume the write fully when they
+                // claim it; PPB takes the rest.
+                if !self.nvic_mmio_write32(word_addr, new_word)
+                    && !self.systick_mmio_write32(word_addr, new_word)
+                {
                     self.ppb[self.active_core].write32(word_addr, new_word);
                 }
             }
@@ -1524,11 +1524,9 @@ impl Bus {
             }
             0xD => self.sio_write32(addr, val),
             0xE => {
-                if self.nvic_mmio_write32(addr, val) {
-                    // handled
-                } else if self.systick_mmio_write32(addr, val) {
-                    // handled
-                } else {
+                // NVIC and SysTick both consume the write fully when they
+                // claim it; PPB takes the rest.
+                if !self.nvic_mmio_write32(addr, val) && !self.systick_mmio_write32(addr, val) {
                     self.ppb[self.active_core].write32(addr, val);
                 }
             }

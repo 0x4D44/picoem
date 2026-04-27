@@ -2755,8 +2755,8 @@ mod more_coverage {
         assert_eq!(c.reg(0), 0x1234 << 4);
     }
 
-    /// dp_register hw0[7]=1 but hw1[7]=0 (parallel add/sub) — hits line 1438 true.
-    /// Already covered by `parallel_*` tests above.
+    // dp_register hw0[7]=1 but hw1[7]=0 (parallel add/sub) — hits line 1438 true.
+    // Already covered by `parallel_*` tests above.
 
     /// Saturating with no overflow (line 1504 False branch via non-overflowing QADD).
     #[test]
@@ -3251,10 +3251,10 @@ mod more_misses {
         assert_eq!(c.reg(0), 0xFFFF_FFF0);
     }
 
-    /// ORN shifted-reg with S=0 (line 443 False, hit via above with S=0).
+    // ORN shifted-reg with S=0 (line 443 False, hit via above with S=0).
 
-    /// STR.W SIO single-cycle path (line 619 False, addr>>28 == 0xD).
-    /// Covered by str_w_to_sio_region_single_cycle above.
+    // STR.W SIO single-cycle path (line 619 False, addr>>28 == 0xD).
+    // Covered by str_w_to_sio_region_single_cycle above.
 
     /// LDR.W rt=15 with NORMAL pc load (not EXC_RETURN) — line 605 False.
     #[test]
@@ -3269,13 +3269,13 @@ mod more_misses {
         assert_eq!(cy, 5);
     }
 
-    /// LDR.W post-index with imm8 writeback — line 563 False.
-    /// w=false, p=false (post-index always writes back).
-    /// The conditional `if w || !p` is True when w=false p=false (since !p=true).
+    // LDR.W post-index with imm8 writeback — line 563 False.
+    // w=false, p=false (post-index always writes back).
+    // The conditional `if w || !p` is True when w=false p=false (since !p=true).
 
-    /// PLD word-sized load NOT treated as NOP (line 534 False path, since
-    /// size==0b10 word loads with rt=15 → real PC load).
-    /// Covered by ldr_w_rt15_normal.
+    // PLD word-sized load NOT treated as NOP (line 534 False path, since
+    // size==0b10 word loads with rt=15 → real PC load).
+    // Covered by ldr_w_rt15_normal.
 
     /// LDM with writeback after PC load (line 671 False, pc_loaded false).
     /// We need LDM WITHOUT PC in reglist.
@@ -3291,21 +3291,21 @@ mod more_misses {
         c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     }
 
-    /// TBB/TBH with hw0=0xE8D0 + hw1 shape mismatch — falls through to LDRD.
-    /// (line 693 False: TBB guard fails)
-    /// Covered by ldrd_basic patterns that use 0xE8D0 would not match since the
-    /// hw1 pattern differs. We'll trigger that via a writeback LDRD with Rn=13
-    /// and a canonical shape.
+    // TBB/TBH with hw0=0xE8D0 + hw1 shape mismatch — falls through to LDRD.
+    // (line 693 False: TBB guard fails)
+    // Covered by ldrd_basic patterns that use 0xE8D0 would not match since the
+    // hw1 pattern differs. We'll trigger that via a writeback LDRD with Rn=13
+    // and a canonical shape.
 
-    /// LDRD normal path (no TBB/TBH, no exclusive) — line 842 False via Rn=15.
-    /// Covered by ldrd_rn15_no_writeback.
+    // LDRD normal path (no TBB/TBH, no exclusive) — line 842 False via Rn=15.
+    // Covered by ldrd_rn15_no_writeback.
 
-    /// thumb32_dp_register with hw1[7]==0 (no misc ops, hw0[7]==1 → parallel).
-    /// Line 1438 True path — covered. Line 1552 False — hit by `hw1 & 0x80 != 0`
-    /// being false. That's the wide-shift-reg path.
-    /// We have multiple tests through `0xFA01, 0xF002` LSL.W etc.
-    /// Ensuring coverage requires hw0 without bit7 — i.e. shift-by-reg family.
-    /// Already triggered by `dp_register_wide_shift_path`.
+    // thumb32_dp_register with hw1[7]==0 (no misc ops, hw0[7]==1 → parallel).
+    // Line 1438 True path — covered. Line 1552 False — hit by `hw1 & 0x80 != 0`
+    // being false. That's the wide-shift-reg path.
+    // We have multiple tests through `0xFA01, 0xF002` LSL.W etc.
+    // Ensuring coverage requires hw0 without bit7 — i.e. shift-by-reg family.
+    // Already triggered by `dp_register_wide_shift_path`.
 
     /// `thumb32_dp_register` with S=1 wide shift (line 1672 False = S=false
     /// currently covered; 1672 True is S=true).
@@ -3374,14 +3374,14 @@ mod more_misses {
         assert_eq!(c.reg(4), base - 8);
     }
 
-    /// STM with writeback true but load=false (line 662 True `!load` path).
-    /// Covered via stmdb_writeback above.
+    // STM with writeback true but load=false (line 662 True `!load` path).
+    // Covered via stmdb_writeback above.
 
-    /// Wide shift path with hw0[4]=0 (S=false) — line 1436 False covered
-    /// by dp_register_wide_shift_path. Need line 1552 False which means
-    /// `hw1 & 0x80 != 0` false → extend reg path should also evaluate False
-    /// (line 1552 is `} else if hw1 & 0x80 != 0 {`). The False branch is
-    /// the wide shift register path. Already covered.
+    // Wide shift path with hw0[4]=0 (S=false) — line 1436 False covered
+    // by dp_register_wide_shift_path. Need line 1552 False which means
+    // `hw1 & 0x80 != 0` false → extend reg path should also evaluate False
+    // (line 1552 is `} else if hw1 & 0x80 != 0 {`). The False branch is
+    // the wide shift register path. Already covered.
 
     /// Multiplies - SMUSD cross=false, Ra=15 (line 1211 default path).
     #[test]
@@ -3448,17 +3448,12 @@ mod more_misses {
         assert_eq!(c.regs.primask, 1);
     }
 
-    /// MSR op_field 0x3F (MRS alt encoding — line 977 True path already).
-    /// Already covered via mrs_op_field_3e.
+    // MSR op_field 0x3F (MRS alt encoding — line 977 True path already).
+    // Already covered via mrs_op_field_3e.
 
-    /// CONTROL MSR when SPSEL=1 (line 1007 True path for PSP-active).
-    /// Covered by msr_psp_when_psp_active. But line 1007:20 still shows True:
-    /// 4 False:0 which is actually okay — the msr_psp_when_psp_active hits it.
-    /// Hmm but True=4 means only 4 calls, not that it's fully covered.
-    /// Actually [True: 4, False: 0] means True was taken 4 times, False 0.
-    /// That's a branch with only one arm covered. Need False branch too:
-    /// MSR PSP when SPSEL=0 (default). Already covered by `msr_psp`.
-    /// Let me add an explicit test.
+    /// CONTROL MSR when SPSEL=0 — explicit test for the False branch of the
+    /// SPSEL gate at line 1007 in `core/execute_thumb32.rs` (the SPSEL=1
+    /// arm is hit by `msr_psp_when_psp_active`).
     #[test]
     fn msr_psp_spsel_zero_path() {
         let mut c = CortexM33::for_test(0);

@@ -4922,10 +4922,10 @@ mod stage2_bus_coverage {
 
     /// UART0/UART1 RX DREQ arms (bus/mod.rs:1638, 1644). RX is not
     /// otherwise stimulated, but uart's `rx_dreq` fires iff enabled +
-    /// rx_fifo non-empty — the `is_enabled()` check alone means both
-    /// false arms already run for disabled UARTs, and the true path
-    /// requires RX stimulus we don't model in Phase 2. So the true arm
-    /// for UART RX DREQ is unreachable from the public API today.
+    // rx_fifo non-empty — the `is_enabled()` check alone means both
+    // false arms already run for disabled UARTs, and the true path
+    // requires RX stimulus we don't model in Phase 2. So the true arm
+    // for UART RX DREQ is unreachable from the public API today.
     // Unreachable: bus/mod.rs:1638, 1644 — UART RX DREQ true arm needs
     // RX-FIFO stimulus, which is deferred to Phase 2+ (no public path).
 
@@ -4945,10 +4945,10 @@ mod stage2_bus_coverage {
         assert_eq!(dreqs & (1 << 0), 0, "PIO0 TX0 DREQ false when FIFO full");
     }
 
-    /// `collect_dreqs` — exercise PIO RX DREQ True arm. Push directly
-    /// into the SM's RX FIFO using the public `pop_tx` path's twin on
-    /// the RX side. PioBlock exposes a test-hook only under feature
-    /// flag. Without that, RX FIFO fill requires running a PIO program.
+    // `collect_dreqs` — exercise PIO RX DREQ True arm. Push directly
+    // into the SM's RX FIFO using the public `pop_tx` path's twin on
+    // the RX side. PioBlock exposes a test-hook only under feature
+    // flag. Without that, RX FIFO fill requires running a PIO program.
     // Unreachable from MMIO-only tests: bus/mod.rs:1612, 1618 —
     // PIO RX DREQ True arm needs RX FIFO stimulus, which requires
     // running a PIO program (public MMIO path only pushes to TX).
@@ -6685,9 +6685,9 @@ mod stage7_sio_coverage {
         assert_eq!(sio.read32(0x074, 0) as i32, -2);
     }
 
-    /// `divider_result_read` default arm for an offset that isn't 0x070 or
-    /// 0x074 (unreachable via public read32 dispatch, but the `_ => return
-    /// 0` arm is kept as a defensive fallback).
+    // `divider_result_read` default arm for an offset that isn't 0x070 or
+    // 0x074 (unreachable via public read32 dispatch, but the `_ => return
+    // 0` arm is kept as a defensive fallback).
     // unreachable: inner match at line 554 cannot be reached — public
     // `read32` dispatcher only routes 0x070/0x074 here. Not tested.
 

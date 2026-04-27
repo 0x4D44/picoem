@@ -797,7 +797,7 @@ mod tests {
         // covers the first step; the per-tick abort at the head of
         // `tick` keeps the real DMA BUSY=0 for every subsequent step.
         for _ in 0..32 {
-            emu.run(1);
+            emu.run(1).expect("emu.run(1) failed mid-test");
             dma.tick(&mut emu.bus);
         }
 
