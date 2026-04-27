@@ -25,13 +25,14 @@ exclude = [
 ]
 
 [features]
-# `threading` is opt-in for V1 because the runtime is currently
-# x86_64-Windows-only (see the `cfg`-gates on
-# `mdpicoem_common::threaded` and `mdrp2350::threaded::*`). On Linux /
-# macOS the feature compiles but exposes no usable threaded entry
-# points; defaulting it off keeps `cargo add mdrp2350` working
-# cross-platform out of the box. Windows users who want the threaded
-# runtime should opt in: `cargo add mdrp2350 --features threading`.
+# `threading` is opt-in for V1. The runtime supports x86_64 Windows
+# and x86_64 Linux today (see the `cfg`-gates on
+# `mdpicoem_common::threaded` and `mdrp2350::threaded::*`). On macOS or
+# any non-x86_64 host the feature compiles but exposes no usable
+# threaded entry points; defaulting it off keeps `cargo add mdrp2350`
+# working cross-platform out of the box. Windows / Linux users who
+# want the threaded runtime should opt in: `cargo add mdrp2350
+# --features threading`.
 default = []
 # Forward the PIO `test-hooks` feature to `mdpicoem-common`. Enables
 # cross-crate unit tests to push RX FIFO words via `PioBlock::push_rx`.
@@ -72,12 +73,17 @@ sha2 = { version = "0.10", features = ["compress"] }
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
 tracing-subscriber = { workspace = true }
 
-# Threading Phase 3 Stage 6b (LLD V7 §8/§9): Windows thread-affinity
-# pinning for the 4-thread runtime. The `ThreadedEmulator` path is
-# `#[cfg]`-gated to x86_64 Windows, and `winapi` is gated to the same
-# target so the dependency stays off Linux/macOS builds entirely.
+# Threading Phase 3 Stage 6b (LLD V7 §8/§9): host thread-affinity
+# pinning for the 6-thread runtime. The `ThreadedEmulator` path is
+# `#[cfg]`-gated to x86_64 Windows + x86_64 Linux. Each platform has
+# its own affinity API, so the per-OS deps are kept narrow:
+# - Windows uses `SetThreadAffinityMask` from `winapi`.
+# - Linux uses `pthread_setaffinity_np` from `libc`.
 [target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies]
 winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+libc = "0.2"
 
 # Dual-execution HLD V1 Stage 1b review (REQUIRED #2): the
 # `execution_model` integration test exercises `Emulator::
