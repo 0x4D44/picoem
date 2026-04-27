@@ -287,10 +287,7 @@ impl AdcRegs {
     /// Raise INTR bits based on current FIFO level vs FCS.THRESH.
     fn refresh_intr(&mut self) {
         let thresh = self.fcs_thresh();
-        if self.fcs_enabled()
-            && thresh > 0
-            && (self.fifo.len() as u32) >= thresh
-        {
+        if self.fcs_enabled() && thresh > 0 && (self.fifo.len() as u32) >= thresh {
             self.intr |= INTR_FIFO;
         } else {
             self.intr &= !INTR_FIFO;
@@ -477,7 +474,9 @@ impl AdcRegs {
         }
 
         let sys_hz = clock_tree.sys_clk_hz.max(1) as u64;
-        self.adc_phase = self.adc_phase.saturating_add((ADC_HZ as u64) * (sys_cycles as u64));
+        self.adc_phase = self
+            .adc_phase
+            .saturating_add((ADC_HZ as u64) * (sys_cycles as u64));
 
         let mut fired = false;
         while self.adc_phase >= sys_hz {
@@ -600,15 +599,28 @@ mod tests {
         let mut irqs = 0u32;
         // Select channel 3 so the deterministic pattern produces
         // non-zero bits (channel 0 + first counter=0 would yield 0).
-        a.write32(CS, CS_EN | CS_START_ONCE | (3 << CS_AINSEL_SHIFT), 0, &mut irqs);
+        a.write32(
+            CS,
+            CS_EN | CS_START_ONCE | (3 << CS_AINSEL_SHIFT),
+            0,
+            &mut irqs,
+        );
         // 96 adc ticks @ 48 MHz vs 125 MHz sys_clk. Needed sys_clk
         // ticks ≈ 96 * 125/48 = 250. Tick a safe overshoot.
         let tree = default_tree();
         a.tick(400, &tree, &mut irqs);
-        assert_eq!(a.cs & CS_READY, CS_READY, "READY must be set after conversion");
+        assert_eq!(
+            a.cs & CS_READY,
+            CS_READY,
+            "READY must be set after conversion"
+        );
         assert_eq!(a.cs & CS_START_ONCE, 0, "START_ONCE must auto-clear");
         assert_eq!(a.read32(RESULT), a.last_sample as u32);
-        assert_ne!(a.read32(RESULT), 0, "deterministic sample should be non-zero");
+        assert_ne!(
+            a.read32(RESULT),
+            0,
+            "deterministic sample should be non-zero"
+        );
     }
 
     #[test]
@@ -697,7 +709,11 @@ mod tests {
         // Drain via FIFO read.
         let _ = a.read32(FIFO);
         assert!(a.fifo.is_empty());
-        assert_eq!(a.intr & INTR_FIFO, 0, "INTR must drop when FIFO below THRESH");
+        assert_eq!(
+            a.intr & INTR_FIFO,
+            0,
+            "INTR must drop when FIFO below THRESH"
+        );
     }
 
     #[test]
@@ -817,7 +833,11 @@ mod tests {
         let mut irqs = 0u32;
         a.write32(CS, CS_EN, 0, &mut irqs);
         let cs = a.read32(CS);
-        assert_ne!(cs & CS_READY, 0, "pico-sdk adc_init poll must exit on first re-read");
+        assert_ne!(
+            cs & CS_READY,
+            0,
+            "pico-sdk adc_init poll must exit on first re-read"
+        );
     }
 
     #[test]
@@ -832,7 +852,11 @@ mod tests {
         assert_eq!(a.cs & CS_READY, 0, "conversion armed should clear READY");
         // Complete the conversion.
         a.tick(400, &default_tree(), &mut irqs);
-        assert_eq!(a.cs & CS_READY, CS_READY, "conversion completion re-latches READY");
+        assert_eq!(
+            a.cs & CS_READY,
+            CS_READY,
+            "conversion completion re-latches READY"
+        );
     }
 
     #[test]
@@ -856,7 +880,10 @@ mod tests {
         assert_eq!(a.cs & CS_READY, 0);
         // BITCLR EN mid-conversion.
         a.write32(CS, CS_EN, 3, &mut irqs);
-        assert!(a.conversion_remaining.is_none(), "EN 1->0 aborts in-flight conversion");
+        assert!(
+            a.conversion_remaining.is_none(),
+            "EN 1->0 aborts in-flight conversion"
+        );
         assert_eq!(a.cs & CS_READY, 0, "aborted conversion leaves READY clear");
     }
 
@@ -867,6 +894,10 @@ mod tests {
         // Start from EN=0; then BITSET EN.
         a.write32(CS, 0, 0, &mut irqs);
         a.write32(CS, CS_EN, 2, &mut irqs);
-        assert_eq!(a.cs & CS_READY, CS_READY, "edge detection must work through alias RMW");
+        assert_eq!(
+            a.cs & CS_READY,
+            CS_READY,
+            "edge detection must work through alias RMW"
+        );
     }
 }

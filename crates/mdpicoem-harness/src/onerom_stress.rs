@@ -16,9 +16,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::onerom_serving_oracle::{
-    stimulus_level_pub, Case, CaseResult, Verdict, SHADOW_SIZE,
-};
+use crate::onerom_serving_oracle::{Case, CaseResult, SHADOW_SIZE, Verdict, stimulus_level_pub};
 
 // ---------------------------------------------------------------------------
 // Sweep generator
@@ -122,7 +120,10 @@ fn nearest_rank<T: Copy + Ord>(sorted: &[T], p: u32) -> T {
 /// discarded. An empty input returns an all-zero histogram.
 pub fn compute_histogram(results: &[CaseResult], sys_clk_hz: u32) -> Histogram {
     let count = results.len();
-    let pass = results.iter().filter(|r| r.verdict == Verdict::Pass).count();
+    let pass = results
+        .iter()
+        .filter(|r| r.verdict == Verdict::Pass)
+        .count();
     let fail = count - pass;
 
     if pass == 0 {
@@ -385,7 +386,11 @@ pub fn format_report(
     // Model-predicted latency: emulated cycles × 1/sysclk. Only trustworthy
     // to the extent our cycle model matches silicon — this tool does not
     // calibrate that, `test_silicon_cycle_oracle_rp2350` does.
-    writeln!(out, "emulated latency (model: cycles x 1/sysclk, uncalibrated) (ns):").unwrap();
+    writeln!(
+        out,
+        "emulated latency (model: cycles x 1/sysclk, uncalibrated) (ns):"
+    )
+    .unwrap();
     writeln!(out, "  min    : {:>4}", hist.min_ns).unwrap();
     writeln!(out, "  p50    : {:>4}", hist.p50_ns).unwrap();
     writeln!(out, "  mean   : {:>4}", hist.mean_ns).unwrap();
@@ -566,7 +571,10 @@ mod tests {
         let h2 = compute_histogram(&pair, 150_000_000);
         assert_eq!(h2.min_ns, 100);
         assert_eq!(h2.max_ns, 200);
-        assert_eq!(h2.p50_ns, 100, "n=2 → p50 = sorted[ceil(0.5*2)-1] = sorted[0] = 100");
+        assert_eq!(
+            h2.p50_ns, 100,
+            "n=2 → p50 = sorted[ceil(0.5*2)-1] = sorted[0] = 100"
+        );
         // p=100 must return sorted[n-1], never index n. The nearest-rank
         // index is ceil(1.0*2)-1 = 1, so we expect the upper value.
         assert_eq!(h2.p95_ns, 200, "n=2 → p95 = sorted[1] = 200");
@@ -739,7 +747,10 @@ mod tests {
             Duration::from_nanos(300),
         ];
         let wc = compute_wall_clock_stats(&durations);
-        assert_eq!(wc.min_ns, 100, "min is the smallest, regardless of input order");
+        assert_eq!(
+            wc.min_ns, 100,
+            "min is the smallest, regardless of input order"
+        );
         assert_eq!(wc.max_ns, 500);
         assert_eq!(wc.p50_ns, 300, "p50 is the middle of the *sorted* set");
     }

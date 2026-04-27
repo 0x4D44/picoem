@@ -5,12 +5,12 @@
 // setup + diff lives in the library module so the `test_silicon`
 // orchestrator can share it.
 
-use mdpicoem_harness::silicon_oracle::{select_by_name, Verdict};
-use mdpicoem_harness::silicon_scenarios::{
-    run_scenario_with_retry, PeriphArgs, PeriphScenario, PLL_SYS_BASE, RESETS_BASE, RESETS_RESET,
-    RESET_PIO0, RESET_PIO1, RESET_PLL_SYS, RED_PATH_SCENARIOS, SCENARIOS,
-};
 use mdpicoem_harness::SILICON_RUN_SLED;
+use mdpicoem_harness::silicon_oracle::{Verdict, select_by_name};
+use mdpicoem_harness::silicon_scenarios::{
+    PLL_SYS_BASE, PeriphArgs, PeriphScenario, RED_PATH_SCENARIOS, RESET_PIO0, RESET_PIO1,
+    RESET_PLL_SYS, RESETS_BASE, RESETS_RESET, SCENARIOS, run_scenario_with_retry,
+};
 use probe_rs::{MemoryInterface, Session, SessionConfig};
 use std::time::Instant;
 
@@ -39,7 +39,10 @@ struct Args {
 
 impl Default for Args {
     fn default() -> Self {
-        Self { inner: PeriphArgs::default(), red_path: false }
+        Self {
+            inner: PeriphArgs::default(),
+            red_path: false,
+        }
     }
 }
 
@@ -124,7 +127,9 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         skipped_filter,
         skipped_exclude,
     );
-    println!("sled=0x{SILICON_RUN_SLED:08X} resets=0x{RESETS_BASE:08X} pll_sys=0x{PLL_SYS_BASE:08X}");
+    println!(
+        "sled=0x{SILICON_RUN_SLED:08X} resets=0x{RESETS_BASE:08X} pll_sys=0x{PLL_SYS_BASE:08X}"
+    );
     println!();
 
     let mut session = Session::auto_attach("rp2350", SessionConfig::default())?;

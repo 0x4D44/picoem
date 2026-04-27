@@ -83,10 +83,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let selected: Vec<&isr_scenarios_rp2040::IsrScenario> = isr_scenarios_rp2040::SCENARIOS
         .iter()
         .filter(|s| {
-            mdpicoem_harness::silicon_oracle::name_matches_filter(
-                s.name,
-                args.filter.as_deref(),
-            )
+            mdpicoem_harness::silicon_oracle::name_matches_filter(s.name, args.filter.as_deref())
         })
         .collect();
 
@@ -102,9 +99,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "silicon_isr_diff_rp2040: {} scenario(s) selected",
         selected.len(),
     );
-    println!(
-        "image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X}",
-    );
+    println!("image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X}",);
     println!(
         "NOTE: V5 IRQ plumbing is complete (NVIC MMIO + SysTick + unified exception dispatcher); EMU-side scenarios should pass.",
     );

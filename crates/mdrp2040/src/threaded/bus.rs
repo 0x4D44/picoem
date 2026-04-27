@@ -242,7 +242,10 @@ impl WorkerBus {
                 if ext_mask == 0 {
                     merged
                 } else {
-                    let ext_val = self.shared.external_gpio_in_override.load(Ordering::Acquire);
+                    let ext_val = self
+                        .shared
+                        .external_gpio_in_override
+                        .load(Ordering::Acquire);
                     (merged & !ext_mask) | (ext_val & ext_mask)
                 }
             }
@@ -311,11 +314,7 @@ impl WorkerBus {
             // Interpolators 0x080..0x0FC — per-worker local.
             0x080..=0x0FC => {
                 let idx = ((offset - 0x080) >> 2) as usize;
-                if idx < 32 {
-                    self.interp[idx]
-                } else {
-                    0
-                }
+                if idx < 32 { self.interp[idx] } else { 0 }
             }
             // Spinlock bank status at 0x05C.
             0x05C => {
@@ -355,9 +354,14 @@ impl WorkerBus {
         let offset = addr & 0xFFF;
         match offset {
             // GPIO_OUT plain store / SET / CLR / XOR (RP2040 4-byte spacing).
-            0x010 => self.shared.gpio_out.store(val & PIN_MASK, Ordering::Release),
+            0x010 => self
+                .shared
+                .gpio_out
+                .store(val & PIN_MASK, Ordering::Release),
             0x014 => {
-                self.shared.gpio_out.fetch_or(val & PIN_MASK, Ordering::AcqRel);
+                self.shared
+                    .gpio_out
+                    .fetch_or(val & PIN_MASK, Ordering::AcqRel);
             }
             0x018 => {
                 self.shared
@@ -365,18 +369,26 @@ impl WorkerBus {
                     .fetch_and(!(val & PIN_MASK), Ordering::AcqRel);
             }
             0x01C => {
-                self.shared.gpio_out.fetch_xor(val & PIN_MASK, Ordering::AcqRel);
+                self.shared
+                    .gpio_out
+                    .fetch_xor(val & PIN_MASK, Ordering::AcqRel);
             }
             // GPIO_OE plain / SET / CLR / XOR.
             0x020 => self.shared.gpio_oe.store(val & PIN_MASK, Ordering::Release),
             0x024 => {
-                self.shared.gpio_oe.fetch_or(val & PIN_MASK, Ordering::AcqRel);
+                self.shared
+                    .gpio_oe
+                    .fetch_or(val & PIN_MASK, Ordering::AcqRel);
             }
             0x028 => {
-                self.shared.gpio_oe.fetch_and(!(val & PIN_MASK), Ordering::AcqRel);
+                self.shared
+                    .gpio_oe
+                    .fetch_and(!(val & PIN_MASK), Ordering::AcqRel);
             }
             0x02C => {
-                self.shared.gpio_oe.fetch_xor(val & PIN_MASK, Ordering::AcqRel);
+                self.shared
+                    .gpio_oe
+                    .fetch_xor(val & PIN_MASK, Ordering::AcqRel);
             }
             // FIFO_ST — W1C for WOF/ROE stickies (bits 2 and 3). Matches
             // serial `Sio::fifo_st_write`.
@@ -482,9 +494,27 @@ impl WorkerBus {
 
         match base {
             SYSINFO_BASE => sysinfo_read(offset),
-            CLOCKS_BASE => self.shared.peripherals.clocks.lock().unwrap().clocks_read(offset),
-            XOSC_BASE => self.shared.peripherals.clocks.lock().unwrap().xosc_read(offset),
-            ROSC_BASE => self.shared.peripherals.clocks.lock().unwrap().rosc_read(offset),
+            CLOCKS_BASE => self
+                .shared
+                .peripherals
+                .clocks
+                .lock()
+                .unwrap()
+                .clocks_read(offset),
+            XOSC_BASE => self
+                .shared
+                .peripherals
+                .clocks
+                .lock()
+                .unwrap()
+                .xosc_read(offset),
+            ROSC_BASE => self
+                .shared
+                .peripherals
+                .clocks
+                .lock()
+                .unwrap()
+                .rosc_read(offset),
             PLL_SYS_BASE => self
                 .shared
                 .peripherals
@@ -1762,15 +1792,9 @@ mod tests {
             "placeholder nvic[1] must remain untouched on a core-0 worker"
         );
         // Read-back through the bus returns the same mask.
-        assert_eq!(
-            b0.read32(0xE000_E100),
-            1u32 << crate::irq::IRQ_TIMER_IRQ_0
-        );
+        assert_eq!(b0.read32(0xE000_E100), 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
         // ICER0 read aliases the same enabled mask.
-        assert_eq!(
-            b0.read32(0xE000_E180),
-            1u32 << crate::irq::IRQ_TIMER_IRQ_0
-        );
+        assert_eq!(b0.read32(0xE000_E180), 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
         // Negative control against hidden globals: `b1` is built from a
         // separate `SharedState::new_default()` (see `fresh_worker`) so
         // these are unrelated emulators, not peer workers in the same
@@ -1793,14 +1817,8 @@ mod tests {
         );
         // Read-back returns the pending mask via either ISPR or ICPR
         // alias.
-        assert_eq!(
-            b0.read32(0xE000_E200),
-            1u32 << crate::irq::IRQ_TIMER_IRQ_0
-        );
-        assert_eq!(
-            b0.read32(0xE000_E280),
-            1u32 << crate::irq::IRQ_TIMER_IRQ_0
-        );
+        assert_eq!(b0.read32(0xE000_E200), 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
+        assert_eq!(b0.read32(0xE000_E280), 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
         // W1C via ICPR0 clears the pending bit.
         b0.write32(0xE000_E280, 1u32 << crate::irq::IRQ_TIMER_IRQ_0);
         assert!(

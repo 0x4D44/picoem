@@ -25,9 +25,7 @@
 // per-case measurement loop hoisted out into a library entry point the
 // orchestrator shares.
 
-use crate::silicon_oracle::{
-    self, enable_cyccnt, read_cyccnt, reset_cyccnt, CaseOutcome, Verdict,
-};
+use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, read_cyccnt, reset_cyccnt};
 use mdrp2350::{Config, Cores, Emulator, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
 use std::time::Instant;
@@ -343,7 +341,10 @@ pub fn compute_diff(hw_median: u32, nop_baseline: u32, emu_cycles: u32) -> (u32,
 /// Build a fresh emulator with `step_quantum=1`, core 1 halted, DWT on,
 /// and the single test instruction primed at `fetch_addr`.
 fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .unwrap();
     emu.cores.expect_arm_mut()[1].halt();
 
     // Write the instruction (two bytes) at `fetch_addr`. The decoded-op
@@ -351,7 +352,9 @@ fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
     // required.
     let fetch_off = fetch_addr - 0x2000_0000;
     emu.bus.memory.sram_write8(fetch_off, (instr & 0xFF) as u8);
-    emu.bus.memory.sram_write8(fetch_off + 1, ((instr >> 8) & 0xFF) as u8);
+    emu.bus
+        .memory
+        .sram_write8(fetch_off + 1, ((instr >> 8) & 0xFF) as u8);
 
     // Seed the data slot so LDR yields a deterministic value and STR has
     // somewhere to land.
@@ -361,10 +364,14 @@ fn fresh_emulator(instr: u32, fetch_addr: u32, data_addr: u32) -> Emulator {
     // not sample CYCCNT here — the emulator's cycle accounting lives on
     // `core.cycles()`.
     let demcr = emu.bus.read32(silicon_oracle::DEMCR_U32, 0);
-    emu.bus.write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA, 0);
-    let ctrl = emu.bus.read32(silicon_oracle::DWT_CTRL_U32, 0);
     emu.bus
-        .write32(silicon_oracle::DWT_CTRL_U32, ctrl | silicon_oracle::CYCCNTENA, 0);
+        .write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA, 0);
+    let ctrl = emu.bus.read32(silicon_oracle::DWT_CTRL_U32, 0);
+    emu.bus.write32(
+        silicon_oracle::DWT_CTRL_U32,
+        ctrl | silicon_oracle::CYCCNTENA,
+        0,
+    );
 
     // Prime core 0 registers to execute exactly one instruction.
     {
@@ -392,7 +399,9 @@ fn measure_emu_one(instr: u32, fetch_addr: u32, data_addr: u32) -> u32 {
     // (which advances both cores and peripherals) because halt-step cares
     // only about the single-instruction cycle accounting on core 0 —
     // peripheral ticks and clock housekeeping would just add noise.
-    let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+    let Cores::Arm(arm) = &mut emu.cores else {
+        unreachable!()
+    };
     arm[0].step(&mut emu.bus);
     let after = arm[0].cycles();
     (after - before) as u32
@@ -664,7 +673,11 @@ mod tests {
             .iter()
             .filter(|c| silicon_oracle::name_matches_filter(c.name, Some("bankcfl_ldr_")))
             .collect();
-        assert_eq!(ldr.len(), 8, "filter 'bankcfl_ldr_' must match all 8 LDR cases");
+        assert_eq!(
+            ldr.len(),
+            8,
+            "filter 'bankcfl_ldr_' must match all 8 LDR cases"
+        );
         let b0: Vec<&BankCase> = cat
             .iter()
             .filter(|c| silicon_oracle::name_matches_filter(c.name, Some("_b0_")))

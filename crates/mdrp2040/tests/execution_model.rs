@@ -77,15 +77,17 @@ fn worker_panic_surfaces_as_error() {
             ref which,
             ref message,
         }) => {
-            assert_eq!(*which, WorkerName::Core0, "panic must be attributed to core0");
+            assert_eq!(
+                *which,
+                WorkerName::Core0,
+                "panic must be attributed to core0"
+            );
             assert!(
                 message.contains("core0"),
                 "panic message must name the worker: got {message:?}"
             );
         }
-        other => panic!(
-            "expected Err(EmulatorError::WorkerPanicked), got {other:?}"
-        ),
+        other => panic!("expected Err(EmulatorError::WorkerPanicked), got {other:?}"),
     }
 
     // One-shot guarantee: the next call must return the SAME error
@@ -99,9 +101,7 @@ fn worker_panic_surfaces_as_error() {
             assert_eq!(*which, WorkerName::Core0);
             assert!(message.contains("core0"));
         }
-        other => panic!(
-            "one-shot: second call must also return WorkerPanicked, got {other:?}"
-        ),
+        other => panic!("one-shot: second call must also return WorkerPanicked, got {other:?}"),
     }
 }
 
@@ -142,9 +142,7 @@ fn threaded_step_returns_not_supported() {
 
     match emu.step() {
         Err(EmulatorError::NotSupportedInThreadedMode) => {}
-        other => panic!(
-            "Threaded step() must return NotSupportedInThreadedMode, got {other:?}"
-        ),
+        other => panic!("Threaded step() must return NotSupportedInThreadedMode, got {other:?}"),
     }
 }
 

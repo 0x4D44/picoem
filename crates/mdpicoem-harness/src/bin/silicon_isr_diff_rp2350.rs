@@ -22,7 +22,7 @@
 // divergences, not a missing dispatch path.
 
 use mdpicoem_harness::isr_scenarios::{self, IsrArgs, SCENARIOS};
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, select_by_name, Verdict};
+use mdpicoem_harness::silicon_oracle::{Verdict, enable_cyccnt, select_by_name};
 use mdpicoem_harness::{ISR_IMAGE_BASE, ISR_MAILBOX_CYCCNT, ISR_STACK_TOP};
 use probe_rs::{Session, SessionConfig};
 use std::time::{Duration, Instant};
@@ -83,8 +83,11 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     })?;
 
     let scenario_names: Vec<&str> = SCENARIOS.iter().map(|s| s.name).collect();
-    let (indices, skipped_filter, skipped_exclude) =
-        select_by_name(&scenario_names, args.filter.as_deref(), args.exclude.as_deref());
+    let (indices, skipped_filter, skipped_exclude) = select_by_name(
+        &scenario_names,
+        args.filter.as_deref(),
+        args.exclude.as_deref(),
+    );
 
     if indices.is_empty() {
         println!(
@@ -97,7 +100,9 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     println!(
         "silicon_isr_diff_rp2350: {} scenario(s) selected ({} skipped by filter, {} skipped by exclude)",
-        indices.len(), skipped_filter, skipped_exclude,
+        indices.len(),
+        skipped_filter,
+        skipped_exclude,
     );
     println!(
         "image_base=0x{ISR_IMAGE_BASE:08X} stack_top=0x{ISR_STACK_TOP:08X} mailbox=0x{ISR_MAILBOX_CYCCNT:08X}",

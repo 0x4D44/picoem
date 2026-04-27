@@ -34,25 +34,24 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use mdpicoem_common::PioBlock;
 
+use crate::Emulator;
 use crate::bus::Bus;
 use crate::core::CortexM33;
-use crate::Emulator;
 
+use super::peripherals::{
+    ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState, UsbState,
+};
+use super::timings::{PerWorkerTimings, RunTimings, TimingRecorder};
 use super::{
     AtomicGpio, BarrierResult, ExclusiveMonitors, PioCommand, SharedMemory, SharedState,
     SpinBarrier, ThreadedPio, ThreadedSio, WorkerBus,
 };
-use super::peripherals::{
-    ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
-    UsbState,
-};
-use super::timings::{PerWorkerTimings, RunTimings, TimingRecorder};
 
 /// Runtime-error payload returned from [`ThreadedEmulator::run_quanta_checked`].
 /// Distinguishes a worker panic from a barrier-watchdog timeout so the
@@ -155,8 +154,7 @@ impl ThreadedEmulator {
         // with per-core caches that still carry stale entries pointing
         // at bytes the single-threaded `Bus` replaced.
         debug_assert!(
-            bus.pending_cache_invalidations.is_empty()
-                && bus.pending_invalidation_regions == 0,
+            bus.pending_cache_invalidations.is_empty() && bus.pending_invalidation_regions == 0,
             "ThreadedEmulator::from_emulator: Bus has unconsumed decode-cache \
              invalidations. Call Emulator::step() or Emulator::reset() before \
              handoff, or the threaded workers will start with stale per-core \
@@ -507,8 +505,7 @@ impl ThreadedEmulator {
         // exactly one `PioBlock`. Happy-path reassembly below rebuilds
         // the array; any PIO worker panic drops all three blocks per
         // HLD V5 §2.7 — the poisoned instance cannot be reused.
-        let [block0, block1, block2] =
-            self.pio_blocks.take().expect("run_quanta reentry");
+        let [block0, block1, block2] = self.pio_blocks.take().expect("run_quanta reentry");
 
         let barrier = Arc::new(SpinBarrier::new(6));
         let shared = self.shared.clone();
@@ -708,7 +705,11 @@ fn panic_message(err: Option<&Box<dyn std::any::Any + Send>>) -> String {
         Some(payload) => payload
             .downcast_ref::<String>()
             .cloned()
-            .or_else(|| payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| "<non-string panic payload>".to_string()),
         None => String::new(),
     }
@@ -735,11 +736,7 @@ fn split_ok(
 /// Generic over the body's return type so the three different body
 /// signatures (`CortexM33` / `PioBlock` / `()`) share the same spawn
 /// path without a trait object.
-fn spawn_worker<F, R>(
-    host_core: usize,
-    barrier: Arc<SpinBarrier>,
-    body: F,
-) -> JoinHandle<R>
+fn spawn_worker<F, R>(host_core: usize, barrier: Arc<SpinBarrier>, body: F) -> JoinHandle<R>
 where
     F: FnOnce(Arc<SpinBarrier>) -> R + Send + 'static,
     R: Send + 'static,
@@ -827,9 +824,7 @@ fn core_worker_body(
         // step loop resumes execution. WFI wake is Phase 5. Pairs with
         // `CoreAtomics::sev_both`'s `Release` store on the SEV caller
         // side via `event_flag_consume`'s `AcqRel` swap.
-        if shared.atomics.is_wfe_waiting(idx)
-            && shared.atomics.event_flag_consume(idx)
-        {
+        if shared.atomics.is_wfe_waiting(idx) && shared.atomics.event_flag_consume(idx) {
             shared.atomics.clear_wfe_waiting(idx);
         }
 
@@ -940,14 +935,18 @@ fn pio_block_worker_body(
             // CPU workers observe them through the shared atomic.
             // PIO→NVIC assertion is Phase-later scope (see function
             // doc); we only publish the bits here.
-            shared.pio.write_irq_flags(block_idx, block.pending_irqs() as u8);
+            shared
+                .pio
+                .write_irq_flags(block_idx, block.pending_irqs() as u8);
         }
 
         // HLD V5 §2.1: publish pad state unconditionally — even a
         // disabled block must publish its current pad latch so coord's
         // `update_gpio` sees a coherent snapshot. Mirrors the
         // pre-split per-block publish loop.
-        shared.pio.write_pads(block_idx, block.pad_out, block.pad_oe);
+        shared
+            .pio
+            .write_pads(block_idx, block.pad_out, block.pad_oe);
 
         // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
         // after phase work. Overlaps with coord phase-2 of this
@@ -995,14 +994,25 @@ fn apply_pio_command(
         "PioCommand.block must match the owning worker's block_idx (§2.2 routing)"
     );
     match cmd {
-        PioCommand::WriteInstrMem { block: _, addr, value, alias } => {
+        PioCommand::WriteInstrMem {
+            block: _,
+            addr,
+            value,
+            alias,
+        } => {
             if addr >= 32 {
                 return;
             }
             let offset = 0x048 + (addr as u32) * 4;
             block.write32(offset, value as u32, alias as u32);
         }
-        PioCommand::SetClkDiv { block: _, sm, int_div, frac_div, alias } => {
+        PioCommand::SetClkDiv {
+            block: _,
+            sm,
+            int_div,
+            frac_div,
+            alias,
+        } => {
             if sm >= 4 {
                 return;
             }
@@ -1012,14 +1022,23 @@ fn apply_pio_command(
             let val = ((int_div as u32) << 16) | ((frac_div as u32) << 8);
             block.write32(offset, val, alias as u32);
         }
-        PioCommand::WriteCtrl { block: _, val, alias } => {
+        PioCommand::WriteCtrl {
+            block: _,
+            val,
+            alias,
+        } => {
             block.write32(0x000, val, alias as u32);
             // Republish the post-write enable mask so CPU-side readers
             // (including the PIO worker's own step-loop enable gate)
             // observe it next quantum.
             shared_pio.write_sm_enabled(block_idx, block.sm_enabled_mask());
         }
-        PioCommand::WriteReg { block: _, offset, val, alias } => {
+        PioCommand::WriteReg {
+            block: _,
+            offset,
+            val,
+            alias,
+        } => {
             block.write32(offset as u32, val, alias as u32);
             // Conservative republish: keeps the mask coherent even if a
             // future `PioBlock::write32` extension ends up toggling
@@ -1070,7 +1089,9 @@ fn coordinator_worker_body(
 
         // Advance master_cycle BEFORE ticking peripherals so CPU
         // workers' next-quantum PLL reads observe the fresh timeline.
-        shared.master_cycle.fetch_add(step_q as u64, Ordering::Release);
+        shared
+            .master_cycle
+            .fetch_add(step_q as u64, Ordering::Release);
         shared.sio.mtime_advance(step_q as u64);
 
         tick_peripherals(&shared, step_q);
@@ -1104,7 +1125,9 @@ fn update_gpio(shared: &SharedState) {
         merged = (merged & !pad_oe) | (pad_out & pad_oe);
     }
     let (ext_val, ext_mask) = shared.gpio.read_external();
-    shared.gpio.write_in((merged & !ext_mask) | (ext_val & ext_mask));
+    shared
+        .gpio
+        .write_in((merged & !ext_mask) | (ext_val & ext_mask));
 }
 
 /// Coordinator-owned peripheral tick. Phase 4 Stage A port of
@@ -1227,19 +1250,11 @@ mod tests {
 
         let threaded = ThreadedEmulator::from_emulator(emu);
         assert!(
-            threaded
-                .shared
-                .atomics
-                .event_flag[1]
-                .load(Ordering::Acquire),
+            threaded.shared.atomics.event_flag[1].load(Ordering::Acquire),
             "pending_fifo_event(1) must land on event_flag[1]"
         );
         assert!(
-            !threaded
-                .shared
-                .atomics
-                .event_flag[0]
-                .load(Ordering::Acquire),
+            !threaded.shared.atomics.event_flag[0].load(Ordering::Acquire),
             "peer (0) must stay clear"
         );
     }
@@ -1264,8 +1279,7 @@ mod tests {
     /// isolates the coordinator's `fetch_add` contribution).
     #[test]
     fn run_quanta_single_then_many() {
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         // Halt both cores so the CPU workers spin-and-wait; coordinator
         // still advances master_cycle per quantum regardless.
         threaded.shared.atomics.set_halted(0);
@@ -1297,9 +1311,7 @@ mod tests {
     /// atomic IRQ wire which CPU workers swap-to-zero each quantum).
     #[test]
     fn tick_peripherals_fires_timer0_alarm0_shared_irq() {
-        use crate::peripherals::ticks::{
-            CTRL_ENABLE, DOMAIN_STRIDE, DOMAIN_TIMER0, TICKS_BASE,
-        };
+        use crate::peripherals::ticks::{CTRL_ENABLE, DOMAIN_STRIDE, DOMAIN_TIMER0, TICKS_BASE};
         use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET, INTR_OFFSET, TIMER0_BASE};
 
         let mut emu = Emulator::new(Config::default());
@@ -1323,8 +1335,14 @@ mod tests {
         // until an ISR W1Cs it. Observable post-run regardless of
         // whether CPU worker take_irq_pending raced ahead of coord's
         // assert_irq_shared in the final quantum (Stage C overlap).
-        let timer0_intr = threaded.shared.peripherals.timers.lock().unwrap()
-            .timer0.read32(INTR_OFFSET);
+        let timer0_intr = threaded
+            .shared
+            .peripherals
+            .timers
+            .lock()
+            .unwrap()
+            .timer0
+            .read32(INTR_OFFSET);
         assert_ne!(
             timer0_intr & 0x1,
             0,
@@ -1349,8 +1367,7 @@ mod tests {
         // firmware-oracle phase. This test exercises the memory-layer
         // contract; the §9 barrier protocol ensures the worker-to-worker
         // happens-before chain separately.
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
 
@@ -1380,8 +1397,7 @@ mod tests {
     /// surface.
     #[test]
     fn wfe_sev_wake() {
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         // Halt core 1 so only core 0's worker exercises the wake hook.
         threaded.shared.atomics.set_halted(1);
 
@@ -1415,8 +1431,7 @@ mod tests {
     /// firmware-driven MMIO path.
     #[test]
     fn fifo_push_wakes_peer_wfe() {
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         threaded.shared.atomics.set_halted(1);
         threaded.shared.atomics.set_wfe_waiting(0);
 
@@ -1451,8 +1466,7 @@ mod tests {
     /// (parity with WorkerBus spinlock dispatch at 0x100..=0x17F).
     #[test]
     fn spinlock_contended_both_cores() {
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let sio = threaded.shared.sio.clone();
 
         // Core 0 claims lock 7.
@@ -1476,8 +1490,7 @@ mod tests {
     /// state roundtrips and the shared NVIC pending bits stay clear.
     #[test]
     fn doorbell_state_roundtrips_without_irq() {
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let sio = &threaded.shared.sio;
         let atomics = &threaded.shared.atomics;
 
@@ -1531,8 +1544,7 @@ mod tests {
         // requires firmware and is deferred to the firmware-oracle phase.
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
 
         // (a) write32 into SRAM records TWO pending invalidations
@@ -1551,7 +1563,8 @@ mod tests {
             "first queued entry is the word address"
         );
         assert_eq!(
-            bus.pending_cache_invalidations[1], addr_a + 2,
+            bus.pending_cache_invalidations[1],
+            addr_a + 2,
             "second queued entry is word+2 to cover trailing hw slot"
         );
 
@@ -1593,8 +1606,7 @@ mod tests {
     /// `apply_pio_command`'s republish path from the MMIO dispatcher.
     #[test]
     fn pio_sm_enable_routes_through_command_queue() {
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
 
         // Block 0 starts disabled.
         assert_eq!(threaded.shared.pio.read_sm_enabled(0), 0);
@@ -1646,8 +1658,7 @@ mod tests {
     fn pio_ctrl_write_via_worker_bus_propagates_to_threaded_pio() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
 
         // PIO1 CTRL = 0x5030_0000, enable SMs 1 and 3.
@@ -1655,10 +1666,18 @@ mod tests {
 
         // Command must be queued (not dropped silently).
         let pending = threaded.shared.pio.drain_commands(1);
-        assert_eq!(pending.len(), 1, "CTRL write must queue exactly one command");
+        assert_eq!(
+            pending.len(),
+            1,
+            "CTRL write must queue exactly one command"
+        );
         assert_eq!(
             pending[0],
-            PioCommand::WriteCtrl { block: 1, val: 0b1010, alias: 0 }
+            PioCommand::WriteCtrl {
+                block: 1,
+                val: 0b1010,
+                alias: 0
+            }
         );
 
         // Apply + verify the republish lands on ThreadedPio.
@@ -1677,8 +1696,7 @@ mod tests {
     fn pio_instr_mem_write_via_worker_bus_propagates_to_block() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
 
         // PIO0 INSTR_MEM7 lives at 0x5020_0000 + 0x048 + 7*4 = 0x5020_0064.
@@ -1690,7 +1708,12 @@ mod tests {
         assert_eq!(pending.len(), 1, "INSTR_MEM write must queue one command");
         assert_eq!(
             pending[0],
-            PioCommand::WriteInstrMem { block: 0, addr: 7, value: insn as u16, alias: 0 }
+            PioCommand::WriteInstrMem {
+                block: 0,
+                addr: 7,
+                value: insn as u16,
+                alias: 0
+            }
         );
 
         // Apply and verify it reached instr_mem[7].
@@ -1709,8 +1732,7 @@ mod tests {
     fn pio_clkdiv_write_via_worker_bus_decodes_int_frac() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
 
         // PIO2 SM3_CLKDIV: 0x5040_0000 + 0x0C8 + 3*0x18 = 0x5040_0110.
@@ -1724,7 +1746,13 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0],
-            PioCommand::SetClkDiv { block: 2, sm: 3, int_div, frac_div, alias: 0 }
+            PioCommand::SetClkDiv {
+                block: 2,
+                sm: 3,
+                int_div,
+                frac_div,
+                alias: 0
+            }
         );
     }
 
@@ -1735,8 +1763,7 @@ mod tests {
     fn pio_non_fast_path_write_uses_generic_writereg() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
 
         // PIO0 TXF0 at 0x5020_0010.
@@ -1748,11 +1775,21 @@ mod tests {
         assert_eq!(pending.len(), 2, "two non-fast-path writes → two commands");
         assert_eq!(
             pending[0],
-            PioCommand::WriteReg { block: 0, offset: 0x010, val: 0xABCD_1234, alias: 0 }
+            PioCommand::WriteReg {
+                block: 0,
+                offset: 0x010,
+                val: 0xABCD_1234,
+                alias: 0
+            }
         );
         assert_eq!(
             pending[1],
-            PioCommand::WriteReg { block: 0, offset: 0x030, val: 0x0000_000F, alias: 0 }
+            PioCommand::WriteReg {
+                block: 0,
+                offset: 0x030,
+                val: 0x0000_000F,
+                alias: 0
+            }
         );
     }
 
@@ -1764,8 +1801,7 @@ mod tests {
     fn pio_ctrl_readback_reflects_published_enable_mask() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         // Seed the shared mask directly (simulates a post-apply state).
         threaded.shared.pio.write_sm_enabled(1, 0b1001);
         threaded.shared.pio.write_irq_flags(2, 0x0A);
@@ -1791,8 +1827,7 @@ mod tests {
     fn pio_ctrl_write_drains_during_run_quanta() {
         use crate::core::CoreBus;
 
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         // Halt both cores so `core_worker_body` idle-spins — the PIO
         // worker still drains commands and ticks each quantum.
         threaded.shared.atomics.set_halted(0);
@@ -1831,8 +1866,7 @@ mod tests {
     fn pio_instr_mem_alias_propagates_through_command() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
 
         // PIO0 INSTR_MEM7 = 0x5020_0064; SET alias adds 0x2000.
@@ -1859,8 +1893,7 @@ mod tests {
     fn pio_clkdiv_alias_propagates_through_command() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
 
         // PIO0 SM0_CLKDIV = 0x5020_00C8; XOR alias adds 0x1000.
@@ -1894,8 +1927,7 @@ mod tests {
     fn pio_ctrl_write_with_set_alias_propagates_or_semantics() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
 
         // Seed: enable SM0 on PIO0 via a plain CTRL write.
         {
@@ -1919,7 +1951,11 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0],
-            PioCommand::WriteCtrl { block: 0, val: 0b0100, alias: 2 },
+            PioCommand::WriteCtrl {
+                block: 0,
+                val: 0b0100,
+                alias: 2
+            },
         );
         apply_pio_command(&mut blocks[0], 0, &threaded.shared.pio, pending[0]);
 
@@ -1943,8 +1979,7 @@ mod tests {
     fn pio_writereg_txf_end_to_end_lands_in_block_fifo() {
         use crate::core::CoreBus;
 
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         // Halt CPUs so only the PIO worker runs its drain/step.
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
@@ -1989,8 +2024,7 @@ mod tests {
     fn pio_multi_command_batch_all_drain() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         {
             let mut bus = WorkerBus::new(0, threaded.shared.clone());
             // CTRL enable (0x000).
@@ -2009,11 +2043,20 @@ mod tests {
         assert_eq!(pending.len(), 5, "five MMIO writes → five commands");
         assert_eq!(
             pending[0],
-            PioCommand::WriteCtrl { block: 0, val: 0b0011, alias: 0 }
+            PioCommand::WriteCtrl {
+                block: 0,
+                val: 0b0011,
+                alias: 0
+            }
         );
         assert_eq!(
             pending[1],
-            PioCommand::WriteInstrMem { block: 0, addr: 3, value: 0x1234, alias: 0 }
+            PioCommand::WriteInstrMem {
+                block: 0,
+                addr: 3,
+                value: 0x1234,
+                alias: 0
+            }
         );
         assert_eq!(
             pending[2],
@@ -2027,11 +2070,21 @@ mod tests {
         );
         assert_eq!(
             pending[3],
-            PioCommand::WriteReg { block: 0, offset: 0x010, val: 0xAA55_AA55, alias: 0 }
+            PioCommand::WriteReg {
+                block: 0,
+                offset: 0x010,
+                val: 0xAA55_AA55,
+                alias: 0
+            }
         );
         assert_eq!(
             pending[4],
-            PioCommand::WriteReg { block: 0, offset: 0x030, val: 0x0000_0001, alias: 0 }
+            PioCommand::WriteReg {
+                block: 0,
+                offset: 0x030,
+                val: 0x0000_0001,
+                alias: 0
+            }
         );
 
         // Apply all and verify observable end-state matches the write sequence.
@@ -2057,8 +2110,7 @@ mod tests {
     fn pio_ahb_read32_unmapped_offset_panics_under_debug() {
         use crate::core::CoreBus;
 
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         let mut bus = WorkerBus::new(0, threaded.shared.clone());
         // FSTAT at 0x5020_0004 — not yet wired.
         let _ = bus.read32(0x5020_0004, 0);
@@ -2086,11 +2138,13 @@ mod tests {
         // Halted cores stay at cycles=0, so systick_advance(0) must have
         // rewritten last_systick_cycles from (42, 99) to (0, 0).
         assert_eq!(
-            threaded.core0.as_ref().unwrap().ppb.last_systick_cycles, 0,
+            threaded.core0.as_ref().unwrap().ppb.last_systick_cycles,
+            0,
             "core0 phase-1 must call systick_advance"
         );
         assert_eq!(
-            threaded.core1.as_ref().unwrap().ppb.last_systick_cycles, 0,
+            threaded.core1.as_ref().unwrap().ppb.last_systick_cycles,
+            0,
             "core1 phase-1 must call systick_advance"
         );
     }
@@ -2102,8 +2156,7 @@ mod tests {
     /// overwrite the seeded pad state before coord reads it).
     #[test]
     fn update_gpio_merges_sio_pio_and_external() {
-        let threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
 
         // SIO drives bit 0 (out & oe).
         threaded.shared.gpio.write_out(0, 0x0000_0001);
@@ -2112,7 +2165,10 @@ mod tests {
         // (higher-indexed blocks overlay lower ones per §4.2).
         threaded.shared.pio.write_pads(2, 0x0000_0010, 0x0000_0011);
         // External stimulus forces bit 8 high.
-        threaded.shared.gpio.write_external(0x0000_0100, 0x0000_0100);
+        threaded
+            .shared
+            .gpio
+            .write_external(0x0000_0100, 0x0000_0100);
 
         update_gpio(&threaded.shared);
 
@@ -2155,8 +2211,7 @@ mod tests {
     /// that forgets the flag sees `None` rather than stale data.
     #[test]
     fn timings_disabled_by_default_yields_none() {
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
 
@@ -2172,8 +2227,7 @@ mod tests {
     /// quantum).
     #[test]
     fn timings_enabled_records_n_samples_per_worker() {
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
         threaded.set_timing_enabled(true);
@@ -2187,7 +2241,8 @@ mod tests {
         assert_eq!(rt.samples(), n as usize);
         for s in rt.summary() {
             assert_eq!(
-                s.samples, n as usize,
+                s.samples,
+                n as usize,
                 "worker {} must record n samples",
                 s.name().as_str()
             );
@@ -2207,8 +2262,7 @@ mod tests {
     /// where a consumer sees a non-`None` from the *previous* run.
     #[test]
     fn timings_reset_when_disabled_between_runs() {
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
 
@@ -2311,11 +2365,7 @@ mod tests {
     ///
     /// After one-or-more `run_quanta` calls, `shared.pio.read_pads(block_idx)`
     /// reports `(1 << set_pin, 1 << set_pin)` (pad_out, pad_oe).
-    fn queue_pio_blinky_setup(
-        shared: &SharedState,
-        block_idx: u8,
-        set_pin: u8,
-    ) {
+    fn queue_pio_blinky_setup(shared: &SharedState, block_idx: u8, set_pin: u8) {
         // Program: addr 0 = SET PINS, 1; addr 1 = JMP 0.
         let set_pins_1: u16 = 0xE001;
         let jmp_0: u16 = 0x0000;
@@ -2391,8 +2441,7 @@ mod tests {
         const PIN_A: u8 = 10;
         const PIN_B: u8 = 20;
 
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         // Halt both cores — we only care about the PIO workers.
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
@@ -2417,8 +2466,16 @@ mod tests {
             "PIO2 pad_oe must drive pin {PIN_B} exclusively (got {oe2:#x})",
         );
         // And the driven bit on each side must be high (SET PINS, 1 ran).
-        assert_ne!(out1 & (1u32 << PIN_A), 0, "PIO1 pad_out bit PIN_A must be 1");
-        assert_ne!(out2 & (1u32 << PIN_B), 0, "PIO2 pad_out bit PIN_B must be 1");
+        assert_ne!(
+            out1 & (1u32 << PIN_A),
+            0,
+            "PIO1 pad_out bit PIN_A must be 1"
+        );
+        assert_ne!(
+            out2 & (1u32 << PIN_B),
+            0,
+            "PIO2 pad_out bit PIN_B must be 1"
+        );
         // Cross-check: PIO1 did not drive PIO2's pin and vice versa.
         assert_eq!(oe1 & (1u32 << PIN_B), 0, "PIO1 must not drive PIO2's pin");
         assert_eq!(oe2 & (1u32 << PIN_A), 0, "PIO2 must not drive PIO1's pin");
@@ -2448,8 +2505,7 @@ mod tests {
         const ENABLE_SM_MASK_1: u32 = 0b0010;
         const ENABLE_SM_MASK_2: u32 = 0b0100;
 
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
 
@@ -2507,8 +2563,7 @@ mod tests {
     fn disabled_block_still_publishes_stable_pads() {
         const PIN: u8 = 15;
 
-        let mut threaded =
-            ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
         threaded.shared.atomics.set_halted(0);
         threaded.shared.atomics.set_halted(1);
 
@@ -2572,8 +2627,7 @@ mod tests {
     #[test]
     fn test_panic_on_pio_worker_poisons_emulator_and_names_block() {
         for block in 0..3u8 {
-            let mut threaded =
-                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
             threaded.shared.atomics.set_halted(0);
             threaded.shared.atomics.set_halted(1);
 
@@ -2583,12 +2637,9 @@ mod tests {
                 .send_command(PioCommand::TestPanic { block });
 
             let expected_name = format!("pio{block}");
-            let result = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| threaded.run_quanta(1)),
-            );
-            let payload = result.expect_err(
-                "run_quanta must panic when a PIO worker panics",
-            );
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| threaded.run_quanta(1)));
+            let payload = result.expect_err("run_quanta must panic when a PIO worker panics");
             let msg = payload
                 .downcast_ref::<String>()
                 .map(String::as_str)
@@ -2612,12 +2663,9 @@ mod tests {
             // Contract: a second `run_quanta` on the poisoned instance
             // panics early with the "poisoned" assertion — proving the
             // instance cannot be reused.
-            let reuse = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| threaded.run_quanta(1)),
-            );
-            let reuse_err = reuse.expect_err(
-                "reuse of a poisoned ThreadedEmulator must panic",
-            );
+            let reuse =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| threaded.run_quanta(1)));
+            let reuse_err = reuse.expect_err("reuse of a poisoned ThreadedEmulator must panic");
             let reuse_msg = reuse_err
                 .downcast_ref::<String>()
                 .map(String::as_str)
@@ -2726,12 +2774,17 @@ mod tests {
             // write does not reach it.
             block.write32(0x048, 0x1234, 0); // INSTR_MEM0
             let before = block.read32(0x048);
-            apply_pio_command(&mut block, 0, &pio, PioCommand::WriteInstrMem {
-                block: 0,
-                addr: 33, // >= 32, skipped
-                value: 0xABCD,
-                alias: 0,
-            });
+            apply_pio_command(
+                &mut block,
+                0,
+                &pio,
+                PioCommand::WriteInstrMem {
+                    block: 0,
+                    addr: 33, // >= 32, skipped
+                    value: 0xABCD,
+                    alias: 0,
+                },
+            );
             // No panic, no effect.
             assert_eq!(block.read32(0x048), before);
         }
@@ -2742,13 +2795,18 @@ mod tests {
         fn apply_pio_command_setclkdiv_out_of_range_skips() {
             let pio = ThreadedPio::new();
             let mut block = PioBlock::new();
-            apply_pio_command(&mut block, 0, &pio, PioCommand::SetClkDiv {
-                block: 0,
-                sm: 4, // >= 4, skipped
-                int_div: 100,
-                frac_div: 0,
-                alias: 0,
-            });
+            apply_pio_command(
+                &mut block,
+                0,
+                &pio,
+                PioCommand::SetClkDiv {
+                    block: 0,
+                    sm: 4, // >= 4, skipped
+                    int_div: 100,
+                    frac_div: 0,
+                    alias: 0,
+                },
+            );
             // No panic — SM0 CLKDIV at 0x0C8 stays at its post-reset value.
             // We only assert absence of panic; the specific post-reset
             // value is implementation detail that may change.
@@ -2760,12 +2818,11 @@ mod tests {
         #[test]
         fn tick_peripherals_held_peripherals_skip_advance() {
             use crate::bus::{
-                RESET_ADC, RESET_I2C0, RESET_I2C1, RESET_PWM, RESET_SPI0,
-                RESET_SPI1, RESET_TIMER0, RESET_TIMER1, RESET_UART0, RESET_UART1,
+                RESET_ADC, RESET_I2C0, RESET_I2C1, RESET_PWM, RESET_SPI0, RESET_SPI1, RESET_TIMER0,
+                RESET_TIMER1, RESET_UART0, RESET_UART1,
             };
 
-            let mut threaded =
-                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
             threaded.shared.atomics.set_halted(0);
             threaded.shared.atomics.set_halted(1);
 
@@ -2815,17 +2872,13 @@ mod tests {
         /// the `wfe_waiting` early-wake branch.
         #[test]
         fn wfe_waiting_early_wake_via_event_flag() {
-            let mut threaded =
-                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
             threaded.shared.atomics.set_halted(0);
             threaded.shared.atomics.set_halted(1);
             // Put core 0 into WFE-waiting, then pre-arm the event flag —
             // the first quantum's top-of-loop drain clears both.
             threaded.shared.atomics.set_wfe_waiting(0);
-            threaded.shared.atomics.event_flag[0].store(
-                true,
-                std::sync::atomic::Ordering::Release,
-            );
+            threaded.shared.atomics.event_flag[0].store(true, std::sync::atomic::Ordering::Release);
             threaded.run_quanta(1);
             assert!(
                 !threaded.shared.atomics.is_wfe_waiting(0),
@@ -2838,10 +2891,9 @@ mod tests {
         /// their true branch for those peripherals too.
         #[test]
         fn tick_peripherals_all_released_drives_every_arm() {
-            use crate::bus::{RESET_UART1, RESET_SPI1, RESET_I2C1, RESET_TIMER1};
+            use crate::bus::{RESET_I2C1, RESET_SPI1, RESET_TIMER1, RESET_UART1};
 
-            let mut threaded =
-                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
             threaded.shared.atomics.set_halted(0);
             threaded.shared.atomics.set_halted(1);
 
@@ -2893,10 +2945,14 @@ mod tests {
             let sp: u32 = 0x2001_0000;
             let reset_pc: u32 = 0x2000_0101; // Thumb bit
             let vectors: [u8; 8] = [
-                (sp & 0xFF) as u8, (sp >> 8 & 0xFF) as u8,
-                (sp >> 16 & 0xFF) as u8, (sp >> 24 & 0xFF) as u8,
-                (reset_pc & 0xFF) as u8, (reset_pc >> 8 & 0xFF) as u8,
-                (reset_pc >> 16 & 0xFF) as u8, (reset_pc >> 24 & 0xFF) as u8,
+                (sp & 0xFF) as u8,
+                (sp >> 8 & 0xFF) as u8,
+                (sp >> 16 & 0xFF) as u8,
+                (sp >> 24 & 0xFF) as u8,
+                (reset_pc & 0xFF) as u8,
+                (reset_pc >> 8 & 0xFF) as u8,
+                (reset_pc >> 16 & 0xFF) as u8,
+                (reset_pc >> 24 & 0xFF) as u8,
             ];
             emu.load_image(0x2000_0000, &vectors);
             // Point core 0 at the reset vector. Bypass bootrom by setting
@@ -2941,8 +2997,7 @@ mod tests {
         /// the merge branch.
         #[test]
         fn core_worker_merges_pending_irq() {
-            let mut threaded =
-                ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
             threaded.shared.atomics.set_halted(0);
             threaded.shared.atomics.set_halted(1);
             threaded.shared.atomics.assert_irq(0, 7);

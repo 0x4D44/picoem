@@ -221,8 +221,12 @@ mod tests {
         let mut emu = Emulator::new(Config::default());
         emu.load_bootrom(&pinned_bootrom());
         let cs = emu.cores.expect_arm();
-        let pc_s = cs[0].bootrom_reboot_hook_pc_s.expect("S hook PC must be populated");
-        let pc_ns = cs[0].bootrom_reboot_hook_pc_ns.expect("NS hook PC must be populated");
+        let pc_s = cs[0]
+            .bootrom_reboot_hook_pc_s
+            .expect("S hook PC must be populated");
+        let pc_ns = cs[0]
+            .bootrom_reboot_hook_pc_ns
+            .expect("NS hook PC must be populated");
         assert_eq!(pc_ns, pc_s + 0x8000);
         // Core 1 mirrors core 0 — both seeded by load_bootrom.
         assert_eq!(cs[1].bootrom_reboot_hook_pc_s, Some(pc_s));
@@ -266,7 +270,9 @@ mod tests {
         // stores it via `set_pc(operand & !1)`. We re-set the bit so
         // the masking step is exercised explicitly here.
         let branch_target = pc_s | 1;
-        emu.cores.expect_arm_mut()[0].regs.set_pc(branch_target & !1);
+        emu.cores.expect_arm_mut()[0]
+            .regs
+            .set_pc(branch_target & !1);
         // Make sure it isn't halted before stepping.
         emu.cores.expect_arm_mut()[0].wake();
 
@@ -344,7 +350,9 @@ mod tests {
         emu.cores.expect_arm_mut()[1].halt();
         // Stage via the production branch path (see fires_when_pc_matches).
         let branch_target = pc_ns | 1;
-        emu.cores.expect_arm_mut()[0].regs.set_pc(branch_target & !1);
+        emu.cores.expect_arm_mut()[0]
+            .regs
+            .set_pc(branch_target & !1);
         emu.cores.expect_arm_mut()[0].wake();
 
         emu.step().unwrap();

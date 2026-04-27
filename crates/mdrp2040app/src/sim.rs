@@ -9,8 +9,8 @@ use std::time::Instant;
 use mdrp2040::{Config, Emulator, Pacer};
 
 use crate::devices::bench::BenchmarkPoller;
-use mdpicoem_devices::LcdDecoder;
 use crate::snapshot::Snapshot;
+use mdpicoem_devices::LcdDecoder;
 
 pub struct FirmwareBytes {
     pub bootrom: Vec<u8>,

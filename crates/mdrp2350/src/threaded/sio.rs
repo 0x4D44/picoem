@@ -154,8 +154,16 @@ impl ThreadedSio {
         };
         let vld = if !read_q.is_empty() { FIFO_ST_VLD } else { 0 };
         let rdy = if !write_q.is_full() { FIFO_ST_RDY } else { 0 };
-        let wof = if self.fifo_wof[core].load(Relaxed) { FIFO_ST_WOF } else { 0 };
-        let roe = if self.fifo_roe[core].load(Relaxed) { FIFO_ST_ROE } else { 0 };
+        let wof = if self.fifo_wof[core].load(Relaxed) {
+            FIFO_ST_WOF
+        } else {
+            0
+        };
+        let roe = if self.fifo_roe[core].load(Relaxed) {
+            FIFO_ST_ROE
+        } else {
+            0
+        };
         vld | rdy | wof | roe
     }
 
@@ -182,11 +190,7 @@ impl ThreadedSio {
         debug_assert!(id < 32);
         let mask = 1u32 << id;
         let prev = self.spinlocks.fetch_or(mask, Acquire);
-        if prev & mask == 0 {
-            mask
-        } else {
-            0
-        }
+        if prev & mask == 0 { mask } else { 0 }
     }
 
     /// Release a spinlock. Hardware ignores the written value, so the API

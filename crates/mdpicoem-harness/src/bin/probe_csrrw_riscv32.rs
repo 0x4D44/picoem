@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile, REG_RV_PC};
 use mdpicoem_harness::riscv_gen::{
-    encode_csr, encode_i_type, encode_s_type, encode_u_type, OPC_LOAD, OPC_OP_IMM, OPC_STORE,
+    OPC_OP_IMM, OPC_STORE, encode_csr, encode_i_type, encode_s_type, encode_u_type,
 };
 
 // virt machine's RAM base — 256 MiB at 0x8000_0000. Root cause of the
@@ -158,7 +158,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // a0 = SCRATCH
     prog.push(encode_u_type(SCRATCH & 0xFFFF_F000, X_A0, OPC_LUI));
-    prog.push(encode_i_type((SCRATCH as i32) & 0xFFF, X_A0, 0b000, X_A0, OPC_OP_IMM));
+    prog.push(encode_i_type(
+        (SCRATCH as i32) & 0xFFF,
+        X_A0,
+        0b000,
+        X_A0,
+        OPC_OP_IMM,
+    ));
 
     let csrs = [
         (CSR_MSCRATCH, WRITE_MSCRATCH, 0),
@@ -168,7 +174,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (csr, val, off) in csrs {
         // t0 = val
         prog.push(encode_u_type(val & 0xFFFF_F000, X_T0, OPC_LUI));
-        prog.push(encode_i_type((val as i32) & 0xFFF, X_T0, 0b000, X_T0, OPC_OP_IMM));
+        prog.push(encode_i_type(
+            (val as i32) & 0xFFF,
+            X_T0,
+            0b000,
+            X_T0,
+            OPC_OP_IMM,
+        ));
         // t1 = csrrs csr, x0 (read)
         prog.push(encode_csr(csr, X_ZERO, F3_RS, X_T1));
         // t3 = csrrw csr, t0 (swap old with new; t3 = old CSR value after instruction)
@@ -223,8 +235,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("=== csrrw probe result ===");
-    println!("Probe terminator PC expected: {term:#010x}, actual: {pc_final:#010x}  ({})",
-             if pc_final == term { "hit bp" } else { "MISSED TERMINATOR" });
+    println!(
+        "Probe terminator PC expected: {term:#010x}, actual: {pc_final:#010x}  ({})",
+        if pc_final == term {
+            "hit bp"
+        } else {
+            "MISSED TERMINATOR"
+        }
+    );
 
     let read_u32 = |buf: &[u8], off: usize| -> u32 {
         u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
@@ -248,8 +266,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if after == *write_val {
             println!("  -> VERDICT: csrrw TOOK EFFECT on {name}");
         } else {
-            println!("  -> VERDICT: csrrw did NOT take effect on {name} (after == before = {})",
-                     before == after);
+            println!(
+                "  -> VERDICT: csrrw did NOT take effect on {name} (after == before = {})",
+                before == after
+            );
         }
     }
 
@@ -258,11 +278,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mhartid = read_u32(&scratch, 44);
     println!();
     println!("environment CSRs:");
-    println!("  mstatus = {mstatus:#010x}  (MPP[12:11] = 0b{:02b}, MIE[3] = {})",
-             (mstatus >> 11) & 0x3,
-             (mstatus >> 3) & 1);
-    println!("  misa    = {misa:#010x}  (MXL[31:30] = {}, priv-M-enabled bit not checked)",
-             (misa >> 30) & 0x3);
+    println!(
+        "  mstatus = {mstatus:#010x}  (MPP[12:11] = 0b{:02b}, MIE[3] = {})",
+        (mstatus >> 11) & 0x3,
+        (mstatus >> 3) & 1
+    );
+    println!(
+        "  misa    = {misa:#010x}  (MXL[31:30] = {}, priv-M-enabled bit not checked)",
+        (misa >> 30) & 0x3
+    );
     println!("  mhartid = {mhartid:#010x}");
 
     // Sanity: verify the probe bytes match what we wrote.
@@ -271,8 +295,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let got = read_u32(&prog_readback, i * 4);
         if got != *w {
             if mismatches < 3 {
-                println!("  mismatch at {:#010x}: wrote {:#010x}, read {:#010x}",
-                         PROBE_SLOT + (i as u32) * 4, w, got);
+                println!(
+                    "  mismatch at {:#010x}: wrote {:#010x}, read {:#010x}",
+                    PROBE_SLOT + (i as u32) * 4,
+                    w,
+                    got
+                );
             }
             mismatches += 1;
         }

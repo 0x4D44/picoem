@@ -30,8 +30,7 @@ fn roms_dir() -> PathBuf {
 fn load_firmware(name: &str) -> FirmwareBytes {
     let roms = roms_dir();
     FirmwareBytes {
-        bootrom: std::fs::read(roms.join("bootrom.bin"))
-            .expect("roms/rp2040/bootrom.bin missing"),
+        bootrom: std::fs::read(roms.join("bootrom.bin")).expect("roms/rp2040/bootrom.bin missing"),
         flash: std::fs::read(roms.join(name))
             .unwrap_or_else(|_| panic!("roms/rp2040/{name} missing")),
     }

@@ -36,8 +36,8 @@ const CYCCNTENA: u32 = 1 << 0;
 const NOP: u32 = 0xBF00;
 const MOVS_R0_42: u32 = 0x202A; // MOVS R0, #42
 const ADDS_R0_R0_1: u32 = 0x3001; // ADDS R0, R0, #1
-const LDR_R0_R1: u32 = 0x6808;    // LDR R0, [R1, #0] — 2-cycle load
-const MUL_R0_R1: u32 = 0x4348;    // MULS R0, R1, R0 — 1-cycle on M33
+const LDR_R0_R1: u32 = 0x6808; // LDR R0, [R1, #0] — 2-cycle load
+const MUL_R0_R1: u32 = 0x4348; // MULS R0, R1, R0 — 1-cycle on M33
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -326,7 +326,7 @@ fn test5_cyccnt_calibration(core: &mut Core, res: &mut Results) -> Result<(), pr
 
     // Measure LDR R0, [R1, #0] — needs R1 pointing to valid SRAM
     core.write_core_reg(RegisterId(1), 0x2000_0200u64)?; // R1 = scratch area
-    core.write_word_32(0x2000_0200, 0x1234_5678)?;       // put data there
+    core.write_word_32(0x2000_0200, 0x1234_5678)?; // put data there
     let mut ldr_counts = Vec::with_capacity(20);
     for _ in 0..20 {
         let c = measure_insn(core, LDR_R0_R1)?;
@@ -344,9 +344,7 @@ fn test5_cyccnt_calibration(core: &mut Core, res: &mut Results) -> Result<(), pr
 
     let ldr_min = *ldr_counts.iter().min().unwrap();
     let mul_min = *mul_counts.iter().min().unwrap();
-    println!(
-        "  Summary: NOP={nop_min} ADDS={adds_min} LDR={ldr_min} MUL={mul_min}"
-    );
+    println!("  Summary: NOP={nop_min} ADDS={adds_min} LDR={ldr_min} MUL={mul_min}");
     println!(
         "  Deltas from NOP: ADDS={} LDR={} MUL={}",
         adds_min as i32 - nop_min as i32,
@@ -379,10 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  NVM:  0x{:08X}..0x{:08X}", r.range.start, r.range.end);
             }
             MemoryRegion::Generic(r) => {
-                println!(
-                    "  Generic: 0x{:08X}..0x{:08X}",
-                    r.range.start, r.range.end
-                );
+                println!("  Generic: 0x{:08X}..0x{:08X}", r.range.start, r.range.end);
             }
         }
     }

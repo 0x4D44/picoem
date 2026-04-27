@@ -299,7 +299,11 @@ fn s61_apb_timer0_alarm0_write8_matrix() {
         let seed = bus.read32(addr, 0);
         bus.write8(addr + lane as u32, 0xCD, 0);
         let want = splice_byte(seed, lane, 0xCD);
-        assert_eq!(bus.read32(addr, 0), want, "TIMER0 ALARM0 write8 lane {lane}");
+        assert_eq!(
+            bus.read32(addr, 0),
+            want,
+            "TIMER0 ALARM0 write8 lane {lane}"
+        );
     }
 }
 
@@ -453,7 +457,10 @@ fn s61_sio_interp_pop_peek_narrow_write_is_no_op() {
         accum0_before, accum0_after,
         "INTERP0 POP/PEEK narrow writes must not side-effect ACCUM0"
     );
-    assert!(!bus.bus_fault(0), "INTERP0 POP/PEEK narrow writes must not fault");
+    assert!(
+        !bus.bus_fault(0),
+        "INTERP0 POP/PEEK narrow writes must not fault"
+    );
 }
 
 // --- §6.1 Boot RAM aperture ---
@@ -466,7 +473,11 @@ fn s61_boot_ram_write8_matrix() {
         let seed = bus.read32(BOOT_RAM_BASE + 0x100, 0);
         bus.write8(BOOT_RAM_BASE + 0x100 + lane as u32, 0x11, 0);
         let want = splice_byte(seed, lane, 0x11);
-        assert_eq!(bus.read32(BOOT_RAM_BASE + 0x100, 0), want, "boot_ram w8 lane {lane}");
+        assert_eq!(
+            bus.read32(BOOT_RAM_BASE + 0x100, 0),
+            want,
+            "boot_ram w8 lane {lane}"
+        );
     }
 }
 
@@ -530,7 +541,11 @@ fn s61_ppb_shcsr_write16_matrix() {
         let seed = bus.read32(SCB_SHCSR, 0);
         bus.write16(SCB_SHCSR + (hw_lane * 2) as u32, 0x5566, 0);
         let want = splice_halfword(seed, hw_lane, 0x5566);
-        assert_eq!(bus.read32(SCB_SHCSR, 0), want, "SHCSR write16 hw_lane {hw_lane}");
+        assert_eq!(
+            bus.read32(SCB_SHCSR, 0),
+            want,
+            "SHCSR write16 hw_lane {hw_lane}"
+        );
     }
 }
 
@@ -609,7 +624,11 @@ fn s62_sspdr_halfword_write_pushes_one_frame() {
     bus.write16(SSPDR, 0xBEEF, 0);
     let sr_after = bus.read32(SPI0_BASE + 0x00C, 0);
     // After push, TX FIFO is non-empty → TFE=0.
-    assert_eq!(sr_after & 0x1, 0, "TFE should clear after halfword push to SSPDR");
+    assert_eq!(
+        sr_after & 0x1,
+        0,
+        "TFE should clear after halfword push to SSPDR"
+    );
 }
 
 #[test]
@@ -654,7 +673,10 @@ fn s62_adc_fifo_byte_write_is_swallowed() {
     bus.write8(ADC_FIFO + 2, 0x42, 0);
     bus.write8(ADC_FIFO + 3, 0x42, 0);
     let fcs_after = bus.read32(ADC_FCS, 0);
-    assert_eq!(fcs_before, fcs_after, "ADC FIFO byte write must not touch FCS");
+    assert_eq!(
+        fcs_before, fcs_after,
+        "ADC FIFO byte write must not touch FCS"
+    );
     assert_eq!(
         fcs_after & FCS_LEVEL_MASK,
         fcs_before & FCS_LEVEL_MASK,
@@ -726,7 +748,11 @@ fn s65_nvic_icpr1_byte_write_clears_only_target_lane() {
     bus.write32(NVIC_ISPR1, 0x0000_0101, 0);
     bus.write8(NVIC_ICPR1 + 1, 0x01, 0);
     let got = bus.read32(NVIC_ISPR1, 0);
-    assert_eq!(got & 1, 1, "bit 0 of ICPR1 must survive byte clear of lane 1");
+    assert_eq!(
+        got & 1,
+        1,
+        "bit 0 of ICPR1 must survive byte clear of lane 1"
+    );
     assert_eq!(got & (1 << 8), 0, "bit 8 should be cleared");
 }
 
@@ -737,8 +763,11 @@ fn s65_nvic_icer0_byte_write_clears_only_target_lane() {
     bus.write32(NVIC_ISER0, 0x0000_0808, 0);
     bus.write8(NVIC_ICER0 + 1, 0x08, 0);
     let got = bus.read32(NVIC_ISER0, 0);
-    assert_eq!(got & 0x0000_0008, 0x0000_0008,
-        "NVIC_ICER0 byte-clear lane 1 must not disturb bit 3");
+    assert_eq!(
+        got & 0x0000_0008,
+        0x0000_0008,
+        "NVIC_ICER0 byte-clear lane 1 must not disturb bit 3"
+    );
     assert_eq!(got & (1 << 11), 0);
 }
 
@@ -1243,7 +1272,11 @@ fn s65_icsr_byte_write_preserves_pendsv_w1s() {
     // Pend PendSV.
     bus.write32(SCB_ICSR, ICSR_PENDSVSET, 0);
     let icsr_before = bus.read32(SCB_ICSR, 0);
-    assert_ne!(icsr_before & ICSR_PENDSVSET, 0, "test setup: PENDSVSET should be set");
+    assert_ne!(
+        icsr_before & ICSR_PENDSVSET,
+        0,
+        "test setup: PENDSVSET should be set"
+    );
     // Byte-read lane 3 (contains PENDSVSET bit 28).
     let lane3 = bus.read8(SCB_ICSR + 3, 0);
     assert_eq!(lane3 & 0x10, 0x10, "PENDSVSET visible in lane 3 read");
@@ -1328,4 +1361,3 @@ fn s67_write16_unmapped_sets_bus_fault() {
         "write16 on unmapped region must set bus_fault — HLD §6.7"
     );
 }
-

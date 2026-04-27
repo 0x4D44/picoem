@@ -116,7 +116,14 @@ fn capture_block(bus: &mut Bus, block: u8) -> PioSnapshot {
         };
     }
 
-    PioSnapshot { block, ctrl, instr_mem, sms, dbg_padout, dbg_padoe }
+    PioSnapshot {
+        block,
+        ctrl,
+        instr_mem,
+        sms,
+        dbg_padout,
+        dbg_padoe,
+    }
 }
 
 #[cfg(test)]
@@ -135,7 +142,9 @@ mod tests {
     fn new_bus() -> mdrp2350::Emulator {
         // Build an emulator so we can use its `Bus` — the bus alone can't
         // be constructed directly from outside the crate.
-        EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible")
+        EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build is infallible")
     }
 
     fn release_pio_reset(bus: &mut Bus) {

@@ -54,7 +54,10 @@ pub struct Trng {
 
 impl Trng {
     pub fn new() -> Self {
-        Self { counter: 0, regs: std::collections::HashMap::new() }
+        Self {
+            counter: 0,
+            regs: std::collections::HashMap::new(),
+        }
     }
 
     /// Read a word. `EHR_DATA0` returns and advances the counter;
@@ -79,8 +82,11 @@ impl Trng {
             EHR_DATA0_OFFSET | TRNG_VALID_OFFSET => {
                 // RO — ignore.
             }
-            RNG_IMR_OFFSET | TRNG_ISR_OFFSET | TRNG_ICR_OFFSET
-            | TRNG_CONFIG_OFFSET | RND_SOURCE_ENABLE_OFFSET => {
+            RNG_IMR_OFFSET
+            | TRNG_ISR_OFFSET
+            | TRNG_ICR_OFFSET
+            | TRNG_CONFIG_OFFSET
+            | RND_SOURCE_ENABLE_OFFSET => {
                 let stored = self.regs.entry(offset).or_insert(0);
                 super::apply_alias_rmw(stored, value, alias);
             }

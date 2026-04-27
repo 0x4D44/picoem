@@ -13,14 +13,14 @@ use crate::Bus;
 /// and traceable to the HLD §4.5 table.
 pub(crate) mod cause {
     pub(crate) const INSTR_ADDR_MISALIGNED: u32 = 0;
-    pub(crate) const INSTR_ACCESS_FAULT:    u32 = 1;
-    pub(crate) const ILLEGAL_INSTRUCTION:   u32 = 2;
-    pub(crate) const BREAKPOINT:            u32 = 3;
-    pub(crate) const LOAD_ADDR_MISALIGNED:  u32 = 4;
-    pub(crate) const LOAD_ACCESS_FAULT:     u32 = 5;
+    pub(crate) const INSTR_ACCESS_FAULT: u32 = 1;
+    pub(crate) const ILLEGAL_INSTRUCTION: u32 = 2;
+    pub(crate) const BREAKPOINT: u32 = 3;
+    pub(crate) const LOAD_ADDR_MISALIGNED: u32 = 4;
+    pub(crate) const LOAD_ACCESS_FAULT: u32 = 5;
     pub(crate) const STORE_ADDR_MISALIGNED: u32 = 6;
-    pub(crate) const STORE_ACCESS_FAULT:    u32 = 7;
-    pub(crate) const ECALL_FROM_M:          u32 = 11;
+    pub(crate) const STORE_ACCESS_FAULT: u32 = 7;
+    pub(crate) const ECALL_FROM_M: u32 = 11;
 }
 
 impl Hazard3 {

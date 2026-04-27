@@ -469,14 +469,8 @@ fn bench_spsc_queue() {
         let elapsed = start.elapsed();
         let mops = ELEMENTS as f64 / elapsed.as_secs_f64() / 1e6;
 
-        println!(
-            "\n4. SPSC queue ({}M elements)",
-            ELEMENTS / 1_000_000
-        );
-        println!(
-            "   Lock-free (cap={}): {:.1} Mops/s",
-            CAPACITY, mops
-        );
+        println!("\n4. SPSC queue ({}M elements)", ELEMENTS / 1_000_000);
+        println!("   Lock-free (cap={}): {:.1} Mops/s", CAPACITY, mops);
     }
 
     // 4b. std::sync::mpsc::sync_channel(8) as a baseline comparison.
@@ -710,7 +704,10 @@ fn bench_prod_barrier_asymmetric(
     rounds: usize,
     late_delay: Duration,
 ) -> BarrierStats {
-    assert!(parties >= 3, "asymmetric case needs ≥ sampler + late + peer");
+    assert!(
+        parties >= 3,
+        "asymmetric case needs ≥ sampler + late + peer"
+    );
     let barrier = Arc::new(ProdSpinBarrier::new(parties));
 
     // Warmup — run a symmetric warmup (no staggering) just to prime
@@ -897,7 +894,10 @@ fn bench_param_barrier_asymmetric(
     late_delay: Duration,
     spin_budget: u32,
 ) -> SweepStats {
-    assert!(parties >= 3, "asymmetric case needs ≥ sampler + late + peer");
+    assert!(
+        parties >= 3,
+        "asymmetric case needs ≥ sampler + late + peer"
+    );
     let barrier = Arc::new(ParamSpinBarrier::new(parties, spin_budget));
 
     // Warmup — prime OS scheduler and caches.
@@ -973,7 +973,10 @@ fn bench_param_barrier_asymmetric(
 }
 
 fn print_sweep_table(rows: &[SweepStats]) {
-    println!("   {:>11} {:>10} {:>10} {:>10} {:>10}", "spin_budget", "mean_ns", "p50_ns", "p99_ns", "samples");
+    println!(
+        "   {:>11} {:>10} {:>10} {:>10} {:>10}",
+        "spin_budget", "mean_ns", "p50_ns", "p99_ns", "samples"
+    );
     println!("   {}", "-".repeat(11 + 1 + 10 + 1 + 10 + 1 + 10 + 1 + 10));
     for r in rows {
         println!(
@@ -1240,15 +1243,12 @@ fn main() {
     // pattern, on a local parameterised-budget clone of the production
     // barrier. Goal: locate the knee where early arrivers stay on the
     // spin path through the 2 µs stagger and nobody parks.
-    println!("\n8. Parameterised SpinBarrier SPIN_BUDGET sweep (6-way asymmetric 2µs, EARLY sampler)");
+    println!(
+        "\n8. Parameterised SpinBarrier SPIN_BUDGET sweep (6-way asymmetric 2µs, EARLY sampler)"
+    );
     let mut sweep_early: Vec<SweepStats> = Vec::new();
     for &budget in &[128u32, 256, 512, 1024, 2048, 4096, 8192] {
-        let row = bench_param_barrier_asymmetric(
-            6,
-            GATE_ROUNDS,
-            Duration::from_micros(2),
-            budget,
-        );
+        let row = bench_param_barrier_asymmetric(6, GATE_ROUNDS, Duration::from_micros(2), budget);
         sweep_early.push(row);
     }
     print_sweep_table(&sweep_early);
@@ -1263,15 +1263,12 @@ fn main() {
     // wait() pays notify_all-on-5-parked (~1-3 µs mean). At b=1024+ no
     // peer has parked — they're all on the spin path waiting for the
     // generation store — and notify_all is essentially free.
-    println!("\n9. Parameterised SpinBarrier SPIN_BUDGET sweep (6-way asymmetric 2µs, LATE sampler)");
+    println!(
+        "\n9. Parameterised SpinBarrier SPIN_BUDGET sweep (6-way asymmetric 2µs, LATE sampler)"
+    );
     let mut sweep_late: Vec<SweepStats> = Vec::new();
     for &budget in &[128u32, 256, 512, 1024, 2048, 4096] {
-        let row = bench_param_barrier_late_tail(
-            6,
-            GATE_ROUNDS,
-            Duration::from_micros(2),
-            budget,
-        );
+        let row = bench_param_barrier_late_tail(6, GATE_ROUNDS, Duration::from_micros(2), budget);
         sweep_late.push(row);
     }
     print_sweep_table(&sweep_late);

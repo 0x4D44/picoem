@@ -36,9 +36,7 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use mdpicoem_harness::{
-    onerom_glue_dma, onerom_serving_oracle, onerom_stress, onerom_sync,
-};
+use mdpicoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_stress, onerom_sync};
 use mdrp2350::{Config, Emulator, EmulatorBuilder};
 
 // ---------------------------------------------------------------------------
@@ -46,8 +44,7 @@ use mdrp2350::{Config, Emulator, EmulatorBuilder};
 // ---------------------------------------------------------------------------
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-const FLASH_PATH: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541.bin";
+const FLASH_PATH: &str = "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541.bin";
 
 /// ROM set index parsed from the fixture. `0` = 1541 $E000 kernal
 /// (901229-06AA). The PIO firmware writes this into SRAM by sync time;
@@ -177,9 +174,7 @@ fn boot_sync(
     // Up-front shadow-lift sanity check: confirm the hardcoded ROM set
     // parses out of the fixture. None here is a loud early signal that
     // the fixture / ROM_SET_INDEX pair is wrong.
-    if onerom_serving_oracle::lift_shadow_from_flash_pub(flash, ROM_SET_INDEX)
-        .is_none()
-    {
+    if onerom_serving_oracle::lift_shadow_from_flash_pub(flash, ROM_SET_INDEX).is_none() {
         return Err(format!(
             "failed to lift ROM set {} from fixture — wrong index or malformed flash",
             ROM_SET_INDEX
@@ -228,8 +223,7 @@ fn boot_sync(
 
     // Prime DMA + oracle after sync.
     glue.prime_after_sync(&mut emu.bus);
-    let oracle =
-        onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, flash);
+    let oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, flash);
     oracle.populate_sram_from_shadow(&mut emu.bus);
 
     Ok((emu, glue, oracle))
@@ -330,9 +324,7 @@ fn main() -> ExitCode {
 
     let sys_clk_hz = emu.bus.sys_clk_hz();
     if sys_clk_hz == 0 {
-        eprintln!(
-            "sys_clk_hz is 0 at sync — PLL not settled; cannot convert ns rungs"
-        );
+        eprintln!("sys_clk_hz is 0 at sync — PLL not settled; cannot convert ns rungs");
         return ExitCode::FAILURE;
     }
 
@@ -365,12 +357,8 @@ fn main() -> ExitCode {
             onerom_serving_oracle::Verdict::WrongByte { .. } => wrong_byte += 1,
             onerom_serving_oracle::Verdict::NoResolve => no_resolve += 1,
             onerom_serving_oracle::Verdict::NoStableByte => no_stable += 1,
-            onerom_serving_oracle::Verdict::ResolvedAddrOutOfRange { .. } => {
-                out_of_range += 1
-            }
-            onerom_serving_oracle::Verdict::LatencyOutOfEnvelope { .. } => {
-                out_of_envelope += 1
-            }
+            onerom_serving_oracle::Verdict::ResolvedAddrOutOfRange { .. } => out_of_range += 1,
+            onerom_serving_oracle::Verdict::LatencyOutOfEnvelope { .. } => out_of_envelope += 1,
         }
     }
 
@@ -383,10 +371,7 @@ fn main() -> ExitCode {
         ROM_SET_INDEX
     );
     println!("fixture:  {}", FLASH_PATH);
-    println!(
-        "cases:    {} (full address sweep, A11=A12=1)",
-        total_cases
-    );
+    println!("cases:    {} (full address sweep, A11=A12=1)", total_cases);
     {
         let mhz = sys_clk_hz as f64 / 1_000_000.0;
         let ns_per_cy = 1_000_000_000.0 / sys_clk_hz as f64;

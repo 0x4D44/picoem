@@ -19,10 +19,10 @@
 // Expansion.md` §Component 3 for the catalogue and measurement contract.
 
 use crate::cycle_cases::{
-    self, fresh_emulator as fresh_emulator_cycle, measure_emu as measure_emu_cycle, pack_seq,
-    pack_stub, CYCLE_SEQ_SLOT, STUB_START,
+    self, CYCLE_SEQ_SLOT, STUB_START, fresh_emulator as fresh_emulator_cycle,
+    measure_emu as measure_emu_cycle, pack_seq, pack_stub,
 };
-use crate::silicon_oracle::{self, enable_cyccnt, CaseOutcome, Verdict};
+use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt};
 use crate::{
     CYCLE_MAILBOX_BASE, DUALCORE_ANTAGONIST_SLOT, DUALCORE_CORE1_DATA, DUALCORE_CORE1_STACK,
     EMU_TEST_STACK,
@@ -185,32 +185,32 @@ const SEQ_CORE1_FIFO_POP: &[u16] = &[
 // touch r4..r7 on core 0.
 
 const INIT_CORE0_LDR_B0: &[(u8, u32)] = &[
-    (1, DUALCORE_CORE1_DATA),       // r1 = bank-0 data slot
+    (1, DUALCORE_CORE1_DATA), // r1 = bank-0 data slot
 ];
 
 const INIT_CORE1_LDR_B0: &[(u8, u32)] = &[
-    (2, DUALCORE_CORE1_DATA),       // r2 = bank-0 data slot (same bank as core 0)
+    (2, DUALCORE_CORE1_DATA), // r2 = bank-0 data slot (same bank as core 0)
 ];
 
 const INIT_CORE1_LDR_B1: &[(u8, u32)] = &[
-    (2, DUALCORE_CORE1_DATA + 4),   // r2 = bank-1 data slot (different bank)
+    (2, DUALCORE_CORE1_DATA + 4), // r2 = bank-1 data slot (different bank)
 ];
 
 const INIT_CORE0_SPINLOCK: &[(u8, u32)] = &[
-    (1, 0xD000_0100),               // r1 = SPINLOCK0 register
+    (1, 0xD000_0100), // r1 = SPINLOCK0 register
 ];
 
 const INIT_CORE1_SPINLOCK: &[(u8, u32)] = &[
-    (1, 0xD000_0100),               // r1 = SPINLOCK0 register
+    (1, 0xD000_0100), // r1 = SPINLOCK0 register
 ];
 
 const INIT_CORE0_FIFO: &[(u8, u32)] = &[
-    (0, 0xA5A5_A5A5),               // r0 = data payload
-    (1, 0xD000_0054),               // r1 = SIO_FIFO_WR
+    (0, 0xA5A5_A5A5), // r0 = data payload
+    (1, 0xD000_0054), // r1 = SIO_FIFO_WR
 ];
 
 const INIT_CORE1_FIFO: &[(u8, u32)] = &[
-    (1, 0xD000_0058),               // r1 = SIO_FIFO_RD
+    (1, 0xD000_0058), // r1 = SIO_FIFO_RD
 ];
 
 /// Initial catalogue. `emu_baseline` values are seeded conservatively;
@@ -401,22 +401,13 @@ fn measure_core0_hw(
 
     // Kick the mailbox and wait for DONE. Mailbox protocol matches
     // cycle_cases — GO=1, DONE=0, SEQ_PTR=CYCLE_SEQ_SLOT|1, ITER=K.
-    core.write_word_32(
-        (CYCLE_MAILBOX_BASE + cycle_cases::MBX_DONE) as u64,
-        0,
-    )?;
-    core.write_word_32(
-        (CYCLE_MAILBOX_BASE + cycle_cases::MBX_CYCLES) as u64,
-        0,
-    )?;
+    core.write_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_DONE) as u64, 0)?;
+    core.write_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_CYCLES) as u64, 0)?;
     core.write_word_32(
         (CYCLE_MAILBOX_BASE + cycle_cases::MBX_SEQ_PTR) as u64,
         CYCLE_SEQ_SLOT | 1,
     )?;
-    core.write_word_32(
-        (CYCLE_MAILBOX_BASE + cycle_cases::MBX_ITER) as u64,
-        k,
-    )?;
+    core.write_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_ITER) as u64, k)?;
     core.write_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_GO) as u64, 1)?;
 
     // NOTE: Assumption 1 dependency — this CYCCNT read assumes the ARMv8-M
@@ -428,8 +419,7 @@ fn measure_core0_hw(
     core.run()?;
     let deadline = Instant::now() + DONE_TIMEOUT;
     loop {
-        let done: u32 =
-            core.read_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_DONE) as u64)?;
+        let done: u32 = core.read_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_DONE) as u64)?;
         if done == 1 {
             break;
         }
@@ -440,8 +430,7 @@ fn measure_core0_hw(
         std::thread::sleep(Duration::from_millis(2));
     }
     core.halt(Duration::from_millis(200))?;
-    let cycles: u32 =
-        core.read_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_CYCLES) as u64)?;
+    let cycles: u32 = core.read_word_32((CYCLE_MAILBOX_BASE + cycle_cases::MBX_CYCLES) as u64)?;
     Ok(cycles)
 }
 
@@ -539,7 +528,10 @@ pub fn run_against(
     args: &DualCoreArgs,
     order: Option<&[&str]>,
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
-    debug_assert!(args.iter_high > args.iter_low, "iter_high must exceed iter_low");
+    debug_assert!(
+        args.iter_high > args.iter_low,
+        "iter_high must exceed iter_low"
+    );
 
     // Enable DWT on core 0 once. Idempotent; lets the binary wrapper be
     // minimal and lets future orchestrator integration call us without
@@ -596,10 +588,7 @@ pub fn run_against(
                 } else {
                     format!(
                         "hw={} emu={} delta={:+} tol={}",
-                        r.hw_per_iter,
-                        r.emu_per_iter,
-                        r.delta,
-                        effective_tol,
+                        r.hw_per_iter, r.emu_per_iter, r.delta, effective_tol,
                     )
                 };
                 outcomes.push(CaseOutcome {
@@ -859,7 +848,8 @@ mod tests {
                 assert!(
                     !c1.name.contains(c2.name),
                     "case '{}' is a substring of '{}'; filter aliasing",
-                    c2.name, c1.name,
+                    c2.name,
+                    c1.name,
                 );
             }
         }
@@ -900,8 +890,7 @@ mod tests {
     #[test]
     fn test_race_cases_have_tolerance_override() {
         for c in CASES {
-            let is_race =
-                c.name.contains("spinlock") || c.name.contains("fifo");
+            let is_race = c.name.contains("spinlock") || c.name.contains("fifo");
             if is_race {
                 assert!(
                     c.tolerance_override.is_some(),

@@ -10,22 +10,23 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::debug;
 
 use crate::bus::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
-use crate::threaded::CoreAtomics;
 use crate::dma::{DMA_BASE, Dma};
 use crate::dreq::{
     DREQ_I2C0_RX, DREQ_I2C0_TX, DREQ_I2C1_RX, DREQ_I2C1_TX, DREQ_SPI0_RX, DREQ_SPI0_TX,
     DREQ_SPI1_RX, DREQ_SPI1_TX, DREQ_UART0_RX, DREQ_UART0_TX, DREQ_UART1_RX, DREQ_UART1_TX,
 };
 use crate::irq::{
-    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP_0,
-    IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0,
-    IRQ_UART0_IRQ, IRQ_UART1_IRQ, PERIPH_IRQ_MASK,
+    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1,
+    IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0, IRQ_UART0_IRQ, IRQ_UART1_IRQ,
+    PERIPH_IRQ_MASK,
 };
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::{ADC_BASE, AdcRegs};
 use crate::peripherals::coresight_trace::{CORESIGHT_TRACE_BASE, CoresightTraceRegs};
 use crate::peripherals::i2c::{I2C0_BASE, I2C1_BASE, I2cRegs};
-use crate::peripherals::inert::{GLITCH_DETECTOR_BASE, GlitchDetector, SYSCFG_BASE, SysCfg, TBMAN_BASE, Tbman};
+use crate::peripherals::inert::{
+    GLITCH_DETECTOR_BASE, GlitchDetector, SYSCFG_BASE, SysCfg, TBMAN_BASE, Tbman,
+};
 use crate::peripherals::io_bank0::{IO_BANK0_BASE, IoBank0Regs};
 use crate::peripherals::otp::{OTP_DATA_BASE, OTP_DATA_SIZE, Otp};
 use crate::peripherals::pads_bank0::{PADS_BANK0_BASE, PadsBank0Regs};
@@ -42,6 +43,7 @@ use crate::peripherals::usb::{USBCTRL_DPRAM_BASE, USBCTRL_DPRAM_SIZE, USBCTRL_RE
 use crate::peripherals::watchdog::{WATCHDOG_BASE, WatchdogRegs};
 use crate::pio::PioBlock;
 use crate::sio::Sio;
+use crate::threaded::CoreAtomics;
 
 /// Number of entries in the PC-keyed decoded-op cache.
 /// Direct-mapped, indexed by `(pc >> 1) & (DECODE_CACHE_SIZE - 1)`.
@@ -86,7 +88,13 @@ impl DecodedOp {
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
-        Self { tag: u32::MAX, hw0: 0, hw1: 0, fetch_wait: 0, flags: 0 }
+        Self {
+            tag: u32::MAX,
+            hw0: 0,
+            hw1: 0,
+            fetch_wait: 0,
+            flags: 0,
+        }
     }
 
     #[inline(always)]
@@ -756,8 +764,10 @@ impl Bus {
     fn xip_sram_read32(&self, addr: u32) -> u32 {
         let off = (addr - 0x1C00_0000) as usize;
         u32::from_le_bytes([
-            self.xip_sram[off], self.xip_sram[off + 1],
-            self.xip_sram[off + 2], self.xip_sram[off + 3],
+            self.xip_sram[off],
+            self.xip_sram[off + 1],
+            self.xip_sram[off + 2],
+            self.xip_sram[off + 3],
         ])
     }
 
@@ -843,8 +853,8 @@ impl Bus {
     /// Returns None for core-local ports (SIO, PPB) that never contend.
     pub fn downstream_port(addr: u32) -> Option<u8> {
         match addr >> 28 {
-            0x0 => Some(0),  // ROM — single port
-            0x1 => Some(1),  // XIP — single port
+            0x0 => Some(0), // ROM — single port
+            0x1 => Some(1), // XIP — single port
             0x2 => {
                 // SRAM — per-bank ports
                 match bank_for_address(addr) {
@@ -1394,7 +1404,7 @@ impl Bus {
             0x5 => (1, 0), // AHB peripherals
             0xD => (1, 0), // SIO
             0xE => (1, 0), // PPB
-            _   => (1, 0), // unmapped
+            _ => (1, 0),   // unmapped
         }
     }
 
@@ -1407,7 +1417,7 @@ impl Bus {
             0x5 => (1, 0), // AHB peripherals
             0xD => (1, 0), // SIO
             0xE => (1, 0), // PPB
-            _   => (1, 0), // unmapped/ROM
+            _ => (1, 0),   // unmapped/ROM
         }
     }
 
@@ -1422,13 +1432,13 @@ impl Bus {
 
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
-            _   => addr & 0x0FFF_FFFF,
+            _ => addr & 0x0FFF_FFFF,
         };
         let val = match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
-            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
-                self.memory.xip_read8((addr - 0x1C00_0000) + self.xip_cache_offset)
-            }
+            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => self
+                .memory
+                .xip_read8((addr - 0x1C00_0000) + self.xip_cache_offset),
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read8(addr),
             0x1 => {
                 if !self.flash_loaded {
@@ -1553,8 +1563,7 @@ impl Bus {
                         // below. DPRAM accepts byte reads directly.
                         USBCTRL_REGS_BASE => self.usbctrl.read32(offset),
                         USBCTRL_DPRAM_BASE => {
-                            let dpram_off =
-                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
                             let v = self.usbctrl.read_dpram(dpram_off, 1) as u8;
                             if self.mmio_trace_enabled {
                                 self.emit_mmio_trace('R', 1, addr, v as u32, core);
@@ -1581,9 +1590,7 @@ impl Bus {
                 let word = match word_offset {
                     0x004 => self.gpio_in.load(Ordering::Relaxed),
                     0x008 => self.read_gpio_hi_in(),
-                    _ => {
-                        self.sio.read32(word_offset, core as usize)
-                    }
+                    _ => self.sio.read32(word_offset, core as usize),
                 };
                 word.to_le_bytes()[(addr & 3) as usize]
             }
@@ -1762,8 +1769,7 @@ impl Bus {
                             bytes[byte_idx] = val;
                             self.qmi_write(reg_offset, u32::from_le_bytes(bytes));
                         }
-                        0x4001_0000 | 0x4005_0000 | 0x4005_8000
-                        | 0x4004_8000 | 0x400E_8000 => {
+                        0x4001_0000 | 0x4005_0000 | 0x4005_8000 | 0x4004_8000 | 0x400E_8000 => {
                             // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
                             // peripherals that handle the atomic alias
                             // internally. For a subword SET/CLR/XOR we
@@ -1820,8 +1826,12 @@ impl Bus {
                                 ((val as u32) << (byte_idx * 8), alias)
                             };
                             match base {
-                                TIMER0_BASE => self.timer0.write32(reg_offset, word_val, pass_alias),
-                                TIMER1_BASE => self.timer1.write32(reg_offset, word_val, pass_alias),
+                                TIMER0_BASE => {
+                                    self.timer0.write32(reg_offset, word_val, pass_alias)
+                                }
+                                TIMER1_BASE => {
+                                    self.timer1.write32(reg_offset, word_val, pass_alias)
+                                }
                                 _ => {
                                     if self.ticks.write32(reg_offset, word_val, pass_alias) {
                                         self.timer0.invalidate_lazy();
@@ -1833,8 +1843,8 @@ impl Bus {
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore byte
                         }
-                        SYSCFG_BASE | TBMAN_BASE | GLITCH_DETECTOR_BASE
-                        | PSM_BASE | WATCHDOG_BASE => {
+                        SYSCFG_BASE | TBMAN_BASE | GLITCH_DETECTOR_BASE | PSM_BASE
+                        | WATCHDOG_BASE => {
                             // Inert / PSM / WATCHDOG narrow byte: same
                             // subword-alias strategy as CLOCKS. WATCHDOG
                             // TRIGGER write from a byte lane is not a real
@@ -1858,9 +1868,13 @@ impl Bus {
                                 ((val as u32) << (byte_idx * 8), alias)
                             };
                             match base {
-                                SYSCFG_BASE => self.syscfg.write32(reg_offset, word_val, pass_alias),
+                                SYSCFG_BASE => {
+                                    self.syscfg.write32(reg_offset, word_val, pass_alias)
+                                }
                                 TBMAN_BASE => self.tbman.write32(reg_offset, word_val, pass_alias),
-                                GLITCH_DETECTOR_BASE => self.glitch.write32(reg_offset, word_val, pass_alias),
+                                GLITCH_DETECTOR_BASE => {
+                                    self.glitch.write32(reg_offset, word_val, pass_alias)
+                                }
                                 PSM_BASE => self.psm.write32(reg_offset, word_val, pass_alias),
                                 _ => {
                                     if self.watchdog.write32(reg_offset, word_val, pass_alias) {
@@ -1873,8 +1887,7 @@ impl Bus {
                             // OTP narrow byte write — OR-only fuse
                             // semantics apply at the word level. Pack
                             // the byte into the correct lane and OR-merge.
-                            let otp_word_off =
-                                (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
+                            let otp_word_off = (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
                             let byte_idx = ((addr - OTP_DATA_BASE) & 3) as usize;
                             let word_val = (val as u32) << (byte_idx * 8);
                             self.otp.write32(otp_word_off, word_val);
@@ -1898,16 +1911,18 @@ impl Bus {
                             };
                             match base {
                                 TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
-                                SHA256_BASE => self.sha256.write32(reg_offset, word_val, pass_alias),
+                                SHA256_BASE => {
+                                    self.sha256.write32(reg_offset, word_val, pass_alias)
+                                }
                                 _ => {
-                                    let mask = self.powman.write32(reg_offset, word_val, pass_alias);
+                                    let mask =
+                                        self.powman.write32(reg_offset, word_val, pass_alias);
                                     self.raise_irqs_u64(mask);
                                 }
                             }
                         }
-                        UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
-                        | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
-                        | PADS_BANK0_BASE => {
+                        UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE | I2C1_BASE
+                        | ADC_BASE | PWM_BASE | IO_BANK0_BASE | PADS_BANK0_BASE => {
                             // Phase 2 peripherals that don't need narrow
                             // byte dispatch (already intercepted above for
                             // UART_DR / SSPDR / IC_DATA_CMD). Use the same
@@ -1937,15 +1952,57 @@ impl Bus {
                             };
                             let mut ext_irqs = 0u64;
                             match base {
-                                UART0_BASE => self.uart[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                UART1_BASE => self.uart[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                SPI0_BASE => self.spi[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                SPI1_BASE => self.spi[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                I2C0_BASE => self.i2c[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                I2C1_BASE => self.i2c[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                ADC_BASE => self.adc.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                PWM_BASE => self.pwm.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                IO_BANK0_BASE => self.io_bank0.write32(reg_offset, word_val, pass_alias),
+                                UART0_BASE => self.uart[0].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                UART1_BASE => self.uart[1].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                SPI0_BASE => self.spi[0].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                SPI1_BASE => self.spi[1].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                I2C0_BASE => self.i2c[0].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                I2C1_BASE => self.i2c[1].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                ADC_BASE => self.adc.write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                PWM_BASE => self.pwm.write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                IO_BANK0_BASE => {
+                                    self.io_bank0.write32(reg_offset, word_val, pass_alias)
+                                }
                                 _ => self.pads_bank0.write32(reg_offset, word_val, pass_alias),
                             }
                             self.raise_irqs_u64(ext_irqs);
@@ -1955,8 +2012,7 @@ impl Bus {
                         // DPRAM is plain memory and accepts byte writes.
                         USBCTRL_REGS_BASE => {}
                         USBCTRL_DPRAM_BASE => {
-                            let dpram_off =
-                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
                             self.usbctrl.write_dpram(dpram_off, val as u32, 1);
                         }
                         _ => {
@@ -1973,7 +2029,8 @@ impl Bus {
                                 3 => old_byte & !val,
                                 _ => unreachable!(),
                             };
-                            self.peripheral_regs.insert(word_addr, u32::from_le_bytes(bytes));
+                            self.peripheral_regs
+                                .insert(word_addr, u32::from_le_bytes(bytes));
                         }
                     }
                 }
@@ -2075,9 +2132,11 @@ impl Bus {
         // Phase 0b.1 Commit B: PPB addresses route through
         // `CortexM33::bus_read16`. Bus-level read16 is still reachable
         // from decode.rs (opcode fetch) and non-PPB tests.
-        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+        debug_assert!(
+            addr >> 28 != 0xE || Self::is_boot_ram(addr),
             "PPB address 0x{:08X} reached Bus::read16 — use CortexM33::bus_read16 wrapper",
-            addr);
+            addr
+        );
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -2085,13 +2144,13 @@ impl Bus {
 
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
-            _   => addr & 0x0FFF_FFFF,
+            _ => addr & 0x0FFF_FFFF,
         };
         let val = match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
-            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
-                self.memory.xip_read16((addr - 0x1C00_0000) + self.xip_cache_offset)
-            }
+            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => self
+                .memory
+                .xip_read16((addr - 0x1C00_0000) + self.xip_cache_offset),
             0x1 if Self::is_xip_sram(addr) => self.xip_sram_read16(addr),
             0x1 => {
                 if !self.flash_loaded {
@@ -2216,8 +2275,7 @@ impl Bus {
                         // narrow reads at the exact byte offset.
                         USBCTRL_REGS_BASE => self.usbctrl.read32(offset),
                         USBCTRL_DPRAM_BASE => {
-                            let dpram_off =
-                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
                             // Narrow halfword read direct from DPRAM.
                             let v = self.usbctrl.read_dpram(dpram_off & !1, 2);
                             if self.mmio_trace_enabled {
@@ -2246,9 +2304,7 @@ impl Bus {
                 let word = match word_offset {
                     0x004 => self.gpio_in.load(Ordering::Relaxed),
                     0x008 => self.read_gpio_hi_in(),
-                    _ => {
-                        self.sio.read32(word_offset, core as usize)
-                    }
+                    _ => self.sio.read32(word_offset, core as usize),
                 };
                 let half_idx = ((addr >> 1) & 1) as usize;
                 [word as u16, (word >> 16) as u16][half_idx]
@@ -2275,9 +2331,11 @@ impl Bus {
         let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses route through
         // `CortexM33::bus_write16`.
-        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+        debug_assert!(
+            addr >> 28 != 0xE || Self::is_boot_ram(addr),
             "PPB address 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
-            addr);
+            addr
+        );
         debug_assert!(
             addr >> 28 != 0xD || !crate::core::PerCoreSio::owns_offset(addr & 0xFFF),
             "DIV/INTERP addr 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
@@ -2422,10 +2480,12 @@ impl Bus {
                             let old_word = self.qmi_read(reg_offset);
                             let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
                             halves[half_idx] = val;
-                            self.qmi_write(reg_offset, (halves[0] as u32) | ((halves[1] as u32) << 16));
+                            self.qmi_write(
+                                reg_offset,
+                                (halves[0] as u32) | ((halves[1] as u32) << 16),
+                            );
                         }
-                        0x4001_0000 | 0x4005_0000 | 0x4005_8000
-                        | 0x4004_8000 | 0x400E_8000 => {
+                        0x4001_0000 | 0x4005_0000 | 0x4005_8000 | 0x4004_8000 | 0x400E_8000 => {
                             // CLOCKS / PLL_SYS / PLL_USB / XOSC / ROSC:
                             // same subword-alias strategy as `write8`
                             // (see the comment there).
@@ -2443,10 +2503,7 @@ impl Bus {
                                 let mut halves: [u16; 2] =
                                     [old_word as u16, (old_word >> 16) as u16];
                                 halves[half_idx] = val;
-                                (
-                                    (halves[0] as u32) | ((halves[1] as u32) << 16),
-                                    0,
-                                )
+                                ((halves[0] as u32) | ((halves[1] as u32) << 16), 0)
                             } else {
                                 ((val as u32) << (half_idx * 16), alias)
                             };
@@ -2473,16 +2530,17 @@ impl Bus {
                                 let mut halves: [u16; 2] =
                                     [old_word as u16, (old_word >> 16) as u16];
                                 halves[half_idx] = val;
-                                (
-                                    (halves[0] as u32) | ((halves[1] as u32) << 16),
-                                    0,
-                                )
+                                ((halves[0] as u32) | ((halves[1] as u32) << 16), 0)
                             } else {
                                 ((val as u32) << (half_idx * 16), alias)
                             };
                             match base {
-                                TIMER0_BASE => self.timer0.write32(reg_offset, word_val, pass_alias),
-                                TIMER1_BASE => self.timer1.write32(reg_offset, word_val, pass_alias),
+                                TIMER0_BASE => {
+                                    self.timer0.write32(reg_offset, word_val, pass_alias)
+                                }
+                                TIMER1_BASE => {
+                                    self.timer1.write32(reg_offset, word_val, pass_alias)
+                                }
                                 _ => {
                                     if self.ticks.write32(reg_offset, word_val, pass_alias) {
                                         self.timer0.invalidate_lazy();
@@ -2494,8 +2552,8 @@ impl Bus {
                         0x4002_0000 => {
                             // RESETS: only word-aligned writes meaningful, ignore halfword
                         }
-                        SYSCFG_BASE | TBMAN_BASE | GLITCH_DETECTOR_BASE
-                        | PSM_BASE | WATCHDOG_BASE => {
+                        SYSCFG_BASE | TBMAN_BASE | GLITCH_DETECTOR_BASE | PSM_BASE
+                        | WATCHDOG_BASE => {
                             // Inert / PSM / WATCHDOG halfword path — subword
                             // alias preservation.
                             let word_addr = canonical & !3;
@@ -2517,9 +2575,13 @@ impl Bus {
                                 ((val as u32) << (half_idx * 16), alias)
                             };
                             match base {
-                                SYSCFG_BASE => self.syscfg.write32(reg_offset, word_val, pass_alias),
+                                SYSCFG_BASE => {
+                                    self.syscfg.write32(reg_offset, word_val, pass_alias)
+                                }
                                 TBMAN_BASE => self.tbman.write32(reg_offset, word_val, pass_alias),
-                                GLITCH_DETECTOR_BASE => self.glitch.write32(reg_offset, word_val, pass_alias),
+                                GLITCH_DETECTOR_BASE => {
+                                    self.glitch.write32(reg_offset, word_val, pass_alias)
+                                }
                                 PSM_BASE => self.psm.write32(reg_offset, word_val, pass_alias),
                                 _ => {
                                     if self.watchdog.write32(reg_offset, word_val, pass_alias) {
@@ -2531,8 +2593,7 @@ impl Bus {
                         OTP_DATA_BASE => {
                             // OTP narrow halfword write — OR-only fuse
                             // semantics at the word level.
-                            let otp_word_off =
-                                (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
+                            let otp_word_off = (addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1) & !3;
                             let half_idx = (((addr - OTP_DATA_BASE) >> 1) & 1) as usize;
                             let word_val = (val as u32) << (half_idx * 16);
                             self.otp.write32(otp_word_off, word_val);
@@ -2557,16 +2618,18 @@ impl Bus {
                             };
                             match base {
                                 TRNG_BASE => self.trng.write32(reg_offset, word_val, pass_alias),
-                                SHA256_BASE => self.sha256.write32(reg_offset, word_val, pass_alias),
+                                SHA256_BASE => {
+                                    self.sha256.write32(reg_offset, word_val, pass_alias)
+                                }
                                 _ => {
-                                    let mask = self.powman.write32(reg_offset, word_val, pass_alias);
+                                    let mask =
+                                        self.powman.write32(reg_offset, word_val, pass_alias);
                                     self.raise_irqs_u64(mask);
                                 }
                             }
                         }
-                        UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE
-                        | I2C1_BASE | ADC_BASE | PWM_BASE | IO_BANK0_BASE
-                        | PADS_BANK0_BASE => {
+                        UART0_BASE | UART1_BASE | SPI0_BASE | SPI1_BASE | I2C0_BASE | I2C1_BASE
+                        | ADC_BASE | PWM_BASE | IO_BANK0_BASE | PADS_BANK0_BASE => {
                             // Phase 2 peripherals halfword path — subword
                             // alias preservation.
                             let word_addr = canonical & !3;
@@ -2594,15 +2657,57 @@ impl Bus {
                             };
                             let mut ext_irqs = 0u64;
                             match base {
-                                UART0_BASE => self.uart[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                UART1_BASE => self.uart[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                SPI0_BASE => self.spi[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                SPI1_BASE => self.spi[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                I2C0_BASE => self.i2c[0].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                I2C1_BASE => self.i2c[1].write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                ADC_BASE => self.adc.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                PWM_BASE => self.pwm.write32(reg_offset, word_val, pass_alias, &mut ext_irqs),
-                                IO_BANK0_BASE => self.io_bank0.write32(reg_offset, word_val, pass_alias),
+                                UART0_BASE => self.uart[0].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                UART1_BASE => self.uart[1].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                SPI0_BASE => self.spi[0].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                SPI1_BASE => self.spi[1].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                I2C0_BASE => self.i2c[0].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                I2C1_BASE => self.i2c[1].write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                ADC_BASE => self.adc.write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                PWM_BASE => self.pwm.write32(
+                                    reg_offset,
+                                    word_val,
+                                    pass_alias,
+                                    &mut ext_irqs,
+                                ),
+                                IO_BANK0_BASE => {
+                                    self.io_bank0.write32(reg_offset, word_val, pass_alias)
+                                }
                                 _ => self.pads_bank0.write32(reg_offset, word_val, pass_alias),
                             }
                             self.raise_irqs_u64(ext_irqs);
@@ -2613,8 +2718,7 @@ impl Bus {
                         // narrow halfword writes directly.
                         USBCTRL_REGS_BASE => {}
                         USBCTRL_DPRAM_BASE => {
-                            let dpram_off =
-                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
                             self.usbctrl.write_dpram(dpram_off & !1, val as u32, 2);
                         }
                         _ => {
@@ -2654,8 +2758,7 @@ impl Bus {
                         0x008 => self.read_gpio_hi_in(),
                         _ => self.sio.read32(reg_offset, core as usize),
                     };
-                    let mut halves: [u16; 2] =
-                        [old_word as u16, (old_word >> 16) as u16];
+                    let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
                     halves[half_idx] = val;
                     let merged = (halves[0] as u32) | ((halves[1] as u32) << 16);
                     self.write32(word_addr, merged, core);
@@ -2685,9 +2788,11 @@ impl Bus {
         // Phase 0b.1 Commit B: PPB addresses are routed through
         // `CortexM33::bus_read32` before reaching here. Anything at
         // `0xE0..0xEF` that is not boot RAM is a caller bug.
-        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+        debug_assert!(
+            addr >> 28 != 0xE || Self::is_boot_ram(addr),
             "PPB address 0x{:08X} reached Bus::read32 — use CortexM33::bus_read32 wrapper",
-            addr);
+            addr
+        );
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
         self.last_access_cycles = cycles;
@@ -2695,7 +2800,7 @@ impl Bus {
 
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
-            _   => addr & 0x0FFF_FFFF,
+            _ => addr & 0x0FFF_FFFF,
         };
         let val = match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
@@ -2766,9 +2871,9 @@ impl Bus {
                         // bits. All four 4 KB sub-windows collapse into the
                         // same `base` after the `!0x3000` alias strip, so we
                         // recover the true byte offset from the raw `addr`.
-                        OTP_DATA_BASE => {
-                            self.otp.read32((addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1))
-                        }
+                        OTP_DATA_BASE => self
+                            .otp
+                            .read32((addr - OTP_DATA_BASE) & (OTP_DATA_SIZE - 1)),
                         TRNG_BASE => self.trng.read32(offset),
                         SHA256_BASE => self.sha256.read32(offset),
                         POWMAN_BASE => self.powman.read32(offset),
@@ -2801,9 +2906,7 @@ impl Bus {
                 match reg_offset {
                     0x004 => self.gpio_in.load(Ordering::Relaxed),
                     0x008 => self.read_gpio_hi_in(),
-                    _ => {
-                        self.sio.read32(reg_offset, core as usize)
-                    }
+                    _ => self.sio.read32(reg_offset, core as usize),
                 }
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
@@ -2825,9 +2928,11 @@ impl Bus {
         let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses are routed through
         // `CortexM33::bus_write32` before reaching here.
-        debug_assert!(addr >> 28 != 0xE || Self::is_boot_ram(addr),
+        debug_assert!(
+            addr >> 28 != 0xE || Self::is_boot_ram(addr),
             "PPB address 0x{:08X} reached Bus::write32 — use CortexM33::bus_write32 wrapper",
-            addr);
+            addr
+        );
         // RV32A: invalidate any LR/SC reservation at this word.
         // HLD §4.7.
         self.invalidate_reservation_at(addr);
@@ -2977,8 +3082,7 @@ impl Bus {
                             self.raise_irqs_u64(ext_irqs);
                         }
                         USBCTRL_DPRAM_BASE => {
-                            let dpram_off =
-                                (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
+                            let dpram_off = (addr - USBCTRL_DPRAM_BASE) & (USBCTRL_DPRAM_SIZE - 1);
                             self.usbctrl.write_dpram(dpram_off & !3, val, 4);
                         }
                         _ => {
@@ -3044,22 +3148,22 @@ impl Bus {
         // PIO0 / PIO1 / PIO2 — four SM × (TX | RX) per block.
         for sm in 0..4 {
             if self.pio[0].tx_dreq(sm) {
-                bits |= 1u64 << (sm as u64);          // DREQ 0..3
+                bits |= 1u64 << (sm as u64); // DREQ 0..3
             }
             if self.pio[0].rx_dreq(sm) {
-                bits |= 1u64 << (4 + sm as u64);      // DREQ 4..7
+                bits |= 1u64 << (4 + sm as u64); // DREQ 4..7
             }
             if self.pio[1].tx_dreq(sm) {
-                bits |= 1u64 << (8 + sm as u64);      // DREQ 8..11
+                bits |= 1u64 << (8 + sm as u64); // DREQ 8..11
             }
             if self.pio[1].rx_dreq(sm) {
-                bits |= 1u64 << (12 + sm as u64);     // DREQ 12..15
+                bits |= 1u64 << (12 + sm as u64); // DREQ 12..15
             }
             if self.pio[2].tx_dreq(sm) {
-                bits |= 1u64 << (16 + sm as u64);     // DREQ 16..19
+                bits |= 1u64 << (16 + sm as u64); // DREQ 16..19
             }
             if self.pio[2].rx_dreq(sm) {
-                bits |= 1u64 << (20 + sm as u64);     // DREQ 20..23
+                bits |= 1u64 << (20 + sm as u64); // DREQ 20..23
             }
         }
 
@@ -3150,11 +3254,7 @@ fn sram_bank_wait(addr: u32, burst: bool) -> u32 {
     if offset < 0x8_0000 {
         // Striped SRAM0-7
         let bank = (offset >> 2) & 7;
-        if bank == 2 || bank == 6 {
-            1
-        } else {
-            0
-        }
+        if bank == 2 || bank == 6 { 1 } else { 0 }
     } else {
         0 // SRAM8-9 non-striped: no extra wait
     }
@@ -3408,8 +3508,8 @@ mod corebus_trait_tests {
 mod bus_observability {
     use crate::bus::Bus;
     use std::sync::{Arc, Mutex};
-    use tracing::{Event, Metadata, Subscriber};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     /// Capture `tracing` events (name + level + fields) into a shared
     /// `Vec<String>` so tests can assert on warn-once semantics.
@@ -3435,8 +3535,12 @@ mod bus_observability {
     }
 
     impl Subscriber for CaptureSubscriber {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
-        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
         fn record(&self, _span: &Id, _values: &Record<'_>) {}
         fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
         fn event(&self, event: &Event<'_>) {
@@ -3468,7 +3572,9 @@ mod bus_observability {
         // aperture, distinct from the OTP_DATA aperture at
         // `0x4013_0000` that step 3b does model.
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut bus = Bus::new();
             bus.write32(0x4012_0000, 0xDEAD_BEEF, 0);
@@ -3476,16 +3582,20 @@ mod bus_observability {
         });
         let events = captured.lock().unwrap();
         let matches = count_warns_matching(&events, "0x40120000");
-        assert_eq!(matches, 1,
+        assert_eq!(
+            matches, 1,
             "expected exactly one WARN for 0x4012_0000; got {} in {:?}",
-            matches, *events);
+            matches, *events
+        );
     }
 
     #[test]
     fn unmodelled_mmio_warn_fires_on_first_read_too() {
         // Reads at an unmodelled address should also warn-once.
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut bus = Bus::new();
             let _ = bus.read32(0x4012_0000, 0);
@@ -3502,7 +3612,9 @@ mod bus_observability {
         // live inside the OTP SBPI controller aperture (unmodelled —
         // see note above).
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut bus = Bus::new();
             bus.write32(0x4012_0000, 0, 0);

@@ -5,12 +5,12 @@
 // `wrk_docs/2026.04.17 - HLD - RP2350 RISC-V Hazard3 Core Support.md`
 // §4.4.
 
-pub(crate) mod regs;
-pub(crate) mod decode;
 pub(crate) mod csr;
-pub(crate) mod trap;
+pub(crate) mod decode;
 pub(crate) mod execute;
 pub(crate) mod irq;
+pub(crate) mod regs;
+pub(crate) mod trap;
 
 #[cfg(test)]
 mod tests_common;
@@ -24,9 +24,9 @@ mod tests_p4;
 mod tests_p5;
 
 use crate::Bus;
+use irq::Xh3Irq;
 use regs::CsrFile;
 use trap::cause;
-use irq::Xh3Irq;
 
 /// `misa` hardwired value — MXL=01 (bit 30) + X (bit 23) + I (bit 8) +
 /// M (bit 12) + A (bit 0) + C (bit 2). No U/S/B. Per HLD §4.3.
@@ -220,11 +220,7 @@ impl Hazard3 {
     /// after `Emulator::step`.
     pub fn gpr(&self, index: u8) -> u32 {
         let i = (index as usize) & 0x1F;
-        if i == 0 {
-            0
-        } else {
-            self.x[i]
-        }
+        if i == 0 { 0 } else { self.x[i] }
     }
 
     /// Write one of the 32 integer registers. Writes to `x[0]` are
@@ -449,7 +445,8 @@ mod tests {
     fn emulator_reset_riscv_calls_hazard3_reset() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Mutate both harts away from §4.3 defaults.
         {

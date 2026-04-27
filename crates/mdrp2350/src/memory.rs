@@ -16,7 +16,9 @@ pub use mdpicoem_common::memory::{Memory, ROM_SIZE, SRAM_SIZE};
 /// Accepts a full address (0x20xx_xxxx through 0x23xx_xxxx); strips alias
 /// and base bits internally. Alias addresses resolve to the same bank.
 pub fn bank_for_address(addr: u32) -> Option<u8> {
-    if (addr >> 28) != 0x2 { return None; }
+    if (addr >> 28) != 0x2 {
+        return None;
+    }
     let offset = addr & 0x00FF_FFFF; // strip alias bits [27:24]
     if offset < 0x8_0000 {
         // Striped region: 0x00000-0x7FFFF (512KB)

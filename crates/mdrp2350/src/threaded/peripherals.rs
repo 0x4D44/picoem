@@ -378,9 +378,7 @@ impl QmiState {
     /// raw register image.
     pub fn qmi_read(&self, offset: u32) -> u32 {
         match offset {
-            0x000 => {
-                self.qmi_regs.first().copied().unwrap_or(0) | (1 << 16) | (1 << 17)
-            }
+            0x000 => self.qmi_regs.first().copied().unwrap_or(0) | (1 << 16) | (1 << 17),
             _ => {
                 let idx = (offset >> 2) as usize;
                 self.qmi_regs.get(idx).copied().unwrap_or(0)
@@ -469,15 +467,13 @@ impl ApbState {
     /// Mirror `Bus::new()` — same IRQ constants wired into each
     /// peripheral as the single-threaded path.
     pub fn post_bootrom() -> Self {
-        use crate::irq::{
-            IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP_0,
-            IRQ_PWM_IRQ_WRAP_1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ,
-            IRQ_UART1_IRQ,
-        };
         use crate::dreq::{
-            DREQ_I2C0_RX, DREQ_I2C0_TX, DREQ_I2C1_RX, DREQ_I2C1_TX, DREQ_SPI0_RX,
-            DREQ_SPI0_TX, DREQ_SPI1_RX, DREQ_SPI1_TX, DREQ_UART0_RX, DREQ_UART0_TX,
-            DREQ_UART1_RX, DREQ_UART1_TX,
+            DREQ_I2C0_RX, DREQ_I2C0_TX, DREQ_I2C1_RX, DREQ_I2C1_TX, DREQ_SPI0_RX, DREQ_SPI0_TX,
+            DREQ_SPI1_RX, DREQ_SPI1_TX, DREQ_UART0_RX, DREQ_UART0_TX, DREQ_UART1_RX, DREQ_UART1_TX,
+        };
+        use crate::irq::{
+            IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1,
+            IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ, IRQ_UART1_IRQ,
         };
         Self {
             uart: [
@@ -546,7 +542,9 @@ pub struct UsbState {
 impl UsbState {
     /// Mirror `Bus::new()` — fresh stub in post-reset state.
     pub fn post_bootrom() -> Self {
-        Self { usbctrl: UsbCtrl::new() }
+        Self {
+            usbctrl: UsbCtrl::new(),
+        }
     }
 }
 
@@ -653,11 +651,7 @@ mod tests {
         assert_eq!(cs_before & (1 << 31), 0, "LOCK must be 0 before deadline");
         // After the deadline — LOCK bit must be 1.
         let cs_after = c.pll_sys_read_at(0x000, 150);
-        assert_ne!(
-            cs_after & (1 << 31),
-            0,
-            "LOCK must be 1 at/after deadline"
-        );
+        assert_ne!(cs_after & (1 << 31), 0, "LOCK must be 1 at/after deadline");
     }
 
     #[test]

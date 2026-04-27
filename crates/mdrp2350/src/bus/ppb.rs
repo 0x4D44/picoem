@@ -2,20 +2,20 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 // FPCCR bit positions (DDI0553 §D1.2.32). Public so other crate modules
 // (exceptions.rs, execute_fpu.rs) can reference them by name.
-pub const FPCCR_LSPACT:    u32 = 1 << 0;
-pub const FPCCR_MMRDY:     u32 = 1 << 5;
-pub const FPCCR_BFRDY:     u32 = 1 << 6;
+pub const FPCCR_LSPACT: u32 = 1 << 0;
+pub const FPCCR_MMRDY: u32 = 1 << 5;
+pub const FPCCR_BFRDY: u32 = 1 << 6;
 pub const FPCCR_SPLIMVIOL: u32 = 1 << 9;
-pub const FPCCR_LSPEN:     u32 = 1 << 30;
-pub const FPCCR_ASPEN:     u32 = 1 << 31;
+pub const FPCCR_LSPEN: u32 = 1 << 30;
+pub const FPCCR_ASPEN: u32 = 1 << 31;
 
 // DWT CTRL / DEMCR bit positions (DDI0553 §D1.2.1, §D1.2.22).
 const DWT_CTRL_CYCCNTENA: u32 = 1 << 0;
-const DEMCR_TRCENA:       u32 = 1 << 24;
+const DEMCR_TRCENA: u32 = 1 << 24;
 
 // SysTick CSR bit positions (ARMv8-M §B11.1).
-const SYST_CSR_ENABLE:    u32 = 1 << 0;
-const SYST_CSR_TICKINT:   u32 = 1 << 1;
+const SYST_CSR_ENABLE: u32 = 1 << 0;
+const SYST_CSR_TICKINT: u32 = 1 << 1;
 // CLKSOURCE is used for register round-trip only; scaling is deferred.
 #[allow(dead_code)]
 const SYST_CSR_CLKSOURCE: u32 = 1 << 2;
@@ -29,10 +29,10 @@ const SYST_24BIT_MASK: u32 = 0x00FF_FFFF;
 // (write 1 clears the SET bit, write 0 ignored). Other ICSR bits are
 // read-only status; writes are preserved only in storage for round-trip.
 pub(crate) const ICSR_NMIPENDSET: u32 = 1 << 31;
-pub(crate) const ICSR_PENDSVSET:  u32 = 1 << 28;
-const ICSR_PENDSVCLR:             u32 = 1 << 27;
-pub(crate) const ICSR_PENDSTSET:  u32 = 1 << 26;
-const ICSR_PENDSTCLR:             u32 = 1 << 25;
+pub(crate) const ICSR_PENDSVSET: u32 = 1 << 28;
+const ICSR_PENDSVCLR: u32 = 1 << 27;
+pub(crate) const ICSR_PENDSTSET: u32 = 1 << 26;
+const ICSR_PENDSTCLR: u32 = 1 << 25;
 
 /// M33 implements 3 bits of priority — bits [7:5] of each priority
 /// byte. 8 architectural levels; the remaining bits are RES0 and read
@@ -271,7 +271,11 @@ impl Ppb {
             0xE304 => self.nvic_iabr[1].load(Ordering::Relaxed),
             0xE400..=0xE430 if (addr & 0x3) == 0 => {
                 let idx = (((addr & 0xFFFF) - 0xE400) / 4) as usize;
-                if idx < NVIC_IPR_WORDS { self.nvic_ipr[idx] } else { 0 }
+                if idx < NVIC_IPR_WORDS {
+                    self.nvic_ipr[idx]
+                } else {
+                    0
+                }
             }
             0xE100..=0xE4FF => 0,
 
@@ -416,14 +420,30 @@ impl Ppb {
             // (datasheet §3.2 note following Table 95). Peripherals only
             // drive 0..=45, but the software-self-pend path works for
             // 46..=51 as well.
-            0xE100 => { self.nvic_iser[0].fetch_or(val, Ordering::Relaxed); }
-            0xE104 => { self.nvic_iser[1].fetch_or(val & nvic_word1_valid_mask(), Ordering::Relaxed); }
-            0xE180 => { self.nvic_iser[0].fetch_and(!val, Ordering::Relaxed); }
-            0xE184 => { self.nvic_iser[1].fetch_and(!val, Ordering::Relaxed); }
-            0xE200 => { self.nvic_ispr[0].fetch_or(val, Ordering::Relaxed); }
-            0xE204 => { self.nvic_ispr[1].fetch_or(val & nvic_word1_valid_mask(), Ordering::Relaxed); }
-            0xE280 => { self.nvic_ispr[0].fetch_and(!val, Ordering::Relaxed); }
-            0xE284 => { self.nvic_ispr[1].fetch_and(!val, Ordering::Relaxed); }
+            0xE100 => {
+                self.nvic_iser[0].fetch_or(val, Ordering::Relaxed);
+            }
+            0xE104 => {
+                self.nvic_iser[1].fetch_or(val & nvic_word1_valid_mask(), Ordering::Relaxed);
+            }
+            0xE180 => {
+                self.nvic_iser[0].fetch_and(!val, Ordering::Relaxed);
+            }
+            0xE184 => {
+                self.nvic_iser[1].fetch_and(!val, Ordering::Relaxed);
+            }
+            0xE200 => {
+                self.nvic_ispr[0].fetch_or(val, Ordering::Relaxed);
+            }
+            0xE204 => {
+                self.nvic_ispr[1].fetch_or(val & nvic_word1_valid_mask(), Ordering::Relaxed);
+            }
+            0xE280 => {
+                self.nvic_ispr[0].fetch_and(!val, Ordering::Relaxed);
+            }
+            0xE284 => {
+                self.nvic_ispr[1].fetch_and(!val, Ordering::Relaxed);
+            }
             // IABR is read-only; writes are ignored.
             0xE300 | 0xE304 => {}
             // NVIC_IPR0..12 — 4×u8 lanes, each masked to bits [7:5].
@@ -463,11 +483,21 @@ impl Ppb {
             // store, CLR wins (apply CLR after SET so the net effect is
             // "not pended"). Other ICSR bits are read-only status.
             0xED04 => {
-                if val & ICSR_NMIPENDSET != 0 { self.icsr |= ICSR_NMIPENDSET; }
-                if val & ICSR_PENDSVSET  != 0 { self.icsr |= ICSR_PENDSVSET;  }
-                if val & ICSR_PENDSTSET  != 0 { self.icsr |= ICSR_PENDSTSET;  }
-                if val & ICSR_PENDSVCLR  != 0 { self.icsr &= !ICSR_PENDSVSET; }
-                if val & ICSR_PENDSTCLR  != 0 { self.icsr &= !ICSR_PENDSTSET; }
+                if val & ICSR_NMIPENDSET != 0 {
+                    self.icsr |= ICSR_NMIPENDSET;
+                }
+                if val & ICSR_PENDSVSET != 0 {
+                    self.icsr |= ICSR_PENDSVSET;
+                }
+                if val & ICSR_PENDSTSET != 0 {
+                    self.icsr |= ICSR_PENDSTSET;
+                }
+                if val & ICSR_PENDSVCLR != 0 {
+                    self.icsr &= !ICSR_PENDSVSET;
+                }
+                if val & ICSR_PENDSTCLR != 0 {
+                    self.icsr &= !ICSR_PENDSTSET;
+                }
             }
 
             // VTOR — 128-byte aligned
@@ -588,9 +618,9 @@ impl Ppb {
     /// priority) — matches silicon behaviour for unconfigured lines.
     pub fn exception_priority(&self, exc_num: u16) -> i16 {
         match exc_num {
-            1 => -3,  // Reset
-            2 => -2,  // NMI
-            3 => -1,  // HardFault (fixed)
+            1 => -3, // Reset
+            2 => -2, // NMI
+            3 => -1, // HardFault (fixed)
             4..=15 => (self.shpr[(exc_num - 4) as usize] & NVIC_PRIORITY_MASK) as i16,
             _ => {
                 // External IRQ: IRQ_NUM = exc_num - 16. NVIC_IPR packs 4
@@ -636,8 +666,10 @@ impl Ppb {
         let mut best: Option<(i16, u16)> = None;
         for word_idx in 0..NVIC_BIT_WORDS {
             let ready = self.nvic_iser[word_idx].load(Ordering::Relaxed)
-                      & self.nvic_ispr[word_idx].load(Ordering::Relaxed);
-            if ready == 0 { continue; }
+                & self.nvic_ispr[word_idx].load(Ordering::Relaxed);
+            if ready == 0 {
+                continue;
+            }
             let mut remaining = ready;
             while remaining != 0 {
                 let bit = remaining.trailing_zeros() as u16;
@@ -646,8 +678,7 @@ impl Ppb {
                 let prio = self.exception_priority(exc_num);
                 let replace = match best {
                     None => true,
-                    Some((b_prio, b_exc)) => prio < b_prio
-                        || (prio == b_prio && exc_num < b_exc),
+                    Some((b_prio, b_exc)) => prio < b_prio || (prio == b_prio && exc_num < b_exc),
                 };
                 if replace {
                     best = Some((prio, exc_num));
@@ -689,7 +720,7 @@ impl Ppb {
     /// mask written by the peer. Phase 0b.3.
     pub fn any_pending_enabled(&self, pending: u64) -> bool {
         let iser = self.nvic_iser[0].load(Ordering::Acquire) as u64
-                 | (self.nvic_iser[1].load(Ordering::Acquire) as u64) << 32;
+            | (self.nvic_iser[1].load(Ordering::Acquire) as u64) << 32;
         (pending & iser) != 0
     }
 
@@ -746,9 +777,7 @@ impl Ppb {
     /// `(cycles as u32) + dwt_cyccnt_base`; otherwise returns the stored
     /// base (whatever was last written).
     pub fn read_cyccnt(&self, core_cycles: u64) -> u32 {
-        if (self.demcr & DEMCR_TRCENA) != 0
-            && (self.dwt_ctrl & DWT_CTRL_CYCCNTENA) != 0
-        {
+        if (self.demcr & DEMCR_TRCENA) != 0 && (self.dwt_ctrl & DWT_CTRL_CYCCNTENA) != 0 {
             (core_cycles as u32).wrapping_add(self.dwt_cyccnt_base)
         } else {
             self.dwt_cyccnt_base
@@ -999,7 +1028,7 @@ mod tests {
     const NVIC_ICPR0: u32 = 0xE000_E280;
     const NVIC_ICPR1: u32 = 0xE000_E284;
     const NVIC_IABR0: u32 = 0xE000_E300;
-    const NVIC_IPR0:  u32 = 0xE000_E400;
+    const NVIC_IPR0: u32 = 0xE000_E400;
 
     #[test]
     fn test_nvic_word1_icer_and_icpr_work_on_high_irqs() {
@@ -1009,13 +1038,19 @@ mod tests {
         let mut ppb = Ppb::default();
         ppb.write32(NVIC_ISER1, 0x0000_000F); // enable IRQs 32..35
         ppb.write32(NVIC_ICER1, 0x0000_0005); // clear bits 32 and 34
-        assert_eq!(ppb.read32(NVIC_ISER1), 0x0000_000A,
-            "ICER1 must clear matching bits in the IRQ>=32 half");
+        assert_eq!(
+            ppb.read32(NVIC_ISER1),
+            0x0000_000A,
+            "ICER1 must clear matching bits in the IRQ>=32 half"
+        );
 
         ppb.write32(NVIC_ISPR1, 0x0000_0007); // pend 32..34
         ppb.write32(NVIC_ICPR1, 0x0000_0002); // clear IRQ 33
-        assert_eq!(ppb.read32(NVIC_ISPR1), 0x0000_0005,
-            "ICPR1 must clear matching bits in the IRQ>=32 half");
+        assert_eq!(
+            ppb.read32(NVIC_ISPR1),
+            0x0000_0005,
+            "ICPR1 must clear matching bits in the IRQ>=32 half"
+        );
     }
 
     #[test]
@@ -1024,8 +1059,11 @@ mod tests {
         // Writing ISER sets enable bits; reading returns the union.
         ppb.write32(NVIC_ISER0, 0x0000_0001); // enable IRQ 0
         ppb.write32(NVIC_ISER0, 0x0000_0080); // enable IRQ 7
-        assert_eq!(ppb.read32(NVIC_ISER0), 0x0000_0081,
-            "ISER writes OR into the mask");
+        assert_eq!(
+            ppb.read32(NVIC_ISER0),
+            0x0000_0081,
+            "ISER writes OR into the mask"
+        );
     }
 
     #[test]
@@ -1074,12 +1112,18 @@ mod tests {
         // write-ignore path and the read path separately.
         let mut ppb = Ppb::default();
         ppb.write32(NVIC_IABR0, 0xFFFF_FFFF);
-        assert_eq!(ppb.read32(NVIC_IABR0), 0,
-            "IABR is read-only; write must be ignored");
+        assert_eq!(
+            ppb.read32(NVIC_IABR0),
+            0,
+            "IABR is read-only; write must be ignored"
+        );
 
         ppb.set_irq_active(5);
-        assert_eq!(ppb.read32(NVIC_IABR0), 1 << 5,
-            "IABR must reflect `set_irq_active` state");
+        assert_eq!(
+            ppb.read32(NVIC_IABR0),
+            1 << 5,
+            "IABR must reflect `set_irq_active` state"
+        );
     }
 
     #[test]
@@ -1305,9 +1349,14 @@ mod tests {
     fn test_fpdscr_roundtrip() {
         let mut ppb = Ppb::default();
         // Set AHP=1, DN=1, FZ=1, RMODE=10 (round toward -inf).
-        ppb.write32(0xE000_EF3C, (1 << 26) | (1 << 25) | (1 << 24) | (0b10 << 22));
-        assert_eq!(ppb.read32(0xE000_EF3C),
-            (1 << 26) | (1 << 25) | (1 << 24) | (0b10 << 22));
+        ppb.write32(
+            0xE000_EF3C,
+            (1 << 26) | (1 << 25) | (1 << 24) | (0b10 << 22),
+        );
+        assert_eq!(
+            ppb.read32(0xE000_EF3C),
+            (1 << 26) | (1 << 25) | (1 << 24) | (0b10 << 22)
+        );
     }
 
     #[test]
@@ -1315,8 +1364,8 @@ mod tests {
         // Reproduces the bootrom's SAU setup: region 7 with
         // RBAR=0x4787, RLAR=0x7FE1 (Secure, enabled)
         let mut ppb = Ppb::default();
-        ppb.write32(0xE000_EDD0, 1);  // SAU_CTRL = enable
-        ppb.write32(0xE000_EDD8, 7);  // SAU_RNR = region 7
+        ppb.write32(0xE000_EDD0, 1); // SAU_CTRL = enable
+        ppb.write32(0xE000_EDD8, 7); // SAU_RNR = region 7
         ppb.write32(0xE000_EDDC, 0x4787); // SAU_RBAR
         ppb.write32(0xE000_EDE0, 0x7FE1); // SAU_RLAR
         // Verify readback
@@ -1382,8 +1431,11 @@ mod tests {
         ppb.write32(0xE000_1000, 1);
         ppb.update_latest_cycles(0);
         ppb.write32(0xE000_1004, 42);
-        assert_eq!(ppb.read_cyccnt(999), 42,
-            "TRCENA=0 must gate CYCCNT reads to the stored base");
+        assert_eq!(
+            ppb.read_cyccnt(999),
+            42,
+            "TRCENA=0 must gate CYCCNT reads to the stored base"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -1403,14 +1455,24 @@ mod tests {
 
         ppb.systick_advance(51); // one underflow
         // COUNTFLAG set
-        assert_ne!(ppb.syst_csr & (1 << 16), 0, "COUNTFLAG must be set on underflow");
+        assert_ne!(
+            ppb.syst_csr & (1 << 16),
+            0,
+            "COUNTFLAG must be set on underflow"
+        );
         // After 51 decrements from 50: decrement 51 steps. The pseudocode:
         // rem=51, cvr=50: rem > cvr (51 > 50) → rem -= cvr+1 (51-51=0), cvr = RVR (100).
         // Loop: rem <= cvr (0 <= 100) → cvr -= 0 → cvr = 100.
-        assert_eq!(ppb.syst_cvr, 100, "CVR reloads to RVR after exactly one underflow");
+        assert_eq!(
+            ppb.syst_cvr, 100,
+            "CVR reloads to RVR after exactly one underflow"
+        );
         // SysTick pending bit set? TICKINT=0, so ICSR.PENDSTSET must NOT be set.
-        assert_eq!(ppb.icsr & (1 << 26), 0,
-            "TICKINT=0: ICSR.PENDSTSET must remain clear");
+        assert_eq!(
+            ppb.icsr & (1 << 26),
+            0,
+            "TICKINT=0: ICSR.PENDSTSET must remain clear"
+        );
     }
 
     #[test]
@@ -1446,10 +1508,16 @@ mod tests {
         // 1 tick: reload CVR from RVR. No fire.
         ppb.systick_advance(1);
         assert_eq!(ppb.syst_cvr, 4, "CVR must reload to RVR on first tick");
-        assert_eq!(ppb.syst_csr & (1 << 16), 0,
-            "COUNTFLAG must NOT be set on the reload tick");
-        assert_eq!(ppb.icsr & (1 << 26), 0,
-            "ICSR.PENDSTSET must NOT be set on the reload tick");
+        assert_eq!(
+            ppb.syst_csr & (1 << 16),
+            0,
+            "COUNTFLAG must NOT be set on the reload tick"
+        );
+        assert_eq!(
+            ppb.icsr & (1 << 26),
+            0,
+            "ICSR.PENDSTSET must NOT be set on the reload tick"
+        );
 
         // 1 more tick past the reload (delta=1 from cumulative core_cycles=2).
         // cvr decrements 4→3. Still no fire.
@@ -1461,8 +1529,10 @@ mod tests {
         // the 1→0 transition. We assert the cvr value lands at 0 — the
         // `cvr→0 via subtraction fires` path is a known gap (tech_debt).
         ppb.systick_advance(5);
-        assert_eq!(ppb.syst_cvr, 0,
-            "CVR reaches 0 after RVR+1 total cycles from initial CVR=0");
+        assert_eq!(
+            ppb.syst_cvr, 0,
+            "CVR reaches 0 after RVR+1 total cycles from initial CVR=0"
+        );
     }
 
     #[test]
@@ -1477,8 +1547,11 @@ mod tests {
 
         ppb.systick_advance(1000);
         assert_eq!(ppb.syst_cvr, 0, "CVR stays at 0 with RVR=0");
-        assert_eq!(ppb.icsr & (1 << 26), 0,
-            "RVR=0 must not fire any SysTick pending");
+        assert_eq!(
+            ppb.icsr & (1 << 26),
+            0,
+            "RVR=0 must not fire any SysTick pending"
+        );
     }
 
     #[test]
@@ -1492,8 +1565,11 @@ mod tests {
 
         ppb.systick_advance(200); // would underflow twice if enabled
         assert_eq!(ppb.syst_cvr, 50, "CVR must not change when ENABLE=0");
-        assert_eq!(ppb.syst_csr & (1 << 16), 0,
-            "COUNTFLAG must not be set when ENABLE=0");
+        assert_eq!(
+            ppb.syst_csr & (1 << 16),
+            0,
+            "COUNTFLAG must not be set when ENABLE=0"
+        );
     }
 
     #[test]
@@ -1511,7 +1587,11 @@ mod tests {
 
         // Second read: COUNTFLAG should be cleared
         let second = ppb.read32(0xE000_E010);
-        assert_eq!(second & (1 << 16), 0, "Second CSR read must show COUNTFLAG=0");
+        assert_eq!(
+            second & (1 << 16),
+            0,
+            "Second CSR read must show COUNTFLAG=0"
+        );
         // ENABLE/CLKSOURCE bits must still be readable
         assert_ne!(second & 1, 0, "ENABLE must remain set");
     }
@@ -1527,8 +1607,11 @@ mod tests {
 
         ppb.systick_advance(60); // underflow
         // ICSR.PENDSTSET (bit 26) must be set by pend_systick().
-        assert_ne!(ppb.icsr & (1 << 26), 0,
-            "TICKINT=1 + underflow must set ICSR.PENDSTSET");
+        assert_ne!(
+            ppb.icsr & (1 << 26),
+            0,
+            "TICKINT=1 + underflow must set ICSR.PENDSTSET"
+        );
     }
 
     #[test]
@@ -1555,7 +1638,10 @@ mod tests {
         // but since writes-to-CVR always clear the register per the spec,
         // the value stored is 0, not the input. Instead, check RVR.
         ppb.write32(0xE000_E014, 0xFFFF_FFFF); // RVR
-        assert_eq!(ppb.read32(0xE000_E014), 0x00FF_FFFF,
-            "RVR read must be masked to 24 bits");
+        assert_eq!(
+            ppb.read32(0xE000_E014),
+            0x00FF_FFFF,
+            "RVR read must be masked to 24 bits"
+        );
     }
 }

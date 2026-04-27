@@ -2,10 +2,8 @@ use std::sync::atomic::Ordering;
 
 use tracing::{debug, info};
 
-
-use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY,
-    FPCCR_SPLIMVIOL};
-use super::{CortexM33, CoreBus, Fault};
+use super::{CoreBus, CortexM33, Fault};
+use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY, FPCCR_SPLIMVIOL};
 
 /// CONTROL.FPCA bit position (bit 2). Owned exclusively by the three sites
 /// in this file plus `fpu_execute`; see `Ppb` field doc invariants.
@@ -90,7 +88,11 @@ impl CortexM33 {
         // so the stacking address below reflects the real SP.
         self.regs.sync_sp_to_banked();
         let use_psp = !self.regs.in_handler_mode() && self.regs.active_sp_is_psp();
-        let original_sp = if use_psp { self.regs.psp } else { self.regs.msp };
+        let original_sp = if use_psp {
+            self.regs.psp
+        } else {
+            self.regs.msp
+        };
 
         // FP frame: thread mode with CONTROL.FPCA=1 forces FType=0 (FP frame
         // present). DDI0553 §B3.4.3. Per HLD §B.4 and Phase 7 stub: only
@@ -114,7 +116,11 @@ impl CortexM33 {
         // adding the FP region pushes the SP past the limit. If the
         // basic frame alone already underflows, SPLIMVIOL stays clear
         // (the violation is not attributable to FP context).
-        let limit = if use_psp { self.regs.psplim } else { self.regs.msplim };
+        let limit = if use_psp {
+            self.regs.psplim
+        } else {
+            self.regs.msplim
+        };
         if frame_sp < limit {
             if had_fp && aligned_sp.wrapping_sub(basic_frame) >= limit {
                 // Basic frame alone would fit; the FP region drove the
@@ -193,14 +199,19 @@ impl CortexM33 {
         // means an FP frame is present (so 0xFFFF_FFE_) and 1 means no FP
         // frame (so 0xFFFF_FFF_, matching Phase 3 behavior). The S=1 stub
         // is preserved per HLD §2 non-goals.
-        let base = if had_fp { 0xFFFF_FFE0_u32 } else { 0xFFFF_FFF0_u32 };
-        self.regs.r[14] = base | if self.regs.in_handler_mode() {
-            0x1 // return to Handler, MSP
-        } else if use_psp {
-            0xD // return to Thread, PSP
+        let base = if had_fp {
+            0xFFFF_FFE0_u32
         } else {
-            0x9 // return to Thread, MSP
+            0xFFFF_FFF0_u32
         };
+        self.regs.r[14] = base
+            | if self.regs.in_handler_mode() {
+                0x1 // return to Handler, MSP
+            } else if use_psp {
+                0xD // return to Thread, PSP
+            } else {
+                0x9 // return to Thread, MSP
+            };
 
         // Fetch vector from table
         let vtor = self.ppb.vtor;
@@ -286,7 +297,11 @@ impl CortexM33 {
         // Handler-mode instructions may have modified r[13] (MSP) without
         // syncing to the banked field. Flush now for correct unstack addr.
         self.regs.sync_sp_to_banked();
-        let sp = if return_to_psp { self.regs.psp } else { self.regs.msp };
+        let sp = if return_to_psp {
+            self.regs.psp
+        } else {
+            self.regs.msp
+        };
 
         // Tail-chain speculation (ARMv8-M §B3.4.2).
         //
@@ -426,7 +441,9 @@ impl CortexM33 {
             let prio = ppb.exception_priority(ext_exc);
             best = match best {
                 None => Some((prio, ext_exc)),
-                Some((bp, be)) if prio < bp || (prio == bp && ext_exc < be) => Some((prio, ext_exc)),
+                Some((bp, be)) if prio < bp || (prio == bp && ext_exc < be) => {
+                    Some((prio, ext_exc))
+                }
                 other => other,
             };
         }
@@ -443,7 +460,12 @@ impl CortexM33 {
     /// eventually EXC_RETURNs and unstacks back to the original
     /// pre-emption state. Cycle cost is 6 (ARMv8-M M33) vs 12 for a
     /// full unstack.
-    fn activate_tail_chain<B: CoreBus>(&mut self, new_exc: u16, exc_return: u32, bus: &mut B) -> u32 {
+    fn activate_tail_chain<B: CoreBus>(
+        &mut self,
+        new_exc: u16,
+        exc_return: u32,
+        bus: &mut B,
+    ) -> u32 {
         // Dispatch cleanup — mirror `try_take_any_pending_exception` +
         // `enter_exception`: clear pending for the new exception,
         // set active for external IRQs.
@@ -561,7 +583,10 @@ impl CortexM33 {
     /// NMI bypasses PRIMASK/FAULTMASK and never consults `can_preempt`;
     /// every other candidate goes through `can_preempt` so PRIMASK /
     /// BASEPRI / FAULTMASK / active-exception priority all apply.
-    pub(crate) fn try_take_any_pending_exception<B: CoreBus>(&mut self, bus: &mut B) -> Option<u32> {
+    pub(crate) fn try_take_any_pending_exception<B: CoreBus>(
+        &mut self,
+        bus: &mut B,
+    ) -> Option<u32> {
         let icsr = self.ppb.icsr;
 
         // NMI (exc 2, priority -2): non-maskable, highest fixed priority.
@@ -592,7 +617,9 @@ impl CortexM33 {
             let prio = self.ppb.exception_priority(ext_exc);
             best = match best {
                 None => Some((prio, ext_exc)),
-                Some((bp, be)) if prio < bp || (prio == bp && ext_exc < be) => Some((prio, ext_exc)),
+                Some((bp, be)) if prio < bp || (prio == bp && ext_exc < be) => {
+                    Some((prio, ext_exc))
+                }
                 other => other,
             };
         }
@@ -751,8 +778,8 @@ impl CortexM33 {
                 let base = rbar & !0x1F;
                 let limit = (rlar & !0x1F) | 0x1F;
                 if addr >= base && addr <= limit {
-                    mpu_bits |= 1 << 16;            // MRVALID
-                    mpu_bits |= (i as u32) & 0xFF;  // MREGION [7:0]
+                    mpu_bits |= 1 << 16; // MRVALID
+                    mpu_bits |= (i as u32) & 0xFF; // MREGION [7:0]
                     // R is always granted if the region matches from
                     // privileged-S state (TT always runs from privileged
                     // S here — the bootrom's self-test issues TT from
@@ -762,10 +789,10 @@ impl CortexM33 {
                     //   AP=10 → priv RO,        AP=11 → any RO.
                     // We read the full 2-bit field (see `let ap` below)
                     // and grant RW when AP[1]=0, i.e. AP ∈ {0, 1}.
-                    mpu_bits |= 1 << 18;                // R
+                    mpu_bits |= 1 << 18; // R
                     let ap = (rbar >> 1) & 0x3;
                     if ap == 0 || ap == 1 {
-                        mpu_bits |= 1 << 19;            // RW (writable)
+                        mpu_bits |= 1 << 19; // RW (writable)
                     }
                     break;
                 }
@@ -797,12 +824,12 @@ impl CortexM33 {
             let nsc = (rlar >> 1) & 1;
             if addr >= base && addr <= limit {
                 let secure = nsc == 0;
-                sau_bits |= (i as u32 & 0xFF) << 8;       // SREGION
-                sau_bits |= 1 << 17;                      // SRVALID
+                sau_bits |= (i as u32 & 0xFF) << 8; // SREGION
+                sau_bits |= 1 << 17; // SRVALID
                 if secure {
-                    sau_bits |= 1 << 22;                  // S
+                    sau_bits |= 1 << 22; // S
                 } else {
-                    sau_bits |= (1 << 20) | (1 << 21);   // NSR, NSRW
+                    sau_bits |= (1 << 20) | (1 << 21); // NSR, NSRW
                 }
                 sau_matched = true;
                 break;
@@ -846,13 +873,13 @@ impl CortexM33 {
         // the RP2350-specific exempt bit (bit 25).
         let idau_secure = match addr >> 28 {
             0x0 => addr < 0x0000_8000, // ROM: lower 32K is secure
-            0x1 => true,                // XIP: secure
-            0x2 => true,                // SRAM: secure
-            0x3 => true,                // SRAM alias
-            0x4 => true,                // APB peripherals: secure
-            0x5 => true,                // AHB peripherals: secure
-            0xD => true,                // SIO: secure
-            0xE => true,                // PPB: always secure
+            0x1 => true,               // XIP: secure
+            0x2 => true,               // SRAM: secure
+            0x3 => true,               // SRAM alias
+            0x4 => true,               // APB peripherals: secure
+            0x5 => true,               // AHB peripherals: secure
+            0xD => true,               // SIO: secure
+            0xE => true,               // PPB: always secure
             _ => false,
         };
 
@@ -899,7 +926,7 @@ mod tests {
         // MemManage (4). Phase 0b.1 Commit B: per-core PPB now lives on
         // `CortexM33`, so VTOR is set on `cpu.ppb`.
         cpu.ppb.vtor = VT_BASE;
-        bus.write32(VT_BASE + 8,  HANDLER_VEC, 0); // NMI       (exc 2)
+        bus.write32(VT_BASE + 8, HANDLER_VEC, 0); // NMI       (exc 2)
         bus.write32(VT_BASE + 12, HANDLER_VEC, 0); // HardFault (exc 3)
         bus.write32(VT_BASE + 16, HANDLER_VEC, 0); // MemManage (exc 4)
         // `B .` (0xE7FE) at the handler address — keeps the handler
@@ -947,7 +974,11 @@ mod tests {
         cpu.ppb.shcsr |= 1 << 16; // MEMFAULTENA
         cpu.pending_fault = Some(Fault::MemManage);
         cpu.step(&mut bus);
-        assert_ne!(cpu.ppb.cfsr & 0x2, 0, "MMFSR.DACCVIOL (bit 1) should be set");
+        assert_ne!(
+            cpu.ppb.cfsr & 0x2,
+            0,
+            "MMFSR.DACCVIOL (bit 1) should be set"
+        );
         // Pin this as the non-escalated path: IPSR must be MemManage (4),
         // not HardFault (3). MMFSR.DACCVIOL would also be set after
         // escalation, so asserting IPSR is what distinguishes the paths.
@@ -973,10 +1004,17 @@ mod tests {
         cpu.step(&mut bus);
 
         // 3. Should have escalated to HardFault with FORCED set; NOT halted.
-        assert_eq!(cpu.regs.ipsr(), 3,
-            "NMI-in-NMI must escalate to HardFault (IPSR=3), got {}", cpu.regs.ipsr());
-        assert_ne!(cpu.ppb.hfsr & (1 << 30), 0,
-            "HFSR.FORCED should be set on escalation");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            3,
+            "NMI-in-NMI must escalate to HardFault (IPSR=3), got {}",
+            cpu.regs.ipsr()
+        );
+        assert_ne!(
+            cpu.ppb.hfsr & (1 << 30),
+            0,
+            "HFSR.FORCED should be set on escalation"
+        );
         assert!(!cpu.is_halted(), "NMI-in-NMI must NOT halt the core");
         assert_eq!(cpu.regs.pc(), HANDLER_ADDR);
     }
@@ -1107,6 +1145,10 @@ mod tests {
             1,
             "first-match must win (region 1 programmed first)"
         );
-        assert_ne!(r & (1 << 19), 0, "RW must reflect region 1's AP=00, not region 7's AP=10");
+        assert_ne!(
+            r & (1 << 19),
+            0,
+            "RW must reflect region 1's AP=00, not region 7's AP=10"
+        );
     }
 }

@@ -3,34 +3,45 @@
 // differential oracle (P2.5) lands. Each test is golden-value style with
 // hand-computed expectations drawn from RV-priv.
 
-use super::csr::{
-    CSR_MCAUSE, CSR_MEPC, CSR_MIE, CSR_MSCRATCH, CSR_MSTATUS, CSR_MTVAL, CSR_MTVEC,
-    CSR_MHARTID, CSR_MCOUNTINHIBIT,
-};
-use super::decode::{self, AluImmKind, AluKind, BranchKind, CsrKind, LoadKind, Op, ShiftKind, StoreKind};
 use super::Hazard3;
+use super::csr::{
+    CSR_MCAUSE, CSR_MCOUNTINHIBIT, CSR_MEPC, CSR_MHARTID, CSR_MIE, CSR_MSCRATCH, CSR_MSTATUS,
+    CSR_MTVAL, CSR_MTVEC,
+};
+use super::decode::{
+    self, AluImmKind, AluKind, BranchKind, CsrKind, LoadKind, Op, ShiftKind, StoreKind,
+};
 use crate::Bus;
 
 use super::tests_common::{fresh, write_insn};
 
 // Encode an R-type.
 fn enc_r(opcode: u32, rd: u8, f3: u32, rs1: u8, rs2: u8, f7: u32) -> u32 {
-    (f7 << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15)
-        | (f3 << 12) | ((rd as u32) << 7) | (opcode << 2) | 0b11
+    (f7 << 25)
+        | ((rs2 as u32) << 20)
+        | ((rs1 as u32) << 15)
+        | (f3 << 12)
+        | ((rd as u32) << 7)
+        | (opcode << 2)
+        | 0b11
 }
 // Encode an I-type (also works for loads / ALUI / JALR / Zicsr).
 fn enc_i(opcode: u32, rd: u8, f3: u32, rs1: u8, imm: i32) -> u32 {
     let imm_u = (imm as u32) & 0xFFF;
-    (imm_u << 20) | ((rs1 as u32) << 15) | (f3 << 12)
-        | ((rd as u32) << 7) | (opcode << 2) | 0b11
+    (imm_u << 20) | ((rs1 as u32) << 15) | (f3 << 12) | ((rd as u32) << 7) | (opcode << 2) | 0b11
 }
 // Encode an S-type.
 fn enc_s(opcode: u32, f3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
     let imm_u = (imm as u32) & 0xFFF;
     let hi = (imm_u >> 5) & 0x7F;
     let lo = imm_u & 0x1F;
-    (hi << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15)
-        | (f3 << 12) | (lo << 7) | (opcode << 2) | 0b11
+    (hi << 25)
+        | ((rs2 as u32) << 20)
+        | ((rs1 as u32) << 15)
+        | (f3 << 12)
+        | (lo << 7)
+        | (opcode << 2)
+        | 0b11
 }
 // Encode a B-type.
 fn enc_b(f3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
@@ -39,8 +50,15 @@ fn enc_b(f3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
     let b11 = (imm_u >> 11) & 0x1;
     let b10_5 = (imm_u >> 5) & 0x3F;
     let b4_1 = (imm_u >> 1) & 0xF;
-    (b12 << 31) | (b10_5 << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15)
-        | (f3 << 12) | (b4_1 << 8) | (b11 << 7) | (0b11_000 << 2) | 0b11
+    (b12 << 31)
+        | (b10_5 << 25)
+        | ((rs2 as u32) << 20)
+        | ((rs1 as u32) << 15)
+        | (f3 << 12)
+        | (b4_1 << 8)
+        | (b11 << 7)
+        | (0b11_000 << 2)
+        | 0b11
 }
 // Encode a J-type (JAL).
 fn enc_j(rd: u8, imm: i32) -> u32 {
@@ -49,8 +67,13 @@ fn enc_j(rd: u8, imm: i32) -> u32 {
     let b10_1 = (imm_u >> 1) & 0x3FF;
     let b11 = (imm_u >> 11) & 0x1;
     let b19_12 = (imm_u >> 12) & 0xFF;
-    (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12)
-        | ((rd as u32) << 7) | (0b11_011 << 2) | 0b11
+    (b20 << 31)
+        | (b10_1 << 21)
+        | (b11 << 20)
+        | (b19_12 << 12)
+        | ((rd as u32) << 7)
+        | (0b11_011 << 2)
+        | 0b11
 }
 // Encode a U-type.
 fn enc_u(opcode: u32, rd: u8, imm: u32) -> u32 {
@@ -75,8 +98,16 @@ const AUIPC: u32 = 0b00_101;
 fn exec_addi_positive() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 5;
-    c.execute(Op::OpImm { kind: AluImmKind::Addi, rd: 2, rs1: 1, imm: 7 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::OpImm {
+            kind: AluImmKind::Addi,
+            rd: 2,
+            rs1: 1,
+            imm: 7,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[2], 12);
     assert_eq!(c.pc, 0x2000_0004);
 }
@@ -85,8 +116,16 @@ fn exec_addi_positive() {
 fn exec_addi_negative_imm() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 10;
-    c.execute(Op::OpImm { kind: AluImmKind::Addi, rd: 2, rs1: 1, imm: -3 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::OpImm {
+            kind: AluImmKind::Addi,
+            rd: 2,
+            rs1: 1,
+            imm: -3,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[2], 7);
 }
 
@@ -95,8 +134,16 @@ fn exec_add_wraps() {
     let (mut c, mut bus) = fresh();
     c.x[1] = u32::MAX;
     c.x[2] = 1;
-    c.execute(Op::Op { kind: AluKind::Add, rd: 3, rs1: 1, rs2: 2 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Add,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[3], 0);
 }
 
@@ -105,8 +152,16 @@ fn exec_sub() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 10;
     c.x[2] = 3;
-    c.execute(Op::Op { kind: AluKind::Sub, rd: 3, rs1: 1, rs2: 2 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Sub,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[3], 7);
 }
 
@@ -115,11 +170,27 @@ fn exec_slt_signed_and_sltu_unsigned() {
     let (mut c, mut bus) = fresh();
     c.x[1] = (-1i32) as u32;
     c.x[2] = 1;
-    c.execute(Op::Op { kind: AluKind::Slt, rd: 3, rs1: 1, rs2: 2 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Slt,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[3], 1, "signed -1 < 1");
-    c.execute(Op::Op { kind: AluKind::Sltu, rd: 4, rs1: 1, rs2: 2 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Sltu,
+            rd: 4,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[4], 0, "unsigned 0xFFFF_FFFF >= 1");
 }
 
@@ -128,11 +199,38 @@ fn exec_xor_or_and() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0xF0F0_F0F0;
     c.x[2] = 0x0FF0_0FF0;
-    c.execute(Op::Op { kind: AluKind::Xor, rd: 3, rs1: 1, rs2: 2 }, &mut bus, 0);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Xor,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[3], 0xFF00_FF00);
-    c.execute(Op::Op { kind: AluKind::Or, rd: 4, rs1: 1, rs2: 2 }, &mut bus, 0);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Or,
+            rd: 4,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[4], 0xFFF0_FFF0);
-    c.execute(Op::Op { kind: AluKind::And, rd: 5, rs1: 1, rs2: 2 }, &mut bus, 0);
+    c.execute(
+        Op::Op {
+            kind: AluKind::And,
+            rd: 5,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[5], 0x00F0_00F0);
 }
 
@@ -141,11 +239,38 @@ fn exec_shifts_reg() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x8000_0001;
     c.x[2] = 1;
-    c.execute(Op::Op { kind: AluKind::Sll, rd: 3, rs1: 1, rs2: 2 }, &mut bus, 0);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Sll,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[3], 0x0000_0002);
-    c.execute(Op::Op { kind: AluKind::Srl, rd: 4, rs1: 1, rs2: 2 }, &mut bus, 0);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Srl,
+            rd: 4,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[4], 0x4000_0000);
-    c.execute(Op::Op { kind: AluKind::Sra, rd: 5, rs1: 1, rs2: 2 }, &mut bus, 0);
+    c.execute(
+        Op::Op {
+            kind: AluKind::Sra,
+            rd: 5,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[5], 0xC000_0000, "arithmetic — sign bit preserved");
 }
 
@@ -153,22 +278,44 @@ fn exec_shifts_reg() {
 fn exec_srai_shifts_by_shamt_only() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x8000_0000;
-    c.execute(Op::ShiftImm { kind: ShiftKind::Srai, rd: 2, rs1: 1, shamt: 4 },
-              &mut bus, 0);
+    c.execute(
+        Op::ShiftImm {
+            kind: ShiftKind::Srai,
+            rd: 2,
+            rs1: 1,
+            shamt: 4,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[2], 0xF800_0000);
 }
 
 #[test]
 fn exec_lui_sets_upper_immediate() {
     let (mut c, mut bus) = fresh();
-    c.execute(Op::Lui { rd: 5, imm: 0x1234_5000 }, &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Lui {
+            rd: 5,
+            imm: 0x1234_5000,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[5], 0x1234_5000);
 }
 
 #[test]
 fn exec_auipc_uses_current_pc() {
     let (mut c, mut bus) = fresh();
-    c.execute(Op::Auipc { rd: 7, imm: 0x0000_1000 }, &mut bus, 0x2000_0100);
+    c.execute(
+        Op::Auipc {
+            rd: 7,
+            imm: 0x0000_1000,
+        },
+        &mut bus,
+        0x2000_0100,
+    );
     assert_eq!(c.x[7], 0x2000_1100);
 }
 
@@ -179,8 +326,16 @@ fn exec_auipc_uses_current_pc() {
 #[test]
 fn x0_writes_are_ignored() {
     let (mut c, mut bus) = fresh();
-    c.execute(Op::OpImm { kind: AluImmKind::Addi, rd: 0, rs1: 0, imm: 5 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::OpImm {
+            kind: AluImmKind::Addi,
+            rd: 0,
+            rs1: 0,
+            imm: 5,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.x[0], 0, "x[0] is hardwired zero");
 }
 
@@ -193,10 +348,26 @@ fn exec_sw_then_lw_roundtrip() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x2000_1000; // base
     c.x[2] = 0xDEAD_BEEF;
-    c.execute(Op::Store { kind: StoreKind::Sw, rs1: 1, rs2: 2, imm: 0 },
-              &mut bus, 0x2000_0000);
-    c.execute(Op::Load { kind: LoadKind::Lw, rd: 3, rs1: 1, imm: 0 },
-              &mut bus, 0x2000_0004);
+    c.execute(
+        Op::Store {
+            kind: StoreKind::Sw,
+            rs1: 1,
+            rs2: 2,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
+    c.execute(
+        Op::Load {
+            kind: LoadKind::Lw,
+            rd: 3,
+            rs1: 1,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0004,
+    );
     assert_eq!(c.x[3], 0xDEAD_BEEF);
 }
 
@@ -205,13 +376,37 @@ fn exec_sb_lb_signed_and_lbu_unsigned() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x2000_1000;
     c.x[2] = 0xFF; // high sign
-    c.execute(Op::Store { kind: StoreKind::Sb, rs1: 1, rs2: 2, imm: 0 },
-              &mut bus, 0);
-    c.execute(Op::Load { kind: LoadKind::Lb, rd: 3, rs1: 1, imm: 0 },
-              &mut bus, 0);
+    c.execute(
+        Op::Store {
+            kind: StoreKind::Sb,
+            rs1: 1,
+            rs2: 2,
+            imm: 0,
+        },
+        &mut bus,
+        0,
+    );
+    c.execute(
+        Op::Load {
+            kind: LoadKind::Lb,
+            rd: 3,
+            rs1: 1,
+            imm: 0,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[3], 0xFFFF_FFFF);
-    c.execute(Op::Load { kind: LoadKind::Lbu, rd: 4, rs1: 1, imm: 0 },
-              &mut bus, 0);
+    c.execute(
+        Op::Load {
+            kind: LoadKind::Lbu,
+            rd: 4,
+            rs1: 1,
+            imm: 0,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[4], 0x0000_00FF);
 }
 
@@ -220,11 +415,37 @@ fn exec_sh_lh_signed_and_lhu_unsigned() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x2000_1000;
     c.x[2] = 0x8234;
-    c.execute(Op::Store { kind: StoreKind::Sh, rs1: 1, rs2: 2, imm: 0 },
-              &mut bus, 0);
-    c.execute(Op::Load { kind: LoadKind::Lh, rd: 3, rs1: 1, imm: 0 }, &mut bus, 0);
+    c.execute(
+        Op::Store {
+            kind: StoreKind::Sh,
+            rs1: 1,
+            rs2: 2,
+            imm: 0,
+        },
+        &mut bus,
+        0,
+    );
+    c.execute(
+        Op::Load {
+            kind: LoadKind::Lh,
+            rd: 3,
+            rs1: 1,
+            imm: 0,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[3], 0xFFFF_8234);
-    c.execute(Op::Load { kind: LoadKind::Lhu, rd: 4, rs1: 1, imm: 0 }, &mut bus, 0);
+    c.execute(
+        Op::Load {
+            kind: LoadKind::Lhu,
+            rd: 4,
+            rs1: 1,
+            imm: 0,
+        },
+        &mut bus,
+        0,
+    );
     assert_eq!(c.x[4], 0x0000_8234);
 }
 
@@ -233,8 +454,16 @@ fn lw_misalign_traps_cause4() {
     let (mut c, mut bus) = fresh();
     c.csrs.mtvec = 0x2000_2000; // direct mode
     c.x[1] = 0x2000_1001; // not 4-aligned
-    c.execute(Op::Load { kind: LoadKind::Lw, rd: 2, rs1: 1, imm: 0 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Load {
+            kind: LoadKind::Lw,
+            rd: 2,
+            rs1: 1,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.csrs.mcause, 4);
     assert_eq!(c.csrs.mepc, 0x2000_0000);
     assert_eq!(c.pc, 0x2000_2000);
@@ -246,8 +475,16 @@ fn sh_misalign_traps_cause6() {
     c.csrs.mtvec = 0x2000_2000;
     c.x[1] = 0x2000_1001;
     c.x[2] = 0x1234;
-    c.execute(Op::Store { kind: StoreKind::Sh, rs1: 1, rs2: 2, imm: 0 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Store {
+            kind: StoreKind::Sh,
+            rs1: 1,
+            rs2: 2,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.csrs.mcause, 6);
 }
 
@@ -260,8 +497,16 @@ fn branch_beq_taken() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 1;
     c.x[2] = 1;
-    c.execute(Op::Branch { kind: BranchKind::Beq, rs1: 1, rs2: 2, imm: 0x20 },
-              &mut bus, 0x2000_0100);
+    c.execute(
+        Op::Branch {
+            kind: BranchKind::Beq,
+            rs1: 1,
+            rs2: 2,
+            imm: 0x20,
+        },
+        &mut bus,
+        0x2000_0100,
+    );
     assert_eq!(c.pc, 0x2000_0120);
 }
 
@@ -270,8 +515,16 @@ fn branch_beq_not_taken_falls_through() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 1;
     c.x[2] = 2;
-    c.execute(Op::Branch { kind: BranchKind::Beq, rs1: 1, rs2: 2, imm: 0x20 },
-              &mut bus, 0x2000_0100);
+    c.execute(
+        Op::Branch {
+            kind: BranchKind::Beq,
+            rs1: 1,
+            rs2: 2,
+            imm: 0x20,
+        },
+        &mut bus,
+        0x2000_0100,
+    );
     assert_eq!(c.pc, 0x2000_0104);
 }
 
@@ -280,8 +533,16 @@ fn branch_blt_signed() {
     let (mut c, mut bus) = fresh();
     c.x[1] = (-5i32) as u32;
     c.x[2] = 3;
-    c.execute(Op::Branch { kind: BranchKind::Blt, rs1: 1, rs2: 2, imm: 0x10 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Branch {
+            kind: BranchKind::Blt,
+            rs1: 1,
+            rs2: 2,
+            imm: 0x10,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.pc, 0x2000_0010, "signed -5 < 3");
 }
 
@@ -290,8 +551,16 @@ fn branch_bltu_unsigned() {
     let (mut c, mut bus) = fresh();
     c.x[1] = (-5i32) as u32; // 0xFFFF_FFFB
     c.x[2] = 3;
-    c.execute(Op::Branch { kind: BranchKind::Bltu, rs1: 1, rs2: 2, imm: 0x10 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Branch {
+            kind: BranchKind::Bltu,
+            rs1: 1,
+            rs2: 2,
+            imm: 0x10,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.pc, 0x2000_0004, "unsigned 0xFFFF_FFFB >= 3, not taken");
 }
 
@@ -300,16 +569,40 @@ fn branch_bne_bge_bgeu() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0;
     c.x[2] = 0;
-    c.execute(Op::Branch { kind: BranchKind::Bne, rs1: 1, rs2: 2, imm: 0x10 },
-              &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Branch {
+            kind: BranchKind::Bne,
+            rs1: 1,
+            rs2: 2,
+            imm: 0x10,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.pc, 0x2000_0004, "bne equal not taken");
 
-    c.execute(Op::Branch { kind: BranchKind::Bge, rs1: 1, rs2: 2, imm: 0x10 },
-              &mut bus, 0x2000_0100);
+    c.execute(
+        Op::Branch {
+            kind: BranchKind::Bge,
+            rs1: 1,
+            rs2: 2,
+            imm: 0x10,
+        },
+        &mut bus,
+        0x2000_0100,
+    );
     assert_eq!(c.pc, 0x2000_0110, "bge 0 >= 0 taken");
 
-    c.execute(Op::Branch { kind: BranchKind::Bgeu, rs1: 1, rs2: 2, imm: 0x10 },
-              &mut bus, 0x2000_0200);
+    c.execute(
+        Op::Branch {
+            kind: BranchKind::Bgeu,
+            rs1: 1,
+            rs2: 2,
+            imm: 0x10,
+        },
+        &mut bus,
+        0x2000_0200,
+    );
     assert_eq!(c.pc, 0x2000_0210, "bgeu 0 >= 0 taken");
 }
 
@@ -329,7 +622,15 @@ fn exec_jal_writes_link_and_jumps() {
 fn exec_jalr_uses_rs1_and_clears_low_bit() {
     let (mut c, mut bus) = fresh();
     c.x[2] = 0x2000_0101; // odd
-    c.execute(Op::Jalr { rd: 1, rs1: 2, imm: 0 }, &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Jalr {
+            rd: 1,
+            rs1: 2,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     // low bit cleared -> 0x2000_0100, which is 4-aligned, OK.
     assert_eq!(c.x[1], 0x2000_0004);
     assert_eq!(c.pc, 0x2000_0100);
@@ -339,7 +640,15 @@ fn exec_jalr_uses_rs1_and_clears_low_bit() {
 fn exec_jalr_rd_eq_rs1_link_wins_over_target_race() {
     let (mut c, mut bus) = fresh();
     c.x[5] = 0x2000_0200;
-    c.execute(Op::Jalr { rd: 5, rs1: 5, imm: 0 }, &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Jalr {
+            rd: 5,
+            rs1: 5,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     // After execute: x[5] is the link (epc+4), pc is the old x[5].
     assert_eq!(c.x[5], 0x2000_0004);
     assert_eq!(c.pc, 0x2000_0200);
@@ -352,7 +661,15 @@ fn jal_target_2byte_aligned_ok_with_c() {
     let (mut c, mut bus) = fresh();
     c.csrs.mtvec = 0x2000_2000;
     c.x[2] = 0x2000_0002; // 2-aligned, not 4-aligned — legal with C.
-    c.execute(Op::Jalr { rd: 1, rs1: 2, imm: 0 }, &mut bus, 0x2000_0000);
+    c.execute(
+        Op::Jalr {
+            rd: 1,
+            rs1: 2,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
     assert_eq!(c.csrs.mcause, 0, "no trap — mcause unchanged from reset");
     assert_eq!(c.pc, 0x2000_0002, "jumped to 2-aligned target");
     assert_eq!(c.x[1], 0x2000_0004, "link = epc + 4 (instruction width)");
@@ -366,7 +683,7 @@ fn jal_target_2byte_aligned_ok_with_c() {
 fn ecall_traps_cause_11() {
     let (mut c, mut bus) = fresh();
     c.csrs.mtvec = 0x2000_2000; // direct
-    c.csrs.mstatus |= 1 << 3;   // set MIE so we can observe the shuffle
+    c.csrs.mstatus |= 1 << 3; // set MIE so we can observe the shuffle
     c.execute(Op::Ecall, &mut bus, 0x2000_0008);
     assert_eq!(c.csrs.mcause, 11);
     assert_eq!(c.csrs.mepc, 0x2000_0008);
@@ -449,8 +766,14 @@ fn csrrw_read_then_write_mscratch() {
     c.csrs.mscratch = 0x1234_5678;
     c.x[1] = 0xFEED_BEEF;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_MSCRATCH },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 2,
+            rs1_or_zimm: 1,
+            csr: CSR_MSCRATCH,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[2], 0x1234_5678, "rd = old");
     assert_eq!(c.csrs.mscratch, 0xFEED_BEEF, "new = rs1");
@@ -462,8 +785,14 @@ fn csrrs_sets_bits() {
     c.csrs.mie = 0;
     c.x[1] = 1 << 7; // MTIE
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrs, rd: 2, rs1_or_zimm: 1, csr: CSR_MIE },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrs,
+            rd: 2,
+            rs1_or_zimm: 1,
+            csr: CSR_MIE,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[2], 0);
     assert_eq!(c.csrs.mie, 1 << 7);
@@ -475,8 +804,14 @@ fn csrrc_clears_bits() {
     c.csrs.mie = (1 << 3) | (1 << 7) | (1 << 11);
     c.x[1] = 1 << 7;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrc, rd: 2, rs1_or_zimm: 1, csr: CSR_MIE },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrc,
+            rd: 2,
+            rs1_or_zimm: 1,
+            csr: CSR_MIE,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[2], (1 << 3) | (1 << 7) | (1 << 11));
     assert_eq!(c.csrs.mie, (1 << 3) | (1 << 11));
@@ -487,8 +822,14 @@ fn csrrwi_uses_zimm() {
     let (mut c, mut bus) = fresh();
     c.csrs.mscratch = 0;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrwi, rd: 2, rs1_or_zimm: 0x1F, csr: CSR_MSCRATCH },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrwi,
+            rd: 2,
+            rs1_or_zimm: 0x1F,
+            csr: CSR_MSCRATCH,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.mscratch, 0x1F);
 }
@@ -498,8 +839,14 @@ fn csrrw_to_readonly_traps_even_rd_x0() {
     let (mut c, mut bus) = fresh();
     c.csrs.mtvec = 0x2000_2000;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MHARTID },
-        &mut bus, 0x2000_0000,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MHARTID,
+        },
+        &mut bus,
+        0x2000_0000,
     );
     assert_eq!(c.csrs.mcause, 2);
     assert_eq!(c.csrs.mepc, 0x2000_0000);
@@ -511,8 +858,14 @@ fn csrrs_to_readonly_with_rs1_nonzero_traps() {
     let (mut c, mut bus) = fresh();
     c.csrs.mtvec = 0x2000_2000;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrs, rd: 2, rs1_or_zimm: 5, csr: CSR_MHARTID },
-        &mut bus, 0x2000_0000,
+        Op::Csr {
+            kind: CsrKind::Csrrs,
+            rd: 2,
+            rs1_or_zimm: 5,
+            csr: CSR_MHARTID,
+        },
+        &mut bus,
+        0x2000_0000,
     );
     assert_eq!(c.csrs.mcause, 2);
 }
@@ -521,8 +874,14 @@ fn csrrs_to_readonly_with_rs1_nonzero_traps() {
 fn csrrs_to_readonly_with_rs1_zero_reads_no_trap() {
     let (mut c, mut bus) = fresh();
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrs, rd: 2, rs1_or_zimm: 0, csr: CSR_MHARTID },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrs,
+            rd: 2,
+            rs1_or_zimm: 0,
+            csr: CSR_MHARTID,
+        },
+        &mut bus,
+        0,
     );
     // No trap; rd gets the hartid value.
     assert_eq!(c.csrs.mcause, 0);
@@ -534,8 +893,14 @@ fn csrrs_to_readonly_with_rs1_zero_reads_no_trap() {
 fn csrrci_to_readonly_with_zimm_zero_no_trap() {
     let (mut c, mut bus) = fresh();
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrci, rd: 3, rs1_or_zimm: 0, csr: CSR_MHARTID },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrci,
+            rd: 3,
+            rs1_or_zimm: 0,
+            csr: CSR_MHARTID,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.mcause, 0);
     assert_eq!(c.x[3], 0);
@@ -546,8 +911,14 @@ fn unimplemented_csr_traps_cause_2() {
     let (mut c, mut bus) = fresh();
     c.csrs.mtvec = 0x2000_2000;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrs, rd: 2, rs1_or_zimm: 0, csr: 0x3C0 /* unimpl */ },
-        &mut bus, 0x2000_0000,
+        Op::Csr {
+            kind: CsrKind::Csrrs,
+            rd: 2,
+            rs1_or_zimm: 0,
+            csr: 0x3C0, /* unimpl */
+        },
+        &mut bus,
+        0x2000_0000,
     );
     assert_eq!(c.csrs.mcause, 2);
 }
@@ -557,8 +928,14 @@ fn mstatus_mpp_warl_rounds_up() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 1 << 11; // MPP = 01 (S-mode) — not supported in V1
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MSTATUS },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MSTATUS,
+        },
+        &mut bus,
+        0,
     );
     // WARL rounds to 0b11 (M-mode only).
     assert_eq!((c.csrs.mstatus >> 11) & 0b11, 0b11);
@@ -569,8 +946,14 @@ fn mtvec_bit1_hardwired_zero() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x1234_5672; // bits [1:0] = 10 — bit 1 should clear
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MTVEC },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MTVEC,
+        },
+        &mut bus,
+        0,
     );
     // Writer keeps bit 0 (MODE) but clears bit 1.
     assert_eq!(c.csrs.mtvec, 0x1234_5670);
@@ -581,8 +964,14 @@ fn mtval_write_ignored_hardwired_zero() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0xFFFF_FFFF;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MTVAL },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MTVAL,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.mtval, 0);
 }
@@ -592,8 +981,14 @@ fn mcause_warl_drops_illegal_exception_code() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 99; // illegal exception code
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MCAUSE },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MCAUSE,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.mcause, 0);
 }
@@ -603,8 +998,14 @@ fn mcause_warl_keeps_legal_interrupt_code() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x8000_0007; // interrupt cause 7 (MTI) — legal
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MCAUSE },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MCAUSE,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.mcause, 0x8000_0007);
 }
@@ -614,8 +1015,14 @@ fn mcountinhibit_reserved_bit_cleared() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0b111; // bit 1 is reserved
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MCOUNTINHIBIT },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MCOUNTINHIBIT,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.mcountinhibit, 0b101);
 }
@@ -625,10 +1032,19 @@ fn mepc_low_bits_masked() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x2000_0103;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_MEPC },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MEPC,
+        },
+        &mut bus,
+        0,
     );
-    assert_eq!(c.csrs.mepc, 0x2000_0102, "low bit masked (bit 1 writable with C)");
+    assert_eq!(
+        c.csrs.mepc, 0x2000_0102,
+        "low bit masked (bit 1 writable with C)"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -652,10 +1068,19 @@ fn pmpcfg0_byte0_roundtrip() {
     // 0x0F = L=0, A=OFF (00), X=1, W=1, R=1 — valid combination.
     c.x[1] = 0x0000_000F;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
-    assert_eq!(c.csrs.pmpcfg[0], 0x0000_000F, "byte 0 roundtrips a legal R/W/X pattern");
+    assert_eq!(
+        c.csrs.pmpcfg[0], 0x0000_000F,
+        "byte 0 roundtrips a legal R/W/X pattern"
+    );
 }
 
 #[test]
@@ -664,8 +1089,14 @@ fn pmpcfg0_reserved_bits_raz() {
     // 0x60 = bits [6:5] set (Smepmp reserved, RAZ/WI on Hazard3).
     c.x[1] = 0x0000_0060;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpcfg[0], 0, "reserved bits [6:5] mask to zero");
 }
@@ -676,8 +1107,14 @@ fn pmpcfg0_invalid_rw_rounded() {
     // 0x02 = W=1, R=0 — illegal per RV-priv §3.7.1; WARL rounds to 0.
     c.x[1] = 0x0000_0002;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpcfg[0], 0, "W=1,R=0 rounds to W=0,R=0");
 }
@@ -688,8 +1125,14 @@ fn pmpcfg0_mode_napot_preserved() {
     // 0x18 = A=NAPOT (11), L=0, no R/W/X.
     c.x[1] = 0x0000_0018;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpcfg[0], 0x0000_0018, "A=NAPOT pattern preserved");
 }
@@ -699,8 +1142,14 @@ fn pmpaddr0_full_width_writable() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0xFFFF_FFFF;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPADDR0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPADDR0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpaddr[0], 0xFFFF_FFFF, "G=0: all 32 bits writable");
 }
@@ -711,10 +1160,19 @@ fn pmpcfg1_byte0_writable_phase2() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x0000_000F;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPCFG1_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 2,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG1_ADDR,
+        },
+        &mut bus,
+        0,
     );
-    assert_eq!(c.csrs.pmpcfg[1], 0x0000_000F, "entry 4 is writable under phase-2");
+    assert_eq!(
+        c.csrs.pmpcfg[1], 0x0000_000F,
+        "entry 4 is writable under phase-2"
+    );
     assert_eq!(c.x[2], 0, "read-side prior value is zero");
 }
 
@@ -724,8 +1182,14 @@ fn pmpaddr7_writable_phase2() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0xDEAD_BEEF;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPADDR7_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 2,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPADDR7_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpaddr[7], 0xDEAD_BEEF, "entry 7 is fully writable");
 }
@@ -736,8 +1200,14 @@ fn pmpcfg2_unsynthesised_wi_phase2() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x0000_00FF;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPCFG2_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 2,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG2_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpcfg[2], 0, "entry 8 unsynthesised — byte WI");
     assert_eq!(c.x[2], 0, "read-side 0 for unsynthesised entry");
@@ -748,8 +1218,14 @@ fn pmpaddr8_unsynthesised_wi_phase2() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0xDEAD_BEEF;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 2, rs1_or_zimm: 1, csr: CSR_PMPADDR8_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 2,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPADDR8_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpaddr[8], 0, "entry 8 unsynthesised — pmpaddr WI");
     assert_eq!(c.x[2], 0, "read-side 0 for unsynthesised entry");
@@ -764,15 +1240,27 @@ fn pmpcfg0_lock_write_protects() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x0000_0080; // L=1, rest zero
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpcfg[0], 0x0000_0080, "L latched");
     // Attempt to clear — should be dropped because L=1 already stored.
     c.x[2] = 0;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 2,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpcfg[0], 0x0000_0080, "locked byte resists clear");
 }
@@ -783,13 +1271,25 @@ fn pmpaddr0_locked_by_own_l() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x0000_0080; // L=1
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     c.x[2] = 0xFFFF_FFFF;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPADDR0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 2,
+            csr: CSR_PMPADDR0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpaddr[0], 0, "pmpaddr0 locked by own pmpcfg0.L");
 }
@@ -801,21 +1301,39 @@ fn pmpaddr0_locked_by_entry1_tor() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x0000_8800; // byte 1 = 0x88 = L|TOR
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!((c.csrs.pmpcfg[0] >> 8) & 0xFF, 0x88, "byte 1 latched L|TOR");
     c.x[2] = 0x1234_5678;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPADDR0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 2,
+            csr: CSR_PMPADDR0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpaddr[0], 0, "pmpaddr0 locked by entry 1 TOR+L");
     // But pmpaddr1 (entry 1's own addr) is *also* locked by its own L.
     c.x[3] = 0x1234_5678;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 3, csr: CSR_PMPADDR1_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 3,
+            csr: CSR_PMPADDR1_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpaddr[1], 0, "pmpaddr1 locked by own L");
 }
@@ -828,16 +1346,35 @@ fn pmpaddr6_not_locked_by_entry7_non_tor() {
     // pmpcfg1 byte 3 = entry 7. 0x98 << 24.
     c.x[1] = 0x9800_0000;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG1_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG1_ADDR,
+        },
+        &mut bus,
+        0,
     );
-    assert_eq!((c.csrs.pmpcfg[1] >> 24) & 0xFF, 0x98, "entry 7 L|NAPOT latched");
+    assert_eq!(
+        (c.csrs.pmpcfg[1] >> 24) & 0xFF,
+        0x98,
+        "entry 7 L|NAPOT latched"
+    );
     c.x[2] = 0xABCD_0000;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPADDR6_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 2,
+            csr: CSR_PMPADDR6_ADDR,
+        },
+        &mut bus,
+        0,
     );
-    assert_eq!(c.csrs.pmpaddr[6], 0xABCD_0000, "pmpaddr6 free — entry 7 not TOR");
+    assert_eq!(
+        c.csrs.pmpaddr[6], 0xABCD_0000,
+        "pmpaddr6 free — entry 7 not TOR"
+    );
 }
 
 #[test]
@@ -846,8 +1383,14 @@ fn reset_pmp_csrs_clears_lock() {
     let (mut c, mut bus) = fresh();
     c.x[1] = 0x0000_00FF; // L=1, NAPOT, XWR
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 1, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_ne!(c.csrs.pmpcfg[0] & 0x80, 0, "L latched pre-reset");
     c.reset_pmp_csrs();
@@ -856,8 +1399,14 @@ fn reset_pmp_csrs_clears_lock() {
     // After reset, a fresh write succeeds.
     c.x[2] = 0x0000_000F;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 0, rs1_or_zimm: 2, csr: CSR_PMPCFG0_ADDR },
-        &mut bus, 0,
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 2,
+            csr: CSR_PMPCFG0_ADDR,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.csrs.pmpcfg[0], 0x0000_000F, "post-reset write lands");
 }
@@ -1128,8 +1677,15 @@ fn csr_read_mhartid_yields_hartid() {
     let mut bus = Bus::new();
     // CSRRS x2, mhartid, x0
     let insn = enc_i(SYSTEM, 2, 0b010, 0, CSR_MHARTID as i32 & 0xFFF);
-    assert!(matches!(decode::decode(insn),
-        Op::Csr { kind: CsrKind::Csrrs, rd: 2, rs1_or_zimm: 0, .. }));
+    assert!(matches!(
+        decode::decode(insn),
+        Op::Csr {
+            kind: CsrKind::Csrrs,
+            rd: 2,
+            rs1_or_zimm: 0,
+            ..
+        }
+    ));
     write_insn(&mut bus, 0, insn);
     c.step(&mut bus);
     assert_eq!(c.x[2], 1, "hart 1 mhartid = 1");

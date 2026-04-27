@@ -40,9 +40,9 @@
 
 use crate::onerom_serving_oracle::{lift_shadow_from_flash_pub, stimulus_level_pub};
 
-use rand::rngs::StdRng;
 use rand::RngCore;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 // ---------------------------------------------------------------------------
 // Ladder defaults
@@ -330,8 +330,7 @@ mod tests {
     /// Fixture path hardcoded to the committed 1541-cpu fixture — the
     /// same one `onerom_stress_cpu_rp2350` targets. Tests that need the
     /// real fixture load it relative to the workspace cwd.
-    const FIXTURE_PATH: &str =
-        "fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
+    const FIXTURE_PATH: &str = "fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
 
     fn load_fixture() -> Vec<u8> {
         // Tests run from `crates/mdpicoem-harness/`; fixture lives
@@ -372,8 +371,7 @@ mod tests {
             assert!(
                 !seen[idx],
                 "addr 0x{:04X} (low11={}) appears twice",
-                step.addr,
-                idx
+                step.addr, idx
             );
             seen[idx] = true;
         }

@@ -514,10 +514,9 @@ impl Dma {
             CH_WRITE_ADDR | CH_AL1_WRITE_ADDR_TRIG | CH_AL2_WRITE_ADDR | CH_AL3_WRITE_ADDR => {
                 ch.write_addr
             }
-            CH_TRANS_COUNT
-            | CH_AL1_TRANS_COUNT
-            | CH_AL2_TRANS_COUNT_TRIG
-            | CH_AL3_TRANS_COUNT => ch.trans_count,
+            CH_TRANS_COUNT | CH_AL1_TRANS_COUNT | CH_AL2_TRANS_COUNT_TRIG | CH_AL3_TRANS_COUNT => {
+                ch.trans_count
+            }
             CH_CTRL_TRIG | CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => ctrl_image,
             _ => 0,
         }
@@ -918,7 +917,7 @@ mod tests {
         // Write ch0 registers via DMA_BASE
         bus.write32(DMA_BASE + 0x00, 0x2000_1000, 0); // READ_ADDR
         bus.write32(DMA_BASE + 0x04, 0x2000_2000, 0); // WRITE_ADDR
-        bus.write32(DMA_BASE + 0x08, 42, 0);           // TRANS_COUNT
+        bus.write32(DMA_BASE + 0x08, 42, 0); // TRANS_COUNT
 
         assert_eq!(bus.read32(DMA_BASE + 0x00, 0), 0x2000_1000);
         assert_eq!(bus.read32(DMA_BASE + 0x04, 0), 0x2000_2000);
@@ -949,7 +948,11 @@ mod tests {
 
         // Read CTRL_TRIG — BUSY should be set
         let readback = bus.read32(DMA_BASE + 0x0C, 0);
-        assert_ne!(readback & CTRL_BUSY, 0, "BUSY must be set after CTRL_TRIG write");
+        assert_ne!(
+            readback & CTRL_BUSY,
+            0,
+            "BUSY must be set after CTRL_TRIG write"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -1003,7 +1006,11 @@ mod tests {
         assert_eq!(bus.read32(dst, 0), 0xCAFE_BABE);
         // BUSY should be clear
         let readback = bus.read32(DMA_BASE + 0x0C, 0);
-        assert_eq!(readback & CTRL_BUSY, 0, "BUSY must clear after transfer completes");
+        assert_eq!(
+            readback & CTRL_BUSY,
+            0,
+            "BUSY must clear after transfer completes"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -1037,7 +1044,11 @@ mod tests {
             assert_eq!(bus.read32(dst + i * 4, 0), i + 1, "word {i} mismatch");
         }
         // INTR bit 0 should be set
-        assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0, "INTR bit 0 must latch");
+        assert_ne!(
+            bus.read32(DMA_BASE + REG_INTR, 0) & 1,
+            0,
+            "INTR bit 0 must latch"
+        );
         // BUSY should be clear
         let ctrl_read = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(ctrl_read & CTRL_BUSY, 0, "BUSY must be clear");
@@ -1067,7 +1078,11 @@ mod tests {
         // Tick — DREQ not asserted, so no transfer should happen
         bus.tick_dma();
 
-        assert_eq!(bus.read32(dst, 0), 0, "no transfer should occur when DREQ is not asserted");
+        assert_eq!(
+            bus.read32(dst, 0),
+            0,
+            "no transfer should occur when DREQ is not asserted"
+        );
         // Channel should still be BUSY
         let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_ne!(readback & CTRL_BUSY, 0, "channel must remain BUSY");
@@ -1136,11 +1151,11 @@ mod tests {
         bus.write32(src1, 0xBBBB_1111, 0);
 
         // Use AL1_CTRL (no trigger) to write ch1 CTRL
-        bus.write32(DMA_BASE + 0x40 + 0x00, src1, 0);    // ch1 READ_ADDR
-        bus.write32(DMA_BASE + 0x40 + 0x04, dst1, 0);    // ch1 WRITE_ADDR
-        bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0);       // ch1 TRANS_COUNT
+        bus.write32(DMA_BASE + 0x40 + 0x00, src1, 0); // ch1 READ_ADDR
+        bus.write32(DMA_BASE + 0x40 + 0x04, dst1, 0); // ch1 WRITE_ADDR
+        bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0); // ch1 TRANS_COUNT
         let ctrl1 = make_ctrl(true, 2, true, true, 63, 1, 0, false);
-        bus.write32(DMA_BASE + 0x40 + 0x10, ctrl1, 0);   // ch1 AL1_CTRL (no trigger)
+        bus.write32(DMA_BASE + 0x40 + 0x10, ctrl1, 0); // ch1 AL1_CTRL (no trigger)
 
         // Tick once: ch0 completes, chains to ch1
         bus.tick_dma();
@@ -1148,7 +1163,11 @@ mod tests {
 
         // ch1 should now be BUSY
         let ch1_ctrl = bus.read32(DMA_BASE + 0x40 + 0x0C, 0);
-        assert_ne!(ch1_ctrl & CTRL_BUSY, 0, "channel 1 must be BUSY after chain");
+        assert_ne!(
+            ch1_ctrl & CTRL_BUSY,
+            0,
+            "channel 1 must be BUSY after chain"
+        );
 
         // Tick again: ch1 completes
         bus.tick_dma();
@@ -1216,7 +1235,10 @@ mod tests {
 
         // INTS0 should be nonzero
         let ints0 = bus.read32(DMA_BASE + REG_INTS0, 0);
-        assert_ne!(ints0, 0, "INTS0 must be set after transfer completes with INTE0 enabled");
+        assert_ne!(
+            ints0, 0,
+            "INTS0 must be set after transfer completes with INTE0 enabled"
+        );
 
         // irq_pending should have DMA_IRQ_0 set
         assert_ne!(
@@ -1381,7 +1403,11 @@ mod tests {
         assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0);
         // W1C: write 1 to bit 0 to clear
         bus.write32(DMA_BASE + REG_INTR, 1, 0);
-        assert_eq!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0, "INTR bit 0 must be cleared");
+        assert_eq!(
+            bus.read32(DMA_BASE + REG_INTR, 0) & 1,
+            0,
+            "INTR bit 0 must be cleared"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -1484,7 +1510,11 @@ mod tests {
 
         bus.tick_dma();
 
-        assert_eq!(bus.read32(DMA_BASE + REG_INTR, 0), 0, "IRQ_QUIET must suppress INTR");
+        assert_eq!(
+            bus.read32(DMA_BASE + REG_INTR, 0),
+            0,
+            "IRQ_QUIET must suppress INTR"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -1597,7 +1627,11 @@ mod tests {
         // BUSY should be clear, INTR bit 0 set.
         let readback = bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(readback & CTRL_BUSY, 0, "BUSY must clear after completion");
-        assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & 1, 0, "INTR bit 0 must latch");
+        assert_ne!(
+            bus.read32(DMA_BASE + REG_INTR, 0) & 1,
+            0,
+            "INTR bit 0 must latch"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -1682,8 +1716,8 @@ mod tests {
     // ----------------------------------------------------------------
 
     use std::sync::{Arc, Mutex};
-    use tracing::{Event, Metadata, Subscriber};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     #[derive(Default)]
     struct CaptureSubscriber {
@@ -1702,8 +1736,12 @@ mod tests {
     }
 
     impl Subscriber for CaptureSubscriber {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
-        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
         fn record(&self, _span: &Id, _values: &Record<'_>) {}
         fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
         fn event(&self, event: &Event<'_>) {
@@ -1728,7 +1766,9 @@ mod tests {
     #[test]
     fn bswap_warn_fires_once_per_channel() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut dma = Dma::new();
             // Two BSWAP-set writes on channel 3 — one warn.
@@ -1749,7 +1789,9 @@ mod tests {
     #[test]
     fn high_priority_warn_fires_once_per_channel() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut dma = Dma::new();
             dma.write32(2 * 0x40 + CH_AL1_CTRL, CTRL_HIGH_PRIORITY, 0);
@@ -1763,7 +1805,9 @@ mod tests {
     #[test]
     fn sniff_ctrl_en_warn_fires_once() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut dma = Dma::new();
             // Two SNIFF_CTRL.EN-set writes — one warn.
@@ -1778,7 +1822,9 @@ mod tests {
     #[test]
     fn sniff_data_warn_fires_once() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut dma = Dma::new();
             dma.write32(REG_SNIFF_DATA, 0xDEAD_BEEF, 0);

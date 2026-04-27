@@ -36,7 +36,11 @@ fn build_with_serial_succeeds() {
     let result = EmulatorBuilder::new(Config::default())
         .execution(ExecutionModel::Serial)
         .build();
-    assert!(result.is_ok(), "Serial build must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Serial build must succeed: {:?}",
+        result.err()
+    );
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows", feature = "threading"))]
@@ -86,16 +90,17 @@ fn worker_panic_surfaces_as_error() {
 
     let first = emu.run_quantum();
     match first {
-        Err(EmulatorError::WorkerPanicked { ref which, ref message }) => {
+        Err(EmulatorError::WorkerPanicked {
+            ref which,
+            ref message,
+        }) => {
             assert_eq!(*which, WorkerName::Pio0, "panic must be attributed to pio0");
             assert!(
                 message.contains("pio0"),
                 "panic message must name the worker: got {message:?}"
             );
         }
-        other => panic!(
-            "expected Err(EmulatorError::WorkerPanicked), got {other:?}"
-        ),
+        other => panic!("expected Err(EmulatorError::WorkerPanicked), got {other:?}"),
     }
 
     // One-shot guarantee: the next call must return the SAME error
@@ -105,13 +110,14 @@ fn worker_panic_surfaces_as_error() {
     // short-circuits before that.)
     let second = emu.run_quantum();
     match second {
-        Err(EmulatorError::WorkerPanicked { ref which, ref message }) => {
+        Err(EmulatorError::WorkerPanicked {
+            ref which,
+            ref message,
+        }) => {
             assert_eq!(*which, WorkerName::Pio0);
             assert!(message.contains("pio0"));
         }
-        other => panic!(
-            "one-shot: second call must also return WorkerPanicked, got {other:?}"
-        ),
+        other => panic!("one-shot: second call must also return WorkerPanicked, got {other:?}"),
     }
 }
 
@@ -160,9 +166,7 @@ fn threaded_step_returns_not_supported() {
 
     match emu.step() {
         Err(EmulatorError::NotSupportedInThreadedMode) => {}
-        other => panic!(
-            "Threaded step() must return NotSupportedInThreadedMode, got {other:?}"
-        ),
+        other => panic!("Threaded step() must return NotSupportedInThreadedMode, got {other:?}"),
     }
 }
 

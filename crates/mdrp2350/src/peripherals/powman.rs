@@ -321,9 +321,7 @@ impl PowmanRegs {
         // target write on mismatch and latch BADPASSWD. Handled up-front
         // so each storage branch below can assume either (a) this offset
         // is not password-gated, or (b) the password is correct.
-        if is_password_gated(offset)
-            && (value & POWMAN_PASSWORD_MASK) != POWMAN_PASSWORD
-        {
+        if is_password_gated(offset) && (value & POWMAN_PASSWORD_MASK) != POWMAN_PASSWORD {
             self.badpasswd |= BADPASSWD_BIT;
             trace!(
                 offset = format_args!("{:#X}", offset),
@@ -861,7 +859,9 @@ mod tests {
     #[test]
     fn archsel_arm_default_and_no_tripwire_on_arm_write() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut p = PowmanRegs::new();
             assert_eq!(p.read32(ARCHSEL_OFFSET), ARCHSEL_ARM);

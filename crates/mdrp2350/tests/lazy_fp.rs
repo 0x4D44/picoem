@@ -9,9 +9,9 @@
 //! through PPB MMIO and call `test_enter_exception` / `test_exit_exception`
 //! to simulate the architecturally-defined paths.
 
-use std::sync::Arc;
-use mdrp2350::{Bus, CortexM33};
 use mdrp2350::threaded::CoreAtomics;
+use mdrp2350::{Bus, CortexM33};
+use std::sync::Arc;
 
 /// Build a `CortexM33` with its own fresh `Arc<CoreAtomics>` for tests
 /// that don't share a bus. Integration-test helper mirroring the
@@ -23,12 +23,12 @@ fn new_core(id: u8) -> CortexM33 {
 // ---------------------------------------------------------------------------
 // FPCCR bit positions — duplicated locally to avoid cross-crate coupling.
 // Identical to the crate-internal constants in `bus/ppb.rs`.
-const FPCCR_LSPACT:    u32 = 1 << 0;
-const FPCCR_MMRDY:     u32 = 1 << 5;
-const FPCCR_BFRDY:     u32 = 1 << 6;
+const FPCCR_LSPACT: u32 = 1 << 0;
+const FPCCR_MMRDY: u32 = 1 << 5;
+const FPCCR_BFRDY: u32 = 1 << 6;
 const FPCCR_SPLIMVIOL: u32 = 1 << 9;
-const FPCCR_LSPEN:     u32 = 1 << 30;
-const FPCCR_ASPEN:     u32 = 1 << 31;
+const FPCCR_LSPEN: u32 = 1 << 30;
+const FPCCR_ASPEN: u32 = 1 << 31;
 
 const CONTROL_FPCA: u32 = 1 << 2;
 
@@ -99,7 +99,6 @@ fn no_fp_handler_no_fp_frame_writes() {
     let pre_msp = cpu.regs.msp;
     cpu.test_enter_exception(11, &mut bus); // SVC
     let post_msp = cpu.regs.msp;
-    
 
     // Frame is 32 bytes (basic only) — no FP region.
     assert_eq!(pre_msp - post_msp, 32, "no-FP frame is exactly 32 bytes");
@@ -135,7 +134,11 @@ fn fp_handler_lazy_flush_then_return() {
     cpu.regs.s[4] = 2.5;
     let (hw0, hw1) = enc_vadd(0, 2, 4);
     cpu.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(cpu.regs.control & CONTROL_FPCA, CONTROL_FPCA, "FPU op sets FPCA");
+    assert_eq!(
+        cpu.regs.control & CONTROL_FPCA,
+        CONTROL_FPCA,
+        "FPU op sets FPCA"
+    );
     assert_eq!(cpu.regs.s[0], 4.0);
 
     // Seed S0..S15 with a known pre-exception pattern.
@@ -148,7 +151,6 @@ fn fp_handler_lazy_flush_then_return() {
 
     let pre_msp = cpu.regs.msp;
     cpu.test_enter_exception(11, &mut bus);
-    
 
     // Frame is 32 + 72 = 104 bytes.
     assert_eq!(pre_msp - cpu.regs.msp, 104);
@@ -180,7 +182,11 @@ fn fp_handler_lazy_flush_then_return() {
     // from the frame. (The pre-exception values are gone — they were
     // overwritten by the flush of the in-handler register file.)
     cpu.test_exit_exception(0xFFFF_FFE9, &mut bus);
-    assert_eq!(cpu.regs.control & CONTROL_FPCA, CONTROL_FPCA, "FPCA restored");
+    assert_eq!(
+        cpu.regs.control & CONTROL_FPCA,
+        CONTROL_FPCA,
+        "FPCA restored"
+    );
     assert_eq!(cpu.regs.msp, pre_msp);
 }
 
@@ -195,7 +201,6 @@ fn fp_handler_lazy_flush_then_return() {
 #[test]
 fn nested_interrupts_capture_fpca_independently() {
     let (mut cpu, mut bus) = fixture();
-    
 
     // Light up FPCA via an FPU op.
     let (hw0, hw1) = enc_vadd(0, 2, 4);
@@ -219,35 +224,55 @@ fn nested_interrupts_capture_fpca_independently() {
     // so the nested inner entry will also reserve an FP region.
     cpu.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(cpu.ppb.fpccr & FPCCR_LSPACT, 0, "outer LSPACT flushed");
-    assert_eq!(cpu.regs.control & CONTROL_FPCA, CONTROL_FPCA,
-        "outer handler now FP-active");
+    assert_eq!(
+        cpu.regs.control & CONTROL_FPCA,
+        CONTROL_FPCA,
+        "outer handler now FP-active"
+    );
 
     // Inner exception — taken with FPCA=1, so inner entry reserves its
     // OWN FP frame (wider frame, FType=0 EXC_RETURN, fresh LSPACT).
     let inner_msp_pre = cpu.regs.msp;
     cpu.test_enter_exception(14, &mut bus); // PendSV
-    assert_eq!(cpu.regs.r[14], 0xFFFF_FFE1,
-        "inner FType=0, return-handler (MSP)");
-    assert_eq!(inner_msp_pre - cpu.regs.msp, 104,
-        "inner reserves basic + FP region (104B)");
+    assert_eq!(
+        cpu.regs.r[14], 0xFFFF_FFE1,
+        "inner FType=0, return-handler (MSP)"
+    );
+    assert_eq!(
+        inner_msp_pre - cpu.regs.msp,
+        104,
+        "inner reserves basic + FP region (104B)"
+    );
     assert_ne!(cpu.ppb.fpccr & FPCCR_LSPACT, 0, "inner lazy reserve");
     let inner_fpcar = cpu.ppb.fpcar;
-    assert_ne!(inner_fpcar, outer_fpcar,
-        "inner FPCAR is distinct from outer FPCAR");
-    assert_eq!(cpu.regs.control & CONTROL_FPCA, 0, "FPCA cleared on inner entry");
+    assert_ne!(
+        inner_fpcar, outer_fpcar,
+        "inner FPCAR is distinct from outer FPCAR"
+    );
+    assert_eq!(
+        cpu.regs.control & CONTROL_FPCA,
+        0,
+        "FPCA cleared on inner entry"
+    );
 
     // Execute a VFP op in the inner handler — flushes the inner lazy
     // reservation and sets FPCA=1 in inner-handler context.
     cpu.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(cpu.ppb.fpccr & FPCCR_LSPACT, 0, "inner LSPACT flushed");
-    assert_eq!(cpu.regs.control & CONTROL_FPCA, CONTROL_FPCA,
-        "inner handler FP-active");
+    assert_eq!(
+        cpu.regs.control & CONTROL_FPCA,
+        CONTROL_FPCA,
+        "inner handler FP-active"
+    );
 
     // Return from inner (FType=0). Inner's FP frame is popped; FPCA
     // restored to 1 by the FType=0 rule.
     cpu.test_exit_exception(cpu.regs.r[14], &mut bus);
-    assert_eq!(cpu.regs.control & CONTROL_FPCA, CONTROL_FPCA,
-        "inner return restores FPCA=1");
+    assert_eq!(
+        cpu.regs.control & CONTROL_FPCA,
+        CONTROL_FPCA,
+        "inner return restores FPCA=1"
+    );
     assert_eq!(cpu.regs.msp, inner_msp_pre, "inner pop restores SP");
     assert_eq!(cpu.regs.r[14], outer_lr, "inner pop restored outer LR");
 
@@ -255,8 +280,11 @@ fn nested_interrupts_capture_fpca_independently() {
     // flushed its lazy reservation earlier, LSPACT=0 here and the FP
     // frame pop restores S0-S15 + FPSCR from memory. FPCA restored to 1.
     cpu.test_exit_exception(outer_lr, &mut bus);
-    assert_eq!(cpu.regs.control & CONTROL_FPCA, CONTROL_FPCA,
-        "outer return restores pre-outer FPCA=1");
+    assert_eq!(
+        cpu.regs.control & CONTROL_FPCA,
+        CONTROL_FPCA,
+        "outer return restores pre-outer FPCA=1"
+    );
     assert_eq!(cpu.regs.msp, outer_msp_pre, "outer pop restores SP");
 }
 
@@ -267,7 +295,7 @@ fn nested_interrupts_capture_fpca_independently() {
 fn eager_mode_writes_fp_frame_on_entry() {
     let (mut cpu, mut bus) = fixture();
     // Disable lazy stacking: clear FPCCR.LSPEN.
-    
+
     cpu.ppb.fpccr &= !FPCCR_LSPEN;
 
     // Light up FPCA.
@@ -294,8 +322,12 @@ fn eager_mode_writes_fp_frame_on_entry() {
     // Verify each saved word.
     for i in 0..16 {
         let expected = 0xFACE_0000 + i as u32;
-        assert_eq!(bus.read32(fpcar + (i as u32) * 4, 0), expected,
-            "S{} eager save mismatch", i);
+        assert_eq!(
+            bus.read32(fpcar + (i as u32) * 4, 0),
+            expected,
+            "S{} eager save mismatch",
+            i
+        );
     }
     assert_eq!(bus.read32(fpcar + 64, 0), 0xC000_0000, "FPSCR eager save");
     assert_eq!(bus.read32(fpcar + 68, 0), 0, "reserved word");
@@ -328,12 +360,14 @@ fn stack_limit_basic_frame_underflow_no_splimviol() {
     cpu.regs.msplim = cpu.regs.msp - 16;
 
     cpu.test_enter_exception(11, &mut bus);
-    
 
     // SPLIMVIOL must be CLEAR — the basic frame alone underflowed, so
     // the FP region isn't the cause.
-    assert_eq!(cpu.ppb.fpccr & FPCCR_SPLIMVIOL, 0,
-        "SPLIMVIOL must stay clear when basic frame alone underflows");
+    assert_eq!(
+        cpu.ppb.fpccr & FPCCR_SPLIMVIOL,
+        0,
+        "SPLIMVIOL must stay clear when basic frame alone underflows"
+    );
     // CFSR.STKOF must be set regardless.
     assert_ne!(cpu.ppb.cfsr & (1 << 20), 0, "CFSR.STKOF must be set");
     // UsageFault is pending.
@@ -356,11 +390,13 @@ fn stack_limit_fp_region_underflow_sets_splimviol() {
     cpu.regs.msplim = cpu.regs.msp - 40;
 
     cpu.test_enter_exception(11, &mut bus);
-    
 
     // SPLIMVIOL set on FPCCR — FP region specifically drove the violation.
-    assert_ne!(cpu.ppb.fpccr & FPCCR_SPLIMVIOL, 0,
-        "SPLIMVIOL must be set when basic fits but FP region underflows");
+    assert_ne!(
+        cpu.ppb.fpccr & FPCCR_SPLIMVIOL,
+        0,
+        "SPLIMVIOL must be set when basic fits but FP region underflows"
+    );
     // CFSR.STKOF (bit 20) set.
     assert_ne!(cpu.ppb.cfsr & (1 << 20), 0, "CFSR.STKOF must be set");
     // UsageFault is pending.
@@ -393,7 +429,7 @@ fn bus_fault_during_lazy_flush_delivers_busfault() {
     // Take an exception — entry reserves the lazy frame on MSP, sets
     // LSPACT, sets FPCAR.
     cpu.test_enter_exception(11, &mut bus);
-    
+
     assert_ne!(cpu.ppb.fpccr & FPCCR_LSPACT, 0);
 
     // Force the flush target to an unmapped address (region 0xB has no
@@ -407,25 +443,38 @@ fn bus_fault_during_lazy_flush_delivers_busfault() {
     // exception 5 (BusFault).
     let (hw0, hw1) = enc_vadd(0, 2, 4);
     bus.write32(HANDLER_ADDR, ((hw1 as u32) << 16) | hw0 as u32, 0);
-    assert_eq!(cpu.regs.pc(), HANDLER_ADDR, "PC sits at handler after entry");
+    assert_eq!(
+        cpu.regs.pc(),
+        HANDLER_ADDR,
+        "PC sits at handler after entry"
+    );
 
     // One step: decode fetches VADD, fpu_execute runs the lazy flush which
     // bus-faults, step() observes bus.bus_fault and delivers BusFault.
     cpu.step(&mut bus);
 
     // BFRDY must be set on the flush.
-    assert_ne!(cpu.ppb.fpccr & FPCCR_BFRDY, 0,
-        "FPCCR.BFRDY must be set on flush bus fault");
+    assert_ne!(
+        cpu.ppb.fpccr & FPCCR_BFRDY,
+        0,
+        "FPCCR.BFRDY must be set on flush bus fault"
+    );
     // LSPACT must be retained so the next attempt sees the unflushed
     // state.
-    assert_ne!(cpu.ppb.fpccr & FPCCR_LSPACT, 0,
-        "LSPACT must remain set after bus-faulting flush");
+    assert_ne!(
+        cpu.ppb.fpccr & FPCCR_LSPACT,
+        0,
+        "LSPACT must remain set after bus-faulting flush"
+    );
     // MMRDY must be clear (we reached BusFault, not MemManage).
     assert_eq!(cpu.ppb.fpccr & FPCCR_MMRDY, 0);
 
     // End-to-end: the BusFault exception (vector 5) must have been taken.
-    assert_eq!(cpu.regs.ipsr(), 5,
-        "IPSR must be BusFault (5) after step() delivers the fault");
+    assert_eq!(
+        cpu.regs.ipsr(),
+        5,
+        "IPSR must be BusFault (5) after step() delivers the fault"
+    );
     // BusFault-specific CFSR bits: PRECISERR (bit 9) and BFARVALID (bit 15).
     assert_ne!(cpu.ppb.cfsr & (1 << 9), 0, "CFSR.BFSR.PRECISERR set");
     assert_ne!(cpu.ppb.cfsr & (1 << 15), 0, "CFSR.BFSR.BFARVALID set");
@@ -449,10 +498,12 @@ fn fabricated_fp_exc_return_raises_usage_fault() {
     // The integrity check at exit must reject this.
     cpu.test_exit_exception(0xFFFF_FFE9, &mut bus);
 
-    
     // CFSR.UFSR.INVPC (bit 17).
-    assert_ne!(cpu.ppb.cfsr & (1 << 17), 0,
-        "CFSR.UFSR.INVPC must be set on bogus FType=0 EXC_RETURN");
+    assert_ne!(
+        cpu.ppb.cfsr & (1 << 17),
+        0,
+        "CFSR.UFSR.INVPC must be set on bogus FType=0 EXC_RETURN"
+    );
     assert!(cpu.has_pending_fault(), "UsageFault must be pending");
 }
 
@@ -482,7 +533,7 @@ fn exc_return_ftype1_with_lspact_mismatch() {
     // reserves the FP region, sets LSPACT, and writes an FType=0
     // EXC_RETURN into LR.
     cpu.test_enter_exception(11, &mut bus);
-    
+
     assert_ne!(cpu.ppb.fpccr & FPCCR_LSPACT, 0, "LSPACT set by lazy entry");
     assert_eq!(cpu.regs.r[14], 0xFFFF_FFE9, "FType=0 EXC_RETURN on entry");
 
@@ -495,13 +546,21 @@ fn exc_return_ftype1_with_lspact_mismatch() {
     cpu.test_exit_exception(fabricated, &mut bus);
 
     // 5. UsageFault pending with CFSR.UFSR.INVPC (bit 17) set.
-    assert_ne!(cpu.ppb.cfsr & (1 << 17), 0,
-        "CFSR.UFSR.INVPC must be set on FType=1/LSPACT=1 mismatch");
-    assert!(cpu.has_pending_fault(),
-        "UsageFault must be pending on integrity-check failure");
+    assert_ne!(
+        cpu.ppb.cfsr & (1 << 17),
+        0,
+        "CFSR.UFSR.INVPC must be set on FType=1/LSPACT=1 mismatch"
+    );
+    assert!(
+        cpu.has_pending_fault(),
+        "UsageFault must be pending on integrity-check failure"
+    );
     // LSPACT is retained — the silent-clear alternative would mask the bug.
-    assert_ne!(cpu.ppb.fpccr & FPCCR_LSPACT, 0,
-        "LSPACT must NOT be silently cleared by the integrity check");
+    assert_ne!(
+        cpu.ppb.fpccr & FPCCR_LSPACT,
+        0,
+        "LSPACT must NOT be silently cleared by the integrity check"
+    );
 }
 
 // ===========================================================================
@@ -529,8 +588,12 @@ fn exception_replay_under_fpca_zero_and_one() {
 
         let expected_frame: u32 = if fpca { 104 } else { 32 };
         let expected_lr: u32 = if fpca { 0xFFFF_FFE9 } else { 0xFFFF_FFF9 };
-        assert_eq!(pre_msp - cpu.regs.msp, expected_frame,
-            "fpca={}: frame size", fpca);
+        assert_eq!(
+            pre_msp - cpu.regs.msp,
+            expected_frame,
+            "fpca={}: frame size",
+            fpca
+        );
         assert_eq!(cpu.regs.r[14], expected_lr, "fpca={}: EXC_RETURN", fpca);
         assert_eq!(cpu.regs.ipsr(), 11, "fpca={}: IPSR=SVC", fpca);
 
@@ -538,9 +601,12 @@ fn exception_replay_under_fpca_zero_and_one() {
         cpu.test_exit_exception(cpu.regs.r[14], &mut bus);
         assert_eq!(cpu.regs.msp, pre_msp, "fpca={}: SP restored", fpca);
         let post_fpca = cpu.regs.control & CONTROL_FPCA;
-        assert_eq!(post_fpca,
+        assert_eq!(
+            post_fpca,
             if fpca { CONTROL_FPCA } else { 0 },
-            "fpca={}: FPCA restored", fpca);
+            "fpca={}: FPCA restored",
+            fpca
+        );
     }
 }
 
@@ -579,8 +645,11 @@ fn core1_fpu_entry_exit_isolated_from_core0() {
     core1.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(core1.regs.s[0], 18.0);
     assert_eq!(core1.regs.control & CONTROL_FPCA, CONTROL_FPCA);
-    assert_eq!(core0.regs.control & CONTROL_FPCA, 0,
-        "Core 0 FPCA must remain clear");
+    assert_eq!(
+        core0.regs.control & CONTROL_FPCA,
+        0,
+        "Core 0 FPCA must remain clear"
+    );
 
     // Core 1 takes an exception. FP frame must be allocated on Core 1's
     // stack and recorded on Core 1's PPB lane.

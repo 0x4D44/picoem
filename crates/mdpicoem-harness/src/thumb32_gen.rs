@@ -63,21 +63,20 @@ pub fn enc_t32_dp_mod_imm(op: u16, s: bool, rn: u16, rd: u16, imm12: u16) -> (u1
 // shift_amount = imm3:imm2 (5 bits, imm3=top3, imm2=bottom2)
 
 pub fn enc_t32_dp_shift_reg(
-    op: u16, s: bool, rn: u16, rd: u16, rm: u16, stype: u16, samount: u16,
+    op: u16,
+    s: bool,
+    rn: u16,
+    rd: u16,
+    rm: u16,
+    stype: u16,
+    samount: u16,
 ) -> (u16, u16) {
     let imm3 = (samount >> 2) & 0x7;
     let imm2 = samount & 0x3;
 
-    let hw0 = 0b11101_01_0000_0_0000u16
-        | ((op & 0xF) << 5)
-        | (u16::from(s) << 4)
-        | (rn & 0xF);
+    let hw0 = 0b11101_01_0000_0_0000u16 | ((op & 0xF) << 5) | (u16::from(s) << 4) | (rn & 0xF);
 
-    let hw1 = (imm3 << 12)
-        | ((rd & 0xF) << 8)
-        | (imm2 << 6)
-        | ((stype & 0x3) << 4)
-        | (rm & 0xF);
+    let hw1 = (imm3 << 12) | ((rd & 0xF) << 8) | (imm2 << 6) | ((stype & 0x3) << 4) | (rm & 0xF);
 
     (hw0, hw1)
 }
@@ -92,7 +91,7 @@ pub fn enc_t32_dp_shift_reg(
 #[inline]
 fn scatter_imm16(base_hw0: u16, rd: u16, imm16: u16) -> (u16, u16) {
     let imm4 = (imm16 >> 12) & 0xF;
-    let i    = (imm16 >> 11) & 1;
+    let i = (imm16 >> 11) & 1;
     let imm3 = (imm16 >> 8) & 0x7;
     let imm8 = imm16 & 0xFF;
 
@@ -117,7 +116,7 @@ pub fn enc_t32_movt(rd: u16, imm16: u16) -> (u16, u16) {
 /// imm12 = i:imm3:imm8 → hw0 bit10=i, hw1 bits [14:12]=imm3, [7:0]=imm8.
 #[inline]
 fn scatter_imm12(base_hw0: u16, rd: u16, rn: u16, imm12: u16) -> (u16, u16) {
-    let i    = (imm12 >> 11) & 1;
+    let i = (imm12 >> 11) & 1;
     let imm3 = (imm12 >> 8) & 0x7;
     let imm8 = imm12 & 0xFF;
 
@@ -235,7 +234,12 @@ fn ls_hw0(size: u16, load: bool, signed: bool, rn: u16) -> u16 {
 
 /// 12-bit unsigned offset mode.
 pub fn enc_t32_ls_imm12(
-    size: u16, load: bool, signed: bool, rn: u16, rt: u16, imm12: u16,
+    size: u16,
+    load: bool,
+    signed: bool,
+    rn: u16,
+    rt: u16,
+    imm12: u16,
 ) -> (u16, u16) {
     // hw0[7] = 1 selects this mode
     let hw0 = ls_hw0(size, load, signed, rn) | (1 << 7);
@@ -245,8 +249,15 @@ pub fn enc_t32_ls_imm12(
 
 /// 8-bit offset with P/U/W bits (pre-index, post-index, negative offset).
 pub fn enc_t32_ls_imm8(
-    size: u16, load: bool, signed: bool, rn: u16, rt: u16,
-    p: bool, u: bool, w: bool, imm8: u16,
+    size: u16,
+    load: bool,
+    signed: bool,
+    rn: u16,
+    rt: u16,
+    p: bool,
+    u: bool,
+    w: bool,
+    imm8: u16,
 ) -> (u16, u16) {
     // hw0[7] = 0, hw1[11] = 1 selects this mode
     let hw0 = ls_hw0(size, load, signed, rn);
@@ -261,13 +272,17 @@ pub fn enc_t32_ls_imm8(
 
 /// Register offset with shift.
 pub fn enc_t32_ls_reg(
-    size: u16, load: bool, signed: bool, rn: u16, rt: u16, rm: u16, shift: u16,
+    size: u16,
+    load: bool,
+    signed: bool,
+    rn: u16,
+    rt: u16,
+    rm: u16,
+    shift: u16,
 ) -> (u16, u16) {
     // hw0[7] = 0, hw1[11] = 0 selects this mode
     let hw0 = ls_hw0(size, load, signed, rn);
-    let hw1 = ((rt & 0xF) << 12)
-        | ((shift & 0x3) << 4)
-        | (rm & 0xF);
+    let hw1 = ((rt & 0xF) << 12) | ((shift & 0x3) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
@@ -282,10 +297,7 @@ pub fn enc_t32_ls_reg(
 /// hw1: register list (16 bits)
 pub fn enc_t32_stm(rn: u16, w: bool, db: bool, reglist: u16) -> (u16, u16) {
     let op = if db { 0b10u16 } else { 0b01u16 };
-    let hw0 = 0b1110_100_00_0_0_0_0000u16
-        | (op << 7)
-        | ((w as u16) << 5)
-        | (rn & 0xF);
+    let hw0 = 0b1110_100_00_0_0_0_0000u16 | (op << 7) | ((w as u16) << 5) | (rn & 0xF);
     (hw0, reglist)
 }
 
@@ -294,10 +306,7 @@ pub fn enc_t32_stm(rn: u16, w: bool, db: bool, reglist: u16) -> (u16, u16) {
 /// hw0: 1110_100_op[1:0]_0_W_1_Rn
 pub fn enc_t32_ldm(rn: u16, w: bool, db: bool, reglist: u16) -> (u16, u16) {
     let op = if db { 0b10u16 } else { 0b01u16 };
-    let hw0 = 0b1110_100_00_0_0_1_0000u16
-        | (op << 7)
-        | ((w as u16) << 5)
-        | (rn & 0xF);
+    let hw0 = 0b1110_100_00_0_0_1_0000u16 | (op << 7) | ((w as u16) << 5) | (rn & 0xF);
     (hw0, reglist)
 }
 
@@ -306,7 +315,13 @@ pub fn enc_t32_ldm(rn: u16, w: bool, db: bool, reglist: u16) -> (u16, u16) {
 /// hw0: 1110_100_P_U_1_W_1_Rn
 /// hw1: Rt[15:12] Rt2[11:8] imm8[7:0]
 pub fn enc_t32_ldrd(
-    rt: u16, rt2: u16, rn: u16, p: bool, u: bool, w: bool, imm8: u16,
+    rt: u16,
+    rt2: u16,
+    rn: u16,
+    p: bool,
+    u: bool,
+    w: bool,
+    imm8: u16,
 ) -> (u16, u16) {
     let hw0 = 0b1110_100_0_0_1_0_1_0000u16
         | ((p as u16) << 8)
@@ -322,7 +337,13 @@ pub fn enc_t32_ldrd(
 /// hw0: 1110_100_P_U_1_W_0_Rn
 /// hw1: Rt[15:12] Rt2[11:8] imm8[7:0]
 pub fn enc_t32_strd(
-    rt: u16, rt2: u16, rn: u16, p: bool, u: bool, w: bool, imm8: u16,
+    rt: u16,
+    rt2: u16,
+    rn: u16,
+    p: bool,
+    u: bool,
+    w: bool,
+    imm8: u16,
 ) -> (u16, u16) {
     let hw0 = 0b1110_100_0_0_1_0_0_0000u16
         | ((p as u16) << 8)
@@ -451,7 +472,14 @@ pub fn enc_t32_smulxy(rd: u16, rn: u16, rm: u16, n_high: bool, m_high: bool) -> 
 
 /// SMLABB/BT/TB/TT Rd, Rn, Rm, Ra — halfword multiply-accumulate.
 /// `n_high`/`m_high` select top (true) or bottom (false) halfword.
-pub fn enc_t32_smlabb(rd: u16, rn: u16, rm: u16, ra: u16, n_high: bool, m_high: bool) -> (u16, u16) {
+pub fn enc_t32_smlabb(
+    rd: u16,
+    rn: u16,
+    rm: u16,
+    ra: u16,
+    n_high: bool,
+    m_high: bool,
+) -> (u16, u16) {
     let hw0 = 0xFB10 | (rn & 0xF);
     let op2 = ((n_high as u16) << 1) | (m_high as u16);
     let hw1 = ((ra & 0xF) << 12) | ((rd & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
@@ -572,7 +600,14 @@ pub fn enc_t32_usada8(rd: u16, rn: u16, rm: u16, ra: u16) -> (u16, u16) {
 // hw1 = RdLo_RdHi_10_N_M_Rm   (N=high Rn, M=high Rm)
 
 /// SMLALBB/BT/TB/TT RdLo, RdHi, Rn, Rm — signed 64-bit halfword MAC.
-pub fn enc_t32_smlalxy(rdlo: u16, rdhi: u16, rn: u16, rm: u16, n_high: bool, m_high: bool) -> (u16, u16) {
+pub fn enc_t32_smlalxy(
+    rdlo: u16,
+    rdhi: u16,
+    rn: u16,
+    rm: u16,
+    n_high: bool,
+    m_high: bool,
+) -> (u16, u16) {
     let hw0 = 0xFBC0 | (rn & 0xF);
     let op2 = 0b1000 | ((n_high as u16) << 1) | (m_high as u16);
     let hw1 = ((rdlo & 0xF) << 12) | ((rdhi & 0xF) << 8) | (op2 << 4) | (rm & 0xF);
@@ -630,21 +665,15 @@ pub fn enc_t32_umaal(rdlo: u16, rdhi: u16, rn: u16, rm: u16) -> (u16, u16) {
 /// imm21 = S:J2:J1:imm6:imm11:0  (no XOR trick for T3)
 pub fn enc_t32_b_cond(cond: u16, offset: i32) -> (u16, u16) {
     let uoff = offset as u32;
-    let s     = (uoff >> 20) & 1;
-    let j2    = (uoff >> 19) & 1;
-    let j1    = (uoff >> 18) & 1;
-    let imm6  = (uoff >> 12) & 0x3F;
+    let s = (uoff >> 20) & 1;
+    let j2 = (uoff >> 19) & 1;
+    let j1 = (uoff >> 18) & 1;
+    let imm6 = (uoff >> 12) & 0x3F;
     let imm11 = (uoff >> 1) & 0x7FF;
 
-    let hw0 = 0xF000u16
-        | ((s as u16) << 10)
-        | ((cond & 0xF) << 6)
-        | (imm6 as u16);
+    let hw0 = 0xF000u16 | ((s as u16) << 10) | ((cond & 0xF) << 6) | (imm6 as u16);
 
-    let hw1 = 0x8000u16
-        | ((j1 as u16) << 13)
-        | ((j2 as u16) << 11)
-        | (imm11 as u16);
+    let hw1 = 0x8000u16 | ((j1 as u16) << 13) | ((j2 as u16) << 11) | (imm11 as u16);
 
     (hw0, hw1)
 }
@@ -657,10 +686,10 @@ pub fn enc_t32_b_cond(cond: u16, offset: i32) -> (u16, u16) {
 /// Uses the XOR trick: I1 = NOT(J1 XOR S), I2 = NOT(J2 XOR S)
 /// imm25 = S:I1:I2:imm10:imm11:0
 pub fn enc_t32_b_uncond(offset: i32) -> (u16, u16) {
-    let uoff  = offset as u32;
-    let s     = (uoff >> 24) & 1;
-    let i1    = (uoff >> 23) & 1;
-    let i2    = (uoff >> 22) & 1;
+    let uoff = offset as u32;
+    let s = (uoff >> 24) & 1;
+    let i1 = (uoff >> 23) & 1;
+    let i2 = (uoff >> 22) & 1;
     let imm10 = (uoff >> 12) & 0x3FF;
     let imm11 = (uoff >> 1) & 0x7FF;
 
@@ -668,14 +697,9 @@ pub fn enc_t32_b_uncond(offset: i32) -> (u16, u16) {
     let j1 = (i1 ^ s) ^ 1;
     let j2 = (i2 ^ s) ^ 1;
 
-    let hw0 = 0xF000u16
-        | ((s as u16) << 10)
-        | (imm10 as u16);
+    let hw0 = 0xF000u16 | ((s as u16) << 10) | (imm10 as u16);
 
-    let hw1 = 0x9000u16
-        | ((j1 as u16) << 13)
-        | ((j2 as u16) << 11)
-        | (imm11 as u16);
+    let hw1 = 0x9000u16 | ((j1 as u16) << 13) | ((j2 as u16) << 11) | (imm11 as u16);
 
     (hw0, hw1)
 }
@@ -685,24 +709,19 @@ pub fn enc_t32_b_uncond(offset: i32) -> (u16, u16) {
 /// hw0: 11110_S_imm10[9:0]
 /// hw1: 11_J1_1_J2_imm11[10:0]
 pub fn enc_t32_bl(offset: i32) -> (u16, u16) {
-    let uoff  = offset as u32;
-    let s     = (uoff >> 24) & 1;
-    let i1    = (uoff >> 23) & 1;
-    let i2    = (uoff >> 22) & 1;
+    let uoff = offset as u32;
+    let s = (uoff >> 24) & 1;
+    let i1 = (uoff >> 23) & 1;
+    let i2 = (uoff >> 22) & 1;
     let imm10 = (uoff >> 12) & 0x3FF;
     let imm11 = (uoff >> 1) & 0x7FF;
 
     let j1 = (i1 ^ s) ^ 1;
     let j2 = (i2 ^ s) ^ 1;
 
-    let hw0 = 0xF000u16
-        | ((s as u16) << 10)
-        | (imm10 as u16);
+    let hw0 = 0xF000u16 | ((s as u16) << 10) | (imm10 as u16);
 
-    let hw1 = 0xD000u16
-        | ((j1 as u16) << 13)
-        | ((j2 as u16) << 11)
-        | (imm11 as u16);
+    let hw1 = 0xD000u16 | ((j1 as u16) << 13) | ((j2 as u16) << 11) | (imm11 as u16);
 
     (hw0, hw1)
 }
@@ -786,28 +805,28 @@ pub fn enc_t32_revsh_w(rd: u16, rm: u16) -> (u16, u16) {
 
 /// LSL.W Rd, Rn, Rm
 pub fn enc_t32_lsl_w_reg(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
-    let hw0 = 0xFA00 | (rn & 0xF);  // stype=00, S=0
+    let hw0 = 0xFA00 | (rn & 0xF); // stype=00, S=0
     let hw1 = 0xF000 | ((rd & 0xF) << 8) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// LSR.W Rd, Rn, Rm
 pub fn enc_t32_lsr_w_reg(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
-    let hw0 = 0xFA20 | (rn & 0xF);  // stype=01, S=0
+    let hw0 = 0xFA20 | (rn & 0xF); // stype=01, S=0
     let hw1 = 0xF000 | ((rd & 0xF) << 8) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// ASR.W Rd, Rn, Rm
 pub fn enc_t32_asr_w_reg(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
-    let hw0 = 0xFA40 | (rn & 0xF);  // stype=10, S=0
+    let hw0 = 0xFA40 | (rn & 0xF); // stype=10, S=0
     let hw1 = 0xF000 | ((rd & 0xF) << 8) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// ROR.W Rd, Rn, Rm
 pub fn enc_t32_ror_w_reg(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
-    let hw0 = 0xFA60 | (rn & 0xF);  // stype=11, S=0
+    let hw0 = 0xFA60 | (rn & 0xF); // stype=11, S=0
     let hw1 = 0xF000 | ((rd & 0xF) << 8) | (rm & 0xF);
     (hw0, hw1)
 }
@@ -821,28 +840,28 @@ pub fn enc_t32_ror_w_reg(rd: u16, rn: u16, rm: u16) -> (u16, u16) {
 
 /// SXTB.W Rd, Rm, {ROR #rot}  (rot = 0, 8, 16, 24)
 pub fn enc_t32_sxtb_w(rd: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA4F;  // ext=100, Rn=15
+    let hw0 = 0xFA4F; // ext=100, Rn=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// UXTB.W Rd, Rm, {ROR #rot}
 pub fn enc_t32_uxtb_w(rd: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA5F;  // ext=101, Rn=15
+    let hw0 = 0xFA5F; // ext=101, Rn=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// SXTH.W Rd, Rm, {ROR #rot}
 pub fn enc_t32_sxth_w(rd: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA0F;  // ext=000, Rn=15
+    let hw0 = 0xFA0F; // ext=000, Rn=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// UXTH.W Rd, Rm, {ROR #rot}
 pub fn enc_t32_uxth_w(rd: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA1F;  // ext=001, Rn=15
+    let hw0 = 0xFA1F; // ext=001, Rn=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
@@ -856,28 +875,28 @@ pub fn enc_t32_uxth_w(rd: u16, rm: u16, rot: u16) -> (u16, u16) {
 
 /// SXTAB Rd, Rn, Rm, {ROR #rot}  (sign-extend byte, add to Rn)
 pub fn enc_t32_sxtab(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA40 | (rn & 0xF);  // ext=100, Rn!=15
+    let hw0 = 0xFA40 | (rn & 0xF); // ext=100, Rn!=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// UXTAB Rd, Rn, Rm, {ROR #rot}  (zero-extend byte, add to Rn)
 pub fn enc_t32_uxtab(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA50 | (rn & 0xF);  // ext=101, Rn!=15
+    let hw0 = 0xFA50 | (rn & 0xF); // ext=101, Rn!=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// SXTAH Rd, Rn, Rm, {ROR #rot}  (sign-extend halfword, add to Rn)
 pub fn enc_t32_sxtah(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA00 | (rn & 0xF);  // ext=000, Rn!=15
+    let hw0 = 0xFA00 | (rn & 0xF); // ext=000, Rn!=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
 
 /// UXTAH Rd, Rn, Rm, {ROR #rot}  (zero-extend halfword, add to Rn)
 pub fn enc_t32_uxtah(rd: u16, rn: u16, rm: u16, rot: u16) -> (u16, u16) {
-    let hw0 = 0xFA10 | (rn & 0xF);  // ext=001, Rn!=15
+    let hw0 = 0xFA10 | (rn & 0xF); // ext=001, Rn!=15
     let hw1 = 0xF080 | ((rd & 0xF) << 8) | ((rot / 8) << 4) | (rm & 0xF);
     (hw0, hw1)
 }
@@ -938,8 +957,8 @@ pub fn enc_t32_parallel(operation: u16, modifier: u16, rn: u16, rd: u16, rm: u16
 // ============================================================================
 
 use crate::{
-    mem_check_u16, mem_check_u32, mem_pre_u16, mem_pre_u32,
-    TestCase, MASK_ALL_FLAGS, MASK_ALL_FLAGS_GE, MASK_NO_FLAGS, MASK_Q_ONLY,
+    MASK_ALL_FLAGS, MASK_ALL_FLAGS_GE, MASK_NO_FLAGS, MASK_Q_ONLY, TestCase, mem_check_u16,
+    mem_check_u32, mem_pre_u16, mem_pre_u32,
 };
 
 // ---------------------------------------------------------------------------
@@ -957,9 +976,14 @@ pub fn gen_t32_dp_mod_imm() -> Vec<TestCase> {
     let tb_c = tb | (1 << 29); // T bit + C flag set
 
     // -- Helper: make a TestCase for S=1 (flag-updating) ALU op --
-    let mk = |name: &str, op: u16, rn: u16, rd: u16, imm12: u16,
-              regs: Vec<(u8, u32)>, xpsr: u32| -> TestCase
-    {
+    let mk = |name: &str,
+              op: u16,
+              rn: u16,
+              rd: u16,
+              imm12: u16,
+              regs: Vec<(u8, u32)>,
+              xpsr: u32|
+     -> TestCase {
         let (hw0, hw1) = enc_t32_dp_mod_imm(op, true, rn, rd, imm12);
         TestCase {
             name: name.into(),
@@ -977,176 +1001,540 @@ pub fn gen_t32_dp_mod_imm() -> Vec<TestCase> {
     // ----------------------------------------------------------------
 
     // Mode 0: imm12[11:10]=00, [9:8]=00 → plain byte 0x000000ii
-    t.push(mk("ADDS.W R3,R5,#0x1F (plain byte)", DP_ADD, 5, 3, 0x01F,
-              vec![(5, 0)], tb));
-    t.push(mk("ADDS.W R0,R1,#0x00 (plain byte zero)", DP_ADD, 1, 0, 0x000,
-              vec![(1, 0)], tb));
-    t.push(mk("ADDS.W R0,R1,#0xFF (plain byte max)", DP_ADD, 1, 0, 0x0FF,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "ADDS.W R3,R5,#0x1F (plain byte)",
+        DP_ADD,
+        5,
+        3,
+        0x01F,
+        vec![(5, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "ADDS.W R0,R1,#0x00 (plain byte zero)",
+        DP_ADD,
+        1,
+        0,
+        0x000,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "ADDS.W R0,R1,#0xFF (plain byte max)",
+        DP_ADD,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0)],
+        tb,
+    ));
 
     // Mode 1: imm12[11:10]=00, [9:8]=01 → 0x00ii00ii
     // imm12 = 0b00_01_iiiiiiii = 0x100 | imm8
-    t.push(mk("ADDS.W R0,R1,#0x00420042 (rep x2)", DP_ADD, 1, 0, 0x142,
-              vec![(1, 0)], tb));
-    t.push(mk("ORRS.W R2,R3,#0x00FF00FF (rep x2 max)", DP_ORR, 3, 2, 0x1FF,
-              vec![(3, 0)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#0x00420042 (rep x2)",
+        DP_ADD,
+        1,
+        0,
+        0x142,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "ORRS.W R2,R3,#0x00FF00FF (rep x2 max)",
+        DP_ORR,
+        3,
+        2,
+        0x1FF,
+        vec![(3, 0)],
+        tb,
+    ));
 
     // Mode 2: imm12[11:10]=00, [9:8]=10 → 0xii00ii00
     // imm12 = 0b00_10_iiiiiiii = 0x200 | imm8
-    t.push(mk("ADDS.W R0,R1,#0x42004200 (rep x2 shifted)", DP_ADD, 1, 0, 0x242,
-              vec![(1, 0)], tb));
-    t.push(mk("EORS.W R4,R5,#0xAB00AB00 (rep x2 shifted)", DP_EOR, 5, 4, 0x2AB,
-              vec![(5, 0xAB00AB00)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#0x42004200 (rep x2 shifted)",
+        DP_ADD,
+        1,
+        0,
+        0x242,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "EORS.W R4,R5,#0xAB00AB00 (rep x2 shifted)",
+        DP_EOR,
+        5,
+        4,
+        0x2AB,
+        vec![(5, 0xAB00AB00)],
+        tb,
+    ));
 
     // Mode 3: imm12[11:10]=00, [9:8]=11 → 0xiiiiiiii
     // imm12 = 0b00_11_iiiiiiii = 0x300 | imm8
-    t.push(mk("ADDS.W R0,R1,#0xABABABAB (rep x4)", DP_ADD, 1, 0, 0x3AB,
-              vec![(1, 0)], tb));
-    t.push(mk("ANDS.W R2,R3,#0xFFFFFFFF (rep x4 max)", DP_AND, 3, 2, 0x3FF,
-              vec![(3, 0x12345678)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#0xABABABAB (rep x4)",
+        DP_ADD,
+        1,
+        0,
+        0x3AB,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "ANDS.W R2,R3,#0xFFFFFFFF (rep x4 max)",
+        DP_AND,
+        3,
+        2,
+        0x3FF,
+        vec![(3, 0x12345678)],
+        tb,
+    ));
 
     // Mode 4: imm12[11:10]!=00 → rotated (0x80|imm7) ROR amount
     // imm12 = 0b01_00000_ii = 0x400 | imm7:  (0x80|0) ROR 8  = 0x80000000
-    t.push(mk("ADDS.W R0,R1,#0x80000000 (rotated)", DP_ADD, 1, 0, 0x400,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#0x80000000 (rotated)",
+        DP_ADD,
+        1,
+        0,
+        0x400,
+        vec![(1, 0)],
+        tb,
+    ));
     // imm12 = 0b10_00000_00 = 0x800: (0x80|0) ROR 16 = 0x00008000
-    t.push(mk("ADDS.W R0,R1,#0x00008000 (rotated)", DP_ADD, 1, 0, 0x800,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#0x00008000 (rotated)",
+        DP_ADD,
+        1,
+        0,
+        0x800,
+        vec![(1, 0)],
+        tb,
+    ));
     // imm12 = 0b01_00001_01 = 0x405: (0x80|5) ROR 8 = 0x85000000
-    t.push(mk("ADDS.W R0,R1,#rotated(0x85 ROR 8)", DP_ADD, 1, 0, 0x405,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#rotated(0x85 ROR 8)",
+        DP_ADD,
+        1,
+        0,
+        0x405,
+        vec![(1, 0)],
+        tb,
+    ));
 
     // ----------------------------------------------------------------
     // ALU operations with S=1 — verify flag behavior
     // ----------------------------------------------------------------
 
     // ADDS.W: zero result (Z)
-    t.push(mk("ADDS.W R0,R1,#0 (Z flag, zero+zero)", DP_ADD, 1, 0, 0x000,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#0 (Z flag, zero+zero)",
+        DP_ADD,
+        1,
+        0,
+        0x000,
+        vec![(1, 0)],
+        tb,
+    ));
     // ADDS.W: negative result (N)
-    t.push(mk("ADDS.W R0,R1,#1 (N flag)", DP_ADD, 1, 0, 0x001,
-              vec![(1, 0xFFFF_FFFE)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#1 (N flag)",
+        DP_ADD,
+        1,
+        0,
+        0x001,
+        vec![(1, 0xFFFF_FFFE)],
+        tb,
+    ));
     // ADDS.W: carry (C)
-    t.push(mk("ADDS.W R0,R1,#1 (C flag, wrap)", DP_ADD, 1, 0, 0x001,
-              vec![(1, 0xFFFF_FFFF)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#1 (C flag, wrap)",
+        DP_ADD,
+        1,
+        0,
+        0x001,
+        vec![(1, 0xFFFF_FFFF)],
+        tb,
+    ));
     // ADDS.W: overflow (V)
-    t.push(mk("ADDS.W R0,R1,#1 (V flag, pos overflow)", DP_ADD, 1, 0, 0x001,
-              vec![(1, 0x7FFF_FFFF)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,#1 (V flag, pos overflow)",
+        DP_ADD,
+        1,
+        0,
+        0x001,
+        vec![(1, 0x7FFF_FFFF)],
+        tb,
+    ));
 
     // SUBS.W
-    t.push(mk("SUBS.W R0,R1,#1 (borrow)", DP_SUB, 1, 0, 0x001,
-              vec![(1, 0)], tb));
-    t.push(mk("SUBS.W R0,R1,#0 (no borrow)", DP_SUB, 1, 0, 0x000,
-              vec![(1, 5)], tb));
-    t.push(mk("SUBS.W R0,R1,#5 (equal)", DP_SUB, 1, 0, 0x005,
-              vec![(1, 5)], tb));
+    t.push(mk(
+        "SUBS.W R0,R1,#1 (borrow)",
+        DP_SUB,
+        1,
+        0,
+        0x001,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "SUBS.W R0,R1,#0 (no borrow)",
+        DP_SUB,
+        1,
+        0,
+        0x000,
+        vec![(1, 5)],
+        tb,
+    ));
+    t.push(mk(
+        "SUBS.W R0,R1,#5 (equal)",
+        DP_SUB,
+        1,
+        0,
+        0x005,
+        vec![(1, 5)],
+        tb,
+    ));
 
     // CMP.W (SUB with Rd=15, flag-only)
-    t.push(mk("CMP.W R1,#0 (Rd=15, equal)", DP_SUB, 1, 15, 0x000,
-              vec![(1, 0)], tb));
-    t.push(mk("CMP.W R2,#1 (Rd=15, less)", DP_SUB, 2, 15, 0x001,
-              vec![(2, 0)], tb));
-    t.push(mk("CMP.W R3,#1 (Rd=15, greater)", DP_SUB, 3, 15, 0x001,
-              vec![(3, 5)], tb));
+    t.push(mk(
+        "CMP.W R1,#0 (Rd=15, equal)",
+        DP_SUB,
+        1,
+        15,
+        0x000,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "CMP.W R2,#1 (Rd=15, less)",
+        DP_SUB,
+        2,
+        15,
+        0x001,
+        vec![(2, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "CMP.W R3,#1 (Rd=15, greater)",
+        DP_SUB,
+        3,
+        15,
+        0x001,
+        vec![(3, 5)],
+        tb,
+    ));
 
     // ANDS.W
-    t.push(mk("ANDS.W R0,R1,#0xFF (non-zero)", DP_AND, 1, 0, 0x0FF,
-              vec![(1, 0x1234_5678)], tb));
-    t.push(mk("ANDS.W R0,R1,#0xFF (zero result)", DP_AND, 1, 0, 0x0FF,
-              vec![(1, 0x1234_5600)], tb));
+    t.push(mk(
+        "ANDS.W R0,R1,#0xFF (non-zero)",
+        DP_AND,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0x1234_5678)],
+        tb,
+    ));
+    t.push(mk(
+        "ANDS.W R0,R1,#0xFF (zero result)",
+        DP_AND,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0x1234_5600)],
+        tb,
+    ));
 
     // TST.W (AND with Rd=15, flag-only)
-    t.push(mk("TST.W R1,#0xFF (Rd=15, non-zero)", DP_AND, 1, 15, 0x0FF,
-              vec![(1, 0x42)], tb));
-    t.push(mk("TST.W R2,#0xFF (Rd=15, zero)", DP_AND, 2, 15, 0x0FF,
-              vec![(2, 0x100)], tb));
+    t.push(mk(
+        "TST.W R1,#0xFF (Rd=15, non-zero)",
+        DP_AND,
+        1,
+        15,
+        0x0FF,
+        vec![(1, 0x42)],
+        tb,
+    ));
+    t.push(mk(
+        "TST.W R2,#0xFF (Rd=15, zero)",
+        DP_AND,
+        2,
+        15,
+        0x0FF,
+        vec![(2, 0x100)],
+        tb,
+    ));
 
     // ORRS.W
-    t.push(mk("ORRS.W R0,R1,#0xFF", DP_ORR, 1, 0, 0x0FF,
-              vec![(1, 0x1234_5600)], tb));
-    t.push(mk("ORRS.W R0,R1,#0 (N flag)", DP_ORR, 1, 0, 0x000,
-              vec![(1, 0x8000_0000)], tb));
+    t.push(mk(
+        "ORRS.W R0,R1,#0xFF",
+        DP_ORR,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0x1234_5600)],
+        tb,
+    ));
+    t.push(mk(
+        "ORRS.W R0,R1,#0 (N flag)",
+        DP_ORR,
+        1,
+        0,
+        0x000,
+        vec![(1, 0x8000_0000)],
+        tb,
+    ));
 
     // EORS.W
-    t.push(mk("EORS.W R0,R1,#0xFF (non-zero)", DP_EOR, 1, 0, 0x0FF,
-              vec![(1, 0xFF)], tb));
-    t.push(mk("EORS.W R0,R1,#0xFF (zero result)", DP_EOR, 1, 0, 0x0FF,
-              vec![(1, 0xFF)], tb));
+    t.push(mk(
+        "EORS.W R0,R1,#0xFF (non-zero)",
+        DP_EOR,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0xFF)],
+        tb,
+    ));
+    t.push(mk(
+        "EORS.W R0,R1,#0xFF (zero result)",
+        DP_EOR,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0xFF)],
+        tb,
+    ));
 
     // TEQ.W (EOR with Rd=15, flag-only)
-    t.push(mk("TEQ.W R1,#0xFF (Rd=15, zero)", DP_EOR, 1, 15, 0x0FF,
-              vec![(1, 0xFF)], tb));
-    t.push(mk("TEQ.W R2,#0xFF (Rd=15, non-zero)", DP_EOR, 2, 15, 0x0FF,
-              vec![(2, 0x100)], tb));
+    t.push(mk(
+        "TEQ.W R1,#0xFF (Rd=15, zero)",
+        DP_EOR,
+        1,
+        15,
+        0x0FF,
+        vec![(1, 0xFF)],
+        tb,
+    ));
+    t.push(mk(
+        "TEQ.W R2,#0xFF (Rd=15, non-zero)",
+        DP_EOR,
+        2,
+        15,
+        0x0FF,
+        vec![(2, 0x100)],
+        tb,
+    ));
 
     // BICS.W
-    t.push(mk("BICS.W R0,R1,#0xFF (clear low byte)", DP_BIC, 1, 0, 0x0FF,
-              vec![(1, 0x1234_56FF)], tb));
-    t.push(mk("BICS.W R0,R1,#0xFF (zero result)", DP_BIC, 1, 0, 0x0FF,
-              vec![(1, 0xFF)], tb));
+    t.push(mk(
+        "BICS.W R0,R1,#0xFF (clear low byte)",
+        DP_BIC,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0x1234_56FF)],
+        tb,
+    ));
+    t.push(mk(
+        "BICS.W R0,R1,#0xFF (zero result)",
+        DP_BIC,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0xFF)],
+        tb,
+    ));
 
     // ORNS.W
-    t.push(mk("ORNS.W R0,R1,#0xFF (ORN = Rn | ~imm)", DP_ORN, 1, 0, 0x0FF,
-              vec![(1, 0)], tb));
-    t.push(mk("ORNS.W R0,R1,#0 (ORN with imm=0)", DP_ORN, 1, 0, 0x000,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "ORNS.W R0,R1,#0xFF (ORN = Rn | ~imm)",
+        DP_ORN,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "ORNS.W R0,R1,#0 (ORN with imm=0)",
+        DP_ORN,
+        1,
+        0,
+        0x000,
+        vec![(1, 0)],
+        tb,
+    ));
 
     // CMN.W (ADD with Rd=15, flag-only)
-    t.push(mk("CMN.W R1,#0 (Rd=15, zero)", DP_ADD, 1, 15, 0x000,
-              vec![(1, 0)], tb));
-    t.push(mk("CMN.W R2,#1 (Rd=15, wrap)", DP_ADD, 2, 15, 0x001,
-              vec![(2, 0xFFFF_FFFF)], tb));
+    t.push(mk(
+        "CMN.W R1,#0 (Rd=15, zero)",
+        DP_ADD,
+        1,
+        15,
+        0x000,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "CMN.W R2,#1 (Rd=15, wrap)",
+        DP_ADD,
+        2,
+        15,
+        0x001,
+        vec![(2, 0xFFFF_FFFF)],
+        tb,
+    ));
 
     // ----------------------------------------------------------------
     // ADCS.W / SBCS.W / RSBS.W — carry-in sensitive
     // ----------------------------------------------------------------
 
     // ADCS.W with C=0
-    t.push(mk("ADCS.W R0,R1,#1 (C_in=0)", DP_ADC, 1, 0, 0x001,
-              vec![(1, 10)], tb));
+    t.push(mk(
+        "ADCS.W R0,R1,#1 (C_in=0)",
+        DP_ADC,
+        1,
+        0,
+        0x001,
+        vec![(1, 10)],
+        tb,
+    ));
     // ADCS.W with C=1
-    t.push(mk("ADCS.W R0,R1,#1 (C_in=1)", DP_ADC, 1, 0, 0x001,
-              vec![(1, 10)], tb_c));
+    t.push(mk(
+        "ADCS.W R0,R1,#1 (C_in=1)",
+        DP_ADC,
+        1,
+        0,
+        0x001,
+        vec![(1, 10)],
+        tb_c,
+    ));
     // ADCS.W producing carry
-    t.push(mk("ADCS.W R0,R1,#1 (C_in=1, wrap)", DP_ADC, 1, 0, 0x001,
-              vec![(1, 0xFFFF_FFFE)], tb_c));
+    t.push(mk(
+        "ADCS.W R0,R1,#1 (C_in=1, wrap)",
+        DP_ADC,
+        1,
+        0,
+        0x001,
+        vec![(1, 0xFFFF_FFFE)],
+        tb_c,
+    ));
 
     // SBCS.W with C=1 (no borrow) — SBC subtracts (imm + !C), C=1 means no extra borrow
-    t.push(mk("SBCS.W R0,R1,#1 (C_in=1, no borrow)", DP_SBC, 1, 0, 0x001,
-              vec![(1, 10)], tb_c));
+    t.push(mk(
+        "SBCS.W R0,R1,#1 (C_in=1, no borrow)",
+        DP_SBC,
+        1,
+        0,
+        0x001,
+        vec![(1, 10)],
+        tb_c,
+    ));
     // SBCS.W with C=0 (borrow)
-    t.push(mk("SBCS.W R0,R1,#1 (C_in=0, borrow)", DP_SBC, 1, 0, 0x001,
-              vec![(1, 10)], tb));
+    t.push(mk(
+        "SBCS.W R0,R1,#1 (C_in=0, borrow)",
+        DP_SBC,
+        1,
+        0,
+        0x001,
+        vec![(1, 10)],
+        tb,
+    ));
     // SBCS.W zero result
-    t.push(mk("SBCS.W R0,R1,#5 (C_in=1, zero result)", DP_SBC, 1, 0, 0x005,
-              vec![(1, 5)], tb_c));
+    t.push(mk(
+        "SBCS.W R0,R1,#5 (C_in=1, zero result)",
+        DP_SBC,
+        1,
+        0,
+        0x005,
+        vec![(1, 5)],
+        tb_c,
+    ));
 
     // RSBS.W (reverse subtract: imm - Rn)
-    t.push(mk("RSBS.W R0,R1,#0 (negate)", DP_RSB, 1, 0, 0x000,
-              vec![(1, 1)], tb));
-    t.push(mk("RSBS.W R0,R1,#0xFF (positive result)", DP_RSB, 1, 0, 0x0FF,
-              vec![(1, 0)], tb));
-    t.push(mk("RSBS.W R0,R1,#0 (negate zero)", DP_RSB, 1, 0, 0x000,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "RSBS.W R0,R1,#0 (negate)",
+        DP_RSB,
+        1,
+        0,
+        0x000,
+        vec![(1, 1)],
+        tb,
+    ));
+    t.push(mk(
+        "RSBS.W R0,R1,#0xFF (positive result)",
+        DP_RSB,
+        1,
+        0,
+        0x0FF,
+        vec![(1, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "RSBS.W R0,R1,#0 (negate zero)",
+        DP_RSB,
+        1,
+        0,
+        0x000,
+        vec![(1, 0)],
+        tb,
+    ));
 
     // ----------------------------------------------------------------
     // No-source variants (Rn=15)
     // ----------------------------------------------------------------
 
     // MOV.W (ORR with Rn=15 → result = 0 | imm = imm)
-    t.push(mk("MOV.W R0,#42 (Rn=15, ORR)", DP_ORR, 15, 0, 0x02A,
-              vec![], tb));
-    t.push(mk("MOV.W R5,#0 (Rn=15, zero)", DP_ORR, 15, 5, 0x000,
-              vec![], tb));
-    t.push(mk("MOV.W R3,#0xFF (Rn=15, 0xFF)", DP_ORR, 15, 3, 0x0FF,
-              vec![], tb));
+    t.push(mk(
+        "MOV.W R0,#42 (Rn=15, ORR)",
+        DP_ORR,
+        15,
+        0,
+        0x02A,
+        vec![],
+        tb,
+    ));
+    t.push(mk(
+        "MOV.W R5,#0 (Rn=15, zero)",
+        DP_ORR,
+        15,
+        5,
+        0x000,
+        vec![],
+        tb,
+    ));
+    t.push(mk(
+        "MOV.W R3,#0xFF (Rn=15, 0xFF)",
+        DP_ORR,
+        15,
+        3,
+        0x0FF,
+        vec![],
+        tb,
+    ));
 
     // MVN.W (ORN with Rn=15 → result = 0xFFFFFFFF | ~imm... wait: ORN = Rn | ~imm,
     // but Rn=15 → ORN reads as 0, so result = ~imm)
-    t.push(mk("MVN.W R0,#0 (Rn=15, ~0 = 0xFFFFFFFF)", DP_ORN, 15, 0, 0x000,
-              vec![], tb));
-    t.push(mk("MVN.W R0,#0xFF (Rn=15, ~0xFF)", DP_ORN, 15, 0, 0x0FF,
-              vec![], tb));
+    t.push(mk(
+        "MVN.W R0,#0 (Rn=15, ~0 = 0xFFFFFFFF)",
+        DP_ORN,
+        15,
+        0,
+        0x000,
+        vec![],
+        tb,
+    ));
+    t.push(mk(
+        "MVN.W R0,#0xFF (Rn=15, ~0xFF)",
+        DP_ORN,
+        15,
+        0,
+        0x0FF,
+        vec![],
+        tb,
+    ));
 
     // ----------------------------------------------------------------
     // Carry-out from ThumbExpandImm rotation (S=1)
@@ -1154,14 +1542,35 @@ pub fn gen_t32_dp_mod_imm() -> Vec<TestCase> {
 
     // Rotated mode with S=1: the MSB of the rotated constant is the carry-out.
     // imm12 = 0b01_00000_00 = 0x400 → 0x80 ROR 8 = 0x80000000 → C=1 (bit 31)
-    t.push(mk("ANDS.W R0,R1,#0x80000000 (rotation C=1)", DP_AND, 1, 0, 0x400,
-              vec![(1, 0xFFFF_FFFF)], tb));
+    t.push(mk(
+        "ANDS.W R0,R1,#0x80000000 (rotation C=1)",
+        DP_AND,
+        1,
+        0,
+        0x400,
+        vec![(1, 0xFFFF_FFFF)],
+        tb,
+    ));
     // imm12 = 0b10_00000_00 = 0x800 → 0x80 ROR 16 = 0x00008000 → C=0 (bit 31=0)
-    t.push(mk("ANDS.W R0,R1,#0x00008000 (rotation C=0)", DP_AND, 1, 0, 0x800,
-              vec![(1, 0xFFFF_FFFF)], tb));
+    t.push(mk(
+        "ANDS.W R0,R1,#0x00008000 (rotation C=0)",
+        DP_AND,
+        1,
+        0,
+        0x800,
+        vec![(1, 0xFFFF_FFFF)],
+        tb,
+    ));
     // imm12 = 0b01_11111_11 = 0x7FF → (0x80|0x7F=0xFF) ROR 8 = 0xFF000000 → C=1
-    t.push(mk("ORRS.W R0,R1,#0xFF000000 (rotation C=1)", DP_ORR, 1, 0, 0x47F,
-              vec![(1, 0)], tb));
+    t.push(mk(
+        "ORRS.W R0,R1,#0xFF000000 (rotation C=1)",
+        DP_ORR,
+        1,
+        0,
+        0x47F,
+        vec![(1, 0)],
+        tb,
+    ));
 
     // Verify rotation carry-out OVERWRITES incoming C flag (not preserves it).
     // Rotated mode: imm12=0x201 → [11:7]=0b00100=4, [6:0]=1
@@ -1183,17 +1592,45 @@ pub fn gen_t32_dp_mod_imm() -> Vec<TestCase> {
     // ----------------------------------------------------------------
     // Register field extraction (different rd/rn combos)
     // ----------------------------------------------------------------
-    t.push(mk("ADDS.W R7,R8,#1 (high Rn)", DP_ADD, 8, 7, 0x001,
-              vec![(8, 100)], tb));
-    t.push(mk("ADDS.W R10,R2,#1 (high Rd)", DP_ADD, 2, 10, 0x001,
-              vec![(2, 50)], tb));
-    t.push(mk("ADDS.W R12,R11,#0 (both high)", DP_ADD, 11, 12, 0x000,
-              vec![(11, 0xDEAD_BEEF)], tb));
+    t.push(mk(
+        "ADDS.W R7,R8,#1 (high Rn)",
+        DP_ADD,
+        8,
+        7,
+        0x001,
+        vec![(8, 100)],
+        tb,
+    ));
+    t.push(mk(
+        "ADDS.W R10,R2,#1 (high Rd)",
+        DP_ADD,
+        2,
+        10,
+        0x001,
+        vec![(2, 50)],
+        tb,
+    ));
+    t.push(mk(
+        "ADDS.W R12,R11,#0 (both high)",
+        DP_ADD,
+        11,
+        12,
+        0x000,
+        vec![(11, 0xDEAD_BEEF)],
+        tb,
+    ));
 
     // -- Ensure we didn't have the EOR zero-result test wrong; fix it:
     // EORS 0xFF ^ 0x00 = 0xFF (not zero), move the actual zero-result test
-    t.push(mk("EORS.W R0,R1,#0x42 (zero: 0x42^0x42=0)", DP_EOR, 1, 0, 0x042,
-              vec![(1, 0x42)], tb));
+    t.push(mk(
+        "EORS.W R0,R1,#0x42 (zero: 0x42^0x42=0)",
+        DP_EOR,
+        1,
+        0,
+        0x042,
+        vec![(1, 0x42)],
+        tb,
+    ));
 
     t
 }
@@ -1217,12 +1654,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 1, 0, 0);
         t.push(TestCase {
             name: "LDR.W R0,[R1,#0] (word, zero offset)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(0, 0xDEAD_BEEF),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1230,12 +1669,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 1, 0, 4);
         t.push(TestCase {
             name: "LDR.W R0,[R1,#4]".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(4, 0xCAFE_BABE),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1243,12 +1684,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 2, 3, 100);
         t.push(TestCase {
             name: "LDR.W R3,[R2,#100] (field extract)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(2, 0x00)],
             addr_regs: vec![2],
             needs_bus: true,
             mem_pre: mem_pre_u32(100, 0x1234_5678),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1258,12 +1701,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, false, 1, 0, 8);
         t.push(TestCase {
             name: "LDRB.W R0,[R1,#8] (zero-extend)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(8, 0xAB)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1271,12 +1716,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, false, 1, 0, 0);
         t.push(TestCase {
             name: "LDRB.W R0,[R1,#0] (0xFF, stays 0xFF)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(0, 0xFF)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1286,12 +1733,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, false, 1, 0, 4);
         t.push(TestCase {
             name: "LDRH.W R0,[R1,#4] (zero-extend)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(4, 0xBEEF),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1301,12 +1750,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 16);
         t.push(TestCase {
             name: "LDRSB.W R0,[R1,#16] (0x80 -> 0xFFFFFF80)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(16, 0x80)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1314,12 +1765,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 0);
         t.push(TestCase {
             name: "LDRSB.W R0,[R1,#0] (0x7F positive)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(0, 0x7F)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1329,12 +1782,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 4);
         t.push(TestCase {
             name: "LDRSH.W R0,[R1,#4] (0x8000 -> 0xFFFF8000)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(4, 0x8000),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1342,12 +1797,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 0);
         t.push(TestCase {
             name: "LDRSH.W R0,[R1,#0] (0x7FFF positive)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(0, 0x7FFF),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1357,12 +1814,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 1, 0, 0);
         t.push(TestCase {
             name: "STR.W R0,[R1,#0]".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xDEAD_BEEF), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u32(0),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1370,12 +1829,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 2, 3, 8);
         t.push(TestCase {
             name: "STR.W R3,[R2,#8] (field extract)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(3, 0x1234_5678), (2, 0x00)],
             addr_regs: vec![2],
             needs_bus: true,
             mem_check: mem_check_u32(8),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1385,12 +1846,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b00, false, false, 1, 0, 4);
         t.push(TestCase {
             name: "STRB.W R0,[R1,#4]".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xAB), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: vec![4],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1400,12 +1863,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b01, false, false, 1, 0, 4);
         t.push(TestCase {
             name: "STRH.W R0,[R1,#4]".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xBEEF), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u16(4),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1419,12 +1884,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, true, false, 8);
         t.push(TestCase {
             name: "LDR.W R0,[R1,#8] (imm8 P=1,U=1,W=0)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(8, 0xAAAA_BBBB),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1434,12 +1901,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, false, false, 8);
         t.push(TestCase {
             name: "LDR.W R0,[R1,#-8] (negative offset)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 16)], // base=16, effective=16-8=8
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(8, 0x1111_2222),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1449,12 +1918,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, true, true, 4);
         t.push(TestCase {
             name: "LDR.W R0,[R1,#4]! (pre-index writeback)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(4, 0xFACE_CAFE),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1464,12 +1935,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, false, true, true, 4);
         t.push(TestCase {
             name: "LDR.W R0,[R1],#4 (post-index)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(0, 0xBEEF_DEAD),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1479,12 +1952,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, true, false, true, 8);
         t.push(TestCase {
             name: "LDR.W R0,[R1,#-8]! (pre-index neg writeback)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 16)], // effective addr = 16-8 = 8
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(8, 0x3333_4444),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1494,12 +1969,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, true, false, 1, 0, false, false, true, 4);
         t.push(TestCase {
             name: "LDR.W R0,[R1],#-4 (post-index neg)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 8)], // load from addr 8, then base = 8-4 = 4
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(8, 0x5555_6666),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1509,12 +1986,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, false, false, 1, 0, true, true, true, 4);
         t.push(TestCase {
             name: "STR.W R0,[R1,#4]! (pre-index writeback store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0x7777_8888), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u32(4),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1524,12 +2003,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b10, false, false, 1, 0, false, true, true, 4);
         t.push(TestCase {
             name: "STR.W R0,[R1],#4 (post-index store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0x9999_AAAA), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u32(0),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1539,12 +2020,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b00, true, false, 1, 0, true, false, false, 4);
         t.push(TestCase {
             name: "LDRB.W R0,[R1,#-4] (neg offset byte)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 8)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(4, 0xCD)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1554,12 +2037,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b01, true, false, 1, 0, true, true, true, 4);
         t.push(TestCase {
             name: "LDRH.W R0,[R1,#4]! (pre-index half)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(4, 0xABCD),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1569,12 +2054,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b00, false, false, 1, 0, false, true, true, 4);
         t.push(TestCase {
             name: "STRB.W R0,[R1],#4 (post-index byte store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0x42), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: vec![0],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1584,12 +2071,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b01, false, false, 1, 0, true, false, false, 4);
         t.push(TestCase {
             name: "STRH.W R0,[R1,#-4] (neg offset half store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xFACE), (1, 8)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u16(4),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1599,12 +2088,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b00, true, true, 1, 0, true, true, true, 4);
         t.push(TestCase {
             name: "LDRSB.W R0,[R1,#4]! (pre-index signed byte)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(4, 0x80)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1614,12 +2105,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm8(0b01, true, true, 1, 0, false, true, true, 4);
         t.push(TestCase {
             name: "LDRSH.W R0,[R1],#4 (post-index signed half)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(0, 0x8000),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1633,12 +2126,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b10, true, false, 1, 0, 2, 0);
         t.push(TestCase {
             name: "LDR.W R0,[R1,R2] (reg offset, shift=0)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00), (2, 8)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(8, 0xAAAA_BBBB),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1648,12 +2143,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b10, true, false, 1, 0, 2, 2);
         t.push(TestCase {
             name: "LDR.W R0,[R1,R2,LSL #2] (shift=2)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00), (2, 4)], // effective = 0 + 4<<2 = 16
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(16, 0x1111_2222),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1663,12 +2160,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b10, false, false, 1, 0, 2, 0);
         t.push(TestCase {
             name: "STR.W R0,[R1,R2] (reg offset store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xCAFE_BABE), (1, 0x00), (2, 4)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u32(4),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1678,12 +2177,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b00, true, false, 1, 0, 2, 0);
         t.push(TestCase {
             name: "LDRB.W R0,[R1,R2] (reg offset byte)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00), (2, 3)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(3, 0xEF)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1693,12 +2194,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b01, true, false, 1, 0, 2, 1);
         t.push(TestCase {
             name: "LDRH.W R0,[R1,R2,LSL #1] (shift=1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00), (2, 4)], // effective = 0 + 4<<1 = 8
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(8, 0xDEAD),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1708,12 +2211,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b00, false, false, 1, 0, 2, 0);
         t.push(TestCase {
             name: "STRB.W R0,[R1,R2] (reg offset byte store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xAB), (1, 0x00), (2, 5)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: vec![5],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1723,12 +2228,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b01, false, false, 1, 0, 2, 1);
         t.push(TestCase {
             name: "STRH.W R0,[R1,R2,LSL #1] (reg offset half store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xBEEF), (1, 0x00), (2, 2)], // effective = 0 + 2<<1 = 4
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u16(4),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1738,12 +2245,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b00, true, true, 1, 0, 2, 0);
         t.push(TestCase {
             name: "LDRSB.W R0,[R1,R2] (reg, sign extend 0x80)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00), (2, 0)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(0, 0x80)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1753,12 +2262,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_reg(0b01, true, true, 1, 0, 2, 0);
         t.push(TestCase {
             name: "LDRSH.W R0,[R1,R2] (reg, sign extend 0xFFFF)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00), (2, 4)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(4, 0xFFFF),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1772,12 +2283,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 1, 0, 252);
         t.push(TestCase {
             name: "LDR.W R0,[R1,#252] (near scratch limit)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u32(252, 0x9876_5432),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1787,12 +2300,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 1, 0, 0);
         t.push(TestCase {
             name: "STR.W R0,[R1,#0] (zero value)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u32(0),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1802,12 +2317,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 1, 0, 0);
         t.push(TestCase {
             name: "STR.W R0,[R1,#0] (0xFFFFFFFF)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xFFFF_FFFF), (1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_check: mem_check_u32(0),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1817,12 +2334,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, true, false, 8, 9, 0);
         t.push(TestCase {
             name: "LDR.W R9,[R8,#0] (high regs)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(8, 0x00)],
             addr_regs: vec![8],
             needs_bus: true,
             mem_pre: mem_pre_u32(0, 0x1234_ABCD),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1830,12 +2349,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b10, false, false, 10, 11, 4);
         t.push(TestCase {
             name: "STR.W R11,[R10,#4] (high regs store)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(11, 0xFEDC_BA98), (10, 0x00)],
             addr_regs: vec![10],
             needs_bus: true,
             mem_check: mem_check_u32(4),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1845,12 +2366,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 0);
         t.push(TestCase {
             name: "LDRSB.W R0,[R1,#0] (0x00 zero)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(0, 0x00)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1860,12 +2383,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 0);
         t.push(TestCase {
             name: "LDRSH.W R0,[R1,#0] (0x0000 zero)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(0, 0x0000),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1875,12 +2400,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b00, true, true, 1, 0, 0);
         t.push(TestCase {
             name: "LDRSB.W R0,[R1,#0] (0xFF -> -1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: vec![(0, 0xFF)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1890,12 +2417,14 @@ pub fn gen_t32_load_store_single() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ls_imm12(0b01, true, true, 1, 0, 0);
         t.push(TestCase {
             name: "LDRSH.W R0,[R1,#0] (0xFFFF -> -1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x00)],
             addr_regs: vec![1],
             needs_bus: true,
             mem_pre: mem_pre_u16(0, 0xFFFF),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1920,9 +2449,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mul(0, 1, 2);
         t.push(TestCase {
             name: "MUL R0, R1, R2 (3*7=21)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 3), (2, 7)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1930,9 +2461,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mul(3, 4, 5);
         t.push(TestCase {
             name: "MUL R3, R4, R5 (field extract)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(4, 100), (5, 200)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1940,9 +2473,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mul(0, 1, 2);
         t.push(TestCase {
             name: "MUL R0, R1, R2 (by zero)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x1234_5678), (2, 0)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1950,9 +2485,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mul(0, 1, 2);
         t.push(TestCase {
             name: "MUL R0, R1, R2 (by one)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0xDEAD_BEEF), (2, 1)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1960,9 +2497,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mul(0, 1, 2);
         t.push(TestCase {
             name: "MUL R0, R1, R2 (large, truncated)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0001_0000), (2, 0x0001_0000)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1975,9 +2514,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mla(0, 1, 2, 3);
         t.push(TestCase {
             name: "MLA R0, R1, R2, R3 (3*7+10=31)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 3), (2, 7), (3, 10)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1985,9 +2526,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mla(4, 5, 6, 7);
         t.push(TestCase {
             name: "MLA R4, R5, R6, R7 (field extract)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(5, 2), (6, 3), (7, 100)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -1995,9 +2538,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mla(0, 1, 2, 3);
         t.push(TestCase {
             name: "MLA R0, R1, R2, R3 (accum only, 0*x+Ra)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0), (2, 42), (3, 99)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2010,9 +2555,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mls(0, 1, 2, 3);
         t.push(TestCase {
             name: "MLS R0, R1, R2, R3 (100-3*7=79)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 3), (2, 7), (3, 100)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2020,9 +2567,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mls(0, 1, 2, 3);
         t.push(TestCase {
             name: "MLS R0, R1, R2, R3 (0-3*7, wraps)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 3), (2, 7), (3, 0)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2035,9 +2584,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smull(0, 1, 2, 3);
         t.push(TestCase {
             name: "SMULL R0,R1, R2,R3 (0x10000*0x10000)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(2, 0x0001_0000), (3, 0x0001_0000)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // RdLo=0, RdHi=1
     }
@@ -2045,9 +2596,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smull(0, 1, 2, 3);
         t.push(TestCase {
             name: "SMULL R0,R1, R2,R3 (small: 3*7)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(2, 3), (3, 7)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // RdLo=21, RdHi=0
     }
@@ -2055,9 +2608,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smull(0, 1, 2, 3);
         t.push(TestCase {
             name: "SMULL R0,R1, R2,R3 (neg: -1 * 2)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(2, 0xFFFF_FFFF), (3, 2)], // -1 * 2 = -2
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // RdLo=0xFFFFFFFE, RdHi=0xFFFFFFFF
     }
@@ -2065,9 +2620,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smull(4, 5, 6, 7);
         t.push(TestCase {
             name: "SMULL R4,R5, R6,R7 (field extract, 0*x)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(6, 0), (7, 0x1234_5678)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2080,9 +2637,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_umull(0, 1, 2, 3);
         t.push(TestCase {
             name: "UMULL R0,R1, R2,R3 (0x10000*0x10000)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(2, 0x0001_0000), (3, 0x0001_0000)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2090,9 +2649,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_umull(0, 1, 2, 3);
         t.push(TestCase {
             name: "UMULL R0,R1, R2,R3 (MAX*2)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(2, 0xFFFF_FFFF), (3, 2)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // 0xFFFFFFFF*2 = 0x1_FFFFFFFE
     }
@@ -2105,9 +2666,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smlal(0, 1, 2, 3);
         t.push(TestCase {
             name: "SMLAL R0,R1, R2,R3 (accum 3*7+100)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 100), (1, 0), (2, 3), (3, 7)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // 64-bit accum: (0:100) + 21 = 121
     }
@@ -2115,9 +2678,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smlal(0, 1, 2, 3);
         t.push(TestCase {
             name: "SMLAL R0,R1, R2,R3 (neg product)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 100), (1, 0), (2, 0xFFFF_FFFF), (3, 2)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // accum + (-1*2) = 100 + (-2) = 98
     }
@@ -2130,9 +2695,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_umlal(0, 1, 2, 3);
         t.push(TestCase {
             name: "UMLAL R0,R1, R2,R3 (accum 5*6+1000)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 1000), (1, 0), (2, 5), (3, 6)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // 1000 + 30 = 1030
     }
@@ -2140,9 +2707,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_umlal(0, 1, 2, 3);
         t.push(TestCase {
             name: "UMLAL R0,R1, R2,R3 (carry into hi)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0xFFFF_FFFF), (1, 0), (2, 1), (3, 2)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         }); // (0:0xFFFFFFFF) + 2 = (1:0x00000001)
     }
@@ -2155,9 +2724,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
         t.push(TestCase {
             name: "SDIV R0, R1, R2 (21/7=3)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 21), (2, 7)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2165,9 +2736,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
         t.push(TestCase {
             name: "SDIV R0, R1, R2 (-21/7=-3)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, (-21i32) as u32), (2, 7)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2175,9 +2748,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
         t.push(TestCase {
             name: "SDIV R0, R1, R2 (-21/-7=3)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, (-21i32) as u32), (2, (-7i32) as u32)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2185,9 +2760,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
         t.push(TestCase {
             name: "SDIV R0, R1, R2 (div by zero = 0)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 42), (2, 0)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2196,9 +2773,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
         t.push(TestCase {
             name: "SDIV R0, R1, R2 (INT32_MIN/-1 = INT32_MIN)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x8000_0000), (2, (-1i32) as u32)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2207,9 +2786,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
         t.push(TestCase {
             name: "SDIV R0, R1, R2 (7/2=3, round-toward-zero)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 7), (2, 2)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2218,9 +2799,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(0, 1, 2);
         t.push(TestCase {
             name: "SDIV R0, R1, R2 (-7/2=-3, round-toward-zero)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, (-7i32) as u32), (2, 2)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2228,9 +2811,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_sdiv(3, 4, 5);
         t.push(TestCase {
             name: "SDIV R3, R4, R5 (field extract)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(4, 100), (5, 10)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2243,9 +2828,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
         t.push(TestCase {
             name: "UDIV R0, R1, R2 (100/10=10)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 100), (2, 10)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2253,9 +2840,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
         t.push(TestCase {
             name: "UDIV R0, R1, R2 (div by zero = 0)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0xFFFF_FFFF), (2, 0)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2263,9 +2852,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
         t.push(TestCase {
             name: "UDIV R0, R1, R2 (7/2=3, truncated)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 7), (2, 2)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2273,9 +2864,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
         t.push(TestCase {
             name: "UDIV R0, R1, R2 (MAX/1=MAX)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0xFFFF_FFFF), (2, 1)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2283,9 +2876,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_udiv(0, 1, 2);
         t.push(TestCase {
             name: "UDIV R0, R1, R2 (1/1=1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 1), (2, 1)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2293,9 +2888,11 @@ pub fn gen_t32_multiply_divide() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_udiv(6, 7, 8);
         t.push(TestCase {
             name: "UDIV R6, R7, R8 (field extract)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(7, 255), (8, 5)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2335,20 +2932,20 @@ pub fn gen_t32_branch() -> Vec<TestCase> {
 
     let conds: &[(u16, &str, u32, u32)] = &[
         // (cond, name, flags_taken, flags_not_taken)  — flags in bits [31:28] = NZCV
-        (0x0, "EQ", 1 << 30,             0),                     // Z=1 / Z=0
-        (0x1, "NE", 0,                   1 << 30),               // Z=0 / Z=1
-        (0x2, "CS", 1 << 29,             0),                     // C=1 / C=0
-        (0x3, "CC", 0,                   1 << 29),               // C=0 / C=1
-        (0x4, "MI", 1 << 31,             0),                     // N=1 / N=0
-        (0x5, "PL", 0,                   1 << 31),               // N=0 / N=1
-        (0x6, "VS", 1 << 28,             0),                     // V=1 / V=0
-        (0x7, "VC", 0,                   1 << 28),               // V=0 / V=1
-        (0x8, "HI", 1 << 29,             1 << 30),               // C=1,Z=0 / Z=1
-        (0x9, "LS", 1 << 30,             1 << 29),               // Z=1 / C=1,Z=0
-        (0xA, "GE", 0,                   1 << 31),               // N=V=0 / N=1,V=0
-        (0xB, "LT", 1 << 31,             0),                     // N=1,V=0 / N=V=0
-        (0xC, "GT", 0,                   1 << 30),               // N=V=0,Z=0 / Z=1
-        (0xD, "LE", 1 << 30,             0),                     // Z=1 / N=V=0,Z=0
+        (0x0, "EQ", 1 << 30, 0),       // Z=1 / Z=0
+        (0x1, "NE", 0, 1 << 30),       // Z=0 / Z=1
+        (0x2, "CS", 1 << 29, 0),       // C=1 / C=0
+        (0x3, "CC", 0, 1 << 29),       // C=0 / C=1
+        (0x4, "MI", 1 << 31, 0),       // N=1 / N=0
+        (0x5, "PL", 0, 1 << 31),       // N=0 / N=1
+        (0x6, "VS", 1 << 28, 0),       // V=1 / V=0
+        (0x7, "VC", 0, 1 << 28),       // V=0 / V=1
+        (0x8, "HI", 1 << 29, 1 << 30), // C=1,Z=0 / Z=1
+        (0x9, "LS", 1 << 30, 1 << 29), // Z=1 / C=1,Z=0
+        (0xA, "GE", 0, 1 << 31),       // N=V=0 / N=1,V=0
+        (0xB, "LT", 1 << 31, 0),       // N=1,V=0 / N=V=0
+        (0xC, "GT", 0, 1 << 30),       // N=V=0,Z=0 / Z=1
+        (0xD, "LE", 1 << 30, 0),       // Z=1 / N=V=0,Z=0
     ];
 
     for &(cond, name, flags_taken, flags_not_taken) in conds {
@@ -2380,12 +2977,7 @@ pub fn gen_t32_branch() -> Vec<TestCase> {
     // B.W — T4 encoding (unconditional wide branch)
     // ----------------------------------------------------------------
 
-    for &(offset, label) in &[
-        (16i32,  "+16"),
-        (100,    "+100"),
-        (-8,     "-8"),
-        (-100,   "-100"),
-    ] {
+    for &(offset, label) in &[(16i32, "+16"), (100, "+100"), (-8, "-8"), (-100, "-100")] {
         let (hw0, hw1) = enc_t32_b_uncond(offset);
         t.push(TestCase {
             name: format!("B.W {label} (unconditional)"),
@@ -2401,10 +2993,7 @@ pub fn gen_t32_branch() -> Vec<TestCase> {
     // BL — branch with link
     // ----------------------------------------------------------------
 
-    for &(offset, label) in &[
-        (16i32,  "+16"),
-        (-8,     "-8"),
-    ] {
+    for &(offset, label) in &[(16i32, "+16"), (-8, "-8")] {
         let (hw0, hw1) = enc_t32_bl(offset);
         t.push(TestCase {
             name: format!("BL {label}"),
@@ -2435,10 +3024,16 @@ pub fn gen_t32_dp_shift_reg() -> Vec<TestCase> {
     let tb_c = tb | (1 << 29); // T bit + carry set
 
     // Helper: build a flag-updating dp_shift_reg TestCase.
-    let mk = |name: &str, op: u16, rn: u16, rd: u16, rm: u16,
-              stype: u16, samount: u16,
-              regs: Vec<(u8, u32)>, xpsr: u32| -> TestCase
-    {
+    let mk = |name: &str,
+              op: u16,
+              rn: u16,
+              rd: u16,
+              rm: u16,
+              stype: u16,
+              samount: u16,
+              regs: Vec<(u8, u32)>,
+              xpsr: u32|
+     -> TestCase {
         let (hw0, hw1) = enc_t32_dp_shift_reg(op, true, rn, rd, rm, stype, samount);
         TestCase {
             name: name.into(),
@@ -2456,104 +3051,356 @@ pub fn gen_t32_dp_shift_reg() -> Vec<TestCase> {
     // ----------------------------------------------------------------
 
     // LSL #0 (no shift, identity)
-    t.push(mk("ADDS.W R0,R1,R2,LSL #0", DP_ADD, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 10), (2, 20)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSL #0",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 10), (2, 20)],
+        tb,
+    ));
     // LSL #1
-    t.push(mk("ADDS.W R0,R1,R2,LSL #1", DP_ADD, 1, 0, 2,
-              SHIFT_LSL, 1, vec![(1, 10), (2, 5)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSL #1",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        1,
+        vec![(1, 10), (2, 5)],
+        tb,
+    ));
     // LSL #16
-    t.push(mk("ADDS.W R0,R1,R2,LSL #16", DP_ADD, 1, 0, 2,
-              SHIFT_LSL, 16, vec![(1, 0), (2, 1)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSL #16",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        16,
+        vec![(1, 0), (2, 1)],
+        tb,
+    ));
     // LSL #31 (max shift)
-    t.push(mk("ADDS.W R0,R1,R2,LSL #31", DP_ADD, 1, 0, 2,
-              SHIFT_LSL, 31, vec![(1, 0), (2, 1)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSL #31",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        31,
+        vec![(1, 0), (2, 1)],
+        tb,
+    ));
 
     // LSR #1
-    t.push(mk("ADDS.W R0,R1,R2,LSR #1", DP_ADD, 1, 0, 2,
-              SHIFT_LSR, 1, vec![(1, 0), (2, 0x8000_0000)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSR #1",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSR,
+        1,
+        vec![(1, 0), (2, 0x8000_0000)],
+        tb,
+    ));
     // LSR #16
-    t.push(mk("ADDS.W R0,R1,R2,LSR #16", DP_ADD, 1, 0, 2,
-              SHIFT_LSR, 16, vec![(1, 0), (2, 0xFFFF_0000)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSR #16",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSR,
+        16,
+        vec![(1, 0), (2, 0xFFFF_0000)],
+        tb,
+    ));
     // LSR #32 (encoded as imm5=0 with type=LSR)
-    t.push(mk("ADDS.W R0,R1,R2,LSR #32", DP_ADD, 1, 0, 2,
-              SHIFT_LSR, 0, vec![(1, 0), (2, 0x8000_0000)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSR #32",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSR,
+        0,
+        vec![(1, 0), (2, 0x8000_0000)],
+        tb,
+    ));
 
     // ASR #1 (positive)
-    t.push(mk("ADDS.W R0,R1,R2,ASR #1 (pos)", DP_ADD, 1, 0, 2,
-              SHIFT_ASR, 1, vec![(1, 0), (2, 0x40)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,ASR #1 (pos)",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_ASR,
+        1,
+        vec![(1, 0), (2, 0x40)],
+        tb,
+    ));
     // ASR #16 (negative, sign-extends)
-    t.push(mk("ADDS.W R0,R1,R2,ASR #16 (neg)", DP_ADD, 1, 0, 2,
-              SHIFT_ASR, 16, vec![(1, 0), (2, 0x8000_0000)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,ASR #16 (neg)",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_ASR,
+        16,
+        vec![(1, 0), (2, 0x8000_0000)],
+        tb,
+    ));
     // ASR #32 (encoded as 0)
-    t.push(mk("ADDS.W R0,R1,R2,ASR #32", DP_ADD, 1, 0, 2,
-              SHIFT_ASR, 0, vec![(1, 0), (2, 0x8000_0000)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,ASR #32",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_ASR,
+        0,
+        vec![(1, 0), (2, 0x8000_0000)],
+        tb,
+    ));
 
     // ROR #1
-    t.push(mk("ADDS.W R0,R1,R2,ROR #1", DP_ADD, 1, 0, 2,
-              SHIFT_ROR, 1, vec![(1, 0), (2, 1)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,ROR #1",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_ROR,
+        1,
+        vec![(1, 0), (2, 1)],
+        tb,
+    ));
     // ROR #16
-    t.push(mk("ADDS.W R0,R1,R2,ROR #16", DP_ADD, 1, 0, 2,
-              SHIFT_ROR, 16, vec![(1, 0), (2, 0xFFFF)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,ROR #16",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_ROR,
+        16,
+        vec![(1, 0), (2, 0xFFFF)],
+        tb,
+    ));
 
     // RRX (type=ROR, amount=0): carry rotated to bit 31
-    t.push(mk("ADDS.W R0,R1,R2,RRX (C=1)", DP_ADD, 1, 0, 2,
-              SHIFT_ROR, 0, vec![(1, 0), (2, 0)], tb_c));
-    t.push(mk("ADDS.W R0,R1,R2,RRX (C=0)", DP_ADD, 1, 0, 2,
-              SHIFT_ROR, 0, vec![(1, 0), (2, 0xFFFF_FFFF)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,RRX (C=1)",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_ROR,
+        0,
+        vec![(1, 0), (2, 0)],
+        tb_c,
+    ));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,RRX (C=0)",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_ROR,
+        0,
+        vec![(1, 0), (2, 0xFFFF_FFFF)],
+        tb,
+    ));
 
     // ----------------------------------------------------------------
     // ALU operations with shifted operand (S=1)
     // ----------------------------------------------------------------
 
     // SUBS.W
-    t.push(mk("SUBS.W R0,R1,R2,LSL #2", DP_SUB, 1, 0, 2,
-              SHIFT_LSL, 2, vec![(1, 100), (2, 10)], tb));
-    t.push(mk("SUBS.W R0,R1,R2,LSR #4 (borrow)", DP_SUB, 1, 0, 2,
-              SHIFT_LSR, 4, vec![(1, 0), (2, 0x10)], tb));
+    t.push(mk(
+        "SUBS.W R0,R1,R2,LSL #2",
+        DP_SUB,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        2,
+        vec![(1, 100), (2, 10)],
+        tb,
+    ));
+    t.push(mk(
+        "SUBS.W R0,R1,R2,LSR #4 (borrow)",
+        DP_SUB,
+        1,
+        0,
+        2,
+        SHIFT_LSR,
+        4,
+        vec![(1, 0), (2, 0x10)],
+        tb,
+    ));
 
     // CMP.W (SUB with Rd=15)
-    t.push(mk("CMP.W R1,R2,LSL #1 (equal)", DP_SUB, 1, 15, 2,
-              SHIFT_LSL, 1, vec![(1, 20), (2, 10)], tb));
-    t.push(mk("CMP.W R3,R4,ASR #1 (less)", DP_SUB, 3, 15, 4,
-              SHIFT_ASR, 1, vec![(3, 0), (4, 0x40)], tb));
+    t.push(mk(
+        "CMP.W R1,R2,LSL #1 (equal)",
+        DP_SUB,
+        1,
+        15,
+        2,
+        SHIFT_LSL,
+        1,
+        vec![(1, 20), (2, 10)],
+        tb,
+    ));
+    t.push(mk(
+        "CMP.W R3,R4,ASR #1 (less)",
+        DP_SUB,
+        3,
+        15,
+        4,
+        SHIFT_ASR,
+        1,
+        vec![(3, 0), (4, 0x40)],
+        tb,
+    ));
 
     // ANDS.W
-    t.push(mk("ANDS.W R0,R1,R2,LSL #8", DP_AND, 1, 0, 2,
-              SHIFT_LSL, 8, vec![(1, 0xFF00_FF00), (2, 0xFF)], tb));
+    t.push(mk(
+        "ANDS.W R0,R1,R2,LSL #8",
+        DP_AND,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        8,
+        vec![(1, 0xFF00_FF00), (2, 0xFF)],
+        tb,
+    ));
 
     // TST.W (AND with Rd=15)
-    t.push(mk("TST.W R1,R2,LSL #16", DP_AND, 1, 15, 2,
-              SHIFT_LSL, 16, vec![(1, 0xFFFF_0000), (2, 1)], tb));
-    t.push(mk("TST.W R1,R2,LSR #1 (zero)", DP_AND, 1, 15, 2,
-              SHIFT_LSR, 1, vec![(1, 0x0000_0001), (2, 0x0000_0001)], tb));
+    t.push(mk(
+        "TST.W R1,R2,LSL #16",
+        DP_AND,
+        1,
+        15,
+        2,
+        SHIFT_LSL,
+        16,
+        vec![(1, 0xFFFF_0000), (2, 1)],
+        tb,
+    ));
+    t.push(mk(
+        "TST.W R1,R2,LSR #1 (zero)",
+        DP_AND,
+        1,
+        15,
+        2,
+        SHIFT_LSR,
+        1,
+        vec![(1, 0x0000_0001), (2, 0x0000_0001)],
+        tb,
+    ));
 
     // ORRS.W
-    t.push(mk("ORRS.W R0,R1,R2,ROR #8", DP_ORR, 1, 0, 2,
-              SHIFT_ROR, 8, vec![(1, 0), (2, 0xFF)], tb));
+    t.push(mk(
+        "ORRS.W R0,R1,R2,ROR #8",
+        DP_ORR,
+        1,
+        0,
+        2,
+        SHIFT_ROR,
+        8,
+        vec![(1, 0), (2, 0xFF)],
+        tb,
+    ));
 
     // EORS.W
-    t.push(mk("EORS.W R0,R1,R2,LSL #4", DP_EOR, 1, 0, 2,
-              SHIFT_LSL, 4, vec![(1, 0xFF), (2, 0x0F)], tb));
+    t.push(mk(
+        "EORS.W R0,R1,R2,LSL #4",
+        DP_EOR,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        4,
+        vec![(1, 0xFF), (2, 0x0F)],
+        tb,
+    ));
 
     // BICS.W
-    t.push(mk("BICS.W R0,R1,R2,LSL #0", DP_BIC, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 0xFFFF_FFFF), (2, 0x0000_00FF)], tb));
+    t.push(mk(
+        "BICS.W R0,R1,R2,LSL #0",
+        DP_BIC,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 0xFFFF_FFFF), (2, 0x0000_00FF)],
+        tb,
+    ));
 
     // ORNS.W
-    t.push(mk("ORNS.W R0,R1,R2,LSL #0", DP_ORN, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 0), (2, 0)], tb));
+    t.push(mk(
+        "ORNS.W R0,R1,R2,LSL #0",
+        DP_ORN,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 0), (2, 0)],
+        tb,
+    ));
 
     // ADCS.W
-    t.push(mk("ADCS.W R0,R1,R2,LSL #0 (C=1)", DP_ADC, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 10), (2, 20)], tb_c));
+    t.push(mk(
+        "ADCS.W R0,R1,R2,LSL #0 (C=1)",
+        DP_ADC,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 10), (2, 20)],
+        tb_c,
+    ));
 
     // SBCS.W
-    t.push(mk("SBCS.W R0,R1,R2,LSL #1 (C=1)", DP_SBC, 1, 0, 2,
-              SHIFT_LSL, 1, vec![(1, 100), (2, 10)], tb_c));
+    t.push(mk(
+        "SBCS.W R0,R1,R2,LSL #1 (C=1)",
+        DP_SBC,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        1,
+        vec![(1, 100), (2, 10)],
+        tb_c,
+    ));
 
     // RSBS.W
-    t.push(mk("RSBS.W R0,R1,R2,LSL #0", DP_RSB, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 10), (2, 20)], tb));
+    t.push(mk(
+        "RSBS.W R0,R1,R2,LSL #0",
+        DP_RSB,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 10), (2, 20)],
+        tb,
+    ));
 
     // ----------------------------------------------------------------
     // Rn=15 standalone shift forms (MOV.W Rd, Rm, shift)
@@ -2561,51 +3408,186 @@ pub fn gen_t32_dp_shift_reg() -> Vec<TestCase> {
 
     // MOV.W = ORR with Rn=15
     // LSL
-    t.push(mk("MOV.W R0,R2,LSL #3 (Rn=15)", DP_ORR, 15, 0, 2,
-              SHIFT_LSL, 3, vec![(2, 1)], tb));
+    t.push(mk(
+        "MOV.W R0,R2,LSL #3 (Rn=15)",
+        DP_ORR,
+        15,
+        0,
+        2,
+        SHIFT_LSL,
+        3,
+        vec![(2, 1)],
+        tb,
+    ));
     // LSR
-    t.push(mk("MOV.W R0,R2,LSR #4 (Rn=15)", DP_ORR, 15, 0, 2,
-              SHIFT_LSR, 4, vec![(2, 0x100)], tb));
+    t.push(mk(
+        "MOV.W R0,R2,LSR #4 (Rn=15)",
+        DP_ORR,
+        15,
+        0,
+        2,
+        SHIFT_LSR,
+        4,
+        vec![(2, 0x100)],
+        tb,
+    ));
     // ASR
-    t.push(mk("MOV.W R0,R2,ASR #8 (Rn=15)", DP_ORR, 15, 0, 2,
-              SHIFT_ASR, 8, vec![(2, 0x8000_0000)], tb));
+    t.push(mk(
+        "MOV.W R0,R2,ASR #8 (Rn=15)",
+        DP_ORR,
+        15,
+        0,
+        2,
+        SHIFT_ASR,
+        8,
+        vec![(2, 0x8000_0000)],
+        tb,
+    ));
     // ROR
-    t.push(mk("MOV.W R0,R2,ROR #16 (Rn=15)", DP_ORR, 15, 0, 2,
-              SHIFT_ROR, 16, vec![(2, 0xDEAD_BEEF)], tb));
+    t.push(mk(
+        "MOV.W R0,R2,ROR #16 (Rn=15)",
+        DP_ORR,
+        15,
+        0,
+        2,
+        SHIFT_ROR,
+        16,
+        vec![(2, 0xDEAD_BEEF)],
+        tb,
+    ));
     // RRX (carry in)
-    t.push(mk("MOV.W R0,R2,RRX (Rn=15, C=1)", DP_ORR, 15, 0, 2,
-              SHIFT_ROR, 0, vec![(2, 0)], tb_c));
+    t.push(mk(
+        "MOV.W R0,R2,RRX (Rn=15, C=1)",
+        DP_ORR,
+        15,
+        0,
+        2,
+        SHIFT_ROR,
+        0,
+        vec![(2, 0)],
+        tb_c,
+    ));
 
     // TEQ.W (EOR with Rd=15, Rn!=15)
-    t.push(mk("TEQ.W R1,R2,LSL #0", DP_EOR, 1, 15, 2,
-              SHIFT_LSL, 0, vec![(1, 0x8000_0000), (2, 0x8000_0000)], tb));
+    t.push(mk(
+        "TEQ.W R1,R2,LSL #0",
+        DP_EOR,
+        1,
+        15,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 0x8000_0000), (2, 0x8000_0000)],
+        tb,
+    ));
 
     // ----------------------------------------------------------------
     // High register combos and edge values
     // ----------------------------------------------------------------
 
-    t.push(mk("ADDS.W R8,R9,R10,LSL #1 (high regs)", DP_ADD, 9, 8, 10,
-              SHIFT_LSL, 1, vec![(9, 100), (10, 50)], tb));
-    t.push(mk("SUBS.W R8,R9,R10,ROR #8 (high regs)", DP_SUB, 9, 8, 10,
-              SHIFT_ROR, 8, vec![(9, 0x1000), (10, 0xFF)], tb));
+    t.push(mk(
+        "ADDS.W R8,R9,R10,LSL #1 (high regs)",
+        DP_ADD,
+        9,
+        8,
+        10,
+        SHIFT_LSL,
+        1,
+        vec![(9, 100), (10, 50)],
+        tb,
+    ));
+    t.push(mk(
+        "SUBS.W R8,R9,R10,ROR #8 (high regs)",
+        DP_SUB,
+        9,
+        8,
+        10,
+        SHIFT_ROR,
+        8,
+        vec![(9, 0x1000), (10, 0xFF)],
+        tb,
+    ));
 
     // Edge values
-    t.push(mk("ADDS.W R0,R1,R2,LSL #0 (0+0)", DP_ADD, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 0), (2, 0)], tb));
-    t.push(mk("ADDS.W R0,R1,R2,LSL #0 (MAX+1)", DP_ADD, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 0xFFFF_FFFF), (2, 1)], tb));
-    t.push(mk("ADDS.W R0,R1,R2,LSL #0 (MIN+MIN)", DP_ADD, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 0x8000_0000), (2, 0x8000_0000)], tb));
-    t.push(mk("EORS.W R0,R1,R2,LSL #0 (all ones)", DP_EOR, 1, 0, 2,
-              SHIFT_LSL, 0, vec![(1, 0xFFFF_FFFF), (2, 0xFFFF_FFFF)], tb));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSL #0 (0+0)",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 0), (2, 0)],
+        tb,
+    ));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSL #0 (MAX+1)",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 0xFFFF_FFFF), (2, 1)],
+        tb,
+    ));
+    t.push(mk(
+        "ADDS.W R0,R1,R2,LSL #0 (MIN+MIN)",
+        DP_ADD,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 0x8000_0000), (2, 0x8000_0000)],
+        tb,
+    ));
+    t.push(mk(
+        "EORS.W R0,R1,R2,LSL #0 (all ones)",
+        DP_EOR,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        0,
+        vec![(1, 0xFFFF_FFFF), (2, 0xFFFF_FFFF)],
+        tb,
+    ));
 
     // Carry-out from shift on logical ops (S=1)
-    t.push(mk("ANDS.W R0,R1,R2,LSL #1 (carry out)", DP_AND, 1, 0, 2,
-              SHIFT_LSL, 1, vec![(1, 0xFFFF_FFFF), (2, 0x8000_0000)], tb));
-    t.push(mk("ORRS.W R0,R1,R2,LSR #1 (carry out)", DP_ORR, 1, 0, 2,
-              SHIFT_LSR, 1, vec![(1, 0), (2, 0x0000_0001)], tb));
-    t.push(mk("EORS.W R0,R1,R2,ASR #1 (carry out)", DP_EOR, 1, 0, 2,
-              SHIFT_ASR, 1, vec![(1, 0), (2, 0xFFFF_FFFF)], tb));
+    t.push(mk(
+        "ANDS.W R0,R1,R2,LSL #1 (carry out)",
+        DP_AND,
+        1,
+        0,
+        2,
+        SHIFT_LSL,
+        1,
+        vec![(1, 0xFFFF_FFFF), (2, 0x8000_0000)],
+        tb,
+    ));
+    t.push(mk(
+        "ORRS.W R0,R1,R2,LSR #1 (carry out)",
+        DP_ORR,
+        1,
+        0,
+        2,
+        SHIFT_LSR,
+        1,
+        vec![(1, 0), (2, 0x0000_0001)],
+        tb,
+    ));
+    t.push(mk(
+        "EORS.W R0,R1,R2,ASR #1 (carry out)",
+        DP_EOR,
+        1,
+        0,
+        2,
+        SHIFT_ASR,
+        1,
+        vec![(1, 0), (2, 0xFFFF_FFFF)],
+        tb,
+    ));
 
     t
 }
@@ -2643,7 +3625,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 c.extend(mem_check_u32(8));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2656,7 +3639,12 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
             name: "STMIA.W R3!, {R8,R9,R10} (high regs)".into(),
             opcode: hw0,
             hw1: Some(hw1),
-            reg_pre: vec![(8, 0xAAAA_AAAA), (9, 0xBBBB_BBBB), (10, 0xCCCC_CCCC), (3, 0x00)],
+            reg_pre: vec![
+                (8, 0xAAAA_AAAA),
+                (9, 0xBBBB_BBBB),
+                (10, 0xCCCC_CCCC),
+                (3, 0x00),
+            ],
             addr_regs: vec![3],
             needs_bus: true,
             mem_check: {
@@ -2665,7 +3653,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 c.extend(mem_check_u32(8));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2682,7 +3671,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_check: mem_check_u32(0),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2700,10 +3690,13 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
             needs_bus: true,
             mem_check: {
                 let mut c = Vec::new();
-                for i in 0..4u32 { c.extend(mem_check_u32(i * 4)); }
+                for i in 0..4u32 {
+                    c.extend(mem_check_u32(i * 4));
+                }
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2724,12 +3717,13 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_check: {
-                let mut c = mem_check_u32(0);  // base-12 = offset 0
+                let mut c = mem_check_u32(0); // base-12 = offset 0
                 c.extend(mem_check_u32(4));
                 c.extend(mem_check_u32(8));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2750,7 +3744,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 c.extend(mem_check_u32(4));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2776,7 +3771,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(8, 0x33333333));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2798,7 +3794,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(8, 0xDEAD_0003));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2815,7 +3812,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: mem_pre_u32(0, 0xCAFE_BABE),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2841,7 +3839,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(8, 0x3333));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2862,7 +3861,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(4, 0xBBBB));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2883,7 +3883,8 @@ pub fn gen_t32_ldm_stm() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(4, 0x6666));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2922,7 +3923,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 c.extend(mem_check_u32(12));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2942,7 +3944,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 c.extend(mem_check_u32(4));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2962,7 +3965,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 c.extend(mem_check_u32(4));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -2982,7 +3986,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 c.extend(mem_check_u32(4));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3006,7 +4011,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 c.extend(mem_check_u32(16));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3030,7 +4036,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 c.extend(mem_check_u32(4));
                 c
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3054,7 +4061,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(12, 0xCAFE_BABE));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3074,7 +4082,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(4, 0x3333_4444));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3094,7 +4103,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(4, 0x6666));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3114,7 +4124,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(4, 0xCCCC_DDDD));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3137,7 +4148,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(16, 0xBB));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3160,7 +4172,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(4, 0xDD));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3180,7 +4193,8 @@ pub fn gen_t32_ldrd_strd() -> Vec<TestCase> {
                 m.extend(mem_pre_u32(256, 0xB00C));
                 m
             },
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3216,7 +4230,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: vec![(0, 4)], // table[0] = 4
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3232,7 +4247,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: vec![(1, 10)], // table[1] = 10
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3248,7 +4264,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: vec![(2, 0)], // table[2] = 0 → PC + 0 = fall-through
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3264,7 +4281,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: vec![(0, 255)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3280,7 +4298,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: vec![(19, 7)], // table[3] at offset 19 = 7
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3300,7 +4319,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: mem_pre_u16(0, 8), // halfword at offset 0
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3316,7 +4336,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: mem_pre_u16(2, 32), // halfword at offset 2 (index 1 * 2)
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3332,7 +4353,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: mem_pre_u16(4, 0), // halfword at offset 4 (index 2 * 2) = 0
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3348,7 +4370,8 @@ pub fn gen_t32_tbb_tbh() -> Vec<TestCase> {
             addr_regs: vec![4],
             needs_bus: true,
             mem_pre: mem_pre_u16(0, 0x00FF),
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3371,9 +4394,7 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
     let tb = 0x0100_0000u32;
 
     // Helper for plain-binary-imm tests (no flags).
-    let mk = |name: &str, hw0: u16, hw1: u16,
-              regs: Vec<(u8, u32)>| -> TestCase
-    {
+    let mk = |name: &str, hw0: u16, hw1: u16, regs: Vec<(u8, u32)>| -> TestCase {
         TestCase {
             name: name.into(),
             opcode: hw0,
@@ -3412,8 +4433,12 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
     // Verify upper bits cleared: pre-set R8 to 0xDEAD_0000, MOVW should overwrite to imm16
     {
         let (hw0, hw1) = enc_t32_movw(8, 0x0042);
-        t.push(mk("MOVW R8,#0x42 (clears upper)", hw0, hw1,
-                   vec![(8, 0xDEAD_0000)]));
+        t.push(mk(
+            "MOVW R8,#0x42 (clears upper)",
+            hw0,
+            hw1,
+            vec![(8, 0xDEAD_0000)],
+        ));
     }
     // High register R12
     {
@@ -3427,18 +4452,30 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
 
     {
         let (hw0, hw1) = enc_t32_movt(0, 0);
-        t.push(mk("MOVT R0,#0 (upper=0, lower preserved)", hw0, hw1,
-                   vec![(0, 0x0000_1234)]));
+        t.push(mk(
+            "MOVT R0,#0 (upper=0, lower preserved)",
+            hw0,
+            hw1,
+            vec![(0, 0x0000_1234)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_movt(2, 0x5678);
-        t.push(mk("MOVT R2,#0x5678 (pair: lower=0x1234)", hw0, hw1,
-                   vec![(2, 0x0000_1234)]));
+        t.push(mk(
+            "MOVT R2,#0x5678 (pair: lower=0x1234)",
+            hw0,
+            hw1,
+            vec![(2, 0x0000_1234)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_movt(1, 0xFFFF);
-        t.push(mk("MOVT R1,#0xFFFF (max upper)", hw0, hw1,
-                   vec![(1, 0x0000_BEEF)]));
+        t.push(mk(
+            "MOVT R1,#0xFFFF (max upper)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_BEEF)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -3472,7 +4509,12 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
     }
     {
         let (hw0, hw1) = enc_t32_subw(4, 4, 1);
-        t.push(mk("SUBW R4,R4,#1 (from zero, wraps)", hw0, hw1, vec![(4, 0)]));
+        t.push(mk(
+            "SUBW R4,R4,#1 (from zero, wraps)",
+            hw0,
+            hw1,
+            vec![(4, 0)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -3482,20 +4524,32 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
     // Insert bottom byte
     {
         let (hw0, hw1) = enc_t32_bfi(0, 1, 0, 8);
-        t.push(mk("BFI R0,R1,#0,#8 (insert low byte)", hw0, hw1,
-                   vec![(0, 0xFFFF_FF00), (1, 0x42)]));
+        t.push(mk(
+            "BFI R0,R1,#0,#8 (insert low byte)",
+            hw0,
+            hw1,
+            vec![(0, 0xFFFF_FF00), (1, 0x42)],
+        ));
     }
     // Insert upper half
     {
         let (hw0, hw1) = enc_t32_bfi(0, 1, 16, 16);
-        t.push(mk("BFI R0,R1,#16,#16 (insert upper half)", hw0, hw1,
-                   vec![(0, 0x0000_ABCD), (1, 0x1234)]));
+        t.push(mk(
+            "BFI R0,R1,#16,#16 (insert upper half)",
+            hw0,
+            hw1,
+            vec![(0, 0x0000_ABCD), (1, 0x1234)],
+        ));
     }
     // Single bit insertion
     {
         let (hw0, hw1) = enc_t32_bfi(3, 2, 4, 1);
-        t.push(mk("BFI R3,R2,#4,#1 (single bit)", hw0, hw1,
-                   vec![(3, 0x0000_0000), (2, 0x0000_0001)]));
+        t.push(mk(
+            "BFI R3,R2,#4,#1 (single bit)",
+            hw0,
+            hw1,
+            vec![(3, 0x0000_0000), (2, 0x0000_0001)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -3504,13 +4558,21 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
 
     {
         let (hw0, hw1) = enc_t32_bfc(0, 0, 8);
-        t.push(mk("BFC R0,#0,#8 (clear low byte)", hw0, hw1,
-                   vec![(0, 0xFFFF_FFFF)]));
+        t.push(mk(
+            "BFC R0,#0,#8 (clear low byte)",
+            hw0,
+            hw1,
+            vec![(0, 0xFFFF_FFFF)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_bfc(1, 8, 16);
-        t.push(mk("BFC R1,#8,#16 (clear middle bits)", hw0, hw1,
-                   vec![(1, 0xFFFF_FFFF)]));
+        t.push(mk(
+            "BFC R1,#8,#16 (clear middle bits)",
+            hw0,
+            hw1,
+            vec![(1, 0xFFFF_FFFF)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -3520,20 +4582,32 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
     // Extract byte at bit 0, width 8: value 0x80 → sign-extend → 0xFFFFFF80
     {
         let (hw0, hw1) = enc_t32_sbfx(0, 1, 0, 8);
-        t.push(mk("SBFX R0,R1,#0,#8 (neg: 0x80)", hw0, hw1,
-                   vec![(1, 0x0000_0080)]));
+        t.push(mk(
+            "SBFX R0,R1,#0,#8 (neg: 0x80)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0080)],
+        ));
     }
     // Extract byte at bit 0, width 8: value 0x42 → positive, zero-extended
     {
         let (hw0, hw1) = enc_t32_sbfx(0, 1, 0, 8);
-        t.push(mk("SBFX R0,R1,#0,#8 (pos: 0x42)", hw0, hw1,
-                   vec![(1, 0x0000_0042)]));
+        t.push(mk(
+            "SBFX R0,R1,#0,#8 (pos: 0x42)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0042)],
+        ));
     }
     // Extract at non-zero lsb
     {
         let (hw0, hw1) = enc_t32_sbfx(2, 3, 16, 8);
-        t.push(mk("SBFX R2,R3,#16,#8 (extract upper byte)", hw0, hw1,
-                   vec![(3, 0x00FF_0000)]));
+        t.push(mk(
+            "SBFX R2,R3,#16,#8 (extract upper byte)",
+            hw0,
+            hw1,
+            vec![(3, 0x00FF_0000)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -3543,20 +4617,32 @@ pub fn gen_t32_dp_plain_imm() -> Vec<TestCase> {
     // Extract byte at bit 0, width 8: value 0x80 → 0x80 (no sign extension)
     {
         let (hw0, hw1) = enc_t32_ubfx(0, 1, 0, 8);
-        t.push(mk("UBFX R0,R1,#0,#8 (0x80, no sign-ext)", hw0, hw1,
-                   vec![(1, 0xFFFF_FF80)]));
+        t.push(mk(
+            "UBFX R0,R1,#0,#8 (0x80, no sign-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0xFFFF_FF80)],
+        ));
     }
     // Extract nibble at bit 4
     {
         let (hw0, hw1) = enc_t32_ubfx(0, 1, 4, 4);
-        t.push(mk("UBFX R0,R1,#4,#4 (nibble)", hw0, hw1,
-                   vec![(1, 0xABCD_EF56)]));
+        t.push(mk(
+            "UBFX R0,R1,#4,#4 (nibble)",
+            hw0,
+            hw1,
+            vec![(1, 0xABCD_EF56)],
+        ));
     }
     // Extract upper 16 bits
     {
         let (hw0, hw1) = enc_t32_ubfx(5, 6, 16, 16);
-        t.push(mk("UBFX R5,R6,#16,#16 (upper half)", hw0, hw1,
-                   vec![(6, 0x1234_5678)]));
+        t.push(mk(
+            "UBFX R5,R6,#16,#16 (upper half)",
+            hw0,
+            hw1,
+            vec![(6, 0x1234_5678)],
+        ));
     }
 
     t
@@ -3581,9 +4667,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ssat(0, 1, 16, SHIFT_LSL, 0);
         t.push(TestCase {
             name: "SSAT R0,#16,R1 (in range, 100)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 100)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3592,9 +4680,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ssat(0, 1, 8, SHIFT_LSL, 0);
         t.push(TestCase {
             name: "SSAT R0,#8,R1 (pos overflow, 200 -> 127)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 200)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3603,9 +4693,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ssat(0, 1, 8, SHIFT_LSL, 0);
         t.push(TestCase {
             name: "SSAT R0,#8,R1 (neg overflow, -200 -> -128)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, (-200i32) as u32)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3614,9 +4706,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_ssat(2, 3, 8, SHIFT_ASR, 4);
         t.push(TestCase {
             name: "SSAT R2,#8,R3,ASR#4 (shifted)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(3, 0x0000_0FF0)], // >> 4 = 0xFF → exceeds 8-bit signed max
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3630,9 +4724,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_usat(0, 1, 8, SHIFT_LSL, 0);
         t.push(TestCase {
             name: "USAT R0,#8,R1 (in range, 100)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 100)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3641,9 +4737,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_usat(0, 1, 8, SHIFT_LSL, 0);
         t.push(TestCase {
             name: "USAT R0,#8,R1 (negative -> 0)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, (-50i32) as u32)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3652,9 +4750,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_usat(0, 1, 8, SHIFT_LSL, 0);
         t.push(TestCase {
             name: "USAT R0,#8,R1 (exceeds 255 -> 255)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 300)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3663,9 +4763,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_usat(4, 5, 16, SHIFT_LSL, 2);
         t.push(TestCase {
             name: "USAT R4,#16,R5,LSL#2 (shifted)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(5, 0x0000_4000)], // << 2 = 0x10000, exceeds 16-bit
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3685,9 +4787,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qadd(0, 1, 2);
         t.push(TestCase {
             name: "QADD R0,R1,R2 (normal, 10+20)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 10), (2, 20)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3696,9 +4800,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qadd(0, 1, 2);
         t.push(TestCase {
             name: "QADD R0,R1,R2 (saturating, MAX+1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x7FFF_FFFF), (2, 1)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3707,9 +4813,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qadd(0, 1, 2);
         t.push(TestCase {
             name: "QADD R0,R1,R2 (saturating, MIN-1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x8000_0000), (2, (-1i32) as u32)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3719,9 +4827,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qsub(0, 1, 2);
         t.push(TestCase {
             name: "QSUB R0,R1,R2 (normal, 30-10)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 30), (2, 10)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3730,9 +4840,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qsub(0, 1, 2);
         t.push(TestCase {
             name: "QSUB R0,R1,R2 (saturating, MIN-1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x8000_0000), (2, 1)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3742,9 +4854,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qdadd(0, 1, 2);
         t.push(TestCase {
             name: "QDADD R0,R1,R2 (normal, 10+2*5)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 10), (2, 5)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3753,9 +4867,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qdadd(0, 1, 2);
         t.push(TestCase {
             name: "QDADD R0,R1,R2 (double saturates, 2*MAX)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0), (2, 0x7FFF_FFFF)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3765,9 +4881,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qdsub(0, 1, 2);
         t.push(TestCase {
             name: "QDSUB R0,R1,R2 (normal, 20-2*3)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 20), (2, 3)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3776,9 +4894,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qdsub(0, 1, 2);
         t.push(TestCase {
             name: "QDSUB R0,R1,R2 (double saturates, 2*MIN)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0), (2, 0x8000_0000)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3788,9 +4908,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_qadd(0, 1, 2);
         t.push(TestCase {
             name: "QADD R0,R1,R2 (Q sticky: pre=1, no sat)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 1), (2, 1)],
-            xpsr_pre: tb_q, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb_q,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3803,9 +4925,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b001, 0b000, 1, 0, 2);
         t.push(TestCase {
             name: "SADD16 R0,R1,R2 (packed 16-bit add)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0003_0005), (2, 0x0001_0002)], // hi: 3+1=4, lo: 5+2=7
-            xpsr_pre: tb, xpsr_mask: MASK_ALL_FLAGS_GE,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_ALL_FLAGS_GE,
             ..TestCase::default()
         });
     }
@@ -3814,10 +4938,12 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b001, 0b000, 1, 0, 2);
         t.push(TestCase {
             name: "SADD16 R0,R1,R2 (neg lane)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             // hi: 0xFFFF + 0x0001 = 0, lo: 0x8000 + 0x0001 = 0x8001 (negative)
             reg_pre: vec![(1, 0xFFFF_8000), (2, 0x0001_0001)],
-            xpsr_pre: tb, xpsr_mask: MASK_ALL_FLAGS_GE,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_ALL_FLAGS_GE,
             ..TestCase::default()
         });
     }
@@ -3826,9 +4952,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b101, 0b000, 1, 0, 2);
         t.push(TestCase {
             name: "SSUB16 R0,R1,R2 (packed 16-bit sub)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0005_000A), (2, 0x0001_0002)], // hi: 5-1=4, lo: 10-2=8
-            xpsr_pre: tb, xpsr_mask: MASK_ALL_FLAGS_GE,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_ALL_FLAGS_GE,
             ..TestCase::default()
         });
     }
@@ -3838,10 +4966,12 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b000, 0b100, 1, 0, 2);
         t.push(TestCase {
             name: "UADD8 R0,R1,R2 (packed 8-bit add)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             // lanes: 0x01+0x02=0x03, 0x10+0x20=0x30, 0x80+0x80=0x100(carry), 0xFF+0x01=0x100(carry)
             reg_pre: vec![(1, 0xFF80_1001), (2, 0x0180_2002)],
-            xpsr_pre: tb, xpsr_mask: MASK_ALL_FLAGS_GE,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_ALL_FLAGS_GE,
             ..TestCase::default()
         });
     }
@@ -3850,9 +4980,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b100, 0b100, 1, 0, 2);
         t.push(TestCase {
             name: "USUB8 R0,R1,R2 (packed 8-bit sub)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0A_05_FF_80), (2, 0x01_02_01_01)],
-            xpsr_pre: tb, xpsr_mask: MASK_ALL_FLAGS_GE,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_ALL_FLAGS_GE,
             ..TestCase::default()
         });
     }
@@ -3862,9 +4994,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b000, 0b000, 1, 0, 2);
         t.push(TestCase {
             name: "SADD8 R0,R1,R2 (signed 8-bit add)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x01_FE_7F_80), (2, 0x01_01_01_01)],
-            xpsr_pre: tb, xpsr_mask: MASK_ALL_FLAGS_GE,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_ALL_FLAGS_GE,
             ..TestCase::default()
         });
     }
@@ -3877,13 +5011,14 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
 
     // GE = 0b1010: select bytes 1,3 from Rn; bytes 0,2 from Rm
     {
-        let hw0 = 0xFAA0 | 1;  // Rn=R1
-        let hw1: u16 = 0xF080 | (0 << 8) | 2;  // Rd=R0, Rm=R2
+        let hw0 = 0xFAA0 | 1; // Rn=R1
+        let hw1: u16 = 0xF080 | (0 << 8) | 2; // Rd=R0, Rm=R2
         // GE[3:0] stored in xPSR bits [19:16]
         let ge_flags = 0b1010u32;
         t.push(TestCase {
             name: "SEL R0,R1,R2 (GE=0b1010)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0xAA_BB_CC_DD), (2, 0x11_22_33_44)],
             xpsr_pre: tb | (ge_flags << 16),
             xpsr_mask: MASK_NO_FLAGS, // SEL doesn't modify flags
@@ -3896,7 +5031,8 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let hw1: u16 = 0xF080 | (0 << 8) | 4;
         t.push(TestCase {
             name: "SEL R0,R3,R4 (GE=0b1111, all from Rn)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(3, 0xDEAD_BEEF), (4, 0x1234_5678)],
             xpsr_pre: tb | (0xF << 16),
             xpsr_mask: MASK_NO_FLAGS,
@@ -3909,7 +5045,8 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let hw1: u16 = 0xF080 | (0 << 8) | 4;
         t.push(TestCase {
             name: "SEL R0,R3,R4 (GE=0b0000, all from Rm)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(3, 0xDEAD_BEEF), (4, 0x1234_5678)],
             xpsr_pre: tb | (0x0 << 16),
             xpsr_mask: MASK_NO_FLAGS,
@@ -3924,10 +5061,12 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b001, 0b001, 1, 0, 2);
         t.push(TestCase {
             name: "QADD16 R0,R1,R2 (saturating 16-bit add)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             // 0x7FFF + 0x0001 → saturated to 0x7FFF, 0x0001 + 0x0001 = 0x0002
             reg_pre: vec![(1, 0x7FFF_0001), (2, 0x0001_0001)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3936,9 +5075,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_parallel(0b001, 0b100, 1, 0, 2);
         t.push(TestCase {
             name: "UADD16 R0,R1,R2 (unsigned 16-bit add)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0100_FF00), (2, 0x0200_0100)],
-            xpsr_pre: tb, xpsr_mask: MASK_ALL_FLAGS_GE,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_ALL_FLAGS_GE,
             ..TestCase::default()
         });
     }
@@ -3952,9 +5093,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, false);
         t.push(TestCase {
             name: "SMULBB R0,R1,R2 (3*4=12)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0xAAAA_0003), (2, 0xBBBB_0004)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3963,9 +5106,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, true, true);
         t.push(TestCase {
             name: "SMULTT R0,R1,R2 (5*6=30)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0005_CCCC), (2, 0x0006_DDDD)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3974,9 +5119,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, true);
         t.push(TestCase {
             name: "SMULBT R0,R1,R2 (7*(-1)=-7)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0000_0007), (2, 0xFFFF_0000)], // top=0xFFFF=-1
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -3985,9 +5132,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smlabb(0, 1, 2, 3, false, false);
         t.push(TestCase {
             name: "SMLABB R0,R1,R2,R3 (3*4+100=112)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 3), (2, 4), (3, 100)],
-            xpsr_pre: tb, xpsr_mask: MASK_Q_ONLY,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_Q_ONLY,
             ..TestCase::default()
         });
     }
@@ -3996,9 +5145,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, false);
         t.push(TestCase {
             name: "SMULBB R0,R1,R2 (0x7FFF*0x7FFF)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0000_7FFF), (2, 0x0000_7FFF)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4008,9 +5159,11 @@ pub fn gen_t32_dsp() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_smulxy(0, 1, 2, false, false);
         t.push(TestCase {
             name: "SMULBB R0,R1,R2 (0x8000*0x8000)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x0000_8000), (2, 0x0000_8000)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4029,9 +5182,7 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
     let tb = 0x0100_0000u32;
 
     // Helper for register-op tests (no flags).
-    let mk = |name: &str, hw0: u16, hw1: u16,
-              regs: Vec<(u8, u32)>| -> TestCase
-    {
+    let mk = |name: &str, hw0: u16, hw1: u16, regs: Vec<(u8, u32)>| -> TestCase {
         TestCase {
             name: name.into(),
             opcode: hw0,
@@ -4049,28 +5200,48 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
 
     {
         let (hw0, hw1) = enc_t32_clz(0, 1);
-        t.push(mk("CLZ R0,R1 (0x00000000 -> 32)", hw0, hw1,
-                   vec![(1, 0x0000_0000)]));
+        t.push(mk(
+            "CLZ R0,R1 (0x00000000 -> 32)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0000)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_clz(0, 1);
-        t.push(mk("CLZ R0,R1 (0x00000001 -> 31)", hw0, hw1,
-                   vec![(1, 0x0000_0001)]));
+        t.push(mk(
+            "CLZ R0,R1 (0x00000001 -> 31)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0001)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_clz(0, 1);
-        t.push(mk("CLZ R0,R1 (0x80000000 -> 0)", hw0, hw1,
-                   vec![(1, 0x8000_0000)]));
+        t.push(mk(
+            "CLZ R0,R1 (0x80000000 -> 0)",
+            hw0,
+            hw1,
+            vec![(1, 0x8000_0000)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_clz(0, 1);
-        t.push(mk("CLZ R0,R1 (0x0000FFFF -> 16)", hw0, hw1,
-                   vec![(1, 0x0000_FFFF)]));
+        t.push(mk(
+            "CLZ R0,R1 (0x0000FFFF -> 16)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_FFFF)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_clz(0, 1);
-        t.push(mk("CLZ R0,R1 (0xFFFFFFFF -> 0)", hw0, hw1,
-                   vec![(1, 0xFFFF_FFFF)]));
+        t.push(mk(
+            "CLZ R0,R1 (0xFFFFFFFF -> 0)",
+            hw0,
+            hw1,
+            vec![(1, 0xFFFF_FFFF)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -4079,23 +5250,39 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
 
     {
         let (hw0, hw1) = enc_t32_rbit(0, 1);
-        t.push(mk("RBIT R0,R1 (0x00000001 -> 0x80000000)", hw0, hw1,
-                   vec![(1, 0x0000_0001)]));
+        t.push(mk(
+            "RBIT R0,R1 (0x00000001 -> 0x80000000)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0001)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_rbit(0, 1);
-        t.push(mk("RBIT R0,R1 (0x80000000 -> 0x00000001)", hw0, hw1,
-                   vec![(1, 0x8000_0000)]));
+        t.push(mk(
+            "RBIT R0,R1 (0x80000000 -> 0x00000001)",
+            hw0,
+            hw1,
+            vec![(1, 0x8000_0000)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_rbit(0, 1);
-        t.push(mk("RBIT R0,R1 (0x0F0F0F0F -> 0xF0F0F0F0)", hw0, hw1,
-                   vec![(1, 0x0F0F_0F0F)]));
+        t.push(mk(
+            "RBIT R0,R1 (0x0F0F0F0F -> 0xF0F0F0F0)",
+            hw0,
+            hw1,
+            vec![(1, 0x0F0F_0F0F)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_rbit(0, 1);
-        t.push(mk("RBIT R0,R1 (0x00000000 -> 0x00000000)", hw0, hw1,
-                   vec![(1, 0x0000_0000)]));
+        t.push(mk(
+            "RBIT R0,R1 (0x00000000 -> 0x00000000)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0000)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -4104,13 +5291,21 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
 
     {
         let (hw0, hw1) = enc_t32_rev_w(0, 1);
-        t.push(mk("REV.W R0,R1 (0x12345678 -> 0x78563412)", hw0, hw1,
-                   vec![(1, 0x1234_5678)]));
+        t.push(mk(
+            "REV.W R0,R1 (0x12345678 -> 0x78563412)",
+            hw0,
+            hw1,
+            vec![(1, 0x1234_5678)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_rev_w(0, 1);
-        t.push(mk("REV.W R0,R1 (0x00000001 -> 0x01000000)", hw0, hw1,
-                   vec![(1, 0x0000_0001)]));
+        t.push(mk(
+            "REV.W R0,R1 (0x00000001 -> 0x01000000)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0001)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -4119,8 +5314,12 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
 
     {
         let (hw0, hw1) = enc_t32_rev16_w(0, 1);
-        t.push(mk("REV16.W R0,R1 (0x12345678 -> 0x34127856)", hw0, hw1,
-                   vec![(1, 0x1234_5678)]));
+        t.push(mk(
+            "REV16.W R0,R1 (0x12345678 -> 0x34127856)",
+            hw0,
+            hw1,
+            vec![(1, 0x1234_5678)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -4129,13 +5328,21 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
 
     {
         let (hw0, hw1) = enc_t32_revsh_w(0, 1);
-        t.push(mk("REVSH.W R0,R1 (0x0000FF80 -> sign-ext)", hw0, hw1,
-                   vec![(1, 0x0000_FF80)]));
+        t.push(mk(
+            "REVSH.W R0,R1 (0x0000FF80 -> sign-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_FF80)],
+        ));
     }
     {
         let (hw0, hw1) = enc_t32_revsh_w(0, 1);
-        t.push(mk("REVSH.W R0,R1 (0x00000001 -> 0x00000100)", hw0, hw1,
-                   vec![(1, 0x0000_0001)]));
+        t.push(mk(
+            "REVSH.W R0,R1 (0x00000001 -> 0x00000100)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0001)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -4145,65 +5352,105 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
     // LSL.W by 0 (identity)
     {
         let (hw0, hw1) = enc_t32_lsl_w_reg(0, 1, 2);
-        t.push(mk("LSL.W R0,R1,R2 (shift=0, identity)", hw0, hw1,
-                   vec![(1, 0xDEAD_BEEF), (2, 0)]));
+        t.push(mk(
+            "LSL.W R0,R1,R2 (shift=0, identity)",
+            hw0,
+            hw1,
+            vec![(1, 0xDEAD_BEEF), (2, 0)],
+        ));
     }
     // LSL.W by 1
     {
         let (hw0, hw1) = enc_t32_lsl_w_reg(0, 1, 2);
-        t.push(mk("LSL.W R0,R1,R2 (shift=1)", hw0, hw1,
-                   vec![(1, 0x4000_0000), (2, 1)]));
+        t.push(mk(
+            "LSL.W R0,R1,R2 (shift=1)",
+            hw0,
+            hw1,
+            vec![(1, 0x4000_0000), (2, 1)],
+        ));
     }
     // LSL.W by 31
     {
         let (hw0, hw1) = enc_t32_lsl_w_reg(0, 1, 2);
-        t.push(mk("LSL.W R0,R1,R2 (shift=31)", hw0, hw1,
-                   vec![(1, 1), (2, 31)]));
+        t.push(mk(
+            "LSL.W R0,R1,R2 (shift=31)",
+            hw0,
+            hw1,
+            vec![(1, 1), (2, 31)],
+        ));
     }
     // LSL.W by 32 (gives 0)
     {
         let (hw0, hw1) = enc_t32_lsl_w_reg(0, 1, 2);
-        t.push(mk("LSL.W R0,R1,R2 (shift=32, gives 0)", hw0, hw1,
-                   vec![(1, 0xFFFF_FFFF), (2, 32)]));
+        t.push(mk(
+            "LSL.W R0,R1,R2 (shift=32, gives 0)",
+            hw0,
+            hw1,
+            vec![(1, 0xFFFF_FFFF), (2, 32)],
+        ));
     }
 
     // LSR.W by 1
     {
         let (hw0, hw1) = enc_t32_lsr_w_reg(0, 1, 2);
-        t.push(mk("LSR.W R0,R1,R2 (shift=1)", hw0, hw1,
-                   vec![(1, 0x8000_0000), (2, 1)]));
+        t.push(mk(
+            "LSR.W R0,R1,R2 (shift=1)",
+            hw0,
+            hw1,
+            vec![(1, 0x8000_0000), (2, 1)],
+        ));
     }
     // LSR.W by 32 (gives 0)
     {
         let (hw0, hw1) = enc_t32_lsr_w_reg(0, 1, 2);
-        t.push(mk("LSR.W R0,R1,R2 (shift=32, gives 0)", hw0, hw1,
-                   vec![(1, 0xFFFF_FFFF), (2, 32)]));
+        t.push(mk(
+            "LSR.W R0,R1,R2 (shift=32, gives 0)",
+            hw0,
+            hw1,
+            vec![(1, 0xFFFF_FFFF), (2, 32)],
+        ));
     }
 
     // ASR.W by 31 (sign fills)
     {
         let (hw0, hw1) = enc_t32_asr_w_reg(0, 1, 2);
-        t.push(mk("ASR.W R0,R1,R2 (shift=31, neg)", hw0, hw1,
-                   vec![(1, 0x8000_0000), (2, 31)]));
+        t.push(mk(
+            "ASR.W R0,R1,R2 (shift=31, neg)",
+            hw0,
+            hw1,
+            vec![(1, 0x8000_0000), (2, 31)],
+        ));
     }
     // ASR.W by 32 (all sign)
     {
         let (hw0, hw1) = enc_t32_asr_w_reg(0, 1, 2);
-        t.push(mk("ASR.W R0,R1,R2 (shift=32, all sign)", hw0, hw1,
-                   vec![(1, 0x8000_0000), (2, 32)]));
+        t.push(mk(
+            "ASR.W R0,R1,R2 (shift=32, all sign)",
+            hw0,
+            hw1,
+            vec![(1, 0x8000_0000), (2, 32)],
+        ));
     }
 
     // ROR.W by 0 (identity)
     {
         let (hw0, hw1) = enc_t32_ror_w_reg(0, 1, 2);
-        t.push(mk("ROR.W R0,R1,R2 (shift=0, identity)", hw0, hw1,
-                   vec![(1, 0xDEAD_BEEF), (2, 0)]));
+        t.push(mk(
+            "ROR.W R0,R1,R2 (shift=0, identity)",
+            hw0,
+            hw1,
+            vec![(1, 0xDEAD_BEEF), (2, 0)],
+        ));
     }
     // ROR.W by 16
     {
         let (hw0, hw1) = enc_t32_ror_w_reg(0, 1, 2);
-        t.push(mk("ROR.W R0,R1,R2 (shift=16)", hw0, hw1,
-                   vec![(1, 0x1234_5678), (2, 16)]));
+        t.push(mk(
+            "ROR.W R0,R1,R2 (shift=16)",
+            hw0,
+            hw1,
+            vec![(1, 0x1234_5678), (2, 16)],
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -4213,38 +5460,62 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
     // SXTB.W: 0x80 → 0xFFFFFF80
     {
         let (hw0, hw1) = enc_t32_sxtb_w(0, 1, 0);
-        t.push(mk("SXTB.W R0,R1 (0x80 -> sign-ext)", hw0, hw1,
-                   vec![(1, 0x0000_0080)]));
+        t.push(mk(
+            "SXTB.W R0,R1 (0x80 -> sign-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0080)],
+        ));
     }
     // UXTB.W: 0x80 → 0x00000080
     {
         let (hw0, hw1) = enc_t32_uxtb_w(0, 1, 0);
-        t.push(mk("UXTB.W R0,R1 (0x80 -> zero-ext)", hw0, hw1,
-                   vec![(1, 0xFFFF_FF80)]));
+        t.push(mk(
+            "UXTB.W R0,R1 (0x80 -> zero-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0xFFFF_FF80)],
+        ));
     }
     // SXTH.W: 0x8000 → 0xFFFF8000
     {
         let (hw0, hw1) = enc_t32_sxth_w(0, 1, 0);
-        t.push(mk("SXTH.W R0,R1 (0x8000 -> sign-ext)", hw0, hw1,
-                   vec![(1, 0x0000_8000)]));
+        t.push(mk(
+            "SXTH.W R0,R1 (0x8000 -> sign-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_8000)],
+        ));
     }
     // UXTH.W: 0x8000 → 0x00008000
     {
         let (hw0, hw1) = enc_t32_uxth_w(0, 1, 0);
-        t.push(mk("UXTH.W R0,R1 (0x8000 -> zero-ext)", hw0, hw1,
-                   vec![(1, 0xFFFF_8000)]));
+        t.push(mk(
+            "UXTH.W R0,R1 (0x8000 -> zero-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0xFFFF_8000)],
+        ));
     }
     // SXTB.W with rotation 8: ROR #8 first, then sign-extend byte
     {
         let (hw0, hw1) = enc_t32_sxtb_w(0, 1, 8);
-        t.push(mk("SXTB.W R0,R1,ROR#8 (rot then sign-ext)", hw0, hw1,
-                   vec![(1, 0x0000_FF00)])); // ROR 8 → 0x000000FF, byte=0xFF → sign-ext
+        t.push(mk(
+            "SXTB.W R0,R1,ROR#8 (rot then sign-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_FF00)],
+        )); // ROR 8 → 0x000000FF, byte=0xFF → sign-ext
     }
     // UXTB.W with rotation 16
     {
         let (hw0, hw1) = enc_t32_uxtb_w(0, 1, 16);
-        t.push(mk("UXTB.W R0,R1,ROR#16 (rot then zero-ext)", hw0, hw1,
-                   vec![(1, 0x00AB_0000)])); // ROR 16 → 0x0000_00AB, byte=0xAB
+        t.push(mk(
+            "UXTB.W R0,R1,ROR#16 (rot then zero-ext)",
+            hw0,
+            hw1,
+            vec![(1, 0x00AB_0000)],
+        )); // ROR 16 → 0x0000_00AB, byte=0xAB
     }
 
     // ----------------------------------------------------------------
@@ -4255,57 +5526,89 @@ pub fn gen_t32_dp_register() -> Vec<TestCase> {
     // Rm=0x80 → sign-extends to 0xFFFFFF80 (-128), Rn=256 → 256+(-128) = 128
     {
         let (hw0, hw1) = enc_t32_sxtab(0, 1, 2, 0);
-        t.push(mk("SXTAB R0,R1,R2 (0x80 sign-ext + 256 = 128)", hw0, hw1,
-                   vec![(1, 256), (2, 0x0000_0080)]));
+        t.push(mk(
+            "SXTAB R0,R1,R2 (0x80 sign-ext + 256 = 128)",
+            hw0,
+            hw1,
+            vec![(1, 256), (2, 0x0000_0080)],
+        ));
     }
     // UXTAB: zero-extend byte from Rm, add to Rn
     // Rm=0xFF80 → byte=0x80, zero-extends to 128, Rn=100 → 228
     {
         let (hw0, hw1) = enc_t32_uxtab(0, 1, 2, 0);
-        t.push(mk("UXTAB R0,R1,R2 (0x80 zero-ext + 100 = 228)", hw0, hw1,
-                   vec![(1, 100), (2, 0x0000_FF80)]));
+        t.push(mk(
+            "UXTAB R0,R1,R2 (0x80 zero-ext + 100 = 228)",
+            hw0,
+            hw1,
+            vec![(1, 100), (2, 0x0000_FF80)],
+        ));
     }
     // SXTAH: sign-extend halfword from Rm, add to Rn
     // Rm=0x8000 → sign-extends to 0xFFFF8000 (-32768), Rn=0x10000 → 0x10000-0x8000 = 0x8000
     {
         let (hw0, hw1) = enc_t32_sxtah(0, 1, 2, 0);
-        t.push(mk("SXTAH R0,R1,R2 (0x8000 sign-ext + 0x10000)", hw0, hw1,
-                   vec![(1, 0x0001_0000), (2, 0x0000_8000)]));
+        t.push(mk(
+            "SXTAH R0,R1,R2 (0x8000 sign-ext + 0x10000)",
+            hw0,
+            hw1,
+            vec![(1, 0x0001_0000), (2, 0x0000_8000)],
+        ));
     }
     // UXTAH: zero-extend halfword from Rm, add to Rn
     // Rm=0xFFFF8000 → halfword=0x8000, zero-extends to 0x8000, Rn=0x100 → 0x8100
     {
         let (hw0, hw1) = enc_t32_uxtah(0, 1, 2, 0);
-        t.push(mk("UXTAH R0,R1,R2 (0x8000 zero-ext + 0x100)", hw0, hw1,
-                   vec![(1, 0x0000_0100), (2, 0xFFFF_8000)]));
+        t.push(mk(
+            "UXTAH R0,R1,R2 (0x8000 zero-ext + 0x100)",
+            hw0,
+            hw1,
+            vec![(1, 0x0000_0100), (2, 0xFFFF_8000)],
+        ));
     }
     // SXTAB with rotation: rot=1 (ROR #8), Rm=0x0000_FF80
     // After ROR 8: 0x800000FF, byte = 0xFF → sign-extends to -1, Rn=10 → 9
     {
         let (hw0, hw1) = enc_t32_sxtab(0, 1, 2, 8);
-        t.push(mk("SXTAB R0,R1,R2,ROR#8 (rot then sign-ext+add)", hw0, hw1,
-                   vec![(1, 10), (2, 0x0000_FF00)])); // ROR 8 → 0x000000FF, byte=0xFF→-1, 10-1=9
+        t.push(mk(
+            "SXTAB R0,R1,R2,ROR#8 (rot then sign-ext+add)",
+            hw0,
+            hw1,
+            vec![(1, 10), (2, 0x0000_FF00)],
+        )); // ROR 8 → 0x000000FF, byte=0xFF→-1, 10-1=9
     }
     // UXTAB with rotation: rot=2 (ROR #16), Rm=0x00AB_0000
     // After ROR 16: 0x0000_00AB, byte = 0xAB → zero-extends to 0xAB, Rn=5 → 5+0xAB=0xB0
     {
         let (hw0, hw1) = enc_t32_uxtab(0, 1, 2, 16);
-        t.push(mk("UXTAB R0,R1,R2,ROR#16 (rot then zero-ext+add)", hw0, hw1,
-                   vec![(1, 5), (2, 0x00AB_0000)])); // ROR 16 → 0x0000_00AB, 5+0xAB=0xB0
+        t.push(mk(
+            "UXTAB R0,R1,R2,ROR#16 (rot then zero-ext+add)",
+            hw0,
+            hw1,
+            vec![(1, 5), (2, 0x00AB_0000)],
+        )); // ROR 16 → 0x0000_00AB, 5+0xAB=0xB0
     }
     // SXTAH with rotation: rot=1 (ROR #8), Rm=0x0080_FF00
     // After ROR 8: 0x000080FF, halfword = 0x80FF → sign-extends to 0xFFFF80FF (-32513), Rn=0x10000
     {
         let (hw0, hw1) = enc_t32_sxtah(0, 1, 2, 8);
-        t.push(mk("SXTAH R0,R1,R2,ROR#8 (rot then sign-ext hw+add)", hw0, hw1,
-                   vec![(1, 0x0001_0000), (2, 0x0080_FF00)]));
+        t.push(mk(
+            "SXTAH R0,R1,R2,ROR#8 (rot then sign-ext hw+add)",
+            hw0,
+            hw1,
+            vec![(1, 0x0001_0000), (2, 0x0080_FF00)],
+        ));
     }
     // UXTAH with rotation: rot=1 (ROR #8), Rm=0x0080_FF00
     // After ROR 8: 0x000080FF, halfword = 0x80FF → zero-extends to 0x80FF, Rn=1 → 0x8100
     {
         let (hw0, hw1) = enc_t32_uxtah(0, 1, 2, 8);
-        t.push(mk("UXTAH R0,R1,R2,ROR#8 (rot then zero-ext hw+add)", hw0, hw1,
-                   vec![(1, 1), (2, 0x0080_FF00)]));
+        t.push(mk(
+            "UXTAH R0,R1,R2,ROR#8 (rot then zero-ext hw+add)",
+            hw0,
+            hw1,
+            vec![(1, 1), (2, 0x0080_FF00)],
+        ));
     }
 
     t
@@ -4329,9 +5632,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_msr(0, 16);
         t.push(TestCase {
             name: "MSR PRIMASK,R0 (sysm=16, val=1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 1)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4340,9 +5645,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_msr(1, 17);
         t.push(TestCase {
             name: "MSR BASEPRI,R1 (sysm=17, val=0x40)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(1, 0x40)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4351,9 +5658,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_msr(2, 19);
         t.push(TestCase {
             name: "MSR FAULTMASK,R2 (sysm=19, val=1)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(2, 1)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4362,9 +5671,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_msr(0, 16);
         t.push(TestCase {
             name: "MSR PRIMASK,R0 (sysm=16, val=0)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(0, 0)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4378,9 +5689,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mrs(0, 16);
         t.push(TestCase {
             name: "MRS R0,PRIMASK (sysm=16)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4389,9 +5702,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mrs(1, 17);
         t.push(TestCase {
             name: "MRS R1,BASEPRI (sysm=17)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4400,9 +5715,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mrs(2, 20);
         t.push(TestCase {
             name: "MRS R2,CONTROL (sysm=20)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4411,9 +5728,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
         let (hw0, hw1) = enc_t32_mrs(8, 16);
         t.push(TestCase {
             name: "MRS R8,PRIMASK (high reg)".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4426,9 +5745,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
     {
         t.push(TestCase {
             name: "NOP.W (no state change)".into(),
-            opcode: 0xF3AF, hw1: Some(0x8000),
+            opcode: 0xF3AF,
+            hw1: Some(0x8000),
             reg_pre: vec![(0, 0xDEAD_BEEF), (1, 0xCAFE_BABE)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4436,7 +5757,8 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
     {
         t.push(TestCase {
             name: "NOP.W (flags preserved)".into(),
-            opcode: 0xF3AF, hw1: Some(0x8000),
+            opcode: 0xF3AF,
+            hw1: Some(0x8000),
             reg_pre: vec![],
             xpsr_pre: tb | (0xF << 28), // NZCV all set
             xpsr_mask: MASK_ALL_FLAGS,
@@ -4452,9 +5774,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
     {
         t.push(TestCase {
             name: "DMB (barrier, no state change)".into(),
-            opcode: 0xF3BF, hw1: Some(0x8F5F),
+            opcode: 0xF3BF,
+            hw1: Some(0x8F5F),
             reg_pre: vec![(0, 42)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4462,9 +5786,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
     {
         t.push(TestCase {
             name: "DSB (barrier, no state change)".into(),
-            opcode: 0xF3BF, hw1: Some(0x8F4F),
+            opcode: 0xF3BF,
+            hw1: Some(0x8F4F),
             reg_pre: vec![(0, 42)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4472,9 +5798,11 @@ pub fn gen_t32_misc_control() -> Vec<TestCase> {
     {
         t.push(TestCase {
             name: "ISB (barrier, no state change)".into(),
-            opcode: 0xF3BF, hw1: Some(0x8F6F),
+            opcode: 0xF3BF,
+            hw1: Some(0x8F6F),
             reg_pre: vec![(0, 42)],
-            xpsr_pre: tb, xpsr_mask: MASK_NO_FLAGS,
+            xpsr_pre: tb,
+            xpsr_mask: MASK_NO_FLAGS,
             ..TestCase::default()
         });
     }
@@ -4491,15 +5819,18 @@ use rand::rngs::StdRng;
 
 /// All valid DP op constants (not contiguous: 0-4, 8, 10-11, 13-14).
 const DP_OPS: [u16; 10] = [
-    DP_AND, DP_BIC, DP_ORR, DP_ORN, DP_EOR,
-    DP_ADD, DP_ADC, DP_SBC, DP_SUB, DP_RSB,
+    DP_AND, DP_BIC, DP_ORR, DP_ORN, DP_EOR, DP_ADD, DP_ADC, DP_SBC, DP_SUB, DP_RSB,
 ];
 
 /// Random register R0-R12 (avoids SP=13 and PC=15).
-fn rand_reg(rng: &mut StdRng) -> u16 { rng.range(0..13) }
+fn rand_reg(rng: &mut StdRng) -> u16 {
+    rng.range(0..13)
+}
 
 /// Random 32-bit value.
-fn rand_val(rng: &mut StdRng) -> u32 { rng.random() }
+fn rand_val(rng: &mut StdRng) -> u32 {
+    rng.random()
+}
 
 /// Random xPSR flags (N, Z, C, V in bits 31:28) with T bit set.
 fn rand_flags(rng: &mut StdRng) -> u32 {
@@ -4520,13 +5851,21 @@ fn biased_f32(rng: &mut StdRng) -> u32 {
         0x7F80_0000 | rng.range(1u32..0x0080_0000)
     } else if r < 0.2 {
         // Inf: +/- Inf
-        if rng.coin(0.5) { 0x7F80_0000 } else { 0xFF80_0000 }
+        if rng.coin(0.5) {
+            0x7F80_0000
+        } else {
+            0xFF80_0000
+        }
     } else if r < 0.3 {
         // Denormal: exponent=0, fraction!=0
         rng.range(1u32..0x0080_0000)
     } else if r < 0.4 {
         // Zero: +/- 0
-        if rng.coin(0.5) { 0x0000_0000 } else { 0x8000_0000 }
+        if rng.coin(0.5) {
+            0x0000_0000
+        } else {
+            0x8000_0000
+        }
     } else {
         // Normal
         rng.random()
@@ -4588,11 +5927,15 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rd = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rd { break r; }
+            if r != rd {
+                break r;
+            }
         };
         let rm = loop {
             let r = rand_reg(rng);
-            if r != rd && r != rn { break r; }
+            if r != rd && r != rn {
+                break r;
+            }
         };
         let mut regs = rand_gp_regs(rng);
         let (name_tag, hw0, hw1) = match variant {
@@ -4603,7 +5946,9 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             1 => {
                 let ra = loop {
                     let r = rand_reg(rng);
-                    if r != rd && r != rn && r != rm { break r; }
+                    if r != rd && r != rn && r != rm {
+                        break r;
+                    }
                 };
                 regs.retain(|&(r, _)| r != ra as u8);
                 regs.push((ra as u8, rand_val(rng)));
@@ -4613,7 +5958,9 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             _ => {
                 let ra = loop {
                     let r = rand_reg(rng);
-                    if r != rd && r != rn && r != rm { break r; }
+                    if r != rd && r != rn && r != rm {
+                        break r;
+                    }
                 };
                 regs.retain(|&(r, _)| r != ra as u8);
                 regs.push((ra as u8, rand_val(rng)));
@@ -4638,11 +5985,15 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rd = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rd { break r; }
+            if r != rd {
+                break r;
+            }
         };
         let rm = loop {
             let r = rand_reg(rng);
-            if r != rd && r != rn { break r; }
+            if r != rd && r != rn {
+                break r;
+            }
         };
         let mut regs = rand_gp_regs(rng);
         // Occasionally test division by zero
@@ -4673,16 +6024,30 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rdlo = rand_reg(rng);
         let rdhi = loop {
             let r = rand_reg(rng);
-            if r != rdlo { break r; }
+            if r != rdlo {
+                break r;
+            }
         };
         let rn = rand_reg(rng);
         let rm = rand_reg(rng);
         let regs = rand_gp_regs(rng);
         let (tag, hw0, hw1) = match variant {
-            0 => { let (h0, h1) = enc_t32_smull(rdlo, rdhi, rn, rm); ("SMULL", h0, h1) }
-            1 => { let (h0, h1) = enc_t32_umull(rdlo, rdhi, rn, rm); ("UMULL", h0, h1) }
-            2 => { let (h0, h1) = enc_t32_smlal(rdlo, rdhi, rn, rm); ("SMLAL", h0, h1) }
-            _ => { let (h0, h1) = enc_t32_umlal(rdlo, rdhi, rn, rm); ("UMLAL", h0, h1) }
+            0 => {
+                let (h0, h1) = enc_t32_smull(rdlo, rdhi, rn, rm);
+                ("SMULL", h0, h1)
+            }
+            1 => {
+                let (h0, h1) = enc_t32_umull(rdlo, rdhi, rn, rm);
+                ("UMULL", h0, h1)
+            }
+            2 => {
+                let (h0, h1) = enc_t32_smlal(rdlo, rdhi, rn, rm);
+                ("SMLAL", h0, h1)
+            }
+            _ => {
+                let (h0, h1) = enc_t32_umlal(rdlo, rdhi, rn, rm);
+                ("UMLAL", h0, h1)
+            }
         };
         t.push(TestCase {
             name: format!("FUZZ:T32_LMUL:{i} {tag} R{rdlo},R{rdhi},R{rn},R{rm}"),
@@ -4702,11 +6067,15 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rd = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rd { break r; }
+            if r != rd {
+                break r;
+            }
         };
         let rm = loop {
             let r = rand_reg(rng);
-            if r != rd && r != rn { break r; }
+            if r != rd && r != rn {
+                break r;
+            }
         };
         let regs = rand_gp_regs(rng);
         let (hw0, hw1) = enc_t32_smulxy(rd, rn, rm, n_high, m_high);
@@ -4730,15 +6099,21 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rd = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rd { break r; }
+            if r != rd {
+                break r;
+            }
         };
         let rm = loop {
             let r = rand_reg(rng);
-            if r != rd && r != rn { break r; }
+            if r != rd && r != rn {
+                break r;
+            }
         };
         let ra = loop {
             let r = rand_reg(rng);
-            if r != rd && r != rn && r != rm { break r; }
+            if r != rd && r != rn && r != rm {
+                break r;
+            }
         };
         let regs = rand_gp_regs(rng);
         let (hw0, hw1) = enc_t32_smlabb(rd, rn, rm, ra, n_high, m_high);
@@ -4872,7 +6247,9 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rdlo = rand_reg(rng);
         let rdhi = loop {
             let r = rand_reg(rng);
-            if r != rdlo { break r; }
+            if r != rdlo {
+                break r;
+            }
         };
         let rn = rand_reg(rng);
         let rm = rand_reg(rng);
@@ -4889,12 +6266,28 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             1 => {
                 let cross = rng.coin(0.5);
                 let (h0, h1) = enc_t32_smlald(rdlo, rdhi, rn, rm, cross);
-                (if cross { "SMLALDX".to_string() } else { "SMLALD".to_string() }, h0, h1)
+                (
+                    if cross {
+                        "SMLALDX".to_string()
+                    } else {
+                        "SMLALD".to_string()
+                    },
+                    h0,
+                    h1,
+                )
             }
             _ => {
                 let cross = rng.coin(0.5);
                 let (h0, h1) = enc_t32_smlsld(rdlo, rdhi, rn, rm, cross);
-                (if cross { "SMLSLDX".to_string() } else { "SMLSLD".to_string() }, h0, h1)
+                (
+                    if cross {
+                        "SMLSLDX".to_string()
+                    } else {
+                        "SMLSLD".to_string()
+                    },
+                    h0,
+                    h1,
+                )
             }
         };
         t.push(TestCase {
@@ -4918,7 +6311,9 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                 let rdlo = rand_reg(rng);
                 let rdhi = loop {
                     let r = rand_reg(rng);
-                    if r != rdlo { break r; }
+                    if r != rdlo {
+                        break r;
+                    }
                 };
                 let rn = rand_reg(rng);
                 let rm = rand_reg(rng);
@@ -4958,11 +6353,15 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rd = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rd { break r; }
+            if r != rd {
+                break r;
+            }
         };
         let rm = loop {
             let r = rand_reg(rng);
-            if r != rd && r != rn { break r; }
+            if r != rd && r != rn {
+                break r;
+            }
         };
         let mut regs = rand_gp_regs(rng);
         // Bias ~20% of operand values toward saturation edges. The outer four
@@ -4989,10 +6388,22 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         regs.push((rn as u8, edge_val(rng)));
         regs.push((rm as u8, edge_val(rng)));
         let (tag, hw0, hw1) = match variant {
-            0 => { let (h0, h1) = enc_t32_qadd(rd, rn, rm); ("QADD", h0, h1) }
-            1 => { let (h0, h1) = enc_t32_qsub(rd, rn, rm); ("QSUB", h0, h1) }
-            2 => { let (h0, h1) = enc_t32_qdadd(rd, rn, rm); ("QDADD", h0, h1) }
-            _ => { let (h0, h1) = enc_t32_qdsub(rd, rn, rm); ("QDSUB", h0, h1) }
+            0 => {
+                let (h0, h1) = enc_t32_qadd(rd, rn, rm);
+                ("QADD", h0, h1)
+            }
+            1 => {
+                let (h0, h1) = enc_t32_qsub(rd, rn, rm);
+                ("QSUB", h0, h1)
+            }
+            2 => {
+                let (h0, h1) = enc_t32_qdadd(rd, rn, rm);
+                ("QDADD", h0, h1)
+            }
+            _ => {
+                let (h0, h1) = enc_t32_qdsub(rd, rn, rm);
+                ("QDSUB", h0, h1)
+            }
         };
         t.push(TestCase {
             name: format!("FUZZ:T32_QSAT:{i} {tag} R{rd},R{rn},R{rm}"),
@@ -5023,11 +6434,15 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rd = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rd { break r; }
+            if r != rd {
+                break r;
+            }
         };
         let rm = loop {
             let r = rand_reg(rng);
-            if r != rd && r != rn { break r; }
+            if r != rd && r != rn {
+                break r;
+            }
         };
         let regs = rand_gp_regs(rng);
         let (hw0, hw1) = enc_t32_parallel(operation, modifier, rn, rd, rm);
@@ -5038,7 +6453,9 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             MASK_NO_FLAGS
         };
         t.push(TestCase {
-            name: format!("FUZZ:T32_PARADD:{i} op={operation:03b} mod={modifier:03b} R{rd},R{rn},R{rm}"),
+            name: format!(
+                "FUZZ:T32_PARADD:{i} op={operation:03b} mod={modifier:03b} R{rd},R{rn},R{rm}"
+            ),
             opcode: hw0,
             hw1: Some(hw1),
             reg_pre: regs,
@@ -5054,7 +6471,9 @@ pub fn generate_fuzz_t32_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rd = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rd { break r; }
+            if r != rd {
+                break r;
+            }
         };
         // Randomise shift type/amount. ASR#0 is UNPREDICTABLE; keep ASR in 1..=31.
         let use_asr = rng.coin(0.5);
@@ -5131,14 +6550,16 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let size_sel: u8 = rng.range(0..3);
         let is_load = rng.coin(0.5);
         let (size, align, max_off) = match size_sel {
-            0 => (0u16, 1u32, SCRATCH_SIZE - 1),  // byte
-            1 => (1u16, 2u32, SCRATCH_SIZE - 2),   // half
-            _ => (2u16, 4u32, SCRATCH_SIZE - 4),   // word
+            0 => (0u16, 1u32, SCRATCH_SIZE - 1), // byte
+            1 => (1u16, 2u32, SCRATCH_SIZE - 2), // half
+            _ => (2u16, 4u32, SCRATCH_SIZE - 4), // word
         };
         let rt = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rt { break r; }
+            if r != rt {
+                break r;
+            }
         };
         let imm12 = (rng.range(0..max_off / align) * align) as u16;
         let offset = imm12 as u32;
@@ -5198,7 +6619,9 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rt = rand_reg(rng);
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rt { break r; }
+            if r != rt {
+                break r;
+            }
         };
 
         // P/U/W: avoid P=0,U=0,W=0 (undefined). For W=1, keep base in middle of scratch.
@@ -5265,11 +6688,15 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rt = rand_reg(rng);
         let rt2 = loop {
             let r = rand_reg(rng);
-            if r != rt { break r; }
+            if r != rt {
+                break r;
+            }
         };
         let rn = loop {
             let r = rand_reg(rng);
-            if r != rt && r != rt2 { break r; }
+            if r != rt && r != rt2 {
+                break r;
+            }
         };
 
         let p = rng.coin(0.7);
@@ -5417,7 +6844,11 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             opcode: hw0,
             hw1: Some(hw1),
             reg_pre,
-            addr_regs: if reglist & (1 << rn) == 0 { vec![rn as u8] } else { vec![] },
+            addr_regs: if reglist & (1 << rn) == 0 {
+                vec![rn as u8]
+            } else {
+                vec![]
+            },
             needs_bus: true,
             mem_pre,
             mem_check,
@@ -5439,8 +6870,11 @@ pub fn generate_fuzz_t32_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 fn fpu_binop_tc(
     name: &str,
     enc_fn: fn(u16, u16, u16) -> (u16, u16),
-    sd: u16, sn: u16, sm: u16,
-    val_n: u32, val_m: u32,
+    sd: u16,
+    sn: u16,
+    sm: u16,
+    val_n: u32,
+    val_m: u32,
 ) -> TestCase {
     let (hw0, hw1) = enc_fn(sd, sn, sm);
     TestCase {
@@ -5460,8 +6894,12 @@ fn fpu_binop_tc(
 fn fpu_mac_tc(
     name: &str,
     enc_fn: fn(u16, u16, u16) -> (u16, u16),
-    sd: u16, sn: u16, sm: u16,
-    val_d: u32, val_n: u32, val_m: u32,
+    sd: u16,
+    sn: u16,
+    sm: u16,
+    val_d: u32,
+    val_n: u32,
+    val_m: u32,
 ) -> TestCase {
     let (hw0, hw1) = enc_fn(sd, sn, sm);
     TestCase {
@@ -5480,7 +6918,8 @@ fn fpu_mac_tc(
 fn fpu_unary_tc(
     name: &str,
     enc_fn: fn(u16, u16) -> (u16, u16),
-    sd: u16, sm: u16,
+    sd: u16,
+    sm: u16,
     val_m: u32,
 ) -> TestCase {
     let (hw0, hw1) = enc_fn(sd, sm);
@@ -5514,74 +6953,300 @@ const F32_HALF: u32 = 0x3F00_0000;
 /// Generate ~60 targeted FPU test cases.
 pub fn gen_t32_fpu() -> Vec<TestCase> {
     use crate::{
-        enc_vadd, enc_vsub, enc_vmul, enc_vnmul, enc_vdiv,
-        enc_vmla, enc_vmls, enc_vnmla, enc_vnmls,
-        enc_vfma, enc_vfms, enc_vfnma, enc_vfnms,
-        enc_vmov_reg, enc_vabs, enc_vneg, enc_vsqrt,
-        enc_vcmp, enc_vcmp_zero, enc_vmrs,
-        enc_vcvt_f32_s32, enc_vcvt_f32_u32,
-        enc_vcvt_s32_f32, enc_vcvt_u32_f32, enc_vcvtr_s32_f32,
-        enc_vmov_to_fpu, enc_vmov_to_arm,
-        MASK_NO_FLAGS,
+        MASK_NO_FLAGS, enc_vabs, enc_vadd, enc_vcmp, enc_vcmp_zero, enc_vcvt_f32_s32,
+        enc_vcvt_f32_u32, enc_vcvt_s32_f32, enc_vcvt_u32_f32, enc_vcvtr_s32_f32, enc_vdiv,
+        enc_vfma, enc_vfms, enc_vfnma, enc_vfnms, enc_vmla, enc_vmls, enc_vmov_reg,
+        enc_vmov_to_arm, enc_vmov_to_fpu, enc_vmrs, enc_vmul, enc_vneg, enc_vnmla, enc_vnmls,
+        enc_vnmul, enc_vsqrt, enc_vsub,
     };
 
     let mut t = Vec::new();
 
     // --- Arithmetic: VADD ---
-    t.push(fpu_binop_tc("VADD 1.0+2.0", enc_vadd, 0, 1, 2, F32_ONE, F32_TWO));
-    t.push(fpu_binop_tc("VADD +0+-0", enc_vadd, 0, 1, 2, F32_POS_ZERO, F32_NEG_ZERO));
-    t.push(fpu_binop_tc("VADD +Inf+1", enc_vadd, 0, 1, 2, F32_POS_INF, F32_ONE));
-    t.push(fpu_binop_tc("VADD +Inf+-Inf", enc_vadd, 0, 1, 2, F32_POS_INF, F32_NEG_INF));
-    t.push(fpu_binop_tc("VADD NaN+1", enc_vadd, 0, 1, 2, F32_QNAN, F32_ONE));
-    t.push(fpu_binop_tc("VADD denorm+denorm", enc_vadd, 0, 1, 2, F32_DENORM, F32_DENORM));
+    t.push(fpu_binop_tc(
+        "VADD 1.0+2.0",
+        enc_vadd,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_TWO,
+    ));
+    t.push(fpu_binop_tc(
+        "VADD +0+-0",
+        enc_vadd,
+        0,
+        1,
+        2,
+        F32_POS_ZERO,
+        F32_NEG_ZERO,
+    ));
+    t.push(fpu_binop_tc(
+        "VADD +Inf+1",
+        enc_vadd,
+        0,
+        1,
+        2,
+        F32_POS_INF,
+        F32_ONE,
+    ));
+    t.push(fpu_binop_tc(
+        "VADD +Inf+-Inf",
+        enc_vadd,
+        0,
+        1,
+        2,
+        F32_POS_INF,
+        F32_NEG_INF,
+    ));
+    t.push(fpu_binop_tc(
+        "VADD NaN+1",
+        enc_vadd,
+        0,
+        1,
+        2,
+        F32_QNAN,
+        F32_ONE,
+    ));
+    t.push(fpu_binop_tc(
+        "VADD denorm+denorm",
+        enc_vadd,
+        0,
+        1,
+        2,
+        F32_DENORM,
+        F32_DENORM,
+    ));
 
     // --- Arithmetic: VSUB ---
-    t.push(fpu_binop_tc("VSUB 3.0-1.0", enc_vsub, 4, 5, 6, F32_THREE, F32_ONE));
-    t.push(fpu_binop_tc("VSUB +0-+0", enc_vsub, 4, 5, 6, F32_POS_ZERO, F32_POS_ZERO));
-    t.push(fpu_binop_tc("VSUB NaN-1", enc_vsub, 4, 5, 6, F32_QNAN, F32_ONE));
+    t.push(fpu_binop_tc(
+        "VSUB 3.0-1.0",
+        enc_vsub,
+        4,
+        5,
+        6,
+        F32_THREE,
+        F32_ONE,
+    ));
+    t.push(fpu_binop_tc(
+        "VSUB +0-+0",
+        enc_vsub,
+        4,
+        5,
+        6,
+        F32_POS_ZERO,
+        F32_POS_ZERO,
+    ));
+    t.push(fpu_binop_tc(
+        "VSUB NaN-1",
+        enc_vsub,
+        4,
+        5,
+        6,
+        F32_QNAN,
+        F32_ONE,
+    ));
 
     // --- Arithmetic: VMUL ---
-    t.push(fpu_binop_tc("VMUL 2.0*3.0", enc_vmul, 0, 1, 2, F32_TWO, F32_THREE));
-    t.push(fpu_binop_tc("VMUL +Inf*0", enc_vmul, 0, 1, 2, F32_POS_INF, F32_POS_ZERO));
-    t.push(fpu_binop_tc("VMUL -1*-1", enc_vmul, 0, 1, 2, F32_NEG_ONE, F32_NEG_ONE));
+    t.push(fpu_binop_tc(
+        "VMUL 2.0*3.0",
+        enc_vmul,
+        0,
+        1,
+        2,
+        F32_TWO,
+        F32_THREE,
+    ));
+    t.push(fpu_binop_tc(
+        "VMUL +Inf*0",
+        enc_vmul,
+        0,
+        1,
+        2,
+        F32_POS_INF,
+        F32_POS_ZERO,
+    ));
+    t.push(fpu_binop_tc(
+        "VMUL -1*-1",
+        enc_vmul,
+        0,
+        1,
+        2,
+        F32_NEG_ONE,
+        F32_NEG_ONE,
+    ));
 
     // --- Arithmetic: VNMUL ---
-    t.push(fpu_binop_tc("VNMUL 2.0*3.0", enc_vnmul, 0, 1, 2, F32_TWO, F32_THREE));
+    t.push(fpu_binop_tc(
+        "VNMUL 2.0*3.0",
+        enc_vnmul,
+        0,
+        1,
+        2,
+        F32_TWO,
+        F32_THREE,
+    ));
 
     // --- Arithmetic: VDIV ---
-    t.push(fpu_binop_tc("VDIV 4.0/2.0", enc_vdiv, 0, 1, 2, F32_FOUR, F32_TWO));
-    t.push(fpu_binop_tc("VDIV 1.0/0.0", enc_vdiv, 0, 1, 2, F32_ONE, F32_POS_ZERO));
-    t.push(fpu_binop_tc("VDIV 0.0/0.0", enc_vdiv, 0, 1, 2, F32_POS_ZERO, F32_POS_ZERO));
+    t.push(fpu_binop_tc(
+        "VDIV 4.0/2.0",
+        enc_vdiv,
+        0,
+        1,
+        2,
+        F32_FOUR,
+        F32_TWO,
+    ));
+    t.push(fpu_binop_tc(
+        "VDIV 1.0/0.0",
+        enc_vdiv,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_POS_ZERO,
+    ));
+    t.push(fpu_binop_tc(
+        "VDIV 0.0/0.0",
+        enc_vdiv,
+        0,
+        1,
+        2,
+        F32_POS_ZERO,
+        F32_POS_ZERO,
+    ));
 
     // --- Multiply-accumulate: VMLA (Sd = Sd + Sn*Sm) ---
-    t.push(fpu_mac_tc("VMLA 1+2*3", enc_vmla, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
-    t.push(fpu_mac_tc("VMLA 0+Inf*0", enc_vmla, 0, 1, 2, F32_POS_ZERO, F32_POS_INF, F32_POS_ZERO));
+    t.push(fpu_mac_tc(
+        "VMLA 1+2*3",
+        enc_vmla,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_TWO,
+        F32_THREE,
+    ));
+    t.push(fpu_mac_tc(
+        "VMLA 0+Inf*0",
+        enc_vmla,
+        0,
+        1,
+        2,
+        F32_POS_ZERO,
+        F32_POS_INF,
+        F32_POS_ZERO,
+    ));
 
     // --- Multiply-accumulate: VMLS (Sd = Sd - Sn*Sm) ---
-    t.push(fpu_mac_tc("VMLS 4-2*1", enc_vmls, 0, 1, 2, F32_FOUR, F32_TWO, F32_ONE));
+    t.push(fpu_mac_tc(
+        "VMLS 4-2*1",
+        enc_vmls,
+        0,
+        1,
+        2,
+        F32_FOUR,
+        F32_TWO,
+        F32_ONE,
+    ));
 
     // --- VNMLA (Sd = -(Sd + Sn*Sm)) ---
-    t.push(fpu_mac_tc("VNMLA 1+2*3", enc_vnmla, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+    t.push(fpu_mac_tc(
+        "VNMLA 1+2*3",
+        enc_vnmla,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_TWO,
+        F32_THREE,
+    ));
 
     // --- VNMLS (Sd = -Sd + Sn*Sm) ---
-    t.push(fpu_mac_tc("VNMLS 1+2*3", enc_vnmls, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+    t.push(fpu_mac_tc(
+        "VNMLS 1+2*3",
+        enc_vnmls,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_TWO,
+        F32_THREE,
+    ));
 
     // --- VFMA (fused) ---
-    t.push(fpu_mac_tc("VFMA 1+2*3", enc_vfma, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
-    t.push(fpu_mac_tc("VFMA NaN+1*1", enc_vfma, 0, 1, 2, F32_QNAN, F32_ONE, F32_ONE));
+    t.push(fpu_mac_tc(
+        "VFMA 1+2*3",
+        enc_vfma,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_TWO,
+        F32_THREE,
+    ));
+    t.push(fpu_mac_tc(
+        "VFMA NaN+1*1",
+        enc_vfma,
+        0,
+        1,
+        2,
+        F32_QNAN,
+        F32_ONE,
+        F32_ONE,
+    ));
 
     // --- VFMS (fused) ---
-    t.push(fpu_mac_tc("VFMS 4-2*1", enc_vfms, 0, 1, 2, F32_FOUR, F32_TWO, F32_ONE));
+    t.push(fpu_mac_tc(
+        "VFMS 4-2*1",
+        enc_vfms,
+        0,
+        1,
+        2,
+        F32_FOUR,
+        F32_TWO,
+        F32_ONE,
+    ));
 
     // --- VFNMA ---
-    t.push(fpu_mac_tc("VFNMA 1+2*3", enc_vfnma, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+    t.push(fpu_mac_tc(
+        "VFNMA 1+2*3",
+        enc_vfnma,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_TWO,
+        F32_THREE,
+    ));
 
     // --- VFNMS ---
-    t.push(fpu_mac_tc("VFNMS 1+2*3", enc_vfnms, 0, 1, 2, F32_ONE, F32_TWO, F32_THREE));
+    t.push(fpu_mac_tc(
+        "VFNMS 1+2*3",
+        enc_vfnms,
+        0,
+        1,
+        2,
+        F32_ONE,
+        F32_TWO,
+        F32_THREE,
+    ));
 
     // --- Unary: VMOV.F32 ---
-    t.push(fpu_unary_tc("VMOV.F32 S0,S1 (3.0)", enc_vmov_reg, 0, 1, F32_THREE));
-    t.push(fpu_unary_tc("VMOV.F32 S0,S1 (NaN)", enc_vmov_reg, 0, 1, F32_QNAN));
+    t.push(fpu_unary_tc(
+        "VMOV.F32 S0,S1 (3.0)",
+        enc_vmov_reg,
+        0,
+        1,
+        F32_THREE,
+    ));
+    t.push(fpu_unary_tc(
+        "VMOV.F32 S0,S1 (NaN)",
+        enc_vmov_reg,
+        0,
+        1,
+        F32_QNAN,
+    ));
 
     // --- Unary: VABS ---
     t.push(fpu_unary_tc("VABS -1.0", enc_vabs, 0, 1, F32_NEG_ONE));
@@ -5607,7 +7272,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcmp(0, 1);
         t.push(TestCase {
             name: "VCMP 1.0==1.0".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(0, F32_ONE), (1, F32_ONE)],
             fpu_check: vec![],
             fpscr_mask: 0xF000_0000,
@@ -5621,7 +7287,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcmp(0, 1);
         t.push(TestCase {
             name: "VCMP 1.0<2.0".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(0, F32_ONE), (1, F32_TWO)],
             fpu_check: vec![],
             fpscr_mask: 0xF000_0000,
@@ -5635,7 +7302,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcmp(0, 1);
         t.push(TestCase {
             name: "VCMP 2.0>1.0".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(0, F32_TWO), (1, F32_ONE)],
             fpu_check: vec![],
             fpscr_mask: 0xF000_0000,
@@ -5649,7 +7317,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcmp(0, 1);
         t.push(TestCase {
             name: "VCMP NaN vs 1.0".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(0, F32_QNAN), (1, F32_ONE)],
             fpu_check: vec![],
             fpscr_mask: 0xF000_0000,
@@ -5664,7 +7333,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcmp_zero(0);
         t.push(TestCase {
             name: "VCMP 0.0 vs #0.0".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(0, F32_POS_ZERO)],
             fpu_check: vec![],
             fpscr_mask: 0xF000_0000,
@@ -5677,7 +7347,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcmp_zero(0);
         t.push(TestCase {
             name: "VCMP -0.0 vs #0.0".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(0, F32_NEG_ZERO)],
             fpu_check: vec![],
             fpscr_mask: 0xF000_0000,
@@ -5693,7 +7364,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcvt_f32_s32(0, 1);
         t.push(TestCase {
             name: "VCVT.F32.S32 42".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, 42u32)],
             fpu_check: vec![0],
             addr_regs: vec![12],
@@ -5706,7 +7378,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcvt_f32_s32(0, 1);
         t.push(TestCase {
             name: "VCVT.F32.S32 -1".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, 0xFFFF_FFFF)],
             fpu_check: vec![0],
             addr_regs: vec![12],
@@ -5719,7 +7392,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcvt_f32_u32(0, 1);
         t.push(TestCase {
             name: "VCVT.F32.U32 42".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, 42u32)],
             fpu_check: vec![0],
             addr_regs: vec![12],
@@ -5734,7 +7408,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcvt_s32_f32(0, 1);
         t.push(TestCase {
             name: "VCVT.S32.F32 3.7".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, 3.7f32.to_bits())],
             fpu_check: vec![0],
             addr_regs: vec![12],
@@ -5747,7 +7422,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcvt_s32_f32(0, 1);
         t.push(TestCase {
             name: "VCVT.S32.F32 NaN".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, F32_QNAN)],
             fpu_check: vec![0],
             addr_regs: vec![12],
@@ -5760,7 +7436,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcvt_u32_f32(0, 1);
         t.push(TestCase {
             name: "VCVT.U32.F32 -1.0".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, F32_NEG_ONE)],
             fpu_check: vec![0],
             addr_regs: vec![12],
@@ -5773,7 +7450,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcvtr_s32_f32(0, 1);
         t.push(TestCase {
             name: "VCVTR.S32.F32 3.7".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, 3.7f32.to_bits())],
             fpu_check: vec![0],
             addr_regs: vec![12],
@@ -5788,7 +7466,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vmov_to_fpu(0, 3);
         t.push(TestCase {
             name: "VMOV S0,R3".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             reg_pre: vec![(3, 0xDEAD_BEEF)],
             fpu_pre: vec![],
             fpu_check: vec![0],
@@ -5804,7 +7483,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vmov_to_arm(3, 1);
         t.push(TestCase {
             name: "VMOV R3,S1".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(1, 0xCAFE_BABE)],
             fpu_check: vec![],
             addr_regs: vec![12],
@@ -5818,7 +7498,8 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
         let (hw0, hw1) = enc_vmrs(0);
         t.push(TestCase {
             name: "VMRS R0,FPSCR".into(),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![],
             fpu_check: vec![],
             // VMRS reads FPSCR into an ARM register.
@@ -5829,22 +7510,70 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
     }
 
     // --- High S-register test: VADD S31, S30, S29 ---
-    t.push(fpu_binop_tc("VADD S31,S30,S29", enc_vadd, 31, 30, 29, F32_ONE, F32_TWO));
+    t.push(fpu_binop_tc(
+        "VADD S31,S30,S29",
+        enc_vadd,
+        31,
+        30,
+        29,
+        F32_ONE,
+        F32_TWO,
+    ));
 
     // --- VSUB with denormals ---
-    t.push(fpu_binop_tc("VSUB denorm-denorm", enc_vsub, 0, 1, 2, F32_DENORM, F32_DENORM));
+    t.push(fpu_binop_tc(
+        "VSUB denorm-denorm",
+        enc_vsub,
+        0,
+        1,
+        2,
+        F32_DENORM,
+        F32_DENORM,
+    ));
 
     // --- VMUL with Inf ---
-    t.push(fpu_binop_tc("VMUL +Inf*1", enc_vmul, 0, 1, 2, F32_POS_INF, F32_ONE));
+    t.push(fpu_binop_tc(
+        "VMUL +Inf*1",
+        enc_vmul,
+        0,
+        1,
+        2,
+        F32_POS_INF,
+        F32_ONE,
+    ));
 
     // --- VDIV NaN ---
-    t.push(fpu_binop_tc("VDIV NaN/1", enc_vdiv, 0, 1, 2, F32_QNAN, F32_ONE));
+    t.push(fpu_binop_tc(
+        "VDIV NaN/1",
+        enc_vdiv,
+        0,
+        1,
+        2,
+        F32_QNAN,
+        F32_ONE,
+    ));
 
     // --- VADD with signalling NaN ---
-    t.push(fpu_binop_tc("VADD sNaN+1", enc_vadd, 0, 1, 2, F32_SNAN, F32_ONE));
+    t.push(fpu_binop_tc(
+        "VADD sNaN+1",
+        enc_vadd,
+        0,
+        1,
+        2,
+        F32_SNAN,
+        F32_ONE,
+    ));
 
     // --- VMUL with 0.5 ---
-    t.push(fpu_binop_tc("VMUL 0.5*2.0", enc_vmul, 0, 1, 2, F32_HALF, F32_TWO));
+    t.push(fpu_binop_tc(
+        "VMUL 0.5*2.0",
+        enc_vmul,
+        0,
+        1,
+        2,
+        F32_HALF,
+        F32_TWO,
+    ));
 
     t
 }
@@ -5855,14 +7584,9 @@ pub fn gen_t32_fpu() -> Vec<TestCase> {
 /// Returns tests. FPU tests use the multi-step path (prelude/epilogue).
 pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     use crate::{
-        enc_vadd, enc_vsub, enc_vmul, enc_vdiv,
-        enc_vmla, enc_vfma,
-        enc_vmov_reg, enc_vabs, enc_vneg, enc_vsqrt,
-        enc_vcmp,
-        enc_vcvt_f32_s32, enc_vcvt_f32_u32,
-        enc_vcvt_s32_f32, enc_vcvt_u32_f32,
-        enc_vmov_to_fpu, enc_vmov_to_arm,
-        MASK_NO_FLAGS,
+        MASK_NO_FLAGS, enc_vabs, enc_vadd, enc_vcmp, enc_vcvt_f32_s32, enc_vcvt_f32_u32,
+        enc_vcvt_s32_f32, enc_vcvt_u32_f32, enc_vdiv, enc_vfma, enc_vmla, enc_vmov_reg,
+        enc_vmov_to_arm, enc_vmov_to_fpu, enc_vmul, enc_vneg, enc_vsqrt, enc_vsub,
     };
 
     let mut t = Vec::new();
@@ -5871,8 +7595,7 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     let rand_sreg = |rng: &mut StdRng| -> u16 { rng.range(0..32) };
 
     // --- Arithmetic (VADD, VSUB, VMUL, VDIV) ---
-    let arith_ops: [fn(u16, u16, u16) -> (u16, u16); 4] =
-        [enc_vadd, enc_vsub, enc_vmul, enc_vdiv];
+    let arith_ops: [fn(u16, u16, u16) -> (u16, u16); 4] = [enc_vadd, enc_vsub, enc_vmul, enc_vdiv];
     let arith_names = ["VADD", "VSUB", "VMUL", "VDIV"];
 
     for i in 0..count {
@@ -5891,8 +7614,12 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         }
 
         t.push(TestCase {
-            name: format!("FUZZ:FPU_ARITH:{i} {} S{sd},S{sn},S{sm}", arith_names[op_idx]),
-            opcode: hw0, hw1: Some(hw1),
+            name: format!(
+                "FUZZ:FPU_ARITH:{i} {} S{sd},S{sn},S{sm}",
+                arith_names[op_idx]
+            ),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre,
             fpu_check: vec![sd as u8],
             addr_regs: vec![12],
@@ -5917,12 +7644,17 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 
         // Build fpu_pre — sd is also an input
         let mut fpu_pre = vec![(sd as u8, val_d)];
-        if sn != sd { fpu_pre.push((sn as u8, val_n)); }
-        if sm != sd && sm != sn { fpu_pre.push((sm as u8, val_m)); }
+        if sn != sd {
+            fpu_pre.push((sn as u8, val_n));
+        }
+        if sm != sd && sm != sn {
+            fpu_pre.push((sm as u8, val_m));
+        }
 
         t.push(TestCase {
             name: format!("FUZZ:FPU_MAC:{i} {} S{sd},S{sn},S{sm}", mac_names[op_idx]),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre,
             fpu_check: vec![sd as u8],
             addr_regs: vec![12],
@@ -5932,8 +7664,7 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     }
 
     // --- Unary (VMOV.F32, VABS, VNEG, VSQRT) ---
-    let unary_ops: [fn(u16, u16) -> (u16, u16); 4] =
-        [enc_vmov_reg, enc_vabs, enc_vneg, enc_vsqrt];
+    let unary_ops: [fn(u16, u16) -> (u16, u16); 4] = [enc_vmov_reg, enc_vabs, enc_vneg, enc_vsqrt];
     let unary_names = ["VMOV", "VABS", "VNEG", "VSQRT"];
 
     for i in 0..count {
@@ -5944,7 +7675,8 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let (hw0, hw1) = unary_ops[op_idx](sd, sm);
         t.push(TestCase {
             name: format!("FUZZ:FPU_UNARY:{i} {} S{sd},S{sm}", unary_names[op_idx]),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre: vec![(sm as u8, val_m)],
             fpu_check: vec![sd as u8],
             addr_regs: vec![12],
@@ -5970,7 +7702,8 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             let (hw0, hw1) = cvt_to_float[op_idx](sd, sm);
             t.push(TestCase {
                 name: format!("FUZZ:FPU_CVT:{i} {} S{sd},S{sm}", cvt_to_names[op_idx]),
-                opcode: hw0, hw1: Some(hw1),
+                opcode: hw0,
+                hw1: Some(hw1),
                 fpu_pre: vec![(sm as u8, val)],
                 fpu_check: vec![sd as u8],
                 addr_regs: vec![12],
@@ -5984,7 +7717,8 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             let (hw0, hw1) = cvt_from_float[op_idx](sd, sm);
             t.push(TestCase {
                 name: format!("FUZZ:FPU_CVT:{i} {} S{sd},S{sm}", cvt_from_names[op_idx]),
-                opcode: hw0, hw1: Some(hw1),
+                opcode: hw0,
+                hw1: Some(hw1),
                 fpu_pre: vec![(sm as u8, val)],
                 fpu_check: vec![sd as u8],
                 addr_regs: vec![12],
@@ -6003,11 +7737,14 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let (hw0, hw1) = enc_vcmp(s0, s1);
 
         let mut fpu_pre = vec![(s0 as u8, val0)];
-        if s1 != s0 { fpu_pre.push((s1 as u8, val1)); }
+        if s1 != s0 {
+            fpu_pre.push((s1 as u8, val1));
+        }
 
         t.push(TestCase {
             name: format!("FUZZ:FPU_CMP:{i} VCMP S{s0},S{s1}"),
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             fpu_pre,
             fpu_check: vec![],
             fpscr_mask: 0xF000_0000,
@@ -6028,7 +7765,8 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             let (hw0, hw1) = enc_vmov_to_fpu(sn, rt);
             t.push(TestCase {
                 name: format!("FUZZ:FPU_VMOV:{i} VMOV S{sn},R{rt}"),
-                opcode: hw0, hw1: Some(hw1),
+                opcode: hw0,
+                hw1: Some(hw1),
                 reg_pre: vec![(rt as u8, val)],
                 fpu_check: vec![sn as u8],
                 addr_regs: vec![12],
@@ -6042,7 +7780,8 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
             let (hw0, hw1) = enc_vmov_to_arm(rt, sn);
             t.push(TestCase {
                 name: format!("FUZZ:FPU_VMOV:{i} VMOV R{rt},S{sn}"),
-                opcode: hw0, hw1: Some(hw1),
+                opcode: hw0,
+                hw1: Some(hw1),
                 fpu_pre: vec![(sn as u8, val)],
                 addr_regs: vec![12],
                 xpsr_mask: MASK_NO_FLAGS,
@@ -6092,7 +7831,7 @@ mod tests {
         //   imm4 = 0xB, i = 1, imm3 = 0b110, imm8 = 0xEF
         let (hw0, hw1) = enc_t32_movw(7, 0xBEEF);
         let imm4 = (hw0 & 0xF) as u32;
-        let i    = ((hw0 >> 10) & 1) as u32;
+        let i = ((hw0 >> 10) & 1) as u32;
         let imm3 = ((hw1 >> 12) & 0x7) as u32;
         let imm8 = (hw1 & 0xFF) as u32;
         let recovered = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
@@ -6181,8 +7920,8 @@ mod tests {
         assert_eq!(hw0 & (1 << 7), 0); // NOT imm12 mode
         assert_ne!(hw1 & (1 << 11), 0); // imm8 selector
         assert_ne!(hw1 & (1 << 10), 0); // P
-        assert_ne!(hw1 & (1 << 9), 0);  // U
-        assert_eq!(hw1 & (1 << 8), 0);  // W=false
+        assert_ne!(hw1 & (1 << 9), 0); // U
+        assert_eq!(hw1 & (1 << 8), 0); // W=false
         assert_eq!(hw1 & 0xFF, 42);
     }
 

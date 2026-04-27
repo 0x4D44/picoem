@@ -37,8 +37,8 @@ use std::sync::atomic::Ordering;
 use mdrp2350::{Bus, Emulator};
 
 use crate::onerom_serving_oracle::{
-    lift_shadow_from_flash_pub, stimulus_level_pub, Case, ADDR_A11_A12_HIGH,
-    SHADOW_BASE, SHADOW_SIZE,
+    ADDR_A11_A12_HIGH, Case, SHADOW_BASE, SHADOW_SIZE, lift_shadow_from_flash_pub,
+    stimulus_level_pub,
 };
 
 // ---------------------------------------------------------------------------
@@ -264,7 +264,9 @@ impl CpuServingOracle {
 
         // 2. Apply stimulus.
         let stim_level = stimulus_level_pub(case.addr_bits);
-        emu.bus.gpio_external_in.store(stim_level, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in
+            .store(stim_level, Ordering::Relaxed);
 
         // The CPU's serve loop looks up shadow[pins_low_16]. The pins
         // the CPU samples are the 16-bit pattern the stim applies — which
@@ -819,8 +821,7 @@ const MAX_USED_GPIOS_RP2350A: u8 = 30;
 /// struct. Returns an empty vec if the fixture declares no sel pins
 /// (all entries `INVALID_PIN`).
 fn parse_sel_pins(flash: &[u8]) -> Option<Vec<(u8, bool)>> {
-    let end = SDRR_PINS_FLASH_OFFSET
-        .checked_add(SDRR_PINS_SEL_JUMPER_PULL_OFFSET + 1)?;
+    let end = SDRR_PINS_FLASH_OFFSET.checked_add(SDRR_PINS_SEL_JUMPER_PULL_OFFSET + 1)?;
     if flash.len() < end {
         return None;
     }
@@ -1024,7 +1025,9 @@ mod tests {
         let out = apply_envelope(result);
         assert_eq!(
             out.verdict,
-            CpuVerdict::LatencyOutOfEnvelope { cycles: out_of_range }
+            CpuVerdict::LatencyOutOfEnvelope {
+                cycles: out_of_range
+            }
         );
         assert_eq!(out.latency_cycles, Some(out_of_range));
     }
@@ -1035,7 +1038,10 @@ mod tests {
         let case = Case::new("test", 0x1800);
 
         for verdict in [
-            CpuVerdict::WrongByte { expected: 0x42, observed: 0xFF },
+            CpuVerdict::WrongByte {
+                expected: 0x42,
+                observed: 0xFF,
+            },
             CpuVerdict::DataPinsNotDriven,
             CpuVerdict::NoStableByte,
         ] {
@@ -1046,7 +1052,11 @@ mod tests {
                 latency_cycles: None,
                 verdict,
             });
-            assert_eq!(out.verdict, verdict, "envelope must not rewrite {:?}", verdict);
+            assert_eq!(
+                out.verdict, verdict,
+                "envelope must not rewrite {:?}",
+                verdict
+            );
         }
     }
 
@@ -1334,8 +1344,7 @@ mod tests {
     /// Build a synthetic flash image just large enough to expose
     /// `sdrr_pins_t.sel[]` + `sel_jumper_pull`.
     fn synth_pins_flash(sel: &[u8], pull_bits: u8) -> Vec<u8> {
-        let mut flash =
-            vec![0u8; SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_JUMPER_PULL_OFFSET + 1];
+        let mut flash = vec![0u8; SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_JUMPER_PULL_OFFSET + 1];
         let base = SDRR_PINS_FLASH_OFFSET + SDRR_PINS_SEL_OFFSET;
         // Fill all MAX_IMG_SEL_PINS entries, padding with INVALID_PIN.
         for ii in 0..MAX_IMG_SEL_PINS {
@@ -1393,19 +1402,21 @@ mod tests {
             (0u32, expected_mask),               // raw 111
             (1u32, (1u32 << 28) | (1u32 << 29)), // raw 110
             (3u32, 1u32 << 29),                  // raw 100
-            (7u32, 0u32),                         // raw 000
+            (7u32, 0u32),                        // raw 000
         ];
         for (index, expected_val) in cases {
             let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
-            force_rom_set_index_via_sel_pins(&mut emu, &flash, index)
-                .expect("force");
+            force_rom_set_index_via_sel_pins(&mut emu, &flash, index).expect("force");
             assert_eq!(
                 emu.bus.gpio_external_mask, expected_mask,
-                "mask for index {}", index
+                "mask for index {}",
+                index
             );
             assert_eq!(
-                emu.bus.gpio_external_in.load(Ordering::Relaxed), expected_val,
-                "value for index {}", index
+                emu.bus.gpio_external_in.load(Ordering::Relaxed),
+                expected_val,
+                "value for index {}",
+                index
             );
         }
     }

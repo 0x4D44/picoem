@@ -94,8 +94,8 @@ use std::time::Instant;
 
 use mdpicoem_devices::{I2sCapture, Psram};
 use mdpicoem_harness::picogus_pins::{
-    ISA_AD0 as PIN_AD0, ISA_AD_COUNT as PIN_AD_COUNT, ISA_EXTERNAL_PIN_MASK, ISA_IOR as PIN_IOR,
-    ISA_IOW as PIN_IOW, I2S_BCLK, I2S_DOUT, I2S_LRCLK,
+    I2S_BCLK, I2S_DOUT, I2S_LRCLK, ISA_AD_COUNT as PIN_AD_COUNT, ISA_AD0 as PIN_AD0,
+    ISA_EXTERNAL_PIN_MASK, ISA_IOR as PIN_IOR, ISA_IOW as PIN_IOW,
 };
 use mdrp2040::{Config, Emulator, EmulatorBuilder};
 
@@ -251,8 +251,7 @@ pub fn parse_trace(text: &str) -> Result<Vec<TraceEvent>, String> {
         let value = parse_hex_u32(parts[2])
             .map_err(|e| format!("line {line_no}: invalid value '{}': {e}", parts[2]))?;
 
-        let kind = TraceKind::parse(parts[3])
-            .map_err(|e| format!("line {line_no}: {e}"))?;
+        let kind = TraceKind::parse(parts[3]).map_err(|e| format!("line {line_no}: {e}"))?;
 
         let max = match kind {
             TraceKind::Write8 | TraceKind::Read8 => 0xFFu32,
@@ -521,8 +520,8 @@ impl IsaSink for Emulator {
         // directly. The next `update_gpio` (inside `step()`) will
         // recompute from scratch and re-apply the override.
         let ext_mask = self.bus.external_gpio_in_mask;
-        self.bus.gpio_in = (self.bus.gpio_in & !ext_mask)
-            | (self.bus.external_gpio_in_override & ext_mask);
+        self.bus.gpio_in =
+            (self.bus.gpio_in & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);
     }
 }
 
@@ -586,7 +585,8 @@ impl<S: IsaSink> IsaSink for CapturingSink<S> {
                 // stall guard in `replay()` can observe it.
                 break;
             }
-            self.capture.tick(self.inner.pad_state(), self.inner.cycles());
+            self.capture
+                .tick(self.inner.pad_state(), self.inner.cycles());
         }
     }
 
@@ -630,11 +630,17 @@ pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: b
     let addr_bits = port & ((1u16 << ADDR_BITS) - 1);
 
     let idle: u32 = std::env::var("PICOGUS_IDLE_CYCLES")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(WRITE_IDLE_CYCLES);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(WRITE_IDLE_CYCLES);
     let addr_hold: u32 = std::env::var("PICOGUS_ADDR_HOLD")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(WRITE_ADDR_HOLD);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(WRITE_ADDR_HOLD);
     let data_hold: u32 = std::env::var("PICOGUS_DATA_HOLD")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(WRITE_DATA_HOLD);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(WRITE_DATA_HOLD);
 
     // Backpressure: on real ISA hardware the PIO asserts IOCHRDY low when
     // its RX FIFO is full, stretching the bus cycle until firmware drains.
@@ -647,11 +653,17 @@ pub fn drive_write_cycle<S: IsaSink>(sink: &mut S, port: u16, data: u16, wide: b
     //   PICOGUS_BACKPRESSURE_STEP       (default 256) — cycles per drain tick
     //   PICOGUS_BACKPRESSURE_MAX        (default 200_000) — give-up cap per event
     let bp_threshold: u8 = std::env::var("PICOGUS_BACKPRESSURE_THRESHOLD")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
     let bp_step: u32 = std::env::var("PICOGUS_BACKPRESSURE_STEP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
     let bp_max: u64 = std::env::var("PICOGUS_BACKPRESSURE_MAX")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(200_000);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200_000);
     if bp_threshold > 0 {
         let start_cycles = sink.cycles();
         while sink.pio0_sm0_rx_fifo_level() >= bp_threshold {
@@ -830,15 +842,12 @@ pub fn replay<S: IsaSink>(
             }
 
             // Targeted r0x44 swap.
-            let data_to_send = if r44_swap_enabled
-                && wide
-                && ev.port == 0x344
-                && current_reg_select == 0x44
-            {
-                ((ev.value >> 8) & 0xFF) | ((ev.value & 0xFF) << 8)
-            } else {
-                ev.value
-            };
+            let data_to_send =
+                if r44_swap_enabled && wide && ev.port == 0x344 && current_reg_select == 0x44 {
+                    ((ev.value >> 8) & 0xFF) | ((ev.value & 0xFF) << 8)
+                } else {
+                    ev.value
+                };
 
             drive_write_cycle(sink, ev.port, data_to_send, wide);
             summary.writes_fired += 1;
@@ -1168,7 +1177,11 @@ fn replay_with_coverage(
         if !ev.kind.is_write() {
             continue;
         }
-        total_to_fire += if matches!(ev.kind, TraceKind::Write16) { 2 } else { 1 };
+        total_to_fire += if matches!(ev.kind, TraceKind::Write16) {
+            2
+        } else {
+            1
+        };
     }
 
     let mut fired_so_far: u64 = 0;
@@ -1222,16 +1235,13 @@ fn replay_with_coverage(
         let sub_count = if is_wide { 2usize } else { 1 };
 
         // Apply targeted r0x44 byte swap.
-        let effective_value = if r44_swap_enabled
-            && is_wide
-            && ev.port == 0x344
-            && current_reg_select == 0x44
-        {
-            r44_swap_hits += 1;
-            ((ev.value >> 8) & 0xFF) | ((ev.value & 0xFF) << 8)
-        } else {
-            ev.value
-        };
+        let effective_value =
+            if r44_swap_enabled && is_wide && ev.port == 0x344 && current_reg_select == 0x44 {
+                r44_swap_hits += 1;
+                ((ev.value >> 8) & 0xFF) | ((ev.value & 0xFF) << 8)
+            } else {
+                ev.value
+            };
 
         for sub_idx in 0..sub_count {
             let fired_port = ev.port.wrapping_add(sub_idx as u16);
@@ -1270,13 +1280,7 @@ fn replay_with_coverage(
             let (decoded_addr, decoded_data) = decode_push(pushed_word);
             let decode_matches_current =
                 decoded_addr == fired_port & 0x3FF && decoded_data == fired_data;
-            cov.classify_sub_event(
-                delta,
-                decode_matches_current,
-                class,
-                decile,
-                &mut pending,
-            );
+            cov.classify_sub_event(delta, decode_matches_current, class, decile, &mut pending);
 
             last_fired_class = Some(class);
             last_fired_port_data = Some((fired_port & 0x3FF, fired_data));
@@ -1484,14 +1488,14 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--firmware-mode requires a slot index".into());
                 }
                 let raw = &args[i];
-                let parsed = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-                    u32::from_str_radix(hex, 16)
-                } else {
-                    raw.parse::<u32>()
-                };
-                firmware_mode = Some(
-                    parsed.map_err(|e| format!("invalid --firmware-mode '{raw}': {e}"))?,
-                );
+                let parsed =
+                    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                        u32::from_str_radix(hex, 16)
+                    } else {
+                        raw.parse::<u32>()
+                    };
+                firmware_mode =
+                    Some(parsed.map_err(|e| format!("invalid --firmware-mode '{raw}': {e}"))?);
             }
             "--step-quantum" => {
                 i += 1;
@@ -1540,10 +1544,7 @@ fn parse_args() -> Result<Args, String> {
 /// * Else if `--flash` is absent, return `None` (no firmware to boot).
 /// * Else default-search [`DEFAULT_BOOTROM_PATH`]. If the file is
 ///   present, use it. If not, return `None` — the caller emits a hint.
-pub fn resolve_bootrom_path(
-    explicit: Option<&Path>,
-    flash_present: bool,
-) -> Option<PathBuf> {
+pub fn resolve_bootrom_path(explicit: Option<&Path>, flash_present: bool) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
@@ -1551,7 +1552,11 @@ pub fn resolve_bootrom_path(
         return None;
     }
     let default = PathBuf::from(DEFAULT_BOOTROM_PATH);
-    if default.is_file() { Some(default) } else { None }
+    if default.is_file() {
+        Some(default)
+    } else {
+        None
+    }
 }
 
 fn print_usage() {
@@ -1617,7 +1622,10 @@ pub struct UartDrain {
 
 impl UartDrain {
     pub fn new() -> Self {
-        Self { line: Vec::with_capacity(128), total_bytes: 0 }
+        Self {
+            line: Vec::with_capacity(128),
+            total_bytes: 0,
+        }
     }
 
     pub fn drain_emu(&mut self, emu: &mut mdrp2040::Emulator) {
@@ -1736,9 +1744,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let sample = if phase < 128 { phase - 64 } else { 192 - phase };
                 *byte = (sample & 0xFF) as u8;
             }
-            eprintln!(
-                "PSRAM pre-seeded with 8-bit triangle wave (PICOGUS_PSRAM_PRESEED set)"
-            );
+            eprintln!("PSRAM pre-seeded with 8-bit triangle wave (PICOGUS_PSRAM_PRESEED set)");
         }
     }
 
@@ -1748,15 +1754,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Use `wrk_scratch/extract_dram_from_trace.py` to produce a file
     // from a captured picogus-tap trace.
     if let Ok(path) = std::env::var("PICOGUS_PSRAM_LOAD") {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("PICOGUS_PSRAM_LOAD: reading {path}: {e}"))?;
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("PICOGUS_PSRAM_LOAD: reading {path}: {e}"))?;
         if let Some(ref mut psram) = emu.bus.psram {
             let n = bytes.len().min(psram.buffer.len());
             psram.buffer[..n].copy_from_slice(&bytes[..n]);
             let nz = psram.buffer[..n].iter().filter(|&&b| b != 0).count();
-            eprintln!(
-                "PSRAM pre-loaded {n} bytes from {path} (nonzero={nz})"
-            );
+            eprintln!("PSRAM pre-loaded {n} bytes from {path} (nonzero={nz})");
         }
     }
 
@@ -1765,13 +1769,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // populated first. If no explicit --bootrom is supplied, default-
     // search `roms/rp2040/bootrom-rp2040-b2.bin` when we have flash to
     // boot; otherwise skip (the replayer's unit-test path runs without).
-    let resolved_bootrom =
-        resolve_bootrom_path(args.bootrom.as_deref(), args.flash.is_some());
+    let resolved_bootrom = resolve_bootrom_path(args.bootrom.as_deref(), args.flash.is_some());
     match (&resolved_bootrom, args.flash.is_some()) {
         (Some(path), _) => {
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("reading bootrom {}: {e}", path.display()))?;
-            eprintln!("Loaded bootrom: {} bytes from {}", bytes.len(), path.display());
+            eprintln!(
+                "Loaded bootrom: {} bytes from {}",
+                bytes.len(),
+                path.display()
+            );
             emu.load_bootrom(&bytes);
         }
         (None, true) => {
@@ -1848,7 +1855,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let old_q = emu.step_quantum;
         emu.step_quantum = 64;
         for i in 0..200_000u64 {
-            if emu.step().expect("Serial step is infallible") == 0 { break; }
+            if emu.step().expect("Serial step is infallible") == 0 {
+                break;
+            }
             // Poll the UART every 256 iterations so early-boot puts()
             // are visible interleaved with the warm-up timeline.
             if i & 0xff == 0 {
@@ -1887,9 +1896,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // 0x4770_20FF = BX LR (0x4770 at offset +2) | MOVS R0,#0xFF (0x20FF at +0)
             // little-endian halfword order in a word write: low-half first.
             emu.bus.write32(stub_gss_addr, 0x4770_20FF);
-            eprintln!(
-                "patched SRAM 0x{stub_gss_addr:08X}: GUS_sample_stereo -> return 0xFF"
-            );
+            eprintln!("patched SRAM 0x{stub_gss_addr:08X}: GUS_sample_stereo -> return 0xFF");
         }
 
         // Diagnostic: stack read/write roundtrip. Writes #77 to [sp, #0],
@@ -1907,13 +1914,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         //  +14 NOP           (0xBF00)
         if let Ok(s) = std::env::var("PICOGUS_STUB_STACK_TEST") {
             let f = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap();
-            emu.bus.write32(f +  0, (0xB082u32) | (0x204Du32 << 16));
-            emu.bus.write32(f +  4, (0x9000u32) | (0x2000u32 << 16));
-            emu.bus.write32(f +  8, (0x9800u32) | (0xB002u32 << 16));
+            emu.bus.write32(f + 0, (0xB082u32) | (0x204Du32 << 16));
+            emu.bus.write32(f + 4, (0x9000u32) | (0x2000u32 << 16));
+            emu.bus.write32(f + 8, (0x9800u32) | (0xB002u32 << 16));
             emu.bus.write32(f + 12, (0x4770u32) | (0xBF00u32 << 16));
-            eprintln!(
-                "patched SRAM 0x{f:08X}: GUS_sample_stereo -> stack roundtrip #77"
-            );
+            eprintln!("patched SRAM 0x{f:08X}: GUS_sample_stereo -> stack roundtrip #77");
         }
 
         // Diagnostic: stack-based accumulator loop. Sum (VolLeft * 100)
@@ -1957,16 +1962,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Ah, I initially put 0x4A06 which is imm8=6 → pc+24 = f+32.
                 // Need imm8=7 for pc+28 = f+36.
                 let ldr_r2 = 0x4A07u32;
-                emu.bus.write32(f +  0, 0x2000_B082);                 // SUB sp,#8 ; MOVS R0,#0
-                emu.bus.write32(f +  4, (0x9001u32) | (ldr_r2 << 16)); // STR R0,[sp,#4] ; LDR R2,[PC,#28]
-                emu.bus.write32(f +  8, (0x2100u32 | n as u32) | (0x2464u32 << 16)); // MOVS R1,#n ; MOVS R4,#100
-                emu.bus.write32(f + 12, 0x6B5B_CA08);                 // LDMIA R2!,{R3} ; LDR R3,[R3,#52]
-                emu.bus.write32(f + 16, 0x9801_4363);                 // MULS R3,R4 ; LDR R0,[sp,#4]
-                emu.bus.write32(f + 20, 0x9001_18C0);                 // ADDS R0,R0,R3 ; STR R0,[sp,#4]
-                emu.bus.write32(f + 24, 0xD1F7_3901);                 // SUBS R1,#1 ; BNE loop
-                emu.bus.write32(f + 28, 0xB002_9801);                 // LDR R0,[sp,#4] ; ADD sp,#8
-                emu.bus.write32(f + 32, 0xBF00_4770);                 // BX LR ; NOP
-                emu.bus.write32(f + 36, g);                           // literal
+                emu.bus.write32(f + 0, 0x2000_B082); // SUB sp,#8 ; MOVS R0,#0
+                emu.bus.write32(f + 4, (0x9001u32) | (ldr_r2 << 16)); // STR R0,[sp,#4] ; LDR R2,[PC,#28]
+                emu.bus
+                    .write32(f + 8, (0x2100u32 | n as u32) | (0x2464u32 << 16)); // MOVS R1,#n ; MOVS R4,#100
+                emu.bus.write32(f + 12, 0x6B5B_CA08); // LDMIA R2!,{R3} ; LDR R3,[R3,#52]
+                emu.bus.write32(f + 16, 0x9801_4363); // MULS R3,R4 ; LDR R0,[sp,#4]
+                emu.bus.write32(f + 20, 0x9001_18C0); // ADDS R0,R0,R3 ; STR R0,[sp,#4]
+                emu.bus.write32(f + 24, 0xD1F7_3901); // SUBS R1,#1 ; BNE loop
+                emu.bus.write32(f + 28, 0xB002_9801); // LDR R0,[sp,#4] ; ADD sp,#8
+                emu.bus.write32(f + 32, 0xBF00_4770); // BX LR ; NOP
+                emu.bus.write32(f + 36, g); // literal
                 eprintln!(
                     "patched SRAM 0x{f:08X}: GUS_sample_stereo -> stack accum sum(VolLeft*100) over {n}"
                 );
@@ -1999,9 +2005,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 //  +20 BX LR           (0x4770)
                 //  +22 NOP             (0xBF00)
                 //  +24 .word &guschan
-                emu.bus.write32(f +  0, 0x4A05_2000);
-                emu.bus.write32(f +  4, 0x2464_2100u32 | n as u32);
-                emu.bus.write32(f +  8, 0x6B5B_CA08);
+                emu.bus.write32(f + 0, 0x4A05_2000);
+                emu.bus.write32(f + 4, 0x2464_2100u32 | n as u32);
+                emu.bus.write32(f + 8, 0x6B5B_CA08);
                 emu.bus.write32(f + 12, 0x18C0_4363);
                 emu.bus.write32(f + 16, 0xD1F9_3901);
                 emu.bus.write32(f + 20, 0xBF00_4770);
@@ -2028,20 +2034,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let n: u16 = p[2].parse().unwrap();
                 assert!(n <= 255);
                 let movs_r0 = 0x2000u16;
-                let ldr_r2 = 0x4A04u16;                // LDR R2,[PC,#16]
-                let movs_r1 = 0x2100u16 | n;            // MOVS R1,#n
-                let ldmia = 0xCA08u16;                  // LDMIA R2!,{R3}
-                let ldr_vl = 0x6B5Bu16;                 // LDR R3,[R3,#52]
-                let adds = 0x18C0u16;                   // ADDS R0,R0,R3
-                let subs = 0x3901u16;                   // SUBS R1,#1
-                let bne = 0xD1FAu16;                    // BNE -12
+                let ldr_r2 = 0x4A04u16; // LDR R2,[PC,#16]
+                let movs_r1 = 0x2100u16 | n; // MOVS R1,#n
+                let ldmia = 0xCA08u16; // LDMIA R2!,{R3}
+                let ldr_vl = 0x6B5Bu16; // LDR R3,[R3,#52]
+                let adds = 0x18C0u16; // ADDS R0,R0,R3
+                let subs = 0x3901u16; // SUBS R1,#1
+                let bne = 0xD1FAu16; // BNE -12
                 let bx_lr = 0x4770u16;
                 let nop = 0xBF00u16;
-                emu.bus.write32(f + 0,  (movs_r0 as u32) | ((ldr_r2 as u32) << 16));
-                emu.bus.write32(f + 4,  (movs_r1 as u32) | ((ldmia as u32) << 16));
-                emu.bus.write32(f + 8,  (ldr_vl as u32) | ((adds as u32) << 16));
-                emu.bus.write32(f + 12, (subs as u32)   | ((bne as u32) << 16));
-                emu.bus.write32(f + 16, (bx_lr as u32)  | ((nop as u32) << 16));
+                emu.bus
+                    .write32(f + 0, (movs_r0 as u32) | ((ldr_r2 as u32) << 16));
+                emu.bus
+                    .write32(f + 4, (movs_r1 as u32) | ((ldmia as u32) << 16));
+                emu.bus
+                    .write32(f + 8, (ldr_vl as u32) | ((adds as u32) << 16));
+                emu.bus
+                    .write32(f + 12, (subs as u32) | ((bne as u32) << 16));
+                emu.bus
+                    .write32(f + 16, (bx_lr as u32) | ((nop as u32) << 16));
                 emu.bus.write32(f + 20, g);
                 eprintln!(
                     "patched SRAM 0x{f:08X}: GUS_sample_stereo -> sum(guschan[0..{n}]->VolLeft)"
@@ -2070,9 +2081,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             emu.bus.write32(f + 4, 0x3901_1840);
             // word 2: BNE -8 (0xD1FC) | BX LR (0x4770) → 0x4770_D1FC
             emu.bus.write32(f + 8, 0x4770_D1FC);
-            eprintln!(
-                "patched SRAM 0x{f:08X}: GUS_sample_stereo -> sum(1..27) = 378"
-            );
+            eprintln!("patched SRAM 0x{f:08X}: GUS_sample_stereo -> sum(1..27) = 378");
         }
 
         // Diagnostic: chain-deref stub.
@@ -2106,7 +2115,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // word @ f: (ldr_lit | ldr1<<16)
                 emu.bus.write32(f, (ldr_lit as u32) | ((ldr1 as u32) << 16));
                 // word @ f+4: (ldr2 | bx_lr<<16)
-                emu.bus.write32(f + 4, (ldr2 as u32) | ((bx_lr as u32) << 16));
+                emu.bus
+                    .write32(f + 4, (ldr2 as u32) | ((bx_lr as u32) << 16));
                 // word @ f+8: literal
                 emu.bus.write32(f + 8, lit);
                 eprintln!(
@@ -2129,9 +2139,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             emu.bus.write32(f, 0x217F_2015);
             // word 1: MULS R0,R1 (0x4348)  | BX LR (0x4770)          → 0x4770_4348
             emu.bus.write32(f + 4, 0x4770_4348);
-            eprintln!(
-                "patched SRAM 0x{f:08X}: GUS_sample_stereo -> return 21 * 127 = 2667"
-            );
+            eprintln!("patched SRAM 0x{f:08X}: GUS_sample_stereo -> return 21 * 127 = 2667");
         }
 
         // Diagnostic: replace GUS_sample_stereo with a stub that returns
@@ -2155,9 +2163,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if parts.len() == 2 {
                 let f = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16).unwrap();
                 let a = u32::from_str_radix(parts[1].trim_start_matches("0x"), 16).unwrap();
-                emu.bus.write32(f, 0x7800_4801);     // LDR R0,[PC,#4] ; LDRB R0,[R0]
+                emu.bus.write32(f, 0x7800_4801); // LDR R0,[PC,#4] ; LDRB R0,[R0]
                 emu.bus.write32(f + 4, 0xBF00_4770); // BX LR ; NOP
-                emu.bus.write32(f + 8, a);           // literal
+                emu.bus.write32(f + 8, a); // literal
                 eprintln!(
                     "patched SRAM 0x{f:08X}: GUS_sample_stereo -> return *(u8*)0x{a:08X} (zext)"
                 );
@@ -2198,9 +2206,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         emu.step_quantum = old_q;
     }
 
-    let duration_ns = args
-        .duration_secs
-        .map(|s| (s * 1e9).max(0.0) as u64);
+    let duration_ns = args.duration_secs.map(|s| (s * 1e9).max(0.0) as u64);
     let post_roll_ns = (args.post_roll_secs * 1e9).max(0.0) as u64;
     let pre_roll_ns = (args.pre_roll_secs * 1e9).max(0.0) as u64;
     let trace_stretch = args.trace_stretch;
@@ -2337,7 +2343,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if transitions < 40 {
                             eprintln!(
                                 "  [watch] cycle {} byte 0x{:08x}: 0x{:02x} -> 0x{:02x}",
-                                sink.cycles(), a, last_watch.unwrap_or(0), cur
+                                sink.cycles(),
+                                a,
+                                last_watch.unwrap_or(0),
+                                cur
                             );
                         }
                         transitions += 1;
@@ -2392,7 +2401,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             psram.pin_mosi(),
         );
         println!("tick() calls:      {}", psram.tick_count);
-        println!("CS# falling edges: {}  (== SPI frames started)", psram.cs_falling_count);
+        println!(
+            "CS# falling edges: {}  (== SPI frames started)",
+            psram.cs_falling_count
+        );
 
         // DRAM-upload signature probe (2026-04-24 investigation). Three
         // bytes at expected bank-1 locations (addr 65536, 65540, 65544).
@@ -2413,11 +2425,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "bytes [65536..65568] = {:?}",
             (65536..65568).map(probe).collect::<Vec<_>>()
         );
-        let bank1_nz = (65536..102_898).filter_map(probe).filter(|&b| b != 0).count();
-        println!(
-            "nonzero bytes in [65536..102898]: {}/37362",
-            bank1_nz
-        );
+        let bank1_nz = (65536..102_898)
+            .filter_map(probe)
+            .filter(|&b| b != 0)
+            .count();
+        println!("nonzero bytes in [65536..102898]: {}/37362", bank1_nz);
     }
 
     // ------------------------------------------------------------------
@@ -2478,8 +2490,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let out_shiftdir = (sc >> 19) & 1;
         let push_thresh_raw = (sc >> 20) & 0x1F;
         let pull_thresh_raw = (sc >> 25) & 0x1F;
-        let push_thresh = if push_thresh_raw == 0 { 32 } else { push_thresh_raw };
-        let pull_thresh = if pull_thresh_raw == 0 { 32 } else { pull_thresh_raw };
+        let push_thresh = if push_thresh_raw == 0 {
+            32
+        } else {
+            push_thresh_raw
+        };
+        let pull_thresh = if pull_thresh_raw == 0 {
+            32
+        } else {
+            pull_thresh_raw
+        };
         println!(
             "         SHIFTCTRL: 0x{:08x}  AUTOPUSH={} PUSH_THRESH={}  AUTOPULL={} PULL_THRESH={}  IN_SHIFTDIR={} OUT_SHIFTDIR={}",
             sc, autopush, push_thresh, autopull, pull_thresh, in_shiftdir, out_shiftdir
@@ -2527,7 +2547,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let p1_sm0_clkdiv = emu.bus.read32(0x5030_0000 + 0x0C8);
     let p1_sm0_clkdiv_int = (p1_sm0_clkdiv >> 16) & 0xFFFF;
     let p1_sm0_clkdiv_frac = (p1_sm0_clkdiv >> 8) & 0xFF;
-    let p1_sm0_clkdiv_eff = if p1_sm0_clkdiv_int == 0 { 65536 } else { p1_sm0_clkdiv_int };
+    let p1_sm0_clkdiv_eff = if p1_sm0_clkdiv_int == 0 {
+        65536
+    } else {
+        p1_sm0_clkdiv_int
+    };
     println!(
         "PIO1 SM0 CLKDIV raw: 0x{:08x}  ({}.{:03} effective ~{} sysclk/PIO-tick)",
         p1_sm0_clkdiv, p1_sm0_clkdiv_int, p1_sm0_clkdiv_frac, p1_sm0_clkdiv_eff
@@ -2680,10 +2704,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("Summary:");
-    println!(
-        "  ever-targeting PIO1 TXF0-3:  {:?}",
-        ever_txf_channels
-    );
+    println!("  ever-targeting PIO1 TXF0-3:  {:?}", ever_txf_channels);
     println!("  channels triggered:           {:?}", triggered_channels);
     println!("  channels served by engine:    {:?}", served_channels);
     println!(
@@ -2826,8 +2847,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "NVIC[0].pending:  0x{:08x}  NVIC[1].pending:  0x{:08x}",
-        emu.bus.nvics[0].pending,
-        emu.bus.nvics[1].pending,
+        emu.bus.nvics[0].pending, emu.bus.nvics[1].pending,
     );
 
     // PWM slice 4 state — this slice drives GUS_sample rate on PicoGUS.
@@ -3001,8 +3021,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let out_shiftdir = (sc >> 19) & 1;
         let push_thresh_raw = (sc >> 20) & 0x1F;
         let pull_thresh_raw = (sc >> 25) & 0x1F;
-        let push_thresh = if push_thresh_raw == 0 { 32 } else { push_thresh_raw };
-        let pull_thresh = if pull_thresh_raw == 0 { 32 } else { pull_thresh_raw };
+        let push_thresh = if push_thresh_raw == 0 {
+            32
+        } else {
+            push_thresh_raw
+        };
+        let pull_thresh = if pull_thresh_raw == 0 {
+            32
+        } else {
+            pull_thresh_raw
+        };
         println!(
             "       SHIFTCTRL: 0x{:08x}  AUTOPUSH={} PUSH_THRESH={}  AUTOPULL={} PULL_THRESH={}  IN_SHIFTDIR={} OUT_SHIFTDIR={}",
             sc, autopush, push_thresh, autopull, pull_thresh, in_shiftdir, out_shiftdir
@@ -3056,10 +3084,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ext_ovr4 = (emu.bus.external_gpio_in_override >> 4) & 1;
     println!(
         "ext mask[4]:      {}    ext override[4]:  {}    (full mask=0x{:08x} override=0x{:08x})",
-        ext_mask4,
-        ext_ovr4,
-        emu.bus.external_gpio_in_mask,
-        emu.bus.external_gpio_in_override,
+        ext_mask4, ext_ovr4, emu.bus.external_gpio_in_mask, emu.bus.external_gpio_in_override,
     );
 
     // PIO ticks vs IOW-low ticks — the smoking gun. If
@@ -3086,14 +3111,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     //   max_pc >  0x0B && autopushes == 0 → SM cleared the WAIT but
     //                                        stalls before IN PINS lands
     let sm0_autopush = emu.bus.pio[0].sm[0].autopush_count;
-    println!(
-        "PIO0 SM0 max PC:           0x{:02x}",
-        emu.pio0_sm0_max_pc
-    );
-    println!(
-        "PIO0 SM0 PC advances:      {}",
-        emu.pio0_sm0_pc_advances
-    );
+    println!("PIO0 SM0 max PC:           0x{:02x}", emu.pio0_sm0_max_pc);
+    println!("PIO0 SM0 PC advances:      {}", emu.pio0_sm0_pc_advances);
     println!("PIO0 SM0 autopushes:       {}", sm0_autopush);
 
     // Persist the captured audio. Reject directories and create any
@@ -3184,8 +3203,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // HLD §7 acceptance (4): captured_sum + misattr_sum + post_roll_orphans
     // should equal the PIO0 SM0 ground-truth autopush count.
     // HLD §7 (5): fired_sum == summary.writes_fired × (1 + write16_share).
-    let reconciliation_total =
-        total_captured + total_misattr + coverage.post_roll_orphans;
+    let reconciliation_total = total_captured + total_misattr + coverage.post_roll_orphans;
     println!(
         "reconciliation: captured({}) + misattr({}) + orphans({}) = {}  \
          vs. autopush={}  (Δ={})",
@@ -3223,7 +3241,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(a) = u32::from_str_radix(tok, 16) {
                 let w = emu.peek(a & !3);
                 let b = ((w >> ((a & 3) * 8)) & 0xFF) as u8;
-                eprintln!("probe  0x{:08x} = 0x{:02x} (word 0x{:08x}: 0x{:08x})", a, b, a & !3, w);
+                eprintln!(
+                    "probe  0x{:08x} = 0x{:02x} (word 0x{:08x}: 0x{:08x})",
+                    a,
+                    b,
+                    a & !3,
+                    w
+                );
             }
         }
     }
@@ -3255,9 +3279,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         const MYGUS_BASE: u32 = 0x2001_7688;
         // GFGus struct offsets (from DWARF, pg-gus.elf rebuild v1):
         const MYGUS_GCURCHANNEL_OFF: u32 = 12; // u16
-        const MYGUS_MIXCONTROL_OFF: u32 = 35;  // u8
+        const MYGUS_MIXCONTROL_OFF: u32 = 35; // u8
         const MYGUS_ACTIVE_CHANNELS_OFF: u32 = 36; // u8
-        const MYGUS_IRQSTATUS_OFF: u32 = 100;  // u8
+        const MYGUS_IRQSTATUS_OFF: u32 = 100; // u8
         const GUSCHAN_BASE: u32 = 0x2001_7c3c;
         // volctrl_t struct at 0x20016ba8; `.gus` member at offset 32.
         const VOLUME_BASE: u32 = 0x2001_6ba8;
@@ -3306,7 +3330,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let gate_open = (reset & 0x03) == 0x03;
         eprintln!(
             "  → audio gate (reset_reg & 0x03 == 0x03): {}",
-            if gate_open { "OPEN" } else { "CLOSED — GUS_sample_stereo() returns 0" },
+            if gate_open {
+                "OPEN"
+            } else {
+                "CLOSED — GUS_sample_stereo() returns 0"
+            },
         );
 
         // Voice 0..3 — enough to catch the Monkey Island config
@@ -3320,34 +3348,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let slot = GUSCHAN_BASE + c * 4;
             let ptr = peek_u32(slot);
             eprintln!();
-            eprintln!("voice {}: guschan[{}] @ 0x{:08x} = 0x{:08x}", c, c, slot, ptr);
+            eprintln!(
+                "voice {}: guschan[{}] @ 0x{:08x} = 0x{:08x}",
+                c, c, slot, ptr
+            );
             if ptr < 0x2000_0000 || ptr >= 0x2004_2000 {
                 eprintln!("  (pointer not in SRAM range — voice not constructed)");
                 continue;
             }
             // GUSChannels struct members (byte_size = 100)
-            let wave_start  = peek_u32(ptr + 0);
-            let wave_end    = peek_u32(ptr + 4);
-            let wave_addr   = peek_u32(ptr + 8);
-            let wave_add    = peek_u32(ptr + 12);
-            let wave_ctrl   = peek_u16(ptr + 16);
-            let wave_freq   = peek_u16(ptr + 18);
-            let ramp_start  = peek_u32(ptr + 20);
-            let ramp_end    = peek_u32(ptr + 24);
-            let ramp_vol    = peek_u32(ptr + 28);
-            let ramp_add    = peek_u32(ptr + 32);
-            let ramp_rate   = peek_u8(ptr + 36);
-            let ramp_ctrl   = peek_u8(ptr + 37);
-            let pan_pot     = peek_u8(ptr + 38);
-            let channum     = peek_u8(ptr + 39);
-            let pan_left    = peek_u32(ptr + 44);
-            let pan_right   = peek_u32(ptr + 48);
-            let vol_left    = peek_u32(ptr + 52);
-            let vol_right   = peek_u32(ptr + 56);
+            let wave_start = peek_u32(ptr + 0);
+            let wave_end = peek_u32(ptr + 4);
+            let wave_addr = peek_u32(ptr + 8);
+            let wave_add = peek_u32(ptr + 12);
+            let wave_ctrl = peek_u16(ptr + 16);
+            let wave_freq = peek_u16(ptr + 18);
+            let ramp_start = peek_u32(ptr + 20);
+            let ramp_end = peek_u32(ptr + 24);
+            let ramp_vol = peek_u32(ptr + 28);
+            let ramp_add = peek_u32(ptr + 32);
+            let ramp_rate = peek_u8(ptr + 36);
+            let ramp_ctrl = peek_u8(ptr + 37);
+            let pan_pot = peek_u8(ptr + 38);
+            let channum = peek_u8(ptr + 39);
+            let pan_left = peek_u32(ptr + 44);
+            let pan_right = peek_u32(ptr + 48);
+            let vol_left = peek_u32(ptr + 52);
+            let vol_right = peek_u32(ptr + 56);
             // useAddr = WaveAddr >> WAVE_FRACT(10); same for start/end
-            let use_addr  = wave_addr  >> 10;
+            let use_addr = wave_addr >> 10;
             let use_start = wave_start >> 10;
-            let use_end   = wave_end   >> 10;
+            let use_end = wave_end >> 10;
             eprintln!(
                 "  WaveCtrl=0x{:02x}  RampCtrl=0x{:02x}  channum={}  PanPot=0x{:02x}",
                 wave_ctrl as u8, ramp_ctrl, channum, pan_pot,
@@ -3366,12 +3397,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             eprintln!(
                 "  RampStart=0x{:08x}  RampEnd=0x{:08x}  RampVol=0x{:08x} (idx>>10={})",
-                ramp_start, ramp_end, ramp_vol, ramp_vol >> 10,
+                ramp_start,
+                ramp_end,
+                ramp_vol,
+                ramp_vol >> 10,
             );
-            eprintln!(
-                "  RampAdd=0x{:08x}  RampRate=0x{:02x}",
-                ramp_add, ramp_rate,
-            );
+            eprintln!("  RampAdd=0x{:08x}  RampRate=0x{:02x}", ramp_add, ramp_rate,);
             eprintln!(
                 "  PanLeft=0x{:08x}  PanRight=0x{:08x}  VolLeft=0x{:08x}  VolRight=0x{:08x}",
                 pan_left, pan_right, vol_left, vol_right,
@@ -3411,17 +3442,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let nz = data.iter().filter(|&&b| b != 0).count();
             eprintln!(
                 "  sample_cache.addr=0x{:08x} addr_next=0x{:08x}  data[0..16]: {}",
-                sc_addr as i32, sc_addr_next as i32,
+                sc_addr as i32,
+                sc_addr_next as i32,
                 data[..16]
                     .iter()
                     .map(|b| format!("{:02x}", b))
                     .collect::<Vec<_>>()
                     .join(" "),
             );
-            eprintln!(
-                "  sample_cache.data non-zero: {}/32",
-                nz,
-            );
+            eprintln!("  sample_cache.data non-zero: {}/32", nz,);
         }
         eprintln!();
     }
@@ -3451,7 +3480,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!(
             "SRAM scan: 0x00 count={}  0x01 count={}  0x07 count={}  total bytes={}",
-            count_by_value[0x00], count_by_value[0x01], count_by_value[0x07],
+            count_by_value[0x00],
+            count_by_value[0x01],
+            count_by_value[0x07],
             (sram_end - sram_base) as u64
         );
         // Dump candidate address lists to files for easy diffing.
@@ -3497,7 +3528,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         summary.post_roll_cycles as f64 / final_sys_clk_hz as f64,
         final_sys_clk_hz
     );
-    println!("Final cycles:     {}", summary.final_cycles + summary.post_roll_cycles);
+    println!(
+        "Final cycles:     {}",
+        summary.final_cycles + summary.post_roll_cycles
+    );
     println!("Core 1 halted:    {}", core1_halted);
     println!("Core 1 PC:        0x{:08x}", core1_pc);
     println!("Wall elapsed:     {:.3} s", wall_elapsed.as_secs_f64());
@@ -3516,10 +3550,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Frames:           {}", capture.frames().len());
     println!("LRCLK edges:      {}", capture.lrclk_edge_count());
     match inferred_rate {
-        Some(rate) => println!(
-            "Sample rate:      {:.1} Hz (inferred from LRCLK)",
-            rate
-        ),
+        Some(rate) => println!("Sample rate:      {:.1} Hz (inferred from LRCLK)", rate),
         None => println!(
             "Sample rate:      — (no LRCLK activity; header stamped {} Hz)",
             wav_rate
@@ -3534,8 +3565,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn load_flash(path: &Path) -> Result<Vec<u8>, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("reading flash {}: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("reading flash {}: {e}", path.display()))?;
     if bytes.len() > 2 * 1024 * 1024 {
         eprintln!(
             "warning: flash image {} bytes exceeds 2 MB window; will be clamped",
@@ -3647,11 +3678,7 @@ pub fn disasm_pio_instr(word: u16) -> String {
             let iff = (body >> 6) & 1 != 0;
             let blk = (body >> 5) & 1 != 0;
             let iff_s = if iff {
-                if is_pull {
-                    "IFEMPTY "
-                } else {
-                    "IFFULL "
-                }
+                if is_pull { "IFEMPTY " } else { "IFFULL " }
             } else {
                 ""
             };
@@ -3751,8 +3778,8 @@ mod tests {
 
     #[test]
     fn parse_sample_fixture() {
-        let text = std::fs::read_to_string(sample_fixture_path())
-            .expect("sample_gus.trace missing");
+        let text =
+            std::fs::read_to_string(sample_fixture_path()).expect("sample_gus.trace missing");
         let events = parse_trace(&text).expect("parse");
         assert_eq!(events.len(), 19, "expected 19 events in sample fixture");
         assert_eq!(events[0].ns, 0);
@@ -3779,8 +3806,7 @@ mod tests {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join("monkey_island_theme.trace");
-        let text = std::fs::read_to_string(&path)
-            .expect("monkey_island_theme.trace missing");
+        let text = std::fs::read_to_string(&path).expect("monkey_island_theme.trace missing");
         let events = parse_trace(&text).expect("parse monkey_island_theme.trace");
 
         // 30 s of Monkey Island theme via GUS: init + ~100 KB DRAM upload
@@ -3808,9 +3834,18 @@ mod tests {
         );
 
         // Must contain both write8 and write16 kinds.
-        let w8 = events.iter().filter(|e| e.kind == TraceKind::Write8).count();
-        let w16 = events.iter().filter(|e| e.kind == TraceKind::Write16).count();
-        assert!(w8 > 0 && w16 > 0, "need both write8 ({w8}) and write16 ({w16})");
+        let w8 = events
+            .iter()
+            .filter(|e| e.kind == TraceKind::Write8)
+            .count();
+        let w16 = events
+            .iter()
+            .filter(|e| e.kind == TraceKind::Write16)
+            .count();
+        assert!(
+            w8 > 0 && w16 > 0,
+            "need both write8 ({w8}) and write16 ({w16})"
+        );
     }
 
     #[test]
@@ -3943,7 +3978,8 @@ ns,port,value,kind
         let mut emu = EmulatorBuilder::new(Config {
             sys_clk_hz: 125_000_000,
         })
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
 
         // Seed ROM with a minimal vector table + self-branch loop so
         // reset brings core 0 up running instructions (rather than
@@ -4085,7 +4121,8 @@ ns,port,value,kind
         let mut emu = EmulatorBuilder::new(Config {
             sys_clk_hz: 125_000_000,
         })
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
         emu.reset();
 
         // Use a thin wrapper that exposes gpio_in between phases.
@@ -4133,7 +4170,11 @@ ns,port,value,kind
         );
 
         // Phase 1: assert — IOW low, address still on bus.
-        assert_eq!(probe.snapshots[1] & iow_mask, 0, "IOW must be low on assert");
+        assert_eq!(
+            probe.snapshots[1] & iow_mask,
+            0,
+            "IOW must be low on assert"
+        );
         assert_eq!(
             (probe.snapshots[1] & ad_mask) >> PIN_AD0,
             0x243,
@@ -4287,8 +4328,18 @@ ns,port,value,kind
         // should make the second event fire at sim-time 2 ms, i.e. the
         // final sink cycle count is ≥ 2 × the stretch=1.0 case.
         let events = vec![
-            TraceEvent { ns: 0, port: 0x240, value: 0x01, kind: TraceKind::Write8 },
-            TraceEvent { ns: 1_000_000, port: 0x241, value: 0x02, kind: TraceKind::Write8 },
+            TraceEvent {
+                ns: 0,
+                port: 0x240,
+                value: 0x01,
+                kind: TraceKind::Write8,
+            },
+            TraceEvent {
+                ns: 1_000_000,
+                port: 0x241,
+                value: 0x02,
+                kind: TraceKind::Write8,
+            },
         ];
         let mut sink1 = MockSink::new();
         let _ = replay(&mut sink1, &events, None, None, 0, 1.0);
@@ -4373,7 +4424,8 @@ ns,port,value,kind
             sys_clk_hz: 125_000_000,
         })
         .step_quantum(1)
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
 
         // Same minimal vector + B-to-self loop as
         // replay_advances_emulator_to_target_cycles.
@@ -4521,7 +4573,11 @@ ns,port,value,kind
             }
             fn drive_pins(&mut self, _iow_low: bool, _ior_low: bool, _ad_bus: u16) {}
             fn pad_state(&self) -> u32 {
-                if self.lrclk_high { 1u32 << I2S_LRCLK } else { 0 }
+                if self.lrclk_high {
+                    1u32 << I2S_LRCLK
+                } else {
+                    0
+                }
             }
         }
 
@@ -4530,7 +4586,10 @@ ns,port,value,kind
         // edges with monotonic sysclk stamps 4, 8, 12, …, 40.
         let sys_clk = 40u32;
         let mut sink = CapturingSink::new(
-            MultiCycleSink { cycles: 0, lrclk_high: false },
+            MultiCycleSink {
+                cycles: 0,
+                lrclk_high: false,
+            },
             sys_clk,
         );
         sink.step(40);
@@ -4576,7 +4635,8 @@ ns,port,value,kind
             sys_clk_hz: 125_000_000,
         })
         .step_quantum(1)
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
 
         let mut rom = vec![0u8; 16];
         // Initial SP at top of SRAM
@@ -4611,7 +4671,8 @@ ns,port,value,kind
             sys_clk_hz: 125_000_000,
         })
         .step_quantum(1)
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
         emu2.load_image(0x0000_0000, &rom);
         emu2.reset();
         let mut sink = CapturingSink::new(emu2, 125_000_000);
@@ -4685,11 +4746,10 @@ ns,port,value,kind
     /// smoke test doesn't depend on the script having been run. Update
     /// both this array and `i2s_chime.bin` if the generator changes.
     const CHIME_FIRMWARE: &[u8] = &[
-        0x0d, 0x4c, 0x07, 0x25, 0x2d, 0x04, 0x01, 0x27, 0x3f, 0x04, 0x01, 0x21,
-        0x49, 0x04, 0x01, 0x22, 0x92, 0x04, 0x65, 0x62, 0xa5, 0x61, 0x40, 0x26,
-        0x30, 0x46, 0x40, 0x07, 0xc0, 0x0f, 0x00, 0x04, 0xa7, 0x61, 0x60, 0x61,
-        0x20, 0x23, 0x61, 0x61, 0xa1, 0x61, 0x01, 0x3b, 0xfb, 0xd1, 0xe2, 0x61,
-        0x01, 0x3e, 0xf1, 0xd1, 0xfe, 0xe7, 0x00, 0xbf, 0x00, 0x00, 0x00, 0xd0,
+        0x0d, 0x4c, 0x07, 0x25, 0x2d, 0x04, 0x01, 0x27, 0x3f, 0x04, 0x01, 0x21, 0x49, 0x04, 0x01,
+        0x22, 0x92, 0x04, 0x65, 0x62, 0xa5, 0x61, 0x40, 0x26, 0x30, 0x46, 0x40, 0x07, 0xc0, 0x0f,
+        0x00, 0x04, 0xa7, 0x61, 0x60, 0x61, 0x20, 0x23, 0x61, 0x61, 0xa1, 0x61, 0x01, 0x3b, 0xfb,
+        0xd1, 0xe2, 0x61, 0x01, 0x3e, 0xf1, 0xd1, 0xfe, 0xe7, 0x00, 0xbf, 0x00, 0x00, 0x00, 0xd0,
     ];
 
     /// Minimal ROM image: SP at word 0 = top of SRAM (0x20042000),
@@ -4717,7 +4777,8 @@ ns,port,value,kind
         })
         .step_quantum(1)
         .flash(CHIME_FIRMWARE.to_vec())
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
         emu.load_bootrom(&minimal_bootrom_for_flash_entry());
         emu.reset();
 
@@ -4777,7 +4838,8 @@ ns,port,value,kind
             + cov.post_roll_orphans
             + cov.catch_up_unattributed;
         assert_eq!(
-            accounted, total_pushes,
+            accounted,
+            total_pushes,
             "HLD §7(4): captured ({}) + misattr ({}) + orphans ({}) + \
              catch_up_unattributed ({}) = {} != autopush_count ({})",
             sum_captured(cov),
@@ -4854,19 +4916,23 @@ ns,port,value,kind
         // table should bump A's decile (2), B becomes the new pending.
         record(&mut cov, 1, false, ClassKey::P344Lo, 5, &mut pending);
         assert_eq!(
-            cov.classes[&ClassKey::P347].misattributed, 1,
+            cov.classes[&ClassKey::P347].misattributed,
+            1,
             "prev (A) must get misattr += 1"
         );
         assert_eq!(
-            cov.classes[&ClassKey::P347].captured, 0,
+            cov.classes[&ClassKey::P347].captured,
+            0,
             "prev (A) must NOT get captured (pre-MUST-FIX bug)"
         );
         assert_eq!(
-            cov.classes[&ClassKey::P344Lo].captured, 0,
+            cov.classes[&ClassKey::P344Lo].captured,
+            0,
             "current (B) must NOT double-count as captured"
         );
         assert_eq!(
-            cov.classes[&ClassKey::P344Lo].misattributed, 0,
+            cov.classes[&ClassKey::P344Lo].misattributed,
+            0,
             "current (B) must NOT double-count as misattr \
              (pre-MUST-FIX bug)"
         );
@@ -4997,14 +5063,7 @@ ns,port,value,kind
         assert!(pending.is_none());
 
         // Stray push with no pending.
-        record(
-            &mut cov,
-            1,
-            false,
-            ClassKey::P345(0x01),
-            4,
-            &mut pending,
-        );
+        record(&mut cov, 1, false, ClassKey::P345(0x01), 4, &mut pending);
         assert!(pending.is_some());
 
         // Catch-up on a new event D: delta=2, match, with pending from
@@ -5360,9 +5419,7 @@ ns,port,value,kind
         // Flip to 370 MHz — capture timestamps unchanged, only the
         // divisor changes.
         cap.set_sys_clk_hz(370_000_000);
-        let rate_370 = cap
-            .inferred_sample_rate_hz()
-            .expect("edges still present");
+        let rate_370 = cap.inferred_sample_rate_hz().expect("edges still present");
         let ratio = rate_370 / rate_125;
         let expected_ratio = 370.0 / 125.0;
         assert!(

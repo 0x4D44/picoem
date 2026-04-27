@@ -32,12 +32,16 @@ fn prepare_emu() -> Emulator {
 
     // Read SP and reset vector from SRAM.
     let initial_sp = u32::from_le_bytes([
-        HELLO_DMA_BIN[0], HELLO_DMA_BIN[1],
-        HELLO_DMA_BIN[2], HELLO_DMA_BIN[3],
+        HELLO_DMA_BIN[0],
+        HELLO_DMA_BIN[1],
+        HELLO_DMA_BIN[2],
+        HELLO_DMA_BIN[3],
     ]);
     let reset_vector = u32::from_le_bytes([
-        HELLO_DMA_BIN[4], HELLO_DMA_BIN[5],
-        HELLO_DMA_BIN[6], HELLO_DMA_BIN[7],
+        HELLO_DMA_BIN[4],
+        HELLO_DMA_BIN[5],
+        HELLO_DMA_BIN[6],
+        HELLO_DMA_BIN[7],
     ]);
     {
         let arm = emu.cores.expect_arm_mut();

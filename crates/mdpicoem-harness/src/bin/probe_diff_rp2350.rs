@@ -11,7 +11,7 @@
 //   probe_diff_rp2350 --cycles             Also compare cycle counts
 
 use mdpicoem_harness::*;
-use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::probe::{DebugProbeSelector, list::Lister};
 use probe_rs::{Core, MemoryInterface, Permissions, RegisterId, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
@@ -177,9 +177,7 @@ fn calibrate_cycles(core: &mut Core) -> Result<u32, Box<dyn std::error::Error>> 
     let min = *counts.iter().min().unwrap();
     let max = *counts.iter().max().unwrap();
     if min != max {
-        eprintln!(
-            "warning: NOP CYCCNT not consistent: min={min}, max={max}, counts={counts:?}"
-        );
+        eprintln!("warning: NOP CYCCNT not consistent: min={min}, max={max}, counts={counts:?}");
         eprintln!("         Cycle comparisons may be unreliable in halt-step mode.");
     }
 
@@ -195,10 +193,7 @@ fn calibrate_cycles(core: &mut Core) -> Result<u32, Box<dyn std::error::Error>> 
 
 /// Execute a single test case on hardware via probe-rs single-step.
 /// Returns post-execution state including CYCCNT.
-fn run_one_probe(
-    core: &mut Core,
-    tc: &TestCase,
-) -> Result<RunState, probe_rs::Error> {
+fn run_one_probe(core: &mut Core, tc: &TestCase) -> Result<RunState, probe_rs::Error> {
     let is_fpu = is_fpu_test(tc);
     let n_steps: usize;
 
@@ -297,10 +292,7 @@ fn run_one_probe(
     if is_fpu {
         for &sn in &tc.fpu_check {
             let mut bytes = [0u8; 4];
-            core.read_8(
-                (EMU_FPU_SCRATCH + (sn as u32) * 4) as u64,
-                &mut bytes,
-            )?;
+            core.read_8((EMU_FPU_SCRATCH + (sn as u32) * 4) as u64, &mut bytes)?;
             fpu.push(u32::from_le_bytes(bytes));
         }
         if tc.fpscr_mask != 0 {
@@ -415,7 +407,15 @@ fn run_targeted(
     }
 
     let elapsed = t0.elapsed();
-    print_summary("targeted", pass, fail, skip, cycle_mismatches, args.cycles, elapsed);
+    print_summary(
+        "targeted",
+        pass,
+        fail,
+        skip,
+        cycle_mismatches,
+        args.cycles,
+        elapsed,
+    );
 
     let rc = rc_for(pass, fail, skip);
     if rc == 3 {
@@ -488,7 +488,15 @@ fn run_fuzz(
     }
 
     let elapsed = t0.elapsed();
-    print_summary("fuzz", pass, fail, skip, cycle_mismatches, args.cycles, elapsed);
+    print_summary(
+        "fuzz",
+        pass,
+        fail,
+        skip,
+        cycle_mismatches,
+        args.cycles,
+        elapsed,
+    );
     if args.cycles || args.fuzz_count.is_some() {
         println!("Seed: {seed}");
         if fail > 0 {
@@ -573,7 +581,9 @@ fn run_one_diff(
 /// rc=3 fires only when at least 20 cases were attempted AND at least 25% of
 /// them ended in `[SKIP]` (probe-rs transport errors). See HLD §3.
 fn rc_for(pass: usize, fail: usize, skip: usize) -> i32 {
-    if fail > 0 { return 1; }
+    if fail > 0 {
+        return 1;
+    }
     let attempted = pass + fail + skip;
     if attempted >= 20 && (skip * 100) / attempted >= 25 {
         return 3;
@@ -640,7 +650,10 @@ mod tests {
                     err.contains("invalid probe selector"),
                     "error should name the flag: {err}"
                 );
-                assert!(err.contains("bogus"), "error should echo the bad value: {err}");
+                assert!(
+                    err.contains("bogus"),
+                    "error should echo the bad value: {err}"
+                );
             }
             Ok(_) => panic!("bogus selector must error"),
         }

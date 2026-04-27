@@ -55,8 +55,7 @@ impl ExclusiveMonitors {
 
     /// Returns true if any core has an active reservation.
     fn any_valid(&self) -> bool {
-        self.monitors[0].load(Relaxed) & VALID != 0
-            || self.monitors[1].load(Relaxed) & VALID != 0
+        self.monitors[0].load(Relaxed) & VALID != 0 || self.monitors[1].load(Relaxed) & VALID != 0
     }
 
     /// Snoop: invalidate any monitor matching this word address.

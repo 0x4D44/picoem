@@ -21,18 +21,19 @@ use crate::bus::{
     RESET_ADC, RESET_I2C0, RESET_IO_BANK0, RESET_PADS_BANK0, RESET_PWM, RESET_SPI0, RESET_UART0,
 };
 use crate::irq::{IRQ_ADC_IRQ_FIFO, IRQ_PWM_IRQ_WRAP_0, IRQ_UART0_IRQ};
-use crate::peripherals::adc::{ADC_BASE, CS as ADC_CS, CS_EN, CS_READY, FCS, FCS_EN, FCS_THRESH_SHIFT, FIFO as ADC_FIFO, INTE as ADC_INTE};
+use crate::peripherals::adc::{
+    ADC_BASE, CS as ADC_CS, CS_EN, CS_READY, FCS, FCS_EN, FCS_THRESH_SHIFT, FIFO as ADC_FIFO,
+    INTE as ADC_INTE,
+};
 use crate::peripherals::i2c::{
     I2C0_BASE, IC_DATA_CMD, IC_ENABLE, IC_RAW_INTR_STAT, IC_TAR, IC_TX_ABRT_SOURCE, INT_TX_ABRT,
 };
 use crate::peripherals::io_bank0::IO_BANK0_BASE;
 use crate::peripherals::pads_bank0::PADS_BANK0_BASE;
 use crate::peripherals::pwm::{CSR_EN, EN as PWM_EN, INTE0, INTR as PWM_INTR, PWM_BASE};
-use crate::peripherals::spi::{
-    SPI0_BASE, SSPCPSR, SSPCR0, SSPCR1, SSPDR, SSPSR,
-};
+use crate::peripherals::spi::{SPI0_BASE, SSPCPSR, SSPCR0, SSPCR1, SSPDR, SSPSR};
 use crate::peripherals::uart::{
-    UART0_BASE, UARTCR, UARTDR, UARTFR, UARTIMSC, UARTLCR_H, UART_INT_TX,
+    UART_INT_TX, UART0_BASE, UARTCR, UARTDR, UARTFR, UARTIMSC, UARTLCR_H,
 };
 
 // RESETS register at 0x4002_0000 — BITSET alias @ +0x2000, BITCLR @ +0x3000.
@@ -397,7 +398,8 @@ fn adc_fifo_byte_write_does_not_pop_sample() {
     // Full word read must still see the sample.
     let sample = bus.read32(ADC_BASE + ADC_FIFO, 0);
     assert_ne!(
-        sample & 0xFFFF, 0,
+        sample & 0xFFFF,
+        0,
         "ADC FIFO byte-write must not pop the pending sample"
     );
 }
@@ -411,7 +413,8 @@ fn adc_fifo_halfword_write_does_not_pop_sample() {
     bus.write16(ADC_BASE + ADC_FIFO, 0xBEEF, 0);
     let sample = bus.read32(ADC_BASE + ADC_FIFO, 0);
     assert_ne!(
-        sample & 0xFFFF, 0,
+        sample & 0xFFFF,
+        0,
         "ADC FIFO halfword-write must not pop the pending sample"
     );
 }

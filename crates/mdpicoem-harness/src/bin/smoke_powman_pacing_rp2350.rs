@@ -21,7 +21,7 @@
 // `probe_diff_rp2350.rs` and the halted-read pattern of the
 // silicon_periph_diff / silicon_isr_diff oracles.
 
-use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::probe::{DebugProbeSelector, list::Lister};
 use probe_rs::{MemoryInterface, Permissions, Session, SessionConfig};
 use std::time::{Duration, Instant};
 

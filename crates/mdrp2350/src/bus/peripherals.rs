@@ -180,10 +180,10 @@ impl Bus {
             0x05C => 1,         // CLK_HSTX_SELECTED
             // clk_usb — non-glitchless.
             0x060 | 0x064 => 0,
-            0x068 => 1,         // CLK_USB_SELECTED
+            0x068 => 1, // CLK_USB_SELECTED
             // clk_adc — non-glitchless.
             0x06C | 0x070 => 0,
-            0x074 => 1,         // CLK_ADC_SELECTED
+            0x074 => 1, // CLK_ADC_SELECTED
             _ => 0,
         }
     }
@@ -268,15 +268,15 @@ impl Bus {
     // RANDOMBIT, COUNT return synthesised values (writes are dropped).
     pub(crate) fn rosc_read(&self, offset: u32) -> u32 {
         match offset {
-            0x000 => self.rosc_regs[0], // CTRL
-            0x004 => self.rosc_regs[1], // FREQA
-            0x008 => self.rosc_regs[2], // FREQB
-            0x00C => 0,                 // RANDOM — stub (no PRNG)
-            0x010 => self.rosc_regs[4], // DORMANT
-            0x014 => self.rosc_regs[5], // DIV
+            0x000 => self.rosc_regs[0],     // CTRL
+            0x004 => self.rosc_regs[1],     // FREQA
+            0x008 => self.rosc_regs[2],     // FREQB
+            0x00C => 0,                     // RANDOM — stub (no PRNG)
+            0x010 => self.rosc_regs[4],     // DORMANT
+            0x014 => self.rosc_regs[5],     // DIV
             0x018 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
-            0x01C => 0,                 // RANDOMBIT
-            0x020 => 0,                 // COUNT
+            0x01C => 0,                     // RANDOMBIT
+            0x020 => 0,                     // COUNT
             _ => 0,
         }
     }
@@ -314,11 +314,11 @@ impl Bus {
     // STATUS and COUNT are read-only.
     pub(crate) fn xosc_read(&self, offset: u32) -> u32 {
         match offset {
-            0x000 => self.xosc_regs[0], // CTRL
+            0x000 => self.xosc_regs[0],     // CTRL
             0x004 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
-            0x008 => self.xosc_regs[2], // DORMANT
-            0x00C => self.xosc_regs[3], // STARTUP
-            0x01C => 0,                 // COUNT
+            0x008 => self.xosc_regs[2],     // DORMANT
+            0x00C => self.xosc_regs[3],     // STARTUP
+            0x01C => 0,                     // COUNT
             _ => 0,
         }
     }
@@ -506,7 +506,11 @@ mod tests {
         // locking in the known bug (see tech_debt.md).
         let mut bus = Bus::new();
         let cs = bus.read32(0x4005_0000, 0);
-        assert_eq!(cs & (1 << 31), 0, "LOCK bit must be 0 at reset (PLL unpowered)");
+        assert_eq!(
+            cs & (1 << 31),
+            0,
+            "LOCK bit must be 0 at reset (PLL unpowered)"
+        );
     }
 
     #[test]
@@ -519,8 +523,8 @@ mod tests {
     // --- Inert-register warn: CLK_*_CTRL.ENABLE clear (HLD V5 §4.A2) ---
 
     use std::sync::{Arc, Mutex};
-    use tracing::{Event, Metadata, Subscriber};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     #[derive(Default)]
     struct CaptureSubscriber {
@@ -539,8 +543,12 @@ mod tests {
     }
 
     impl Subscriber for CaptureSubscriber {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
-        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
         fn record(&self, _span: &Id, _values: &Record<'_>) {}
         fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
         fn event(&self, event: &Event<'_>) {
@@ -565,7 +573,9 @@ mod tests {
     #[test]
     fn clk_peri_ctrl_enable_clear_warns_once() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut bus = Bus::new();
             // CLK_PERI_CTRL is at CLOCKS offset 0x048 → 0x4001_0048.

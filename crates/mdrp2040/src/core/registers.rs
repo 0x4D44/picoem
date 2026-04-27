@@ -195,7 +195,11 @@ impl Registers {
 
     /// Sync R13 from the appropriate banked SP after switching.
     pub fn sync_sp_from_banked(&mut self) {
-        self.r[13] = if self.active_sp_is_psp() { self.psp } else { self.msp };
+        self.r[13] = if self.active_sp_is_psp() {
+            self.psp
+        } else {
+            self.msp
+        };
     }
 
     /// Evaluate an ARM condition code (cond in `[0..0xE]`).

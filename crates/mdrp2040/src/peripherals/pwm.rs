@@ -517,8 +517,11 @@ mod tests {
         p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(SLICE_TOP, 100, 0, &mut irqs);
         p.write32(EN, 0, 0, &mut irqs); // clears CSR.EN via the alias
-        assert_eq!(p.slices[0].csr & CSR_EN, 0,
-            "writing 0 to PWM_EN must clear CSR.EN on every slice");
+        assert_eq!(
+            p.slices[0].csr & CSR_EN,
+            0,
+            "writing 0 to PWM_EN must clear CSR.EN on every slice"
+        );
         p.tick(500, &default_tree(), &mut irqs);
         assert_eq!(p.slices[0].ctr, 0);
         assert_eq!(p.intr, 0);
@@ -543,8 +546,10 @@ mod tests {
         assert_eq!(p.slices[0].csr & CSR_EN, 0);
         let ctr_after_clear = p.slices[0].ctr;
         p.tick(500, &default_tree(), &mut irqs);
-        assert_eq!(p.slices[0].ctr, ctr_after_clear,
-            "slice halts once PWM_EN clears its bit");
+        assert_eq!(
+            p.slices[0].ctr, ctr_after_clear,
+            "slice halts once PWM_EN clears its bit"
+        );
     }
 
     // --- INTR W1C -------------------------------------------------------
@@ -598,8 +603,11 @@ mod tests {
         p.write32(EN, 0b0000_0011, 0, &mut irqs);
         // After 21 ticks both slices have wrapped at least once.
         p.tick(21, &default_tree(), &mut irqs);
-        assert_eq!(p.intr & 0b11, 0b11,
-            "both slices 0 and 1 must latch wrap bits");
+        assert_eq!(
+            p.intr & 0b11,
+            0b11,
+            "both slices 0 and 1 must latch wrap bits"
+        );
         assert_eq!(p.intr & 0b100, 0, "slice 2 must not latch — not enabled");
     }
 
@@ -646,7 +654,10 @@ mod tests {
         let base = 4 * SLICE_STRIDE;
         p.write32(base + SLICE_CSR, CSR_A_INV, 0, &mut irqs);
         p.write32(base + SLICE_CSR, CSR_B_INV, 2, &mut irqs); // BITSET
-        assert_eq!(p.slices[4].csr & (CSR_A_INV | CSR_B_INV), CSR_A_INV | CSR_B_INV);
+        assert_eq!(
+            p.slices[4].csr & (CSR_A_INV | CSR_B_INV),
+            CSR_A_INV | CSR_B_INV
+        );
     }
 
     // --- PWM_EN is an alias of the eight CSR.EN bits (datasheet §4.5.3.18) ---
@@ -685,7 +696,6 @@ mod tests {
         let mut irqs = 0u32;
         p.intr = 0b1111_0000;
         p.write32(INTR, 0b0101_0000, 0, &mut irqs);
-        assert_eq!(p.intr, 0b1010_0000,
-            "only bits set in value get W1C'd");
+        assert_eq!(p.intr, 0b1010_0000, "only bits set in value get W1C'd");
     }
 }

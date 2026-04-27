@@ -27,17 +27,14 @@
 // against `tech_debt.md` § "Exception entry/exit not differentially
 // validated"; the oracle is the surfacing tool.
 
-use crate::isr_scenarios::{
-    ICSR_PENDSVSET, MAIN_OFFSET as M33_MAIN_OFFSET, NVIC_ICPR0_ADDR,
-    SCB_ICSR_ADDR, SYST_CSR_ADDR, SYST_CSR_ENABLE_TICKINT_CORE,
-    SYST_CVR_ADDR, SYST_RVR_ADDR,
-};
-use crate::silicon_oracle::{
-    self, enable_cyccnt, reset_cyccnt, CaseOutcome, Verdict,
-};
-use crate::{ISR_IMAGE_BASE, ISR_STACK_TOP};
 #[cfg(test)]
 use crate::ISR_MAILBOX_CYCCNT;
+use crate::isr_scenarios::{
+    ICSR_PENDSVSET, MAIN_OFFSET as M33_MAIN_OFFSET, NVIC_ICPR0_ADDR, SCB_ICSR_ADDR, SYST_CSR_ADDR,
+    SYST_CSR_ENABLE_TICKINT_CORE, SYST_CVR_ADDR, SYST_RVR_ADDR,
+};
+use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, reset_cyccnt};
+use crate::{ISR_IMAGE_BASE, ISR_STACK_TOP};
 use mdrp2040::{Config, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
 use std::time::{Duration, Instant};
@@ -783,10 +780,7 @@ fn apply_init_regs_emu(emu: &mut mdrp2040::Emulator, init_regs: &[(IsrReg, u32)]
 
 /// Scenario-specific MMIO preamble. Handles the one case (tail-chain)
 /// that needs SysTick pre-armed via MMIO rather than through init_regs.
-fn scenario_preamble_hw(
-    core: &mut Core,
-    name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn scenario_preamble_hw(core: &mut Core, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     if name == "isr_m0_tail_chain_pendsv_systick" {
         // Arm SysTick with a short reload so the underflow fires quickly.
         core.write_word_32(SYST_RVR_ADDR as u64, 4)?;
@@ -869,7 +863,9 @@ fn primary_observable_addr(name: &str) -> u32 {
     match name {
         "isr_m0_timer_cold" => CTR_TIMER_ADDR,
         "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
-        other => panic!("primary_observable_addr: unknown scenario '{other}'; add it to this match"),
+        other => {
+            panic!("primary_observable_addr: unknown scenario '{other}'; add it to this match")
+        }
     }
 }
 
@@ -916,7 +912,10 @@ pub fn setup_emulator_image(emu: &mut mdrp2040::Emulator, sc: &IsrScenario) {
     let demcr = emu.mmio_read32(silicon_oracle::DEMCR_U32);
     emu.mmio_write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA);
     let dwt_ctrl = emu.mmio_read32(silicon_oracle::DWT_CTRL_U32);
-    emu.mmio_write32(silicon_oracle::DWT_CTRL_U32, dwt_ctrl | silicon_oracle::CYCCNTENA);
+    emu.mmio_write32(
+        silicon_oracle::DWT_CTRL_U32,
+        dwt_ctrl | silicon_oracle::CYCCNTENA,
+    );
     emu.mmio_write32(silicon_oracle::DWT_CYCCNT_ADDR, 0);
 
     // Prime core-0 thread-mode state. T-bit set, MSP at stack top, LR
@@ -1142,7 +1141,11 @@ fn run_one_scenario(
         }
     }
 
-    let verdict = if first_div.is_none() { Verdict::Pass } else { Verdict::Fail };
+    let verdict = if first_div.is_none() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    };
     Ok((verdict, first_div, t0.elapsed()))
 }
 
@@ -1174,12 +1177,9 @@ pub fn run_against(
                 let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 outcomes.push(match verdict {
                     Verdict::Pass => CaseOutcome::pass("isr_m0", sc.name, elapsed_ms),
-                    Verdict::Fail => CaseOutcome::fail(
-                        "isr_m0",
-                        sc.name,
-                        detail.unwrap_or_default(),
-                        elapsed_ms,
-                    ),
+                    Verdict::Fail => {
+                        CaseOutcome::fail("isr_m0", sc.name, detail.unwrap_or_default(), elapsed_ms)
+                    }
                 });
             }
             Err(e) => {
@@ -1254,31 +1254,16 @@ mod tests {
             assert_eq!(sc.image.len(), ISR_IMAGE_SIZE, "image size");
 
             // Word 0 — initial MSP.
-            let msp = u32::from_le_bytes([
-                sc.image[0],
-                sc.image[1],
-                sc.image[2],
-                sc.image[3],
-            ]);
+            let msp = u32::from_le_bytes([sc.image[0], sc.image[1], sc.image[2], sc.image[3]]);
             assert_eq!(msp, ISR_STACK_TOP, "vector[0]");
 
             // Word 1 — Reset_Handler.
-            let rv = u32::from_le_bytes([
-                sc.image[4],
-                sc.image[5],
-                sc.image[6],
-                sc.image[7],
-            ]);
+            let rv = u32::from_le_bytes([sc.image[4], sc.image[5], sc.image[6], sc.image[7]]);
             assert_eq!(rv & 1, 1, "reset vector Thumb LSB");
             assert_eq!(rv & !1, ISR_IMAGE_BASE + MAIN_OFFSET, "reset vector target");
 
             // Word 14 — PendSV, points at handler.
-            let pv = u32::from_le_bytes([
-                sc.image[56],
-                sc.image[57],
-                sc.image[58],
-                sc.image[59],
-            ]);
+            let pv = u32::from_le_bytes([sc.image[56], sc.image[57], sc.image[58], sc.image[59]]);
             assert_eq!(pv & 1, 1, "PendSV Thumb LSB");
             assert_eq!(
                 pv & !1,
@@ -1287,12 +1272,7 @@ mod tests {
             );
 
             // Word 15 — SysTick.
-            let sv = u32::from_le_bytes([
-                sc.image[60],
-                sc.image[61],
-                sc.image[62],
-                sc.image[63],
-            ]);
+            let sv = u32::from_le_bytes([sc.image[60], sc.image[61], sc.image[62], sc.image[63]]);
             assert_eq!(sv & 1, 1, "SysTick Thumb LSB");
             assert_eq!(
                 sv & !1,
@@ -1301,12 +1281,7 @@ mod tests {
             );
 
             // Word 16 — TIMER_IRQ_0.
-            let tv = u32::from_le_bytes([
-                sc.image[64],
-                sc.image[65],
-                sc.image[66],
-                sc.image[67],
-            ]);
+            let tv = u32::from_le_bytes([sc.image[64], sc.image[65], sc.image[66], sc.image[67]]);
             assert_eq!(tv & 1, 1, "TIMER_IRQ_0 Thumb LSB");
             assert_eq!(
                 tv & !1,
@@ -1349,7 +1324,8 @@ mod tests {
                 assert!(
                     !s1.name.contains(s2.name),
                     "'{}' is a substring of '{}' — filter aliasing",
-                    s2.name, s1.name,
+                    s2.name,
+                    s1.name,
                 );
             }
         }

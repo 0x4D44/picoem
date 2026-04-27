@@ -44,7 +44,7 @@ use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs};
 use mdpicoem_harness::isr_scenarios::{self, IsrArgs};
 use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter, should_exclude};
 use mdpicoem_harness::silicon_scenarios::{self, PeriphArgs};
-use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::probe::{DebugProbeSelector, list::Lister};
 use probe_rs::{Permissions, Session, SessionConfig};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -149,12 +149,14 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
             "--probe" => {
                 i += 1;
                 if i >= argv.len() {
-                    return Err(format!("--probe requires a VID:PID:SERIAL argument\n{USAGE}"));
+                    return Err(format!(
+                        "--probe requires a VID:PID:SERIAL argument\n{USAGE}"
+                    ));
                 }
-                probe = Some(
-                    DebugProbeSelector::try_from(argv[i].as_str())
-                        .map_err(|e| format!("invalid probe selector '{}': {e}\n{USAGE}", argv[i]))?,
-                );
+                probe =
+                    Some(DebugProbeSelector::try_from(argv[i].as_str()).map_err(|e| {
+                        format!("invalid probe selector '{}': {e}\n{USAGE}", argv[i])
+                    })?);
             }
             "--verbose" => verbose = true,
             "--help" | "-h" => return Err(USAGE.to_string()),
@@ -163,7 +165,14 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
         i += 1;
     }
     let seed = seed.unwrap_or_else(default_seed);
-    Ok(CliArgs { soak, seed, filter, exclude, verbose, probe })
+    Ok(CliArgs {
+        soak,
+        seed,
+        filter,
+        exclude,
+        verbose,
+        probe,
+    })
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -346,10 +355,7 @@ struct OraclePlan {
 /// handle; dualcore takes `&mut Session` directly because it drives
 /// core 1 as well. Session stays on the calling thread throughout — no
 /// worker thread (probe-rs USB handles are thread-affine on Windows).
-fn run_one_oracle(
-    session: &mut Session,
-    plan: &OraclePlan,
-) -> Result<Vec<CaseOutcome>, String> {
+fn run_one_oracle(session: &mut Session, plan: &OraclePlan) -> Result<Vec<CaseOutcome>, String> {
     // When `order` is provided, convert `Vec<String>` into a transient
     // `Vec<&str>` for the library call. The caller owns the `String`
     // backing storage for the duration of this function.
@@ -427,7 +433,9 @@ fn attach(probe: Option<&DebugProbeSelector>) -> Result<Session, probe_rs::Error
     // themselves right after opening the session; test_silicon skipped
     // this step and the cycle oracle's first `write_core_reg` landed on
     // a running target → "An ARM specific error occurred".
-    session.core(0)?.reset_and_halt(Duration::from_millis(500))?;
+    session
+        .core(0)?
+        .reset_and_halt(Duration::from_millis(500))?;
     Ok(session)
 }
 
@@ -536,10 +544,7 @@ impl Summary {
         println!("================ test_silicon summary ================");
         println!("iterations:   {iterations}");
         for (oracle, s) in &self.totals {
-            println!(
-                "  {:<8} pass={:>6}  fail={:>6}",
-                oracle, s.pass, s.fail,
-            );
+            println!("  {:<8} pass={:>6}  fail={:>6}", oracle, s.pass, s.fail,);
         }
         println!("reattach_count:    {}", self.reattach_count);
         if self.failing_cases.is_empty() {
@@ -574,7 +579,14 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
 
     // Print start banner.
     println!("test_silicon: starting");
-    println!("  mode:    {}", if args.soak.is_some() { "soak" } else { "single-pass" });
+    println!(
+        "  mode:    {}",
+        if args.soak.is_some() {
+            "soak"
+        } else {
+            "single-pass"
+        }
+    );
     if let Some(d) = args.soak {
         println!("  soak:    {}", humantime::format_duration(d));
     }
@@ -725,20 +737,20 @@ fn single_pass(
                 // name reflects "whole-oracle probe error" rather than a
                 // specific case name.
                 let case_name: &'static str = interner.intern(PROBE_ERROR_SENTINEL);
-                let synthetic = CaseOutcome::fail(
-                    oracle_name_static(oracle.as_str()),
-                    case_name,
-                    e.clone(),
-                    0,
-                );
+                let synthetic =
+                    CaseOutcome::fail(oracle_name_static(oracle.as_str()), case_name, e.clone(), 0);
                 summary.record(&[synthetic], 0);
                 // Reattach so the next oracle can run.
                 summary.reattach_count += 1;
-                session = reattach_with_retries(probe)
-                    .map_err(|e| format!("reattach failed: {e}"))?;
+                session =
+                    reattach_with_retries(probe).map_err(|e| format!("reattach failed: {e}"))?;
             }
         }
-        println!("  ({} oracle took {:.2}s)", oracle.as_str(), t0.elapsed().as_secs_f64());
+        println!(
+            "  ({} oracle took {:.2}s)",
+            oracle.as_str(),
+            t0.elapsed().as_secs_f64()
+        );
         println!();
     }
     // `verbose` is accepted but in single-pass mode the per-case table
@@ -846,7 +858,12 @@ fn soak_loop(
         shuffle_in_place(&mut isr_plan, &mut rng);
 
         if args.verbose {
-            println!("{} iter={} seed={} starting", fmt_elapsed(start.elapsed()), iter_index, s);
+            println!(
+                "{} iter={} seed={} starting",
+                fmt_elapsed(start.elapsed()),
+                iter_index,
+                s
+            );
         }
 
         // One `run_against` call per oracle — NOT per case. This is the
@@ -923,7 +940,11 @@ fn soak_loop(
                             let line = format!(
                                 "{} iter={} seed={} oracle={} case={} detail={}",
                                 fmt_elapsed(start.elapsed()),
-                                iter_index, s, o.oracle, o.case, o.detail,
+                                iter_index,
+                                s,
+                                o.oracle,
+                                o.case,
+                                o.detail,
                             );
                             emit_log_line(log_path, &line);
                         }
@@ -950,7 +971,11 @@ fn soak_loop(
                     let line = format!(
                         "{} iter={} seed={} oracle={} case={} detail={}",
                         fmt_elapsed(start.elapsed()),
-                        iter_index, s, synthetic_oracle, case_name_static, detail,
+                        iter_index,
+                        s,
+                        synthetic_oracle,
+                        case_name_static,
+                        detail,
                     );
                     emit_log_line(log_path, &line);
                     summary.record(&[synth], s);
@@ -968,7 +993,8 @@ fn soak_loop(
                             let rline = format!(
                                 "{} iter={} reattach failed: {rerr} (consecutive={})",
                                 fmt_elapsed(start.elapsed()),
-                                iter_index, consecutive_reattach_fails,
+                                iter_index,
+                                consecutive_reattach_fails,
                             );
                             emit_log_line(log_path, &rline);
                             if consecutive_reattach_fails >= GIVE_UP_THRESHOLD {
@@ -1176,10 +1202,7 @@ mod tests {
     #[test]
     fn test_pass_outcomes_do_not_appear_in_failing_cases() {
         let mut s = Summary::default();
-        s.record(
-            &[CaseOutcome::pass(ORACLE_PERIPH, "pio0_nop_loop", 12)],
-            42,
-        );
+        s.record(&[CaseOutcome::pass(ORACLE_PERIPH, "pio0_nop_loop", 12)], 42);
         assert!(s.failing_cases.is_empty());
         assert_eq!(s.totals.get(ORACLE_PERIPH).map(|x| x.pass), Some(1));
     }
@@ -1200,7 +1223,10 @@ mod tests {
     #[test]
     fn test_fmt_elapsed_hours() {
         assert_eq!(fmt_elapsed(Duration::from_secs(3600)), "[+01:00:00]");
-        assert_eq!(fmt_elapsed(Duration::from_secs(2 * 3600 + 30 * 60 + 15)), "[+02:30:15]");
+        assert_eq!(
+            fmt_elapsed(Duration::from_secs(2 * 3600 + 30 * 60 + 15)),
+            "[+02:30:15]"
+        );
     }
 
     #[test]
@@ -1243,8 +1269,17 @@ mod tests {
     fn test_five_catalogues_cover_correct_oracles() {
         let names = collect_all_catalogue_names();
         // At least one name per oracle.
-        assert!(names.iter().any(|n| n.starts_with("cycle") || n.starts_with("nop") || n.starts_with("push") || n.starts_with("backward") || n.starts_with("ldm") || n.starts_with("bank_")));
-        assert!(names.iter().any(|n| n.starts_with("pio0") || n.starts_with("pll_sys") || n.starts_with("clock")));
+        assert!(names.iter().any(|n| n.starts_with("cycle")
+            || n.starts_with("nop")
+            || n.starts_with("push")
+            || n.starts_with("backward")
+            || n.starts_with("ldm")
+            || n.starts_with("bank_")));
+        assert!(
+            names.iter().any(|n| n.starts_with("pio0")
+                || n.starts_with("pll_sys")
+                || n.starts_with("clock"))
+        );
         assert!(names.iter().any(|n| n.starts_with("bankcfl_")));
         assert!(names.iter().any(|n| n.starts_with("dualcore_")));
         assert!(names.iter().any(|n| n.starts_with("isr_")));
@@ -1280,8 +1315,7 @@ mod tests {
 
     #[test]
     fn test_parse_args_probe_full_selector() {
-        let a = parse_args(vec!["--probe".into(), "2e8a:000c:E46410955F614129".into()])
-            .unwrap();
+        let a = parse_args(vec!["--probe".into(), "2e8a:000c:E46410955F614129".into()]).unwrap();
         let sel = a.probe.expect("probe must be Some");
         assert_eq!(sel.vendor_id, 0x2e8a);
         assert_eq!(sel.product_id, 0x000c);
@@ -1328,7 +1362,10 @@ mod tests {
         // Make sure the error message mentions both names so a failing
         // soak run's log actually tells Arthur which pair is broken.
         assert!(err.contains("bank_ldr"), "err must cite inner name: {err}");
-        assert!(err.contains("bank_ldr_b0"), "err must cite outer name: {err}");
+        assert!(
+            err.contains("bank_ldr_b0"),
+            "err must cite outer name: {err}"
+        );
     }
 
     /// Catches straight duplicates.

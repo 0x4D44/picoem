@@ -45,11 +45,7 @@ impl PadsBank0 {
             0x00 => self.voltage_select,
             0x04..=0x7C => {
                 let idx = ((off - 0x04) >> 2) as usize;
-                if idx < NUM_PADS {
-                    self.pads[idx]
-                } else {
-                    0
-                }
+                if idx < NUM_PADS { self.pads[idx] } else { 0 }
             }
             0x80 => self.swclk,
             0x84 => self.swd,

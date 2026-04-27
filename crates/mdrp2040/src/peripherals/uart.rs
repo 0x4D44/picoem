@@ -424,7 +424,7 @@ impl UartRegs {
                 self.rsr_ecr = 0;
             }
             UARTFR | UARTMIS | UARTRIS => {} // read-only
-            UARTILPR => {} // not modelled
+            UARTILPR => {}                   // not modelled
             UARTIBRD => {
                 let mut stored = self.ibrd;
                 super::apply_alias_rmw(&mut stored, value, alias);

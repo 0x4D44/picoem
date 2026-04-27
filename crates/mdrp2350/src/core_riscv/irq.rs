@@ -79,11 +79,11 @@ pub(crate) struct Xh3Irq {
 }
 
 /// meicontext bit positions.
-pub(crate) const CTX_MRETEIRQ:   u32 = 1 << 0;
-pub(crate) const CTX_CLEARTS:    u32 = 1 << 1;
-pub(crate) const CTX_MSIESAVE:   u32 = 1 << 2;
-pub(crate) const CTX_MTIESAVE:   u32 = 1 << 3;
-pub(crate) const CTX_NOIRQ:      u32 = 1 << 15;
+pub(crate) const CTX_MRETEIRQ: u32 = 1 << 0;
+pub(crate) const CTX_CLEARTS: u32 = 1 << 1;
+pub(crate) const CTX_MSIESAVE: u32 = 1 << 2;
+pub(crate) const CTX_MTIESAVE: u32 = 1 << 3;
+pub(crate) const CTX_NOIRQ: u32 = 1 << 15;
 
 impl Xh3Irq {
     pub(crate) fn new() -> Self {
@@ -125,10 +125,7 @@ impl Xh3Irq {
     ///
     /// We return the winner's priority so the CSR write / entry path can
     /// populate `meicontext.preempt = priority + 1`.
-    pub(crate) fn arbitrate(
-        &self,
-        irq_pending: u64,
-    ) -> Option<(u8, u8)> {
+    pub(crate) fn arbitrate(&self, irq_pending: u64) -> Option<(u8, u8)> {
         let set = self.enabled_pending(irq_pending);
         if set == 0 {
             return None;
@@ -388,14 +385,14 @@ impl Xh3Irq {
     /// spec's supported nesting depth); HW always sets `mreteirq` on
     /// entry regardless of depth.
     pub(crate) fn on_ext_irq_entry(&mut self, irq: u8, priority: u8) {
-        let preempt_cur  = (self.meicontext >> 16) & 0xF;
+        let preempt_cur = (self.meicontext >> 16) & 0xF;
         let ppreempt_cur = (self.meicontext >> 24) & 0xF;
         // pppreempt <- ppreempt <- preempt; preempt <- priority+1.
         // Saturate at 0xF (max 4-bit preempt level). A previous
         // `.saturating_add(1) & 0xF` formulation wrapped 15→0 after the
         // mask, which allowed *any* IRQ to preempt the highest-priority
         // handler. `.min(0xF)` saturates correctly.
-        let new_preempt  = ((priority as u32) + 1).min(0xF);
+        let new_preempt = ((priority as u32) + 1).min(0xF);
         let new_ppreempt = preempt_cur;
         let new_pppreempt = ppreempt_cur;
         let mut c = self.meicontext;
@@ -435,7 +432,7 @@ impl Xh3Irq {
         if (self.meicontext & CTX_MRETEIRQ) == 0 {
             return;
         }
-        let ppreempt  = (self.meicontext >> 24) & 0xF;
+        let ppreempt = (self.meicontext >> 24) & 0xF;
         let pppreempt = (self.meicontext >> 28) & 0xF;
         let mut c = self.meicontext;
         c &= !(0xFu32 << 16);
@@ -615,13 +612,20 @@ mod tests {
         x.on_mret();
         assert_eq!((x.meicontext >> 16) & 0xF, 2, "preempt <- ppreempt");
         assert_eq!((x.meicontext >> 24) & 0xF, 0, "ppreempt <- pppreempt");
-        assert_eq!(x.meicontext & CTX_MRETEIRQ, CTX_MRETEIRQ,
-            "mreteirq stays asserted while depth > 0");
+        assert_eq!(
+            x.meicontext & CTX_MRETEIRQ,
+            CTX_MRETEIRQ,
+            "mreteirq stays asserted while depth > 0"
+        );
         assert_eq!(x.meicontext & CTX_NOIRQ, 0, "still in a handler");
         // Outer mret: depth 1 -> 0, clears mreteirq + sets noirq.
         x.on_mret();
         assert_eq!((x.meicontext >> 16) & 0xF, 0, "preempt fully popped");
-        assert_eq!(x.meicontext & CTX_MRETEIRQ, 0, "mreteirq cleared at depth 0");
+        assert_eq!(
+            x.meicontext & CTX_MRETEIRQ,
+            0,
+            "mreteirq cleared at depth 0"
+        );
         assert_eq!(x.meicontext & CTX_NOIRQ, CTX_NOIRQ);
     }
 

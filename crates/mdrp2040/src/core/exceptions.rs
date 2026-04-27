@@ -35,9 +35,9 @@ impl CortexM0Plus {
     #[inline]
     fn return_address(&self, exc_num: u16) -> u32 {
         match exc_num {
-            3 => self.current_instr_addr,     // HardFault — retry faulting instr
-            11 => self.regs.pc(),             // SVC — return after the SVC
-            _ => self.regs.pc(),              // async / NMI / PendSV / SysTick
+            3 => self.current_instr_addr, // HardFault — retry faulting instr
+            11 => self.regs.pc(),         // SVC — return after the SVC
+            _ => self.regs.pc(),          // async / NMI / PendSV / SysTick
         }
     }
 
@@ -74,7 +74,11 @@ impl CortexM0Plus {
         self.regs.sync_sp_to_banked();
 
         let use_psp = !self.regs.in_handler_mode() && self.regs.active_sp_is_psp();
-        let original_sp = if use_psp { self.regs.psp } else { self.regs.msp };
+        let original_sp = if use_psp {
+            self.regs.psp
+        } else {
+            self.regs.msp
+        };
 
         // 8-byte alignment: pre-decrement by 4 when SP is misaligned.
         let aligned_sp = original_sp & !0x7;
@@ -220,7 +224,11 @@ impl CortexM0Plus {
             return 0;
         }
 
-        let sp = if return_to_psp { self.regs.psp } else { self.regs.msp };
+        let sp = if return_to_psp {
+            self.regs.psp
+        } else {
+            self.regs.msp
+        };
 
         // Pop the 8-word frame.
         self.regs.r[0] = bus.read32(sp);
@@ -450,7 +458,11 @@ mod tests {
 
         cpu.step(&mut bus);
 
-        assert_eq!(cpu.regs.ipsr(), 16, "IRQ 0 (priority 0x40) wins over PendSV (0xC0)");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            16,
+            "IRQ 0 (priority 0x40) wins over PendSV (0xC0)"
+        );
         assert_eq!(cpu.regs.pc(), handlers[16]);
         assert!(
             !bus.nvics[0].is_pending(0),
@@ -477,7 +489,11 @@ mod tests {
 
         cpu.step(&mut bus);
 
-        assert_eq!(cpu.regs.ipsr(), 14, "tie-break by lower exception number → PendSV");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            14,
+            "tie-break by lower exception number → PendSV"
+        );
         assert_eq!(cpu.regs.pc(), handlers[14]);
         assert_eq!(bus.ppb[0].icsr & (1 << 28), 0, "PENDSVSET cleared");
         assert_ne!(

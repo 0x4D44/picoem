@@ -20,7 +20,7 @@
 //! [`StateMachine::enabled`]). Writes from outside the crate are not
 //! supported — reprogram via the PIO register bus instead.
 
-use super::decode::{decode, DecodedInsn, PioOp};
+use super::decode::{DecodedInsn, PioOp, decode};
 use super::fifo::PioFifo;
 
 /// One PIO state machine.
@@ -325,8 +325,7 @@ impl StateMachine {
                 // Diagnostic: bump stall-cycle counters. Pure observation.
                 self.stall_cycles = self.stall_cycles.wrapping_add(1);
                 if self.pc == 0x19 {
-                    self.cycles_stalled_at_pc_0x19 =
-                        self.cycles_stalled_at_pc_0x19.wrapping_add(1);
+                    self.cycles_stalled_at_pc_0x19 = self.cycles_stalled_at_pc_0x19.wrapping_add(1);
                 }
                 return;
             }
@@ -386,8 +385,7 @@ impl StateMachine {
             // counter includes both re-stalls and first-stalls.
             self.stall_cycles = self.stall_cycles.wrapping_add(1);
             if fetched_pc == 0x19 {
-                self.cycles_stalled_at_pc_0x19 =
-                    self.cycles_stalled_at_pc_0x19.wrapping_add(1);
+                self.cycles_stalled_at_pc_0x19 = self.cycles_stalled_at_pc_0x19.wrapping_add(1);
             }
         }
 
@@ -545,10 +543,12 @@ impl StateMachine {
         shared_pin_dirs: &mut u32,
     ) -> bool {
         match &decoded.op {
-            PioOp::Jmp { condition, address } => {
-                self.exec_jmp(*condition, *address, gpio_in)
-            }
-            PioOp::Wait { polarity, source, index } => {
+            PioOp::Jmp { condition, address } => self.exec_jmp(*condition, *address, gpio_in),
+            PioOp::Wait {
+                polarity,
+                source,
+                index,
+            } => {
                 self.exec_wait(*polarity, *source, *index, irq_flags, gpio_in);
                 false
             }
@@ -556,9 +556,10 @@ impl StateMachine {
                 self.exec_in(*source, *bit_count, gpio_in);
                 false
             }
-            PioOp::Out { destination, bit_count } => {
-                self.exec_out(*destination, *bit_count, shared_pin_values, shared_pin_dirs)
-            }
+            PioOp::Out {
+                destination,
+                bit_count,
+            } => self.exec_out(*destination, *bit_count, shared_pin_values, shared_pin_dirs),
             PioOp::Push { if_full, block } => {
                 self.exec_push(*if_full, *block);
                 false
@@ -567,16 +568,18 @@ impl StateMachine {
                 self.exec_pull(*if_empty, *block);
                 false
             }
-            PioOp::Mov { destination, op, source } => {
-                self.exec_mov(
-                    *destination,
-                    *op,
-                    *source,
-                    gpio_in,
-                    shared_pin_values,
-                    shared_pin_dirs,
-                )
-            }
+            PioOp::Mov {
+                destination,
+                op,
+                source,
+            } => self.exec_mov(
+                *destination,
+                *op,
+                *source,
+                gpio_in,
+                shared_pin_values,
+                shared_pin_dirs,
+            ),
             PioOp::Irq { clear, wait, index } => {
                 self.exec_irq(*clear, *wait, *index, irq_flags);
                 false
@@ -591,9 +594,10 @@ impl StateMachine {
     /// JMP instruction. Returns true if the jump was taken (PC was set).
     fn exec_jmp(&mut self, condition: u8, address: u8, gpio_in: u32) -> bool {
         let take_jump = match condition {
-            0 => true,                    // Always
-            1 => self.x == 0,            // !X
-            2 => {                        // X-- (jump+decrement iff X != 0)
+            0 => true,        // Always
+            1 => self.x == 0, // !X
+            2 => {
+                // X-- (jump+decrement iff X != 0)
                 // Datasheet §3.4.4: if X is already 0, the branch is
                 // not taken AND X remains 0. The decrement is part of
                 // the taken-jump action, not a mandatory side effect —
@@ -606,20 +610,23 @@ impl StateMachine {
                 }
                 was_nonzero
             }
-            3 => self.y == 0,            // !Y
-            4 => {                        // Y-- (jump+decrement iff Y != 0)
+            3 => self.y == 0, // !Y
+            4 => {
+                // Y-- (jump+decrement iff Y != 0)
                 let was_nonzero = self.y != 0;
                 if was_nonzero {
                     self.y = self.y.wrapping_sub(1);
                 }
                 was_nonzero
             }
-            5 => self.x != self.y,       // X!=Y
-            6 => {                        // PIN (JMP_PIN from EXECCTRL[28:24])
+            5 => self.x != self.y, // X!=Y
+            6 => {
+                // PIN (JMP_PIN from EXECCTRL[28:24])
                 let jmp_pin = (self.execctrl >> 24) & 0x1F;
                 (gpio_in >> jmp_pin) & 1 != 0
             }
-            7 => {                        // !OSRE (osr_count < pull_threshold)
+            7 => {
+                // !OSRE (osr_count < pull_threshold)
                 self.osr_count < self.pull_threshold()
             }
             _ => false,
@@ -716,21 +723,29 @@ impl StateMachine {
         let in_shiftdir_right = (self.shiftctrl >> 18) & 1 != 0;
 
         let src_val = match source {
-            0 => self.read_pins(gpio_in),  // PINS
-            1 => self.x,                    // X
-            2 => self.y,                    // Y
-            3 => 0,                         // NULL
-            6 => self.isr,                  // ISR
-            7 => self.osr,                  // OSR
-            _ => 0,                         // Reserved
+            0 => self.read_pins(gpio_in), // PINS
+            1 => self.x,                  // X
+            2 => self.y,                  // Y
+            3 => 0,                       // NULL
+            6 => self.isr,                // ISR
+            7 => self.osr,                // OSR
+            _ => 0,                       // Reserved
         };
 
         let bc = bit_count as u32;
-        let data = if bc >= 32 { src_val } else { src_val & ((1u32 << bc) - 1) };
+        let data = if bc >= 32 {
+            src_val
+        } else {
+            src_val & ((1u32 << bc) - 1)
+        };
 
         if in_shiftdir_right {
             // Shift right: new data goes into MSB side
-            if bc >= 32 { self.isr = 0; } else { self.isr >>= bc; }
+            if bc >= 32 {
+                self.isr = 0;
+            } else {
+                self.isr >>= bc;
+            }
             if bc < 32 {
                 self.isr |= data << (32 - bc);
             } else {
@@ -738,7 +753,11 @@ impl StateMachine {
             }
         } else {
             // Shift left: new data goes into LSB side
-            if bc >= 32 { self.isr = 0; } else { self.isr <<= bc; }
+            if bc >= 32 {
+                self.isr = 0;
+            } else {
+                self.isr <<= bc;
+            }
             self.isr |= data;
         }
 
@@ -791,13 +810,29 @@ impl StateMachine {
         // Extract data from OSR
         let data = if out_shiftdir_right {
             // Shift right: data comes from LSB side
-            let d = if bc >= 32 { self.osr } else { self.osr & ((1u32 << bc) - 1) };
-            if bc >= 32 { self.osr = 0; } else { self.osr >>= bc; }
+            let d = if bc >= 32 {
+                self.osr
+            } else {
+                self.osr & ((1u32 << bc) - 1)
+            };
+            if bc >= 32 {
+                self.osr = 0;
+            } else {
+                self.osr >>= bc;
+            }
             d
         } else {
             // Shift left: data comes from MSB side
-            let d = if bc >= 32 { self.osr } else { self.osr >> (32 - bc) };
-            if bc >= 32 { self.osr = 0; } else { self.osr <<= bc; }
+            let d = if bc >= 32 {
+                self.osr
+            } else {
+                self.osr >> (32 - bc)
+            };
+            if bc >= 32 {
+                self.osr = 0;
+            } else {
+                self.osr <<= bc;
+            }
             d
         };
 
@@ -813,9 +848,9 @@ impl StateMachine {
                 let count = out_count.min(bit_count);
                 Self::write_pin_field(shared_pin_values, data, out_base, count);
             }
-            1 => self.x = data,           // X
-            2 => self.y = data,           // Y
-            3 => {}                        // NULL (discard)
+            1 => self.x = data, // X
+            2 => self.y = data, // Y
+            3 => {}             // NULL (discard)
             4 => {
                 // PINDIRS — writes shared direction latch
                 let out_base = (self.pinctrl & 0x1F) as u8;
@@ -896,7 +931,8 @@ impl StateMachine {
     ) -> bool {
         // Read source
         let mut val = match source {
-            0 => {                          // PINS — RP2350 masks by IN_COUNT
+            0 => {
+                // PINS — RP2350 masks by IN_COUNT
                 let raw = self.read_pins(gpio_in);
                 let in_count = (self.shiftctrl & 0x1F) as u32;
                 if in_count == 0 || in_count >= 32 {
@@ -905,10 +941,11 @@ impl StateMachine {
                     raw & ((1u32 << in_count) - 1)
                 }
             }
-            1 => self.x,                    // X
-            2 => self.y,                    // Y
-            3 => 0,                         // NULL
-            5 => {                          // STATUS
+            1 => self.x, // X
+            2 => self.y, // Y
+            3 => 0,      // NULL
+            5 => {
+                // STATUS
                 let status_sel = (self.execctrl >> 4) & 1 != 0;
                 let status_n = (self.execctrl & 0xF) as u8;
                 let level = if status_sel {
@@ -918,17 +955,17 @@ impl StateMachine {
                 };
                 if level < status_n { u32::MAX } else { 0 }
             }
-            6 => self.isr,                  // ISR
-            7 => self.osr,                  // OSR
-            _ => 0,                         // Reserved
+            6 => self.isr, // ISR
+            7 => self.osr, // OSR
+            _ => 0,        // Reserved
         };
 
         // Apply operation
         val = match op {
-            0 => val,                       // None
-            1 => !val,                      // Invert
-            2 => val.reverse_bits(),        // Bit-reverse
-            _ => val,                       // Reserved
+            0 => val,                // None
+            1 => !val,               // Invert
+            2 => val.reverse_bits(), // Bit-reverse
+            _ => val,                // Reserved
         };
 
         // Write destination
@@ -994,8 +1031,8 @@ impl StateMachine {
                 let set_count = ((self.pinctrl >> 26) & 0x7) as u8;
                 Self::write_pin_field(shared_pin_values, data as u32, set_base, set_count);
             }
-            1 => self.x = data as u32,           // X (zero-extend)
-            2 => self.y = data as u32,           // Y (zero-extend)
+            1 => self.x = data as u32, // X (zero-extend)
+            2 => self.y = data as u32, // Y (zero-extend)
             4 => {
                 // PINDIRS (set_base-relative, up to SET_COUNT) — writes shared direction latch
                 let set_base = ((self.pinctrl >> 5) & 0x1F) as u8;
@@ -1200,7 +1237,10 @@ mod tests {
         assert_eq!(sm.x, 0, "X must stay 0 (no wrap to 0xFFFFFFFF)");
         assert_eq!(sm.pc, 1, "PC must advance past the JMP, not jump to 5");
         assert_eq!(sm.pc_visits[0], 1);
-        assert_eq!(sm.pc_visits[5], 0, "target slot 5 must not have been visited");
+        assert_eq!(
+            sm.pc_visits[5], 0,
+            "target slot 5 must not have been visited"
+        );
     }
 
     // ====================================================================
@@ -1962,7 +2002,10 @@ mod tests {
         let mut dirs = 0u32;
         let pc_set = sm.exec_out(3, 8, &mut pins, &mut dirs); // OUT NULL, 8
         assert!(!pc_set);
-        assert!(!sm.stalled, "osr_count below threshold — no autopull refill");
+        assert!(
+            !sm.stalled,
+            "osr_count below threshold — no autopull refill"
+        );
         // OSR must still hold its pre-OUT value shifted, not 0xBEEF_CAFE.
         // Default shift-direction (right, bit 19 unaltered from above):
         // we set shiftctrl=1<<17 only, so bit 19 is 0 → shift LEFT here;

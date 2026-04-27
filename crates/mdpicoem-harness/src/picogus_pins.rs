@@ -86,13 +86,11 @@ pub const I2S_LRCLK: u8 = 18;
 // ---------------------------------------------------------------------------
 
 /// Bitmask covering IOW#, IOR#, and the 10-bit AD bus.
-pub const ISA_EXTERNAL_PIN_MASK: u32 = (1u32 << ISA_IOW)
-    | (1u32 << ISA_IOR)
-    | (((1u32 << ISA_AD_COUNT) - 1) << ISA_AD0);
+pub const ISA_EXTERNAL_PIN_MASK: u32 =
+    (1u32 << ISA_IOW) | (1u32 << ISA_IOR) | (((1u32 << ISA_AD_COUNT) - 1) << ISA_AD0);
 
 /// Bitmask covering the three I2S pins (DOUT + BCLK + LRCLK).
-pub const I2S_PIN_MASK: u32 =
-    (1u32 << I2S_DOUT) | (1u32 << I2S_BCLK) | (1u32 << I2S_LRCLK);
+pub const I2S_PIN_MASK: u32 = (1u32 << I2S_DOUT) | (1u32 << I2S_BCLK) | (1u32 << I2S_LRCLK);
 
 #[cfg(test)]
 mod tests {

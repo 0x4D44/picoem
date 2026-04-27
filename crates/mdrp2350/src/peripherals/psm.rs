@@ -45,7 +45,11 @@ pub struct Psm {
 
 impl Psm {
     pub fn new() -> Self {
-        Self { frce_on: 0, frce_off: 0, wdsel: 0 }
+        Self {
+            frce_on: 0,
+            frce_off: 0,
+            wdsel: 0,
+        }
     }
 
     /// Read a word. `DONE` mirrors `FRCE_ON` (instant handshake).

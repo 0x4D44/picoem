@@ -582,7 +582,10 @@ mod tests {
         p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1, 0, &mut irqs);
         p.tick(64, &default_tree(), &mut irqs);
-        assert_eq!(p.slices[0].ctr, 20, "DIV=0x33: 64 clks / 3.1875 = 20 advances");
+        assert_eq!(
+            p.slices[0].ctr, 20,
+            "DIV=0x33: 64 clks / 3.1875 = 20 advances"
+        );
         assert_eq!(p.slices[0].frac_accum, 4, "residue 1024 % 51 = 4");
     }
 
@@ -608,7 +611,10 @@ mod tests {
         assert_eq!(p.slices[0].frac_accum, 0, "reprogram must clear frac_accum");
         // One tick: (0+16)/16 = 1; stale (19+16)/16 = 2 → detects the bug.
         p.tick(1, &default_tree(), &mut irqs);
-        assert_eq!(p.slices[0].ctr, 16, "one tick at divisor 1.0 must advance by 1");
+        assert_eq!(
+            p.slices[0].ctr, 16,
+            "one tick at divisor 1.0 must advance by 1"
+        );
     }
 
     // Silicon oracle scenario S_PWM_FRACTIONAL_DIV: TOP=0xFFFF, DIV=0x0020
@@ -625,7 +631,10 @@ mod tests {
         p.write32(SLICE_CSR, CSR_EN, 0, &mut irqs);
         p.write32(EN, 1, 0, &mut irqs);
         p.tick(200, &default_tree(), &mut irqs);
-        assert_eq!(p.slices[0].ctr, 100, "divisor 2.0: CTR should be 200/2 = 100");
+        assert_eq!(
+            p.slices[0].ctr, 100,
+            "divisor 2.0: CTR should be 200/2 = 100"
+        );
     }
 
     // Per-cycle dispatch companion to the bulk-tick test above. Pinned for
@@ -657,8 +666,8 @@ mod tests {
     // --- Inert-register warn-once (HLD V5 §4.A2 site 5) ----------------
 
     use std::sync::{Arc, Mutex};
-    use tracing::{Event, Metadata, Subscriber};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     #[derive(Default)]
     struct CaptureSubscriber {
@@ -677,8 +686,12 @@ mod tests {
     }
 
     impl Subscriber for CaptureSubscriber {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool { true }
-        fn new_span(&self, _span: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
         fn record(&self, _span: &Id, _values: &Record<'_>) {}
         fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
         fn event(&self, event: &Event<'_>) {
@@ -703,7 +716,9 @@ mod tests {
     #[test]
     fn dma_enable_warn_fires_once_per_slice() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = CaptureSubscriber { events: captured.clone() };
+        let subscriber = CaptureSubscriber {
+            events: captured.clone(),
+        };
         tracing::subscriber::with_default(subscriber, || {
             let mut p = new_pwm();
             // Two enable calls on slice 5 — one warn.

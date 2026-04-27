@@ -20,12 +20,16 @@ fn prepare_emu() -> Emulator {
     emu.reset();
 
     let initial_sp = u32::from_le_bytes([
-        HELLO_PWM_BIN[0], HELLO_PWM_BIN[1],
-        HELLO_PWM_BIN[2], HELLO_PWM_BIN[3],
+        HELLO_PWM_BIN[0],
+        HELLO_PWM_BIN[1],
+        HELLO_PWM_BIN[2],
+        HELLO_PWM_BIN[3],
     ]);
     let reset_vector = u32::from_le_bytes([
-        HELLO_PWM_BIN[4], HELLO_PWM_BIN[5],
-        HELLO_PWM_BIN[6], HELLO_PWM_BIN[7],
+        HELLO_PWM_BIN[4],
+        HELLO_PWM_BIN[5],
+        HELLO_PWM_BIN[6],
+        HELLO_PWM_BIN[7],
     ]);
     {
         let arm = emu.cores.expect_arm_mut();

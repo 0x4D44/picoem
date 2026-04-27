@@ -17,8 +17,8 @@ mod bus_integration {
     const PIN_SCK: u8 = 2;
     const PIN_MOSI: u8 = 3;
 
+    use crate::{Config, Emulator, EmulatorBuilder};
     use mdpicoem_devices::Psram;
-    use crate::{Config, EmulatorBuilder, Emulator};
 
     /// Drive the PSRAM's CS/SCK/MOSI pins by poking SIO directly, then
     /// call update_gpio() so the PSRAM observes the change.
@@ -60,7 +60,8 @@ mod bus_integration {
     fn bus_hook_write_round_trip() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build().expect("Serial build is infallible");
+            .build()
+            .expect("Serial build is infallible");
         // Idle: CS high.
         drive_pins(&mut emu, true, false, false);
 
@@ -81,7 +82,8 @@ mod bus_integration {
     fn bus_hook_miso_drives_gpio_in_bit_zero() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build().expect("Serial build is infallible");
+            .build()
+            .expect("Serial build is infallible");
         // Seed the buffer so read returns a known non-zero byte.
         emu.bus.psram.as_mut().unwrap().buffer[0x00] = 0xFF; // all 1s — every MISO bit is 1
 
@@ -97,8 +99,10 @@ mod bus_integration {
         let got = clock_byte_via_bus(&mut emu, 0x00);
         drive_pins(&mut emu, true, false, false);
 
-        assert_eq!(got, 0xFF,
-            "PSRAM must drive GPIO0 (MISO) high for each '1' bit in the read byte");
+        assert_eq!(
+            got, 0xFF,
+            "PSRAM must drive GPIO0 (MISO) high for each '1' bit in the read byte"
+        );
     }
 
     #[test]
@@ -111,7 +115,8 @@ mod bus_integration {
         // wins.
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build().expect("Serial build is infallible");
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.psram.as_mut().unwrap().buffer[0x00] = 0xAA;
 
         // PIO1 drives a different pin (not GPIO0) — ensure no collision.
@@ -135,7 +140,8 @@ mod bus_integration {
     fn bus_hook_reset_clears_psram_state() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .psram(Psram::picogus())
-            .build().expect("Serial build is infallible");
+            .build()
+            .expect("Serial build is infallible");
         // Get the PSRAM into a non-idle state.
         drive_pins(&mut emu, true, false, false);
         drive_pins(&mut emu, false, false, false);
@@ -143,14 +149,15 @@ mod bus_integration {
         // Leave the frame in-progress (no CS rise yet).
 
         // Seed a reset vector so reset() can run.
-        emu.bus.memory.load_rom(&[
-            0x00, 0x00, 0x03, 0x20,
-            0x01, 0x00, 0x00, 0x20,
-        ]);
+        emu.bus
+            .memory
+            .load_rom(&[0x00, 0x00, 0x03, 0x20, 0x01, 0x00, 0x00, 0x20]);
         emu.reset();
 
         // After reset, PSRAM state machine must be idle again.
-        assert!(emu.bus.psram.as_ref().unwrap().phase_is_idle(),
-            "Emulator::reset() must propagate to psram.reset_state()");
+        assert!(
+            emu.bus.psram.as_ref().unwrap().phase_is_idle(),
+            "Emulator::reset() must propagate to psram.reset_state()"
+        );
     }
 }

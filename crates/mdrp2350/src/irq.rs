@@ -268,7 +268,10 @@ mod tests {
         for &irq in CORE_LOCAL_IRQS {
             assert!(irq < IRQ_COUNT, "core-local IRQ {irq} out of range");
             // Core-local IRQs are peripheral-driven, not software-only.
-            assert!(irq < PERIPH_IRQ_COUNT, "core-local IRQ {irq} above peripheral range");
+            assert!(
+                irq < PERIPH_IRQ_COUNT,
+                "core-local IRQ {irq} above peripheral range"
+            );
         }
     }
 }

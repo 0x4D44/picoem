@@ -604,8 +604,11 @@ mod tests {
         // Writing OVERF bits to CTRL_LANE1 should not stick.
         interp.write(0x30, 0x03FF_FFFF, 0);
         let read = interp.read(0x30, false);
-        assert_eq!(read & 0x0380_0000, 0,
-            "CTRL_LANE1 OVERF region must read as 0");
+        assert_eq!(
+            read & 0x0380_0000,
+            0,
+            "CTRL_LANE1 OVERF region must read as 0"
+        );
     }
 
     #[test]
@@ -629,8 +632,10 @@ mod tests {
         let mut interp = Interp::new();
         // Seed OVERF0 and OVERF1 directly.
         interp.ctrl_lane[0] |= CTRL_OVERF0 | CTRL_OVERF1;
-        assert_eq!(interp.read(0x2C, false) & CTRL_OVERF_MASK,
-            CTRL_OVERF0 | CTRL_OVERF1);
+        assert_eq!(
+            interp.read(0x2C, false) & CTRL_OVERF_MASK,
+            CTRL_OVERF0 | CTRL_OVERF1
+        );
         // Write 1 to OVERF0 only — clears it, leaves OVERF1.
         interp.write(0x2C, CTRL_OVERF0, 0);
         assert_eq!(interp.read(0x2C, false) & CTRL_OVERF_MASK, CTRL_OVERF1);

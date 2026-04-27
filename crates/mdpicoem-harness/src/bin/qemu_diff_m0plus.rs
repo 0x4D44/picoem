@@ -28,11 +28,11 @@ use std::time::Duration;
 use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile};
 use mdpicoem_harness::m0plus::{Bus as M0Bus, CortexM0Plus};
 use mdpicoem_harness::{
-    compare, generate_all, generate_fuzz_classes, select_fuzz_class, setup_reg,
-    CompareBases, FuzzClass, RunState, TestCase, EMU_M0PLUS_TEST_SCRATCH,
-    EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK, MASK_ALL_FLAGS, MASK_NZ_ONLY,
-    QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT, QEMU_M0PLUS_TEST_STACK,
-    QEMU_M0PLUS_VECTOR_TABLE_BASE, REG_LR, REG_PC, REG_SP, REG_XPSR, SCRATCH_SIZE,
+    CompareBases, EMU_M0PLUS_TEST_SCRATCH, EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK, FuzzClass,
+    MASK_ALL_FLAGS, MASK_NZ_ONLY, QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT,
+    QEMU_M0PLUS_TEST_STACK, QEMU_M0PLUS_VECTOR_TABLE_BASE, REG_LR, REG_PC, REG_SP, REG_XPSR,
+    RunState, SCRATCH_SIZE, TestCase, compare, generate_all, generate_fuzz_classes,
+    select_fuzz_class, setup_reg,
 };
 
 /// BKPT #0 instruction (little-endian bytes).
@@ -194,12 +194,13 @@ fn run_fuzz(
     seed: u64,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("M0+ fuzz mode: {count_per_class} tests/class, seed={seed}");
-    println!(
-        "(reproduce with: qemu_diff_m0plus --fuzz {count_per_class} --seed {seed})"
-    );
+    println!("(reproduce with: qemu_diff_m0plus --fuzz {count_per_class} --seed {seed})");
 
     // We only ever care about the Base class on M0+ — no FPU, no DSP.
-    let buckets = select_fuzz_class(generate_fuzz_classes(count_per_class, seed), FuzzClass::Base);
+    let buckets = select_fuzz_class(
+        generate_fuzz_classes(count_per_class, seed),
+        FuzzClass::Base,
+    );
     let alu: Vec<TestCase> = buckets
         .base_alu
         .into_iter()
@@ -258,9 +259,7 @@ fn run_fuzz(
     println!("Passed: {pass}");
     println!("Failed: {fail}");
     if fail > 0 {
-        println!(
-            "\nReproduce: qemu_diff_m0plus --fuzz {count_per_class} --seed {seed}"
-        );
+        println!("\nReproduce: qemu_diff_m0plus --fuzz {count_per_class} --seed {seed}");
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
@@ -319,11 +318,7 @@ fn is_m0plus_safe(tc: &TestCase) -> bool {
 // Per-test execution
 // ============================================================================
 
-fn run_one_test(
-    gdb: &mut GdbClient,
-    bus: &mut M0Bus,
-    tc: &TestCase,
-) -> Result<(), String> {
+fn run_one_test(gdb: &mut GdbClient, bus: &mut M0Bus, tc: &TestCase) -> Result<(), String> {
     let qemu_state = run_qemu_side(gdb, tc).map_err(|e| format!("QEMU error: {e}"))?;
     let emu_state = run_emu_side(tc, bus);
     compare(tc, &qemu_state, &emu_state, &CompareBases::M0PLUS_RP2040)
@@ -382,7 +377,8 @@ fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState
         .mem_check
         .iter()
         .map(|&off| {
-            gdb.read_mem(QEMU_M0PLUS_TEST_SCRATCH + off, 1).map(|b| b[0])
+            gdb.read_mem(QEMU_M0PLUS_TEST_SCRATCH + off, 1)
+                .map(|b| b[0])
         })
         .collect::<std::io::Result<Vec<u8>>>()?;
 

@@ -11,12 +11,11 @@
 //   silicon_cycle_oracle_rp2350 -- --iter-low 51 --iter-high 151
 //   silicon_cycle_oracle_rp2350 -- --tolerance 1
 
-use mdpicoem_harness::cycle_cases::{
-    self, run_cycle_case, CycleArgs, CycleCase, CASES, CYCLE_SEQ_SLOT, DWT_CYCCNT_ADDR,
-    STUB_START,
-};
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, select_by_name, Verdict};
 use mdpicoem_harness::CYCLE_MAILBOX_BASE;
+use mdpicoem_harness::cycle_cases::{
+    self, CASES, CYCLE_SEQ_SLOT, CycleArgs, CycleCase, DWT_CYCCNT_ADDR, STUB_START, run_cycle_case,
+};
+use mdpicoem_harness::silicon_oracle::{Verdict, enable_cyccnt, select_by_name};
 use probe_rs::{MemoryInterface, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
@@ -130,7 +129,9 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     );
     println!(
         "selected {} case(s) ({} skipped by filter, {} skipped by exclude)",
-        selected.len(), skipped_filter, skipped_exclude,
+        selected.len(),
+        skipped_filter,
+        skipped_exclude,
     );
     println!();
 
@@ -174,7 +175,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut fail = 0usize;
     let t0 = Instant::now();
     for case in &selected {
-        let r = run_cycle_case(&mut core, case, args.iter_low, args.iter_high, args.tolerance)?;
+        let r = run_cycle_case(
+            &mut core,
+            case,
+            args.iter_low,
+            args.iter_high,
+            args.tolerance,
+        )?;
         total += 1;
         match r.verdict {
             Verdict::Pass => pass += 1,
@@ -185,7 +192,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         // tol=<N>)`. The full hw/emu/delta columns are still emitted
         // above so any drift remains visible.
         let verdict_str = if r.known_delta_pass {
-            format!("PASS (known Δ={:+}, tol={})", r.delta, r.effective_tolerance)
+            format!(
+                "PASS (known Δ={:+}, tol={})",
+                r.delta, r.effective_tolerance
+            )
         } else {
             r.verdict.as_str().to_string()
         };

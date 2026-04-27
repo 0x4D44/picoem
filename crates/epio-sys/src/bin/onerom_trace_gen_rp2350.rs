@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use epio_sys::shim::{
-    trace_gen_ctx, trace_gen_dump_instr_mem, trace_gen_dump_sm_reg, trace_gen_free,
-    trace_gen_init, trace_gen_step,
+    trace_gen_ctx, trace_gen_dump_instr_mem, trace_gen_dump_sm_reg, trace_gen_free, trace_gen_init,
+    trace_gen_step,
 };
 
 const SCENARIO_NAME: &str = "onerom_2364_single_byte";
@@ -230,4 +230,3 @@ fn main() -> ExitCode {
         }
     }
 }
-

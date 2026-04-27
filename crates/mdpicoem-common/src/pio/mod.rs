@@ -481,8 +481,7 @@ impl PioBlock {
             }
         }
         if (cur >> 3) & 1 != 0 {
-            self.pad_out_mosi_writes_of_1 =
-                self.pad_out_mosi_writes_of_1.wrapping_add(1);
+            self.pad_out_mosi_writes_of_1 = self.pad_out_mosi_writes_of_1.wrapping_add(1);
         }
         self.prev_pad_out_diag = cur;
     }
@@ -607,13 +606,13 @@ impl PioBlock {
             // FDEBUG: W1C (or alias)
             0x008 => {
                 let mask = match alias {
-                    0 | 3 => val,  // normal write and CLR both clear bits
-                    1 => val,      // XOR
-                    2 => val,      // SET
+                    0 | 3 => val, // normal write and CLR both clear bits
+                    1 => val,     // XOR
+                    2 => val,     // SET
                     _ => return,
                 };
                 match alias {
-                    0 => self.fdebug &= !mask,  // W1C: writing 1 clears
+                    0 => self.fdebug &= !mask, // W1C: writing 1 clears
                     1 => self.fdebug ^= mask,
                     2 => self.fdebug |= mask,
                     3 => self.fdebug &= !mask,
@@ -699,7 +698,7 @@ impl PioBlock {
             // IRQ: W1C (or alias)
             0x030 => {
                 match alias {
-                    0 => self.irq_flags &= !(val as u8),  // W1C
+                    0 => self.irq_flags &= !(val as u8), // W1C
                     1 => self.irq_flags ^= val as u8,
                     2 => self.irq_flags |= val as u8,
                     3 => self.irq_flags &= !(val as u8),
@@ -711,7 +710,9 @@ impl PioBlock {
                 self.irq_flags |= val as u8;
             }
             // INPUT_SYNC_BYPASS
-            0x038 => { self.input_sync_bypass = val; }
+            0x038 => {
+                self.input_sync_bypass = val;
+            }
             // DBG_PADOUT, DBG_PADOE, DBG_CFGINFO: read-only
             0x03C..=0x044 => {}
             // INSTR_MEM0-31
@@ -886,10 +887,7 @@ impl PioBlock {
     /// `write32` to set `sm[i].pinctrl` directly must call this
     /// themselves before stepping if they expect side-set behaviour.
     pub fn recompute_any_sideset(&mut self) {
-        self.any_sideset_programmed = self
-            .sm
-            .iter()
-            .any(|s| ((s.pinctrl >> 29) & 7) != 0);
+        self.any_sideset_programmed = self.sm.iter().any(|s| ((s.pinctrl >> 29) & 7) != 0);
     }
 
     /// Apply APB alias semantics to a stored register field.
@@ -1005,11 +1003,18 @@ mod tests {
     fn test_sm_reset_values() {
         let sm = StateMachine::new();
         assert_eq!(sm.execctrl, 0x0001_F000, "EXECCTRL reset: wrap_top=31");
-        assert_eq!(sm.shiftctrl, 0x000C_0000, "SHIFTCTRL reset: thresholds=0 (32)");
+        assert_eq!(
+            sm.shiftctrl, 0x000C_0000,
+            "SHIFTCTRL reset: thresholds=0 (32)"
+        );
         assert_eq!(sm.pinctrl, 0x1400_0000, "PINCTRL reset: SET_COUNT=5");
         assert_eq!(sm.clkdiv_int, 1, "CLKDIV int reset: 1");
         assert_eq!(sm.clkdiv_frac, 0, "CLKDIV frac reset: 0");
-        assert_eq!(sm.read_clkdiv(), 0x0001_0000, "CLKDIV register: 0x0001_0000");
+        assert_eq!(
+            sm.read_clkdiv(),
+            0x0001_0000,
+            "CLKDIV register: 0x0001_0000"
+        );
     }
 
     #[test]
@@ -1029,7 +1034,11 @@ mod tests {
         let read_back = pio.read32(0x0CC);
         // Bit 31 is EXEC_STALLED (read-only), reflects sm.stalled || delay > 0
         // SM is not stalled and delay_count=0, so bit 31 should be 0
-        assert_eq!(read_back & 0x8000_0000, 0, "bit 31 is read-only EXEC_STALLED");
+        assert_eq!(
+            read_back & 0x8000_0000,
+            0,
+            "bit 31 is read-only EXEC_STALLED"
+        );
         assert_eq!(read_back & 0x7FFF_FFFF, 0x7FFF_FFFF, "bits 30:0 roundtrip");
     }
 
@@ -1294,7 +1303,10 @@ mod tests {
         assert!(!pio.sm[0].enabled);
         assert_eq!(pio.sm[0].pc, 0);
         assert_eq!(pio.sm[0].x, 0);
-        assert_eq!(pio.sm[0].execctrl, 0x0001_F000, "reset restores default EXECCTRL");
+        assert_eq!(
+            pio.sm[0].execctrl, 0x0001_F000,
+            "reset restores default EXECCTRL"
+        );
         assert!(pio.sm[1].tx_fifo.is_empty());
         assert_eq!(pio.instr_mem[5], 0);
         assert_eq!(pio.irq_flags, 0);
@@ -1374,8 +1386,11 @@ mod tests {
         let mut pio = PioBlock::new();
 
         // 0x134 must NOT be IRQ0_INTS — it is RXF0_PUTGET3 (unmodeled → 0).
-        assert_eq!(pio.read32(0x134), 0,
-            "0x134 is RXF0_PUTGET3 on RP2350, must return 0");
+        assert_eq!(
+            pio.read32(0x134),
+            0,
+            "0x134 is RXF0_PUTGET3 on RP2350, must return 0"
+        );
 
         // Inject IRQ flag 0 via the IRQ_FORCE register (offset 0x034).
         pio.write32(0x034, 0x01, 0);
@@ -1383,10 +1398,16 @@ mod tests {
 
         // INTR at 0x16C must expose IRQ flag 0 at bit 8 (not bit 0).
         let intr = pio.read32(0x16C);
-        assert_ne!(intr & (1 << 8), 0,
-            "INTR at 0x16C: SM0 IRQ flag 0 must appear at bit 8");
-        assert_eq!(intr & 0x1, 0,
-            "INTR at 0x16C: bit 0 (SM0_RXNEMPTY) must be 0 when RX FIFO empty");
+        assert_ne!(
+            intr & (1 << 8),
+            0,
+            "INTR at 0x16C: SM0 IRQ flag 0 must appear at bit 8"
+        );
+        assert_eq!(
+            intr & 0x1,
+            0,
+            "INTR at 0x16C: bit 0 (SM0_RXNEMPTY) must be 0 when RX FIFO empty"
+        );
 
         // IRQ0_INTE at 0x170: write 0x100 (bit 8 = SM0/IRQ flag 0).
         pio.write32(0x170, 0x100, 0);
@@ -1394,14 +1415,20 @@ mod tests {
 
         // IRQ0_INTS at 0x178: (INTR & INTE) | INTF — must return 0x100.
         let ints = pio.read32(0x178);
-        assert_ne!(ints & 0x100, 0,
-            "IRQ0_INTS at 0x178 must show SM0 IRQ flag (bit 8) when INTE bit 8 set");
+        assert_ne!(
+            ints & 0x100,
+            0,
+            "IRQ0_INTS at 0x178 must show SM0 IRQ flag (bit 8) when INTE bit 8 set"
+        );
 
         // IRQ1_INTE at 0x17C: bit 9 (SM1/IRQ flag 1), SM0 never set it.
         pio.write32(0x17C, 0x200, 0);
-        let ints1 = pio.read32(0x184);  // IRQ1_INTS
-        assert_eq!(ints1 & 0x200, 0,
-            "IRQ1_INTS must be 0: SM0 never set IRQ flag 1");
+        let ints1 = pio.read32(0x184); // IRQ1_INTS
+        assert_eq!(
+            ints1 & 0x200,
+            0,
+            "IRQ1_INTS must be 0: SM0 never set IRQ flag 1"
+        );
     }
 
     /// RP2040 INTR bit layout: IRQ flags at [3:0], RXNEMPTY at [7:4],
@@ -1413,10 +1440,16 @@ mod tests {
         pio.write32(0x034, 0x01, 0);
         assert_eq!(pio.irq_flags, 0x01, "irq_flags bit 0 must be set");
         let intr = pio.raw_intr_rp2040();
-        assert_eq!(intr & 0x001, 0x001,
-            "raw_intr_rp2040: IRQ flag 0 must appear at bit 0 (RP2040 ds Table 358)");
-        assert_eq!(intr >> 12, 0,
-            "raw_intr_rp2040: bits [31:12] must be zero (12-bit register)");
+        assert_eq!(
+            intr & 0x001,
+            0x001,
+            "raw_intr_rp2040: IRQ flag 0 must appear at bit 0 (RP2040 ds Table 358)"
+        );
+        assert_eq!(
+            intr >> 12,
+            0,
+            "raw_intr_rp2040: bits [31:12] must be zero (12-bit register)"
+        );
     }
 
     /// RP2350 INTR bit layout: IRQ flags at [15:8], TXNFULL at [7:4],
@@ -1428,10 +1461,16 @@ mod tests {
         pio.write32(0x034, 0x01, 0);
         assert_eq!(pio.irq_flags, 0x01, "irq_flags bit 0 must be set");
         let intr = pio.raw_intr_rp2350();
-        assert_ne!(intr & 0x100, 0,
-            "raw_intr_rp2350: IRQ flag 0 must appear at bit 8 (RP2350 ds Table 1018)");
-        assert_eq!(intr & 0x001, 0,
-            "raw_intr_rp2350: bit 0 (SM0_RXNEMPTY) must be 0 when RX FIFO empty");
+        assert_ne!(
+            intr & 0x100,
+            0,
+            "raw_intr_rp2350: IRQ flag 0 must appear at bit 8 (RP2350 ds Table 1018)"
+        );
+        assert_eq!(
+            intr & 0x001,
+            0,
+            "raw_intr_rp2350: bit 0 (SM0_RXNEMPTY) must be 0 when RX FIFO empty"
+        );
     }
 
     // ---- Stage B: Clock divider tests ----
@@ -1504,7 +1543,7 @@ mod tests {
 
     #[test]
     fn test_decode_jmp() {
-        use super::decode::{decode, PioOp};
+        use super::decode::{PioOp, decode};
         // JMP always to addr 5: opcode=000, delay/ss=00000, cond=000, addr=00101
         // insn = 0b000_00000_000_00101 = 0x0005
         let d = decode(0x0005, 0x1400_0000, 0x0001_F000);
@@ -1521,7 +1560,7 @@ mod tests {
 
     #[test]
     fn test_decode_set() {
-        use super::decode::{decode, PioOp};
+        use super::decode::{PioOp, decode};
         // SET PINS 0x1F: opcode=111, delay/ss=00000, dest=000, data=11111
         // insn = 0b111_00000_000_11111 = 0xE01F
         let d = decode(0xE01F, 0x1400_0000, 0x0001_F000);
@@ -1537,7 +1576,7 @@ mod tests {
 
     #[test]
     fn test_decode_sideset_delay_split() {
-        use super::decode::{decode, PioOp};
+        use super::decode::{PioOp, decode};
         // PINCTRL with sideset_count=2 (bits[31:29]=010)
         let pinctrl = 0x1400_0000 | (2u32 << 29);
         // SET X, 5 with sideset_val=3, delay=6
@@ -1720,7 +1759,10 @@ mod tests {
         pio.sm[0].tx_fifo.push(42);
         step_n(&mut pio, 1, 0); // Re-evaluate: FIFO not empty => unstall, re-execute PULL
         assert!(!pio.sm[0].stalled);
-        assert_eq!(pio.sm[0].osr, 42, "PULL transferred data from TX FIFO to OSR");
+        assert_eq!(
+            pio.sm[0].osr, 42,
+            "PULL transferred data from TX FIFO to OSR"
+        );
         assert_eq!(pio.sm[0].pc, 1, "PC advanced after unstall");
 
         step_n(&mut pio, 1, 0); // Execute SET X, 5 (at addr 1)
@@ -1809,7 +1851,11 @@ mod tests {
         pio.sm[2].pc = 0;
         pio.irq_flags = 0;
         step_n(&mut pio, 1, 0); // SM2 executes IRQ set rel 0
-        assert_eq!(pio.irq_flags & (1 << 2), 1 << 2, "IRQ flag 2 set (rel 0 from SM2)");
+        assert_eq!(
+            pio.irq_flags & (1 << 2),
+            1 << 2,
+            "IRQ flag 2 set (rel 0 from SM2)"
+        );
     }
 
     #[test]
@@ -1895,8 +1941,11 @@ mod tests {
         step_n(&mut pio, 1, 0);
         assert!(pio.sm[0].stalled, "SM stalls on empty PULL");
         // Side-set=1 at sideset_base=3: pin 3 should be set
-        assert_eq!(pio.sm[0].sideset_pins & (1 << 3), 1 << 3,
-            "side-set applied even on stalling instruction");
+        assert_eq!(
+            pio.sm[0].sideset_pins & (1 << 3),
+            1 << 3,
+            "side-set applied even on stalling instruction"
+        );
     }
 
     // ---- Stage C: Autopush tests ----
@@ -1969,7 +2018,11 @@ mod tests {
         // Even after 32 bits shifted in, no auto-push.
         let mut pio = make_pio_with_program(&[0xE02F, 0x4028, 0x4028, 0x4028, 0x4028]);
         // Verify autopush is disabled by default
-        assert_eq!(pio.sm[0].shiftctrl & (1 << 16), 0, "autopush disabled by default");
+        assert_eq!(
+            pio.sm[0].shiftctrl & (1 << 16),
+            0,
+            "autopush disabled by default"
+        );
         // Set IN_SHIFTDIR=0 (left)
         pio.sm[0].shiftctrl &= !(1 << 18);
 
@@ -1979,7 +2032,10 @@ mod tests {
         }
         // isr_count saturates at 32
         assert_eq!(pio.sm[0].isr_count, 32);
-        assert!(pio.sm[0].rx_fifo.is_empty(), "no autopush with default shiftctrl");
+        assert!(
+            pio.sm[0].rx_fifo.is_empty(),
+            "no autopush with default shiftctrl"
+        );
     }
 
     // ---- Stage C: Autopull tests ----
@@ -2004,7 +2060,10 @@ mod tests {
         assert!(!pio.sm[0].stalled, "should not stall — FIFO had data");
         // Autopull loaded 0x0000_ABCD into OSR, then OUT shifted 8 bits out.
         // Default shiftctrl bit 19 = 1 (shift right), so bottom 8 bits = 0xCD shifted out.
-        assert_eq!(pio.sm[0].osr_count, 8, "8 bits shifted out after autopull refill");
+        assert_eq!(
+            pio.sm[0].osr_count, 8,
+            "8 bits shifted out after autopull refill"
+        );
         // The remaining OSR should be 0x0000_ABCD >> 8 = 0x0000_00AB
         assert_eq!(pio.sm[0].osr, 0x0000_00AB);
         // out_pins bottom 8 bits should be 0xCD
@@ -2024,7 +2083,10 @@ mod tests {
         pio.sm[0].osr_count = 32;
 
         step_n(&mut pio, 1, 0); // OUT NULL, 8 — autopull fires, FIFO empty => stall
-        assert!(pio.sm[0].stalled, "SM stalls when autopull finds empty FIFO");
+        assert!(
+            pio.sm[0].stalled,
+            "SM stalls when autopull finds empty FIFO"
+        );
         assert_eq!(pio.sm[0].pc, 0, "PC should not advance while stalled");
 
         step_n(&mut pio, 1, 0); // Still stalled
@@ -2069,11 +2131,17 @@ mod tests {
         // Default shiftctrl: shift right, so bottom 4 bits (0xF) are shifted out.
         // out_base=5 means bits should appear at positions 5,6,7,8.
         let expected_mask = 0xF << 5;
-        assert_eq!(pio.shared_pin_values & expected_mask, expected_mask,
-            "OUT PINS with out_base=5 should set pins [8:5]");
+        assert_eq!(
+            pio.shared_pin_values & expected_mask,
+            expected_mask,
+            "OUT PINS with out_base=5 should set pins [8:5]"
+        );
         // Other pins should be 0
-        assert_eq!(pio.shared_pin_values & !expected_mask, 0,
-            "only pins [8:5] should be set");
+        assert_eq!(
+            pio.shared_pin_values & !expected_mask,
+            0,
+            "only pins [8:5] should be set"
+        );
     }
 
     #[test]
@@ -2091,8 +2159,10 @@ mod tests {
         step_n(&mut pio, 1, 0); // OUT PINS, 4
         // Pins should wrap: bits 30,31,0,1 all set
         let expected = (3u32 << 30) | 3u32; // bits 30,31 and bits 0,1
-        assert_eq!(pio.shared_pin_values, expected,
-            "OUT PINS with out_base=30 should wrap to bits [31:30] and [1:0]");
+        assert_eq!(
+            pio.shared_pin_values, expected,
+            "OUT PINS with out_base=30 should wrap to bits [31:30] and [1:0]"
+        );
     }
 
     #[test]
@@ -2111,19 +2181,29 @@ mod tests {
 
         step_n(&mut pio, 1, 0); // Execute SET X, 1 [side 1] [delay 3]
         assert_eq!(pio.sm[0].x, 1);
-        assert_eq!(pio.sm[0].sideset_pins & (1 << 7), 1 << 7,
-            "sideset pin 7 set on execution");
+        assert_eq!(
+            pio.sm[0].sideset_pins & (1 << 7),
+            1 << 7,
+            "sideset pin 7 set on execution"
+        );
 
         // Check through all 3 delay cycles
         for cycle in 0..3 {
-            assert_eq!(pio.sm[0].sideset_pins & (1 << 7), 1 << 7,
-                "sideset pin 7 persists during delay cycle {}", cycle);
+            assert_eq!(
+                pio.sm[0].sideset_pins & (1 << 7),
+                1 << 7,
+                "sideset pin 7 persists during delay cycle {}",
+                cycle
+            );
             step_n(&mut pio, 1, 0);
         }
         // After delay completes, sideset_pins should still hold its value
         // (it's only overwritten by the next instruction's sideset)
-        assert_eq!(pio.sm[0].sideset_pins & (1 << 7), 1 << 7,
-            "sideset pin 7 still set after delay completes");
+        assert_eq!(
+            pio.sm[0].sideset_pins & (1 << 7),
+            1 << 7,
+            "sideset pin 7 still set after delay completes"
+        );
     }
 
     // ====================================================================
@@ -2401,7 +2481,11 @@ mod tests {
         // Write SHIFTCTRL with FJOIN_TX still set — no join change.
         pio.write32(0x0D0, (1 << 30) | (1 << 17), 0);
         // apply_fifo_join must NOT have been called (fifo not flushed).
-        assert_eq!(pio.sm[0].tx_fifo.level(), 5, "join-preserving write must not flush");
+        assert_eq!(
+            pio.sm[0].tx_fifo.level(),
+            5,
+            "join-preserving write must not flush"
+        );
     }
 
     /// SMn_EXECCTRL read with SM stalled: bit 31 (EXEC_STALLED) must
@@ -2554,7 +2638,11 @@ mod tests {
         // actual_ss_pins = SIDESET_COUNT - 1 = 1 when SIDE_EN=1. One pin
         // at SIDESET_BASE=3 → bit 3 of pad_oe must be driven by
         // sideset_dirs.
-        assert_ne!(pio.pad_oe & (1 << 3), 0, "SIDE_PINDIR=1 drives oe via sideset_dirs");
+        assert_ne!(
+            pio.pad_oe & (1 << 3),
+            0,
+            "SIDE_PINDIR=1 drives oe via sideset_dirs"
+        );
     }
 
     /// `merge_pin_outputs` SIDESET_COUNT=5 (max) side-set-value path hits
@@ -2915,7 +3003,11 @@ mod tests {
         pio.step(0);
         // shared_pin_values resets to u32::MAX (weak-pullup); with no
         // side-set overlay, pad_out mirrors that default.
-        assert_eq!(pio.pad_out, u32::MAX, "pad_out passes through shared_pin_values");
+        assert_eq!(
+            pio.pad_out,
+            u32::MAX,
+            "pad_out passes through shared_pin_values"
+        );
         assert_eq!(pio.pad_oe, 0, "no PINDIRS ever set, oe stays clear");
     }
 
@@ -2961,11 +3053,7 @@ mod tests {
         pio.sm[0].clkdiv_frac = 0;
 
         pio.step(0); // SET PINDIRS, 1 → shared_pin_dirs bit 0 = 1
-        assert_ne!(
-            pio.pad_oe & 1,
-            0,
-            "OE established by SET PINDIRS on tick 1"
-        );
+        assert_ne!(pio.pad_oe & 1, 0, "OE established by SET PINDIRS on tick 1");
 
         pio.step(0); // NOP side 1 → sideset_pins bit 0 = 1; oe stays set
         assert_ne!(

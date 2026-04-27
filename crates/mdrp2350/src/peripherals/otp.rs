@@ -43,7 +43,9 @@ pub struct Otp {
 
 impl Otp {
     pub fn new() -> Self {
-        Self { storage: Box::new([0u32; OTP_WORD_COUNT]) }
+        Self {
+            storage: Box::new([0u32; OTP_WORD_COUNT]),
+        }
     }
 
     /// Read a word. `offset` is bytes from [`OTP_DATA_BASE`].
@@ -93,7 +95,12 @@ mod tests {
     fn reset_state_is_zero() {
         let otp = Otp::new();
         for off in (0..OTP_DATA_SIZE).step_by(4) {
-            assert_eq!(otp.read32(off), 0, "OTP word at {:#X} must be 0 at reset", off);
+            assert_eq!(
+                otp.read32(off),
+                0,
+                "OTP word at {:#X} must be 0 at reset",
+                off
+            );
         }
     }
 

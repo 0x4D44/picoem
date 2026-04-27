@@ -69,10 +69,10 @@ fn process_is_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{
-            CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FALSE, WAIT_TIMEOUT,
+            CloseHandle, ERROR_INVALID_PARAMETER, FALSE, GetLastError, WAIT_TIMEOUT,
         };
         use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
         };
         const STILL_ACTIVE: u32 = 259; // STATUS_PENDING; documented "process is still running"
 
@@ -144,8 +144,8 @@ fn wait_for_process_death(pid: u32, timeout: Duration) -> bool {
 #[test]
 fn drop_kills_child_within_500ms() {
     let child = spawn_long_lived_child();
-    let qp = QemuProcess::from_child(child, QemuProfile::M33_RP2350)
-        .expect("wrap child in QemuProcess");
+    let qp =
+        QemuProcess::from_child(child, QemuProfile::M33_RP2350).expect("wrap child in QemuProcess");
     let pid = qp.child_id();
     assert!(
         process_is_alive(pid),
@@ -182,7 +182,9 @@ fn job_object_kills_child_when_parent_aborts() {
     let helper = env!("CARGO_BIN_EXE_test_helper_job_object");
 
     let mut cmd = Command::new(helper);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
     let output = cmd.output().expect("run test_helper_job_object");
 
     // The helper aborts after printing the PID, so we expect a non-zero
@@ -250,7 +252,7 @@ fn socket_freed_after_external_kill() {
     use std::net::TcpListener;
 
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
     // Locate the release binary. We deliberately do NOT use
     // CARGO_BIN_EXE_* — that points at the dev profile under `cargo test`,

@@ -50,7 +50,8 @@ fn main() -> ExitCode {
 
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -139,12 +140,42 @@ fn main() -> ExitCode {
         let hw = emu.bus.read8(addr, 0) as u32 | ((emu.bus.read8(addr + 1, 0) as u32) << 8);
         // Minimal classifier — just show the encoding family.
         let mnemonic = match hw & 0xF800 {
-            0x6000 => format!("STR R{}, [R{}, #{}]", hw & 7, (hw >> 3) & 7, ((hw >> 6) & 0x1F) * 4),
-            0x6800 => format!("LDR R{}, [R{}, #{}]", hw & 7, (hw >> 3) & 7, ((hw >> 6) & 0x1F) * 4),
-            0x7000 => format!("STRB R{}, [R{}, #{}]", hw & 7, (hw >> 3) & 7, (hw >> 6) & 0x1F),
-            0x7800 => format!("LDRB R{}, [R{}, #{}]", hw & 7, (hw >> 3) & 7, (hw >> 6) & 0x1F),
-            0x8000 => format!("STRH R{}, [R{}, #{}]", hw & 7, (hw >> 3) & 7, ((hw >> 6) & 0x1F) * 2),
-            0x8800 => format!("LDRH R{}, [R{}, #{}]", hw & 7, (hw >> 3) & 7, ((hw >> 6) & 0x1F) * 2),
+            0x6000 => format!(
+                "STR R{}, [R{}, #{}]",
+                hw & 7,
+                (hw >> 3) & 7,
+                ((hw >> 6) & 0x1F) * 4
+            ),
+            0x6800 => format!(
+                "LDR R{}, [R{}, #{}]",
+                hw & 7,
+                (hw >> 3) & 7,
+                ((hw >> 6) & 0x1F) * 4
+            ),
+            0x7000 => format!(
+                "STRB R{}, [R{}, #{}]",
+                hw & 7,
+                (hw >> 3) & 7,
+                (hw >> 6) & 0x1F
+            ),
+            0x7800 => format!(
+                "LDRB R{}, [R{}, #{}]",
+                hw & 7,
+                (hw >> 3) & 7,
+                (hw >> 6) & 0x1F
+            ),
+            0x8000 => format!(
+                "STRH R{}, [R{}, #{}]",
+                hw & 7,
+                (hw >> 3) & 7,
+                ((hw >> 6) & 0x1F) * 2
+            ),
+            0x8800 => format!(
+                "LDRH R{}, [R{}, #{}]",
+                hw & 7,
+                (hw >> 3) & 7,
+                ((hw >> 6) & 0x1F) * 2
+            ),
             _ => format!("0x{:04X}", hw),
         };
         if hw != 0 {
@@ -168,18 +199,46 @@ fn main() -> ExitCode {
     println!("SRAM shadow scan: {} non-zero bytes out of 65536", nonzero);
     println!("  first 16 bytes at 0x20000000: {:02X?}", first_values);
     // Spot-check key shadow offsets that the oracle will look up:
-    println!("  shadow[0x9000] = 0x{:02X}  (walk1 baseline pin pattern)", emu.bus.read8(0x2000_9000, 0));
-    println!("  shadow[0x9080] = 0x{:02X}  (walk1 A0 pin pattern)", emu.bus.read8(0x2000_9080, 0));
-    println!("  shadow[0x9040] = 0x{:02X}  (walk1 A1 pin pattern)", emu.bus.read8(0x2000_9040, 0));
-    println!("  shadow[0x9020] = 0x{:02X}  (walk1 A2 pin pattern)", emu.bus.read8(0x2000_9020, 0));
-    println!("  shadow[0x9010] = 0x{:02X}  (walk1 A3 pin pattern)", emu.bus.read8(0x2000_9010, 0));
+    println!(
+        "  shadow[0x9000] = 0x{:02X}  (walk1 baseline pin pattern)",
+        emu.bus.read8(0x2000_9000, 0)
+    );
+    println!(
+        "  shadow[0x9080] = 0x{:02X}  (walk1 A0 pin pattern)",
+        emu.bus.read8(0x2000_9080, 0)
+    );
+    println!(
+        "  shadow[0x9040] = 0x{:02X}  (walk1 A1 pin pattern)",
+        emu.bus.read8(0x2000_9040, 0)
+    );
+    println!(
+        "  shadow[0x9020] = 0x{:02X}  (walk1 A2 pin pattern)",
+        emu.bus.read8(0x2000_9020, 0)
+    );
+    println!(
+        "  shadow[0x9010] = 0x{:02X}  (walk1 A3 pin pattern)",
+        emu.bus.read8(0x2000_9010, 0)
+    );
 
     // Inspect the serve loop bytes.
     println!();
     println!("Serve loop disassembly (instruction words at each hot PC):");
-    for pc in [0x10000926, 0x10000928, 0x1000092A, 0x1000092C, 0x1000092E, 0x10000930u32] {
+    for pc in [
+        0x10000926,
+        0x10000928,
+        0x1000092A,
+        0x1000092C,
+        0x1000092E,
+        0x10000930u32,
+    ] {
         let w = emu.bus.read32(pc, 0);
-        println!("  PC=0x{:08X}: raw 0x{:08X}  [lo=0x{:04X} hi=0x{:04X}]", pc, w, w & 0xFFFF, (w >> 16) & 0xFFFF);
+        println!(
+            "  PC=0x{:08X}: raw 0x{:08X}  [lo=0x{:04X} hi=0x{:04X}]",
+            pc,
+            w,
+            w & 0xFFFF,
+            (w >> 16) & 0xFFFF
+        );
     }
 
     // Inspect registers in the serve loop.
@@ -194,7 +253,9 @@ fn main() -> ExitCode {
     println!();
     println!("Applying CS1-low stim (0x1800 baseline)...");
     let stim_level_cs1_low: u32 = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3); // CS1 at bit 13 clear
-    emu.bus.gpio_external_in.store(stim_level_cs1_low, Ordering::Relaxed);
+    emu.bus
+        .gpio_external_in
+        .store(stim_level_cs1_low, Ordering::Relaxed);
     for n in 0..500u64 {
         emu.run(1).expect("Serial run is infallible");
         let oe = emu.bus.read32(0xD000_0020, 0);
@@ -221,8 +282,11 @@ fn main() -> ExitCode {
     emu.bus.write8(0xD000_0010, 0xA5, 0);
     let after_byte = emu.bus.read32(0xD000_0010, 0);
     println!("  before write8: SIO_GPIO_OUT = 0x{:08X}", before);
-    println!("  after  write8: SIO_GPIO_OUT = 0x{:08X}  (expected 0x{:08X} if byte 0 sticks)",
-             after_byte, (before & !0xFFu32) | 0xA5);
+    println!(
+        "  after  write8: SIO_GPIO_OUT = 0x{:08X}  (expected 0x{:08X} if byte 0 sticks)",
+        after_byte,
+        (before & !0xFFu32) | 0xA5
+    );
     emu.bus.write32(0xD000_0010, before, 0); // restore
 
     // Now compare to word write:
@@ -236,7 +300,9 @@ fn main() -> ExitCode {
     println!();
     println!("Steady-state CS1-low stim for 200 ticks (tracking OEN + PC + OUT):");
     let cs1_low_stim: u32 = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-    emu.bus.gpio_external_in.store(cs1_low_stim, Ordering::Relaxed);
+    emu.bus
+        .gpio_external_in
+        .store(cs1_low_stim, Ordering::Relaxed);
     for t in 0..200u32 {
         emu.run(1).expect("Serial run is infallible");
         let oe = emu.bus.read32(0xD000_0030, 0);
@@ -262,7 +328,9 @@ fn main() -> ExitCode {
     // Sweep stim: apply different addr bits and print the observed byte.
     println!();
     println!("Address sweep (applying stim + waiting, observing data pins):");
-    for &addr_bits in &[0x1801u16, 0x1802, 0x1804, 0x1808, 0x1810, 0x1820, 0x1AAA, 0x1D55, 0x1FFF] {
+    for &addr_bits in &[
+        0x1801u16, 0x1802, 0x1804, 0x1808, 0x1810, 0x1820, 0x1AAA, 0x1D55, 0x1FFF,
+    ] {
         // Compose stim.
         let mut stim: u32 = 0;
         for (i, &pin) in ADDR_PINS.iter().enumerate() {
@@ -325,7 +393,10 @@ fn main() -> ExitCode {
     }
 
     println!();
-    println!("PC histogram (top 20, over {} instructions):", PROFILE_INSTRUCTIONS);
+    println!(
+        "PC histogram (top 20, over {} instructions):",
+        PROFILE_INSTRUCTIONS
+    );
     let mut entries: Vec<_> = hist.iter().map(|(k, v)| (*k, *v)).collect();
     entries.sort_by(|a, b| b.1.cmp(&a.1));
     for (pc, n) in entries.iter().take(20) {
@@ -344,7 +415,10 @@ fn main() -> ExitCode {
     hot_pcs.sort();
     if let (Some(&lo), Some(&hi)) = (hot_pcs.first(), hot_pcs.last()) {
         println!();
-        println!("Hot-PC range (count >= {}): 0x{:08X}..=0x{:08X}", min_count, lo, hi);
+        println!(
+            "Hot-PC range (count >= {}): 0x{:08X}..=0x{:08X}",
+            min_count, lo, hi
+        );
         let span = hi.wrapping_sub(lo);
         println!("  span: {} bytes", span);
     }
@@ -358,7 +432,10 @@ fn main() -> ExitCode {
         "Final GPIO snapshot: gpio_in=0x{:08X} SIO_OUT=0x{:08X} SIO_OE=0x{:08X}",
         gpio_in, gpio_out, gpio_oe
     );
-    println!("  data bits (pins 16..23): 0x{:02X}", (gpio_in >> 16) & 0xFF);
+    println!(
+        "  data bits (pins 16..23): 0x{:02X}",
+        (gpio_in >> 16) & 0xFF
+    );
     println!("  data OEN (pins 16..23): 0x{:02X}", (gpio_oe >> 16) & 0xFF);
 
     ExitCode::SUCCESS

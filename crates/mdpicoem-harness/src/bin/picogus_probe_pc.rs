@@ -25,11 +25,26 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--flash" => { i += 1; flash = Some(PathBuf::from(&args[i])); }
-            "--bootrom" => { i += 1; bootrom = Some(PathBuf::from(&args[i])); }
-            "--steps" => { i += 1; total_steps = args[i].parse().unwrap(); }
-            "--sample-every" => { i += 1; sample_every = args[i].parse().unwrap(); }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            "--flash" => {
+                i += 1;
+                flash = Some(PathBuf::from(&args[i]));
+            }
+            "--bootrom" => {
+                i += 1;
+                bootrom = Some(PathBuf::from(&args[i]));
+            }
+            "--steps" => {
+                i += 1;
+                total_steps = args[i].parse().unwrap();
+            }
+            "--sample-every" => {
+                i += 1;
+                sample_every = args[i].parse().unwrap();
+            }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
         i += 1;
     }
@@ -39,10 +54,13 @@ fn main() {
     let flash_bytes = std::fs::read(&flash).expect("read flash");
     let bootrom_bytes = std::fs::read(&bootrom).expect("read bootrom");
 
-    let mut emu = EmulatorBuilder::new(Config { sys_clk_hz: 125_000_000 })
-        .flash(flash_bytes)
-        .step_quantum(64)
-        .build().expect("Serial build is infallible");
+    let mut emu = EmulatorBuilder::new(Config {
+        sys_clk_hz: 125_000_000,
+    })
+    .flash(flash_bytes)
+    .step_quantum(64)
+    .build()
+    .expect("Serial build is infallible");
     emu.load_bootrom(&bootrom_bytes);
     emu.reset();
     emu.direct_boot_from_flash(0x100);
@@ -58,7 +76,9 @@ fn main() {
     // to return 0 (success) immediately so we can debug downstream init.
     emu.step_quantum = 64;
     for _ in 0..200_000u64 {
-        if emu.step().expect("Serial step is infallible") == 0 { break; }
+        if emu.step().expect("Serial step is infallible") == 0 {
+            break;
+        }
     }
     // Patch: MOVS R0, #0 (0x2000) + BX LR (0x4770) at test_psram entry
     emu.bus.write32(0x2001_2FA4, 0x4770_2000);
@@ -87,7 +107,15 @@ fn main() {
     const RING_LEN: usize = 64;
     #[derive(Clone, Copy)]
     #[allow(dead_code)]
-    struct CallRec { step: u64, from: u32, to: u32, lr: u32, r0: u32, r1: u32, vtor: u32 }
+    struct CallRec {
+        step: u64,
+        from: u32,
+        to: u32,
+        lr: u32,
+        r0: u32,
+        r1: u32,
+        vtor: u32,
+    }
     let mut ring: Vec<CallRec> = Vec::with_capacity(RING_LEN);
     let mut ring_head: usize = 0;
     for s in 0..100_000u64 {
@@ -107,7 +135,15 @@ fn main() {
                 let vtor = emu.bus.read32(0xe000_ed08);
                 let r0 = emu.cores[0].regs.r[0];
                 let r1 = emu.cores[0].regs.r[1];
-                let rec = CallRec { step: s, from: before_pc, to: after_pc, lr: after_lr, r0, r1, vtor };
+                let rec = CallRec {
+                    step: s,
+                    from: before_pc,
+                    to: after_pc,
+                    lr: after_lr,
+                    r0,
+                    r1,
+                    vtor,
+                };
                 if ring.len() < RING_LEN {
                     ring.push(rec);
                 } else {
@@ -137,16 +173,26 @@ fn main() {
                 let addr = dump_base + (i * 4);
                 let w = emu.bus.read32(addr);
                 eprint!("{w:#010x} ");
-                if i % 4 == 3 { eprint!("\n                  "); }
+                if i % 4 == 3 {
+                    eprint!("\n                  ");
+                }
             }
             eprintln!();
             // Dump instructions around pre-PC (the BKPT/panic site) and
             // panic wrapper. Each Thumb-16 halfword printed as u16.
             let dump_windows = [
-                ("crash site", before_pc.saturating_sub(16), before_pc.saturating_add(16)),
+                (
+                    "crash site",
+                    before_pc.saturating_sub(16),
+                    before_pc.saturating_add(16),
+                ),
                 ("panic wrapper", 0x2000_0290, 0x2000_02a8),
                 ("hard_assertion_failure", 0x2000_0db0, 0x2000_0de0),
-                ("caller @ r5/stack+36", (r[5] & !1).saturating_sub(16), (r[5] & !1).saturating_add(16)),
+                (
+                    "caller @ r5/stack+36",
+                    (r[5] & !1).saturating_sub(16),
+                    (r[5] & !1).saturating_add(16),
+                ),
                 ("stack chain 0x20000449", 0x2000_0440, 0x2000_0460),
                 ("stack chain 0x20000393", 0x2000_0380, 0x2000_03a8),
             ];
@@ -158,7 +204,15 @@ fn main() {
                 Box::new((ring_head..RING_LEN).chain(0..ring_head))
             };
             for idx in order {
-                let CallRec { step: s, from, to, lr: _, r0, r1, vtor } = ring[idx];
+                let CallRec {
+                    step: s,
+                    from,
+                    to,
+                    lr: _,
+                    r0,
+                    r1,
+                    vtor,
+                } = ring[idx];
                 eprintln!(
                     "    step={s:>6}  {from:#010x} -> {to:#010x}  r0={r0:#010x} r1={r1:#010x} vtor={vtor:#010x}"
                 );
@@ -170,18 +224,25 @@ fn main() {
                     let hw = emu.bus.read32(addr & !3);
                     let low = hw as u16;
                     let high = (hw >> 16) as u16;
-                    eprintln!("    {:#010x}: {:04x}  {:#010x}: {:04x}", addr, low, addr+2, high);
+                    eprintln!(
+                        "    {:#010x}: {:04x}  {:#010x}: {:04x}",
+                        addr,
+                        low,
+                        addr + 2,
+                        high
+                    );
                     addr += 4;
                 }
             }
             break;
         }
         if left_exception {
-            eprintln!(
-                "EXC RETURN #{s}: pc {before_pc:#010x} -> {after_pc:#010x}",
-            );
+            eprintln!("EXC RETURN #{s}: pc {before_pc:#010x} -> {after_pc:#010x}",);
         }
-        if consumed == 0 { eprintln!("HALT @ {s}"); break; }
+        if consumed == 0 {
+            eprintln!("HALT @ {s}");
+            break;
+        }
     }
     emu.step_quantum = 64;
 
@@ -208,14 +269,22 @@ fn main() {
             let dc = cycles - last_sample_cycles;
             eprintln!(
                 "step {:>8} cycles={:>12} (+{:>8}) pc0={:#010x} lr0={:#010x} pc1={:#010x} halted1={}",
-                steps, cycles, dc, pc, emu.cores[0].regs.lr(),
-                emu.cores[1].regs.pc(), emu.cores[1].is_halted(),
+                steps,
+                cycles,
+                dc,
+                pc,
+                emu.cores[0].regs.lr(),
+                emu.cores[1].regs.pc(),
+                emu.cores[1].is_halted(),
             );
             last_sample_cycles = cycles;
             if pc == last_pc {
                 same_pc_count += 1;
                 if same_pc_count >= 4 {
-                    eprintln!("  PC has not moved across {} samples — likely tight loop", same_pc_count);
+                    eprintln!(
+                        "  PC has not moved across {} samples — likely tight loop",
+                        same_pc_count
+                    );
                 }
             } else {
                 same_pc_count = 0;
@@ -248,15 +317,33 @@ fn main() {
         let lo = word as u16;
         let hi = (word >> 16) as u16;
         let marker_lo = if addr == (pc & !1) { " <-- PC" } else { "" };
-        let marker_hi = if (addr + 2) == (pc & !1) { " <-- PC" } else { "" };
-        eprintln!("    {:#010x}: {:04x}{}  {:#010x}: {:04x}{}", addr, lo, marker_lo, addr+2, hi, marker_hi);
+        let marker_hi = if (addr + 2) == (pc & !1) {
+            " <-- PC"
+        } else {
+            ""
+        };
+        eprintln!(
+            "    {:#010x}: {:04x}{}  {:#010x}: {:04x}{}",
+            addr,
+            lo,
+            marker_lo,
+            addr + 2,
+            hi,
+            marker_hi
+        );
         addr += 4;
     }
     // Dump r0..r7 and stack to correlate with the loop variables.
     eprintln!(
         "    r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
-        emu.cores[0].regs.r[0], emu.cores[0].regs.r[1], emu.cores[0].regs.r[2], emu.cores[0].regs.r[3],
-        emu.cores[0].regs.r[4], emu.cores[0].regs.r[5], emu.cores[0].regs.r[6], emu.cores[0].regs.r[7],
+        emu.cores[0].regs.r[0],
+        emu.cores[0].regs.r[1],
+        emu.cores[0].regs.r[2],
+        emu.cores[0].regs.r[3],
+        emu.cores[0].regs.r[4],
+        emu.cores[0].regs.r[5],
+        emu.cores[0].regs.r[6],
+        emu.cores[0].regs.r[7],
     );
     let sp = emu.cores[0].regs.sp();
     eprintln!("-- stack [sp-16..sp+48]");
@@ -280,7 +367,15 @@ fn main() {
         let hi = (word >> 16) as u16;
         let marker_lo = if addr == lr { " <-- LR" } else { "" };
         let marker_hi = if (addr + 2) == lr { " <-- LR" } else { "" };
-        eprintln!("    {:#010x}: {:04x}{}  {:#010x}: {:04x}{}", addr, lo, marker_lo, addr+2, hi, marker_hi);
+        eprintln!(
+            "    {:#010x}: {:04x}{}  {:#010x}: {:04x}{}",
+            addr,
+            lo,
+            marker_lo,
+            addr + 2,
+            hi,
+            marker_hi
+        );
         addr += 4;
     }
 
@@ -295,22 +390,41 @@ fn main() {
     // CLK_REF_CTRL / DIV / SELECTED, CLK_SYS_CTRL / DIV / SELECTED,
     // CLK_PERI_CTRL / SELECTED, CLK_USB_CTRL / DIV / SELECTED.
     let clk_names: &[(&str, u32)] = &[
-        ("CLK_GPOUT0_CTRL", 0x00), ("CLK_GPOUT0_DIV", 0x04),
-        ("CLK_REF_CTRL", 0x30), ("CLK_REF_DIV", 0x34), ("CLK_REF_SELECTED", 0x38),
-        ("CLK_SYS_CTRL", 0x3c), ("CLK_SYS_DIV", 0x40), ("CLK_SYS_SELECTED", 0x44),
-        ("CLK_PERI_CTRL", 0x48), ("CLK_PERI_SELECTED", 0x50),
-        ("CLK_USB_CTRL", 0x54), ("CLK_USB_DIV", 0x58), ("CLK_USB_SELECTED", 0x5c),
-        ("CLK_ADC_CTRL", 0x60), ("CLK_ADC_DIV", 0x64), ("CLK_ADC_SELECTED", 0x68),
-        ("CLK_RTC_CTRL", 0x6c), ("CLK_RTC_DIV", 0x70), ("CLK_RTC_SELECTED", 0x74),
+        ("CLK_GPOUT0_CTRL", 0x00),
+        ("CLK_GPOUT0_DIV", 0x04),
+        ("CLK_REF_CTRL", 0x30),
+        ("CLK_REF_DIV", 0x34),
+        ("CLK_REF_SELECTED", 0x38),
+        ("CLK_SYS_CTRL", 0x3c),
+        ("CLK_SYS_DIV", 0x40),
+        ("CLK_SYS_SELECTED", 0x44),
+        ("CLK_PERI_CTRL", 0x48),
+        ("CLK_PERI_SELECTED", 0x50),
+        ("CLK_USB_CTRL", 0x54),
+        ("CLK_USB_DIV", 0x58),
+        ("CLK_USB_SELECTED", 0x5c),
+        ("CLK_ADC_CTRL", 0x60),
+        ("CLK_ADC_DIV", 0x64),
+        ("CLK_ADC_SELECTED", 0x68),
+        ("CLK_RTC_CTRL", 0x6c),
+        ("CLK_RTC_DIV", 0x70),
+        ("CLK_RTC_SELECTED", 0x74),
         ("CLK_SYS_RESUS_CTRL", 0x78),
-        ("FC0_REF_KHZ", 0x80), ("FC0_SRC", 0x94),
+        ("FC0_REF_KHZ", 0x80),
+        ("FC0_SRC", 0x94),
     ];
     for (name, off) in clk_names {
         let v = emu.bus.read32(CLOCKS_BASE + off);
         eprintln!("    {off:#06x} {name:<22} = {v:#010x}");
     }
-    eprintln!("    emu.bus.clock_tree.sys_clk_hz = {} Hz", emu.bus.clock_tree.sys_clk_hz);
-    eprintln!("    emu.bus.clock_tree.ref_clk_hz = {} Hz", emu.bus.clock_tree.ref_clk_hz);
+    eprintln!(
+        "    emu.bus.clock_tree.sys_clk_hz = {} Hz",
+        emu.bus.clock_tree.sys_clk_hz
+    );
+    eprintln!(
+        "    emu.bus.clock_tree.ref_clk_hz = {} Hz",
+        emu.bus.clock_tree.ref_clk_hz
+    );
 
     eprintln!("-- PLL_SYS @ {PLL_SYS_BASE:#010x}");
     for (name, off) in &[("CS", 0u32), ("PWR", 4), ("FBDIV_INT", 8), ("PRIM", 12)] {
@@ -332,7 +446,10 @@ fn main() {
         let fstat = emu.bus.read32(base + 0x004);
         let fdebug = emu.bus.read32(base + 0x008);
         let flevel = emu.bus.read32(base + 0x00c);
-        eprintln!("    CTRL   = {ctrl:#010x} (SM_ENABLE bits[3:0]={:04b})", ctrl & 0xf);
+        eprintln!(
+            "    CTRL   = {ctrl:#010x} (SM_ENABLE bits[3:0]={:04b})",
+            ctrl & 0xf
+        );
         eprintln!("    FSTAT  = {fstat:#010x}");
         eprintln!("    FDEBUG = {fdebug:#010x}");
         eprintln!("    FLEVEL = {flevel:#010x}");
@@ -340,7 +457,9 @@ fn main() {
         eprint!("    INSTR_MEM:");
         for i in 0u32..32 {
             let w = emu.bus.read32(base + 0x048 + i * 4);
-            if i % 8 == 0 { eprint!("\n       "); }
+            if i % 8 == 0 {
+                eprint!("\n       ");
+            }
             eprint!(" {:04x}", w & 0xffff);
         }
         eprintln!();

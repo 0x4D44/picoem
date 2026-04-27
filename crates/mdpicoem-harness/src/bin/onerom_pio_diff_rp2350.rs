@@ -182,9 +182,8 @@ fn observe(pio: &PioBlock, input_drive: u32, input_level: u32) -> (u32, u32) {
     let pad_oe = pio.pad_oe;
     let pad_out = pio.pad_out;
     let drive = input_drive | pad_oe;
-    let level = (input_drive & input_level)
-        | (!input_drive & pad_oe & pad_out)
-        | !(input_drive | pad_oe);
+    let level =
+        (input_drive & input_level) | (!input_drive & pad_oe & pad_out) | !(input_drive | pad_oe);
     (drive, level)
 }
 
@@ -252,7 +251,10 @@ fn main() -> ExitCode {
     }
 
     if divergences == 0 {
-        println!("PASS — all {} cycles match the committed trace", trace.body.len());
+        println!(
+            "PASS — all {} cycles match the committed trace",
+            trace.body.len()
+        );
         ExitCode::SUCCESS
     } else {
         println!();

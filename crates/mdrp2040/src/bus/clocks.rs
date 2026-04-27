@@ -274,7 +274,11 @@ pub struct XoscRegs {
 
 impl XoscRegs {
     pub fn new() -> Self {
-        Self { ctrl: 0, dormant: 0, startup: 0 }
+        Self {
+            ctrl: 0,
+            dormant: 0,
+            startup: 0,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -336,7 +340,14 @@ pub struct RoscRegs {
 
 impl RoscRegs {
     pub fn new() -> Self {
-        Self { ctrl: 0, freqa: 0, freqb: 0, dormant: 0, div: 0, phase: 0 }
+        Self {
+            ctrl: 0,
+            freqa: 0,
+            freqb: 0,
+            dormant: 0,
+            div: 0,
+            phase: 0,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -352,8 +363,8 @@ impl RoscRegs {
             0x10 => self.div,
             0x14 => self.phase,
             0x18 => (1 << 31) | (1 << 12), // STATUS: STABLE | ENABLED
-            0x1C => 0, // RANDOMBIT
-            0x20 => 0, // COUNT
+            0x1C => 0,                     // RANDOMBIT
+            0x20 => 0,                     // COUNT
             _ => 0,
         }
     }
@@ -460,12 +471,7 @@ pub fn pll_write(regs: &mut PllRegs, offset: u32, val: u32, alias: u32) -> bool 
 /// * CLK_REF_DIV[11:8] — integer divider (0 → treat as 1).
 /// * CLK_SYS_DIV[31:16] — integer divider (0 → treat as 1). Fractional
 ///   bits [15:0] are ignored.
-pub fn recompute(
-    clocks: &ClocksRegs,
-    pll_sys: &PllRegs,
-    pll_usb: &PllRegs,
-    tree: &mut ClockTree,
-) {
+pub fn recompute(clocks: &ClocksRegs, pll_sys: &PllRegs, pll_usb: &PllRegs, tree: &mut ClockTree) {
     let ref_src_hz = match clocks.clk_ref_ctrl & 0x3 {
         0 => ROSC_FREQ_HZ,
         1 => {

@@ -239,7 +239,10 @@ mod tests {
         let _ = wd.write32(LOAD_OFFSET, 100, 0);
         let _ = wd.write32(CTRL_OFFSET, CTRL_ENABLE_BIT | (1 << 25), 0); // PAUSE_DBG0
         for _ in 0..200 {
-            assert!(!wd.tick(), "fire should not occur while a PAUSE_* bit is set");
+            assert!(
+                !wd.tick(),
+                "fire should not occur while a PAUSE_* bit is set"
+            );
         }
         assert_eq!(wd.read32(CTRL_OFFSET) & CTRL_TIME_MASK, 100);
     }
@@ -272,7 +275,10 @@ mod tests {
     fn trigger_write_fires_immediately() {
         let mut wd = WatchdogRegs::new();
         let fired = wd.write32(CTRL_OFFSET, CTRL_TRIGGER_BIT, 0);
-        assert!(fired, "CTRL.TRIGGER write should request an immediate reset");
+        assert!(
+            fired,
+            "CTRL.TRIGGER write should request an immediate reset"
+        );
         // TRIGGER is self-clearing.
         assert_eq!(wd.read32(CTRL_OFFSET) & CTRL_TRIGGER_BIT, 0);
     }

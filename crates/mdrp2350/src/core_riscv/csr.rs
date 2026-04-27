@@ -17,34 +17,34 @@ use super::Hazard3;
 use super::decode::CsrKind;
 use crate::Bus;
 
-pub(crate) const CSR_MSTATUS:      u16 = 0x300;
-pub(crate) const CSR_MISA:         u16 = 0x301;
-pub(crate) const CSR_MIE:          u16 = 0x304;
-pub(crate) const CSR_MTVEC:        u16 = 0x305;
-pub(crate) const CSR_MCOUNTINHIBIT:u16 = 0x320;
-pub(crate) const CSR_MSCRATCH:     u16 = 0x340;
-pub(crate) const CSR_MEPC:         u16 = 0x341;
-pub(crate) const CSR_MCAUSE:       u16 = 0x342;
-pub(crate) const CSR_MTVAL:        u16 = 0x343;
-pub(crate) const CSR_MIP:          u16 = 0x344;
+pub(crate) const CSR_MSTATUS: u16 = 0x300;
+pub(crate) const CSR_MISA: u16 = 0x301;
+pub(crate) const CSR_MIE: u16 = 0x304;
+pub(crate) const CSR_MTVEC: u16 = 0x305;
+pub(crate) const CSR_MCOUNTINHIBIT: u16 = 0x320;
+pub(crate) const CSR_MSCRATCH: u16 = 0x340;
+pub(crate) const CSR_MEPC: u16 = 0x341;
+pub(crate) const CSR_MCAUSE: u16 = 0x342;
+pub(crate) const CSR_MTVAL: u16 = 0x343;
+pub(crate) const CSR_MIP: u16 = 0x344;
 // Machine counters
-pub(crate) const CSR_MCYCLE:       u16 = 0xB00;
-pub(crate) const CSR_MINSTRET:     u16 = 0xB02;
-pub(crate) const CSR_MCYCLEH:      u16 = 0xB80;
-pub(crate) const CSR_MINSTRETH:    u16 = 0xB82;
+pub(crate) const CSR_MCYCLE: u16 = 0xB00;
+pub(crate) const CSR_MINSTRET: u16 = 0xB02;
+pub(crate) const CSR_MCYCLEH: u16 = 0xB80;
+pub(crate) const CSR_MINSTRETH: u16 = 0xB82;
 // Read-only constants
-pub(crate) const CSR_MVENDORID:    u16 = 0xF11;
-pub(crate) const CSR_MARCHID:      u16 = 0xF12;
-pub(crate) const CSR_MIMPID:       u16 = 0xF13;
-pub(crate) const CSR_MHARTID:      u16 = 0xF14;
-pub(crate) const CSR_MCONFIGPTR:   u16 = 0xF15;
+pub(crate) const CSR_MVENDORID: u16 = 0xF11;
+pub(crate) const CSR_MARCHID: u16 = 0xF12;
+pub(crate) const CSR_MIMPID: u16 = 0xF13;
+pub(crate) const CSR_MHARTID: u16 = 0xF14;
+pub(crate) const CSR_MCONFIGPTR: u16 = 0xF15;
 // Hazard3 Xh3irq external-IRQ controller (P4).
-pub(crate) const CSR_MEIEA:        u16 = 0xBE0;
-pub(crate) const CSR_MEIPA:        u16 = 0xBE1;
-pub(crate) const CSR_MEIFA:        u16 = 0xBE2;
-pub(crate) const CSR_MEIPRA:       u16 = 0xBE3;
-pub(crate) const CSR_MEINEXT:      u16 = 0xBE4;
-pub(crate) const CSR_MEICONTEXT:   u16 = 0xBE5;
+pub(crate) const CSR_MEIEA: u16 = 0xBE0;
+pub(crate) const CSR_MEIPA: u16 = 0xBE1;
+pub(crate) const CSR_MEIFA: u16 = 0xBE2;
+pub(crate) const CSR_MEIPRA: u16 = 0xBE3;
+pub(crate) const CSR_MEINEXT: u16 = 0xBE4;
+pub(crate) const CSR_MEICONTEXT: u16 = 0xBE5;
 
 // Physical Memory Protection (`pmpcfg0..3`, `pmpaddr0..15`) per RV-priv
 // 1.12 §3.7. Phase-2 models the Hazard3 PMP as a CSR register bank only —
@@ -68,9 +68,9 @@ pub(crate) const CSR_MEICONTEXT:   u16 = 0xBE5;
 // from QEMU on every pmpaddr readback. G=3 is deferred until a silicon
 // RISC-V diff oracle exists (no such oracle today — `test_rp2350_probe_*`
 // covers ARM only). See HLD V2 §A.5.
-pub(crate) const CSR_PMPCFG0:   u16 = 0x3A0;
-pub(crate) const CSR_PMPCFG3:   u16 = 0x3A3;
-pub(crate) const CSR_PMPADDR0:  u16 = 0x3B0;
+pub(crate) const CSR_PMPCFG0: u16 = 0x3A0;
+pub(crate) const CSR_PMPCFG3: u16 = 0x3A3;
+pub(crate) const CSR_PMPADDR0: u16 = 0x3B0;
 pub(crate) const CSR_PMPADDR15: u16 = 0x3BF;
 pub(crate) const PMP_NUM_ENTRIES: usize = 8;
 /// pmpcfg reserved bits [6:5] per byte (Smepmp, not implemented by Hazard3)
@@ -89,9 +89,9 @@ const PMPCFG_A_TOR: u8 = 0b0000_1000;
 /// mstatus writable mask. V1 supports MIE (bit 3), MPIE (bit 7),
 /// MPP (bits [12:11], WARL to 0b11). All other bits (SIE/UIE/MPRV/
 /// Secure-extension bits) read as 0 and ignore writes.
-const MSTATUS_MIE:  u32 = 1 << 3;
+const MSTATUS_MIE: u32 = 1 << 3;
 const MSTATUS_MPIE: u32 = 1 << 7;
-const MSTATUS_MPP:  u32 = 0b11 << 11;
+const MSTATUS_MPP: u32 = 0b11 << 11;
 pub(crate) const MSTATUS_WRITE_MASK: u32 = MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP;
 
 /// mie writable mask — only MSIE (3), MTIE (7), MEIE (11). Bits outside
@@ -127,7 +127,9 @@ pub(crate) enum CsrAccess {
 
 /// Return true if the CSR address is read-only per RV-priv (bits [11:10]==0b11).
 #[inline]
-fn is_read_only(csr: u16) -> bool { (csr >> 10) & 0b11 == 0b11 }
+fn is_read_only(csr: u16) -> bool {
+    (csr >> 10) & 0b11 == 0b11
+}
 
 /// Dispatch a Zicsr instruction. `rs1_or_zimm` is the 5-bit source field
 /// (register index for register forms, zero-extended immediate for `*i`
@@ -145,9 +147,8 @@ pub(crate) fn csr_access(
     let is_imm = matches!(kind, CsrKind::Csrrwi | CsrKind::Csrrsi | CsrKind::Csrrci);
     let src = if is_imm { rs1_or_zimm as u32 } else { rs1_val };
     let is_write_like = match kind {
-        CsrKind::Csrrw | CsrKind::Csrrwi => true,            // always writes
-        CsrKind::Csrrs | CsrKind::Csrrsi
-        | CsrKind::Csrrc | CsrKind::Csrrci => rs1_or_zimm != 0,
+        CsrKind::Csrrw | CsrKind::Csrrwi => true, // always writes
+        CsrKind::Csrrs | CsrKind::Csrrsi | CsrKind::Csrrc | CsrKind::Csrrci => rs1_or_zimm != 0,
     };
 
     // Trap gate per §4.5.
@@ -155,8 +156,7 @@ pub(crate) fn csr_access(
         match kind {
             // csrrw always traps on RO even with rd=x0 (write side is illegal).
             CsrKind::Csrrw | CsrKind::Csrrwi => return CsrAccess::Trap,
-            CsrKind::Csrrs | CsrKind::Csrrsi
-            | CsrKind::Csrrc | CsrKind::Csrrci => {
+            CsrKind::Csrrs | CsrKind::Csrrsi | CsrKind::Csrrc | CsrKind::Csrrci => {
                 if rs1_or_zimm != 0 {
                     return CsrAccess::Trap;
                 }
@@ -192,33 +192,33 @@ pub(crate) fn csr_access(
 /// into mcause=2).
 fn read_csr(hart: &Hazard3, csr: u16, irq_pending: u64) -> Option<u32> {
     Some(match csr {
-        CSR_MSTATUS       => hart.csrs.mstatus,
-        CSR_MISA          => hart.misa(),
-        CSR_MIE           => hart.csrs.mie,
-        CSR_MTVEC         => hart.csrs.mtvec,
+        CSR_MSTATUS => hart.csrs.mstatus,
+        CSR_MISA => hart.misa(),
+        CSR_MIE => hart.csrs.mie,
+        CSR_MTVEC => hart.csrs.mtvec,
         CSR_MCOUNTINHIBIT => hart.csrs.mcountinhibit,
-        CSR_MSCRATCH      => hart.csrs.mscratch,
-        CSR_MEPC          => hart.csrs.mepc,
-        CSR_MCAUSE        => hart.csrs.mcause,
-        CSR_MTVAL         => hart.csrs.mtval,         // hardwired 0
-        CSR_MIP           => hart.csrs.mip,
-        CSR_MCYCLE        => hart.csrs.mcycle as u32,
-        CSR_MINSTRET      => hart.csrs.minstret as u32,
-        CSR_MCYCLEH       => (hart.csrs.mcycle >> 32) as u32,
-        CSR_MINSTRETH     => (hart.csrs.minstret >> 32) as u32,
-        CSR_MVENDORID     => hart.mvendorid(),
-        CSR_MARCHID       => hart.marchid(),
-        CSR_MIMPID        => hart.mimpid(),
-        CSR_MHARTID       => hart.mhartid(),
-        CSR_MCONFIGPTR    => hart.mconfigptr(),
+        CSR_MSCRATCH => hart.csrs.mscratch,
+        CSR_MEPC => hart.csrs.mepc,
+        CSR_MCAUSE => hart.csrs.mcause,
+        CSR_MTVAL => hart.csrs.mtval, // hardwired 0
+        CSR_MIP => hart.csrs.mip,
+        CSR_MCYCLE => hart.csrs.mcycle as u32,
+        CSR_MINSTRET => hart.csrs.minstret as u32,
+        CSR_MCYCLEH => (hart.csrs.mcycle >> 32) as u32,
+        CSR_MINSTRETH => (hart.csrs.minstret >> 32) as u32,
+        CSR_MVENDORID => hart.mvendorid(),
+        CSR_MARCHID => hart.marchid(),
+        CSR_MIMPID => hart.mimpid(),
+        CSR_MHARTID => hart.mhartid(),
+        CSR_MCONFIGPTR => hart.mconfigptr(),
         // Hazard3 Xh3irq CSRs. `meinext` / `meipa` read from
         // `bus.irq_pending | meifa` per HLD §4.6.
-        CSR_MEIEA         => hart.xh3irq.read_meiea(),
-        CSR_MEIPA         => hart.xh3irq.read_meipa(irq_pending),
-        CSR_MEIFA         => hart.xh3irq.read_meifa(),
-        CSR_MEIPRA        => hart.xh3irq.read_meipra(),
-        CSR_MEINEXT       => hart.xh3irq.read_meinext(irq_pending),
-        CSR_MEICONTEXT    => hart.xh3irq.read_meicontext(),
+        CSR_MEIEA => hart.xh3irq.read_meiea(),
+        CSR_MEIPA => hart.xh3irq.read_meipa(irq_pending),
+        CSR_MEIFA => hart.xh3irq.read_meifa(),
+        CSR_MEIPRA => hart.xh3irq.read_meipra(),
+        CSR_MEINEXT => hart.xh3irq.read_meinext(irq_pending),
+        CSR_MEICONTEXT => hart.xh3irq.read_meicontext(),
         // PMP register bank — phase-1 (NUM_ENTRIES=1). Unsynthesised
         // slots read as 0; synthesised slots return stored (already
         // WARL-masked) value. See `write_pmp_csr` for WARL rules.
@@ -252,7 +252,9 @@ fn write_csr(hart: &mut Hazard3, csr: u16, val: u32, irq_pending: u64) {
             let masked = val & MSTATUS_WRITE_MASK;
             // If the incoming MPP field isn't 0b11, round up.
             let mpp_bits = (masked & MSTATUS_MPP) >> 11;
-            let fixed_mpp = if mpp_bits == 0b11 { masked } else {
+            let fixed_mpp = if mpp_bits == 0b11 {
+                masked
+            } else {
                 (masked & !MSTATUS_MPP) | (0b11 << 11)
             };
             hart.csrs.mstatus = fixed_mpp;
@@ -303,16 +305,18 @@ fn write_csr(hart: &mut Hazard3, csr: u16, val: u32, irq_pending: u64) {
             // next quantum boundary. Still mask to the supported bits.
             hart.csrs.mip = (hart.csrs.mip & !MIP_MASK) | (val & MIP_MASK);
         }
-        CSR_MCYCLE   => hart.csrs.mcycle   = (hart.csrs.mcycle   & !0xFFFF_FFFF) | val as u64,
+        CSR_MCYCLE => hart.csrs.mcycle = (hart.csrs.mcycle & !0xFFFF_FFFF) | val as u64,
         CSR_MINSTRET => hart.csrs.minstret = (hart.csrs.minstret & !0xFFFF_FFFF) | val as u64,
-        CSR_MCYCLEH  => hart.csrs.mcycle   = (hart.csrs.mcycle   & 0xFFFF_FFFF) | ((val as u64) << 32),
-        CSR_MINSTRETH=> hart.csrs.minstret = (hart.csrs.minstret & 0xFFFF_FFFF) | ((val as u64) << 32),
+        CSR_MCYCLEH => hart.csrs.mcycle = (hart.csrs.mcycle & 0xFFFF_FFFF) | ((val as u64) << 32),
+        CSR_MINSTRETH => {
+            hart.csrs.minstret = (hart.csrs.minstret & 0xFFFF_FFFF) | ((val as u64) << 32)
+        }
         // Hazard3 Xh3irq CSRs.
-        CSR_MEIEA      => hart.xh3irq.write_meiea(val),
-        CSR_MEIPA      => hart.xh3irq.write_meipa(val),
-        CSR_MEIFA      => hart.xh3irq.write_meifa(val),
-        CSR_MEIPRA     => hart.xh3irq.write_meipra(val),
-        CSR_MEINEXT    => hart.xh3irq.write_meinext(val, irq_pending),
+        CSR_MEIEA => hart.xh3irq.write_meiea(val),
+        CSR_MEIPA => hart.xh3irq.write_meipa(val),
+        CSR_MEIFA => hart.xh3irq.write_meifa(val),
+        CSR_MEIPRA => hart.xh3irq.write_meipra(val),
+        CSR_MEINEXT => hart.xh3irq.write_meinext(val, irq_pending),
         CSR_MEICONTEXT => hart.xh3irq.write_meicontext(val, &mut hart.csrs.mie),
         // PMP register bank — phase-1 (NUM_ENTRIES=1). Writes to any
         // unsynthesised slot are silently dropped; writes to pmpcfg0

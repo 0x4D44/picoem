@@ -40,7 +40,8 @@ fn reset_loads_sp_and_pc_from_rom() {
 fn builder_overrides_step_quantum() {
     let emu = EmulatorBuilder::new(Config::default())
         .step_quantum(32)
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
     assert_eq!(emu.step_quantum, 32);
 }
 
@@ -63,7 +64,8 @@ fn direct_boot_from_flash_applies_vector_table() {
 
     let mut emu = EmulatorBuilder::new(Config::default())
         .flash(flash)
-        .build().expect("Serial build is infallible");
+        .build()
+        .expect("Serial build is infallible");
     emu.reset();
     emu.direct_boot_from_flash(0x100);
 

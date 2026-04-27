@@ -22,10 +22,10 @@ pub use self::clocks::{ClockTree, ROSC_FREQ_HZ, XOSC_FREQ_HZ, pll_output_hz};
 pub use self::divider::Divider;
 pub use self::fifo::Fifo;
 pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE};
-pub use self::pacer::{PacerSnapshot, PacerStats};
-pub use self::pio::PioBlock;
 #[cfg(target_arch = "x86_64")]
 pub use self::pacer::Pacer;
+pub use self::pacer::{PacerSnapshot, PacerStats};
+pub use self::pio::PioBlock;
 
 // Former `Peripheral` trait removed — zero impls workspace-wide.
 // See `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md`

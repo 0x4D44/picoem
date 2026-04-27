@@ -19,8 +19,8 @@
 //! Narrow writes use a CAS retry loop over the `AtomicU32` word so
 //! concurrent byte/halfword/word writes to the same word cannot tear.
 
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// ROM base address.
 pub const ROM_BASE: u32 = 0x0000_0000;

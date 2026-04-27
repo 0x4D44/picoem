@@ -7,15 +7,45 @@ pub struct DecodedInsn {
 
 /// PIO instruction opcodes.
 pub enum PioOp {
-    Jmp { condition: u8, address: u8 },
-    Wait { polarity: bool, source: u8, index: u8 },
-    In { source: u8, bit_count: u8 },
-    Out { destination: u8, bit_count: u8 },
-    Push { if_full: bool, block: bool },
-    Pull { if_empty: bool, block: bool },
-    Mov { destination: u8, op: u8, source: u8 },
-    Irq { clear: bool, wait: bool, index: u8 },
-    Set { destination: u8, data: u8 },
+    Jmp {
+        condition: u8,
+        address: u8,
+    },
+    Wait {
+        polarity: bool,
+        source: u8,
+        index: u8,
+    },
+    In {
+        source: u8,
+        bit_count: u8,
+    },
+    Out {
+        destination: u8,
+        bit_count: u8,
+    },
+    Push {
+        if_full: bool,
+        block: bool,
+    },
+    Pull {
+        if_empty: bool,
+        block: bool,
+    },
+    Mov {
+        destination: u8,
+        op: u8,
+        source: u8,
+    },
+    Irq {
+        clear: bool,
+        wait: bool,
+        index: u8,
+    },
+    Set {
+        destination: u8,
+        data: u8,
+    },
 }
 
 /// Decode a 16-bit PIO instruction.
@@ -93,9 +123,15 @@ pub fn decode(insn: u16, pinctrl: u32, execctrl: u32) -> DecodedInsn {
             let if_x = (operand >> 6) & 1 != 0;
             let block = (operand >> 5) & 1 != 0;
             if direction {
-                PioOp::Pull { if_empty: if_x, block }
+                PioOp::Pull {
+                    if_empty: if_x,
+                    block,
+                }
             } else {
-                PioOp::Push { if_full: if_x, block }
+                PioOp::Push {
+                    if_full: if_x,
+                    block,
+                }
             }
         }
         // 101: MOV
@@ -179,7 +215,10 @@ mod tests {
         // OUT PINS, 32: opcode=011, dest=000(PINS), bit_count=00000 → 0x6000.
         let d = decode(0x6000, 0x1400_0000, 0x0001_F000);
         match d.op {
-            PioOp::Out { destination, bit_count } => {
+            PioOp::Out {
+                destination,
+                bit_count,
+            } => {
                 assert_eq!(destination, 0);
                 assert_eq!(bit_count, 32);
             }
@@ -210,7 +249,11 @@ mod tests {
         // MOV Y, ~X: opcode=101, dst=010, op=01, src=001 → 0xA049.
         let d = decode(0xA049, 0x1400_0000, 0x0001_F000);
         match d.op {
-            PioOp::Mov { destination, op, source } => {
+            PioOp::Mov {
+                destination,
+                op,
+                source,
+            } => {
                 assert_eq!(destination, 2);
                 assert_eq!(op, 1);
                 assert_eq!(source, 1);

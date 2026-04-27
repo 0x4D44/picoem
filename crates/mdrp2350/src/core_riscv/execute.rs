@@ -11,7 +11,7 @@ use crate::Bus;
 use crate::bus::canon_oracle_addr;
 
 use super::Hazard3;
-use super::csr::{csr_access, CsrAccess};
+use super::csr::{CsrAccess, csr_access};
 use super::decode::{
     AluImmKind, AluKind, AmoKind, BranchKind, CsrKind, LoadKind, MulDivKind, Op, ShiftKind,
     StoreKind,
@@ -88,15 +88,20 @@ impl Hazard3 {
                 // C. No further alignment check is needed.
             }
 
-            Op::Branch { kind, rs1, rs2, imm } => {
+            Op::Branch {
+                kind,
+                rs1,
+                rs2,
+                imm,
+            } => {
                 let a = self.rd_x(rs1);
                 let b = self.rd_x(rs2);
                 let taken = match kind {
-                    BranchKind::Beq  => a == b,
-                    BranchKind::Bne  => a != b,
-                    BranchKind::Blt  => (a as i32) <  (b as i32),
-                    BranchKind::Bge  => (a as i32) >= (b as i32),
-                    BranchKind::Bltu => a <  b,
+                    BranchKind::Beq => a == b,
+                    BranchKind::Bne => a != b,
+                    BranchKind::Blt => (a as i32) < (b as i32),
+                    BranchKind::Bge => (a as i32) >= (b as i32),
+                    BranchKind::Bltu => a < b,
                     BranchKind::Bgeu => a >= b,
                 };
                 if taken {
@@ -133,7 +138,7 @@ impl Hazard3 {
                         v
                     }
                     LoadKind::Lhu => bus.read16(addr, self.hart_id) as u32,
-                    LoadKind::Lw  => bus.read32(addr, self.hart_id),
+                    LoadKind::Lw => bus.read32(addr, self.hart_id),
                 };
                 if bus.bus_fault(self.hart_id as usize) {
                     bus.clear_bus_fault(self.hart_id as usize);
@@ -144,7 +149,12 @@ impl Hazard3 {
                 self.wr(rd, val);
             }
 
-            Op::Store { kind, rs1, rs2, imm } => {
+            Op::Store {
+                kind,
+                rs1,
+                rs2,
+                imm,
+            } => {
                 let addr = self.rd_x(rs1).wrapping_add(imm as u32);
                 let val = self.rd_x(rs2);
                 let aligned = match kind {
@@ -157,7 +167,7 @@ impl Hazard3 {
                     return;
                 }
                 match kind {
-                    StoreKind::Sb => bus.write8(addr,  val as u8, self.hart_id),
+                    StoreKind::Sb => bus.write8(addr, val as u8, self.hart_id),
                     StoreKind::Sh => bus.write16(addr, val as u16, self.hart_id),
                     StoreKind::Sw => bus.write32(addr, val, self.hart_id),
                 }
@@ -172,16 +182,33 @@ impl Hazard3 {
                 let a = self.rd_x(rs1);
                 let b = imm as u32;
                 let r = match kind {
-                    AluImmKind::Addi  => a.wrapping_add(b),
-                    AluImmKind::Slti  => if (a as i32) < imm { 1 } else { 0 },
-                    AluImmKind::Sltiu => if a < b { 1 } else { 0 },
-                    AluImmKind::Xori  => a ^ b,
-                    AluImmKind::Ori   => a | b,
-                    AluImmKind::Andi  => a & b,
+                    AluImmKind::Addi => a.wrapping_add(b),
+                    AluImmKind::Slti => {
+                        if (a as i32) < imm {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    AluImmKind::Sltiu => {
+                        if a < b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    AluImmKind::Xori => a ^ b,
+                    AluImmKind::Ori => a | b,
+                    AluImmKind::Andi => a & b,
                 };
                 self.wr(rd, r);
             }
-            Op::ShiftImm { kind, rd, rs1, shamt } => {
+            Op::ShiftImm {
+                kind,
+                rd,
+                rs1,
+                shamt,
+            } => {
                 let a = self.rd_x(rs1);
                 let s = shamt & 0x1F;
                 let r = match kind {
@@ -196,16 +223,28 @@ impl Hazard3 {
                 let a = self.rd_x(rs1);
                 let b = self.rd_x(rs2);
                 let r = match kind {
-                    AluKind::Add  => a.wrapping_add(b),
-                    AluKind::Sub  => a.wrapping_sub(b),
-                    AluKind::Sll  => a.wrapping_shl(b & 0x1F),
-                    AluKind::Slt  => if (a as i32) < (b as i32) { 1 } else { 0 },
-                    AluKind::Sltu => if a < b { 1 } else { 0 },
-                    AluKind::Xor  => a ^ b,
-                    AluKind::Srl  => a.wrapping_shr(b & 0x1F),
-                    AluKind::Sra  => ((a as i32).wrapping_shr(b & 0x1F)) as u32,
-                    AluKind::Or   => a | b,
-                    AluKind::And  => a & b,
+                    AluKind::Add => a.wrapping_add(b),
+                    AluKind::Sub => a.wrapping_sub(b),
+                    AluKind::Sll => a.wrapping_shl(b & 0x1F),
+                    AluKind::Slt => {
+                        if (a as i32) < (b as i32) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    AluKind::Sltu => {
+                        if a < b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    AluKind::Xor => a ^ b,
+                    AluKind::Srl => a.wrapping_shr(b & 0x1F),
+                    AluKind::Sra => ((a as i32).wrapping_shr(b & 0x1F)) as u32,
+                    AluKind::Or => a | b,
+                    AluKind::And => a & b,
                 };
                 self.wr(rd, r);
             }
@@ -217,7 +256,14 @@ impl Hazard3 {
                 self.wr(rd, r);
             }
 
-            Op::Amo { kind, rd, rs1, rs2, aq: _, rl: _ } => {
+            Op::Amo {
+                kind,
+                rd,
+                rs1,
+                rs2,
+                aq: _,
+                rl: _,
+            } => {
                 self.exec_amo(kind, rd, rs1, rs2, bus, epc);
             }
 
@@ -256,7 +302,12 @@ impl Hazard3 {
                 self.wfi_parked = true;
             }
 
-            Op::Csr { kind, rd, rs1_or_zimm, csr } => {
+            Op::Csr {
+                kind,
+                rd,
+                rs1_or_zimm,
+                csr,
+            } => {
                 let rs1_val = if matches!(kind, CsrKind::Csrrw | CsrKind::Csrrs | CsrKind::Csrrc) {
                     self.rd_x(rs1_or_zimm)
                 } else {
@@ -296,15 +347,7 @@ impl Hazard3 {
     /// bus-fault -> mcause 5/7/7. AMO-outside-reservable is the only
     /// case that traps (mcause=7) — LR/SC outside reservable silently
     /// fail.
-    fn exec_amo(
-        &mut self,
-        kind: AmoKind,
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-        bus: &mut Bus,
-        epc: u32,
-    ) {
+    fn exec_amo(&mut self, kind: AmoKind, rd: u8, rs1: u8, rs2: u8, bus: &mut Bus, epc: u32) {
         // Canonicalise the reservation address up-front so the value we
         // store in `bus.reservation[core]` lives in the same address space
         // as the value `invalidate_reservation_at` sees (which is always
@@ -397,12 +440,12 @@ impl Hazard3 {
                 let src = self.rd_x(rs2);
                 let new = match kind {
                     AmoKind::Swap => src,
-                    AmoKind::Add  => old.wrapping_add(src),
-                    AmoKind::And  => old & src,
-                    AmoKind::Or   => old | src,
-                    AmoKind::Xor  => old ^ src,
-                    AmoKind::Min  => ((old as i32).min(src as i32)) as u32,
-                    AmoKind::Max  => ((old as i32).max(src as i32)) as u32,
+                    AmoKind::Add => old.wrapping_add(src),
+                    AmoKind::And => old & src,
+                    AmoKind::Or => old | src,
+                    AmoKind::Xor => old ^ src,
+                    AmoKind::Min => ((old as i32).min(src as i32)) as u32,
+                    AmoKind::Max => ((old as i32).max(src as i32)) as u32,
                     AmoKind::Minu => old.min(src),
                     AmoKind::Maxu => old.max(src),
                     AmoKind::Lr | AmoKind::Sc => unreachable!(),
@@ -449,7 +492,11 @@ fn exec_muldiv(kind: MulDivKind, a: u32, b: u32) -> u32 {
             }
         }
         MulDivKind::Divu => {
-            if b == 0 { 0xFFFF_FFFF } else { a / b }
+            if b == 0 {
+                0xFFFF_FFFF
+            } else {
+                a / b
+            }
         }
         MulDivKind::Rem => {
             if b == 0 {
@@ -461,7 +508,11 @@ fn exec_muldiv(kind: MulDivKind, a: u32, b: u32) -> u32 {
             }
         }
         MulDivKind::Remu => {
-            if b == 0 { a } else { a % b }
+            if b == 0 {
+                a
+            } else {
+                a % b
+            }
         }
     }
 }

@@ -216,7 +216,11 @@ impl I2sCapture {
         // The new side of LRCLK becomes the current channel. Actual
         // commit of the finalizing word happens on the next BCLK
         // rising edge (which latches that word's LSB).
-        self.current_channel = if new_lrclk { Channel::Right } else { Channel::Left };
+        self.current_channel = if new_lrclk {
+            Channel::Right
+        } else {
+            Channel::Left
+        };
 
         self.lrclk_edges = self.lrclk_edges.saturating_add(1);
         if self.first_lrclk_cycle.is_none() {
@@ -337,7 +341,9 @@ impl I2sCapture {
     /// back to the given `fallback_rate` when fewer than 2 LRCLK edges
     /// were observed.
     pub fn duration_secs(&self, fallback_rate: u32) -> f64 {
-        let rate = self.inferred_sample_rate_hz().unwrap_or(fallback_rate as f64);
+        let rate = self
+            .inferred_sample_rate_hz()
+            .unwrap_or(fallback_rate as f64);
         if rate <= 0.0 {
             return 0.0;
         }
@@ -383,8 +389,7 @@ pub fn write_wav(path: &Path, sample_rate_hz: u32, frames: &[(i16, i16)]) -> io:
     let bytes_per_sample: u16 = bits_per_sample / 8;
     let block_align: u16 = channels * bytes_per_sample;
     let byte_rate: u32 = sample_rate_hz * (block_align as u32);
-    let data_bytes: u32 = (frames.len() as u32)
-        .saturating_mul(block_align as u32);
+    let data_bytes: u32 = (frames.len() as u32).saturating_mul(block_align as u32);
     let riff_size: u32 = 36u32.saturating_add(data_bytes);
 
     let mut buf: Vec<u8> = Vec::with_capacity(WAV_HEADER_BYTES + data_bytes as usize);
@@ -501,7 +506,10 @@ mod tests {
 
         clock_philips_frame(&mut cap, &mut cycle, 0x1234, 0x5678);
         clock_philips_frame(&mut cap, &mut cycle, 0x0001, 0x0002);
-        clock_philips_frame(&mut cap, &mut cycle, 0xC000 /* -0x4000 as u16 */, 0x7FFF);
+        clock_philips_frame(
+            &mut cap, &mut cycle, 0xC000, /* -0x4000 as u16 */
+            0x7FFF,
+        );
 
         assert_eq!(
             cap.frames(),
@@ -804,7 +812,7 @@ mod tests {
         // finalizing takes effect. Shift in the LSB with LRCLK=0.
         cap.tick(pads(false, false, true), cycle); // edge 1→0
         cycle += 1;
-        cap.tick(pads(true, false, true), cycle);  // LSB of RIGHT = 1
+        cap.tick(pads(true, false, true), cycle); // LSB of RIGHT = 1
         cycle += 1;
 
         // Close the frame with a 15-bit LEFT=0 and LSB under LRCLK=1.
@@ -816,7 +824,7 @@ mod tests {
         }
         cap.tick(pads(false, true, false), cycle); // edge 0→1
         cycle += 1;
-        cap.tick(pads(true, true, false), cycle);  // LSB of LEFT = 0
+        cap.tick(pads(true, true, false), cycle); // LSB of LEFT = 0
 
         // RIGHT was 15 1-bits + 1 LSB=1 = 0xFFFF. LEFT was all zero.
         let last = *cap.frames().last().expect("frame emitted");

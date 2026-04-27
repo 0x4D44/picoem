@@ -26,15 +26,13 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
-use mdpicoem_harness::gdb_client::{
-    GdbClient, QemuProcess, QemuProfile, REG_RV_PC, REG_RV_X0,
-};
+use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile, REG_RV_PC, REG_RV_X0};
 use mdpicoem_harness::riscv_gen::{
-    self, encode_csr, encode_i_type, encode_s_type, OPC_OP_IMM, OPC_SYSTEM, RiscvClass,
-    RiscvTestCase, SCRATCH_BASE, TRAP_STUB,
+    self, OPC_OP_IMM, OPC_SYSTEM, RiscvClass, RiscvTestCase, SCRATCH_BASE, TRAP_STUB, encode_csr,
+    encode_i_type, encode_s_type,
 };
 
 use mdrp2350::{Arch, Config, EmulatorBuilder};
@@ -100,7 +98,9 @@ const CSR_DIFF_ADDRS: [u16; 7] = [
 ];
 
 /// Human-readable CSR names (for error reporting).
-const CSR_DIFF_NAMES: [&str; 7] = ["mstatus", "mie", "mtvec", "mscratch", "mepc", "mcause", "mip"];
+const CSR_DIFF_NAMES: [&str; 7] = [
+    "mstatus", "mie", "mtvec", "mscratch", "mepc", "mcause", "mip",
+];
 
 // CSR funct3 codes (per RISC-V spec §9):
 const CSR_F3_RW: u32 = 0b001;
@@ -221,9 +221,7 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             other => {
-                return Err(format!(
-                    "unknown argument '{other}' (use --help for usage)"
-                ));
+                return Err(format!("unknown argument '{other}' (use --help for usage)"));
             }
         }
         i += 1;
@@ -236,7 +234,12 @@ fn parse_args() -> Result<Args, String> {
         return Err("--class requires --fuzz".into());
     }
 
-    Ok(Args { fuzz_count, seed, class_filter, self_check_only })
+    Ok(Args {
+        fuzz_count,
+        seed,
+        class_filter,
+        self_check_only,
+    })
 }
 
 fn print_help() {
@@ -287,7 +290,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.core_riscv_mut(1).set_halted(true);
 
     // 6. §4.1 proxy self-check — runs on both sides before any test.
@@ -374,7 +378,10 @@ impl Drop for BootStub {
 /// keep it on disk for the lifetime of the harness run.
 fn write_boot_stub() -> Result<BootStub, Box<dyn std::error::Error>> {
     let mut path = std::env::temp_dir();
-    path.push(format!("mdpicoem-qemu-diff-riscv32-{}.bin", std::process::id()));
+    path.push(format!(
+        "mdpicoem-qemu-diff-riscv32-{}.bin",
+        std::process::id()
+    ));
     std::fs::write(&path, EBREAK_WORD.to_le_bytes())?;
     Ok(BootStub { path })
 }
@@ -441,7 +448,9 @@ fn run_proxy_self_check(
     // Emulator: load stub + zero scratchpad, set PC/gp, step to ebreak.
     emu.load_image(SELFCHECK_STUB, &stub_bytes);
     for i in 0..56u32 {
-        emu.bus.memory.sram_write8((SELFCHECK_SCRATCH & 0x00FF_FFFF) + i, 0);
+        emu.bus
+            .memory
+            .sram_write8((SELFCHECK_SCRATCH & 0x00FF_FFFF) + i, 0);
     }
     {
         let h = emu.core_riscv_mut(0);
@@ -462,10 +471,19 @@ fn run_proxy_self_check(
 
 fn check_patterns(side: &str, snap: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     if snap.len() != 56 {
-        return Err(format!("{side}: self-check snapshot length {}, expected 56", snap.len()).into());
+        return Err(format!(
+            "{side}: self-check snapshot length {}, expected 56",
+            snap.len()
+        )
+        .into());
     }
     for i in 0..7 {
-        let a = u32::from_le_bytes([snap[i * 4], snap[i * 4 + 1], snap[i * 4 + 2], snap[i * 4 + 3]]);
+        let a = u32::from_le_bytes([
+            snap[i * 4],
+            snap[i * 4 + 1],
+            snap[i * 4 + 2],
+            snap[i * 4 + 3],
+        ]);
         let b_off = (i + 7) * 4;
         let b = u32::from_le_bytes([
             snap[b_off],
@@ -651,7 +669,8 @@ fn seed_global_mtvec(
     if qemu_mtvec != TRAP_STUB {
         return Err(format!(
             "global mtvec seed failed on QEMU: mtvec={qemu_mtvec:#010x}, expected {TRAP_STUB:#010x}"
-        ).into());
+        )
+        .into());
     }
     Ok(())
 }
@@ -795,11 +814,7 @@ fn run_fuzz(
 /// cases of class `c` come out (HLD 2026.04.18 Fuzz `--class` Filter UX V1,
 /// Option A). Every `RiscvClass` variant has a matching `pub fn gen_fuzz_*`
 /// in `riscv_gen.rs`; this is a pure dispatch — no new public API.
-fn dispatch_per_class(
-    c: RiscvClass,
-    rng: &mut StdRng,
-    count: usize,
-) -> Vec<RiscvTestCase> {
+fn dispatch_per_class(c: RiscvClass, rng: &mut StdRng, count: usize) -> Vec<RiscvTestCase> {
     match c {
         RiscvClass::Rv32iAlu => riscv_gen::gen_fuzz_rv32i_alu(rng, count),
         RiscvClass::Rv32iMem => riscv_gen::gen_fuzz_rv32i_mem(rng, count),
@@ -881,7 +896,8 @@ fn run_one_test(
     zero_sram_region(gdb, emu, SCRATCH_BASE, 0x100)?;
 
     // Write the code on both sides.
-    gdb.write_mem(TEST_SLOT, &bytes).map_err(|e| format!("QEMU write_mem: {e}"))?;
+    gdb.write_mem(TEST_SLOT, &bytes)
+        .map_err(|e| format!("QEMU write_mem: {e}"))?;
     emu.load_image(TEST_SLOT, &bytes);
 
     // Reset the emulator's volatile diff-set CSRs (mcause, mstatus, mie,
@@ -945,8 +961,7 @@ fn run_one_test(
 
     let cycle_before = emu.core_riscv(0).cycles();
     let undef_before = emu.core_riscv(0).undef_count();
-    step_emu_until_pc(emu, term_addr, 256)
-        .map_err(|e| format!("emulator: {e}"))?;
+    step_emu_until_pc(emu, term_addr, 256).map_err(|e| format!("emulator: {e}"))?;
     let cycle_after = emu.core_riscv(0).cycles();
     let undef_after = emu.core_riscv(0).undef_count();
 
@@ -970,7 +985,9 @@ fn run_one_test(
     // (which uses gp and t6 as scratch and would otherwise overwrite
     // test outputs in those registers).
     let qemu_regs = read_gprs_qemu(gdb)?;
-    let qemu_pc = gdb.read_reg(REG_RV_PC as u8).map_err(|e| format!("QEMU PC: {e}"))?;
+    let qemu_pc = gdb
+        .read_reg(REG_RV_PC as u8)
+        .map_err(|e| format!("QEMU PC: {e}"))?;
     let emu_regs = read_gprs_emu(emu);
     let emu_pc = emu.core_riscv(0).pc();
 
@@ -1035,9 +1052,15 @@ fn run_one_test(
                 let rd = ((w >> 7) & 0x1F) as u8;
                 let csr = ((w >> 20) & 0xFFF) as u16;
                 Some((rd, csr))
-            } else { None }
-        } else { None }
-    } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Secondary hint: if this is a Pmp write-then-read-back pair, also
     // route the second word's rd through `warl_mask`. The read-back
@@ -1053,9 +1076,15 @@ fn run_one_test(
                 let rd = ((w >> 7) & 0x1F) as u8;
                 let csr = ((w >> 20) & 0xFFF) as u16;
                 Some((rd, csr))
-            } else { None }
-        } else { None }
-    } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     const PROXY_SCRATCH: u8 = 31;
     if qemu_oracle_valid {
@@ -1070,15 +1099,15 @@ fn run_one_test(
                 .filter(|(rd, _)| *rd == r)
                 .or_else(|| csr_rd_hint2.filter(|(rd, _)| *rd == r));
             let (q, e) = if let Some((_, csr)) = applied {
-                (warl_mask(csr, qemu_regs[r as usize]),
-                 warl_mask(csr, emu_regs[r as usize]))
+                (
+                    warl_mask(csr, qemu_regs[r as usize]),
+                    warl_mask(csr, emu_regs[r as usize]),
+                )
             } else {
                 (qemu_regs[r as usize], emu_regs[r as usize])
             };
             if q != e {
-                return Err(format!(
-                    "x{r} diff: QEMU={q:#010x} emu={e:#010x}"
-                ));
+                return Err(format!("x{r} diff: QEMU={q:#010x} emu={e:#010x}"));
             }
         }
         if qemu_pc != emu_pc {
@@ -1348,7 +1377,11 @@ fn warl_mask(csr: u16, v: u32) -> u32 {
             let code = v & 0x7FFF_FFFF;
             let legal_code = if interrupt != 0 {
                 if matches!(code, 3 | 7 | 11) { code } else { 0 }
-            } else if code <= 7 || code == 11 { code } else { 0 };
+            } else if code <= 7 || code == 11 {
+                code
+            } else {
+                0
+            };
             interrupt | legal_code
         }
         // PMP — phase-2 (NUM_ENTRIES=8). pmpcfg byte per-byte WARL: mask
@@ -1369,7 +1402,11 @@ fn warl_mask(csr: u16, v: u32) -> u32 {
                 let b = (v >> (byte * 8)) & 0xFF;
                 let masked = if entry_idx >= 8 { 0 } else { b & 0x9F };
                 // W=1,R=0 is WARL-rounded to W=0,R=0
-                let masked = if (masked & 0b11) == 0b10 { masked & !0b11 } else { masked };
+                let masked = if (masked & 0b11) == 0b10 {
+                    masked & !0b11
+                } else {
+                    masked
+                };
                 out |= masked << (byte * 8);
             }
             out
@@ -1407,8 +1444,18 @@ fn diff_csr_snapshots(qemu: &[u8], emu: &[u8]) -> Result<(), String> {
     for phase in 0..2 {
         let off = phase * 28;
         for i in 0..7 {
-            let qb: [u8; 4] = [qemu[off + i * 4], qemu[off + i * 4 + 1], qemu[off + i * 4 + 2], qemu[off + i * 4 + 3]];
-            let eb: [u8; 4] = [emu[off + i * 4], emu[off + i * 4 + 1], emu[off + i * 4 + 2], emu[off + i * 4 + 3]];
+            let qb: [u8; 4] = [
+                qemu[off + i * 4],
+                qemu[off + i * 4 + 1],
+                qemu[off + i * 4 + 2],
+                qemu[off + i * 4 + 3],
+            ];
+            let eb: [u8; 4] = [
+                emu[off + i * 4],
+                emu[off + i * 4 + 1],
+                emu[off + i * 4 + 2],
+                emu[off + i * 4 + 3],
+            ];
             let csr = CSR_DIFF_ADDRS[i];
             let qv = warl_mask(csr, u32::from_le_bytes(qb));
             let ev = warl_mask(csr, u32::from_le_bytes(eb));
@@ -1438,7 +1485,9 @@ fn zero_gprs_qemu(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Error>>
 fn read_gprs_qemu(gdb: &mut GdbClient) -> Result<[u32; 32], String> {
     let mut out = [0u32; 32];
     for r in 0u8..32 {
-        out[r as usize] = gdb.read_reg(r).map_err(|e| format!("QEMU read x{r}: {e}"))?;
+        out[r as usize] = gdb
+            .read_reg(r)
+            .map_err(|e| format!("QEMU read x{r}: {e}"))?;
     }
     out[0] = 0;
     Ok(out)

@@ -194,14 +194,16 @@ fn run() -> Result<(), String> {
     })
     .step_quantum(1)
     .flash(flash_bytes)
-    .build().expect("Serial build is infallible");
+    .build()
+    .expect("Serial build is infallible");
 
     // Load a bootrom if we can find one — SDK-style images need it to
     // resolve `rom_func_lookup` at runtime. Missing bootrom is only fatal
     // for firmware that actually exercises those paths.
     let resolved_bootrom = resolve_bootrom_path(args.bootrom.as_deref());
     if let Some(path) = &resolved_bootrom {
-        let bytes = std::fs::read(path).map_err(|e| format!("reading bootrom {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("reading bootrom {}: {e}", path.display()))?;
         eprintln!(
             "mmio_trace_rp2040: loaded bootrom {} bytes from {}",
             bytes.len(),
@@ -209,9 +211,7 @@ fn run() -> Result<(), String> {
         );
         emu.load_bootrom(&bytes);
     } else {
-        eprintln!(
-            "mmio_trace_rp2040: no bootrom loaded (not found at {DEFAULT_BOOTROM_PATH})"
-        );
+        eprintln!("mmio_trace_rp2040: no bootrom loaded (not found at {DEFAULT_BOOTROM_PATH})");
     }
 
     emu.reset();
@@ -246,7 +246,10 @@ fn run() -> Result<(), String> {
     emu.bus.mmio_trace_enabled = true;
     let ran = emu.run(args.cycles).expect("Serial run is infallible");
     emu.bus.mmio_trace_enabled = false;
-    eprintln!("mmio_trace_rp2040: ran {} cycles (requested {})", ran, args.cycles);
+    eprintln!(
+        "mmio_trace_rp2040: ran {} cycles (requested {})",
+        ran, args.cycles
+    );
 
     Ok(())
 }

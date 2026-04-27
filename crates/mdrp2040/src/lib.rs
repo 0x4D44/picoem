@@ -133,10 +133,7 @@ pub enum EmulatorError {
     /// One of the worker threads panicked. The `Emulator` is sticky-
     /// poisoned after this; drop and rebuild. Only produced on the
     /// Threaded path.
-    WorkerPanicked {
-        which: WorkerName,
-        message: String,
-    },
+    WorkerPanicked { which: WorkerName, message: String },
     /// The shared [`mdpicoem_common::SpinBarrier`] watchdog fired
     /// because a worker failed to arrive at the rendezvous within
     /// [`mdpicoem_common::threaded::DEFAULT_DEADLINE`]. The `Emulator`
@@ -147,10 +144,7 @@ pub enum EmulatorError {
     /// cannot identify *which* worker failed to arrive, this field
     /// names an observer rather than the culprit. `elapsed_ms` is the
     /// reporting waiter's own wall-clock elapsed time at expiry.
-    BarrierTimeout {
-        which: WorkerName,
-        elapsed_ms: u32,
-    },
+    BarrierTimeout { which: WorkerName, elapsed_ms: u32 },
 }
 
 impl std::fmt::Display for EmulatorError {
@@ -160,11 +154,9 @@ impl std::fmt::Display for EmulatorError {
                 f,
                 "operation not supported on a Threaded Emulator (Serial-only)"
             ),
-            EmulatorError::WorkerPanicked { which, message } => write!(
-                f,
-                "worker {} panicked: {message}",
-                which.as_str()
-            ),
+            EmulatorError::WorkerPanicked { which, message } => {
+                write!(f, "worker {} panicked: {message}", which.as_str())
+            }
             EmulatorError::BarrierTimeout { which, elapsed_ms } => write!(
                 f,
                 "barrier watchdog fired (observed by worker {}) after {}ms",
@@ -187,9 +179,9 @@ pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
 pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 
-pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats};
 #[cfg(target_arch = "x86_64")]
 pub use mdpicoem_common::Pacer;
+pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats};
 
 /// ROSC nominal frequency (~6.5 MHz). RP2040 boots on ROSC at the same
 /// nominal rate as RP2350; PLL configuration (if any) happens later in
@@ -335,8 +327,7 @@ impl Emulator {
 
     /// Placeholder-guard message shared by the typed accessors below.
     #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
-    const PLACEHOLDER_GUARD_MSG: &'static str =
-        "direct field access on cores/bus/clock is Serial-only; emulator is in \
+    const PLACEHOLDER_GUARD_MSG: &'static str = "direct field access on cores/bus/clock is Serial-only; emulator is in \
          Threaded mode — use typed accessors like core_cycles(), master_cycle(), \
          gpio_read() instead";
 
@@ -448,18 +439,14 @@ impl Emulator {
                     rom_buf[offset..end].copy_from_slice(&data[..end - offset]);
                     self.bus.memory.load_rom(&rom_buf);
                 }
-                self.invalidate_decode_caches_region(
-                    crate::bus::invalidation_regions::ROM,
-                );
+                self.invalidate_decode_caches_region(crate::bus::invalidation_regions::ROM);
             }
             0x2 => {
                 for (i, &byte) in data.iter().enumerate() {
                     let a = addr.wrapping_add(i as u32);
                     self.bus.memory.sram_write8(a & 0x00FF_FFFF, byte);
                 }
-                self.invalidate_decode_caches_region(
-                    crate::bus::invalidation_regions::SRAM,
-                );
+                self.invalidate_decode_caches_region(crate::bus::invalidation_regions::SRAM);
             }
             _ => {}
         }
@@ -628,8 +615,7 @@ impl Emulator {
     fn drain_cache_invalidations(bus: &mut Bus, cores: &mut [CortexM0Plus; 2]) {
         if !bus.pending_cache_invalidations.is_empty() {
             let active = bus.active_core();
-            cores[active]
-                .invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+            cores[active].invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
             bus.pending_cache_invalidations.clear();
         }
         if bus.pending_invalidation_regions != 0 {
@@ -729,8 +715,7 @@ impl Emulator {
         // tick. Drop to the slow path whenever SysTick is enabled on
         // the active core; SysTick-disabled workloads (almost
         // everything) keep their fast-path eligibility.
-        let systick_idle =
-            !self.bus.systicks[self.bus.active_core()].is_enabled();
+        let systick_idle = !self.bus.systicks[self.bus.active_core()].is_enabled();
         if pio_idle && peri_idle && dma_idle && systick_idle && !any_irq {
             self.tick_pio(consumed as u32);
             // Advance lazy-scheduled peripherals (TIMER alarms) by the
@@ -824,8 +809,7 @@ impl Emulator {
         // observation diagnostics under-count by quantum factor").
         self.pio_tick_count = self.pio_tick_count.wrapping_add(cycles as u64);
         if gpio_in & (1u32 << 4) == 0 {
-            self.pio_tick_iow_low_count =
-                self.pio_tick_iow_low_count.wrapping_add(cycles as u64);
+            self.pio_tick_iow_low_count = self.pio_tick_iow_low_count.wrapping_add(cycles as u64);
         }
         self.bus.pio[0].step_n(cycles, gpio_in);
         self.bus.pio[1].step_n(cycles, gpio_in);
@@ -904,10 +888,7 @@ impl Emulator {
             self.apply_pending_panic_inject();
             let step_q = self.step_quantum as u64;
             let quanta = cycles.div_ceil(step_q.max(1));
-            let threaded = self
-                .threaded
-                .as_mut()
-                .expect("threaded promoted above");
+            let threaded = self.threaded.as_mut().expect("threaded promoted above");
             match threaded.run_quanta_checked(quanta) {
                 Ok(()) => Ok(quanta.saturating_mul(step_q)),
                 Err(threaded::RunError::Panic { which, message }) => {
@@ -1116,9 +1097,7 @@ impl Emulator {
             // WFI wake: halted core + pending+enabled IRQ = un-halt.
             // Reuses `halted` so this also wakes a BKPT-halted core if
             // an IRQ asserts; matches the mdrp2350 design wart.
-            if self.cores[core].is_halted()
-                && self.bus.nvics[core].pending_and_enabled() != 0
-            {
+            if self.cores[core].is_halted() && self.bus.nvics[core].pending_and_enabled() != 0 {
                 self.cores[core].wake();
             }
         }
@@ -1260,8 +1239,7 @@ impl Emulator {
         // bulk invalidation here keeps the cache coherent with any
         // pre-step `poke` of executable bytes, with negligible overhead
         // (callers typically poke before the first step).
-        self.bus.pending_invalidation_regions |=
-            crate::bus::invalidation_regions::BULK;
+        self.bus.pending_invalidation_regions |= crate::bus::invalidation_regions::BULK;
         self.cores[0].invalidate_decode_cache_all();
         self.cores[1].invalidate_decode_cache_all();
         self.bus.pending_invalidation_regions = 0;
@@ -1378,7 +1356,11 @@ impl EmulatorBuilder {
     pub fn build(self) -> Result<Emulator, ConfigError> {
         // Threading availability gate — dual-execution HLD V1 §5.2.
         if self.execution == ExecutionModel::Threaded {
-            #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+            #[cfg(not(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                target_os = "windows"
+            )))]
             return Err(ConfigError::ThreadingUnavailable);
             #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
             {
@@ -1439,4 +1421,3 @@ impl EmulatorBuilder {
         Ok(emu)
     }
 }
-

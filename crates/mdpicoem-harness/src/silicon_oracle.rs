@@ -210,7 +210,12 @@ mod tests {
 
     #[test]
     fn test_case_outcome_fail_carries_detail() {
-        let o = CaseOutcome::fail("cycle", "backward_branch_large", "hw=14 emu=16 delta=-2 tol=0", 5);
+        let o = CaseOutcome::fail(
+            "cycle",
+            "backward_branch_large",
+            "hw=14 emu=16 delta=-2 tol=0",
+            5,
+        );
         assert_eq!(o.verdict, Verdict::Fail);
         assert_eq!(o.detail, "hw=14 emu=16 delta=-2 tol=0");
     }
@@ -265,7 +270,7 @@ mod tests {
     fn test_select_filter_only() {
         let (sel, sf, se) = select_by_name(NAMES, Some("pio"), None);
         assert_eq!(sel, vec![0, 1]);
-        assert_eq!(sf, 3);  // adc_one_shot, adc_round_robin_2ch, pll_sys_lock_timing
+        assert_eq!(sf, 3); // adc_one_shot, adc_round_robin_2ch, pll_sys_lock_timing
         assert_eq!(se, 0);
     }
 
@@ -274,7 +279,7 @@ mod tests {
         let (sel, sf, se) = select_by_name(NAMES, None, Some("adc"));
         assert_eq!(sel, vec![0, 1, 4]);
         assert_eq!(sf, 0);
-        assert_eq!(se, 2);  // adc_one_shot, adc_round_robin_2ch
+        assert_eq!(se, 2); // adc_one_shot, adc_round_robin_2ch
     }
 
     #[test]
@@ -300,7 +305,7 @@ mod tests {
         // filter="adc" picks 2; exclude="adc" removes all 2 → empty
         let (sel, sf, se) = select_by_name(NAMES, Some("adc"), Some("adc"));
         assert!(sel.is_empty());
-        assert_eq!(sf, 3);  // pio0, pio1, pll skipped by filter
-        assert_eq!(se, 2);  // both adc* skipped by exclude
+        assert_eq!(sf, 3); // pio0, pio1, pll skipped by filter
+        assert_eq!(se, 2); // both adc* skipped by exclude
     }
 }

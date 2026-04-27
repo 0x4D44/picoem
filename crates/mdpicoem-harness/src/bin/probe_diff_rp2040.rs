@@ -29,11 +29,11 @@
 
 use mdpicoem_harness::m0plus::{Bus as M0Bus, CortexM0Plus};
 use mdpicoem_harness::{
-    compare_probe, generate_all, generate_fuzz, setup_reg, RunState, TestCase,
-    EMU_M0PLUS_TEST_SCRATCH, EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK,
-    MASK_ALL_FLAGS, MASK_NZ_ONLY, SCRATCH_SIZE,
+    EMU_M0PLUS_TEST_SCRATCH, EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK, MASK_ALL_FLAGS,
+    MASK_NZ_ONLY, RunState, SCRATCH_SIZE, TestCase, compare_probe, generate_all, generate_fuzz,
+    setup_reg,
 };
-use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::probe::{DebugProbeSelector, list::Lister};
 use probe_rs::{Core, MemoryInterface, Permissions, RegisterId, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
@@ -141,7 +141,11 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, Stri
         return Err("--seed requires --fuzz".into());
     }
 
-    Ok(Args { fuzz_count, seed, probe })
+    Ok(Args {
+        fuzz_count,
+        seed,
+        probe,
+    })
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -261,32 +265,36 @@ fn is_m0plus_silicon_safe(tc: &TestCase) -> bool {
 
 /// Execute a single test case on hardware via probe-rs single-step.
 /// Returns post-execution state (no cycle count — M0+ has no DWT CYCCNT).
-fn run_one_probe(
-    core: &mut Core,
-    tc: &TestCase,
-) -> Result<RunState, DiffError> {
+fn run_one_probe(core: &mut Core, tc: &TestCase) -> Result<RunState, DiffError> {
     // 1. Write instruction (16 or 32 bits) + BKPT sentinel to test slot.
     let mut code = tc.opcode.to_le_bytes().to_vec();
     if let Some(hw1) = tc.hw1 {
         code.extend_from_slice(&hw1.to_le_bytes());
     }
     code.extend_from_slice(&BKPT.to_le_bytes());
-    core.write_8(EMU_M0PLUS_TEST_SLOT as u64, &code).map_err(DiffError::ProbeError)?;
+    core.write_8(EMU_M0PLUS_TEST_SLOT as u64, &code)
+        .map_err(DiffError::ProbeError)?;
 
     // 2. Set register defaults: R0-R12 = 0
     for i in 0..=12u16 {
-        core.write_core_reg(RegisterId(i), 0u32).map_err(DiffError::ProbeError)?;
+        core.write_core_reg(RegisterId(i), 0u32)
+            .map_err(DiffError::ProbeError)?;
     }
     // SP = test stack, LR = sentinel, PC = test slot, xPSR = precondition.
-    core.write_core_reg(RegisterId(13), EMU_M0PLUS_TEST_STACK).map_err(DiffError::ProbeError)?;
-    core.write_core_reg(RegisterId(14), 0xFFFF_FFFFu32).map_err(DiffError::ProbeError)?;
-    core.write_core_reg(PC, EMU_M0PLUS_TEST_SLOT).map_err(DiffError::ProbeError)?;
-    core.write_core_reg(XPSR, tc.xpsr_pre).map_err(DiffError::ProbeError)?;
+    core.write_core_reg(RegisterId(13), EMU_M0PLUS_TEST_STACK)
+        .map_err(DiffError::ProbeError)?;
+    core.write_core_reg(RegisterId(14), 0xFFFF_FFFFu32)
+        .map_err(DiffError::ProbeError)?;
+    core.write_core_reg(PC, EMU_M0PLUS_TEST_SLOT)
+        .map_err(DiffError::ProbeError)?;
+    core.write_core_reg(XPSR, tc.xpsr_pre)
+        .map_err(DiffError::ProbeError)?;
 
     // 3. Apply register preconditions (same address space as the emulator).
     for &(reg, val) in &tc.reg_pre {
         let val = setup_reg(reg, val, tc, EMU_M0PLUS_TEST_SCRATCH);
-        core.write_core_reg(RegisterId(reg as u16), val).map_err(DiffError::ProbeError)?;
+        core.write_core_reg(RegisterId(reg as u16), val)
+            .map_err(DiffError::ProbeError)?;
     }
 
     // 4. Memory setup (zero scratch + write preconditions).
@@ -294,9 +302,11 @@ fn run_one_probe(
         core.write_8(
             EMU_M0PLUS_TEST_SCRATCH as u64,
             &[0u8; SCRATCH_SIZE as usize],
-        ).map_err(DiffError::ProbeError)?;
+        )
+        .map_err(DiffError::ProbeError)?;
         for &(offset, val) in &tc.mem_pre {
-            core.write_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &[val]).map_err(DiffError::ProbeError)?;
+            core.write_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &[val])
+                .map_err(DiffError::ProbeError)?;
         }
     }
 
@@ -316,7 +326,9 @@ fn run_one_probe(
     // 7. Read post-state.
     let mut regs = [0u32; 16];
     for i in 0..16u32 {
-        regs[i as usize] = core.read_core_reg(RegisterId(i as u16)).map_err(DiffError::ProbeError)?;
+        regs[i as usize] = core
+            .read_core_reg(RegisterId(i as u16))
+            .map_err(DiffError::ProbeError)?;
     }
     let xpsr: u32 = core.read_core_reg(XPSR).map_err(DiffError::ProbeError)?;
 
@@ -324,7 +336,8 @@ fn run_one_probe(
     let mut mem = Vec::new();
     for &offset in &tc.mem_check {
         let mut byte = [0u8; 1];
-        core.read_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &mut byte).map_err(DiffError::ProbeError)?;
+        core.read_8((EMU_M0PLUS_TEST_SCRATCH + offset) as u64, &mut byte)
+            .map_err(DiffError::ProbeError)?;
         mem.push(byte[0]);
     }
 
@@ -373,16 +386,20 @@ fn run_one_emu_m0plus(tc: &TestCase, bus: &mut M0Bus) -> RunState {
     }
 
     let cycles = match tc.hw1 {
-        None => if tc.needs_bus {
-            core.execute_one_with_bus(tc.opcode, bus)
-        } else {
-            core.execute_one(tc.opcode)
-        },
-        Some(hw1) => if tc.needs_bus {
-            core.execute_one_wide_with_bus(tc.opcode, hw1, bus)
-        } else {
-            core.execute_one_wide(tc.opcode, hw1)
-        },
+        None => {
+            if tc.needs_bus {
+                core.execute_one_with_bus(tc.opcode, bus)
+            } else {
+                core.execute_one(tc.opcode)
+            }
+        }
+        Some(hw1) => {
+            if tc.needs_bus {
+                core.execute_one_wide_with_bus(tc.opcode, hw1, bus)
+            } else {
+                core.execute_one_wide(tc.opcode, hw1)
+            }
+        }
     };
 
     let mut regs = [0u32; 16];
@@ -618,7 +635,11 @@ fn run_fuzz(
     // Preserve pre-existing semantics: any UNDEF-on-silicon escalates to rc=1
     // (filter-gap is treated as a hard failure, since it indicates the M0+
     // safety filter let an unsupported encoding through to silicon).
-    let rc = if undef > 0 { 1 } else { rc_for(pass, fail, skip, undef) };
+    let rc = if undef > 0 {
+        1
+    } else {
+        rc_for(pass, fail, skip, undef)
+    };
     if rc == 1 {
         println!("Reproduce: probe_diff_rp2040 --fuzz {count_per_class} --seed {seed}");
     }
@@ -646,7 +667,9 @@ enum DiffError {
     /// on a VTOR=0 core means the instruction UNDEF'd on silicon and was
     /// dispatched into the bootrom's HardFault handler. Surfaces
     /// filter-gap bugs in `is_m0plus_silicon_safe`.
-    UndefOnSilicon { pc: u32 },
+    UndefOnSilicon {
+        pc: u32,
+    },
 }
 
 /// Classify the PC read after `core.step()`. Returns `Some(pc)` only when
@@ -663,11 +686,7 @@ fn classify_post_step_pc(pc: u32) -> Option<u32> {
 
 /// Run one test on both hardware and the emulator, compare results.
 /// Semantic-only comparison — no cycle check (M0+ lacks DWT CYCCNT).
-fn run_one_diff(
-    core: &mut Core,
-    bus: &mut M0Bus,
-    tc: &TestCase,
-) -> Result<(), DiffError> {
+fn run_one_diff(core: &mut Core, bus: &mut M0Bus, tc: &TestCase) -> Result<(), DiffError> {
     let hw_state = run_one_probe(core, tc)?;
     let emu_state = run_one_emu_m0plus(tc, bus);
     compare_probe(tc, &hw_state, &emu_state).map_err(DiffError::Mismatch)
@@ -689,7 +708,9 @@ fn run_one_diff(
 /// attempted AND at least 25% of them ended in `[SKIP]` (probe-rs transport
 /// errors). At exactly 25%, rc=3 trips (e.g. 25/100 → rc=3). See HLD §3.
 fn rc_for(pass: usize, fail: usize, skip: usize, undef: usize) -> i32 {
-    if fail > 0 || undef > 0 { return 1; }
+    if fail > 0 || undef > 0 {
+        return 1;
+    }
     let attempted = pass + fail + skip + undef;
     if attempted >= 20 && (skip * 100) / attempted >= 25 {
         return 3;
@@ -747,40 +768,73 @@ mod tests {
 
     #[test]
     fn filter_admits_msr_primask_control() {
-        assert!(is_m0plus_silicon_safe(&msr_case(16)), "PRIMASK must be allowed");
-        assert!(is_m0plus_silicon_safe(&msr_case(20)), "CONTROL must be allowed");
-        assert!(is_m0plus_silicon_safe(&mrs_case(16)), "MRS PRIMASK must be allowed");
-        assert!(is_m0plus_silicon_safe(&mrs_case(20)), "MRS CONTROL must be allowed");
+        assert!(
+            is_m0plus_silicon_safe(&msr_case(16)),
+            "PRIMASK must be allowed"
+        );
+        assert!(
+            is_m0plus_silicon_safe(&msr_case(20)),
+            "CONTROL must be allowed"
+        );
+        assert!(
+            is_m0plus_silicon_safe(&mrs_case(16)),
+            "MRS PRIMASK must be allowed"
+        );
+        assert!(
+            is_m0plus_silicon_safe(&mrs_case(20)),
+            "MRS CONTROL must be allowed"
+        );
     }
 
     #[test]
     fn filter_rejects_basepri_faultmask() {
-        assert!(!is_m0plus_silicon_safe(&msr_case(17)), "BASEPRI must be rejected");
-        assert!(!is_m0plus_silicon_safe(&msr_case(19)), "FAULTMASK must be rejected");
-        assert!(!is_m0plus_silicon_safe(&mrs_case(17)), "MRS BASEPRI must be rejected");
-        assert!(!is_m0plus_silicon_safe(&mrs_case(19)), "MRS FAULTMASK must be rejected");
+        assert!(
+            !is_m0plus_silicon_safe(&msr_case(17)),
+            "BASEPRI must be rejected"
+        );
+        assert!(
+            !is_m0plus_silicon_safe(&msr_case(19)),
+            "FAULTMASK must be rejected"
+        );
+        assert!(
+            !is_m0plus_silicon_safe(&mrs_case(17)),
+            "MRS BASEPRI must be rejected"
+        );
+        assert!(
+            !is_m0plus_silicon_safe(&mrs_case(19)),
+            "MRS FAULTMASK must be rejected"
+        );
     }
 
     #[test]
     fn filter_rejects_banked_ns_aliases() {
         // sysm >= 0x80 are banked _NS aliases (M33 TrustZone only).
-        assert!(!is_m0plus_silicon_safe(&msr_case(0x90)), "banked MSR must be rejected");
-        assert!(!is_m0plus_silicon_safe(&mrs_case(0x94)), "banked MRS must be rejected");
+        assert!(
+            !is_m0plus_silicon_safe(&msr_case(0x90)),
+            "banked MSR must be rejected"
+        );
+        assert!(
+            !is_m0plus_silicon_safe(&mrs_case(0x94)),
+            "banked MRS must be rejected"
+        );
     }
 
     #[test]
     fn filter_admits_barriers() {
         // DMB / DSB / ISB — all three share hw0 = 0xF3BF, hw1[15:8] = 0x8F.
         let dmb = TestCase {
-            opcode: 0xF3BF, hw1: Some(0x8F5F),
+            opcode: 0xF3BF,
+            hw1: Some(0x8F5F),
             ..TestCase::default()
         };
         let dsb = TestCase {
-            opcode: 0xF3BF, hw1: Some(0x8F4F),
+            opcode: 0xF3BF,
+            hw1: Some(0x8F4F),
             ..TestCase::default()
         };
         let isb = TestCase {
-            opcode: 0xF3BF, hw1: Some(0x8F6F),
+            opcode: 0xF3BF,
+            hw1: Some(0x8F6F),
             ..TestCase::default()
         };
         assert!(is_m0plus_silicon_safe(&dmb));
@@ -794,7 +848,8 @@ mod tests {
         // hw1 & 0xD000 == 0xD000.
         let (hw0, hw1) = mdpicoem_harness::thumb32_gen::enc_t32_bl(4);
         let tc = TestCase {
-            opcode: hw0, hw1: Some(hw1),
+            opcode: hw0,
+            hw1: Some(hw1),
             ..TestCase::default()
         };
         assert!(is_m0plus_silicon_safe(&tc), "BL must be allowed");
@@ -804,17 +859,22 @@ mod tests {
     fn filter_rejects_other_thumb32() {
         // A random non-subset Thumb-32 — e.g. TBB (hw0 = 0xE8DF, hw1 = 0xF000).
         let tc = TestCase {
-            opcode: 0xE8DF, hw1: Some(0xF000),
+            opcode: 0xE8DF,
+            hw1: Some(0xF000),
             ..TestCase::default()
         };
         assert!(!is_m0plus_silicon_safe(&tc), "TBB must be rejected");
 
         // LDRD literal — another M33-only Thumb-32 encoding.
         let tc = TestCase {
-            opcode: 0xE95F, hw1: Some(0x0100),
+            opcode: 0xE95F,
+            hw1: Some(0x0100),
             ..TestCase::default()
         };
-        assert!(!is_m0plus_silicon_safe(&tc), "LDRD literal must be rejected");
+        assert!(
+            !is_m0plus_silicon_safe(&tc),
+            "LDRD literal must be rejected"
+        );
     }
 
     #[test]
@@ -857,7 +917,10 @@ mod tests {
             opcode2: Some(0x0000),
             ..TestCase::default()
         };
-        assert!(!is_m0plus_silicon_safe(&multi), "multi-step must be rejected");
+        assert!(
+            !is_m0plus_silicon_safe(&multi),
+            "multi-step must be rejected"
+        );
     }
 
     #[test]
@@ -946,7 +1009,10 @@ mod tests {
                     err.contains("invalid probe selector"),
                     "error should name the flag: {err}"
                 );
-                assert!(err.contains("bogus"), "error should echo the bad value: {err}");
+                assert!(
+                    err.contains("bogus"),
+                    "error should echo the bad value: {err}"
+                );
             }
             Ok(_) => panic!("bogus selector must error"),
         }
@@ -1054,10 +1120,7 @@ mod tests {
         // barriers). If the filter drops the admit list to zero or
         // excludes the subset entirely, something has gone wrong.
         let all = generate_all();
-        let admitted: Vec<_> = all
-            .into_iter()
-            .filter(is_m0plus_silicon_safe)
-            .collect();
+        let admitted: Vec<_> = all.into_iter().filter(is_m0plus_silicon_safe).collect();
         assert!(
             admitted.len() > 100,
             "filter should admit at least 100 common Thumb-16 cases; got {}",

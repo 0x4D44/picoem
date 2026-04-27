@@ -456,7 +456,10 @@ mod tests {
         s.write32(SSPCR1, SSPCR1_SSE | SSPCR1_LBM, 0, &mut irqs);
         s.write32(SSPDR, 0xA5, 0, &mut irqs);
         // RX FIFO should carry the loopback copy immediately.
-        assert!(s.read32(SSPSR) & SSPSR_RNE != 0, "RX non-empty after LBM push");
+        assert!(
+            s.read32(SSPSR) & SSPSR_RNE != 0,
+            "RX non-empty after LBM push"
+        );
         let rx = s.read32(SSPDR);
         assert_eq!(rx, 0xA5);
     }

@@ -511,7 +511,10 @@ mod tests {
         cs_fall(&mut psram, &mut pins);
         clock_byte(&mut psram, &mut pins, 0x99);
         cs_rise(&mut psram, &mut pins);
-        assert!(!psram.reset_armed(), "0x99 after 0x66 must clear reset_armed");
+        assert!(
+            !psram.reset_armed(),
+            "0x99 after 0x66 must clear reset_armed"
+        );
         assert!(psram.phase_is_idle());
     }
 

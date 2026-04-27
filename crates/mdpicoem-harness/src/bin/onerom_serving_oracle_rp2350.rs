@@ -30,8 +30,7 @@ use mdpicoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_sync};
 use mdrp2350::{Config, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-const FLASH_PATH: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
+const FLASH_PATH: &str = "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
 
 /// Cycle cap for boot. Same budget as Stage F's binary — sync normally
 /// arrives around cycle 7k; 10M is generous.
@@ -72,7 +71,8 @@ fn main() -> ExitCode {
     // check to work (HLD §4.4).
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -160,12 +160,8 @@ fn main() -> ExitCode {
         unique.len(),
     );
     if unique.len() == 1 {
-        println!(
-            "WARNING: shadow is uniform — oracle cannot distinguish between addresses."
-        );
-        println!(
-            "         See the Shadow Source Investigation journal (2026-04-15)."
-        );
+        println!("WARNING: shadow is uniform — oracle cannot distinguish between addresses.");
+        println!("         See the Shadow Source Investigation journal (2026-04-15).");
     }
 
     // No pre-case external-input setup needed: `run_case` authoritatively
@@ -264,11 +260,7 @@ fn format_verdict_short(v: &onerom_serving_oracle::Verdict) -> String {
         onerom_serving_oracle::Verdict::WrongByte { .. } => "WrongByte".to_string(),
         onerom_serving_oracle::Verdict::NoResolve => "NoResolve".to_string(),
         onerom_serving_oracle::Verdict::NoStableByte => "NoStableByte".to_string(),
-        onerom_serving_oracle::Verdict::ResolvedAddrOutOfRange { .. } => {
-            "AddrOOR".to_string()
-        }
-        onerom_serving_oracle::Verdict::LatencyOutOfEnvelope { .. } => {
-            "LatencyOOE".to_string()
-        }
+        onerom_serving_oracle::Verdict::ResolvedAddrOutOfRange { .. } => "AddrOOR".to_string(),
+        onerom_serving_oracle::Verdict::LatencyOutOfEnvelope { .. } => "LatencyOOE".to_string(),
     }
 }

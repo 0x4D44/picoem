@@ -93,8 +93,11 @@ fn bus_pio_instr_mem_write_is_observable_via_force_exec() {
 
     // Tick PIO0 once so SM0 executes SET PINS, 1 and pad_out reflects it.
     bus.pio[0].step(0);
-    assert_eq!(bus.pio[0].pad_out & 0x1, 0x1,
-        "SET PINS, 1 must drive pad_out bit 0 high — confirms INSTR_MEM write landed");
+    assert_eq!(
+        bus.pio[0].pad_out & 0x1,
+        0x1,
+        "SET PINS, 1 must drive pad_out bit 0 high — confirms INSTR_MEM write landed"
+    );
 }
 
 #[test]
@@ -149,8 +152,11 @@ fn update_gpio_pio_overrides_sio_on_same_pin() {
     emu.bus.pio[0].pad_oe = 1 << 5;
     emu.bus.pio[0].pad_out = 0;
     emu.update_gpio();
-    assert_eq!(emu.bus.gpio_in & (1 << 5), 0,
-        "PIO pad_oe bit must override SIO on pin 5");
+    assert_eq!(
+        emu.bus.gpio_in & (1 << 5),
+        0,
+        "PIO pad_oe bit must override SIO on pin 5"
+    );
 }
 
 #[test]
@@ -173,7 +179,11 @@ fn update_gpio_pio1_participates_in_merge() {
     emu.bus.pio[1].pad_oe = 1 << 7;
     emu.bus.pio[1].pad_out = 1 << 7;
     emu.update_gpio();
-    assert_ne!(emu.bus.gpio_in & (1 << 7), 0, "PIO1 pin 7 must appear in gpio_in");
+    assert_ne!(
+        emu.bus.gpio_in & (1 << 7),
+        0,
+        "PIO1 pin 7 must appear in gpio_in"
+    );
 }
 
 #[test]
@@ -184,8 +194,11 @@ fn update_gpio_masks_to_30_pins() {
     emu.bus.pio[0].pad_oe = 0xFFFF_FFFF;
     emu.bus.pio[0].pad_out = 0xFFFF_FFFF;
     emu.update_gpio();
-    assert_eq!(emu.bus.gpio_in & 0xC000_0000, 0,
-        "bits 30/31 must be masked off — RP2040 has 30 GPIOs");
+    assert_eq!(
+        emu.bus.gpio_in & 0xC000_0000,
+        0,
+        "bits 30/31 must be masked off — RP2040 has 30 GPIOs"
+    );
     assert_eq!(emu.bus.gpio_in, 0x3FFF_FFFF);
 }
 
@@ -207,13 +220,17 @@ fn update_gpio_masks_to_30_pins() {
 ///   addr 1: SET PINS, 0   (pin LOW)
 ///   addr 2: JMP 0         (loop)
 fn blinky_emulator(pio_base: u32, pin: u8) -> Emulator {
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
     let set_pins_1: u16 = 0xE001; // SET PINS, 1
     let set_pins_0: u16 = 0xE000; // SET PINS, 0
     let jmp_0: u16 = 0x0000; // JMP 0
 
     for (i, insn) in [set_pins_1, set_pins_0, jmp_0].iter().enumerate() {
-        emu.bus.write32(pio_base + 0x048 + (i as u32) * 4, *insn as u32);
+        emu.bus
+            .write32(pio_base + 0x048 + (i as u32) * 4, *insn as u32);
     }
 
     // SM0_PINCTRL: set_count=1 (bits 28:26), set_base=pin (bits 9:5).
@@ -293,7 +310,10 @@ fn pio1_blinky_is_independent_of_pio0() {
 fn pio0_and_pio1_drive_different_pins_concurrently() {
     // Run PIO0 on pin 5 and PIO1 on pin 12 simultaneously.
     // Both should reflect in gpio_in on the same step.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
 
     // Load identical blinky programs into both blocks.
     let set_pins_1: u16 = 0xE001;
@@ -307,12 +327,14 @@ fn pio0_and_pio1_drive_different_pins_concurrently() {
     }
 
     // PIO0 → pin 5
-    emu.bus.write32(PIO0_BASE + 0x0DC, (1u32 << 26) | (5u32 << 5));
+    emu.bus
+        .write32(PIO0_BASE + 0x0DC, (1u32 << 26) | (5u32 << 5));
     emu.bus.write32(PIO0_BASE + 0x0D8, 0xE081); // SET PINDIRS, 1
     emu.bus.write32(PIO0_BASE + 0x000, 0x1);
 
     // PIO1 → pin 12
-    emu.bus.write32(PIO1_BASE + 0x0DC, (1u32 << 26) | (12u32 << 5));
+    emu.bus
+        .write32(PIO1_BASE + 0x0DC, (1u32 << 26) | (12u32 << 5));
     emu.bus.write32(PIO1_BASE + 0x0D8, 0xE081);
     emu.bus.write32(PIO1_BASE + 0x000, 0x1);
 
@@ -334,7 +356,10 @@ fn pio_multi_sm_different_pins_in_one_block() {
     // SM0 drives pin 5, SM1 drives pin 12, both in PIO0. Both pins must
     // reflect in gpio_in after one step — two SMs on the same block tick
     // concurrently on each system-clock cycle (default clkdiv=1).
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
 
     // Shared instruction memory layout:
     //   addr 0: SET PINS, 1  (SM0 body)
@@ -345,20 +370,25 @@ fn pio_multi_sm_different_pins_in_one_block() {
     let jmp_0: u16 = 0x0000;
     let jmp_2: u16 = 0x0002;
     for (i, insn) in [set_pins_1, jmp_0, set_pins_1, jmp_2].iter().enumerate() {
-        emu.bus.write32(PIO0_BASE + 0x048 + (i as u32) * 4, *insn as u32);
+        emu.bus
+            .write32(PIO0_BASE + 0x048 + (i as u32) * 4, *insn as u32);
     }
 
     // SM0_PINCTRL: set_count=1, set_base=5.
-    emu.bus.write32(PIO0_BASE + 0x0DC, (1u32 << 26) | (5u32 << 5));
+    emu.bus
+        .write32(PIO0_BASE + 0x0DC, (1u32 << 26) | (5u32 << 5));
     // SM0_EXECCTRL: wrap_top=1, wrap_bottom=0 (loops addr 0→1→0).
-    emu.bus.write32(PIO0_BASE + 0x0CC, (1u32 << 12) | (0u32 << 7));
+    emu.bus
+        .write32(PIO0_BASE + 0x0CC, (1u32 << 12) | (0u32 << 7));
     // Force SET PINDIRS, 1 for SM0 (uses SM0's set_base=5).
     emu.bus.write32(PIO0_BASE + 0x0D8, 0xE081);
 
     // SM1_PINCTRL at 0x0F4 (0x0DC + 0x18): set_count=1, set_base=12.
-    emu.bus.write32(PIO0_BASE + 0x0F4, (1u32 << 26) | (12u32 << 5));
+    emu.bus
+        .write32(PIO0_BASE + 0x0F4, (1u32 << 26) | (12u32 << 5));
     // SM1_EXECCTRL at 0x0E4 (0x0CC + 0x18): wrap_top=3, wrap_bottom=2.
-    emu.bus.write32(PIO0_BASE + 0x0E4, (3u32 << 12) | (2u32 << 7));
+    emu.bus
+        .write32(PIO0_BASE + 0x0E4, (3u32 << 12) | (2u32 << 7));
     // SM1_INSTR at 0x0F0: force SET PINDIRS, 1 for SM1 (uses SM1's
     // set_base=12).
     emu.bus.write32(PIO0_BASE + 0x0F0, 0xE081);
@@ -424,9 +454,11 @@ fn emu_step_advances_pio_by_core0_cycle_cost() {
         emu.bus.write32(PIO0_BASE + 0x050, 0xE001);
         emu.bus.write32(PIO0_BASE + 0x054, 0x0000);
         // SM0_PINCTRL: set_count=1, set_base=0.
-        emu.bus.write32(PIO0_BASE + 0x0DC, (1u32 << 26) | (0u32 << 5));
+        emu.bus
+            .write32(PIO0_BASE + 0x0DC, (1u32 << 26) | (0u32 << 5));
         // SM0_EXECCTRL: wrap_top=3, wrap_bottom=0.
-        emu.bus.write32(PIO0_BASE + 0x0CC, (3u32 << 12) | (0u32 << 7));
+        emu.bus
+            .write32(PIO0_BASE + 0x0CC, (3u32 << 12) | (0u32 << 7));
         // Force SET PINDIRS, 1 so pin 0 is driven.
         emu.bus.write32(PIO0_BASE + 0x0D8, 0xE081);
         // Enable SM0.
@@ -434,18 +466,26 @@ fn emu_step_advances_pio_by_core0_cycle_cost() {
     }
 
     // --- Baseline: core 0 on NOPs -> c0 = 1 per step -> 1 PIO tick -> pin 0.
-    let mut emu_nop = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu_nop = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
     setup_pio(&mut emu_nop);
     park_core0_on_nops(&mut emu_nop);
     emu_nop.step().expect("Serial step is infallible");
-    assert!(!emu_nop.gpio_read(0),
-        "after 1 PIO tick pin 0 must be LOW (SET PINS, 0 @ addr 0)");
+    assert!(
+        !emu_nop.gpio_read(0),
+        "after 1 PIO tick pin 0 must be LOW (SET PINS, 0 @ addr 0)"
+    );
 
     // --- Discriminator: core 0 on a 3-cycle taken branch -> c0 = 3 ->
     // 3 PIO ticks -> pin 1. Uses `B +0` (0xE000 Thumb-16), which
     // branches to the very next instruction at +3 cycles; chain enough
     // copies that the test can step multiple times if it wants to.
-    let mut emu_branch = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu_branch = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
     setup_pio(&mut emu_branch);
     let prog = 0x2000_0000u32;
     for i in 0..256u32 {
@@ -455,10 +495,12 @@ fn emu_step_advances_pio_by_core0_cycle_cost() {
     emu_branch.cores[0].regs.msp = 0x2003_0000;
     emu_branch.cores[0].regs.r[13] = emu_branch.cores[0].regs.msp;
     emu_branch.step().expect("Serial step is infallible");
-    assert!(emu_branch.gpio_read(0),
+    assert!(
+        emu_branch.gpio_read(0),
         "after 3 PIO ticks pin 0 must be HIGH (SET PINS, 1 @ addr 2) — \
          proves Emulator::step advances PIO by c0 cycles per instruction \
-         when step_quantum=1");
+         when step_quantum=1"
+    );
 }
 
 #[test]
@@ -478,14 +520,10 @@ fn emulator_reset_clears_pio_state() {
 
     emu.reset();
 
-    assert!(!emu.bus.pio[0].sm[0].enabled(),
-        "reset() must disable SMs");
-    assert_eq!(emu.bus.pio[0].pad_out, 0,
-        "reset() must clear pad_out");
-    assert_eq!(emu.bus.pio[0].pad_oe, 0,
-        "reset() must clear pad_oe");
-    assert_eq!(emu.bus.pio[1].pad_oe, 0,
-        "reset() must also reset PIO1");
+    assert!(!emu.bus.pio[0].sm[0].enabled(), "reset() must disable SMs");
+    assert_eq!(emu.bus.pio[0].pad_out, 0, "reset() must clear pad_out");
+    assert_eq!(emu.bus.pio[0].pad_oe, 0, "reset() must clear pad_oe");
+    assert_eq!(emu.bus.pio[1].pad_oe, 0, "reset() must also reset PIO1");
 }
 
 #[test]
@@ -504,14 +542,18 @@ fn pio0_sm0_autopush_at_threshold_18() {
     // This test isolates exactly that path with no ISA waveform, no
     // boot path, no other SMs — just the IN/IN/JMP loop and a
     // controlled GPIO pattern.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
 
     // PIO0 instruction memory.
     let in_pins_10: u16 = 0x400A; // IN PINS, 10  (010 00000 000 01010)
-    let in_pins_8:  u16 = 0x4008; // IN PINS, 8   (010 00000 000 01000)
-    let jmp_0:      u16 = 0x0000; // JMP 0
+    let in_pins_8: u16 = 0x4008; // IN PINS, 8   (010 00000 000 01000)
+    let jmp_0: u16 = 0x0000; // JMP 0
     for (i, insn) in [in_pins_10, in_pins_8, jmp_0].iter().enumerate() {
-        emu.bus.write32(PIO0_BASE + 0x048 + (i as u32) * 4, *insn as u32);
+        emu.bus
+            .write32(PIO0_BASE + 0x048 + (i as u32) * 4, *insn as u32);
     }
 
     // SM0_SHIFTCTRL @ +0x0D0:
@@ -525,7 +567,8 @@ fn pio0_sm0_autopush_at_threshold_18() {
     emu.bus.write32(PIO0_BASE + 0x0DC, 6u32 << 15);
 
     // SM0_EXECCTRL @ +0x0CC: wrap_top=2, wrap_bottom=0.
-    emu.bus.write32(PIO0_BASE + 0x0CC, (2u32 << 12) | (0u32 << 7));
+    emu.bus
+        .write32(PIO0_BASE + 0x0CC, (2u32 << 12) | (0u32 << 7));
 
     // SM0_CLKDIV @ +0x0C8: 1.0 (one PIO cycle per system clock).
     emu.bus.write32(PIO0_BASE + 0x0C8, 0x0001_0000);
@@ -565,8 +608,7 @@ fn pio0_sm0_autopush_at_threshold_18() {
         "ISR must hold the 10-bit address pattern after first IN"
     );
     assert_eq!(
-        emu.bus.pio[0].sm[0].autopush_count,
-        0,
+        emu.bus.pio[0].sm[0].autopush_count, 0,
         "autopush must not fire at isr_count=10 (threshold=18)"
     );
     assert!(

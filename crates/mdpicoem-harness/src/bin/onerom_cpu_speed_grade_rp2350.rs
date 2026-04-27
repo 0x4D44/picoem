@@ -57,15 +57,15 @@ fn main() -> std::process::ExitCode {
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 mod windows_main {
     use std::process::ExitCode;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use mdpicoem_harness::onerom_cpu_speed_grade::{
-        build_walk_plan, first_failing_rung, shuffle_plan, verify_observed, FailContext,
-        LadderRung, SweepReport, WalkStep, DEFAULT_LADDER, GPIO_DATA_BASE, ROM_SET_INDEX,
-        WALK_PLAN_LEN,
+        DEFAULT_LADDER, FailContext, GPIO_DATA_BASE, LadderRung, ROM_SET_INDEX, SweepReport,
+        WALK_PLAN_LEN, WalkStep, build_walk_plan, first_failing_rung, shuffle_plan,
+        verify_observed,
     };
     use mdpicoem_harness::onerom_serving_oracle;
     use mdpicoem_harness::onerom_serving_oracle_cpu;
@@ -201,10 +201,8 @@ mod windows_main {
             fn GetCurrentThread() -> HANDLE;
             fn SetPriorityClass(hProcess: HANDLE, dwPriorityClass: DWORD) -> BOOL;
             fn SetThreadPriority(hThread: HANDLE, nPriority: i32) -> BOOL;
-            fn SetThreadAffinityMask(
-                hThread: HANDLE,
-                dwThreadAffinityMask: DWORD_PTR,
-            ) -> DWORD_PTR;
+            fn SetThreadAffinityMask(hThread: HANDLE, dwThreadAffinityMask: DWORD_PTR)
+            -> DWORD_PTR;
         }
 
         /// Raise process to HIGH_PRIORITY_CLASS. Safe to call once at
@@ -329,9 +327,7 @@ mod windows_main {
                 }
                 "--step-quantum" => {
                     i += 1;
-                    let v = args
-                        .get(i)
-                        .ok_or("--step-quantum requires a value")?;
+                    let v = args.get(i).ok_or("--step-quantum requires a value")?;
                     step_quantum = v
                         .parse::<u32>()
                         .map_err(|e| format!("--step-quantum: {}", e))?;
@@ -406,7 +402,8 @@ mod windows_main {
     fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         emu.load_bootrom(bootrom);
         emu.load_flash(flash);
         emu.reset();
@@ -515,9 +512,7 @@ mod windows_main {
     ) -> ProbeResult {
         // Pin one stimulus, run, measure.
         let first = &plan[0];
-        shared
-            .gpio
-            .write_external(first.gpio_stim, first.gpio_mask);
+        shared.gpio.write_external(first.gpio_stim, first.gpio_mask);
 
         let c0 = shared.master_cycle.load(Ordering::Acquire);
         let t0 = Instant::now();
@@ -586,9 +581,7 @@ mod windows_main {
         for &perm in shuffle {
             let step = &plan[perm as usize];
             let t0 = Instant::now();
-            shared
-                .gpio
-                .write_external(step.gpio_stim, step.gpio_mask);
+            shared.gpio.write_external(step.gpio_stim, step.gpio_mask);
             while t0.elapsed() < target {
                 std::hint::spin_loop();
             }
@@ -637,9 +630,7 @@ mod windows_main {
         for &perm in shuffle {
             let step = &plan[perm as usize];
             let t0 = Instant::now();
-            shared
-                .gpio
-                .write_external(step.gpio_stim, step.gpio_mask);
+            shared.gpio.write_external(step.gpio_stim, step.gpio_mask);
             while t0.elapsed() < target {
                 std::hint::spin_loop();
             }
@@ -853,9 +844,7 @@ mod windows_main {
             }
             // Leave gpio_external_in on plan[0] so the threaded
             // runtime starts with a valid stim.
-            emu.bus
-                .gpio_external_in
-                .store(plan[0].gpio_stim, ordering);
+            emu.bus.gpio_external_in.store(plan[0].gpio_stim, ordering);
             for _ in 0..100 {
                 emu.run(1).expect("Serial run is infallible");
             }
@@ -1036,27 +1025,14 @@ mod windows_main {
             let mut host_stalled_total: u32 = 0;
             for sweep_idx in 0..cli.sweeps_per_threshold {
                 let shuffle = shuffle_plan(plan.len(), cli.seed, sweep_idx);
-                let (observed, stalled) = if std::env::var("SPEED_GRADE_DEBUG").is_ok()
-                    && sweep_idx == 0
-                {
-                    run_sweep_debug(
-                        &shared_for_meas,
-                        &plan,
-                        &shuffle,
-                        rung.target_ns,
-                        30,
-                    )
-                } else {
-                    run_sweep(&shared_for_meas, &plan, &shuffle, rung.target_ns)
-                };
+                let (observed, stalled) =
+                    if std::env::var("SPEED_GRADE_DEBUG").is_ok() && sweep_idx == 0 {
+                        run_sweep_debug(&shared_for_meas, &plan, &shuffle, rung.target_ns, 30)
+                    } else {
+                        run_sweep(&shared_for_meas, &plan, &shuffle, rung.target_ns)
+                    };
                 host_stalled_total = host_stalled_total.saturating_add(stalled);
-                let fail = verify_observed(
-                    &plan,
-                    &shuffle,
-                    &observed,
-                    rung.target_ns,
-                    sweep_idx,
-                );
+                let fail = verify_observed(&plan, &shuffle, &observed, rung.target_ns, sweep_idx);
                 if let Some(fc) = fail {
                     // Count all mismatches in this sweep (not just the first).
                     let sweep_errors: u32 = observed

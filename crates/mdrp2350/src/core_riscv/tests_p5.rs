@@ -7,12 +7,12 @@
 // unreachable from unit-test scope (e.g. `unreachable!()` panics that only
 // fire on hardware UB), the section explains why it is left alone.
 
+use super::Hazard3;
 use super::csr::{CSR_MHARTID, CSR_MINSTRET, CSR_MIP, CSR_MSCRATCH, CSR_MTVAL, CSR_MTVEC};
 use super::decode::{
     self, AluImmKind, AluKind, AmoKind, CsrKind, LoadKind, MulDivKind, Op, StoreKind,
 };
-use super::irq::{Xh3Irq, CTX_MRETEIRQ, CTX_NOIRQ};
-use super::Hazard3;
+use super::irq::{CTX_MRETEIRQ, CTX_NOIRQ, Xh3Irq};
 use crate::{Arch, Bus, Config, Cores, EmulatorBuilder};
 
 // ---------- helpers ----------
@@ -689,8 +689,7 @@ fn exec_remu_by_zero_returns_dividend() {
 #[test]
 fn decode_slli_funct7_zero_legal() {
     // funct3 = 001 (SLLI), funct7 = 0 (legal). rd=3, rs1=4, shamt=5.
-    let insn = (5u32 << 20) | (4u32 << 15) | (0b001 << 12) | (3u32 << 7)
-        | (0b00_100 << 2) | 0b11;
+    let insn = (5u32 << 20) | (4u32 << 15) | (0b001 << 12) | (3u32 << 7) | (0b00_100 << 2) | 0b11;
     matches!(
         decode::decode(insn),
         Op::ShiftImm {
@@ -1421,7 +1420,8 @@ fn mod_csr_read_minstret_and_mtvec() {
 fn mod_emu_builder_defaults_hart_ids() {
     let emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let Cores::RiscV(cs) = &emu.cores else {
         panic!("expected RiscV cores")
     };

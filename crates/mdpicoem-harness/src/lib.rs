@@ -63,8 +63,8 @@ pub mod silicon_oracle;
 pub mod silicon_scenarios;
 pub mod thumb32_gen;
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 /// Extension trait to call Rng::gen() without hitting the `gen` keyword reservation.
 pub(crate) trait RngExt {
@@ -3109,8 +3109,8 @@ fn gen_push_pop() -> Vec<TestCase> {
         addr_regs: vec![13],
         needs_bus: true,
         mem_check: {
-            let mut c = mem_check_u32(8);  // R0 at scratch+8
-            c.extend(mem_check_u32(12));   // R1 at scratch+12
+            let mut c = mem_check_u32(8); // R0 at scratch+8
+            c.extend(mem_check_u32(12)); // R1 at scratch+12
             c
         },
         ..TestCase::default()
@@ -3136,8 +3136,8 @@ fn gen_push_pop() -> Vec<TestCase> {
         needs_bus: true,
         mem_check: {
             let mut c = mem_check_u32(12); // R0 at scratch+12
-            c.extend(mem_check_u32(16));   // R1 at scratch+16
-            c.extend(mem_check_u32(20));   // LR at scratch+20
+            c.extend(mem_check_u32(16)); // R1 at scratch+16
+            c.extend(mem_check_u32(20)); // LR at scratch+20
             c
         },
         ..TestCase::default()
@@ -3194,8 +3194,14 @@ fn gen_push_pop() -> Vec<TestCase> {
         name: "PUSH {R0-R7}".into(),
         opcode: enc_push(0xFF, false),
         reg_pre: vec![
-            (0, 0x00), (1, 0x11), (2, 0x22), (3, 0x33),
-            (4, 0x44), (5, 0x55), (6, 0x66), (7, 0x77),
+            (0, 0x00),
+            (1, 0x11),
+            (2, 0x22),
+            (3, 0x33),
+            (4, 0x44),
+            (5, 0x55),
+            (6, 0x66),
+            (7, 0x77),
             (13, 64),
         ],
         addr_regs: vec![13],
@@ -3372,8 +3378,14 @@ fn gen_stm_ldm() -> Vec<TestCase> {
         name: "STM R3!, {R0-R2, R4-R7}".into(),
         opcode: enc_stm(3, 0xF7), // bits 0-2 + 4-7 = 0b1111_0111
         reg_pre: vec![
-            (3, 0), (0, 0x00), (1, 0x11), (2, 0x22),
-            (4, 0x44), (5, 0x55), (6, 0x66), (7, 0x77),
+            (3, 0),
+            (0, 0x00),
+            (1, 0x11),
+            (2, 0x22),
+            (4, 0x44),
+            (5, 0x55),
+            (6, 0x66),
+            (7, 0x77),
         ],
         addr_regs: vec![3],
         needs_bus: true,
@@ -3948,21 +3960,21 @@ fn flags_condition_true(cond: u16) -> u32 {
     let c = 1u32 << 29;
     let v = 1u32 << 28;
     match cond & 0xF {
-        0  => tb | z,                 // EQ: Z=1
-        1  => tb,                     // NE: Z=0
-        2  => tb | c,                 // CS: C=1
-        3  => tb,                     // CC: C=0
-        4  => tb | n,                 // MI: N=1
-        5  => tb,                     // PL: N=0
-        6  => tb | v,                 // VS: V=1
-        7  => tb,                     // VC: V=0
-        8  => tb | c,                 // HI: C=1 & Z=0
-        9  => tb | z,                 // LS: C=0 | Z=1
-        10 => tb,                     // GE: N==V (both 0)
-        11 => tb | n,                 // LT: N!=V (N=1, V=0)
-        12 => tb,                     // GT: Z=0 & N==V (both 0)
-        13 => tb | z,                 // LE: Z=1 OR N!=V
-        _  => tb,
+        0 => tb | z,  // EQ: Z=1
+        1 => tb,      // NE: Z=0
+        2 => tb | c,  // CS: C=1
+        3 => tb,      // CC: C=0
+        4 => tb | n,  // MI: N=1
+        5 => tb,      // PL: N=0
+        6 => tb | v,  // VS: V=1
+        7 => tb,      // VC: V=0
+        8 => tb | c,  // HI: C=1 & Z=0
+        9 => tb | z,  // LS: C=0 | Z=1
+        10 => tb,     // GE: N==V (both 0)
+        11 => tb | n, // LT: N!=V (N=1, V=0)
+        12 => tb,     // GT: Z=0 & N==V (both 0)
+        13 => tb | z, // LE: Z=1 OR N!=V
+        _ => tb,
     }
 }
 
@@ -3974,21 +3986,21 @@ fn flags_condition_false(cond: u16) -> u32 {
     let c = 1u32 << 29;
     let v = 1u32 << 28;
     match cond & 0xF {
-        0  => tb,                     // EQ false: Z=0
-        1  => tb | z,                 // NE false: Z=1
-        2  => tb,                     // CS false: C=0
-        3  => tb | c,                 // CC false: C=1
-        4  => tb,                     // MI false: N=0
-        5  => tb | n,                 // PL false: N=1
-        6  => tb,                     // VS false: V=0
-        7  => tb | v,                 // VC false: V=1
-        8  => tb | z,                 // HI false: Z=1
-        9  => tb | c,                 // LS false: C=1 & Z=0
-        10 => tb | n,                 // GE false: N!=V (N=1, V=0)
-        11 => tb,                     // LT false: N==V (both 0)
-        12 => tb | z,                 // GT false: Z=1
-        13 => tb,                     // LE false: Z=0 & N==V
-        _  => tb,
+        0 => tb,      // EQ false: Z=0
+        1 => tb | z,  // NE false: Z=1
+        2 => tb,      // CS false: C=0
+        3 => tb | c,  // CC false: C=1
+        4 => tb,      // MI false: N=0
+        5 => tb | n,  // PL false: N=1
+        6 => tb,      // VS false: V=0
+        7 => tb | v,  // VC false: V=1
+        8 => tb | z,  // HI false: Z=1
+        9 => tb | c,  // LS false: C=1 & Z=0
+        10 => tb | n, // GE false: N!=V (N=1, V=0)
+        11 => tb,     // LT false: N==V (both 0)
+        12 => tb | z, // GT false: Z=1
+        13 => tb,     // LE false: Z=0 & N==V
+        _ => tb,
     }
 }
 
@@ -4000,21 +4012,21 @@ fn cond_passes(cond: u16, xpsr: u32) -> bool {
     let c = (xpsr >> 29) & 1 != 0;
     let v = (xpsr >> 28) & 1 != 0;
     match cond & 0xF {
-        0  => z,
-        1  => !z,
-        2  => c,
-        3  => !c,
-        4  => n,
-        5  => !n,
-        6  => v,
-        7  => !v,
-        8  => c && !z,
-        9  => !c || z,
+        0 => z,
+        1 => !z,
+        2 => c,
+        3 => !c,
+        4 => n,
+        5 => !n,
+        6 => v,
+        7 => !v,
+        8 => c && !z,
+        9 => !c || z,
         10 => n == v,
         11 => n != v,
         12 => !z && (n == v),
         13 => z || (n != v),
-        _  => true,
+        _ => true,
     }
 }
 
@@ -4176,9 +4188,8 @@ fn generate_fuzz_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     };
 
     // Helper: random register values for all 8 low registers
-    let rand_low_regs = |rng: &mut StdRng| -> Vec<(u8, u32)> {
-        (0..8).map(|i| (i, rng.random())).collect()
-    };
+    let rand_low_regs =
+        |rng: &mut StdRng| -> Vec<(u8, u32)> { (0..8).map(|i| (i, rng.random())).collect() };
 
     // --- Shifts (LSL/LSR/ASR immediate) ---
     for i in 0..count {
@@ -4270,7 +4281,11 @@ fn generate_fuzz_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let op: u16 = rng.range(0..16);
         let opcode = enc_data_proc(op, rm, rdn);
         // MUL (op=13): C and V are UNPREDICTABLE
-        let xpsr_mask = if op == 13 { MASK_NZ_ONLY } else { MASK_ALL_FLAGS };
+        let xpsr_mask = if op == 13 {
+            MASK_NZ_ONLY
+        } else {
+            MASK_ALL_FLAGS
+        };
         t.push(TestCase {
             name: format!("FUZZ:DPROC:{i} op={op}"),
             opcode,
@@ -4405,8 +4420,7 @@ fn generate_fuzz_alu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                 // stays within GP regs only (avoid SP/LR/PC).
                 let rd: u16 = rng.range(0..12);
                 let rm: u16 = rng.range(0..12);
-                let regs: Vec<(u8, u32)> =
-                    (0..=12).map(|r| (r, rng.random())).collect();
+                let regs: Vec<(u8, u32)> = (0..=12).map(|r| (r, rng.random())).collect();
                 (
                     format!("MOV R{rd},R{rm}"),
                     enc_mov_high(rd, rm),
@@ -4466,11 +4480,15 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let rt: u16 = rng.range(0..8);
         let rn: u16 = loop {
             let r = rng.range(0..8);
-            if r != rt { break r; }
+            if r != rt {
+                break r;
+            }
         };
         let rm: u16 = loop {
             let r = rng.range(0..8);
-            if r != rn && r != rt { break r; }
+            if r != rn && r != rt {
+                break r;
+            }
         };
         // Offset must be word-aligned for word ops, half-aligned for half ops.
         // Use small offset to stay in scratch area (256 bytes).
@@ -4548,7 +4566,9 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         // Ensure rt != rn so store data doesn't clobber base address
         let rn: u16 = loop {
             let r = rng.range(0..8);
-            if r != rt { break r; }
+            if r != rt {
+                break r;
+            }
         };
         let variant = rng.range(0..6u8);
         let data_val: u32 = rng.random();
@@ -4559,37 +4579,73 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                 // But keep within 240 bytes of scratch
                 let imm5: u16 = rng.range(0..32);
                 let off = imm5 as u32 * 4;
-                ("STR_I", enc_str_imm(rt, rn, imm5), Vec::new(), mem_check_u32(off), off)
+                (
+                    "STR_I",
+                    enc_str_imm(rt, rn, imm5),
+                    Vec::new(),
+                    mem_check_u32(off),
+                    off,
+                )
             }
             1 => {
                 // LDR [Rn, #imm5*4]
                 let imm5: u16 = rng.range(0..32);
                 let off = imm5 as u32 * 4;
-                ("LDR_I", enc_ldr_imm(rt, rn, imm5), mem_pre_u32(off, data_val), Vec::new(), off)
+                (
+                    "LDR_I",
+                    enc_ldr_imm(rt, rn, imm5),
+                    mem_pre_u32(off, data_val),
+                    Vec::new(),
+                    off,
+                )
             }
             2 => {
                 // STRB [Rn, #imm5]: offset = imm5
                 let imm5: u16 = rng.range(0..32);
                 let off = imm5 as u32;
-                ("STRB_I", enc_strb_imm(rt, rn, imm5), Vec::new(), vec![off], off)
+                (
+                    "STRB_I",
+                    enc_strb_imm(rt, rn, imm5),
+                    Vec::new(),
+                    vec![off],
+                    off,
+                )
             }
             3 => {
                 // LDRB [Rn, #imm5]
                 let imm5: u16 = rng.range(0..32);
                 let off = imm5 as u32;
-                ("LDRB_I", enc_ldrb_imm(rt, rn, imm5), vec![(off, data_val as u8)], Vec::new(), off)
+                (
+                    "LDRB_I",
+                    enc_ldrb_imm(rt, rn, imm5),
+                    vec![(off, data_val as u8)],
+                    Vec::new(),
+                    off,
+                )
             }
             4 => {
                 // STRH [Rn, #imm5*2]: offset = imm5*2
                 let imm5: u16 = rng.range(0..32);
                 let off = imm5 as u32 * 2;
-                ("STRH_I", enc_strh_imm(rt, rn, imm5), Vec::new(), mem_check_u16(off), off)
+                (
+                    "STRH_I",
+                    enc_strh_imm(rt, rn, imm5),
+                    Vec::new(),
+                    mem_check_u16(off),
+                    off,
+                )
             }
             _ => {
                 // LDRH [Rn, #imm5*2]
                 let imm5: u16 = rng.range(0..32);
                 let off = imm5 as u32 * 2;
-                ("LDRH_I", enc_ldrh_imm(rt, rn, imm5), mem_pre_u16(off, data_val as u16), Vec::new(), off)
+                (
+                    "LDRH_I",
+                    enc_ldrh_imm(rt, rn, imm5),
+                    mem_pre_u16(off, data_val as u16),
+                    Vec::new(),
+                    off,
+                )
             }
         };
 
@@ -4725,7 +4781,9 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                 // Build reglist excluding rn (to avoid storing the address-translated value)
                 let mut reglist8: u16 = rng.range(1..256);
                 reglist8 &= !(1 << rn); // clear rn from list
-                if reglist8 == 0 { reglist8 = 1 << ((rn + 1) % 8); } // ensure at least 1
+                if reglist8 == 0 {
+                    reglist8 = 1 << ((rn + 1) % 8);
+                } // ensure at least 1
 
                 let opcode = enc_stm(rn, reglist8);
                 let reg_count = reglist8.count_ones();
@@ -4760,7 +4818,9 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
                 let rn: u16 = rng.range(0..8);
                 let mut reglist8: u16 = rng.range(1..256);
                 reglist8 &= !(1 << rn); // exclude rn: avoids address-space mismatch between oracles
-                if reglist8 == 0 { reglist8 = 1 << ((rn + 1) % 8); }
+                if reglist8 == 0 {
+                    reglist8 = 1 << ((rn + 1) % 8);
+                }
 
                 let opcode = enc_ldm(rn, reglist8);
                 let reg_count = reglist8.count_ones();
@@ -4795,11 +4855,21 @@ fn generate_fuzz_mem(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         let (name_prefix, opcode, mem_pre, mem_check) = match variant {
             0 => {
                 let off = imm8 as u32 * 4;
-                ("STR_SP", enc_str_sp(rt, imm8), Vec::new(), mem_check_u32(off))
+                (
+                    "STR_SP",
+                    enc_str_sp(rt, imm8),
+                    Vec::new(),
+                    mem_check_u32(off),
+                )
             }
             _ => {
                 let off = imm8 as u32 * 4;
-                ("LDR_SP", enc_ldr_sp(rt, imm8), mem_pre_u32(off, data_val), Vec::new())
+                (
+                    "LDR_SP",
+                    enc_ldr_sp(rt, imm8),
+                    mem_pre_u32(off, data_val),
+                    Vec::new(),
+                )
             }
         };
 
@@ -4873,11 +4943,21 @@ pub struct FuzzBuckets {
 pub fn generate_fuzz_classes(count_per_class: usize, seed: u64) -> FuzzBuckets {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut base_alu = generate_fuzz_alu(count_per_class, &mut rng);
-    base_alu.extend(thumb32_gen::generate_fuzz_t32_alu(count_per_class, &mut rng));
+    base_alu.extend(thumb32_gen::generate_fuzz_t32_alu(
+        count_per_class,
+        &mut rng,
+    ));
     let fpu = thumb32_gen::generate_fuzz_fpu(count_per_class, &mut rng);
     let mut base_mem = generate_fuzz_mem(count_per_class, &mut rng);
-    base_mem.extend(thumb32_gen::generate_fuzz_t32_mem(count_per_class, &mut rng));
-    FuzzBuckets { base_alu, base_mem, fpu }
+    base_mem.extend(thumb32_gen::generate_fuzz_t32_mem(
+        count_per_class,
+        &mut rng,
+    ));
+    FuzzBuckets {
+        base_alu,
+        base_mem,
+        fpu,
+    }
 }
 
 /// Filter buckets by selected class. `FuzzClass::All` returns
@@ -4947,7 +5027,8 @@ pub fn setup_reg(reg: u8, val: u32, tc: &TestCase, scratch_base: u32) -> u32 {
 pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     debug_assert!(
         tc.hw1.is_none() || tc.opcode >= 0xE800,
-        "Thumb-32 test has hw1 but opcode {:#06x} < 0xE800", tc.opcode
+        "Thumb-32 test has hw1 but opcode {:#06x} < 0xE800",
+        tc.opcode
     );
 
     // Phase 3 Stage 2: share the shared_bus's atomics with the core so
@@ -4981,16 +5062,20 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
     // Reset bus wait-state accumulator before execution (mirrors decode_execute).
     shared_bus.reset_extra_wait_states();
     let base_cycles = match tc.hw1 {
-        None => if tc.needs_bus {
-            core.execute_one_with_bus(tc.opcode, shared_bus)
-        } else {
-            core.execute_one(tc.opcode)
-        },
-        Some(hw1) => if tc.needs_bus {
-            core.execute_one_wide_with_bus(tc.opcode, hw1, shared_bus)
-        } else {
-            core.execute_one_wide(tc.opcode, hw1)
-        },
+        None => {
+            if tc.needs_bus {
+                core.execute_one_with_bus(tc.opcode, shared_bus)
+            } else {
+                core.execute_one(tc.opcode)
+            }
+        }
+        Some(hw1) => {
+            if tc.needs_bus {
+                core.execute_one_wide_with_bus(tc.opcode, hw1, shared_bus)
+            } else {
+                core.execute_one_wide(tc.opcode, hw1)
+            }
+        }
     };
     // Add bus extra wait states (e.g., SRAM bank 2/6 penalty, APB latency).
     let cycles = base_cycles + shared_bus.extra_wait_states();
@@ -5007,7 +5092,14 @@ pub fn run_one_emu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         .map(|&offset| shared_bus.read8(EMU_TEST_SCRATCH + offset, 0))
         .collect();
 
-    RunState { regs, xpsr, mem, cycles, fpu: Vec::new(), fpscr: 0 }
+    RunState {
+        regs,
+        xpsr,
+        mem,
+        cycles,
+        fpu: Vec::new(),
+        fpscr: 0,
+    }
 }
 
 /// Run a multi-step test case on the emulator (IT blocks, FPU prelude/epilogue).
@@ -5061,7 +5153,9 @@ pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         None => 2,
     };
     // Write the body instruction (the instruction under test inside IT).
-    let op2 = tc.opcode2.expect("run_one_emu_multistep requires tc.opcode2");
+    let op2 = tc
+        .opcode2
+        .expect("run_one_emu_multistep requires tc.opcode2");
     shared_bus.write16(EMU_TEST_SLOT + body_offset, op2, 0);
     if let Some(hw1_2) = tc.hw1_2 {
         shared_bus.write16(EMU_TEST_SLOT + body_offset + 2, hw1_2, 0);
@@ -5090,7 +5184,14 @@ pub fn run_one_emu_multistep(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         .collect();
 
     // Cycle counting is intentionally skipped for multi-step tests.
-    RunState { regs, xpsr, mem, cycles: 0, fpu: Vec::new(), fpscr: 0 }
+    RunState {
+        regs,
+        xpsr,
+        mem,
+        cycles: 0,
+        fpu: Vec::new(),
+        fpscr: 0,
+    }
 }
 
 // ============================================================================
@@ -5133,43 +5234,69 @@ pub(crate) fn vfp_dp(op_hi: u16, op_lo: u16, op2_lo: u16, sd: u16, sn: u16, sm: 
 }
 
 /// Encode VADD.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 0, sd, sn, sm) }
+pub(crate) fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b11, 0, sd, sn, sm)
+}
 
 /// Encode VSUB.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vsub(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 1, sd, sn, sm) }
+pub(crate) fn enc_vsub(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b11, 1, sd, sn, sm)
+}
 
 /// Encode VMUL.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 0, sd, sn, sm) }
+pub(crate) fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b10, 0, sd, sn, sm)
+}
 
 /// Encode VNMUL.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vnmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 1, sd, sn, sm) }
+pub(crate) fn enc_vnmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b10, 1, sd, sn, sm)
+}
 
 /// Encode VDIV.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b00, 0, sd, sn, sm) }
+pub(crate) fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b00, 0, sd, sn, sm)
+}
 
 /// Encode VMLA.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 0, sd, sn, sm) }
+pub(crate) fn enc_vmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b00, 0, sd, sn, sm)
+}
 
 /// Encode VMLS.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 1, sd, sn, sm) }
+pub(crate) fn enc_vmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b00, 1, sd, sn, sm)
+}
 
 /// Encode VNMLA.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vnmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 1, sd, sn, sm) }
+pub(crate) fn enc_vnmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b01, 1, sd, sn, sm)
+}
 
 /// Encode VNMLS.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vnmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 0, sd, sn, sm) }
+pub(crate) fn enc_vnmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b01, 0, sd, sn, sm)
+}
 
 /// Encode VFMA.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vfma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 0, sd, sn, sm) }
+pub(crate) fn enc_vfma(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b10, 0, sd, sn, sm)
+}
 
 /// Encode VFMS.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vfms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 1, sd, sn, sm) }
+pub(crate) fn enc_vfms(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b10, 1, sd, sn, sm)
+}
 
 /// Encode VFNMA.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vfnma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 1, sd, sn, sm) }
+pub(crate) fn enc_vfnma(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b01, 1, sd, sn, sm)
+}
 
 /// Encode VFNMS.F32 Sd, Sn, Sm.
-pub(crate) fn enc_vfnms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 0, sd, sn, sm) }
+pub(crate) fn enc_vfnms(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b01, 0, sd, sn, sm)
+}
 
 /// Encode a VFP unary instruction.
 /// All unary: hw0[7:4]=1D11 (op_hi=1, op_lo=11), hw1[6]=1.
@@ -5185,37 +5312,59 @@ pub(crate) fn vfp_unary(opc3: u16, t: u16, sd: u16, sm: u16) -> (u16, u16) {
 }
 
 /// VMOV.F32 Sd, Sm (register copy).
-pub(crate) fn enc_vmov_reg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 0, sd, sm) }
+pub(crate) fn enc_vmov_reg(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0000, 0, sd, sm)
+}
 
 /// VABS.F32 Sd, Sm.
-pub(crate) fn enc_vabs(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 1, sd, sm) }
+pub(crate) fn enc_vabs(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0000, 1, sd, sm)
+}
 
 /// VNEG.F32 Sd, Sm.
-pub(crate) fn enc_vneg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 0, sd, sm) }
+pub(crate) fn enc_vneg(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0001, 0, sd, sm)
+}
 
 /// VSQRT.F32 Sd, Sm.
-pub(crate) fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 1, sd, sm) }
+pub(crate) fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0001, 1, sd, sm)
+}
 
 /// VCMP.F32 Sd, Sm (quiet).
-pub(crate) fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0100, 0, sd, sm) }
+pub(crate) fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0100, 0, sd, sm)
+}
 
 /// VCMP.F32 Sd, #0.0.
-pub(crate) fn enc_vcmp_zero(sd: u16) -> (u16, u16) { vfp_unary(0b0101, 0, sd, 0) }
+pub(crate) fn enc_vcmp_zero(sd: u16) -> (u16, u16) {
+    vfp_unary(0b0101, 0, sd, 0)
+}
 
 /// VCVT.F32.S32 Sd, Sm (signed int -> float).
-pub(crate) fn enc_vcvt_f32_s32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 1, sd, sm) }
+pub(crate) fn enc_vcvt_f32_s32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1000, 1, sd, sm)
+}
 
 /// VCVT.F32.U32 Sd, Sm (unsigned int -> float).
-pub(crate) fn enc_vcvt_f32_u32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 0, sd, sm) }
+pub(crate) fn enc_vcvt_f32_u32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1000, 0, sd, sm)
+}
 
 /// VCVT.S32.F32 Sd, Sm (float -> signed int, round toward zero).
-pub(crate) fn enc_vcvt_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 1, sd, sm) }
+pub(crate) fn enc_vcvt_s32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1101, 1, sd, sm)
+}
 
 /// VCVT.U32.F32 Sd, Sm (float -> unsigned int, round toward zero).
-pub(crate) fn enc_vcvt_u32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1100, 1, sd, sm) }
+pub(crate) fn enc_vcvt_u32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1100, 1, sd, sm)
+}
 
 /// VCVTR.S32.F32 Sd, Sm (float -> signed int, round per FPSCR).
-pub(crate) fn enc_vcvtr_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 0, sd, sm) }
+pub(crate) fn enc_vcvtr_s32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1101, 0, sd, sm)
+}
 
 /// Encode VMOV Sn, Rt (ARM -> FPU). MCR format, L=0.
 pub(crate) fn enc_vmov_to_fpu(sn: u16, rt: u16) -> (u16, u16) {
@@ -5441,7 +5590,14 @@ pub fn run_one_emu_fpu(tc: &TestCase, shared_bus: &mut Bus) -> RunState {
         0
     };
 
-    RunState { regs, xpsr, mem, cycles: 0, fpu, fpscr }
+    RunState {
+        regs,
+        xpsr,
+        mem,
+        cycles: 0,
+        fpu,
+        fpscr,
+    }
 }
 
 // ============================================================================
@@ -5527,7 +5683,9 @@ pub fn run_fpu_smoke_test(shared_bus: &mut Bus) -> Result<(), String> {
         if actual_pc != expected_pc {
             return Err(format!(
                 "After instruction {}: PC={:#010x}, expected {:#010x}",
-                i + 1, actual_pc, expected_pc
+                i + 1,
+                actual_pc,
+                expected_pc
             ));
         }
     }
@@ -5580,7 +5738,9 @@ pub fn compare(
     // Skip R11 for FPU tests — it's used internally by the prelude/epilogue.
     let is_fpu = is_fpu_test(tc);
     for i in 0..=12 {
-        if is_fpu && i == 11 { continue; }
+        if is_fpu && i == 11 {
+            continue;
+        }
         if tc.addr_regs.contains(&(i as u8)) {
             // Address registers have per-side absolute values.
             // Compare as delta from scratch base to catch writeback updates.
@@ -5729,7 +5889,9 @@ pub fn compare_probe(tc: &TestCase, hw: &RunState, emu: &RunState) -> Result<(),
     // prelude/epilogue mechanism.
     let is_fpu = is_fpu_test(tc);
     for i in 0..=12 {
-        if is_fpu && (i == 11 || i == 12) { continue; }
+        if is_fpu && (i == 11 || i == 12) {
+            continue;
+        }
         if hw.regs[i] != emu.regs[i] {
             diffs.push(format!(
                 "R{i}: HW={:#010x} EMU={:#010x}",
@@ -5767,10 +5929,7 @@ pub fn compare_probe(tc: &TestCase, hw: &RunState, emu: &RunState) -> Result<(),
     let hw_flags = hw.xpsr & probe_mask;
     let emu_flags = emu.xpsr & probe_mask;
     if hw_flags != emu_flags {
-        diffs.push(format!(
-            "xPSR: HW={:#010x} EMU={:#010x}",
-            hw.xpsr, emu.xpsr
-        ));
+        diffs.push(format!("xPSR: HW={:#010x} EMU={:#010x}", hw.xpsr, emu.xpsr));
     }
 
     // Memory: byte-by-byte at mem_check offsets
@@ -5996,11 +6155,7 @@ mod tests {
         let tests = generate_all();
         let mut names = std::collections::HashSet::new();
         for tc in &tests {
-            assert!(
-                names.insert(&tc.name),
-                "duplicate test name: {}",
-                tc.name
-            );
+            assert!(names.insert(&tc.name), "duplicate test name: {}", tc.name);
         }
     }
 
@@ -6289,7 +6444,14 @@ mod tests {
     // -- compare tests --
 
     fn make_state(regs: [u32; 16], xpsr: u32, mem: Vec<u8>) -> RunState {
-        RunState { regs, xpsr, mem, cycles: 0, fpu: Vec::new(), fpscr: 0 }
+        RunState {
+            regs,
+            xpsr,
+            mem,
+            cycles: 0,
+            fpu: Vec::new(),
+            fpscr: 0,
+        }
     }
 
     fn base_regs_qemu() -> [u32; 16] {
@@ -6340,7 +6502,10 @@ mod tests {
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
         let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
-        assert!(err.contains("SP delta"), "expected SP delta in error: {err}");
+        assert!(
+            err.contains("SP delta"),
+            "expected SP delta in error: {err}"
+        );
     }
 
     #[test]
@@ -6375,7 +6540,10 @@ mod tests {
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
         let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
-        assert!(err.contains("PC delta"), "expected PC delta in error: {err}");
+        assert!(
+            err.contains("PC delta"),
+            "expected PC delta in error: {err}"
+        );
     }
 
     #[test]
@@ -6473,7 +6641,10 @@ mod tests {
         let qemu = make_state(qemu_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
         let err = compare(&tc, &qemu, &emu, &CompareBases::M33_RP2350).unwrap_err();
-        assert!(err.contains("R2 addr delta"), "expected addr delta diff: {err}");
+        assert!(
+            err.contains("R2 addr delta"),
+            "expected addr delta diff: {err}"
+        );
     }
 
     #[test]
@@ -6580,7 +6751,10 @@ mod tests {
         let (alu1, _) = generate_fuzz(10, 1);
         let (alu2, _) = generate_fuzz(10, 2);
         // With different seeds, at least some opcodes should differ
-        let differs = alu1.iter().zip(alu2.iter()).any(|(a, b)| a.opcode != b.opcode);
+        let differs = alu1
+            .iter()
+            .zip(alu2.iter())
+            .any(|(a, b)| a.opcode != b.opcode);
         assert!(differs, "different seeds should produce different tests");
     }
 
@@ -6593,14 +6767,16 @@ mod tests {
                 assert!(
                     tc.opcode >= 0xE800,
                     "T32 fuzz test '{}' has opcode {:#06x} < 0xE800",
-                    tc.name, tc.opcode
+                    tc.name,
+                    tc.opcode
                 );
             } else {
                 // Thumb-16: opcode must be below 0xE800
                 assert!(
                     tc.opcode < 0xE800,
                     "T16 fuzz test '{}' has opcode {:#06x} >= 0xE800",
-                    tc.name, tc.opcode
+                    tc.name,
+                    tc.opcode
                 );
             }
         }
@@ -6614,13 +6790,15 @@ mod tests {
                 assert!(
                     tc.opcode >= 0xE800,
                     "T32 fuzz test '{}' has opcode {:#06x} < 0xE800",
-                    tc.name, tc.opcode
+                    tc.name,
+                    tc.opcode
                 );
             } else {
                 assert!(
                     tc.opcode < 0xE800,
                     "T16 fuzz test '{}' has opcode {:#06x} >= 0xE800",
-                    tc.name, tc.opcode
+                    tc.name,
+                    tc.opcode
                 );
             }
         }
@@ -6703,7 +6881,11 @@ mod tests {
         //   variants (2 PUSH slots + 1 POP + 1 POP_PC). The class still emits
         //   `count` tests per call, so the class count stays at 5.
         // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
-        assert_eq!(alu.len(), (9 + 16 + 6) * 10, "ALU count: (9 T16 + 16 T32 + 6 FPU) * 10");
+        assert_eq!(
+            alu.len(),
+            (9 + 16 + 6) * 10,
+            "ALU count: (9 T16 + 16 T32 + 6 FPU) * 10"
+        );
         assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
     }
 
@@ -6712,9 +6894,11 @@ mod tests {
         let (alu, mem) = generate_fuzz(20, 111);
         for tc in alu.iter().chain(mem.iter()) {
             assert_ne!(
-                tc.xpsr_pre & 0x0100_0000, 0,
+                tc.xpsr_pre & 0x0100_0000,
+                0,
                 "fuzz test '{}' missing T bit in xpsr_pre: {:#010x}",
-                tc.name, tc.xpsr_pre
+                tc.name,
+                tc.xpsr_pre
             );
         }
     }
@@ -6730,27 +6914,46 @@ mod tests {
         assert_eq!(buckets.base_alu.len() + buckets.fpu.len(), legacy_alu.len());
         assert_eq!(buckets.base_mem.len(), legacy_mem.len());
         assert!(!buckets.fpu.is_empty(), "fpu bucket should be non-empty");
-        assert!(!buckets.base_alu.is_empty(), "base_alu bucket should be non-empty");
+        assert!(
+            !buckets.base_alu.is_empty(),
+            "base_alu bucket should be non-empty"
+        );
     }
 
     #[test]
     fn fuzz_classes_fpu_bucket_only_fpu_tests() {
         let buckets = generate_fuzz_classes(10, 0xABCD);
         for tc in &buckets.fpu {
-            assert!(is_fpu_test(tc), "fpu bucket contains non-FPU test: {}", tc.name);
+            assert!(
+                is_fpu_test(tc),
+                "fpu bucket contains non-FPU test: {}",
+                tc.name
+            );
         }
         for tc in &buckets.base_alu {
-            assert!(!is_fpu_test(tc), "base_alu bucket contains FPU test: {}", tc.name);
+            assert!(
+                !is_fpu_test(tc),
+                "base_alu bucket contains FPU test: {}",
+                tc.name
+            );
         }
         for tc in &buckets.base_mem {
-            assert!(!is_fpu_test(tc), "base_mem bucket contains FPU test: {}", tc.name);
+            assert!(
+                !is_fpu_test(tc),
+                "base_mem bucket contains FPU test: {}",
+                tc.name
+            );
         }
     }
 
     #[test]
     fn select_fuzz_class_all_preserves_buckets() {
         let buckets = generate_fuzz_classes(3, 7);
-        let (ba, bm, f) = (buckets.base_alu.len(), buckets.base_mem.len(), buckets.fpu.len());
+        let (ba, bm, f) = (
+            buckets.base_alu.len(),
+            buckets.base_mem.len(),
+            buckets.fpu.len(),
+        );
         let selected = select_fuzz_class(buckets, FuzzClass::All);
         assert_eq!(selected.base_alu.len(), ba);
         assert_eq!(selected.base_mem.len(), bm);
@@ -6761,7 +6964,10 @@ mod tests {
     fn select_fuzz_class_base_drops_fpu() {
         let buckets = generate_fuzz_classes(3, 7);
         let selected = select_fuzz_class(buckets, FuzzClass::Base);
-        assert!(selected.fpu.is_empty(), "Base class must produce empty fpu bucket");
+        assert!(
+            selected.fpu.is_empty(),
+            "Base class must produce empty fpu bucket"
+        );
         assert!(!selected.base_alu.is_empty());
         assert!(!selected.base_mem.is_empty());
     }
@@ -6770,8 +6976,14 @@ mod tests {
     fn select_fuzz_class_fpu_drops_base() {
         let buckets = generate_fuzz_classes(3, 7);
         let selected = select_fuzz_class(buckets, FuzzClass::Fpu);
-        assert!(selected.base_alu.is_empty(), "Fpu class must produce empty base_alu bucket");
-        assert!(selected.base_mem.is_empty(), "Fpu class must produce empty base_mem bucket");
+        assert!(
+            selected.base_alu.is_empty(),
+            "Fpu class must produce empty base_alu bucket"
+        );
+        assert!(
+            selected.base_mem.is_empty(),
+            "Fpu class must produce empty base_mem bucket"
+        );
         assert!(!selected.fpu.is_empty());
     }
 
@@ -6781,14 +6993,22 @@ mod tests {
     #[test]
     fn fuzz_produces_both_probe_only_classes() {
         let (_, mem) = generate_fuzz(1000, 42);
-        let pop_pc = mem.iter()
+        let pop_pc = mem
+            .iter()
             .filter(|tc| tc.name.starts_with("FUZZ:POP_PC:"))
             .count();
-        let t32_ldm_pc = mem.iter()
+        let t32_ldm_pc = mem
+            .iter()
             .filter(|tc| tc.probe_only && tc.name.starts_with("FUZZ:T32_LDM:"))
             .count();
-        assert!(pop_pc > 0, "expected at least one FUZZ:POP_PC probe_only test");
-        assert!(t32_ldm_pc > 0, "expected at least one T32 LDM+PC probe_only test");
+        assert!(
+            pop_pc > 0,
+            "expected at least one FUZZ:POP_PC probe_only test"
+        );
+        assert!(
+            t32_ldm_pc > 0,
+            "expected at least one T32 LDM+PC probe_only test"
+        );
     }
 
     // -- RunState.cycles --
@@ -6868,9 +7088,8 @@ mod tests {
     #[test]
     fn run_one_emu_multistep_it_t32_body() {
         // IT EQ; ADDS.W R0, R1, R2 — Thumb-32 body inside IT block.
-        let (hw0, hw1) = thumb32_gen::enc_t32_dp_shift_reg(
-            thumb32_gen::DP_ADD, true, 1, 0, 2, 0, 0,
-        );
+        let (hw0, hw1) =
+            thumb32_gen::enc_t32_dp_shift_reg(thumb32_gen::DP_ADD, true, 1, 0, 2, 0, 0);
         let tc = TestCase {
             name: "test".into(),
             opcode: enc_it(0, 0b1000),
@@ -6939,7 +7158,10 @@ mod tests {
         let hw = make_state(hw_regs, 0x0100_0000, vec![]);
         let emu = make_state(emu_regs, 0x0100_0000, vec![]);
         let err = compare_probe(&tc, &hw, &emu).unwrap_err();
-        assert!(err.contains("R2"), "should detect R2 diff even with addr_regs: {err}");
+        assert!(
+            err.contains("R2"),
+            "should detect R2 diff even with addr_regs: {err}"
+        );
     }
 
     #[test]
@@ -7292,11 +7514,10 @@ mod tests {
         let state = run_one_emu_fpu(&tc, &mut bus);
         assert_eq!(state.fpu.len(), 1, "S2 should be captured");
         assert_eq!(state.fpu[0], 4.0f32.to_bits(), "1.5 + 2.5 = 4.0");
-        // FPSCR was captured because fpscr_mask != 0.
-        // Exact bits are implementation-defined but must be some u32 read
-        // out of the scratch area; a strict self-consistency check is
-        // enough to prove the path ran without panicking.
-        assert_eq!(state.fpscr & !0xFFFF_FFFFu32, 0);
+        // The FPSCR capture path ran (fpscr_mask != 0). Exact bits are
+        // implementation-defined post-VADD; the sibling test
+        // `run_one_emu_fpu_without_fpscr_capture` covers the negative
+        // case (mask = 0 ⇒ fpscr = 0).
     }
 
     #[test]

@@ -342,11 +342,16 @@ mod tests {
         let a = CoreAtomics::default();
         a.assert_irq(0, 5);
         let first = a.take_irq_pending(0);
-        assert_ne!(first & (1u64 << 5), 0,
-            "first take_irq_pending must return the mask with bit 5 set");
+        assert_ne!(
+            first & (1u64 << 5),
+            0,
+            "first take_irq_pending must return the mask with bit 5 set"
+        );
         let second = a.take_irq_pending(0);
-        assert_eq!(second, 0,
-            "second take_irq_pending must observe the zeroed mask");
+        assert_eq!(
+            second, 0,
+            "second take_irq_pending must observe the zeroed mask"
+        );
     }
 
     #[test]
@@ -452,8 +457,8 @@ mod tests {
     #[test]
     fn rcp_count_check_retry_with_concurrent_bump() {
         use std::sync::Arc;
-        use std::thread;
         use std::sync::atomic::Ordering;
+        use std::thread;
 
         let a = Arc::new(CoreAtomics::default());
         a.rcp_count_set(0);

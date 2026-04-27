@@ -89,11 +89,8 @@ fn main() {
 
     for core_id in 0..2 {
         let c = emu.core_counters(core_id);
-        let total_accesses = c.sram_reads
-            + c.sram_writes
-            + c.sio_accesses
-            + c.peripheral_accesses
-            + c.ppb_accesses;
+        let total_accesses =
+            c.sram_reads + c.sram_writes + c.sio_accesses + c.peripheral_accesses + c.ppb_accesses;
 
         println!("--- Core {} ---", core_id);
         println!("  Decode/execute cycles:  {}", c.decode_execute_cycles);

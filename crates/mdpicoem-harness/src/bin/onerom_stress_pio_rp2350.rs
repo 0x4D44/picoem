@@ -18,14 +18,11 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use mdpicoem_harness::{
-    onerom_glue_dma, onerom_serving_oracle, onerom_stress, onerom_sync,
-};
+use mdpicoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_stress, onerom_sync};
 use mdrp2350::{Config, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-const FLASH_PATH: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541.bin";
+const FLASH_PATH: &str = "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541.bin";
 
 /// ROM set index parsed from the fixture. `0` = 1541 $E000 kernal
 /// (901229-06AA). Change + recompile to sweep a different set in the same
@@ -67,9 +64,7 @@ fn main() -> ExitCode {
     // We still boot below (the oracle lifts its own copy via
     // `new_at_sync` reading the SRAM rom_set_index), but a None here is
     // a loud early signal that the fixture / ROM_SET_INDEX pair is wrong.
-    if onerom_serving_oracle::lift_shadow_from_flash_pub(&flash, ROM_SET_INDEX)
-        .is_none()
-    {
+    if onerom_serving_oracle::lift_shadow_from_flash_pub(&flash, ROM_SET_INDEX).is_none() {
         eprintln!(
             "failed to lift ROM set {} from fixture — wrong index or malformed flash",
             ROM_SET_INDEX
@@ -81,7 +76,8 @@ fn main() -> ExitCode {
     // cycle-level granularity for its per-cycle observation loop.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -127,8 +123,7 @@ fn main() -> ExitCode {
     // SRAM-encoded rom_set_index; the up-front `lift_shadow_from_flash_pub`
     // above confirms the hardcoded `ROM_SET_INDEX` matches a real set.
     glue.prime_after_sync(&mut emu.bus);
-    let mut oracle =
-        onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, &flash);
+    let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, &flash);
     oracle.populate_sram_from_shadow(&mut emu.bus);
 
     // Silent sweep: 2048 cases, no per-case output.

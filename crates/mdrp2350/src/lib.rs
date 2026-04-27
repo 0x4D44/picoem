@@ -2,16 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub mod bootrom_hooks;
+pub mod bus;
 pub mod core;
 pub mod core_riscv;
-pub mod bus;
 pub mod dma;
 pub mod dreq;
 pub mod irq;
 pub mod memory;
 pub mod peripherals;
-pub mod sio;
 pub mod pio;
+pub mod sio;
 pub mod threaded;
 
 use tracing::info;
@@ -113,11 +113,9 @@ impl std::fmt::Display for EmulatorError {
                 "operation not supported on a Threaded Emulator (Serial-only)"
             ),
             #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
-            EmulatorError::WorkerPanicked { which, message } => write!(
-                f,
-                "worker {} panicked: {message}",
-                which.as_str()
-            ),
+            EmulatorError::WorkerPanicked { which, message } => {
+                write!(f, "worker {} panicked: {message}", which.as_str())
+            }
             #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
             EmulatorError::BarrierTimeout { which, elapsed_ms } => write!(
                 f,
@@ -137,16 +135,16 @@ mod pio_tests;
 #[cfg(test)]
 mod tests_narrow;
 
-pub use self::core::CortexM33;
-pub use self::core::CoreCounters;
-pub use self::core_riscv::Hazard3;
 pub use self::bus::Bus;
+pub use self::core::CoreCounters;
+pub use self::core::CortexM33;
+pub use self::core_riscv::Hazard3;
 pub use self::memory::Memory;
 pub use self::sio::Sio;
 
-pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats};
 #[cfg(target_arch = "x86_64")]
 pub use mdpicoem_common::Pacer;
+pub use mdpicoem_common::{Clock, PacerSnapshot, PacerStats};
 
 /// Stop reason when running until a condition.
 pub enum StopReason {
@@ -187,7 +185,10 @@ pub fn load_pinned_silicon_bootrom() -> std::io::Result<Vec<u8>> {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.pop(); // crates
     root.pop(); // workspace root
-    let bin_path = root.join("roms").join("rp2350").join("bootrom-combined.bin");
+    let bin_path = root
+        .join("roms")
+        .join("rp2350")
+        .join("bootrom-combined.bin");
     let sha_path = root
         .join("roms")
         .join("rp2350")
@@ -195,12 +196,19 @@ pub fn load_pinned_silicon_bootrom() -> std::io::Result<Vec<u8>> {
 
     let bytes = std::fs::read(&bin_path)?;
     let expected_hex = std::fs::read_to_string(&sha_path)?;
-    let expected_hex = expected_hex.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let expected_hex = expected_hex
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let digest = hasher.finalize();
-    let actual_hex = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    let actual_hex = digest
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
 
     if actual_hex != expected_hex {
         return Err(std::io::Error::new(
@@ -753,7 +761,9 @@ impl Emulator {
     /// stomped here on the next quantum — the hardware source wins, per
     /// RV-priv §3.1.9 which classes these bits as hardware-owned.
     fn fan_out_riscv_irqs(&mut self) {
-        let Cores::RiscV(cs) = &mut self.cores else { return; };
+        let Cores::RiscV(cs) = &mut self.cores else {
+            return;
+        };
         let sio = &self.bus.sio;
         for c in 0..2 {
             let mut mip = cs[c].mip();
@@ -820,10 +830,7 @@ impl Emulator {
             }
             let step_q = self.step_quantum as u64;
             let quanta = cycles.div_ceil(step_q.max(1));
-            let threaded = self
-                .threaded
-                .as_mut()
-                .expect("threaded promoted above");
+            let threaded = self.threaded.as_mut().expect("threaded promoted above");
             match threaded.run_quanta_checked(quanta) {
                 Ok(()) => {
                     // Drain bootrom-hook latch to the host-visible field
@@ -898,9 +905,7 @@ impl Emulator {
                 threaded::WorkerName::Pio0 => 0,
                 threaded::WorkerName::Pio1 => 1,
                 threaded::WorkerName::Pio2 => 2,
-                _ => panic!(
-                    "inject_panic_for_testing: only Pio0/Pio1/Pio2 supported today"
-                ),
+                _ => panic!("inject_panic_for_testing: only Pio0/Pio1/Pio2 supported today"),
             };
             threaded
                 .shared()
@@ -1083,8 +1088,7 @@ impl Emulator {
                     // WFE wake: event flag clears WFE sleep. Consume
                     // (AcqRel swap to false) pairs with `sev_both`'s
                     // Release.
-                    if self.bus.atomics.is_wfe_waiting(i)
-                        && self.bus.atomics.event_flag_consume(i)
+                    if self.bus.atomics.is_wfe_waiting(i) && self.bus.atomics.event_flag_consume(i)
                     {
                         self.bus.atomics.clear_wfe_waiting(i);
                     }
@@ -1155,8 +1159,7 @@ impl Emulator {
     /// Central so the string stays consistent between tests and the
     /// REQUIRED #1 contract documented in `tech_debt.md`.
     #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
-    const PLACEHOLDER_GUARD_MSG: &'static str =
-        "direct field access on cores/bus/clock is Serial-only; emulator is in \
+    const PLACEHOLDER_GUARD_MSG: &'static str = "direct field access on cores/bus/clock is Serial-only; emulator is in \
          Threaded mode — use typed accessors like core_cycles(), master_cycle(), \
          gpio_get() instead";
 
@@ -1282,10 +1285,14 @@ impl Emulator {
             let low = addr & 0xFFFF;
             if matches!(low, 0xE200 | 0xE204 | 0xE280 | 0xE284) {
                 let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
-                let ispr = self.core(0).ppb.nvic_ispr[word]
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let ispr =
+                    self.core(0).ppb.nvic_ispr[word].load(std::sync::atomic::Ordering::Relaxed);
                 let mask64 = (ispr as u64) << (word * 32);
-                let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
+                let keep = if word == 0 {
+                    !0xFFFF_FFFFu64
+                } else {
+                    0xFFFF_FFFFu64
+                };
                 let prev = self.bus.atomics.irq_pending_load(0);
                 self.bus.atomics.set_irq_pending(0, (prev & keep) | mask64);
             }
@@ -1354,9 +1361,7 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
             // `bus.pending_cache_invalidations`. Cross-core SMC still
             // requires firmware DSB+ISB per V7 spec.
             if !bus.pending_cache_invalidations.is_empty() {
-                cs[core_id].invalidate_decode_cache_entries(
-                    &bus.pending_cache_invalidations,
-                );
+                cs[core_id].invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
                 bus.pending_cache_invalidations.clear();
             }
             // Region-scoped invalidation triggered mid-step (via
@@ -1458,7 +1463,11 @@ impl EmulatorBuilder {
         // Threading availability gate — dual-execution HLD V1 §5.2.
         // Reject before building any state so the caller knows early.
         if self.execution == ExecutionModel::Threaded {
-            #[cfg(not(all(feature = "threading", target_arch = "x86_64", target_os = "windows")))]
+            #[cfg(not(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                target_os = "windows"
+            )))]
             return Err(ConfigError::ThreadingUnavailable);
         }
         // ThreadedEmulator pins one worker per host core; reject early

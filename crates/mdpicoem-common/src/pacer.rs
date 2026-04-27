@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Shared monitoring state. Atomic counters updated on the hot path,
 /// safe to read from any thread without locking.
@@ -186,9 +186,8 @@ fn calibrate_overhead(nominal_quantum_tsc: u64, tsc_freq_hz: u64) -> u64 {
     const BATCHES: usize = 5;
     const PER_BATCH: u64 = 2000;
 
-    let tsc_to_ns = |ticks: u64| -> u64 {
-        (ticks as u128 * 1_000_000_000 / tsc_freq_hz as u128) as u64
-    };
+    let tsc_to_ns =
+        |ticks: u64| -> u64 { (ticks as u128 * 1_000_000_000 / tsc_freq_hz as u128) as u64 };
 
     // Throwaway stats to exercise the same atomic updates production does.
     let stats = PacerStats::new();
@@ -356,9 +355,7 @@ impl Pacer {
             return;
         }
         self.sys_clk_hz = new;
-        let nominal = (self.tsc_freq_hz as u128
-            * self.quantum_cycles as u128
-            / new as u128) as u64;
+        let nominal = (self.tsc_freq_hz as u128 * self.quantum_cycles as u128 / new as u128) as u64;
         self.quantum_tsc_ticks = nominal.saturating_sub(self.overhead);
     }
 
@@ -374,7 +371,10 @@ impl Pacer {
     /// Call after stepping the emulator for `quantum_cycles()` cycles.
     #[inline(always)]
     pub fn end_quantum(&mut self) {
-        debug_assert!(self.quantum_start_tsc != 0, "begin_quantum() must be called before end_quantum()");
+        debug_assert!(
+            self.quantum_start_tsc != 0,
+            "begin_quantum() must be called before end_quantum()"
+        );
 
         // TSC wraparound: at 5 GHz, u64 wraps after ~117 years. If it does wrap
         // (or a VM offsets the TSC), unsigned subtraction produces a large value
@@ -407,7 +407,9 @@ impl Pacer {
         // Update cumulative wall time since first begin_quantum.
         // Set wall_ns BEFORE cycles so snapshots see wall slightly ahead of
         // cycles (biases MHz low, bounded) rather than the reverse.
-        let first = self.first_begin_tsc.expect("begin_quantum() must be called before end_quantum()");
+        let first = self
+            .first_begin_tsc
+            .expect("begin_quantum() must be called before end_quantum()");
         let wall_tsc = final_tsc - first;
         self.stats.set_wall_ns(self.tsc_to_ns(wall_tsc));
         self.stats.add_emulated_cycles(self.quantum_cycles);
@@ -617,7 +619,10 @@ mod tests {
         pacer.end_quantum();
 
         let snap = pacer.stats().snapshot();
-        assert!(snap.behind_count > 0, "should detect being behind real-time");
+        assert!(
+            snap.behind_count > 0,
+            "should detect being behind real-time"
+        );
     }
 
     #[test]
@@ -632,7 +637,10 @@ mod tests {
         let snap = pacer.stats().snapshot();
         let total = snap.emulation_ns + snap.spin_ns;
         assert!(total > 0, "total ns should be non-zero after a quantum");
-        assert!(total < 1_000_000_000, "a single quantum should take < 1 second");
+        assert!(
+            total < 1_000_000_000,
+            "a single quantum should take < 1 second"
+        );
     }
 
     #[test]
@@ -642,7 +650,10 @@ mod tests {
         pacer.begin_quantum();
         pacer.end_quantum();
         let snap = pacer.stats().snapshot();
-        assert!(snap.wall_ns > 0, "wall_ns should be non-zero after a quantum");
+        assert!(
+            snap.wall_ns > 0,
+            "wall_ns should be non-zero after a quantum"
+        );
     }
 
     #[test]
@@ -654,7 +665,12 @@ mod tests {
             pacer.begin_quantum();
             pacer.end_quantum();
             let wall = pacer.stats().snapshot().wall_ns;
-            assert!(wall > last, "wall_ns should grow each quantum: {} > {}", wall, last);
+            assert!(
+                wall > last,
+                "wall_ns should grow each quantum: {} > {}",
+                wall,
+                last
+            );
             last = wall;
         }
     }

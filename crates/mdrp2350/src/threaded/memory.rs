@@ -1111,17 +1111,21 @@ mod tests {
         let mem = Arc::new(SharedMemory::new());
         let barrier = Arc::new(Barrier::new(4));
         let addr = BASE + 0x3000;
-        let handles: Vec<_> = (0..4u32).map(|lane| {
-            let mem = mem.clone();
-            let barrier = barrier.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                for i in 0..20_000u32 {
-                    mem.write8(addr + lane, ((i ^ lane) & 0xFF) as u8);
-                }
+        let handles: Vec<_> = (0..4u32)
+            .map(|lane| {
+                let mem = mem.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..20_000u32 {
+                        mem.write8(addr + lane, ((i ^ lane) & 0xFF) as u8);
+                    }
+                })
             })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// Boot RAM CAS retry. Two writers hit adjacent halves of the same
@@ -1168,17 +1172,21 @@ mod tests {
         let mem = Arc::new(SharedMemory::new());
         let barrier = Arc::new(Barrier::new(4));
         let addr = BOOT_RAM_BASE + 0x180;
-        let handles: Vec<_> = (0..4u32).map(|lane| {
-            let mem = mem.clone();
-            let barrier = barrier.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                for i in 0..20_000u32 {
-                    mem.write_boot_ram8(addr + lane, ((i ^ lane) & 0xFF) as u8);
-                }
+        let handles: Vec<_> = (0..4u32)
+            .map(|lane| {
+                let mem = mem.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..20_000u32 {
+                        mem.write_boot_ram8(addr + lane, ((i ^ lane) & 0xFF) as u8);
+                    }
+                })
             })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// XIP SRAM write16 CAS retry.
@@ -1223,17 +1231,21 @@ mod tests {
         let mem = Arc::new(SharedMemory::new());
         let barrier = Arc::new(Barrier::new(4));
         let addr = XIP_SRAM_BASE + 0x180;
-        let handles: Vec<_> = (0..4u32).map(|lane| {
-            let mem = mem.clone();
-            let barrier = barrier.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                for i in 0..20_000u32 {
-                    mem.write_xip_sram8(addr + lane, ((i ^ lane) & 0xFF) as u8);
-                }
+        let handles: Vec<_> = (0..4u32)
+            .map(|lane| {
+                let mem = mem.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..20_000u32 {
+                        mem.write_xip_sram8(addr + lane, ((i ^ lane) & 0xFF) as u8);
+                    }
+                })
             })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// `read_rom32` short-read path: load a ROM of 2 bytes so any read

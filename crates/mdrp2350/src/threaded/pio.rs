@@ -28,8 +28,11 @@
 //! arbitrarily through the Mutex, which matches real hardware semantics.
 
 use super::SpscQueue;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
+use std::sync::atomic::{
+    AtomicU8, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 
 pub const PIO_BLOCKS: usize = 3;
 pub const SMS_PER_BLOCK: usize = 4;
@@ -107,12 +110,23 @@ pub enum PioCommand {
     /// is propagated to `PioBlock::write32` so firmware that uses the
     /// aliased MMIO regions (e.g. SET/CLR/XOR ROM patching) produces
     /// the same memory contents as the single-threaded `Bus` path.
-    WriteInstrMem { block: u8, addr: u8, value: u16, alias: u8 },
+    WriteInstrMem {
+        block: u8,
+        addr: u8,
+        value: u16,
+        alias: u8,
+    },
     /// SMn_CLKDIV write. `alias` is propagated through to
     /// `PioBlock::write32` for parity with the single-threaded `Bus`
     /// path, which forwards the 2-bit alias encoded in the upper MMIO
     /// address bits to `PioBlock::write32` unconditionally.
-    SetClkDiv { block: u8, sm: u8, int_div: u16, frac_div: u8, alias: u8 },
+    SetClkDiv {
+        block: u8,
+        sm: u8,
+        int_div: u16,
+        frac_div: u8,
+        alias: u8,
+    },
     /// CTRL (0x000) write: SM_ENABLE / SM_RESTART / CLKDIV_RESTART.
     /// After applying, the PIO worker publishes the resulting
     /// `sm_enabled_mask` onto `ThreadedPio::sm_enabled` so CPU-side
@@ -122,7 +136,12 @@ pub enum PioCommand {
     /// Covers TXF0..TXF3, FDEBUG, IRQ, IRQ_FORCE, INPUT_SYNC_BYPASS,
     /// per-SM EXECCTRL / SHIFTCTRL / INSTR / PINCTRL, and any PIO offset
     /// the two purpose-built variants above do not route.
-    WriteReg { block: u8, offset: u16, val: u32, alias: u8 },
+    WriteReg {
+        block: u8,
+        offset: u16,
+        val: u32,
+        alias: u8,
+    },
     /// Test-only panic-injection variant (HLD V5 §2.2 + dual-
     /// execution HLD V1 §5.5). The `apply_pio_command` arm for this
     /// variant unconditionally panics with a message containing
@@ -158,12 +177,8 @@ impl PioCommand {
 impl ThreadedPio {
     pub fn new() -> Self {
         Self {
-            tx: std::array::from_fn(|_| {
-                std::array::from_fn(|_| SpscQueue::new(PIO_FIFO_DEPTH))
-            }),
-            rx: std::array::from_fn(|_| {
-                std::array::from_fn(|_| SpscQueue::new(PIO_FIFO_DEPTH))
-            }),
+            tx: std::array::from_fn(|_| std::array::from_fn(|_| SpscQueue::new(PIO_FIFO_DEPTH))),
+            rx: std::array::from_fn(|_| std::array::from_fn(|_| SpscQueue::new(PIO_FIFO_DEPTH))),
             sm_enabled: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
             irq_flags: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
             dreq: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
@@ -290,7 +305,10 @@ impl ThreadedPio {
     /// `cmd.block()` so each Stage B.2 PIO worker drains only its own
     /// traffic.
     pub fn send_command(&self, cmd: PioCommand) {
-        debug_assert!((cmd.block() as usize) < PIO_BLOCKS, "PioCommand.block out of range");
+        debug_assert!(
+            (cmd.block() as usize) < PIO_BLOCKS,
+            "PioCommand.block out of range"
+        );
         let block_idx = cmd.block() as usize;
         self.commands[block_idx]
             .lock()
@@ -371,10 +389,7 @@ mod tests {
         for i in 0..PIO_FIFO_DEPTH {
             assert!(pio.tx_push(1, 2, i), "push {i} should succeed");
         }
-        assert!(
-            !pio.tx_push(1, 2, 0xFFFF),
-            "push into full FIFO must fail"
-        );
+        assert!(!pio.tx_push(1, 2, 0xFFFF), "push into full FIFO must fail");
         assert_eq!(pio.tx_level(1, 2), PIO_FIFO_DEPTH);
     }
 
@@ -556,10 +571,30 @@ mod tests {
     #[test]
     fn pio_command_block_accessor() {
         let cases = [
-            PioCommand::WriteInstrMem { block: 7, addr: 0, value: 0, alias: 0 },
-            PioCommand::SetClkDiv { block: 7, sm: 0, int_div: 1, frac_div: 0, alias: 0 },
-            PioCommand::WriteCtrl { block: 7, val: 0, alias: 0 },
-            PioCommand::WriteReg { block: 7, offset: 0, val: 0, alias: 0 },
+            PioCommand::WriteInstrMem {
+                block: 7,
+                addr: 0,
+                value: 0,
+                alias: 0,
+            },
+            PioCommand::SetClkDiv {
+                block: 7,
+                sm: 0,
+                int_div: 1,
+                frac_div: 0,
+                alias: 0,
+            },
+            PioCommand::WriteCtrl {
+                block: 7,
+                val: 0,
+                alias: 0,
+            },
+            PioCommand::WriteReg {
+                block: 7,
+                offset: 0,
+                val: 0,
+                alias: 0,
+            },
         ];
         for cmd in &cases {
             assert_eq!(cmd.block(), 7, "block() accessor must return 7 for {cmd:?}");
@@ -573,7 +608,7 @@ mod tests {
     /// (`self.pads[block].store(...)`) still compile unchanged.
     #[test]
     fn aligned_pio_atomics_on_own_lines() {
-        use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+        use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
         assert_eq!(std::mem::align_of::<Aligned<AtomicU64>>(), 64);
         assert_eq!(std::mem::size_of::<[Aligned<AtomicU8>; 3]>(), 192);
         // Deref-path smoke — proves the accessor pattern still compiles
@@ -603,7 +638,10 @@ mod tests {
             });
         }
         let cap_before = pio.commands[0].lock().unwrap().capacity();
-        assert!(cap_before >= 128, "capacity should have grown to hold 128 entries");
+        assert!(
+            cap_before >= 128,
+            "capacity should have grown to hold 128 entries"
+        );
 
         let drained = pio.drain_commands(0);
         assert_eq!(drained.len(), 128);

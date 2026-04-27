@@ -26,7 +26,9 @@ pub struct CoresightTraceRegs {
 
 impl CoresightTraceRegs {
     pub fn new() -> Self {
-        Self { regs: HashMap::new() }
+        Self {
+            regs: HashMap::new(),
+        }
     }
 
     /// Read a word. Unwritten offsets read 0.

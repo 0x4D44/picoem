@@ -299,7 +299,10 @@ impl VectorSlot {
     /// Construct a slot. `const` so the mode-sets can live in `static`
     /// items.
     pub const fn new(index: usize, handler_offset: u32) -> Self {
-        Self { index, handler_offset }
+        Self {
+            index,
+            handler_offset,
+        }
     }
 }
 
@@ -537,9 +540,15 @@ const fn build_image_irq<
 
     // Word 14: PendSV / Word 15: SysTick
     let pv = pendsv_vec.to_le_bytes();
-    out[56] = pv[0]; out[57] = pv[1]; out[58] = pv[2]; out[59] = pv[3];
+    out[56] = pv[0];
+    out[57] = pv[1];
+    out[58] = pv[2];
+    out[59] = pv[3];
     let sv = systick_vec.to_le_bytes();
-    out[60] = sv[0]; out[61] = sv[1]; out[62] = sv[2]; out[63] = sv[3];
+    out[60] = sv[0];
+    out[61] = sv[1];
+    out[62] = sv[2];
+    out[63] = sv[3];
 
     // Default external-IRQ entries 16..=63: default handler (bkpt #1
     // halt). Scenarios override via extra_slots. Covers all 48 NVIC
@@ -551,7 +560,10 @@ const fn build_image_irq<
     while ext_slot < 64 {
         let off = ext_slot * 4;
         let b = default_vec.to_le_bytes();
-        out[off] = b[0]; out[off + 1] = b[1]; out[off + 2] = b[2]; out[off + 3] = b[3];
+        out[off] = b[0];
+        out[off + 1] = b[1];
+        out[off + 2] = b[2];
+        out[off + 3] = b[3];
         ext_slot += 1;
     }
 
@@ -564,7 +576,10 @@ const fn build_image_irq<
             let off = slot.index * 4;
             let vec = (image_base + slot.handler_offset) | 1;
             let b = vec.to_le_bytes();
-            out[off] = b[0]; out[off + 1] = b[1]; out[off + 2] = b[2]; out[off + 3] = b[3];
+            out[off] = b[0];
+            out[off + 1] = b[1];
+            out[off + 2] = b[2];
+            out[off + 3] = b[3];
         }
         s += 1;
     }
@@ -1169,26 +1184,40 @@ const HANDLER_NONE: [u16; 0] = [];
 
 use crate::{ISR_IMAGE_BASE, ISR_MAILBOX_CYCCNT, ISR_STACK_TOP};
 
-const IMAGE_PENDSV_COLD: [u8; ISR_IMAGE_SIZE] =
-    build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_BASELINE, MAIN_BASELINE);
+const IMAGE_PENDSV_COLD: [u8; ISR_IMAGE_SIZE] = build_image(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_BASELINE,
+    MAIN_BASELINE,
+);
 
-const IMAGE_LAZY_FP_SAVE: [u8; ISR_IMAGE_SIZE] =
-    build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_LAZY_FP_OBSERVE, MAIN_LAZY_FP);
+const IMAGE_LAZY_FP_SAVE: [u8; ISR_IMAGE_SIZE] = build_image(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_LAZY_FP_OBSERVE,
+    MAIN_LAZY_FP,
+);
 
-const IMAGE_EAGER_FP_SAVE: [u8; ISR_IMAGE_SIZE] =
-    build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_BASELINE, MAIN_EAGER_FP);
+const IMAGE_EAGER_FP_SAVE: [u8; ISR_IMAGE_SIZE] = build_image(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_BASELINE,
+    MAIN_EAGER_FP,
+);
 
-const IMAGE_TAIL_CHAIN: [u8; ISR_IMAGE_SIZE] =
-    build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_BASELINE, MAIN_TAIL_CHAIN);
+const IMAGE_TAIL_CHAIN: [u8; ISR_IMAGE_SIZE] = build_image(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_BASELINE,
+    MAIN_TAIL_CHAIN,
+);
 
 // Mode-set slices for external-IRQ scenarios. Each maps the relevant
 // external IRQ slot to its handler offset inside the image.
 //
 // Scenarios A + B populate only slot 16 (TIMER0_IRQ_0) and point it at
 // `IRQ_HANDLER_OFFSET` — the shared CYCCNT-mailbox handler.
-const MODESET_IRQ_TIMER0: &[VectorSlot] = &[
-    VectorSlot::new(16, IRQ_HANDLER_OFFSET),
-];
+const MODESET_IRQ_TIMER0: &[VectorSlot] = &[VectorSlot::new(16, IRQ_HANDLER_OFFSET)];
 
 // Scenario C populates slot 16 (TIMER0_IRQ_0 → low-priority alt handler)
 // and slot 17 (TIMER0_IRQ_1 → high-priority primary handler). The slot
@@ -1199,17 +1228,32 @@ const MODESET_IRQ_PREEMPT: &[VectorSlot] = &[
     VectorSlot::new(17, IRQ_HANDLER_OFFSET),
 ];
 
-const IMAGE_IRQ_COLD: [u8; IRQ_IMAGE_SIZE] =
-    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
-        HANDLER_IRQ_CYCCNT, HANDLER_NONE, MAIN_IRQ_COLD, MODESET_IRQ_TIMER0);
+const IMAGE_IRQ_COLD: [u8; IRQ_IMAGE_SIZE] = build_image_irq(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_IRQ_CYCCNT,
+    HANDLER_NONE,
+    MAIN_IRQ_COLD,
+    MODESET_IRQ_TIMER0,
+);
 
-const IMAGE_IRQ_MASKED_PEND: [u8; IRQ_IMAGE_SIZE] =
-    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
-        HANDLER_IRQ_CYCCNT, HANDLER_NONE, MAIN_IRQ_MASKED_PEND, MODESET_IRQ_TIMER0);
+const IMAGE_IRQ_MASKED_PEND: [u8; IRQ_IMAGE_SIZE] = build_image_irq(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_IRQ_CYCCNT,
+    HANDLER_NONE,
+    MAIN_IRQ_MASKED_PEND,
+    MODESET_IRQ_TIMER0,
+);
 
-const IMAGE_IRQ_PRIORITY_PREEMPT: [u8; IRQ_IMAGE_SIZE] =
-    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
-        HANDLER_IRQ_PREEMPT, HANDLER_IRQ_LOW_PRIO, MAIN_IRQ_PRIORITY_PREEMPT, MODESET_IRQ_PREEMPT);
+const IMAGE_IRQ_PRIORITY_PREEMPT: [u8; IRQ_IMAGE_SIZE] = build_image_irq(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_IRQ_PREEMPT,
+    HANDLER_IRQ_LOW_PRIO,
+    MAIN_IRQ_PRIORITY_PREEMPT,
+    MODESET_IRQ_PREEMPT,
+);
 
 // ---------------------------------------------------------------------------
 // POWMAN TIMER IRQ scenario (Coverage Gap Fill V11 §3.2)
@@ -1231,9 +1275,7 @@ const IMAGE_IRQ_PRIORITY_PREEMPT: [u8; IRQ_IMAGE_SIZE] =
 // NVIC line 45 is in bank 1: ISER1 at 0xE000_E104, bit (45 - 32) = 13.
 // Value 1 << 13 = 0x2000.
 
-const MODESET_IRQ_POWMAN: &[VectorSlot] = &[
-    VectorSlot::new(61, IRQ_HANDLER_OFFSET),
-];
+const MODESET_IRQ_POWMAN: &[VectorSlot] = &[VectorSlot::new(61, IRQ_HANDLER_OFFSET)];
 
 /// POWMAN handler — V13 Stage 2. Captures CYCCNT into
 /// `ISR_MAILBOX_CYCCNT` (for the `cyccnt_delta` observable) *and*
@@ -1417,14 +1459,17 @@ const MAIN_IRQ_POWMAN: [u16; 40] = [
     0x4010, // [39] lit: POWMAN_INTE = 0x4010_00E4 high                                 (NEW)
 ];
 
-const IMAGE_IRQ_POWMAN: [u8; IRQ_IMAGE_SIZE] =
-    build_image_irq(ISR_IMAGE_BASE, ISR_STACK_TOP,
-        HANDLER_POWMAN_SENTINEL, HANDLER_NONE, MAIN_IRQ_POWMAN, MODESET_IRQ_POWMAN);
+const IMAGE_IRQ_POWMAN: [u8; IRQ_IMAGE_SIZE] = build_image_irq(
+    ISR_IMAGE_BASE,
+    ISR_STACK_TOP,
+    HANDLER_POWMAN_SENTINEL,
+    HANDLER_NONE,
+    MAIN_IRQ_POWMAN,
+    MODESET_IRQ_POWMAN,
+);
 
 // -- Scenario: powman_match_irq_timer_line_45 (Coverage Gap Fill V11 §3.2) --
-const INIT_IRQ_POWMAN: &[(IsrReg, u32)] = &[
-    (IsrReg::Vtor, ISR_IMAGE_BASE),
-];
+const INIT_IRQ_POWMAN: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_IRQ_POWMAN: &[(&str, IsrObservable)] = &[
     // V13 Stage 2 — two observables in parallel:
     //
@@ -1450,9 +1495,7 @@ const OBS_IRQ_POWMAN: &[(&str, IsrObservable)] = &[
 // ---------------------------------------------------------------------------
 
 // -- Scenario 1: isr_pendsv_cold --
-const INIT_PENDSV_COLD: &[(IsrReg, u32)] = &[
-    (IsrReg::Vtor, ISR_IMAGE_BASE),
-];
+const INIT_PENDSV_COLD: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_PENDSV_COLD: &[(&str, IsrObservable)] = &[
     // The CYCCNT delta is the load-bearing baseline — everything else
     // compares against it. Cold entry on M33 is ~12 cycles (exception-
@@ -1482,7 +1525,10 @@ const OBS_LAZY_FP_SAVE: &[(&str, IsrObservable)] = &[
     // FPCCR: LSPACT bit MUST be set (lazy save reserved the frame but
     // didn't flush S0-S15). Mask includes LSPACT (bit 0) + LSPEN
     // (bit 30) — both are part of the observable state.
-    ("fpccr", IsrObservable::Mmio(FPCCR_ADDR, FPCCR_LSPACT | FPCCR_LSPEN | FPCCR_ASPEN)),
+    (
+        "fpccr",
+        IsrObservable::Mmio(FPCCR_ADDR, FPCCR_LSPACT | FPCCR_LSPEN | FPCCR_ASPEN),
+    ),
     // FPCAR: must be non-zero (points at the reserved 18-word FP region
     // inside the stacked frame). Runner compares the raw word, masking
     // the low 3 bits (FPCAR is 8-byte aligned).
@@ -1511,7 +1557,10 @@ const INIT_EAGER_FP_SAVE: &[(IsrReg, u32)] = &[
 ];
 const OBS_EAGER_FP_SAVE: &[(&str, IsrObservable)] = &[
     // LSPACT MUST be clear (eager save already happened).
-    ("fpccr", IsrObservable::Mmio(FPCCR_ADDR, FPCCR_LSPACT | FPCCR_LSPEN)),
+    (
+        "fpccr",
+        IsrObservable::Mmio(FPCCR_ADDR, FPCCR_LSPACT | FPCCR_LSPEN),
+    ),
     // FPCAR may be non-zero (exception entry still records it) but
     // this scenario doesn't care about its exact value.
     // Stacked basic-frame R0 — the runner primes R0 = 0x11111111 before
@@ -1550,9 +1599,7 @@ const OBS_TAIL_CHAIN: &[(&str, IsrObservable)] = &[
 //   * Stacked xPSR — carries IRQ 0's active exception number (16).
 //
 // VTOR points at ISR_IMAGE_BASE; no other preamble required.
-const INIT_EXT_IRQ_COLD: &[(IsrReg, u32)] = &[
-    (IsrReg::Vtor, ISR_IMAGE_BASE),
-];
+const INIT_EXT_IRQ_COLD: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_EXT_IRQ_COLD: &[(&str, IsrObservable)] = &[
     ("cyccnt_delta", IsrObservable::CycleDelta),
     ("stacked_pc", IsrObservable::Stacked(StackedReg::Pc)),
@@ -1565,9 +1612,7 @@ const OBS_EXT_IRQ_COLD: &[(&str, IsrObservable)] = &[
 // no delivery happens. Then main writes NVIC_ISER → unmask triggers
 // delivery. Same observables as scenario 5 since the end state is
 // identical — the point is that delivery is deferred until ISER is set.
-const INIT_EXT_IRQ_MASKED_PEND: &[(IsrReg, u32)] = &[
-    (IsrReg::Vtor, ISR_IMAGE_BASE),
-];
+const INIT_EXT_IRQ_MASKED_PEND: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_EXT_IRQ_MASKED_PEND: &[(&str, IsrObservable)] = &[
     ("cyccnt_delta", IsrObservable::CycleDelta),
     ("stacked_pc", IsrObservable::Stacked(StackedReg::Pc)),
@@ -1586,9 +1631,7 @@ const OBS_EXT_IRQ_MASKED_PEND: &[(&str, IsrObservable)] = &[
 // preemption occurred. If preemption is broken (no dispatch of IRQ 1
 // while IRQ 0's handler is running), the scenario times out with
 // mailbox = 0xAAAA_AAAA.
-const INIT_EXT_IRQ_PRIORITY_PREEMPT: &[(IsrReg, u32)] = &[
-    (IsrReg::Vtor, ISR_IMAGE_BASE),
-];
+const INIT_EXT_IRQ_PRIORITY_PREEMPT: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_EXT_IRQ_PRIORITY_PREEMPT: &[(&str, IsrObservable)] = &[
     // `CycleDelta` reads ISR_MAILBOX_CYCCNT; scenario C reuses the slot
     // for the sentinel byte. The expected value on both HW and EMU is
@@ -1701,9 +1744,7 @@ pub const SCENARIOS: &[IsrScenario] = &[
 // Runner (library API)
 // ---------------------------------------------------------------------------
 
-use crate::silicon_oracle::{
-    self, enable_cyccnt, reset_cyccnt, CaseOutcome, Verdict,
-};
+use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, reset_cyccnt};
 use mdrp2350::{Config, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
 use std::time::{Duration, Instant};
@@ -1814,20 +1855,14 @@ fn apply_init_regs_emu(emu: &mut mdrp2350::Emulator, init_regs: &[(IsrReg, u32)]
 /// Scenario-specific MMIO preamble. Handles the two cases that don't
 /// fit the `init_regs` schema: eager-FP needs FPCCR.LSPEN cleared, and
 /// tail-chain needs SysTick pre-armed.
-fn scenario_preamble_hw(
-    core: &mut Core,
-    name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn scenario_preamble_hw(core: &mut Core, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     match name {
         "isr_eager_fp_save" => {
             // Clear FPCCR.LSPEN. Keep ASPEN so the exception-entry path
             // still records FPCAR — it's the lazy-vs-eager split we're
             // testing, not ASPEN behaviour.
             let fpccr: u32 = core.read_word_32(FPCCR_ADDR as u64)?;
-            core.write_word_32(
-                FPCCR_ADDR as u64,
-                (fpccr & !FPCCR_LSPEN) | FPCCR_ASPEN,
-            )?;
+            core.write_word_32(FPCCR_ADDR as u64, (fpccr & !FPCCR_LSPEN) | FPCCR_ASPEN)?;
         }
         "isr_tail_chain_pendsv_systick" => {
             // Pre-arm SysTick: RVR=4, CVR=0, then enable | tickint |
@@ -1961,11 +1996,7 @@ fn run_one_scenario(
         if Instant::now() > deadline {
             let _ = core.halt(Duration::from_millis(200));
             let pc: u32 = core.read_core_reg(PC_REG).unwrap_or(0xDEAD_BEEF);
-            return Err(format!(
-                "scenario '{}' BKPT timeout: PC=0x{pc:08X}",
-                sc.name
-            )
-            .into());
+            return Err(format!("scenario '{}' BKPT timeout: PC=0x{pc:08X}", sc.name).into());
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1983,7 +2014,10 @@ fn run_one_scenario(
     // EMU side — fresh emulator so scenarios don't interfere.
     // --------------------------------------------------------------
 
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .unwrap();
     emu.core_mut(1).halt();
 
     // Phase 0b.1 Commit B: per-core PPB (SCB, NVIC, SysTick, FPCCR,
@@ -2024,7 +2058,10 @@ fn run_one_scenario(
     let demcr = emu.mmio_read32(silicon_oracle::DEMCR_U32);
     emu.mmio_write32(silicon_oracle::DEMCR_U32, demcr | silicon_oracle::TRCENA);
     let dwt_ctrl = emu.mmio_read32(silicon_oracle::DWT_CTRL_U32);
-    emu.mmio_write32(silicon_oracle::DWT_CTRL_U32, dwt_ctrl | silicon_oracle::CYCCNTENA);
+    emu.mmio_write32(
+        silicon_oracle::DWT_CTRL_U32,
+        dwt_ctrl | silicon_oracle::CYCCNTENA,
+    );
     emu.mmio_write32(silicon_oracle::DWT_CYCCNT_ADDR, 0);
 
     // Prime core-0 state on EMU.
@@ -2092,7 +2129,11 @@ fn run_one_scenario(
         }
     }
 
-    let verdict = if first_div.is_none() { Verdict::Pass } else { Verdict::Fail };
+    let verdict = if first_div.is_none() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    };
     Ok((verdict, first_div, t0.elapsed()))
 }
 
@@ -2154,12 +2195,9 @@ pub fn run_against(
                 let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 outcomes.push(match verdict {
                     Verdict::Pass => CaseOutcome::pass("isr", sc.name, elapsed_ms),
-                    Verdict::Fail => CaseOutcome::fail(
-                        "isr",
-                        sc.name,
-                        detail.unwrap_or_default(),
-                        elapsed_ms,
-                    ),
+                    Verdict::Fail => {
+                        CaseOutcome::fail("isr", sc.name, detail.unwrap_or_default(), elapsed_ms)
+                    }
                 });
             }
             Err(e) => {
@@ -2258,8 +2296,11 @@ mod tests {
     //     prefix.
     #[test]
     fn test_catalogue_size_and_prefix() {
-        assert_eq!(SCENARIOS.len(), 8,
-            "catalogue must carry v1 (4) + Phase 0a (3) + POWMAN (1) = 8 scenarios");
+        assert_eq!(
+            SCENARIOS.len(),
+            8,
+            "catalogue must carry v1 (4) + Phase 0a (3) + POWMAN (1) = 8 scenarios"
+        );
         for s in SCENARIOS {
             assert!(
                 s.name.starts_with("isr_"),
@@ -2287,12 +2328,7 @@ mod tests {
             );
 
             // Word 0 — initial MSP.
-            let msp = u32::from_le_bytes([
-                sc.image[0],
-                sc.image[1],
-                sc.image[2],
-                sc.image[3],
-            ]);
+            let msp = u32::from_le_bytes([sc.image[0], sc.image[1], sc.image[2], sc.image[3]]);
             assert_eq!(
                 msp, ISR_STACK_TOP,
                 "scenario '{}' vector[0] must be ISR_STACK_TOP",
@@ -2300,12 +2336,7 @@ mod tests {
             );
 
             // Word 1 — Reset_Handler. Thumb LSB set, base matches.
-            let rv = u32::from_le_bytes([
-                sc.image[4],
-                sc.image[5],
-                sc.image[6],
-                sc.image[7],
-            ]);
+            let rv = u32::from_le_bytes([sc.image[4], sc.image[5], sc.image[6], sc.image[7]]);
             assert_eq!(
                 rv & 1,
                 1,
@@ -2321,12 +2352,7 @@ mod tests {
             );
 
             // Word 14 — PendSV handler.
-            let pv = u32::from_le_bytes([
-                sc.image[56],
-                sc.image[57],
-                sc.image[58],
-                sc.image[59],
-            ]);
+            let pv = u32::from_le_bytes([sc.image[56], sc.image[57], sc.image[58], sc.image[59]]);
             assert_eq!(
                 pv & 1,
                 1,
@@ -2341,12 +2367,7 @@ mod tests {
             );
 
             // Word 15 — SysTick handler.
-            let sv = u32::from_le_bytes([
-                sc.image[60],
-                sc.image[61],
-                sc.image[62],
-                sc.image[63],
-            ]);
+            let sv = u32::from_le_bytes([sc.image[60], sc.image[61], sc.image[62], sc.image[63]]);
             assert_eq!(
                 sv & 1,
                 1,
@@ -2356,15 +2377,11 @@ mod tests {
 
             // Default handler must be bkpt #1 (0xBE01).
             let dh_off = layout.default_handler_offset as usize;
-            let dh = u16::from_le_bytes([
-                sc.image[dh_off],
-                sc.image[dh_off + 1],
-            ]);
+            let dh = u16::from_le_bytes([sc.image[dh_off], sc.image[dh_off + 1]]);
             assert_eq!(
                 dh, 0xBE01,
                 "scenario '{}' default handler at 0x{:03X} must be bkpt #1",
-                sc.name,
-                dh_off,
+                sc.name, dh_off,
             );
         }
     }
@@ -2407,14 +2424,14 @@ mod tests {
             // Slot 16 at byte offset 64. Must have Thumb LSB set and
             // point past the default handler (otherwise the mode-set
             // write didn't land).
-            let vec16 = u32::from_le_bytes([
-                sc.image[64],
-                sc.image[65],
-                sc.image[66],
-                sc.image[67],
-            ]);
-            assert_eq!(vec16 & 1, 1,
-                "scenario '{}' slot 16 missing Thumb LSB", sc.name);
+            let vec16 =
+                u32::from_le_bytes([sc.image[64], sc.image[65], sc.image[66], sc.image[67]]);
+            assert_eq!(
+                vec16 & 1,
+                1,
+                "scenario '{}' slot 16 missing Thumb LSB",
+                sc.name
+            );
             let target = vec16 & !1;
             assert_ne!(
                 target,
@@ -2442,18 +2459,18 @@ mod tests {
             .iter()
             .find(|s| s.name == "isr_ext_irq_priority_preempt")
             .expect("priority_preempt scenario must be in catalogue");
-        let vec16 = u32::from_le_bytes([
-            sc.image[64],  sc.image[65],  sc.image[66],  sc.image[67],
-        ]);
-        let vec17 = u32::from_le_bytes([
-            sc.image[68],  sc.image[69],  sc.image[70],  sc.image[71],
-        ]);
-        assert_eq!(vec16 & !1,
+        let vec16 = u32::from_le_bytes([sc.image[64], sc.image[65], sc.image[66], sc.image[67]]);
+        let vec17 = u32::from_le_bytes([sc.image[68], sc.image[69], sc.image[70], sc.image[71]]);
+        assert_eq!(
+            vec16 & !1,
             ISR_IMAGE_BASE + IRQ_ALT_HANDLER_OFFSET,
-            "slot 16 must point at alt handler (low-priority IRQ 0)");
-        assert_eq!(vec17 & !1,
+            "slot 16 must point at alt handler (low-priority IRQ 0)"
+        );
+        assert_eq!(
+            vec17 & !1,
             ISR_IMAGE_BASE + IRQ_HANDLER_OFFSET,
-            "slot 17 must point at primary handler (high-priority IRQ 1)");
+            "slot 17 must point at primary handler (high-priority IRQ 1)"
+        );
     }
 
     // (3c) `build_image_modeset` with an empty slice must produce
@@ -2464,7 +2481,10 @@ mod tests {
         const HW: [u16; 2] = [0xBE00, 0xBE00];
         let a = build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW);
         let b = build_image_modeset(ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW, &[]);
-        assert_eq!(a, b, "empty mode-set must behave identically to build_image");
+        assert_eq!(
+            a, b,
+            "empty mode-set must behave identically to build_image"
+        );
     }
 
     // (3d) DEFAULT_MODESET (PendSV + SysTick at HANDLER_OFFSET) must
@@ -2475,10 +2495,11 @@ mod tests {
     fn test_build_image_modeset_default_matches_build_image() {
         const HW: [u16; 2] = [0xBE00, 0xBE00];
         let a = build_image(ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW);
-        let b = build_image_modeset(
-            ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW, DEFAULT_MODESET,
+        let b = build_image_modeset(ISR_IMAGE_BASE, ISR_STACK_TOP, HW, HW, DEFAULT_MODESET);
+        assert_eq!(
+            a, b,
+            "DEFAULT_MODESET must behave identically to build_image"
         );
-        assert_eq!(a, b, "DEFAULT_MODESET must behave identically to build_image");
     }
 
     // (4) Substring-uniqueness within the catalogue. Orchestrator fires
@@ -2499,7 +2520,8 @@ mod tests {
                 assert!(
                     !s1.name.contains(s2.name),
                     "scenario '{}' is a substring of '{}'; filter aliasing",
-                    s2.name, s1.name,
+                    s2.name,
+                    s1.name,
                 );
             }
         }
@@ -2590,8 +2612,7 @@ mod tests {
             assert!(
                 saw_bkpt0,
                 "scenario '{}' handler body at 0x{:03X} must contain bkpt #0",
-                sc.name,
-                layout.handler_offset,
+                sc.name, layout.handler_offset,
             );
         }
     }
@@ -2686,11 +2707,7 @@ mod tests {
             // literals. Walk through IRQ_MAIN_OFFSET so both handler
             // bodies are covered; they share the same pool structure.
             let end = layout.main_offset as usize;
-            let loads = collect_ldr_literal_loads(
-                sc.image,
-                layout.handler_offset as usize,
-                end,
-            );
+            let loads = collect_ldr_literal_loads(sc.image, layout.handler_offset as usize, end);
             for (instr_off, rd, target, word) in loads {
                 assert_eq!(
                     target & 3,
@@ -2798,11 +2815,7 @@ mod tests {
         let inte_val_load_off = main_off + 9 * 2;
         let inte_addr_load_off = main_off + 10 * 2;
 
-        let loads = collect_ldr_literal_loads(
-            sc.image,
-            main_off,
-            sc.image.len(),
-        );
+        let loads = collect_ldr_literal_loads(sc.image, main_off, sc.image.len());
         let r4_inte_word = loads
             .iter()
             .find(|(addr, rd, _, _)| *addr == inte_val_load_off && *rd == 4)
@@ -2850,9 +2863,7 @@ mod tests {
                 5 => 0xE000_1004, // DWT_CYCCNT_ADDR
                 6 => 0xE000_ED04, // SCB_ICSR_ADDR
                 7 => 0x1000_0000, // ICSR_PENDSVSET
-                _ => unreachable!(
-                    "unexpected LDR target register r{rd} in main routine"
-                ),
+                _ => unreachable!("unexpected LDR target register r{rd} in main routine"),
             }
         }
 
@@ -2862,11 +2873,7 @@ mod tests {
             if sc.image.len() != ISR_IMAGE_SIZE {
                 continue;
             }
-            let loads = collect_ldr_literal_loads(
-                sc.image,
-                MAIN_OFFSET as usize,
-                ISR_IMAGE_SIZE,
-            );
+            let loads = collect_ldr_literal_loads(sc.image, MAIN_OFFSET as usize, ISR_IMAGE_SIZE);
             assert!(
                 !loads.is_empty(),
                 "scenario '{}' main routine has no LDR literal loads",
@@ -2939,11 +2946,8 @@ mod tests {
             if sc.image.len() != IRQ_IMAGE_SIZE {
                 continue;
             }
-            let loads = collect_ldr_literal_loads(
-                sc.image,
-                IRQ_MAIN_OFFSET as usize,
-                IRQ_IMAGE_SIZE,
-            );
+            let loads =
+                collect_ldr_literal_loads(sc.image, IRQ_MAIN_OFFSET as usize, IRQ_IMAGE_SIZE);
             assert!(
                 !loads.is_empty(),
                 "scenario '{}' ext-IRQ main has no LDR literal loads",
@@ -2984,7 +2988,10 @@ mod tests {
     ///
     /// Mirrors the EMU-side half of `run_one_scenario` but skips HW.
     fn run_scenario_emu_mailbox(sc: &IsrScenario) -> u32 {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .unwrap();
         emu.core_mut(1).halt();
 
         // Upload image.
@@ -3007,11 +3014,15 @@ mod tests {
 
         // Enable DWT CYCCNT.
         let demcr = emu.mmio_read32(crate::silicon_oracle::DEMCR_U32);
-        emu.mmio_write32(crate::silicon_oracle::DEMCR_U32,
-            demcr | crate::silicon_oracle::TRCENA);
+        emu.mmio_write32(
+            crate::silicon_oracle::DEMCR_U32,
+            demcr | crate::silicon_oracle::TRCENA,
+        );
         let dwt_ctrl = emu.mmio_read32(crate::silicon_oracle::DWT_CTRL_U32);
-        emu.mmio_write32(crate::silicon_oracle::DWT_CTRL_U32,
-            dwt_ctrl | crate::silicon_oracle::CYCCNTENA);
+        emu.mmio_write32(
+            crate::silicon_oracle::DWT_CTRL_U32,
+            dwt_ctrl | crate::silicon_oracle::CYCCNTENA,
+        );
         emu.mmio_write32(crate::silicon_oracle::DWT_CYCCNT_ADDR, 0);
 
         // Prime core 0.
@@ -3053,8 +3064,14 @@ mod tests {
     /// (cycle models evolve).
     #[test]
     fn test_investigate_cold_vs_tail_chain_emu_cyccnt() {
-        let cold = SCENARIOS.iter().find(|s| s.name == "isr_pendsv_cold").unwrap();
-        let tail = SCENARIOS.iter().find(|s| s.name == "isr_tail_chain_pendsv_systick").unwrap();
+        let cold = SCENARIOS
+            .iter()
+            .find(|s| s.name == "isr_pendsv_cold")
+            .unwrap();
+        let tail = SCENARIOS
+            .iter()
+            .find(|s| s.name == "isr_tail_chain_pendsv_systick")
+            .unwrap();
 
         let cold_mbx = run_scenario_emu_mailbox(cold);
         let tail_mbx = run_scenario_emu_mailbox(tail);
@@ -3062,7 +3079,10 @@ mod tests {
         eprintln!("=== ISR oracle delta investigation ===");
         eprintln!("isr_pendsv_cold                  mailbox_cyccnt = {cold_mbx}");
         eprintln!("isr_tail_chain_pendsv_systick    mailbox_cyccnt = {tail_mbx}");
-        eprintln!("delta (cold - tail)              = {}", cold_mbx as i64 - tail_mbx as i64);
+        eprintln!(
+            "delta (cold - tail)              = {}",
+            cold_mbx as i64 - tail_mbx as i64
+        );
         eprintln!("HW reference (previous session)  = 19 for both");
 
         // Sanity-check both scenarios actually reached their handler.

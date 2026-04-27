@@ -20,13 +20,12 @@
 
 use mdpicoem_harness::ieee754_ref;
 use mdpicoem_harness::{Bus, CortexM33};
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 // Which six FPSCR bits we care about (cumulative exception flags).
-const FPSCR_FLAG_MASK: u32 =
-    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 7);
+const FPSCR_FLAG_MASK: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 7);
 
 // FPSCR control bits we sweep over: FZ (flush-to-zero, bit 24) and DN
 // (default NaN, bit 25). All four combinations are exercised so the oracle
@@ -111,7 +110,11 @@ fn parse_args() -> Result<Args, String> {
     if seed.is_some() && fuzz_count.is_none() {
         return Err("--seed requires --fuzz".into());
     }
-    Ok(Args { fuzz_count, seed, mode })
+    Ok(Args {
+        fuzz_count,
+        seed,
+        mode,
+    })
 }
 
 // ============================================================================
@@ -169,14 +172,24 @@ fn vfp_unary(opc3: u16, t: u16, sd: u16, sm: u16) -> (u16, u16) {
     (hw0, hw1)
 }
 
-fn enc_vrintr(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0110, 0, sd, sm) }
-fn enc_vrintz(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0110, 1, sd, sm) }
-fn enc_vrintx(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0111, 0, sd, sm) }
+fn enc_vrintr(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0110, 0, sd, sm)
+}
+fn enc_vrintz(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0110, 1, sd, sm)
+}
+fn enc_vrintx(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0111, 0, sd, sm)
+}
 // T-variants of VCVT.F16↔F32 share the same conversion logic — only the half
 // of Sd/Sm differs. We test the B-variants; T-variants are exercised by the
 // in-crate unit tests in `crates/mdrp2350/src/tests.rs`.
-fn enc_vcvtb_f16_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0010, 0, sd, sm) }
-fn enc_vcvtb_f32_f16(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0011, 0, sd, sm) }
+fn enc_vcvtb_f16_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0010, 0, sd, sm)
+}
+fn enc_vcvtb_f32_f16(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0011, 0, sd, sm)
+}
 
 // ============================================================================
 // Test runner
@@ -354,11 +367,11 @@ fn random_f32(rng: &mut StdRng) -> f32 {
         1 => -0.0,
         2 => f32::INFINITY,
         3 => f32::NEG_INFINITY,
-        4 => f32::from_bits(0x7FC0_0000),  // qNaN
-        5 => f32::from_bits(0x7F80_0001),  // sNaN
-        6 => f32::MIN_POSITIVE,            // smallest normal
-        7 => f32::from_bits(0x0000_0001),  // smallest subnormal
-        8 => f32::from_bits(0x007F_FFFF),  // largest subnormal
+        4 => f32::from_bits(0x7FC0_0000), // qNaN
+        5 => f32::from_bits(0x7F80_0001), // sNaN
+        6 => f32::MIN_POSITIVE,           // smallest normal
+        7 => f32::from_bits(0x0000_0001), // smallest subnormal
+        8 => f32::from_bits(0x007F_FFFF), // largest subnormal
         9 => f32::MAX,
         10 => -f32::MAX,
         11 => 1.0,
@@ -446,8 +459,15 @@ fn fpscr_modes_for(op: Op) -> Vec<(u32, String)> {
 /// FPU mode runner — returns true on all-pass.
 fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
     let ops = [
-        Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Sqrt, Op::Fma,
-        Op::VRintR, Op::VRintX, Op::VRintZ,
+        Op::Add,
+        Op::Sub,
+        Op::Mul,
+        Op::Div,
+        Op::Sqrt,
+        Op::Fma,
+        Op::VRintR,
+        Op::VRintX,
+        Op::VRintZ,
     ];
 
     match fuzz_count {
@@ -468,14 +488,17 @@ fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
                     }
                 }
             }
-            println!("[FPU] Edge cases: {}/{} passed (FPSCR modes vary per op)", total - fail, total);
+            println!(
+                "[FPU] Edge cases: {}/{} passed (FPSCR modes vary per op)",
+                total - fail,
+                total
+            );
             fail == 0
         }
         Some(count) => {
             // Total count is a rough upper bound for the print; per-op modes
             // vary (VRINT* multiply by 4 rmodes).
-            let total_modes: usize =
-                ops.iter().map(|&o| fpscr_modes_for(o).len()).sum();
+            let total_modes: usize = ops.iter().map(|&o| fpscr_modes_for(o).len()).sum();
             println!(
                 "[FPU] Fuzz: {count} tests/op/mode, {} (op,mode) cells, seed={seed}\n\
                  (reproduce: softfloat_diff --fuzz {count} --seed {seed})",
@@ -491,8 +514,16 @@ fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
                     for _ in 0..count {
                         total += 1;
                         let a = random_f32(&mut rng);
-                        let b = if arity >= 2 { random_f32(&mut rng) } else { 0.0 };
-                        let c = if arity >= 3 { random_f32(&mut rng) } else { 0.0 };
+                        let b = if arity >= 2 {
+                            random_f32(&mut rng)
+                        } else {
+                            0.0
+                        };
+                        let c = if arity >= 3 {
+                            random_f32(&mut rng)
+                        } else {
+                            0.0
+                        };
                         if let Some(d) = run_single(op, a, b, c, mode, label_static) {
                             if fail < 20 {
                                 eprintln!("[FPU FAIL] {d}");
@@ -504,7 +535,10 @@ fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
             }
             println!("[FPU] Fuzz: {}/{} passed", total - fail, total);
             if fail >= 20 {
-                eprintln!("[FPU] (suppressed output for {} additional failures)", fail - 20);
+                eprintln!(
+                    "[FPU] (suppressed output for {} additional failures)",
+                    fail - 20
+                );
             }
             fail == 0
         }
@@ -535,18 +569,18 @@ impl HalfDir {
 fn random_f16_bits(rng: &mut StdRng) -> u16 {
     let roll = rng.gen_range(0..16);
     match roll {
-        0 => 0x0000,                  // +0
-        1 => 0x8000,                  // -0
-        2 => 0x7C00,                  // +inf
-        3 => 0xFC00,                  // -inf
-        4 => 0x7E00,                  // canonical QNaN (default)
-        5 => 0x7C01,                  // SNaN
-        6 => 0x0001,                  // smallest subnormal
-        7 => 0x03FF,                  // largest subnormal
-        8 => 0x0400,                  // smallest normal
-        9 => 0x7BFF,                  // largest normal
-        10 => 0x3C00,                 // +1.0
-        11 => 0xBC00,                 // -1.0
+        0 => 0x0000,  // +0
+        1 => 0x8000,  // -0
+        2 => 0x7C00,  // +inf
+        3 => 0xFC00,  // -inf
+        4 => 0x7E00,  // canonical QNaN (default)
+        5 => 0x7C01,  // SNaN
+        6 => 0x0001,  // smallest subnormal
+        7 => 0x03FF,  // largest subnormal
+        8 => 0x0400,  // smallest normal
+        9 => 0x7BFF,  // largest normal
+        10 => 0x3C00, // +1.0
+        11 => 0xBC00, // -1.0
         _ => rng.r#gen::<u16>(),
     }
 }
@@ -558,14 +592,18 @@ fn half_edge_cases_f32() -> Vec<f32> {
     let qnan = f32::from_bits(0x7FCD_EAD0);
     let denorm = f32::from_bits(0x0000_0001);
     vec![
-        0.0, -0.0,
-        f32::INFINITY, f32::NEG_INFINITY,
-        snan, qnan,
+        0.0,
+        -0.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        snan,
+        qnan,
         denorm,
-        1.0, -1.0,
-        65504.0,    // largest f16 normal
+        1.0,
+        -1.0,
+        65504.0, // largest f16 normal
         -65504.0,
-        65536.0,    // overflows to f16 inf
+        65536.0,                     // overflows to f16 inf
         f32::from_bits(0x387F_C000), // largest f16 subnormal as f32
         6.103515625e-5,              // smallest f16 normal (2^-14)
         f32::from_bits(0x33800000),  // smallest f16 subnormal (2^-24)
@@ -575,25 +613,18 @@ fn half_edge_cases_f32() -> Vec<f32> {
 
 fn half_edge_cases_f16() -> Vec<u16> {
     vec![
-        0x0000, 0x8000,             // ±0
-        0x7C00, 0xFC00,             // ±inf
-        0x7E00,                     // canonical QNaN
-        0x7C01, 0x7DFF,             // SNaNs
-        0x7E01, 0x7FFF,             // QNaNs (with payload)
-        0x0001, 0x03FF,             // ±subnormals
-        0x8001, 0x83FF,
-        0x0400, 0x3C00, 0xBC00,     // smallest normal, ±1.0
-        0x7BFF, 0xFBFF,             // largest ±normals
+        0x0000, 0x8000, // ±0
+        0x7C00, 0xFC00, // ±inf
+        0x7E00, // canonical QNaN
+        0x7C01, 0x7DFF, // SNaNs
+        0x7E01, 0x7FFF, // QNaNs (with payload)
+        0x0001, 0x03FF, // ±subnormals
+        0x8001, 0x83FF, 0x0400, 0x3C00, 0xBC00, // smallest normal, ±1.0
+        0x7BFF, 0xFBFF, // largest ±normals
     ]
 }
 
-fn run_one_half(
-    dir: HalfDir,
-    fpscr_mode: u32,
-    mode_label: &str,
-    f32_in: f32,
-    f16_in: u16,
-) -> bool {
+fn run_one_half(dir: HalfDir, fpscr_mode: u32, mode_label: &str, f32_in: f32, f16_in: u16) -> bool {
     let mut emu = CortexM33::default();
     emu.regs.fpscr = fpscr_mode;
 
@@ -608,8 +639,7 @@ fn run_one_half(
             let emu_half = (emu.regs.s[0].to_bits() & 0xFFFF) as u16;
             let emu_flags = emu.regs.fpscr & FPSCR_FLAG_MASK;
 
-            let (ref_half, ref_flags) =
-                ieee754_ref::ref_vcvt_f16_from_f32(f32_in, fpscr_mode);
+            let (ref_half, ref_flags) = ieee754_ref::ref_vcvt_f16_from_f32(f32_in, fpscr_mode);
 
             let result_match = if is_f16_nan(emu_half) && is_f16_nan(ref_half) {
                 if fpscr_mode & ieee754_ref::DN != 0 {
@@ -626,9 +656,15 @@ fn run_one_half(
             eprintln!(
                 "[FPU FAIL] {} [{} fpscr_in=0x{:08X}] in=0x{:08X}({}) | \
                  emu=0x{:04X} flags=0x{:02X} | ref=0x{:04X} flags=0x{:02X}",
-                dir.name(), mode_label, fpscr_mode,
-                f32_in.to_bits(), f32_in,
-                emu_half, emu_flags, ref_half, ref_flags
+                dir.name(),
+                mode_label,
+                fpscr_mode,
+                f32_in.to_bits(),
+                f32_in,
+                emu_half,
+                emu_flags,
+                ref_half,
+                ref_flags
             );
             false
         }
@@ -640,8 +676,7 @@ fn run_one_half(
             let emu_result = emu.regs.s[0];
             let emu_flags = emu.regs.fpscr & FPSCR_FLAG_MASK;
 
-            let (ref_result, ref_flags) =
-                ieee754_ref::ref_vcvt_f32_from_f16(f16_in, fpscr_mode);
+            let (ref_result, ref_flags) = ieee754_ref::ref_vcvt_f32_from_f16(f16_in, fpscr_mode);
 
             let result_match = if emu_result.is_nan() && ref_result.is_nan() {
                 if fpscr_mode & ieee754_ref::DN != 0 {
@@ -658,10 +693,16 @@ fn run_one_half(
             eprintln!(
                 "[FPU FAIL] {} [{} fpscr_in=0x{:08X}] in=0x{:04X} | \
                  emu=0x{:08X}({}) flags=0x{:02X} | ref=0x{:08X}({}) flags=0x{:02X}",
-                dir.name(), mode_label, fpscr_mode,
+                dir.name(),
+                mode_label,
+                fpscr_mode,
                 f16_in,
-                emu_result.to_bits(), emu_result, emu_flags,
-                ref_result.to_bits(), ref_result, ref_flags
+                emu_result.to_bits(),
+                emu_result,
+                emu_flags,
+                ref_result.to_bits(),
+                ref_result,
+                ref_flags
             );
             false
         }
@@ -698,8 +739,14 @@ fn run_vcvt_half(fuzz_count: Option<usize>, seed: u64) -> bool {
                     }
                 }
             }
-            println!("[FPU] VCVT.F16 edge cases: {}/{} passed", total - fail, total);
-            if fail != 0 { all_pass = false; }
+            println!(
+                "[FPU] VCVT.F16 edge cases: {}/{} passed",
+                total - fail,
+                total
+            );
+            if fail != 0 {
+                all_pass = false;
+            }
         }
         Some(count) => {
             let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0xCAFE));
@@ -727,7 +774,9 @@ fn run_vcvt_half(fuzz_count: Option<usize>, seed: u64) -> bool {
                 }
             }
             println!("[FPU] VCVT.F16 fuzz: {}/{} passed", total - fail, total);
-            if fail != 0 { all_pass = false; }
+            if fail != 0 {
+                all_pass = false;
+            }
         }
     }
     all_pass
@@ -933,7 +982,11 @@ fn run_dcp(fuzz_count: Option<usize>, seed: u64) -> bool {
                 for _ in 0..count {
                     total += 1;
                     let a = random_f64(&mut rng);
-                    let b = if arity >= 2 { random_f64(&mut rng) } else { 0.0 };
+                    let b = if arity >= 2 {
+                        random_f64(&mut rng)
+                    } else {
+                        0.0
+                    };
                     if let Some(d) = run_dcp_single(op, a, b) {
                         if fail < 20 {
                             eprintln!("[DCP FAIL] {d}");
@@ -944,7 +997,10 @@ fn run_dcp(fuzz_count: Option<usize>, seed: u64) -> bool {
             }
             println!("[DCP] Fuzz: {}/{} passed", total - fail, total);
             if fail >= 20 {
-                eprintln!("[DCP] (suppressed output for {} additional failures)", fail - 20);
+                eprintln!(
+                    "[DCP] (suppressed output for {} additional failures)",
+                    fail - 20
+                );
             }
             fail == 0
         }
@@ -1103,14 +1159,22 @@ fn edge_cases() -> Vec<(Op, f32, f32, f32)> {
     // VRINTR / VRINTX / VRINTZ — share the input list; the runner sweeps
     // FPSCR.RMode for the rmode-sensitive variants.
     let vrint_inputs = [
-        0.0f32, -0.0,
-        1.0, -1.0,
-        2.5, -2.5,           // half-way (RN: 2.0/-2.0; RP: 3/-2; RM: 2/-3; RZ: 2/-2)
-        1.5, -1.5,
-        0.5, -0.5,           // half-way at exponent boundary
-        100.0, -100.0,
-        f32::INFINITY, f32::NEG_INFINITY,
-        snan, qnan,
+        0.0f32,
+        -0.0,
+        1.0,
+        -1.0,
+        2.5,
+        -2.5, // half-way (RN: 2.0/-2.0; RP: 3/-2; RM: 2/-3; RZ: 2/-2)
+        1.5,
+        -1.5,
+        0.5,
+        -0.5, // half-way at exponent boundary
+        100.0,
+        -100.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        snan,
+        qnan,
         denorm,
         f32::from_bits(0x4B00_0001), // > 2^23, not exactly representable as integer
         f32::from_bits(0x3F7F_FFFF), // 0.999... — rounds up under RP, down under RZ

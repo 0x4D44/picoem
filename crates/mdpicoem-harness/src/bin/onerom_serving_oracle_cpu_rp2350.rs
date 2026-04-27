@@ -71,7 +71,8 @@ fn main() -> ExitCode {
     // step_quantum=1 for per-cycle observation fidelity.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -238,8 +239,7 @@ fn main() -> ExitCode {
 
     // Build the oracle. Shadow is lifted from flash (canonical ground
     // truth — mirrors the PIO oracle's approach).
-    let mut oracle =
-        onerom_serving_oracle_cpu::CpuServingOracle::new_at_sync(&mut emu.bus, &flash);
+    let mut oracle = onerom_serving_oracle_cpu::CpuServingOracle::new_at_sync(&mut emu.bus, &flash);
 
     // Shadow-integrity tripwire (same as the PIO oracle).
     let unique: HashSet<u8> = oracle.shadow().iter().copied().collect();
@@ -250,9 +250,7 @@ fn main() -> ExitCode {
         unique.len(),
     );
     if unique.len() == 1 {
-        println!(
-            "WARNING: shadow is uniform — oracle cannot distinguish between addresses."
-        );
+        println!("WARNING: shadow is uniform — oracle cannot distinguish between addresses.");
     }
 
     // In CPU mode the firmware populates SRAM itself via a CPU copy
@@ -265,7 +263,10 @@ fn main() -> ExitCode {
     // Per-case sweep.
     let total = onerom_serving_oracle_cpu::CPU_DEFAULT_CASES.len();
     let mut wall_us: Vec<f64> = Vec::with_capacity(total);
-    for (idx, case) in onerom_serving_oracle_cpu::CPU_DEFAULT_CASES.iter().enumerate() {
+    for (idx, case) in onerom_serving_oracle_cpu::CPU_DEFAULT_CASES
+        .iter()
+        .enumerate()
+    {
         let t0 = Instant::now();
         let result = oracle.run_case(&mut emu, *case);
         let elapsed_us = t0.elapsed().as_nanos() as f64 / 1000.0;
@@ -333,9 +334,7 @@ fn format_verdict_short(v: &onerom_serving_oracle_cpu::CpuVerdict) -> String {
     match v {
         onerom_serving_oracle_cpu::CpuVerdict::Pass => "Pass".to_string(),
         onerom_serving_oracle_cpu::CpuVerdict::WrongByte { .. } => "WrongByte".to_string(),
-        onerom_serving_oracle_cpu::CpuVerdict::DataPinsNotDriven => {
-            "DataPinsNotDriven".to_string()
-        }
+        onerom_serving_oracle_cpu::CpuVerdict::DataPinsNotDriven => "DataPinsNotDriven".to_string(),
         onerom_serving_oracle_cpu::CpuVerdict::NoStableByte => "NoStableByte".to_string(),
         onerom_serving_oracle_cpu::CpuVerdict::LatencyOutOfEnvelope { .. } => {
             "LatencyOOE".to_string()

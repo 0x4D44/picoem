@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::core::CortexM33;
-use crate::bus::Bus;
-use crate::threaded::CoreAtomics;
 use crate::Cores;
+use crate::bus::Bus;
+use crate::core::CortexM33;
+use crate::threaded::CoreAtomics;
 
 // ============================================================================
 // Helper: build a core + bus, optionally pre-load SRAM
@@ -501,7 +501,7 @@ fn str_ldr_reg() {
     let (mut c, mut bus) = core_and_bus();
     c.set_reg(0, 0xCAFE_BABE);
     c.set_reg(1, 0x2000_0000); // SRAM base
-    c.set_reg(2, 4);           // offset
+    c.set_reg(2, 4); // offset
     // STR R0, [R1, R2]: 0101_000_010_001_000 = 0x5088
     c.execute_one_with_bus(0x5088, &mut bus);
     assert_eq!(bus.read32(0x2000_0004, 0), 0xCAFE_BABE);
@@ -873,7 +873,7 @@ fn run_small_program() {
 // ThumbExpandImm
 // ============================================================================
 
-use crate::core::execute_thumb32::{thumb_expand_imm_c, thumb_expand_imm, extract_imm12};
+use crate::core::execute_thumb32::{extract_imm12, thumb_expand_imm, thumb_expand_imm_c};
 
 #[test]
 fn thumb_expand_imm_pattern_00() {
@@ -1162,9 +1162,9 @@ fn ands_w_imm_carry() {
     let cy = c.execute_one_wide(hw0, hw1);
     // imm32 = 0x8000_0000
     assert_eq!(c.reg(0), 0x8000_0000); // 0xFFFFFFFF & 0x80000000
-    assert!(c.flag_n());  // bit 31 set
+    assert!(c.flag_n()); // bit 31 set
     assert!(!c.flag_z());
-    assert!(c.flag_c());  // carry from ThumbExpandImm rotation
+    assert!(c.flag_c()); // carry from ThumbExpandImm rotation
     assert_eq!(cy, 2); // M33 measured: 2 cycles (rotated imm)
 }
 
@@ -1504,7 +1504,7 @@ fn bfi_basic() {
     // BFI R0, R1, #4, #8 — insert bits [11:4] from R1 into R0
     let mut c = CortexM33::for_test(0);
     c.set_reg(0, 0xFFFF_FFFF);
-    c.set_reg(1, 0xAB);       // low 8 bits = 0xAB
+    c.set_reg(1, 0xAB); // low 8 bits = 0xAB
     let (hw0, hw1) = encode_bfi(0, 1, 4, 8);
     let cy = c.execute_one_wide(hw0, hw1);
     // mask = 0xFF << 4 = 0xFF0
@@ -1691,7 +1691,7 @@ fn ldr_w_reg() {
     let (mut c, mut bus) = core_and_bus();
     bus.write32(0x2000_0010, 0x1234_5678, 0); // array[4] at base + 4*4
     c.set_reg(1, 0x2000_0000); // base
-    c.set_reg(2, 4);           // index
+    c.set_reg(2, 4); // index
     let (hw0, hw1) = encode_ldr_w_reg(0, 1, 2, 2); // LSL #2
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     assert_eq!(c.reg(0), 0x1234_5678);
@@ -1796,8 +1796,8 @@ fn ldr_w_pre_index() {
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldr_w_imm8_puw(0, 1, 4, true, true, true);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(c.reg(0), 0x1111_2222);      // loaded from base+4
-    assert_eq!(c.reg(1), 0x2000_0004);      // R1 updated (writeback)
+    assert_eq!(c.reg(0), 0x1111_2222); // loaded from base+4
+    assert_eq!(c.reg(1), 0x2000_0004); // R1 updated (writeback)
     assert_eq!(cy, 2); // M33 measured: 2 cycles (SRAM, zero-wait-state)
 }
 
@@ -1810,8 +1810,8 @@ fn ldr_w_post_index() {
     c.set_reg(1, 0x2000_0000);
     let (hw0, hw1) = encode_ldr_w_imm8_puw(0, 1, 4, false, true, true);
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
-    assert_eq!(c.reg(0), 0x3333_4444);      // loaded from original base
-    assert_eq!(c.reg(1), 0x2000_0004);      // R1 updated after load
+    assert_eq!(c.reg(0), 0x3333_4444); // loaded from original base
+    assert_eq!(c.reg(1), 0x2000_0004); // R1 updated after load
     assert_eq!(cy, 2); // M33 measured: 2 cycles (SRAM, zero-wait-state)
 }
 
@@ -1841,8 +1841,15 @@ fn ldr_w_rt15_loads_pc() {
     // LDR.W R15, [R1, #0] → Rt=15, size=word → loads PC
     let (hw0, hw1) = encode_ldr_w_imm12(15, 1, 0);
     eprintln!("hw0={:#06x} hw1={:#06x}", hw0, hw1);
-    let sz = (hw0 >> 5) & 3; let ld = (hw0 >> 4) & 1;
-    eprintln!("size={} load={} rn={} rt={}", sz, ld, hw0 & 0xF, (hw1 >> 12) & 0xF);
+    let sz = (hw0 >> 5) & 3;
+    let ld = (hw0 >> 4) & 1;
+    eprintln!(
+        "size={} load={} rn={} rt={}",
+        sz,
+        ld,
+        hw0 & 0xF,
+        (hw1 >> 12) & 0xF
+    );
     let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
     eprintln!("cy={} pc={:#x} r15={:#x}", cy, c.regs.pc(), c.regs.r[15]);
     // PC set to loaded value with bit[0] cleared
@@ -2115,9 +2122,9 @@ fn stm_w_db() {
 
     // DB: start addr = SP - 5*4 = 0x2000_0FEC
     let start = sp - 20;
-    assert_eq!(bus.read32(start, 0),      0x4444_4444); // R4
-    assert_eq!(bus.read32(start + 4, 0),  0x5555_5555); // R5
-    assert_eq!(bus.read32(start + 8, 0),  0x6666_6666); // R6
+    assert_eq!(bus.read32(start, 0), 0x4444_4444); // R4
+    assert_eq!(bus.read32(start + 4, 0), 0x5555_5555); // R5
+    assert_eq!(bus.read32(start + 8, 0), 0x6666_6666); // R6
     assert_eq!(bus.read32(start + 12, 0), 0x7777_7777); // R7
     assert_eq!(bus.read32(start + 16, 0), 0xEEEE_EEEE); // LR
     // Writeback: SP = SP - 5*4 = 0x2000_0FEC
@@ -2131,9 +2138,9 @@ fn ldm_w_db_with_pc() {
     // LDMIA.W R13!, {R4-R7, PC} — pop with PC (5 regs including PC)
     let (mut c, mut bus) = core_and_bus();
     let sp = 0x2000_0FEC;
-    bus.write32(sp,      0x4444_4444, 0); // R4
-    bus.write32(sp + 4,  0x5555_5555, 0); // R5
-    bus.write32(sp + 8,  0x6666_6666, 0); // R6
+    bus.write32(sp, 0x4444_4444, 0); // R4
+    bus.write32(sp + 4, 0x5555_5555, 0); // R5
+    bus.write32(sp + 8, 0x6666_6666, 0); // R6
     bus.write32(sp + 12, 0x7777_7777, 0); // R7
     bus.write32(sp + 16, 0x0800_0101, 0); // PC value (Thumb bit set)
     c.set_reg(13, sp);
@@ -2246,12 +2253,12 @@ fn lsls_w_reg_flags() {
     // LSLS.W R0, R1, R2 (S=1): hw0=0xFA11, hw1=0xF002
     let mut c = CortexM33::for_test(0);
     c.set_reg(1, 0x8000_0001); // bit 31 set
-    c.set_reg(2, 1);           // shift left by 1
+    c.set_reg(2, 1); // shift left by 1
     let cy = c.execute_one_wide(0xFA11, 0xF002);
     assert_eq!(c.reg(0), 0x0000_0002);
-    assert!(!c.flag_n());    // result bit 31 = 0
-    assert!(!c.flag_z());    // result != 0
-    assert!(c.flag_c());     // bit 31 shifted out → carry = 1
+    assert!(!c.flag_n()); // result bit 31 = 0
+    assert!(!c.flag_z()); // result != 0
+    assert!(c.flag_c()); // bit 31 shifted out → carry = 1
     assert_eq!(cy, 1); // M33 measured: 1 cycle
 }
 
@@ -2471,7 +2478,7 @@ fn smull_basic() {
     let (hw0, hw1) = encode_smull(0, 1, 2, 3);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 20_000_000); // lo
-    assert_eq!(c.reg(1), 0);          // hi = 0
+    assert_eq!(c.reg(1), 0); // hi = 0
     assert_eq!(cy, 2); // M33 measured: 2 cycles (multiplier)
 }
 
@@ -2510,7 +2517,7 @@ fn umull_large() {
     let (hw0, hw1) = encode_umull(0, 1, 2, 3);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0xFFFF_FFFE); // lo
-    assert_eq!(c.reg(1), 1);            // hi
+    assert_eq!(c.reg(1), 1); // hi
     assert_eq!(cy, 2); // M33 measured: 2 cycles (multiplier)
 }
 
@@ -2584,13 +2591,13 @@ fn smlal_basic() {
     // SMLAL R0, R1, R2, R3: accumulator=1000, product=3*7=21, result=1021
     let mut c = CortexM33::for_test(0);
     c.set_reg(0, 1000); // rd_lo (accumulator low)
-    c.set_reg(1, 0);    // rd_hi (accumulator high)
-    c.set_reg(2, 3);    // rn
-    c.set_reg(3, 7);    // rm
+    c.set_reg(1, 0); // rd_hi (accumulator high)
+    c.set_reg(2, 3); // rn
+    c.set_reg(3, 7); // rm
     let (hw0, hw1) = encode_smlal(0, 1, 2, 3);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 1021); // lo
-    assert_eq!(c.reg(1), 0);    // hi
+    assert_eq!(c.reg(1), 0); // hi
     assert_eq!(cy, 2); // M33 measured: 2 cycles (multiplier)
 }
 
@@ -2598,10 +2605,10 @@ fn smlal_basic() {
 fn umlal_basic() {
     // UMLAL R0, R1, R2, R3: accumulator=500, product=100*200=20000, result=20500
     let mut c = CortexM33::for_test(0);
-    c.set_reg(0, 500);  // rd_lo
-    c.set_reg(1, 0);    // rd_hi
-    c.set_reg(2, 100);  // rn
-    c.set_reg(3, 200);  // rm
+    c.set_reg(0, 500); // rd_lo
+    c.set_reg(1, 0); // rd_hi
+    c.set_reg(2, 100); // rn
+    c.set_reg(3, 200); // rm
     let (hw0, hw1) = encode_umlal(0, 1, 2, 3);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 20500);
@@ -2616,13 +2623,16 @@ fn umlal_basic() {
 /// Encode a data-processing (shifted register) instruction.
 /// Format: 11101_01_op[3:0]_S_Rn  0_imm3_Rd_imm2_tt_Rm
 fn encode_dp_shifted_reg(
-    op: u8, s: bool, rn: u8, rd: u8, rm: u8, shift_type: u8, shift_n: u8,
+    op: u8,
+    s: bool,
+    rn: u8,
+    rd: u8,
+    rm: u8,
+    shift_type: u8,
+    shift_n: u8,
 ) -> (u16, u16) {
     // hw0 = 11101_01_op[3:0]_S_Rn[3:0]
-    let hw0: u16 = 0xEA00
-        | ((op as u16 & 0xF) << 5)
-        | ((s as u16) << 4)
-        | (rn as u16 & 0xF);
+    let hw0: u16 = 0xEA00 | ((op as u16 & 0xF) << 5) | ((s as u16) << 4) | (rn as u16 & 0xF);
     // hw1 = 0_imm3_Rd_imm2_tt_Rm
     // shift_n[4:2] = imm3, shift_n[1:0] = imm2
     let imm3 = ((shift_n >> 2) & 0x7) as u16;
@@ -2684,7 +2694,7 @@ fn cmp_w_shifted_reg() {
     let cy = c.execute_one_wide(hw0, hw1);
     assert!(!c.flag_n());
     assert!(!c.flag_z());
-    assert!(c.flag_c());   // no borrow → C=1
+    assert!(c.flag_c()); // no borrow → C=1
     assert!(!c.flag_v());
     assert_eq!(cy, 2); // M33 measured: 2 cycles (barrel shifter)
 }
@@ -2713,9 +2723,9 @@ fn rrx_w() {
     let (hw0, hw1) = encode_dp_shifted_reg(0b0010, true, 15, 0, 1, 0b11, 0);
     let cy = c.execute_one_wide(hw0, hw1);
     assert_eq!(c.reg(0), 0x8000_0001);
-    assert!(c.flag_n());   // bit 31 set
+    assert!(c.flag_n()); // bit 31 set
     assert!(!c.flag_z());
-    assert!(c.flag_c());   // carry_out from RRX = bit[0] of input
+    assert!(c.flag_c()); // carry_out from RRX = bit[0] of input
     assert_eq!(cy, 1); // M33 measured: 1 cycle (MOV.W via RRX, Rn=15 — shift is primary op)
 }
 
@@ -2741,7 +2751,14 @@ fn orr_w_shifted() {
 /// Encode LDRD/STRD immediate.
 /// Format: 1110_100_P_U_1_W_L_Rn  Rt_Rt2_imm8
 fn encode_ldrd_strd(
-    p: bool, u: bool, w: bool, load: bool, rn: u8, rt: u8, rt2: u8, imm8: u8,
+    p: bool,
+    u: bool,
+    w: bool,
+    load: bool,
+    rn: u8,
+    rt: u8,
+    rt2: u8,
+    imm8: u8,
 ) -> (u16, u16) {
     let hw0: u16 = 0xE800
         | ((p as u16) << 8)
@@ -2750,9 +2767,7 @@ fn encode_ldrd_strd(
         | ((w as u16) << 5)
         | ((load as u16) << 4)
         | (rn as u16 & 0xF);
-    let hw1: u16 = ((rt as u16 & 0xF) << 12)
-        | ((rt2 as u16 & 0xF) << 8)
-        | (imm8 as u16);
+    let hw1: u16 = ((rt as u16 & 0xF) << 12) | ((rt2 as u16 & 0xF) << 8) | (imm8 as u16);
     (hw0, hw1)
 }
 
@@ -2834,9 +2849,9 @@ fn tbb_basic() {
     // hw1 = 1111_0000_0000_Rm = 0xF000 | Rm
     let (mut c, mut bus) = core_and_bus();
     c.regs.set_pc(0x1000);
-    c.set_reg(0, 0x2000_0000);   // base
-    c.set_reg(1, 3);              // index
-    bus.write8(0x2000_0003, 10, 0);  // table[3] = 10
+    c.set_reg(0, 0x2000_0000); // base
+    c.set_reg(1, 3); // index
+    bus.write8(0x2000_0003, 10, 0); // table[3] = 10
     // read_pc = 0x1004, target = 0x1004 + 10*2 = 0x1018
     let hw0: u16 = 0xE8D0; // Rn=0
     let hw1: u16 = 0xF001; // Rm=1, H=0
@@ -2850,8 +2865,8 @@ fn tbh_basic() {
     // TBH [R0, R1]: read halfword at R0 + R1*2, branch PC += 2*halfword
     let (mut c, mut bus) = core_and_bus();
     c.regs.set_pc(0x1000);
-    c.set_reg(0, 0x2000_0000);   // base
-    c.set_reg(1, 2);              // index
+    c.set_reg(0, 0x2000_0000); // base
+    c.set_reg(1, 2); // index
     bus.write16(0x2000_0004, 20, 0); // table[2] = 20 (at base + 2*2 = base+4)
     // read_pc = 0x1004, target = 0x1004 + 20*2 = 0x102C
     let hw0: u16 = 0xE8D0; // Rn=0
@@ -2989,9 +3004,9 @@ fn it_eq_taken() {
     // IT EQ; MOVS R0, #42 — condition true (Z=1), should execute
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF08, 0);       // IT EQ (firstcond=0000, mask=1000)
-    bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42
-    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF08, 0); // IT EQ (firstcond=0000, mask=1000)
+    bus.write16(base + 2, 0x202A, 0); // MOVS R0, #42
+    bus.write16(base + 4, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(true); // EQ condition true
 
@@ -3008,9 +3023,9 @@ fn it_eq_skipped() {
     // IT EQ; MOVS R0, #42 — condition false (Z=0), should skip
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF08, 0);       // IT EQ
-    bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42
-    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF08, 0); // IT EQ
+    bus.write16(base + 2, 0x202A, 0); // MOVS R0, #42
+    bus.write16(base + 4, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(false); // EQ condition false
 
@@ -3027,14 +3042,14 @@ fn it_flag_suppression() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // ADDS R0, R1, R2 = 0x1888
-    bus.write16(base, 0xBF08, 0);       // IT EQ
-    bus.write16(base + 2, 0x1888, 0);   // ADDS R0, R1, R2
-    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF08, 0); // IT EQ
+    bus.write16(base + 2, 0x1888, 0); // ADDS R0, R1, R2
+    bus.write16(base + 4, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.set_reg(1, 5);
     c.set_reg(2, 10);
-    c.regs.set_flag_z(true);  // EQ true, and Z=1 should be preserved
-    c.regs.set_flag_c(true);  // C=1 should be preserved
+    c.regs.set_flag_z(true); // EQ true, and Z=1 should be preserved
+    c.regs.set_flag_c(true); // C=1 should be preserved
 
     step_one(&mut c, &mut bus); // IT
     step_one(&mut c, &mut bus); // ADDS R0, R1, R2
@@ -3051,13 +3066,13 @@ fn it_cmp_always_sets_flags() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // CMP R0, R1 (data processing) = 0x4288
-    bus.write16(base, 0xBF08, 0);       // IT EQ
-    bus.write16(base + 2, 0x4288, 0);   // CMP R0, R1
-    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF08, 0); // IT EQ
+    bus.write16(base + 2, 0x4288, 0); // CMP R0, R1
+    bus.write16(base + 4, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.set_reg(0, 10);
     c.set_reg(1, 5);
-    c.regs.set_flag_z(true);  // EQ true (so CMP executes), Z=1 initially
+    c.regs.set_flag_z(true); // EQ true (so CMP executes), Z=1 initially
 
     step_one(&mut c, &mut bus); // IT
     step_one(&mut c, &mut bus); // CMP R0, R1 (10 - 5 = 5, not zero)
@@ -3074,12 +3089,12 @@ fn it_cmp_imm_always_sets_flags() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // CMP R0, #5 = 0x2805 (bits[15:11]=00101, Rn=000, imm8=0x05)
-    bus.write16(base, 0xBF08, 0);       // IT EQ
-    bus.write16(base + 2, 0x2805, 0);   // CMP R0, #5
-    bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF08, 0); // IT EQ
+    bus.write16(base + 2, 0x2805, 0); // CMP R0, #5
+    bus.write16(base + 4, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.set_reg(0, 10);
-    c.regs.set_flag_z(true);  // EQ true
+    c.regs.set_flag_z(true); // EQ true
 
     step_one(&mut c, &mut bus); // IT
     step_one(&mut c, &mut bus); // CMP R0, #5
@@ -3095,10 +3110,10 @@ fn ite_then_else_taken() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // ITE EQ: firstcond=0000, mask=0100 with E-bit set → mask=1100 = 0x0C
-    bus.write16(base, 0xBF0C, 0);       // ITE EQ
-    bus.write16(base + 2, 0x2001, 0);   // MOVS R0, #1 (Then)
-    bus.write16(base + 4, 0x2002, 0);   // MOVS R0, #2 (Else)
-    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF0C, 0); // ITE EQ
+    bus.write16(base + 2, 0x2001, 0); // MOVS R0, #1 (Then)
+    bus.write16(base + 4, 0x2002, 0); // MOVS R0, #2 (Else)
+    bus.write16(base + 6, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(true); // EQ true → Then
 
@@ -3115,10 +3130,10 @@ fn ite_then_else_not_taken() {
     // ITE EQ; MOVS R0, #1; MOVS R0, #2 — with Z=0: R0=2 (Then skipped, Else taken)
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF0C, 0);       // ITE EQ
-    bus.write16(base + 2, 0x2001, 0);   // MOVS R0, #1 (Then — skipped)
-    bus.write16(base + 4, 0x2002, 0);   // MOVS R0, #2 (Else — executed)
-    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF0C, 0); // ITE EQ
+    bus.write16(base + 2, 0x2001, 0); // MOVS R0, #1 (Then — skipped)
+    bus.write16(base + 4, 0x2002, 0); // MOVS R0, #2 (Else — executed)
+    bus.write16(base + 6, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(false); // EQ false → Else
 
@@ -3136,10 +3151,10 @@ fn itt_eq_both_taken() {
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
     // ITT EQ: firstcond=0000, mask=0100 (two Then, no Else)
-    bus.write16(base, 0xBF04, 0);       // ITT EQ
-    bus.write16(base + 2, 0x2001, 0);   // MOVS R0, #1
-    bus.write16(base + 4, 0x2102, 0);   // MOVS R1, #2
-    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF04, 0); // ITT EQ
+    bus.write16(base + 2, 0x2001, 0); // MOVS R0, #1
+    bus.write16(base + 4, 0x2102, 0); // MOVS R1, #2
+    bus.write16(base + 6, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(true);
 
@@ -3157,10 +3172,10 @@ fn it_state_cleared_after_block() {
     // After IT block completes, the next instruction should execute unconditionally
     let (mut c, mut bus) = core_and_bus();
     let base = 0x2000_0000u32;
-    bus.write16(base, 0xBF08, 0);       // IT EQ
-    bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42 (in IT block)
-    bus.write16(base + 4, 0x2103, 0);   // MOVS R1, #3 (outside IT block)
-    bus.write16(base + 6, 0xE7FE, 0);   // B . (halt)
+    bus.write16(base, 0xBF08, 0); // IT EQ
+    bus.write16(base + 2, 0x202A, 0); // MOVS R0, #42 (in IT block)
+    bus.write16(base + 4, 0x2103, 0); // MOVS R1, #3 (outside IT block)
+    bus.write16(base + 6, 0xE7FE, 0); // B . (halt)
     c.regs.set_pc(base);
     c.regs.set_flag_z(false); // EQ false → IT body skipped
 
@@ -3168,8 +3183,8 @@ fn it_state_cleared_after_block() {
     step_one(&mut c, &mut bus); // MOVS R0, #42 — skipped
     step_one(&mut c, &mut bus); // MOVS R1, #3 — unconditional, should execute
 
-    assert_eq!(c.reg(0), 0);  // skipped
-    assert_eq!(c.reg(1), 3);  // executed unconditionally
+    assert_eq!(c.reg(0), 0); // skipped
+    assert_eq!(c.reg(1), 3); // executed unconditionally
     assert_eq!(c.it_state(), 0);
 }
 
@@ -3199,43 +3214,69 @@ fn vfp_dp(op_hi: u16, op_lo: u16, op2_lo: u16, sd: u16, sn: u16, sm: u16) -> (u1
 }
 
 /// Encode VADD.F32 Sd, Sn, Sm.
-fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 0, sd, sn, sm) }
+fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b11, 0, sd, sn, sm)
+}
 
 /// Encode VSUB.F32 Sd, Sn, Sm.
-fn enc_vsub(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 1, sd, sn, sm) }
+fn enc_vsub(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b11, 1, sd, sn, sm)
+}
 
 /// Encode VMUL.F32 Sd, Sn, Sm.
-fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 0, sd, sn, sm) }
+fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b10, 0, sd, sn, sm)
+}
 
 /// Encode VNMUL.F32 Sd, Sn, Sm.
-fn enc_vnmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 1, sd, sn, sm) }
+fn enc_vnmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b10, 1, sd, sn, sm)
+}
 
 /// Encode VDIV.F32 Sd, Sn, Sm.
-fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b00, 0, sd, sn, sm) }
+fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b00, 0, sd, sn, sm)
+}
 
 /// Encode VMLA.F32 Sd, Sn, Sm.
-fn enc_vmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 0, sd, sn, sm) }
+fn enc_vmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b00, 0, sd, sn, sm)
+}
 
 /// Encode VMLS.F32 Sd, Sn, Sm.
-fn enc_vmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b00, 1, sd, sn, sm) }
+fn enc_vmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b00, 1, sd, sn, sm)
+}
 
 /// Encode VNMLA.F32 Sd, Sn, Sm.
-fn enc_vnmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 1, sd, sn, sm) }
+fn enc_vnmla(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b01, 1, sd, sn, sm)
+}
 
 /// Encode VNMLS.F32 Sd, Sn, Sm.
-fn enc_vnmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b01, 0, sd, sn, sm) }
+fn enc_vnmls(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b01, 0, sd, sn, sm)
+}
 
 /// Encode VFMA.F32 Sd, Sn, Sm.
-fn enc_vfma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 0, sd, sn, sm) }
+fn enc_vfma(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b10, 0, sd, sn, sm)
+}
 
 /// Encode VFMS.F32 Sd, Sn, Sm.
-fn enc_vfms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b10, 1, sd, sn, sm) }
+fn enc_vfms(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b10, 1, sd, sn, sm)
+}
 
 /// Encode VFNMA.F32 Sd, Sn, Sm.
-fn enc_vfnma(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 1, sd, sn, sm) }
+fn enc_vfnma(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b01, 1, sd, sn, sm)
+}
 
 /// Encode VFNMS.F32 Sd, Sn, Sm.
-fn enc_vfnms(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b01, 0, sd, sn, sm) }
+fn enc_vfnms(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b01, 0, sd, sn, sm)
+}
 
 /// Encode a VFP unary instruction.
 /// All unary: hw0[7:4]=1D11 (op_hi=1, op_lo=11), hw1[6]=1.
@@ -3251,37 +3292,59 @@ fn vfp_unary(opc3: u16, t: u16, sd: u16, sm: u16) -> (u16, u16) {
 }
 
 /// VMOV.F32 Sd, Sm (register copy).
-fn enc_vmov_reg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 0, sd, sm) }
+fn enc_vmov_reg(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0000, 0, sd, sm)
+}
 
 /// VABS.F32 Sd, Sm.
-fn enc_vabs(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0000, 1, sd, sm) }
+fn enc_vabs(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0000, 1, sd, sm)
+}
 
 /// VNEG.F32 Sd, Sm.
-fn enc_vneg(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 0, sd, sm) }
+fn enc_vneg(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0001, 0, sd, sm)
+}
 
 /// VSQRT.F32 Sd, Sm.
-fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0001, 1, sd, sm) }
+fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0001, 1, sd, sm)
+}
 
 /// VCMP.F32 Sd, Sm (quiet).
-fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0100, 0, sd, sm) }
+fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0100, 0, sd, sm)
+}
 
 /// VCMP.F32 Sd, #0.0.
-fn enc_vcmp_zero(sd: u16) -> (u16, u16) { vfp_unary(0b0101, 0, sd, 0) }
+fn enc_vcmp_zero(sd: u16) -> (u16, u16) {
+    vfp_unary(0b0101, 0, sd, 0)
+}
 
 /// VCVT.F32.S32 Sd, Sm (signed int → float).
-fn enc_vcvt_f32_s32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 1, sd, sm) }
+fn enc_vcvt_f32_s32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1000, 1, sd, sm)
+}
 
 /// VCVT.F32.U32 Sd, Sm (unsigned int → float).
-fn enc_vcvt_f32_u32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1000, 0, sd, sm) }
+fn enc_vcvt_f32_u32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1000, 0, sd, sm)
+}
 
 /// VCVT.S32.F32 Sd, Sm (float → signed int, round toward zero).
-fn enc_vcvt_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 1, sd, sm) }
+fn enc_vcvt_s32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1101, 1, sd, sm)
+}
 
 /// VCVT.U32.F32 Sd, Sm (float → unsigned int, round toward zero).
-fn enc_vcvt_u32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1100, 1, sd, sm) }
+fn enc_vcvt_u32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1100, 1, sd, sm)
+}
 
 /// VCVTR.S32.F32 Sd, Sm (float → signed int, round per FPSCR).
-fn enc_vcvtr_s32_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b1101, 0, sd, sm) }
+fn enc_vcvtr_s32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1101, 0, sd, sm)
+}
 
 /// Encode VMOV Sn, Rt (ARM → FPU). MCR format, L=0.
 fn enc_vmov_to_fpu(sn: u16, rt: u16) -> (u16, u16) {
@@ -3392,22 +3455,34 @@ fn enc_vmaxminnm(op: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
 }
 
 /// Encode VMAXNM.F32 Sd, Sn, Sm.
-fn enc_vmaxnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) { enc_vmaxminnm(0, sd, sn, sm) }
+fn enc_vmaxnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    enc_vmaxminnm(0, sd, sn, sm)
+}
 
 /// Encode VMINNM.F32 Sd, Sn, Sm.
-fn enc_vminnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) { enc_vmaxminnm(1, sd, sn, sm) }
+fn enc_vminnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    enc_vmaxminnm(1, sd, sn, sm)
+}
 
 /// Encode VCVTB.F16.F32 Sd, Sm (convert f32 → f16 into bottom half of Sd).
-fn enc_vcvtb_f16_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0010, 0, sd, sm) }
+fn enc_vcvtb_f16_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0010, 0, sd, sm)
+}
 
 /// Encode VCVTT.F16.F32 Sd, Sm (convert f32 → f16 into top half of Sd).
-fn enc_vcvtt_f16_f32(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0010, 1, sd, sm) }
+fn enc_vcvtt_f16_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0010, 1, sd, sm)
+}
 
 /// Encode VCVTB.F32.F16 Sd, Sm (convert f16 from bottom half of Sm → f32 Sd).
-fn enc_vcvtb_f32_f16(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0011, 0, sd, sm) }
+fn enc_vcvtb_f32_f16(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0011, 0, sd, sm)
+}
 
 /// Encode VCVTT.F32.F16 Sd, Sm (convert f16 from top half of Sm → f32 Sd).
-fn enc_vcvtt_f32_f16(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0011, 1, sd, sm) }
+fn enc_vcvtt_f32_f16(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0011, 1, sd, sm)
+}
 
 // ============================================================================
 // FPU tests
@@ -4120,14 +4195,22 @@ fn fpu_vmaxnm_zero_signs() {
     c.regs.s[4] = -0.0f32;
     let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits(), 0x0000_0000, "maxNum(+0,-0) must be +0");
+    assert_eq!(
+        c.regs.s[0].to_bits(),
+        0x0000_0000,
+        "maxNum(+0,-0) must be +0"
+    );
 
     // (-0, +0) — same expected result regardless of order
     c.regs.s[2] = -0.0f32;
     c.regs.s[4] = 0.0f32;
     let (hw0, hw1) = enc_vmaxnm(0, 2, 4);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits(), 0x0000_0000, "maxNum(-0,+0) must be +0");
+    assert_eq!(
+        c.regs.s[0].to_bits(),
+        0x0000_0000,
+        "maxNum(-0,+0) must be +0"
+    );
 }
 
 #[test]
@@ -4140,14 +4223,22 @@ fn fpu_vminnm_zero_signs() {
     c.regs.s[4] = -0.0f32;
     let (hw0, hw1) = enc_vminnm(0, 2, 4);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits(), 0x8000_0000, "minNum(+0,-0) must be -0");
+    assert_eq!(
+        c.regs.s[0].to_bits(),
+        0x8000_0000,
+        "minNum(+0,-0) must be -0"
+    );
 
     // (-0, +0) — same expected result regardless of order
     c.regs.s[2] = -0.0f32;
     c.regs.s[4] = 0.0f32;
     let (hw0, hw1) = enc_vminnm(0, 2, 4);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits(), 0x8000_0000, "minNum(-0,+0) must be -0");
+    assert_eq!(
+        c.regs.s[0].to_bits(),
+        0x8000_0000,
+        "minNum(-0,+0) must be -0"
+    );
 }
 
 // ----- FPSCR exception flags (Phase 7 Stage A.1) ---------------------------
@@ -4243,7 +4334,10 @@ fn fpscr_idc_on_denormal_input() {
     c.regs.s[4] = 1.0;
     let (hw0, hw1) = enc_vadd(0, 2, 4);
     c.execute_one_wide(hw0, hw1);
-    assert!(c.regs.fpscr & FPSCR_IDC != 0, "IDC must set on denormal input");
+    assert!(
+        c.regs.fpscr & FPSCR_IDC != 0,
+        "IDC must set on denormal input"
+    );
 }
 
 #[test]
@@ -4435,7 +4529,11 @@ fn fpu_vcvtb_f16_f32_overflow() {
     c.regs.s[0] = f32::from_bits(0xAAAA_0000);
     let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x7C00, "1e30 -> f16 must be +inf");
+    assert_eq!(
+        c.regs.s[0].to_bits() & 0xFFFF,
+        0x7C00,
+        "1e30 -> f16 must be +inf"
+    );
     assert_eq!(c.regs.s[0].to_bits() & 0xFFFF_0000, 0xAAAA_0000);
 }
 
@@ -4447,7 +4545,11 @@ fn fpu_vcvtb_f16_f32_underflow() {
     c.regs.s[0] = f32::from_bits(0x5555_0000);
     let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x0000, "1e-10 -> f16 must be +0");
+    assert_eq!(
+        c.regs.s[0].to_bits() & 0xFFFF,
+        0x0000,
+        "1e-10 -> f16 must be +0"
+    );
     assert_eq!(c.regs.s[0].to_bits() & 0xFFFF_0000, 0x5555_0000);
 }
 
@@ -4465,7 +4567,11 @@ fn fpu_vcvtb_f16_f32_negative_zero_roundtrip() {
     // Convert back: VCVTB.F32.F16 S4, S0
     let (hw0, hw1) = enc_vcvtb_f32_f16(4, 0);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[4].to_bits(), 0x8000_0000, "round-trip must preserve -0 sign");
+    assert_eq!(
+        c.regs.s[4].to_bits(),
+        0x8000_0000,
+        "round-trip must preserve -0 sign"
+    );
 }
 
 // ----- VRINT* (R / X / Z) -- DN / IOC / IDC / IXC --------------------------
@@ -4480,9 +4586,15 @@ fn fpu_vcvtb_f16_f32_negative_zero_roundtrip() {
 // (Re-uses FPSCR_* constants defined further up in this file alongside the
 // existing FPU exception-flag tests.)
 
-fn enc_vrintr(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0110, 0, sd, sm) }
-fn enc_vrintz(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0110, 1, sd, sm) }
-fn enc_vrintx(sd: u16, sm: u16) -> (u16, u16) { vfp_unary(0b0111, 0, sd, sm) }
+fn enc_vrintr(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0110, 0, sd, sm)
+}
+fn enc_vrintz(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0110, 1, sd, sm)
+}
+fn enc_vrintx(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b0111, 0, sd, sm)
+}
 
 #[test]
 fn fpu_vrintx_inexact_sets_ixc() {
@@ -4491,7 +4603,10 @@ fn fpu_vrintx_inexact_sets_ixc() {
     let (hw0, hw1) = enc_vrintx(0, 2);
     c.execute_one_wide(hw0, hw1);
     assert_eq!(c.regs.s[0], 2.0); // round-to-even
-    assert!(c.regs.fpscr & FPSCR_IXC != 0, "VRINTX must raise IXC on inexact");
+    assert!(
+        c.regs.fpscr & FPSCR_IXC != 0,
+        "VRINTX must raise IXC on inexact"
+    );
 }
 
 #[test]
@@ -4521,7 +4636,11 @@ fn fpu_vrintx_snan_sets_ioc_dn_canonicalizes() {
     c.regs.s[2] = f32::from_bits(0x7F80_0001); // SNaN
     let (hw0, hw1) = enc_vrintx(0, 2);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits(), 0x7FC0_0000, "DN=1 must canonicalize NaN");
+    assert_eq!(
+        c.regs.s[0].to_bits(),
+        0x7FC0_0000,
+        "DN=1 must canonicalize NaN"
+    );
     assert!(c.regs.fpscr & FPSCR_IOC != 0, "SNaN must raise IOC");
 }
 
@@ -4557,7 +4676,10 @@ fn fpu_vrintx_denormal_input_sets_idc() {
     c.regs.s[2] = f32::from_bits(0x0000_0001); // smallest subnormal
     let (hw0, hw1) = enc_vrintx(0, 2);
     c.execute_one_wide(hw0, hw1);
-    assert!(c.regs.fpscr & FPSCR_IDC != 0, "Denormal input must raise IDC");
+    assert!(
+        c.regs.fpscr & FPSCR_IDC != 0,
+        "Denormal input must raise IDC"
+    );
     // Under FZ=0 the denormal is preserved through ftz_input; rounding to
     // integer of a tiny denormal gives 0, and VRINTX raises IXC.
     assert_eq!(c.regs.s[0], 0.0);
@@ -4575,7 +4697,10 @@ fn fpu_vrintx_denormal_fz_flushes_to_zero_no_ixc() {
     c.execute_one_wide(hw0, hw1);
     assert_eq!(c.regs.s[0], 0.0);
     assert!(c.regs.fpscr & FPSCR_IDC != 0);
-    assert!(c.regs.fpscr & FPSCR_IXC == 0, "Flushed input is exact zero — no IXC");
+    assert!(
+        c.regs.fpscr & FPSCR_IXC == 0,
+        "Flushed input is exact zero — no IXC"
+    );
 }
 
 #[test]
@@ -4647,7 +4772,11 @@ fn fpu_vcvtb_f16_f32_denormal_input_sets_idc() {
     c.regs.s[0] = 0.0;
     let (hw0, hw1) = enc_vcvtb_f16_f32(0, 2);
     c.execute_one_wide(hw0, hw1);
-    assert_eq!(c.regs.s[0].to_bits() & 0xFFFF, 0x0000, "denormal flushes to f16 +0");
+    assert_eq!(
+        c.regs.s[0].to_bits() & 0xFFFF,
+        0x0000,
+        "denormal flushes to f16 +0"
+    );
     assert!(c.regs.fpscr & FPSCR_IDC != 0, "f32 denormal must raise IDC");
 }
 
@@ -4784,9 +4913,9 @@ fn smulbb() {
 fn smlabb() {
     // SMLABB R0, R1, R2, R3 — halfword multiply-accumulate
     let mut c = CortexM33::for_test(0);
-    c.set_reg(1, 5);     // bottom = 5
-    c.set_reg(2, 6);     // bottom = 6
-    c.set_reg(3, 100);   // accumulator
+    c.set_reg(1, 5); // bottom = 5
+    c.set_reg(2, 6); // bottom = 6
+    c.set_reg(3, 100); // accumulator
     // hw0 = 0xFB11, hw1 = 0x3002 (Ra=3, Rd=0, op2=00, Rm=2)
     c.execute_one_wide(0xFB11, 0x3002);
     assert_eq!(c.reg(0), 130); // 5*6 + 100 = 130
@@ -4846,8 +4975,8 @@ fn sadd16() {
     let result = c.reg(0);
     let lo = result & 0xFFFF;
     let hi = result >> 16;
-    assert_eq!(lo, 255);  // 200 + 55
-    assert_eq!(hi, 150);  // 100 + 50
+    assert_eq!(lo, 255); // 200 + 55
+    assert_eq!(hi, 150); // 100 + 50
     // Both results >= 0, so GE[3:0] should have bits set
     assert_eq!(c.regs.ge_flags() & 0x3, 0x3); // lo result >= 0
     assert_eq!(c.regs.ge_flags() & 0xC, 0xC); // hi result >= 0
@@ -4951,8 +5080,8 @@ fn umaal() {
     let mut c = CortexM33::for_test(0);
     c.set_reg(1, 100);
     c.set_reg(2, 200);
-    c.set_reg(4, 50);  // RdLo addend
-    c.set_reg(5, 30);  // RdHi addend
+    c.set_reg(4, 50); // RdLo addend
+    c.set_reg(5, 30); // RdHi addend
     // UMAAL: op1=110, op2=0110
     // hw0 = 0xFBE1 (op1=110, Rn=R1)
     // hw1 = 0x4562 (RdLo=4, RdHi=5, op2=0110, Rm=R2)
@@ -5035,8 +5164,8 @@ fn bus_rom_boundary_32kb() {
     rom_data[0x7FFF] = 0xEE;
     bus.memory.load_rom(&rom_data);
     assert_eq!(bus.read8(0x0000_7FFF, 0), 0xEE); // last byte of 32 KB ROM
-    assert_eq!(bus.read8(0x0000_8000, 0), 0);     // beyond ROM → 0
-    assert_eq!(bus.read8(0x0000_FFFF, 0), 0);     // well beyond ROM → 0
+    assert_eq!(bus.read8(0x0000_8000, 0), 0); // beyond ROM → 0
+    assert_eq!(bus.read8(0x0000_FFFF, 0), 0); // well beyond ROM → 0
 }
 
 #[test]
@@ -5117,7 +5246,13 @@ fn sram_striped_access_consecutive_words_go_to_consecutive_banks() {
     for i in 0u32..9 {
         let addr = 0x2000_0000 + i * 4;
         let expected = 0xA000_0000 | i;
-        assert_eq!(bus.read32(addr, 0), expected, "word {} at 0x{:08X}", i, addr);
+        assert_eq!(
+            bus.read32(addr, 0),
+            expected,
+            "word {} at 0x{:08X}",
+            i,
+            addr
+        );
     }
 }
 
@@ -5327,7 +5462,7 @@ fn atomic_alias_apb_interposed_latency() {
 fn arbitration_single_core_no_contention() {
     // A single core accessing a bus target incurs no stall.
     let bus = Bus::new();
-    let stall = bus.arbitrate_stall(/*core=*/0, /*addr=*/0x2000_0000);
+    let stall = bus.arbitrate_stall(/*core=*/ 0, /*addr=*/ 0x2000_0000);
     assert_eq!(stall, 0);
 }
 
@@ -5337,8 +5472,8 @@ fn arbitration_two_cores_different_banks_no_contention() {
     // Core 0 → bank 0 (0x20000000), Core 1 → bank 1 (0x20000004)
     let bus = Bus::new();
     let (stall0, stall1) = bus.arbitrate_pair(
-        /*core0_addr=*/0x2000_0000, // bank 0
-        /*core1_addr=*/0x2000_0004, // bank 1
+        /*core0_addr=*/ 0x2000_0000, // bank 0
+        /*core1_addr=*/ 0x2000_0004, // bank 1
     );
     assert_eq!(stall0, 0);
     assert_eq!(stall1, 0);
@@ -5351,8 +5486,8 @@ fn arbitration_two_cores_same_bank_one_stalls() {
     // Both map to bank 0 (word offsets 0 and 8, both % 8 = 0).
     let bus = Bus::new();
     let (stall0, stall1) = bus.arbitrate_pair(
-        /*core0_addr=*/0x2000_0000, // bank 0 (word 0)
-        /*core1_addr=*/0x2000_0020, // bank 0 (word 8)
+        /*core0_addr=*/ 0x2000_0000, // bank 0 (word 0)
+        /*core1_addr=*/ 0x2000_0020, // bank 0 (word 8)
     );
     assert_eq!(stall0, 0, "core 0 should win (higher priority)");
     assert_eq!(stall1, 1, "core 1 should stall");
@@ -5449,9 +5584,18 @@ fn sram_atomic_no_extra_latency() {
 #[test]
 fn sram_alias_bank_for_address_resolves_correctly() {
     // Alias addresses should resolve to same bank as canonical
-    assert_eq!(crate::memory::bank_for_address(0x2000_0004), crate::memory::bank_for_address(0x2100_0004));
-    assert_eq!(crate::memory::bank_for_address(0x2000_0004), crate::memory::bank_for_address(0x2200_0004));
-    assert_eq!(crate::memory::bank_for_address(0x2000_0004), crate::memory::bank_for_address(0x2300_0004));
+    assert_eq!(
+        crate::memory::bank_for_address(0x2000_0004),
+        crate::memory::bank_for_address(0x2100_0004)
+    );
+    assert_eq!(
+        crate::memory::bank_for_address(0x2000_0004),
+        crate::memory::bank_for_address(0x2200_0004)
+    );
+    assert_eq!(
+        crate::memory::bank_for_address(0x2000_0004),
+        crate::memory::bank_for_address(0x2300_0004)
+    );
 }
 
 // ============================================================================
@@ -5492,7 +5636,11 @@ fn dual_core_extra_wait_states_no_pollution() {
     // directly to simulate pollution.
     bus.reset_extra_wait_states();
     bus.add_extra_wait_states(1);
-    assert_eq!(bus.extra_wait_states(), 1, "precondition: manual pollution applied");
+    assert_eq!(
+        bus.extra_wait_states(),
+        1,
+        "precondition: manual pollution applied"
+    );
 
     // Core 0 executes one NOP — decode_execute must reset the accumulator
     // before the fetch, so the observed value reflects only this fetch.
@@ -5505,8 +5653,14 @@ fn dual_core_extra_wait_states_no_pollution() {
 
     // NOPs from SRAM banks 0 and 1 add no extra waits. If the polluted
     // "+1" from the bank-2 probe had leaked through, we'd see ≥ 1 here.
-    assert_eq!(c0_waits, 0, "core 0 NOP from bank 0 should have no extra waits");
-    assert_eq!(c1_waits, 0, "core 1 NOP from bank 1 should have no extra waits");
+    assert_eq!(
+        c0_waits, 0,
+        "core 0 NOP from bank 0 should have no extra waits"
+    );
+    assert_eq!(
+        c1_waits, 0,
+        "core 1 NOP from bank 1 should have no extra waits"
+    );
 }
 
 // ============================================================================
@@ -5540,7 +5694,11 @@ fn sram_bank0_no_extra_wait() {
     bus.reset_extra_wait_states();
     // 0x20000000: offset 0x0, bank = (0x0 >> 2) & 7 = 0
     let _ = bus.read32(0x2000_0000, 0);
-    assert_eq!(bus.extra_wait_states(), 0, "bank 0 read should have no extra wait state");
+    assert_eq!(
+        bus.extra_wait_states(),
+        0,
+        "bank 0 read should have no extra wait state"
+    );
 }
 
 #[test]
@@ -5559,14 +5717,18 @@ fn sram_bank89_no_extra_wait() {
     bus.reset_extra_wait_states();
     // 0x20080000: offset 0x80000, non-striped SRAM8
     let _ = bus.read32(0x2008_0000, 0);
-    assert_eq!(bus.extra_wait_states(), 0, "SRAM8 read should have no extra wait state");
+    assert_eq!(
+        bus.extra_wait_states(),
+        0,
+        "SRAM8 read should have no extra wait state"
+    );
 }
 
 // ============================================================================
 // Integration: Reset + Bootrom
 // ============================================================================
 
-use crate::{Emulator, Config};
+use crate::{Config, Emulator};
 
 #[test]
 fn test_reset_loads_sp_and_pc_from_rom() {
@@ -5580,8 +5742,10 @@ fn test_reset_loads_sp_and_pc_from_rom() {
     rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
     // Put a NOP (MOVS R0, R0 = 0x0000) at address 0x100
     // followed by an infinite loop (B . = 0xE7FE)
-    rom[0x100] = 0x00; rom[0x101] = 0x00; // NOP (MOVS R0, R0)
-    rom[0x102] = 0xFE; rom[0x103] = 0xE7; // B .
+    rom[0x100] = 0x00;
+    rom[0x101] = 0x00; // NOP (MOVS R0, R0)
+    rom[0x102] = 0xFE;
+    rom[0x103] = 0xE7; // B .
 
     emu.load_bootrom(&rom);
     emu.reset();
@@ -5618,12 +5782,15 @@ fn test_svc_exception_round_trip() {
     rom[0x2C..0x30].copy_from_slice(&0x0000_0201u32.to_le_bytes()); // -> 0x200
 
     // Code at 0x100: SVC #0
-    rom[0x100] = 0x00; rom[0x101] = 0xDF; // SVC #0 = 0xDF00
+    rom[0x100] = 0x00;
+    rom[0x101] = 0xDF; // SVC #0 = 0xDF00
     // Code at 0x102: infinite loop after SVC returns
-    rom[0x102] = 0xFE; rom[0x103] = 0xE7; // B .
+    rom[0x102] = 0xFE;
+    rom[0x103] = 0xE7; // B .
 
     // SVC handler at 0x200: BX LR (return from exception)
-    rom[0x200] = 0x70; rom[0x201] = 0x47; // BX LR = 0x4770
+    rom[0x200] = 0x70;
+    rom[0x201] = 0x47; // BX LR = 0x4770
 
     emu.load_bootrom(&rom);
     emu.reset();
@@ -5653,14 +5820,18 @@ fn test_busfault_on_unmapped_access() {
     rom[0x0C..0x10].copy_from_slice(&0x0000_0381u32.to_le_bytes()); // -> 0x380
 
     // Code at 0x100: LDR R0, [R1, #0] where R1 will be 0x60000000 (unmapped)
-    rom[0x100] = 0x08; rom[0x101] = 0x68; // LDR R0, [R1, #0] = 0x6808
-    rom[0x102] = 0xFE; rom[0x103] = 0xE7; // B . (shouldn't reach if fault works)
+    rom[0x100] = 0x08;
+    rom[0x101] = 0x68; // LDR R0, [R1, #0] = 0x6808
+    rom[0x102] = 0xFE;
+    rom[0x103] = 0xE7; // B . (shouldn't reach if fault works)
 
     // BusFault handler at 0x300: BX LR (return from exception)
-    rom[0x300] = 0x70; rom[0x301] = 0x47; // BX LR
+    rom[0x300] = 0x70;
+    rom[0x301] = 0x47; // BX LR
 
     // HardFault handler at 0x380: infinite loop
-    rom[0x380] = 0xFE; rom[0x381] = 0xE7; // B .
+    rom[0x380] = 0xFE;
+    rom[0x381] = 0xE7; // B .
 
     emu.load_bootrom(&rom);
     emu.reset();
@@ -5676,7 +5847,11 @@ fn test_busfault_on_unmapped_access() {
     }
 
     // CFSR should have PRECISERR (bit 9) set
-    assert_ne!(emu.core_mut(0).ppb.cfsr & (1 << 9), 0, "PRECISERR should be set");
+    assert_ne!(
+        emu.core_mut(0).ppb.cfsr & (1 << 9),
+        0,
+        "PRECISERR should be set"
+    );
 }
 
 /// BKPT must halt the core. The silicon oracles (`silicon_isr_diff_*`,
@@ -5717,7 +5892,8 @@ fn async_dispatch_rom(looping_handlers: bool) -> Vec<u8> {
     rom[0x38..0x3C].copy_from_slice(&0x0000_0201u32.to_le_bytes()); // PendSV -> 0x200
     rom[0x3C..0x40].copy_from_slice(&0x0000_0281u32.to_le_bytes()); // SysTick -> 0x280
     // Main at 0x100: `B .` — async exception is the only way to move.
-    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    rom[0x100] = 0xFE;
+    rom[0x101] = 0xE7;
     let handler: [u8; 2] = if looping_handlers {
         [0xFE, 0xE7] // B .
     } else {
@@ -5744,7 +5920,9 @@ fn core0_step(emu: &mut Emulator) {
     if pending != 0 {
         emu.core_mut(0).ppb.merge_irq_pending(pending);
     }
-    let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+    let Cores::Arm(arm) = &mut emu.cores else {
+        unreachable!()
+    };
     arm[0].step(&mut emu.bus);
 }
 
@@ -5759,14 +5937,28 @@ fn test_async_dispatch_pendsv_enters_handler() {
     emu.load_bootrom(&async_dispatch_rom(true));
     emu.reset();
 
-    for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0, "must be in thread mode before pend");
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        0,
+        "must be in thread mode before pend"
+    );
 
     emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 14, "should be in PendSV handler");
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0200, "PC at PendSV handler entry");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        14,
+        "should be in PendSV handler"
+    );
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.pc(),
+        0x0000_0200,
+        "PC at PendSV handler entry"
+    );
 }
 
 #[test]
@@ -5774,13 +5966,18 @@ fn test_async_dispatch_clears_pending_bit_on_entry() {
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&async_dispatch_rom(true));
     emu.reset();
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
     emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.core_mut(0).ppb.icsr & ICSR_PENDSVSET_BIT, 0,
-        "SET bit must clear on exception activation (ARMv8-M §B3.2.4)");
+    assert_eq!(
+        emu.core_mut(0).ppb.icsr & ICSR_PENDSVSET_BIT,
+        0,
+        "SET bit must clear on exception activation (ARMv8-M §B3.2.4)"
+    );
 }
 
 #[test]
@@ -5788,14 +5985,22 @@ fn test_async_dispatch_primask_masks_pendsv() {
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&async_dispatch_rom(true));
     emu.reset();
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
     emu.core_mut(0).regs.primask = 1;
     emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
 
-    for _ in 0..10 { core0_step(&mut emu); }
+    for _ in 0..10 {
+        core0_step(&mut emu);
+    }
     assert_eq!(emu.core_mut(0).regs.ipsr(), 0, "PRIMASK must block PendSV");
-    assert_ne!(emu.core_mut(0).ppb.icsr & ICSR_PENDSVSET_BIT, 0, "pending bit must remain set");
+    assert_ne!(
+        emu.core_mut(0).ppb.icsr & ICSR_PENDSVSET_BIT,
+        0,
+        "pending bit must remain set"
+    );
 }
 
 #[test]
@@ -5803,13 +6008,21 @@ fn test_async_dispatch_pendsvclr_prevents_dispatch() {
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&async_dispatch_rom(true));
     emu.reset();
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
     emu.core_mut(0).ppb.write32(ICSR_ADDR, ICSR_PENDSVSET_BIT);
     emu.core_mut(0).ppb.write32(ICSR_ADDR, ICSR_PENDSVCLR_BIT);
 
-    for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0, "cleared pend bit must not dispatch");
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        0,
+        "cleared pend bit must not dispatch"
+    );
 }
 
 #[test]
@@ -5817,16 +6030,28 @@ fn test_async_dispatch_pendsv_round_trip() {
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&async_dispatch_rom(false)); // BX LR handler
     emu.reset();
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
     let main_pc_before = emu.core_mut(0).regs.pc();
     emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
 
     // Step enough for entry + BX LR + exit: 3 instructions worth.
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0, "must be back in thread mode");
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), main_pc_before, "must resume main loop PC");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        0,
+        "must be back in thread mode"
+    );
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.pc(),
+        main_pc_before,
+        "must resume main loop PC"
+    );
 }
 
 #[test]
@@ -5834,13 +6059,23 @@ fn test_async_dispatch_systick_enters_handler() {
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&async_dispatch_rom(true));
     emu.reset();
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
     emu.core_mut(0).ppb.icsr |= ICSR_PENDSTSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 15, "should be in SysTick handler");
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0280, "PC at SysTick handler entry");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        15,
+        "should be in SysTick handler"
+    );
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.pc(),
+        0x0000_0280,
+        "PC at SysTick handler entry"
+    );
 }
 
 // ============================================================================
@@ -5868,31 +6103,50 @@ fn test_tail_chain_pendsv_to_systick_preserves_frame() {
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&async_dispatch_rom(false)); // BX LR handler
     emu.reset();
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
     // Step 1: pend PendSV + SysTick simultaneously. PendSV wins dispatch
     // (lower exc number at same priority). Single-step enters PendSV.
     emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT | ICSR_PENDSTSET_BIT;
     core0_step(&mut emu);
     assert_eq!(emu.core_mut(0).regs.ipsr(), 14, "PendSV wins arbitration");
-    assert_ne!(emu.core_mut(0).ppb.icsr & ICSR_PENDSTSET_BIT, 0,
-        "SysTick must remain pending while PendSV is active");
+    assert_ne!(
+        emu.core_mut(0).ppb.icsr & ICSR_PENDSTSET_BIT,
+        0,
+        "SysTick must remain pending while PendSV is active"
+    );
     let msp_in_pendsv = emu.cores.expect_arm_mut()[0].regs.msp;
 
     // Step 2: runs the single BX LR in the handler. exit_exception
     // sees SysTick pending and tail-chains — no unstack, no re-stack.
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 15,
-        "tail-chain must activate SysTick, not return to thread");
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.msp, msp_in_pendsv,
-        "tail-chain must NOT pop the frame — MSP preserved for the new handler");
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x0000_0280,
-        "PC at SysTick handler entry address");
-    assert_eq!(emu.core_mut(0).ppb.icsr & ICSR_PENDSTSET_BIT, 0,
-        "SysTick pending bit clears on tail-chain activation");
-    assert!(CortexM33::is_exc_return(emu.cores.expect_arm_mut()[0].regs.lr()),
-        "LR still an EXC_RETURN magic (frame held for eventual thread return)");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        15,
+        "tail-chain must activate SysTick, not return to thread"
+    );
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.msp,
+        msp_in_pendsv,
+        "tail-chain must NOT pop the frame — MSP preserved for the new handler"
+    );
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.pc(),
+        0x0000_0280,
+        "PC at SysTick handler entry address"
+    );
+    assert_eq!(
+        emu.core_mut(0).ppb.icsr & ICSR_PENDSTSET_BIT,
+        0,
+        "SysTick pending bit clears on tail-chain activation"
+    );
+    assert!(
+        CortexM33::is_exc_return(emu.cores.expect_arm_mut()[0].regs.lr()),
+        "LR still an EXC_RETURN magic (frame held for eventual thread return)"
+    );
 }
 
 /// Tail-chain cycle cost: ~6 cycles (ARMv8-M §B3.4.2), vs ~12 for a
@@ -5925,8 +6179,10 @@ fn test_tail_chain_cycle_cost_is_discounted() {
     let cycles = cpu.test_exit_exception(0xFFFF_FFF9, &mut bus);
 
     assert_eq!(cpu.regs.ipsr(), 15, "tail-chained into SysTick");
-    assert_eq!(cycles, 6,
-        "tail-chain cost is 6 cycles, not 12 (full unstack); got {cycles}");
+    assert_eq!(
+        cycles, 6,
+        "tail-chain cost is 6 cycles, not 12 (full unstack); got {cycles}"
+    );
 }
 
 /// Negative control: EXC_RETURN with no pending exception must not
@@ -5992,7 +6248,8 @@ fn external_irq_rom() -> Vec<u8> {
         rom[vec_off..vec_off + 4].copy_from_slice(&(handler_addr | 1).to_le_bytes());
     }
     // Main at 0x100: busy-wait.
-    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    rom[0x100] = 0xFE;
+    rom[0x101] = 0xE7;
     rom
 }
 
@@ -6005,9 +6262,13 @@ fn load_external_irq_emu() -> Emulator {
     for irq in 0..52u32 {
         let handler_addr = 0x2000_0200u32 + irq * 0x40;
         emu.bus.memory.sram_write8(handler_addr & 0x0FFF_FFFF, 0xFE);
-        emu.bus.memory.sram_write8((handler_addr + 1) & 0x0FFF_FFFF, 0xE7);
+        emu.bus
+            .memory
+            .sram_write8((handler_addr + 1) & 0x0FFF_FFFF, 0xE7);
     }
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
     emu
 }
 
@@ -6022,10 +6283,16 @@ fn test_external_irq_pend_plus_enable_enters_handler() {
 
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16 + 0,
-        "IPSR must be TIMER0_IRQ_0 (exception 16)");
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.pc(), 0x2000_0200,
-        "PC at TIMER0 handler entry");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        16 + 0,
+        "IPSR must be TIMER0_IRQ_0 (exception 16)"
+    );
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.pc(),
+        0x2000_0200,
+        "PC at TIMER0 handler entry"
+    );
 }
 
 #[test]
@@ -6035,9 +6302,14 @@ fn test_external_irq_pending_without_enable_does_not_dispatch() {
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
-    for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0,
-        "pending-without-enable must not dispatch");
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        0,
+        "pending-without-enable must not dispatch"
+    );
 }
 
 #[test]
@@ -6050,9 +6322,14 @@ fn test_external_irq_priority_mask_blocks_dispatch() {
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
-    for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0,
-        "PRIMASK must block external IRQ dispatch");
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        0,
+        "PRIMASK must block external IRQ dispatch"
+    );
 }
 
 #[test]
@@ -6062,13 +6339,20 @@ fn test_external_irq_basepri_masks_dispatch() {
     let mut emu = load_external_irq_emu();
     emu.core_mut(0).regs.basepri = 0x20;
     emu.core_mut(0).ppb.write32(0xE000_E100, 1u32 << 0);
-    emu.core_mut(0).ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.core_mut(0)
+        .ppb
+        .write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
-    for _ in 0..5 { core0_step(&mut emu); }
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 0,
-        "BASEPRI=0x20 must mask IRQ at priority 0xC0");
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        0,
+        "BASEPRI=0x20 must mask IRQ at priority 0xC0"
+    );
 }
 
 #[test]
@@ -6077,13 +6361,18 @@ fn test_external_irq_basepri_zero_is_transparent() {
     let mut emu = load_external_irq_emu();
     emu.core_mut(0).regs.basepri = 0;
     emu.core_mut(0).ppb.write32(0xE000_E100, 1u32 << 0);
-    emu.core_mut(0).ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.core_mut(0)
+        .ppb
+        .write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     emu.bus.atomics.irq_pending[0].fetch_or(1u64 << 0, Ordering::Relaxed);
     emu.core_mut(0).ppb.nvic_ispr[0].fetch_or(1u32 << 0, Ordering::Relaxed);
 
     core0_step(&mut emu);
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16 + 0,
-        "BASEPRI=0 is transparent; IRQ 0 must dispatch");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        16 + 0,
+        "BASEPRI=0 is transparent; IRQ 0 must dispatch"
+    );
 }
 
 #[test]
@@ -6100,24 +6389,41 @@ fn test_assert_irq_core_targets_receiver() {
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_SIO_IRQ_FIFO; // 25, core-local
     emu.bus.assert_irq_core(1, irq);
-    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed), 0,
-        "core 0 irq_pending must remain clear");
-    assert_ne!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
-        "core 1 irq_pending must record the assert");
+    assert_eq!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed),
+        0,
+        "core 0 irq_pending must remain clear"
+    );
+    assert_ne!(
+        emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq),
+        0,
+        "core 1 irq_pending must record the assert"
+    );
     // Phase 3 Stage 1: the `irq_pending_dirty` flag is gone; the pending
     // mask itself (non-zero) carries the "needs merge" signal.
-    assert!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) != 0,
-        "core 1 irq_pending must signal the pending merge");
-    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed), 0,
-        "core 0 irq_pending must remain clear");
+    assert!(
+        emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) != 0,
+        "core 1 irq_pending must signal the pending merge"
+    );
+    assert_eq!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed),
+        0,
+        "core 0 irq_pending must remain clear"
+    );
     // Drive the merge and re-check NVIC_ISPR — core 1 latches, core 0
     // stays clean.
     let pending1 = emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed);
     emu.core_mut(1).ppb.merge_irq_pending(pending1);
-    assert_ne!(emu.core_mut(1).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
-        "NVIC_ISPR on core 1 must latch after merge");
-    assert_eq!(emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
-        "NVIC_ISPR on core 0 must remain clear");
+    assert_ne!(
+        emu.core_mut(1).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq),
+        0,
+        "NVIC_ISPR on core 1 must latch after merge"
+    );
+    assert_eq!(
+        emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq),
+        0,
+        "NVIC_ISPR on core 0 must remain clear"
+    );
 }
 
 #[test]
@@ -6144,22 +6450,36 @@ fn test_assert_irq_shared_latches_on_both_cores() {
     let mut emu = load_external_irq_emu();
     let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
     emu.bus.assert_irq_shared(irq);
-    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq), 0,
-        "core 0 irq_pending must record the assert");
-    assert_ne!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
-        "core 1 irq_pending must record the assert");
+    assert_ne!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq),
+        0,
+        "core 0 irq_pending must record the assert"
+    );
+    assert_ne!(
+        emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq),
+        0,
+        "core 1 irq_pending must record the assert"
+    );
     // Phase 3 Stage 1: non-zero `irq_pending` replaces the `irq_pending_dirty` flag.
-    assert!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) != 0
-         && emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) != 0,
-        "both cores' irq_pending must carry the pending signal");
+    assert!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) != 0
+            && emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) != 0,
+        "both cores' irq_pending must carry the pending signal"
+    );
     let pending0 = emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed);
     emu.core_mut(0).ppb.merge_irq_pending(pending0);
     let pending1b = emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed);
     emu.core_mut(1).ppb.merge_irq_pending(pending1b);
-    assert_ne!(emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
-        "NVIC_ISPR on core 0 must latch after merge");
-    assert_ne!(emu.core_mut(1).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq), 0,
-        "NVIC_ISPR on core 1 must latch after merge");
+    assert_ne!(
+        emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq),
+        0,
+        "NVIC_ISPR on core 0 must latch after merge"
+    );
+    assert_ne!(
+        emu.core_mut(1).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << irq),
+        0,
+        "NVIC_ISPR on core 1 must latch after merge"
+    );
 }
 
 #[test]
@@ -6175,10 +6495,16 @@ fn test_clear_irq_core_drops_pending_on_one_core() {
     emu.bus.assert_irq_core(0, irq);
     emu.bus.assert_irq_core(1, irq);
     emu.bus.clear_irq_core(0, irq);
-    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq), 0,
-        "clear_irq_core must drop the pending bit on the named core");
-    assert_ne!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
-        "clear_irq_core must not touch the other core");
+    assert_eq!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq),
+        0,
+        "clear_irq_core must drop the pending bit on the named core"
+    );
+    assert_ne!(
+        emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq),
+        0,
+        "clear_irq_core must not touch the other core"
+    );
 }
 
 #[test]
@@ -6191,10 +6517,16 @@ fn test_clear_irq_shared_drops_pending_on_both_cores() {
     let irq = crate::irq::IRQ_TIMER0_IRQ_0; // shared
     emu.bus.assert_irq_shared(irq);
     emu.bus.clear_irq_shared(irq);
-    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq), 0,
-        "clear_irq_shared must clear core 0's pending bit");
-    assert_eq!(emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq), 0,
-        "clear_irq_shared must clear core 1's pending bit");
+    assert_eq!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << irq),
+        0,
+        "clear_irq_shared must clear core 0's pending bit"
+    );
+    assert_eq!(
+        emu.bus.atomics.irq_pending[1].load(Ordering::Relaxed) & (1u64 << irq),
+        0,
+        "clear_irq_shared must clear core 1's pending bit"
+    );
 }
 
 #[test]
@@ -6209,12 +6541,18 @@ fn test_mmio_nvic_ispr_write_mirrors_into_irq_pending_and_dispatches() {
     // Pend IRQ 0 via MMIO path — this is the case B1 restores.
     emu.mmio_write32(0xE000_E200, 1u32 << 0);
     // After write, bus.irq_pending must reflect the latch.
-    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0), 0,
-        "NVIC_ISPR MMIO write must mirror into bus.irq_pending[core]");
+    assert_ne!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0),
+        0,
+        "NVIC_ISPR MMIO write must mirror into bus.irq_pending[core]"
+    );
     // And the dispatch path must enter the handler on next step.
     core0_step(&mut emu);
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16 + 0,
-        "MMIO-pended IRQ 0 must enter exception 16 on next step");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        16 + 0,
+        "MMIO-pended IRQ 0 must enter exception 16 on next step"
+    );
 }
 
 #[test]
@@ -6225,13 +6563,22 @@ fn test_mmio_nvic_icpr_write_drops_irq_pending_mirror() {
     let mut emu = load_external_irq_emu();
     // Pend via MMIO (mirrors set bit).
     emu.mmio_write32(0xE000_E200, 1u32 << 0);
-    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0), 0);
+    assert_ne!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0),
+        0
+    );
     // Clear via MMIO ICPR.
     emu.mmio_write32(0xE000_E280, 1u32 << 0);
-    assert_eq!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0), 0,
-        "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror");
-    assert_eq!(emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 0), 0,
-        "NVIC_ICPR MMIO write must clear the architectural latch");
+    assert_eq!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 0),
+        0,
+        "NVIC_ICPR MMIO write must clear the bus.irq_pending mirror"
+    );
+    assert_eq!(
+        emu.core_mut(0).ppb.nvic_ispr[0].load(Ordering::Relaxed) & (1u32 << 0),
+        0,
+        "NVIC_ICPR MMIO write must clear the architectural latch"
+    );
 }
 
 #[test]
@@ -6242,8 +6589,11 @@ fn test_mmio_nvic_ispr_word1_write_mirrors_high_half() {
     // in bits 32..=63 of irq_pending.
     let mut emu = load_external_irq_emu();
     emu.mmio_write32(0xE000_E204, 1u32 << (40 - 32));
-    assert_ne!(emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 40), 0,
-        "NVIC_ISPR1 write for IRQ 40 must mirror into bus.irq_pending[core] bit 40");
+    assert_ne!(
+        emu.bus.atomics.irq_pending[0].load(Ordering::Relaxed) & (1u64 << 40),
+        0,
+        "NVIC_ISPR1 write for IRQ 40 must mirror into bus.irq_pending[core] bit 40"
+    );
 }
 
 #[test]
@@ -6258,12 +6608,15 @@ fn test_execution_priority_basepri_leq_current_is_noop() {
     // Pretend we're in handler mode at exception 16 (IRQ 0).
     c.regs.xpsr = (c.regs.xpsr & !0x1FF) | 16;
     // Give IRQ 0 priority 0x40 via NVIC_IPR0 byte 0.
-    c.ppb.write32(0xE000_E400, u32::from_le_bytes([0x40, 0, 0, 0]));
+    c.ppb
+        .write32(0xE000_E400, u32::from_le_bytes([0x40, 0, 0, 0]));
     c.regs.basepri = 0xE0;
     let prio = c.execution_priority();
-    assert_eq!(prio, 0x40,
+    assert_eq!(
+        prio, 0x40,
         "BASEPRI=0xE0 must NOT raise execution priority above the \
-         current active-exception priority 0x40");
+         current active-exception priority 0x40"
+    );
 }
 
 #[test]
@@ -6286,8 +6639,11 @@ fn test_unified_arbitration_external_irq_beats_pendsv() {
     emu.mmio_write32(0xE000_E200, 1u32 << 0); // NVIC_ISPR IRQ 0
     // One step: unified arbitration picks IRQ 0 (priority 0x20 beats 0x80).
     core0_step(&mut emu);
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 16,
-        "unified arbitration must pick IRQ 0 (priority 0x20) over PendSV (priority 0x80)");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        16,
+        "unified arbitration must pick IRQ 0 (priority 0x20) over PendSV (priority 0x80)"
+    );
 }
 
 #[test]
@@ -6314,8 +6670,11 @@ fn test_priority_preempt_end_to_end_via_step_loop() {
     // Now pend IRQ 1 at higher priority. Must preempt on next step.
     emu.mmio_write32(0xE000_E200, 1u32 << 1);
     core0_step(&mut emu);
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 17,
-        "IRQ 1 (priority 0x40) must preempt IRQ 0 handler (priority 0xC0)");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        17,
+        "IRQ 1 (priority 0x40) must preempt IRQ 0 handler (priority 0xC0)"
+    );
 }
 
 // ============================================================================
@@ -6343,7 +6702,10 @@ fn test_execution_priority_basepri_clamps_masked_value() {
     // Pre-Phase-0a this returned 256 (the initial "no mask" value);
     // post-Phase-0a it returns 0x80.
     let prio = c.execution_priority();
-    assert_eq!(prio, 0x80, "BASEPRI=0x80 must clamp execution_priority to 0x80");
+    assert_eq!(
+        prio, 0x80,
+        "BASEPRI=0x80 must clamp execution_priority to 0x80"
+    );
 }
 
 #[test]
@@ -6356,8 +6718,10 @@ fn test_execution_priority_basepri_masks_unimplemented_bits() {
     let prio_masked = c.execution_priority();
     c.regs.basepri = 0x80;
     let prio_pure = c.execution_priority();
-    assert_eq!(prio_masked, prio_pure,
-        "BASEPRI bits [4:0] must be masked before clamping");
+    assert_eq!(
+        prio_masked, prio_pure,
+        "BASEPRI bits [4:0] must be masked before clamping"
+    );
 }
 
 #[test]
@@ -6366,8 +6730,10 @@ fn test_execution_priority_basepri_zero_does_nothing() {
     let (mut c, _bus) = core_and_bus();
     c.regs.basepri = 0;
     let prio = c.execution_priority();
-    assert_eq!(prio, 256,
-        "BASEPRI=0 must leave priority at its thread-mode max");
+    assert_eq!(
+        prio, 256,
+        "BASEPRI=0 must leave priority at its thread-mode max"
+    );
 }
 
 #[test]
@@ -6392,10 +6758,14 @@ fn test_execution_priority_basepri_vs_higher_priority_irq() {
     let can = emu.core_mut(0).can_preempt(16 + 0); // IRQ 0 priority 0
     assert!(can, "IRQ at priority 0 always beats BASEPRI 0x80");
     // But an IRQ with priority 0xC0 set via NVIC_IPR should NOT preempt.
-    emu.core_mut(0).ppb.write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
+    emu.core_mut(0)
+        .ppb
+        .write32(0xE000_E400, u32::from_le_bytes([0xC0, 0, 0, 0]));
     let can_irq0_at_0xc0 = emu.core_mut(0).can_preempt(16 + 0);
-    assert!(!can_irq0_at_0xc0,
-        "IRQ 0 at priority 0xC0 must not preempt BASEPRI 0x80");
+    assert!(
+        !can_irq0_at_0xc0,
+        "IRQ 0 at priority 0xC0 must not preempt BASEPRI 0x80"
+    );
 }
 
 // ============================================================================
@@ -6515,7 +6885,10 @@ fn tt_bootrom_scenario() {
     let result = c.reg(2);
 
     // Bootrom expects exactly 0x02CE0700 for this scenario
-    assert_eq!(result, 0x02CE0700, "TT result should match bootrom expected value");
+    assert_eq!(
+        result, 0x02CE0700,
+        "TT result should match bootrom expected value"
+    );
     // Verify key fields:
     // SREGION = 7 at bits [15:8]
     assert_eq!((result >> 8) & 0xFF, 7, "SREGION should be 7");
@@ -6570,24 +6943,29 @@ fn ldrex_strex_success() {
     // -> STREX succeeds (Rd = 0) and memory is updated.
     let (mut c, mut bus) = core_and_bus();
     bus.write32(0x2000_0200, 0xAAAA_AAAA, 0); // seed memory
-    c.set_reg(2, 0x2000_0200);                // Rn base
-    c.set_reg(1, 0xBEEF_F00D);                // Rt (STREX store value)
+    c.set_reg(2, 0x2000_0200); // Rn base
+    c.set_reg(1, 0xBEEF_F00D); // Rt (STREX store value)
 
     // LDREX R3, [R2, #0]: hw0=0xE852, hw1=0x3F00
     //   hw0[3:0]=Rn=2, hw1[15:12]=Rt=3, hw1[11:8]=0xF, hw1[7:0]=imm8=0
     c.execute_one_wide_with_bus(0xE852, 0x3F00, &mut bus);
     assert_eq!(c.reg(3), 0xAAAA_AAAA, "LDREX loaded seed value");
-    assert_eq!(c.exclusive_address, Some(0x2000_0200),
-        "LDREX set local monitor to the loaded address");
+    assert_eq!(
+        c.exclusive_address,
+        Some(0x2000_0200),
+        "LDREX set local monitor to the loaded address"
+    );
 
     // STREX R0, R1, [R2, #0]: hw0=0xE842, hw1=0x1000
     //   hw0[3:0]=Rn=2, hw1[15:12]=Rt=1, hw1[11:8]=Rd=0, hw1[7:0]=imm8=0
     c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus);
     assert_eq!(c.reg(0), 0, "STREX success -> Rd = 0");
-    assert_eq!(bus.read32(0x2000_0200, 0), 0xBEEF_F00D,
-        "STREX updated memory on success");
-    assert_eq!(c.exclusive_address, None,
-        "STREX clears the local monitor");
+    assert_eq!(
+        bus.read32(0x2000_0200, 0),
+        0xBEEF_F00D,
+        "STREX updated memory on success"
+    );
+    assert_eq!(c.exclusive_address, None, "STREX clears the local monitor");
 }
 
 #[test]
@@ -6607,8 +6985,11 @@ fn ldrex_clrex_strex_fail() {
 
     c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus); // STREX
     assert_eq!(c.reg(0), 1, "STREX after CLREX must fail");
-    assert_eq!(bus.read32(0x2000_0210, 0), 0xAAAA_AAAA,
-        "memory must be unchanged after failed STREX");
+    assert_eq!(
+        bus.read32(0x2000_0210, 0),
+        0xAAAA_AAAA,
+        "memory must be unchanged after failed STREX"
+    );
 }
 
 #[test]
@@ -6626,8 +7007,11 @@ fn ldrex_samecore_str_strex_success() {
     // the wrapper flips `did_write_this_quantum` but must NOT clear the
     // local monitor — that's the invariant under test.
     c.bus_write32(0x2000_0220, 0x1111_2222, &mut bus);
-    assert_eq!(c.exclusive_address, Some(0x2000_0220),
-        "same-core write must NOT clear local monitor");
+    assert_eq!(
+        c.exclusive_address,
+        Some(0x2000_0220),
+        "same-core write must NOT clear local monitor"
+    );
     assert!(c.did_write_this_quantum, "same-core write set the flag");
 
     c.execute_one_wide_with_bus(0xE842, 0x1000, &mut bus); // STREX R0, R1, [R2]
@@ -6654,8 +7038,10 @@ fn ldrex_strex_different_addr_fail() {
     assert_eq!(c.reg(0), 1, "STREX to different address must fail");
     assert_eq!(bus.read32(0x2000_0234, 0), 0xCCCC_CCCC, "B unchanged");
     assert_eq!(bus.read32(0x2000_0230, 0), 0xAAAA_AAAA, "A unchanged");
-    assert_eq!(c.exclusive_address, None,
-        "STREX clears the monitor even on failure");
+    assert_eq!(
+        c.exclusive_address, None,
+        "STREX clears the monitor even on failure"
+    );
 }
 
 #[test]
@@ -6677,7 +7063,9 @@ fn ldrex_peer_write_strex_fail() {
     // Core 1 performs a write via the wrapper; this sets its
     // `did_write_this_quantum = true` and writes to memory.
     {
-        let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+        let Cores::Arm(arm) = &mut emu.cores else {
+            unreachable!()
+        };
         arm[1].bus_write32(addr, 0x1234_5678, &mut emu.bus);
     }
     assert!(emu.core_mut(1).did_write_this_quantum);
@@ -6690,20 +7078,31 @@ fn ldrex_peer_write_strex_fail() {
     emu.core_mut(0).halt();
     emu.core_mut(1).halt();
     emu.step().unwrap();
-    assert_eq!(emu.core_mut(0).exclusive_address, None,
-        "peer-core write must invalidate our monitor via the snoop");
-    assert!(!emu.core_mut(1).did_write_this_quantum,
-        "snoop must clear did_write_this_quantum for the next quantum");
+    assert_eq!(
+        emu.core_mut(0).exclusive_address,
+        None,
+        "peer-core write must invalidate our monitor via the snoop"
+    );
+    assert!(
+        !emu.core_mut(1).did_write_this_quantum,
+        "snoop must clear did_write_this_quantum for the next quantum"
+    );
 
     // And STREX from core 0 now fails, completing the scenario.
     emu.core_mut(0).wake();
     emu.core_mut(0).set_reg(2, addr);
     emu.core_mut(0).set_reg(1, 0xBEEF_F00D);
     {
-        let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+        let Cores::Arm(arm) = &mut emu.cores else {
+            unreachable!()
+        };
         arm[0].execute_one_wide_with_bus(0xE842, 0x1000, &mut emu.bus);
     }
-    assert_eq!(emu.core_mut(0).reg(0), 1, "STREX must fail after peer snoop");
+    assert_eq!(
+        emu.core_mut(0).reg(0),
+        1,
+        "STREX must fail after peer snoop"
+    );
 }
 
 #[test]
@@ -6717,7 +7116,8 @@ fn ldrex_ldrex_strex_strex_race() {
     // then the snoop fires at the quantum boundary.
     let mut emu = crate::EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // Minimal ROM — reset vector points at 0x2000_0000 (SRAM). We drive
     // state directly via the registers so we don't need a full vector
@@ -6768,17 +7168,18 @@ fn ldrex_ldrex_strex_strex_race() {
     // soon as both cores have executed both instructions (PC advanced by
     // 8 bytes from their program start).
     for _ in 0..64 {
-        if emu.core_mut(0).regs.pc() >= 0x2000_0008
-            && emu.core_mut(1).regs.pc() >= 0x2000_0108
-        {
+        if emu.core_mut(0).regs.pc() >= 0x2000_0008 && emu.core_mut(1).regs.pc() >= 0x2000_0108 {
             break;
         }
         emu.step().unwrap();
     }
     assert_eq!(emu.core_mut(0).reg(0), 0, "core 0 STREX wins");
     assert_eq!(emu.core_mut(1).reg(0), 1, "core 1 STREX loses");
-    assert_eq!(emu.bus.read32(addr, 0), 0xAAAA_0000,
-        "memory shows the winning store");
+    assert_eq!(
+        emu.bus.read32(addr, 0),
+        0xAAAA_0000,
+        "memory shows the winning store"
+    );
     assert_eq!(emu.core_mut(0).exclusive_address, None);
     assert_eq!(emu.core_mut(1).exclusive_address, None);
 }
@@ -6908,8 +7309,9 @@ fn msplim_alignment() {
 fn bootrom_diagnostic_run() {
     let rom_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../roms/rp2350/bootrom-combined.bin");
-    let rom_data = std::fs::read(&rom_path)
-        .expect("bootrom binary not found — download from github.com/raspberrypi/pico-bootrom-rp2350");
+    let rom_data = std::fs::read(&rom_path).expect(
+        "bootrom binary not found — download from github.com/raspberrypi/pico-bootrom-rp2350",
+    );
 
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&rom_data);
@@ -6961,29 +7363,53 @@ fn bootrom_diagnostic_run() {
                 last_trace_pc = pc;
                 eprintln!("[cycle {:>7}] Reached {:#010x}: {}", cycle, addr, label);
                 let c0 = &emu.cores.expect_arm()[0];
-                eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                    c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]);
-                eprintln!("  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
-                    c0.regs.r[4], c0.regs.r[5], c0.regs.r[6], c0.regs.r[7]);
-                eprintln!("  LR={:#010x} SP={:#010x} secure={}", c0.regs.lr(), c0.regs.sp(), c0.secure);
-                eprintln!("  R8={:#010x} R9={:#010x} R10={:#010x} R11={:#010x} R12={:#010x}",
-                    c0.regs.r[8], c0.regs.r[9], c0.regs.r[10], c0.regs.r[11], c0.regs.r[12]);
-                eprintln!("  MSP={:#010x} MSP_NS={:#010x} PSP={:#010x} PSP_NS={:#010x}",
-                    c0.regs.msp, c0.regs.msp_ns, c0.regs.psp, c0.regs.psp_ns);
+                eprintln!(
+                    "  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
+                    c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]
+                );
+                eprintln!(
+                    "  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
+                    c0.regs.r[4], c0.regs.r[5], c0.regs.r[6], c0.regs.r[7]
+                );
+                eprintln!(
+                    "  LR={:#010x} SP={:#010x} secure={}",
+                    c0.regs.lr(),
+                    c0.regs.sp(),
+                    c0.secure
+                );
+                eprintln!(
+                    "  R8={:#010x} R9={:#010x} R10={:#010x} R11={:#010x} R12={:#010x}",
+                    c0.regs.r[8], c0.regs.r[9], c0.regs.r[10], c0.regs.r[11], c0.regs.r[12]
+                );
+                eprintln!(
+                    "  MSP={:#010x} MSP_NS={:#010x} PSP={:#010x} PSP_NS={:#010x}",
+                    c0.regs.msp, c0.regs.msp_ns, c0.regs.psp, c0.regs.psp_ns
+                );
                 // Extra detail at bxns points
                 if addr == 0x0382 || addr == 0x7EA4 {
-                    let target = if addr == 0x0382 { c0.regs.r[0] } else { c0.regs.lr() };
+                    let target = if addr == 0x0382 {
+                        c0.regs.r[0]
+                    } else {
+                        c0.regs.lr()
+                    };
                     eprintln!("  BXNS target={:#010x}", target);
                     // Try to read memory at target
                     let t = target & !1;
-                    eprintln!("  Memory at target: [{:#010x}]={:#010x} [{:#010x}]={:#010x}",
-                        t, emu.peek(t), t+4, emu.peek(t+4));
+                    eprintln!(
+                        "  Memory at target: [{:#010x}]={:#010x} [{:#010x}]={:#010x}",
+                        t,
+                        emu.peek(t),
+                        t + 4,
+                        emu.peek(t + 4)
+                    );
                     // Dump XIP SRAM first 8 words
                     eprintln!("  XIP SRAM (0x1500_0000):");
                     for i in 0..8 {
                         let a = 0x1500_0000 + i * 4;
                         eprint!("    [{:#010x}]={:#010x}", a, emu.peek(a));
-                        if i % 4 == 3 { eprintln!(); }
+                        if i % 4 == 3 {
+                            eprintln!();
+                        }
                     }
                     eprintln!();
                     // Also dump USB SRAM (0x5010_0000)
@@ -6991,7 +7417,9 @@ fn bootrom_diagnostic_run() {
                     for i in 0..8 {
                         let a = 0x5010_0000 + i * 4;
                         eprint!("    [{:#010x}]={:#010x}", a, emu.peek(a));
-                        if i % 4 == 3 { eprintln!(); }
+                        if i % 4 == 3 {
+                            eprintln!();
+                        }
                     }
                     eprintln!();
                 }
@@ -7020,8 +7448,10 @@ fn bootrom_diagnostic_run() {
             eprintln!("  PC={:#010x} LR={:#010x}", pc, c0.regs.lr());
             eprintln!("  CFSR={:#010x} HFSR={:#010x}", c0.ppb.cfsr, c0.ppb.hfsr);
             eprintln!("  BFAR={:#010x} MMFAR={:#010x}", c0.ppb.bfar, c0.ppb.mmfar);
-            eprintln!("  R0-R3: {:#010x} {:#010x} {:#010x} {:#010x}",
-                c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]);
+            eprintln!(
+                "  R0-R3: {:#010x} {:#010x} {:#010x} {:#010x}",
+                c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]
+            );
             eprintln!("  SP={:#010x} MSP={:#010x}", c0.regs.sp(), c0.regs.msp);
             eprintln!("  Max bootrom PC so far={:#010x}", max_pc);
             // Read exception frame from stack
@@ -7034,10 +7464,14 @@ fn bootrom_diagnostic_run() {
             let ret_pc = emu.peek(sp + 24);
             let xpsr = emu.peek(sp + 28);
             eprintln!("  Exception frame at SP={:#010x}:", sp);
-            eprintln!("    Stacked R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                r0, r1, r2, r3);
-            eprintln!("    Stacked LR={:#010x} PC={:#010x} xPSR={:#010x}",
-                lr, ret_pc, xpsr);
+            eprintln!(
+                "    Stacked R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
+                r0, r1, r2, r3
+            );
+            eprintln!(
+                "    Stacked LR={:#010x} PC={:#010x} xPSR={:#010x}",
+                lr, ret_pc, xpsr
+            );
         }
 
         if pc == last_pc {
@@ -7047,11 +7481,14 @@ fn bootrom_diagnostic_run() {
                 let c0 = &emu.cores.expect_arm()[0];
                 eprintln!("  IPSR={}, LR={:#010x}", c0.regs.ipsr(), c0.regs.lr());
                 eprintln!("  CFSR={:#010x}, HFSR={:#010x}", c0.ppb.cfsr, c0.ppb.hfsr);
-                eprintln!("  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
-                    c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]);
-                eprintln!("  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
-                    c0.regs.r[4], c0.regs.r[5],
-                    c0.regs.r[6], c0.regs.r[7]);
+                eprintln!(
+                    "  R0={:#010x} R1={:#010x} R2={:#010x} R3={:#010x}",
+                    c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], c0.regs.r[3]
+                );
+                eprintln!(
+                    "  R4={:#010x} R5={:#010x} R6={:#010x} R7={:#010x}",
+                    c0.regs.r[4], c0.regs.r[5], c0.regs.r[6], c0.regs.r[7]
+                );
                 eprintln!("  SP={:#010x} MSP={:#010x}", c0.regs.sp(), c0.regs.msp);
                 eprintln!("  BFAR={:#010x} MMFAR={:#010x}", c0.ppb.bfar, c0.ppb.mmfar);
                 eprintln!("  Max bootrom PC reached={:#010x}", max_pc);
@@ -7061,10 +7498,15 @@ fn bootrom_diagnostic_run() {
                     let stacked_pc = emu.peek(sp + 24);
                     let stacked_lr = emu.peek(sp + 20);
                     let stacked_xpsr = emu.peek(sp + 28);
-                    eprintln!("  Stacked: PC={:#010x} LR={:#010x} xPSR={:#010x}",
-                        stacked_pc, stacked_lr, stacked_xpsr);
+                    eprintln!(
+                        "  Stacked: PC={:#010x} LR={:#010x} xPSR={:#010x}",
+                        stacked_pc, stacked_lr, stacked_xpsr
+                    );
                 } else {
-                    eprintln!("  SP not in SRAM, cannot read exception frame (SP={:#010x})", sp);
+                    eprintln!(
+                        "  SP not in SRAM, cannot read exception frame (SP={:#010x})",
+                        sp
+                    );
                 }
                 break;
             }
@@ -7078,12 +7520,22 @@ fn bootrom_diagnostic_run() {
     let c0 = &emu.cores.expect_arm()[0];
     let final_pc = c0.regs.pc();
     eprintln!("Final PC={:#010x}, cycles run", final_pc);
-    eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
-        c0.regs.ipsr(), c0.ppb.cfsr, c0.ppb.hfsr);
-    eprintln!("  secure={}, LR={:#010x}, SP={:#010x}",
-        c0.secure, c0.regs.lr(), c0.regs.sp());
-    eprintln!("  MSP={:#010x} MSP_NS={:#010x}",
-        c0.regs.msp, c0.regs.msp_ns);
+    eprintln!(
+        "  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
+        c0.regs.ipsr(),
+        c0.ppb.cfsr,
+        c0.ppb.hfsr
+    );
+    eprintln!(
+        "  secure={}, LR={:#010x}, SP={:#010x}",
+        c0.secure,
+        c0.regs.lr(),
+        c0.regs.sp()
+    );
+    eprintln!(
+        "  MSP={:#010x} MSP_NS={:#010x}",
+        c0.regs.msp, c0.regs.msp_ns
+    );
     eprintln!("  Max bootrom PC={:#010x}", max_pc);
 }
 
@@ -7241,13 +7693,13 @@ fn test_clocks_all_selected_registers_nonzero() {
             Re-enable after the follow-up PR that tightens CP7 \
             canary/count side-effects."]
 fn test_flash_boot_blinky() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../roms/rp2350");
-    let rom = std::fs::read(base.join("bootrom-combined.bin"))
-        .expect("bootrom not found");
-    let flash = std::fs::read(base.join("blinky.bin"))
-        .expect("blinky.bin not found — run: python3 roms/rp2350/gen_blinky.py roms/rp2350/blinky.bin");
+    let rom = std::fs::read(base.join("bootrom-combined.bin")).expect("bootrom not found");
+    let flash = std::fs::read(base.join("blinky.bin")).expect(
+        "blinky.bin not found — run: python3 roms/rp2350/gen_blinky.py roms/rp2350/blinky.bin",
+    );
 
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&rom);
@@ -7276,12 +7728,17 @@ fn test_flash_boot_blinky() {
         if pc == last_pc {
             stuck_count += 1;
             if stuck_count > 1000 {
-                eprintln!("Stuck at PC={:#010x} after {} cycles, GPIO_OUT={:#010x}",
-                    pc, cycle, emu.bus.sio.gpio_out);
+                eprintln!(
+                    "Stuck at PC={:#010x} after {} cycles, GPIO_OUT={:#010x}",
+                    pc, cycle, emu.bus.sio.gpio_out
+                );
                 let c0 = &emu.cores.expect_arm()[0];
-                eprintln!("  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
+                eprintln!(
+                    "  IPSR={}, CFSR={:#010x}, HFSR={:#010x}",
                     c0.regs.ipsr(),
-                    c0.ppb.cfsr, c0.ppb.hfsr);
+                    c0.ppb.cfsr,
+                    c0.ppb.hfsr
+                );
                 break;
             }
         } else {
@@ -7298,17 +7755,26 @@ fn test_flash_boot_blinky() {
     assert!(entered_flash, "Bootrom should have jumped to flash");
 
     // PC should be in the blinky's delay loop (0x100000B8-0x100000BA)
-    assert!(pc >= 0x1000_0060 && pc < 0x1000_0100,
-        "PC should be in blinky code region (PC={:#010x})", pc);
+    assert!(
+        pc >= 0x1000_0060 && pc < 0x1000_0100,
+        "PC should be in blinky code region (PC={:#010x})",
+        pc
+    );
 
     // The blinky toggles GPIO 25: first SET, then XOR in a loop.
     // At any snapshot the pin may be high or low — check it was EVER set.
-    assert!(gpio_out_ever & (1 << 25) != 0,
-        "GPIO 25 should have been set at some point (gpio_out_ever={:#010x})", gpio_out_ever);
+    assert!(
+        gpio_out_ever & (1 << 25) != 0,
+        "GPIO 25 should have been set at some point (gpio_out_ever={:#010x})",
+        gpio_out_ever
+    );
 
     // OE must be set (the blinky always enables output)
-    assert!(gpio_oe & (1 << 25) != 0,
-        "GPIO OE 25 should be set (gpio_oe={:#010x})", gpio_oe);
+    assert!(
+        gpio_oe & (1 << 25) != 0,
+        "GPIO OE 25 should be set (gpio_oe={:#010x})",
+        gpio_oe
+    );
 
     // Phase 4 Core 1 health gate: Core 1 should never enter handler mode
     assert_eq!(core1_max_ipsr, 0, "Core 1 should never enter handler mode");
@@ -7361,7 +7827,11 @@ fn fifo_empty_read_returns_zero_and_sets_roe() {
 
     // FIFO_ST should show ROE (bit 3) set for Core 0
     let st = bus.read32(FIFO_ST, 0);
-    assert!(st & 0x8 != 0, "ROE bit should be set after empty read, FIFO_ST={:#x}", st);
+    assert!(
+        st & 0x8 != 0,
+        "ROE bit should be set after empty read, FIFO_ST={:#x}",
+        st
+    );
 }
 
 #[test]
@@ -7376,7 +7846,11 @@ fn fifo_full_write_drops_data_and_sets_wof() {
 
     // Core 0's FIFO_ST should show WOF (bit 2) set
     let st = bus.read32(FIFO_ST, 0);
-    assert!(st & 0x4 != 0, "WOF bit should be set after overflow, FIFO_ST={:#x}", st);
+    assert!(
+        st & 0x4 != 0,
+        "WOF bit should be set after overflow, FIFO_ST={:#x}",
+        st
+    );
 
     // Core 1 should read the original 8 values, not the dropped 0xDEAD
     set_core1(&mut bus);
@@ -7402,7 +7876,11 @@ fn fifo_st_reflects_vld_and_rdy() {
 
     // Now Core 0's RX has data
     let st = bus.read32(FIFO_ST, 0);
-    assert_eq!(st & 0x1, 0x1, "VLD should be 1 after data written to our RX");
+    assert_eq!(
+        st & 0x1,
+        0x1,
+        "VLD should be 1 after data written to our RX"
+    );
 
     // Fill Core 1's RX from Core 0 (8 entries)
     for i in 0..8u32 {
@@ -7459,8 +7937,14 @@ fn fifo_write_sets_event_flag_on_receiver() {
 
     // Core 0 writes FIFO_WR -> should set event_flag[1] (receiver = Core 1)
     bus.write32(FIFO_WR, 0x42, 0);
-    assert!(bus.atomics.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after Core 0 FIFO write");
-    assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should NOT be set");
+    assert!(
+        bus.atomics.event_flag[1].load(Ordering::Relaxed),
+        "event_flag[1] should be set after Core 0 FIFO write"
+    );
+    assert!(
+        !bus.atomics.event_flag[0].load(Ordering::Relaxed),
+        "event_flag[0] should NOT be set"
+    );
 
     // Clear event flags
     bus.atomics.event_flag[0].store(false, Ordering::Relaxed);
@@ -7470,7 +7954,10 @@ fn fifo_write_sets_event_flag_on_receiver() {
     set_core1(&mut bus);
     bus.write32(FIFO_WR, 0x43, 1);
     set_core0(&mut bus);
-    assert!(bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after Core 1 FIFO write");
+    assert!(
+        bus.atomics.event_flag[0].load(Ordering::Relaxed),
+        "event_flag[0] should be set after Core 1 FIFO write"
+    );
 }
 
 #[test]
@@ -7486,7 +7973,10 @@ fn fifo_overflow_does_not_set_event_flag() {
 
     // Overflow write should NOT set event flag
     bus.write32(FIFO_WR, 0xDEAD, 0);
-    assert!(!bus.atomics.event_flag[1].load(Ordering::Relaxed), "event_flag should NOT be set on overflow write");
+    assert!(
+        !bus.atomics.event_flag[1].load(Ordering::Relaxed),
+        "event_flag should NOT be set on overflow write"
+    );
 }
 
 // ============================================================================
@@ -7502,7 +7992,11 @@ fn spinlock_claim_returns_bit_mask() {
 
     // SPINLOCK_ST should reflect the claimed lock
     let st = bus.read32(SPINLOCK_ST, 0);
-    assert_eq!(st & (1 << 5), 1 << 5, "SPINLOCK_ST should show lock 5 claimed");
+    assert_eq!(
+        st & (1 << 5),
+        1 << 5,
+        "SPINLOCK_ST should show lock 5 claimed"
+    );
 }
 
 #[test]
@@ -7526,7 +8020,11 @@ fn spinlock_release_via_write() {
 
     // Release via write (any value)
     bus.write32(spinlock_addr(7), 0, 0);
-    assert_eq!(bus.read32(SPINLOCK_ST, 0) & (1 << 7), 0, "Lock 7 should be released");
+    assert_eq!(
+        bus.read32(SPINLOCK_ST, 0) & (1 << 7),
+        0,
+        "Lock 7 should be released"
+    );
 
     // Re-claim should succeed
     let result = bus.read32(spinlock_addr(7), 0);
@@ -7543,7 +8041,10 @@ fn spinlock_contention_core0_claims_core1_sees_zero() {
     // Core 1 tries to claim same lock -> gets 0
     set_core1(&mut bus);
     let c1 = bus.read32(spinlock_addr(15), 1);
-    assert_eq!(c1, 0, "Core 1 should fail to claim lock already held by Core 0");
+    assert_eq!(
+        c1, 0,
+        "Core 1 should fail to claim lock already held by Core 0"
+    );
 
     // Core 1 can release it though (any write clears)
     bus.write32(spinlock_addr(15), 1, 1);
@@ -7563,14 +8064,22 @@ fn spinlock_st_bitmask_reflects_state() {
     bus.read32(spinlock_addr(31), 0);
 
     let st = bus.read32(SPINLOCK_ST, 0);
-    assert_eq!(st, (1 << 0) | (1 << 3) | (1 << 31),
-        "SPINLOCK_ST should reflect exactly the claimed locks, got {:#010x}", st);
+    assert_eq!(
+        st,
+        (1 << 0) | (1 << 3) | (1 << 31),
+        "SPINLOCK_ST should reflect exactly the claimed locks, got {:#010x}",
+        st
+    );
 
     // Release lock 3
     bus.write32(spinlock_addr(3), 0, 0);
     let st = bus.read32(SPINLOCK_ST, 0);
-    assert_eq!(st, (1 << 0) | (1 << 31),
-        "SPINLOCK_ST should reflect lock 3 released, got {:#010x}", st);
+    assert_eq!(
+        st,
+        (1 << 0) | (1 << 31),
+        "SPINLOCK_ST should reflect lock 3 released, got {:#010x}",
+        st
+    );
 }
 
 // ============================================================================
@@ -7583,8 +8092,14 @@ fn wfe_with_event_pending_consumes_and_continues() {
     bus.atomics.event_flag[0].store(true, Ordering::Relaxed);
     // WFE Thumb-16 encoding: 0xBF20 (hint op = 0x2, mask = 0)
     cpu.execute_one_with_bus(0xBF20, &mut bus);
-    assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag should be consumed");
-    assert!(!cpu.is_wfe_waiting(), "core should NOT be sleeping — event was pending");
+    assert!(
+        !bus.atomics.event_flag[0].load(Ordering::Relaxed),
+        "event_flag should be consumed"
+    );
+    assert!(
+        !cpu.is_wfe_waiting(),
+        "core should NOT be sleeping — event was pending"
+    );
 }
 
 #[test]
@@ -7592,7 +8107,10 @@ fn wfe_without_event_enters_sleep() {
     let (mut cpu, mut bus) = core_and_bus();
     assert!(!bus.atomics.event_flag[0].load(Ordering::Relaxed));
     cpu.execute_one_with_bus(0xBF20, &mut bus);
-    assert!(cpu.is_wfe_waiting(), "core should be sleeping — no event was pending");
+    assert!(
+        cpu.is_wfe_waiting(),
+        "core should be sleeping — no event was pending"
+    );
 }
 
 #[test]
@@ -7602,8 +8120,14 @@ fn sev_sets_both_event_flags() {
     assert!(!bus.atomics.event_flag[1].load(Ordering::Relaxed));
     // SEV Thumb-16 encoding: 0xBF40 (hint op = 0x4, mask = 0)
     cpu.execute_one_with_bus(0xBF40, &mut bus);
-    assert!(bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag[0] should be set after SEV");
-    assert!(bus.atomics.event_flag[1].load(Ordering::Relaxed), "event_flag[1] should be set after SEV");
+    assert!(
+        bus.atomics.event_flag[0].load(Ordering::Relaxed),
+        "event_flag[0] should be set after SEV"
+    );
+    assert!(
+        bus.atomics.event_flag[1].load(Ordering::Relaxed),
+        "event_flag[1] should be set after SEV"
+    );
 }
 
 #[test]
@@ -7615,7 +8139,8 @@ fn wake_check_clears_wfe_on_event() {
     rom[0..4].copy_from_slice(&0x2008_0000u32.to_le_bytes());
     rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
     // Infinite loop at 0x100
-    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    rom[0x100] = 0xFE;
+    rom[0x101] = 0xE7;
     emu.load_bootrom(&rom);
     emu.reset();
 
@@ -7625,8 +8150,14 @@ fn wake_check_clears_wfe_on_event() {
 
     emu.step().unwrap();
 
-    assert!(!emu.core_mut(0).is_wfe_waiting(), "core should have been woken by event_flag");
-    assert!(!emu.bus.atomics.event_flag[0].load(Ordering::Relaxed), "event_flag should have been consumed");
+    assert!(
+        !emu.core_mut(0).is_wfe_waiting(),
+        "core should have been woken by event_flag"
+    );
+    assert!(
+        !emu.bus.atomics.event_flag[0].load(Ordering::Relaxed),
+        "event_flag should have been consumed"
+    );
 }
 
 // ============================================================================
@@ -7635,11 +8166,11 @@ fn wake_check_clears_wfe_on_event() {
 
 #[test]
 fn test_core1_boot_reaches_wfe() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../roms/rp2350");
-    let rom = std::fs::read(base.join("bootrom-combined.bin"))
-        .expect("bootrom-combined.bin not found");
+    let rom =
+        std::fs::read(base.join("bootrom-combined.bin")).expect("bootrom-combined.bin not found");
 
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&rom);
@@ -7653,15 +8184,22 @@ fn test_core1_boot_reaches_wfe() {
         }
     }
 
-    assert!(emu.cores.expect_arm_mut()[1].is_wfe_waiting(),
+    assert!(
+        emu.cores.expect_arm_mut()[1].is_wfe_waiting(),
         "Core 1 should be sleeping in WFE after bootrom init (PC={:#010x})",
-        emu.cores.expect_arm_mut()[1].regs.pc());
-    assert_eq!(emu.cores.expect_arm_mut()[1].regs.ipsr(), 0,
+        emu.cores.expect_arm_mut()[1].regs.pc()
+    );
+    assert_eq!(
+        emu.cores.expect_arm_mut()[1].regs.ipsr(),
+        0,
         "Core 1 should not be in an exception handler (IPSR={})",
-        emu.cores.expect_arm_mut()[1].regs.ipsr());
-    assert!(emu.cores.expect_arm_mut()[1].regs.pc() < 0x8000,
+        emu.cores.expect_arm_mut()[1].regs.ipsr()
+    );
+    assert!(
+        emu.cores.expect_arm_mut()[1].regs.pc() < 0x8000,
         "Core 1 PC should be in bootrom range (PC={:#010x})",
-        emu.cores.expect_arm_mut()[1].regs.pc());
+        emu.cores.expect_arm_mut()[1].regs.pc()
+    );
 }
 
 // ============================================================================
@@ -7675,13 +8213,14 @@ fn test_core1_boot_reaches_wfe() {
             by CP7 canary/salt/count side-effect gaps rather than MPU \
             state. Re-enable after the CP7 tightening follow-up PR."]
 fn test_dualcore_launch() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../roms/rp2350");
-    let bootrom = std::fs::read(base.join("bootrom-combined.bin"))
-        .expect("bootrom-combined.bin not found");
-    let flash = std::fs::read(base.join("dualcore.bin"))
-        .expect("dualcore.bin not found — run: python roms/rp2350/gen_dualcore.py roms/rp2350/dualcore.bin");
+    let bootrom =
+        std::fs::read(base.join("bootrom-combined.bin")).expect("bootrom-combined.bin not found");
+    let flash = std::fs::read(base.join("dualcore.bin")).expect(
+        "dualcore.bin not found — run: python roms/rp2350/gen_dualcore.py roms/rp2350/dualcore.bin",
+    );
 
     let mut emu = Emulator::new(Config::default());
     emu.load_bootrom(&bootrom);
@@ -7698,17 +8237,28 @@ fn test_dualcore_launch() {
     }
 
     // Core 0 set GPIO 25
-    assert!(emu.bus.sio.gpio_out & (1 << 25) != 0,
-        "Core 0 should set GPIO 25 (gpio_out={:#010x})", emu.bus.sio.gpio_out);
+    assert!(
+        emu.bus.sio.gpio_out & (1 << 25) != 0,
+        "Core 0 should set GPIO 25 (gpio_out={:#010x})",
+        emu.bus.sio.gpio_out
+    );
     // Core 1 set GPIO 0
-    assert!(emu.bus.sio.gpio_out & 1 != 0,
-        "Core 1 should set GPIO 0 (gpio_out={:#010x})", emu.bus.sio.gpio_out);
+    assert!(
+        emu.bus.sio.gpio_out & 1 != 0,
+        "Core 1 should set GPIO 0 (gpio_out={:#010x})",
+        emu.bus.sio.gpio_out
+    );
     // Core 1 should be running app code (PC >= 0x10000000)
-    assert!(emu.cores.expect_arm_mut()[1].regs.pc() >= 0x1000_0000,
-        "Core 1 should be in flash, PC={:#010x}", emu.cores.expect_arm_mut()[1].regs.pc());
+    assert!(
+        emu.cores.expect_arm_mut()[1].regs.pc() >= 0x1000_0000,
+        "Core 1 should be in flash, PC={:#010x}",
+        emu.cores.expect_arm_mut()[1].regs.pc()
+    );
     // Core 1 should not be WFE-waiting
-    assert!(!emu.cores.expect_arm_mut()[1].is_wfe_waiting(),
-        "Core 1 should not be WFE-waiting");
+    assert!(
+        !emu.cores.expect_arm_mut()[1].is_wfe_waiting(),
+        "Core 1 should not be WFE-waiting"
+    );
 }
 
 // ============================================================================
@@ -7719,15 +8269,21 @@ fn test_dualcore_launch() {
 fn test_rosc_status_returns_stable_enabled() {
     let (_, mut bus) = core_and_bus();
     let status = bus.read32(0x400E_8018, 0);
-    assert_eq!(status, (1 << 31) | (1 << 12),
-        "ROSC STATUS should report STABLE | ENABLED");
+    assert_eq!(
+        status,
+        (1 << 31) | (1 << 12),
+        "ROSC STATUS should report STABLE | ENABLED"
+    );
 }
 
 #[test]
 fn test_config_default_uses_rosc_frequency() {
     use crate::Config;
-    assert_eq!(Config::default().sys_clk_hz, 6_500_000,
-        "Config::default() should use ROSC frequency (~6.5 MHz)");
+    assert_eq!(
+        Config::default().sys_clk_hz,
+        6_500_000,
+        "Config::default() should use ROSC frequency (~6.5 MHz)"
+    );
 }
 
 // ============================================================================
@@ -7745,10 +8301,16 @@ fn test_bus_new_is_post_bootrom_sys_clock() {
     // while Emulator::reset returned post-bootrom).
     use mdpicoem_common::clocks::{RP2350_SYS_CLK_HZ, XOSC_FREQ_HZ};
     let bus = Bus::new();
-    assert_eq!(bus.sys_clk_hz(), RP2350_SYS_CLK_HZ,
-        "fresh Bus must report post-bootrom clk_sys = 150 MHz");
-    assert_eq!(bus.ref_clk_hz(), XOSC_FREQ_HZ,
-        "fresh Bus must report post-bootrom clk_ref = 12 MHz (XOSC)");
+    assert_eq!(
+        bus.sys_clk_hz(),
+        RP2350_SYS_CLK_HZ,
+        "fresh Bus must report post-bootrom clk_sys = 150 MHz"
+    );
+    assert_eq!(
+        bus.ref_clk_hz(),
+        XOSC_FREQ_HZ,
+        "fresh Bus must report post-bootrom clk_ref = 12 MHz (XOSC)"
+    );
 }
 
 #[test]
@@ -7759,8 +8321,11 @@ fn test_xosc_via_clk_ref_sys_clock() {
     bus.write32(0x4001_0030, 0x0000_0002, 0);
     // CLK_SYS_CTRL SRC=0 (clk_ref)
     bus.write32(0x4001_003C, 0x0000_0000, 0);
-    assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ,
-        "CLK_SYS routed through CLK_REF=XOSC should give 12 MHz");
+    assert_eq!(
+        bus.sys_clk_hz(),
+        XOSC_FREQ_HZ,
+        "CLK_SYS routed through CLK_REF=XOSC should give 12 MHz"
+    );
     assert_eq!(bus.ref_clk_hz(), XOSC_FREQ_HZ);
 }
 
@@ -7773,8 +8338,11 @@ fn test_clk_sys_div_scales_output() {
     bus.write32(0x4001_003C, 0x0000_0000, 0);
     // CLK_SYS_DIV integer = 2 (bits [31:16])
     bus.write32(0x4001_0040, 0x0002_0000, 0);
-    assert_eq!(bus.sys_clk_hz(), XOSC_FREQ_HZ / 2,
-        "CLK_SYS_DIV=2 should halve the source frequency");
+    assert_eq!(
+        bus.sys_clk_hz(),
+        XOSC_FREQ_HZ / 2,
+        "CLK_SYS_DIV=2 should halve the source frequency"
+    );
 }
 
 #[test]
@@ -7785,8 +8353,11 @@ fn test_clocks_write_alias_set() {
     // SET alias (alias=2) at offset 0x030 → 0x4001_0000 | (2 << 12) | 0x030
     bus.write32(0x4001_2030, 0x0000_0002, 0);
     // Expect OR, not overwrite → 0x03
-    assert_eq!(bus.read32(0x4001_0030, 0), 0x0000_0003,
-        "SET alias should OR bits into CLK_REF_CTRL, not overwrite");
+    assert_eq!(
+        bus.read32(0x4001_0030, 0),
+        0x0000_0003,
+        "SET alias should OR bits into CLK_REF_CTRL, not overwrite"
+    );
 }
 
 // ============================================================================
@@ -7806,8 +8377,11 @@ fn test_pll_sys_at_150mhz() {
     bus.write32(0x4005_000C, (5 << 16) | (2 << 12), 0);
     // Switch CLK_SYS to aux=0 (PLL_SYS): SRC=1, AUXSRC=0
     bus.write32(0x4001_003C, 0x0000_0001, 0);
-    assert_eq!(bus.sys_clk_hz(), 150_000_000,
-        "PLL_SYS configured for 150 MHz should give sys_clk_hz = 150_000_000");
+    assert_eq!(
+        bus.sys_clk_hz(),
+        150_000_000,
+        "PLL_SYS configured for 150 MHz should give sys_clk_hz = 150_000_000"
+    );
 }
 
 #[test]
@@ -7816,8 +8390,11 @@ fn test_unconfigured_pll_zero_hz() {
     // Switching CLK_SYS to PLL_SYS without configuring should report 0 Hz.
     let (_, mut bus) = core_and_bus();
     bus.write32(0x4001_003C, 0x0000_0001, 0); // SRC=1 (aux), AUXSRC=0 (PLL_SYS)
-    assert_eq!(bus.sys_clk_hz(), 0,
-        "Unconfigured PLL (FBDIV=0) must honestly report 0 Hz, not a .max(1) fudge");
+    assert_eq!(
+        bus.sys_clk_hz(),
+        0,
+        "Unconfigured PLL (FBDIV=0) must honestly report 0 Hz, not a .max(1) fudge"
+    );
 }
 
 #[test]
@@ -7836,13 +8413,19 @@ fn test_pll_usb_separate_from_pll_sys() {
     // Configure PLL_USB to some non-trivial value (48 MHz: FBDIV=100,
     // POSTDIV1=5, POSTDIV2=5; VCO=1200M / 25 = 48M).
     bus.write32(0x4005_8000, 0x0000_0001, 0); // CS REFDIV=1
-    bus.write32(0x4005_8008, 100, 0);         // FBDIV_INT
+    bus.write32(0x4005_8008, 100, 0); // FBDIV_INT
     bus.write32(0x4005_800C, (5 << 16) | (5 << 12), 0);
-    assert_eq!(bus.sys_clk_hz(), before,
-        "PLL_USB changes must not affect sys_clk_hz while CLK_SYS is on ROSC");
+    assert_eq!(
+        bus.sys_clk_hz(),
+        before,
+        "PLL_USB changes must not affect sys_clk_hz while CLK_SYS is on ROSC"
+    );
     // Sanity: PLL_USB registers actually took the writes.
-    assert_eq!(bus.read32(0x4005_8008, 0), 100,
-        "PLL_USB FBDIV_INT should read back the value we wrote");
+    assert_eq!(
+        bus.read32(0x4005_8008, 0),
+        100,
+        "PLL_USB FBDIV_INT should read back the value we wrote"
+    );
 }
 
 #[test]
@@ -7853,22 +8436,32 @@ fn test_pll_fbdiv_max_no_overflow() {
     bus.write32(0x4005_0008, 0xFFF, 0); // FBDIV_INT = 4095 (max)
     bus.write32(0x4001_003C, 0x0000_0001, 0); // Route CLK_SYS → PLL_SYS
     let hz = bus.sys_clk_hz();
-    assert!(hz > 1_000_000_000 && hz < 1_010_000_000,
-        "FBDIV=4095 with defaults should produce ~1.003 GHz (got {hz})");
+    assert!(
+        hz > 1_000_000_000 && hz < 1_010_000_000,
+        "FBDIV=4095 with defaults should produce ~1.003 GHz (got {hz})"
+    );
 }
 
 #[test]
 fn test_pll_sys_reset_values() {
     // Reset values per LLD §4.3 — CS read forces LOCK bit (1<<31).
     let bus = Bus::new();
-    assert_eq!(bus.pll_sys_regs[0], 0x0000_0001,
-        "PLL_SYS CS reset = REFDIV=1");
-    assert_eq!(bus.pll_sys_regs[1], 0x0000_002D,
-        "PLL_SYS PWR reset = powered-down bits");
-    assert_eq!(bus.pll_sys_regs[2], 0,
-        "PLL_SYS FBDIV_INT reset = 0 (PLL off)");
-    assert_eq!(bus.pll_sys_regs[3], 0x0007_7000,
-        "PLL_SYS PRIM reset = POSTDIV1=7|POSTDIV2=7");
+    assert_eq!(
+        bus.pll_sys_regs[0], 0x0000_0001,
+        "PLL_SYS CS reset = REFDIV=1"
+    );
+    assert_eq!(
+        bus.pll_sys_regs[1], 0x0000_002D,
+        "PLL_SYS PWR reset = powered-down bits"
+    );
+    assert_eq!(
+        bus.pll_sys_regs[2], 0,
+        "PLL_SYS FBDIV_INT reset = 0 (PLL off)"
+    );
+    assert_eq!(
+        bus.pll_sys_regs[3], 0x0007_7000,
+        "PLL_SYS PRIM reset = POSTDIV1=7|POSTDIV2=7"
+    );
     // Same for PLL_USB — independent backing.
     assert_eq!(bus.pll_usb_regs, [0x0000_0001, 0x0000_002D, 0, 0x0007_7000]);
 }
@@ -7882,8 +8475,10 @@ fn test_pll_cs_read_forces_lock_bit() {
     // assertion was locking in the known bug (see tech_debt.md).
     let mut bus = Bus::new();
     let cs_read = bus.read32(0x4005_0000, 0);
-    assert_eq!(cs_read, 0x0000_0001,
-        "CS read at reset must NOT force LOCK — PLL is powered down, FBDIV=0");
+    assert_eq!(
+        cs_read, 0x0000_0001,
+        "CS read at reset must NOT force LOCK — PLL is powered down, FBDIV=0"
+    );
     assert_eq!(cs_read & (1 << 31), 0, "LOCK=0 at reset");
 }
 
@@ -7896,8 +8491,10 @@ fn test_pll_sys_write_set_alias_subword() {
     // should yield 0x6D (0x2D | 0x40).
     // Address: 0x4005_8004 + SET alias (2 << 12) = 0x4005_A004.
     bus.write8(0x4005_A004, 0x40, 0);
-    assert_eq!(bus.pll_usb_regs[1], 0x6D,
-        "byte-wide SET alias on PLL_USB PWR must OR, not overwrite");
+    assert_eq!(
+        bus.pll_usb_regs[1], 0x6D,
+        "byte-wide SET alias on PLL_USB PWR must OR, not overwrite"
+    );
 }
 
 // ============================================================================
@@ -7929,8 +8526,8 @@ fn test_pll_cs_lock_zero_before_arm() {
     // that arm must yield LOCK=0.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100, 0);    // FBDIV_INT = 100
-    bus.write32(0x4005_0004, 0, 0);      // PWR = 0 (fully powered up)
+    bus.write32(0x4005_0008, 100, 0); // FBDIV_INT = 100
+    bus.write32(0x4005_0004, 0, 0); // PWR = 0 (fully powered up)
     bus.master_cycle = 100;
     let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 before arm cycle");
@@ -7941,8 +8538,8 @@ fn test_pll_cs_lock_one_after_arm() {
     // Same sequence, but read after the arm expiry.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100, 0);    // FBDIV_INT = 100
-    bus.write32(0x4005_0004, 0, 0);      // PWR = 0
+    bus.write32(0x4005_0008, 100, 0); // FBDIV_INT = 100
+    bus.write32(0x4005_0004, 0, 0); // PWR = 0
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
     let cs = bus.read32(0x4005_0000, 0);
     assert_ne!(cs & (1 << 31), 0, "LOCK must be 1 past arm cycle");
@@ -7954,7 +8551,7 @@ fn test_pll_cs_lock_zero_with_pd_set() {
     let mut bus = Bus::new();
     bus.master_cycle = 0;
     bus.write32(0x4005_0008, 100, 0);
-    bus.write32(0x4005_0004, 0x01, 0);   // PWR = 0x01 (PD only)
+    bus.write32(0x4005_0004, 0x01, 0); // PWR = 0x01 (PD only)
     bus.master_cycle = 10_000;
     let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while PD=1");
@@ -7966,7 +8563,7 @@ fn test_pll_cs_lock_zero_with_vcopd_set() {
     let mut bus = Bus::new();
     bus.master_cycle = 0;
     bus.write32(0x4005_0008, 100, 0);
-    bus.write32(0x4005_0004, 0x20, 0);   // PWR = 0x20 (VCOPD only)
+    bus.write32(0x4005_0004, 0x20, 0); // PWR = 0x20 (VCOPD only)
     bus.master_cycle = 10_000;
     let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "LOCK must be 0 while VCOPD=1");
@@ -7977,7 +8574,7 @@ fn test_pll_cs_lock_zero_with_fbdiv_zero() {
     // PWR=0, FBDIV=0 — unconfigured PLL; predicate false.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0004, 0, 0);      // PWR = 0
+    bus.write32(0x4005_0004, 0, 0); // PWR = 0
     // FBDIV stays at reset value of 0.
     bus.master_cycle = 10_000;
     let cs = bus.read32(0x4005_0000, 0);
@@ -7993,14 +8590,18 @@ fn test_pll_cs_lock_rearm_after_powerdown() {
     let mut bus = Bus::new();
     bus.master_cycle = 0;
     bus.write32(0x4005_0008, 100, 0);
-    bus.write32(0x4005_0004, 0, 0);      // power up
+    bus.write32(0x4005_0004, 0, 0); // power up
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
     let cs1 = bus.read32(0x4005_0000, 0);
     assert_ne!(cs1 & (1 << 31), 0, "LOCK must be 1 after initial lock");
 
-    bus.write32(0x4005_0004, 0x21, 0);   // PD+VCOPD set → drop lock
+    bus.write32(0x4005_0004, 0x21, 0); // PD+VCOPD set → drop lock
     let cs2 = bus.read32(0x4005_0000, 0);
-    assert_eq!(cs2 & (1 << 31), 0, "LOCK must drop when power-down re-asserts");
+    assert_eq!(
+        cs2 & (1 << 31),
+        0,
+        "LOCK must drop when power-down re-asserts"
+    );
 }
 
 #[test]
@@ -8010,10 +8611,10 @@ fn test_pll_cs_bypass_does_not_force_lock() {
     // conservative "BYPASS doesn't assert LOCK" interpretation (HLD §2).
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0000, 0x101, 0);  // CS: REFDIV=1 | BYPASS=1
-    bus.write32(0x4005_0008, 100, 0);    // FBDIV = 100
-    bus.write32(0x4005_0004, 0, 0);      // PWR = 0
-    bus.master_cycle = 100;           // still well before arm
+    bus.write32(0x4005_0000, 0x101, 0); // CS: REFDIV=1 | BYPASS=1
+    bus.write32(0x4005_0008, 100, 0); // FBDIV = 100
+    bus.write32(0x4005_0004, 0, 0); // PWR = 0
+    bus.master_cycle = 100; // still well before arm
     let cs = bus.read32(0x4005_0000, 0);
     assert_eq!(cs & (1 << 31), 0, "BYPASS must not force LOCK=1");
 }
@@ -8024,7 +8625,7 @@ fn test_pll_cs_read_preserves_refdiv() {
     // REFDIV bits preserved in the read-back.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0000, 0x05, 0);   // REFDIV = 5
+    bus.write32(0x4005_0000, 0x05, 0); // REFDIV = 5
     bus.write32(0x4005_0008, 100, 0);
     bus.write32(0x4005_0004, 0, 0);
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
@@ -8040,21 +8641,28 @@ fn test_pll_cs_alias_writes_trigger_arm() {
     // CS SET (which leaves the PLL powered down).
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100, 0);    // FBDIV = 100 (predicate still
-                                      // false because PWR is still 0x2D)
-    assert_eq!(bus.pll_sys_lock_at_cycle, None,
-        "FBDIV write must not arm while PLL is powered down");
+    bus.write32(0x4005_0008, 100, 0); // FBDIV = 100 (predicate still
+    // false because PWR is still 0x2D)
+    assert_eq!(
+        bus.pll_sys_lock_at_cycle, None,
+        "FBDIV write must not arm while PLL is powered down"
+    );
 
     // SET alias on CS: OR 0x01 (no visible change — REFDIV already 1).
     bus.write32(0x4005_2000, 0x01, 0);
-    assert_eq!(bus.pll_sys_lock_at_cycle, None,
-        "CS SET alias must not arm while PLL is powered down");
+    assert_eq!(
+        bus.pll_sys_lock_at_cycle, None,
+        "CS SET alias must not arm while PLL is powered down"
+    );
 
     bus.master_cycle = 100;
     // CLR alias on PWR: clear all power-down bits.
     bus.write32(0x4005_3004, 0x2D, 0);
-    assert_eq!(bus.pll_sys_lock_at_cycle, Some(100 + PLL_LOCK_DELAY_SYSCLKS),
-        "PWR CLR alias must arm the lock at now + delay");
+    assert_eq!(
+        bus.pll_sys_lock_at_cycle,
+        Some(100 + PLL_LOCK_DELAY_SYSCLKS),
+        "PWR CLR alias must arm the lock at now + delay"
+    );
 }
 
 #[test]
@@ -8074,10 +8682,15 @@ fn test_pll_prim_write_does_not_rearm() {
 
     // Write PRIM to a different POSTDIV combination.
     bus.write32(0x4005_000C, (2u32 << 16) | (2u32 << 12), 0);
-    assert_eq!(bus.pll_sys_lock_at_cycle, armed_at,
-        "PRIM write must not rearm the lock-detect counter");
-    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
-        "LOCK must stay 1 after PRIM-only write");
+    assert_eq!(
+        bus.pll_sys_lock_at_cycle, armed_at,
+        "PRIM write must not rearm the lock-detect counter"
+    );
+    assert_ne!(
+        bus.read32(0x4005_0000, 0) & (1 << 31),
+        0,
+        "LOCK must stay 1 after PRIM-only write"
+    );
 }
 
 #[test]
@@ -8085,13 +8698,19 @@ fn test_pll_usb_independent_of_pll_sys() {
     // Arm PLL_SYS; PLL_USB should remain un-armed and read LOCK=0.
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100, 0);    // PLL_SYS FBDIV
-    bus.write32(0x4005_0004, 0, 0);      // PLL_SYS PWR = 0
+    bus.write32(0x4005_0008, 100, 0); // PLL_SYS FBDIV
+    bus.write32(0x4005_0004, 0, 0); // PLL_SYS PWR = 0
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
-        "PLL_SYS should report LOCK=1 past arm");
-    assert_eq!(bus.read32(0x4005_8000, 0) & (1 << 31), 0,
-        "PLL_USB must remain LOCK=0 (independent state)");
+    assert_ne!(
+        bus.read32(0x4005_0000, 0) & (1 << 31),
+        0,
+        "PLL_SYS should report LOCK=1 past arm"
+    );
+    assert_eq!(
+        bus.read32(0x4005_8000, 0) & (1 << 31),
+        0,
+        "PLL_USB must remain LOCK=0 (independent state)"
+    );
     assert_eq!(bus.pll_usb_lock_at_cycle, None);
 }
 
@@ -8104,26 +8723,35 @@ fn test_pll_cs_rearm_on_fbdiv_change_mid_run() {
     // kept LOCK latched here.)
     let mut bus = Bus::new();
     bus.master_cycle = 0;
-    bus.write32(0x4005_0008, 100, 0);    // FBDIV = 100
-    bus.write32(0x4005_0004, 0, 0);      // PWR = 0 → arm
+    bus.write32(0x4005_0008, 100, 0); // FBDIV = 100
+    bus.write32(0x4005_0004, 0, 0); // PWR = 0 → arm
     bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
-        "initial lock past first arm");
+    assert_ne!(
+        bus.read32(0x4005_0000, 0) & (1 << 31),
+        0,
+        "initial lock past first arm"
+    );
 
     let reconfig_at = PLL_LOCK_DELAY_SYSCLKS + 100;
     bus.master_cycle = reconfig_at;
-    bus.write32(0x4005_0008, 125, 0);    // change FBDIV while powered
+    bus.write32(0x4005_0008, 125, 0); // change FBDIV while powered
     assert_eq!(
         bus.pll_sys_lock_at_cycle,
         Some(reconfig_at + PLL_LOCK_DELAY_SYSCLKS),
         "FBDIV change must re-arm the lock-detect counter",
     );
-    assert_eq!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
-        "LOCK must drop to 0 between rearm and the new arm point");
+    assert_eq!(
+        bus.read32(0x4005_0000, 0) & (1 << 31),
+        0,
+        "LOCK must drop to 0 between rearm and the new arm point"
+    );
 
     bus.master_cycle = reconfig_at + PLL_LOCK_DELAY_SYSCLKS + 1;
-    assert_ne!(bus.read32(0x4005_0000, 0) & (1 << 31), 0,
-        "LOCK must re-assert past the new arm");
+    assert_ne!(
+        bus.read32(0x4005_0000, 0) & (1 << 31),
+        0,
+        "LOCK must re-assert past the new arm"
+    );
 }
 
 // ============================================================================
@@ -8135,8 +8763,11 @@ fn test_rosc_ctrl_roundtrip() {
     // Writing CTRL (0x000) should be stored and read back verbatim.
     let (_, mut bus) = core_and_bus();
     bus.write32(0x400E_8000, 0xDEAD_BEEF, 0);
-    assert_eq!(bus.read32(0x400E_8000, 0), 0xDEAD_BEEF,
-        "ROSC CTRL should round-trip writes (stored, reads return last write)");
+    assert_eq!(
+        bus.read32(0x400E_8000, 0),
+        0xDEAD_BEEF,
+        "ROSC CTRL should round-trip writes (stored, reads return last write)"
+    );
 }
 
 #[test]
@@ -8145,24 +8776,33 @@ fn test_rosc_status_unchanged_by_writes() {
     // return STABLE | ENABLED per the V1 stub behaviour.
     let (_, mut bus) = core_and_bus();
     bus.write32(0x400E_8018, 0, 0);
-    assert_eq!(bus.read32(0x400E_8018, 0), (1 << 31) | (1 << 12),
-        "ROSC STATUS must remain STABLE|ENABLED regardless of writes");
+    assert_eq!(
+        bus.read32(0x400E_8018, 0),
+        (1 << 31) | (1 << 12),
+        "ROSC STATUS must remain STABLE|ENABLED regardless of writes"
+    );
 }
 
 #[test]
 fn test_xosc_ctrl_roundtrip() {
     let (_, mut bus) = core_and_bus();
     bus.write32(0x4004_8000, 0xCAFE_BABE, 0);
-    assert_eq!(bus.read32(0x4004_8000, 0), 0xCAFE_BABE,
-        "XOSC CTRL should round-trip writes");
+    assert_eq!(
+        bus.read32(0x4004_8000, 0),
+        0xCAFE_BABE,
+        "XOSC CTRL should round-trip writes"
+    );
 }
 
 #[test]
 fn test_xosc_startup_roundtrip() {
     let (_, mut bus) = core_and_bus();
     bus.write32(0x4004_800C, 0x0000_00C4, 0);
-    assert_eq!(bus.read32(0x4004_800C, 0), 0x0000_00C4,
-        "XOSC STARTUP should round-trip writes");
+    assert_eq!(
+        bus.read32(0x4004_800C, 0),
+        0x0000_00C4,
+        "XOSC STARTUP should round-trip writes"
+    );
 }
 
 #[test]
@@ -8172,8 +8812,11 @@ fn test_rosc_ctrl_alias_set() {
     let (_, mut bus) = core_and_bus();
     bus.write32(0x400E_8000, 0x0000_0001, 0);
     bus.write32(0x400E_A000, 0x0000_0002, 0);
-    assert_eq!(bus.read32(0x400E_8000, 0), 0x0000_0003,
-        "SET alias on ROSC CTRL should OR bits, not overwrite");
+    assert_eq!(
+        bus.read32(0x400E_8000, 0),
+        0x0000_0003,
+        "SET alias on ROSC CTRL should OR bits, not overwrite"
+    );
 }
 
 // ============================================================================
@@ -8191,16 +8834,22 @@ fn test_config_sys_clk_hz_seeds_bus() {
         sys_clk_hz: 12_345_678,
         ..Default::default()
     });
-    assert_eq!(emu.bus.sys_clk_hz(), 12_345_678,
-        "Bus should expose Config::sys_clk_hz as the pre-recompute seed");
+    assert_eq!(
+        emu.bus.sys_clk_hz(),
+        12_345_678,
+        "Bus should expose Config::sys_clk_hz as the pre-recompute seed"
+    );
 
     // First write to a CLOCKS register triggers recompute, which
     // overwrites the seed with the register-derived value. Reset
     // register state routes CLK_SYS → clk_ref → ROSC.
     let mut emu = emu;
     emu.bus.write32(0x4001_003C, 0x0000_0000, 0); // CLK_SYS_CTRL SRC=0 (clk_ref)
-    assert_eq!(emu.bus.sys_clk_hz(), ROSC_FREQ_HZ,
-        "First CLOCKS write should replace the seed with the derived ROSC frequency");
+    assert_eq!(
+        emu.bus.sys_clk_hz(),
+        ROSC_FREQ_HZ,
+        "First CLOCKS write should replace the seed with the derived ROSC frequency"
+    );
 }
 
 // ============================================================================
@@ -8217,11 +8866,18 @@ fn systick_test_emulator() -> crate::Emulator {
     // with a NOP-equivalent `B .` loop so the core just keeps stepping.
     let mut rom = vec![0u8; 32 * 1024];
     // Initial SP
-    rom[0] = 0x00; rom[1] = 0x01; rom[2] = 0x00; rom[3] = 0x20;
+    rom[0] = 0x00;
+    rom[1] = 0x01;
+    rom[2] = 0x00;
+    rom[3] = 0x20;
     // Reset vector: 0x0000_0101 (thumb bit)
-    rom[4] = 0x01; rom[5] = 0x01; rom[6] = 0x00; rom[7] = 0x00;
+    rom[4] = 0x01;
+    rom[5] = 0x01;
+    rom[6] = 0x00;
+    rom[7] = 0x00;
     // At 0x100: B . (0xE7FE)
-    rom[0x100] = 0xFE; rom[0x101] = 0xE7;
+    rom[0x100] = 0xFE;
+    rom[0x101] = 0xE7;
     emu.load_bootrom(&rom);
     emu.reset();
     emu
@@ -8251,8 +8907,10 @@ fn test_dwt_cyccnt_wired_to_core_cycles() {
     let cyc2 = emu.core(0).cycles();
     emu.core_mut(0).ppb.update_latest_cycles(cyc2);
     let cyccnt = emu.core_mut(0).ppb.read_cyccnt(cyc2);
-    assert_eq!(cyccnt, delta,
-        "After zeroing CYCCNT, read must equal cycles elapsed since write");
+    assert_eq!(
+        cyccnt, delta,
+        "After zeroing CYCCNT, read must equal cycles elapsed since write"
+    );
 }
 
 #[test]
@@ -8262,7 +8920,9 @@ fn test_emulator_tick_systick_advances_per_core() {
     let mut emu = systick_test_emulator();
 
     // Enable SysTick on core 0: ENABLE + TICKINT + CLKSOURCE
-    emu.core_mut(0).ppb.write32(0xE000_E010, 1 | (1 << 1) | (1 << 2));
+    emu.core_mut(0)
+        .ppb
+        .write32(0xE000_E010, 1 | (1 << 1) | (1 << 2));
     // RVR = 1 (smallest non-zero period); CVR = 0 (will immediately underflow).
     // Set CVR via field because register writes always clear CVR.
     emu.core_mut(0).ppb.write32(0xE000_E014, 1);
@@ -8273,11 +8933,17 @@ fn test_emulator_tick_systick_advances_per_core() {
     emu.step().unwrap();
 
     // Multi-reload within the quantum should have set COUNTFLAG.
-    assert_ne!(emu.core_mut(0).ppb.syst_csr & (1 << 16), 0,
-        "SysTick must underflow during the quantum");
+    assert_ne!(
+        emu.core_mut(0).ppb.syst_csr & (1 << 16),
+        0,
+        "SysTick must underflow during the quantum"
+    );
     // TICKINT=1: ICSR.PENDSTSET must be set.
-    assert_ne!(emu.core_mut(0).ppb.icsr & (1 << 26), 0,
-        "TICKINT=1 + underflow must pend SysTick via ICSR.PENDSTSET");
+    assert_ne!(
+        emu.core_mut(0).ppb.icsr & (1 << 26),
+        0,
+        "TICKINT=1 + underflow must pend SysTick via ICSR.PENDSTSET"
+    );
 }
 
 #[test]
@@ -8292,10 +8958,16 @@ fn test_emulator_tick_systick_disabled_core_untouched() {
 
     emu.step().unwrap();
 
-    assert_eq!(emu.core_mut(1).ppb.syst_cvr, 77,
-        "Disabled SysTick must not tick at quantum end");
-    assert_eq!(emu.core_mut(1).ppb.syst_csr & (1 << 16), 0,
-        "Disabled SysTick must not set COUNTFLAG");
+    assert_eq!(
+        emu.core_mut(1).ppb.syst_cvr,
+        77,
+        "Disabled SysTick must not tick at quantum end"
+    );
+    assert_eq!(
+        emu.core_mut(1).ppb.syst_csr & (1 << 16),
+        0,
+        "Disabled SysTick must not set COUNTFLAG"
+    );
 }
 
 // ============================================================================
@@ -8356,8 +9028,10 @@ fn decode_cache_hit_miss_smoke() {
     core.regs.set_pc(pc);
     let tag_before = core.decode_cache[slot].tag;
     core.step(&mut bus);
-    assert_eq!(core.decode_cache[slot].tag, tag_before,
-        "second visit is a hit — tag unchanged");
+    assert_eq!(
+        core.decode_cache[slot].tag, tag_before,
+        "second visit is a hit — tag unchanged"
+    );
 }
 
 #[test]
@@ -8383,14 +9057,20 @@ fn decode_cache_invalidation_on_sram_write() {
     // Drain the queue into the core (mirrors `Emulator::step`).
     core.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
     bus.pending_cache_invalidations.clear();
-    assert_eq!(core.decode_cache[cache_slot(pc)].tag, u32::MAX,
-        "drained queue clears the slot");
+    assert_eq!(
+        core.decode_cache[cache_slot(pc)].tag,
+        u32::MAX,
+        "drained queue clears the slot"
+    );
 
     // Next fetch re-populates with the new bytes.
     core.regs.set_pc(pc);
     core.step(&mut bus);
-    assert_eq!(core.decode_cache[cache_slot(pc)].hw0, 0x1C40,
-        "re-populate picked up the new halfword");
+    assert_eq!(
+        core.decode_cache[cache_slot(pc)].hw0,
+        0x1C40,
+        "re-populate picked up the new halfword"
+    );
 }
 
 #[test]
@@ -8406,10 +9086,13 @@ fn decode_cache_invalidation_on_load_flash() {
     let mut emu = Emulator::new(Config::default());
 
     // Fake populated entries on BOTH cores directly in their caches.
-    let xip_pc = 0x1000_0002u32;   // slot 1
-    let sram_pc = 0x2000_0008u32;  // slot 4 — different slot
-    assert_ne!(cache_slot(xip_pc), cache_slot(sram_pc),
-        "test precondition: the two PCs must hash to distinct slots");
+    let xip_pc = 0x1000_0002u32; // slot 1
+    let sram_pc = 0x2000_0008u32; // slot 4 — different slot
+    assert_ne!(
+        cache_slot(xip_pc),
+        cache_slot(sram_pc),
+        "test precondition: the two PCs must hash to distinct slots"
+    );
 
     for core in emu.cores.expect_arm_mut().iter_mut() {
         core.decode_cache[cache_slot(xip_pc)] = crate::bus::DecodedOp {
@@ -8431,17 +9114,29 @@ fn decode_cache_invalidation_on_load_flash() {
     emu.load_flash(&[0x00; 256]);
 
     for (i, core) in emu.cores.expect_arm().iter().enumerate() {
-        assert_eq!(core.decode_cache[cache_slot(xip_pc)].tag, u32::MAX,
-            "core {}: XIP-region entry invalidated by load_flash", i);
+        assert_eq!(
+            core.decode_cache[cache_slot(xip_pc)].tag,
+            u32::MAX,
+            "core {}: XIP-region entry invalidated by load_flash",
+            i
+        );
         // Region-scoped drain: load_flash only sets the XIP bit, so
         // the SRAM-resident entry must survive untouched. This is the
         // perf-critical post-review behaviour — firmware that reloads
         // flash then runs SRAM code does not pay a cold-cache
         // repopulate tax on every instruction of the next quantum.
-        assert_eq!(core.decode_cache[cache_slot(sram_pc)].tag, sram_pc,
-            "core {}: SRAM-region slot preserved by XIP-only load_flash", i);
-        assert_eq!(core.decode_cache[cache_slot(sram_pc)].hw0, 0xBEEF,
-            "core {}: SRAM-region hw0 preserved by XIP-only load_flash", i);
+        assert_eq!(
+            core.decode_cache[cache_slot(sram_pc)].tag,
+            sram_pc,
+            "core {}: SRAM-region slot preserved by XIP-only load_flash",
+            i
+        );
+        assert_eq!(
+            core.decode_cache[cache_slot(sram_pc)].hw0,
+            0xBEEF,
+            "core {}: SRAM-region hw0 preserved by XIP-only load_flash",
+            i
+        );
     }
 }
 
@@ -8477,10 +9172,16 @@ fn decode_cache_wide_boundary_invalidation() {
     bus.write16(wide_pc + 2, 0xAAAA, 0);
     core.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
     bus.pending_cache_invalidations.clear();
-    assert_eq!(core.decode_cache[cache_slot(wide_pc)].tag, u32::MAX,
-        "write at hw1 boundary clears the wide slot at N");
-    assert_eq!(core.decode_cache[cache_slot(wide_pc + 2)].tag, u32::MAX,
-        "write to the slot itself also clears");
+    assert_eq!(
+        core.decode_cache[cache_slot(wide_pc)].tag,
+        u32::MAX,
+        "write at hw1 boundary clears the wide slot at N"
+    );
+    assert_eq!(
+        core.decode_cache[cache_slot(wide_pc + 2)].tag,
+        u32::MAX,
+        "write to the slot itself also clears"
+    );
 }
 
 #[test]
@@ -8493,8 +9194,11 @@ fn decode_cache_bank2_fetch_wait_preserved() {
     // Bank 2 address: (offset >> 2) & 7 == 2 means offset 8, 40, 72, ...
     let pc = 0x2000_0008u32;
     // Sanity-check the bank.
-    assert_eq!(crate::memory::bank_for_address(pc), Some(2),
-        "test precondition: PC must be in bank 2");
+    assert_eq!(
+        crate::memory::bank_for_address(pc),
+        Some(2),
+        "test precondition: PC must be in bank 2"
+    );
 
     place_hw_in_sram(&mut bus, pc, 0x0000); // LSLS R0,R0,#0 — pure, 1 cycle
 
@@ -8510,11 +9214,16 @@ fn decode_cache_bank2_fetch_wait_preserved() {
     core.step(&mut bus);
     let c2 = core.cycles() - cycles_mid;
 
-    assert_eq!(c1, c2,
-        "populate and hit must return identical cycle counts for bank-2 SRAM");
+    assert_eq!(
+        c1, c2,
+        "populate and hit must return identical cycle counts for bank-2 SRAM"
+    );
     assert!(c1 >= 2, "bank 2 fetch adds a wait state, so cycles >= 1+1");
-    assert_eq!(core.decode_cache[cache_slot(pc)].fetch_wait, 1,
-        "fetch_wait for bank 2 is 1");
+    assert_eq!(
+        core.decode_cache[cache_slot(pc)].fetch_wait,
+        1,
+        "fetch_wait for bank 2 is 1"
+    );
 }
 
 #[test]
@@ -8546,8 +9255,11 @@ fn decode_cache_pure_path_preserves_accumulator() {
     // the accumulator exactly as it was.
     core.regs.set_pc(pc);
     core.step(&mut bus);
-    assert_eq!(bus.extra_wait_states(), polluted,
-        "pure path must not touch bus.extra_wait_states");
+    assert_eq!(
+        bus.extra_wait_states(),
+        polluted,
+        "pure path must not touch bus.extra_wait_states"
+    );
 }
 
 #[test]
@@ -8565,17 +9277,27 @@ fn decode_cache_impure_ldr_still_works() {
 
     core.regs.set_pc(pc);
     core.step(&mut bus);
-    assert_eq!(core.reg(0), 0xDEAD_BEEF, "LDR literal loaded expected value");
+    assert_eq!(
+        core.reg(0),
+        0xDEAD_BEEF,
+        "LDR literal loaded expected value"
+    );
 
     // Cache entry must be classified impure (LDR literal hits the bus).
-    assert!(!core.decode_cache[cache_slot(pc)].is_pure(),
-        "LDR literal is impure");
+    assert!(
+        !core.decode_cache[cache_slot(pc)].is_pure(),
+        "LDR literal is impure"
+    );
 
     // A second execution at the same PC still works.
     core.regs.set_pc(pc);
     core.set_reg(0, 0);
     core.step(&mut bus);
-    assert_eq!(core.reg(0), 0xDEAD_BEEF, "hit on impure op re-executes correctly");
+    assert_eq!(
+        core.reg(0),
+        0xDEAD_BEEF,
+        "hit on impure op re-executes correctly"
+    );
 }
 
 #[test]
@@ -8587,7 +9309,8 @@ fn decode_cache_invalidate_all_clears_everything() {
 
     // Pre-populate a handful of slots across regions.
     for (i, pc) in [0x0000_0004u32, 0x1000_0008, 0x2000_0010, 0x2080_0020]
-        .iter().enumerate()
+        .iter()
+        .enumerate()
     {
         core.decode_cache[cache_slot(*pc)] = crate::bus::DecodedOp {
             tag: *pc,
@@ -8601,8 +9324,12 @@ fn decode_cache_invalidate_all_clears_everything() {
     core.invalidate_decode_cache_all();
 
     for pc in [0x0000_0004u32, 0x1000_0008, 0x2000_0010, 0x2080_0020] {
-        assert_eq!(core.decode_cache[cache_slot(pc)].tag, u32::MAX,
-            "invalidate_decode_cache_all cleared slot for PC={:08X}", pc);
+        assert_eq!(
+            core.decode_cache[cache_slot(pc)].tag,
+            u32::MAX,
+            "invalidate_decode_cache_all cleared slot for PC={:08X}",
+            pc
+        );
     }
 }
 
@@ -8618,42 +9345,44 @@ fn decode_cache_classify_is_pure_table() {
     // (name, hw0, hw1, is_wide, expected_is_pure)
     const CASES: &[(&str, u16, u16, bool, bool)] = &[
         // --- Pure Thumb-16 ----------------------------------------------
-        ("LSLS imm (00000)",           0x0000, 0x0000, false, true),
-        ("ADD/SUB reg/imm3 (00011)",   0x1800, 0x0000, false, true),
-        ("MOV imm8 (00100)",           0x2000, 0x0000, false, true),
-        ("CMP imm8 (00101)",           0x2800, 0x0000, false, true),
-        ("DP ADC/SBC (01000, b10=0)",  0x4000, 0x0000, false, true),
-        ("ADR (10100)",                0xA000, 0x0000, false, true),
-        ("ADD SP imm (10101)",         0xA800, 0x0000, false, true),
-        ("B uncond (11100)",           0xE000, 0x0000, false, true),
+        ("LSLS imm (00000)", 0x0000, 0x0000, false, true),
+        ("ADD/SUB reg/imm3 (00011)", 0x1800, 0x0000, false, true),
+        ("MOV imm8 (00100)", 0x2000, 0x0000, false, true),
+        ("CMP imm8 (00101)", 0x2800, 0x0000, false, true),
+        ("DP ADC/SBC (01000, b10=0)", 0x4000, 0x0000, false, true),
+        ("ADR (10100)", 0xA000, 0x0000, false, true),
+        ("ADD SP imm (10101)", 0xA800, 0x0000, false, true),
+        ("B uncond (11100)", 0xE000, 0x0000, false, true),
         // --- Impure Thumb-16 --------------------------------------------
         ("BX/BLX special (01000 b10=1)", 0x4400, 0x0000, false, false),
-        ("LDR literal (01001)",          0x4800, 0x0000, false, false),
-        ("LDR reg (01010)",              0x5800, 0x0000, false, false),
-        ("STR imm (01100)",              0x6000, 0x0000, false, false),
-        ("LDM (11001)",                  0xC800, 0x0000, false, false),
-        ("SVC (11011, cond=F)",          0xDF00, 0x0000, false, false),
-        ("PUSH (misc 0100)",             0xB400, 0x0000, false, false),
-        ("POP (misc 1100)",              0xBC00, 0x0000, false, false),
+        ("LDR literal (01001)", 0x4800, 0x0000, false, false),
+        ("LDR reg (01010)", 0x5800, 0x0000, false, false),
+        ("STR imm (01100)", 0x6000, 0x0000, false, false),
+        ("LDM (11001)", 0xC800, 0x0000, false, false),
+        ("SVC (11011, cond=F)", 0xDF00, 0x0000, false, false),
+        ("PUSH (misc 0100)", 0xB400, 0x0000, false, false),
+        ("POP (misc 1100)", 0xBC00, 0x0000, false, false),
         // --- Pure Thumb-32 ----------------------------------------------
-        ("dp_modified_imm",              0xF000, 0x0000, true,  true),
-        ("dp_shifted_reg",               0xEA00, 0x0000, true,  true),
-        ("multiply",                     0xFA00, 0x0000, true,  true),
-        ("BL (branch_misc)",             0xF000, 0xD000, true,  true),
-        ("DMB (barrier)",                0xF3BF, 0x8F50, true,  true),
+        ("dp_modified_imm", 0xF000, 0x0000, true, true),
+        ("dp_shifted_reg", 0xEA00, 0x0000, true, true),
+        ("multiply", 0xFA00, 0x0000, true, true),
+        ("BL (branch_misc)", 0xF000, 0xD000, true, true),
+        ("DMB (barrier)", 0xF3BF, 0x8F50, true, true),
         // --- Impure Thumb-32 --------------------------------------------
-        ("LDR.W (load_store_single)",    0xF850, 0x0000, true,  false),
-        ("STM.W (ldm_stm)",              0xE880, 0x0000, true,  false),
-        ("LDRD (load_store_dual)",       0xE850, 0x0000, true,  false),
-        ("VLDR (coprocessor/FPU)",       0xED50, 0x0000, true,  false),
-        ("MRC on CP7 RCP (coprocessor)", 0xEE70, 0x0000, true,  false),
+        ("LDR.W (load_store_single)", 0xF850, 0x0000, true, false),
+        ("STM.W (ldm_stm)", 0xE880, 0x0000, true, false),
+        ("LDRD (load_store_dual)", 0xE850, 0x0000, true, false),
+        ("VLDR (coprocessor/FPU)", 0xED50, 0x0000, true, false),
+        ("MRC on CP7 RCP (coprocessor)", 0xEE70, 0x0000, true, false),
     ];
 
     for &(name, hw0, hw1, is_wide, expected) in CASES {
         let got = classify_is_pure(hw0, hw1, is_wide);
-        assert_eq!(got, expected,
+        assert_eq!(
+            got, expected,
             "classify_is_pure({:04X}, {:04X}, wide={}) = {} for {}, expected {}",
-            hw0, hw1, is_wide, got, name, expected);
+            hw0, hw1, is_wide, got, name, expected
+        );
     }
 }
 
@@ -8666,12 +9395,16 @@ fn decode_cache_classify_is_pure_table() {
 /// OneROM full-system harness.
 #[test]
 fn gpio_external_stimulus_overlays_masked_bits() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let mut emu = Emulator::new(Config::default());
 
     // Bring PIO0 out of reset so its pad_out/pad_oe updates propagate.
-    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
+    emu.bus.write32(
+        0x4002_0000 | (3 << 12),
+        (1 << 15) | (1 << 16) | (1 << 17),
+        0,
+    );
 
     // Force PIO0 to drive bit 0 (unmasked) high. We poke pad_out / pad_oe
     // directly — we're only interested in what `update_gpio` composes.
@@ -8680,7 +9413,9 @@ fn gpio_external_stimulus_overlays_masked_bits() {
 
     // Harness claims bit 5 and bit 10 (drive HIGH) and bit 12 (drive LOW).
     emu.bus.gpio_external_mask = (1 << 5) | (1 << 10) | (1 << 12);
-    emu.bus.gpio_external_in.store((1 << 5) | (1 << 10), Ordering::Relaxed); // bit 12 low
+    emu.bus
+        .gpio_external_in
+        .store((1 << 5) | (1 << 10), Ordering::Relaxed); // bit 12 low
 
     // One step. Single-quantum is fine — `update_gpio` runs inside it.
     emu.run(1).unwrap();
@@ -8705,17 +9440,23 @@ fn gpio_external_stimulus_overlays_masked_bits() {
 /// `gpio_in` is whatever SIO + PIO produce.
 #[test]
 fn gpio_external_mask_zero_is_noop() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let mut emu = Emulator::new(Config::default());
-    emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
+    emu.bus.write32(
+        0x4002_0000 | (3 << 12),
+        (1 << 15) | (1 << 16) | (1 << 17),
+        0,
+    );
 
     emu.bus.pio[0].pad_oe = 0x0000_00FF;
     emu.bus.pio[0].pad_out = 0x0000_005A;
 
     // No external stimulus.
     emu.bus.gpio_external_mask = 0;
-    emu.bus.gpio_external_in.store(0xFFFF_FFFF, Ordering::Relaxed); // set but masked out
+    emu.bus
+        .gpio_external_in
+        .store(0xFFFF_FFFF, Ordering::Relaxed); // set but masked out
 
     emu.run(1).unwrap();
 
@@ -8747,7 +9488,8 @@ fn gpio_external_in_visible_first_cycle_after_write() {
     // instruction that runs in the first step.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // Place `LDR R0, [R1, #0]` at SRAM base. Thumb-16 encoding = 0x6808.
     emu.bus.memory.sram_write16(0, 0x6808);
@@ -8842,7 +9584,11 @@ fn trace_enabled_emits_write32_line() {
         lines,
     );
     let line = lines[0];
-    assert!(line.starts_with("TRACE W 4 0x20000200"), "line = {:?}", line);
+    assert!(
+        line.starts_with("TRACE W 4 0x20000200"),
+        "line = {:?}",
+        line
+    );
     assert!(line.contains("val=0xDEADBEEF"), "line = {:?}", line);
     assert!(line.contains("core=0"), "line = {:?}", line);
     assert!(line.contains("pc=0x10000100"), "line = {:?}", line);
@@ -8870,14 +9616,42 @@ fn trace_enabled_emits_all_six_access_methods() {
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 6, "expected 6 trace lines, got {:?}", lines);
-    assert!(lines[0].starts_with("TRACE W 1 0x20000100"), "{:?}", lines[0]);
-    assert!(lines[1].starts_with("TRACE W 2 0x20000102"), "{:?}", lines[1]);
-    assert!(lines[2].starts_with("TRACE W 4 0x20000104"), "{:?}", lines[2]);
-    assert!(lines[3].starts_with("TRACE R 1 0x20000100"), "{:?}", lines[3]);
-    assert!(lines[4].starts_with("TRACE R 2 0x20000102"), "{:?}", lines[4]);
-    assert!(lines[5].starts_with("TRACE R 4 0x20000104"), "{:?}", lines[5]);
+    assert!(
+        lines[0].starts_with("TRACE W 1 0x20000100"),
+        "{:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("TRACE W 2 0x20000102"),
+        "{:?}",
+        lines[1]
+    );
+    assert!(
+        lines[2].starts_with("TRACE W 4 0x20000104"),
+        "{:?}",
+        lines[2]
+    );
+    assert!(
+        lines[3].starts_with("TRACE R 1 0x20000100"),
+        "{:?}",
+        lines[3]
+    );
+    assert!(
+        lines[4].starts_with("TRACE R 2 0x20000102"),
+        "{:?}",
+        lines[4]
+    );
+    assert!(
+        lines[5].starts_with("TRACE R 4 0x20000104"),
+        "{:?}",
+        lines[5]
+    );
     for line in &lines {
-        assert!(line.contains("core=0") && line.contains("pc=0x10000100"), "{}", line);
+        assert!(
+            line.contains("core=0") && line.contains("pc=0x10000100"),
+            "{}",
+            line
+        );
     }
 }
 
@@ -8935,7 +9709,12 @@ fn trace_active_pc_is_per_core() {
     let captured = capture.0.lock().unwrap();
     let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3, "expected three trace lines, got {:?}", lines);
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected three trace lines, got {:?}",
+        lines
+    );
     assert!(
         lines[0].contains("core=0") && lines[0].contains("pc=0x00001000"),
         "line 0 = {:?}",
@@ -9146,8 +9925,10 @@ fn wfi_halts_when_no_pending_irq() {
     let pre_halted = core.is_halted();
     assert!(!pre_halted, "should not be halted before WFI");
     core.execute_one_with_bus(0xBF30, &mut bus);
-    assert!(core.is_halted(),
-        "WFI with no pending IRQ should halt the core");
+    assert!(
+        core.is_halted(),
+        "WFI with no pending IRQ should halt the core"
+    );
 }
 
 #[test]
@@ -9159,8 +9940,10 @@ fn wfi_nop_when_enabled_pending_irq() {
     bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     // WFI: 0xBF30
     core.execute_one_with_bus(0xBF30, &mut bus);
-    assert!(!core.is_halted(),
-        "WFI with enabled pending IRQ should NOT halt (acts as NOP)");
+    assert!(
+        !core.is_halted(),
+        "WFI with enabled pending IRQ should NOT halt (acts as NOP)"
+    );
 }
 
 #[test]
@@ -9171,8 +9954,10 @@ fn wfi_halts_when_pending_but_disabled_irq() {
     core.ppb.nvic_iser[0].store(0, Ordering::Relaxed);
     // WFI: 0xBF30
     core.execute_one_with_bus(0xBF30, &mut bus);
-    assert!(core.is_halted(),
-        "WFI with pending but disabled IRQ should halt");
+    assert!(
+        core.is_halted(),
+        "WFI with pending but disabled IRQ should halt"
+    );
 }
 
 #[test]
@@ -9187,8 +9972,10 @@ fn wfi_wake_on_irq_assert() {
     emu.bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     // Wake check should clear halted
     emu.wake_checks();
-    assert!(!emu.core_mut(0).is_halted(),
-        "wake_checks should wake WFI-halted core with enabled pending IRQ");
+    assert!(
+        !emu.core_mut(0).is_halted(),
+        "wake_checks should wake WFI-halted core with enabled pending IRQ"
+    );
 }
 
 #[test]
@@ -9200,8 +9987,10 @@ fn wfi_stays_halted_without_enabled_irq() {
     emu.bus.atomics.irq_pending[0].store(1, Ordering::Relaxed);
     emu.core_mut(0).ppb.nvic_iser[0].store(0, Ordering::Relaxed);
     emu.wake_checks();
-    assert!(emu.core_mut(0).is_halted(),
-        "wake_checks should NOT wake WFI-halted core without enabled IRQ");
+    assert!(
+        emu.core_mut(0).is_halted(),
+        "wake_checks should NOT wake WFI-halted core without enabled IRQ"
+    );
 }
 
 #[test]
@@ -9213,11 +10002,15 @@ fn debug_step_clears_halted() {
     // NOP instruction
     emu.bus.memory.sram_write16(0, 0xBF00);
     {
-        let Cores::Arm(arm) = &mut emu.cores else { unreachable!() };
+        let Cores::Arm(arm) = &mut emu.cores else {
+            unreachable!()
+        };
         arm[0].debug_step(&mut emu.bus);
     }
-    assert!(!emu.core_mut(0).is_halted(),
-        "debug_step should clear halted before stepping");
+    assert!(
+        !emu.core_mut(0).is_halted(),
+        "debug_step should clear halted before stepping"
+    );
 }
 
 // ============================================================================
@@ -9247,24 +10040,32 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
 
     // Main at 0x100: SUB SP, SP, #0x80 (Thumb-16 encoding: 0xB0A0)
     // Encoding: 1011 0000 1_0100000 = 0xB0A0 (subtract 0x80 = 128 bytes from SP)
-    rom[0x100] = 0xA0; rom[0x101] = 0xB0; // SUB SP, #0x80
+    rom[0x100] = 0xA0;
+    rom[0x101] = 0xB0; // SUB SP, #0x80
     // 0x102: B . (infinite loop — PendSV will preempt here)
-    rom[0x102] = 0xFE; rom[0x103] = 0xE7;
+    rom[0x102] = 0xFE;
+    rom[0x103] = 0xE7;
 
     // PendSV handler at 0x200: B . (infinite loop so we can inspect state)
-    rom[0x200] = 0xFE; rom[0x201] = 0xE7;
+    rom[0x200] = 0xFE;
+    rom[0x201] = 0xE7;
 
     emu.load_bootrom(&rom);
     emu.reset();
 
     // Run a few steps so the core reaches 0x100 and executes the SUB SP.
-    for _ in 0..5 { core0_step(&mut emu); }
+    for _ in 0..5 {
+        core0_step(&mut emu);
+    }
 
     // After reset, SP starts at 0x2008_0000. After SUB SP, #0x80, r[13]
     // should be 0x2007_FF80. Confirm the SUB executed.
     let sp_after_sub = emu.cores.expect_arm_mut()[0].regs.r[13];
-    assert_eq!(sp_after_sub, 0x2007_FF80,
-        "SP after SUB SP, #0x80 should be 0x2007_FF80, got {:#010x}", sp_after_sub);
+    assert_eq!(
+        sp_after_sub, 0x2007_FF80,
+        "SP after SUB SP, #0x80 should be 0x2007_FF80, got {:#010x}",
+        sp_after_sub
+    );
 
     // The banked MSP may be stale (still 0x2008_0000) because set_sp()
     // only writes r[13]. This is the bug we're testing.
@@ -9275,8 +10076,11 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
     emu.core_mut(0).ppb.icsr |= ICSR_PENDSVSET_BIT;
     core0_step(&mut emu);
 
-    assert_eq!(emu.cores.expect_arm_mut()[0].regs.ipsr(), 14,
-        "should be in PendSV handler after step");
+    assert_eq!(
+        emu.cores.expect_arm_mut()[0].regs.ipsr(),
+        14,
+        "should be in PendSV handler after step"
+    );
 
     // The exception frame should have been pushed at the post-SUB SP value
     // (0x2007_FF80), 8-byte aligned, minus 32 bytes for the basic frame.
@@ -9286,23 +10090,30 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
     // The stacked return address (at frame_sp + 24) should point to the
     // instruction after SUB SP — i.e. the B . at 0x102.
     let stacked_return_addr = emu.bus.read32(expected_frame_sp.wrapping_add(24), 0);
-    assert_eq!(stacked_return_addr, 0x0000_0102,
+    assert_eq!(
+        stacked_return_addr, 0x0000_0102,
         "stacked return address should be 0x102 (the B . after SUB SP), got {:#010x}",
-        stacked_return_addr);
+        stacked_return_addr
+    );
 
     // The MSP (banked) should now be the frame SP after entry wrote it back.
     let core0_msp = emu.cores.expect_arm()[0].regs.msp;
-    assert_eq!(core0_msp, expected_frame_sp,
+    assert_eq!(
+        core0_msp, expected_frame_sp,
         "banked MSP after exception entry should be frame_sp={:#010x}, got {:#010x}",
-        expected_frame_sp, core0_msp);
+        expected_frame_sp, core0_msp
+    );
 
     // Also verify stacked R0 is readable at the frame base (sanity check
     // that the frame landed at the right address, not at the stale SP).
     let stacked_xpsr = emu.bus.read32(expected_frame_sp.wrapping_add(28), 0);
     // xPSR bit 9 should be 0 (no alignment padding needed since SP was
     // already 8-byte aligned).
-    assert_eq!(stacked_xpsr & (1 << 9), 0,
-        "no alignment padding expected (SP was 8-aligned)");
+    assert_eq!(
+        stacked_xpsr & (1 << 9),
+        0,
+        "no alignment padding expected (SP was 8-aligned)"
+    );
 }
 
 // ============================================================================
@@ -9325,7 +10136,7 @@ fn test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp() {
 /// lanes of the 32-bit register, matching RP2350 silicon.
 #[test]
 fn sio_gpio_out_byte_write_replicates_across_lanes() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let mut emu = Emulator::new(Config::default());
 
@@ -9364,7 +10175,7 @@ fn sio_gpio_out_byte_write_replicates_across_lanes() {
 /// across both halves of the 32-bit register.
 #[test]
 fn sio_gpio_out_halfword_write_replicates() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let mut emu = Emulator::new(Config::default());
 
@@ -9389,8 +10200,11 @@ fn sio_gpio_oe_byte_write_replicates_across_lanes() {
     let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
     emu.bus.write8(0xD000_0030, 0xFF, 0);
     let word = emu.bus.read32(0xD000_0030, 0);
-    assert_eq!(word, 0xFFFF_FFFF,
-        "STRB to SIO_GPIO_OE must replicate byte across all four lanes; got {:#010x}", word);
+    assert_eq!(
+        word, 0xFFFF_FFFF,
+        "STRB to SIO_GPIO_OE must replicate byte across all four lanes; got {:#010x}",
+        word
+    );
 }
 
 /// Replication must be GPIO_OUT-family-specific, not blanket across
@@ -9398,7 +10212,7 @@ fn sio_gpio_oe_byte_write_replicates_across_lanes() {
 /// MTIMEL at offset 0x1B0) must still behave as byte-lane RMW.
 #[test]
 fn sio_non_gpio_out_byte_write_still_rmw() {
-    use crate::{Emulator, Config};
+    use crate::{Config, Emulator};
 
     let mut emu = Emulator::new(Config::default());
 
@@ -9424,7 +10238,10 @@ fn sio_non_gpio_out_byte_write_still_rmw() {
 #[test]
 fn mtime_stays_zero_at_post_reset_matches_silicon() {
     use crate::{Config, EmulatorBuilder};
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .unwrap();
     emu.core_mut(0).halt();
     emu.core_mut(1).halt();
     // Post-reset MTIME_CTRL is 0x0D (EN + DBGPAUSE_CORE0 + DBGPAUSE_CORE1,
@@ -9433,9 +10250,11 @@ fn mtime_stays_zero_at_post_reset_matches_silicon() {
     emu.mmio_write32(0xD000_01A4, 0x01);
     emu.run(200).unwrap();
     let mtime_lo = emu.mmio_read32(0xD000_01B0);
-    assert_eq!(mtime_lo, 0,
+    assert_eq!(
+        mtime_lo, 0,
         "MTIME must not advance without TICKS.RISCV configuration \
-         (silicon reads 0 at this scenario gate)");
+         (silicon reads 0 at this scenario gate)"
+    );
 }
 
 // ============================================================================
@@ -9467,21 +10286,33 @@ fn sysinfo_reads_hardcoded_readonly_fields() {
     // CHIP_ID: live RP2354 silicon value (V12 Stage 3, probe
     // E46410955F614129). PART=0x0004 (RP2354) occupies bits [14:12]
     // → 0x4 << 12 = 0x4000; MAN=0x927 (Raspberry Pi); REV=0 (masked).
-    assert_eq!(bus.read32(0x4000_0000, 0), 0x0000_4927,
+    assert_eq!(
+        bus.read32(0x4000_0000, 0),
+        0x0000_4927,
         "SYSINFO.CHIP_ID: expected PART<<12 | MAN = 0x4000 | 0x927 \
-         (REV nibble masked by silicon scenario)");
+         (REV nibble masked by silicon scenario)"
+    );
     // PACKAGE_SEL: 0 = RP2350A QFN60 (Pico 2 baseline).
-    assert_eq!(bus.read32(0x4000_0004, 0), 0x0000_0000,
-        "SYSINFO.PACKAGE_SEL: RP2350A");
+    assert_eq!(
+        bus.read32(0x4000_0004, 0),
+        0x0000_0000,
+        "SYSINFO.PACKAGE_SEL: RP2350A"
+    );
     // PLATFORM: live RP2354 silicon reads 0 (V12 Stage 3, probe
     // E46410955F614129).
-    assert_eq!(bus.read32(0x4000_0008, 0), 0x0000_0000,
-        "SYSINFO.PLATFORM: silicon-measured value");
+    assert_eq!(
+        bus.read32(0x4000_0008, 0),
+        0x0000_0000,
+        "SYSINFO.PLATFORM: silicon-measured value"
+    );
     // GITREF_RP2350: chip-revision-specific 32-bit constant. Emulator
     // exposes 0 as a placeholder; Stage 5 silicon pre-flight records the
     // true value and re-adds the silicon-scenario observe entry.
-    assert_eq!(bus.read32(0x4000_0014, 0), 0x0000_0000,
-        "SYSINFO.GITREF_RP2350: placeholder (silicon pre-flight pending)");
+    assert_eq!(
+        bus.read32(0x4000_0014, 0),
+        0x0000_0000,
+        "SYSINFO.GITREF_RP2350: placeholder (silicon pre-flight pending)"
+    );
 }
 
 // ============================================================================
@@ -9548,9 +10379,8 @@ fn tbman_platform_reads_silicon_value() {
 #[test]
 fn glitch_detector_arm_readback_tracks_ctrl() {
     use crate::peripherals::inert::{
-        GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_RESET,
-        GLITCH_DETECTOR_ARM_VALUE_NO, GLITCH_DETECTOR_ARM_VALUE_YES,
-        GLITCH_DETECTOR_BASE, GLITCH_DETECTOR_TRIG_STATUS_OFFSET,
+        GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_RESET, GLITCH_DETECTOR_ARM_VALUE_NO,
+        GLITCH_DETECTOR_ARM_VALUE_YES, GLITCH_DETECTOR_BASE, GLITCH_DETECTOR_TRIG_STATUS_OFFSET,
     };
 
     let (_, mut bus) = core_and_bus();
@@ -9609,8 +10439,8 @@ fn glitch_detector_arm_readback_tracks_ctrl() {
 #[test]
 fn glitch_detector_arm_resets_to_arm_value_no_on_warm_reset() {
     use crate::peripherals::inert::{
-        GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_RESET,
-        GLITCH_DETECTOR_ARM_VALUE_YES, GLITCH_DETECTOR_BASE,
+        GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_RESET, GLITCH_DETECTOR_ARM_VALUE_YES,
+        GLITCH_DETECTOR_BASE,
     };
 
     let mut emu = Emulator::new(Config::default());
@@ -9668,8 +10498,7 @@ fn glitch_detector_arm_resets_to_arm_value_no_on_warm_reset() {
 #[test]
 fn powman_count_advances_at_expected_rate() {
     use crate::peripherals::powman::{
-        POWMAN_BASE, POWMAN_SYS_PER_TICK, READ_TIME_LOWER_OFFSET, TIMER_OFFSET,
-        TIMER_RUN_BIT,
+        POWMAN_BASE, POWMAN_SYS_PER_TICK, READ_TIME_LOWER_OFFSET, TIMER_OFFSET, TIMER_RUN_BIT,
     };
 
     let mut emu = Emulator::new(Config::default());
@@ -9724,7 +10553,8 @@ fn powman_match_pends_nvic_line_45() {
     );
 
     // Enable NVIC line 45 (bank 1, bit 13). NVIC_ISER1 = 0xE000_E104.
-    emu.bus.write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32), 0);
+    emu.bus
+        .write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32), 0);
 
     // Tick enough sys_clks to cross MATCH=100.
     let n = 100 * POWMAN_SYS_PER_TICK as u32 + 50;
@@ -9806,7 +10636,8 @@ fn powman_match_enters_emulator_handler() {
         0x5AFE_0000 | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
         0,
     );
-    emu.bus.write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32), 0);
+    emu.bus
+        .write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32), 0);
 
     // Run long enough for alarm to fire and IRQ to dispatch. 100 ticks
     // of POWMAN plus margin for exception-entry cycles.
@@ -9829,7 +10660,8 @@ fn powman_match_enters_emulator_handler() {
     // "the main loop happened to branch here" as an escape hatch.
     let ipsr = emu.core(0).regs.xpsr & 0x1FF;
     assert_eq!(
-        ipsr, 16 + 45,
+        ipsr,
+        16 + 45,
         "core 0 IPSR must equal 16 + IRQ 45 = 61; got {}",
         ipsr
     );
@@ -9842,9 +10674,8 @@ fn powman_state_resets_on_emulator_reset() {
     // return to post-power-on zero. Mirrors the Stage 3
     // `glitch_detector_arm_restored_on_warm_reset` pattern.
     use crate::peripherals::powman::{
-        ALARM_TIME_15TO0_OFFSET, POWMAN_BASE, READ_TIME_LOWER_OFFSET,
-        SET_TIME_15TO0_OFFSET, SET_TIME_31TO16_OFFSET, TIMER_OFFSET,
-        TIMER_ALARM_ENAB_BIT, TIMER_RUN_BIT,
+        ALARM_TIME_15TO0_OFFSET, POWMAN_BASE, READ_TIME_LOWER_OFFSET, SET_TIME_15TO0_OFFSET,
+        SET_TIME_31TO16_OFFSET, TIMER_ALARM_ENAB_BIT, TIMER_OFFSET, TIMER_RUN_BIT,
     };
 
     let mut emu = Emulator::new(Config::default());
@@ -9879,8 +10710,7 @@ fn powman_state_resets_on_emulator_reset() {
         "precondition: ALARM_TIME_15TO0 round-trips"
     );
     assert_eq!(
-        emu.bus.read32(POWMAN_BASE + TIMER_OFFSET, 0)
-            & (TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT),
+        emu.bus.read32(POWMAN_BASE + TIMER_OFFSET, 0) & (TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT),
         TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
         "precondition: TIMER carries RUN|ALARM_ENAB"
     );
@@ -10298,7 +11128,11 @@ mod stage1_execute_coverage {
         cpu.set_reg(0, 0xFFFF_FFF9);
         // BLX R0: 0x4780
         cpu.execute_one_with_bus(0x4780, &mut bus);
-        assert_eq!(cpu.regs.ipsr(), 0, "BLX with EXC_RETURN magic hit exit path");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            0,
+            "BLX with EXC_RETURN magic hit exit path"
+        );
     }
 
     // line 406: BX target is EXC_RETURN magic — exit_exception via BX.
@@ -10344,7 +11178,7 @@ mod stage1_execute_coverage {
         let (mut c, mut bus) = core_and_bus();
         c.set_reg(0, 0xAABB_CCDD);
         c.set_reg(1, 0xD000_0000); // SIO base
-        c.set_reg(2, 0x10);        // GPIO_OUT offset
+        c.set_reg(2, 0x10); // GPIO_OUT offset
         // STR R0, [R1, R2]: 0101_000_010_001_000 = 0x5088
         let cy = c.execute_one_with_bus(0x5088, &mut bus);
         assert_eq!(cy, 1, "SIO store is single-cycle");
@@ -10591,7 +11425,11 @@ mod stage1_execute_coverage {
         bus.write32(sp, 0xFFFF_FFF9, 0); // the PC slot for POP {PC}
         // POP {PC}: 1011_1101_00000000 = 0xBD00
         cpu.execute_one_with_bus(0xBD00, &mut bus);
-        assert_eq!(cpu.regs.ipsr(), 0, "EXC_RETURN via POP unstacks to thread mode");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            0,
+            "EXC_RETURN via POP unstacks to thread mode"
+        );
     }
 
     // line 719 else arm: POP without PC → cost = 1 + count (no +3).
@@ -10719,7 +11557,11 @@ mod stage1_execute_coverage {
         c.regs.set_flag_z(true); // Z=1 means LE → GT is false
         // BGT +6: cond=1100, imm8=3 → 1101_1100_00000011 = 0xDC03
         let cy = c.execute_one(0xDC03);
-        assert_eq!(c.regs.pc(), 0x1002, "branch not taken — PC stays at post-execute value");
+        assert_eq!(
+            c.regs.pc(),
+            0x1002,
+            "branch not taken — PC stays at post-execute value"
+        );
         assert_eq!(cy, 1);
     }
 
@@ -10840,7 +11682,11 @@ mod stage1_execute_coverage {
         c.set_reg(1, 0x1234_5678);
         // 10111010_10_001_000 = 0xBA88 — REV dispatch bits[7:6] = 0b10 → undefined arm.
         c.execute_one(0xBA88);
-        assert_eq!(c.reg(0), 0xDEAD_BEEF, "Rd unchanged on reserved REV dispatch");
+        assert_eq!(
+            c.reg(0),
+            0xDEAD_BEEF,
+            "Rd unchanged on reserved REV dispatch"
+        );
     }
 
     // ---- Sign/zero-extend dispatch (SXTB, UXTH) — pin remaining sub-arms ----
@@ -11400,9 +12246,9 @@ mod stage1_decode_coverage {
         let (mut c, mut bus) = core_and_bus();
         let base = 0x2000_0100u32;
         // IT EQ; NOP
-        bus.write16(base, 0xBF08, 0);       // IT EQ
-        bus.write16(base + 2, 0xBF00, 0);   // NOP (in IT)
-        bus.write16(base + 4, 0xE7FE, 0);   // B . (halt)
+        bus.write16(base, 0xBF08, 0); // IT EQ
+        bus.write16(base + 2, 0xBF00, 0); // NOP (in IT)
+        bus.write16(base + 4, 0xE7FE, 0); // B . (halt)
         c.regs.set_pc(base);
         c.regs.set_flag_z(true); // EQ true so NOP executes
         c.step(&mut bus); // IT
@@ -11419,8 +12265,8 @@ mod stage1_decode_coverage {
         let (mut c, mut bus) = core_and_bus();
         let base = 0x2000_0200u32;
         // IT EQ; CMP R0, #0 (flag-only, 0x2800)
-        bus.write16(base, 0xBF08, 0);       // IT EQ
-        bus.write16(base + 2, 0x2800, 0);   // CMP R0, #0 — flag-only
+        bus.write16(base, 0xBF08, 0); // IT EQ
+        bus.write16(base + 2, 0x2800, 0); // CMP R0, #0 — flag-only
         bus.write16(base + 4, 0xE7FE, 0);
         c.regs.set_pc(base);
         c.regs.set_flag_z(true);
@@ -11458,9 +12304,9 @@ mod stage1_decode_coverage {
         let (mut c, mut bus) = core_and_bus();
         let base = 0x2000_0400u32;
         // IT EQ; BL +0 (wide, pure, inside IT).
-        bus.write16(base, 0xBF08, 0);        // IT EQ
-        bus.write16(base + 2, 0xF000, 0);    // BL hw0
-        bus.write16(base + 4, 0xF800, 0);    // BL hw1 (-> base+6)
+        bus.write16(base, 0xBF08, 0); // IT EQ
+        bus.write16(base + 2, 0xF000, 0); // BL hw0
+        bus.write16(base + 4, 0xF800, 0); // BL hw1 (-> base+6)
         bus.write16(base + 6, 0xE7FE, 0);
         c.regs.set_pc(base);
         c.regs.set_flag_z(true);
@@ -11478,8 +12324,8 @@ mod stage1_decode_coverage {
     fn decode_execute_narrow_condition_false() {
         let (mut c, mut bus) = core_and_bus();
         let base = 0x2000_0500u32;
-        bus.write16(base, 0xBF08, 0);       // IT EQ
-        bus.write16(base + 2, 0x202A, 0);   // MOVS R0, #42
+        bus.write16(base, 0xBF08, 0); // IT EQ
+        bus.write16(base + 2, 0x202A, 0); // MOVS R0, #42
         bus.write16(base + 4, 0xE7FE, 0);
         c.regs.set_pc(base);
         c.regs.set_flag_z(false); // EQ false → skip
@@ -11660,8 +12506,8 @@ mod stage1_decode_coverage {
     // state (is_wide / is_pure / in_it / cond_passed / bank) is observable
     // on both bus types, so we mirror a minimum set here.
 
-    use crate::threaded::{SharedState, WorkerBus};
     use crate::core::bus_trait::CoreBus;
+    use crate::threaded::{SharedState, WorkerBus};
 
     /// Build a core + WorkerBus that share the same `Arc<CoreAtomics>`.
     fn core_and_worker_bus() -> (CortexM33, WorkerBus) {
@@ -11676,7 +12522,7 @@ mod stage1_decode_coverage {
     fn worker_bus_decode_execute_narrow_pure() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1000u32;
-        bus.write16(pc, 0x0000, 0);         // LSLS R0, R0, #0 — pure narrow
+        bus.write16(pc, 0x0000, 0); // LSLS R0, R0, #0 — pure narrow
         bus.write16(pc + 2, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.step_no_atomics(&mut bus);
@@ -11688,8 +12534,8 @@ mod stage1_decode_coverage {
     fn worker_bus_decode_execute_wide_pure() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1100u32;
-        bus.write16(pc, 0xF000, 0);         // BL hw0
-        bus.write16(pc + 2, 0xF800, 0);     // BL hw1 → PC += 4
+        bus.write16(pc, 0xF000, 0); // BL hw0
+        bus.write16(pc + 2, 0xF800, 0); // BL hw1 → PC += 4
         bus.write16(pc + 4, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.step_no_atomics(&mut bus);
@@ -11742,8 +12588,8 @@ mod stage1_decode_coverage {
     fn worker_bus_decode_execute_in_it_block() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1400u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
-        bus.write16(pc + 2, 0xBF00, 0);    // NOP (inside IT)
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0xBF00, 0); // NOP (inside IT)
         bus.write16(pc + 4, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.regs.set_flag_z(true);
@@ -11759,11 +12605,11 @@ mod stage1_decode_coverage {
     fn worker_bus_decode_execute_cond_false() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1500u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
-        bus.write16(pc + 2, 0x202A, 0);    // MOVS R0, #42
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0x202A, 0); // MOVS R0, #42
         bus.write16(pc + 4, 0xE7FE, 0);
         c.regs.set_pc(pc);
-        c.regs.set_flag_z(false);          // EQ false → skip
+        c.regs.set_flag_z(false); // EQ false → skip
         c.set_reg(0, 0);
         c.step_no_atomics(&mut bus); // IT
         c.step_no_atomics(&mut bus); // MOVS skipped
@@ -11791,9 +12637,9 @@ mod stage1_decode_coverage {
     fn worker_bus_decode_execute_wide_in_it_block() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1700u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
-        bus.write16(pc + 2, 0xF000, 0);    // BL hw0
-        bus.write16(pc + 4, 0xF800, 0);    // BL hw1 — target = pc+6
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0xF000, 0); // BL hw0
+        bus.write16(pc + 4, 0xF800, 0); // BL hw1 — target = pc+6
         bus.write16(pc + 6, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.regs.set_flag_z(true);
@@ -11807,8 +12653,8 @@ mod stage1_decode_coverage {
     fn worker_bus_decode_execute_flag_only_in_it_block() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1800u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
-        bus.write16(pc + 2, 0x2800, 0);    // CMP R0, #0 (flag-only)
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0x2800, 0); // CMP R0, #0 (flag-only)
         bus.write16(pc + 4, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.regs.set_flag_z(true);
@@ -11823,7 +12669,7 @@ mod stage1_decode_coverage {
     fn worker_bus_slow_narrow_in_it_block() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1900u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc, 0xBF08, 0); // IT EQ
         // LDR R0, [R1]: 0110_1_00000_001_000 = 0x6808 (impure, routes slow path).
         bus.write16(pc + 2, 0x6808, 0);
         bus.write16(pc + 4, 0xE7FE, 0);
@@ -11842,11 +12688,11 @@ mod stage1_decode_coverage {
     fn worker_bus_slow_narrow_in_it_cond_false() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1A00u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
-        bus.write16(pc + 2, 0x6808, 0);    // LDR R0, [R1] (skipped)
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0x6808, 0); // LDR R0, [R1] (skipped)
         bus.write16(pc + 4, 0xE7FE, 0);
         c.regs.set_pc(pc);
-        c.regs.set_flag_z(false);          // EQ false → skip LDR
+        c.regs.set_flag_z(false); // EQ false → skip LDR
         c.set_reg(0, 0xAAAA);
         c.step_no_atomics(&mut bus); // IT
         c.step_no_atomics(&mut bus); // LDR skipped
@@ -11859,7 +12705,7 @@ mod stage1_decode_coverage {
     fn worker_bus_slow_wide_in_it_block() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1B00u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
+        bus.write16(pc, 0xBF08, 0); // IT EQ
         // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000 (impure wide).
         bus.write16(pc + 2, 0xF8D1, 0);
         bus.write16(pc + 4, 0x0000, 0);
@@ -11879,12 +12725,12 @@ mod stage1_decode_coverage {
     fn decode_execute_pure_wide_cond_false() {
         let (mut c, mut bus) = core_and_bus();
         let pc = 0x2000_0D00u32;
-        bus.write16(pc, 0xBF08, 0);        // IT EQ
-        bus.write16(pc + 2, 0xF000, 0);    // BL hw0
-        bus.write16(pc + 4, 0xF800, 0);    // BL hw1 (skipped)
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0xF000, 0); // BL hw0
+        bus.write16(pc + 4, 0xF800, 0); // BL hw1 (skipped)
         bus.write16(pc + 6, 0xE7FE, 0);
         c.regs.set_pc(pc);
-        c.regs.set_flag_z(false);          // EQ false → skip BL
+        c.regs.set_flag_z(false); // EQ false → skip BL
         c.step(&mut bus); // IT
         c.step(&mut bus); // BL skipped (pure-wide, cond_passed=false)
     }
@@ -11895,12 +12741,12 @@ mod stage1_decode_coverage {
     fn worker_bus_decode_execute_cache_hit_on_rerun() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_1C00u32;
-        bus.write16(pc, 0x0000, 0);        // NOP (pure)
+        bus.write16(pc, 0x0000, 0); // NOP (pure)
         bus.write16(pc + 2, 0xE7FE, 0);
         c.regs.set_pc(pc);
-        c.step_no_atomics(&mut bus);       // populate
-        c.regs.set_pc(pc);                  // re-run same PC
-        c.step_no_atomics(&mut bus);       // cache hit
+        c.step_no_atomics(&mut bus); // populate
+        c.regs.set_pc(pc); // re-run same PC
+        c.step_no_atomics(&mut bus); // cache hit
     }
 
     // ---- execute_thumb16 WorkerBus dispatch coverage ------------------------
@@ -12063,9 +12909,9 @@ mod stage1_decode_coverage {
     fn worker_bus_pure_wide_cond_false() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_2300u32;
-        bus.write16(pc, 0xBF08, 0);         // IT EQ
-        bus.write16(pc + 2, 0xF000, 0);     // BL hw0
-        bus.write16(pc + 4, 0xF800, 0);     // BL hw1 — skipped
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0xF000, 0); // BL hw0
+        bus.write16(pc + 4, 0xF800, 0); // BL hw1 — skipped
         bus.write16(pc + 6, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.regs.set_flag_z(false);
@@ -12079,8 +12925,8 @@ mod stage1_decode_coverage {
     fn decode_execute_slow_narrow_cond_false() {
         let (mut c, mut bus) = core_and_bus();
         let pc = 0x2000_0E00u32;
-        bus.write16(pc, 0xBF08, 0);         // IT EQ
-        bus.write16(pc + 2, 0x6808, 0);     // LDR R0, [R1] — impure, skipped
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0x6808, 0); // LDR R0, [R1] — impure, skipped
         bus.write16(pc + 4, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.regs.set_flag_z(false);
@@ -12095,7 +12941,7 @@ mod stage1_decode_coverage {
     fn decode_execute_slow_wide_cond_false() {
         let (mut c, mut bus) = core_and_bus();
         let pc = 0x2000_0F00u32;
-        bus.write16(pc, 0xBF08, 0);         // IT EQ
+        bus.write16(pc, 0xBF08, 0); // IT EQ
         // LDR.W R0, [R1, #0]: hw0=0xF8D1, hw1=0x0000 (impure wide).
         bus.write16(pc + 2, 0xF8D1, 0);
         bus.write16(pc + 4, 0x0000, 0);
@@ -12114,9 +12960,9 @@ mod stage1_decode_coverage {
     fn worker_bus_slow_wide_cond_false() {
         let (mut c, mut bus) = core_and_worker_bus();
         let pc = 0x2000_2400u32;
-        bus.write16(pc, 0xBF08, 0);         // IT EQ
-        bus.write16(pc + 2, 0xF8D1, 0);     // LDR.W hw0
-        bus.write16(pc + 4, 0x0000, 0);     // LDR.W hw1
+        bus.write16(pc, 0xBF08, 0); // IT EQ
+        bus.write16(pc + 2, 0xF8D1, 0); // LDR.W hw0
+        bus.write16(pc + 4, 0x0000, 0); // LDR.W hw1
         bus.write16(pc + 6, 0xE7FE, 0);
         c.regs.set_pc(pc);
         c.regs.set_flag_z(false);
@@ -12241,9 +13087,8 @@ mod stage1_decode_coverage {
 mod stage2_bus_coverage {
     use crate::Bus;
     use crate::bus::{
-        self, RESET_ADC, RESET_DMA, RESET_I2C0, RESET_I2C1,
-        RESET_POWMAN, RESET_PWM, RESET_SPI0, RESET_SPI1,
-        RESET_TIMER0, RESET_TIMER1, RESET_UART0, RESET_UART1, RESETS_POST_BOOTROM,
+        self, RESET_ADC, RESET_DMA, RESET_I2C0, RESET_I2C1, RESET_POWMAN, RESET_PWM, RESET_SPI0,
+        RESET_SPI1, RESET_TIMER0, RESET_TIMER1, RESET_UART0, RESET_UART1, RESETS_POST_BOOTROM,
         canon_oracle_addr,
     };
 
@@ -12288,8 +13133,8 @@ mod stage2_bus_coverage {
 
     #[test]
     fn downstream_port_table_covers_every_branch() {
-        assert_eq!(Bus::downstream_port(0x0000_1000), Some(0));  // ROM
-        assert_eq!(Bus::downstream_port(0x1000_0000), Some(1));  // XIP
+        assert_eq!(Bus::downstream_port(0x0000_1000), Some(0)); // ROM
+        assert_eq!(Bus::downstream_port(0x1000_0000), Some(1)); // XIP
         // SRAM — striped banks 0..7 (ports 2..9).
         let p_sram = Bus::downstream_port(0x2000_0000).unwrap();
         assert!((2..=11).contains(&p_sram));
@@ -12297,8 +13142,8 @@ mod stage2_bus_coverage {
         assert_eq!(Bus::downstream_port(0x20FF_FFFF), Some(2));
         assert_eq!(Bus::downstream_port(0x4000_0000), Some(12)); // APB
         assert_eq!(Bus::downstream_port(0x5000_0000), Some(13)); // AHB
-        assert_eq!(Bus::downstream_port(0xD000_0000), None);     // SIO
-        assert_eq!(Bus::downstream_port(0xE000_0000), None);     // PPB
+        assert_eq!(Bus::downstream_port(0xD000_0000), None); // SIO
+        assert_eq!(Bus::downstream_port(0xE000_0000), None); // PPB
         assert_eq!(Bus::downstream_port(0x7000_0000), Some(14)); // unmapped
     }
 
@@ -12476,7 +13321,10 @@ mod stage2_bus_coverage {
         let v = bus.read32(crate::peripherals::uart::UART1_BASE + 0x024, 0);
         assert_eq!(v, 0, "UART1 held in reset: reads 0");
         bus.write32(crate::peripherals::uart::UART1_BASE + 0x024, 0xAA, 0);
-        assert_eq!(bus.read32(crate::peripherals::uart::UART1_BASE + 0x024, 0), 0);
+        assert_eq!(
+            bus.read32(crate::peripherals::uart::UART1_BASE + 0x024, 0),
+            0
+        );
 
         // Half and byte paths for held peripheral also drop writes.
         let half = bus.read16(crate::peripherals::uart::UART1_BASE + 0x024, 0);
@@ -12485,7 +13333,10 @@ mod stage2_bus_coverage {
         assert_eq!(byte, 0);
         bus.write16(crate::peripherals::uart::UART1_BASE + 0x024, 0xBB, 0);
         bus.write8(crate::peripherals::uart::UART1_BASE + 0x024, 0x5A, 0);
-        assert_eq!(bus.read32(crate::peripherals::uart::UART1_BASE + 0x024, 0), 0);
+        assert_eq!(
+            bus.read32(crate::peripherals::uart::UART1_BASE + 0x024, 0),
+            0
+        );
     }
 
     #[test]
@@ -12493,9 +13344,16 @@ mod stage2_bus_coverage {
         let mut bus = Bus::new();
         // Release SPI1.
         bus.write32(RESETS_CLR, 1 << RESET_SPI1, 0);
-        bus.write32(crate::peripherals::spi::SPI1_BASE + crate::peripherals::spi::SSPCPSR, 0x10, 0);
+        bus.write32(
+            crate::peripherals::spi::SPI1_BASE + crate::peripherals::spi::SSPCPSR,
+            0x10,
+            0,
+        );
         assert_eq!(
-            bus.read32(crate::peripherals::spi::SPI1_BASE + crate::peripherals::spi::SSPCPSR, 0),
+            bus.read32(
+                crate::peripherals::spi::SPI1_BASE + crate::peripherals::spi::SSPCPSR,
+                0
+            ),
             0x10,
         );
     }
@@ -12504,21 +13362,38 @@ mod stage2_bus_coverage {
     fn reset_set_puts_peripheral_back_into_reset() {
         let mut bus = Bus::new();
         // Program UART0 (already released post-bootrom).
-        bus.write32(crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD, 81, 0);
+        bus.write32(
+            crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD,
+            81,
+            0,
+        );
         assert_eq!(
-            bus.read32(crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD, 0),
+            bus.read32(
+                crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD,
+                0
+            ),
             81,
         );
         // Put UART0 back into reset.
         bus.write32(RESETS_SET, 1 << RESET_UART0, 0);
         // Now reads return 0 / writes drop.
         assert_eq!(
-            bus.read32(crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD, 0),
+            bus.read32(
+                crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD,
+                0
+            ),
             0,
         );
-        bus.write32(crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD, 99, 0);
+        bus.write32(
+            crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD,
+            99,
+            0,
+        );
         assert_eq!(
-            bus.read32(crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD, 0),
+            bus.read32(
+                crate::peripherals::uart::UART0_BASE + crate::peripherals::uart::UARTIBRD,
+                0
+            ),
             0,
         );
     }
@@ -12627,7 +13502,11 @@ mod stage2_bus_coverage {
         let mut bus = Bus::new();
         // Enable UART0 TX path.
         bus.write32(UART0_BASE + UARTLCR_H, 1 << 4 /* FEN */, 0);
-        bus.write32(UART0_BASE + UARTCR, (1 << 0) | (1 << 8) /* UARTEN|TXE */, 0);
+        bus.write32(
+            UART0_BASE + UARTCR,
+            (1 << 0) | (1 << 8), /* UARTEN|TXE */
+            0,
+        );
         bus.write8(UART0_BASE + UARTDR, 0x5A, 0);
         // Word read shows the RX FIFO is empty (0). Side-effect path took.
         let _ = bus.read8(UART0_BASE + UARTDR, 0);
@@ -12817,14 +13696,14 @@ mod stage2_bus_coverage {
 
     #[test]
     fn trng_sha_powman_subword_narrow_paths() {
-        use crate::peripherals::{trng, sha256, powman};
+        use crate::peripherals::{powman, sha256, trng};
         let mut bus = Bus::new();
         bus.write32(RESETS_CLR, 1 << RESET_POWMAN, 0);
         // TRNG / SHA / POWMAN bases: byte/half with alias 0 AND alias 2.
         for base in [trng::TRNG_BASE, sha256::SHA256_BASE, powman::POWMAN_BASE] {
             bus.write8(base, 0x01, 0);
             bus.write16(base, 0x0001, 0);
-            bus.write8(base | 0x2000, 0x01, 0);    // alias SET
+            bus.write8(base | 0x2000, 0x01, 0); // alias SET
             bus.write16(base | 0x2000, 0x0001, 0); // alias SET
         }
     }
@@ -12837,7 +13716,10 @@ mod stage2_bus_coverage {
         // GPIO_OUT at SIO base + 0x010. Byte write must replicate.
         bus.write8(0xD000_0010, 0xA5, 0);
         let w = bus.sio.gpio_out;
-        assert_eq!(w, 0xA5A5_A5A5, "GPIO_OUT byte write must replicate across lanes");
+        assert_eq!(
+            w, 0xA5A5_A5A5,
+            "GPIO_OUT byte write must replicate across lanes"
+        );
         // Halfword write replicates across both halves.
         bus.write16(0xD000_0010, 0x1234, 0);
         assert_eq!(bus.sio.gpio_out, 0x1234_1234);
@@ -12921,12 +13803,18 @@ mod stage2_bus_coverage {
         // After default construction many peripherals are held. Release all
         // Phase 2 + TIMER + POWMAN so every `if !is_held_in_reset_bit` arm
         // takes the True path at least once.
-        let release_mask = (1u32 << RESET_TIMER0) | (1u32 << RESET_TIMER1)
-            | (1u32 << RESET_UART0) | (1u32 << RESET_UART1)
-            | (1u32 << RESET_SPI0) | (1u32 << RESET_SPI1)
-            | (1u32 << RESET_I2C0) | (1u32 << RESET_I2C1)
-            | (1u32 << RESET_ADC) | (1u32 << RESET_PWM)
-            | (1u32 << RESET_DMA) | (1u32 << RESET_POWMAN);
+        let release_mask = (1u32 << RESET_TIMER0)
+            | (1u32 << RESET_TIMER1)
+            | (1u32 << RESET_UART0)
+            | (1u32 << RESET_UART1)
+            | (1u32 << RESET_SPI0)
+            | (1u32 << RESET_SPI1)
+            | (1u32 << RESET_I2C0)
+            | (1u32 << RESET_I2C1)
+            | (1u32 << RESET_ADC)
+            | (1u32 << RESET_PWM)
+            | (1u32 << RESET_DMA)
+            | (1u32 << RESET_POWMAN);
         bus.write32(RESETS_CLR, release_mask, 0);
         bus.tick_peripherals(1);
         // Now put them all back into reset and tick again: every gate
@@ -12940,8 +13828,16 @@ mod stage2_bus_coverage {
         let mut bus = Bus::new();
         // Program TIMER0 ALARM0 at t=1us, enable INTE, then tick enough
         // TICKS edges for the alarm to fire.
-        bus.write32(crate::peripherals::timer::TIMER0_BASE + crate::peripherals::timer::INTE_OFFSET, 1, 0);
-        bus.write32(crate::peripherals::timer::TIMER0_BASE + crate::peripherals::timer::ALARM0_OFFSET, 1, 0);
+        bus.write32(
+            crate::peripherals::timer::TIMER0_BASE + crate::peripherals::timer::INTE_OFFSET,
+            1,
+            0,
+        );
+        bus.write32(
+            crate::peripherals::timer::TIMER0_BASE + crate::peripherals::timer::ALARM0_OFFSET,
+            1,
+            0,
+        );
         // Enable the TIMER0 domain on TICKS (CYCLES=1 → 1 sysclk per us edge).
         // TICKS_BASE is 0x4010_8000. TIMER0 domain CYCLES is at offset 0x20
         // (domain TIMER0 = index 2 with stride 0x0C; refer ticks.rs).
@@ -13034,18 +13930,18 @@ mod stage2_bus_coverage {
         let mut bus = Bus::new();
         // CLK_REF_CTRL variants: SRC=0 (ROSC), SRC=1 aux=0 (PLL_USB),
         // SRC=1 aux=1 (gpin0 — unmodelled returns 0), SRC=2 (XOSC).
-        bus.write32(0x4001_0030, 0x0, 0);                     // SRC=0 → ROSC
-        bus.write32(0x4001_0030, 0x1, 0);                     // SRC=1 aux=0 → PLL_USB
-        bus.write32(0x4001_0030, 0x1 | (1 << 5), 0);          // SRC=1 aux=1 → 0
-        bus.write32(0x4001_0030, 0x2, 0);                     // SRC=2 → XOSC
+        bus.write32(0x4001_0030, 0x0, 0); // SRC=0 → ROSC
+        bus.write32(0x4001_0030, 0x1, 0); // SRC=1 aux=0 → PLL_USB
+        bus.write32(0x4001_0030, 0x1 | (1 << 5), 0); // SRC=1 aux=1 → 0
+        bus.write32(0x4001_0030, 0x2, 0); // SRC=2 → XOSC
         // CLK_SYS_CTRL variants: SRC=0 (ref_hz), SRC=1 aux=0 (PLL_SYS),
         // aux=1 (PLL_USB), aux=2 (ROSC), aux=3 (XOSC), aux=4 (unmodelled → 0).
-        bus.write32(0x4001_003C, 0x0, 0);                     // ref path
-        bus.write32(0x4001_003C, 0x1, 0);                     // PLL_SYS
-        bus.write32(0x4001_003C, 0x1 | (1 << 5), 0);          // PLL_USB
-        bus.write32(0x4001_003C, 0x1 | (2 << 5), 0);          // ROSC
-        bus.write32(0x4001_003C, 0x1 | (3 << 5), 0);          // XOSC
-        bus.write32(0x4001_003C, 0x1 | (4 << 5), 0);          // gpin — 0
+        bus.write32(0x4001_003C, 0x0, 0); // ref path
+        bus.write32(0x4001_003C, 0x1, 0); // PLL_SYS
+        bus.write32(0x4001_003C, 0x1 | (1 << 5), 0); // PLL_USB
+        bus.write32(0x4001_003C, 0x1 | (2 << 5), 0); // ROSC
+        bus.write32(0x4001_003C, 0x1 | (3 << 5), 0); // XOSC
+        bus.write32(0x4001_003C, 0x1 | (4 << 5), 0); // gpin — 0
         let _ = bus.sys_clk_hz();
     }
 
@@ -13055,14 +13951,20 @@ mod stage2_bus_coverage {
     fn load_bootrom_sets_rom_invalidation_region() {
         let mut bus = Bus::new();
         bus.load_bootrom(&[0u8; 32]);
-        assert_ne!(bus.pending_invalidation_regions & bus::invalidation_regions::ROM, 0);
+        assert_ne!(
+            bus.pending_invalidation_regions & bus::invalidation_regions::ROM,
+            0
+        );
     }
 
     #[test]
     fn invalidate_all_sets_bulk_bit() {
         let mut bus = Bus::new();
         bus.invalidate_all();
-        assert_ne!(bus.pending_invalidation_regions & bus::invalidation_regions::BULK, 0);
+        assert_ne!(
+            bus.pending_invalidation_regions & bus::invalidation_regions::BULK,
+            0
+        );
     }
 
     #[test]
@@ -13100,12 +14002,16 @@ mod stage2_bus_coverage {
     // Drive RX DREQ on UART1/SPI1 by running loopback mode.
     #[test]
     fn collect_dreqs_rx_arms_via_uart1_spi1_loopback() {
-        use crate::peripherals::{uart, spi};
+        use crate::peripherals::{spi, uart};
         let mut bus = Bus::new();
         bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1), 0);
         // UART1: loopback (LBE) + RXE + TXE, push TX, tick to transfer.
         bus.write32(uart::UART1_BASE + uart::UARTLCR_H, 1 << 4, 0);
-        bus.write32(uart::UART1_BASE + uart::UARTCR, 1 | (1 << 7) | (1 << 8) | (1 << 9), 0);
+        bus.write32(
+            uart::UART1_BASE + uart::UARTCR,
+            1 | (1 << 7) | (1 << 8) | (1 << 9),
+            0,
+        );
         bus.write32(uart::UART1_BASE + uart::UARTIBRD, 81, 0);
         bus.write32(uart::UART1_BASE + uart::UARTFBRD, 24, 0);
         bus.write32(uart::UART1_BASE + uart::UARTDR, 0x42, 0);
@@ -13126,9 +14032,13 @@ mod stage2_bus_coverage {
     // `if tx_dreq()/rx_dreq()` True branches.
     #[test]
     fn collect_dreqs_all_peripheral_branches_when_enabled() {
-        use crate::peripherals::{uart, spi, i2c, adc};
+        use crate::peripherals::{adc, i2c, spi, uart};
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1),
+            0,
+        );
         // UART0/1: enable + TXE.
         bus.write32(uart::UART0_BASE + uart::UARTLCR_H, 1 << 4, 0);
         bus.write32(uart::UART0_BASE + uart::UARTCR, 1 | (1 << 8), 0);
@@ -13169,9 +14079,13 @@ mod stage2_bus_coverage {
 
     #[test]
     fn byte_reads_of_uart1_spi1_i2c1_narrow_side_effect_regs() {
-        use crate::peripherals::{uart, spi, i2c};
+        use crate::peripherals::{i2c, spi, uart};
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1),
+            0,
+        );
         // UART0/UART1 narrow byte read of UARTDR.
         let _ = bus.read8(uart::UART0_BASE + uart::UARTDR, 0);
         let _ = bus.read8(uart::UART1_BASE + uart::UARTDR, 0);
@@ -13182,29 +14096,43 @@ mod stage2_bus_coverage {
         let _ = bus.read8(i2c::I2C0_BASE + i2c::IC_DATA_CMD, 0);
         let _ = bus.read8(i2c::I2C1_BASE + i2c::IC_DATA_CMD, 0);
         // ADC narrow byte read of FIFO.
-        let _ = bus.read8(crate::peripherals::adc::ADC_BASE + crate::peripherals::adc::FIFO, 0);
+        let _ = bus.read8(
+            crate::peripherals::adc::ADC_BASE + crate::peripherals::adc::FIFO,
+            0,
+        );
     }
 
     #[test]
     fn halfword_reads_of_uart1_spi1_i2c1_narrow_side_effect_regs() {
-        use crate::peripherals::{uart, spi, i2c};
+        use crate::peripherals::{i2c, spi, uart};
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1),
+            0,
+        );
         let _ = bus.read16(uart::UART0_BASE + uart::UARTDR, 0);
         let _ = bus.read16(uart::UART1_BASE + uart::UARTDR, 0);
         let _ = bus.read16(spi::SPI0_BASE + spi::SSPDR, 0);
         let _ = bus.read16(spi::SPI1_BASE + spi::SSPDR, 0);
         let _ = bus.read16(i2c::I2C0_BASE + i2c::IC_DATA_CMD, 0);
         let _ = bus.read16(i2c::I2C1_BASE + i2c::IC_DATA_CMD, 0);
-        let _ = bus.read16(crate::peripherals::adc::ADC_BASE + crate::peripherals::adc::FIFO, 0);
+        let _ = bus.read16(
+            crate::peripherals::adc::ADC_BASE + crate::peripherals::adc::FIFO,
+            0,
+        );
     }
 
     // Narrow writes against UART1/SPI1/I2C1 DR/DATA_CMD (both instances).
     #[test]
     fn narrow_writes_to_uart1_spi1_i2c1_dr_arms() {
-        use crate::peripherals::{uart, spi, i2c};
+        use crate::peripherals::{i2c, spi, uart};
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1),
+            0,
+        );
         // Enable UART1 + SPI1 so the side-effect paths run.
         bus.write32(uart::UART1_BASE + uart::UARTLCR_H, 1 << 4, 0);
         bus.write32(uart::UART1_BASE + uart::UARTCR, 1 | (1 << 8), 0);
@@ -13223,9 +14151,13 @@ mod stage2_bus_coverage {
     // tracing turned on to drive the True branch of emit_mmio_trace.
     #[test]
     fn narrow_byte_reads_with_mmio_trace_enabled() {
-        use crate::peripherals::{uart, spi, i2c, adc};
+        use crate::peripherals::{adc, i2c, spi, uart};
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1),
+            0,
+        );
         let sink = Vec::<u8>::new();
         bus.set_mmio_trace_sink(Some(Box::new(sink)));
         bus.mmio_trace_enabled = true;
@@ -13310,7 +14242,11 @@ mod stage2_bus_coverage {
     fn byte_reads_cover_every_apb_peripheral_arm() {
         let mut bus = Bus::new();
         // Release I2C1 / UART1 / SPI1 so their arms run.
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN),
+            0,
+        );
         // SYSINFO.
         let _ = bus.read8(0x4000_0000, 0);
         // RESETS.
@@ -13333,7 +14269,10 @@ mod stage2_bus_coverage {
         let _ = bus.read8(crate::peripherals::spi::SPI0_BASE + 0xC, 0);
         let _ = bus.read8(crate::peripherals::spi::SPI1_BASE + 0xC, 0);
         // I2C0 / I2C1.
-        let _ = bus.read8(crate::peripherals::i2c::I2C0_BASE + 0x70 /* IC_STATUS */, 0);
+        let _ = bus.read8(
+            crate::peripherals::i2c::I2C0_BASE + 0x70, /* IC_STATUS */
+            0,
+        );
         let _ = bus.read8(crate::peripherals::i2c::I2C1_BASE + 0x70, 0);
         // ADC — read CS (non-FIFO).
         let _ = bus.read8(crate::peripherals::adc::ADC_BASE + 0x00, 0);
@@ -13363,7 +14302,11 @@ mod stage2_bus_coverage {
     #[test]
     fn halfword_reads_cover_every_apb_peripheral_arm() {
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN),
+            0,
+        );
         let _ = bus.read16(0x4000_0000, 0);
         let _ = bus.read16(0x4002_0000, 0);
         let _ = bus.read16(0x4001_0030, 0);
@@ -13404,7 +14347,11 @@ mod stage2_bus_coverage {
     #[test]
     fn word_read_of_dma_and_all_peripherals() {
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN),
+            0,
+        );
         let _ = bus.read32(crate::dma::DMA_BASE, 0);
         // DMA write32.
         bus.write32(crate::dma::DMA_BASE + 0x040, 0, 0);
@@ -13414,7 +14361,11 @@ mod stage2_bus_coverage {
     #[test]
     fn word_reads_of_all_peripherals() {
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1) | (1 << RESET_POWMAN),
+            0,
+        );
         // SYSINFO / RESETS / CLOCKS / XOSC / ROSC / PLL_SYS / PLL_USB / QMI.
         let _ = bus.read32(0x4000_0000, 0);
         let _ = bus.read32(0x4002_0000, 0);
@@ -13514,9 +14465,13 @@ mod stage2_bus_coverage {
     // Halfword SET-alias writes to every Phase 2 peripheral.
     #[test]
     fn halfword_set_alias_writes_to_phase2_peripherals() {
-        use crate::peripherals::{uart, spi, i2c, adc, pwm, io_bank0, pads_bank0};
+        use crate::peripherals::{adc, i2c, io_bank0, pads_bank0, pwm, spi, uart};
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1),
+            0,
+        );
         // Halfword writes with alias=SET (0x2000). Drives the `alias != 0`
         // half-shift arm on every Phase 2 base.
         bus.write16(uart::UART0_BASE + uart::UARTIBRD | 0x2000, 0x01, 0);
@@ -13534,9 +14489,13 @@ mod stage2_bus_coverage {
     // Byte writes to Phase 2 peripherals at non-DR offsets (subword alias).
     #[test]
     fn byte_halfword_writes_to_all_phase2_non_dr_offsets() {
-        use crate::peripherals::{uart, spi, i2c, adc, pwm, io_bank0, pads_bank0};
+        use crate::peripherals::{adc, i2c, io_bank0, pads_bank0, pwm, spi, uart};
         let mut bus = Bus::new();
-        bus.write32(RESETS_CLR, (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1), 0);
+        bus.write32(
+            RESETS_CLR,
+            (1 << RESET_UART1) | (1 << RESET_SPI1) | (1 << RESET_I2C1),
+            0,
+        );
         // UART0/1 IBRD byte/half alias 0 (RMW) and alias 2 (SET).
         bus.write8(uart::UART0_BASE + uart::UARTIBRD, 0x11, 0);
         bus.write8(uart::UART0_BASE + uart::UARTIBRD | 0x2000, 0x01, 0);
@@ -13579,7 +14538,7 @@ mod stage2_bus_coverage {
     // Exercise word-writes to peripherals we haven't touched.
     #[test]
     fn word_writes_through_remaining_peripheral_arms() {
-        use crate::peripherals::{otp, trng, sha256};
+        use crate::peripherals::{otp, sha256, trng};
         let mut bus = Bus::new();
         bus.write32(RESETS_CLR, 1 << RESET_POWMAN, 0);
         // OTP write32 — OR-only fuse.
@@ -13635,17 +14594,21 @@ mod stage2_bus_coverage {
 }
 
 mod stage2_i2c_coverage {
+    use crate::dreq::{DREQ_I2C0_RX, DREQ_I2C0_TX};
+    use crate::irq::IRQ_I2C0_IRQ;
     use crate::peripherals::i2c::*;
     use mdpicoem_common::clocks::ClockTree;
-    use crate::irq::IRQ_I2C0_IRQ;
-    use crate::dreq::{DREQ_I2C0_TX, DREQ_I2C0_RX};
 
     fn new_i2c() -> I2cRegs {
         I2cRegs::new(IRQ_I2C0_IRQ, DREQ_I2C0_TX, DREQ_I2C0_RX)
     }
 
     fn tree() -> ClockTree {
-        ClockTree { sys_clk_hz: 150_000_000, ref_clk_hz: 12_000_000, peri_clk_hz: 150_000_000 }
+        ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        }
     }
 
     // status read arms: activity, TFNF, TFE, RFNE, RFF. Force each to fire.
@@ -13938,17 +14901,21 @@ mod stage2_i2c_coverage {
 }
 
 mod stage2_spi_coverage {
+    use crate::dreq::{DREQ_SPI0_RX, DREQ_SPI0_TX};
+    use crate::irq::IRQ_SPI0_IRQ;
     use crate::peripherals::spi::*;
     use mdpicoem_common::clocks::ClockTree;
-    use crate::irq::IRQ_SPI0_IRQ;
-    use crate::dreq::{DREQ_SPI0_TX, DREQ_SPI0_RX};
 
     fn new_spi() -> SpiRegs {
         SpiRegs::new(IRQ_SPI0_IRQ, DREQ_SPI0_TX, DREQ_SPI0_RX)
     }
 
     fn tree() -> ClockTree {
-        ClockTree { sys_clk_hz: 150_000_000, ref_clk_hz: 12_000_000, peri_clk_hz: 150_000_000 }
+        ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        }
     }
 
     #[test]
@@ -13977,7 +14944,11 @@ mod stage2_spi_coverage {
         s.tick(100_000, &tree(), &mut irqs);
         let sr = s.read32(SSPSR);
         assert_ne!(sr & (1 << 3) /* RFF */, 0);
-        assert_eq!(sr & (1 << 1) /* TNF */, (1 << 1), "TX drained → TNF set");
+        assert_eq!(
+            sr & (1 << 1), /* TNF */
+            (1 << 1),
+            "TX drained → TNF set"
+        );
     }
 
     #[test]
@@ -14131,7 +15102,11 @@ mod stage2_spi_coverage {
         s.write32(SSPDR, 0xA, 0, &mut irqs);
         // With a tiny peri_hz, bits_per_sec underflows to 0 → the arm
         // returns 1 sys_clk per word.
-        let tiny = ClockTree { sys_clk_hz: 1, ref_clk_hz: 1, peri_clk_hz: 1 };
+        let tiny = ClockTree {
+            sys_clk_hz: 1,
+            ref_clk_hz: 1,
+            peri_clk_hz: 1,
+        };
         s.tick(1, &tiny, &mut irqs);
     }
 
@@ -14149,17 +15124,21 @@ mod stage2_spi_coverage {
 }
 
 mod stage2_uart_coverage {
+    use crate::dreq::{DREQ_UART0_RX, DREQ_UART0_TX};
+    use crate::irq::IRQ_UART0_IRQ;
     use crate::peripherals::uart::*;
     use mdpicoem_common::clocks::ClockTree;
-    use crate::irq::IRQ_UART0_IRQ;
-    use crate::dreq::{DREQ_UART0_TX, DREQ_UART0_RX};
 
     fn new_uart() -> UartRegs {
         UartRegs::new(IRQ_UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX)
     }
 
     fn tree() -> ClockTree {
-        ClockTree { sys_clk_hz: 150_000_000, ref_clk_hz: 12_000_000, peri_clk_hz: 150_000_000 }
+        ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        }
     }
 
     #[test]
@@ -14327,7 +15306,11 @@ mod stage2_uart_coverage {
         u.write32(UARTFBRD, 0x3F, 0, &mut irqs);
         u.write32(UARTDR, 0x12, 0, &mut irqs);
         // Tiny peri_hz → baud underflows to 0; sysclks_per_byte returns 1.
-        let tiny = ClockTree { sys_clk_hz: 1, ref_clk_hz: 1, peri_clk_hz: 1 };
+        let tiny = ClockTree {
+            sys_clk_hz: 1,
+            ref_clk_hz: 1,
+            peri_clk_hz: 1,
+        };
         u.tick(100, &tiny, &mut irqs);
     }
 
@@ -14343,7 +15326,11 @@ mod stage2_uart_coverage {
         for _ in 0..16 {
             u.write32(UARTDR, 0x5A, 0, &mut irqs);
         }
-        let t = ClockTree { sys_clk_hz: 150_000_000, ref_clk_hz: 12_000_000, peri_clk_hz: 150_000_000 };
+        let t = ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        };
         u.tick(10_000_000, &t, &mut irqs);
         // RX FIFO is full after all loopback bytes.
         let fr = u.read32(UARTFR);
@@ -14373,16 +15360,20 @@ mod stage2_uart_coverage {
 }
 
 mod stage2_adc_coverage {
+    use crate::irq::IRQ_ADC_IRQ_FIFO;
     use crate::peripherals::adc::*;
     use mdpicoem_common::clocks::ClockTree;
-    use crate::irq::IRQ_ADC_IRQ_FIFO;
 
     fn new_adc() -> AdcRegs {
         AdcRegs::new(IRQ_ADC_IRQ_FIFO)
     }
 
     fn tree() -> ClockTree {
-        ClockTree { sys_clk_hz: 150_000_000, ref_clk_hz: 12_000_000, peri_clk_hz: 150_000_000 }
+        ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        }
     }
 
     #[test]
@@ -14605,16 +15596,20 @@ mod stage2_adc_coverage {
 }
 
 mod stage2_pwm_coverage {
+    use crate::irq::{IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1};
     use crate::peripherals::pwm::*;
     use mdpicoem_common::clocks::ClockTree;
-    use crate::irq::{IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1};
 
     fn new_pwm() -> PwmRegs {
         PwmRegs::new(IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1)
     }
 
     fn tree() -> ClockTree {
-        ClockTree { sys_clk_hz: 150_000_000, ref_clk_hz: 12_000_000, peri_clk_hz: 150_000_000 }
+        ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        }
     }
 
     // note_dma_enable branches: no-op when bits clear or slice out of range.
@@ -14623,8 +15618,8 @@ mod stage2_pwm_coverage {
         let mut p = new_pwm();
         p.note_dma_enable(0, false); // dreq_bits_set == false branch
         p.note_dma_enable(99, true); // slice out-of-range branch
-        p.note_dma_enable(0, true);  // true path
-        p.note_dma_enable(0, true);  // already warned branch (second call)
+        p.note_dma_enable(0, true); // true path
+        p.note_dma_enable(0, true); // already warned branch (second call)
     }
 
     // decode_slice_offset returns None when offset beyond slice block.
@@ -14767,9 +15762,9 @@ mod stage2_pwm_coverage {
         let mut p = new_pwm();
         let mut irqs = 0u64;
         // Slice offsets: CSR=0x00 stride=0x14. TOP=0x10.
-        p.write32(0x00, CSR_EN, 0, &mut irqs);       // slice 0 local-enabled
-        p.write32(0x10, 100, 0, &mut irqs);           // slice 0 TOP = 100
-        p.write32(EN, 1, 0, &mut irqs);               // slice 0 globally enabled
+        p.write32(0x00, CSR_EN, 0, &mut irqs); // slice 0 local-enabled
+        p.write32(0x10, 100, 0, &mut irqs); // slice 0 TOP = 100
+        p.write32(EN, 1, 0, &mut irqs); // slice 0 globally enabled
         p.write32(SLICE_STRIDE + 0x00, CSR_EN, 0, &mut irqs); // slice 1 local
         p.write32(SLICE_STRIDE + 0x10, 100, 0, &mut irqs);
         // slice 1 NOT globally enabled — `continue` arm.
@@ -14780,8 +15775,8 @@ mod stage2_pwm_coverage {
 }
 
 mod stage2_timer_coverage {
-    use crate::peripherals::timer::*;
     use crate::irq::IRQ_TIMER0_IRQ_0;
+    use crate::peripherals::timer::*;
 
     fn t0() -> TimerRegs {
         TimerRegs::new(IRQ_TIMER0_IRQ_0)
@@ -14956,10 +15951,10 @@ mod stage2_timer_coverage {
 #[cfg(test)]
 mod stage3_fpu_coverage {
     use super::*;
-    use std::sync::Arc;
-    use crate::core::CortexM33;
     use crate::bus::Bus;
+    use crate::core::CortexM33;
     use crate::threaded::CoreAtomics;
+    use std::sync::Arc;
 
     // Signaling-NaN payloads (quiet bit clear, payload non-zero).
     const SNAN_POS: u32 = 0x7F80_0001;
@@ -14968,7 +15963,9 @@ mod stage3_fpu_coverage {
     const QNAN_NEG: u32 = 0xFFC9_ABCD;
     const ARM_QNAN: u32 = 0x7FC0_0000;
 
-    fn snan(bits: u32) -> f32 { f32::from_bits(bits) }
+    fn snan(bits: u32) -> f32 {
+        f32::from_bits(bits)
+    }
 
     // ----- fp_add branches (lines 174-195) ---------------------------------
 
@@ -15031,8 +16028,12 @@ mod stage3_fpu_coverage {
         c.regs.s[4] = -f32::from_bits(0x0080_0000); // -MIN_NORMAL
         let (hw0, hw1) = enc_vadd(0, 2, 4);
         c.execute_one_wide(hw0, hw1);
-        assert_eq!(c.regs.s[0].to_bits() & 0x7FFF_FFFF, 0,
-            "flushed to +/-0, got 0x{:08X}", c.regs.s[0].to_bits());
+        assert_eq!(
+            c.regs.s[0].to_bits() & 0x7FFF_FFFF,
+            0,
+            "flushed to +/-0, got 0x{:08X}",
+            c.regs.s[0].to_bits()
+        );
         assert!(c.regs.fpscr & FPSCR_UFC != 0, "UFC must be set");
         assert!(c.regs.fpscr & FPSCR_IXC != 0, "IXC must be set");
     }
@@ -15105,8 +16106,12 @@ mod stage3_fpu_coverage {
         c.regs.s[4] = f32::from_bits(0x0080_0001); // MIN_NORMAL + 1 ulp
         let (hw0, hw1) = enc_vsub(0, 2, 4);
         c.execute_one_wide(hw0, hw1);
-        assert_eq!(c.regs.s[0].to_bits() & 0x7FFF_FFFF, 0,
-            "flushed to +/-0, got 0x{:08X}", c.regs.s[0].to_bits());
+        assert_eq!(
+            c.regs.s[0].to_bits() & 0x7FFF_FFFF,
+            0,
+            "flushed to +/-0, got 0x{:08X}",
+            c.regs.s[0].to_bits()
+        );
         assert!(c.regs.fpscr & FPSCR_UFC != 0);
     }
 
@@ -15412,8 +16417,8 @@ mod stage3_fpu_coverage {
         let mut c = CortexM33::for_test(0);
         c.regs.fpscr = FPSCR_DN;
         c.regs.s[0] = f32::NEG_INFINITY; // addend
-        c.regs.s[2] = f32::INFINITY;     // op1
-        c.regs.s[4] = 2.0;               // op2
+        c.regs.s[2] = f32::INFINITY; // op1
+        c.regs.s[4] = 2.0; // op2
         let (hw0, hw1) = enc_vfma(0, 2, 4);
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.fpscr & FPSCR_IOC != 0);
@@ -15835,7 +16840,7 @@ mod stage3_fpu_coverage {
     fn fpu_lazy_flush_bus_fault_keeps_lspact() {
         // Unmapped FPCAR triggers bus_fault during flush; LSPACT must
         // stay set; BFRDY is recorded in FPCCR.
-        use crate::bus::ppb::{FPCCR_LSPACT, FPCCR_BFRDY};
+        use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT};
         let atomics = Arc::new(CoreAtomics::default());
         let mut cpu = CortexM33::new(0, Arc::clone(&atomics));
         let mut bus = Bus::with_atomics(atomics);
@@ -16443,7 +17448,11 @@ mod stage3_fpu_coverage {
         c.execute_one_wide(hw0, hw1);
         // f16 subnormal: exp=0, frac encoded.
         let h = c.regs.s[0].to_bits() & 0xFFFF;
-        assert!(h > 0 && (h >> 10) & 0x1F == 0, "expected f16 subnormal, got 0x{:04X}", h);
+        assert!(
+            h > 0 && (h >> 10) & 0x1F == 0,
+            "expected f16 subnormal, got 0x{:04X}",
+            h
+        );
     }
 
     #[test]
@@ -16642,7 +17651,11 @@ mod stage3_fpu_coverage {
         let (hw0, hw1) = enc_vdiv(0, 2, 4);
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.s[0], 3.0);
-        assert_eq!(c.regs.fpscr & FPSCR_IXC, 0, "exact division must not set IXC");
+        assert_eq!(
+            c.regs.fpscr & FPSCR_IXC,
+            0,
+            "exact division must not set IXC"
+        );
     }
 
     #[test]
@@ -16907,8 +17920,11 @@ mod stage3_fpu_coverage {
         // If it doesn't carry, exp=10+15=25=0x19, frac=0x3FF → 0x67FF.
         // Either result is acceptable for exercising the branch.
         let h = c.regs.s[0].to_bits() & 0xFFFF;
-        assert!(h == 0x6800 || h == 0x67FF || h == 0x6400 || h == 0x63FF,
-            "unexpected h=0x{:04X}", h);
+        assert!(
+            h == 0x6800 || h == 0x67FF || h == 0x6400 || h == 0x63FF,
+            "unexpected h=0x{:04X}",
+            h
+        );
     }
 
     #[test]
@@ -17005,7 +18021,10 @@ mod stage3_fpu_coverage {
         let (mut c, mut bus) = core_and_bus();
         let base = 0x2000_0700u32;
         c.set_reg(0, base);
-        c.regs.s[0] = 1.0; c.regs.s[1] = 2.0; c.regs.s[2] = 3.0; c.regs.s[3] = 4.0;
+        c.regs.s[0] = 1.0;
+        c.regs.s[1] = 2.0;
+        c.regs.s[2] = 3.0;
+        c.regs.s[3] = 4.0;
         let hw0: u16 = 0xEC00 | (1 << 7) | 0;
         let hw1: u16 = 0x0A00 | 4;
         let cy = c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
@@ -17033,7 +18052,7 @@ mod stage3_fpu_coverage {
         let (mut c, mut bus) = core_and_bus();
         let base = 0x2000_0900u32;
         c.set_reg(0, base);
-        bus.write32(base,     7.0f32.to_bits(), 0);
+        bus.write32(base, 7.0f32.to_bits(), 0);
         bus.write32(base + 4, 8.0f32.to_bits(), 0);
         bus.write32(base + 8, 9.0f32.to_bits(), 0);
         bus.write32(base + 12, 10.0f32.to_bits(), 0);
@@ -17155,7 +18174,7 @@ mod stage3_fpu_coverage {
     #[test]
     fn vrintr_normal_no_idc() {
         let mut c = CortexM33::for_test(0);
-        c.regs.s[2] = 3.14;
+        c.regs.s[2] = 3.5;
         let (hw0, hw1) = enc_vrintr(0, 2);
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.fpscr & FPSCR_IDC, 0);
@@ -17243,8 +18262,8 @@ mod stage3_fpu_coverage {
         let mut c = CortexM33::for_test(0);
         c.regs.fpscr = FPSCR_DN;
         c.regs.s[0] = f32::NEG_INFINITY; // addend
-        c.regs.s[2] = 2.0;               // op1 finite nonzero
-        c.regs.s[4] = f32::INFINITY;     // op2 inf
+        c.regs.s[2] = 2.0; // op1 finite nonzero
+        c.regs.s[4] = f32::INFINITY; // op2 inf
         let (hw0, hw1) = enc_vfma(0, 2, 4);
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.fpscr & FPSCR_IOC != 0);
@@ -17272,9 +18291,9 @@ mod stage3_fpu_coverage {
     fn vfma_inf_product_from_op2_plus_opposing_inf() {
         let mut c = CortexM33::for_test(0);
         c.regs.fpscr = FPSCR_DN;
-        c.regs.s[0] = f32::INFINITY;      // addend +inf
-        c.regs.s[2] = -1.0;               // op1 finite negative
-        c.regs.s[4] = f32::INFINITY;      // op2 +inf
+        c.regs.s[0] = f32::INFINITY; // addend +inf
+        c.regs.s[2] = -1.0; // op1 finite negative
+        c.regs.s[4] = f32::INFINITY; // op2 +inf
         // product = -1 * +inf = -inf; addend is +inf → IOC
         let (hw0, hw1) = enc_vfma(0, 2, 4);
         c.execute_one_wide(hw0, hw1);
@@ -18015,10 +19034,10 @@ mod stage7_interp_coverage {
 }
 
 mod stage7_coprocessor_coverage {
-    use std::sync::Arc;
     use crate::bus::Bus;
     use crate::core::{CortexM33, Fault};
     use crate::threaded::CoreAtomics;
+    use std::sync::Arc;
 
     fn enable_cp(cpu: &mut CortexM33, coproc: u8) {
         cpu.ppb.cpacr |= 0x3 << (coproc as u32 * 2);
@@ -18165,8 +19184,8 @@ mod stage7_coprocessor_coverage {
     fn encode_cdp_dcp(opc1: u8, crn: u8, crd: u8, op2: u8, crm: u8) -> (u16, u16) {
         // CDP: bit 4 of hw1 must be 0.
         let hw0: u16 = 0xEE00 | ((opc1 as u16 & 0xF) << 4) | (crn as u16 & 0xF);
-        let hw1: u16 = ((crd as u16) << 12) | (4u16 << 8) | ((op2 as u16 & 0x7) << 5)
-            | (crm as u16 & 0xF);
+        let hw1: u16 =
+            ((crd as u16) << 12) | (4u16 << 8) | ((op2 as u16 & 0x7) << 5) | (crm as u16 & 0xF);
         (hw0, hw1)
     }
 
@@ -18371,7 +19390,11 @@ mod stage7_coprocessor_coverage {
         let hw0: u16 = 0xFE10 | (1u16 << 5); // opc1=1, L=1
         let hw1: u16 = (15u16 << 12) | (7u16 << 8) | (0u16 << 5) | 0x10;
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_ne!(cpu.regs.xpsr & (1 << 31), 0, "N bit should be set (salt valid)");
+        assert_ne!(
+            cpu.regs.xpsr & (1 << 31),
+            0,
+            "N bit should be set (salt valid)"
+        );
     }
 
     #[test]
@@ -18479,11 +19502,11 @@ mod stage7_coprocessor_coverage {
 }
 
 mod stage7_exceptions_coverage {
-    use std::sync::Arc;
     use crate::bus::Bus;
     use crate::bus::ppb::{FPCCR_LSPACT, FPCCR_LSPEN};
     use crate::core::{CortexM33, Fault};
     use crate::threaded::CoreAtomics;
+    use std::sync::Arc;
 
     const VT_BASE: u32 = 0x2000_0000;
     const HANDLER_ADDR: u32 = 0x2000_0100;
@@ -18549,8 +19572,11 @@ mod stage7_exceptions_coverage {
         // Set MSPLIM so basic frame (32) fits but +FP region (72) doesn't.
         cpu.regs.msplim = cpu.regs.msp.wrapping_sub(50);
         let _ = cpu.enter_exception(2, &mut bus);
-        assert_ne!(cpu.ppb.fpccr & crate::bus::ppb::FPCCR_SPLIMVIOL, 0,
-            "SPLIMVIOL must latch when FP region drove the violation");
+        assert_ne!(
+            cpu.ppb.fpccr & crate::bus::ppb::FPCCR_SPLIMVIOL,
+            0,
+            "SPLIMVIOL must latch when FP region drove the violation"
+        );
     }
 
     // Lazy-FP path: had_fp + LSPEN=1 → LSPACT set, no S-register writes.
@@ -18964,10 +19990,10 @@ mod stage7_exceptions_coverage {
 }
 
 mod stage7_core_mod_coverage {
-    use std::sync::Arc;
     use crate::bus::Bus;
-    use crate::core::{CortexM33, Fault, PerCoreSio, CoreCounters};
+    use crate::core::{CoreCounters, CortexM33, Fault, PerCoreSio};
     use crate::threaded::CoreAtomics;
+    use std::sync::Arc;
 
     #[test]
     fn core_halted_wfi_cycles_counter() {
@@ -19070,8 +20096,8 @@ mod stage7_core_mod_coverage {
         let mut cpu = CortexM33::for_test(0);
         cpu.dcp_set_half(0, 0xDEAD_BEEF);
         assert_eq!(cpu.dcp_get_half(0), 0xDEAD_BEEF);
-        cpu.dcp_set_double(2, 3.14);
-        assert!((cpu.dcp_get_double(2) - 3.14).abs() < 1e-12);
+        cpu.dcp_set_double(2, 3.5);
+        assert!((cpu.dcp_get_double(2) - 3.5).abs() < 1e-12);
     }
 
     #[test]
@@ -19279,7 +20305,7 @@ mod stage7_dma_coverage {
         // Write distinct values via base alias, read back through each alias.
         bus.write32(DMA_BASE + 0x00, 0x1111, 0); // READ_ADDR
         bus.write32(DMA_BASE + 0x04, 0x2222, 0); // WRITE_ADDR
-        bus.write32(DMA_BASE + 0x08, 5, 0);       // TRANS_COUNT
+        bus.write32(DMA_BASE + 0x08, 5, 0); // TRANS_COUNT
         // AL1_READ_ADDR (0x14) reads READ_ADDR.
         assert_eq!(bus.read32(DMA_BASE + 0x14, 0), 0x1111);
         assert_eq!(bus.read32(DMA_BASE + 0x28, 0), 0x1111);
@@ -19538,7 +20564,8 @@ mod stage7_lib_coverage {
     fn builder_riscv_variant() {
         let emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
         assert!(emu.cores.is_riscv());
     }
 
@@ -19546,13 +20573,16 @@ mod stage7_lib_coverage {
     fn builder_custom_quantum() {
         let emu = EmulatorBuilder::new(Config::default())
             .step_quantum(128)
-            .build().unwrap();
+            .build()
+            .unwrap();
         assert_eq!(emu.step_quantum, 128);
     }
 
     #[test]
     fn builder_custom_sysclk() {
-        let config = Config { sys_clk_hz: 125_000_000 };
+        let config = Config {
+            sys_clk_hz: 125_000_000,
+        };
         let emu = EmulatorBuilder::new(config).build().unwrap();
         assert_eq!(emu.bus.sys_clk_hz(), 125_000_000);
     }
@@ -19641,7 +20671,8 @@ mod stage7_lib_coverage {
     fn core_panics_on_riscv() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let _ = emu.core_mut(0);
     }
 
@@ -19649,7 +20680,8 @@ mod stage7_lib_coverage {
     fn core_riscv_on_riscv() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
         // Should not panic.
         let _ = emu.core_riscv(0);
         let _ = emu.core_riscv_mut(1);
@@ -19673,7 +20705,8 @@ mod stage7_lib_coverage {
     fn reset_on_riscv_emulator() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
         emu.reset();
     }
 
@@ -19695,7 +20728,8 @@ mod stage7_lib_coverage {
     fn cores_expect_riscv_on_riscv() {
         let emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let _ = emu.cores.expect_riscv();
     }
 
@@ -19704,7 +20738,8 @@ mod stage7_lib_coverage {
     fn cores_expect_arm_panics_on_riscv() {
         let emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let _ = emu.cores.expect_arm();
     }
 
@@ -19720,7 +20755,8 @@ mod stage7_lib_coverage {
     fn cores_expect_arm_mut_panics_on_riscv() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .arch(Arch::RiscV)
-            .build().unwrap();
+            .build()
+            .unwrap();
         if let Cores::RiscV(_) = &emu.cores {
             let _ = emu.cores.expect_arm_mut();
         }
@@ -20026,7 +21062,10 @@ mod stage7_ppb_coverage {
         let mut ppb = Ppb::default();
         ppb.nvic_iabr[0].store(0xFF, std::sync::atomic::Ordering::Relaxed);
         ppb.clear_active(5); // system exception; no effect on IABR.
-        assert_eq!(ppb.nvic_iabr[0].load(std::sync::atomic::Ordering::Relaxed), 0xFF);
+        assert_eq!(
+            ppb.nvic_iabr[0].load(std::sync::atomic::Ordering::Relaxed),
+            0xFF
+        );
     }
 
     #[test]
@@ -20113,8 +21152,8 @@ mod stage7_ppb_coverage {
 
 mod stage7_powman_coverage {
     use crate::peripherals::powman::{
-        PowmanRegs, ALARM_TIME_15TO0_OFFSET, ARCHSEL_OFFSET, BADPASSWD_BIT, BADPASSWD_OFFSET,
-        INTE_OFFSET, INTF_OFFSET, INT_TIMER_BIT, INTR_OFFSET, INTS_OFFSET, POWMAN_PASSWORD,
+        ALARM_TIME_15TO0_OFFSET, ARCHSEL_OFFSET, BADPASSWD_BIT, BADPASSWD_OFFSET, INT_TIMER_BIT,
+        INTE_OFFSET, INTF_OFFSET, INTR_OFFSET, INTS_OFFSET, POWMAN_PASSWORD, PowmanRegs,
         READ_TIME_LOWER_OFFSET, READ_TIME_UPPER_OFFSET, SET_TIME_15TO0_OFFSET, TIMER_ALARM_BIT,
         TIMER_ALARM_ENAB_BIT, TIMER_OFFSET, TIMER_RUN_BIT, VREG_CTRL_OFFSET, VREG_OFFSET,
         VREG_STS_OFFSET,
@@ -20218,7 +21257,11 @@ mod stage7_powman_coverage {
         // Force INTR.TIMER by advancing past alarm.
         let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 5, 0);
         let _ = p.write32(INTE_OFFSET, POWMAN_PASSWORD | INT_TIMER_BIT, 0);
-        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        let _ = p.write32(
+            TIMER_OFFSET,
+            POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+            0,
+        );
         // Use a fake clock tree with default sys_clk_hz.
         use mdpicoem_common::clocks::ClockTree;
         let clock = ClockTree::default();
@@ -20235,7 +21278,11 @@ mod stage7_powman_coverage {
         let mut p = PowmanRegs::new();
         // Arm alarm without INTE first.
         let _ = p.write32(ALARM_TIME_15TO0_OFFSET, POWMAN_PASSWORD | 5, 0);
-        let _ = p.write32(TIMER_OFFSET, POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT, 0);
+        let _ = p.write32(
+            TIMER_OFFSET,
+            POWMAN_PASSWORD | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
+            0,
+        );
         use mdpicoem_common::clocks::ClockTree;
         let clock = ClockTree::default();
         let _ = p.advance(10 * 50, &clock);
@@ -20352,8 +21399,8 @@ mod stage7_powman_coverage {
 #[cfg(test)]
 mod stage8_workerbus_smoke {
     use super::*;
-    use crate::threaded::{SharedState, WorkerBus};
     use crate::core::bus_trait::CoreBus;
+    use crate::threaded::{SharedState, WorkerBus};
 
     // ---- helpers -----------------------------------------------------
 
@@ -21242,9 +22289,9 @@ mod stage8_workerbus_smoke {
     fn it_te_alternate_branches() {
         let (mut c, mut bus) = core_and_worker_bus();
         // ITE EQ, then MOVS R0,#1 (T), MOVS R0,#2 (E)
-        bus.write16(0x2000_3500, 0xBF0C, 0);   // ITE EQ (mask 0x0C)
-        bus.write16(0x2000_3502, 0x2001, 0);   // MOVS R0, #1
-        bus.write16(0x2000_3504, 0x2002, 0);   // MOVS R0, #2
+        bus.write16(0x2000_3500, 0xBF0C, 0); // ITE EQ (mask 0x0C)
+        bus.write16(0x2000_3502, 0x2001, 0); // MOVS R0, #1
+        bus.write16(0x2000_3504, 0x2002, 0); // MOVS R0, #2
         bus.write16(0x2000_3506, 0xE7FE, 0);
         c.set_reg(0, 0);
         c.regs.set_flag_z(true);
@@ -21259,10 +22306,10 @@ mod stage8_workerbus_smoke {
     fn it_tee_three_slots() {
         let (mut c, mut bus) = core_and_worker_bus();
         // ITEE EQ: mask bits spell T/E/E under EQ. Encoding 0xBF06.
-        bus.write16(0x2000_3600, 0xBF06, 0);   // ITEE EQ
-        bus.write16(0x2000_3602, 0x2001, 0);   // MOVS R0, #1 (T)
-        bus.write16(0x2000_3604, 0x2002, 0);   // MOVS R0, #2 (E)
-        bus.write16(0x2000_3606, 0x2003, 0);   // MOVS R0, #3 (E)
+        bus.write16(0x2000_3600, 0xBF06, 0); // ITEE EQ
+        bus.write16(0x2000_3602, 0x2001, 0); // MOVS R0, #1 (T)
+        bus.write16(0x2000_3604, 0x2002, 0); // MOVS R0, #2 (E)
+        bus.write16(0x2000_3606, 0x2003, 0); // MOVS R0, #3 (E)
         bus.write16(0x2000_3608, 0xE7FE, 0);
         c.set_reg(0, 0);
         c.regs.set_flag_z(false); // NE → T false, E true, E true
@@ -21283,8 +22330,8 @@ mod stage8_workerbus_smoke {
         // Using 0xBF07 (mask=0x7 → T, then EEE at Z=true positions):
         // Actually: cond = 0 (EQ), xyz = E,E,E, firstcond[0] = 0, mask = xyz'1 = 0b1111 (the last '1').
         // Use 0xBF01 — but that's 5 slots. Use a narrower TEE pattern:
-        bus.write16(0x2000_3700, 0xBF04, 0);   // IT EQ (0x04 padded)
-        bus.write16(0x2000_3702, 0x2005, 0);   // MOVS R0, #5 under EQ
+        bus.write16(0x2000_3700, 0xBF04, 0); // IT EQ (0x04 padded)
+        bus.write16(0x2000_3702, 0x2005, 0); // MOVS R0, #5 under EQ
         bus.write16(0x2000_3704, 0xE7FE, 0);
         c.set_reg(0, 0);
         c.regs.set_flag_z(true);
@@ -21298,7 +22345,7 @@ mod stage8_workerbus_smoke {
     fn it_wide_conditional_in_block() {
         let (mut c, mut bus) = core_and_worker_bus();
         // IT NE then ADDW.W R0, R0, #7
-        bus.write16(0x2000_3800, 0xBF18, 0);   // IT NE
+        bus.write16(0x2000_3800, 0xBF18, 0); // IT NE
         let (hw0, hw1) = encode_addw(0, 0, 7);
         bus.write16(0x2000_3802, hw0, 0);
         bus.write16(0x2000_3804, hw1, 0);
@@ -21615,7 +22662,7 @@ mod stage8_workerbus_smoke {
         let vtor: u32 = 0x2000_5000;
         c.ppb.vtor = vtor;
         bus.write32(vtor + 14 * 4, 0x2000_5101, 0); // PendSV → 0x2000_5100
-        bus.write16(0x2000_5100, 0xE7FE, 0);        // B . handler
+        bus.write16(0x2000_5100, 0xE7FE, 0); // B . handler
         c.regs.msp = 0x2000_6000;
         c.regs.r[13] = c.regs.msp;
 
@@ -21803,9 +22850,9 @@ mod stage8_workerbus_smoke {
         narrow_at(&mut bus, 0x2000_6300, 0x2800);
         c.set_reg(0, 0);
         c.regs.set_pc(0x2000_6300);
-        c.step_no_atomics(&mut bus);  // populate
+        c.step_no_atomics(&mut bus); // populate
         c.regs.set_pc(0x2000_6300);
-        c.step_no_atomics(&mut bus);  // cache-hit, flag-only
+        c.step_no_atomics(&mut bus); // cache-hit, flag-only
         assert!(c.flag_z());
     }
 
@@ -22226,7 +23273,7 @@ mod stage8_workerbus_smoke {
         // Clear FPCCR.LSPEN to force eager save.
         c.ppb.fpccr &= !(1 << 1);
 
-        c.regs.s[0] = 3.14;
+        c.regs.s[0] = 3.5;
         c.regs.s[15] = 1.5;
 
         bus.write16(0x2000_8B00, 0xE7FE, 0);

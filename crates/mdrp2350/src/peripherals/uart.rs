@@ -379,7 +379,7 @@ impl UartRegs {
                 self.rsr_ecr = 0;
             }
             UARTFR | UARTMIS | UARTRIS => {} // read-only
-            UARTILPR => {}                    // unmodelled
+            UARTILPR => {}                   // unmodelled
             UARTIBRD => {
                 let mut stored = self.ibrd;
                 super::apply_alias_rmw(&mut stored, value, alias);
@@ -495,7 +495,11 @@ impl UartRegs {
         let sysclks_per_byte = self.sysclks_per_byte(clock_tree);
         self.tx_cycle_accum = self.tx_cycle_accum.saturating_add(cycles as u64);
         let loopback = (self.cr & UARTCR_LBE) != 0 && (self.cr & UARTCR_RXE) != 0;
-        let rx_cap = if self.fifos_enabled() { UART_FIFO_DEPTH } else { 1 };
+        let rx_cap = if self.fifos_enabled() {
+            UART_FIFO_DEPTH
+        } else {
+            1
+        };
         while self.tx_cycle_accum >= sysclks_per_byte && !self.tx_fifo.is_empty() {
             self.tx_cycle_accum -= sysclks_per_byte;
             let byte = self.tx_fifo.pop_front().unwrap();
@@ -579,7 +583,11 @@ mod tests {
     fn fr_cts_is_zero_at_reset_not_hardwired_high() {
         let mut u = u0();
         let fr = u.read32(UARTFR);
-        assert_eq!(fr & (1 << 0), 0, "CTS (bit 0) must be 0 (not hardwired high)");
+        assert_eq!(
+            fr & (1 << 0),
+            0,
+            "CTS (bit 0) must be 0 (not hardwired high)"
+        );
     }
 
     /// Replicates the `uart0_rx_loopback` silicon scenario: configure
@@ -603,7 +611,12 @@ mod tests {
         u.write32(UARTIBRD, 81, 0, &mut irqs);
         u.write32(UARTFBRD, 24, 0, &mut irqs);
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
-        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_LBE | (1 << 9) /* RXE */ | UARTCR_TXE, 0, &mut irqs);
+        u.write32(
+            UARTCR,
+            UARTCR_UARTEN | UARTCR_LBE | (1 << 9) /* RXE */ | UARTCR_TXE,
+            0,
+            &mut irqs,
+        );
         u.write32(UARTDR, 0x42, 0, &mut irqs);
         // Tick for 4000 sysclks — roughly 30% of one byte-time (~13020
         // cycles). TX FIFO is still non-empty: BUSY=1, RXFE=1, CTS=0.
@@ -611,8 +624,7 @@ mod tests {
         u.tick(4_000, &t, &mut irqs);
         let fr = u.read32(UARTFR);
         assert_eq!(
-            fr,
-            0x0000_0018,
+            fr, 0x0000_0018,
             "UARTFR mid-TX must be 0x18 (BUSY|RXFE, CTS=0); got 0x{fr:08X}",
         );
     }
@@ -627,15 +639,19 @@ mod tests {
         u.write32(UARTIBRD, 81, 0, &mut irqs);
         u.write32(UARTFBRD, 24, 0, &mut irqs);
         u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
-        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_LBE | (1 << 9) /* RXE */ | UARTCR_TXE, 0, &mut irqs);
+        u.write32(
+            UARTCR,
+            UARTCR_UARTEN | UARTCR_LBE | (1 << 9) /* RXE */ | UARTCR_TXE,
+            0,
+            &mut irqs,
+        );
         u.write32(UARTDR, 0x42, 0, &mut irqs);
         // Tick well past one byte-time at 150 MHz (~1302 sysclks).
         let t = tree(SYS_HZ); // 150 MHz
         u.tick(60_000, &t, &mut irqs);
         let fr = u.read32(UARTFR);
         assert_eq!(
-            fr,
-            0x0000_0080,
+            fr, 0x0000_0080,
             "UARTFR post-TX must be 0x80 (TXFE, loopback byte in RX, CTS=0); got 0x{fr:08X}",
         );
         // Also verify the byte is recoverable via UARTDR read.
@@ -1015,6 +1031,9 @@ mod tests {
         // The looped-back byte must be recoverable — the observable
         // UARTDR mask 0xFF on silicon reads 0x42 after the fix.
         let dr = bus.read32(UART0_BASE + UARTDR, 0) & 0xFF;
-        assert_eq!(dr, 0x42, "RX FIFO must hold the loopback byte 0x42; got 0x{dr:02X}");
+        assert_eq!(
+            dr, 0x42,
+            "RX FIFO must hold the loopback byte 0x42; got 0x{dr:02X}"
+        );
     }
 }

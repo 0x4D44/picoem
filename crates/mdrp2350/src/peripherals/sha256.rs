@@ -68,8 +68,14 @@ const CSR_ERR_WDATA_NOT_RDY_BIT: u32 = 1 << 3;
 
 /// SHA-256 initial hash values (FIPS-180-4 §5.3.3).
 const SHA256_IV: [u32; 8] = [
-    0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
-    0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
 ];
 
 /// SHA-256 register block.

@@ -128,10 +128,10 @@ fn both_models_compare<T: PartialEq + std::fmt::Debug>(
 fn seed_single_core_alu(emu: &mut Emulator) {
     emu.core_mut(0).regs.msp = STACK_TOP;
     emu.core_mut(0).regs.r[13] = STACK_TOP;
-    emu.poke(SRAM_BASE, 0x1C40_2001);          // MOVS R0,#1 | ADDS R0,R0,#1
-    emu.poke(SRAM_BASE + 4, 0x0000_E7FD);      // B .-2
+    emu.poke(SRAM_BASE, 0x1C40_2001); // MOVS R0,#1 | ADDS R0,R0,#1
+    emu.poke(SRAM_BASE + 4, 0x0000_E7FD); // B .-2
     emu.core_mut(0).regs.set_pc(SRAM_BASE);
-    emu.core_mut(0).regs.xpsr = 1 << 24;       // Thumb bit
+    emu.core_mut(0).regs.xpsr = 1 << 24; // Thumb bit
     emu.core_mut(1).halt();
 }
 
@@ -218,22 +218,18 @@ fn run_quantum_advances_both_models() {
 /// core's counter must stay at 0 and the ALU core must make progress.
 #[test]
 fn single_core_alu_loop_advances_core0() {
-    both_models_compare(
-        RUN_CYCLES,
-        seed_single_core_alu,
-        |_emu, c0, c1| (c0 > 0, c1 == 0),
-    );
+    both_models_compare(RUN_CYCLES, seed_single_core_alu, |_emu, c0, c1| {
+        (c0 > 0, c1 == 0)
+    });
 }
 
 /// Observable: (c0_advanced, c1_advanced) shape. Both models must
 /// produce the same shape when both cores are woken on an ALU loop.
 #[test]
 fn dual_core_alu_both_cores_advance() {
-    both_models_compare(
-        RUN_CYCLES,
-        seed_dual_core_alu,
-        |_emu, c0, c1| (c0 > 0, c1 > 0),
-    );
+    both_models_compare(RUN_CYCLES, seed_dual_core_alu, |_emu, c0, c1| {
+        (c0 > 0, c1 > 0)
+    });
 }
 
 /// BIC-and-shift loop: MOVS R0,#0xFF ; MOVS R1,#0x0F ; BICS R0,R1 ; LSLS R0,R0,#4 ; B .-6.
@@ -378,17 +374,17 @@ fn dual_core_gpio_both_cores_run() {
             // Core 0 at SRAM_BASE, core 1 at SRAM_BASE+0x40.
             emu.core_mut(0).regs.msp = STACK_TOP;
             emu.core_mut(0).regs.r[13] = STACK_TOP;
-            emu.poke(SRAM_BASE, 0x2101_4A01);            // LDR R2,[PC,#4] | MOVS R1,#1
-            emu.poke(SRAM_BASE + 4, 0xE7FD_6011);        // STR R1,[R2] | B .-4
-            emu.poke(SRAM_BASE + 8, 0);                  // NOP padding
-            emu.poke(SRAM_BASE + 12, SIO_BASE + 0x028);  // SIO_GPIO_OUT_XOR
+            emu.poke(SRAM_BASE, 0x2101_4A01); // LDR R2,[PC,#4] | MOVS R1,#1
+            emu.poke(SRAM_BASE + 4, 0xE7FD_6011); // STR R1,[R2] | B .-4
+            emu.poke(SRAM_BASE + 8, 0); // NOP padding
+            emu.poke(SRAM_BASE + 12, SIO_BASE + 0x028); // SIO_GPIO_OUT_XOR
             emu.core_mut(0).regs.set_pc(SRAM_BASE);
             emu.core_mut(0).regs.xpsr = 1 << 24;
 
             emu.core_mut(1).regs.msp = STACK_TOP_CORE1;
             emu.core_mut(1).regs.r[13] = STACK_TOP_CORE1;
-            emu.poke(SRAM_BASE + 0x40, 0x2102_4A01);          // LDR R2 | MOVS R1,#2
-            emu.poke(SRAM_BASE + 0x44, 0xE7FD_6011);          // STR | B .-4
+            emu.poke(SRAM_BASE + 0x40, 0x2102_4A01); // LDR R2 | MOVS R1,#2
+            emu.poke(SRAM_BASE + 0x44, 0xE7FD_6011); // STR | B .-4
             emu.poke(SRAM_BASE + 0x48, 0);
             emu.poke(SRAM_BASE + 0x4C, SIO_BASE + 0x028);
             emu.core_mut(1).regs.set_pc(SRAM_BASE + 0x40);
@@ -703,7 +699,11 @@ fn nvic_pre_run_enable_write_accepted() {
             // elsewhere; skip the post-write read there — it's
             // Serial-only.
             let iser = emu.mmio_read32(NVIC_ISER0);
-            assert_eq!(iser & 1, 1, "NVIC_ISER bit0 must be 1 post-write on {model:?}");
+            assert_eq!(
+                iser & 1,
+                1,
+                "NVIC_ISER bit0 must be 1 post-write on {model:?}"
+            );
         }
         // Clear and run — no fault even with NVIC bit set and no IRQ pending.
         emu.mmio_write32(NVIC_ICER0, 0xFFFF_FFFF);

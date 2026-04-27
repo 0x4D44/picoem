@@ -174,7 +174,8 @@ fn pio_write(emu: &mut Emulator, offset: u32, val: u32) {
 fn pio_test_emulator() -> Emulator {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     // De-assert PIO0's RESETS bit via the CLR alias.
     emu.bus.resets_state &= !(1u32 << crate::bus::RESET_PIO0);
     emu
@@ -202,7 +203,7 @@ fn test_pio_blinky_gpio25() {
     // Load program
     let set_pins_1: u16 = 0xE001; // SET PINS, 1
     let set_pins_0: u16 = 0xE000; // SET PINS, 0
-    let jmp_0: u16 = 0x0000;      // JMP 0
+    let jmp_0: u16 = 0x0000; // JMP 0
     pio_load_program(&mut emu, &[set_pins_1, set_pins_0, jmp_0]);
 
     // SM0_PINCTRL: set_base=25, set_count=1
@@ -230,10 +231,10 @@ fn test_pio_blinky_gpio25() {
     //   Step 4: SET PINS,1 => HIGH
     //   ... repeats
     let expected = [
-        true, false, false,  // pattern 1
-        true, false, false,  // pattern 2
-        true, false, false,  // pattern 3
-        true, false, false,  // pattern 4
+        true, false, false, // pattern 1
+        true, false, false, // pattern 2
+        true, false, false, // pattern 3
+        true, false, false, // pattern 4
     ];
 
     let mut actual = Vec::new();
@@ -242,9 +243,11 @@ fn test_pio_blinky_gpio25() {
         actual.push(emu.gpio_read(25));
     }
 
-    assert_eq!(actual, expected,
+    assert_eq!(
+        actual, expected,
         "GPIO 25 waveform mismatch over 12 cycles\n  actual:   {:?}\n  expected: {:?}",
-        actual, expected);
+        actual, expected
+    );
 }
 
 #[test]
@@ -268,7 +271,10 @@ fn test_pio_uart_tx_0x55() {
     let out_pins_1: u16 = 0x6001;
     let jmp_xdec_2: u16 = 0x0042;
     let jmp_0: u16 = 0x0000;
-    pio_load_program(&mut emu, &[pull_block, set_x_7, out_pins_1, jmp_xdec_2, jmp_0]);
+    pio_load_program(
+        &mut emu,
+        &[pull_block, set_x_7, out_pins_1, jmp_xdec_2, jmp_0],
+    );
 
     // SM0_PINCTRL: out_base=0, out_count=1, set_count=1, set_base=0
     let pinctrl = (1u32 << 26) | (1u32 << 20);
@@ -333,9 +339,11 @@ fn test_pio_uart_tx_0x55() {
 
     // Expected: 0x55 LSB-first = 1,0,1,0,1,0,1,0
     let expected_bits: Vec<bool> = vec![true, false, true, false, true, false, true, false];
-    assert_eq!(received_bits, expected_bits,
+    assert_eq!(
+        received_bits, expected_bits,
         "UART TX 0x55 data bits mismatch (LSB first)\n  received: {:?}\n  expected: {:?}",
-        received_bits, expected_bits);
+        received_bits, expected_bits
+    );
 
     // Reconstruct the byte from received bits
     let mut byte: u8 = 0;
@@ -344,7 +352,11 @@ fn test_pio_uart_tx_0x55() {
             byte |= 1 << i;
         }
     }
-    assert_eq!(byte, 0x55, "reconstructed byte should be 0x55, got {:#04x}", byte);
+    assert_eq!(
+        byte, 0x55,
+        "reconstructed byte should be 0x55, got {:#04x}",
+        byte
+    );
 }
 
 #[test]
@@ -365,13 +377,20 @@ fn test_pio_spi_clk_mosi() {
 
     // Encode instructions (sideset_count=1, bit 12 = sideset)
     let pull_block_s0: u16 = 0x80A0; // 100_0_0000_10100000
-    let set_x7_s0: u16     = 0xE027; // 111_0_0000_001_00111
-    let out_pins1_s1: u16  = 0x7001; // 011_1_0000_000_00001
-    let jmp_xdec2_s0: u16  = 0x0042; // 000_0_0000_010_00010
-    let jmp_0_s0: u16      = 0x0000; // 000_0_0000_000_00000
-    pio_load_program(&mut emu, &[
-        pull_block_s0, set_x7_s0, out_pins1_s1, jmp_xdec2_s0, jmp_0_s0,
-    ]);
+    let set_x7_s0: u16 = 0xE027; // 111_0_0000_001_00111
+    let out_pins1_s1: u16 = 0x7001; // 011_1_0000_000_00001
+    let jmp_xdec2_s0: u16 = 0x0042; // 000_0_0000_010_00010
+    let jmp_0_s0: u16 = 0x0000; // 000_0_0000_000_00000
+    pio_load_program(
+        &mut emu,
+        &[
+            pull_block_s0,
+            set_x7_s0,
+            out_pins1_s1,
+            jmp_xdec2_s0,
+            jmp_0_s0,
+        ],
+    );
 
     // SM0_PINCTRL:
     //   out_base=0 (MOSI on pin 0), out_count=1
@@ -382,7 +401,7 @@ fn test_pio_spi_clk_mosi() {
                 | (1u32 << 20)   // out_count=1
                 | (1u32 << 10)   // sideset_base=1
                 | (0u32 << 5)    // set_base=0
-                | (0u32);        // out_base=0
+                | (0u32); // out_base=0
     pio_write(&mut emu, 0x0DC, pinctrl);
 
     // SM0_EXECCTRL: wrap_top=4, wrap_bottom=0, SIDE_EN=0
@@ -425,14 +444,18 @@ fn test_pio_spi_clk_mosi() {
 
     // CLK should be HIGH only on OUT steps (side 1): steps 3,5,7,...,17
     // (0-indexed: 2,4,6,8,10,12,14,16)
-    let expected_clk: Vec<bool> = (0..total_steps).map(|i| {
-        // OUT steps at 0-indexed: 2, 4, 6, 8, 10, 12, 14, 16
-        i >= 2 && i <= 16 && i % 2 == 0
-    }).collect();
+    let expected_clk: Vec<bool> = (0..total_steps)
+        .map(|i| {
+            // OUT steps at 0-indexed: 2, 4, 6, 8, 10, 12, 14, 16
+            i >= 2 && i <= 16 && i % 2 == 0
+        })
+        .collect();
 
-    assert_eq!(clk_trace, expected_clk,
+    assert_eq!(
+        clk_trace, expected_clk,
         "SPI CLK waveform mismatch\n  actual:   {:?}\n  expected: {:?}",
-        clk_trace, expected_clk);
+        clk_trace, expected_clk
+    );
 
     // MOSI data bits (sampled on CLK rising edges = OUT steps)
     let out_steps: Vec<usize> = vec![2, 4, 6, 8, 10, 12, 14, 16];
@@ -443,15 +466,21 @@ fn test_pio_spi_clk_mosi() {
 
     // Expected: 0x55 LSB-first = 1,0,1,0,1,0,1,0
     let expected_mosi: Vec<bool> = vec![true, false, true, false, true, false, true, false];
-    assert_eq!(mosi_bits, expected_mosi,
+    assert_eq!(
+        mosi_bits, expected_mosi,
         "SPI MOSI data mismatch (LSB first)\n  actual:   {:?}\n  expected: {:?}",
-        mosi_bits, expected_mosi);
+        mosi_bits, expected_mosi
+    );
 
     // Verify CLK and MOSI timing relationship: MOSI transitions
     // should be captured on the CLK rising edge (OUT instruction).
     // On CLK falling edges (JMP instruction), MOSI holds its value.
     for &i in &out_steps {
-        assert!(clk_trace[i], "CLK must be HIGH when MOSI data bit is presented (step {})", i);
+        assert!(
+            clk_trace[i],
+            "CLK must be HIGH when MOSI data bit is presented (step {})",
+            i
+        );
     }
 }
 
@@ -565,7 +594,8 @@ fn test_pio_resets_gating() {
     // from reset — the default `RESETS_POST_BOOTROM` holds PIO0/1/2.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // Confirm PIO0 is held in reset.
     assert_ne!(
@@ -587,7 +617,8 @@ fn test_pio_resets_gating() {
     emu.bus.write32(PIO0_BASE + 0x04C, jmp_0 as u32, 0);
 
     // SM0_EXECCTRL: wrap_top=1, wrap_bottom=0.
-    emu.bus.write32(PIO0_BASE + 0x0CC, (1u32 << 12) | (0u32 << 7), 0);
+    emu.bus
+        .write32(PIO0_BASE + 0x0CC, (1u32 << 12) | (0u32 << 7), 0);
     // SM0_CLKDIV: integer=1, frac=0 (one instruction per system clock).
     emu.bus.write32(PIO0_BASE + 0x0C8, 1u32 << 16, 0);
 

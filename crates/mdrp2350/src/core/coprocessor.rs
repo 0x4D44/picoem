@@ -1,9 +1,14 @@
+use super::{CoreBus, CortexM33, Fault};
 use crate::sio::Sio;
-use super::{CortexM33, CoreBus, Fault};
 
 impl CortexM33 {
     /// Top-level coprocessor dispatch.
-    pub(crate) fn thumb32_coprocessor<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_coprocessor<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
 
         // Check CPACR (2 bits per coprocessor). Phase 0b.1 Commit B:
@@ -120,7 +125,11 @@ impl CortexM33 {
         if is_bulk {
             if is_mrc {
                 // op2=0 is the documented get; other op2 treated as NOP read 0.
-                self.regs.r[rt] = if op2 == 0 { bus.gpio_read_out() & Sio::PIN_MASK } else { 0 };
+                self.regs.r[rt] = if op2 == 0 {
+                    bus.gpio_read_out() & Sio::PIN_MASK
+                } else {
+                    0
+                };
             } else {
                 let v = self.regs.r[rt] & Sio::PIN_MASK;
                 match op2 {
@@ -174,7 +183,11 @@ impl CortexM33 {
     ) {
         if is_bulk {
             if is_mrc {
-                self.regs.r[rt] = if op2 == 0 { bus.gpio_read_oe() & Sio::PIN_MASK } else { 0 };
+                self.regs.r[rt] = if op2 == 0 {
+                    bus.gpio_read_oe() & Sio::PIN_MASK
+                } else {
+                    0
+                };
             } else {
                 let v = self.regs.r[rt] & Sio::PIN_MASK;
                 match op2 {
@@ -231,7 +244,11 @@ impl CortexM33 {
             self.regs.r[rt] = bus.gpio_read_in() & Sio::PIN_MASK;
         } else {
             let pin = (crn << 4) | crm;
-            self.regs.r[rt] = if pin < 30 { (bus.gpio_read_in() >> pin) & 1 } else { 0 };
+            self.regs.r[rt] = if pin < 30 {
+                (bus.gpio_read_in() >> pin) & 1
+            } else {
+                0
+            };
         }
     }
 
@@ -390,11 +407,11 @@ impl CortexM33 {
                 // Rust's native f64 comparison operators already implement
                 // the IEEE quiet-NaN-compares-false rule.
                 let pass = match opc2 {
-                    0 => a == b,     // eq
-                    1 => a < b,      // lt
-                    2 => a <= b,     // le
-                    3 => a > b,      // gt
-                    4 => a >= b,     // ge
+                    0 => a == b, // eq
+                    1 => a < b,  // lt
+                    2 => a <= b, // le
+                    3 => a > b,  // gt
+                    4 => a >= b, // ge
                     _ => {
                         return 1; // Unknown compare — silent NOP, no status write.
                     }
@@ -570,7 +587,11 @@ impl CortexM33 {
                 (1, 0) if rt == 15 => {
                     // rcp_canary_status pc: write NZCV to APSR.
                     // N = salt_valid[core]; Z=0, C=0, V=0.
-                    let n = if self.atomics.rcp_salt_is_valid(core) { 1u32 << 31 } else { 0 };
+                    let n = if self.atomics.rcp_salt_is_valid(core) {
+                        1u32 << 31
+                    } else {
+                        0
+                    };
                     self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | n;
                 }
                 _ => {} // unrecognized MRC: silent NOP
@@ -617,7 +638,8 @@ impl CortexM33 {
             }
             (4, 0) => {
                 // rcp_count_init imm — set the redundancy counter to imm.
-                self.atomics.rcp_count_set(((crn as u32) << 4) | (crm as u32));
+                self.atomics
+                    .rcp_count_set(((crn as u32) << 4) | (crm as u32));
             }
             (5, 1) => {
                 // rcp_count_check imm — assert counter == imm, then increment.
@@ -1297,7 +1319,10 @@ mod tests {
         let (crn, crm) = split_imm8(0x6c);
         let (hw0, hw1) = encode_mcr2_full(7, 0, crn, 2, 1, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(cpu.pending_fault.is_none(), "matching canary must not raise fault");
+        assert!(
+            cpu.pending_fault.is_none(),
+            "matching canary must not raise fault"
+        );
     }
 
     #[test]
@@ -1426,7 +1451,11 @@ mod tests {
         // CDP cp7, opc1=0, opc2=1, all others zero — the bootrom encoding
         // (verified: 0xEE00_0720).
         let (hw0, hw1) = encode_cdp(7, 0, 0, 0, 1, 0);
-        assert_eq!((hw0, hw1), (0xEE00, 0x0720), "encoding must match bootrom rcp_panic");
+        assert_eq!(
+            (hw0, hw1),
+            (0xEE00, 0x0720),
+            "encoding must match bootrom rcp_panic"
+        );
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
     }
@@ -1469,12 +1498,24 @@ mod tests {
         // and implement the op against a verified encoding.
         let cases: &[(&str, (u16, u16))] = &[
             // rcp_ifgte — previously opc1=6, opc2=0 MCR2.
-            ("rcp_ifgte (MCR2 opc1=6 opc2=0)", encode_mcr2_full(7, 6, 0, 1, 0, 2)),
+            (
+                "rcp_ifgte (MCR2 opc1=6 opc2=0)",
+                encode_mcr2_full(7, 6, 0, 1, 0, 2),
+            ),
             // rcp_iflte — previously opc1=6, opc2=1 MCR2.
-            ("rcp_iflte (MCR2 opc1=6 opc2=1)", encode_mcr2_full(7, 6, 0, 1, 1, 2)),
+            (
+                "rcp_iflte (MCR2 opc1=6 opc2=1)",
+                encode_mcr2_full(7, 6, 0, 1, 1, 2),
+            ),
             // rcp_switch — previously opc1=0, opc2=2 CDP (and CDP2).
-            ("rcp_switch (CDP  opc1=0 opc2=2)", encode_cdp(7, 0, 0, 0, 2, 0)),
-            ("rcp_switch (CDP2 opc1=0 opc2=2)", encode_cdp2(7, 0, 0, 0, 2, 0)),
+            (
+                "rcp_switch (CDP  opc1=0 opc2=2)",
+                encode_cdp(7, 0, 0, 0, 2, 0),
+            ),
+            (
+                "rcp_switch (CDP2 opc1=0 opc2=2)",
+                encode_cdp2(7, 0, 0, 0, 2, 0),
+            ),
         ];
 
         for (label, (hw0, hw1)) in cases {
@@ -1519,7 +1560,10 @@ mod tests {
         // salt_valid defaults false
         let (hw0, hw1) = encode_mrc2_full(7, 1, 0, 15, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(!cpu.regs.flag_n(), "N flag must be clear when salt is invalid");
+        assert!(
+            !cpu.regs.flag_n(),
+            "N flag must be clear when salt is invalid"
+        );
     }
 
     /// Encodings observed in the bootrom must round-trip through our encoder
@@ -1584,7 +1628,10 @@ mod tests {
         // canary_check r2, 0x6C
         let (hw0, hw1) = encode_mcr2_full(7, 0, crn, 2, 1, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(cpu.pending_fault.is_none(), "get/check pair must roundtrip even with zero salt");
+        assert!(
+            cpu.pending_fault.is_none(),
+            "get/check pair must roundtrip even with zero salt"
+        );
     }
 
     /// CDP2 `rcp_panic` via 0xFE00 prefix — same bit pattern but with the
@@ -1605,7 +1652,10 @@ mod tests {
         // opc1=7, opc2=7 — not assigned by us.
         let (hw0, hw1) = encode_mcr2_full(7, 7, 0, 0, 7, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert!(cpu.pending_fault.is_none(), "unknown CP7 encoding must be silent NOP");
+        assert!(
+            cpu.pending_fault.is_none(),
+            "unknown CP7 encoding must be silent NOP"
+        );
     }
 
     // ============================================================
@@ -1869,13 +1919,13 @@ mod tests {
         let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
-        dcp_set_double(&mut cpu, 0, 3.14);
-        dcp_set_double(&mut cpu, 1, 3.14);
+        dcp_set_double(&mut cpu, 0, 3.5);
+        dcp_set_double(&mut cpu, 1, 3.5);
         let (hw0, hw1) = encode_cdp_dcp(1, 0, 0, 0, 1);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cpu.dcp_status, 1);
 
-        dcp_set_double(&mut cpu, 1, 3.15);
+        dcp_set_double(&mut cpu, 1, 3.625);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cpu.dcp_status, 0);
     }
@@ -1993,7 +2043,7 @@ mod tests {
         let mut cpu = CortexM33::for_test(0);
         let mut bus = Bus::default();
         enable_cp(&mut cpu, 4);
-        let original: f32 = 2.71828;
+        let original: f32 = 2.625;
         cpu.dcp_halves[0] = original.to_bits();
         // f2d: d[1] = (f64)(f32)d_half_a(d[0])
         let (hw0, hw1) = encode_cdp_dcp(2, 5, 1, 0, 0);
@@ -2173,8 +2223,7 @@ mod tests {
 
         // Rust's `NaN as i32` saturates to 0.
         assert_eq!(
-            cpu.dcp_halves[2] as i32,
-            0,
+            cpu.dcp_halves[2] as i32, 0,
             "d2i(NaN) half A must be 0 (Rust `NaN as i32` semantics)"
         );
         // Half B is always cleared by the d2i path.

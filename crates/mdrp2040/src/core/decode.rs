@@ -22,7 +22,7 @@
 //! fetch-wait replay — RP2040's bus does not feed wait states into the
 //! core's cycle accumulator).
 
-use super::{CortexM0Plus, CoreBus};
+use super::{CoreBus, CortexM0Plus};
 use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
 
 /// Direct-mapped index mask for the decode cache. Kept local to avoid
@@ -211,7 +211,11 @@ impl CortexM0Plus {
         }
 
         let wide = is_wide(hw0);
-        let hw1 = if wide { bus.read16(pc.wrapping_add(2)) } else { 0 };
+        let hw1 = if wide {
+            bus.read16(pc.wrapping_add(2))
+        } else {
+            0
+        };
         if wide && bus.bus_fault() {
             return DecodedOp {
                 tag: u32::MAX,
@@ -223,8 +227,12 @@ impl CortexM0Plus {
 
         let pure = classify_is_pure(hw0, hw1, wide);
         let mut flags = 0u8;
-        if wide { flags |= DecodedOp::FLAG_WIDE; }
-        if pure { flags |= DecodedOp::FLAG_PURE; }
+        if wide {
+            flags |= DecodedOp::FLAG_WIDE;
+        }
+        if pure {
+            flags |= DecodedOp::FLAG_PURE;
+        }
 
         let entry = DecodedOp {
             tag: pc,

@@ -282,15 +282,9 @@ impl TimerState {
 
     /// Route a TIMER write. Alias is the 2-bit APB normalized form
     /// (0=plain / 1=XOR / 2=BITSET / 3=BITCLR).
-    pub fn write32(
-        &mut self,
-        offset: u32,
-        value: u32,
-        alias: u32,
-        master_cycle: u64,
-        sys_hz: u32,
-    ) {
-        self.regs.write32(offset, value, alias, master_cycle, sys_hz);
+    pub fn write32(&mut self, offset: u32, value: u32, alias: u32, master_cycle: u64, sys_hz: u32) {
+        self.regs
+            .write32(offset, value, alias, master_cycle, sys_hz);
     }
 }
 

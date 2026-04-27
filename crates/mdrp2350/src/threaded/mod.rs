@@ -7,18 +7,18 @@
 //! See `wrk_docs/2026.04.17 - LLD - Threaded Dual-Core Phase 2 V4.md`.
 
 pub mod atomics;
-pub mod memory;
 pub mod gpio;
+pub mod memory;
 pub mod monitors;
 // `barrier` + `spsc` were promoted to `mdpicoem-common::threaded` as
 // Stage 3a of the dual-execution HLD V1 (§6.4 step 1). The re-exports
 // below keep every existing `crate::threaded::{SpinBarrier, SpscQueue,
 // BarrierResult}` call site source-compatible.
-pub mod sio;
-pub mod pio;
-pub mod peripherals;
-pub mod shared;
 pub mod bus;
+pub mod peripherals;
+pub mod pio;
+pub mod shared;
+pub mod sio;
 // Stage 6b (LLD V7 §8/§9): `ThreadedEmulator` pins one thread per
 // worker via `SetThreadAffinityMask`, so the whole module is gated to
 // x86_64 Windows. Non-Windows callers continue on the serial
@@ -34,22 +34,21 @@ pub mod emulator;
 pub mod timings;
 
 pub use atomics::CoreAtomics;
-pub use memory::SharedMemory;
 pub use gpio::AtomicGpio;
+pub use memory::SharedMemory;
 pub use monitors::ExclusiveMonitors;
 // Re-exported from `mdpicoem-common::threaded` (Stage 3a). Chip-local
 // call sites keep using `crate::threaded::{SpinBarrier, BarrierResult,
 // SpscQueue}` unchanged.
-pub use mdpicoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
-pub use sio::ThreadedSio;
-pub use pio::{ThreadedPio, PioCommand};
-pub use peripherals::{
-    ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState,
-    UsbState,
-};
-pub use shared::SharedState;
 pub use bus::{PioBus, WorkerBus};
 #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
 pub use emulator::{RunError, ThreadedEmulator};
+pub use mdpicoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
+pub use peripherals::{
+    ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState, UsbState,
+};
+pub use pio::{PioCommand, ThreadedPio};
+pub use shared::SharedState;
+pub use sio::ThreadedSio;
 #[cfg(all(feature = "threading", target_arch = "x86_64", target_os = "windows"))]
 pub use timings::{RunTimings, WorkerName, WorkerSummary};

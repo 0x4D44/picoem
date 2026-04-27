@@ -411,7 +411,10 @@ mod tests {
 
             // Column 2: 0x prefix, lowercase hex, width matches kind.
             let value = cols[2];
-            assert!(value.starts_with("0x"), "line {lineno}: value no 0x: {value}");
+            assert!(
+                value.starts_with("0x"),
+                "line {lineno}: value no 0x: {value}"
+            );
             let value_digits = &value[2..];
             let expected_width = match kind {
                 "write8" | "read8" => 2,

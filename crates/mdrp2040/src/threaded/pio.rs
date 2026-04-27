@@ -208,19 +208,43 @@ mod tests {
     #[test]
     fn pio_command_block_dispatch() {
         assert_eq!(
-            PioCommand::WriteCtrl { block: 0, val: 0, alias: 0 }.block(),
+            PioCommand::WriteCtrl {
+                block: 0,
+                val: 0,
+                alias: 0
+            }
+            .block(),
             0
         );
         assert_eq!(
-            PioCommand::WriteInstrMem { block: 1, addr: 0, value: 0, alias: 0 }.block(),
+            PioCommand::WriteInstrMem {
+                block: 1,
+                addr: 0,
+                value: 0,
+                alias: 0
+            }
+            .block(),
             1
         );
         assert_eq!(
-            PioCommand::SetClkDiv { block: 1, sm: 0, int_div: 0, frac_div: 0, alias: 0 }.block(),
+            PioCommand::SetClkDiv {
+                block: 1,
+                sm: 0,
+                int_div: 0,
+                frac_div: 0,
+                alias: 0
+            }
+            .block(),
             1
         );
         assert_eq!(
-            PioCommand::WriteReg { block: 0, offset: 0, val: 0, alias: 0 }.block(),
+            PioCommand::WriteReg {
+                block: 0,
+                offset: 0,
+                val: 0,
+                alias: 0
+            }
+            .block(),
             0
         );
     }

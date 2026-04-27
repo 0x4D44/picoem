@@ -36,8 +36,7 @@ use mdrp2350::{Config, Emulator, EmulatorBuilder};
 // ---------------------------------------------------------------------------
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-const FLASH_PATH: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
+const FLASH_PATH: &str = "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
 
 /// ROM set index parsed from the fixture. `0` = 1541 $E000 kernal
 /// (901229-06AA, 2364 bake) — matches the library's hardcoded pin
@@ -154,7 +153,8 @@ fn parse_cli() -> Result<Cli, String> {
 fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_bootrom(bootrom);
     emu.load_flash(flash);
     emu.reset();
@@ -171,11 +171,7 @@ fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
 
     // Force ROM set 0 via the image_sel helper so the firmware boots
     // the 2364 bake matching the library pin constants.
-    onerom_serving_oracle_cpu::force_rom_set_index_via_sel_pins(
-        &mut emu,
-        flash,
-        ROM_SET_INDEX,
-    )?;
+    onerom_serving_oracle_cpu::force_rom_set_index_via_sel_pins(&mut emu, flash, ROM_SET_INDEX)?;
 
     // Phase 1: step until PC enters the serve-loop range.
     let mut phase1_cycle: Option<u64> = None;
@@ -363,10 +359,7 @@ fn main() -> ExitCode {
         ROM_SET_INDEX
     );
     println!("fixture:  {}", FLASH_PATH);
-    println!(
-        "cases:    {} (full address sweep, A11=A12=1)",
-        total_cases
-    );
+    println!("cases:    {} (full address sweep, A11=A12=1)", total_cases);
     println!();
     println!("   threshold     errors    verdict");
     println!("      (cy)");

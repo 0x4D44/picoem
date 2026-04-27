@@ -168,9 +168,7 @@ const S_SMOKE_GPIO_BIT24_ROUND_TRIP: &[(u32, u32)] = &[
     (SIO_GPIO_OE_SET, GPIO24),
     (SIO_GPIO_OUT_SET, GPIO24),
 ];
-const O_SMOKE_GPIO_BIT24_ROUND_TRIP: &[(u32, u32)] = &[
-    (SIO_GPIO_OUT, GPIO24),
-];
+const O_SMOKE_GPIO_BIT24_ROUND_TRIP: &[(u32, u32)] = &[(SIO_GPIO_OUT, GPIO24)];
 
 // GAP_TIMER_UNMODELLED — divergence-inducing scenario expected to FAIL
 // today; will PASS after Phase 1 lands TIMER. Serves as Phase 0's
@@ -187,12 +185,8 @@ const O_SMOKE_GPIO_BIT24_ROUND_TRIP: &[(u32, u32)] = &[
 // ignore convention silicon sometimes uses for partial TIMERAWL reads;
 // any non-zero value in the low 24 bits on silicon diverges from the
 // emulator's zero.
-const S_GAP_TIMER_UNMODELLED: &[(u32, u32)] = &[
-    (RESETS_RESET + ALIAS_CLR, RESET_TIMER),
-];
-const O_GAP_TIMER_UNMODELLED: &[(u32, u32)] = &[
-    (TIMER_TIMERAWL, 0x00FF_FFFF),
-];
+const S_GAP_TIMER_UNMODELLED: &[(u32, u32)] = &[(RESETS_RESET + ALIAS_CLR, RESET_TIMER)];
+const O_GAP_TIMER_UNMODELLED: &[(u32, u32)] = &[(TIMER_TIMERAWL, 0x00FF_FFFF)];
 
 // SMOKE_XOSC_CTRL_WRITE_ROUND_TRIP — baseline smoke that writes a
 // sentinel value into XOSC_CTRL and reads it back. Both HW and EMU
@@ -212,12 +206,8 @@ const O_GAP_TIMER_UNMODELLED: &[(u32, u32)] = &[
 // intent was that the emulator might swallow XOSC_CTRL writes. It does
 // not — the dispatch path landed in Phase 0 Wave 2. Renamed to reflect
 // reality.
-const S_SMOKE_XOSC_CTRL_WRITE_ROUND_TRIP: &[(u32, u32)] = &[
-    (XOSC_CTRL, 0x00FA_BABE),
-];
-const O_SMOKE_XOSC_CTRL_WRITE_ROUND_TRIP: &[(u32, u32)] = &[
-    (XOSC_CTRL, 0x00FF_FFFF),
-];
+const S_SMOKE_XOSC_CTRL_WRITE_ROUND_TRIP: &[(u32, u32)] = &[(XOSC_CTRL, 0x00FA_BABE)];
+const O_SMOKE_XOSC_CTRL_WRITE_ROUND_TRIP: &[(u32, u32)] = &[(XOSC_CTRL, 0x00FF_FFFF)];
 
 /// Phase 0 catalogue. V7 HLD §4.4.3 required four scenarios; devil's-
 /// advocate review classified three as green round-trip smoke and one
@@ -452,10 +442,7 @@ fn run_sled_hw(core: &mut Core) -> Result<(), Box<dyn std::error::Error>> {
             let pc: u32 = core.read_core_reg(PC_REG).unwrap_or(0xDEAD_BEEF);
             let sp: u32 = core.read_core_reg(SP_REG).unwrap_or(0xDEAD_BEEF);
             let lr: u32 = core.read_core_reg(LR_REG).unwrap_or(0xDEAD_BEEF);
-            return Err(format!(
-                "BKPT timeout: PC=0x{pc:08X} SP=0x{sp:08X} LR=0x{lr:08X}"
-            )
-            .into());
+            return Err(format!("BKPT timeout: PC=0x{pc:08X} SP=0x{sp:08X} LR=0x{lr:08X}").into());
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -528,15 +515,18 @@ fn run_scenario(
 
     // Emulator side — fresh builder per scenario so PRIMASK/CONTROL/
     // pending-fault state cannot leak between cases.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .expect("Serial build is infallible");
     emu.core_mut(1).halt();
     for &(addr, val) in sc.setup {
         emu.mmio_write32(addr, val);
     }
 
     if let Some(bytes) = sc.custom_sled {
-        let vetted: &[u8] = validate_custom_sled(bytes)
-            .map_err(|e| format!("scenario '{}': {e}", sc.name))?;
+        let vetted: &[u8] =
+            validate_custom_sled(bytes).map_err(|e| format!("scenario '{}': {e}", sc.name))?;
         emu.load_image(SILICON_RUN_SLED, vetted);
         {
             let c = emu.core_mut(0);
@@ -549,9 +539,7 @@ fn run_scenario(
         let bkpt_pc = SILICON_RUN_SLED + (vetted.len() as u32) - 2;
         let start = emu.cycles();
         let budget = window_sysclks as u64;
-        while emu.core(0).regs.pc() != bkpt_pc
-            && emu.cycles().saturating_sub(start) < budget
-        {
+        while emu.core(0).regs.pc() != bkpt_pc && emu.cycles().saturating_sub(start) < budget {
             emu.step().expect("Serial step is infallible");
         }
         let overshot = emu.core(0).regs.pc() != bkpt_pc;
@@ -570,11 +558,15 @@ fn run_scenario(
         // Default path: halt cores, advance bus/peripheral state by the
         // HW-measured window so both sides see the same cycle count.
         emu.core_mut(0).halt();
-        emu.run(window_sysclks as u64).expect("Serial run is infallible");
+        emu.run(window_sysclks as u64)
+            .expect("Serial run is infallible");
     }
 
-    let emu_obs: Vec<u32> =
-        sc.observe.iter().map(|(addr, _m)| emu.mmio_read32(*addr)).collect();
+    let emu_obs: Vec<u32> = sc
+        .observe
+        .iter()
+        .map(|(addr, _m)| emu.mmio_read32(*addr))
+        .collect();
     let emu_pins = if sc.observe_pins != 0 {
         Some(sample_pins_emu(&mut emu, sc.observe_pins))
     } else {
@@ -623,7 +615,10 @@ fn run_scenario(
                 println!("    DIFF {msg}");
             }
         } else if verbose {
-            println!("    ok   MMIO 0x{:08X} mask=0x{:08X}: 0x{:08X}", addr, mask, h);
+            println!(
+                "    ok   MMIO 0x{:08X} mask=0x{:08X}: 0x{:08X}",
+                addr, mask, h
+            );
         }
     }
     if let (Some(h), Some(e)) = (hw_pins, emu_pins) {
@@ -647,7 +642,11 @@ fn run_scenario(
         }
     }
 
-    let verdict = if first_div.is_none() { Verdict::Pass } else { Verdict::Fail };
+    let verdict = if first_div.is_none() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    };
     Ok(ScenarioResult {
         name: sc.name,
         verdict,
@@ -721,7 +720,11 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     let selected: Vec<&PeriphScenario> = SCENARIOS
         .iter()
-        .filter(|s| args.filter.as_deref().is_none_or(|sub| s.name.contains(sub)))
+        .filter(|s| {
+            args.filter
+                .as_deref()
+                .is_none_or(|sub| s.name.contains(sub))
+        })
         .collect();
 
     let skipped = SCENARIOS.len() - selected.len();
@@ -817,8 +820,7 @@ mod tests {
     use super::*;
 
     fn is_mmio(addr: u32) -> bool {
-        (0x4000_0000..0x6000_0000).contains(&addr)
-            || (0xD000_0000..0xE000_0000).contains(&addr)
+        (0x4000_0000..0x6000_0000).contains(&addr) || (0xD000_0000..0xE000_0000).contains(&addr)
     }
 
     #[test]
@@ -861,9 +863,13 @@ mod tests {
     fn sysclk_bounds_positive_and_ordered() {
         for sc in SCENARIOS {
             assert!(sc.max_sysclks > 0, "'{}' has max_sysclks=0", sc.name);
-            assert!(sc.min_sysclks <= sc.max_sysclks,
+            assert!(
+                sc.min_sysclks <= sc.max_sysclks,
                 "'{}' min_sysclks {} > max_sysclks {}",
-                sc.name, sc.min_sysclks, sc.max_sysclks);
+                sc.name,
+                sc.min_sysclks,
+                sc.max_sysclks
+            );
         }
     }
 
@@ -961,7 +967,10 @@ mod tests {
     #[test]
     fn assemble_sled_converges_to_bkpt() {
         let sled = assemble_sled(40); // N = ceil(40/4) = 10 iterations
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         emu.core_mut(1).halt();
         emu.load_image(SILICON_RUN_SLED, &sled);
         {
@@ -977,8 +986,7 @@ mod tests {
         // bounded loop always halts, an infinite loop never does.
         let budget: u64 = 500;
         let start = emu.cycles();
-        while emu.core(0).regs.pc() != bkpt_pc && emu.cycles().saturating_sub(start) < budget
-        {
+        while emu.core(0).regs.pc() != bkpt_pc && emu.cycles().saturating_sub(start) < budget {
             emu.step().expect("Serial step is infallible");
         }
         assert_eq!(

@@ -17,9 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use crate::threaded::{
-    atomics::CoreAtomics, gpio::AtomicGpio, memory::SharedMemory,
-    monitors::ExclusiveMonitors, peripherals::Peripherals, pio::ThreadedPio,
-    sio::ThreadedSio,
+    atomics::CoreAtomics, gpio::AtomicGpio, memory::SharedMemory, monitors::ExclusiveMonitors,
+    peripherals::Peripherals, pio::ThreadedPio, sio::ThreadedSio,
 };
 
 /// Arc-bundled shared state handed to every worker in the threaded

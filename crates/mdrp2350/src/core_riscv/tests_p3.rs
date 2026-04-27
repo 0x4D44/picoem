@@ -18,10 +18,8 @@
 // compressed-instruction table. Each test plants a 16-bit word at the
 // reset PC and single-steps.
 
-use super::decode::{
-    self, AmoKind, MulDivKind, Op,
-};
 use super::Hazard3;
+use super::decode::{self, AmoKind, MulDivKind, Op};
 use crate::Bus;
 
 // ---------- helpers ----------
@@ -30,8 +28,13 @@ use super::tests_common::{fresh, write_hw, write_insn};
 
 // R-type encoder — matches tests_p2.
 fn enc_r(opcode: u32, rd: u8, f3: u32, rs1: u8, rs2: u8, f7: u32) -> u32 {
-    (f7 << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15)
-        | (f3 << 12) | ((rd as u32) << 7) | (opcode << 2) | 0b11
+    (f7 << 25)
+        | ((rs2 as u32) << 20)
+        | ((rs1 as u32) << 15)
+        | (f3 << 12)
+        | ((rd as u32) << 7)
+        | (opcode << 2)
+        | 0b11
 }
 
 // AMO encoder: funct5 + aq + rl + rs2 + rs1 + 010 + rd + 0101111
@@ -59,8 +62,14 @@ fn mul_basic() {
     c.x[1] = 7;
     c.x[2] = 6;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Mul, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Mul,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 42);
 }
@@ -72,8 +81,14 @@ fn mul_wraps_low_32() {
     c.x[1] = 0x0001_0000;
     c.x[2] = 0x0001_0000;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Mul, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Mul,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0);
 }
@@ -85,16 +100,28 @@ fn mulh_signed_signed() {
     c.x[1] = (-2i32) as u32;
     c.x[2] = (-3i32) as u32;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Mulh, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Mulh,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0);
     // INT_MIN * INT_MIN = 2^62 -> high 32 = 2^30 = 0x4000_0000.
     c.x[1] = i32::MIN as u32;
     c.x[2] = i32::MIN as u32;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Mulh, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Mulh,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0x4000_0000);
 }
@@ -108,8 +135,14 @@ fn mulhsu_signed_times_unsigned() {
     c.x[1] = (-1i32) as u32;
     c.x[2] = 0xFFFF_FFFF;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Mulhsu, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Mulhsu,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0xFFFF_FFFF);
 }
@@ -121,8 +154,14 @@ fn mulhu_unsigned() {
     c.x[1] = 0xFFFF_FFFF;
     c.x[2] = 0xFFFF_FFFF;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Mulhu, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Mulhu,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0xFFFF_FFFE);
 }
@@ -133,15 +172,27 @@ fn div_basic_and_negative() {
     c.x[1] = 20;
     c.x[2] = 3;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Div, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Div,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3] as i32, 6);
     c.x[1] = (-20i32) as u32;
     c.x[2] = 3;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Div, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Div,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3] as i32, -6);
 }
@@ -152,8 +203,14 @@ fn div_by_zero_yields_all_ones() {
     c.x[1] = 42;
     c.x[2] = 0;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Div, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Div,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0xFFFF_FFFF);
 }
@@ -164,8 +221,14 @@ fn div_overflow_intmin_div_minus1() {
     c.x[1] = i32::MIN as u32;
     c.x[2] = (-1i32) as u32;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Div, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Div,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], i32::MIN as u32);
 }
@@ -176,14 +239,26 @@ fn divu_basic_and_by_zero() {
     c.x[1] = 0xFFFF_FFFE;
     c.x[2] = 2;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Divu, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Divu,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0x7FFF_FFFF);
     c.x[2] = 0;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Divu, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Divu,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0xFFFF_FFFF);
 }
@@ -194,8 +269,14 @@ fn rem_basic_and_overflow() {
     c.x[1] = (-20i32) as u32;
     c.x[2] = 3;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Rem, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Rem,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3] as i32, -2, "sign of dividend");
 
@@ -203,8 +284,14 @@ fn rem_basic_and_overflow() {
     c.x[1] = i32::MIN as u32;
     c.x[2] = (-1i32) as u32;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Rem, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Rem,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0);
 }
@@ -215,8 +302,14 @@ fn rem_by_zero_returns_dividend() {
     c.x[1] = 0xCAFE_BABE;
     c.x[2] = 0;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Rem, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Rem,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0xCAFE_BABE);
 }
@@ -227,8 +320,14 @@ fn remu_by_zero_returns_dividend() {
     c.x[1] = 0xDEAD_BEEF;
     c.x[2] = 0;
     c.execute(
-        Op::MulDiv { kind: MulDivKind::Remu, rd: 3, rs1: 1, rs2: 2 },
-        &mut bus, 0,
+        Op::MulDiv {
+            kind: MulDivKind::Remu,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], 0xDEAD_BEEF);
 }
@@ -256,8 +355,16 @@ fn lr_w_records_reservation_and_loads() {
     bus.memory.sram_write32(0x100, 0x1234_5678);
     c.x[1] = 0x2000_0100;
     c.execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[2], 0x1234_5678);
     assert_eq!(bus.reservation[0], Some(0x2000_0100));
@@ -270,14 +377,30 @@ fn sc_w_succeeds_when_reservation_matches() {
     c.x[1] = 0x2000_0100;
     // LR
     c.execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     // SC new value
     c.x[3] = 0xDEAD_BEEF;
     c.execute(
-        Op::Amo { kind: AmoKind::Sc, rd: 4, rs1: 1, rs2: 3, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Sc,
+            rd: 4,
+            rs1: 1,
+            rs2: 3,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[4], 0, "SC success returns 0");
     assert_eq!(bus.memory.sram_read32(0x100), 0xDEAD_BEEF);
@@ -287,10 +410,18 @@ fn sc_w_succeeds_when_reservation_matches() {
 #[test]
 fn sc_w_fails_when_reservation_cleared_by_other_core() {
     let (mut c0, mut bus) = fresh();
-    c0.x[1] = 0x2000_0200;    // Core 0 LR
+    c0.x[1] = 0x2000_0200; // Core 0 LR
     c0.execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(bus.reservation[0], Some(0x2000_0200));
 
@@ -304,8 +435,16 @@ fn sc_w_fails_when_reservation_cleared_by_other_core() {
     // SC fails (rd=1).
     c0.x[3] = 0x1234_5678;
     c0.execute(
-        Op::Amo { kind: AmoKind::Sc, rd: 4, rs1: 1, rs2: 3, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Sc,
+            rd: 4,
+            rs1: 1,
+            rs2: 3,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c0.x[4], 1, "SC fails after reservation cleared");
     // Memory unchanged by the failing SC.
@@ -318,8 +457,16 @@ fn lr_w_outside_reservable_silent_noop() {
     // XIP SRAM region — outside reservable per HLD §4.7.
     c.x[1] = 0x1C00_0000;
     c.execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     // No reservation recorded.
     assert_eq!(bus.reservation[0], None);
@@ -335,8 +482,16 @@ fn sc_w_outside_reservable_silent_fail() {
     c.x[1] = 0x1C00_0000;
     c.x[3] = 0xBEEF_BEEF;
     c.execute(
-        Op::Amo { kind: AmoKind::Sc, rd: 4, rs1: 1, rs2: 3, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Sc,
+            rd: 4,
+            rs1: 1,
+            rs2: 3,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[4], 1, "SC outside reservable returns 1");
     assert_eq!(c.csrs.mcause, 0, "no trap");
@@ -349,10 +504,21 @@ fn amo_outside_reservable_traps_cause7() {
     c.x[1] = 0x1C00_0000; // XIP SRAM — outside reservable
     c.x[2] = 1;
     c.execute(
-        Op::Amo { kind: AmoKind::Add, rd: 3, rs1: 1, rs2: 2, aq: false, rl: false },
-        &mut bus, 0x2000_0000,
+        Op::Amo {
+            kind: AmoKind::Add,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0x2000_0000,
     );
-    assert_eq!(c.csrs.mcause, 7, "amo outside reservable -> store access fault");
+    assert_eq!(
+        c.csrs.mcause, 7,
+        "amo outside reservable -> store access fault"
+    );
     assert_eq!(c.pc, 0x2000_2000);
 }
 
@@ -362,8 +528,16 @@ fn lr_w_misaligned_traps_cause4() {
     c.csrs.mtvec = 0x2000_2000;
     c.x[1] = 0x2000_0101; // word-misaligned
     c.execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0x2000_0000,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0x2000_0000,
     );
     assert_eq!(c.csrs.mcause, 4);
 }
@@ -374,8 +548,16 @@ fn sc_w_misaligned_traps_cause6() {
     c.csrs.mtvec = 0x2000_2000;
     c.x[1] = 0x2000_0101;
     c.execute(
-        Op::Amo { kind: AmoKind::Sc, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0x2000_0000,
+        Op::Amo {
+            kind: AmoKind::Sc,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0x2000_0000,
     );
     assert_eq!(c.csrs.mcause, 6);
 }
@@ -386,8 +568,16 @@ fn amoadd_w_misaligned_traps_cause6() {
     c.csrs.mtvec = 0x2000_2000;
     c.x[1] = 0x2000_0101;
     c.execute(
-        Op::Amo { kind: AmoKind::Add, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0x2000_0000,
+        Op::Amo {
+            kind: AmoKind::Add,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0x2000_0000,
     );
     assert_eq!(c.csrs.mcause, 6);
 }
@@ -401,13 +591,23 @@ fn amo_case(kind: AmoKind, old: u32, src: u32, expected_new: u32) {
     c.x[1] = 0x2000_0000 + off;
     c.x[2] = src;
     c.execute(
-        Op::Amo { kind, rd: 3, rs1: 1, rs2: 2, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind,
+            rd: 3,
+            rs1: 1,
+            rs2: 2,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[3], old, "rd = original value");
     assert_eq!(
-        bus.memory.sram_read32(off), expected_new,
-        "mem after amo[{:?}]", kind,
+        bus.memory.sram_read32(off),
+        expected_new,
+        "mem after amo[{:?}]",
+        kind,
     );
 }
 
@@ -416,7 +616,7 @@ fn amo_swap_add_and_or_xor() {
     amo_case(AmoKind::Swap, 0x1111_1111, 0x2222_2222, 0x2222_2222);
     amo_case(AmoKind::Add, 100, 23, 123);
     amo_case(AmoKind::And, 0xF0F0_F0F0, 0xFF00_FF00, 0xF000_F000);
-    amo_case(AmoKind::Or,  0x0F0F_0F0F, 0xF0F0_F0F0, 0xFFFF_FFFF);
+    amo_case(AmoKind::Or, 0x0F0F_0F0F, 0xF0F0_F0F0, 0xFFFF_FFFF);
     amo_case(AmoKind::Xor, 0xAAAA_AAAA, 0xFFFF_FFFF, 0x5555_5555);
 }
 
@@ -459,8 +659,16 @@ fn lrsc_property_invariants_two_harts() {
     // --- Invariant: after lr.w on core 0, reservation[0] == Some(addr).
     harts[0].x[1] = addr;
     harts[0].execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(bus.reservation[0], Some(addr));
     assert_eq!(bus.reservation[1], None);
@@ -471,14 +679,30 @@ fn lrsc_property_invariants_two_harts() {
     harts[1].x[2] = 0x1111_1111;
     // Core 1 also reserves the same word.
     harts[1].execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 3, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 3,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(bus.reservation[1], Some(addr));
     // Now core 1 does a successful SC.
     harts[1].execute(
-        Op::Amo { kind: AmoKind::Sc, rd: 4, rs1: 1, rs2: 2, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Sc,
+            rd: 4,
+            rs1: 1,
+            rs2: 2,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(harts[1].x[4], 0, "SC on core 1 succeeded");
     assert_eq!(bus.memory.sram_read32(0x1000), 0x1111_1111);
@@ -491,11 +715,23 @@ fn lrsc_property_invariants_two_harts() {
     // memory unchanged.    harts[0].x[1] = addr;
     harts[0].x[2] = 0xDEAD_DEAD;
     harts[0].execute(
-        Op::Amo { kind: AmoKind::Sc, rd: 5, rs1: 1, rs2: 2, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Sc,
+            rd: 5,
+            rs1: 1,
+            rs2: 2,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(harts[0].x[5], 1, "SC fails without prior LR");
-    assert_eq!(bus.memory.sram_read32(0x1000), 0x1111_1111, "memory unchanged");
+    assert_eq!(
+        bus.memory.sram_read32(0x1000),
+        0x1111_1111,
+        "memory unchanged"
+    );
 
     // --- Invariant: amo*.w outside reservable -> mcause=7, memory
     // unchanged.
@@ -506,8 +742,16 @@ fn lrsc_property_invariants_two_harts() {
     harts[0].x[1] = xip_addr;
     harts[0].x[2] = 5;
     harts[0].execute(
-        Op::Amo { kind: AmoKind::Add, rd: 6, rs1: 1, rs2: 2, aq: false, rl: false },
-        &mut bus, 0x2000_0000,
+        Op::Amo {
+            kind: AmoKind::Add,
+            rd: 6,
+            rs1: 1,
+            rs2: 2,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0x2000_0000,
     );
     assert_eq!(harts[0].csrs.mcause, 7);
     assert_eq!(bus.memory.sram_read32(0x1000), before);
@@ -701,7 +945,10 @@ fn c_j_unconditional_jump_pc_plus_2() {
     let (mut c, mut bus) = fresh();
     write_hw(&mut bus, 0, cj);
     c.step(&mut bus);
-    assert_eq!(c.pc, 0x2000_0004, "c.j with imm=4 jumps from 0x..0000 to 0x..0004");
+    assert_eq!(
+        c.pc, 0x2000_0004,
+        "c.j with imm=4 jumps from 0x..0000 to 0x..0004"
+    );
 }
 
 #[test]
@@ -889,8 +1136,16 @@ fn sc_w_different_addr_fails() {
     // LR.W at 0x2000_1000: reservation[0] = Some(0x2000_1000).
     c.x[1] = 0x2000_1000;
     c.execute(
-        Op::Amo { kind: AmoKind::Lr, rd: 2, rs1: 1, rs2: 0, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Lr,
+            rd: 2,
+            rs1: 1,
+            rs2: 0,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[2], 0xAAAA_AAAA, "LR loaded the word at 0x2000_1000");
     assert_eq!(bus.reservation[0], Some(0x2000_1000));
@@ -900,8 +1155,16 @@ fn sc_w_different_addr_fails() {
     c.x[3] = 0x2000_1004;
     c.x[4] = 0xDEAD_BEEF;
     c.execute(
-        Op::Amo { kind: AmoKind::Sc, rd: 5, rs1: 3, rs2: 4, aq: false, rl: false },
-        &mut bus, 0,
+        Op::Amo {
+            kind: AmoKind::Sc,
+            rd: 5,
+            rs1: 3,
+            rs2: 4,
+            aq: false,
+            rl: false,
+        },
+        &mut bus,
+        0,
     );
     assert_eq!(c.x[5], 1, "SC at a different addr must fail (rd=1)");
     // Target word unchanged.

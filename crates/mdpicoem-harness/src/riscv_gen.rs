@@ -304,10 +304,10 @@ pub fn gen_rv32i_alu_edge_cases() -> Vec<RiscvTestCase> {
     // Register-immediate (OP-IMM, funct7/funct3 per RV32I table)
     let i_cases: &[(&str, u32, i32, u8, u8)] = &[
         ("addi_zero", 0, 0, 1, 2),
-        ("addi_pos", 0, 0x7FF, 3, 4),     // max positive imm
-        ("addi_neg", 0, -2048, 5, 6),     // min negative imm
-        ("addi_alias_same", 0, 1, 7, 7),  // rd == rs1
-        ("addi_x0_write", 0, 42, 1, 0),   // rd = x0 → discarded
+        ("addi_pos", 0, 0x7FF, 3, 4),    // max positive imm
+        ("addi_neg", 0, -2048, 5, 6),    // min negative imm
+        ("addi_alias_same", 0, 1, 7, 7), // rd == rs1
+        ("addi_x0_write", 0, 42, 1, 0),  // rd = x0 → discarded
         ("slti_neg", 2, -1, 8, 9),
         ("sltiu_one", 3, 1, 10, 11),
         ("xori_all", 4, -1, 12, 13),
@@ -316,7 +316,13 @@ pub fn gen_rv32i_alu_edge_cases() -> Vec<RiscvTestCase> {
     ];
     for &(name, funct3, imm, rs1, rd) in i_cases {
         let w = encode_i_type(imm, rs1, funct3, rd, OPC_OP_IMM);
-        out.push(alu_case(format!("alu_{name}"), w, rd, rs1, imm_as_reg_u32(imm)));
+        out.push(alu_case(
+            format!("alu_{name}"),
+            w,
+            rd,
+            rs1,
+            imm_as_reg_u32(imm),
+        ));
     }
     // Shift-immediate: shamt[4:0] plus funct7 (0 for SLLI/SRLI, 0x20 for SRAI).
     let shift_cases: &[(&str, u32, u32, u32, u8, u8)] = &[
@@ -630,10 +636,7 @@ pub fn gen_rv32i_branch_edge_cases() -> Vec<RiscvTestCase> {
     // JAL near-forward with sled (same as conditional branch forward
     // layout), plus one backward case (same as backward layout above).
     // `jal_rdx0` is forward imm = 4, rd = 0 (no link).
-    let jal_forward: &[(&str, i32, u8)] = &[
-        ("jal_near_pos", 4, 1),
-        ("jal_rdx0", 4, 0),
-    ];
+    let jal_forward: &[(&str, i32, u8)] = &[("jal_near_pos", 4, 1), ("jal_rdx0", 4, 0)];
     for &(name, imm, rd) in jal_forward {
         let w = encode_j_type(imm, rd, OPC_JAL);
         let mut words = vec![w];
@@ -827,7 +830,7 @@ pub fn gen_rv32a_reservable_edge_cases() -> Vec<RiscvTestCase> {
     //   amominu.w  = 0b11000
     //   amomaxu.w  = 0b11100
     let amo_ops: &[(&str, u32, bool)] = &[
-        ("lr_w", 0b00010, true),      // rs2 must be 0 for lr.w
+        ("lr_w", 0b00010, true), // rs2 must be 0 for lr.w
         ("sc_w", 0b00011, false),
         ("amoswap_w", 0b00001, false),
         ("amoadd_w", 0b00000, false),
@@ -905,19 +908,19 @@ pub fn gen_rv32c_edge_cases() -> Vec<RiscvTestCase> {
     const TRAP_EBREAK: u32 = TRAP_STUB + 16;
     let plain: &[(&str, u16, Option<(u8, u32)>)] = &[
         ("c_addi4spn", 0b0_0000_0001_0010_0000, None), // addi4spn rd'=x8, nzimm=small
-        ("c_nop", 0x0001, None),                           // c.addi x0, 0 (canonical nop)
-        ("c_addi_1", 0x0085, None),                        // c.addi x1, 1
-        ("c_li", 0x4085, None),                            // c.li x1, 1 (imm[4:0]=00001)
-        ("c_lui", 0x6105, None),                           // c.lui x2, 1  (imm nonzero)
-        ("c_andi", 0x8805, None),                          // c.andi x8, 1
+        ("c_nop", 0x0001, None),                       // c.addi x0, 0 (canonical nop)
+        ("c_addi_1", 0x0085, None),                    // c.addi x1, 1
+        ("c_li", 0x4085, None),                        // c.li x1, 1 (imm[4:0]=00001)
+        ("c_lui", 0x6105, None),                       // c.lui x2, 1  (imm nonzero)
+        ("c_andi", 0x8805, None),                      // c.andi x8, 1
         // c.jr / c.jalr rs1 = x1; seed x1 to TRAP_EBREAK so the jump
         // lands on the handler's ebreak — avoids the x1 = 0 fetch-fault
         // divergence (QEMU mcause 1 vs emu mcause 2).
-        ("c_jr_x1", 0x8082, Some((1, TRAP_EBREAK))),       // c.jr x1
-        ("c_jalr_x1", 0x9082, Some((1, TRAP_EBREAK))),     // c.jalr x1
-        ("c_slli", 0x0086, None),                          // c.slli x1, 1
-        ("c_lwsp", 0x4082, None),                          // c.lwsp x1, 0(sp)
-        ("c_swsp", 0xc006, None),                          // c.swsp x1, 0(sp)
+        ("c_jr_x1", 0x8082, Some((1, TRAP_EBREAK))), // c.jr x1
+        ("c_jalr_x1", 0x9082, Some((1, TRAP_EBREAK))), // c.jalr x1
+        ("c_slli", 0x0086, None),                    // c.slli x1, 1
+        ("c_lwsp", 0x4082, None),                    // c.lwsp x1, 0(sp)
+        ("c_swsp", 0xc006, None),                    // c.swsp x1, 0(sp)
     ];
     for &(name, enc, extra) in plain {
         let mut reg_pre = vec![(2, SCRATCH_BASE)]; // sp in scratchpad for stack cases
@@ -1001,8 +1004,10 @@ pub fn gen_rv32c_edge_cases() -> Vec<RiscvTestCase> {
     //   15:13 = 101, 12:10 = 011, 9:7 = 011, 6:5 = rs1'/rs2' variant, 4:2 = reg pair idx, 1:0 = 10
     // We sweep a few register-pair discriminators.
     for idx in 0u16..4 {
-        let enc_mvsa: u16 = 0b101 << 13 | 0b011 << 10 | 0b011 << 7 | 0b01 << 5 | (idx & 0x7) << 2 | 0b10;
-        let enc_mva01s: u16 = 0b101 << 13 | 0b011 << 10 | 0b011 << 7 | 0b11 << 5 | (idx & 0x7) << 2 | 0b10;
+        let enc_mvsa: u16 =
+            0b101 << 13 | 0b011 << 10 | 0b011 << 7 | 0b01 << 5 | (idx & 0x7) << 2 | 0b10;
+        let enc_mva01s: u16 =
+            0b101 << 13 | 0b011 << 10 | 0b011 << 7 | 0b11 << 5 | (idx & 0x7) << 2 | 0b10;
         out.push(RiscvTestCase {
             name: format!("zcmp_cm_mvsa01_{idx}"),
             words: vec![u32::from(enc_mvsa)],
@@ -1185,25 +1190,25 @@ pub fn gen_csr_side_effect_edge_cases() -> Vec<RiscvTestCase> {
 pub fn gen_pmp_edge_cases() -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(20);
     let patterns: &[(&str, u16, u32)] = &[
-        ("pmpcfg0_zero",        0x3A0, 0x0000_0000),
-        ("pmpcfg0_rwx",         0x3A0, 0x0000_0007),
-        ("pmpcfg0_napot",       0x3A0, 0x0000_0018),
-        ("pmpcfg0_napot_rwx",   0x3A0, 0x0000_001F),
-        ("pmpcfg0_tor",         0x3A0, 0x0000_0008),
-        ("pmpcfg0_na4",         0x3A0, 0x0000_0010),
-        ("pmpcfg0_reserved",    0x3A0, 0x0000_0060),
-        ("pmpcfg0_bad_rw",      0x3A0, 0x0000_0002),
+        ("pmpcfg0_zero", 0x3A0, 0x0000_0000),
+        ("pmpcfg0_rwx", 0x3A0, 0x0000_0007),
+        ("pmpcfg0_napot", 0x3A0, 0x0000_0018),
+        ("pmpcfg0_napot_rwx", 0x3A0, 0x0000_001F),
+        ("pmpcfg0_tor", 0x3A0, 0x0000_0008),
+        ("pmpcfg0_na4", 0x3A0, 0x0000_0010),
+        ("pmpcfg0_reserved", 0x3A0, 0x0000_0060),
+        ("pmpcfg0_bad_rw", 0x3A0, 0x0000_0002),
         // Phase-2: pmpcfg1 byte 0 is now synthesised (entry 4).
-        ("pmpcfg1_entry4_rwx",  0x3A1, 0x0000_000F),
+        ("pmpcfg1_entry4_rwx", 0x3A1, 0x0000_000F),
         // Phase-2: entry 8 stays WI — boundary probe.
-        ("pmpcfg2_unsynth",     0x3A2, 0x0000_00FF),
-        ("pmpaddr0_zero",       0x3B0, 0x0000_0000),
-        ("pmpaddr0_ones",       0x3B0, 0xFFFF_FFFF),
-        ("pmpaddr0_napot_16b",  0x3B0, 0x0008_0007),
+        ("pmpcfg2_unsynth", 0x3A2, 0x0000_00FF),
+        ("pmpaddr0_zero", 0x3B0, 0x0000_0000),
+        ("pmpaddr0_ones", 0x3B0, 0xFFFF_FFFF),
+        ("pmpaddr0_napot_16b", 0x3B0, 0x0008_0007),
         // Phase-2: pmpaddr7 now writable — readback verifies full width.
-        ("pmpaddr7_writable",   0x3B7, 0xDEAD_BEEF),
+        ("pmpaddr7_writable", 0x3B7, 0xDEAD_BEEF),
         // Phase-2: entry 8 pmpaddr stays WI — boundary probe.
-        ("pmpaddr8_unsynth",    0x3B8, 0xDEAD_BEEF),
+        ("pmpaddr8_unsynth", 0x3B8, 0xDEAD_BEEF),
     ];
     for (name, csr, val) in patterns {
         // csrrw x10, <csr>, x6  ; csrrs x11, <csr>, x0
@@ -1270,7 +1275,11 @@ pub fn gen_fuzz_rv32i_alu<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCas
         } else {
             // R-type
             let funct3 = funct3_r_list[rng.gen_range(0..funct3_r_list.len())];
-            let funct7 = if funct3 == 0 && rng.gen_bool(0.3) { 0x20 } else { 0 };
+            let funct7 = if funct3 == 0 && rng.gen_bool(0.3) {
+                0x20
+            } else {
+                0
+            };
             let rs2 = rand_gpr(rng);
             encode_r_type(funct7, rs2, rs1, funct3, rd, OPC_OP)
         };
@@ -1346,10 +1355,7 @@ pub fn gen_fuzz_rv32i_mem<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCas
 }
 
 /// Fuzz generator: deliberately misaligned loads/stores.
-pub fn gen_fuzz_rv32i_misaligned<R: Rng>(
-    rng: &mut R,
-    count: usize,
-) -> Vec<RiscvTestCase> {
+pub fn gen_fuzz_rv32i_misaligned<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let is_load = rng.gen_bool(0.5);
@@ -1436,7 +1442,9 @@ pub fn gen_fuzz_rv32i_branch<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTest
                     // Same reservation as `rand_gpr` (skip gp/t6) plus x0 is
                     // fine (JAL to x0 = no link).
                     let r = rng.gen_range(0..32_u8);
-                    if r != 3 && r != 31 { break r; }
+                    if r != 3 && r != 31 {
+                        break r;
+                    }
                 };
                 encode_j_type(offset, rd, OPC_JAL)
             }
@@ -1464,7 +1472,11 @@ pub fn gen_fuzz_rv32i_upper<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestC
     for i in 0..count {
         let rd = rng.gen_range(0..32_u8);
         let imm = rng.next_u32() & 0xFFFF_F000;
-        let op = if rng.gen_bool(0.5) { OPC_LUI } else { OPC_AUIPC };
+        let op = if rng.gen_bool(0.5) {
+            OPC_LUI
+        } else {
+            OPC_AUIPC
+        };
         let w = encode_u_type(imm, rd, op);
         out.push(RiscvTestCase {
             name: format!("fuzz_upper_{i}"),
@@ -1507,8 +1519,10 @@ pub fn gen_fuzz_rv32m<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
 pub fn gen_fuzz_rv32a<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
     // funct7 op5 bits per §4.5 / RISC-V spec §8.
-    const OP5: &[u32] = &[0b00010, 0b00011, 0b00001, 0b00000, 0b00100, 0b01000, 0b01100,
-        0b10000, 0b10100, 0b11000, 0b11100];
+    const OP5: &[u32] = &[
+        0b00010, 0b00011, 0b00001, 0b00000, 0b00100, 0b01000, 0b01100, 0b10000, 0b10100, 0b11000,
+        0b11100,
+    ];
     for i in 0..count {
         let op5 = OP5[rng.gen_range(0..OP5.len())];
         let aqrl = rng.gen_range(0..4_u32); // { 00, 01, 10, 11 }
@@ -1531,7 +1545,9 @@ pub fn gen_fuzz_rv32a<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
         // so its result never pollutes the GPR diff.
         if op5 == 0b00011 {
             let lr_funct7 = (0b00010 << 2) | aqrl;
-            words.push(encode_r_type(lr_funct7, /*rs2*/ 0, rs1, 0b010, /*rd*/ 0, OPC_AMO));
+            words.push(encode_r_type(
+                lr_funct7, /*rs2*/ 0, rs1, 0b010, /*rd*/ 0, OPC_AMO,
+            ));
         }
         words.push(w);
         let mut reg_pre = vec![(rs1, SCRATCH_BASE)];
@@ -1649,13 +1665,8 @@ fn gen_rvc_mem_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let b5_3 = (uimm >> 3) & 0b111;
             let b2 = (uimm >> 2) & 0b1;
             let b6 = (uimm >> 6) & 0b1;
-            let enc = 0b010_u16 << 13
-                | b5_3 << 10
-                | rs1p << 7
-                | b2 << 6
-                | b6 << 5
-                | rdp << 2
-                | 0b00;
+            let enc =
+                0b010_u16 << 13 | b5_3 << 10 | rs1p << 7 | b2 << 6 | b6 << 5 | rdp << 2 | 0b00;
             let rs1 = (rs1p + 8) as u8;
             (enc, vec![(rs1, SCRATCH_BASE)])
         }
@@ -1667,13 +1678,8 @@ fn gen_rvc_mem_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let b5_3 = (uimm >> 3) & 0b111;
             let b2 = (uimm >> 2) & 0b1;
             let b6 = (uimm >> 6) & 0b1;
-            let enc = 0b110_u16 << 13
-                | b5_3 << 10
-                | rs1p << 7
-                | b2 << 6
-                | b6 << 5
-                | rs2p << 2
-                | 0b00;
+            let enc =
+                0b110_u16 << 13 | b5_3 << 10 | rs1p << 7 | b2 << 6 | b6 << 5 | rs2p << 2 | 0b00;
             let rs1 = (rs1p + 8) as u8;
             let rs2 = (rs2p + 8) as u8;
             let mut reg_pre = vec![(rs1, SCRATCH_BASE)];
@@ -1693,12 +1699,7 @@ fn gen_rvc_mem_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let b5 = (uimm >> 5) & 0b1;
             let b4_2 = (uimm >> 2) & 0b111;
             let b7_6 = (uimm >> 6) & 0b11;
-            let enc = 0b010_u16 << 13
-                | b5 << 12
-                | rd << 7
-                | b4_2 << 4
-                | b7_6 << 2
-                | 0b10;
+            let enc = 0b010_u16 << 13 | b5 << 12 | rd << 7 | b4_2 << 4 | b7_6 << 2 | 0b10;
             (enc, vec![(2, SCRATCH_BASE)])
         }
         _ => {
@@ -1708,11 +1709,7 @@ fn gen_rvc_mem_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let uimm = (rng.gen_range(0_u16..64)) << 2;
             let b5_2 = (uimm >> 2) & 0b1111;
             let b7_6 = (uimm >> 6) & 0b11;
-            let enc = 0b110_u16 << 13
-                | b5_2 << 9
-                | b7_6 << 7
-                | rs2 << 2
-                | 0b10;
+            let enc = 0b110_u16 << 13 | b5_2 << 9 | b7_6 << 7 | rs2 << 2 | 0b10;
             (enc, vec![(2, SCRATCH_BASE), (rs2 as u8, rng.next_u32())])
         }
     };
@@ -1760,7 +1757,11 @@ fn gen_rvc_branch_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
             // Seed the test register to a mix of zero (taken) and non-zero
             // (not-taken) across the fuzz batch so both paths get coverage.
-            let val: u32 = if rng.gen_bool(0.5) { 0 } else { rng.next_u32() | 1 };
+            let val: u32 = if rng.gen_bool(0.5) {
+                0
+            } else {
+                rng.next_u32() | 1
+            };
             (encode_c_beqz(imm, rs1p, 0b110), vec![(rs1, val)])
         }
         _ => {
@@ -1768,7 +1769,11 @@ fn gen_rvc_branch_case<R: Rng>(rng: &mut R, i: usize) -> RiscvTestCase {
             let rs1p = rng.gen_range(0_u16..8);
             let rs1 = (rs1p + 8) as u8;
             let imm = (rng.gen_range(1..=(SLED_BYTES / 2)) * 2) as i32;
-            let val: u32 = if rng.gen_bool(0.5) { 0 } else { rng.next_u32() | 1 };
+            let val: u32 = if rng.gen_bool(0.5) {
+                0
+            } else {
+                rng.next_u32() | 1
+            };
             (encode_c_beqz(imm, rs1p, 0b111), vec![(rs1, val)])
         }
     };
@@ -1827,14 +1832,7 @@ fn encode_c_beqz(imm: i32, rs1p: u16, f3: u16) -> u16 {
     let b5 = ((raw >> 5) & 1) as u16;
     let b4_3 = ((raw >> 3) & 0b11) as u16;
     let b2_1 = ((raw >> 1) & 0b11) as u16;
-    f3 << 13
-        | b8 << 12
-        | b4_3 << 10
-        | rs1p << 7
-        | b7_6 << 5
-        | b2_1 << 3
-        | b5 << 2
-        | 0b01
+    f3 << 13 | b8 << 12 | b4_3 << 10 | rs1p << 7 | b7_6 << 5 | b2_1 << 3 | b5 << 2 | 0b01
 }
 
 /// Build a well-formed RV32C arithmetic encoding. Every returned
@@ -1979,8 +1977,7 @@ fn gen_rv32c_arith<R: Rng>(rng: &mut R) -> u16 {
             let b6 = (nzimm_raw >> 6) & 1;
             let b5 = (nzimm_raw >> 5) & 1;
             let b4 = (nzimm_raw >> 4) & 1;
-            0b011 << 13 | b9 << 12 | 2 << 7
-                | b4 << 6 | b6 << 5 | b8_7 << 3 | b5 << 2 | 0b01
+            0b011 << 13 | b9 << 12 | 2 << 7 | b4 << 6 | b6 << 5 | b8_7 << 3 | b5 << 2 | 0b01
         }
     }
 }
@@ -2068,10 +2065,7 @@ pub fn gen_fuzz_zifencei<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase
 }
 
 /// Fuzz generator: CSR-side-effect chains. Kept bounded per LLD §6.
-pub fn gen_fuzz_csr_side_effect<R: Rng>(
-    rng: &mut R,
-    count: usize,
-) -> Vec<RiscvTestCase> {
+pub fn gen_fuzz_csr_side_effect<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     let mut out = Vec::with_capacity(count);
     // Fuzz-relevant M-mode CSRs. `mtvec` (0x305) is deliberately omitted:
     // writing a random value to the trap vector isn't a meaningful test
@@ -2106,10 +2100,22 @@ pub fn gen_fuzz_csr_side_effect<R: Rng>(
     // the write" side effect the class is probing, without burning
     // pathological whole-register random bit patterns into mstatus/mip.
     const SAFE_VALUES: [u32; 16] = [
-        0x0000_0000, 0x0000_0001, 0x0000_0002, 0x0000_0004,
-        0x0000_0008, 0x0000_0080, 0x0000_0800, 0x0000_1800,
-        0x0000_00FF, 0x0000_0FFF, 0x0000_8888, 0x8000_0000,
-        0x8000_0003, 0x8000_0007, 0x8000_000B, 0x0000_1888,
+        0x0000_0000,
+        0x0000_0001,
+        0x0000_0002,
+        0x0000_0004,
+        0x0000_0008,
+        0x0000_0080,
+        0x0000_0800,
+        0x0000_1800,
+        0x0000_00FF,
+        0x0000_0FFF,
+        0x0000_8888,
+        0x8000_0000,
+        0x8000_0003,
+        0x8000_0007,
+        0x8000_000B,
+        0x0000_1888,
     ];
     for i in 0..count {
         let csr = CSRS[rng.gen_range(0..CSRS.len())];
@@ -2157,8 +2163,7 @@ pub fn gen_fuzz_pmp<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
     // clean on both sides. Kept in the pool because `--class pmp`
     // callers generally want the full CSR surface exercised.
     const CSRS: &[u16] = &[
-        0x3A0, 0x3A1, 0x3A2, 0x3A3,
-        0x3B0, 0x3B1, 0x3B2, 0x3B3, 0x3B4, 0x3B5, 0x3B6, 0x3B7,
+        0x3A0, 0x3A1, 0x3A2, 0x3A3, 0x3B0, 0x3B1, 0x3B2, 0x3B3, 0x3B4, 0x3B5, 0x3B6, 0x3B7,
     ];
     // Interesting bit patterns for rs1. Phase-2 hard constraint (HLD
     // §5.1 Risk 1 + V2 §A.6): **no L-bit (bit 7 of any pmpcfg byte)
@@ -2219,7 +2224,9 @@ pub fn gen_fuzz_pmp<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
                 let r = rand_gpr(rng);
                 // Avoid collision with rd1 so both write-old and read-back
                 // values show up in distinct GPR slots.
-                if r != rd1 { break r; }
+                if r != rd1 {
+                    break r;
+                }
             };
             let csrrs = encode_csr(csr, 0, 2, rd2);
             vec![csrrw, csrrs]
@@ -2270,7 +2277,10 @@ pub fn generate_fuzz<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
         .collect();
     let allocated: usize = allocations.iter().map(|(_, n)| *n).sum();
     // Distribute residue into the ALU bucket (largest weight).
-    if let Some(slot) = allocations.iter_mut().find(|(c, _)| *c == RiscvClass::Rv32iAlu) {
+    if let Some(slot) = allocations
+        .iter_mut()
+        .find(|(c, _)| *c == RiscvClass::Rv32iAlu)
+    {
         slot.1 += count - allocated;
     }
     let mut out = Vec::with_capacity(count);
@@ -2301,8 +2311,8 @@ pub fn generate_fuzz<R: Rng>(rng: &mut R, count: usize) -> Vec<RiscvTestCase> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     // --------------------------------------------------------------------
     // Encoder-helper unit tests — known-good hand-computed constants.
@@ -2508,10 +2518,21 @@ mod tests {
         // Mirror mdrp2350::bus::canon_oracle_addr so the 0x8xxx_xxxx alias
         // resolves to its SRAM image before the window check — matches the
         // runtime's in_reservable() semantics.
-        let canon = |a: u32| if (a >> 28) == 0x8 { (a & 0x0FFF_FFFF) | 0x2000_0000 } else { a };
+        let canon = |a: u32| {
+            if (a >> 28) == 0x8 {
+                (a & 0x0FFF_FFFF) | 0x2000_0000
+            } else {
+                a
+            }
+        };
         for tc in &cs {
             for reg in &tc.addr_regs {
-                let v = tc.reg_pre.iter().find(|(r, _)| r == reg).map(|(_, v)| *v).unwrap();
+                let v = tc
+                    .reg_pre
+                    .iter()
+                    .find(|(r, _)| r == reg)
+                    .map(|(_, v)| *v)
+                    .unwrap();
                 let v_canon = canon(v);
                 assert!(
                     (RESERVABLE_LO..RESERVABLE_HI).contains(&v_canon),
@@ -2554,13 +2575,24 @@ mod tests {
         // the CSR addr falls into the pmpcfg (0x3A0..=0x3A3) or pmpaddr
         // (0x3B0..=0x3BF) range.
         for tc in &cs {
-            assert_eq!(tc.words.len(), 2, "pmp edge case must be a write-then-read pair: {}", tc.name);
+            assert_eq!(
+                tc.words.len(),
+                2,
+                "pmp edge case must be a write-then-read pair: {}",
+                tc.name
+            );
             for &w in &tc.words {
-                assert_eq!(w & 0x7F, OPC_SYSTEM, "pmp word not OPC_SYSTEM in {}: 0x{w:08X}", tc.name);
+                assert_eq!(
+                    w & 0x7F,
+                    OPC_SYSTEM,
+                    "pmp word not OPC_SYSTEM in {}: 0x{w:08X}",
+                    tc.name
+                );
                 let csr = (w >> 20) & 0xFFF;
                 assert!(
                     (0x3A0..=0x3A3).contains(&csr) || (0x3B0..=0x3BF).contains(&csr),
-                    "pmp csr out of range in {}: 0x{csr:03x}", tc.name
+                    "pmp csr out of range in {}: 0x{csr:03x}",
+                    tc.name
                 );
             }
         }
@@ -2578,8 +2610,10 @@ mod tests {
         // ~25 % of the RV32C pool, so a batch of 200 yields ~50 mem cases.
         let mut rng = StdRng::seed_from_u64(0xC0DE_BA5E);
         let cases = gen_fuzz_rv32c(&mut rng, 200);
-        let mem_cases: Vec<&RiscvTestCase> =
-            cases.iter().filter(|tc| tc.name.contains("_mem_")).collect();
+        let mem_cases: Vec<&RiscvTestCase> = cases
+            .iter()
+            .filter(|tc| tc.name.contains("_mem_"))
+            .collect();
         assert!(
             mem_cases.len() >= 20,
             "fuzz_rvc_{{mem}} sampled too rarely: {}/200",
@@ -2668,11 +2702,21 @@ mod tests {
         // Every two-word case starts with FENCE.I.
         for tc in cases.iter().filter(|tc| tc.words.len() == 2) {
             let w = tc.words[0];
-            assert_eq!(w & 0x7F, OPC_MISC_MEM, "zifencei head not MISC-MEM: {}", tc.name);
+            assert_eq!(
+                w & 0x7F,
+                OPC_MISC_MEM,
+                "zifencei head not MISC-MEM: {}",
+                tc.name
+            );
             assert_eq!((w >> 12) & 0x7, 1, "zifencei head not FENCE.I: {}", tc.name);
             // Second word must be an ADDI (OP-IMM, funct3=0).
             let w2 = tc.words[1];
-            assert_eq!(w2 & 0x7F, OPC_OP_IMM, "zifencei tail not OP-IMM: {}", tc.name);
+            assert_eq!(
+                w2 & 0x7F,
+                OPC_OP_IMM,
+                "zifencei tail not OP-IMM: {}",
+                tc.name
+            );
             assert_eq!((w2 >> 12) & 0x7, 0, "zifencei tail not ADDI: {}", tc.name);
         }
     }
@@ -2855,10 +2899,20 @@ mod tests {
         }
         // Every Zcmp sweep case must be tagged `expect_trap: Some(2)`.
         for tc in zcmp {
-            assert_eq!(tc.expect_trap, Some(2), "Zcmp case {} not tagged trap=2", tc.name);
+            assert_eq!(
+                tc.expect_trap,
+                Some(2),
+                "Zcmp case {} not tagged trap=2",
+                tc.name
+            );
             // And the bit pattern must satisfy funct3=5 AND quadrant=2.
             let enc = tc.words[0] as u16;
-            assert_eq!((enc >> 13) & 0x7, 0b101, "Zcmp funct3 bit-pattern wrong in {}", tc.name);
+            assert_eq!(
+                (enc >> 13) & 0x7,
+                0b101,
+                "Zcmp funct3 bit-pattern wrong in {}",
+                tc.name
+            );
             assert_eq!(enc & 0x3, 0b10, "Zcmp quadrant bits wrong in {}", tc.name);
         }
     }
@@ -2878,18 +2932,17 @@ mod tests {
     fn decoded_to_class(inst: &riscv_decode::Instruction) -> &'static str {
         use riscv_decode::Instruction::*;
         match inst {
-            Add(_) | Addi(_) | Sub(_) | Sll(_) | Slli(_) | Srl(_) | Srli(_) | Sra(_)
-            | Srai(_) | Xor(_) | Xori(_) | Or(_) | Ori(_) | And(_) | Andi(_) | Slt(_)
-            | Slti(_) | Sltu(_) | Sltiu(_) => "alu",
+            Add(_) | Addi(_) | Sub(_) | Sll(_) | Slli(_) | Srl(_) | Srli(_) | Sra(_) | Srai(_)
+            | Xor(_) | Xori(_) | Or(_) | Ori(_) | And(_) | Andi(_) | Slt(_) | Slti(_) | Sltu(_)
+            | Sltiu(_) => "alu",
             Lb(_) | Lh(_) | Lw(_) | Lbu(_) | Lhu(_) | Sb(_) | Sh(_) | Sw(_) => "mem",
-            Beq(_) | Bne(_) | Blt(_) | Bge(_) | Bltu(_) | Bgeu(_) | Jal(_) | Jalr(_) => {
-                "branch"
-            }
+            Beq(_) | Bne(_) | Blt(_) | Bge(_) | Bltu(_) | Bgeu(_) | Jal(_) | Jalr(_) => "branch",
             Lui(_) | Auipc(_) => "upper",
-            Mul(_) | Mulh(_) | Mulhu(_) | Mulhsu(_) | Div(_) | Divu(_) | Rem(_)
-            | Remu(_) => "rv32m",
-            LrW(_) | ScW(_) | AmoswapW(_) | AmoaddW(_) | AmoxorW(_) | AmoandW(_)
-            | AmoorW(_) | AmominW(_) | AmomaxW(_) | AmominuW(_) | AmomaxuW(_) => "rv32a",
+            Mul(_) | Mulh(_) | Mulhu(_) | Mulhsu(_) | Div(_) | Divu(_) | Rem(_) | Remu(_) => {
+                "rv32m"
+            }
+            LrW(_) | ScW(_) | AmoswapW(_) | AmoaddW(_) | AmoxorW(_) | AmoandW(_) | AmoorW(_)
+            | AmominW(_) | AmomaxW(_) | AmominuW(_) | AmomaxuW(_) => "rv32a",
             Csrrw(_) | Csrrs(_) | Csrrc(_) | Csrrwi(_) | Csrrsi(_) | Csrrci(_) => "zicsr",
             FenceI => "fencei",
             Fence(_) => "fence",
@@ -2907,9 +2960,7 @@ mod tests {
             // covers `addi x0, x0, 0` (NOP); `decoded == "misc"` covers
             // the planted ebreak used by backward-taken layouts. Both
             // are harness scaffolding, not branch instructions under test.
-            RiscvClass::Rv32iBranch => {
-                decoded == "branch" || decoded == "alu" || decoded == "misc"
-            }
+            RiscvClass::Rv32iBranch => decoded == "branch" || decoded == "alu" || decoded == "misc",
             RiscvClass::Rv32iUpper => decoded == "upper" || decoded == "alu",
             RiscvClass::Rv32m => decoded == "rv32m",
             RiscvClass::Rv32aReservable => decoded == "rv32a",
@@ -2918,9 +2969,7 @@ mod tests {
             // fence-family word and a subsequent arithmetic word. The
             // class is still "fence-family under test"; the trailing ADDI
             // is scaffolding exercising the post-fence register bank.
-            RiscvClass::Zifencei => {
-                decoded == "fencei" || decoded == "fence" || decoded == "alu"
-            }
+            RiscvClass::Zifencei => decoded == "fencei" || decoded == "fence" || decoded == "alu",
             RiscvClass::CsrSideEffect => {
                 // Multi-instruction: the first word is a csrrw/csrrs etc.,
                 // the second a branch or arithmetic.  The per-word check

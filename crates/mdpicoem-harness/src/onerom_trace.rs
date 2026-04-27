@@ -54,8 +54,8 @@ pub struct Trace {
 /// Returns a string error (rather than `io::Error`) to preserve the
 /// existing callers' error-handling surface.
 pub fn parse_trace(path: &Path) -> Result<Trace, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     parse_trace_str(&text)
 }
 
@@ -69,14 +69,11 @@ pub fn parse_trace_str(text: &str) -> Result<Trace, String> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("instr ") {
-            parse_instr(rest, &mut trace)
-                .map_err(|e| format!("line {}: {}", lineno + 1, e))?;
+            parse_instr(rest, &mut trace).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
         } else if let Some(rest) = line.strip_prefix("reg ") {
-            parse_reg(rest, &mut trace)
-                .map_err(|e| format!("line {}: {}", lineno + 1, e))?;
+            parse_reg(rest, &mut trace).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
         } else {
-            parse_body_row(line, &mut trace)
-                .map_err(|e| format!("line {}: {}", lineno + 1, e))?;
+            parse_body_row(line, &mut trace).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
         }
     }
     Ok(trace)
@@ -116,7 +113,12 @@ fn parse_reg(rest: &str, trace: &mut Trace) -> Result<(), String> {
     let execctrl = next_hex(&mut toks, "execctrl")?;
     let shiftctrl = next_hex(&mut toks, "shiftctrl")?;
     let pinctrl = next_hex(&mut toks, "pinctrl")?;
-    trace.regs[sm as usize] = SmReg { clkdiv, execctrl, shiftctrl, pinctrl };
+    trace.regs[sm as usize] = SmReg {
+        clkdiv,
+        execctrl,
+        shiftctrl,
+        pinctrl,
+    };
     Ok(())
 }
 
@@ -127,7 +129,13 @@ fn parse_body_row(line: &str, trace: &mut Trace) -> Result<(), String> {
     let input_level = next_hex(&mut toks, "input_level")?;
     let out_drive = next_hex(&mut toks, "out_drive")?;
     let out_level = next_hex(&mut toks, "out_level")?;
-    trace.body.push(BodyRow { cycle, input_drive, input_level, out_drive, out_level });
+    trace.body.push(BodyRow {
+        cycle,
+        input_drive,
+        input_level,
+        out_drive,
+        out_level,
+    });
     Ok(())
 }
 
@@ -136,13 +144,11 @@ fn next_num<'a, T: std::str::FromStr>(
     what: &str,
 ) -> Result<T, String> {
     let s = toks.next().ok_or_else(|| format!("missing {}", what))?;
-    s.parse::<T>().map_err(|_| format!("bad {} number: {}", what, s))
+    s.parse::<T>()
+        .map_err(|_| format!("bad {} number: {}", what, s))
 }
 
-fn next_hex<'a>(
-    toks: &mut impl Iterator<Item = &'a str>,
-    what: &str,
-) -> Result<u32, String> {
+fn next_hex<'a>(toks: &mut impl Iterator<Item = &'a str>, what: &str) -> Result<u32, String> {
     let s = toks.next().ok_or_else(|| format!("missing {}", what))?;
     u32::from_str_radix(s.trim_start_matches("0x"), 16)
         .map_err(|_| format!("bad {} hex: {}", what, s))
@@ -163,12 +169,15 @@ reg 1 0 0x00010000 0x00020000 0x00030000 0x00040000
 ";
         let t = parse_trace_str(text).unwrap();
         assert_eq!(t.instrs, vec![0x1234, 0xABCD]);
-        assert_eq!(t.regs[0], SmReg {
-            clkdiv: 0x0001_0000,
-            execctrl: 0x0002_0000,
-            shiftctrl: 0x0003_0000,
-            pinctrl: 0x0004_0000,
-        });
+        assert_eq!(
+            t.regs[0],
+            SmReg {
+                clkdiv: 0x0001_0000,
+                execctrl: 0x0002_0000,
+                shiftctrl: 0x0003_0000,
+                pinctrl: 0x0004_0000,
+            }
+        );
         assert_eq!(t.body.len(), 2);
         assert_eq!(t.body[0].cycle, 0);
         assert_eq!(t.body[1].out_level, 0x01);

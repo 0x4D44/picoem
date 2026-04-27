@@ -13,6 +13,5 @@ use probe_rs::probe::DebugProbeSelector;
 /// message that prefixes the offending input string. All probe-using
 /// binaries should funnel through this so the error format is uniform.
 pub fn parse_probe_selector(s: &str) -> Result<DebugProbeSelector, String> {
-    DebugProbeSelector::try_from(s)
-        .map_err(|e| format!("invalid probe selector '{s}': {e}"))
+    DebugProbeSelector::try_from(s).map_err(|e| format!("invalid probe selector '{s}': {e}"))
 }

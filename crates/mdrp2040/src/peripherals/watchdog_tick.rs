@@ -110,9 +110,7 @@ impl WatchdogTickRegs {
                 }
                 v
             }
-            o if (SCRATCH0_OFFSET..SCRATCH_END_OFFSET).contains(&o)
-                && (o & 0x3) == 0 =>
-            {
+            o if (SCRATCH0_OFFSET..SCRATCH_END_OFFSET).contains(&o) && (o & 0x3) == 0 => {
                 self.scratch[((o - SCRATCH0_OFFSET) >> 2) as usize]
             }
             _ => 0,
@@ -129,9 +127,7 @@ impl WatchdogTickRegs {
     /// sufficient for firmware that polls `RUNNING` after `ENABLE`
     /// (there's no corpus binary distinguishing the two cadences).
     pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
-        if (SCRATCH0_OFFSET..SCRATCH_END_OFFSET).contains(&offset)
-            && (offset & 0x3) == 0
-        {
+        if (SCRATCH0_OFFSET..SCRATCH_END_OFFSET).contains(&offset) && (offset & 0x3) == 0 {
             let idx = ((offset - SCRATCH0_OFFSET) >> 2) as usize;
             apply_alias_rmw(&mut self.scratch[idx], value, alias);
             return;

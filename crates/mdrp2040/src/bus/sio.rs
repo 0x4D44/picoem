@@ -348,7 +348,11 @@ impl Sio {
         // Raw → shifted (arithmetic shift when SIGNED).
         let raw = accum0;
         let shifted: u32 = if shift >= 32 {
-            if signed { ((raw as i32) >> 31) as u32 } else { 0 }
+            if signed {
+                ((raw as i32) >> 31) as u32
+            } else {
+                0
+            }
         } else if signed {
             ((raw as i32) >> shift) as u32
         } else {
@@ -425,10 +429,18 @@ impl Sio {
 
     fn fifo_st_read(&self, core: usize) -> u32 {
         // Bit 0: VLD — this core's RX queue has data.
-        let rx_fifo = if core == 0 { &self.fifo_to_core0 } else { &self.fifo_to_core1 };
+        let rx_fifo = if core == 0 {
+            &self.fifo_to_core0
+        } else {
+            &self.fifo_to_core1
+        };
         let vld = !rx_fifo.is_empty();
         // Bit 1: RDY — other core's RX queue has space.
-        let tx_fifo = if core == 0 { &self.fifo_to_core1 } else { &self.fifo_to_core0 };
+        let tx_fifo = if core == 0 {
+            &self.fifo_to_core1
+        } else {
+            &self.fifo_to_core0
+        };
         let rdy = !tx_fifo.is_full();
         let wof = self.fifo_wof[core];
         let roe = self.fifo_roe[core];
@@ -599,20 +611,34 @@ impl Sio {
     fn divider_write(&mut self, offset: u32, val: u32, core: usize) {
         let d = &mut self.divider[core];
         match offset {
-            0x060 => { d.dividend = val; d.signed = false; }
+            0x060 => {
+                d.dividend = val;
+                d.signed = false;
+            }
             0x064 => {
                 d.divisor = val;
                 d.signed = false;
                 Self::compute_division(d);
             }
-            0x068 => { d.dividend = val; d.signed = true; }
+            0x068 => {
+                d.dividend = val;
+                d.signed = true;
+            }
             0x06C => {
                 d.divisor = val;
                 d.signed = true;
                 Self::compute_division(d);
             }
-            0x070 => { d.quotient = val; d.dirty = true; d.reads_pending = 0; }
-            0x074 => { d.remainder = val; d.dirty = true; d.reads_pending = 0; }
+            0x070 => {
+                d.quotient = val;
+                d.dirty = true;
+                d.reads_pending = 0;
+            }
+            0x074 => {
+                d.remainder = val;
+                d.dirty = true;
+                d.reads_pending = 0;
+            }
             _ => {}
         }
     }

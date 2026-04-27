@@ -11,13 +11,12 @@
 // behaviour matters — the `fan_out_riscv_irqs` hook only fires on the
 // emulator-level step path.
 
+use super::Hazard3;
 use super::csr::{
-    CSR_MEICONTEXT, CSR_MEIEA, CSR_MEIFA, CSR_MEINEXT,
-    CSR_MEIPA, CSR_MEIPRA, CSR_MEPC,
+    CSR_MEICONTEXT, CSR_MEIEA, CSR_MEIFA, CSR_MEINEXT, CSR_MEIPA, CSR_MEIPRA, CSR_MEPC,
 };
 use super::decode::{CsrKind, Op};
 use super::irq::{CTX_CLEARTS, CTX_MRETEIRQ, CTX_NOIRQ};
-use super::Hazard3;
 use crate::{Arch, Bus, Config, Cores, EmulatorBuilder};
 
 // ---------- helpers ----------
@@ -28,7 +27,12 @@ use super::tests_common::fresh;
 fn csr_write(c: &mut Hazard3, bus: &mut Bus, csr: u16, val: u32) {
     c.x[5] = val;
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrw, rd: 6, rs1_or_zimm: 5, csr },
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 6,
+            rs1_or_zimm: 5,
+            csr,
+        },
         bus,
         0x2000_0000,
     );
@@ -38,7 +42,12 @@ fn csr_write(c: &mut Hazard3, bus: &mut Bus, csr: u16, val: u32) {
 /// side effect). Returns the observed value.
 fn csr_read(c: &mut Hazard3, bus: &mut Bus, csr: u16) -> u32 {
     c.execute(
-        Op::Csr { kind: CsrKind::Csrrs, rd: 7, rs1_or_zimm: 0, csr },
+        Op::Csr {
+            kind: CsrKind::Csrrs,
+            rd: 7,
+            rs1_or_zimm: 0,
+            csr,
+        },
         bus,
         0x2000_0000,
     );
@@ -219,7 +228,10 @@ fn p4_meipra_affects_arbitration() {
 fn p4_meip_raised_by_enable_bit() {
     let (mut c, mut bus) = fresh();
     bus.atomics.set_irq_pending(0, 1 << 4);
-    assert!(!c.compute_meip(bus.atomics.irq_pending_load(0)), "disabled -> no MEIP");
+    assert!(
+        !c.compute_meip(bus.atomics.irq_pending_load(0)),
+        "disabled -> no MEIP"
+    );
     // Enable IRQ 4 via window 0.
     csr_write(&mut c, &mut bus, CSR_MEIEA, (0x0010_u32 << 16) | 0);
     assert!(c.compute_meip(bus.atomics.irq_pending_load(0)));
@@ -242,7 +254,8 @@ fn p4_meip_cleared_when_pending_clears() {
 fn build_emu_parked(mie: u32, mie_global: bool) -> crate::Emulator {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build().unwrap();
+        .build()
+        .unwrap();
     if let Cores::RiscV(cs) = &mut emu.cores {
         cs[0].wfi_parked = true;
         cs[0].csrs.mie = mie;
@@ -281,7 +294,10 @@ fn p4_wfi_wake_from_mtip_mie1_delivers_trap() {
     plant_wfi_handler(&mut emu.bus, 0x2000_1000);
     emu.bus.sio.mtime_match_asserted[0] = true;
     emu.step().unwrap();
-    assert!(!emu.cores.expect_riscv()[0].wfi_parked, "wake cleared wfi_parked");
+    assert!(
+        !emu.cores.expect_riscv()[0].wfi_parked,
+        "wake cleared wfi_parked"
+    );
     // Step again — trap should deliver (MIE=1, mip.MTIP=1, mie.MTIE=1).
     // Handler is `wfi` so the hart re-parks after trap entry.
     emu.step().unwrap();
@@ -342,17 +358,27 @@ fn p4_wfi_wake_mie_global_zero_no_trap() {
     plant_wfi_handler(&mut emu.bus, 0x2000_4000);
     emu.bus.sio.mtime_match_asserted[0] = true;
     emu.step().unwrap();
-    assert!(!emu.cores.expect_riscv()[0].wfi_parked, "wfi wakes regardless of MIE");
+    assert!(
+        !emu.cores.expect_riscv()[0].wfi_parked,
+        "wfi wakes regardless of MIE"
+    );
     emu.step().unwrap();
     // With MIE=0 global, the hart executes the `wfi` at pc=0x2000_4000
     // and parks again. mcause stays at reset value 0 — no trap.
     let mcause = emu.cores.expect_riscv()[0].csrs.mcause;
-    assert_eq!(mcause & 0x8000_0000, 0,
-        "MIE=0 global blocks interrupt delivery (mcause={:#x})", mcause);
+    assert_eq!(
+        mcause & 0x8000_0000,
+        0,
+        "MIE=0 global blocks interrupt delivery (mcause={:#x})",
+        mcause
+    );
     // mepc was never written (no trap entry), so it stays at reset value
     // 0. Confirms the trap never happened.
-    assert_eq!(emu.cores.expect_riscv()[0].csrs.mepc, 0,
-        "no trap entry occurred while MIE=0");
+    assert_eq!(
+        emu.cores.expect_riscv()[0].csrs.mepc,
+        0,
+        "no trap entry occurred while MIE=0"
+    );
 }
 
 #[test]
@@ -366,8 +392,10 @@ fn p4_wfi_wake_mie_bit_clear_no_wake() {
     }
     emu.bus.sio.mtime_match_asserted[0] = true;
     emu.step().unwrap();
-    assert!(emu.cores.expect_riscv()[0].wfi_parked,
-        "mie.MTIE=0 -> predicate zero -> no wake");
+    assert!(
+        emu.cores.expect_riscv()[0].wfi_parked,
+        "mie.MTIE=0 -> predicate zero -> no wake"
+    );
 }
 
 // ---------- mie per-bit masking (3 tests) ----------
@@ -375,8 +403,8 @@ fn p4_wfi_wake_mie_bit_clear_no_wake() {
 #[test]
 fn p4_mie_msie_independent_of_mtie() {
     let (mut c, mut bus) = fresh();
-    c.csrs.mstatus = 1 << 3;   // MIE global
-    c.csrs.mie = 1 << 3;       // only MSIE
+    c.csrs.mstatus = 1 << 3; // MIE global
+    c.csrs.mie = 1 << 3; // only MSIE
     c.csrs.mip = (1 << 3) | (1 << 7); // both MSIP + MTIP asserted
     c.csrs.mtvec = 0x2000_1000;
     // Plant a nop at pc so fetch succeeds if no trap.
@@ -461,8 +489,11 @@ fn p4_nested_preempt_stack_push_then_pop() {
     assert_eq!((c.xh3irq.meicontext >> 24) & 0xF, 2);
     c.mret();
     assert_eq!((c.xh3irq.meicontext >> 16) & 0xF, 2, "pop to outer preempt");
-    assert_eq!(c.xh3irq.meicontext & CTX_MRETEIRQ, CTX_MRETEIRQ,
-        "mreteirq re-armed by HW while still nested");
+    assert_eq!(
+        c.xh3irq.meicontext & CTX_MRETEIRQ,
+        CTX_MRETEIRQ,
+        "mreteirq re-armed by HW while still nested"
+    );
 }
 
 #[test]
@@ -475,15 +506,25 @@ fn p4_nested_preempt_two_levels_unwinds_correctly() {
     c.xh3irq.on_ext_irq_entry(9, 4); // depth=2; preempt=5, ppreempt=2
     // Inner mret: depth 2 -> 1, preempt pops to 2.
     c.mret();
-    assert_eq!((c.xh3irq.meicontext >> 16) & 0xF, 2, "inner pop to outer level");
-    assert_eq!(c.xh3irq.meicontext & CTX_MRETEIRQ, CTX_MRETEIRQ,
-        "mreteirq stays asserted for the outer mret");
+    assert_eq!(
+        (c.xh3irq.meicontext >> 16) & 0xF,
+        2,
+        "inner pop to outer level"
+    );
+    assert_eq!(
+        c.xh3irq.meicontext & CTX_MRETEIRQ,
+        CTX_MRETEIRQ,
+        "mreteirq stays asserted for the outer mret"
+    );
     assert_eq!(c.xh3irq.meicontext & CTX_NOIRQ, 0, "still in a handler");
     // Outer mret: depth 1 -> 0, preempt pops to 0 + noirq/mreteirq flip.
     c.mret();
     assert_eq!((c.xh3irq.meicontext >> 16) & 0xF, 0, "thread context");
-    assert_eq!(c.xh3irq.meicontext & CTX_MRETEIRQ, 0,
-        "mreteirq cleared when stack fully unwound");
+    assert_eq!(
+        c.xh3irq.meicontext & CTX_MRETEIRQ,
+        0,
+        "mreteirq cleared when stack fully unwound"
+    );
     assert_eq!(c.xh3irq.meicontext & CTX_NOIRQ, CTX_NOIRQ);
 }
 
@@ -493,7 +534,8 @@ fn p4_nested_preempt_two_levels_unwinds_correctly() {
 fn p4_fan_out_drives_mip_from_hw_sources() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build().unwrap();
+        .build()
+        .unwrap();
     // Default mtimecmp=0 means the MTIP match-asserts as soon as the
     // mtime tick fires; freeze MTIME to assert per-core manually below.
     emu.bus.sio.mtime_ctrl = 0;
@@ -521,8 +563,11 @@ fn p4_fan_out_drives_mip_from_hw_sources() {
     assert_eq!(c0_mip & (1 << 3), 1 << 3, "MSIP set");
     assert_eq!(c0_mip & (1 << 11), 1 << 11, "MEIP set");
     let c1_mip = emu.cores.expect_riscv()[1].mip();
-    assert_eq!(c1_mip & ((1 << 7) | (1 << 3) | (1 << 11)), 0,
-        "core 1 has no hw sources asserted");
+    assert_eq!(
+        c1_mip & ((1 << 7) | (1 << 3) | (1 << 11)),
+        0,
+        "core 1 has no hw sources asserted"
+    );
 }
 
 // ---------- clearts (meicontext side effect) test ----------
@@ -555,7 +600,8 @@ fn plant_insn(bus: &mut Bus, addr: u32, insn: u32) {
 fn p4_mret_to_wfi_parks_then_new_irq_wakes() {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build().unwrap();
+        .build()
+        .unwrap();
     freeze_mtime(&mut emu.bus);
     let wfi_pc = 0x2000_5000u32;
     plant_insn(&mut emu.bus, wfi_pc, 0x1050_0073); // wfi
@@ -565,7 +611,7 @@ fn p4_mret_to_wfi_parks_then_new_irq_wakes() {
         // points at the wfi. The second hart parks so it doesn't race.
         cs[0].csrs.mstatus = 1 << 7;
         cs[0].csrs.mepc = wfi_pc;
-        cs[0].csrs.mie = 1 << 7;   // MTIE
+        cs[0].csrs.mie = 1 << 7; // MTIE
         cs[0].csrs.mtvec = 0x2000_6000;
         // Simulate that we were inside an external-IRQ handler by driving
         // xh3irq through one entry; the mret must pop cleanly.
@@ -577,21 +623,28 @@ fn p4_mret_to_wfi_parks_then_new_irq_wakes() {
         cs[0].mret();
         assert_eq!(cs[0].pc, wfi_pc);
         assert_eq!(cs[0].csrs.mstatus & (1 << 3), 1 << 3, "MIE restored");
-        assert_eq!(cs[0].xh3irq.meicontext & CTX_NOIRQ, CTX_NOIRQ,
-            "preempt stack unwound on mret");
+        assert_eq!(
+            cs[0].xh3irq.meicontext & CTX_NOIRQ,
+            CTX_NOIRQ,
+            "preempt stack unwound on mret"
+        );
     }
 
     // Step once — executes wfi and parks.
     emu.step().unwrap();
-    assert!(emu.cores.expect_riscv()[0].wfi_parked,
-        "wfi parked the hart after mret landed on it");
+    assert!(
+        emu.cores.expect_riscv()[0].wfi_parked,
+        "wfi parked the hart after mret landed on it"
+    );
 
     // Fire a new MTIP source. fan_out_riscv_irqs lifts mip[7]; wake_checks
     // clears wfi_parked.
     emu.bus.sio.mtime_match_asserted[0] = true;
     emu.step().unwrap();
-    assert!(!emu.cores.expect_riscv()[0].wfi_parked,
-        "new pending IRQ wakes the hart parked at wfi");
+    assert!(
+        !emu.cores.expect_riscv()[0].wfi_parked,
+        "new pending IRQ wakes the hart parked at wfi"
+    );
 }
 
 #[test]
@@ -604,7 +657,8 @@ fn p4_mret_to_wfi_immediately_woken_if_irq_already_pending() {
     // iterations don't drift into zeroed SRAM) runs.
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build().unwrap();
+        .build()
+        .unwrap();
     freeze_mtime(&mut emu.bus);
     let wfi_pc = 0x2000_5100u32;
     let handler_pc = 0x2000_6100u32;
@@ -632,16 +686,16 @@ fn p4_mret_to_wfi_immediately_woken_if_irq_already_pending() {
     // One step: executes wfi (parks), then wake_checks un-parks because
     // (mip & mie) != 0.
     emu.step().unwrap();
-    assert!(!emu.cores.expect_riscv()[0].wfi_parked,
-        "pre-pending IRQ wakes immediately");
+    assert!(
+        !emu.cores.expect_riscv()[0].wfi_parked,
+        "pre-pending IRQ wakes immediately"
+    );
     // Next step delivers the MTIP trap; the self-loop keeps the hart at
     // handler_pc without further traps.
     emu.step().unwrap();
     let c = &emu.cores.expect_riscv()[0];
-    assert_eq!(c.csrs.mcause, 0x8000_0007,
-        "MTIP trap delivered after wake");
-    assert_eq!(c.pc, handler_pc,
-        "handler self-loop holds PC at the vector");
+    assert_eq!(c.csrs.mcause, 0x8000_0007, "MTIP trap delivered after wake");
+    assert_eq!(c.pc, handler_pc, "handler self-loop holds PC at the vector");
 }
 
 // ---------- IRQ coincident with mret (2 tests) ----------
@@ -656,7 +710,7 @@ fn p4_mret_with_pending_meip_retraps_on_next_step() {
     // In-handler state: MPIE=1 so mret restores MIE. mepc to a planted nop.
     c.csrs.mstatus = 1 << 7;
     c.csrs.mepc = 0x2000_7000;
-    c.csrs.mie = 1 << 11;   // MEIE
+    c.csrs.mie = 1 << 11; // MEIE
     c.csrs.mtvec = 0x2000_8000;
     plant_insn(&mut bus, 0x2000_7000, 0x0000_0013); // nop after mret
     plant_insn(&mut bus, 0x2000_8000, 0x0000_0013); // handler nop
@@ -674,10 +728,15 @@ fn p4_mret_with_pending_meip_retraps_on_next_step() {
     // Next step sees MEIP still asserted; trap fires before the nop.
     c.step(&mut bus);
     assert_eq!(c.csrs.mcause, 0x8000_000B, "re-trap as MEI");
-    assert_eq!(c.csrs.mepc, 0x2000_7000,
-        "mepc = PC of the un-executed instruction after the earlier mret");
-    assert_eq!((c.xh3irq.meicontext >> 4) & 0x1FF, 9,
-        "xh3irq latched the winning IRQ");
+    assert_eq!(
+        c.csrs.mepc, 0x2000_7000,
+        "mepc = PC of the un-executed instruction after the earlier mret"
+    );
+    assert_eq!(
+        (c.xh3irq.meicontext >> 4) & 0x1FF,
+        9,
+        "xh3irq latched the winning IRQ"
+    );
 }
 
 #[test]
@@ -689,7 +748,7 @@ fn p4_mret_with_pending_mtip_retraps_on_next_step() {
     c.csrs.mtvec = 0x2000_8100;
     plant_insn(&mut bus, 0x2000_7100, 0x0000_0013);
     plant_insn(&mut bus, 0x2000_8100, 0x0000_0013);
-    c.csrs.mip = 1 << 7;  // MTIP still asserted at mret boundary
+    c.csrs.mip = 1 << 7; // MTIP still asserted at mret boundary
 
     c.mret();
     // Step: trap delivery fires immediately.
@@ -719,8 +778,11 @@ fn p4_meifa_force_coexists_with_real_pending() {
     csr_write(&mut c, &mut bus, CSR_MEINEXT, 1);
     assert_eq!(c.xh3irq.meifa & (1 << 5), 0, "meifa bit 5 cleared");
     // But bus.irq_pending still carries the HW bit.
-    assert_eq!(bus.atomics.irq_pending_load(0) & (1 << 5), 1 << 5,
-        "HW pending is not touched by meinext.update");
+    assert_eq!(
+        bus.atomics.irq_pending_load(0) & (1 << 5),
+        1 << 5,
+        "HW pending is not touched by meinext.update"
+    );
 
     // Next read still shows IRQ 5 pending — the HW source is independent.
     let r2 = csr_read(&mut c, &mut bus, CSR_MEINEXT);
@@ -760,5 +822,8 @@ fn p4_meipra_change_mid_handler_affects_meinext() {
     let r2 = csr_read(&mut c, &mut bus, CSR_MEINEXT);
     let irq = (r2 & 0x7FC) >> 2;
     assert_eq!(r2 >> 31, 0, "IRQ 7 now above ppreempt");
-    assert_eq!(irq, 7, "re-prioritisation makes IRQ 7 the arbitration winner");
+    assert_eq!(
+        irq, 7,
+        "re-prioritisation makes IRQ 7 the arbitration winner"
+    );
 }

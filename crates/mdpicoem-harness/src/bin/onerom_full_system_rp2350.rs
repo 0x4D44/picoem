@@ -23,8 +23,7 @@ use mdpicoem_harness::{onerom_glue_dma, onerom_snapshot_fmt, onerom_sync};
 use mdrp2350::{Config, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-const FLASH_PATH: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
+const FLASH_PATH: &str = "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
 
 /// Cycle cap for boot. Rough budget: a few million cycles should be
 /// more than enough for bootrom + OneROM init at our default
@@ -93,7 +92,11 @@ fn main() -> ExitCode {
     let bootrom = match std::fs::read(&bootrom_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("failed to read bootrom at {}: {}", bootrom_path.display(), e);
+            eprintln!(
+                "failed to read bootrom at {}: {}",
+                bootrom_path.display(),
+                e
+            );
             return ExitCode::from(2);
         }
     };
@@ -101,7 +104,11 @@ fn main() -> ExitCode {
     let flash = match std::fs::read(&flash_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("failed to read flash image at {}: {}", flash_path.display(), e);
+            eprintln!(
+                "failed to read flash image at {}: {}",
+                flash_path.display(),
+                e
+            );
             return ExitCode::from(2);
         }
     };
@@ -117,7 +124,8 @@ fn main() -> ExitCode {
     // diagnosing where main() returns early.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -180,15 +188,15 @@ fn main() -> ExitCode {
     // step_quantum=1, i.e. ~16 instructions).
     #[derive(Default, Clone, Copy, PartialEq)]
     struct PeriphSnapshot {
-        resets:     u32, // RESETS.RESET (bits set = in reset)
-        pio0_ctrl:  u32,
-        pio1_ctrl:  u32,
-        pio2_ctrl:  u32,
-        pio0_im0:   u32,
-        pio1_im0:   u32,
-        pio2_im0:   u32,
+        resets: u32, // RESETS.RESET (bits set = in reset)
+        pio0_ctrl: u32,
+        pio1_ctrl: u32,
+        pio2_ctrl: u32,
+        pio0_im0: u32,
+        pio1_im0: u32,
+        pio2_im0: u32,
         clk_sys_ctrl: u32,
-        clk_sys_sel:  u32,
+        clk_sys_sel: u32,
     }
     let mut last_snap = PeriphSnapshot::default();
     let mut periph_log: Vec<(u64, u32, &'static str, u32, u32)> = Vec::new();
@@ -215,18 +223,15 @@ fn main() -> ExitCode {
 
         // Safety: cycle counter must advance.
         if after_cycles == before_cycles {
-            eprintln!(
-                "cycle counter stalled at {} pc=0x{:08X}",
-                before_cycles, pc
-            );
+            eprintln!("cycle counter stalled at {} pc=0x{:08X}", before_cycles, pc);
             break;
         }
 
         // Log a trace entry on any "long jump" (function-call-ish
         // transition) or early warm-up.
         let pc_delta = pc.wrapping_sub(last_pc);
-        let is_long_jump = !(pc_delta <= LONG_JUMP_BYTES
-            || pc_delta >= 0u32.wrapping_sub(LONG_JUMP_BYTES));
+        let is_long_jump =
+            !(pc_delta <= LONG_JUMP_BYTES || pc_delta >= 0u32.wrapping_sub(LONG_JUMP_BYTES));
         if is_long_jump || trace.len() < 40 {
             record(after_cycles, last_pc, pc, &mut trace);
         }
@@ -244,30 +249,30 @@ fn main() -> ExitCode {
             // actually see when firmware programs each PIO block's first
             // instruction slot.
             let snap = PeriphSnapshot {
-                resets:       emu.bus.read32(0x4002_0000, 0),
-                pio0_ctrl:    emu.bus.pio[0].read32(0x000),
-                pio1_ctrl:    emu.bus.pio[1].read32(0x000),
-                pio2_ctrl:    emu.bus.pio[2].read32(0x000),
-                pio0_im0:     emu.bus.pio[0].instr_mem()[0] as u32,
-                pio1_im0:     emu.bus.pio[1].instr_mem()[0] as u32,
-                pio2_im0:     emu.bus.pio[2].instr_mem()[0] as u32,
+                resets: emu.bus.read32(0x4002_0000, 0),
+                pio0_ctrl: emu.bus.pio[0].read32(0x000),
+                pio1_ctrl: emu.bus.pio[1].read32(0x000),
+                pio2_ctrl: emu.bus.pio[2].read32(0x000),
+                pio0_im0: emu.bus.pio[0].instr_mem()[0] as u32,
+                pio1_im0: emu.bus.pio[1].instr_mem()[0] as u32,
+                pio2_im0: emu.bus.pio[2].instr_mem()[0] as u32,
                 clk_sys_ctrl: emu.bus.read32(0x4001_003C, 0),
-                clk_sys_sel:  emu.bus.read32(0x4001_0044, 0),
+                clk_sys_sel: emu.bus.read32(0x4001_0044, 0),
             };
             let mut push = |tag: &'static str, old: u32, new: u32| {
                 if old != new {
                     periph_log.push((after_cycles, pc, tag, old, new));
                 }
             };
-            push("RESETS",       last_snap.resets,       snap.resets);
-            push("PIO0.CTRL",    last_snap.pio0_ctrl,    snap.pio0_ctrl);
-            push("PIO1.CTRL",    last_snap.pio1_ctrl,    snap.pio1_ctrl);
-            push("PIO2.CTRL",    last_snap.pio2_ctrl,    snap.pio2_ctrl);
-            push("PIO0.INSTR[0]",last_snap.pio0_im0,     snap.pio0_im0);
-            push("PIO1.INSTR[0]",last_snap.pio1_im0,     snap.pio1_im0);
-            push("PIO2.INSTR[0]",last_snap.pio2_im0,     snap.pio2_im0);
+            push("RESETS", last_snap.resets, snap.resets);
+            push("PIO0.CTRL", last_snap.pio0_ctrl, snap.pio0_ctrl);
+            push("PIO1.CTRL", last_snap.pio1_ctrl, snap.pio1_ctrl);
+            push("PIO2.CTRL", last_snap.pio2_ctrl, snap.pio2_ctrl);
+            push("PIO0.INSTR[0]", last_snap.pio0_im0, snap.pio0_im0);
+            push("PIO1.INSTR[0]", last_snap.pio1_im0, snap.pio1_im0);
+            push("PIO2.INSTR[0]", last_snap.pio2_im0, snap.pio2_im0);
             push("CLK_SYS_CTRL", last_snap.clk_sys_ctrl, snap.clk_sys_ctrl);
-            push("CLK_SYS_SEL",  last_snap.clk_sys_sel,  snap.clk_sys_sel);
+            push("CLK_SYS_SEL", last_snap.clk_sys_sel, snap.clk_sys_sel);
             last_snap = snap;
         }
 
@@ -317,7 +322,9 @@ fn main() -> ExitCode {
                 | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
             let stim_level = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
             emu.bus.gpio_external_mask = stim_mask;
-            emu.bus.gpio_external_in.store(stim_level, Ordering::Relaxed);
+            emu.bus
+                .gpio_external_in
+                .store(stim_level, Ordering::Relaxed);
         }
 
         // Post-sync: pump the glue DMA and log observations (F.4).
@@ -327,8 +334,7 @@ fn main() -> ExitCode {
             let rel_cycle = after_cycles.saturating_sub(sync_cycle);
             let data_byte =
                 ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
-            let pio2_drives_data =
-                ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
+            let pio2_drives_data = ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
             obs_log.push((rel_cycle, data_byte, pio2_drives_data));
 
             if rel_cycle >= POST_SYNC_STIMULUS_CYCLES {
@@ -344,30 +350,44 @@ fn main() -> ExitCode {
 
     // Dump the trace.
     println!();
-    println!("CONTROL-FLOW TRACE (last {} long-jumps, cycle / prev → new):", trace.len());
+    println!(
+        "CONTROL-FLOW TRACE (last {} long-jumps, cycle / prev → new):",
+        trace.len()
+    );
     for (cyc, prev, new) in &trace {
         println!("  cycle {:>10}  0x{:08X} -> 0x{:08X}", cyc, prev, new);
     }
 
     println!();
-    println!("DENSE PC LOG (last {} cycles, every instruction):", dense.len());
+    println!(
+        "DENSE PC LOG (last {} cycles, every instruction):",
+        dense.len()
+    );
     for (cyc, prev, new) in &dense {
         println!("  cycle {:>10}  0x{:08X} -> 0x{:08X}", cyc, prev, new);
     }
 
     println!();
-    println!("PERIPHERAL STATE CHANGES ({} events, sampled every {} cycles):",
-             periph_log.len(), periph_sample_interval);
+    println!(
+        "PERIPHERAL STATE CHANGES ({} events, sampled every {} cycles):",
+        periph_log.len(),
+        periph_sample_interval
+    );
     for (cyc, pc, tag, old, new) in &periph_log {
-        println!("  cycle {:>10}  pc=0x{:08X}  {:<14} 0x{:08X} -> 0x{:08X}",
-                 cyc, pc, tag, old, new);
+        println!(
+            "  cycle {:>10}  pc=0x{:08X}  {:<14} 0x{:08X} -> 0x{:08X}",
+            cyc, pc, tag, old, new
+        );
     }
 
     println!();
     println!("CORE 0 REGISTER DUMP AT STOP:");
     let regs = &emu.core(0).regs;
     println!("  PC  = 0x{:08X}    SP  = 0x{:08X}", regs.pc(), regs.sp());
-    println!("  IPSR = 0x{:08X}   (exception number; 0 = thread mode)", regs.ipsr());
+    println!(
+        "  IPSR = 0x{:08X}   (exception number; 0 = thread mode)",
+        regs.ipsr()
+    );
     for r in 0..8u8 {
         print!("  R{}  = 0x{:08X}  ", r, regs.r[r as usize]);
         if (r + 1) % 4 == 0 {
@@ -439,8 +459,7 @@ fn main() -> ExitCode {
         print!("{}", onerom_snapshot_fmt::format_snapshot(report));
 
         let oracle_path = Path::new("crates/mdpicoem-harness/oracles/onerom_2364.trace");
-        let (branch, reason) =
-            onerom_snapshot_fmt::decide_oracle_branch(report, oracle_path);
+        let (branch, reason) = onerom_snapshot_fmt::decide_oracle_branch(report, oracle_path);
         println!();
         println!("ORACLE DECISION: branch={:?} reason=\"{}\"", branch, reason);
     }
@@ -455,7 +474,10 @@ fn main() -> ExitCode {
         let ch1_pushes = glue_dma.ch1_pushes();
         let verdict = evaluate_smoke_test(&obs_log, ch1_pushes);
         for (cyc, byte, oe) in &obs_log {
-            println!("  rel {:>3}  data=0x{:02X}  pio2_oe=0x{:02X}", cyc, byte, oe);
+            println!(
+                "  rel {:>3}  data=0x{:02X}  pio2_oe=0x{:02X}",
+                cyc, byte, oe
+            );
         }
         println!();
         println!("  glue DMA CH1 pushes during observation: {}", ch1_pushes);
@@ -501,7 +523,11 @@ enum SmokeVerdict {
     /// A stable byte was observed on D0..D7 for at least `MIN_STABLE_CYCLES`
     /// consecutive cycles within the expected 8..30 post-CS window, with
     /// PIO2 driving all 8 data lanes (pad_oe mask == 0xFF) throughout.
-    Pass { byte: u8, start: u64, end: u64 },
+    Pass {
+        byte: u8,
+        start: u64,
+        end: u64,
+    },
     Fail(String),
 }
 
@@ -537,7 +563,9 @@ fn evaluate_smoke_test(obs_log: &[(u64, u8, u8)], ch1_pushes: u32) -> SmokeVerdi
     if window.is_empty() {
         return SmokeVerdict::Fail(format!(
             "observation log does not cover window {}..{} (got {} rows)",
-            WINDOW_START, WINDOW_END, obs_log.len()
+            WINDOW_START,
+            WINDOW_END,
+            obs_log.len()
         ));
     }
 

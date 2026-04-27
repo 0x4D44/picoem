@@ -218,7 +218,10 @@ const fn make_backward_seq<const TOTAL: usize>(n: usize) -> [u16; TOTAL] {
 /// Encode Thumb-16 unconditional B (T2) given the halfword offset imm11
 /// (signed, range [-1024, 1023]).
 const fn encode_b_t2(imm11_hw: i32) -> u16 {
-    assert!(imm11_hw >= -1024 && imm11_hw <= 1023, "imm11 out of range for B T2");
+    assert!(
+        imm11_hw >= -1024 && imm11_hw <= 1023,
+        "imm11 out of range for B T2"
+    );
     let bits = (imm11_hw as i16) as u16 & 0x07FF;
     0xE000 | bits
 }
@@ -375,14 +378,24 @@ pub const CASES: &[CycleCase] = &[
     // `wrk_docs/2026.04.21 - HLD - Track B Cycle Oracle Fidelity.md` §3.2
     // and §5 for the full rationale; the printed hw/emu/delta columns
     // still surface any future drift even when the case passes.
-    CycleCase { name: "nop_chain_8", seq: SEQ_NOP_CHAIN_8, emu_baseline: 14, tolerance: 3 },
+    CycleCase {
+        name: "nop_chain_8",
+        seq: SEQ_NOP_CHAIN_8,
+        emu_baseline: 14,
+        tolerance: 3,
+    },
     // `push_2_min_cost` — known-delta. HW=10 EMU=12 Δ=−2. Silicon holds
     // the two PUSH stores in the M33 write buffer; when the POP loads
     // arrive targeting the same addresses, they're satisfied from the
     // write buffer at 1 cycle each (partial store-to-load forwarding),
     // giving ≈4-cycle body cost vs. our 6. Requires a write-buffer state
     // model with address/forwarding tracking — see HLD §3.3.
-    CycleCase { name: "push_2_min_cost", seq: SEQ_PUSH_2, emu_baseline: 12, tolerance: 2 },
+    CycleCase {
+        name: "push_2_min_cost",
+        seq: SEQ_PUSH_2,
+        emu_baseline: 12,
+        tolerance: 2,
+    },
     CycleCase {
         name: "backward_branch_small",
         seq: SEQ_BACKWARD_SMALL,
@@ -415,8 +428,18 @@ pub const CASES: &[CycleCase] = &[
         emu_baseline: 10,
         tolerance: 1,
     },
-    CycleCase { name: "ldm_8_reg", seq: SEQ_LDM_8_REG, emu_baseline: 17, tolerance: 0 },
-    CycleCase { name: "single_adds", seq: SEQ_SINGLE_ADDS, emu_baseline: 7, tolerance: 0 },
+    CycleCase {
+        name: "ldm_8_reg",
+        seq: SEQ_LDM_8_REG,
+        emu_baseline: 17,
+        tolerance: 0,
+    },
+    CycleCase {
+        name: "single_adds",
+        seq: SEQ_SINGLE_ADDS,
+        emu_baseline: 7,
+        tolerance: 0,
+    },
     CycleCase {
         name: "back_to_back_alu",
         seq: SEQ_BACK_TO_BACK_ALU,
@@ -507,7 +530,7 @@ pub fn pack_seq(seq: &[u16]) -> Vec<u8> {
 // extension, the `test_silicon` orchestrator) drive the same measurement
 // path without duplicating MMIO constants.
 
-use crate::silicon_oracle::{self, enable_cyccnt, CaseOutcome, Verdict};
+use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt};
 use probe_rs::{Core, MemoryInterface, RegisterId};
 use std::time::{Duration, Instant};
 
@@ -525,7 +548,14 @@ const DONE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Zero the mailbox region on silicon (six u32 slots).
 fn zero_mailbox_hw(core: &mut Core) -> Result<(), probe_rs::Error> {
-    for off in [MBX_GO, MBX_DONE, MBX_SEQ_PTR, MBX_ITER, MBX_CYCLES, MBX_RESERVED] {
+    for off in [
+        MBX_GO,
+        MBX_DONE,
+        MBX_SEQ_PTR,
+        MBX_ITER,
+        MBX_CYCLES,
+        MBX_RESERVED,
+    ] {
         core.write_word_32((CYCLE_MAILBOX_BASE + off) as u64, 0)?;
     }
     Ok(())
@@ -777,7 +807,10 @@ pub fn run_against(
     args: &CycleArgs,
     order: Option<&[&str]>,
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
-    debug_assert!(args.iter_high > args.iter_low, "iter_high must exceed iter_low");
+    debug_assert!(
+        args.iter_high > args.iter_low,
+        "iter_high must exceed iter_low"
+    );
 
     // Enable DWT defensively — idempotent; lets the standalone binary be
     // minimal and also lets the orchestrator call us without trusting
@@ -825,10 +858,9 @@ pub fn run_against(
             // orchestrator's summary output stays tidy; known-delta PASS
             // carries the Δ + tol so soak-run forensics don't have to
             // re-read the standalone binary's table.
-            Verdict::Pass if r.known_delta_pass => format!(
-                "known Δ={:+} tol={}",
-                r.delta, r.effective_tolerance,
-            ),
+            Verdict::Pass if r.known_delta_pass => {
+                format!("known Δ={:+} tol={}", r.delta, r.effective_tolerance,)
+            }
             Verdict::Pass => String::new(),
             Verdict::Fail => format!(
                 "hw={} emu={} delta={:+} tol={}",
@@ -856,17 +888,31 @@ pub fn fresh_emulator(seq_bytes: &[u8]) -> Emulator {
     // step_quantum(1) — the stub + seq all run on core 0; the DWT reads
     // inside the stub see per-instruction core.cycles via PPB, so cycle
     // accounting is per-instruction regardless of quantum.
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .unwrap();
     emu.cores.expect_arm_mut()[1].halt();
 
     let stub_bytes = pack_stub();
     for (i, &b) in stub_bytes.iter().enumerate() {
-        emu.bus.memory.sram_write8((STUB_START - 0x2000_0000) + i as u32, b);
+        emu.bus
+            .memory
+            .sram_write8((STUB_START - 0x2000_0000) + i as u32, b);
     }
     for (i, &b) in seq_bytes.iter().enumerate() {
-        emu.bus.memory.sram_write8((CYCLE_SEQ_SLOT - 0x2000_0000) + i as u32, b);
+        emu.bus
+            .memory
+            .sram_write8((CYCLE_SEQ_SLOT - 0x2000_0000) + i as u32, b);
     }
-    for off in [MBX_GO, MBX_DONE, MBX_SEQ_PTR, MBX_ITER, MBX_CYCLES, MBX_RESERVED] {
+    for off in [
+        MBX_GO,
+        MBX_DONE,
+        MBX_SEQ_PTR,
+        MBX_ITER,
+        MBX_CYCLES,
+        MBX_RESERVED,
+    ] {
         emu.bus.write32(CYCLE_MAILBOX_BASE + off, 0, 0);
     }
 
@@ -903,7 +949,8 @@ pub fn measure_emu(emu: &mut Emulator, seq_start: u32, k: u32) -> Result<u32, St
     );
     emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_DONE, 0, 0);
     emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_CYCLES, 0, 0);
-    emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_SEQ_PTR, seq_start | 1, 0);
+    emu.bus
+        .write32(CYCLE_MAILBOX_BASE + MBX_SEQ_PTR, seq_start | 1, 0);
     emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_ITER, k, 0);
     emu.bus.write32(CYCLE_MAILBOX_BASE + MBX_GO, 1, 0);
 
@@ -934,7 +981,11 @@ mod tests {
 
     #[test]
     fn test_mailbox_base_alignment() {
-        assert_eq!(CYCLE_MAILBOX_BASE % 4, 0, "mailbox base must be word-aligned");
+        assert_eq!(
+            CYCLE_MAILBOX_BASE % 4,
+            0,
+            "mailbox base must be word-aligned"
+        );
     }
 
     #[test]
@@ -945,14 +996,20 @@ mod tests {
         //   instr_addr([19]) = 38, PC = 42, target = 4 → delta = -38,
         //   imm11_hw = -19 → two's-complement 11-bit = 0x7ED.
         //   Encoding: 0b11100_111_1110_1101 = 0xE7ED.
-        assert_eq!(MEASUREMENT_STUB[19], 0xE7ED, "final branch must loop to poll");
+        assert_eq!(
+            MEASUREMENT_STUB[19], 0xE7ED,
+            "final branch must loop to poll"
+        );
         // Computed, not hardcoded (proof):
         let instr_addr_hw = 19;
-        let pc_hw = instr_addr_hw + 2;              // PC = instr+4 bytes = +2 halfwords
-        let target_hw: i32 = 2;                     // poll label
-        let imm11_hw = target_hw - pc_hw as i32;    // signed halfword offset
+        let pc_hw = instr_addr_hw + 2; // PC = instr+4 bytes = +2 halfwords
+        let target_hw: i32 = 2; // poll label
+        let imm11_hw = target_hw - pc_hw as i32; // signed halfword offset
         let encoded = 0xE000u16 | ((imm11_hw as i16) as u16 & 0x07FF);
-        assert_eq!(MEASUREMENT_STUB[19], encoded, "final B encoding matches formula");
+        assert_eq!(
+            MEASUREMENT_STUB[19], encoded,
+            "final B encoding matches formula"
+        );
     }
 
     #[test]

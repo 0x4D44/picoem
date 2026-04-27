@@ -159,9 +159,15 @@ impl IoBank0 {
             0x130..=0x13C => self.proc1_inte[idx(off)] = apply(self.proc1_inte[idx(off)], val),
             0x140..=0x14C => self.proc1_intf[idx(off)] = apply(self.proc1_intf[idx(off)], val),
             0x150..=0x15C => self.proc1_ints[idx(off)] = apply(self.proc1_ints[idx(off)], val),
-            0x160..=0x16C => self.dormant_wake_inte[idx(off)] = apply(self.dormant_wake_inte[idx(off)], val),
-            0x170..=0x17C => self.dormant_wake_intf[idx(off)] = apply(self.dormant_wake_intf[idx(off)], val),
-            0x180..=0x18C => self.dormant_wake_ints[idx(off)] = apply(self.dormant_wake_ints[idx(off)], val),
+            0x160..=0x16C => {
+                self.dormant_wake_inte[idx(off)] = apply(self.dormant_wake_inte[idx(off)], val)
+            }
+            0x170..=0x17C => {
+                self.dormant_wake_intf[idx(off)] = apply(self.dormant_wake_intf[idx(off)], val)
+            }
+            0x180..=0x18C => {
+                self.dormant_wake_ints[idx(off)] = apply(self.dormant_wake_ints[idx(off)], val)
+            }
             _ => {}
         }
     }

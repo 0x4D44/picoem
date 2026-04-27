@@ -1,5 +1,5 @@
-use crate::bus::{DecodedOp, DECODE_CACHE_SIZE, is_cacheable_pc};
-use super::{CortexM33, CoreBus};
+use super::{CoreBus, CortexM33};
+use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
 
 // Direct-mapped index mask — kept local to avoid crossing `pub(crate)`
 // visibility boundaries for a one-liner.
@@ -222,8 +222,11 @@ fn classify_thumb32_misc_control_pure(hw0: u16, hw1: u16) -> bool {
     }
     let op_field = (hw0 >> 4) & 0x7F;
     // MSR / MRS — register-file only, pure.
-    if op_field == 0b0111000 || op_field == 0b0111001
-        || op_field == 0b0111110 || op_field == 0b0111111 {
+    if op_field == 0b0111000
+        || op_field == 0b0111001
+        || op_field == 0b0111110
+        || op_field == 0b0111111
+    {
         return true;
     }
     // Otherwise falls into `thumb32_undefined` — impure.
@@ -310,11 +313,17 @@ impl CortexM33 {
                 } else {
                     1
                 };
-                if in_it { self.advance_it_state(); }
+                if in_it {
+                    self.advance_it_state();
+                }
                 c
             } else {
                 self.regs.set_pc(pc.wrapping_add(2));
-                let saved_flags = if in_it { self.regs.xpsr & 0xF800_0000 } else { 0 };
+                let saved_flags = if in_it {
+                    self.regs.xpsr & 0xF800_0000
+                } else {
+                    0
+                };
                 let c = if cond_passed {
                     self.execute_thumb16(hw0, bus)
                 } else {
@@ -325,7 +334,9 @@ impl CortexM33 {
                 if in_it && cond_passed && !flag_only {
                     self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
                 }
-                if in_it { self.advance_it_state(); }
+                if in_it {
+                    self.advance_it_state();
+                }
                 c
             };
 
@@ -335,13 +346,19 @@ impl CortexM33 {
                 ws_before,
                 "pure op at PC={:08X} (hw0={:04X}, hw1={:04X}) \
                  dirtied bus.extra_wait_states",
-                pc, hw0, hw1,
+                pc,
+                hw0,
+                hw1,
             );
 
             // Apply bank penalty only on non-sequential fetches. The
             // M33 prefetch buffer absorbs the penalty on sequential PC
             // advances (PC+2 or PC+4).
-            let bank_penalty = if is_sequential { 0 } else { entry.fetch_wait as u32 };
+            let bank_penalty = if is_sequential {
+                0
+            } else {
+                entry.fetch_wait as u32
+            };
             cycles + bank_penalty
         } else {
             // Slow path — preserves existing semantics verbatim.
@@ -358,11 +375,17 @@ impl CortexM33 {
                 } else {
                     1
                 };
-                if in_it { self.advance_it_state(); }
+                if in_it {
+                    self.advance_it_state();
+                }
                 cycles + bus.extra_wait_states()
             } else {
                 self.regs.set_pc(pc.wrapping_add(2));
-                let saved_flags = if in_it { self.regs.xpsr & 0xF800_0000 } else { 0 };
+                let saved_flags = if in_it {
+                    self.regs.xpsr & 0xF800_0000
+                } else {
+                    0
+                };
                 let cycles = if cond_passed {
                     self.execute_thumb16(hw0, bus)
                 } else {
@@ -371,7 +394,9 @@ impl CortexM33 {
                 if in_it && cond_passed && !flag_only {
                     self.regs.xpsr = (self.regs.xpsr & !0xF800_0000) | saved_flags;
                 }
-                if in_it { self.advance_it_state(); }
+                if in_it {
+                    self.advance_it_state();
+                }
                 cycles + bus.extra_wait_states()
             }
         }
@@ -412,7 +437,11 @@ impl CortexM33 {
         }
 
         let wide = is_wide(hw0);
-        let hw1 = if wide { bus.read16(pc.wrapping_add(2), self.core_id) } else { 0 };
+        let hw1 = if wide {
+            bus.read16(pc.wrapping_add(2), self.core_id)
+        } else {
+            0
+        };
         if wide && bus.bus_fault(self.core_id) {
             return DecodedOp {
                 tag: u32::MAX,
@@ -446,11 +475,23 @@ impl CortexM33 {
         let pure = classify_is_pure(hw0, hw1, wide);
 
         let mut flags = 0u8;
-        if wide { flags |= DecodedOp::FLAG_WIDE; }
-        if pure { flags |= DecodedOp::FLAG_PURE; }
-        if flag_only { flags |= DecodedOp::FLAG_FLAG_ONLY; }
+        if wide {
+            flags |= DecodedOp::FLAG_WIDE;
+        }
+        if pure {
+            flags |= DecodedOp::FLAG_PURE;
+        }
+        if flag_only {
+            flags |= DecodedOp::FLAG_FLAG_ONLY;
+        }
 
-        let entry = DecodedOp { tag: pc, hw0, hw1, fetch_wait, flags };
+        let entry = DecodedOp {
+            tag: pc,
+            hw0,
+            hw1,
+            fetch_wait,
+            flags,
+        };
 
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
@@ -531,38 +572,44 @@ impl CortexM33 {
     pub(crate) fn execute_thumb32<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let op1 = (hw0 >> 11) & 0x3;
         let op2 = ((hw0 >> 4) & 0x7F) as u32;
-        let op  = (hw1 >> 15) & 0x1;
+        let op = (hw1 >> 15) & 0x1;
 
         match op1 {
             0b01 => match op2 >> 5 {
-                0b00 => if op2 & 0x04 == 0 {
-                    self.thumb32_ldm_stm(hw0, hw1, bus)
-                } else {
-                    self.thumb32_load_store_dual(hw0, hw1, bus)
-                },
-                0b01 => self.thumb32_dp_shifted_reg(hw0, hw1, bus),
-                _    => self.thumb32_coprocessor(hw0, hw1, bus),
-            },
-            0b10 => if op == 0 {
-                if op2 & 0x20 == 0 {
-                    self.thumb32_dp_modified_imm(hw0, hw1, bus)
-                } else {
-                    self.thumb32_dp_plain_imm(hw0, hw1, bus)
+                0b00 => {
+                    if op2 & 0x04 == 0 {
+                        self.thumb32_ldm_stm(hw0, hw1, bus)
+                    } else {
+                        self.thumb32_load_store_dual(hw0, hw1, bus)
+                    }
                 }
-            } else {
-                self.thumb32_branch_misc(hw0, hw1, bus)
+                0b01 => self.thumb32_dp_shifted_reg(hw0, hw1, bus),
+                _ => self.thumb32_coprocessor(hw0, hw1, bus),
             },
-            0b11 => if op2 & 0x40 != 0 {
-                self.thumb32_coprocessor(hw0, hw1, bus)
-            } else if op2 & 0x20 == 0 {
-                self.thumb32_load_store_single(hw0, hw1, bus)
-            } else if op2 & 0x10 == 0 {
-                self.thumb32_dp_register(hw0, hw1, bus)
-            } else if op2 & 0x08 == 0 {
-                self.thumb32_multiply(hw0, hw1, bus)
-            } else {
-                self.thumb32_long_multiply(hw0, hw1, bus)
-            },
+            0b10 => {
+                if op == 0 {
+                    if op2 & 0x20 == 0 {
+                        self.thumb32_dp_modified_imm(hw0, hw1, bus)
+                    } else {
+                        self.thumb32_dp_plain_imm(hw0, hw1, bus)
+                    }
+                } else {
+                    self.thumb32_branch_misc(hw0, hw1, bus)
+                }
+            }
+            0b11 => {
+                if op2 & 0x40 != 0 {
+                    self.thumb32_coprocessor(hw0, hw1, bus)
+                } else if op2 & 0x20 == 0 {
+                    self.thumb32_load_store_single(hw0, hw1, bus)
+                } else if op2 & 0x10 == 0 {
+                    self.thumb32_dp_register(hw0, hw1, bus)
+                } else if op2 & 0x08 == 0 {
+                    self.thumb32_multiply(hw0, hw1, bus)
+                } else {
+                    self.thumb32_long_multiply(hw0, hw1, bus)
+                }
+            }
             _ => self.thumb32_undefined(hw0, hw1, bus),
         }
     }

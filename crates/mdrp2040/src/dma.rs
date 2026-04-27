@@ -365,7 +365,9 @@ impl Dma {
             }
             REG_N_CHANNELS => NUM_CHANNELS as u32,
             _ => {
-                if offset >= CH_DBG_CTDREQ_OFFSET && offset < CH_DBG_CTDREQ_OFFSET + 0x40 * NUM_CHANNELS as u32 {
+                if offset >= CH_DBG_CTDREQ_OFFSET
+                    && offset < CH_DBG_CTDREQ_OFFSET + 0x40 * NUM_CHANNELS as u32
+                {
                     let ch = ((offset - CH_DBG_CTDREQ_OFFSET) / 0x40) as usize;
                     let inner = (offset - CH_DBG_CTDREQ_OFFSET) % 0x40;
                     match inner {
@@ -422,8 +424,7 @@ impl Dma {
                         // Diagnostic counter bumps even when EN=0 —
                         // captures firmware intent regardless of
                         // whether `trigger_channel` would arm.
-                        self.channels[i].trig_multi =
-                            self.channels[i].trig_multi.wrapping_add(1);
+                        self.channels[i].trig_multi = self.channels[i].trig_multi.wrapping_add(1);
                         self.trigger_channel(i);
                     }
                 }
@@ -459,10 +460,9 @@ impl Dma {
             CH_WRITE_ADDR | CH_AL1_WRITE_ADDR_TRIG | CH_AL2_WRITE_ADDR | CH_AL3_WRITE_ADDR => {
                 ch.write_addr
             }
-            CH_TRANS_COUNT
-            | CH_AL1_TRANS_COUNT
-            | CH_AL2_TRANS_COUNT_TRIG
-            | CH_AL3_TRANS_COUNT => ch.trans_count,
+            CH_TRANS_COUNT | CH_AL1_TRANS_COUNT | CH_AL2_TRANS_COUNT_TRIG | CH_AL3_TRANS_COUNT => {
+                ch.trans_count
+            }
             CH_CTRL_TRIG | CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => ctrl_image,
             _ => 0,
         }
@@ -519,8 +519,7 @@ impl Dma {
             CH_CTRL_TRIG => {
                 let new = apply_alias(self.channels[ch_idx].ctrl, value, alias);
                 self.channels[ch_idx].ctrl = new & CTRL_WRITABLE_MASK;
-                self.channels[ch_idx].trig_ctrl =
-                    self.channels[ch_idx].trig_ctrl.wrapping_add(1);
+                self.channels[ch_idx].trig_ctrl = self.channels[ch_idx].trig_ctrl.wrapping_add(1);
                 self.trigger_channel(ch_idx);
             }
             CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
@@ -568,8 +567,7 @@ impl Dma {
                 continue;
             }
             let treq = ch.treq_sel();
-            let ready = treq == DREQ_FORCE
-                || (treq < 64 && (dreqs >> treq) & 1 != 0);
+            let ready = treq == DREQ_FORCE || (treq < 64 && (dreqs >> treq) & 1 != 0);
             if ready {
                 // Diagnostic: record that this channel's TREQ_SEL was
                 // satisfied at least once. Kept sticky so per-channel
@@ -697,10 +695,8 @@ mod tests {
     //! gating (UART TX + FORCE), and the RESETS bus-level guard.
 
     use super::*;
+    use crate::bus::peripheral_dispatch::{RESET_DMA, RESET_TIMER, RESET_UART0, RESET_UART1};
     use crate::bus::{Bus, DMA_BASE, RESETS_BASE};
-    use crate::bus::peripheral_dispatch::{
-        RESET_DMA, RESET_TIMER, RESET_UART0, RESET_UART1,
-    };
     use crate::dreq::{DREQ_FORCE, DREQ_UART0_TX};
     use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1};
 
@@ -844,15 +840,13 @@ mod tests {
         }
 
         let ctrl = make_ctrl(
-            true,  // EN
-            true,  // INCR_READ
-            true,  // INCR_WRITE
-            2,     // DATA_SIZE = 32-bit
-            0,     // CHAIN_TO = self → no chain
-            DREQ_FORCE,
-            0,     // no ring
-            false,
-            false,
+            true, // EN
+            true, // INCR_READ
+            true, // INCR_WRITE
+            2,    // DATA_SIZE = 32-bit
+            0,    // CHAIN_TO = self → no chain
+            DREQ_FORCE, 0, // no ring
+            false, false,
         );
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 4, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
@@ -887,9 +881,7 @@ mod tests {
             bus.write32(0x2000_0100 + i * 4, i);
         }
         // RING_SIZE = 4 → 16-byte ring; RING_SEL = 1 (write ring).
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 4, true, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 4, true, false);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 8, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
         for _ in 0..8 {
@@ -913,15 +905,11 @@ mod tests {
         bus.write32(0x2000_0200, 0xBBBB_0002);
 
         // Pre-program CH1 (don't trigger it).
-        let ctrl1 = make_ctrl(
-            true, false, false, 2, 1, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl1 = make_ctrl(true, false, false, 2, 1, DREQ_FORCE, 0, false, false);
         program_channel(&mut bus, 1, 0x2000_0200, 0x2000_0400, 1, ctrl1);
 
         // CH0 with CHAIN_TO = 1.
-        let ctrl0 = make_ctrl(
-            true, false, false, 2, 1, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl0 = make_ctrl(true, false, false, 2, 1, DREQ_FORCE, 0, false, false);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0300, 1, ctrl0);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl0);
 
@@ -940,9 +928,7 @@ mod tests {
     fn chan_abort_clears_busy() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 100, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
         for _ in 0..5 {
@@ -960,9 +946,7 @@ mod tests {
         release_dma(&mut bus);
         // Enable INTE0 bit 0 — CH0 completion routes to DMA_IRQ_0 (NVIC 11).
         bus.write32(DMA_BASE + REG_INTE0, 1);
-        let ctrl = make_ctrl(
-            true, false, false, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, false, false, 2, 0, DREQ_FORCE, 0, false, false);
         bus.write32(0x2000_0100, 0x1234_5678);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
@@ -976,9 +960,7 @@ mod tests {
         let mut bus = Bus::new();
         release_dma(&mut bus);
         // Force a completion on CH0 so INTR[0] latches.
-        let ctrl = make_ctrl(
-            true, false, false, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, false, false, 2, 0, DREQ_FORCE, 0, false, false);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
         bus.tick_dma();
@@ -994,9 +976,7 @@ mod tests {
         // TREQ_SEL = UART0_TX but UART0 is held in RESETS → tx_dreq=false.
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, false, false, 2, 0, DREQ_UART0_TX, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, false, false, 2, 0, DREQ_UART0_TX, 0, false, false);
         bus.write32(0x2000_0100, 0xC0FF_EE00);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
@@ -1025,9 +1005,7 @@ mod tests {
     fn force_dreq_always_runs() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
         for i in 0..2 {
             bus.write32(0x2000_0100 + i * 4, 0x1000 + i);
         }
@@ -1057,9 +1035,7 @@ mod tests {
         let mut bus = Bus::new();
         release_dma(&mut bus);
         assert!(bus.dma.is_idle());
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
         bus.write32(0x2000_0100, 0xCAFE_BABE);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
@@ -1076,9 +1052,7 @@ mod tests {
     fn ctrl_trig_trigger_via_ctrl_trig_alias() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
         bus.write32(0x2000_0100, 0xABCD);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, ctrl);
         // Writing AL1_CTRL didn't trigger — BUSY still 0.
@@ -1095,9 +1069,7 @@ mod tests {
         // chained reloader channels.
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
         bus.write32(0x2000_0100, 0xF00D);
         // Pre-program everything except READ_ADDR via CTRL_TRIG path.
         bus.write32(DMA_BASE + CH_WRITE_ADDR, 0x2000_0200);
@@ -1115,9 +1087,7 @@ mod tests {
     fn multi_chan_trigger_arms_selected_bits() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, false, false, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, false, false, 2, 0, DREQ_FORCE, 0, false, false);
         for ch in 0..3 {
             program_channel(
                 &mut bus,
@@ -1212,9 +1182,7 @@ mod tests {
     fn transfers_issued_bumps_on_issue_transfer() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
         bus.write32(0x2000_0100, 0xBEEF);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 3, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
@@ -1229,9 +1197,7 @@ mod tests {
         // FORCE TREQ = 63 → bit 63 sticks after the first ready tick.
         let mut bus = Bus::new();
         release_dma(&mut bus);
-        let ctrl = make_ctrl(
-            true, true, true, 2, 0, DREQ_FORCE, 0, false, false,
-        );
+        let ctrl = make_ctrl(true, true, true, 2, 0, DREQ_FORCE, 0, false, false);
         bus.write32(0x2000_0100, 0xC0DE);
         program_channel(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, ctrl);
         trigger_channel_via_ctrl_trig(&mut bus, 0, ctrl);
@@ -1246,9 +1212,7 @@ mod tests {
         // be set in the mask.
         bus.write32(RESETS_BASE + 0x3000, 1u32 << RESET_UART0);
         bus.write32(0x4003_4030, 1); // UARTEN
-        let ctrl_uart = make_ctrl(
-            true, false, false, 2, 0, DREQ_UART0_TX, 0, false, false,
-        );
+        let ctrl_uart = make_ctrl(true, false, false, 2, 0, DREQ_UART0_TX, 0, false, false);
         program_channel(&mut bus, 1, 0x2000_0100, 0x2000_0300, 1, ctrl_uart);
         trigger_channel_via_ctrl_trig(&mut bus, 1, ctrl_uart);
         bus.tick_dma();

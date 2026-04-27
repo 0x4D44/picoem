@@ -16,8 +16,8 @@
 // See the HLD §Component 3 and `CLAUDE.md` under "Testing Topology" for
 // the hardware-gated prerequisites.
 
-use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs, DualCoreCase, CASES};
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, select_by_name, Verdict};
+use mdpicoem_harness::dualcore_cases::{self, CASES, DualCoreArgs, DualCoreCase};
+use mdpicoem_harness::silicon_oracle::{Verdict, enable_cyccnt, select_by_name};
 use mdpicoem_harness::{CYCLE_MAILBOX_BASE, DUALCORE_ANTAGONIST_SLOT};
 use probe_rs::{MemoryInterface, Session, SessionConfig};
 use std::time::{Duration, Instant};
@@ -127,12 +127,12 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         "silicon_dualcore_diff_rp2350: K_low={} K_high={} tol={}",
         args.iter_low, args.iter_high, args.tolerance,
     );
-    println!(
-        "antagonist=0x{DUALCORE_ANTAGONIST_SLOT:08X} mailbox=0x{CYCLE_MAILBOX_BASE:08X}",
-    );
+    println!("antagonist=0x{DUALCORE_ANTAGONIST_SLOT:08X} mailbox=0x{CYCLE_MAILBOX_BASE:08X}",);
     println!(
         "selected {} case(s) ({} skipped by filter, {} skipped by exclude)",
-        selected.len(), skipped_filter, skipped_exclude,
+        selected.len(),
+        skipped_filter,
+        skipped_exclude,
     );
     println!();
 
@@ -167,7 +167,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let stub_bytes = mdpicoem_harness::cycle_cases::pack_stub();
     {
         let mut core = session.core(0)?;
-        core.write_8(mdpicoem_harness::cycle_cases::STUB_START as u64, &stub_bytes)?;
+        core.write_8(
+            mdpicoem_harness::cycle_cases::STUB_START as u64,
+            &stub_bytes,
+        )?;
         // Zero mailbox (six u32 slots).
         for off in [0u32, 4, 8, 12, 16, 20] {
             core.write_word_32((CYCLE_MAILBOX_BASE + off) as u64, 0)?;

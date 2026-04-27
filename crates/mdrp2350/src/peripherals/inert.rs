@@ -131,7 +131,9 @@ pub struct SysCfg {
 
 impl SysCfg {
     pub fn new() -> Self {
-        Self { regs: HashMap::new() }
+        Self {
+            regs: HashMap::new(),
+        }
     }
 
     /// Read a word from SYSCFG. Unwritten offsets read 0.
@@ -332,21 +334,13 @@ mod tests {
     fn glitch_detector_arm_roundtrip() {
         let mut g = GlitchDetector::new();
         // Write "force-arm YES" (0x0000) — must read back unchanged.
-        g.write32(
-            GLITCH_DETECTOR_ARM_OFFSET,
-            GLITCH_DETECTOR_ARM_VALUE_YES,
-            0,
-        );
+        g.write32(GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_VALUE_YES, 0);
         assert_eq!(
             g.read32(GLITCH_DETECTOR_ARM_OFFSET),
             GLITCH_DETECTOR_ARM_VALUE_YES
         );
         // Write "force-arm NO" (0x5bad) — must read back unchanged.
-        g.write32(
-            GLITCH_DETECTOR_ARM_OFFSET,
-            GLITCH_DETECTOR_ARM_VALUE_NO,
-            0,
-        );
+        g.write32(GLITCH_DETECTOR_ARM_OFFSET, GLITCH_DETECTOR_ARM_VALUE_NO, 0);
         assert_eq!(
             g.read32(GLITCH_DETECTOR_ARM_OFFSET),
             GLITCH_DETECTOR_ARM_VALUE_NO

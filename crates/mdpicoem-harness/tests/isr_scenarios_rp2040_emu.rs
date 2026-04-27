@@ -10,7 +10,7 @@
 //! regression points directly at the misdispatch / hang.
 
 use mdpicoem_harness::isr_scenarios_rp2040::{
-    self, run_emu_scenario, setup_emulator_image, EmuOutcome, IsrScenario,
+    self, EmuOutcome, IsrScenario, run_emu_scenario, setup_emulator_image,
 };
 use mdrp2040::{Config, EmulatorBuilder};
 
@@ -88,9 +88,7 @@ fn isr_m0_tail_chain_passes_on_emu() {
             );
         }
         EmuOutcome::Timeout => {
-            panic!(
-                "isr_m0_tail_chain: cycle budget exhausted before ctr_pendsv reached 1",
-            );
+            panic!("isr_m0_tail_chain: cycle budget exhausted before ctr_pendsv reached 1",);
         }
     }
 }

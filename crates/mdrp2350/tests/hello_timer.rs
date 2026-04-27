@@ -34,12 +34,16 @@ fn prepare_emu() -> Emulator {
     // Read SP and reset vector from SRAM (the firmware's actual vector
     // table — ROM would be all zeros).
     let initial_sp = u32::from_le_bytes([
-        HELLO_TIMER_BIN[0], HELLO_TIMER_BIN[1],
-        HELLO_TIMER_BIN[2], HELLO_TIMER_BIN[3],
+        HELLO_TIMER_BIN[0],
+        HELLO_TIMER_BIN[1],
+        HELLO_TIMER_BIN[2],
+        HELLO_TIMER_BIN[3],
     ]);
     let reset_vector = u32::from_le_bytes([
-        HELLO_TIMER_BIN[4], HELLO_TIMER_BIN[5],
-        HELLO_TIMER_BIN[6], HELLO_TIMER_BIN[7],
+        HELLO_TIMER_BIN[4],
+        HELLO_TIMER_BIN[5],
+        HELLO_TIMER_BIN[6],
+        HELLO_TIMER_BIN[7],
     ]);
     {
         let arm = emu.cores.expect_arm_mut();
@@ -60,11 +64,7 @@ fn hello_timer_firmware_increments_counter() {
     let mut emu = prepare_emu();
 
     // Pre-condition: counter reads 0.
-    assert_eq!(
-        emu.peek(COUNTER_ADDR),
-        0,
-        "counter cell must start at 0"
-    );
+    assert_eq!(emu.peek(COUNTER_ADDR), 0, "counter cell must start at 0");
 
     // Run enough cycles for at least a few alarm fires. At post-bootrom
     // clk_sys = 150 MHz and TICKS.TIMER0.CYCLES = 12, one µs = 12 sys_clks;

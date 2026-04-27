@@ -1568,9 +1568,9 @@ mod exceptions {
         let handler = 0x2000_5000u32;
         bus.write32(0x2000_0000 + 11 * 4, handler | 1);
         // Handler body: SUB SP,#8 ; ADD SP,#8 ; BX LR
-        bus.write16(handler, 0xB082);        // SUB SP, #8
-        bus.write16(handler + 2, 0xB002);    // ADD SP, #8
-        bus.write16(handler + 4, 0x4770);    // BX LR
+        bus.write16(handler, 0xB082); // SUB SP, #8
+        bus.write16(handler + 2, 0xB002); // ADD SP, #8
+        bus.write16(handler + 4, 0x4770); // BX LR
         // Deliver SVC via the real fault path so enter_exception is driven
         // by the same code path that normal execution uses.
         cpu.pending_fault = Some(crate::core::Fault::Svc);
@@ -1589,11 +1589,7 @@ mod exceptions {
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.ipsr(), 0, "Returned to thread mode");
         // Unwind deallocated 32 bytes from the stack — net SP back to start.
-        assert_eq!(
-            cpu.regs.sp(),
-            initial_sp,
-            "SP restored to pre-fault value"
-        );
+        assert_eq!(cpu.regs.sp(), initial_sp, "SP restored to pre-fault value");
     }
 
     #[test]
@@ -1675,10 +1671,7 @@ mod exceptions {
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.ipsr(), 3, "HardFault taken");
         assert_eq!(cpu.regs.pc(), handlers[3]);
-        assert!(
-            !bus.bus_fault(),
-            "step() cleared the sticky bus_fault flag"
-        );
+        assert!(!bus.bus_fault(), "step() cleared the sticky bus_fault flag");
     }
 
     /// HLD V5 §6.2 / Final step: harness integration tests probe
@@ -1857,7 +1850,10 @@ mod emulator_step {
     fn step_executes_movs_sequence() {
         // Build a tiny program in SRAM and set PC there. Five MOVS instructions
         // writing constants to r0..r4.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let program_base: u32 = 0x2000_1000;
         let instrs: [u16; 5] = [
             0x2001, // MOVS r0, #1
@@ -1884,7 +1880,10 @@ mod emulator_step {
     fn step_handles_svc_and_return() {
         // Program: SVC #0 at 0x1000 followed by a NOP. Handler at 0x2000
         // is a single BX LR. Verify we reach the handler, then return.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let vtor = 0x2000_0000u32;
         let handler = 0x2000_1000u32;
         let stack_top = 0x2000_8000u32;
@@ -1916,7 +1915,10 @@ mod emulator_step {
 
     #[test]
     fn step_hardfault_on_undefined_then_unwinds() {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let vtor = 0x2000_0000u32;
         let handler = 0x2000_1000u32;
         let stack_top = 0x2000_8000u32;
@@ -1945,7 +1947,10 @@ mod emulator_step {
         // Emulator::run loops calling step until the cycle budget is met.
         // Lay down 10 NOPs and verify both PC and the cycle count advanced
         // as expected.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let prog = 0x2000_1000u32;
         for i in 0..10 {
             emu.bus.write16(prog + (i as u32) * 2, 0xBF00); // NOP
@@ -1969,7 +1974,10 @@ mod emulator_step {
         // — SVCall priority (0) is not higher than execution priority (0
         // with PRIMASK set). The architectural response is to escalate
         // to HardFault rather than silently deliver the SVCall.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let vtor = 0x2000_0000u32;
         let svc_handler = 0x2000_1000u32;
         let hf_handler = 0x2000_2000u32;
@@ -1994,7 +2002,10 @@ mod emulator_step {
 
     #[test]
     fn halted_core0_does_not_freeze_core1() {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(4).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(4)
+            .build()
+            .expect("Serial build is infallible");
         let prog = 0x2000_1000u32;
         for i in 0..8u32 {
             emu.bus.write16(prog + i * 2, 0xBF00); // NOP
@@ -2028,7 +2039,7 @@ mod emulator_step {
 //      state as N quantum-1 steps against an identical program.
 mod quantum_contract {
     use crate::bus::PIO0_BASE;
-    use crate::{Config, EmulatorBuilder, Emulator};
+    use crate::{Config, Emulator, EmulatorBuilder};
 
     /// Seed a run of NOPs at 0x2000_1000 and park core 0 on them.
     /// Each NOP is a 1-cycle instruction on M0+, so each `emu.step()`
@@ -2046,7 +2057,10 @@ mod quantum_contract {
 
     #[test]
     fn step_quantum_1_advances_by_one_instruction() {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         seed_nop_program(&mut emu);
         let pc_before = emu.cores[0].regs.pc();
         let consumed = emu.step().expect("Serial step is infallible");
@@ -2066,7 +2080,10 @@ mod quantum_contract {
         // overshoot is strictly bounded.
         const N: u32 = 16;
         const MAX_INSTR_COST: u64 = 4;
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(N).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(N)
+            .build()
+            .expect("Serial build is infallible");
         seed_nop_program(&mut emu);
         let consumed = emu.step().expect("Serial step is infallible");
         assert!(
@@ -2086,7 +2103,10 @@ mod quantum_contract {
 
     #[test]
     fn step_return_equals_clock_delta() {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(8).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(8)
+            .build()
+            .expect("Serial build is infallible");
         seed_nop_program(&mut emu);
         let before = emu.cycles();
         let consumed = emu.step().expect("Serial step is infallible");
@@ -2105,7 +2125,8 @@ mod quantum_contract {
     fn toggle_emulator(step_quantum: u32) -> Emulator {
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(step_quantum)
-            .build().expect("Serial build is infallible");
+            .build()
+            .expect("Serial build is infallible");
 
         // Program: SET PINS, 1 @ addr 0; SET PINS, 0 @ addr 1.
         let set_pins_1: u16 = 0xE001;
@@ -2172,7 +2193,9 @@ mod external_gpio_override {
     fn override_wins_over_default_merge() {
         // Set bits on GPIO10..15 via the override. After update_gpio,
         // those bits in `gpio_in` must reflect the override exactly.
-        let mut emu = EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build is infallible");
         emu.reset();
 
         let mask: u32 = 0b111111u32 << 10; // GPIO10..GPIO15
@@ -2195,7 +2218,9 @@ mod external_gpio_override {
         // the override still wins. This is the exact race that B1 hid:
         // SIO sets a bit, update_gpio merges, and the override would be
         // lost without the post-PSRAM splice.
-        let mut emu = EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build is infallible");
         emu.reset();
 
         let mask: u32 = 0b111111u32 << 10;
@@ -2242,7 +2267,9 @@ mod external_gpio_override {
         // Set the override, reset, verify both fields are 0 — protects
         // tests from leaking state across resets and matches the rest
         // of the Bus reset conventions.
-        let mut emu = EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.external_gpio_in_mask = 0xFFFF_FFFF;
         emu.bus.external_gpio_in_override = 0xDEAD_BEEF;
         emu.reset();
@@ -2276,9 +2303,13 @@ mod pll_lock {
     const ALIAS_CLR: u32 = 0x3000;
 
     #[inline]
-    fn pll_sys(offset: u32) -> u32 { PLL_SYS_BASE + offset }
+    fn pll_sys(offset: u32) -> u32 {
+        PLL_SYS_BASE + offset
+    }
     #[inline]
-    fn pll_usb(offset: u32) -> u32 { PLL_USB_BASE + offset }
+    fn pll_usb(offset: u32) -> u32 {
+        PLL_USB_BASE + offset
+    }
 
     #[test]
     fn test_pll_cs_read_lock_zero_at_reset() {
@@ -2353,7 +2384,11 @@ mod pll_lock {
 
         bus.write32(pll_sys(PWR_OFF), 0x21); // PD+VCOPD set
         let cs2 = bus.read32(pll_sys(CS_OFF));
-        assert_eq!(cs2 & (1 << 31), 0, "LOCK must drop when power-down re-asserts");
+        assert_eq!(
+            cs2 & (1 << 31),
+            0,
+            "LOCK must drop when power-down re-asserts"
+        );
     }
 
     #[test]
@@ -2386,21 +2421,28 @@ mod pll_lock {
         let mut bus = Bus::new();
         bus.master_cycle = 0;
         bus.write32(pll_sys(FBDIV_OFF), 100);
-        assert_eq!(bus.pll_sys_lock_at_cycle, None,
-            "FBDIV write must not arm while PLL is powered down");
+        assert_eq!(
+            bus.pll_sys_lock_at_cycle, None,
+            "FBDIV write must not arm while PLL is powered down"
+        );
 
         // SET alias on CS: OR 0x01 (no visible change — REFDIV already 1).
         bus.write32(pll_sys(CS_OFF) + ALIAS_SET, 0x01);
-        assert_eq!(bus.pll_sys_lock_at_cycle, None,
-            "CS SET alias must not arm while PLL is powered down");
+        assert_eq!(
+            bus.pll_sys_lock_at_cycle, None,
+            "CS SET alias must not arm while PLL is powered down"
+        );
         // Reference ALIAS_XOR to keep the alias alphabet in the test body
         // (avoids dead_code warnings and documents the three-alias shape).
         let _ = ALIAS_XOR;
 
         bus.master_cycle = 100;
         bus.write32(pll_sys(PWR_OFF) + ALIAS_CLR, 0x2D);
-        assert_eq!(bus.pll_sys_lock_at_cycle, Some(100 + PLL_LOCK_DELAY_SYSCLKS),
-            "PWR CLR alias must arm the lock at now + delay");
+        assert_eq!(
+            bus.pll_sys_lock_at_cycle,
+            Some(100 + PLL_LOCK_DELAY_SYSCLKS),
+            "PWR CLR alias must arm the lock at now + delay"
+        );
     }
 
     #[test]
@@ -2416,10 +2458,15 @@ mod pll_lock {
         assert_ne!(bus.read32(pll_sys(CS_OFF)) & (1 << 31), 0);
 
         bus.write32(pll_sys(PRIM_OFF), (2u32 << 16) | (2u32 << 12));
-        assert_eq!(bus.pll_sys_lock_at_cycle, armed_at,
-            "PRIM write must not rearm the lock-detect counter");
-        assert_ne!(bus.read32(pll_sys(CS_OFF)) & (1 << 31), 0,
-            "LOCK must stay 1 after PRIM-only write");
+        assert_eq!(
+            bus.pll_sys_lock_at_cycle, armed_at,
+            "PRIM write must not rearm the lock-detect counter"
+        );
+        assert_ne!(
+            bus.read32(pll_sys(CS_OFF)) & (1 << 31),
+            0,
+            "LOCK must stay 1 after PRIM-only write"
+        );
     }
 
     #[test]
@@ -2429,10 +2476,16 @@ mod pll_lock {
         bus.write32(pll_sys(FBDIV_OFF), 100);
         bus.write32(pll_sys(PWR_OFF), 0);
         bus.master_cycle = PLL_LOCK_DELAY_SYSCLKS + 1;
-        assert_ne!(bus.read32(pll_sys(CS_OFF)) & (1 << 31), 0,
-            "PLL_SYS should report LOCK=1 past arm");
-        assert_eq!(bus.read32(pll_usb(CS_OFF)) & (1 << 31), 0,
-            "PLL_USB must remain LOCK=0 (independent state)");
+        assert_ne!(
+            bus.read32(pll_sys(CS_OFF)) & (1 << 31),
+            0,
+            "PLL_SYS should report LOCK=1 past arm"
+        );
+        assert_eq!(
+            bus.read32(pll_usb(CS_OFF)) & (1 << 31),
+            0,
+            "PLL_USB must remain LOCK=0 (independent state)"
+        );
         assert_eq!(bus.pll_usb_lock_at_cycle, None);
     }
 }
@@ -2445,8 +2498,8 @@ mod pll_lock {
 // §5.5 (fast-path gate with DMA + peripherals + IRQ), and the PIO →
 // NVIC routing helper in `Emulator::tick_pio_and_route_irqs_single`.
 mod phase1_wave1 {
-    use crate::bus::{Bus, PIO0_BASE, PIO1_BASE, TIMER_BASE, WATCHDOG_BASE};
     use crate::bus::peripheral_dispatch::{RESET_WATCHDOG, is_held_in_reset};
+    use crate::bus::{Bus, PIO0_BASE, PIO1_BASE, TIMER_BASE, WATCHDOG_BASE};
     use crate::irq::{IRQ_PIO0_IRQ_0, IRQ_PIO1_IRQ_0, IRQ_TIMER_IRQ_0};
     use crate::peripherals::watchdog_tick::TICK_OFFSET;
     use crate::{Config, EmulatorBuilder};
@@ -2464,7 +2517,10 @@ mod phase1_wave1 {
         // Directly set irq_pending on the bus; one step of the slow path
         // drains it into both cores. (The fast path cannot drain because
         // it early-exits on `any_irq`.)
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         // Park a NOP so the step path has something to execute.
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
@@ -2473,12 +2529,19 @@ mod phase1_wave1 {
         // Assert TIMER_IRQ_0 (line 0) via the bus's pending bitmap.
         emu.bus.irq_pending |= 1u32 << IRQ_TIMER_IRQ_0;
         emu.step().expect("Serial step is infallible");
-        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
-            "core 0 NVIC must latch TIMER_IRQ_0 from irq_pending");
-        assert!(emu.bus.nvics[1].is_pending(IRQ_TIMER_IRQ_0 as u8),
-            "core 1 NVIC must also latch it (shared IRQ wire)");
-        assert_eq!(emu.bus.irq_pending(), 0,
-            "drain must clear the bus-level bitmap");
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "core 0 NVIC must latch TIMER_IRQ_0 from irq_pending"
+        );
+        assert!(
+            emu.bus.nvics[1].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "core 1 NVIC must also latch it (shared IRQ wire)"
+        );
+        assert_eq!(
+            emu.bus.irq_pending(),
+            0,
+            "drain must clear the bus-level bitmap"
+        );
     }
 
     // --- RESETS Bus-level guard -----------------------------------------
@@ -2499,7 +2562,10 @@ mod phase1_wave1 {
         // Default RESETS holds bit 24 (WATCHDOG) — writing to
         // WATCHDOG_TICK must be a no-op.
         bus.write32(WATCHDOG_BASE + TICK_OFFSET, 0x0000_03FF);
-        assert_eq!(bus.watchdog_tick.cycles, 12, "CYCLES stays at reset default");
+        assert_eq!(
+            bus.watchdog_tick.cycles, 12,
+            "CYCLES stays at reset default"
+        );
         assert!(!bus.watchdog_tick.enable);
     }
 
@@ -2541,7 +2607,10 @@ mod phase1_wave1 {
         // Build an emulator with no PIO activity, no DMA, no IRQ
         // pending. A single NOP step should still succeed and leave
         // irq_pending at 0 (fast path never touches it).
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
@@ -2562,7 +2631,10 @@ mod phase1_wave1 {
         // When irq_pending is non-zero at the start of the quantum,
         // the gate opens and the slow-path loop runs — which drains
         // irq_pending into the NVIC.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
@@ -2579,7 +2651,10 @@ mod phase1_wave1 {
 
     #[test]
     fn pio0_irq_flag_bit0_routes_to_nvic_line_7() {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
@@ -2594,13 +2669,18 @@ mod phase1_wave1 {
         // drains into the NVIC.
         assert!(!emu.bus.pio_all_idle());
         emu.step().expect("Serial step is infallible");
-        assert!(emu.bus.nvics[0].is_pending(IRQ_PIO0_IRQ_0 as u8),
-            "PIO0 IRQ flag bit 0 must route to NVIC line #7 (PIO0_IRQ_0)");
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_PIO0_IRQ_0 as u8),
+            "PIO0 IRQ flag bit 0 must route to NVIC line #7 (PIO0_IRQ_0)"
+        );
     }
 
     #[test]
     fn pio1_irq_flag_bit1_routes_to_nvic_line_10() {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
@@ -2612,8 +2692,10 @@ mod phase1_wave1 {
         emu.bus.write32(PIO1_BASE + 0x034, 0x02);
         emu.step().expect("Serial step is infallible");
         // PIO1_IRQ_1 is IRQ_PIO1_IRQ_0 + 1.
-        assert!(emu.bus.nvics[0].is_pending((IRQ_PIO1_IRQ_0 + 1) as u8),
-            "PIO1 IRQ flag bit 1 must route to NVIC line #10 (PIO1_IRQ_1)");
+        assert!(
+            emu.bus.nvics[0].is_pending((IRQ_PIO1_IRQ_0 + 1) as u8),
+            "PIO1 IRQ flag bit 1 must route to NVIC line #10 (PIO1_IRQ_1)"
+        );
     }
 
     #[test]
@@ -2623,7 +2705,10 @@ mod phase1_wave1 {
         // entry "PIO INTn_INTE routing not modelled"). Flags 4-7 are
         // strictly intra-PIO SM-to-SM signalling and must NEVER raise
         // any NVIC line regardless of the routing model.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
@@ -2632,8 +2717,11 @@ mod phase1_wave1 {
         emu.bus.write32(PIO0_BASE + 0x034, 0xF0);
         emu.step().expect("Serial step is infallible");
         // No NVIC line 7..=10 should be latched.
-        assert_eq!(emu.bus.nvics[0].pending & 0x780, 0,
-            "high IRQ flags (bits 4-7) must not route to PIO0/PIO1 NVIC lines");
+        assert_eq!(
+            emu.bus.nvics[0].pending & 0x780,
+            0,
+            "high IRQ flags (bits 4-7) must not route to PIO0/PIO1 NVIC lines"
+        );
     }
 
     #[test]
@@ -2648,7 +2736,10 @@ mod phase1_wave1 {
         // reads `irq_flags`, not the INTE/INTF registers). It passes
         // once `tick_pio_and_route_irqs_single` is wired through
         // `PioBlock::int0_ints` / `int1_ints`.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         emu.bus.write16(0x2000_1000, 0xBF00);
         emu.cores[0].regs.set_pc(0x2000_1000);
         emu.cores[0].regs.msp = 0x2002_0000;
@@ -2659,10 +2750,14 @@ mod phase1_wave1 {
         emu.bus.write32(PIO0_BASE + 0x000, 0x1);
         emu.bus.write32(PIO0_BASE + 0x130, 0x001);
         emu.step().expect("Serial step is infallible");
-        assert!(emu.bus.nvics[0].is_pending(IRQ_PIO0_IRQ_0 as u8),
-            "INT0_INTF bit 0 must route to NVIC #7 (PIO0_IRQ_0)");
-        assert!(!emu.bus.nvics[0].is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
-            "INT0_INTF bit 0 must NOT bleed into NVIC #8 (PIO0_IRQ_1)");
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_PIO0_IRQ_0 as u8),
+            "INT0_INTF bit 0 must route to NVIC #7 (PIO0_IRQ_0)"
+        );
+        assert!(
+            !emu.bus.nvics[0].is_pending((IRQ_PIO0_IRQ_0 + 1) as u8),
+            "INT0_INTF bit 0 must NOT bleed into NVIC #8 (PIO0_IRQ_1)"
+        );
     }
 
     /// Regression: PicoGUS PIO0 SM0 (IOW capture) program is
@@ -2679,7 +2774,10 @@ mod phase1_wave1 {
     /// driven low through the override path.
     #[test]
     fn pio0_sm0_catches_external_gpio_iow_low_after_high() {
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
 
         // Park core 0 on a NOP at 0x2000_1000 so step() always has
         // somewhere to fetch and never faults the CPU side.
@@ -2823,7 +2921,10 @@ mod phase1_wave2 {
         // Core 0, thread mode, PRIMASK clear. Enable IRQ 0 and assert it
         // pending via the bus bitmap (drained on first slow-path step).
         // Expected: exception entry to vector 16 (TIMER_IRQ_0).
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let (handler_addr, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
         // Wire VTOR + PC + SP on core 0.
         emu.bus.ppb[0].vtor = 0x2000_0000;
@@ -2838,26 +2939,39 @@ mod phase1_wave2 {
         // would early-exit on `any_irq`).
         emu.step().expect("Serial step is infallible");
         // Drain happened — NVIC latched the pending bit.
-        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
-            "NVIC must latch the pending bit after slow-path drain");
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "NVIC must latch the pending bit after slow-path drain"
+        );
         // Second step: CPU-side poll picks it up and enters the handler.
         emu.step().expect("Serial step is infallible");
         // PC must be at the handler.
-        assert_eq!(emu.cores[0].regs.pc(), handler_addr,
-            "exception entry must land at the handler address");
+        assert_eq!(
+            emu.cores[0].regs.pc(),
+            handler_addr,
+            "exception entry must land at the handler address"
+        );
         // IPSR must be 16 (exception number for TIMER_IRQ_0 → 16).
-        assert_eq!(emu.cores[0].regs.ipsr(), 16,
-            "IPSR must encode exception #16 inside the handler");
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            16,
+            "IPSR must encode exception #16 inside the handler"
+        );
         // NVIC pending bit is cleared by dispatch.
-        assert!(!emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
-            "dispatch clears the pending bit");
+        assert!(
+            !emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "dispatch clears the pending bit"
+        );
     }
 
     #[test]
     fn pending_without_enable_does_not_dispatch() {
         // NVIC pending but not enabled — CPU must stay in thread mode
         // and keep executing the main routine.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
         emu.bus.ppb[0].vtor = 0x2000_0000;
         emu.cores[0].regs.set_pc(main_addr);
@@ -2867,15 +2981,20 @@ mod phase1_wave2 {
         // enabled bit intentionally not set.
         emu.step().expect("Serial step is infallible");
         assert_eq!(emu.cores[0].regs.ipsr(), 0, "still in thread mode");
-        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
-            "pending bit stays set when NVIC masks the line");
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "pending bit stays set when NVIC masks the line"
+        );
     }
 
     #[test]
     fn primask_blocks_dispatch() {
         // Pending + enabled but PRIMASK set — no dispatch, pending
         // bit remains latched.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
         emu.bus.ppb[0].vtor = 0x2000_0000;
         emu.cores[0].regs.set_pc(main_addr);
@@ -2885,10 +3004,15 @@ mod phase1_wave2 {
         emu.bus.nvics[0].set_enabled(IRQ_TIMER_IRQ_0 as u8);
         emu.bus.nvics[0].set_pending(IRQ_TIMER_IRQ_0 as u8);
         emu.step().expect("Serial step is infallible");
-        assert_eq!(emu.cores[0].regs.ipsr(), 0,
-            "PRIMASK=1 must block dispatch — stay in thread mode");
-        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
-            "PRIMASK leaves the pending bit latched");
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            0,
+            "PRIMASK=1 must block dispatch — stay in thread mode"
+        );
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "PRIMASK leaves the pending bit latched"
+        );
     }
 
     #[test]
@@ -2898,7 +3022,10 @@ mod phase1_wave2 {
         // `can_dispatch_now` checks `ppb.any_active()`, so the test
         // sets BOTH IPSR (for handler-mode reads inside the step path)
         // and the PPB active bit (the actual dispatch gate).
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
         emu.bus.ppb[0].vtor = 0x2000_0000;
         emu.cores[0].regs.set_pc(main_addr);
@@ -2920,7 +3047,10 @@ mod phase1_wave2 {
     fn lowest_priority_value_wins_tiebreak_by_irq_number() {
         // Two IRQs pending: IRQ 3 at priority 0xC0, IRQ 5 at priority
         // 0x40. Lower priority value = higher priority, so IRQ 5 wins.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
         emu.bus.ppb[0].vtor = 0x2000_0000;
         emu.cores[0].regs.set_pc(main_addr);
@@ -2934,8 +3064,11 @@ mod phase1_wave2 {
         emu.bus.nvics[0].set_priority(5, 0x40);
         emu.step().expect("Serial step is infallible");
         // IPSR must be exception #(16 + 5) = 21 (UART1_IRQ by table).
-        assert_eq!(emu.cores[0].regs.ipsr(), 21,
-            "higher-priority (lower value) IRQ must dispatch first");
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            21,
+            "higher-priority (lower value) IRQ must dispatch first"
+        );
         // IRQ 5 dispatched (cleared); IRQ 3 still pending.
         assert!(!emu.bus.nvics[0].is_pending(5));
         assert!(emu.bus.nvics[0].is_pending(3));
@@ -2944,7 +3077,10 @@ mod phase1_wave2 {
     #[test]
     fn equal_priority_picks_lowest_irq_number() {
         // Two IRQs at the same priority 0x00 — lowest-number wins.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         let (_handler, main_addr) = plant_vector_table(&mut emu.bus, 0x2000_0000);
         emu.bus.ppb[0].vtor = 0x2000_0000;
         emu.cores[0].regs.set_pc(main_addr);
@@ -2956,8 +3092,11 @@ mod phase1_wave2 {
         emu.bus.nvics[0].set_pending(5);
         // Both defaults to priority 0x00.
         emu.step().expect("Serial step is infallible");
-        assert_eq!(emu.cores[0].regs.ipsr(), 16 + 2,
-            "tie-break by lowest IRQ number");
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            16 + 2,
+            "tie-break by lowest IRQ number"
+        );
     }
 
     // --- Bus-level TIMER dispatch + RESETS gate -------------------------
@@ -2970,8 +3109,11 @@ mod phase1_wave2 {
         bus.write32(crate::bus::TIMER_BASE + 0x10, 500);
         // Read comes back through reset-gate: 0.
         assert_eq!(bus.read32(crate::bus::TIMER_BASE + 0x10), 0);
-        assert_eq!(bus.timer.read32(0x10, 0, 125_000_000), 0,
-            "direct peripheral read-back confirms no state change");
+        assert_eq!(
+            bus.timer.read32(0x10, 0, 125_000_000),
+            0,
+            "direct peripheral read-back confirms no state change"
+        );
     }
 
     #[test]
@@ -3002,7 +3144,10 @@ mod phase1_wave2 {
         // Program an alarm that matches inside the window we'll pass to
         // advance_lazy_scheduled and assert the IRQ bit lands in
         // bus.irq_pending + the NVIC gets it on drain.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(64).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(64)
+            .build()
+            .expect("Serial build is infallible");
         // Release TIMER's RESET bit.
         emu.bus.write32(0x4000_F000, 1u32 << 21);
         // Park a NOP so step() has something to execute.
@@ -3022,8 +3167,10 @@ mod phase1_wave2 {
         emu.step().expect("Serial step is infallible");
         // NVIC must have picked up IRQ_TIMER_IRQ_0 via drain after the
         // fast-path `advance_lazy_scheduled`.
-        assert!(emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
-            "ALARM0 match must propagate to NVIC via lazy schedule");
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "ALARM0 match must propagate to NVIC via lazy schedule"
+        );
         // INTR must show the alarm fired and armed cleared.
         let intr = emu.bus.read32(crate::bus::TIMER_BASE + 0x34);
         assert_eq!(intr & 1, 1, "INTR bit 0 must latch");
@@ -3042,19 +3189,15 @@ mod phase1_wave2 {
 // `tick` / `simulate_transaction` into `bus.irq_pending` (and onward to the
 // NVIC via `drain_pending_irqs_to_cores`).
 mod phase2_uart_spi_i2c {
-    use crate::bus::peripheral_dispatch::{
-        RESET_I2C0, RESET_SPI0, RESET_UART0, is_held_in_reset,
-    };
-    use crate::bus::{
-        Bus, I2C0_BASE, I2C1_BASE, SPI0_BASE, SPI1_BASE, UART0_BASE, UART1_BASE,
-    };
+    use crate::bus::peripheral_dispatch::{RESET_I2C0, RESET_SPI0, RESET_UART0, is_held_in_reset};
+    use crate::bus::{Bus, I2C0_BASE, I2C1_BASE, SPI0_BASE, SPI1_BASE, UART0_BASE, UART1_BASE};
     use crate::irq::{IRQ_I2C0_IRQ, IRQ_SPI0_IRQ, IRQ_UART0_IRQ};
-    use crate::peripherals::i2c::{IC_CLR_TX_ABRT, IC_ENABLE, IC_RAW_INTR_STAT, IC_TAR, INT_TX_ABRT};
-    use crate::peripherals::spi::{
-        SSP_INT_RX, SSPCR0, SSPCR1, SSPDR, SSPIMSC, SSPRIS,
+    use crate::peripherals::i2c::{
+        IC_CLR_TX_ABRT, IC_ENABLE, IC_RAW_INTR_STAT, IC_TAR, INT_TX_ABRT,
     };
+    use crate::peripherals::spi::{SSP_INT_RX, SSPCR0, SSPCR1, SSPDR, SSPIMSC, SSPRIS};
     use crate::peripherals::uart::{
-        UARTCR, UARTDR, UARTFBRD, UARTFR, UARTIBRD, UARTIMSC, UARTLCR_H, UARTRIS, UART_INT_TX,
+        UART_INT_TX, UARTCR, UARTDR, UARTFBRD, UARTFR, UARTIBRD, UARTIMSC, UARTLCR_H, UARTRIS,
     };
     use crate::{Config, EmulatorBuilder};
 
@@ -3087,7 +3230,11 @@ mod phase2_uart_spi_i2c {
         bus.write32(UART0_BASE + UARTCR, 0x301);
         // Release then verify the write actually takes effect.
         bus.write32(RESETS_CLR, 1u32 << RESET_UART0);
-        assert_eq!(bus.read32(UART0_BASE + UARTCR), 0, "pre-release write swallowed");
+        assert_eq!(
+            bus.read32(UART0_BASE + UARTCR),
+            0,
+            "pre-release write swallowed"
+        );
         bus.write32(UART0_BASE + UARTCR, 0x301);
         assert_eq!(bus.read32(UART0_BASE + UARTCR), 0x301);
     }
@@ -3097,7 +3244,11 @@ mod phase2_uart_spi_i2c {
         let mut bus = Bus::new();
         bus.write32(SPI0_BASE + SSPCR1, 0x2);
         bus.write32(RESETS_CLR, 1u32 << RESET_SPI0);
-        assert_eq!(bus.read32(SPI0_BASE + SSPCR1), 0, "pre-release write swallowed");
+        assert_eq!(
+            bus.read32(SPI0_BASE + SSPCR1),
+            0,
+            "pre-release write swallowed"
+        );
         bus.write32(SPI0_BASE + SSPCR1, 0x2);
         assert_eq!(bus.read32(SPI0_BASE + SSPCR1), 0x2);
     }
@@ -3107,7 +3258,11 @@ mod phase2_uart_spi_i2c {
         let mut bus = Bus::new();
         bus.write32(I2C0_BASE + IC_ENABLE, 0x1);
         bus.write32(RESETS_CLR, 1u32 << RESET_I2C0);
-        assert_eq!(bus.read32(I2C0_BASE + IC_ENABLE), 0, "pre-release write swallowed");
+        assert_eq!(
+            bus.read32(I2C0_BASE + IC_ENABLE),
+            0,
+            "pre-release write swallowed"
+        );
         bus.write32(I2C0_BASE + IC_ENABLE, 0x1);
         assert_eq!(bus.read32(I2C0_BASE + IC_ENABLE), 0x1);
     }
@@ -3134,7 +3289,10 @@ mod phase2_uart_spi_i2c {
         // enable, push a byte, run the emulator for enough cycles that
         // the slow-path tick drains the FIFO and raises TXIS. Confirm
         // the bit lands in `bus.irq_pending` and then in the NVIC.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         // Seed 125 MHz so the baud math matches pico-sdk defaults.
         emu.bus.seed_sys_clk_hz(125_000_000);
         // peri_clk_hz follows sys via the default CLK_PERI_CTRL AUXSRC=0.
@@ -3212,7 +3370,10 @@ mod phase2_uart_spi_i2c {
         // Load enough loopback words to cross RX half-full threshold
         // (4 of 8 entries). RIS latches RX; IMSC = RX enables it;
         // route through the bus's IRQ assertion path.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         release_all(&mut emu.bus);
         emu.bus.write32(SPI0_BASE + SSPCR0, 0x07);
         emu.bus.write32(SPI0_BASE + SSPCR1, 0x3); // SSE | LBM
@@ -3278,7 +3439,10 @@ mod phase2_uart_spi_i2c {
         // With IC_INTR_MASK set to admit TX_ABRT, the I2C module
         // pushes the IRQ into irq_pending during `simulate_transaction`.
         // Stepping the emulator drains it into the NVIC.
-        let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().expect("Serial build is infallible");
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
         release_all(&mut emu.bus);
         emu.bus.write32(I2C0_BASE + IC_TAR, 0x55);
         emu.bus.write32(I2C0_BASE + IC_ENABLE, 1);
@@ -3311,8 +3475,10 @@ mod phase2_uart_spi_i2c {
         bus.write32(UART0_BASE + UARTLCR_H, 1 << 4);
         bus.write32(UART0_BASE + UARTCR, 0x301);
         bus.write32(UART0_BASE + UARTDR, 0x42);
-        assert!(!bus.all_peripherals_idle(),
-            "pending TX byte breaks the idle gate");
+        assert!(
+            !bus.all_peripherals_idle(),
+            "pending TX byte breaks the idle gate"
+        );
     }
 
     #[test]
@@ -3908,7 +4074,10 @@ mod stage2_bus_coverage {
         // Alias 0xE > 3 in xip_flash_offset's terms.
         let v = bus.read32(0x1E00_0000);
         assert_eq!(v, 0);
-        assert!(!bus.bus_fault(), "region-1 read outside flash must not fault");
+        assert!(
+            !bus.bus_fault(),
+            "region-1 read outside flash must not fault"
+        );
     }
 
     /// `pio_rp2040_to_internal` must pass through offsets outside
@@ -4015,8 +4184,17 @@ mod stage2_bus_coverage {
         let mut bus = Bus::new();
         // Every peripheral in the reset map is held on fresh Bus::new().
         for base in [
-            UART0_BASE, UART1_BASE, SPI0_BASE, SPI1_BASE, I2C0_BASE, I2C1_BASE, TIMER_BASE,
-            WATCHDOG_BASE, ADC_BASE, PWM_BASE, DMA_BASE,
+            UART0_BASE,
+            UART1_BASE,
+            SPI0_BASE,
+            SPI1_BASE,
+            I2C0_BASE,
+            I2C1_BASE,
+            TIMER_BASE,
+            WATCHDOG_BASE,
+            ADC_BASE,
+            PWM_BASE,
+            DMA_BASE,
         ] {
             // Writes drop silently; reads return 0.
             bus.write32(base + 0x00, 0xDEAD_BEEF);
@@ -4864,11 +5042,11 @@ mod stage2_bus_coverage {
 
 mod stage2_i2c_coverage {
     use crate::peripherals::i2c::{
-        I2cRegs, IC_CON, IC_CLR_RX_OVER, IC_CLR_RX_UNDER, IC_CLR_TX_OVER, IC_CLR_RD_REQ,
-        IC_CLR_RX_DONE, IC_CLR_ACTIVITY, IC_CLR_START_DET, IC_CLR_GEN_CALL, IC_CLR_INTR,
-        IC_DATA_CMD, IC_ENABLE, IC_ENABLE_STATUS, IC_FS_SCL_HCNT, IC_FS_SCL_LCNT, IC_FS_SPKLEN,
-        IC_INTR_MASK, IC_SAR, IC_SDA_HOLD, IC_SS_SCL_HCNT, IC_SS_SCL_LCNT, IC_STATUS, IC_TAR,
-        IC_TX_TL, IC_RX_TL, INT_RX_FULL, INT_STOP_DET, INT_TX_ABRT, INT_TX_EMPTY,
+        I2cRegs, IC_CLR_ACTIVITY, IC_CLR_GEN_CALL, IC_CLR_INTR, IC_CLR_RD_REQ, IC_CLR_RX_DONE,
+        IC_CLR_RX_OVER, IC_CLR_RX_UNDER, IC_CLR_START_DET, IC_CLR_TX_OVER, IC_CON, IC_DATA_CMD,
+        IC_ENABLE, IC_ENABLE_STATUS, IC_FS_SCL_HCNT, IC_FS_SCL_LCNT, IC_FS_SPKLEN, IC_INTR_MASK,
+        IC_RX_TL, IC_SAR, IC_SDA_HOLD, IC_SS_SCL_HCNT, IC_SS_SCL_LCNT, IC_STATUS, IC_TAR, IC_TX_TL,
+        INT_RX_FULL, INT_STOP_DET, INT_TX_ABRT, INT_TX_EMPTY,
     };
 
     const IRQ: u32 = 23;
@@ -5153,8 +5331,8 @@ mod stage2_i2c_coverage {
 
 mod stage2_spi_coverage {
     use crate::peripherals::spi::{
-        SSPCPSR, SSPCR0, SSPCR1, SSPDMACR, SSPDR, SSPIMSC, SSPPCELLID3, SSPPERIPHID3,
-        SpiRegs, SSP_INT_ROR, SSP_INT_RX, SSP_INT_RT,
+        SSP_INT_ROR, SSP_INT_RT, SSP_INT_RX, SSPCPSR, SSPCR0, SSPCR1, SSPDMACR, SSPDR, SSPIMSC,
+        SSPPCELLID3, SSPPERIPHID3, SpiRegs,
     };
 
     const IRQ: u32 = 18;
@@ -5178,7 +5356,9 @@ mod stage2_spi_coverage {
         assert!(!s.is_idle());
     }
     #[inline]
-    fn SSPICR_OFFSET() -> u32 { 0x020 }
+    fn SSPICR_OFFSET() -> u32 {
+        0x020
+    }
 
     /// `tx_dreq` / `rx_dreq` false when disabled (spi.rs:159, 165).
     #[test]
@@ -5473,8 +5653,8 @@ mod stage2_spi_coverage {
 
 mod stage2_uart_coverage {
     use crate::peripherals::uart::{
-        UartRegs, UARTCR, UARTDMACR, UARTDR, UARTFBRD, UARTFR, UARTIBRD, UARTIFLS, UARTILPR,
-        UARTIMSC, UARTLCR_H, UARTPCELLID3, UARTPERIPHID3, UARTRSR_ECR, UART_INT_RX,
+        UART_INT_RX, UARTCR, UARTDMACR, UARTDR, UARTFBRD, UARTFR, UARTIBRD, UARTIFLS, UARTILPR,
+        UARTIMSC, UARTLCR_H, UARTPCELLID3, UARTPERIPHID3, UARTRSR_ECR, UartRegs,
     };
 
     const IRQ: u32 = 20;
@@ -5545,8 +5725,10 @@ mod stage2_uart_coverage {
             u.write32(UARTDR, 0xAA, 0, &mut irqs);
         }
         u.tick(10, &tree(), &mut irqs);
-        assert!(u.is_idle() || u.read32(UARTFR) & (1 << 7) != 0,
-            "FIFO drains at 1 cycle/byte when baud unconfigured");
+        assert!(
+            u.is_idle() || u.read32(UARTFR) & (1 << 7) != 0,
+            "FIFO drains at 1 cycle/byte when baud unconfigured"
+        );
     }
 
     // Unreachable (uart.rs:367): `div_64 == 0` requires both ibrd and
@@ -5846,7 +6028,11 @@ mod stage2_adc_coverage {
         a.tick(400, &tree(), &mut irqs);
         let sample = a.read32(FIFO);
         // SHIFT: original sample in low 12 bits; >>4 drops low nibble.
-        assert!(sample < 0x100, "SHIFT mode clamps to 8 bits: got {:#x}", sample);
+        assert!(
+            sample < 0x100,
+            "SHIFT mode clamps to 8 bits: got {:#x}",
+            sample
+        );
     }
 
     /// CS EN 0 (no change) → neither EN-rise nor EN-fall branches fire
@@ -5978,11 +6164,10 @@ mod stage2_adc_coverage {
         a.tick(5_000, &tree(), &mut irqs);
         assert!(a.fifo_len() >= 1);
     }
-
 }
 
 mod stage2_pwm_coverage {
-    use crate::peripherals::pwm::{PwmRegs, CSR_EN, INTE, INTF, INTR, INTS, SLICE_STRIDE};
+    use crate::peripherals::pwm::{CSR_EN, INTE, INTF, INTR, INTS, PwmRegs, SLICE_STRIDE};
     use mdpicoem_common::clocks::ClockTree;
 
     const IRQ: u32 = 4;
@@ -6060,7 +6245,11 @@ mod stage2_pwm_coverage {
         let mut irqs = 0;
         // Write PH_ADVANCE; the emulated pulse auto-clears after.
         p.write32(0x00, CSR_EN | (1 << 7), 0, &mut irqs);
-        assert_eq!(p.read32(0x00) & (1 << 7), 0, "PH_ADVANCE clears transiently");
+        assert_eq!(
+            p.read32(0x00) & (1 << 7),
+            0,
+            "PH_ADVANCE clears transiently"
+        );
     }
 
     // Unreachable (pwm.rs inner SLICE `_` match): SLICE_STRIDE is 0x14
@@ -6155,7 +6344,6 @@ mod stage2_pwm_coverage {
         // Unknown global.
         assert_eq!(p.read32(0xC0), 0);
     }
-
 }
 
 mod stage2_timer_coverage {
@@ -6963,8 +7151,8 @@ mod stage7_sio_coverage {
         let mut sio = Sio::new();
         for block_base in [0x080u32, 0x0C0] {
             for sub_offset in [
-                0x00u32, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20,
-                0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C,
+                0x00u32, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30,
+                0x34, 0x38, 0x3C,
             ] {
                 let _ = sio.read32(block_base + sub_offset, 0);
                 let _ = sio.read32(block_base + sub_offset, 1);
@@ -7071,8 +7259,8 @@ mod stage7_dma_coverage {
     //! trigger-channel guard arms (EN=0 + TRANS_COUNT=0), route_irqs
     //! both-zero arm, IRQ_QUIET path, and the `issue_transfer`
     //! data-size=1/2 + ring-on-read branches.
-    use crate::bus::{Bus, DMA_BASE, RESETS_BASE};
     use crate::bus::peripheral_dispatch::RESET_DMA;
+    use crate::bus::{Bus, DMA_BASE, RESETS_BASE};
     use crate::dma::{Dma, NUM_CHANNELS};
     use crate::dreq::DREQ_FORCE;
     use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1};
@@ -7134,15 +7322,25 @@ mod stage7_dma_coverage {
         quiet: bool,
     ) -> u32 {
         let mut c = 0u32;
-        if en { c |= CTRL_EN; }
-        if incr_read { c |= CTRL_INCR_READ; }
-        if incr_write { c |= CTRL_INCR_WRITE; }
+        if en {
+            c |= CTRL_EN;
+        }
+        if incr_read {
+            c |= CTRL_INCR_READ;
+        }
+        if incr_write {
+            c |= CTRL_INCR_WRITE;
+        }
         c |= (data_size & 0x3) << CTRL_DATA_SIZE_SHIFT;
         c |= (chain_to & 0xF) << CTRL_CHAIN_TO_SHIFT;
         c |= ((treq as u32) & 0x3F) << CTRL_TREQ_SEL_SHIFT;
         c |= (ring & 0xF) << CTRL_RING_SIZE_SHIFT;
-        if ring_on_write { c |= CTRL_RING_SEL; }
-        if quiet { c |= CTRL_IRQ_QUIET; }
+        if ring_on_write {
+            c |= CTRL_RING_SEL;
+        }
+        if quiet {
+            c |= CTRL_IRQ_QUIET;
+        }
         c
     }
 
@@ -7261,7 +7459,10 @@ mod stage7_dma_coverage {
         // Inner default arm (offset 8).
         assert_eq!(bus.read32(DMA_BASE + 0x800 + 2 * 0x40 + 8), 0);
         // Beyond DBG block → outer default.
-        assert_eq!(bus.read32(DMA_BASE + 0x800 + 0x40 * NUM_CHANNELS as u32 + 4), 0);
+        assert_eq!(
+            bus.read32(DMA_BASE + 0x800 + 0x40 * NUM_CHANNELS as u32 + 4),
+            0
+        );
     }
 
     // -----------------------------------------------------------------
@@ -7933,7 +8134,10 @@ mod stage8_residue_coverage {
     fn builder_with_flash_loads_it() {
         let cfg = Config::default();
         let flash = vec![0xAAu8; 64];
-        let emu = EmulatorBuilder::new(cfg).flash(flash).build().expect("Serial build is infallible");
+        let emu = EmulatorBuilder::new(cfg)
+            .flash(flash)
+            .build()
+            .expect("Serial build is infallible");
         // Flash was loaded: xip_read8(offset=0) should be 0xAA.
         let val = emu.bus.memory.xip_read8(0);
         assert_eq!(val, 0xAA, "flash byte 0 should be what we loaded");
@@ -8146,7 +8350,10 @@ mod wfe_sev_tests {
         bus.nvics[0].set_pending(5);
         let cycles = core.execute_one_with_bus(WFI, &mut bus);
         assert_eq!(cycles, 1);
-        assert!(!core.is_halted(), "pending+enabled IRQ must keep core running");
+        assert!(
+            !core.is_halted(),
+            "pending+enabled IRQ must keep core running"
+        );
     }
 
     /// Test 7: A core halted by WFI wakes when an IRQ is later

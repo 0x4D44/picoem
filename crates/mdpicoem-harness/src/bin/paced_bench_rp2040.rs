@@ -142,10 +142,7 @@ const SIO_TOGGLE_PIN: u8 = 0;
 fn resets_deassert_pio0(emu: &mut Emulator) {
     // APB CLR alias (+0x3000): writing 1s clears the corresponding RESET
     // bits, bringing those peripherals out of reset.
-    emu.mmio_write32(
-        RESETS_BASE + RESETS_RESET_OFFSET + 0x3000,
-        RESETS_PIO0_BIT,
-    );
+    emu.mmio_write32(RESETS_BASE + RESETS_RESET_OFFSET + 0x3000, RESETS_PIO0_BIT);
 }
 
 /// Configure a GPIO pin for output on `funcsel`: program the IO_BANK0
@@ -243,10 +240,10 @@ fn setup_basic_core0(emu: &mut Emulator) {
 /// literal address 0xC. Encoding: `0x4800 | (Rd<<8) | (imm8)` with
 /// Rd=2, imm8=2 → `0x4A02`. Three instructions per loop iteration.
 fn setup_peripheral_core0(emu: &mut Emulator) {
-    emu.poke(0x2000_0000, 0x2101_4A02);           // LDR R2 | MOVS R1
-    emu.poke(0x2000_0004, 0x6011_1C40);           // ADDS R0,R0,#1 | STR R1,[R2]
-    emu.poke(0x2000_0008, 0xBF00_E7FC);           // B .-8 | NOP
-    emu.poke(0x2000_000C, SIO_GPIO_OUT_XOR);      // literal: SIO XOR addr
+    emu.poke(0x2000_0000, 0x2101_4A02); // LDR R2 | MOVS R1
+    emu.poke(0x2000_0004, 0x6011_1C40); // ADDS R0,R0,#1 | STR R1,[R2]
+    emu.poke(0x2000_0008, 0xBF00_E7FC); // B .-8 | NOP
+    emu.poke(0x2000_000C, SIO_GPIO_OUT_XOR); // literal: SIO XOR addr
 
     // Enter at the prologue (LDR R2).
     emu.core_mut(0).regs.set_pc(0x2000_0000);
@@ -466,7 +463,10 @@ fn main() {
     #[cfg(target_os = "windows")]
     match win::boost_and_pin(core) {
         Ok(()) => println!("Pinned to core {} at HIGH priority / TIME_CRITICAL", core),
-        Err(e) => eprintln!("warning: failed to boost priority: {} (continuing with default)", e),
+        Err(e) => eprintln!(
+            "warning: failed to boost priority: {} (continuing with default)",
+            e
+        ),
     }
     #[cfg(not(target_os = "windows"))]
     let _ = core;
@@ -549,19 +549,35 @@ fn run_once(cfg: &RunConfig) -> f64 {
     let mut pacer = Pacer::with_quantum(sys_clk_hz, quantum.into());
     let stats = pacer.stats();
 
-    let core_mode = if workload.is_dual_core() { "dual-core" } else { "single-core" };
-    let pio_mode = if workload.needs_pio() { " + PIO0 SM0 wrap" } else { "" };
+    let core_mode = if workload.is_dual_core() {
+        "dual-core"
+    } else {
+        "single-core"
+    };
+    let pio_mode = if workload.needs_pio() {
+        " + PIO0 SM0 wrap"
+    } else {
+        ""
+    };
     let runtime_mode = match model {
         ExecutionModel::Serial => "serial",
         ExecutionModel::Threaded => "threaded",
     };
     println!(
         "mdrp2040 paced benchmark — target {} MHz, quantum {} cycles, step_quantum {}, {}, workload {}{}, runtime {}",
-        clock_mhz, quantum, step_quantum, core_mode, workload.as_str(), pio_mode, runtime_mode,
+        clock_mhz,
+        quantum,
+        step_quantum,
+        core_mode,
+        workload.as_str(),
+        pio_mode,
+        runtime_mode,
     );
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
-    println!("{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
-        "time", "emu_cycles", "emu_MHz", "util%", "headroom%", "behind");
+    println!(
+        "{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
+        "time", "emu_cycles", "emu_MHz", "util%", "headroom%", "behind"
+    );
 
     // --- Monitoring thread ---
     stats.set_running(true);
@@ -601,7 +617,9 @@ fn run_once(cfg: &RunConfig) -> f64 {
         }
         loop {
             if let Some(target) = cycles_target {
-                if unpaced_cycles >= target { break; }
+                if unpaced_cycles >= target {
+                    break;
+                }
             } else if start.elapsed() >= duration {
                 break;
             }
@@ -650,14 +668,16 @@ fn run_once(cfg: &RunConfig) -> f64 {
         let c1_delta = c1_end.saturating_sub(c1_start);
         let executed = c0_delta.max(c1_delta);
         let mhz = executed as f64 / wall_secs / 1_000_000.0;
-        let host_cycles_per_emu =
-            pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
+        let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
         println!(
             "Executed cyc:   {} (c0={}, c1={})",
             executed, c0_delta, c1_delta
         );
         println!("Requested cyc:  {}", unpaced_cycles);
-        println!("Avg MHz:        {:.1} (per-core peak, from executed cycles)", mhz);
+        println!(
+            "Avg MHz:        {:.1} (per-core peak, from executed cycles)",
+            mhz
+        );
         println!("Host/emu cycle: {:.2}", host_cycles_per_emu);
         println!("Verdict:        UNPACED (profiling mode)");
         return mhz;
@@ -674,14 +694,24 @@ fn run_once(cfg: &RunConfig) -> f64 {
     let mhz_ratio = snap.emulated_mhz() / clock_mhz as f64;
 
     if mhz_ratio >= 0.99 && behind_rate < 0.001 {
-        println!("Verdict:        REAL-TIME OK ({:.1}% of target, {:.2}% headroom, {:.3}% behind)",
-                 mhz_ratio * 100.0, snap.headroom() * 100.0, behind_rate * 100.0);
+        println!(
+            "Verdict:        REAL-TIME OK ({:.1}% of target, {:.2}% headroom, {:.3}% behind)",
+            mhz_ratio * 100.0,
+            snap.headroom() * 100.0,
+            behind_rate * 100.0
+        );
     } else if mhz_ratio >= 0.95 && behind_rate < 0.01 {
-        println!("Verdict:        REAL-TIME MARGINAL ({:.1}% of target, {:.2}% behind)",
-                 mhz_ratio * 100.0, behind_rate * 100.0);
+        println!(
+            "Verdict:        REAL-TIME MARGINAL ({:.1}% of target, {:.2}% behind)",
+            mhz_ratio * 100.0,
+            behind_rate * 100.0
+        );
     } else {
-        println!("Verdict:        CANNOT SUSTAIN REAL-TIME ({:.1}% of target, {:.2}% behind)",
-                 mhz_ratio * 100.0, behind_rate * 100.0);
+        println!(
+            "Verdict:        CANNOT SUSTAIN REAL-TIME ({:.1}% of target, {:.2}% behind)",
+            mhz_ratio * 100.0,
+            behind_rate * 100.0
+        );
     }
 
     snap.emulated_mhz()
@@ -697,10 +727,7 @@ fn run_with_model(emu: &mut Emulator, cycles: u64) -> u64 {
         ExecutionModel::Threaded => match emu.run(cycles) {
             Ok(n) => n,
             Err(EmulatorError::WorkerPanicked { which, message }) => {
-                eprintln!(
-                    "fatal: threaded worker '{:?}' panicked: {}",
-                    which, message
-                );
+                eprintln!("fatal: threaded worker '{:?}' panicked: {}", which, message);
                 std::process::exit(1);
             }
             Err(e) => {
@@ -720,13 +747,15 @@ fn monitor_loop(stats: Arc<PacerStats>) {
         }
         let snap = stats.snapshot();
         let elapsed = start.elapsed().as_secs();
-        println!("{:>6} {:>14} {:>10.1} {:>7.1}% {:>9.1}% {:>8}",
+        println!(
+            "{:>6} {:>14} {:>10.1} {:>7.1}% {:>9.1}% {:>8}",
             elapsed,
             snap.emulated_cycles,
             snap.emulated_mhz(),
             snap.utilization() * 100.0,
             snap.headroom() * 100.0,
-            snap.behind_count);
+            snap.behind_count
+        );
     }
 }
 
@@ -823,8 +852,14 @@ fn run_ab_harness(base_cfg: &RunConfig, reps: u32) {
         base_cfg.step_quantum,
     );
 
-    let serial_cfg = RunConfig { model: ExecutionModel::Serial, ..*base_cfg };
-    let threaded_cfg = RunConfig { model: ExecutionModel::Threaded, ..*base_cfg };
+    let serial_cfg = RunConfig {
+        model: ExecutionModel::Serial,
+        ..*base_cfg
+    };
+    let threaded_cfg = RunConfig {
+        model: ExecutionModel::Threaded,
+        ..*base_cfg
+    };
 
     println!("\n=== Serial reps ===");
     let serial_mhz = collect_reps(&serial_cfg, reps);

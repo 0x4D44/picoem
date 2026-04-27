@@ -1,5 +1,4 @@
-
-use super::{CortexM33, CoreBus};
+use super::{CoreBus, CortexM33};
 
 // ============================================================================
 // Helpers
@@ -30,7 +29,12 @@ pub(crate) fn sign_extend(val: u32, bits: u32) -> u32 {
 impl CortexM33 {
     /// LSLS Rd, Rm, #imm5 — encoding T1 (00000_imm5_Rm_Rd).
     /// When imm5=0 this is MOVS Rd, Rm (carry unchanged).
-    pub(crate) fn thumb16_lsl_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_lsl_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rd = (opcode & 0x7) as usize;
         let rm = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -52,7 +56,12 @@ impl CortexM33 {
 
     /// LSRS Rd, Rm, #imm5 — encoding T1 (00001_imm5_Rm_Rd).
     /// imm5=0 encodes shift by 32.
-    pub(crate) fn thumb16_lsr_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_lsr_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rd = (opcode & 0x7) as usize;
         let rm = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -72,7 +81,12 @@ impl CortexM33 {
 
     /// ASRS Rd, Rm, #imm5 — encoding T1 (00010_imm5_Rm_Rd).
     /// imm5=0 encodes shift by 32.
-    pub(crate) fn thumb16_asr_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_asr_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rd = (opcode & 0x7) as usize;
         let rm = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -99,7 +113,12 @@ impl CortexM33 {
 
     /// Bits[15:11]=00011. Sub-decode on bits[10:9]:
     /// 00=ADDS reg, 01=SUBS reg, 10=ADDS imm3, 11=SUBS imm3.
-    pub(crate) fn thumb16_add_sub<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_add_sub<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rd = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let rn_val = self.regs.r[rn];
@@ -144,7 +163,12 @@ impl CortexM33 {
     // ========================================================================
 
     /// MOVS Rd, #imm8 (00100_Rd_imm8).
-    pub(crate) fn thumb16_mov_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_mov_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rd = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         self.regs.r[rd] = imm8;
@@ -153,7 +177,12 @@ impl CortexM33 {
     }
 
     /// CMP Rn, #imm8 (00101_Rn_imm8).
-    pub(crate) fn thumb16_cmp_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_cmp_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rn = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let rn_val = self.regs.r[rn];
@@ -163,7 +192,12 @@ impl CortexM33 {
     }
 
     /// ADDS Rd, Rd, #imm8 (00110_Rdn_imm8).
-    pub(crate) fn thumb16_add_imm8<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_add_imm8<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rdn = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let rdn_val = self.regs.r[rdn];
@@ -174,7 +208,12 @@ impl CortexM33 {
     }
 
     /// SUBS Rd, Rd, #imm8 (00111_Rdn_imm8).
-    pub(crate) fn thumb16_sub_imm8<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_sub_imm8<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rdn = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let rdn_val = self.regs.r[rdn];
@@ -190,7 +229,12 @@ impl CortexM33 {
 
     /// 16 register-register ALU ops. Opcode bits[9:6] select the operation.
     /// All operate on low registers (R0-R7), all update flags.
-    pub(crate) fn thumb16_data_processing<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_data_processing<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let op = (opcode >> 6) & 0xF;
         let rm = ((opcode >> 3) & 0x7) as usize;
         let rdn = (opcode & 0x7) as usize;
@@ -348,15 +392,28 @@ impl CortexM33 {
     // ========================================================================
 
     /// High-register ADD/CMP/MOV and BX/BLX.
-    pub(crate) fn thumb16_special_data_bx<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_special_data_bx<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let op = (opcode >> 8) & 0x3;
         match op {
             0b00 => {
                 // ADD Rd, Rm (high registers, no flag update)
                 let d = ((opcode >> 4) & 0x8 | opcode & 0x7) as usize; // D:Rd
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let rm_val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
-                let rd_val = if d == 15 { self.read_pc() } else { self.regs.r[d] };
+                let rm_val = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
+                let rd_val = if d == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[d]
+                };
                 let result = rd_val.wrapping_add(rm_val);
                 if d == 15 {
                     self.regs.set_pc(result & !1);
@@ -369,8 +426,16 @@ impl CortexM33 {
                 // CMP Rn, Rm (high registers)
                 let n = ((opcode >> 4) & 0x8 | opcode & 0x7) as usize;
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let rn_val = if n == 15 { self.read_pc() } else { self.regs.r[n] };
-                let rm_val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
+                let rn_val = if n == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[n]
+                };
+                let rm_val = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
                 let (result, c, v) = add_with_carry(rn_val, !rm_val, true);
                 self.regs.set_nzcv(result >> 31 != 0, result == 0, c, v);
                 1
@@ -379,7 +444,11 @@ impl CortexM33 {
                 // MOV Rd, Rm (high registers, no flag update)
                 let d = ((opcode >> 4) & 0x8 | opcode & 0x7) as usize;
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
+                let val = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
                 if d == 15 {
                     if Self::is_exc_return(val) {
                         return self.exit_exception(val, bus);
@@ -393,7 +462,11 @@ impl CortexM33 {
             _ => {
                 // BX / BLX
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let target = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
+                let target = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
                 let link = opcode & (1 << 7) != 0; // bit 7: 0=BX, 1=BLX
                 if link {
                     // BLX Rm: LR = address of next instruction | 1
@@ -423,7 +496,12 @@ impl CortexM33 {
     // ========================================================================
 
     /// LDR Rt, [PC, #imm8*4] (01001_Rt_imm8).
-    pub(crate) fn thumb16_ldr_literal<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_ldr_literal<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         // PC is aligned down to word boundary, then offset added
@@ -439,7 +517,12 @@ impl CortexM33 {
 
     /// STR/STRH/STRB/LDRSB/LDR/LDRH/LDRB/LDRSH with register offset.
     /// Encoding: 0101_opc_Rm_Rn_Rt.
-    pub(crate) fn thumb16_load_store_reg<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_load_store_reg<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let rm = ((opcode >> 6) & 0x7) as usize;
@@ -497,7 +580,12 @@ impl CortexM33 {
     // ========================================================================
 
     /// STR Rt, [Rn, #imm5*4] (01100_imm5_Rn_Rt).
-    pub(crate) fn thumb16_str_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_str_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -507,7 +595,12 @@ impl CortexM33 {
     }
 
     /// LDR Rt, [Rn, #imm5*4] (01101_imm5_Rn_Rt).
-    pub(crate) fn thumb16_ldr_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_ldr_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -517,7 +610,12 @@ impl CortexM33 {
     }
 
     /// STRB Rt, [Rn, #imm5] (01110_imm5_Rn_Rt).
-    pub(crate) fn thumb16_strb_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_strb_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -527,7 +625,12 @@ impl CortexM33 {
     }
 
     /// LDRB Rt, [Rn, #imm5] (01111_imm5_Rn_Rt).
-    pub(crate) fn thumb16_ldrb_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_ldrb_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -537,7 +640,12 @@ impl CortexM33 {
     }
 
     /// STRH Rt, [Rn, #imm5*2] (10000_imm5_Rn_Rt).
-    pub(crate) fn thumb16_strh_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_strh_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -547,7 +655,12 @@ impl CortexM33 {
     }
 
     /// LDRH Rt, [Rn, #imm5*2] (10001_imm5_Rn_Rt).
-    pub(crate) fn thumb16_ldrh_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_ldrh_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = (opcode & 0x7) as usize;
         let rn = ((opcode >> 3) & 0x7) as usize;
         let imm5 = ((opcode >> 6) & 0x1F) as u32;
@@ -561,7 +674,12 @@ impl CortexM33 {
     // ========================================================================
 
     /// STR Rt, [SP, #imm8*4] (10010_Rt_imm8).
-    pub(crate) fn thumb16_str_sp<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_str_sp<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
@@ -570,7 +688,12 @@ impl CortexM33 {
     }
 
     /// LDR Rt, [SP, #imm8*4] (10011_Rt_imm8).
-    pub(crate) fn thumb16_ldr_sp<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_ldr_sp<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rt = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         let addr = self.regs.sp().wrapping_add(imm8 << 2);
@@ -592,7 +715,12 @@ impl CortexM33 {
     }
 
     /// ADD Rd, SP, #imm8*4 (10101_Rd_imm8).
-    pub(crate) fn thumb16_add_sp_imm<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_add_sp_imm<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let rd = ((opcode >> 8) & 0x7) as usize;
         let imm8 = (opcode & 0xFF) as u32;
         self.regs.r[rd] = self.regs.sp().wrapping_add(imm8 << 2);
@@ -626,10 +754,10 @@ impl CortexM33 {
                 let rd = (opcode & 0x7) as usize;
                 let val = self.regs.r[rm];
                 match (opcode >> 6) & 0x3 {
-                    0b00 => self.regs.r[rd] = val as i16 as i32 as u32,  // SXTH
-                    0b01 => self.regs.r[rd] = val as i8 as i32 as u32,   // SXTB
-                    0b10 => self.regs.r[rd] = val & 0xFFFF,              // UXTH
-                    _    => self.regs.r[rd] = val & 0xFF,                // UXTB
+                    0b00 => self.regs.r[rd] = val as i16 as i32 as u32, // SXTH
+                    0b01 => self.regs.r[rd] = val as i8 as i32 as u32,  // SXTB
+                    0b10 => self.regs.r[rd] = val & 0xFFFF,             // UXTH
+                    _ => self.regs.r[rd] = val & 0xFF,                  // UXTB
                 }
                 1
             }
@@ -673,12 +801,13 @@ impl CortexM33 {
                 let rd = (opcode & 0x7) as usize;
                 let val = self.regs.r[rm];
                 match (opcode >> 6) & 0x3 {
-                    0b00 => self.regs.r[rd] = val.swap_bytes(),          // REV
-                    0b01 => {                                             // REV16
-                        self.regs.r[rd] =
-                            ((val >> 8) & 0x00FF_00FF) | ((val << 8) & 0xFF00_FF00);
+                    0b00 => self.regs.r[rd] = val.swap_bytes(), // REV
+                    0b01 => {
+                        // REV16
+                        self.regs.r[rd] = ((val >> 8) & 0x00FF_00FF) | ((val << 8) & 0xFF00_FF00);
                     }
-                    0b11 => {                                             // REVSH
+                    0b11 => {
+                        // REVSH
                         let half = (val & 0xFFFF) as u16;
                         let swapped = half.swap_bytes();
                         self.regs.r[rd] = swapped as i16 as i32 as u32;
@@ -736,8 +865,8 @@ impl CortexM33 {
                     // Hints: NOP, YIELD, WFE, WFI, SEV
                     let hint_op = (opcode >> 4) & 0xF;
                     match hint_op {
-                        0x0 | 0x1 => 1,                       // NOP, YIELD
-                        0x2 => self.wfe(bus),                  // WFE
+                        0x0 | 0x1 => 1,       // NOP, YIELD
+                        0x2 => self.wfe(bus), // WFE
                         // FPU × sleep (HLD §B.7): WFI/WFE retain S0-S31 +
                         // FPSCR and do NOT clear FPCCR.LSPACT.
                         0x3 => {
@@ -751,8 +880,11 @@ impl CortexM33 {
                                 1
                             }
                         }
-                        0x4 => { self.atomics.sev_both(); 1 }, // SEV
-                        _ => 1,                                // Reserved
+                        0x4 => {
+                            self.atomics.sev_both();
+                            1
+                        } // SEV
+                        _ => 1, // Reserved
                     }
                 }
             }
@@ -828,7 +960,12 @@ impl CortexM33 {
     // ========================================================================
 
     /// B.cond and SVC (1101_cond_imm8).
-    pub(crate) fn thumb16_cond_branch_svc<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_cond_branch_svc<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let cond = ((opcode >> 8) & 0xF) as u8;
         match cond {
             0xE => {
@@ -859,7 +996,12 @@ impl CortexM33 {
     // ========================================================================
 
     /// B label (11100_imm11).
-    pub(crate) fn thumb16_branch<B: CoreBus>(&mut self, opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_branch<B: CoreBus>(
+        &mut self,
+        opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         let imm11 = (opcode & 0x7FF) as u32;
         let offset = sign_extend(imm11 << 1, 12); // 11-bit imm, shifted left 1, sign-extended from bit 11
         let target = self.read_pc().wrapping_add(offset);
@@ -885,7 +1027,12 @@ impl CortexM33 {
     // ========================================================================
 
     /// Undefined instruction — raises UsageFault.
-    pub(crate) fn thumb16_undefined<B: CoreBus>(&mut self, _opcode: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb16_undefined<B: CoreBus>(
+        &mut self,
+        _opcode: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         self.pending_fault = Some(super::Fault::UsageFault);
         0
     }

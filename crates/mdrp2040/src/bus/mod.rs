@@ -43,7 +43,6 @@ use crate::irq::{
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::AdcRegs;
 use crate::peripherals::i2c::I2cRegs;
-use mdpicoem_devices::Psram;
 use crate::peripherals::pwm::PwmRegs;
 use crate::peripherals::spi::SpiRegs;
 use crate::peripherals::timer::TimerRegs;
@@ -51,6 +50,7 @@ use crate::peripherals::uart::UartRegs;
 use crate::peripherals::watchdog_tick::WatchdogTickRegs;
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
+use mdpicoem_devices::Psram;
 use pads_bank0::PadsBank0;
 use ppb::Ppb;
 use resets::Resets;
@@ -245,7 +245,12 @@ impl DecodedOp {
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
-        Self { tag: u32::MAX, hw0: 0, hw1: 0, flags: 0 }
+        Self {
+            tag: u32::MAX,
+            hw0: 0,
+            hw1: 0,
+            flags: 0,
+        }
     }
 
     #[inline(always)]
@@ -949,8 +954,12 @@ impl Bus {
                 self.timer.write32(offset, val, alias, mc, sys_hz);
             }
             WATCHDOG_BASE => self.watchdog_tick.write32(offset, val, alias),
-            UART0_BASE => self.uart0.write32(offset, val, alias, &mut self.irq_pending),
-            UART1_BASE => self.uart1.write32(offset, val, alias, &mut self.irq_pending),
+            UART0_BASE => self
+                .uart0
+                .write32(offset, val, alias, &mut self.irq_pending),
+            UART1_BASE => self
+                .uart1
+                .write32(offset, val, alias, &mut self.irq_pending),
             SPI0_BASE => self.spi0.write32(offset, val, alias, &mut self.irq_pending),
             SPI1_BASE => self.spi1.write32(offset, val, alias, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write32(offset, val, alias, &mut self.irq_pending),
@@ -1109,8 +1118,12 @@ impl Bus {
             SPI1_BASE => self.spi1.write16(offset, val, &mut self.irq_pending),
             UART0_BASE => self.uart0.write8(offset, val as u8, &mut self.irq_pending),
             UART1_BASE => self.uart1.write8(offset, val as u8, &mut self.irq_pending),
-            I2C0_BASE => self.i2c0.write32(offset, val as u32, 0, &mut self.irq_pending),
-            I2C1_BASE => self.i2c1.write32(offset, val as u32, 0, &mut self.irq_pending),
+            I2C0_BASE => self
+                .i2c0
+                .write32(offset, val as u32, 0, &mut self.irq_pending),
+            I2C1_BASE => self
+                .i2c1
+                .write32(offset, val as u32, 0, &mut self.irq_pending),
             // ADC FIFO is read-only — narrow writes swallowed.
             ADC_BASE => {}
             _ => {}
@@ -1920,16 +1933,24 @@ impl Bus {
         // TIMER IRQs occupy NVIC lines 0..3.
         self.irq_pending |= nvic_bits & 0xF;
         // UART / SPI / I2C: chunked TX drain + IRQ route.
-        self.uart0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
-        self.uart1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
-        self.spi0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
-        self.spi1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
-        self.i2c0.tick(cycles, &self.clock_tree, &mut self.irq_pending);
-        self.i2c1.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.uart0
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.uart1
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.spi0
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.spi1
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.i2c0
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.i2c1
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // ADC: fixed-point clk_adc accumulator advances via tick.
-        self.adc.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.adc
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // PWM: per-slice counter advance + wrap-IRQ latch.
-        self.pwm.tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.pwm
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
         // DMA ticks LAST per HLD V7 §5.6 ordering contract — peripherals
         // produce DREQ on this cycle, DMA snapshots + consumes. Stays
         // once per quantum; mirrors RP2350.
@@ -2379,7 +2400,11 @@ mod tests {
             lines
         );
         let line = lines[0];
-        assert!(line.starts_with("TRACE W 4 0x20000200"), "line = {:?}", line);
+        assert!(
+            line.starts_with("TRACE W 4 0x20000200"),
+            "line = {:?}",
+            line
+        );
         assert!(line.contains("val=0xDEADBEEF"), "line = {:?}", line);
         assert!(line.contains("core=0"), "line = {:?}", line);
         assert!(line.contains("pc=0x10000100"), "line = {:?}", line);
@@ -2437,7 +2462,12 @@ mod tests {
         let captured = capture.0.lock().unwrap();
         let text = std::str::from_utf8(&captured).expect("trace must be utf-8");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "expected three trace lines, got {:?}", lines);
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected three trace lines, got {:?}",
+            lines
+        );
         assert!(
             lines[0].contains("core=0") && lines[0].contains("pc=0x00001000"),
             "line 0 = {:?}",
@@ -2580,8 +2610,7 @@ mod tests {
             crate::peripherals::adc::CS_EN,
         );
         assert_eq!(
-            bus.read32(ADC_BASE + crate::peripherals::adc::CS)
-                & crate::peripherals::adc::CS_EN,
+            bus.read32(ADC_BASE + crate::peripherals::adc::CS) & crate::peripherals::adc::CS_EN,
             crate::peripherals::adc::CS_EN
         );
     }
@@ -2621,10 +2650,17 @@ mod tests {
         bus.write8(PIO1_BASE + 0x010, 0x42);
         // FSTAT: TXEMPTY bit 24 for SM0 must be cleared.
         let fstat = bus.read32(PIO1_BASE + 0x004);
-        assert_eq!(fstat & (1 << 24), 0, "TX FIFO must not be empty after byte write");
+        assert_eq!(
+            fstat & (1 << 24),
+            0,
+            "TX FIFO must not be empty after byte write"
+        );
         // Pop from TX FIFO and verify byte-replicated value.
         let val = bus.pio[1].pop_tx(0).expect("TX FIFO should have one entry");
-        assert_eq!(val, 0x42424242, "byte 0x42 must be replicated to all four lanes");
+        assert_eq!(
+            val, 0x42424242,
+            "byte 0x42 must be replicated to all four lanes"
+        );
     }
 
     #[test]
@@ -2638,10 +2674,17 @@ mod tests {
         bus.write16(PIO1_BASE + 0x010, 0x1234);
         // FSTAT: TXEMPTY bit 24 for SM0 must be cleared.
         let fstat = bus.read32(PIO1_BASE + 0x004);
-        assert_eq!(fstat & (1 << 24), 0, "TX FIFO must not be empty after halfword write");
+        assert_eq!(
+            fstat & (1 << 24),
+            0,
+            "TX FIFO must not be empty after halfword write"
+        );
         // Pop from TX FIFO and verify halfword-replicated value.
         let val = bus.pio[1].pop_tx(0).expect("TX FIFO should have one entry");
-        assert_eq!(val, 0x12341234, "halfword 0x1234 must be replicated to both lanes");
+        assert_eq!(
+            val, 0x12341234,
+            "halfword 0x1234 must be replicated to both lanes"
+        );
     }
 
     #[test]
@@ -2682,9 +2725,7 @@ mod tests {
         );
         bus.adc.write32(
             crate::peripherals::adc::CS,
-            crate::peripherals::adc::CS_EN
-                | crate::peripherals::adc::CS_START_ONCE
-                | (3 << 12),
+            crate::peripherals::adc::CS_EN | crate::peripherals::adc::CS_START_ONCE | (3 << 12),
             0,
             &mut irqs,
         );

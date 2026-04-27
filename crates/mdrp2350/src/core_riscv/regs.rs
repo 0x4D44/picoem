@@ -49,7 +49,7 @@ pub(crate) struct CsrFile {
     /// L-bit (bit 7) write-protects the byte and its paired pmpaddr per
     /// RV-priv §3.7.1; `Hazard3::reset_pmp_csrs()` clears L between fuzz
     /// cases.
-    pub pmpcfg:  [u32; 4],
+    pub pmpcfg: [u32; 4],
     /// Per-entry PMP address. `pmpaddr[i]` for `i >= PMP_NUM_ENTRIES` is
     /// RAZ/WI. Phase-2 models L-bit gating (own-L + entry i+1 TOR-lock).
     pub pmpaddr: [u32; 16],
@@ -72,7 +72,7 @@ impl CsrFile {
             mcountinhibit: 0b101,
             mcycle: 0,
             minstret: 0,
-            pmpcfg:  [0; 4],
+            pmpcfg: [0; 4],
             pmpaddr: [0; 16],
         }
     }

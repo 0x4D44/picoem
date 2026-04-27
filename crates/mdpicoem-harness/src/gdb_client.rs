@@ -213,13 +213,11 @@ mod job {
     //! the Job is insurance for the abnormal-exit case.
 
     use std::process::Child;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
@@ -271,8 +269,7 @@ mod job {
                 LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                 ..std::mem::zeroed()
             };
-            let info_size =
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+            let info_size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
             let ok = SetInformationJobObject(
                 job.0,
                 JobObjectExtendedLimitInformation,
@@ -289,11 +286,7 @@ mod job {
             }
 
             // Open the child with the rights needed for AssignProcessToJobObject.
-            let proc_handle = OpenProcess(
-                PROCESS_SET_QUOTA | PROCESS_TERMINATE,
-                FALSE,
-                child.id(),
-            );
+            let proc_handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, child.id());
             if proc_handle.is_null() {
                 eprintln!(
                     "warning: OpenProcess(child={}) failed (errno {}); \
@@ -340,8 +333,7 @@ pub struct QemuProcess {
 
 impl QemuProcess {
     /// Standard Windows install path for the ARM QEMU binary.
-    const WINDOWS_QEMU_ARM_PATH: &'static str =
-        r"C:\Program Files\qemu\qemu-system-arm.exe";
+    const WINDOWS_QEMU_ARM_PATH: &'static str = r"C:\Program Files\qemu\qemu-system-arm.exe";
     /// Standard Windows install path for the RISC-V 32-bit QEMU binary.
     const WINDOWS_QEMU_RISCV32_PATH: &'static str =
         r"C:\Program Files\qemu\qemu-system-riscv32.exe";
@@ -408,10 +400,9 @@ impl QemuProcess {
         // of `args`; all other entries borrow from `profile` or stack locals.
         let image_str = image.map(|p| p.to_string_lossy().into_owned());
         let loader_device = match (profile.loader_addr, image_str.as_deref()) {
-            (Some(addr), Some(path)) => Some(format!(
-                "loader,file={},addr=0x{:x},cpu-num=0",
-                path, addr
-            )),
+            (Some(addr), Some(path)) => {
+                Some(format!("loader,file={},addr=0x{:x},cpu-num=0", path, addr))
+            }
             _ => None,
         };
 
@@ -487,10 +478,7 @@ impl QemuProcess {
                         ),
                     )
                 } else {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to spawn {binary_name}: {e}"),
-                    )
+                    io::Error::new(e.kind(), format!("failed to spawn {binary_name}: {e}"))
                 }
             })?;
 
@@ -515,7 +503,11 @@ impl QemuProcess {
         #[cfg(windows)]
         {
             let _job = job::assign_to_kill_on_close_job(&child);
-            Ok(Self { child, profile, _job })
+            Ok(Self {
+                child,
+                profile,
+                _job,
+            })
         }
         #[cfg(not(windows))]
         {
@@ -618,9 +610,7 @@ impl GdbClient {
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "unexpected handshake reply: expected T or S stop reply, got '{reply}'"
-                ),
+                format!("unexpected handshake reply: expected T or S stop reply, got '{reply}'"),
             ))
         }
     }
@@ -818,9 +808,7 @@ impl GdbClient {
         if pc != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "RV loader PC mismatch: expected {expected:#010x}, got {pc:#010x}"
-                ),
+                format!("RV loader PC mismatch: expected {expected:#010x}, got {pc:#010x}"),
             ));
         }
         tracing::info!(
@@ -895,10 +883,9 @@ impl GdbClient {
         // buf[0] = '$', payload is buf[1..hash_pos], checksum is buf[hash_pos+1..hash_pos+3]
         let hash_pos = self.buf.iter().rposition(|&b| b == b'#').unwrap();
         let payload = &self.buf[1..hash_pos];
-        let cksum_str = std::str::from_utf8(&self.buf[hash_pos + 1..])
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "checksum is not valid UTF-8")
-            })?;
+        let cksum_str = std::str::from_utf8(&self.buf[hash_pos + 1..]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "checksum is not valid UTF-8")
+        })?;
 
         let received_cksum = u8::from_str_radix(cksum_str, 16).map_err(|_| {
             io::Error::new(
@@ -918,7 +905,10 @@ impl GdbClient {
         }
 
         let result = String::from_utf8(payload.to_vec()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "response payload is not valid UTF-8")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "response payload is not valid UTF-8",
+            )
         })?;
 
         // Send ACK.
@@ -1000,7 +990,10 @@ fn gdb_checksum(data: &[u8]) -> u8 {
 /// Example: `0x12345678` -> `"78563412"` (LE byte order: 0x78, 0x56, 0x34, 0x12).
 fn encode_le_hex32(value: u32) -> String {
     let bytes = value.to_le_bytes();
-    format!("{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3])
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
 }
 
 /// Decode 8 little-endian hex characters to a u32.

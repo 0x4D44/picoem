@@ -509,10 +509,7 @@ mod tests {
         t.advance_us(50);
         let bits = t.poll_alarms();
         // TIMER1 alarm 0 fires on IRQ 4.
-        assert_eq!(
-            bits & (1u64 << IRQ_TIMER1_IRQ_0),
-            1u64 << IRQ_TIMER1_IRQ_0
-        );
+        assert_eq!(bits & (1u64 << IRQ_TIMER1_IRQ_0), 1u64 << IRQ_TIMER1_IRQ_0);
         // No TIMER0 IRQ bits set.
         assert_eq!(bits & (1u64 << IRQ_TIMER0_IRQ_0), 0);
     }
@@ -616,15 +613,22 @@ mod tests {
         let armed_before = t.armed;
         let cache_before = t.alarm_fire_us;
         t.invalidate_lazy();
-        assert_eq!(t.armed, armed_before,
-            "armed bits must survive a TICKS rate change (R1)");
-        assert_eq!(t.alarm_fire_us, cache_before,
-            "cache is rate-invariant; invalidate_lazy is a no-op");
+        assert_eq!(
+            t.armed, armed_before,
+            "armed bits must survive a TICKS rate change (R1)"
+        );
+        assert_eq!(
+            t.alarm_fire_us, cache_before,
+            "cache is rate-invariant; invalidate_lazy is a no-op"
+        );
         // Sanity: alarm still fires at its original target.
         t.advance_us(100);
         t.poll_alarms();
-        assert_eq!(t.intr & 0x1, 0x1,
-            "armed alarm must fire after invalidate_lazy (no-op)");
+        assert_eq!(
+            t.intr & 0x1,
+            0x1,
+            "armed alarm must fire after invalidate_lazy (no-op)"
+        );
     }
 
     // --- LOCKED / SOURCE ------------------------------------------------

@@ -371,8 +371,16 @@ impl CortexM0Plus {
                 // ADD Rd, Rm (high registers, no flags)
                 let d = (((opcode >> 4) & 0x8) | (opcode & 0x7)) as usize; // DN:Rd
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let rm_val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
-                let rd_val = if d == 15 { self.read_pc() } else { self.regs.r[d] };
+                let rm_val = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
+                let rd_val = if d == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[d]
+                };
                 let result = rd_val.wrapping_add(rm_val);
                 if d == 15 {
                     // ARMv6-M ARM DDI 0419E §A5.1.2: ADD Rdn, Rm with Rd==15
@@ -390,8 +398,16 @@ impl CortexM0Plus {
                 // CMP Rn, Rm (high registers)
                 let n = (((opcode >> 4) & 0x8) | (opcode & 0x7)) as usize;
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let rn_val = if n == 15 { self.read_pc() } else { self.regs.r[n] };
-                let rm_val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
+                let rn_val = if n == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[n]
+                };
+                let rm_val = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
                 let (result, c, v) = add_with_carry(rn_val, !rm_val, true);
                 self.regs.set_nzcv(result >> 31 != 0, result == 0, c, v);
                 1
@@ -400,7 +416,11 @@ impl CortexM0Plus {
                 // MOV Rd, Rm (high registers, no flags)
                 let d = (((opcode >> 4) & 0x8) | (opcode & 0x7)) as usize;
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let val = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
+                let val = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
                 if d == 15 {
                     // ARMv6-M ARM DDI 0419E §A5.1.2: MOV Rd, Rm with Rd==15
                     // uses ALUWritePC(), defined as BranchWritePC which masks
@@ -422,7 +442,11 @@ impl CortexM0Plus {
                 // if clear). BX to an EXC_RETURN magic value performs an
                 // exception return instead of a branch.
                 let rm = ((opcode >> 3) & 0xF) as usize;
-                let target = if rm == 15 { self.read_pc() } else { self.regs.r[rm] };
+                let target = if rm == 15 {
+                    self.read_pc()
+                } else {
+                    self.regs.r[rm]
+                };
                 let link = opcode & (1 << 7) != 0;
                 if link {
                     // BLX Rm — LR = address of next instruction | 1.
@@ -761,8 +785,7 @@ impl CortexM0Plus {
                     0b00 => self.regs.r[rd] = val.swap_bytes(), // REV
                     0b01 => {
                         // REV16
-                        self.regs.r[rd] =
-                            ((val >> 8) & 0x00FF_00FF) | ((val << 8) & 0xFF00_FF00);
+                        self.regs.r[rd] = ((val >> 8) & 0x00FF_00FF) | ((val << 8) & 0xFF00_FF00);
                     }
                     0b11 => {
                         // REVSH

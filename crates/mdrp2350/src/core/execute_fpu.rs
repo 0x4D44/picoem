@@ -7,7 +7,7 @@
 //   Register transfer: hw0[15:8]=0xEE, hw1[11:8]=0xA, hw1[4]=1
 //   Load/store:        hw0[15:12]=0xE, hw0[11:9]=0b110, hw1[11:8]=0xA
 
-use super::{CortexM33, CoreBus};
+use super::{CoreBus, CortexM33};
 
 // ============================================================================
 // VFP register extraction
@@ -51,10 +51,18 @@ const FPSCR_V: u32 = 1 << 28;
 
 fn fpscr_set_nzcv(fpscr: &mut u32, n: bool, z: bool, c: bool, v: bool) {
     *fpscr &= !(FPSCR_N | FPSCR_Z | FPSCR_C | FPSCR_V);
-    if n { *fpscr |= FPSCR_N; }
-    if z { *fpscr |= FPSCR_Z; }
-    if c { *fpscr |= FPSCR_C; }
-    if v { *fpscr |= FPSCR_V; }
+    if n {
+        *fpscr |= FPSCR_N;
+    }
+    if z {
+        *fpscr |= FPSCR_Z;
+    }
+    if c {
+        *fpscr |= FPSCR_C;
+    }
+    if v {
+        *fpscr |= FPSCR_V;
+    }
 }
 
 #[inline(always)]
@@ -395,41 +403,63 @@ fn vfp_expand_imm_f32(imm8: u8) -> f32 {
 // ============================================================================
 
 fn f32_to_i32_rtz(val: f32) -> i32 {
-    if val.is_nan() { return 0; }
-    if val >= i32::MAX as f32 { return i32::MAX; }
-    if val <= i32::MIN as f32 { return i32::MIN; }
+    if val.is_nan() {
+        return 0;
+    }
+    if val >= i32::MAX as f32 {
+        return i32::MAX;
+    }
+    if val <= i32::MIN as f32 {
+        return i32::MIN;
+    }
     val as i32
 }
 
 fn f32_to_u32_rtz(val: f32) -> u32 {
-    if val.is_nan() || val < 0.0 { return 0; }
-    if val >= u32::MAX as f32 { return u32::MAX; }
+    if val.is_nan() || val < 0.0 {
+        return 0;
+    }
+    if val >= u32::MAX as f32 {
+        return u32::MAX;
+    }
     val as u32
 }
 
 fn f32_to_i32_rmode(val: f32, rmode: u32) -> i32 {
-    if val.is_nan() { return 0; }
+    if val.is_nan() {
+        return 0;
+    }
     let rounded = match rmode {
         0b00 => val.round_ties_even(),
         0b01 => val.ceil(),
         0b10 => val.floor(),
         _ => return f32_to_i32_rtz(val),
     };
-    if rounded >= i32::MAX as f32 { return i32::MAX; }
-    if rounded <= i32::MIN as f32 { return i32::MIN; }
+    if rounded >= i32::MAX as f32 {
+        return i32::MAX;
+    }
+    if rounded <= i32::MIN as f32 {
+        return i32::MIN;
+    }
     rounded as i32
 }
 
 fn f32_to_u32_rmode(val: f32, rmode: u32) -> u32 {
-    if val.is_nan() || val < 0.0 { return 0; }
+    if val.is_nan() || val < 0.0 {
+        return 0;
+    }
     let rounded = match rmode {
         0b00 => val.round_ties_even(),
         0b01 => val.ceil(),
         0b10 => val.floor(),
         _ => return f32_to_u32_rtz(val),
     };
-    if rounded >= u32::MAX as f32 { return u32::MAX; }
-    if rounded < 0.0 { return 0; }
+    if rounded >= u32::MAX as f32 {
+        return u32::MAX;
+    }
+    if rounded < 0.0 {
+        return 0;
+    }
     rounded as u32
 }
 
@@ -601,7 +631,11 @@ impl CortexM33 {
             // VSEL<cc>.F32 — hw0[6:5] = cc: 00=EQ, 01=VS, 10=GE, 11=GT
             let cc = (hw0 >> 5) & 0x3;
             let take_sn = self.vsel_condition_holds(cc);
-            self.regs.s[sd] = if take_sn { self.regs.s[sn] } else { self.regs.s[sm] };
+            self.regs.s[sd] = if take_sn {
+                self.regs.s[sn]
+            } else {
+                self.regs.s[sm]
+            };
             1
         } else if (hw0 >> 5) & 0x3 == 0 {
             // VMAXNM / VMINNM
@@ -635,10 +669,10 @@ impl CortexM33 {
         let z = self.regs.flag_z();
         let v = self.regs.flag_v();
         match cc & 0x3 {
-            0b00 => z,               // EQ: Z == 1
-            0b01 => v,               // VS: V == 1
-            0b10 => n == v,          // GE: N == V
-            _    => !z && (n == v),  // GT: Z == 0 && N == V
+            0b00 => z,           // EQ: Z == 1
+            0b01 => v,           // VS: V == 1
+            0b10 => n == v,      // GE: N == V
+            _ => !z && (n == v), // GT: Z == 0 && N == V
         }
     }
 
@@ -887,8 +921,7 @@ impl CortexM33 {
             }
             (0b0110, 1) => {
                 // VRINTZ.F32 Sd, Sm — round toward zero (no IXC tracking)
-                let (val, flags) =
-                    fpu_vrint(self.regs.s[sm], 0b11, self.regs.fpscr, false);
+                let (val, flags) = fpu_vrint(self.regs.s[sm], 0b11, self.regs.fpscr, false);
                 self.regs.fpscr |= flags;
                 self.regs.s[sd] = val;
                 1
@@ -1140,7 +1173,9 @@ impl CortexM33 {
 
             for i in 0..count {
                 let reg = sd + i;
-                if reg >= 32 { break; }
+                if reg >= 32 {
+                    break;
+                }
 
                 if l != 0 {
                     self.regs.s[reg] = f32::from_bits(self.bus_read32(addr, bus));
@@ -1193,15 +1228,16 @@ impl CortexM33 {
     /// side-channel bus-fault flag (or, in future, the pending MemManage).
     /// Using a unit error avoids fabricating a `Fault::UsageFault` that
     /// is never actually delivered (step() catches the bus flag first).
-    pub(crate) fn flush_lazy_fp_context<B: CoreBus>(
-        &mut self,
-        bus: &mut B,
-    ) -> Result<(), ()> {
+    pub(crate) fn flush_lazy_fp_context<B: CoreBus>(&mut self, bus: &mut B) -> Result<(), ()> {
         let base = self.ppb.fpcar;
 
         // S0..S15 → +0..+60.
         for i in 0..16 {
-            self.bus_write32(base.wrapping_add((i as u32) * 4), self.regs.s[i].to_bits(), bus);
+            self.bus_write32(
+                base.wrapping_add((i as u32) * 4),
+                self.regs.s[i].to_bits(),
+                bus,
+            );
             if bus.bus_fault(self.core_id) {
                 self.ppb.fpccr |= crate::bus::ppb::FPCCR_BFRDY;
                 return Err(());
@@ -1485,10 +1521,23 @@ fn f32_to_f16_bits(v: f32, fpscr_in: u32) -> (u16, u32) {
         let m = (frac | 0x0080_0000) as u64;
         let shift: u32 = (-e - 1) as u32;
         let mantissa = (m >> shift) as u32;
-        let round_bit = if shift == 0 { 0 } else { ((m >> (shift - 1)) & 1) as u32 };
-        let sticky = if shift < 2 { false } else { (m & ((1u64 << (shift - 1)) - 1)) != 0 };
+        let round_bit = if shift == 0 {
+            0
+        } else {
+            ((m >> (shift - 1)) & 1) as u32
+        };
+        let sticky = if shift < 2 {
+            false
+        } else {
+            (m & ((1u64 << (shift - 1)) - 1)) != 0
+        };
         let lsb = mantissa & 1;
-        let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+        let rounded = mantissa
+            + if round_bit != 0 && (sticky || lsb != 0) {
+                1
+            } else {
+                0
+            };
         // Rounding up may carry the result into the normal range (2^-14),
         // which is exactly exp=1, frac=0 in half precision.
         if rounded >= 0x400 {
@@ -1503,7 +1552,12 @@ fn f32_to_f16_bits(v: f32, fpscr_in: u32) -> (u16, u32) {
     let round_bit = (frac >> 12) & 1;
     let sticky = (frac & 0xFFF) != 0;
     let lsb = mantissa & 1;
-    let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+    let rounded = mantissa
+        + if round_bit != 0 && (sticky || lsb != 0) {
+            1
+        } else {
+            0
+        };
 
     // Rounding may overflow the 10-bit fraction into the exponent.
     if rounded > 0x3FF {

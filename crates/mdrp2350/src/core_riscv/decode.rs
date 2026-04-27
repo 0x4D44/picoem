@@ -15,24 +15,24 @@
 //     module.
 
 #![allow(dead_code)] // P2 constructs these ops; some variants are only
-                    // reachable once tests wire them, but every variant
-                    // is covered by at least one execute_* path.
+// reachable once tests wire them, but every variant
+// is covered by at least one execute_* path.
 
 /// Primary opcode field (bits [6:2] with [1:0]==0b11 for base-ISA 32-bit
 /// instructions). The low two bits being 0b11 is the gate that separates
 /// base from compressed (C) encodings.
-const OPCODE_LUI:    u32 = 0b01_101;
-const OPCODE_AUIPC:  u32 = 0b00_101;
-const OPCODE_JAL:    u32 = 0b11_011;
-const OPCODE_JALR:   u32 = 0b11_001;
+const OPCODE_LUI: u32 = 0b01_101;
+const OPCODE_AUIPC: u32 = 0b00_101;
+const OPCODE_JAL: u32 = 0b11_011;
+const OPCODE_JALR: u32 = 0b11_001;
 const OPCODE_BRANCH: u32 = 0b11_000;
-const OPCODE_LOAD:   u32 = 0b00_000;
-const OPCODE_STORE:  u32 = 0b01_000;
+const OPCODE_LOAD: u32 = 0b00_000;
+const OPCODE_STORE: u32 = 0b01_000;
 const OPCODE_OP_IMM: u32 = 0b00_100;
-const OPCODE_OP:     u32 = 0b01_100;
+const OPCODE_OP: u32 = 0b01_100;
 const OPCODE_MISC_MEM: u32 = 0b00_011;
 const OPCODE_SYSTEM: u32 = 0b11_100;
-const OPCODE_AMO:    u32 = 0b01_011; // RV32A (funct3 = 010 for word-sized)
+const OPCODE_AMO: u32 = 0b01_011; // RV32A (funct3 = 010 for word-sized)
 
 /// Decoded RV32I + Zicsr + Zifencei instruction. Scratch fields are
 /// pre-extracted u5/u12 values to keep the executor branch-free on the
@@ -40,40 +40,95 @@ const OPCODE_AMO:    u32 = 0b01_011; // RV32A (funct3 = 010 for word-sized)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
     // U-type
-    Lui   { rd: u8, imm: u32 },
-    Auipc { rd: u8, imm: u32 },
+    Lui {
+        rd: u8,
+        imm: u32,
+    },
+    Auipc {
+        rd: u8,
+        imm: u32,
+    },
 
     // J-type
-    Jal  { rd: u8, imm: i32 },
+    Jal {
+        rd: u8,
+        imm: i32,
+    },
     // I-type (jump)
-    Jalr { rd: u8, rs1: u8, imm: i32 },
+    Jalr {
+        rd: u8,
+        rs1: u8,
+        imm: i32,
+    },
 
     // B-type
-    Branch { kind: BranchKind, rs1: u8, rs2: u8, imm: i32 },
+    Branch {
+        kind: BranchKind,
+        rs1: u8,
+        rs2: u8,
+        imm: i32,
+    },
 
     // I-type loads
-    Load { kind: LoadKind, rd: u8, rs1: u8, imm: i32 },
+    Load {
+        kind: LoadKind,
+        rd: u8,
+        rs1: u8,
+        imm: i32,
+    },
 
     // S-type stores
-    Store { kind: StoreKind, rs1: u8, rs2: u8, imm: i32 },
+    Store {
+        kind: StoreKind,
+        rs1: u8,
+        rs2: u8,
+        imm: i32,
+    },
 
     // I-type ALU
-    OpImm   { kind: AluImmKind, rd: u8, rs1: u8, imm: i32 },
+    OpImm {
+        kind: AluImmKind,
+        rd: u8,
+        rs1: u8,
+        imm: i32,
+    },
     // I-type shift (immediate); shamt already extracted
-    ShiftImm { kind: ShiftKind, rd: u8, rs1: u8, shamt: u8 },
+    ShiftImm {
+        kind: ShiftKind,
+        rd: u8,
+        rs1: u8,
+        shamt: u8,
+    },
 
     // R-type ALU
-    Op { kind: AluKind, rd: u8, rs1: u8, rs2: u8 },
+    Op {
+        kind: AluKind,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
 
     // RV32M (multiply / divide). Shares OPCODE_OP with R-type ALU, but
     // uses funct7 == 0x01. Split into its own variant so the executor
     // can distinguish mul/div cleanly.
-    MulDiv { kind: MulDivKind, rd: u8, rs1: u8, rs2: u8 },
+    MulDiv {
+        kind: MulDivKind,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
 
     // RV32A (atomics, word-sized subset). `aq`/`rl` memory-ordering bits
     // are ignored on the emulator (single-hart-at-a-time bus, same as
     // FENCE) but preserved in case future work wants to model them.
-    Amo { kind: AmoKind, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
+    Amo {
+        kind: AmoKind,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        aq: bool,
+        rl: bool,
+    },
 
     // MISC-MEM
     Fence,
@@ -84,38 +139,88 @@ pub(crate) enum Op {
     Ebreak,
     Mret,
     Wfi,
-    Csr { kind: CsrKind, rd: u8, rs1_or_zimm: u8, csr: u16 },
+    Csr {
+        kind: CsrKind,
+        rd: u8,
+        rs1_or_zimm: u8,
+        csr: u16,
+    },
 
     /// Anything we couldn't classify. Executor turns this into mcause=2.
-    Illegal { insn: u32 },
+    Illegal {
+        insn: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BranchKind { Beq, Bne, Blt, Bge, Bltu, Bgeu }
+pub(crate) enum BranchKind {
+    Beq,
+    Bne,
+    Blt,
+    Bge,
+    Bltu,
+    Bgeu,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoadKind { Lb, Lh, Lw, Lbu, Lhu }
+pub(crate) enum LoadKind {
+    Lb,
+    Lh,
+    Lw,
+    Lbu,
+    Lhu,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StoreKind { Sb, Sh, Sw }
+pub(crate) enum StoreKind {
+    Sb,
+    Sh,
+    Sw,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AluImmKind { Addi, Slti, Sltiu, Xori, Ori, Andi }
+pub(crate) enum AluImmKind {
+    Addi,
+    Slti,
+    Sltiu,
+    Xori,
+    Ori,
+    Andi,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShiftKind { Slli, Srli, Srai }
+pub(crate) enum ShiftKind {
+    Slli,
+    Srli,
+    Srai,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AluKind {
-    Add, Sub, Sll, Slt, Sltu, Xor, Srl, Sra, Or, And,
+    Add,
+    Sub,
+    Sll,
+    Slt,
+    Sltu,
+    Xor,
+    Srl,
+    Sra,
+    Or,
+    And,
 }
 
 /// RV32M operations. Funct3 encoding: MUL=0, MULH=1, MULHSU=2, MULHU=3,
 /// DIV=4, DIVU=5, REM=6, REMU=7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MulDivKind {
-    Mul, Mulh, Mulhsu, Mulhu,
-    Div, Divu, Rem, Remu,
+    Mul,
+    Mulh,
+    Mulhsu,
+    Mulhu,
+    Div,
+    Divu,
+    Rem,
+    Remu,
 }
 
 /// RV32A word-sized operations. LR/SC don't carry an rs2 address-operand
@@ -123,32 +228,57 @@ pub(crate) enum MulDivKind {
 /// ignores rs2 for `Lr` and treats it as the store value for `Sc`/amo*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AmoKind {
-    Lr, Sc,
-    Swap, Add, And, Or, Xor,
-    Min, Max, Minu, Maxu,
+    Lr,
+    Sc,
+    Swap,
+    Add,
+    And,
+    Or,
+    Xor,
+    Min,
+    Max,
+    Minu,
+    Maxu,
 }
 
 /// Zicsr instruction family. `Imm` forms carry the 5-bit zimm in the
 /// `rs1_or_zimm` field; register forms carry the rs1 index there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CsrKind {
-    Csrrw, Csrrs, Csrrc, Csrrwi, Csrrsi, Csrrci,
+    Csrrw,
+    Csrrs,
+    Csrrc,
+    Csrrwi,
+    Csrrsi,
+    Csrrci,
 }
 
 // --- Bitfield accessors ---------------------------------------------------
 
 #[inline(always)]
-fn opcode(insn: u32) -> u32 { (insn >> 2) & 0x1F }
+fn opcode(insn: u32) -> u32 {
+    (insn >> 2) & 0x1F
+}
 #[inline(always)]
-fn rd(insn: u32)     -> u8 { ((insn >> 7) & 0x1F) as u8 }
+fn rd(insn: u32) -> u8 {
+    ((insn >> 7) & 0x1F) as u8
+}
 #[inline(always)]
-fn rs1(insn: u32)    -> u8 { ((insn >> 15) & 0x1F) as u8 }
+fn rs1(insn: u32) -> u8 {
+    ((insn >> 15) & 0x1F) as u8
+}
 #[inline(always)]
-fn rs2(insn: u32)    -> u8 { ((insn >> 20) & 0x1F) as u8 }
+fn rs2(insn: u32) -> u8 {
+    ((insn >> 20) & 0x1F) as u8
+}
 #[inline(always)]
-fn funct3(insn: u32) -> u32 { (insn >> 12) & 0x7 }
+fn funct3(insn: u32) -> u32 {
+    (insn >> 12) & 0x7
+}
 #[inline(always)]
-fn funct7(insn: u32) -> u32 { (insn >> 25) & 0x7F }
+fn funct7(insn: u32) -> u32 {
+    (insn >> 25) & 0x7F
+}
 
 /// Sign-extend `bits` treating bit `msb` as the sign bit.
 #[inline(always)]
@@ -159,7 +289,9 @@ fn sext(bits: u32, msb: u32) -> i32 {
 
 /// I-type 12-bit immediate (bits 31:20), sign-extended.
 #[inline(always)]
-fn imm_i(insn: u32) -> i32 { sext(insn >> 20, 11) }
+fn imm_i(insn: u32) -> i32 {
+    sext(insn >> 20, 11)
+}
 
 /// S-type immediate: bits 31:25 (hi7) + 11:7 (lo5), sign-extended.
 #[inline(always)]
@@ -181,16 +313,21 @@ fn imm_b(insn: u32) -> i32 {
 
 /// U-type immediate: bits 31:12 shifted to 31:12 with zero low 12 bits.
 #[inline(always)]
-fn imm_u(insn: u32) -> u32 { insn & 0xFFFF_F000 }
+fn imm_u(insn: u32) -> u32 {
+    insn & 0xFFFF_F000
+}
 
 /// J-type immediate: [20|10:1|11|19:12] in bits [31|30:21|20|19:12], <<1.
 #[inline(always)]
 fn imm_j(insn: u32) -> i32 {
-    let b20    = (insn >> 31) & 0x1;
-    let b10_1  = (insn >> 21) & 0x3FF;
-    let b11    = (insn >> 20) & 0x1;
+    let b20 = (insn >> 31) & 0x1;
+    let b10_1 = (insn >> 21) & 0x3FF;
+    let b11 = (insn >> 20) & 0x1;
     let b19_12 = (insn >> 12) & 0xFF;
-    sext((b20 << 20) | (b19_12 << 12) | (b11 << 11) | (b10_1 << 1), 20)
+    sext(
+        (b20 << 20) | (b19_12 << 12) | (b11 << 11) | (b10_1 << 1),
+        20,
+    )
 }
 
 // --- Top-level decode -----------------------------------------------------
@@ -207,24 +344,37 @@ pub(crate) fn decode(insn: u32) -> Op {
 
     let op = opcode(insn);
     match op {
-        OPCODE_LUI   => Op::Lui   { rd: rd(insn), imm: imm_u(insn) },
-        OPCODE_AUIPC => Op::Auipc { rd: rd(insn), imm: imm_u(insn) },
-        OPCODE_JAL   => Op::Jal   { rd: rd(insn), imm: imm_j(insn) },
+        OPCODE_LUI => Op::Lui {
+            rd: rd(insn),
+            imm: imm_u(insn),
+        },
+        OPCODE_AUIPC => Op::Auipc {
+            rd: rd(insn),
+            imm: imm_u(insn),
+        },
+        OPCODE_JAL => Op::Jal {
+            rd: rd(insn),
+            imm: imm_j(insn),
+        },
         OPCODE_JALR => {
             // JALR is funct3=0 only.
             if funct3(insn) != 0 {
                 return Op::Illegal { insn };
             }
-            Op::Jalr { rd: rd(insn), rs1: rs1(insn), imm: imm_i(insn) }
+            Op::Jalr {
+                rd: rd(insn),
+                rs1: rs1(insn),
+                imm: imm_i(insn),
+            }
         }
         OPCODE_BRANCH => decode_branch(insn),
-        OPCODE_LOAD   => decode_load(insn),
-        OPCODE_STORE  => decode_store(insn),
+        OPCODE_LOAD => decode_load(insn),
+        OPCODE_STORE => decode_store(insn),
         OPCODE_OP_IMM => decode_op_imm(insn),
-        OPCODE_OP     => decode_op(insn),
+        OPCODE_OP => decode_op(insn),
         OPCODE_MISC_MEM => decode_misc_mem(insn),
-        OPCODE_SYSTEM   => decode_system(insn),
-        OPCODE_AMO      => decode_amo(insn),
+        OPCODE_SYSTEM => decode_system(insn),
+        OPCODE_AMO => decode_amo(insn),
         _ => Op::Illegal { insn },
     }
 }
@@ -239,7 +389,12 @@ fn decode_branch(insn: u32) -> Op {
         0b111 => BranchKind::Bgeu,
         _ => return Op::Illegal { insn },
     };
-    Op::Branch { kind, rs1: rs1(insn), rs2: rs2(insn), imm: imm_b(insn) }
+    Op::Branch {
+        kind,
+        rs1: rs1(insn),
+        rs2: rs2(insn),
+        imm: imm_b(insn),
+    }
 }
 
 fn decode_load(insn: u32) -> Op {
@@ -251,7 +406,12 @@ fn decode_load(insn: u32) -> Op {
         0b101 => LoadKind::Lhu,
         _ => return Op::Illegal { insn },
     };
-    Op::Load { kind, rd: rd(insn), rs1: rs1(insn), imm: imm_i(insn) }
+    Op::Load {
+        kind,
+        rd: rd(insn),
+        rs1: rs1(insn),
+        imm: imm_i(insn),
+    }
 }
 
 fn decode_store(insn: u32) -> Op {
@@ -261,7 +421,12 @@ fn decode_store(insn: u32) -> Op {
         0b010 => StoreKind::Sw,
         _ => return Op::Illegal { insn },
     };
-    Op::Store { kind, rs1: rs1(insn), rs2: rs2(insn), imm: imm_s(insn) }
+    Op::Store {
+        kind,
+        rs1: rs1(insn),
+        rs2: rs2(insn),
+        imm: imm_s(insn),
+    }
 }
 
 fn decode_op_imm(insn: u32) -> Op {
@@ -277,7 +442,12 @@ fn decode_op_imm(insn: u32) -> Op {
             return Op::Illegal { insn };
         }
         let shamt = ((insn >> 20) & 0x1F) as u8;
-        return Op::ShiftImm { kind: ShiftKind::Slli, rd: rd_, rs1: rs1_, shamt };
+        return Op::ShiftImm {
+            kind: ShiftKind::Slli,
+            rd: rd_,
+            rs1: rs1_,
+            shamt,
+        };
     }
     if f3 == 0b101 {
         let f7 = funct7(insn);
@@ -287,7 +457,12 @@ fn decode_op_imm(insn: u32) -> Op {
             0b010_0000 => ShiftKind::Srai,
             _ => return Op::Illegal { insn },
         };
-        return Op::ShiftImm { kind, rd: rd_, rs1: rs1_, shamt };
+        return Op::ShiftImm {
+            kind,
+            rd: rd_,
+            rs1: rs1_,
+            shamt,
+        };
     }
 
     let kind = match f3 {
@@ -299,7 +474,12 @@ fn decode_op_imm(insn: u32) -> Op {
         0b111 => AluImmKind::Andi,
         _ => unreachable!("f3 001/101 handled above"),
     };
-    Op::OpImm { kind, rd: rd_, rs1: rs1_, imm: imm_i(insn) }
+    Op::OpImm {
+        kind,
+        rd: rd_,
+        rs1: rs1_,
+        imm: imm_i(insn),
+    }
 }
 
 fn decode_op(insn: u32) -> Op {
@@ -321,7 +501,12 @@ fn decode_op(insn: u32) -> Op {
             0b111 => MulDivKind::Remu,
             _ => unreachable!("f3 is 3 bits"),
         };
-        return Op::MulDiv { kind, rd: rd_, rs1: rs1_, rs2: rs2_ };
+        return Op::MulDiv {
+            kind,
+            rd: rd_,
+            rs1: rs1_,
+            rs2: rs2_,
+        };
     }
     let kind = match (f3, f7) {
         (0b000, 0b000_0000) => AluKind::Add,
@@ -336,7 +521,12 @@ fn decode_op(insn: u32) -> Op {
         (0b111, 0b000_0000) => AluKind::And,
         _ => return Op::Illegal { insn },
     };
-    Op::Op { kind, rd: rd_, rs1: rs1_, rs2: rs2_ }
+    Op::Op {
+        kind,
+        rd: rd_,
+        rs1: rs1_,
+        rs2: rs2_,
+    }
 }
 
 /// RV32A word-sized atomics. Bits 31..27 select the op, bits 26/25 are
@@ -372,7 +562,14 @@ fn decode_amo(insn: u32) -> Op {
         0b11100 => AmoKind::Maxu,
         _ => return Op::Illegal { insn },
     };
-    Op::Amo { kind, rd: rd_, rs1: rs1_, rs2: rs2_, aq, rl }
+    Op::Amo {
+        kind,
+        rd: rd_,
+        rs1: rs1_,
+        rs2: rs2_,
+        aq,
+        rl,
+    }
 }
 
 fn decode_misc_mem(insn: u32) -> Op {
@@ -416,7 +613,12 @@ fn decode_system(insn: u32) -> Op {
         0b111 => CsrKind::Csrrci,
         _ => return Op::Illegal { insn },
     };
-    Op::Csr { kind, rd: rd(insn), rs1_or_zimm: rs1(insn), csr }
+    Op::Csr {
+        kind,
+        rd: rd(insn),
+        rs1_or_zimm: rs1(insn),
+        csr,
+    }
 }
 
 // --- RV32C (compressed) decode -------------------------------------------
@@ -437,11 +639,15 @@ fn decode_system(insn: u32) -> Op {
 // encodings to x8..x15 per spec.
 
 #[inline(always)]
-fn creg3(bits: u16) -> u8 { 8 + (bits & 0x7) as u8 }
+fn creg3(bits: u16) -> u8 {
+    8 + (bits & 0x7) as u8
+}
 
 /// Sign-extend a u32 of `msb+1` significant bits (bit `msb` is the sign).
 #[inline(always)]
-fn sext_u(bits: u32, msb: u32) -> i32 { sext(bits, msb) }
+fn sext_u(bits: u32, msb: u32) -> i32 {
+    sext(bits, msb)
+}
 
 pub(crate) fn decode16(hw: u16) -> Op {
     // Illegal compressed instruction: the all-zeros 16-bit word.
@@ -466,33 +672,48 @@ fn decode16_q0(hw: u32, f3: u32) -> Op {
         0b000 => {
             // C.ADDI4SPN rd', nzuimm — rd = sp + nzuimm
             // nzuimm[5:4|9:6|2|3] in insn[12:11|10:7|6|5]. nzuimm != 0.
-            let b5_4   = (hw >> 11) & 0b11;
-            let b9_6   = (hw >> 7) & 0b1111;
-            let b2     = (hw >> 6) & 0b1;
-            let b3     = (hw >> 5) & 0b1;
+            let b5_4 = (hw >> 11) & 0b11;
+            let b9_6 = (hw >> 7) & 0b1111;
+            let b2 = (hw >> 6) & 0b1;
+            let b3 = (hw >> 5) & 0b1;
             let nzuimm = (b9_6 << 6) | (b5_4 << 4) | (b3 << 3) | (b2 << 2);
             if nzuimm == 0 {
                 return Op::Illegal { insn: hw };
             }
-            Op::OpImm { kind: AluImmKind::Addi, rd: rd_p, rs1: 2, imm: nzuimm as i32 }
+            Op::OpImm {
+                kind: AluImmKind::Addi,
+                rd: rd_p,
+                rs1: 2,
+                imm: nzuimm as i32,
+            }
         }
         0b010 => {
             // C.LW rd', uimm(rs1')
             // uimm[5:3|2|6] in insn[12:10|6|5]
             let b5_3 = (hw >> 10) & 0b111;
-            let b2   = (hw >> 6) & 0b1;
-            let b6   = (hw >> 5) & 0b1;
+            let b2 = (hw >> 6) & 0b1;
+            let b6 = (hw >> 5) & 0b1;
             let uimm = (b6 << 6) | (b5_3 << 3) | (b2 << 2);
-            Op::Load { kind: LoadKind::Lw, rd: rd_p, rs1: rs1_p, imm: uimm as i32 }
+            Op::Load {
+                kind: LoadKind::Lw,
+                rd: rd_p,
+                rs1: rs1_p,
+                imm: uimm as i32,
+            }
         }
         0b110 => {
             // C.SW rs2', uimm(rs1')
             let b5_3 = (hw >> 10) & 0b111;
-            let b2   = (hw >> 6) & 0b1;
-            let b6   = (hw >> 5) & 0b1;
+            let b2 = (hw >> 6) & 0b1;
+            let b6 = (hw >> 5) & 0b1;
             let uimm = (b6 << 6) | (b5_3 << 3) | (b2 << 2);
             let rs2_p = creg3((hw >> 2) as u16);
-            Op::Store { kind: StoreKind::Sw, rs1: rs1_p, rs2: rs2_p, imm: uimm as i32 }
+            Op::Store {
+                kind: StoreKind::Sw,
+                rs1: rs1_p,
+                rs2: rs2_p,
+                imm: uimm as i32,
+            }
         }
         _ => Op::Illegal { insn: hw },
     }
@@ -507,9 +728,19 @@ fn decode16_q1(hw: u32, f3: u32) -> Op {
             let imm_raw = (((hw >> 12) & 1) << 5) | ((hw >> 2) & 0x1F);
             let imm = sext_u(imm_raw, 5);
             if rd_ == 0 && imm_raw == 0 {
-                return Op::OpImm { kind: AluImmKind::Addi, rd: 0, rs1: 0, imm: 0 };
+                return Op::OpImm {
+                    kind: AluImmKind::Addi,
+                    rd: 0,
+                    rs1: 0,
+                    imm: 0,
+                };
             }
-            Op::OpImm { kind: AluImmKind::Addi, rd: rd_, rs1: rd_, imm }
+            Op::OpImm {
+                kind: AluImmKind::Addi,
+                rd: rd_,
+                rs1: rd_,
+                imm,
+            }
         }
         0b001 => {
             // C.JAL imm — rv32-only. rd = x1.
@@ -521,7 +752,12 @@ fn decode16_q1(hw: u32, f3: u32) -> Op {
             let rd_ = ((hw >> 7) & 0x1F) as u8;
             let imm_raw = (((hw >> 12) & 1) << 5) | ((hw >> 2) & 0x1F);
             let imm = sext_u(imm_raw, 5);
-            Op::OpImm { kind: AluImmKind::Addi, rd: rd_, rs1: 0, imm }
+            Op::OpImm {
+                kind: AluImmKind::Addi,
+                rd: rd_,
+                rs1: 0,
+                imm,
+            }
         }
         0b011 => {
             let rd_ = ((hw >> 7) & 0x1F) as u8;
@@ -538,7 +774,12 @@ fn decode16_q1(hw: u32, f3: u32) -> Op {
                     return Op::Illegal { insn: hw };
                 }
                 let imm = sext_u(nzimm_raw, 9);
-                Op::OpImm { kind: AluImmKind::Addi, rd: 2, rs1: 2, imm }
+                Op::OpImm {
+                    kind: AluImmKind::Addi,
+                    rd: 2,
+                    rs1: 2,
+                    imm,
+                }
             } else {
                 // C.LUI rd, nzimm[17:12]. Bits[12] = imm[17]; bits[6:2] = imm[16:12].
                 let b17 = (hw >> 12) & 1;
@@ -564,7 +805,12 @@ fn decode16_q1(hw: u32, f3: u32) -> Op {
                     if shamt >= 32 {
                         return Op::Illegal { insn: hw };
                     }
-                    Op::ShiftImm { kind: ShiftKind::Srli, rd: rs1_p, rs1: rs1_p, shamt }
+                    Op::ShiftImm {
+                        kind: ShiftKind::Srli,
+                        rd: rs1_p,
+                        rs1: rs1_p,
+                        shamt,
+                    }
                 }
                 0b01 => {
                     let b5 = ((hw >> 12) & 1) as u8;
@@ -573,12 +819,22 @@ fn decode16_q1(hw: u32, f3: u32) -> Op {
                     if shamt >= 32 {
                         return Op::Illegal { insn: hw };
                     }
-                    Op::ShiftImm { kind: ShiftKind::Srai, rd: rs1_p, rs1: rs1_p, shamt }
+                    Op::ShiftImm {
+                        kind: ShiftKind::Srai,
+                        rd: rs1_p,
+                        rs1: rs1_p,
+                        shamt,
+                    }
                 }
                 0b10 => {
                     let imm_raw = (((hw >> 12) & 1) << 5) | ((hw >> 2) & 0x1F);
                     let imm = sext_u(imm_raw, 5);
-                    Op::OpImm { kind: AluImmKind::Andi, rd: rs1_p, rs1: rs1_p, imm }
+                    Op::OpImm {
+                        kind: AluImmKind::Andi,
+                        rd: rs1_p,
+                        rs1: rs1_p,
+                        imm,
+                    }
                 }
                 0b11 => {
                     let rs2_p = creg3((hw >> 2) as u16);
@@ -592,7 +848,12 @@ fn decode16_q1(hw: u32, f3: u32) -> Op {
                         // only. Illegal on RV32.
                         _ => return Op::Illegal { insn: hw },
                     };
-                    Op::Op { kind, rd: rs1_p, rs1: rs1_p, rs2: rs2_p }
+                    Op::Op {
+                        kind,
+                        rd: rs1_p,
+                        rs1: rs1_p,
+                        rs2: rs2_p,
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -605,12 +866,22 @@ fn decode16_q1(hw: u32, f3: u32) -> Op {
         0b110 => {
             let rs1_p = creg3((hw >> 7) as u16);
             let imm = c_bimm(hw);
-            Op::Branch { kind: BranchKind::Beq, rs1: rs1_p, rs2: 0, imm }
+            Op::Branch {
+                kind: BranchKind::Beq,
+                rs1: rs1_p,
+                rs2: 0,
+                imm,
+            }
         }
         0b111 => {
             let rs1_p = creg3((hw >> 7) as u16);
             let imm = c_bimm(hw);
-            Op::Branch { kind: BranchKind::Bne, rs1: rs1_p, rs2: 0, imm }
+            Op::Branch {
+                kind: BranchKind::Bne,
+                rs1: rs1_p,
+                rs2: 0,
+                imm,
+            }
         }
         _ => Op::Illegal { insn: hw },
     }
@@ -627,7 +898,12 @@ fn decode16_q2(hw: u32, f3: u32) -> Op {
             if shamt >= 32 {
                 return Op::Illegal { insn: hw };
             }
-            Op::ShiftImm { kind: ShiftKind::Slli, rd: rd_, rs1: rd_, shamt }
+            Op::ShiftImm {
+                kind: ShiftKind::Slli,
+                rd: rd_,
+                rs1: rd_,
+                shamt,
+            }
         }
         0b010 => {
             if rd_ == 0 {
@@ -637,7 +913,12 @@ fn decode16_q2(hw: u32, f3: u32) -> Op {
             let b4_2 = (hw >> 4) & 0b111;
             let b7_6 = (hw >> 2) & 0b11;
             let uimm = (b7_6 << 6) | (b5 << 5) | (b4_2 << 2);
-            Op::Load { kind: LoadKind::Lw, rd: rd_, rs1: 2, imm: uimm as i32 }
+            Op::Load {
+                kind: LoadKind::Lw,
+                rd: rd_,
+                rs1: 2,
+                imm: uimm as i32,
+            }
         }
         0b100 => {
             let bit12 = (hw >> 12) & 1;
@@ -646,23 +927,46 @@ fn decode16_q2(hw: u32, f3: u32) -> Op {
                     if rd_ == 0 {
                         return Op::Illegal { insn: hw };
                     }
-                    Op::Jalr { rd: 0, rs1: rd_, imm: 0 }
+                    Op::Jalr {
+                        rd: 0,
+                        rs1: rd_,
+                        imm: 0,
+                    }
                 } else {
-                    Op::Op { kind: AluKind::Add, rd: rd_, rs1: 0, rs2: rs2_ }
+                    Op::Op {
+                        kind: AluKind::Add,
+                        rd: rd_,
+                        rs1: 0,
+                        rs2: rs2_,
+                    }
                 }
             } else if rd_ == 0 && rs2_ == 0 {
                 Op::Ebreak
             } else if rs2_ == 0 {
-                Op::Jalr { rd: 1, rs1: rd_, imm: 0 }
+                Op::Jalr {
+                    rd: 1,
+                    rs1: rd_,
+                    imm: 0,
+                }
             } else {
-                Op::Op { kind: AluKind::Add, rd: rd_, rs1: rd_, rs2: rs2_ }
+                Op::Op {
+                    kind: AluKind::Add,
+                    rd: rd_,
+                    rs1: rd_,
+                    rs2: rs2_,
+                }
             }
         }
         0b110 => {
             let b5_2 = (hw >> 9) & 0b1111;
             let b7_6 = (hw >> 7) & 0b11;
             let uimm = (b7_6 << 6) | (b5_2 << 2);
-            Op::Store { kind: StoreKind::Sw, rs1: 2, rs2: rs2_, imm: uimm as i32 }
+            Op::Store {
+                kind: StoreKind::Sw,
+                rs1: 2,
+                rs2: rs2_,
+                imm: uimm as i32,
+            }
         }
         _ => Op::Illegal { insn: hw },
     }
@@ -671,27 +975,33 @@ fn decode16_q2(hw: u32, f3: u32) -> Op {
 /// C.J / C.JAL immediate. 12-bit sign-extended.
 /// imm[11|4|9:8|10|6|7|3:1|5] in bits[12|11|10:9|8|7|6|5:3|2].
 fn c_jimm(hw: u32) -> i32 {
-    let b11   = (hw >> 12) & 1;
-    let b4    = (hw >> 11) & 1;
-    let b9_8  = (hw >> 9) & 0b11;
-    let b10   = (hw >> 8) & 1;
-    let b6    = (hw >> 7) & 1;
-    let b7    = (hw >> 6) & 1;
-    let b3_1  = (hw >> 3) & 0b111;
-    let b5    = (hw >> 2) & 1;
-    let raw = (b11 << 11) | (b10 << 10) | (b9_8 << 8) | (b7 << 7) | (b6 << 6)
-        | (b5 << 5) | (b4 << 4) | (b3_1 << 1);
+    let b11 = (hw >> 12) & 1;
+    let b4 = (hw >> 11) & 1;
+    let b9_8 = (hw >> 9) & 0b11;
+    let b10 = (hw >> 8) & 1;
+    let b6 = (hw >> 7) & 1;
+    let b7 = (hw >> 6) & 1;
+    let b3_1 = (hw >> 3) & 0b111;
+    let b5 = (hw >> 2) & 1;
+    let raw = (b11 << 11)
+        | (b10 << 10)
+        | (b9_8 << 8)
+        | (b7 << 7)
+        | (b6 << 6)
+        | (b5 << 5)
+        | (b4 << 4)
+        | (b3_1 << 1);
     sext_u(raw, 11)
 }
 
 /// C.BEQZ / C.BNEZ immediate.
 /// imm[8|4:3|7:6|2:1|5] in bits[12|11:10|6:5|4:3|2].
 fn c_bimm(hw: u32) -> i32 {
-    let b8   = (hw >> 12) & 1;
+    let b8 = (hw >> 12) & 1;
     let b4_3 = (hw >> 10) & 0b11;
     let b7_6 = (hw >> 5) & 0b11;
     let b2_1 = (hw >> 3) & 0b11;
-    let b5   = (hw >> 2) & 1;
+    let b5 = (hw >> 2) & 1;
     let raw = (b8 << 8) | (b7_6 << 6) | (b5 << 5) | (b4_3 << 3) | (b2_1 << 1);
     sext_u(raw, 8)
 }
@@ -706,21 +1016,35 @@ mod tests {
 
     fn enc_i(opcode: u32, rd: u8, f3: u32, rs1: u8, imm: i32) -> u32 {
         let imm_u = (imm as u32) & 0xFFF;
-        (imm_u << 20) | ((rs1 as u32) << 15) | (f3 << 12) | ((rd as u32) << 7)
-            | (opcode << 2) | 0b11
+        (imm_u << 20)
+            | ((rs1 as u32) << 15)
+            | (f3 << 12)
+            | ((rd as u32) << 7)
+            | (opcode << 2)
+            | 0b11
     }
 
     fn enc_r(opcode: u32, rd: u8, f3: u32, rs1: u8, rs2: u8, f7: u32) -> u32 {
-        (f7 << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15)
-            | (f3 << 12) | ((rd as u32) << 7) | (opcode << 2) | 0b11
+        (f7 << 25)
+            | ((rs2 as u32) << 20)
+            | ((rs1 as u32) << 15)
+            | (f3 << 12)
+            | ((rd as u32) << 7)
+            | (opcode << 2)
+            | 0b11
     }
 
     fn enc_s(opcode: u32, f3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
         let imm_u = (imm as u32) & 0xFFF;
         let hi = (imm_u >> 5) & 0x7F;
         let lo = imm_u & 0x1F;
-        (hi << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15)
-            | (f3 << 12) | (lo << 7) | (opcode << 2) | 0b11
+        (hi << 25)
+            | ((rs2 as u32) << 20)
+            | ((rs1 as u32) << 15)
+            | (f3 << 12)
+            | (lo << 7)
+            | (opcode << 2)
+            | 0b11
     }
 
     fn enc_b(f3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
@@ -729,9 +1053,15 @@ mod tests {
         let b11 = (imm_u >> 11) & 0x1;
         let b10_5 = (imm_u >> 5) & 0x3F;
         let b4_1 = (imm_u >> 1) & 0xF;
-        (b12 << 31) | (b10_5 << 25) | ((rs2 as u32) << 20)
-            | ((rs1 as u32) << 15) | (f3 << 12) | (b4_1 << 8)
-            | (b11 << 7) | (OPCODE_BRANCH << 2) | 0b11
+        (b12 << 31)
+            | (b10_5 << 25)
+            | ((rs2 as u32) << 20)
+            | ((rs1 as u32) << 15)
+            | (f3 << 12)
+            | (b4_1 << 8)
+            | (b11 << 7)
+            | (OPCODE_BRANCH << 2)
+            | 0b11
     }
 
     fn enc_j(rd: u8, imm: i32) -> u32 {
@@ -740,8 +1070,13 @@ mod tests {
         let b10_1 = (imm_u >> 1) & 0x3FF;
         let b11 = (imm_u >> 11) & 0x1;
         let b19_12 = (imm_u >> 12) & 0xFF;
-        (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12)
-            | ((rd as u32) << 7) | (OPCODE_JAL << 2) | 0b11
+        (b20 << 31)
+            | (b10_1 << 21)
+            | (b11 << 20)
+            | (b19_12 << 12)
+            | ((rd as u32) << 7)
+            | (OPCODE_JAL << 2)
+            | 0b11
     }
 
     #[test]
@@ -757,13 +1092,25 @@ mod tests {
     fn decodes_lui() {
         // LUI x5, 0x12345
         let insn = enc_u(OPCODE_LUI, 5, 0x1234_5000);
-        assert_eq!(decode(insn), Op::Lui { rd: 5, imm: 0x1234_5000 });
+        assert_eq!(
+            decode(insn),
+            Op::Lui {
+                rd: 5,
+                imm: 0x1234_5000
+            }
+        );
     }
 
     #[test]
     fn decodes_auipc() {
         let insn = enc_u(OPCODE_AUIPC, 7, 0x0000_1000);
-        assert_eq!(decode(insn), Op::Auipc { rd: 7, imm: 0x0000_1000 });
+        assert_eq!(
+            decode(insn),
+            Op::Auipc {
+                rd: 7,
+                imm: 0x0000_1000
+            }
+        );
     }
 
     #[test]
@@ -771,7 +1118,12 @@ mod tests {
         // ADDI x1, x0, -1  ->  0xFFFF_FFFF
         let insn = enc_i(OPCODE_OP_IMM, 1, 0b000, 0, -1);
         match decode(insn) {
-            Op::OpImm { kind: AluImmKind::Addi, rd: 1, rs1: 0, imm: -1 } => (),
+            Op::OpImm {
+                kind: AluImmKind::Addi,
+                rd: 1,
+                rs1: 0,
+                imm: -1,
+            } => (),
             other => panic!("unexpected {:?}", other),
         }
     }
@@ -793,7 +1145,12 @@ mod tests {
         for (f3, f7, expected) in cases {
             let insn = enc_r(OPCODE_OP, 3, f3, 4, 5, f7);
             match decode(insn) {
-                Op::Op { kind, rd: 3, rs1: 4, rs2: 5 } if kind == expected => (),
+                Op::Op {
+                    kind,
+                    rd: 3,
+                    rs1: 4,
+                    rs2: 5,
+                } if kind == expected => (),
                 other => panic!("{:?} -> {:?}", (f3, f7, expected), other),
             }
         }
@@ -805,7 +1162,12 @@ mod tests {
         let insn = enc_b(0b000, 1, 2, -8);
         assert_eq!(
             decode(insn),
-            Op::Branch { kind: BranchKind::Beq, rs1: 1, rs2: 2, imm: -8 },
+            Op::Branch {
+                kind: BranchKind::Beq,
+                rs1: 1,
+                rs2: 2,
+                imm: -8
+            },
         );
     }
 
@@ -819,7 +1181,15 @@ mod tests {
     fn decodes_store_sw() {
         // SW x5, 0x10(x3)
         let insn = enc_s(OPCODE_STORE, 0b010, 3, 5, 0x10);
-        assert_eq!(decode(insn), Op::Store { kind: StoreKind::Sw, rs1: 3, rs2: 5, imm: 0x10 });
+        assert_eq!(
+            decode(insn),
+            Op::Store {
+                kind: StoreKind::Sw,
+                rs1: 3,
+                rs2: 5,
+                imm: 0x10
+            }
+        );
     }
 
     #[test]
@@ -840,18 +1210,33 @@ mod tests {
         let insn = enc_i(OPCODE_SYSTEM, 5, 0b001, 6, 0x300);
         assert_eq!(
             decode(insn),
-            Op::Csr { kind: CsrKind::Csrrw, rd: 5, rs1_or_zimm: 6, csr: 0x300 },
+            Op::Csr {
+                kind: CsrKind::Csrrw,
+                rd: 5,
+                rs1_or_zimm: 6,
+                csr: 0x300
+            },
         );
     }
 
     #[test]
     fn decodes_shift_imm_srai() {
         // SRAI x1, x2, 3 — funct7=0100000, shamt=3
-        let insn = (0b010_0000 << 25) | (3u32 << 20) | (2u32 << 15)
-            | (0b101 << 12) | (1u32 << 7) | (OPCODE_OP_IMM << 2) | 0b11;
+        let insn = (0b010_0000 << 25)
+            | (3u32 << 20)
+            | (2u32 << 15)
+            | (0b101 << 12)
+            | (1u32 << 7)
+            | (OPCODE_OP_IMM << 2)
+            | 0b11;
         assert_eq!(
             decode(insn),
-            Op::ShiftImm { kind: ShiftKind::Srai, rd: 1, rs1: 2, shamt: 3 },
+            Op::ShiftImm {
+                kind: ShiftKind::Srai,
+                rd: 1,
+                rs1: 2,
+                shamt: 3
+            },
         );
     }
 
@@ -878,36 +1263,77 @@ mod tests {
         let insn = enc_r(OPCODE_OP, 3, 0b000, 4, 5, 0b000_0001);
         assert_eq!(
             decode(insn),
-            Op::MulDiv { kind: MulDivKind::Mul, rd: 3, rs1: 4, rs2: 5 },
+            Op::MulDiv {
+                kind: MulDivKind::Mul,
+                rd: 3,
+                rs1: 4,
+                rs2: 5
+            },
         );
     }
 
     #[test]
     fn decodes_rv32a_lr_w_and_sc_w() {
         // LR.W x5, (x6)  — funct5=00010, rs2=0, funct3=010, opcode=0101111 (AMO)
-        let insn = (0b00010u32 << 27) | (0u32 << 20) | (6u32 << 15)
-            | (0b010 << 12) | (5u32 << 7) | (OPCODE_AMO << 2) | 0b11;
+        let insn = (0b00010u32 << 27)
+            | (0u32 << 20)
+            | (6u32 << 15)
+            | (0b010 << 12)
+            | (5u32 << 7)
+            | (OPCODE_AMO << 2)
+            | 0b11;
         assert_eq!(
             decode(insn),
-            Op::Amo { kind: AmoKind::Lr, rd: 5, rs1: 6, rs2: 0, aq: false, rl: false },
+            Op::Amo {
+                kind: AmoKind::Lr,
+                rd: 5,
+                rs1: 6,
+                rs2: 0,
+                aq: false,
+                rl: false
+            },
         );
         // SC.W x5, x7, (x6)
-        let insn = (0b00011u32 << 27) | (7u32 << 20) | (6u32 << 15)
-            | (0b010 << 12) | (5u32 << 7) | (OPCODE_AMO << 2) | 0b11;
+        let insn = (0b00011u32 << 27)
+            | (7u32 << 20)
+            | (6u32 << 15)
+            | (0b010 << 12)
+            | (5u32 << 7)
+            | (OPCODE_AMO << 2)
+            | 0b11;
         assert_eq!(
             decode(insn),
-            Op::Amo { kind: AmoKind::Sc, rd: 5, rs1: 6, rs2: 7, aq: false, rl: false },
+            Op::Amo {
+                kind: AmoKind::Sc,
+                rd: 5,
+                rs1: 6,
+                rs2: 7,
+                aq: false,
+                rl: false
+            },
         );
     }
 
     #[test]
     fn decodes_rv32a_amoadd_w() {
         // AMOADD.W x5, x7, (x6)  — funct5=00000
-        let insn = (0b00000u32 << 27) | (7u32 << 20) | (6u32 << 15)
-            | (0b010 << 12) | (5u32 << 7) | (OPCODE_AMO << 2) | 0b11;
+        let insn = (0b00000u32 << 27)
+            | (7u32 << 20)
+            | (6u32 << 15)
+            | (0b010 << 12)
+            | (5u32 << 7)
+            | (OPCODE_AMO << 2)
+            | 0b11;
         assert_eq!(
             decode(insn),
-            Op::Amo { kind: AmoKind::Add, rd: 5, rs1: 6, rs2: 7, aq: false, rl: false },
+            Op::Amo {
+                kind: AmoKind::Add,
+                rd: 5,
+                rs1: 6,
+                rs2: 7,
+                aq: false,
+                rl: false
+            },
         );
     }
 }

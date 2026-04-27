@@ -333,7 +333,10 @@ const S_PIO0_SIDE_SET_TOGGLE: &[(u32, u32)] = &[
     // / SM state cannot leak (HLD V1 §5 preventive).
     (RESETS_RESET + ALIAS_SET, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
-    (RESETS_RESET + ALIAS_CLR, RESET_PIO0 | RESET_IO_BANK0 | RESET_PADS_BANK0),
+    (
+        RESETS_RESET + ALIAS_CLR,
+        RESET_PIO0 | RESET_IO_BANK0 | RESET_PADS_BANK0,
+    ),
     // PADS_BANK0 GPIO0: IE=1, drive=4 mA (value matches paced_bench_rp2350).
     (PADS_BANK0_GPIO0, 0x0000_0056),
     // IO_BANK0 GPIO0_CTRL: FUNCSEL=6 (PIO0).
@@ -430,10 +433,10 @@ const O_PIO0_RESET_GATING_PLACEHOLDER: &[(u32, u32)] = &[
 // originally logged against mdrp2040 — same pattern in mdrp2350).
 const S_PLL_SYS_LOCK_TIMING: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_PLL_SYS),
-    (PLL_SYS_BASE + PLL_CS_OFF, 1),        // REFDIV=1
+    (PLL_SYS_BASE + PLL_CS_OFF, 1), // REFDIV=1
     (PLL_SYS_BASE + PLL_FBDIV_INT_OFF, 100),
     (PLL_SYS_BASE + PLL_PRIM_OFF, (2u32 << 16) | (2u32 << 12)),
-    (PLL_SYS_BASE + PLL_PWR_OFF, 0),       // all powered up
+    (PLL_SYS_BASE + PLL_PWR_OFF, 0), // all powered up
 ];
 const O_PLL_SYS_LOCK_TIMING: &[(u32, u32)] = &[
     // CS.LOCK bit only — the narrower the mask, the clearer the failure.
@@ -457,10 +460,10 @@ const O_PLL_SYS_LOCK_TIMING: &[(u32, u32)] = &[
 // semantics" (CYCCNT counts core ticks regardless of PLL state).
 const S_CLOCK_PLL_SYS_REPROGRAM_MID_RUN: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_PLL_SYS),
-    (PLL_SYS_BASE + PLL_CS_OFF, 1),        // REFDIV=1
+    (PLL_SYS_BASE + PLL_CS_OFF, 1),          // REFDIV=1
     (PLL_SYS_BASE + PLL_FBDIV_INT_OFF, 125), // initial FBDIV
     (PLL_SYS_BASE + PLL_PRIM_OFF, (2u32 << 16) | (2u32 << 12)), // POSTDIV1=2, POSTDIV2=2
-    (PLL_SYS_BASE + PLL_PWR_OFF, 0),       // all powered up
+    (PLL_SYS_BASE + PLL_PWR_OFF, 0),         // all powered up
 ];
 const O_CLOCK_PLL_SYS_REPROGRAM_MID_RUN: &[(u32, u32)] = &[
     // CS.LOCK (bit 31) — by the end of the post-reprogram window LOCK
@@ -541,7 +544,10 @@ const S_CLOCK_DIV_CHANGE_PIO_RUNNING: &[(u32, u32)] = &[
     // state cannot leak (HLD V1 §5 preventive).
     (RESETS_RESET + ALIAS_SET, RESET_PIO0),
     (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
-    (RESETS_RESET + ALIAS_CLR, RESET_PIO0 | RESET_IO_BANK0 | RESET_PADS_BANK0),
+    (
+        RESETS_RESET + ALIAS_CLR,
+        RESET_PIO0 | RESET_IO_BANK0 | RESET_PADS_BANK0,
+    ),
     (pio_instr_mem_addr(PIO0_BASE, 0), 0xE03F), // SET X, 31
     (pio_instr_mem_addr(PIO0_BASE, 1), 0x0041), // JMP X-- 1
     (pio_instr_mem_addr(PIO0_BASE, 2), 0x0002), // JMP 2 (stall)
@@ -813,10 +819,7 @@ pub const RESET_TIMER1_BIT: u32 = 1 << 24;
 pub const TICKS_TIMER1_CTRL: u32 = TICKS_BASE + 0x24;
 
 // S_SIO_DIV_UNSIGNED: Write 100 / 7 unsigned, observe quotient/remainder/CSR.
-const S_SIO_DIVIDER_UNSIGNED: &[(u32, u32)] = &[
-    (SIO_DIV_UDIVIDEND, 100),
-    (SIO_DIV_UDIVISOR, 7),
-];
+const S_SIO_DIVIDER_UNSIGNED: &[(u32, u32)] = &[(SIO_DIV_UDIVIDEND, 100), (SIO_DIV_UDIVISOR, 7)];
 const O_SIO_DIVIDER_UNSIGNED: &[(u32, u32)] = &[
     (SIO_DIV_QUOTIENT, 0xFFFF_FFFF),
     (SIO_DIV_REMAINDER, 0xFFFF_FFFF),
@@ -937,11 +940,8 @@ const S_TIMER1_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESET_TIMER1_BIT),
     (TICKS_TIMER1_CTRL, TICKS_CTRL_ENABLE),
 ];
-const O_TIMER1_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] = &[
-    (TIMER1_INTR, 0x1),
-    (TIMER1_INTE, 0x1),
-    (TIMER1_ARMED, 0x1),
-];
+const O_TIMER1_ALARM0_FIRE_AND_CLEAR: &[(u32, u32)] =
+    &[(TIMER1_INTR, 0x1), (TIMER1_INTE, 0x1), (TIMER1_ARMED, 0x1)];
 
 // ---------------------------------------------------------------------------
 // Phase 2 scenarios — UART0, SPI0, I2C0, ADC, PWM
@@ -1034,9 +1034,7 @@ const S_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
     (UART0_UARTCR, UARTCR_UARTEN | UARTCR_TXE),
     (UART0_UARTDR, 0x5A),
 ];
-const O_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[
-    (UART0_UARTFR, UARTFR_TXFE_BIT),
-];
+const O_UART0_TX_SINGLE_BYTE: &[(u32, u32)] = &[(UART0_UARTFR, UARTFR_TXFE_BIT)];
 
 /// UART0 RX loopback — enable FIFO + UARTEN + TXE + RXE + LBE,
 /// program baud (IBRD=81, FBRD=24 = 115200 @ 150 MHz clk_peri), push
@@ -1075,7 +1073,10 @@ const S_UART0_RX_LOOPBACK: &[(u32, u32)] = &[
     (UART0_UARTIBRD, 81),
     (UART0_UARTFBRD, 24),
     (UART0_UARTLCR_H, UARTLCR_H_FEN | UARTLCR_H_WLEN_8),
-    (UART0_UARTCR, UARTCR_UARTEN | UARTCR_LBE | UARTCR_TXE | UARTCR_RXE),
+    (
+        UART0_UARTCR,
+        UARTCR_UARTEN | UARTCR_LBE | UARTCR_TXE | UARTCR_RXE,
+    ),
     (UART0_UARTDR, 0x42),
 ];
 const O_UART0_RX_LOOPBACK: &[(u32, u32)] = &[
@@ -1091,8 +1092,8 @@ const O_UART0_RX_LOOPBACK: &[(u32, u32)] = &[
 /// readback matches.
 const S_SPI0_LOOPBACK_SINGLE_BYTE: &[(u32, u32)] = &[
     (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
-    (SPI0_SSPCR0, 7),                        // DSS=7 (8-bit)
-    (SPI0_SSPCR1, SSPCR1_SSE | SSPCR1_LBM),  // enable + loopback
+    (SPI0_SSPCR0, 7),                       // DSS=7 (8-bit)
+    (SPI0_SSPCR1, SSPCR1_SSE | SSPCR1_LBM), // enable + loopback
     (SPI0_SSPDR, 0xA5),
 ];
 const O_SPI0_LOOPBACK_SINGLE_BYTE: &[(u32, u32)] = &[
@@ -1115,9 +1116,7 @@ const S_I2C0_BUS_SCAN_NACK: &[(u32, u32)] = &[
     (I2C0_IC_ENABLE, 1),
     (I2C0_IC_DATA_CMD, IC_DATA_CMD_READ_BIT | IC_DATA_CMD_STOP),
 ];
-const O_I2C0_BUS_SCAN_NACK: &[(u32, u32)] = &[
-    (I2C0_IC_TX_ABRT_SOURCE, 0x1),
-];
+const O_I2C0_BUS_SCAN_NACK: &[(u32, u32)] = &[(I2C0_IC_TX_ABRT_SOURCE, 0x1)];
 
 /// ADC one-shot — enable, start once, advance enough sys_clks for a
 /// conversion to complete. Observe CS.READY set and CS.START_ONCE
@@ -1167,9 +1166,7 @@ const S_PWM_WRAP_IRQ: &[(u32, u32)] = &[
     (PWM_SLICE0_CSR, PWM_CSR_EN_BIT),
     (PWM_EN_OFFSET, 1),
 ];
-const O_PWM_WRAP_IRQ: &[(u32, u32)] = &[
-    (PWM_INTR_OFFSET, 0x1),
-];
+const O_PWM_WRAP_IRQ: &[(u32, u32)] = &[(PWM_INTR_OFFSET, 0x1)];
 
 /// Phase 3.2 — PWM fractional divider: slice 0, TOP=0xFFFF, DIV=0x0020
 /// (integer 2, frac 0 = divisor 2.0), EN=1. After 200 sys_clks the
@@ -1182,7 +1179,7 @@ const S_PWM_FRACTIONAL_DIV: &[(u32, u32)] = &[
     (PWM_EN_OFFSET, 1),
 ];
 const O_PWM_FRACTIONAL_DIV: &[(u32, u32)] = &[
-    (PWM_SLICE0_CTR, 100), // 200 sysclks / divisor 2.0 = 100
+    (PWM_SLICE0_CTR, 100),  // 200 sysclks / divisor 2.0 = 100
     (PWM_INTR_OFFSET, 0x0), // no wrap at TOP=0xFFFF
 ];
 
@@ -1778,9 +1775,7 @@ const PREFIX_UART0_HARD_RESET: &[(u32, u32)] = &[
 // reports as 1 diverges. We mask bit 0 of IMR as a conservative
 // witness bit; the TRNG reset value has that bit set per the silicon
 // datasheet wake path.
-const S_RED_TRNG_IMR_UNMODELLED: &[(u32, u32)] = &[
-    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
-];
+const S_RED_TRNG_IMR_UNMODELLED: &[(u32, u32)] = &[(RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL)];
 const O_RED_TRNG_IMR_UNMODELLED: &[(u32, u32)] = &[
     // Bit 0 of IMR is RND_NUM_VLD mask — asserted at reset on silicon.
     (TRNG_IMR, 0x0000_0001),
@@ -1791,12 +1786,8 @@ const O_RED_TRNG_IMR_UNMODELLED: &[(u32, u32)] = &[
 // hash accelerator reports the write-FIFO ready to accept words at
 // reset (FIFO is empty). EMU's HashMap stub returns 0. Divergence on
 // bit 2 → FAIL.
-const S_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[
-    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
-];
-const O_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[
-    (SHA256_CSR, SHA256_CSR_WFIFO_READY),
-];
+const S_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[(RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL)];
+const O_RED_SHA256_CSR_UNMODELLED: &[(u32, u32)] = &[(SHA256_CSR, SHA256_CSR_WFIFO_READY)];
 
 // ---------------------------------------------------------------------------
 // DMA scenarios — Phase 3 (HLD V5 §5.6)
@@ -1830,9 +1821,7 @@ pub const DMA_INTR: u32 = DMA_BASE + 0x400;
 //   bits [16:13]: CHAIN_TO = 0 (ch0 = self = no chain, per RP2350 datasheet §12.6.3.2)
 //   bits [22:17]: TREQ_SEL = 63 (0x3F, PERMANENT/FORCE)
 //   → 0x007E_0059
-const S_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
-    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
-];
+const S_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[(RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT)];
 const O_DMA_MEM_TO_MEM_32BIT: &[(u32, u32)] = &[
     // All 4 destination words must match source (seeded 0xDEAD_0001..4).
     (0x2000_0300, 0xFFFF_FFFF),
@@ -1950,9 +1939,7 @@ const SLED_DMA_MEM_TO_MEM_32BIT: &[u8] =
 //   EN=1, DATA_SIZE=2, INCR_READ[4], INCR_WRITE[6], TREQ_SEL=63[22:17],
 //   CHAIN_TO=1[16:13] (ch1=self=no further chain per RP2350 §12.6.3.2).
 //   → 0x007E_2059
-const S_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
-    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
-];
+const S_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[(RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT)];
 const O_DMA_CHAIN_TRIGGER: &[(u32, u32)] = &[
     // Ch0 destination (0x2000_0600 ← 0xAAAA_0000).
     (0x2000_0600, 0xFFFF_FFFF),
@@ -2090,8 +2077,7 @@ const SLED_DMA_CHAIN_TRIGGER_HW: [u16; 64] = [
     0xD1FC, //  [62] bne  [60]              ; imm8=-4 → loop while ch1 busy
     0xBE00, //  [63] bkpt #0
 ];
-const SLED_DMA_CHAIN_TRIGGER: &[u8] =
-    &halfwords_to_le_bytes::<64, 128>(SLED_DMA_CHAIN_TRIGGER_HW);
+const SLED_DMA_CHAIN_TRIGGER: &[u8] = &halfwords_to_le_bytes::<64, 128>(SLED_DMA_CHAIN_TRIGGER_HW);
 
 // S_DMA3: DMA timer-paced transfer — TREQ_SEL=59 (TIMER0), rate 1/10.
 //
@@ -2122,9 +2108,7 @@ const SLED_DMA_CHAIN_TRIGGER: &[u8] =
 /// which masked the Residual C.2.1 bug on the emulator before the 2026-04-17
 /// register-offset fix.
 pub const DMA_TIMER0: u32 = DMA_BASE + 0x440;
-const S_DMA_TIMER_PACED: &[(u32, u32)] = &[
-    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
-];
+const S_DMA_TIMER_PACED: &[(u32, u32)] = &[(RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT)];
 const O_DMA_TIMER_PACED: &[(u32, u32)] = &[
     // All 4 destination words must match source (seeded 0xCAFE_0001..4).
     (0x2000_0B00, 0xFFFF_FFFF),
@@ -2236,8 +2220,7 @@ const SLED_DMA_TIMER_PACED_HW: [u16; 49] = [
     0xD1FC, //  [47] bne  [45]              ; imm8=-4 → loop while BUSY
     0xBE00, //  [48] bkpt #0
 ];
-const SLED_DMA_TIMER_PACED: &[u8] =
-    &halfwords_to_le_bytes::<49, 98>(SLED_DMA_TIMER_PACED_HW);
+const SLED_DMA_TIMER_PACED: &[u8] = &halfwords_to_le_bytes::<49, 98>(SLED_DMA_TIMER_PACED_HW);
 
 /// Red-path catalogue. Selected by `silicon_periph_diff_rp2350
 /// --red-path` (mutually exclusive with the default catalogue).
@@ -2266,9 +2249,7 @@ pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
 // Library-API entry point (`run_against`)
 // ---------------------------------------------------------------------------
 
-use crate::silicon_oracle::{
-    self, enable_cyccnt, read_cyccnt, reset_cyccnt, CaseOutcome, Verdict,
-};
+use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, read_cyccnt, reset_cyccnt};
 use crate::{EMU_TEST_STACK, SILICON_RUN_SLED};
 use mdrp2350::{Config, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
@@ -2466,10 +2447,7 @@ fn run_sled_hw(core: &mut Core) -> Result<u32, Box<dyn std::error::Error>> {
             let pc: u32 = core.read_core_reg(PC_REG).unwrap_or(0xDEAD_BEEF);
             let sp: u32 = core.read_core_reg(SP_REG).unwrap_or(0xDEAD_BEEF);
             let lr: u32 = core.read_core_reg(LR_REG).unwrap_or(0xDEAD_BEEF);
-            return Err(format!(
-                "BKPT timeout: PC=0x{pc:08X} SP=0x{sp:08X} LR=0x{lr:08X}"
-            )
-            .into());
+            return Err(format!("BKPT timeout: PC=0x{pc:08X} SP=0x{sp:08X} LR=0x{lr:08X}").into());
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -2521,9 +2499,9 @@ pub fn run_scenario(
     // below so a malformed sled fails before any bus state is touched.
     let owned_sled: Vec<u8>;
     let sled_bytes: &[u8] = match sc.custom_sled {
-        Some(bytes) => validate_custom_sled(bytes).map_err(|e| {
-            format!("scenario '{}': {e}", sc.name)
-        })?,
+        Some(bytes) => {
+            validate_custom_sled(bytes).map_err(|e| format!("scenario '{}': {e}", sc.name))?
+        }
         None => {
             owned_sled = assemble_sled(sc.max_sysclks);
             &owned_sled
@@ -2544,7 +2522,10 @@ pub fn run_scenario(
         None
     };
 
-    let mut emu = EmulatorBuilder::new(Config::default()).step_quantum(1).build().unwrap();
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .unwrap();
     // Core 1 stays halted throughout; scenarios are single-core only.
     emu.core_mut(1).halt();
     for &(addr, val) in sc.setup {
@@ -2567,8 +2548,8 @@ pub fn run_scenario(
         // drift from HW in a way no current observable notices but
         // future scenarios might. Stopping at BKPT keeps xPSR in the
         // same shape on both sides.
-        let vetted: &[u8] = validate_custom_sled(bytes)
-            .map_err(|e| format!("scenario '{}': {e}", sc.name))?;
+        let vetted: &[u8] =
+            validate_custom_sled(bytes).map_err(|e| format!("scenario '{}': {e}", sc.name))?;
         emu.load_image(SILICON_RUN_SLED, vetted);
         // NOTE: depends on fresh EmulatorBuilder per scenario for default-zero
         // PRIMASK/CONTROL/FAULTMASK; reusing a long-lived emulator would
@@ -2577,17 +2558,15 @@ pub fn run_scenario(
         {
             let c = emu.core_mut(0);
             c.wake();
-            c.set_reg(13, EMU_TEST_STACK);  // SP
-            c.set_reg(14, 0xFFFF_FFFF);     // LR
+            c.set_reg(13, EMU_TEST_STACK); // SP
+            c.set_reg(14, 0xFFFF_FFFF); // LR
             c.regs.set_pc(SILICON_RUN_SLED);
-            c.regs.xpsr = 0x0100_0000;      // T=1 (Thumb)
+            c.regs.xpsr = 0x0100_0000; // T=1 (Thumb)
         }
         let bkpt_pc = SILICON_RUN_SLED + (vetted.len() as u32) - 2;
         let start = emu.cycles();
         let budget = actual_sysclks as u64;
-        while emu.core(0).regs.pc() != bkpt_pc
-            && emu.cycles().saturating_sub(start) < budget
-        {
+        while emu.core(0).regs.pc() != bkpt_pc && emu.cycles().saturating_sub(start) < budget {
             emu.step().expect("Serial step is infallible");
         }
         let overshot = emu.core(0).regs.pc() != bkpt_pc;
@@ -2608,7 +2587,8 @@ pub fn run_scenario(
         // state after N cycles" — the sled's job on HW is just to burn
         // N cycles, not to mutate MMIO.
         emu.core_mut(0).halt();
-        emu.run(actual_sysclks as u64).expect("Serial run is infallible");
+        emu.run(actual_sysclks as u64)
+            .expect("Serial run is infallible");
     }
     gate_peripheral_emu(&mut emu, sc.name);
 
@@ -2621,8 +2601,11 @@ pub fn run_scenario(
         );
     }
 
-    let emu_obs: Vec<u32> =
-        sc.observe.iter().map(|(addr, _m)| emu.mmio_read32(*addr)).collect();
+    let emu_obs: Vec<u32> = sc
+        .observe
+        .iter()
+        .map(|(addr, _m)| emu.mmio_read32(*addr))
+        .collect();
     let emu_pins = if sc.observe_pins != 0 {
         Some(sample_pins_emu(&mut emu, sc.observe_pins))
     } else {
@@ -2636,7 +2619,11 @@ pub fn run_scenario(
         if h != e {
             let msg = format!(
                 "MMIO 0x{:08X} mask=0x{:08X}: HW=0x{:08X} EMU=0x{:08X} (xor=0x{:08X})",
-                addr, mask, h, e, h ^ e,
+                addr,
+                mask,
+                h,
+                e,
+                h ^ e,
             );
             if first_div.is_none() {
                 first_div = Some(msg.clone());
@@ -2645,7 +2632,10 @@ pub fn run_scenario(
                 println!("    DIFF {msg}");
             }
         } else if verbose {
-            println!("    ok   MMIO 0x{:08X} mask=0x{:08X}: 0x{:08X}", addr, mask, h);
+            println!(
+                "    ok   MMIO 0x{:08X} mask=0x{:08X}: 0x{:08X}",
+                addr, mask, h
+            );
         }
     }
     if let (Some(h), Some(e)) = (hw_pins, emu_pins) {
@@ -2669,7 +2659,11 @@ pub fn run_scenario(
         }
     }
 
-    let verdict = if first_div.is_none() { Verdict::Pass } else { Verdict::Fail };
+    let verdict = if first_div.is_none() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    };
     Ok(PeriphScenarioResult {
         name: sc.name,
         verdict,
@@ -2872,7 +2866,11 @@ mod tests {
     /// Catalog must ship the five v1 scenarios the HLD enumerates.
     #[test]
     fn test_scenarios_catalog_nonempty() {
-        assert!(SCENARIOS.len() >= 5, "at least 5 scenarios, got {}", SCENARIOS.len());
+        assert!(
+            SCENARIOS.len() >= 5,
+            "at least 5 scenarios, got {}",
+            SCENARIOS.len()
+        );
     }
 
     /// Every setup / observe address must target MMIO — catches a
@@ -2931,8 +2929,7 @@ mod tests {
                     let txf_hi = base + 0x20;
                     let rxf_lo = base + 0x20;
                     let rxf_hi = base + 0x30;
-                    if (txf_lo..txf_hi).contains(&addr) || (rxf_lo..rxf_hi).contains(&addr)
-                    {
+                    if (txf_lo..txf_hi).contains(&addr) || (rxf_lo..rxf_hi).contains(&addr) {
                         eprintln!(
                             "scenario '{}' observes FIFO 0x{:08X} (pops on read)",
                             sc.name, addr,
@@ -2956,7 +2953,10 @@ mod tests {
         // Ends in 0xBF00 (nop), not 0xBE00 (bkpt).
         let bad: &[u8] = &[0x00, 0xBF, 0x00, 0xBF];
         let err = validate_custom_sled(bad).expect_err("sled without BKPT should be rejected");
-        assert!(err.contains("bkpt"), "error should mention bkpt, got: {err}");
+        assert!(
+            err.contains("bkpt"),
+            "error should mention bkpt, got: {err}"
+        );
     }
 
     /// Odd-length byte stream can't be a Thumb halfword sequence — reject.
@@ -2974,7 +2974,10 @@ mod tests {
     #[test]
     fn test_validate_custom_sled_rejects_empty() {
         let err = validate_custom_sled(&[]).expect_err("empty sled should be rejected");
-        assert!(err.contains("empty"), "error should mention empty, got: {err}");
+        assert!(
+            err.contains("empty"),
+            "error should mention empty, got: {err}"
+        );
     }
 
     /// Happy path: a minimal valid sled is just one halfword of BKPT #0.
@@ -3034,8 +3037,13 @@ mod tests {
     /// catalogue shuffle can randomise them alongside everything else.
     #[test]
     fn test_clock_pll_sys_reprogram_mid_run_present() {
-        let sc = SCENARIOS.iter().find(|s| s.name == "clock_pll_sys_reprogram_mid_run");
-        assert!(sc.is_some(), "scenario 'clock_pll_sys_reprogram_mid_run' missing");
+        let sc = SCENARIOS
+            .iter()
+            .find(|s| s.name == "clock_pll_sys_reprogram_mid_run");
+        assert!(
+            sc.is_some(),
+            "scenario 'clock_pll_sys_reprogram_mid_run' missing"
+        );
         let sc = sc.unwrap();
         assert!(
             sc.custom_sled.is_some(),
@@ -3045,8 +3053,13 @@ mod tests {
 
     #[test]
     fn test_clock_div_change_pio_running_present() {
-        let sc = SCENARIOS.iter().find(|s| s.name == "clock_div_change_pio_running");
-        assert!(sc.is_some(), "scenario 'clock_div_change_pio_running' missing");
+        let sc = SCENARIOS
+            .iter()
+            .find(|s| s.name == "clock_div_change_pio_running");
+        assert!(
+            sc.is_some(),
+            "scenario 'clock_div_change_pio_running' missing"
+        );
         let sc = sc.unwrap();
         assert!(
             sc.custom_sled.is_some(),
@@ -3189,10 +3202,9 @@ mod tests {
     /// `ChipNotFound` is configuration-level — not worth retrying.
     #[test]
     fn test_is_transient_probe_error_rejects_chip_not_found() {
-        let e: Box<dyn std::error::Error + 'static> =
-            Box::new(probe_rs::Error::ChipNotFound(
-                probe_rs::config::RegistryError::ChipNotFound("rp2350".into()),
-            ));
+        let e: Box<dyn std::error::Error + 'static> = Box::new(probe_rs::Error::ChipNotFound(
+            probe_rs::config::RegistryError::ChipNotFound("rp2350".into()),
+        ));
         assert!(
             !is_transient_probe_error(e.as_ref()),
             "probe_rs::Error::ChipNotFound must NOT be classified as transient",
@@ -3309,7 +3321,9 @@ mod tests {
             assert!(
                 sc.min_sysclks <= sc.max_sysclks,
                 "'{}' min_sysclks {} > max_sysclks {}",
-                sc.name, sc.min_sysclks, sc.max_sysclks,
+                sc.name,
+                sc.min_sysclks,
+                sc.max_sysclks,
             );
         }
     }
@@ -3333,7 +3347,8 @@ mod tests {
         assert!(
             sc.min_sysclks > 0 && actual_sysclks < sc.min_sysclks,
             "expected warning condition to trigger for actual={} < min={}",
-            actual_sysclks, sc.min_sysclks,
+            actual_sysclks,
+            sc.min_sysclks,
         );
     }
 
@@ -3369,7 +3384,8 @@ mod tests {
         use mdrp2350::{Config, EmulatorBuilder};
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         // Apply the RESETS CLR so DMA is out of reset (mirrors setup table).
         emu.mmio_write32(RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT);
         // Load and run the sled.
@@ -3384,9 +3400,7 @@ mod tests {
         }
         let bkpt_pc = SILICON_RUN_SLED + (sled.len() as u32) - 2;
         let start = emu.cycles();
-        while emu.core(0).regs.pc() != bkpt_pc
-            && emu.cycles().saturating_sub(start) < budget
-        {
+        while emu.core(0).regs.pc() != bkpt_pc && emu.cycles().saturating_sub(start) < budget {
             emu.step().expect("Serial step is infallible");
         }
         assert_eq!(
@@ -3429,12 +3443,28 @@ mod tests {
         // RP2040 layout, RING_SEL would have been at bit 10 and CHAIN_TO at [14:11].
         let ch0_ctrl = emu.mmio_read32(DMA_BASE + 0x0C);
         let ch1_ctrl = emu.mmio_read32(DMA_BASE + 0x50);
-        assert_eq!(ch0_ctrl & (1 << 12), 0, "ch0 must not have RING_SEL (bit 12) set");
-        assert_eq!(ch1_ctrl & (1 << 12), 0, "ch1 must not have RING_SEL (bit 12) set");
+        assert_eq!(
+            ch0_ctrl & (1 << 12),
+            0,
+            "ch0 must not have RING_SEL (bit 12) set"
+        );
+        assert_eq!(
+            ch1_ctrl & (1 << 12),
+            0,
+            "ch1 must not have RING_SEL (bit 12) set"
+        );
         // Also verify TREQ_SEL field is correctly at bits[22:17] (RP2350) not [20:15] (RP2040).
         // For TREQ_SEL=63: bits[22:17] of 0x007E_2059 = (0x007E_2059 >> 17) & 0x3F = 63.
-        assert_eq!((ch0_ctrl >> 17) & 0x3F, 63, "ch0 TREQ_SEL must be 63 (FORCE) at bits[22:17]");
-        assert_eq!((ch1_ctrl >> 17) & 0x3F, 63, "ch1 TREQ_SEL must be 63 (FORCE) at bits[22:17]");
+        assert_eq!(
+            (ch0_ctrl >> 17) & 0x3F,
+            63,
+            "ch0 TREQ_SEL must be 63 (FORCE) at bits[22:17]"
+        );
+        assert_eq!(
+            (ch1_ctrl >> 17) & 0x3F,
+            63,
+            "ch1 TREQ_SEL must be 63 (FORCE) at bits[22:17]"
+        );
     }
 
     #[test]
@@ -3482,13 +3512,15 @@ mod tests {
         for sc in RED_PATH_SCENARIOS {
             let mut emu = EmulatorBuilder::new(Config::default())
                 .step_quantum(1)
-                .build().unwrap();
+                .build()
+                .unwrap();
             emu.core_mut(0).halt();
             emu.core_mut(1).halt();
             for &(addr, val) in sc.setup {
                 emu.mmio_write32(addr, val);
             }
-            emu.run(sc.max_sysclks as u64).expect("Serial run is infallible");
+            emu.run(sc.max_sysclks as u64)
+                .expect("Serial run is infallible");
             for &(addr, mask) in sc.observe {
                 let got = emu.mmio_read32(addr) & mask;
                 assert_eq!(

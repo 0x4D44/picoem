@@ -58,7 +58,7 @@ const PIO_FSTAT: u32 = 0x004;
 
 // FSTAT bit positions. Each is an LSB index: add the SM index (0..3) to
 // get the actual bit number. See RP2350 datasheet §12.6.4.6.
-const FSTAT_TXFULL_SM0:  u32 = 16;
+const FSTAT_TXFULL_SM0: u32 = 16;
 const FSTAT_RXEMPTY_SM0: u32 = 8;
 /// Only used by unit tests that observe the TX FIFO non-empty flag.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -275,7 +275,11 @@ impl GlueDma {
                 // firmware yet, we still land the write in peripheral_regs
                 // (the poll_triggers tick after CH1's own CTRL_TRIG write
                 // will then latch it cleanly).
-                bus.write32(DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR, self.ch0_pending_addr, 0);
+                bus.write32(
+                    DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR,
+                    self.ch0_pending_addr,
+                    0,
+                );
             }
             return;
         }
@@ -392,7 +396,7 @@ fn decode_pio_tx_addr(addr: u32) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mdrp2350::{Config, EmulatorBuilder, Emulator};
+    use mdrp2350::{Config, Emulator, EmulatorBuilder};
 
     // ----- RP2350 V6 CTRL field positions (mirrors mdrp2350::dma). -----
     // Pinned here so a future mdrp2350 DMA refactor that shifts fields
@@ -413,10 +417,16 @@ mod tests {
     /// the test fails if dma.rs shifts fields again.
     fn v6_ctrl(en: bool, data_size: u32, incr_r: bool, incr_w: bool, treq: u8, chain: u32) -> u32 {
         let mut v = 0u32;
-        if en { v |= V6_EN; }
+        if en {
+            v |= V6_EN;
+        }
         v |= (data_size & 0x3) << V6_DATA_SIZE_SHIFT;
-        if incr_r { v |= V6_INCR_READ; }
-        if incr_w { v |= V6_INCR_WRITE; }
+        if incr_r {
+            v |= V6_INCR_READ;
+        }
+        if incr_w {
+            v |= V6_INCR_WRITE;
+        }
         v |= (treq as u32 & 0x3F) << V6_TREQ_SEL_SHIFT;
         v |= (chain & 0xF) << V6_CHAIN_TO_SHIFT;
         v
@@ -440,7 +450,9 @@ mod tests {
     }
 
     fn new_emu() -> Emulator {
-        EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible")
+        EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build is infallible")
     }
 
     /// Channel latches its three regs + ctrl on a non-zero CTRL_TRIG write.
@@ -502,7 +514,11 @@ mod tests {
         // future peripheral masking. (Today the emulator doesn't gate
         // PIO writes on RESETS, but it's the shape the firmware does —
         // keeps the test robust against future changes.)
-        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
+        emu.bus.write32(
+            0x4002_0000 | (3 << 12),
+            (1 << 15) | (1 << 16) | (1 << 17),
+            0,
+        );
 
         dma.prime_after_sync(&mut emu.bus);
 
@@ -591,7 +607,11 @@ mod tests {
         emu.bus.write8(0x2000_0200, 0x5A, 0);
 
         // Bring PIO1 + PIO2 out of reset.
-        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
+        emu.bus.write32(
+            0x4002_0000 | (3 << 12),
+            (1 << 15) | (1 << 16) | (1 << 17),
+            0,
+        );
 
         // Push the target address into PIO1 SM0 RX FIFO via the test hook.
         emu.bus.pio[1].push_rx(0, 0x2000_0200);
@@ -612,7 +632,7 @@ mod tests {
         program_channel(
             &mut emu.bus,
             0,
-            PIO_BASES[1] + 0x024, // RXF1 (source)
+            PIO_BASES[1] + 0x024,                        // RXF1 (source)
             DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR, // CH1.READ_ADDR (sink)
             1,
             0x0000_0001,
@@ -649,7 +669,11 @@ mod tests {
         // PIO2 SM0 TX FIFO must now report non-empty.
         let fstat = emu.bus.read32(PIO_BASES[2] + PIO_FSTAT, 0);
         let tx_empty = (fstat >> (FSTAT_TXEMPTY_SM0 + 0)) & 1 != 0;
-        assert!(!tx_empty, "PIO2 SM0 TX empty after chain push; FSTAT=0x{:08X}", fstat);
+        assert!(
+            !tx_empty,
+            "PIO2 SM0 TX empty after chain push; FSTAT=0x{:08X}",
+            fstat
+        );
     }
 
     /// The channel's configured `write_addr` must be respected — prior
@@ -670,7 +694,11 @@ mod tests {
         emu.bus.write8(0x2000_0100, 0xA5, 0);
 
         // Bring PIO2 out of reset.
-        emu.bus.write32(0x4002_0000 | (3 << 12), (1 << 15) | (1 << 16) | (1 << 17), 0);
+        emu.bus.write32(
+            0x4002_0000 | (3 << 12),
+            (1 << 15) | (1 << 16) | (1 << 17),
+            0,
+        );
 
         dma.prime_after_sync(&mut emu.bus);
 
@@ -733,7 +761,8 @@ mod tests {
     fn glue_dma_suppresses_real_dma_with_v6_treq_sel_force() {
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let mut dma = GlueDma::new();
         release_dma(&mut emu.bus);
 
@@ -777,7 +806,8 @@ mod tests {
         let waddr = emu.bus.read32(DMA_BASE + 0x04, 0);
         let ctrl_rb = emu.bus.read32(DMA_BASE + 0x0C, 0);
         assert_eq!(
-            tcount, COUNT,
+            tcount,
+            COUNT,
             "real DMA consumed {} transfers across 32 ticks; pump failed \
              to suppress it",
             COUNT.saturating_sub(tcount)

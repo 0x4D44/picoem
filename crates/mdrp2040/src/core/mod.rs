@@ -12,13 +12,13 @@
 //! no CBZ/CBNZ, no security state, no FP, no MPU, no wide-path handling
 //! from inside Thumb-16.
 
-pub mod registers;
+pub mod bus_trait;
 pub(crate) mod decode;
+pub(crate) mod exceptions;
 mod execute;
 mod execute_wide;
-pub(crate) mod exceptions;
 pub mod nvic;
-pub mod bus_trait;
+pub mod registers;
 
 use tracing::info;
 

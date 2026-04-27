@@ -29,7 +29,7 @@ use std::sync::atomic::Ordering;
 
 use mdrp2350::{Bus, Emulator};
 
-use crate::onerom_glue_dma::{GlueDma, DMA_READ_CYCLES, DMA_WRITE_CYCLES};
+use crate::onerom_glue_dma::{DMA_READ_CYCLES, DMA_WRITE_CYCLES, GlueDma};
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -149,8 +149,7 @@ const PER_CASE_TIMEOUT: u32 = 60;
 /// propagation-lag false-positive class. See Phase D.2b in
 /// `wrk_journals/2026.04.17 - JRN - OneROM Serving Oracle Fix Wave.md`
 /// for the A7 (case 9) live-sweep trace that motivated this gate.
-const MIN_FRESH_ARRIVAL_CYCLE: u64 =
-    (DMA_READ_CYCLES as u64) + (DMA_WRITE_CYCLES as u64);
+const MIN_FRESH_ARRIVAL_CYCLE: u64 = (DMA_READ_CYCLES as u64) + (DMA_WRITE_CYCLES as u64);
 
 /// Data bus base — D0..D7 on GPIO 16..23. Mirrors Stage F.
 const GPIO_DATA_BASE: u8 = 16;
@@ -379,12 +378,7 @@ impl ServingOracle {
     ///   the per-tick loop builds up an `Observation` vector for at
     ///   most `PER_CASE_TIMEOUT` cycles. At the end (or on early stable-
     ///   byte detection), the trace is fed to [`evaluate_case_trace`].
-    pub fn run_case(
-        &mut self,
-        emu: &mut Emulator,
-        glue: &mut GlueDma,
-        case: Case,
-    ) -> &CaseResult {
+    pub fn run_case(&mut self, emu: &mut Emulator, glue: &mut GlueDma, case: Case) -> &CaseResult {
         debug_assert!(
             case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
             "run_case: case.addr_bits must have A11=A12=1"
@@ -401,7 +395,9 @@ impl ServingOracle {
         // 1. init seed (first call only).
         if !self.seed_done {
             let seed_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-            emu.bus.gpio_external_in.store(seed_level, Ordering::Relaxed);
+            emu.bus
+                .gpio_external_in
+                .store(seed_level, Ordering::Relaxed);
             self.tick_cycles(emu, glue, SEED_CYCLES);
             self.seed_done = true;
         }
@@ -425,7 +421,9 @@ impl ServingOracle {
         // 3. cs_assert: apply the case stimulus.
         let stim_level = stimulus_level(case.addr_bits);
         let expected_pin_bits: u16 = (stim_level & 0xFFFF) as u16;
-        emu.bus.gpio_external_in.store(stim_level, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in
+            .store(stim_level, Ordering::Relaxed);
 
         // Snapshot the push counter *before* stimulus-time ticks.
         // The observation loop records ch1_pushes as a delta relative
@@ -469,12 +467,9 @@ impl ServingOracle {
             // Early-exit if the verdict for the trace so far is already
             // conclusive — no need to tick out the full 60-cycle budget
             // once we've seen stability.
-            if let Some(result) = try_evaluate_conclusive(
-                case,
-                &self.rom_shadow,
-                expected_pin_bits,
-                &trace,
-            ) {
+            if let Some(result) =
+                try_evaluate_conclusive(case, &self.rom_shadow, expected_pin_bits, &trace)
+            {
                 // Leave the bus in gap-level state for the next case.
                 emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
 
@@ -543,16 +538,9 @@ impl ServingOracle {
         let _ = writeln!(out, "OneROM Serving Oracle — Report");
         if ns_available {
             let mhz = sys_clk_hz as f64 / 1_000_000.0;
-            let _ = writeln!(
-                out,
-                "sys_clk_hz: {} Hz ({:.3} MHz)",
-                sys_clk_hz, mhz
-            );
+            let _ = writeln!(out, "sys_clk_hz: {} Hz ({:.3} MHz)", sys_clk_hz, mhz);
         } else {
-            let _ = writeln!(
-                out,
-                "sys_clk_hz: UNAVAILABLE (PLL not settled at sync)"
-            );
+            let _ = writeln!(out, "sys_clk_hz: UNAVAILABLE (PLL not settled at sync)");
         }
         let unique_shadow: std::collections::HashSet<u8> =
             self.rom_shadow.iter().copied().collect();
@@ -573,15 +561,13 @@ impl ServingOracle {
             let _ = writeln!(
                 out,
                 " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6} {:>6}  verdict",
-                "idx", "label", "addr", "resolved", "expected", "observed",
-                "cycles", "ns"
+                "idx", "label", "addr", "resolved", "expected", "observed", "cycles", "ns"
             );
         } else {
             let _ = writeln!(
                 out,
                 " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6}  verdict",
-                "idx", "label", "addr", "resolved", "expected", "observed",
-                "cycles"
+                "idx", "label", "addr", "resolved", "expected", "observed", "cycles"
             );
         }
 
@@ -615,15 +601,13 @@ impl ServingOracle {
                 let _ = writeln!(
                     out,
                     " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6} {:>6}  {}",
-                    idx, r.case.label, addr, resolved, expected, observed,
-                    cycles, ns, verdict
+                    idx, r.case.label, addr, resolved, expected, observed, cycles, ns, verdict
                 );
             } else {
                 let _ = writeln!(
                     out,
                     " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6}  {}",
-                    idx, r.case.label, addr, resolved, expected, observed,
-                    cycles, verdict
+                    idx, r.case.label, addr, resolved, expected, observed, cycles, verdict
                 );
             }
         }
@@ -694,10 +678,7 @@ impl ServingOracle {
                     "  latency stats (Pass cases only): min={} max={} mean={} cycles (ns unavailable)",
                     min, max, mean
                 );
-                let _ = writeln!(
-                    out,
-                    "  ROM speed class: unavailable (sys_clk_hz == 0)"
-                );
+                let _ = writeln!(out, "  ROM speed class: unavailable (sys_clk_hz == 0)");
             }
         }
 
@@ -716,10 +697,7 @@ impl ServingOracle {
             out,
             "  Silicon-calibrated timing is a future pass via the silicon oracle"
         );
-        let _ = writeln!(
-            out,
-            "  rig (see silicon_cycle_oracle_rp2350)."
-        );
+        let _ = writeln!(out, "  rig (see silicon_cycle_oracle_rp2350).");
 
         out
     }
@@ -818,11 +796,7 @@ pub(crate) fn lift_shadow_from_flash(
     // slice length. Ptrs < FLASH_BASE or past end of flash return None.
     let ptr_to_off = |ptr: u32| -> Option<usize> {
         let off = (ptr.checked_sub(FLASH_BASE)?) as usize;
-        if off >= flash.len() {
-            None
-        } else {
-            Some(off)
-        }
+        if off >= flash.len() { None } else { Some(off) }
     };
     let read_u32 = |off: usize| -> Option<u32> {
         let bytes = flash.get(off..off + 4)?;
@@ -830,18 +804,15 @@ pub(crate) fn lift_shadow_from_flash(
     };
 
     // sdrr_info_t at flash+0x200 → metadata_header pointer at +44.
-    let metadata_ptr =
-        read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
+    let metadata_ptr = read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
     let metadata_off = ptr_to_off(metadata_ptr)?;
 
     // onerom_metadata_header_t: rom_set_count at +20, rom_sets ptr at +24.
-    let rom_set_count =
-        *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)?;
+    let rom_set_count = *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)?;
     if rom_set_index >= rom_set_count {
         return None;
     }
-    let rom_sets_ptr =
-        read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
+    let rom_sets_ptr = read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
     let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
 
     // sdrr_rom_set_t[rom_set_index]: data ptr at +0, size at +4.
@@ -1099,7 +1070,11 @@ pub(crate) fn evaluate_case_trace(
             latency_cycles: None,
             verdict: Verdict::NoResolve,
         },
-        EvalState::WaitStable { resolved_addr, expected, .. } => CaseResult {
+        EvalState::WaitStable {
+            resolved_addr,
+            expected,
+            ..
+        } => CaseResult {
             case,
             resolved_addr: Some(resolved_addr),
             expected_byte: Some(expected),
@@ -1236,8 +1211,7 @@ mod tests {
     fn synth_flash(rom_set_count: u8) -> Vec<u8> {
         let mut flash = vec![0u8; 0x3_0000]; // 192 KB, room for 2 sets
         // sdrr_info_t.metadata_header at flash+0x200+44 → 0x1000C000.
-        flash[0x200 + SDRR_INFO_METADATA_PTR_OFFSET
-            ..0x200 + SDRR_INFO_METADATA_PTR_OFFSET + 4]
+        flash[0x200 + SDRR_INFO_METADATA_PTR_OFFSET..0x200 + SDRR_INFO_METADATA_PTR_OFFSET + 4]
             .copy_from_slice(&(0x1000_C000u32).to_le_bytes());
         // metadata_header.rom_set_count at 0xC000 + 20.
         flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = rom_set_count;
@@ -1249,13 +1223,15 @@ mod tests {
         for i in 0..2 {
             let entry = 0xC100 + i * ROM_SET_STRIDE;
             // data ptr: set 0 → 0x10020000, set 1 → 0x10010000.
-            let data_ptr = if i == 0 { 0x1002_0000u32 } else { 0x1001_0000u32 };
-            flash[entry + ROM_SET_DATA_PTR_OFFSET
-                ..entry + ROM_SET_DATA_PTR_OFFSET + 4]
+            let data_ptr = if i == 0 {
+                0x1002_0000u32
+            } else {
+                0x1001_0000u32
+            };
+            flash[entry + ROM_SET_DATA_PTR_OFFSET..entry + ROM_SET_DATA_PTR_OFFSET + 4]
                 .copy_from_slice(&data_ptr.to_le_bytes());
             // size = SHADOW_SIZE.
-            flash[entry + ROM_SET_SIZE_OFFSET
-                ..entry + ROM_SET_SIZE_OFFSET + 4]
+            flash[entry + ROM_SET_SIZE_OFFSET..entry + ROM_SET_SIZE_OFFSET + 4]
                 .copy_from_slice(&(SHADOW_SIZE as u32).to_le_bytes());
         }
         // Per-set ROM image: walking byte keyed on set index.
@@ -1277,12 +1253,9 @@ mod tests {
         let s0 = lift_shadow_from_flash(&flash, 0).expect("set 0");
         for i in 0..SHADOW_SIZE {
             assert_eq!(
-                s0[i],
-                i as u8,
+                s0[i], i as u8,
                 "set 0 shadow[{}] = 0x{:02X}, expected 0x{:02X}",
-                i,
-                s0[i],
-                i as u8
+                i, s0[i], i as u8
             );
         }
 
@@ -1341,8 +1314,7 @@ mod tests {
     /// the journal), so 5 is a comfortable lower bound.
     #[test]
     fn walking_1s_distinctness_from_real_fixture() {
-        let flash_path =
-            "fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
+        let flash_path = "fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
         let flash = match std::fs::read(flash_path) {
             Ok(b) => b,
             Err(_) => {
@@ -1356,12 +1328,10 @@ mod tests {
             }
         };
 
-        let shadow = lift_shadow_from_flash(&flash, 1)
-            .expect("real fixture must parse");
+        let shadow = lift_shadow_from_flash(&flash, 1).expect("real fixture must parse");
 
         // Whole-shadow uniqueness — this is the false-green tripwire.
-        let unique_total: std::collections::HashSet<u8> =
-            shadow.iter().copied().collect();
+        let unique_total: std::collections::HashSet<u8> = shadow.iter().copied().collect();
         assert!(
             unique_total.len() > 1,
             "shadow is uniform ({} unique byte) — false-green tripwire would trip",
@@ -1370,8 +1340,7 @@ mod tests {
 
         // Walking-1 distinctness.
         let walks: [usize; 11] = [
-            0x001, 0x002, 0x004, 0x008, 0x010, 0x020, 0x040, 0x080,
-            0x100, 0x200, 0x400,
+            0x001, 0x002, 0x004, 0x008, 0x010, 0x020, 0x040, 0x080, 0x100, 0x200, 0x400,
         ];
         let unique_walks: std::collections::HashSet<u8> =
             walks.iter().map(|&o| shadow[o]).collect();
@@ -1384,7 +1353,6 @@ mod tests {
             walks.iter().map(|&o| shadow[o]).collect::<Vec<_>>(),
         );
     }
-
 
     /// 2. Happy-path PASS: push at cycle 5, stable 0x42 from cycle 12 for 3 cycles.
     #[test]
@@ -1445,7 +1413,10 @@ mod tests {
         let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
         assert_eq!(
             result.verdict,
-            Verdict::WrongByte { expected: 0x42, observed: 0x00 }
+            Verdict::WrongByte {
+                expected: 0x42,
+                observed: 0x00
+            }
         );
         assert_eq!(result.latency_cycles, Some(12));
     }
@@ -1768,8 +1739,7 @@ mod tests {
         // zero. Accumulate the set of "single-bit masks" seen and
         // compare against the reference 11-bit set {0x001,..,0x400}.
         let low_bits = |addr: u16| -> u16 { addr & 0x07FF };
-        let is_walking_single_bit =
-            |bits: u16| -> bool { bits != 0 && bits.count_ones() == 1 };
+        let is_walking_single_bit = |bits: u16| -> bool { bits != 0 && bits.count_ones() == 1 };
 
         let mut seen_single_bits: u16 = 0; // OR of all walking-1 masks observed
         let mut baseline_seen = false;
@@ -1864,7 +1834,9 @@ mod tests {
         let out = apply_envelope(result);
         assert_eq!(
             out.verdict,
-            Verdict::LatencyOutOfEnvelope { cycles: out_of_range }
+            Verdict::LatencyOutOfEnvelope {
+                cycles: out_of_range
+            }
         );
         // Other fields survive the rewrite.
         assert_eq!(out.latency_cycles, Some(out_of_range));
@@ -2046,8 +2018,10 @@ mod tests {
     /// conformant results, which this test verifies.
     #[test]
     fn run_case_applies_envelope_before_pushing_result() {
-        let shadow: Box<[u8; SHADOW_SIZE]> =
-            vec![0u8; SHADOW_SIZE].into_boxed_slice().try_into().unwrap();
+        let shadow: Box<[u8; SHADOW_SIZE]> = vec![0u8; SHADOW_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
         let mut oracle = ServingOracle::new_with_shadow(shadow);
 
         // A raw `Pass+5` would be rewritten by `apply_envelope` to
@@ -2097,7 +2071,9 @@ mod tests {
     use mdrp2350::{Config, EmulatorBuilder};
 
     fn mk_emu() -> Emulator {
-        EmulatorBuilder::new(Config::default()).build().expect("Serial build is infallible")
+        EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build is infallible")
     }
 
     /// The four walking-1 SDRR A0..A3 offsets must appear in SRAM with the
@@ -2141,9 +2117,6 @@ mod tests {
         oracle.populate_sram_from_shadow(&mut emu.bus);
 
         assert_eq!(emu.bus.read8(SHADOW_BASE, 0), 0xAA);
-        assert_eq!(
-            emu.bus.read8(SHADOW_BASE + SHADOW_SIZE as u32 - 1, 0),
-            0x55
-        );
+        assert_eq!(emu.bus.read8(SHADOW_BASE + SHADOW_SIZE as u32 - 1, 0), 0x55);
     }
 }

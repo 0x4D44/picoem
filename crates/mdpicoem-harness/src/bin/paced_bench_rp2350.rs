@@ -194,9 +194,15 @@ fn vfp_dp(op_hi: u16, op_lo: u16, op2_lo: u16, sd: u16, sn: u16, sm: u16) -> (u1
     (hw0, hw1)
 }
 
-fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b11, 0, sd, sn, sm) }
-fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(0, 0b10, 0, sd, sn, sm) }
-fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) { vfp_dp(1, 0b00, 0, sd, sn, sm) }
+fn enc_vadd(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b11, 0, sd, sn, sm)
+}
+fn enc_vmul(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(0, 0b10, 0, sd, sn, sm)
+}
+fn enc_vdiv(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    vfp_dp(1, 0b00, 0, sd, sn, sm)
+}
 
 fn enc_vsqrt(sd: u16, sm: u16) -> (u16, u16) {
     // VSQRT.F32: unary with opc3=0b0001, t=1 (F32).
@@ -275,10 +281,7 @@ const SIO_TOGGLE_PIN: u8 = 0;
 fn resets_deassert_pio0(emu: &mut Emulator) {
     // APB CLR alias (+0x3000): writing 1s clears the corresponding RESET
     // bits, bringing those peripherals out of reset.
-    emu.mmio_write32(
-        RESETS_BASE + RESETS_RESET_OFFSET + 0x3000,
-        RESETS_PIO0_BIT,
-    );
+    emu.mmio_write32(RESETS_BASE + RESETS_RESET_OFFSET + 0x3000, RESETS_PIO0_BIT);
 }
 
 /// Configure a GPIO pin for output on `funcsel`: program the IO_BANK0
@@ -429,10 +432,10 @@ fn setup_basic_core0(emu: &mut Emulator) {
 ///   0xA: NOP                (0xBF00) — alignment halfword
 ///   0xC: .word SIO_GPIO_OUT_XOR
 fn setup_peripheral_core0(emu: &mut Emulator) {
-    emu.poke(0x2000_0000, 0x2101_4A02);           // LDR R2 | MOVS R1
-    emu.poke(0x2000_0004, 0x6011_1C40);           // ADDS R0,R0,#1 | STR R1,[R2]
-    emu.poke(0x2000_0008, 0xBF00_E7FC);           // B .-8 | NOP
-    emu.poke(0x2000_000C, SIO_GPIO_OUT_XOR);      // literal: SIO XOR addr
+    emu.poke(0x2000_0000, 0x2101_4A02); // LDR R2 | MOVS R1
+    emu.poke(0x2000_0004, 0x6011_1C40); // ADDS R0,R0,#1 | STR R1,[R2]
+    emu.poke(0x2000_0008, 0xBF00_E7FC); // B .-8 | NOP
+    emu.poke(0x2000_000C, SIO_GPIO_OUT_XOR); // literal: SIO XOR addr
 
     // Enter at the prologue (LDR R2).
     emu.core_mut(0).regs.set_pc(0x2000_0000);
@@ -458,10 +461,10 @@ fn setup_basic_core1_at(emu: &mut Emulator, addr: u32) {
 ///   VSQRT S3, S3
 ///   B .-20
 fn setup_fpu_heavy_core0(emu: &mut Emulator) {
-    let (va0, va1) = enc_vadd(3, 1, 2);   // VADD  S3, S1, S2
-    let (vm0, vm1) = enc_vmul(3, 3, 1);   // VMUL  S3, S3, S1
-    let (vd0, vd1) = enc_vdiv(3, 3, 2);   // VDIV  S3, S3, S2
-    let (vs0, vs1) = enc_vsqrt(3, 3);     // VSQRT S3, S3
+    let (va0, va1) = enc_vadd(3, 1, 2); // VADD  S3, S1, S2
+    let (vm0, vm1) = enc_vmul(3, 3, 1); // VMUL  S3, S3, S1
+    let (vd0, vd1) = enc_vdiv(3, 3, 2); // VDIV  S3, S3, S2
+    let (vs0, vs1) = enc_vsqrt(3, 3); // VSQRT S3, S3
     emu.poke(0x2000_0000, pair(va0, va1));
     emu.poke(0x2000_0004, pair(vm0, vm1));
     emu.poke(0x2000_0008, pair(vd0, vd1));
@@ -613,7 +616,10 @@ mod win {
 enum Runtime {
     Serial(Emulator),
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    Threaded { inner: ThreadedEmulator, step_q: u32 },
+    Threaded {
+        inner: ThreadedEmulator,
+        step_q: u32,
+    },
 }
 
 impl Runtime {
@@ -768,7 +774,10 @@ fn main() {
     #[cfg(target_os = "windows")]
     match win::boost_and_pin(core) {
         Ok(()) => println!("Pinned to core {} at HIGH priority / TIME_CRITICAL", core),
-        Err(e) => eprintln!("warning: failed to boost priority: {} (continuing with default)", e),
+        Err(e) => eprintln!(
+            "warning: failed to boost priority: {} (continuing with default)",
+            e
+        ),
     }
     #[cfg(not(target_os = "windows"))]
     let _ = core;
@@ -846,7 +855,10 @@ fn main() {
         println!("\n=== run {}/{} ({}) ===", run_idx, total_runs, label);
         let mhz = run_once(&cfg);
         if run_idx == 1 {
-            println!("(run {}: {:.1} MHz — warmup, discarded from stats)", run_idx, mhz);
+            println!(
+                "(run {}: {:.1} MHz — warmup, discarded from stats)",
+                run_idx, mhz
+            );
         } else {
             println!("(run {}: {:.1} MHz)", run_idx, mhz);
             throughputs.push(mhz);
@@ -878,7 +890,8 @@ fn run_once(cfg: &RunConfig) -> f64 {
         ..Default::default()
     })
     .step_quantum(step_quantum)
-    .build().unwrap();
+    .build()
+    .unwrap();
     setup(&mut emu, workload);
 
     // Promote into threaded mode after setup — `ThreadedEmulator::from_emulator`
@@ -914,16 +927,32 @@ fn run_once(cfg: &RunConfig) -> f64 {
     let mut pacer = Pacer::with_quantum(sys_clk_hz, quantum.into());
     let stats = pacer.stats();
 
-    let core_mode = if workload.is_dual_core() { "dual-core" } else { "single-core" };
-    let pio_mode = if workload.needs_pio() { " + PIO0 SM0 wrap" } else { "" };
+    let core_mode = if workload.is_dual_core() {
+        "dual-core"
+    } else {
+        "single-core"
+    };
+    let pio_mode = if workload.needs_pio() {
+        " + PIO0 SM0 wrap"
+    } else {
+        ""
+    };
     let runtime_mode = if threaded { "threaded" } else { "serial" };
     println!(
         "mdrp2350 paced benchmark — target {} MHz, quantum {} cycles, step_quantum {}, {}, workload {}{}, runtime {}",
-        clock_mhz, quantum, step_quantum, core_mode, workload.as_str(), pio_mode, runtime_mode,
+        clock_mhz,
+        quantum,
+        step_quantum,
+        core_mode,
+        workload.as_str(),
+        pio_mode,
+        runtime_mode,
     );
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
-    println!("{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
-        "time", "emu_cycles", "emu_MHz", "util%", "headroom%", "behind");
+    println!(
+        "{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
+        "time", "emu_cycles", "emu_MHz", "util%", "headroom%", "behind"
+    );
 
     // --- Monitoring thread ---
     stats.set_running(true);
@@ -965,7 +994,9 @@ fn run_once(cfg: &RunConfig) -> f64 {
         let mut n: u64 = 0;
         loop {
             if let Some(target) = cycles_target {
-                if n >= target { break; }
+                if n >= target {
+                    break;
+                }
             } else if start.elapsed() >= duration {
                 break;
             }
@@ -1022,10 +1053,22 @@ fn run_once(cfg: &RunConfig) -> f64 {
         // clock). Under HIGH_PRIORITY_CLASS / TIME_CRITICAL this gives a
         // stable-enough signal for the HLD §12 budget gate.
         let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
-        println!("Executed cyc:   {} (c0={}, c1={})", executed, c0_delta, c1_delta);
-        println!("Requested cyc:  {} (coord-tick advancement; not a perf signal in threaded)", requested);
-        println!("Avg MHz:        {:.1}  (per-core peak, from executed cycles)", mhz);
-        println!("Requested MHz:  {:.1}  (informational — what the run loop asked for)", mhz_requested);
+        println!(
+            "Executed cyc:   {} (c0={}, c1={})",
+            executed, c0_delta, c1_delta
+        );
+        println!(
+            "Requested cyc:  {} (coord-tick advancement; not a perf signal in threaded)",
+            requested
+        );
+        println!(
+            "Avg MHz:        {:.1}  (per-core peak, from executed cycles)",
+            mhz
+        );
+        println!(
+            "Requested MHz:  {:.1}  (informational — what the run loop asked for)",
+            mhz_requested
+        );
         // HLD §12's <33 host-cycles/emu-cycle budget was calibrated
         // against `basic` and `fpu-heavy`. The peripheral / contention /
         // stress workloads deliberately do more work per master cycle
@@ -1036,15 +1079,23 @@ fn run_once(cfg: &RunConfig) -> f64 {
         // informationally for the rest.
         let budget_gated = matches!(workload, Workload::Basic | Workload::FpuHeavy);
         if budget_gated {
-            println!("Host/emu cycle: {:.2} (target: <33 per HLD §12)", host_cycles_per_emu);
+            println!(
+                "Host/emu cycle: {:.2} (target: <33 per HLD §12)",
+                host_cycles_per_emu
+            );
             if host_cycles_per_emu < 33.0 {
                 println!("Budget:         OK ({:.2} < 33)", host_cycles_per_emu);
             } else {
-                println!("Budget:         OVER ({:.2} >= 33) — investigate regression", host_cycles_per_emu);
+                println!(
+                    "Budget:         OVER ({:.2} >= 33) — investigate regression",
+                    host_cycles_per_emu
+                );
             }
         } else {
-            println!("Host/emu cycle: {:.2} (informational; HLD §12 budget only gates basic/fpu-heavy)",
-                     host_cycles_per_emu);
+            println!(
+                "Host/emu cycle: {:.2} (informational; HLD §12 budget only gates basic/fpu-heavy)",
+                host_cycles_per_emu
+            );
         }
         println!("Verdict:        UNPACED (profiling mode)");
 
@@ -1072,14 +1123,24 @@ fn run_once(cfg: &RunConfig) -> f64 {
     let mhz_ratio = snap.emulated_mhz() / clock_mhz as f64;
 
     if mhz_ratio >= 0.99 && behind_rate < 0.001 {
-        println!("Verdict:        REAL-TIME OK ({:.1}% of target, {:.2}% headroom, {:.3}% behind)",
-                 mhz_ratio * 100.0, snap.headroom() * 100.0, behind_rate * 100.0);
+        println!(
+            "Verdict:        REAL-TIME OK ({:.1}% of target, {:.2}% headroom, {:.3}% behind)",
+            mhz_ratio * 100.0,
+            snap.headroom() * 100.0,
+            behind_rate * 100.0
+        );
     } else if mhz_ratio >= 0.95 && behind_rate < 0.01 {
-        println!("Verdict:        REAL-TIME MARGINAL ({:.1}% of target, {:.2}% behind)",
-                 mhz_ratio * 100.0, behind_rate * 100.0);
+        println!(
+            "Verdict:        REAL-TIME MARGINAL ({:.1}% of target, {:.2}% behind)",
+            mhz_ratio * 100.0,
+            behind_rate * 100.0
+        );
     } else {
-        println!("Verdict:        CANNOT SUSTAIN REAL-TIME ({:.1}% of target, {:.2}% behind)",
-                 mhz_ratio * 100.0, behind_rate * 100.0);
+        println!(
+            "Verdict:        CANNOT SUSTAIN REAL-TIME ({:.1}% of target, {:.2}% behind)",
+            mhz_ratio * 100.0,
+            behind_rate * 100.0
+        );
     }
 
     snap.emulated_mhz()
@@ -1099,12 +1160,7 @@ fn print_runs_summary(_cfg: &RunConfig, throughputs: &[f64]) {
     println!("{:>4} {:>8} {:>10}", "run", "label", "MHz");
     println!("{:>4} {:>8} {:>10}", 1, "warmup", "(see above)");
     for (i, mhz) in throughputs.iter().enumerate() {
-        println!(
-            "{:>4} {:>8} {:>10.1}",
-            i + 2,
-            "run",
-            mhz,
-        );
+        println!("{:>4} {:>8} {:>10.1}", i + 2, "run", mhz,);
     }
 
     let mean = throughputs.iter().copied().sum::<f64>() / n as f64;
@@ -1120,7 +1176,11 @@ fn print_runs_summary(_cfg: &RunConfig, throughputs: &[f64]) {
         0.0
     };
     let stdev = variance.sqrt();
-    let cv_pct = if mean > 0.0 { 100.0 * stdev / mean } else { 0.0 };
+    let cv_pct = if mean > 0.0 {
+        100.0 * stdev / mean
+    } else {
+        0.0
+    };
 
     let mut sorted = throughputs.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1151,13 +1211,15 @@ fn monitor_loop(stats: Arc<PacerStats>) {
         }
         let snap = stats.snapshot();
         let elapsed = start.elapsed().as_secs();
-        println!("{:>6} {:>14} {:>10.1} {:>7.1}% {:>9.1}% {:>8}",
+        println!(
+            "{:>6} {:>14} {:>10.1} {:>7.1}% {:>9.1}% {:>8}",
             elapsed,
             snap.emulated_cycles,
             snap.emulated_mhz(),
             snap.utilization() * 100.0,
             snap.headroom() * 100.0,
-            snap.behind_count);
+            snap.behind_count
+        );
     }
 }
 
@@ -1185,9 +1247,9 @@ fn parse_workload() -> Result<Workload, String> {
             return match_workload(v);
         }
         if a == "--workload" {
-            let v = args
-                .get(i + 1)
-                .ok_or("--workload requires basic|peripheral|contention|stress|fpu-heavy|onerom-shape")?;
+            let v = args.get(i + 1).ok_or(
+                "--workload requires basic|peripheral|contention|stress|fpu-heavy|onerom-shape",
+            )?;
             return match_workload(v);
         }
     }
@@ -1271,8 +1333,14 @@ fn run_ab_harness(base_cfg: &RunConfig, reps: u32) {
         base_cfg.step_quantum,
     );
 
-    let serial_cfg = RunConfig { threaded: false, ..*base_cfg };
-    let threaded_cfg = RunConfig { threaded: true, ..*base_cfg };
+    let serial_cfg = RunConfig {
+        threaded: false,
+        ..*base_cfg
+    };
+    let threaded_cfg = RunConfig {
+        threaded: true,
+        ..*base_cfg
+    };
 
     println!("\n=== Serial reps ===");
     let serial_mhz = collect_reps(&serial_cfg, reps);
@@ -1301,7 +1369,10 @@ fn run_ab_harness(base_cfg: &RunConfig, reps: u32) {
         format!("WINNER: Serial ({:.1}%)", delta_pct)
     };
 
-    println!("\n=== A/B summary — workload: {} ===", base_cfg.workload.as_str());
+    println!(
+        "\n=== A/B summary — workload: {} ===",
+        base_cfg.workload.as_str()
+    );
     println!(
         "{:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "model", "median", "p25", "p75", "min", "max"
@@ -1330,7 +1401,11 @@ fn run_single_model_reps(cfg: &RunConfig, reps: u32) {
     );
     let samples = collect_reps(cfg, reps);
     let s = Stats::from(&samples);
-    println!("\n=== stats — workload: {} (model: {}) ===", cfg.workload.as_str(), label);
+    println!(
+        "\n=== stats — workload: {} (model: {}) ===",
+        cfg.workload.as_str(),
+        label
+    );
     println!(
         "{:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "model", "median", "p25", "p75", "min", "max"

@@ -256,10 +256,7 @@ impl AdcRegs {
 
     fn refresh_intr(&mut self) {
         let thresh = self.fcs_thresh();
-        if self.fcs_enabled()
-            && thresh > 0
-            && (self.fifo.len() as u32) >= thresh
-        {
+        if self.fcs_enabled() && thresh > 0 && (self.fifo.len() as u32) >= thresh {
             self.intr |= INTR_FIFO;
         } else {
             self.intr &= !INTR_FIFO;
@@ -415,7 +412,9 @@ impl AdcRegs {
         }
 
         let sys_hz = clock_tree.sys_clk_hz.max(1) as u64;
-        self.adc_phase = self.adc_phase.saturating_add((ADC_HZ as u64) * (sys_cycles as u64));
+        self.adc_phase = self
+            .adc_phase
+            .saturating_add((ADC_HZ as u64) * (sys_cycles as u64));
 
         let mut fired = false;
         while self.adc_phase >= sys_hz {
@@ -515,7 +514,12 @@ mod tests {
     fn start_once_completes_sets_ready() {
         let mut a = AdcRegs::new(ADC_IRQ);
         let mut irqs = 0u64;
-        a.write32(CS, CS_EN | CS_START_ONCE | (3 << CS_AINSEL_SHIFT), 0, &mut irqs);
+        a.write32(
+            CS,
+            CS_EN | CS_START_ONCE | (3 << CS_AINSEL_SHIFT),
+            0,
+            &mut irqs,
+        );
         // 96 adc ticks @ 48 MHz → 96*150/48 = 300 sys_clks.
         a.tick(500, &default_tree(), &mut irqs);
         assert_eq!(a.cs & CS_READY, CS_READY);

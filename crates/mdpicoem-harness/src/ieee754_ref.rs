@@ -78,9 +78,7 @@ fn is_denormal_f32(v: f32) -> bool {
 #[inline]
 fn is_snan_f32(v: f32) -> bool {
     let bits = v.to_bits();
-    (bits & 0x7F80_0000) == 0x7F80_0000
-        && (bits & 0x003F_FFFF) != 0
-        && (bits & 0x0040_0000) == 0
+    (bits & 0x7F80_0000) == 0x7F80_0000 && (bits & 0x003F_FFFF) != 0 && (bits & 0x0040_0000) == 0
 }
 
 /// Apply FZ flush-to-zero to an input. When `v` is denormal, always set IDC;
@@ -537,10 +535,23 @@ pub fn ref_vcvt_f16_from_f32(v: f32, fpscr_in: u32) -> (u16, u32) {
         let m = (frac | 0x0080_0000) as u64;
         let shift: u32 = (-e - 1) as u32;
         let mantissa = (m >> shift) as u32;
-        let round_bit = if shift == 0 { 0 } else { ((m >> (shift - 1)) & 1) as u32 };
-        let sticky = if shift < 2 { false } else { (m & ((1u64 << (shift - 1)) - 1)) != 0 };
+        let round_bit = if shift == 0 {
+            0
+        } else {
+            ((m >> (shift - 1)) & 1) as u32
+        };
+        let sticky = if shift < 2 {
+            false
+        } else {
+            (m & ((1u64 << (shift - 1)) - 1)) != 0
+        };
         let lsb = mantissa & 1;
-        let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+        let rounded = mantissa
+            + if round_bit != 0 && (sticky || lsb != 0) {
+                1
+            } else {
+                0
+            };
         if rounded >= 0x400 {
             return (sign | (1 << 10), flags);
         }
@@ -552,7 +563,12 @@ pub fn ref_vcvt_f16_from_f32(v: f32, fpscr_in: u32) -> (u16, u32) {
     let round_bit = (frac >> 12) & 1;
     let sticky = (frac & 0xFFF) != 0;
     let lsb = mantissa & 1;
-    let rounded = mantissa + if round_bit != 0 && (sticky || lsb != 0) { 1 } else { 0 };
+    let rounded = mantissa
+        + if round_bit != 0 && (sticky || lsb != 0) {
+            1
+        } else {
+            0
+        };
 
     if rounded > 0x3FF {
         let new_exp = exp16 + 1;
@@ -725,7 +741,11 @@ mod tests {
         // 1e-20 * 1e-20 = 1e-40, tininess-before-rounding. With FZ=1, result
         // is flushed to +0 with UFC+IXC.
         let (r, f) = ref_mul(1e-20, 1e-20, FZ);
-        assert_eq!(r.to_bits(), 0.0f32.to_bits(), "FZ=1 must flush tiny result to +0");
+        assert_eq!(
+            r.to_bits(),
+            0.0f32.to_bits(),
+            "FZ=1 must flush tiny result to +0"
+        );
         assert!(f & UFC != 0, "UFC must set on FTZ output flush");
         assert!(f & IXC != 0, "IXC must set on FTZ output flush");
     }
@@ -767,7 +787,11 @@ mod tests {
         // from tiny-result flushing.
         let denorm = f32::from_bits(0x0000_0001);
         let (r, f) = ref_add(denorm, 0.0, 0);
-        assert_eq!(r.to_bits(), denorm.to_bits(), "FZ=0 preserves denormal input");
+        assert_eq!(
+            r.to_bits(),
+            denorm.to_bits(),
+            "FZ=0 preserves denormal input"
+        );
         assert!(f & IDC != 0, "IDC still set even with FZ=0");
     }
 
@@ -1196,7 +1220,7 @@ mod dcp_tests {
         assert_eq!(ref_d2u(d), u);
 
         // f2d is exact; d2f may round.
-        let f = 3.14f32;
+        let f = 3.5f32;
         assert_eq!(ref_f2d(f), f as f64);
         assert_eq!(ref_d2f(f as f64), f);
     }

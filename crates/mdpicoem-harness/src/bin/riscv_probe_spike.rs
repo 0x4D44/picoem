@@ -16,7 +16,7 @@
 //   riscv_probe_spike --attempt-archsel-flip   # only if RUNBOOK offset is pinned
 
 use mdpicoem_harness::{EMU_TEST_SLOT, EMU_TEST_STACK};
-use probe_rs::probe::{list::Lister, DebugProbeSelector};
+use probe_rs::probe::{DebugProbeSelector, list::Lister};
 use probe_rs::{
     Architecture, Core, MemoryInterface, Permissions, RegisterId, Session, SessionConfig,
 };
@@ -107,7 +107,10 @@ fn parse_args() -> Result<Args, String> {
         }
         i += 1;
     }
-    Ok(Args { probe, attempt_archsel_flip })
+    Ok(Args {
+        probe,
+        attempt_archsel_flip,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -129,13 +132,25 @@ struct RowResult {
 
 impl RowResult {
     fn pass(label: &'static str, reason: impl Into<String>) -> Self {
-        Self { label, verdict: Verdict::Pass, reason: reason.into() }
+        Self {
+            label,
+            verdict: Verdict::Pass,
+            reason: reason.into(),
+        }
     }
     fn fail(label: &'static str, reason: impl Into<String>) -> Self {
-        Self { label, verdict: Verdict::Fail, reason: reason.into() }
+        Self {
+            label,
+            verdict: Verdict::Fail,
+            reason: reason.into(),
+        }
     }
     fn skip(label: &'static str, reason: impl Into<String>) -> Self {
-        Self { label, verdict: Verdict::Skip, reason: reason.into() }
+        Self {
+            label,
+            verdict: Verdict::Skip,
+            reason: reason.into(),
+        }
     }
 }
 
@@ -265,7 +280,9 @@ fn row2_gpr(core: &mut Core) -> RowResult {
 fn row3_csr(core: &mut Core) -> RowResult {
     let orig = match core.read_core_reg::<u32>(CSR_MSCRATCH) {
         Ok(v) => v,
-        Err(e) => return RowResult::fail("3. CSR read/write", format!("read mscratch failed: {e}")),
+        Err(e) => {
+            return RowResult::fail("3. CSR read/write", format!("read mscratch failed: {e}"));
+        }
     };
     let probe = orig ^ 0xA5A5_A5A5;
     if let Err(e) = core.write_core_reg(CSR_MSCRATCH, probe) {
@@ -274,10 +291,7 @@ fn row3_csr(core: &mut Core) -> RowResult {
     let back = match core.read_core_reg::<u32>(CSR_MSCRATCH) {
         Ok(v) => v,
         Err(e) => {
-            return RowResult::fail(
-                "3. CSR read/write",
-                format!("readback failed: {e}"),
-            );
+            return RowResult::fail("3. CSR read/write", format!("readback failed: {e}"));
         }
     };
     let _ = core.write_core_reg(CSR_MSCRATCH, orig); // restore
@@ -312,15 +326,24 @@ fn row4_breakpoint(core: &mut Core<'_>) -> (RowResult, u64) {
     }
     stub.extend_from_slice(&RV_EBREAK.to_le_bytes());
     if let Err(e) = core.write_8(addr, &stub) {
-        return (RowResult::fail("4. HW breakpoint", format!("write stub: {e}")), addr);
+        return (
+            RowResult::fail("4. HW breakpoint", format!("write stub: {e}")),
+            addr,
+        );
     }
     // Seed sp (RV x2) and pc. EMU_TEST_STACK is u32 in mdpicoem_harness; the
     // RV32 backend's write_core_reg expects u32.
     if let Err(e) = core.write_core_reg::<u32>(RV_X2_SP, EMU_TEST_STACK) {
-        return (RowResult::fail("4. HW breakpoint", format!("set sp: {e}")), addr);
+        return (
+            RowResult::fail("4. HW breakpoint", format!("set sp: {e}")),
+            addr,
+        );
     }
     if let Err(e) = core.write_core_reg(RV_PC, addr as u32) {
-        return (RowResult::fail("4. HW breakpoint", format!("set pc: {e}")), addr);
+        return (
+            RowResult::fail("4. HW breakpoint", format!("set pc: {e}")),
+            addr,
+        );
     }
 
     let bp_addr = addr + 6; // after 3 × c.nop, before the 4th c.nop / c.ebreak
@@ -338,17 +361,21 @@ fn row4_breakpoint(core: &mut Core<'_>) -> (RowResult, u64) {
         if hw_bp_set {
             let _ = core.clear_hw_breakpoint(bp_addr);
         }
-        return (RowResult::fail("4. HW breakpoint", format!("run: {e}")), addr);
+        return (
+            RowResult::fail("4. HW breakpoint", format!("run: {e}")),
+            addr,
+        );
     }
     let wait = core.wait_for_core_halted(Duration::from_millis(2000));
-    if hw_bp_set
-        && let Err(e) = core.clear_hw_breakpoint(bp_addr)
-    {
+    if hw_bp_set && let Err(e) = core.clear_hw_breakpoint(bp_addr) {
         tracing::debug!(target: "riscv_probe_spike", "clear_hw_breakpoint failed: {e}");
     }
     match (wait, hw_bp_set) {
         (Ok(()), true) => (
-            RowResult::pass("4. HW breakpoint", format!("hw breakpoint hit at 0x{bp_addr:08X}")),
+            RowResult::pass(
+                "4. HW breakpoint",
+                format!("hw breakpoint hit at 0x{bp_addr:08X}"),
+            ),
             addr,
         ),
         (Ok(()), false) => (
@@ -442,7 +469,10 @@ fn row_e1_mcycle(core: &mut Core<'_>) -> RowResult {
         if Instant::now() > deadline {
             return RowResult::fail(
                 "E1. mcycle advances under step",
-                format!("step loop exceeded {:?} budget at iteration {i}", E1_STEP_BUDGET),
+                format!(
+                    "step loop exceeded {:?} budget at iteration {i}",
+                    E1_STEP_BUDGET
+                ),
             );
         }
         if let Err(e) = core.step() {
@@ -656,7 +686,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // SKIP through the remaining rows, print the matrix, map to PLAN D.
     let mut session = match attach_session(&args) {
         Ok(s) => {
-            println!("Attached session, {} core(s) enumerated", s.list_cores().len());
+            println!(
+                "Attached session, {} core(s) enumerated",
+                s.list_cores().len()
+            );
             s
         }
         Err(e) => {
@@ -768,7 +801,10 @@ fn print_summary(results: &[RowResult]) {
             "silicon gap accepted; file tech_debt.md entry per HLD §4 Phase 1",
         )
     } else if row1 && row2 && row3 && row4 && row5 {
-        ("FULL", "Phase 3 LLD starts on Path A (probe-rs direct + mailbox cycle)")
+        (
+            "FULL",
+            "Phase 3 LLD starts on Path A (probe-rs direct + mailbox cycle)",
+        )
     } else if row1 && row2 && !row3 && !row4 && !row5 {
         (
             "MAILBOX",
@@ -780,7 +816,10 @@ fn print_summary(results: &[RowResult]) {
             "Phase 3 LLD picks proxy mix — Path A for passing rows, fallback for failures",
         )
     } else {
-        ("UNRESOLVED", "rows 1/2 partially failed — re-run with --probe")
+        (
+            "UNRESOLVED",
+            "rows 1/2 partially failed — re-run with --probe",
+        )
     };
 
     // m1: print outcome first, THEN the matrix.
@@ -815,6 +854,9 @@ fn print_summary(results: &[RowResult]) {
         }
     }
     println!();
-    println!("Totals    : {p} PASS, {f} FAIL, {s} SKIP (out of {})", results.len());
+    println!(
+        "Totals    : {p} PASS, {f} FAIL, {s} SKIP (out of {})",
+        results.len()
+    );
     println!("(Exit code is 0 on a clean spike run regardless of per-row verdicts.)");
 }

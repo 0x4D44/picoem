@@ -137,10 +137,7 @@ fn emit_table_row(out: &mut String, s: &SmSnapshot, enabled: bool) {
 /// Reads and parses `oracle_path` (same format as `onerom_2364.trace`), then
 /// walks the §4 decision tree. The returned `String` is a short
 /// human-readable reason describing *why* the branch was chosen.
-pub fn decide_oracle_branch(
-    report: &SyncReport,
-    oracle_path: &Path,
-) -> (OracleBranch, String) {
+pub fn decide_oracle_branch(report: &SyncReport, oracle_path: &Path) -> (OracleBranch, String) {
     let oracle_instrs = match onerom_trace::instrs_only(oracle_path) {
         Ok(v) => v,
         Err(e) => {
@@ -237,9 +234,21 @@ mod tests {
         report.pio1.instr_mem[0] = 0x1234;
         report.pio1.sms[0].clkdiv = 0x1_0000;
         let out = format_snapshot(&report);
-        assert!(out.contains("instr 1 1 0x1234"), "trace line missing: {}", out);
-        assert!(out.contains("reg 1 0 0x00010000"), "reg line missing: {}", out);
-        assert!(out.contains("block sm CLKDIV"), "table header missing: {}", out);
+        assert!(
+            out.contains("instr 1 1 0x1234"),
+            "trace line missing: {}",
+            out
+        );
+        assert!(
+            out.contains("reg 1 0 0x00010000"),
+            "reg line missing: {}",
+            out
+        );
+        assert!(
+            out.contains("block sm CLKDIV"),
+            "table header missing: {}",
+            out
+        );
     }
 
     /// Synthetic report with correct shape (PIO1=0b0001, PIO2=0b0011) but

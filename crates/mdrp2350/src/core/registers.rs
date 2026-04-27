@@ -247,30 +247,36 @@ impl Registers {
 
     /// Sync R13 from the appropriate banked SP after switching.
     pub fn sync_sp_from_banked(&mut self) {
-        self.r[13] = if self.active_sp_is_psp() { self.psp } else { self.msp };
+        self.r[13] = if self.active_sp_is_psp() {
+            self.psp
+        } else {
+            self.msp
+        };
     }
 
     /// Evaluate an ARM condition code against current flags.
     #[inline(always)]
     pub fn condition_passed(&self, cond: u8) -> bool {
-        if cond >= 0xE { return true; }
+        if cond >= 0xE {
+            return true;
+        }
         match cond & 0xF {
-            0x0 => self.flag_z(),                                     // EQ
-            0x1 => !self.flag_z(),                                    // NE
-            0x2 => self.flag_c(),                                     // CS/HS
-            0x3 => !self.flag_c(),                                    // CC/LO
-            0x4 => self.flag_n(),                                     // MI
-            0x5 => !self.flag_n(),                                    // PL
-            0x6 => self.flag_v(),                                     // VS
-            0x7 => !self.flag_v(),                                    // VC
-            0x8 => self.flag_c() && !self.flag_z(),                   // HI
-            0x9 => !self.flag_c() || self.flag_z(),                   // LS
-            0xA => self.flag_n() == self.flag_v(),                    // GE
-            0xB => self.flag_n() != self.flag_v(),                    // LT
+            0x0 => self.flag_z(),                                      // EQ
+            0x1 => !self.flag_z(),                                     // NE
+            0x2 => self.flag_c(),                                      // CS/HS
+            0x3 => !self.flag_c(),                                     // CC/LO
+            0x4 => self.flag_n(),                                      // MI
+            0x5 => !self.flag_n(),                                     // PL
+            0x6 => self.flag_v(),                                      // VS
+            0x7 => !self.flag_v(),                                     // VC
+            0x8 => self.flag_c() && !self.flag_z(),                    // HI
+            0x9 => !self.flag_c() || self.flag_z(),                    // LS
+            0xA => self.flag_n() == self.flag_v(),                     // GE
+            0xB => self.flag_n() != self.flag_v(),                     // LT
             0xC => !self.flag_z() && (self.flag_n() == self.flag_v()), // GT
-            0xD => self.flag_z() || (self.flag_n() != self.flag_v()), // LE
-            0xE => true,                                              // AL
-            _ => true,                                                // unconditional
+            0xD => self.flag_z() || (self.flag_n() != self.flag_v()),  // LE
+            0xE => true,                                               // AL
+            _ => true,                                                 // unconditional
         }
     }
 }

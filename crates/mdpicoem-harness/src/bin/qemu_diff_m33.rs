@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use mdpicoem_harness::gdb_client::{sanity_check, GdbClient, QemuProcess};
+use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, sanity_check};
 use mdpicoem_harness::*;
 
 /// BKPT #0 instruction (little-endian bytes).
@@ -104,18 +104,22 @@ fn parse_args() -> Result<Args, String> {
                 if i >= args.len() {
                     return Err("--fuzz requires a count argument".into());
                 }
-                fuzz_count = Some(args[i].parse::<usize>().map_err(|e| {
-                    format!("invalid fuzz count '{}': {e}", args[i])
-                })?);
+                fuzz_count = Some(
+                    args[i]
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid fuzz count '{}': {e}", args[i]))?,
+                );
             }
             "--seed" => {
                 i += 1;
                 if i >= args.len() {
                     return Err("--seed requires a value argument".into());
                 }
-                seed = Some(args[i].parse::<u64>().map_err(|e| {
-                    format!("invalid seed '{}': {e}", args[i])
-                })?);
+                seed = Some(
+                    args[i]
+                        .parse::<u64>()
+                        .map_err(|e| format!("invalid seed '{}': {e}", args[i]))?,
+                );
             }
             "--classes" => {
                 i += 1;
@@ -145,7 +149,11 @@ fn parse_args() -> Result<Args, String> {
         return Err("--classes requires --fuzz".into());
     }
 
-    Ok(Args { fuzz_count, seed, class })
+    Ok(Args {
+        fuzz_count,
+        seed,
+        class,
+    })
 }
 
 // ============================================================================
@@ -239,12 +247,21 @@ fn run_fuzz(
 
     let buckets = select_fuzz_class(generate_fuzz_classes(count_per_class, seed), class);
     let raw_total = buckets.base_alu.len() + buckets.base_mem.len() + buckets.fpu.len();
-    let alu_tests: Vec<TestCase> =
-        buckets.base_alu.into_iter().filter(|tc| !tc.probe_only).collect();
-    let mem_tests: Vec<TestCase> =
-        buckets.base_mem.into_iter().filter(|tc| !tc.probe_only).collect();
-    let fpu_tests: Vec<TestCase> =
-        buckets.fpu.into_iter().filter(|tc| !tc.probe_only).collect();
+    let alu_tests: Vec<TestCase> = buckets
+        .base_alu
+        .into_iter()
+        .filter(|tc| !tc.probe_only)
+        .collect();
+    let mem_tests: Vec<TestCase> = buckets
+        .base_mem
+        .into_iter()
+        .filter(|tc| !tc.probe_only)
+        .collect();
+    let fpu_tests: Vec<TestCase> = buckets
+        .fpu
+        .into_iter()
+        .filter(|tc| !tc.probe_only)
+        .collect();
     let total = alu_tests.len() + mem_tests.len() + fpu_tests.len();
     let filtered = raw_total - total;
     if filtered > 0 {
@@ -347,11 +364,7 @@ fn setup_vector_table(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Run a single differential test: set up both sides, execute, compare.
-fn run_one_test(
-    gdb: &mut GdbClient,
-    shared_bus: &mut Bus,
-    tc: &TestCase,
-) -> Result<(), String> {
+fn run_one_test(gdb: &mut GdbClient, shared_bus: &mut Bus, tc: &TestCase) -> Result<(), String> {
     let qemu_state = run_qemu_side(gdb, tc).map_err(|e| format!("QEMU error: {e}"))?;
     let emu_state = if is_fpu_test(tc) {
         run_one_emu_fpu(tc, shared_bus)
@@ -393,25 +406,19 @@ fn is_gdb_error(e: &str) -> bool {
 }
 
 /// Kill the old QEMU process, spawn a new one, and reconnect GDB.
-fn respawn_qemu(
-    qemu: &mut QemuProcess,
-    gdb: &mut GdbClient,
-) -> Result<(), String> {
+fn respawn_qemu(qemu: &mut QemuProcess, gdb: &mut GdbClient) -> Result<(), String> {
     // Drop old QEMU (kill on drop), spawn new
     *qemu = QemuProcess::spawn().map_err(|e| e.to_string())?;
     std::thread::sleep(Duration::from_millis(500));
-    *gdb = GdbClient::connect("localhost:3333", Duration::from_secs(5))
-        .map_err(|e| e.to_string())?;
+    *gdb =
+        GdbClient::connect("localhost:3333", Duration::from_secs(5)).map_err(|e| e.to_string())?;
     gdb.handshake().map_err(|e| e.to_string())?;
     setup_vector_table(gdb).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Execute the test on QEMU via GDB and read back post-state.
-fn run_qemu_side(
-    gdb: &mut GdbClient,
-    tc: &TestCase,
-) -> std::io::Result<RunState> {
+fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState> {
     let is_fpu = is_fpu_test(tc);
 
     // Determine the number of single-steps and write instruction sequence.
@@ -520,5 +527,12 @@ fn run_qemu_side(
         }
     }
 
-    Ok(RunState { regs, xpsr, mem, cycles: 0, fpu, fpscr })
+    Ok(RunState {
+        regs,
+        xpsr,
+        mem,
+        cycles: 0,
+        fpu,
+        fpscr,
+    })
 }

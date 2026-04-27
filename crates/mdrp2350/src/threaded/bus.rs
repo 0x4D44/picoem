@@ -210,7 +210,13 @@ impl WorkerBus {
 
         match base {
             // CLOCKS / PLL / ROSC / XOSC live inside ClocksState.
-            0x4001_0000 => self.shared.peripherals.clocks.lock().unwrap().clocks_read(offset),
+            0x4001_0000 => self
+                .shared
+                .peripherals
+                .clocks
+                .lock()
+                .unwrap()
+                .clocks_read(offset),
             0x4005_0000 => self
                 .shared
                 .peripherals
@@ -225,24 +231,91 @@ impl WorkerBus {
                 .lock()
                 .unwrap()
                 .pll_usb_read_at(offset, mc),
-            0x4004_8000 => self.shared.peripherals.clocks.lock().unwrap().xosc_read(offset),
-            0x400E_8000 => self.shared.peripherals.clocks.lock().unwrap().rosc_read(offset),
+            0x4004_8000 => self
+                .shared
+                .peripherals
+                .clocks
+                .lock()
+                .unwrap()
+                .xosc_read(offset),
+            0x400E_8000 => self
+                .shared
+                .peripherals
+                .clocks
+                .lock()
+                .unwrap()
+                .rosc_read(offset),
 
-            0x4002_0000 => self.shared.peripherals.resets.lock().unwrap().resets_read(offset),
+            0x4002_0000 => self
+                .shared
+                .peripherals
+                .resets
+                .lock()
+                .unwrap()
+                .resets_read(offset),
             0x400D_0000 => self.shared.peripherals.qmi.lock().unwrap().qmi_read(offset),
             0x4000_0000 => sysinfo_read(offset),
 
-            TIMER0_BASE => self.shared.peripherals.timers.lock().unwrap().timer0.read32(offset),
-            TIMER1_BASE => self.shared.peripherals.timers.lock().unwrap().timer1.read32(offset),
-            TICKS_BASE => self.shared.peripherals.timers.lock().unwrap().ticks.read32(offset),
+            TIMER0_BASE => self
+                .shared
+                .peripherals
+                .timers
+                .lock()
+                .unwrap()
+                .timer0
+                .read32(offset),
+            TIMER1_BASE => self
+                .shared
+                .peripherals
+                .timers
+                .lock()
+                .unwrap()
+                .timer1
+                .read32(offset),
+            TICKS_BASE => self
+                .shared
+                .peripherals
+                .timers
+                .lock()
+                .unwrap()
+                .ticks
+                .read32(offset),
 
             UART0_BASE => self.shared.peripherals.apb.lock().unwrap().uart[0].read32(offset),
             SPI0_BASE => self.shared.peripherals.apb.lock().unwrap().spi[0].read32(offset),
             I2C0_BASE => self.shared.peripherals.apb.lock().unwrap().i2c[0].read32(offset),
-            ADC_BASE => self.shared.peripherals.apb.lock().unwrap().adc.read32(offset),
-            PWM_BASE => self.shared.peripherals.apb.lock().unwrap().pwm.read32(offset),
-            IO_BANK0_BASE => self.shared.peripherals.apb.lock().unwrap().io_bank0.read32(offset),
-            PADS_BANK0_BASE => self.shared.peripherals.apb.lock().unwrap().pads_bank0.read32(offset),
+            ADC_BASE => self
+                .shared
+                .peripherals
+                .apb
+                .lock()
+                .unwrap()
+                .adc
+                .read32(offset),
+            PWM_BASE => self
+                .shared
+                .peripherals
+                .apb
+                .lock()
+                .unwrap()
+                .pwm
+                .read32(offset),
+            IO_BANK0_BASE => self
+                .shared
+                .peripherals
+                .apb
+                .lock()
+                .unwrap()
+                .io_bank0
+                .read32(offset),
+            PADS_BANK0_BASE => self
+                .shared
+                .peripherals
+                .apb
+                .lock()
+                .unwrap()
+                .pads_bank0
+                .read32(offset),
 
             _ => {
                 // Legacy HashMap fallback.
@@ -355,57 +428,52 @@ impl WorkerBus {
 
             UART0_BASE => {
                 let mut ext_irqs = 0u64;
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .uart[0]
-                    .write32(offset, val, alias, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().uart[0].write32(
+                    offset,
+                    val,
+                    alias,
+                    &mut ext_irqs,
+                );
                 self.raise_irqs_shared(ext_irqs);
             }
             SPI0_BASE => {
                 let mut ext_irqs = 0u64;
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .spi[0]
-                    .write32(offset, val, alias, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().spi[0].write32(
+                    offset,
+                    val,
+                    alias,
+                    &mut ext_irqs,
+                );
                 self.raise_irqs_shared(ext_irqs);
             }
             I2C0_BASE => {
                 let mut ext_irqs = 0u64;
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .i2c[0]
-                    .write32(offset, val, alias, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().i2c[0].write32(
+                    offset,
+                    val,
+                    alias,
+                    &mut ext_irqs,
+                );
                 self.raise_irqs_shared(ext_irqs);
             }
             ADC_BASE => {
                 let mut ext_irqs = 0u64;
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .adc
-                    .write32(offset, val, alias, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().adc.write32(
+                    offset,
+                    val,
+                    alias,
+                    &mut ext_irqs,
+                );
                 self.raise_irqs_shared(ext_irqs);
             }
             PWM_BASE => {
                 let mut ext_irqs = 0u64;
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .pwm
-                    .write32(offset, val, alias, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().pwm.write32(
+                    offset,
+                    val,
+                    alias,
+                    &mut ext_irqs,
+                );
                 self.raise_irqs_shared(ext_irqs);
             }
             IO_BANK0_BASE => self
@@ -469,7 +537,13 @@ impl WorkerBus {
                 {
                     return 0;
                 }
-                self.shared.peripherals.usb.lock().unwrap().usbctrl.read32(offset)
+                self.shared
+                    .peripherals
+                    .usb
+                    .lock()
+                    .unwrap()
+                    .usbctrl
+                    .read32(offset)
             }
             USBCTRL_DPRAM_BASE => {
                 if self
@@ -525,16 +599,15 @@ impl WorkerBus {
                     }
                 }
             }
-            _ => {
-                self.shared
-                    .peripherals
-                    .legacy
-                    .lock()
-                    .unwrap()
-                    .get(&canonical)
-                    .copied()
-                    .unwrap_or(0)
-            }
+            _ => self
+                .shared
+                .peripherals
+                .legacy
+                .lock()
+                .unwrap()
+                .get(&canonical)
+                .copied()
+                .unwrap_or(0),
         }
     }
 
@@ -571,13 +644,12 @@ impl WorkerBus {
                     return;
                 }
                 let mut ext_irqs = 0u64;
-                self.shared
-                    .peripherals
-                    .usb
-                    .lock()
-                    .unwrap()
-                    .usbctrl
-                    .write32(offset, val, alias, &mut ext_irqs);
+                self.shared.peripherals.usb.lock().unwrap().usbctrl.write32(
+                    offset,
+                    val,
+                    alias,
+                    &mut ext_irqs,
+                );
                 self.raise_irqs_shared(ext_irqs);
             }
             USBCTRL_DPRAM_BASE => {
@@ -636,7 +708,11 @@ impl WorkerBus {
                 let block = ((base - 0x5020_0000) >> 20) as u8;
                 let off12 = offset as u16;
                 let cmd = match off12 {
-                    0x000 => PioCommand::WriteCtrl { block, val, alias: alias as u8 },
+                    0x000 => PioCommand::WriteCtrl {
+                        block,
+                        val,
+                        alias: alias as u8,
+                    },
                     0x048..=0x0C4 => {
                         let addr = ((off12 - 0x048) >> 2) as u8;
                         PioCommand::WriteInstrMem {
@@ -661,7 +737,12 @@ impl WorkerBus {
                             alias: alias as u8,
                         }
                     }
-                    _ => PioCommand::WriteReg { block, offset: off12, val, alias: alias as u8 },
+                    _ => PioCommand::WriteReg {
+                        block,
+                        offset: off12,
+                        val,
+                        alias: alias as u8,
+                    },
                 };
                 self.shared.pio.send_command(cmd);
             }
@@ -718,10 +799,10 @@ impl WorkerBus {
 
         match reg_offset {
             0x000 => core as u32,                  // CPUID
-            0x004 => self.gpio_in_fresh(),         // GPIO_IN — SIO+PIO from last quantum + fresh external
-            0x008 => 0,                            // GPIO_HI_IN — bank 1 not modelled yet
+            0x004 => self.gpio_in_fresh(), // GPIO_IN — SIO+PIO from last quantum + fresh external
+            0x008 => 0,                    // GPIO_HI_IN — bank 1 not modelled yet
             0x010 => self.shared.gpio.read_out(0), // GPIO_OUT
-            0x030 => self.shared.gpio.read_oe(0),  // GPIO_OE
+            0x030 => self.shared.gpio.read_oe(0), // GPIO_OE
             // FIFO
             0x050 => self.shared.sio.fifo_st(core as usize), // FIFO_ST
             0x058 => {
@@ -869,30 +950,18 @@ impl WorkerBus {
         }
 
         let v = match (base, word_offset) {
-            (UART0_BASE, crate::peripherals::uart::UARTDR) => self
-                .shared
-                .peripherals
-                .apb
-                .lock()
-                .unwrap()
-                .uart[0]
-                .read8(crate::peripherals::uart::UARTDR),
-            (SPI0_BASE, crate::peripherals::spi::SSPDR) => self
-                .shared
-                .peripherals
-                .apb
-                .lock()
-                .unwrap()
-                .spi[0]
-                .read8(crate::peripherals::spi::SSPDR),
-            (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => self
-                .shared
-                .peripherals
-                .apb
-                .lock()
-                .unwrap()
-                .i2c[0]
-                .read8(crate::peripherals::i2c::IC_DATA_CMD),
+            (UART0_BASE, crate::peripherals::uart::UARTDR) => {
+                self.shared.peripherals.apb.lock().unwrap().uart[0]
+                    .read8(crate::peripherals::uart::UARTDR)
+            }
+            (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
+                self.shared.peripherals.apb.lock().unwrap().spi[0]
+                    .read8(crate::peripherals::spi::SSPDR)
+            }
+            (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                self.shared.peripherals.apb.lock().unwrap().i2c[0]
+                    .read8(crate::peripherals::i2c::IC_DATA_CMD)
+            }
             (ADC_BASE, crate::peripherals::adc::FIFO) => self
                 .shared
                 .peripherals
@@ -933,30 +1002,18 @@ impl WorkerBus {
         }
 
         let v = match (base, word_offset) {
-            (SPI0_BASE, crate::peripherals::spi::SSPDR) => self
-                .shared
-                .peripherals
-                .apb
-                .lock()
-                .unwrap()
-                .spi[0]
-                .read16(crate::peripherals::spi::SSPDR),
-            (UART0_BASE, crate::peripherals::uart::UARTDR) => self
-                .shared
-                .peripherals
-                .apb
-                .lock()
-                .unwrap()
-                .uart[0]
-                .read8(crate::peripherals::uart::UARTDR) as u16,
-            (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => self
-                .shared
-                .peripherals
-                .apb
-                .lock()
-                .unwrap()
-                .i2c[0]
-                .read8(crate::peripherals::i2c::IC_DATA_CMD) as u16,
+            (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
+                self.shared.peripherals.apb.lock().unwrap().spi[0]
+                    .read16(crate::peripherals::spi::SSPDR)
+            }
+            (UART0_BASE, crate::peripherals::uart::UARTDR) => {
+                self.shared.peripherals.apb.lock().unwrap().uart[0]
+                    .read8(crate::peripherals::uart::UARTDR) as u16
+            }
+            (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
+                self.shared.peripherals.apb.lock().unwrap().i2c[0]
+                    .read8(crate::peripherals::i2c::IC_DATA_CMD) as u16
+            }
             (ADC_BASE, crate::peripherals::adc::FIFO) => self
                 .shared
                 .peripherals
@@ -1002,31 +1059,25 @@ impl WorkerBus {
         let mut ext_irqs = 0u64;
         match (base, word_offset) {
             (UART0_BASE, crate::peripherals::uart::UARTDR) => {
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .uart[0]
-                    .write8(crate::peripherals::uart::UARTDR, val, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().uart[0].write8(
+                    crate::peripherals::uart::UARTDR,
+                    val,
+                    &mut ext_irqs,
+                );
             }
             (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .spi[0]
-                    .write8(crate::peripherals::spi::SSPDR, val, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().spi[0].write8(
+                    crate::peripherals::spi::SSPDR,
+                    val,
+                    &mut ext_irqs,
+                );
             }
             (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .i2c[0]
-                    .write8(crate::peripherals::i2c::IC_DATA_CMD, val, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().i2c[0].write8(
+                    crate::peripherals::i2c::IC_DATA_CMD,
+                    val,
+                    &mut ext_irqs,
+                );
             }
             (ADC_BASE, crate::peripherals::adc::FIFO) => {
                 // Read-only on silicon (datasheet §12.4.5). Swallow,
@@ -1070,31 +1121,25 @@ impl WorkerBus {
         let mut ext_irqs = 0u64;
         match (base, word_offset) {
             (SPI0_BASE, crate::peripherals::spi::SSPDR) => {
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .spi[0]
-                    .write16(crate::peripherals::spi::SSPDR, val, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().spi[0].write16(
+                    crate::peripherals::spi::SSPDR,
+                    val,
+                    &mut ext_irqs,
+                );
             }
             (UART0_BASE, crate::peripherals::uart::UARTDR) => {
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .uart[0]
-                    .write8(crate::peripherals::uart::UARTDR, val as u8, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().uart[0].write8(
+                    crate::peripherals::uart::UARTDR,
+                    val as u8,
+                    &mut ext_irqs,
+                );
             }
             (I2C0_BASE, crate::peripherals::i2c::IC_DATA_CMD) => {
-                self.shared
-                    .peripherals
-                    .apb
-                    .lock()
-                    .unwrap()
-                    .i2c[0]
-                    .write8(crate::peripherals::i2c::IC_DATA_CMD, val as u8, &mut ext_irqs);
+                self.shared.peripherals.apb.lock().unwrap().i2c[0].write8(
+                    crate::peripherals::i2c::IC_DATA_CMD,
+                    val as u8,
+                    &mut ext_irqs,
+                );
             }
             (ADC_BASE, crate::peripherals::adc::FIFO) => {
                 // Read-only — swallow.
@@ -2002,9 +2047,10 @@ mod tests {
 
     mod stage5_coverage {
         use super::*;
-        use crate::bus::{RESET_UART0, RESET_SPI0, RESET_I2C0, RESET_ADC,
-            RESET_PWM, RESET_IO_BANK0, RESET_PADS_BANK0, RESET_TIMER0,
-            RESET_TIMER1, RESET_DMA};
+        use crate::bus::{
+            RESET_ADC, RESET_DMA, RESET_I2C0, RESET_IO_BANK0, RESET_PADS_BANK0, RESET_PWM,
+            RESET_SPI0, RESET_TIMER0, RESET_TIMER1, RESET_UART0,
+        };
 
         // ---- APB read dispatch -----------------------------------------
 
@@ -2105,10 +2151,10 @@ mod tests {
             bus.write32(0x4002_0000, 0x0000_0000, 0); // RESETS
             bus.write32(0x400D_0000, 0x0000_0000, 0); // QMI
             bus.write32(0x4000_0000, 0xFFFF_FFFF, 0); // SYSINFO write-no-op
-            bus.write32(TIMER0_BASE + 0x40, 0x1, 0);  // TIMER0 INTR-ish
+            bus.write32(TIMER0_BASE + 0x40, 0x1, 0); // TIMER0 INTR-ish
             bus.write32(TIMER1_BASE + 0x40, 0x1, 0);
             bus.write32(TICKS_BASE + 0x08, 0x1, 0);
-            bus.write32(UART0_BASE + 0x44, 0x1, 0);   // UARTICR
+            bus.write32(UART0_BASE + 0x44, 0x1, 0); // UARTICR
             bus.write32(SPI0_BASE + 0x20, 0x1, 0);
             bus.write32(I2C0_BASE + 0x40, 0x1, 0);
             bus.write32(ADC_BASE + 0x14, 0x1, 0);
@@ -2200,7 +2246,11 @@ mod tests {
             bus.write32(0x5020_0010, 0x1234_5678, 0);
             // Commands must have queued on the PIO worker queue.
             let drained = shared.pio.drain_commands(0);
-            assert!(drained.len() >= 4, "expected >= 4 commands, got {}", drained.len());
+            assert!(
+                drained.len() >= 4,
+                "expected >= 4 commands, got {}",
+                drained.len()
+            );
         }
 
         // ---- AHB USBCTRL dispatch --------------------------------------
@@ -2474,10 +2524,10 @@ mod tests {
         fn narrow_write8_each_arm() {
             let shared = fresh_shared();
             let mut bus = WorkerBus::new(0, shared);
-            bus.write8(UART0_BASE, b'X', 0);     // UART TX
+            bus.write8(UART0_BASE, b'X', 0); // UART TX
             bus.write8(SPI0_BASE + 0x008, 0x55, 0); // SPI TX
             bus.write8(I2C0_BASE + 0x010, 0x77, 0); // I2C write
-            bus.write8(ADC_BASE + 0x00C, 0x00, 0);  // ADC FIFO swallowed
+            bus.write8(ADC_BASE + 0x00C, 0x00, 0); // ADC FIFO swallowed
         }
 
         #[test]
@@ -2616,8 +2666,12 @@ mod tests {
             // assertion but the path is covered.
             let pending0 = shared.atomics.irq_pending_load(0);
             // Software-only bits (46..=51) must not appear.
-            let swmask = (1u64 << 46) | (1u64 << 47) | (1u64 << 48)
-                | (1u64 << 49) | (1u64 << 50) | (1u64 << 51);
+            let swmask = (1u64 << 46)
+                | (1u64 << 47)
+                | (1u64 << 48)
+                | (1u64 << 49)
+                | (1u64 << 50)
+                | (1u64 << 51);
             assert_eq!(pending0 & swmask, 0);
         }
 
@@ -2664,9 +2718,17 @@ mod tests {
             // Suppress unused-import warnings for the RESET_* constants
             // imported at the module top. Each is used somewhere above or
             // here; this keeps the batch import compact.
-            let _ = (RESET_UART0, RESET_SPI0, RESET_I2C0, RESET_ADC,
-                RESET_PWM, RESET_IO_BANK0, RESET_PADS_BANK0,
-                RESET_TIMER1, RESET_DMA);
+            let _ = (
+                RESET_UART0,
+                RESET_SPI0,
+                RESET_I2C0,
+                RESET_ADC,
+                RESET_PWM,
+                RESET_IO_BANK0,
+                RESET_PADS_BANK0,
+                RESET_TIMER1,
+                RESET_DMA,
+            );
         }
 
         // ---- CoreBus wait-state accounting via dyn --------------------
@@ -2776,7 +2838,7 @@ mod tests {
         #[test]
         fn ticks_invalidate_lazy_on_timer0_ctrl_write() {
             use crate::peripherals::ticks::{
-                CTRL_ENABLE, DOMAIN_STRIDE, DOMAIN_TIMER0, CTRL_OFFSET,
+                CTRL_ENABLE, CTRL_OFFSET, DOMAIN_STRIDE, DOMAIN_TIMER0,
             };
             let shared = fresh_shared();
             let mut bus = WorkerBus::new(0, shared);

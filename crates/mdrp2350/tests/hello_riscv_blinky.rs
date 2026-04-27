@@ -20,8 +20,7 @@ use std::time::{Duration, Instant};
 
 use mdrp2350::{Arch, Config, Emulator, EmulatorBuilder};
 
-const BLINKY_RISCV_BIN: &[u8] =
-    include_bytes!("../../../roms/rp2350/blinky-riscv.bin");
+const BLINKY_RISCV_BIN: &[u8] = include_bytes!("../../../roms/rp2350/blinky-riscv.bin");
 
 const LOAD_BASE: u32 = 0x2000_0000;
 const LED_PIN: u8 = 25;
@@ -29,7 +28,8 @@ const LED_PIN: u8 = 25;
 fn prepare_emu() -> Emulator {
     let mut emu = EmulatorBuilder::new(Config::default())
         .arch(Arch::RiscV)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_image(LOAD_BASE, BLINKY_RISCV_BIN);
     emu.reset();
     emu
@@ -40,8 +40,10 @@ fn blinky_riscv_toggles_led_pin() {
     let mut emu = prepare_emu();
 
     // Sanity: GPIO25 starts low (post-reset SIO.GPIO_OUT = 0, OE = 0).
-    assert!(!emu.gpio_read(LED_PIN),
-            "GPIO{LED_PIN} should be low at reset");
+    assert!(
+        !emu.gpio_read(LED_PIN),
+        "GPIO{LED_PIN} should be low at reset"
+    );
 
     let mut seen_high = false;
     let mut seen_low_after_high = false;
@@ -69,7 +71,8 @@ fn blinky_riscv_toggles_led_pin() {
         assert!(
             Instant::now() < wall_deadline,
             "blinky-riscv did not toggle GPIO{LED_PIN} within 2s wall time \
-             (cycles={})", emu.cycles()
+             (cycles={})",
+            emu.cycles()
         );
     }
 

@@ -25,12 +25,16 @@ fn prepare_emu() -> Emulator {
     emu.reset();
 
     let initial_sp = u32::from_le_bytes([
-        HELLO_UART_BIN[0], HELLO_UART_BIN[1],
-        HELLO_UART_BIN[2], HELLO_UART_BIN[3],
+        HELLO_UART_BIN[0],
+        HELLO_UART_BIN[1],
+        HELLO_UART_BIN[2],
+        HELLO_UART_BIN[3],
     ]);
     let reset_vector = u32::from_le_bytes([
-        HELLO_UART_BIN[4], HELLO_UART_BIN[5],
-        HELLO_UART_BIN[6], HELLO_UART_BIN[7],
+        HELLO_UART_BIN[4],
+        HELLO_UART_BIN[5],
+        HELLO_UART_BIN[6],
+        HELLO_UART_BIN[7],
     ]);
     {
         let arm = emu.cores.expect_arm_mut();

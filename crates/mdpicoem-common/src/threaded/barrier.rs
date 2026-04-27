@@ -294,12 +294,9 @@ impl SpinBarrier {
         // Race: two waiters can both elapse before the first CAS. The
         // first to store wins; the second observes the recorded value
         // via `poisoned_or_timed_out_result`.
-        let _ = self.timeout_elapsed_ms.compare_exchange(
-            0,
-            elapsed_ms as u64,
-            AcqRel,
-            Acquire,
-        );
+        let _ = self
+            .timeout_elapsed_ms
+            .compare_exchange(0, elapsed_ms as u64, AcqRel, Acquire);
         self.timed_out.store(true, Release);
         self.poison();
         BarrierResult::TimedOut { elapsed_ms }
@@ -318,9 +315,7 @@ impl SpinBarrier {
     /// `Duration` isn't `Clone`-friendly inside the emulator error
     /// variant that surfaces this value.
     pub fn timeout_elapsed_ms(&self) -> u32 {
-        self.timeout_elapsed_ms
-            .load(Acquire)
-            .min(u32::MAX as u64) as u32
+        self.timeout_elapsed_ms.load(Acquire).min(u32::MAX as u64) as u32
     }
 
     /// Abort all current and future waiters with [`BarrierResult::Poisoned`].
@@ -344,11 +339,11 @@ impl SpinBarrier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{
         AtomicU32, AtomicUsize,
         Ordering::{self, SeqCst},
     };
-    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -366,12 +361,10 @@ mod tests {
             .map(|i| {
                 let b = Arc::clone(&barrier);
                 let f = Arc::clone(&flags[i]);
-                thread::spawn(move || {
-                    match b.wait() {
-                        BarrierResult::Released => f.store(1, SeqCst),
-                        BarrierResult::Poisoned => panic!("unexpected poison"),
-                        BarrierResult::TimedOut { .. } => panic!("unexpected timeout"),
-                    }
+                thread::spawn(move || match b.wait() {
+                    BarrierResult::Released => f.store(1, SeqCst),
+                    BarrierResult::Poisoned => panic!("unexpected poison"),
+                    BarrierResult::TimedOut { .. } => panic!("unexpected timeout"),
                 })
             })
             .collect();

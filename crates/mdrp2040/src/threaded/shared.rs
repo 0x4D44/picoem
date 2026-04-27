@@ -101,8 +101,7 @@ impl SharedState {
     pub fn new_default() -> Self {
         // 32 AtomicU32 cells. Array init via `core::array::from_fn`
         // keeps the constructor boilerplate contained.
-        let spinlocks_array: [AtomicU32; 32] =
-            std::array::from_fn(|_| AtomicU32::new(0));
+        let spinlocks_array: [AtomicU32; 32] = std::array::from_fn(|_| AtomicU32::new(0));
 
         Self {
             memory: Arc::new(SharedMemory::new_zero()),

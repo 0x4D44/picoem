@@ -11,9 +11,9 @@
 // cycle count against the NOP-corrected HW median.
 
 use mdpicoem_harness::bank_conflict_cases::{
-    build_catalog, measure_nop_baseline_hw, run_bank_case, BankArgs, BankCase,
+    BankArgs, BankCase, build_catalog, measure_nop_baseline_hw, run_bank_case,
 };
-use mdpicoem_harness::silicon_oracle::{enable_cyccnt, name_matches_filter, Verdict};
+use mdpicoem_harness::silicon_oracle::{Verdict, enable_cyccnt, name_matches_filter};
 use probe_rs::{Session, SessionConfig};
 use std::time::{Duration, Instant};
 
@@ -122,16 +122,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     println!(
         "{:<26} {:>5} {:>5} {:>11} {:>9} {:>7} {:>7} {:>+7} {:>6} {:>6}",
-        "case",
-        "fbnk",
-        "dbnk",
-        "data",
-        "hw_med",
-        "hw_adj",
-        "emu",
-        "delta",
-        "tol",
-        "verdict",
+        "case", "fbnk", "dbnk", "data", "hw_med", "hw_adj", "emu", "delta", "tol", "verdict",
     );
     println!("{}", "-".repeat(110));
 
@@ -140,7 +131,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut fail = 0usize;
     let t0 = Instant::now();
     for case in &selected {
-        let r = run_bank_case(&mut core, case, args.num_samples, args.tolerance, nop_baseline)?;
+        let r = run_bank_case(
+            &mut core,
+            case,
+            args.num_samples,
+            args.tolerance,
+            nop_baseline,
+        )?;
         total += 1;
         match r.verdict {
             Verdict::Pass => pass += 1,

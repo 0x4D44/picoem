@@ -1,11 +1,11 @@
-pub mod registers;
-pub(crate) mod decode;
-mod execute;
-pub(crate) mod execute_thumb32;
-mod execute_fpu;
-pub(crate) mod exceptions;
-pub(crate) mod coprocessor;
 pub mod bus_trait;
+pub(crate) mod coprocessor;
+pub(crate) mod decode;
+pub(crate) mod exceptions;
+mod execute;
+mod execute_fpu;
+pub(crate) mod execute_thumb32;
+pub mod registers;
 
 use std::sync::Arc;
 
@@ -16,8 +16,8 @@ use tracing::info;
 use crate::bus::Bus;
 use crate::bus::ppb::Ppb;
 use crate::threaded::CoreAtomics;
-pub use registers::Registers;
 pub use bus_trait::CoreBus;
+pub use registers::Registers;
 
 // Per-core interpolator register file (INTERP0 or INTERP1). Phase 3
 // Stage 3 (LLD V7 §6) moved register storage off `Sio` onto each core's
@@ -125,30 +125,36 @@ impl PerCoreSio {
     fn divider_write(&mut self, offset: u32, val: u32) {
         let d = &mut self.divider;
         match offset {
-            0x060 => { // DIV_UDIVIDEND
+            0x060 => {
+                // DIV_UDIVIDEND
                 d.dividend = val;
                 d.signed = false;
             }
-            0x064 => { // DIV_UDIVISOR — triggers unsigned computation
+            0x064 => {
+                // DIV_UDIVISOR — triggers unsigned computation
                 d.divisor = val;
                 d.signed = false;
                 Self::compute_division(d);
             }
-            0x068 => { // DIV_SDIVIDEND
+            0x068 => {
+                // DIV_SDIVIDEND
                 d.dividend = val;
                 d.signed = true;
             }
-            0x06C => { // DIV_SDIVISOR — triggers signed computation
+            0x06C => {
+                // DIV_SDIVISOR — triggers signed computation
                 d.divisor = val;
                 d.signed = true;
                 Self::compute_division(d);
             }
-            0x070 => { // DIV_QUOTIENT (direct set)
+            0x070 => {
+                // DIV_QUOTIENT (direct set)
                 d.quotient = val;
                 d.dirty = true;
                 d.reads_pending = 0;
             }
-            0x074 => { // DIV_REMAINDER (direct set)
+            0x074 => {
+                // DIV_REMAINDER (direct set)
                 d.remainder = val;
                 d.dirty = true;
                 d.reads_pending = 0;
@@ -162,7 +168,11 @@ impl PerCoreSio {
             // Division by zero (RP2350 behavior)
             if d.signed {
                 let dividend_signed = d.dividend as i32;
-                d.quotient = if dividend_signed < 0 { 1u32 } else { (-1i32) as u32 };
+                d.quotient = if dividend_signed < 0 {
+                    1u32
+                } else {
+                    (-1i32) as u32
+                };
             } else {
                 d.quotient = 0xFFFF_FFFF;
             }
@@ -220,7 +230,13 @@ impl CoreCounters {
     fn classify_access(&mut self, addr: u32, is_write: bool) {
         let region = addr >> 28;
         match region {
-            0x2 => if is_write { self.sram_writes += 1 } else { self.sram_reads += 1 },
+            0x2 => {
+                if is_write {
+                    self.sram_writes += 1
+                } else {
+                    self.sram_reads += 1
+                }
+            }
             0xD => self.sio_accesses += 1,
             0xE => self.ppb_accesses += 1,
             _ => self.peripheral_accesses += 1,
@@ -452,9 +468,7 @@ impl CortexM33 {
         // the quantum boundary and propagates `shutdown_requested` on
         // the `Emulator`.
         let pc = self.regs.pc();
-        if Some(pc) == self.bootrom_reboot_hook_pc_s
-            || Some(pc) == self.bootrom_reboot_hook_pc_ns
-        {
+        if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
             self.bootrom_hook_fired = true;
             self.atomics.set_halted(core);
             return;
@@ -540,9 +554,7 @@ impl CortexM33 {
         // Bootrom mask-ROM hook — same shape as `Self::step`, see HLD
         // V5 §"Component 3 — Bootrom mask-ROM" / "Hook check placement".
         let pc = self.regs.pc();
-        if Some(pc) == self.bootrom_reboot_hook_pc_s
-            || Some(pc) == self.bootrom_reboot_hook_pc_ns
-        {
+        if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
             self.bootrom_hook_fired = true;
             self.atomics.set_halted(self.core_id as usize);
             return;
@@ -607,7 +619,7 @@ impl CortexM33 {
     /// evicted too). Non-cacheable addresses (anything outside ROM / XIP
     /// / SRAM per `is_cacheable_pc`) are skipped.
     pub fn invalidate_decode_cache_entries(&mut self, addrs: &[u32]) {
-        use crate::bus::{DecodedOp, DECODE_CACHE_SIZE, is_cacheable_pc};
+        use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
         const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
         let empty = DecodedOp::empty();
         for &addr in addrs {
@@ -838,7 +850,11 @@ impl CortexM33 {
             // returns 0 — byte access is more unusual and worth flagging
             // via a telltale zero.
             let word = self.ppb.read32(addr & !3);
-            let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
+            let val = if addr & 2 != 0 {
+                (word >> 16) as u16
+            } else {
+                word as u16
+            };
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
             }
@@ -847,7 +863,11 @@ impl CortexM33 {
             // Matches the pre-Stage-3 `Bus::read16` 0xD path: read the
             // containing 32-bit SIO register and slice the halfword.
             let word = self.sio_local.read32(addr & 0xFFF & !3);
-            let val = if addr & 2 != 0 { (word >> 16) as u16 } else { word as u16 };
+            let val = if addr & 2 != 0 {
+                (word >> 16) as u16
+            } else {
+                word as u16
+            };
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
             }
@@ -950,7 +970,11 @@ impl CortexM33 {
             let word = if low == 0xE200 || low == 0xE280 { 0 } else { 1 };
             let ispr = self.ppb.nvic_ispr[word].load(std::sync::atomic::Ordering::Relaxed);
             let mask64 = (ispr as u64) << (word * 32);
-            let keep = if word == 0 { !0xFFFF_FFFFu64 } else { 0xFFFF_FFFFu64 };
+            let keep = if word == 0 {
+                !0xFFFF_FFFFu64
+            } else {
+                0xFFFF_FFFFu64
+            };
             let core = self.core_id as usize;
             // Phase 3 Stage 1: `irq_pending` migrated onto `CoreAtomics`.
             // Preserve the word that isn't being replaced; overwrite the
@@ -1141,7 +1165,7 @@ mod tests {
         let mut s = PerCoreSio::default();
         // 100 / 7 = 14 remainder 2
         s.write32(0x060, 100); // DIV_UDIVIDEND
-        s.write32(0x064, 7);   // DIV_UDIVISOR
+        s.write32(0x064, 7); // DIV_UDIVISOR
         assert_eq!(s.read32(0x070), 14);
         assert_eq!(s.read32(0x074), 2);
     }
@@ -1151,7 +1175,7 @@ mod tests {
         let mut s = PerCoreSio::default();
         // -100 / 7 = -14 remainder -2
         s.write32(0x068, (-100i32) as u32); // DIV_SDIVIDEND
-        s.write32(0x06C, 7);                // DIV_SDIVISOR
+        s.write32(0x06C, 7); // DIV_SDIVISOR
         assert_eq!(s.read32(0x070) as i32, -14);
         assert_eq!(s.read32(0x074) as i32, -2);
     }
@@ -1170,7 +1194,7 @@ mod tests {
     fn divider_unsigned_div_by_zero() {
         let mut s = PerCoreSio::default();
         s.write32(0x060, 42); // dividend = 42
-        s.write32(0x064, 0);  // divisor = 0
+        s.write32(0x064, 0); // divisor = 0
         assert_eq!(s.read32(0x070), 0xFFFF_FFFF);
         assert_eq!(s.read32(0x074), 42);
     }
@@ -1179,7 +1203,7 @@ mod tests {
     fn divider_signed_div_by_zero_positive() {
         let mut s = PerCoreSio::default();
         s.write32(0x068, 42); // dividend = 42 (positive)
-        s.write32(0x06C, 0);  // divisor = 0
+        s.write32(0x06C, 0); // divisor = 0
         // positive dividend / 0 → quotient = -1
         assert_eq!(s.read32(0x070) as i32, -1);
         assert_eq!(s.read32(0x074), 42);
@@ -1189,7 +1213,7 @@ mod tests {
     fn divider_signed_div_by_zero_negative() {
         let mut s = PerCoreSio::default();
         s.write32(0x068, (-42i32) as u32); // dividend = -42
-        s.write32(0x06C, 0);               // divisor = 0
+        s.write32(0x06C, 0); // divisor = 0
         // negative dividend / 0 → quotient = 1
         assert_eq!(s.read32(0x070), 1);
         assert_eq!(s.read32(0x074), (-42i32) as u32);
@@ -1273,7 +1297,7 @@ mod tests {
 
         // Core 0: 100 / 10 = 10 remainder 0 — all via MMIO.
         core0.bus_write32(0xD000_0060, 100, &mut bus); // DIV_UDIVIDEND
-        core0.bus_write32(0xD000_0064, 10,  &mut bus); // DIV_UDIVISOR (triggers compute)
+        core0.bus_write32(0xD000_0064, 10, &mut bus); // DIV_UDIVISOR (triggers compute)
 
         // Core 1 has not touched DIV yet — its quotient must still be
         // 0 (POR default). If storage were aliased, core 1 would see
@@ -1290,7 +1314,7 @@ mod tests {
 
         // Core 1 does its own divide via MMIO: 99 / 9 = 11.
         core1.bus_write32(0xD000_0060, 99, &mut bus);
-        core1.bus_write32(0xD000_0064, 9,  &mut bus);
+        core1.bus_write32(0xD000_0064, 9, &mut bus);
         assert_eq!(core1.bus_read32(0xD000_0070, &mut bus), 11);
 
         // Core 0's quotient is unchanged by core 1's concurrent divide.

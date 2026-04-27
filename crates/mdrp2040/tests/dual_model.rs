@@ -195,20 +195,16 @@ fn run_quantum_advances_both_models() {
 
 #[test]
 fn single_core_alu_loop_advances_core0() {
-    both_models_compare(
-        RUN_CYCLES,
-        seed_single_core_alu,
-        |_emu, c0, c1| (c0 > 0, c1 == 0),
-    );
+    both_models_compare(RUN_CYCLES, seed_single_core_alu, |_emu, c0, c1| {
+        (c0 > 0, c1 == 0)
+    });
 }
 
 #[test]
 fn dual_core_alu_both_cores_advance() {
-    both_models_compare(
-        RUN_CYCLES,
-        seed_dual_core_alu,
-        |_emu, c0, c1| (c0 > 0, c1 > 0),
-    );
+    both_models_compare(RUN_CYCLES, seed_dual_core_alu, |_emu, c0, c1| {
+        (c0 > 0, c1 > 0)
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -367,11 +363,7 @@ fn spinlock_prerun_claim() {
     for model in [ExecutionModel::Serial, ExecutionModel::Threaded] {
         let mut emu = build(model);
         let claim = emu.mmio_read32(spinlock_addr(5));
-        assert_eq!(
-            claim,
-            1 << 5,
-            "{model:?}: spinlock 5 claim must succeed",
-        );
+        assert_eq!(claim, 1 << 5, "{model:?}: spinlock 5 claim must succeed",);
         let reclaim = emu.mmio_read32(spinlock_addr(5));
         assert_eq!(reclaim, 0, "{model:?}: spinlock 5 re-claim must return 0");
     }
@@ -566,7 +558,11 @@ fn nvic_pre_run_enable_write_accepted() {
         emu.mmio_write32(NVIC_ISER0, 0x0000_0001);
         if model == ExecutionModel::Serial {
             let iser = emu.mmio_read32(NVIC_ISER0);
-            assert_eq!(iser & 1, 1, "NVIC_ISER bit0 must be 1 post-write on {model:?}");
+            assert_eq!(
+                iser & 1,
+                1,
+                "NVIC_ISER bit0 must be 1 post-write on {model:?}"
+            );
         }
         emu.mmio_write32(NVIC_ICER0, 0xFFFF_FFFF);
         emu.core_mut(0).halt();

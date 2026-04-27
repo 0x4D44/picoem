@@ -211,7 +211,13 @@ fn stats(samples: &[u64]) -> (u64, u64, u64, u64, u64) {
         let raw = (sorted.len() as u64 * 99).div_ceil(100);
         (raw.saturating_sub(1) as usize).min(sorted.len() - 1)
     };
-    (mean, sorted[p50_idx], sorted[p99_idx], sorted[sorted.len() - 1], total)
+    (
+        mean,
+        sorted[p50_idx],
+        sorted[p99_idx],
+        sorted[sorted.len() - 1],
+        total,
+    )
 }
 
 /// Runtime helper a worker uses to bracket its wait / phase-work spans.

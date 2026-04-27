@@ -63,8 +63,7 @@ use mdpicoem_harness::{
 use mdrp2350::{Config, Emulator, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-const FLASH_PATH: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
+const FLASH_PATH: &str = "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
 
 /// ROM set index parsed from the fixture. `0` = 1541 $E000 kernal
 /// (901229-06AA). Change + recompile to sweep a different set; no
@@ -123,9 +122,7 @@ fn main() -> ExitCode {
     // Up-front shadow-lift sanity check (mirrors the PIO stress binary):
     // confirm `ROM_SET_INDEX` parses out of the fixture. If None, the
     // sweep is meaningless.
-    if onerom_serving_oracle::lift_shadow_from_flash_pub(&flash, ROM_SET_INDEX)
-        .is_none()
-    {
+    if onerom_serving_oracle::lift_shadow_from_flash_pub(&flash, ROM_SET_INDEX).is_none() {
         eprintln!(
             "failed to lift ROM set {} from fixture — wrong index or malformed flash",
             ROM_SET_INDEX
@@ -136,7 +133,8 @@ fn main() -> ExitCode {
     // step_quantum=1 for per-cycle observation fidelity.
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
-        .build().unwrap();
+        .build()
+        .unwrap();
     emu.load_bootrom(&bootrom);
     emu.load_flash(&flash);
     emu.reset();
@@ -212,12 +210,12 @@ fn main() -> ExitCode {
     // Phase 2: PC + sentinel sync. If sentinel is None (window
     // all-zero) this degrades to PC-only — same contract as the CPU
     // oracle binary.
-    let mut sync_cycle: Option<u64> =
-        if is_in_serve_loop_1541(&emu) && sentinel_ok(&emu, sentinel) {
-            phase1_cycle
-        } else {
-            None
-        };
+    let mut sync_cycle: Option<u64> = if is_in_serve_loop_1541(&emu) && sentinel_ok(&emu, sentinel)
+    {
+        phase1_cycle
+    } else {
+        None
+    };
     while sync_cycle.is_none() && emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
         emu.run(1).expect("Serial run is infallible");
@@ -260,8 +258,7 @@ fn main() -> ExitCode {
     // report formatter. The verdict mapping is straight across; see
     // `cpu_to_pio_result` below.
     let cpu_results = oracle.results();
-    let pio_results: Vec<CaseResult> =
-        cpu_results.iter().map(cpu_to_pio_result).collect();
+    let pio_results: Vec<CaseResult> = cpu_results.iter().map(cpu_to_pio_result).collect();
 
     let sys_clk_hz = emu.bus.sys_clk_hz();
     let hist = onerom_stress::compute_histogram(&pio_results, sys_clk_hz);
@@ -338,14 +335,10 @@ fn sentinel_ok(emu: &Emulator, sentinel: Option<(u32, u8)>) -> bool {
 fn cpu_to_pio_result(cpu: &CpuCaseResult) -> CaseResult {
     let verdict = match cpu.verdict {
         CpuVerdict::Pass => Verdict::Pass,
-        CpuVerdict::WrongByte { expected, observed } => {
-            Verdict::WrongByte { expected, observed }
-        }
+        CpuVerdict::WrongByte { expected, observed } => Verdict::WrongByte { expected, observed },
         CpuVerdict::DataPinsNotDriven => Verdict::NoResolve,
         CpuVerdict::NoStableByte => Verdict::NoStableByte,
-        CpuVerdict::LatencyOutOfEnvelope { cycles } => {
-            Verdict::LatencyOutOfEnvelope { cycles }
-        }
+        CpuVerdict::LatencyOutOfEnvelope { cycles } => Verdict::LatencyOutOfEnvelope { cycles },
     };
     CaseResult {
         case: Case::new(cpu.case.label, cpu.case.addr_bits),

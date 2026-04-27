@@ -346,10 +346,7 @@ mod tests {
         );
         // Offset 0x80 aliases to 0x00 (domain 0, CTRL) via the & 0x7F
         // mask, matching silicon's incomplete APB decode.
-        assert_eq!(
-            TicksRegs::decode_offset(0x80),
-            Some((0, CTRL_OFFSET))
-        );
+        assert_eq!(TicksRegs::decode_offset(0x80), Some((0, CTRL_OFFSET)));
     }
 
     // --- Reset state -----------------------------------------------------
@@ -386,8 +383,11 @@ mod tests {
         t.domains[DOMAIN_TIMER0].enable = true;
         t.domains[DOMAIN_TIMER0].cycles = 0;
         t.advance_all(1_000_000);
-        assert_eq!(t.take_timer0_edges(), 0,
-            "CYCLES=0 must halt the divider, no edges");
+        assert_eq!(
+            t.take_timer0_edges(),
+            0,
+            "CYCLES=0 must halt the divider, no edges"
+        );
     }
 
     #[test]
@@ -449,7 +449,10 @@ mod tests {
         let mut t = TicksRegs::new_hardware_reset();
         let off_cycles = DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE + CYCLES_OFFSET;
         let invalidates = t.write32(off_cycles, 24, 0);
-        assert!(invalidates, "CYCLES write on TIMER0 must request invalidation");
+        assert!(
+            invalidates,
+            "CYCLES write on TIMER0 must request invalidation"
+        );
         assert_eq!(t.domains[DOMAIN_TIMER0].cycles, 24);
         assert_eq!(t.read32(off_cycles), 24);
     }
@@ -546,8 +549,10 @@ mod tests {
         t.domains[DOMAIN_TIMER0].sys_clks = 99;
         let off_ctrl = DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE + CTRL_OFFSET;
         t.write32(off_ctrl, CTRL_ENABLE, 0);
-        assert_eq!(t.domains[DOMAIN_TIMER0].sys_clks, 0,
-            "ENABLE 0→1 transition must zero the accumulator");
+        assert_eq!(
+            t.domains[DOMAIN_TIMER0].sys_clks, 0,
+            "ENABLE 0→1 transition must zero the accumulator"
+        );
     }
 
     // --- Alias semantics (BITSET / BITCLR) -------------------------------
@@ -616,8 +621,10 @@ mod tests {
         // >= DOMAIN_COUNT, so the write is rejected (returns false).
         let before = t.domains;
         assert!(!t.write32(0x4C, 0xFFFF_FFFF, 0));
-        assert_eq!(t.domains.map(|d| (d.enable, d.cycles)),
-                   before.map(|d| (d.enable, d.cycles)));
+        assert_eq!(
+            t.domains.map(|d| (d.enable, d.cycles)),
+            before.map(|d| (d.enable, d.cycles))
+        );
     }
 
     // --- RISCV domain drain (Residual A.2.1) -----------------------------

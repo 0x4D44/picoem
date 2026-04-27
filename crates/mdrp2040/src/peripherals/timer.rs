@@ -276,14 +276,7 @@ impl TimerRegs {
     /// Write a TIMER register with an APB alias (normalised 2-bit form:
     /// 0 plain / 1 XOR / 2 BITSET / 3 BITCLR). `sys_hz` lets ALARM writes
     /// convert the target microsecond value to a fire-cycle.
-    pub fn write32(
-        &mut self,
-        offset: u32,
-        value: u32,
-        alias: u32,
-        master_cycle: u64,
-        sys_hz: u32,
-    ) {
+    pub fn write32(&mut self, offset: u32, value: u32, alias: u32, master_cycle: u64, sys_hz: u32) {
         match offset {
             // Phase 1: software-poke of TIMER value is a no-op.
             TIMEHW_OFFSET | TIMELW_OFFSET | TIMEHR_OFFSET => {}
@@ -446,8 +439,11 @@ mod tests {
         t.read32(TIMELR_OFFSET, us1 * 125, SYS_HZ);
         // Bump master_cycle so now > latched.
         let us2: u64 = (9u64 << 32) | 99;
-        assert_eq!(t.read32(TIMEHR_OFFSET, us2 * 125, SYS_HZ), 1,
-            "TIMEHR must return the latched snapshot, not the live value");
+        assert_eq!(
+            t.read32(TIMEHR_OFFSET, us2 * 125, SYS_HZ),
+            1,
+            "TIMEHR must return the latched snapshot, not the live value"
+        );
     }
 
     // --- Alarms + IRQ ----------------------------------------------------
@@ -471,11 +467,7 @@ mod tests {
         let mut t = TimerRegs::new();
         // Write ALARM0 = 100 µs at master_cycle 0.
         t.write32(ALARM0_OFFSET, 100, 0, 0, SYS_HZ);
-        assert_eq!(
-            t.poll_alarms(99 * 125, SYS_HZ),
-            0,
-            "no fire before target"
-        );
+        assert_eq!(t.poll_alarms(99 * 125, SYS_HZ), 0, "no fire before target");
         let nvic_bits = t.poll_alarms(100 * 125, SYS_HZ);
         assert_eq!(nvic_bits, 0, "INTE not set => no NVIC line raised");
         // But INTR bit is latched even without INTE.
@@ -512,13 +504,19 @@ mod tests {
         assert_eq!(t.armed & 1, 0, "alarm auto-disarmed after fire");
         // Second poll with INTR still latched: MUST re-raise.
         let n2 = t.poll_alarms(101 * 125, SYS_HZ);
-        assert_eq!(n2 & 1, 1,
-            "level re-assert: INTR latched + INTE set => NVIC bit 0 re-raised");
+        assert_eq!(
+            n2 & 1,
+            1,
+            "level re-assert: INTR latched + INTE set => NVIC bit 0 re-raised"
+        );
         // After W1C of INTR, the re-assert stops.
         t.write32(INTR_OFFSET, 1, 0, 0, SYS_HZ);
         let n3 = t.poll_alarms(102 * 125, SYS_HZ);
-        assert_eq!(n3 & 1, 0,
-            "after firmware W1Cs INTR, the level condition drops");
+        assert_eq!(
+            n3 & 1,
+            0,
+            "after firmware W1Cs INTR, the level condition drops"
+        );
     }
 
     #[test]
@@ -600,8 +598,10 @@ mod tests {
     fn is_idle_true_with_armed_but_no_pending() {
         let mut t = TimerRegs::new();
         t.write32(ALARM0_OFFSET, 100, 0, 0, SYS_HZ);
-        assert!(t.is_idle(),
-            "alarms armed but not yet fired are fast-path idle");
+        assert!(
+            t.is_idle(),
+            "alarms armed but not yet fired are fast-path idle"
+        );
     }
 
     // --- Multiple alarms --------------------------------------------------

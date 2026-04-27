@@ -1,8 +1,8 @@
 // Helpers used by stubs once instructions are implemented in later stages.
 #![allow(dead_code)]
 
-use super::{CortexM33, CoreBus};
-use super::execute::{sign_extend, add_with_carry};
+use super::execute::{add_with_carry, sign_extend};
+use super::{CoreBus, CortexM33};
 
 // ============================================================================
 // ThumbExpandImm helpers
@@ -17,7 +17,7 @@ pub(crate) fn thumb_expand_imm_c(imm12: u32, carry_in: bool) -> (u32, bool) {
             0b00 => imm8,
             0b01 => (imm8 << 16) | imm8,
             0b10 => (imm8 << 24) | (imm8 << 8),
-            _    => imm8.wrapping_mul(0x01_01_01_01),
+            _ => imm8.wrapping_mul(0x01_01_01_01),
         };
         (val, carry_in)
     } else {
@@ -102,7 +102,12 @@ pub(crate) fn barrel_shift(val: u32, shift_type: u8, amount: u32, carry_in: bool
 impl CortexM33 {
     // -- Data processing (modified immediate) --------------------------------
 
-    pub(crate) fn thumb32_dp_modified_imm<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_dp_modified_imm<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let op = ((hw0 >> 5) & 0xF) as u8;
         let s = (hw0 >> 4) & 1 != 0;
         let rn = (hw0 & 0xF) as usize;
@@ -188,11 +193,13 @@ impl CortexM33 {
                 let (result, carry, overflow) = add_with_carry(self.regs.r[rn], imm32, false);
                 if s && rd == 15 {
                     // CMN — discard result, update flags only
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 } else {
                     self.regs.r[rd] = result;
                     if s {
-                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                        self.regs
+                            .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                     }
                 }
                 cy
@@ -203,7 +210,8 @@ impl CortexM33 {
                     add_with_carry(self.regs.r[rn], imm32, self.regs.flag_c());
                 self.regs.r[rd] = result;
                 if s {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
                 cy
             }
@@ -213,7 +221,8 @@ impl CortexM33 {
                     add_with_carry(self.regs.r[rn], !imm32, self.regs.flag_c());
                 self.regs.r[rd] = result;
                 if s {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
                 cy
             }
@@ -222,11 +231,13 @@ impl CortexM33 {
                 let (result, carry, overflow) = add_with_carry(self.regs.r[rn], !imm32, true);
                 if s && rd == 15 {
                     // CMP — discard result, update flags only
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 } else {
                     self.regs.r[rd] = result;
                     if s {
-                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                        self.regs
+                            .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                     }
                 }
                 cy
@@ -236,7 +247,8 @@ impl CortexM33 {
                 let (result, carry, overflow) = add_with_carry(!self.regs.r[rn], imm32, true);
                 self.regs.r[rd] = result;
                 if s {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
                 cy
             }
@@ -247,7 +259,12 @@ impl CortexM33 {
 
     // -- Data processing (plain binary immediate) ----------------------------
 
-    pub(crate) fn thumb32_dp_plain_imm<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_dp_plain_imm<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let op = ((hw0 >> 4) & 0x1F) as u8;
         let rn = (hw0 & 0xF) as usize;
         let rd = ((hw1 >> 8) & 0xF) as usize;
@@ -335,8 +352,7 @@ impl CortexM33 {
                     self.regs.r[rd] = self.regs.r[rd] & !mask;
                 } else {
                     // BFI: insert bits from Rn
-                    self.regs.r[rd] = (self.regs.r[rd] & !mask)
-                        | ((self.regs.r[rn] << lsb) & mask);
+                    self.regs.r[rd] = (self.regs.r[rd] & !mask) | ((self.regs.r[rn] << lsb) & mask);
                 }
                 1 // M33 measured: 1 cycle
             }
@@ -348,7 +364,11 @@ impl CortexM33 {
                 let shift_n = ((((hw1 >> 12) & 0x7) << 2) | ((hw1 >> 6) & 0x3)) as u32;
                 let shifted = barrel_shift(self.regs.r[rn], shift_type, shift_n, false).0;
                 let signed_val = shifted as i32;
-                let max = if sat_bit < 32 { (1i64 << sat_bit) - 1 } else { i64::from(i32::MAX) };
+                let max = if sat_bit < 32 {
+                    (1i64 << sat_bit) - 1
+                } else {
+                    i64::from(i32::MAX)
+                };
                 let result = if signed_val < 0 {
                     self.regs.set_flag_q();
                     0u32
@@ -376,7 +396,12 @@ impl CortexM33 {
 
     // -- Data processing (shifted register) ----------------------------------
 
-    pub(crate) fn thumb32_dp_shifted_reg<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_dp_shifted_reg<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let op = ((hw0 >> 5) & 0xF) as u8;
         let s = (hw0 >> 4) & 1 != 0;
         let rn = (hw0 & 0xF) as usize;
@@ -390,7 +415,13 @@ impl CortexM33 {
 
         // MOV.W/MVN.W (Rn=15): shift is primary operation, always 1 cycle
         // Otherwise: LSL #0..#2 = 1 cycle (barrel shifter fast path), other shifts = 2 cycles
-        let cy = if rn == 15 { 1 } else if shift_type == 0 && shift_n <= 2 { 1 } else { 2 };
+        let cy = if rn == 15 {
+            1
+        } else if shift_type == 0 && shift_n <= 2 {
+            1
+        } else {
+            2
+        };
 
         match op {
             // AND / TST
@@ -465,11 +496,13 @@ impl CortexM33 {
             0b1000 => {
                 let (result, carry, overflow) = add_with_carry(self.regs.r[rn], shifted, false);
                 if s && rd == 15 {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 } else {
                     self.regs.r[rd] = result;
                     if s {
-                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                        self.regs
+                            .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                     }
                 }
                 cy
@@ -480,7 +513,8 @@ impl CortexM33 {
                     add_with_carry(self.regs.r[rn], shifted, self.regs.flag_c());
                 self.regs.r[rd] = result;
                 if s {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
                 cy
             }
@@ -490,7 +524,8 @@ impl CortexM33 {
                     add_with_carry(self.regs.r[rn], !shifted, self.regs.flag_c());
                 self.regs.r[rd] = result;
                 if s {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
                 cy
             }
@@ -498,11 +533,13 @@ impl CortexM33 {
             0b1101 => {
                 let (result, carry, overflow) = add_with_carry(self.regs.r[rn], !shifted, true);
                 if s && rd == 15 {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 } else {
                     self.regs.r[rd] = result;
                     if s {
-                        self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                        self.regs
+                            .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                     }
                 }
                 cy
@@ -512,7 +549,8 @@ impl CortexM33 {
                 let (result, carry, overflow) = add_with_carry(!self.regs.r[rn], shifted, true);
                 self.regs.r[rd] = result;
                 if s {
-                    self.regs.set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
+                    self.regs
+                        .set_nzcv(result >> 31 != 0, result == 0, carry, overflow);
                 }
                 cy
             }
@@ -522,12 +560,17 @@ impl CortexM33 {
 
     // -- Load/store single ---------------------------------------------------
 
-    pub(crate) fn thumb32_load_store_single<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
-        let size = ((hw0 >> 5) & 0x3) as u8;    // hw0[6:5]: 00=byte, 01=half, 10=word
-        let load = (hw0 >> 4) & 1 != 0;         // hw0[4]: 1=load, 0=store
-        let sign = (hw0 >> 8) & 1 != 0;         // hw0[8]: 1=signed load
-        let rn = (hw0 & 0xF) as usize;          // hw0[3:0], 15=PC-relative
-        let rt = ((hw1 >> 12) & 0xF) as usize;  // hw1[15:12]
+    pub(crate) fn thumb32_load_store_single<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
+        let size = ((hw0 >> 5) & 0x3) as u8; // hw0[6:5]: 00=byte, 01=half, 10=word
+        let load = (hw0 >> 4) & 1 != 0; // hw0[4]: 1=load, 0=store
+        let sign = (hw0 >> 8) & 1 != 0; // hw0[8]: 1=signed load
+        let rn = (hw0 & 0xF) as usize; // hw0[3:0], 15=PC-relative
+        let rt = ((hw1 >> 12) & 0xF) as usize; // hw1[15:12]
 
         // PLD/PLI: byte or halfword load with Rt=15 is a preload hint, not a real load.
         // Word-size loads with Rt=15 are real PC loads (LDR.W PC, [...]).
@@ -541,7 +584,11 @@ impl CortexM33 {
             let base = self.read_pc() & !3; // word-aligned PC
             let u = (hw0 >> 7) & 1 != 0;
             let imm12 = (hw1 & 0xFFF) as u32;
-            if u { base.wrapping_add(imm12) } else { base.wrapping_sub(imm12) }
+            if u {
+                base.wrapping_add(imm12)
+            } else {
+                base.wrapping_sub(imm12)
+            }
         } else if (hw0 >> 7) & 1 != 0 {
             // Immediate 12-bit unsigned offset
             let imm12 = (hw1 & 0xFFF) as u32;
@@ -579,21 +626,32 @@ impl CortexM33 {
     /// Returns cycle count: load=2, store=2, undefined=1 (M33 measured).
     #[inline(always)]
     fn thumb32_ls_single_access<B: CoreBus>(
-        &mut self, size: u8, sign: bool, load: bool,
-        rt: usize, addr: u32, bus: &mut B,
+        &mut self,
+        size: u8,
+        sign: bool,
+        load: bool,
+        rt: usize,
+        addr: u32,
+        bus: &mut B,
     ) -> u32 {
         match (size, sign) {
             (0b00, false) => {
-                if load { self.regs.r[rt] = self.bus_read8(addr, bus) as u32; }
-                else { self.bus_write8(addr, self.regs.r[rt] as u8, bus); }
+                if load {
+                    self.regs.r[rt] = self.bus_read8(addr, bus) as u32;
+                } else {
+                    self.bus_write8(addr, self.regs.r[rt] as u8, bus);
+                }
             }
             (0b00, true) => {
                 // LDRSB (load only; signed stores don't exist)
                 self.regs.r[rt] = self.bus_read8(addr, bus) as i8 as i32 as u32;
             }
             (0b01, false) => {
-                if load { self.regs.r[rt] = self.bus_read16(addr, bus) as u32; }
-                else { self.bus_write16(addr, self.regs.r[rt] as u16, bus); }
+                if load {
+                    self.regs.r[rt] = self.bus_read16(addr, bus) as u32;
+                } else {
+                    self.bus_write16(addr, self.regs.r[rt] as u16, bus);
+                }
             }
             (0b01, true) => {
                 // LDRSH (load only)
@@ -616,7 +674,13 @@ impl CortexM33 {
             }
             _ => return 1, // undefined: signed word or size=11
         }
-        if load { 2 } else if addr >> 28 == 0xD { 1 } else { 2 } // SIO stores single-cycle
+        if load {
+            2
+        } else if addr >> 28 == 0xD {
+            1
+        } else {
+            2
+        } // SIO stores single-cycle
     }
 
     // -- Load/store multiple -------------------------------------------------
@@ -631,8 +695,8 @@ impl CortexM33 {
         // Direction: IA (01) or DB (10)
         let op = (hw0 >> 7) & 0x3;
         let mut addr = match op {
-            0b01 => self.regs.r[rn],                                // IA: start at Rn
-            0b10 => self.regs.r[rn].wrapping_sub(count * 4),       // DB: start at Rn - 4*count
+            0b01 => self.regs.r[rn],                         // IA: start at Rn
+            0b10 => self.regs.r[rn].wrapping_sub(count * 4), // DB: start at Rn - 4*count
             _ => return self.thumb32_undefined(hw0, hw1, bus),
         };
 
@@ -661,8 +725,8 @@ impl CortexM33 {
         // Writeback: if W set AND (for loads) Rn is NOT in reglist
         if w && (!load || reglist & (1 << rn) == 0) {
             self.regs.r[rn] = match op {
-                0b01 => self.regs.r[rn].wrapping_add(count * 4),   // IA: Rn + 4*count
-                0b10 => self.regs.r[rn].wrapping_sub(count * 4),   // DB: Rn - 4*count
+                0b01 => self.regs.r[rn].wrapping_add(count * 4), // IA: Rn + 4*count
+                0b10 => self.regs.r[rn].wrapping_sub(count * 4), // DB: Rn - 4*count
                 _ => unreachable!(),
             };
         }
@@ -674,7 +738,12 @@ impl CortexM33 {
 
     // -- Load/store dual, exclusive, table branch ----------------------------
 
-    pub(crate) fn thumb32_load_store_dual<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_load_store_dual<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         // SG (Secure Gateway): encoding 0xE97F_E97F.
         // When executed from Non-Secure state, transitions to Secure and clears
         // LR bit 0 to mark the return address as Non-Secure.
@@ -697,10 +766,12 @@ impl CortexM33 {
             let base = self.regs.r[rn];
             if h {
                 let halfword = self.bus_read16(base.wrapping_add(self.regs.r[rm] << 1), bus);
-                self.regs.set_pc(self.read_pc().wrapping_add((halfword as u32) << 1));
+                self.regs
+                    .set_pc(self.read_pc().wrapping_add((halfword as u32) << 1));
             } else {
                 let byte = self.bus_read8(base.wrapping_add(self.regs.r[rm]), bus);
-                self.regs.set_pc(self.read_pc().wrapping_add((byte as u32) << 1));
+                self.regs
+                    .set_pc(self.read_pc().wrapping_add((byte as u32) << 1));
             }
             return 4;
         }
@@ -758,10 +829,7 @@ impl CortexM33 {
         // LDREXB/STREXB pair at the same byte offset still round-trips,
         // and LDREXH at an odd-word offset (0x102) lines up with STREXH
         // at that same offset.
-        if hw0 & 0xFFF0 == 0xE8D0
-            && (hw1 >> 4) & 0xFF == 0xF4
-            && hw1 & 0xF == 0xF
-        {
+        if hw0 & 0xFFF0 == 0xE8D0 && (hw1 >> 4) & 0xFF == 0xF4 && hw1 & 0xF == 0xF {
             // LDREXB
             let rn = (hw0 & 0xF) as usize;
             let rt = ((hw1 >> 12) & 0xF) as usize;
@@ -770,10 +838,7 @@ impl CortexM33 {
             self.exclusive_address = Some(addr & !3);
             return 2;
         }
-        if hw0 & 0xFFF0 == 0xE8D0
-            && (hw1 >> 4) & 0xFF == 0xF5
-            && hw1 & 0xF == 0xF
-        {
+        if hw0 & 0xFFF0 == 0xE8D0 && (hw1 >> 4) & 0xFF == 0xF5 && hw1 & 0xF == 0xF {
             // LDREXH
             let rn = (hw0 & 0xF) as usize;
             let rt = ((hw1 >> 12) & 0xF) as usize;
@@ -825,8 +890,16 @@ impl CortexM33 {
         let imm8 = (hw1 & 0xFF) as u32;
         let offset = imm8 << 2;
 
-        let base = if rn == 15 { self.read_pc() & !3 } else { self.regs.r[rn] };
-        let offset_addr = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
+        let base = if rn == 15 {
+            self.read_pc() & !3
+        } else {
+            self.regs.r[rn]
+        };
+        let offset_addr = if u {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
         let addr = if p { offset_addr } else { base };
 
         bus.set_burst_mode(true);
@@ -848,7 +921,12 @@ impl CortexM33 {
 
     // -- Branches and miscellaneous control ----------------------------------
 
-    pub(crate) fn thumb32_branch_misc<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_branch_misc<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         // Sub-dispatch per LLD Section 5.7
         if hw1 & (1 << 14) != 0 {
             // hw1[14] = 1 -> BL
@@ -920,9 +998,9 @@ impl CortexM33 {
         if hw0 == 0xF3AF {
             let hint = hw1 & 0xFF;
             return match hint {
-                0x00 => 1,                              // NOP.W
-                0x01 => 1,                              // YIELD.W
-                0x02 => self.wfe(bus),                   // WFE.W
+                0x00 => 1,             // NOP.W
+                0x01 => 1,             // YIELD.W
+                0x02 => self.wfe(bus), // WFE.W
                 // FPU × sleep (HLD §B.7): WFI/WFE retain S0-S31 + FPSCR
                 // and do NOT clear FPCCR.LSPACT. Resume continues with
                 // pre-sleep FP state intact.
@@ -937,7 +1015,10 @@ impl CortexM33 {
                         1
                     }
                 }
-                0x04 => { self.atomics.sev_both(); 1 },  // SEV.W
+                0x04 => {
+                    self.atomics.sev_both();
+                    1
+                } // SEV.W
                 _ => self.thumb32_undefined(hw0, hw1, bus),
             };
         }
@@ -947,7 +1028,10 @@ impl CortexM33 {
             let barrier_op = (hw1 >> 4) & 0xF;
             return match barrier_op {
                 // CLREX: clear the local exclusive monitor (Phase 0b.2).
-                0x2 => { self.exclusive_address = None; 1 }
+                0x2 => {
+                    self.exclusive_address = None;
+                    1
+                }
                 // DSB / DMB: ARMv8-M memory barrier. V7 LLD §10 maps these
                 // to a SeqCst fence so the emulator's semantics are correct
                 // under weaker host memory models (e.g. Loom, aarch64 host).
@@ -1029,9 +1113,7 @@ impl CortexM33 {
             }
             // BASEPRI_MAX — only lowers (numerically) the priority ceiling
             18 => {
-                if val & 0xFF != 0
-                    && ((val & 0xFF) < self.regs.basepri || self.regs.basepri == 0)
-                {
+                if val & 0xFF != 0 && ((val & 0xFF) < self.regs.basepri || self.regs.basepri == 0) {
                     self.regs.basepri = val & 0xFF;
                 }
             }
@@ -1055,9 +1137,9 @@ impl CortexM33 {
             0x89 => self.regs.psp_ns = val,            // PSP_NS
             0x8A => self.regs.msplim_ns = val & !0x7,  // MSPLIM_NS
             0x8B => self.regs.psplim_ns = val & !0x7,  // PSPLIM_NS
-            0x90 => self.regs.primask_ns = val & 1,     // PRIMASK_NS
-            0x91 => self.regs.basepri_ns = val & 0xFF,  // BASEPRI_NS
-            0x93 => self.regs.faultmask_ns = val & 1,   // FAULTMASK_NS
+            0x90 => self.regs.primask_ns = val & 1,    // PRIMASK_NS
+            0x91 => self.regs.basepri_ns = val & 0xFF, // BASEPRI_NS
+            0x93 => self.regs.faultmask_ns = val & 1,  // FAULTMASK_NS
             0x94 => {
                 // CONTROL_NS — same FPCA-preservation rule as Secure CONTROL.
                 let preserved_fpca = self.regs.control_ns & 0x4;
@@ -1161,7 +1243,9 @@ impl CortexM33 {
                     let acc = self.regs.r[ra] as i32;
                     let (result, overflow) = product.overflowing_add(acc);
                     self.regs.r[rd] = result as u32;
-                    if overflow { self.regs.set_flag_q(); }
+                    if overflow {
+                        self.regs.set_flag_q();
+                    }
                 }
             }
             // Dual multiply add: SMLAD/SMLADX (Ra!=15) / SMUAD/SMUADX (Ra=15)
@@ -1170,21 +1254,31 @@ impl CortexM33 {
                 let rn_lo = self.regs.r[rn] as i16 as i32;
                 let rn_hi = (self.regs.r[rn] >> 16) as i16 as i32;
                 let (rm_lo, rm_hi) = if cross {
-                    ((self.regs.r[rm] >> 16) as i16 as i32, self.regs.r[rm] as i16 as i32)
+                    (
+                        (self.regs.r[rm] >> 16) as i16 as i32,
+                        self.regs.r[rm] as i16 as i32,
+                    )
                 } else {
-                    (self.regs.r[rm] as i16 as i32, (self.regs.r[rm] >> 16) as i16 as i32)
+                    (
+                        self.regs.r[rm] as i16 as i32,
+                        (self.regs.r[rm] >> 16) as i16 as i32,
+                    )
                 };
                 let p1 = rn_lo.wrapping_mul(rm_lo);
                 let p2 = rn_hi.wrapping_mul(rm_hi);
                 let (sum, ov1) = p1.overflowing_add(p2);
                 if ra == 15 {
                     self.regs.r[rd] = sum as u32;
-                    if ov1 { self.regs.set_flag_q(); }
+                    if ov1 {
+                        self.regs.set_flag_q();
+                    }
                 } else {
                     let acc = self.regs.r[ra] as i32;
                     let (result, ov2) = sum.overflowing_add(acc);
                     self.regs.r[rd] = result as u32;
-                    if ov1 || ov2 { self.regs.set_flag_q(); }
+                    if ov1 || ov2 {
+                        self.regs.set_flag_q();
+                    }
                 }
             }
             // Word x halfword: SMLAWB/SMLAWT (Ra!=15) / SMULWB/SMULWT (Ra=15)
@@ -1203,7 +1297,9 @@ impl CortexM33 {
                     let acc = self.regs.r[ra] as i32;
                     let (result, overflow) = product_hi.overflowing_add(acc);
                     self.regs.r[rd] = result as u32;
-                    if overflow { self.regs.set_flag_q(); }
+                    if overflow {
+                        self.regs.set_flag_q();
+                    }
                 }
             }
             // Dual multiply subtract: SMLSD/SMLSDX (Ra!=15) / SMUSD/SMUSDX (Ra=15)
@@ -1212,9 +1308,15 @@ impl CortexM33 {
                 let rn_lo = self.regs.r[rn] as i16 as i32;
                 let rn_hi = (self.regs.r[rn] >> 16) as i16 as i32;
                 let (rm_lo, rm_hi) = if cross {
-                    ((self.regs.r[rm] >> 16) as i16 as i32, self.regs.r[rm] as i16 as i32)
+                    (
+                        (self.regs.r[rm] >> 16) as i16 as i32,
+                        self.regs.r[rm] as i16 as i32,
+                    )
                 } else {
-                    (self.regs.r[rm] as i16 as i32, (self.regs.r[rm] >> 16) as i16 as i32)
+                    (
+                        self.regs.r[rm] as i16 as i32,
+                        (self.regs.r[rm] >> 16) as i16 as i32,
+                    )
                 };
                 let p1 = rn_lo.wrapping_mul(rm_lo);
                 let p2 = rn_hi.wrapping_mul(rm_hi);
@@ -1225,7 +1327,9 @@ impl CortexM33 {
                     let acc = self.regs.r[ra] as i32;
                     let (result, overflow) = diff.overflowing_add(acc);
                     self.regs.r[rd] = result as u32;
-                    if overflow { self.regs.set_flag_q(); }
+                    if overflow {
+                        self.regs.set_flag_q();
+                    }
                 }
             }
             // Most significant word multiply: SMMLA/SMMLAR / SMMUL/SMMULR
@@ -1286,7 +1390,12 @@ impl CortexM33 {
 
     // -- Long multiply / divide (64-bit result) ------------------------------
 
-    pub(crate) fn thumb32_long_multiply<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_long_multiply<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let op1 = ((hw0 >> 4) & 0x7) as u8;
         let rn = (hw0 & 0xF) as usize;
         let rd_lo = ((hw1 >> 12) & 0xF) as usize;
@@ -1334,12 +1443,24 @@ impl CortexM33 {
                 self.regs.r[rd_hi] = if b == 0 { 0 } else { a.wrapping_div(b) as u32 };
                 // M33 measured: data-dependent early termination [1..12]
                 // Floor of 5 for all non-zero divisors, scaling to 12 for large dividends
-                let dividend_abs = if a < 0 { a.wrapping_neg() as u32 } else { a as u32 };
+                let dividend_abs = if a < 0 {
+                    a.wrapping_neg() as u32
+                } else {
+                    a as u32
+                };
                 if b == 0 {
                     1
                 } else {
-                    let bits = if dividend_abs == 0 { 0 } else { 32 - dividend_abs.leading_zeros() };
-                    if bits <= 20 { 5 } else { 5 + (bits - 20) * 7 / 11 }
+                    let bits = if dividend_abs == 0 {
+                        0
+                    } else {
+                        32 - dividend_abs.leading_zeros()
+                    };
+                    if bits <= 20 {
+                        5
+                    } else {
+                        5 + (bits - 20) * 7 / 11
+                    }
                 }
             }
             (0b011, 0b1111) => {
@@ -1353,7 +1474,11 @@ impl CortexM33 {
                     1
                 } else {
                     let bits = if a == 0 { 0 } else { 32 - a.leading_zeros() };
-                    if bits <= 20 { 5 } else { 5 + (bits - 20) * 7 / 11 }
+                    if bits <= 20 {
+                        5
+                    } else {
+                        5 + (bits - 20) * 7 / 11
+                    }
                 }
             }
             // SMLALBB/BT/TB/TT: op1=100, op2=10xx
@@ -1383,9 +1508,15 @@ impl CortexM33 {
                 let rn_lo = self.regs.r[rn] as i16 as i64;
                 let rn_hi = (self.regs.r[rn] >> 16) as i16 as i64;
                 let (rm_lo, rm_hi) = if cross {
-                    ((self.regs.r[rm] >> 16) as i16 as i64, self.regs.r[rm] as i16 as i64)
+                    (
+                        (self.regs.r[rm] >> 16) as i16 as i64,
+                        self.regs.r[rm] as i16 as i64,
+                    )
                 } else {
-                    (self.regs.r[rm] as i16 as i64, (self.regs.r[rm] >> 16) as i16 as i64)
+                    (
+                        self.regs.r[rm] as i16 as i64,
+                        (self.regs.r[rm] >> 16) as i16 as i64,
+                    )
                 };
                 let p1 = rn_lo * rm_lo;
                 let p2 = rn_hi * rm_hi;
@@ -1401,9 +1532,15 @@ impl CortexM33 {
                 let rn_lo = self.regs.r[rn] as i16 as i64;
                 let rn_hi = (self.regs.r[rn] >> 16) as i16 as i64;
                 let (rm_lo, rm_hi) = if cross {
-                    ((self.regs.r[rm] >> 16) as i16 as i64, self.regs.r[rm] as i16 as i64)
+                    (
+                        (self.regs.r[rm] >> 16) as i16 as i64,
+                        self.regs.r[rm] as i16 as i64,
+                    )
                 } else {
-                    (self.regs.r[rm] as i16 as i64, (self.regs.r[rm] >> 16) as i16 as i64)
+                    (
+                        self.regs.r[rm] as i16 as i64,
+                        (self.regs.r[rm] >> 16) as i16 as i64,
+                    )
                 };
                 let p1 = rn_lo * rm_lo;
                 let p2 = rn_hi * rm_hi;
@@ -1429,7 +1566,12 @@ impl CortexM33 {
 
     // -- Data processing (register) ------------------------------------------
 
-    pub(crate) fn thumb32_dp_register<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_dp_register<B: CoreBus>(
+        &mut self,
+        hw0: u16,
+        hw1: u16,
+        bus: &mut B,
+    ) -> u32 {
         let rd = ((hw1 >> 8) & 0xF) as usize;
         let rm = (hw1 & 0xF) as usize;
 
@@ -1484,7 +1626,11 @@ impl CortexM33 {
                 // positive overflow occurred (clamp to i32::MAX); if non-negative,
                 // negative overflow occurred (clamp to i32::MIN).
                 let saturate = |val: i32, ov: bool| -> i32 {
-                    if ov { if val < 0 { i32::MAX } else { i32::MIN } } else { val }
+                    if ov {
+                        if val < 0 { i32::MAX } else { i32::MIN }
+                    } else {
+                        val
+                    }
                 };
                 match (op1_65, op2_54) {
                     (0b00, 0b00) => {
@@ -1492,7 +1638,9 @@ impl CortexM33 {
                         let a = self.regs.r[rn] as i32;
                         let b = self.regs.r[rm] as i32;
                         let (result, overflow) = a.overflowing_add(b);
-                        if overflow { self.regs.set_flag_q(); }
+                        if overflow {
+                            self.regs.set_flag_q();
+                        }
                         self.regs.r[rd] = saturate(result, overflow) as u32;
                         2 // M33 measured: 2 cycles (DSP hardware)
                     }
@@ -1501,10 +1649,14 @@ impl CortexM33 {
                         let rn_val = self.regs.r[rn] as i32;
                         let rm_val = self.regs.r[rm] as i32;
                         let (doubled, ov1) = rn_val.overflowing_add(rn_val);
-                        if ov1 { self.regs.set_flag_q(); }
+                        if ov1 {
+                            self.regs.set_flag_q();
+                        }
                         let doubled = saturate(doubled, ov1);
                         let (result, ov2) = rm_val.overflowing_add(doubled);
-                        if ov2 { self.regs.set_flag_q(); }
+                        if ov2 {
+                            self.regs.set_flag_q();
+                        }
                         self.regs.r[rd] = saturate(result, ov2) as u32;
                         2 // M33 measured: 2 cycles (DSP hardware)
                     }
@@ -1513,7 +1665,9 @@ impl CortexM33 {
                         let a = self.regs.r[rm] as i32;
                         let b = self.regs.r[rn] as i32;
                         let (result, overflow) = a.overflowing_sub(b);
-                        if overflow { self.regs.set_flag_q(); }
+                        if overflow {
+                            self.regs.set_flag_q();
+                        }
                         self.regs.r[rd] = saturate(result, overflow) as u32;
                         2 // M33 measured: 2 cycles (DSP hardware)
                     }
@@ -1522,10 +1676,14 @@ impl CortexM33 {
                         let rn_val = self.regs.r[rn] as i32;
                         let rm_val = self.regs.r[rm] as i32;
                         let (doubled, ov1) = rn_val.overflowing_add(rn_val);
-                        if ov1 { self.regs.set_flag_q(); }
+                        if ov1 {
+                            self.regs.set_flag_q();
+                        }
                         let doubled = saturate(doubled, ov1);
                         let (result, ov2) = rm_val.overflowing_sub(doubled);
-                        if ov2 { self.regs.set_flag_q(); }
+                        if ov2 {
+                            self.regs.set_flag_q();
+                        }
                         self.regs.r[rd] = saturate(result, ov2) as u32;
                         2 // M33 measured: 2 cycles (DSP hardware)
                     }
@@ -1553,15 +1711,15 @@ impl CortexM33 {
             // -- Extend ops (hw0[7]=0, hw1[7]=1) --------------------------------
             // hw0 = 1111_1010_0_ext_Rn, hw1 = 1111_Rd_10_rot_Rm
             let rn = (hw0 & 0xF) as usize;
-            let ext = ((hw0 >> 4) & 0x7) as u8;  // hw0[6:4]
-            let rot = ((hw1 >> 4) & 0x3) * 8;    // rotation in bits: 0, 8, 16, 24
+            let ext = ((hw0 >> 4) & 0x7) as u8; // hw0[6:4]
+            let rot = ((hw1 >> 4) & 0x3) * 8; // rotation in bits: 0, 8, 16, 24
             let rotated = self.regs.r[rm].rotate_right(rot as u32);
 
             if rn == 15 {
                 // Plain extend (no add)
                 let result = match ext {
-                    0b000 => (rotated as i16) as i32 as u32,          // SXTH
-                    0b001 => rotated & 0xFFFF,                        // UXTH
+                    0b000 => (rotated as i16) as i32 as u32, // SXTH
+                    0b001 => rotated & 0xFFFF,               // UXTH
                     0b010 => {
                         // SXTB16: sign-extend bytes 0 and 2 to halfwords
                         let b0 = (rotated & 0xFF) as i8 as i16 as u16 as u32;
@@ -1572,8 +1730,8 @@ impl CortexM33 {
                         // UXTB16: zero-extend bytes 0 and 2 to halfwords
                         (rotated & 0xFF) | (((rotated >> 16) & 0xFF) << 16)
                     }
-                    0b100 => (rotated as i8) as i32 as u32,           // SXTB
-                    0b101 => rotated & 0xFF,                          // UXTB
+                    0b100 => (rotated as i8) as i32 as u32, // SXTB
+                    0b101 => rotated & 0xFF,                // UXTB
                     _ => return self.thumb32_undefined(hw0, hw1, bus),
                 };
                 self.regs.r[rd] = result;
@@ -1600,8 +1758,8 @@ impl CortexM33 {
                         let hi = ((addend >> 16) & 0xFFFF).wrapping_add(b2) & 0xFFFF;
                         lo | (hi << 16)
                     }
-                    0b100 => addend.wrapping_add((rotated as i8) as i32 as u32),  // SXTAB
-                    0b101 => addend.wrapping_add(rotated & 0xFF),                 // UXTAB
+                    0b100 => addend.wrapping_add((rotated as i8) as i32 as u32), // SXTAB
+                    0b101 => addend.wrapping_add(rotated & 0xFF),                // UXTAB
                     _ => return self.thumb32_undefined(hw0, hw1, bus),
                 };
                 self.regs.r[rd] = result;
@@ -1611,8 +1769,8 @@ impl CortexM33 {
             // -- Wide shifts by register (hw0[7]=0, hw1[7:4]=0000) --------------
             // hw0 = 1111_1010_0_stype_S_Rn, hw1 = 1111_Rd_0000_Rm
             let rn = (hw0 & 0xF) as usize;
-            let stype = ((hw0 >> 5) & 0x3) as u8;  // hw0[6:5]
-            let s = hw0 & (1 << 4) != 0;           // hw0[4] = S bit
+            let stype = ((hw0 >> 5) & 0x3) as u8; // hw0[6:5]
+            let s = hw0 & (1 << 4) != 0; // hw0[4] = S bit
             let shift = self.regs.r[rm] & 0xFF;
             let value = self.regs.r[rn];
 
@@ -1680,7 +1838,12 @@ impl CortexM33 {
     // -- Parallel add/subtract ------------------------------------------------
 
     fn thumb32_parallel_add_sub(
-        &mut self, rd: usize, rn: usize, rm: usize, par_op1: u8, par_op2: u8,
+        &mut self,
+        rd: usize,
+        rn: usize,
+        rm: usize,
+        par_op1: u8,
+        par_op2: u8,
     ) -> u32 {
         // par_op1 = hw0[6:4] = base operation (ADD8/ADD16/ASX/SAX/SUB8/SUB16)
         // par_op2 = hw1[6:4] = modifier (signed/Q/halving/unsigned/UQ/UH)
@@ -1689,7 +1852,9 @@ impl CortexM33 {
         match par_op2 {
             // Signed variants
             0b000 => match par_op1 {
-                0b001 | 0b010 | 0b110 | 0b101 => self.parallel_signed_16(rd, a, b, par_op1, false, false),
+                0b001 | 0b010 | 0b110 | 0b101 => {
+                    self.parallel_signed_16(rd, a, b, par_op1, false, false)
+                }
                 0b000 | 0b100 => self.parallel_signed_8(rd, a, b, par_op1),
                 _ => 1,
             },
@@ -1699,7 +1864,9 @@ impl CortexM33 {
             0b010 => self.parallel_signed_16(rd, a, b, par_op1, false, true),
             // Unsigned variants
             0b100 => match par_op1 {
-                0b001 | 0b010 | 0b110 | 0b101 => self.parallel_unsigned_16(rd, a, b, par_op1, false, false),
+                0b001 | 0b010 | 0b110 | 0b101 => {
+                    self.parallel_unsigned_16(rd, a, b, par_op1, false, false)
+                }
                 0b000 | 0b100 => self.parallel_unsigned_8(rd, a, b, par_op1),
                 _ => 1,
             },
@@ -1712,17 +1879,23 @@ impl CortexM33 {
     }
 
     fn parallel_signed_16(
-        &mut self, rd: usize, a: u32, b: u32, op: u8, sat: bool, halving: bool,
+        &mut self,
+        rd: usize,
+        a: u32,
+        b: u32,
+        op: u8,
+        sat: bool,
+        halving: bool,
     ) -> u32 {
         let a_lo = a as i16 as i32;
         let a_hi = (a >> 16) as i16 as i32;
         let b_lo = b as i16 as i32;
         let b_hi = (b >> 16) as i16 as i32;
         let (r_lo, r_hi) = match op {
-            0b001 => (a_lo + b_lo, a_hi + b_hi),       // ADD16
-            0b010 => (a_lo - b_hi, a_hi + b_lo),       // ASX
-            0b110 => (a_lo + b_hi, a_hi - b_lo),       // SAX
-            0b101 => (a_lo - b_lo, a_hi - b_hi),       // SUB16
+            0b001 => (a_lo + b_lo, a_hi + b_hi), // ADD16
+            0b010 => (a_lo - b_hi, a_hi + b_lo), // ASX
+            0b110 => (a_lo + b_hi, a_hi - b_lo), // SAX
+            0b101 => (a_lo - b_lo, a_hi - b_hi), // SUB16
             _ => return 1,
         };
         let (lo, hi) = if sat {
@@ -1731,8 +1904,16 @@ impl CortexM33 {
             (r_lo >> 1, r_hi >> 1)
         } else {
             let mut ge = self.regs.ge_flags();
-            if r_lo >= 0 { ge |= 0x3; } else { ge &= !0x3; }
-            if r_hi >= 0 { ge |= 0xC; } else { ge &= !0xC; }
+            if r_lo >= 0 {
+                ge |= 0x3;
+            } else {
+                ge &= !0x3;
+            }
+            if r_hi >= 0 {
+                ge |= 0xC;
+            } else {
+                ge &= !0xC;
+            }
             self.regs.set_ge_flags(ge);
             (r_lo, r_hi)
         };
@@ -1741,7 +1922,13 @@ impl CortexM33 {
     }
 
     fn parallel_unsigned_16(
-        &mut self, rd: usize, a: u32, b: u32, op: u8, sat: bool, halving: bool,
+        &mut self,
+        rd: usize,
+        a: u32,
+        b: u32,
+        op: u8,
+        sat: bool,
+        halving: bool,
     ) -> u32 {
         let a_lo = (a & 0xFFFF) as u32;
         let a_hi = (a >> 16) as u32;
@@ -1749,10 +1936,10 @@ impl CortexM33 {
         let b_hi = (b >> 16) as u32;
         // Use i32 for subtraction results to handle borrow
         let (r_lo_i, r_hi_i): (i32, i32) = match op {
-            0b001 => (a_lo as i32 + b_lo as i32, a_hi as i32 + b_hi as i32),  // ADD16
-            0b010 => (a_lo as i32 - b_hi as i32, a_hi as i32 + b_lo as i32),  // ASX
-            0b110 => (a_lo as i32 + b_hi as i32, a_hi as i32 - b_lo as i32),  // SAX
-            0b101 => (a_lo as i32 - b_lo as i32, a_hi as i32 - b_hi as i32),  // SUB16
+            0b001 => (a_lo as i32 + b_lo as i32, a_hi as i32 + b_hi as i32), // ADD16
+            0b010 => (a_lo as i32 - b_hi as i32, a_hi as i32 + b_lo as i32), // ASX
+            0b110 => (a_lo as i32 + b_hi as i32, a_hi as i32 - b_lo as i32), // SAX
+            0b101 => (a_lo as i32 - b_lo as i32, a_hi as i32 - b_hi as i32), // SUB16
             _ => return 1,
         };
         let (lo, hi) = if sat {
@@ -1768,23 +1955,55 @@ impl CortexM33 {
             match op {
                 0b001 => {
                     // ADD16: both lanes are addition
-                    if r_lo_i >= 0x10000 { ge |= 0x3; } else { ge &= !0x3; }
-                    if r_hi_i >= 0x10000 { ge |= 0xC; } else { ge &= !0xC; }
+                    if r_lo_i >= 0x10000 {
+                        ge |= 0x3;
+                    } else {
+                        ge &= !0x3;
+                    }
+                    if r_hi_i >= 0x10000 {
+                        ge |= 0xC;
+                    } else {
+                        ge &= !0xC;
+                    }
                 }
                 0b010 => {
                     // ASX: lo = sub (a_lo - b_hi), hi = add (a_hi + b_lo)
-                    if r_lo_i >= 0 { ge |= 0x3; } else { ge &= !0x3; }
-                    if r_hi_i >= 0x10000 { ge |= 0xC; } else { ge &= !0xC; }
+                    if r_lo_i >= 0 {
+                        ge |= 0x3;
+                    } else {
+                        ge &= !0x3;
+                    }
+                    if r_hi_i >= 0x10000 {
+                        ge |= 0xC;
+                    } else {
+                        ge &= !0xC;
+                    }
                 }
                 0b110 => {
                     // SAX: lo = add (a_lo + b_hi), hi = sub (a_hi - b_lo)
-                    if r_lo_i >= 0x10000 { ge |= 0x3; } else { ge &= !0x3; }
-                    if r_hi_i >= 0 { ge |= 0xC; } else { ge &= !0xC; }
+                    if r_lo_i >= 0x10000 {
+                        ge |= 0x3;
+                    } else {
+                        ge &= !0x3;
+                    }
+                    if r_hi_i >= 0 {
+                        ge |= 0xC;
+                    } else {
+                        ge &= !0xC;
+                    }
                 }
                 _ => {
                     // SUB16: both lanes are subtraction
-                    if r_lo_i >= 0 { ge |= 0x3; } else { ge &= !0x3; }
-                    if r_hi_i >= 0 { ge |= 0xC; } else { ge &= !0xC; }
+                    if r_lo_i >= 0 {
+                        ge |= 0x3;
+                    } else {
+                        ge &= !0x3;
+                    }
+                    if r_hi_i >= 0 {
+                        ge |= 0xC;
+                    } else {
+                        ge &= !0xC;
+                    }
                 }
             }
             self.regs.set_ge_flags(ge);
@@ -1805,7 +2024,9 @@ impl CortexM33 {
                 0b100 => a_byte - b_byte,
                 _ => return 1,
             };
-            if r >= 0 { ge |= 1 << i; }
+            if r >= 0 {
+                ge |= 1 << i;
+            }
             result |= ((r as u8) as u32) << (i * 8);
         }
         self.regs.set_ge_flags(ge);
@@ -1825,8 +2046,16 @@ impl CortexM33 {
                 _ => return 1,
             };
             match op {
-                0b000 => { if r >= 0x100 { ge |= 1 << i; } }
-                _ => { if r >= 0 { ge |= 1 << i; } }
+                0b000 => {
+                    if r >= 0x100 {
+                        ge |= 1 << i;
+                    }
+                }
+                _ => {
+                    if r >= 0 {
+                        ge |= 1 << i;
+                    }
+                }
             }
             result |= ((r as u32) & 0xFF) << (i * 8);
         }
@@ -1865,7 +2094,12 @@ impl CortexM33 {
     // -- Undefined 32-bit instruction ----------------------------------------
 
     /// Undefined 32-bit instruction — raises UsageFault.
-    pub(crate) fn thumb32_undefined<B: CoreBus>(&mut self, _hw0: u16, _hw1: u16, _bus: &mut B) -> u32 {
+    pub(crate) fn thumb32_undefined<B: CoreBus>(
+        &mut self,
+        _hw0: u16,
+        _hw1: u16,
+        _bus: &mut B,
+    ) -> u32 {
         self.pending_fault = Some(super::Fault::UsageFault);
         0
     }

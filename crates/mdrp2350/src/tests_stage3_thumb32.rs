@@ -35,12 +35,15 @@ fn encode_dp_mod_imm(op: u8, s: bool, rn: u8, rd: u8, imm12: u32) -> (u16, u16) 
 }
 
 fn encode_dp_shifted_reg(
-    op: u8, s: bool, rn: u8, rd: u8, rm: u8, shift_type: u8, shift_n: u8,
+    op: u8,
+    s: bool,
+    rn: u8,
+    rd: u8,
+    rm: u8,
+    shift_type: u8,
+    shift_n: u8,
 ) -> (u16, u16) {
-    let hw0: u16 = 0xEA00
-        | ((op as u16 & 0xF) << 5)
-        | ((s as u16) << 4)
-        | (rn as u16 & 0xF);
+    let hw0: u16 = 0xEA00 | ((op as u16 & 0xF) << 5) | ((s as u16) << 4) | (rn as u16 & 0xF);
     let imm3 = ((shift_n >> 2) & 0x7) as u16;
     let imm2 = (shift_n & 0x3) as u16;
     let hw1: u16 = (imm3 << 12)
@@ -53,8 +56,15 @@ fn encode_dp_shifted_reg(
 
 /// Encode LDR/STR with P/U/W (8-bit immediate, pre/post-index).
 fn encode_ls_imm8_puw(
-    size: u8, load: bool, sign: bool, rt: u8, rn: u8, imm8: u8,
-    p: bool, u: bool, w: bool,
+    size: u8,
+    load: bool,
+    sign: bool,
+    rt: u8,
+    rn: u8,
+    imm8: u8,
+    p: bool,
+    u: bool,
+    w: bool,
 ) -> (u16, u16) {
     // hw0[15:9] = 1111100, hw0[8] = sign, hw0[7] = 0 (imm8 mode uses bit 11 in hw1),
     //   hw0[6:5] = size, hw0[4] = load, hw0[3:0] = Rn
@@ -74,7 +84,7 @@ fn encode_ls_imm8_puw(
 
 // ===========================================================================
 mod data_processing_immediate {
-// ===========================================================================
+    // ===========================================================================
 
     use super::*;
 
@@ -90,7 +100,7 @@ mod data_processing_immediate {
         let (hw0, hw1) = encode_dp_mod_imm(0b0000, true, 0, 15, 0xFF);
         let cy = c.execute_one_wide(hw0, hw1);
         assert!(c.flag_n() || !c.flag_n());
-        assert!(!c.flag_z());      // 0xFF != 0
+        assert!(!c.flag_z()); // 0xFF != 0
         assert_eq!(cy, 1);
     }
 
@@ -370,7 +380,7 @@ mod data_processing_immediate {
 
 // ===========================================================================
 mod dp_shifted_reg {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// LSL #3 (shift_type=0, shift_n=3 > 2) — line 393 false path.
@@ -669,7 +679,7 @@ mod dp_shifted_reg {
 
 // ===========================================================================
 mod load_store_single {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// PLI (signed byte with Rt=15) — line 534.
@@ -776,7 +786,7 @@ mod load_store_single {
 
 // ===========================================================================
 mod ldm_stm {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// `op = 00` → undefined (line 636).
@@ -804,7 +814,7 @@ mod ldm_stm {
     fn ldm_w_writeback_skipped_when_rn_in_list() {
         let (mut c, mut bus) = core_and_bus();
         let base = 0x2000_0100;
-        bus.write32(base, 0xAAAA, 0);       // R0
+        bus.write32(base, 0xAAAA, 0); // R0
         bus.write32(base + 4, 0x1234_5678, 0); // R4 (target base)
         c.set_reg(4, base);
         // LDMIA.W R4!, {R0, R4} — R4 in list, writeback suppressed
@@ -863,7 +873,7 @@ mod ldm_stm {
 
 // ===========================================================================
 mod load_store_dual_and_exclusive {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// SG encoding: in Secure state → NOP (line 681 false branch for !secure).
@@ -1052,7 +1062,7 @@ mod load_store_dual_and_exclusive {
 
 // ===========================================================================
 mod branches_misc_control {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// B.W conditional, condition false — covers line 890 (the else branch).
@@ -1144,7 +1154,7 @@ mod branches_misc_control {
 
 // ===========================================================================
 mod multiply {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// MLA — line 1130 Ra != 15 branch.
@@ -1468,7 +1478,7 @@ mod multiply {
 
 // ===========================================================================
 mod long_multiply {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// SDIV with zero dividend → bits=0 → line 1341 false, line 1342 not hit.
@@ -1525,8 +1535,8 @@ mod long_multiply {
     #[test]
     fn smlalbb() {
         let mut c = CortexM33::for_test(0);
-        c.set_reg(0, 0);    // rd_lo
-        c.set_reg(1, 0);    // rd_hi
+        c.set_reg(0, 0); // rd_lo
+        c.set_reg(1, 0); // rd_hi
         c.set_reg(2, 0x0000_0003); // Rn bottom = 3
         c.set_reg(3, 0x0000_0004); // Rm bottom = 4
         let hw0: u16 = 0xFBC0u16 | 2;
@@ -1642,7 +1652,7 @@ mod long_multiply {
 
 // ===========================================================================
 mod mrs_msr {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// MSR APSR with mask=0b10 (NZCVQ).
@@ -2006,7 +2016,7 @@ mod mrs_msr {
 
 // ===========================================================================
 mod tbb_tbh {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// TBB with a negative-ish large offset to cover the line 697/703 path.
@@ -2039,7 +2049,7 @@ mod tbb_tbh {
 
 // ===========================================================================
 mod bfi_ubfx_sbfx {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// BFI with width=1 (single bit).
@@ -2108,7 +2118,7 @@ mod bfi_ubfx_sbfx {
 
 // ===========================================================================
 mod dp_register_misc {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// SXTB16 (extend-only, Rn=15) — hits line 1563/1567.
@@ -2558,7 +2568,7 @@ mod dp_register_misc {
 
 // ===========================================================================
 mod more_coverage {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// DP-shifted-reg with LSR barrel_shift amount=0 (encodes LSR #32,
@@ -3019,7 +3029,7 @@ mod more_coverage {
 
 // ===========================================================================
 mod rotation_cycle_paths {
-// ===========================================================================
+    // ===========================================================================
     // These tests use the rotation-mode ThumbExpandImm (imm12 >> 10 != 0) to
     // push the 2-cycle branch of line 113 in thumb32_dp_modified_imm.
 
@@ -3129,7 +3139,7 @@ mod rotation_cycle_paths {
 
 // ===========================================================================
 mod more_misses {
-// ===========================================================================
+    // ===========================================================================
     use super::*;
 
     /// dp_modified_imm with Rn != 15 for ORR-path (line 144 False).
@@ -3489,7 +3499,7 @@ mod more_misses {
 
 // ===========================================================================
 mod worker_bus_exec {
-// ===========================================================================
+    // ===========================================================================
     //! Duplicate a minimum set of tests via `WorkerBus` so the generic
     //! `thumb32_*` functions' WorkerBus monomorphizations also get their
     //! arms exercised. Covers True:0/False:0 branches that appear in the
@@ -3508,13 +3518,7 @@ mod worker_bus_exec {
 
     /// Run a 4-byte sequence at `pc`: the wide instruction followed by an
     /// infinite loop (B .), via `step_no_atomics`.
-    fn run_wide(
-        c: &mut CortexM33,
-        bus: &mut WorkerBus,
-        pc: u32,
-        hw0: u16,
-        hw1: u16,
-    ) {
+    fn run_wide(c: &mut CortexM33, bus: &mut WorkerBus, pc: u32, hw0: u16, hw1: u16) {
         bus.write16(pc, hw0, 0);
         bus.write16(pc + 2, hw1, 0);
         bus.write16(pc + 4, 0xE7FE, 0);
@@ -3712,10 +3716,8 @@ mod worker_bus_exec {
         let mut pc = 0x2000_2000u32;
 
         let enc = |op: u8, s: bool, rn: u8, rd: u8, rm: u8, st: u8, n: u8| -> (u16, u16) {
-            let hw0: u16 = 0xEA00
-                | ((op as u16 & 0xF) << 5)
-                | ((s as u16) << 4)
-                | (rn as u16 & 0xF);
+            let hw0: u16 =
+                0xEA00 | ((op as u16 & 0xF) << 5) | ((s as u16) << 4) | (rn as u16 & 0xF);
             let imm3 = ((n >> 2) & 0x7) as u16;
             let imm2 = (n & 0x3) as u16;
             let hw1: u16 = (imm3 << 12)
@@ -3731,81 +3733,102 @@ mod worker_bus_exec {
 
         // ANDS Rd=0 (s=true, line 404 False).
         let (hw0, hw1) = enc(0b0000, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // TST (s && rd==15, line 399 True).
         let (hw0, hw1) = enc(0b0000, true, 1, 15, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // TEQ.
         let (hw0, hw1) = enc(0b0100, true, 1, 15, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // EORS.
         let (hw0, hw1) = enc(0b0100, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // BICS.
         let (hw0, hw1) = enc(0b0001, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // BIC (S=0, line 415 False).
         let (hw0, hw1) = enc(0b0001, false, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // ORR Rn!=15.
         let (hw0, hw1) = enc(0b0010, false, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // ORN Rn!=15.
         let (hw0, hw1) = enc(0b0011, false, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // ORRS (s=true).
         let (hw0, hw1) = enc(0b0010, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // ORNS.
         let (hw0, hw1) = enc(0b0011, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // ADDS / CMN / ADCS / SBCS / SUBS / CMP / RSBS.
         let (hw0, hw1) = enc(0b1000, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         let (hw0, hw1) = enc(0b1000, true, 1, 15, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         let (hw0, hw1) = enc(0b1010, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         let (hw0, hw1) = enc(0b1011, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         let (hw0, hw1) = enc(0b1101, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         let (hw0, hw1) = enc(0b1101, true, 1, 15, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         let (hw0, hw1) = enc(0b1110, true, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // ADC (S=0).
         let (hw0, hw1) = enc(0b1010, false, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // SBC (S=0).
         let (hw0, hw1) = enc(0b1011, false, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // SUB (S=0).
         let (hw0, hw1) = enc(0b1101, false, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         // RSB (S=0).
         let (hw0, hw1) = enc(0b1110, false, 1, 0, 2, 0, 0);
-        run_wide(&mut c, &mut bus, pc, hw0, hw1); pc += 0x100;
+        run_wide(&mut c, &mut bus, pc, hw0, hw1);
+        pc += 0x100;
 
         let _ = pc;
     }
@@ -3896,19 +3919,37 @@ mod worker_bus_exec {
         run_wide(&mut c, &mut bus, pc, 0xE850u16 | 5, (0u16 << 12) | 0);
         pc += 0x100;
         c.set_reg(6, 0x1234);
-        run_wide(&mut c, &mut bus, pc, 0xE840u16 | 5, (6u16 << 12) | (7 << 8) | 0);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xE840u16 | 5,
+            (6u16 << 12) | (7 << 8) | 0,
+        );
         pc += 0x100;
 
         // LDREXB / STREXB
         run_wide(&mut c, &mut bus, pc, 0xE8D0u16 | 5, (0u16 << 12) | 0x0F4F);
         pc += 0x100;
-        run_wide(&mut c, &mut bus, pc, 0xE8C0u16 | 5, (6u16 << 12) | 0x0F40 | 7);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xE8C0u16 | 5,
+            (6u16 << 12) | 0x0F40 | 7,
+        );
         pc += 0x100;
 
         // LDREXH / STREXH
         run_wide(&mut c, &mut bus, pc, 0xE8D0u16 | 5, (0u16 << 12) | 0x0F5F);
         pc += 0x100;
-        run_wide(&mut c, &mut bus, pc, 0xE8C0u16 | 5, (6u16 << 12) | 0x0F50 | 7);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xE8C0u16 | 5,
+            (6u16 << 12) | 0x0F50 | 7,
+        );
         pc += 0x100;
 
         // TBB
@@ -3930,80 +3971,194 @@ mod worker_bus_exec {
         c.set_reg(2, 4);
 
         // MUL
-        run_wide(&mut c, &mut bus, pc, 0xFB00u16 | 1, (15u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB00u16 | 1,
+            (15u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // MLA
         c.set_reg(3, 5);
-        run_wide(&mut c, &mut bus, pc, 0xFB00u16 | 1, (3u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB00u16 | 1,
+            (3u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // SMULBB
-        run_wide(&mut c, &mut bus, pc, 0xFB10u16 | 1, (15u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB10u16 | 1,
+            (15u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // SMLABB
-        run_wide(&mut c, &mut bus, pc, 0xFB10u16 | 1, (3u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB10u16 | 1,
+            (3u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // SMUAD
-        run_wide(&mut c, &mut bus, pc, 0xFB20u16 | 1, (15u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB20u16 | 1,
+            (15u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // SMULWB
         c.set_reg(1, 0x0002_0000);
         c.set_reg(2, 0x0000_0010);
-        run_wide(&mut c, &mut bus, pc, 0xFB30u16 | 1, (15u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB30u16 | 1,
+            (15u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // SMUSD
         c.set_reg(1, (5u16 as u32) | ((7u16 as u32) << 16));
         c.set_reg(2, (2u16 as u32) | ((3u16 as u32) << 16));
-        run_wide(&mut c, &mut bus, pc, 0xFB40u16 | 1, (15u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB40u16 | 1,
+            (15u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // SMMUL
         c.set_reg(1, 0x0100_0000);
         c.set_reg(2, 0x0100_0000);
-        run_wide(&mut c, &mut bus, pc, 0xFB50u16 | 1, (15u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB50u16 | 1,
+            (15u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // SMMLS
         c.set_reg(3, 5);
-        run_wide(&mut c, &mut bus, pc, 0xFB60u16 | 1, (3u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB60u16 | 1,
+            (3u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
         // USAD8
-        run_wide(&mut c, &mut bus, pc, 0xFB70u16 | 1, (15u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB70u16 | 1,
+            (15u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
 
         // SMULL / UMULL / SMLAL / UMLAL
-        run_wide(&mut c, &mut bus, pc, 0xFB80u16 | 1, (0u16 << 12) | (1 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB80u16 | 1,
+            (0u16 << 12) | (1 << 8) | 2,
+        );
         pc += 0x100;
-        run_wide(&mut c, &mut bus, pc, 0xFBA0u16 | 1, (0u16 << 12) | (1 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBA0u16 | 1,
+            (0u16 << 12) | (1 << 8) | 2,
+        );
         pc += 0x100;
-        run_wide(&mut c, &mut bus, pc, 0xFBC0u16 | 1, (0u16 << 12) | (1 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBC0u16 | 1,
+            (0u16 << 12) | (1 << 8) | 2,
+        );
         pc += 0x100;
-        run_wide(&mut c, &mut bus, pc, 0xFBE0u16 | 1, (0u16 << 12) | (1 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBE0u16 | 1,
+            (0u16 << 12) | (1 << 8) | 2,
+        );
         pc += 0x100;
 
         // SDIV / UDIV
-        run_wide(&mut c, &mut bus, pc,
-            0xFB90u16 | 1, 0xF000 | (0 << 8) | 0x00F0 | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB90u16 | 1,
+            0xF000 | (0 << 8) | 0x00F0 | 2,
+        );
         pc += 0x100;
-        run_wide(&mut c, &mut bus, pc,
-            0xFBB0u16 | 1, 0xF000 | (0 << 8) | 0x00F0 | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBB0u16 | 1,
+            0xF000 | (0 << 8) | 0x00F0 | 2,
+        );
         pc += 0x100;
 
         // SMLALBB
-        run_wide(&mut c, &mut bus, pc, 0xFBC0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (8 << 4) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBC0u16 | 1,
+            (0u16 << 12) | (1 << 8) | (8 << 4) | 2,
+        );
         pc += 0x100;
 
         // SMLALD
-        run_wide(&mut c, &mut bus, pc, 0xFBC0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBC0u16 | 1,
+            (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 2,
+        );
         pc += 0x100;
 
         // SMLSLD
-        run_wide(&mut c, &mut bus, pc, 0xFBD0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBD0u16 | 1,
+            (0u16 << 12) | (1 << 8) | (0b1100 << 4) | 2,
+        );
         pc += 0x100;
 
         // UMAAL
-        run_wide(&mut c, &mut bus, pc, 0xFBE0u16 | 1,
-            (0u16 << 12) | (1 << 8) | (0b0110 << 4) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFBE0u16 | 1,
+            (0u16 << 12) | (1 << 8) | (0b0110 << 4) | 2,
+        );
         pc += 0x100;
 
         let _ = pc;
@@ -4400,30 +4555,60 @@ mod worker_bus_exec {
         c.set_reg(1, 0x8000_8000);
         c.set_reg(2, 0x8000_8000);
         c.set_reg(3, 0x7FFF_FFFF);
-        run_wide(&mut c, &mut bus, pc, 0xFB20u16 | 1, (3u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB20u16 | 1,
+            (3u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
 
         // Overflow in SMLAW (line 1206)
         c.set_reg(1, 0x7FFF_FFFF);
         c.set_reg(2, 0x0000_7FFF);
         c.set_reg(3, 0x7FFF_FFFF);
-        run_wide(&mut c, &mut bus, pc, 0xFB30u16 | 1, (3u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB30u16 | 1,
+            (3u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
 
         // Overflow in SMLSD (line 1228)
         c.set_reg(1, 0x0001_7FFF);
         c.set_reg(2, 0x0000_7FFF);
         c.set_reg(3, 0x7000_0000);
-        run_wide(&mut c, &mut bus, pc, 0xFB40u16 | 1, (3u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB40u16 | 1,
+            (3u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
 
         // SMMLAR / SMMULR (line 1245)
         c.set_reg(1, 0x7FFF_FFFF);
         c.set_reg(2, 0x0000_0002);
-        run_wide(&mut c, &mut bus, pc, 0xFB50u16 | 1, (15u16 << 12) | (0 << 8) | (1 << 4) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB50u16 | 1,
+            (15u16 << 12) | (0 << 8) | (1 << 4) | 2,
+        );
         pc += 0x100;
         c.set_reg(3, 5);
-        run_wide(&mut c, &mut bus, pc, 0xFB50u16 | 1, (3u16 << 12) | (0 << 8) | (1 << 4) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB50u16 | 1,
+            (3u16 << 12) | (0 << 8) | (1 << 4) | 2,
+        );
         pc += 0x100;
 
         // SG Non-Secure (line 681/682)
@@ -4502,7 +4687,13 @@ mod worker_bus_exec {
         c.set_reg(1, 0x7FFF_0000);
         c.set_reg(2, 0x7FFF_7FFF);
         c.set_reg(3, 1);
-        run_wide(&mut c, &mut bus, pc, 0xFB20u16 | 1, (3u16 << 12) | (0 << 8) | 2);
+        run_wide(
+            &mut c,
+            &mut bus,
+            pc,
+            0xFB20u16 | 1,
+            (3u16 << 12) | (0 << 8) | 2,
+        );
         pc += 0x100;
 
         let _ = pc;

@@ -113,7 +113,11 @@ fn parse_args() -> Result<Args, String> {
 
     let cycles = cycles.ok_or_else(|| "missing required --cycles <N>".to_string())?;
     let firmware = firmware.ok_or_else(|| "missing required firmware path".to_string())?;
-    Ok(Args { cycles, firmware, bootrom })
+    Ok(Args {
+        cycles,
+        firmware,
+        bootrom,
+    })
 }
 
 fn print_usage() {
@@ -194,8 +198,8 @@ fn run() -> Result<(), String> {
     // that actually exercises those paths; we log and proceed.
     let resolved_bootrom = resolve_bootrom_path(args.bootrom.as_deref());
     if let Some(path) = &resolved_bootrom {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("reading bootrom {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("reading bootrom {}: {e}", path.display()))?;
         eprintln!(
             "mmio_trace_rp2350: loaded bootrom {} bytes from {}",
             bytes.len(),
@@ -203,9 +207,7 @@ fn run() -> Result<(), String> {
         );
         emu.load_bootrom(&bytes);
     } else {
-        eprintln!(
-            "mmio_trace_rp2350: no bootrom loaded (not found at {DEFAULT_BOOTROM_PATH})",
-        );
+        eprintln!("mmio_trace_rp2350: no bootrom loaded (not found at {DEFAULT_BOOTROM_PATH})",);
     }
 
     emu.load_flash(&flash_bytes);

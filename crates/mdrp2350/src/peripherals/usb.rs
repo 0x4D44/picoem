@@ -291,7 +291,6 @@ impl UsbCtrl {
             _ => {}
         }
     }
-
 }
 
 impl Default for UsbCtrl {
@@ -322,7 +321,11 @@ mod tests {
     #[test]
     fn default_reads_static_no_device() {
         let mut u = UsbCtrl::new();
-        assert_eq!(u.read32(SIE_STATUS), 0, "VBUS_DETECTED, CONNECTED, etc all 0");
+        assert_eq!(
+            u.read32(SIE_STATUS),
+            0,
+            "VBUS_DETECTED, CONNECTED, etc all 0"
+        );
         assert_eq!(u.read32(BUFF_STATUS), 0);
         assert_eq!(u.read32(INTS), 0);
         assert_eq!(u.read32(INTR), 0);
@@ -337,9 +340,9 @@ mod tests {
         // SIE_CTRL with PULLUP_EN. Read SIE_STATUS — must report no
         // VBUS, no IRQ.
         u.write32(USB_MUXING, 0x00000009, 0, &mut irqs); // TO_PHY | SOFTCON
-        u.write32(USB_PWR, 0x000000A0, 0, &mut irqs);    // VBUS_DETECT_OVERRIDE_EN | VBUS_EN_OVERRIDE_EN
-        u.write32(MAIN_CTRL, 0x00000001, 0, &mut irqs);  // CONTROLLER_EN
-        u.write32(SIE_CTRL, 0x00010000, 0, &mut irqs);   // PULLUP_EN
+        u.write32(USB_PWR, 0x000000A0, 0, &mut irqs); // VBUS_DETECT_OVERRIDE_EN | VBUS_EN_OVERRIDE_EN
+        u.write32(MAIN_CTRL, 0x00000001, 0, &mut irqs); // CONTROLLER_EN
+        u.write32(SIE_CTRL, 0x00010000, 0, &mut irqs); // PULLUP_EN
         let status = u.read32(SIE_STATUS);
         assert_eq!(status & (1 << 17), 0, "VBUS_DETECTED clear");
         assert_eq!(status & (1 << 16), 0, "CONNECTED clear");
@@ -472,7 +475,11 @@ mod tests {
         release_usbctrl(&mut bus);
         // Write SIE_STATUS via APB BITSET alias (+0x2000). Stub still
         // reads 0.
-        bus.write32(USBCTRL_REGS_BASE + SIE_STATUS + 0x2000, (1 << 19) | (1 << 18), 0);
+        bus.write32(
+            USBCTRL_REGS_BASE + SIE_STATUS + 0x2000,
+            (1 << 19) | (1 << 18),
+            0,
+        );
         assert_eq!(bus.read32(USBCTRL_REGS_BASE + SIE_STATUS, 0), 0);
     }
 

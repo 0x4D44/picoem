@@ -24,8 +24,8 @@
 //!    flag so the instance cannot be reused after a worker panic.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use mdpicoem_common::PioBlock;
@@ -35,12 +35,12 @@ use crate::bus::Bus;
 use crate::core::CortexM0Plus;
 use crate::{Emulator, WorkerName};
 
+use super::memory as tmem;
+use super::peripherals::{ClocksState, IoState, ResetsState, TimerState};
 use super::{
     BarrierResult, CoreAtomics, Peripherals, PioCommand, SharedMemory, SharedState, SpinBarrier,
     ThreadedPio,
 };
-use super::memory as tmem;
-use super::peripherals::{ClocksState, IoState, ResetsState, TimerState};
 
 // =======================================================================
 // ThreadedEmulator
@@ -55,20 +55,14 @@ pub enum RunError {
     /// One of the worker threads panicked. `message` is the downcast
     /// payload text; `which` is the first worker to return `Err` from
     /// `JoinHandle::join` scanning in worker-index order.
-    Panic {
-        which: WorkerName,
-        message: String,
-    },
+    Panic { which: WorkerName, message: String },
     /// The shared barrier's wall-clock deadline elapsed before all
     /// workers arrived. `which` names the first worker whose barrier
     /// call returned `TimedOut` (an observer, not the culprit); the
     /// barrier cannot identify the missing worker on its own.
     /// `elapsed_ms` is the wall-clock elapsed time recorded by the
     /// first waiter to trip the watchdog.
-    Timeout {
-        which: WorkerName,
-        elapsed_ms: u32,
-    },
+    Timeout { which: WorkerName, elapsed_ms: u32 },
 }
 
 /// 3-thread runtime handle over a seeded `SharedState` and both CPU
@@ -162,9 +156,8 @@ impl ThreadedEmulator {
         let external_gpio_in_override = Arc::new(std::sync::atomic::AtomicU32::new(
             bus.external_gpio_in_override,
         ));
-        let external_gpio_in_mask = Arc::new(std::sync::atomic::AtomicU32::new(
-            bus.external_gpio_in_mask,
-        ));
+        let external_gpio_in_mask =
+            Arc::new(std::sync::atomic::AtomicU32::new(bus.external_gpio_in_mask));
 
         // CoreAtomics bundle — seeded with the serial bus's IRQ pending
         // mask broadcast to both cores, WFE / halted state, bus fault
@@ -495,8 +488,7 @@ fn clone_memory(bus: &Bus) -> SharedMemory {
     }
     let rom: Arc<[u8]> = rom_bytes.into();
 
-    let mut sram_words: Vec<std::sync::atomic::AtomicU32> =
-        Vec::with_capacity(tmem::SRAM_WORDS);
+    let mut sram_words: Vec<std::sync::atomic::AtomicU32> = Vec::with_capacity(tmem::SRAM_WORDS);
     for i in 0..tmem::SRAM_WORDS {
         let w = bus.memory.sram_read32((i as u32) * 4);
         sram_words.push(std::sync::atomic::AtomicU32::new(w));
@@ -516,7 +508,11 @@ fn panic_message(err: Option<&Box<dyn std::any::Any + Send>>) -> String {
         Some(payload) => payload
             .downcast_ref::<String>()
             .cloned()
-            .or_else(|| payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| "<non-string panic payload>".to_string()),
         None => String::new(),
     }
@@ -525,11 +521,7 @@ fn panic_message(err: Option<&Box<dyn std::any::Any + Send>>) -> String {
 /// Spawn a worker thread pinned to `host_core` running `body`. Catches
 /// panics from `body` and poisons the shared barrier before re-raising
 /// the panic so the remaining workers drop out of their spin loops.
-fn spawn_worker<F, R>(
-    host_core: usize,
-    barrier: Arc<SpinBarrier>,
-    body: F,
-) -> JoinHandle<R>
+fn spawn_worker<F, R>(host_core: usize, barrier: Arc<SpinBarrier>, body: F) -> JoinHandle<R>
 where
     F: FnOnce(Arc<SpinBarrier>) -> R + Send + 'static,
     R: Send + 'static,
@@ -597,9 +589,7 @@ fn core_worker_body(
         }
 
         // WFE wake: consume event_flag and clear wfe_waiting.
-        if shared.atomics.is_wfe_waiting(core_id)
-            && shared.atomics.event_flag_consume(core_id)
-        {
+        if shared.atomics.is_wfe_waiting(core_id) && shared.atomics.event_flag_consume(core_id) {
             shared.atomics.clear_wfe_waiting(core_id);
         }
 
@@ -683,8 +673,8 @@ fn coordinator_worker_body(
         //    the latest merged GPIO pin state (initial value for quantum 0
         //    comes from from_emulator's seed; subsequent quanta see the
         //    previous quantum's merge result).
-        let gpio_snapshot = shared.gpio_out.load(Ordering::Acquire)
-            & shared.gpio_oe.load(Ordering::Acquire);
+        let gpio_snapshot =
+            shared.gpio_out.load(Ordering::Acquire) & shared.gpio_oe.load(Ordering::Acquire);
         for block_idx in 0..2 {
             if shared.pio.sm_enabled(block_idx) != 0 {
                 pio_blocks[block_idx].step_n(step_q, gpio_snapshot);
@@ -773,7 +763,11 @@ fn coordinator_worker_body(
 /// Apply a CPU-queued `PioCommand` to the coordinator's owned PioBlock.
 fn apply_pio_command(block: &mut PioBlock, cmd: PioCommand) {
     match cmd {
-        PioCommand::WriteCtrl { block: _, val, alias } => {
+        PioCommand::WriteCtrl {
+            block: _,
+            val,
+            alias,
+        } => {
             block.write32(0x000, val, alias as u32);
         }
         PioCommand::WriteInstrMem {
