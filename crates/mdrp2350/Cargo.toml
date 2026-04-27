@@ -1,12 +1,38 @@
 [package]
 name = "mdrp2350"
-version = "2.4.1"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Cycle-accurate emulator for the Raspberry Pi RP2350 / RP2354 (dual Cortex-M33 + PIO + FPU)."
+repository = "https://github.com/0x4D44/mdpicoem"
+homepage = "https://github.com/0x4D44/mdpicoem"
+documentation = "https://docs.rs/mdrp2350"
+readme = "README.md"
+keywords = ["emulator", "rp2350", "rp2354", "cortex-m33", "pico"]
+categories = ["emulators", "embedded"]
+# Five integration tests use `include_bytes!("../../../roms/rp2350/...")`
+# to load workspace-root firmware images. Those paths escape the crate
+# root and would not resolve from a crates.io tarball, so the tests are
+# excluded from publication. They remain in the workspace for in-tree
+# `cargo test -p mdrp2350` runs.
+exclude = [
+    "tests/hello_dma.rs",
+    "tests/hello_pwm.rs",
+    "tests/hello_riscv_blinky.rs",
+    "tests/hello_timer.rs",
+    "tests/hello_uart.rs",
+]
 
 [features]
-default = ["threading"]
+# `threading` is opt-in for V1 because the runtime is currently
+# x86_64-Windows-only (see the `cfg`-gates on
+# `mdpicoem_common::threaded` and `mdrp2350::threaded::*`). On Linux /
+# macOS the feature compiles but exposes no usable threaded entry
+# points; defaulting it off keeps `cargo add mdrp2350` working
+# cross-platform out of the box. Windows users who want the threaded
+# runtime should opt in: `cargo add mdrp2350 --features threading`.
+default = []
 # Forward the PIO `test-hooks` feature to `mdpicoem-common`. Enables
 # cross-crate unit tests to push RX FIFO words via `PioBlock::push_rx`.
 # (Consumed by mdpicoem-harness [dev-dependencies] — removing this
@@ -32,7 +58,7 @@ threading = []
 testing = []
 
 [dependencies]
-mdpicoem-common = { path = "../mdpicoem-common" }
+mdpicoem-common = { version = "0.1", path = "../mdpicoem-common" }
 tracing = { workspace = true }
 # SHA-256 block compressor — HLD V5 §7.D.6. `compress` feature exposes
 # the padding-less `compress256` entry point, which matches the RP2350
@@ -70,3 +96,17 @@ required-features = ["testing"]
 [[test]]
 name = "dual_model"
 required-features = ["threading"]
+
+# docs.rs builds on Linux x86_64. The `threading` feature is currently
+# Windows-only at the source level (mdpicoem_common::threaded is gated
+# to x86_64-windows; mdrp2350::threaded::* references items from it
+# unconditionally when the feature is on, which fails to compile on
+# other targets). For 0.1.x we document the Serial-only baseline; the
+# threaded runtime is described in the README + the `threaded` module's
+# top-level doc comment for Windows users who opt into the feature.
+# This will be revisited in 0.2 once the threaded modules are properly
+# stubbed for non-Windows targets.
+[package.metadata.docs.rs]
+features = ["testing", "test-hooks"]
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs"]

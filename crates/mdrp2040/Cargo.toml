@@ -1,12 +1,26 @@
 [package]
 name = "mdrp2040"
-version = "0.19.3"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Cycle-accurate emulator for the Raspberry Pi RP2040 (dual Cortex-M0+ + PIO)."
+repository = "https://github.com/0x4D44/mdpicoem"
+homepage = "https://github.com/0x4D44/mdpicoem"
+documentation = "https://docs.rs/mdrp2040"
+readme = "README.md"
+keywords = ["emulator", "rp2040", "cortex-m0", "embedded", "pico"]
+categories = ["emulators", "embedded"]
 
 [features]
-default = ["threading"]
+# `threading` is opt-in for V1 because the runtime is currently
+# x86_64-Windows-only (see the `cfg`-gates on
+# `mdpicoem_common::threaded` and `mdrp2040::threaded::*`). On Linux /
+# macOS the feature compiles but exposes no usable threaded entry
+# points; defaulting it off keeps `cargo add mdrp2040` working
+# cross-platform out of the box. Windows users who want the threaded
+# runtime should opt in: `cargo add mdrp2040 --features threading`.
+default = []
 # Forward the PIO `test-hooks` feature to `mdpicoem-common`. Enables
 # cross-crate unit tests to pop TX FIFO words via `PioBlock::pop_tx`
 # and push RX FIFO words via `PioBlock::push_rx`.
@@ -22,8 +36,8 @@ threading = []
 testing = []
 
 [dependencies]
-mdpicoem-common = { path = "../mdpicoem-common" }
-mdpicoem-devices = { path = "../mdpicoem-devices" }
+mdpicoem-common = { version = "0.1", path = "../mdpicoem-common" }
+mdpicoem-devices = { version = "0.1", path = "../mdpicoem-devices" }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -47,3 +61,12 @@ required-features = ["threading", "testing"]
 [[test]]
 name = "dual_model"
 required-features = ["threading"]
+
+# docs.rs builds on Linux x86_64. The `threading` feature is currently
+# Windows-only at the source level (see mdrp2350's matching note); for
+# 0.1.x we document the Serial-only baseline and leave the threaded
+# runtime to the README + Windows-only opt-in.
+[package.metadata.docs.rs]
+features = ["testing", "test-hooks"]
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs"]

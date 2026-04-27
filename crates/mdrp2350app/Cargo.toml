@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-mdrp2350 = { path = "../mdrp2350" }
+mdrp2350 = { path = "../mdrp2350", features = ["threading"] }
 ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"

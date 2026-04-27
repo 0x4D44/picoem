@@ -8,8 +8,8 @@ rust-version.workspace = true
 [dependencies]
 mdpicoem-common = { path = "../mdpicoem-common", features = ["pio-pad-diag"] }
 mdpicoem-devices = { path = "../mdpicoem-devices" }
-mdrp2350 = { path = "../mdrp2350" }
-mdrp2040 = { path = "../mdrp2040" }
+mdrp2350 = { path = "../mdrp2350", features = ["threading"] }
+mdrp2040 = { path = "../mdrp2040", features = ["threading"] }
 probe-rs = "0.31"
 rand = "0.8"
 chrono = "0.4"
