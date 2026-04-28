@@ -13,7 +13,7 @@
 //!     - `0xF1` — return to Handler mode, MSP (nested exception).
 //!     - `0xF9` — return to Thread mode, MSP.
 //!     - `0xFD` — return to Thread mode, PSP.
-//!   Any other low-nibble → HardFault (InvalidExcReturn).
+//!     - any other low-nibble → HardFault (InvalidExcReturn).
 //!
 //! Cycle counts: entry ≈ 16, exit ≈ 12 (M0+ TRM typical).
 

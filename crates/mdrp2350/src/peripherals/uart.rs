@@ -977,6 +977,7 @@ mod tests {
     ///   * `UARTLCR_H.WLEN` — the emulator doesn't mask transmitted/
     ///     received data to `WLEN+5` bits (PL011 silicon does; WLEN=00
     ///     at reset truncates `0x42` to `0x02` on the wire).
+    ///
     /// This test locks in both invariants so a future emulator refactor
     /// that starts honouring either gate keeps the scenario passing.
     ///

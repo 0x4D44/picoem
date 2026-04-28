@@ -462,6 +462,7 @@ mod tests {
     ///   - bit 16 under LRCLK=0 (LSB of RIGHT — LRCLK falling)
     ///   - bits 15..1 under LRCLK=0 (top 15 bits of LEFT)
     ///   - bit 0 under LRCLK=1 (LSB of LEFT — LRCLK rising)
+    ///
     /// 32 BCLK rising edges per frame, so `cycle` advances by 64.
     fn clock_philips_frame(cap: &mut I2sCapture, cycle: &mut u64, left: u16, right: u16) {
         // 15 bits of RIGHT (bit 15 down to bit 1) with LRCLK=1.

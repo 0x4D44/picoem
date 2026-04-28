@@ -105,6 +105,7 @@ const MIE_MASK: u32 = (1 << 3) | (1 << 7) | (1 << 11);
 ///     `fan_out_riscv_irqs`.
 ///   * MTIP (bit 7)  — driven by SIO's MTIME/MTIMECMP comparator via
 ///     `fan_out_riscv_irqs`.
+///
 /// None of these are firmware-writable: any bits a CSR write set would
 /// be stomped within a single quantum by `fan_out_riscv_irqs`, so the
 /// visible effect is zero. Worse, firmware setting MEIP with no matching

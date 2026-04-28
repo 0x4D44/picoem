@@ -255,8 +255,8 @@ pub const DUALCORE_CORE1_DATA: u32 = 0x2000_1200;
 pub const DUALCORE_CORE1_STACK: u32 = 0x2003_E000;
 
 /// ISR oracle (`silicon_isr_diff_rp2350`) SRAM image base. Each scenario's
-/// hand-assembled Thumb image (vector table + handler stub + main routine
-/// + literal pool) is uploaded starting here. Chosen to sit above the
+/// hand-assembled Thumb image (vector table, handler stub, main routine,
+/// literal pool) is uploaded starting here. Chosen to sit above the
 /// periph oracle's sled (`SILICON_RUN_SLED = 0x2000_1100`) and the
 /// antagonist slot (`DUALCORE_ANTAGONIST_SLOT = 0x2000_1114`), so the
 /// oracles do not collide within a single orchestrator iteration. The
