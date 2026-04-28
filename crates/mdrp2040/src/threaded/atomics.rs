@@ -388,4 +388,162 @@ mod tests {
             assert_eq!(a.bus_fault_addr(c), 0);
         }
     }
+
+    // --- Out-of-range guards on per-core helpers ---------------------------
+
+    #[test]
+    fn assert_irq_bad_core_only() {
+        // core >= 2 short-circuits — irq value is irrelevant.
+        let a = CoreAtomics::default();
+        a.assert_irq(2, 0);
+        a.assert_irq(99, 5);
+        assert_eq!(a.irq_pending_load(0), 0);
+        assert_eq!(a.irq_pending_load(1), 0);
+    }
+
+    #[test]
+    fn assert_irq_bad_irq_only() {
+        // core valid but irq >= 32 — drops without panicking on shift.
+        let a = CoreAtomics::default();
+        a.assert_irq(0, 32);
+        a.assert_irq(1, 100);
+        assert_eq!(a.irq_pending_load(0), 0);
+        assert_eq!(a.irq_pending_load(1), 0);
+    }
+
+    #[test]
+    fn assert_irq_shared_out_of_range_is_noop() {
+        // The shared variant guards `irq < 32` separately; neither core
+        // should see a bit set.
+        let a = CoreAtomics::default();
+        a.assert_irq_shared(32);
+        a.assert_irq_shared(64);
+        assert_eq!(a.irq_pending_load(0), 0);
+        assert_eq!(a.irq_pending_load(1), 0);
+    }
+
+    #[test]
+    fn clear_irq_out_of_range_is_noop() {
+        let a = CoreAtomics::default();
+        a.assert_irq(0, 7);
+        a.assert_irq(1, 7);
+        // Bad core — should not affect either pending mask.
+        a.clear_irq(2, 7);
+        a.clear_irq(99, 7);
+        assert_eq!(a.irq_pending_load(0), 1u32 << 7);
+        assert_eq!(a.irq_pending_load(1), 1u32 << 7);
+        // Bad irq — shift would otherwise overflow / wrap; guard drops it.
+        a.clear_irq(0, 32);
+        a.clear_irq(1, 200);
+        assert_eq!(a.irq_pending_load(0), 1u32 << 7);
+        assert_eq!(a.irq_pending_load(1), 1u32 << 7);
+    }
+
+    #[test]
+    fn set_irq_pending_overwrites_mask() {
+        let a = CoreAtomics::default();
+        a.assert_irq(0, 1);
+        a.set_irq_pending(0, 0xDEAD_BEEF);
+        assert_eq!(a.irq_pending_load(0), 0xDEAD_BEEF);
+        // Untouched core stays clean.
+        assert_eq!(a.irq_pending_load(1), 0);
+    }
+
+    // --- FIFO sticky helpers (WOF / ROE) ----------------------------------
+
+    #[test]
+    fn fifo_wof_set_clear_round_trip_per_core() {
+        let a = CoreAtomics::default();
+        assert!(!a.fifo_wof(0));
+        assert!(!a.fifo_wof(1));
+        a.set_fifo_wof(0);
+        assert!(a.fifo_wof(0));
+        assert!(!a.fifo_wof(1));
+        a.set_fifo_wof(1);
+        assert!(a.fifo_wof(0));
+        assert!(a.fifo_wof(1));
+        a.clear_fifo_wof(0);
+        assert!(!a.fifo_wof(0));
+        assert!(a.fifo_wof(1));
+        a.clear_fifo_wof(1);
+        assert!(!a.fifo_wof(1));
+    }
+
+    #[test]
+    fn fifo_roe_set_clear_round_trip_per_core() {
+        let a = CoreAtomics::default();
+        assert!(!a.fifo_roe(0));
+        assert!(!a.fifo_roe(1));
+        a.set_fifo_roe(0);
+        assert!(a.fifo_roe(0));
+        assert!(!a.fifo_roe(1));
+        a.set_fifo_roe(1);
+        assert!(a.fifo_roe(0));
+        assert!(a.fifo_roe(1));
+        a.clear_fifo_roe(0);
+        assert!(!a.fifo_roe(0));
+        assert!(a.fifo_roe(1));
+        a.clear_fifo_roe(1);
+        assert!(!a.fifo_roe(1));
+    }
+
+    #[test]
+    fn fifo_sticky_helpers_ignore_out_of_range_core() {
+        // All four set/clear paths take the `if core < 2` false branch
+        // here; reads return false on bad core via the else arm.
+        let a = CoreAtomics::default();
+        a.set_fifo_wof(2);
+        a.set_fifo_wof(99);
+        a.set_fifo_roe(2);
+        a.set_fifo_roe(99);
+        // Real cores are still clean.
+        assert!(!a.fifo_wof(0));
+        assert!(!a.fifo_wof(1));
+        assert!(!a.fifo_roe(0));
+        assert!(!a.fifo_roe(1));
+        // Reads on bad core return false (else arm).
+        assert!(!a.fifo_wof(2));
+        assert!(!a.fifo_wof(99));
+        assert!(!a.fifo_roe(2));
+        assert!(!a.fifo_roe(99));
+        // Set legitimate flags then verify clear-on-bad-core leaves them alone.
+        a.set_fifo_wof(0);
+        a.set_fifo_roe(1);
+        a.clear_fifo_wof(2);
+        a.clear_fifo_wof(99);
+        a.clear_fifo_roe(2);
+        a.clear_fifo_roe(99);
+        assert!(a.fifo_wof(0));
+        assert!(a.fifo_roe(1));
+    }
+
+    // --- WFE / halt symmetry ----------------------------------------------
+
+    #[test]
+    fn halt_and_wfe_state_round_trip() {
+        let a = CoreAtomics::default();
+        a.set_halted(0);
+        a.set_wfe_waiting(1);
+        assert!(a.is_halted(0));
+        assert!(!a.is_halted(1));
+        assert!(!a.is_wfe_waiting(0));
+        assert!(a.is_wfe_waiting(1));
+        a.clear_halted(0);
+        a.clear_wfe_waiting(1);
+        assert!(!a.is_halted(0));
+        assert!(!a.is_wfe_waiting(1));
+    }
+
+    #[test]
+    fn take_irq_pending_returns_only_set_bits() {
+        // Multi-bit mask path: confirms swap returns the full mask, not
+        // just the most recently OR-ed bit.
+        let a = CoreAtomics::default();
+        a.assert_irq(1, 2);
+        a.assert_irq(1, 9);
+        a.assert_irq(1, 17);
+        let mask = a.take_irq_pending(1);
+        assert_eq!(mask, (1u32 << 2) | (1u32 << 9) | (1u32 << 17));
+        assert_eq!(a.take_irq_pending(1), 0);
+    }
 }

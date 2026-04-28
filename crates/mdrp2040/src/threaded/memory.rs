@@ -340,4 +340,146 @@ mod tests {
         mem.write_u32_atomic(BASE, 0x1234_5678, Ordering::Release);
         assert_eq!(mem.read_u32_atomic(BASE, Ordering::Acquire), 0x1234_5678);
     }
+
+    // --- ROM-specific corner cases ----------------------------------------
+
+    #[test]
+    fn rom_writes_silently_drop_for_all_widths() {
+        // ROM is read-only — `write_u32_atomic` / `write32` / `write16` /
+        // `write8` to the ROM region must leave bytes untouched. Build a
+        // ROM with a known stamp so we can assert the write was a no-op.
+        let mut rom_bytes = vec![0u8; ROM_SIZE as usize];
+        rom_bytes[0..4].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        let rom: Arc<[u8]> = rom_bytes.into();
+        let mut sram_vec: Vec<AtomicU32> = Vec::with_capacity(SRAM_WORDS);
+        for _ in 0..SRAM_WORDS {
+            sram_vec.push(AtomicU32::new(0));
+        }
+        let sram: Arc<[AtomicU32]> = sram_vec.into();
+        let mem = SharedMemory::new(rom, sram);
+
+        mem.write32(ROM_BASE, 0xFFFF_FFFF);
+        mem.write16(ROM_BASE, 0xAAAA);
+        mem.write16(ROM_BASE + 2, 0xBBBB);
+        mem.write8(ROM_BASE, 0xCC);
+        mem.write8(ROM_BASE + 3, 0xDD);
+        // Original word survives every write attempt.
+        assert_eq!(mem.read32(ROM_BASE), 0x1122_3344);
+    }
+
+    #[test]
+    fn read8_rom_path_at_each_byte_offset() {
+        // Cover the read8 ROM-fallthrough with all four byte alignments
+        // so the `(addr & 3) * 8` shift sees every value.
+        let mut rom_bytes = vec![0u8; ROM_SIZE as usize];
+        rom_bytes[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let rom: Arc<[u8]> = rom_bytes.into();
+        let mut sram_vec: Vec<AtomicU32> = Vec::with_capacity(SRAM_WORDS);
+        for _ in 0..SRAM_WORDS {
+            sram_vec.push(AtomicU32::new(0));
+        }
+        let sram: Arc<[AtomicU32]> = sram_vec.into();
+        let mem = SharedMemory::new(rom, sram);
+
+        assert_eq!(mem.read8(ROM_BASE), 0x11);
+        assert_eq!(mem.read8(ROM_BASE + 1), 0x22);
+        assert_eq!(mem.read8(ROM_BASE + 2), 0x33);
+        assert_eq!(mem.read8(ROM_BASE + 3), 0x44);
+    }
+
+    #[test]
+    fn read16_rom_returns_two_low_bytes() {
+        // read16 always goes through `read_u32_atomic` on the word base,
+        // so a ROM-backed read16 hits the ROM path (line 102). Use both
+        // halfword offsets to also touch the `addr & 2 != 0` true branch.
+        let mut rom_bytes = vec![0u8; ROM_SIZE as usize];
+        rom_bytes[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let rom: Arc<[u8]> = rom_bytes.into();
+        let mut sram_vec: Vec<AtomicU32> = Vec::with_capacity(SRAM_WORDS);
+        for _ in 0..SRAM_WORDS {
+            sram_vec.push(AtomicU32::new(0));
+        }
+        let sram: Arc<[AtomicU32]> = sram_vec.into();
+        let mem = SharedMemory::new(rom, sram);
+
+        assert_eq!(mem.read16(ROM_BASE), 0x2211);
+        assert_eq!(mem.read16(ROM_BASE + 2), 0x4433);
+    }
+
+    #[test]
+    fn read_returns_zero_when_rom_too_short_for_word() {
+        // Build a ROM that's only 2 bytes long — `read_u32_atomic` will
+        // see `off + 3 < rom.len()` as false and fall through to 0. Same
+        // for `read8` past the truncated tail.
+        let rom: Arc<[u8]> = vec![0xAA, 0xBB].into();
+        let mut sram_vec: Vec<AtomicU32> = Vec::with_capacity(SRAM_WORDS);
+        for _ in 0..SRAM_WORDS {
+            sram_vec.push(AtomicU32::new(0));
+        }
+        let sram: Arc<[AtomicU32]> = sram_vec.into();
+        let mem = SharedMemory::new(rom, sram);
+        // Address is < ROM_BASE+ROM_SIZE (16 KB) but past the actual rom
+        // slice, so the inner length check fails.
+        assert_eq!(mem.read32(0x0000_0010), 0);
+        assert_eq!(mem.read8(0x0000_0010), 0);
+    }
+
+    // --- SRAM out-of-range narrow accesses --------------------------------
+
+    #[test]
+    fn write16_write8_outside_sram_are_noops() {
+        // `sram_idx` returns None for non-SRAM addresses, so write16/8
+        // exit early without touching anything — the early-return
+        // branches the unit tests must visit.
+        let mem = fresh();
+        mem.write16(0x4000_0000, 0xBEEF);
+        mem.write8(0x4000_0001, 0xAB);
+        // Round-trip a real SRAM byte to confirm the memory still works.
+        mem.write32(BASE, 0);
+        mem.write8(BASE, 0x5A);
+        assert_eq!(mem.read8(BASE), 0x5A);
+    }
+
+    #[test]
+    fn read8_unmapped_returns_zero() {
+        // `read8` outside both SRAM and ROM ranges → 0 (else arm).
+        let mem = fresh();
+        assert_eq!(mem.read8(0x4000_0000), 0);
+        assert_eq!(mem.read8(0xE000_E000), 0);
+    }
+
+    #[test]
+    fn read16_alias_high_half() {
+        // Hit `addr & 2 != 0` true branch (line 142) with the SRAM path.
+        let mem = fresh();
+        mem.write32(BASE, 0xAAAA_BBBB);
+        assert_eq!(mem.read16(BASE), 0xBBBB);
+        assert_eq!(mem.read16(BASE + 2), 0xAAAA);
+    }
+
+    #[test]
+    fn sram_idx_rejects_offset_past_sram_size() {
+        // Address inside the 0x2x alias prefix but past 264 KB — the
+        // inner `offset < SRAM_SIZE` guard returns None, so reads see 0.
+        let mem = fresh();
+        let past = 0x2000_0000 + SRAM_SIZE;
+        assert_eq!(mem.read32(past), 0);
+        assert_eq!(mem.read8(past), 0);
+    }
+
+    #[test]
+    fn cas32_round_trip_via_writers() {
+        // Drive cas32 from both success and stale-expected paths to keep
+        // both edges of the `compare_exchange` result branch warm.
+        let mem = fresh();
+        mem.write32(BASE, 7);
+        assert!(mem.cas32(BASE, 7, 8));
+        assert_eq!(mem.read32(BASE), 8);
+        // Stale expected — fails (returns false), value unchanged.
+        assert!(!mem.cas32(BASE, 7, 9));
+        assert_eq!(mem.read32(BASE), 8);
+        // ROM and unmapped CAS both hit `sram_idx` None branch.
+        assert!(!mem.cas32(ROM_BASE, 0, 1));
+        assert!(!mem.cas32(0x4000_0000, 0, 1));
+    }
 }

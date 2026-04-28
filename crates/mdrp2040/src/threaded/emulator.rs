@@ -979,4 +979,531 @@ mod tests {
             "external override must survive from_emulator + one quantum"
         );
     }
+
+    // ----- Builder + accessor coverage ----------------------------------
+
+    /// `with_thread_mask` overrides the default `[0,1,2]` pinning mask.
+    /// We don't actually run a quantum here — the affinity call happens
+    /// inside `spawn_worker` and a non-default mask might fail on a
+    /// host with too few logical CPUs. Round-trip through the public
+    /// builder accessor only.
+    #[test]
+    fn with_thread_mask_persists() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let threaded = ThreadedEmulator::from_emulator(emu).with_thread_mask([0, 1, 2]);
+        assert_eq!(threaded.thread_mask, [0, 1, 2]);
+    }
+
+    /// `core_cycles(0|1)` returns the inner core's cycle counter while
+    /// the cores are owned by `ThreadedEmulator` (i.e. between
+    /// `run_quanta_checked` calls). Fresh emulator ⇒ both 0.
+    #[test]
+    fn core_cycles_returns_zero_for_fresh_emulator() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        assert_eq!(threaded.core_cycles(0), 0);
+        assert_eq!(threaded.core_cycles(1), 0);
+    }
+
+    /// `core_cycles` panics for any index other than 0 or 1.
+    #[test]
+    #[should_panic(expected = "idx must be 0 or 1")]
+    fn core_cycles_panics_on_invalid_idx() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        let _ = threaded.core_cycles(2);
+    }
+
+    /// `shared()` returns the same `Arc<SharedState>` carried inside
+    /// the emulator. Identity check via `Arc::ptr_eq` against an
+    /// indirectly-cloned handle.
+    #[test]
+    fn shared_accessor_returns_state() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        let cloned = Arc::clone(threaded.shared());
+        assert!(Arc::ptr_eq(threaded.shared(), &cloned));
+    }
+
+    // ----- run_quanta_checked drain-loop coverage -----------------------
+
+    /// `run_quanta_checked(0)` is a no-op: workers spawn, take the n=0
+    /// loop bound, return immediately. master_cycle stays put.
+    #[test]
+    fn run_quanta_zero_is_noop() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+        let before = threaded.master_cycle();
+
+        threaded
+            .run_quanta_checked(0)
+            .expect("run_quanta_checked(0) infallible");
+
+        assert_eq!(
+            threaded.master_cycle(),
+            before,
+            "n=0 must not advance master_cycle"
+        );
+    }
+
+    /// One core halted, the other not: covers the
+    /// `if !shared.atomics.is_halted(core_id)` branch in
+    /// `core_worker_body` taking both true and false on the same run.
+    /// Core 1 is halted by the builder default; core 0 is left running.
+    /// Without a program loaded `core.is_halted()` becomes true after
+    /// the first faulting fetch, so the inner step loop terminates
+    /// quickly. The test simply asserts the call returns Ok.
+    #[test]
+    fn run_quanta_one_core_halted_other_runs() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        // Core 1 is halted by default (set in `EmulatorBuilder::build`).
+        // Core 0 left running — its worker exercises the
+        // `is_halted(0) == false` branch and the inner step loop, which
+        // hardfaults out almost immediately on a no-firmware reset.
+        threaded
+            .run_quanta_checked(2)
+            .expect("run_quanta_checked(2) with mixed halted state");
+
+        let step_q = threaded.step_quantum as u64;
+        assert_eq!(threaded.master_cycle(), 2 * step_q);
+    }
+
+    /// Re-entry after a successful run is allowed (non-poisoned path).
+    /// Exercises the `Some(core)` restore arms at the tail of
+    /// `run_quanta_checked`.
+    #[test]
+    fn run_quanta_repeat_invocations_restore_state() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        for _ in 0..3 {
+            threaded
+                .run_quanta_checked(1)
+                .expect("each round restores cores + pio_blocks");
+        }
+
+        let step_q = threaded.step_quantum as u64;
+        assert_eq!(threaded.master_cycle(), 3 * step_q);
+    }
+
+    // ----- WFE / SEV cross-core wake -----------------------------------
+
+    /// SEV-on-WFE wake mirroring the mdrp2350 §11 item 15 test. Park
+    /// core 0 on WFE then SEV both cores; after one quantum the core
+    /// worker's top-of-loop hook must consume `event_flag` and clear
+    /// `wfe_waiting`.
+    #[test]
+    fn wfe_sev_wake_clears_waiting_flag() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        // Halt core 1 so only core 0 exercises the WFE wake hook.
+        threaded.shared.atomics.set_halted(1);
+        threaded.shared.atomics.set_wfe_waiting(0);
+        assert!(threaded.shared.atomics.is_wfe_waiting(0));
+
+        // SEV both cores.
+        threaded.shared.atomics.sev_both();
+        threaded
+            .run_quanta_checked(1)
+            .expect("run_quanta_checked(1)");
+
+        assert!(
+            !threaded.shared.atomics.is_wfe_waiting(0),
+            "WFE wake must clear wfe_waiting after SEV"
+        );
+        assert!(
+            !threaded.shared.atomics.event_flag_load(0),
+            "event_flag[0] must be consumed by the wake check"
+        );
+    }
+
+    // ----- from_emulator state-carry coverage --------------------------
+
+    /// Pre-promotion `Bus::irq_pending` is broadcast to both cores'
+    /// `CoreAtomics::irq_pending` slots. Covers the `if bus.irq_pending
+    /// != 0` branch on both iterations of the seed loop.
+    #[test]
+    fn from_emulator_broadcasts_irq_pending() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        emu.bus.irq_pending = 0b1010;
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        assert_eq!(threaded.shared.atomics.irq_pending_load(0), 0b1010);
+        assert_eq!(threaded.shared.atomics.irq_pending_load(1), 0b1010);
+    }
+
+    /// `Bus::event_flag[c]` must lift into `CoreAtomics::event_flag[c]`
+    /// at promotion. Covers both per-core branches of the loop.
+    #[test]
+    fn from_emulator_preserves_event_flag() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        emu.bus.event_flag[0] = true;
+        emu.bus.event_flag[1] = false;
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        assert!(threaded.shared.atomics.event_flag_load(0));
+        assert!(!threaded.shared.atomics.event_flag_load(1));
+    }
+
+    /// Halted-core promotion: when both serial cores are halted at
+    /// handoff, both atomic `halted` slots must be set so the worker
+    /// loop skips its inner step loop.
+    #[test]
+    fn from_emulator_carries_halted_flags() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        assert!(threaded.shared.atomics.is_halted(0));
+        assert!(threaded.shared.atomics.is_halted(1));
+    }
+
+    /// PIO `sm_enabled_mask` round-trips through promotion via
+    /// `ThreadedPio::publish_sm_enabled`. Drive a non-default mask onto
+    /// PIO0 / PIO1 via the serial bus before handoff and verify the
+    /// shared snapshot mirrors it.
+    #[test]
+    fn from_emulator_seeds_pio_sm_enabled() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        // Write CTRL.SM_ENABLE = 0b0011 onto PIO0 (base 0x5020_0000)
+        // and 0b0100 onto PIO1 (base 0x5030_0000) via serial MMIO.
+        emu.bus.write32(0x5020_0000, 0b0011);
+        emu.bus.write32(0x5030_0000, 0b0100);
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        assert_eq!(threaded.shared.pio.sm_enabled(0), 0b0011);
+        assert_eq!(threaded.shared.pio.sm_enabled(1), 0b0100);
+    }
+
+    /// `master_cycle` initial value is `max(clock.cycles, bus.master_cycle)`.
+    /// Force a non-zero `clock.cycles` and verify the threaded counter
+    /// starts there.
+    #[test]
+    fn from_emulator_seeds_master_cycle_from_clock() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        emu.clock.cycles = 12_345;
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        assert_eq!(threaded.master_cycle(), 12_345);
+    }
+
+    // ----- Poison / re-entry guards ------------------------------------
+
+    /// After a panic-induced poisoning, calling `run_quanta_checked`
+    /// must trip the leading `assert!(!self.poisoned)` panic.
+    #[cfg(feature = "testing")]
+    #[test]
+    #[should_panic(expected = "poisoned by prior worker panic")]
+    fn run_quanta_after_poison_panics() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.inject_panic_for_testing(WorkerName::Core0);
+        // First call panics core 0 and sets `self.poisoned = true`.
+        let _ = threaded.run_quanta_checked(1);
+        assert!(threaded.poisoned, "first call must poison");
+        // Second call must trip the assert.
+        let _ = threaded.run_quanta_checked(1);
+    }
+
+    /// `inject_panic_for_testing(Core1)` ⇒ core 1 worker panics and
+    /// `RunError::Panic{Core1, ..}` is returned.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn run_quanta_core1_panic_surfaces() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.inject_panic_for_testing(WorkerName::Core1);
+
+        let result = threaded.run_quanta_checked(1);
+        match result {
+            Err(RunError::Panic {
+                which: WorkerName::Core1,
+                ref message,
+            }) => {
+                assert!(
+                    message.contains("core1"),
+                    "message should name core1: {message}"
+                );
+            }
+            other => panic!("expected Err(RunError::Panic{{Core1,...}}), got {other:?}"),
+        }
+        assert!(threaded.poisoned);
+        // shared.panic_info must mirror.
+        let info = threaded.shared.panic_info.lock().unwrap();
+        let (which, msg) = info.as_ref().expect("panic_info must be populated");
+        assert_eq!(*which, WorkerName::Core1);
+        assert!(msg.contains("core1"));
+    }
+
+    /// `inject_panic_for_testing(Coord)` ⇒ coordinator worker panics
+    /// and `RunError::Panic{Coord, ..}` is returned. Also covers the
+    /// `pio_blocks = None` branch on the coord-panic path.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn run_quanta_coord_panic_surfaces() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.inject_panic_for_testing(WorkerName::Coord);
+
+        let result = threaded.run_quanta_checked(1);
+        match result {
+            Err(RunError::Panic {
+                which: WorkerName::Coord,
+                ref message,
+            }) => {
+                assert!(
+                    message.contains("coord"),
+                    "message should name coord: {message}"
+                );
+            }
+            other => panic!("expected Err(RunError::Panic{{Coord,...}}), got {other:?}"),
+        }
+        assert!(threaded.poisoned);
+        assert!(
+            threaded.pio_blocks.is_none(),
+            "coordinator panic must drop pio_blocks"
+        );
+        assert!(
+            threaded
+                .shared
+                .poisoned
+                .load(std::sync::atomic::Ordering::Acquire),
+            "shared.poisoned must mirror"
+        );
+    }
+
+    // ----- Coordinator branches: PIO step + TIMER IRQ + GPIO merge -----
+
+    /// Coordinator GPIO merge applies the SIO `gpio_out & gpio_oe` mask
+    /// per quantum. Seed both atomics, run a quantum with cores halted,
+    /// and verify the post-merge `gpio_out` is the `out & oe` mask
+    /// (lines 720-739 in `coordinator_worker_body`).
+    #[test]
+    fn coordinator_merges_sio_gpio_mask() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        threaded.shared.gpio_out.store(0xFFFF, Ordering::Release);
+        threaded.shared.gpio_oe.store(0x00FF, Ordering::Release);
+
+        threaded
+            .run_quanta_checked(1)
+            .expect("run_quanta_checked(1)");
+
+        // After merge: out = out & oe, oe = oe. PIO contributions are
+        // zero (no SM enabled), so the result is the SIO mask.
+        assert_eq!(threaded.shared.gpio_out.load(Ordering::Acquire), 0x00FF);
+        assert_eq!(threaded.shared.gpio_oe.load(Ordering::Acquire), 0x00FF);
+    }
+
+    // ----- Helper coverage: panic_message + apply_pio_command ----------
+
+    /// `panic_message` extracts the payload from `JoinHandle::join`'s
+    /// `Err` arm. Cover all three arms: `String`, `&'static str`, and
+    /// the `<non-string panic payload>` fallback. Also covers `None`
+    /// (Ok join — empty string).
+    #[test]
+    fn panic_message_extracts_all_payload_kinds() {
+        // Build payloads that mimic what `JoinHandle::join` returns.
+        let s_payload: Box<dyn std::any::Any + Send> = Box::new(String::from("string panic"));
+        assert_eq!(panic_message(Some(&s_payload)), "string panic");
+
+        let static_payload: Box<dyn std::any::Any + Send> = Box::new("static-str panic");
+        assert_eq!(panic_message(Some(&static_payload)), "static-str panic");
+
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42u64);
+        assert_eq!(panic_message(Some(&other_payload)), "<non-string panic payload>");
+
+        assert_eq!(panic_message(None), "");
+    }
+
+    /// `apply_pio_command` covers all four `PioCommand` arms. We feed
+    /// each one into a fresh `PioBlock` and verify a non-default
+    /// observable byte changed afterwards. The exact register layout
+    /// is the contract's responsibility — this test only proves we
+    /// hit each match arm.
+    #[test]
+    fn apply_pio_command_dispatches_all_variants() {
+        let mut block = PioBlock::new();
+
+        // CTRL: SM_ENABLE = 0b0001.
+        apply_pio_command(
+            &mut block,
+            PioCommand::WriteCtrl {
+                block: 0,
+                val: 0b0001,
+                alias: 0,
+            },
+        );
+        assert_eq!(block.sm_enabled_mask(), 0b0001);
+
+        // INSTR_MEM[5] = 0xABCD.
+        apply_pio_command(
+            &mut block,
+            PioCommand::WriteInstrMem {
+                block: 0,
+                addr: 5,
+                value: 0xABCD,
+                alias: 0,
+            },
+        );
+        // INSTR_MEM is write-only via MMIO, so use the test accessor.
+        assert_eq!(block.instr_mem()[5], 0xABCD);
+
+        // INSTR_MEM out-of-range (addr >= 32) is a no-op — covers the
+        // `if addr < 32` false arm.
+        apply_pio_command(
+            &mut block,
+            PioCommand::WriteInstrMem {
+                block: 0,
+                addr: 99,
+                value: 0xDEAD,
+                alias: 0,
+            },
+        );
+
+        // SetClkDiv on SM 1.
+        apply_pio_command(
+            &mut block,
+            PioCommand::SetClkDiv {
+                block: 0,
+                sm: 1,
+                int_div: 0x1234,
+                frac_div: 0x56,
+                alias: 0,
+            },
+        );
+        // SM1_CLKDIV at 0x0C8 + 1*0x18 = 0x0E0.
+        let expected = (0x1234u32 << 16) | (0x56u32 << 8);
+        assert_eq!(block.read32(0x0E0), expected);
+
+        // SetClkDiv with sm >= 4 is a no-op (covers `if sm < 4` false).
+        apply_pio_command(
+            &mut block,
+            PioCommand::SetClkDiv {
+                block: 0,
+                sm: 7,
+                int_div: 0xFFFF,
+                frac_div: 0xFF,
+                alias: 0,
+            },
+        );
+
+        // Generic WriteReg: hit FDEBUG @ 0x008.
+        apply_pio_command(
+            &mut block,
+            PioCommand::WriteReg {
+                block: 0,
+                offset: 0x008,
+                val: 0xFFFF_FFFF,
+                alias: 0,
+            },
+        );
+        // FDEBUG is W1C — read-back returns 0 after writing 1s.
+        // Just exercise the dispatch; no assertion needed beyond
+        // "didn't panic".
+        let _ = block.read32(0x008);
+    }
+
+    // ----- Drop / cleanup -----------------------------------------------
+
+    /// Drop without an explicit run — covers the no-active-workers
+    /// drop path. Must not panic, must not leak Arcs.
+    #[test]
+    fn drop_without_running_quanta() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        let shared = Arc::clone(threaded.shared());
+        let pre_strong = Arc::strong_count(&shared);
+        drop(threaded);
+        // Strong count must drop by at least 1 once the emulator
+        // releases its handle.
+        let post_strong = Arc::strong_count(&shared);
+        assert!(
+            post_strong < pre_strong,
+            "drop must release the emulator's Arc handle: {pre_strong} -> {post_strong}"
+        );
+    }
+
+    /// Drop after a successful run cycle — covers the post-run drop
+    /// path where cores + pio_blocks have been restored.
+    #[test]
+    fn drop_after_successful_run() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+        threaded
+            .run_quanta_checked(1)
+            .expect("run_quanta_checked(1)");
+        // Implicit drop here.
+    }
+
+    /// Drop after a panic-poisoned run — covers the drop path where
+    /// `pio_blocks` may be `None` (coord panic) or `Some` (core panic).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn drop_after_poisoned_run() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.inject_panic_for_testing(WorkerName::Coord);
+        let _ = threaded.run_quanta_checked(1);
+        // Implicit drop — must not double-fault on `pio_blocks = None`.
+    }
 }

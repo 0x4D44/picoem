@@ -395,4 +395,136 @@ mod tests {
         // Lock should be armed at some cycle ≥ start.
         assert!(c.pll_sys_lock_at_cycle.is_some());
     }
+
+    // --- PLL CS read path (offset == 0x00 LOCK synthesis) -----------------
+
+    #[test]
+    fn pll_sys_read_cs_synthesises_lock_bit() {
+        // After arming the PLL with `pll_sys_lock_at_cycle = Some(...)`,
+        // a CS read at `master_cycle >= lock_at` reports LOCK = 1.
+        let mut c = ClocksState::new_default();
+        c.pll_sys_write_at(0x04, 0, 0, 100); // clear PWR
+        c.pll_sys_write_at(0x08, 125, 0, 100); // FBDIV
+        let lock_at = c.pll_sys_lock_at_cycle.expect("lock should be armed");
+        // Before lock_at — LOCK bit is 0; after — LOCK bit is set (bit 31).
+        let before = c.pll_sys_read_at(0x00, lock_at.saturating_sub(1));
+        let after = c.pll_sys_read_at(0x00, lock_at + 1_000);
+        assert_eq!(before & (1 << 31), 0);
+        assert_ne!(after & (1 << 31), 0);
+        // Non-CS offset goes through the plain `pll_read` path.
+        let fbdiv = c.pll_sys_read_at(0x08, 0);
+        assert_eq!(fbdiv & 0xFFF, 125);
+    }
+
+    #[test]
+    fn pll_usb_read_cs_synthesises_lock_bit() {
+        let mut c = ClocksState::new_default();
+        c.pll_usb_write_at(0x04, 0, 0, 200);
+        c.pll_usb_write_at(0x08, 64, 0, 200);
+        let lock_at = c.pll_usb_lock_at_cycle.expect("USB lock armed");
+        let before = c.pll_usb_read_at(0x00, lock_at.saturating_sub(1));
+        let after = c.pll_usb_read_at(0x00, lock_at + 1_000);
+        assert_eq!(before & (1 << 31), 0);
+        assert_ne!(after & (1 << 31), 0);
+        let fbdiv = c.pll_usb_read_at(0x08, 0);
+        assert_eq!(fbdiv & 0xFFF, 64);
+    }
+
+    #[test]
+    fn pll_usb_write_arms_lock_and_recomputes() {
+        // Mirrors the SYS test for the USB PLL — exercises the
+        // `if pll_write(...)` true branch in `pll_usb_write_at`.
+        let mut c = ClocksState::new_default();
+        c.pll_usb_write_at(0x04, 0, 0, 50);
+        c.pll_usb_write_at(0x08, 100, 0, 50);
+        assert!(c.pll_usb_lock_at_cycle.is_some());
+    }
+
+    #[test]
+    fn pll_writes_with_no_change_dont_arm_lock() {
+        // Writing the existing reset value back exercises the
+        // `pll_write` returns-false branch (no recompute, no lock arm).
+        let mut c = ClocksState::new_default();
+        c.pll_sys_write_at(0x00, c.pll_sys_regs[0], 0, 100);
+        c.pll_usb_write_at(0x00, c.pll_usb_regs[0], 0, 100);
+        assert_eq!(c.pll_sys_lock_at_cycle, None);
+        assert_eq!(c.pll_usb_lock_at_cycle, None);
+    }
+
+    // --- ResetsState lookup paths -----------------------------------------
+
+    #[test]
+    fn resets_state_lookup_misses_for_unmapped_base() {
+        // `is_held_in_reset_base` walks `BASE_RESET_MAP` — exercise the
+        // fallthrough false branch with an address that isn't in it.
+        let r = ResetsState::new_default();
+        assert!(!r.is_held_in_reset_base(0xDEAD_0000));
+        assert!(!r.is_held_in_reset_base(crate::bus::SIO_BASE));
+    }
+
+    #[test]
+    fn resets_state_write_releases_peripheral() {
+        // Writing 0 to RESET clears all reset-held bits (RAW path).
+        let mut r = ResetsState::new_default();
+        // Default holds everything; release UART0 + TIMER bits via the
+        // RESET register at offset 0.
+        let initial = r.read(0x00);
+        assert_ne!(initial, 0);
+        r.write(0x00, 0, 0);
+        assert_eq!(r.read(0x00), 0);
+        assert!(!r.is_held_in_reset_base(crate::bus::TIMER_BASE));
+        assert!(!r.is_held_in_reset_base(crate::bus::UART0_BASE));
+    }
+
+    // --- XOSC / ROSC plumbing (read + write through the wrappers) --------
+
+    #[test]
+    fn xosc_rosc_read_write_round_trip() {
+        let mut c = ClocksState::new_default();
+        // Pull current values, write something back, observe via read.
+        let xosc_initial = c.xosc_read(0x00);
+        let rosc_initial = c.rosc_read(0x00);
+        // Re-write the same — exercises the write32 → no-side-effect path.
+        c.xosc_write(0x00, xosc_initial, 0);
+        c.rosc_write(0x00, rosc_initial, 0);
+        // STATUS (offset 0x04 on XOSC) is synthesised — just confirm reads work.
+        let _ = c.xosc_read(0x04);
+        let _ = c.rosc_read(0x18);
+    }
+
+    // --- TimerState read/write routing ------------------------------------
+
+    #[test]
+    fn timer_state_read_write_uses_master_cycle() {
+        let mut t = TimerState::new_default();
+        // Write a TIMER PAUSE bit (offset 0x30) to exercise the write path.
+        t.write32(0x30, 1, 0, 0, 12_000_000);
+        // Reading TIMERAWL/TIMERAWH (offsets 0x28 / 0x24) returns the
+        // current cycle-derived counter; just confirm no panic.
+        let _ = t.read32(0x28, 100, 12_000_000);
+        let _ = t.read32(0x24, 100, 12_000_000);
+    }
+
+    // --- IoState construction ---------------------------------------------
+
+    #[test]
+    fn io_state_default_is_zeroed() {
+        let io = IoState::new_default();
+        // Both sub-banks should expose their reset-state read at offset 0.
+        let _ = io.io_bank0.read32(0x00);
+        let _ = io.pads_bank0.read32(0x00);
+    }
+
+    // --- ClocksState write that does not trigger recompute ---------------
+
+    #[test]
+    fn clocks_write_no_recompute_when_offset_unmapped() {
+        // Pick an offset write32 ignores so the inner branch returns false
+        // and `recompute()` is skipped.
+        let mut c = ClocksState::new_default();
+        let snapshot = c.clock_tree.sys_clk_hz;
+        // Offset 0xFFC is past the end of the CLOCKS register file.
+        c.clocks_write(0xFFC, 0xDEAD_BEEF, 0);
+        assert_eq!(c.clock_tree.sys_clk_hz, snapshot);
+    }
 }
