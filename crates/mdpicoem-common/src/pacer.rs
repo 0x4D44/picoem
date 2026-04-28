@@ -155,7 +155,9 @@ fn rdtscp() -> u64 {
 /// clear message if not. All modern x86_64 CPUs (since ~2008) support this.
 #[cfg(target_arch = "x86_64")]
 fn require_constant_tsc() {
-    let result = std::arch::x86_64::__cpuid(0x80000007);
+    // SAFETY: leaf 0x80000007 is the AMD/Intel "Advanced Power Management"
+    // feature leaf, defined on every x86_64 CPU; no memory side effects.
+    let result = unsafe { std::arch::x86_64::__cpuid(0x80000007) };
     let has_invariant_tsc = (result.edx >> 8) & 1 != 0;
     assert!(
         has_invariant_tsc,
@@ -356,7 +358,13 @@ impl Pacer {
         }
         self.sys_clk_hz = new;
         let nominal = (self.tsc_freq_hz as u128 * self.quantum_cycles as u128 / new as u128) as u64;
-        self.quantum_tsc_ticks = nominal.saturating_sub(self.overhead);
+        // Mirror the `calibrate_overhead` clamp from `Pacer::with_quantum`:
+        // when the new quantum is small (high sys_clk) the stored overhead
+        // (calibrated against the old, larger quantum) can exceed `nominal`,
+        // saturating ticks to zero. Cap the overhead applied here at 25% of
+        // the new nominal so we always retain a non-zero quantum.
+        let effective_overhead = self.overhead.min(nominal / 4);
+        self.quantum_tsc_ticks = nominal.saturating_sub(effective_overhead).max(1);
     }
 
     /// Mark the start of a quantum. Call before stepping the emulator.
