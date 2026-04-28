@@ -21,8 +21,6 @@
     clippy::vec_init_then_push
 )]
 
-#[allow(dead_code)]
-
 // When test generators are added later, they'll use:
 //   use crate::*;
 

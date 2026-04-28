@@ -636,9 +636,9 @@ impl ThreadedEmulator {
                 bl2.expect("pio2 Ok but block missing"),
             ]);
         } else {
-            // At least one PIO worker panicked — drop all three blocks
-            // (including any Ok returns) per HLD V5 §2.7.
-            drop((bl0, bl1, bl2));
+            // At least one PIO worker panicked — release all three blocks
+            // (including any Ok returns) per HLD V5 §2.7. PioBlock has no
+            // Drop impl and the locals drop naturally at scope exit.
             self.pio_blocks = None;
         }
         // Coordinator worker returns `((), PerWorkerTimings)`.
@@ -2707,21 +2707,6 @@ mod tests {
         }
     }
 
-    // ----- HLD V5 §4 item 6: OneROM-shape soak ---------------------------
-
-    /// HLD V5 §4 item 6 — `ThreadedEmulator` runs an OneROM-shape workload
-    /// (PIO0 idle, PIO1 SM0 enabled, PIO2 SM0+SM1 enabled) for
-    /// `min(60 s wall, 10^8 quanta)` with `debug_assertions` on, under
-    /// the bench default `step_quantum = 256` (§8 gates on the throughput
-    /// regime, not the barrier-dominated `sq=64` regime). The runtime
-    /// must complete without panicking and without poisoning the instance.
-    ///
-    /// Termination: whichever of wall-clock 60 s or 10^8 quanta fires
-    /// first, checked once per `CHUNK_QUANTA`-sized `run_quanta` call.
-    /// Final output (printed for journal capture):
-    ///  - elapsed wall time,
-    ///  - quanta completed,
-    ///  - effective throughput (`quanta * step_quantum / elapsed`).
     // =====================================================================
     // stage5_coverage: accessor / lifecycle / error-path coverage
     // =====================================================================
@@ -3037,6 +3022,21 @@ mod tests {
         }
     }
 
+    // ----- HLD V5 §4 item 6: OneROM-shape soak ---------------------------
+
+    /// HLD V5 §4 item 6 — `ThreadedEmulator` runs an OneROM-shape workload
+    /// (PIO0 idle, PIO1 SM0 enabled, PIO2 SM0+SM1 enabled) for
+    /// `min(60 s wall, 10^8 quanta)` with `debug_assertions` on, under
+    /// the bench default `step_quantum = 256` (§8 gates on the throughput
+    /// regime, not the barrier-dominated `sq=64` regime). The runtime
+    /// must complete without panicking and without poisoning the instance.
+    ///
+    /// Termination: whichever of wall-clock 60 s or 10^8 quanta fires
+    /// first, checked once per `CHUNK_QUANTA`-sized `run_quanta` call.
+    /// Final output (printed for journal capture):
+    ///  - elapsed wall time,
+    ///  - quanta completed,
+    ///  - effective throughput (`quanta * step_quantum / elapsed`).
     #[test]
     #[ignore = "60s stress; run explicitly via cargo test -- --ignored stress_onerom"]
     fn stress_onerom_60s() {

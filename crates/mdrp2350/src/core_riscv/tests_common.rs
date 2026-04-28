@@ -3,8 +3,6 @@
 //! Add helpers here as new ones become 2+-way duplicated; kept narrow on
 //! purpose so each `tests_pN.rs` still owns its own per-phase scaffolding.
 
-#![cfg(test)]
-
 use super::Hazard3;
 use crate::Bus;
 
