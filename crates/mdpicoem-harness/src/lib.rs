@@ -4971,6 +4971,15 @@ pub fn generate_fuzz_classes(count_per_class: usize, seed: u64) -> FuzzBuckets {
         count_per_class,
         &mut rng,
     ));
+    // Randomised M0+ Thumb-32 cases (BL / MSR / MRS / barriers) — admitted
+    // by `is_m0plus_safe` in `qemu_diff_m0plus` and the matching silicon
+    // filter, so they cross the QEMU `cortex-m0` differential without being
+    // skipped. Folded into base_alu so any class filter that selects ALU
+    // gets them by default.
+    base_alu.extend(thumb32_gen::generate_fuzz_m0plus_t32(
+        count_per_class,
+        &mut rng,
+    ));
     let fpu = thumb32_gen::generate_fuzz_fpu(count_per_class, &mut rng);
     let mut base_mem = generate_fuzz_mem(count_per_class, &mut rng);
     base_mem.extend(thumb32_gen::generate_fuzz_t32_mem(
