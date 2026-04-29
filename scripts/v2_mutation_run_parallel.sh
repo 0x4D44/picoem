@@ -39,8 +39,7 @@ CATALOG="$V2_DIR/mutants_catalog.json"
 mkdir -p "$PARA_DIR"
 
 start() {
-    local n="${1:-4}"
-    shift || true
+    shift || true  # consume the unused legacy N argument if present
     local extra=("$@")
 
     if [ ! -f "$SWEEP_MISSED" ]; then
@@ -50,12 +49,22 @@ start() {
         echo "missing $CATALOG" >&2; exit 1
     fi
 
-    echo "Splitting $(wc -l < "$SWEEP_MISSED") missed mutants into $n shards"
+    echo "Splitting $(wc -l < "$SWEEP_MISSED") missed mutants by oracle"
     rm -f "$PARA_DIR"/missed.shard.* "$PARA_DIR"/results.*.jsonl \
           "$PARA_DIR"/log.* "$PARA_DIR"/pid.*
-    # split assigns lines round-robin across N files when -n l/N is used.
-    split --number=l/"$n" -d -a 1 \
-        "$SWEEP_MISSED" "$PARA_DIR"/missed.shard.
+    # Three shards, one per oracle. This avoids the port-3333 collision
+    # that hits when two parallel M33 workers each try to spawn QEMU.
+    # Shard 0 → qemu_diff_m33 (mdrp2350: decode.rs, execute.rs, execute_thumb32.rs)
+    # Shard 1 → qemu_diff_m0plus (all mdrp2040 files)
+    # Shard 2 → softfloat_diff (mdrp2350/execute_fpu.rs)
+    awk '
+      /crates\/mdrp2350\/src\/core\/decode\.rs:/         { print > "'"$PARA_DIR"'/missed.shard.0"; next }
+      /crates\/mdrp2350\/src\/core\/execute\.rs:/        { print > "'"$PARA_DIR"'/missed.shard.0"; next }
+      /crates\/mdrp2350\/src\/core\/execute_thumb32\.rs:/{ print > "'"$PARA_DIR"'/missed.shard.0"; next }
+      /crates\/mdrp2040\/src\/core\//                    { print > "'"$PARA_DIR"'/missed.shard.1"; next }
+      /crates\/mdrp2350\/src\/core\/execute_fpu\.rs:/    { print > "'"$PARA_DIR"'/missed.shard.2"; next }
+    ' "$SWEEP_MISSED"
+    local n=3
 
     mkdir -p "$WORKSPACES"
     for i in $(seq 0 $((n-1))); do
