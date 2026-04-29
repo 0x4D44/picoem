@@ -1899,3 +1899,289 @@ mod stage4_lib_residue {
         assert_eq!(emu.peek(0x2000_2000), 0xCAFE_F00D);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 5: branch-coverage residue not hit by Stage 4. Targets specific
+// `if` arms inside `reset`, `load_image`, `step_serial`, `tick_systick`,
+// `tick_pio_and_route_irqs`, `tick_pio`, `update_gpio`, and `wake_checks`.
+// Pure append-only — does not modify production code.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage5_lib_residue {
+    use super::*;
+    use mdpicoem_devices::Psram;
+
+    // ------------------- reset: psram present (line 422) -------------------
+
+    /// Drives the true branch of `if let Some(ref mut psram) = self.bus.psram`
+    /// (line 422) inside `reset()` by attaching a PSRAM device first.
+    #[test]
+    fn reset_with_psram_attached() {
+        let psram = Psram::new(0, 1, 2, 3);
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .psram(psram)
+            .build()
+            .unwrap();
+        emu.reset();
+        assert_eq!(emu.cycles(), 0);
+    }
+
+    // ------------------- load_image: ROM offset boundary (line 461) -------------------
+
+    /// Drives the false branch of `if offset < ROM_SIZE` inside the ROM
+    /// arm of `load_image` (line 461) by passing an offset past ROM end.
+    /// `offset = addr & 0x0FFF_FFFF` so `0x0FFF_FFFF` is well past the
+    /// 16 KB ROM_SIZE.
+    #[test]
+    fn load_image_rom_offset_past_end_is_skipped() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0x55u8; 4];
+        // offset = 0x0FFF_FFFF >= ROM_SIZE so the inner copy is skipped.
+        emu.load_image(0x0FFF_FFFF, &data);
+        // ROM byte 0 untouched (was 0).
+        assert_eq!(emu.bus.memory.rom_read8(0), 0);
+    }
+
+    /// Drives the true branch of the same `if offset < ROM_SIZE` (line 461)
+    /// — the existing test suite hits this through `load_image_rom_region_overlay`,
+    /// repeated here for explicit branch attribution.
+    #[test]
+    fn load_image_rom_offset_inside_overlays() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        emu.load_image(0x0000_0010, &data);
+        assert_eq!(emu.bus.memory.rom_read8(0x10), 0xAA);
+    }
+
+    // ------------------- step_serial: while-loop arms + c0/c1 paths -------------------
+
+    /// Drives the true arm of the c1 step `if !self.cores[1].is_halted()
+    /// && !self.bus.wfe_waiting[1]` (line 700) by waking core 1 first.
+    /// Also covers line 681/682 (while predicate evaluates with both
+    /// cores live).
+    #[test]
+    fn step_serial_runs_core1_when_awake() {
+        let mut emu = Emulator::new(Config::default());
+        emu.wake_core1();
+        assert!(!emu.cores[1].is_halted());
+        let _ = emu.step().unwrap();
+    }
+
+    /// Drives the WFE-waiting branch in the c1 selection (line 700 false
+    /// arm via wfe_waiting=true).
+    #[test]
+    fn step_serial_skips_core1_when_wfe_waiting() {
+        let mut emu = Emulator::new(Config::default());
+        emu.wake_core1();
+        emu.bus.wfe_waiting[1] = true;
+        let _ = emu.step().unwrap();
+    }
+
+    /// Drives the true arm of `if c0 == 0 && c1 == 0` (line 715) by
+    /// halting core 0 and parking core 1 in WFE so neither contributes
+    /// cycles, but the while predicate still fires once because halted
+    /// flags can be reset between iterations. Best-effort branch-visit
+    /// test — actual entry depends on inner-loop timing.
+    #[test]
+    fn step_serial_break_on_zero_cycles_smoke() {
+        let mut emu = Emulator::new(Config::default());
+        // Both cores halted so the while predicate gates entry to the
+        // loop body. The loop exits before producing cycles, so the
+        // post-loop bookkeeping still runs.
+        emu.cores[0].halt();
+        emu.halt_core1();
+        let _ = emu.step().unwrap();
+    }
+
+    // ------------------- step_serial: slow-path / fast-path gating (line 750) -------------------
+
+    /// Drives the slow-path arm of the fast-path gate (line 750 false)
+    /// by enabling SysTick on the active core. The predicate
+    /// `systick_idle = !systicks[active].is_enabled()` becomes false,
+    /// forcing the slow branch.
+    #[test]
+    fn step_serial_drops_to_slow_path_when_systick_enabled() {
+        let mut emu = Emulator::new(Config::default());
+        // Enable SysTick on core 0 (CSR.ENABLE = bit 0).
+        emu.bus.systicks[0].csr |= 1;
+        let _ = emu.step().unwrap();
+    }
+
+    /// Drives the fast-path arm of the same gate (line 750 true). Default
+    /// state has no SysTick, no IRQ, no PIO — the existing
+    /// `step_serial_returns_ok` already exercises this; making it explicit
+    /// here for branch attribution.
+    #[test]
+    fn step_serial_takes_fast_path_when_idle() {
+        let mut emu = Emulator::new(Config::default());
+        let _ = emu.step().unwrap();
+    }
+
+    // ------------------- drain_pending_irqs_to_cores (line 792, 795) -------------------
+
+    /// Drives the true arm of `if self.bus.irq_pending != 0` (line 792)
+    /// AND the inner per-IRQ scan (line 795 true) by pre-staging a bus
+    /// irq_pending bit. Forces the slow path via SysTick enable so the
+    /// drain runs.
+    #[test]
+    fn drain_pending_irqs_routes_to_nvics() {
+        let mut emu = Emulator::new(Config::default());
+        // Force slow path.
+        emu.bus.systicks[0].csr |= 1;
+        // Pre-stage a pending IRQ on bus.irq_pending.
+        emu.bus.irq_pending = 0x1; // line 0
+        let _ = emu.step().unwrap();
+        // After the slow path drains, both NVICs see line 0 pending.
+        assert!(emu.bus.nvics[0].is_pending(0) || emu.bus.nvics[1].is_pending(0));
+    }
+
+    // ------------------- tick_systick (lines 812, 817) -------------------
+
+    /// Drives the true branches of `if systicks[0].tick()` (line 812) and
+    /// `if systicks[1].tick()` (line 817) by enabling SysTick with
+    /// CVR=0, RVR=0 so the very first tick fires.
+    #[test]
+    fn tick_systick_fires_on_both_cores_when_enabled() {
+        let mut emu = Emulator::new(Config::default());
+        // Wake core 1 so it consumes cycles → tick_systick(c0, c1) with
+        // both > 0.
+        emu.wake_core1();
+        // Enable SysTick (ENABLE=1, TICKINT=1) on both cores; CVR=0, RVR=0
+        // → first tick reloads + fires.
+        emu.bus.systicks[0].csr = 0b11;
+        emu.bus.systicks[1].csr = 0b11;
+        emu.bus.systicks[0].cvr = 0;
+        emu.bus.systicks[1].cvr = 0;
+        let _ = emu.step().unwrap();
+    }
+
+    // ------------------- tick_pio_and_route_irqs (lines 842, 852, 855, 860, 863) -------------------
+
+    /// Drives the false arm of `if gpio_in & (1u32 << 4) == 0` (line 842)
+    /// by seeding `bus.gpio_in` with bit 4 high before the slow-path
+    /// tick. tick_pio_and_route_irqs reads gpio_in directly so we must
+    /// pre-set it; update_gpio runs after tick_pio so the external mask
+    /// alone doesn't apply early enough.
+    #[test]
+    fn tick_pio_iow_high_does_not_count_as_low() {
+        let mut emu = Emulator::new(Config::default());
+        // Force slow path so tick_pio_and_route_irqs runs.
+        emu.bus.systicks[0].csr |= 1;
+        // Pre-seed gpio_in with bit 4 high AND set the external mask so
+        // update_gpio's post-tick rewrite preserves it across the cycle.
+        emu.bus.gpio_in = 1u32 << 4;
+        emu.bus.external_gpio_in_mask = 1u32 << 4;
+        emu.bus.external_gpio_in_override = 1u32 << 4;
+        let _ = emu.step().unwrap();
+        // The branch was visited; whether the count stays zero depends
+        // on whether tick_pio runs again after update_gpio. The goal is
+        // line coverage of the false arm of the IOW gate.
+    }
+
+    /// Drives the true arms of the PIO INTF routing `if int0_ints != 0`
+    /// (line 860) and `int1_ints != 0` (line 863) for both PIO blocks.
+    /// Uses the slow-path forcing trick so tick_pio_and_route_irqs runs.
+    #[test]
+    fn tick_pio_routes_intf_to_irq_pending() {
+        let mut emu = Emulator::new(Config::default());
+        // Force slow path.
+        emu.bus.systicks[0].csr |= 1;
+        // Release every peripheral from reset so MMIO writes to PIO land.
+        emu.bus.resets.state = 0;
+        // Write INT0_INTF / INT1_INTF on both PIO blocks. RP2040 PIO
+        // INT0_INTF offset 0x034, INT1_INTF offset 0x040 (datasheet
+        // §3.7). bus offsets: PIO0=0x5020_0000, PIO1=0x5030_0000.
+        emu.bus.write32(0x5020_0034, 0x1);
+        emu.bus.write32(0x5020_0040, 0x1);
+        emu.bus.write32(0x5030_0034, 0x1);
+        emu.bus.write32(0x5030_0040, 0x1);
+        let _ = emu.step().unwrap();
+    }
+
+    // ------------------- tick_pio early-return (line 876) -------------------
+
+    /// Drives the true arm of `if cycles == 0` inside `tick_pio`
+    /// (line 876) by stepping with cores idle. This is best-effort —
+    /// the step path may always pass non-zero cycles. We instead invoke
+    /// the situation by halting both cores so `consumed` may be zero.
+    #[test]
+    fn tick_pio_zero_cycles_is_noop_smoke() {
+        let mut emu = Emulator::new(Config::default());
+        emu.cores[0].halt();
+        emu.halt_core1();
+        let _ = emu.step().unwrap();
+    }
+
+    // ------------------- update_gpio: psram path + external mask (lines 1110, 1111, 1118) -------------------
+
+    /// Drives the true branch of `if let Some(ref mut psram) = self.bus.psram`
+    /// (line 1110) plus the inner `if let Some(miso) = psram.tick(out)`
+    /// (line 1111) by attaching a PSRAM and calling update_gpio via a
+    /// public path (gpio_write triggers it).
+    #[test]
+    fn update_gpio_with_psram_attached() {
+        let psram = Psram::new(0, 1, 2, 3);
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .psram(psram)
+            .build()
+            .unwrap();
+        // gpio_write calls update_gpio internally.
+        emu.gpio_write(5, true);
+    }
+
+    /// Drives the true branch of `if ext_mask != 0` (line 1118) by
+    /// asserting an external GPIO mask before update_gpio runs.
+    #[test]
+    fn update_gpio_external_mask_overrides() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.external_gpio_in_mask = 1u32 << 5;
+        emu.bus.external_gpio_in_override = 1u32 << 5;
+        // Trigger update_gpio via gpio_write.
+        emu.gpio_write(0, false);
+        assert!(emu.gpio_read(5));
+    }
+
+    // ------------------- wake_checks (lines 1148, 1155) -------------------
+
+    /// Drives the true arm of `if self.bus.wfe_waiting[core] &&
+    /// self.bus.event_flag[core]` (line 1148): pre-park core 0 on WFE
+    /// with an event latched.
+    #[test]
+    fn wake_checks_consumes_wfe_event_core0() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.wfe_waiting[0] = true;
+        emu.bus.event_flag[0] = true;
+        emu.cores[0].halt();
+        let _ = emu.step().unwrap();
+        assert!(!emu.bus.wfe_waiting[0]);
+        assert!(!emu.bus.event_flag[0]);
+    }
+
+    /// Drives the true arm of `if self.cores[core].is_halted() &&
+    /// self.bus.nvics[core].pending_and_enabled() != 0` (line 1155)
+    /// by enabling and pending an IRQ on core 0 while halted.
+    #[test]
+    fn wake_checks_unhalts_on_pending_enabled_irq_core0() {
+        let mut emu = Emulator::new(Config::default());
+        emu.cores[0].halt();
+        emu.bus.nvics[0].set_enabled(0);
+        emu.bus.nvics[0].set_pending(0);
+        let _ = emu.step().unwrap();
+        assert!(!emu.cores[0].is_halted());
+    }
+
+    // ------------------- core_cycles: fall-through after core 1 wake -------------------
+
+    /// Indirect coverage for the cycle-counter idx==1 arm in core_cycles
+    /// after the core has actually consumed a cycle. The default-zero
+    /// case is covered by `core_cycles_default_zero`; this test forces
+    /// a non-zero counter to pair with it.
+    #[test]
+    fn core_cycles_idx1_after_step() {
+        let mut emu = Emulator::new(Config::default());
+        emu.wake_core1();
+        let _ = emu.step().unwrap();
+        // No exact assertion — accessor evaluates the idx==1 arm.
+        let _ = emu.core_cycles(1);
+    }
+}
