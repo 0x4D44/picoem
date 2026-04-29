@@ -11,10 +11,12 @@
 //   * GDB port: 3334 (3333 is in use by qemu_diff_m33).
 //   * Emulator: `mdrp2040::CortexM0Plus` + `mdrp2040::Bus`.
 //
-// Test-case filter: only Thumb-16 instructions that are valid on both
-// M0+ and M33 are fuzzed. M33-only encodings (IT blocks, CBZ/CBNZ,
-// Thumb-32 DP/ldm/stm/mul, FP) are filtered out. The fuzz generator
-// lives in `mdpicoem_harness::lib`; we just select the subset.
+// Test-case filter: Thumb-16 instructions plus the M0+ Thumb-32 subset
+// (`BL`, `MRS`, `MSR`, `DSB`, `DMB`, `ISB`) are exercised. M33-only
+// encodings (IT blocks, CBZ/CBNZ, M33-only Thumb-32 DP/ldm/stm/multiply,
+// FP, BASEPRI/FAULTMASK SYSm, banked `_NS` aliases) are filtered out.
+// The fuzz generator lives in `mdpicoem_harness::lib`; we just select
+// the subset. The doc-comment on `is_m0plus_safe` is authoritative.
 //
 // Usage (mirrors qemu_diff_m33):
 //   qemu_diff_m0plus                              Run targeted edge-case tests
@@ -123,6 +125,17 @@ fn parse_args() -> Result<Args, String> {
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = parse_args()?;
+
+    // Sanity gate (HLD §5.5): emit admit-count of the curated `generate_all`
+    // corpus through the relaxed filter before any QEMU work. If a future
+    // encoder change silently drops every Thumb-32 admit, `run_targeted`
+    // could still report all-passes; this line makes that loud.
+    let all = generate_all();
+    let admitted: Vec<&TestCase> = all.iter().filter(|tc| is_m0plus_safe(tc)).collect();
+    let total = admitted.len();
+    let t32 = admitted.iter().filter(|tc| tc.hw1.is_some()).count();
+    let t16 = total - t32;
+    println!("Test corpus: {total} total, {t16} Thumb-16, {t32} Thumb-32 (after filter).");
 
     let profile = QemuProfile::M0_PLUS_RP2040;
     eprintln!(
