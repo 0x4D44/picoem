@@ -1496,3 +1496,406 @@ impl EmulatorBuilder {
         Ok(emu)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 4: residue branch coverage for the top-level `lib.rs` (Emulator,
+// EmulatorBuilder, Config, ConfigError, EmulatorError, ExecutionModel,
+// WorkerName). Pure append-only — does not modify any production code.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_lib_residue {
+    use super::*;
+
+    // ------------------- ConfigError -------------------
+
+    #[test]
+    fn config_error_display_threading_unavailable() {
+        let s = format!("{}", ConfigError::ThreadingUnavailable);
+        assert!(s.contains("Threaded"));
+        assert!(s.contains("unavailable"));
+    }
+
+    #[test]
+    fn config_error_debug_and_clone_eq() {
+        let e1 = ConfigError::ThreadingUnavailable;
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+        let _ = format!("{:?}", e1);
+    }
+
+    #[test]
+    fn config_error_is_std_error() {
+        fn assert_err<E: std::error::Error>(_: &E) {}
+        assert_err(&ConfigError::ThreadingUnavailable);
+    }
+
+    // ------------------- EmulatorError -------------------
+
+    #[test]
+    fn emulator_error_display_not_supported_in_threaded() {
+        let s = format!("{}", EmulatorError::NotSupportedInThreadedMode);
+        assert!(s.contains("Threaded"));
+    }
+
+    #[test]
+    fn emulator_error_display_worker_panicked() {
+        let e = EmulatorError::WorkerPanicked {
+            which: WorkerName::Core0,
+            message: String::from("boom"),
+        };
+        let s = format!("{}", e);
+        assert!(s.contains("panicked"));
+        assert!(s.contains("boom"));
+        assert!(s.contains("core0"));
+    }
+
+    #[test]
+    fn emulator_error_display_barrier_timeout() {
+        let e = EmulatorError::BarrierTimeout {
+            which: WorkerName::Coord,
+            elapsed_ms: 1_234,
+        };
+        let s = format!("{}", e);
+        assert!(s.contains("barrier"));
+        assert!(s.contains("1234"));
+        assert!(s.contains("coord"));
+    }
+
+    #[test]
+    fn emulator_error_clone_eq_debug() {
+        let e1 = EmulatorError::NotSupportedInThreadedMode;
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+        let _ = format!("{:?}", e1);
+    }
+
+    // ------------------- WorkerName -------------------
+
+    #[test]
+    fn worker_name_as_str_all_variants() {
+        assert_eq!(WorkerName::Core0.as_str(), "core0");
+        assert_eq!(WorkerName::Core1.as_str(), "core1");
+        assert_eq!(WorkerName::Coord.as_str(), "coord");
+    }
+
+    #[test]
+    fn worker_name_clone_eq_debug() {
+        let w = WorkerName::Core1;
+        assert_eq!(w, w.clone());
+        let _ = format!("{:?}", w);
+    }
+
+    // ------------------- ExecutionModel -------------------
+
+    #[test]
+    fn execution_model_default_is_serial() {
+        assert_eq!(ExecutionModel::default(), ExecutionModel::Serial);
+    }
+
+    #[test]
+    fn execution_model_eq_and_debug() {
+        assert_eq!(ExecutionModel::Threaded, ExecutionModel::Threaded);
+        assert_ne!(ExecutionModel::Serial, ExecutionModel::Threaded);
+        let _ = format!("{:?}", ExecutionModel::Serial);
+        let _ = format!("{:?}", ExecutionModel::Threaded);
+    }
+
+    // ------------------- Builder: ConfigError::ThreadingUnavailable -------------------
+
+    #[cfg(not(feature = "threading"))]
+    #[test]
+    fn builder_threaded_no_feature_returns_threading_unavailable() {
+        let res = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build();
+        match res {
+            Err(ConfigError::ThreadingUnavailable) => {}
+            Ok(_) => panic!("Threaded should fail without `threading` feature"),
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    #[test]
+    fn builder_threaded_off_platform_returns_threading_unavailable() {
+        let res = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build();
+        match res {
+            Err(ConfigError::ThreadingUnavailable) => {}
+            Ok(_) => panic!("Threaded should fail on unsupported platforms"),
+        }
+    }
+
+    // ------------------- Builder defaults / overrides -------------------
+
+    #[test]
+    fn builder_default_step_quantum() {
+        let emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        assert_eq!(emu.step_quantum, DEFAULT_STEP_QUANTUM);
+    }
+
+    #[test]
+    fn builder_custom_step_quantum() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(8)
+            .build()
+            .unwrap();
+        assert_eq!(emu.step_quantum, 8);
+    }
+
+    #[test]
+    fn builder_custom_sysclk() {
+        let cfg = Config {
+            sys_clk_hz: 125_000_000,
+        };
+        let emu = EmulatorBuilder::new(cfg).build().unwrap();
+        // The clock tree is recomputed from sys_clk_hz; simplest check is
+        // that the emulator builds and the master cycle starts at zero.
+        assert_eq!(emu.cycles(), 0);
+    }
+
+    #[test]
+    fn builder_execution_serial_explicit() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Serial)
+            .build()
+            .unwrap();
+        assert_eq!(emu.execution_model(), ExecutionModel::Serial);
+    }
+
+    #[test]
+    fn builder_with_flash_pre_loads_xip() {
+        let mut flash = vec![0u8; 32];
+        flash[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let emu = EmulatorBuilder::new(Config::default())
+            .flash(flash)
+            .build()
+            .unwrap();
+        // XIP base is 0x1000_0000 — the flash loader writes there.
+        assert_eq!(emu.bus.memory.xip_read32(0), 0xDEAD_BEEF);
+    }
+
+    // ------------------- Emulator basics -------------------
+
+    #[test]
+    fn execution_model_accessor_returns_selected() {
+        let emu = Emulator::new(Config::default());
+        assert_eq!(emu.execution_model(), ExecutionModel::Serial);
+    }
+
+    #[test]
+    fn core_cycles_default_zero() {
+        let emu = Emulator::new(Config::default());
+        assert_eq!(emu.core_cycles(0), 0);
+        assert_eq!(emu.core_cycles(1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "core_cycles: idx must be 0 or 1")]
+    fn core_cycles_invalid_idx_panics() {
+        let emu = Emulator::new(Config::default());
+        let _ = emu.core_cycles(2);
+    }
+
+    #[test]
+    fn cycles_starts_at_zero() {
+        let emu = Emulator::new(Config::default());
+        assert_eq!(emu.cycles(), 0);
+    }
+
+    #[test]
+    fn core_and_core_mut_accessors() {
+        let mut emu = Emulator::new(Config::default());
+        // No id() public method available like mdrp2350's, but we can
+        // exercise both accessors and the placeholder-guard path.
+        let _ = emu.core(0);
+        let _ = emu.core_mut(1);
+    }
+
+    // ------------------- Emulator::run / step -------------------
+
+    #[test]
+    fn run_zero_cycles_serial_is_noop() {
+        let mut emu = Emulator::new(Config::default());
+        let executed = emu.run(0).unwrap();
+        // run() returns the delta in cycles. With cycles=0 the inner loop
+        // condition `clock.cycles - start < 0` is false on first check, so
+        // no quanta run.
+        assert_eq!(executed, 0);
+    }
+
+    #[test]
+    fn run_quantum_serial_returns_ok() {
+        let mut emu = Emulator::new(Config::default());
+        let r = emu.run_quantum().unwrap();
+        // run_quantum returns the number of cycles consumed in this
+        // quantum; with both cores halted (core 1 always halted, core 0
+        // running zero-data ROM) this is bounded by step_quantum.
+        assert!(r <= emu.step_quantum as u64);
+    }
+
+    #[test]
+    fn step_serial_returns_ok() {
+        let mut emu = Emulator::new(Config::default());
+        // Both cores halt quickly with zero-data ROM, but step still
+        // returns Ok(consumed) on Serial.
+        let _ = emu.step().unwrap();
+    }
+
+    // ------------------- gpio bounds -------------------
+
+    #[test]
+    fn gpio_read_pin_30_returns_false() {
+        let emu = Emulator::new(Config::default());
+        assert!(!emu.gpio_read(30));
+        assert!(!emu.gpio_read(31));
+    }
+
+    #[test]
+    fn gpio_write_pin_out_of_range_is_noop() {
+        let mut emu = Emulator::new(Config::default());
+        // Pin 30 is past the valid range. The function bails early — no
+        // GPIO_OE bit gets set.
+        emu.gpio_write(30, true);
+        assert_eq!(emu.bus.sio.gpio_oe & (1u32 << 30), 0);
+    }
+
+    #[test]
+    fn gpio_write_in_range_sets_oe_and_out() {
+        let mut emu = Emulator::new(Config::default());
+        emu.gpio_write(5, true);
+        assert_ne!(emu.bus.sio.gpio_oe & (1u32 << 5), 0);
+        assert_ne!(emu.bus.sio.gpio_out & (1u32 << 5), 0);
+        emu.gpio_write(5, false);
+        assert_eq!(emu.bus.sio.gpio_out & (1u32 << 5), 0);
+    }
+
+    #[test]
+    fn gpio_read_all_default_zero() {
+        let emu = Emulator::new(Config::default());
+        assert_eq!(emu.gpio_read_all(), 0);
+    }
+
+    // ------------------- load_image / load_bootrom / load_flash -------------------
+
+    #[test]
+    fn load_image_sram_writes_through() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0x11u8, 0x22, 0x33, 0x44];
+        emu.load_image(0x2000_0100, &data);
+        assert_eq!(emu.peek(0x2000_0100), 0x4433_2211);
+    }
+
+    #[test]
+    fn load_image_rom_region_overlay() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        emu.load_image(0x0000_0000, &data);
+        assert_eq!(emu.bus.memory.rom_read8(0), 0xAA);
+        assert_eq!(emu.bus.memory.rom_read8(3), 0xDD);
+    }
+
+    #[test]
+    fn load_image_unknown_region_silently_dropped() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0xFFu8; 4];
+        // 0x4 region — no match arm, falls through.
+        emu.load_image(0x4000_0000, &data);
+    }
+
+    #[test]
+    fn load_bootrom_loads_first_word() {
+        let mut emu = Emulator::new(Config::default());
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+        emu.load_bootrom(&data);
+        assert_eq!(emu.bus.memory.rom_read32(0), 0x2000_8000);
+    }
+
+    #[test]
+    fn load_flash_drains_invalidations() {
+        let mut emu = Emulator::new(Config::default());
+        emu.load_flash(&[0u8; 16]);
+        assert_eq!(emu.bus.pending_invalidation_regions, 0);
+    }
+
+    // ------------------- direct_boot_from_flash -------------------
+
+    #[test]
+    fn direct_boot_from_flash_seeds_sp_pc_vtor() {
+        let mut emu = Emulator::new(Config::default());
+        // Build a minimal vector table at flash offset 0x100 (pico-sdk).
+        let sp = 0x2002_0000u32;
+        let entry = 0x1000_0301u32; // Thumb-bit set
+        let vtor_offset = 0x100u32;
+        let mut flash = vec![0u8; 0x200];
+        flash[(vtor_offset as usize)..(vtor_offset as usize + 4)]
+            .copy_from_slice(&sp.to_le_bytes());
+        flash[(vtor_offset as usize + 4)..(vtor_offset as usize + 8)]
+            .copy_from_slice(&entry.to_le_bytes());
+        emu.load_flash(&flash);
+        emu.direct_boot_from_flash(vtor_offset);
+        for c in 0..2 {
+            assert_eq!(emu.cores[c].regs.msp, sp);
+            assert_eq!(emu.cores[c].regs.pc(), entry & !1);
+        }
+        assert_eq!(emu.bus.ppb[0].vtor, 0x1000_0000 + vtor_offset);
+        // Core 1 stays halted by halt_core1.
+        assert!(emu.cores[1].is_halted());
+    }
+
+    // ------------------- halt_core1 / wake_core1 -------------------
+
+    #[test]
+    fn halt_and_wake_core1_round_trip() {
+        let mut emu = Emulator::new(Config::default());
+        // Initial state: core 1 halted.
+        assert!(emu.cores[1].is_halted());
+        emu.wake_core1();
+        assert!(!emu.cores[1].is_halted());
+        emu.halt_core1();
+        assert!(emu.cores[1].is_halted());
+    }
+
+    // ------------------- mmio_read32 / mmio_write32 -------------------
+
+    #[test]
+    fn mmio_write_read_roundtrip_sram() {
+        let mut emu = Emulator::new(Config::default());
+        emu.mmio_write32(0x2000_0000, 0xDEAD_BEEF);
+        assert_eq!(emu.mmio_read32(0x2000_0000), 0xDEAD_BEEF);
+    }
+
+    // ------------------- reset -------------------
+
+    #[test]
+    fn reset_clears_clock() {
+        let mut emu = Emulator::new(Config::default());
+        let _ = emu.step().unwrap();
+        emu.reset();
+        assert_eq!(emu.cycles(), 0);
+        assert_eq!(emu.pio_tick_count, 0);
+    }
+
+    // ------------------- drain_uart0_tx_log -------------------
+
+    #[test]
+    fn drain_uart0_tx_log_default_empty() {
+        let mut emu = Emulator::new(Config::default());
+        let v = emu.drain_uart0_tx_log();
+        assert!(v.is_empty());
+    }
+
+    // ------------------- poke / peek -------------------
+
+    #[test]
+    fn poke_and_peek_round_trip_sram() {
+        let mut emu = Emulator::new(Config::default());
+        emu.poke(0x2000_2000, 0xCAFE_F00D);
+        assert_eq!(emu.peek(0x2000_2000), 0xCAFE_F00D);
+    }
+}

@@ -3162,4 +3162,425 @@ mod tests {
              compressed_unhandled = {compressed_unhandled}"
         );
     }
+
+    // ====================================================================
+    // Stage 4 — riscv_gen residue coverage lift
+    //
+    // Targets uncovered branches in:
+    //   * `is_fp_opcode` — every entry in `FP_OPCODES` plus a non-FP
+    //     opcode false case.
+    //   * `is_compressed` — both arms (low 2 bits == 0b11 vs anything else).
+    //   * `RiscvClass::weight_bp` — all 12 match arms.
+    //   * `RiscvClass::ALL` — length and ordering invariants.
+    //   * Encoder boundary values (each of R/I/S/B/U/J/CSR with min/max
+    //     immediate, register x31, opcode bits stripped).
+    //   * Per-class fuzz generators called individually so each match
+    //     arm in `generate_fuzz`'s allocator dispatch is reached
+    //     independently of the weight-driven mix.
+    //
+    // Append-only inside the existing `mod tests`. No changes to
+    // production code.
+    // ====================================================================
+
+    // ----- is_fp_opcode -----------------------------------------------------
+
+    #[test]
+    fn is_fp_opcode_each_entry_is_detected() {
+        // Every entry of `FP_OPCODES` must be detected. We zero-extend
+        // each opcode into a synthetic word so the only relevant bits
+        // are bits[6:0].
+        for op in FP_OPCODES {
+            let word = op; // already in low 7 bits
+            assert!(is_fp_opcode(word), "FP opcode 0x{op:02X} not detected");
+            // Garbage in upper bits must not affect the result.
+            assert!(
+                is_fp_opcode(word | 0xFFFF_FF80),
+                "FP opcode 0x{op:02X} not detected with upper bits set"
+            );
+        }
+    }
+
+    #[test]
+    fn is_fp_opcode_rejects_non_fp() {
+        // OPC_OP (0x33), OPC_OP_IMM (0x13), OPC_LOAD (0x03), OPC_LUI
+        // (0x37), OPC_AUIPC (0x17), OPC_BRANCH (0x63), OPC_JAL (0x6F),
+        // OPC_JALR (0x67), OPC_AMO (0x2F), OPC_MISC_MEM (0x0F),
+        // OPC_SYSTEM (0x73), OPC_STORE (0x23). None are F/D.
+        let non_fp = [
+            OPC_OP,
+            OPC_OP_IMM,
+            OPC_LOAD,
+            OPC_STORE,
+            OPC_LUI,
+            OPC_AUIPC,
+            OPC_BRANCH,
+            OPC_JAL,
+            OPC_JALR,
+            OPC_AMO,
+            OPC_MISC_MEM,
+            OPC_SYSTEM,
+        ];
+        for op in non_fp {
+            assert!(
+                !is_fp_opcode(op),
+                "non-FP opcode 0x{op:02X} flagged as FP"
+            );
+        }
+    }
+
+    // ----- is_compressed ----------------------------------------------------
+
+    #[test]
+    fn is_compressed_branches() {
+        // Quadrant 0/1/2 → compressed. Quadrant 3 (bits[1:0] == 0b11)
+        // is the 32-bit form.
+        assert!(is_compressed(0x0000_0000)); // Q0 (illegal, but compressed shape)
+        assert!(is_compressed(0x0000_0001)); // Q1
+        assert!(is_compressed(0x0000_0002)); // Q2
+        assert!(!is_compressed(0x0000_0003)); // Q3 — uncompressed
+        // Real instruction examples.
+        assert!(is_compressed(u32::from(0x4081u16))); // c.li (Q1)
+        assert!(!is_compressed(0x0000_0013)); // ADDI x0,x0,0 — 32-bit
+        assert!(!is_compressed(0xFFFF_FFFF)); // bottom = 0b11
+    }
+
+    // ----- RiscvClass::weight_bp -------------------------------------------
+
+    #[test]
+    fn riscv_class_weight_bp_each_variant_returns_lld_value() {
+        // Per-arm assertions match LLD §6 exactly. If a phase update
+        // shifts the weights, this test must be updated alongside the
+        // production change.
+        assert_eq!(RiscvClass::Rv32iAlu.weight_bp(), 3000);
+        assert_eq!(RiscvClass::Rv32iMem.weight_bp(), 1200);
+        assert_eq!(RiscvClass::Rv32iMisalignedMem.weight_bp(), 500);
+        assert_eq!(RiscvClass::Rv32iBranch.weight_bp(), 1000);
+        assert_eq!(RiscvClass::Rv32iUpper.weight_bp(), 500);
+        assert_eq!(RiscvClass::Rv32m.weight_bp(), 1000);
+        assert_eq!(RiscvClass::Rv32aReservable.weight_bp(), 1000);
+        assert_eq!(RiscvClass::Rv32c.weight_bp(), 500);
+        assert_eq!(RiscvClass::Zicsr.weight_bp(), 800);
+        assert_eq!(RiscvClass::Zifencei.weight_bp(), 200);
+        assert_eq!(RiscvClass::CsrSideEffect.weight_bp(), 300);
+        assert_eq!(RiscvClass::Pmp.weight_bp(), 0);
+    }
+
+    #[test]
+    fn riscv_class_all_has_twelve_unique_variants() {
+        assert_eq!(RiscvClass::ALL.len(), 12);
+        // Each variant appears exactly once.
+        for c in RiscvClass::ALL {
+            let count = RiscvClass::ALL.iter().filter(|x| **x == c).count();
+            assert_eq!(count, 1, "duplicate variant in ALL: {c:?}");
+        }
+        // Order must place Rv32iAlu first and Pmp last (matches the
+        // LLD §6 table + phase-1 PMP addition).
+        assert_eq!(RiscvClass::ALL[0], RiscvClass::Rv32iAlu);
+        assert_eq!(RiscvClass::ALL[11], RiscvClass::Pmp);
+    }
+
+    #[test]
+    fn riscv_class_derives_copy_eq_hash() {
+        // Hash trait is derived; exercise it via a HashMap insertion to
+        // catch any future remove-derive regression.
+        use std::collections::HashSet;
+        let s: HashSet<RiscvClass> = RiscvClass::ALL.iter().copied().collect();
+        assert_eq!(s.len(), 12);
+        let dbg = format!("{:?}", RiscvClass::Zicsr);
+        assert!(dbg.contains("Zicsr"));
+    }
+
+    // ----- Encoder boundary cases -----------------------------------------
+
+    #[test]
+    fn encode_r_type_truncates_oversized_fields() {
+        // funct7=0xFF → masks to 0x7F. rs2=0x80 → masks to 0. rs1=0x80 →
+        // masks to 0. rd=0x80 → masks to 0. opcode=0xFF → masks to 0x7F.
+        let w = encode_r_type(0xFF, 0x80, 0x80, 0xF, 0x80, 0xFF);
+        // funct7 high bit (bit 31) preserved, opcode low 7 bits mask.
+        assert_eq!(w & 0x7F, 0x7F, "opcode mask");
+        assert_eq!((w >> 25) & 0x7F, 0x7F, "funct7 mask");
+        assert_eq!((w >> 20) & 0x1F, 0, "rs2 truncated");
+        assert_eq!((w >> 15) & 0x1F, 0, "rs1 truncated");
+        assert_eq!((w >> 7) & 0x1F, 0, "rd truncated");
+        assert_eq!((w >> 12) & 0x7, 0x7, "funct3 mask");
+    }
+
+    #[test]
+    fn encode_i_type_handles_extreme_immediates() {
+        // imm=2047 → low 12 bits = 0x7FF, sign bit clear.
+        let w = encode_i_type(2047, 0, 0, 0, OPC_OP_IMM);
+        assert_eq!((w >> 20) & 0xFFF, 0x7FF);
+        // imm=-2048 → low 12 bits = 0x800.
+        let w = encode_i_type(-2048, 0, 0, 0, OPC_OP_IMM);
+        assert_eq!((w >> 20) & 0xFFF, 0x800);
+        // imm=0 → all zeros in imm field.
+        let w = encode_i_type(0, 0, 0, 0, OPC_OP_IMM);
+        assert_eq!((w >> 20) & 0xFFF, 0x0);
+        // imm overflow wraps modulo 2^12.
+        let w = encode_i_type(0x1234, 0, 0, 0, OPC_OP_IMM);
+        assert_eq!((w >> 20) & 0xFFF, 0x234);
+    }
+
+    #[test]
+    fn encode_s_type_splits_immediate_correctly() {
+        // imm=0xFFF → imm_hi=0x7F (bits[31:25]), imm_lo=0x1F (bits[11:7]).
+        let w = encode_s_type(-1, 0, 0, 0, OPC_STORE);
+        assert_eq!((w >> 25) & 0x7F, 0x7F, "imm_hi");
+        assert_eq!((w >> 7) & 0x1F, 0x1F, "imm_lo");
+        // imm=0x123 → hi=0x09, lo=0x03.
+        let w = encode_s_type(0x123, 0, 0, 0, OPC_STORE);
+        assert_eq!((w >> 25) & 0x7F, 0x09);
+        assert_eq!((w >> 7) & 0x1F, 0x03);
+    }
+
+    #[test]
+    fn encode_b_type_layout_branch_imm_zero() {
+        // imm=0: bit 31 (imm[12]) clear, bit 7 (imm[11]) clear, bits[30:25]
+        // and bits[11:8] both 0.
+        let w = encode_b_type(0, 0, 0, 0, OPC_BRANCH);
+        assert_eq!(w >> 31, 0);
+        assert_eq!((w >> 7) & 1, 0);
+        assert_eq!((w >> 25) & 0x3F, 0);
+        assert_eq!((w >> 8) & 0xF, 0);
+    }
+
+    #[test]
+    fn encode_u_type_strips_low_12_bits() {
+        // Documentation says: "imm32 expected to have zeros in low 12
+        // bits; we mask anyway." Verify the masking really happens.
+        let w = encode_u_type(0xFFFF_FFFF, 0, OPC_LUI);
+        // Top 20 bits of the immediate must survive; bits 19:12 of the
+        // word are bits 31:12 of the immediate (per encode_u_type).
+        assert_eq!(w & 0xFFFF_F000, 0xFFFF_F000);
+        // rd field (bits 11:7) is 0.
+        assert_eq!((w >> 7) & 0x1F, 0);
+        // Opcode preserved.
+        assert_eq!(w & 0x7F, OPC_LUI);
+    }
+
+    #[test]
+    fn encode_j_type_negative_imm_sign_extends_correctly() {
+        // imm=-2 is illegal (must be 2-byte aligned) but the encoder
+        // does not assert on that — it just truncates. Use a legal
+        // -4 to verify the bit-20 (sign) propagation.
+        let w = encode_j_type(-4, 0, OPC_JAL);
+        assert_eq!(w >> 31, 1, "imm[20] sign bit");
+        // imm=4 keeps bit[20] clear.
+        let w = encode_j_type(4, 0, OPC_JAL);
+        assert_eq!(w >> 31, 0, "imm[20] clear for +4");
+    }
+
+    #[test]
+    fn encode_csr_uses_opc_system_unconditionally() {
+        // The opcode is hardcoded inside encode_csr — verify it lands
+        // in the low 7 bits regardless of the other fields.
+        let w = encode_csr(0xFFF, 0x1F, 0x7, 0x1F);
+        assert_eq!(w & 0x7F, OPC_SYSTEM);
+        // CSR address bits[31:20].
+        assert_eq!((w >> 20) & 0xFFF, 0xFFF);
+        assert_eq!((w >> 15) & 0x1F, 0x1F);
+        assert_eq!((w >> 12) & 0x7, 0x7);
+        assert_eq!((w >> 7) & 0x1F, 0x1F);
+    }
+
+    // ----- Per-class fuzz generator dispatch -------------------------------
+    //
+    // `generate_fuzz` walks `RiscvClass::ALL` and calls one generator per
+    // class via `match`. The mixed-distribution test exercises the dispatch
+    // implicitly, but each individual generator's signature + class tag
+    // is verified here so a future "wrong class on RNG draw" bug surfaces
+    // against the per-class call rather than the integrated mix.
+
+    #[test]
+    fn fuzz_rv32i_alu_returns_correct_class() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32i_alu(&mut rng, 5);
+        assert_eq!(cs.len(), 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32iAlu);
+            assert!(tc.expect_trap.is_none(), "ALU fuzz must not predict trap");
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32i_mem_returns_correct_class() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32i_mem(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32iMem);
+            assert!(!tc.addr_regs.is_empty(), "mem case missing addr_regs");
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32i_misaligned_returns_trap_tag() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32i_misaligned(&mut rng, 10);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32iMisalignedMem);
+            let trap = tc.expect_trap.expect("misaligned must trap");
+            assert!(trap == 4 || trap == 6, "misaligned trap = {trap}");
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32i_branch_class_and_sled_shape() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32i_branch(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32iBranch);
+            // Each branch case is followed by a 16-NOP sled (17 words total).
+            assert_eq!(tc.words.len(), 17);
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32i_upper_class_tag() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32i_upper(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32iUpper);
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32m_class_tag() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32m(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32m);
+            // Every word must be R-type with funct7=0x01 (M-extension).
+            for &w in &tc.words {
+                assert_eq!(w & 0x7F, OPC_OP);
+                assert_eq!((w >> 25) & 0x7F, 0x01);
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32a_class_tag_in_reservable_window() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32a(&mut rng, 5);
+        let canon = |a: u32| {
+            if (a >> 28) == 0x8 {
+                (a & 0x0FFF_FFFF) | 0x2000_0000
+            } else {
+                a
+            }
+        };
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32aReservable);
+            for reg in &tc.addr_regs {
+                let v = tc
+                    .reg_pre
+                    .iter()
+                    .find(|(r, _)| r == reg)
+                    .map(|(_, v)| *v)
+                    .unwrap();
+                let v_canon = canon(v);
+                assert!((RESERVABLE_LO..RESERVABLE_HI).contains(&v_canon));
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32c_class_tag_and_compressed() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_rv32c(&mut rng, 30);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Rv32c);
+            // First word's low halfword must be a 16-bit (compressed)
+            // encoding, matching the class invariant.
+            assert!(is_compressed(tc.words[0]));
+        }
+    }
+
+    #[test]
+    fn fuzz_zicsr_class_tag() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_zicsr(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Zicsr);
+            for &w in &tc.words {
+                assert_eq!(w & 0x7F, OPC_SYSTEM);
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_zifencei_class_tag() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_zifencei(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Zifencei);
+        }
+    }
+
+    #[test]
+    fn fuzz_csr_side_effect_class_tag() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_csr_side_effect(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::CsrSideEffect);
+        }
+    }
+
+    #[test]
+    fn fuzz_pmp_class_tag_csr_in_pmp_range() {
+        let mut rng = StdRng::seed_from_u64(0x4ABC);
+        let cs = gen_fuzz_pmp(&mut rng, 5);
+        for tc in &cs {
+            assert_eq!(tc.class, RiscvClass::Pmp);
+            for &w in &tc.words {
+                assert_eq!(w & 0x7F, OPC_SYSTEM);
+                let csr = (w >> 20) & 0xFFF;
+                assert!(
+                    (0x3A0..=0x3A3).contains(&csr) || (0x3B0..=0x3BF).contains(&csr),
+                    "pmp csr 0x{csr:03X} out of range",
+                );
+            }
+        }
+    }
+
+    // ----- generate_edge_cases ordering -----------------------------------
+
+    #[test]
+    fn generate_edge_cases_order_matches_riscv_class_all() {
+        // Each class's edge cases are concatenated in `RiscvClass::ALL`
+        // order. Walk the result and confirm consecutive class tags
+        // never go backwards relative to that order.
+        let all = generate_edge_cases();
+        let order: Vec<RiscvClass> = RiscvClass::ALL.to_vec();
+        let mut last_idx = 0usize;
+        for tc in &all {
+            let idx = order.iter().position(|c| *c == tc.class).expect("class in ALL");
+            assert!(
+                idx >= last_idx,
+                "edge cases out of order: class {:?} (idx {idx}) follows last_idx {last_idx}",
+                tc.class
+            );
+            last_idx = idx;
+        }
+    }
+
+    // ----- Address constants ------------------------------------------------
+
+    #[test]
+    fn scratch_base_above_virt_flash() {
+        // VIRT_FLASH starts at 0x2000_0000 on QEMU virt; SCRATCH_BASE
+        // sits above 0x8000_0000 so the canonicalisation alias maps to
+        // SRAM cleanly. Documented constraint, regression-trapped here.
+        assert!(SCRATCH_BASE >= 0x8000_0000);
+        assert!(TRAP_STUB >= 0x8000_0000);
+    }
+
+    #[test]
+    fn reservable_window_nonempty() {
+        assert!(RESERVABLE_LO < RESERVABLE_HI);
+        // RESERVABLE_HI is exclusive — sanity-check the documented
+        // RP2350 §2.1.6.2 range (520 KB SRAM).
+        assert_eq!(RESERVABLE_LO, 0x2000_0000);
+        assert_eq!(RESERVABLE_HI - RESERVABLE_LO, 520 * 1024);
+    }
 }

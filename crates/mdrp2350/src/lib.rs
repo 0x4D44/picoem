@@ -1635,3 +1635,358 @@ mod tests;
 
 #[cfg(test)]
 mod tests_stage3_thumb32;
+
+// ---------------------------------------------------------------------------
+// Stage 4: residue branch coverage for the top-level `lib.rs` (Emulator,
+// EmulatorBuilder, Config, Cores, ConfigError, EmulatorError, Arch,
+// ExecutionModel). Pure append-only — does not modify any production code.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_lib_residue {
+    use super::*;
+
+    // ------------------- ConfigError -------------------
+
+    #[test]
+    fn config_error_display_threading_unavailable() {
+        let s = format!("{}", ConfigError::ThreadingUnavailable);
+        assert!(s.contains("Threaded"));
+        assert!(s.contains("unavailable"));
+    }
+
+    #[test]
+    fn config_error_debug_and_clone_eq() {
+        let e1 = ConfigError::ThreadingUnavailable;
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+        // Debug just needs to format successfully.
+        let _ = format!("{:?}", e1);
+    }
+
+    #[test]
+    fn config_error_is_std_error() {
+        // Confirms `impl std::error::Error for ConfigError`.
+        fn assert_err<E: std::error::Error>(_: &E) {}
+        assert_err(&ConfigError::ThreadingUnavailable);
+    }
+
+    // ------------------- EmulatorError -------------------
+
+    #[test]
+    fn emulator_error_display_not_supported_in_threaded() {
+        let s = format!("{}", EmulatorError::NotSupportedInThreadedMode);
+        assert!(s.contains("Threaded"));
+    }
+
+    #[test]
+    fn emulator_error_clone_and_eq() {
+        let e1 = EmulatorError::NotSupportedInThreadedMode;
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+        let _ = format!("{:?}", e1);
+    }
+
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn emulator_error_display_worker_panicked() {
+        let e = EmulatorError::WorkerPanicked {
+            which: threaded::WorkerName::Pio0,
+            message: String::from("boom"),
+        };
+        let s = format!("{}", e);
+        assert!(s.contains("panicked"));
+        assert!(s.contains("boom"));
+    }
+
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn emulator_error_display_barrier_timeout() {
+        let e = EmulatorError::BarrierTimeout {
+            which: threaded::WorkerName::Coord,
+            elapsed_ms: 1_234,
+        };
+        let s = format!("{}", e);
+        assert!(s.contains("barrier"));
+        assert!(s.contains("1234"));
+    }
+
+    // ------------------- Arch / ExecutionModel default & derives -------------------
+
+    #[test]
+    fn arch_default_is_arm() {
+        assert!(matches!(Arch::default(), Arch::Arm));
+    }
+
+    #[test]
+    fn execution_model_default_is_serial() {
+        assert_eq!(ExecutionModel::default(), ExecutionModel::Serial);
+    }
+
+    #[test]
+    fn execution_model_debug_and_eq() {
+        assert_eq!(ExecutionModel::Threaded, ExecutionModel::Threaded);
+        assert_ne!(ExecutionModel::Serial, ExecutionModel::Threaded);
+        let _ = format!("{:?}", ExecutionModel::Serial);
+        let _ = format!("{:?}", ExecutionModel::Threaded);
+    }
+
+    // ------------------- Builder: ConfigError::ThreadingUnavailable -------------------
+    //
+    // On no-threading-feature builds (the default), selecting Threaded must
+    // return ConfigError::ThreadingUnavailable. On threading-feature builds
+    // the same call succeeds when the host has enough cores; we cover the
+    // success path inline in `builder_threaded_with_feature`.
+
+    #[cfg(not(feature = "threading"))]
+    #[test]
+    fn builder_threaded_no_feature_returns_threading_unavailable() {
+        let res = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build();
+        match res {
+            Err(ConfigError::ThreadingUnavailable) => {}
+            Ok(_) => panic!("Threaded should fail without `threading` feature"),
+        }
+    }
+
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn builder_threaded_with_feature_riscv_rejected() {
+        // ThreadedEmulator supports Arm only; Threaded + RiscV is an
+        // explicit ThreadingUnavailable arm in `build()`.
+        let res = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .execution(ExecutionModel::Threaded)
+            .build();
+        match res {
+            Err(ConfigError::ThreadingUnavailable) => {}
+            Ok(_) => panic!("Threaded + RiscV should be rejected"),
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    #[test]
+    fn builder_threaded_off_platform_returns_threading_unavailable() {
+        // On platforms where threading isn't supported (non-x86_64, non-
+        // Windows/Linux), Threaded build must fail.
+        let res = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build();
+        match res {
+            Err(ConfigError::ThreadingUnavailable) => {}
+            Ok(_) => panic!("Threaded should fail on unsupported platforms"),
+        }
+    }
+
+    // ------------------- Cores accessors / introspection -------------------
+
+    #[test]
+    fn cores_is_arm_and_is_riscv_flags() {
+        let arm = EmulatorBuilder::new(Config::default()).build().unwrap();
+        assert!(arm.cores.is_arm());
+        assert!(!arm.cores.is_riscv());
+
+        let rv = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build()
+            .unwrap();
+        assert!(!rv.cores.is_arm());
+        assert!(rv.cores.is_riscv());
+    }
+
+    // ------------------- Emulator::execution_model & core_cycles -------------------
+
+    #[test]
+    fn execution_model_accessor_returns_selected() {
+        let emu = Emulator::new(Config::default());
+        assert_eq!(emu.execution_model(), ExecutionModel::Serial);
+    }
+
+    #[test]
+    fn core_cycles_default_zero_arm() {
+        let emu = Emulator::new(Config::default());
+        assert_eq!(emu.core_cycles(0), 0);
+        assert_eq!(emu.core_cycles(1), 0);
+    }
+
+    #[test]
+    fn core_cycles_default_zero_riscv() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build()
+            .unwrap();
+        assert_eq!(emu.core_cycles(0), 0);
+        assert_eq!(emu.core_cycles(1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "core_cycles: idx must be 0 or 1")]
+    fn core_cycles_invalid_idx_panics() {
+        let emu = Emulator::new(Config::default());
+        let _ = emu.core_cycles(2);
+    }
+
+    // ------------------- Emulator::run / step fast paths -------------------
+
+    #[test]
+    fn run_zero_cycles_serial_is_noop() {
+        let mut emu = Emulator::new(Config::default());
+        let before = emu.cycles();
+        let after = emu.run(0).unwrap();
+        // The while loop predicate `cycles < target` with cycles==target is
+        // false, so no quanta execute. Master cycle is unchanged.
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn step_serial_returns_ok() {
+        let mut emu = Emulator::new(Config::default());
+        let r = emu.step().unwrap();
+        assert!(r >= emu.step_quantum as u64);
+    }
+
+    #[test]
+    fn run_quantum_serial_returns_ok() {
+        let mut emu = Emulator::new(Config::default());
+        let r = emu.run_quantum().unwrap();
+        assert_eq!(r, emu.step_quantum as u64);
+    }
+
+    // ------------------- Builder: defaults / step_quantum override -------------------
+
+    #[test]
+    fn builder_default_step_quantum() {
+        let emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        assert_eq!(emu.step_quantum, DEFAULT_STEP_QUANTUM);
+    }
+
+    #[test]
+    fn builder_arch_arm_explicit() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::Arm)
+            .build()
+            .unwrap();
+        assert!(emu.cores.is_arm());
+    }
+
+    #[test]
+    fn builder_execution_serial_explicit() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Serial)
+            .build()
+            .unwrap();
+        assert_eq!(emu.execution_model(), ExecutionModel::Serial);
+    }
+
+    // ------------------- Emulator::load_* paths -------------------
+
+    #[test]
+    fn load_bootrom_replaces_first_words() {
+        let mut emu = Emulator::new(Config::default());
+        // 16 bytes is enough — load_bootrom clamps internally.
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+        data[4..8].copy_from_slice(&0x1000_0001u32.to_le_bytes());
+        emu.load_bootrom(&data);
+        assert_eq!(emu.bus.memory.rom_read32(0), 0x2000_8000);
+        assert_eq!(emu.bus.memory.rom_read32(4), 0x1000_0001);
+    }
+
+    #[test]
+    fn load_image_oracle_alias_writes_sram() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        emu.load_image(0x8000_0100, &data);
+        // SRAM-aliased read via `peek` (canonical 0x2000_xxxx).
+        let v = emu.peek(0x2000_0100);
+        assert_eq!(v & 0xFF, 0xAA);
+        assert_eq!((v >> 8) & 0xFF, 0xBB);
+    }
+
+    #[test]
+    fn load_image_unknown_region_silently_dropped() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0xFFu8; 4];
+        // 0x4 region (peripherals) — match arm `_` falls through with
+        // no side effect. Just confirm it doesn't panic.
+        emu.load_image(0x4000_0000, &data);
+    }
+
+    #[test]
+    fn load_image_rom_region_is_ignored() {
+        let mut emu = Emulator::new(Config::default());
+        // Pre-seed bootrom so we can prove the load_image ROM-region arm
+        // does NOT clobber it.
+        let mut bootrom = vec![0u8; 32];
+        bootrom[0] = 0x55;
+        emu.load_bootrom(&bootrom);
+        let data = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        emu.load_image(0x0000_0000, &data);
+        assert_eq!(emu.bus.memory.rom_read8(0), 0x55, "ROM untouched");
+    }
+
+    // ------------------- gpio / poke / peek smoke -------------------
+
+    #[test]
+    fn gpio_read_and_read_all_default() {
+        let emu = Emulator::new(Config::default());
+        // Default: no SIO drive, no PIO drive — gpio_in is 0.
+        assert!(!emu.gpio_read(0));
+        assert_eq!(emu.gpio_read_all(), 0);
+    }
+
+    #[test]
+    fn gpio_write_is_stub_noop() {
+        let mut emu = Emulator::new(Config::default());
+        // gpio_write is documented as a Phase 1 stub. Just confirm it
+        // doesn't panic and gpio_read still reflects the merged value.
+        emu.gpio_write(0, true);
+        assert!(!emu.gpio_read(0));
+    }
+
+    #[test]
+    fn cycles_starts_at_zero() {
+        let emu = Emulator::new(Config::default());
+        assert_eq!(emu.cycles(), 0);
+    }
+
+    #[test]
+    fn reset_clears_master_cycle_and_clock() {
+        let mut emu = Emulator::new(Config::default());
+        // Advance the clock, then reset and re-check.
+        let _ = emu.step().unwrap();
+        assert!(emu.cycles() > 0);
+        emu.reset();
+        assert_eq!(emu.cycles(), 0);
+        assert!(!emu.shutdown_requested);
+    }
+
+    // ------------------- StopReason exists & constructible -------------------
+
+    #[test]
+    fn stop_reason_constructors_compile() {
+        // StopReason is `pub` but currently unused on the public surface.
+        // Constructing each variant exercises the type at compile and
+        // touches each branch for coverage purposes.
+        let _ = StopReason::CycleLimit;
+        let _ = StopReason::Breakpoint(0xAA);
+        let _ = StopReason::Wfi;
+        let _ = StopReason::Fault;
+    }
+}

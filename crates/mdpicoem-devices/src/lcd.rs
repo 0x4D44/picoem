@@ -429,6 +429,77 @@ mod tests {
         assert_eq!(after.cursor, before.cursor);
     }
 
+    /// Set-cursor with a single-byte payload `[0x02]` — both `col` and
+    /// `row` arguments are missing, so both `bytes.get(1)` and
+    /// `bytes.get(2)` return `None` and default to 0. Existing tests
+    /// cover the missing-row case but not the missing-col case.
+    #[test]
+    fn set_cursor_no_args_defaults_to_origin() {
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
+        // Move cursor away from origin first so the default-to-(0,0)
+        // path is observable.
+        push_frame(&mut dec, &[0x02, 7, 1]);
+        assert_eq!(dec.state().cursor, (7, 1));
+        // SET_CURSOR with NO arg bytes at all.
+        push_frame(&mut dec, &[0x02]);
+        assert_eq!(dec.state().cursor, (0, 0));
+    }
+
+    /// Drives a row-1 overflow that scrolls TWICE within a single
+    /// WRITE frame. After the first scroll, row 0 holds the original
+    /// row 1 content (with 'A' at col 19); the second scroll then
+    /// pushes that down again. Exercises the eager-wrap +
+    /// `row >= LCD_ROWS` branch and the `scroll_up` body more than
+    /// once per frame, beyond the single scroll covered today.
+    #[test]
+    fn row1_overflow_scrolls_twice_within_one_write() {
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
+        // Position at (19, 1) and write 22 chars: 'A'..'V'. Each char
+        // at col 19 of row 1 forces an eager-wrap+scroll.
+        push_frame(&mut dec, &[0x01]);
+        push_frame(&mut dec, &[0x02, 19, 1]);
+        // 22 distinct chars to span two scrolls plus some tail.
+        let payload: Vec<u8> = std::iter::once(0x03)
+            .chain((b'A'..=b'V').take(22))
+            .collect();
+        push_frame(&mut dec, &payload);
+
+        let state = dec.state();
+        // Final cursor position must remain in-range.
+        assert!(
+            (state.cursor.0 as usize) < LCD_COLS,
+            "cursor col {} out of range",
+            state.cursor.0,
+        );
+        assert!(
+            (state.cursor.1 as usize) < LCD_ROWS,
+            "cursor row {} out of range",
+            state.cursor.1,
+        );
+        // 'V' is the 22nd char (1-indexed); it lands somewhere on
+        // row 1 after multiple scrolls. The exact column depends on
+        // the wrap pattern but it MUST exist on row 1 (last char
+        // written) and must NOT remain at row 1 col 19 (the 'A'
+        // origin) since at least one scroll occurred.
+        assert!(
+            state.rows[1].iter().any(|&b| b == b'V'),
+            "row 1 should contain 'V' after multiple scrolls: {:?}",
+            std::str::from_utf8(&state.rows[1]).unwrap_or("?"),
+        );
+    }
+
+    /// Set-cursor whose col argument is exactly at the boundary
+    /// (LCD_COLS-1) should NOT clamp — it's already valid. Pairs with
+    /// `set_cursor_out_of_range_args_clamp` (which exercises the
+    /// strictly-greater-than branch) to nail down the exact `col.min(...)`
+    /// boundary.
+    #[test]
+    fn set_cursor_at_max_boundary_does_not_clamp() {
+        let mut dec = LcdDecoder::new(TEST_SCLK, TEST_DATA, TEST_CS);
+        push_frame(&mut dec, &[0x02, 19, 1]);
+        assert_eq!(dec.state().cursor, (19, 1));
+    }
+
     #[test]
     fn sclk_high_before_cs_falls_still_captures_bit7() {
         // Regression for the lost-bit-7 bug. Pre-fix: if the prior quantum
