@@ -7808,6 +7808,109 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     t
 }
 
+/// Generate `count` random Thumb-32 fuzz tests for the M0+ wide subset:
+/// BL, MSR, MRS, DSB / DMB / ISB. Per the M0+ admit set
+/// ([`crate::m0plus_admits_wide`]) the SYSm values are restricted to the
+/// architected reads/writes (PRIMASK, MSP, PSP, IPSR/EPSR/IAPSR/IEPSR,
+/// CONTROL); BASEPRI/FAULTMASK and banked NS aliases are excluded.
+///
+/// Output count: 4 × `count` cases (one per sub-class).
+pub fn generate_fuzz_t32_m0plus_wide(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
+    use crate::{M0PLUS_SYSM, MASK_NO_FLAGS};
+
+    let mut t = Vec::new();
+
+    // ---- BL (immediate) — random offset constrained to fit within the
+    //      QEMU `microbit` SRAM window (16 KiB at 0x2000_0000) so the BL
+    //      target stays in mapped memory. Layout (see `lib.rs`):
+    //        TEST_SLOT  = 0x2000_0100
+    //        SRAM range = 0x2000_0000 .. 0x2000_4000
+    //      Effective branch target is `(slot + 4) + offset`, so the safe
+    //      asymmetric bounds are roughly [-0x100, +0x3EFC]. We use a
+    //      symmetric ±2^12 range (±4 KiB) — well inside both walls and
+    //      far less than the ±2^24 BL architectural max, but BL only
+    //      mutates PC + LR (no fetch happens at the target before the
+    //      diff snapshot), so the encoder math is what's actually under
+    //      test here, not the target's physical mapping.
+    //      The encoder handles the bit-2 / J1/J2 split internally.
+    for i in 0..count {
+        let mag: i32 = rng.range(0..(1 << 12));
+        let neg: bool = rng.coin(0.5);
+        // Force even offsets (instruction-aligned).
+        let offset = if neg { -mag & !1 } else { mag & !1 };
+        let (hw0, hw1) = enc_t32_bl(offset);
+        t.push(TestCase {
+            name: format!("FUZZ:T32_M0PLUS_BL:{i} offset={offset}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ---- MSR SYSm, Rn — random Rn ∈ [0,12], sysm from the admit set. ----
+    for i in 0..count {
+        let rn = rand_reg(rng);
+        let sysm = M0PLUS_SYSM[rng.range(0..M0PLUS_SYSM.len())] as u16;
+        let (hw0, hw1) = enc_t32_msr(rn, sysm);
+        let mut regs = rand_gp_regs(rng);
+        regs.retain(|&(r, _)| r != rn as u8);
+        regs.push((rn as u8, rand_val(rng)));
+        t.push(TestCase {
+            name: format!("FUZZ:T32_M0PLUS_MSR:{i} sysm={sysm} R{rn}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: regs,
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ---- MRS Rd, SYSm — random Rd ∈ [0,12], sysm from the admit set. ----
+    for i in 0..count {
+        let rd = rand_reg(rng);
+        let sysm = M0PLUS_SYSM[rng.range(0..M0PLUS_SYSM.len())] as u16;
+        let (hw0, hw1) = enc_t32_mrs(rd, sysm);
+        t.push(TestCase {
+            name: format!("FUZZ:T32_M0PLUS_MRS:{i} R{rd} sysm={sysm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: rand_gp_regs(rng),
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    // ---- Barriers (DSB / DMB / ISB) — random option nibble (4 bits). ----
+    //      hw0 = 0xF3BF, hw1[15:12] = 0x8, hw1[11:8] = 0xF,
+    //      hw1[7:4]  = op   (4=DSB, 5=DMB, 6=ISB),
+    //      hw1[3:0]  = option (random 4 bits — M0+ implements as NOP).
+    for i in 0..count {
+        let op_idx = rng.range(0..3usize);
+        let (op_field, name) = match op_idx {
+            0 => (0x4u16, "DSB"),
+            1 => (0x5u16, "DMB"),
+            _ => (0x6u16, "ISB"),
+        };
+        let option: u16 = rng.range(0..16);
+        let hw0 = 0xF3BFu16;
+        let hw1 = 0x8F00u16 | (op_field << 4) | option;
+        t.push(TestCase {
+            name: format!("FUZZ:T32_M0PLUS_{name}:{i} option={option:#x}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            xpsr_pre: rand_flags(rng),
+            xpsr_mask: MASK_NO_FLAGS,
+            ..TestCase::default()
+        });
+    }
+
+    t
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================

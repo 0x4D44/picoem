@@ -269,18 +269,12 @@ fn run_fuzz(
 // M0+ compatibility filter
 // ============================================================================
 
-/// Is this test case runnable on M0+?
+/// Is this test case runnable on M0+ (under QEMU `cortex-m0`)?
 ///
 /// Excludes:
 ///   * FPU tests (M0+ has no FPU).
-///   * Thumb-32 tests except the 6 supported encodings (BL, MRS, MSR,
-///     DSB, DMB, ISB). For simplicity we drop **all** Thumb-32 tests —
-///     the 6 supported encodings are dominated by the BL branch target
-///     which is address-sensitive and better covered by the targeted
-///     suite anyway. The fuzz generators for Thumb-32 target M33-only
-///     DP/ldm/stm/mul encodings.
-///   * Multi-step tests (`opcode2.is_some()`) — these are IT-block
-///     sequences which M0+ doesn't support.
+///   * Multi-step tests (`opcode2.is_some()` / `hw1_2.is_some()`) — these
+///     are IT-block paired sequences which M0+ doesn't support.
 ///   * CBZ/CBNZ (`0xB1xx`, `0xB3xx`, `0xB9xx`, `0xBBxx`) — M33-only
 ///     conditional zero-compare branches.
 ///   * IT (`0xBFxx` with cond != 0 — but the whole range `0xBF00..=0xBFFF`
@@ -289,11 +283,16 @@ fn run_fuzz(
 ///   * Saturation / Q-flag / GE-flag tests — these mask specific xPSR
 ///     bits M0+ doesn't implement. Detect via `xpsr_mask != MASK_ALL_FLAGS`
 ///     and `xpsr_mask != 0` — keep only the common-case flag masks.
+///   * Thumb-32 encodings outside the M0+ subset (BL, MRS, MSR, DSB, DMB,
+///     ISB). The admit logic — including the MSR/MRS SYSm reject set —
+///     is shared with `probe_diff_rp2040` via
+///     [`mdpicoem_harness::m0plus_admits_wide`].
 fn is_m0plus_safe(tc: &TestCase) -> bool {
     if !tc.fpu_pre.is_empty() || !tc.fpu_check.is_empty() || tc.fpscr_mask != 0 {
         return false;
     }
-    if tc.hw1.is_some() || tc.opcode2.is_some() || tc.hw1_2.is_some() {
+    // Multi-step paired-instruction cases (IT bodies on M33) — M0+ has no IT.
+    if tc.opcode2.is_some() || tc.hw1_2.is_some() {
         return false;
     }
     // 0xBFxx: IT + hints.
@@ -309,6 +308,12 @@ fn is_m0plus_safe(tc: &TestCase) -> bool {
     // Anything else (MASK_Q_ONLY, MASK_ALL_FLAGS_GE) is filtered.
     let m = tc.xpsr_mask;
     if m != 0 && m != MASK_ALL_FLAGS && m != MASK_NZ_ONLY {
+        return false;
+    }
+    // Thumb-32 admit gate — shared with `probe_diff_rp2040`.
+    if let Some(hw1) = tc.hw1
+        && !mdpicoem_harness::m0plus_admits_wide(tc.opcode, hw1)
+    {
         return false;
     }
     true
@@ -336,9 +341,15 @@ fn setup_vector_table(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Err
 
 /// Execute the test on QEMU and read back post-state.
 fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState> {
-    // Write instruction + BKPT sentinel.
+    // Write instruction (16 or 32 bits) + BKPT sentinel.
     gdb.write_mem(QEMU_M0PLUS_TEST_SLOT, &tc.opcode.to_le_bytes())?;
-    gdb.write_mem(QEMU_M0PLUS_TEST_SLOT + 2, &BKPT_BYTES)?;
+    let bkpt_addr = if let Some(hw1) = tc.hw1 {
+        gdb.write_mem(QEMU_M0PLUS_TEST_SLOT + 2, &hw1.to_le_bytes())?;
+        QEMU_M0PLUS_TEST_SLOT + 4
+    } else {
+        QEMU_M0PLUS_TEST_SLOT + 2
+    };
+    gdb.write_mem(bkpt_addr, &BKPT_BYTES)?;
 
     // Register defaults.
     for i in 0..=12u8 {
@@ -424,8 +435,16 @@ fn run_emu_side(tc: &TestCase, bus: &mut M0Bus) -> RunState {
         }
     }
 
-    // Execute.
-    let _cycles = if tc.needs_bus {
+    // Execute. Wide (Thumb-32) encodings dispatch through
+    // `execute_one_wide_with_bus`; 16-bit Thumb encodings use the
+    // standard path. The wide path always uses the bus (for ISB cache
+    // invalidation), so we don't gate on `needs_bus` for it.
+    // BL/MRS/MSR/DSB/DMB also touch bus state on M0+ (PRIMASK transitions,
+    // instruction-cache invalidation), so the wide path is always
+    // bus-routed.
+    let _cycles = if let Some(hw1) = tc.hw1 {
+        core.execute_one_wide_with_bus(tc.opcode, hw1, bus)
+    } else if tc.needs_bus {
         core.execute_one_with_bus(tc.opcode, bus)
     } else {
         core.execute_one(tc.opcode)
@@ -450,5 +469,174 @@ fn run_emu_side(tc: &TestCase, bus: &mut M0Bus) -> RunState {
         cycles: 0,
         fpu: Vec::new(),
         fpscr: 0,
+    }
+}
+
+// ============================================================================
+// Filter-level self-tests (no QEMU required)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mdpicoem_harness::thumb32_gen::{enc_t32_bl, enc_t32_mrs, enc_t32_msr};
+
+    fn msr_case(sysm: u16) -> TestCase {
+        let (hw0, hw1) = enc_t32_msr(0, sysm);
+        TestCase {
+            name: format!("MSR sysm={sysm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            ..TestCase::default()
+        }
+    }
+
+    fn mrs_case(sysm: u16) -> TestCase {
+        let (hw0, hw1) = enc_t32_mrs(0, sysm);
+        TestCase {
+            name: format!("MRS sysm={sysm}"),
+            opcode: hw0,
+            hw1: Some(hw1),
+            ..TestCase::default()
+        }
+    }
+
+    #[test]
+    fn filter_admits_msr_primask_control() {
+        assert!(is_m0plus_safe(&msr_case(16)), "MSR PRIMASK must admit");
+        assert!(is_m0plus_safe(&msr_case(20)), "MSR CONTROL must admit");
+        assert!(is_m0plus_safe(&mrs_case(16)), "MRS PRIMASK must admit");
+        assert!(is_m0plus_safe(&mrs_case(20)), "MRS CONTROL must admit");
+    }
+
+    #[test]
+    fn filter_rejects_basepri_faultmask() {
+        assert!(!is_m0plus_safe(&msr_case(17)), "MSR BASEPRI must reject");
+        assert!(!is_m0plus_safe(&msr_case(19)), "MSR FAULTMASK must reject");
+        assert!(!is_m0plus_safe(&mrs_case(17)), "MRS BASEPRI must reject");
+        assert!(!is_m0plus_safe(&mrs_case(19)), "MRS FAULTMASK must reject");
+    }
+
+    #[test]
+    fn filter_rejects_banked_ns_aliases() {
+        assert!(
+            !is_m0plus_safe(&msr_case(0x90)),
+            "banked MSR alias must reject"
+        );
+        assert!(
+            !is_m0plus_safe(&mrs_case(0x94)),
+            "banked MRS alias must reject"
+        );
+    }
+
+    #[test]
+    fn filter_admits_barriers() {
+        for &(name, hw1) in &[("DSB", 0x8F4Fu16), ("DMB", 0x8F5F), ("ISB", 0x8F6F)] {
+            let tc = TestCase {
+                opcode: 0xF3BF,
+                hw1: Some(hw1),
+                ..TestCase::default()
+            };
+            assert!(is_m0plus_safe(&tc), "{name} must admit");
+        }
+    }
+
+    #[test]
+    fn filter_admits_bl() {
+        let (hw0, hw1) = enc_t32_bl(8);
+        let tc = TestCase {
+            opcode: hw0,
+            hw1: Some(hw1),
+            ..TestCase::default()
+        };
+        assert!(is_m0plus_safe(&tc), "BL must admit");
+    }
+
+    #[test]
+    fn filter_rejects_other_thumb32() {
+        // TBB — Thumb-32 table-branch byte (M33-only).
+        let tbb = TestCase {
+            opcode: 0xE8DF,
+            hw1: Some(0xF000),
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&tbb), "TBB must reject");
+
+        // FPU — VMOV.F32 (M33-only encoding).
+        let vmov = TestCase {
+            opcode: 0xEEB0,
+            hw1: Some(0x0A00),
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&vmov), "FPU must reject");
+    }
+
+    #[test]
+    fn filter_rejects_it_and_cbz() {
+        let it = TestCase {
+            opcode: 0xBF08,
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&it), "IT must reject");
+
+        let cbz = TestCase {
+            opcode: 0xB108,
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&cbz), "CBZ must reject");
+
+        let cbnz = TestCase {
+            opcode: 0xB920,
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&cbnz), "CBNZ must reject");
+    }
+
+    #[test]
+    fn filter_rejects_fpu_and_multistep() {
+        let fpu = TestCase {
+            opcode: 0x0000,
+            fpu_pre: vec![(0, 0x3F80_0000)],
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&fpu), "FPU test must reject");
+
+        let multi = TestCase {
+            opcode: 0xBF08,
+            opcode2: Some(0x0000),
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&multi), "multi-step must reject");
+    }
+
+    #[test]
+    fn filter_admits_common_thumb16_alu() {
+        // MOVS R0, #42 — 0x202A.
+        let movs = TestCase {
+            opcode: 0x202A,
+            ..TestCase::default()
+        };
+        assert!(is_m0plus_safe(&movs), "MOVS must admit");
+    }
+
+    #[test]
+    fn emu_side_runs_msr_primask_without_panic() {
+        // End-to-end smoke: MSR PRIMASK,R0 with R0=1. No QEMU; just
+        // verifies the wide-dispatch path through `run_emu_side`.
+        let (hw0, hw1) = enc_t32_msr(0, 16);
+        let tc = TestCase {
+            name: "MSR PRIMASK,R0=1 (emu smoke)".into(),
+            opcode: hw0,
+            hw1: Some(hw1),
+            reg_pre: vec![(0, 1)],
+            xpsr_pre: 0x0100_0000,
+            xpsr_mask: 0,
+            ..TestCase::default()
+        };
+        assert!(is_m0plus_safe(&tc));
+        let mut bus = M0Bus::new();
+        let state = run_emu_side(&tc, &mut bus);
+        // Sanity: T-bit preserved.
+        assert_eq!(state.xpsr & 0x0100_0000, 0x0100_0000);
     }
 }

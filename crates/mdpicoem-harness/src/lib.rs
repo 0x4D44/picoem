@@ -82,9 +82,12 @@ pub mod onerom_stress;
 pub mod onerom_sync;
 pub mod onerom_trace;
 pub mod picogus_pins;
+pub mod probe_diff_rp2040_lib;
 pub mod riscv_gen;
 pub mod silicon_oracle;
+pub mod silicon_periph_rp2040;
 pub mod silicon_scenarios;
+pub mod test_silicon_common;
 pub mod thumb32_gen;
 
 use rand::SeedableRng;
@@ -4977,6 +4980,17 @@ pub fn generate_fuzz_classes(count_per_class: usize, seed: u64) -> FuzzBuckets {
         count_per_class,
         &mut rng,
     ));
+    // M0+ Thumb-32 subset (BL, MSR, MRS, DSB/DMB/ISB). Drawn AFTER all
+    // existing draws so prior M33 seeds keep producing byte-identical
+    // case streams (CLAUDE.md "Seed reproducibility ... is byte-identical
+    // across this change" guarantee). Folded into `base_alu` so the
+    // existing `FuzzClass::Base` dispatch admits these cases without
+    // protocol change. Cases admitted on M33 (no filtering); on M0+
+    // gated through `m0plus_admits_wide`.
+    base_alu.extend(thumb32_gen::generate_fuzz_t32_m0plus_wide(
+        count_per_class,
+        &mut rng,
+    ));
     FuzzBuckets {
         base_alu,
         base_mem,
@@ -5977,6 +5991,90 @@ pub fn compare_probe(tc: &TestCase, hw: &RunState, emu: &RunState) -> Result<(),
 }
 
 // ============================================================================
+// M0+ Thumb-32 admit helper (shared by qemu_diff_m0plus + probe_diff_rp2040)
+// ============================================================================
+
+/// Does the M0+ ISA admit this Thumb-32 (hw0, hw1) encoding?
+///
+/// ARMv6-M defines exactly six wide encodings:
+///
+/// * **BL** (immediate): hw0[15:11] = `0b11110`, hw1[15:14] = `0b11`, hw1[12] = 1
+///   — pattern `(hw0 & 0xF800) == 0xF000 && (hw1 & 0xD000) == 0xD000`.
+/// * **MSR** SYSm, Rn:   hw0 = `0xF380 | Rn`, hw1 = `0x8800 | sysm`
+///   — pattern `(hw0 & 0xFFF0) == 0xF380 && (hw1 & 0xFF00) == 0x8800`.
+/// * **MRS** Rd, SYSm:   hw0 = `0xF3EF`, hw1 = `0x8000 | (Rd << 8) | sysm`
+///   — pattern `hw0 == 0xF3EF && (hw1 & 0xF000) == 0x8000`.
+/// * **DSB / DMB / ISB**: hw0 = `0xF3BF`, hw1 = `0x8Fxy` (x = op, y = option)
+///   — pattern `hw0 == 0xF3BF && (hw1 & 0xFF00) == 0x8F00`.
+///
+/// For MSR / MRS, additionally restrict SYSm to the canonical M0+ admit
+/// list ([`M0PLUS_SYSM`] = `{0, 3, 5, 8, 9, 16, 20}` — APSR, xPSR, IPSR,
+/// MSP, PSP, PRIMASK, CONTROL). Every other sysm value is RESERVED on
+/// ARMv6-M and faults Undefined → HardFault on the emulator side
+/// (`mdrp2040::core::execute_wide::thumb32_msr`/`thumb32_mrs`), so admitting
+/// them would let QEMU execute architecturally-divergent inputs while the
+/// emulator faults. In particular, this rejects:
+///
+/// * `sysm ∈ {1, 2, 4, 6, 7, 10..=15, 18, 21..=127}` → RESERVED on M0+
+/// * `sysm == 17` → BASEPRI   (M33-only)
+/// * `sysm == 19` → FAULTMASK (M33-only)
+/// * `sysm >= 0x80`           → banked `_NS` aliases (M33 TrustZone-only)
+///
+/// Anything else returns `false`. Mirrors `is_m0plus_silicon_safe` in
+/// `probe_diff_rp2040.rs` so the QEMU and silicon oracles use identical
+/// admit logic.
+pub fn m0plus_admits_wide(hw0: u16, hw1: u16) -> bool {
+    // BL (T1): hw0[15:11] = 0b11110, hw1[15:14] = 0b11, hw1[12] = 1.
+    let is_bl = (hw0 & 0xF800) == 0xF000 && (hw1 & 0xD000) == 0xD000;
+
+    // MSR (T1): hw0 = 0xF380 | Rn, hw1 = 0x8800 | sysm.
+    let is_msr = (hw0 & 0xFFF0) == 0xF380 && (hw1 & 0xFF00) == 0x8800;
+
+    // MRS (T1): hw0 = 0xF3EF, hw1 = 0x8000 | (Rd << 8) | sysm.
+    let is_mrs = hw0 == 0xF3EF && (hw1 & 0xF000) == 0x8000;
+
+    // Barriers (DSB/DMB/ISB): hw0 = 0xF3BF, hw1 = 0x8Fxy.
+    let is_barrier = hw0 == 0xF3BF && (hw1 & 0xFF00) == 0x8F00;
+
+    if !(is_bl || is_msr || is_mrs || is_barrier) {
+        return false;
+    }
+
+    // Gate MSR / MRS sysm. The emulator (`mdrp2040::core::execute_wide`
+    // `thumb32_msr`/`thumb32_mrs`) faults Undefined on every sysm outside
+    // the canonical M0+ admit list, so we must mirror that here — admitting
+    // anything broader would let architecturally-divergent cases through
+    // the QEMU oracle, where QEMU executes them while the emulator faults.
+    if is_msr || is_mrs {
+        let sysm = (hw1 & 0xFF) as u8;
+        if !M0PLUS_SYSM.contains(&sysm) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Canonical SYSm values architected on Cortex-M0+ for use with MSR / MRS.
+///
+/// Single source of truth shared by [`m0plus_admits_wide`], the QEMU /
+/// silicon admit filters, and the wide-encoding fuzz generator
+/// (`thumb32_gen::generate_fuzz_t32_m0plus_wide`). The list mirrors the
+/// branches actually handled by `mdrp2040::core::execute_wide::thumb32_msr`
+/// / `thumb32_mrs`; every other sysm value (1, 2, 4, 6, 7, 10..15, 17..19,
+/// 21..127, 0x80+) is RESERVED on ARMv6-M and faults Undefined →
+/// HardFault.
+///
+/// * `0`  = APSR        (NZCV flags)
+/// * `3`  = xPSR        (subset of APSR for NZCV writes)
+/// * `5`  = IPSR        (read-only; writes ignored)
+/// * `8`  = MSP         (Main stack pointer, banked)
+/// * `9`  = PSP         (Process stack pointer, banked)
+/// * `16` = PRIMASK     (only bit 0 architected)
+/// * `20` = CONTROL     (SPSEL + nPRIV)
+pub const M0PLUS_SYSM: &[u8] = &[0, 3, 5, 8, 9, 16, 20];
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 
@@ -6906,6 +7004,7 @@ mod tests {
         //          smm_family, dual_halfword, word_x_half, long_halfword, dsp_special,
         //          qsat, paradd, sat, bcond = 16 classes
         // FPU: arith, mac, unary, convert, compare, vmov = 6 classes
+        // T32 M0+ wide: bl, msr, mrs, barriers = 4 classes
         // T16 MEM: lsreg, lsimm, push/pop, stm/ldm, lssp = 5 classes
         //   Note: push/pop is a SINGLE class whose inner loop fans out to 4
         //   variants (2 PUSH slots + 1 POP + 1 POP_PC). The class still emits
@@ -6913,8 +7012,8 @@ mod tests {
         // T32 MEM: ls_imm12, ls_imm8, ldrd/strd, ldm/stm = 4 classes
         assert_eq!(
             alu.len(),
-            (9 + 16 + 6) * 10,
-            "ALU count: (9 T16 + 16 T32 + 6 FPU) * 10"
+            (9 + 16 + 6 + 4) * 10,
+            "ALU count: (9 T16 + 16 T32 + 6 FPU + 4 T32_M0PLUS) * 10"
         );
         assert_eq!(mem.len(), (5 + 4) * 10, "MEM count: (5 T16 + 4 T32) * 10");
     }
@@ -7903,5 +8002,119 @@ mod tests {
         assert_eq!(b.emu_slot, EMU_M0PLUS_TEST_SLOT);
         assert_eq!(b.emu_scratch, EMU_M0PLUS_TEST_SCRATCH);
         assert_eq!(b.emu_stack, EMU_M0PLUS_TEST_STACK);
+    }
+
+    // ----------------------------------------------------------------------
+    // m0plus_admits_wide — shared admit helper tests.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn m0plus_admits_wide_admits_bl() {
+        // BL with a small positive offset.
+        let (hw0, hw1) = thumb32_gen::enc_t32_bl(8);
+        assert!(m0plus_admits_wide(hw0, hw1), "BL +8 must be admitted");
+
+        // BL with a negative offset.
+        let (hw0, hw1) = thumb32_gen::enc_t32_bl(-12);
+        assert!(m0plus_admits_wide(hw0, hw1), "BL -12 must be admitted");
+    }
+
+    #[test]
+    fn m0plus_admits_wide_admits_msr() {
+        // MSR PRIMASK (sysm=16), MSR CONTROL (sysm=20), MSR APSR (sysm=0).
+        for &sysm in &[0u16, 3, 5, 8, 9, 16, 20] {
+            let (hw0, hw1) = thumb32_gen::enc_t32_msr(0, sysm);
+            assert!(
+                m0plus_admits_wide(hw0, hw1),
+                "MSR sysm={sysm} must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn m0plus_admits_wide_admits_mrs() {
+        for &sysm in &[0u16, 3, 5, 8, 9, 16, 20] {
+            let (hw0, hw1) = thumb32_gen::enc_t32_mrs(0, sysm);
+            assert!(
+                m0plus_admits_wide(hw0, hw1),
+                "MRS sysm={sysm} must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn m0plus_admits_wide_admits_barriers() {
+        // DSB option=SY, DMB option=SY, ISB option=SY.
+        let dsb = (0xF3BFu16, 0x8F4Fu16);
+        let dmb = (0xF3BFu16, 0x8F5Fu16);
+        let isb = (0xF3BFu16, 0x8F6Fu16);
+        assert!(m0plus_admits_wide(dsb.0, dsb.1), "DSB must be admitted");
+        assert!(m0plus_admits_wide(dmb.0, dmb.1), "DMB must be admitted");
+        assert!(m0plus_admits_wide(isb.0, isb.1), "ISB must be admitted");
+    }
+
+    #[test]
+    fn m0plus_admits_wide_rejects_msr_basepri_faultmask_banked() {
+        // sysm=17 (BASEPRI), sysm=19 (FAULTMASK) — M33-only.
+        for &sysm in &[17u16, 19] {
+            let (hw0, hw1) = thumb32_gen::enc_t32_msr(0, sysm);
+            assert!(
+                !m0plus_admits_wide(hw0, hw1),
+                "MSR sysm={sysm} must be rejected"
+            );
+            let (hw0, hw1) = thumb32_gen::enc_t32_mrs(0, sysm);
+            assert!(
+                !m0plus_admits_wide(hw0, hw1),
+                "MRS sysm={sysm} must be rejected"
+            );
+        }
+        // sysm >= 0x80 — banked TrustZone aliases.
+        let (hw0, hw1) = thumb32_gen::enc_t32_msr(0, 0x80);
+        assert!(
+            !m0plus_admits_wide(hw0, hw1),
+            "MSR sysm=0x80 banked alias must be rejected"
+        );
+        let (hw0, hw1) = thumb32_gen::enc_t32_mrs(0, 0x90);
+        assert!(
+            !m0plus_admits_wide(hw0, hw1),
+            "MRS sysm=0x90 banked alias must be rejected"
+        );
+    }
+
+    #[test]
+    fn m0plus_admits_wide_rejects_reserved_sysm() {
+        // Every sysm value outside M0PLUS_SYSM = {0, 3, 5, 8, 9, 16, 20}
+        // is RESERVED on ARMv6-M and faults Undefined on the emulator side.
+        // The helper must reject these for both MSR and MRS to keep QEMU /
+        // emulator architecturally aligned. Sample widely across the 0..0x7F
+        // window plus the historically-called-out 17 / 19 in case the canonical
+        // set ever drifts.
+        const RESERVED: &[u16] = &[
+            1, 2, 4, 6, 7, 10, 11, 12, 13, 14, 15, 17, 18, 19, 21, 22, 31, 50, 100, 127,
+        ];
+        for &sysm in RESERVED {
+            let (hw0, hw1) = thumb32_gen::enc_t32_msr(0, sysm);
+            assert!(
+                !m0plus_admits_wide(hw0, hw1),
+                "MSR sysm={sysm} (reserved) must be rejected"
+            );
+            let (hw0, hw1) = thumb32_gen::enc_t32_mrs(0, sysm);
+            assert!(
+                !m0plus_admits_wide(hw0, hw1),
+                "MRS sysm={sysm} (reserved) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn m0plus_admits_wide_rejects_other_thumb32() {
+        // TBB — Thumb-32 table-branch byte (M33-only).
+        assert!(!m0plus_admits_wide(0xE8DF, 0xF000));
+        // LDRD literal — M33-only wide encoding.
+        assert!(!m0plus_admits_wide(0xE95F, 0x0100));
+        // FPU — VMOV.F32 (M33-only).
+        assert!(!m0plus_admits_wide(0xEEB0, 0x0A00));
+        // Random non-subset wide encoding.
+        assert!(!m0plus_admits_wide(0xF000, 0x0000));
     }
 }
