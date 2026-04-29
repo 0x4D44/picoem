@@ -25765,6 +25765,22 @@ mod stage3_bus_residue {
         assert_eq!(v_hi, 0x7856);
     }
 
+    #[test]
+    fn coresight_trace_halfword_write_dispatches_through_word_path() {
+        let mut bus = Bus::new();
+        // Pre-fill the word so we can confirm halfword RMW preserves the
+        // unwritten half (matches the existing read16 test's address).
+        bus.write32(0xE004_1100, 0xAAAA_5555, 0);
+        // Halfword writes through the Bus::write16 0xE coresight arm.
+        bus.write16(0xE004_1100, 0x1234, 0);
+        bus.write16(0xE004_1102, 0x5678, 0);
+        // Round-trip via byte reads (whose 0xE arm is and stays reachable).
+        assert_eq!(bus.read8(0xE004_1100, 0), 0x34);
+        assert_eq!(bus.read8(0xE004_1101, 0), 0x12);
+        assert_eq!(bus.read8(0xE004_1102, 0), 0x78);
+        assert_eq!(bus.read8(0xE004_1103, 0), 0x56);
+    }
+
     // ----- PPB residue: SHCSR / NMIPENDSET / PENDSVCLR / SHPR1 / IPR -----
 
     #[test]
