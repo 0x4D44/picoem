@@ -893,22 +893,22 @@ impl WorkerBus {
         match low {
             // NVIC_ISER0: write-1-to-SET the enable bit.
             0xE100 => {
-                n.enabled |= val;
+                n.enabled |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICER0: write-1-to-CLEAR the enable bit.
             0xE180 => {
-                n.enabled &= !val;
+                n.enabled &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_ISPR0: write-1-to-SET the pending bit.
             0xE200 => {
-                n.pending |= val;
+                n.pending |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICPR0: write-1-to-CLEAR the pending bit.
             0xE280 => {
-                n.pending &= !val;
+                n.pending &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_IPR0..7: 4×u8 priority bytes, masked to bits [7:6].

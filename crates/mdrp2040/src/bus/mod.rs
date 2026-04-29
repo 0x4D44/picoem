@@ -2587,9 +2587,35 @@ mod tests {
         // ISER0: write all-ones, expect only the 26 implemented bits.
         bus.write32(0xE000_E100, 0xFFFF_FFFF);
         assert_eq!(bus.read32(0xE000_E100), 0x03FF_FFFF);
-        // ISPR0: same shape.
+        // ICER0: with all 26 enable bits set, an all-ones write must
+        // clear them all (no high-bit residue gating the AND-NOT).
+        bus.write32(0xE000_E180, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E100), 0);
+        // ISPR0: same shape as ISER0 on the SET side.
         bus.write32(0xE000_E200, 0xFFFF_FFFF);
         assert_eq!(bus.read32(0xE000_E200), 0x03FF_FFFF);
+        // ICPR0: same shape as ICER0 on the CLEAR side.
+        bus.write32(0xE000_E280, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E200), 0);
+
+        // Force high bits into the field directly to exercise the
+        // clear-arm mask: without `val & IRQ_LINE_MASK` on the ICER0/
+        // ICPR0 arms, an all-ones write would clear the high bits too.
+        bus.nvics[0].enabled = 0xFFFF_FFFF;
+        bus.write32(0xE000_E180, 0xFFFF_FFFF); // ICER0 — should clear only bits 0..25
+        assert_eq!(
+            bus.read32(0xE000_E100),
+            0xFC00_0000,
+            "ICER0 must mask val before clearing — high bits preserved"
+        );
+
+        bus.nvics[0].pending = 0xFFFF_FFFF;
+        bus.write32(0xE000_E280, 0xFFFF_FFFF); // ICPR0 — should clear only bits 0..25
+        assert_eq!(
+            bus.read32(0xE000_E200),
+            0xFC00_0000,
+            "ICPR0 must mask val before clearing — high bits preserved"
+        );
     }
 
     // ----- ADC + PWM bus integration (Phase 3) --------------------------
