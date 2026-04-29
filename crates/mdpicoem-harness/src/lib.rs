@@ -378,6 +378,9 @@ pub const REG_XPSR: u8 = 25;
 pub const MASK_ALL_FLAGS: u32 = 0xF800_0000;
 /// N, Z only — for MUL where C and V are UNPREDICTABLE.
 pub const MASK_NZ_ONLY: u32 = 0xC000_0000;
+/// NZCV flag bits only (bits 31:28). Use for ARMv6-M APSR-write fuzzing where
+/// Q (bit 27) is not architectural on M0/M0+.
+pub const MASK_NZCV_ONLY: u32 = 0xF000_0000;
 /// No flags — for MOV/ADD (high register) which don't update flags.
 pub const MASK_NO_FLAGS: u32 = 0x0000_0000;
 /// N, Z, C, V, Q + GE[3:0] — for DSP parallel add/sub and SEL.

@@ -971,8 +971,8 @@ pub fn enc_t32_parallel(operation: u16, modifier: u16, rn: u16, rd: u16, rm: u16
 // ============================================================================
 
 use crate::{
-    MASK_ALL_FLAGS, MASK_ALL_FLAGS_GE, MASK_NO_FLAGS, MASK_Q_ONLY, TestCase, mem_check_u16,
-    mem_check_u32, mem_pre_u16, mem_pre_u32,
+    MASK_ALL_FLAGS, MASK_ALL_FLAGS_GE, MASK_NO_FLAGS, MASK_NZCV_ONLY, MASK_Q_ONLY, TestCase,
+    mem_check_u16, mem_check_u32, mem_pre_u16, mem_pre_u32,
 };
 
 // ---------------------------------------------------------------------------
@@ -7913,25 +7913,44 @@ fn fuzz_m0plus_bl(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     t
 }
 
-/// Generate `count` MSR T1 fuzz cases. Rn ∈ 0..=12, sysm ∈ admit set.
+/// SYSm values sampled by the MSR fuzz generator. Narrower than
+/// `M0PLUS_SYSM_ADMIT` because QEMU `cortex-m0` diverges from ARMv6-M on
+/// MSR writes for sysm 8 (MSP), 9 (PSP), and 20 (CONTROL) — mdrp2040 is
+/// spec-correct on those paths (Stage E.1 verdict in
+/// `wrk_journals/2026.04.29 - JRN - M0+ T32 Randomised Fuzz Generator.md`),
+/// and curated unit tests in `crates/mdrp2040/src/tests.rs` (mod
+/// `m0plus_msr_mrs_fixes`) already pin the spec-correct behaviour. Keeping
+/// those sysm values out of the random stream prevents the regression-gate
+/// signal from being swamped by known QEMU bugs. The `qemu_diff_m0plus`
+/// filter still admits sysm 8/9/20 so curated cases continue to flow
+/// through.
+const M0PLUS_MSR_FUZZ_SYSM: [u16; 2] = [0, 16];
+
+/// Generate `count` MSR T1 fuzz cases. Rn ∈ 0..=12, sysm ∈ {0, 16}.
 ///
-/// For sysm == 0 (APSR), the executor writes NZCV from `Rn[31:28]`, so
-/// the case must allow flag bits to differ — `xpsr_mask = MASK_ALL_FLAGS`.
-/// For PRIMASK / CONTROL / MSP / PSP, the write doesn't touch the xPSR flag
-/// bits, so `MASK_NO_FLAGS` keeps the differential strict on those bits.
+/// For sysm == 0 (APSR), the executor writes NZCV from `Rn[31:28]`. ARMv6-M
+/// APSR is NZCV only (Q is an ARMv7-M Mainline addition), so the case uses
+/// `MASK_NZCV_ONLY` — wider would let QEMU's incorrect Q-bit inheritance
+/// from cortex-m3 leak through.
+/// For sysm == 16 (PRIMASK), the write doesn't touch the xPSR flag bits,
+/// so `MASK_NO_FLAGS` keeps the differential strict on those bits.
+///
+/// MRS reads cleanly across all admitted SYSm values; MSR sysm 8/9/20 are
+/// skipped due to QEMU `cortex-m0` divergence (see Stage E.1 journal).
 fn fuzz_m0plus_msr(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     let mut t = Vec::with_capacity(count);
     for i in 0..count {
         let rn = rand_reg(rng); // R0..=R12
-        let sysm = M0PLUS_SYSM_ADMIT[rng.range(0..M0PLUS_SYSM_ADMIT.len())];
+        let sysm = M0PLUS_MSR_FUZZ_SYSM[rng.range(0..M0PLUS_MSR_FUZZ_SYSM.len())];
         let (hw0, hw1) = enc_t32_msr(rn, sysm);
         // Seed Rn with a random value so the special-register write
         // exercises a non-trivial bit pattern.
         let rn_val = rand_val(rng);
-        // APSR writes change NZCV from Rn[31:28]; any other sysm leaves
-        // the xPSR flag bits untouched.
+        // APSR (sysm=0) writes NZCV from Rn[31:28]; PRIMASK (sysm=16) leaves
+        // xPSR flag bits untouched. ARMv6-M has no architectural Q flag, so
+        // APSR cases use NZCV-only (bits 31:28), not NZCVQ.
         let xpsr_mask = if sysm == 0 {
-            MASK_ALL_FLAGS
+            MASK_NZCV_ONLY
         } else {
             MASK_NO_FLAGS
         };
@@ -8083,8 +8102,10 @@ mod m0plus_t32_fuzz_tests {
         }
     }
 
-    /// 100 MSR-only cases must hit the M0+ admit set: sysm ∈ {0, 8, 9, 16, 20},
-    /// Rn ∈ 0..=12, and the encoded hw0/hw1 fixed-bit patterns.
+    /// 100 MSR-only cases must hit the narrow MSR fuzz set: sysm ∈ {0, 16}
+    /// (per `M0PLUS_MSR_FUZZ_SYSM` — sysm 8/9/20 are excluded because QEMU
+    /// `cortex-m0` is non-spec-compliant on those writes; see Stage E.1
+    /// journal). Rn ∈ 0..=12 and the encoded hw0/hw1 fixed-bit patterns.
     #[test]
     fn msr_sysm_in_admit_set() {
         let mut r = rng(0x55_55_55_55);
@@ -8107,24 +8128,26 @@ mod m0plus_t32_fuzz_tests {
             assert!(rn <= 12, "MSR Rn={rn} out of M0+ GP range 0..=12");
             let sysm = hw1 & 0xFF;
             assert!(
-                super::M0PLUS_SYSM_ADMIT.contains(&sysm),
-                "MSR sysm={sysm} not in admit set {:?}",
-                super::M0PLUS_SYSM_ADMIT
+                super::M0PLUS_MSR_FUZZ_SYSM.contains(&sysm),
+                "MSR sysm={sysm} not in MSR fuzz set {:?}",
+                super::M0PLUS_MSR_FUZZ_SYSM
             );
         }
     }
 
     /// MSR APSR writes (sysm == 0) move bits [31:28] of Rn into the xPSR
-    /// flag bits, so the case must let those bits differ — `xpsr_mask`
-    /// must be `MASK_ALL_FLAGS`. All other sysm values leave xPSR flags
-    /// untouched, so they keep `MASK_NO_FLAGS`. Without this distinction
-    /// the differential is structurally blind to APSR-write bugs (the
-    /// runner masks out exactly the bits the instruction changes).
+    /// NZCV flags. ARMv6-M has no architectural Q flag, so the case must
+    /// use `MASK_NZCV_ONLY` — `MASK_ALL_FLAGS` would let QEMU's incorrect
+    /// cortex-m3-inherited Q-bit behaviour leak into the differential.
+    /// PRIMASK (sysm == 16) leaves xPSR flags untouched, so it keeps
+    /// `MASK_NO_FLAGS`. Without this distinction the differential is
+    /// structurally blind to APSR-write bugs (the runner masks out exactly
+    /// the bits the instruction changes).
     #[test]
-    fn msr_apsr_uses_flag_mask() {
+    fn msr_apsr_uses_nzcv_mask() {
         let mut r = rng(0x4F_5C_0D_E2);
-        // 1000 cases gives many APSR draws (P(no APSR in 1000) = (4/5)^1000
-        // ≈ 1e-97 — astronomical).
+        // 1000 cases gives many APSR draws (P(no APSR in 1000) = (1/2)^1000
+        // ≈ 1e-301 — astronomical) and many PRIMASK draws likewise.
         let cases = fuzz_m0plus_msr(1000, &mut r);
         let mut saw_apsr = false;
         let mut saw_other = false;
@@ -8134,8 +8157,8 @@ mod m0plus_t32_fuzz_tests {
             if sysm == 0 {
                 saw_apsr = true;
                 assert_eq!(
-                    tc.xpsr_mask, MASK_ALL_FLAGS,
-                    "APSR-write case must use MASK_ALL_FLAGS: name={:?}",
+                    tc.xpsr_mask, MASK_NZCV_ONLY,
+                    "APSR-write case must use MASK_NZCV_ONLY: name={:?}",
                     tc.name
                 );
             } else {
@@ -8245,11 +8268,22 @@ mod m0plus_t32_fuzz_tests {
                 "case {:?} matches {} shapes (expected 1): hw0={:#06x} hw1={:#06x}",
                 tc.name, n, hw0, hw1
             );
-            if is_msr || is_mrs {
+            if is_msr {
+                // MSR fuzz stream is narrowed to {0, 16} to dodge QEMU
+                // `cortex-m0` divergence on MSP/PSP/CONTROL writes.
+                let sysm = hw1 & 0xFF;
+                assert!(
+                    super::M0PLUS_MSR_FUZZ_SYSM.contains(&sysm),
+                    "MSR sysm={sysm} not in MSR fuzz set {:?}",
+                    super::M0PLUS_MSR_FUZZ_SYSM
+                );
+            } else if is_mrs {
+                // MRS reads work for the full admit set after the B5/B6
+                // executor fix in Stage E.1.
                 let sysm = hw1 & 0xFF;
                 assert!(
                     super::M0PLUS_SYSM_ADMIT.contains(&sysm),
-                    "MSR/MRS sysm={sysm} not in admit set {:?}",
+                    "MRS sysm={sysm} not in admit set {:?}",
                     super::M0PLUS_SYSM_ADMIT
                 );
             }
