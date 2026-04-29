@@ -58,15 +58,92 @@ python3 scripts/v2_mutation_summary.py
 
 ## Oracle routing
 
-| File                                 | Oracle             |
-|---                                   |---                 |
-| `mdrp2350/core/execute_thumb32.rs`   | `qemu_diff_m33`    |
-| `mdrp2350/core/execute_fpu.rs`       | `softfloat_diff`   |
-| `mdrp2350/core/execute.rs`           | `qemu_diff_m33`    |
-| `mdrp2350/core/decode.rs`            | `qemu_diff_m33`    |
-| `mdrp2040/core/execute.rs`           | `qemu_diff_m0plus` |
-| `mdrp2040/core/execute_wide.rs`      | `qemu_diff_m0plus` |
-| `mdrp2040/core/decode.rs`            | `qemu_diff_m0plus` |
+Routing is now driven by **`scripts/v2_oracle_routing.json`** — a JSON
+sidecar supporting per-file defaults plus per-function overrides. See
+`wrk_docs/2026.04.29 - HLD - V2 Per-Function Oracle Routing V1.md` for
+the full schema and rationale.
+
+Per-file defaults (the fallback when no per-function entry exists):
+
+| File                                 | Oracle             | Args                |
+|---                                   |---                 |---                  |
+| `mdrp2350/core/execute_thumb32.rs`   | `qemu_diff_m33`    | `--classes base`    |
+| `mdrp2350/core/execute_fpu.rs`       | `softfloat_diff`   | `--mode all`        |
+| `mdrp2350/core/execute.rs`           | `qemu_diff_m33`    | `--classes base`    |
+| `mdrp2350/core/decode.rs`            | `qemu_diff_m33`    | `--classes base`    |
+| `mdrp2040/core/execute.rs`           | `qemu_diff_m0plus` | (none)              |
+| `mdrp2040/core/execute_wide.rs`      | `qemu_diff_m0plus` | (none)              |
+| `mdrp2040/core/decode.rs`            | `qemu_diff_m0plus` | (none)              |
+
+Per-function overrides for `execute_fpu.rs`: IEEE-754 helpers (`fp_add`,
+`fp_sub`, `fp_mul`, `fp_div`, `fp_fma`, `fp_sqrt`, `fpu_unary`, the f16
+/ f32 conversions, the rounding-mode helpers, NaN canonicalisers) route
+to `softfloat_diff` only. VFP-encoding helpers (`vfp_sd`, `vfp_sn`,
+`vfp_sm`, `fpscr_set_nzcv`, `vfp_expand_imm_f32`) route to
+`qemu_diff_m33 --classes fpu` only — these are observable only when an
+actual VFP instruction executes. Dispatch / public-API entries
+(`fpu_v8m_dp`, `fpu_data_processing`, `fpu_reg_transfer`, etc.) route to
+**both** (caught-if-any).
+
+### Routing-related CLI flags
+
+- `--routing <path>` — path to the JSON sidecar (default
+  `scripts/v2_oracle_routing.json`).
+- `--no-routing` — disable the sidecar; use the in-code
+  `ORACLE_FOR_FILE` fallback only.
+- `--allow-fpu` — force `fpu_class` capability ON regardless of the
+  smoke probe.
+- `--no-fpu` — force `fpu_class` capability OFF regardless of the smoke
+  probe.
+- `--allow-fpu` and `--no-fpu` are mutually exclusive.
+
+### FPU-class smoke probe
+
+When the loaded routing table has any route with `requires:
+"fpu_class"`, the runner spawns one `qemu_diff_m33 --classes fpu --fuzz
+1` at startup with a **10-second wall-clock cap**. Pass criteria: exit
+in {0, 1} within the cap (oracle ran cleanly OR caught a diff — both
+prove the FPU class isn't EAGAIN-stuck). Fail criteria: timeout, spawn
+error, or exit code outside {0, 1}.
+
+On pass, `fpu_class` is in the capabilities set and the relevant routes
+run as configured. On fail, those routes record a new outcome
+**`oracle_unavailable`** (distinct from `oracle_survived` — the gap is
+on the oracle side, not the mutation). The smoke probe runs once per
+runner invocation.
+
+If the FPU class is broken in your environment (QEMU 8.2 + mps2-an505
+has been observed to hang on FPU cases), expect `oracle_unavailable`
+rows for the encoding-helper mutants. They count as "needs better
+oracle", not "equivalent mutation" — the V2 triage should subtract
+them from the Bucket 4 total.
+
+### Aggregation rules (multi-route mutants)
+
+| Route mix                              | Aggregate          |
+|---                                     |---                 |
+| Any route is `oracle_caught`           | `oracle_caught`    |
+| Any route is `build_failed`            | `build_failed`     |
+| Any route is `oracle_survived`         | `oracle_survived`  |
+| All routes are `oracle_unavailable`    | `oracle_unavailable` |
+| Otherwise                              | `error`            |
+
+The mixed `oracle_unavailable + oracle_survived → oracle_survived` rule:
+if at least one oracle measured the mutant and reported survived,
+that's a real measurement. The unavailable route is recorded inside
+`routes[]` for triage when the oracle becomes available.
+
+### Cross-port coordination caveat
+
+When the FPU-class capability is healthy AND the parallel launcher
+(`scripts/v2_mutation_run_parallel.sh`) is in use, the per-function
+routing in `execute_fpu.rs` may push a mutant from the softfloat worker
+(W2) onto a `qemu_diff_m33 --classes fpu` invocation that races with
+W0 on GDB port 3333. **This is not an issue today** because the FPU
+smoke probe fails on the current host and routes degrade to
+`oracle_unavailable`. When the FPU env is repaired (QEMU 10.2 / pinned
+host), a separate work-package will add launcher-level coordination.
+See HLD V1 §10.6 for the deferred design.
 
 ## Cancellation safety
 

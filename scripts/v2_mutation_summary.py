@@ -47,8 +47,8 @@ def main() -> None:
     print()
     cls = Counter(r["classification"] for r in rows)
     print("By classification:")
-    for k in ("oracle_caught", "oracle_survived", "build_failed",
-              "skip_no_oracle", "error"):
+    for k in ("oracle_caught", "oracle_survived", "oracle_unavailable",
+              "build_failed", "skip_no_oracle", "error"):
         print(f"  {k:<18} {cls.get(k, 0):>5}")
     print()
 

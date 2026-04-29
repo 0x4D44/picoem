@@ -63,3 +63,7 @@ wrk_debug/
 # CARGO_INCREMENTAL=0 to avoid). The dumps drop into the repo root;
 # they're diagnostic output, not source.
 rustc-ice-*.txt
+
+# Python bytecode caches from scripts/ (mutation runner, routing tests).
+__pycache__/
+*.pyc
