@@ -258,6 +258,8 @@ const fn build_image_m0plus<const N_HANDLER_HW: usize, const N_MAIN_HW: usize>(
 //   + 0xFE0 — TIMER scenario counter
 //   + 0xFE4 — PendSV scenario counter
 //   + 0xFE8 — SysTick scenario counter
+//   + 0xFEC — V2 §3.2 gate cell (main writes 1 then 2)
+//   + 0xFF0 — V2 §3.2 gate_at_entry (handler captures gate on entry)
 //   ...
 //   + 0xFF8 — ISR_MAILBOX_CYCCNT (defined in lib.rs; reserved for the
 //             RP2350 oracle, kept clear here for parity)
@@ -268,6 +270,13 @@ pub const ICPR_READBACK_ADDR: u32 = 0x2000_3FDC;
 pub const CTR_TIMER_ADDR: u32 = 0x2000_3FE0;
 pub const CTR_PENDSV_ADDR: u32 = 0x2000_3FE4;
 pub const CTR_SYSTICK_ADDR: u32 = 0x2000_3FE8;
+/// V2 §3.2 — gate cell. Main writes `1` before `cpsie i`, `2` after. On
+/// architecturally-correct M0+ the handler runs at the `cpsie i`
+/// boundary, so the handler's read of `gate` returns `1`.
+pub const GATE_ADDR: u32 = 0x2000_3FEC;
+/// V2 §3.2 — observable: gate value at handler entry. The handler
+/// stores `*gate` into this cell. PASS on `gate_at_entry == 1`.
+pub const GATE_AT_ENTRY_ADDR: u32 = 0x2000_3FF0;
 
 /// Handler for the TIMER_IRQ_0 scenario.
 ///
@@ -466,6 +475,113 @@ const _: () = assert!(
 const _: () = assert!(
     HANDLER_TAIL[30] == 0x0000 && HANDLER_TAIL[31] == 0x0A00,
     "ICSR clear mask must remain at hw[30..=31] for hw[15] ldr math",
+);
+
+/// Handler for V2 §3.2 `isr_m0_masked_pending_unmask`. Mirrors
+/// HANDLER_TIMER's "W1C TIMER.INTR → W1C NVIC_ICPR0 → counter" prefix
+/// (so a re-pend during the handler body doesn't re-dispatch — although
+/// for this scenario TIMER.INTE is intentionally left disabled by main,
+/// see MAIN_MASKED), but adds an extra observable: load `*GATE_ADDR`
+/// into r5 then store it into `GATE_AT_ENTRY_ADDR`. That captures
+/// whether the handler ran *between* main's `gate=1` and `gate=2`
+/// stores — the load-bearing assertion for the PRIMASK-gate / `cpsie i`
+/// dispatch-boundary check.
+///
+/// Layout — image bytes 0x04C..0x080:
+/// ```text
+///   [ 0] ldr  r0, [pc, #28]    ; r0 = TIMER_INTR_ADDR        (lit hw[16])
+///   [ 1] movs r1, #1
+///   [ 2] str  r1, [r0]         ; W1C TIMER.INTR bit 0
+///   [ 3] ldr  r0, [pc, #28]    ; r0 = NVIC_ICPR0_ADDR        (lit hw[18])
+///   [ 4] str  r1, [r0]         ; W1C NVIC pending bit 0
+///   [ 5] ldr  r2, [pc, #28]    ; r2 = GATE_ADDR              (lit hw[20])
+///   [ 6] ldr  r5, [r2]         ; r5 = *gate
+///   [ 7] ldr  r3, [pc, #28]    ; r3 = GATE_AT_ENTRY_ADDR     (lit hw[22])
+///   [ 8] str  r5, [r3]         ; *gate_at_entry = r5
+///   [ 9] ldr  r0, [pc, #28]    ; r0 = CTR_TIMER_ADDR         (lit hw[24])
+///   [10] ldr  r1, [r0]
+///   [11] adds r1, #1
+///   [12] str  r1, [r0]         ; ctr_timer += 1
+///   [13] bx   lr
+///   [14..15] nop padding
+///   [16..17] lit: TIMER_INTR_ADDR     (0x4005_4034)
+///   [18..19] lit: NVIC_ICPR0_ADDR     (0xE000_E280)
+///   [20..21] lit: GATE_ADDR           (0x2000_3FEC)
+///   [22..23] lit: GATE_AT_ENTRY_ADDR  (0x2000_3FF0)
+///   [24..25] lit: CTR_TIMER_ADDR      (0x2000_3FE0)
+/// ```
+///
+/// Literal math — handler body lives at HANDLER_OFFSET = 0x04C, so
+/// hw[i] byte = 0x04C + 2*i. Each `ldr [pc, #imm8*4]` aligns PC down
+/// to a 4-byte boundary first.
+///
+///   hw[ 0] addr 0x04C, PC 0x050, Align 0x050, target hw[16]=0x06C → imm=0x1C → imm8=7 → 0x4807
+///   hw[ 3] addr 0x052, PC 0x056, Align 0x054, target hw[18]=0x070 → imm=0x1C → imm8=7 → 0x4807
+///   hw[ 5] addr 0x056, PC 0x05A, Align 0x058, target hw[20]=0x074 → imm=0x1C → imm8=7 → 0x4A07
+///   hw[ 7] addr 0x05A, PC 0x05E, Align 0x05C, target hw[22]=0x078 → imm=0x1C → imm8=7 → 0x4B07
+///   hw[ 9] addr 0x05E, PC 0x062, Align 0x060, target hw[24]=0x07C → imm=0x1C → imm8=7 → 0x4807
+const HANDLER_MASKED: [u16; 26] = [
+    // Phase 1: W1C TIMER.INTR (defensive — INTE is left off by main, but
+    // mirrors HANDLER_TIMER's pico-sdk-shaped prefix so a future variant
+    // that enables INTE doesn't re-dispatch).
+    0x4807, // [ 0] ldr  r0, [pc, #28]   — TIMER_INTR_ADDR
+    0x2101, // [ 1] movs r1, #1
+    0x6001, // [ 2] str  r1, [r0]        — TIMER.INTR = 1 (W1C bit 0)
+    // Phase 2: W1C NVIC_ICPR0 bit 0 (clears the firmware-set pending bit
+    // so EXC_RETURN's tail-chain poll doesn't re-dispatch).
+    0x4807, // [ 3] ldr  r0, [pc, #28]   — NVIC_ICPR0_ADDR
+    0x6001, // [ 4] str  r1, [r0]        — NVIC_ICPR0 = 1 (r1 still 1)
+    // Phase 3: capture *gate into gate_at_entry (LOAD-BEARING).
+    0x4A07, // [ 5] ldr  r2, [pc, #28]   — GATE_ADDR
+    0x6815, // [ 6] ldr  r5, [r2]        — r5 = *gate
+    0x4B07, // [ 7] ldr  r3, [pc, #28]   — GATE_AT_ENTRY_ADDR
+    0x601D, // [ 8] str  r5, [r3]        — *gate_at_entry = r5
+    // Phase 4: ctr_timer += 1.
+    0x4807, // [ 9] ldr  r0, [pc, #28]   — CTR_TIMER_ADDR
+    0x6801, // [10] ldr  r1, [r0]
+    0x3101, // [11] adds r1, #1
+    0x6001, // [12] str  r1, [r0]
+    // Phase 5: return via EXC_RETURN.
+    0x4770, // [13] bx   lr
+    0xBF00, // [14] nop padding
+    0xBF00, // [15] nop padding
+    0x4034, // [16] lit: TIMER_INTR_ADDR     low  (0x4005_4034)
+    0x4005, // [17] lit: TIMER_INTR_ADDR     high
+    0xE280, // [18] lit: NVIC_ICPR0_ADDR     low  (0xE000_E280)
+    0xE000, // [19] lit: NVIC_ICPR0_ADDR     high
+    0x3FEC, // [20] lit: GATE_ADDR           low  (0x2000_3FEC)
+    0x2000, // [21] lit: GATE_ADDR           high
+    0x3FF0, // [22] lit: GATE_AT_ENTRY_ADDR  low  (0x2000_3FF0)
+    0x2000, // [23] lit: GATE_AT_ENTRY_ADDR  high
+    0x3FE0, // [24] lit: CTR_TIMER_ADDR      low  (0x2000_3FE0)
+    0x2000, // [25] lit: CTR_TIMER_ADDR      high
+];
+
+// Pin literal-pool byte offsets — every `ldr [pc, #imm]` above depends
+// on these slots staying put.
+const _: () = assert!(
+    HANDLER_MASKED[16] == 0x4034 && HANDLER_MASKED[17] == 0x4005,
+    "TIMER_INTR_ADDR literal must remain at hw[16..=17]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[18] == 0xE280 && HANDLER_MASKED[19] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at hw[18..=19]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[20] == 0x3FEC && HANDLER_MASKED[21] == 0x2000,
+    "GATE_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[22] == 0x3FF0 && HANDLER_MASKED[23] == 0x2000,
+    "GATE_AT_ENTRY_ADDR literal must remain at hw[22..=23]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[24] == 0x3FE0 && HANDLER_MASKED[25] == 0x2000,
+    "CTR_TIMER_ADDR literal must remain at hw[24..=25]",
+);
+const _: () = assert!(
+    (HANDLER_OFFSET as usize) + HANDLER_MASKED.len() * 2 <= MAIN_OFFSET as usize,
+    "HANDLER_MASKED must fit between HANDLER_OFFSET and MAIN_OFFSET",
 );
 
 // ---------------------------------------------------------------------------
@@ -788,6 +904,102 @@ const _: () = assert!(
     "MAIN_NVIC_RAZWI must fit inside the image's main region",
 );
 
+/// V2 §3.2 main: PRIMASK-gated pend then `cpsie i` unmask.
+///
+/// Sequence:
+///   1. `cpsid i` — set PRIMASK=1 (block exception dispatch).
+///   2. `*NVIC_ISPR0 = 1` — set TIMER_IRQ_0 pending in NVIC.
+///   3. `*NVIC_ISER0 = 1` — enable TIMER_IRQ_0 in NVIC.
+///   4. `*gate = 1`        — pre-unmask gate value.
+///   5. `cpsie i`          — clear PRIMASK; on architecturally-correct
+///      M0+ the dispatch happens on this boundary.
+///   6. `*gate = 2`        — main resumes after handler returns.
+///   7. `b .`              — busy-wait.
+///
+/// **Caveat re: TIMER level re-pend.** TIMER_IRQ_0 has level-driven
+/// re-pend behaviour in `peripherals/timer.rs` — `tick_peripherals`
+/// re-asserts NVIC bit 0 every cycle while `(timer.intr & timer.inte) != 0`.
+/// Main therefore does NOT enable `TIMER.INTE`: the IRQ is set pending
+/// purely via `NVIC_ISPR0`, so once the handler clears `NVIC_ICPR0` bit 0
+/// there's no level signal to re-assert it. Single-shot dispatch.
+///
+/// Register convention (matching MAIN_TIMER's shape):
+///   r0 — scratch (1, then 2 — written into the gate / NVIC bits)
+///   r4 — held: NVIC_ISPR0_ADDR
+///   r5 — held: NVIC_ISER0_ADDR
+///   r6 — held: GATE_ADDR
+///
+/// Layout — image bytes 0x100..0x130:
+/// ```text
+///   [ 0] cpsid i                ; 0xB672 — PRIMASK=1
+///   [ 1] ldr  r4, [pc, #28]     ; r4 = NVIC_ISPR0_ADDR    (lit hw[16])
+///   [ 2] movs r0, #1
+///   [ 3] str  r0, [r4]          ; pend TIMER_IRQ_0
+///   [ 4] ldr  r5, [pc, #24]     ; r5 = NVIC_ISER0_ADDR    (lit hw[18])
+///   [ 5] str  r0, [r5]          ; enable TIMER_IRQ_0 in NVIC
+///   [ 6] ldr  r6, [pc, #24]     ; r6 = GATE_ADDR          (lit hw[20])
+///   [ 7] str  r0, [r6]          ; *gate = 1   (PRE-UNMASK probe)
+///   [ 8] cpsie i                ; 0xB662 — PRIMASK=0  (DISPATCH BOUNDARY)
+///   [ 9] movs r0, #2
+///   [10] str  r0, [r6]          ; *gate = 2   (post-handler resume)
+///   [11] b    .                 ; 0xE7FE — busy-wait
+///   [12] bkpt #0                ; safety net
+///   [13..15] nop padding
+///   [16..17] lit: NVIC_ISPR0_ADDR (0xE000_E200)
+///   [18..19] lit: NVIC_ISER0_ADDR (0xE000_E100)
+///   [20..21] lit: GATE_ADDR       (0x2000_3FEC)
+/// ```
+///
+/// Literal math — main lives at MAIN_OFFSET = 0x100, so hw[i] byte =
+/// 0x100 + 2*i. `ldr [pc, #imm8*4]` rounds PC down to a 4-byte boundary
+/// before adding imm8*4.
+///
+///   hw[ 1] addr 0x102, PC 0x106, Align 0x104, target hw[16]=0x120 → imm=0x1C → imm8=7 → 0x4C07
+///   hw[ 4] addr 0x108, PC 0x10C, Align 0x10C, target hw[18]=0x124 → imm=0x18 → imm8=6 → 0x4D06
+///   hw[ 6] addr 0x10C, PC 0x110, Align 0x110, target hw[20]=0x128 → imm=0x18 → imm8=6 → 0x4E06
+const MAIN_MASKED: [u16; 22] = [
+    0xB672, // [ 0] cpsid i               — PRIMASK=1
+    0x4C07, // [ 1] ldr  r4, [pc, #28]    — NVIC_ISPR0_ADDR
+    0x2001, // [ 2] movs r0, #1
+    0x6020, // [ 3] str  r0, [r4]         — pend TIMER_IRQ_0
+    0x4D06, // [ 4] ldr  r5, [pc, #24]    — NVIC_ISER0_ADDR
+    0x6028, // [ 5] str  r0, [r5]         — enable TIMER_IRQ_0
+    0x4E06, // [ 6] ldr  r6, [pc, #24]    — GATE_ADDR
+    0x6030, // [ 7] str  r0, [r6]         — *gate = 1
+    0xB662, // [ 8] cpsie i               — PRIMASK=0  (dispatch boundary)
+    0x2002, // [ 9] movs r0, #2
+    0x6030, // [10] str  r0, [r6]         — *gate = 2  (post-handler)
+    0xE7FE, // [11] b    .                — busy-wait
+    0xBE00, // [12] bkpt #0               — safety net
+    0xBF00, // [13] nop padding
+    0xBF00, // [14] nop padding
+    0xBF00, // [15] nop padding
+    0xE200, // [16] lit: NVIC_ISPR0_ADDR low  (0xE000_E200)
+    0xE000, // [17] lit: NVIC_ISPR0_ADDR high
+    0xE100, // [18] lit: NVIC_ISER0_ADDR low  (0xE000_E100)
+    0xE000, // [19] lit: NVIC_ISER0_ADDR high
+    0x3FEC, // [20] lit: GATE_ADDR        low  (0x2000_3FEC)
+    0x2000, // [21] lit: GATE_ADDR        high
+];
+
+// Pin literal-pool byte offsets.
+const _: () = assert!(
+    MAIN_MASKED[16] == 0xE200 && MAIN_MASKED[17] == 0xE000,
+    "NVIC_ISPR0_ADDR literal must remain at hw[16..=17]",
+);
+const _: () = assert!(
+    MAIN_MASKED[18] == 0xE100 && MAIN_MASKED[19] == 0xE000,
+    "NVIC_ISER0_ADDR literal must remain at hw[18..=19]",
+);
+const _: () = assert!(
+    MAIN_MASKED[20] == 0x3FEC && MAIN_MASKED[21] == 0x2000,
+    "GATE_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    (MAIN_OFFSET as usize) + MAIN_MASKED.len() * 2 <= ISR_IMAGE_SIZE,
+    "MAIN_MASKED must fit inside the image's main region",
+);
+
 // ---------------------------------------------------------------------------
 // Scenario images
 // ---------------------------------------------------------------------------
@@ -806,6 +1018,10 @@ const IMAGE_TAIL_CHAIN: [u8; ISR_IMAGE_SIZE] =
 /// for any architecturally-required entries.
 const IMAGE_NVIC_RAZWI: [u8; ISR_IMAGE_SIZE] =
     build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, [], MAIN_NVIC_RAZWI);
+
+/// V2 §3.2 image — PRIMASK-gated pend then `cpsie i` unmask.
+const IMAGE_MASKED_PENDING: [u8; ISR_IMAGE_SIZE] =
+    build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_MASKED, MAIN_MASKED);
 
 // ---------------------------------------------------------------------------
 // Scenario type
@@ -882,6 +1098,19 @@ const OBS_TAIL_CHAIN: &[(&str, IsrObservable)] = &[
     ("ctr_systick", IsrObservable::Memory(CTR_SYSTICK_ADDR)),
 ];
 
+const INIT_MASKED: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
+const OBS_MASKED: &[(&str, IsrObservable)] = &[
+    // Primary load-bearing observable: gate snapshot at handler entry.
+    // PASS condition is `gate_at_entry == 1` — the handler ran AFTER
+    // the gate=1 store and BEFORE the gate=2 store, i.e. dispatch
+    // happened on the `cpsie i` boundary (not later).
+    ("gate_at_entry", IsrObservable::Memory(GATE_AT_ENTRY_ADDR)),
+    // Secondary: the handler ran exactly once.
+    ("ctr_timer", IsrObservable::Memory(CTR_TIMER_ADDR)),
+    // Secondary: main resumed after handler returned (gate==2).
+    ("gate", IsrObservable::Memory(GATE_ADDR)),
+];
+
 const INIT_NVIC_RAZWI: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_NVIC_RAZWI: &[(&str, IsrObservable)] = &[
     // Primary load-bearing observable: ISER0 high bits read as zero.
@@ -929,6 +1158,17 @@ pub const SCENARIOS: &[IsrScenario] = &[
         init_regs: INIT_NVIC_RAZWI,
         max_millis: 1500,
         observe: OBS_NVIC_RAZWI,
+    },
+    // V2 §3.2: PRIMASK-gated pend, then `cpsie i` unmask. Verifies the
+    // PRIMASK gate inside `try_take_any_pending_exception` and proves
+    // dispatch happens on the `cpsie i` boundary, not later.
+    IsrScenario {
+        name: "isr_m0_masked_pending_unmask",
+        image: &IMAGE_MASKED_PENDING,
+        entry_offset: MAIN_OFFSET,
+        init_regs: INIT_MASKED,
+        max_millis: 1500,
+        observe: OBS_MASKED,
     },
 ];
 
@@ -1065,11 +1305,16 @@ fn reset_scenario_state_hw(core: &mut Core) -> Result<(), Box<dyn std::error::Er
     core.write_word_32(ISPR_READBACK_ADDR as u64, 0)?;
     core.write_word_32(ICER_READBACK_ADDR as u64, 0)?;
     core.write_word_32(ICPR_READBACK_ADDR as u64, 0)?;
+    // V2 §3.2 — PRIMASK-gate scenario observable cells.
+    core.write_word_32(GATE_ADDR as u64, 0)?;
+    core.write_word_32(GATE_AT_ENTRY_ADDR as u64, 0)?;
     // Clear TIMER.INTR (W1C both alarm flags) and disable INTE.
     core.write_word_32(TIMER_INTR_ADDR as u64, 0xFFFF_FFFF)?;
     core.write_word_32(TIMER_INTE_ADDR as u64, 0)?;
-    // Clear any pre-seeded NVIC state so the V2 §3.4 scenario starts
-    // from a known zero pending/enabled mask.
+    // Clear any pre-seeded NVIC state so the V2 §3.4 / §3.2 scenarios
+    // start from a known zero pending/enabled mask. ICER0/ICPR0 use
+    // W1C semantics — writing all-ones clears every bit. ISER0 has no
+    // direct W1C, so ICER0 alone is what disables enabled IRQs.
     core.write_word_32(NVIC_ICER0_ADDR as u64, 0xFFFF_FFFF)?;
     core.write_word_32(NVIC_ICPR0_ADDR as u64, 0xFFFF_FFFF)?;
     Ok(())
@@ -1083,6 +1328,9 @@ fn reset_scenario_state_emu(emu: &mut mdrp2040::Emulator) {
     emu.poke(ISPR_READBACK_ADDR, 0);
     emu.poke(ICER_READBACK_ADDR, 0);
     emu.poke(ICPR_READBACK_ADDR, 0);
+    // V2 §3.2 — PRIMASK-gate scenario observable cells.
+    emu.poke(GATE_ADDR, 0);
+    emu.poke(GATE_AT_ENTRY_ADDR, 0);
     emu.mmio_write32(TIMER_INTR_ADDR, 0xFFFF_FFFF);
     emu.mmio_write32(TIMER_INTE_ADDR, 0);
     emu.mmio_write32(NVIC_ICER0_ADDR, 0xFFFF_FFFF);
@@ -1110,6 +1358,7 @@ fn primary_observable_addr(name: &str) -> u32 {
         "isr_m0_timer_cold" => CTR_TIMER_ADDR,
         "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
         "isr_m0_nvic_high_bits_razwi" => ISER_READBACK_ADDR,
+        "isr_m0_masked_pending_unmask" => GATE_AT_ENTRY_ADDR,
         other => {
             panic!("primary_observable_addr: unknown scenario '{other}'; add it to this match")
         }
@@ -1299,6 +1548,7 @@ fn run_one_scenario(
         "isr_m0_timer_cold" => CTR_TIMER_ADDR,
         "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
         "isr_m0_nvic_high_bits_razwi" => ISER_READBACK_ADDR,
+        "isr_m0_masked_pending_unmask" => GATE_AT_ENTRY_ADDR,
         _ => CTR_TIMER_ADDR,
     };
     loop {
@@ -1486,7 +1736,11 @@ mod tests {
 
     #[test]
     fn catalogue_size_and_prefix() {
-        assert_eq!(SCENARIOS.len(), 3, "Phase 1 (V1×2) + V2 stage 2 (×1) = 3 scenarios");
+        assert_eq!(
+            SCENARIOS.len(),
+            4,
+            "Phase 1 (V1×2) + V2 stage 2 (×1) + V2 stage 3 (×1) = 4 scenarios",
+        );
         for s in SCENARIOS {
             assert!(
                 s.name.starts_with("isr_m0_"),
@@ -1610,6 +1864,11 @@ mod tests {
             assert!(ICER_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
             assert!(ICPR_READBACK_ADDR >= ISR_STACK_TOP);
             assert!(ICPR_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            // V2 §3.2 gate cells — same constraint.
+            assert!(GATE_ADDR >= ISR_STACK_TOP);
+            assert!(GATE_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(GATE_AT_ENTRY_ADDR >= ISR_STACK_TOP);
+            assert!(GATE_AT_ENTRY_ADDR < ISR_STACK_TOP + 0x1000);
             // And clear of the mailbox words themselves.
             assert!(CTR_TIMER_ADDR < ISR_MAILBOX_CYCCNT);
             assert!(CTR_PENDSV_ADDR < ISR_MAILBOX_CYCCNT);
@@ -1618,11 +1877,17 @@ mod tests {
             assert!(ISPR_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
             assert!(ICER_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
             assert!(ICPR_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(GATE_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(GATE_AT_ENTRY_ADDR < ISR_MAILBOX_CYCCNT);
             // No collision with the existing CTR cells.
             assert!(ISER_READBACK_ADDR != CTR_TIMER_ADDR);
             assert!(ISPR_READBACK_ADDR != CTR_TIMER_ADDR);
             assert!(ICER_READBACK_ADDR != CTR_TIMER_ADDR);
             assert!(ICPR_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(GATE_ADDR != CTR_TIMER_ADDR);
+            assert!(GATE_ADDR != CTR_PENDSV_ADDR);
+            assert!(GATE_ADDR != CTR_SYSTICK_ADDR);
+            assert!(GATE_AT_ENTRY_ADDR != GATE_ADDR);
         };
     }
 

@@ -150,3 +150,51 @@ fn isr_m0_nvic_high_bits_razwi_passes_on_emu() {
         }
     }
 }
+
+/// V2 §3.2 — PRIMASK-gated pend then `cpsie i` unmask.
+///
+/// Verifies the PRIMASK gate inside `try_take_any_pending_exception`
+/// (`mdrp2040/src/core/mod.rs:331`) and that dispatch happens at the
+/// `cpsie i` boundary, not later. Main pends + enables TIMER_IRQ_0 with
+/// PRIMASK=1, stores `gate=1`, executes `cpsie i`, then attempts to
+/// store `gate=2`. The handler reads `gate` into `gate_at_entry`. On a
+/// correctly-implemented core the handler runs between the two main
+/// stores, so `gate_at_entry == 1` and `gate == 2` after main resumes.
+#[test]
+fn isr_m0_masked_pending_unmask_passes_on_emu() {
+    let sc = find_scenario("isr_m0_masked_pending_unmask");
+    match run_scenario(sc) {
+        EmuOutcome::Completed(obs) => {
+            // Per OBS_MASKED ordering:
+            //   obs[0] = gate_at_entry (primary, load-bearing)
+            //   obs[1] = ctr_timer
+            //   obs[2] = gate
+            assert_eq!(
+                obs[0], 1,
+                "gate_at_entry should be 1 (handler ran between gate=1 and gate=2 stores), got {}",
+                obs[0],
+            );
+            assert_eq!(
+                obs[1], 1,
+                "ctr_timer should be 1 after one TIMER ISR fire, got {}",
+                obs[1],
+            );
+            assert_eq!(
+                obs[2], 2,
+                "gate should be 2 after main resumed past cpsie i, got {}",
+                obs[2],
+            );
+        }
+        EmuOutcome::HardFault { pc, ipsr } => {
+            panic!(
+                "isr_m0_masked_pending_unmask: EMU hardfault at pc=0x{:08X} ipsr={}",
+                pc, ipsr,
+            );
+        }
+        EmuOutcome::Timeout => {
+            panic!(
+                "isr_m0_masked_pending_unmask: cycle budget exhausted before gate_at_entry advanced",
+            );
+        }
+    }
+}
