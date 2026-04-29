@@ -92,3 +92,61 @@ fn isr_m0_tail_chain_passes_on_emu() {
         }
     }
 }
+
+/// V2 §3.4 — NVIC ISER/ICER/ISPR/ICPR high-bits RAZ/WI scenario.
+///
+/// Pure register-shape; no handler dispatch. The main body writes
+/// `0xFFFF_FFFF` to each of the four NVIC bitmaps, reads each back, and
+/// stores the readback into a SRAM cell. Pre-seeds before ICER/ICPR use
+/// values within the implemented mask (`0x0000_FFFF`) since firmware
+/// can't bypass the mask on real silicon.
+///
+/// Expected (per HLD §3.4):
+///   - iser_readback == 0x03FF_FFFF — high bits RAZ
+///   - ispr_readback == 0x03FF_FFFF — same
+///   - icer_readback == 0           — masked clear covers full pre-seed
+///   - icpr_readback == 0           — same
+#[test]
+fn isr_m0_nvic_high_bits_razwi_passes_on_emu() {
+    let sc = find_scenario("isr_m0_nvic_high_bits_razwi");
+    match run_scenario(sc) {
+        EmuOutcome::Completed(obs) => {
+            // Per OBS_NVIC_RAZWI ordering:
+            //   obs[0] = iser_readback (primary)
+            //   obs[1] = ispr_readback
+            //   obs[2] = icer_readback
+            //   obs[3] = icpr_readback
+            assert_eq!(
+                obs[0], 0x03FF_FFFF,
+                "iser_readback should be 0x03FF_FFFF (high bits RAZ), got 0x{:08X}",
+                obs[0],
+            );
+            assert_eq!(
+                obs[1], 0x03FF_FFFF,
+                "ispr_readback should be 0x03FF_FFFF (high bits RAZ), got 0x{:08X}",
+                obs[1],
+            );
+            assert_eq!(
+                obs[2], 0,
+                "icer_readback should be 0 after masked-clear of full pre-seed, got 0x{:08X}",
+                obs[2],
+            );
+            assert_eq!(
+                obs[3], 0,
+                "icpr_readback should be 0 after masked-clear of full pre-seed, got 0x{:08X}",
+                obs[3],
+            );
+        }
+        EmuOutcome::HardFault { pc, ipsr } => {
+            panic!(
+                "isr_m0_nvic_high_bits_razwi: EMU hardfault at pc=0x{:08X} ipsr={}",
+                pc, ipsr,
+            );
+        }
+        EmuOutcome::Timeout => {
+            panic!(
+                "isr_m0_nvic_high_bits_razwi: cycle budget exhausted before iser_readback advanced",
+            );
+        }
+    }
+}

@@ -251,9 +251,20 @@ const fn build_image_m0plus<const N_HANDLER_HW: usize, const N_MAIN_HW: usize>(
 // grows down).
 //
 // Layout inside the mailbox page:
+//   + 0xFD0 — V2 §3.4 ISER readback (RAZ/WI scenario, primary obs)
+//   + 0xFD4 — V2 §3.4 ISPR readback
+//   + 0xFD8 — V2 §3.4 ICER readback
+//   + 0xFDC — V2 §3.4 ICPR readback
 //   + 0xFE0 — TIMER scenario counter
 //   + 0xFE4 — PendSV scenario counter
 //   + 0xFE8 — SysTick scenario counter
+//   ...
+//   + 0xFF8 — ISR_MAILBOX_CYCCNT (defined in lib.rs; reserved for the
+//             RP2350 oracle, kept clear here for parity)
+pub const ISER_READBACK_ADDR: u32 = 0x2000_3FD0;
+pub const ISPR_READBACK_ADDR: u32 = 0x2000_3FD4;
+pub const ICER_READBACK_ADDR: u32 = 0x2000_3FD8;
+pub const ICPR_READBACK_ADDR: u32 = 0x2000_3FDC;
 pub const CTR_TIMER_ADDR: u32 = 0x2000_3FE0;
 pub const CTR_PENDSV_ADDR: u32 = 0x2000_3FE4;
 pub const CTR_SYSTICK_ADDR: u32 = 0x2000_3FE8;
@@ -590,6 +601,193 @@ const MAIN_TAIL: [u16; 22] = [
     0x0000, // [21] reserved
 ];
 
+/// V2 §3.4 main: write 0xFFFFFFFF to each of NVIC ISER0/ISPR0/ICER0/ICPR0,
+/// read back, and store readback into the four `*_READBACK` SRAM cells.
+/// Pre-seeds before ICER0 / ICPR0 use 0x0000_FFFF (within the mask
+/// range) so the masked-clear can demonstrate it covers the full
+/// pre-seed and produces a final readback of 0. No handler dispatch.
+///
+/// Register convention:
+///   r0 — scratch (MMIO/SRAM target address per step)
+///   r1 — scratch (readback value)
+///   r2 — held: 0xFFFF_FFFF (the all-ones write value)
+///   r3 — held: 0x0000_FFFF (within-mask pre-seed value)
+///   r4 — held: NVIC_ISER0_ADDR
+///   r5 — held: NVIC_ISPR0_ADDR
+///
+/// Literal-pool layout matches the M0+ `ldr [pc, #imm8*4]` math: PC
+/// rounded down to a 4-byte boundary plus imm8*4. hw[i] byte address =
+/// 0x100 + 2*i. Pool packed at hw[44..64].
+///
+/// ```text
+///   [ 0] ldr  r2, [pc, #84]   ; r2 = 0xFFFF_FFFF              (lit hw[44])
+///   [ 1] ldr  r3, [pc, #88]   ; r3 = 0x0000_FFFF              (lit hw[46])
+///   [ 2] ldr  r4, [pc, #88]   ; r4 = NVIC_ISER0_ADDR          (lit hw[48])
+///   [ 3] ldr  r5, [pc, #92]   ; r5 = NVIC_ISPR0_ADDR          (lit hw[50])
+///   ; -- Step 1: ISER0 RAZ/WI
+///   [ 4] str  r2, [r4]        ; *NVIC_ISER0 = 0xFFFFFFFF
+///   [ 5] ldr  r1, [r4]        ; r1 = readback (expect 0x03FF_FFFF)
+///   [ 6] ldr  r0, [pc, #88]   ; r0 = ISER_READBACK_ADDR       (lit hw[52])
+///   [ 7] str  r1, [r0]
+///   [ 8] str  r3, [r4]        ; pre-seed ISER0 = 0x0000_FFFF (within mask)
+///   ; -- Step 2: ISPR0 RAZ/WI
+///   [ 9] str  r2, [r5]        ; *NVIC_ISPR0 = 0xFFFFFFFF
+///   [10] ldr  r1, [r5]        ; r1 = readback (expect 0x03FF_FFFF)
+///   [11] ldr  r0, [pc, #84]   ; r0 = ISPR_READBACK_ADDR       (lit hw[54])
+///   [12] str  r1, [r0]
+///   [13] str  r3, [r5]        ; pre-seed ISPR0 = 0x0000_FFFF
+///   ; -- Step 3: ICER0 — masked-clear covers full pre-seed
+///   [14] ldr  r0, [pc, #80]   ; r0 = NVIC_ICER0_ADDR          (lit hw[56])
+///   [15] str  r2, [r0]        ; *NVIC_ICER0 = 0xFFFFFFFF
+///   [16] ldr  r1, [r4]        ; r1 = ISER0 readback (expect 0)
+///   [17] ldr  r0, [pc, #80]   ; r0 = ICER_READBACK_ADDR       (lit hw[58])
+///   [18] str  r1, [r0]
+///   ; -- Step 4: ICPR0 — masked-clear covers full pre-seed
+///   [19] ldr  r0, [pc, #80]   ; r0 = NVIC_ICPR0_ADDR          (lit hw[60])
+///   [20] str  r2, [r0]        ; *NVIC_ICPR0 = 0xFFFFFFFF
+///   [21] ldr  r1, [r5]        ; r1 = ISPR0 readback (expect 0)
+///   [22] ldr  r0, [pc, #76]   ; r0 = ICPR_READBACK_ADDR       (lit hw[62])
+///   [23] str  r1, [r0]
+///   [24] b    .               ; busy-wait
+///   [25..43] nop padding
+///   [44..45] lit: 0xFFFF_FFFF
+///   [46..47] lit: 0x0000_FFFF
+///   [48..49] lit: NVIC_ISER0_ADDR (0xE000_E100)
+///   [50..51] lit: NVIC_ISPR0_ADDR (0xE000_E200)
+///   [52..53] lit: ISER_READBACK_ADDR (0x2000_3FD0)
+///   [54..55] lit: ISPR_READBACK_ADDR (0x2000_3FD4)
+///   [56..57] lit: NVIC_ICER0_ADDR (0xE000_E180)
+///   [58..59] lit: ICER_READBACK_ADDR (0x2000_3FD8)
+///   [60..61] lit: NVIC_ICPR0_ADDR (0xE000_E280)
+///   [62..63] lit: ICPR_READBACK_ADDR (0x2000_3FDC)
+/// ```
+///
+/// Literal math (per `ldr Rt, [pc, #imm8*4]`, PC = instr_addr+4 rounded
+/// down to 4-byte boundary):
+///   hw[ 0] addr 0x100, PC 0x104, Align 0x104, target hw[44]=0x158 → imm=0x54  → imm8=21 → 0x4A15
+///   hw[ 1] addr 0x102, PC 0x106, Align 0x104, target hw[46]=0x15C → imm=0x58  → imm8=22 → 0x4B16
+///   hw[ 2] addr 0x104, PC 0x108, Align 0x108, target hw[48]=0x160 → imm=0x58  → imm8=22 → 0x4C16
+///   hw[ 3] addr 0x106, PC 0x10A, Align 0x108, target hw[50]=0x164 → imm=0x5C  → imm8=23 → 0x4D17
+///   hw[ 6] addr 0x10C, PC 0x110, Align 0x110, target hw[52]=0x168 → imm=0x58  → imm8=22 → 0x4816
+///   hw[11] addr 0x116, PC 0x11A, Align 0x118, target hw[54]=0x16C → imm=0x54  → imm8=21 → 0x4815
+///   hw[14] addr 0x11C, PC 0x120, Align 0x120, target hw[56]=0x170 → imm=0x50  → imm8=20 → 0x4814
+///   hw[17] addr 0x122, PC 0x126, Align 0x124, target hw[58]=0x174 → imm=0x50  → imm8=20 → 0x4814
+///   hw[19] addr 0x126, PC 0x12A, Align 0x128, target hw[60]=0x178 → imm=0x50  → imm8=20 → 0x4814
+///   hw[22] addr 0x12C, PC 0x130, Align 0x130, target hw[62]=0x17C → imm=0x4C  → imm8=19 → 0x4813
+const MAIN_NVIC_RAZWI: [u16; 64] = [
+    0x4A15, // [ 0] ldr  r2, [pc, #84]   — 0xFFFF_FFFF
+    0x4B16, // [ 1] ldr  r3, [pc, #88]   — 0x0000_FFFF
+    0x4C16, // [ 2] ldr  r4, [pc, #88]   — NVIC_ISER0_ADDR
+    0x4D17, // [ 3] ldr  r5, [pc, #92]   — NVIC_ISPR0_ADDR
+    0x6022, // [ 4] str  r2, [r4]        — *NVIC_ISER0 = 0xFFFFFFFF
+    0x6821, // [ 5] ldr  r1, [r4]        — readback
+    0x4816, // [ 6] ldr  r0, [pc, #88]   — ISER_READBACK_ADDR
+    0x6001, // [ 7] str  r1, [r0]
+    0x6023, // [ 8] str  r3, [r4]        — pre-seed *NVIC_ISER0 = 0x0000FFFF
+    0x602A, // [ 9] str  r2, [r5]        — *NVIC_ISPR0 = 0xFFFFFFFF
+    0x6829, // [10] ldr  r1, [r5]        — readback
+    0x4815, // [11] ldr  r0, [pc, #84]   — ISPR_READBACK_ADDR
+    0x6001, // [12] str  r1, [r0]
+    0x602B, // [13] str  r3, [r5]        — pre-seed *NVIC_ISPR0 = 0x0000FFFF
+    0x4814, // [14] ldr  r0, [pc, #80]   — NVIC_ICER0_ADDR
+    0x6002, // [15] str  r2, [r0]        — *NVIC_ICER0 = 0xFFFFFFFF
+    0x6821, // [16] ldr  r1, [r4]        — readback ISER0 (expect 0)
+    0x4814, // [17] ldr  r0, [pc, #80]   — ICER_READBACK_ADDR
+    0x6001, // [18] str  r1, [r0]
+    0x4814, // [19] ldr  r0, [pc, #80]   — NVIC_ICPR0_ADDR
+    0x6002, // [20] str  r2, [r0]        — *NVIC_ICPR0 = 0xFFFFFFFF
+    0x6829, // [21] ldr  r1, [r5]        — readback ISPR0 (expect 0)
+    0x4813, // [22] ldr  r0, [pc, #76]   — ICPR_READBACK_ADDR
+    0x6001, // [23] str  r1, [r0]
+    0xE7FE, // [24] b    .               — busy-wait
+    0xBF00, // [25] nop                  — padding
+    0xBF00, // [26] nop
+    0xBF00, // [27] nop
+    0xBF00, // [28] nop
+    0xBF00, // [29] nop
+    0xBF00, // [30] nop
+    0xBF00, // [31] nop
+    0xBF00, // [32] nop
+    0xBF00, // [33] nop
+    0xBF00, // [34] nop
+    0xBF00, // [35] nop
+    0xBF00, // [36] nop
+    0xBF00, // [37] nop
+    0xBF00, // [38] nop
+    0xBF00, // [39] nop
+    0xBF00, // [40] nop
+    0xBF00, // [41] nop
+    0xBF00, // [42] nop
+    0xBF00, // [43] nop
+    0xFFFF, // [44] lit: 0xFFFF_FFFF low
+    0xFFFF, // [45] lit: 0xFFFF_FFFF high
+    0xFFFF, // [46] lit: 0x0000_FFFF low
+    0x0000, // [47] lit: 0x0000_FFFF high
+    0xE100, // [48] lit: NVIC_ISER0_ADDR low
+    0xE000, // [49] lit: NVIC_ISER0_ADDR high
+    0xE200, // [50] lit: NVIC_ISPR0_ADDR low
+    0xE000, // [51] lit: NVIC_ISPR0_ADDR high
+    0x3FD0, // [52] lit: ISER_READBACK_ADDR low
+    0x2000, // [53] lit: ISER_READBACK_ADDR high
+    0x3FD4, // [54] lit: ISPR_READBACK_ADDR low
+    0x2000, // [55] lit: ISPR_READBACK_ADDR high
+    0xE180, // [56] lit: NVIC_ICER0_ADDR low
+    0xE000, // [57] lit: NVIC_ICER0_ADDR high
+    0x3FD8, // [58] lit: ICER_READBACK_ADDR low
+    0x2000, // [59] lit: ICER_READBACK_ADDR high
+    0xE280, // [60] lit: NVIC_ICPR0_ADDR low
+    0xE000, // [61] lit: NVIC_ICPR0_ADDR high
+    0x3FDC, // [62] lit: ICPR_READBACK_ADDR low
+    0x2000, // [63] lit: ICPR_READBACK_ADDR high
+];
+
+// Pin literal-pool byte offsets — every `ldr [pc, #imm]` above depends
+// on these slots staying put.
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[44] == 0xFFFF && MAIN_NVIC_RAZWI[45] == 0xFFFF,
+    "0xFFFF_FFFF literal must remain at hw[44..=45]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[46] == 0xFFFF && MAIN_NVIC_RAZWI[47] == 0x0000,
+    "0x0000_FFFF literal must remain at hw[46..=47]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[48] == 0xE100 && MAIN_NVIC_RAZWI[49] == 0xE000,
+    "NVIC_ISER0_ADDR literal must remain at hw[48..=49]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[50] == 0xE200 && MAIN_NVIC_RAZWI[51] == 0xE000,
+    "NVIC_ISPR0_ADDR literal must remain at hw[50..=51]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[52] == 0x3FD0 && MAIN_NVIC_RAZWI[53] == 0x2000,
+    "ISER_READBACK_ADDR literal must remain at hw[52..=53]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[54] == 0x3FD4 && MAIN_NVIC_RAZWI[55] == 0x2000,
+    "ISPR_READBACK_ADDR literal must remain at hw[54..=55]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[56] == 0xE180 && MAIN_NVIC_RAZWI[57] == 0xE000,
+    "NVIC_ICER0_ADDR literal must remain at hw[56..=57]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[58] == 0x3FD8 && MAIN_NVIC_RAZWI[59] == 0x2000,
+    "ICER_READBACK_ADDR literal must remain at hw[58..=59]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[60] == 0xE280 && MAIN_NVIC_RAZWI[61] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at hw[60..=61]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[62] == 0x3FDC && MAIN_NVIC_RAZWI[63] == 0x2000,
+    "ICPR_READBACK_ADDR literal must remain at hw[62..=63]",
+);
+const _: () = assert!(
+    (MAIN_OFFSET as usize) + MAIN_NVIC_RAZWI.len() * 2 <= ISR_IMAGE_SIZE,
+    "MAIN_NVIC_RAZWI must fit inside the image's main region",
+);
+
 // ---------------------------------------------------------------------------
 // Scenario images
 // ---------------------------------------------------------------------------
@@ -599,6 +797,15 @@ const IMAGE_TIMER_COLD: [u8; ISR_IMAGE_SIZE] =
 
 const IMAGE_TAIL_CHAIN: [u8; ISR_IMAGE_SIZE] =
     build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_TAIL, MAIN_TAIL);
+
+/// V2 §3.4 image. No handler dispatch — passes an empty `[u16; 0]` so
+/// the handler region stays zero. Vector slots [14..16] still point at
+/// HANDLER_OFFSET (as the builder mandates), but no scenario instruction
+/// pends those exceptions, so the zero-filled handler region is never
+/// reached. Slots [2..13] still point at the `bkpt #1` default handler
+/// for any architecturally-required entries.
+const IMAGE_NVIC_RAZWI: [u8; ISR_IMAGE_SIZE] =
+    build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, [], MAIN_NVIC_RAZWI);
 
 // ---------------------------------------------------------------------------
 // Scenario type
@@ -675,6 +882,20 @@ const OBS_TAIL_CHAIN: &[(&str, IsrObservable)] = &[
     ("ctr_systick", IsrObservable::Memory(CTR_SYSTICK_ADDR)),
 ];
 
+const INIT_NVIC_RAZWI: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
+const OBS_NVIC_RAZWI: &[(&str, IsrObservable)] = &[
+    // Primary load-bearing observable: ISER0 high bits read as zero.
+    // Listed first so `primary_observable_addr` polls it.
+    ("iser_readback", IsrObservable::Memory(ISER_READBACK_ADDR)),
+    ("ispr_readback", IsrObservable::Memory(ISPR_READBACK_ADDR)),
+    // ICER/ICPR readback expected to be 0 (whole pre-seed cleared by the
+    // masked write). ICER/ICPR readbacks are stored later in the main
+    // body than the ISER/ISPR ones; the runner's one-extra-chunk grace
+    // window covers the whole tail before halting — see `run_emu_scenario`.
+    ("icer_readback", IsrObservable::Memory(ICER_READBACK_ADDR)),
+    ("icpr_readback", IsrObservable::Memory(ICPR_READBACK_ADDR)),
+];
+
 // ---------------------------------------------------------------------------
 // Catalogue
 // ---------------------------------------------------------------------------
@@ -698,6 +919,16 @@ pub const SCENARIOS: &[IsrScenario] = &[
         init_regs: INIT_TAIL_CHAIN,
         max_millis: 1500,
         observe: OBS_TAIL_CHAIN,
+    },
+    // V2 §3.4: NVIC ISER/ICER/ISPR/ICPR high-bits RAZ/WI. No handler
+    // dispatch — pure register-shape assertion.
+    IsrScenario {
+        name: "isr_m0_nvic_high_bits_razwi",
+        image: &IMAGE_NVIC_RAZWI,
+        entry_offset: MAIN_OFFSET,
+        init_regs: INIT_NVIC_RAZWI,
+        max_millis: 1500,
+        observe: OBS_NVIC_RAZWI,
     },
 ];
 
@@ -829,9 +1060,18 @@ fn reset_scenario_state_hw(core: &mut Core) -> Result<(), Box<dyn std::error::Er
     core.write_word_32(CTR_TIMER_ADDR as u64, 0)?;
     core.write_word_32(CTR_PENDSV_ADDR as u64, 0)?;
     core.write_word_32(CTR_SYSTICK_ADDR as u64, 0)?;
+    // V2 §3.4 — NVIC RAZ/WI scenario observable cells.
+    core.write_word_32(ISER_READBACK_ADDR as u64, 0)?;
+    core.write_word_32(ISPR_READBACK_ADDR as u64, 0)?;
+    core.write_word_32(ICER_READBACK_ADDR as u64, 0)?;
+    core.write_word_32(ICPR_READBACK_ADDR as u64, 0)?;
     // Clear TIMER.INTR (W1C both alarm flags) and disable INTE.
     core.write_word_32(TIMER_INTR_ADDR as u64, 0xFFFF_FFFF)?;
     core.write_word_32(TIMER_INTE_ADDR as u64, 0)?;
+    // Clear any pre-seeded NVIC state so the V2 §3.4 scenario starts
+    // from a known zero pending/enabled mask.
+    core.write_word_32(NVIC_ICER0_ADDR as u64, 0xFFFF_FFFF)?;
+    core.write_word_32(NVIC_ICPR0_ADDR as u64, 0xFFFF_FFFF)?;
     Ok(())
 }
 
@@ -839,8 +1079,14 @@ fn reset_scenario_state_emu(emu: &mut mdrp2040::Emulator) {
     emu.poke(CTR_TIMER_ADDR, 0);
     emu.poke(CTR_PENDSV_ADDR, 0);
     emu.poke(CTR_SYSTICK_ADDR, 0);
+    emu.poke(ISER_READBACK_ADDR, 0);
+    emu.poke(ISPR_READBACK_ADDR, 0);
+    emu.poke(ICER_READBACK_ADDR, 0);
+    emu.poke(ICPR_READBACK_ADDR, 0);
     emu.mmio_write32(TIMER_INTR_ADDR, 0xFFFF_FFFF);
     emu.mmio_write32(TIMER_INTE_ADDR, 0);
+    emu.mmio_write32(NVIC_ICER0_ADDR, 0xFFFF_FFFF);
+    emu.mmio_write32(NVIC_ICPR0_ADDR, 0xFFFF_FFFF);
 }
 
 /// Result of running a scenario's EMU half. Per HLD V5 §6.2.
@@ -863,6 +1109,7 @@ fn primary_observable_addr(name: &str) -> u32 {
     match name {
         "isr_m0_timer_cold" => CTR_TIMER_ADDR,
         "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
+        "isr_m0_nvic_high_bits_razwi" => ISER_READBACK_ADDR,
         other => {
             panic!("primary_observable_addr: unknown scenario '{other}'; add it to this match")
         }
@@ -1051,6 +1298,7 @@ fn run_one_scenario(
     let primary_counter_addr = match sc.name {
         "isr_m0_timer_cold" => CTR_TIMER_ADDR,
         "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
+        "isr_m0_nvic_high_bits_razwi" => ISER_READBACK_ADDR,
         _ => CTR_TIMER_ADDR,
     };
     loop {
@@ -1238,7 +1486,7 @@ mod tests {
 
     #[test]
     fn catalogue_size_and_prefix() {
-        assert_eq!(SCENARIOS.len(), 2, "Phase 1 minimum = 2 scenarios");
+        assert_eq!(SCENARIOS.len(), 3, "Phase 1 (V1×2) + V2 stage 2 (×1) = 3 scenarios");
         for s in SCENARIOS {
             assert!(
                 s.name.starts_with("isr_m0_"),
@@ -1353,10 +1601,28 @@ mod tests {
             assert!(CTR_PENDSV_ADDR < ISR_STACK_TOP + 0x1000);
             assert!(CTR_SYSTICK_ADDR >= ISR_STACK_TOP);
             assert!(CTR_SYSTICK_ADDR < ISR_STACK_TOP + 0x1000);
+            // V2 §3.4 readback cells — same constraint.
+            assert!(ISER_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ISER_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(ISPR_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ISPR_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(ICER_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ICER_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(ICPR_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ICPR_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
             // And clear of the mailbox words themselves.
             assert!(CTR_TIMER_ADDR < ISR_MAILBOX_CYCCNT);
             assert!(CTR_PENDSV_ADDR < ISR_MAILBOX_CYCCNT);
             assert!(CTR_SYSTICK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ISER_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ISPR_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ICER_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ICPR_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            // No collision with the existing CTR cells.
+            assert!(ISER_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(ISPR_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(ICER_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(ICPR_READBACK_ADDR != CTR_TIMER_ADDR);
         };
     }
 
