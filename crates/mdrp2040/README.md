@@ -68,13 +68,15 @@ The Raspberry Pi RP2040 B2 bootrom is published by Raspberry Pi at
   path. Recommended for most uses.
 - **`ExecutionModel::Threaded`** — three-thread worker runtime,
   barrier-synchronised at the quantum boundary. Faster for some
-  workloads. **Currently x86_64 Windows only**; other platforms get
-  `ConfigError::ThreadingUnavailable`.
+  workloads. Currently supported on **x86_64 Windows and x86_64 Linux**;
+  other platforms get `ConfigError::ThreadingUnavailable`.
 
 ## Features
 
-- `threading` (default) — feature-gates the threaded runtime. Disable
-  for Serial-only builds on non-Windows hosts.
+- `threading` — feature-gates the threaded runtime. Opt-in for V1 so
+  `cargo add mdrp2040` works cross-platform out of the box; on x86_64
+  Windows or x86_64 Linux, enable with
+  `cargo add mdrp2040 --features threading` to use `ThreadedEmulator`.
 - `testing` — opt-in panic-injection APIs. **Do not enable in
   production builds.**
 - `test-hooks` — exposes test-only PIO hooks for cross-crate testing.
