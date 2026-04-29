@@ -52,6 +52,21 @@ CATALOG_PATH = V2_DIR / "mutants_catalog.json"
 RESULTS_PATH = V2_DIR / "results.jsonl"
 LOG_PATH = V2_DIR / "runner.log"
 
+# These paths are mutable: --results-path / --catalog-path / --log-path
+# override them at startup so parallel workers can each write to a
+# private file. The bound is global because process_mutant() and
+# friends use them. Unfashionable but pragmatic for a sequential
+# Python runner.
+def _set_paths(catalog: Optional[str], results: Optional[str],
+               log: Optional[str]) -> None:
+    global CATALOG_PATH, RESULTS_PATH, LOG_PATH
+    if catalog:
+        CATALOG_PATH = Path(catalog)
+    if results:
+        RESULTS_PATH = Path(results)
+    if log:
+        LOG_PATH = Path(log)
+
 ORACLE_FOR_FILE = {
     "crates/mdrp2350/src/core/execute_thumb32.rs": "qemu_diff_m33",
     "crates/mdrp2350/src/core/execute_fpu.rs":     "softfloat_diff",
@@ -285,7 +300,11 @@ def main():
     ap.add_argument("--skip-done", action="store_true",
                     help="skip mutants already present in results.jsonl "
                          "(restart-friendly)")
+    ap.add_argument("--catalog-path", help="override catalog JSON path")
+    ap.add_argument("--results-path", help="override results.jsonl path")
+    ap.add_argument("--log-path", help="override runner.log path")
     args = ap.parse_args()
+    _set_paths(args.catalog_path, args.results_path, args.log_path)
 
     if not (args.missed or args.names or args.sample or args.retry_survivors):
         ap.error("specify --missed, --names, --sample, or --retry-survivors")
