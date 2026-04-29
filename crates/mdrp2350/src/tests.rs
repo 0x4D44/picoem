@@ -24593,12 +24593,55 @@ mod stage2_thumb32_residue {
         let hw0: u16 = 0xF36F;
         let hw1: u16 = 31u16;
         c.execute_one_wide(hw0, hw1);
-        // width = 31 - 0 + 1 = 32 → mask = (1<<32)-1, but `1u32<<32` is UB
-        // (the production code uses `1u32 << width` which for width=32 is
-        // a logical shift overflow). Just exercise the branch — assert
-        // *something* changed without asserting the exact value because
-        // the implementation behaviour at width=32 is unspecified.
-        let _ = c.reg(0);
+        assert_eq!(c.reg(0), 0, "BFC width=32 must clear the entire destination word");
+    }
+
+    /// BFI width=32 (lsb=0, msb=31): replaces the entire destination word with Rn.
+    #[test]
+    fn bfi_full_width_replaces_word() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(0, 0xDEAD_BEEF);
+        c.set_reg(1, 0x1234_5678);
+        // BFI: Rn != 15. lsb=0, msb=31.
+        // hw0 = 0xF200 | (0b10110 << 4) | Rn=1 = 0xF361.
+        // hw1 = (imm3=0 << 12) | (imm2=0 << 6) | msb=31 = 31.
+        let hw0: u16 = 0xF361;
+        let hw1: u16 = 31u16;
+        c.execute_one_wide(hw0, hw1);
+        assert_eq!(c.reg(0), 0x1234_5678, "BFI width=32 must replace the entire destination word");
+    }
+
+    /// SBFX width=32 (lsb=0, widthm1=31) over a value with the sign bit set.
+    /// Sign-extension of a 32-bit field is the identity.
+    #[test]
+    fn sbfx_full_width_passthrough_negative() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x8000_0000);
+        // SBFX R0, R1, #0, #32
+        let lsb = 0u16;
+        let widthm1 = 31u16;
+        let imm3 = (lsb >> 2) & 0x7;
+        let imm2 = lsb & 0x3;
+        let hw0: u16 = 0xF200 | (0b10100u16 << 4) | 1;
+        let hw1: u16 = (imm3 << 12) | (imm2 << 6) | widthm1;
+        c.execute_one_wide(hw0, hw1);
+        assert_eq!(c.reg(0), 0x8000_0000, "SBFX width=32 is identity (sign-extend of full word)");
+    }
+
+    /// UBFX width=32 (lsb=0, widthm1=31): extracts the entire word unchanged.
+    #[test]
+    fn ubfx_full_width_passthrough() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0xCAFE_BABE);
+        // UBFX R0, R1, #0, #32
+        let lsb = 0u16;
+        let widthm1 = 31u16;
+        let imm3 = (lsb >> 2) & 0x7;
+        let imm2 = lsb & 0x3;
+        let hw0: u16 = 0xF200 | (0b11100u16 << 4) | 1;
+        let hw1: u16 = (imm3 << 12) | (imm2 << 6) | widthm1;
+        c.execute_one_wide(hw0, hw1);
+        assert_eq!(c.reg(0), 0xCAFE_BABE, "UBFX width=32 is identity (extract full word)");
     }
 
     /// BFC narrow width (lsb=8, msb=15): clears bits [15:8] only.
