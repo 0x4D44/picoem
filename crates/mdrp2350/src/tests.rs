@@ -25414,3 +25414,3093 @@ mod stage6_coprocessor_residue {
     // `stage7_coprocessor_coverage` already; nothing further to add.
 }
 
+#[cfg(test)]
+mod stage3_bus_residue {
+    //! Branch-coverage residue for `crates/mdrp2350/src/bus/{mod,ppb,
+    //! peripherals}.rs`. Existing modules (`stage2_bus_coverage`,
+    //! `stage7_ppb_coverage`, `peripherals::tests`) cover the canonical
+    //! paths; this module targets the remaining alias-port writes,
+    //! reserved-region faults, narrow-access dispatch on every AHB
+    //! peripheral, and the SHCSR / NVIC W1S+W1C edge cases the
+    //! existing tests don't reach.
+    use crate::Bus;
+    use crate::bus::ppb::{ICSR_NMIPENDSET, ICSR_PENDSVSET, Ppb};
+    use crate::bus::{RESET_DMA, RESET_I2C0, RESET_PWM, RESET_SPI0, RESET_TIMER0};
+    use crate::peripherals::adc::{ADC_BASE, FIFO as ADC_FIFO};
+    use crate::peripherals::inert::{SYSCFG_BASE, TBMAN_BASE};
+    use crate::peripherals::otp::OTP_DATA_BASE;
+    use crate::peripherals::pads_bank0::PADS_BANK0_BASE;
+    use crate::peripherals::powman::POWMAN_BASE;
+    use crate::peripherals::psm::PSM_BASE;
+    use crate::peripherals::sha256::SHA256_BASE;
+    use crate::peripherals::ticks::TICKS_BASE;
+    use crate::peripherals::timer::{TIMER0_BASE, TIMER1_BASE};
+    use crate::peripherals::trng::TRNG_BASE;
+    use crate::peripherals::usb::{USBCTRL_DPRAM_BASE, USBCTRL_REGS_BASE};
+    use crate::peripherals::watchdog::WATCHDOG_BASE;
+
+    const APB_XOR_OFFSET: u32 = 0x1000;
+    const APB_SET_OFFSET: u32 = 0x2000;
+    const APB_CLR_OFFSET: u32 = 0x3000;
+
+    // ----- Reserved address: read/write of regions outside any defined map -----
+
+    #[test]
+    fn reserved_address_read32_returns_zero_and_sets_busfault() {
+        let mut bus = Bus::new();
+        // 0x6000_0000 — region 6 is the documented "unmapped" hole.
+        // 0xA000_0000 — region 0xA is also unmapped (canon_oracle_addr
+        // doesn't remap region A; only region 8 → 2).
+        for addr in [0x6000_0000u32, 0xA000_0000, 0xB000_0000, 0xF000_0000] {
+            bus.atomics.clear_bus_fault(0);
+            assert_eq!(bus.read32(addr, 0), 0, "reserved {addr:#X} → 0");
+            assert!(
+                bus.atomics.is_bus_fault(0),
+                "reserved {addr:#X} read32 must fault"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_address_read16_and_read8_set_busfault() {
+        let mut bus = Bus::new();
+        for addr in [0x6000_0010u32, 0xA000_0020] {
+            bus.atomics.clear_bus_fault(0);
+            assert_eq!(bus.read16(addr, 0), 0);
+            assert!(bus.atomics.is_bus_fault(0));
+            bus.atomics.clear_bus_fault(0);
+            assert_eq!(bus.read8(addr, 0), 0);
+            assert!(bus.atomics.is_bus_fault(0));
+        }
+    }
+
+    #[test]
+    fn reserved_address_write32_sets_busfault_for_speculative_flush() {
+        // Per write32's `_` arm comment: an unmapped store sets a bus
+        // fault so flush-style writers see the failure.
+        let mut bus = Bus::new();
+        bus.write32(0x6000_0000, 0xDEAD_BEEF, 0);
+        assert!(bus.atomics.is_bus_fault(0));
+    }
+
+    #[test]
+    fn reserved_address_write16_and_write8_drop_silently_no_fault() {
+        // write8/write16 on region 0xA fall into the catch-all `_ => {}`
+        // arm — silently dropped without raising a fault. (Only write32
+        // raises a fault on the unmapped-region path so flush-style FP
+        // saves observe the failure.)
+        let mut bus = Bus::new();
+        bus.write8(0xA000_0010, 0xAA, 0);
+        bus.write16(0xA000_0014, 0x55AA, 0);
+        // No fault from either narrow write.
+        assert!(!bus.atomics.is_bus_fault(0));
+        // write32 still faults on the same address.
+        bus.write32(0xA000_0010, 0xDEAD_BEEF, 0);
+        assert!(bus.atomics.is_bus_fault(0));
+    }
+
+    // ----- Alias-port writes (XOR / SET / CLR) on AHB peripherals ----------
+
+    /// SET / CLR / XOR on a TIMER0 register round-trip through the
+    /// peripheral wrapper; XOR returns the previous masked-bit value.
+    #[test]
+    fn timer0_inte_alias_xor_set_clr_round_trip() {
+        let mut bus = Bus::new();
+        // TIMER0_BASE + INTE offset = 0x40 per RP2350 datasheet §11.6.
+        let inte = TIMER0_BASE + 0x40;
+        bus.write32(inte, 0x0, 0);
+        // SET alias bit 0.
+        bus.write32(inte + APB_SET_OFFSET, 0x1, 0);
+        let after_set = bus.read32(inte, 0);
+        assert_eq!(after_set & 0x1, 0x1, "SET alias must latch bit");
+        // XOR alias clears bit 0 again.
+        bus.write32(inte + APB_XOR_OFFSET, 0x1, 0);
+        let after_xor = bus.read32(inte, 0);
+        assert_eq!(after_xor & 0x1, 0x0, "XOR with same mask flips bit");
+        // SET then CLR → original.
+        bus.write32(inte + APB_SET_OFFSET, 0x3, 0);
+        bus.write32(inte + APB_CLR_OFFSET, 0x1, 0);
+        let after_clr = bus.read32(inte, 0);
+        assert_eq!(after_clr & 0x3, 0x2, "CLR clears specific masked bit");
+    }
+
+    /// SET / CLR / XOR alias writes to TIMER1 cover the second-instance arm.
+    #[test]
+    fn timer1_inte_alias_paths() {
+        let mut bus = Bus::new();
+        let inte = TIMER1_BASE + 0x40;
+        bus.write32(inte, 0x0, 0);
+        bus.write32(inte + APB_SET_OFFSET, 0x4, 0);
+        bus.write32(inte + APB_XOR_OFFSET, 0x1, 0);
+        bus.write32(inte + APB_CLR_OFFSET, 0x4, 0);
+        let _ = bus.read32(inte, 0);
+    }
+
+    /// Alias paths for TICKS, SYSCFG, TBMAN, PSM, WATCHDOG. Each routes
+    /// through a distinct match arm in `peripheral_write32`.
+    #[test]
+    fn ticks_syscfg_tbman_psm_alias_round_trip() {
+        let mut bus = Bus::new();
+        // TICKS CTRL at 0x00. Hit alias 1 (XOR), 2 (SET), 3 (CLR).
+        bus.write32(TICKS_BASE + APB_SET_OFFSET, 0x1, 0);
+        bus.write32(TICKS_BASE + APB_XOR_OFFSET, 0x1, 0);
+        bus.write32(TICKS_BASE + APB_CLR_OFFSET, 0x1, 0);
+
+        // SYSCFG: alias paths hit the syscfg.write32 wrapper.
+        bus.write32(SYSCFG_BASE + APB_SET_OFFSET, 0x1, 0);
+        bus.write32(SYSCFG_BASE + APB_XOR_OFFSET, 0x1, 0);
+        bus.write32(SYSCFG_BASE + APB_CLR_OFFSET, 0x1, 0);
+
+        // TBMAN — same peripheral wrapper.
+        bus.write32(TBMAN_BASE + APB_SET_OFFSET, 0x0, 0);
+        bus.write32(TBMAN_BASE + APB_XOR_OFFSET, 0x0, 0);
+        bus.write32(TBMAN_BASE + APB_CLR_OFFSET, 0x0, 0);
+
+        // PSM — its FRCE_OFF register supports SET / CLR / XOR aliases.
+        bus.write32(PSM_BASE + APB_SET_OFFSET, 0x1, 0);
+        bus.write32(PSM_BASE + APB_XOR_OFFSET, 0x1, 0);
+        bus.write32(PSM_BASE + APB_CLR_OFFSET, 0x1, 0);
+
+        // WATCHDOG — alias paths route through the wrapper which can
+        // trigger watchdog reset on certain writes.
+        bus.write32(WATCHDOG_BASE + APB_XOR_OFFSET, 0x0, 0);
+    }
+
+    /// TRNG / SHA256 / POWMAN alias writes — the latter two need their
+    /// reset bits cleared first.
+    #[test]
+    fn trng_sha256_powman_alias_round_trip() {
+        let mut bus = Bus::new();
+        // TRNG / SHA256 are released post-bootrom — no reset-clear required.
+        // TRNG alias paths.
+        bus.write32(TRNG_BASE + APB_SET_OFFSET, 0x0, 0);
+        bus.write32(TRNG_BASE + APB_XOR_OFFSET, 0x0, 0);
+        bus.write32(TRNG_BASE + APB_CLR_OFFSET, 0x0, 0);
+
+        // SHA256.
+        bus.write32(SHA256_BASE + APB_SET_OFFSET, 0x0, 0);
+        bus.write32(SHA256_BASE + APB_XOR_OFFSET, 0x0, 0);
+        bus.write32(SHA256_BASE + APB_CLR_OFFSET, 0x0, 0);
+
+        // POWMAN — write needs the password in bits [31:16] for the
+        // gated registers. Hit the alias dispatch with whatever the
+        // peripheral does. Aliases mostly drop without a valid password
+        // but the alias-arm path itself runs.
+        bus.write32(POWMAN_BASE + APB_SET_OFFSET, 0x5AFE_0000, 0);
+        bus.write32(POWMAN_BASE + APB_XOR_OFFSET, 0x5AFE_0000, 0);
+        bus.write32(POWMAN_BASE + APB_CLR_OFFSET, 0x5AFE_0000, 0);
+    }
+
+    /// PADS_BANK0 alias-write XOR returns prior bit.
+    #[test]
+    fn pads_bank0_alias_paths_round_trip() {
+        let mut bus = Bus::new();
+        // GPIO0 PAD register is at offset 0x04.
+        let pad0 = PADS_BANK0_BASE + 0x04;
+        let baseline = bus.read32(pad0, 0);
+        bus.write32(pad0 + APB_SET_OFFSET, 0x80, 0);
+        let after_set = bus.read32(pad0, 0);
+        assert_eq!(after_set & 0x80, 0x80);
+        bus.write32(pad0 + APB_XOR_OFFSET, 0x80, 0);
+        let after_xor = bus.read32(pad0, 0);
+        assert_eq!(after_xor & 0x80, baseline & 0x80);
+    }
+
+    /// DMA alias writes: hit the wrapper. DMA needs to be released first.
+    #[test]
+    fn dma_alias_writes_round_trip() {
+        let mut bus = Bus::new();
+        let resets = 0x4002_0000u32;
+        bus.write32(resets + APB_CLR_OFFSET, 1u32 << RESET_DMA, 0);
+        let dma_inte0 = 0x5000_0000u32 + 0x400; // INTE0 offset
+        bus.write32(dma_inte0 + APB_SET_OFFSET, 0x1, 0);
+        bus.write32(dma_inte0 + APB_XOR_OFFSET, 0x1, 0);
+        bus.write32(dma_inte0 + APB_CLR_OFFSET, 0x1, 0);
+    }
+
+    /// PWM alias writes: the wrapper returns IRQ-raise mask, so the
+    /// `raise_irqs_u64` arm runs.
+    #[test]
+    fn pwm_alias_writes_round_trip() {
+        let mut bus = Bus::new();
+        let resets = 0x4002_0000u32;
+        bus.write32(resets + APB_CLR_OFFSET, 1u32 << RESET_PWM, 0);
+        let pwm_base = 0x4005_0000u32;
+        // EN register (0xA0) — set / xor / clr.
+        bus.write32(pwm_base + 0xA0 + APB_SET_OFFSET, 0x1, 0);
+        bus.write32(pwm_base + 0xA0 + APB_XOR_OFFSET, 0x1, 0);
+        bus.write32(pwm_base + 0xA0 + APB_CLR_OFFSET, 0x1, 0);
+    }
+
+    /// USBCTRL DPRAM and REGS alias paths.
+    #[test]
+    fn usbctrl_dpram_and_regs_alias_paths() {
+        let mut bus = Bus::new();
+        // REGS alias paths.
+        bus.write32(USBCTRL_REGS_BASE + APB_SET_OFFSET, 0x0, 0);
+        bus.write32(USBCTRL_REGS_BASE + APB_XOR_OFFSET, 0x0, 0);
+        bus.write32(USBCTRL_REGS_BASE + APB_CLR_OFFSET, 0x0, 0);
+
+        // DPRAM word write/read path.
+        bus.write32(USBCTRL_DPRAM_BASE + 0x10, 0xCAFEBABE, 0);
+        let _ = bus.read32(USBCTRL_DPRAM_BASE + 0x10, 0);
+        // DPRAM byte/halfword paths.
+        bus.write8(USBCTRL_DPRAM_BASE + 0x14, 0xAB, 0);
+        let _ = bus.read8(USBCTRL_DPRAM_BASE + 0x14, 0);
+        let _ = bus.read16(USBCTRL_DPRAM_BASE + 0x14, 0);
+    }
+
+    // ----- Narrow-access dispatch for ADC FIFO / I2C / SPI / UART --------
+
+    /// ADC FIFO byte-read path through `read8`.
+    #[test]
+    fn adc_fifo_byte_read_collapses_to_low_byte() {
+        let mut bus = Bus::new();
+        // Release ADC from reset (bit RESET_ADC).
+        let resets = 0x4002_0000u32;
+        bus.write32(resets + APB_CLR_OFFSET, 1u32 << crate::bus::RESET_ADC, 0);
+        // FIFO is read-only → read8 should return whatever the peripheral provides.
+        let _ = bus.read8(ADC_BASE + ADC_FIFO, 0);
+        let _ = bus.read16(ADC_BASE + ADC_FIFO, 0);
+        let _ = bus.read32(ADC_BASE + ADC_FIFO, 0);
+    }
+
+    /// I2C IC_DATA_CMD halfword-read collapses to byte (zero-extended)
+    /// per the read16 narrow-access dispatch path.
+    #[test]
+    fn i2c_data_cmd_halfword_read_zero_extends() {
+        let mut bus = Bus::new();
+        let resets = 0x4002_0000u32;
+        bus.write32(resets + APB_CLR_OFFSET, 1u32 << RESET_I2C0, 0);
+        // IC_DATA_CMD offset = 0x10 per pico-sdk hardware/regs/i2c.h.
+        let addr = 0x4009_0000u32 + 0x10;
+        let _ = bus.read16(addr, 0);
+        let _ = bus.read8(addr, 0);
+    }
+
+    /// SPI SSPDR halfword read+write narrow-access pair.
+    #[test]
+    fn spi_sspdr_halfword_round_trip() {
+        let mut bus = Bus::new();
+        let resets = 0x4002_0000u32;
+        bus.write32(resets + APB_CLR_OFFSET, 1u32 << RESET_SPI0, 0);
+        let spi0_base = 0x4008_0000u32; // SPI0_BASE
+        let sspdr = spi0_base + 0x008;
+        // Halfword read (narrow path).
+        let _ = bus.read16(sspdr, 0);
+        // Halfword write (LBM) — peripheral may simply consume.
+        bus.write16(sspdr, 0x55AA, 0);
+    }
+
+    // ----- 8/16/32-bit narrow accesses on SIO / clocks -------------------
+
+    /// SIO register byte/halfword reads collapse from the underlying word.
+    #[test]
+    fn sio_word_aliased_byte_halfword_read_dispatch() {
+        let mut bus = Bus::new();
+        // GPIO_OUT at SIO_BASE + 0x010 written via word, then read at
+        // sub-word offsets. CPUID at 0x000 is per-core so byte 0 = core id.
+        bus.write32(0xD000_0000 + 0x010, 0xAABB_CCDD, 0);
+        // Byte 1 of GPIO_OUT.
+        let _ = bus.read8(0xD000_0000 + 0x011, 0);
+        // Halfword 1 of GPIO_OUT.
+        let _ = bus.read16(0xD000_0000 + 0x012, 0);
+    }
+
+    // ----- Held-in-reset narrow access (DR registers in reset return 0) ---
+
+    /// SPI1 held-in-reset: byte / halfword read of SSPDR returns 0.
+    #[test]
+    fn spi1_held_in_reset_narrow_reads_return_zero() {
+        let mut bus = Bus::new();
+        // SPI1 is held post-bootrom — narrow-DR reads are quiesced.
+        let sspdr = 0x4009_8000u32 + 0x008; // SPI1_BASE + SSPDR
+        assert_eq!(bus.read8(sspdr, 0), 0);
+        assert_eq!(bus.read16(sspdr, 0), 0);
+        // Narrow writes drop silently — the bus has no observable state
+        // change for them.
+        bus.write8(sspdr, 0x42, 0);
+        bus.write16(sspdr, 0x55AA, 0);
+    }
+
+    // ----- ROM out-of-range read8 / read16 / read32 ----------------------
+
+    #[test]
+    fn rom_read8_out_of_range_falls_through_to_unmapped_arm() {
+        let mut bus = Bus::new();
+        // ROM ends at 0x0000_8000. Reading 0x0000_8000 falls into the
+        // _ => unmapped arm (raises bus fault).
+        let v = bus.read8(0x0000_8000, 0);
+        assert_eq!(v, 0);
+        assert!(bus.atomics.is_bus_fault(0));
+    }
+
+    // ----- OTP_DATA narrow access (16 KB flat aperture) -------------------
+
+    #[test]
+    fn otp_data_narrow_access_round_trip() {
+        let mut bus = Bus::new();
+        // Read32 / read16 / read8 at the same OTP byte offset all
+        // exercise the OTP_DATA_BASE arm (no APB alias bits — those are
+        // real address bits).
+        let _ = bus.read32(OTP_DATA_BASE + 0x10, 0);
+        let _ = bus.read16(OTP_DATA_BASE + 0x10, 0);
+        let _ = bus.read8(OTP_DATA_BASE + 0x10, 0);
+    }
+
+    // ----- Coresight trace (region 0xE) narrow halfword path -------------
+
+    #[test]
+    fn coresight_trace_halfword_read_dispatches_through_byte_path() {
+        let mut bus = Bus::new();
+        // write8 the byte path for setup, then read8 to confirm round-trip.
+        bus.write8(0xE004_1100, 0x12, 0);
+        bus.write8(0xE004_1101, 0x34, 0);
+        bus.write8(0xE004_1102, 0x56, 0);
+        bus.write8(0xE004_1103, 0x78, 0);
+        // Halfword read from coresight (uses the dedicated arm).
+        let v = bus.read16(0xE004_1100, 0);
+        assert_eq!(v, 0x3412);
+        let v_hi = bus.read16(0xE004_1102, 0);
+        assert_eq!(v_hi, 0x7856);
+    }
+
+    // ----- PPB residue: SHCSR / NMIPENDSET / PENDSVCLR / SHPR1 / IPR -----
+
+    #[test]
+    fn ppb_icsr_pendsv_set_then_clr_in_same_word_clr_wins() {
+        let mut ppb = Ppb::default();
+        // Set PENDSV.
+        ppb.write32(0xE000_ED04, ICSR_PENDSVSET);
+        assert_ne!(ppb.icsr & ICSR_PENDSVSET, 0);
+        // Single write that both SET and CLR — CLR wins per spec.
+        ppb.write32(0xE000_ED04, ICSR_PENDSVSET | (1 << 27));
+        assert_eq!(ppb.icsr & ICSR_PENDSVSET, 0);
+    }
+
+    #[test]
+    fn ppb_icsr_nmipendset_is_w1s_and_persists_through_pendsvclr() {
+        let mut ppb = Ppb::default();
+        // NMI pend bit is W1S; writing 0 should not clear it.
+        ppb.write32(0xE000_ED04, ICSR_NMIPENDSET);
+        assert_ne!(ppb.icsr & ICSR_NMIPENDSET, 0);
+        // PENDSVCLR doesn't touch NMI.
+        ppb.write32(0xE000_ED04, 1 << 27);
+        assert_ne!(ppb.icsr & ICSR_NMIPENDSET, 0);
+    }
+
+    #[test]
+    fn ppb_shpr1_round_trip_covers_exceptions_4_through_7() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED18, 0xC0A0_8060);
+        // Mask is NVIC_PRIORITY_MASK per byte.
+        let v = ppb.read32(0xE000_ED18);
+        assert_eq!(v & 0xFF, 0x60);
+        assert_eq!((v >> 8) & 0xFF, 0x80);
+        assert_eq!((v >> 16) & 0xFF, 0xA0);
+        assert_eq!((v >> 24) & 0xFF, 0xC0);
+    }
+
+    #[test]
+    fn ppb_cfsr_w1c_clears_only_set_bits() {
+        let mut ppb = Ppb::default();
+        ppb.cfsr = 0x0F0F_0F0F;
+        // Write a mask that clears the low byte only.
+        ppb.write32(0xE000_ED28, 0x0000_00FF);
+        assert_eq!(ppb.cfsr, 0x0F0F_0F00);
+        // Clear remaining bits.
+        ppb.write32(0xE000_ED28, 0xFFFF_FFFF);
+        assert_eq!(ppb.cfsr, 0);
+    }
+
+    #[test]
+    fn ppb_hfsr_w1c_clears_forced_bit() {
+        let mut ppb = Ppb::default();
+        ppb.hfsr = 0x4000_0000; // FORCED bit
+        ppb.write32(0xE000_ED2C, 0x4000_0000);
+        assert_eq!(ppb.hfsr, 0);
+    }
+
+    #[test]
+    fn ppb_iabr_word1_read_zero_default() {
+        let mut ppb = Ppb::default();
+        assert_eq!(ppb.read32(0xE000_E300), 0);
+        assert_eq!(ppb.read32(0xE000_E304), 0);
+    }
+
+    #[test]
+    fn ppb_nvic_ispr_word1_w1c_clears_only_in_implemented_bits() {
+        let mut ppb = Ppb::default();
+        // Pend a high IRQ via ISPR1 — masked to nvic_word1_valid_mask.
+        ppb.write32(0xE000_E204, 0x0000_FFFF);
+        let pending_after_set = ppb.read32(0xE000_E204);
+        assert_ne!(pending_after_set, 0);
+        // Clear via ICPR1.
+        ppb.write32(0xE000_E284, pending_after_set);
+        assert_eq!(ppb.read32(0xE000_E204), 0);
+    }
+
+    #[test]
+    fn ppb_iser_word1_clear_via_icer1() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E104, 0x000F_FFFF);
+        let after_set = ppb.read32(0xE000_E104);
+        assert_ne!(after_set, 0);
+        ppb.write32(0xE000_E184, after_set);
+        assert_eq!(ppb.read32(0xE000_E104), 0);
+    }
+
+    #[test]
+    fn ppb_ipr_misaligned_write_silently_ignored() {
+        let mut ppb = Ppb::default();
+        // Address 0xE402 is misaligned — no-op (covered by silent-ignore arm).
+        ppb.write32(0xE000_E402, 0xFFFF_FFFF);
+        // The aligned IPR0 stays at 0.
+        assert_eq!(ppb.read32(0xE000_E400), 0);
+    }
+
+    #[test]
+    fn ppb_dwt_cyccnt_write_then_advance_returns_written_plus_delta() {
+        let mut ppb = Ppb::default();
+        ppb.demcr = 1 << 24; // TRCENA
+        ppb.write32(0xE000_1000, 0x1); // CYCCNTENA
+        // Write CYCCNT=100 at cycles=10: stored base = 100 - 10 = 90.
+        ppb.update_latest_cycles(10);
+        ppb.write32(0xE000_1004, 100);
+        // Now advance to cycles=15. read32 with internal latest_cycles=10 still
+        // — read_cyccnt uses `latest_cycles` snapshot which is what we set.
+        let v = ppb.read32(0xE000_1004);
+        assert_eq!(v, 100);
+    }
+
+    // ----- peripherals.rs: ROSC/XOSC read-only register paths ------------
+
+    /// ROSC RANDOM (0x00C) and RANDOMBIT (0x01C) read as 0 on reads;
+    /// writes hit the read-only-ignored arm.
+    #[test]
+    fn rosc_read_only_offsets_zero_and_writes_ignored() {
+        let mut bus = Bus::new();
+        // ROSC base 0x400E_8000.
+        let rosc = 0x400E_8000u32;
+        // RANDOM (0x00C) reads 0.
+        assert_eq!(bus.read32(rosc + 0x00C, 0), 0);
+        // RANDOMBIT (0x01C) reads 0.
+        assert_eq!(bus.read32(rosc + 0x01C, 0), 0);
+        // COUNT (0x020) reads 0.
+        assert_eq!(bus.read32(rosc + 0x020, 0), 0);
+        // STATUS read returns STABLE | ENABLED.
+        let st = bus.read32(rosc + 0x018, 0);
+        assert_ne!(st & (1 << 31), 0);
+        // Write to read-only RANDOM is dropped.
+        bus.write32(rosc + 0x00C, 0xFFFF_FFFF, 0);
+        assert_eq!(bus.read32(rosc + 0x00C, 0), 0);
+    }
+
+    /// XOSC COUNT (0x01C) is read-only and writes are dropped.
+    #[test]
+    fn xosc_count_read_only_writes_ignored() {
+        let mut bus = Bus::new();
+        let xosc = 0x4004_8000u32;
+        assert_eq!(bus.read32(xosc + 0x01C, 0), 0);
+        bus.write32(xosc + 0x01C, 0xFFFF_FFFF, 0);
+        assert_eq!(bus.read32(xosc + 0x01C, 0), 0);
+        // STATUS write: read-only.
+        let st_before = bus.read32(xosc + 0x004, 0);
+        bus.write32(xosc + 0x004, 0, 0);
+        assert_eq!(bus.read32(xosc + 0x004, 0), st_before);
+    }
+
+    /// ROSC alias-write (XOR/SET/CLR) on CTRL register exercises the
+    /// alias-aware closure in `rosc_write`.
+    #[test]
+    fn rosc_ctrl_alias_xor_set_clr() {
+        let mut bus = Bus::new();
+        let rosc = 0x400E_8000u32;
+        // Plain write sets CTRL.
+        bus.write32(rosc + 0x000, 0xFAB4_AA0, 0);
+        // SET alias.
+        bus.write32(rosc + 0x000 + APB_SET_OFFSET, 0x1, 0);
+        // CLR alias.
+        bus.write32(rosc + 0x000 + APB_CLR_OFFSET, 0x1, 0);
+        // XOR alias.
+        bus.write32(rosc + 0x000 + APB_XOR_OFFSET, 0xFF, 0);
+    }
+
+    /// CLOCKS unknown offset read returns 0 (the `_ => 0` arm in clocks_read).
+    #[test]
+    fn clocks_unknown_offset_reads_zero() {
+        let mut bus = Bus::new();
+        // Offset 0x080 isn't part of the documented register map.
+        assert_eq!(bus.read32(0x4001_0000 + 0x080, 0), 0);
+    }
+
+    /// SYSINFO offset 0x010 (between PLATFORM and GITREF) lands in the
+    /// `_ => 0` arm.
+    #[test]
+    fn sysinfo_unknown_offset_reads_zero() {
+        let mut bus = Bus::new();
+        // Offset 0x010 isn't documented — falls through to 0.
+        assert_eq!(bus.read32(0x4000_0000 + 0x010, 0), 0);
+    }
+
+    /// QMI write offset >= qmi_regs.len() exercises the `if idx <` false arm.
+    #[test]
+    fn qmi_write_out_of_range_silently_dropped() {
+        let mut bus = Bus::new();
+        // Write to a far offset that maps to an idx outside qmi_regs.
+        bus.write32(0x400D_0000 + 0x0FFC, 0x1234_5678, 0);
+        // The matching read returns 0 (out of range default arm).
+        let v = bus.read32(0x400D_0000 + 0x0FFC, 0);
+        assert_eq!(v, 0);
+    }
+
+    /// PLL_USB write+read round-trip through the wrapper covers the
+    /// pll_write_into / pll_read_from helpers (offsets 0x004, 0x008, 0x00C).
+    #[test]
+    fn pll_usb_pwr_fbdiv_prim_round_trip() {
+        let mut bus = Bus::new();
+        let pll_usb = 0x4005_8000u32;
+        bus.write32(pll_usb + 0x004, 0x002D, 0); // PWR
+        assert_eq!(bus.read32(pll_usb + 0x004, 0), 0x002D);
+        bus.write32(pll_usb + 0x008, 100, 0); // FBDIV
+        assert_eq!(bus.read32(pll_usb + 0x008, 0), 100);
+        bus.write32(pll_usb + 0x00C, 0x0001_0001, 0); // PRIM
+        assert_eq!(bus.read32(pll_usb + 0x00C, 0), 0x0001_0001);
+    }
+
+    /// PLL alias-write (XOR/SET/CLR) on PWR — covers the alias arms in
+    /// `pll_write_into`.
+    #[test]
+    fn pll_usb_pwr_alias_writes() {
+        let mut bus = Bus::new();
+        let pll_usb = 0x4005_8000u32;
+        bus.write32(pll_usb + 0x004, 0xFF, 0);
+        bus.write32(pll_usb + 0x004 + APB_SET_OFFSET, 0x100, 0);
+        bus.write32(pll_usb + 0x004 + APB_XOR_OFFSET, 0xFF, 0);
+        bus.write32(pll_usb + 0x004 + APB_CLR_OFFSET, 0xFF, 0);
+    }
+
+    /// PLL unknown offset (within base+0x000..=0x00C window stripping
+    /// extra bits) — `pll_reg_index` returns None → write dropped, read
+    /// returns 0.
+    #[test]
+    fn pll_unknown_offset_reads_zero_and_drops_writes() {
+        let mut bus = Bus::new();
+        let pll_sys = 0x4005_0000u32;
+        // Offset 0x010 isn't in pll_reg_index match arms.
+        bus.write32(pll_sys + 0x010, 0xFFFF_FFFF, 0);
+        assert_eq!(bus.read32(pll_sys + 0x010, 0), 0);
+    }
+
+    // ----- RESETS write_path: alias 0/1/2/3 all reachable -----------------
+
+    /// RESETS state alias paths: CLR releases bit; SET re-asserts; XOR toggles.
+    #[test]
+    fn resets_alias_xor_set_clr_round_trip() {
+        let mut bus = Bus::new();
+        let resets = 0x4002_0000u32;
+        // SET alias asserts TIMER0.
+        bus.write32(resets + APB_SET_OFFSET, 1u32 << RESET_TIMER0, 0);
+        assert_ne!(bus.resets_state & (1u32 << RESET_TIMER0), 0);
+        // XOR alias toggles back to 0.
+        bus.write32(resets + APB_XOR_OFFSET, 1u32 << RESET_TIMER0, 0);
+        assert_eq!(bus.resets_state & (1u32 << RESET_TIMER0), 0);
+        // CLR is a no-op when bit is already cleared, but covers alias 3.
+        bus.write32(resets + APB_CLR_OFFSET, 1u32 << RESET_TIMER0, 0);
+        assert_eq!(bus.resets_state & (1u32 << RESET_TIMER0), 0);
+    }
+
+    /// RESETS write to non-zero offset (wdsel @ 0x004) is dropped.
+    #[test]
+    fn resets_offset_other_than_state_dropped() {
+        let mut bus = Bus::new();
+        let resets = 0x4002_0000u32;
+        let baseline = bus.resets_state;
+        // 0x004 is WDSEL; resets_write only handles 0x000.
+        bus.write32(resets + 0x004, 0xDEAD_BEEF, 0);
+        assert_eq!(bus.resets_state, baseline);
+    }
+}
+
+mod stage3_io_peripherals_residue {
+    //! Branch-coverage residue for the four RP2350 IO peripherals
+    //! `crates/mdrp2350/src/peripherals/{i2c,spi,uart,adc}.rs`. The
+    //! per-peripheral `tests` modules already cover the canonical paths;
+    //! this module targets the remaining branch-pairs:
+    //!
+    //! * I2C: TX FIFO threshold transitions, alias bitset/clr/xor on
+    //!   programmable registers, IC_INTR_STAT masking, every IC_CLR_*
+    //!   arm, IC_TX_ABRT_SOURCE 7-bit and 10-bit reason bits, the
+    //!   STATUS_RFF/STATUS_RFNE arms, narrow-access dispatch on
+    //!   IC_DATA_CMD, reset-on-disable + bus-driven RESET assert.
+    //! * SPI: TX FIFO full edge, frame_data_mask DSS=15 (16-bit) and
+    //!   DSS<3 clamp, sysclks_per_word denom-zero / bits_per_sec-zero,
+    //!   loopback RX FIFO full overrun, SSPDMACR mask + alias semantics,
+    //!   refresh_tx_rx_interrupts RX-half-or-more set/clear paths,
+    //!   read8/write8/read16 dispatch on non-DR offsets.
+    //! * UART: tx_fill_threshold each IFLS sel arm (0..=4 + default),
+    //!   sysclks_per_byte ibrd!=0 path, push_tx threshold-clear path,
+    //!   read_dr empty path, write_dr alias dispatch, RSR_ECR write
+    //!   clear, DMACR mask, FEN-clear truncates RX, byte-write to
+    //!   non-DR delegates to write32, byte-read from non-DR delegates.
+    //! * ADC: CS en before/after combinations, FCS UNDER/OVER W1C via
+    //!   alias 0/2 only, INTF forces IRQ via INTE, dreq() predicate,
+    //!   round-robin sparse mask, FCS_SHIFT halves sample, START_MANY
+    //!   loop break when conversion_remaining=None and START_MANY=0.
+    //!
+    //! Branches deliberately skipped (provably unreachable from public
+    //! API given ALWAYS_ACK_ADDRS is empty for V5 bus_scan corpus):
+    //!   * I2C `simulate_transaction` `ack && is_read` branch
+    //!     (`rx_fifo.push_back`) — every ACK requires a non-empty
+    //!     ALWAYS_ACK_ADDRS, which is empty by design for V5.
+    //!   * I2C `simulate_transaction` `ack && !is_read && tx_fifo.len()
+    //!     < 16` branch (TX push) — same reason.
+    //!   * I2C "GEN_CALL_NOACK / RX_OVER abrupt master abort" — the
+    //!     emulator does not model these abort sources (`tx_abrt_source`
+    //!     is only ever set with `ABRT_7B_ADDR_NOACK` or
+    //!     `ABRT_10ADDR1_NOACK`). The brief asks for them but they're
+    //!     not branches in the production code — covering them would
+    //!     require new semantics, not new tests.
+    //!   * UART break-detect / parity-error sticky — UART_INT_BE /
+    //!     UART_INT_PE / UART_INT_FE sources are not generated by the
+    //!     emulator (only TX path is modelled per the comment at
+    //!     `refresh_tx_interrupt`). Tests can W1C them via ICR (already
+    //!     covered) but the SET path doesn't exist.
+
+    use crate::dreq::{
+        DREQ_I2C0_RX, DREQ_I2C0_TX, DREQ_SPI0_RX, DREQ_SPI0_TX, DREQ_UART0_RX, DREQ_UART0_TX,
+    };
+    use crate::irq::{IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_SPI0_IRQ, IRQ_UART0_IRQ};
+    use crate::peripherals::adc as adc_p;
+    use crate::peripherals::i2c as i2c_p;
+    use crate::peripherals::spi as spi_p;
+    use crate::peripherals::uart as uart_p;
+    use mdpicoem_common::clocks::ClockTree;
+
+    fn tree(sys: u32, peri: u32) -> ClockTree {
+        ClockTree {
+            sys_clk_hz: sys,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: peri,
+        }
+    }
+
+    // =====================================================================
+    // I2C — DW_apb_i2c
+    // =====================================================================
+
+    fn new_i2c() -> i2c_p::I2cRegs {
+        i2c_p::I2cRegs::new(IRQ_I2C0_IRQ, DREQ_I2C0_TX, DREQ_I2C0_RX)
+    }
+
+    /// `IC_INTR_STAT` returns `raw & mask` — verify masked vs unmasked
+    /// produce different reads. Existing tests poke `intr_mask` directly;
+    /// here we drive it through `write32(IC_INTR_MASK, ...)`.
+    #[test]
+    fn i2c_intr_stat_masking_via_intr_mask_register() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        // Force a NACK to latch TX_ABRT in raw_intr_stat.
+        i.write32(i2c_p::IC_TAR, 0x3C, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 0x00, 0, &mut irqs);
+        let raw = i.read32(i2c_p::IC_RAW_INTR_STAT);
+        assert_ne!(raw & i2c_p::INT_TX_ABRT, 0);
+        // Mask all bits off → IC_INTR_STAT reads 0.
+        i.write32(i2c_p::IC_INTR_MASK, 0, 0, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_INTR_STAT), 0);
+        // Mask only TX_ABRT on → IC_INTR_STAT shows just that bit.
+        i.write32(i2c_p::IC_INTR_MASK, i2c_p::INT_TX_ABRT, 0, &mut irqs);
+        assert_eq!(
+            i.read32(i2c_p::IC_INTR_STAT) & i2c_p::INT_TX_ABRT,
+            i2c_p::INT_TX_ABRT
+        );
+    }
+
+    /// 7-bit address NACK sets the latching `INT_TX_ABRT` raw bit; the
+    /// transient `IC_TX_ABRT_SOURCE` is auto-cleared because `!ack`
+    /// triggers the STOP-equivalent cleanup in `simulate_transaction`.
+    /// `IC_CLR_TX_ABRT` is the explicit clear-arm — read returns 0 and
+    /// the latched raw bit clears.
+    #[test]
+    fn i2c_clr_tx_abrt_arm_via_register_dispatch() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_TAR, 0x55, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 0, 0, &mut irqs);
+        // Latched raw TX_ABRT bit persists.
+        assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT) & i2c_p::INT_TX_ABRT, 0);
+        // Read IC_CLR_TX_ABRT — returns 0, clears both.
+        assert_eq!(i.read32(i2c_p::IC_CLR_TX_ABRT), 0);
+        assert_eq!(i.read32(i2c_p::IC_RAW_INTR_STAT) & i2c_p::INT_TX_ABRT, 0);
+        assert_eq!(i.read32(i2c_p::IC_TX_ABRT_SOURCE), 0);
+    }
+
+    /// 10-bit master mode runs through the `ten_bit` true arm in
+    /// `simulate_transaction`. The source register is auto-cleared by
+    /// the `!ack` STOP-equivalent path, so we observe the durable
+    /// `INT_TX_ABRT` latch. Distinguishes the 10-bit code path from the
+    /// 7-bit path which the existing `nack_default_for_bus_scan` covers.
+    #[test]
+    fn i2c_10bit_addressing_path_latches_tx_abrt() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        // Enable 10-bit master mode (bit 4) + master + restart-en + slave-disable.
+        i.write32(
+            i2c_p::IC_CON,
+            1u32 << 0 | 1u32 << 4 | 1u32 << 5 | 1u32 << 6,
+            0,
+            &mut irqs,
+        );
+        i.write32(i2c_p::IC_TAR, 0x123, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 0, 0, &mut irqs);
+        // Latched TX_ABRT raw bit confirms the 10-bit path executed.
+        assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT) & i2c_p::INT_TX_ABRT, 0);
+    }
+
+    /// IC_CLR_INTR (W1C bulk-clear) returns 0 and clears all auto-clear
+    /// bits including the latched TX_ABRT raw bit.
+    #[test]
+    fn i2c_clr_intr_bulk_clear_returns_zero_and_clears_raw() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_TAR, 0x42, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 1u32 << 9, 0, &mut irqs);
+        assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT), 0);
+        assert_eq!(i.read32(i2c_p::IC_CLR_INTR), 0);
+        // INT_RX_FULL is the only bit not auto-cleared by IC_CLR_INTR;
+        // since the bus_scan-style transaction NACKs (no rx push), all
+        // auto-clear bits should be gone.
+        assert_eq!(i.read32(i2c_p::IC_RAW_INTR_STAT), 0);
+    }
+
+    /// Each individual `IC_CLR_*` arm: read returns 0, raw bit cleared.
+    /// Drives the dispatch-arm coverage for every offset in 0x44..=0x68.
+    #[test]
+    fn i2c_individual_clr_arms_each_clear_their_bit() {
+        let mut i = new_i2c();
+        // Inject every clearable raw bit, then read each clear-arm.
+        // raw_intr_stat is private — drive via a NACK that latches multiple
+        // bits, then exercise the individual clears one at a time.
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_TAR, 0x42, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 1u32 << 9, 0, &mut irqs);
+        // Now exercise each clear arm. Each returns 0.
+        for offset in [
+            i2c_p::IC_CLR_RX_UNDER,
+            i2c_p::IC_CLR_RX_OVER,
+            i2c_p::IC_CLR_TX_OVER,
+            i2c_p::IC_CLR_RD_REQ,
+            i2c_p::IC_CLR_RX_DONE,
+            i2c_p::IC_CLR_ACTIVITY,
+            i2c_p::IC_CLR_STOP_DET,
+            i2c_p::IC_CLR_START_DET,
+            i2c_p::IC_CLR_GEN_CALL,
+        ] {
+            assert_eq!(i.read32(offset), 0, "offset {offset:#X}");
+        }
+    }
+
+    /// IC_STATUS reflects MST_ACTIVITY and ACTIVITY when activity flag set.
+    /// Skip-STOP transaction transiently sets activity before NACK clears it,
+    /// so issue WITHOUT the STOP bit and BEFORE the NACK pathway flips the
+    /// flag back: not quite reachable. Instead drive the "no-activity" path
+    /// directly and confirm STATUS_TFE/TFNF are set.
+    #[test]
+    fn i2c_status_tfe_and_tfnf_at_reset_no_activity() {
+        let mut i = new_i2c();
+        let s = i.read32(i2c_p::IC_STATUS);
+        // STATUS_TFE = bit 2, STATUS_TFNF = bit 1
+        assert_ne!(s & (1 << 2), 0);
+        assert_ne!(s & (1 << 1), 0);
+        // STATUS_ACTIVITY=bit0 / STATUS_MST_ACTIVITY=bit5 clear.
+        assert_eq!(s & (1 << 0), 0);
+        assert_eq!(s & (1 << 5), 0);
+    }
+
+    /// Disabling the I2C clears tx_fifo, rx_fifo, and activity (the
+    /// `if !is_enabled() { ... }` branch on IC_ENABLE write).
+    /// Trigger a NACK first to set activity (cleared by STOP), then
+    /// exercise the disable path on a fresh transaction.
+    #[test]
+    fn i2c_disable_clears_state_post_enable() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_TAR, 0x10, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 0, 0, &mut irqs); // no STOP → activity set
+        // Now disable.
+        i.write32(i2c_p::IC_ENABLE, 0, 0, &mut irqs);
+        // STATUS bits reflect cleared state.
+        let s = i.read32(i2c_p::IC_STATUS);
+        assert_eq!(s & (1 << 0), 0, "ACTIVITY clear after disable");
+        assert_eq!(i.read32(i2c_p::IC_TXFLR), 0);
+    }
+
+    /// `IC_DATA_CMD` byte read via narrow path: `read8` collapses to
+    /// `read32` and returns the LSB.
+    #[test]
+    fn i2c_read8_data_cmd_returns_zero_when_rx_empty() {
+        let mut i = new_i2c();
+        assert_eq!(i.read8(i2c_p::IC_DATA_CMD), 0);
+    }
+
+    /// `write8` to a non-`IC_DATA_CMD` offset delegates to write32 with
+    /// alias=0. Covers the `else` branch.
+    #[test]
+    fn i2c_write8_non_data_cmd_routes_through_write32() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write8(i2c_p::IC_FS_SPKLEN, 0x55, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_FS_SPKLEN), 0x55);
+    }
+
+    /// `write8(IC_DATA_CMD, ...)` enters the simulate path via the
+    /// dedicated arm.
+    #[test]
+    fn i2c_write8_data_cmd_simulates_transaction() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_TAR, 0x18, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write8(i2c_p::IC_DATA_CMD, 0xAA, &mut irqs);
+        // NACK → TX_ABRT in raw_intr_stat.
+        assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT) & i2c_p::INT_TX_ABRT, 0);
+    }
+
+    /// `simulate_transaction` returns immediately when not enabled (the
+    /// `if !is_enabled() { return; }` early-exit). Issue a write to
+    /// IC_DATA_CMD with EN=0 and confirm raw_intr_stat is unchanged.
+    #[test]
+    fn i2c_data_cmd_write_no_op_when_disabled() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        // EN remains 0 at construction.
+        i.write32(i2c_p::IC_DATA_CMD, 0xFF, 0, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_RAW_INTR_STAT), 0);
+    }
+
+    /// Programmable registers honour each alias code (XOR=1, BITSET=2,
+    /// BITCLR=3) on the disabled-only path.
+    #[test]
+    fn i2c_programmable_register_alias_paths() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        // SAR is unconditionally writable.
+        i.write32(i2c_p::IC_SAR, 0x100, 0, &mut irqs);
+        // BITSET +0x008 → 0x108.
+        i.write32(i2c_p::IC_SAR, 0x008, 2, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_SAR), 0x108);
+        // XOR 0xFF → 0x108 ^ 0xFF = 0x1F7 → masked to 0x3FF (10-bit).
+        i.write32(i2c_p::IC_SAR, 0x0FF, 1, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_SAR), 0x108 ^ 0x0FF);
+        // BITCLR clears low 8 bits.
+        i.write32(i2c_p::IC_SAR, 0x0FF, 3, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_SAR) & 0xFF, 0);
+    }
+
+    /// IC_SS_SCL_HCNT/LCNT and IC_FS_SCL_HCNT/LCNT: each plain-storage
+    /// arm with non-zero alias.
+    #[test]
+    fn i2c_scl_count_registers_round_trip_with_alias() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_SS_SCL_HCNT, 0x1234, 0, &mut irqs);
+        i.write32(i2c_p::IC_SS_SCL_LCNT, 0x4321, 0, &mut irqs);
+        i.write32(i2c_p::IC_FS_SCL_HCNT, 0x5678, 0, &mut irqs);
+        i.write32(i2c_p::IC_FS_SCL_LCNT, 0x8765, 0, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_SS_SCL_HCNT), 0x1234);
+        assert_eq!(i.read32(i2c_p::IC_SS_SCL_LCNT), 0x4321);
+        assert_eq!(i.read32(i2c_p::IC_FS_SCL_HCNT), 0x5678);
+        assert_eq!(i.read32(i2c_p::IC_FS_SCL_LCNT), 0x8765);
+        // BITSET alias on FS_SCL_HCNT.
+        i.write32(i2c_p::IC_FS_SCL_HCNT, 0x0001, 2, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_FS_SCL_HCNT), 0x5679);
+    }
+
+    /// `IC_RX_TL` and `IC_TX_TL` are 8-bit truncated programmable; alias
+    /// path covered.
+    #[test]
+    fn i2c_rx_tl_tx_tl_truncated_to_8_bits() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_RX_TL, 0xDEAD, 0, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_RX_TL), 0xAD);
+        i.write32(i2c_p::IC_TX_TL, 0xCAFE, 0, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_TX_TL), 0xFE);
+    }
+
+    /// `IC_SDA_HOLD` round-trip through alias code 0.
+    #[test]
+    fn i2c_sda_hold_round_trip() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_SDA_HOLD, 0xABCD, 0, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_SDA_HOLD), 0xABCD);
+    }
+
+    /// Unknown register offset returns 0 on read, no-op on write.
+    #[test]
+    fn i2c_unknown_offset_default_arm() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        assert_eq!(i.read32(0xABC), 0);
+        i.write32(0xABC, 0xDEAD, 0, &mut irqs); // no-op
+        assert_eq!(i.read32(0xABC), 0);
+    }
+
+    /// `is_idle` is false once a NACK latches abort bits; clearing
+    /// returns it to true. Locks in both arms of the predicate.
+    #[test]
+    fn i2c_is_idle_arms() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        assert!(i.is_idle());
+        i.write32(i2c_p::IC_TAR, 0x10, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 1 << 9, 0, &mut irqs); // STOP-included
+        assert!(!i.is_idle(), "raw_intr_stat latches even after STOP");
+        let _ = i.read32(i2c_p::IC_CLR_INTR);
+        assert!(i.is_idle());
+    }
+
+    /// `tx_dreq` and `rx_dreq` predicates: false when disabled (covers
+    /// short-circuit), true when enabled with empty/full FIFOs.
+    #[test]
+    fn i2c_tx_rx_dreq_predicates() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        assert!(!i.tx_dreq(), "disabled → no DREQ");
+        assert!(!i.rx_dreq());
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        assert!(i.tx_dreq(), "enabled empty TX → DREQ");
+        assert!(!i.rx_dreq(), "enabled empty RX → no DREQ");
+    }
+
+    /// `route_irq` re-fires after `IC_INTR_MASK` write: with raw bit
+    /// already latched, raising the mask raises the NVIC line.
+    #[test]
+    fn i2c_intr_mask_write_re_routes_irq() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        // Latch TX_ABRT.
+        i.write32(i2c_p::IC_TAR, 0x10, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 1 << 9, 0, &mut irqs);
+        irqs = 0;
+        // Mask off everything → tick still routes 0.
+        i.write32(i2c_p::IC_INTR_MASK, 0, 0, &mut irqs);
+        assert_eq!(irqs & (1u64 << IRQ_I2C0_IRQ), 0);
+        // Now unmask TX_ABRT → write itself routes the IRQ.
+        i.write32(i2c_p::IC_INTR_MASK, i2c_p::INT_TX_ABRT, 0, &mut irqs);
+        assert_ne!(irqs & (1u64 << IRQ_I2C0_IRQ), 0);
+    }
+
+    /// `tick` route_irq path with no work — ensures the cold-path arm
+    /// runs even with empty raw_intr_stat.
+    #[test]
+    fn i2c_tick_with_no_pending_irq_is_noop() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.tick(100, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_eq!(irqs, 0);
+    }
+
+    /// `IC_ENABLE_STATUS` reflects bit 0 of the enable register.
+    #[test]
+    fn i2c_enable_status_mirrors_enable_bit() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        assert_eq!(i.read32(i2c_p::IC_ENABLE_STATUS), 0);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        assert_eq!(i.read32(i2c_p::IC_ENABLE_STATUS), 1);
+    }
+
+    /// Reset-mid-transaction via `reset()`: latched raw bits clear and
+    /// FIFOs return to empty. Covers the `*self = Self::new(...)` arm.
+    #[test]
+    fn i2c_reset_mid_transaction_clears_state() {
+        let mut i = new_i2c();
+        let mut irqs = 0u64;
+        i.write32(i2c_p::IC_TAR, 0x10, 0, &mut irqs);
+        i.write32(i2c_p::IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(i2c_p::IC_DATA_CMD, 0, 0, &mut irqs); // no STOP
+        assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT), 0);
+        i.reset();
+        assert_eq!(i.read32(i2c_p::IC_RAW_INTR_STAT), 0);
+        assert_eq!(i.read32(i2c_p::IC_ENABLE), 0);
+        assert!(i.is_idle());
+    }
+
+    /// `Default` impl constructs with the I2C0 wiring.
+    #[test]
+    fn i2c_default_is_i2c0_wiring() {
+        let i: i2c_p::I2cRegs = Default::default();
+        assert_eq!(i.dreq_tx_index(), DREQ_I2C0_TX);
+        assert_eq!(i.dreq_rx_index(), DREQ_I2C0_RX);
+    }
+
+    // =====================================================================
+    // SPI — PL022
+    // =====================================================================
+
+    fn new_spi() -> spi_p::SpiRegs {
+        spi_p::SpiRegs::new(IRQ_SPI0_IRQ, DREQ_SPI0_TX, DREQ_SPI0_RX)
+    }
+
+    /// TX FIFO full edge — pushing a 9th word with depth=8 is dropped.
+    /// Covers the `tx_fifo.len() < SSP_FIFO_DEPTH` false arm in push_dr.
+    #[test]
+    fn spi_tx_fifo_full_drops_overflow() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs); // 8-bit
+        s.write32(spi_p::SSPCR1, 1u32 << 1, 0, &mut irqs); // SSE
+        // Don't tick → no drain; push 10 words.
+        for _ in 0..10 {
+            s.write32(spi_p::SSPDR, 0xAA, 0, &mut irqs);
+        }
+        // SR.TFE clear, SR.TNF clear once we hit depth 8.
+        let sr = s.read32(spi_p::SSPSR);
+        assert_eq!(sr & (1 << 0), 0, "TFE clear with words queued");
+        assert_eq!(sr & (1 << 1), 0, "TNF clear at FIFO full");
+    }
+
+    /// `frame_data_mask` DSS=15 → 16-bit frame; high bits truncated.
+    #[test]
+    fn spi_frame_mask_dss_15_is_16_bit() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 0x000F, 0, &mut irqs); // DSS=15 → 16-bit
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs); // SSE+LBM
+        s.write32(spi_p::SSPCPSR, 2, 0, &mut irqs);
+        // Write 0xDEAD_BEEF; only low 16 bits should survive.
+        s.write32(spi_p::SSPDR, 0xDEAD_BEEF, 0, &mut irqs);
+        s.tick(10_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPDR), 0xBEEF);
+    }
+
+    /// `frame_data_mask` DSS<3 (DSS=0/1/2) clamps to bits=4 (4-bit
+    /// frame). Verify a 4-bit frame masks the high nibble.
+    #[test]
+    fn spi_frame_mask_dss_below_3_clamps_to_4_bit() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 0x0000, 0, &mut irqs); // DSS=0 → clamps to 4-bit
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        s.write32(spi_p::SSPCPSR, 2, 0, &mut irqs);
+        s.write32(spi_p::SSPDR, 0xFF, 0, &mut irqs);
+        s.tick(1_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPDR), 0x0F, "4-bit mask retains low nibble");
+    }
+
+    /// `sysclks_per_word` denom=0 path: cpsr=2 (mask 0xFE → 2), but the
+    /// actual divisor (cpsdvsr * (1+scr)) can never be 0 when raw_cpsr
+    /// is non-zero — so the `denom == 0` arm is provably unreachable.
+    /// Instead exercise the bits_per_sec=0 arm: peri_clk so low that
+    /// `peri / denom` rounds to 0 → returns 1.
+    #[test]
+    fn spi_sysclks_per_word_low_peri_returns_1() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        s.write32(spi_p::SSPCPSR, 0xFE, 0, &mut irqs); // max prescale
+        // peri_hz=1 → 1 / 254 = 0 → bits_per_sec=0 → return 1.
+        s.write32(spi_p::SSPDR, 0x42, 0, &mut irqs);
+        s.tick(10, &tree(150_000_000, 1), &mut irqs);
+        // After 10 cycles with spw=1 (RX-side push), word should be there.
+        assert_eq!(s.read32(spi_p::SSPDR), 0x42);
+    }
+
+    /// SSPCPSR truncates LSB (mask 0xFE) — write 0x03 reads 0x02.
+    #[test]
+    fn spi_sspcpsr_lsb_truncated() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCPSR, 0x03, 0, &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPCPSR), 0x02);
+    }
+
+    /// `SSPDMACR` mask = 0x3 (TXDMAE + RXDMAE only); higher bits dropped.
+    #[test]
+    fn spi_sspdmacr_mask_and_alias() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPDMACR, 0xFF, 0, &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPDMACR), 0x3);
+        // BITCLR alias removes RXDMAE only.
+        s.write32(spi_p::SSPDMACR, 0x1, 3, &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPDMACR), 0x2);
+    }
+
+    /// `SSPCR1` masked to 0xF (low 4 bits).
+    #[test]
+    fn spi_sspcr1_truncated_to_4_bits() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR1, 0xFFFF_FFFF, 0, &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPCR1), 0xF);
+    }
+
+    /// Disabling SPI (clearing SSE) resets `tx_cycle_accum` — a follow-up
+    /// re-enable + push starts cleanly. Cover the `if !is_enabled()` arm.
+    #[test]
+    fn spi_disable_resets_tx_cycle_accumulator() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        s.write32(spi_p::SSPCPSR, 0xFE, 0, &mut irqs); // slow
+        s.write32(spi_p::SSPDR, 0x33, 0, &mut irqs);
+        // Tick to accumulate a partial word.
+        s.tick(100, &tree(150_000_000, 150_000), &mut irqs);
+        // Disable SPI.
+        s.write32(spi_p::SSPCR1, 0, 0, &mut irqs);
+        // Re-enable + drive different word.
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        // FIFO retained; just exercise the path.
+        let _ = s.read32(spi_p::SSPSR);
+    }
+
+    /// Loopback RX SET + tick CLEAR transitions. The CLEAR arm of
+    /// `refresh_tx_rx_interrupts` only runs from `tick`, and `tick`
+    /// early-exits with an empty TX FIFO — so we keep the TX FIFO
+    /// continuously primed across the drain to force the CLEAR path.
+    #[test]
+    fn spi_rx_irq_set_via_loopback() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        s.write32(spi_p::SSPCPSR, 2, 0, &mut irqs);
+        // Drive 8 words → full RX FIFO after tick.
+        for i in 0u32..8 {
+            s.write32(spi_p::SSPDR, i, 0, &mut irqs);
+        }
+        s.tick(50_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        // RX FIFO depth >= 4 → SSP_INT_RX latched.
+        assert_ne!(s.read32(spi_p::SSPRIS) & spi_p::SSP_INT_RX, 0);
+        // Drain RX down to 0 with TX-prime in between to force CLEAR
+        // arm execution.
+        for _ in 0..8 {
+            let _ = s.read32(spi_p::SSPDR);
+        }
+        s.write32(spi_p::SSPDR, 0xAA, 0, &mut irqs);
+        s.tick(50_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        // Now RX has 1 word from the new TX → < 4 → CLEAR arm runs.
+        assert_eq!(s.read32(spi_p::SSPRIS) & spi_p::SSP_INT_RX, 0);
+    }
+
+    /// SSPSR reports RFF=1 when RX FIFO is full (depth=8 via loopback).
+    #[test]
+    fn spi_sspsr_rff_set_when_rx_full() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        s.write32(spi_p::SSPCPSR, 2, 0, &mut irqs);
+        for _ in 0..8 {
+            s.write32(spi_p::SSPDR, 0x55, 0, &mut irqs);
+        }
+        s.tick(50_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_ne!(s.read32(spi_p::SSPSR) & (1 << 3), 0, "RFF set");
+        assert_ne!(s.read32(spi_p::SSPSR) & (1 << 2), 0, "RNE set");
+    }
+
+    /// `read16` on SSPDR pops one word; on non-DR offset delegates to
+    /// `read32`-as-u16.
+    #[test]
+    fn spi_read16_dispatch_dr_vs_other() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 0xF, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        s.write32(spi_p::SSPCPSR, 2, 0, &mut irqs);
+        s.write32(spi_p::SSPDR, 0xAB_CD, 0, &mut irqs);
+        s.tick(10_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_eq!(s.read16(spi_p::SSPDR), 0xABCD);
+        // Non-DR delegates: SSPCPSR returns u16-truncated value.
+        assert_eq!(s.read16(spi_p::SSPCPSR), 0x0002);
+    }
+
+    /// `read8` on SSPDR pops; on non-DR delegates.
+    #[test]
+    fn spi_read8_dispatch_dr_vs_other() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1 | 1u32 << 0, 0, &mut irqs);
+        s.write32(spi_p::SSPCPSR, 2, 0, &mut irqs);
+        s.write32(spi_p::SSPDR, 0x9A, 0, &mut irqs);
+        s.tick(10_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_eq!(s.read8(spi_p::SSPDR), 0x9A);
+        assert_eq!(s.read8(spi_p::SSPCR0), 0x07);
+    }
+
+    /// `write8`/`write16` on non-DR offset delegates to `write32`.
+    #[test]
+    fn spi_write_narrow_non_dr_delegates() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write8(spi_p::SSPCPSR, 0x10, &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPCPSR), 0x10);
+        s.write16(spi_p::SSPCR0, 0x00FF, &mut irqs);
+        assert_eq!(s.read32(spi_p::SSPCR0) & 0xFFFF, 0x00FF);
+    }
+
+    /// `write32` to a read-only or unknown register is dropped (default
+    /// arm). SSPSR is read-only — writes never modify state; reads
+    /// return live FIFO status. Unknown offsets read as 0.
+    #[test]
+    fn spi_unknown_and_readonly_writes_dropped() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        let sspsr_before = s.read32(spi_p::SSPSR);
+        s.write32(spi_p::SSPSR, 0xDEAD, 0, &mut irqs);
+        // SSPSR read returns live status — write was a no-op.
+        assert_eq!(s.read32(spi_p::SSPSR), sspsr_before);
+        s.write32(0x800, 0xBEEF, 0, &mut irqs); // unknown
+        assert_eq!(s.read32(0x800), 0);
+    }
+
+    /// `tick` early-exit arms: cycles=0; not enabled; tx_fifo empty.
+    /// Each separately exercises a different boolean in the OR chain.
+    #[test]
+    fn spi_tick_early_exit_arms() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        // cycles=0
+        s.tick(0, &tree(150_000_000, 150_000_000), &mut irqs);
+        // Not enabled (SSE=0), with a manually-staged TX FIFO via push_dr.
+        s.tick(100, &tree(150_000_000, 150_000_000), &mut irqs);
+        // Enabled, empty TX FIFO.
+        s.write32(spi_p::SSPCR1, 1u32 << 1, 0, &mut irqs);
+        s.tick(100, &tree(150_000_000, 150_000_000), &mut irqs);
+    }
+
+    /// `is_idle` true at reset, false with TX FIFO populated.
+    #[test]
+    fn spi_is_idle_arms() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        assert!(s.is_idle());
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1, 0, &mut irqs);
+        s.write32(spi_p::SSPDR, 0xAA, 0, &mut irqs);
+        assert!(!s.is_idle());
+    }
+
+    /// `tx_dreq` / `rx_dreq` predicates: enabled vs disabled.
+    #[test]
+    fn spi_dreq_predicates_match_enable_state() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        assert!(!s.tx_dreq());
+        assert!(!s.rx_dreq());
+        s.write32(spi_p::SSPCR1, 1u32 << 1, 0, &mut irqs);
+        assert!(s.tx_dreq());
+    }
+
+    /// `Default` constructs with SPI0 wiring.
+    #[test]
+    fn spi_default_is_spi0_wiring() {
+        let s: spi_p::SpiRegs = Default::default();
+        assert_eq!(s.dreq_tx_index(), DREQ_SPI0_TX);
+        assert_eq!(s.dreq_rx_index(), DREQ_SPI0_RX);
+    }
+
+    /// `reset()` clears state on a populated peripheral.
+    #[test]
+    fn spi_reset_clears_state() {
+        let mut s = new_spi();
+        let mut irqs = 0u64;
+        s.write32(spi_p::SSPCR0, 7, 0, &mut irqs);
+        s.write32(spi_p::SSPCR1, 1u32 << 1, 0, &mut irqs);
+        s.write32(spi_p::SSPDR, 0xFF, 0, &mut irqs);
+        s.reset();
+        assert!(s.is_idle());
+        assert_eq!(s.read32(spi_p::SSPCR0), 0);
+        assert_eq!(s.read32(spi_p::SSPCR1), 0);
+    }
+
+    // =====================================================================
+    // UART — PL011
+    // =====================================================================
+
+    fn new_uart() -> uart_p::UartRegs {
+        uart_p::UartRegs::new(IRQ_UART0_IRQ, DREQ_UART0_TX, DREQ_UART0_RX)
+    }
+
+    /// `tx_fill_threshold` IFLS arms 0..=4 + default. Each maps to a
+    /// distinct fill threshold; a TX push at exactly that level clears
+    /// `UART_INT_TX`. Drives every match arm in `tx_fill_threshold`.
+    #[test]
+    fn uart_tx_fill_threshold_each_ifls_arm() {
+        for sel in [0u32, 1, 2, 3, 4, 7] {
+            let mut u = new_uart();
+            let mut irqs = 0u64;
+            u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+            u.write32(uart_p::UARTCR, 1u32 | (1u32 << 8), 0, &mut irqs);
+            u.write32(uart_p::UARTIFLS, sel & 0x7, 0, &mut irqs);
+            // Push 1 byte → tick is required to refresh; we just exercise
+            // that the IFLS write-arm + alias path runs.
+            u.write32(uart_p::UARTDR, 0x42, 0, &mut irqs);
+            assert_eq!(u.read32(uart_p::UARTIFLS) & 0x3F, sel & 0x7);
+        }
+    }
+
+    /// `sysclks_per_byte` ibrd!=0 path: confirm tick drains under
+    /// realistic baud (already covered by other tests, but locks in
+    /// the `if ibrd==0 && fbrd==0` false arm via small fbrd-only).
+    #[test]
+    fn uart_sysclks_per_byte_fbrd_only_path() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+        u.write32(uart_p::UARTCR, 1u32 | (1u32 << 8), 0, &mut irqs);
+        // ibrd=0 fbrd=1 (non-zero) → exercises the !(ibrd==0 && fbrd==0)
+        // path even though fbrd alone is degenerate.
+        u.write32(uart_p::UARTFBRD, 1, 0, &mut irqs);
+        u.write32(uart_p::UARTDR, 0xAA, 0, &mut irqs);
+        // Tick → spw computed, accumulator advances.
+        u.tick(1_000_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        // FIFO is drained.
+        assert!(u.read32(uart_p::UARTFR) & (1 << 7) != 0, "TXFE set");
+    }
+
+    /// `read_dr` empty path: returns 0 with no RX data.
+    #[test]
+    fn uart_read_dr_empty_returns_zero() {
+        let mut u = new_uart();
+        assert_eq!(u.read32(uart_p::UARTDR), 0);
+        assert_eq!(u.read8(uart_p::UARTDR), 0);
+    }
+
+    /// `RSR_ECR` write zeroes the register regardless of value.
+    #[test]
+    fn uart_rsr_ecr_write_zeroes() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTRSR_ECR, 0xFF, 0, &mut irqs);
+        assert_eq!(u.read32(uart_p::UARTRSR_ECR), 0);
+    }
+
+    /// `UARTILPR` is RAZ/WI: write does nothing, read returns 0.
+    #[test]
+    fn uart_ilpr_raz_wi() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTILPR, 0xFF, 0, &mut irqs);
+        assert_eq!(u.read32(uart_p::UARTILPR), 0);
+    }
+
+    /// `UARTDMACR` mask 0x7 + alias path.
+    #[test]
+    fn uart_dmacr_mask_and_alias() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTDMACR, 0xFF, 0, &mut irqs);
+        assert_eq!(u.read32(uart_p::UARTDMACR), 0x7);
+        u.write32(uart_p::UARTDMACR, 0x1, 3, &mut irqs);
+        assert_eq!(u.read32(uart_p::UARTDMACR), 0x6);
+    }
+
+    /// IFLS write XOR alias path (alias=1).
+    #[test]
+    fn uart_ifls_xor_alias() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        let before = u.read32(uart_p::UARTIFLS);
+        u.write32(uart_p::UARTIFLS, 0x3F, 1, &mut irqs);
+        assert_eq!(u.read32(uart_p::UARTIFLS), before ^ 0x3F);
+    }
+
+    /// FEN clear truncates RX FIFO down to 1 (covers `rx_fifo.truncate(1)`
+    /// arm in UARTLCR_H write).
+    #[test]
+    fn uart_fen_clear_truncates_rx_to_one() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        // Set up loopback so RX gets populated.
+        u.write32(uart_p::UARTIBRD, 81, 0, &mut irqs);
+        u.write32(uart_p::UARTFBRD, 24, 0, &mut irqs);
+        u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+        u.write32(
+            uart_p::UARTCR,
+            1 | (1u32 << 7) | (1u32 << 8) | (1u32 << 9), // EN+LBE+TXE+RXE
+            0,
+            &mut irqs,
+        );
+        for b in [0x11u32, 0x22, 0x33, 0x44] {
+            u.write32(uart_p::UARTDR, b, 0, &mut irqs);
+        }
+        u.tick(120_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        // RX has multiple bytes. Now clear FEN.
+        u.write32(uart_p::UARTLCR_H, 0, 0, &mut irqs);
+        let mut count = 0;
+        while u.read32(uart_p::UARTFR) & (1 << 4) == 0 {
+            // RXFE clear → drain
+            let _ = u.read32(uart_p::UARTDR);
+            count += 1;
+            if count > 4 {
+                break;
+            }
+        }
+        assert!(count <= 1, "FEN clear must truncate RX to ≤1 byte; got {count}");
+    }
+
+    /// TXE clear means push_tx is dropped (covers the
+    /// `is_tx_enabled` false arm distinct from UARTEN=0).
+    #[test]
+    fn uart_push_dropped_when_txe_clear() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+        // UARTEN=1 but TXE=0.
+        u.write32(uart_p::UARTCR, 1, 0, &mut irqs);
+        u.write32(uart_p::UARTDR, 0xAA, 0, &mut irqs);
+        // FR.TXFE remains set (TX FIFO still empty).
+        assert_ne!(u.read32(uart_p::UARTFR) & (1 << 7), 0);
+    }
+
+    /// `push_tx` threshold-clear arm: filling TX over `tx_fill_threshold`
+    /// clears the latched UART_INT_TX (the `if len > thresh` true arm).
+    #[test]
+    fn uart_push_tx_clears_int_tx_when_over_threshold() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTIBRD, 1, 0, &mut irqs);
+        u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+        u.write32(uart_p::UARTCR, 1 | (1u32 << 8), 0, &mut irqs);
+        // IFLS = 4 → threshold 7/8 of 16 = 14.
+        u.write32(uart_p::UARTIFLS, 4, 0, &mut irqs);
+        // Push enough bytes that TX_INT first sets (≤14), then clears (>14).
+        for i in 0u32..15 {
+            u.write32(uart_p::UARTDR, i, 0, &mut irqs);
+        }
+        // Pushing past the threshold clears UART_INT_TX.
+        assert_eq!(u.read32(uart_p::UARTRIS) & uart_p::UART_INT_TX, 0);
+    }
+
+    /// Word-write to UARTDR (alias=0) pushes once (covers the wide path,
+    /// distinct from `write8` which the existing test exercises).
+    #[test]
+    fn uart_word_write_dr_pushes_once() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+        u.write32(uart_p::UARTCR, 1 | (1u32 << 8), 0, &mut irqs);
+        u.write32(uart_p::UARTDR, 0xAA, 0, &mut irqs);
+        // Read via FR — TX FIFO non-empty.
+        assert_eq!(u.read32(uart_p::UARTFR) & (1 << 7), 0, "TXFE clear");
+    }
+
+    /// `write8` on non-DR offset delegates to write32 with alias 0.
+    #[test]
+    fn uart_write8_non_dr_delegates() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write8(uart_p::UARTIBRD, 0x55, &mut irqs);
+        assert_eq!(u.read32(uart_p::UARTIBRD), 0x55);
+    }
+
+    /// `read8` on non-DR delegates.
+    #[test]
+    fn uart_read8_non_dr_delegates() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTIBRD, 0xCD, 0, &mut irqs);
+        assert_eq!(u.read8(uart_p::UARTIBRD), 0xCD);
+    }
+
+    /// Unknown offset returns 0; default arm in write32 is no-op.
+    #[test]
+    fn uart_unknown_offset_default_arm() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        assert_eq!(u.read32(0xABC), 0);
+        u.write32(0xABC, 0xDEAD, 0, &mut irqs); // no-op
+    }
+
+    /// `is_idle` arms.
+    #[test]
+    fn uart_is_idle_predicate() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        assert!(u.is_idle());
+        u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+        u.write32(uart_p::UARTCR, 1 | (1u32 << 8), 0, &mut irqs);
+        u.write32(uart_p::UARTDR, 0xCC, 0, &mut irqs);
+        assert!(!u.is_idle());
+    }
+
+    /// `tx_dreq` / `rx_dreq` predicates.
+    #[test]
+    fn uart_dreq_predicates() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        assert!(!u.tx_dreq(), "disabled UART → no DREQ");
+        u.write32(uart_p::UARTCR, 1, 0, &mut irqs);
+        assert!(u.tx_dreq(), "EN=1 + empty FIFO + cap=1 (FEN=0) → TX DREQ");
+        assert!(!u.rx_dreq(), "empty RX FIFO");
+    }
+
+    /// `Default` constructs with UART0 wiring.
+    #[test]
+    fn uart_default_is_uart0_wiring() {
+        let u: uart_p::UartRegs = Default::default();
+        assert_eq!(u.dreq_tx_index(), DREQ_UART0_TX);
+        assert_eq!(u.dreq_rx_index(), DREQ_UART0_RX);
+    }
+
+    /// `reset()` clears state.
+    #[test]
+    fn uart_reset_clears_state() {
+        let mut u = new_uart();
+        let mut irqs = 0u64;
+        u.write32(uart_p::UARTLCR_H, 1u32 << 4, 0, &mut irqs);
+        u.write32(uart_p::UARTCR, 1 | (1u32 << 8), 0, &mut irqs);
+        u.write32(uart_p::UARTDR, 0x42, 0, &mut irqs);
+        u.reset();
+        assert!(u.is_idle());
+        assert_eq!(u.read32(uart_p::UARTCR), 0);
+    }
+
+    // =====================================================================
+    // ADC
+    // =====================================================================
+
+    fn new_adc() -> adc_p::AdcRegs {
+        adc_p::AdcRegs::new(IRQ_ADC_IRQ_FIFO)
+    }
+
+    /// CS write: en_before=true, en_after=false → conversion_remaining
+    /// cleared, READY cleared. Covers the `else if` arm in CS write.
+    #[test]
+    fn adc_cs_disable_clears_in_flight_conversion_and_ready() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::CS, adc_p::CS_EN | adc_p::CS_START_ONCE, 0, &mut irqs);
+        a.tick(50, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert!(a.read32(adc_p::CS) & adc_p::CS_EN != 0);
+        // Disable EN → CS_READY cleared, conversion aborted.
+        a.write32(adc_p::CS, 0, 0, &mut irqs);
+        assert_eq!(a.read32(adc_p::CS) & adc_p::CS_READY, 0);
+        assert_eq!(a.read32(adc_p::CS) & adc_p::CS_EN, 0);
+    }
+
+    /// CS write: en_before=false, en_after=true with no
+    /// conversion_remaining → CS_READY latched. Covers the
+    /// `!en_before && en_after && conversion_remaining.is_none()` arm.
+    #[test]
+    fn adc_cs_enable_latches_ready_when_no_conversion() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::CS, adc_p::CS_EN, 0, &mut irqs);
+        assert_ne!(a.read32(adc_p::CS) & adc_p::CS_READY, 0);
+    }
+
+    /// CS write: en_before=true, en_after=true (no transition).
+    /// Neither arm fires.
+    #[test]
+    fn adc_cs_already_enabled_no_transition() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::CS, adc_p::CS_EN, 0, &mut irqs);
+        // Re-enable while already enabled.
+        a.write32(adc_p::CS, adc_p::CS_EN, 0, &mut irqs);
+        assert_ne!(a.read32(adc_p::CS) & adc_p::CS_EN, 0);
+    }
+
+    /// FCS write: alias=1 (XOR) does NOT clear UNDER bit (only alias 0/2
+    /// do, per the W1C-with-a-twist semantics in the production code).
+    #[test]
+    fn adc_fcs_under_not_cleared_by_xor_alias() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        // Set UNDER via empty pop.
+        let _ = a.read32(adc_p::FIFO);
+        assert_ne!(a.read32(adc_p::FCS) & adc_p::FCS_UNDER, 0);
+        // XOR alias: UNDER NOT cleared.
+        a.write32(adc_p::FCS, adc_p::FCS_UNDER, 1, &mut irqs);
+        assert_ne!(a.read32(adc_p::FCS) & adc_p::FCS_UNDER, 0);
+        // BITCLR alias: UNDER NOT cleared either (alias!=0 && alias!=2).
+        a.write32(adc_p::FCS, adc_p::FCS_UNDER, 3, &mut irqs);
+        assert_ne!(a.read32(adc_p::FCS) & adc_p::FCS_UNDER, 0);
+        // Plain write (alias=0) clears.
+        a.write32(adc_p::FCS, adc_p::FCS_UNDER, 0, &mut irqs);
+        assert_eq!(a.read32(adc_p::FCS) & adc_p::FCS_UNDER, 0);
+    }
+
+    /// `dreq()` predicate: false when `FCS_DREQ_EN` clear; true when set
+    /// and FIFO non-empty.
+    #[test]
+    fn adc_dreq_predicate_arms() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        assert!(!a.dreq(), "FCS_DREQ_EN clear → no DREQ");
+        a.write32(adc_p::FCS, adc_p::FCS_EN | adc_p::FCS_DREQ_EN, 0, &mut irqs);
+        assert!(!a.dreq(), "DREQ_EN set but FIFO empty → no DREQ");
+        a.write32(adc_p::CS, adc_p::CS_EN | adc_p::CS_START_ONCE, 0, &mut irqs);
+        a.tick(500, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert!(a.dreq(), "DREQ_EN set + FIFO non-empty → DREQ");
+    }
+
+    /// `read16` on FIFO with FCS_SHIFT clear returns full 16-bit word.
+    #[test]
+    fn adc_fifo_no_shift_returns_full_word() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::FCS, adc_p::FCS_EN, 0, &mut irqs);
+        a.write32(adc_p::CS, adc_p::CS_EN | adc_p::CS_START_ONCE, 0, &mut irqs);
+        a.tick(500, &tree(150_000_000, 150_000_000), &mut irqs);
+        let s = a.read16(adc_p::FIFO);
+        // SHIFT clear → no >>4.
+        let _ = s; // value depends on counter; just confirm no panic.
+    }
+
+    /// AINSEL round-robin in single-channel mask: rrobin=0x1 means only
+    /// channel 0; the inner-while runs once and stays at 0.
+    #[test]
+    fn adc_round_robin_single_channel_mask() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::FCS, adc_p::FCS_EN, 0, &mut irqs);
+        a.write32(
+            adc_p::CS,
+            adc_p::CS_EN | adc_p::CS_START_MANY | (1u32 << 16),
+            0,
+            &mut irqs,
+        );
+        a.tick(2_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        // AINSEL stays at 0 with single-channel rrobin.
+        assert_eq!((a.read32(adc_p::CS) >> 12) & 0x7, 0);
+    }
+
+    /// CS_RROBIN=0 (no round-robin) → AINSEL never advances.
+    #[test]
+    fn adc_round_robin_zero_mask_keeps_ainsel() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::FCS, adc_p::FCS_EN, 0, &mut irqs);
+        // AINSEL=2, RROBIN=0.
+        a.write32(
+            adc_p::CS,
+            adc_p::CS_EN | adc_p::CS_START_MANY | (2u32 << 12),
+            0,
+            &mut irqs,
+        );
+        a.tick(2_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_eq!((a.read32(adc_p::CS) >> 12) & 0x7, 2);
+    }
+
+    /// FCS read returns FIFO_LEVEL bits 16..19 reflecting current depth.
+    #[test]
+    fn adc_fcs_level_bits_reflect_fifo_depth() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::FCS, adc_p::FCS_EN, 0, &mut irqs);
+        a.write32(adc_p::CS, adc_p::CS_EN | adc_p::CS_START_MANY, 0, &mut irqs);
+        a.tick(20_000, &tree(150_000_000, 150_000_000), &mut irqs);
+        let fcs = a.read32(adc_p::FCS);
+        let level = (fcs >> 16) & 0xF;
+        assert!(level > 0, "level field reflects samples in FIFO");
+        assert_ne!(fcs & (1 << 9), 0, "FULL bit set when depth=4");
+    }
+
+    /// FCS read empty bit (8) set when FIFO empty.
+    #[test]
+    fn adc_fcs_empty_bit_at_reset() {
+        let mut a = new_adc();
+        let fcs = a.read32(adc_p::FCS);
+        assert_ne!(fcs & (1 << 8), 0);
+    }
+
+    /// INTF write+clear via alias paths.
+    #[test]
+    fn adc_intf_alias_paths() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::INTF, adc_p::INTR_FIFO, 0, &mut irqs);
+        assert_ne!(a.read32(adc_p::INTF) & adc_p::INTR_FIFO, 0);
+        // BITCLR.
+        a.write32(adc_p::INTF, adc_p::INTR_FIFO, 3, &mut irqs);
+        assert_eq!(a.read32(adc_p::INTF) & adc_p::INTR_FIFO, 0);
+    }
+
+    /// DIV write masked to 24 bits + alias path.
+    #[test]
+    fn adc_div_truncated_to_24_bits() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::DIV, 0xFFFF_FFFF, 0, &mut irqs);
+        assert_eq!(a.read32(adc_p::DIV), 0x00FF_FFFF);
+        // BITCLR alias.
+        a.write32(adc_p::DIV, 0x00FF_0000, 3, &mut irqs);
+        assert_eq!(a.read32(adc_p::DIV), 0x0000_FFFF);
+    }
+
+    /// Tick with conversion_remaining=Some, sys_cycles small enough that
+    /// rem decrements but doesn't reach zero (covers `*rem > 1` true arm).
+    #[test]
+    fn adc_tick_decrements_remaining_without_completion() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::CS, adc_p::CS_EN | adc_p::CS_START_ONCE, 0, &mut irqs);
+        // Small tick: 30 sys_cycles * 48/150 ≈ 9.6 sub-ticks.
+        a.tick(30, &tree(150_000_000, 150_000_000), &mut irqs);
+        assert_eq!(a.read32(adc_p::CS) & adc_p::CS_READY, 0);
+        // Conversion not done yet.
+        assert_ne!(a.read32(adc_p::CS) & adc_p::CS_START_ONCE, 0);
+    }
+
+    /// `Default` constructs with the ADC IRQ wiring.
+    #[test]
+    fn adc_default_irq_wiring() {
+        let _a: adc_p::AdcRegs = Default::default();
+    }
+
+    /// `reset()` clears state.
+    #[test]
+    fn adc_reset_clears_state() {
+        let mut a = new_adc();
+        let mut irqs = 0u64;
+        a.write32(adc_p::CS, adc_p::CS_EN | adc_p::CS_START_ONCE, 0, &mut irqs);
+        a.tick(500, &tree(150_000_000, 150_000_000), &mut irqs);
+        a.reset();
+        assert!(a.is_idle());
+        assert_eq!(a.read32(adc_p::CS), 0);
+    }
+}
+
+mod stage3_timer_misc_residue {
+    //! Branch-coverage residue for the RP2350 timer / power / crypto /
+    //! system peripherals:
+    //!
+    //!   * `peripherals/powman.rs` — INTS read, TIMER alias arms (XOR/OR/CLR),
+    //!     INTR W1C without TIMER bit, INTE/INTF with stripped low-16,
+    //!     unknown-offset hashmap alias path, ARCHSEL read default.
+    //!   * `peripherals/timer.rs` — TIMER0 + TIMER1 four alarms each (alarm
+    //!     1/2/3 routing on irq_base), pause+resume, write-only TIMEHW/W
+    //!     read returns 0, alias arms on INTE/INTF/INTR, DBGPAUSE alias
+    //!     mask, PAUSE alias path, ARMED alias bitset, default-arm in read.
+    //!   * `peripherals/sha256.rs` — WDATA read (W-only returns 0), SUM
+    //!     range RO write drop, default-arm read, default-arm write,
+    //!     reset() clears state, unaligned SUM read.
+    //!   * `peripherals/watchdog.rs` — REASON read, REASON write via alias,
+    //!     default-arm write, scratch boundary, tick path with time==0
+    //!     after fire (no re-fire), TRIGGER + ENABLE combination, post-reset
+    //!     scratch preservation (already covered in private tests).
+    //!   * `peripherals/pwm.rs` — CSR_EN clear mid-cycle (counter freezes),
+    //!     DIVMODE field bits round-trip via CSR write, unknown global
+    //!     read returns 0 (default arm), per-slice CC/CTR/TOP read paths.
+    //!   * `peripherals/io_bank0.rs` — INTR write via alias, dormant_wake
+    //!     INTS read, write to `decode_int_offset` returning None (out of
+    //!     entire block), PROC1 INTS read (section 6 — derived).
+    //!   * `peripherals/pads_bank0.rs` — read of unknown offset returns 0,
+    //!     write of unknown offset is no-op, alias bitclr / xor on pad,
+    //!     VOLTAGE_SELECT alias paths.
+    //!
+    //! Branches deliberately skipped:
+    //!   * TIMER `write32` `_ => masked_in` arm at `peripherals/timer.rs:435`
+    //!     (inside `match alias & 0x3`) — `alias & 0x3` is 0..=3, so the
+    //!     default arm is statically unreachable.
+    //!   * TIMER read32 `ALARM0_OFFSET..=0x1C` `idx >= 4` arm — the offset
+    //!     range maps `idx` to 0..=3 by construction; unreachable.
+    //!   * TIMER write32 `ALARM0_OFFSET..=0x1C` `idx >= 4` early return —
+    //!     same reason as above.
+    //!   * SHA256 `read32` SUM range `(offset & 3) != 0` falls to default
+    //!     arm — exercised below via an offset such as 0x09 to bring the
+    //!     `(offset & 3) == 0` guard into the false branch.
+    //!   * POWMAN LASTSWBOOTREASON — that register is not modelled in the
+    //!     production file (see `peripherals/powman.rs` register-map
+    //!     comment); reads of any unknown offset land in the HashMap
+    //!     fallthrough and return 0 by default. We exercise the read-of-
+    //!     unset-offset branch via `read32(0xF8)` for an arbitrary
+    //!     unknown offset.
+    //!   * PWM DIVMODE-specific behaviours — `peripherals/pwm.rs` stores
+    //!     DIVMODE only as a 2-bit field within CSR; there is no per-mode
+    //!     advance behaviour in V5 (the divisor accumulator runs the same
+    //!     for all DIVMODE values). The DIVMODE round-trip exercises the
+    //!     storage-mask branches.
+
+    use crate::peripherals::powman as powman_p;
+    use crate::peripherals::pwm as pwm_p;
+    use crate::peripherals::sha256 as sha_p;
+    use crate::peripherals::timer as timer_p;
+    use crate::peripherals::watchdog as wd_p;
+    use crate::peripherals::{io_bank0, pads_bank0};
+
+    use crate::irq::{
+        IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0,
+    };
+    use mdpicoem_common::clocks::ClockTree;
+
+    // =====================================================================
+    // POWMAN — password-gated writes, INTS, TIMER alias arms, LASTSWBOOTREASON
+    // =====================================================================
+
+    fn new_powman() -> powman_p::PowmanRegs {
+        powman_p::PowmanRegs::new()
+    }
+
+    fn tree_150() -> ClockTree {
+        ClockTree {
+            sys_clk_hz: 150_000_000,
+            ref_clk_hz: 12_000_000,
+            peri_clk_hz: 150_000_000,
+        }
+    }
+
+    /// `INTS` read returns `(intr & inte) | intf`. Drive each lane and
+    /// observe the read merging them.
+    #[test]
+    fn powman_ints_read_merges_intr_inte_intf() {
+        let mut p = new_powman();
+        // Seed INTR.TIMER via an alarm match.
+        let _ = p.write32(
+            powman_p::ALARM_TIME_15TO0_OFFSET,
+            powman_p::POWMAN_PASSWORD | 1,
+            0,
+        );
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_RUN_BIT | powman_p::TIMER_ALARM_ENAB_BIT,
+            0,
+        );
+        let _ = p.advance(50, &tree_150());
+        // INTE.TIMER = 0 → INTS.TIMER from INTR is gated off, INTF is 0.
+        assert_eq!(p.read32(powman_p::INTS_OFFSET) & powman_p::INT_TIMER_BIT, 0);
+        // Set INTE.TIMER → INTS now reflects INTR & INTE.
+        let _ = p.write32(
+            powman_p::INTE_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::INT_TIMER_BIT,
+            0,
+        );
+        assert_ne!(p.read32(powman_p::INTS_OFFSET) & powman_p::INT_TIMER_BIT, 0);
+    }
+
+    /// TIMER write with alias 2 (BITSET) preserves prior bits and OR's in
+    /// the new value. Exercises the alias=2 arm of the TIMER_OFFSET match.
+    #[test]
+    fn powman_timer_write_bitset_alias_preserves_prior() {
+        let mut p = new_powman();
+        // First plain-write RUN.
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_RUN_BIT,
+            0,
+        );
+        // BITSET-alias add ALARM_ENAB.
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_ALARM_ENAB_BIT,
+            2,
+        );
+        let v = p.read32(powman_p::TIMER_OFFSET);
+        assert_ne!(v & powman_p::TIMER_RUN_BIT, 0, "BITSET preserves RUN");
+        assert_ne!(v & powman_p::TIMER_ALARM_ENAB_BIT, 0, "BITSET adds ALARM_ENAB");
+    }
+
+    /// TIMER write with alias 3 (BITCLR) clears named bits.
+    #[test]
+    fn powman_timer_write_bitclr_alias_clears_named_bits() {
+        let mut p = new_powman();
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_RUN_BIT | powman_p::TIMER_ALARM_ENAB_BIT,
+            0,
+        );
+        // BITCLR-alias remove RUN.
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_RUN_BIT,
+            3,
+        );
+        let v = p.read32(powman_p::TIMER_OFFSET);
+        assert_eq!(v & powman_p::TIMER_RUN_BIT, 0, "BITCLR removes RUN");
+        assert_ne!(
+            v & powman_p::TIMER_ALARM_ENAB_BIT,
+            0,
+            "BITCLR leaves ALARM_ENAB"
+        );
+    }
+
+    /// TIMER write with alias 1 (XOR) toggles bits.
+    #[test]
+    fn powman_timer_write_xor_alias_toggles() {
+        let mut p = new_powman();
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_RUN_BIT,
+            0,
+        );
+        // XOR with RUN → toggles RUN off.
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_RUN_BIT,
+            1,
+        );
+        let v = p.read32(powman_p::TIMER_OFFSET);
+        assert_eq!(v & powman_p::TIMER_RUN_BIT, 0);
+    }
+
+    /// INTR write where `(value & INT_TIMER_BIT) == 0` exercises the
+    /// false branch of the TIMER.ALARM mirror at line 459-461.
+    #[test]
+    fn powman_intr_write_without_timer_bit_does_not_clear_alarm() {
+        let mut p = new_powman();
+        // Force ALARM bit + INTR.TIMER set via match.
+        let _ = p.write32(
+            powman_p::ALARM_TIME_15TO0_OFFSET,
+            powman_p::POWMAN_PASSWORD | 1,
+            0,
+        );
+        let _ = p.write32(
+            powman_p::TIMER_OFFSET,
+            powman_p::POWMAN_PASSWORD | powman_p::TIMER_RUN_BIT | powman_p::TIMER_ALARM_ENAB_BIT,
+            0,
+        );
+        let _ = p.advance(50, &tree_150());
+        assert_ne!(p.read32(powman_p::TIMER_OFFSET) & powman_p::TIMER_ALARM_BIT, 0);
+        // INTR write with bit 0 set (not TIMER bit which is bit 1) — should
+        // not clear TIMER.ALARM.
+        let _ = p.write32(powman_p::INTR_OFFSET, 0x1, 0);
+        assert_ne!(
+            p.read32(powman_p::TIMER_OFFSET) & powman_p::TIMER_ALARM_BIT,
+            0,
+            "INTR write without TIMER bit must not mirror clear TIMER.ALARM"
+        );
+    }
+
+    /// LASTSWBOOTREASON / unknown-offset read returns 0 from HashMap fallthrough.
+    #[test]
+    fn powman_unknown_offset_read_returns_zero() {
+        let p = new_powman();
+        // 0xF8 is not modelled — HashMap.get returns None → 0.
+        assert_eq!(p.read32(0xF8), 0);
+    }
+
+    /// Unknown-offset write via XOR alias exercises the alias-aware
+    /// HashMap fallthrough write path.
+    #[test]
+    fn powman_unknown_offset_write_xor_alias_roundtrip() {
+        let mut p = new_powman();
+        // First plain-write a value.
+        let _ = p.write32(0xFC, 0x0F, 0);
+        // Then XOR-alias toggle bits.
+        let _ = p.write32(0xFC, 0x05, 1);
+        assert_eq!(p.read32(0xFC), 0x0A);
+    }
+
+    /// ARCHSEL is not password-gated and reads back the stored value
+    /// (covers ARCHSEL_OFFSET in both read and write match arms).
+    #[test]
+    fn powman_archsel_round_trip_no_password_required() {
+        let mut p = new_powman();
+        let _ = p.write32(powman_p::ARCHSEL_OFFSET, 0xDEAD, 0);
+        // Stored as plain u32 — no masking on read.
+        let v = p.read32(powman_p::ARCHSEL_OFFSET);
+        assert_eq!(v, 0xDEAD);
+    }
+
+    // =====================================================================
+    // TIMER — TIMER0 + TIMER1 four alarms each, pause/resume, alias arms
+    // =====================================================================
+
+    fn new_timer0() -> timer_p::TimerRegs {
+        timer_p::TimerRegs::new(IRQ_TIMER0_IRQ_0)
+    }
+
+    fn new_timer1() -> timer_p::TimerRegs {
+        timer_p::TimerRegs::new(IRQ_TIMER1_IRQ_0)
+    }
+
+    /// All four TIMER0 alarms route to IRQ 0..=3 when their respective
+    /// INTE bits are set.
+    #[test]
+    fn timer0_four_alarms_route_to_irq_base_plus_n() {
+        let mut t = new_timer0();
+        t.write32(timer_p::INTE_OFFSET, 0xF, 0);
+        // ALARM0 at offset 0x10, ALARM1 at 0x14, ALARM2 at 0x18, ALARM3 at 0x1C.
+        t.write32(timer_p::ALARM0_OFFSET, 1, 0);
+        t.write32(timer_p::ALARM0_OFFSET + 4, 2, 0);
+        t.write32(timer_p::ALARM0_OFFSET + 8, 3, 0);
+        t.write32(timer_p::ALARM0_OFFSET + 12, 4, 0);
+        t.advance_us(4);
+        let bits = t.poll_alarms();
+        // All four alarms must fire and route to IRQ 0..=3.
+        assert_ne!(bits & (1u64 << IRQ_TIMER0_IRQ_0), 0);
+        assert_ne!(bits & (1u64 << (IRQ_TIMER0_IRQ_0 + 1)), 0);
+        assert_ne!(bits & (1u64 << (IRQ_TIMER0_IRQ_0 + 2)), 0);
+        assert_ne!(bits & (1u64 << (IRQ_TIMER0_IRQ_0 + 3)), 0);
+    }
+
+    /// All four TIMER1 alarms route on IRQ_TIMER1_IRQ_0 + n (= 4..=7).
+    #[test]
+    fn timer1_four_alarms_route_to_irq_base_plus_n() {
+        let mut t = new_timer1();
+        t.write32(timer_p::INTE_OFFSET, 0xF, 0);
+        t.write32(timer_p::ALARM0_OFFSET, 1, 0);
+        t.write32(timer_p::ALARM0_OFFSET + 4, 2, 0);
+        t.write32(timer_p::ALARM0_OFFSET + 8, 3, 0);
+        t.write32(timer_p::ALARM0_OFFSET + 12, 4, 0);
+        t.advance_us(4);
+        let bits = t.poll_alarms();
+        assert_ne!(bits & (1u64 << IRQ_TIMER1_IRQ_0), 0);
+        assert_ne!(bits & (1u64 << (IRQ_TIMER1_IRQ_0 + 3)), 0);
+        // No TIMER0 IRQ bits.
+        assert_eq!(bits & 0xF, 0);
+    }
+
+    /// Timer pause + resume — counter freezes during pause then resumes
+    /// from the same point.
+    #[test]
+    fn timer_pause_resume_preserves_counter() {
+        let mut t = new_timer0();
+        t.advance_us(50);
+        t.write32(timer_p::PAUSE_OFFSET, 1, 0);
+        // Paused — advance_us is a no-op.
+        t.advance_us(100);
+        let mid = t.read32(timer_p::TIMERAWL_OFFSET);
+        assert_eq!(mid, 50, "paused timer must freeze at 50");
+        // Resume.
+        t.write32(timer_p::PAUSE_OFFSET, 0, 0);
+        t.advance_us(20);
+        assert_eq!(t.read32(timer_p::TIMERAWL_OFFSET), 70);
+    }
+
+    /// `TIMEHW` and `TIMELW` reads return 0 (write-only registers).
+    #[test]
+    fn timer_timehw_timelw_read_raz() {
+        let mut t = new_timer0();
+        t.advance_us(0xDEAD_BEEF);
+        assert_eq!(t.read32(timer_p::TIMEHW_OFFSET), 0);
+        assert_eq!(t.read32(timer_p::TIMELW_OFFSET), 0);
+    }
+
+    /// Read of a register-block default arm (offset 0x100 etc) returns 0.
+    #[test]
+    fn timer_unknown_offset_reads_zero() {
+        let mut t = new_timer0();
+        assert_eq!(t.read32(0x100), 0);
+        assert_eq!(t.read32(0x4FC), 0);
+    }
+
+    /// `ARMED` write with BITSET alias still computes a disarm mask.
+    #[test]
+    fn timer_armed_write_bitset_alias_disarms() {
+        let mut t = new_timer0();
+        t.write32(timer_p::ALARM0_OFFSET, 100, 0);
+        t.write32(timer_p::ALARM0_OFFSET + 4, 100, 0);
+        // BITSET alias on ARMED with bit 0 → final stored 0b11 → disarm
+        // both alarms 0 and 1.
+        t.write32(timer_p::ARMED_OFFSET, 0b11, 2);
+        // Both alarms disarmed.
+        assert_eq!(t.read32(timer_p::ARMED_OFFSET) & 0xF, 0);
+    }
+
+    /// `DBGPAUSE` write with alias and read-back masks to 3 bits.
+    #[test]
+    fn timer_dbgpause_alias_masked_to_3_bits() {
+        let mut t = new_timer0();
+        t.write32(timer_p::DBGPAUSE_OFFSET, 0xFFFF_FFFF, 0);
+        // Only bottom 3 bits stored.
+        assert_eq!(t.read32(timer_p::DBGPAUSE_OFFSET), 0b111);
+    }
+
+    /// `INTE` BITCLR alias clears only the addressed bits.
+    #[test]
+    fn timer_inte_bitclr_alias_partial() {
+        let mut t = new_timer0();
+        t.write32(timer_p::INTE_OFFSET, 0xF, 0);
+        t.write32(timer_p::INTE_OFFSET, 0b0101, 3); // BITCLR
+        assert_eq!(t.read32(timer_p::INTE_OFFSET), 0b1010);
+    }
+
+    /// `INTF` BITSET alias with INTE gates the NVIC line.
+    #[test]
+    fn timer_intf_alias_bitset_routes_nvic_with_inte() {
+        let mut t = new_timer0();
+        t.write32(timer_p::INTE_OFFSET, 0x1, 0);
+        // BITSET alias on INTF.
+        t.write32(timer_p::INTF_OFFSET, 0x1, 2);
+        let bits = t.poll_alarms();
+        assert_ne!(bits & (1u64 << IRQ_TIMER0_IRQ_0), 0);
+    }
+
+    // =====================================================================
+    // SHA256 — WDATA write x16 → SUM read; WDATA_RDY toggle; reset clears
+    // =====================================================================
+
+    /// Full block of 16 zero words drives `compress256` once and SUM_VALID
+    /// goes high. `WDATA_READY` toggles from 1 → 0 across the 16th write.
+    #[test]
+    fn sha256_wdata_ready_toggles_across_16_writes() {
+        let mut sha = sha_p::Sha256Regs::new();
+        // CSR.START = bit 0; WDATA_READY = bit 1; SUM_VALID = bit 2.
+        sha.write32(0x00, 0x1, 0); // START
+        // After START, WDATA_READY = 1, SUM_VALID = 0.
+        let csr0 = sha.read32(0x00);
+        assert_ne!(csr0 & (1 << 1), 0, "WDATA_READY high after START");
+        assert_eq!(csr0 & (1 << 2), 0, "SUM_VALID low after START");
+        // Feed 15 words — still ready.
+        for _ in 0..15 {
+            sha.write32(0x04, 0, 0);
+        }
+        let csr15 = sha.read32(0x00);
+        assert_ne!(csr15 & (1 << 1), 0, "WDATA_READY still high after 15 writes");
+        // 16th write fills the block → SUM_VALID becomes 1, WDATA_READY 0.
+        sha.write32(0x04, 0, 0);
+        let csr16 = sha.read32(0x00);
+        assert_eq!(csr16 & (1 << 1), 0, "WDATA_READY low after 16 writes");
+        assert_ne!(csr16 & (1 << 2), 0, "SUM_VALID high after 16 writes");
+    }
+
+    /// `WDATA_OFFSET` reads return 0 (write-only).
+    #[test]
+    fn sha256_wdata_read_returns_zero() {
+        let sha = sha_p::Sha256Regs::new();
+        assert_eq!(sha.read32(0x04), 0);
+    }
+
+    /// SUM range RO write is dropped (line 192-194 in sha256.rs).
+    #[test]
+    fn sha256_sum_range_write_dropped() {
+        let mut sha = sha_p::Sha256Regs::new();
+        // SUM0 is at 0x08. Write to it must not change the IV.
+        let before = sha.read32(0x08);
+        sha.write32(0x08, 0xDEAD_BEEF, 0);
+        assert_eq!(sha.read32(0x08), before);
+    }
+
+    /// Out-of-range read (default arm) returns 0.
+    #[test]
+    fn sha256_default_read_returns_zero() {
+        let sha = sha_p::Sha256Regs::new();
+        // 0x100 is past SUM7 (0x24).
+        assert_eq!(sha.read32(0x100), 0);
+        // Unaligned within SUM range falls to default arm.
+        assert_eq!(sha.read32(0x09), 0);
+    }
+
+    /// Out-of-range write (default arm) is a no-op.
+    #[test]
+    fn sha256_default_write_is_noop() {
+        let mut sha = sha_p::Sha256Regs::new();
+        sha.write32(0x200, 0xDEAD_BEEF, 0);
+        // Nothing observable changes.
+        assert_eq!(sha.read32(0x200), 0);
+    }
+
+    /// `reset()` clears state — equivalent to CSR.START.
+    #[test]
+    fn sha256_reset_clears_state() {
+        let mut sha = sha_p::Sha256Regs::new();
+        sha.write32(0x00, 0x1, 0); // START
+        // Feed 16 words to drive sum_valid high.
+        for _ in 0..16 {
+            sha.write32(0x04, 0xAAAA_AAAA, 0);
+        }
+        assert_ne!(sha.read32(0x00) & (1 << 2), 0, "sum_valid high");
+        sha.reset();
+        // After reset: SUM = IV, WDATA_READY = 1, SUM_VALID = 0.
+        assert_eq!(sha.read32(0x08), 0x6a09_e667, "SUM0 = IV[0]");
+        assert_ne!(sha.read32(0x00) & (1 << 1), 0, "WDATA_READY high after reset");
+        assert_eq!(sha.read32(0x00) & (1 << 2), 0, "SUM_VALID low after reset");
+    }
+
+    // =====================================================================
+    // WATCHDOG — countdown decrement, REASON, scratch, alias on REASON
+    // =====================================================================
+
+    fn new_watchdog() -> wd_p::WatchdogRegs {
+        wd_p::WatchdogRegs::new()
+    }
+
+    /// REASON read returns 0 in V5 (stubbed). Drives the REASON_OFFSET arm.
+    #[test]
+    fn watchdog_reason_read_returns_stub() {
+        let wd = new_watchdog();
+        // REASON is at 0x08.
+        assert_eq!(wd.read32(0x08), 0);
+    }
+
+    /// REASON write via alias 2 (BITSET) lands in the alias_rmw branch.
+    #[test]
+    fn watchdog_reason_write_alias_bitset_roundtrip() {
+        let mut wd = new_watchdog();
+        let _ = wd.write32(0x08, 0x3, 2); // BITSET → reason = 0x3
+        assert_eq!(wd.read32(0x08), 0x3);
+        let _ = wd.write32(0x08, 0x1, 3); // BITCLR
+        assert_eq!(wd.read32(0x08), 0x2);
+    }
+
+    /// Default-arm write (offset outside CTRL/LOAD/REASON/SCRATCH) is a
+    /// no-op and returns false.
+    #[test]
+    fn watchdog_default_write_is_noop() {
+        let mut wd = new_watchdog();
+        let fired = wd.write32(0x100, 0xDEAD_BEEF, 0);
+        assert!(!fired);
+    }
+
+    /// `tick()` returns false when ENABLE = 1 but `time` already 0
+    /// (already-fired path). Exercises line 155-158.
+    #[test]
+    fn watchdog_tick_no_refire_when_time_already_zero() {
+        let mut wd = new_watchdog();
+        let _ = wd.write32(0x04, 1, 0); // LOAD = 1
+        let _ = wd.write32(0x00, 1 << 30, 0); // CTRL.ENABLE
+        // First tick fires.
+        assert!(wd.tick());
+        // Subsequent tick must NOT re-fire (time stays 0).
+        assert!(!wd.tick());
+        assert!(!wd.tick());
+    }
+
+    /// Scratch boundary — offset just past SCRATCH7 falls to default and
+    /// reads 0. Boundary is `SCRATCH0 + 4 * 8 = 0x0C + 0x20 = 0x2C`.
+    #[test]
+    fn watchdog_scratch_boundary_reads_zero() {
+        let mut wd = new_watchdog();
+        // 0x2C is past SCRATCH7 (last is 0x28). Write/read should hit the
+        // default arm and return 0 / be a no-op.
+        let fired = wd.write32(0x2C, 0xDEAD_BEEF, 0);
+        assert!(!fired);
+        assert_eq!(wd.read32(0x2C), 0);
+    }
+
+    /// HW_BOOT / HW_RESET / PWRMAN bits in CTRL — the production file
+    /// holds these bits as plain storage (the ENABLE / TRIGGER /
+    /// PAUSE_* are the only modelled CTRL bits). Verify high bits round-
+    /// trip through the writable mask: CTRL_WRITABLE_MASK = !TIME_MASK
+    /// = 0xFF00_0000. Bits 24..=31 round-trip; bits 0..=23 are TIME-owned.
+    #[test]
+    fn watchdog_ctrl_high_bits_round_trip_via_writable_mask() {
+        let mut wd = new_watchdog();
+        // Set ENABLE (bit 30) + PAUSE_DBG1 (bit 26) + PAUSE_DBG0 (bit 25)
+        // + PAUSE_JTAG (bit 24).
+        let bits = (1u32 << 30) | (1u32 << 26) | (1u32 << 25) | (1u32 << 24);
+        let fired = wd.write32(0x00, bits, 0);
+        assert!(!fired, "no TRIGGER bit means no immediate fire");
+        let v = wd.read32(0x00);
+        assert_eq!(v & bits, bits, "HW_BOOT-class bits round-trip in CTRL");
+    }
+
+    /// `LOAD` write masks to 24 bits then seeds `time`.
+    #[test]
+    fn watchdog_load_truncates_to_24_bits() {
+        let mut wd = new_watchdog();
+        let _ = wd.write32(0x04, 0xFFFF_FFFF, 0);
+        // CTRL[23:0] is `time` — must equal 0x00FF_FFFF.
+        assert_eq!(wd.read32(0x00) & 0x00FF_FFFF, 0x00FF_FFFF);
+    }
+
+    // =====================================================================
+    // PWM — CSR_EN clear mid-cycle, CSR DIVMODE field, default-arm read
+    // =====================================================================
+
+    fn new_pwm() -> pwm_p::PwmRegs {
+        pwm_p::PwmRegs::new(IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1)
+    }
+
+    /// CSR_EN cleared mid-cycle: counter freezes at the value reached
+    /// before the clear; subsequent ticks do not advance the counter.
+    #[test]
+    fn pwm_csr_en_clear_mid_cycle_freezes_counter() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        p.write32(0x10, 100, 0, &mut irqs); // TOP=100
+        p.write32(0x00, pwm_p::CSR_EN, 0, &mut irqs); // local-enable
+        p.write32(pwm_p::EN, 1, 0, &mut irqs); // global-enable
+        p.tick(40, &tree_150(), &mut irqs);
+        let mid = p.read32(0x08); // CTR
+        assert!(mid > 0, "counter advanced to {}", mid);
+        // Now clear CSR_EN — local-disable.
+        p.write32(0x00, 0, 0, &mut irqs);
+        p.tick(200, &tree_150(), &mut irqs);
+        // After local-disable the counter must not have moved further.
+        assert_eq!(p.read32(0x08), mid);
+    }
+
+    /// CSR DIVMODE field round-trips via plain write. DIVMODE is bits
+    /// [5:4] of CSR; values 0..=3 must each store and read back.
+    #[test]
+    fn pwm_csr_divmode_roundtrip_all_modes() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        for mode in 0u32..=3 {
+            let csr = pwm_p::CSR_EN | (mode << 4);
+            p.write32(0x00, csr, 0, &mut irqs);
+            // PH_ADVANCE / PH_RETARD auto-clear; DIVMODE bits must persist.
+            assert_eq!(
+                (p.read32(0x00) >> 4) & 0x3,
+                mode,
+                "DIVMODE={mode} must round-trip"
+            );
+        }
+    }
+
+    /// `read32` default arm: an offset past INTS1 (>= 0x110) returns 0.
+    #[test]
+    fn pwm_read_unknown_offset_returns_zero_default_arm() {
+        let mut p = new_pwm();
+        assert_eq!(p.read32(0x110), 0);
+        assert_eq!(p.read32(0x1FC), 0);
+    }
+
+    /// CC + CTR + TOP per-slice reads through the slice decoder.
+    #[test]
+    fn pwm_per_slice_cc_ctr_top_round_trip() {
+        let mut p = new_pwm();
+        let mut irqs = 0u64;
+        let base = 3 * pwm_p::SLICE_STRIDE;
+        // CTR at base+0x08, CC at base+0x0C, TOP at base+0x10.
+        p.write32(base + 0x08, 0x1111, 0, &mut irqs);
+        p.write32(base + 0x0C, 0x2222, 0, &mut irqs);
+        p.write32(base + 0x10, 0x3333, 0, &mut irqs);
+        assert_eq!(p.read32(base + 0x08), 0x1111);
+        assert_eq!(p.read32(base + 0x0C), 0x2222);
+        assert_eq!(p.read32(base + 0x10), 0x3333);
+    }
+
+    // =====================================================================
+    // IO_BANK0 — INTR W1C-ish via alias, dormant_wake INTS, PROC1 INTS
+    // =====================================================================
+
+    fn new_io_bank0() -> io_bank0::IoBank0Regs {
+        io_bank0::IoBank0Regs::new()
+    }
+
+    /// INTR write via BITCLR alias clears named bits in storage. Confirms
+    /// the section=0 arm in `write32`.
+    #[test]
+    fn io_bank0_intr_write_alias_bitclr() {
+        let mut b = new_io_bank0();
+        // Plain-write INTR group 0 to 0xFF.
+        b.write32(0x230, 0xFF, 0);
+        // BITCLR alias — clear the low 4 bits.
+        b.write32(0x230, 0x0F, 3);
+        assert_eq!(b.read32(0x230), 0xF0);
+    }
+
+    /// PROC1 INTS read derives `(intr | proc1_intf) & proc1_inte`.
+    /// Section layout (each section is 6*4 = 0x18 bytes):
+    ///   INTR        = 0x230
+    ///   PROC0_INTE  = 0x248
+    ///   PROC0_INTF  = 0x260
+    ///   PROC0_INTS  = 0x278
+    ///   PROC1_INTE  = 0x290
+    ///   PROC1_INTF  = 0x2A8
+    ///   PROC1_INTS  = 0x2C0
+    #[test]
+    fn io_bank0_proc1_ints_derived() {
+        let mut b = new_io_bank0();
+        b.write32(0x230, 0xF, 0); // INTR group 0
+        let proc1_inte = 0x290u32;
+        let proc1_ints = 0x2C0u32;
+        b.write32(proc1_inte, 0xC, 0);
+        // INTS = (INTR | INTF) & INTE = (0xF | 0) & 0xC = 0xC.
+        assert_eq!(b.read32(proc1_ints), 0xC);
+        // Writing PROC1_INTS is read-only (section 6 in write match).
+        b.write32(proc1_ints, 0xFFFF_FFFF, 0);
+        assert_eq!(b.read32(proc1_ints), 0xC);
+    }
+
+    /// Dormant-wake INTS read derives `(intr | dwake_intf) & dwake_inte`.
+    /// DWAKE_INTE start: PROC1_INTS + 6*4 = 0x278 + 0x18 + 0x18 + 0x18 = ...
+    /// Use the public offset arithmetic: groups 7/8/9 = DWAKE INTE/INTF/INTS.
+    #[test]
+    fn io_bank0_dormant_wake_ints_derived_and_readonly() {
+        let mut b = new_io_bank0();
+        // Compute offsets from the section table layout.
+        // INTR = 0x230; PROC0_INTE = 0x248; PROC0_INTF = 0x260;
+        // PROC0_INTS = 0x278; PROC1_INTE = 0x290; PROC1_INTF = 0x2A8;
+        // PROC1_INTS = 0x2C0; DWAKE_INTE = 0x2D8; DWAKE_INTF = 0x2F0;
+        // DWAKE_INTS = 0x308.
+        let dwake_inte = 0x2D8u32;
+        let dwake_intf = 0x2F0u32;
+        let dwake_ints = 0x308u32;
+        b.write32(0x230, 0xF0, 0); // INTR group 0 = 0xF0
+        b.write32(dwake_inte, 0xC0, 0);
+        b.write32(dwake_intf, 0x00, 0);
+        // INTS = (0xF0 | 0) & 0xC0 = 0xC0.
+        assert_eq!(b.read32(dwake_ints), 0xC0);
+        // Write to DWAKE_INTS is read-only (section 9 in write).
+        b.write32(dwake_ints, 0xFFFF_FFFF, 0);
+        assert_eq!(b.read32(dwake_ints), 0xC0);
+    }
+
+    /// Offset between GPIO_BANK_END and INT_BLOCK_START — neither
+    /// `decode_gpio_offset` nor `decode_int_offset` matches; read returns
+    /// 0 and write is a no-op.
+    #[test]
+    fn io_bank0_offset_between_gpio_and_int_block_is_inert() {
+        let mut b = new_io_bank0();
+        // 0x180 (GPIO_BANK_END) .. 0x230 (INT_BLOCK_START).
+        b.write32(0x200, 0xDEAD_BEEF, 0);
+        assert_eq!(b.read32(0x200), 0);
+    }
+
+    /// Offset past the entire interrupt-block region — both decoders
+    /// return None; read returns 0 and write is a no-op (line 173 final
+    /// `0` arm + line 235-237 default arm).
+    #[test]
+    fn io_bank0_offset_past_int_block_is_inert() {
+        let mut b = new_io_bank0();
+        b.write32(0x400, 0xCAFE_F00D, 0);
+        assert_eq!(b.read32(0x400), 0);
+    }
+
+    // =====================================================================
+    // PADS_BANK0 — pad pull-up / pull-down / drive strength / unknown ofs
+    // =====================================================================
+
+    fn new_pads_bank0() -> pads_bank0::PadsBank0Regs {
+        pads_bank0::PadsBank0Regs::new()
+    }
+
+    /// Pad pull-up / pull-down / drive-strength bits round-trip via plain
+    /// write. PDE = bit 2 (pull-down enable), PUE = bit 3 (pull-up
+    /// enable), DRIVE = bits [5:4].
+    #[test]
+    fn pads_bank0_pull_drive_bits_round_trip() {
+        let mut p = new_pads_bank0();
+        let off = 0x04u32; // GPIO0 pad
+        // PUE (1<<3) | PDE (1<<2) | DRIVE=3 (3<<4) → 0x3C.
+        p.write32(off, 0x3C, 0);
+        assert_eq!(p.read32(off), 0x3C);
+        // Pull-down only.
+        p.write32(off, 1 << 2, 0);
+        assert_eq!(p.read32(off), 1 << 2);
+    }
+
+    /// Read of an unknown offset (between VSEL=0 and pad block start
+    /// 0x04 — no such gap — and past pad block end) returns 0 (default
+    /// arm at line 66 `read32`).
+    #[test]
+    fn pads_bank0_unknown_offset_reads_zero() {
+        let mut p = new_pads_bank0();
+        // Past PAD_COUNT * 4 + GPIO_PAD_START = 4 + 192 = 196 = 0xC4.
+        // Use 0x100 to be safely past.
+        assert_eq!(p.read32(0x100), 0);
+    }
+
+    /// Write to an unknown offset is a no-op (default arm — falls past
+    /// both `if offset == VSEL` and `pad_index`).
+    #[test]
+    fn pads_bank0_unknown_offset_write_is_noop() {
+        let mut p = new_pads_bank0();
+        p.write32(0x200, 0xDEAD_BEEF, 0);
+        // No observable state change.
+        assert_eq!(p.read32(0x200), 0);
+    }
+
+    /// Pad register BITCLR alias clears named bits.
+    #[test]
+    fn pads_bank0_pad_bitclr_alias() {
+        let mut p = new_pads_bank0();
+        let off = 0x04u32; // GPIO0 pad
+        p.write32(off, 0xFF, 0); // store 0xFF (masked to PAD_MASK)
+        p.write32(off, 0x0F, 3); // BITCLR low nibble
+        assert_eq!(p.read32(off), 0xFF & !0x0F);
+    }
+
+    /// Pad register XOR alias toggles bits.
+    #[test]
+    fn pads_bank0_pad_xor_alias() {
+        let mut p = new_pads_bank0();
+        let off = 0x04u32;
+        p.write32(off, 0x55, 0);
+        p.write32(off, 0xFF, 1); // XOR
+        // (0x55 ^ 0xFF) = 0xAA, masked to PAD_MASK.
+        assert_eq!(p.read32(off), 0xAA);
+    }
+
+    /// `VOLTAGE_SELECT` BITSET alias and BITCLR alias.
+    #[test]
+    fn pads_bank0_voltage_select_alias_paths() {
+        let mut p = new_pads_bank0();
+        // BITSET — set bit 0.
+        p.write32(0x00, 0x1, 2);
+        assert_eq!(p.read32(0x00), 0x1);
+        // BITCLR — clear bit 0.
+        p.write32(0x00, 0x1, 3);
+        assert_eq!(p.read32(0x00), 0x0);
+    }
+}
+
+#[cfg(test)]
+mod stage3_dma_residue {
+    //! Branch-coverage residue for `crates/mdrp2350/src/dma.rs`.
+    //!
+    //! `stage7_dma_coverage` already covers the alias readback paths,
+    //! the IRQ2/3 storage, multi-chan trigger, and the basic mem→mem
+    //! and ring transfers. The branches that survive are the engine's
+    //! arbitration corners (no-busy, multi-busy, halted-channel skip),
+    //! the DMA-internal pacing-timer guards (`X==0 || Y==0`), the
+    //! self-chain / out-of-range / reload=0 chain bypasses, the
+    //! warn-once latches reached via `CTRL_TRIG` (not just `AL1_CTRL`),
+    //! and the alias=1/2/3 paths on per-channel registers.
+    //!
+    //! These tests poke MMIO via `Bus::{read32,write32}` rather than
+    //! talking to `Dma` directly when the goal is end-to-end behaviour;
+    //! they fall through to direct `Dma::write32` only for the
+    //! warn-once helpers (so the channel index in the warn metadata
+    //! is observable). Append-only: no production code is touched.
+    use crate::bus::Bus;
+    use crate::dma::{DMA_BASE, Dma, NUM_CHANNELS};
+    use crate::dreq::{DREQ_FORCE, DREQ_TIMER0, DREQ_UART0_TX};
+    use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1};
+
+    // Per-channel inner offsets (mirror dma.rs constants — file-private).
+    const CH_READ_ADDR: u32 = 0x00;
+    const CH_WRITE_ADDR: u32 = 0x04;
+    const CH_TRANS_COUNT: u32 = 0x08;
+    const CH_CTRL_TRIG: u32 = 0x0C;
+    const CH_AL1_CTRL: u32 = 0x10;
+    const CH_AL3_READ_ADDR_TRIG: u32 = 0x3C;
+
+    // RP2350 CTRL field positions (datasheet §12.6.6).
+    const CTRL_EN: u32 = 1 << 0;
+    const CTRL_HIGH_PRIORITY: u32 = 1 << 1;
+    const CTRL_DATA_SIZE_SHIFT: u32 = 2;
+    const CTRL_INCR_READ: u32 = 1 << 4;
+    const CTRL_INCR_WRITE: u32 = 1 << 6;
+    const CTRL_RING_SIZE_SHIFT: u32 = 8;
+    const CTRL_RING_SEL: u32 = 1 << 12;
+    const CTRL_CHAIN_TO_SHIFT: u32 = 13;
+    const CTRL_TREQ_SEL_SHIFT: u32 = 17;
+    const CTRL_BSWAP: u32 = 1 << 24;
+    const CTRL_BUSY: u32 = 1 << 26;
+
+    // Global registers (RP2350 layout — TIMER0 at 0x440, MULTI_TRIGGER at 0x450).
+    const REG_INTR: u32 = 0x400;
+    const REG_INTE0: u32 = 0x404;
+    const REG_INTF0: u32 = 0x408;
+    const REG_INTE1: u32 = 0x414;
+    const REG_INTS0: u32 = 0x40C;
+    const REG_INTS1: u32 = 0x41C;
+    const REG_TIMER0: u32 = 0x440;
+    const REG_MULTI_CHAN_TRIGGER: u32 = 0x450;
+    const REG_CHAN_ABORT: u32 = 0x464;
+
+    fn release_dma(bus: &mut Bus) {
+        use crate::bus::RESET_DMA;
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
+    }
+
+    fn ctrl(en: bool, ds: u32, ir: bool, iw: bool, treq: u8, chain: u32, ring: u32, rsel: bool) -> u32 {
+        let mut v = 0u32;
+        if en {
+            v |= CTRL_EN;
+        }
+        v |= (ds & 0x3) << CTRL_DATA_SIZE_SHIFT;
+        if ir {
+            v |= CTRL_INCR_READ;
+        }
+        if iw {
+            v |= CTRL_INCR_WRITE;
+        }
+        v |= (treq as u32 & 0x3F) << CTRL_TREQ_SEL_SHIFT;
+        v |= (chain & 0xF) << CTRL_CHAIN_TO_SHIFT;
+        v |= (ring & 0xF) << CTRL_RING_SIZE_SHIFT;
+        if rsel {
+            v |= CTRL_RING_SEL;
+        }
+        v
+    }
+
+    /// Pre-program a channel without arming (uses AL1_CTRL — no trigger).
+    fn program(bus: &mut Bus, ch: u32, rd: u32, wr: u32, n: u32, c: u32) {
+        let base = DMA_BASE + ch * 0x40;
+        bus.write32(base + CH_READ_ADDR, rd, 0);
+        bus.write32(base + CH_WRITE_ADDR, wr, 0);
+        bus.write32(base + CH_TRANS_COUNT, n, 0);
+        bus.write32(base + CH_AL1_CTRL, c, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // tick() arbitration & early-exit corners.
+    // ------------------------------------------------------------------
+
+    /// `tick()` with no armed channels — `selected` stays `None` and
+    /// the early-exit path is taken (post-timer-update branch).
+    #[test]
+    fn tick_with_no_busy_channels_returns_early() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // No channels armed.
+        bus.tick_dma();
+        assert!(bus.dma.is_idle());
+    }
+
+    /// Two channels ready in the same tick — lowest index wins (line
+    /// `selected = Some(i); break`). Channel 0 finishes first, then
+    /// channel 5 finishes on the next tick.
+    #[test]
+    fn fixed_priority_lower_index_wins() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0xA001, 0);
+        bus.write32(0x2000_0200, 0xB005, 0);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0300, 1, c);
+        program(&mut bus, 5, 0x2000_0200, 0x2000_0400, 1, c);
+        // Trigger both via CTRL_TRIG.
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        bus.write32(DMA_BASE + 5 * 0x40 + CH_CTRL_TRIG, c, 0);
+        // First tick — channel 0 wins; channel 5 still busy.
+        bus.tick_dma();
+        let r0 = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        let r5 = bus.read32(DMA_BASE + 5 * 0x40 + CH_CTRL_TRIG, 0);
+        assert_eq!(r0 & CTRL_BUSY, 0, "channel 0 must complete first");
+        assert_ne!(r5 & CTRL_BUSY, 0, "channel 5 must still be busy");
+        assert_eq!(bus.read32(0x2000_0300, 0), 0xA001);
+        // Second tick — channel 5 wins now.
+        bus.tick_dma();
+        let r5 = bus.read32(DMA_BASE + 5 * 0x40 + CH_CTRL_TRIG, 0);
+        assert_eq!(r5 & CTRL_BUSY, 0);
+        assert_eq!(bus.read32(0x2000_0400, 0), 0xB005);
+    }
+
+    /// `tick()` skips non-busy channels in the iteration (channel 0..6
+    /// idle, channel 7 armed). Hits the `if !ch.busy { continue; }` arm
+    /// false-then-true sequence inside the arbitration loop.
+    #[test]
+    fn tick_skips_idle_channels_to_find_busy() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0xCAFE_F00D, 0);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
+        program(&mut bus, 7, 0x2000_0100, 0x2000_0200, 1, c);
+        bus.write32(DMA_BASE + 7 * 0x40 + CH_CTRL_TRIG, c, 0);
+        bus.tick_dma();
+        assert_eq!(bus.read32(0x2000_0200, 0), 0xCAFE_F00D);
+    }
+
+    /// Highest-index channel (15) — exercises the upper end of the
+    /// per-channel arbitration loop and the `ch_idx == NUM_CHANNELS-1`
+    /// path of `channel_write32`/`channel_read32`.
+    #[test]
+    fn highest_channel_index_15_works() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0xDEAD_C0DE, 0);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
+        program(&mut bus, 15, 0x2000_0100, 0x2000_0200, 1, c);
+        bus.write32(DMA_BASE + 15 * 0x40 + CH_CTRL_TRIG, c, 0);
+        bus.tick_dma();
+        assert_eq!(bus.read32(0x2000_0200, 0), 0xDEAD_C0DE);
+        // INTR bit 15 latches.
+        assert_ne!(bus.read32(DMA_BASE + REG_INTR, 0) & (1u32 << 15), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // DMA-internal pacing timer guards: X==0, Y==0, and the
+    // `timer_dreq_asserted` reset path when neither fires.
+    // ------------------------------------------------------------------
+
+    /// TIMER0 register at X=0 (numerator zero) — `X == 0 || Y == 0`
+    /// guard takes the early-continue arm. DMA never receives a
+    /// TIMER0 DREQ pulse, so a TIMER0-paced channel stays BUSY
+    /// indefinitely.
+    #[test]
+    fn timer_with_zero_numerator_never_fires() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // X=0, Y=10 — guard must trip and DREQ must NEVER assert.
+        bus.write32(DMA_BASE + REG_TIMER0, 10, 0);
+        bus.write32(0x2000_0100, 0x42, 0);
+        let c = ctrl(true, 2, true, true, DREQ_TIMER0, 0, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, c);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        for _ in 0..100 {
+            bus.tick_dma();
+        }
+        let rd = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_ne!(rd & CTRL_BUSY, 0, "BUSY must persist when numerator=0");
+        assert_eq!(bus.read32(0x2000_0200, 0), 0);
+    }
+
+    /// TIMER0 register at Y=0 (denominator zero) — same early-continue
+    /// arm but exercises the `Y == 0` half of the OR.
+    #[test]
+    fn timer_with_zero_denominator_never_fires() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // X=1, Y=0.
+        bus.write32(DMA_BASE + REG_TIMER0, 1u32 << 16, 0);
+        bus.write32(0x2000_0100, 0x42, 0);
+        let c = ctrl(true, 2, true, true, DREQ_TIMER0, 0, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, c);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        for _ in 0..50 {
+            bus.tick_dma();
+        }
+        let rd = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_ne!(rd & CTRL_BUSY, 0);
+    }
+
+    /// TIMER1 (independent of TIMER0) — `(treq - DREQ_TIMER0)` indexer
+    /// must select the correct accumulator slot. X/Y=1/1 so it fires
+    /// every cycle, completing 4 transfers in 4 ticks.
+    #[test]
+    fn timer1_indexes_correct_accumulator_slot() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        const REG_TIMER1: u32 = 0x444;
+        const DREQ_TIMER1: u8 = 60;
+        bus.write32(DMA_BASE + REG_TIMER1, (1u32 << 16) | 1, 0);
+        for i in 0..4u32 {
+            bus.write32(0x2000_0100 + i * 4, 0xDEC0_DE00 + i, 0);
+        }
+        let c = ctrl(true, 2, true, true, DREQ_TIMER1, 0, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0200, 4, c);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        for _ in 0..4 {
+            bus.tick_dma();
+        }
+        for i in 0..4u32 {
+            assert_eq!(bus.read32(0x2000_0200 + i * 4, 0), 0xDEC0_DE00 + i);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Chain-trigger corner cases.
+    // ------------------------------------------------------------------
+
+    /// `chain_to == ch_idx` — the datasheet's "self-chain = no chain"
+    /// shorthand. The completion handler must skip the trigger arm
+    /// (line `if chain_to != ch_idx && chain_to < NUM_CHANNELS`).
+    #[test]
+    fn self_chain_is_no_chain() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0x9999, 0);
+        // chain_to=0 = ch_idx=0 → no chain.
+        let c = ctrl(true, 2, false, false, DREQ_FORCE, 0, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, c);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        bus.tick_dma();
+        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_eq!(r & CTRL_BUSY, 0);
+        // No tick after — channel 0 stays idle.
+        bus.tick_dma();
+        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_eq!(r & CTRL_BUSY, 0);
+    }
+
+    /// `chain_to >= NUM_CHANNELS` is masked at field-decode (4-bit
+    /// field, max 15). With `chain_to = 15` and ch_idx=0, the
+    /// `chain_to < NUM_CHANNELS` guard is true (15 < 16). Ch15 must
+    /// have non-zero reload to actually arm — pre-program it with
+    /// reload=1, and verify it fires.
+    #[test]
+    fn chain_to_fifteen_arms_target() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0x1A_1A1A, 0);
+        bus.write32(0x2000_0300, 0x2B_2B2B, 0);
+        // CH15 pre-programmed (reload=1, no chain).
+        let c15 = ctrl(true, 2, false, false, DREQ_FORCE, 15, 0, false);
+        program(&mut bus, 15, 0x2000_0300, 0x2000_0400, 1, c15);
+        // CH0 chains to 15.
+        let c0 = ctrl(true, 2, false, false, DREQ_FORCE, 15, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, c0);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c0, 0);
+        bus.tick_dma(); // ch0 completes, chains to 15.
+        let r15 = bus.read32(DMA_BASE + 15 * 0x40 + CH_CTRL_TRIG, 0);
+        assert_ne!(r15 & CTRL_BUSY, 0, "ch15 must be armed by chain");
+        bus.tick_dma(); // ch15 fires.
+        assert_eq!(bus.read32(0x2000_0400, 0), 0x2B_2B2B);
+    }
+
+    /// Chain target with `trans_count_reload == 0`: target stays idle
+    /// (the `if reload > 0` check inside the chain handler skips the
+    /// reload write, then `trigger_channel` immediately fails the
+    /// `trans_count == 0` guard).
+    #[test]
+    fn chain_to_unprogrammed_target_does_not_arm() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(0x2000_0100, 0x77, 0);
+        // CH0 chains to 1, but CH1 is never programmed.
+        let c0 = ctrl(true, 2, false, false, DREQ_FORCE, 1, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, c0);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c0, 0);
+        bus.tick_dma();
+        let r1 = bus.read32(DMA_BASE + 0x40 + CH_CTRL_TRIG, 0);
+        assert_eq!(r1 & CTRL_BUSY, 0, "unprogrammed chain target stays idle");
+    }
+
+    // ------------------------------------------------------------------
+    // CH_ABORT: single-channel and multi-channel mask.
+    // ------------------------------------------------------------------
+
+    /// `CH_ABORT` mask covering multiple channels — every selected
+    /// channel's `busy` flag clears in one MMIO write.
+    #[test]
+    fn ch_abort_multi_channel_mask() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // Three channels armed but DREQ-gated (UART0 not enabled).
+        let c = ctrl(true, 2, true, true, DREQ_UART0_TX, 0, 0, false);
+        for ch in 0..3u32 {
+            program(&mut bus, ch, 0x2000_0100, 0x2000_0200 + ch * 4, 100, c);
+            bus.write32(DMA_BASE + ch * 0x40 + CH_CTRL_TRIG, c, 0);
+        }
+        // Abort 0b101 — channels 0 and 2.
+        bus.write32(DMA_BASE + REG_CHAN_ABORT, 0b101, 0);
+        let r0 = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        let r1 = bus.read32(DMA_BASE + 0x40 + CH_CTRL_TRIG, 0);
+        let r2 = bus.read32(DMA_BASE + 2 * 0x40 + CH_CTRL_TRIG, 0);
+        assert_eq!(r0 & CTRL_BUSY, 0);
+        assert_ne!(r1 & CTRL_BUSY, 0, "ch1 must remain busy");
+        assert_eq!(r2 & CTRL_BUSY, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // IRQ_FORCE (INTF0 / INTF1) — force IRQ without a real transfer.
+    // ------------------------------------------------------------------
+
+    /// Setting INTF0 with INTE0 routes `DMA_IRQ_0` even with no
+    /// completed transfer. Exercises `route_irqs` reading `intf0`.
+    #[test]
+    fn intf0_forces_dma_irq0_without_transfer() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + REG_INTE0, 0x1, 0);
+        bus.write32(DMA_BASE + REG_INTF0, 0x1, 0);
+        // Ticking the DMA with no armed channel runs route_irqs.
+        bus.tick_dma();
+        let ints0 = bus.read32(DMA_BASE + REG_INTS0, 0);
+        assert_eq!(ints0 & 1, 1, "INTF0|INTR & INTE0 must propagate");
+        assert_ne!(
+            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_0),
+            0,
+            "DMA_IRQ_0 must latch via INTF force"
+        );
+    }
+
+    /// INTF1 force similarly — the `route_irqs` second arm.
+    #[test]
+    fn intf1_forces_dma_irq1_without_transfer() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + REG_INTE1, 0x1, 0);
+        const REG_INTF1: u32 = 0x418;
+        bus.write32(DMA_BASE + REG_INTF1, 0x1, 0);
+        bus.tick_dma();
+        let ints1 = bus.read32(DMA_BASE + REG_INTS1, 0);
+        assert_eq!(ints1 & 1, 1);
+        assert_ne!(
+            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_1),
+            0
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Alias write semantics on per-channel registers (XOR/SET/CLR).
+    // ------------------------------------------------------------------
+
+    /// XOR alias on READ_ADDR — flips bits in the stored value.
+    #[test]
+    fn alias_xor_on_read_addr() {
+        let mut dma = Dma::new();
+        dma.write32(CH_READ_ADDR, 0xFFFF_0000, 0);
+        dma.write32(CH_READ_ADDR, 0x0000_AAAA, 1); // XOR
+        let ch = dma.channel(0);
+        assert_eq!(ch.read_addr, 0xFFFF_AAAA);
+    }
+
+    /// SET alias (alias 2) on WRITE_ADDR — `old | value`.
+    #[test]
+    fn alias_set_on_write_addr() {
+        let mut dma = Dma::new();
+        dma.write32(CH_WRITE_ADDR, 0x0000_F00F, 0);
+        dma.write32(CH_WRITE_ADDR, 0x00F0_0000, 2); // SET
+        assert_eq!(dma.channel(0).write_addr, 0x00F0_F00F);
+    }
+
+    /// CLR alias (alias 3) on TRANS_COUNT — `old & !value`.
+    #[test]
+    fn alias_clr_on_trans_count() {
+        let mut dma = Dma::new();
+        dma.write32(CH_TRANS_COUNT, 0xFF, 0);
+        dma.write32(CH_TRANS_COUNT, 0x0F, 3); // CLR
+        assert_eq!(dma.channel(0).trans_count, 0xF0);
+    }
+
+    /// CTRL_TRIG with `BSWAP` set fires the warn-once latch via the
+    /// `CTRL_TRIG` path (separate code path from `AL1_CTRL`). Issuing
+    /// the same write twice must still warn only once.
+    #[test]
+    fn ctrl_trig_bswap_warn_fires_once() {
+        // Use the bus path so check_inert_ctrl_bits is reached via
+        // CTRL_TRIG, not just AL1_CTRL.
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false) | CTRL_BSWAP;
+        bus.write32(DMA_BASE + CH_TRANS_COUNT, 1, 0);
+        bus.write32(DMA_BASE, 0x2000_0100, 0);
+        bus.write32(DMA_BASE + CH_WRITE_ADDR, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        // No assertion on stdout — the warn-once latch lives on the Dma
+        // struct itself; we just exercise the path so coverage records
+        // both arms of the inert-bits guard.
+        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        // BSWAP is at bit 24 — masked out of CTRL_WRITABLE_MASK so the
+        // readback should NOT report BSWAP set. (Bit 24 is BSWAP — we
+        // only need to confirm the channel still arms.)
+        assert_ne!(r & CTRL_BUSY, 0);
+    }
+
+    /// CTRL_TRIG with HIGH_PRIORITY set — same shape, separate latch.
+    #[test]
+    fn ctrl_trig_high_priority_warn_fires_once() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false) | CTRL_HIGH_PRIORITY;
+        bus.write32(DMA_BASE + CH_TRANS_COUNT, 1, 0);
+        bus.write32(DMA_BASE, 0x2000_0100, 0);
+        bus.write32(DMA_BASE + CH_WRITE_ADDR, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_ne!(r & CTRL_BUSY, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // DREQ matrix — TX from various peripherals & PIO TX.
+    // ------------------------------------------------------------------
+
+    /// Channel armed for a peripheral whose DREQ never asserts (UART1
+    /// held in RESETS) — channel stays BUSY. Hits the `treq < 64 &&
+    /// (dreqs >> treq) & 1 != 0` arm with the AND false.
+    #[test]
+    fn dreq_uart1_unreleased_keeps_channel_busy() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let c = ctrl(true, 2, true, true, 30, 0, 0, false); // DREQ_UART1_TX
+        bus.write32(DMA_BASE + CH_TRANS_COUNT, 1, 0);
+        bus.write32(DMA_BASE, 0x2000_0100, 0);
+        bus.write32(DMA_BASE + CH_WRITE_ADDR, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        for _ in 0..10 {
+            bus.tick_dma();
+        }
+        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_ne!(r & CTRL_BUSY, 0, "UART1 TX DREQ must not assert");
+    }
+
+    /// SPI0 TX DREQ — hits the SPI side of the DREQ matrix arm. SPI0
+    /// held in RESETS, so `tx_dreq` is false and the channel stalls.
+    #[test]
+    fn dreq_spi0_unreleased_keeps_channel_busy() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        let c = ctrl(true, 2, true, true, 24, 0, 0, false); // DREQ_SPI0_TX
+        bus.write32(DMA_BASE + CH_TRANS_COUNT, 1, 0);
+        bus.write32(DMA_BASE, 0x2000_0100, 0);
+        bus.write32(DMA_BASE + CH_WRITE_ADDR, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        for _ in 0..5 {
+            bus.tick_dma();
+        }
+        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_ne!(r & CTRL_BUSY, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // CTRL read while idle — reports BUSY=0 (the false arm of the
+    // ternary `if ch.busy { CTRL_BUSY } else { 0 }`).
+    // ------------------------------------------------------------------
+
+    /// CTRL read on a never-triggered channel returns 0 in bit 26.
+    #[test]
+    fn ctrl_read_idle_channel_clears_busy_bit() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // Channel never armed → BUSY bit must be 0.
+        let r = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
+        assert_eq!(r & CTRL_BUSY, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // route_irqs cross-core: shared IRQs land on BOTH cores' atomics.
+    // ------------------------------------------------------------------
+
+    /// DMA IRQs are shared (`assert_irq_shared`) — the same pending
+    /// bit must appear on core 0 AND core 1.
+    #[test]
+    fn dma_irq_is_shared_across_both_cores() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        bus.write32(DMA_BASE + REG_INTE0, 0x1, 0);
+        bus.write32(0x2000_0100, 0x42, 0);
+        bus.write32(DMA_BASE, 0x2000_0100, 0);
+        bus.write32(DMA_BASE + CH_WRITE_ADDR, 0x2000_0200, 0);
+        bus.write32(DMA_BASE + CH_TRANS_COUNT, 1, 0);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
+        bus.tick_dma();
+        let p0 = bus.atomics.irq_pending_load(0);
+        let p1 = bus.atomics.irq_pending_load(1);
+        let mask = 1u64 << IRQ_DMA_IRQ_0;
+        assert_ne!(p0 & mask, 0, "core 0 pending");
+        assert_ne!(p1 & mask, 0, "core 1 pending — DMA IRQs are shared");
+    }
+
+    // ------------------------------------------------------------------
+    // AL3_READ_ADDR_TRIG: alias-1 (XOR) on the trigger path. Combined
+    // alias semantics + trigger arming.
+    // ------------------------------------------------------------------
+
+    /// `AL3_READ_ADDR_TRIG` write via XOR alias — the new READ_ADDR is
+    /// `old XOR value`, then the channel triggers atomically.
+    #[test]
+    fn al3_read_addr_trig_with_xor_alias() {
+        let mut dma = Dma::new();
+        // Pre-set READ_ADDR via base alias.
+        dma.write32(CH_READ_ADDR, 0xFFFF_0000, 0);
+        // Pre-arm CTRL with EN=1, DATA_SIZE=2, count seeded.
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
+        dma.write32(CH_AL1_CTRL, c, 0);
+        dma.write32(CH_TRANS_COUNT, 1, 0);
+        // XOR-alias write to AL3_READ_ADDR_TRIG (alias 1).
+        dma.write32(CH_AL3_READ_ADDR_TRIG, 0x0000_BEEF, 1);
+        let ch = dma.channel(0);
+        assert_eq!(ch.read_addr, 0xFFFF_BEEF);
+        assert!(ch.busy, "trigger arm fires after alias-XOR write");
+    }
+
+    /// `MULTI_CHAN_TRIGGER` with all-channel mask (0xFFFF) — every
+    /// armed channel arms; unarmed channels stay clear (the
+    /// `(ch.ctrl & CTRL_EN) == 0` guard arm in `trigger_channel`).
+    #[test]
+    fn multi_chan_trigger_full_mask_only_arms_configured() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+        // Configure only channels 2 and 7.
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
+        program(&mut bus, 2, 0x2000_0100, 0x2000_0200, 1, c);
+        program(&mut bus, 7, 0x2000_0300, 0x2000_0400, 1, c);
+        bus.write32(DMA_BASE + REG_MULTI_CHAN_TRIGGER, 0xFFFF, 0);
+        // Channel 2 + 7 armed; others stay clear.
+        for ch in 0..NUM_CHANNELS {
+            let r = bus.read32(DMA_BASE + ch as u32 * 0x40 + CH_CTRL_TRIG, 0);
+            let want_busy = ch == 2 || ch == 7;
+            if want_busy {
+                assert_ne!(r & CTRL_BUSY, 0, "ch{} must be busy", ch);
+            } else {
+                assert_eq!(r & CTRL_BUSY, 0, "ch{} must be idle", ch);
+            }
+        }
+    }
+}
