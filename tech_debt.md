@@ -594,24 +594,6 @@ harness is available to measure the real cycle count. Same caveat
 applies to the other hardcoded M0+ cycle counts in the same file
 (`LDR`, `LDM`, `B`, `BL`, `ADDS`).
 
-### Thumb-32 subset not QEMU-differentially validated
-
-`qemu_diff_m0plus` uses the `is_m0plus_safe` filter in
-`crates/mdpicoem-harness/src/lib.rs` which rejects every `TestCase` with
-`hw1.is_some()` — i.e., all 32-bit-wide Thumb encodings. Phase 4.B
-shipped ~700 lines of Thumb-32 executor code (`execute_wide.rs`) for
-`BL`, `MRS`, `MSR`, `DSB`, `DMB`, `ISB` with **unit-test-only
-coverage**; the QEMU differential oracle never exercises these paths.
-
-Fix: extend the fuzz generator (or add a new M0+-specific wide-subset
-generator) to produce valid `BL`/`MRS`/`MSR`/`DSB`/`DMB`/`ISB` test
-cases, then relax `is_m0plus_safe` to allow them through. Medium
-priority — unit tests cover the known happy paths but a
-differential oracle would catch decode/flag/SYSm corner cases that
-unit tests tend to miss. This entry supersedes the older "Thumb-32
-Test Generators" section above for the M0+-specific subset; the
-mdrp2350 T32 generator work remains pending separately.
-
 ### Exception entry/exit not differentially validated
 
 `qemu_diff_m33` and `qemu_diff_m0plus` single-step individual
