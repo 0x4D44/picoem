@@ -96,18 +96,19 @@ start() {
         fi
 
         echo "  worker $i: shard=$(wc -l < "$shard") mutants → $results"
-        # Override the workspace's release profile to disable fat LTO.
-        # Default profile.release in Cargo.toml has lto="fat" + codegen-units=1
-        # for chip libs; per-mutant rebuild then takes ~100 s. With LTO off
-        # and codegen-units=16, steady-state rebuild drops to ~15 s. Mutation
-        # detection only depends on oracle CORRECTNESS, not its exact
-        # optimisation profile, so this is safe.
+        # Override the workspace's release profile via cargo --config:
+        # default profile.release has lto="fat" + per-package codegen-units=1
+        # for the chip libs; per-mutant rebuild then takes ~100 s. With LTO
+        # off and codegen-units=16 (workspace + chip-package overrides),
+        # steady-state rebuild drops to ~20 s. Mutation detection only
+        # depends on oracle CORRECTNESS, not its exact optimisation
+        # profile, so this is safe.
+        # Note: env vars CARGO_PROFILE_RELEASE_PACKAGE_*_CODEGEN_UNITS
+        # don't take effect in cargo (per-package overrides are
+        # config-only); --config is the supported path.
         (
             cd "$w"
-            nohup setsid env \
-                CARGO_PROFILE_RELEASE_LTO=off \
-                CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
-                python3 scripts/v2_mutation_runner.py \
+            nohup setsid python3 scripts/v2_mutation_runner.py \
                 --missed "$shard" \
                 --skip-done \
                 --fuzz 200 \
@@ -115,6 +116,14 @@ start() {
                 --catalog-path "$w/mutation/v2/mutants_catalog.json" \
                 --results-path "$results" \
                 --log-path "$logf" \
+                --cargo-arg --config \
+                --cargo-arg 'profile.release.lto=false' \
+                --cargo-arg --config \
+                --cargo-arg 'profile.release.codegen-units=16' \
+                --cargo-arg --config \
+                --cargo-arg 'profile.release.package.mdrp2350.codegen-units=16' \
+                --cargo-arg --config \
+                --cargo-arg 'profile.release.package.mdrp2040.codegen-units=16' \
                 "${extra[@]}" \
                 >> "$logf" 2>&1 < /dev/null &
             echo "$!" > "$PARA_DIR/pid.$i"

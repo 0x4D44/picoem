@@ -135,10 +135,14 @@ def revert(file_path: Path, original: bytes) -> None:
     file_path.write_bytes(original)
 
 
+CARGO_EXTRA_ARGS = []  # populated from --cargo-arg in main()
+
+
 def build_oracle(oracle: str) -> tuple[bool, str]:
     """Run cargo build for the oracle binary. Returns (success, stderr)."""
     cmd = [
         "cargo", "build", "--release",
+        *CARGO_EXTRA_ARGS,
         "-p", "mdpicoem-harness",
         "--bin", oracle,
     ]
@@ -303,8 +307,15 @@ def main():
     ap.add_argument("--catalog-path", help="override catalog JSON path")
     ap.add_argument("--results-path", help="override results.jsonl path")
     ap.add_argument("--log-path", help="override runner.log path")
+    ap.add_argument("--cargo-arg", action="append", default=[],
+                    help="extra arg for the cargo build invocation "
+                         "(repeat). Example: --cargo-arg "
+                         "--config --cargo-arg "
+                         "'profile.release.lto=false'")
     args = ap.parse_args()
     _set_paths(args.catalog_path, args.results_path, args.log_path)
+    global CARGO_EXTRA_ARGS
+    CARGO_EXTRA_ARGS = args.cargo_arg
 
     if not (args.missed or args.names or args.sample or args.retry_survivors):
         ap.error("specify --missed, --names, --sample, or --retry-survivors")
