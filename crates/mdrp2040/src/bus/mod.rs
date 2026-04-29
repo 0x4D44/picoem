@@ -1612,22 +1612,22 @@ impl Bus {
         match low {
             // NVIC_ISER0: write-1-to-SET the enable bit.
             0xE100 => {
-                n.enabled |= val;
+                n.enabled |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICER0: write-1-to-CLEAR the enable bit.
             0xE180 => {
-                n.enabled &= !val;
+                n.enabled &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_ISPR0: write-1-to-SET the pending bit.
             0xE200 => {
-                n.pending |= val;
+                n.pending |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICPR0: write-1-to-CLEAR the pending bit.
             0xE280 => {
-                n.pending &= !val;
+                n.pending &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_IPR0..7: 4×u8 priority bytes, each masked to the
@@ -2575,6 +2575,21 @@ mod tests {
         let mut bus = Bus::new();
         bus.write32(0xE000_E100, 1u32 << 0);
         assert_eq!(bus.read32(0xE000_E100), 1u32 << 0);
+    }
+
+    #[test]
+    fn nvic_high_bits_razwi() {
+        // RP2040 has 26 IRQ lines (bits 0..=25). Writes to ISER0/ICER0/
+        // ISPR0/ICPR0 with bits 26..31 set must be silently dropped on
+        // real silicon (RAZ/WI). Reads naturally RAZ since the field
+        // never has high bits set.
+        let mut bus = Bus::new();
+        // ISER0: write all-ones, expect only the 26 implemented bits.
+        bus.write32(0xE000_E100, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E100), 0x03FF_FFFF);
+        // ISPR0: same shape.
+        bus.write32(0xE000_E200, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E200), 0x03FF_FFFF);
     }
 
     // ----- ADC + PWM bus integration (Phase 3) --------------------------

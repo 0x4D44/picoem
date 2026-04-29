@@ -67,6 +67,11 @@ pub const IRQ_RTC_IRQ: u32 = 25;
 /// Total number of RP2040 IRQ lines routed to the NVIC (0..=25).
 pub const IRQ_COUNT: u32 = 26;
 
+/// Bitmask of architecturally-implemented NVIC IRQ lines (bits 0..=25).
+/// Bits 26..31 are RAZ/WI on real silicon — apply this mask to writes
+/// that target ISER0/ICER0/ISPR0/ICPR0 to match that behaviour.
+pub const IRQ_LINE_MASK: u32 = (1 << IRQ_COUNT) - 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;
