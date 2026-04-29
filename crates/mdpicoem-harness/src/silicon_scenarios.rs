@@ -25,14 +25,24 @@ pub const RESETS_RESET_DONE: u32 = RESETS_BASE + 0x08;
 pub const ALIAS_SET: u32 = 0x2000;
 pub const ALIAS_CLR: u32 = 0x3000;
 
-/// RESETS bits used by scenarios and cleanup.
+/// RESETS bits used by scenarios and cleanup. Bit positions track
+/// `crates/mdrp2350/src/bus/mod.rs:175-223` (the canonical table) — the
+/// constants below are the absolute u32 bitmasks used in
+/// `RESETS_RESET +/- ALIAS_*` writes.
 pub const RESET_ADC: u32 = 1 << 0;
+pub const RESET_I2C0: u32 = 1 << 4;
 pub const RESET_IO_BANK0: u32 = 1 << 6;
 pub const RESET_PADS_BANK0: u32 = 1 << 9;
 pub const RESET_PIO0: u32 = 1 << 11;
 pub const RESET_PIO1: u32 = 1 << 12;
 pub const RESET_PLL_SYS: u32 = 1 << 14;
+pub const RESET_PWM: u32 = 1 << 16;
+pub const RESET_SPI0: u32 = 1 << 18;
 pub const RESET_UART0: u32 = 1 << 26;
+// NOTE: WATCHDOG is NOT reset-gated on RP2350 (`reset_bit_for_base` in
+// `crates/mdrp2350/src/bus/mod.rs:264` has no entry for WATCHDOG_BASE),
+// so Track 4 watchdog scenarios skip the RESETS pulse and clear CTRL
+// directly via MMIO before reprogramming.
 
 // PIO register offsets (identical for all three PIO blocks).
 pub const PIO_CTRL_OFF: u32 = 0x000;
@@ -1008,10 +1018,47 @@ pub const PWM_BASE_RP2350: u32 = 0x400A_8000;
 const PWM_SLICE0_CSR: u32 = PWM_BASE_RP2350;
 const PWM_SLICE0_DIV: u32 = PWM_BASE_RP2350 + 0x04;
 const PWM_SLICE0_CTR: u32 = PWM_BASE_RP2350 + 0x08;
+/// PWM slice-0 CC register (`+0x0C`) — channel-A/B compare values
+/// packed [31:16]/[15:0]. Used by `pwm_slice0_duty_cc_observed`.
+const PWM_SLICE0_CC: u32 = PWM_BASE_RP2350 + 0x0C;
 const PWM_SLICE0_TOP: u32 = PWM_BASE_RP2350 + 0x10;
 const PWM_EN_OFFSET: u32 = PWM_BASE_RP2350 + 0xF0;
 const PWM_INTR_OFFSET: u32 = PWM_BASE_RP2350 + 0xF4;
 const PWM_CSR_EN_BIT: u32 = 1 << 0;
+
+// Track 4 — additional UART / SPI / I2C / ADC offset constants used by
+// the under-covered-peripheral scenarios appended to the catalogue.
+// All offsets verified against the corresponding peripheral source
+// files in `crates/mdrp2350/src/peripherals/`.
+
+/// UART `UARTRIS` (raw interrupt status, RO) at `+0x3C`.
+const UART_UARTRIS: u32 = 0x3C;
+/// UART `UARTIFLS` (FIFO interrupt level select) at `+0x34`.
+const UART_UARTIFLS: u32 = 0x34;
+
+/// SPI `SSPSR` (status, RO) at `+0x0C`.
+const SPI_SSPSR: u32 = 0x0C;
+/// SPI `SSPCPSR` (clock prescale) at `+0x10`.
+const SPI_SSPCPSR: u32 = 0x10;
+
+/// I2C `IC_CON` at `+0x00`. Note: writes only land while
+/// `IC_ENABLE.bit0 = 0` (see `i2c.rs:382`).
+const I2C_IC_CON: u32 = 0x00;
+/// I2C `IC_RAW_INTR_STAT` at `+0x34`.
+const I2C_IC_RAW_INTR_STAT: u32 = 0x34;
+
+/// ADC `DIV` (sample-rate divider) at `+0x10`.
+const ADC_DIV: u32 = 0x10;
+
+/// WATCHDOG base (RP2350 `0x400D_8000`, pico-sdk `hardware_regs/watchdog.h`,
+/// see `crates/mdrp2350/src/peripherals/watchdog.rs:48`). NOT reset-gated
+/// on RP2350.
+pub const WATCHDOG_BASE: u32 = 0x400D_8000;
+const WATCHDOG_CTRL: u32 = 0x00;
+const WATCHDOG_LOAD: u32 = 0x04;
+const WATCHDOG_SCRATCH0: u32 = 0x0C;
+/// WATCHDOG `CTRL.ENABLE` (bit 30 — see `watchdog.rs:58`).
+const WATCHDOG_CTRL_ENABLE: u32 = 1 << 30;
 
 /// UART0 single-byte TX scenario — enable FIFO + UARTEN + TXE, push one
 /// byte via UARTDR, advance `max_sysclks`, observe UARTFR.TXFE set.
@@ -1221,6 +1268,305 @@ const O_ADC_ROUND_ROBIN_2CH: &[(u32, u32)] = &[
     // The exact value depends on how many conversions completed in the
     // window, but both HW and EMU should agree.
     (ADC_CS_RP2350, ADC_CS_AINSEL_MASK),
+];
+
+// ---------------------------------------------------------------------------
+// Track 4 — under-covered peripheral expansions (UART/SPI/I2C/ADC/PWM/WATCHDOG)
+// ---------------------------------------------------------------------------
+//
+// Eight new pure-data scenarios. All `custom_sled = None`,
+// `observe_pins = 0`, generous (≥4× nominal) sysclk windows tuned to
+// survive silicon variation. Validation runs against RP2354 silicon when
+// probe time becomes available; landed in append-only fashion so existing
+// scenario names + ordering are preserved (filter behaviour depends).
+//
+// Naming convention follows the existing catalogue:
+//   <peripheral><index?>_<observable>_<context>
+//
+// All eight target a single peripheral block per scenario per HLD V5
+// §4 observability constraint.
+
+// 1. uart0_tx_fifo_fill_and_ris — push 4 bytes through UART0 TX FIFO with
+//    a mid-fill IFLS threshold; observe FR full word + RIS RXFE/TX/CTS
+//    bits. RESET_UART0 pulse + CLK_PERI enable per the A.2.2 fix in
+//    `S_UART0_RX_LOOPBACK`. IBRD=81 / FBRD=24 = 115200 @ 150 MHz clk_peri.
+const S_UART0_TX_FIFO_FILL_AND_RIS: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    // Inlined PREFIX_UART0_HARD_RESET — symmetric with the existing
+    // UART0 scenarios so Fisher-Yates ordering doesn't leak FIFO state.
+    (RESETS_RESET + ALIAS_SET, RESET_UART0),
+    (RESETS_RESET + ALIAS_CLR, RESET_UART0),
+    (CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE),
+    (UART0_UARTIBRD, 81),
+    (UART0_UARTFBRD, 24),
+    (UART0_UARTLCR_H, UARTLCR_H_FEN | UARTLCR_H_WLEN_8),
+    // IFLS: TXIFLSEL=2 (1/2-full → mid-fill) | RXIFLSEL=2 (also 1/2).
+    (UART0_BASE + UART_UARTIFLS, (2 << 3) | 2),
+    (UART0_UARTCR, UARTCR_UARTEN | UARTCR_TXE),
+    // Push 4 bytes — interleaved DR pushes mirror common firmware patterns.
+    (UART0_UARTDR, 0x10),
+    (UART0_UARTDR, 0x20),
+    (UART0_UARTDR, 0x30),
+    (UART0_UARTDR, 0x40),
+];
+const O_UART0_TX_FIFO_FILL_AND_RIS: &[(u32, u32)] = &[
+    // UARTFR full-word: TXFE/TXFF/RXFE/BUSY/CTS bits all matter; differs
+    // depending on whether the 4-byte burst has fully drained.
+    (UART0_UARTFR, 0xFFFF_FFFF),
+    // UARTRIS — low byte holds the documented interrupt sources
+    // (CTS/RX/TX/RT/FE/PE/BE/OE per `uart.rs:107-121`). Mask 0xFF covers
+    // the modelled set without snagging upper undefined bits.
+    (UART0_BASE + UART_UARTRIS, 0xFF),
+];
+
+// 2. uart0_rx_4byte_loopback_fr_ris — clone of the existing
+//    `uart0_rx_loopback` but with 4 bytes pushed through the loopback
+//    path. Verifies FIFO accumulation under LBE.
+const S_UART0_RX_LOOPBACK_4BYTES: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (RESETS_RESET + ALIAS_SET, RESET_UART0),
+    (RESETS_RESET + ALIAS_CLR, RESET_UART0),
+    (CLOCKS_CLK_PERI_CTRL, CLK_CTRL_ENABLE),
+    (UART0_UARTIBRD, 81),
+    (UART0_UARTFBRD, 24),
+    (UART0_UARTLCR_H, UARTLCR_H_FEN | UARTLCR_H_WLEN_8),
+    (
+        UART0_UARTCR,
+        UARTCR_UARTEN | UARTCR_LBE | UARTCR_TXE | UARTCR_RXE,
+    ),
+    (UART0_UARTDR, 0x11),
+    (UART0_UARTDR, 0x22),
+    (UART0_UARTDR, 0x33),
+    (UART0_UARTDR, 0x44),
+];
+const O_UART0_RX_LOOPBACK_4BYTES: &[(u32, u32)] = &[
+    // UARTFR full-word — RXFE clear (FIFO non-empty), TXFE set after drain.
+    (UART0_UARTFR, 0xFFFF_FFFF),
+    // First UARTDR read pops the RX FIFO head (0x11). One pop is fine —
+    // we only observe one FIFO entry on each side.
+    (UART0_UARTDR, 0xFF),
+    (UART0_BASE + UART_UARTRIS, 0xFF),
+];
+
+// 3. spi0_loopback_4bytes_drain — push 4 bytes through SPI0 LBM and
+//    drain. Generous max_sysclks per the table covers SSPCPSR=2 timing
+//    plus 4-byte transfer. Observables: SSPSR (FIFO flags) + SSPDR pop.
+const S_SPI0_LOOPBACK_4BYTES_DRAIN: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (RESETS_RESET + ALIAS_SET, RESET_SPI0),
+    (RESETS_RESET + ALIAS_CLR, RESET_SPI0),
+    (SPI0_BASE + SPI_SSPCPSR, 2), // CPSDVSR=2 (slowest non-zero divisor)
+    (SPI0_SSPCR0, 7),             // DSS=7 (8-bit)
+    (SPI0_SSPCR1, SSPCR1_SSE | SSPCR1_LBM),
+    (SPI0_SSPDR, 0xA1),
+    (SPI0_SSPDR, 0xB2),
+    (SPI0_SSPDR, 0xC3),
+    (SPI0_SSPDR, 0xD4),
+];
+const O_SPI0_LOOPBACK_4BYTES_DRAIN: &[(u32, u32)] = &[
+    // SSPSR low 5 bits are the documented status field (TFE/TNF/RNE/RFF/BSY
+    // per `spi.rs:81-85`). Mask isolates the architectural state.
+    (SPI0_BASE + SPI_SSPSR, 0x1F),
+    // SSPDR pop — first read returns 0xA1 (FIFO head).
+    (SPI0_SSPDR, 0xFF),
+];
+
+// 4. i2c0_master_register_state_after_enable — verify that the master/
+//    7-bit/restart_en/slave_disable IC_CON value sticks once IC_ENABLE
+//    is asserted, and IC_RAW_INTR_STAT shows no spurious interrupts on
+//    a freshly-enabled controller. RESET_I2C0 pulse first to wipe any
+//    prior-scenario state.
+//
+//    IC_CON write is rejected when IC_ENABLE.bit0 = 1 (`i2c.rs:384`), so
+//    the order is: ENABLE=0 → CON → TAR → ENABLE=1. The CON value is
+//    deliberately distinct from the DW reset default
+//    (`master | speed=fast | restart_en | slave_disable` = 0x65) — we
+//    drop the SPEED=fast bits to land 0x61 so a write that silently
+//    fails leaves the readback at 0x65 and the diff catches it.
+const I2C_IC_CON_TRACK4: u32 = 0x01 // master mode (bit 0)
+    | (1 << 5) // restart_en
+    | (1 << 6); // slave_disable; SPEED=00, 7-bit (bit 4 clear)
+const S_I2C0_MASTER_REGISTER_STATE_AFTER_ENABLE: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (RESETS_RESET + ALIAS_SET, RESET_I2C0),
+    (RESETS_RESET + ALIAS_CLR, RESET_I2C0),
+    (I2C0_IC_ENABLE, 0),
+    (I2C0_BASE_RP2350 + I2C_IC_CON, I2C_IC_CON_TRACK4),
+    (I2C0_IC_TAR, 0x55),
+    (I2C0_IC_ENABLE, 1),
+];
+const O_I2C0_MASTER_REGISTER_STATE_AFTER_ENABLE: &[(u32, u32)] = &[
+    // IC_ENABLE bit 0 — must read back as set.
+    (I2C0_IC_ENABLE, 0x1),
+    // IC_CON full byte — the discriminating observable. The setup
+    // writes 0x61 (master | restart_en | slave_disable, SPEED=00),
+    // distinct from the DW reset default 0x65 (which has SPEED=fast
+    // bits set). A silently-failed CON write would leave silicon
+    // reading back 0x65 vs the emulator's 0x61 — diff catches it.
+    (I2C0_BASE_RP2350 + I2C_IC_CON, 0xFF),
+    // IC_RAW_INTR_STAT — must be 0 (no transactions issued, no aborts).
+    // Mask covers all 13 documented interrupt sources (`i2c.rs:81-94`).
+    (I2C0_BASE_RP2350 + I2C_IC_RAW_INTR_STAT, 0x1FFF),
+];
+
+// 5. adc_continuous_sample_rate_div — drive the ADC in continuous-sample
+//    mode (CS.START_MANY) with a non-trivial DIV value, observe FCS LEVEL
+//    field advancing as samples accumulate and CS.AINSEL settling.
+//    Mirrors the existing `S_ADC_ROUND_ROBIN_2CH` pad/funcsel setup so
+//    the silicon APB-lockup hazard stays mitigated.
+//
+//    DIV = 0x0000_FF00 (INT=0xFF, FRAC=0 → divisor 255.0) deliberately
+//    slows the conversion rate enough that LEVEL doesn't saturate the
+//    4-entry FIFO inside `max_sysclks`.
+const S_ADC_CONTINUOUS_SAMPLE_RATE_DIV: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (PADS_BANK0_GPIO26, 0x96),
+    (IO_BANK0_GPIO26_CTRL, 31),
+    (ADC_BASE + ADC_DIV, 0x0000_FF00),
+    (ADC_FCS_RP2350, ADC_FCS_SHIFT_EN), // EN=1, SHIFT=1
+    // CS write: EN=1, START_MANY=1 (bit 3); RROBIN[20:16]=0 implicitly,
+    // which holds AINSEL[14:12] constant at the initial channel for the
+    // duration of the window (datasheet §12.4.6). This is what makes
+    // the AINSEL observable in the diff array deterministic.
+    (ADC_CS_RP2350, CS_EN_BIT | (1 << 3)), // EN | START_MANY
+];
+const O_ADC_CONTINUOUS_SAMPLE_RATE_DIV: &[(u32, u32)] = &[
+    // FCS mask 0x000F_0F00 = LEVEL[19:16] (4-bit fill counter,
+    // `adc.rs:86-87`) plus the EMPTY/FULL/UNDER/OVER status bits at
+    // [11:8] (`adc.rs:82-85`). Both sides should report the same fill
+    // depth + sticky flags after the same elapsed sysclks.
+    (ADC_FCS_RP2350, 0x000F_0F00),
+    // CS.AINSEL [14:12] — must agree on which channel is currently
+    // selected. With RROBIN=0 and START_MANY, AINSEL stays at the
+    // initial channel (0) on both sides.
+    (ADC_CS_RP2350, 0x7000),
+];
+
+// 6. pwm_slice0_duty_cc_observed — exercise the per-slice fractional
+//    divider + CC compare path and read CTR / CSR back. TOP=999
+//    + DIV=0x0820 (INT=8, FRAC=2 → divisor 8.125). Window pinned to
+//    exactly 8_000 sysclks (min == max) so CTR advances ~985 ticks
+//    (8000 / 8.125 ≈ 984.6) — comfortably under TOP=999 with no wrap,
+//    making CTR observable with a full mask deterministic. CC=500 sits
+//    mid-cycle as a duty marker but is not directly observed; the
+//    state-machine evidence is CTR + CSR.EN reading back consistently
+//    on both sides.
+const S_PWM_SLICE0_DUTY_CC_OBSERVED: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (RESETS_RESET + ALIAS_SET, RESET_PWM),
+    (RESETS_RESET + ALIAS_CLR, RESET_PWM),
+    // PREFIX_PWM_SLICE0_CLEAN — gate slice off, zero CSR/CTR, W1C wraps.
+    (PWM_EN_OFFSET, 0),
+    (PWM_SLICE0_CSR, 0),
+    (PWM_SLICE0_CTR, 0),
+    (PWM_INTR_OFFSET, 0xF),
+    // TOP / DIV / CC must land BEFORE CSR_EN so DAP latency between
+    // writes can't tick the counter against stale values.
+    (PWM_SLICE0_TOP, 999),
+    (PWM_SLICE0_DIV, 0x0820), // INT=8, FRAC=2
+    (PWM_SLICE0_CC, 500),     // channel-A duty mid-cycle
+    (PWM_SLICE0_CSR, PWM_CSR_EN_BIT),
+    (PWM_EN_OFFSET, 1),
+];
+const O_PWM_SLICE0_DUTY_CC_OBSERVED: &[(u32, u32)] = &[
+    // CTR full word — both sides advance at the same rate (PWM ticks
+    // are sysclk-driven, not gated on clk_peri). With min == max ==
+    // 8_000 sysclks at divisor 8.125, CTR settles at ~985 (no wrap
+    // since 985 < TOP=999), so the comparison is fully deterministic.
+    (PWM_SLICE0_CTR, 0xFFFF_FFFF),
+    // CSR — verify slice-0 EN + DIVMODE bits land. Mask 0xFF covers the
+    // documented writeable subset (`pwm.rs:86-93`).
+    (PWM_SLICE0_CSR, 0xFF),
+];
+
+// 7. watchdog_timer_bite_reason — DOWNGRADED scenario.
+//
+//    The original prompt asked us to actually trigger a watchdog reset
+//    on silicon (LOAD=1000, ENABLE, no PAUSE_DBG, do not feed → fire) and
+//    observe REASON.TIMER. Two reasons we downgrade:
+//
+//    1. **Silicon-side reset risk.** A real watchdog bite resets the
+//       core mid-scenario. `run_scenario_with_retry` only retries on
+//       `probe_rs::Error::Probe` / `Timeout`; a watchdog-induced SWD
+//       disconnect can surface as `Arm` errors instead, and the cleanup
+//       path in `run_against` (`silicon_scenarios.rs:2812`) does halt + a
+//       RESETS read after every scenario — that read against a half-reset
+//       core is a flake source for the rest of the iteration's catalogue.
+//       Soak runs would surface this as intermittent FAILs on whichever
+//       scenario happened to follow `watchdog_timer_bite_reason` under
+//       Fisher-Yates shuffling.
+//
+//    2. **Emulator-side stub gap.** `WatchdogRegs::reason` is hardcoded
+//       to 0 in V5 (`watchdog.rs:79` + `read32` returns it verbatim) —
+//       the emulator never sets REASON.TIMER even when the countdown
+//       fires. So `REASON mask 0x3` would diverge HW=1 vs EMU=0 today,
+//       which is a real catch but can't validate the rest of the
+//       countdown machinery if we never trigger the bite.
+//
+//    Downgrade per prompt step 5: pick LOAD large enough that it does
+//    NOT fire inside `max_sysclks`, and observe "ENABLE bit set + TIME
+//    field decreased from LOAD". Both sides advance the countdown each
+//    `tick_peripherals`, so by `max_sysclks=40_000` both should have
+//    decremented TIME by a non-trivial amount without crossing zero.
+//
+//    Setup writes CTRL=0 first (no RESETS_WATCHDOG bit available — the
+//    block is not reset-gated on RP2350) so prior-scenario state can't
+//    leak the ENABLE bit forward.
+//
+//    LOAD=0x000F_FFFF (24-bit ceiling minus a margin) so the countdown
+//    is far from firing. CTRL with ENABLE=1 only — no PAUSE_DBG bits, no
+//    TRIGGER. The CTRL_TIME mirror at [23:0] gives us the live countdown
+//    on read.
+const WATCHDOG_LOAD_NO_BITE: u32 = 0x000F_FFFF;
+const S_WATCHDOG_TIMER_BITE_REASON: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    // Clear CTRL — disables countdown, drops any stale PAUSE_* / TRIGGER.
+    (WATCHDOG_BASE + WATCHDOG_CTRL, 0),
+    // Seed the countdown — LOAD also reloads the TIME shadow.
+    (WATCHDOG_BASE + WATCHDOG_LOAD, WATCHDOG_LOAD_NO_BITE),
+    // Enable countdown. No PAUSE_DBG → counter advances while halted.
+    (WATCHDOG_BASE + WATCHDOG_CTRL, WATCHDOG_CTRL_ENABLE),
+];
+const O_WATCHDOG_TIMER_BITE_REASON: &[(u32, u32)] = &[
+    // CTRL mask 0x00FF_FFFF — covers the TIME[23:0] mirror only. Both
+    // sides' countdowns must agree on having advanced (i.e. TIME <
+    // LOAD). Upper byte (ENABLE/TRIGGER + PAUSE_*) is masked out because
+    // ENABLE alone is not a discriminating diff against the prior CTRL=0
+    // write below; the TIME mirror is the load-bearing signal.
+    //
+    // REASON is intentionally NOT observed: REASON.TIMER is sticky on
+    // silicon across watchdog resets until firmware clears it
+    // (datasheet §4.7.5). A previous test or probe-attach sequence that
+    // triggered the watchdog would leave silicon's REASON.TIMER set
+    // while the emulator stubs REASON to 0 — soak runs would FAIL
+    // intermittently. The CTRL.TIME mirror already proves the countdown
+    // advanced.
+    (WATCHDOG_BASE + WATCHDOG_CTRL, 0x00FF_FFFF),
+];
+
+// 8. watchdog_scratch_persists_across_load — SCRATCH0..7 are documented
+//    to survive a watchdog reset (datasheet §4.7), and even simpler: a
+//    firmware re-write of LOAD must not perturb SCRATCH state at all.
+//    Setup writes a known-bad cookie to SCRATCH0, hits LOAD twice, and
+//    we read SCRATCH0 back. Quick scenario, no countdown involved.
+const S_WATCHDOG_SCRATCH_PERSISTS_ACROSS_LOAD: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_CLR, RESETS_CLR_ALL),
+    (WATCHDOG_BASE + WATCHDOG_CTRL, 0),
+    // First LOAD — large value so we definitely don't fire if a
+    // bug somewhere left ENABLE asserted between scenarios.
+    (WATCHDOG_BASE + WATCHDOG_LOAD, 0x000F_FFFF),
+    // Plant the discriminator. 0xDEADBEEF is intentional: distinct from
+    // 0 (post-reset default), distinct from `RESETS_CLR_ALL` (0xFFFF_FFFF),
+    // distinct from 0x5BAD (a glitch-detector sentinel). Any read that
+    // returns 0xDEADBEEF can only have come from this write.
+    (WATCHDOG_BASE + WATCHDOG_SCRATCH0, 0xDEAD_BEEF),
+    // Second LOAD — the scenario's load-bearing event. SCRATCH0 must
+    // not be touched by LOAD writes per the datasheet.
+    (WATCHDOG_BASE + WATCHDOG_LOAD, 0x000F_FFFE),
+];
+const O_WATCHDOG_SCRATCH_PERSISTS_ACROSS_LOAD: &[(u32, u32)] = &[
+    // SCRATCH0 full word — must read back as 0xDEADBEEF on both sides.
+    (WATCHDOG_BASE + WATCHDOG_SCRATCH0, 0xFFFF_FFFF),
 ];
 
 // S_PIO0_INT_ROUTING_SPLIT — Phase 4.1: PIO0 SM0 asserts IRQ flag 0;
@@ -1584,6 +1930,105 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         setup: S_GLITCH_DETECTOR_ARM_READBACK,
         max_sysclks: 100,
         observe: O_GLITCH_DETECTOR_ARM_READBACK,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Track 4 — UART0 TX FIFO fill + raw interrupt status. Pushes 4 bytes
+    // through the TX FIFO with a 1/2-fill IFLS threshold, observes UARTFR
+    // (full word) and UARTRIS (low byte covers the 8 modelled int sources).
+    // Window: 4× one-byte time at 115200 baud / 150 MHz ≈ 30_000 sysclks.
+    PeriphScenario {
+        name: "uart0_tx_fifo_fill_and_ris",
+        setup: S_UART0_TX_FIFO_FILL_AND_RIS,
+        max_sysclks: 120_000,
+        observe: O_UART0_TX_FIFO_FILL_AND_RIS,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 5_000,
+    },
+    // Track 4 — UART0 RX loopback with 4 bytes. Same baud + LBE setup as
+    // the existing `uart0_rx_loopback` scenario, but the additional
+    // payload exercises FIFO accumulation under loopback.
+    PeriphScenario {
+        name: "uart0_rx_4byte_loopback_fr_ris",
+        setup: S_UART0_RX_LOOPBACK_4BYTES,
+        max_sysclks: 200_000,
+        observe: O_UART0_RX_LOOPBACK_4BYTES,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 60_000,
+    },
+    // Track 4 — SPI0 LBM 4-byte drain. CPSDVSR=2 keeps the transfer
+    // window short; SSPSR readback proves the FIFO drained.
+    PeriphScenario {
+        name: "spi0_loopback_4bytes_drain",
+        setup: S_SPI0_LOOPBACK_4BYTES_DRAIN,
+        max_sysclks: 2_000,
+        observe: O_SPI0_LOOPBACK_4BYTES_DRAIN,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 200,
+    },
+    // Track 4 — I2C0 register-state-after-enable. Verifies IC_CON sticks
+    // after the master/7-bit/restart_en/slave_disable sequence and no
+    // spurious interrupts fire in the absence of a transaction.
+    PeriphScenario {
+        name: "i2c0_master_register_state_after_enable",
+        setup: S_I2C0_MASTER_REGISTER_STATE_AFTER_ENABLE,
+        max_sysclks: 200,
+        observe: O_I2C0_MASTER_REGISTER_STATE_AFTER_ENABLE,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 0,
+    },
+    // Track 4 — ADC continuous-sample with sample-rate divider. Stresses
+    // the FCS LEVEL field + CS.AINSEL fixed point against a non-trivial
+    // DIV value.
+    PeriphScenario {
+        name: "adc_continuous_sample_rate_div",
+        setup: S_ADC_CONTINUOUS_SAMPLE_RATE_DIV,
+        max_sysclks: 100_000,
+        observe: O_ADC_CONTINUOUS_SAMPLE_RATE_DIV,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 5_000,
+    },
+    // Track 4 — PWM slice-0 duty cycle observation. Exercises the
+    // fractional divider + CC compare path. Window pinned to exactly
+    // 8_000 sysclks (min == max) so CTR advances a deterministic
+    // ~985 ticks at divisor 8.125 — under TOP=999, no wrap. See the
+    // scenario comment for the math.
+    PeriphScenario {
+        name: "pwm_slice0_duty_cc_observed",
+        setup: S_PWM_SLICE0_DUTY_CC_OBSERVED,
+        max_sysclks: 8_000,
+        observe: O_PWM_SLICE0_DUTY_CC_OBSERVED,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 8_000,
+    },
+    // Track 4 — WATCHDOG countdown progress (DOWNGRADED from "fire-and-
+    // observe-REASON.TIMER" — see scenario comment for rationale).
+    // Observes that ENABLE+LOAD seeded a counter that decrements without
+    // crossing zero in the window. REASON observable is masked to 0.
+    PeriphScenario {
+        name: "watchdog_timer_bite_reason",
+        setup: S_WATCHDOG_TIMER_BITE_REASON,
+        max_sysclks: 40_000,
+        observe: O_WATCHDOG_TIMER_BITE_REASON,
+        observe_pins: 0,
+        custom_sled: None,
+        min_sysclks: 5_000,
+    },
+    // Track 4 — WATCHDOG SCRATCH0 must persist through LOAD writes (the
+    // datasheet guarantees survival across a full WDT reset; this is the
+    // weaker invariant that's safe to test without firing the watchdog).
+    PeriphScenario {
+        name: "watchdog_scratch_persists_across_load",
+        setup: S_WATCHDOG_SCRATCH_PERSISTS_ACROSS_LOAD,
+        max_sysclks: 200,
+        observe: O_WATCHDOG_SCRATCH_PERSISTS_ACROSS_LOAD,
         observe_pins: 0,
         custom_sled: None,
         min_sysclks: 0,
@@ -2804,6 +3249,13 @@ pub fn run_against(
     // `pio0_side_set_toggle` scenario; leaving them un-asserted here
     // would leave GPIO0 configured for PIO0 at the start of the next
     // iteration's first scenario, leaking state across oracles.
+    //
+    // Note: scenarios all start their setup with `RESETS_RESET +
+    // ALIAS_CLR = RESETS_CLR_ALL`, so per-scenario RESETS bookkeeping is
+    // unnecessary in this cleanup path — only the cross-oracle handoff
+    // needs the bits re-asserted. The mask is the union of every bit
+    // any scenario clears; new scenarios that clear additional RESETS
+    // bits must extend it.
     //
     // Cleanup failures are logged to stderr even though the rest of
     // `run_against` is silent — an operator needs to see them to
