@@ -243,31 +243,91 @@ def iter_target_names(args, catalog: dict[str, dict]) -> Iterable[str]:
                 yield n
 
 
+def load_already_done(only_class: Optional[str] = None) -> set[str]:
+    """Return mutant names already present in results.jsonl (for dedup).
+
+    If `only_class` is set, return only the names whose recorded
+    classification matches (used by --retry-class to re-test specific
+    classifications, e.g. retry oracle_survived at deeper fuzz)."""
+    done: set[str] = set()
+    if not RESULTS_PATH.exists():
+        return done
+    with RESULTS_PATH.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if only_class is None or r.get("classification") == only_class:
+                done.add(r["name"])
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--missed", help="path to V1 missed.txt; one mutant name per line")
     ap.add_argument("--names", nargs="*", help="specific mutant names to process")
     ap.add_argument("--sample", action="store_true",
                     help="run a small hand-picked sample for prototyping")
+    ap.add_argument("--retry-survivors", action="store_true",
+                    help="re-test all oracle_survived entries from results.jsonl "
+                         "(deep-pass mode; pair with --fuzz larger than the "
+                         "first-pass value)")
     ap.add_argument("--fuzz", type=int, default=DEFAULT_FUZZ,
                     help=f"fuzz iterations per oracle run (default {DEFAULT_FUZZ})")
     ap.add_argument("--timeout", type=int, default=180,
                     help="per-oracle timeout in seconds (default 180)")
     ap.add_argument("--max", type=int, default=0,
                     help="stop after N mutants (0 = no limit)")
+    ap.add_argument("--skip-done", action="store_true",
+                    help="skip mutants already present in results.jsonl "
+                         "(restart-friendly)")
     args = ap.parse_args()
 
-    if not (args.missed or args.names or args.sample):
-        ap.error("specify --missed, --names, or --sample")
+    if not (args.missed or args.names or args.sample or args.retry_survivors):
+        ap.error("specify --missed, --names, --sample, or --retry-survivors")
 
     V2_DIR.mkdir(parents=True, exist_ok=True)
-    log(f"V2 runner starting: fuzz={args.fuzz} timeout={args.timeout}s max={args.max}")
+    log(f"V2 runner starting: fuzz={args.fuzz} timeout={args.timeout}s "
+        f"max={args.max} skip_done={args.skip_done}")
     catalog = load_catalog()
     log(f"loaded catalog: {len(catalog)} mutants")
 
+    if args.retry_survivors:
+        # Retry mode: drop existing oracle_survived rows from results.jsonl,
+        # then iterate them. We rewrite results.jsonl in place (filter + tail).
+        survivors: list[str] = []
+        keep: list[dict] = []
+        if RESULTS_PATH.exists():
+            with RESULTS_PATH.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    r = json.loads(line)
+                    if r["classification"] == "oracle_survived":
+                        survivors.append(r["name"])
+                    else:
+                        keep.append(r)
+        log(f"retry-survivors: {len(survivors)} survivors to re-test "
+            f"(keeping {len(keep)} non-survivor rows)")
+        with RESULTS_PATH.open("w") as f:
+            for r in keep:
+                f.write(json.dumps(r) + "\n")
+        names_iter: Iterable[str] = iter(survivors)
+    elif args.skip_done:
+        done = load_already_done()
+        log(f"--skip-done: {len(done)} mutants already in results.jsonl")
+        names_iter = (n for n in iter_target_names(args, catalog) if n not in done)
+    else:
+        names_iter = iter_target_names(args, catalog)
+
     results_f = RESULTS_PATH.open("a")
     n = 0
-    for name in iter_target_names(args, catalog):
+    for name in names_iter:
         if args.max and n >= args.max:
             break
         m = catalog.get(name)
