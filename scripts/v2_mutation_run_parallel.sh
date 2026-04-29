@@ -106,24 +106,29 @@ start() {
         # Note: env vars CARGO_PROFILE_RELEASE_PACKAGE_*_CODEGEN_UNITS
         # don't take effect in cargo (per-package overrides are
         # config-only); --config is the supported path.
+        # Tune --fuzz per oracle: M33 oracle's `--fuzz N --classes base`
+        # iterates N × 168 random tests; at N=200 each mutant takes
+        # ~70 s. Drop to N=100 (~35 s) for first-pass — survivors get
+        # re-tested at N=2000 in deep-pass anyway.
+        local fuzz=100
         (
             cd "$w"
             nohup setsid python3 scripts/v2_mutation_runner.py \
                 --missed "$shard" \
                 --skip-done \
-                --fuzz 200 \
+                --fuzz $fuzz \
                 --timeout 180 \
                 --catalog-path "$w/mutation/v2/mutants_catalog.json" \
                 --results-path "$results" \
                 --log-path "$logf" \
-                --cargo-arg --config \
-                --cargo-arg 'profile.release.lto=false' \
-                --cargo-arg --config \
-                --cargo-arg 'profile.release.codegen-units=16' \
-                --cargo-arg --config \
-                --cargo-arg 'profile.release.package.mdrp2350.codegen-units=16' \
-                --cargo-arg --config \
-                --cargo-arg 'profile.release.package.mdrp2040.codegen-units=16' \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.lto=false' \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.codegen-units=16' \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.package.mdrp2350.codegen-units=16' \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.package.mdrp2040.codegen-units=16' \
                 "${extra[@]}" \
                 >> "$logf" 2>&1 < /dev/null &
             echo "$!" > "$PARA_DIR/pid.$i"
