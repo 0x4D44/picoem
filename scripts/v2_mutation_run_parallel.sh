@@ -96,9 +96,18 @@ start() {
         fi
 
         echo "  worker $i: shard=$(wc -l < "$shard") mutants → $results"
+        # Override the workspace's release profile to disable fat LTO.
+        # Default profile.release in Cargo.toml has lto="fat" + codegen-units=1
+        # for chip libs; per-mutant rebuild then takes ~100 s. With LTO off
+        # and codegen-units=16, steady-state rebuild drops to ~15 s. Mutation
+        # detection only depends on oracle CORRECTNESS, not its exact
+        # optimisation profile, so this is safe.
         (
             cd "$w"
-            nohup setsid python3 scripts/v2_mutation_runner.py \
+            nohup setsid env \
+                CARGO_PROFILE_RELEASE_LTO=off \
+                CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+                python3 scripts/v2_mutation_runner.py \
                 --missed "$shard" \
                 --skip-done \
                 --fuzz 200 \
