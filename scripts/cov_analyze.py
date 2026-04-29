@@ -19,6 +19,7 @@ EXCLUDE_PATTERNS = [
     r'mdrp2350app/src/(main|ui|sim|firmware|panels)',
     r'mdpicoem/crates/[^/]+/tests/',
     r'mdpicoem/crates/[^/]+/src/(tests|tests_narrow|tests_stage3_thumb32|pio_tests)\.rs$',
+    r'mdpicoem/crates/[^/]+/src/core_riscv/tests_(common|p1|p2|p3|p4|p5|p6)\.rs$',
 ]
 exclude_re = re.compile('|'.join(EXCLUDE_PATTERNS))
 
