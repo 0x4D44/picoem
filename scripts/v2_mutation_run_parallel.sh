@@ -254,15 +254,200 @@ clean() {
     rm -rf "$PARA_DIR"
 }
 
+deep_start() {
+    shift || true
+    local extra=("$@")
+
+    local survivors="$V2_DIR/parallel/survivors.txt"
+    if [ ! -f "$survivors" ]; then
+        echo "missing $survivors — extract first" >&2; exit 1
+    fi
+    if [ ! -f "$CATALOG" ]; then
+        echo "missing $CATALOG" >&2; exit 1
+    fi
+
+    echo "Deep-pass: $(wc -l < "$survivors") survivors at --fuzz 2000"
+    rm -f "$PARA_DIR"/deep.shard.* "$PARA_DIR"/deep.*.jsonl \
+          "$PARA_DIR"/deep_log.* "$PARA_DIR"/deep_pid.*
+
+    awk '
+      /crates\/mdrp2350\/src\/core\/decode\.rs:/         { print > "'"$PARA_DIR"'/deep.shard.0"; next }
+      /crates\/mdrp2350\/src\/core\/execute\.rs:/        { print > "'"$PARA_DIR"'/deep.shard.0"; next }
+      /crates\/mdrp2350\/src\/core\/execute_thumb32\.rs:/{ print > "'"$PARA_DIR"'/deep.shard.0"; next }
+      /crates\/mdrp2040\/src\/core\//                    { print > "'"$PARA_DIR"'/deep.shard.1"; next }
+      /crates\/mdrp2350\/src\/core\/execute_fpu\.rs:/    { print > "'"$PARA_DIR"'/deep.shard.2"; next }
+    ' "$survivors"
+
+    mkdir -p "$WORKSPACES"
+    for i in 0 1 2; do
+        local w="$WORKSPACES/w$i"
+        if [ ! -d "$w" ]; then
+            git worktree add --detach "$w" HEAD >/dev/null
+        fi
+        # Refresh runner script in worktree (in case it's stale from
+        # a previous run on an older HEAD).
+        cp -f scripts/v2_mutation_runner.py "$w/scripts/"
+        cp -f scripts/v2_mutation_run_parallel.sh "$w/scripts/"
+        mkdir -p "$w/mutation/v2"
+        cp -f "$CATALOG" "$w/mutation/v2/mutants_catalog.json"
+
+        local shard="$PARA_DIR/deep.shard.$i"
+        if [ ! -f "$shard" ]; then
+            echo "  worker $i: no shard (file missing) — skipping"
+            continue
+        fi
+        local results="$PARA_DIR/deep.$i.jsonl"
+        local logf="$PARA_DIR/deep_log.$i"
+
+        # Deep-pass writes to its own results file (no dedup base
+        # required — every name in the shard is a known survivor we
+        # want re-tested).
+        : > "$results"
+
+        echo "  worker $i: shard=$(wc -l < "$shard") survivors → $results"
+        (
+            cd "$w"
+            nohup setsid python3 scripts/v2_mutation_runner.py \
+                --missed "$shard" \
+                --fuzz 2000 \
+                --timeout 600 \
+                --catalog-path "$w/mutation/v2/mutants_catalog.json" \
+                --results-path "$results" \
+                --log-path "$logf" \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.lto=false' \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.codegen-units=16' \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.package.mdrp2350.codegen-units=16' \
+                --cargo-arg=--config \
+                --cargo-arg='profile.release.package.mdrp2040.codegen-units=16' \
+                "${extra[@]}" \
+                >> "$logf" 2>&1 < /dev/null &
+            echo "$!" > "$PARA_DIR/deep_pid.$i"
+        )
+        sleep 1
+    done
+    echo "Launched 3 deep-pass workers."
+}
+
+deep_status() {
+    for i in 0 1 2; do
+        local f="$PARA_DIR/deep.$i.jsonl"
+        local pidf="$PARA_DIR/deep_pid.$i"
+        [ -f "$f" ] || continue
+        local n=$(wc -l < "$f" 2>/dev/null || echo 0)
+        local pid="?"
+        local status="?"
+        if [ -f "$pidf" ]; then
+            pid=$(cat "$pidf")
+            if kill -0 "$pid" 2>/dev/null; then status="running"; else status="exited"; fi
+        fi
+        local caught=$(grep -c "oracle_caught" "$f" 2>/dev/null || echo 0)
+        local survived=$(grep -c "oracle_survived" "$f" 2>/dev/null || echo 0)
+        printf "  deep w%d: pid=%s [%s] %d records (caught=%d survived=%d)\n" \
+            "$i" "$pid" "$status" "$n" "$caught" "$survived"
+    done
+}
+
+deep_stop() {
+    for i in 0 1 2; do
+        local pidf="$PARA_DIR/deep_pid.$i"
+        [ -f "$pidf" ] || continue
+        local pid=$(cat "$pidf")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "killing deep worker pid=$pid"
+            kill -INT "$pid" 2>/dev/null || true
+        fi
+    done
+    sleep 5
+    for i in 0 1 2; do
+        local pidf="$PARA_DIR/deep_pid.$i"
+        [ -f "$pidf" ] || continue
+        local pid=$(cat "$pidf")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+    for w in "$WORKSPACES"/w*; do
+        [ -d "$w" ] || continue
+        (cd "$w" && git checkout -- crates/ 2>/dev/null || true)
+    done
+}
+
+deep_merge() {
+    # Update the canonical results.jsonl with deep-pass verdicts.
+    # For each name that appears in any deep.<i>.jsonl, the deep-pass
+    # row WINS (it's the more-thorough measurement). Names not in
+    # deep-pass keep their first-pass row (most are oracle_caught
+    # rows that didn't need re-testing).
+    python3 - "$PARA_DIR" "$V2_DIR/results.jsonl" << 'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+para_dir = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+
+# Load first-pass results.
+existing = {}
+if out_path.exists():
+    with out_path.open() as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                r = json.loads(line)
+                existing[r["name"]] = r
+
+# Override with deep-pass.
+deep = {}
+for f in sorted(para_dir.glob("deep.*.jsonl")):
+    with f.open() as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                r = json.loads(line)
+                # Mark deep-pass rows for the consumer.
+                r["deep_pass"] = True
+                deep[r["name"]] = r
+
+flipped_to_caught = 0
+flipped_to_other = 0
+for name, r in deep.items():
+    prev = existing.get(name)
+    if prev and prev["classification"] == "oracle_survived" \
+            and r["classification"] == "oracle_caught":
+        flipped_to_caught += 1
+    elif prev and prev["classification"] != r["classification"]:
+        flipped_to_other += 1
+    existing[name] = r
+
+with out_path.open("w") as fp:
+    for r in existing.values():
+        fp.write(json.dumps(r) + "\n")
+
+print(f"deep-pass overrides applied: {len(deep)} mutants re-tested")
+print(f"flipped survived → caught:    {flipped_to_caught}")
+print(f"other classification flips:   {flipped_to_other}")
+print(f"persistent survivors:         {len(deep) - flipped_to_caught - flipped_to_other}")
+print(f"final results.jsonl rows:     {len(existing)}")
+PYEOF
+}
+
 case "${1:-}" in
-    start)   shift; start "$@" ;;
-    status)  status ;;
-    wait)    wait_workers ;;
-    merge)   merge ;;
-    stop)    stop ;;
-    clean)   clean ;;
+    start)        shift; start "$@" ;;
+    status)       status ;;
+    wait)         wait_workers ;;
+    merge)        merge ;;
+    stop)         stop ;;
+    clean)        clean ;;
+    deep-start)   deep_start "$@" ;;
+    deep-status)  deep_status ;;
+    deep-stop)    deep_stop ;;
+    deep-merge)   deep_merge ;;
     *)
         echo "usage: $0 {start [N=4] [extra args] | status | wait | merge | stop | clean}" >&2
+        echo "   or: $0 {deep-start [extra args] | deep-status | deep-stop | deep-merge}" >&2
         exit 2
         ;;
 esac
