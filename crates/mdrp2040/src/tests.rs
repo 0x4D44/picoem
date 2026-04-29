@@ -4031,6 +4031,178 @@ mod stage1_execute_coverage {
     }
 }
 
+// ===========================================================================
+// 2026-04-28 — M0+ Thumb-32 MSR/MRS fixes from qemu_diff_m0plus fuzz triage
+// ---------------------------------------------------------------------------
+// The 10k-iteration fuzz session in /tmp/qemu_m0plus_fuzz10k_v2.log surfaced
+// six bug classes spanning MSR (sysm = 0, 8, 9, 20) and MRS (sysm = 8, 9).
+// Per the work-package brief:
+//
+//   B1 (MSR APSR / sysm=0, Q-flag bit 27)  — QEMU divergence; ARMv6-M B1.4.2
+//      defines APSR as N/Z/C/V only (no Q on M0+). EMU is spec-correct, the
+//      test below documents the expected behaviour and pins it down.
+//   B2 (MSR sysm=8, MSP)   — EMU spec-correct (existing tests at lines
+//      3964-3990 cover the banked-write semantics).
+//   B3 (MSR sysm=9, PSP)   — likewise spec-correct.
+//   B4 (MSR sysm=20, CTRL) — likewise spec-correct.
+//   B5 (MRS sysm=8, MSP)   — REAL BUG: handler returns `regs.msp` even when
+//      MSP is the active SP, where the architectural value lives in r[13].
+//   B6 (MRS sysm=9, PSP)   — REAL BUG: symmetric.
+//
+// The first test is a B1 confirmation (passes pre-fix); the rest are B5/B6
+// reproducers (fail pre-fix) plus three brief-mandated MSR scenarios that
+// happen to pass with the existing executor and serve as regression pins.
+// ===========================================================================
+
+mod m0plus_msr_mrs_fixes {
+    use super::*;
+
+    /// B1 — MSR APSR (sysm=0) writes only NZCV; the Q flag (bit 27) is not
+    /// architected on ARMv6-M and must remain clear.
+    ///
+    /// Encoding: hw0 = 0xF380 | Rn (Rn = 0), hw1 = 0x8800 | sysm (sysm = 0).
+    #[test]
+    fn msr_apsr_sysm_0_writes_nzcv_only() {
+        let mut cpu = CortexM0Plus::new();
+        // Top 5 bits all set: NZCV + Q. Q (bit 27) must NOT propagate.
+        cpu.regs.r[0] = 0xF800_0000;
+        cpu.regs.xpsr = 0x0100_0000; // T bit set, all flags clear pre.
+        cpu.execute_one_wide(0xF380, 0x8800);
+        assert_eq!(
+            cpu.regs.xpsr & 0xF000_0000,
+            0xF000_0000,
+            "NZCV must all be set"
+        );
+        assert_eq!(
+            cpu.regs.xpsr & 0x0800_0000,
+            0,
+            "Q (bit 27) is not architected on M0+ APSR"
+        );
+        // T bit and IPSR untouched.
+        assert_eq!(cpu.regs.xpsr & 0x0100_0000, 0x0100_0000);
+        assert!(!cpu.has_pending_fault());
+    }
+
+    /// B5 — MRS sysm=8 (MSP) must return the architectural MSP. When MSP is
+    /// the active SP (SPSEL=0), the live value lives in r[13]; the cached
+    /// `regs.msp` is only authoritative when MSP is the inactive bank.
+    ///
+    /// This reproduces the harness pattern where `set_reg(13, ...)` seeds
+    /// the active SP without touching `regs.msp` — pre-fix the read returns
+    /// the stale 0.
+    #[test]
+    fn mrs_msp_returns_msp_when_active() {
+        let mut cpu = CortexM0Plus::new();
+        // SPSEL=0 → MSP active. `regs.msp` left at 0; r[13] = seed.
+        let seed = 0x2000_1000u32;
+        cpu.regs.r[13] = seed;
+        // MRS r0, MSP — hw0 = 0xF3EF, hw1 = 0x8008.
+        cpu.execute_one_wide(0xF3EF, 0x8008);
+        assert_eq!(cpu.regs.r[0], seed);
+    }
+
+    /// B5 cont. — MRS sysm=8 must read the cached `regs.msp` when MSP is
+    /// the inactive bank (SPSEL=1, PSP active).
+    #[test]
+    fn mrs_msp_returns_banked_msp_when_inactive() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.control = 0x2; // SPSEL=1 → PSP active.
+        cpu.regs.msp = 0xCAFE_F00D; // Banked MSP value.
+        cpu.regs.r[13] = 0x1234_5678; // Active SP = PSP, irrelevant for MSP read.
+        cpu.execute_one_wide(0xF3EF, 0x8008);
+        assert_eq!(cpu.regs.r[0], 0xCAFE_F00D);
+    }
+
+    /// B6 — MRS sysm=9 (PSP) must return the architectural PSP. Symmetric
+    /// to B5: when PSP is active, the live value is r[13]; otherwise the
+    /// cached `regs.psp` is authoritative.
+    ///
+    /// Reproducer: switch to PSP active via MSR CONTROL (which syncs
+    /// banks), seed r[13] directly, switch back. The brief's recipe sets
+    /// PSP through the active-SP write path then reads it.
+    #[test]
+    fn mrs_psp_returns_psp_when_active() {
+        let mut cpu = CortexM0Plus::new();
+        // SPSEL=1 → PSP active. seed = active SP (= PSP).
+        cpu.regs.control = 0x2;
+        let seed = 0xE8A8_B844u32;
+        cpu.regs.r[13] = seed;
+        // MRS r0, PSP — hw0 = 0xF3EF, hw1 = 0x8009.
+        cpu.execute_one_wide(0xF3EF, 0x8009);
+        assert_eq!(cpu.regs.r[0], seed);
+    }
+
+    /// B6 cont. — MRS sysm=9 must read the cached `regs.psp` when PSP is
+    /// the inactive bank (SPSEL=0, MSP active).
+    #[test]
+    fn mrs_psp_returns_banked_psp_when_inactive() {
+        let mut cpu = CortexM0Plus::new();
+        // SPSEL=0 (default) → MSP active.
+        cpu.regs.psp = 0xDEAD_BEEF;
+        cpu.regs.r[13] = 0x2000_1000; // Active SP = MSP.
+        cpu.execute_one_wide(0xF3EF, 0x8009);
+        assert_eq!(cpu.regs.r[0], 0xDEAD_BEEF);
+    }
+
+    /// Brief-mandated test 4 — MSR sysm=8 (MSP) while SPSEL=1 (PSP active)
+    /// must update the MSP bank only; r[13] stays on PSP. A subsequent
+    /// MRS sysm=8 must observe the freshly-written value.
+    ///
+    /// Already covered architecturally by `msr_msp_with_psp_active_does_not_touch_r13`
+    /// at line 3978; this variant chains in the MRS read-back to pin the
+    /// invariant end-to-end.
+    #[test]
+    fn msr_msp_writes_msp_only_when_psp_active() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.control = 0x2; // SPSEL=1 → PSP active.
+        cpu.regs.r[13] = 0x2000_4000; // Active SP = PSP.
+        cpu.regs.psp = 0x2000_4000;
+        cpu.regs.r[0] = 0x2000_8000; // MSP value to write.
+        // MSR MSP, r0 — hw0 = 0xF380, hw1 = 0x8808.
+        cpu.execute_one_wide(0xF380, 0x8808);
+        assert_eq!(cpu.regs.msp, 0x2000_8000, "MSP bank updated");
+        assert_eq!(cpu.regs.r[13], 0x2000_4000, "active SP (PSP) untouched");
+        // Read back MSP via MRS — must return the freshly written value
+        // (MSP is inactive, so reads come from regs.msp).
+        cpu.execute_one_wide(0xF3EF, 0x8108); // MRS r1, MSP
+        assert_eq!(cpu.regs.r[1], 0x2000_8000);
+    }
+
+    /// Brief-mandated test 5 — symmetric to 4: MSR sysm=9 (PSP) while
+    /// SPSEL=0 (MSP active) updates the PSP bank only; r[13] stays on MSP.
+    #[test]
+    fn msr_psp_writes_psp_only_when_msp_active() {
+        let mut cpu = CortexM0Plus::new();
+        // SPSEL=0 (default) → MSP active.
+        cpu.regs.r[13] = 0x2000_2000; // Active SP = MSP.
+        cpu.regs.r[0] = 0x2000_5000; // PSP value to write.
+        cpu.execute_one_wide(0xF380, 0x8809); // MSR PSP, r0
+        assert_eq!(cpu.regs.psp, 0x2000_5000, "PSP bank updated");
+        assert_eq!(cpu.regs.r[13], 0x2000_2000, "active SP (MSP) untouched");
+        // Read back PSP — should return 0x2000_5000.
+        cpu.execute_one_wide(0xF3EF, 0x8109); // MRS r1, PSP
+        assert_eq!(cpu.regs.r[1], 0x2000_5000);
+    }
+
+    /// Brief-mandated test 6 — MSR sysm=20 (CONTROL) flipping SPSEL must
+    /// retarget r[13] to the new bank's value.
+    #[test]
+    fn msr_control_spsel_switches_sp() {
+        let mut cpu = CortexM0Plus::new();
+        // SPSEL=0 → MSP active. r[13] = MSP = A.
+        let a = 0x2000_8000u32;
+        let b = 0x2000_C000u32;
+        cpu.regs.r[13] = a;
+        cpu.regs.psp = b; // PSP holds the alternate-bank value.
+        cpu.regs.r[0] = 0x2; // CONTROL value: SPSEL=1, nPRIV=0.
+        // MSR CONTROL, r0 — hw0 = 0xF380, hw1 = 0x8814.
+        cpu.execute_one_wide(0xF380, 0x8814);
+        assert_eq!(cpu.regs.control, 0x2);
+        assert_eq!(cpu.regs.r[13], b, "r[13] now tracks PSP");
+        assert_eq!(cpu.regs.msp, a, "MSP saved to bank");
+    }
+}
+
 // ============================================================================
 // Stage 2 — Bus & peripheral branch coverage (2026-04-23)
 // ----------------------------------------------------------------------------

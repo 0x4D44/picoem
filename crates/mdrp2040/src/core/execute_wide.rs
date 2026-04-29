@@ -207,10 +207,25 @@ impl CortexM0Plus {
             0 | 3 => self.regs.xpsr & 0xF000_0000,
             // IPSR — exception number in [8:0].
             5 => self.regs.xpsr & 0x1FF,
-            // MSP
-            8 => self.regs.msp,
-            // PSP
-            9 => self.regs.psp,
+            // MSP — when MSP is the active SP the architectural value
+            // lives in r[13]; the cached `regs.msp` is only authoritative
+            // while MSP is the inactive bank. Mirrors the symmetric write
+            // path on line 156.
+            8 => {
+                if self.regs.active_sp_is_psp() {
+                    self.regs.msp
+                } else {
+                    self.regs.r[13]
+                }
+            }
+            // PSP — symmetric: live in r[13] when PSP-active, else cached.
+            9 => {
+                if self.regs.active_sp_is_psp() {
+                    self.regs.r[13]
+                } else {
+                    self.regs.psp
+                }
+            }
             // PRIMASK
             16 => self.regs.primask & 1,
             // CONTROL
