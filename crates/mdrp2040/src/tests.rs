@@ -3177,6 +3177,376 @@ mod phase1_wave2 {
         let armed = emu.bus.read32(crate::bus::TIMER_BASE + 0x20);
         assert_eq!(armed & 1, 0, "ARMED bit 0 must auto-clear on fire");
     }
+
+    // -----------------------------------------------------------------
+    // Forcing-function tests — lock in the V5 IRQ plumbing end-to-end.
+    //
+    // These three tests drive the same MMIO surface firmware uses (SCB
+    // VTOR, NVIC ISER, SCB ICSR) so the dispatcher in
+    // `CortexM0Plus::try_take_any_pending_exception`
+    // (`crates/mdrp2040/src/core/mod.rs:330-375`) and the bus-level
+    // drain at `Bus::irq_pending`
+    // (`crates/mdrp2040/src/bus/mod.rs:395`) cannot regress silently.
+    // See `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md`
+    // §5.2 / §5.3 for the design.
+
+    /// Cold-entry IRQ test, MMIO-driven: program VTOR via the SCB
+    /// register, enable NVIC line 0 via the ISER register, and assert
+    /// the bus-level IRQ. After two single-quantum steps the dispatcher
+    /// must enter the handler with the canonical 8-word frame on the
+    /// stack and IPSR == 16 (TIMER_IRQ_0 → exception #16).
+    #[test]
+    fn test_irq_cold_entry_timer_irq_0() {
+        const SCB_VTOR_ADDR: u32 = 0xE000_ED08;
+        const NVIC_ISER0_ADDR: u32 = 0xE000_E100;
+        const VTOR_BASE: u32 = 0x2000_0000;
+        const HANDLER_ADDR: u32 = VTOR_BASE + 0x80;
+        const MAIN_ADDR: u32 = VTOR_BASE + 0x100;
+        const STACK_TOP: u32 = 0x2002_0000;
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+
+        // Plant a 17-entry vector table: slot 0 = initial SP, slots 1..=15
+        // = system exceptions (all → handler), slot 16 = TIMER_IRQ_0
+        // (NVIC line 0 → exception #16). Every vector carries the
+        // architectural Thumb bit.
+        emu.bus.write32(VTOR_BASE, STACK_TOP);
+        for i in 1..=16u32 {
+            emu.bus.write32(VTOR_BASE + i * 4, HANDLER_ADDR | 1);
+        }
+        // Handler: NOP + self-loop.
+        emu.bus.write16(HANDLER_ADDR, 0xBF00);
+        emu.bus.write16(HANDLER_ADDR + 2, 0xE7FE);
+        // Main: NOP + self-loop.
+        emu.bus.write16(MAIN_ADDR, 0xBF00);
+        emu.bus.write16(MAIN_ADDR + 2, 0xE7FE);
+
+        // Program VTOR through the SCB MMIO, the way firmware does.
+        emu.bus.write32(SCB_VTOR_ADDR, VTOR_BASE);
+        assert_eq!(
+            emu.bus.ppb[0].vtor, VTOR_BASE,
+            "VTOR write through SCB must reach ppb[0]"
+        );
+
+        // Seed core 0: PC = main, MSP = stack top, also r[13] (the SP
+        // alias used in the hot path). Park R0..R3, R12, LR with known
+        // sentinels so we can verify the stacked frame.
+        emu.cores[0].regs.set_pc(MAIN_ADDR);
+        emu.cores[0].regs.msp = STACK_TOP;
+        emu.cores[0].regs.r[13] = STACK_TOP;
+        emu.cores[0].regs.r[0] = 0xAAAA_0000;
+        emu.cores[0].regs.r[1] = 0xAAAA_0001;
+        emu.cores[0].regs.r[2] = 0xAAAA_0002;
+        emu.cores[0].regs.r[3] = 0xAAAA_0003;
+        emu.cores[0].regs.r[12] = 0xAAAA_000C;
+        emu.cores[0].regs.r[14] = 0xAAAA_000E; // LR
+
+        // Enable NVIC line 0 through the ISER register, like firmware.
+        emu.bus.write32(NVIC_ISER0_ADDR, 1u32 << IRQ_TIMER_IRQ_0);
+        assert!(
+            emu.bus.nvics[0].is_enabled(IRQ_TIMER_IRQ_0 as u8),
+            "ISER write must reach nvics[0].enabled"
+        );
+
+        // Assert the IRQ on the bus-level pending bitmap. The next slow-
+        // path step drains it into both cores' NVICs.
+        emu.bus.irq_pending |= 1u32 << IRQ_TIMER_IRQ_0;
+
+        // Step 1: drain irq_pending → NVIC.pending.
+        emu.step().expect("Serial step is infallible");
+        assert_eq!(
+            emu.bus.irq_pending(),
+            0,
+            "drain must clear the bus-level bitmap"
+        );
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "drain must latch the NVIC pending bit"
+        );
+
+        // Step 2: dispatcher accepts and enters the handler.
+        emu.step().expect("Serial step is infallible");
+
+        // PC must equal the handler with the Thumb bit cleared.
+        assert_eq!(
+            emu.cores[0].regs.pc(),
+            HANDLER_ADDR,
+            "dispatch must land at the handler with Thumb bit stripped"
+        );
+        // IPSR must encode exception #16 (TIMER_IRQ_0).
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            16,
+            "IPSR must encode the dispatched exception number"
+        );
+        // 8-word frame: MSP decreased by 32 from STACK_TOP (STACK_TOP is
+        // already 8-aligned, so no STKALIGN pad).
+        let frame_sp = STACK_TOP - 32;
+        assert_eq!(
+            emu.cores[0].regs.msp, frame_sp,
+            "MSP must decrease by exactly 32 bytes (8-word frame)"
+        );
+        // Frame layout (ARMv6-M ARM §B1.5.6): R0, R1, R2, R3, R12, LR,
+        // return-PC, xPSR — low address to high.
+        assert_eq!(emu.bus.read32(frame_sp), 0xAAAA_0000, "frame[0] = R0");
+        assert_eq!(emu.bus.read32(frame_sp + 4), 0xAAAA_0001, "frame[1] = R1");
+        assert_eq!(emu.bus.read32(frame_sp + 8), 0xAAAA_0002, "frame[2] = R2");
+        assert_eq!(
+            emu.bus.read32(frame_sp + 12),
+            0xAAAA_0003,
+            "frame[3] = R3"
+        );
+        assert_eq!(
+            emu.bus.read32(frame_sp + 16),
+            0xAAAA_000C,
+            "frame[4] = R12"
+        );
+        assert_eq!(
+            emu.bus.read32(frame_sp + 20),
+            0xAAAA_000E,
+            "frame[5] = LR"
+        );
+        // Return-PC: step 1 ran the slow-path drain *and* executed the
+        // NOP at MAIN_ADDR (advancing PC to MAIN_ADDR + 2); step 2's
+        // dispatch pre-empted before the next instruction committed.
+        // ARMv6-M ARM §B1.5.6: async exceptions stack the next-
+        // instruction PC.
+        assert_eq!(
+            emu.bus.read32(frame_sp + 24),
+            MAIN_ADDR + 2,
+            "frame[6] = stacked return-PC = next-after-NOP"
+        );
+        // Stacked xPSR: Thumb bit (24) set, IPSR field clear (was thread
+        // mode at entry), STKALIGN bit (9) clear (already 8-aligned).
+        let stacked_xpsr = emu.bus.read32(frame_sp + 28);
+        assert_ne!(
+            stacked_xpsr & (1 << 24),
+            0,
+            "stacked xPSR must carry the Thumb bit"
+        );
+        assert_eq!(
+            stacked_xpsr & 0x1FF,
+            0,
+            "stacked xPSR IPSR field must reflect pre-entry thread mode"
+        );
+
+        // LR must hold an EXC_RETURN magic — Thread mode + MSP.
+        assert_eq!(
+            emu.cores[0].regs.r[14],
+            0xFFFF_FFF9,
+            "LR must hold EXC_RETURN for Thread/MSP"
+        );
+
+        // NVIC pending bit must clear on accept.
+        assert!(
+            !emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "NVIC pending bit must clear on dispatch"
+        );
+    }
+
+    /// PendSV (#14) and SysTick (#15) both pended via ICSR W1S bits at
+    /// the same priority. PendSV's lower exception number wins the
+    /// tie-break. After PendSV's handler self-loops (the planted
+    /// handler is `NOP; B .`), tearing down via a synthetic
+    /// `test_exit_exception` triggers tail-chaining into SysTick — no
+    /// unstacking, the same MSP carries through.
+    #[test]
+    fn test_pendsv_systick_tail_chain_priority() {
+        const SCB_VTOR_ADDR: u32 = 0xE000_ED08;
+        const SCB_ICSR_ADDR: u32 = 0xE000_ED04;
+        const ICSR_PENDSVSET: u32 = 1 << 28;
+        const ICSR_PENDSTSET: u32 = 1 << 26;
+        const VTOR_BASE: u32 = 0x2000_0000;
+        const HANDLER_ADDR: u32 = VTOR_BASE + 0x80;
+        const MAIN_ADDR: u32 = VTOR_BASE + 0x100;
+        const STACK_TOP: u32 = 0x2002_0000;
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+
+        // 16-entry system-exception vector table; vectors 14 (PendSV) and
+        // 15 (SysTick) point at the same handler stub — the tests below
+        // discriminate by IPSR and tail-chain SP behaviour, not by PC.
+        emu.bus.write32(VTOR_BASE, STACK_TOP);
+        for i in 1..=15u32 {
+            emu.bus.write32(VTOR_BASE + i * 4, HANDLER_ADDR | 1);
+        }
+        emu.bus.write16(HANDLER_ADDR, 0xBF00);
+        emu.bus.write16(HANDLER_ADDR + 2, 0xE7FE);
+        emu.bus.write16(MAIN_ADDR, 0xBF00);
+        emu.bus.write16(MAIN_ADDR + 2, 0xE7FE);
+
+        emu.bus.write32(SCB_VTOR_ADDR, VTOR_BASE);
+        emu.cores[0].regs.set_pc(MAIN_ADDR);
+        emu.cores[0].regs.msp = STACK_TOP;
+        emu.cores[0].regs.r[13] = STACK_TOP;
+
+        // Pend BOTH PendSV and SysTick at the same priority (default 0).
+        // ICSR W1S bits at 0xE000_ED04: PENDSVSET (28), PENDSTSET (26).
+        emu.bus.write32(SCB_ICSR_ADDR, ICSR_PENDSVSET | ICSR_PENDSTSET);
+        let icsr = emu.bus.ppb[0].icsr;
+        assert_ne!(icsr & ICSR_PENDSVSET, 0, "PENDSVSET must latch");
+        assert_ne!(icsr & ICSR_PENDSTSET, 0, "PENDSTSET must latch");
+
+        // Step: PendSV (#14) must win the tie-break (lower exc number
+        // beats SysTick #15 at equal priority).
+        emu.step().expect("Serial step is infallible");
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            14,
+            "PendSV (#14) must win the priority tie over SysTick (#15)"
+        );
+        // PENDSVSET must clear on accept; PENDSTSET stays latched.
+        assert_eq!(
+            emu.bus.ppb[0].icsr & ICSR_PENDSVSET,
+            0,
+            "PENDSVSET must clear on dispatch"
+        );
+        assert_ne!(
+            emu.bus.ppb[0].icsr & ICSR_PENDSTSET,
+            0,
+            "PENDSTSET must remain latched while PendSV runs"
+        );
+
+        let in_handler_msp = emu.cores[0].regs.msp;
+        assert_eq!(
+            in_handler_msp,
+            STACK_TOP - 32,
+            "PendSV entry must push the 8-word frame"
+        );
+
+        // Synthesise the handler's `BX LR` to drive tail-chaining: the
+        // dispatcher sees PENDSTSET still latched on exit and re-enters
+        // SysTick without unstacking. We use the `test_exit_exception`
+        // hook to avoid having to assemble the BX directly into the
+        // handler stub.
+        emu.cores[0]
+            .test_exit_exception(0xFFFF_FFF9, &mut emu.bus);
+        // After tail-chain, IPSR must be 15 (SysTick) and the MSP must
+        // match the in-handler value (no full unstacking).
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            15,
+            "SysTick (#15) must tail-chain after PendSV (#14)"
+        );
+        assert_eq!(
+            emu.cores[0].regs.msp, in_handler_msp,
+            "tail-chain re-pushes a frame at the same SP — the unstack/restack cancel \
+             (exit_exception unstacks, deallocates SP, then polls pending exceptions; \
+             cf. HLD V5 §5.3 unstack-then-redispatch order)"
+        );
+        // PENDSTSET is now cleared by the SysTick dispatch.
+        assert_eq!(
+            emu.bus.ppb[0].icsr & ICSR_PENDSTSET,
+            0,
+            "PENDSTSET must clear when SysTick dispatches"
+        );
+
+        // Final return: SysTick exits via EXC_RETURN 0xF9 → Thread/MSP.
+        // After this the frame is unstacked and we're back in main.
+        emu.cores[0]
+            .test_exit_exception(0xFFFF_FFF9, &mut emu.bus);
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            0,
+            "Thread mode after SysTick returns"
+        );
+        assert_eq!(
+            emu.cores[0].regs.msp, STACK_TOP,
+            "MSP fully restored to pre-entry value"
+        );
+    }
+
+    /// PRIMASK = 1 must mask all maskable IRQs (PendSV / SysTick /
+    /// external) regardless of NVIC enable + pending. Clearing PRIMASK
+    /// must un-mask immediately on the next step.
+    #[test]
+    fn test_irq_masked_pending_primask() {
+        const SCB_VTOR_ADDR: u32 = 0xE000_ED08;
+        const VTOR_BASE: u32 = 0x2000_0000;
+        const HANDLER_ADDR: u32 = VTOR_BASE + 0x80;
+        const MAIN_ADDR: u32 = VTOR_BASE + 0x100;
+        const STACK_TOP: u32 = 0x2002_0000;
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build is infallible");
+
+        // 17-entry vector table covering TIMER_IRQ_0 (slot 16).
+        emu.bus.write32(VTOR_BASE, STACK_TOP);
+        for i in 1..=16u32 {
+            emu.bus.write32(VTOR_BASE + i * 4, HANDLER_ADDR | 1);
+        }
+        emu.bus.write16(HANDLER_ADDR, 0xBF00);
+        emu.bus.write16(HANDLER_ADDR + 2, 0xE7FE);
+        emu.bus.write16(MAIN_ADDR, 0xBF00);
+        emu.bus.write16(MAIN_ADDR + 2, 0xE7FE);
+
+        // Program VTOR through the SCB MMIO, the way firmware does
+        // (consistent with test_irq_cold_entry_timer_irq_0 and
+        // test_pendsv_systick_tail_chain_priority).
+        emu.bus.write32(SCB_VTOR_ADDR, VTOR_BASE);
+        assert_eq!(
+            emu.bus.ppb[0].vtor, VTOR_BASE,
+            "VTOR write through SCB must reach ppb[0]"
+        );
+        emu.cores[0].regs.set_pc(MAIN_ADDR);
+        emu.cores[0].regs.msp = STACK_TOP;
+        emu.cores[0].regs.r[13] = STACK_TOP;
+
+        // Mask interrupts BEFORE pending the IRQ.
+        emu.cores[0].regs.primask = 1;
+        emu.bus.nvics[0].set_enabled(IRQ_TIMER_IRQ_0 as u8);
+        emu.bus.irq_pending |= 1u32 << IRQ_TIMER_IRQ_0;
+
+        // Several steps with PRIMASK set — drain still happens (the
+        // bus-level bitmap moves into NVIC.pending) but no dispatch.
+        // Belt-and-braces: assert NVIC pending stays latched across
+        // every iteration, not just the final state.
+        for i in 0..4 {
+            emu.step().expect("Serial step is infallible");
+            assert_eq!(
+                emu.cores[0].regs.ipsr(),
+                0,
+                "PRIMASK=1 must keep the core in thread mode (iter {i})"
+            );
+            assert!(
+                emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+                "PRIMASK must leave NVIC pending latched across steps (iter {i})"
+            );
+        }
+        // PC must still be inside main (the planted self-loop).
+        assert!(
+            emu.cores[0].regs.pc() == MAIN_ADDR
+                || emu.cores[0].regs.pc() == MAIN_ADDR + 2,
+            "PC must remain in main while IRQ is masked"
+        );
+        // NVIC pending bit stays latched.
+        assert!(
+            emu.bus.nvics[0].is_pending(IRQ_TIMER_IRQ_0 as u8),
+            "PRIMASK leaves NVIC pending latched"
+        );
+
+        // Clear PRIMASK — the next step must dispatch.
+        emu.cores[0].regs.primask = 0;
+        emu.step().expect("Serial step is infallible");
+        assert_eq!(
+            emu.cores[0].regs.ipsr(),
+            16,
+            "clearing PRIMASK must unmask the pending TIMER_IRQ_0"
+        );
+        assert_eq!(
+            emu.cores[0].regs.pc(),
+            HANDLER_ADDR,
+            "PC must be at the TIMER_IRQ_0 handler after unmask"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

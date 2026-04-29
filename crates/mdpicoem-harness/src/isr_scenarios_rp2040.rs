@@ -15,17 +15,20 @@
 // imported from the M33 module — they name architectural registers
 // that are identical across M33 and M0+.
 //
-// **Expected EMU behaviour.** As of this write, the `mdrp2040` core's
-// `step()` does not poll ICSR.PENDSVSET / PENDSTSET between
-// instructions, and NVIC ISER/ISPR/ICPR registers are unmodelled — an
-// `str` to ICSR latches the bit (ppb.rs handles W1S/W1C correctly) but
-// no exception is dispatched. A write to NVIC_ISER / NVIC_ISPR falls
-// through harmlessly. Both scenarios therefore FAIL on the EMU side
-// until the Phase 1 IRQ plumbing (`Bus::irq_pending` +
-// `tick_peripherals` + pending-exception dispatch in `CortexM0Plus::
-// step`) lands. This is the same posture the RP2350 oracle takes
-// against `tech_debt.md` § "Exception entry/exit not differentially
-// validated"; the oracle is the surfacing tool.
+// **Expected EMU behaviour.** V5 IRQ plumbing is complete (HLD V7
+// §5.2 / §5.3 — see `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral
+// Coverage V7.md`): the bus drains pending lines from
+// `Bus::irq_pending` (`crates/mdrp2040/src/bus/mod.rs:395`) into both
+// cores' NVIC pending latches, NVIC ISER / ISPR / ICPR / IPR are fully
+// modelled at `0xE000_E100..0xE000_E41F`, the per-core SysTick latches
+// `ICSR.PENDSTSET` on underflow, and the unified pending-exception
+// dispatcher (`CortexM0Plus::try_take_any_pending_exception` at
+// `crates/mdrp2040/src/core/mod.rs:330-375`) runs every `step()`,
+// covering PendSV / SysTick / external-IRQ entry through
+// `enter_exception` (`crates/mdrp2040/src/core/exceptions.rs`). EMU-
+// side scenarios should therefore pass; remaining FAILs surface real
+// divergences in stacked-frame layout, exception priority, or counter
+// observables rather than missing plumbing.
 
 #[cfg(test)]
 use crate::ISR_MAILBOX_CYCCNT;
@@ -643,10 +646,11 @@ pub struct IsrScenario {
     pub image: &'static [u8],
     pub entry_offset: u32,
     pub init_regs: &'static [(IsrReg, u32)],
-    /// Wall-clock budget in milliseconds. Exception dispatch isn't
-    /// modelled yet on EMU, so this runs out on the EMU side — which
-    /// is the expected FAIL signal. Kept short so the oracle completes
-    /// quickly even with two FAIL scenarios.
+    /// Wall-clock budget in milliseconds. Exception dispatch is
+    /// modelled (HLD V7 §5.2 / §5.3 — see `Bus::irq_pending`,
+    /// `CortexM0Plus::try_take_any_pending_exception`,
+    /// `enter_exception`); the budget bounds runtime in case a
+    /// scenario regresses and a handler fails to exit cleanly.
     pub max_millis: u32,
     pub observe: &'static [(&'static str, IsrObservable)],
 }
@@ -720,6 +724,7 @@ const EXTRA_REG: RegisterId = RegisterId(0b10100);
 #[derive(Clone, Debug, Default)]
 pub struct IsrArgs {
     pub filter: Option<String>,
+    pub exclude: Option<String>,
     pub verbose: bool,
 }
 
@@ -743,7 +748,7 @@ fn isr_reg_id(r: IsrReg) -> Option<RegisterId> {
 fn apply_init_regs_hw(
     core: &mut Core,
     init_regs: &[(IsrReg, u32)],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for &(reg, val) in init_regs {
         match reg {
             IsrReg::Vtor => {
@@ -780,7 +785,10 @@ fn apply_init_regs_emu(emu: &mut mdrp2040::Emulator, init_regs: &[(IsrReg, u32)]
 
 /// Scenario-specific MMIO preamble. Handles the one case (tail-chain)
 /// that needs SysTick pre-armed via MMIO rather than through init_regs.
-fn scenario_preamble_hw(core: &mut Core, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn scenario_preamble_hw(
+    core: &mut Core,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if name == "isr_m0_tail_chain_pendsv_systick" {
         // Arm SysTick with a short reload so the underflow fires quickly.
         core.write_word_32(SYST_RVR_ADDR as u64, 4)?;
@@ -801,7 +809,7 @@ fn scenario_preamble_emu(emu: &mut mdrp2040::Emulator, name: &str) {
 fn read_observable_hw(
     core: &mut Core,
     obs: IsrObservable,
-) -> Result<u32, Box<dyn std::error::Error>> {
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     Ok(match obs {
         IsrObservable::Mmio(addr, _mask) => core.read_word_32(addr as u64)?,
         IsrObservable::Memory(addr) => core.read_word_32(addr as u64)?,
@@ -825,7 +833,9 @@ fn observable_mask(obs: IsrObservable) -> u32 {
 /// Clear the per-scenario counter cells and TIMER state in SRAM / MMIO.
 /// Done before every scenario on both sides so a previous scenario's
 /// counter doesn't bleed through.
-fn reset_scenario_state_hw(core: &mut Core) -> Result<(), Box<dyn std::error::Error>> {
+fn reset_scenario_state_hw(
+    core: &mut Core,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     core.write_word_32(CTR_TIMER_ADDR as u64, 0)?;
     core.write_word_32(CTR_PENDSV_ADDR as u64, 0)?;
     core.write_word_32(CTR_SYSTICK_ADDR as u64, 0)?;
@@ -1017,7 +1027,7 @@ fn run_one_scenario(
     core: &mut Core,
     sc: &IsrScenario,
     verbose: bool,
-) -> Result<(Verdict, Option<String>, Duration), Box<dyn std::error::Error>> {
+) -> Result<(Verdict, Option<String>, Duration), Box<dyn std::error::Error + Send + Sync>> {
     let t0 = Instant::now();
 
     // ---- HW side -----------------------------------------------------
@@ -1149,35 +1159,69 @@ fn run_one_scenario(
     Ok((verdict, first_div, t0.elapsed()))
 }
 
-/// Library entry point. Runs every scenario whose name matches
-/// `args.filter` in catalogue order; performs a best-effort cleanup
-/// (VTOR=0, SysTick disabled, NVIC ICPR cleared, TIMER.INTE cleared,
-/// ICSR pend-clears) before returning.
+/// Library entry point. Runs scenarios on `core` and returns one
+/// `CaseOutcome` per scenario actually executed; performs a best-effort
+/// cleanup (VTOR=0, SysTick disabled, NVIC ICPR cleared, TIMER.INTE
+/// cleared, ICSR pend-clears) before returning.
+///
+/// * `order = None` — run scenarios in catalogue order, applying
+///   `args.filter` (substring include) and `args.exclude` (substring
+///   skip) filters.
+/// * `order = Some(&[name, …])` — run exactly those scenarios in that
+///   order; `args.filter` / `args.exclude` are ignored. Unknown names
+///   are skipped with one `eprintln!` per name.
+/// * `deadline = Some(t)` — return early between scenarios when
+///   `Instant::now() > t` so the orchestrator's per-oracle watchdog can
+///   bail out without losing the partial outcomes already collected.
 pub fn run_against(
     core: &mut Core,
     args: &IsrArgs,
-) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
+    order: Option<&[&str]>,
+    deadline: Option<Instant>,
+) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error + Send + Sync>> {
     if !core.status()?.is_halted() {
         core.halt(Duration::from_millis(200))?;
     }
     // Enable CYCCNT for parity — harmless if absent on M0+ silicon.
     let _ = enable_cyccnt(core);
 
-    let selected: Vec<&IsrScenario> = SCENARIOS
-        .iter()
-        .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
-        .collect();
+    let selected: Vec<&IsrScenario> = match order {
+        None => SCENARIOS
+            .iter()
+            .filter(|s| silicon_oracle::name_matches_filter(s.name, args.filter.as_deref()))
+            .filter(|s| !silicon_oracle::should_exclude(s.name, args.exclude.as_deref()))
+            .collect(),
+        Some(names) => {
+            let mut v: Vec<&IsrScenario> = Vec::with_capacity(names.len());
+            for name in names {
+                match SCENARIOS.iter().find(|s| s.name == *name) {
+                    Some(sc) => v.push(sc),
+                    None => eprintln!(
+                        "isr_scenarios_rp2040::run_against: unknown scenario '{name}' in order list; skipping",
+                    ),
+                }
+            }
+            v
+        }
+    };
 
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
-    let mut loop_err: Option<Box<dyn std::error::Error>> = None;
+    let mut loop_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
     for sc in &selected {
+        if let Some(d) = deadline {
+            if Instant::now() > d {
+                break;
+            }
+        }
         match run_one_scenario(core, sc, args.verbose) {
             Ok((verdict, detail, elapsed)) => {
                 let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 outcomes.push(match verdict {
                     Verdict::Pass => CaseOutcome::pass("isr_m0", sc.name, elapsed_ms),
-                    Verdict::Fail => {
+                    // run_one_scenario only emits Pass/Fail; tolerate
+                    // the other variants to keep this match exhaustive.
+                    Verdict::Fail | Verdict::Skip | Verdict::Degraded => {
                         CaseOutcome::fail("isr_m0", sc.name, detail.unwrap_or_default(), elapsed_ms)
                     }
                 });

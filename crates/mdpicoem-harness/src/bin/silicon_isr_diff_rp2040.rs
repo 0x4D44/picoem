@@ -19,13 +19,17 @@
 // `probe_diff_rp2040`); this binary ships ahead of silicon hookup so
 // the Phase-1 exit criterion has a concrete oracle to point at.
 //
-// Expected EMU behaviour. The `mdrp2040` core's `step()` does not
-// poll ICSR.PENDSVSET / PENDSTSET between instructions, and the
-// NVIC ISER / ISPR / ICPR registers are unmodelled on `mdrp2040`. An
-// `str` to those addresses falls through harmlessly — no exception
-// dispatches on the EMU side. Both v1 scenarios are therefore
-// expected to FAIL on EMU until the Phase 1 IRQ plumbing lands (V7
-// §4.4, §6.1). The oracle is the surfacing tool for that gap.
+// Expected EMU behaviour. V5 IRQ plumbing is complete (NVIC MMIO +
+// SysTick + unified exception dispatcher) per HLD V7 §5.2 / §5.3
+// (`wrk_docs/2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md`):
+// `Bus::irq_pending` (`crates/mdrp2040/src/bus/mod.rs:395`) drains into
+// both cores' NVICs, NVIC ISER / ISPR / ICPR / IPR are modelled at
+// `0xE000_E100..0xE000_E41F`, and `CortexM0Plus::try_take_any_pending_
+// exception` (`crates/mdrp2040/src/core/mod.rs:330-375`) dispatches
+// PendSV / SysTick / external IRQs every `step()` through
+// `enter_exception` (`crates/mdrp2040/src/core/exceptions.rs`). EMU-
+// side scenarios should pass; remaining FAILs surface real divergences
+// rather than missing plumbing.
 
 use mdpicoem_harness::isr_scenarios_rp2040::{self, IsrArgs};
 use mdpicoem_harness::silicon_oracle::Verdict;
@@ -114,6 +118,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let t_total = Instant::now();
     let mut pass = 0usize;
     let mut fail = 0usize;
+    let mut skip = 0usize;
+    let mut degraded = 0usize;
 
     println!(
         "{:<40} {:>8} {:>8}  first_divergence",
@@ -123,11 +129,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     {
         let mut core = session.core(0)?;
-        let outcomes = isr_scenarios_rp2040::run_against(&mut core, &args)?;
+        let outcomes = isr_scenarios_rp2040::run_against(&mut core, &args, None, None)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
         for o in &outcomes {
             match o.verdict {
                 Verdict::Pass => pass += 1,
                 Verdict::Fail => fail += 1,
+                Verdict::Skip => skip += 1,
+                Verdict::Degraded => degraded += 1,
             }
             println!(
                 "{:<40} {:>6}ms {:>8}  {}",
@@ -142,10 +151,12 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let elapsed = t_total.elapsed();
     println!();
     println!(
-        "summary: total={} pass={} fail={}  ({:.2}s)",
-        pass + fail,
+        "summary: total={} pass={} fail={} skip={} degraded={}  ({:.2}s)",
+        pass + fail + skip + degraded,
         pass,
         fail,
+        skip,
+        degraded,
         elapsed.as_secs_f64(),
     );
     Ok(if fail > 0 { 1 } else { 0 })
