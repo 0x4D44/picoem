@@ -7833,23 +7833,72 @@ pub fn generate_fuzz_fpu(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 /// banked _NS aliases (>=0x80) are TrustZone-only.
 const M0PLUS_SYSM_ADMIT: [u16; 5] = [0, 8, 9, 16, 20];
 
-/// Random signed 21-bit even byte offset for BL T1 (low bit forced to 0).
+/// Random signed 24-bit even byte offset for BL T1 (low bit forced to 0).
 ///
-/// Range: [-2^20, +2^20 - 2] — well inside BL T1's full ±2^24 byte reach,
-/// so every offset round-trips through `enc_t32_bl` without saturation.
-fn rand_bl_offset_21bit_even(rng: &mut StdRng) -> i32 {
-    // Sign-extend a 32-bit random pull from 21 bits, then clear the low bit.
+/// Range: [-2^24, +2^24 - 2]. The encoder accepts the full 25-bit signed
+/// range (±2^24), but going wider risks PC wraps that QEMU and mdrp2040
+/// could resolve differently; 24-bit is the safe envelope for random draws.
+/// The boundary case set in `boundary_bl_cases` covers the explicit ±2^24
+/// edge, and explicitly hits the s/I1/I2 XOR boundary surface near ±2^20
+/// and ±2^21 so the random stream isn't relied on to find them.
+fn rand_bl_offset_24bit_even(rng: &mut StdRng) -> i32 {
+    // Sign-extend a 32-bit random pull from 24 bits, then clear the low bit.
     let raw = rng.random::<u32>() as i32;
-    // Shift left 11, then arithmetic-shift right 11 to sign-extend bit 20.
-    let signed_21 = (raw << 11) >> 11;
-    signed_21 & !1
+    // Shift left 8, then arithmetic-shift right 8 to sign-extend bit 23.
+    let signed_24 = (raw << 8) >> 8;
+    signed_24 & !1
+}
+
+/// Curated BL boundary cases — explicit hits on the encoder's sign-extension
+/// and J1/J2 XOR boundary surfaces. Random uniform sampling has only ~2^-20
+/// chance per draw of landing on an exact boundary, so this set targets the
+/// bug class structurally: ±2^20 and ±2^21 exercise the J1/J2 XOR transition
+/// where a sign-extension off-by-one would corrupt the BL imm21 path
+/// historically; ±2^24 sits at the encoder's full 25-bit signed-range edge,
+/// the largest offset we admit. Each boundary is paired with its
+/// (boundary − 2) sibling — adjacent encodings differ in only the lowest
+/// imm11 bit, so a divergence between the two pinpoints carry / wrap bugs
+/// at the boundary itself rather than further out.
+fn boundary_bl_cases() -> Vec<TestCase> {
+    let offsets: [(i32, &str); 15] = [
+        (0, "0"),
+        (2, "+2"),
+        (-2, "-2"),
+        (1 << 20, "+2^20"),
+        (-(1 << 20), "-2^20"),
+        ((1 << 20) - 2, "+(2^20 - 2)"),
+        (-((1 << 20) - 2), "-(2^20 - 2)"),
+        (1 << 21, "+2^21"),
+        (-(1 << 21), "-2^21"),
+        ((1 << 21) - 2, "+(2^21 - 2)"),
+        (-((1 << 21) - 2), "-(2^21 - 2)"),
+        (1 << 24, "+2^24"),
+        (-(1 << 24), "-2^24"),
+        ((1 << 24) - 2, "+(2^24 - 2)"),
+        (-((1 << 24) - 2), "-(2^24 - 2)"),
+    ];
+    offsets
+        .iter()
+        .map(|(offset, label)| {
+            let (hw0, hw1) = enc_t32_bl(*offset);
+            TestCase {
+                name: format!("FUZZ-BOUNDARY: BL {label}"),
+                opcode: hw0,
+                hw1: Some(hw1),
+                xpsr_pre: 0x0100_0000, // T bit set, flags clear
+                xpsr_mask: MASK_NO_FLAGS,
+                modifies_lr: true,
+                ..TestCase::default()
+            }
+        })
+        .collect()
 }
 
 /// Generate `count` BL T1 fuzz cases.
 fn fuzz_m0plus_bl(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     let mut t = Vec::with_capacity(count);
     for i in 0..count {
-        let offset = rand_bl_offset_21bit_even(rng);
+        let offset = rand_bl_offset_24bit_even(rng);
         let (hw0, hw1) = enc_t32_bl(offset);
         t.push(TestCase {
             name: format!("FUZZ:M0PLUS_T32_BL:{i} off={offset:+}"),
@@ -7865,6 +7914,11 @@ fn fuzz_m0plus_bl(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 }
 
 /// Generate `count` MSR T1 fuzz cases. Rn ∈ 0..=12, sysm ∈ admit set.
+///
+/// For sysm == 0 (APSR), the executor writes NZCV from `Rn[31:28]`, so
+/// the case must allow flag bits to differ — `xpsr_mask = MASK_ALL_FLAGS`.
+/// For PRIMASK / CONTROL / MSP / PSP, the write doesn't touch the xPSR flag
+/// bits, so `MASK_NO_FLAGS` keeps the differential strict on those bits.
 fn fuzz_m0plus_msr(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     let mut t = Vec::with_capacity(count);
     for i in 0..count {
@@ -7874,13 +7928,20 @@ fn fuzz_m0plus_msr(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
         // Seed Rn with a random value so the special-register write
         // exercises a non-trivial bit pattern.
         let rn_val = rand_val(rng);
+        // APSR writes change NZCV from Rn[31:28]; any other sysm leaves
+        // the xPSR flag bits untouched.
+        let xpsr_mask = if sysm == 0 {
+            MASK_ALL_FLAGS
+        } else {
+            MASK_NO_FLAGS
+        };
         t.push(TestCase {
             name: format!("FUZZ:M0PLUS_T32_MSR:{i} R{rn}->sysm={sysm} val={rn_val:#010x}"),
             opcode: hw0,
             hw1: Some(hw1),
             reg_pre: vec![(rn as u8, rn_val)],
             xpsr_pre: 0x0100_0000,
-            xpsr_mask: MASK_NO_FLAGS,
+            xpsr_mask,
             ..TestCase::default()
         });
     }
@@ -7910,6 +7971,8 @@ fn fuzz_m0plus_mrs(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
 /// {4, 5, 6}; option uniform over 0..=15.
 fn fuzz_m0plus_barrier(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     let mut t = Vec::with_capacity(count);
+    // Filter admits any op nibble; mdrp2040 UNDEFs op∉{4,5,6} (DSB/DMB/ISB),
+    // so we restrict the generator.
     let ops: [(u16, &str); 3] = [(4, "DSB"), (5, "DMB"), (6, "ISB")];
     for i in 0..count {
         let (op, name) = ops[rng.range(0..3usize)];
@@ -7928,15 +7991,25 @@ fn fuzz_m0plus_barrier(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
     t
 }
 
-/// Generate `count` random Thumb-32 fuzz cases per shape (BL, MSR, MRS,
-/// barrier) — total `4 * count` cases. Order is fixed (BL first, then MSR,
-/// MRS, barriers) so seeded reproduction stays stable.
+/// Generate ~`count` random Thumb-32 fuzz cases split block-sequentially
+/// across four shapes (BL, MSR, MRS, barrier).
+///
+/// Budget: `each = count / 4` cases per shape — total ~`count` random
+/// cases — plus a fixed curated set of BL boundary cases prepended (15
+/// extra, budget-free). Block-sequential order (all BL, then all MSR,
+/// then all MRS, then all barriers) keeps seeded reproduction stable
+/// across runs; nothing is interleaved.
 pub fn generate_fuzz_m0plus_t32(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
-    let mut t = Vec::with_capacity(count.saturating_mul(4));
-    t.extend(fuzz_m0plus_bl(count, rng));
-    t.extend(fuzz_m0plus_msr(count, rng));
-    t.extend(fuzz_m0plus_mrs(count, rng));
-    t.extend(fuzz_m0plus_barrier(count, rng));
+    let each = count / 4;
+    let boundary = boundary_bl_cases();
+    let mut t = Vec::with_capacity(boundary.len() + each.saturating_mul(4));
+    // Boundary cases come first so seed-reproduced indices are stable
+    // regardless of the random `count` parameter.
+    t.extend(boundary);
+    t.extend(fuzz_m0plus_bl(each, rng));
+    t.extend(fuzz_m0plus_msr(each, rng));
+    t.extend(fuzz_m0plus_mrs(each, rng));
+    t.extend(fuzz_m0plus_barrier(each, rng));
     t
 }
 
@@ -7946,6 +8019,11 @@ pub fn generate_fuzz_m0plus_t32(count: usize, rng: &mut StdRng) -> Vec<TestCase>
 
 #[cfg(test)]
 mod m0plus_t32_fuzz_tests {
+    //! Filter admit predicates are re-derived inline (matching
+    //! `is_m0plus_safe` in `qemu_diff_m0plus.rs`). If that filter ever
+    //! widens or narrows, these tests will not detect the drift — manually
+    //! re-sync.
+
     use super::*;
     use rand::SeedableRng;
 
@@ -8012,7 +8090,6 @@ mod m0plus_t32_fuzz_tests {
         let mut r = rng(0x55_55_55_55);
         let cases = fuzz_m0plus_msr(100, &mut r);
         assert_eq!(cases.len(), 100);
-        let admit: &[u16] = &[0, 8, 9, 16, 20];
         for tc in &cases {
             let hw0 = tc.opcode;
             let hw1 = tc.hw1.expect("MSR is Thumb-32 — hw1 must be set");
@@ -8030,10 +8107,48 @@ mod m0plus_t32_fuzz_tests {
             assert!(rn <= 12, "MSR Rn={rn} out of M0+ GP range 0..=12");
             let sysm = hw1 & 0xFF;
             assert!(
-                admit.contains(&sysm),
-                "MSR sysm={sysm} not in admit set {{0,8,9,16,20}}"
+                super::M0PLUS_SYSM_ADMIT.contains(&sysm),
+                "MSR sysm={sysm} not in admit set {:?}",
+                super::M0PLUS_SYSM_ADMIT
             );
         }
+    }
+
+    /// MSR APSR writes (sysm == 0) move bits [31:28] of Rn into the xPSR
+    /// flag bits, so the case must let those bits differ — `xpsr_mask`
+    /// must be `MASK_ALL_FLAGS`. All other sysm values leave xPSR flags
+    /// untouched, so they keep `MASK_NO_FLAGS`. Without this distinction
+    /// the differential is structurally blind to APSR-write bugs (the
+    /// runner masks out exactly the bits the instruction changes).
+    #[test]
+    fn msr_apsr_uses_flag_mask() {
+        let mut r = rng(0x4F_5C_0D_E2);
+        // 1000 cases gives many APSR draws (P(no APSR in 1000) = (4/5)^1000
+        // ≈ 1e-97 — astronomical).
+        let cases = fuzz_m0plus_msr(1000, &mut r);
+        let mut saw_apsr = false;
+        let mut saw_other = false;
+        for tc in &cases {
+            let hw1 = tc.hw1.expect("MSR is Thumb-32 — hw1 must be set");
+            let sysm = hw1 & 0xFF;
+            if sysm == 0 {
+                saw_apsr = true;
+                assert_eq!(
+                    tc.xpsr_mask, MASK_ALL_FLAGS,
+                    "APSR-write case must use MASK_ALL_FLAGS: name={:?}",
+                    tc.name
+                );
+            } else {
+                saw_other = true;
+                assert_eq!(
+                    tc.xpsr_mask, MASK_NO_FLAGS,
+                    "non-APSR sysm={sysm} case must use MASK_NO_FLAGS: name={:?}",
+                    tc.name
+                );
+            }
+        }
+        assert!(saw_apsr, "no APSR (sysm=0) cases drawn in 1000 MSR samples");
+        assert!(saw_other, "no non-APSR cases drawn in 1000 MSR samples");
     }
 
     /// 100 MRS-only cases must hit the M0+ admit set: sysm ∈ {0, 8, 9, 16, 20},
@@ -8043,7 +8158,6 @@ mod m0plus_t32_fuzz_tests {
         let mut r = rng(0xAA_AA_AA_AA);
         let cases = fuzz_m0plus_mrs(100, &mut r);
         assert_eq!(cases.len(), 100);
-        let admit: &[u16] = &[0, 8, 9, 16, 20];
         for tc in &cases {
             let hw0 = tc.opcode;
             let hw1 = tc.hw1.expect("MRS is Thumb-32 — hw1 must be set");
@@ -8057,8 +8171,9 @@ mod m0plus_t32_fuzz_tests {
             assert!(rd <= 12, "MRS Rd={rd} out of M0+ GP range 0..=12");
             let sysm = hw1 & 0xFF;
             assert!(
-                admit.contains(&sysm),
-                "MRS sysm={sysm} not in admit set {{0,8,9,16,20}}"
+                super::M0PLUS_SYSM_ADMIT.contains(&sysm),
+                "MRS sysm={sysm} not in admit set {:?}",
+                super::M0PLUS_SYSM_ADMIT
             );
         }
     }
@@ -8081,12 +8196,10 @@ mod m0plus_t32_fuzz_tests {
                 "Barrier hw1 admit pattern violated: hw1={hw1:#06x}"
             );
             let op = (hw1 >> 4) & 0xF;
-            let option = hw1 & 0xF;
             assert!(
                 op == 4 || op == 5 || op == 6,
                 "Barrier op={op} not in {{4,5,6}}"
             );
-            assert!(option <= 0xF, "Barrier option={option} >15 (impossible)");
             saw_op[(op - 4) as usize] = true;
         }
         // Across 100 cases, all three ops should appear with high probability.
@@ -8096,19 +8209,27 @@ mod m0plus_t32_fuzz_tests {
         assert!(saw_op[2], "ISB never appeared in 100 cases");
     }
 
-    /// 1000 cases via the public entry point. Each case must classify as
-    /// exactly one of {BL, MSR, MRS, barrier}, and all four shapes must
-    /// appear (none starved).
+    /// `generate_fuzz_m0plus_t32(count, ..)` emits `count / 4` cases per
+    /// shape (block-sequential — total ~`count` random cases) plus a
+    /// fixed 15-case BL boundary set prepended. Each case must classify
+    /// as exactly one of {BL, MSR, MRS, barrier}, and all four shapes
+    /// must appear (none starved).
     #[test]
     fn mixed_distribution() {
         let mut r = rng(0xC0_FF_EE_77);
-        let cases = generate_fuzz_m0plus_t32(250, &mut r);
-        assert_eq!(cases.len(), 1000);
+        // count = 1000 → each = 250 per shape. Boundary set (15 BL) is
+        // prepended on top, so total = 1015.
+        let cases = generate_fuzz_m0plus_t32(1000, &mut r);
+        let n_boundary = super::boundary_bl_cases().len();
+        assert_eq!(
+            cases.len(),
+            1000 + n_boundary,
+            "expected 4 × 250 random + {n_boundary} boundary cases"
+        );
         let mut n_bl = 0usize;
         let mut n_msr = 0usize;
         let mut n_mrs = 0usize;
         let mut n_bar = 0usize;
-        let admit_sysm: &[u16] = &[0, 8, 9, 16, 20];
         for tc in &cases {
             let hw0 = tc.opcode;
             let hw1 = tc.hw1.expect("M0+ T32 case must have hw1");
@@ -8127,8 +8248,9 @@ mod m0plus_t32_fuzz_tests {
             if is_msr || is_mrs {
                 let sysm = hw1 & 0xFF;
                 assert!(
-                    admit_sysm.contains(&sysm),
-                    "MSR/MRS sysm={sysm} not in admit set"
+                    super::M0PLUS_SYSM_ADMIT.contains(&sysm),
+                    "MSR/MRS sysm={sysm} not in admit set {:?}",
+                    super::M0PLUS_SYSM_ADMIT
                 );
             }
             if is_bl {
@@ -8141,10 +8263,11 @@ mod m0plus_t32_fuzz_tests {
                 n_bar += 1;
             }
         }
-        assert!(n_bl > 0, "no BL cases in 1000-case sample");
-        assert!(n_msr > 0, "no MSR cases in 1000-case sample");
-        assert!(n_mrs > 0, "no MRS cases in 1000-case sample");
-        assert!(n_bar > 0, "no barrier cases in 1000-case sample");
+        // 250 random BL + 15 boundary BL = 265.
+        assert_eq!(n_bl, 250 + n_boundary, "BL count mismatch");
+        assert_eq!(n_msr, 250, "MSR count mismatch");
+        assert_eq!(n_mrs, 250, "MRS count mismatch");
+        assert_eq!(n_bar, 250, "barrier count mismatch");
     }
 
     /// Same RNG seed → byte-identical case sequence (encoding fields
