@@ -263,3 +263,91 @@ bug — stop and escalate rather than ignoring it.
    patch to `select_ap_and_ap_bank`, and smoke-test the same
    oracles. Keep the sentinel WARN text identical so dashboards that
    grep for it keep working.
+
+## Recovering wedged WinUSB endpoints on the Pico debug probes
+
+### Symptom
+
+- `probe-rs list` shows both probes (or one) as expected.
+- `probe-rs info --probe <VID:PID:SERIAL> --chip <chip>` fails on every
+  attempt with this exact pair of error lines:
+  ```
+  Error while probing target: Failed to open the debug probe.
+
+  Caused by:
+      0: An error which is specific to the debug probe in use occurred.
+      1: Could not determine a suitable packet size for this probe.
+  ```
+- The same fingerprint appears in any harness binary that opens the
+  probe (`probe_diff_rp2350`, `probe_diff_rp2040`, `test_silicon`,
+  `silicon_*_diff_*`); the wrappers under `fuzz-runs/` log it as
+  `rc=2`.
+- The PnP layer reports the probes as healthy: `Get-PnpDevice |
+  Where-Object InstanceId -match VID_2E8A` shows `Status: OK` for the
+  `VID_2E8A&PID_000C` USB Composite + CMSIS-DAP v2 + USB Serial
+  entries.
+
+### Root cause
+
+The Windows side of the CMSIS-DAP v2 endpoint has gotten into a state
+where libusb / nusb cannot complete the initial control transfer that
+negotiates packet size. Empirically this happens after a fuzz session
+ends uncleanly — a panic, a `kill -9` of an oracle holding an open
+endpoint, or rapid back-to-back attaches against the same probe. Once
+wedged, the endpoint stays wedged until the OS re-enumerates the USB
+device.
+
+Two prior incidents are documented in
+`wrk_journals/2026.04.25 - JRN - Probe Fuzz Supervisor.md` (cascades
+#1 and #2) and `wrk_journals/2026.04.28 - JRN - Two-Probe 24h Soak.md`
+(both probes wedged at the start of the 24h window).
+
+### Recipe
+
+The only reliable fix is **physical unplug + replug**:
+
+1. Unplug both Pico debug probe USB cables from the host.
+2. Wait 5 seconds.
+3. Plug both probes back in.
+4. Wait ~10 seconds for Windows to re-enumerate.
+5. Verify with `probe-rs list` that both serials reappear.
+6. Run a quick attach probe to confirm recovery:
+   ```bash
+   probe-rs info --probe 2e8a:000c:E46410955F614129 --chip RP235x | head -5
+   probe-rs info --probe 2e8a:000c:E46410955F3C5C27 --chip RP2040 | head -5
+   ```
+   The output should start with `Probing target via JTAG/SWD` and
+   reach a real chip-info section, not the "Could not determine a
+   suitable packet size" wedge fingerprint.
+
+### Why software-only recovery does not work
+
+- `probe-rs info` returns `rc=0` even on probe-open failure (it
+  considers "I tried and reported the error" a success), so simple
+  retry loops cannot detect the wedge by exit code alone — grep the
+  stdout/stderr for the fingerprint instead.
+- Waiting for the wedge to clear on its own does not work; we have
+  observed the same probe staying wedged across multiple-minute
+  pauses with no driver activity. The endpoint state does not heal
+  without USB re-enumeration.
+- `Disable-PnpDevice` / `Enable-PnpDevice` would re-enumerate, but
+  require Administrator. Default development sessions are not
+  elevated; reaching for an elevated PowerShell terminal to run them
+  is roughly the same friction as a physical replug.
+- Repeated `probe-rs` open attempts during a wedge appear to make
+  the wedge worse, not better — see cascade-2 in the 2026-04-25
+  journal for the cascade signature. The `fuzz-runs/run-*.sh`
+  drivers all back off 30s on `rc=2` to limit the damage when this
+  happens during a soak.
+
+### Avoiding the wedge
+
+- Always let `test_silicon` and the `probe_diff_*` binaries shut
+  down via their own `Drop` paths. `kill -9` on a binary that holds
+  the probe open is the most reliable way to reproduce the wedge.
+- The driver scripts under `fuzz-runs/` use the `trap 'rm -f
+  "$BIN"' EXIT` pattern, which is fine for the binary copy but does
+  not propagate a kill signal to a running child. If you must
+  forcibly stop a soak, prefer SIGTERM (`kill <pid>`, not `kill
+  -9`); the orchestrator catches SIGTERM and closes the probe
+  cleanly. SIGKILL is the wedge-maker.
