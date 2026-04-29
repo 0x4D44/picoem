@@ -25197,3 +25197,220 @@ mod stage2_thumb32_residue {
     }
 }
 
+// ============================================================================
+// stage6_coprocessor_residue — branch-coverage residue for core/coprocessor.rs
+// ============================================================================
+//
+// Additional unit tests targeting the few branches of `core/coprocessor.rs`
+// not exercised by `stage7_coprocessor_coverage`. Each test below names the
+// specific branch it covers, mirroring the style of `tests_p5.rs` for the
+// RISC-V core. Append-only — production code is unchanged.
+
+#[cfg(test)]
+mod stage6_coprocessor_residue {
+    use crate::bus::Bus;
+    use crate::core::{CortexM33, Fault};
+    use crate::threaded::CoreAtomics;
+    use std::sync::Arc;
+
+    fn enable_cp(cpu: &mut CortexM33, coproc: u8) {
+        cpu.ppb.cpacr |= 0x3 << (coproc as u32 * 2);
+    }
+
+    fn make_env() -> (CortexM33, Bus) {
+        let atomics = Arc::new(CoreAtomics::default());
+        let cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let bus = Bus::with_atomics(atomics);
+        (cpu, bus)
+    }
+
+    // -----------------------------------------------------------------------
+    // Top-level dispatch: undefined coprocessor IDs raise UsageFault when
+    // CPACR is enabled. CP1 specifically checks the "old SIO alias" branch
+    // does NOT exist — coprocessor 1 is unimplemented and must trap.
+    // -----------------------------------------------------------------------
+
+    /// CP1 — unimplemented (no SDK / silicon usage). Must fault.
+    #[test]
+    fn coproc_1_undefined_raises_usagefault() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 1);
+        // MCR cp1: hw0=0xEE00, hw1 with coproc=1 + bit4=1.
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (1u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+    }
+
+    /// CP3 — unimplemented; same UsageFault path.
+    #[test]
+    fn coproc_3_undefined_raises_usagefault() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 3);
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (3u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+    }
+
+    /// CP6 — unimplemented; UsageFault.
+    #[test]
+    fn coproc_6_undefined_raises_usagefault() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 6);
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (6u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+    }
+
+    /// CP15 (system control on real ARM, but the M33 ISA reserves it — we
+    /// fault). Covers the upper-end of the "_ => UsageFault" arm.
+    #[test]
+    fn coproc_15_undefined_raises_usagefault() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 15);
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (15u16 << 8) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+    }
+
+    // -----------------------------------------------------------------------
+    // CP4/5 DCP — CDP2 prefix (0xFE..) is dispatched the same as CDP (0xEE..)
+    // through cp4_5_dcp; the `is_mrc_mcr` discriminator's "(hw0>>12)&0xF==0xE"
+    // gate is *false* for the 0xFE prefix, so CDP2 always reaches
+    // dcp_cdp_family regardless of hw1 bit 4.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dcp_cdp2_prefix_dispatches_to_cdp_family() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        // Seed d[0] = 1.0, d[1] = 2.0; encode `dadd d[2] = d[0] + d[1]` with
+        // the CDP2 prefix (0xFE.. instead of 0xEE..). Same arithmetic
+        // semantics — locks in the prefix-agnostic dispatch.
+        cpu.dcp_set_double(0, 1.0);
+        cpu.dcp_set_double(1, 2.0);
+        // hw0 = 0xFE | opc1=0 | CRn=0 = 0xFE00
+        // hw1 = CRd=2 << 12 | coproc=4 << 8 | opc2=0 << 5 | bit4=0 | CRm=1 = 0x2401
+        let hw0: u16 = 0xFE00;
+        let hw1: u16 = (2u16 << 12) | (4u16 << 8) | 1;
+        let cycles = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cycles, 4, "dadd cycle cost");
+        assert_eq!(cpu.dcp_get_double(2), 3.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // CP4/5 DCP transfer family — opc1=0, opc2=0/1 select half A/B; opc1!=0
+    // is reserved → silent NOP. Cover both the half-B write/read paths
+    // (wxmb/rfmb) by exercising opc2=1 explicitly with non-zero halves.
+    // -----------------------------------------------------------------------
+
+    /// `wxmb` (MCR opc2=1) writes ARM Rt into half B of the target double.
+    #[test]
+    fn dcp_wxmb_writes_half_b() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.regs.r[5] = 0xAAAA_BBBB;
+        // MCR cp4: hw0 = 0xEE00 (opc1=0, L=0), hw1 = Rt=5<<12 | coproc=4<<8
+        // | opc2=1<<5 | bit4=1 | CRm=2.
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (5u16 << 12) | (4u16 << 8) | (1u16 << 5) | 0x10 | 2;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        // Half B of double 2 → register file index 2*2 + 1 = 5.
+        assert_eq!(cpu.dcp_get_half(5), 0xAAAA_BBBB);
+        assert_eq!(cpu.dcp_get_half(4), 0, "half A untouched");
+    }
+
+    /// `rfmb` (MRC opc2=1) reads half B of the source double into ARM Rt.
+    #[test]
+    fn dcp_rfmb_reads_half_b() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_half(7, 0xCAFE_F00D); // double 3, half B
+        // MRC cp4: hw0 = 0xEE10 (opc1=0, L=1), hw1 = Rt=6<<12 | coproc=4<<8
+        // | opc2=1<<5 | bit4=1 | CRm=3.
+        let hw0: u16 = 0xEE10;
+        let hw1: u16 = (6u16 << 12) | (4u16 << 8) | (1u16 << 5) | 0x10 | 3;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.r[6], 0xCAFE_F00D);
+    }
+
+    // -----------------------------------------------------------------------
+    // DCP arithmetic sets the *zero* status bit when result is +0. Covers
+    // the dcp_set_arith_status `r == 0.0` true arm.
+    // -----------------------------------------------------------------------
+
+    /// `dadd 0.0 + 0.0 = +0.0` sets the Z status bit (bit 0).
+    #[test]
+    fn dcp_dadd_zero_result_sets_z_bit() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, 0.0);
+        cpu.dcp_set_double(1, 0.0);
+        // dadd d[2] = d[0] + d[1]
+        let hw0: u16 = 0xEE00;
+        let hw1: u16 = (2u16 << 12) | (4u16 << 8) | 1;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_double(2), 0.0);
+        assert_ne!(cpu.dcp_get_status() & 0x1, 0, "Z bit must be set");
+        assert_eq!(cpu.dcp_get_status() & 0x4, 0, "Inf bit must be clear");
+        assert_eq!(cpu.dcp_get_status() & 0x8, 0, "NaN bit must be clear");
+    }
+
+    // -----------------------------------------------------------------------
+    // CP7 RCP — explicit canary mismatch lock-in: seed salt to a known
+    // value, write a deliberately-corrupted check value, observe NMI.
+    // (The test_rcp_canary_check_fail_raises_nmi inside coprocessor.rs uses
+    // `rcp_setup` with a salt of 0x1234_5678; here we use a separate salt
+    // and explicit corruption to lock in the predicate `r != expected`
+    // independent of the harness fixture.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cp7_canary_check_explicit_corrupt_value_nmis() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        // Seed salt to a known value via the atomics path (matches existing
+        // bootrom-style flow).
+        bus.atomics.rcp_salt_set(0, 0xA5A5_A5A5);
+        // Compute correct canary; then deliberately flip bit 4.
+        let correct = 0xA5A5_A5A5u32 ^ 0xDEAD_BEEF;
+        cpu.regs.r[3] = correct ^ 0x10;
+        // MCR2 cp7, opc1=0, opc2=1, CRn=0, CRm=0 — rcp_canary_check Rt=3.
+        // hw0 = 0xFE | opc1=0 | L=0 | CRn=0 = 0xFE00
+        // hw1 = Rt=3 | coproc=7 | opc2=1 | bit4=1 | CRm=0 = 0x3730
+        let hw0: u16 = 0xFE00;
+        let hw1: u16 = (3u16 << 12) | (7u16 << 8) | (1u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    /// Same MCR2 encoding but with the matching canary — must NOT fault.
+    /// Locks in the predicate's "true → fall through" arm against the
+    /// "true → NMI" arm above.
+    #[test]
+    fn cp7_canary_check_matching_value_no_fault() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        bus.atomics.rcp_salt_set(0, 0x1357_2468);
+        cpu.regs.r[3] = 0x1357_2468u32 ^ 0xDEAD_BEEF;
+        let hw0: u16 = 0xFE00;
+        let hw1: u16 = (3u16 << 12) | (7u16 << 8) | (1u16 << 5) | 0x10;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    // unreachable: `cp7_rcp` has a `_ => 1` catch-all for hw0 prefixes
+    // outside {0xEE, 0xFE, 0xEC, 0xFC}, but `thumb32_coprocessor` is only
+    // dispatched from `execute_thumb32` for top-nibble 0xE / 0xF Thumb-32
+    // encodings. Every reachable hw0 high byte falls into one of those
+    // four buckets — `_ => 1` is structurally unreachable.
+
+    // unreachable: `core/coprocessor.rs` `cp7_mcrr_mrrc_family` has a
+    // `match opc1 { 7 => ..., 8 => ..., _ => {} }` arm. `_ => {}` is
+    // exercised by `cp7_mcrr_unknown_opc1_silent_nop` in
+    // `stage7_coprocessor_coverage` already; nothing further to add.
+}
+

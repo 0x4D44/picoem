@@ -1451,3 +1451,332 @@ fn mod_step_compressed_vs_32bit_dispatch() {
     c.step(&mut bus);
     assert_eq!(c.pc, 0x2000_0006, "2 + 4 = 6");
 }
+
+// =====================================================================
+// Stage 6 CSR residue — branches not exercised by the bulk tests above.
+// =====================================================================
+//
+// Targets the remaining csr.rs branches: writes to mcycle/mcycleh/
+// minstret/minstreth (the four lower/high halves of the 64-bit machine
+// counters), the PMP TOR cross-entry lock gate, and the locked-byte
+// drop in `write_pmp_cfg`.
+
+use super::csr::{CSR_MCYCLE, CSR_MCYCLEH, CSR_MINSTRETH};
+
+// Write low-half mcycle: keeps the high half of the stored u64.
+#[test]
+fn csr_mcycle_low_write_preserves_high_half() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.mcycle = 0xAABB_CCDD_0000_0000;
+    c.x[1] = 0x1234_5678;
+    c.execute(
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MCYCLE,
+        },
+        &mut bus,
+        0,
+    );
+    assert_eq!(c.csrs.mcycle, 0xAABB_CCDD_1234_5678);
+}
+
+// Write high-half mcycle: keeps the low half.
+#[test]
+fn csr_mcycleh_high_write_preserves_low_half() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.mcycle = 0x0000_0000_DEAD_BEEF;
+    c.x[1] = 0xCAFE_BABE;
+    c.execute(
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MCYCLEH,
+        },
+        &mut bus,
+        0,
+    );
+    assert_eq!(c.csrs.mcycle, 0xCAFE_BABE_DEAD_BEEF);
+}
+
+// Write low-half minstret: keeps the high half.
+#[test]
+fn csr_minstret_low_write_preserves_high_half() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.minstret = 0x1111_2222_0000_0000;
+    c.x[1] = 0x9999_AAAA;
+    c.execute(
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MINSTRET,
+        },
+        &mut bus,
+        0,
+    );
+    assert_eq!(c.csrs.minstret, 0x1111_2222_9999_AAAA);
+}
+
+// Write high-half minstret: keeps the low half.
+#[test]
+fn csr_minstreth_high_write_preserves_low_half() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.minstret = 0x0000_0000_5555_6666;
+    c.x[1] = 0x7777_8888;
+    c.execute(
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_MINSTRETH,
+        },
+        &mut bus,
+        0,
+    );
+    assert_eq!(c.csrs.minstret, 0x7777_8888_5555_6666);
+}
+
+// PMP write_pmp_cfg with own L bit set must drop the byte write. Seeds
+// pmpcfg byte 0 with L=1 (sticky-locked), then attempts to clear it via
+// CSR write — the byte must remain locked.
+#[test]
+fn csr_pmpcfg_locked_byte_write_dropped() {
+    use super::csr::CSR_PMPCFG0;
+    let (mut c, mut bus) = fresh();
+    // Seed: byte 0 has L=1, R=W=X=1, A=NA4. Use raw poke to bypass the
+    // first-write WARL path (we need the *stored* L=1 to gate).
+    c.csrs.pmpcfg[0] = 0x0000_009F; // L=1, A=NA4=01, X=1, W=1, R=1
+    // Attempt to overwrite byte 0 with all-zero (clear all bits).
+    c.x[1] = 0x0000_0000;
+    c.execute(
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPCFG0,
+        },
+        &mut bus,
+        0,
+    );
+    // Byte 0 must remain locked at 0x9F — write was dropped.
+    assert_eq!(
+        c.csrs.pmpcfg[0] & 0xFF,
+        0x9F,
+        "L=1 byte must reject CSR-write attempts"
+    );
+}
+
+// PMP TOR cross-entry lock: when `pmpcfg[i+1]` has L=1 AND A=TOR, then
+// `pmpaddr[i]` is locked because entry i+1 uses pmpaddr[i] as its lower
+// bound (RV-priv §3.7.1). Lock entry 1 with A=TOR, then write pmpaddr[0]
+// — write must be dropped.
+#[test]
+fn csr_pmpaddr_locked_by_tor_cross_entry() {
+    use super::csr::CSR_PMPADDR0;
+    let (mut c, mut bus) = fresh();
+    // Seed pmpcfg[0] byte 1 (entry 1) with L=1, A=TOR (0b01000), R=1.
+    // bits in byte 1: L=bit15, A_hi=bit12, A_lo=bit11, X=bit10, W=bit9, R=bit8.
+    // L=1, A=01 (TOR=0b01<<3=0x08), R=1: byte1 = 0x89.
+    c.csrs.pmpcfg[0] = 0x0000_8900; // entry 1 = 0x89
+    // Pre-set pmpaddr[0] to a known value.
+    c.csrs.pmpaddr[0] = 0xFFFF_FFFF;
+    // Attempt to overwrite via CSR — must be dropped.
+    c.x[1] = 0x0000_0000;
+    c.execute(
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: CSR_PMPADDR0,
+        },
+        &mut bus,
+        0,
+    );
+    assert_eq!(
+        c.csrs.pmpaddr[0], 0xFFFF_FFFF,
+        "pmpaddr[0] must be locked by entry 1's TOR L-bit"
+    );
+}
+
+// PMP write_pmp_addr to an unsynthesised entry (idx >= 8) is silently
+// dropped — covers the `idx >= PMP_NUM_ENTRIES` early-return.
+#[test]
+fn csr_pmpaddr_unsynthesised_entry_drops() {
+    use super::csr::CSR_PMPADDR0;
+    let (mut c, mut bus) = fresh();
+    // pmpaddr8 = CSR 0x3B0 + 8 = 0x3B8 — entries 8..15 are unsynthesised.
+    let csr_pmpaddr8 = CSR_PMPADDR0 + 8;
+    c.x[1] = 0xDEAD_BEEF;
+    c.execute(
+        Op::Csr {
+            kind: CsrKind::Csrrw,
+            rd: 0,
+            rs1_or_zimm: 1,
+            csr: csr_pmpaddr8,
+        },
+        &mut bus,
+        0,
+    );
+    assert_eq!(c.csrs.pmpaddr[8], 0, "pmpaddr8 RAZ/WI");
+}
+
+// =====================================================================
+// Stage 6 execute residue — additional execute.rs branches.
+// =====================================================================
+
+// Misaligned Sw store traps mcause=6. Covers the `aligned = addr & 3 == 0`
+// false arm of the StoreKind::Sw match.
+#[test]
+fn exec_sw_misaligned_traps_cause_6() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.mtvec = 0x2000_2000;
+    c.x[1] = 0x2000_1003; // not 4-aligned
+    c.x[2] = 0x1234_5678;
+    c.execute(
+        Op::Store {
+            kind: StoreKind::Sw,
+            rs1: 1,
+            rs2: 2,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
+    assert_eq!(c.csrs.mcause, 6);
+    assert_eq!(c.csrs.mepc, 0x2000_0000);
+    assert_eq!(c.pc, 0x2000_2000);
+}
+
+// Misaligned Lhu load traps mcause=4 — covers the `LoadKind::Lhu` arm of
+// the `aligned` tuple destructuring (twin of Lh, but different match arm).
+#[test]
+fn exec_lhu_misaligned_traps_cause_4() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.mtvec = 0x2000_2000;
+    c.x[1] = 0x2000_1001; // not 2-aligned
+    c.execute(
+        Op::Load {
+            kind: LoadKind::Lhu,
+            rd: 2,
+            rs1: 1,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0000,
+    );
+    assert_eq!(c.csrs.mcause, 4);
+}
+
+// Branch NOT taken (Beq with rs1 != rs2) — covers the `taken = false` arm
+// of the branch dispatch. PC must advance to next-sequential, not to the
+// branch target.
+#[test]
+fn exec_branch_not_taken_advances_to_next() {
+    let (mut c, mut bus) = fresh();
+    c.x[1] = 1;
+    c.x[2] = 2;
+    c.execute(
+        decode::Op::Branch {
+            kind: decode::BranchKind::Beq,
+            rs1: 1,
+            rs2: 2,
+            imm: 16,
+        },
+        &mut bus,
+        0x2000_0100,
+    );
+    // Pre-advanced PC = 0x2000_0104; no override.
+    assert_eq!(c.pc, 0x2000_0104, "branch not taken — fall-through PC");
+    assert_eq!(c.csrs.mcause, 0, "no trap");
+}
+
+// JALR with `rd == rs1` — link must be computed BEFORE the target write
+// so the source is preserved. RV-priv mandates this ordering and the
+// executor's "let link = self.pc; wr(rd, link); pc = target" sequence
+// implements it.
+#[test]
+fn exec_jalr_rd_eq_rs1_preserves_target() {
+    let (mut c, mut bus) = fresh();
+    // x[5] = 0x2000_4000 (the jump target with bit 0 deliberately set —
+    // the executor clears bit 0 per RV-priv).
+    c.x[5] = 0x2000_4001;
+    // JALR rd=5, rs1=5, imm=0 — common JALR t0, t0 idiom.
+    c.execute(
+        Op::Jalr {
+            rd: 5,
+            rs1: 5,
+            imm: 0,
+        },
+        &mut bus,
+        0x2000_0100,
+    );
+    // PC = (0x2000_4001) & !1 = 0x2000_4000.
+    assert_eq!(c.pc, 0x2000_4000);
+    // x[5] = link = 0x2000_0104 (epc + 4).
+    assert_eq!(c.x[5], 0x2000_0104);
+}
+
+// mret with mstatus.MPP = 0b00 (U-mode, not supported in V1) — the post-
+// mret state must round MPP back to 0b11 (M-mode) per RV-priv WARL. This
+// is the "bad MPP" case from the trap.rs `mret` path.
+#[test]
+fn exec_mret_with_mpp_zero_rounds_to_m() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.mepc = 0x2000_0200;
+    // After-trap state with MPP deliberately set to 0b00 (U-mode), MPIE=1.
+    c.csrs.mstatus = (1 << 7) | (0b00 << 11);
+    c.execute(Op::Mret, &mut bus, 0x2000_0000);
+    assert_eq!(c.pc, 0x2000_0200);
+    // mret unconditionally writes MPP <- 0b11 per V1 WARL.
+    assert_eq!(
+        (c.csrs.mstatus >> 11) & 0b11,
+        0b11,
+        "mret rounds MPP to M-mode regardless of pre-mret MPP"
+    );
+    // MIE <- old MPIE = 1; MPIE <- 1.
+    assert_eq!((c.csrs.mstatus >> 3) & 1, 1, "MIE <- MPIE");
+    assert_eq!((c.csrs.mstatus >> 7) & 1, 1, "MPIE <- 1");
+}
+
+// mret with MPP = 0b10 (illegal — only 0b00 / 0b01 / 0b11 are spec-legal,
+// and only M-mode (0b11) is supported). Must round to 0b11.
+#[test]
+fn exec_mret_with_illegal_mpp_rounds_to_m() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.mepc = 0x2000_0300;
+    // Set MPP to 0b10 (not architecturally legal; not supported in V1).
+    c.csrs.mstatus = (1 << 7) | (0b10 << 11);
+    c.execute(Op::Mret, &mut bus, 0x2000_0000);
+    assert_eq!((c.csrs.mstatus >> 11) & 0b11, 0b11);
+}
+
+// Vectored mtvec (mode=1) for an exception (not interrupt) still
+// dispatches to base, not base+code*4. Cover the `mode==1 && interrupt`
+// false arm in `enter_trap` (trap.rs:77).
+#[test]
+fn exec_ecall_with_vectored_mtvec_dispatches_to_base() {
+    let (mut c, mut bus) = fresh();
+    // mode=1 (vectored), base=0x2000_2000.
+    c.csrs.mtvec = 0x2000_2001;
+    c.execute(Op::Ecall, &mut bus, 0x2000_0008);
+    // Exceptions in vectored mode go to base, not base+11*4.
+    assert_eq!(c.pc, 0x2000_2000);
+    assert_eq!(c.csrs.mcause, 11, "ECALL_FROM_M");
+}
+
+// Vectored mtvec for an interrupt dispatches to base + 4*code. Covers the
+// `mode==1 && interrupt` true arm — paired with the test above.
+#[test]
+fn exec_vectored_interrupt_dispatches_per_code() {
+    let (mut c, mut bus) = fresh();
+    c.csrs.mtvec = 0x2000_2001; // mode=1, base=0x2000_2000
+    // Drive enter_trap directly with cause=0x8000_0007 (MTI interrupt).
+    c.enter_trap(0x8000_0007, 0, 0x2000_0000, &mut bus);
+    // Vectored: PC = base + 4*7 = 0x2000_2000 + 28 = 0x2000_201C.
+    assert_eq!(c.pc, 0x2000_201C);
+    assert_eq!(c.csrs.mcause, 0x8000_0007);
+}
+
