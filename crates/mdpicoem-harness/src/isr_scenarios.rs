@@ -2195,7 +2195,9 @@ pub fn run_against(
                 let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 outcomes.push(match verdict {
                     Verdict::Pass => CaseOutcome::pass("isr", sc.name, elapsed_ms),
-                    Verdict::Fail => {
+                    // run_one_scenario only emits Pass/Fail; tolerate
+                    // the other variants to keep this match exhaustive.
+                    Verdict::Fail | Verdict::Skip | Verdict::Degraded => {
                         CaseOutcome::fail("isr", sc.name, detail.unwrap_or_default(), elapsed_ms)
                     }
                 });
