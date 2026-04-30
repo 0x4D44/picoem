@@ -1499,8 +1499,14 @@ impl EmulatorBuilder {
     /// Useful for benches sweeping quantum size, or tests wanting tighter
     /// peripheral-latency observation.
     pub fn step_quantum(mut self, n: u32) -> Self {
-        debug_assert!(n > 0, "step_quantum must be >= 1");
-        self.step_quantum = n;
+        // Clamp `0 -> 1`. Previously a `debug_assert!` here meant
+        // `step_quantum(0)` triggered a silent infinite-loop footgun
+        // in release builds: the inner `step()` drains
+        // `step_quantum` master-clock cycles per call, so 0 advances
+        // nothing and `run()`'s pacing loop never makes progress.
+        // Clamping at the entry point keeps every downstream caller
+        // safe without leaking the constraint into the runtime.
+        self.step_quantum = n.max(1);
         self
     }
 
@@ -1874,6 +1880,24 @@ mod stage4_lib_residue {
     fn builder_default_step_quantum() {
         let emu = EmulatorBuilder::new(Config::default()).build().unwrap();
         assert_eq!(emu.step_quantum, DEFAULT_STEP_QUANTUM);
+    }
+
+    #[test]
+    fn step_quantum_zero_clamps_to_one() {
+        // Regression: `EmulatorBuilder::step_quantum(0)` previously
+        // tripped a `debug_assert!` (and silently advanced 0 cycles
+        // per `step()` in release builds — an infinite-loop footgun
+        // for `run()`). The clamp at the builder entry point keeps
+        // the runtime contract `step_quantum >= 1` intact.
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(0)
+            .build()
+            .unwrap();
+        assert_eq!(emu.step_quantum, 1);
+        // `step()` must make forward progress (advance >= 1 master
+        // cycle) and not loop forever.
+        let advanced = emu.step().unwrap();
+        assert!(advanced >= 1);
     }
 
     #[test]
