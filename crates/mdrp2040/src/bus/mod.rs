@@ -1967,6 +1967,17 @@ impl Bus {
         self.irq_pending |= nvic_bits & 0xF;
     }
 
+    /// Soonest scheduled lazy IRQ deadline (master-cycle space) across
+    /// peripherals modelled today. TIMER is the only lazy IRQ source in
+    /// V1 (PWM/ADC/etc. tick on `consumed`, not on absolute deadlines),
+    /// so this currently returns `timer.next_armed_inte_fire_cycle()`.
+    /// Used by the both-cores-blocked clock-advance branch in
+    /// `Emulator::step_serial` to pick the next event horizon —
+    /// closes tech_debt §1649 for RP2040.
+    pub fn next_scheduled_lazy_deadline(&self) -> Option<u64> {
+        self.timer.next_armed_inte_fire_cycle()
+    }
+
     /// Read the current pending-IRQ bitmap. Mostly for tests.
     #[cfg(test)]
     #[inline]

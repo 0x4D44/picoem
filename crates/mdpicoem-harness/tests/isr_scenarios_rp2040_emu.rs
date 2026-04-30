@@ -151,6 +151,49 @@ fn isr_m0_nvic_high_bits_razwi_passes_on_emu() {
     }
 }
 
+/// V2 §3.3 — WFI wake on TIMER alarm. Validates the both-cores-park
+/// wake path now that tech_debt §1649 is closed for RP2040
+/// (`step_serial` advances the master clock to the soonest scheduled
+/// alarm when both cores are blocked).
+#[test]
+fn isr_m0_wfi_wake_passes_on_emu() {
+    let sc = find_scenario("isr_m0_wfi_wake");
+    match run_scenario(sc) {
+        EmuOutcome::Completed(obs) => {
+            // Per OBS_WFI ordering:
+            //   obs[0] = phase_at_entry (primary, load-bearing)
+            //   obs[1] = ctr_timer
+            //   obs[2] = phase
+            assert_eq!(
+                obs[0], 1,
+                "phase_at_entry should be 1 (handler ran during WFI window, before main resumed), got {}",
+                obs[0],
+            );
+            assert_eq!(
+                obs[1], 1,
+                "ctr_timer should be 1 after one TIMER ISR fire, got {}",
+                obs[1],
+            );
+            assert_eq!(
+                obs[2], 2,
+                "phase should be 2 after main resumed past wfi, got {}",
+                obs[2],
+            );
+        }
+        EmuOutcome::HardFault { pc, ipsr } => {
+            panic!(
+                "isr_m0_wfi_wake: EMU hardfault at pc=0x{:08X} ipsr={}",
+                pc, ipsr,
+            );
+        }
+        EmuOutcome::Timeout => {
+            panic!(
+                "isr_m0_wfi_wake: cycle budget exhausted before phase_at_entry advanced",
+            );
+        }
+    }
+}
+
 /// V2 §3.2 — PRIMASK-gated pend then `cpsie i` unmask.
 ///
 /// Verifies the PRIMASK gate inside `try_take_any_pending_exception`

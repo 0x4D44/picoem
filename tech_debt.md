@@ -1655,6 +1655,7 @@ Validated by `isr_m0_wfi_wake` scenario passing on EMU via the standard
 `run_scenario` helper (no test-side core-1 busy-loop scaffolding).
 RP2350 still open with the same shape — fold in when surfaced by an
 analogous mdrp2350 scenario.
+Note: PWM/ADC-only both-blocked scenarios (no TIMER alarm) would still stall under the V1 fix. Fold into resolution if such a scenario lands.
 
 
 `crates/mdrp2040/src/lib.rs:595-625` (post-WFE/SEV wiring) and

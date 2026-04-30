@@ -721,6 +721,39 @@ impl Emulator {
         }
 
         let consumed = self.clock.cycles.wrapping_sub(start);
+        // tech_debt §1649: when both cores are blocked (halted-or-WFE)
+        // and the inner loop made no progress, `consumed == 0` and
+        // neither the fast-path nor the slow-path below would advance
+        // the master clock — so a TIMER alarm scheduled in the future
+        // could never fire to wake either core. Detect that exact
+        // state, advance the master clock to the soonest scheduled
+        // IRQ-raising alarm (capped by `step_quantum`), tick lazy
+        // peripherals once, drain the resulting IRQs to the NVICs, and
+        // let `wake_checks` at the tail un-halt the woken core. Take
+        // the early return so we don't double-advance via fast/slow
+        // path. Production fix per HLD V2 / tech_debt §1649 Option 1.
+        if consumed == 0
+            && (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
+            && (self.cores[1].is_halted() || self.bus.wfe_waiting[1])
+            && self.bus.irq_pending == 0
+            && self.bus.nvics[0].pending_and_enabled() == 0
+            && self.bus.nvics[1].pending_and_enabled() == 0
+            && let Some(deadline) = self.bus.next_scheduled_lazy_deadline()
+            && deadline > self.bus.master_cycle
+        {
+            // Cap a single advance at `step_quantum`. If the deadline is
+            // farther out, the caller's `run`/`run_quantum` loop iterates
+            // and the next `step()` re-enters this branch, closing the
+            // gap across multiple quanta — never silently stalls.
+            let max_advance = self.step_quantum as u64;
+            let advance = (deadline - self.bus.master_cycle).min(max_advance);
+            self.clock.cycles = self.clock.cycles.wrapping_add(advance);
+            self.bus.master_cycle = self.clock.cycles;
+            self.bus.tick_peripherals(advance as u32);
+            self.drain_pending_irqs_to_cores();
+            self.wake_checks();
+            return advance;
+        }
         // See the fn docstring for the rationale on the fast-path and
         // the per-cycle interleave. Measured impact of the fast-path
         // gate on paced_bench_rp2040 (pure ALU, PIO disabled): without
@@ -1991,6 +2024,76 @@ mod stage5_lib_residue {
         emu.cores[0].halt();
         emu.halt_core1();
         let _ = emu.step().unwrap();
+    }
+
+    /// Production fix for tech_debt §1649: when both cores are blocked
+    /// (halted/WFI here) and a TIMER alarm with INTE is scheduled in the
+    /// future, the master clock must still advance to the alarm's fire
+    /// cycle so the IRQ raises and `wake_checks` un-halts a core.
+    ///
+    /// Pre-fix behaviour: `consumed == 0` every quantum → master_cycle
+    /// never moves → poll_alarms never matches → core stays parked
+    /// forever.
+    /// Post-fix behaviour: the both-blocked branch advances the clock
+    /// to the soonest scheduled fire cycle (capped by `step_quantum`),
+    /// raises the IRQ, drains it to NVICs, and `wake_checks` un-halts.
+    #[test]
+    fn step_serial_advances_clock_when_both_cores_blocked_with_armed_alarm() {
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET};
+
+        // Use a generous step_quantum so a single step() can cover the
+        // whole armed-alarm interval in one go.
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(2_000_000)
+            .build()
+            .expect("Serial build is infallible");
+
+        // Both cores parked. Core 1 is halt_core1 (correct production
+        // path); core 0 we explicitly halt to emulate WFI.
+        emu.cores[0].halt();
+        emu.halt_core1();
+        assert!(emu.cores[0].is_halted());
+        assert!(emu.cores[1].is_halted());
+
+        // Arm TIMER ALARM0 200 µs into the future and enable INTE so the
+        // fire raises NVIC line 0. Reach into bus.timer directly — same
+        // crate, `pub(crate)` field.
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        emu.bus
+            .timer
+            .write32(INTE_OFFSET, 0x1, 0, emu.bus.master_cycle, sys_hz);
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+
+        // Sanity: nothing pending yet — the bus IRQ vector is clean,
+        // both NVICs are clean, and both cores are halted. Without the
+        // fix, this state is a permanent dead-end.
+        assert_eq!(emu.bus.irq_pending, 0);
+        assert_eq!(emu.bus.nvics[0].pending_and_enabled(), 0);
+        assert_eq!(emu.bus.nvics[1].pending_and_enabled(), 0);
+
+        // One step suffices when step_quantum >> alarm horizon.
+        let _ = emu.step().unwrap();
+
+        // Post-fix: TIMER alarm fired, IRQ drained to at least one NVIC,
+        // and `wake_checks` un-halted the core(s) it landed on. Any of
+        // these three observations is sufficient — and on the pre-fix
+        // code, none of them holds.
+        let nvic_pending = emu.bus.nvics[0].is_pending(0) || emu.bus.nvics[1].is_pending(0);
+        let core_woke = !emu.cores[0].is_halted() || !emu.cores[1].is_halted();
+        assert!(
+            nvic_pending || core_woke,
+            "Both-blocked clock-advance branch did not deliver TIMER alarm: \
+             nvic0_pend0={} nvic1_pend0={} c0_halted={} c1_halted={} \
+             master_cycle={} alarm_fire={:?}",
+            emu.bus.nvics[0].is_pending(0),
+            emu.bus.nvics[1].is_pending(0),
+            emu.cores[0].is_halted(),
+            emu.cores[1].is_halted(),
+            emu.bus.master_cycle,
+            emu.bus.next_scheduled_lazy_deadline(),
+        );
     }
 
     // ------------------- step_serial: slow-path / fast-path gating (line 750) -------------------
