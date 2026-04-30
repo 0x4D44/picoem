@@ -6115,9 +6115,10 @@ mod tests {
     // The dualcore bank-conflict pair (same-bank vs diff-bank) relies on
     // core 1's instruction fetches NOT landing on the same SRAM bank
     // port as core 0's fetches/data. Otherwise the intended bank-match
-    // contrast is dominated by I-fetch contention. Bank math matches
-    // `mdrp2350::bus::sram_bank_wait`: `offset = addr & 0x000F_FFFF`,
-    // `bank = (offset >> 2) & 7`.
+    // contrast is dominated by I-fetch contention. Bank math (replicated
+    // by `bank_of` below): `offset = addr & 0x000F_FFFF`,
+    // `bank = (offset >> 2) & 7`. Mirrors the now-removed
+    // `mdrp2350::bus::sram_bank_wait` historical helper.
 
     fn bank_of(addr: u32) -> u32 {
         let offset = addr & 0x000F_FFFF;

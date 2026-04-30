@@ -782,7 +782,8 @@ impl Bus {
     /// keeps `dma` itself `pub(crate)` while preserving the read-only
     /// observability the harness needs.
     ///
-    /// Panics if `i >= DmaChannel::COUNT` (matches `Dma::channel`).
+    /// Panics if `i >= crate::dma::NUM_CHANNELS` (matches the
+    /// underlying `Dma::channel` slice index).
     #[inline]
     pub fn dma_channel(&self, i: usize) -> &crate::dma::DmaChannel {
         self.dma.channel(i)
