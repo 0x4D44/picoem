@@ -25,10 +25,8 @@
 //!    coordinator), joins them, and surfaces panics via the `poisoned`
 //!    flag so the instance cannot be reused after a worker panic.
 
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::{self, JoinHandle};
 
 use mdpicoem_common::PioBlock;
 use tracing::{error, warn};
@@ -41,7 +39,7 @@ use super::memory as tmem;
 use super::peripherals::{ClocksState, IoState, ResetsState, TimerState};
 use super::{
     BarrierResult, CoreAtomics, Peripherals, PioCommand, SharedMemory, SharedState, SpinBarrier,
-    ThreadedPio,
+    ThreadedPio, panic_message, spawn_worker,
 };
 
 // =======================================================================
@@ -502,90 +500,12 @@ fn clone_memory(bus: &Bus) -> SharedMemory {
 // =======================================================================
 // Worker-thread plumbing
 // =======================================================================
-
-/// Extract a human-readable message from a `JoinHandle::join()` Err
-/// payload.
-fn panic_message(err: Option<&Box<dyn std::any::Any + Send>>) -> String {
-    match err {
-        Some(payload) => payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| {
-                payload
-                    .downcast_ref::<&'static str>()
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
-        None => String::new(),
-    }
-}
-
-/// Spawn a worker thread pinned to `host_core` running `body`. Catches
-/// panics from `body` and poisons the shared barrier before re-raising
-/// the panic so the remaining workers drop out of their spin loops.
-fn spawn_worker<F, R>(host_core: usize, barrier: Arc<SpinBarrier>, body: F) -> JoinHandle<R>
-where
-    F: FnOnce(Arc<SpinBarrier>) -> R + Send + 'static,
-    R: Send + 'static,
-{
-    thread::spawn(move || {
-        pin_to_host_core(host_core);
-        let b_for_body = barrier.clone();
-        match std::panic::catch_unwind(AssertUnwindSafe(move || body(b_for_body))) {
-            Ok(r) => r,
-            Err(payload) => {
-                barrier.poison();
-                std::panic::resume_unwind(payload);
-            }
-        }
-    })
-}
-
-/// Pin the current thread to the supplied host logical-CPU id.
-///
-/// Per-OS backends:
-/// - Windows: `SetThreadAffinityMask` (single-bit mask).
-/// - Linux: `pthread_setaffinity_np` with a one-bit `cpu_set_t`.
-///
-/// The whole module is gated to those two operating systems, so the
-/// `cfg` arms below are exhaustive on supported builds.
-fn pin_to_host_core(host_core: usize) {
-    assert!(
-        host_core < usize::BITS as usize,
-        "host_core {host_core} exceeds processor-mask bit width"
-    );
-    #[cfg(target_os = "windows")]
-    {
-        use winapi::um::processthreadsapi::GetCurrentThread;
-        use winapi::um::winbase::SetThreadAffinityMask;
-        let h = unsafe { GetCurrentThread() };
-        let mask = 1usize << host_core;
-        let prev = unsafe { SetThreadAffinityMask(h, mask) };
-        assert!(
-            prev != 0,
-            "SetThreadAffinityMask failed for host core {host_core}"
-        );
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::CPU_ZERO(&mut set);
-            libc::CPU_SET(host_core, &mut set);
-        }
-        let rc = unsafe {
-            libc::pthread_setaffinity_np(
-                libc::pthread_self(),
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &set,
-            )
-        };
-        assert!(
-            rc == 0,
-            "pthread_setaffinity_np failed for host core {host_core}: errno={rc}"
-        );
-    }
-}
+//
+// `panic_message`, `spawn_worker`, and `pin_to_host_core` were promoted
+// to `mdpicoem-common::threaded::worker` per the 2026-04-30 Threaded
+// Helpers Pull-Up HLD V1. They reach this file via the `use super::{...}`
+// import at the top of the file (re-exported from
+// `crate::threaded::mod.rs`).
 
 // =======================================================================
 // Worker bodies
@@ -1346,26 +1266,10 @@ mod tests {
         assert_eq!(threaded.shared.gpio_oe.load(Ordering::Acquire), 0x00FF);
     }
 
-    // ----- Helper coverage: panic_message + apply_pio_command ----------
-
-    /// `panic_message` extracts the payload from `JoinHandle::join`'s
-    /// `Err` arm. Cover all three arms: `String`, `&'static str`, and
-    /// the `<non-string panic payload>` fallback. Also covers `None`
-    /// (Ok join — empty string).
-    #[test]
-    fn panic_message_extracts_all_payload_kinds() {
-        // Build payloads that mimic what `JoinHandle::join` returns.
-        let s_payload: Box<dyn std::any::Any + Send> = Box::new(String::from("string panic"));
-        assert_eq!(panic_message(Some(&s_payload)), "string panic");
-
-        let static_payload: Box<dyn std::any::Any + Send> = Box::new("static-str panic");
-        assert_eq!(panic_message(Some(&static_payload)), "static-str panic");
-
-        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42u64);
-        assert_eq!(panic_message(Some(&other_payload)), "<non-string panic payload>");
-
-        assert_eq!(panic_message(None), "");
-    }
+    // ----- Helper coverage: apply_pio_command ---------------------------
+    // `panic_message_extracts_all_payload_kinds` moved with `panic_message`
+    // to `mdpicoem-common::threaded::worker::tests` per the 2026-04-30
+    // Threaded Helpers Pull-Up HLD V1 §5.4.
 
     /// `apply_pio_command` covers all four `PioCommand` arms. We feed
     /// each one into a fresh `PioBlock` and verify a non-default

@@ -57,6 +57,17 @@ pub use bus::{PioBus, WorkerBus};
 ))]
 pub use emulator::{RunError, ThreadedEmulator};
 pub use mdpicoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
+// Worker-thread helpers (panic_message, spawn_worker, pin_to_host_core)
+// were promoted from `threaded::emulator` to `mdpicoem-common::threaded`
+// per the 2026-04-30 Threaded Helpers Pull-Up HLD V1. These re-exports
+// keep the chip-local call sites that reach them via `super::{...}`
+// from `threaded::emulator` source-compatible.
+#[cfg(all(
+    feature = "threading",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub use mdpicoem_common::threaded::{panic_message, pin_to_host_core, spawn_worker};
 pub use peripherals::{
     ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState, UsbState,
 };

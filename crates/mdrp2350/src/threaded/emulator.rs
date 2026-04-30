@@ -34,11 +34,9 @@
 //! see `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` §6 and
 //! `threaded::peripherals::ClocksState::pll_sys_read_at`.
 
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::{self, JoinHandle};
 
 use mdpicoem_common::PioBlock;
 
@@ -52,7 +50,7 @@ use super::peripherals::{
 use super::timings::{PerWorkerTimings, RunTimings, TimingRecorder};
 use super::{
     AtomicGpio, BarrierResult, ExclusiveMonitors, PioCommand, SharedMemory, SharedState,
-    SpinBarrier, ThreadedPio, ThreadedSio, WorkerBus,
+    SpinBarrier, ThreadedPio, ThreadedSio, WorkerBus, panic_message, spawn_worker,
 };
 
 /// Runtime-error payload returned from [`ThreadedEmulator::run_quanta_checked`].
@@ -697,25 +695,12 @@ impl ThreadedEmulator {
 // =======================================================================
 // Worker-thread plumbing
 // =======================================================================
-
-/// Extract a human-readable message from a `JoinHandle::join()` Err
-/// payload. Falls back to a fixed string if the payload is neither a
-/// `String` nor a `&'static str` — matches the downcast pattern used in
-/// the in-crate panic-assertion tests.
-fn panic_message(err: Option<&Box<dyn std::any::Any + Send>>) -> String {
-    match err {
-        Some(payload) => payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| {
-                payload
-                    .downcast_ref::<&'static str>()
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
-        None => String::new(),
-    }
-}
+//
+// `panic_message`, `spawn_worker`, and `pin_to_host_core` were promoted
+// to `mdpicoem-common::threaded::worker` per the 2026-04-30 Threaded
+// Helpers Pull-Up HLD V1. They reach this file as `panic_message`,
+// `spawn_worker`, `pin_to_host_core` via the `use super::{...}` import
+// at the top of the file (re-exported from `crate::threaded::mod.rs`).
 
 /// Helper for `run_quanta`'s PIO-worker join handling: split an
 /// `Option<(PioBlock, PerWorkerTimings)>` into its two halves so the
@@ -728,77 +713,6 @@ fn split_ok(
     match ok {
         Some((b, t)) => (Some(b), Some(t)),
         None => (None, None),
-    }
-}
-
-/// Spawn a worker thread pinned to `host_core` running `body`. Catches
-/// panics from `body` and poisons the shared barrier before re-raising
-/// the panic so the remaining workers drop out of their spin loops.
-///
-/// Generic over the body's return type so the three different body
-/// signatures (`CortexM33` / `PioBlock` / `()`) share the same spawn
-/// path without a trait object.
-fn spawn_worker<F, R>(host_core: usize, barrier: Arc<SpinBarrier>, body: F) -> JoinHandle<R>
-where
-    F: FnOnce(Arc<SpinBarrier>) -> R + Send + 'static,
-    R: Send + 'static,
-{
-    thread::spawn(move || {
-        pin_to_host_core(host_core);
-        let b_for_body = barrier.clone();
-        match std::panic::catch_unwind(AssertUnwindSafe(move || body(b_for_body))) {
-            Ok(r) => r,
-            Err(payload) => {
-                barrier.poison();
-                std::panic::resume_unwind(payload);
-            }
-        }
-    })
-}
-
-/// Pin the current thread to the supplied host logical-CPU id.
-///
-/// Per-OS backends:
-/// - Windows: `SetThreadAffinityMask` (single-bit mask).
-/// - Linux: `pthread_setaffinity_np` with a one-bit `cpu_set_t`.
-///
-/// The whole module is gated to those two operating systems, so the
-/// `cfg` arms below are exhaustive on supported builds.
-fn pin_to_host_core(host_core: usize) {
-    assert!(
-        host_core < usize::BITS as usize,
-        "host_core {host_core} exceeds processor-mask bit width"
-    );
-    #[cfg(target_os = "windows")]
-    {
-        use winapi::um::processthreadsapi::GetCurrentThread;
-        use winapi::um::winbase::SetThreadAffinityMask;
-        let h = unsafe { GetCurrentThread() };
-        let mask = 1usize << host_core;
-        let prev = unsafe { SetThreadAffinityMask(h, mask) };
-        assert!(
-            prev != 0,
-            "SetThreadAffinityMask failed for host core {host_core}"
-        );
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::CPU_ZERO(&mut set);
-            libc::CPU_SET(host_core, &mut set);
-        }
-        let rc = unsafe {
-            libc::pthread_setaffinity_np(
-                libc::pthread_self(),
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &set,
-            )
-        };
-        assert!(
-            rc == 0,
-            "pthread_setaffinity_np failed for host core {host_core}: errno={rc}"
-        );
     }
 }
 
