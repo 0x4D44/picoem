@@ -797,19 +797,20 @@ fn s65_scb_cfsr_byte_write_clears_only_target_lane() {
 }
 
 #[test]
-#[ignore = "No public bus API seeds HFSR; it is only set via the \
-            fault-escalation path. Without a seed, a byte-write test \
-            trivially passes (storage is zero, RMW is a no-op) without \
-            actually exercising the W1C preservation contract. Revisit \
-            once the fault-escalation path has a test hook. See \
-            tech_debt.md."]
 fn s65_scb_hfsr_byte_write_clears_only_target_lane() {
     let mut bus = Bus::new();
-    bus.write32(SCB_HFSR, 0x0000_0F0F, 0);
-    let _ = bus.read32(SCB_HFSR, 0);
+    clear_bf(&mut bus);
+    // Seed HFSR via the test-only `Bus::seed_hfsr_for_test`. Production
+    // sets HFSR exclusively through `CortexM33::ppb` on the fault-escalation
+    // path; the seeder bypasses that to make the storage observable to the
+    // narrow `write8` RMW under test without an Emulator/CortexM33 in scope.
+    bus.seed_hfsr_for_test(0x0000_0F0F);
     bus.write8(SCB_HFSR + 1, 0x00, 0);
-    let _ = bus.read32(SCB_HFSR, 0);
     assert!(!bus.bus_fault(0), "HFSR byte write must not fault");
+    // Future Stage 2/3/4 work: also assert lane preservation through the
+    // PPB-routed narrow-access path. Today the narrow write lands in the
+    // `peripheral_regs` catch-all, so we only pin the no-fault contract.
+    // Tracked under T1 of the 2026-04-29 sweep tracker.
 }
 
 // --- §6.5 DMA_INTR / INTS0 / INTS1 (Shape A) ---

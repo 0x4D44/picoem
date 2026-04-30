@@ -52,11 +52,6 @@ impl Fifo {
         self.count >= 8
     }
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> u8 {
-        self.count
-    }
-
     /// Non-consuming snapshot of the FIFO contents in head → tail order.
     ///
     /// Used by `mdrp2350::threaded::ThreadedSio::seed` to copy the

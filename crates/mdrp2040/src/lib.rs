@@ -1410,9 +1410,12 @@ impl EmulatorBuilder {
     }
 
     /// Override the per-step quantum (default [`DEFAULT_STEP_QUANTUM`]).
+    ///
+    /// Clamps `0 -> 1`. Previously a `debug_assert!` here meant
+    /// `step_quantum(0)` silently advanced 0 cycles per `step()` in
+    /// release builds, a guaranteed infinite-loop footgun for `run()`.
     pub fn step_quantum(mut self, n: u32) -> Self {
-        debug_assert!(n > 0, "step_quantum must be >= 1");
-        self.step_quantum = n;
+        self.step_quantum = n.max(1);
         self
     }
 
@@ -1679,6 +1682,24 @@ mod stage4_lib_residue {
             .build()
             .unwrap();
         assert_eq!(emu.step_quantum, 8);
+    }
+
+    #[test]
+    fn step_quantum_zero_clamps_to_one() {
+        // Regression: `EmulatorBuilder::step_quantum(0)` previously
+        // tripped a `debug_assert!` (and silently advanced 0 cycles
+        // per `step()` in release builds — an infinite-loop footgun
+        // for `run()`). The clamp at the builder entry point keeps
+        // the runtime contract `step_quantum >= 1` intact.
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(0)
+            .build()
+            .unwrap();
+        assert_eq!(emu.step_quantum, 1);
+        // `step()` must make forward progress (advance >= 1 master
+        // cycle) and not loop forever.
+        let advanced = emu.step().unwrap();
+        assert!(advanced >= 1);
     }
 
     #[test]

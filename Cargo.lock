@@ -1441,7 +1441,9 @@ dependencies = [
 name = "mdpicoem-common"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tracing",
+ "winapi",
 ]
 
 [[package]]

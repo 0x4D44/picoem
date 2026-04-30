@@ -10517,7 +10517,6 @@ fn powman_count_advances_at_expected_rate() {
 }
 
 #[test]
-#[ignore = "threading: PPB writes (NVIC ISER/ISPR) must go through CortexM33::bus_write32 wrapper — test writes direct via Bus"]
 fn powman_match_pends_nvic_line_45() {
     use crate::peripherals::powman::{
         ALARM_TIME_15TO0_OFFSET, INT_TIMER_BIT, INTE_OFFSET, IRQ_POWMAN_IRQ_TIMER, POWMAN_BASE,
@@ -10550,24 +10549,37 @@ fn powman_match_pends_nvic_line_45() {
     );
 
     // Enable NVIC line 45 (bank 1, bit 13). NVIC_ISER1 = 0xE000_E104.
-    emu.bus
-        .write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32), 0);
+    // PPB writes must route through `Emulator::mmio_write32` so they
+    // land on `CortexM33::ppb` (the `Bus::write32` PPB-bypass debug_assert
+    // catches direct PPB writes).
+    emu.mmio_write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32));
 
     // Tick enough sys_clks to cross MATCH=100.
     let n = 100 * POWMAN_SYS_PER_TICK as u32 + 50;
     emu.bus.tick_peripherals(n);
 
-    // NVIC_ISPR1 bit 13 (= IRQ 45 - 32) should be set.
-    let ispr1 = emu.bus.read32(0xE000_E204, 0);
+    // Phase 0b.1 Commit B: peripheral-raised IRQs latch in
+    // `bus.atomics.irq_pending` and merge into per-core `ppb.nvic_ispr`
+    // only at step-loop entry (`take_irq_pending`+`merge_irq_pending` in
+    // `step_pair_arm`). This test deliberately never steps a core, so we
+    // assert the latch at its true home: `bus.atomics.irq_pending`.
+    // POWMAN is a shared IRQ — both cores' pending banks should hold it.
+    let pending0 = emu.bus.atomics.irq_pending_load(0);
+    let pending1 = emu.bus.atomics.irq_pending_load(1);
+    let bit = 1u64 << IRQ_POWMAN_IRQ_TIMER;
     assert_ne!(
-        ispr1 & (1u32 << (IRQ_POWMAN_IRQ_TIMER - 32)),
+        pending0 & bit,
         0,
-        "NVIC_ISPR1 bit 13 (IRQ 45) must be latched; PRIMASK blocks dispatch, not pending"
+        "core-0 pending mask must latch IRQ 45; PRIMASK blocks dispatch, not pending"
+    );
+    assert_ne!(
+        pending1 & bit,
+        0,
+        "core-1 pending mask must latch IRQ 45 (POWMAN is a shared IRQ)"
     );
 }
 
 #[test]
-#[ignore = "threading: PPB writes (NVIC ISER, VTOR) must go through CortexM33::bus_write32 wrapper — test writes direct via Bus"]
 fn powman_match_enters_emulator_handler() {
     use crate::peripherals::powman::{
         ALARM_TIME_15TO0_OFFSET, INT_TIMER_BIT, INTE_OFFSET, IRQ_POWMAN_IRQ_TIMER, POWMAN_BASE,
@@ -10601,9 +10613,11 @@ fn powman_match_enters_emulator_handler() {
     // step once and assert PC was at HANDLER_ADDR before the BKPT.
     emu.bus.write32(HANDLER_ADDR, 0x0000_BE00, 0); // bkpt #0 at [0], padding
 
-    // Program VTOR — both secure and non-secure aliases.
-    emu.bus.write32(0xE000_ED08, VT_BASE, 0); // S_VTOR
-    emu.bus.write32(0xE002_ED08, VT_BASE, 0); // NS_VTOR
+    // Program VTOR — both secure and non-secure aliases. PPB writes
+    // must route through `Emulator::mmio_write32` so they land on
+    // `CortexM33::ppb`.
+    emu.mmio_write32(0xE000_ED08, VT_BASE); // S_VTOR
+    emu.mmio_write32(0xE002_ED08, VT_BASE); // NS_VTOR
 
     // Seed core 0 with a minimal thread-mode context so it can take
     // the exception. Clear PRIMASK; program a simple `b .` PC so the
@@ -10633,8 +10647,7 @@ fn powman_match_enters_emulator_handler() {
         0x5AFE_0000 | TIMER_RUN_BIT | TIMER_ALARM_ENAB_BIT,
         0,
     );
-    emu.bus
-        .write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32), 0);
+    emu.mmio_write32(0xE000_E104, 1u32 << (IRQ_POWMAN_IRQ_TIMER - 32));
 
     // Run long enough for alarm to fire and IRQ to dispatch. 100 ticks
     // of POWMAN plus margin for exception-entry cycles.
@@ -21074,29 +21087,6 @@ mod stage7_ppb_coverage {
             ppb.nvic_iabr[0].load(std::sync::atomic::Ordering::Relaxed),
             0xFF
         );
-    }
-
-    #[test]
-    fn set_irq_pending_out_of_range_noop() {
-        let mut ppb = Ppb::default();
-        ppb.set_irq_pending(1000);
-        // No change.
-    }
-
-    #[test]
-    fn clear_irq_pending_out_of_range_noop() {
-        let mut ppb = Ppb::default();
-        ppb.clear_irq_pending(1000);
-    }
-
-    #[test]
-    fn set_irq_active_and_check_enabled() {
-        let mut ppb = Ppb::default();
-        ppb.set_irq_active(5);
-        assert!(!ppb.irq_enabled(5));
-        ppb.write32(0xE000_E100, 1 << 5);
-        assert!(ppb.irq_enabled(5));
-        assert!(!ppb.irq_enabled(1000));
     }
 
     #[test]

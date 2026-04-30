@@ -70,7 +70,6 @@ impl Ppb {
     /// SysTick respectively). Bits [5:0] of the priority byte are
     /// RAZ/WI on M0+ — we ignore them here.
     #[inline]
-    #[allow(dead_code)] // used starting Phase 5 NVIC wiring
     pub fn exception_priority(&self, exc_num: u16) -> i16 {
         debug_assert!(
             exc_num < 16,

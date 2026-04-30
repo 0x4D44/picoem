@@ -57,7 +57,7 @@ impl Memory {
     // --- ROM ---
 
     pub fn load_rom(&mut self, data: &[u8]) {
-        let len = data.len().min(ROM_SIZE);
+        let len = data.len().min(self.rom.len());
         self.rom[..len].copy_from_slice(&data[..len]);
     }
 
@@ -491,6 +491,30 @@ mod tests {
         assert_eq!(xip[..2], [0x42; 2]);
         // Tail of the pre-sized XIP stays zero after the clamp.
         assert_eq!(xip[2..], [0u8; 6]);
+    }
+
+    #[test]
+    fn load_rom_clamps_to_rom_len_not_constant() {
+        // Regression: `load_rom` previously clamped against the
+        // RP2350 `ROM_SIZE` constant (32 KB) regardless of the
+        // actual `self.rom` length. On the RP2040 path
+        // (`with_sizes(16 * 1024, ...)`) a 32 KB input would panic
+        // inside `copy_from_slice` because the destination slice
+        // was only 16 KB long. The fix clamps to `self.rom.len()`
+        // — symmetric with `load_flash`.
+        let mut mem = Memory::with_sizes(16 * 1024, 0);
+        let data: Vec<u8> = (0..32 * 1024_u32).map(|i| (i & 0xFF) as u8).collect();
+        // Must not panic.
+        mem.load_rom(&data);
+        // First 16 KB must be the input prefix verbatim.
+        for i in 0..16 * 1024_u32 {
+            assert_eq!(mem.rom_read8(i), (i & 0xFF) as u8);
+        }
+        // Reads past `self.rom.len()` fall through to the
+        // out-of-range branches — they return 0, not the input
+        // tail. Confirms we did not silently grow `rom`.
+        assert_eq!(mem.rom_read8(0x4000), 0);
+        assert_eq!(mem.rom_read32(0x4000), 0);
     }
 
     #[test]

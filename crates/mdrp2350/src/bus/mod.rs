@@ -1219,6 +1219,24 @@ impl Bus {
         self.atomics.clear_bus_fault(core);
     }
 
+    /// Test-only: seed the SCB HFSR storage observable by `Bus::read32(SCB_HFSR)`.
+    ///
+    /// HFSR is set in production exclusively via the fault-escalation path on
+    /// `CortexM33::ppb`. This helper exists so the narrow-access audit suite
+    /// (`tests_narrow.rs::s65_scb_hfsr_byte_write_clears_only_target_lane`)
+    /// can seed HFSR without an Emulator/CortexM33 in scope. The seed is
+    /// written into `Bus::peripheral_regs[SCB_HFSR]`; subsequent
+    /// `Bus::read32(SCB_HFSR)` consults that map under the matching cfg-gated
+    /// short-circuit in the region 0xE read path (see `read32` below).
+    ///
+    /// Feature-gated via `cfg(any(test, feature = "testing"))`. Never reachable
+    /// in a release library build.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn seed_hfsr_for_test(&mut self, value: u32) {
+        const SCB_HFSR_ADDR: u32 = 0xE000_ED2C;
+        self.peripheral_regs.insert(SCB_HFSR_ADDR, value);
+    }
+
     /// Request a system-wide watchdog reset (HLD V5 §7.D.3). Called by
     /// the WATCHDOG peripheral when its countdown fires. The CPU step
     /// loop polls [`Self::watchdog_reset_requested`] before instruction
@@ -2898,6 +2916,16 @@ impl Bus {
                 self.coresight_trace.read32(addr - CORESIGHT_TRACE_BASE)
             }
             _ => {
+                // Test-only: serve seeded SCB_HFSR reads from the
+                // peripheral_regs catch-all so `seed_hfsr_for_test` has a
+                // matching reader. One-address intercept under the same cfg
+                // — production binaries are byte-identical.
+                #[cfg(any(test, feature = "testing"))]
+                if addr == 0xE000_ED2C {
+                    if let Some(v) = self.peripheral_regs.get(&addr) {
+                        return *v;
+                    }
+                }
                 self.atomics.set_bus_fault(core as usize, addr);
                 0
             }
@@ -3222,27 +3250,6 @@ impl Bus {
         dma.tick(self);
         dma.route_irqs(&self.atomics);
         self.dma = dma;
-    }
-}
-
-/// Extra wait-state for SRAM bank access (retained for documentation).
-/// Banks 2 and 6 have +1 cycle on RP2350 (measured on silicon via DWT CYCCNT).
-/// No longer called from data-access paths. Bank 2/6 penalty is now
-/// modeled on instruction fetch only, conditional on sequentiality.
-/// Returns 0 during burst mode (STM/LDM/PUSH/POP) — the SRAM controller
-/// handles sequential accesses without per-word bank penalties.
-#[allow(dead_code)]
-fn sram_bank_wait(addr: u32, burst: bool) -> u32 {
-    if burst {
-        return 0;
-    }
-    let offset = addr & 0x000F_FFFF;
-    if offset < 0x8_0000 {
-        // Striped SRAM0-7
-        let bank = (offset >> 2) & 7;
-        if bank == 2 || bank == 6 { 1 } else { 0 }
-    } else {
-        0 // SRAM8-9 non-striped: no extra wait
     }
 }
 

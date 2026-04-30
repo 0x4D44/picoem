@@ -30,3 +30,14 @@ pio-pad-diag = []
 
 [dependencies]
 tracing = { workspace = true }
+
+# Worker-thread affinity FFI for `threaded::worker::pin_to_host_core`
+# (2026-04-30 Threaded Helpers Pull-Up HLD V1). Same per-OS deps already
+# carried by both chip crates' Cargo.toml — Windows uses
+# `SetThreadAffinityMask` from `winapi`; Linux uses
+# `pthread_setaffinity_np` from `libc`.
+[target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+libc = "0.2"

@@ -382,11 +382,11 @@ pub struct Bus {
     /// this with the 12-channel model. Consulted by the fast-path gate
     /// in [`crate::Emulator::step`] via [`Dma::is_idle`].
     ///
-    /// `pub` so diagnostic harnesses (e.g. `picogus_diff_rp2040`) can
-    /// read per-channel observation counters on `DmaChannel` without
-    /// going through MMIO. Matches the precedent of `pub gpio_in` and
-    /// `pub pio` above. Control still flows through `bus.write32`.
-    pub dma: Dma,
+    /// `pub(crate)` because external readers (diagnostic harnesses
+    /// such as `picogus_diff_rp2040` that need per-channel observation
+    /// counters on `DmaChannel`) go through [`Self::dma_channel`]
+    /// instead. Control still flows through `bus.write32`.
+    pub(crate) dma: Dma,
     /// Pending external IRQ bitmap (bit N = IRQ #N asserted this
     /// cycle). Peripherals OR into this field when their state raises
     /// a line; [`crate::Emulator::drain_pending_irqs_to_cores`] drains
@@ -772,6 +772,21 @@ impl Bus {
     /// `UART0.DR` since the previous call. See `UartRegs::drain_tx_log`.
     pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
         self.uart0.drain_tx_log()
+    }
+
+    /// Borrow a single DMA channel's observation state.
+    ///
+    /// External diagnostic harnesses (e.g. `picogus_diff_rp2040`) read
+    /// per-channel counters on `DmaChannel` to verdict scenarios that
+    /// MMIO can't surface without write side-effects. The accessor
+    /// keeps `dma` itself `pub(crate)` while preserving the read-only
+    /// observability the harness needs.
+    ///
+    /// Panics if `i >= crate::dma::NUM_CHANNELS` (matches the
+    /// underlying `Dma::channel` slice index).
+    #[inline]
+    pub fn dma_channel(&self, i: usize) -> &crate::dma::DmaChannel {
+        self.dma.channel(i)
     }
 
     /// Base read latency for an address region (cycles).

@@ -1751,3 +1751,175 @@ semantics), but adding a single MSR sysm=20 case to
 `gen_t32_misc_control` would give the targeted oracle path explicit
 regression coverage independent of the random fuzz path. Cheap fix;
 not blocking.
+
+## Tech-debt entries added by 2026.04.29 sweep (logged 2026-04-30)
+
+The following were surfaced by the multi-agent codebase sweep (see
+`wrk_docs/2026.04.29 - Codebase Tech-Debt Sweep Report.md` and the
+companion action plan). Each is tracker-only — no code changes
+this round. Cross-reference IDs (B*, T*, R*, H*, M*) map to the
+sweep report for context.
+
+### B3 — MPU registers stored but not enforced (RP2350)
+
+PPB at `crates/mdrp2350/src/bus/ppb.rs:99,340,552` round-trips
+firmware writes to `MPU_CTRL`/`MPU_RNR`/`MPU_RBAR`/`MPU_RLAR`
+cleanly. There is no MPU-region predicate on data reads/writes;
+only the `TT` (test-target) instruction at
+`crates/mdrp2350/src/core/exceptions.rs:760-799` consults regions.
+FPU lazy-flush at `crates/mdrp2350/src/core/execute_fpu.rs:1216-1230`
+self-marks `// MemManage — *not yet wired*. When Stage E enforces
+the MPU on data writes, this function will also set FPCCR.MMRDY and
+assign self.pending_fault = Some(Fault::MemManage) directly`.
+
+**Distinct from** the TrustZone S-bit FIXME at this file's
+"Phase 7 Stage 6 — TrustZone V8M secure exception entry asymmetry"
+section. That one bites NS exception entry; this one bites every
+MPU-protected workload.
+
+**Cross-reference:** the `Fault::MemManage` enum variant at
+`crates/mdrp2350/src/core/mod.rs:188-202` has only test
+constructors today (verified 2026-04-29). Do **not** delete — it
+returns to production when this lands.
+
+**Suggested fix.** Add `Bus::mpu_check(addr, kind, core) -> Option<Fault>`
+predicate, plumbed through `read*`/`write*` and the FPU lazy-flush
+path. Gate on `MPU_CTRL.ENABLE=1` so the cost is zero on
+current-corpus firmware (none of which enables MPU). Trigger to
+schedule: Phase 8 TrustZone work, or first corpus firmware that
+exercises MPU.
+
+### B4 — Cross-core LDREX/STREX granularity is whole-quantum, not word (RP2350 Serial)
+
+`crates/mdrp2350/src/lib.rs:1456-1460` invalidates a peer's
+exclusive monitor on **any** data write in the quantum, not just
+writes hitting the reserved word. ARMv8-M §A3.4 specifies
+word-or-cache-line granularity. Liveness preserved (LDREX/STREX
+retry loops are well-defined), but tight LDREX/STREX cycle counts
+diverge from silicon by a constant factor.
+
+`ExclusiveMonitors::snoop` at `crates/mdrp2350/src/threaded/bus.rs`
+does word-granular invalidation, but is wired only on the threaded
+path. Serial mode has no cousin.
+
+**Silicon-oracle coverage:** zero. Verified by grep — no LDREX/STREX
+cases in `cycle_cases.rs`, `dualcore_cases.rs`, `dual_model.rs`. So
+this gap is silicon-untested in either direction.
+
+**Suggested fix.** Either wire `monitors.snoop` into Serial mode, or
+replace `did_write_this_quantum` with per-core "wrote-to-word X"
+tracking. Add a silicon oracle case for cross-core competing-write
+LDREX/STREX before either fix lands.
+
+### T1 — 22 narrow-audit Stage 2/3/4 tests `#[ignore]`d (RP2350)
+
+`crates/mdrp2350/src/tests_narrow.rs:311-1243` carries 22 markers of
+the form `#[ignore = "narrow-audit Stage 2/3/4 not applied
+(reverse-merge tech debt)"]`. Each pins a silicon-correct
+narrow-access behaviour the production code does NOT honour today:
+NVIC ISER/ISPR/ICPR W1C through byte/half writes, SIO interp, DMA
+INTR side effects, SCB CFSR W1C through narrow writes, etc.
+
+Stage 1 of the Bus Narrow-Access Audit
+(`wrk_docs/2026.04.17 - HLD - Bus Narrow-Access Audit.md`) landed
+the tests; Stages 2/3/4 production-code fixes were deferred. The
+existing entry at the W1C IO_BANK0 INTR section above mentions only
+the two `s65_io_bank0_intr*` tests; the other 20 were tracked only
+by the `#[ignore]` reason string until now.
+
+**Suggested fix.** Schedule the Stage 2/3/4 audit work, or fold
+each test's wait-condition into a structured sub-tracker. Each test
+reads its own subsystem name in the function name; an `rg
+'#\[ignore = "narrow-audit'` against `tests_narrow.rs` yields the
+inventory.
+
+### T2 — RP2040 DMA flag-bit `#[allow(dead_code)]` mirror
+
+Same shape as the existing entry in this file's "DMA blocker / V1
+deferred features" section (RP2350) but on
+`crates/mdrp2040/src/dma.rs:73,99,115,118` —
+`CTRL_HIGH_PRIORITY`, `CTRL_BSWAP`, `CTRL_SNIFF_EN`,
+`CH_DBG_TCR_OFFSET`. Same regression-shape (the BUSY-bit-position
+assertion test the existing RP2350 entry prescribes has no RP2040
+equivalent).
+
+### T3 — OneROM serving oracle O(N²) per case acknowledged TODO
+
+`crates/mdpicoem-harness/src/onerom_serving_oracle.rs:886-903`
+re-runs `evaluate_case_trace` from scratch every tick. Source
+TODO marks it acceptable at G.1 N=60 single-case scale. Now
+exercised by the 15-case sweep under `test_silicon` (per the
+`test_silicon` orchestrator HLD). Streaming-evaluator refactor is
+described inline; ~half-day of work.
+
+### R1 — `Memory` mutator API does not invalidate the decode cache
+
+`Bus::pending_invalidation_regions` at `crates/mdrp2350/src/bus/mod.rs:494-516`
+is updated only via `Bus::write*`. Direct mutations through
+`Memory::sram_write*`, `Memory::xip_*`, `Memory::load_*` bypass it.
+
+**Distinct from** the existing `Emulator` direct-field-access entry
+elsewhere in this file. `Memory`'s own fields (`rom`, `sram`, `xip`)
+are private at `crates/mdpicoem-common/src/memory.rs:9-11`, so the
+hazard is the mutator API surface, not pub-field exposure. Making
+`bus.memory` `pub(crate)` does NOT fix the cache-invalidation
+problem.
+
+**Suggested fix.** Either add a post-mutation invalidation hook on
+`Bus` callable by Memory mutators, or route Memory mutators through
+Bus typed wrappers. Tied into the broader encapsulation migration
+(see "RP2040 Threaded — Emulator direct-field access" entry above).
+
+### H5 — RP2040 watchdog `CYCLES_RESET = 12` is post-init, not silicon zero
+
+`crates/mdrp2040/src/peripherals/watchdog_tick.rs:48-55` documents
+the divergence in source:
+`// real silicon resets to 0; the default models the post-init
+state`. Firmware sniffing `WATCHDOG.TICK.CYCLES` immediately after
+reset to detect "uninitialised cycle config" sees 12 on emu, 0 on
+silicon, and skips its `runtime_init_clocks` step. PicoGUS doesn't
+trip this; future RP2040 firmware might.
+
+**Suggested fix.** Either reset to 0 (and update the `hello_timer`
+corpus to write CYCLES first), or accept the divergence — the
+in-source comment becomes the authoritative tracker entry once this
+is logged here.
+
+### H7 — Worker-poison panic in production threading path (RP2350)
+
+`crates/mdrp2350/src/threaded/emulator.rs:480-483` emits a `panic!`
+on a Send/Sync-bridge join-handle context rather than
+`tracing::error!` + `EmulatorError::WorkerPanicked` early-return.
+The sticky-after-panic contract documented at
+`crates/mdrp2350/src/lib.rs:64-72`, the `panic_info` field at
+`lib.rs:360`, and `EmulatorError::WorkerPanicked` at `lib.rs:976`
+already exist — this is purely converting the display path to use
+them.
+
+**Severity:** code-shape concern, not a current-corpus correctness
+issue.
+
+### M3 — `probe-rs` is patched in-tree
+
+`Cargo.toml:52-53` has `[patch.crates-io]` pointing to
+`third_party/probe-rs-0.31.0-mdrp-patched`. Track the de-fork
+condition (e.g. "drop the patch when probe-rs upstream lands the
+silicon-target session-attach fix in 0.32.x"). Workspace currently
+has no automated check that the fork is alive or that upstream has
+caught up.
+
+## Half-modelled architectural state — inventory (2026-04-30)
+
+The following architectural state machines are partially modelled.
+Firmware that exercises any one silently produces wrong results;
+firmware that combines them produces wrong results in unpredictable
+ways. None blocks current corpus firmware. Promote individual rows
+to active work as their use cases land.
+
+| State machine | Stored | Enforced | Differential-validated | Tracker rows |
+|---|---|---|---|---|
+| MPU regions (RP2350) | ✅ | ❌ | ❌ | B3 above |
+| TrustZone S-bit at exception entry | partial | partial | ❌ | "Phase 7 Stage 6 — TrustZone V8M secure exception entry" section |
+| FPSCR.AHP (half-precision FP) | ✅ | ❌ | ❌ | `crates/mdrp2350/src/core/execute_fpu.rs:1414` TODO |
+| RP2040 NVIC dispatch | partial | partial | ❌ (silicon_isr_diff_rp2040 FAILs by design) | "RP2040 Phase 1 IRQ plumbing" section |
+| Cross-core exclusive-monitor granularity (Serial) | ✅ | over-eager | ❌ | B4 above |
