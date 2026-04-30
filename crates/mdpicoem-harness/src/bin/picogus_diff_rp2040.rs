@@ -2660,7 +2660,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let en = ctrl & 1;
         let treq = (ctrl >> 15) & 0x3F;
         let busy = (ctrl >> 24) & 1;
-        let c = emu.bus.dma.channel(ch);
+        let c = emu.bus.dma_channel(ch);
         let any_trig = c.trig_ctrl
             + c.trig_write_addr
             + c.trig_trans_count
@@ -2755,7 +2755,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // triggered channel is fine — the HLD rule is "if ANY channel
         // fits the pattern".
         let ch = triggered_channels[0];
-        let c = emu.bus.dma.channel(ch);
+        let c = emu.bus.dma_channel(ch);
         let treq = ((c.ctrl >> 15) & 0x3F) as u8;
         let dreq_bit = if treq < 64 {
             (c.dreq_observed_mask >> treq) & 1 != 0
@@ -2772,7 +2772,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else if !served_channels.is_empty() && pio1_sm0_autopush == 0 {
         let ch = served_channels[0];
-        let c = emu.bus.dma.channel(ch);
+        let c = emu.bus.dma_channel(ch);
         format!(
             "ENGINE SERVED, PIO DIDN'T CONSUME (CH{} xfers={}) — \
              investigate PIO1 SM0 pull/shift or TX FIFO sink plumbing",

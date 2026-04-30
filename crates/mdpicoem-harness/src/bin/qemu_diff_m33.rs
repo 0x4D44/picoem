@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, sanity_check};
+use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile, sanity_check};
 use mdpicoem_harness::*;
 
 /// BKPT #0 instruction (little-endian bytes).
@@ -167,7 +167,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut qemu = QemuProcess::spawn()?;
 
     // 2. Connect GDB with retry
-    let mut gdb = GdbClient::connect("localhost:3333", Duration::from_secs(5))?;
+    let mut gdb = GdbClient::connect(&QemuProfile::M33_RP2350.gdb_addr(), Duration::from_secs(5))?;
     gdb.handshake()?;
 
     // 3. Write minimal vector table so QEMU isn't stuck in HardFault
@@ -410,8 +410,8 @@ fn respawn_qemu(qemu: &mut QemuProcess, gdb: &mut GdbClient) -> Result<(), Strin
     // Drop old QEMU (kill on drop), spawn new
     *qemu = QemuProcess::spawn().map_err(|e| e.to_string())?;
     std::thread::sleep(Duration::from_millis(500));
-    *gdb =
-        GdbClient::connect("localhost:3333", Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    *gdb = GdbClient::connect(&QemuProfile::M33_RP2350.gdb_addr(), Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
     gdb.handshake().map_err(|e| e.to_string())?;
     setup_vector_table(gdb).map_err(|e| e.to_string())?;
     Ok(())
