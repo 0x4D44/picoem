@@ -609,6 +609,158 @@ fn half_edge_cases_f32() -> Vec<f32> {
     ]
 }
 
+/// Targeted f32 inputs that exercise the round-half-to-even paths in
+/// `f32_to_f16_bits` — both subnormal (lines 1516-1547 of execute_fpu.rs)
+/// and normal (1549-1570). Constructed so that round_bit / sticky / lsb
+/// at the f16-mantissa boundary vary independently, plus boundary cases
+/// for the `rounded > 0x3FF` carry-into-exponent test at line 1563.
+///
+/// Closes the V3 Stream B Bucket 1 candidates flagged in V2 Triage HLD
+/// §10.3:
+///
+/// - line 1534 `mantissa & 1` (subnormal lsb)
+/// - line 1536 `if round_bit != 0 && (sticky || lsb != 0)` (round trigger)
+/// - line 1553 `(frac & 0xFFF) != 0` (normal sticky)
+/// - line 1554 `mantissa & 1` (normal lsb)
+/// - line 1563 `if rounded > 0x3FF` (mantissa carry)
+fn vcvt_f16_rounding_edge_cases_f32() -> Vec<f32> {
+    let mut out = Vec::new();
+    // ---------- Subnormal output (e ∈ [-24, -15]) ----------
+    //
+    // For each exponent in this range, build an f32 whose mantissa bits
+    // place a controllable lsb at bit `shift` and round_bit at bit
+    // `shift - 1` of the implicit-1-prepended `m = (1 << 23) | frac`.
+    //
+    // shift = -e - 1 ∈ [14, 23]. For shift=14 the f16 mantissa has 9
+    // independently-varying bits; for shift=23 it has zero (mantissa is
+    // always 1 from the implicit leading bit). Sweep lsb / round_bit /
+    // sticky independently across `shift ∈ {14, 17, 20}` to hit a
+    // representative spread.
+    for &e in &[-15i32, -18, -21] {
+        let exp = (e + 127) as u32;
+        let shift = (-e - 1) as u32;
+        // Build masks within the 23-bit frac field (bit 23 is implicit-1
+        // and not part of frac).
+        // - lsb_bit at bit `shift` of m → bit `shift` of frac (since shift < 23)
+        // - round_bit at bit `shift - 1` of m → bit `shift - 1` of frac
+        // - sticky covers bits 0..(shift - 1) of m → same in frac
+        for &(round_bit, sticky_bit, lsb) in &[
+            (0u32, 0u32, 0u32),
+            (0, 0, 1),
+            (0, 1, 0),
+            (0, 1, 1),
+            (1, 0, 0),
+            (1, 0, 1), // line 1534/1536: original rounds-up, mut1534 doesn't
+            (1, 1, 0), // line 1536: round-up via sticky alone
+            (1, 1, 1),
+        ] {
+            let mut frac: u32 = 0;
+            if lsb == 1 && shift < 23 {
+                frac |= 1 << shift;
+            }
+            if round_bit == 1 && shift >= 1 {
+                frac |= 1 << (shift - 1);
+            }
+            if sticky_bit == 1 && shift >= 2 {
+                // Set bit 0 only — guarantees sticky is true.
+                frac |= 1;
+            }
+            let bits = (exp << 23) | (frac & 0x7F_FFFF);
+            out.push(f32::from_bits(bits));
+            // Sign-mirrored variant for free coverage of the sign-bit
+            // assembly path at lines 1488/1546.
+            out.push(f32::from_bits(bits | 0x8000_0000));
+        }
+    }
+
+    // ---------- Normal output, generic round-half-to-even spread ----------
+    //
+    // For e ∈ {-10, 0, 10} (representative normal range), vary round_bit
+    // (frac bit 12), sticky bits (frac bits 0..=11), and the f16
+    // mantissa lsb (frac bit 13).
+    for &e in &[-10i32, 0, 10] {
+        let exp = (e + 127) as u32;
+        for &(round_bit, sticky_bit, lsb) in &[
+            (0u32, 0u32, 0u32),
+            (0, 0, 1),
+            (0, 1, 0),
+            (1, 0, 0), // mantissa unchanged (round_bit set but no carry)
+            (1, 0, 1), // line 1554/1536: round-up via lsb only
+            (1, 1, 0), // line 1553: round-up via sticky only
+            (1, 1, 1),
+        ] {
+            let mut frac: u32 = 0;
+            if lsb == 1 {
+                frac |= 1 << 13;
+            }
+            if round_bit == 1 {
+                frac |= 1 << 12;
+            }
+            if sticky_bit == 1 {
+                // Set bit 0 — guarantees sticky non-zero. Bit 0 is in
+                // the lower 12 of frac so it doesn't cross the round_bit
+                // / lsb positions.
+                frac |= 1;
+            }
+            // Set the upper f16-mantissa bits so we don't sit on
+            // mantissa = 0 (which is a special path).
+            frac |= 0xA << 19; // frac[22:19] = 1010, gives mantissa[9:6] = 1010
+            let bits = (exp << 23) | (frac & 0x7F_FFFF);
+            out.push(f32::from_bits(bits));
+        }
+    }
+
+    // ---------- Normal-branch carry boundary (line 1563) ----------
+    //
+    // `if rounded > 0x3FF` carries the result into the next exponent.
+    // The mutation `> → >=` differs when `rounded == 0x3FF` exactly, so
+    // we need (a) cases where `rounded == 0x3FF` and (b) cases where
+    // `rounded == 0x3FE` (just below) and `rounded == 0x400` (just
+    // above) to disambiguate.
+    //
+    // Construct frac so `mantissa = frac >> 13` lands on 0x3FF (or
+    // 0x3FE rounded up to 0x3FF, etc).
+    for &e in &[0i32, 5, -10] {
+        let exp = (e + 127) as u32;
+        // mantissa = 0x3FF, round_bit = 0, sticky = 0 → rounded = 0x3FF.
+        // Line 1563 takes the false branch; mutation `>=` takes true.
+        let frac_3ff_no_round = (0x3FFu32) << 13;
+        out.push(f32::from_bits((exp << 23) | (frac_3ff_no_round & 0x7F_FFFF)));
+        // mantissa = 0x3FE, round_bit = 1, sticky = 1 → rounded =
+        // 0x3FF. Same boundary, different path in.
+        let frac_3fe_round_sticky =
+            ((0x3FEu32) << 13) | (1 << 12) | 1;
+        out.push(f32::from_bits(
+            (exp << 23) | (frac_3fe_round_sticky & 0x7F_FFFF),
+        ));
+        // mantissa = 0x3FF, round_bit = 1, sticky = 1 → rounded =
+        // 0x400. Original carries; mutation also carries (>= 0x3FF
+        // is also true). No divergence here, but useful coverage.
+        let frac_3ff_round_sticky =
+            ((0x3FFu32) << 13) | (1 << 12) | 1;
+        out.push(f32::from_bits(
+            (exp << 23) | (frac_3ff_round_sticky & 0x7F_FFFF),
+        ));
+    }
+
+    // ---------- Normal-branch sticky-zero corner (line 1553) ----------
+    //
+    // The mutation `(frac & 0xFFF) != 0` → `(frac ^ 0xFFF) != 0` flips
+    // sticky from false to true unless `frac & 0xFFF == 0xFFF`. Generate
+    // f32 where `frac & 0xFFF == 0` exactly so original sticky is false
+    // and the mutation makes it true.
+    for &e in &[0i32, -5, 5] {
+        let exp = (e + 127) as u32;
+        // frac with lower 12 bits zero. Set round_bit = 1, lsb = 0 so
+        // original (with sticky=false, lsb=0) does NOT round up; mutation
+        // (with sticky=true) DOES round up. Detectable.
+        let frac = ((0x300u32) << 13) | (1 << 12);
+        out.push(f32::from_bits((exp << 23) | (frac & 0x7F_FFFF)));
+    }
+
+    out
+}
+
 fn half_edge_cases_f16() -> Vec<u16> {
     vec![
         0x0000, 0x8000, // ±0
@@ -737,6 +889,17 @@ fn run_vcvt_half(fuzz_count: Option<usize>, seed: u64) -> bool {
                     }
                 }
             }
+            // F32→F16 round-half-to-even targeted cases (subnormal +
+            // normal-branch boundary). Closes V3 Bucket 1 candidates at
+            // f32_to_f16_bits lines 1534/1536/1553/1554/1563.
+            for &v in &vcvt_f16_rounding_edge_cases_f32() {
+                for (mode, label) in FPSCR_MODES {
+                    total += 1;
+                    if !run_one_half(HalfDir::F16FromF32, mode, label, v, 0) {
+                        fail += 1;
+                    }
+                }
+            }
             println!(
                 "[FPU] VCVT.F16 edge cases: {}/{} passed",
                 total - fail,
@@ -761,7 +924,19 @@ fn run_vcvt_half(fuzz_count: Option<usize>, seed: u64) -> bool {
                     }
                 }
             }
-            // F32 → F16
+            // F32 → F16, deterministic round-half-to-even targeted
+            // sweep (run once per FPSCR mode regardless of fuzz count
+            // — small constant cost, ~100 cases × 4 modes).
+            let rounding_cases = vcvt_f16_rounding_edge_cases_f32();
+            for (mode, label) in FPSCR_MODES {
+                for &v in &rounding_cases {
+                    total += 1;
+                    if !run_one_half(HalfDir::F16FromF32, mode, label, v, 0) {
+                        fail += 1;
+                    }
+                }
+            }
+            // F32 → F16, random fuzz.
             for (mode, label) in FPSCR_MODES {
                 for _ in 0..count {
                     total += 1;
