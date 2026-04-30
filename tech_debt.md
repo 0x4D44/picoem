@@ -1646,7 +1646,16 @@ Re-enable as soon as the W1C peripheral path lands. Until then, the
 narrow-write paths into IO_BANK0 INTR are tested only by the bus-side
 mask, which is not equivalent to silicon W1C.
 
-## Master clock does not advance when both cores are WFE/WFI-blocked (RP2040 + RP2350) (2026-04-26)
+## Master clock does not advance when both cores are WFE/WFI-blocked (RP2350 only — RP2040 closed 2026-04-29) (2026-04-26)
+
+**Status (2026-04-29):** RP2040 closed in V2 ISR Oracle implementation
+(`crates/mdrp2040/src/lib.rs` step_serial both-blocked clock-advance
+branch + `Bus::next_scheduled_lazy_deadline` + `TimerRegs::next_armed_inte_fire_cycle`).
+Validated by `isr_m0_wfi_wake` scenario passing on EMU via the standard
+`run_scenario` helper (no test-side core-1 busy-loop scaffolding).
+RP2350 still open with the same shape — fold in when surfaced by an
+analogous mdrp2350 scenario.
+
 
 `crates/mdrp2040/src/lib.rs:595-625` (post-WFE/SEV wiring) and
 `crates/mdrp2350/src/lib.rs:1339-1342` both use the same step-loop
@@ -1696,3 +1705,19 @@ today.
 
 Linked HLD: `wrk_docs/2026.04.26 - HLD - RP2040 WFE-SEV Wake
 Mechanics V1.md` §8 Q3 (deferred per supervisor adjudication).
+
+## Curated MSR sysm=20 case missing from `gen_t32_misc_control` (2026-04-29)
+
+`crates/mdpicoem-harness/src/thumb32_gen.rs::gen_t32_misc_control`
+emits MSR cases for sysm ∈ {16, 17, 19} but not 20 (CONTROL write).
+The 2026.04.29 M0+ T32 Randomised Fuzz Generator iteration narrowed
+`fuzz_m0plus_msr` to drop sysm 8/9/20 because QEMU `cortex-m0` is
+non-spec-compliant on those SYSm values (see `wrk_journals/2026.04.29
+- JRN - M0+ T32 Randomised Fuzz Generator.md` Stage E.1 verdict).
+That leaves MSR CONTROL with no QEMU-side regression gate. mdrp2040
+is spec-correct (existing curated unit tests at
+`mdrp2040/src/tests.rs:3964–4031` cover the spec-compliant write
+semantics), but adding a single MSR sysm=20 case to
+`gen_t32_misc_control` would give the targeted oracle path explicit
+regression coverage independent of the random fuzz path. Cheap fix;
+not blocking.
