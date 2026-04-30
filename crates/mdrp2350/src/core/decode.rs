@@ -614,3 +614,620 @@ impl CortexM33 {
         }
     }
 }
+
+#[cfg(test)]
+mod classifier_tests {
+    //! Direct tests for the purity / flag-only classifier helpers in
+    //! this module.
+    //!
+    //! Strategy: each classifier is a pure function of opcode bits. We
+    //! assert (a) per-match-arm structural cases with named encodings,
+    //! and (b) FNV-1a fingerprints over the relevant input space (full
+    //! 16-bit space for Thumb-16; cross-product of structural patterns
+    //! for Thumb-32). Any mutation that changes even one input → output
+    //! mapping flips the fingerprint.
+    //!
+    //! Classifier consumer (mdrp2350): `decode_execute` reads
+    //! `is_pure()` to gate the fast-path / slow-path split (line 284).
+    //! The fast and slow paths produce identical register / xpsr state;
+    //! only `bus.extra_wait_states()` accumulation differs, which feeds
+    //! cycle counting. The QEMU oracle does not compare cycles cross-
+    //! tool (qemu.cycles is hardcoded 0), so classifier mutations are
+    //! observable only via direct unit tests like these.
+    //!
+    //! NOTE: the fingerprint is "current behaviour, not architectural
+    //! truth". If a real classifier bug is fixed, update the asserted
+    //! constant after manually reviewing the diff.
+    use super::{
+        classify_is_pure, classify_thumb16_misc_pure, classify_thumb16_pure,
+        classify_thumb32_branch_misc_pure, classify_thumb32_misc_control_pure,
+        classify_thumb32_pure, is_thumb16_flag_only, is_wide,
+    };
+
+    /// FNV-1a 64-bit hash of the byte sequence. Deterministic across
+    /// Rust versions (unlike `std::collections::hash_map::DefaultHasher`).
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn pack_bool_bits(values: impl IntoIterator<Item = bool>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut byte = 0u8;
+        let mut bit = 0u32;
+        for v in values {
+            if v {
+                byte |= 1 << bit;
+            }
+            bit += 1;
+            if bit == 8 {
+                bytes.push(byte);
+                byte = 0;
+                bit = 0;
+            }
+        }
+        if bit != 0 {
+            bytes.push(byte);
+        }
+        bytes
+    }
+
+    /// Build a Thumb-16 opcode with prefix `p` (5 bits) and a body of zeros.
+    fn t16(prefix: u16) -> u16 {
+        prefix << 11
+    }
+
+    /// Build a misc-group opcode with op[11:8] = `op`. Prefix is 1011_0.
+    fn misc(op: u16) -> u16 {
+        (0b10110u16 << 11) | (op << 8)
+    }
+
+    // ---------- classify_thumb16_pure: per-prefix structural ----------
+
+    #[test]
+    fn t16_shift_immediate_is_pure() {
+        // 00000 LSL imm, 00001 LSR imm, 00010 ASR imm
+        for prefix in 0b00000..=0b00010u16 {
+            assert!(
+                classify_thumb16_pure(t16(prefix)),
+                "prefix {prefix:05b} should be pure (shift imm)"
+            );
+        }
+    }
+
+    #[test]
+    fn t16_add_sub_is_pure() {
+        assert!(classify_thumb16_pure(t16(0b00011)));
+    }
+
+    #[test]
+    fn t16_imm8_data_processing_is_pure() {
+        for prefix in 0b00100..=0b00111u16 {
+            assert!(
+                classify_thumb16_pure(t16(prefix)),
+                "prefix {prefix:05b} should be pure (imm8 DP)"
+            );
+        }
+    }
+
+    #[test]
+    fn t16_data_processing_pure_special_data_impure() {
+        // 0b01000 with bit10=0 → DP register (pure)
+        assert!(classify_thumb16_pure(0b01000_00000_000000));
+        // 0b01000 with bit10=1 → special data / BX / BLX (impure)
+        assert!(!classify_thumb16_pure(0b01000_10000_000000));
+    }
+
+    #[test]
+    fn t16_loads_stores_are_impure() {
+        // 0b01001 LDR literal
+        assert!(!classify_thumb16_pure(t16(0b01001)));
+        // 0b01010, 0b01011 LDR/STR register offset
+        assert!(!classify_thumb16_pure(t16(0b01010)));
+        assert!(!classify_thumb16_pure(t16(0b01011)));
+        // 0b01100..=0b10001 LDR/STR immediate offset (six handlers)
+        for prefix in 0b01100..=0b10001u16 {
+            assert!(
+                !classify_thumb16_pure(t16(prefix)),
+                "prefix {prefix:05b} should be impure (LDR/STR imm offset)"
+            );
+        }
+        // 0b10010, 0b10011 LDR/STR SP-relative
+        assert!(!classify_thumb16_pure(t16(0b10010)));
+        assert!(!classify_thumb16_pure(t16(0b10011)));
+    }
+
+    #[test]
+    fn t16_adr_and_add_sp_imm_are_pure() {
+        assert!(classify_thumb16_pure(t16(0b10100))); // ADR
+        assert!(classify_thumb16_pure(t16(0b10101))); // ADD SP, imm
+    }
+
+    #[test]
+    fn t16_misc_group_dispatches() {
+        // op[11:8] = 0b0000 → ADD/SUB SP imm7 (pure)
+        let pure_misc = (0b10110u16 << 11) | (0b0000 << 8);
+        assert!(classify_thumb16_pure(pure_misc));
+        // op[11:8] = 0b0100 → PUSH (impure)
+        let impure_misc = (0b10110u16 << 11) | (0b0100 << 8);
+        assert!(!classify_thumb16_pure(impure_misc));
+    }
+
+    #[test]
+    fn t16_stm_ldm_are_impure() {
+        assert!(!classify_thumb16_pure(t16(0b11000))); // STM
+        assert!(!classify_thumb16_pure(t16(0b11001))); // LDM
+    }
+
+    #[test]
+    fn t16_b_cond_pure_svc_udf_impure() {
+        // Prefix 11010/11011, cond field bits[11:8]:
+        //   0x0..=0xD → B.cond (pure)
+        //   0xE → UDF (impure)
+        //   0xF → SVC (impure)
+        for cond in 0x0..=0xDu16 {
+            let opc = (0b11010u16 << 11) | (cond << 8);
+            assert!(
+                classify_thumb16_pure(opc),
+                "B.cond cond={cond:#x} should be pure"
+            );
+        }
+        let udf = (0b11010u16 << 11) | (0xE << 8);
+        let svc = (0b11010u16 << 11) | (0xF << 8);
+        assert!(!classify_thumb16_pure(udf));
+        assert!(!classify_thumb16_pure(svc));
+    }
+
+    #[test]
+    fn t16_b_unconditional_is_pure() {
+        assert!(classify_thumb16_pure(t16(0b11100)));
+    }
+
+    #[test]
+    fn t16_thumb32_prefixes_classify_impure_via_thumb16_path() {
+        // Prefixes 0b11101 / 0b11110 / 0b11111 should never reach
+        // classify_thumb16_pure (is_wide catches all three on M33), but
+        // if they do, the function returns false (impure).
+        assert!(!classify_thumb16_pure(t16(0b11101)));
+        assert!(!classify_thumb16_pure(t16(0b11110)));
+        assert!(!classify_thumb16_pure(t16(0b11111)));
+    }
+
+    // ---------- classify_thumb16_misc_pure: per-op structural ----------
+
+    #[test]
+    fn misc_add_sub_sp_imm7_is_pure() {
+        assert!(classify_thumb16_misc_pure(misc(0b0000)));
+    }
+
+    #[test]
+    fn misc_sxt_uxt_is_pure() {
+        assert!(classify_thumb16_misc_pure(misc(0b0010)));
+    }
+
+    #[test]
+    fn misc_push_is_impure() {
+        assert!(!classify_thumb16_misc_pure(misc(0b0100)));
+        assert!(!classify_thumb16_misc_pure(misc(0b0101)));
+    }
+
+    #[test]
+    fn misc_cps_is_pure() {
+        assert!(classify_thumb16_misc_pure(misc(0b0110)));
+    }
+
+    #[test]
+    fn misc_rev_is_pure() {
+        assert!(classify_thumb16_misc_pure(misc(0b1010)));
+    }
+
+    #[test]
+    fn misc_pop_is_impure() {
+        assert!(!classify_thumb16_misc_pure(misc(0b1100)));
+        assert!(!classify_thumb16_misc_pure(misc(0b1101)));
+    }
+
+    #[test]
+    fn misc_bkpt_is_pure_on_m33() {
+        // mdrp2350 classifies BKPT as a NOP stub → pure.
+        // (mdrp2040 classifies BKPT impure because it sets pending_fault.)
+        assert!(classify_thumb16_misc_pure(misc(0b1110)));
+    }
+
+    #[test]
+    fn misc_hints_are_pure() {
+        // op[11:8] == 0b1111 → IT / hints (NOP / YIELD / WFE / WFI / SEV).
+        assert!(classify_thumb16_misc_pure(misc(0b1111)));
+    }
+
+    #[test]
+    fn misc_cbz_cbnz_are_pure() {
+        // CBZ / CBNZ match `op & 0x5 == 0x1` (op bits[11:8] in {0x1, 0x3, 0x9, 0xB}).
+        // M33-only encoding; mdrp2040 lacks this.
+        for op in [0x1u16, 0x3, 0x9, 0xB] {
+            assert!(
+                classify_thumb16_misc_pure(misc(op)),
+                "CBZ/CBNZ op {op:#x} should be pure"
+            );
+        }
+    }
+
+    #[test]
+    fn misc_unenumerated_ops_are_pure_by_fallback() {
+        // The mdrp2350 fallback arm is `_ => true` (NOP stubs default
+        // to pure). This is the structural counterpart to mdrp2040's
+        // `_ => false` — encode the divergence so a mutation flipping
+        // either crate's fallback is caught.
+        for op in 0..=0xFu16 {
+            let expected = match op {
+                0b0100 | 0b0101 | 0b1100 | 0b1101 => false, // PUSH / POP
+                _ => true,
+            };
+            assert_eq!(
+                classify_thumb16_misc_pure(misc(op)),
+                expected,
+                "misc op[11:8]={op:#x} expected {expected}"
+            );
+        }
+    }
+
+    // ---------- is_thumb16_flag_only ----------
+
+    #[test]
+    fn flag_only_cmp_imm8_is_flag_only() {
+        // 00101 CMP Rn, #imm8
+        assert!(is_thumb16_flag_only(t16(0b00101)));
+    }
+
+    #[test]
+    fn flag_only_data_processing_tst_cmp_cmn() {
+        // 0b01000 with bit10=0, dp_op = (opcode >> 6) & 0xF.
+        // Flag-only: TST (0x8), CMP (0xA), CMN (0xB).
+        for dp_op in [0x8u16, 0xA, 0xB] {
+            let opc = (0b01000u16 << 11) | (dp_op << 6);
+            assert!(
+                is_thumb16_flag_only(opc),
+                "DP op {dp_op:#x} should be flag-only"
+            );
+        }
+        // Other DP ops are NOT flag-only.
+        for dp_op in [0x0u16, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x9, 0xC, 0xD, 0xE, 0xF] {
+            let opc = (0b01000u16 << 11) | (dp_op << 6);
+            assert!(
+                !is_thumb16_flag_only(opc),
+                "DP op {dp_op:#x} should NOT be flag-only"
+            );
+        }
+    }
+
+    #[test]
+    fn flag_only_special_data_cmp() {
+        // 0b01000 with bit10=1, opcode[9:8] = 0b01 → CMP Rn, Rm (high reg).
+        let opc = (0b01000u16 << 11) | (1 << 10) | (0b01 << 8);
+        assert!(is_thumb16_flag_only(opc));
+        // Other special-data sub-ops are NOT flag-only.
+        for sub in [0b00u16, 0b10, 0b11] {
+            let opc = (0b01000u16 << 11) | (1 << 10) | (sub << 8);
+            assert!(
+                !is_thumb16_flag_only(opc),
+                "special-data sub {sub:#x} should NOT be flag-only"
+            );
+        }
+    }
+
+    #[test]
+    fn flag_only_other_prefixes_are_not_flag_only() {
+        // Spot-check: shifts, branches, loads/stores never flag-only.
+        for prefix in [0b00000u16, 0b00100, 0b01001, 0b11100] {
+            assert!(
+                !is_thumb16_flag_only(t16(prefix)),
+                "prefix {prefix:05b} should NOT be flag-only"
+            );
+        }
+    }
+
+    // ---------- classify_thumb32_pure: per-encoding structural ----------
+
+    /// Build a Thumb-32 hw0 with prefix `0b11110` and op2 / op1 fields.
+    /// op1 = (hw0 >> 11) & 0x3 (already covered via prefix bits[12:11]).
+    /// op2 = (hw0 >> 4) & 0x7F.
+    fn t32_hw0(op1: u16, op2: u16) -> u16 {
+        // Top 5 bits = 11110. Then op1 in bits [12:11]. Then op2 in [10:4].
+        (0b11110u16 << 11) | (op1 << 11) | ((op2 & 0x7F) << 4)
+    }
+
+    #[test]
+    fn t32_op1_01_dp_shifted_reg_is_pure() {
+        // op1 = 0b01, op2 >> 5 = 0b01 → dp_shifted_reg (pure).
+        let hw0 = (0b11101u16 << 11) | (0b01 << 11) | (0b01_00000 << 4);
+        assert!(classify_thumb32_pure(hw0, 0));
+    }
+
+    #[test]
+    fn t32_op1_01_load_store_dual_is_impure() {
+        // op1 = 0b01, op2 >> 5 = 0b00 → ldm/stm/ldrd/strd (impure).
+        let hw0 = (0b11101u16 << 11) | (0b01 << 11) | (0b00_00000 << 4);
+        assert!(!classify_thumb32_pure(hw0, 0));
+    }
+
+    #[test]
+    fn t32_op1_01_coprocessor_is_impure() {
+        // op1 = 0b01, op2 >> 5 in {0b10, 0b11} → coprocessor (impure).
+        let hw0_10 = (0b11101u16 << 11) | (0b01 << 11) | (0b10_00000 << 4);
+        let hw0_11 = (0b11101u16 << 11) | (0b01 << 11) | (0b11_00000 << 4);
+        assert!(!classify_thumb32_pure(hw0_10, 0));
+        assert!(!classify_thumb32_pure(hw0_11, 0));
+    }
+
+    #[test]
+    fn t32_op1_10_dp_imm_is_pure_when_hw1_msb_clear() {
+        // op1 = 0b10, hw1 bit15 = 0 → dp_modified_imm / dp_plain_imm (pure).
+        let hw0 = (0b11110u16 << 11) | (0b10 << 11);
+        let hw1 = 0x0000;
+        assert!(classify_thumb32_pure(hw0, hw1));
+    }
+
+    #[test]
+    fn t32_op1_10_branch_misc_dispatches() {
+        // op1 = 0b10, hw1 bit15 = 1 → branch_misc (recursive dispatch).
+        let hw0 = (0b11110u16 << 11) | (0b10 << 11);
+        // BL: hw1 bit14 set. classify_thumb32_branch_misc_pure returns true.
+        let hw1 = 1 << 14;
+        assert!(classify_thumb32_pure(hw0, hw1));
+    }
+
+    #[test]
+    fn t32_op1_11_load_store_single_is_impure() {
+        // op1 = 0b11, op2 & 0x40 = 0, op2 & 0x20 = 0 → load_store_single (impure).
+        let hw0 = (0b11111u16 << 11) | (0b11 << 11) | (0b0000000 << 4);
+        assert!(!classify_thumb32_pure(hw0, 0));
+    }
+
+    #[test]
+    fn t32_op1_11_dp_register_is_pure() {
+        // op1 = 0b11, op2 & 0x40 = 0, op2 & 0x20 = 1, op2 & 0x10 = 0 → dp_register (pure).
+        let hw0 = (0b11111u16 << 11) | (0b11 << 11) | (0b0100000 << 4);
+        assert!(classify_thumb32_pure(hw0, 0));
+    }
+
+    #[test]
+    fn t32_op1_11_multiply_is_pure() {
+        // op2 & 0x40 = 0, op2 & 0x20 = 1, op2 & 0x10 = 1, op2 & 0x08 = 0 → multiply (pure).
+        let hw0 = (0b11111u16 << 11) | (0b11 << 11) | (0b0110000 << 4);
+        assert!(classify_thumb32_pure(hw0, 0));
+    }
+
+    #[test]
+    fn t32_op1_11_long_multiply_is_pure() {
+        // op2 & 0x40 = 0, op2 & 0x20 = 1, op2 & 0x10 = 1, op2 & 0x08 = 1 → long_multiply (pure).
+        let hw0 = (0b11111u16 << 11) | (0b11 << 11) | (0b0111000 << 4);
+        assert!(classify_thumb32_pure(hw0, 0));
+    }
+
+    #[test]
+    fn t32_op1_11_coprocessor_is_impure() {
+        // op2 & 0x40 != 0 → coprocessor (impure).
+        let hw0 = (0b11111u16 << 11) | (0b11 << 11) | (0b1000000 << 4);
+        assert!(!classify_thumb32_pure(hw0, 0));
+    }
+
+    // ---------- classify_thumb32_branch_misc_pure ----------
+
+    #[test]
+    fn branch_misc_bl_is_pure() {
+        // BL: hw1 bit14 set.
+        assert!(classify_thumb32_branch_misc_pure(0xF000, 1 << 14));
+    }
+
+    #[test]
+    fn branch_misc_b_w_t4_is_pure() {
+        // B.W T4: hw1 bit14=0, hw1 bit12=1.
+        assert!(classify_thumb32_branch_misc_pure(0xF000, 1 << 12));
+    }
+
+    #[test]
+    fn branch_misc_b_w_t3_cond_is_pure() {
+        // B.W T3: hw1 bit14=0, hw1 bit12=0, misc_op = (hw0 >> 6) & 0xF
+        // with `misc_op & 0xE != 0xE` → conditional branch (pure).
+        let hw0 = 0xF000; // misc_op bits[9:6] = 0b0000.
+        assert!(classify_thumb32_branch_misc_pure(hw0, 0));
+    }
+
+    #[test]
+    fn branch_misc_misc_control_dispatches() {
+        // misc_op & 0xE == 0xE → misc_control sub-dispatch.
+        // Use NOP.W (pure) and undefined hint (impure) cases.
+        let hw0_nop = 0xF3AF;
+        let hw1_nop = 0x0000; // hint = 0x00 → NOP.
+        let hw1_unrecognised = 0x0005; // hint = 0x05 (out of 0..=0x04).
+        assert!(classify_thumb32_branch_misc_pure(hw0_nop, hw1_nop));
+        assert!(!classify_thumb32_branch_misc_pure(hw0_nop, hw1_unrecognised));
+    }
+
+    // ---------- classify_thumb32_misc_control_pure ----------
+
+    #[test]
+    fn misc_control_hints_are_pure() {
+        let hw0 = 0xF3AF;
+        for hint in 0x00..=0x04u16 {
+            assert!(
+                classify_thumb32_misc_control_pure(hw0, hint),
+                "hint {hint:#x} should be pure"
+            );
+        }
+        // Out-of-range hint → impure (falls into thumb32_undefined).
+        assert!(!classify_thumb32_misc_control_pure(hw0, 0x05));
+        assert!(!classify_thumb32_misc_control_pure(hw0, 0xFF));
+    }
+
+    #[test]
+    fn misc_control_barriers_are_pure() {
+        // hw0 == 0xF3BF, barrier_op = (hw1 >> 4) & 0xF in {0x2, 0x4, 0x5, 0x6}.
+        let hw0 = 0xF3BF;
+        for barrier_op in [0x2u16, 0x4, 0x5, 0x6] {
+            let hw1 = barrier_op << 4;
+            assert!(
+                classify_thumb32_misc_control_pure(hw0, hw1),
+                "barrier_op {barrier_op:#x} should be pure"
+            );
+        }
+        // Unrecognised barrier (e.g. 0x7) → impure.
+        let hw1 = 0x7 << 4;
+        assert!(!classify_thumb32_misc_control_pure(hw0, hw1));
+    }
+
+    #[test]
+    fn misc_control_msr_mrs_are_pure() {
+        // op_field = (hw0 >> 4) & 0x7F in {0b0111000, 0b0111001, 0b0111110, 0b0111111}.
+        for op_field in [0b0111000u16, 0b0111001, 0b0111110, 0b0111111] {
+            let hw0 = (op_field & 0x7F) << 4;
+            // hw0 must NOT be 0xF3BF or 0xF3AF — the function checks those first.
+            // Pick a base that doesn't collide.
+            let hw0 = hw0 | 0xF000;
+            // Still need to avoid F3AF / F3BF.
+            assert!(hw0 != 0xF3AF && hw0 != 0xF3BF);
+            assert!(
+                classify_thumb32_misc_control_pure(hw0, 0),
+                "op_field {op_field:#b} should be pure"
+            );
+        }
+    }
+
+    #[test]
+    fn misc_control_unrecognised_is_impure() {
+        // Some op_field that isn't MSR/MRS/hints/barriers.
+        let hw0 = 0xF000; // op_field = 0, not matching any case.
+        assert!(!classify_thumb32_misc_control_pure(hw0, 0));
+    }
+
+    // ---------- classify_is_pure: dispatcher ----------
+
+    #[test]
+    fn dispatcher_routes_thumb16() {
+        assert_eq!(
+            classify_is_pure(t16(0b00000), 0, false),
+            classify_thumb16_pure(t16(0b00000))
+        );
+        assert_eq!(
+            classify_is_pure(t16(0b01001), 0, false),
+            classify_thumb16_pure(t16(0b01001))
+        );
+    }
+
+    #[test]
+    fn dispatcher_routes_thumb32() {
+        let hw0 = (0b11110u16 << 11) | (0b10 << 11);
+        let hw1 = 1 << 14; // BL
+        assert_eq!(
+            classify_is_pure(hw0, hw1, true),
+            classify_thumb32_pure(hw0, hw1)
+        );
+    }
+
+    // ---------- is_wide ----------
+
+    #[test]
+    fn is_wide_matches_all_m33_thumb32_prefixes() {
+        // M33 accepts three wide prefixes: 0b11101, 0b11110, 0b11111
+        // (i.e. hw0 >= 0xE800).
+        assert!(is_wide(0xE800));
+        assert!(is_wide(0xF000)); // 0b11110
+        assert!(is_wide(0xF800)); // 0b11111
+        assert!(is_wide(0xFFFF));
+        // Just below threshold → narrow.
+        assert!(!is_wide(0xE7FF));
+        assert!(!is_wide(0x0000));
+        assert!(!is_wide(0x4000));
+    }
+
+    // ---------- exhaustive Thumb-16 fingerprint ----------
+    //
+    // Snapshot tests: enumerate the entire 16-bit input space, compute
+    // each classifier's output, and assert the FNV-1a fingerprint
+    // matches a checked-in constant. ANY mutation that changes even one
+    // input → output mapping flips this hash.
+
+    #[test]
+    fn t16_pure_full_space_fingerprint() {
+        let bits = (0..=0xFFFFu16).map(classify_thumb16_pure);
+        let packed = pack_bool_bits(bits);
+        let h = fnv1a64(&packed);
+        assert_eq!(
+            h, T16_PURE_FINGERPRINT,
+            "classify_thumb16_pure fingerprint changed (computed = {h:#018x})"
+        );
+    }
+
+    #[test]
+    fn t16_misc_full_space_fingerprint() {
+        // The misc classifier inspects opcode[11:8]; enumerate all 16
+        // sub-ops at canonical misc encoding (prefix 1011_0).
+        let bits = (0..=0xFu16).map(misc).map(classify_thumb16_misc_pure);
+        let packed = pack_bool_bits(bits);
+        let h = fnv1a64(&packed);
+        assert_eq!(
+            h, MISC_PURE_FINGERPRINT,
+            "classify_thumb16_misc_pure fingerprint changed (computed = {h:#018x})"
+        );
+    }
+
+    #[test]
+    fn flag_only_full_space_fingerprint() {
+        let bits = (0..=0xFFFFu16).map(is_thumb16_flag_only);
+        let packed = pack_bool_bits(bits);
+        let h = fnv1a64(&packed);
+        assert_eq!(
+            h, FLAG_ONLY_FINGERPRINT,
+            "is_thumb16_flag_only fingerprint changed (computed = {h:#018x})"
+        );
+    }
+
+    #[test]
+    fn t32_pure_structured_fingerprint() {
+        // Cross-product over a representative set of (hw0, hw1) pairs
+        // covering the dispatch arms in classify_thumb32_pure. Chosen
+        // to exercise every match arm — see the structural tests above.
+        let mut bits = Vec::with_capacity(64);
+        // op1 = 0b01, op2 >> 5 ∈ {0b00, 0b01, 0b10, 0b11}
+        for op2_high in [0b00u16, 0b01, 0b10, 0b11] {
+            let hw0 = (0b11101u16 << 11) | (op2_high << 16 - 4 - 1) | ((op2_high << 5) << 4);
+            // Simpler: build via t32 op1=01, op2 = op2_high << 5.
+            let hw0 = (0b11101u16 << 11) | (0b01 << 11) | ((op2_high << 5) << 4);
+            bits.push(classify_thumb32_pure(hw0, 0));
+        }
+        // op1 = 0b10, hw1 bit15 ∈ {0, 1} × hw1 bit14 ∈ {0, 1} × misc_op patterns
+        for hw1 in [0x0000u16, 0x4000, 0x8000, 0xC000, 0x4000 | 0x1000, 0x8000 | 0xF000] {
+            let hw0 = (0b11110u16 << 11) | (0b10 << 11);
+            bits.push(classify_thumb32_pure(hw0, hw1));
+        }
+        // op1 = 0b11, op2 patterns
+        for op2 in [0b0000000u16, 0b0100000, 0b0110000, 0b0111000, 0b1000000] {
+            let hw0 = (0b11111u16 << 11) | (0b11 << 11) | (op2 << 4);
+            bits.push(classify_thumb32_pure(hw0, 0));
+        }
+        let packed = pack_bool_bits(bits);
+        let h = fnv1a64(&packed);
+        assert_eq!(
+            h, T32_PURE_STRUCTURED_FINGERPRINT,
+            "classify_thumb32_pure fingerprint changed (computed = {h:#018x})"
+        );
+    }
+
+    /// FNV-1a 64-bit hash of the bit-packed `classify_thumb16_pure`
+    /// output over inputs `0..=0xFFFF`. Computed 2026-04-30 against
+    /// the M33 classifier as committed at this point in the V3 work.
+    const T16_PURE_FINGERPRINT: u64 = 0x1eb1ffd1d55d2865;
+    /// FNV-1a 64-bit hash of `classify_thumb16_misc_pure` over the
+    /// 16 misc sub-ops (canonical prefix 1011_0).
+    const MISC_PURE_FINGERPRINT: u64 = 0x0acfb907b723bba3;
+    /// FNV-1a 64-bit hash of `is_thumb16_flag_only` over the entire
+    /// 16-bit input space.
+    const FLAG_ONLY_FINGERPRINT: u64 = 0x15d893b9ae1ee96d;
+    /// FNV-1a 64-bit hash of `classify_thumb32_pure` over the
+    /// structured cross-product covering each dispatch arm.
+    const T32_PURE_STRUCTURED_FINGERPRINT: u64 = 0x0a8f8d07b6ed8cea;
+}
