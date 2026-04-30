@@ -2121,8 +2121,10 @@ impl Bus {
         // `CortexM33::bus_read16`. Bus-level read16 is still reachable
         // from decode.rs (opcode fetch) and non-PPB tests.
         debug_assert!(
-            addr >> 28 != 0xE || Self::is_boot_ram(addr),
-            "PPB address 0x{:08X} reached Bus::read16 — use CortexM33::bus_read16 wrapper",
+            addr >> 28 != 0xE
+                || Self::is_boot_ram(addr)
+                || Self::is_coresight_trace(addr),
+            "PPB/coresight-aperture-bypass: address 0x{:08X} reached Bus::read16 — use CortexM33::bus_read16 wrapper",
             addr
         );
         let region = addr >> 28;
@@ -2318,8 +2320,10 @@ impl Bus {
         // Phase 0b.1 Commit B: PPB addresses route through
         // `CortexM33::bus_write16`.
         debug_assert!(
-            addr >> 28 != 0xE || Self::is_boot_ram(addr),
-            "PPB address 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
+            addr >> 28 != 0xE
+                || Self::is_boot_ram(addr)
+                || Self::is_coresight_trace(addr),
+            "PPB/coresight-aperture-bypass: address 0x{:08X} reached Bus::write16 — use CortexM33::bus_write16 wrapper",
             addr
         );
         debug_assert!(
@@ -2768,8 +2772,10 @@ impl Bus {
         // `CortexM33::bus_read32` before reaching here. Anything at
         // `0xE0..0xEF` that is not boot RAM is a caller bug.
         debug_assert!(
-            addr >> 28 != 0xE || Self::is_boot_ram(addr),
-            "PPB address 0x{:08X} reached Bus::read32 — use CortexM33::bus_read32 wrapper",
+            addr >> 28 != 0xE
+                || Self::is_boot_ram(addr)
+                || Self::is_coresight_trace(addr),
+            "PPB/coresight-aperture-bypass: address 0x{:08X} reached Bus::read32 — use CortexM33::bus_read32 wrapper",
             addr
         );
         let region = addr >> 28;
@@ -2907,8 +2913,10 @@ impl Bus {
         // Phase 0b.1 Commit B: PPB addresses are routed through
         // `CortexM33::bus_write32` before reaching here.
         debug_assert!(
-            addr >> 28 != 0xE || Self::is_boot_ram(addr),
-            "PPB address 0x{:08X} reached Bus::write32 — use CortexM33::bus_write32 wrapper",
+            addr >> 28 != 0xE
+                || Self::is_boot_ram(addr)
+                || Self::is_coresight_trace(addr),
+            "PPB/coresight-aperture-bypass: address 0x{:08X} reached Bus::write32 — use CortexM33::bus_write32 wrapper",
             addr
         );
         // RV32A: invalidate any LR/SC reservation at this word.

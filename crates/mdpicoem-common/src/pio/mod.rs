@@ -3073,4 +3073,225 @@ mod tests {
             "side-set drove the value high on tick 2"
         );
     }
+
+    // ====================================================================
+    // Coverage top-up: PIO block IRQ flag/mask interactions, CLKDIV
+    // fractional boundaries, SM enable/disable ripple, INSTR_MEM
+    // boundary indices, and DBG_PADOUT/DBG_PADOE post-step reads.
+    // ====================================================================
+
+    /// IRQ-flag interactions through the INTE/INTF mask: a flag bit must
+    /// only surface in the effective `*_INTS` register when the matching
+    /// INTE bit is set, while INTF bits ride through unconditionally.
+    /// Covers the `(INTR & INTE) | INTF` composition for both NVIC lines
+    /// on the RP2350 layout.
+    #[test]
+    fn pio_int_flag_mask_interactions_rp2350() {
+        let mut pio = PioBlock::new();
+        // Set IRQ flags 0..3 via IRQ_FORCE.
+        pio.write32(0x034, 0x0F, 0);
+        // INTE0 enables only flag 0 (bit 8 in RP2350 layout).
+        pio.write32(0x170, 1 << 8, 0);
+        // INTF0 forces bit 9 unconditionally.
+        pio.write32(0x174, 1 << 9, 0);
+        let ints0 = pio.read32(0x178);
+        assert_ne!(ints0 & (1 << 8), 0, "flag 0 surfaces via INTE bit 8");
+        assert_eq!(
+            ints0 & (1 << 10),
+            0,
+            "flag 2 (bit 10) suppressed by INTE=0"
+        );
+        assert_ne!(ints0 & (1 << 9), 0, "INTF bit 9 forces ints regardless");
+        // Clear INTE — flags drop out of INTS but INTF stays.
+        pio.write32(0x170, 0, 0);
+        let ints0 = pio.read32(0x178);
+        assert_eq!(
+            ints0 & (1 << 8),
+            0,
+            "flag 0 hidden once INTE bit 8 cleared"
+        );
+        assert_ne!(ints0 & (1 << 9), 0, "INTF survives INTE clearing");
+
+        // RP2040 layout: flag 0 surfaces at bit 0 of INTR; verify via
+        // int0_ints_rp2040 / int1_ints_rp2040 helpers paired with INTE
+        // and INTF.
+        pio.int0_inte = 0x001;
+        pio.int0_intf = 0x010;
+        pio.int1_inte = 0x002;
+        pio.int1_intf = 0;
+        let l0 = pio.int0_ints_rp2040();
+        let l1 = pio.int1_ints_rp2040();
+        assert_ne!(l0 & 0x001, 0, "RP2040 line 0: flag 0 enabled by INTE");
+        assert_ne!(l0 & 0x010, 0, "RP2040 line 0: INTF bit 4 forces");
+        assert_eq!(l1 & 0x001, 0, "RP2040 line 1: flag 0 not enabled");
+    }
+
+    /// CLKDIV fractional boundary at frac=255 (just under int+1). Verifies
+    /// the divider's averaged tick rate over many cycles. With int=1
+    /// frac=255, threshold = 256 + 255 = 511; +256 per cycle yields 256
+    /// ticks per 511 cycles (≈1.996x divisor).
+    #[test]
+    fn clkdiv_frac_boundary_at_255_averages_correctly() {
+        let mut pio = PioBlock::new();
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 1;
+        pio.sm[0].clkdiv_frac = 255;
+        let mut ticks = 0;
+        // 5110 cycles → expected ticks = 5110 * 256 / 511 = 2560.
+        for _ in 0..5110 {
+            if pio.sm[0].clock_tick() {
+                ticks += 1;
+            }
+        }
+        assert_eq!(ticks, 2560, "frac=255 averages 256/511 ticks per cycle");
+    }
+
+    /// CLKDIV at the int=0 (treated as 256) boundary: every cycle ticks
+    /// because acc += 256 and threshold == 256. Independently verified at
+    /// the SM level by `clock_tick_treats_int_zero_as_256`; this variant
+    /// drives the divider through `PioBlock` to exercise the full path.
+    #[test]
+    fn clkdiv_int_zero_through_block_ticks_every_cycle() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x0C8, 0, 0); // SM0 CLKDIV: int=0, frac=0 → divisor 256
+        pio.set_sm_enabled(0, true);
+        let mut ticks = 0;
+        for _ in 0..1000 {
+            if pio.sm[0].clock_tick() {
+                ticks += 1;
+            }
+        }
+        assert_eq!(ticks, 1000, "int=0 must mean divide-by-256 → 1.0 effective");
+    }
+
+    /// CLKDIV maximum integer divisor (int=0xFFFF, frac=0). Verify the
+    /// threshold computation does not overflow and the divisor produces
+    /// roughly 1 tick per 65535 cycles. Sample 4 ticks deterministically.
+    #[test]
+    fn clkdiv_int_max_divisor_does_not_overflow() {
+        let mut pio = PioBlock::new();
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 0xFFFF;
+        pio.sm[0].clkdiv_frac = 0;
+        let mut ticks = 0;
+        // 4 * 65535 = 262140 cycles → 4 ticks.
+        for _ in 0..(4 * 65535) {
+            if pio.sm[0].clock_tick() {
+                ticks += 1;
+            }
+        }
+        assert_eq!(ticks, 4);
+    }
+
+    /// SM enable/disable ripple: enabling SM0 alone must not perturb other
+    /// SMs' enable mask bits, and disabling all SMs (last one) clears the
+    /// pad latches via merge_pin_outputs.
+    #[test]
+    fn sm_enable_disable_ripple_is_isolated() {
+        let mut pio = PioBlock::new();
+        pio.set_sm_enabled(0, true);
+        pio.set_sm_enabled(1, true);
+        pio.set_sm_enabled(2, true);
+        pio.set_sm_enabled(3, true);
+        assert_eq!(pio.sm_enabled_mask(), 0b1111);
+        // Disable SM2 — others untouched.
+        pio.set_sm_enabled(2, false);
+        assert_eq!(pio.sm_enabled_mask(), 0b1011);
+        assert!(pio.sm[0].enabled);
+        assert!(pio.sm[1].enabled);
+        assert!(!pio.sm[2].enabled);
+        assert!(pio.sm[3].enabled);
+        // Disabling all clears pad latches.
+        pio.shared_pin_values = 0xFFFF;
+        pio.shared_pin_dirs = 0xFFFF;
+        pio.set_sm_enabled(0, false);
+        pio.set_sm_enabled(1, false);
+        pio.set_sm_enabled(3, false);
+        assert_eq!(pio.sm_enabled_mask(), 0);
+        // Pad latches are zeroed by merge_pin_outputs once mask hits 0.
+        assert_eq!(pio.pad_out, 0);
+        assert_eq!(pio.pad_oe, 0);
+    }
+
+    /// INSTR_MEM accessor at boundary indices 0 and 31. Writes via the
+    /// register interface and reads back through `instr_mem()` accessor.
+    #[test]
+    fn instr_mem_boundary_indices_round_trip() {
+        let mut pio = PioBlock::new();
+        // Slot 0 (offset 0x048).
+        pio.write32(0x048, 0xC0DE, 0);
+        // Slot 31 (offset 0x048 + 31*4 = 0x0C4).
+        pio.write32(0x0C4, 0xBEEF, 0);
+        // Bounds are tight: slot 32 doesn't exist; we use the public
+        // accessor to verify boundary slots.
+        let mem = pio.instr_mem();
+        assert_eq!(mem[0], 0xC0DE);
+        assert_eq!(mem[31], 0xBEEF);
+        // Slots between boundaries untouched.
+        for i in 1..31 {
+            assert_eq!(mem[i], 0, "slot {i} untouched");
+        }
+        // Writes only land within 32 slots — offset just past the
+        // INSTR_MEM range (0x0C8) goes to per-SM CLKDIV instead.
+        pio.write32(0x0C4, 0x1111, 0); // slot 31 again
+        assert_eq!(pio.instr_mem()[31], 0x1111);
+    }
+
+    /// DBG_PADOUT / DBG_PADOE reads after a step that drives the pads.
+    /// Confirms the read path returns the post-merge state, not stale
+    /// pre-step values.
+    #[test]
+    fn dbg_padout_padoe_reflect_post_step_state() {
+        let mut pio = PioBlock::new();
+        // SET PINDIRS,1 at slot 0 + SET PINS,1 at slot 1, with SET_BASE=4
+        // and SET_COUNT=1 so we drive bit 4 of pad_out + pad_oe.
+        pio.sm[0].pinctrl = (1u32 << 26) | (4u32 << 5);
+        pio.instr_mem[0] = 0xE081; // SET PINDIRS, 1
+        pio.instr_mem[1] = 0xE001; // SET PINS, 1
+        // Wrap fully around 5-bit memory so PC advances 0→1→2…
+        pio.sm[0].execctrl = 0x1Fu32 << 12;
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 1;
+        pio.sm[0].clkdiv_frac = 0;
+        pio.step(0);
+        // After SET PINDIRS,1 → bit 4 of pad_oe set; pad_out unchanged.
+        assert_ne!(pio.read32(0x040) & (1 << 4), 0, "DBG_PADOE bit 4 set");
+        pio.step(0);
+        // After SET PINS,1 → bit 4 of pad_out set, pad_oe still set.
+        assert_ne!(pio.read32(0x03C) & (1 << 4), 0, "DBG_PADOUT bit 4 set");
+        assert_ne!(pio.read32(0x040) & (1 << 4), 0, "DBG_PADOE bit 4 stays set");
+    }
+
+    /// FDEBUG alias arm with `alias >= 4`: the dispatcher returns early
+    /// (line 618 `_ => return`). This should be a no-op (no panic, no
+    /// state change).
+    #[test]
+    fn fdebug_alias_out_of_range_is_noop() {
+        let mut pio = PioBlock::new();
+        pio.fdebug = 0xCAFE;
+        pio.write32(0x008, 0xFF, 99); // alias=99 → early return
+        assert_eq!(pio.fdebug, 0xCAFE, "out-of-range alias must not modify FDEBUG");
+    }
+
+    /// CLKDIV write sequence: setting integer alone (frac=0) yields exact
+    /// 1/N ticks; restart via CTRL.CLKDIV_RESTART zeroes the accumulator
+    /// so the next tick fires on schedule.
+    #[test]
+    fn clkdiv_restart_resets_phase() {
+        let mut pio = PioBlock::new();
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 4;
+        pio.sm[0].clkdiv_frac = 0;
+        // Run one tick, draining the accumulator.
+        for _ in 0..4 {
+            let _ = pio.sm[0].clock_tick();
+        }
+        // Acc lands on 0 after the threshold-cross subtraction; advance
+        // by 1 to leave acc=256.
+        let _ = pio.sm[0].clock_tick();
+        assert_eq!(pio.sm[0].clkdiv_acc, 256);
+        // CTRL CLKDIV_RESTART for SM0 (bit 8).
+        pio.write32(0x000, 1 << 8, 0);
+        assert_eq!(pio.sm[0].clkdiv_acc, 0, "CLKDIV_RESTART zeros acc");
+    }
 }

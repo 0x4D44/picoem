@@ -229,6 +229,28 @@ impl TimerRegs {
         self.intr == 0 && (self.intf & self.inte) == 0
     }
 
+    /// Return the soonest scheduled alarm fire cycle across alarms
+    /// that are both armed AND have INTE set, or `None` if no such
+    /// alarm is currently scheduled to raise an NVIC IRQ. Used by
+    /// the both-cores-blocked clock-advance path to find the next
+    /// peripheral wake event without polling unrelated peripherals.
+    /// (Closes tech_debt §1649 for RP2040.)
+    pub fn next_armed_inte_fire_cycle(&self) -> Option<u64> {
+        let mut soonest: Option<u64> = None;
+        for n in 0..4 {
+            if self.armed & (1 << n) == 0 {
+                continue;
+            }
+            if self.inte & (1 << n) == 0 {
+                continue;
+            }
+            if let Some(fc) = self.alarm_fire_cycle[n] {
+                soonest = Some(soonest.map_or(fc, |s| s.min(fc)));
+            }
+        }
+        soonest
+    }
+
     // -------------------------------------------------------------------
     // Register dispatch
     // -------------------------------------------------------------------

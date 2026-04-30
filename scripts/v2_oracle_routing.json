@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "default_oracles_by_file": {
+    "crates/mdrp2350/src/core/execute_thumb32.rs": [
+      {"oracle": "qemu_diff_m33", "args": ["--classes", "base"]}
+    ],
+    "crates/mdrp2350/src/core/execute_fpu.rs": [
+      {"oracle": "softfloat_diff", "args": ["--mode", "all"]}
+    ],
+    "crates/mdrp2350/src/core/execute.rs": [
+      {"oracle": "qemu_diff_m33", "args": ["--classes", "base"]}
+    ],
+    "crates/mdrp2350/src/core/decode.rs": [
+      {"oracle": "qemu_diff_m33", "args": ["--classes", "base"]}
+    ],
+    "crates/mdrp2040/src/core/execute.rs": [
+      {"oracle": "qemu_diff_m0plus", "args": []}
+    ],
+    "crates/mdrp2040/src/core/execute_wide.rs": [
+      {"oracle": "qemu_diff_m0plus", "args": []}
+    ],
+    "crates/mdrp2040/src/core/decode.rs": [
+      {"oracle": "qemu_diff_m0plus", "args": []}
+    ]
+  },
+  "by_function": {
+    "crates/mdrp2350/src/core/execute_fpu.rs": {
+      "vfp_sd": [
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "vfp_sn": [
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "vfp_sm": [
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "fpscr_set_nzcv": [
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "vfp_expand_imm_f32": [
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+
+      "fp_add":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fp_sub":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fp_mul":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fp_div":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fp_fma":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fp_sqrt": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+
+      "CortexM33::fpu_unary": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+
+      "f32_to_f16_bits":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "f16_bits_to_f32":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "f32_to_u32_rmode": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "f32_to_i32_rmode": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "f32_to_u32_rtz":   [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "f32_to_i32_rtz":   [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "ftz_input_value":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "canonicalize_nan_fma": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "canonicalize_nan":     [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "canonicalize_nan_unary": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+
+      "fpu_minnum": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fpu_maxnum": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fpu_vrint":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+
+      "is_snan":     [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "is_snan_f16": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "quieten_nan": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "is_denormal": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "is_mul_inf_zero": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "apply_dn":    [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "ftz_input":   [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "ftz_output":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "overflowed":  [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "underflowed": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+      "fpscr_rmode": [{"oracle": "softfloat_diff", "args": ["--mode", "all"]}],
+
+      "CortexM33::fpu_v8m_dp": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "CortexM33::fpu_data_processing": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "CortexM33::fpu_reg_transfer": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "CortexM33::fpu_load_store": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "CortexM33::fpu_execute": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "CortexM33::fpu_vcmp": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "CortexM33::vsel_condition_holds": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ],
+      "CortexM33::flush_lazy_fp_context": [
+        {"oracle": "softfloat_diff", "args": ["--mode", "all"]},
+        {"oracle": "qemu_diff_m33", "args": ["--classes", "fpu"], "requires": "fpu_class"}
+      ]
+    }
+  }
+}

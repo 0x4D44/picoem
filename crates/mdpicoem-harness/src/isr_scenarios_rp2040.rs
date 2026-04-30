@@ -15,20 +15,13 @@
 // imported from the M33 module — they name architectural registers
 // that are identical across M33 and M0+.
 //
-// **Expected EMU behaviour.** V5 IRQ plumbing is complete (HLD V7
-// §5.2 / §5.3 — see `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral
-// Coverage V7.md`): the bus drains pending lines from
-// `Bus::irq_pending` (`crates/mdrp2040/src/bus/mod.rs:395`) into both
-// cores' NVIC pending latches, NVIC ISER / ISPR / ICPR / IPR are fully
-// modelled at `0xE000_E100..0xE000_E41F`, the per-core SysTick latches
-// `ICSR.PENDSTSET` on underflow, and the unified pending-exception
-// dispatcher (`CortexM0Plus::try_take_any_pending_exception` at
-// `crates/mdrp2040/src/core/mod.rs:330-375`) runs every `step()`,
-// covering PendSV / SysTick / external-IRQ entry through
-// `enter_exception` (`crates/mdrp2040/src/core/exceptions.rs`). EMU-
-// side scenarios should therefore pass; remaining FAILs surface real
-// divergences in stacked-frame layout, exception priority, or counter
-// observables rather than missing plumbing.
+// **Status.** The Phase 1 IRQ plumbing (`Bus::irq_pending` +
+// `tick_peripherals` + pending-exception dispatch in
+// `CortexM0Plus::step`, plus NVIC ISER/ICER/ISPR/ICPR/IPR0..7 in
+// `bus/mod.rs::nvic_mmio_write32` + `nvic_mmio_read32`) has landed.
+// All six scenarios (V1 × 2 + V2 × 4) dispatch correctly on the EMU
+// side and have been validated against real RP2040 silicon under
+// `silicon_isr_diff_rp2040`.
 
 #[cfg(test)]
 use crate::ISR_MAILBOX_CYCCNT;
@@ -55,11 +48,28 @@ pub const NVIC_ISER0_ADDR: u32 = 0xE000_E100;
 pub const NVIC_ICER0_ADDR: u32 = 0xE000_E180;
 /// NVIC_ISPR0 — Interrupt Set-Pending Register 0.
 pub const NVIC_ISPR0_ADDR: u32 = 0xE000_E200;
+/// NVIC_IPR0 — Interrupt Priority Register 0 (priority bytes for IRQs
+/// 0..3; M0+ implements bits [7:6] only). Used by the V2 §3.1 priority-
+/// preempt scenario to give IRQ #1 a numerically-lower priority value
+/// than IRQ #0.
+pub const NVIC_IPR0_ADDR: u32 = 0xE000_E400;
 
 /// RP2040 TIMER peripheral base.
 pub const TIMER_BASE: u32 = 0x4005_4000;
 /// TIMER ALARM0 (write to arm a deadline against TIMERAWL).
 pub const TIMER_ALARM0_ADDR: u32 = TIMER_BASE + 0x10;
+/// TIMER ALARM1 (write to arm a deadline against TIMERAWL). Used by the
+/// V2 §3.1 priority-preempt scenario to fire ALARM0 + ALARM1 at the same
+/// TIMERAWL deadline so both NVIC pending bits set in lock-step.
+pub const TIMER_ALARM1_ADDR: u32 = TIMER_BASE + 0x14;
+/// TIMER TIMERAWL — low 32 bits of the live timer (no latch). Read by
+/// the V2 §3.3 WFI scenario to compute a near-future ALARM0 deadline.
+pub const TIMER_TIMERAWL_ADDR: u32 = TIMER_BASE + 0x28;
+/// TIMER ARMED — W1C disarm register (one bit per ALARM, write-1-to-
+/// clear). Used by `reset_scenario_state_*` to disarm any leftover
+/// alarms from the previous scenario; without this, `alarm_fire_cycle`
+/// slots stay live across the reset cycle and can re-pend INTR.
+pub const TIMER_ARMED_ADDR: u32 = TIMER_BASE + 0x20;
 /// TIMER INTR — W1C pending alarm bits (bit 0 = ALARM0).
 pub const TIMER_INTR_ADDR: u32 = TIMER_BASE + 0x34;
 /// TIMER INTE — interrupt enable mask (bit 0 = ALARM0).
@@ -67,6 +77,9 @@ pub const TIMER_INTE_ADDR: u32 = TIMER_BASE + 0x38;
 
 /// TIMER_IRQ_0 (IRQ #0). Matches `mdrp2040::irq::IRQ_TIMER_IRQ_0`.
 pub const IRQ_TIMER_IRQ_0: u32 = 0;
+/// TIMER_IRQ_1 (IRQ #1). Matches `mdrp2040::irq::IRQ_TIMER_IRQ_1`. Used
+/// by the V2 §3.1 priority-preempt scenario.
+pub const IRQ_TIMER_IRQ_1: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Image layout (M0+ variant)
@@ -254,12 +267,65 @@ const fn build_image_m0plus<const N_HANDLER_HW: usize, const N_MAIN_HW: usize>(
 // grows down).
 //
 // Layout inside the mailbox page:
+//   + 0xFC8 — V2 §3.3 phase cell (main writes 1, wfi, then 2)
+//   + 0xFCC — V2 §3.3 phase_at_entry (handler captures phase on entry)
+//   + 0xFD0 — V2 §3.4 ISER readback (RAZ/WI scenario, primary obs)
+//   + 0xFD4 — V2 §3.4 ISPR readback
+//   + 0xFD8 — V2 §3.4 ICER readback
+//   + 0xFDC — V2 §3.4 ICPR readback
 //   + 0xFE0 — TIMER scenario counter
 //   + 0xFE4 — PendSV scenario counter
 //   + 0xFE8 — SysTick scenario counter
+//   + 0xFEC — V2 §3.2 gate cell (main writes 1 then 2)
+//   + 0xFF0 — V2 §3.2 gate_at_entry (handler captures gate on entry)
+//   + 0xFF4 — reserved (free slot)
+//   + 0xFF8 — ISR_MAILBOX_CYCCNT (defined in lib.rs; reserved for the
+//             RP2350 oracle, kept clear here for parity)
+//
+// Stage 4 placed PHASE/PHASE_AT_ENTRY *below* the existing block at
+// 0xFC8/0xFCC because moving any of the existing cells would force
+// edits to Stage 2 / Stage 3 handlers' literal pools, which is
+// explicitly out of scope for Stage 4. Stage 5 followed the same
+// downward-grow pattern, placing the priority-preempt cells contiguously
+// below at 0xFB8/0xFBC/0xFC0.
+//
+// Stage 5 layout (priority-preempt scenario — V2 §3.1):
+//   + 0xFB8 — CTR_IRQ_0
+//   + 0xFBC — CTR_IRQ_1
+//   + 0xFC0 — ORDER_FIRST_IRQ (primary observable; written once with
+//             a non-zero sentinel by whichever handler ran first)
+/// V2 §3.1 — counter for HANDLER_IRQ0 (TIMER_IRQ_0 / ALARM0).
+pub const CTR_IRQ_0_ADDR: u32 = 0x2000_3FB8;
+/// V2 §3.1 — counter for HANDLER_IRQ1 (TIMER_IRQ_1 / ALARM1).
+pub const CTR_IRQ_1_ADDR: u32 = 0x2000_3FBC;
+/// V2 §3.1 — observable: which handler ran first. Each handler writes
+/// its sentinel (`HANDLER_IRQ0 = 0xA0`, `HANDLER_IRQ1 = 0xA1`) only if
+/// this cell is currently zero. PASS on `order_first_irq == 0xA1` —
+/// IRQ_1 has lower priority value (= higher priority) and must dispatch
+/// first; IRQ_0 then runs via tail-chain.
+pub const ORDER_FIRST_IRQ_ADDR: u32 = 0x2000_3FC0;
+/// V2 §3.3 — phase cell. Main writes `1` before `wfi`, then `2` after
+/// the handler returns and main resumes. PASS on `phase == 2`.
+pub const PHASE_ADDR: u32 = 0x2000_3FC8;
+/// V2 §3.3 — observable: phase value at handler entry. The handler
+/// stores `*phase` into this cell. PASS on `phase_at_entry == 1`,
+/// proving the handler dispatched during the WFI window (between the
+/// `phase=1` and `phase=2` stores).
+pub const PHASE_AT_ENTRY_ADDR: u32 = 0x2000_3FCC;
+pub const ISER_READBACK_ADDR: u32 = 0x2000_3FD0;
+pub const ISPR_READBACK_ADDR: u32 = 0x2000_3FD4;
+pub const ICER_READBACK_ADDR: u32 = 0x2000_3FD8;
+pub const ICPR_READBACK_ADDR: u32 = 0x2000_3FDC;
 pub const CTR_TIMER_ADDR: u32 = 0x2000_3FE0;
 pub const CTR_PENDSV_ADDR: u32 = 0x2000_3FE4;
 pub const CTR_SYSTICK_ADDR: u32 = 0x2000_3FE8;
+/// V2 §3.2 — gate cell. Main writes `1` before `cpsie i`, `2` after. On
+/// architecturally-correct M0+ the handler runs at the `cpsie i`
+/// boundary, so the handler's read of `gate` returns `1`.
+pub const GATE_ADDR: u32 = 0x2000_3FEC;
+/// V2 §3.2 — observable: gate value at handler entry. The handler
+/// stores `*gate` into this cell. PASS on `gate_at_entry == 1`.
+pub const GATE_AT_ENTRY_ADDR: u32 = 0x2000_3FF0;
 
 /// Handler for the TIMER_IRQ_0 scenario.
 ///
@@ -460,6 +526,421 @@ const _: () = assert!(
     "ICSR clear mask must remain at hw[30..=31] for hw[15] ldr math",
 );
 
+/// Handler for V2 §3.2 `isr_m0_masked_pending_unmask`. Mirrors
+/// HANDLER_TIMER's "W1C TIMER.INTR → W1C NVIC_ICPR0 → counter" prefix
+/// (so a re-pend during the handler body doesn't re-dispatch — although
+/// for this scenario TIMER.INTE is intentionally left disabled by main,
+/// see MAIN_MASKED), but adds an extra observable: load `*GATE_ADDR`
+/// into r5 then store it into `GATE_AT_ENTRY_ADDR`. That captures
+/// whether the handler ran *between* main's `gate=1` and `gate=2`
+/// stores — the load-bearing assertion for the PRIMASK-gate / `cpsie i`
+/// dispatch-boundary check.
+///
+/// Layout — image bytes 0x04C..0x080:
+/// ```text
+///   [ 0] ldr  r0, [pc, #28]    ; r0 = TIMER_INTR_ADDR        (lit hw[16])
+///   [ 1] movs r1, #1
+///   [ 2] str  r1, [r0]         ; W1C TIMER.INTR bit 0
+///   [ 3] ldr  r0, [pc, #28]    ; r0 = NVIC_ICPR0_ADDR        (lit hw[18])
+///   [ 4] str  r1, [r0]         ; W1C NVIC pending bit 0
+///   [ 5] ldr  r2, [pc, #28]    ; r2 = GATE_ADDR              (lit hw[20])
+///   [ 6] ldr  r5, [r2]         ; r5 = *gate
+///   [ 7] ldr  r3, [pc, #28]    ; r3 = GATE_AT_ENTRY_ADDR     (lit hw[22])
+///   [ 8] str  r5, [r3]         ; *gate_at_entry = r5
+///   [ 9] ldr  r0, [pc, #28]    ; r0 = CTR_TIMER_ADDR         (lit hw[24])
+///   [10] ldr  r1, [r0]
+///   [11] adds r1, #1
+///   [12] str  r1, [r0]         ; ctr_timer += 1
+///   [13] bx   lr
+///   [14..15] nop padding
+///   [16..17] lit: TIMER_INTR_ADDR     (0x4005_4034)
+///   [18..19] lit: NVIC_ICPR0_ADDR     (0xE000_E280)
+///   [20..21] lit: GATE_ADDR           (0x2000_3FEC)
+///   [22..23] lit: GATE_AT_ENTRY_ADDR  (0x2000_3FF0)
+///   [24..25] lit: CTR_TIMER_ADDR      (0x2000_3FE0)
+/// ```
+///
+/// Literal math — handler body lives at HANDLER_OFFSET = 0x04C, so
+/// hw[i] byte = 0x04C + 2*i. Each `ldr [pc, #imm8*4]` aligns PC down
+/// to a 4-byte boundary first.
+///
+///   hw[ 0] addr 0x04C, PC 0x050, Align 0x050, target hw[16]=0x06C → imm=0x1C → imm8=7 → 0x4807
+///   hw[ 3] addr 0x052, PC 0x056, Align 0x054, target hw[18]=0x070 → imm=0x1C → imm8=7 → 0x4807
+///   hw[ 5] addr 0x056, PC 0x05A, Align 0x058, target hw[20]=0x074 → imm=0x1C → imm8=7 → 0x4A07
+///   hw[ 7] addr 0x05A, PC 0x05E, Align 0x05C, target hw[22]=0x078 → imm=0x1C → imm8=7 → 0x4B07
+///   hw[ 9] addr 0x05E, PC 0x062, Align 0x060, target hw[24]=0x07C → imm=0x1C → imm8=7 → 0x4807
+const HANDLER_MASKED: [u16; 26] = [
+    // Phase 1: W1C TIMER.INTR (defensive — INTE is left off by main, but
+    // mirrors HANDLER_TIMER's pico-sdk-shaped prefix so a future variant
+    // that enables INTE doesn't re-dispatch).
+    0x4807, // [ 0] ldr  r0, [pc, #28]   — TIMER_INTR_ADDR
+    0x2101, // [ 1] movs r1, #1
+    0x6001, // [ 2] str  r1, [r0]        — TIMER.INTR = 1 (W1C bit 0)
+    // Phase 2: W1C NVIC_ICPR0 bit 0 (clears the firmware-set pending bit
+    // so EXC_RETURN's tail-chain poll doesn't re-dispatch).
+    0x4807, // [ 3] ldr  r0, [pc, #28]   — NVIC_ICPR0_ADDR
+    0x6001, // [ 4] str  r1, [r0]        — NVIC_ICPR0 = 1 (r1 still 1)
+    // Phase 3: capture *gate into gate_at_entry (LOAD-BEARING).
+    0x4A07, // [ 5] ldr  r2, [pc, #28]   — GATE_ADDR
+    0x6815, // [ 6] ldr  r5, [r2]        — r5 = *gate
+    0x4B07, // [ 7] ldr  r3, [pc, #28]   — GATE_AT_ENTRY_ADDR
+    0x601D, // [ 8] str  r5, [r3]        — *gate_at_entry = r5
+    // Phase 4: ctr_timer += 1.
+    0x4807, // [ 9] ldr  r0, [pc, #28]   — CTR_TIMER_ADDR
+    0x6801, // [10] ldr  r1, [r0]
+    0x3101, // [11] adds r1, #1
+    0x6001, // [12] str  r1, [r0]
+    // Phase 5: return via EXC_RETURN.
+    0x4770, // [13] bx   lr
+    0xBF00, // [14] nop padding
+    0xBF00, // [15] nop padding
+    0x4034, // [16] lit: TIMER_INTR_ADDR     low  (0x4005_4034)
+    0x4005, // [17] lit: TIMER_INTR_ADDR     high
+    0xE280, // [18] lit: NVIC_ICPR0_ADDR     low  (0xE000_E280)
+    0xE000, // [19] lit: NVIC_ICPR0_ADDR     high
+    0x3FEC, // [20] lit: GATE_ADDR           low  (0x2000_3FEC)
+    0x2000, // [21] lit: GATE_ADDR           high
+    0x3FF0, // [22] lit: GATE_AT_ENTRY_ADDR  low  (0x2000_3FF0)
+    0x2000, // [23] lit: GATE_AT_ENTRY_ADDR  high
+    0x3FE0, // [24] lit: CTR_TIMER_ADDR      low  (0x2000_3FE0)
+    0x2000, // [25] lit: CTR_TIMER_ADDR      high
+];
+
+// Pin literal-pool byte offsets — every `ldr [pc, #imm]` above depends
+// on these slots staying put.
+const _: () = assert!(
+    HANDLER_MASKED[16] == 0x4034 && HANDLER_MASKED[17] == 0x4005,
+    "TIMER_INTR_ADDR literal must remain at hw[16..=17]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[18] == 0xE280 && HANDLER_MASKED[19] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at hw[18..=19]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[20] == 0x3FEC && HANDLER_MASKED[21] == 0x2000,
+    "GATE_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[22] == 0x3FF0 && HANDLER_MASKED[23] == 0x2000,
+    "GATE_AT_ENTRY_ADDR literal must remain at hw[22..=23]",
+);
+const _: () = assert!(
+    HANDLER_MASKED[24] == 0x3FE0 && HANDLER_MASKED[25] == 0x2000,
+    "CTR_TIMER_ADDR literal must remain at hw[24..=25]",
+);
+const _: () = assert!(
+    (HANDLER_OFFSET as usize) + HANDLER_MASKED.len() * 2 <= MAIN_OFFSET as usize,
+    "HANDLER_MASKED must fit between HANDLER_OFFSET and MAIN_OFFSET",
+);
+
+/// Handler for V2 §3.3 `isr_m0_wfi_wake`. Identical structural shape to
+/// HANDLER_MASKED — same prefix, same instruction encodings, just the
+/// PHASE / PHASE_AT_ENTRY literals replace GATE / GATE_AT_ENTRY. The
+/// handler's load-bearing observable is `*phase` captured at entry,
+/// proving the dispatch happened during the WFI window (between main's
+/// `*phase=1` and `*phase=2` stores).
+///
+/// Layout — image bytes 0x04C..0x080:
+/// ```text
+///   [ 0] ldr  r0, [pc, #28]    ; r0 = TIMER_INTR_ADDR        (lit hw[16])
+///   [ 1] movs r1, #1
+///   [ 2] str  r1, [r0]         ; W1C TIMER.INTR bit 0 (load-bearing —
+///                              ;   ALARM0 INTE is enabled by main, so
+///                              ;   without this the level re-asserts)
+///   [ 3] ldr  r0, [pc, #28]    ; r0 = NVIC_ICPR0_ADDR        (lit hw[18])
+///   [ 4] str  r1, [r0]         ; W1C NVIC pending bit 0
+///   [ 5] ldr  r2, [pc, #28]    ; r2 = PHASE_ADDR             (lit hw[20])
+///   [ 6] ldr  r5, [r2]         ; r5 = *phase
+///   [ 7] ldr  r3, [pc, #28]    ; r3 = PHASE_AT_ENTRY_ADDR    (lit hw[22])
+///   [ 8] str  r5, [r3]         ; *phase_at_entry = r5
+///   [ 9] ldr  r0, [pc, #28]    ; r0 = CTR_TIMER_ADDR         (lit hw[24])
+///   [10] ldr  r1, [r0]
+///   [11] adds r1, #1
+///   [12] str  r1, [r0]         ; ctr_timer += 1
+///   [13] bx   lr
+///   [14..15] nop padding
+///   [16..17] lit: TIMER_INTR_ADDR     (0x4005_4034)
+///   [18..19] lit: NVIC_ICPR0_ADDR     (0xE000_E280)
+///   [20..21] lit: PHASE_ADDR          (0x2000_3FC8)
+///   [22..23] lit: PHASE_AT_ENTRY_ADDR (0x2000_3FCC)
+///   [24..25] lit: CTR_TIMER_ADDR      (0x2000_3FE0)
+/// ```
+///
+/// Literal math is identical to HANDLER_MASKED — every `ldr [pc, #imm]`
+/// targets the next-but-one literal slot at imm8=7 (28 bytes). See
+/// HANDLER_MASKED above for the per-instruction derivation.
+const HANDLER_WFI: [u16; 26] = [
+    // Phase 1: W1C TIMER.INTR — drops level immediately so the alarm
+    // doesn't re-pend NVIC after the handler clears ICPR0 below.
+    0x4807, // [ 0] ldr  r0, [pc, #28]   — TIMER_INTR_ADDR
+    0x2101, // [ 1] movs r1, #1
+    0x6001, // [ 2] str  r1, [r0]        — TIMER.INTR = 1 (W1C bit 0)
+    // Phase 2: W1C NVIC_ICPR0 bit 0 (clears NVIC pending state set by
+    // the alarm fire so EXC_RETURN's tail-chain poll doesn't re-dispatch).
+    0x4807, // [ 3] ldr  r0, [pc, #28]   — NVIC_ICPR0_ADDR
+    0x6001, // [ 4] str  r1, [r0]        — NVIC_ICPR0 = 1 (r1 still 1)
+    // Phase 3: capture *phase into phase_at_entry (LOAD-BEARING).
+    0x4A07, // [ 5] ldr  r2, [pc, #28]   — PHASE_ADDR
+    0x6815, // [ 6] ldr  r5, [r2]        — r5 = *phase
+    0x4B07, // [ 7] ldr  r3, [pc, #28]   — PHASE_AT_ENTRY_ADDR
+    0x601D, // [ 8] str  r5, [r3]        — *phase_at_entry = r5
+    // Phase 4: ctr_timer += 1.
+    0x4807, // [ 9] ldr  r0, [pc, #28]   — CTR_TIMER_ADDR
+    0x6801, // [10] ldr  r1, [r0]
+    0x3101, // [11] adds r1, #1
+    0x6001, // [12] str  r1, [r0]
+    // Phase 5: return via EXC_RETURN.
+    0x4770, // [13] bx   lr
+    0xBF00, // [14] nop padding
+    0xBF00, // [15] nop padding
+    0x4034, // [16] lit: TIMER_INTR_ADDR     low  (0x4005_4034)
+    0x4005, // [17] lit: TIMER_INTR_ADDR     high
+    0xE280, // [18] lit: NVIC_ICPR0_ADDR     low  (0xE000_E280)
+    0xE000, // [19] lit: NVIC_ICPR0_ADDR     high
+    0x3FC8, // [20] lit: PHASE_ADDR          low  (0x2000_3FC8)
+    0x2000, // [21] lit: PHASE_ADDR          high
+    0x3FCC, // [22] lit: PHASE_AT_ENTRY_ADDR low  (0x2000_3FCC)
+    0x2000, // [23] lit: PHASE_AT_ENTRY_ADDR high
+    0x3FE0, // [24] lit: CTR_TIMER_ADDR      low  (0x2000_3FE0)
+    0x2000, // [25] lit: CTR_TIMER_ADDR      high
+];
+
+// Pin literal-pool byte offsets — every `ldr [pc, #imm]` above depends
+// on these slots staying put.
+const _: () = assert!(
+    HANDLER_WFI[16] == 0x4034 && HANDLER_WFI[17] == 0x4005,
+    "TIMER_INTR_ADDR literal must remain at hw[16..=17]",
+);
+const _: () = assert!(
+    HANDLER_WFI[18] == 0xE280 && HANDLER_WFI[19] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at hw[18..=19]",
+);
+const _: () = assert!(
+    HANDLER_WFI[20] == 0x3FC8 && HANDLER_WFI[21] == 0x2000,
+    "PHASE_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    HANDLER_WFI[22] == 0x3FCC && HANDLER_WFI[23] == 0x2000,
+    "PHASE_AT_ENTRY_ADDR literal must remain at hw[22..=23]",
+);
+const _: () = assert!(
+    HANDLER_WFI[24] == 0x3FE0 && HANDLER_WFI[25] == 0x2000,
+    "CTR_TIMER_ADDR literal must remain at hw[24..=25]",
+);
+const _: () = assert!(
+    (HANDLER_OFFSET as usize) + HANDLER_WFI.len() * 2 <= MAIN_OFFSET as usize,
+    "HANDLER_WFI must fit between HANDLER_OFFSET and MAIN_OFFSET",
+);
+
+/// V2 §3.1 — Two distinct handler bodies concatenated into one array
+/// for image-builder convenience.
+///
+/// HANDLER_IRQ0 occupies hw[0..24] (24 halfwords), HANDLER_IRQ1
+/// occupies hw[24..48] (24 halfwords). The image-builder plants
+/// vector entry [16] at HANDLER_OFFSET (HANDLER_IRQ0 entry) and the
+/// scenario const-time-patches vector entry [17] to point at
+/// HANDLER_OFFSET + 24*2 = HANDLER_OFFSET + 48 (HANDLER_IRQ1 entry).
+/// See `IMAGE_PRIORITY_PREEMPT` and `patch_vector_entry`.
+///
+/// Layout choice. Two distinct handlers (rather than one IPSR-reading
+/// handler) is per HLD §3.1: simpler, no `mrs` in the handler hot path,
+/// no shared counter array. We keep both bodies in a single `[u16; N]`
+/// because `build_image_m0plus` already handles a single handler array
+/// — patching only vector entry [17] avoids modifying the builder's
+/// signature (and so cannot regress V1 / Stage 2-4 scenarios).
+///
+/// **Sentinel values for `order_first_irq`.** The cell starts at zero
+/// (cleared by `reset_scenario_state_*`). Each handler's "is this the
+/// first to run?" check is `cmp r3, #0; bne skip; ...`, so we must use
+/// a non-zero sentinel — IRQ_0 writes `0xA0`, IRQ_1 writes `0xA1`. PASS
+/// is `order_first_irq == 0xA1` (IRQ_1 ran first).
+///
+/// **HANDLER_IRQ0 layout** — bytes 0x04C..0x07C inside the image, hw
+/// indices [0..24] in this array:
+/// ```text
+///   [ 0] ldr  r0, [pc, #28]     ; r0 = TIMER_INTR_ADDR        (lit hw[16])
+///   [ 1] movs r1, #1             ; W1C bit value for ALARM0
+///   [ 2] str  r1, [r0]           ; W1C TIMER.INTR bit 0
+///   [ 3] ldr  r0, [pc, #28]      ; r0 = NVIC_ICPR0_ADDR        (lit hw[18])
+///   [ 4] str  r1, [r0]           ; W1C NVIC bit 0  (r1 still 1)
+///   [ 5] ldr  r2, [pc, #28]      ; r2 = ORDER_FIRST_IRQ_ADDR   (lit hw[20])
+///   [ 6] ldr  r3, [r2]           ; r3 = *order_first_irq
+///   [ 7] cmp  r3, #0
+///   [ 8] bne  hw[11]             ; skip movs+str if non-zero
+///   [ 9] movs r3, #0xA0          ; sentinel — IRQ_0 ran first
+///   [10] str  r3, [r2]
+///   [11] ldr  r0, [pc, #20]      ; r0 = CTR_IRQ_0_ADDR         (lit hw[22])
+///   [12] ldr  r1, [r0]
+///   [13] adds r1, #1
+///   [14] str  r1, [r0]           ; ctr_irq_0 += 1
+///   [15] bx   lr                 ; return via EXC_RETURN
+///   [16..17] lit: TIMER_INTR_ADDR        (0x4005_4034)
+///   [18..19] lit: NVIC_ICPR0_ADDR        (0xE000_E280)
+///   [20..21] lit: ORDER_FIRST_IRQ_ADDR   (0x2000_3FC0)
+///   [22..23] lit: CTR_IRQ_0_ADDR         (0x2000_3FB8)
+/// ```
+///
+/// Literal math — HANDLER_IRQ0 starts at byte 0x04C, so absolute hw[i]
+/// byte = 0x04C + 2*i. `ldr [pc, #imm8*4]` rounds PC down to a 4-byte
+/// boundary first.
+///
+///   hw[ 0] addr 0x04C, PC 0x050, Align 0x050, target hw[16]=0x06C → imm=0x1C → imm8=7 → 0x4807
+///   hw[ 3] addr 0x052, PC 0x056, Align 0x054, target hw[18]=0x070 → imm=0x1C → imm8=7 → 0x4807
+///   hw[ 5] addr 0x056, PC 0x05A, Align 0x058, target hw[20]=0x074 → imm=0x1C → imm8=7 → 0x4A07
+///   hw[11] addr 0x062, PC 0x066, Align 0x064, target hw[22]=0x078 → imm=0x14 → imm8=5 → 0x4805
+///
+/// Branch math — `bne` at hw[8], byte 0x05C, branch_PC = 0x060.
+/// Target hw[11] at 0x062. offset = 0x062 - 0x060 = 2 → imm8 = 1.
+/// Encoding: 0xD101.
+///
+/// **HANDLER_IRQ1 layout** — bytes 0x07C..0x0AC, hw indices [24..48]
+/// in this array. Identical structure to HANDLER_IRQ0; literal-pool
+/// offsets are the same (each handler self-contained). Differences:
+///   - movs r1 = #2  (W1C bit 1 for ALARM1)
+///   - sentinel = #0xA1
+///   - lits point at CTR_IRQ_1_ADDR / TIMER_INTR / NVIC_ICPR0 / ORDER
+///
+/// Literal math — HANDLER_IRQ1 starts at byte 0x07C (= 0x04C + 24*2).
+/// hw[24+k] is at byte 0x07C + 2*k. The relative-from-PC math therefore
+/// yields the same encodings as HANDLER_IRQ0.
+///
+///   hw[24+ 0] addr 0x07C, PC 0x080, Align 0x080, target hw[24+16]=0x09C → imm8=7 → 0x4807
+///   hw[24+ 3] addr 0x082, PC 0x086, Align 0x084, target hw[24+18]=0x0A0 → imm8=7 → 0x4807
+///   hw[24+ 5] addr 0x086, PC 0x08A, Align 0x088, target hw[24+20]=0x0A4 → imm8=7 → 0x4A07
+///   hw[24+11] addr 0x092, PC 0x096, Align 0x094, target hw[24+22]=0x0A8 → imm8=5 → 0x4805
+///
+/// `bne` at hw[24+8], byte 0x08C, branch_PC = 0x090, target byte 0x092
+/// → imm8 = 1 → 0xD101.
+const HANDLER_PRIORITY_PREEMPT: [u16; 48] = [
+    // ---- HANDLER_IRQ0 (entry at HANDLER_OFFSET = 0x04C) -----------------
+    // Phase 1: W1C TIMER.INTR bit 0 (drops level for ALARM0).
+    0x4807, // [ 0] ldr  r0, [pc, #28]   — TIMER_INTR_ADDR
+    0x2101, // [ 1] movs r1, #1
+    0x6001, // [ 2] str  r1, [r0]        — TIMER.INTR = 1 (W1C bit 0)
+    // Phase 2: W1C NVIC_ICPR0 bit 0.
+    0x4807, // [ 3] ldr  r0, [pc, #28]   — NVIC_ICPR0_ADDR
+    0x6001, // [ 4] str  r1, [r0]        — NVIC_ICPR0 = 1 (r1 still 1)
+    // Phase 3: order_first_irq race-free first-write.
+    0x4A07, // [ 5] ldr  r2, [pc, #28]   — ORDER_FIRST_IRQ_ADDR
+    0x6813, // [ 6] ldr  r3, [r2]        — r3 = *order
+    0x2B00, // [ 7] cmp  r3, #0
+    0xD101, // [ 8] bne  hw[11]          — skip if non-zero
+    0x23A0, // [ 9] movs r3, #0xA0       — sentinel for IRQ_0
+    0x6013, // [10] str  r3, [r2]        — *order = 0xA0
+    // Phase 4: ctr_irq_0 += 1.
+    0x4805, // [11] ldr  r0, [pc, #20]   — CTR_IRQ_0_ADDR
+    0x6801, // [12] ldr  r1, [r0]
+    0x3101, // [13] adds r1, #1
+    0x6001, // [14] str  r1, [r0]
+    // Phase 5: return via EXC_RETURN.
+    0x4770, // [15] bx   lr
+    // ---- HANDLER_IRQ0 literal pool (hw[16..24]) ------------------------
+    0x4034, // [16] lit: TIMER_INTR_ADDR        low  (0x4005_4034)
+    0x4005, // [17] lit: TIMER_INTR_ADDR        high
+    0xE280, // [18] lit: NVIC_ICPR0_ADDR        low  (0xE000_E280)
+    0xE000, // [19] lit: NVIC_ICPR0_ADDR        high
+    0x3FC0, // [20] lit: ORDER_FIRST_IRQ_ADDR   low  (0x2000_3FC0)
+    0x2000, // [21] lit: ORDER_FIRST_IRQ_ADDR   high
+    0x3FB8, // [22] lit: CTR_IRQ_0_ADDR         low  (0x2000_3FB8)
+    0x2000, // [23] lit: CTR_IRQ_0_ADDR         high
+    // ---- HANDLER_IRQ1 (entry at HANDLER_OFFSET + 48 = 0x07C) -----------
+    // Phase 1: W1C TIMER.INTR bit 1 (drops level for ALARM1).
+    0x4807, // [24] ldr  r0, [pc, #28]   — TIMER_INTR_ADDR
+    0x2102, // [25] movs r1, #2
+    0x6001, // [26] str  r1, [r0]        — TIMER.INTR = 2 (W1C bit 1)
+    // Phase 2: W1C NVIC_ICPR0 bit 1.
+    0x4807, // [27] ldr  r0, [pc, #28]   — NVIC_ICPR0_ADDR
+    0x6001, // [28] str  r1, [r0]        — NVIC_ICPR0 = 2 (r1 still 2)
+    // Phase 3: order_first_irq race-free first-write.
+    0x4A07, // [29] ldr  r2, [pc, #28]   — ORDER_FIRST_IRQ_ADDR
+    0x6813, // [30] ldr  r3, [r2]        — r3 = *order
+    0x2B00, // [31] cmp  r3, #0
+    0xD101, // [32] bne  hw[24+11]       — skip if non-zero
+    0x23A1, // [33] movs r3, #0xA1       — sentinel for IRQ_1
+    0x6013, // [34] str  r3, [r2]        — *order = 0xA1
+    // Phase 4: ctr_irq_1 += 1.
+    0x4805, // [35] ldr  r0, [pc, #20]   — CTR_IRQ_1_ADDR
+    0x6801, // [36] ldr  r1, [r0]
+    0x3101, // [37] adds r1, #1
+    0x6001, // [38] str  r1, [r0]
+    // Phase 5: return via EXC_RETURN.
+    0x4770, // [39] bx   lr
+    // ---- HANDLER_IRQ1 literal pool (hw[40..48]) ------------------------
+    0x4034, // [40] lit: TIMER_INTR_ADDR        low  (0x4005_4034)
+    0x4005, // [41] lit: TIMER_INTR_ADDR        high
+    0xE280, // [42] lit: NVIC_ICPR0_ADDR        low  (0xE000_E280)
+    0xE000, // [43] lit: NVIC_ICPR0_ADDR        high
+    0x3FC0, // [44] lit: ORDER_FIRST_IRQ_ADDR   low  (0x2000_3FC0)
+    0x2000, // [45] lit: ORDER_FIRST_IRQ_ADDR   high
+    0x3FBC, // [46] lit: CTR_IRQ_1_ADDR         low  (0x2000_3FBC)
+    0x2000, // [47] lit: CTR_IRQ_1_ADDR         high
+];
+
+// HANDLER_IRQ1 entry offset (relative to HANDLER_OFFSET) — used by
+// `IMAGE_PRIORITY_PREEMPT` to patch vector entry [17].
+const HANDLER_IRQ0_LEN_HW: usize = 24;
+const HANDLER_IRQ1_OFFSET_BYTES: u32 = (HANDLER_IRQ0_LEN_HW as u32) * 2;
+
+// Pin every literal-pool slot — every `ldr [pc, #imm]` above depends on
+// these offsets staying put.
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[16] == 0x4034 && HANDLER_PRIORITY_PREEMPT[17] == 0x4005,
+    "TIMER_INTR_ADDR literal must remain at HANDLER_IRQ0 hw[16..=17]",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[18] == 0xE280 && HANDLER_PRIORITY_PREEMPT[19] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at HANDLER_IRQ0 hw[18..=19]",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[20] == 0x3FC0 && HANDLER_PRIORITY_PREEMPT[21] == 0x2000,
+    "ORDER_FIRST_IRQ_ADDR literal must remain at HANDLER_IRQ0 hw[20..=21]",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[22] == 0x3FB8 && HANDLER_PRIORITY_PREEMPT[23] == 0x2000,
+    "CTR_IRQ_0_ADDR literal must remain at HANDLER_IRQ0 hw[22..=23]",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[40] == 0x4034 && HANDLER_PRIORITY_PREEMPT[41] == 0x4005,
+    "TIMER_INTR_ADDR literal must remain at HANDLER_IRQ1 hw[40..=41]",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[42] == 0xE280 && HANDLER_PRIORITY_PREEMPT[43] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at HANDLER_IRQ1 hw[42..=43]",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[44] == 0x3FC0 && HANDLER_PRIORITY_PREEMPT[45] == 0x2000,
+    "ORDER_FIRST_IRQ_ADDR literal must remain at HANDLER_IRQ1 hw[44..=45]",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[46] == 0x3FBC && HANDLER_PRIORITY_PREEMPT[47] == 0x2000,
+    "CTR_IRQ_1_ADDR literal must remain at HANDLER_IRQ1 hw[46..=47]",
+);
+// Pin the HANDLER_IRQ0 / HANDLER_IRQ1 boundary with a bracketed
+// pair of anchors. The head anchor (hw[24] == 0x4807) catches a
+// boundary that drifted *forward*; the tail anchor (hw[15] == 0x4770,
+// IRQ0's `bx lr`) catches a boundary that drifted *backward*. Without
+// the tail anchor, IRQ0 growing by one halfword and IRQ1 contracting
+// by one would leave hw[24] still 0x4807 (IRQ1's *second* `ldr` looks
+// identical to its first) while vector entry [17] silently lands one
+// instruction past IRQ1's true entry point. The length-to-offset pin
+// makes the same invariant explicit in symbolic form.
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[15] == 0x4770,
+    "HANDLER_IRQ0 must end at hw[15] with bx lr (0x4770)",
+);
+const _: () = assert!(
+    HANDLER_PRIORITY_PREEMPT[24] == 0x4807,
+    "HANDLER_IRQ1 entry must remain at hw[24] (ldr r0, [pc, #28])",
+);
+const _: () = assert!(
+    HANDLER_IRQ0_LEN_HW * 2 == HANDLER_IRQ1_OFFSET_BYTES as usize,
+    "HANDLER_IRQ1_OFFSET_BYTES must equal HANDLER_IRQ0_LEN_HW * 2",
+);
+const _: () = assert!(
+    (HANDLER_OFFSET as usize) + HANDLER_PRIORITY_PREEMPT.len() * 2 <= MAIN_OFFSET as usize,
+    "HANDLER_PRIORITY_PREEMPT must fit between HANDLER_OFFSET and MAIN_OFFSET",
+);
+
 // ---------------------------------------------------------------------------
 // Hand-assembled main routines
 // ---------------------------------------------------------------------------
@@ -593,6 +1074,539 @@ const MAIN_TAIL: [u16; 22] = [
     0x0000, // [21] reserved
 ];
 
+/// V2 §3.4 main: write 0xFFFFFFFF to each of NVIC ISER0/ISPR0/ICER0/ICPR0,
+/// read back, and store readback into the four `*_READBACK` SRAM cells.
+/// Pre-seeds before ICER0 / ICPR0 use 0x0000_FFFF (within the mask
+/// range) so the masked-clear can demonstrate it covers the full
+/// pre-seed and produces a final readback of 0. No handler dispatch.
+///
+/// Register convention:
+///   r0 — scratch (MMIO/SRAM target address per step)
+///   r1 — scratch (readback value)
+///   r2 — held: 0xFFFF_FFFF (the all-ones write value)
+///   r3 — held: 0x0000_FFFF (within-mask pre-seed value)
+///   r4 — held: NVIC_ISER0_ADDR
+///   r5 — held: NVIC_ISPR0_ADDR
+///
+/// Literal-pool layout matches the M0+ `ldr [pc, #imm8*4]` math: PC
+/// rounded down to a 4-byte boundary plus imm8*4. hw[i] byte address =
+/// 0x100 + 2*i. Pool packed at hw[44..64].
+///
+/// ```text
+///   [ 0] ldr  r2, [pc, #84]   ; r2 = 0xFFFF_FFFF              (lit hw[44])
+///   [ 1] ldr  r3, [pc, #88]   ; r3 = 0x0000_FFFF              (lit hw[46])
+///   [ 2] ldr  r4, [pc, #88]   ; r4 = NVIC_ISER0_ADDR          (lit hw[48])
+///   [ 3] ldr  r5, [pc, #92]   ; r5 = NVIC_ISPR0_ADDR          (lit hw[50])
+///   ; -- Step 1: ISER0 RAZ/WI
+///   [ 4] str  r2, [r4]        ; *NVIC_ISER0 = 0xFFFFFFFF
+///   [ 5] ldr  r1, [r4]        ; r1 = readback (expect 0x03FF_FFFF)
+///   [ 6] ldr  r0, [pc, #88]   ; r0 = ISER_READBACK_ADDR       (lit hw[52])
+///   [ 7] str  r1, [r0]
+///   [ 8] str  r3, [r4]        ; pre-seed ISER0 = 0x0000_FFFF (within mask)
+///   ; -- Step 2: ISPR0 RAZ/WI
+///   [ 9] str  r2, [r5]        ; *NVIC_ISPR0 = 0xFFFFFFFF
+///   [10] ldr  r1, [r5]        ; r1 = readback (expect 0x03FF_FFFF)
+///   [11] ldr  r0, [pc, #84]   ; r0 = ISPR_READBACK_ADDR       (lit hw[54])
+///   [12] str  r1, [r0]
+///   [13] str  r3, [r5]        ; pre-seed ISPR0 = 0x0000_FFFF
+///   ; -- Step 3: ICER0 — masked-clear covers full pre-seed
+///   [14] ldr  r0, [pc, #80]   ; r0 = NVIC_ICER0_ADDR          (lit hw[56])
+///   [15] str  r2, [r0]        ; *NVIC_ICER0 = 0xFFFFFFFF
+///   [16] ldr  r1, [r4]        ; r1 = ISER0 readback (expect 0)
+///   [17] ldr  r0, [pc, #80]   ; r0 = ICER_READBACK_ADDR       (lit hw[58])
+///   [18] str  r1, [r0]
+///   ; -- Step 4: ICPR0 — masked-clear covers full pre-seed
+///   [19] ldr  r0, [pc, #80]   ; r0 = NVIC_ICPR0_ADDR          (lit hw[60])
+///   [20] str  r2, [r0]        ; *NVIC_ICPR0 = 0xFFFFFFFF
+///   [21] ldr  r1, [r5]        ; r1 = ISPR0 readback (expect 0)
+///   [22] ldr  r0, [pc, #76]   ; r0 = ICPR_READBACK_ADDR       (lit hw[62])
+///   [23] str  r1, [r0]
+///   [24] b    .               ; busy-wait
+///   [25..43] nop padding
+///   [44..45] lit: 0xFFFF_FFFF
+///   [46..47] lit: 0x0000_FFFF
+///   [48..49] lit: NVIC_ISER0_ADDR (0xE000_E100)
+///   [50..51] lit: NVIC_ISPR0_ADDR (0xE000_E200)
+///   [52..53] lit: ISER_READBACK_ADDR (0x2000_3FD0)
+///   [54..55] lit: ISPR_READBACK_ADDR (0x2000_3FD4)
+///   [56..57] lit: NVIC_ICER0_ADDR (0xE000_E180)
+///   [58..59] lit: ICER_READBACK_ADDR (0x2000_3FD8)
+///   [60..61] lit: NVIC_ICPR0_ADDR (0xE000_E280)
+///   [62..63] lit: ICPR_READBACK_ADDR (0x2000_3FDC)
+/// ```
+///
+/// Literal math (per `ldr Rt, [pc, #imm8*4]`, PC = instr_addr+4 rounded
+/// down to 4-byte boundary):
+///   hw[ 0] addr 0x100, PC 0x104, Align 0x104, target hw[44]=0x158 → imm=0x54  → imm8=21 → 0x4A15
+///   hw[ 1] addr 0x102, PC 0x106, Align 0x104, target hw[46]=0x15C → imm=0x58  → imm8=22 → 0x4B16
+///   hw[ 2] addr 0x104, PC 0x108, Align 0x108, target hw[48]=0x160 → imm=0x58  → imm8=22 → 0x4C16
+///   hw[ 3] addr 0x106, PC 0x10A, Align 0x108, target hw[50]=0x164 → imm=0x5C  → imm8=23 → 0x4D17
+///   hw[ 6] addr 0x10C, PC 0x110, Align 0x110, target hw[52]=0x168 → imm=0x58  → imm8=22 → 0x4816
+///   hw[11] addr 0x116, PC 0x11A, Align 0x118, target hw[54]=0x16C → imm=0x54  → imm8=21 → 0x4815
+///   hw[14] addr 0x11C, PC 0x120, Align 0x120, target hw[56]=0x170 → imm=0x50  → imm8=20 → 0x4814
+///   hw[17] addr 0x122, PC 0x126, Align 0x124, target hw[58]=0x174 → imm=0x50  → imm8=20 → 0x4814
+///   hw[19] addr 0x126, PC 0x12A, Align 0x128, target hw[60]=0x178 → imm=0x50  → imm8=20 → 0x4814
+///   hw[22] addr 0x12C, PC 0x130, Align 0x130, target hw[62]=0x17C → imm=0x4C  → imm8=19 → 0x4813
+const MAIN_NVIC_RAZWI: [u16; 64] = [
+    0x4A15, // [ 0] ldr  r2, [pc, #84]   — 0xFFFF_FFFF
+    0x4B16, // [ 1] ldr  r3, [pc, #88]   — 0x0000_FFFF
+    0x4C16, // [ 2] ldr  r4, [pc, #88]   — NVIC_ISER0_ADDR
+    0x4D17, // [ 3] ldr  r5, [pc, #92]   — NVIC_ISPR0_ADDR
+    0x6022, // [ 4] str  r2, [r4]        — *NVIC_ISER0 = 0xFFFFFFFF
+    0x6821, // [ 5] ldr  r1, [r4]        — readback
+    0x4816, // [ 6] ldr  r0, [pc, #88]   — ISER_READBACK_ADDR
+    0x6001, // [ 7] str  r1, [r0]
+    0x6023, // [ 8] str  r3, [r4]        — pre-seed *NVIC_ISER0 = 0x0000FFFF
+    0x602A, // [ 9] str  r2, [r5]        — *NVIC_ISPR0 = 0xFFFFFFFF
+    0x6829, // [10] ldr  r1, [r5]        — readback
+    0x4815, // [11] ldr  r0, [pc, #84]   — ISPR_READBACK_ADDR
+    0x6001, // [12] str  r1, [r0]
+    0x602B, // [13] str  r3, [r5]        — pre-seed *NVIC_ISPR0 = 0x0000FFFF
+    0x4814, // [14] ldr  r0, [pc, #80]   — NVIC_ICER0_ADDR
+    0x6002, // [15] str  r2, [r0]        — *NVIC_ICER0 = 0xFFFFFFFF
+    0x6821, // [16] ldr  r1, [r4]        — readback ISER0 (expect 0)
+    0x4814, // [17] ldr  r0, [pc, #80]   — ICER_READBACK_ADDR
+    0x6001, // [18] str  r1, [r0]
+    0x4814, // [19] ldr  r0, [pc, #80]   — NVIC_ICPR0_ADDR
+    0x6002, // [20] str  r2, [r0]        — *NVIC_ICPR0 = 0xFFFFFFFF
+    0x6829, // [21] ldr  r1, [r5]        — readback ISPR0 (expect 0)
+    0x4813, // [22] ldr  r0, [pc, #76]   — ICPR_READBACK_ADDR
+    0x6001, // [23] str  r1, [r0]
+    0xE7FE, // [24] b    .               — busy-wait
+    0xBF00, // [25] nop                  — padding
+    0xBF00, // [26] nop
+    0xBF00, // [27] nop
+    0xBF00, // [28] nop
+    0xBF00, // [29] nop
+    0xBF00, // [30] nop
+    0xBF00, // [31] nop
+    0xBF00, // [32] nop
+    0xBF00, // [33] nop
+    0xBF00, // [34] nop
+    0xBF00, // [35] nop
+    0xBF00, // [36] nop
+    0xBF00, // [37] nop
+    0xBF00, // [38] nop
+    0xBF00, // [39] nop
+    0xBF00, // [40] nop
+    0xBF00, // [41] nop
+    0xBF00, // [42] nop
+    0xBF00, // [43] nop
+    0xFFFF, // [44] lit: 0xFFFF_FFFF low
+    0xFFFF, // [45] lit: 0xFFFF_FFFF high
+    0xFFFF, // [46] lit: 0x0000_FFFF low
+    0x0000, // [47] lit: 0x0000_FFFF high
+    0xE100, // [48] lit: NVIC_ISER0_ADDR low
+    0xE000, // [49] lit: NVIC_ISER0_ADDR high
+    0xE200, // [50] lit: NVIC_ISPR0_ADDR low
+    0xE000, // [51] lit: NVIC_ISPR0_ADDR high
+    0x3FD0, // [52] lit: ISER_READBACK_ADDR low
+    0x2000, // [53] lit: ISER_READBACK_ADDR high
+    0x3FD4, // [54] lit: ISPR_READBACK_ADDR low
+    0x2000, // [55] lit: ISPR_READBACK_ADDR high
+    0xE180, // [56] lit: NVIC_ICER0_ADDR low
+    0xE000, // [57] lit: NVIC_ICER0_ADDR high
+    0x3FD8, // [58] lit: ICER_READBACK_ADDR low
+    0x2000, // [59] lit: ICER_READBACK_ADDR high
+    0xE280, // [60] lit: NVIC_ICPR0_ADDR low
+    0xE000, // [61] lit: NVIC_ICPR0_ADDR high
+    0x3FDC, // [62] lit: ICPR_READBACK_ADDR low
+    0x2000, // [63] lit: ICPR_READBACK_ADDR high
+];
+
+// Pin literal-pool byte offsets — every `ldr [pc, #imm]` above depends
+// on these slots staying put.
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[44] == 0xFFFF && MAIN_NVIC_RAZWI[45] == 0xFFFF,
+    "0xFFFF_FFFF literal must remain at hw[44..=45]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[46] == 0xFFFF && MAIN_NVIC_RAZWI[47] == 0x0000,
+    "0x0000_FFFF literal must remain at hw[46..=47]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[48] == 0xE100 && MAIN_NVIC_RAZWI[49] == 0xE000,
+    "NVIC_ISER0_ADDR literal must remain at hw[48..=49]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[50] == 0xE200 && MAIN_NVIC_RAZWI[51] == 0xE000,
+    "NVIC_ISPR0_ADDR literal must remain at hw[50..=51]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[52] == 0x3FD0 && MAIN_NVIC_RAZWI[53] == 0x2000,
+    "ISER_READBACK_ADDR literal must remain at hw[52..=53]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[54] == 0x3FD4 && MAIN_NVIC_RAZWI[55] == 0x2000,
+    "ISPR_READBACK_ADDR literal must remain at hw[54..=55]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[56] == 0xE180 && MAIN_NVIC_RAZWI[57] == 0xE000,
+    "NVIC_ICER0_ADDR literal must remain at hw[56..=57]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[58] == 0x3FD8 && MAIN_NVIC_RAZWI[59] == 0x2000,
+    "ICER_READBACK_ADDR literal must remain at hw[58..=59]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[60] == 0xE280 && MAIN_NVIC_RAZWI[61] == 0xE000,
+    "NVIC_ICPR0_ADDR literal must remain at hw[60..=61]",
+);
+const _: () = assert!(
+    MAIN_NVIC_RAZWI[62] == 0x3FDC && MAIN_NVIC_RAZWI[63] == 0x2000,
+    "ICPR_READBACK_ADDR literal must remain at hw[62..=63]",
+);
+const _: () = assert!(
+    (MAIN_OFFSET as usize) + MAIN_NVIC_RAZWI.len() * 2 <= ISR_IMAGE_SIZE,
+    "MAIN_NVIC_RAZWI must fit inside the image's main region",
+);
+
+/// V2 §3.2 main: PRIMASK-gated pend then `cpsie i` unmask.
+///
+/// Sequence:
+///   1. `cpsid i` — set PRIMASK=1 (block exception dispatch).
+///   2. `*NVIC_ISPR0 = 1` — set TIMER_IRQ_0 pending in NVIC.
+///   3. `*NVIC_ISER0 = 1` — enable TIMER_IRQ_0 in NVIC.
+///   4. `*gate = 1`        — pre-unmask gate value.
+///   5. `cpsie i`          — clear PRIMASK; on architecturally-correct
+///      M0+ the dispatch happens on this boundary.
+///   6. `*gate = 2`        — main resumes after handler returns.
+///   7. `b .`              — busy-wait.
+///
+/// **Caveat re: TIMER level re-pend.** TIMER_IRQ_0 has level-driven
+/// re-pend behaviour in `peripherals/timer.rs` — `tick_peripherals`
+/// re-asserts NVIC bit 0 every cycle while `(timer.intr & timer.inte) != 0`.
+/// Main therefore does NOT enable `TIMER.INTE`: the IRQ is set pending
+/// purely via `NVIC_ISPR0`, so once the handler clears `NVIC_ICPR0` bit 0
+/// there's no level signal to re-assert it. Single-shot dispatch.
+///
+/// Register convention (matching MAIN_TIMER's shape):
+///   r0 — scratch (1, then 2 — written into the gate / NVIC bits)
+///   r4 — held: NVIC_ISPR0_ADDR
+///   r5 — held: NVIC_ISER0_ADDR
+///   r6 — held: GATE_ADDR
+///
+/// Layout — image bytes 0x100..0x130:
+/// ```text
+///   [ 0] cpsid i                ; 0xB672 — PRIMASK=1
+///   [ 1] ldr  r4, [pc, #28]     ; r4 = NVIC_ISPR0_ADDR    (lit hw[16])
+///   [ 2] movs r0, #1
+///   [ 3] str  r0, [r4]          ; pend TIMER_IRQ_0
+///   [ 4] ldr  r5, [pc, #24]     ; r5 = NVIC_ISER0_ADDR    (lit hw[18])
+///   [ 5] str  r0, [r5]          ; enable TIMER_IRQ_0 in NVIC
+///   [ 6] ldr  r6, [pc, #24]     ; r6 = GATE_ADDR          (lit hw[20])
+///   [ 7] str  r0, [r6]          ; *gate = 1   (PRE-UNMASK probe)
+///   [ 8] cpsie i                ; 0xB662 — PRIMASK=0  (DISPATCH BOUNDARY)
+///   [ 9] movs r0, #2
+///   [10] str  r0, [r6]          ; *gate = 2   (post-handler resume)
+///   [11] b    .                 ; 0xE7FE — busy-wait
+///   [12] bkpt #0                ; safety net
+///   [13..15] nop padding
+///   [16..17] lit: NVIC_ISPR0_ADDR (0xE000_E200)
+///   [18..19] lit: NVIC_ISER0_ADDR (0xE000_E100)
+///   [20..21] lit: GATE_ADDR       (0x2000_3FEC)
+/// ```
+///
+/// Literal math — main lives at MAIN_OFFSET = 0x100, so hw[i] byte =
+/// 0x100 + 2*i. `ldr [pc, #imm8*4]` rounds PC down to a 4-byte boundary
+/// before adding imm8*4.
+///
+///   hw[ 1] addr 0x102, PC 0x106, Align 0x104, target hw[16]=0x120 → imm=0x1C → imm8=7 → 0x4C07
+///   hw[ 4] addr 0x108, PC 0x10C, Align 0x10C, target hw[18]=0x124 → imm=0x18 → imm8=6 → 0x4D06
+///   hw[ 6] addr 0x10C, PC 0x110, Align 0x110, target hw[20]=0x128 → imm=0x18 → imm8=6 → 0x4E06
+const MAIN_MASKED: [u16; 22] = [
+    0xB672, // [ 0] cpsid i               — PRIMASK=1
+    0x4C07, // [ 1] ldr  r4, [pc, #28]    — NVIC_ISPR0_ADDR
+    0x2001, // [ 2] movs r0, #1
+    0x6020, // [ 3] str  r0, [r4]         — pend TIMER_IRQ_0
+    0x4D06, // [ 4] ldr  r5, [pc, #24]    — NVIC_ISER0_ADDR
+    0x6028, // [ 5] str  r0, [r5]         — enable TIMER_IRQ_0
+    0x4E06, // [ 6] ldr  r6, [pc, #24]    — GATE_ADDR
+    0x6030, // [ 7] str  r0, [r6]         — *gate = 1
+    0xB662, // [ 8] cpsie i               — PRIMASK=0  (dispatch boundary)
+    0x2002, // [ 9] movs r0, #2
+    0x6030, // [10] str  r0, [r6]         — *gate = 2  (post-handler)
+    0xE7FE, // [11] b    .                — busy-wait
+    0xBE00, // [12] bkpt #0               — safety net
+    0xBF00, // [13] nop padding
+    0xBF00, // [14] nop padding
+    0xBF00, // [15] nop padding
+    0xE200, // [16] lit: NVIC_ISPR0_ADDR low  (0xE000_E200)
+    0xE000, // [17] lit: NVIC_ISPR0_ADDR high
+    0xE100, // [18] lit: NVIC_ISER0_ADDR low  (0xE000_E100)
+    0xE000, // [19] lit: NVIC_ISER0_ADDR high
+    0x3FEC, // [20] lit: GATE_ADDR        low  (0x2000_3FEC)
+    0x2000, // [21] lit: GATE_ADDR        high
+];
+
+// Pin literal-pool byte offsets.
+const _: () = assert!(
+    MAIN_MASKED[16] == 0xE200 && MAIN_MASKED[17] == 0xE000,
+    "NVIC_ISPR0_ADDR literal must remain at hw[16..=17]",
+);
+const _: () = assert!(
+    MAIN_MASKED[18] == 0xE100 && MAIN_MASKED[19] == 0xE000,
+    "NVIC_ISER0_ADDR literal must remain at hw[18..=19]",
+);
+const _: () = assert!(
+    MAIN_MASKED[20] == 0x3FEC && MAIN_MASKED[21] == 0x2000,
+    "GATE_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    (MAIN_OFFSET as usize) + MAIN_MASKED.len() * 2 <= ISR_IMAGE_SIZE,
+    "MAIN_MASKED must fit inside the image's main region",
+);
+
+/// V2 §3.3 main: enable TIMER_IRQ_0, arm ALARM0 at TIMERAWL+200, mark
+/// `phase=1`, WFI, mark `phase=2`, busy-wait.
+///
+/// Sequence:
+///   1. Enable TIMER_IRQ_0 in NVIC (`*NVIC_ISER0 = 1`).
+///   2. Enable ALARM0 INTE (`*TIMER_INTE = 1`) — this is what makes the
+///      alarm fire raise NVIC bit 0 (level-driven).
+///   3. Read TIMERAWL, add a 200-tick (~200 µs at default 1µs cadence)
+///      delta to compute the deadline.
+///   4. Write deadline to `TIMER_ALARM0`.
+///   5. `*phase = 1`            — pre-WFI gate.
+///   6. `wfi`                   — park the core; alarm will wake.
+///   7. `*phase = 2`            — main resumed after handler returned.
+///   8. `b .`                   — busy-wait.
+///
+/// Register convention:
+///   r0 — scratch (1, 2, mask)
+///   r1 — scratch (timer addresses, deadline source/dest)
+///   r2 — scratch (deadline value)
+///   r4 — held: NVIC_ISER0_ADDR
+///   r5 — held: TIMER_INTE_ADDR
+///   r6 — held: PHASE_ADDR
+///
+/// Layout — image bytes 0x100..0x13C:
+/// ```text
+///   [ 0] ldr  r4, [pc, #36]    ; r4 = NVIC_ISER0_ADDR     (lit hw[20])
+///   [ 1] movs r0, #1
+///   [ 2] str  r0, [r4]         ; enable IRQ #0 in NVIC
+///   [ 3] ldr  r5, [pc, #36]    ; r5 = TIMER_INTE_ADDR     (lit hw[22])
+///   [ 4] str  r0, [r5]         ; enable ALARM0 INTE
+///   [ 5] ldr  r1, [pc, #36]    ; r1 = TIMER_TIMERAWL_ADDR (lit hw[24])
+///   [ 6] ldr  r2, [r1]         ; r2 = TIMERAWL (now)
+///   [ 7] adds r2, #200         ; r2 = deadline (now + 200 ticks)
+///   [ 8] ldr  r1, [pc, #32]    ; r1 = TIMER_ALARM0_ADDR   (lit hw[26])
+///   [ 9] str  r2, [r1]         ; arm alarm
+///   [10] ldr  r6, [pc, #32]    ; r6 = PHASE_ADDR          (lit hw[28])
+///   [11] str  r0, [r6]         ; *phase = 1   (PRE-WFI probe)
+///   [12] wfi                   ; 0xBF30 — park core; alarm wake
+///   [13] movs r0, #2
+///   [14] str  r0, [r6]         ; *phase = 2   (post-handler resume)
+///   [15] b    .                ; 0xE7FE — busy-wait
+///   [16] bkpt #0               ; safety net
+///   [17..19] nop padding
+///   [20..21] lit: NVIC_ISER0_ADDR     (0xE000_E100)
+///   [22..23] lit: TIMER_INTE_ADDR     (0x4005_4038)
+///   [24..25] lit: TIMER_TIMERAWL_ADDR (0x4005_4028)
+///   [26..27] lit: TIMER_ALARM0_ADDR   (0x4005_4010)
+///   [28..29] lit: PHASE_ADDR          (0x2000_3FC8)
+/// ```
+///
+/// Literal math — main lives at MAIN_OFFSET = 0x100, hw[i] byte =
+/// 0x100 + 2*i. `ldr [pc, #imm8*4]` rounds PC down to a 4-byte boundary
+/// before adding imm8*4.
+///
+///   hw[ 0] addr 0x100, PC 0x104, Align 0x104, target hw[20]=0x128 → imm=0x24 → imm8=9 → 0x4C09
+///   hw[ 3] addr 0x106, PC 0x10A, Align 0x108, target hw[22]=0x12C → imm=0x24 → imm8=9 → 0x4D09
+///   hw[ 5] addr 0x10A, PC 0x10E, Align 0x10C, target hw[24]=0x130 → imm=0x24 → imm8=9 → 0x4909
+///   hw[ 8] addr 0x110, PC 0x114, Align 0x114, target hw[26]=0x134 → imm=0x20 → imm8=8 → 0x4908
+///   hw[10] addr 0x114, PC 0x118, Align 0x118, target hw[28]=0x138 → imm=0x20 → imm8=8 → 0x4E08
+const MAIN_WFI: [u16; 30] = [
+    0x4C09, // [ 0] ldr  r4, [pc, #36]    — NVIC_ISER0_ADDR
+    0x2001, // [ 1] movs r0, #1
+    0x6020, // [ 2] str  r0, [r4]         — *NVIC_ISER0 = 1
+    0x4D09, // [ 3] ldr  r5, [pc, #36]    — TIMER_INTE_ADDR
+    0x6028, // [ 4] str  r0, [r5]         — *TIMER.INTE = 1
+    0x4909, // [ 5] ldr  r1, [pc, #36]    — TIMER_TIMERAWL_ADDR
+    0x680A, // [ 6] ldr  r2, [r1]         — r2 = TIMERAWL
+    0x32C8, // [ 7] adds r2, #200         — r2 = deadline
+    0x4908, // [ 8] ldr  r1, [pc, #32]    — TIMER_ALARM0_ADDR
+    0x600A, // [ 9] str  r2, [r1]         — *TIMER.ALARM0 = deadline
+    0x4E08, // [10] ldr  r6, [pc, #32]    — PHASE_ADDR
+    0x6030, // [11] str  r0, [r6]         — *phase = 1  (r0 still 1)
+    0xBF30, // [12] wfi                   — park core
+    0x2002, // [13] movs r0, #2
+    0x6030, // [14] str  r0, [r6]         — *phase = 2  (post-handler)
+    0xE7FE, // [15] b    .                — busy-wait
+    0xBE00, // [16] bkpt #0               — safety net
+    0xBF00, // [17] nop padding
+    0xBF00, // [18] nop padding
+    0xBF00, // [19] nop padding
+    0xE100, // [20] lit: NVIC_ISER0_ADDR     low  (0xE000_E100)
+    0xE000, // [21] lit: NVIC_ISER0_ADDR     high
+    0x4038, // [22] lit: TIMER_INTE_ADDR     low  (0x4005_4038)
+    0x4005, // [23] lit: TIMER_INTE_ADDR     high
+    0x4028, // [24] lit: TIMER_TIMERAWL_ADDR low  (0x4005_4028)
+    0x4005, // [25] lit: TIMER_TIMERAWL_ADDR high
+    0x4010, // [26] lit: TIMER_ALARM0_ADDR   low  (0x4005_4010)
+    0x4005, // [27] lit: TIMER_ALARM0_ADDR   high
+    0x3FC8, // [28] lit: PHASE_ADDR          low  (0x2000_3FC8)
+    0x2000, // [29] lit: PHASE_ADDR          high
+];
+
+// Pin literal-pool byte offsets.
+const _: () = assert!(
+    MAIN_WFI[20] == 0xE100 && MAIN_WFI[21] == 0xE000,
+    "NVIC_ISER0_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    MAIN_WFI[22] == 0x4038 && MAIN_WFI[23] == 0x4005,
+    "TIMER_INTE_ADDR literal must remain at hw[22..=23]",
+);
+const _: () = assert!(
+    MAIN_WFI[24] == 0x4028 && MAIN_WFI[25] == 0x4005,
+    "TIMER_TIMERAWL_ADDR literal must remain at hw[24..=25]",
+);
+const _: () = assert!(
+    MAIN_WFI[26] == 0x4010 && MAIN_WFI[27] == 0x4005,
+    "TIMER_ALARM0_ADDR literal must remain at hw[26..=27]",
+);
+const _: () = assert!(
+    MAIN_WFI[28] == 0x3FC8 && MAIN_WFI[29] == 0x2000,
+    "PHASE_ADDR literal must remain at hw[28..=29]",
+);
+const _: () = assert!(
+    (MAIN_OFFSET as usize) + MAIN_WFI.len() * 2 <= ISR_IMAGE_SIZE,
+    "MAIN_WFI must fit inside the image's main region",
+);
+
+/// V2 §3.1 main: program NVIC priorities, enable both IRQs, arm both
+/// alarms at the same TIMERAWL deadline, enable both INTE bits, spin.
+///
+/// Sequence:
+///   1. `*NVIC_IPR0 = 0x0000_40C0` — IRQ #0 priority byte = 0xC0
+///      (effective 3); IRQ #1 priority byte = 0x40 (effective 1). Lower
+///      numeric value wins, so IRQ #1 dispatches first.
+///   2. `*NVIC_ISER0 = 3` — enable IRQ #0 + IRQ #1.
+///   3. Read TIMERAWL, add 200-tick delta → deadline.
+///   4. Write deadline to `TIMER_ALARM0` AND `TIMER_ALARM1` so both
+///      alarms fire on the same `tick_peripherals` call.
+///   5. `*TIMER_INTE = 3` — route both alarms to NVIC bits 0 and 1.
+///   6. `b .` — busy-wait. Both alarms fire → both NVIC pending bits set
+///      → `try_take_any_pending_exception` picks IRQ #1 first (lower
+///      priority value); on its return, tail-chain poll picks IRQ #0.
+///
+/// Register convention:
+///   r0 — scratch (MMIO target address per step)
+///   r1 — scratch (priority pattern, then enable mask `3`, then INTE mask)
+///   r2 — held: deadline value
+///
+/// Layout — image bytes 0x100..0x144:
+/// ```text
+///   [ 0] ldr  r0, [pc, #36]    ; r0 = NVIC_IPR0_ADDR             (lit hw[20])
+///   [ 1] ldr  r1, [pc, #40]    ; r1 = 0x0000_40C0                (lit hw[22])
+///   [ 2] str  r1, [r0]         ; *NVIC_IPR0 = 0x40C0 (priority array)
+///   [ 3] ldr  r0, [pc, #40]    ; r0 = NVIC_ISER0_ADDR            (lit hw[24])
+///   [ 4] movs r1, #3
+///   [ 5] str  r1, [r0]         ; *NVIC_ISER0 = 3 (enable IRQ#0+#1)
+///   [ 6] ldr  r0, [pc, #36]    ; r0 = TIMER_TIMERAWL_ADDR        (lit hw[26])
+///   [ 7] ldr  r2, [r0]         ; r2 = TIMERAWL
+///   [ 8] adds r2, #200         ; r2 = deadline
+///   [ 9] ldr  r0, [pc, #36]    ; r0 = TIMER_ALARM0_ADDR          (lit hw[28])
+///   [10] str  r2, [r0]         ; arm ALARM0
+///   [11] ldr  r0, [pc, #36]    ; r0 = TIMER_ALARM1_ADDR          (lit hw[30])
+///   [12] str  r2, [r0]         ; arm ALARM1 (same deadline)
+///   [13] ldr  r0, [pc, #36]    ; r0 = TIMER_INTE_ADDR            (lit hw[32])
+///   [14] str  r1, [r0]         ; *INTE = 3 (r1 still 3)
+///   [15] b    .                ; busy-wait
+///   [16] bkpt #0               ; safety net
+///   [17..19] nop padding
+///   [20..21] lit: NVIC_IPR0_ADDR        (0xE000_E400)
+///   [22..23] lit: 0x0000_40C0           — priority pattern
+///   [24..25] lit: NVIC_ISER0_ADDR        (0xE000_E100)
+///   [26..27] lit: TIMER_TIMERAWL_ADDR   (0x4005_4028)
+///   [28..29] lit: TIMER_ALARM0_ADDR     (0x4005_4010)
+///   [30..31] lit: TIMER_ALARM1_ADDR     (0x4005_4014)
+///   [32..33] lit: TIMER_INTE_ADDR       (0x4005_4038)
+/// ```
+///
+/// Literal math — main lives at MAIN_OFFSET = 0x100, hw[i] byte =
+/// 0x100 + 2*i. `ldr [pc, #imm8*4]` rounds PC down to a 4-byte boundary
+/// before adding imm8*4.
+///
+///   hw[ 0] addr 0x100, PC 0x104, Align 0x104, target hw[20]=0x128 → imm=0x24 → imm8=9 → 0x4809
+///   hw[ 1] addr 0x102, PC 0x106, Align 0x104, target hw[22]=0x12C → imm=0x28 → imm8=10 → 0x490A
+///   hw[ 3] addr 0x106, PC 0x10A, Align 0x108, target hw[24]=0x130 → imm=0x28 → imm8=10 → 0x480A
+///   hw[ 6] addr 0x10C, PC 0x110, Align 0x110, target hw[26]=0x134 → imm=0x24 → imm8=9 → 0x4809
+///   hw[ 9] addr 0x112, PC 0x116, Align 0x114, target hw[28]=0x138 → imm=0x24 → imm8=9 → 0x4809
+///   hw[11] addr 0x116, PC 0x11A, Align 0x118, target hw[30]=0x13C → imm=0x24 → imm8=9 → 0x4809
+///   hw[13] addr 0x11A, PC 0x11E, Align 0x11C, target hw[32]=0x140 → imm=0x24 → imm8=9 → 0x4809
+const MAIN_PRIORITY_PREEMPT: [u16; 34] = [
+    0x4809, // [ 0] ldr  r0, [pc, #36]   — NVIC_IPR0_ADDR
+    0x490A, // [ 1] ldr  r1, [pc, #40]   — 0x0000_40C0
+    0x6001, // [ 2] str  r1, [r0]        — *NVIC_IPR0 = 0x40C0
+    0x480A, // [ 3] ldr  r0, [pc, #40]   — NVIC_ISER0_ADDR
+    0x2103, // [ 4] movs r1, #3
+    0x6001, // [ 5] str  r1, [r0]        — *NVIC_ISER0 = 3
+    0x4809, // [ 6] ldr  r0, [pc, #36]   — TIMER_TIMERAWL_ADDR
+    0x6802, // [ 7] ldr  r2, [r0]        — r2 = TIMERAWL
+    0x32C8, // [ 8] adds r2, #200        — r2 = deadline
+    0x4809, // [ 9] ldr  r0, [pc, #36]   — TIMER_ALARM0_ADDR
+    0x6002, // [10] str  r2, [r0]        — arm ALARM0
+    0x4809, // [11] ldr  r0, [pc, #36]   — TIMER_ALARM1_ADDR
+    0x6002, // [12] str  r2, [r0]        — arm ALARM1 (same deadline)
+    0x4809, // [13] ldr  r0, [pc, #36]   — TIMER_INTE_ADDR
+    0x6001, // [14] str  r1, [r0]        — *INTE = 3 (r1 still 3)
+    0xE7FE, // [15] b    .               — busy-wait
+    0xBE00, // [16] bkpt #0              — safety net
+    0xBF00, // [17] nop padding
+    0xBF00, // [18] nop padding
+    0xBF00, // [19] nop padding
+    0xE400, // [20] lit: NVIC_IPR0_ADDR        low  (0xE000_E400)
+    0xE000, // [21] lit: NVIC_IPR0_ADDR        high
+    0x40C0, // [22] lit: 0x0000_40C0           low  — priority pattern
+    0x0000, // [23] lit: 0x0000_40C0           high
+    0xE100, // [24] lit: NVIC_ISER0_ADDR        low  (0xE000_E100)
+    0xE000, // [25] lit: NVIC_ISER0_ADDR        high
+    0x4028, // [26] lit: TIMER_TIMERAWL_ADDR   low  (0x4005_4028)
+    0x4005, // [27] lit: TIMER_TIMERAWL_ADDR   high
+    0x4010, // [28] lit: TIMER_ALARM0_ADDR     low  (0x4005_4010)
+    0x4005, // [29] lit: TIMER_ALARM0_ADDR     high
+    0x4014, // [30] lit: TIMER_ALARM1_ADDR     low  (0x4005_4014)
+    0x4005, // [31] lit: TIMER_ALARM1_ADDR     high
+    0x4038, // [32] lit: TIMER_INTE_ADDR       low  (0x4005_4038)
+    0x4005, // [33] lit: TIMER_INTE_ADDR       high
+];
+
+// Pin literal-pool byte offsets.
+const _: () = assert!(
+    MAIN_PRIORITY_PREEMPT[20] == 0xE400 && MAIN_PRIORITY_PREEMPT[21] == 0xE000,
+    "NVIC_IPR0_ADDR literal must remain at hw[20..=21]",
+);
+const _: () = assert!(
+    MAIN_PRIORITY_PREEMPT[22] == 0x40C0 && MAIN_PRIORITY_PREEMPT[23] == 0x0000,
+    "priority pattern 0x0000_40C0 literal must remain at hw[22..=23]",
+);
+const _: () = assert!(
+    MAIN_PRIORITY_PREEMPT[24] == 0xE100 && MAIN_PRIORITY_PREEMPT[25] == 0xE000,
+    "NVIC_ISER0_ADDR literal must remain at hw[24..=25]",
+);
+const _: () = assert!(
+    MAIN_PRIORITY_PREEMPT[26] == 0x4028 && MAIN_PRIORITY_PREEMPT[27] == 0x4005,
+    "TIMER_TIMERAWL_ADDR literal must remain at hw[26..=27]",
+);
+const _: () = assert!(
+    MAIN_PRIORITY_PREEMPT[28] == 0x4010 && MAIN_PRIORITY_PREEMPT[29] == 0x4005,
+    "TIMER_ALARM0_ADDR literal must remain at hw[28..=29]",
+);
+const _: () = assert!(
+    MAIN_PRIORITY_PREEMPT[30] == 0x4014 && MAIN_PRIORITY_PREEMPT[31] == 0x4005,
+    "TIMER_ALARM1_ADDR literal must remain at hw[30..=31]",
+);
+const _: () = assert!(
+    MAIN_PRIORITY_PREEMPT[32] == 0x4038 && MAIN_PRIORITY_PREEMPT[33] == 0x4005,
+    "TIMER_INTE_ADDR literal must remain at hw[32..=33]",
+);
+const _: () = assert!(
+    (MAIN_OFFSET as usize) + MAIN_PRIORITY_PREEMPT.len() * 2 <= ISR_IMAGE_SIZE,
+    "MAIN_PRIORITY_PREEMPT must fit inside the image's main region",
+);
+
 // ---------------------------------------------------------------------------
 // Scenario images
 // ---------------------------------------------------------------------------
@@ -602,6 +1616,72 @@ const IMAGE_TIMER_COLD: [u8; ISR_IMAGE_SIZE] =
 
 const IMAGE_TAIL_CHAIN: [u8; ISR_IMAGE_SIZE] =
     build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_TAIL, MAIN_TAIL);
+
+/// V2 §3.4 image. No handler dispatch — passes an empty `[u16; 0]` so
+/// the handler region stays zero. Vector slots [14..16] still point at
+/// HANDLER_OFFSET (as the builder mandates), but no scenario instruction
+/// pends those exceptions, so the zero-filled handler region is never
+/// reached. Slots [2..13] still point at the `bkpt #1` default handler
+/// for any architecturally-required entries.
+const IMAGE_NVIC_RAZWI: [u8; ISR_IMAGE_SIZE] =
+    build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, [], MAIN_NVIC_RAZWI);
+
+/// V2 §3.2 image — PRIMASK-gated pend then `cpsie i` unmask.
+const IMAGE_MASKED_PENDING: [u8; ISR_IMAGE_SIZE] =
+    build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_MASKED, MAIN_MASKED);
+
+/// V2 §3.3 image — WFI wake on TIMER ALARM0.
+const IMAGE_WFI_WAKE: [u8; ISR_IMAGE_SIZE] =
+    build_image_m0plus(ISR_IMAGE_BASE, ISR_STACK_TOP, HANDLER_WFI, MAIN_WFI);
+
+/// Const helper — overwrite one vector-table entry's u32. Used by the V2
+/// §3.1 image so vector entry [17] (TIMER_IRQ_1) lands on HANDLER_IRQ1's
+/// first instruction inside the concatenated `HANDLER_PRIORITY_PREEMPT`
+/// array, while vector entry [16] (TIMER_IRQ_0) keeps the
+/// builder-default of HANDLER_OFFSET (HANDLER_IRQ0's entry).
+///
+/// `entry_idx` indexes 4-byte vector-table slots starting at byte 0.
+/// `build_image_m0plus` only fills entries [0..VECTOR_TABLE_ENTRIES] with
+/// non-zero values; entries 17..=N occupy bytes that are part of the
+/// post-vector "zero padding" region (HLD layout) and so are still inside
+/// the vector-table-shaped prefix of the image up to DEFAULT_HANDLER_OFFSET.
+/// The bounds check therefore allows entry indices in the range
+/// `[0, DEFAULT_HANDLER_OFFSET / 4)` so the patch can land in the padding
+/// gap without colliding with the default-handler `bkpt #1`.
+const fn patch_vector_entry(
+    mut image: [u8; ISR_IMAGE_SIZE],
+    entry_idx: usize,
+    target: u32,
+) -> [u8; ISR_IMAGE_SIZE] {
+    assert!(
+        entry_idx * 4 < DEFAULT_HANDLER_OFFSET as usize,
+        "patch_vector_entry: entry_idx must land inside the vector-table prefix",
+    );
+    let off = entry_idx * 4;
+    let b = target.to_le_bytes();
+    image[off] = b[0];
+    image[off + 1] = b[1];
+    image[off + 2] = b[2];
+    image[off + 3] = b[3];
+    image
+}
+
+/// V2 §3.1 image — priority preemption. Built by `build_image_m0plus`,
+/// then patched so vector entry [17] (TIMER_IRQ_1) points at
+/// HANDLER_IRQ1's entry inside `HANDLER_PRIORITY_PREEMPT`
+/// (= HANDLER_OFFSET + HANDLER_IRQ1_OFFSET_BYTES). Vector entry [16]
+/// (TIMER_IRQ_0) is left at the builder default of HANDLER_OFFSET,
+/// where HANDLER_IRQ0 starts.
+const IMAGE_PRIORITY_PREEMPT: [u8; ISR_IMAGE_SIZE] = patch_vector_entry(
+    build_image_m0plus(
+        ISR_IMAGE_BASE,
+        ISR_STACK_TOP,
+        HANDLER_PRIORITY_PREEMPT,
+        MAIN_PRIORITY_PREEMPT,
+    ),
+    17,
+    (ISR_IMAGE_BASE + HANDLER_OFFSET + HANDLER_IRQ1_OFFSET_BYTES) | 1,
+);
 
 // ---------------------------------------------------------------------------
 // Scenario type
@@ -646,11 +1726,9 @@ pub struct IsrScenario {
     pub image: &'static [u8],
     pub entry_offset: u32,
     pub init_regs: &'static [(IsrReg, u32)],
-    /// Wall-clock budget in milliseconds. Exception dispatch is
-    /// modelled (HLD V7 §5.2 / §5.3 — see `Bus::irq_pending`,
-    /// `CortexM0Plus::try_take_any_pending_exception`,
-    /// `enter_exception`); the budget bounds runtime in case a
-    /// scenario regresses and a handler fails to exit cleanly.
+    /// Wall-clock budget in milliseconds for the EMU side. Dispatch is
+    /// modelled (see the module-level Status block); kept short so the
+    /// oracle completes quickly.
     pub max_millis: u32,
     pub observe: &'static [(&'static str, IsrObservable)],
 }
@@ -662,8 +1740,8 @@ pub struct IsrScenario {
 const INIT_TIMER_COLD: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_TIMER_COLD: &[(&str, IsrObservable)] = &[
     // Primary load-bearing observable: the handler ran exactly once so
-    // the counter == 1. On silicon this should PASS; on EMU it FAILS
-    // because the core never dispatches the IRQ.
+    // the counter == 1. Dispatch path is silicon-validated; EMU and
+    // silicon both PASS.
     ("ctr_timer", IsrObservable::Memory(CTR_TIMER_ADDR)),
     // TIMER.INTR bit 0 clear after the W1C inside the handler.
     ("timer_intr", IsrObservable::Mmio(TIMER_INTR_ADDR, 0x1)),
@@ -677,6 +1755,59 @@ const OBS_TAIL_CHAIN: &[(&str, IsrObservable)] = &[
     // once before the runner halts).
     ("ctr_pendsv", IsrObservable::Memory(CTR_PENDSV_ADDR)),
     ("ctr_systick", IsrObservable::Memory(CTR_SYSTICK_ADDR)),
+];
+
+const INIT_MASKED: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
+const OBS_MASKED: &[(&str, IsrObservable)] = &[
+    // Primary load-bearing observable: gate snapshot at handler entry.
+    // PASS condition is `gate_at_entry == 1` — the handler ran AFTER
+    // the gate=1 store and BEFORE the gate=2 store, i.e. dispatch
+    // happened on the `cpsie i` boundary (not later).
+    ("gate_at_entry", IsrObservable::Memory(GATE_AT_ENTRY_ADDR)),
+    // Secondary: the handler ran exactly once.
+    ("ctr_timer", IsrObservable::Memory(CTR_TIMER_ADDR)),
+    // Secondary: main resumed after handler returned (gate==2).
+    ("gate", IsrObservable::Memory(GATE_ADDR)),
+];
+
+const INIT_WFI: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
+const OBS_WFI: &[(&str, IsrObservable)] = &[
+    // Primary load-bearing observable: phase snapshot at handler entry.
+    // PASS condition is `phase_at_entry == 1` — the handler ran during
+    // the WFI window, AFTER `*phase=1` but BEFORE main resumed past
+    // `wfi` and stored `*phase=2`.
+    ("phase_at_entry", IsrObservable::Memory(PHASE_AT_ENTRY_ADDR)),
+    // Secondary: the handler ran exactly once.
+    ("ctr_timer", IsrObservable::Memory(CTR_TIMER_ADDR)),
+    // Secondary: main resumed past WFI after the handler returned.
+    ("phase", IsrObservable::Memory(PHASE_ADDR)),
+];
+
+const INIT_PRIORITY_PREEMPT: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
+const OBS_PRIORITY_PREEMPT: &[(&str, IsrObservable)] = &[
+    // Primary load-bearing observable: which handler ran first. PASS
+    // condition is `order_first_irq == 0xA1` (IRQ_1 sentinel) — IRQ_1
+    // has the lower priority value, so it must dispatch first; IRQ_0
+    // then runs via tail-chain. Listed first so `primary_observable_addr`
+    // polls it.
+    ("order_first_irq", IsrObservable::Memory(ORDER_FIRST_IRQ_ADDR)),
+    // Secondary: each handler ran exactly once.
+    ("ctr_irq_0", IsrObservable::Memory(CTR_IRQ_0_ADDR)),
+    ("ctr_irq_1", IsrObservable::Memory(CTR_IRQ_1_ADDR)),
+];
+
+const INIT_NVIC_RAZWI: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
+const OBS_NVIC_RAZWI: &[(&str, IsrObservable)] = &[
+    // Primary load-bearing observable: ISER0 high bits read as zero.
+    // Listed first so `primary_observable_addr` polls it.
+    ("iser_readback", IsrObservable::Memory(ISER_READBACK_ADDR)),
+    ("ispr_readback", IsrObservable::Memory(ISPR_READBACK_ADDR)),
+    // ICER/ICPR readback expected to be 0 (whole pre-seed cleared by the
+    // masked write). ICER/ICPR readbacks are stored later in the main
+    // body than the ISER/ISPR ones; the runner's one-extra-chunk grace
+    // window covers the whole tail before halting — see `run_emu_scenario`.
+    ("icer_readback", IsrObservable::Memory(ICER_READBACK_ADDR)),
+    ("icpr_readback", IsrObservable::Memory(ICPR_READBACK_ADDR)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -702,6 +1833,52 @@ pub const SCENARIOS: &[IsrScenario] = &[
         init_regs: INIT_TAIL_CHAIN,
         max_millis: 1500,
         observe: OBS_TAIL_CHAIN,
+    },
+    // V2 §3.4: NVIC ISER/ICER/ISPR/ICPR high-bits RAZ/WI. No handler
+    // dispatch — pure register-shape assertion.
+    IsrScenario {
+        name: "isr_m0_nvic_high_bits_razwi",
+        image: &IMAGE_NVIC_RAZWI,
+        entry_offset: MAIN_OFFSET,
+        init_regs: INIT_NVIC_RAZWI,
+        max_millis: 1500,
+        observe: OBS_NVIC_RAZWI,
+    },
+    // V2 §3.2: PRIMASK-gated pend, then `cpsie i` unmask. Verifies the
+    // PRIMASK gate inside `try_take_any_pending_exception` and proves
+    // dispatch happens on the `cpsie i` boundary, not later.
+    IsrScenario {
+        name: "isr_m0_masked_pending_unmask",
+        image: &IMAGE_MASKED_PENDING,
+        entry_offset: MAIN_OFFSET,
+        init_regs: INIT_MASKED,
+        max_millis: 1500,
+        observe: OBS_MASKED,
+    },
+    // V2 §3.3: WFI wake on TIMER ALARM0. Main parks the core via WFI
+    // after arming the alarm; the alarm fires, NVIC re-pends, the core
+    // un-halts, dispatches the handler, and main resumes.
+    IsrScenario {
+        name: "isr_m0_wfi_wake",
+        image: &IMAGE_WFI_WAKE,
+        entry_offset: MAIN_OFFSET,
+        init_regs: INIT_WFI,
+        max_millis: 1500,
+        observe: OBS_WFI,
+    },
+    // V2 §3.1: priority-preempt / tail-chain. Two TIMER alarms fire in
+    // lock-step on the same TIMERAWL deadline; IPR0 gives IRQ #1 a lower
+    // priority value than IRQ #0, so IRQ #1's handler dispatches first
+    // and IRQ #0's runs as a tail-chain. Validates the priority array
+    // path through `Nvic::highest_priority_pending` and
+    // `try_take_any_pending_exception`.
+    IsrScenario {
+        name: "isr_m0_priority_preempt",
+        image: &IMAGE_PRIORITY_PREEMPT,
+        entry_offset: MAIN_OFFSET,
+        init_regs: INIT_PRIORITY_PREEMPT,
+        max_millis: 1500,
+        observe: OBS_PRIORITY_PREEMPT,
     },
 ];
 
@@ -839,9 +2016,38 @@ fn reset_scenario_state_hw(
     core.write_word_32(CTR_TIMER_ADDR as u64, 0)?;
     core.write_word_32(CTR_PENDSV_ADDR as u64, 0)?;
     core.write_word_32(CTR_SYSTICK_ADDR as u64, 0)?;
-    // Clear TIMER.INTR (W1C both alarm flags) and disable INTE.
+    // V2 §3.4 — NVIC RAZ/WI scenario observable cells.
+    core.write_word_32(ISER_READBACK_ADDR as u64, 0)?;
+    core.write_word_32(ISPR_READBACK_ADDR as u64, 0)?;
+    core.write_word_32(ICER_READBACK_ADDR as u64, 0)?;
+    core.write_word_32(ICPR_READBACK_ADDR as u64, 0)?;
+    // V2 §3.2 — PRIMASK-gate scenario observable cells.
+    core.write_word_32(GATE_ADDR as u64, 0)?;
+    core.write_word_32(GATE_AT_ENTRY_ADDR as u64, 0)?;
+    // V2 §3.3 — WFI-wake scenario observable cells.
+    core.write_word_32(PHASE_ADDR as u64, 0)?;
+    core.write_word_32(PHASE_AT_ENTRY_ADDR as u64, 0)?;
+    // V2 §3.1 — priority-preempt scenario observable cells.
+    core.write_word_32(CTR_IRQ_0_ADDR as u64, 0)?;
+    core.write_word_32(CTR_IRQ_1_ADDR as u64, 0)?;
+    core.write_word_32(ORDER_FIRST_IRQ_ADDR as u64, 0)?;
+    // Clear TIMER.INTR (W1C both alarm flags), disable INTE, and disarm
+    // every ALARM. ARMED is W1C — write 0xF to disarm all four alarms;
+    // without this, `alarm_fire_cycle` slots from a prior scenario stay
+    // live and can re-pend INTR after this reset.
+    core.write_word_32(TIMER_ARMED_ADDR as u64, 0xF)?;
     core.write_word_32(TIMER_INTR_ADDR as u64, 0xFFFF_FFFF)?;
     core.write_word_32(TIMER_INTE_ADDR as u64, 0)?;
+    // Clear any pre-seeded NVIC state so the V2 §3.4 / §3.2 / §3.1
+    // scenarios start from a known zero pending/enabled/priority mask.
+    // ICER0/ICPR0 use W1C semantics — writing all-ones clears every bit.
+    // ISER0 has no direct W1C, so ICER0 alone is what disables enabled
+    // IRQs. NVIC_IPR0 must be zeroed too — V2 §3.1 leaves a non-zero
+    // priority pattern there which would otherwise bleed into V1 / Stage
+    // 2-4 scenarios.
+    core.write_word_32(NVIC_ICER0_ADDR as u64, 0xFFFF_FFFF)?;
+    core.write_word_32(NVIC_ICPR0_ADDR as u64, 0xFFFF_FFFF)?;
+    core.write_word_32(NVIC_IPR0_ADDR as u64, 0)?;
     Ok(())
 }
 
@@ -849,8 +2055,31 @@ fn reset_scenario_state_emu(emu: &mut mdrp2040::Emulator) {
     emu.poke(CTR_TIMER_ADDR, 0);
     emu.poke(CTR_PENDSV_ADDR, 0);
     emu.poke(CTR_SYSTICK_ADDR, 0);
+    emu.poke(ISER_READBACK_ADDR, 0);
+    emu.poke(ISPR_READBACK_ADDR, 0);
+    emu.poke(ICER_READBACK_ADDR, 0);
+    emu.poke(ICPR_READBACK_ADDR, 0);
+    // V2 §3.2 — PRIMASK-gate scenario observable cells.
+    emu.poke(GATE_ADDR, 0);
+    emu.poke(GATE_AT_ENTRY_ADDR, 0);
+    // V2 §3.3 — WFI-wake scenario observable cells.
+    emu.poke(PHASE_ADDR, 0);
+    emu.poke(PHASE_AT_ENTRY_ADDR, 0);
+    // V2 §3.1 — priority-preempt scenario observable cells.
+    emu.poke(CTR_IRQ_0_ADDR, 0);
+    emu.poke(CTR_IRQ_1_ADDR, 0);
+    emu.poke(ORDER_FIRST_IRQ_ADDR, 0);
+    // Disarm every ALARM (W1C — write 0xF) before clearing INTR so a
+    // pending fire-cycle can't re-pend INTR after this reset. Mirrors
+    // the HW-side reset above.
+    emu.mmio_write32(TIMER_ARMED_ADDR, 0xF);
     emu.mmio_write32(TIMER_INTR_ADDR, 0xFFFF_FFFF);
     emu.mmio_write32(TIMER_INTE_ADDR, 0);
+    emu.mmio_write32(NVIC_ICER0_ADDR, 0xFFFF_FFFF);
+    emu.mmio_write32(NVIC_ICPR0_ADDR, 0xFFFF_FFFF);
+    // V2 §3.1 — clear NVIC priority array (defends against bleed-through
+    // from a prior priority-preempt run leaving non-zero priorities).
+    emu.mmio_write32(NVIC_IPR0_ADDR, 0);
 }
 
 /// Result of running a scenario's EMU half. Per HLD V5 §6.2.
@@ -873,6 +2102,10 @@ fn primary_observable_addr(name: &str) -> u32 {
     match name {
         "isr_m0_timer_cold" => CTR_TIMER_ADDR,
         "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
+        "isr_m0_nvic_high_bits_razwi" => ISER_READBACK_ADDR,
+        "isr_m0_masked_pending_unmask" => GATE_AT_ENTRY_ADDR,
+        "isr_m0_wfi_wake" => PHASE_AT_ENTRY_ADDR,
+        "isr_m0_priority_preempt" => ORDER_FIRST_IRQ_ADDR,
         other => {
             panic!("primary_observable_addr: unknown scenario '{other}'; add it to this match")
         }
@@ -1061,6 +2294,10 @@ fn run_one_scenario(
     let primary_counter_addr = match sc.name {
         "isr_m0_timer_cold" => CTR_TIMER_ADDR,
         "isr_m0_tail_chain_pendsv_systick" => CTR_PENDSV_ADDR,
+        "isr_m0_nvic_high_bits_razwi" => ISER_READBACK_ADDR,
+        "isr_m0_masked_pending_unmask" => GATE_AT_ENTRY_ADDR,
+        "isr_m0_wfi_wake" => PHASE_AT_ENTRY_ADDR,
+        "isr_m0_priority_preempt" => ORDER_FIRST_IRQ_ADDR,
         _ => CTR_TIMER_ADDR,
     };
     loop {
@@ -1282,7 +2519,11 @@ mod tests {
 
     #[test]
     fn catalogue_size_and_prefix() {
-        assert_eq!(SCENARIOS.len(), 2, "Phase 1 minimum = 2 scenarios");
+        assert_eq!(
+            SCENARIOS.len(),
+            6,
+            "Phase 1 (V1×2) + V2 stage 2-5 (×4) = 6 scenarios",
+        );
         for s in SCENARIOS {
             assert!(
                 s.name.starts_with("isr_m0_"),
@@ -1381,6 +2622,7 @@ mod tests {
         assert_eq!(NVIC_ISER0_ADDR, 0xE000_E100);
         assert_eq!(TIMER_BASE, 0x4005_4000);
         assert_eq!(TIMER_ALARM0_ADDR, 0x4005_4010);
+        assert_eq!(TIMER_TIMERAWL_ADDR, 0x4005_4028);
         assert_eq!(TIMER_INTR_ADDR, 0x4005_4034);
         assert_eq!(TIMER_INTE_ADDR, 0x4005_4038);
         assert_eq!(IRQ_TIMER_IRQ_0, 0);
@@ -1397,10 +2639,82 @@ mod tests {
             assert!(CTR_PENDSV_ADDR < ISR_STACK_TOP + 0x1000);
             assert!(CTR_SYSTICK_ADDR >= ISR_STACK_TOP);
             assert!(CTR_SYSTICK_ADDR < ISR_STACK_TOP + 0x1000);
+            // V2 §3.4 readback cells — same constraint.
+            assert!(ISER_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ISER_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(ISPR_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ISPR_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(ICER_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ICER_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(ICPR_READBACK_ADDR >= ISR_STACK_TOP);
+            assert!(ICPR_READBACK_ADDR < ISR_STACK_TOP + 0x1000);
+            // V2 §3.2 gate cells — same constraint.
+            assert!(GATE_ADDR >= ISR_STACK_TOP);
+            assert!(GATE_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(GATE_AT_ENTRY_ADDR >= ISR_STACK_TOP);
+            assert!(GATE_AT_ENTRY_ADDR < ISR_STACK_TOP + 0x1000);
+            // V2 §3.3 phase cells — same constraint.
+            assert!(PHASE_ADDR >= ISR_STACK_TOP);
+            assert!(PHASE_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(PHASE_AT_ENTRY_ADDR >= ISR_STACK_TOP);
+            assert!(PHASE_AT_ENTRY_ADDR < ISR_STACK_TOP + 0x1000);
             // And clear of the mailbox words themselves.
             assert!(CTR_TIMER_ADDR < ISR_MAILBOX_CYCCNT);
             assert!(CTR_PENDSV_ADDR < ISR_MAILBOX_CYCCNT);
             assert!(CTR_SYSTICK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ISER_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ISPR_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ICER_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ICPR_READBACK_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(GATE_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(GATE_AT_ENTRY_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(PHASE_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(PHASE_AT_ENTRY_ADDR < ISR_MAILBOX_CYCCNT);
+            // No collision with the existing CTR cells.
+            assert!(ISER_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(ISPR_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(ICER_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(ICPR_READBACK_ADDR != CTR_TIMER_ADDR);
+            assert!(GATE_ADDR != CTR_TIMER_ADDR);
+            assert!(GATE_ADDR != CTR_PENDSV_ADDR);
+            assert!(GATE_ADDR != CTR_SYSTICK_ADDR);
+            assert!(GATE_AT_ENTRY_ADDR != GATE_ADDR);
+            // V2 §3.3 — PHASE cells distinct from every other slot.
+            assert!(PHASE_ADDR != PHASE_AT_ENTRY_ADDR);
+            assert!(PHASE_ADDR != ISER_READBACK_ADDR);
+            assert!(PHASE_ADDR != ISPR_READBACK_ADDR);
+            assert!(PHASE_ADDR != ICER_READBACK_ADDR);
+            assert!(PHASE_ADDR != ICPR_READBACK_ADDR);
+            assert!(PHASE_ADDR != CTR_TIMER_ADDR);
+            assert!(PHASE_ADDR != CTR_PENDSV_ADDR);
+            assert!(PHASE_ADDR != CTR_SYSTICK_ADDR);
+            assert!(PHASE_ADDR != GATE_ADDR);
+            assert!(PHASE_ADDR != GATE_AT_ENTRY_ADDR);
+            // V2 §3.1 — priority-preempt cells inside the mailbox page,
+            // clear of the mailbox words, and pairwise-distinct from every
+            // other observable cell.
+            assert!(CTR_IRQ_0_ADDR >= ISR_STACK_TOP);
+            assert!(CTR_IRQ_0_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(CTR_IRQ_1_ADDR >= ISR_STACK_TOP);
+            assert!(CTR_IRQ_1_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(ORDER_FIRST_IRQ_ADDR >= ISR_STACK_TOP);
+            assert!(ORDER_FIRST_IRQ_ADDR < ISR_STACK_TOP + 0x1000);
+            assert!(CTR_IRQ_0_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(CTR_IRQ_1_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(ORDER_FIRST_IRQ_ADDR < ISR_MAILBOX_CYCCNT);
+            assert!(CTR_IRQ_0_ADDR != CTR_IRQ_1_ADDR);
+            assert!(CTR_IRQ_0_ADDR != ORDER_FIRST_IRQ_ADDR);
+            assert!(CTR_IRQ_1_ADDR != ORDER_FIRST_IRQ_ADDR);
+            assert!(CTR_IRQ_0_ADDR != CTR_TIMER_ADDR);
+            assert!(CTR_IRQ_0_ADDR != CTR_PENDSV_ADDR);
+            assert!(CTR_IRQ_0_ADDR != CTR_SYSTICK_ADDR);
+            assert!(CTR_IRQ_0_ADDR != PHASE_ADDR);
+            assert!(CTR_IRQ_0_ADDR != PHASE_AT_ENTRY_ADDR);
+            assert!(CTR_IRQ_0_ADDR != GATE_ADDR);
+            assert!(CTR_IRQ_0_ADDR != GATE_AT_ENTRY_ADDR);
+            assert!(CTR_IRQ_1_ADDR != CTR_TIMER_ADDR);
+            assert!(ORDER_FIRST_IRQ_ADDR != CTR_TIMER_ADDR);
+            assert!(ORDER_FIRST_IRQ_ADDR != PHASE_ADDR);
         };
     }
 

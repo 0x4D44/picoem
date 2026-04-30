@@ -1612,22 +1612,22 @@ impl Bus {
         match low {
             // NVIC_ISER0: write-1-to-SET the enable bit.
             0xE100 => {
-                n.enabled |= val;
+                n.enabled |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICER0: write-1-to-CLEAR the enable bit.
             0xE180 => {
-                n.enabled &= !val;
+                n.enabled &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_ISPR0: write-1-to-SET the pending bit.
             0xE200 => {
-                n.pending |= val;
+                n.pending |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICPR0: write-1-to-CLEAR the pending bit.
             0xE280 => {
-                n.pending &= !val;
+                n.pending &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_IPR0..7: 4×u8 priority bytes, each masked to the
@@ -1965,6 +1965,17 @@ impl Bus {
             .timer
             .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
         self.irq_pending |= nvic_bits & 0xF;
+    }
+
+    /// Soonest scheduled lazy IRQ deadline (master-cycle space) across
+    /// peripherals modelled today. TIMER is the only lazy IRQ source in
+    /// V1 (PWM/ADC/etc. tick on `consumed`, not on absolute deadlines),
+    /// so this currently returns `timer.next_armed_inte_fire_cycle()`.
+    /// Used by the both-cores-blocked clock-advance branch in
+    /// `Emulator::step_serial` to pick the next event horizon —
+    /// closes tech_debt §1649 for RP2040.
+    pub fn next_scheduled_lazy_deadline(&self) -> Option<u64> {
+        self.timer.next_armed_inte_fire_cycle()
     }
 
     /// Read the current pending-IRQ bitmap. Mostly for tests.
@@ -2575,6 +2586,47 @@ mod tests {
         let mut bus = Bus::new();
         bus.write32(0xE000_E100, 1u32 << 0);
         assert_eq!(bus.read32(0xE000_E100), 1u32 << 0);
+    }
+
+    #[test]
+    fn nvic_high_bits_razwi() {
+        // RP2040 has 26 IRQ lines (bits 0..=25). Writes to ISER0/ICER0/
+        // ISPR0/ICPR0 with bits 26..31 set must be silently dropped on
+        // real silicon (RAZ/WI). Reads naturally RAZ since the field
+        // never has high bits set.
+        let mut bus = Bus::new();
+        // ISER0: write all-ones, expect only the 26 implemented bits.
+        bus.write32(0xE000_E100, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E100), 0x03FF_FFFF);
+        // ICER0: with all 26 enable bits set, an all-ones write must
+        // clear them all (no high-bit residue gating the AND-NOT).
+        bus.write32(0xE000_E180, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E100), 0);
+        // ISPR0: same shape as ISER0 on the SET side.
+        bus.write32(0xE000_E200, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E200), 0x03FF_FFFF);
+        // ICPR0: same shape as ICER0 on the CLEAR side.
+        bus.write32(0xE000_E280, 0xFFFF_FFFF);
+        assert_eq!(bus.read32(0xE000_E200), 0);
+
+        // Force high bits into the field directly to exercise the
+        // clear-arm mask: without `val & IRQ_LINE_MASK` on the ICER0/
+        // ICPR0 arms, an all-ones write would clear the high bits too.
+        bus.nvics[0].enabled = 0xFFFF_FFFF;
+        bus.write32(0xE000_E180, 0xFFFF_FFFF); // ICER0 — should clear only bits 0..25
+        assert_eq!(
+            bus.read32(0xE000_E100),
+            0xFC00_0000,
+            "ICER0 must mask val before clearing — high bits preserved"
+        );
+
+        bus.nvics[0].pending = 0xFFFF_FFFF;
+        bus.write32(0xE000_E280, 0xFFFF_FFFF); // ICPR0 — should clear only bits 0..25
+        assert_eq!(
+            bus.read32(0xE000_E200),
+            0xFC00_0000,
+            "ICPR0 must mask val before clearing — high bits preserved"
+        );
     }
 
     // ----- ADC + PWM bus integration (Phase 3) --------------------------

@@ -21,6 +21,8 @@
 // without doing anything useful (the corresponding test never invokes it).
 
 use std::io::Write;
+
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 
 #[cfg(windows)]

@@ -636,9 +636,9 @@ impl ThreadedEmulator {
                 bl2.expect("pio2 Ok but block missing"),
             ]);
         } else {
-            // At least one PIO worker panicked — leave all three blocks
-            // (including any Ok returns) to drop at end-of-scope here, per
-            // HLD V5 §2.7.
+            // At least one PIO worker panicked — release all three blocks
+            // (including any Ok returns) per HLD V5 §2.7. PioBlock has no
+            // Drop impl and the locals drop naturally at scope exit.
             self.pio_blocks = None;
         }
         // Coordinator worker returns `((), PerWorkerTimings)`.

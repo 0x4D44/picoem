@@ -893,22 +893,22 @@ impl WorkerBus {
         match low {
             // NVIC_ISER0: write-1-to-SET the enable bit.
             0xE100 => {
-                n.enabled |= val;
+                n.enabled |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICER0: write-1-to-CLEAR the enable bit.
             0xE180 => {
-                n.enabled &= !val;
+                n.enabled &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_ISPR0: write-1-to-SET the pending bit.
             0xE200 => {
-                n.pending |= val;
+                n.pending |= val & crate::irq::IRQ_LINE_MASK;
                 true
             }
             // NVIC_ICPR0: write-1-to-CLEAR the pending bit.
             0xE280 => {
-                n.pending &= !val;
+                n.pending &= !(val & crate::irq::IRQ_LINE_MASK);
                 true
             }
             // NVIC_IPR0..7: 4×u8 priority bytes, masked to bits [7:6].
@@ -1824,5 +1824,463 @@ mod tests {
             "ICPR0 write must clear the pending bit"
         );
         assert_eq!(b0.read32(0xE000_E200), 0);
+    }
+
+    // --- Coverage fill-in tests ----------------------------------------------
+    //
+    // Targets the SIO/APB/AHB/XIP/PPB/legacy branches not exercised by the
+    // tests above. Each test exercises one logical branch / fallthrough and
+    // is self-contained against `fresh_worker`.
+
+    // --- SIO read paths -----------------------------------------------------
+
+    /// GPIO_IN merges OUT & OE; with no external override mask, the
+    /// merged view is `out & oe`.
+    #[test]
+    fn gpio_in_returns_out_and_oe_when_no_external_override() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0010, 0xF0); // GPIO_OUT
+        b0.write32(0xD000_0020, 0x33); // GPIO_OE
+        // GPIO_IN at 0x004 = out & oe = 0x30.
+        assert_eq!(b0.read32(0xD000_0004), 0x30);
+    }
+
+    /// GPIO_IN external-override branch: bits in `external_gpio_in_mask`
+    /// take their value from `external_gpio_in_override`, the rest from
+    /// the merged out & oe view.
+    #[test]
+    fn gpio_in_applies_external_override_mask() {
+        let (shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0010, 0xFFFF); // OUT
+        b0.write32(0xD000_0020, 0xFFFF); // OE — merged becomes 0xFFFF
+        // External override: force bits [3:0] to 0x5, leaving [15:4]
+        // alone.
+        shared
+            .external_gpio_in_mask
+            .store(0x000F, Ordering::Release);
+        shared
+            .external_gpio_in_override
+            .store(0x0005, Ordering::Release);
+        let v = b0.read32(0xD000_0004);
+        // Top nibble [15:4] = 0xFFF (from merged), low nibble = 0x5
+        // (from override) → 0xFFF5.
+        assert_eq!(v, 0xFFF5);
+    }
+
+    /// GPIO_OUT and its three alias offsets all read the same backing
+    /// register (alias bits affect writes only).
+    #[test]
+    fn gpio_out_alias_reads_return_same_value() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0010, 0x123);
+        let v = b0.read32(0xD000_0010);
+        assert_eq!(b0.read32(0xD000_0014), v);
+        assert_eq!(b0.read32(0xD000_0018), v);
+        assert_eq!(b0.read32(0xD000_001C), v);
+    }
+
+    /// GPIO_OE and its three alias offsets all read the same backing
+    /// register.
+    #[test]
+    fn gpio_oe_alias_reads_return_same_value() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0020, 0x456);
+        let v = b0.read32(0xD000_0020);
+        assert_eq!(b0.read32(0xD000_0024), v);
+        assert_eq!(b0.read32(0xD000_0028), v);
+        assert_eq!(b0.read32(0xD000_002C), v);
+    }
+
+    /// GPIO_OE write strips bits [31:30] (PIN_MASK).
+    #[test]
+    fn gpio_oe_write_strips_top_two_bits() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0020, 0xFFFF_FFFF);
+        assert_eq!(b0.read32(0xD000_0020), 0x3FFF_FFFF);
+    }
+
+    /// GPIO_OE SET / CLR / XOR alias writes round-trip just like the
+    /// GPIO_OUT aliases.
+    #[test]
+    fn gpio_oe_set_clr_xor_round_trip() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0020, 0x0F); // plain
+        b0.write32(0xD000_0024, 0x10); // SET
+        assert_eq!(b0.read32(0xD000_0020), 0x1F);
+        b0.write32(0xD000_0028, 0x01); // CLR
+        assert_eq!(b0.read32(0xD000_0020), 0x1E);
+        b0.write32(0xD000_002C, 0xFF); // XOR
+        assert_eq!(b0.read32(0xD000_0020), 0xE1);
+    }
+
+    /// SPINLOCK_ST at 0x05C reports the bitmap of currently-held locks.
+    #[test]
+    fn spinlock_st_reports_held_lock_bitmap() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Initially zero held.
+        assert_eq!(b0.read32(0xD000_005C), 0);
+        // Claim spinlock 3 and 7.
+        let _ = b0.read32(0xD000_0100 + 3 * 4);
+        let _ = b0.read32(0xD000_0100 + 7 * 4);
+        let bits = b0.read32(0xD000_005C);
+        assert_eq!(bits, (1 << 3) | (1 << 7));
+        // Release spinlock 3, only 7 remains.
+        b0.write32(0xD000_0100 + 3 * 4, 0);
+        assert_eq!(b0.read32(0xD000_005C), 1 << 7);
+    }
+
+    /// DIV_CSR at 0x078: bit 0 (READY) is always 1; bit 1 (DIRTY) tracks
+    /// whether results are unread/clean.
+    #[test]
+    fn div_csr_reports_ready_and_dirty_flags() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Fresh divider — not dirty, only READY set.
+        assert_eq!(b0.read32(0xD000_0078), 0x1);
+        // Trigger a divide: divisor write computes and sets dirty.
+        b0.write32(0xD000_0060, 10);
+        b0.write32(0xD000_0064, 3);
+        let csr = b0.read32(0xD000_0078);
+        assert_eq!(csr & 0x1, 0x1, "READY must remain 1");
+        assert_eq!(csr & 0x2, 0x2, "DIRTY must be set after compute");
+    }
+
+    /// DIV_UDIVIDEND/DIVISOR alias reads (0x068/0x06C signed pair) read
+    /// the same backing fields.
+    #[test]
+    fn divider_dividend_divisor_alias_reads() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0060, 50); // unsigned dividend
+        b0.write32(0xD000_0064, 6); // unsigned divisor
+        // 0x068 / 0x06C are aliases for the same dividend / divisor
+        // backing fields.
+        assert_eq!(b0.read32(0xD000_0068), 50);
+        assert_eq!(b0.read32(0xD000_006C), 6);
+    }
+
+    /// Divider unsigned div-by-zero returns 0xFFFF_FFFF for quotient and
+    /// the dividend for remainder.
+    #[test]
+    fn divider_unsigned_div_by_zero() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0060, 12345); // UDIVIDEND
+        b0.write32(0xD000_0064, 0); // UDIVISOR — triggers div-by-zero
+        assert_eq!(b0.read32(0xD000_0070), 0xFFFF_FFFF);
+        assert_eq!(b0.read32(0xD000_0074), 12345);
+    }
+
+    /// Divider signed div-by-zero with a positive dividend: quotient is
+    /// (-1) per `compute()` semantics.
+    #[test]
+    fn divider_signed_div_by_zero_positive_dividend() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0068, 99); // SDIVIDEND positive
+        b0.write32(0xD000_006C, 0); // SDIVISOR
+        assert_eq!(b0.read32(0xD000_0070), (-1i32) as u32);
+        assert_eq!(b0.read32(0xD000_0074), 99);
+    }
+
+    /// Direct write to DIV_QUOTIENT/REMAINDER stores the value and sets
+    /// the DIRTY flag (without re-running compute).
+    #[test]
+    fn divider_write_quotient_remainder_marks_dirty() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0070, 0xCAFE);
+        b0.write32(0xD000_0074, 0xBABE);
+        assert_eq!(b0.read32(0xD000_0070), 0xCAFE);
+        assert_eq!(b0.read32(0xD000_0074), 0xBABE);
+        assert_eq!(b0.read32(0xD000_0078) & 0x2, 0x2);
+    }
+
+    /// SIO unmapped offset reads return zero (the wildcard arm).
+    #[test]
+    fn sio_unmapped_offset_reads_zero() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // 0xD000_0FF0 is past the documented SIO offsets.
+        assert_eq!(b0.read32(0xD000_0FF0), 0);
+        // Same for an unmapped write — must not panic and silently
+        // discards the value.
+        b0.write32(0xD000_0FF0, 0xDEAD_BEEF);
+        assert_eq!(b0.read32(0xD000_0FF0), 0);
+    }
+
+    /// FIFO push from core 1 to core 0 latches SIO_PROC0_IRQ (15).
+    #[test]
+    fn fifo_push_from_core1_raises_core0_irq_pending() {
+        let shared = Arc::new(SharedState::new_default());
+        let mut b1 = WorkerBus::new(shared.clone(), 1);
+        b1.write32(0xD000_0054, 0x42);
+        let bits = shared.atomics.irq_pending_load(0);
+        assert_ne!(bits & (1 << 15), 0, "SIO_PROC0_IRQ must be latched");
+    }
+
+    /// Core 1 reads its RX FIFO (the 0_to_1 queue) — covers the
+    /// `core_id == 1` arm of the FIFO_RD selector.
+    #[test]
+    fn fifo_rd_on_core1_drains_core0_to_1_queue() {
+        let shared = Arc::new(SharedState::new_default());
+        let mut b0 = WorkerBus::new(shared.clone(), 0);
+        let mut b1 = WorkerBus::new(shared.clone(), 1);
+        b0.write32(0xD000_0054, 0xC0FF_EE);
+        // Core 1 pop drains the 0→1 queue.
+        assert_eq!(b1.read32(0xD000_0058), 0xC0FF_EE);
+    }
+
+    // --- APB peripheral fall-throughs --------------------------------------
+
+    /// SYSINFO at 0x4000_0000 reads CHIP_ID and PLATFORM, and writes are
+    /// silently dropped (read-only).
+    #[test]
+    fn sysinfo_read_returns_chip_id_and_platform() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Release SYSINFO (bit 0) so the dispatch reaches sysinfo_read.
+        b0.write32(0x4000_C000 + 0x3000, 0x1);
+        assert_eq!(b0.read32(0x4000_0000), 0x0000_0001); // CHIP_ID
+        assert_eq!(b0.read32(0x4000_0004), 0x0000_0000); // PLATFORM
+        assert_eq!(b0.read32(0x4000_0010), 0); // unmapped offset
+        // Writes are read-only no-ops — must not raise a fault.
+        b0.write32(0x4000_0000, 0xDEAD_BEEF);
+        assert_eq!(b0.read32(0x4000_0000), 0x0000_0001);
+    }
+
+    /// Unmapped APB base falls through to the legacy HashMap; writes
+    /// land there and reads echo them back.
+    #[test]
+    fn apb_unmapped_base_uses_legacy_storage() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // 0x4007_0000 is unmapped (not SYSINFO/CLOCKS/RESETS/IO_BANK0/etc).
+        b0.write32(0x4007_0000, 0xDEAD_BEEF);
+        assert_eq!(b0.read32(0x4007_0000), 0xDEAD_BEEF);
+    }
+
+    /// `legacy_write` alias 1 is XOR with the existing value.
+    #[test]
+    fn apb_legacy_write_alias_xor() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Plain store first.
+        b0.write32(0x4007_0000, 0x0F0F_0F0F);
+        // alias=1 → XOR: addr base + 0x1000 selects XOR alias.
+        b0.write32(0x4007_0000 + 0x1000, 0xFFFF_FFFF);
+        assert_eq!(b0.read32(0x4007_0000), !0x0F0F_0F0F);
+    }
+
+    /// `legacy_write` alias 2 is OR (SET); alias 3 is AND-NOT (CLR).
+    #[test]
+    fn apb_legacy_write_alias_set_and_clr() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0x4007_0000, 0x0000_FFFF);
+        // SET (alias 2 → +0x2000): bits 16-19 turn on.
+        b0.write32(0x4007_0000 + 0x2000, 0x000F_0000);
+        assert_eq!(b0.read32(0x4007_0000), 0x000F_FFFF);
+        // CLR (alias 3 → +0x3000): clear bits 0-3.
+        b0.write32(0x4007_0000 + 0x3000, 0x0000_000F);
+        assert_eq!(b0.read32(0x4007_0000), 0x000F_FFF0);
+    }
+
+    /// PADS_BANK0 `BITCLR` (alias 3, +0x3000) clears the addressed bits;
+    /// `BITXOR` (alias 1, +0x1000) toggles them.
+    #[test]
+    fn pads_bank0_bitclr_and_bitxor_aliases() {
+        let (_shared, mut b0) = fresh_worker(0);
+        let base = 0x4001_C000 + 0x04; // GPIO0 pad
+        // Default PAD_RESET = 0x56; SET bit 0x80 first.
+        b0.write32(base + 0x2000, 0x80);
+        assert_eq!(b0.read32(base), 0x56 | 0x80);
+        // BITXOR toggles bit 0x80 back off, plus toggle bit 0x01.
+        b0.write32(base + 0x1000, 0x80 | 0x01);
+        assert_eq!(b0.read32(base), (0x56 ^ 0x01));
+        // BITCLR clears bit 0x40 from the remaining 0x57.
+        b0.write32(base + 0x3000, 0x40);
+        assert_eq!(b0.read32(base), 0x17);
+    }
+
+    // --- AHB / PIO / DMA fall-throughs --------------------------------------
+
+    /// PIO1 (block 1) write enqueues against the block-1 command queue,
+    /// not block 0.
+    #[test]
+    fn pio1_ctrl_write_enqueues_on_block_1() {
+        let (shared, mut b0) = fresh_worker(0);
+        // PIO1 base 0x5030_0000.
+        b0.write32(0x5030_0000, 0xA);
+        assert!(shared.pio.drain_commands(0).is_empty());
+        let drained = shared.pio.drain_commands(1);
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            drained[0],
+            PioCommand::WriteCtrl {
+                block: 1,
+                val: 0xA,
+                alias: 0,
+            }
+        ));
+    }
+
+    /// PIO1 CTRL read mirrors the block-1 sm_enabled atomic.
+    #[test]
+    fn pio1_ctrl_read_reflects_block1_snapshot() {
+        let (shared, mut b0) = fresh_worker(0);
+        shared.pio.publish_sm_enabled(1, 0xC);
+        assert_eq!(b0.read32(0x5030_0000), 0xC);
+        // block 0 stays at zero.
+        assert_eq!(b0.read32(0x5020_0000), 0);
+    }
+
+    /// PIO read at a non-CTRL offset returns the snapshot value the
+    /// coordinator has published.
+    #[test]
+    fn pio_snapshot_read_through_workerbus() {
+        let (shared, mut b0) = fresh_worker(0);
+        // Build a snapshot vector covering the offsets the coordinator
+        // publishes; the snapshot indexes by offset.
+        let mut words = vec![0u32; 0x140 / 4];
+        words[(0x010 >> 2) as usize] = 0xCAFE_BABE; // arbitrary FSTAT slot
+        shared.pio.publish_snapshot(0, &words);
+        assert_eq!(b0.read32(0x5020_0010), 0xCAFE_BABE);
+    }
+
+    /// AHB region without a PIO base (e.g. DMA at 0x5000_0000) falls
+    /// through to the legacy HashMap.
+    #[test]
+    fn ahb_dma_fallthrough_uses_legacy_storage() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // 0x5000_0000 is the DMA base — no typed routing on threaded
+        // path, so the legacy HashMap stores the value.
+        b0.write32(0x5000_0000, 0x1234_5678);
+        assert_eq!(b0.read32(0x5000_0000), 0x1234_5678);
+    }
+
+    // --- XIP region (0x1) ---------------------------------------------------
+
+    /// XIP_CTRL.CTRL (offset 0x00) reports EN=1 by default so bootrom
+    /// init loops terminate without firmware setup.
+    #[test]
+    fn xip_ctrl_ctrl_default_reads_one() {
+        let (_shared, mut b0) = fresh_worker(0);
+        assert_eq!(b0.read32(0x1400_0000), 1);
+    }
+
+    /// A firmware-written value to XIP_CTRL.CTRL overrides the synthesised
+    /// default (the legacy HashMap entry wins).
+    #[test]
+    fn xip_ctrl_ctrl_legacy_overrides_default() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0x1400_0000, 0x7);
+        assert_eq!(b0.read32(0x1400_0000), 0x7);
+    }
+
+    /// XIP_CTRL non-zero offset falls through to legacy HashMap.
+    #[test]
+    fn xip_ctrl_other_offset_uses_legacy() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Offset 0x04 is just legacy storage — defaults to 0.
+        assert_eq!(b0.read32(0x1400_0004), 0);
+        b0.write32(0x1400_0004, 0xDEAD);
+        assert_eq!(b0.read32(0x1400_0004), 0xDEAD);
+    }
+
+    /// SSI_SR (offset 0x28) is hard-coded to TFE|BF (0x05) so firmware
+    /// TX wait loops terminate.
+    #[test]
+    fn ssi_sr_synthesises_tfe_bf() {
+        let (_shared, mut b0) = fresh_worker(0);
+        assert_eq!(b0.read32(0x1800_0028), 0x05);
+    }
+
+    /// SSI non-special-case offset falls through to legacy storage.
+    #[test]
+    fn ssi_other_offset_uses_legacy() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0x1800_0010, 0xABCD); // SSI_TXFLR or similar
+        assert_eq!(b0.read32(0x1800_0010), 0xABCD);
+    }
+
+    /// XIP region base outside XIP_CTRL/SSI falls through to legacy
+    /// storage (e.g. raw XIP window 0x1000_0000 — RP2040 has no flash so
+    /// the threaded path stubs it via legacy HashMap).
+    #[test]
+    fn xip_window_fallthrough_uses_legacy() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0x1000_0000, 0x1111_2222);
+        assert_eq!(b0.read32(0x1000_0000), 0x1111_2222);
+    }
+
+    // --- PPB ---------------------------------------------------------------
+
+    /// PPB read for a non-NVIC, non-SysTick offset falls through to
+    /// `Ppb::read32`. SHCSR at 0xE000_ED24 is one such offset.
+    #[test]
+    fn ppb_non_nvic_offset_dispatches_to_ppb_module() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // VTOR at 0xE000_ED08 — write through bus, read back.
+        b0.write32(0xE000_ED08, 0x1000_0000);
+        assert_eq!(b0.read32(0xE000_ED08), 0x1000_0000);
+    }
+
+    /// SysTick MMIO at 0xE000_E014 (SYST_RVR) round-trips via the per-
+    /// worker SysTick storage. RVR is masked to bits[23:0].
+    #[test]
+    fn systick_rvr_round_trip_masks_to_24_bits() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xE000_E014, 0xFFFF_FFFF);
+        assert_eq!(b0.read32(0xE000_E014), 0x00FF_FFFF);
+    }
+
+    /// NVIC IPR0..7 round-trip writes and reads back the priority bytes,
+    /// each masked to PRIORITY_MASK (bits [7:6]).
+    #[test]
+    fn nvic_ipr_round_trip_masks_priority_bits() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Write a full 4-IRQ priority word with non-implemented bits.
+        // PRIORITY_MASK = 0xC0, so each lane gets `val & 0xC0`.
+        b0.write32(0xE000_E400, 0xC0_80_40_FF);
+        // Read back: each byte is masked.
+        let v = b0.read32(0xE000_E400);
+        assert_eq!(v & 0xFF, 0xFF & 0xC0); // lane 0: 0xFF → 0xC0
+        assert_eq!((v >> 8) & 0xFF, 0x40 & 0xC0); // lane 1: 0x40 → 0x40
+        assert_eq!((v >> 16) & 0xFF, 0x80 & 0xC0); // lane 2: 0x80 → 0x80
+        assert_eq!((v >> 24) & 0xFF, 0xC0 & 0xC0); // lane 3: 0xC0 → 0xC0
+    }
+
+    // --- Outer dispatch fall-throughs --------------------------------------
+
+    /// Top-region 0x6 / 0x7 / 0x8 / 0xF (etc) are unmapped — the outer
+    /// dispatch wildcard returns 0 for reads and silently drops writes.
+    #[test]
+    fn unmapped_top_region_reads_zero_and_writes_drop() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Region 0x6 is unmapped on RP2040.
+        assert_eq!(b0.read32(0x6000_0000), 0);
+        b0.write32(0x6000_0000, 0xDEAD_BEEF);
+        assert_eq!(b0.read32(0x6000_0000), 0);
+        // Region 0xF likewise.
+        assert_eq!(b0.read32(0xF000_0000), 0);
+        b0.write32(0xF000_0000, 0xCAFE);
+        assert_eq!(b0.read32(0xF000_0000), 0);
+    }
+
+    /// Narrow MMIO writes (write8 / write16) RMW through the word32
+    /// path — round-trip via the legacy fallback at 0x4007_0000.
+    #[test]
+    fn narrow_mmio_write_round_trips_through_word32_path() {
+        let (_shared, mut b0) = fresh_worker(0);
+        // Seed the word.
+        b0.write32(0x4007_0000, 0x1122_3344);
+        // Narrow byte write to lane 1 (addr+1).
+        b0.write8(0x4007_0001, 0xAA);
+        assert_eq!(b0.read32(0x4007_0000), 0x1122_AA44);
+        // Narrow halfword write to high half (addr+2).
+        b0.write16(0x4007_0002, 0xBEEF);
+        assert_eq!(b0.read32(0x4007_0000), 0xBEEF_AA44);
+        // Narrow reads pick out the lanes.
+        assert_eq!(b0.read8(0x4007_0001), 0xAA);
+        assert_eq!(b0.read16(0x4007_0002), 0xBEEF);
+    }
+
+    /// GPIO_OUT plain write strips bits [31:30] (PIN_MASK).
+    #[test]
+    fn gpio_out_write_strips_top_two_bits() {
+        let (_shared, mut b0) = fresh_worker(0);
+        b0.write32(0xD000_0010, 0xFFFF_FFFF);
+        assert_eq!(b0.read32(0xD000_0010), 0x3FFF_FFFF);
     }
 }

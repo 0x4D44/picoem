@@ -123,6 +123,7 @@ impl Ppb {
     /// * `VTOR`     at `0xE000_ED08`.
     /// * `AIRCR`    at `0xE000_ED0C` — stub (VECTKEY echoes 0x05FA).
     /// * `SHPR2/3`  at `0xE000_ED1C/20` (SHPR1 is RAZ on M0+).
+    ///
     /// Other offsets read-as-zero.
     ///
     /// Addresses are decoded by `addr & 0xFFFF`, matching mdrp2350's

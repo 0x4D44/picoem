@@ -3,11 +3,13 @@
 //
 // Thin CLI wrapper around `isr_scenarios_rp2040::run_against`. Each
 // scenario uploads a hand-assembled SRAM image (17-entry vector
-// table + TIMER/PendSV/SysTick handler + main routine + literal
-// pool) at `ISR_IMAGE_BASE`, reprograms VTOR to point there, runs
-// main which pends the relevant exception (TIMER_IRQ_0 via NVIC, or
-// PendSV+SysTick for the tail-chain scenario), and diffs the
-// resulting SRAM counters + peripheral-pending observables.
+// table + handler stubs + main routine + literal pool) at
+// `ISR_IMAGE_BASE`, reprograms VTOR to point there, runs main which
+// pends the relevant exception(s), and diffs the resulting SRAM
+// counters + peripheral-pending observables. Ships the V1 minimum
+// (timer_cold + tail_chain) plus the V2 expansion
+// (nvic_high_bits_razwi, masked_pending_unmask, wfi_wake,
+// priority_preempt). All six scenarios are silicon-validated.
 //
 // Usage:
 //   silicon_isr_diff_rp2040
@@ -15,21 +17,7 @@
 //   silicon_isr_diff_rp2040 --verbose
 //
 // Hardware prerequisite: Pico debug probe attached to an RP2040
-// board. The RP2040 oracle family is otherwise stub (see
-// `probe_diff_rp2040`); this binary ships ahead of silicon hookup so
-// the Phase-1 exit criterion has a concrete oracle to point at.
-//
-// Expected EMU behaviour. V5 IRQ plumbing is complete (NVIC MMIO +
-// SysTick + unified exception dispatcher) per HLD V7 §5.2 / §5.3
-// (`wrk_docs/2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md`):
-// `Bus::irq_pending` (`crates/mdrp2040/src/bus/mod.rs:395`) drains into
-// both cores' NVICs, NVIC ISER / ISPR / ICPR / IPR are modelled at
-// `0xE000_E100..0xE000_E41F`, and `CortexM0Plus::try_take_any_pending_
-// exception` (`crates/mdrp2040/src/core/mod.rs:330-375`) dispatches
-// PendSV / SysTick / external IRQs every `step()` through
-// `enter_exception` (`crates/mdrp2040/src/core/exceptions.rs`). EMU-
-// side scenarios should pass; remaining FAILs surface real divergences
-// rather than missing plumbing.
+// board.
 
 use mdpicoem_harness::isr_scenarios_rp2040::{self, IsrArgs};
 use mdpicoem_harness::silicon_oracle::Verdict;

@@ -83,9 +83,11 @@ pub fn is_m0plus_silicon_safe(tc: &TestCase) -> bool {
         return false;
     }
 
-    // M33-only xPSR flag families.
+    // M33-only xPSR flag families. Admitted: no-flags, NZ-only,
+    // NZCV-only (architectural ARMv6-M APSR width — the mask used by
+    // `fuzz_m0plus_msr` for MSR APSR sysm=0 cases), and full NZCVQ.
     let m = tc.xpsr_mask;
-    if m != 0 && m != MASK_ALL_FLAGS && m != MASK_NZ_ONLY {
+    if m != 0 && m != MASK_ALL_FLAGS && m != MASK_NZ_ONLY && m != crate::MASK_NZCV_ONLY {
         return false;
     }
 
@@ -683,6 +685,22 @@ mod tests {
     #[test]
     fn rc_for_exactly_at_threshold() {
         assert_eq!(rc_for(75, 0, 25, 0), 3);
+    }
+
+    /// Stage E.2 regression: `MASK_NZCV_ONLY` (0xF000_0000) is the
+    /// architectural ARMv6-M APSR width and the mask used by
+    /// `fuzz_m0plus_msr` for MSR APSR (sysm=0) cases. Pre-fix the filter
+    /// rejected it as a "non-standard xPSR flag family", silently
+    /// dropping every APSR-write fuzz case.
+    #[test]
+    fn filter_admits_mask_nzcv_only() {
+        // ANDS r1, r0 — Thumb-16 ALU, satisfies all non-mask gates.
+        let case = TestCase {
+            opcode: 0x4001,
+            xpsr_mask: crate::MASK_NZCV_ONLY,
+            ..TestCase::default()
+        };
+        assert!(is_m0plus_silicon_safe(&case));
     }
 
     #[test]

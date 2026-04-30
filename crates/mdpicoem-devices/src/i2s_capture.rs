@@ -462,6 +462,7 @@ mod tests {
     ///   - bit 16 under LRCLK=0 (LSB of RIGHT — LRCLK falling)
     ///   - bits 15..1 under LRCLK=0 (top 15 bits of LEFT)
     ///   - bit 0 under LRCLK=1 (LSB of LEFT — LRCLK rising)
+    ///
     /// 32 BCLK rising edges per frame, so `cycle` advances by 64.
     fn clock_philips_frame(cap: &mut I2sCapture, cycle: &mut u64, left: u16, right: u16) {
         // 15 bits of RIGHT (bit 15 down to bit 1) with LRCLK=1.
@@ -905,5 +906,173 @@ mod tests {
         let bytes = fs::read(&tmp).expect("read");
         assert_eq!(bytes.len(), WAV_HEADER_BYTES);
         let _ = fs::remove_file(&tmp);
+    }
+
+    // ---- Additional branch-coverage tests ----------------------------------
+
+    /// Covers `duration_secs` with `inferred_sample_rate_hz` returning
+    /// `Some(positive)` and `frames > 0` — the success path that
+    /// computes a non-zero duration from real captured data. Existing
+    /// tests only exercise the `None` and zero-fallback branches.
+    #[test]
+    fn duration_secs_uses_inferred_rate_when_available() {
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
+        let mut cycle: u64 = 0;
+        // Capture three real frames so `frames.len() > 0` and LRCLK
+        // edge timing yields a positive inferred rate.
+        clock_philips_frame(&mut cap, &mut cycle, 0x0001, 0x0002);
+        clock_philips_frame(&mut cap, &mut cycle, 0x0003, 0x0004);
+        clock_philips_frame(&mut cap, &mut cycle, 0x0005, 0x0006);
+
+        let inferred = cap
+            .inferred_sample_rate_hz()
+            .expect("at least 2 LRCLK edges expected");
+        assert!(inferred > 0.0, "inferred rate must be positive");
+        let frames = cap.frames().len() as f64;
+        let expected = frames / inferred;
+        // `fallback_rate` here is a sentinel that must NOT be used.
+        let dur = cap.duration_secs(0);
+        assert!(
+            (dur - expected).abs() < 1e-9,
+            "duration {dur} should match {expected} (frames/inferred)",
+        );
+        assert!(dur > 0.0, "duration must be positive when frames > 0");
+    }
+
+    /// Sample-rate inference at a very low BCLK / LRCLK rate. Drives a
+    /// long half-period (10_000 cycles) to exercise the divisor path
+    /// in `inferred_sample_rate_hz` away from the steady-state PicoGUS
+    /// numbers. Targets the boundary at the low end of representable
+    /// rates without overflowing the f64 product.
+    #[test]
+    fn very_low_bclk_inferred_rate_within_tolerance() {
+        let sys_clk = 125_000_000u32;
+        let mut cap = I2sCapture::new(sys_clk, BCLK, LRCLK, DOUT);
+        // 10_000 cycles per half-period -> 6.25 kHz at 125 MHz sysclk.
+        let half_period: u64 = 10_000;
+        let mut lrclk = false;
+        let mut cycle: u64 = 0;
+        for _frame in 0..8 {
+            for _ in 0..half_period {
+                cap.tick(pads(false, lrclk, false), cycle);
+                cycle += 1;
+            }
+            lrclk = !lrclk;
+        }
+        let target = sys_clk as f64 / (2.0 * half_period as f64);
+        let inferred = cap.inferred_sample_rate_hz().expect("rate");
+        let rel = (inferred - target).abs() / target;
+        assert!(
+            rel < 0.05,
+            "very-low-BCLK: inferred {inferred:.3} Hz vs target {target:.3} Hz (rel {rel:.3})",
+        );
+    }
+
+    /// Sample-rate inference at a very high BCLK / LRCLK rate. Drives a
+    /// 1-cycle half-period (the smallest non-degenerate value that
+    /// keeps `last > first`). Exercises the high-rate end of the
+    /// computation.
+    #[test]
+    fn very_high_bclk_inferred_rate_within_tolerance() {
+        let sys_clk = 125_000_000u32;
+        let mut cap = I2sCapture::new(sys_clk, BCLK, LRCLK, DOUT);
+        // 1 cycle per half-period -> sys_clk/2 = 62.5 MHz "sample rate"
+        // (nonsensical for real I2S but valid for the inference math).
+        let half_period: u64 = 1;
+        let mut lrclk = false;
+        let mut cycle: u64 = 0;
+        for _ in 0..200 {
+            for _ in 0..half_period {
+                cap.tick(pads(false, lrclk, false), cycle);
+                cycle += 1;
+            }
+            lrclk = !lrclk;
+        }
+        let target = sys_clk as f64 / (2.0 * half_period as f64);
+        let inferred = cap.inferred_sample_rate_hz().expect("rate");
+        let rel = (inferred - target).abs() / target;
+        assert!(
+            rel < 0.05,
+            "very-high-BCLK: inferred {inferred:.3} Hz vs target {target:.3} Hz (rel {rel:.3})",
+        );
+    }
+
+    /// Mono-style transmitter that only sends LEFT samples (LRCLK
+    /// stuck-low never raises). Confirms the decoder produces zero
+    /// stereo frames — there is no "mono->stereo duplication" API, so
+    /// we assert the documented behaviour: half-frames stay parked in
+    /// `pending_left` and never emit. Covers the
+    /// `pending_right.is_none()` branch in the Channel::Left arm of
+    /// `on_bclk_rising` (stash path) without a subsequent pair-up.
+    #[test]
+    fn mono_left_only_stream_produces_no_frames() {
+        let mut cap = I2sCapture::new(125_000_000, BCLK, LRCLK, DOUT);
+        let mut cycle: u64 = 0;
+        // Drive 16-bit windows under LRCLK=0 only. Without an LRCLK
+        // rising edge, no Channel::Right commit ever runs. Need an
+        // initial LRCLK=1 priming edge to set finalizing logic, then
+        // settle to LRCLK=0 for many windows.
+        // First half-frame: LRCLK=1 (priming), no DOUT.
+        for _ in 0..15 {
+            cap.tick(pads(false, true, false), cycle);
+            cycle += 1;
+            cap.tick(pads(true, true, false), cycle);
+            cycle += 1;
+        }
+        // LRCLK falls to 0 — bit_count=15, finalizing transitions.
+        cap.tick(pads(false, false, false), cycle);
+        cycle += 1;
+        cap.tick(pads(true, false, false), cycle); // LSB of priming RIGHT
+        cycle += 1;
+        // Now stay LRCLK=0 forever and clock 100 bits — only 15 land,
+        // remainder hit the `bit_count >= 15` early return.
+        for _ in 0..100 {
+            cap.tick(pads(false, false, true), cycle);
+            cycle += 1;
+            cap.tick(pads(true, false, true), cycle);
+            cycle += 1;
+        }
+        // No LRCLK rising edge -> no Right commit -> frames stays
+        // empty even though pending_right got populated by the priming
+        // commit and a Left half-frame may be parked.
+        assert_eq!(
+            cap.frames().len(),
+            0,
+            "mono-left-only stream must not emit stereo frames",
+        );
+    }
+
+    /// Covers the `path.parent()` returning `None` branch of
+    /// `write_wav`. `Path::new("/")` yields `parent() == None`, but
+    /// it's a directory — gets rejected first. We instead use a
+    /// platform-neutral construct: a one-component relative path
+    /// (no slashes) under a chdir'd existing directory. That keeps
+    /// `parent()` as `Some("")` which is the empty-parent branch
+    /// already covered. The genuine `None` arm is reachable only on a
+    /// root path, which always fails the directory check, so the
+    /// `None` arm of the `if let Some(parent)` pattern is provably
+    /// unreachable for a successful write. Document that here as a
+    /// negative result and skip.
+    ///
+    /// This test instead pins down a non-existent multi-level parent
+    /// to drive the `!parent.exists()` true branch (currently covered
+    /// by `write_wav_creates_missing_parent_dirs`) plus the
+    /// `parent.exists()` short-circuit (the false branch of
+    /// `!parent.exists()`) by writing twice into the same parent.
+    #[test]
+    fn write_wav_existing_parent_skips_create_dir_all() {
+        let root = tmp_dir();
+        let dir = root.join("i2s_existing_parent");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("first.wav");
+        // First write: parent already exists from the create_dir_all
+        // above -> hits the `!parent.exists()` FALSE branch.
+        write_wav(&path, 22_050, &[(10, 20)]).expect("first write");
+        assert!(path.exists());
+        // Second write to a sibling: same parent, also exists.
+        let path2 = dir.join("second.wav");
+        write_wav(&path2, 22_050, &[(30, 40)]).expect("second write");
+        assert!(path2.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

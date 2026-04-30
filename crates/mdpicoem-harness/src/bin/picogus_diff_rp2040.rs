@@ -5051,6 +5051,7 @@ ns,port,value,kind
     ///   - A stray push with no pending (delta=1 mismatch, no pending).
     ///   - A catch-up (delta=2 match with pending).
     ///   - A post-roll orphan injected separately.
+    ///
     /// Total simulated pushes: 3 + 1 + 1 + 2 + 1 = 8.
     #[test]
     fn classifier_invariant_holds_across_mixed_sequence() {

@@ -11,10 +11,12 @@
 //   * GDB port: 3334 (3333 is in use by qemu_diff_m33).
 //   * Emulator: `mdrp2040::CortexM0Plus` + `mdrp2040::Bus`.
 //
-// Test-case filter: only Thumb-16 instructions that are valid on both
-// M0+ and M33 are fuzzed. M33-only encodings (IT blocks, CBZ/CBNZ,
-// Thumb-32 DP/ldm/stm/mul, FP) are filtered out. The fuzz generator
-// lives in `mdpicoem_harness::lib`; we just select the subset.
+// Test-case filter: Thumb-16 instructions plus the M0+ Thumb-32 subset
+// (`BL`, `MRS`, `MSR`, `DSB`, `DMB`, `ISB`) are exercised. M33-only
+// encodings (IT blocks, CBZ/CBNZ, M33-only Thumb-32 DP/ldm/stm/multiply,
+// FP, BASEPRI/FAULTMASK SYSm, banked `_NS` aliases) are filtered out.
+// The fuzz generator lives in `mdpicoem_harness::lib`; we just select
+// the subset. The doc-comment on `is_m0plus_safe` is authoritative.
 //
 // Usage (mirrors qemu_diff_m33):
 //   qemu_diff_m0plus                              Run targeted edge-case tests
@@ -29,7 +31,7 @@ use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile};
 use mdpicoem_harness::m0plus::{Bus as M0Bus, CortexM0Plus};
 use mdpicoem_harness::{
     CompareBases, EMU_M0PLUS_TEST_SCRATCH, EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK, FuzzClass,
-    MASK_ALL_FLAGS, MASK_NZ_ONLY, QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT,
+    MASK_ALL_FLAGS, MASK_NZ_ONLY, MASK_NZCV_ONLY, QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT,
     QEMU_M0PLUS_TEST_STACK, QEMU_M0PLUS_VECTOR_TABLE_BASE, REG_LR, REG_PC, REG_SP, REG_XPSR,
     RunState, SCRATCH_SIZE, TestCase, compare, generate_all, generate_fuzz_classes,
     select_fuzz_class, setup_reg,
@@ -123,6 +125,17 @@ fn parse_args() -> Result<Args, String> {
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = parse_args()?;
+
+    // Sanity gate (HLD §5.5): emit admit-count of the curated `generate_all`
+    // corpus through the relaxed filter before any QEMU work. If a future
+    // encoder change silently drops every Thumb-32 admit, `run_targeted`
+    // could still report all-passes; this line makes that loud.
+    let all = generate_all();
+    let admitted: Vec<&TestCase> = all.iter().filter(|tc| is_m0plus_safe(tc)).collect();
+    let total = admitted.len();
+    let t32 = admitted.iter().filter(|tc| tc.hw1.is_some()).count();
+    let t16 = total - t32;
+    println!("Test corpus: {total} total, {t16} Thumb-16, {t32} Thumb-32 (after filter).");
 
     let profile = QemuProfile::M0_PLUS_RP2040;
     eprintln!(
@@ -271,7 +284,12 @@ fn run_fuzz(
 
 /// Is this test case runnable on M0+ (under QEMU `cortex-m0`)?
 ///
-/// Excludes:
+/// Admits Thumb-16 instructions common to M0+ and M33 **plus** the M0+
+/// Thumb-32 subset: `BL`, `MRS`, `MSR`, `DSB`, `DMB`, `ISB`. All six are
+/// plain ARMv6-M and execute on QEMU `cortex-m0` even though QEMU has no
+/// `cortex-m0plus` model.
+///
+/// Rejects:
 ///   * FPU tests (M0+ has no FPU).
 ///   * Multi-step tests (`opcode2.is_some()` / `hw1_2.is_some()`) — these
 ///     are IT-block paired sequences which M0+ doesn't support.
@@ -280,14 +298,16 @@ fn run_fuzz(
 ///   * IT (`0xBFxx` with cond != 0 — but the whole range `0xBF00..=0xBFFF`
 ///     is safest to filter since NOP/YIELD/WFE/WFI/SEV share the prefix
 ///     and we don't need to fuzz hints).
-///   * Saturation / Q-flag / GE-flag tests — these mask specific xPSR
-///     bits M0+ doesn't implement. Detect via `xpsr_mask != MASK_ALL_FLAGS`
-///     and `xpsr_mask != 0` — keep only the common-case flag masks.
+///   * Non-standard xPSR masks (Q-flag-only / GE-flag families) — M0+
+///     doesn't implement those flags. Admitted: no-flags, NZ-only,
+///     NZCV-only (the architectural ARMv6-M APSR width, used by MSR APSR
+///     fuzz cases), and the full NZCVQ legacy mask.
 ///   * Thumb-32 encodings outside the M0+ subset (BL, MRS, MSR, DSB, DMB,
 ///     ISB). The admit logic — including the MSR/MRS SYSm reject set —
 ///     is shared with `probe_diff_rp2040` via
 ///     [`mdpicoem_harness::m0plus_admits_wide`].
 fn is_m0plus_safe(tc: &TestCase) -> bool {
+    // FPU tests: M0+ has no FPU.
     if !tc.fpu_pre.is_empty() || !tc.fpu_check.is_empty() || tc.fpscr_mask != 0 {
         return false;
     }
@@ -295,19 +315,25 @@ fn is_m0plus_safe(tc: &TestCase) -> bool {
     if tc.opcode2.is_some() || tc.hw1_2.is_some() {
         return false;
     }
-    // 0xBFxx: IT + hints.
+
+    // Raw IT / hint prefix (0xBFxx): IT itself is M33-only; NOP / YIELD /
+    // WFE / WFI / SEV are architecturally supported on M0+ but we don't
+    // need to fuzz hints, so filter the whole range.
     if (tc.opcode & 0xFF00) == 0xBF00 {
         return false;
     }
-    // 0xB1xx/0xB3xx/0xB9xx/0xBBxx: CBZ/CBNZ.
+
+    // CBZ / CBNZ (0xB1xx / 0xB3xx / 0xB9xx / 0xBBxx).
     if matches!(tc.opcode & 0xF500, 0xB100) {
         return false;
     }
-    // Non-standard xPSR masks (Q / GE flags) imply M33-only instructions.
-    // MASK_NO_FLAGS (0), MASK_ALL_FLAGS (NZCV+Q), and MASK_NZ_ONLY are safe.
-    // Anything else (MASK_Q_ONLY, MASK_ALL_FLAGS_GE) is filtered.
+
+    // M33-only xPSR flag families (Q-flag alone, GE flags). M0+ accepts
+    // no-flags, NZ-only, NZCV-only (the architectural ARMv6-M APSR width,
+    // used by MSR APSR fuzz cases — Q is ARMv7-M-only), and full NZCVQ
+    // (legacy width, M0+ just leaves Q clear).
     let m = tc.xpsr_mask;
-    if m != 0 && m != MASK_ALL_FLAGS && m != MASK_NZ_ONLY {
+    if m != 0 && m != MASK_ALL_FLAGS && m != MASK_NZ_ONLY && m != MASK_NZCV_ONLY {
         return false;
     }
     // Thumb-32 admit gate — shared with `probe_diff_rp2040`.
@@ -341,15 +367,13 @@ fn setup_vector_table(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Err
 
 /// Execute the test on QEMU and read back post-state.
 fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState> {
-    // Write instruction (16 or 32 bits) + BKPT sentinel.
-    gdb.write_mem(QEMU_M0PLUS_TEST_SLOT, &tc.opcode.to_le_bytes())?;
-    let bkpt_addr = if let Some(hw1) = tc.hw1 {
-        gdb.write_mem(QEMU_M0PLUS_TEST_SLOT + 2, &hw1.to_le_bytes())?;
-        QEMU_M0PLUS_TEST_SLOT + 4
-    } else {
-        QEMU_M0PLUS_TEST_SLOT + 2
-    };
-    gdb.write_mem(bkpt_addr, &BKPT_BYTES)?;
+    // Write instruction (16 or 32 bits) + BKPT sentinel as one image.
+    let mut code = tc.opcode.to_le_bytes().to_vec();
+    if let Some(hw1) = tc.hw1 {
+        code.extend_from_slice(&hw1.to_le_bytes());
+    }
+    code.extend_from_slice(&BKPT_BYTES);
+    gdb.write_mem(QEMU_M0PLUS_TEST_SLOT, &code)?;
 
     // Register defaults.
     for i in 0..=12u8 {
@@ -437,11 +461,9 @@ fn run_emu_side(tc: &TestCase, bus: &mut M0Bus) -> RunState {
 
     // Execute. Wide (Thumb-32) encodings dispatch through
     // `execute_one_wide_with_bus`; 16-bit Thumb encodings use the
-    // standard path. The wide path always uses the bus (for ISB cache
-    // invalidation), so we don't gate on `needs_bus` for it.
-    // BL/MRS/MSR/DSB/DMB also touch bus state on M0+ (PRIMASK transitions,
-    // instruction-cache invalidation), so the wide path is always
-    // bus-routed.
+    // standard path. The wide path always uses the bus because
+    // BL/MRS/MSR/DSB/DMB touch bus state on M0+ (PRIMASK transitions,
+    // instruction-cache invalidation), so we don't gate on `needs_bus`.
     let _cycles = if let Some(hw1) = tc.hw1 {
         core.execute_one_wide_with_bus(tc.opcode, hw1, bus)
     } else if tc.needs_bus {
@@ -562,6 +584,14 @@ mod tests {
         };
         assert!(!is_m0plus_safe(&tbb), "TBB must reject");
 
+        // LDRD literal — M33-only Thumb-32 encoding.
+        let ldrd = TestCase {
+            opcode: 0xE95F,
+            hw1: Some(0x0100),
+            ..TestCase::default()
+        };
+        assert!(!is_m0plus_safe(&ldrd), "LDRD literal must reject");
+
         // FPU — VMOV.F32 (M33-only encoding).
         let vmov = TestCase {
             opcode: 0xEEB0,
@@ -617,6 +647,28 @@ mod tests {
             ..TestCase::default()
         };
         assert!(is_m0plus_safe(&movs), "MOVS must admit");
+
+        // ADDS R0, R1, R2 — 0x1888.
+        let adds = TestCase {
+            opcode: 0x1888,
+            ..TestCase::default()
+        };
+        assert!(is_m0plus_safe(&adds), "ADDS must admit");
+    }
+
+    /// Stage E.2 regression: `MASK_NZCV_ONLY` (0xF000_0000) is the architectural
+    /// ARMv6-M APSR width and is the mask used by `fuzz_m0plus_msr` for MSR
+    /// APSR (sysm=0) cases. Pre-fix the filter rejected it as a "non-standard
+    /// xPSR flag family", silently dropping every APSR-write fuzz case.
+    #[test]
+    fn filter_admits_mask_nzcv_only() {
+        // ANDS r1, r0 — Thumb-16 ALU, satisfies all non-mask gates.
+        let case = TestCase {
+            opcode: 0x4001,
+            xpsr_mask: MASK_NZCV_ONLY,
+            ..TestCase::default()
+        };
+        assert!(is_m0plus_safe(&case));
     }
 
     #[test]

@@ -10,8 +10,6 @@
 //! Grouped by HLD section with `// §6.x` comments. No production code
 //! is modified by Stage 1 — tests only.
 
-#![cfg(test)]
-
 use crate::bus::Bus;
 use crate::dma::DMA_BASE;
 use crate::peripherals::adc::ADC_BASE;

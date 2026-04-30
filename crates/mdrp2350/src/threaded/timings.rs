@@ -5,11 +5,10 @@
 //! two nanosecond timestamps per quantum:
 //!
 //!   - `phase_work_ns`  — wall time doing the worker's actual phase
-//!                        work (CPU step / PIO step / coord tick), i.e.
-//!                        from the previous `barrier.wait()` return to
-//!                        the next `barrier.wait()` entry.
+//!     work (CPU step / PIO step / coord tick), i.e. from the previous
+//!     `barrier.wait()` return to the next `barrier.wait()` entry.
 //!   - `barrier_wait_ns` — wall time blocked in `barrier.wait()`, i.e.
-//!                         from wait entry to wait return.
+//!     from wait entry to wait return.
 //!
 //! Interpretation: the highest `phase_work_ns` each quantum is the
 //! bottleneck worker; a worker with high `barrier_wait_ns` finished

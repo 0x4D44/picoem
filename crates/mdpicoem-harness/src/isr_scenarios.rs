@@ -1652,7 +1652,7 @@ const OBS_EXT_IRQ_PRIORITY_PREEMPT: &[(&str, IsrObservable)] = &[
 ///   5. `isr_ext_irq_timer0_cold` — cold TIMER0_IRQ_0 assert + entry.
 ///   6. `isr_ext_irq_masked_pending` — pend-before-unmask delivery.
 ///   7. `isr_ext_irq_priority_preempt` — high-priority IRQ preempts
-///       low-priority handler mid-execution.
+///      low-priority handler mid-execution.
 ///
 /// All names keep the `isr_` prefix for orchestrator substring-
 /// uniqueness; the `_ext_irq_` mid-segment distinguishes them from the
@@ -2146,8 +2146,8 @@ fn run_one_scenario(
 /// Cleanup failures are logged to stderr but do not alter the return.
 ///
 /// Preconditions: `core` is live (auto-attached). The function halts
-/// + enables CYCCNT on entry; individual scenarios reset CYCCNT
-/// themselves via the main routine.
+/// the core and enables CYCCNT on entry; individual scenarios reset
+/// CYCCNT themselves via the main routine.
 ///
 /// Case selection:
 /// * `order = None` — run every scenario whose name matches

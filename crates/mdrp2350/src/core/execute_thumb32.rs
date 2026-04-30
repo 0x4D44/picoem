@@ -337,7 +337,7 @@ impl CortexM33 {
                 let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
                 let widthm1 = (hw1 & 0x1F) as u32;
                 let width = widthm1 + 1;
-                let val = (self.regs.r[rn] >> lsb) & ((1u32 << width) - 1);
+                let val = (self.regs.r[rn] >> lsb) & (((1u64 << width) - 1) as u32);
                 self.regs.r[rd] = sign_extend(val, width);
                 1 // M33 measured: 1 cycle
             }
@@ -346,7 +346,7 @@ impl CortexM33 {
                 let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
                 let msb = (hw1 & 0x1F) as u32;
                 let width = msb - lsb + 1;
-                let mask = ((1u32 << width) - 1) << lsb;
+                let mask = (((1u64 << width) - 1) as u32) << lsb;
                 if rn == 15 {
                     // BFC: clear bits
                     self.regs.r[rd] &= !mask;
@@ -386,7 +386,7 @@ impl CortexM33 {
                 let lsb = (((hw1 >> 12) & 0x7) << 2 | ((hw1 >> 6) & 0x3)) as u32;
                 let widthm1 = (hw1 & 0x1F) as u32;
                 let width = widthm1 + 1;
-                self.regs.r[rd] = (self.regs.r[rn] >> lsb) & ((1u32 << width) - 1);
+                self.regs.r[rd] = (self.regs.r[rn] >> lsb) & (((1u64 << width) - 1) as u32);
                 1 // M33 measured: 1 cycle
             }
             // Undefined
