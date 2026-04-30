@@ -3,11 +3,13 @@
 //
 // Thin CLI wrapper around `isr_scenarios_rp2040::run_against`. Each
 // scenario uploads a hand-assembled SRAM image (17-entry vector
-// table + TIMER/PendSV/SysTick handler + main routine + literal
-// pool) at `ISR_IMAGE_BASE`, reprograms VTOR to point there, runs
-// main which pends the relevant exception (TIMER_IRQ_0 via NVIC, or
-// PendSV+SysTick for the tail-chain scenario), and diffs the
-// resulting SRAM counters + peripheral-pending observables.
+// table + handler stubs + main routine + literal pool) at
+// `ISR_IMAGE_BASE`, reprograms VTOR to point there, runs main which
+// pends the relevant exception(s), and diffs the resulting SRAM
+// counters + peripheral-pending observables. Ships the V1 minimum
+// (timer_cold + tail_chain) plus the V2 expansion
+// (nvic_high_bits_razwi, masked_pending_unmask, wfi_wake,
+// priority_preempt). All six scenarios are silicon-validated.
 //
 // Usage:
 //   silicon_isr_diff_rp2040
@@ -15,17 +17,7 @@
 //   silicon_isr_diff_rp2040 --verbose
 //
 // Hardware prerequisite: Pico debug probe attached to an RP2040
-// board. The RP2040 oracle family is otherwise stub (see
-// `probe_diff_rp2040`); this binary ships ahead of silicon hookup so
-// the Phase-1 exit criterion has a concrete oracle to point at.
-//
-// Expected EMU behaviour. The `mdrp2040` core's `step()` does not
-// poll ICSR.PENDSVSET / PENDSTSET between instructions, and the
-// NVIC ISER / ISPR / ICPR registers are unmodelled on `mdrp2040`. An
-// `str` to those addresses falls through harmlessly — no exception
-// dispatches on the EMU side. Both v1 scenarios are therefore
-// expected to FAIL on EMU until the Phase 1 IRQ plumbing lands (V7
-// §4.4, §6.1). The oracle is the surfacing tool for that gap.
+// board.
 
 use mdpicoem_harness::isr_scenarios_rp2040::{self, IsrArgs};
 use mdpicoem_harness::silicon_oracle::Verdict;

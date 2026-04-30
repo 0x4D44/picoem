@@ -820,7 +820,8 @@ impl Emulator {
     /// Both cores see every IRQ — RP2040 has a single NVIC per core
     /// but shared peripheral IRQ wires, so each line latches
     /// independently on both cores and firmware routes via
-    /// `NVIC_IPR` / `NVIC_ISER` (not modelled yet — tech_debt).
+    /// `NVIC_IPR` / `NVIC_ISER` (modelled in
+    /// `bus/mod.rs::nvic_mmio_write32` + `nvic_mmio_read32`).
     fn drain_pending_irqs_to_cores(&mut self) {
         if self.bus.irq_pending != 0 {
             let raised = std::mem::replace(&mut self.bus.irq_pending, 0);

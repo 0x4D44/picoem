@@ -15,17 +15,13 @@
 // imported from the M33 module — they name architectural registers
 // that are identical across M33 and M0+.
 //
-// **Expected EMU behaviour.** As of this write, the `mdrp2040` core's
-// `step()` does not poll ICSR.PENDSVSET / PENDSTSET between
-// instructions, and NVIC ISER/ISPR/ICPR registers are unmodelled — an
-// `str` to ICSR latches the bit (ppb.rs handles W1S/W1C correctly) but
-// no exception is dispatched. A write to NVIC_ISER / NVIC_ISPR falls
-// through harmlessly. Both scenarios therefore FAIL on the EMU side
-// until the Phase 1 IRQ plumbing (`Bus::irq_pending` +
-// `tick_peripherals` + pending-exception dispatch in `CortexM0Plus::
-// step`) lands. This is the same posture the RP2350 oracle takes
-// against `tech_debt.md` § "Exception entry/exit not differentially
-// validated"; the oracle is the surfacing tool.
+// **Status.** The Phase 1 IRQ plumbing (`Bus::irq_pending` +
+// `tick_peripherals` + pending-exception dispatch in
+// `CortexM0Plus::step`, plus NVIC ISER/ICER/ISPR/ICPR/IPR0..7 in
+// `bus/mod.rs::nvic_mmio_write32` + `nvic_mmio_read32`) has landed.
+// All six scenarios (V1 × 2 + V2 × 4) dispatch correctly on the EMU
+// side and have been validated against real RP2040 silicon under
+// `silicon_isr_diff_rp2040`.
 
 #[cfg(test)]
 use crate::ISR_MAILBOX_CYCCNT;
@@ -1730,10 +1726,9 @@ pub struct IsrScenario {
     pub image: &'static [u8],
     pub entry_offset: u32,
     pub init_regs: &'static [(IsrReg, u32)],
-    /// Wall-clock budget in milliseconds. Exception dispatch isn't
-    /// modelled yet on EMU, so this runs out on the EMU side — which
-    /// is the expected FAIL signal. Kept short so the oracle completes
-    /// quickly even with two FAIL scenarios.
+    /// Wall-clock budget in milliseconds for the EMU side. Dispatch is
+    /// modelled (see the module-level Status block); kept short so the
+    /// oracle completes quickly.
     pub max_millis: u32,
     pub observe: &'static [(&'static str, IsrObservable)],
 }
@@ -1745,8 +1740,8 @@ pub struct IsrScenario {
 const INIT_TIMER_COLD: &[(IsrReg, u32)] = &[(IsrReg::Vtor, ISR_IMAGE_BASE)];
 const OBS_TIMER_COLD: &[(&str, IsrObservable)] = &[
     // Primary load-bearing observable: the handler ran exactly once so
-    // the counter == 1. On silicon this should PASS; on EMU it FAILS
-    // because the core never dispatches the IRQ.
+    // the counter == 1. Dispatch path is silicon-validated; EMU and
+    // silicon both PASS.
     ("ctr_timer", IsrObservable::Memory(CTR_TIMER_ADDR)),
     // TIMER.INTR bit 0 clear after the W1C inside the handler.
     ("timer_intr", IsrObservable::Mmio(TIMER_INTR_ADDR, 0x1)),
