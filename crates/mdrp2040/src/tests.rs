@@ -4144,6 +4144,31 @@ mod m0plus_msr_mrs_fixes {
         assert_eq!(cpu.regs.r[0], 0xDEAD_BEEF);
     }
 
+    /// B6 cont. — Handler-mode corner: when IPSR != 0 the active SP is MSP
+    /// regardless of CONTROL.SPSEL (per ARMv6-M B1.4.4). MRS sysm=9 must
+    /// therefore return the banked `regs.psp`, not r[13]. This branch is
+    /// unreachable from the random fuzz stream (which never enters handler
+    /// mode) but is logically distinct from
+    /// `mrs_psp_returns_banked_psp_when_inactive` because there SPSEL was
+    /// the gating bit; here the handler-mode override is.
+    #[test]
+    fn mrs_psp_in_handler_returns_banked_psp() {
+        let mut cpu = CortexM0Plus::new();
+        // CONTROL.SPSEL = 1 would normally select PSP in thread mode...
+        cpu.regs.control = 0x2;
+        // ...but IPSR != 0 (here: external IRQ #2 → exception number 18)
+        // forces MSP active per `active_sp_is_psp`. Preserve T-bit while
+        // setting IPSR.
+        cpu.regs.xpsr = 0x0100_0000 | 18;
+        cpu.regs.psp = 0xCAFE_BAB0; // Banked PSP, word-aligned.
+        cpu.regs.r[13] = 0x2000_1000; // Active SP = MSP (handler mode).
+        // MRS r0, PSP — hw0 = 0xF3EF, hw1 = 0x8009.
+        cpu.execute_one_wide(0xF3EF, 0x8009);
+        assert_eq!(cpu.regs.r[0], 0xCAFE_BAB0);
+        // Sanity: handler-mode invariant held throughout — active SP stays MSP.
+        assert!(!cpu.regs.active_sp_is_psp());
+    }
+
     /// Brief-mandated test 4 — MSR sysm=8 (MSP) while SPSEL=1 (PSP active)
     /// must update the MSP bank only; r[13] stays on PSP. A subsequent
     /// MRS sysm=8 must observe the freshly-written value.

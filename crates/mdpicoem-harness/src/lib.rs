@@ -6049,6 +6049,16 @@ mod tests {
     }
 
     #[test]
+    fn mask_nzcv_only_covers_nzcv() {
+        // Bits 31:28 = N, Z, C, V. Bit 27 (Q) is ARMv7-M only — NOT included.
+        // This is the architectural ARMv6-M APSR width used by M0+ MSR APSR
+        // (sysm=0) fuzz cases.
+        assert_eq!(MASK_NZCV_ONLY, 0xF000_0000);
+        assert_eq!(MASK_NZCV_ONLY & MASK_ALL_FLAGS, 0xF000_0000);
+        assert_eq!(MASK_NZCV_ONLY & 0x0800_0000, 0); // Q bit excluded
+    }
+
+    #[test]
     fn mask_no_flags_is_zero() {
         assert_eq!(MASK_NO_FLAGS, 0);
     }

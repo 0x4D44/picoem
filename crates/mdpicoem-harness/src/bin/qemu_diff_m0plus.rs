@@ -31,7 +31,7 @@ use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile};
 use mdpicoem_harness::m0plus::{Bus as M0Bus, CortexM0Plus};
 use mdpicoem_harness::{
     CompareBases, EMU_M0PLUS_TEST_SCRATCH, EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK, FuzzClass,
-    MASK_ALL_FLAGS, MASK_NZ_ONLY, QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT,
+    MASK_ALL_FLAGS, MASK_NZ_ONLY, MASK_NZCV_ONLY, QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT,
     QEMU_M0PLUS_TEST_STACK, QEMU_M0PLUS_VECTOR_TABLE_BASE, REG_LR, REG_PC, REG_SP, REG_XPSR,
     RunState, SCRATCH_SIZE, TestCase, compare, generate_all, generate_fuzz_classes,
     select_fuzz_class, setup_reg,
@@ -295,8 +295,9 @@ fn run_fuzz(
 ///     implement IT. Also rejects raw IT opcodes (`0xBFxx` with cond).
 ///   * CBZ / CBNZ (`0xB1xx` / `0xB3xx` / `0xB9xx` / `0xBBxx`) — M33-only
 ///     conditional zero-compare branches.
-///   * Non-standard xPSR masks (Q-flag / GE-flag families) — M0+ doesn't
-///     implement those flags.
+///   * Non-standard xPSR masks (Q-flag-only / GE-flag families) — M0+
+///     doesn't implement those flags. Admitted: no-flags, NZ-only,
+///     NZCV-only, and the full NZCVQ legacy mask.
 ///   * MSR / MRS with sysm ∈ {17 (BASEPRI), 19 (FAULTMASK)} — M33-only
 ///     special registers. Also rejects any `sysm >= 0x80` banked `_NS`
 ///     aliases (TrustZone-only on M33; M0+ UNDEFs them).
@@ -333,10 +334,11 @@ fn is_m0plus_safe(tc: &TestCase) -> bool {
     }
 
     // M33-only xPSR flag families (Q-flag alone, GE flags). M0+ accepts
-    // no-flags, NZ-only, and full NZCV (plus Q in the mask, but M0+ just
-    // leaves Q clear).
+    // no-flags, NZ-only, NZCV-only (the architectural ARMv6-M APSR width,
+    // used by MSR APSR fuzz cases — Q is ARMv7-M-only), and full NZCVQ
+    // (legacy width, M0+ just leaves Q clear).
     let m = tc.xpsr_mask;
-    if m != 0 && m != MASK_ALL_FLAGS && m != MASK_NZ_ONLY {
+    if m != 0 && m != MASK_ALL_FLAGS && m != MASK_NZ_ONLY && m != MASK_NZCV_ONLY {
         return false;
     }
 
@@ -724,5 +726,20 @@ mod tests {
             ..TestCase::default()
         };
         assert!(is_m0plus_safe(&adds));
+    }
+
+    /// Stage E.2 regression: `MASK_NZCV_ONLY` (0xF000_0000) is the architectural
+    /// ARMv6-M APSR width and is the mask used by `fuzz_m0plus_msr` for MSR
+    /// APSR (sysm=0) cases. Pre-fix the filter rejected it as a "non-standard
+    /// xPSR flag family", silently dropping every APSR-write fuzz case.
+    #[test]
+    fn filter_admits_mask_nzcv_only() {
+        // ANDS r1, r0 — Thumb-16 ALU, satisfies all non-mask gates.
+        let case = TestCase {
+            opcode: 0x4001,
+            xpsr_mask: MASK_NZCV_ONLY,
+            ..TestCase::default()
+        };
+        assert!(is_m0plus_safe(&case));
     }
 }

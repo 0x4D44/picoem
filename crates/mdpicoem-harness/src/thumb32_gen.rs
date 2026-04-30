@@ -7938,6 +7938,17 @@ const M0PLUS_MSR_FUZZ_SYSM: [u16; 2] = [0, 16];
 /// MRS reads cleanly across all admitted SYSm values; MSR sysm 8/9/20 are
 /// skipped due to QEMU `cortex-m0` divergence (see Stage E.1 journal).
 fn fuzz_m0plus_msr(count: usize, rng: &mut StdRng) -> Vec<TestCase> {
+    // Invariant: every SYSm we fuzz here must also be admitted by the
+    // broader M0+ filter (`M0PLUS_SYSM_ADMIT`). If a future edit narrows the
+    // admit set without trimming the fuzz set, we'd silently dispatch cases
+    // that the filter then rejects on the way out — wasting the random
+    // budget. Cheap subset check keeps the two sets honest in lock-step.
+    debug_assert!(
+        M0PLUS_MSR_FUZZ_SYSM
+            .iter()
+            .all(|s| M0PLUS_SYSM_ADMIT.contains(s)),
+        "MSR fuzz SYSm must be subset of admitted SYSm"
+    );
     let mut t = Vec::with_capacity(count);
     for i in 0..count {
         let rn = rand_reg(rng); // R0..=R12
