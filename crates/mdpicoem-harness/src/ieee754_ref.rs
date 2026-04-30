@@ -395,6 +395,123 @@ pub fn ref_fma(a: f32, b: f32, c: f32, fpscr_in: u32) -> (f32, u32) {
     (result, flags)
 }
 
+/// Reference VSEL.F32 — pick `sn` if the condition `cc` holds against the
+/// APSR.NZCV flags; otherwise pick `sm`. Mirrors `vsel_condition_holds`
+/// in `execute_fpu.rs:667`.
+///
+/// `cc` encoding: 00=EQ, 01=VS, 10=GE, 11=GT (the only encodable VSEL
+/// conditions).
+pub fn ref_vsel(cc: u16, apsr_n: bool, apsr_z: bool, apsr_v: bool, sn: f32, sm: f32) -> f32 {
+    let take_sn = match cc & 0x3 {
+        0b00 => apsr_z,                  // EQ
+        0b01 => apsr_v,                  // VS
+        0b10 => apsr_n == apsr_v,        // GE
+        _ => !apsr_z && (apsr_n == apsr_v), // GT
+    };
+    if take_sn { sn } else { sm }
+}
+
+/// Reference VCVT.U32.F32 (round per FPSCR.RMode). Mirrors
+/// `f32_to_u32_rmode` in `execute_fpu.rs`. Result is the u32 reinterpreted
+/// as f32 bits — matching the emulator's `regs.s[sd] = f32::from_bits(result)`.
+/// No FPSCR flags raised (the emulator simplification — see V3.1 tech_debt
+/// note in journal: real silicon raises IXC/IOC for inexact / out-of-range,
+/// but this is a known mdrp2350 simplification).
+pub fn ref_vcvt_u32_rmode(val: f32, rmode: u32, _fpscr_in: u32) -> (f32, u32) {
+    let result: u32 = if val.is_nan() || val < 0.0 {
+        0
+    } else {
+        let rounded = match rmode {
+            0b00 => val.round_ties_even(),
+            0b01 => val.ceil(),
+            0b10 => val.floor(),
+            _ => {
+                // RTZ — fall through to the rtz path
+                if val >= u32::MAX as f32 {
+                    return (f32::from_bits(u32::MAX), 0);
+                }
+                return (f32::from_bits(val as u32), 0);
+            }
+        };
+        if rounded >= u32::MAX as f32 {
+            u32::MAX
+        } else if rounded < 0.0 {
+            0
+        } else {
+            rounded as u32
+        }
+    };
+    (f32::from_bits(result), 0)
+}
+
+/// Reference VCVT.U32.F32 with round-toward-zero. Mirrors `f32_to_u32_rtz`.
+pub fn ref_vcvt_u32_rtz(val: f32, _fpscr_in: u32) -> (f32, u32) {
+    let result: u32 = if val.is_nan() || val < 0.0 {
+        0
+    } else if val >= u32::MAX as f32 {
+        u32::MAX
+    } else {
+        val as u32
+    };
+    (f32::from_bits(result), 0)
+}
+
+/// Reference VCVT.S32.F32 (round per FPSCR.RMode). Mirrors `f32_to_i32_rmode`.
+pub fn ref_vcvt_s32_rmode(val: f32, rmode: u32, _fpscr_in: u32) -> (f32, u32) {
+    let result: i32 = if val.is_nan() {
+        0
+    } else {
+        let rounded = match rmode {
+            0b00 => val.round_ties_even(),
+            0b01 => val.ceil(),
+            0b10 => val.floor(),
+            _ => {
+                // RTZ
+                if val >= i32::MAX as f32 {
+                    return (f32::from_bits(i32::MAX as u32), 0);
+                }
+                if val <= i32::MIN as f32 {
+                    return (f32::from_bits(i32::MIN as u32), 0);
+                }
+                return (f32::from_bits(val as i32 as u32), 0);
+            }
+        };
+        if rounded >= i32::MAX as f32 {
+            i32::MAX
+        } else if rounded <= i32::MIN as f32 {
+            i32::MIN
+        } else {
+            rounded as i32
+        }
+    };
+    (f32::from_bits(result as u32), 0)
+}
+
+/// Reference VCVT.S32.F32 RTZ. Mirrors `f32_to_i32_rtz`.
+pub fn ref_vcvt_s32_rtz(val: f32, _fpscr_in: u32) -> (f32, u32) {
+    let result: i32 = if val.is_nan() {
+        0
+    } else if val >= i32::MAX as f32 {
+        i32::MAX
+    } else if val <= i32::MIN as f32 {
+        i32::MIN
+    } else {
+        val as i32
+    };
+    (f32::from_bits(result as u32), 0)
+}
+
+/// Reference VCVT.F32.U32 — uint→float (Sm bits interpreted as u32).
+pub fn ref_vcvt_f32_from_u32(val: f32, _fpscr_in: u32) -> (f32, u32) {
+    (val.to_bits() as f32, 0)
+}
+
+/// Reference VCVT.F32.S32 — int→float (Sm bits interpreted as i32).
+pub fn ref_vcvt_f32_from_s32(val: f32, _fpscr_in: u32) -> (f32, u32) {
+    let bits = val.to_bits() as i32;
+    (bits as f32, 0)
+}
+
 /// Reference VCMP.F32 (and VCMPE — the emulator treats both identically).
 ///
 /// Computes the FPSCR.NZCV nibble that VCMP writes via `fpu_vcmp` in

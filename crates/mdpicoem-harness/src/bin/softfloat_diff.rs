@@ -200,6 +200,46 @@ fn enc_vmaxnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
     (hw0, hw1)
 }
 
+/// VSEL<cc>.F32. cc encodes in hw0[6:5]: 00=EQ, 01=VS, 10=GE, 11=GT.
+/// hw0[7]=0 distinguishes from VMINNM/VMAXNM. hw1[8]=0, hw1[6]=0 (single,
+/// no op2 selector).
+fn enc_vsel(cc: u16, sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xFE00 | ((cc & 0x3) << 5) | (d << 4) | vn;
+    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// VCVT.F32.U32 — uint→float. (opc3=0b1000, t=0)
+fn enc_vcvt_f32_u32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1000, 0, sd, sm)
+}
+/// VCVT.F32.S32 — int→float. (opc3=0b1000, t=1)
+fn enc_vcvt_f32_s32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1000, 1, sd, sm)
+}
+/// VCVTR.U32.F32 — float→uint, RMode. (opc3=0b1100, t=0)
+fn enc_vcvtr_u32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1100, 0, sd, sm)
+}
+/// VCVT.U32.F32 — float→uint, RTZ. (opc3=0b1100, t=1)
+fn enc_vcvt_u32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1100, 1, sd, sm)
+}
+/// VCVTR.S32.F32 — float→int, RMode. (opc3=0b1101, t=0)
+fn enc_vcvtr_s32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1101, 0, sd, sm)
+}
+/// VCVT.S32.F32 — float→int, RTZ. (opc3=0b1101, t=1)
+fn enc_vcvt_s32_f32(sd: u16, sm: u16) -> (u16, u16) {
+    vfp_unary(0b1101, 1, sd, sm)
+}
+
 fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) {
     // (opc3=0b0100, t=0) — fpu_unary dispatch row 893.
     vfp_unary(0b0100, 0, sd, sm)
@@ -257,6 +297,26 @@ enum Op {
     Vmaxnm,
     Vcmp,
     Vcmpe,
+    /// VCVT.F32.U32 — uint→float.
+    VcvtFU,
+    /// VCVT.F32.S32 — int→float.
+    VcvtFS,
+    /// VCVTR.U32.F32 — float→uint, FPSCR.RMode.
+    VcvtUR,
+    /// VCVT.U32.F32 — float→uint, RTZ.
+    VcvtU,
+    /// VCVTR.S32.F32 — float→int, FPSCR.RMode.
+    VcvtSR,
+    /// VCVT.S32.F32 — float→int, RTZ.
+    VcvtS,
+    /// VSEL.F32 with cc=EQ.
+    VselEq,
+    /// VSEL.F32 with cc=VS.
+    VselVs,
+    /// VSEL.F32 with cc=GE.
+    VselGe,
+    /// VSEL.F32 with cc=GT.
+    VselGt,
 }
 
 impl Op {
@@ -277,14 +337,55 @@ impl Op {
             Op::Vmaxnm => "VMAXNM",
             Op::Vcmp => "VCMP",
             Op::Vcmpe => "VCMPE",
+            Op::VcvtFU => "VCVT.F32.U32",
+            Op::VcvtFS => "VCVT.F32.S32",
+            Op::VcvtUR => "VCVTR.U32.F32",
+            Op::VcvtU => "VCVT.U32.F32",
+            Op::VcvtSR => "VCVTR.S32.F32",
+            Op::VcvtS => "VCVT.S32.F32",
+            Op::VselEq => "VSEL.EQ",
+            Op::VselVs => "VSEL.VS",
+            Op::VselGe => "VSEL.GE",
+            Op::VselGt => "VSEL.GT",
         }
     }
 
     fn arity(self) -> usize {
         match self {
-            Op::Sqrt | Op::VRintR | Op::VRintX | Op::VRintZ | Op::Vabs | Op::Vneg => 1,
-            Op::Fma => 3, // a, b, and accumulator
+            Op::Sqrt
+            | Op::VRintR
+            | Op::VRintX
+            | Op::VRintZ
+            | Op::Vabs
+            | Op::Vneg
+            | Op::VcvtFU
+            | Op::VcvtFS
+            | Op::VcvtUR
+            | Op::VcvtU
+            | Op::VcvtSR
+            | Op::VcvtS => 1,
+            // FMA carries a third operand (accumulator).
+            // VSEL repurposes the third slot to carry APSR.NZCV bits — see
+            // `is_vsel` and the run_single setup.
+            Op::Fma | Op::VselEq | Op::VselVs | Op::VselGe | Op::VselGt => 3,
             _ => 2,
+        }
+    }
+
+    /// True if the op is a VSEL variant. The third slot of (a, b, c) is
+    /// repurposed to carry APSR.NZCV bits via `c.to_bits()`.
+    fn is_vsel(self) -> bool {
+        matches!(self, Op::VselEq | Op::VselVs | Op::VselGe | Op::VselGt)
+    }
+
+    /// VSEL `cc` field for the encoder (EQ=0, VS=1, GE=2, GT=3).
+    fn vsel_cc(self) -> u16 {
+        match self {
+            Op::VselEq => 0b00,
+            Op::VselVs => 0b01,
+            Op::VselGe => 0b10,
+            Op::VselGt => 0b11,
+            _ => panic!("vsel_cc on non-VSEL op {}", self.name()),
         }
     }
 
@@ -295,12 +396,31 @@ impl Op {
         matches!(self, Op::Vcmp | Op::Vcmpe)
     }
 
+    /// True if the op's f32 result must be compared bit-exact regardless
+    /// of whether the bits encode a NaN. Two cases:
+    /// - VCVT-to-int: the result encodes an integer; saturation values
+    ///   like `u32::MAX` happen to look like NaN bits, so the NaN-vs-NaN
+    ///   equivalence shortcut would mask saturation divergences.
+    /// - VSEL: the result is one of the input operands verbatim. A
+    ///   mutation in `vsel_condition_holds` could pick the wrong operand
+    ///   and still be classified "match" if both operands are NaN.
+    fn integer_result_bits(self) -> bool {
+        matches!(
+            self,
+            Op::VcvtUR | Op::VcvtU | Op::VcvtSR | Op::VcvtS
+                | Op::VselEq | Op::VselVs | Op::VselGe | Op::VselGt
+        )
+    }
+
     /// True if the op's behavior depends on FPSCR.RMode (so the runner sweeps
     /// all four rmodes). VRINTZ ignores RMode (always RZ); arithmetic ops
     /// produce identical results across rmodes for the operand classes the
     /// fuzz harness exercises (we don't probe rounding boundaries here).
     fn rmode_sensitive(self) -> bool {
-        matches!(self, Op::VRintR | Op::VRintX)
+        matches!(
+            self,
+            Op::VRintR | Op::VRintX | Op::VcvtUR | Op::VcvtSR
+        )
     }
 }
 
@@ -357,7 +477,12 @@ fn run_single(
     emu.regs.s[2] = a;
     emu.regs.s[4] = b;
     // For FMA, the accumulator is in Sd itself (pre-op).
+    // For VSEL, `c` carries APSR.NZCV bits (positions 31/30/29/28); the
+    // s[0] pre-load is harmless (VSEL writes Sd from the chosen operand).
     emu.regs.s[0] = c;
+    if op.is_vsel() {
+        emu.regs.xpsr = c.to_bits() & 0xF000_0000;
+    }
 
     let (hw0, hw1) = match op {
         Op::Add => enc_vadd(0, 2, 4),
@@ -374,6 +499,13 @@ fn run_single(
         Op::Vminnm => enc_vminnm(0, 2, 4),
         Op::Vmaxnm => enc_vmaxnm(0, 2, 4),
         Op::Vcmp | Op::Vcmpe => unreachable!("VCMP routed via run_vcmp_one"),
+        Op::VcvtFU => enc_vcvt_f32_u32(0, 2),
+        Op::VcvtFS => enc_vcvt_f32_s32(0, 2),
+        Op::VcvtUR => enc_vcvtr_u32_f32(0, 2),
+        Op::VcvtU => enc_vcvt_u32_f32(0, 2),
+        Op::VcvtSR => enc_vcvtr_s32_f32(0, 2),
+        Op::VcvtS => enc_vcvt_s32_f32(0, 2),
+        Op::VselEq | Op::VselVs | Op::VselGe | Op::VselGt => enc_vsel(op.vsel_cc(), 0, 2, 4),
     };
     emu.execute_one_wide(hw0, hw1);
     let emu_result = emu.regs.s[0];
@@ -398,13 +530,37 @@ fn run_single(
         Op::Vminnm => ieee754_ref::ref_vminnm(a, b, fpscr_mode),
         Op::Vmaxnm => ieee754_ref::ref_vmaxnm(a, b, fpscr_mode),
         Op::Vcmp | Op::Vcmpe => unreachable!("VCMP routed via run_vcmp_one"),
+        Op::VcvtFU => ieee754_ref::ref_vcvt_f32_from_u32(a, fpscr_mode),
+        Op::VcvtFS => ieee754_ref::ref_vcvt_f32_from_s32(a, fpscr_mode),
+        Op::VcvtUR => ieee754_ref::ref_vcvt_u32_rmode(a, rmode, fpscr_mode),
+        Op::VcvtU => ieee754_ref::ref_vcvt_u32_rtz(a, fpscr_mode),
+        Op::VcvtSR => ieee754_ref::ref_vcvt_s32_rmode(a, rmode, fpscr_mode),
+        Op::VcvtS => ieee754_ref::ref_vcvt_s32_rtz(a, fpscr_mode),
+        Op::VselEq | Op::VselVs | Op::VselGe | Op::VselGt => {
+            let apsr = c.to_bits();
+            let n_flag = (apsr & 0x8000_0000) != 0;
+            let z_flag = (apsr & 0x4000_0000) != 0;
+            let v_flag = (apsr & 0x1000_0000) != 0;
+            (
+                ieee754_ref::ref_vsel(op.vsel_cc(), n_flag, z_flag, v_flag, a, b),
+                0,
+            )
+        }
     };
 
     // Compare results. With DN=0, two NaN results match regardless of bits
     // (payload propagation is not contracted — HLD §A.3). With DN=1 both
     // sides are required to emit the canonical 0x7FC0_0000, so we keep
     // strict bit-equality in that case.
-    let results_match = if emu_result.is_nan() && ref_result.is_nan() {
+    //
+    // VCVT-to-int family bypass: their f32 result encodes an integer (the
+    // emulator stores `f32::from_bits(int_result)`), and integer bit
+    // patterns can incidentally land on NaN-encoded bits (e.g. u32::MAX =
+    // 0xFFFFFFFF is a NaN). We require strict bit-equality regardless of
+    // NaN-ness for those ops.
+    let results_match = if op.integer_result_bits() {
+        emu_result.to_bits() == ref_result.to_bits()
+    } else if emu_result.is_nan() && ref_result.is_nan() {
         if fpscr_mode & ieee754_ref::DN != 0 {
             emu_result.to_bits() == ref_result.to_bits()
         } else {
@@ -610,6 +766,16 @@ fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
         Op::Vmaxnm,
         Op::Vcmp,
         Op::Vcmpe,
+        Op::VcvtFU,
+        Op::VcvtFS,
+        Op::VcvtUR,
+        Op::VcvtU,
+        Op::VcvtSR,
+        Op::VcvtS,
+        Op::VselEq,
+        Op::VselVs,
+        Op::VselGe,
+        Op::VselGt,
     ];
 
     match fuzz_count {
@@ -1579,6 +1745,70 @@ fn edge_cases() -> Vec<(Op, f32, f32, f32)> {
     for &(a, b) in &cmp_inputs {
         v.push((Op::Vcmp, a, b, 0.0));
         v.push((Op::Vcmpe, a, b, 0.0));
+    }
+
+    // VCVT-to-int / VCVT-from-int — coverage: NaN, ±inf, ±zero, large
+    // magnitudes near the i32/u32 saturation boundaries, fractional
+    // half-way values, denormals.
+    let vcvt_inputs = [
+        0.0f32,
+        -0.0,
+        1.0,
+        -1.0,
+        2.5,    // RN: 2; RP: 3; RM: 2; RZ: 2
+        -2.5,
+        1.5,
+        -1.5,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        snan,
+        qnan,
+        denorm,
+        // Boundary values for i32/u32 saturation. f32 can't represent
+        // 2^31 exactly past the round-up, but close.
+        2147483648.0,            // = 2^31, just over i32::MAX
+        -2147483648.0,           // = -2^31, exactly i32::MIN as f32
+        4294967296.0,            // = 2^32, just over u32::MAX
+        2147483520.0,            // = i32::MAX rounded down
+        f32::MAX,                // very large
+        -f32::MAX,
+        // VCVT.F32.U32 / VCVT.F32.S32 inputs reinterpret f32 bits as
+        // integer; pre-encode common integer values as f32-bits.
+        f32::from_bits(0),
+        f32::from_bits(1),
+        f32::from_bits(0xFFFF_FFFF),
+        f32::from_bits(0x8000_0000),
+        f32::from_bits(0x7FFF_FFFF),
+        f32::from_bits(0x4000_0000),
+    ];
+    for &val in &vcvt_inputs {
+        v.push((Op::VcvtFU, val, 0.0, 0.0));
+        v.push((Op::VcvtFS, val, 0.0, 0.0));
+        v.push((Op::VcvtUR, val, 0.0, 0.0));
+        v.push((Op::VcvtU, val, 0.0, 0.0));
+        v.push((Op::VcvtSR, val, 0.0, 0.0));
+        v.push((Op::VcvtS, val, 0.0, 0.0));
+    }
+
+    // VSEL — sweep all 16 APSR.NZCV combinations × representative (sn, sm)
+    // pairs. The third slot `c` carries APSR-bits as f32::from_bits().
+    // Operand pairs include NaN to verify the integer_result_bits check
+    // catches a wrong-operand pick under DN=0.
+    let vsel_operand_pairs = [
+        (1.0f32, 2.0),    // distinct finite
+        (qnan, 1.0),      // NaN as sn
+        (1.0, qnan),      // NaN as sm
+        (snan, qnan),     // both NaN, different payloads
+    ];
+    for nzcv_bits in 0..16u32 {
+        let apsr_bits = nzcv_bits << 28;
+        let apsr_f32 = f32::from_bits(apsr_bits);
+        for &(sn, sm) in &vsel_operand_pairs {
+            v.push((Op::VselEq, sn, sm, apsr_f32));
+            v.push((Op::VselVs, sn, sm, apsr_f32));
+            v.push((Op::VselGe, sn, sm, apsr_f32));
+            v.push((Op::VselGt, sn, sm, apsr_f32));
+        }
     }
 
     v
