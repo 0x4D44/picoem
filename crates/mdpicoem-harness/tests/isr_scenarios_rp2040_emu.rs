@@ -194,6 +194,57 @@ fn isr_m0_wfi_wake_passes_on_emu() {
     }
 }
 
+/// V2 §3.1 — priority preemption / tail-chain.
+///
+/// Two TIMER alarms armed at the same TIMERAWL deadline, both INTE bits
+/// set, with `NVIC_IPR0 = (0xC0 << 0) | (0x40 << 8)`. M0+ implements
+/// priority bits [7:6]: IRQ #0 = 3 (lower priority), IRQ #1 = 1 (higher
+/// priority). When both fire on the same `tick_peripherals`, both NVIC
+/// pending bits set in lock-step; `try_take_any_pending_exception` picks
+/// IRQ #1 first; on its return the tail-chain poll picks IRQ #0.
+///
+/// Each handler writes a distinct non-zero sentinel to `order_first_irq`
+/// — but only if the cell is still zero. Whichever ran first wins. PASS
+/// is `order_first_irq == 0xA1` (IRQ_1 sentinel).
+#[test]
+fn isr_m0_priority_preempt_passes_on_emu() {
+    let sc = find_scenario("isr_m0_priority_preempt");
+    match run_scenario(sc) {
+        EmuOutcome::Completed(obs) => {
+            // Per OBS_PRIORITY_PREEMPT ordering:
+            //   obs[0] = order_first_irq (primary, load-bearing)
+            //   obs[1] = ctr_irq_0
+            //   obs[2] = ctr_irq_1
+            assert_eq!(
+                obs[0], 0xA1,
+                "order_first_irq should be 0xA1 (IRQ_1 ran first because of higher priority), got 0x{:08X}",
+                obs[0],
+            );
+            assert_eq!(
+                obs[1], 1,
+                "ctr_irq_0 should be 1 (IRQ_0 ran via tail-chain after IRQ_1), got {}",
+                obs[1],
+            );
+            assert_eq!(
+                obs[2], 1,
+                "ctr_irq_1 should be 1 (IRQ_1 ran first), got {}",
+                obs[2],
+            );
+        }
+        EmuOutcome::HardFault { pc, ipsr } => {
+            panic!(
+                "isr_m0_priority_preempt: EMU hardfault at pc=0x{:08X} ipsr={}",
+                pc, ipsr,
+            );
+        }
+        EmuOutcome::Timeout => {
+            panic!(
+                "isr_m0_priority_preempt: cycle budget exhausted before order_first_irq advanced",
+            );
+        }
+    }
+}
+
 /// V2 §3.2 — PRIMASK-gated pend then `cpsie i` unmask.
 ///
 /// Verifies the PRIMASK gate inside `try_take_any_pending_exception`
