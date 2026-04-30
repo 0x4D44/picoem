@@ -92,23 +92,25 @@ impl Nvic {
 
     // --- Pending ----------------------------------------------------------
 
-    /// Mark IRQ line `irq` as pending. No-op if `irq >= 32` (the RP2040
-    /// datasheet pins the NVIC at 32 lines).
+    /// Mark IRQ line `irq` as pending. No-op if
+    /// `irq >= crate::irq::IRQ_COUNT` — RP2040 routes only lines 0..=25
+    /// to the NVIC; bits 26..=31 are RAZ/WI on real silicon.
     ///
     /// This is a set operation, not a toggle — level peripherals
     /// re-assert every cycle the condition holds, so repeated calls
     /// with the same line are idempotent.
     #[inline]
     pub fn set_pending(&mut self, irq: u8) {
-        if irq < 32 {
+        if (irq as u32) < crate::irq::IRQ_COUNT {
             self.pending |= 1u32 << irq;
         }
     }
 
-    /// Clear the pending bit for IRQ line `irq`. No-op if `irq >= 32`.
+    /// Clear the pending bit for IRQ line `irq`. No-op if
+    /// `irq >= crate::irq::IRQ_COUNT`.
     #[inline]
     pub fn clear_pending(&mut self, irq: u8) {
-        if irq < 32 {
+        if (irq as u32) < crate::irq::IRQ_COUNT {
             self.pending &= !(1u32 << irq);
         }
     }
@@ -122,18 +124,21 @@ impl Nvic {
 
     // --- Enable mask ------------------------------------------------------
 
-    /// Unmask IRQ line `irq`. No-op if `irq >= 32`.
+    /// Unmask IRQ line `irq`. No-op if `irq >= crate::irq::IRQ_COUNT`
+    /// — RP2040 routes only lines 0..=25 to the NVIC; bits 26..=31 are
+    /// RAZ/WI on real silicon.
     #[inline]
     pub fn set_enabled(&mut self, irq: u8) {
-        if irq < 32 {
+        if (irq as u32) < crate::irq::IRQ_COUNT {
             self.enabled |= 1u32 << irq;
         }
     }
 
-    /// Mask IRQ line `irq` (clear the enable bit). No-op if `irq >= 32`.
+    /// Mask IRQ line `irq` (clear the enable bit). No-op if
+    /// `irq >= crate::irq::IRQ_COUNT`.
     #[inline]
     pub fn clear_enabled(&mut self, irq: u8) {
-        if irq < 32 {
+        if (irq as u32) < crate::irq::IRQ_COUNT {
             self.enabled &= !(1u32 << irq);
         }
     }
@@ -266,6 +271,11 @@ mod tests {
         let mut n = Nvic::new();
         n.set_pending(32);
         n.set_pending(255);
+        // RP2040 routes only lines 0..=25 — bits 26..=31 are RAZ/WI on
+        // real silicon, so the API must reject them too (not just the
+        // 32-line architectural ceiling).
+        n.set_pending(26);
+        n.set_pending(31);
         assert_eq!(n.pending, 0);
     }
 
@@ -304,6 +314,10 @@ mod tests {
         let mut n = Nvic::new();
         n.set_enabled(32);
         n.set_enabled(200);
+        // Same RAZ/WI structural reason as set_pending — bits 26..=31
+        // must not latch even though they fit in the 32-bit register.
+        n.set_enabled(26);
+        n.set_enabled(31);
         assert_eq!(n.enabled, 0);
     }
 
