@@ -355,21 +355,18 @@ impl Hazard3 {
     }
 
     /// Read `mip`. Exposed for P4's `fan_out_riscv_irqs` (HLD §4.6).
-    #[allow(dead_code)]
     pub(crate) fn mip(&self) -> u32 {
         self.csrs.mip
     }
 
     /// Write `mip`. Exposed for P4's `fan_out_riscv_irqs`, which drives
     /// bits 3 (MSIP) and 7 (MTIP) directly per RV-priv §3.1.9.
-    #[allow(dead_code)]
     pub(crate) fn set_mip(&mut self, v: u32) {
         self.csrs.mip = v;
     }
 
     /// Read `mie`. Exposed for the `wfi` wake predicate
     /// `(mip & mie) != 0` (HLD §4.6).
-    #[allow(dead_code)]
     pub(crate) fn mie(&self) -> u32 {
         self.csrs.mie
     }

@@ -21090,29 +21090,6 @@ mod stage7_ppb_coverage {
     }
 
     #[test]
-    fn set_irq_pending_out_of_range_noop() {
-        let mut ppb = Ppb::default();
-        ppb.set_irq_pending(1000);
-        // No change.
-    }
-
-    #[test]
-    fn clear_irq_pending_out_of_range_noop() {
-        let mut ppb = Ppb::default();
-        ppb.clear_irq_pending(1000);
-    }
-
-    #[test]
-    fn set_irq_active_and_check_enabled() {
-        let mut ppb = Ppb::default();
-        ppb.set_irq_active(5);
-        assert!(!ppb.irq_enabled(5));
-        ppb.write32(0xE000_E100, 1 << 5);
-        assert!(ppb.irq_enabled(5));
-        assert!(!ppb.irq_enabled(1000));
-    }
-
-    #[test]
     fn systick_advance_counts_down_no_underflow() {
         let mut ppb = Ppb {
             syst_csr: 1 | 2, // ENABLE + TICKINT

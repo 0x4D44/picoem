@@ -3253,27 +3253,6 @@ impl Bus {
     }
 }
 
-/// Extra wait-state for SRAM bank access (retained for documentation).
-/// Banks 2 and 6 have +1 cycle on RP2350 (measured on silicon via DWT CYCCNT).
-/// No longer called from data-access paths. Bank 2/6 penalty is now
-/// modeled on instruction fetch only, conditional on sequentiality.
-/// Returns 0 during burst mode (STM/LDM/PUSH/POP) — the SRAM controller
-/// handles sequential accesses without per-word bank penalties.
-#[allow(dead_code)]
-fn sram_bank_wait(addr: u32, burst: bool) -> u32 {
-    if burst {
-        return 0;
-    }
-    let offset = addr & 0x000F_FFFF;
-    if offset < 0x8_0000 {
-        // Striped SRAM0-7
-        let bank = (offset >> 2) & 7;
-        if bank == 2 || bank == 6 { 1 } else { 0 }
-    } else {
-        0 // SRAM8-9 non-striped: no extra wait
-    }
-}
-
 impl Default for Bus {
     fn default() -> Self {
         Self::new()

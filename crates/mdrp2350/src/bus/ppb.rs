@@ -689,19 +689,6 @@ impl Ppb {
         best.map(|(_, exc)| exc)
     }
 
-    /// Mark an external IRQ as pending in NVIC_ISPR. No-op if the IRQ
-    /// exceeds the implemented count. Unit-test helper; release paths
-    /// set NVIC_ISPR via [`Self::merge_irq_pending`] or direct MMIO
-    /// writes going through `CortexM33::bus_write32`.
-    #[allow(dead_code)]
-    pub(crate) fn set_irq_pending(&mut self, irq: u32) {
-        if irq < crate::irq::IRQ_COUNT {
-            let word = (irq / 32) as usize;
-            let bit = irq % 32;
-            self.nvic_ispr[word].fetch_or(1u32 << bit, Ordering::Relaxed);
-        }
-    }
-
     /// Union a 64-bit peripheral IRQ-pending bitmap into `nvic_ispr`.
     /// Phase 0b.1 Commit B + Phase 3 Stage 1: called by the step-path
     /// when `CoreAtomics::take_irq_pending` returns non-zero — that
@@ -724,19 +711,6 @@ impl Ppb {
         (pending & iser) != 0
     }
 
-    /// Clear an external IRQ's pending bit. Phase 1 drain-loop callers
-    /// use this when a level source stops asserting; the step-path
-    /// dispatch in `try_take_any_pending_exception` writes `nvic_ispr`
-    /// directly to keep the hot path inlined.
-    #[allow(dead_code)]
-    pub(crate) fn clear_irq_pending(&mut self, irq: u32) {
-        if irq < crate::irq::IRQ_COUNT {
-            let word = (irq / 32) as usize;
-            let bit = irq % 32;
-            self.nvic_ispr[word].fetch_and(!(1u32 << bit), Ordering::Relaxed);
-        }
-    }
-
     /// Set an external IRQ's active bit. Called by exception entry.
     pub(crate) fn set_irq_active(&mut self, irq: u32) {
         if irq < crate::irq::IRQ_COUNT {
@@ -744,20 +718,6 @@ impl Ppb {
             let bit = irq % 32;
             self.nvic_iabr[word].fetch_or(1u32 << bit, Ordering::Relaxed);
         }
-    }
-
-    /// True iff the IRQ is enabled in NVIC_ISER. Surfaces the primitive
-    /// the drain loop uses to decide level-reassert; `highest_priority_pending_irq`
-    /// folds the same check into its bitmask AND, so the step-path hot
-    /// loop never calls this directly.
-    #[allow(dead_code)]
-    pub(crate) fn irq_enabled(&self, irq: u32) -> bool {
-        if irq >= crate::irq::IRQ_COUNT {
-            return false;
-        }
-        let word = (irq / 32) as usize;
-        let bit = irq % 32;
-        (self.nvic_iser[word].load(Ordering::Relaxed) & (1u32 << bit)) != 0
     }
 
     // ----------------------------------------------------------------
@@ -1178,21 +1138,6 @@ mod tests {
     }
 
     #[test]
-    fn test_nvic_ispr_self_pend_bit_48_sets_ispr_bit() {
-        // The set_irq_pending helper must also reach bit 48 — covers the
-        // path an ISR-scenario "software self-pend" scenario exercises
-        // via NVIC_ISPR directly. Dispatch is tested at the `step`
-        // level in tests.rs; this test only pins the ISPR-bank write.
-        let mut ppb = Ppb::default();
-        ppb.set_irq_pending(48);
-        assert_eq!(
-            ppb.nvic_ispr[1].load(Ordering::Relaxed) & (1u32 << (48 - 32)),
-            1u32 << (48 - 32),
-            "set_irq_pending(48) must land on NVIC_ISPR1"
-        );
-    }
-
-    #[test]
     fn test_nvic_iser1_bit_20_to_31_res0_for_spare_shims() {
         // IRQs 52..=63 do not exist on RP2350; writes must not latch.
         let mut ppb = Ppb::default();
@@ -1208,7 +1153,10 @@ mod tests {
     #[test]
     fn test_highest_priority_pending_irq_honours_enable() {
         let mut ppb = Ppb::default();
-        ppb.set_irq_pending(10);
+        // Setup via the production-path `merge_irq_pending` (the same
+        // OR-into-NVIC_ISPR semantics the step path uses to absorb
+        // peripheral-line bitmaps). Bit `irq` of the u64 == IRQ #irq.
+        ppb.merge_irq_pending(1u64 << 10);
         // Not enabled → nothing to take.
         assert_eq!(ppb.highest_priority_pending_irq(), None);
         // Enable → exception 26 (IRQ 10) should be ready.
@@ -1221,8 +1169,7 @@ mod tests {
         let mut ppb = Ppb::default();
         // Both IRQ 5 and IRQ 10 pending-and-enabled at default priority 0
         // → IRQ 5 (exception 21) wins the tie.
-        ppb.set_irq_pending(5);
-        ppb.set_irq_pending(10);
+        ppb.merge_irq_pending((1u64 << 5) | (1u64 << 10));
         ppb.write32(NVIC_ISER0, (1u32 << 5) | (1u32 << 10));
         assert_eq!(ppb.highest_priority_pending_irq(), Some(16 + 5));
     }
@@ -1232,8 +1179,7 @@ mod tests {
         let mut ppb = Ppb::default();
         // IRQ 5 priority = 0x80; IRQ 10 priority = 0x40 (higher-priority =
         // lower numeric value). Both enabled+pending → IRQ 10 wins.
-        ppb.set_irq_pending(5);
-        ppb.set_irq_pending(10);
+        ppb.merge_irq_pending((1u64 << 5) | (1u64 << 10));
         ppb.write32(NVIC_ISER0, (1u32 << 5) | (1u32 << 10));
         // IPR0 byte-lanes: [IRQ0, IRQ1, IRQ2, IRQ3]
         // IPR1 byte-lanes: [IRQ4, IRQ5, IRQ6, IRQ7]

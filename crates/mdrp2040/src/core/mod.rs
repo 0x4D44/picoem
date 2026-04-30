@@ -33,7 +33,6 @@ pub use registers::Registers;
 /// SVC call (exception 11). Phase 4.B turns these variants into the
 /// appropriate exception number via [`CortexM0Plus::deliver_fault`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum Fault {
     /// Undefined instruction — decoder rejected the encoding. Delivers
     /// as HardFault (exception #3).
