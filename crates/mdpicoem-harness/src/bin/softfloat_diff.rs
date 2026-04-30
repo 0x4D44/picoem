@@ -172,6 +172,51 @@ fn vfp_unary(opc3: u16, t: u16, sd: u16, sm: u16) -> (u16, u16) {
     (hw0, hw1)
 }
 
+/// VMINNM.F32: hw0 = `1111_1110_1_00_D_Vn` (with hw0[7]=1 splitting from
+/// VSEL, hw0[6:5]=00 disambiguating from reserved sub-ops);
+/// hw1 = `Vd_1010_N_1_M_0_Vm` where hw1[6]=1 selects min vs max.
+fn enc_vminnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xFE00 | (1 << 7) | (d << 4) | vn;
+    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (1 << 6) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+/// VMAXNM.F32: same shape as VMINNM but with hw1[6] = 0.
+fn enc_vmaxnm(sd: u16, sn: u16, sm: u16) -> (u16, u16) {
+    let vd = (sd >> 1) & 0xF;
+    let d = sd & 1;
+    let vn = (sn >> 1) & 0xF;
+    let n = sn & 1;
+    let vm = (sm >> 1) & 0xF;
+    let m = sm & 1;
+    let hw0 = 0xFE00 | (1 << 7) | (d << 4) | vn;
+    let hw1 = (vd << 12) | 0x0A00 | (n << 7) | (m << 5) | vm;
+    (hw0, hw1)
+}
+
+fn enc_vcmp(sd: u16, sm: u16) -> (u16, u16) {
+    // (opc3=0b0100, t=0) — fpu_unary dispatch row 893.
+    vfp_unary(0b0100, 0, sd, sm)
+}
+fn enc_vcmpe(sd: u16, sm: u16) -> (u16, u16) {
+    // (opc3=0b0100, t=1) — fpu_unary dispatch row 898. mdrp2350 treats
+    // VCMP and VCMPE identically (no SNaN signalling).
+    vfp_unary(0b0100, 1, sd, sm)
+}
+fn enc_vabs(sd: u16, sm: u16) -> (u16, u16) {
+    // (opc3=0b0000, t=1) — see fpu_unary dispatch table at execute_fpu.rs:840.
+    vfp_unary(0b0000, 1, sd, sm)
+}
+fn enc_vneg(sd: u16, sm: u16) -> (u16, u16) {
+    // (opc3=0b0001, t=0)
+    vfp_unary(0b0001, 0, sd, sm)
+}
 fn enc_vrintr(sd: u16, sm: u16) -> (u16, u16) {
     vfp_unary(0b0110, 0, sd, sm)
 }
@@ -206,6 +251,12 @@ enum Op {
     VRintR,
     VRintX,
     VRintZ,
+    Vabs,
+    Vneg,
+    Vminnm,
+    Vmaxnm,
+    Vcmp,
+    Vcmpe,
 }
 
 impl Op {
@@ -220,15 +271,28 @@ impl Op {
             Op::VRintR => "VRINTR",
             Op::VRintX => "VRINTX",
             Op::VRintZ => "VRINTZ",
+            Op::Vabs => "VABS",
+            Op::Vneg => "VNEG",
+            Op::Vminnm => "VMINNM",
+            Op::Vmaxnm => "VMAXNM",
+            Op::Vcmp => "VCMP",
+            Op::Vcmpe => "VCMPE",
         }
     }
 
     fn arity(self) -> usize {
         match self {
-            Op::Sqrt | Op::VRintR | Op::VRintX | Op::VRintZ => 1,
+            Op::Sqrt | Op::VRintR | Op::VRintX | Op::VRintZ | Op::Vabs | Op::Vneg => 1,
             Op::Fma => 3, // a, b, and accumulator
             _ => 2,
         }
+    }
+
+    /// True if the op writes FPSCR.NZCV instead of an Sd value (VCMP family).
+    /// Compare-shaped ops are dispatched via `run_vcmp_one`; the rest go
+    /// through `run_single`.
+    fn writes_nzcv(self) -> bool {
+        matches!(self, Op::Vcmp | Op::Vcmpe)
     }
 
     /// True if the op's behavior depends on FPSCR.RMode (so the runner sweeps
@@ -305,6 +369,11 @@ fn run_single(
         Op::VRintR => enc_vrintr(0, 2),
         Op::VRintX => enc_vrintx(0, 2),
         Op::VRintZ => enc_vrintz(0, 2),
+        Op::Vabs => enc_vabs(0, 2),
+        Op::Vneg => enc_vneg(0, 2),
+        Op::Vminnm => enc_vminnm(0, 2, 4),
+        Op::Vmaxnm => enc_vmaxnm(0, 2, 4),
+        Op::Vcmp | Op::Vcmpe => unreachable!("VCMP routed via run_vcmp_one"),
     };
     emu.execute_one_wide(hw0, hw1);
     let emu_result = emu.regs.s[0];
@@ -324,6 +393,11 @@ fn run_single(
         Op::VRintX => ieee754_ref::ref_vrint(a, rmode, fpscr_mode, true),
         // VRINTZ ignores FPSCR.RMode — always RZ (rmode=0b11).
         Op::VRintZ => ieee754_ref::ref_vrint(a, 0b11, fpscr_mode, false),
+        Op::Vabs => ieee754_ref::ref_vabs(a, fpscr_mode),
+        Op::Vneg => ieee754_ref::ref_vneg(a, fpscr_mode),
+        Op::Vminnm => ieee754_ref::ref_vminnm(a, b, fpscr_mode),
+        Op::Vmaxnm => ieee754_ref::ref_vmaxnm(a, b, fpscr_mode),
+        Op::Vcmp | Op::Vcmpe => unreachable!("VCMP routed via run_vcmp_one"),
     };
 
     // Compare results. With DN=0, two NaN results match regardless of bits
@@ -352,6 +426,70 @@ fn run_single(
             c,
             emu_result_bits: emu_result.to_bits(),
             ref_result_bits: ref_result.to_bits(),
+            emu_flags,
+            ref_flags,
+        })
+    }
+}
+
+/// Top-level dispatch: VCMP-family ops route to `run_vcmp_one`,
+/// everything else goes through `run_single`.
+fn run_one(
+    op: Op,
+    a: f32,
+    b: f32,
+    c: f32,
+    fpscr_mode: u32,
+    mode_label: &'static str,
+) -> Option<Discrepancy> {
+    if op.writes_nzcv() {
+        run_vcmp_one(op, a, b, fpscr_mode, mode_label)
+    } else {
+        run_single(op, a, b, c, fpscr_mode, mode_label)
+    }
+}
+
+/// Dedicated runner for VCMP / VCMPE. Output is FPSCR.NZCV (bits 31..=28),
+/// not an Sd register write — so the existing `run_single` shape doesn't
+/// fit. Uses Sd=s[2] (pre-loaded with `a`) and Sm=s[4] (`b`), mirroring
+/// `run_single`'s operand layout.
+fn run_vcmp_one(
+    op: Op,
+    a: f32,
+    b: f32,
+    fpscr_mode: u32,
+    mode_label: &'static str,
+) -> Option<Discrepancy> {
+    let mut emu = CortexM33::default();
+    emu.regs.fpscr = fpscr_mode;
+    emu.regs.s[2] = a;
+    emu.regs.s[4] = b;
+    let (hw0, hw1) = match op {
+        Op::Vcmp => enc_vcmp(2, 4),
+        Op::Vcmpe => enc_vcmpe(2, 4),
+        _ => unreachable!("run_vcmp_one called with non-VCMP op {:?}", op.name()),
+    };
+    emu.execute_one_wide(hw0, hw1);
+    let emu_nzcv = emu.regs.fpscr & 0xF000_0000;
+    let emu_flags = emu.regs.fpscr & FPSCR_FLAG_MASK;
+
+    let (ref_nzcv, ref_flags) = ieee754_ref::ref_vcmp(a, b, fpscr_mode);
+
+    if emu_nzcv == ref_nzcv && emu_flags == ref_flags {
+        None
+    } else {
+        Some(Discrepancy {
+            op,
+            mode_label,
+            fpscr_mode,
+            a,
+            b,
+            c: 0.0,
+            // Pack the NZCV nibble into the result-bits fields so the
+            // existing Discrepancy display can show `emu nzcv=0x...` /
+            // `ref nzcv=0x...`. Reader interprets these as nibble-only.
+            emu_result_bits: emu_nzcv,
+            ref_result_bits: ref_nzcv,
             emu_flags,
             ref_flags,
         })
@@ -466,6 +604,12 @@ fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
         Op::VRintR,
         Op::VRintX,
         Op::VRintZ,
+        Op::Vabs,
+        Op::Vneg,
+        Op::Vminnm,
+        Op::Vmaxnm,
+        Op::Vcmp,
+        Op::Vcmpe,
     ];
 
     match fuzz_count {
@@ -480,7 +624,7 @@ fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
                     // is the whole process; cheap and avoids threading a
                     // lifetime through Discrepancy.
                     let label_static: &'static str = Box::leak(label.into_boxed_str());
-                    if let Some(d) = run_single(op, a, b, c, mode, label_static) {
+                    if let Some(d) = run_one(op, a, b, c, mode, label_static) {
                         eprintln!("[FAIL] {d}");
                         fail += 1;
                     }
@@ -522,7 +666,7 @@ fn run_fpu(fuzz_count: Option<usize>, seed: u64) -> bool {
                         } else {
                             0.0
                         };
-                        if let Some(d) = run_single(op, a, b, c, mode, label_static) {
+                        if let Some(d) = run_one(op, a, b, c, mode, label_static) {
                             if fail < 20 {
                                 eprintln!("[FPU FAIL] {d}");
                             }
@@ -1356,6 +1500,85 @@ fn edge_cases() -> Vec<(Op, f32, f32, f32)> {
         v.push((Op::VRintR, val, 0.0, 0.0));
         v.push((Op::VRintX, val, 0.0, 0.0));
         v.push((Op::VRintZ, val, 0.0, 0.0));
+    }
+
+    // VABS / VNEG — sign-bit operations, same input set covers all cases.
+    let unary_sign_inputs = [
+        0.0f32,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        snan,
+        qnan,
+        denorm,
+        max_sub,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::MAX,
+        -f32::MAX,
+        // SNaN with negative sign bit — exercises sign-flip on payload-bearing NaN.
+        f32::from_bits(0xFF80_0001),
+    ];
+    for &val in &unary_sign_inputs {
+        v.push((Op::Vabs, val, 0.0, 0.0));
+        v.push((Op::Vneg, val, 0.0, 0.0));
+    }
+
+    // VMINNM / VMAXNM — IEEE-754-2008 minNum/maxNum semantics. Coverage:
+    // both NaN, exactly one NaN (Q + S), zero-sign rules, ordered pairs.
+    let nm_inputs = [
+        (1.0f32, 2.0),
+        (2.0, 1.0),
+        (1.0, 1.0),
+        (-1.0, 1.0),
+        (0.0, 0.0),
+        (0.0, -0.0),
+        (-0.0, 0.0),
+        (-0.0, -0.0),
+        (qnan, 1.0),
+        (1.0, qnan),
+        (qnan, qnan),
+        (snan, 1.0), // SNaN sets IOC; result is the non-NaN operand
+        (1.0, snan),
+        (snan, qnan),
+        (snan, snan),
+        (f32::INFINITY, 1.0),
+        (-f32::INFINITY, 1.0),
+        (f32::INFINITY, -f32::INFINITY),
+        (denorm, 0.0),
+    ];
+    for &(a, b) in &nm_inputs {
+        v.push((Op::Vminnm, a, b, 0.0));
+        v.push((Op::Vmaxnm, a, b, 0.0));
+    }
+
+    // VCMP / VCMPE — output is FPSCR.NZCV, not Sd. Coverage: ordered
+    // pairs (less / equal / greater), unordered (NaN), zero-sign edge.
+    // `run_vcmp_one` reads s[2] (Sd) and s[4] (Sm); the pre-load loop
+    // in `run_single` would put `a` into s[2] and `b` into s[4].
+    let cmp_inputs = [
+        (1.0f32, 2.0),  // less
+        (2.0, 1.0),     // greater
+        (1.0, 1.0),     // equal
+        (0.0, -0.0),    // equal at zero (per IEEE)
+        (-0.0, 0.0),    // ditto
+        (0.0, 0.0),
+        (qnan, 1.0),    // unordered (LHS NaN)
+        (1.0, qnan),    // unordered (RHS NaN)
+        (qnan, qnan),
+        (snan, 1.0),
+        (1.0, snan),
+        (f32::INFINITY, 1.0),
+        (-f32::INFINITY, 1.0),
+        (f32::INFINITY, f32::NEG_INFINITY),
+        (f32::INFINITY, f32::INFINITY),
+        (denorm, 0.0),
+    ];
+    for &(a, b) in &cmp_inputs {
+        v.push((Op::Vcmp, a, b, 0.0));
+        v.push((Op::Vcmpe, a, b, 0.0));
     }
 
     v

@@ -395,6 +395,109 @@ pub fn ref_fma(a: f32, b: f32, c: f32, fpscr_in: u32) -> (f32, u32) {
     (result, flags)
 }
 
+/// Reference VCMP.F32 (and VCMPE — the emulator treats both identically).
+///
+/// Computes the FPSCR.NZCV nibble that VCMP writes via `fpu_vcmp` in
+/// `execute_fpu.rs`. Returns `(nzcv_bits, flags)` where `nzcv_bits` is
+/// the four flags positioned at FPSCR bits 31..=28, and `flags` is the
+/// cumulative-exception delta. The mdrp2350 implementation does NOT
+/// raise IOC for SNaN inputs (the dispatch comment at execute_fpu.rs
+/// line 900 notes "Same result as VCMP for emulation (no FP
+/// exceptions)"), so the reference matches that behaviour and returns
+/// no exception flags.
+pub fn ref_vcmp(a: f32, b: f32, _fpscr_in: u32) -> (u32, u32) {
+    let (n, z, c, v) = if a.is_nan() || b.is_nan() {
+        (false, false, true, true) // unordered
+    } else if a == b {
+        (false, true, true, false) // equal
+    } else if a < b {
+        (true, false, false, false) // less than
+    } else {
+        (false, false, true, false) // greater than
+    };
+    let nzcv =
+        ((n as u32) << 31) | ((z as u32) << 30) | ((c as u32) << 29) | ((v as u32) << 28);
+    (nzcv, 0)
+}
+
+/// Reference VMINNM.F32 (IEEE 754-2008 minNum semantics).
+///
+/// Mirrors `fpu_minnum` in `execute_fpu.rs` plus the IOC-on-SNaN check
+/// that lives in the dispatch (`fpu_v8m_dp` line 648):
+/// - Both NaN → ARM canonical default NaN.
+/// - Exactly one NaN → the non-NaN operand.
+/// - Both ±0 → -0 if either has the sign bit set; otherwise +0.
+/// - Otherwise standard `<` ordering.
+/// IOC is set when either input is a signaling NaN. No DN/FZ application
+/// (NaN-result path returns the canonical NaN already; non-NaN paths
+/// don't construct NaNs).
+pub fn ref_vminnm(a: f32, b: f32, _fpscr_in: u32) -> (f32, u32) {
+    let mut flags = 0u32;
+    if is_snan_f32(a) || is_snan_f32(b) {
+        flags |= IOC;
+    }
+    let result = if a.is_nan() && b.is_nan() {
+        f32::from_bits(ARM_DEFAULT_NAN)
+    } else if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a == 0.0 && b == 0.0 {
+        if (a.to_bits() & 0x8000_0000) != 0 || (b.to_bits() & 0x8000_0000) != 0 {
+            -0.0
+        } else {
+            0.0
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    };
+    (result, flags)
+}
+
+/// Reference VMAXNM.F32 (IEEE 754-2008 maxNum semantics). Same NaN /
+/// IOC rules as `ref_vminnm`; the both-zero case returns +0 if either
+/// operand is +0 (rather than -0).
+pub fn ref_vmaxnm(a: f32, b: f32, _fpscr_in: u32) -> (f32, u32) {
+    let mut flags = 0u32;
+    if is_snan_f32(a) || is_snan_f32(b) {
+        flags |= IOC;
+    }
+    let result = if a.is_nan() && b.is_nan() {
+        f32::from_bits(ARM_DEFAULT_NAN)
+    } else if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a == 0.0 && b == 0.0 {
+        if (a.to_bits() & 0x8000_0000) == 0 || (b.to_bits() & 0x8000_0000) == 0 {
+            0.0
+        } else {
+            -0.0
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    };
+    (result, flags)
+}
+
+/// Reference VABS.F32 — clear the sign bit. Per ARMv8-M DDI0553 §C2.4.30:
+/// VABS is a sign-bit-only register operation; it does not classify NaN
+/// payloads, does not raise IOC for SNaN, and does not honor DN/FZ.
+/// Subnormal inputs pass through unchanged.
+pub fn ref_vabs(a: f32, _fpscr_in: u32) -> (f32, u32) {
+    (f32::from_bits(a.to_bits() & 0x7FFF_FFFF), 0)
+}
+
+/// Reference VNEG.F32 — flip the sign bit. Per ARMv8-M DDI0553 §C2.4.181:
+/// pure sign-bit operation, no FPSCR side effects, no DN/FZ application.
+pub fn ref_vneg(a: f32, _fpscr_in: u32) -> (f32, u32) {
+    (f32::from_bits(a.to_bits() ^ 0x8000_0000), 0)
+}
+
 /// Reference VRINT (round to integer per `rmode`).
 ///
 /// `exact = true` matches VRINTX (raises IXC when the rounded value differs
