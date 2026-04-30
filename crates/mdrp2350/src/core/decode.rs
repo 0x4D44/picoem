@@ -932,14 +932,6 @@ mod classifier_tests {
 
     // ---------- classify_thumb32_pure: per-encoding structural ----------
 
-    /// Build a Thumb-32 hw0 with prefix `0b11110` and op2 / op1 fields.
-    /// op1 = (hw0 >> 11) & 0x3 (already covered via prefix bits[12:11]).
-    /// op2 = (hw0 >> 4) & 0x7F.
-    fn t32_hw0(op1: u16, op2: u16) -> u16 {
-        // Top 5 bits = 11110. Then op1 in bits [12:11]. Then op2 in [10:4].
-        (0b11110u16 << 11) | (op1 << 11) | ((op2 & 0x7F) << 4)
-    }
-
     #[test]
     fn t32_op1_01_dp_shifted_reg_is_pure() {
         // op1 = 0b01, op2 >> 5 = 0b01 → dp_shifted_reg (pure).
@@ -1194,8 +1186,6 @@ mod classifier_tests {
         let mut bits = Vec::with_capacity(64);
         // op1 = 0b01, op2 >> 5 ∈ {0b00, 0b01, 0b10, 0b11}
         for op2_high in [0b00u16, 0b01, 0b10, 0b11] {
-            let hw0 = (0b11101u16 << 11) | (op2_high << 16 - 4 - 1) | ((op2_high << 5) << 4);
-            // Simpler: build via t32 op1=01, op2 = op2_high << 5.
             let hw0 = (0b11101u16 << 11) | (0b01 << 11) | ((op2_high << 5) << 4);
             bits.push(classify_thumb32_pure(hw0, 0));
         }

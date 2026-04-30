@@ -1,0 +1,14 @@
+# V3 Stream A validation — narrow cargo-mutants to the two decode.rs
+# files only, to validate that the new classifier_tests modules catch
+# the previously-missed classifier mutants.
+examine_globs = [
+    "crates/mdrp2350/src/core/decode.rs",
+    "crates/mdrp2040/src/core/decode.rs",
+]
+
+# Same generous timeout as the workspace default — emulator unit tests
+# include some tight loops.
+timeout_multiplier = 5.0
+
+# Restrict cargo invocations to the two chip crates (no harness rebuild).
+test_package = ["mdrp2350", "mdrp2040"]
