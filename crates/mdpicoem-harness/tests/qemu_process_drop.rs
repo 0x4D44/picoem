@@ -271,7 +271,7 @@ fn socket_freed_after_external_kill() {
     }
 
     // Run with --fuzz 1 so the binary actually gets to the spawn-QEMU step.
-    let child = Command::new(&exe)
+    let mut child = Command::new(&exe)
         .args(["--fuzz", "1"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -309,4 +309,8 @@ fn socket_freed_after_external_kill() {
         "GDB port 3333 was not freed within 2 s of TerminateProcess on parent pid {pid} — \
          a zombie qemu-system-arm.exe is still bound to it"
     );
+
+    // Reap the externally-terminated child so its kernel handle is released
+    // immediately rather than at end-of-test-process.
+    let _ = child.wait();
 }

@@ -140,7 +140,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         let r = run_scenario_with_retry(&mut core, sc, i == 0, args.inner.verbose)?;
         match r.verdict {
             Verdict::Pass => pass += 1,
-            Verdict::Fail => fail += 1,
+            Verdict::Fail | Verdict::Skip | Verdict::Degraded => fail += 1,
         }
         println!(
             "{:<40} {:>6} {:>10.1} {:>7}  {}",

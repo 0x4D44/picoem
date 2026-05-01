@@ -706,14 +706,15 @@ impl CycleCaseResult {
     /// merging the two code paths is deferred until a second caller
     /// appears.
     pub fn to_outcome(&self) -> CaseOutcome {
-        if self.verdict == Verdict::Pass {
-            CaseOutcome::pass("cycle", self.name, self.elapsed_ms)
-        } else {
-            let detail = format!(
-                "hw={} emu={} delta={:+} tol={}",
-                self.hw_per_iter, self.emu_per_iter, self.delta, self.effective_tolerance,
-            );
-            CaseOutcome::fail("cycle", self.name, detail, self.elapsed_ms)
+        match self.verdict {
+            Verdict::Pass => CaseOutcome::pass("cycle", self.name, self.elapsed_ms),
+            Verdict::Fail | Verdict::Skip | Verdict::Degraded => {
+                let detail = format!(
+                    "hw={} emu={} delta={:+} tol={}",
+                    self.hw_per_iter, self.emu_per_iter, self.delta, self.effective_tolerance,
+                );
+                CaseOutcome::fail("cycle", self.name, detail, self.elapsed_ms)
+            }
         }
     }
 }
@@ -862,7 +863,11 @@ pub fn run_against(
                 format!("known Δ={:+} tol={}", r.delta, r.effective_tolerance,)
             }
             Verdict::Pass => String::new(),
-            Verdict::Fail => format!(
+            // Fail / Skip / Degraded all surface the same numeric detail.
+            // `run_cycle_case` only produces Pass/Fail today; tolerating
+            // Skip/Degraded keeps this match exhaustive without forcing a
+            // separate code path.
+            Verdict::Fail | Verdict::Skip | Verdict::Degraded => format!(
                 "hw={} emu={} delta={:+} tol={}",
                 r.hw_per_iter, r.emu_per_iter, r.delta, r.effective_tolerance,
             ),

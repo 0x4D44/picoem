@@ -192,7 +192,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         total += 1;
         match r.verdict {
             Verdict::Pass => pass += 1,
-            Verdict::Fail => fail += 1,
+            Verdict::Fail | Verdict::Skip | Verdict::Degraded => fail += 1,
         }
         let eff_tol = dualcore_cases::effective_tolerance(case, args.tolerance);
         println!(

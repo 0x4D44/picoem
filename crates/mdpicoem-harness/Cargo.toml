@@ -1,6 +1,6 @@
 [package]
 name = "mdpicoem-harness"
-version = "0.37.1"
+version = "0.38.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -223,6 +223,10 @@ path = "src/bin/silicon_periph_diff_rp2040.rs"
 [[bin]]
 name = "silicon_isr_diff_rp2040"
 path = "src/bin/silicon_isr_diff_rp2040.rs"
+
+[[bin]]
+name = "test_silicon_rp2040"
+path = "src/bin/test_silicon_rp2040.rs"
 
 # ---------------------------------------------------------------------------
 # Cross-cutting / threading micro-benchmarks

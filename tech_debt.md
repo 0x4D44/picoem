@@ -2,6 +2,35 @@
 
 Items discovered during development that need addressing in later phases.
 
+## WATCHDOG REASON modelling + reset-survival (2026-04-28, Track 4)
+
+The Track 4 `watchdog_timer_bite_reason` scenario in
+`crates/mdpicoem-harness/src/silicon_scenarios.rs` was downgraded from
+"actually fire the watchdog and observe REASON.TIMER" to "seed the
+countdown and observe TIME advancing". Two gaps need closing before a
+true bite-and-observe scenario is viable:
+
+1. **Emulator REASON modelling.** `WatchdogRegs::reason` in
+   `crates/mdrp2350/src/peripherals/watchdog.rs:79` is hardcoded to 0
+   and `read32` returns it verbatim. The emulator never sets
+   REASON.TIMER even when the countdown reaches zero. A bite-and-
+   observe scenario would diverge HW=1 vs EMU=0 today.
+2. **Reset-survival in `run_scenario_with_retry`.** A real watchdog
+   bite resets the core mid-scenario, surfacing as `probe_rs::Error::
+   Arm` (not just `Probe`/`Timeout`). The current retry path in
+   `run_scenario_with_retry` would not survive this cleanly, and the
+   `run_against` cleanup that reads RESETS post-scenario would race a
+   half-reset core. Future bite scenarios need explicit handling for
+   the watchdog-reset path.
+
+A separate datasheet quirk informs the current downgraded scenario's
+observable choice: REASON.TIMER is sticky on silicon across watchdog
+resets until firmware clears it (datasheet §4.7.5). If a previous test
+or probe-attach sequence triggered the watchdog, silicon's
+REASON.TIMER stays set across power cycles, so even a "expect
+REASON=0 because we didn't bite" observable is flake-prone. The
+downgraded scenario observes only CTRL.TIME decrement.
+
 ## SpinBarrier watchdog tuning follow-ups (2026-04-24, Stage 5)
 
 Stage 5 added a wall-clock watchdog to `SpinBarrier::wait` in

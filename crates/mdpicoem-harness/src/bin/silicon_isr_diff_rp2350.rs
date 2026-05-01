@@ -135,7 +135,9 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         for o in &outcomes {
             match o.verdict {
                 Verdict::Pass => pass += 1,
-                Verdict::Fail => fail += 1,
+                // M33 oracles do not currently emit Skip/Degraded, but
+                // tolerate them to keep the match exhaustive.
+                Verdict::Fail | Verdict::Skip | Verdict::Degraded => fail += 1,
             }
             println!(
                 "{:<40} {:>6}ms {:>8}  {}",

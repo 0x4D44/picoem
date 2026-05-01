@@ -29,14 +29,10 @@
 // See `wrk_docs/2026.04.15 - HLD - test_silicon Orchestrator and Coverage
 // Expansion.md` §Component 1 for the full contract.
 
-use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use mdpicoem_harness::bank_conflict_cases::{self, BankArgs};
 use mdpicoem_harness::cycle_cases::{self, CycleArgs};
@@ -44,16 +40,16 @@ use mdpicoem_harness::dualcore_cases::{self, DualCoreArgs};
 use mdpicoem_harness::isr_scenarios::{self, IsrArgs};
 use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter, should_exclude};
 use mdpicoem_harness::silicon_scenarios::{self, PeriphArgs};
-use probe_rs::probe::{DebugProbeSelector, list::Lister};
-use probe_rs::{Permissions, Session, SessionConfig};
+use mdpicoem_harness::test_silicon_common::{
+    GIVE_UP_THRESHOLD, HEARTBEAT_INTERVAL, NameInterner, Summary, append_error_log,
+    attach as common_attach, default_seed, emit_log_line, errors_log_path as common_errors_log_path,
+    fmt_elapsed, iter_seed, now_iso, parse_duration, reattach_with_retries as common_reattach,
+    shuffle_in_place, validate_catalogue_names_are_unique,
+};
+use probe_rs::probe::DebugProbeSelector;
+use probe_rs::Session;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-
-const REATTACH_RETRY: Duration = Duration::from_secs(5);
-const REATTACH_TIMEOUT: Duration = Duration::from_secs(60);
-const REATTACH_INITIAL_SLEEP: Duration = Duration::from_secs(1);
-const GIVE_UP_THRESHOLD: u32 = 3;
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3600);
 
 // Oracle identifiers (match what `CaseOutcome.oracle` carries from each
 // library API). Kept in one place so the summary + filtering stay in sync.
@@ -119,7 +115,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
                 if i >= argv.len() {
                     return Err(format!("--soak requires a duration\n{USAGE}"));
                 }
-                soak = Some(parse_duration(&argv[i])?);
+                soak = Some(parse_duration(&argv[i]).map_err(|e| format!("{e}\n{USAGE}"))?);
             }
             "--seed" => {
                 i += 1;
@@ -175,72 +171,6 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
     })
 }
 
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    humantime::parse_duration(s).map_err(|e| format!("invalid duration '{s}': {e}\n{USAGE}"))
-}
-
-fn default_seed() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-// ---------------------------------------------------------------------------
-// Name-list shuffling (Fisher-Yates; operates on `&'static str` slices
-// so the original catalogue arrays stay intact)
-// ---------------------------------------------------------------------------
-
-fn shuffle_in_place<T>(v: &mut [T], rng: &mut StdRng) {
-    use rand::RngCore;
-    for i in (1..v.len()).rev() {
-        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
-        v.swap(i, j);
-    }
-}
-
-fn iter_seed(base_seed: u64, iter_index: u64) -> u64 {
-    base_seed.wrapping_add(iter_index)
-}
-
-// ---------------------------------------------------------------------------
-// Substring-uniqueness validator
-// ---------------------------------------------------------------------------
-
-/// Validate that the combined set of case names across the three
-/// catalogues has no name that is a strict substring of another. The
-/// orchestrator's filter semantics (and the library APIs' `filter`
-/// arguments) are substring-match, and one oracle's name being a substring
-/// of another would alias two cases under a single `--filter` flag. Fail
-/// fast at startup — a corrupt filter is worse than a clean refusal.
-///
-/// Returns `Err` with a human-readable message pointing at the first
-/// offending pair; returns `Ok(())` otherwise.
-fn validate_catalogue_names_are_unique(names: &[&str]) -> Result<(), String> {
-    // O(N^2). The catalogues together carry ~50 names; the whole check
-    // runs in microseconds.
-    for (i, a) in names.iter().enumerate() {
-        for (j, b) in names.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            if a == b {
-                return Err(format!(
-                    "duplicate case name '{a}' appears in two catalogues; \
-                     names must be unique across oracles",
-                ));
-            }
-            if a.contains(b) {
-                return Err(format!(
-                    "case name '{b}' is a substring of '{a}'; \
-                     the orchestrator's filter logic relies on uniqueness",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Combine the five catalogues' names into one `Vec<&str>` for the
 /// validator to chew on. Called once at startup.
 fn collect_all_catalogue_names() -> Vec<&'static str> {
@@ -261,34 +191,6 @@ fn collect_all_catalogue_names() -> Vec<&'static str> {
         names.push(s.name);
     }
     names
-}
-
-// ---------------------------------------------------------------------------
-// Synthetic-case-name interner
-// ---------------------------------------------------------------------------
-//
-// `CaseOutcome.case` is `&'static str`. When the orchestrator synthesises
-// a FAIL outcome for a watchdog / probe-rs error, the case name can be a
-// runtime-assembled string (e.g. the oracle name plus a sentinel). We
-// intern each such name exactly once via `Box::leak` so repeated failures
-// on the same synthetic name do not accumulate leaks over a week-long
-// soak run. Bounded by the number of distinct synthetic names ever
-// emitted — in practice just the two sentinels plus per-oracle tags.
-
-#[derive(Default)]
-struct NameInterner {
-    seen: BTreeMap<String, &'static str>,
-}
-
-impl NameInterner {
-    fn intern(&mut self, s: &str) -> &'static str {
-        if let Some(v) = self.seen.get(s) {
-            return v;
-        }
-        let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-        self.seen.insert(s.to_string(), leaked);
-        leaked
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,143 +322,18 @@ fn run_one_oracle(session: &mut Session, plan: &OraclePlan) -> Result<Vec<CaseOu
     result.map_err(|e| e.to_string())
 }
 
+/// Local wrappers binding chip = "rp2350" so the call sites read the
+/// same as before the test_silicon_common extraction.
 fn attach(probe: Option<&DebugProbeSelector>) -> Result<Session, probe_rs::Error> {
-    let mut session = match probe {
-        None => Session::auto_attach("rp2350", SessionConfig::default())?,
-        Some(selector) => {
-            let probe = Lister::new().open(selector.clone())?;
-            probe.attach("rp2350", Permissions::default())?
-        }
-    };
-    // Reset + halt on attach so the first oracle finds the core in a
-    // known state. Standalone oracle binaries call `reset_and_halt`
-    // themselves right after opening the session; test_silicon skipped
-    // this step and the cycle oracle's first `write_core_reg` landed on
-    // a running target → "An ARM specific error occurred".
-    session
-        .core(0)?
-        .reset_and_halt(Duration::from_millis(500))?;
-    Ok(session)
+    common_attach("rp2350", probe)
 }
 
-/// Re-attach with the HLD retry schedule: sleep 1s, then retry every 5s up
-/// to 60s. Returns the fresh Session or the last error.
 fn reattach_with_retries(probe: Option<&DebugProbeSelector>) -> Result<Session, String> {
-    thread::sleep(REATTACH_INITIAL_SLEEP);
-    let deadline = Instant::now() + REATTACH_TIMEOUT;
-    loop {
-        match attach(probe) {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                if Instant::now() >= deadline {
-                    return Err(e.to_string());
-                }
-                thread::sleep(REATTACH_RETRY);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Logging helpers
-// ---------------------------------------------------------------------------
-
-/// Format an elapsed duration as `[+HH:MM:SS]`.
-fn fmt_elapsed(d: Duration) -> String {
-    let total = d.as_secs();
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    format!("[+{h:02}:{m:02}:{s:02}]")
+    common_reattach("rp2350", probe)
 }
 
 fn errors_log_path() -> PathBuf {
-    let pid = std::process::id();
-    PathBuf::from(format!("fuzz-runs/test_silicon.{pid}.errors.log"))
-}
-
-fn ensure_fuzz_runs_dir() -> std::io::Result<()> {
-    std::fs::create_dir_all("fuzz-runs")
-}
-
-fn append_error_log(path: &PathBuf, line: &str) {
-    let _ = ensure_fuzz_runs_dir();
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
-    }
-}
-
-/// Print a line to stdout, mirror to stderr, and append to the
-/// catastrophic-failure log. One call per FAIL / probe error / reattach
-/// failure keeps the soak-loop body terse.
-fn emit_log_line(log_path: &PathBuf, line: &str) {
-    println!("{line}");
-    eprintln!("{line}");
-    append_error_log(log_path, line);
-}
-
-// ---------------------------------------------------------------------------
-// Summary bookkeeping
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct Stats {
-    pass: u64,
-    fail: u64,
-}
-
-#[derive(Default)]
-struct Summary {
-    totals: BTreeMap<&'static str, Stats>,
-    reattach_count: u64,
-    /// (oracle, case) -> smallest iter_seed that reproduced a FAIL.
-    failing_cases: BTreeMap<(&'static str, String), u64>,
-}
-
-impl Summary {
-    fn record(&mut self, outcomes: &[CaseOutcome], iter_seed_for_fail: u64) {
-        for o in outcomes {
-            let s = self.totals.entry(o.oracle).or_default();
-            match o.verdict {
-                Verdict::Pass => s.pass += 1,
-                Verdict::Fail => {
-                    s.fail += 1;
-                    let key = (o.oracle, o.case.to_string());
-                    self.failing_cases
-                        .entry(key)
-                        .and_modify(|old| {
-                            if iter_seed_for_fail < *old {
-                                *old = iter_seed_for_fail;
-                            }
-                        })
-                        .or_insert(iter_seed_for_fail);
-                }
-            }
-        }
-    }
-
-    fn total_fail(&self) -> u64 {
-        self.totals.values().map(|s| s.fail).sum()
-    }
-
-    fn print(&self, iterations: u64) {
-        println!();
-        println!("================ test_silicon summary ================");
-        println!("iterations:   {iterations}");
-        for (oracle, s) in &self.totals {
-            println!("  {:<8} pass={:>6}  fail={:>6}", oracle, s.pass, s.fail,);
-        }
-        println!("reattach_count:    {}", self.reattach_count);
-        if self.failing_cases.is_empty() {
-            println!("failing cases: none");
-        } else {
-            println!("failing cases (oracle / case / smallest-repro-seed):");
-            for ((oracle, case), seed) in &self.failing_cases {
-                println!("  {oracle:<8} {case:<40} seed={seed}");
-            }
-        }
-        println!("======================================================");
-    }
+    common_errors_log_path("test_silicon")
 }
 
 // ---------------------------------------------------------------------------
@@ -643,7 +420,7 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
                 probe_sel,
             )?;
             let _ = session; // silence unused warning after last use
-            summary.print(1);
+            summary.print("test_silicon summary", 1);
             if summary.total_fail() > 0 {
                 return Ok(1);
             }
@@ -660,7 +437,7 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
                 stop_flag,
                 probe_sel,
             )?;
-            summary.print(total_iters);
+            summary.print("test_silicon summary", total_iters);
             if give_up_code == 2 {
                 return Ok(2);
             }
@@ -670,12 +447,6 @@ fn orchestrate(args: &CliArgs, stop_flag: Arc<AtomicBool>) -> Result<i32, String
             Ok(0)
         }
     }
-}
-
-fn now_iso() -> String {
-    let now = SystemTime::now();
-    let dt: chrono::DateTime<chrono::Utc> = now.into();
-    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Single-pass mode. Runs each oracle's whole catalogue once in
@@ -1192,8 +963,8 @@ mod tests {
         s.record(&[oc("nop_chain_8")], 200);
 
         assert_eq!(s.failing_cases.len(), 2);
-        let key1 = (ORACLE_CYCLE, "backward_branch_large".to_string());
-        let key2 = (ORACLE_CYCLE, "nop_chain_8".to_string());
+        let key1 = (ORACLE_CYCLE, "backward_branch_large");
+        let key2 = (ORACLE_CYCLE, "nop_chain_8");
         assert_eq!(s.failing_cases.get(&key1), Some(&50));
         assert_eq!(s.failing_cases.get(&key2), Some(&200));
         assert_eq!(s.total_fail(), 4);

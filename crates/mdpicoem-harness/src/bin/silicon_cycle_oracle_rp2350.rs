@@ -185,7 +185,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         total += 1;
         match r.verdict {
             Verdict::Pass => pass += 1,
-            Verdict::Fail => fail += 1,
+            Verdict::Fail | Verdict::Skip | Verdict::Degraded => fail += 1,
         }
         // HLD §6.2 + lead addendum: when a case passes only due to
         // non-zero effective tolerance, print `PASS (known Δ=<delta>,

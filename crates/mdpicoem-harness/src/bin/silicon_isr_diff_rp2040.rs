@@ -106,6 +106,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let t_total = Instant::now();
     let mut pass = 0usize;
     let mut fail = 0usize;
+    let mut skip = 0usize;
+    let mut degraded = 0usize;
 
     println!(
         "{:<40} {:>8} {:>8}  first_divergence",
@@ -115,11 +117,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     {
         let mut core = session.core(0)?;
-        let outcomes = isr_scenarios_rp2040::run_against(&mut core, &args)?;
+        let outcomes = isr_scenarios_rp2040::run_against(&mut core, &args, None, None)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
         for o in &outcomes {
             match o.verdict {
                 Verdict::Pass => pass += 1,
                 Verdict::Fail => fail += 1,
+                Verdict::Skip => skip += 1,
+                Verdict::Degraded => degraded += 1,
             }
             println!(
                 "{:<40} {:>6}ms {:>8}  {}",
@@ -134,10 +139,12 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let elapsed = t_total.elapsed();
     println!();
     println!(
-        "summary: total={} pass={} fail={}  ({:.2}s)",
-        pass + fail,
+        "summary: total={} pass={} fail={} skip={} degraded={}  ({:.2}s)",
+        pass + fail + skip + degraded,
         pass,
         fail,
+        skip,
+        degraded,
         elapsed.as_secs_f64(),
     );
     Ok(if fail > 0 { 1 } else { 0 })

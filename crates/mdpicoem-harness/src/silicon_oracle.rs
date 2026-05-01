@@ -45,10 +45,26 @@ pub const CYCCNTENA: u32 = 1 << 0;
 // ---------------------------------------------------------------------------
 
 /// A single case's verdict.
+///
+/// `Skip` and `Degraded` were added to preserve signal that previously
+/// collapsed under `Fail`: a probe-rs transport hiccup (degraded) should
+/// drive reattach decisions, while a filter-gap UNDEF on silicon (skip)
+/// is a coverage gap, not a divergence — neither is a true emulator
+/// failure. Existing match sites that only knew `Pass`/`Fail` need to
+/// tolerate the new variants; the orchestrator-side bookkeeping treats
+/// them as their own counters.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Verdict {
     Pass,
     Fail,
+    /// Case could not be evaluated against silicon (e.g. filter-gap
+    /// UNDEF where silicon dispatched into the bootrom HardFault path).
+    /// Coverage gap, not divergence.
+    Skip,
+    /// Probe-rs / transport-level error during the case. Does not
+    /// indicate emulator divergence; signals that the probe channel is
+    /// unstable. The orchestrator uses these to drive reattach.
+    Degraded,
 }
 
 impl Verdict {
@@ -56,6 +72,8 @@ impl Verdict {
         match self {
             Verdict::Pass => "PASS",
             Verdict::Fail => "FAIL",
+            Verdict::Skip => "SKIP",
+            Verdict::Degraded => "DEGR",
         }
     }
 }
@@ -98,6 +116,39 @@ impl CaseOutcome {
             oracle,
             case,
             verdict: Verdict::Fail,
+            detail: detail.into(),
+            elapsed_ms,
+        }
+    }
+
+    /// Filter-gap or coverage-only outcome — case skipped, not failed.
+    pub fn skip(
+        oracle: &'static str,
+        case: &'static str,
+        detail: impl Into<String>,
+        elapsed_ms: u32,
+    ) -> Self {
+        Self {
+            oracle,
+            case,
+            verdict: Verdict::Skip,
+            detail: detail.into(),
+            elapsed_ms,
+        }
+    }
+
+    /// Probe-rs / transport-level error during the case. Surfaces a
+    /// degraded probe channel rather than emulator divergence.
+    pub fn degraded(
+        oracle: &'static str,
+        case: &'static str,
+        detail: impl Into<String>,
+        elapsed_ms: u32,
+    ) -> Self {
+        Self {
+            oracle,
+            case,
+            verdict: Verdict::Degraded,
             detail: detail.into(),
             elapsed_ms,
         }
@@ -196,6 +247,34 @@ mod tests {
     fn test_verdict_as_str() {
         assert_eq!(Verdict::Pass.as_str(), "PASS");
         assert_eq!(Verdict::Fail.as_str(), "FAIL");
+        assert_eq!(Verdict::Skip.as_str(), "SKIP");
+        assert_eq!(Verdict::Degraded.as_str(), "DEGR");
+    }
+
+    #[test]
+    fn test_case_outcome_skip_round_trip() {
+        let o = CaseOutcome::skip(
+            "probe_diff",
+            "bx_pc_with_garbage",
+            "UNDEF_ON_SILICON: pc=0x00000004",
+            3,
+        );
+        assert_eq!(o.verdict, Verdict::Skip);
+        assert!(o.detail.starts_with("UNDEF_ON_SILICON"));
+        assert_eq!(o.elapsed_ms, 3);
+    }
+
+    #[test]
+    fn test_case_outcome_degraded_round_trip() {
+        let o = CaseOutcome::degraded(
+            "probe_diff",
+            "ldrh_at_overrun",
+            "probe-rs error: USB stall",
+            8,
+        );
+        assert_eq!(o.verdict, Verdict::Degraded);
+        assert!(o.detail.contains("USB stall"));
+        assert_eq!(o.elapsed_ms, 8);
     }
 
     #[test]

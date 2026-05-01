@@ -91,16 +91,11 @@ required-features = ["testing"]
 name = "dual_model"
 required-features = ["threading"]
 
-# docs.rs builds on Linux x86_64. The `threading` feature is currently
-# Windows-only at the source level (mdpicoem_common::threaded is gated
-# to x86_64-windows; mdrp2350::threaded::* references items from it
-# unconditionally when the feature is on, which fails to compile on
-# other targets). For 0.1.x we document the Serial-only baseline; the
-# threaded runtime is described in the README + the `threaded` module's
-# top-level doc comment for Windows users who opt into the feature.
-# This will be revisited in 0.2 once the threaded modules are properly
-# stubbed for non-Windows targets.
+# docs.rs builds on Linux x86_64. Enable all opt-in features so the
+# rendered API surface includes the threaded runtime (`x86_64`-Linux is
+# one of the two supported platforms for `ThreadedEmulator`) plus the
+# test-only hooks that integration tests reference.
 [package.metadata.docs.rs]
-features = ["testing", "test-hooks"]
+features = ["threading", "testing", "test-hooks"]
 targets = ["x86_64-unknown-linux-gnu"]
 rustdoc-args = ["--cfg", "docsrs"]

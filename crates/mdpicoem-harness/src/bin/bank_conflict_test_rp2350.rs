@@ -141,7 +141,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         total += 1;
         match r.verdict {
             Verdict::Pass => pass += 1,
-            Verdict::Fail => fail += 1,
+            Verdict::Fail | Verdict::Skip | Verdict::Degraded => fail += 1,
         }
         println!(
             "{:<26} {:>5} {:>5} 0x{:08X} {:>9} {:>7} {:>7} {:>+7} {:>6} {:>6}",

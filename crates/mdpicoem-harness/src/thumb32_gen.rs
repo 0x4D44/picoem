@@ -7882,7 +7882,7 @@ fn boundary_bl_cases() -> Vec<TestCase> {
         .map(|(offset, label)| {
             let (hw0, hw1) = enc_t32_bl(*offset);
             TestCase {
-                name: format!("FUZZ-BOUNDARY: BL {label}"),
+                name: format!("FUZZ:BOUNDARY_BL {label}"),
                 opcode: hw0,
                 hw1: Some(hw1),
                 xpsr_pre: 0x0100_0000, // T bit set, flags clear

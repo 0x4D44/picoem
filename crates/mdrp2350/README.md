@@ -74,13 +74,16 @@ emulator instance:
   path (QEMU diff, silicon diff). Recommended for most uses.
 - **`ExecutionModel::Threaded`** — six-thread worker runtime,
   barrier-synchronised at the quantum boundary. Faster for compute-heavy
-  workloads. **Currently x86_64 Windows only**; on other platforms
-  `Builder::build()` returns `ConfigError::ThreadingUnavailable`.
+  workloads. Currently supported on **x86_64 Windows and x86_64 Linux**;
+  on other platforms `Builder::build()` returns
+  `ConfigError::ThreadingUnavailable`.
 
 ## Features
 
-- `threading` (default) — feature-gates the threaded runtime. Disable for
-  Serial-only builds on non-Windows hosts.
+- `threading` — feature-gates the threaded runtime. Opt-in for V1 so
+  `cargo add mdrp2350` works cross-platform out of the box; on x86_64
+  Windows or x86_64 Linux, enable with
+  `cargo add mdrp2350 --features threading` to use `ThreadedEmulator`.
 - `testing` — opt-in panic-injection APIs for the panic-containment test
   suite. **Do not enable in production builds.**
 - `test-hooks` — exposes test-only PIO hooks for cross-crate testing.
