@@ -1219,18 +1219,19 @@ impl Bus {
         self.atomics.clear_bus_fault(core);
     }
 
-    /// Test-only: seed the SCB HFSR storage observable by `Bus::read32(SCB_HFSR)`.
+    /// Test-only: seed the SCB HFSR storage in `Bus::peripheral_regs` so the
+    /// narrow-access audit suite can stage a known prior value without an
+    /// Emulator/CortexM33 in scope.
     ///
-    /// HFSR is set in production exclusively via the fault-escalation path on
-    /// `CortexM33::ppb`. This helper exists so the narrow-access audit suite
+    /// HFSR is set in production exclusively via the fault-escalation path
+    /// on `CortexM33::ppb`. The current consumer
     /// (`tests_narrow.rs::s65_scb_hfsr_byte_write_clears_only_target_lane`)
-    /// can seed HFSR without an Emulator/CortexM33 in scope. The seed is
-    /// written into `Bus::peripheral_regs[SCB_HFSR]`; subsequent
-    /// `Bus::read32(SCB_HFSR)` consults that map under the matching cfg-gated
-    /// short-circuit in the region 0xE read path (see `read32` below).
+    /// only pins the no-fault contract through `Bus::write8`; it does not
+    /// read the seed back. Future Stage 2/3/4 narrow-access work that
+    /// splices through `peripheral_regs` will be the first true reader.
     ///
-    /// Feature-gated via `cfg(any(test, feature = "testing"))`. Never reachable
-    /// in a release library build.
+    /// Feature-gated via `cfg(any(test, feature = "testing"))`. Never
+    /// reachable in a release library build.
     #[cfg(any(test, feature = "testing"))]
     pub fn seed_hfsr_for_test(&mut self, value: u32) {
         const SCB_HFSR_ADDR: u32 = 0xE000_ED2C;
@@ -2916,16 +2917,6 @@ impl Bus {
                 self.coresight_trace.read32(addr - CORESIGHT_TRACE_BASE)
             }
             _ => {
-                // Test-only: serve seeded SCB_HFSR reads from the
-                // peripheral_regs catch-all so `seed_hfsr_for_test` has a
-                // matching reader. One-address intercept under the same cfg
-                // — production binaries are byte-identical.
-                #[cfg(any(test, feature = "testing"))]
-                if addr == 0xE000_ED2C {
-                    if let Some(v) = self.peripheral_regs.get(&addr) {
-                        return *v;
-                    }
-                }
                 self.atomics.set_bus_fault(core as usize, addr);
                 0
             }

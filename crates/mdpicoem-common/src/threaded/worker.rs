@@ -82,8 +82,17 @@ pub fn pin_to_host_core(host_core: usize) {
     {
         use winapi::um::processthreadsapi::GetCurrentThread;
         use winapi::um::winbase::SetThreadAffinityMask;
+        // SAFETY: `GetCurrentThread` is a pure FFI call that returns a
+        // pseudo-handle to the calling thread. It takes no arguments,
+        // never fails, and the handle does not need to be closed.
         let h = unsafe { GetCurrentThread() };
         let mask = 1usize << host_core;
+        // SAFETY: `h` is the valid pseudo-handle just returned by
+        // `GetCurrentThread`. `mask` is non-zero because the
+        // `host_core < usize::BITS` precondition asserted above bounds
+        // the shift, so `1 << host_core` cannot wrap to 0 (an all-zero
+        // mask is the only invalid value `SetThreadAffinityMask`
+        // rejects). FFI signature otherwise has no further preconditions.
         let prev = unsafe { SetThreadAffinityMask(h, mask) };
         assert!(
             prev != 0,
@@ -92,11 +101,24 @@ pub fn pin_to_host_core(host_core: usize) {
     }
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: `cpu_set_t` is a fixed-size POD bitset (a `[u64; 16]`
+        // wrapper on glibc x86_64) for which the all-zero bit pattern
+        // is valid and equivalent to `CPU_ZERO`.
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `&mut set` is a valid, aligned, exclusive pointer to
+        // a fully-initialized `cpu_set_t`. `host_core` is bounded by
+        // the `host_core < usize::BITS` precondition (≤ 63 on 64-bit),
+        // well below `CPU_SETSIZE` (1024 on glibc), so `CPU_SET` will
+        // not write out of bounds.
         unsafe {
             libc::CPU_ZERO(&mut set);
             libc::CPU_SET(host_core, &mut set);
         }
+        // SAFETY: `pthread_self()` always returns the calling thread's
+        // valid pthread handle. `cpusetsize` matches the layout of the
+        // `cpu_set_t` we just initialized, and `&set` is a valid
+        // pointer to that initialized value for the duration of the
+        // call. The kernel only reads through the pointer.
         let rc = unsafe {
             libc::pthread_setaffinity_np(
                 libc::pthread_self(),

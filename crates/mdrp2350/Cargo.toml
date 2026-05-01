@@ -1,6 +1,6 @@
 [package]
 name = "mdrp2350"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -72,18 +72,6 @@ sha2 = { version = "0.10", features = ["compress"] }
 [dev-dependencies]
 mdpicoem-common = { path = "../mdpicoem-common", features = ["test-hooks"] }
 tracing-subscriber = { workspace = true }
-
-# Threading Phase 3 Stage 6b (LLD V7 §8/§9): host thread-affinity
-# pinning for the 6-thread runtime. The `ThreadedEmulator` path is
-# `#[cfg]`-gated to x86_64 Windows + x86_64 Linux. Each platform has
-# its own affinity API, so the per-OS deps are kept narrow:
-# - Windows uses `SetThreadAffinityMask` from `winapi`.
-# - Linux uses `pthread_setaffinity_np` from `libc`.
-[target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }
-
-[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
-libc = "0.2"
 
 # Dual-execution HLD V1 Stage 1b review (REQUIRED #2): the
 # `execution_model` integration test exercises `Emulator::
