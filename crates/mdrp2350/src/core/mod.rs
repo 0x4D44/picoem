@@ -251,7 +251,7 @@ pub struct CortexM33 {
     /// "read PC" value (instr_addr + 4) per ARM architecture definition.
     current_instr_addr: u32,
     /// IT block state. Format: cond[7:4]:mask[3:0]. mask=0 means not in IT block.
-    it_state: u8,
+    pub(crate) it_state: u8,
     /// Pending synchronous fault from the most recent instruction.
     pub(crate) pending_fault: Option<Fault>,
     /// DCP (CP4/5) half-word register file. Eight double-precision slots

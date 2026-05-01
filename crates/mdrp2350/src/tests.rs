@@ -19897,6 +19897,40 @@ mod stage7_exceptions_coverage {
         assert_eq!(decoded, 0xAB);
     }
 
+    /// Direct test of `encode_it_to_xpsr` across IT state values that
+    /// independently exercise the two output bit groups: bits[26:25]
+    /// (from `it & 0xC0`) and bits[15:10] (from `it & 0x3F`). Catches
+    /// the `| → ^/&`, `<< → >>`, and `& → |/^` mutations on the two
+    /// shift-and-or expressions in the encoder.
+    #[test]
+    fn it_state_encode_to_xpsr_bit_groups() {
+        let mut cpu = CortexM33::for_test(0);
+        // Each test case exercises a different bit pattern across both
+        // groups. The expected encoding mirrors the source formula:
+        //   ((it & 0xC0) << 19) | ((it & 0x3F) << 10)
+        let cases: [(u8, u32); 8] = [
+            (0x00, 0x0000_0000),
+            (0xFF, ((0xFFu32 & 0xC0) << 19) | ((0xFFu32 & 0x3F) << 10)),
+            (0xC0, (0xC0u32 & 0xC0) << 19),                 // top bits only
+            (0x3F, (0x3Fu32 & 0x3F) << 10),                 // bottom bits only
+            (0x80, (0x80u32 & 0xC0) << 19),                 // bit 7 only
+            (0x40, (0x40u32 & 0xC0) << 19),                 // bit 6 only
+            (0x01, (0x01u32 & 0x3F) << 10),                 // bit 0 only
+            (0xAB, ((0xABu32 & 0xC0) << 19) | ((0xABu32 & 0x3F) << 10)),
+        ];
+        for (it, expected) in cases {
+            cpu.it_state = it;
+            let encoded = cpu.encode_it_to_xpsr();
+            assert_eq!(
+                encoded, expected,
+                "it_state=0x{it:02X}: expected 0x{expected:08X}, got 0x{encoded:08X}"
+            );
+            // Roundtrip through the decoder for free coverage.
+            let decoded = CortexM33::decode_it_from_xpsr(encoded);
+            assert_eq!(decoded, it, "decode roundtrip mismatch for 0x{it:02X}");
+        }
+    }
+
     // execute_tt: SAU disabled + MPU match.
     #[test]
     fn tt_sau_off_with_mpu_match() {
@@ -19964,6 +19998,54 @@ mod stage7_exceptions_coverage {
         assert_eq!(r_rom_ns & (1 << 25), 0);
         let r_unknown = cpu.execute_tt(0x7000_0000);
         assert_eq!(r_unknown & (1 << 25), 0);
+    }
+
+    /// Exhaustive IDAU sweep — verifies the secure/non-secure
+    /// classification for every high-nibble in 0x0..=0xF. Catches
+    /// `delete match arm 0xN` mutations on `rp2350_idau` and the
+    /// `addr < 0x0000_8000` boundary mutation on the 0x0 arm. Driven
+    /// by the bit-23 (IRVALID-secure) and bit-25 (RP2350 exempt) flags
+    /// which the IDAU sets together for recognized secure regions.
+    #[test]
+    fn tt_idau_full_high_nibble_sweep() {
+        let cpu = CortexM33::for_test(0);
+        // Secure-classified prefixes per rp2350_idau dispatch table:
+        //   0x0 (low 32K), 0x1 XIP, 0x2/0x3 SRAM, 0x4/0x5 peripherals,
+        //   0xD SIO, 0xE PPB.
+        // Use 0x10 offset within each prefix to avoid the special low
+        // 0x0 boundary; for 0x0 itself we test both halves below.
+        let secure_prefixes: [u32; 8] = [0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0xD, 0xE];
+        let nonsecure_prefixes: [u32; 8] = [0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xF];
+
+        for prefix in secure_prefixes {
+            let addr = (prefix << 28) | 0x0010; // small offset, away from boundary
+            let r = cpu.execute_tt(addr);
+            assert_ne!(
+                r & (1 << 23),
+                0,
+                "prefix 0x{prefix:X} should be IRVALID-secure (IDAU bit 23)"
+            );
+            assert_ne!(
+                r & (1 << 25),
+                0,
+                "prefix 0x{prefix:X} should be RP2350-exempt (IDAU bit 25)"
+            );
+        }
+        for prefix in nonsecure_prefixes {
+            let addr = (prefix << 28) | 0x0010;
+            let r = cpu.execute_tt(addr);
+            assert_eq!(
+                r & (1 << 25),
+                0,
+                "prefix 0x{prefix:X} should NOT be RP2350-exempt"
+            );
+        }
+
+        // 0x0 boundary: addr < 0x8000 secure; addr >= 0x8000 non-secure.
+        let r_lo = cpu.execute_tt(0x0000_7FFF);
+        assert_ne!(r_lo & (1 << 25), 0, "0x0000_7FFF (lower 32K) should be exempt");
+        let r_hi = cpu.execute_tt(0x0000_8000);
+        assert_eq!(r_hi & (1 << 25), 0, "0x0000_8000 (upper 32K) should NOT be exempt");
     }
 
     // enter_exception return_address branches (synchronous faults).
