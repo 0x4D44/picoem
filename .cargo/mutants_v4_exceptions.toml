@@ -1,0 +1,15 @@
+# V4 Thread 3 — narrow cargo-mutants to exceptions.rs files only.
+# Validates the V3 framework on a fresh file (vector table, stacking,
+# EXC_RETURN, NVIC integration, fault handlers).
+examine_globs = [
+    "crates/mdrp2350/src/core/exceptions.rs",
+    "crates/mdrp2040/src/core/exceptions.rs",
+]
+
+# Same generous timeout as the workspace default — exceptions paths
+# include some tight loops (e.g. exception-entry register stacking).
+timeout_multiplier = 5.0
+
+# Restrict cargo invocations to the two chip crates (no harness rebuild
+# costs). Same scoping as the V3 decode.rs validation.
+test_package = ["mdrp2350", "mdrp2040"]
