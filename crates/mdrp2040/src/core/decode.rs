@@ -42,11 +42,20 @@ pub(crate) fn is_wide(hw0: u16) -> bool {
 /// a synchronous fault — i.e. pure-ALU on registers, MOV-imm, hints,
 /// barriers, and BL / B / B.cond.
 ///
-/// Reserved for the iter7 fast-path skip; iter6 sets the flag at
-/// populate time but does not act on it. Conservative-by-default: a
-/// false negative just means the slow path runs (no harm); a false
-/// positive would silently change cycle accounting, so anything that
-/// might touch the bus is classified impure.
+/// Decode oracle for the `classifier_tests` module below (V3 Stream A,
+/// commit `dabf3b3`; see `wrk_journals/2026.04.30 - JRN - Mutation
+/// Testing V3 Execution.md` Stage 1 for the methodology). Not consumed
+/// by the production decoder on M0+: the iter7 fast-path skip was
+/// attempted and reverted within noise (commit `2621534`); see
+/// `wrk_docs/2026.04.30 - HLD - RP2040 FLAG_PURE Consumer Removal
+/// V1.md` for context. Kept in tree under `#[cfg(test)]` so Stream A's
+/// 28 test functions continue to land against an oracle.
+///
+/// Conservative-by-default: a false negative just means the slow path
+/// would run (no harm); a false positive would silently change cycle
+/// accounting, so anything that might touch the bus is classified
+/// impure.
+#[cfg(test)]
 fn classify_is_pure(hw0: u16, hw1: u16, wide: bool) -> bool {
     if !wide {
         classify_thumb16_pure(hw0)
@@ -55,6 +64,7 @@ fn classify_is_pure(hw0: u16, hw1: u16, wide: bool) -> bool {
     }
 }
 
+#[cfg(test)]
 fn classify_thumb16_pure(opcode: u16) -> bool {
     match opcode >> 11 {
         // Shifts / add/sub / mov-cmp-add-sub imm — pure ALU.
@@ -85,6 +95,7 @@ fn classify_thumb16_pure(opcode: u16) -> bool {
     }
 }
 
+#[cfg(test)]
 fn classify_thumb16_misc_pure(opcode: u16) -> bool {
     let op = (opcode >> 8) & 0xF;
     match op {
@@ -110,6 +121,7 @@ fn classify_thumb16_misc_pure(opcode: u16) -> bool {
     }
 }
 
+#[cfg(test)]
 fn classify_thumb32_pure(hw0: u16, hw1: u16) -> bool {
     // BL — pure (writes LR + PC only).
     if (hw1 & 0xD000) == 0xD000 {
@@ -186,9 +198,8 @@ impl CortexM0Plus {
     }
 
     /// Populate path — runs on a cache miss. Fetches `hw0` (and `hw1`
-    /// for wide instructions) via the bus, classifies purity, and
-    /// writes the slot. Returns a [`DecodedOp`] for the caller to
-    /// dispatch immediately.
+    /// for wide instructions) via the bus and writes the slot. Returns
+    /// a [`DecodedOp`] for the caller to dispatch immediately.
     ///
     /// Faulty fetches are NOT cached: the slot is left untouched, the
     /// returned entry still carries the fetched halfwords so the
@@ -225,13 +236,9 @@ impl CortexM0Plus {
             };
         }
 
-        let pure = classify_is_pure(hw0, hw1, wide);
         let mut flags = 0u8;
         if wide {
             flags |= DecodedOp::FLAG_WIDE;
-        }
-        if pure {
-            flags |= DecodedOp::FLAG_PURE;
         }
 
         let entry = DecodedOp {
@@ -321,12 +328,12 @@ mod classifier_tests {
     //! input → output mapping; the structural cases give human-readable
     //! diagnostics on failure and document the intended behaviour.
     //!
-    //! Classifier consumer status (mdrp2040): the `FLAG_PURE` field is
-    //! populated at decode time but no production code on mdrp2040 reads
-    //! `is_pure()` (commit `42ee533` deferred the consumer). These
-    //! tests still exercise the classifier directly so mutations land
-    //! against an oracle. When the consumer ships, the consumer-side
-    //! tests will overlap.
+    //! Classifier role on mdrp2040: the four classifier functions exist
+    //! solely as decode oracles for these tests; the production decoder
+    //! does not call them. The fast-path skip was attempted and reverted
+    //! within noise (commit `2621534`) and the populate-side scaffolding
+    //! was removed alongside this comment edit; see `wrk_docs/2026.04.30
+    //! - HLD - RP2040 FLAG_PURE Consumer Removal V1.md` for context.
     //!
     //! NOTE: the fingerprint is "current behaviour, not architectural
     //! truth". If a real classifier bug is fixed, update the asserted
