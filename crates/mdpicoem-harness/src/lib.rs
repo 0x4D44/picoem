@@ -160,6 +160,12 @@ pub const QEMU_TEST_SCRATCH: u32 = 0x0000_0200;
 // Layout within SRAM:
 //   0x2000_0000 .. 0x2000_00FF  — reserved for a minimal vector table
 //                                 (SP at word 0, reset at word 1).
+//   0x2000_0080                 — PRIMER_SLOT — pre-test PRIMASK reset
+//                                 instruction (MSR PRIMASK, R0 with R0=0).
+//                                 Lives inside the vector-table reservation
+//                                 at vector index 32 (first IRQ on ARMv6-M);
+//                                 the M0+ oracle never raises IRQs, so this
+//                                 slot is otherwise unused.
 //   0x2000_0100                 — TEST_SLOT — instruction slot.
 //   0x2000_0200                 — TEST_SCRATCH — 1 KiB data scratch.
 //   0x2000_1000                 — TEST_STACK — grows down from here.
@@ -174,6 +180,14 @@ pub const QEMU_M0PLUS_TEST_STACK: u32 = 0x2000_1000;
 pub const QEMU_M0PLUS_TEST_SCRATCH: u32 = 0x2000_0200;
 /// QEMU M0+: vector table base (SP + reset vector live here).
 pub const QEMU_M0PLUS_VECTOR_TABLE_BASE: u32 = 0x2000_0000;
+/// QEMU M0+: PRIMASK-reset primer slot. A 4-byte `MSR PRIMASK, R0`
+/// instruction is written here once at startup; `run_qemu_side` steps
+/// through it (with R0=0 from the per-test default reset) before each test
+/// to clear PRIMASK. QEMU's CPU state persists across single-step runs, so
+/// without this primer a `MSR PRIMASK, Rn` from a prior test would leak
+/// PRIMASK=1 into the next test — and `MRS Rd, PRIMASK` would then diverge
+/// from the EMU side, which builds a fresh `CortexM0Plus::new()` per test.
+pub const QEMU_M0PLUS_PRIMER_SLOT: u32 = 0x2000_0080;
 
 // Emulator-side M0+ layout. Happens to match the QEMU M0+ layout (mdrp2040's
 // SRAM window also starts at 0x2000_0000), but declared separately so

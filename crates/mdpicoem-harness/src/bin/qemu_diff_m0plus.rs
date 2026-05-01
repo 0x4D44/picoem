@@ -31,14 +31,21 @@ use mdpicoem_harness::gdb_client::{GdbClient, QemuProcess, QemuProfile};
 use mdpicoem_harness::m0plus::{Bus as M0Bus, CortexM0Plus};
 use mdpicoem_harness::{
     CompareBases, EMU_M0PLUS_TEST_SCRATCH, EMU_M0PLUS_TEST_SLOT, EMU_M0PLUS_TEST_STACK, FuzzClass,
-    MASK_ALL_FLAGS, MASK_NZ_ONLY, MASK_NZCV_ONLY, QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT,
-    QEMU_M0PLUS_TEST_STACK, QEMU_M0PLUS_VECTOR_TABLE_BASE, REG_LR, REG_PC, REG_SP, REG_XPSR,
-    RunState, SCRATCH_SIZE, TestCase, compare, generate_all, generate_fuzz_classes,
-    select_fuzz_class, setup_reg,
+    MASK_ALL_FLAGS, MASK_NZ_ONLY, MASK_NZCV_ONLY, QEMU_M0PLUS_PRIMER_SLOT,
+    QEMU_M0PLUS_TEST_SCRATCH, QEMU_M0PLUS_TEST_SLOT, QEMU_M0PLUS_TEST_STACK,
+    QEMU_M0PLUS_VECTOR_TABLE_BASE, REG_LR, REG_PC, REG_SP, REG_XPSR, RunState, SCRATCH_SIZE,
+    TestCase, compare, generate_all, generate_fuzz_classes, select_fuzz_class, setup_reg,
 };
 
 /// BKPT #0 instruction (little-endian bytes).
 const BKPT_BYTES: [u8; 2] = [0x00, 0xBE];
+
+/// `MSR PRIMASK, R0` — Thumb-32, 4 bytes (hw0=0xF380, hw1=0x8810). Written
+/// once to `QEMU_M0PLUS_PRIMER_SLOT` at startup and stepped through before
+/// every test (with R0=0 from the per-test register default) to clear
+/// PRIMASK on QEMU. See the `QEMU_M0PLUS_PRIMER_SLOT` doc-comment for the
+/// rationale.
+const PRIMER_BYTES: [u8; 4] = [0x80, 0xF3, 0x10, 0x88];
 
 /// Set by the Ctrl-C handler. See sibling comment in `qemu_diff_m33`.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -411,6 +418,7 @@ fn setup_vector_table(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Err
     table[0..4].copy_from_slice(&sp_bytes);
     table[4..8].copy_from_slice(&reset_vector);
     gdb.write_mem(QEMU_M0PLUS_VECTOR_TABLE_BASE, &table)?;
+    gdb.write_mem(QEMU_M0PLUS_PRIMER_SLOT, &PRIMER_BYTES)?;
     Ok(())
 }
 
@@ -424,16 +432,25 @@ fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState
     code.extend_from_slice(&BKPT_BYTES);
     gdb.write_mem(QEMU_M0PLUS_TEST_SLOT, &code)?;
 
-    // Register defaults.
+    // Register defaults. R0=0 must be set before the primer step so that
+    // `MSR PRIMASK, R0` clears PRIMASK to 0. `reg_pre` overrides (which may
+    // set R0 to non-zero) are applied AFTER the primer.
     for i in 0..=12u8 {
         gdb.write_reg(i, 0)?;
     }
     gdb.write_reg(REG_SP, QEMU_M0PLUS_TEST_STACK)?;
     gdb.write_reg(REG_LR, 0xFFFF_FFFF)?;
-    gdb.write_reg(REG_PC, QEMU_M0PLUS_TEST_SLOT)?;
+    gdb.write_reg(REG_PC, QEMU_M0PLUS_PRIMER_SLOT)?;
     gdb.write_reg(REG_XPSR, tc.xpsr_pre)?;
 
-    // Register preconditions (with address translation).
+    // PRIMASK reset primer: step `MSR PRIMASK, R0` (R0=0 ⇒ PRIMASK=0).
+    // Aligns QEMU's persistent CPU state with the EMU's fresh-CPU-per-test
+    // model. xPSR flag bits are unchanged by `MSR PRIMASK,Rn` per ARMv6-M
+    // B5.2.3, so xpsr_pre survives the primer.
+    gdb.step()?;
+
+    // Register preconditions (with address translation). Applied after the
+    // primer so that an `R0` override can't accidentally set PRIMASK=1.
     for &(reg, val) in &tc.reg_pre {
         let val = setup_reg(reg, val, tc, QEMU_M0PLUS_TEST_SCRATCH);
         gdb.write_reg(reg, val)?;
@@ -447,7 +464,9 @@ fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState
         }
     }
 
-    // Single step.
+    // Re-aim PC at the test slot (primer left it at PRIMER_SLOT+4) and step
+    // the actual test instruction.
+    gdb.write_reg(REG_PC, QEMU_M0PLUS_TEST_SLOT)?;
     gdb.step()?;
 
     // Read post-state.
