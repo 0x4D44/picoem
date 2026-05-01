@@ -49,7 +49,7 @@ pub use monitors::ExclusiveMonitors;
 // Re-exported from `mdpicoem-common::threaded` (Stage 3a). Chip-local
 // call sites keep using `crate::threaded::{SpinBarrier, BarrierResult,
 // SpscQueue}` unchanged.
-pub use bus::{PioBus, WorkerBus};
+pub use bus::WorkerBus;
 #[cfg(all(
     feature = "threading",
     target_arch = "x86_64",

@@ -6,9 +6,6 @@
 //!
 //! - [`WorkerBus`] — owned by each CPU worker thread, implements
 //!   [`crate::core::bus_trait::CoreBus`].
-//! - [`PioBus`] — owned by the PIO worker thread; holds the three
-//!   `PioBlock`s. Stage 5 only stands up the constructor; Stage 7 adds
-//!   the worker loop that drives PIO stepping.
 //!
 //! ## What Stage 5 covers
 //!
@@ -44,8 +41,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use mdpicoem_common::PioBlock;
-
 use crate::core::bus_trait::CoreBus;
 use crate::dma::DMA_BASE;
 use crate::peripherals::adc::ADC_BASE;
@@ -66,40 +61,6 @@ use crate::threaded::SharedState;
 /// tops out at 13 registers; FPU context push spills 16 words; keep
 /// headroom so typical bursts amortise within a single allocation.
 pub(crate) const PENDING_INVALIDATION_CAPACITY: usize = 16;
-
-// =======================================================================
-// PioBus
-// =======================================================================
-
-/// PIO-thread view of the shared state. Owns the three [`PioBlock`]s
-/// that the worker drives per-cycle.
-///
-/// Stage 5 only stands up the constructor + the [`Self::take_blocks`]
-/// escape hatch; Stage 7 wires `pio_worker_body` that drains
-/// `shared.pio.drain_commands()` and steps each enabled state machine
-/// `step_quantum` times per quantum.
-pub struct PioBus {
-    #[allow(dead_code)] // consumed by Stage 7's pio_worker_body
-    shared: SharedState,
-    #[allow(dead_code)] // consumed by Stage 7 + take_blocks (cfg(test))
-    blocks: [PioBlock; 3],
-}
-
-impl PioBus {
-    /// Construct a new PIO worker bus with the given shared state and
-    /// PIO block storage. Stage 7's `pio_worker_body` consumes this.
-    pub fn new(shared: SharedState, blocks: [PioBlock; 3]) -> Self {
-        Self { shared, blocks }
-    }
-
-    /// Reclaim the underlying `PioBlock`s at worker exit. Called by
-    /// Stage 7's `run_quanta` to hand the blocks back to the
-    /// `ThreadedEmulator`.
-    #[allow(dead_code)] // used in Stage 7 worker exit + by cfg(test)
-    pub(crate) fn take_blocks(self) -> [PioBlock; 3] {
-        self.blocks
-    }
-}
 
 // =======================================================================
 // WorkerBus
@@ -127,7 +88,6 @@ impl PioBus {
 /// each `core.step()`.
 ///
 pub struct WorkerBus {
-    core_id: u8,
     shared: SharedState,
     active_pc: u32,
     burst_mode: bool,
@@ -155,7 +115,6 @@ impl WorkerBus {
         // keeps the write hot path allocation-free in steady state.
         let pending_cache_invalidations = Vec::with_capacity(PENDING_INVALIDATION_CAPACITY);
         Self {
-            core_id,
             shared,
             active_pc: 0,
             burst_mode: false,
@@ -163,14 +122,6 @@ impl WorkerBus {
             last_fetch_addr: u32::MAX,
             pending_cache_invalidations,
         }
-    }
-
-    /// Accessor for tests only — otherwise the `core_id` is consumed
-    /// through the `core` arg on each access method.
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) fn core_id(&self) -> u8 {
-        self.core_id
     }
 
     // --- Per-region dispatch (internal) ---
@@ -1984,7 +1935,6 @@ mod tests {
             bus.pending_cache_invalidations.capacity() >= PENDING_INVALIDATION_CAPACITY,
             "capacity must be >= PENDING_INVALIDATION_CAPACITY (STM 13 regs + headroom)"
         );
-        assert_eq!(bus.core_id(), 0);
     }
 
     // --- Fix 3: boot_ram / xip_sram routed through WorkerBus ---
@@ -2028,15 +1978,6 @@ mod tests {
             ci,
             "xip_sram writes must not queue cache invalidations"
         );
-    }
-
-    #[test]
-    fn pio_bus_take_blocks_roundtrips() {
-        let shared = fresh_shared();
-        let blocks = [PioBlock::new(), PioBlock::new(), PioBlock::new()];
-        let pb = PioBus::new(shared, blocks);
-        let recovered = pb.take_blocks();
-        assert_eq!(recovered.len(), 3, "PioBus returns the three blocks");
     }
 
     // =====================================================================

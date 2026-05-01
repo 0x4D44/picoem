@@ -43,8 +43,6 @@
 
 use std::sync::Arc;
 
-use mdpicoem_common::clocks::ClockTree;
-
 use crate::bus::ppb::Ppb;
 use crate::bus::systick::SysTick;
 use crate::core::Nvic;
@@ -144,13 +142,6 @@ impl WorkerBus {
             divider: DividerLocal::default(),
             interp: [0u32; 32],
         }
-    }
-
-    /// Access the shared state bundle (used by the worker loop in
-    /// Stage 3b.4 and by diagnostics).
-    #[allow(dead_code)]
-    pub(crate) fn shared(&self) -> &Arc<SharedState> {
-        &self.shared
     }
 
     /// Drain the cross-core IRQ pending mask published by the
@@ -990,13 +981,6 @@ impl WorkerBus {
         }
     }
 
-    /// Expose the `ClockTree` cached inside `peripherals.clocks`.
-    /// Cheap read; locks briefly. Used by Stage 3b.4's coordinator when
-    /// it decides how many sub-cycles to advance per quantum.
-    #[allow(dead_code)]
-    pub fn clock_tree(&self) -> ClockTree {
-        self.shared.peripherals.clocks.lock().unwrap().clock_tree
-    }
 }
 
 // =======================================================================

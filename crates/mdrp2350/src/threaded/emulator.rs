@@ -372,16 +372,6 @@ impl ThreadedEmulator {
         self.bootrom_hook_fired
     }
 
-    /// Override the default host-core pinning mask. The supplied mask
-    /// maps worker index (0=core0, 1=core1, 2=pio0, 3=pio1, 4=pio2,
-    /// 5=coordinator) to host logical-CPU id. Useful on SMT /
-    /// hyperthreaded hosts where the default dense `[0, 1, 2, 3, 4, 5]`
-    /// mapping would share physical cores with the other five workers.
-    pub fn with_thread_mask(mut self, mask: [usize; 6]) -> Self {
-        self.thread_mask = mask;
-        self
-    }
-
     /// Current shared master-cycle count. Lock-free `Acquire` load,
     /// paired with the coordinator's `fetch_add(Release)` in
     /// [`coordinator_worker_body`].
@@ -2627,17 +2617,6 @@ mod tests {
 
     mod stage5_coverage {
         use super::*;
-
-        /// `with_thread_mask` overrides the default pin mask and the
-        /// `run_quanta` path uses it. We only assert on the stored mask;
-        /// observable side-effects are Win32 affinity, not test-visible.
-        #[test]
-        fn with_thread_mask_sets_mask_and_chain_returns_self() {
-            let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
-            let mask: [usize; 6] = [5, 4, 3, 2, 1, 0];
-            let after = threaded.with_thread_mask(mask);
-            assert_eq!(after.thread_mask, mask);
-        }
 
         /// `core_cycles(0)` / `core_cycles(1)` on a freshly-built runtime
         /// return 0 (matching each core's pre-execution cycle count).
