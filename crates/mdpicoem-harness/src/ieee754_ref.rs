@@ -544,6 +544,7 @@ pub fn ref_vcmp(a: f32, b: f32, _fpscr_in: u32) -> (u32, u32) {
 /// - Exactly one NaN → the non-NaN operand.
 /// - Both ±0 → -0 if either has the sign bit set; otherwise +0.
 /// - Otherwise standard `<` ordering.
+///
 /// IOC is set when either input is a signaling NaN. No DN/FZ application
 /// (NaN-result path returns the canonical NaN already; non-NaN paths
 /// don't construct NaNs).

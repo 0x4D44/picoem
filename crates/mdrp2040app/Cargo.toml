@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 mdrp2040 = { path = "../mdrp2040", features = ["threading"] }
 mdpicoem-devices = { path = "../mdpicoem-devices" }

@@ -24,6 +24,9 @@ exclude = [
     "tests/hello_uart.rs",
 ]
 
+[lints]
+workspace = true
+
 [features]
 # `threading` is opt-in for V1. The runtime supports x86_64 Windows
 # and x86_64 Linux today (see the `cfg`-gates on

@@ -3571,13 +3571,13 @@ mod tests {
         // VIRT_FLASH starts at 0x2000_0000 on QEMU virt; SCRATCH_BASE
         // sits above 0x8000_0000 so the canonicalisation alias maps to
         // SRAM cleanly. Documented constraint, regression-trapped here.
-        assert!(SCRATCH_BASE >= 0x8000_0000);
-        assert!(TRAP_STUB >= 0x8000_0000);
+        const _: () = assert!(SCRATCH_BASE >= 0x8000_0000);
+        const _: () = assert!(TRAP_STUB >= 0x8000_0000);
     }
 
     #[test]
     fn reservable_window_nonempty() {
-        assert!(RESERVABLE_LO < RESERVABLE_HI);
+        const _: () = assert!(RESERVABLE_LO < RESERVABLE_HI);
         // RESERVABLE_HI is exclusive — sanity-check the documented
         // RP2350 §2.1.6.2 range (520 KB SRAM).
         assert_eq!(RESERVABLE_LO, 0x2000_0000);

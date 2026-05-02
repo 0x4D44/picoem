@@ -1727,7 +1727,7 @@ fn exec_mret_with_mpp_zero_rounds_to_m() {
     let (mut c, mut bus) = fresh();
     c.csrs.mepc = 0x2000_0200;
     // After-trap state with MPP deliberately set to 0b00 (U-mode), MPIE=1.
-    #[allow(clippy::erasing_op)]
+    #[allow(clippy::identity_op, clippy::erasing_op)]
     {
         c.csrs.mstatus = (1 << 7) | (0b00 << 11);
     }

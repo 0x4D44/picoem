@@ -24,6 +24,38 @@ rust-version = "1.88"
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[workspace.lints.clippy]
+# Bit-field literals deliberately group by ARM/RISC-V ISA encoding
+# fields (e.g. `0b11110_0_111000_0000u16` = wide-prefix | S | op | Rn).
+# Reformatting to 4-bit groups destroys the ISA-encoding visibility.
+unusual_byte_groupings = "allow"
+
+# Emulator code routinely iterates by index where `i` is itself the
+# semantic value: register number 0..16, NVIC line 0..240, GPIO pad
+# 0..30, core ID 0..2. Explicit indexing reads more naturally than
+# `.iter().enumerate()` in those contexts and matches the hardware
+# documentation.
+needless_range_loop = "allow"
+
+# Cortex-M / coprocessor / GDB-stub handler signatures naturally
+# carry 8+ arguments (cpu, bus, opcode fields, encoding flags...).
+# Bundling into structs hides the protocol.
+too_many_arguments = "allow"
+
+# Tuple-and-fn-pointer types in test scaffolding and callback
+# registries are dense by design; aliasing them out hides the shape.
+type_complexity = "allow"
+
+# `Cores::Arm([CortexM33; 2])` vs `Cores::RiscV([Hazard3; 2])` and the
+# paced-bench `Runtime::Serial(Emulator)` are stack-allocated
+# deliberately to keep the hot path off the heap.
+large_enum_variant = "allow"
+
+# ARMv8-M exception names (HardFault, UsageFault, MemFault) and
+# RISC-V opcode classes (OpImm, OpReg) mirror the ISA spec; renaming
+# would break the link to the architecture reference.
+enum_variant_names = "allow"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

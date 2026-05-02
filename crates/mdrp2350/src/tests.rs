@@ -25979,8 +25979,10 @@ mod stage3_bus_residue {
 
     #[test]
     fn ppb_cfsr_w1c_clears_only_set_bits() {
-        let mut ppb = Ppb::default();
-        ppb.cfsr = 0x0F0F_0F0F;
+        let mut ppb = Ppb {
+            cfsr: 0x0F0F_0F0F,
+            ..Ppb::default()
+        };
         // Write a mask that clears the low byte only.
         ppb.write32(0xE000_ED28, 0x0000_00FF);
         assert_eq!(ppb.cfsr, 0x0F0F_0F00);
@@ -25991,8 +25993,10 @@ mod stage3_bus_residue {
 
     #[test]
     fn ppb_hfsr_w1c_clears_forced_bit() {
-        let mut ppb = Ppb::default();
-        ppb.hfsr = 0x4000_0000; // FORCED bit
+        let mut ppb = Ppb {
+            hfsr: 0x4000_0000, // FORCED bit
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_ED2C, 0x4000_0000);
         assert_eq!(ppb.hfsr, 0);
     }
@@ -26037,8 +26041,10 @@ mod stage3_bus_residue {
 
     #[test]
     fn ppb_dwt_cyccnt_write_then_advance_returns_written_plus_delta() {
-        let mut ppb = Ppb::default();
-        ppb.demcr = 1 << 24; // TRCENA
+        let mut ppb = Ppb {
+            demcr: 1 << 24, // TRCENA
+            ..Ppb::default()
+        };
         ppb.write32(0xE000_1000, 0x1); // CYCCNTENA
         // Write CYCCNT=100 at cycles=10: stored base = 100 - 10 = 90.
         ppb.update_latest_cycles(10);

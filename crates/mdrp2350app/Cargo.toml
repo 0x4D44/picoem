@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 mdrp2350 = { path = "../mdrp2350", features = ["threading"] }
 ratatui = "0.30"

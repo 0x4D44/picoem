@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["emulator", "rp2350", "rp2040", "embedded", "pico"]
 categories = ["emulators", "embedded"]
 
+[lints]
+workspace = true
+
 [features]
 # Test-only hooks that expose otherwise-private PIO state (e.g. RX FIFO
 # push) for cross-crate unit tests. NOT part of the production API —
