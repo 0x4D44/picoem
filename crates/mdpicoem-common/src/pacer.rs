@@ -155,9 +155,7 @@ fn rdtscp() -> u64 {
 /// clear message if not. All modern x86_64 CPUs (since ~2008) support this.
 #[cfg(target_arch = "x86_64")]
 fn require_constant_tsc() {
-    // SAFETY: leaf 0x80000007 is the AMD/Intel "Advanced Power Management"
-    // feature leaf, defined on every x86_64 CPU; no memory side effects.
-    let result = unsafe { std::arch::x86_64::__cpuid(0x80000007) };
+    let result = std::arch::x86_64::__cpuid(0x80000007);
     let has_invariant_tsc = (result.edx >> 8) & 1 != 0;
     assert!(
         has_invariant_tsc,
