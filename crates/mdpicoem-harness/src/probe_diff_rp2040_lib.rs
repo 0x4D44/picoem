@@ -113,7 +113,9 @@ pub enum DiffError {
     /// on a VTOR=0 core means the instruction UNDEF'd on silicon and was
     /// dispatched into the bootrom's HardFault handler. Surfaces
     /// filter-gap bugs in `is_m0plus_silicon_safe`.
-    UndefOnSilicon { pc: u32 },
+    UndefOnSilicon {
+        pc: u32,
+    },
 }
 
 /// Classify the PC read after `core.step()`. Returns `Some(pc)` only when
@@ -350,10 +352,8 @@ pub fn run_against(
     let cases: Vec<TestCase> = match order {
         None => cases,
         Some(names) => {
-            let mut by_name: std::collections::HashMap<String, TestCase> = cases
-                .into_iter()
-                .map(|tc| (tc.name.clone(), tc))
-                .collect();
+            let mut by_name: std::collections::HashMap<String, TestCase> =
+                cases.into_iter().map(|tc| (tc.name.clone(), tc)).collect();
             let mut out: Vec<TestCase> = Vec::with_capacity(names.len());
             for n in names {
                 if let Some(tc) = by_name.remove(*n) {

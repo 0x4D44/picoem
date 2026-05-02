@@ -237,15 +237,30 @@ impl Summary {
                 Verdict::Pass => s.pass += 1,
                 Verdict::Fail => {
                     s.fail += 1;
-                    Self::insert_smallest(&mut self.failing_cases, o.oracle, o.case, iter_seed_for_fail);
+                    Self::insert_smallest(
+                        &mut self.failing_cases,
+                        o.oracle,
+                        o.case,
+                        iter_seed_for_fail,
+                    );
                 }
                 Verdict::Skip => {
                     s.skip += 1;
-                    Self::insert_smallest(&mut self.skipping_cases, o.oracle, o.case, iter_seed_for_fail);
+                    Self::insert_smallest(
+                        &mut self.skipping_cases,
+                        o.oracle,
+                        o.case,
+                        iter_seed_for_fail,
+                    );
                 }
                 Verdict::Degraded => {
                     s.degraded += 1;
-                    Self::insert_smallest(&mut self.degraded_cases, o.oracle, o.case, iter_seed_for_fail);
+                    Self::insert_smallest(
+                        &mut self.degraded_cases,
+                        o.oracle,
+                        o.case,
+                        iter_seed_for_fail,
+                    );
                 }
             }
         }
@@ -329,10 +344,7 @@ impl Summary {
 /// `"rp2350"`). Optionally selects a specific probe by `VID:PID:SERIAL`.
 /// Reset+halts core 0 on success so the first oracle finds the target in
 /// a known state — matches the standalone oracle binaries' first action.
-pub fn attach(
-    chip: &str,
-    probe: Option<&DebugProbeSelector>,
-) -> Result<Session, probe_rs::Error> {
+pub fn attach(chip: &str, probe: Option<&DebugProbeSelector>) -> Result<Session, probe_rs::Error> {
     let mut session = match probe {
         None => Session::auto_attach(chip, SessionConfig::default())?,
         Some(selector) => {

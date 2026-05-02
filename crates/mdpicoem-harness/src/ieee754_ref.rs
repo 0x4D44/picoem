@@ -403,9 +403,9 @@ pub fn ref_fma(a: f32, b: f32, c: f32, fpscr_in: u32) -> (f32, u32) {
 /// conditions).
 pub fn ref_vsel(cc: u16, apsr_n: bool, apsr_z: bool, apsr_v: bool, sn: f32, sm: f32) -> f32 {
     let take_sn = match cc & 0x3 {
-        0b00 => apsr_z,                  // EQ
-        0b01 => apsr_v,                  // VS
-        0b10 => apsr_n == apsr_v,        // GE
+        0b00 => apsr_z,                     // EQ
+        0b01 => apsr_v,                     // VS
+        0b10 => apsr_n == apsr_v,           // GE
         _ => !apsr_z && (apsr_n == apsr_v), // GT
     };
     if take_sn { sn } else { sm }
@@ -532,8 +532,7 @@ pub fn ref_vcmp(a: f32, b: f32, _fpscr_in: u32) -> (u32, u32) {
     } else {
         (false, false, true, false) // greater than
     };
-    let nzcv =
-        ((n as u32) << 31) | ((z as u32) << 30) | ((c as u32) << 29) | ((v as u32) << 28);
+    let nzcv = ((n as u32) << 31) | ((z as u32) << 30) | ((c as u32) << 29) | ((v as u32) << 28);
     (nzcv, 0)
 }
 

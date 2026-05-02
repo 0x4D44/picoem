@@ -8272,8 +8272,7 @@ mod m0plus_t32_fuzz_tests {
             let is_mrs = hw0 == 0xF3EF && (hw1 & 0xF000) == 0x8000;
             let is_barrier = hw0 == 0xF3BF && (hw1 & 0xFF00) == 0x8F00;
             // Exactly one shape.
-            let n =
-                (is_bl as u8) + (is_msr as u8) + (is_mrs as u8) + (is_barrier as u8);
+            let n = (is_bl as u8) + (is_msr as u8) + (is_mrs as u8) + (is_barrier as u8);
             assert_eq!(
                 n, 1,
                 "case {:?} matches {} shapes (expected 1): hw0={:#06x} hw1={:#06x}",
@@ -8331,7 +8330,10 @@ mod m0plus_t32_fuzz_tests {
             assert_eq!(x.reg_pre, y.reg_pre, "case {i}: reg_pre mismatch");
             assert_eq!(x.xpsr_pre, y.xpsr_pre, "case {i}: xpsr_pre mismatch");
             assert_eq!(x.xpsr_mask, y.xpsr_mask, "case {i}: xpsr_mask mismatch");
-            assert_eq!(x.modifies_lr, y.modifies_lr, "case {i}: modifies_lr mismatch");
+            assert_eq!(
+                x.modifies_lr, y.modifies_lr,
+                "case {i}: modifies_lr mismatch"
+            );
             assert_eq!(x.name, y.name, "case {i}: name mismatch");
         }
     }

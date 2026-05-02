@@ -42,12 +42,13 @@ use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter
 use mdpicoem_harness::silicon_scenarios::{self, PeriphArgs};
 use mdpicoem_harness::test_silicon_common::{
     GIVE_UP_THRESHOLD, HEARTBEAT_INTERVAL, NameInterner, Summary, append_error_log,
-    attach as common_attach, default_seed, emit_log_line, errors_log_path as common_errors_log_path,
-    fmt_elapsed, iter_seed, now_iso, parse_duration, reattach_with_retries as common_reattach,
-    shuffle_in_place, validate_catalogue_names_are_unique,
+    attach as common_attach, default_seed, emit_log_line,
+    errors_log_path as common_errors_log_path, fmt_elapsed, iter_seed, now_iso, parse_duration,
+    reattach_with_retries as common_reattach, shuffle_in_place,
+    validate_catalogue_names_are_unique,
 };
-use probe_rs::probe::DebugProbeSelector;
 use probe_rs::Session;
+use probe_rs::probe::DebugProbeSelector;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 

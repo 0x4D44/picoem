@@ -1790,7 +1790,10 @@ const OBS_PRIORITY_PREEMPT: &[(&str, IsrObservable)] = &[
     // has the lower priority value, so it must dispatch first; IRQ_0
     // then runs via tail-chain. Listed first so `primary_observable_addr`
     // polls it.
-    ("order_first_irq", IsrObservable::Memory(ORDER_FIRST_IRQ_ADDR)),
+    (
+        "order_first_irq",
+        IsrObservable::Memory(ORDER_FIRST_IRQ_ADDR),
+    ),
     // Secondary: each handler ran exactly once.
     ("ctr_irq_0", IsrObservable::Memory(CTR_IRQ_0_ADDR)),
     ("ctr_irq_1", IsrObservable::Memory(CTR_IRQ_1_ADDR)),

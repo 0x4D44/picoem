@@ -151,7 +151,10 @@ mod tests {
         assert_eq!(panic_message(Some(&static_payload)), "static-str panic");
 
         let other_payload: Box<dyn std::any::Any + Send> = Box::new(42u64);
-        assert_eq!(panic_message(Some(&other_payload)), "<non-string panic payload>");
+        assert_eq!(
+            panic_message(Some(&other_payload)),
+            "<non-string panic payload>"
+        );
 
         assert_eq!(panic_message(None), "");
     }

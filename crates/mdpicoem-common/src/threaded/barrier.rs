@@ -651,7 +651,10 @@ mod tests {
         // park mutex and broadcasts, releasing the parked waiter.
         let late = barrier.wait();
         assert_eq!(late, BarrierResult::Released);
-        assert_eq!(early.join().expect("early panicked"), BarrierResult::Released);
+        assert_eq!(
+            early.join().expect("early panicked"),
+            BarrierResult::Released
+        );
         assert!(!barrier.timed_out());
     }
 
@@ -665,10 +668,7 @@ mod tests {
     #[test]
     fn waiter_parks_then_observes_poison() {
         // Long deadline so the watchdog never fires.
-        let barrier = Arc::new(SpinBarrier::with_deadline(
-            2,
-            Duration::from_secs(30),
-        ));
+        let barrier = Arc::new(SpinBarrier::with_deadline(2, Duration::from_secs(30)));
         let b = Arc::clone(&barrier);
 
         let h = thread::spawn(move || b.wait());

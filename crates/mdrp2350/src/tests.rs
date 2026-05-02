@@ -19911,11 +19911,11 @@ mod stage7_exceptions_coverage {
         let cases: [(u8, u32); 8] = [
             (0x00, 0x0000_0000),
             (0xFF, ((0xFFu32 & 0xC0) << 19) | ((0xFFu32 & 0x3F) << 10)),
-            (0xC0, (0xC0u32 & 0xC0) << 19),                 // top bits only
-            (0x3F, (0x3Fu32 & 0x3F) << 10),                 // bottom bits only
-            (0x80, (0x80u32 & 0xC0) << 19),                 // bit 7 only
-            (0x40, (0x40u32 & 0xC0) << 19),                 // bit 6 only
-            (0x01, (0x01u32 & 0x3F) << 10),                 // bit 0 only
+            (0xC0, (0xC0u32 & 0xC0) << 19), // top bits only
+            (0x3F, (0x3Fu32 & 0x3F) << 10), // bottom bits only
+            (0x80, (0x80u32 & 0xC0) << 19), // bit 7 only
+            (0x40, (0x40u32 & 0xC0) << 19), // bit 6 only
+            (0x01, (0x01u32 & 0x3F) << 10), // bit 0 only
             (0xAB, ((0xABu32 & 0xC0) << 19) | ((0xABu32 & 0x3F) << 10)),
         ];
         for (it, expected) in cases {
@@ -20043,9 +20043,17 @@ mod stage7_exceptions_coverage {
 
         // 0x0 boundary: addr < 0x8000 secure; addr >= 0x8000 non-secure.
         let r_lo = cpu.execute_tt(0x0000_7FFF);
-        assert_ne!(r_lo & (1 << 25), 0, "0x0000_7FFF (lower 32K) should be exempt");
+        assert_ne!(
+            r_lo & (1 << 25),
+            0,
+            "0x0000_7FFF (lower 32K) should be exempt"
+        );
         let r_hi = cpu.execute_tt(0x0000_8000);
-        assert_eq!(r_hi & (1 << 25), 0, "0x0000_8000 (upper 32K) should NOT be exempt");
+        assert_eq!(
+            r_hi & (1 << 25),
+            0,
+            "0x0000_8000 (upper 32K) should NOT be exempt"
+        );
     }
 
     // enter_exception return_address branches (synchronous faults).
@@ -23493,7 +23501,10 @@ mod stage2_exceptions_corecasecoverage {
         let _ = cpu.enter_exception(11, &mut bus);
         let frame_sp = cpu.regs.msp;
         let stacked_ret = bus.read32(frame_sp + 24, 0);
-        assert_eq!(stacked_ret, pc_after, "async/SVC arm must stack PC, not instr_addr");
+        assert_eq!(
+            stacked_ret, pc_after,
+            "async/SVC arm must stack PC, not instr_addr"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -23548,7 +23559,11 @@ mod stage2_exceptions_corecasecoverage {
         cpu.regs.r[13] = cpu.regs.msp;
         let _ = cpu.enter_exception(14, &mut bus);
         let stacked_xpsr = bus.read32(cpu.regs.msp + 28, 0);
-        assert_eq!(stacked_xpsr & (1 << 9), 0, "no align-padding bit when SP aligned");
+        assert_eq!(
+            stacked_xpsr & (1 << 9),
+            0,
+            "no align-padding bit when SP aligned"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -23730,7 +23745,10 @@ mod stage2_exceptions_corecasecoverage {
         cpu.regs.primask = 1;
         let exc_return = 0xFFFF_FFF9u32; // FType=1, Thread, MSP
         let cycles = cpu.exit_exception(exc_return, &mut bus);
-        assert_eq!(cycles, 12, "must take ordinary unstack path, not tail chain (=6)");
+        assert_eq!(
+            cycles, 12,
+            "must take ordinary unstack path, not tail chain (=6)"
+        );
         // Returned to thread mode (IPSR cleared by stacked xPSR).
         assert_eq!(cpu.regs.ipsr(), 0);
     }
@@ -23786,7 +23804,11 @@ mod stage2_exceptions_corecasecoverage {
         let (mut cpu, mut bus) = core_bus();
         cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSVSET | crate::bus::ppb::ICSR_PENDSTSET;
         let _ = cpu.try_take_any_pending_exception(&mut bus);
-        assert_eq!(cpu.regs.ipsr(), 14, "PendSV (14) wins tie over SysTick (15)");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            14,
+            "PendSV (14) wins tie over SysTick (15)"
+        );
     }
 
     /// SysTick priority lifted to a numerically lower (higher-priority)
@@ -23851,7 +23873,11 @@ mod stage2_exceptions_corecasecoverage {
         cpu.ppb.shcsr |= 1 << 17; // BUSFAULTENA
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.ipsr(), 5, "BusFault handler taken (exc 5)");
-        assert_ne!(cpu.ppb.cfsr & ((1 << 9) | (1 << 15)), 0, "PRECISERR + BFARVALID set");
+        assert_ne!(
+            cpu.ppb.cfsr & ((1 << 9) | (1 << 15)),
+            0,
+            "PRECISERR + BFARVALID set"
+        );
     }
 
     /// BUSFAULTENA off → escalates to HardFault, sets HFSR.FORCED.
@@ -24479,7 +24505,10 @@ mod stage2_fpu_residue {
         let (hw0, hw1) = enc_vsqrt(0, 2);
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.s[0].to_bits() & 0x7FFF_FFFF, 0);
-        assert!(c.regs.fpscr & FPSCR_IDC != 0, "IDC always set on denormal input");
+        assert!(
+            c.regs.fpscr & FPSCR_IDC != 0,
+            "IDC always set on denormal input"
+        );
     }
 
     // ----- VCVT.U32.F32 saturation paths --------------------------------------
@@ -24665,7 +24694,11 @@ mod stage2_thumb32_residue {
         let hw0: u16 = 0xF36F;
         let hw1: u16 = 31u16;
         c.execute_one_wide(hw0, hw1);
-        assert_eq!(c.reg(0), 0, "BFC width=32 must clear the entire destination word");
+        assert_eq!(
+            c.reg(0),
+            0,
+            "BFC width=32 must clear the entire destination word"
+        );
     }
 
     /// BFI width=32 (lsb=0, msb=31): replaces the entire destination word with Rn.
@@ -24680,7 +24713,11 @@ mod stage2_thumb32_residue {
         let hw0: u16 = 0xF361;
         let hw1: u16 = 31u16;
         c.execute_one_wide(hw0, hw1);
-        assert_eq!(c.reg(0), 0x1234_5678, "BFI width=32 must replace the entire destination word");
+        assert_eq!(
+            c.reg(0),
+            0x1234_5678,
+            "BFI width=32 must replace the entire destination word"
+        );
     }
 
     /// SBFX width=32 (lsb=0, widthm1=31) over a value with the sign bit set.
@@ -24697,7 +24734,11 @@ mod stage2_thumb32_residue {
         let hw0: u16 = 0xF200 | (0b10100u16 << 4) | 1;
         let hw1: u16 = (imm3 << 12) | (imm2 << 6) | widthm1;
         c.execute_one_wide(hw0, hw1);
-        assert_eq!(c.reg(0), 0x8000_0000, "SBFX width=32 is identity (sign-extend of full word)");
+        assert_eq!(
+            c.reg(0),
+            0x8000_0000,
+            "SBFX width=32 is identity (sign-extend of full word)"
+        );
     }
 
     /// UBFX width=32 (lsb=0, widthm1=31): extracts the entire word unchanged.
@@ -24713,7 +24754,11 @@ mod stage2_thumb32_residue {
         let hw0: u16 = 0xF200 | (0b11100u16 << 4) | 1;
         let hw1: u16 = (imm3 << 12) | (imm2 << 6) | widthm1;
         c.execute_one_wide(hw0, hw1);
-        assert_eq!(c.reg(0), 0xCAFE_BABE, "UBFX width=32 is identity (extract full word)");
+        assert_eq!(
+            c.reg(0),
+            0xCAFE_BABE,
+            "UBFX width=32 is identity (extract full word)"
+        );
     }
 
     /// BFC narrow width (lsb=8, msb=15): clears bits [15:8] only.
@@ -26626,7 +26671,11 @@ mod stage3_io_peripherals_residue {
         s.write32(spi_p::SSPCPSR, 2, 0, &mut irqs);
         s.write32(spi_p::SSPDR, 0xFF, 0, &mut irqs);
         s.tick(1_000, &tree(150_000_000, 150_000_000), &mut irqs);
-        assert_eq!(s.read32(spi_p::SSPDR), 0x0F, "4-bit mask retains low nibble");
+        assert_eq!(
+            s.read32(spi_p::SSPDR),
+            0x0F,
+            "4-bit mask retains low nibble"
+        );
     }
 
     /// `sysclks_per_word` denom=0 path: cpsr=2 (mask 0xFE → 2), but the
@@ -26982,7 +27031,10 @@ mod stage3_io_peripherals_residue {
                 break;
             }
         }
-        assert!(count <= 1, "FEN clear must truncate RX to ≤1 byte; got {count}");
+        assert!(
+            count <= 1,
+            "FEN clear must truncate RX to ≤1 byte; got {count}"
+        );
     }
 
     /// TXE clear means push_tx is dropped (covers the
@@ -27367,9 +27419,7 @@ mod stage3_timer_misc_residue {
     use crate::peripherals::watchdog as wd_p;
     use crate::peripherals::{io_bank0, pads_bank0};
 
-    use crate::irq::{
-        IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0,
-    };
+    use crate::irq::{IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0};
     use mdpicoem_common::clocks::ClockTree;
 
     // =====================================================================
@@ -27435,7 +27485,11 @@ mod stage3_timer_misc_residue {
         );
         let v = p.read32(powman_p::TIMER_OFFSET);
         assert_ne!(v & powman_p::TIMER_RUN_BIT, 0, "BITSET preserves RUN");
-        assert_ne!(v & powman_p::TIMER_ALARM_ENAB_BIT, 0, "BITSET adds ALARM_ENAB");
+        assert_ne!(
+            v & powman_p::TIMER_ALARM_ENAB_BIT,
+            0,
+            "BITSET adds ALARM_ENAB"
+        );
     }
 
     /// TIMER write with alias 3 (BITCLR) clears named bits.
@@ -27498,7 +27552,10 @@ mod stage3_timer_misc_residue {
             0,
         );
         let _ = p.advance(50, &tree_150());
-        assert_ne!(p.read32(powman_p::TIMER_OFFSET) & powman_p::TIMER_ALARM_BIT, 0);
+        assert_ne!(
+            p.read32(powman_p::TIMER_OFFSET) & powman_p::TIMER_ALARM_BIT,
+            0
+        );
         // INTR write with bit 0 set (not TIMER bit which is bit 1) — should
         // not clear TIMER.ALARM.
         let _ = p.write32(powman_p::INTR_OFFSET, 0x1, 0);
@@ -27685,7 +27742,11 @@ mod stage3_timer_misc_residue {
             sha.write32(0x04, 0, 0);
         }
         let csr15 = sha.read32(0x00);
-        assert_ne!(csr15 & (1 << 1), 0, "WDATA_READY still high after 15 writes");
+        assert_ne!(
+            csr15 & (1 << 1),
+            0,
+            "WDATA_READY still high after 15 writes"
+        );
         // 16th write fills the block → SUM_VALID becomes 1, WDATA_READY 0.
         sha.write32(0x04, 0, 0);
         let csr16 = sha.read32(0x00);
@@ -27742,7 +27803,11 @@ mod stage3_timer_misc_residue {
         sha.reset();
         // After reset: SUM = IV, WDATA_READY = 1, SUM_VALID = 0.
         assert_eq!(sha.read32(0x08), 0x6a09_e667, "SUM0 = IV[0]");
-        assert_ne!(sha.read32(0x00) & (1 << 1), 0, "WDATA_READY high after reset");
+        assert_ne!(
+            sha.read32(0x00) & (1 << 1),
+            0,
+            "WDATA_READY high after reset"
+        );
         assert_eq!(sha.read32(0x00) & (1 << 2), 0, "SUM_VALID low after reset");
     }
 
@@ -28127,7 +28192,16 @@ mod stage3_dma_residue {
         bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
     }
 
-    fn ctrl(en: bool, ds: u32, ir: bool, iw: bool, treq: u8, chain: u32, ring: u32, rsel: bool) -> u32 {
+    fn ctrl(
+        en: bool,
+        ds: u32,
+        ir: bool,
+        iw: bool,
+        treq: u8,
+        chain: u32,
+        ring: u32,
+        rsel: bool,
+    ) -> u32 {
         let mut v = 0u32;
         if en {
             v |= CTRL_EN;
@@ -28431,10 +28505,7 @@ mod stage3_dma_residue {
         bus.tick_dma();
         let ints1 = bus.read32(DMA_BASE + REG_INTS1, 0);
         assert_eq!(ints1 & 1, 1);
-        assert_ne!(
-            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_1),
-            0
-        );
+        assert_ne!(bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_1), 0);
     }
 
     // ------------------------------------------------------------------

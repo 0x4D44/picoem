@@ -3096,20 +3096,12 @@ mod tests {
         pio.write32(0x174, 1 << 9, 0);
         let ints0 = pio.read32(0x178);
         assert_ne!(ints0 & (1 << 8), 0, "flag 0 surfaces via INTE bit 8");
-        assert_eq!(
-            ints0 & (1 << 10),
-            0,
-            "flag 2 (bit 10) suppressed by INTE=0"
-        );
+        assert_eq!(ints0 & (1 << 10), 0, "flag 2 (bit 10) suppressed by INTE=0");
         assert_ne!(ints0 & (1 << 9), 0, "INTF bit 9 forces ints regardless");
         // Clear INTE — flags drop out of INTS but INTF stays.
         pio.write32(0x170, 0, 0);
         let ints0 = pio.read32(0x178);
-        assert_eq!(
-            ints0 & (1 << 8),
-            0,
-            "flag 0 hidden once INTE bit 8 cleared"
-        );
+        assert_eq!(ints0 & (1 << 8), 0, "flag 0 hidden once INTE bit 8 cleared");
         assert_ne!(ints0 & (1 << 9), 0, "INTF survives INTE clearing");
 
         // RP2040 layout: flag 0 surfaces at bit 0 of INTR; verify via
@@ -3270,7 +3262,10 @@ mod tests {
         let mut pio = PioBlock::new();
         pio.fdebug = 0xCAFE;
         pio.write32(0x008, 0xFF, 99); // alias=99 → early return
-        assert_eq!(pio.fdebug, 0xCAFE, "out-of-range alias must not modify FDEBUG");
+        assert_eq!(
+            pio.fdebug, 0xCAFE,
+            "out-of-range alias must not modify FDEBUG"
+        );
     }
 
     /// CLKDIV write sequence: setting integer alone (frac=0) yields exact

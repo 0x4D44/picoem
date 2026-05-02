@@ -802,7 +802,11 @@ mod tests {
         // BASE_1AND0 splits halves into BASE0/BASE1 only — must NOT
         // touch BASE2.
         interp.write(0x3C, 0xAAAA_BBBB, 0);
-        assert_eq!(interp.read(0x10, false), 0xBEEF, "BASE2 untouched by BASE_1AND0");
+        assert_eq!(
+            interp.read(0x10, false),
+            0xBEEF,
+            "BASE2 untouched by BASE_1AND0"
+        );
     }
 
     /// PEEK on POP_FULL (offset 0x28) with BLEND off must OR lane
@@ -900,11 +904,7 @@ mod tests {
         interp.ctrl_lane[1] = 0xFFFF_FFFF;
         let read1 = interp.read(0x30, false);
         assert_eq!(read1 & 0xFC00_0000, 0, "reserved bits clear on lane 1");
-        assert_eq!(
-            read1 & CTRL_OVERF_MASK,
-            0,
-            "OVERF region reads 0 on lane 1"
-        );
+        assert_eq!(read1 & CTRL_OVERF_MASK, 0, "OVERF region reads 0 on lane 1");
     }
 
     /// Reserved offsets read as 0 (the wildcard `_ => 0` arm of `read`).
@@ -934,7 +934,10 @@ mod tests {
         interp.write(0x20, 0x5678, 0); // PEEK_LANE0 — ignored
         interp.write(0x24, 0x9ABC, 0); // PEEK_LANE1 — ignored
         interp.write(0x28, 0xDEF0, 0); // PEEK_FULL — ignored
-        assert_eq!(interp.accum[0], 0xCAFE, "writes to ROs must not perturb state");
+        assert_eq!(
+            interp.accum[0], 0xCAFE,
+            "writes to ROs must not perturb state"
+        );
     }
 
     /// Wildcard arm of `write` for unaligned/unmapped offsets.

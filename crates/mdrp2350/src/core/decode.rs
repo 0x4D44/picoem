@@ -895,7 +895,9 @@ mod classifier_tests {
             );
         }
         // Other DP ops are NOT flag-only.
-        for dp_op in [0x0u16, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x9, 0xC, 0xD, 0xE, 0xF] {
+        for dp_op in [
+            0x0u16, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x9, 0xC, 0xD, 0xE, 0xF,
+        ] {
             let opc = (0b01000u16 << 11) | (dp_op << 6);
             assert!(
                 !is_thumb16_flag_only(opc),
@@ -1037,7 +1039,10 @@ mod classifier_tests {
         let hw1_nop = 0x0000; // hint = 0x00 → NOP.
         let hw1_unrecognised = 0x0005; // hint = 0x05 (out of 0..=0x04).
         assert!(classify_thumb32_branch_misc_pure(hw0_nop, hw1_nop));
-        assert!(!classify_thumb32_branch_misc_pure(hw0_nop, hw1_unrecognised));
+        assert!(!classify_thumb32_branch_misc_pure(
+            hw0_nop,
+            hw1_unrecognised
+        ));
     }
 
     // ---------- classify_thumb32_misc_control_pure ----------
@@ -1190,7 +1195,14 @@ mod classifier_tests {
             bits.push(classify_thumb32_pure(hw0, 0));
         }
         // op1 = 0b10, hw1 bit15 ∈ {0, 1} × hw1 bit14 ∈ {0, 1} × misc_op patterns
-        for hw1 in [0x0000u16, 0x4000, 0x8000, 0xC000, 0x4000 | 0x1000, 0x8000 | 0xF000] {
+        for hw1 in [
+            0x0000u16,
+            0x4000,
+            0x8000,
+            0xC000,
+            0x4000 | 0x1000,
+            0x8000 | 0xF000,
+        ] {
             let hw0 = (0b11110u16 << 11) | (0b10 << 11);
             bits.push(classify_thumb32_pure(hw0, hw1));
         }

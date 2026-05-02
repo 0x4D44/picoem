@@ -332,8 +332,8 @@ mod classifier_tests {
     //! truth". If a real classifier bug is fixed, update the asserted
     //! constant after manually reviewing the diff.
     use super::{
-        classify_is_pure, classify_thumb16_misc_pure, classify_thumb16_pure,
-        classify_thumb32_pure, is_wide,
+        classify_is_pure, classify_thumb16_misc_pure, classify_thumb16_pure, classify_thumb32_pure,
+        is_wide,
     };
 
     /// FNV-1a 64-bit hash of the byte sequence. Deterministic across
@@ -537,10 +537,7 @@ mod classifier_tests {
         // mdrp2040 lacks CBZ/CBNZ (ARMv6-M). Verify all unenumerated
         // misc ops classify impure.
         for op in 0..=0xFu16 {
-            let expected = matches!(
-                op,
-                0b0000 | 0b0010 | 0b0110 | 0b1010 | 0b1111
-            );
+            let expected = matches!(op, 0b0000 | 0b0010 | 0b0110 | 0b1010 | 0b1111);
             assert_eq!(
                 classify_thumb16_misc_pure(misc(op)),
                 expected,

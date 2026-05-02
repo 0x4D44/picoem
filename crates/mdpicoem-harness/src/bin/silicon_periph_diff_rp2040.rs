@@ -7,9 +7,9 @@
 // Phase 0 sub-task 0.E per
 // `wrk_docs/2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md` §4.2 / §4.4.
 
+use mdpicoem_harness::SILICON_RUN_SLED;
 use mdpicoem_harness::silicon_oracle::Verdict;
 use mdpicoem_harness::silicon_periph_rp2040::{self, PeriphArgs, SCENARIOS, TIMER_BASE, XOSC_BASE};
-use mdpicoem_harness::SILICON_RUN_SLED;
 use probe_rs::{Session, SessionConfig};
 use std::time::Instant;
 

@@ -187,9 +187,7 @@ fn isr_m0_wfi_wake_passes_on_emu() {
             );
         }
         EmuOutcome::Timeout => {
-            panic!(
-                "isr_m0_wfi_wake: cycle budget exhausted before phase_at_entry advanced",
-            );
+            panic!("isr_m0_wfi_wake: cycle budget exhausted before phase_at_entry advanced",);
         }
     }
 }

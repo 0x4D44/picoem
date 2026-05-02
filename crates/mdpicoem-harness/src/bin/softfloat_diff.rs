@@ -407,8 +407,14 @@ impl Op {
     fn integer_result_bits(self) -> bool {
         matches!(
             self,
-            Op::VcvtUR | Op::VcvtU | Op::VcvtSR | Op::VcvtS
-                | Op::VselEq | Op::VselVs | Op::VselGe | Op::VselGt
+            Op::VcvtUR
+                | Op::VcvtU
+                | Op::VcvtSR
+                | Op::VcvtS
+                | Op::VselEq
+                | Op::VselVs
+                | Op::VselGe
+                | Op::VselGt
         )
     }
 
@@ -417,10 +423,7 @@ impl Op {
     /// produce identical results across rmodes for the operand classes the
     /// fuzz harness exercises (we don't probe rounding boundaries here).
     fn rmode_sensitive(self) -> bool {
-        matches!(
-            self,
-            Op::VRintR | Op::VRintX | Op::VcvtUR | Op::VcvtSR
-        )
+        matches!(self, Op::VRintR | Op::VRintX | Op::VcvtUR | Op::VcvtSR)
     }
 }
 
@@ -1035,19 +1038,19 @@ fn vcvt_f16_rounding_edge_cases_f32() -> Vec<f32> {
         // mantissa = 0x3FF, round_bit = 0, sticky = 0 → rounded = 0x3FF.
         // Line 1563 takes the false branch; mutation `>=` takes true.
         let frac_3ff_no_round = (0x3FFu32) << 13;
-        out.push(f32::from_bits((exp << 23) | (frac_3ff_no_round & 0x7F_FFFF)));
+        out.push(f32::from_bits(
+            (exp << 23) | (frac_3ff_no_round & 0x7F_FFFF),
+        ));
         // mantissa = 0x3FE, round_bit = 1, sticky = 1 → rounded =
         // 0x3FF. Same boundary, different path in.
-        let frac_3fe_round_sticky =
-            ((0x3FEu32) << 13) | (1 << 12) | 1;
+        let frac_3fe_round_sticky = ((0x3FEu32) << 13) | (1 << 12) | 1;
         out.push(f32::from_bits(
             (exp << 23) | (frac_3fe_round_sticky & 0x7F_FFFF),
         ));
         // mantissa = 0x3FF, round_bit = 1, sticky = 1 → rounded =
         // 0x400. Original carries; mutation also carries (>= 0x3FF
         // is also true). No divergence here, but useful coverage.
-        let frac_3ff_round_sticky =
-            ((0x3FFu32) << 13) | (1 << 12) | 1;
+        let frac_3ff_round_sticky = ((0x3FFu32) << 13) | (1 << 12) | 1;
         out.push(f32::from_bits(
             (exp << 23) | (frac_3ff_round_sticky & 0x7F_FFFF),
         ));
@@ -1725,14 +1728,14 @@ fn edge_cases() -> Vec<(Op, f32, f32, f32)> {
     // `run_vcmp_one` reads s[2] (Sd) and s[4] (Sm); the pre-load loop
     // in `run_single` would put `a` into s[2] and `b` into s[4].
     let cmp_inputs = [
-        (1.0f32, 2.0),  // less
-        (2.0, 1.0),     // greater
-        (1.0, 1.0),     // equal
-        (0.0, -0.0),    // equal at zero (per IEEE)
-        (-0.0, 0.0),    // ditto
+        (1.0f32, 2.0), // less
+        (2.0, 1.0),    // greater
+        (1.0, 1.0),    // equal
+        (0.0, -0.0),   // equal at zero (per IEEE)
+        (-0.0, 0.0),   // ditto
         (0.0, 0.0),
-        (qnan, 1.0),    // unordered (LHS NaN)
-        (1.0, qnan),    // unordered (RHS NaN)
+        (qnan, 1.0), // unordered (LHS NaN)
+        (1.0, qnan), // unordered (RHS NaN)
         (qnan, qnan),
         (snan, 1.0),
         (1.0, snan),
@@ -1755,7 +1758,7 @@ fn edge_cases() -> Vec<(Op, f32, f32, f32)> {
         -0.0,
         1.0,
         -1.0,
-        2.5,    // RN: 2; RP: 3; RM: 2; RZ: 2
+        2.5, // RN: 2; RP: 3; RM: 2; RZ: 2
         -2.5,
         1.5,
         -1.5,
@@ -1766,11 +1769,11 @@ fn edge_cases() -> Vec<(Op, f32, f32, f32)> {
         denorm,
         // Boundary values for i32/u32 saturation. f32 can't represent
         // 2^31 exactly past the round-up, but close.
-        2147483648.0,            // = 2^31, just over i32::MAX
-        -2147483648.0,           // = -2^31, exactly i32::MIN as f32
-        4294967296.0,            // = 2^32, just over u32::MAX
-        2147483520.0,            // = i32::MAX rounded down
-        f32::MAX,                // very large
+        2147483648.0,  // = 2^31, just over i32::MAX
+        -2147483648.0, // = -2^31, exactly i32::MIN as f32
+        4294967296.0,  // = 2^32, just over u32::MAX
+        2147483520.0,  // = i32::MAX rounded down
+        f32::MAX,      // very large
         -f32::MAX,
         // VCVT.F32.U32 / VCVT.F32.S32 inputs reinterpret f32 bits as
         // integer; pre-encode common integer values as f32-bits.
@@ -1795,10 +1798,10 @@ fn edge_cases() -> Vec<(Op, f32, f32, f32)> {
     // Operand pairs include NaN to verify the integer_result_bits check
     // catches a wrong-operand pick under DN=0.
     let vsel_operand_pairs = [
-        (1.0f32, 2.0),    // distinct finite
-        (qnan, 1.0),      // NaN as sn
-        (1.0, qnan),      // NaN as sm
-        (snan, qnan),     // both NaN, different payloads
+        (1.0f32, 2.0), // distinct finite
+        (qnan, 1.0),   // NaN as sn
+        (1.0, qnan),   // NaN as sm
+        (snan, qnan),  // both NaN, different payloads
     ];
     for nzcv_bits in 0..16u32 {
         let apsr_bits = nzcv_bits << 28;

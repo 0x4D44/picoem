@@ -8553,4 +8553,3 @@ mod stage4_harness_residue {
         assert_eq!(c, FuzzClass::Base);
     }
 }
-

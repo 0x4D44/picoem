@@ -3221,10 +3221,7 @@ mod tests {
             OPC_SYSTEM,
         ];
         for op in non_fp {
-            assert!(
-                !is_fp_opcode(op),
-                "non-FP opcode 0x{op:02X} flagged as FP"
-            );
+            assert!(!is_fp_opcode(op), "non-FP opcode 0x{op:02X} flagged as FP");
         }
     }
 
@@ -3554,7 +3551,10 @@ mod tests {
         let order: Vec<RiscvClass> = RiscvClass::ALL.to_vec();
         let mut last_idx = 0usize;
         for tc in &all {
-            let idx = order.iter().position(|c| *c == tc.class).expect("class in ALL");
+            let idx = order
+                .iter()
+                .position(|c| *c == tc.class)
+                .expect("class in ALL");
             assert!(
                 idx >= last_idx,
                 "edge cases out of order: class {:?} (idx {idx}) follows last_idx {last_idx}",

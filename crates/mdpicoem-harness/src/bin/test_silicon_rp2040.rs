@@ -34,9 +34,7 @@ use std::time::{Duration, Instant};
 use mdpicoem_harness::cli::parse_probe_selector;
 use mdpicoem_harness::isr_scenarios_rp2040::{self, IsrArgs};
 use mdpicoem_harness::probe_diff_rp2040_lib::{self, ProbeDiffArgs};
-use mdpicoem_harness::silicon_oracle::{
-    CaseOutcome, Verdict, name_matches_filter, should_exclude,
-};
+use mdpicoem_harness::silicon_oracle::{CaseOutcome, Verdict, name_matches_filter, should_exclude};
 use mdpicoem_harness::silicon_periph_rp2040::{self, PeriphArgs};
 use mdpicoem_harness::test_silicon_common::{
     GIVE_UP_THRESHOLD, HEARTBEAT_INTERVAL, NameInterner, Summary, append_error_log, attach,
@@ -44,8 +42,8 @@ use mdpicoem_harness::test_silicon_common::{
     now_iso, parse_duration, reattach_with_retries, shuffle_in_place,
     validate_catalogue_names_are_unique,
 };
-use probe_rs::probe::DebugProbeSelector;
 use probe_rs::Session;
+use probe_rs::probe::DebugProbeSelector;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -185,7 +183,8 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
                         "--probe requires a VID:PID:SERIAL argument\n{USAGE}"
                     ));
                 }
-                a.probe = Some(parse_probe_selector(&argv[i]).map_err(|e| format!("{e}\n{USAGE}"))?);
+                a.probe =
+                    Some(parse_probe_selector(&argv[i]).map_err(|e| format!("{e}\n{USAGE}"))?);
             }
             "--fuzz-count" => {
                 i += 1;
@@ -215,11 +214,17 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
 /// orchestrator runs them. Used by both the substring-uniqueness check
 /// and the soak-loop name lists.
 fn periph_names() -> Vec<&'static str> {
-    silicon_periph_rp2040::SCENARIOS.iter().map(|s| s.name).collect()
+    silicon_periph_rp2040::SCENARIOS
+        .iter()
+        .map(|s| s.name)
+        .collect()
 }
 
 fn isr_names() -> Vec<&'static str> {
-    isr_scenarios_rp2040::SCENARIOS.iter().map(|s| s.name).collect()
+    isr_scenarios_rp2040::SCENARIOS
+        .iter()
+        .map(|s| s.name)
+        .collect()
 }
 
 /// probe_diff has a generated catalogue (`generate_all`) on the order of
@@ -546,8 +551,8 @@ fn single_pass(
                     CaseOutcome::fail(oracle_name_static(oracle.as_str()), case_name, e.clone(), 0);
                 summary.record(&[synth], 0);
                 summary.reattach_count += 1;
-                session =
-                    reattach_with_retries(CHIP, probe).map_err(|e| format!("reattach failed: {e}"))?;
+                session = reattach_with_retries(CHIP, probe)
+                    .map_err(|e| format!("reattach failed: {e}"))?;
             }
         }
         println!(
@@ -900,7 +905,10 @@ mod tests {
     #[test]
     fn fmt_elapsed_round_trip() {
         assert_eq!(fmt_elapsed(Duration::from_secs(0)), "[+00:00:00]");
-        assert_eq!(fmt_elapsed(Duration::from_secs(3600 + 60 + 2)), "[+01:01:02]");
+        assert_eq!(
+            fmt_elapsed(Duration::from_secs(3600 + 60 + 2)),
+            "[+01:01:02]"
+        );
     }
 
     #[test]
@@ -985,8 +993,7 @@ mod tests {
 
     #[test]
     fn parse_args_probe_bogus_value_errors() {
-        let err =
-            parse_args(vec!["--probe".into(), "bogus".into()]).expect_err("bogus must error");
+        let err = parse_args(vec!["--probe".into(), "bogus".into()]).expect_err("bogus must error");
         assert!(
             err.contains("invalid probe selector"),
             "unexpected error: {err}"
@@ -1085,5 +1092,4 @@ mod tests {
         let rc = orchestrate(&args, stop).expect("dry-run must not error");
         assert_eq!(rc, 0);
     }
-
 }

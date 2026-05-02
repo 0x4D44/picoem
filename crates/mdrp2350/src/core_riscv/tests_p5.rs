@@ -1779,4 +1779,3 @@ fn exec_vectored_interrupt_dispatches_per_code() {
     assert_eq!(c.pc, 0x2000_201C);
     assert_eq!(c.csrs.mcause, 0x8000_0007);
 }
-

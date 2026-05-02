@@ -3294,21 +3294,9 @@ mod phase1_wave2 {
         assert_eq!(emu.bus.read32(frame_sp), 0xAAAA_0000, "frame[0] = R0");
         assert_eq!(emu.bus.read32(frame_sp + 4), 0xAAAA_0001, "frame[1] = R1");
         assert_eq!(emu.bus.read32(frame_sp + 8), 0xAAAA_0002, "frame[2] = R2");
-        assert_eq!(
-            emu.bus.read32(frame_sp + 12),
-            0xAAAA_0003,
-            "frame[3] = R3"
-        );
-        assert_eq!(
-            emu.bus.read32(frame_sp + 16),
-            0xAAAA_000C,
-            "frame[4] = R12"
-        );
-        assert_eq!(
-            emu.bus.read32(frame_sp + 20),
-            0xAAAA_000E,
-            "frame[5] = LR"
-        );
+        assert_eq!(emu.bus.read32(frame_sp + 12), 0xAAAA_0003, "frame[3] = R3");
+        assert_eq!(emu.bus.read32(frame_sp + 16), 0xAAAA_000C, "frame[4] = R12");
+        assert_eq!(emu.bus.read32(frame_sp + 20), 0xAAAA_000E, "frame[5] = LR");
         // Return-PC: step 1 ran the slow-path drain *and* executed the
         // NOP at MAIN_ADDR (advancing PC to MAIN_ADDR + 2); step 2's
         // dispatch pre-empted before the next instruction committed.
@@ -3335,8 +3323,7 @@ mod phase1_wave2 {
 
         // LR must hold an EXC_RETURN magic — Thread mode + MSP.
         assert_eq!(
-            emu.cores[0].regs.r[14],
-            0xFFFF_FFF9,
+            emu.cores[0].regs.r[14], 0xFFFF_FFF9,
             "LR must hold EXC_RETURN for Thread/MSP"
         );
 
@@ -3388,7 +3375,8 @@ mod phase1_wave2 {
 
         // Pend BOTH PendSV and SysTick at the same priority (default 0).
         // ICSR W1S bits at 0xE000_ED04: PENDSVSET (28), PENDSTSET (26).
-        emu.bus.write32(SCB_ICSR_ADDR, ICSR_PENDSVSET | ICSR_PENDSTSET);
+        emu.bus
+            .write32(SCB_ICSR_ADDR, ICSR_PENDSVSET | ICSR_PENDSTSET);
         let icsr = emu.bus.ppb[0].icsr;
         assert_ne!(icsr & ICSR_PENDSVSET, 0, "PENDSVSET must latch");
         assert_ne!(icsr & ICSR_PENDSTSET, 0, "PENDSTSET must latch");
@@ -3425,8 +3413,7 @@ mod phase1_wave2 {
         // SysTick without unstacking. We use the `test_exit_exception`
         // hook to avoid having to assemble the BX directly into the
         // handler stub.
-        emu.cores[0]
-            .test_exit_exception(0xFFFF_FFF9, &mut emu.bus);
+        emu.cores[0].test_exit_exception(0xFFFF_FFF9, &mut emu.bus);
         // After tail-chain, IPSR must be 15 (SysTick) and the MSP must
         // match the in-handler value (no full unstacking).
         assert_eq!(
@@ -3449,8 +3436,7 @@ mod phase1_wave2 {
 
         // Final return: SysTick exits via EXC_RETURN 0xF9 → Thread/MSP.
         // After this the frame is unstacked and we're back in main.
-        emu.cores[0]
-            .test_exit_exception(0xFFFF_FFF9, &mut emu.bus);
+        emu.cores[0].test_exit_exception(0xFFFF_FFF9, &mut emu.bus);
         assert_eq!(
             emu.cores[0].regs.ipsr(),
             0,
@@ -3523,8 +3509,7 @@ mod phase1_wave2 {
         }
         // PC must still be inside main (the planted self-loop).
         assert!(
-            emu.cores[0].regs.pc() == MAIN_ADDR
-                || emu.cores[0].regs.pc() == MAIN_ADDR + 2,
+            emu.cores[0].regs.pc() == MAIN_ADDR || emu.cores[0].regs.pc() == MAIN_ADDR + 2,
             "PC must remain in main while IRQ is masked"
         );
         // NVIC pending bit stays latched.
@@ -9597,7 +9582,10 @@ mod stage2_core_residue {
         let cycles_before = cpu.cycles;
         let cycles = cpu.step(&mut bus);
         assert_eq!(cycles, 0);
-        assert_eq!(cpu.cycles, cycles_before, "halted step must not bill cycles");
+        assert_eq!(
+            cpu.cycles, cycles_before,
+            "halted step must not bill cycles"
+        );
     }
 
     /// `wake()` clears the halt flag.
@@ -9665,7 +9653,11 @@ mod stage2_core_residue {
         bus.write16(prog, 0xDE00); // UDF #0
         cpu.regs.set_pc(prog);
         let _ = cpu.step(&mut bus);
-        assert_eq!(cpu.regs.ipsr(), 3, "UDF dispatched as HardFault via pending_fault");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            3,
+            "UDF dispatched as HardFault via pending_fault"
+        );
     }
 
     /// PRIMASK=1 short-circuits `try_take_any_pending_exception` to 0
@@ -9929,7 +9921,8 @@ mod stage2_core_residue {
         // Plant a vector table.
         let vtor: u32 = 0x2000_2000;
         for i in 0..32 {
-            emu.bus.write32(vtor + (i as u32) * 4, (0x2000_3000 + (i as u32) * 32) | 1);
+            emu.bus
+                .write32(vtor + (i as u32) * 4, (0x2000_3000 + (i as u32) * 32) | 1);
         }
         emu.bus.ppb[0].vtor = vtor;
         // PendSV configured priority 0xC0, PENDSVSET latched.
@@ -9942,7 +9935,10 @@ mod stage2_core_residue {
         let _ = emu.step().expect("Serial step is infallible");
         // External IRQ wins → IPSR = 16 + 5 = 21.
         assert_eq!(emu.cores[0].regs.ipsr(), 21);
-        assert!(!emu.bus.nvics[0].is_pending(5), "dispatch clears NVIC pending");
+        assert!(
+            !emu.bus.nvics[0].is_pending(5),
+            "dispatch clears NVIC pending"
+        );
         // PendSV still latched — only the chosen candidate's latch clears.
         assert_ne!(emu.bus.ppb[0].icsr & (1 << 28), 0);
     }
@@ -10043,7 +10039,10 @@ mod stage2_core_residue {
         cpu.test_enter_exception(14, &mut bus);
         // Nibble 0x5 is invalid.
         cpu.test_exit_exception(0xFFFF_FFF5, &mut bus);
-        assert!(cpu.has_pending_fault(), "invalid EXC_RETURN must stage fault");
+        assert!(
+            cpu.has_pending_fault(),
+            "invalid EXC_RETURN must stage fault"
+        );
     }
 }
 
@@ -10848,8 +10847,9 @@ mod stage3_rp2040_peripherals_residue {
     /// the alias=1 arm in the ICR write path.
     #[test]
     fn uart_icr_xor_alias_path() {
-        use crate::peripherals::uart::{UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTICR, UARTIMSC,
-            UARTLCR_H, UartRegs};
+        use crate::peripherals::uart::{
+            UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTICR, UARTIMSC, UARTLCR_H, UartRegs,
+        };
         let mut u = UartRegs::new(20);
         let mut irqs = 0u32;
         u.write32(UARTLCR_H, 1 << 4, 0, &mut irqs);
@@ -10978,9 +10978,7 @@ mod stage3_rp2040_peripherals_residue {
     /// the per-alarm loop body four times across `poll_alarms`.
     #[test]
     fn timer_four_alarms_all_fire_independently() {
-        use crate::peripherals::timer::{
-            ALARM0_OFFSET, INTE_OFFSET, INTR_OFFSET, TimerRegs,
-        };
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET, INTR_OFFSET, TimerRegs};
         const SYS: u32 = 125_000_000;
         let mut t = TimerRegs::new();
         // Enable all four NVIC routes.
@@ -11136,7 +11134,16 @@ mod stage3_dma_residue {
         bus.write32(RESETS_BASE + 0x3000, 1u32 << RESET_DMA);
     }
 
-    fn ctrl(en: bool, ds: u32, ir: bool, iw: bool, treq: u8, chain: u32, ring: u32, rsel: bool) -> u32 {
+    fn ctrl(
+        en: bool,
+        ds: u32,
+        ir: bool,
+        iw: bool,
+        treq: u8,
+        chain: u32,
+        ring: u32,
+        rsel: bool,
+    ) -> u32 {
         let mut v = 0u32;
         if en {
             v |= CTRL_EN;
