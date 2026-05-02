@@ -138,7 +138,7 @@ cleared on a fresh cold power-up. Sequence:
      a write. The emulator's current values are **assumptions**:
      `POWMAN_BASE = 0x4010_0000`, `CHIP_RESET` offset `0x20`, both
      explicitly flagged ASSUMPTION in
-     `crates/mdrp2350/src/peripherals/powman.rs` module doc (offset
+     `crates/rp2350-emu/src/peripherals/powman.rs` module doc (offset
      `0x20` is an educated guess inside the 4 KB POWMAN aperture; the
      emulator's storage model round-trips regardless of whether the
      offset matches silicon exactly, so the in-tree offset itself is
@@ -168,10 +168,10 @@ cleared on a fresh cold power-up. Sequence:
 3. Update this section to replace the ASSUMPTION block with a pinned
    value, citing the source.
 4. Update `POWMAN_OFFSET_PINNED` in
-   `crates/mdpicoem-harness/src/bin/riscv_probe_spike.rs` from
+   `crates/picoem-harness/src/bin/riscv_probe_spike.rs` from
    `false` to `true` and fix the `POWMAN_BASE` / `CHIP_RESET_OFFSET`
    constants to match.
-5. Update the emulator's `crates/mdrp2350/src/peripherals/powman.rs`
+5. Update the emulator's `crates/rp2350-emu/src/peripherals/powman.rs`
    module doc to drop the ASSUMPTION flag on the matching offset (if
    the datasheet value equals the emulator's current guess) or to
    correct the guess (if not — will require a storage-model audit,
@@ -198,7 +198,7 @@ After attach:
   CPU arch — the probe YAML is ARM-only and probe-rs routes through
   the Arm debug sequence regardless of silicon state.
 - Run `riscv_probe_spike` (the Phase 1 spike binary in
-  `crates/mdpicoem-harness/src/bin/riscv_probe_spike.rs`). It
+  `crates/picoem-harness/src/bin/riscv_probe_spike.rs`). It
   calls `Core::architecture()` and reads `mhartid`; the summary row
   "1. Attach + RV core enumeration" tells you which arch the silicon
   booted into. PASS = RV, FAIL with "architectures = [Arm, Arm]" =

@@ -6,9 +6,9 @@ The goal is a small, clean, verifiable emulator core that can boot the real Pi b
 
 ```
 mdpicoem (this repo)           — RP2350/RP2354 + RP2040 emulators, TUIs, test harness
-  ├─► mdrp2350                 — RP2350 / RP2354 emulator library (Cortex-M33)
-  ├─► mdrp2040                 — RP2040 emulator library (Cortex-M0+)
-  └─► onerom-emu               — OneROM firmware running on mdrp2350
+  ├─► rp2350-emu                 — RP2350 / RP2354 emulator library (Cortex-M33)
+  ├─► rp2040-emu                 — RP2040 emulator library (Cortex-M0+)
+  └─► onerom-emu               — OneROM firmware running on rp2350-emu
         └─► mddosem            — DOS emulator, uses OneROM as BIOS
 ```
 
@@ -57,17 +57,17 @@ place.
 cargo build --release
 
 # RP2350 / RP2354 interactive TUI (dual Cortex-M33)
-cargo run -p mdrp2350app --release              # blinky (default)
-cargo run -p mdrp2350app --release -- lcd       # LCD demo
-cargo run -p mdrp2350app --release -- benchmark # throughput benchmark
-cargo run -p mdrp2350app --release -- blinky    # (explicit)
+cargo run -p rp2350-emu-tui --release              # blinky (default)
+cargo run -p rp2350-emu-tui --release -- lcd       # LCD demo
+cargo run -p rp2350-emu-tui --release -- benchmark # throughput benchmark
+cargo run -p rp2350-emu-tui --release -- blinky    # (explicit)
 
 # RP2040 interactive TUI (dual Cortex-M0+)
-cargo run -p mdrp2040app --release              # blinky (default)
+cargo run -p rp2040-emu-tui --release              # blinky (default)
 
 # Load your own firmware
-cargo run -p mdrp2350app --release -- path/to/firmware.bin
-cargo run -p mdrp2040app --release -- path/to/firmware.bin
+cargo run -p rp2350-emu-tui --release -- path/to/firmware.bin
+cargo run -p rp2040-emu-tui --release -- path/to/firmware.bin
 ```
 
 The RP2350 TUI has panels for CPU status, GPIO state, an LCD device emulator, an ISA trace view, and a live benchmark panel. The RP2040 TUI has the same shape minus the FPU / DCP / RCP / NS panels, and its ISA panel carries M0+-specific cycle numbers.
@@ -78,15 +78,15 @@ Bundled ROMs under `roms/rp2350/` (`blinky.bin`, `benchmark.bin`, `lcd_demo.bin`
 
 Seven crates under `crates/`:
 
-- **`mdpicoem-common`** — shared primitives: `Memory`, `ClockTree`, `Pacer`, PIO primitive types (`PioBlock` / `StateMachine`), divider/FIFO, `Peripheral` trait. Both chip crates depend on this.
-- **`mdrp2350`** — the RP2350 / RP2354 emulator core library (CPUs, bus, memory, clocks, SIO, PIO, FPU, coprocessors, pacer).
-- **`mdrp2350app`** — interactive TUI (ratatui + crossterm) for `mdrp2350`, with panels and a device frontend (LCD, benchmark).
-- **`mdrp2040`** — the RP2040 emulator core library (dual Cortex-M0+, bus, memory, clocks, SIO, PIO).
-- **`mdrp2040app`** — interactive TUI for `mdrp2040`.
-- **`mdpicoem-harness`** — all differential and hardware-in-the-loop test binaries. Binaries are chip-suffixed (`qemu_diff_m33` / `qemu_diff_m0plus`, `probe_diff_rp2350` / `probe_diff_rp2040`, etc.).
-- **`mdpicoem-debug`** — GDB RSP server and trace tooling. Stubbed.
+- **`picoem-common`** — shared primitives: `Memory`, `ClockTree`, `Pacer`, PIO primitive types (`PioBlock` / `StateMachine`), divider/FIFO, `Peripheral` trait. Both chip crates depend on this.
+- **`rp2350-emu`** — the RP2350 / RP2354 emulator core library (CPUs, bus, memory, clocks, SIO, PIO, FPU, coprocessors, pacer).
+- **`rp2350-emu-tui`** — interactive TUI (ratatui + crossterm) for `rp2350-emu`, with panels and a device frontend (LCD, benchmark).
+- **`rp2040-emu`** — the RP2040 emulator core library (dual Cortex-M0+, bus, memory, clocks, SIO, PIO).
+- **`rp2040-emu-tui`** — interactive TUI for `rp2040-emu`.
+- **`picoem-harness`** — all differential and hardware-in-the-loop test binaries. Binaries are chip-suffixed (`qemu_diff_m33` / `qemu_diff_m0plus`, `probe_diff_rp2350` / `probe_diff_rp2040`, etc.).
+- **`picoem-debug`** — GDB RSP server and trace tooling. Stubbed.
 
-The real UIs are `mdrp2350app` and `mdrp2040app`; run them with `cargo run -p mdrp2350app` or `cargo run -p mdrp2040app`. The workspace has no top-level binary.
+The real UIs are `rp2350-emu-tui` and `rp2040-emu-tui`; run them with `cargo run -p rp2350-emu-tui` or `cargo run -p rp2040-emu-tui`. The workspace has no top-level binary.
 
 ## Testing
 
@@ -96,8 +96,8 @@ The emulators are validated by independent oracles, each catching different bug 
 
 ```bash
 cargo test                      # all crates
-cargo test -p mdrp2350          # RP2350 / RP2354 core only
-cargo test -p mdrp2040          # RP2040 core only
+cargo test -p rp2350-emu          # RP2350 / RP2354 core only
+cargo test -p rp2040-emu          # RP2040 core only
 cargo test <name_substring>     # filtered
 ```
 
@@ -109,14 +109,14 @@ Each oracle spawns a QEMU reference CPU, connects over GDB, runs the same instru
 
 ```bash
 # RP2350 / Cortex-M33 oracle (GDB port 3333)
-cargo run -p mdpicoem-harness --release --bin qemu_diff_m33                        # edge-case suite
-cargo run -p mdpicoem-harness --release --bin qemu_diff_m33 -- --fuzz 100000       # random fuzz
-cargo run -p mdpicoem-harness --release --bin qemu_diff_m33 -- --fuzz 100000 --seed <S>
+cargo run -p picoem-harness --release --bin qemu_diff_m33                        # edge-case suite
+cargo run -p picoem-harness --release --bin qemu_diff_m33 -- --fuzz 100000       # random fuzz
+cargo run -p picoem-harness --release --bin qemu_diff_m33 -- --fuzz 100000 --seed <S>
 
 # RP2040 / Cortex-M0+ oracle (GDB port 3334, uses QEMU `cortex-m0` — see `tech_debt.md`)
-cargo run -p mdpicoem-harness --release --bin qemu_diff_m0plus
-cargo run -p mdpicoem-harness --release --bin qemu_diff_m0plus -- --fuzz 100000
-cargo run -p mdpicoem-harness --release --bin qemu_diff_m0plus -- --fuzz 100000 --seed <S>
+cargo run -p picoem-harness --release --bin qemu_diff_m0plus
+cargo run -p picoem-harness --release --bin qemu_diff_m0plus -- --fuzz 100000
+cargo run -p picoem-harness --release --bin qemu_diff_m0plus -- --fuzz 100000 --seed <S>
 ```
 
 Requires `qemu-system-arm` on `PATH`.
@@ -129,13 +129,13 @@ Drive a real RP2354 board over SWD via a Pi Pico debug probe, single-step it, an
 
 ```bash
 # Same instruction-level test suite as qemu_diff_m33 but against silicon
-cargo run -p mdpicoem-harness --release --bin probe_diff_rp2350
+cargo run -p picoem-harness --release --bin probe_diff_rp2350
 
 # Register / DWT cycle-counter sanity checks
-cargo run -p mdpicoem-harness --release --bin probe_verify_rp2350
+cargo run -p picoem-harness --release --bin probe_verify_rp2350
 
 # SRAM bank-conflict timing characterisation
-cargo run -p mdpicoem-harness --release --bin bank_conflict_test_rp2350
+cargo run -p picoem-harness --release --bin bank_conflict_test_rp2350
 ```
 
 Requires a Pi Pico configured as a `probe-rs`-compatible debug probe wired to an RP2354 target (for the `*_rp2350` binaries) or a Pico V1 / RP2040 target (for `probe_diff_rp2040`). On a host with both probes attached, disambiguate with `--probe <VID:PID:SERIAL>` — `probe-rs list` shows the available serials.
@@ -143,8 +143,8 @@ Requires a Pi Pico configured as a `probe-rs`-compatible debug probe wired to an
 ### 4. Paced benchmark and full integration
 
 ```bash
-cargo run -p mdpicoem-harness --release --bin paced_bench_rp2350
-cargo run -p mdpicoem-harness --release --bin full_test_rp2350
+cargo run -p picoem-harness --release --bin paced_bench_rp2350
+cargo run -p picoem-harness --release --bin full_test_rp2350
 ```
 
 Measures real-time throughput with wall-clock pacing and runs a larger integration smoke. Useful for regression-checking performance work.

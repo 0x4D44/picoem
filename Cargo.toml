@@ -4,14 +4,14 @@ members = ["crates/*"]
 # default-members so `cargo build` at the root keeps working on hosts
 # without clang. Build it explicitly: `cargo build -p epio-sys`.
 default-members = [
-    "crates/mdpicoem-common",
-    "crates/mdpicoem-debug",
-    "crates/mdpicoem-devices",
-    "crates/mdpicoem-harness",
-    "crates/mdrp2040",
-    "crates/mdrp2040app",
-    "crates/mdrp2350",
-    "crates/mdrp2350app",
+    "crates/picoem-common",
+    "crates/picoem-debug",
+    "crates/picoem-devices",
+    "crates/picoem-harness",
+    "crates/rp2040-emu",
+    "crates/rp2040-emu-tui",
+    "crates/rp2350-emu",
+    "crates/rp2350-emu-tui",
 ]
 resolver = "2"
 
@@ -61,10 +61,10 @@ opt-level = 3
 lto = "fat"
 panic = "abort"
 
-[profile.release.package.mdrp2350]
+[profile.release.package.rp2350-emu]
 codegen-units = 1
 
-[profile.release.package.mdrp2040]
+[profile.release.package.rp2040-emu]
 codegen-units = 1
 
 # Release build with line-tables for profiling (samply, perf, VTune).

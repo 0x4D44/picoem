@@ -1,0 +1,104 @@
+[package]
+name = "rp2350-emu"
+version = "0.1.3"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cycle-accurate emulator for the Raspberry Pi RP2350 / RP2354 (dual Cortex-M33 + PIO + FPU)."
+repository = "https://github.com/0x4D44/mdpicoem"
+homepage = "https://github.com/0x4D44/mdpicoem"
+documentation = "https://docs.rs/rp2350-emu"
+readme = "README.md"
+keywords = ["emulator", "rp2350", "rp2354", "cortex-m33", "pico"]
+categories = ["emulators", "embedded"]
+# Five integration tests use `include_bytes!("../../../roms/rp2350/...")`
+# to load workspace-root firmware images. Those paths escape the crate
+# root and would not resolve from a crates.io tarball, so the tests are
+# excluded from publication. They remain in the workspace for in-tree
+# `cargo test -p rp2350-emu` runs.
+exclude = [
+    "tests/hello_dma.rs",
+    "tests/hello_pwm.rs",
+    "tests/hello_riscv_blinky.rs",
+    "tests/hello_timer.rs",
+    "tests/hello_uart.rs",
+]
+
+[lints]
+workspace = true
+
+[features]
+# `threading` is opt-in for V1. The runtime supports x86_64 Windows
+# and x86_64 Linux today (see the `cfg`-gates on
+# `picoem_common::threaded` and `rp2350_emu::threaded::*`). On macOS or
+# any non-x86_64 host the feature compiles but exposes no usable
+# threaded entry points; defaulting it off keeps `cargo add rp2350-emu`
+# working cross-platform out of the box. Windows / Linux users who
+# want the threaded runtime should opt in: `cargo add rp2350-emu
+# --features threading`.
+default = []
+# Forward the PIO `test-hooks` feature to `picoem-common`. Enables
+# cross-crate unit tests to push RX FIFO words via `PioBlock::push_rx`.
+# (Consumed by picoem-harness [dev-dependencies] — removing this
+# breaks the concurrent PicoGUS / silicon-oracle test harness.)
+test-hooks = ["picoem-common/test-hooks"]
+# Dual-execution HLD V1 (Stage 1b): feature-gates the threaded runtime.
+# Default on; disable for Serial-only builds on non-x86_64 targets or in
+# consumer projects that never want the 6-thread worker pool. Gating is
+# layered with the existing `cfg(all(target_arch = "x86_64", target_os =
+# "windows"))` guard on `threaded::{emulator,timings}` so the feature
+# flag controls the module's *exposure* while the platform cfg still
+# governs whether `ThreadedEmulator` itself compiles.
+threading = []
+# Dual-execution HLD V1 Stage 1b review (REQUIRED #2): opt-in surface
+# for test-only panic-injection APIs (`Emulator::inject_panic_for_testing`,
+# `threaded::PioCommand::TestPanic`). These exist solely to prove
+# panic-containment in the `tests/execution_model.rs` integration
+# suite; hiding them behind a feature flag keeps the release crate's
+# public surface from shipping a "brick your emulator" hook. NOT in
+# `default` on purpose — integration tests that need the injector
+# declare `required-features = ["testing"]`. Callers outside of the
+# test tree should never enable this.
+testing = []
+
+[dependencies]
+picoem-common = { version = "0.1", path = "../picoem-common" }
+tracing = { workspace = true }
+# SHA-256 block compressor — HLD V5 §7.D.6. `compress` feature exposes
+# the padding-less `compress256` entry point, which matches the RP2350
+# SHA-256 hardware's 16-word block compressor exactly.
+sha2 = { version = "0.10", features = ["compress"] }
+
+# Enable the PIO `test-hooks` feature for in-crate tests so `pop_tx` /
+# `push_rx` are callable without gating the production build. This
+# mirrors how `picoem-harness` opts in under its own [dev-dependencies].
+[dev-dependencies]
+picoem-common = { path = "../picoem-common", features = ["test-hooks"] }
+tracing-subscriber = { workspace = true }
+
+# Dual-execution HLD V1 Stage 1b review (REQUIRED #2): the
+# `execution_model` integration test exercises `Emulator::
+# inject_panic_for_testing` and `PioCommand::TestPanic`, both of
+# which are gated behind the `testing` feature. Run with
+# `cargo test -p rp2350-emu --features testing`.
+[[test]]
+name = "execution_model"
+required-features = ["testing"]
+
+# Dual-execution HLD V1 Stage 2: curated dual-model smoke tests that
+# run identical scenarios on Serial and Threaded and assert end-state
+# equality where observable (HLD V1 §7.1 / §7.2). Requires the
+# `threading` feature so `ExecutionModel::Threaded` is selectable at
+# build time.
+[[test]]
+name = "dual_model"
+required-features = ["threading"]
+
+# docs.rs builds on Linux x86_64. Enable all opt-in features so the
+# rendered API surface includes the threaded runtime (`x86_64`-Linux is
+# one of the two supported platforms for `ThreadedEmulator`) plus the
+# test-only hooks that integration tests reference.
+[package.metadata.docs.rs]
+features = ["threading", "testing", "test-hooks"]
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,0 +1,19 @@
+[package]
+name = "picoem-devices"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Off-chip device models (PSRAM, LCD, I2S) for the picoem RP2040/RP2350 emulator workspace."
+repository = "https://github.com/0x4D44/mdpicoem"
+homepage = "https://github.com/0x4D44/mdpicoem"
+documentation = "https://docs.rs/picoem-devices"
+readme = "README.md"
+keywords = ["emulator", "psram", "embedded", "device-model", "pico"]
+categories = ["emulators", "embedded", "hardware-support"]
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }
