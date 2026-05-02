@@ -482,7 +482,7 @@ mod tests {
         // written) and must NOT remain at row 1 col 19 (the 'A'
         // origin) since at least one scroll occurred.
         assert!(
-            state.rows[1].iter().any(|&b| b == b'V'),
+            state.rows[1].contains(&b'V'),
             "row 1 should contain 'V' after multiple scrolls: {:?}",
             std::str::from_utf8(&state.rows[1]).unwrap_or("?"),
         );

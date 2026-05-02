@@ -23675,7 +23675,7 @@ mod stage2_exceptions_corecasecoverage {
         let fp_sp = cpu.regs.msp + 32;
         let known = 4.25f32.to_bits();
         for i in 0..16 {
-            bus.write32(fp_sp + (i as u32) * 4, known.wrapping_add(i), 0);
+            bus.write32(fp_sp + i * 4, known.wrapping_add(i), 0);
         }
         bus.write32(fp_sp + 64, 0x1234_5678, 0); // FPSCR
         cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
@@ -24819,7 +24819,7 @@ mod stage2_thumb32_residue {
         let op_bits = 0b10000u16;
         let hw0: u16 = 0xF300 | (op_bits << 4) | 1;
         // hw1 = imm3:Rd:imm2:0:sat_imm5
-        let hw1: u16 = (0u16 << 12) | (0u16 << 8) | (0u16 << 6) | 7u16;
+        let hw1: u16 = 7u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(0) as i32, 127);
         assert!(c.regs.flag_q());
@@ -24986,7 +24986,7 @@ mod stage2_thumb32_residue {
         c.set_reg(0, (-2i32) as u32);
         c.set_reg(1, 0x4000_0000);
         // SMULL RdLo, RdHi, Rn, Rm: hw0 = 0xFB80 | Rn, hw1 = RdLo<<12 | RdHi<<8 | 0 | Rm
-        let hw0: u16 = 0xFB80 | 0; // Rn=R0
+        let hw0: u16 = 0xFB80; // Rn=R0
         let hw1: u16 = (2u16 << 12) | (3u16 << 8) | 1u16; // RdLo=R2 RdHi=R3 Rm=R1
         c.execute_one_wide(hw0, hw1);
         // -2 * 0x40000000 = -0x80000000 = sign-extended 0xFFFF_FFFF_8000_0000
@@ -25055,7 +25055,7 @@ mod stage2_thumb32_residue {
         c.set_reg(2, 0x0000_0001); // RdLo
         c.set_reg(3, 0x0000_0002); // RdHi
         // hw0 = 0xFBE0 | Rn, hw1[7:4] = 0110.
-        let hw0: u16 = 0xFBE0 | 0;
+        let hw0: u16 = 0xFBE0;
         let hw1: u16 = (2u16 << 12) | (3u16 << 8) | (0b0110 << 4) | 1u16;
         c.execute_one_wide(hw0, hw1);
         // product = 0x1_0000 * 0x1_0000 = 0x1_0000_0000.
@@ -25071,7 +25071,7 @@ mod stage2_thumb32_residue {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 100);
         c.set_reg(1, 0);
-        let hw0: u16 = 0xFB90 | 0; // op1=001 → SDIV
+        let hw0: u16 = 0xFB90; // op1=001 → SDIV
         let hw1: u16 = (0xFu16 << 12) | (3u16 << 8) | (0xFu16 << 4) | 1u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(3), 0);
@@ -25083,7 +25083,7 @@ mod stage2_thumb32_residue {
         let mut c = CortexM33::for_test(0);
         c.set_reg(0, 100);
         c.set_reg(1, 0);
-        let hw0: u16 = 0xFBB0 | 0; // op1=011 → UDIV
+        let hw0: u16 = 0xFBB0; // op1=011 → UDIV
         let hw1: u16 = (0xFu16 << 12) | (3u16 << 8) | (0xFu16 << 4) | 1u16;
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.reg(3), 0);
@@ -26093,13 +26093,13 @@ mod stage3_bus_residue {
         let mut bus = Bus::new();
         let rosc = 0x400E_8000u32;
         // Plain write sets CTRL.
-        bus.write32(rosc + 0x000, 0xFAB4_AA0, 0);
+        bus.write32(rosc, 0xFAB4_AA0, 0);
         // SET alias.
-        bus.write32(rosc + 0x000 + APB_SET_OFFSET, 0x1, 0);
+        bus.write32(rosc + APB_SET_OFFSET, 0x1, 0);
         // CLR alias.
-        bus.write32(rosc + 0x000 + APB_CLR_OFFSET, 0x1, 0);
+        bus.write32(rosc + APB_CLR_OFFSET, 0x1, 0);
         // XOR alias.
-        bus.write32(rosc + 0x000 + APB_XOR_OFFSET, 0xFF, 0);
+        bus.write32(rosc + APB_XOR_OFFSET, 0xFF, 0);
     }
 
     /// CLOCKS unknown offset read returns 0 (the `_ => 0` arm in clocks_read).

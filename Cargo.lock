@@ -1455,14 +1455,14 @@ dependencies = [
 
 [[package]]
 name = "mdpicoem-devices"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "mdpicoem-harness"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2040"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mdpicoem-common",
  "mdpicoem-devices",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2350"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "mdpicoem-common",
  "sha2",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "mdrp2350app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossterm",

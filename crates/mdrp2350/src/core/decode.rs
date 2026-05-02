@@ -750,6 +750,7 @@ mod classifier_tests {
     #[test]
     fn t16_misc_group_dispatches() {
         // op[11:8] = 0b0000 → ADD/SUB SP imm7 (pure)
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         let pure_misc = (0b10110u16 << 11) | (0b0000 << 8);
         assert!(classify_thumb16_pure(pure_misc));
         // op[11:8] = 0b0100 → PUSH (impure)
@@ -944,6 +945,7 @@ mod classifier_tests {
     #[test]
     fn t32_op1_01_load_store_dual_is_impure() {
         // op1 = 0b01, op2 >> 5 = 0b00 → ldm/stm/ldrd/strd (impure).
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         let hw0 = (0b11101u16 << 11) | (0b01 << 11) | (0b00_00000 << 4);
         assert!(!classify_thumb32_pure(hw0, 0));
     }
@@ -977,6 +979,7 @@ mod classifier_tests {
     #[test]
     fn t32_op1_11_load_store_single_is_impure() {
         // op1 = 0b11, op2 & 0x40 = 0, op2 & 0x20 = 0 → load_store_single (impure).
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         let hw0 = (0b11111u16 << 11) | (0b11 << 11) | (0b0000000 << 4);
         assert!(!classify_thumb32_pure(hw0, 0));
     }

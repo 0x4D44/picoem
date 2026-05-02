@@ -692,13 +692,13 @@ pub fn run_against(
 
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(selected.len());
     for (i, sc) in selected.iter().enumerate() {
-        if let Some(d) = deadline {
-            if Instant::now() > d {
-                // Watchdog fired between scenarios; return collected
-                // outcomes so the orchestrator records partial progress
-                // and can move on to the next oracle.
-                break;
-            }
+        if let Some(d) = deadline
+            && Instant::now() > d
+        {
+            // Watchdog fired between scenarios; return collected
+            // outcomes so the orchestrator records partial progress
+            // and can move on to the next oracle.
+            break;
         }
         let first_scenario = i == 0;
         match run_scenario_with_retry(core, sc, first_scenario, args.verbose) {

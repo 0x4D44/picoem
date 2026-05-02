@@ -93,10 +93,10 @@ pub fn is_m0plus_silicon_safe(tc: &TestCase) -> bool {
 
     // Thumb-32 admit list (BL / MSR / MRS / DSB / DMB / ISB) with sysm
     // reject set (BASEPRI=17, FAULTMASK=19, banked >= 0x80).
-    if let Some(hw1) = tc.hw1 {
-        if !crate::m0plus_admits_wide(tc.opcode, hw1) {
-            return false;
-        }
+    if let Some(hw1) = tc.hw1
+        && !crate::m0plus_admits_wide(tc.opcode, hw1)
+    {
+        return false;
     }
 
     true
@@ -341,7 +341,7 @@ pub fn run_against(
         Some(count) => {
             let (alu, mem) = generate_fuzz(count, args.seed);
             alu.into_iter()
-                .chain(mem.into_iter())
+                .chain(mem)
                 .filter(is_m0plus_silicon_safe)
                 .filter(|tc| !tc.probe_only)
                 .collect()
@@ -369,10 +369,10 @@ pub fn run_against(
     let mut interner = SyntheticNameInterner::default();
 
     for tc in &cases {
-        if let Some(d) = deadline {
-            if Instant::now() > d {
-                break;
-            }
+        if let Some(d) = deadline
+            && Instant::now() > d
+        {
+            break;
         }
         let t0 = Instant::now();
         let case_static = interner.intern(&tc.name);

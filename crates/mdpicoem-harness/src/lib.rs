@@ -8264,7 +8264,7 @@ mod stage4_harness_residue {
             // `all_test_names_nonempty`); this assertion documents which
             // labels we expect.
             assert_eq!(name.len(), 2, "label sanity: {name}");
-            assert_eq!(name.is_empty(), false, "cond {cond} label empty");
+            assert!(!name.is_empty(), "cond {cond} label empty");
         }
     }
 
@@ -8524,7 +8524,7 @@ mod stage4_harness_residue {
         let a = CompareBases::M33_RP2350;
         let b = a; // Copy
         let _c = a; // and again
-        let d = a.clone();
+        let d = a;
         let dbg = format!("{:?}", b);
         assert!(dbg.contains("CompareBases"));
         assert_eq!(d.qemu_slot, a.qemu_slot);

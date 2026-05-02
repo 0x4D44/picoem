@@ -2449,10 +2449,10 @@ pub fn run_against(
     let mut loop_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
     for sc in &selected {
-        if let Some(d) = deadline {
-            if Instant::now() > d {
-                break;
-            }
+        if let Some(d) = deadline
+            && Instant::now() > d
+        {
+            break;
         }
         match run_one_scenario(core, sc, args.verbose) {
             Ok((verdict, detail, elapsed)) => {

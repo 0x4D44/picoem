@@ -1727,7 +1727,10 @@ fn exec_mret_with_mpp_zero_rounds_to_m() {
     let (mut c, mut bus) = fresh();
     c.csrs.mepc = 0x2000_0200;
     // After-trap state with MPP deliberately set to 0b00 (U-mode), MPIE=1.
-    c.csrs.mstatus = (1 << 7) | (0b00 << 11);
+    #[allow(clippy::erasing_op)]
+    {
+        c.csrs.mstatus = (1 << 7) | (0b00 << 11);
+    }
     c.execute(Op::Mret, &mut bus, 0x2000_0000);
     assert_eq!(c.pc, 0x2000_0200);
     // mret unconditionally writes MPP <- 0b11 per V1 WARL.

@@ -445,7 +445,7 @@ mod tests {
             state.cursor.1,
         );
         assert!(
-            state.rows[1].iter().any(|&b| b == b'V'),
+            state.rows[1].contains(&b'V'),
             "row 1 should contain 'V' after multiple scrolls",
         );
     }

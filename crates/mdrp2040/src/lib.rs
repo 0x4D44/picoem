@@ -1049,10 +1049,10 @@ impl Emulator {
     #[inline]
     fn apply_pending_panic_inject(&mut self) {
         #[cfg(feature = "testing")]
-        if let Some(which) = self.pending_panic_inject.take() {
-            if let Some(t) = self.threaded.as_mut() {
-                t.inject_panic_for_testing(which);
-            }
+        if let Some(which) = self.pending_panic_inject.take()
+            && let Some(t) = self.threaded.as_mut()
+        {
+            t.inject_panic_for_testing(which);
         }
     }
 

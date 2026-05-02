@@ -10170,7 +10170,7 @@ mod stage3_bus_residue {
         let mut bus = Bus::new();
         // Release PWM (bit 14 in RP2040 RESETS).
         bus.write32(RESETS_CLR, 1u32 << 14);
-        let csr0 = PWM_BASE + 0x000;
+        let csr0 = PWM_BASE;
         bus.write32(csr0 + APB_SET_OFFSET, 0x1);
         bus.write32(csr0 + APB_XOR_OFFSET, 0x1);
         bus.write32(csr0 + APB_CLR_OFFSET, 0x1);
@@ -10193,7 +10193,7 @@ mod stage3_bus_residue {
     fn watchdog_alias_paths() {
         let mut bus = Bus::new();
         bus.write32(RESETS_CLR, 1u32 << 24);
-        let watchdog_inte = WATCHDOG_BASE + 0x000;
+        let watchdog_inte = WATCHDOG_BASE;
         bus.write32(watchdog_inte + APB_SET_OFFSET, 0x0);
         bus.write32(watchdog_inte + APB_XOR_OFFSET, 0x0);
         bus.write32(watchdog_inte + APB_CLR_OFFSET, 0x0);
@@ -10253,7 +10253,7 @@ mod stage3_bus_residue {
     fn uart1_dr_byte_access() {
         let mut bus = Bus::new();
         bus.write32(RESETS_CLR, 1u32 << 23); // RESET_UART1
-        let dr = UART1_BASE + 0x000;
+        let dr = UART1_BASE;
         let _ = bus.read8(dr);
         let _ = bus.read16(dr);
         bus.write8(dr, 0x41);
@@ -10293,8 +10293,8 @@ mod stage3_bus_residue {
     fn pio_non_txf_narrow_write_dropped() {
         let mut bus = Bus::new();
         bus.write32(RESETS_CLR, 1u32 << 10);
-        bus.write8(PIO0_BASE + 0x000, 0xFF); // CTRL — dropped
-        bus.write16(PIO0_BASE + 0x000, 0xFFFF);
+        bus.write8(PIO0_BASE, 0xFF); // CTRL — dropped
+        bus.write16(PIO0_BASE, 0xFFFF);
     }
 
     // ----- SIO byte/halfword via Bus -------------------------------------

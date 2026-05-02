@@ -433,6 +433,7 @@ mod classifier_tests {
         // We assert here that the dispatch happens correctly by picking
         // a canonical pure misc op and a canonical impure misc op.
         // op[11:8] = 0b0000 → ADD/SUB SP imm7 (pure)
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         let pure_misc = (0b10110u16 << 11) | (0b0000 << 8);
         assert!(classify_thumb16_pure(pure_misc));
         // op[11:8] = 0b0100 → PUSH (impure)
