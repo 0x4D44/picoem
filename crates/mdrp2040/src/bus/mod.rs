@@ -232,16 +232,12 @@ pub(crate) struct DecodedOp {
     pub hw1: u16,
     /// Packed flags.
     ///   bit 0 — `is_wide`
-    ///   bit 1 — `is_pure` (handler does not touch the bus and does not
-    ///           raise a synchronous fault). Reserved here; unused on
-    ///           the M0+ fast path until iter7 wires the skip.
-    ///   bits 2..7 — reserved
+    ///   bits 1..7 — reserved
     pub flags: u8,
 }
 
 impl DecodedOp {
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
-    pub(crate) const FLAG_PURE: u8 = 0b0000_0010;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -256,12 +252,6 @@ impl DecodedOp {
     #[inline(always)]
     pub(crate) fn is_wide(&self) -> bool {
         self.flags & Self::FLAG_WIDE != 0
-    }
-
-    #[inline(always)]
-    #[allow(dead_code)] // wired into iter7 fast-path skip
-    pub(crate) fn is_pure(&self) -> bool {
-        self.flags & Self::FLAG_PURE != 0
     }
 }
 

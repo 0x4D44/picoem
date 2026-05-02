@@ -301,15 +301,6 @@ impl ThreadedEmulator {
         }
     }
 
-    /// Override the default host-core pinning mask. The supplied mask
-    /// maps worker index (0=core0, 1=core1, 2=coordinator) to host
-    /// logical-CPU id.
-    #[allow(dead_code)]
-    pub fn with_thread_mask(mut self, mask: [usize; 3]) -> Self {
-        self.thread_mask = mask;
-        self
-    }
-
     /// Current shared master-cycle count. Lock-free `Acquire` load.
     pub fn master_cycle(&self) -> u64 {
         self.shared.master_cycle.load(Ordering::Acquire)
@@ -902,20 +893,6 @@ mod tests {
 
     // ----- Builder + accessor coverage ----------------------------------
 
-    /// `with_thread_mask` overrides the default `[0,1,2]` pinning mask.
-    /// We don't actually run a quantum here — the affinity call happens
-    /// inside `spawn_worker` and a non-default mask might fail on a
-    /// host with too few logical CPUs. Round-trip through the public
-    /// builder accessor only.
-    #[test]
-    fn with_thread_mask_persists() {
-        let emu = EmulatorBuilder::new(Config::default())
-            .build()
-            .expect("Serial build infallible");
-        let threaded = ThreadedEmulator::from_emulator(emu).with_thread_mask([0, 1, 2]);
-        assert_eq!(threaded.thread_mask, [0, 1, 2]);
-    }
-
     /// `core_cycles(0|1)` returns the inner core's cycle counter while
     /// the cores are owned by `ThreadedEmulator` (i.e. between
     /// `run_quanta_checked` calls). Fresh emulator ⇒ both 0.
@@ -938,19 +915,6 @@ mod tests {
             .expect("Serial build infallible");
         let threaded = ThreadedEmulator::from_emulator(emu);
         let _ = threaded.core_cycles(2);
-    }
-
-    /// `shared()` returns the same `Arc<SharedState>` carried inside
-    /// the emulator. Identity check via `Arc::ptr_eq` against an
-    /// indirectly-cloned handle.
-    #[test]
-    fn shared_accessor_returns_state() {
-        let emu = EmulatorBuilder::new(Config::default())
-            .build()
-            .expect("Serial build infallible");
-        let threaded = ThreadedEmulator::from_emulator(emu);
-        let cloned = Arc::clone(threaded.shared());
-        assert!(Arc::ptr_eq(threaded.shared(), &cloned));
     }
 
     // ----- run_quanta_checked drain-loop coverage -----------------------
