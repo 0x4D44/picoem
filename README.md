@@ -1,11 +1,11 @@
-# mdpicoem
+# picoem
 
 Cycle-accurate emulators for the Raspberry Pi **RP2354 / RP2350** (dual Arm Cortex-M33 @ 150 MHz, 520 KB SRAM, FPU, coprocessors, PIO) and **RP2040** (dual Arm Cortex-M0+ @ 133 MHz, 264 KB SRAM, PIO), written in Rust.
 
 The goal is a small, clean, verifiable emulator core that can boot the real Pi bootroms, run ARMv8-M (M33) or ARMv6-M (M0+) firmware with accurate cycle timing, and serve as a reusable library crate for downstream projects.
 
 ```
-mdpicoem (this repo)           — RP2350/RP2354 + RP2040 emulators, TUIs, test harness
+picoem (this repo)           — RP2350/RP2354 + RP2040 emulators, TUIs, test harness
   ├─► rp2350-emu                 — RP2350 / RP2354 emulator library (Cortex-M33)
   ├─► rp2040-emu                 — RP2040 emulator library (Cortex-M0+)
   └─► onerom-emu               — OneROM firmware running on rp2350-emu
@@ -41,7 +41,7 @@ upstream sources via git submodules. A normal clone works for everything else,
 but `cargo build -p epio-sys` requires submodules to be initialised:
 
 ```bash
-git clone --recursive https://github.com/0x4D44/mdpicoem.git
+git clone --recursive https://github.com/0x4D44/picoem.git
 # or, after a non-recursive clone:
 git submodule update --init
 ```

@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-mdpicoem is a research-grade emulator: it executes potentially
+picoem is a research-grade emulator: it executes potentially
 untrusted firmware images, but inside a userspace simulator on a
 developer's host. The realistic security surface is small —
 predominantly:

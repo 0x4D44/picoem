@@ -2,10 +2,10 @@
 
 [![Crates.io](https://img.shields.io/crates/v/picoem-devices.svg)](https://crates.io/crates/picoem-devices)
 [![Docs.rs](https://docs.rs/picoem-devices/badge.svg)](https://docs.rs/picoem-devices)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/mdpicoem)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
 
 Off-chip device models — PSRAM, LCD, I2S — for the
-[mdpicoem](https://github.com/0x4D44/mdpicoem) RP2350 / RP2040 emulator
+[picoem](https://github.com/0x4D44/picoem) RP2350 / RP2040 emulator
 workspace.
 
 This is a support crate for the Pico emulators. Most users want
@@ -23,7 +23,7 @@ uses the HyperRAM-style PSRAM model for `test_psram` compatibility).
 - **I2S capture model** — sampling sink that decodes BCLK/LRCLK/DOUT
   from the RP2040 emulator's PIO pad output and produces stereo PCM.
 
-See the [workspace README](https://github.com/0x4D44/mdpicoem) for the
+See the [workspace README](https://github.com/0x4D44/picoem) for the
 broader context.
 
 ## License

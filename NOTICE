@@ -1,7 +1,7 @@
-mdpicoem — NOTICE
+picoem — NOTICE
 ==================
 
-The mdpicoem codebase is licensed under MIT OR Apache-2.0 at your option.
+The picoem codebase is licensed under MIT OR Apache-2.0 at your option.
 See LICENSE-MIT and LICENSE-APACHE for details.
 
 --------------------------------------------------------------------------------
@@ -107,7 +107,7 @@ probe-rs (vendored fork)
     the SelectCache is still DPv1). It is wired in from the workspace
     root via `[patch.crates-io]`. Our local modifications are dual-
     licensed MIT OR Apache-2.0 under the same terms as upstream and the
-    rest of `mdpicoem`. See the PATCHES.md file referenced above for
+    rest of `picoem`. See the PATCHES.md file referenced above for
     the full change description and a removal plan once upstream merges
     a fix.
 

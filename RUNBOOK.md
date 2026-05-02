@@ -1,6 +1,6 @@
 # RUNBOOK
 
-Operator recipes for the mdpicoem repo. Pairs with `tech_debt.md` (which
+Operator recipes for the picoem repo. Pairs with `tech_debt.md` (which
 tracks bugs), `CLAUDE.md` (which tracks conventions), and the HLDs under
 `wrk_docs/`.
 

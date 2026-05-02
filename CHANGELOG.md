@@ -10,4 +10,4 @@ for published crates.
 
 ### Added
 
-- Initial public release of the mdpicoem workspace as open source.
+- Initial public release of the picoem workspace as open source.

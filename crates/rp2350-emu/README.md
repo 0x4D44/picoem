@@ -2,12 +2,12 @@
 
 [![Crates.io](https://img.shields.io/crates/v/rp2350-emu.svg)](https://crates.io/crates/rp2350-emu)
 [![Docs.rs](https://docs.rs/rp2350-emu/badge.svg)](https://docs.rs/rp2350-emu)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/mdpicoem)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
 
 A cycle-accurate emulator library for the **Raspberry Pi RP2350 / RP2354**
 (dual Arm Cortex-M33 @ 150 MHz, 520 KB SRAM, FPU, coprocessors, PIO).
 
-`rp2350-emu` is the RP2350-side of the [mdpicoem](https://github.com/0x4D44/mdpicoem)
+`rp2350-emu` is the RP2350-side of the [picoem](https://github.com/0x4D44/picoem)
 workspace. It boots the real Raspberry Pi bootrom, runs ARMv8-M Mainline
 firmware, and is differentially validated against both QEMU's Cortex-M33 and
 real RP2354 silicon via SWD.
@@ -90,7 +90,7 @@ emulator instance:
 
 ## Workspace context
 
-This crate is part of the `mdpicoem` workspace; the project also publishes:
+This crate is part of the `picoem` workspace; the project also publishes:
 
 - [`rp2040-emu`](https://crates.io/crates/rp2040-emu) — RP2040 (Cortex-M0+) emulator.
 - [`picoem-common`](https://crates.io/crates/picoem-common) — shared primitives.
@@ -98,7 +98,7 @@ This crate is part of the `mdpicoem` workspace; the project also publishes:
 
 The full workspace, including TUI applications, the test harness, the
 QEMU + silicon differential oracles, and design documents, lives at
-<https://github.com/0x4D44/mdpicoem>.
+<https://github.com/0x4D44/picoem>.
 
 ## License
 

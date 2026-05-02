@@ -2,13 +2,13 @@
 
 [![Crates.io](https://img.shields.io/crates/v/picoem-common.svg)](https://crates.io/crates/picoem-common)
 [![Docs.rs](https://docs.rs/picoem-common/badge.svg)](https://docs.rs/picoem-common)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/mdpicoem)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
 
-Shared primitive types for the [mdpicoem](https://github.com/0x4D44/mdpicoem)
+Shared primitive types for the [picoem](https://github.com/0x4D44/picoem)
 RP2350 / RP2354 / RP2040 emulator workspace.
 
 This crate is a low-level building block for the chip emulators in the
-mdpicoem workspace; it is unlikely to be useful as a stand-alone library.
+picoem workspace; it is unlikely to be useful as a stand-alone library.
 **If you want to embed a Pico emulator in your project, depend on
 [`rp2350-emu`](https://crates.io/crates/rp2350-emu) or
 [`rp2040-emu`](https://crates.io/crates/rp2040-emu) instead** — they re-export

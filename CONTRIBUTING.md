@@ -1,12 +1,12 @@
-# Contributing to mdpicoem
+# Contributing to picoem
 
-Thanks for your interest in mdpicoem. This is a personal research
+Thanks for your interest in picoem. This is a personal research
 project, not a sponsored or commercial codebase, so PR review and
 issue triage are best-effort — please be patient.
 
 ## Project status and scope
 
-mdpicoem is an actively-developed cycle-accurate emulator workspace
+picoem is an actively-developed cycle-accurate emulator workspace
 for the Raspberry Pi RP2350 / RP2354 (dual Cortex-M33 + PIO) and
 RP2040 (dual Cortex-M0+ + PIO). The Arm-mode cores are the focus; the
 RP2350 RISC-V Hazard3 cores are present and partially functional but

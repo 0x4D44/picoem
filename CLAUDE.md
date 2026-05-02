@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## mdpicoem — RP2350 / RP2040 Emulator Workspace
+## picoem — RP2350 / RP2040 Emulator Workspace
 
 Cycle-accurate emulators for the Raspberry Pi RP2354 / RP2350 family (dual Cortex-M33 + PIO) and the RP2040 (dual Cortex-M0+ + PIO). Rust workspace under `crates/` after the post-restructure state (Phases 1–7 complete):
 
