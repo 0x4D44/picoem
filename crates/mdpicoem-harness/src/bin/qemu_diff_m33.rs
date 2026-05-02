@@ -31,6 +31,26 @@ const BKPT_BYTES: [u8; 2] = [0x00, 0xBE];
 /// Vector table base address (secure alias of ssram-0).
 const VECTOR_TABLE_BASE: u32 = 0x1000_0000;
 
+/// Special-register-reset primer: three back-to-back Thumb-32 `MSR Sn, R0`
+/// instructions written once at startup to `QEMU_M33_PRIMER_SLOT` and
+/// stepped through (with R0=0 from the per-test default reset) before
+/// every test. Resets PRIMASK / BASEPRI / FAULTMASK on QEMU to align with
+/// the EMU side, which builds a fresh `CortexM33::new()` per test. See
+/// `QEMU_M33_PRIMER_SLOT` in `mdpicoem_harness` for the full rationale.
+///
+/// Encoding (ARMv8-M B5.4.6 / T1 — `MSR Sn, R0`, hw0 fixed for Rn=0):
+///   PRIMASK   (SYSm=16): F3 80 88 10  →  LE bytes 0x80 0xF3 0x10 0x88
+///   BASEPRI   (SYSm=17): F3 80 88 11  →  LE bytes 0x80 0xF3 0x11 0x88
+///   FAULTMASK (SYSm=19): F3 80 88 13  →  LE bytes 0x80 0xF3 0x13 0x88
+const PRIMER_BYTES: [u8; 12] = [
+    0x80, 0xF3, 0x10, 0x88, // MSR PRIMASK, R0
+    0x80, 0xF3, 0x11, 0x88, // MSR BASEPRI, R0
+    0x80, 0xF3, 0x13, 0x88, // MSR FAULTMASK, R0
+];
+
+/// Number of single-steps to execute the primer.
+const PRIMER_STEPS: usize = 3;
+
 /// Set by the Ctrl-C handler. Polled at fuzz-loop checkpoints; never
 /// inspected from the handler itself (handlers must not call
 /// `process::exit` — that would skip `QemuProcess`'s `Drop` and re-open
@@ -360,6 +380,11 @@ fn setup_vector_table(gdb: &mut GdbClient) -> Result<(), Box<dyn std::error::Err
     gdb.write_mem(VECTOR_TABLE_BASE, &table)?;
     // Enable FPU: CPACR CP10/CP11 full access
     gdb.write_mem(0xE000_ED88, &0x00F0_0000u32.to_le_bytes())?;
+    // Special-register-reset primer (PRIMASK / BASEPRI / FAULTMASK ← 0).
+    // Stepped before every test by `run_qemu_side` to clear leakage from
+    // prior tests. See `PRIMER_BYTES` and `QEMU_M33_PRIMER_SLOT` for
+    // rationale.
+    gdb.write_mem(QEMU_M33_PRIMER_SLOT, &PRIMER_BYTES)?;
     Ok(())
 }
 
@@ -454,16 +479,30 @@ fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState
         n_steps = if tc.opcode2.is_some() { 2 } else { 1 };
     }
 
-    // Set register defaults
+    // Set register defaults. PC is aimed at the primer slot first so the
+    // three `MSR PRIMASK/BASEPRI/FAULTMASK, R0` instructions execute before
+    // any per-test register override has a chance to set R0 != 0. xPSR
+    // flag bits are unchanged by `MSR <special-reg>, Rn` per ARMv8-M B5.2,
+    // so `tc.xpsr_pre` survives the primer.
     for i in 0..=12u8 {
         gdb.write_reg(i, 0)?;
     }
     gdb.write_reg(REG_SP, QEMU_TEST_STACK)?;
     gdb.write_reg(REG_LR, 0xFFFF_FFFF)?;
-    gdb.write_reg(REG_PC, QEMU_TEST_SLOT)?;
+    gdb.write_reg(REG_PC, QEMU_M33_PRIMER_SLOT)?;
     gdb.write_reg(REG_XPSR, tc.xpsr_pre)?;
 
-    // Apply register preconditions with address translation
+    // Special-register-reset primer: step PRIMASK / BASEPRI / FAULTMASK
+    // writes-of-zero. Aligns QEMU's persistent CPU state with the EMU's
+    // fresh-CPU-per-test model so `MRS Rd, <special>` doesn't leak across
+    // tests.
+    for _ in 0..PRIMER_STEPS {
+        gdb.step()?;
+    }
+
+    // Apply register preconditions with address translation. Applied AFTER
+    // the primer so that an `R0` override can't accidentally re-set
+    // PRIMASK/BASEPRI/FAULTMASK to non-zero.
     for &(reg, val) in &tc.reg_pre {
         let val = setup_reg(reg, val, tc, QEMU_TEST_SCRATCH);
         gdb.write_reg(reg, val)?;
@@ -491,7 +530,9 @@ fn run_qemu_side(gdb: &mut GdbClient, tc: &TestCase) -> std::io::Result<RunState
         }
     }
 
-    // Step through the instruction sequence
+    // Re-aim PC at the test slot (the primer left it at
+    // QEMU_M33_PRIMER_SLOT + 12) and step the actual test sequence.
+    gdb.write_reg(REG_PC, QEMU_TEST_SLOT)?;
     for _ in 0..n_steps {
         gdb.step()?;
     }
