@@ -428,22 +428,19 @@ impl I2cRegs {
 
     pub fn write32(&mut self, offset: u32, value: u32, alias: u32, irqs: &mut u32) {
         match offset {
-            IC_CON => {
-                // IC_CON is writable only when IC_ENABLE.EN=0 per DW
-                // spec; the emulator honours this to catch firmware
-                // bugs that reorder the sequence.
-                if !self.is_enabled() {
-                    let mut stored = self.con;
-                    super::apply_alias_rmw(&mut stored, value, alias);
-                    self.con = stored;
-                }
+            // IC_CON is writable only when IC_ENABLE.EN=0 per DW
+            // spec; the emulator honours this to catch firmware
+            // bugs that reorder the sequence. Writes while enabled
+            // fall through to the catch-all (no-op).
+            IC_CON if !self.is_enabled() => {
+                let mut stored = self.con;
+                super::apply_alias_rmw(&mut stored, value, alias);
+                self.con = stored;
             }
-            IC_TAR => {
-                if !self.is_enabled() {
-                    let mut stored = self.tar;
-                    super::apply_alias_rmw(&mut stored, value, alias);
-                    self.tar = stored & 0x3FF;
-                }
+            IC_TAR if !self.is_enabled() => {
+                let mut stored = self.tar;
+                super::apply_alias_rmw(&mut stored, value, alias);
+                self.tar = stored & 0x3FF;
             }
             IC_SAR => {
                 let mut stored = self.sar;

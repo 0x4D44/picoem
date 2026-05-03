@@ -619,11 +619,10 @@ fn is_password_gated(offset: u32) -> bool {
 fn sys_per_tick(clock_tree: &ClockTree) -> u64 {
     let sys_hz = clock_tree.sys_clk_hz as u64;
     let tick_hz = POWMAN_TICK_HZ as u64;
-    if tick_hz == 0 {
-        0
-    } else {
-        (sys_hz / tick_hz).max(1)
-    }
+    sys_hz
+        .checked_div(tick_hz)
+        .map(|q| q.max(1))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

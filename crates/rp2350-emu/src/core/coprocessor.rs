@@ -100,13 +100,12 @@ impl CortexM33 {
             2 => self.cp0_lo_in(bus, is_mrc, is_bulk, crn, crm, rt),
             // ---- HI banks (pins 30..47) — RP2354A has no pins here.
             // Reads RAZ, writes WI. Preserve any Rt value on MRC by writing 0;
-            // no SIO mutation on MCR.
-            4..=6 => {
-                if is_mrc {
-                    self.regs.r[rt] = 0;
-                }
+            // no SIO mutation on MCR. The is_mrc=false case (i.e. MCR) falls
+            // through to the silent-NOP catch-all.
+            4..=6 if is_mrc => {
+                self.regs.r[rt] = 0;
             }
-            _ => {} // unknown opc1 -> silent NOP
+            _ => {} // unknown opc1 / MCR to HI bank -> silent NOP
         }
         1
     }
@@ -624,17 +623,13 @@ impl CortexM33 {
                     self.pending_fault = Some(Fault::Nmi);
                 }
             }
-            (2, 0) => {
-                // rcp_btrue Rt — assert Rt == 1.
-                if self.regs.r[rt] != 1 {
-                    self.pending_fault = Some(Fault::Nmi);
-                }
+            // rcp_btrue Rt — assert Rt == 1.
+            (2, 0) if self.regs.r[rt] != 1 => {
+                self.pending_fault = Some(Fault::Nmi);
             }
-            (3, 1) => {
-                // rcp_bfalse Rt — assert Rt == 0.
-                if self.regs.r[rt] != 0 {
-                    self.pending_fault = Some(Fault::Nmi);
-                }
+            // rcp_bfalse Rt — assert Rt == 0.
+            (3, 1) if self.regs.r[rt] != 0 => {
+                self.pending_fault = Some(Fault::Nmi);
             }
             (4, 0) => {
                 // rcp_count_init imm — set the redundancy counter to imm.
@@ -691,11 +686,10 @@ impl CortexM33 {
         let rt2 = (hw0 & 0xF) as usize;
 
         match opc1 {
-            7 => {
-                // rcp_iequal Rt, Rt2 — assert Rt == Rt2 (bootrom 0xFC4x_x770).
-                if self.regs.r[rt] != self.regs.r[rt2] {
-                    self.pending_fault = Some(Fault::Nmi);
-                }
+            // rcp_iequal Rt, Rt2 — assert Rt == Rt2 (bootrom 0xFC4x_x770).
+            // Equal case (assertion holds) falls through to the catch-all.
+            7 if self.regs.r[rt] != self.regs.r[rt2] => {
+                self.pending_fault = Some(Fault::Nmi);
             }
             8 => {
                 match crm {

@@ -253,13 +253,7 @@ impl TimerRegs {
             TIMERAWH_OFFSET => (self.count_us >> 32) as u32,
             TIMERAWL_OFFSET => self.count_us as u32,
             DBGPAUSE_OFFSET => self.dbgpause as u32,
-            PAUSE_OFFSET => {
-                if self.pause {
-                    1
-                } else {
-                    0
-                }
-            }
+            PAUSE_OFFSET => u32::from(self.pause),
             LOCKED_OFFSET => 0, // V5: unmodelled (RAZ)
             SOURCE_OFFSET => SOURCE_TICKS,
             INTR_OFFSET => (self.intr & 0xF) as u32,

@@ -1110,11 +1110,13 @@ impl CortexM33 {
             17 => {
                 self.regs.basepri = val & 0xFF;
             }
-            // BASEPRI_MAX — only lowers (numerically) the priority ceiling
-            18 => {
-                if val & 0xFF != 0 && ((val & 0xFF) < self.regs.basepri || self.regs.basepri == 0) {
-                    self.regs.basepri = val & 0xFF;
-                }
+            // BASEPRI_MAX — only lowers (numerically) the priority ceiling.
+            // The "no-op when val=0 or doesn't lower" case falls through to
+            // the catch-all.
+            18 if val & 0xFF != 0
+                && ((val & 0xFF) < self.regs.basepri || self.regs.basepri == 0) =>
+            {
+                self.regs.basepri = val & 0xFF;
             }
             // FAULTMASK
             19 => {
@@ -1466,7 +1468,7 @@ impl CortexM33 {
                 // UDIV
                 let a = self.regs.r[rn];
                 let b = self.regs.r[rm];
-                self.regs.r[rd_hi] = if b == 0 { 0 } else { a / b };
+                self.regs.r[rd_hi] = a.checked_div(b).unwrap_or(0);
                 // M33 measured: data-dependent early termination [1..12]
                 // Floor of 5 for all non-zero divisors, scaling to 12 for large dividends
                 if b == 0 {

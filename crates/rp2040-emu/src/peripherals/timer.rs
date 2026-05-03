@@ -280,13 +280,7 @@ impl TimerRegs {
             TIMERAWH_OFFSET => (now >> 32) as u32,
             TIMERAWL_OFFSET => now as u32,
             DBGPAUSE_OFFSET => self.dbgpause as u32,
-            PAUSE_OFFSET => {
-                if self.pause {
-                    1
-                } else {
-                    0
-                }
-            }
+            PAUSE_OFFSET => u32::from(self.pause),
             INTR_OFFSET => (self.intr & 0xF) as u32,
             INTE_OFFSET => (self.inte & 0xF) as u32,
             INTF_OFFSET => (self.intf & 0xF) as u32,

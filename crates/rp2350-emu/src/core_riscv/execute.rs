@@ -490,13 +490,7 @@ fn exec_muldiv(kind: MulDivKind, a: u32, b: u32) -> u32 {
                 ((a as i32).wrapping_div(b as i32)) as u32
             }
         }
-        MulDivKind::Divu => {
-            if b == 0 {
-                0xFFFF_FFFF
-            } else {
-                a / b
-            }
-        }
+        MulDivKind::Divu => a.checked_div(b).unwrap_or(0xFFFF_FFFF),
         MulDivKind::Rem => {
             if b == 0 {
                 a // remainder = dividend
