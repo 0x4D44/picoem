@@ -38,7 +38,7 @@ use rp2350_emu::{Bus, Emulator};
 
 use crate::onerom_serving_oracle::{
     ADDR_A11_A12_HIGH, Case, SHADOW_BASE, SHADOW_SIZE, lift_shadow_from_flash_pub,
-    stimulus_level_pub,
+    stimulus_level_pub, stimulus_level_raw,
 };
 
 // ---------------------------------------------------------------------------
@@ -242,17 +242,30 @@ impl CpuServingOracle {
     /// 3. Envelope check: reclassify `Pass` with out-of-envelope latency
     ///    to `LatencyOutOfEnvelope`.
     pub fn run_case(&mut self, emu: &mut Emulator, case: Case) -> &CpuCaseResult {
+        // Two construction modes — see `Case` doc. The `raw_pin_state`
+        // path bypasses the A11=A12=1 invariant so larger-than-1541-style
+        // fixtures (e.g. the 256 KiB SeaBIOS validator) can drive every
+        // 16-bit GPIO pattern directly.
         debug_assert!(
-            case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
-            "run_case: case.addr_bits must have A11=A12=1"
+            case.raw_pin_state.is_some()
+                || case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
+            "run_case: case.addr_bits must have A11=A12=1 (or use Case::raw_pin_state)"
         );
 
         // External-input mask covers CS1/CS2/CS3 and all address pins.
         // D0..D7 (16..23) are CPU-driven — never mask them.
-        let ext_mask: u32 = (1u32 << GPIO_CS1)
-            | (1u32 << GPIO_CS2)
-            | (1u32 << GPIO_CS3)
-            | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
+        // For `raw_pin_state` cases we drive every bit of the low 16
+        // (with CS1 forced low) so the mask covers the whole low-16
+        // GPIO range minus the data pins.
+        let ext_mask: u32 = if case.raw_pin_state.is_some() {
+            // Bits 0..15, exclude data pins (16..23).
+            0x0000_FFFFu32
+        } else {
+            (1u32 << GPIO_CS1)
+                | (1u32 << GPIO_CS2)
+                | (1u32 << GPIO_CS3)
+                | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p))
+        };
         emu.bus.gpio_external_mask = ext_mask;
 
         // 1. Gap drive — CS1/CS2/CS3 all high, addr=0.
@@ -263,7 +276,10 @@ impl CpuServingOracle {
         }
 
         // 2. Apply stimulus.
-        let stim_level = stimulus_level_pub(case.addr_bits);
+        let stim_level = match case.raw_pin_state {
+            Some(p) => stimulus_level_raw(p),
+            None => stimulus_level_pub(case.addr_bits),
+        };
         emu.bus
             .gpio_external_in
             .store(stim_level, Ordering::Relaxed);

@@ -168,23 +168,75 @@ const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
 
 /// One address stimulus for the sweep.
 ///
-/// `addr_bits` must have A11=A12=1 (`addr_bits & 0x1800 == 0x1800`) —
-/// the `Case::new` constructor and the `DEFAULT_CASES` initializer
-/// both assert this.
+/// Two construction modes are supported, distinguished by `raw_pin_state`:
+///
+/// 1. **Legacy permutation mode** (`raw_pin_state == None`): build via
+///    `Case::new(label, addr_bits)`. The 13-bit `addr_bits` are permuted
+///    through `ADDR_PINS` by [`stimulus_level`]. The
+///    `addr_bits & 0x1800 == 0x1800` invariant is enforced — CS2/CS3
+///    share GPIOs with A11/A12 so a deselected chip requires those high.
+///
+/// 2. **Raw-pin-state mode** (`raw_pin_state == Some(p)`): build via
+///    `Case::raw_pin_state(label, pin_state)`. Used by larger-than-1541
+///    fixtures (e.g. the 256 KiB SeaBIOS fixture). `pin_state` is a
+///    literal 16-bit GPIO pattern with CS1 (bit 13) masked low at
+///    construction; every other pin including A11/A12 is driven
+///    verbatim. The legacy `addr_bits` field is unused in this mode
+///    (set to 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Case {
     pub label: &'static str,
+    /// Legacy-mode payload. The 13-bit address pattern permuted through
+    /// `ADDR_PINS` by [`stimulus_level`]. Unused (set to 0) when
+    /// `raw_pin_state` is `Some`.
     pub addr_bits: u16,
+    /// `Some(p)` if this case drives a raw 16-bit GPIO pattern (with
+    /// CS1 already masked low); `None` if `addr_bits` should be permuted
+    /// through `ADDR_PINS` via [`stimulus_level`]. See the type doc for
+    /// context.
+    pub raw_pin_state: Option<u16>,
 }
 
 impl Case {
-    /// Build a case, asserting the A11=A12=1 invariant in debug builds.
+    /// Build a legacy case, asserting the A11=A12=1 invariant in debug
+    /// builds. `raw_pin_state` is `None`.
     pub const fn new(label: &'static str, addr_bits: u16) -> Self {
         debug_assert!(
             addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
             "Case::new: addr_bits must have A11=A12=1 (addr_bits & 0x1800 == 0x1800)"
         );
-        Self { label, addr_bits }
+        Self {
+            label,
+            addr_bits,
+            raw_pin_state: None,
+        }
+    }
+
+    /// Build a case that drives `pin_state` directly onto GPIO 0..15
+    /// with CS1 (bit 13) forced low at construction. Bypasses the
+    /// A11=A12=1 invariant — caller is responsible for the pin map.
+    /// Used by the SeaBIOS 256 KiB fixture validator.
+    pub const fn raw_pin_state(label: &'static str, pin_state: u16) -> Self {
+        Self {
+            label,
+            addr_bits: 0,
+            raw_pin_state: Some(pin_state & !(1u16 << 13)),
+        }
+    }
+
+    /// Build a case that drives `pin_state` directly onto GPIO 0..15
+    /// **without** masking CS1 low. The caller is responsible for the
+    /// pin map. Used exclusively by the SeaBIOS validator's
+    /// `--probe-cs1-thorough` mode to gather empirical evidence on
+    /// firmware behaviour at CS1=high (firmware tristates D0..D7 there
+    /// per the journal). Do not use for byte-correctness assertions —
+    /// the regular `raw_pin_state` path is the right tool for that.
+    pub const fn raw_pin_state_unmasked(label: &'static str, pin_state: u16) -> Self {
+        Self {
+            label,
+            addr_bits: 0,
+            raw_pin_state: Some(pin_state),
+        }
     }
 }
 
@@ -848,6 +900,92 @@ pub fn stimulus_level_pub(addr_bits: u16) -> u32 {
     stimulus_level(addr_bits)
 }
 
+/// Stimulus level for a `Case::raw_pin_state` (or
+/// `Case::raw_pin_state_unmasked`) case: pass `pin_state` through
+/// verbatim onto GPIO 0..15. No permutation, no A11/A12 invariant, no
+/// CS1 masking — the masking decision is made at `Case` construction
+/// time (`Case::raw_pin_state` masks CS1 low; `Case::raw_pin_state_unmasked`
+/// preserves whatever the caller drives, including CS1=high for the
+/// SeaBIOS validator's `--probe-cs1-thorough` empirical-evidence mode).
+/// Used by the SeaBIOS 256 KiB validator that needs to enumerate all
+/// 16-bit GPIO patterns directly.
+pub fn stimulus_level_raw(pin_state: u16) -> u32 {
+    pin_state as u32
+}
+
+/// Layout descriptor for one ROM set in an SDRR fixture image. Pairs
+/// the byte offset within the flash where the set's data lives with
+/// the declared size (in bytes). Returned by [`parse_rom_set_layout`]
+/// as a fixture-authoring primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RomSetSlot {
+    /// Byte offset within the flash image of the `sdrr_rom_set_t`
+    /// descriptor itself (the 64-byte struct entry in the `rom_sets[]`
+    /// array). Useful for fixture authors that need to patch fields of
+    /// the descriptor (e.g. the `roms[]` pointer at `+0x08`).
+    pub descriptor_offset: usize,
+    /// Byte offset within the flash image of the start of this set's
+    /// pre-processed ROM data.
+    pub data_offset: usize,
+    /// Declared `size` field of the `sdrr_rom_set_t` entry, in bytes.
+    pub size: usize,
+}
+
+/// Walk the SDRR struct chain (`sdrr_info_t` → `onerom_metadata_header_t`
+/// → `sdrr_rom_set_t[]`) and return one [`RomSetSlot`] per ROM set in
+/// the fixture, in declaration order. Inverse-of-author for
+/// [`lift_shadow_from_flash`]: callers (e.g. the SeaBIOS fixture
+/// builder) can use the returned offsets to overwrite the per-set
+/// shadow bytes in a flash image without rebuilding the whole envelope.
+///
+/// Returns `None` on any parse failure (truncated image, out-of-flash
+/// pointer, etc.) — same conservative behaviour as
+/// [`lift_shadow_from_flash`].
+pub fn parse_rom_set_layout(flash: &[u8]) -> Option<Vec<RomSetSlot>> {
+    let ptr_to_off = |ptr: u32| -> Option<usize> {
+        let off = (ptr.checked_sub(FLASH_BASE)?) as usize;
+        if off >= flash.len() { None } else { Some(off) }
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        let bytes = flash.get(off..off + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+
+    let metadata_ptr = read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
+    let metadata_off = ptr_to_off(metadata_ptr)?;
+
+    let rom_set_count =
+        *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)? as usize;
+    if rom_set_count == 0 {
+        // A zero-count fixture is malformed; the firmware would never
+        // dereference rom_sets[0]. Report it via the function's standard
+        // "None on parse failure" channel rather than returning Some(vec![]).
+        return None;
+    }
+    let rom_sets_ptr = read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
+    let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
+
+    let mut out = Vec::with_capacity(rom_set_count);
+    for k in 0..rom_set_count {
+        let set_off = rom_sets_off + k * ROM_SET_STRIDE;
+        let data_ptr = read_u32(set_off + ROM_SET_DATA_PTR_OFFSET)?;
+        let size = read_u32(set_off + ROM_SET_SIZE_OFFSET)? as usize;
+        let data_off = ptr_to_off(data_ptr)?;
+        // Bounds check: ensure the declared size fits inside the flash
+        // image. A bad size here would otherwise let the caller copy
+        // off the end.
+        if data_off.checked_add(size).is_none_or(|end| end > flash.len()) {
+            return None;
+        }
+        out.push(RomSetSlot {
+            descriptor_offset: set_off,
+            data_offset: data_off,
+            size,
+        });
+    }
+    Some(out)
+}
+
 /// `pub` shim over [`lift_shadow_from_flash`] for the CPU-serve oracle
 /// and its binary driver.
 pub fn lift_shadow_from_flash_pub(
@@ -1302,6 +1440,96 @@ mod tests {
     fn lift_shadow_rejects_truncated_flash() {
         let flash = vec![0u8; 0x300]; // only ~sdrr_info_t bytes; no metadata.
         assert!(lift_shadow_from_flash(&flash, 0).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // SeaBIOS-fixture API: `parse_rom_set_layout`, `Case::raw_pin_state`,
+    // and `stimulus_level_raw`. Added 2026-05-03 alongside the SeaBIOS
+    // 256 KiB fixture; cover the public contract so future authors of
+    // similarly large fixtures don't regress these helpers silently.
+    // -------------------------------------------------------------------
+
+    /// `parse_rom_set_layout` walks the SDRR struct chain and returns one
+    /// `RomSetSlot` per declared ROM set, with descriptor / data offsets
+    /// matching what `lift_shadow_from_flash` would resolve internally.
+    #[test]
+    fn parse_rom_set_layout_happy_path() {
+        let flash = synth_flash(2);
+        let layout = parse_rom_set_layout(&flash).expect("layout must parse");
+        assert_eq!(layout.len(), 2);
+
+        // Set 0: data ptr = 0x1000_C100 + 0x14000 = 0x1002_0000 → off 0x20000.
+        // Set 1: data ptr = 0x1001_0000 → off 0x10000.
+        // Stride = 64; rom_sets array starts at 0xC100 in the synth blob.
+        assert_eq!(layout[0].descriptor_offset, 0xC100);
+        assert_eq!(layout[0].data_offset, 0x2_0000);
+        assert_eq!(layout[0].size, SHADOW_SIZE);
+
+        assert_eq!(layout[1].descriptor_offset, 0xC100 + ROM_SET_STRIDE);
+        assert_eq!(layout[1].data_offset, 0x1_0000);
+        assert_eq!(layout[1].size, SHADOW_SIZE);
+    }
+
+    /// Truncated flash (smaller than the metadata pointer target) must
+    /// return `None` — same conservative behaviour as
+    /// `lift_shadow_from_flash`.
+    #[test]
+    fn parse_rom_set_layout_rejects_truncated_flash() {
+        let flash = vec![0u8; 512];
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// A `rom_set_count` of zero is malformed (the firmware would
+    /// dereference rom_sets[0] regardless), so the parser must
+    /// surface it as a parse failure rather than `Some(vec![])`.
+    #[test]
+    fn parse_rom_set_layout_rejects_zero_count() {
+        let mut flash = synth_flash(2);
+        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = 0;
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// A `size` field that overruns the flash image must be rejected
+    /// (otherwise a downstream copy could walk off the end).
+    #[test]
+    fn parse_rom_set_layout_rejects_oversize_size_field() {
+        let mut flash = synth_flash(2);
+        let entry_off = 0xC100; // set 0
+        let bad_size = (flash.len() as u32) + 1;
+        flash[entry_off + ROM_SET_SIZE_OFFSET..entry_off + ROM_SET_SIZE_OFFSET + 4]
+            .copy_from_slice(&bad_size.to_le_bytes());
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// `Case::raw_pin_state` must mask CS1 (bit 13) low at construction.
+    /// The validator and any future raw-mode caller depend on this so a
+    /// stray CS1=high pattern can never drift through the API.
+    #[test]
+    fn case_raw_pin_state_masks_cs1() {
+        let case = Case::raw_pin_state("x", 0xFFFF);
+        assert_eq!(case.raw_pin_state, Some(0xDFFF));
+    }
+
+    /// `stimulus_level_raw` is now a verbatim pass-through (the masking
+    /// decision lives at `Case` construction — `Case::raw_pin_state`
+    /// masks CS1, `Case::raw_pin_state_unmasked` preserves it for the
+    /// SeaBIOS validator's `--probe-cs1-thorough` empirical mode).
+    #[test]
+    fn stimulus_level_raw_is_passthrough() {
+        assert_eq!(stimulus_level_raw(0xFFFF), 0xFFFF);
+        assert_eq!(stimulus_level_raw(0xDFFF), 0xDFFF);
+        assert_eq!(stimulus_level_raw(0x0000), 0x0000);
+    }
+
+    /// `Case::raw_pin_state_unmasked` must preserve CS1 verbatim — the
+    /// `--probe-cs1-thorough` mode in the SeaBIOS validator depends on
+    /// CS1=high actually reaching the GPIO bus.
+    #[test]
+    fn case_raw_pin_state_unmasked_preserves_cs1() {
+        let case = Case::raw_pin_state_unmasked("x", 0xFFFF);
+        assert_eq!(case.raw_pin_state, Some(0xFFFF));
+        let case = Case::raw_pin_state_unmasked("x", 0x2000);
+        assert_eq!(case.raw_pin_state, Some(0x2000));
     }
 
     /// 4. Real fixture check — `test-sdrr-0.bin` set 1 (the one our

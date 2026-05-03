@@ -529,7 +529,13 @@ pub struct Bus {
     /// Optional override sink for trace output. `None` routes to stdout
     /// via `println!`. Unit tests inject a `Vec<u8>`-backed sink to
     /// capture lines without wrestling with fd 1 redirection.
-    pub(crate) mmio_trace_sink: Option<Box<dyn Write>>,
+    ///
+    /// `+ Send` keeps `Bus` (and therefore `Emulator`) movable across
+    /// thread boundaries; required by long-lived workers such as
+    /// `mddosem-onerom-bios::OneRomServer` that own an emulator on a
+    /// pinned host thread. `Vec<u8>` (the only sink injected today) is
+    /// `Send`, so the bound is non-breaking for existing callers.
+    pub(crate) mmio_trace_sink: Option<Box<dyn Write + Send>>,
     /// Per-core LR/SC reservation (RV32A). `Some(addr)` holds a
     /// word-aligned SRAM address the core has reserved via `lr.w`; any
     /// write to that word by any master clears the corresponding
@@ -954,7 +960,7 @@ impl Bus {
     /// back to stdout. This is `pub(crate)` to keep it off the public
     /// surface — the binary toggles `mmio_trace_enabled` only.
     #[cfg(test)]
-    pub(crate) fn set_mmio_trace_sink(&mut self, sink: Option<Box<dyn Write>>) {
+    pub(crate) fn set_mmio_trace_sink(&mut self, sink: Option<Box<dyn Write + Send>>) {
         self.mmio_trace_sink = sink;
     }
 

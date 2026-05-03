@@ -112,6 +112,23 @@ path = "src/bin/onerom_serving_oracle_rp2350.rs"
 name = "onerom_serving_oracle_cpu_rp2350"
 path = "src/bin/onerom_serving_oracle_cpu_rp2350.rs"
 
+# SeaBIOS fixture builder — overwrites the 4 ROM sets of the 1541 template
+# fixture with the 4 quarters of the 256 KiB SeaBIOS image. See HLD
+# `2026.05.03 - HLD - OneROM live BIOS serve.md`.
+[[bin]]
+name = "build_seabios_fixture"
+path = "src/bin/build_seabios_fixture.rs"
+test = false
+
+# SeaBIOS fixture byte-correctness validator — drives every 16-bit GPIO
+# pin pattern through `CpuServingOracle` for each ROM set and confirms
+# the served byte matches the corresponding SeaBIOS byte. Companion to
+# `build_seabios_fixture`; not for CI (long-running on full sweep).
+[[bin]]
+name = "seabios_fixture_byte_correct"
+path = "src/bin/seabios_fixture_byte_correct.rs"
+test = false
+
 [[bin]]
 name = "onerom_stress_cpu_rp2350"
 path = "src/bin/onerom_stress_cpu_rp2350.rs"
