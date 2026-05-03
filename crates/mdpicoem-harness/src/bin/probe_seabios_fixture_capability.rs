@@ -1,17 +1,24 @@
-//! One-shot diagnostic: is the 1541 fixture's per-ROM-set 64 KiB shadow
-//! a direct GPIO-state-indexed lookup table, or a permuted/scrambled one?
-//! Decides whether 256 KiB SeaBIOS can be served via 4 ROM sets x 64 KiB.
+//! One-shot diagnostic: is the fixture's per-ROM-set 64 KiB shadow a
+//! direct GPIO-state-indexed lookup table, or a permuted/scrambled one?
+//! Originally aimed at the 1541 template; now also used to probe
+//! candidate templates (e.g. `test-sdrr-0`) as alternatives.
 //!
 //! Usage:
 //!   cargo run -p mdpicoem-harness --bin probe_seabios_fixture_capability --release
+//!   cargo run -p mdpicoem-harness --bin probe_seabios_fixture_capability --release -- \
+//!       --fixture <path>
+//!
+//! `rom_set_count` is read from the fixture's metadata header rather
+//! than hard-coded, so this works on fixtures with any number of sets.
 
 use std::collections::HashSet;
 
 use mdpicoem_harness::onerom_serving_oracle::{
-    DEFAULT_CASES, lift_shadow_from_flash_pub, stimulus_level_pub,
+    DEFAULT_CASES, lift_shadow_from_flash_pub, parse_rom_set_layout, stimulus_level_pub,
 };
 
-const FIXTURE: &str = "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
+const DEFAULT_FIXTURE: &str =
+    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
 
 /// Bitwise-reflected CRC32 (IEEE 802.3 / zlib) — table-free; lets us
 /// compare against the 0xDB903413 reference in the predecessor journal.
@@ -32,15 +39,69 @@ fn hex32(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02X}", x)).collect::<Vec<_>>().join(" ")
 }
 
-fn main() {
-    let flash = match std::fs::read(FIXTURE) {
-        Ok(b) => b,
-        Err(e) => { eprintln!("failed to read fixture {}: {}", FIXTURE, e); std::process::exit(2); }
-    };
-    println!("fixture: {} ({} bytes)\n", FIXTURE, flash.len());
+fn parse_cli() -> String {
+    let mut fixture = DEFAULT_FIXTURE.to_string();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--fixture" => {
+                fixture = args
+                    .next()
+                    .unwrap_or_else(|| {
+                        eprintln!("--fixture needs a value");
+                        std::process::exit(2);
+                    });
+            }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: probe_seabios_fixture_capability [--fixture <path>]\n\
+                     defaults to {DEFAULT_FIXTURE}"
+                );
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unrecognised argument: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+    fixture
+}
 
-    let shadows: Vec<Option<Box<[u8; 0x10000]>>> =
-        (0u8..4).map(|i| lift_shadow_from_flash_pub(&flash, i)).collect();
+fn main() {
+    let fixture = parse_cli();
+    let flash = match std::fs::read(&fixture) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read fixture {}: {}", fixture, e);
+            std::process::exit(2);
+        }
+    };
+    println!("fixture: {} ({} bytes)\n", fixture, flash.len());
+
+    // Read rom_set_count from the fixture's metadata header rather
+    // than assuming 4. `parse_rom_set_layout` walks the SDRR struct
+    // chain and returns one slot per declared ROM set.
+    let layout = match parse_rom_set_layout(&flash) {
+        Some(v) => v,
+        None => {
+            eprintln!("parse_rom_set_layout returned None — fixture metadata mismatch");
+            std::process::exit(3);
+        }
+    };
+    let rom_set_count = layout.len();
+    println!("rom_set_count: {}", rom_set_count);
+    for (k, slot) in layout.iter().enumerate() {
+        println!(
+            "  set {}: data_offset=0x{:06X} size={}",
+            k, slot.data_offset, slot.size
+        );
+    }
+    println!();
+
+    let shadows: Vec<Option<Box<[u8; 0x10000]>>> = (0..rom_set_count)
+        .map(|i| lift_shadow_from_flash_pub(&flash, i as u8))
+        .collect();
 
     for (idx, sh_opt) in shadows.iter().enumerate() {
         println!("=== rom_set {} ===", idx);
@@ -68,11 +129,17 @@ fn main() {
             _ => false,
         }
     };
-    for (a, b) in [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)] {
-        println!("shadow_set_{}_eq_set_{}: {}", a, b, eq(a,b));
+    for a in 0..rom_set_count {
+        for b in (a + 1)..rom_set_count {
+            println!("shadow_set_{}_eq_set_{}: {}", a, b, eq(a, b));
+        }
     }
 
-    let dist0 = shadows[0].as_ref().map(|s| distinct(s.as_ref())).unwrap_or(0);
+    let dist0 = shadows
+        .first()
+        .and_then(|s| s.as_ref())
+        .map(|s| distinct(s.as_ref()))
+        .unwrap_or(0);
     let any_loaded = shadows.iter().any(|s| s.is_some());
     let verdict = if !any_loaded {
         "?  (no rom_sets parsed — fixture metadata mismatch)"
