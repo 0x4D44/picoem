@@ -109,6 +109,14 @@ path = "src/bin/onerom_serving_oracle_rp2350.rs"
 name = "onerom_serving_oracle_cpu_rp2350"
 path = "src/bin/onerom_serving_oracle_cpu_rp2350.rs"
 
+# One-shot SeaBIOS feasibility probe — does the 1541 fixture's 64 KiB
+# shadow look like a direct GPIO-indexed LUT, or a permuted one?
+# Diagnostic; delete after the supervisor reads its output once.
+[[bin]]
+name = "probe_seabios_fixture_capability"
+path = "src/bin/probe_seabios_fixture_capability.rs"
+test = false
+
 [[bin]]
 name = "onerom_stress_cpu_rp2350"
 path = "src/bin/onerom_stress_cpu_rp2350.rs"
