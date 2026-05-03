@@ -28,8 +28,8 @@ cargo build --release
 
 # Unit tests.
 cargo test
-cargo test -p mdrp2350      # RP2350 only
-cargo test -p mdrp2040      # RP2040 only
+cargo test -p rp2350-emu      # RP2350 only
+cargo test -p rp2040-emu      # RP2040 only
 
 # Code coverage.
 cargo llvm-cov
@@ -65,7 +65,7 @@ used in the codebase but is specific to the maintainer's hardware.
 Use plain present-tense imperative summaries (e.g. "fix dma channel
 arbitration", not "fixed" or "fixes"). For commits that touch a
 specific subsystem, prefix the summary line with that subsystem's
-short name where it helps readability — e.g. `mdrp2350: ...`,
+short name where it helps readability — e.g. `rp2350-emu: ...`,
 `harness: ...`, `picogus: ...`. Don't go out of your way to retrofit
 a prefix when a commit spans subsystems.
 

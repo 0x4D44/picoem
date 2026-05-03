@@ -1438,93 +1438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mdpicoem-common"
-version = "0.1.1"
-dependencies = [
- "libc",
- "tracing",
- "winapi",
-]
-
-[[package]]
-name = "mdpicoem-debug"
-version = "0.1.0"
-dependencies = [
- "mdrp2350",
-]
-
-[[package]]
-name = "mdpicoem-devices"
-version = "0.1.0"
-dependencies = [
- "tracing",
-]
-
-[[package]]
-name = "mdpicoem-harness"
-version = "0.38.0"
-dependencies = [
- "chrono",
- "ctrlc",
- "humantime",
- "libc",
- "mdpicoem-common",
- "mdpicoem-devices",
- "mdrp2040",
- "mdrp2350",
- "probe-rs",
- "rand",
- "riscv-decode",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mdrp2040"
-version = "0.1.1"
-dependencies = [
- "mdpicoem-common",
- "mdpicoem-devices",
- "tracing",
-]
-
-[[package]]
-name = "mdrp2040app"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "crossterm",
- "mdpicoem-devices",
- "mdrp2040",
- "ratatui",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mdrp2350"
-version = "0.1.2"
-dependencies = [
- "mdpicoem-common",
- "sha2",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mdrp2350app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "mdrp2350",
- "ratatui",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1914,6 +1827,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "picoem-common"
+version = "0.1.2"
+dependencies = [
+ "libc",
+ "tracing",
+ "winapi",
+]
+
+[[package]]
+name = "picoem-debug"
+version = "0.1.0"
+dependencies = [
+ "rp2350-emu",
+]
+
+[[package]]
+name = "picoem-devices"
+version = "0.1.1"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
+name = "picoem-harness"
+version = "0.38.1"
+dependencies = [
+ "chrono",
+ "ctrlc",
+ "humantime",
+ "libc",
+ "picoem-common",
+ "picoem-devices",
+ "probe-rs",
+ "rand",
+ "riscv-decode",
+ "rp2040-emu",
+ "rp2350-emu",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2248,6 +2204,50 @@ checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
 dependencies = [
  "rmp",
  "serde",
+]
+
+[[package]]
+name = "rp2040-emu"
+version = "0.1.2"
+dependencies = [
+ "picoem-common",
+ "picoem-devices",
+ "tracing",
+]
+
+[[package]]
+name = "rp2040-emu-tui"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "picoem-devices",
+ "ratatui",
+ "rp2040-emu",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rp2350-emu"
+version = "0.1.3"
+dependencies = [
+ "picoem-common",
+ "sha2",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rp2350-emu-tui"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "rp2350-emu",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

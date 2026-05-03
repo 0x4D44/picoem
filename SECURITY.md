@@ -25,10 +25,10 @@ remediation to follow on whatever timeline matches the severity.
 
 ## What is in scope
 
-- The `mdrp2350`, `mdrp2040`, `mdpicoem-common`, and `mdpicoem-devices`
+- The `rp2350-emu`, `rp2040-emu`, `picoem-common`, and `picoem-devices`
   library crates.
-- The `mdrp2350app` and `mdrp2040app` TUI applications.
-- The `mdpicoem-harness` binaries, including the QEMU and probe-rs
+- The `rp2350-emu-tui` and `rp2040-emu-tui` TUI applications.
+- The `picoem-harness` binaries, including the QEMU and probe-rs
   differential oracles.
 - The vendored `probe-rs` fork
   (`third_party/probe-rs-0.31.0-mdrp-patched/`) **only insofar as the
@@ -40,7 +40,7 @@ remediation to follow on whatever timeline matches the severity.
 
 - Firmware images and trace fixtures redistributed under
   `roms/`, `third_party/picogus/`, and
-  `crates/mdpicoem-harness/fixtures/`. Issues in upstream firmware
+  `crates/picoem-harness/fixtures/`. Issues in upstream firmware
   should be reported to those upstream projects.
 - Issues found in the `epio-sys` vendored upstream sources. Report
   those to the upstream `epio` / `apio` repositories.
