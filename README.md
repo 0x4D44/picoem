@@ -14,7 +14,14 @@ picoem (this repo)           — RP2350/RP2354 + RP2040 emulators, TUIs, test ha
 
 ## Status
 
-Actively developed. Arm-mode only; Hazard3 RISC-V cores on RP2350 are out of scope. Phases 1–7 of the workspace restructure are complete: both chips ship functional cores, bus fabric, dual-core SIO, PIO, clocks, and per-chip differential test oracles.
+A personal research project, published in case it's useful to others.
+I use these crates in my own work and will likely keep pushing fixes
+as I hit them, but I'm not committing to issue triage, PR review SLAs,
+or ongoing feature development. No promises — if you need certainty
+around a bugfix or feature, fork freely under MIT/Apache-2.0.
+
+Feature coverage as of the published versions — Arm-mode only; Hazard3
+RISC-V cores on RP2350 are out of scope:
 
 | Subsystem | RP2350 / RP2354 | RP2040 |
 |---|---|---|

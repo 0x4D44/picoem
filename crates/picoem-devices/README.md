@@ -1,5 +1,8 @@
 # picoem-devices
 
+> **Status:** Personal research project — no maintenance commitments.
+> See the [project repository](https://github.com/0x4D44/picoem).
+
 [![Crates.io](https://img.shields.io/crates/v/picoem-devices.svg)](https://crates.io/crates/picoem-devices)
 [![Docs.rs](https://docs.rs/picoem-devices/badge.svg)](https://docs.rs/picoem-devices)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
