@@ -56,11 +56,11 @@ const SHADOW_SIZE: usize = onerom_serving_oracle::SHADOW_SIZE;
 const SEABIOS_SIZE: usize = 4 * SHADOW_SIZE;
 const NUM_ROM_SETS: u32 = 4;
 
-/// Boot-sync cycle cap. Sets 0/1/2 sync within ~25k cycles in practice;
-/// 10M is generous. NOTE: rom_set 3 in the existing 1541 fixture also
-/// fails to sync within this budget (verified independently with the
-/// unmodified 1541 fixture) — a pre-existing emulator/firmware quirk
-/// surfaced by this validator, not something we can fix here.
+// 10M is generous; observed sync cycles in practice are ~25K. The
+// unmodified 1541 fixture has rom_set 3 failing to sync (broken
+// roms[] pointer in the template). build_seabios_fixture patches
+// that descriptor field, so all 4 SeaBIOS-fixture sets sync inside
+// ~25K cycles.
 const BOOT_CYCLE_CAP: u64 = 10_000_000;
 const PROGRESS_INTERVAL: usize = 4096;
 
@@ -72,12 +72,14 @@ struct Cli {
     fixture: PathBuf,
     seabios: PathBuf,
     smoke: bool,
+    probe_cs1_thorough: bool,
 }
 
 fn parse_cli() -> Result<Cli, String> {
     let mut fixture = PathBuf::from(DEFAULT_FIXTURE);
     let mut seabios = PathBuf::from(DEFAULT_SEABIOS);
     let mut smoke = false;
+    let mut probe_cs1_thorough = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -85,20 +87,29 @@ fn parse_cli() -> Result<Cli, String> {
             "--fixture" => fixture = PathBuf::from(args.next().ok_or("--fixture needs a value")?),
             "--seabios" => seabios = PathBuf::from(args.next().ok_or("--seabios needs a value")?),
             "--smoke" => smoke = true,
+            "--probe-cs1-thorough" => probe_cs1_thorough = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: seabios_fixture_byte_correct [--fixture <path>] [--seabios <path>] [--smoke]\n\
-                     --smoke      runs all 4 ROM sets with the first 256 pin states each (fast spot check)."
+                    "usage: seabios_fixture_byte_correct [--fixture <path>] [--seabios <path>] [--smoke | --probe-cs1-thorough]\n\
+                     --smoke                 runs all 4 ROM sets with the first 256 pin states each (fast spot check).\n\
+                     --probe-cs1-thorough    drives 256 deterministic LCG-seeded random pin states with CS1=high\n\
+                                             on rom_set 1 (varied content) and reports the verdict distribution.\n\
+                                             Used to gather empirical evidence for the firmware-tristates-at-CS1=high\n\
+                                             claim. The regular full-sweep skip path stays unchanged."
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
+    if smoke && probe_cs1_thorough {
+        return Err("--smoke and --probe-cs1-thorough are mutually exclusive".into());
+    }
     Ok(Cli {
         fixture,
         seabios,
         smoke,
+        probe_cs1_thorough,
     })
 }
 
@@ -183,12 +194,43 @@ fn boot_sync(bootrom: &[u8], flash: &[u8], rom_set_index: u32) -> Result<Emulato
 #[derive(Default)]
 struct SetTally {
     pass: usize,
+    /// Subset of `pass` where the expected byte is NOT equal to the
+    /// most-common (modal) expected byte for the set's CS1-low pin
+    /// states. For chunk 0 (all zeros) `discriminating_pass = 0` because
+    /// every served byte is the modal byte — the pass count proves
+    /// nothing about per-pin-state correctness. For chunks with varied
+    /// data this approaches the full pass count.
+    discriminating_pass: usize,
+    /// Number of unique expected-byte values across the set's CS1-low
+    /// pin states (i.e. across the lower 32 KiB of the set's chunk that
+    /// the firmware can serve). Surfaced so the human can see at a
+    /// glance whether the chunk is trivial (1 unique byte) or varied.
+    unique_expected_bytes: usize,
     wrong: usize,
     no_stable: usize,
     not_driven: usize,
     latency_oor: usize,
     unservable_cs1: usize,
     first_wrong: Option<(u16, u8, u8)>,
+}
+
+/// Returns the most-common byte across the supplied slice. Ties broken
+/// by lowest byte value (stable). Used to identify the "trivial pass"
+/// byte for the discriminating-pass metric.
+fn modal_byte(bytes: &[u8]) -> u8 {
+    let mut counts = [0u32; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let mut best_byte = 0u8;
+    let mut best_count = 0u32;
+    for (i, &c) in counts.iter().enumerate() {
+        if c > best_count {
+            best_count = c;
+            best_byte = i as u8;
+        }
+    }
+    best_byte
 }
 
 fn run_set(
@@ -236,7 +278,25 @@ fn run_set(
         ));
     }
 
+    // Pre-compute the set's CS1-low expected bytes so we can derive the
+    // modal byte and the unique-byte count BEFORE the sweep. The sweep
+    // is full-range over `pin_state in pin_lo..pin_hi`; CS1-low subset
+    // is everything where bit 13 is clear within that range.
+    let mut cs1_low_bytes = Vec::with_capacity((pin_hi - pin_lo) as usize);
+    for pin_state in pin_lo..pin_hi {
+        if (pin_state as u16) & CS1_BIT == 0 {
+            cs1_low_bytes.push(chunk[pin_state as usize]);
+        }
+    }
+    let set_modal = modal_byte(&cs1_low_bytes);
+    let unique_count = cs1_low_bytes
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<u8>>()
+        .len();
+
     let mut tally = SetTally::default();
+    tally.unique_expected_bytes = unique_count;
     let t0 = Instant::now();
 
     for pin_state in pin_lo..pin_hi {
@@ -248,10 +308,17 @@ fn run_set(
         let result = oracle.run_case(&mut emu, case);
         let expected = chunk[pin_state as usize];
 
+        let mut count_pass = || {
+            tally.pass += 1;
+            if expected != set_modal {
+                tally.discriminating_pass += 1;
+            }
+        };
+
         match result.verdict {
             CpuVerdict::Pass => {
                 if result.observed_byte == Some(expected) {
-                    tally.pass += 1;
+                    count_pass();
                 } else {
                     tally.wrong += 1;
                     if tally.first_wrong.is_none() {
@@ -275,7 +342,7 @@ fn run_set(
                 // Latency-only deviation; if the byte was correct we still
                 // count it as a pass for byte-correctness purposes.
                 if result.observed_byte == Some(expected) {
-                    tally.pass += 1;
+                    count_pass();
                 } else {
                     tally.latency_oor += 1;
                 }
@@ -303,9 +370,11 @@ fn run_set(
 
     let elapsed_ms = t0.elapsed().as_millis();
     println!(
-        "  done in {} ms: pass={} (32 KiB byte-correct) wrong={} no_stable={} not_driven={} latency_oor={} unservable_cs1={} (CS1=high → firmware tristates D0..D7)",
+        "  done in {} ms: pass={} ({} discriminating-pass, {} unique expected bytes; CS1-low half = 32 KiB) wrong={} no_stable={} not_driven={} latency_oor={} unservable_cs1={} (CS1=high → firmware tristates D0..D7)",
         elapsed_ms,
         tally.pass,
+        tally.discriminating_pass,
+        tally.unique_expected_bytes,
         tally.wrong,
         tally.no_stable,
         tally.not_driven,
@@ -320,6 +389,121 @@ fn run_set(
     }
     let _ = std::io::stdout().flush();
     Ok(tally)
+}
+
+/// Constant LCG seed for `--probe-cs1-thorough`. Reproducible across
+/// runs — no thread-rng, no clock-based seed (per the journal's
+/// determinism requirement). Picked arbitrarily.
+const PROBE_CS1_LCG_SEED: u64 = 0xC51E_C51E_C51E_C51E;
+const PROBE_CS1_NUM_CASES: usize = 256;
+
+/// Run the `--probe-cs1-thorough` mode: drive 256 deterministic-LCG-
+/// seeded random pin states with CS1=high on rom_set 1 (chunk 1 has
+/// varied non-zero content, so any silent OEN-asserts-with-zero-output
+/// firmware bug would be visible). Reports verdict distribution.
+///
+/// All-`DataPinsNotDriven` strengthens the firmware-tristates-at-CS1=high
+/// claim; any `Pass`/`WrongByte`/`NoStableByte` would surface a surprise.
+fn run_probe_cs1_thorough(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
+    const ROM_SET_INDEX: u32 = 1;
+
+    println!("=== --probe-cs1-thorough (rom_set {}, {} CS1=high cases, LCG seed 0x{:016X}) ===",
+        ROM_SET_INDEX, PROBE_CS1_NUM_CASES, PROBE_CS1_LCG_SEED);
+    let _ = std::io::stdout().flush();
+
+    let bootrom = std::fs::read(BOOTROM_PATH).map_err(|e| format!("bootrom: {e}"))?;
+    let mut emu = boot_sync(&bootrom, flash, ROM_SET_INDEX)?;
+    println!("  synced at cycle {}", emu.cycles());
+
+    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, flash);
+    // Cross-check the lifted shadow vs seabios chunk for ROM_SET_INDEX so
+    // a stray probe run on a misbuilt fixture surfaces immediately.
+    let chunk_lo = (ROM_SET_INDEX as usize) * SHADOW_SIZE;
+    let chunk = &seabios[chunk_lo..chunk_lo + SHADOW_SIZE];
+    let lifted = oracle.shadow();
+    let mut shadow_mismatch = 0usize;
+    for i in 0..SHADOW_SIZE {
+        if lifted[i] != chunk[i] {
+            shadow_mismatch += 1;
+        }
+    }
+    if shadow_mismatch != 0 {
+        return Err(format!(
+            "rom_set {} (probe): lifted shadow differs from seabios chunk in {} bytes",
+            ROM_SET_INDEX, shadow_mismatch
+        ));
+    }
+
+    // Numerical Recipes LCG (Knuth's MMIX constants) — deterministic,
+    // small, no dependencies. We only need 256 16-bit values with the
+    // CS1 bit forced high.
+    let mut state: u64 = PROBE_CS1_LCG_SEED;
+    let lcg_next = |s: &mut u64| -> u16 {
+        *s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        // High bits have better distribution than low bits in a Knuth LCG.
+        ((*s >> 33) & 0xFFFF) as u16
+    };
+
+    let mut pass = 0usize;
+    let mut wrong = 0usize;
+    let mut no_stable = 0usize;
+    let mut not_driven = 0usize;
+    let mut latency_oor = 0usize;
+    let mut surprises: Vec<(u16, &'static str, Option<u8>)> = Vec::new();
+
+    for _ in 0..PROBE_CS1_NUM_CASES {
+        let pin_state = lcg_next(&mut state) | CS1_BIT;
+        let case = onerom_serving_oracle::Case::raw_pin_state_unmasked("probe-cs1", pin_state);
+        let result = oracle.run_case(&mut emu, case);
+        match result.verdict {
+            CpuVerdict::Pass => {
+                pass += 1;
+                surprises.push((pin_state, "Pass", result.observed_byte));
+            }
+            CpuVerdict::WrongByte { observed, .. } => {
+                wrong += 1;
+                surprises.push((pin_state, "WrongByte", Some(observed)));
+            }
+            CpuVerdict::NoStableByte => {
+                no_stable += 1;
+                surprises.push((pin_state, "NoStableByte", None));
+            }
+            CpuVerdict::DataPinsNotDriven => not_driven += 1,
+            CpuVerdict::LatencyOutOfEnvelope { .. } => {
+                latency_oor += 1;
+                surprises.push((pin_state, "LatencyOutOfEnvelope", result.observed_byte));
+            }
+        }
+    }
+
+    println!(
+        "  verdict distribution over {} CS1=high cases:",
+        PROBE_CS1_NUM_CASES
+    );
+    println!("    DataPinsNotDriven    = {}", not_driven);
+    println!("    Pass                 = {}", pass);
+    println!("    WrongByte            = {}", wrong);
+    println!("    NoStableByte         = {}", no_stable);
+    println!("    LatencyOutOfEnvelope = {}", latency_oor);
+
+    if not_driven == PROBE_CS1_NUM_CASES {
+        println!(
+            "  verdict: ALL {} cases reported DataPinsNotDriven — the firmware-tristates-at-CS1=high claim is strengthened.",
+            PROBE_CS1_NUM_CASES
+        );
+        Ok(())
+    } else {
+        // Surface up to the first 8 surprises so the human sees what diverged.
+        println!("  SURPRISE: {} of {} cases produced a non-DataPinsNotDriven verdict.", PROBE_CS1_NUM_CASES - not_driven, PROBE_CS1_NUM_CASES);
+        for (i, (p, v, b)) in surprises.iter().take(8).enumerate() {
+            println!("    [{}] pin_state=0x{:04X}  verdict={}  observed_byte={:?}", i, p, v, b);
+        }
+        Err(format!(
+            "expected all {} cases to report DataPinsNotDriven; got {} non-DataPinsNotDriven",
+            PROBE_CS1_NUM_CASES,
+            PROBE_CS1_NUM_CASES - not_driven
+        ))
+    }
 }
 
 fn main() -> ExitCode {
@@ -342,10 +526,14 @@ fn main() -> ExitCode {
 
     println!("fixture: {}", cli.fixture.display());
     println!("seabios: {}", cli.seabios.display());
-    println!(
-        "mode:    {}",
-        if cli.smoke { "smoke" } else { "full" }
-    );
+    let mode_str = if cli.smoke {
+        "smoke"
+    } else if cli.probe_cs1_thorough {
+        "probe-cs1-thorough"
+    } else {
+        "full"
+    };
+    println!("mode:    {}", mode_str);
     let _ = std::io::stdout().flush();
 
     let flash = match std::fs::read(&cli.fixture) {
@@ -367,6 +555,16 @@ fn main() -> ExitCode {
         return ExitCode::from(3);
     }
 
+    if cli.probe_cs1_thorough {
+        return match run_probe_cs1_thorough(&flash, &seabios) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("--probe-cs1-thorough failed: {}", e);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Smoke runs all 4 sets with the first 256 pin states each — fast
     // spot check that exercises every set's serve path against (often)
     // non-zero shadow data; the full run drives every 16-bit pin state
@@ -383,6 +581,9 @@ fn main() -> ExitCode {
         match run_set(&flash, &seabios, k, 0, pin_hi) {
             Ok(t) => {
                 grand.pass += t.pass;
+                grand.discriminating_pass += t.discriminating_pass;
+                // unique_expected_bytes is per-set; do not sum into grand
+                // (a sum across sets is not meaningful — see per-set lines).
                 grand.wrong += t.wrong;
                 grand.no_stable += t.no_stable;
                 grand.not_driven += t.not_driven;
@@ -410,22 +611,35 @@ fn main() -> ExitCode {
         + grand.unservable_cs1;
     println!();
     println!("=== grand total ===");
-    println!("  pass            = {}  (= {} KiB byte-correct verified)", grand.pass, grand.pass / 1024);
-    println!("  wrong           = {}", grand.wrong);
-    println!("  no_stable       = {}", grand.no_stable);
-    println!("  not_driven      = {}", grand.not_driven);
-    println!("  latency_oor     = {}", grand.latency_oor);
     println!(
-        "  unservable_cs1  = {}  (firmware tristates D0..D7 at CS1=high — bytes are present in the fixture but unreachable through the existing serve loop)",
-        grand.unservable_cs1
-    );
-    println!(
-        "fixture capacity  = {} bytes ({} KiB), serve coverage = {} bytes ({} KiB)",
-        total_cases,
-        total_cases / 1024,
+        "  pass                  = {}  (= {} KiB byte-correct, but see discriminating count below)",
         grand.pass,
         grand.pass / 1024
     );
+    println!(
+        "  discriminating_pass   = {}     (pass count where the expected byte differed from the set's modal byte; trivial passes from all-zero chunks excluded)",
+        grand.discriminating_pass
+    );
+    println!("  wrong                 = {}", grand.wrong);
+    println!("  no_stable             = {}", grand.no_stable);
+    println!("  not_driven            = {}", grand.not_driven);
+    println!("  latency_oor           = {}", grand.latency_oor);
+    println!(
+        "  unservable_cs1        = {}  (firmware tristates D0..D7 at CS1=high)",
+        grand.unservable_cs1
+    );
+    println!(
+        "fixture content   = {} bytes ({} KiB) of seabios laid into 4 ROM-set shadows",
+        SEABIOS_SIZE,
+        SEABIOS_SIZE / 1024
+    );
+    println!(
+        "serve coverage    = {} bytes ({} KiB) reachable at CS1=low; the upper {} KiB written into CS1=high shadow positions is unservable",
+        grand.pass,
+        grand.pass / 1024,
+        grand.unservable_cs1 / 1024
+    );
+    let _ = total_cases; // retained for readability of the running totals above
     if let Some((p, e, o)) = grand.first_wrong {
         println!(
             "  first wrong overall: pin_state=0x{:04X} expected=0x{:02X} observed=0x{:02X}",

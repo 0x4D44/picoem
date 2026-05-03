@@ -223,6 +223,21 @@ impl Case {
             raw_pin_state: Some(pin_state & !(1u16 << 13)),
         }
     }
+
+    /// Build a case that drives `pin_state` directly onto GPIO 0..15
+    /// **without** masking CS1 low. The caller is responsible for the
+    /// pin map. Used exclusively by the SeaBIOS validator's
+    /// `--probe-cs1-thorough` mode to gather empirical evidence on
+    /// firmware behaviour at CS1=high (firmware tristates D0..D7 there
+    /// per the journal). Do not use for byte-correctness assertions —
+    /// the regular `raw_pin_state` path is the right tool for that.
+    pub const fn raw_pin_state_unmasked(label: &'static str, pin_state: u16) -> Self {
+        Self {
+            label,
+            addr_bits: 0,
+            raw_pin_state: Some(pin_state),
+        }
+    }
 }
 
 /// Default address-case set — walking-1s over A0..A10 plus three
@@ -885,15 +900,17 @@ pub fn stimulus_level_pub(addr_bits: u16) -> u32 {
     stimulus_level(addr_bits)
 }
 
-/// Stimulus level for a `Case::raw_pin_state` case: drive `pin_state`
-/// directly onto GPIO 0..15 with CS1 (bit 13) forced low. Defensive
-/// belt-and-braces — `Case::raw_pin_state` already masks at
-/// construction, but this also handles raw `pin_state` integers passed
-/// in from outside that path. No permutation, no A11/A12 invariant.
+/// Stimulus level for a `Case::raw_pin_state` (or
+/// `Case::raw_pin_state_unmasked`) case: pass `pin_state` through
+/// verbatim onto GPIO 0..15. No permutation, no A11/A12 invariant, no
+/// CS1 masking — the masking decision is made at `Case` construction
+/// time (`Case::raw_pin_state` masks CS1 low; `Case::raw_pin_state_unmasked`
+/// preserves whatever the caller drives, including CS1=high for the
+/// SeaBIOS validator's `--probe-cs1-thorough` empirical-evidence mode).
 /// Used by the SeaBIOS 256 KiB validator that needs to enumerate all
 /// 16-bit GPIO patterns directly.
 pub fn stimulus_level_raw(pin_state: u16) -> u32 {
-    (pin_state as u32) & !(1u32 << 13)
+    pin_state as u32
 }
 
 /// Layout descriptor for one ROM set in an SDRR fixture image. Pairs
@@ -1493,13 +1510,26 @@ mod tests {
         assert_eq!(case.raw_pin_state, Some(0xDFFF));
     }
 
-    /// `stimulus_level_raw` is the defensive belt-and-braces masker on
-    /// the level path. Even if a caller stuffs an unmasked u16 in via
-    /// some future code path, the level emitted onto the GPIO bus must
-    /// still have CS1 low.
+    /// `stimulus_level_raw` is now a verbatim pass-through (the masking
+    /// decision lives at `Case` construction — `Case::raw_pin_state`
+    /// masks CS1, `Case::raw_pin_state_unmasked` preserves it for the
+    /// SeaBIOS validator's `--probe-cs1-thorough` empirical mode).
     #[test]
-    fn stimulus_level_raw_masks_cs1() {
-        assert_eq!(stimulus_level_raw(0xFFFF), 0xDFFF);
+    fn stimulus_level_raw_is_passthrough() {
+        assert_eq!(stimulus_level_raw(0xFFFF), 0xFFFF);
+        assert_eq!(stimulus_level_raw(0xDFFF), 0xDFFF);
+        assert_eq!(stimulus_level_raw(0x0000), 0x0000);
+    }
+
+    /// `Case::raw_pin_state_unmasked` must preserve CS1 verbatim — the
+    /// `--probe-cs1-thorough` mode in the SeaBIOS validator depends on
+    /// CS1=high actually reaching the GPIO bus.
+    #[test]
+    fn case_raw_pin_state_unmasked_preserves_cs1() {
+        let case = Case::raw_pin_state_unmasked("x", 0xFFFF);
+        assert_eq!(case.raw_pin_state, Some(0xFFFF));
+        let case = Case::raw_pin_state_unmasked("x", 0x2000);
+        assert_eq!(case.raw_pin_state, Some(0x2000));
     }
 
     /// 4. Real fixture check — `test-sdrr-0.bin` set 1 (the one our
