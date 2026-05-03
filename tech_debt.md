@@ -365,17 +365,6 @@ recording here so the residue-coverage push owner can pick them up. Not
 blocking V2 since the skipped tests' coverage is already replicated by
 QEMU/silicon oracles for those code paths.
 
-## Resolved
-
-### PIO side-set drives pad_oe without PINDIRS — Resolved (2026-04-15)
-
-Fixed per `wrk_docs/2026.04.15 - HLD - PIO Side-Set Pad OE.md` (Option A):
-dropped the `oe |= positioned_mask` in `PioBlock::merge_pin_outputs`'s
-value-drive branch. `shared_pin_dirs` (populated by SET/OUT/MOV PINDIRS)
-now solely owns pad_oe for side-set pins, matching RP2350 §11.3.2.3.
-New unit tests T1–T4 in `crates/mdpicoem-common/src/pio/mod.rs` pin the
-correct behaviour.
-
 ## Cycle Timing — Phase 2 (Bus Fabric)
 
 Measured on real RP2354 silicon via DWT CYCCNT (probe_diff --cycles).
@@ -484,12 +473,6 @@ Fix: swap the bit check; update tests that used the wrong canonical encoding. Tr
 
 mdrp2040 Phase 4.A fixed the bug in its own code (2026-04-14).
 
-### mdrp2350 banked SP staleness in `enter_exception`/`exit_exception`
-
-mdrp2040 Phase 4.B uncovered (and fixed in its own tree) a banked-SP staleness hazard in the shared exception-entry/-exit pattern: `enter_exception` reads `self.regs.msp`/`psp` directly, but plain instructions (`SUB SP,#imm`, `ADD SP,#imm`, `PUSH`, `POP`) update `r[13]` without syncing back to the banked field. Handlers that allocate stack locals then return to unwind from a stale banked SP, corrupting the frame pointer.
-
-**Resolved (2026-04-16):** `sync_sp_to_banked()` inserted at the top of both `enter_exception` (after lockup check) and `exit_exception` (before unstack address read) in `crates/mdrp2350/src/core/exceptions.rs`, mirroring the mdrp2040 Phase 4.B fix. Unit test `test_pendsv_stacks_at_post_sub_sp_not_stale_banked_msp` confirms the frame is stacked at the correct post-SUB address.
-
 ## Phase 5.A Simplifications (RP2040 bus)
 
 These surfaced during Phase 5.A code review. The emulator compiles and Phase 5.A unit tests pass, but firmware exercising any of these paths will see incorrect behaviour. All are Phase 6+ work.
@@ -502,29 +485,6 @@ These surfaced during Phase 5.A code review. The emulator compiles and Phase 5.A
 
 `crates/mdrp2040/src/bus/sio.rs` `DIV_CSR` reports `READY=1` immediately after a divider write. Real hardware requires 8 cycles for the DIV result to become available. Pico SDK `hw_divider_delay` uses inline-asm hard-coded NOPs rather than polling `CSR.READY`, so most SDK-using firmware is unaffected, but any firmware that busy-polls `CSR.READY` will read a stale result. Low priority — fix with a cycle counter on the divider state.
 
-### RP2040 PLL LOCK always 1
-
-`crates/mdrp2040/src/bus/clocks.rs` forces `PLL_SYS_CS[31]` (LOCK) to 1 on read so firmware wait-for-lock loops fall through on the first poll. If firmware writes `FBDIV_INT=0` and then polls LOCK, it will observe LOCK=1 but the derived `pll_output_hz` returns 0 (so the clock tree is 0 Hz). Partial mitigation: callers reading `sys_clk_hz` see the zero propagation. Proper modelling: LOCK=1 only when `pll_output_hz` > 0 (and/or only after a configured lock-delay). Low priority.
-
-**Confirmed present on mdrp2350** (2026-04-15) via `silicon_periph_diff_rp2350` `pll_sys_lock_timing` scenario — `crates/mdrp2350/src/bus/peripherals.rs:21` forces CS[31]=1 unconditionally regardless of CS.ENABLE, PWR, or settle time. Same fix applies.
-
-**Resolved (2026-04-15):** both chips now derive CS[31] from the PLL
-register image, a `Bus::pll_*_lock_at_cycle: Option<u64>` arm state, and
-the current master cycle count, via three pure helpers in
-`mdpicoem_common::clocks` (`PLL_LOCK_DELAY_SYSCLKS = 2_000`,
-`pll_is_locked_base`, `pll_cs_read_with_lock`, `pll_should_arm_lock`).
-The write path implements **Option B** — PWR transitions back through
-"not powered / not configured" drop the arm, and FBDIV / REFDIV changes
-while still powered re-arm per silicon behaviour (PRIM / POSTDIV writes
-deliberately do not rearm). See
-`wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` for the design;
-twelve per-chip integration tests (`test_pll_cs_*` / `test_pll_usb_*`)
-plus sixteen common-side helper tests cover the blast radius.
-
-### ~~RP2040 core 1 SDK handshake not parsed~~ (resolved 2026-04-16)
-
-Resolved by `wrk_docs/2026.04.16 - HLD - RP2040 Core 1 Multicore Launch Handshake.md`. `Sio::fifo_wr` now runs a 6-state FSM for the full `multicore_launch_core1_raw` protocol (0, 0, 1, VTOR, SP, entry) while core 1 is halted; `Emulator::maybe_wake_core1` consumes the emitted `Core1Launch` token and applies VTOR/MSP/PC + `reset_control_for_launch` before waking the core. Covered by T1..T9 in `crates/mdrp2040/tests/multicore.rs` (including the SDK-sender-scripted T9).
-
 ### RP2040 multicore launch: entry with Thumb bit clear silently stripped
 
 `Emulator::maybe_wake_core1` and `Emulator::direct_boot_from_flash` both land core 1 with `pc = entry & !1`. On real silicon a BLX target with bit 0 clear raises a UsageFault (escalated to HardFault on M0+). Our emulator silently strips the bit, so malformed vector tables get the wrong diagnostic. Low risk — pico-sdk always sets the Thumb bit on reset-vector words — but if real PicoGUS-like firmware miswrites the handshake `entry` field, our emulator will run where silicon would fault. Fix: validate bit 0 on entry and raise `Fault::InvalidEpsr` / `HardFault` instead. Applies to both sites symmetrically.
@@ -536,28 +496,6 @@ The real RP2040 bootrom at `bootrom_rt0.S:366-368` clears `SCR.SLEEPDEEP` immedi
 ### RP2040 SIO address-mask quirk: atomic aliases hit unmapped offsets
 
 `Bus::sio_write32` does `offset = addr & 0xFFF` before dispatch. That strips the atomic-alias bits (bits 12-13), but it also folds `0xD000_2054` (which is outside the SIO window on real silicon — SIO is 4 KB at 0xD000_0000..0xD000_0FFF) down onto `fifo_wr`. Effect: firmware that inadvertently writes to the second SIO-sized page sees our FIFO respond when real silicon would bus-fault. Pre-existing, surfaced while auditing `fifo_wr` for the multicore handshake HLD. Fix: validate `addr` is within `SIO_BASE..SIO_BASE+0x1000` before dispatch, or preserve the alias bits and use proper alias semantics.
-
-### RP2040 per-instruction dual-core cadence
-
-`crates/mdrp2040/src/lib.rs` `Emulator::step` runs one instruction per core per call — unlike mdrp2350's quantum (N-instructions-per-quantum) scheduler. `update_gpio()` and `wake_checks()` also run per-instruction, which adds measurable per-Hz overhead and makes paced-throughput numbers worse than mdrp2350. Should converge to the quantum model before Phase 7 app work so `paced_bench` numbers are comparable across the two chips.
-
-**Status (2026-04-14, post-Phase-7):** not fixed. Phase 7 landed with
-`Emulator::step` still running one instruction per core per call. The
-`step_quantum` field on the builder is assigned but unused by `step()`,
-so configuring it is a no-op. Firmware correctness is unaffected (the
-blinky smoke test runs end-to-end in ~290ms, 7x headroom vs the 2s
-budget), but `paced_bench` for mdrp2040 is not directly comparable to
-mdrp2350's quantum-mode numbers until convergence happens. Still a real
-improvement to make, just not a blocker for firmware correctness.
-
-**Resolved (2026-04-14):** `Emulator::step` now drains both cores up to
-`step_quantum` master cycles per call and ticks PIO / GPIO / wake-checks
-once at quantum end, mirroring `mdrp2350::Emulator::step`. Per-instruction
-core-0/core-1 interleaving (and `maybe_wake_core1`) preserved so bank
-contention timing and intra-quantum FIFO wakes still fire. Tests that
-need single-instruction granularity opt in via
-`EmulatorBuilder::new(Config::default()).step_quantum(1).build()`. See
-`wrk_docs/2026.04.14 - HLD - mdrp2040 Quantum Step.md` (v1.2.0).
 
 ### RP2040 pacer MHz panel undercounts consumed cycles
 
@@ -587,23 +525,15 @@ a safe simplification — but firmware that expects a mid-execution SM to
 freeze on RESETS assert will diverge. mdrp2350 carries the same
 behaviour.
 
-### PIO INTn_INTE routing — RESOLVED 2026-04-16
+### `pio_all_idle()` ignores INTE/INTF when all SMs disabled
 
-`Emulator::tick_pio_and_route_irqs_single` in mdrp2040 now routes via
-`PioBlock::int0_ints` / `int1_ints` (i.e. `(INTR & INTE) | INTF`),
-matching the mdrp2350 implementation landed in commit `8bb7614`. The
-shared register surface (offsets `0x12C`..`0x140` on `PioBlock`) is
-already wired through the bus dispatch. Resolves the PicoGUS audio
-blocker — firmware ISA handlers fire on PIO0 RX FIFO RXNEMPTY as
-intended.
-
-Note: `pio_all_idle()` still keys on `irq_flags` only, not on
-`int0_ints` / `int1_ints`. Firmware that enables `INTn_INTE` for an
-RXNEMPTY/TXNFULL bit while leaving all SMs disabled (an unusual
-pattern) will miss the IRQ on the fast path. PicoGUS keeps SM0
-enabled whenever the IRQ matters, so this is not on the critical
-path. Update `pio_all_idle()` to consult `int0_ints`/`int1_ints` if
-a future workload needs the disabled-SM IRQ behaviour.
+`pio_all_idle()` keys on `irq_flags` only, not on `int0_ints` /
+`int1_ints`. Firmware that enables `INTn_INTE` for an RXNEMPTY/TXNFULL
+bit while leaving all SMs disabled (an unusual pattern) will miss the
+IRQ on the fast path. PicoGUS keeps SM0 enabled whenever the IRQ
+matters, so this is not on the critical path. Update `pio_all_idle()`
+to consult `int0_ints`/`int1_ints` if a future workload needs the
+disabled-SM IRQ behaviour.
 
 ## Phase 6 Simplifications (Harness split)
 
@@ -731,41 +661,6 @@ already landed (5 of 10 oracle cases fixed, 5 improved-but-residual).
 Treat as a follow-up HLD for exception-entry cycle fidelity when the
 residual causes a firmware-observable timing bug.
 
-### `isr_tail_chain_pendsv_systick` — scenario mis-named (RESOLVED to cold parity)
-
-The scenario as catalogued in v1 does NOT exercise tail-chain
-transitions. Shared `HANDLER_BASELINE` ends in `bkpt #0` at halfword
-[4] — no EXC_RETURN is ever issued, so the emulator's tail-chain
-path (landed 2026-04-16) is never entered by this scenario.
-
-**Root cause of the original HW=19 / EMU=15 delta (investigated 2026-04-16):**
-
-The preamble writes `SYST_CVR=0` then `SYST_CSR=ENABLE|TICKINT|CLKSOURCE`.
-`Ppb::systick_advance` at `crates/mdrp2350/src/bus/ppb.rs:743` had an
-off-by-RVR bug at CVR=0 startup:
-
-```rust
-// Pre-fix: cvr=0, rem=1 → "rem -= cvr+1 = 1; cvr=RVR; FIRE."
-// Consumed 1 cycle to fire, wrong by RVR cycles vs silicon.
-```
-
-ARMv8-M §B11.2.1 counter operation: when CVR=0 at start of a tick,
-the counter LOADS RVR into CVR on that tick (reload, no fire).
-Pending only asserts on the subsequent cvr→0 decrement transition.
-So CVR=0 with RVR=4 should take 5 ticks to the first fire (1 reload
-+ 4 decrements). EMU fired after just 1 tick.
-
-**Fix landed (2026-04-16):** `systick_advance` now handles the CVR=0
-start as a reload-without-fire step, then falls through to the
-normal countdown loop. Regression test
-`test_systick_cvr_zero_reloads_without_fire_on_first_tick` pins the
-behaviour. Scratch investigation test
-`test_investigate_cold_vs_tail_chain_emu_cyccnt` in
-`crates/mdpicoem-harness/src/isr_scenarios.rs` confirms both
-scenarios now report mailbox CYCCNT = 22 (HW=19 for both, so EMU=+3
-matching the cold-ISR residual above). The scenarios are no longer
-divergent between themselves on EMU.
-
 ### `Ppb::systick_advance` — cvr→0 via subtraction is silent (bug 2)
 
 Separate systick bug discovered during the investigation. The
@@ -796,21 +691,6 @@ without signal degradation.
 
 Priority: low (latent, no current scenario exercises the rem=cvr
 boundary in a way that observably diverges from silicon).
-
-### Tail-chain fast path landed (2026-04-16)
-
-`exit_exception` now speculates post-pop priority against pending
-exceptions; on tail-chain, skips the unstack + re-stack and jumps
-directly to the new handler at 6 cycles (vs ~24 for the old
-two-step exit-then-reentry). See
-`crates/mdrp2350/src/core/exceptions.rs` `activate_tail_chain`, and
-unit tests `test_tail_chain_pendsv_to_systick_preserves_frame` +
-`test_tail_chain_cycle_cost_is_discounted` in
-`crates/mdrp2350/src/tests.rs`. Architecturally correct; does not
-close the `isr_pendsv_cold` residual (separate cold-entry gap) and
-did not directly close `isr_tail_chain_pendsv_systick` either —
-that scenario's delta was caused by the systick CVR=0 bug above,
-closed by a separate fix to `Ppb::systick_advance`.
 
 ## PicoGUS Integration — Stage 1 follow-ups
 
@@ -1060,90 +940,26 @@ fetch-classification / bus hot path.
 
 ## PicoGUS Integration — Stage 6 follow-ups
 
-### ~~Real RP2040 bootrom not vendored~~ (resolved 2026-04-15)
-
-Fixed by vendoring the upstream B2 bootrom as
-`roms/rp2040/bootrom-rp2040-b2.bin` (SHA256
-`9c19b46f068c21f90d200c514faad4a0d5cecfc978f155b8c9d25cb6bc2efd81`,
-BSD-3-Clause). `picogus_diff_rp2040` gained a `--bootrom` flag that
-default-searches this path when `--flash` is supplied. Journal:
-`wrk_journals/2026.04.15 - JRN - PicoGUS RP2040 Bootrom + Boot Smoke.md`.
-
-Superseded by the two follow-ups below: the bootrom alone isn't enough
-to boot real SDK firmware, because our peripheral model is incomplete,
-and the SDK runtime itself also trips an assertion we don't yet
-understand.
-
-### ~~PicoGUS v4.0.0 firmware panics early in pico-sdk runtime~~ (resolved 2026-04-15)
-
-Resolved across four phases. Full narrative in
-`wrk_journals/2026.04.15 - JRN - PicoGUS SDK Panic Debug.md`. The
-"alarm 1 already claimed" hypothesis from the original diagnosis
-turned out to be a red herring — the r0=1 panic argument was the
-IRQ number passed to `irq_set_exclusive_handler`, not a hardware
-alarm index.
-
-- **Phase 1** (`22135ff`, `eadda71`) — `direct_boot_from_flash`
-  didn't write VTOR. Real silicon's `exit_from_boot2` writes SP +
-  VTOR + PC before jumping to the SDK reset handler; we were only
-  setting SP + PC. Added the VTOR write, both cores.
-- **Phase 2** (`34d7d6a`) — `crates/mdrp2040/src/bus/ppb.rs` had a
-  broken mask/pattern pair. `match addr & 0x0FFF_FFFF { 0x000E_D008
-  => self.vtor }` never matched because for `addr = 0xE000_ED08` the
-  mask yields `0x0000_ED08`, not `0x000E_D008`. Every SCB register
-  read returned 0, every write was silently dropped. Existing tests
-  all used direct field assignment (`bus.ppb[0].vtor = val`) which
-  bypassed the match, so the bug was invisible. Rewrote using the
-  correct mdrp2350 idiom (`match addr & 0xFFFF { 0xED08 =>
-  self.vtor }`) + added 5 regression tests + bus-level integration
-  assertion.
-- **Phase 4** (`5e113dc`) — `execute.rs` incorrectly raised
-  `Fault::InvalidEpsr` on `MOV PC, Rm` and `ADD PC, Rm` with even
-  destination. Per ARMv6-M ARM DDI 0419E §A5.1.2, `ALUWritePC`
-  (used by those two instructions when Rd=15) just masks the LSB —
-  only `BXWritePC` / `LoadWritePC` correctly fault. gcc emits `mov
-  pc, rN` for switch jump tables with even-aligned label targets;
-  this tripped the bogus fault in `_vfprintf`. Removed the check,
-  added positive regression tests. mdrp2350 already had the correct
-  behaviour.
-
-**Result**: real PicoGUS v4.0.0 firmware now runs through
-`picogus_diff_rp2040` for 62.7 M cycles (2.002 s simulated time)
-with zero stall events. All SDK panic paths are cleared.
-
-Three new blockers surfaced during Phase 5 diagnosis (no audio yet)
-— see entries below.
-
 ### PicoGUS: no I2S output — blocked on remaining DMA gate
 
 **Impact: HIGH** for the end-to-end PicoGUS ear-test acceptance.
 None blocks the oracle itself — the SDK panic is cleared, tests are
 green, chime firmware still produces audio.
 
-Two of three emulator peripheral gates are now resolved; the
-remaining gate is DMA.
+Remaining gate is DMA.
 
-1. ~~**RP2040 TIMER peripheral model** (blocker-1)~~ — RESOLVED.
-   TIMERAWH/TIMERAWL + ALARM0..3 + NVIC IRQ routing landed.
-
-2. ~~**RP2040 core 1 SDK launch handshake** (blocker-2)~~ — RESOLVED
-   2026-04-16 by the multicore-launch HLD. `Sio::fifo_wr` now parses
-   the full `multicore_launch_core1` 6-word handshake; core 1 wakes
-   at the supplied entry with the supplied MSP/VTOR. See
-   `crates/mdrp2040/tests/multicore.rs` T1..T9.
-
-3. **RP2040 DMA block model** (remaining blocker, MEDIUM impact).
+1. **RP2040 DMA block model** (blocker, MEDIUM impact).
    I2S output is DMA → PIO TX FIFO. No DMA = no PIO FIFO samples
    ever get loaded = no BCLK/LRCLK/DOUT output even if PIO were
    programmed. Our emulator's `bus/mod.rs` has a generic
    `peripheral_regs` HashMap fall-through at 0x50000000; DMA writes
    land there and do nothing. Scope: ~3-5 days.
 
-4. (Non-emulator) Real DOSBox-X trace capture to drive audio,
+2. (Non-emulator) Real DOSBox-X trace capture to drive audio,
    tracked as an external dependency in the PicoGUS Integration HLD
    Stage 6.
 
-After gate-3 lands, audio should finally reach the I2S pins.
+After gate-1 lands, audio should finally reach the I2S pins.
 
 ### Secondary finding — ISA-pin idle default matters for diagnostic probes
 
@@ -1329,17 +1145,6 @@ design for Phase 4 and documented in the relevant DMA module.
   documented as known anomaly.
 
 ### test_silicon residual failures (2026-04-16 baseline)
-
-- ~~**Cycle timing residuals (3 cases)**: `push_2_min_cost` (delta=-2),
-  `bank_contention_fetch_data_same` and `_diff` (delta=-1 each).~~
-  **Resolved (known-delta, 2026-04-21)** — accepted as bounded pipeline
-  residuals with per-case tolerances in
-  `crates/mdpicoem-harness/src/cycle_cases.rs`. See
-  `wrk_docs/2026.04.21 - HLD - Track B Cycle Oracle Fidelity.md` and the
-  "Resolved (known-delta) — Cycle Oracle per-case tolerances
-  (2026-04-21)" section above. Closing these at tol=0 requires Phase-2
-  pipeline-model work (write-buffer forwarding + load-to-use forwarding);
-  deferred.
 
 - **TICKS TIMER0 CYCLES readback**: `ticks_timer0_retarget_halves_rate`
   fails with EMU=0x18 (correctly accepts aliased write), HW=0x00.
@@ -1675,41 +1480,26 @@ Re-enable as soon as the W1C peripheral path lands. Until then, the
 narrow-write paths into IO_BANK0 INTR are tested only by the bus-side
 mask, which is not equivalent to silicon W1C.
 
-## Master clock does not advance when both cores are WFE/WFI-blocked (RP2350 only — RP2040 closed 2026-04-29) (2026-04-26)
+## Master clock does not advance when both cores are WFE/WFI-blocked (RP2350) (2026-04-26)
 
-**Status (2026-04-29):** RP2040 closed in V2 ISR Oracle implementation
+RP2040 closed 2026-04-29 in V2 ISR Oracle implementation
 (`crates/mdrp2040/src/lib.rs` step_serial both-blocked clock-advance
 branch + `Bus::next_scheduled_lazy_deadline` + `TimerRegs::next_armed_inte_fire_cycle`).
-Validated by `isr_m0_wfi_wake` scenario passing on EMU via the standard
-`run_scenario` helper (no test-side core-1 busy-loop scaffolding).
 RP2350 still open with the same shape — fold in when surfaced by an
 analogous mdrp2350 scenario.
 Note: PWM/ADC-only both-blocked scenarios (no TIMER alarm) would still stall under the V1 fix. Fold into resolution if such a scenario lands.
 
-
-`crates/mdrp2040/src/lib.rs:595-625` (post-WFE/SEV wiring) and
-`crates/mdrp2350/src/lib.rs:1339-1342` both use the same step-loop
-shape: each core that is `is_halted() || is_wfe_waiting()` contributes
-zero cycles to the quantum. When both cores are blocked the loop body
-hits `if c0 == 0 && c1 == 0 { break; }` and the master clock does not
-advance.
-
-**The gap.** On real silicon, with both cores in WFI, a TIMER alarm
-can still fire and assert IRQ on the NVIC; the wake propagates via
-`wake_checks` → `pending_and_enabled() != 0` → `cores[c].wake()`,
-unblocking the WFI'd core for the next quantum. In the emulator that
-chain is intact for the *wake* — `wake_checks` runs at the quantum
-tail unconditionally — but the *trigger* is missing: lazy peripherals
+**Same shape on mdrp2350.** The `step_pair_arm` skip predicate at
+`crates/mdrp2350/src/lib.rs:1339-1342`:
+`while !cs[core_id].is_halted() && !cs[core_id].is_wfe_waiting() && cs[core_id].cycles < target`
+guarantees the cycle counter doesn't advance when both cores are
+blocked, and the higher-level clock counter follows the cores. The
+*wake* chain is intact (`wake_checks` runs at the quantum tail
+unconditionally) but the *trigger* is missing: lazy peripherals
 (TIMER alarms) advance through `Bus::advance_lazy_scheduled(consumed)`
 where `consumed` is the per-quantum delta. Both-cores-blocked → zero
-delta → no alarm tick → no IRQ assert → no wake.
-
-**Same shape on mdrp2350.** The `step_pair_arm` skip predicate at
-`crates/mdrp2350/src/lib.rs:1339-1342` exhibits the same behaviour:
-`while !cs[core_id].is_halted() && !cs[core_id].is_wfe_waiting() && cs[core_id].cycles < target`
-guarantees the cycle counter doesn't advance, and the higher-level
-clock counter follows the cores. SysTick on M33 runs off the same
-master cycle — same shape, same gap.
+delta → no alarm tick → no IRQ assert → no wake. SysTick on M33 runs
+off the same master cycle — same shape, same gap.
 
 **Risk classification.** Theoretical. No current corpus scenario
 exercises a "both cores enter WFI together, expect TIMER alarm to
