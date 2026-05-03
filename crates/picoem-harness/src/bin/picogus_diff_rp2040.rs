@@ -1263,11 +1263,10 @@ fn replay_with_coverage(
 
             // Decile bucket for this sub-event (based on fired-order
             // progress through the total sub-events we'll fire).
-            let decile = if total_to_fire == 0 {
-                0
-            } else {
-                ((fired_so_far * 10) / total_to_fire).min(9) as usize
-            };
+            let decile = (fired_so_far * 10)
+                .checked_div(total_to_fire)
+                .map(|d| d.min(9) as usize)
+                .unwrap_or(0);
 
             // Always bump `fired` for this class / decile.
             {

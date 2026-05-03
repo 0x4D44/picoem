@@ -398,7 +398,7 @@ fn main() -> ExitCode {
         PROFILE_INSTRUCTIONS
     );
     let mut entries: Vec<_> = hist.iter().map(|(k, v)| (*k, *v)).collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     for (pc, n) in entries.iter().take(20) {
         let pct = 100.0 * (*n as f64) / (PROFILE_INSTRUCTIONS as f64);
         println!("  PC=0x{:08X}  count={:>5}  ({:>5.2}%)", pc, n, pct);

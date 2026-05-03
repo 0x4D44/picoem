@@ -299,8 +299,10 @@ fn run_set(
         .collect::<std::collections::HashSet<u8>>()
         .len();
 
-    let mut tally = SetTally::default();
-    tally.unique_expected_bytes = unique_count;
+    let mut tally = SetTally {
+        unique_expected_bytes: unique_count,
+        ..SetTally::default()
+    };
     let t0 = Instant::now();
 
     for pin_state in pin_lo..pin_hi {
@@ -357,7 +359,7 @@ fn run_set(
         }
 
         let done = (pin_state - pin_lo + 1) as usize;
-        if done % PROGRESS_INTERVAL == 0 {
+        if done.is_multiple_of(PROGRESS_INTERVAL) {
             let total = (pin_hi - pin_lo) as usize;
             let elapsed_ms = t0.elapsed().as_millis();
             println!(
