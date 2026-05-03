@@ -149,6 +149,18 @@ pub const QEMU_TEST_SLOT: u32 = 0x0000_0100;
 pub const QEMU_TEST_STACK: u32 = 0x0004_0000;
 /// QEMU: scratch SRAM for load/store data.
 pub const QEMU_TEST_SCRATCH: u32 = 0x0000_0200;
+/// QEMU M33: special-register-reset primer slot. Three back-to-back Thumb-32
+/// `MSR Sn, R0` instructions (PRIMASK / BASEPRI / FAULTMASK) are written here
+/// once at startup; `run_qemu_side` steps through all three (with R0=0 from
+/// the per-test default reset) before each test, clearing the writeable
+/// special registers. QEMU's CPU state persists across single-step runs, so
+/// without this primer a prior test's `MSR PRIMASK,Rn` (or `MSR BASEPRI,Rn`,
+/// or `MSR FAULTMASK,Rn`) leaks into the next test — and a later
+/// `MRS Rd, <special>` then diverges from the EMU side, which builds a fresh
+/// `CortexM33::new()` per test. Lives inside the vector-table reservation
+/// at `0x1000_0080` (12 bytes); the M33 oracle never raises IRQs that would
+/// dispatch through that region, so the slot is otherwise unused.
+pub const QEMU_M33_PRIMER_SLOT: u32 = 0x1000_0080;
 
 // ============================================================================
 // Address constants — QEMU M0+ side (microbit / cortex-m0)
