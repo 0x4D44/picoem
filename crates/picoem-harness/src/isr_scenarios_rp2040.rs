@@ -31,8 +31,8 @@ use crate::isr_scenarios::{
 };
 use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, reset_cyccnt};
 use crate::{ISR_IMAGE_BASE, ISR_STACK_TOP};
-use rp2040_emu::{Config, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
+use rp2040_emu::{Config, EmulatorBuilder};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------

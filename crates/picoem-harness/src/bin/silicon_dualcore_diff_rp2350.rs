@@ -167,10 +167,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let stub_bytes = picoem_harness::cycle_cases::pack_stub();
     {
         let mut core = session.core(0)?;
-        core.write_8(
-            picoem_harness::cycle_cases::STUB_START as u64,
-            &stub_bytes,
-        )?;
+        core.write_8(picoem_harness::cycle_cases::STUB_START as u64, &stub_bytes)?;
         // Zero mailbox (six u32 slots).
         for off in [0u32, 4, 8, 12, 16, 20] {
             core.write_word_32((CYCLE_MAILBOX_BASE + off) as u64, 0)?;

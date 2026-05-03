@@ -247,8 +247,7 @@ impl CpuServingOracle {
         // fixtures (e.g. the 256 KiB SeaBIOS validator) can drive every
         // 16-bit GPIO pattern directly.
         debug_assert!(
-            case.raw_pin_state.is_some()
-                || case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
+            case.raw_pin_state.is_some() || case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
             "run_case: case.addr_bits must have A11=A12=1 (or use Case::raw_pin_state)"
         );
 

@@ -25,8 +25,8 @@
 
 use crate::silicon_oracle::{self, CaseOutcome, Verdict};
 use crate::{EMU_TEST_STACK, SILICON_RUN_SLED};
-use rp2040_emu::{Config, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
+use rp2040_emu::{Config, EmulatorBuilder};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------

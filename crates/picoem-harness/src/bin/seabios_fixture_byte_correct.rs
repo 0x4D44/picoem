@@ -256,7 +256,11 @@ fn run_set(
 
     let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, flash);
     let shadow = oracle.shadow();
-    let unique = shadow.iter().copied().collect::<std::collections::HashSet<u8>>().len();
+    let unique = shadow
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<u8>>()
+        .len();
     println!("  shadow: {} unique bytes", unique);
 
     // Cross-check: the lifted shadow MUST match the corresponding 64 KiB
@@ -330,7 +334,10 @@ fn run_set(
                     }
                 }
             }
-            CpuVerdict::WrongByte { expected: e, observed } => {
+            CpuVerdict::WrongByte {
+                expected: e,
+                observed,
+            } => {
                 tally.wrong += 1;
                 if tally.first_wrong.is_none() {
                     tally.first_wrong = Some((pin_state as u16, e, observed));
@@ -407,8 +414,10 @@ const PROBE_CS1_NUM_CASES: usize = 256;
 fn run_probe_cs1_thorough(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
     const ROM_SET_INDEX: u32 = 1;
 
-    println!("=== --probe-cs1-thorough (rom_set {}, {} CS1=high cases, LCG seed 0x{:016X}) ===",
-        ROM_SET_INDEX, PROBE_CS1_NUM_CASES, PROBE_CS1_LCG_SEED);
+    println!(
+        "=== --probe-cs1-thorough (rom_set {}, {} CS1=high cases, LCG seed 0x{:016X}) ===",
+        ROM_SET_INDEX, PROBE_CS1_NUM_CASES, PROBE_CS1_LCG_SEED
+    );
     let _ = std::io::stdout().flush();
 
     let bootrom = std::fs::read(BOOTROM_PATH).map_err(|e| format!("bootrom: {e}"))?;
@@ -439,7 +448,9 @@ fn run_probe_cs1_thorough(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
     // CS1 bit forced high.
     let mut state: u64 = PROBE_CS1_LCG_SEED;
     let lcg_next = |s: &mut u64| -> u16 {
-        *s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        *s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         // High bits have better distribution than low bits in a Knuth LCG.
         ((*s >> 33) & 0xFFFF) as u16
     };
@@ -494,9 +505,16 @@ fn run_probe_cs1_thorough(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
         Ok(())
     } else {
         // Surface up to the first 8 surprises so the human sees what diverged.
-        println!("  SURPRISE: {} of {} cases produced a non-DataPinsNotDriven verdict.", PROBE_CS1_NUM_CASES - not_driven, PROBE_CS1_NUM_CASES);
+        println!(
+            "  SURPRISE: {} of {} cases produced a non-DataPinsNotDriven verdict.",
+            PROBE_CS1_NUM_CASES - not_driven,
+            PROBE_CS1_NUM_CASES
+        );
         for (i, (p, v, b)) in surprises.iter().take(8).enumerate() {
-            println!("    [{}] pin_state=0x{:04X}  verdict={}  observed_byte={:?}", i, p, v, b);
+            println!(
+                "    [{}] pin_state=0x{:04X}  verdict={}  observed_byte={:?}",
+                i, p, v, b
+            );
         }
         Err(format!(
             "expected all {} cases to report DataPinsNotDriven; got {} non-DataPinsNotDriven",
@@ -551,7 +569,11 @@ fn main() -> ExitCode {
         }
     };
     if seabios.len() != SEABIOS_SIZE {
-        eprintln!("seabios image must be {} bytes; got {}", SEABIOS_SIZE, seabios.len());
+        eprintln!(
+            "seabios image must be {} bytes; got {}",
+            SEABIOS_SIZE,
+            seabios.len()
+        );
         return ExitCode::from(3);
     }
 

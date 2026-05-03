@@ -1745,8 +1745,8 @@ pub const SCENARIOS: &[IsrScenario] = &[
 // ---------------------------------------------------------------------------
 
 use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, reset_cyccnt};
-use rp2350_emu::{Config, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
+use rp2350_emu::{Config, EmulatorBuilder};
 use std::time::{Duration, Instant};
 
 const PC_REG: RegisterId = RegisterId(15);

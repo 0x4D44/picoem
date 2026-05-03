@@ -77,8 +77,7 @@ mod windows_main {
     // -----------------------------------------------------------------------
 
     const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-    const FLASH_PATH: &str =
-        "crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
+    const FLASH_PATH: &str = "crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
 
     const DEFAULT_SEED: u64 = 0x1541_CAFE_0000_0001;
     const DEFAULT_SWEEPS_PER_THRESHOLD: u32 = 3;

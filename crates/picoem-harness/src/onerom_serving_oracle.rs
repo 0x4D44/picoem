@@ -954,8 +954,7 @@ pub fn parse_rom_set_layout(flash: &[u8]) -> Option<Vec<RomSetSlot>> {
     let metadata_ptr = read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
     let metadata_off = ptr_to_off(metadata_ptr)?;
 
-    let rom_set_count =
-        *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)? as usize;
+    let rom_set_count = *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)? as usize;
     if rom_set_count == 0 {
         // A zero-count fixture is malformed; the firmware would never
         // dereference rom_sets[0]. Report it via the function's standard
@@ -974,7 +973,10 @@ pub fn parse_rom_set_layout(flash: &[u8]) -> Option<Vec<RomSetSlot>> {
         // Bounds check: ensure the declared size fits inside the flash
         // image. A bad size here would otherwise let the caller copy
         // off the end.
-        if data_off.checked_add(size).is_none_or(|end| end > flash.len()) {
+        if data_off
+            .checked_add(size)
+            .is_none_or(|end| end > flash.len())
+        {
             return None;
         }
         out.push(RomSetSlot {

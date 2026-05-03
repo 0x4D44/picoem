@@ -27,8 +27,8 @@ use crate::{
     CYCLE_MAILBOX_BASE, DUALCORE_ANTAGONIST_SLOT, DUALCORE_CORE1_DATA, DUALCORE_CORE1_STACK,
     EMU_TEST_STACK,
 };
-use rp2350_emu::Emulator;
 use probe_rs::{Core, MemoryInterface, RegisterId, Session};
+use rp2350_emu::Emulator;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------

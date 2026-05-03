@@ -62,15 +62,15 @@ pub use picoem_common::threaded::{BarrierResult, SpinBarrier, SpscQueue};
 // per the 2026-04-30 Threaded Helpers Pull-Up HLD V1. These re-exports
 // keep the chip-local call sites that reach them via `super::{...}`
 // from `threaded::emulator` source-compatible.
+pub use peripherals::{
+    ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState, UsbState,
+};
 #[cfg(all(
     feature = "threading",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 pub use picoem_common::threaded::{panic_message, pin_to_host_core, spawn_worker};
-pub use peripherals::{
-    ApbState, ClocksState, DmaState, Peripherals, QmiState, ResetsState, TimersState, UsbState,
-};
 pub use pio::{PioCommand, ThreadedPio};
 pub use shared::SharedState;
 pub use sio::ThreadedSio;

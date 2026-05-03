@@ -2696,8 +2696,8 @@ pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
 
 use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, read_cyccnt, reset_cyccnt};
 use crate::{EMU_TEST_STACK, SILICON_RUN_SLED};
-use rp2350_emu::{Config, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
+use rp2350_emu::{Config, EmulatorBuilder};
 use std::time::{Duration, Instant};
 
 const PC_REG: RegisterId = RegisterId(15);

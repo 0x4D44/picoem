@@ -26,8 +26,8 @@
 // orchestrator shares.
 
 use crate::silicon_oracle::{self, CaseOutcome, Verdict, enable_cyccnt, read_cyccnt, reset_cyccnt};
-use rp2350_emu::{Config, Cores, Emulator, EmulatorBuilder};
 use probe_rs::{Core, MemoryInterface, RegisterId};
+use rp2350_emu::{Config, Cores, Emulator, EmulatorBuilder};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
