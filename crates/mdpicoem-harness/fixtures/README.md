@@ -1,8 +1,9 @@
 # mdpicoem-harness fixtures
 
-Test fixtures consumed by the harness binaries. None of these files
-contain redistributed third-party game data, ROM data, or source code.
-They are functional captures and locally-built firmware images.
+Test fixtures consumed by the harness binaries. The binary fixtures here
+are either functional captures (the `*.trace` files), locally-built RP2350
+firmware images (the `onerom-*.bin` files), or open-source firmware that we
+redistribute under its license (currently SeaBIOS, see below).
 
 ## Trace files (`*.trace`)
 
@@ -49,6 +50,20 @@ images, not redistributed third-party content; rebuilds of these
 binaries are produced from the OneROM source tree as the project
 evolves. See the OneROM HLD documents under `wrk_docs/` for build
 provenance.
+
+## SeaBIOS image (`sources/seabios-256k.bin`)
+
+`sources/seabios-256k.bin` is a 256 KiB SeaBIOS x86 BIOS binary used by
+`build_seabios_fixture` to author `onerom-fire-24-a-rp2350-seabios-cpu.bin`.
+SeaBIOS is open-source firmware (LGPLv3) maintained at
+https://github.com/coreboot/seabios. The byte-identical copy lives in
+mddosem at `assets/roms/bios-256k.bin`; see the journal
+`wrk_journals/2026.05.03 - JRN - SDRR SeaBIOS fixture.md` for SHA-256 +
+provenance.
+
+The derived fixture `onerom-fire-24-a-rp2350-seabios-cpu.bin` embeds the
+SeaBIOS bytes inside SDRR firmware envelope; the fixture inherits SeaBIOS's
+LGPLv3.
 
 ## Notes for downstream users
 

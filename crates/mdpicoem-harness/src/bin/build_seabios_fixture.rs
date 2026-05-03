@@ -17,11 +17,18 @@ use std::process::ExitCode;
 
 use mdpicoem_harness::onerom_serving_oracle::{SHADOW_SIZE, parse_rom_set_layout};
 
-const DEFAULT_TEMPLATE: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin";
-const DEFAULT_SEABIOS: &str = "crates/mdpicoem-harness/fixtures/sources/seabios-256k.bin";
-const DEFAULT_OUTPUT: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-seabios-cpu.bin";
+const DEFAULT_TEMPLATE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin"
+);
+const DEFAULT_SEABIOS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/sources/seabios-256k.bin"
+);
+const DEFAULT_OUTPUT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/onerom-fire-24-a-rp2350-seabios-cpu.bin"
+);
 
 const SEABIOS_SIZE: usize = 256 * 1024;
 const EXPECTED_ROM_SET_COUNT: usize = 4;
@@ -89,6 +96,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    eprintln!(
+        "build_seabios_fixture: template={} seabios={} output={}",
+        cli.template.display(),
+        cli.seabios.display(),
+        cli.output.display()
+    );
 
     println!("template: {}", cli.template.display());
     println!("seabios:  {}", cli.seabios.display());
@@ -159,6 +173,15 @@ fn main() -> ExitCode {
     // syncs. Copying set 0's pointer into all sets ensures every set
     // boots through the same firmware code path with the same valid
     // sdrr_rom_info_t.
+    //
+    // Empirical evidence (from probe_rom_set_descriptors on the 1541 template,
+    // see wrk_journals/2026.05.03 - JRN - SDRR SeaBIOS fixture.md):
+    //   set 0 +0x08: 0x1000_C210  (canonical, lands on a valid sdrr_rom_info_t)
+    //   set 1 +0x08: 0x1000_C20C  (-4 bytes; still a valid descriptor by overlap)
+    //   set 2 +0x08: 0x1000_C208  (-8 bytes; still valid by overlap)
+    //   set 3 +0x08: 0x1000_C204  (-12 bytes; lands on garbage; firmware never syncs)
+    // We patch sets 1, 2, 3 to share set 0's pointer so all four route through
+    // the same firmware code path with the same pin map / chip type.
     const ROMS_PTR_FIELD: usize = 0x08;
     let canonical_ptr: [u8; 4] = fixture[layout[0].descriptor_offset + ROMS_PTR_FIELD
         ..layout[0].descriptor_offset + ROMS_PTR_FIELD + 4]

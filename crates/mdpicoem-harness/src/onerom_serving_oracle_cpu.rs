@@ -38,7 +38,7 @@ use mdrp2350::{Bus, Emulator};
 
 use crate::onerom_serving_oracle::{
     ADDR_A11_A12_HIGH, Case, SHADOW_BASE, SHADOW_SIZE, lift_shadow_from_flash_pub,
-    stimulus_level_pub, stimulus_level_raw, stimulus_level_raw_unmasked,
+    stimulus_level_pub, stimulus_level_raw,
 };
 
 // ---------------------------------------------------------------------------
@@ -277,7 +277,6 @@ impl CpuServingOracle {
 
         // 2. Apply stimulus.
         let stim_level = match case.raw_pin_state {
-            Some(p) if case.is_cs1_unmasked() => stimulus_level_raw_unmasked(p),
             Some(p) => stimulus_level_raw(p),
             None => stimulus_level_pub(case.addr_bits),
         };

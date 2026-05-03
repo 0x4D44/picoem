@@ -168,29 +168,32 @@ const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
 
 /// One address stimulus for the sweep.
 ///
-/// Two construction modes are supported:
+/// Two construction modes are supported, distinguished by `raw_pin_state`:
 ///
-/// 1. The legacy `Case::new(label, addr_bits)` mode: 13-bit `addr_bits`
-///    are permuted through `ADDR_PINS` by [`stimulus_level`]. The
+/// 1. **Legacy permutation mode** (`raw_pin_state == None`): build via
+///    `Case::new(label, addr_bits)`. The 13-bit `addr_bits` are permuted
+///    through `ADDR_PINS` by [`stimulus_level`]. The
 ///    `addr_bits & 0x1800 == 0x1800` invariant is enforced — CS2/CS3
 ///    share GPIOs with A11/A12 so a deselected chip requires those high.
-///    `raw_pin_state` is `None` in this mode.
 ///
-/// 2. The `Case::raw_pin_state(label, pin_state)` mode added for
-///    larger-than-1541-style ROMs (e.g. the 256 KiB SeaBIOS fixture).
-///    `pin_state` is a literal 16-bit GPIO pattern; the only invariant
-///    is CS1 (bit 13) low — every pin including A11/A12 is driven
-///    verbatim. Used by harnesses that need direct GPIO-state-indexed
-///    LUT serving across the full 64 KiB shadow per ROM set.
-///    `addr_bits == 0` in this mode (unused; the field exists only for
-///    the legacy path).
+/// 2. **Raw-pin-state mode** (`raw_pin_state == Some(p)`): build via
+///    `Case::raw_pin_state(label, pin_state)`. Used by larger-than-1541
+///    fixtures (e.g. the 256 KiB SeaBIOS fixture). `pin_state` is a
+///    literal 16-bit GPIO pattern with CS1 (bit 13) masked low at
+///    construction; every other pin including A11/A12 is driven
+///    verbatim. The legacy `addr_bits` field is unused in this mode
+///    (set to 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Case {
     pub label: &'static str,
+    /// Legacy-mode payload. The 13-bit address pattern permuted through
+    /// `ADDR_PINS` by [`stimulus_level`]. Unused (set to 0) when
+    /// `raw_pin_state` is `Some`.
     pub addr_bits: u16,
     /// `Some(p)` if this case drives a raw 16-bit GPIO pattern (with
-    /// CS1 low); `None` if `addr_bits` should be permuted through
-    /// `ADDR_PINS` via [`stimulus_level`]. See the type doc for context.
+    /// CS1 already masked low); `None` if `addr_bits` should be permuted
+    /// through `ADDR_PINS` via [`stimulus_level`]. See the type doc for
+    /// context.
     pub raw_pin_state: Option<u16>,
 }
 
@@ -210,40 +213,15 @@ impl Case {
     }
 
     /// Build a case that drives `pin_state` directly onto GPIO 0..15
-    /// (with CS1=bit 13 forced low) instead of permuting `addr_bits`
-    /// through `ADDR_PINS`. Bypasses the A11=A12=1 invariant — caller
-    /// is responsible for the pin map. Used by the SeaBIOS 256 KiB
-    /// fixture validator.
+    /// with CS1 (bit 13) forced low at construction. Bypasses the
+    /// A11=A12=1 invariant — caller is responsible for the pin map.
+    /// Used by the SeaBIOS 256 KiB fixture validator.
     pub const fn raw_pin_state(label: &'static str, pin_state: u16) -> Self {
         Self {
             label,
             addr_bits: 0,
             raw_pin_state: Some(pin_state & !(1u16 << 13)),
         }
-    }
-
-    /// Build a case that drives `pin_state` directly onto GPIO 0..15
-    /// **without** masking CS1 (bit 13). Used by the SeaBIOS validator's
-    /// `--probe-cs1` mode to empirically probe whether the SDRR firmware
-    /// tristates the data pins when CS1 is high, or serves regardless.
-    /// The `raw_pin_state` field still carries the value; downstream
-    /// code distinguishes via [`Case::is_cs1_unmasked`].
-    pub const fn raw_pin_state_unmasked(label: &'static str, pin_state: u16) -> Self {
-        Self {
-            label,
-            // Repurpose `addr_bits` as a sentinel: 0xFFFF marks "raw,
-            // CS1-unmasked". Legacy `Case::new` callers always set
-            // `addr_bits & 0x1800 == 0x1800` (sub-0x2000), so 0xFFFF is
-            // unambiguous. The data lives in `raw_pin_state` as usual.
-            addr_bits: 0xFFFF,
-            raw_pin_state: Some(pin_state),
-        }
-    }
-
-    /// True if this case was built with [`Case::raw_pin_state_unmasked`]
-    /// and so CS1 must NOT be forced low when computing the stim level.
-    pub const fn is_cs1_unmasked(&self) -> bool {
-        self.raw_pin_state.is_some() && self.addr_bits == 0xFFFF
     }
 }
 
@@ -908,19 +886,14 @@ pub fn stimulus_level_pub(addr_bits: u16) -> u32 {
 }
 
 /// Stimulus level for a `Case::raw_pin_state` case: drive `pin_state`
-/// directly onto GPIO 0..15 with CS1 (bit 13) forced low. No permutation,
-/// no A11/A12 invariant. Used by the SeaBIOS 256 KiB validator that
-/// needs to enumerate all 16-bit GPIO patterns directly.
+/// directly onto GPIO 0..15 with CS1 (bit 13) forced low. Defensive
+/// belt-and-braces — `Case::raw_pin_state` already masks at
+/// construction, but this also handles raw `pin_state` integers passed
+/// in from outside that path. No permutation, no A11/A12 invariant.
+/// Used by the SeaBIOS 256 KiB validator that needs to enumerate all
+/// 16-bit GPIO patterns directly.
 pub fn stimulus_level_raw(pin_state: u16) -> u32 {
     (pin_state as u32) & !(1u32 << 13)
-}
-
-/// Stimulus level for a `Case::raw_pin_state_unmasked` case: drive
-/// `pin_state` directly onto GPIO 0..15 with **no** masking — bit 13
-/// (CS1) propagates verbatim. Used only by the SeaBIOS validator's
-/// `--probe-cs1` mode to test the firmware's CS1=high behaviour.
-pub fn stimulus_level_raw_unmasked(pin_state: u16) -> u32 {
-    pin_state as u32
 }
 
 /// Layout descriptor for one ROM set in an SDRR fixture image. Pairs
@@ -966,6 +939,12 @@ pub fn parse_rom_set_layout(flash: &[u8]) -> Option<Vec<RomSetSlot>> {
 
     let rom_set_count =
         *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)? as usize;
+    if rom_set_count == 0 {
+        // A zero-count fixture is malformed; the firmware would never
+        // dereference rom_sets[0]. Report it via the function's standard
+        // "None on parse failure" channel rather than returning Some(vec![]).
+        return None;
+    }
     let rom_sets_ptr = read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
     let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
 
@@ -1444,6 +1423,83 @@ mod tests {
     fn lift_shadow_rejects_truncated_flash() {
         let flash = vec![0u8; 0x300]; // only ~sdrr_info_t bytes; no metadata.
         assert!(lift_shadow_from_flash(&flash, 0).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // SeaBIOS-fixture API: `parse_rom_set_layout`, `Case::raw_pin_state`,
+    // and `stimulus_level_raw`. Added 2026-05-03 alongside the SeaBIOS
+    // 256 KiB fixture; cover the public contract so future authors of
+    // similarly large fixtures don't regress these helpers silently.
+    // -------------------------------------------------------------------
+
+    /// `parse_rom_set_layout` walks the SDRR struct chain and returns one
+    /// `RomSetSlot` per declared ROM set, with descriptor / data offsets
+    /// matching what `lift_shadow_from_flash` would resolve internally.
+    #[test]
+    fn parse_rom_set_layout_happy_path() {
+        let flash = synth_flash(2);
+        let layout = parse_rom_set_layout(&flash).expect("layout must parse");
+        assert_eq!(layout.len(), 2);
+
+        // Set 0: data ptr = 0x1000_C100 + 0x14000 = 0x1002_0000 → off 0x20000.
+        // Set 1: data ptr = 0x1001_0000 → off 0x10000.
+        // Stride = 64; rom_sets array starts at 0xC100 in the synth blob.
+        assert_eq!(layout[0].descriptor_offset, 0xC100);
+        assert_eq!(layout[0].data_offset, 0x2_0000);
+        assert_eq!(layout[0].size, SHADOW_SIZE);
+
+        assert_eq!(layout[1].descriptor_offset, 0xC100 + ROM_SET_STRIDE);
+        assert_eq!(layout[1].data_offset, 0x1_0000);
+        assert_eq!(layout[1].size, SHADOW_SIZE);
+    }
+
+    /// Truncated flash (smaller than the metadata pointer target) must
+    /// return `None` — same conservative behaviour as
+    /// `lift_shadow_from_flash`.
+    #[test]
+    fn parse_rom_set_layout_rejects_truncated_flash() {
+        let flash = vec![0u8; 512];
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// A `rom_set_count` of zero is malformed (the firmware would
+    /// dereference rom_sets[0] regardless), so the parser must
+    /// surface it as a parse failure rather than `Some(vec![])`.
+    #[test]
+    fn parse_rom_set_layout_rejects_zero_count() {
+        let mut flash = synth_flash(2);
+        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = 0;
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// A `size` field that overruns the flash image must be rejected
+    /// (otherwise a downstream copy could walk off the end).
+    #[test]
+    fn parse_rom_set_layout_rejects_oversize_size_field() {
+        let mut flash = synth_flash(2);
+        let entry_off = 0xC100; // set 0
+        let bad_size = (flash.len() as u32) + 1;
+        flash[entry_off + ROM_SET_SIZE_OFFSET..entry_off + ROM_SET_SIZE_OFFSET + 4]
+            .copy_from_slice(&bad_size.to_le_bytes());
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// `Case::raw_pin_state` must mask CS1 (bit 13) low at construction.
+    /// The validator and any future raw-mode caller depend on this so a
+    /// stray CS1=high pattern can never drift through the API.
+    #[test]
+    fn case_raw_pin_state_masks_cs1() {
+        let case = Case::raw_pin_state("x", 0xFFFF);
+        assert_eq!(case.raw_pin_state, Some(0xDFFF));
+    }
+
+    /// `stimulus_level_raw` is the defensive belt-and-braces masker on
+    /// the level path. Even if a caller stuffs an unmasked u16 in via
+    /// some future code path, the level emitted onto the GPIO bus must
+    /// still have CS1 low.
+    #[test]
+    fn stimulus_level_raw_masks_cs1() {
+        assert_eq!(stimulus_level_raw(0xFFFF), 0xDFFF);
     }
 
     /// 4. Real fixture check — `test-sdrr-0.bin` set 1 (the one our

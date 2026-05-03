@@ -109,14 +109,6 @@ path = "src/bin/onerom_serving_oracle_rp2350.rs"
 name = "onerom_serving_oracle_cpu_rp2350"
 path = "src/bin/onerom_serving_oracle_cpu_rp2350.rs"
 
-# One-shot SeaBIOS feasibility probe — does the 1541 fixture's 64 KiB
-# shadow look like a direct GPIO-indexed LUT, or a permuted one?
-# Diagnostic; delete after the supervisor reads its output once.
-[[bin]]
-name = "probe_seabios_fixture_capability"
-path = "src/bin/probe_seabios_fixture_capability.rs"
-test = false
-
 # SeaBIOS fixture builder — overwrites the 4 ROM sets of the 1541 template
 # fixture with the 4 quarters of the 256 KiB SeaBIOS image. See HLD
 # `2026.05.03 - HLD - OneROM live BIOS serve.md`.
@@ -132,23 +124,6 @@ test = false
 [[bin]]
 name = "seabios_fixture_byte_correct"
 path = "src/bin/seabios_fixture_byte_correct.rs"
-test = false
-
-# Disposable sync-probe — boots an arbitrary OneROM CPU-mode fixture
-# once per declared ROM set, reports which sets reach the serve loop.
-# Used to compare fixture templates (1541 vs test-sdrr-0 etc.). Delete
-# after the supervisor has the data.
-[[bin]]
-name = "probe_sync_per_rom_set"
-path = "src/bin/probe_sync_per_rom_set.rs"
-test = false
-
-# Disposable: dump the full 64-byte sdrr_rom_set_t descriptor for each
-# ROM set in a fixture and diff them pairwise. Used to find the
-# metadata field that gates whether set 3 of the 1541 fixture boots.
-[[bin]]
-name = "probe_rom_set_descriptors"
-path = "src/bin/probe_rom_set_descriptors.rs"
 test = false
 
 [[bin]]

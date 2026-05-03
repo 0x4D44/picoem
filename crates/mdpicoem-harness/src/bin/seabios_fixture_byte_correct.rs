@@ -1,12 +1,29 @@
-//! Byte-correctness validator for the SeaBIOS SDRR fixture.
+//! Validates that the OneROM-served bytes match the SeaBIOS image for every
+//! reachable pin state. Per-fixture max byte-correct coverage is 128 KiB
+//! (32 KiB × 4 ROM sets at CS1=low) — the firmware tristates D0..D7 when
+//! CS1 is high, so the upper half of each ROM set's shadow is unservable
+//! through this firmware path.
+//!
+//! ## Architectural ceiling
+//!
+//! The fire-24-a SDRR firmware tristates D0..D7 whenever CS1 (bit 13) is
+//! high. This was confirmed empirically on 2026-05-03; see the journal
+//! `wrk_journals/2026.05.03 - JRN - SDRR SeaBIOS fixture.md`.
+//!
+//! Consequence: 32 KiB byte-correct verifiable per ROM set × 4 sets =
+//! 128 KiB max coverage per fixture. The upper 128 KiB of the SeaBIOS
+//! image is laid into the shadow but is unservable through this firmware.
+//! Serving all 256 KiB requires either a different SDRR firmware variant
+//! with a wider pin map (the README mentions 27C-series EPROMs up to
+//! 512 KiB), or a two-fixture topology where Stream B's worker reloads
+//! the emulator with a different fixture for the upper 128 KiB.
 //!
 //! For each of the 4 ROM sets in
 //! `onerom-fire-24-a-rp2350-seabios-cpu.bin`, boot the firmware,
 //! force the ROM set selection, sync the CPU into the serve loop, then
-//! drive every 16-bit GPIO pin pattern (with CS1 held low) through
-//! [`CpuServingOracle::run_case`] and confirm the served byte matches
-//! the corresponding byte in the SeaBIOS image. Reports per-set
-//! pass/wrong/no-stable/undefined counts; ALL 256 KiB must pass.
+//! drive every 16-bit GPIO pin pattern (skipping CS1=high cases as
+//! unservable) through [`CpuServingOracle::run_case`] and confirm the
+//! served byte matches the corresponding byte in the SeaBIOS image.
 //!
 //! Usage:
 //!   cargo run --release -p mdpicoem-harness --bin seabios_fixture_byte_correct
@@ -26,9 +43,14 @@ use mdpicoem_harness::{
 use mdrp2350::{Config, Emulator, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
-const DEFAULT_FIXTURE: &str =
-    "crates/mdpicoem-harness/fixtures/onerom-fire-24-a-rp2350-seabios-cpu.bin";
-const DEFAULT_SEABIOS: &str = "crates/mdpicoem-harness/fixtures/sources/seabios-256k.bin";
+const DEFAULT_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/onerom-fire-24-a-rp2350-seabios-cpu.bin"
+);
+const DEFAULT_SEABIOS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/sources/seabios-256k.bin"
+);
 
 const SHADOW_SIZE: usize = onerom_serving_oracle::SHADOW_SIZE;
 const SEABIOS_SIZE: usize = 4 * SHADOW_SIZE;
@@ -50,14 +72,12 @@ struct Cli {
     fixture: PathBuf,
     seabios: PathBuf,
     smoke: bool,
-    probe_cs1: bool,
 }
 
 fn parse_cli() -> Result<Cli, String> {
     let mut fixture = PathBuf::from(DEFAULT_FIXTURE);
     let mut seabios = PathBuf::from(DEFAULT_SEABIOS);
     let mut smoke = false;
-    let mut probe_cs1 = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -65,28 +85,20 @@ fn parse_cli() -> Result<Cli, String> {
             "--fixture" => fixture = PathBuf::from(args.next().ok_or("--fixture needs a value")?),
             "--seabios" => seabios = PathBuf::from(args.next().ok_or("--seabios needs a value")?),
             "--smoke" => smoke = true,
-            "--probe-cs1" => probe_cs1 = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: seabios_fixture_byte_correct [--fixture <path>] [--seabios <path>] [--smoke|--probe-cs1]\n\
-                     --smoke      runs all 4 ROM sets with the first 256 pin states each (fast spot check).\n\
-                     --probe-cs1  rom_set 0 only — drives 10 hand-picked pin_state cases with CS1 high\n\
-                                  (and 3 with CS1 low for sanity) to test whether the firmware actually\n\
-                                  tristates D0..D7 when CS1 is high or serves regardless."
+                    "usage: seabios_fixture_byte_correct [--fixture <path>] [--seabios <path>] [--smoke]\n\
+                     --smoke      runs all 4 ROM sets with the first 256 pin states each (fast spot check)."
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
-    if smoke && probe_cs1 {
-        return Err("--smoke and --probe-cs1 are mutually exclusive".to_string());
-    }
     Ok(Cli {
         fixture,
         seabios,
         smoke,
-        probe_cs1,
     })
 }
 
@@ -175,7 +187,7 @@ struct SetTally {
     no_stable: usize,
     not_driven: usize,
     latency_oor: usize,
-    skipped_cs1: usize,
+    unservable_cs1: usize,
     first_wrong: Option<(u16, u8, u8)>,
 }
 
@@ -229,7 +241,7 @@ fn run_set(
 
     for pin_state in pin_lo..pin_hi {
         if (pin_state as u16) & CS1_BIT != 0 {
-            tally.skipped_cs1 += 1;
+            tally.unservable_cs1 += 1;
             continue;
         }
         let case = onerom_serving_oracle::Case::raw_pin_state("seabios", pin_state as u16);
@@ -275,14 +287,14 @@ fn run_set(
             let total = (pin_hi - pin_lo) as usize;
             let elapsed_ms = t0.elapsed().as_millis();
             println!(
-                "    progress: {}/{}  pass={} wrong={} no_stable={} not_driven={} skipped={}  ({} ms)",
+                "    progress: {}/{}  pass={} wrong={} no_stable={} not_driven={} unservable_cs1={}  ({} ms)",
                 done,
                 total,
                 tally.pass,
                 tally.wrong,
                 tally.no_stable,
                 tally.not_driven,
-                tally.skipped_cs1,
+                tally.unservable_cs1,
                 elapsed_ms
             );
             let _ = std::io::stdout().flush();
@@ -291,14 +303,14 @@ fn run_set(
 
     let elapsed_ms = t0.elapsed().as_millis();
     println!(
-        "  done in {} ms: pass={} wrong={} no_stable={} not_driven={} latency_oor={} skipped_cs1={}",
+        "  done in {} ms: pass={} (32 KiB byte-correct) wrong={} no_stable={} not_driven={} latency_oor={} unservable_cs1={} (CS1=high → firmware tristates D0..D7)",
         elapsed_ms,
         tally.pass,
         tally.wrong,
         tally.no_stable,
         tally.not_driven,
         tally.latency_oor,
-        tally.skipped_cs1
+        tally.unservable_cs1
     );
     if let Some((p, e, o)) = tally.first_wrong {
         println!(
@@ -308,177 +320,6 @@ fn run_set(
     }
     let _ = std::io::stdout().flush();
     Ok(tally)
-}
-
-/// `--probe-cs1` mode: empirically probe whether the SDRR firmware
-/// tristates the data pins when CS1 is high, or serves regardless. Runs
-/// rom_set 0 only with a small, hand-picked battery of pin states (some
-/// CS1=high, some CS1=low for sanity), reporting pin_state +
-/// expected_byte + observed_byte + verdict per case. The shadow lookup
-/// for CS1=high cases is `shadow[pin_state]` because the CPU's serve
-/// loop indexes shadow by the full sampled GPIO low-16 word —
-/// `gpio_in[0..16]` — without masking CS1 itself; so if the firmware
-/// serves regardless of CS1, the byte at that index is what we expect.
-fn run_probe_cs1(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
-    println!("=== --probe-cs1: rom_set 0, hand-picked CS1 cases ===");
-    let _ = std::io::stdout().flush();
-
-    let bootrom = std::fs::read(BOOTROM_PATH).map_err(|e| format!("bootrom: {e}"))?;
-    let mut emu = boot_sync(&bootrom, flash, 0)?;
-    println!("synced at cycle {}", emu.cycles());
-
-    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, flash);
-    let shadow = oracle.shadow();
-    println!(
-        "shadow: {} unique bytes",
-        shadow
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<u8>>()
-            .len()
-    );
-
-    // Cross-check that the lifted shadow matches the seabios chunk for
-    // rom_set 0 — same belt-and-braces as `run_set` so a fixture build
-    // bug doesn't produce a confusing "all wrong byte" output.
-    let chunk = &seabios[0..SHADOW_SIZE];
-    let mismatch = (0..SHADOW_SIZE).filter(|&i| shadow[i] != chunk[i]).count();
-    if mismatch != 0 {
-        return Err(format!(
-            "rom_set 0: lifted shadow differs from seabios chunk in {} bytes",
-            mismatch
-        ));
-    }
-
-    // 10 cases with CS1 high (bit 13 = 0x2000), then 3 with CS1 low for
-    // sanity. Each tuple is (pin_state, label).
-    let cases: &[(u16, &'static str)] = &[
-        // CS1 high (bit 13 set) — these are the empirical probe.
-        (0x2000, "cs1_high+all_low"),
-        (0x2001, "cs1_high+a0"),
-        (0x2A00, "cs1_high+pattern_2A00"),
-        (0xA000, "cs1_high+0xA000"),
-        (0xE000, "cs1_high+all_cs"),
-        (0x2002, "cs1_high+a1"),
-        (0x2100, "cs1_high+a8"),
-        (0x21FF, "cs1_high+0x21FF"),
-        (0x2FFF, "cs1_high+0x2FFF"),
-        (0xFFFF, "cs1_high+all_set"),
-        // CS1 low sanity (bit 13 clear).
-        (0x0000, "cs1_low+all_low"),
-        (0x00FF, "cs1_low+0x00FF"),
-        (0x1234, "cs1_low+0x1234"),
-    ];
-
-    println!();
-    println!(
-        "{:<28} {:<10} {:<10} {:<10} {}",
-        "label", "pin_state", "expected", "observed", "verdict"
-    );
-    println!("{}", "-".repeat(84));
-    let _ = std::io::stdout().flush();
-
-    let mut summary_cs1_high_pass = 0usize;
-    let mut summary_cs1_high_not_driven = 0usize;
-    let mut summary_cs1_high_no_stable = 0usize;
-    let mut summary_cs1_high_wrong = 0usize;
-    let mut summary_cs1_low_pass = 0usize;
-    let mut summary_cs1_low_other = 0usize;
-
-    for &(pin_state, label) in cases {
-        let cs1_high = (pin_state & CS1_BIT) != 0;
-        let case = if cs1_high {
-            onerom_serving_oracle::Case::raw_pin_state_unmasked(label, pin_state)
-        } else {
-            onerom_serving_oracle::Case::raw_pin_state(label, pin_state)
-        };
-        let result = oracle.run_case(&mut emu, case);
-        let expected = chunk[pin_state as usize];
-        let observed_str = match result.observed_byte {
-            Some(b) => format!("0x{:02X}", b),
-            None => "-".to_string(),
-        };
-        let verdict_str = match result.verdict {
-            CpuVerdict::Pass => {
-                if cs1_high {
-                    summary_cs1_high_pass += 1;
-                } else {
-                    summary_cs1_low_pass += 1;
-                }
-                "Pass".to_string()
-            }
-            CpuVerdict::WrongByte { expected: e, observed } => {
-                if cs1_high {
-                    summary_cs1_high_wrong += 1;
-                } else {
-                    summary_cs1_low_other += 1;
-                }
-                format!("WrongByte(exp=0x{:02X},obs=0x{:02X})", e, observed)
-            }
-            CpuVerdict::NoStableByte => {
-                if cs1_high {
-                    summary_cs1_high_no_stable += 1;
-                } else {
-                    summary_cs1_low_other += 1;
-                }
-                "NoStableByte".to_string()
-            }
-            CpuVerdict::DataPinsNotDriven => {
-                if cs1_high {
-                    summary_cs1_high_not_driven += 1;
-                } else {
-                    summary_cs1_low_other += 1;
-                }
-                "DataPinsNotDriven".to_string()
-            }
-            CpuVerdict::LatencyOutOfEnvelope { .. } => {
-                if cs1_high {
-                    summary_cs1_high_wrong += 1;
-                } else {
-                    summary_cs1_low_other += 1;
-                }
-                "LatencyOutOfEnvelope".to_string()
-            }
-        };
-        println!(
-            "{:<28} 0x{:04X}     0x{:02X}       {:<10} {}",
-            label, pin_state, expected, observed_str, verdict_str
-        );
-        let _ = std::io::stdout().flush();
-    }
-
-    println!();
-    println!("=== summary ===");
-    println!("CS1=high (10 cases):");
-    println!("  Pass              = {}", summary_cs1_high_pass);
-    println!("  DataPinsNotDriven = {}", summary_cs1_high_not_driven);
-    println!("  NoStableByte      = {}", summary_cs1_high_no_stable);
-    println!("  WrongByte/other   = {}", summary_cs1_high_wrong);
-    println!("CS1=low  (3 cases):");
-    println!("  Pass              = {}", summary_cs1_low_pass);
-    println!("  other             = {}", summary_cs1_low_other);
-    println!();
-    if summary_cs1_high_pass == 10 {
-        println!(
-            "VERDICT: firmware serves regardless of CS1. \
-             The skip-CS1=high logic is overly conservative; \
-             removing it would extend coverage from 128 KiB to 256 KiB per fixture."
-        );
-    } else if summary_cs1_high_not_driven + summary_cs1_high_no_stable == 10 {
-        println!(
-            "VERDICT: firmware tristates D0..D7 when CS1 is high. \
-             The skip-CS1=high logic is correct; \
-             max coverage is 128 KiB per fixture (need 2 fixtures for 256 KiB SeaBIOS)."
-        );
-    } else {
-        println!(
-            "VERDICT: mixed — see per-case lines. \
-             Cannot conclude firmware policy from this probe alone."
-        );
-    }
-    let _ = std::io::stdout().flush();
-
-    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -492,17 +333,18 @@ fn main() -> ExitCode {
         }
     };
 
+    eprintln!(
+        "seabios_fixture_byte_correct: bootrom={} fixture={} seabios={}",
+        std::path::Path::new(BOOTROM_PATH).display(),
+        cli.fixture.display(),
+        cli.seabios.display()
+    );
+
     println!("fixture: {}", cli.fixture.display());
     println!("seabios: {}", cli.seabios.display());
     println!(
         "mode:    {}",
-        if cli.probe_cs1 {
-            "probe-cs1"
-        } else if cli.smoke {
-            "smoke"
-        } else {
-            "full"
-        }
+        if cli.smoke { "smoke" } else { "full" }
     );
     let _ = std::io::stdout().flush();
 
@@ -525,16 +367,6 @@ fn main() -> ExitCode {
         return ExitCode::from(3);
     }
 
-    if cli.probe_cs1 {
-        return match run_probe_cs1(&flash, &seabios) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("probe-cs1 failed: {e}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
     // Smoke runs all 4 sets with the first 256 pin states each — fast
     // spot check that exercises every set's serve path against (often)
     // non-zero shadow data; the full run drives every 16-bit pin state
@@ -555,7 +387,7 @@ fn main() -> ExitCode {
                 grand.no_stable += t.no_stable;
                 grand.not_driven += t.not_driven;
                 grand.latency_oor += t.latency_oor;
-                grand.skipped_cs1 += t.skipped_cs1;
+                grand.unservable_cs1 += t.unservable_cs1;
                 if grand.first_wrong.is_none() {
                     grand.first_wrong = t.first_wrong;
                 }
@@ -570,14 +402,30 @@ fn main() -> ExitCode {
         }
     }
 
+    let total_cases = grand.pass
+        + grand.wrong
+        + grand.no_stable
+        + grand.not_driven
+        + grand.latency_oor
+        + grand.unservable_cs1;
     println!();
     println!("=== grand total ===");
-    println!("  pass        = {}", grand.pass);
-    println!("  wrong       = {}", grand.wrong);
-    println!("  no_stable   = {}", grand.no_stable);
-    println!("  not_driven  = {}", grand.not_driven);
-    println!("  latency_oor = {}", grand.latency_oor);
-    println!("  skipped_cs1 = {}  (CS1=high → firmware tristates data)", grand.skipped_cs1);
+    println!("  pass            = {}  (= {} KiB byte-correct verified)", grand.pass, grand.pass / 1024);
+    println!("  wrong           = {}", grand.wrong);
+    println!("  no_stable       = {}", grand.no_stable);
+    println!("  not_driven      = {}", grand.not_driven);
+    println!("  latency_oor     = {}", grand.latency_oor);
+    println!(
+        "  unservable_cs1  = {}  (firmware tristates D0..D7 at CS1=high — bytes are present in the fixture but unreachable through the existing serve loop)",
+        grand.unservable_cs1
+    );
+    println!(
+        "fixture capacity  = {} bytes ({} KiB), serve coverage = {} bytes ({} KiB)",
+        total_cases,
+        total_cases / 1024,
+        grand.pass,
+        grand.pass / 1024
+    );
     if let Some((p, e, o)) = grand.first_wrong {
         println!(
             "  first wrong overall: pin_state=0x{:04X} expected=0x{:02X} observed=0x{:02X}",
