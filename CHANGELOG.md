@@ -6,8 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for published crates.
 
+Per-crate version numbers reflect the workspace's pre-public iteration
+history rather than restarting at `0.1.0`. Each crate's own `[package]
+version` was bumped in line with the user CLAUDE.md per-file
+semantic-versioning convention as the workspace evolved; the inaugural
+public release simply ships those current versions.
+
 ## [Unreleased]
 
-### Added
+## [Initial public release] — 2026-05-03
 
-- Initial public release of the picoem workspace as open source.
+First publication of the picoem workspace as open source under the
+dual MIT OR Apache-2.0 license.
+
+### Crates published to crates.io
+
+| Crate | Version | Notes |
+|---|---|---|
+| `picoem-common` | `0.1.2` | Shared primitives: `Memory`, `ClockTree`, `Pacer`, PIO building blocks, threading helpers. |
+| `picoem-devices` | `0.1.1` | Off-chip device models: PSRAM, LCD, I2S capture. |
+| `rp2350-emu` | `0.1.3` | RP2350 / RP2354 emulator library (dual Cortex-M33 + PIO + FPU). |
+| `rp2040-emu` | `0.1.2` | RP2040 emulator library (dual Cortex-M0+ + PIO). |
+| `picoem-debug` | `0.1.0` | Placeholder for the future GDB RSP server / debug tooling. |
+| `rp2350-emu-tui` | `0.1.1` | Interactive ratatui/crossterm TUI for `rp2350-emu`. |
+| `rp2040-emu-tui` | `0.1.1` | Interactive ratatui/crossterm TUI for `rp2040-emu`. |
+
+### Not published
+
+- `picoem-harness` — internal differential-test binaries; depends on a
+  patched probe-rs and uses path-only deps with crate-private features.
+  `publish = false` in its manifest. Namespace squat handled separately
+  per OSS-release HLD §13.7.
+- `epio-sys` — `-sys` belongs to the upstream `piersfinlayson/epio`
+  project; not squatted.
+
+### What's in scope for V1
+
+See the workspace [README](README.md) and per-crate READMEs for the
+modelled feature set. Differential validation against QEMU (Cortex-M33,
+Cortex-M0, RV32IMC-Zba-Zbb-Zbs) and against real RP2354 / RP2040 silicon
+via probe-rs. Phases 1–7 of the workspace restructure complete.
+
+### Acknowledgements
+
+- Raspberry Pi Ltd for the RP2350 and RP2040 bootroms (BSD-3-Clause).
+- The `probe-rs` project — vendored fork carrying a small DPv1
+  cache-upgrade workaround for upstream issue #3872.
+- The Rust embedded ecosystem — `rp235x-hal`, `rp2040-hal`, and the
+  Cortex-M tooling crates that informed our naming and API choices.

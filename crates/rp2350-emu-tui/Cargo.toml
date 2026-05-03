@@ -4,12 +4,19 @@ version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Interactive ratatui/crossterm TUI for the rp2350-emu Raspberry Pi RP2350/RP2354 emulator: register/memory/trace inspection and firmware loading."
+repository = "https://github.com/0x4D44/picoem"
+homepage = "https://github.com/0x4D44/picoem"
+documentation = "https://docs.rs/rp2350-emu-tui"
+readme = "README.md"
+keywords = ["emulator", "rp2350", "rp2354", "tui", "pico"]
+categories = ["emulators", "embedded", "command-line-utilities"]
 
 [lints]
 workspace = true
 
 [dependencies]
-rp2350-emu = { path = "../rp2350-emu", features = ["threading"] }
+rp2350-emu = { version = "0.1", path = "../rp2350-emu", features = ["threading"] }
 ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"

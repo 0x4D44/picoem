@@ -1,34 +1,65 @@
 # rp2350-emu-tui
 
-Interactive TUI (ratatui/crossterm) for the `rp2350-emu` RP2350 / RP2354
-emulator: register / memory / trace inspection and firmware loading for
-the dual-core Cortex-M33 complex.
+[![Crates.io](https://img.shields.io/crates/v/rp2350-emu-tui.svg)](https://crates.io/crates/rp2350-emu-tui)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
 
-## RISC-V (Hazard3) — library only in P5
+Interactive terminal UI for the
+[`rp2350-emu`](https://crates.io/crates/rp2350-emu) Raspberry Pi
+RP2350 / RP2354 emulator (dual Arm Cortex-M33 + PIO + FPU).
 
-As of Phase 5 of the RISC-V Hazard3 HLD
-(`wrk_docs/2026.04.17 - HLD - RP2350 RISC-V Hazard3 Core Support.md`),
-the `rp2350-emu` library can construct a RISC-V emulator via
+Built with [ratatui](https://ratatui.rs/) and
+[crossterm](https://github.com/crossterm-rs/crossterm). Boots a real
+Raspberry Pi bootrom + ARMv8-M firmware image and lets you step the
+machine, inspect register / memory / trace state, and watch GPIO from a
+plain terminal.
 
-```rust
-let mut emu = EmulatorBuilder::new(Config::default())
-    .arch(Arch::RiscV)
-    .build();
+## Install
+
+```bash
+cargo install rp2350-emu-tui
 ```
 
-and run bare-asm `rv32i` firmware (e.g. `roms/rp2350/blinky-riscv.bin`
-from `gen_blinky_riscv.py`). The integration smoke test lives at
-`crates/rp2350-emu/tests/hello_riscv_blinky.rs`.
+Then point it at a bootrom + firmware image. See the
+[picoem repo](https://github.com/0x4D44/picoem) for ready-to-run
+bootrom and demo firmware (blinky, LCD demo, benchmark stubs).
 
-**This TUI is Arm-specific.** Its panels render Cortex-M33 state —
-FPU, RCP, DCP, banked SP, secure / non-secure context, xPSR, ARMv8-M
-exception entry diagnostics — that have no Hazard3 analogue. Wiring up
-an `--arch riscv` flag here would need a parallel panel set for Hazard3
-state (x0..x31, `mstatus`, `mcause`, `mepc`, the `xh3irq` CSR window,
-`mcycle`/`minstret`, `wfi` park flag) as well as dispatch-by-`Arch` in
-every existing panel.
+## What it shows
 
-P5 deliberately ships the library and smoke firmware only. The TUI
-integration is **a follow-up phase**; until it lands, use the library
-API directly from a test or a small custom binary if you need to drive a
-Hazard3 emulator interactively.
+- Per-core Cortex-M33 register file (R0..R15, xPSR, banked SP, CONTROL).
+- VFPv5 single-precision FPU register file (S0..S31), with FPCCR/FPCAR
+  diagnostics for lazy FP context save.
+- DCP / RCP coprocessor state (CP4/CP5/CP7).
+- ARMv8-M exception entry diagnostics — vector table, EXC_RETURN,
+  Secure / Non-Secure context, NVIC priority.
+- Memory dump windows (ROM, SRAM, XIP flash) and a streaming
+  instruction trace.
+
+## RISC-V (Hazard3)
+
+The underlying `rp2350-emu` library can construct a RISC-V Hazard3
+emulator (per Phase 5 of the Hazard3 HLD). **This TUI is Arm-specific** —
+its panels render Cortex-M33 state that has no Hazard3 analogue. If you
+need an interactive RISC-V driver today, use the library API directly.
+
+## Workspace context
+
+Part of the [picoem](https://github.com/0x4D44/picoem) workspace, which
+also publishes:
+
+- [`rp2350-emu`](https://crates.io/crates/rp2350-emu) — the underlying RP2350 emulator library.
+- [`rp2040-emu`](https://crates.io/crates/rp2040-emu) — RP2040 (Cortex-M0+) emulator.
+- [`rp2040-emu-tui`](https://crates.io/crates/rp2040-emu-tui) — RP2040 sibling of this TUI.
+
+## License
+
+Dual-licensed under either:
+
+- Apache License, Version 2.0
+- MIT license
+
+at your option.
+
+*Raspberry Pi*, *RP2350*, and *RP2354* are trademarks of Raspberry Pi
+Ltd. *Arm* and *Cortex-M33* are trademarks or registered trademarks of
+Arm Limited. This project is independent and not affiliated with or
+endorsed by either company.

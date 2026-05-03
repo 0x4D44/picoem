@@ -4,6 +4,13 @@ version = "0.38.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Internal test-binary crate. Depends on the patched probe-rs (workspace
+# `[patch.crates-io]`) and uses path-only deps to its sibling library
+# crates with `test-hooks` features that are not part of any published
+# surface — it is not publishable in its current form. Per OSS-release
+# HLD §13.7, the namespace squat for `picoem-harness` is performed at
+# publish time via a temp-dir minimal stub, not from this manifest.
+publish = false
 
 [lints]
 workspace = true

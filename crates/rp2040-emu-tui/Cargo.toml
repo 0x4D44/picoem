@@ -4,13 +4,20 @@ version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Interactive ratatui/crossterm TUI for the rp2040-emu Raspberry Pi RP2040 emulator: register/memory/trace inspection and firmware loading."
+repository = "https://github.com/0x4D44/picoem"
+homepage = "https://github.com/0x4D44/picoem"
+documentation = "https://docs.rs/rp2040-emu-tui"
+readme = "README.md"
+keywords = ["emulator", "rp2040", "cortex-m0", "tui", "pico"]
+categories = ["emulators", "embedded", "command-line-utilities"]
 
 [lints]
 workspace = true
 
 [dependencies]
-rp2040-emu = { path = "../rp2040-emu", features = ["threading"] }
-picoem-devices = { path = "../picoem-devices" }
+rp2040-emu = { version = "0.1", path = "../rp2040-emu", features = ["threading"] }
+picoem-devices = { version = "0.1", path = "../picoem-devices" }
 ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"
