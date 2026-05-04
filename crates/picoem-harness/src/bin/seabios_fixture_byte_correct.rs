@@ -606,6 +606,35 @@ fn main() -> ExitCode {
     };
     println!("fixture: {} ({}-pin)", spec.label, spec.chip_pins);
 
+    // Guard: this binary is fire-24-a-only (per HLD §4.5). Two latent
+    // failure modes break silently if pointed at a fire-32-a fixture:
+    //  - `cs1_mask = spec.unservable_when_high as u16` zeroes out for
+    //    fire-32-a (`(1u64 << 16) as u16 == 0`), so every CS1=high case
+    //    in the sweep would slip through unmasked.
+    //  - The full sweep upper bound `pin_hi = 0x1_0000` covers only 16
+    //    of fire-32-a's 19 address pins — 7/8ths of the 32-pin address
+    //    space would never be tested.
+    // The fire-32-a path lands in a separate Stage 3 binary;
+    // hard-fail here so an accidental fixture swap is loud.
+    if spec.chip_pins != 24 {
+        eprintln!(
+            "ERROR: seabios_fixture_byte_correct is fire-24-a-only (chip_pins=24); \
+             got chip_pins={} from {}. A fire-32-a binary lands in Stage 3.",
+            spec.chip_pins,
+            cli.fixture.display(),
+        );
+        return ExitCode::from(2);
+    }
+    // Tight invariant for the `as u16` cast: fire-24-a's CS1 lives at
+    // GPIO13, so the mask fits in u16. Other 24-pin layouts that move
+    // CS1 to GPIO ≥ 16 would silently zero the mask under the same
+    // narrowing — assert here so we catch it loud.
+    debug_assert_eq!(
+        spec.unservable_when_high,
+        1u64 << 13,
+        "fire-24-a CS1 expected at GPIO13"
+    );
+
     if cli.probe_cs1_thorough {
         return match run_probe_cs1_thorough(&flash, &spec, &seabios) {
             Ok(()) => ExitCode::SUCCESS,

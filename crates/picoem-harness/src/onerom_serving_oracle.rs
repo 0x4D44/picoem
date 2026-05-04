@@ -554,6 +554,10 @@ impl ServingOracle {
     /// 1..3 are XOR/SET/CLR-on-write, not plain stores, and would
     /// silently corrupt the populate.
     pub fn populate_sram_from_shadow(&self, bus: &mut Bus) {
+        // fire-32-a's 524288-byte shadow lands in RP2350 SRAM with ~8 KiB
+        // headroom before colliding with sdrr_runtime_info at
+        // 0x2008_0000. Stage 3 will validate this empirically when the
+        // wide-bus path lands.
         for offset in 0..self.spec.shadow_size {
             bus.write8(SHADOW_BASE + offset as u32, self.rom_shadow[offset], 0);
         }

@@ -22,13 +22,13 @@
 //! 27C010 (17 native pins) on the same fire-32-a socket would yield
 //! `addr_pins.len() == 17` even though the socket exposes 19 lines.
 //!
-//! Stage 1 (this module): introduces [`FixtureSpec`] + [`FixtureSpec::from_flash`]
-//! and consolidates the SDRR metadata helpers ([`parse_rom_set_layout`],
+//! Stage 1 introduced [`FixtureSpec`] + [`FixtureSpec::from_flash`] and
+//! consolidated the SDRR metadata helpers ([`parse_rom_set_layout`],
 //! [`RomSetSlot`], the `SDRR_INFO_*` / `METADATA_HEADER_*` / `ROM_SET_*`
-//! constants, [`FLASH_BASE`]) here. The legacy
-//! `crates/picoem-harness/src/onerom_serving_oracle.rs` re-exports the
-//! moved items as a Stage-1 compatibility shim; Stage 2 collapses those
-//! re-exports.
+//! constants, [`FLASH_BASE`]) here. Stage 2 widened the serving oracles
+//! to consume `FixtureSpec` directly and collapsed the legacy
+//! `onerom_serving_oracle.rs` re-export shim; this module now owns the
+//! metadata helpers outright.
 
 use std::error::Error;
 use std::fmt;
@@ -393,6 +393,21 @@ impl FixtureSpec {
                 });
             }
             data_pins[ii] = pin;
+        }
+
+        // 4a. Reject non-contiguous data layouts. Both serving oracles
+        // compute the served byte as `(gpio_in >> data_pins[0]) & 0xFF`,
+        // which only holds when D0..D7 land on consecutive GPIOs. Both
+        // known fixtures satisfy this (fire-24-a: 16..=23; fire-32-a:
+        // 0..=7), so the check is non-breaking; it traps any future
+        // fixture variant that splits the byte across non-adjacent pins
+        // before the silent miscompose reaches the byte-correct sweep.
+        for ii in 1..8 {
+            if data_pins[ii] != data_pins[0].wrapping_add(ii as u8) {
+                return Err(FixtureError::UnknownLayout {
+                    reason: "data pins must be contiguous (D0..D7 on consecutive GPIOs)",
+                });
+            }
         }
 
         // 5. addr[16] then addr2[16], scanning up to the first 0xFF
@@ -960,5 +975,208 @@ mod tests {
             Err(FixtureError::UnknownLayout { .. }) => {}
             other => panic!("expected UnknownLayout for chip_pins=28, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_flash_rejects_non_contiguous_data_pins() {
+        // Both serving oracles compose the served byte by shifting
+        // `gpio_in >> data_pins[0]` and masking to 8 bits — that's only
+        // correct when D0..D7 are consecutive. The synth helper sets
+        // data[] to 10..=17; perturb data[3] off the consecutive line
+        // and expect UnknownLayout.
+        let mut flash = synth_fixture_flash();
+        flash[0x1000 + SDRR_PINS_DATA_OFFSET + 3] = 25;
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::UnknownLayout { reason }) => {
+                assert!(
+                    reason.contains("contiguous"),
+                    "reason should mention contiguity; got {reason:?}"
+                );
+            }
+            other => panic!("expected UnknownLayout for non-contiguous data pins, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Tests for lift_shadow_from_flash + parse_rom_set_layout, ported
+    // from the pre-Stage-2 onerom_serving_oracle.rs (commit de64969). The
+    // helpers moved into this module during Stage 1; these tests guard
+    // the move.
+    // -------------------------------------------------------------------
+
+    /// Per-set shadow size used by the multi-set synth helper. Distinct
+    /// from `synth_fixture_flash`'s 0x1_0000-byte single-set layout (the
+    /// two-set helper places data at 0x1_0000 and 0x2_0000, so the
+    /// 192 KiB blob has room for both).
+    const SYNTH_TWO_SET_SHADOW_SIZE: usize = 0x1_0000;
+
+    /// Build a synthetic flash blob with `rom_set_count` SDRR ROM sets.
+    /// Mirrors the `synth_flash` helper that lived in the pre-Stage-2
+    /// `onerom_serving_oracle.rs`. Set 0's data lands at flash offset
+    /// 0x2_0000 with byte pattern `j as u8`; set 1's data lands at
+    /// 0x1_0000 with pattern `(j as u8) + 0x80`. The deliberate
+    /// out-of-order layout (set 0 beyond set 1) confirms the parser
+    /// follows the per-set `data` pointer rather than assuming
+    /// contiguous packing.
+    fn synth_flash_two_set(rom_set_count: u8) -> Vec<u8> {
+        let mut flash = vec![0u8; 0x3_0000]; // 192 KiB, room for 2 sets
+        // sdrr_info_t.metadata_header at flash+0x200+44 → 0x1000_C000.
+        flash[SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET
+            ..SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET + 4]
+            .copy_from_slice(&(0x1000_C000u32).to_le_bytes());
+        // metadata_header.rom_set_count at 0xC000 + 20.
+        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = rom_set_count;
+        // metadata_header.rom_sets at 0xC000 + 24 → 0x1000_C100.
+        flash[0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET
+            ..0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET + 4]
+            .copy_from_slice(&(0x1000_C100u32).to_le_bytes());
+        // Two sdrr_rom_set_t entries, stride 64 bytes.
+        for i in 0..2 {
+            let entry = 0xC100 + i * ROM_SET_STRIDE;
+            // data ptr: set 0 → 0x1002_0000, set 1 → 0x1001_0000.
+            let data_ptr = if i == 0 {
+                0x1002_0000u32
+            } else {
+                0x1001_0000u32
+            };
+            flash[entry + ROM_SET_DATA_PTR_OFFSET..entry + ROM_SET_DATA_PTR_OFFSET + 4]
+                .copy_from_slice(&data_ptr.to_le_bytes());
+            // size = SYNTH_TWO_SET_SHADOW_SIZE.
+            flash[entry + ROM_SET_SIZE_OFFSET..entry + ROM_SET_SIZE_OFFSET + 4]
+                .copy_from_slice(&(SYNTH_TWO_SET_SHADOW_SIZE as u32).to_le_bytes());
+        }
+        // Per-set ROM image: walking byte keyed on set index.
+        for j in 0..SYNTH_TWO_SET_SHADOW_SIZE {
+            flash[0x2_0000 + j] = j as u8; // set 0
+            flash[0x1_0000 + j] = (j as u8).wrapping_add(0x80); // set 1
+        }
+        flash
+    }
+
+    /// Build a `FixtureSpec` with the same `shadow_size` the multi-set
+    /// helper generates. `lift_shadow_from_flash` only consumes
+    /// `spec.shadow_size`, so other fields can be defaulted.
+    fn synth_two_set_spec() -> FixtureSpec {
+        FixtureSpec {
+            label: "synth/0x10000",
+            chip_pins: 24,
+            addr_pins: vec![],
+            data_pins: [0; 8],
+            cs1: 0,
+            asserted_low_during_read: vec![],
+            deasserted_high_during_read: vec![],
+            unservable_when_high: 0,
+            shadow_size: SYNTH_TWO_SET_SHADOW_SIZE,
+        }
+    }
+
+    /// `lift_shadow_from_flash` follows the SDRR struct chain and
+    /// returns the selected set's bytes. Exercises the parser with a
+    /// synthetic two-set flash blob — no emulator in the loop.
+    #[test]
+    fn lift_shadow_from_flash_happy_path() {
+        let flash = synth_flash_two_set(2);
+        let spec = synth_two_set_spec();
+
+        // Set 0 → pattern (j as u8).
+        let s0 = lift_shadow_from_flash(&flash, 0, &spec).expect("set 0");
+        for i in 0..SYNTH_TWO_SET_SHADOW_SIZE {
+            assert_eq!(
+                s0[i], i as u8,
+                "set 0 shadow[{}] = 0x{:02X}, expected 0x{:02X}",
+                i, s0[i], i as u8
+            );
+        }
+
+        // Set 1 → pattern (j as u8) + 0x80.
+        let s1 = lift_shadow_from_flash(&flash, 1, &spec).expect("set 1");
+        for i in 0..SYNTH_TWO_SET_SHADOW_SIZE {
+            let want = (i as u8).wrapping_add(0x80);
+            assert_eq!(
+                s1[i], want,
+                "set 1 shadow[{}] = 0x{:02X}, expected 0x{:02X}",
+                i, s1[i], want
+            );
+        }
+    }
+
+    /// `lift_shadow_from_flash` returns `None` when `rom_set_index`
+    /// is out of range. Protects against the firmware-not-yet-initialised
+    /// case where `rom_set_index == 0xFF` and naively indexing would
+    /// walk off the end of the array.
+    #[test]
+    fn lift_shadow_rejects_out_of_range_index() {
+        let flash = synth_flash_two_set(2);
+        let spec = synth_two_set_spec();
+        assert!(
+            lift_shadow_from_flash(&flash, 2, &spec).is_none(),
+            "index 2 must be rejected (count = 2)"
+        );
+        assert!(
+            lift_shadow_from_flash(&flash, 0xFF, &spec).is_none(),
+            "index 0xFF must be rejected"
+        );
+    }
+
+    /// `lift_shadow_from_flash` returns `None` on a malformed blob
+    /// (here: truncated so the metadata_header pointer reads past EOF).
+    /// Callers must never panic on a bad fixture.
+    #[test]
+    fn lift_shadow_rejects_truncated_flash() {
+        let flash = vec![0u8; 0x300]; // only ~sdrr_info_t bytes; no metadata.
+        let spec = synth_two_set_spec();
+        assert!(lift_shadow_from_flash(&flash, 0, &spec).is_none());
+    }
+
+    /// `parse_rom_set_layout` walks the SDRR struct chain and returns one
+    /// `RomSetSlot` per declared ROM set, with descriptor / data offsets
+    /// matching what `lift_shadow_from_flash` would resolve internally.
+    #[test]
+    fn parse_rom_set_layout_happy_path() {
+        let flash = synth_flash_two_set(2);
+        let layout = parse_rom_set_layout(&flash).expect("layout must parse");
+        assert_eq!(layout.len(), 2);
+
+        // Set 0: data ptr = 0x1002_0000 → off 0x2_0000.
+        // Set 1: data ptr = 0x1001_0000 → off 0x1_0000.
+        // Stride = 64; rom_sets array starts at 0xC100 in the synth blob.
+        assert_eq!(layout[0].descriptor_offset, 0xC100);
+        assert_eq!(layout[0].data_offset, 0x2_0000);
+        assert_eq!(layout[0].size, SYNTH_TWO_SET_SHADOW_SIZE);
+
+        assert_eq!(layout[1].descriptor_offset, 0xC100 + ROM_SET_STRIDE);
+        assert_eq!(layout[1].data_offset, 0x1_0000);
+        assert_eq!(layout[1].size, SYNTH_TWO_SET_SHADOW_SIZE);
+    }
+
+    /// Truncated flash (smaller than the metadata pointer target) must
+    /// return `None` — same conservative behaviour as
+    /// `lift_shadow_from_flash`.
+    #[test]
+    fn parse_rom_set_layout_rejects_truncated_flash() {
+        let flash = vec![0u8; 512];
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// A `rom_set_count` of zero is malformed (the firmware would
+    /// dereference rom_sets[0] regardless), so the parser must
+    /// surface it as a parse failure rather than `Some(vec![])`.
+    #[test]
+    fn parse_rom_set_layout_rejects_zero_count() {
+        let mut flash = synth_flash_two_set(2);
+        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = 0;
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// A `size` field that overruns the flash image must be rejected
+    /// (otherwise a downstream copy could walk off the end).
+    #[test]
+    fn parse_rom_set_layout_rejects_oversize_size_field() {
+        let mut flash = synth_flash_two_set(2);
+        let entry_off = 0xC100; // set 0
+        let bad_size = (flash.len() as u32) + 1;
+        flash[entry_off + ROM_SET_SIZE_OFFSET..entry_off + ROM_SET_SIZE_OFFSET + 4]
+            .copy_from_slice(&bad_size.to_le_bytes());
+        assert!(parse_rom_set_layout(&flash).is_none());
     }
 }
