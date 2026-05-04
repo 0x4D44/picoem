@@ -66,6 +66,10 @@ for the reproduction recipe and pin-map notes.
 | `sources/seabios-32-27c020.json` | OneROM source config used to generate the fixture | `7c00bc8b559024779e6f18140cadfaa692449fd7f8c58642ef2151eefd3e3ccf` |
 | `sources/seabios-256k.bin` | Source SeaBIOS image referenced by the JSON config | `ae6f6aa973aaccc143f57aa960fb035fd9de4daee4ad0cd713322f8c259e7650` |
 
+The 128 KiB SeaBIOS SDRR package used by mddosem lives in the private
+`mddosem-corpus` repository under `roms/bios/seabios-128k/`; picoem keeps only
+the generic validator and parser support for 64/128/256 KiB SeaBIOS inputs.
+
 ## SeaBIOS image (`sources/seabios-256k.bin`)
 
 `sources/seabios-256k.bin` is a 256 KiB SeaBIOS x86 BIOS binary used by
