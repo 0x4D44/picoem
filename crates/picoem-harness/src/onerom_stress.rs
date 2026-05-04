@@ -16,7 +16,8 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::onerom_serving_oracle::{Case, CaseResult, SHADOW_SIZE, Verdict, stimulus_level_pub};
+use crate::onerom_fixture::FixtureSpec;
+use crate::onerom_serving_oracle::{Case, CaseResult, Verdict};
 
 // ---------------------------------------------------------------------------
 // Sweep generator
@@ -28,38 +29,40 @@ const SWEEP_START: u16 = 0x1800;
 const SWEEP_END: u16 = 0x1FFF;
 
 /// Static label used for every swept case. The sweep is dense — 2048
-/// entries, differentiated by `addr_bits` — so a per-case textual label
-/// would be noise; the driver binary surfaces `addr_bits` directly in
-/// per-failure lines.
+/// entries — so a per-case textual label would be noise; the driver
+/// binary surfaces the `pin_pattern` directly in per-failure lines.
 const SWEEP_LABEL: &str = "stress sweep";
 
-/// Generate the full 2048-entry `addr_bits ∈ 0x1800..=0x1FFF` sweep.
-///
-/// Each case reuses [`Case::new`] (same A11=A12=1 invariant assert as
-/// the 15-case [`DEFAULT_CASES`][crate::onerom_serving_oracle::DEFAULT_CASES]).
-/// The expected byte is *not* stored on `Case` — the driver computes it
-/// post-hoc via [`expected_byte_for`], which mirrors the evaluator's
-/// shadow index at `onerom_serving_oracle::evaluate_case_trace`.
-pub fn generate_sweep_cases() -> Vec<Case> {
+/// Generate the full 2048-entry `addr_bits ∈ 0x1800..=0x1FFF` sweep
+/// against `spec`. Each case is built via [`Case::from_addr`] so the
+/// per-fixture pin map drives the GPIO pattern.
+pub fn generate_sweep_cases(spec: &FixtureSpec) -> Vec<Case> {
     (SWEEP_START..=SWEEP_END)
-        .map(|addr_bits| Case::new(SWEEP_LABEL, addr_bits))
+        .map(|addr_bits| Case::from_addr(SWEEP_LABEL, addr_bits as u32, spec))
         .collect()
 }
 
-/// Expected byte for a given `addr_bits`, given the lifted shadow.
+/// Expected byte for a given `addr_bits`, given the lifted shadow + spec.
 ///
 /// Driver binaries (PIO/CPU stress) must call this rather than
 /// re-deriving the expected byte inline — keep the shadow-lookup
 /// formula in one place.
 ///
 /// Matches the lookup in `evaluate_case_trace`:
-/// `resolved = (0x2000 << 16) | (stimulus_level(addr_bits) & 0xFFFF)`,
+/// `resolved = (0x2000 << 16) | (stim_level & 0xFFFF)`,
 /// `expected = shadow[resolved - SHADOW_BASE]`, which for the current
-/// `SHADOW_BASE = 0x2000_0000` collapses to
-/// `shadow[stimulus_level(addr_bits) & 0xFFFF]`.
+/// `SHADOW_BASE = 0x2000_0000` collapses to `shadow[stim_level & 0xFFFF]`.
+/// The stim level is the case `pin_pattern` ORed with the
+/// deasserted-high CS pins from `spec.deasserted_high_during_read`.
 #[must_use]
-pub fn expected_byte_for(shadow: &[u8; SHADOW_SIZE], addr_bits: u16) -> u8 {
-    let idx = (stimulus_level_pub(addr_bits) & 0xFFFF) as usize;
+pub fn expected_byte_for(shadow: &[u8], addr_bits: u16, spec: &FixtureSpec) -> u8 {
+    let case = Case::from_addr("expected", addr_bits as u32, spec);
+    let mut stim: u64 = 0;
+    for &p in &spec.deasserted_high_during_read {
+        stim |= 1u64 << p;
+    }
+    stim |= case.pin_pattern;
+    let idx = (stim & 0xFFFF) as usize;
     shadow[idx]
 }
 
@@ -329,7 +332,7 @@ fn rom_speed_class(mean_ns: u32) -> &'static str {
 /// inline (no pretty-printing) so the driver's "first N failures"
 /// block stays compact.
 fn format_fail_line(r: &CaseResult) -> String {
-    let addr = format!("0x{:04X}", r.case.addr_bits);
+    let pattern = format!("0x{:08X}", r.case.pin_pattern as u32);
     let expected = match r.expected_byte {
         Some(b) => format!("0x{:02X}", b),
         None => "-".to_string(),
@@ -351,8 +354,8 @@ fn format_fail_line(r: &CaseResult) -> String {
         Verdict::LatencyOutOfEnvelope { .. } => "LatencyOutOfEnvelope".to_string(),
     };
     format!(
-        "  addr={} expected={} observed={} cycles={} verdict={}",
-        addr, expected, observed, cycles, verdict
+        "  pattern={} expected={} observed={} cycles={} verdict={}",
+        pattern, expected, observed, cycles, verdict
     )
 }
 
@@ -481,13 +484,29 @@ fn ns_to_us_f64(ns: u64) -> f64 {
 mod tests {
     use super::*;
     use crate::onerom_serving_oracle::SHADOW_BASE;
+    use std::path::PathBuf;
+
+    fn fire24a_fixture_path() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("fixtures");
+        p.push("onerom-fire-24-a-rp2350-seabios-cpu.bin");
+        p
+    }
+
+    fn fire24a_spec() -> FixtureSpec {
+        let p = fire24a_fixture_path();
+        let flash = std::fs::read(&p)
+            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
+        FixtureSpec::from_flash(&flash).expect("fire-24-a parse must succeed")
+    }
 
     /// Build a synthetic `Pass` CaseResult with a specific cycle count.
     /// Used to feed hand-crafted latency distributions into the
     /// histogram aggregator without spinning up an emulator.
     fn mk_pass_result(addr_bits: u16, cycles: u32) -> CaseResult {
+        let spec = fire24a_spec();
         CaseResult {
-            case: Case::new("test", addr_bits),
+            case: Case::from_addr("test", addr_bits as u32, &spec),
             resolved_addr: Some(SHADOW_BASE),
             expected_byte: Some(0x00),
             observed_byte: Some(0x00),
@@ -594,38 +613,49 @@ mod tests {
         assert_eq!(h5.p99_ns, 166, "n=5 → p99 = 25 cycles @ 150 MHz = 166 ns");
     }
 
-    /// Test C: the sweep covers every addr_bits from 0x1800 to 0x1FFF
-    /// inclusive, and the expected-byte helper looks up the shadow via
-    /// `stimulus_level_pub(addr_bits) & 0xFFFF`.
+    /// Test C: the sweep covers every addr in 0x1800..=0x1FFF inclusive,
+    /// and the expected-byte helper looks up the shadow via the
+    /// fixture-aware stim composition.
     #[test]
     fn generate_sweep_cases_covers_full_range() {
+        let spec = fire24a_spec();
         // Predictable pattern: shadow[i] = (i & 0xFF) as u8.
-        let mut shadow = Box::new([0u8; SHADOW_SIZE]);
-        for i in 0..SHADOW_SIZE {
+        let mut shadow = vec![0u8; spec.shadow_size].into_boxed_slice();
+        for i in 0..spec.shadow_size {
             shadow[i] = (i & 0xFF) as u8;
         }
 
-        let cases = generate_sweep_cases();
+        let cases = generate_sweep_cases(&spec);
         assert_eq!(cases.len(), 2048);
-        assert_eq!(cases.first().unwrap().addr_bits, 0x1800);
-        assert_eq!(cases.last().unwrap().addr_bits, 0x1FFF);
 
-        // Denseness: every addr_bits from 0x1800..=0x1FFF must be
-        // present exactly once, in order. Catches a broken generator
-        // that emits duplicates (e.g. [0x1800, 0x1FFF, 0x1FFF, ...]).
-        for (i, case) in cases.iter().enumerate() {
-            assert_eq!(case.addr_bits, 0x1800 + i as u16);
+        // Denseness: each pin_pattern appears exactly once. The
+        // 0x1800..=0x1FFF address range maps through `from_addr` to
+        // 2048 distinct patterns.
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for case in &cases {
+            assert!(
+                seen.insert(case.pin_pattern),
+                "duplicate pin_pattern 0x{:X}",
+                case.pin_pattern
+            );
         }
 
-        // Known case: addr_bits = 0x1802. The expected byte comes from
-        // the shadow at index `stimulus_level(0x1802) & 0xFFFF`.
+        // Known case: addr_bits = 0x1802. The expected byte must equal
+        // `shadow[(stim & 0xFFFF) as usize]` where stim composes
+        // deasserted-high pins + the case pattern.
         let addr_bits = 0x1802u16;
-        let expected_idx = (stimulus_level_pub(addr_bits) & 0xFFFF) as usize;
+        let case = Case::from_addr("test", addr_bits as u32, &spec);
+        let mut stim: u64 = 0;
+        for &p in &spec.deasserted_high_during_read {
+            stim |= 1u64 << p;
+        }
+        stim |= case.pin_pattern;
+        let expected_idx = (stim & 0xFFFF) as usize;
         let expected = shadow[expected_idx];
         assert_eq!(
-            expected_byte_for(&shadow, addr_bits),
+            expected_byte_for(&shadow, addr_bits, &spec),
             expected,
-            "expected byte must match shadow[stimulus_level(0x1802) & 0xFFFF]"
+            "expected byte must match shadow[stim_level(0x1802) & 0xFFFF]"
         );
     }
 
@@ -638,8 +668,9 @@ mod tests {
     #[test]
     fn histogram_unique_cycles_counts_distinct_buckets() {
         use crate::onerom_serving_oracle::Case;
+        let spec = fire24a_spec();
         let mk = |label: &'static str, addr: u16, cycles: u32| CaseResult {
-            case: Case::new(label, addr),
+            case: Case::from_addr(label, addr as u32, &spec),
             expected_byte: Some(0),
             observed_byte: Some(0),
             resolved_addr: None,

@@ -163,6 +163,7 @@ fn parse_cli() -> Result<Cli, String> {
 fn boot_sync(
     bootrom: &[u8],
     flash: &[u8],
+    spec: &picoem_harness::onerom_fixture::FixtureSpec,
 ) -> Result<
     (
         Emulator,
@@ -174,7 +175,7 @@ fn boot_sync(
     // Up-front shadow-lift sanity check: confirm the hardcoded ROM set
     // parses out of the fixture. None here is a loud early signal that
     // the fixture / ROM_SET_INDEX pair is wrong.
-    if onerom_serving_oracle::lift_shadow_from_flash_pub(flash, ROM_SET_INDEX).is_none() {
+    if picoem_harness::onerom_fixture::lift_shadow_from_flash(flash, ROM_SET_INDEX, spec).is_none() {
         return Err(format!(
             "failed to lift ROM set {} from fixture — wrong index or malformed flash",
             ROM_SET_INDEX
@@ -223,7 +224,8 @@ fn boot_sync(
 
     // Prime DMA + oracle after sync.
     glue.prime_after_sync(&mut emu.bus);
-    let oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, flash);
+    let oracle =
+        onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, spec.clone(), flash);
     oracle.populate_sram_from_shadow(&mut emu.bus);
 
     Ok((emu, glue, oracle))
@@ -314,7 +316,15 @@ fn main() -> ExitCode {
         }
     };
 
-    let (mut emu, mut glue, mut oracle) = match boot_sync(&bootrom, &flash) {
+    let spec = match picoem_harness::onerom_fixture::FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (mut emu, mut glue, mut oracle) = match boot_sync(&bootrom, &flash, &spec) {
         Ok(trio) => trio,
         Err(e) => {
             eprintln!("boot-sync failed: {}", e);
@@ -328,7 +338,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let cases = onerom_stress::generate_sweep_cases();
+    let cases = onerom_stress::generate_sweep_cases(&spec);
     let mut latencies: Vec<u32> = Vec::with_capacity(cases.len());
     let mut wrong_byte: u32 = 0;
     let mut no_resolve: u32 = 0;

@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use picoem_harness::onerom_serving_oracle::{SHADOW_SIZE, parse_rom_set_layout};
+use picoem_harness::onerom_fixture::{FixtureSpec, parse_rom_set_layout};
 
 const DEFAULT_TEMPLATE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -255,6 +255,16 @@ fn main() -> ExitCode {
     }
     println!("seabios sha256: {}", hex_digest(&actual_sha));
 
+    let spec = match FixtureSpec::from_flash(&fixture) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::from(3);
+        }
+    };
+    let shadow_size = spec.shadow_size;
+    println!("template fixture: {} ({}-pin), shadow_size=0x{:X}", spec.label, spec.chip_pins, shadow_size);
+
     let layout = match parse_rom_set_layout(&fixture) {
         Some(v) => v,
         None => {
@@ -271,10 +281,10 @@ fn main() -> ExitCode {
         return ExitCode::from(3);
     }
     for (k, slot) in layout.iter().enumerate() {
-        if slot.size != SHADOW_SIZE {
+        if slot.size != shadow_size {
             eprintln!(
-                "ROM set {} has size {} bytes; expected {} (SHADOW_SIZE)",
-                k, slot.size, SHADOW_SIZE
+                "ROM set {} has size {} bytes; expected {} (spec.shadow_size)",
+                k, slot.size, shadow_size
             );
             return ExitCode::from(3);
         }
@@ -326,20 +336,20 @@ fn main() -> ExitCode {
         layout.len()
     );
 
-    // Each ROM set k receives the k-th 64 KiB chunk of seabios.
+    // Each ROM set k receives the k-th `shadow_size`-byte chunk of seabios.
     // Direct copy — no permutation. Validator drives raw 16-bit GPIO
-    // states so `shadow[pin_state] == seabios[k * 0x10000 + pin_state]`.
+    // states so `shadow[pin_state] == seabios[k * shadow_size + pin_state]`.
     for (k, slot) in layout.iter().enumerate() {
-        let src_lo = k * SHADOW_SIZE;
-        let src_hi = src_lo + SHADOW_SIZE;
+        let src_lo = k * shadow_size;
+        let src_hi = src_lo + shadow_size;
         let dst_lo = slot.data_offset;
-        let dst_hi = dst_lo + SHADOW_SIZE;
+        let dst_hi = dst_lo + shadow_size;
         fixture[dst_lo..dst_hi].copy_from_slice(&seabios[src_lo..src_hi]);
     }
     println!(
         "patched {} ROM sets ({} bytes total)",
         layout.len(),
-        layout.len() * SHADOW_SIZE
+        layout.len() * shadow_size
     );
 
     if let Err(e) = std::fs::write(&cli.output, &fixture) {

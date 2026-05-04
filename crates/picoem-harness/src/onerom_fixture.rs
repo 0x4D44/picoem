@@ -575,6 +575,69 @@ fn addr2_field_name(ii: usize) -> &'static str {
 // SDRR struct chain helpers — moved verbatim from `onerom_serving_oracle.rs`.
 // ---------------------------------------------------------------------------
 
+/// Lift the per-set shadow from a loaded SDRR `.bin`.
+///
+/// Walks the SDRR struct chain (`sdrr_info_t` at `0x200` →
+/// `onerom_metadata_header_t` → `sdrr_rom_set_t[rom_set_index]`) to
+/// locate the selected ROM set's pre-processed image, then copies
+/// `spec.shadow_size` bytes into a heap-allocated buffer. This is the
+/// exact byte sequence `preload_rom_image` would have copied from
+/// flash to `rom_table` in SRAM — reading it from flash directly
+/// sidesteps the preload-not-done-at-sync problem (the DMA program
+/// never fires on our emulator).
+///
+/// Returns `None` on any parse failure (malformed struct pointer,
+/// `rom_set_index` out of range, source truncated). Callers fall back
+/// to a zero-filled shadow; the binary-level tripwire then surfaces
+/// the all-zero result via the `unique bytes == 1` warning.
+///
+/// Buffer length is exactly `spec.shadow_size`. Pre-Stage-2 the helper
+/// returned a fixed-size `Box<[u8; SHADOW_SIZE]>` clamped via
+/// `size.min(SHADOW_SIZE)`; Stage 2 honours the per-fixture shadow
+/// size verbatim so 27C020-class (512 KiB) fixtures can be lifted in
+/// full.
+pub fn lift_shadow_from_flash(
+    flash: &[u8],
+    rom_set_index: u8,
+    spec: &FixtureSpec,
+) -> Option<Box<[u8]>> {
+    let ptr_to_off = |ptr: u32| -> Option<usize> {
+        let off = (ptr.checked_sub(FLASH_BASE)?) as usize;
+        if off >= flash.len() { None } else { Some(off) }
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        let bytes = flash.get(off..off + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+
+    // sdrr_info_t at flash+0x200 → metadata_header pointer at +44.
+    let metadata_ptr = read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
+    let metadata_off = ptr_to_off(metadata_ptr)?;
+
+    // onerom_metadata_header_t: rom_set_count at +20, rom_sets ptr at +24.
+    let rom_set_count = *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)?;
+    if rom_set_index >= rom_set_count {
+        return None;
+    }
+    let rom_sets_ptr = read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
+    let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
+
+    // sdrr_rom_set_t[rom_set_index]: data ptr at +0, size at +4.
+    let set_off = rom_sets_off + (rom_set_index as usize) * ROM_SET_STRIDE;
+    let data_ptr = read_u32(set_off + ROM_SET_DATA_PTR_OFFSET)?;
+    let size = read_u32(set_off + ROM_SET_SIZE_OFFSET)? as usize;
+    let data_off = ptr_to_off(data_ptr)?;
+
+    // Allocate exactly `spec.shadow_size` bytes (no clamp). Copy up to
+    // the per-set declared `size`; zero-pad the tail if `size <
+    // spec.shadow_size` (defensive — not expected on conformant fixtures).
+    let copy_len = size.min(spec.shadow_size);
+    let src = flash.get(data_off..data_off + copy_len)?;
+    let mut shadow: Box<[u8]> = vec![0u8; spec.shadow_size].into_boxed_slice();
+    shadow[..copy_len].copy_from_slice(src);
+    Some(shadow)
+}
+
 /// Walk the SDRR struct chain (`sdrr_info_t` → `onerom_metadata_header_t`
 /// → `sdrr_rom_set_t[]`) and return one [`RomSetSlot`] per ROM set in
 /// the fixture, in declaration order. Inverse-of-author for

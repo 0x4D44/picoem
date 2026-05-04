@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use picoem_harness::onerom_fixture::FixtureSpec;
 use picoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_sync};
 use rp2350_emu::{Config, EmulatorBuilder};
 
@@ -131,10 +132,22 @@ fn main() -> ExitCode {
         );
     }
 
+    // Parse the FixtureSpec from the loaded flash before constructing
+    // the oracle. The same flash bytes are reused for the shadow lift.
+    let spec = match FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("fixture: {} ({}-pin)", spec.label, spec.chip_pins);
+
     // Prime the DMA and capture the SRAM shadow.
     glue.prime_after_sync(&mut emu.bus);
 
-    let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, &flash);
+    let mut oracle =
+        onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, spec.clone(), &flash);
 
     // Mirror the flash-parsed shadow into SRAM — emulates what the
     // firmware's `preload_rom_image` DMA would have done. Without this
@@ -156,7 +169,7 @@ fn main() -> ExitCode {
     println!(
         "shadow @ 0x{:08X}..+0x{:04X}: {} unique bytes",
         onerom_serving_oracle::SHADOW_BASE,
-        onerom_serving_oracle::SHADOW_SIZE,
+        spec.shadow_size,
         unique.len(),
     );
     if unique.len() == 1 {
@@ -180,9 +193,10 @@ fn main() -> ExitCode {
     // Per-case one-line output: operator sees progress even if a later
     // case hangs or crashes. Keep the format narrow enough that 15
     // lines fit on one screen.
-    let total = onerom_serving_oracle::DEFAULT_CASES.len();
+    let cases = onerom_serving_oracle::default_cases(&spec);
+    let total = cases.len();
     let mut wall_us: Vec<f64> = Vec::with_capacity(total);
-    for (idx, case) in onerom_serving_oracle::DEFAULT_CASES.iter().enumerate() {
+    for (idx, case) in cases.iter().enumerate() {
         let t0 = Instant::now();
         let result = oracle.run_case(&mut emu, &mut glue, *case);
         let elapsed_us = t0.elapsed().as_nanos() as f64 / 1000.0;
@@ -201,11 +215,11 @@ fn main() -> ExitCode {
             .map(|c| format!("{}", c))
             .unwrap_or_else(|| "—".to_string());
         println!(
-            "[{:>2}/{:>2}] {:<16} addr=0x{:04X} verdict={:<12} expected={} observed={} cycles={} wall={:.3} us",
+            "[{:>2}/{:>2}] {:<16} pat=0x{:08X} verdict={:<12} expected={} observed={} cycles={} wall={:.3} us",
             idx + 1,
             total,
             result.case.label,
-            result.case.addr_bits,
+            result.case.pin_pattern as u32,
             verdict_str,
             expected,
             observed,

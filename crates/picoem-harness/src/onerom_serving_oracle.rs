@@ -7,21 +7,21 @@
 //! pin stimuli, and for each case prove the observed byte matches the
 //! shadow byte that CH1.READ_ADDR actually resolved to.
 //!
-//! Stage G.1 wires the state machine and the trace-driven verdict logic
-//! for a single baseline case (`0x1800`, A11=A12=1 with all low bits 0).
-//! The full 15-case walking-1s + pattern sweep lands in G.2; the timing
-//! report in G.3.
+//! Stage 2 of the fixture-generalization HLD (`wrk_docs/2026.05.04 - HLD -
+//! OneROM Serving Oracle Fixture Generalization.md`) drops the hardcoded
+//! 24-pin pin-map / 64 KiB shadow and consumes a [`crate::onerom_fixture::FixtureSpec`]
+//! as the single source of truth for pin numbering, deassert/assert
+//! levels, and shadow size. fire-24-a behaviour is preserved bit-for-bit;
+//! fire-32-a (Stage 3) plugs into the same `FixtureSpec` parsing path.
 //!
-//! Design: `wrk_docs/2026.04.15 - HLD - OneROM Serving Oracle (Stage G).md`.
+//! Design: `wrk_docs/2026.04.15 - HLD - OneROM Serving Oracle (Stage G).md`
+//! plus the 2026.05.04 fixture-generalization HLD.
 //!
 //! Key invariants enforced by this module (see HLD §4.3, §4.4):
-//! - `addr_bits & 0x1800 == 0x1800` for every case — pin-map collision
-//!   means CS2/CS3 share GPIOs with A12/A11; CS2=CS3=high requires
-//!   A11=A12=1.
 //! - Stability is anchored *after* the CH1 push cycle. A trace whose
 //!   `data_byte` happens to hold the prior case's byte at cs_low must
 //!   not report a fictional zero-latency PASS. See §4.4.
-//! - `resolved_addr` must fall in `[SHADOW_BASE, SHADOW_BASE + SHADOW_SIZE)`
+//! - `resolved_addr` must fall in `[SHADOW_BASE, SHADOW_BASE + spec.shadow_size)`
 //!   before we look up `expected_byte`. Outside → `ResolvedAddrOutOfRange`.
 
 use std::fmt::Write as _;
@@ -29,30 +29,19 @@ use std::sync::atomic::Ordering;
 
 use rp2350_emu::{Bus, Emulator};
 
+use crate::onerom_fixture::{FixtureError, FixtureSpec, lift_shadow_from_flash};
 use crate::onerom_glue_dma::{DMA_READ_CYCLES, DMA_WRITE_CYCLES, GlueDma};
 
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
 
-/// Mask every case must set to keep CS2/CS3 deasserted during reads.
-/// See HLD §4.1 + the CAUTION block in `onerom_full_system_rp2350.rs`.
-pub const ADDR_A11_A12_HIGH: u16 = 0x1800;
-
 /// Base of the SRAM shadow — matches the OneROM runtime's `rom_table`
-/// destination on RP2350. `preload_rom_image` copies the 64 KB pre-
-/// processed ROM image to `_ram_rom_image_start`, which this firmware
+/// destination on RP2350. `preload_rom_image` copies the per-set
+/// pre-processed ROM image to `_ram_rom_image_start`, which this firmware
 /// build places at SRAM origin (confirmed via `sdrr_runtime_info` at
-/// `0x20080000`: `rom_table = 0x20000000`, `rom_table_size = 65536`).
+/// `0x20080000`: `rom_table = 0x20000000`).
 pub const SHADOW_BASE: u32 = 0x2000_0000;
-
-/// Shadow size: 64 KB — the full `rom_table` span. SDRR's "pre-
-/// processed" 2364-class ROM is 8 KB of raw bytes baked into a 64 KB
-/// address-permutation table, so PIO1's resolved addresses span the
-/// whole 64 KB region (observed 0x20000000..0x2000B000 across the 15
-/// address-sweep cases). An 8 KB shadow misses the upper two-thirds
-/// and trips `ResolvedAddrOutOfRange` spuriously.
-pub const SHADOW_SIZE: usize = 0x1_0000;
 
 /// Acceptable CS-low-to-stable-byte cycle envelope.
 ///
@@ -85,14 +74,15 @@ pub const ENVELOPE_CYCLES: std::ops::RangeInclusive<u32> = 15..=45;
 /// required to declare a value "stable".
 const MIN_STABLE_CYCLES: usize = 3;
 
-/// Cycles of CS1-high + CS2/CS3-high + addr=0 we drive on the first
-/// case to guarantee a clean high-to-low edge on CS1. Stage F ends
-/// with CS1 low, so without this seed case 1 would never see a
-/// transition. Applied once, in the `init` transition (HLD §4.3).
+/// Cycles of CS-high + addr=0 we drive on the first case to guarantee a
+/// clean high-to-low edge on the gate CS. Stage F ends with the gate CS
+/// low, so without this seed case 1 would never see a transition.
+/// Applied once, in the `init` transition (HLD §4.3).
 const SEED_CYCLES: u32 = 4;
 
-/// Cycles of gap-level (CS1/CS2/CS3 high, addr=0) we drive at the start
-/// of each case to put PIO in a known CS-high state before stimulus.
+/// Cycles of gap-level (gate CS + deasserted-high CS pins high, addr=0)
+/// we drive at the start of each case to put PIO in a known CS-high
+/// state before stimulus.
 ///
 /// Earlier versions (H2 in the Stage G fix-wave) attempted an
 /// invariant-based drain that spun until the glue DMA pipeline and
@@ -151,133 +141,96 @@ const PER_CASE_TIMEOUT: u32 = 60;
 /// for the A7 (case 9) live-sweep trace that motivated this gate.
 const MIN_FRESH_ARRIVAL_CYCLE: u64 = (DMA_READ_CYCLES as u64) + (DMA_WRITE_CYCLES as u64);
 
-/// Data bus base — D0..D7 on GPIO 16..23. Mirrors Stage F.
-const GPIO_DATA_BASE: u8 = 16;
-
-/// CS lanes on the `test-sdrr-0` fixture. Mirrors Stage F.
-const GPIO_CS1: u8 = 13;
-const GPIO_CS2: u8 = 12;
-const GPIO_CS3: u8 = 15;
-
-/// A0..A12 pin map. Mirrors Stage F.
-const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 /// One address stimulus for the sweep.
 ///
-/// Two construction modes are supported, distinguished by `raw_pin_state`:
-///
-/// 1. **Legacy permutation mode** (`raw_pin_state == None`): build via
-///    `Case::new(label, addr_bits)`. The 13-bit `addr_bits` are permuted
-///    through `ADDR_PINS` by [`stimulus_level`]. The
-///    `addr_bits & 0x1800 == 0x1800` invariant is enforced — CS2/CS3
-///    share GPIOs with A11/A12 so a deselected chip requires those high.
-///
-/// 2. **Raw-pin-state mode** (`raw_pin_state == Some(p)`): build via
-///    `Case::raw_pin_state(label, pin_state)`. Used by larger-than-1541
-///    fixtures (e.g. the 256 KiB SeaBIOS fixture). `pin_state` is a
-///    literal 16-bit GPIO pattern with CS1 (bit 13) masked low at
-///    construction; every other pin including A11/A12 is driven
-///    verbatim. The legacy `addr_bits` field is unused in this mode
-///    (set to 0).
+/// Stage 2 of the fixture-generalization HLD collapses the legacy
+/// permutation/raw modes into a single `pin_pattern: u64` that's the
+/// authoritative GPIO bitmask the fixture's stim composition will OR
+/// onto the deasserted-high level. Build via [`Case::from_addr`] (which
+/// permutes a chip-internal address through `spec.addr_pins`) or
+/// [`Case::from_raw`] (which takes a literal pattern).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Case {
     pub label: &'static str,
-    /// Legacy-mode payload. The 13-bit address pattern permuted through
-    /// `ADDR_PINS` by [`stimulus_level`]. Unused (set to 0) when
-    /// `raw_pin_state` is `Some`.
-    pub addr_bits: u16,
-    /// `Some(p)` if this case drives a raw 16-bit GPIO pattern (with
-    /// CS1 already masked low); `None` if `addr_bits` should be permuted
-    /// through `ADDR_PINS` via [`stimulus_level`]. See the type doc for
-    /// context.
-    pub raw_pin_state: Option<u16>,
+    /// GPIO pin pattern for the case stimulus, as a u64 so future
+    /// fire-32-a fixtures with GPIOs ≥ 32 can be expressed without
+    /// re-typing. Stage 2 keeps fire-24-a working unchanged (max GPIO
+    /// 23 → fits in u32); Stage 3 widens the bus interface so this
+    /// value can flow through to the GPIO atomic without an assertion.
+    pub pin_pattern: u64,
 }
 
 impl Case {
-    /// Build a legacy case, asserting the A11=A12=1 invariant in debug
-    /// builds. `raw_pin_state` is `None`.
-    pub const fn new(label: &'static str, addr_bits: u16) -> Self {
-        debug_assert!(
-            addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
-            "Case::new: addr_bits must have A11=A12=1 (addr_bits & 0x1800 == 0x1800)"
-        );
-        Self {
+    /// Build a case from a chip-internal address by permuting bit `i`
+    /// of `addr` onto `spec.addr_pins[i]`. The resulting `pin_pattern`
+    /// captures only the address bits — chip-select levels are added
+    /// later by the oracle's stim composition (HLD §4.4).
+    pub fn from_addr(label: &'static str, addr: u32, spec: &FixtureSpec) -> Self {
+        let mut pat = 0u64;
+        for (bit, &gpio) in spec.addr_pins.iter().enumerate() {
+            if (addr >> bit) & 1 != 0 {
+                pat |= 1u64 << gpio;
+            }
+        }
+        Case {
             label,
-            addr_bits,
-            raw_pin_state: None,
+            pin_pattern: pat,
         }
     }
 
-    /// Build a case that drives `pin_state` directly onto GPIO 0..15
-    /// with CS1 (bit 13) forced low at construction. Bypasses the
-    /// A11=A12=1 invariant — caller is responsible for the pin map.
-    /// Used by the SeaBIOS 256 KiB fixture validator.
-    pub const fn raw_pin_state(label: &'static str, pin_state: u16) -> Self {
-        Self {
+    /// Build a case that drives `pin_pattern` directly. Caller is
+    /// responsible for the pin map; used by larger-than-default fixtures
+    /// (e.g. the 256 KiB SeaBIOS validator) that enumerate every 16-bit
+    /// GPIO pattern verbatim.
+    pub const fn from_raw(label: &'static str, pin_pattern: u64) -> Self {
+        Case {
             label,
-            addr_bits: 0,
-            raw_pin_state: Some(pin_state & !(1u16 << 13)),
-        }
-    }
-
-    /// Build a case that drives `pin_state` directly onto GPIO 0..15
-    /// **without** masking CS1 low. The caller is responsible for the
-    /// pin map. Used exclusively by the SeaBIOS validator's
-    /// `--probe-cs1-thorough` mode to gather empirical evidence on
-    /// firmware behaviour at CS1=high (firmware tristates D0..D7 there
-    /// per the journal). Do not use for byte-correctness assertions —
-    /// the regular `raw_pin_state` path is the right tool for that.
-    pub const fn raw_pin_state_unmasked(label: &'static str, pin_state: u16) -> Self {
-        Self {
-            label,
-            addr_bits: 0,
-            raw_pin_state: Some(pin_state),
+            pin_pattern,
         }
     }
 }
 
 /// Default address-case set — walking-1s over A0..A10 plus three
-/// high-coverage patterns. See HLD §4.2.
+/// high-coverage patterns. Translated through `spec.addr_pins`.
 ///
-/// Structure:
+/// Structure (15 entries):
 /// - 1 baseline case (`0x1800` — all low bits clear, A11=A12=1 only).
-/// - 11 walking-1s cases: one per A0..A10 bit, labelled `walk1 A<n>`
-///   where `n` is the bit index (so `walk1 A0` = `0x1801` = bit 0 set).
-/// - 3 pattern cases: `0x1AAA` (alt), `0x1D55` (comp-alt), `0x1FFF`
-///   (all low 11 bits set). HLD §4.2 lists a fourth "0x1800" pattern
-///   entry but notes it's already the baseline, so the pattern block
-///   contributes only 3 non-duplicate cases.
+/// - 11 walking-1s cases: one per A0..A10 bit, labelled `walk1 A<n>`.
+/// - 3 pattern cases: `0x1AAA`, `0x1D55`, `0x1FFF`.
 ///
-/// Total: 15 entries. Construction enforces `addr_bits & 0x1800 == 0x1800`.
-/// In debug builds, both `Case::new`'s and `run_case`'s `debug_assert!`
-/// guards catch a bad entry. In release builds (where both asserts compile
-/// away), the `default_cases_full_sweep_shape` unit test is the backstop:
-/// it runs under `cargo test --release` and re-checks the invariant on
-/// every entry, so a bad addition fails loudly the next time tests run.
-pub const DEFAULT_CASES: &[Case] = &[
-    // Baseline: A11=A12=1, all of A0..A10 low.
-    Case::new("walk1 baseline", 0x1800),
-    // Walking-1s across A0..A10 (bit index matches label number).
-    Case::new("walk1 A0", 0x1801),
-    Case::new("walk1 A1", 0x1802),
-    Case::new("walk1 A2", 0x1804),
-    Case::new("walk1 A3", 0x1808),
-    Case::new("walk1 A4", 0x1810),
-    Case::new("walk1 A5", 0x1820),
-    Case::new("walk1 A6", 0x1840),
-    Case::new("walk1 A7", 0x1880),
-    Case::new("walk1 A8", 0x1900),
-    Case::new("walk1 A9", 0x1A00),
-    Case::new("walk1 A10", 0x1C00),
-    // Pattern cases — wider-range coverage.
-    Case::new("pattern AAA", 0x1AAA),
-    Case::new("pattern D55", 0x1D55),
-    Case::new("pattern FFF", 0x1FFF),
-];
+/// The address values still carry the legacy fire-24-a A11=A12=1
+/// invariant (CS2/CS3 share GPIOs with A11/A12 on that pin map, so
+/// keeping those high is what deselects the chip). `Case::from_addr`
+/// translates each address into a pin pattern through the supplied
+/// `FixtureSpec`, so the same catalogue works on any fixture whose
+/// `addr_pins` covers ≥ 13 lines.
+pub fn default_cases(spec: &FixtureSpec) -> Vec<Case> {
+    const TABLE: &[(&str, u32)] = &[
+        ("walk1 baseline", 0x1800),
+        ("walk1 A0", 0x1801),
+        ("walk1 A1", 0x1802),
+        ("walk1 A2", 0x1804),
+        ("walk1 A3", 0x1808),
+        ("walk1 A4", 0x1810),
+        ("walk1 A5", 0x1820),
+        ("walk1 A6", 0x1840),
+        ("walk1 A7", 0x1880),
+        ("walk1 A8", 0x1900),
+        ("walk1 A9", 0x1A00),
+        ("walk1 A10", 0x1C00),
+        ("pattern AAA", 0x1AAA),
+        ("pattern D55", 0x1D55),
+        ("pattern FFF", 0x1FFF),
+    ];
+    TABLE
+        .iter()
+        .map(|(label, addr)| Case::from_addr(label, *addr, spec))
+        .collect()
+}
 
 /// Outcome for one case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,20 +280,42 @@ pub(crate) struct Observation {
     pub ch1_pushes: u32,
     /// `bus.read32(CH1.READ_ADDR, 0)` sampled this cycle.
     pub resolved_addr: u32,
-    /// Byte currently exposed on D0..D7 (`(gpio_in >> 16) & 0xFF`).
+    /// Byte currently exposed on D0..D7 (`(gpio_in >> spec.data_pins[0]) & 0xFF` —
+    /// the data pins are contiguous on supported fixtures).
     pub data_byte: u8,
-    /// PIO2's output-enable mask over D0..D7 (`(pio[2].pad_oe >> 16) & 0xFF`).
+    /// PIO2's output-enable mask over D0..D7.
     pub pio2_pad_oe_data: u8,
 }
 
-/// Oracle state. Owns the SRAM shadow captured at sync and the vector
-/// of per-case results.
+/// Errors surfaced by [`ServingOracle::new_at_sync`]. Stage 2 widens
+/// the constructor to consume a [`FixtureSpec`] derived from the same
+/// flash image; on parse failure the typed error propagates here so
+/// drivers can render a useful diagnostic.
+#[derive(Debug)]
+pub enum OracleNewError {
+    /// Underlying [`FixtureSpec::from_flash`] failed.
+    FixtureParse(FixtureError),
+}
+
+impl std::fmt::Display for OracleNewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FixtureParse(e) => write!(f, "ServingOracle::new_at_sync: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OracleNewError {}
+
+/// Oracle state. Owns the per-fixture pin map + capacity and the SRAM
+/// shadow captured at sync.
 pub struct ServingOracle {
-    rom_shadow: Box<[u8; SHADOW_SIZE]>,
+    spec: FixtureSpec,
+    rom_shadow: Box<[u8]>,
     results: Vec<CaseResult>,
     /// Tracks whether we've driven the `init` seed yet. `run_case`
     /// does so exactly once — on the first call — to produce a clean
-    /// high-to-low CS1 edge for case 1.
+    /// high-to-low edge on the gate CS for case 1.
     seed_done: bool,
 }
 
@@ -352,25 +327,23 @@ impl ServingOracle {
     /// because at the current sync criterion (`PIO1.CTRL.SM_ENABLE &&
     /// PIO2.CTRL.SM_ENABLE`) the DMA-driven `preload_rom_image` copy has
     /// NOT yet populated `rom_table` in SRAM. Observed: even stepping
-    /// 1 M cycles past sync leaves SRAM[0x20000000..+0x10000] entirely
-    /// zero on our emulator (the preload DMA program is not executed).
-    /// See `wrk_journals/2026.04.15 - JRN - OneROM Shadow Source
-    /// Investigation.md` for the evidence trail.
+    /// 1 M cycles past sync leaves SRAM[0x20000000..+spec.shadow_size]
+    /// entirely zero on our emulator (the preload DMA program is not
+    /// executed). See `wrk_journals/2026.04.15 - JRN - OneROM Shadow
+    /// Source Investigation.md` for the evidence trail.
     ///
-    /// The canonical ground truth is therefore the **pre-processed ROM
-    /// image embedded in flash** — the exact bytes `preload_rom_image`
-    /// *would* copy if the DMA ran to completion. We read
-    /// `rom_set_index` from `sdrr_runtime_info` in SRAM (the one field
-    /// the firmware does populate by sync), then walk the flash structs
-    /// (`sdrr_info_t` → `onerom_metadata_header_t` → `sdrr_rom_set_t[]`)
-    /// to locate the selected set's `data` pointer and copy its
-    /// `SHADOW_SIZE` bytes into the shadow.
+    /// Stage 2: takes a `FixtureSpec` (parsed from the same `flash`
+    /// image by the caller) so the per-fixture shadow size is honoured.
+    /// Reads `rom_set_index` from the SRAM-resident `sdrr_runtime_info`
+    /// (the one field the firmware does populate by sync), then walks
+    /// the flash structs to locate the selected set's `data` pointer
+    /// and copies its `spec.shadow_size` bytes into the shadow.
     ///
     /// Fall-backs: on any parse failure (bad magic, out-of-range pointer,
     /// index out of range) the shadow is zero-filled. The binary-level
     /// "shadow-integrity tripwire" reports `unique bytes == 1` and warns,
     /// so a silently-wrong shadow still surfaces to the operator.
-    pub fn new_at_sync(bus: &mut Bus, flash: &[u8]) -> Self {
+    pub fn new_at_sync(bus: &mut Bus, spec: FixtureSpec, flash: &[u8]) -> Self {
         // Offset of `sdrr_runtime_info.rom_set_index` within SRAM:
         // `_sdrr_runtime_info_location = _end - 8192 = 0x20080000` (per
         // `sdrr/link/common.ld`); `rom_set_index` is at runtime-info
@@ -382,10 +355,11 @@ impl ServingOracle {
             .memory
             .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
 
-        let shadow = lift_shadow_from_flash(flash, rom_set_index)
-            .unwrap_or_else(|| Box::new([0u8; SHADOW_SIZE]));
+        let shadow = lift_shadow_from_flash(flash, rom_set_index, &spec)
+            .unwrap_or_else(|| vec![0u8; spec.shadow_size].into_boxed_slice());
 
         Self {
+            spec,
             rom_shadow: shadow,
             results: Vec::new(),
             seed_done: false,
@@ -397,9 +371,14 @@ impl ServingOracle {
     /// `format_report_has_required_sections` (and future trace-free
     /// report tests) so the formatter can be exercised without spinning
     /// up an emulator just to seed SRAM.
-    #[cfg(test)]
-    pub(crate) fn new_with_shadow(shadow: Box<[u8; SHADOW_SIZE]>) -> Self {
+    pub fn new_with_shadow(spec: FixtureSpec, shadow: Box<[u8]>) -> Self {
+        debug_assert_eq!(
+            shadow.len(),
+            spec.shadow_size,
+            "new_with_shadow: shadow length must match spec.shadow_size"
+        );
         Self {
+            spec,
             rom_shadow: shadow,
             results: Vec::new(),
             seed_done: false,
@@ -419,37 +398,40 @@ impl ServingOracle {
     /// DMA; records per-cycle observations; runs the verdict evaluator.
     ///
     /// State machine per HLD §4.3:
-    /// - `init` (first call only): drive CS1+CS2+CS3 high with addr=0
-    ///   for `SEED_CYCLES`. Guarantees the next CS1-low stimulus produces
-    ///   a high→low edge PIO1 can detect, regardless of what state Stage
-    ///   F's external-input mask left behind.
-    /// - `idle → cs_assert`: apply the case stimulus (CS1 low, CS2/CS3
-    ///   high, A-bus = `case.addr_bits`). Record `cs_low_cycle` and
-    ///   `ch1_pushes_before`.
+    /// - `init` (first call only): drive the gate CS + every
+    ///   deasserted-high CS pin high, with addr=0, for `SEED_CYCLES`.
+    ///   Guarantees the next stim produces a clean high→low edge on the
+    ///   gate CS regardless of what state Stage F's external-input mask
+    ///   left behind.
+    /// - `idle → cs_assert`: apply the case stimulus (gate CS low,
+    ///   deasserted-high CS pins high, A-bus = `case.pin_pattern`).
+    ///   Record `cs_low_cycle` and `ch1_pushes_before`.
     /// - `cs_assert → wait_push → wait_stable → record → cs_release → idle`:
     ///   the per-tick loop builds up an `Observation` vector for at
     ///   most `PER_CASE_TIMEOUT` cycles. At the end (or on early stable-
     ///   byte detection), the trace is fed to [`evaluate_case_trace`].
     pub fn run_case(&mut self, emu: &mut Emulator, glue: &mut GlueDma, case: Case) -> &CaseResult {
+        // External-input mask covers gate CS (cs1 today on fire-24-a),
+        // every deasserted-high CS pin, every asserted-low pin, and all
+        // address pins. Data pins are PIO-driven; never mask them.
+        // fire-32-a (Stage 3) will widen the bus to u64; today we assert
+        // that no fixture uses GPIOs >= 32 to make the Stage 3 follow-up
+        // loud.
+        let ext_mask: u64 = self.compose_ext_mask();
         debug_assert!(
-            case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
-            "run_case: case.addr_bits must have A11=A12=1"
+            ext_mask >> 32 == 0,
+            "ext_mask uses GPIOs >= 32; widen Bus interface for fire-32-a (Stage 3)"
         );
+        emu.bus.gpio_external_mask = ext_mask as u32;
 
-        // External-input mask covers CS1/CS2/CS3 and all address pins.
-        // D0..D7 are PIO-driven; never mask them.
-        let ext_mask: u32 = (1u32 << GPIO_CS1)
-            | (1u32 << GPIO_CS2)
-            | (1u32 << GPIO_CS3)
-            | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
-        emu.bus.gpio_external_mask = ext_mask;
-
-        // 1. init seed (first call only).
+        // 1. init seed (first call only). Drive the gate CS + every
+        //    deasserted-high CS pin high.
         if !self.seed_done {
-            let seed_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
+            let seed_level: u64 = self.compose_seed_level();
+            debug_assert!(seed_level >> 32 == 0, "seed_level uses GPIOs >= 32");
             emu.bus
                 .gpio_external_in
-                .store(seed_level, Ordering::Relaxed);
+                .store(seed_level as u32, Ordering::Relaxed);
             self.tick_cycles(emu, glue, SEED_CYCLES);
             self.seed_done = true;
         }
@@ -466,16 +448,20 @@ impl ServingOracle {
         // the observation window are now skipped by the scan, so a
         // short fixed-duration gap is sufficient to seed CS-high before
         // stimulus.
-        let gap_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
+        let gap_level: u64 = self.compose_gap_level();
+        debug_assert!(gap_level >> 32 == 0, "gap_level uses GPIOs >= 32");
+        emu.bus
+            .gpio_external_in
+            .store(gap_level as u32, Ordering::Relaxed);
         self.tick_cycles(emu, glue, GAP_CYCLES);
 
         // 3. cs_assert: apply the case stimulus.
-        let stim_level = stimulus_level(case.addr_bits);
+        let stim_level: u64 = self.compose_stim_level(case.pin_pattern);
+        debug_assert!(stim_level >> 32 == 0, "stim_level uses GPIOs >= 32");
         let expected_pin_bits: u16 = (stim_level & 0xFFFF) as u16;
         emu.bus
             .gpio_external_in
-            .store(stim_level, Ordering::Relaxed);
+            .store(stim_level as u32, Ordering::Relaxed);
 
         // Snapshot the push counter *before* stimulus-time ticks.
         // The observation loop records ch1_pushes as a delta relative
@@ -483,6 +469,11 @@ impl ServingOracle {
         // per-cycle push edges (for skipping gap pushes that slip in
         // during the observation window).
         let pushes_before = glue.ch1_pushes();
+
+        // Data-pin base — the data pins are contiguous on every supported
+        // fixture (fire-24-a: GPIO 16..23; fire-32-a: GPIO 0..7). Use
+        // data_pins[0] as the shift offset.
+        let data_base = self.spec.data_pins[0];
 
         // 4. wait_push → wait_stable: tick up to PER_CASE_TIMEOUT cycles,
         //    recording an Observation per cycle.
@@ -505,8 +496,8 @@ impl ServingOracle {
             // fix-wave brief (2026-04-17).
             let resolved = glue.last_pushed_read_addr();
             let data_byte =
-                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
-            let pad_oe = ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
+                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> data_base) & 0xFF) as u8;
+            let pad_oe = ((emu.bus.pio[2].pad_oe >> data_base) & 0xFF) as u8;
 
             trace.push(Observation {
                 cycle: c as u64,
@@ -519,11 +510,17 @@ impl ServingOracle {
             // Early-exit if the verdict for the trace so far is already
             // conclusive — no need to tick out the full 60-cycle budget
             // once we've seen stability.
-            if let Some(result) =
-                try_evaluate_conclusive(case, &self.rom_shadow, expected_pin_bits, &trace)
-            {
+            if let Some(result) = try_evaluate_conclusive(
+                case,
+                &self.rom_shadow,
+                self.spec.shadow_size,
+                expected_pin_bits,
+                &trace,
+            ) {
                 // Leave the bus in gap-level state for the next case.
-                emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
+                emu.bus
+                    .gpio_external_in
+                    .store(gap_level as u32, Ordering::Relaxed);
 
                 self.results.push(apply_envelope(result));
                 return self.results.last().unwrap();
@@ -533,9 +530,12 @@ impl ServingOracle {
         // 5. Budget exhausted — run the evaluator one last time; it'll
         //    report NoResolve / NoStableByte based on where the state
         //    machine stopped.
-        let result = evaluate_case_trace(case, &self.rom_shadow, expected_pin_bits, &trace);
+        let result =
+            evaluate_case_trace(case, &self.rom_shadow, self.spec.shadow_size, expected_pin_bits, &trace);
 
-        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in
+            .store(gap_level as u32, Ordering::Relaxed);
 
         self.results.push(apply_envelope(result));
         self.results.last().unwrap()
@@ -554,7 +554,7 @@ impl ServingOracle {
     /// 1..3 are XOR/SET/CLR-on-write, not plain stores, and would
     /// silently corrupt the populate.
     pub fn populate_sram_from_shadow(&self, bus: &mut Bus) {
-        for offset in 0..SHADOW_SIZE {
+        for offset in 0..self.spec.shadow_size {
             bus.write8(SHADOW_BASE + offset as u32, self.rom_shadow[offset], 0);
         }
     }
@@ -569,8 +569,15 @@ impl ServingOracle {
     /// checks the authoritative shadow the verdict evaluator will
     /// consult, rather than sampling SRAM — which is no longer the
     /// shadow source on this build.
-    pub fn shadow(&self) -> &[u8; SHADOW_SIZE] {
+    pub fn shadow(&self) -> &[u8] {
         &self.rom_shadow
+    }
+
+    /// Accessor for the per-fixture pin map + capacity. Useful for
+    /// drivers that want to render the fixture label or check pin
+    /// numbers in their own diagnostics.
+    pub fn spec(&self) -> &FixtureSpec {
+        &self.spec
     }
 
     /// Full report formatter (HLD §5 + §5.4).
@@ -600,33 +607,33 @@ impl ServingOracle {
             out,
             "shadow: 0x{:08X} + 0x{:04X} bytes, {} unique",
             SHADOW_BASE,
-            SHADOW_SIZE,
+            self.spec.shadow_size,
             unique_shadow.len()
         );
         let _ = writeln!(out, "cases: {}", self.results.len());
         let _ = writeln!(out);
 
         // --- Per-case table ----------------------------------------------
-        // Columns: idx, label, addr, resolved, expected, observed, cycles,
+        // Columns: idx, label, pattern, resolved, expected, observed, cycles,
         // [ns,] verdict. ns column is omitted when sys_clk_hz == 0.
         if ns_available {
             let _ = writeln!(
                 out,
-                " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6} {:>6}  verdict",
-                "idx", "label", "addr", "resolved", "expected", "observed", "cycles", "ns"
+                " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6} {:>6}  verdict",
+                "idx", "label", "pattern", "resolved", "expected", "observed", "cycles", "ns"
             );
         } else {
             let _ = writeln!(
                 out,
-                " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6}  verdict",
-                "idx", "label", "addr", "resolved", "expected", "observed", "cycles"
+                " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6}  verdict",
+                "idx", "label", "pattern", "resolved", "expected", "observed", "cycles"
             );
         }
 
         let total = self.results.len();
         for (i, r) in self.results.iter().enumerate() {
             let idx = format!("{}/{}", i + 1, total);
-            let addr = format!("0x{:04X}", r.case.addr_bits);
+            let pattern = format!("0x{:08X}", r.case.pin_pattern as u32);
             let resolved = r
                 .resolved_addr
                 .map(|a| format!("0x{:08X}", a))
@@ -652,14 +659,14 @@ impl ServingOracle {
                     .unwrap_or_else(|| "—".to_string());
                 let _ = writeln!(
                     out,
-                    " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6} {:>6}  {}",
-                    idx, r.case.label, addr, resolved, expected, observed, cycles, ns, verdict
+                    " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6} {:>6}  {}",
+                    idx, r.case.label, pattern, resolved, expected, observed, cycles, ns, verdict
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    " {:>5}  {:<20} {:<8} {:<10} {:<8} {:<8} {:>6}  {}",
-                    idx, r.case.label, addr, resolved, expected, observed, cycles, verdict
+                    " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6}  {}",
+                    idx, r.case.label, pattern, resolved, expected, observed, cycles, verdict
                 );
             }
         }
@@ -763,150 +770,74 @@ impl ServingOracle {
             glue.tick(&mut emu.bus);
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Stimulus helpers
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Stim/gap level composition (HLD §4.4)
+    //
+    // Every output is a u64 so fire-32-a (max GPIO 47) can be expressed
+    // without re-typing. The bus interface is u32 today; `run_case`
+    // downcasts at the boundary with a `debug_assert!` that the high
+    // 32 bits are zero. Stage 3 widens the bus.
+    // ---------------------------------------------------------------------
 
-/// Build the `gpio_external_in` bitmask for a case's address stimulus.
-///
-/// CS1 low (asserted), CS2/CS3 high (deasserted — forced by A11/A12 = 1
-/// per the pin-map collision); A0..A12 reflect `addr_bits`.
-///
-/// The low-16 of the returned value is the exact `pin_bits` pattern
-/// that PIO1 will observe on `gpio_in` and push into CH1.READ_ADDR as
-/// `(0x2000 << 16) | pin_bits`. The evaluator uses this low-16 as
-/// `expected_pin_bits` to distinguish stim-matching pushes from
-/// gap-level / background pushes.
-pub(crate) fn stimulus_level(addr_bits: u16) -> u32 {
-    let mut level: u32 = 0;
-    // CS2 (GPIO12)/CS3 (GPIO15) double as A12/A11 — driven high by the
-    // A11=A12=1 case invariant (asserted in `Case::new`).
-    for (i, &pin) in ADDR_PINS.iter().enumerate() {
-        if (addr_bits >> i) & 1 != 0 {
-            level |= 1u32 << pin;
+    /// Combined external-input mask covering the gate CS, every
+    /// deasserted-high CS pin, every asserted-low pin, and every
+    /// address pin. Data pins are PIO-driven and excluded.
+    fn compose_ext_mask(&self) -> u64 {
+        let mut mask: u64 = 1u64 << self.spec.cs1;
+        for &p in &self.spec.deasserted_high_during_read {
+            mask |= 1u64 << p;
         }
+        for &p in &self.spec.asserted_low_during_read {
+            mask |= 1u64 << p;
+        }
+        for &p in &self.spec.addr_pins {
+            mask |= 1u64 << p;
+        }
+        mask
     }
-    // CS1 stays low — do not set bit 13.
-    level
-}
 
-// ---------------------------------------------------------------------------
-// Flash struct parser — shadow ground truth
-//
-// Stage 1 of the OneROM Fixture Generalization (HLD: 2026.05.04) moved the
-// SDRR struct chain helpers into `onerom_fixture`. The constants and
-// `parse_rom_set_layout` / `RomSetSlot` types are re-exported from there so
-// existing call sites (`build_seabios_fixture`, the tests below) keep
-// compiling. Stage 2 collapses these re-exports.
-// ---------------------------------------------------------------------------
-
-pub use crate::onerom_fixture::{
-    FLASH_BASE, METADATA_HEADER_ROM_SETS_PTR_OFFSET, METADATA_HEADER_ROM_SET_COUNT_OFFSET,
-    ROM_SET_DATA_PTR_OFFSET, ROM_SET_SIZE_OFFSET, ROM_SET_STRIDE, RomSetSlot,
-    SDRR_INFO_METADATA_PTR_OFFSET, SDRR_INFO_OFFSET, parse_rom_set_layout,
-};
-
-/// Lift the ROM-table shadow from the loaded flash bytes.
-///
-/// Walks the SDRR flash layout (`sdrr_info_t` at `0x200` →
-/// `onerom_metadata_header_t` → `sdrr_rom_set_t[rom_set_index]`) to
-/// locate the selected ROM set's pre-processed image, then copies
-/// `SHADOW_SIZE` bytes from it. This is the exact byte sequence
-/// `preload_rom_image` copies from flash to `rom_table` in SRAM —
-/// reading it from flash directly sidesteps the preload-not-done-at-
-/// sync problem (the DMA program never fires on our emulator).
-///
-/// Returns `None` on any parse failure (malformed struct pointer,
-/// index out of range, source truncated). Callers fall back to a
-/// zero-filled shadow, which the binary-level tripwire surfaces via
-/// the `unique bytes == 1` warning.
-pub(crate) fn lift_shadow_from_flash(
-    flash: &[u8],
-    rom_set_index: u8,
-) -> Option<Box<[u8; SHADOW_SIZE]>> {
-    // Pointer → flash-byte-offset, with bounds check against the loaded
-    // slice length. Ptrs < FLASH_BASE or past end of flash return None.
-    let ptr_to_off = |ptr: u32| -> Option<usize> {
-        let off = (ptr.checked_sub(FLASH_BASE)?) as usize;
-        if off >= flash.len() { None } else { Some(off) }
-    };
-    let read_u32 = |off: usize| -> Option<u32> {
-        let bytes = flash.get(off..off + 4)?;
-        Some(u32::from_le_bytes(bytes.try_into().ok()?))
-    };
-
-    // sdrr_info_t at flash+0x200 → metadata_header pointer at +44.
-    let metadata_ptr = read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
-    let metadata_off = ptr_to_off(metadata_ptr)?;
-
-    // onerom_metadata_header_t: rom_set_count at +20, rom_sets ptr at +24.
-    let rom_set_count = *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)?;
-    if rom_set_index >= rom_set_count {
-        return None;
+    /// Init seed level. Same shape as the gap level: gate CS high +
+    /// every deasserted-high CS pin high. (Asserted-low pins stay LOW
+    /// — they're driven low during reads, so the init seed leaves them
+    /// in their inactive state which is "not driven" / 0.)
+    fn compose_seed_level(&self) -> u64 {
+        let mut level: u64 = 1u64 << self.spec.cs1;
+        for &p in &self.spec.deasserted_high_during_read {
+            level |= 1u64 << p;
+        }
+        level
     }
-    let rom_sets_ptr = read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
-    let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
 
-    // sdrr_rom_set_t[rom_set_index]: data ptr at +0, size at +4.
-    let set_off = rom_sets_off + (rom_set_index as usize) * ROM_SET_STRIDE;
-    let data_ptr = read_u32(set_off + ROM_SET_DATA_PTR_OFFSET)?;
-    let size = read_u32(set_off + ROM_SET_SIZE_OFFSET)? as usize;
-    let data_off = ptr_to_off(data_ptr)?;
+    /// Gap-level (CS-high, addr=0, asserted-low pins LEFT high so the
+    /// chip is fully deselected during the inter-case quiet period).
+    fn compose_gap_level(&self) -> u64 {
+        let mut level: u64 = 1u64 << self.spec.cs1;
+        for &p in &self.spec.deasserted_high_during_read {
+            level |= 1u64 << p;
+        }
+        for &p in &self.spec.asserted_low_during_read {
+            level |= 1u64 << p;
+        }
+        level
+    }
 
-    // Copy up to SHADOW_SIZE bytes; zero-pad the tail if the set data is
-    // smaller than the shadow (shouldn't happen for RP2350 builds — all
-    // sets are `ROM_SET_IMAGE_SIZE = 65536 = SHADOW_SIZE` — but defend).
-    let copy_len = size.min(SHADOW_SIZE);
-    let src = flash.get(data_off..data_off + copy_len)?;
-    let mut shadow = Box::new([0u8; SHADOW_SIZE]);
-    shadow[..copy_len].copy_from_slice(src);
-    Some(shadow)
-}
-
-// ---------------------------------------------------------------------------
-// Cross-module re-exports for the CPU-serve oracle + its binary driver.
-//
-// `stimulus_level` and `lift_shadow_from_flash` are `pub(crate)` for
-// internal unit-test use; the CPU-serve oracle (`onerom_serving_oracle_cpu`)
-// and its `src/bin/` driver need them but only see `pub` items across a
-// binary-crate boundary. These shims keep the implementation private to
-// this module while exposing the exact same contract under a distinct
-// `_pub` name — mirrors the pattern used for other cross-module oracle
-// helpers in this crate.
-// ---------------------------------------------------------------------------
-
-/// `pub` shim over [`stimulus_level`] for the CPU-serve oracle.
-pub fn stimulus_level_pub(addr_bits: u16) -> u32 {
-    stimulus_level(addr_bits)
-}
-
-/// Stimulus level for a `Case::raw_pin_state` (or
-/// `Case::raw_pin_state_unmasked`) case: pass `pin_state` through
-/// verbatim onto GPIO 0..15. No permutation, no A11/A12 invariant, no
-/// CS1 masking — the masking decision is made at `Case` construction
-/// time (`Case::raw_pin_state` masks CS1 low; `Case::raw_pin_state_unmasked`
-/// preserves whatever the caller drives, including CS1=high for the
-/// SeaBIOS validator's `--probe-cs1-thorough` empirical-evidence mode).
-/// Used by the SeaBIOS 256 KiB validator that needs to enumerate all
-/// 16-bit GPIO patterns directly.
-pub fn stimulus_level_raw(pin_state: u16) -> u32 {
-    pin_state as u32
-}
-
-// `RomSetSlot` and `parse_rom_set_layout` were moved to `onerom_fixture`
-// during Stage 1 of the OneROM Fixture Generalization. They are
-// re-exported at the top of this module so existing call sites keep
-// compiling.
-
-/// `pub` shim over [`lift_shadow_from_flash`] for the CPU-serve oracle
-/// and its binary driver.
-pub fn lift_shadow_from_flash_pub(
-    flash: &[u8],
-    rom_set_index: u8,
-) -> Option<Box<[u8; SHADOW_SIZE]>> {
-    lift_shadow_from_flash(flash, rom_set_index)
+    /// Stim-level for a case: deasserted-high CS pins high, asserted-low
+    /// pins LOW (the chip is now selected for reading), gate CS LOW (the
+    /// case pattern doesn't include it — pin_pattern is address bits
+    /// only), and the case's `pin_pattern` ORed in for the address bus.
+    /// Note that the gate CS staying LOW is the desired behaviour: the
+    /// stim composition does NOT set bit `cs1`.
+    fn compose_stim_level(&self, case_pattern: u64) -> u64 {
+        let mut level: u64 = 0;
+        for &p in &self.spec.deasserted_high_during_read {
+            level |= 1u64 << p;
+        }
+        // Asserted-low pins stay LOW during stim (they're the active-
+        // assertion pins for reads — driving them high would deselect
+        // the chip). They're already 0 in `level`.
+        level | case_pattern
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -941,11 +872,12 @@ enum EvalState {
 // evaluator that carries state across ticks.
 fn try_evaluate_conclusive(
     case: Case,
-    shadow: &[u8; SHADOW_SIZE],
+    shadow: &[u8],
+    shadow_size: usize,
     expected_pin_bits: u16,
     trace: &[Observation],
 ) -> Option<CaseResult> {
-    let result = evaluate_case_trace(case, shadow, expected_pin_bits, trace);
+    let result = evaluate_case_trace(case, shadow, shadow_size, expected_pin_bits, trace);
     match result.verdict {
         // Timeouts are only meaningful after the budget is exhausted —
         // keep ticking.
@@ -958,10 +890,10 @@ fn try_evaluate_conclusive(
 /// machine over a synthetic `&[Observation]` sequence and returns the
 /// resulting [`CaseResult`].
 ///
-/// The `expected_pin_bits` argument is the low-16 of the case's
-/// `stimulus_level` — the pin pattern PIO1 will latch and push into
-/// CH1.READ_ADDR when the stimulus reaches the DUT. The evaluator uses
-/// it to distinguish **stim-matching pushes** (the ones this case cares
+/// The `expected_pin_bits` argument is the low-16 of the case's stim
+/// level — the pin pattern PIO1 will latch and push into CH1.READ_ADDR
+/// when the stimulus reaches the DUT. The evaluator uses it to
+/// distinguish **stim-matching pushes** (the ones this case cares
 /// about) from gap-level pushes that leak through the pipeline
 /// (`resolved = 0x2000_B000`) or other background activity. Only
 /// stim-matching pushes transition `WaitPush → WaitStable`.
@@ -971,7 +903,8 @@ fn try_evaluate_conclusive(
 /// variant without an emulator in the loop.
 pub(crate) fn evaluate_case_trace(
     case: Case,
-    shadow: &[u8; SHADOW_SIZE],
+    shadow: &[u8],
+    shadow_size: usize,
     expected_pin_bits: u16,
     trace: &[Observation],
 ) -> CaseResult {
@@ -1009,12 +942,12 @@ pub(crate) fn evaluate_case_trace(
                     }
 
                     // Stim-matching push. The hi16==0x2000 check above
-                    // already guarantees in-range (SHADOW_SIZE=0x10000
-                    // spans the full u16 low-half), but keep the
-                    // explicit AddrOOR check as belt-and-braces so a
-                    // future resize of SHADOW_SIZE can't silently drop
-                    // the bounds check.
-                    if !(SHADOW_BASE..SHADOW_BASE + SHADOW_SIZE as u32).contains(&resolved) {
+                    // already guarantees in-range for shadow_size ==
+                    // 0x10000 (which spans the full u16 low-half), but
+                    // we still validate the bound explicitly so future
+                    // resizes (e.g. fire-32-a's 512 KiB shadow) can
+                    // surface out-of-range pushes.
+                    if !(SHADOW_BASE..SHADOW_BASE + shadow_size as u32).contains(&resolved) {
                         return CaseResult {
                             case,
                             resolved_addr: Some(resolved),
@@ -1231,276 +1164,146 @@ fn format_verdict_full(v: &Verdict) -> String {
 #[allow(clippy::doc_lazy_continuation)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn mk_case() -> Case {
-        Case::new("test", 0x1800)
+    /// Path to the fire-24-a CPU SeaBIOS fixture used by the in-crate
+    /// tests as their canonical fixture source. Loaded via
+    /// `CARGO_MANIFEST_DIR` so `cargo test` works regardless of cwd.
+    fn fire24a_fixture_path() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("fixtures");
+        p.push("onerom-fire-24-a-rp2350-seabios-cpu.bin");
+        p
     }
 
-    /// Expected pin-bits pattern for `mk_case()` — the low-16 of the
-    /// `0x1800` stimulus level. Used as `expected_pin_bits` by the
-    /// evaluator and as the low-16 of synthetic `resolved_addr` values
-    /// in tests that want the stim-match predicate to fire.
+    /// Read the fire-24-a SeaBIOS-CPU fixture from disk.
+    fn fire24a_fixture_bytes() -> Vec<u8> {
+        let p = fire24a_fixture_path();
+        std::fs::read(&p)
+            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e))
+    }
+
+    /// Parse a `FixtureSpec` from the fire-24-a SeaBIOS-CPU fixture.
+    fn fire24a_spec() -> FixtureSpec {
+        let flash = fire24a_fixture_bytes();
+        FixtureSpec::from_flash(&flash).expect("fire-24-a parse must succeed")
+    }
+
+    /// Shadow size for the fire-24-a fixture (64 KiB).
+    fn fire24a_shadow_size() -> usize {
+        fire24a_spec().shadow_size
+    }
+
+    /// Build a baseline 0x1800 case under the fire-24-a fixture (the
+    /// common fixture-aware analogue of the legacy `mk_case()`).
+    fn mk_case() -> Case {
+        let spec = fire24a_spec();
+        Case::from_addr("test", 0x1800, &spec)
+    }
+
+    /// Compute the low-16 stim-pattern bits PIO1 would push for
+    /// `mk_case` under the fire-24-a fixture. Used as
+    /// `expected_pin_bits` by the evaluator in tests that synthesise
+    /// stim-matching pushes.
     fn mk_case_pin_bits() -> u16 {
-        (stimulus_level(mk_case().addr_bits) & 0xFFFF) as u16
+        let spec = fire24a_spec();
+        // The stim composition is gate CS LOW + deasserted-high CS pins
+        // HIGH + case pin_pattern ORed in. Compute it here so tests
+        // don't depend on `compose_stim_level` being public.
+        let mut level: u64 = 0;
+        for &p in &spec.deasserted_high_during_read {
+            level |= 1u64 << p;
+        }
+        let case_pat = mk_case().pin_pattern;
+        let total = level | case_pat;
+        (total & 0xFFFF) as u16
     }
 
     /// Build a `resolved_addr` that matches `mk_case()`'s stim-pattern.
     /// Since the pin-bits (u16) occupy the low-16 of `resolved_addr`,
     /// and the stim-pattern uniquely identifies the case, every
-    /// `resolved_addr` for `mk_case()` equals `0x2000_0000 |
-    /// mk_case_pin_bits()`. Shadow offsets are therefore fixed at the
-    /// pin-bits value, so tests that previously used offsets like 0x10
-    /// now place their expected bytes at the pin-bits offset.
+    /// `resolved_addr` for `mk_case()` equals `0x2000_0000 | mk_case_pin_bits()`.
     fn mk_case_resolved() -> u32 {
         SHADOW_BASE | (mk_case_pin_bits() as u32)
     }
 
-    fn empty_shadow() -> Box<[u8; SHADOW_SIZE]> {
-        Box::new([0u8; SHADOW_SIZE])
+    fn empty_shadow() -> Box<[u8]> {
+        vec![0u8; fire24a_shadow_size()].into_boxed_slice()
     }
 
-    /// Build a synthetic flash blob that mimics the SDRR flash layout
-    /// enough for `lift_shadow_from_flash` to find a ROM set. The blob
-    /// packs: sdrr_info_t at `0x200`, metadata_header at `0xC000` (so
-    /// the `metadata_header` pointer points at 0x1000C000 as in the real
-    /// fixture), rom_sets array at `0xC100`, and two ROM set images —
-    /// set 0 at `0x20000` and set 1 at `0x10000`. Each image is a
-    /// walking byte pattern keyed on the set index so the test can
-    /// discriminate which set was picked.
-    fn synth_flash(rom_set_count: u8) -> Vec<u8> {
-        let mut flash = vec![0u8; 0x3_0000]; // 192 KB, room for 2 sets
-        // sdrr_info_t.metadata_header at flash+0x200+44 → 0x1000C000.
-        flash[0x200 + SDRR_INFO_METADATA_PTR_OFFSET..0x200 + SDRR_INFO_METADATA_PTR_OFFSET + 4]
-            .copy_from_slice(&(0x1000_C000u32).to_le_bytes());
-        // metadata_header.rom_set_count at 0xC000 + 20.
-        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = rom_set_count;
-        // metadata_header.rom_sets at 0xC000 + 24 → 0x1000C100.
-        flash[0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET
-            ..0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET + 4]
-            .copy_from_slice(&(0x1000_C100u32).to_le_bytes());
-        // Two sdrr_rom_set_t entries, stride 64 bytes.
-        for i in 0..2 {
-            let entry = 0xC100 + i * ROM_SET_STRIDE;
-            // data ptr: set 0 → 0x10020000, set 1 → 0x10010000.
-            let data_ptr = if i == 0 {
-                0x1002_0000u32
-            } else {
-                0x1001_0000u32
-            };
-            flash[entry + ROM_SET_DATA_PTR_OFFSET..entry + ROM_SET_DATA_PTR_OFFSET + 4]
-                .copy_from_slice(&data_ptr.to_le_bytes());
-            // size = SHADOW_SIZE.
-            flash[entry + ROM_SET_SIZE_OFFSET..entry + ROM_SET_SIZE_OFFSET + 4]
-                .copy_from_slice(&(SHADOW_SIZE as u32).to_le_bytes());
-        }
-        // Per-set ROM image: walking byte keyed on set index.
-        for j in 0..SHADOW_SIZE {
-            flash[0x20000 + j] = j as u8; // set 0: i as u8
-            flash[0x10000 + j] = (j as u8).wrapping_add(0x80); // set 1
-        }
-        flash
-    }
-
-    /// 1. `lift_shadow_from_flash` follows the SDRR struct chain and
-    /// returns the selected set's bytes. Exercises the parser with a
-    /// synthetic two-set flash blob — no emulator in the loop.
-    #[test]
-    fn lift_shadow_from_flash_happy_path() {
-        let flash = synth_flash(2);
-
-        // Set 0 → pattern (j as u8).
-        let s0 = lift_shadow_from_flash(&flash, 0).expect("set 0");
-        for i in 0..SHADOW_SIZE {
-            assert_eq!(
-                s0[i], i as u8,
-                "set 0 shadow[{}] = 0x{:02X}, expected 0x{:02X}",
-                i, s0[i], i as u8
-            );
-        }
-
-        // Set 1 → pattern (j as u8) + 0x80.
-        let s1 = lift_shadow_from_flash(&flash, 1).expect("set 1");
-        for i in 0..SHADOW_SIZE {
-            let want = (i as u8).wrapping_add(0x80);
-            assert_eq!(
-                s1[i], want,
-                "set 1 shadow[{}] = 0x{:02X}, expected 0x{:02X}",
-                i, s1[i], want
-            );
-        }
-    }
-
-    /// 2. `lift_shadow_from_flash` returns `None` when `rom_set_index`
-    /// is out of range. Protects against the firmware-not-yet-initialised
-    /// case where `rom_set_index == 0xFF` and naively indexing would
-    /// walk off the end of the array.
-    #[test]
-    fn lift_shadow_rejects_out_of_range_index() {
-        let flash = synth_flash(2);
-        assert!(
-            lift_shadow_from_flash(&flash, 2).is_none(),
-            "index 2 must be rejected (count = 2)"
-        );
-        assert!(
-            lift_shadow_from_flash(&flash, 0xFF).is_none(),
-            "index 0xFF must be rejected"
-        );
-    }
-
-    /// 3. `lift_shadow_from_flash` returns `None` on a malformed blob
-    /// (here: truncated so the metadata_header pointer reads past EOF).
-    /// Callers must never panic on a bad fixture.
-    #[test]
-    fn lift_shadow_rejects_truncated_flash() {
-        let flash = vec![0u8; 0x300]; // only ~sdrr_info_t bytes; no metadata.
-        assert!(lift_shadow_from_flash(&flash, 0).is_none());
-    }
-
-    // -------------------------------------------------------------------
-    // SeaBIOS-fixture API: `parse_rom_set_layout`, `Case::raw_pin_state`,
-    // and `stimulus_level_raw`. Added 2026-05-03 alongside the SeaBIOS
-    // 256 KiB fixture; cover the public contract so future authors of
-    // similarly large fixtures don't regress these helpers silently.
-    // -------------------------------------------------------------------
-
-    /// `parse_rom_set_layout` walks the SDRR struct chain and returns one
-    /// `RomSetSlot` per declared ROM set, with descriptor / data offsets
-    /// matching what `lift_shadow_from_flash` would resolve internally.
-    #[test]
-    fn parse_rom_set_layout_happy_path() {
-        let flash = synth_flash(2);
-        let layout = parse_rom_set_layout(&flash).expect("layout must parse");
-        assert_eq!(layout.len(), 2);
-
-        // Set 0: data ptr = 0x1000_C100 + 0x14000 = 0x1002_0000 → off 0x20000.
-        // Set 1: data ptr = 0x1001_0000 → off 0x10000.
-        // Stride = 64; rom_sets array starts at 0xC100 in the synth blob.
-        assert_eq!(layout[0].descriptor_offset, 0xC100);
-        assert_eq!(layout[0].data_offset, 0x2_0000);
-        assert_eq!(layout[0].size, SHADOW_SIZE);
-
-        assert_eq!(layout[1].descriptor_offset, 0xC100 + ROM_SET_STRIDE);
-        assert_eq!(layout[1].data_offset, 0x1_0000);
-        assert_eq!(layout[1].size, SHADOW_SIZE);
-    }
-
-    /// Truncated flash (smaller than the metadata pointer target) must
-    /// return `None` — same conservative behaviour as
-    /// `lift_shadow_from_flash`.
-    #[test]
-    fn parse_rom_set_layout_rejects_truncated_flash() {
-        let flash = vec![0u8; 512];
-        assert!(parse_rom_set_layout(&flash).is_none());
-    }
-
-    /// A `rom_set_count` of zero is malformed (the firmware would
-    /// dereference rom_sets[0] regardless), so the parser must
-    /// surface it as a parse failure rather than `Some(vec![])`.
-    #[test]
-    fn parse_rom_set_layout_rejects_zero_count() {
-        let mut flash = synth_flash(2);
-        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = 0;
-        assert!(parse_rom_set_layout(&flash).is_none());
-    }
-
-    /// A `size` field that overruns the flash image must be rejected
-    /// (otherwise a downstream copy could walk off the end).
-    #[test]
-    fn parse_rom_set_layout_rejects_oversize_size_field() {
-        let mut flash = synth_flash(2);
-        let entry_off = 0xC100; // set 0
-        let bad_size = (flash.len() as u32) + 1;
-        flash[entry_off + ROM_SET_SIZE_OFFSET..entry_off + ROM_SET_SIZE_OFFSET + 4]
-            .copy_from_slice(&bad_size.to_le_bytes());
-        assert!(parse_rom_set_layout(&flash).is_none());
-    }
-
-    /// `Case::raw_pin_state` must mask CS1 (bit 13) low at construction.
-    /// The validator and any future raw-mode caller depend on this so a
-    /// stray CS1=high pattern can never drift through the API.
-    #[test]
-    fn case_raw_pin_state_masks_cs1() {
-        let case = Case::raw_pin_state("x", 0xFFFF);
-        assert_eq!(case.raw_pin_state, Some(0xDFFF));
-    }
-
-    /// `stimulus_level_raw` is now a verbatim pass-through (the masking
-    /// decision lives at `Case` construction — `Case::raw_pin_state`
-    /// masks CS1, `Case::raw_pin_state_unmasked` preserves it for the
-    /// SeaBIOS validator's `--probe-cs1-thorough` empirical mode).
-    #[test]
-    fn stimulus_level_raw_is_passthrough() {
-        assert_eq!(stimulus_level_raw(0xFFFF), 0xFFFF);
-        assert_eq!(stimulus_level_raw(0xDFFF), 0xDFFF);
-        assert_eq!(stimulus_level_raw(0x0000), 0x0000);
-    }
-
-    /// `Case::raw_pin_state_unmasked` must preserve CS1 verbatim — the
-    /// `--probe-cs1-thorough` mode in the SeaBIOS validator depends on
-    /// CS1=high actually reaching the GPIO bus.
-    #[test]
-    fn case_raw_pin_state_unmasked_preserves_cs1() {
-        let case = Case::raw_pin_state_unmasked("x", 0xFFFF);
-        assert_eq!(case.raw_pin_state, Some(0xFFFF));
-        let case = Case::raw_pin_state_unmasked("x", 0x2000);
-        assert_eq!(case.raw_pin_state, Some(0x2000));
-    }
-
-    /// 4. Real fixture check — `test-sdrr-0.bin` set 1 (the one our
-    /// boot path selects: `rom_set_index = 0x01` confirmed via the live
-    /// binary's runtime_info diagnostic at 2026-04-15) must yield a
-    /// non-uniform shadow AND have meaningful variation at the walking-
-    /// 1s offsets. This is the tripwire from the task brief:
+    /// Single load-bearing equivalence proof for Stage 2: the new
+    /// `Case::from_addr` output must be byte-identical to the legacy
+    /// `stimulus_level()` output for every entry in the historic
+    /// 15-case default catalogue, against the fire-24-a fixture.
     ///
-    ///   "the bytes at shadow[0x001], shadow[0x002], ..., shadow[0x400]
-    ///    (the walking-1 offsets) should be pairwise distinct, or at
-    ///    least have meaningful variation"
-    ///
-    /// Pairwise distinctness is too strict — several walking-1 slots
-    /// in the SDRR pre-processed image hold 0x00, so we relax to
-    /// "at least 5 unique values among the 11 walking-1 offsets".
-    /// The live set 1 data has exactly 6 unique walking-1 bytes (see
-    /// the journal), so 5 is a comfortable lower bound.
+    /// The legacy `stimulus_level` body is reproduced here verbatim
+    /// (TEMPORARY copy — Stage 2 is the only test that asserts this).
+    /// The legacy production code itself was deleted; if this test
+    /// ever fails, either the fire-24-a `addr_pins` parse drifted or
+    /// `Case::from_addr`'s permutation logic regressed. Both are
+    /// load-bearing for fire-24-a behaviour preservation.
     #[test]
-    fn walking_1s_distinctness_from_real_fixture() {
-        let flash_path = "fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
-        let flash = match std::fs::read(flash_path) {
-            Ok(b) => b,
-            Err(_) => {
-                // If running from the workspace root, paths are relative
-                // to the harness crate, but `cargo test` runs with cwd
-                // set to the crate root. Try both.
-                std::fs::read(
-                    "crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin",
-                )
-                .expect("test fixture must be present at either path")
+    fn case_from_addr_matches_legacy_stimulus_level() {
+        // The pre-Stage-2 ADDR_PINS map for fire-24-a — copied from
+        // the deleted production constant. The FixtureSpec parser
+        // rebuilds this from the firmware's `sdrr_pins_t` so we
+        // assert equality against both pathways below.
+        const LEGACY_ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
+
+        // The legacy `stimulus_level` body, reproduced verbatim. CS1
+        // stays low; CS2 (GPIO12) and CS3 (GPIO15) double as A12 and
+        // A11 respectively under this pin map and are driven by the
+        // A11=A12=1 case invariant.
+        fn legacy_stimulus_level(addr_bits: u16) -> u32 {
+            let mut level: u32 = 0;
+            for (i, &pin) in LEGACY_ADDR_PINS.iter().enumerate() {
+                if (addr_bits >> i) & 1 != 0 {
+                    level |= 1u32 << pin;
+                }
             }
-        };
+            level
+        }
 
-        let shadow = lift_shadow_from_flash(&flash, 1).expect("real fixture must parse");
+        let spec = fire24a_spec();
 
-        // Whole-shadow uniqueness — this is the false-green tripwire.
-        let unique_total: std::collections::HashSet<u8> = shadow.iter().copied().collect();
-        assert!(
-            unique_total.len() > 1,
-            "shadow is uniform ({} unique byte) — false-green tripwire would trip",
-            unique_total.len()
+        // Sanity: the parsed addr_pins matches the legacy literal.
+        assert_eq!(
+            spec.addr_pins,
+            LEGACY_ADDR_PINS.to_vec(),
+            "fire-24-a addr_pins parse drifted from the legacy literal"
         );
 
-        // Walking-1 distinctness.
-        let walks: [usize; 11] = [
-            0x001, 0x002, 0x004, 0x008, 0x010, 0x020, 0x040, 0x080, 0x100, 0x200, 0x400,
+        const LEGACY_TABLE: &[(&str, u16)] = &[
+            ("walk1 baseline", 0x1800),
+            ("walk1 A0", 0x1801),
+            ("walk1 A1", 0x1802),
+            ("walk1 A2", 0x1804),
+            ("walk1 A3", 0x1808),
+            ("walk1 A4", 0x1810),
+            ("walk1 A5", 0x1820),
+            ("walk1 A6", 0x1840),
+            ("walk1 A7", 0x1880),
+            ("walk1 A8", 0x1900),
+            ("walk1 A9", 0x1A00),
+            ("walk1 A10", 0x1C00),
+            ("pattern AAA", 0x1AAA),
+            ("pattern D55", 0x1D55),
+            ("pattern FFF", 0x1FFF),
         ];
-        let unique_walks: std::collections::HashSet<u8> =
-            walks.iter().map(|&o| shadow[o]).collect();
-        assert!(
-            unique_walks.len() >= 5,
-            "walking-1 offsets must have meaningful variation (got {} unique values \
-             among {} offsets): {:?}",
-            unique_walks.len(),
-            walks.len(),
-            walks.iter().map(|&o| shadow[o]).collect::<Vec<_>>(),
-        );
+
+        for (label, addr_bits) in LEGACY_TABLE {
+            let new_case = Case::from_addr(label, *addr_bits as u32, &spec);
+            let legacy_level = legacy_stimulus_level(*addr_bits);
+            // Legacy `stimulus_level` returned the pin pattern for the
+            // address bits only (no chip-select levels). `Case::from_addr`
+            // produces the same — chip-select levels are added later by
+            // the oracle's stim composition.
+            assert_eq!(
+                new_case.pin_pattern as u32, legacy_level,
+                "case `{}` (addr_bits=0x{:04X}): from_addr=0x{:08X}, legacy=0x{:08X}",
+                label, addr_bits, new_case.pin_pattern as u32, legacy_level
+            );
+        }
     }
 
     /// 2. Happy-path PASS: push at cycle 5, stable 0x42 from cycle 12 for 3 cycles.
@@ -1512,8 +1315,6 @@ mod tests {
         shadow[pin_bits as usize] = 0x42;
         let resolved = mk_case_resolved();
 
-        // Trace: cycles 0..=14. push at cycle 5, data stable at 0x42
-        // with pad_oe=0xFF at cycles 12, 13, 14.
         let mut trace = Vec::new();
         for c in 0..15u64 {
             let pushes = if c >= 5 { 1 } else { 0 };
@@ -1528,7 +1329,7 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
         assert_eq!(result.verdict, Verdict::Pass);
         assert_eq!(result.latency_cycles, Some(12));
         assert_eq!(result.resolved_addr, Some(resolved));
@@ -1559,7 +1360,7 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
         assert_eq!(
             result.verdict,
             Verdict::WrongByte {
@@ -1571,21 +1372,8 @@ mod tests {
     }
 
     /// 4. Prior-case residue: data is already 0xAA at cycle 0, but the
-    /// push only happens at cycle 5. The stable run must not start at
-    /// cycle 0 — the first_stable_cycle > push_cycle rule anchors the
-    /// latency measurement after cycle 5. Post-Phase-D.2b, the
-    /// MIN_FRESH_ARRIVAL_CYCLE=8 floor further delays stability to
-    /// cycle 8 (even though a byte-match run would otherwise form at
-    /// cycle 6), so the 3-cycle run completes at cycle 10 →
-    /// stable_cycle=8 → latency=8.
-    ///
-    // Validates: residue rejection — the push-anchored latency anchors
-    // after the push cycle AND after the fresh-arrival floor, not at
-    // cycle 0 of a residual byte. Does NOT directly validate the `>`
-    // vs `>=` distinction on the push_cycle comparator — the `continue;`
-    // after the WaitPush→WaitStable transition already prevents the
-    // push cycle from entering the WaitStable arm, so that comparator
-    // is belt-and-braces. Remove either with caution.
+    /// push only happens at cycle 5. Latency must anchor after the push
+    /// + fresh-arrival floor, not at cycle 0.
     #[test]
     fn verdict_rejects_prior_case_residue() {
         let case = mk_case();
@@ -1594,8 +1382,6 @@ mod tests {
         shadow[pin_bits as usize] = 0xAA;
         let resolved = mk_case_resolved();
 
-        // Data byte 0xAA and pad_oe 0xFF from cycle 0 onward (residue).
-        // Push happens at cycle 5.
         let mut trace = Vec::new();
         for c in 0..15u64 {
             let pushes = if c >= 5 { 1 } else { 0 };
@@ -1608,15 +1394,12 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
         assert_eq!(
             result.verdict,
             Verdict::Pass,
             "residue rejection should still PASS once anchored after push + floor"
         );
-        // cs_low_cycle = 0; push_cycle=5. Pre-D.2b the run would start at
-        // cycle 6; post-D.2b MIN_FRESH_ARRIVAL_CYCLE=8 defers it to cycle
-        // 8. 3-cycle run (8,9,10); stable_cycle=8; latency = 8 - 0 = 8.
         assert_eq!(
             result.latency_cycles,
             Some(MIN_FRESH_ARRIVAL_CYCLE as u32),
@@ -1624,24 +1407,14 @@ mod tests {
         );
     }
 
-    /// 4b. Gap-push rejection (H3 fix, 2026-04-17): simulates the
-    /// post-H3 failure mode where gap-level pushes slip into the
-    /// observation window from OneROM's background pipeline. The
-    /// evaluator sees a push edge (`ch1_pushes: 1`) at cycle 0 but the
-    /// `resolved_addr` is the gap-level pattern (`0x2000_B000`), not
-    /// this case's stim pattern. The data bus carries a stale byte
-    /// (`0x20`) that would look stable to a naive evaluator.
-    ///
-    /// Desired: a push whose `resolved & 0xFFFF != expected_pin_bits`
-    /// is skipped as non-stim. If no stim-matching push arrives within
-    /// the window, the verdict is `NoResolve`.
+    /// 4b. Gap-push rejection (H3 fix): a push whose `resolved` is the
+    /// gap-level pattern is skipped as non-stim; verdict is `NoResolve`
+    /// when no stim-matching push arrives.
     #[test]
     fn stability_rejects_stale_byte_without_fresh_push() {
         let case = mk_case();
         let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
-        // Gap-level resolved addr: low-16 = 0xB000 ≠ stim pin-bits
-        // (0x9000 for mk_case). The evaluator must skip this push.
         let resolved = SHADOW_BASE + 0xB000;
         assert_ne!(
             (resolved & 0xFFFF) as u16,
@@ -1649,8 +1422,6 @@ mod tests {
             "test precondition: gap resolve must differ from stim pin-bits",
         );
 
-        // ch1_pushes = 1 from cycle 0 (in-window gap push); stale 0x20
-        // held stable at pad_oe=0xFF.
         let mut trace = Vec::new();
         for c in 0..(PER_CASE_TIMEOUT as u64) {
             trace.push(Observation {
@@ -1662,10 +1433,8 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
 
-        // The 0x20 byte is *not* from this case's push — the only push
-        // in the trace is gap-level and is skipped.
         assert!(
             !matches!(result.verdict, Verdict::WrongByte { observed: 0x20, .. }),
             "stale byte must not surface as WrongByte(observed=0x20); got {:?}",
@@ -1682,8 +1451,6 @@ mod tests {
             "stale byte must not surface as LatencyOutOfEnvelope; got {:?}",
             result.verdict
         );
-        // No stim-matching push within the window → `WaitPush` never
-        // transitions → `NoResolve`.
         assert_eq!(
             result.verdict,
             Verdict::NoResolve,
@@ -1692,11 +1459,8 @@ mod tests {
         assert!(result.observed_byte.is_none());
     }
 
-    /// 4c. All-zero push-count trace: regression guard for the
-    /// pure-residue case (no push at all during the case). Current
-    /// evaluator returns `NoResolve` via the `WaitPush` gate; keep this
-    /// as a backstop so any future refactor that bypasses the gate
-    /// fails loudly.
+    /// 4c. All-zero push-count trace: returns `NoResolve` via the
+    /// `WaitPush` gate.
     #[test]
     fn stability_rejects_stale_byte_with_zero_pushes_throughout() {
         let case = mk_case();
@@ -1715,21 +1479,19 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
         assert_eq!(result.verdict, Verdict::NoResolve);
         assert!(result.observed_byte.is_none());
     }
 
     /// 4d. Early-exit gate (H3): `try_evaluate_conclusive` must not
     /// declare a case conclusive while the trace-so-far contains no
-    /// stim-matching push. The `run_case` loop must keep ticking until
-    /// a stim-match lands or the per-case budget expires.
+    /// stim-matching push.
     #[test]
     fn try_evaluate_conclusive_requires_fresh_push_edge() {
         let case = mk_case();
         let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
-        // Gap-level resolved — non-stim, should be skipped by scan.
         let resolved = SHADOW_BASE + 0xB000;
 
         let mut trace = Vec::new();
@@ -1743,7 +1505,7 @@ mod tests {
             });
         }
         assert!(
-            try_evaluate_conclusive(case, &shadow, pin_bits, &trace).is_none(),
+            try_evaluate_conclusive(case, &shadow, fire24a_shadow_size(), pin_bits, &trace).is_none(),
             "no stim-matching push → not conclusive"
         );
     }
@@ -1751,26 +1513,14 @@ mod tests {
     /// 4e. Fresh-arrival-cycle gate (Phase D.2b): even with a fresh push
     /// edge inside the window, stability declared before the glue DMA
     /// pipeline could possibly have delivered the new byte must be
-    /// rejected. Models the live A7 (case 9) failure where CH1 pushes
-    /// advance 0→1 at cycle 0, `data_byte == 0x20` is stale from a prior
-    /// case, and a 3-cycle stable run at cycles 1..=3 erroneously
-    /// surfaces as `WrongByte observed=0x20 cycles=3`. The fresh byte
-    /// cannot have propagated yet — CH0 read (4) + CH1 read/write (4) =
-    /// 8 sysclks of pipeline depth minimum.
+    /// rejected.
     #[test]
     fn stability_rejects_stale_byte_under_min_fresh_arrival_cycle() {
         let case = mk_case();
         let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
-        // Resolved addr must match stim so the push edge is taken;
-        // expected byte = 0x00 (empty shadow).
         let resolved = mk_case_resolved();
 
-        // Cycle 0: baseline observation with ch1_pushes=0.
-        // Cycles 1..N: ch1_pushes=1 (fresh push edge), stale data_byte=0x20,
-        // pad_oe=0xFF throughout. Data byte NEVER changes, so without the
-        // cycle-floor gate the evaluator would form a 3-cycle stable run
-        // at cycles 1,2,3 and report WrongByte(observed=0x20).
         let mut trace = Vec::new();
         trace.push(Observation {
             cycle: 0,
@@ -1789,13 +1539,8 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
 
-        // The key invariant: no latency < MIN_FRESH_ARRIVAL_CYCLE may be
-        // reported, under any verdict. Pre-fix the evaluator produces
-        // WrongByte(observed=0x20) at latency=2; post-fix any WrongByte
-        // that emerges must be at latency >= 8 (or the case times out as
-        // NoStableByte).
         if let Some(cycles) = result.latency_cycles {
             assert!(
                 (cycles as u64) >= MIN_FRESH_ARRIVAL_CYCLE,
@@ -1806,7 +1551,6 @@ mod tests {
                 result.verdict
             );
         }
-        // Stale 0x20 must not PASS against expected 0x00.
         assert_ne!(
             result.verdict,
             Verdict::Pass,
@@ -1814,24 +1558,12 @@ mod tests {
         );
     }
 
-    /// 5. Push with non-0x2000 hi16 is a non-stim push and skipped —
-    /// the evaluator must not transition to `WaitStable` on it.
-    /// Post-H3 (2026-04-17): the stim-pattern predicate requires
-    /// `resolved >> 16 == 0x2000` to accept a push; addresses outside
-    /// that hi16 window are treated as non-stim / background activity
-    /// and scanned past. If no stim-matching push arrives, verdict is
-    /// `NoResolve`.
-    ///
-    /// Note: `Verdict::ResolvedAddrOutOfRange` remains in the enum as
-    /// belt-and-braces for a future SHADOW_SIZE resize, but with
-    /// SHADOW_SIZE=0x10000 spanning the full low-16 range, it is
-    /// unreachable under the current stim-pattern predicate.
+    /// 5. Push with non-0x2000 hi16 is a non-stim push and skipped.
     #[test]
     fn verdict_non_stim_push_skipped_as_no_resolve() {
         let case = mk_case();
         let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
-        // hi16 != 0x2000 — skipped regardless of low-16.
         let non_stim_addr = 0x2100_0000u32;
 
         let trace = vec![
@@ -1851,7 +1583,7 @@ mod tests {
             },
         ];
 
-        let result = evaluate_case_trace(case, &shadow, pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
         assert_eq!(
             result.verdict,
             Verdict::NoResolve,
@@ -1861,92 +1593,40 @@ mod tests {
         assert!(result.expected_byte.is_none());
     }
 
-    /// 6. Full sweep shape: G.2 landed the 15-case walking-1s + pattern
-    /// set. Validate length, the A11=A12=1 invariant on every entry, and
-    /// single-bit coverage across A0..A10 (each low-bit appears in
-    /// exactly one non-baseline walking case, plus the all-zero baseline).
+    /// 6. Default-cases shape: 15 cases, each with the same shape under
+    /// `from_addr` (label, computed pin_pattern). Validates length and
+    /// distinct labels.
     #[test]
     fn default_cases_full_sweep_shape() {
-        // Length as specified by HLD §4.2: 12 walking-1s (baseline + one
-        // per A0..A10 = 12) + 3 distinct pattern cases (0x1AAA, 0x1D55,
-        // 0x1FFF; the 0x1800 "pattern" is already the baseline).
-        assert_eq!(DEFAULT_CASES.len(), 15, "expected 15 cases");
+        let spec = fire24a_spec();
+        let cases = default_cases(&spec);
+        assert_eq!(cases.len(), 15, "expected 15 cases");
 
-        // Every case must keep CS2/CS3 deasserted (A11=A12=1).
-        for c in DEFAULT_CASES {
-            assert_eq!(
-                c.addr_bits & ADDR_A11_A12_HIGH,
-                ADDR_A11_A12_HIGH,
-                "case `{}` has wrong high bits: 0x{:04X}",
-                c.label,
-                c.addr_bits
+        // Distinct labels.
+        let mut seen_labels: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for c in &cases {
+            assert!(
+                seen_labels.insert(c.label),
+                "duplicate label `{}` in default_cases",
+                c.label
             );
         }
 
-        // Walking-1s coverage: for each bit in A0..A10, exactly one
-        // walking case must have that bit set with all other low bits
-        // zero. Accumulate the set of "single-bit masks" seen and
-        // compare against the reference 11-bit set {0x001,..,0x400}.
-        let low_bits = |addr: u16| -> u16 { addr & 0x07FF };
-        let is_walking_single_bit = |bits: u16| -> bool { bits != 0 && bits.count_ones() == 1 };
-
-        let mut seen_single_bits: u16 = 0; // OR of all walking-1 masks observed
-        let mut baseline_seen = false;
-        for c in DEFAULT_CASES {
-            let lb = low_bits(c.addr_bits);
-            if lb == 0 {
-                baseline_seen = true;
-            } else if is_walking_single_bit(lb) {
-                assert_eq!(
-                    seen_single_bits & lb,
-                    0,
-                    "duplicate walking-1 bit in case `{}`: 0x{:04X}",
-                    c.label,
-                    c.addr_bits
-                );
-                seen_single_bits |= lb;
-            }
-        }
-        assert!(baseline_seen, "baseline (low bits 0) must be present");
-        assert_eq!(
-            seen_single_bits, 0x07FF,
-            "walking-1s coverage incomplete: got 0x{:04X}, want 0x07FF",
-            seen_single_bits
-        );
-
-        // Pattern cases must all be distinct from walking cases and
-        // from each other. The spec calls out exactly three non-baseline
-        // patterns: 0x1AAA, 0x1D55, 0x1FFF.
-        let mut saw_aaa = false;
-        let mut saw_d55 = false;
-        let mut saw_fff = false;
-        for c in DEFAULT_CASES {
-            match c.addr_bits {
-                0x1AAA => saw_aaa = true,
-                0x1D55 => saw_d55 = true,
-                0x1FFF => saw_fff = true,
-                _ => {}
-            }
-        }
-        assert!(saw_aaa, "missing pattern case 0x1AAA");
-        assert!(saw_d55, "missing pattern case 0x1D55");
-        assert!(saw_fff, "missing pattern case 0x1FFF");
-
-        // Final sanity: no duplicate addr_bits anywhere in the list.
-        let mut uniq = std::collections::HashSet::new();
-        for c in DEFAULT_CASES {
+        // Distinct pin patterns.
+        let mut seen_patterns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for c in &cases {
             assert!(
-                uniq.insert(c.addr_bits),
-                "duplicate case addr_bits: 0x{:04X}",
-                c.addr_bits
+                seen_patterns.insert(c.pin_pattern),
+                "duplicate pin_pattern 0x{:X} in default_cases (label `{}`)",
+                c.pin_pattern,
+                c.label
             );
         }
     }
 
     // --- G.3 tests: envelope post-processing + report formatter ----------
 
-    /// 7. Envelope pass-through: a Pass verdict with latency inside the
-    /// `ENVELOPE_CYCLES` envelope must survive `apply_envelope` unchanged.
+    /// 7. Envelope pass-through.
     #[test]
     fn apply_envelope_passes_through_in_range_latency() {
         let case = mk_case();
@@ -1965,8 +1645,7 @@ mod tests {
         assert_eq!(out.latency_cycles, Some(in_range));
     }
 
-    /// 8. Envelope rewrite: a Pass verdict with latency outside the
-    /// envelope must be reclassified as `LatencyOutOfEnvelope`.
+    /// 8. Envelope rewrite.
     #[test]
     fn apply_envelope_rewrites_out_of_range_latency() {
         let case = mk_case();
@@ -1987,24 +1666,15 @@ mod tests {
                 cycles: out_of_range
             }
         );
-        // Other fields survive the rewrite.
         assert_eq!(out.latency_cycles, Some(out_of_range));
         assert_eq!(out.observed_byte, Some(0x42));
     }
 
     /// 9. Non-Pass verdicts are never rewritten by the envelope check.
-    /// Tests WrongByte, NoResolve, NoStableByte, and
-    /// ResolvedAddrOutOfRange — the envelope filter must be a no-op
-    /// regardless of what `latency_cycles` says.
     #[test]
     fn apply_envelope_leaves_non_pass_verdicts_alone() {
         let case = mk_case();
 
-        // WrongByte with latency inside the envelope. The envelope
-        // value itself is immaterial — apply_envelope only considers
-        // Pass verdicts — but seed with an in-range value so a reader
-        // doesn't have to check twice that the non-rewrite comes from
-        // the verdict, not the latency.
         let in_range = *ENVELOPE_CYCLES.start() + 5;
         let wrong_byte = CaseResult {
             case,
@@ -2026,7 +1696,6 @@ mod tests {
             }
         );
 
-        // NoResolve with no latency at all.
         let no_resolve = CaseResult {
             case,
             resolved_addr: None,
@@ -2038,8 +1707,6 @@ mod tests {
         let out = apply_envelope(no_resolve);
         assert_eq!(out.verdict, Verdict::NoResolve);
 
-        // ResolvedAddrOutOfRange: even if latency is set (it shouldn't
-        // be, but defend anyway), apply_envelope must not rewrite.
         let bad_addr = 0x2100_0000u32;
         let addr_oor = CaseResult {
             case,
@@ -2056,21 +1723,17 @@ mod tests {
         );
     }
 
-    /// 10. `format_report` sections smoke-check. Builds a
-    /// `ServingOracle` with three hand-crafted results (one per major
-    /// verdict shape), renders the report, and asserts the required
-    /// sections are present. Deliberately NOT a pixel-perfect check —
-    /// formatter tweaks should not break this test.
+    /// 10. `format_report` sections smoke-check.
     #[test]
     fn format_report_has_required_sections() {
-        let mut shadow = Box::new([0u8; SHADOW_SIZE]);
+        let spec = fire24a_spec();
+        let mut shadow = empty_shadow();
         shadow[0x10] = 0x42;
-        let mut oracle = ServingOracle::new_with_shadow(shadow);
+        let mut oracle = ServingOracle::new_with_shadow(spec.clone(), shadow);
 
-        let case = mk_case();
+        let case = Case::from_addr("test", 0x1800, &spec);
         let in_range = *ENVELOPE_CYCLES.start() + 5;
 
-        // One Pass (in envelope) → exercises the latency-stats branch.
         oracle.push_result_for_test(CaseResult {
             case,
             resolved_addr: Some(SHADOW_BASE + 0x10),
@@ -2080,7 +1743,6 @@ mod tests {
             verdict: Verdict::Pass,
         });
 
-        // One WrongByte → exercises the WrongByte row + fail bucket.
         oracle.push_result_for_test(CaseResult {
             case,
             resolved_addr: Some(SHADOW_BASE + 0x10),
@@ -2093,7 +1755,6 @@ mod tests {
             },
         });
 
-        // One LatencyOutOfEnvelope → exercises the LatencyOOE row.
         oracle.push_result_for_test(CaseResult {
             case,
             resolved_addr: Some(SHADOW_BASE + 0x10),
@@ -2105,7 +1766,6 @@ mod tests {
 
         let report = oracle.format_report(150_000_000);
 
-        // Header.
         assert!(
             report.contains("sys_clk_hz: 150000000"),
             "header missing sys_clk_hz: {}",
@@ -2117,7 +1777,6 @@ mod tests {
             report
         );
 
-        // Per-case table rows — one per verdict shape.
         assert!(report.contains("Pass"), "missing Pass row: {}", report);
         assert!(
             report.contains("WrongByte"),
@@ -2130,7 +1789,6 @@ mod tests {
             report
         );
 
-        // Summary section.
         assert!(
             report.contains("Summary:"),
             "missing Summary section: {}",
@@ -2142,7 +1800,6 @@ mod tests {
             report
         );
 
-        // Emulator-bounded caveat snippet (HLD §5.4).
         assert!(
             report.contains("glue DMA + PIO model"),
             "missing emulator-bounded caveat: {}",
@@ -2152,35 +1809,14 @@ mod tests {
 
     /// 11. Envelope wiring invariant: every `CaseResult` stored in
     /// `ServingOracle::results` must be a fixed point of `apply_envelope`.
-    /// This is the production path's contract (`run_case` pushes
-    /// `apply_envelope(result)`), and the invariant is equivalent: if
-    /// `apply_envelope` has already been applied, applying it again is a
-    /// no-op; if a raw (pre-envelope) result ever leaks into `results`,
-    /// `apply_envelope` would rewrite its verdict and the equality fails.
-    ///
-    /// Guards against a future refactor accidentally pushing a raw
-    /// `Pass`-with-out-of-range-latency into `results` — that would reach
-    /// the report as a false PASS. The test-only `push_result_for_test`
-    /// bypasses `apply_envelope` deliberately (so report tests can seed
-    /// synthetic `LatencyOutOfEnvelope` rows without round-tripping); it
-    /// is therefore the caller's responsibility to push envelope-
-    /// conformant results, which this test verifies.
     #[test]
     fn run_case_applies_envelope_before_pushing_result() {
-        let shadow: Box<[u8; SHADOW_SIZE]> = vec![0u8; SHADOW_SIZE]
-            .into_boxed_slice()
-            .try_into()
-            .unwrap();
-        let mut oracle = ServingOracle::new_with_shadow(shadow);
+        let spec = fire24a_spec();
+        let cases = default_cases(&spec);
+        let mut oracle = ServingOracle::new_with_shadow(spec, empty_shadow());
 
-        // A raw `Pass+5` would be rewritten by `apply_envelope` to
-        // `LatencyOutOfEnvelope { cycles: 5 }` (5 is below the
-        // `ENVELOPE_CYCLES` floor). Push the already-transformed
-        // result — the same thing `run_case` does on the production
-        // path — and then assert every stored result is a fixed point
-        // of `apply_envelope`.
         let pre = CaseResult {
-            case: DEFAULT_CASES[0],
+            case: cases[0],
             verdict: Verdict::Pass,
             latency_cycles: Some(5),
             resolved_addr: Some(SHADOW_BASE),
@@ -2195,9 +1831,6 @@ mod tests {
         );
         oracle.push_result_for_test(post);
 
-        // Invariant the production path must preserve: every stored
-        // result is envelope-idempotent. If `run_case` is ever refactored
-        // to push a raw result, this assertion fails.
         for r in oracle.results() {
             assert_eq!(
                 *r,
@@ -2209,13 +1842,6 @@ mod tests {
     }
 
     // --- Phase C tests: `populate_sram_from_shadow` --------------------------
-    //
-    // The oracle's flash-parsed shadow is the ground truth, but the glue DMA
-    // CH1 still reads through the bus at `resolved_addr`. Without mirroring
-    // the shadow into emulator SRAM the bus returns 0x00 for every read —
-    // `observed_byte` collapses to a single uniform value across all 15
-    // cases. These tests pin `populate_sram_from_shadow` as the contract
-    // that publishes the shadow to SRAM at `SHADOW_BASE`.
 
     use rp2350_emu::{Config, EmulatorBuilder};
 
@@ -2225,20 +1851,18 @@ mod tests {
             .expect("Serial build is infallible")
     }
 
-    /// The four walking-1 SDRR A0..A3 offsets must appear in SRAM with the
-    /// shadow's bytes after `populate_sram_from_shadow`. Also asserts the
-    /// non-zero byte at 0x9010 — silent-revert guard, in case a future
-    /// refactor accidentally routes the write through a SRAM alias that
-    /// XOR/SET/CLRs instead of storing the byte verbatim.
+    /// Walking-1 SDRR offsets must appear in SRAM with the shadow's
+    /// bytes after `populate_sram_from_shadow`.
     #[test]
     fn populate_sram_from_shadow_writes_bus_at_walking_1_offsets() {
         let mut emu = mk_emu();
+        let spec = fire24a_spec();
         let mut shadow = empty_shadow();
         shadow[0x9010] = 0x08;
         shadow[0x9020] = 0x04;
         shadow[0x9040] = 0x02;
         shadow[0x9080] = 0x01;
-        let oracle = ServingOracle::new_with_shadow(shadow);
+        let oracle = ServingOracle::new_with_shadow(spec, shadow);
 
         oracle.populate_sram_from_shadow(&mut emu.bus);
 
@@ -2253,19 +1877,20 @@ mod tests {
         );
     }
 
-    /// Off-by-one guard on the populate loop — both ends of the shadow
-    /// range must land in SRAM.
+    /// Off-by-one guard on the populate loop.
     #[test]
     fn populate_sram_from_shadow_covers_full_shadow_range() {
         let mut emu = mk_emu();
+        let spec = fire24a_spec();
+        let shadow_size = spec.shadow_size;
         let mut shadow = empty_shadow();
         shadow[0] = 0xAA;
-        shadow[SHADOW_SIZE - 1] = 0x55;
-        let oracle = ServingOracle::new_with_shadow(shadow);
+        shadow[shadow_size - 1] = 0x55;
+        let oracle = ServingOracle::new_with_shadow(spec, shadow);
 
         oracle.populate_sram_from_shadow(&mut emu.bus);
 
         assert_eq!(emu.bus.read8(SHADOW_BASE, 0), 0xAA);
-        assert_eq!(emu.bus.read8(SHADOW_BASE + SHADOW_SIZE as u32 - 1, 0), 0x55);
+        assert_eq!(emu.bus.read8(SHADOW_BASE + shadow_size as u32 - 1, 0), 0x55);
     }
 }

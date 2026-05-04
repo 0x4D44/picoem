@@ -24,21 +24,18 @@
 //!   and a pure `verify_observed` that walks the observation buffer
 //!   and returns the first mismatch (if any) as a `FailContext`.
 //!
-//! The pin constants (`GPIO_CS1`/`GPIO_CS2`/`GPIO_CS3`, `ADDR_PINS`,
-//! `GPIO_DATA_BASE`) are private to [`crate::onerom_serving_oracle_cpu`]
-//! — we reach through the re-exported stimulus helper
-//! [`crate::onerom_serving_oracle::stimulus_level_pub`] to keep the
-//! pin-map knowledge in one place. For the 1541 `ROM_SET_INDEX=0`
-//! fixture, CS2/CS3 are "NotUsed" per the SDRR bake (the 2364 serve
-//! loop gates only on CS1=GPIO13), so the stimulus for the walk is
-//! the same encoding the stress sweep uses: CS1 held low, A0..A12
-//! placed at `ADDR_PINS[0..13]`.
+//! Pin layout flows through a [`FixtureSpec`] supplied by the caller —
+//! the binary parses it once at startup via
+//! [`FixtureSpec::from_flash`] and threads it through `build_walk_plan`
+//! and the measurement helpers. Stage 2 of the fixture-generalization
+//! HLD eliminated the pin-map duplicates that lived here pre-restructure.
 //!
 //! Unit tests cover the pure bits below. The end-to-end gate is the
 //! binary run; this module owns none of the threading, timing, or
 //! report-format surface.
 
-use crate::onerom_serving_oracle::{lift_shadow_from_flash_pub, stimulus_level_pub};
+use crate::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
+use crate::onerom_serving_oracle::Case;
 
 use rand::RngCore;
 use rand::SeedableRng;
@@ -97,19 +94,18 @@ pub struct WalkStep {
     pub addr: u16,
 }
 
-/// Pin constants — kept in sync with
-/// [`crate::onerom_serving_oracle::stimulus_level`]. Mirrors the
-/// `test-sdrr-0` and 1541-set-0 pin bake (both 2364 images; identical
-/// pin layout verified via the stress binary's 2048/2048 PASS).
-///
-/// Private — the public contract is `WalkStep.gpio_mask`, not these
-/// constants.
-const GPIO_CS1: u8 = 13;
-const GPIO_CS2: u8 = 12;
-const GPIO_CS3: u8 = 15;
-const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
+// Pin constants live on the supplied `FixtureSpec`. `build_walk_plan`
+// composes the same `gpio_mask` shape (gate CS + every deasserted-high
+// CS pin + every asserted-low pin + every address pin) that the
+// `CpuServingOracle::run_case` external-input mask uses.
 
-/// Base pin index for the 8-bit data bus (D0..D7 → GPIO 16..23).
+/// Base pin index for the 8-bit data bus on the legacy fire-24-a
+/// fixture (D0..D7 → GPIO 16..23). Kept as a public constant so the
+/// 1541-targeted speed-grade binary can extract the observed byte from
+/// the bus word without re-deriving the offset every time. Stage 2
+/// notes: a fixture-aware version would query `spec.data_pins[0]` —
+/// the binary still does it this way because its measurement loop
+/// pre-dates the spec plumbing; a follow-up will switch it over.
 pub const GPIO_DATA_BASE: u8 = 16;
 
 /// Walk-plan length: 2048 cases — the A11=A12=1 subspace where the
@@ -151,44 +147,60 @@ pub const ADDR_A11_A12_HIGH: u16 = 0x1800;
 /// function reads from flash.
 pub const ROM_SET_INDEX: u8 = 0;
 
-/// Build the full 8 KB walk plan against the shadow lifted from the
-/// fixture's ROM set 0. Returns a 8192-entry `Vec<WalkStep>`, one per
-/// 13-bit address.
+/// Build the full walk plan against the shadow lifted from the
+/// fixture's ROM set 0. Returns a `WALK_PLAN_LEN`-entry vector, one per
+/// 13-bit address in the A11=A12=1 subspace.
 ///
 /// Each step:
-/// - `gpio_stim` places bit `i` of the 13-bit address on `ADDR_PINS[i]`.
-///   CS1 stays low (bit not set); CS2 (GPIO12) and CS3 (GPIO15) are
-///   driven by A12 and A11 respectively per the pin-map aliasing
-///   baked into this firmware — mirrors
-///   [`stimulus_level_pub`]'s convention.
-/// - `gpio_mask` covers CS1, CS2, CS3, and all `ADDR_PINS` bits. The
-///   measurement thread writes this pair via `write_external(stim,
-///   mask)`; the coordinator's `update_gpio` then merges the masked
-///   bits into `gpio_in` each quantum.
+/// - `gpio_stim` is composed by [`Case::from_addr`] (address bits
+///   permuted through `spec.addr_pins`) ORed with the deasserted-high
+///   CS pins from `spec.deasserted_high_during_read`. The gate CS
+///   (`spec.cs1`) stays LOW — that's what selects the chip.
+/// - `gpio_mask` covers gate CS, every deasserted-high CS pin, every
+///   asserted-low pin, and every address pin. Mirrors
+///   `CpuServingOracle::run_case`'s external-input mask.
 /// - `expected` is `shadow[gpio_stim & 0xFFFF]` — the same shadow
-///   lookup the CPU performs in the serve loop, so a matching observed
-///   byte on the wire is byte-identical to what the firmware served.
+///   lookup the CPU performs in its serve loop.
 ///
-/// Returns `Err` on any shadow-lift parse failure (malformed fixture,
-/// ROM set 0 absent, pointer out of range). The walk is only
-/// well-defined when the shadow lift succeeds — the caller cannot
-/// fall back to a zero-filled shadow here without silently producing
-/// an all-zero expected map (every PASS would be spurious).
-pub fn build_walk_plan(flash: &[u8]) -> Result<Vec<WalkStep>, String> {
-    let shadow = lift_shadow_from_flash_pub(flash, ROM_SET_INDEX)
+/// Returns `Err` on any shadow-lift parse failure.
+pub fn build_walk_plan(flash: &[u8], spec: &FixtureSpec) -> Result<Vec<WalkStep>, String> {
+    let shadow = lift_shadow_from_flash(flash, ROM_SET_INDEX, spec)
         .ok_or_else(|| "failed to lift ROM set 0 shadow from flash".to_string())?;
 
-    let mask: u32 = (1u32 << GPIO_CS1)
-        | (1u32 << GPIO_CS2)
-        | (1u32 << GPIO_CS3)
-        | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
+    // Compose the external-input mask from the spec.
+    let mut mask_u64: u64 = 1u64 << spec.cs1;
+    for &p in &spec.deasserted_high_during_read {
+        mask_u64 |= 1u64 << p;
+    }
+    for &p in &spec.asserted_low_during_read {
+        mask_u64 |= 1u64 << p;
+    }
+    for &p in &spec.addr_pins {
+        mask_u64 |= 1u64 << p;
+    }
+    debug_assert!(
+        mask_u64 >> 32 == 0,
+        "build_walk_plan: gpio_mask uses GPIOs >= 32; widen Bus interface for fire-32-a (Stage 3)"
+    );
+    let mask = mask_u64 as u32;
+
+    // Pre-compute the deasserted-high contribution (this is what the
+    // oracle's stim composition adds before ORing in the case pattern).
+    let mut deasserted_high: u64 = 0;
+    for &p in &spec.deasserted_high_during_read {
+        deasserted_high |= 1u64 << p;
+    }
 
     let mut plan = Vec::with_capacity(WALK_PLAN_LEN);
-    // Walk the A11=A12=1 subspace: addr_bits ranges 0x1800..=0x1FFF.
-    // `low11` iterates A0..A10, then we OR in the A11=A12=1 bits.
     for low11 in 0..WALK_PLAN_LEN as u16 {
         let addr_bits = ADDR_A11_A12_HIGH | low11;
-        let stim = stimulus_level_pub(addr_bits);
+        let case = Case::from_addr("walk", addr_bits as u32, spec);
+        let stim_u64 = deasserted_high | case.pin_pattern;
+        debug_assert!(
+            stim_u64 >> 32 == 0,
+            "build_walk_plan: gpio_stim uses GPIOs >= 32"
+        );
+        let stim = stim_u64 as u32;
         let shadow_offset = (stim & 0xFFFF) as usize;
         let expected = shadow[shadow_offset];
         plan.push(WalkStep {
@@ -339,22 +351,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to load {}: {}", FIXTURE_PATH, e))
     }
 
+    fn load_spec() -> FixtureSpec {
+        FixtureSpec::from_flash(&load_fixture()).expect("FixtureSpec parse must succeed")
+    }
+
     /// The walk plan covers every A11=A12=1 case (addr_bits ∈
     /// 0x1800..=0x1FFF), each exactly once. Validates the core shape
     /// invariant: no duplicates, no gaps.
-    ///
-    /// HLD V3 §3 asked for 8192 samples / 8 KB; actual reach is 2048
-    /// per [`WALK_PLAN_LEN`]. The test asserts the invariant we
-    /// actually ship, not the aspirational one.
     #[test]
     fn walk_plan_covers_2kb_a11_a12_high_subspace() {
         let flash = load_fixture();
-        let plan = build_walk_plan(&flash).expect("build_walk_plan");
+        let spec = FixtureSpec::from_flash(&flash).expect("spec parse");
+        let plan = build_walk_plan(&flash, &spec).expect("build_walk_plan");
         assert_eq!(plan.len(), WALK_PLAN_LEN, "walk plan must be 2048 steps");
 
         let mut seen = vec![false; WALK_PLAN_LEN];
         for step in &plan {
-            // Every step must satisfy the A11=A12=1 invariant.
             assert_eq!(
                 step.addr & ADDR_A11_A12_HIGH,
                 ADDR_A11_A12_HIGH,
@@ -382,26 +394,20 @@ mod tests {
     }
 
     /// For a sampling of addresses, re-extracting the 13-bit address
-    /// from `gpio_stim` via `ADDR_PINS` must yield the same address.
-    /// This is the load-bearing property for the measurement path
-    /// — if stim placement ever drifts from the oracle's pin bake,
-    /// the CPU will look up the wrong shadow entry and every sample
-    /// will diverge.
+    /// from `gpio_stim` via `spec.addr_pins` must yield the same
+    /// address. Load-bearing property for the measurement path.
     #[test]
     fn walk_plan_stim_encodes_address_correctly() {
         let flash = load_fixture();
-        let plan = build_walk_plan(&flash).expect("build_walk_plan");
+        let spec = load_spec();
+        let plan = build_walk_plan(&flash, &spec).expect("build_walk_plan");
 
-        // Check a spread of addresses — baseline + walking-1s across
-        // A0..A10 + the dense pattern. All within the A11=A12=1
-        // subspace (0x1800..=0x1FFF) so they actually live in the
-        // walk plan.
         let samples: Vec<u16> = (0..11u16)
             .map(|bit| ADDR_A11_A12_HIGH | (1u16 << bit))
             .chain([
                 ADDR_A11_A12_HIGH,
-                ADDR_A11_A12_HIGH | 0x07FF, // all low bits set
-                ADDR_A11_A12_HIGH | 0x02AA, // alt
+                ADDR_A11_A12_HIGH | 0x07FF,
+                ADDR_A11_A12_HIGH | 0x02AA,
             ])
             .collect();
         for &addr in &samples {
@@ -410,9 +416,9 @@ mod tests {
                 .find(|s| s.addr == addr)
                 .unwrap_or_else(|| panic!("addr 0x{:04X} not in plan", addr));
             // Rebuild the 13-bit address from the stim word by
-            // walking ADDR_PINS in the same order stimulus_level uses.
+            // walking spec.addr_pins.
             let mut decoded: u16 = 0;
-            for (i, &pin) in ADDR_PINS.iter().enumerate() {
+            for (i, &pin) in spec.addr_pins.iter().enumerate().take(13) {
                 if (step.gpio_stim >> pin) & 1 != 0 {
                     decoded |= 1u16 << i;
                 }
@@ -422,21 +428,28 @@ mod tests {
                 "addr 0x{:04X} stim 0x{:08X} decoded to 0x{:04X}",
                 addr, step.gpio_stim, decoded
             );
-            // CS1 must stay low — the serve loop gates on CS1 edge.
+            // Gate CS (cs1) must stay low.
             assert_eq!(
-                step.gpio_stim & (1u32 << GPIO_CS1),
+                step.gpio_stim & (1u32 << spec.cs1),
                 0,
-                "CS1 must be low in every stim (addr {:#06x})",
+                "gate CS must be low in every stim (addr {:#06x})",
                 addr
             );
-            // Mask must include CS1/CS2/CS3 and all ADDR pins.
-            let expected_mask: u32 = (1u32 << GPIO_CS1)
-                | (1u32 << GPIO_CS2)
-                | (1u32 << GPIO_CS3)
-                | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
+            // Mask must include gate CS, every deasserted/asserted CS pin,
+            // and every address pin.
+            let mut expected_mask: u64 = 1u64 << spec.cs1;
+            for &p in &spec.deasserted_high_during_read {
+                expected_mask |= 1u64 << p;
+            }
+            for &p in &spec.asserted_low_during_read {
+                expected_mask |= 1u64 << p;
+            }
+            for &p in &spec.addr_pins {
+                expected_mask |= 1u64 << p;
+            }
             assert_eq!(
-                step.gpio_mask, expected_mask,
-                "gpio_mask must cover CS1/CS2/CS3 + all ADDR_PINS"
+                step.gpio_mask as u64, expected_mask,
+                "gpio_mask must cover gate CS + dehigh/aslow CS pins + ADDR_PINS"
             );
         }
     }
@@ -511,7 +524,8 @@ mod tests {
     #[test]
     fn verify_reports_first_mismatch() {
         let flash = load_fixture();
-        let plan = build_walk_plan(&flash).expect("build_walk_plan");
+        let spec = load_spec();
+        let plan = build_walk_plan(&flash, &spec).expect("build_walk_plan");
 
         // Trivial shuffle: identity.
         let shuffle: Vec<u32> = (0..plan.len() as u32).collect();

@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use picoem_harness::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
 use picoem_harness::{onerom_serving_oracle, onerom_serving_oracle_cpu};
 use rp2350_emu::{Config, EmulatorBuilder};
 
@@ -144,15 +145,22 @@ fn main() -> ExitCode {
         emu.core(0).regs.pc(),
     );
 
+    // Parse the FixtureSpec for shadow lifting + oracle construction.
+    let spec = match FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("fixture: {} ({}-pin)", spec.label, spec.chip_pins);
+
     // Lift shadow via the SRAM-reported rom_set_index.
     let rom_set_index = emu
         .bus
         .memory
         .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
-    let sentinel: Option<(u32, u8)> = match onerom_serving_oracle::lift_shadow_from_flash_pub(
-        &flash,
-        rom_set_index,
-    ) {
+    let sentinel: Option<(u32, u8)> = match lift_shadow_from_flash(&flash, rom_set_index, &spec) {
         Some(shadow) => {
             let s = onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow);
             match s {
@@ -239,14 +247,18 @@ fn main() -> ExitCode {
 
     // Build the oracle. Shadow is lifted from flash (canonical ground
     // truth — mirrors the PIO oracle's approach).
-    let mut oracle = onerom_serving_oracle_cpu::CpuServingOracle::new_at_sync(&mut emu.bus, &flash);
+    let mut oracle = onerom_serving_oracle_cpu::CpuServingOracle::new_at_sync(
+        &mut emu.bus,
+        spec.clone(),
+        &flash,
+    );
 
     // Shadow-integrity tripwire (same as the PIO oracle).
     let unique: HashSet<u8> = oracle.shadow().iter().copied().collect();
     println!(
         "shadow @ 0x{:08X}..+0x{:04X}: {} unique bytes",
         onerom_serving_oracle::SHADOW_BASE,
-        onerom_serving_oracle::SHADOW_SIZE,
+        spec.shadow_size,
         unique.len(),
     );
     if unique.len() == 1 {
@@ -261,12 +273,10 @@ fn main() -> ExitCode {
     // lifted shadow is used only as the verdict-comparison reference.
 
     // Per-case sweep.
-    let total = onerom_serving_oracle_cpu::CPU_DEFAULT_CASES.len();
+    let cases = onerom_serving_oracle_cpu::cpu_default_cases(&spec);
+    let total = cases.len();
     let mut wall_us: Vec<f64> = Vec::with_capacity(total);
-    for (idx, case) in onerom_serving_oracle_cpu::CPU_DEFAULT_CASES
-        .iter()
-        .enumerate()
-    {
+    for (idx, case) in cases.iter().enumerate() {
         let t0 = Instant::now();
         let result = oracle.run_case(&mut emu, *case);
         let elapsed_us = t0.elapsed().as_nanos() as f64 / 1000.0;
@@ -285,11 +295,11 @@ fn main() -> ExitCode {
             .map(|c| format!("{}", c))
             .unwrap_or_else(|| "—".to_string());
         println!(
-            "[{:>2}/{:>2}] {:<16} addr=0x{:04X} verdict={:<18} expected={} observed={} cycles={} wall={:.3} us",
+            "[{:>2}/{:>2}] {:<16} pat=0x{:08X} verdict={:<18} expected={} observed={} cycles={} wall={:.3} us",
             idx + 1,
             total,
             result.case.label,
-            result.case.addr_bits,
+            result.case.pin_pattern as u32,
             verdict_str,
             expected,
             observed,

@@ -18,6 +18,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use picoem_harness::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
 use picoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_stress, onerom_sync};
 use rp2350_emu::{Config, EmulatorBuilder};
 
@@ -58,13 +59,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // Parse the FixtureSpec up front — fail fast on malformed flash.
+    let spec = match FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+
     // Up-front shadow-lift sanity check: confirm the hardcoded ROM set
     // parses out of the fixture. If this returns None the sweep cannot
     // meaningfully PASS — every case would see the fallback zero shadow.
     // We still boot below (the oracle lifts its own copy via
     // `new_at_sync` reading the SRAM rom_set_index), but a None here is
     // a loud early signal that the fixture / ROM_SET_INDEX pair is wrong.
-    if onerom_serving_oracle::lift_shadow_from_flash_pub(&flash, ROM_SET_INDEX).is_none() {
+    if lift_shadow_from_flash(&flash, ROM_SET_INDEX, &spec).is_none() {
         eprintln!(
             "failed to lift ROM set {} from fixture — wrong index or malformed flash",
             ROM_SET_INDEX
@@ -120,10 +130,11 @@ fn main() -> ExitCode {
     }
 
     // Prime DMA + oracle. `new_at_sync` lifts its shadow by reading the
-    // SRAM-encoded rom_set_index; the up-front `lift_shadow_from_flash_pub`
+    // SRAM-encoded rom_set_index; the up-front `lift_shadow_from_flash`
     // above confirms the hardcoded `ROM_SET_INDEX` matches a real set.
     glue.prime_after_sync(&mut emu.bus);
-    let mut oracle = onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, &flash);
+    let mut oracle =
+        onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, spec.clone(), &flash);
     oracle.populate_sram_from_shadow(&mut emu.bus);
 
     // Silent sweep: 2048 cases, no per-case output.
@@ -133,7 +144,7 @@ fn main() -> ExitCode {
     // report can show host elapsed time alongside the emulated-cycle
     // model latency. Both cases contribute to the throughput
     // denominator (failing cases still consume host time).
-    let cases = onerom_stress::generate_sweep_cases();
+    let cases = onerom_stress::generate_sweep_cases(&spec);
     let mut wall_durations: Vec<Duration> = Vec::with_capacity(cases.len());
     for case in &cases {
         let t0 = Instant::now();

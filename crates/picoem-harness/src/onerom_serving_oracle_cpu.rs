@@ -25,29 +25,32 @@
 //! - **Envelope**: measured empirically; CPU-serve steady-state latency
 //!   differs from PIO pipeline latency.
 //!
-//! Design mirrors [`crate::onerom_serving_oracle`] — we share
-//! [`Case`] / [`DEFAULT_CASES`] / [`SHADOW_BASE`] / [`SHADOW_SIZE`] /
-//! [`ADDR_A11_A12_HIGH`] from there to keep the stimulus catalogue in
-//! exactly one place. Everything that touches PIO/DMA is re-implemented
-//! here for CPU-serve semantics.
+//! Design mirrors [`crate::onerom_serving_oracle`] — we share [`Case`]
+//! and [`SHADOW_BASE`] from there to keep the stimulus surface aligned.
+//! Stage 2 of the fixture-generalization HLD migrates this oracle off
+//! the legacy hardcoded pin map onto the per-fixture
+//! [`crate::onerom_fixture::FixtureSpec`]; everything that touches
+//! PIO/DMA is re-implemented here for CPU-serve semantics.
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 
 use rp2350_emu::{Bus, Emulator};
 
-use crate::onerom_serving_oracle::{
-    ADDR_A11_A12_HIGH, Case, SHADOW_BASE, SHADOW_SIZE, lift_shadow_from_flash_pub,
-    stimulus_level_pub, stimulus_level_raw,
-};
+use crate::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
+use crate::onerom_serving_oracle::{Case, SHADOW_BASE};
 
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
 
-/// Re-export the shared case catalogue at the CPU-oracle path so callers
-/// can use either oracle without reaching back into the PIO module.
-pub use crate::onerom_serving_oracle::DEFAULT_CASES as CPU_DEFAULT_CASES;
+/// Default case catalogue for the CPU oracle — wraps
+/// [`crate::onerom_serving_oracle::default_cases`] verbatim. Stage 2
+/// drops the legacy `CPU_DEFAULT_CASES` constant in favour of this
+/// per-fixture function.
+pub fn cpu_default_cases(spec: &FixtureSpec) -> Vec<Case> {
+    crate::onerom_serving_oracle::default_cases(spec)
+}
 
 /// CPU serve-loop PC range (RP2350, CPU-mode fixture). The hot loop is
 /// five instructions (one 32-bit TST.W plus four 16-bit halfwords),
@@ -127,24 +130,6 @@ const MIN_FRESH_ARRIVAL_CYCLE_CPU: u32 = 6;
 /// had multiple full loop iterations to act.
 const ZERO_BYTE_TRUST_TIMEOUT_CPU: u32 = 40;
 
-/// Data bus base — D0..D7 on GPIO 16..23. Mirrors the PIO oracle.
-const GPIO_DATA_BASE: u8 = 16;
-
-/// Data-pin mask (bits 16..23). Used by the `data_pin_mask_covers_*`
-/// unit test to pin the pin-range invariant; the `run_case` inner loop
-/// extracts the byte directly via a shift, so this constant is a
-/// test-only artefact.
-#[cfg(test)]
-const GPIO_DATA_MASK: u32 = 0xFF << GPIO_DATA_BASE;
-
-/// CS lanes on the `test-sdrr-0` fixture. Mirrors the PIO oracle.
-const GPIO_CS1: u8 = 13;
-const GPIO_CS2: u8 = 12;
-const GPIO_CS3: u8 = 15;
-
-/// A0..A12 pin map. Mirrors the PIO oracle.
-const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
-
 /// SIO GPIO_OE MMIO (RP2350 8-byte offsets).
 const SIO_GPIO_OE_ADDR: u32 = 0xD000_0030;
 
@@ -185,7 +170,8 @@ pub struct CpuCaseResult {
 
 /// CPU-serve oracle state.
 pub struct CpuServingOracle {
-    rom_shadow: Box<[u8; SHADOW_SIZE]>,
+    spec: FixtureSpec,
+    rom_shadow: Box<[u8]>,
     results: Vec<CpuCaseResult>,
 }
 
@@ -198,7 +184,11 @@ impl CpuServingOracle {
     /// the shadow from flash (not SRAM) because it's the canonical
     /// ground truth and the implementation is already plumbed in the
     /// PIO oracle — using flash keeps the two paths symmetric.
-    pub fn new_at_sync(bus: &mut Bus, flash: &[u8]) -> Self {
+    ///
+    /// Stage 2: takes a `FixtureSpec` (parsed from the same `flash`
+    /// image by the caller) so the per-fixture shadow size + pin map
+    /// is honoured.
+    pub fn new_at_sync(bus: &mut Bus, spec: FixtureSpec, flash: &[u8]) -> Self {
         // `sdrr_runtime_info.rom_set_index` offset within SRAM — mirror
         // of the PIO oracle. Constants from `sdrr/link/common.ld` +
         // `sdrr_runtime_info_t`.
@@ -208,19 +198,25 @@ impl CpuServingOracle {
             .memory
             .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
 
-        let shadow = lift_shadow_from_flash_pub(flash, rom_set_index)
-            .unwrap_or_else(|| Box::new([0u8; SHADOW_SIZE]));
+        let shadow = lift_shadow_from_flash(flash, rom_set_index, &spec)
+            .unwrap_or_else(|| vec![0u8; spec.shadow_size].into_boxed_slice());
 
         Self {
+            spec,
             rom_shadow: shadow,
             results: Vec::new(),
         }
     }
 
     /// Test-only constructor accepting a pre-built shadow.
-    #[cfg(test)]
-    pub(crate) fn new_with_shadow(shadow: Box<[u8; SHADOW_SIZE]>) -> Self {
+    pub fn new_with_shadow(spec: FixtureSpec, shadow: Box<[u8]>) -> Self {
+        debug_assert_eq!(
+            shadow.len(),
+            spec.shadow_size,
+            "new_with_shadow: shadow length must match spec.shadow_size"
+        );
         Self {
+            spec,
             rom_shadow: shadow,
             results: Vec::new(),
         }
@@ -242,46 +238,37 @@ impl CpuServingOracle {
     /// 3. Envelope check: reclassify `Pass` with out-of-envelope latency
     ///    to `LatencyOutOfEnvelope`.
     pub fn run_case(&mut self, emu: &mut Emulator, case: Case) -> &CpuCaseResult {
-        // Two construction modes — see `Case` doc. The `raw_pin_state`
-        // path bypasses the A11=A12=1 invariant so larger-than-1541-style
-        // fixtures (e.g. the 256 KiB SeaBIOS validator) can drive every
-        // 16-bit GPIO pattern directly.
+        // External-input mask covers gate CS, every deasserted-high CS
+        // pin, every asserted-low pin, and all address pins. Data pins
+        // are CPU-driven — never mask them.
+        // fire-32-a (Stage 3) will widen the bus to u64; today we
+        // assert that no fixture uses GPIOs >= 32 to make the Stage 3
+        // follow-up loud.
+        let ext_mask: u64 = self.compose_ext_mask();
         debug_assert!(
-            case.raw_pin_state.is_some() || case.addr_bits & ADDR_A11_A12_HIGH == ADDR_A11_A12_HIGH,
-            "run_case: case.addr_bits must have A11=A12=1 (or use Case::raw_pin_state)"
+            ext_mask >> 32 == 0,
+            "ext_mask uses GPIOs >= 32; widen Bus interface for fire-32-a (Stage 3)"
         );
+        emu.bus.gpio_external_mask = ext_mask as u32;
 
-        // External-input mask covers CS1/CS2/CS3 and all address pins.
-        // D0..D7 (16..23) are CPU-driven — never mask them.
-        // For `raw_pin_state` cases we drive every bit of the low 16
-        // (with CS1 forced low) so the mask covers the whole low-16
-        // GPIO range minus the data pins.
-        let ext_mask: u32 = if case.raw_pin_state.is_some() {
-            // Bits 0..15, exclude data pins (16..23).
-            0x0000_FFFFu32
-        } else {
-            (1u32 << GPIO_CS1)
-                | (1u32 << GPIO_CS2)
-                | (1u32 << GPIO_CS3)
-                | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p))
-        };
-        emu.bus.gpio_external_mask = ext_mask;
-
-        // 1. Gap drive — CS1/CS2/CS3 all high, addr=0.
-        let gap_level = (1u32 << GPIO_CS1) | (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
-        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
+        // 1. Gap drive — gate CS + every deasserted-high + every
+        //    asserted-low pin all HIGH so the chip is fully deselected.
+        let gap_level: u64 = self.compose_gap_level();
+        debug_assert!(gap_level >> 32 == 0, "gap_level uses GPIOs >= 32");
+        emu.bus
+            .gpio_external_in
+            .store(gap_level as u32, Ordering::Relaxed);
         for _ in 0..GAP_CYCLES {
             emu.run(1).expect("Serial run is infallible");
         }
 
-        // 2. Apply stimulus.
-        let stim_level = match case.raw_pin_state {
-            Some(p) => stimulus_level_raw(p),
-            None => stimulus_level_pub(case.addr_bits),
-        };
+        // 2. Apply stimulus: gate CS LOW, deasserted-high pins HIGH,
+        //    asserted-low pins LOW, case pin_pattern ORed in.
+        let stim_level: u64 = self.compose_stim_level(case.pin_pattern);
+        debug_assert!(stim_level >> 32 == 0, "stim_level uses GPIOs >= 32");
         emu.bus
             .gpio_external_in
-            .store(stim_level, Ordering::Relaxed);
+            .store(stim_level as u32, Ordering::Relaxed);
 
         // The CPU's serve loop looks up shadow[pins_low_16]. The pins
         // the CPU samples are the 16-bit pattern the stim applies — which
@@ -289,6 +276,9 @@ impl CpuServingOracle {
         // pins_low_16.
         let shadow_offset = (stim_level & 0xFFFF) as usize;
         let expected_byte = self.rom_shadow[shadow_offset];
+
+        // Data-pin base — pins are contiguous on supported fixtures.
+        let data_base = self.spec.data_pins[0];
 
         // 3. Tick and observe.
         let mut state = StabilityState::default();
@@ -298,14 +288,14 @@ impl CpuServingOracle {
             emu.run(1).expect("Serial run is infallible");
 
             let sio_oe = emu.bus.read32(SIO_GPIO_OE_ADDR, 0);
-            let oe_data = ((sio_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
+            let oe_data = ((sio_oe >> data_base) & 0xFF) as u8;
             // Observe byte from `gpio_in` — this is the composite of
             // external-input stimulus + SIO/PIO outputs after the
-            // bus's `update_gpio` merge. Data bits 16..23 are CPU-driven
-            // so they reflect whatever the CPU's STRB has pushed via
+            // bus's `update_gpio` merge. Data bits are CPU-driven so
+            // they reflect whatever the CPU's STRB has pushed via
             // SIO_GPIO_OUT.
             let data_byte =
-                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
+                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> data_base) & 0xFF) as u8;
 
             if let Some(d) = observe_tick(&mut state, tick, oe_data, data_byte) {
                 decision = Some(d);
@@ -348,7 +338,9 @@ impl CpuServingOracle {
         let post = apply_envelope(raw);
 
         // Leave the bus in gap-level state for the next case.
-        emu.bus.gpio_external_in.store(gap_level, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in
+            .store(gap_level as u32, Ordering::Relaxed);
 
         self.results.push(post);
         self.results.last().unwrap()
@@ -360,8 +352,51 @@ impl CpuServingOracle {
     }
 
     /// Accessor for the shadow (for tripwire diagnostics in the binary).
-    pub fn shadow(&self) -> &[u8; SHADOW_SIZE] {
+    pub fn shadow(&self) -> &[u8] {
         &self.rom_shadow
+    }
+
+    /// Accessor for the per-fixture pin map + capacity.
+    pub fn spec(&self) -> &FixtureSpec {
+        &self.spec
+    }
+
+    // ---------------------------------------------------------------------
+    // Stim/gap level composition (mirrors the PIO oracle).
+    // ---------------------------------------------------------------------
+
+    fn compose_ext_mask(&self) -> u64 {
+        let mut mask: u64 = 1u64 << self.spec.cs1;
+        for &p in &self.spec.deasserted_high_during_read {
+            mask |= 1u64 << p;
+        }
+        for &p in &self.spec.asserted_low_during_read {
+            mask |= 1u64 << p;
+        }
+        for &p in &self.spec.addr_pins {
+            mask |= 1u64 << p;
+        }
+        mask
+    }
+
+    fn compose_gap_level(&self) -> u64 {
+        let mut level: u64 = 1u64 << self.spec.cs1;
+        for &p in &self.spec.deasserted_high_during_read {
+            level |= 1u64 << p;
+        }
+        for &p in &self.spec.asserted_low_during_read {
+            level |= 1u64 << p;
+        }
+        level
+    }
+
+    fn compose_stim_level(&self, case_pattern: u64) -> u64 {
+        let mut level: u64 = 0;
+        for &p in &self.spec.deasserted_high_during_read {
+            level |= 1u64 << p;
+        }
+        // Asserted-low pins stay LOW during stim. Already 0 in `level`.
+        level | case_pattern
     }
 
     /// Format the full CPU-serve report (header, per-case table,
@@ -385,7 +420,7 @@ impl CpuServingOracle {
             out,
             "shadow: 0x{:08X} + 0x{:04X} bytes, {} unique",
             SHADOW_BASE,
-            SHADOW_SIZE,
+            self.spec.shadow_size,
             unique_shadow.len()
         );
         let _ = writeln!(out, "cases: {}", self.results.len());
@@ -395,21 +430,21 @@ impl CpuServingOracle {
         if ns_available {
             let _ = writeln!(
                 out,
-                " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6} {:>6}  verdict",
-                "idx", "label", "addr", "expected", "observed", "cycles", "ns"
+                " {:>5}  {:<20} {:<10} {:<8} {:<8} {:>6} {:>6}  verdict",
+                "idx", "label", "pattern", "expected", "observed", "cycles", "ns"
             );
         } else {
             let _ = writeln!(
                 out,
-                " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6}  verdict",
-                "idx", "label", "addr", "expected", "observed", "cycles"
+                " {:>5}  {:<20} {:<10} {:<8} {:<8} {:>6}  verdict",
+                "idx", "label", "pattern", "expected", "observed", "cycles"
             );
         }
 
         let total = self.results.len();
         for (i, r) in self.results.iter().enumerate() {
             let idx = format!("{}/{}", i + 1, total);
-            let addr = format!("0x{:04X}", r.case.addr_bits);
+            let pattern = format!("0x{:08X}", r.case.pin_pattern as u32);
             let expected = r
                 .expected_byte
                 .map(|b| format!("0x{:02X}", b))
@@ -430,14 +465,14 @@ impl CpuServingOracle {
                     .unwrap_or_else(|| "—".to_string());
                 let _ = writeln!(
                     out,
-                    " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6} {:>6}  {}",
-                    idx, r.case.label, addr, expected, observed, cycles, ns, verdict
+                    " {:>5}  {:<20} {:<10} {:<8} {:<8} {:>6} {:>6}  {}",
+                    idx, r.case.label, pattern, expected, observed, cycles, ns, verdict
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    " {:>5}  {:<20} {:<8} {:<8} {:<8} {:>6}  {}",
-                    idx, r.case.label, addr, expected, observed, cycles, verdict
+                    " {:>5}  {:<20} {:<10} {:<8} {:<8} {:>6}  {}",
+                    idx, r.case.label, pattern, expected, observed, cycles, verdict
                 );
             }
         }
@@ -534,15 +569,14 @@ impl CpuServingOracle {
 /// on `test-sdrr-0-cpu.bin`, firing the tripwire a full ~8 500 cycles
 /// before the shadow was actually populated.
 pub const SENTINEL_SCAN_WINDOW: usize = 256;
-const _: () = assert!(SENTINEL_SCAN_WINDOW <= SHADOW_SIZE);
 
 /// Pick a shadow-readiness sentinel: scan the final
 /// [`SENTINEL_SCAN_WINDOW`] bytes of `shadow` *from the end backward*
 /// for the first non-zero byte and return its (SRAM offset, expected
-/// value). Returns `None` if the scan window is all zeroes — in which
-/// case the caller should fall back to the PC-only sync check (no
-/// tripwire protection is possible when every byte we could probe is
-/// legitimately zero).
+/// value). Returns `None` if the scan window is all zeroes (or if
+/// `shadow.len() < SENTINEL_SCAN_WINDOW`) — the caller should fall
+/// back to the PC-only sync check (no tripwire protection is possible
+/// when every byte we could probe is legitimately zero).
 ///
 /// Tail-biased: a sentinel near the end of the shadow is only
 /// populated after the firmware's sequential CPU copy has reached
@@ -555,12 +589,15 @@ const _: () = assert!(SENTINEL_SCAN_WINDOW <= SHADOW_SIZE);
 /// Used by the binary driver to seed the sync detector's tripwire;
 /// extracted as a pure function so it can be unit-tested without an
 /// `Emulator` or `Bus` in the loop.
-pub fn find_shadow_sentinel(shadow: &[u8; SHADOW_SIZE]) -> Option<(u32, u8)> {
-    let start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
+pub fn find_shadow_sentinel(shadow: &[u8]) -> Option<(u32, u8)> {
+    if shadow.len() < SENTINEL_SCAN_WINDOW {
+        return None;
+    }
+    let start = shadow.len() - SENTINEL_SCAN_WINDOW;
     // Scan from the end backward so the returned offset is the
     // highest non-zero index within the window — i.e. the byte
     // written latest by a sequential CPU copy.
-    for i in (start..SHADOW_SIZE).rev() {
+    for i in (start..shadow.len()).rev() {
         if shadow[i] != 0 {
             return Some((i as u32, shadow[i]));
         }
@@ -945,70 +982,72 @@ pub fn force_rom_set_index_via_sel_pins(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn empty_shadow() -> Box<[u8; SHADOW_SIZE]> {
-        Box::new([0u8; SHADOW_SIZE])
+    fn fire24a_fixture_path() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("fixtures");
+        p.push("onerom-fire-24-a-rp2350-seabios-cpu.bin");
+        p
+    }
+
+    fn fire24a_spec() -> FixtureSpec {
+        let p = fire24a_fixture_path();
+        let flash = std::fs::read(&p)
+            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
+        FixtureSpec::from_flash(&flash).expect("fire-24-a parse must succeed")
+    }
+
+    fn empty_shadow_for(spec: &FixtureSpec) -> Box<[u8]> {
+        vec![0u8; spec.shadow_size].into_boxed_slice()
     }
 
     /// Byte-extraction semantics: given a `gpio_in` word whose bits
-    /// 16..23 carry the data byte, the oracle's observation pipeline
-    /// yields exactly those 8 bits. This is the single load-bearing
-    /// observation invariant for the CPU oracle — if someone changes
-    /// the pin range, this test fails loudly.
+    /// `data_base..data_base+8` carry the data byte, the oracle's
+    /// observation pipeline yields exactly those 8 bits.
     #[test]
-    fn observed_byte_comes_from_gpio_in_bits_16_through_23() {
+    fn observed_byte_comes_from_gpio_in_at_data_base() {
+        let spec = fire24a_spec();
+        let data_base = spec.data_pins[0]; // fire-24-a: 16
+
         // Walking-1 + known pattern: each byte value appears exactly
-        // once across bits 16..23.
+        // once across the data-pin range.
         for byte in 0..=255u8 {
-            let gpio_in: u32 = (byte as u32) << 16;
-            // Simulate the oracle's extraction line verbatim.
-            let observed = ((gpio_in >> GPIO_DATA_BASE) & 0xFF) as u8;
-            assert_eq!(
-                observed, byte,
-                "byte 0x{:02X}: gpio_in=0x{:08X} extracted=0x{:02X}",
-                byte, gpio_in, observed
-            );
+            let gpio_in: u32 = (byte as u32) << data_base;
+            let observed = ((gpio_in >> data_base) & 0xFF) as u8;
+            assert_eq!(observed, byte);
         }
 
-        // Low bits must NOT leak into the observed byte — set every
-        // bit below 16 and verify the observed byte is still 0.
-        let noise_only: u32 = 0x0000_FFFF;
-        let observed = ((noise_only >> GPIO_DATA_BASE) & 0xFF) as u8;
-        assert_eq!(
-            observed, 0x00,
-            "low-bit noise must not bleed into observed byte"
-        );
-
-        // High bits above 23 must NOT leak either.
-        let high_noise: u32 = 0xFF00_0000;
-        let observed = ((high_noise >> GPIO_DATA_BASE) & 0xFF) as u8;
-        assert_eq!(
-            observed, 0x00,
-            "high-bit noise (bits 24..31) must not bleed into observed byte"
-        );
+        // Bits below data_base must NOT leak into the observed byte.
+        let mask_below: u32 = (1u32 << data_base) - 1;
+        let observed = ((mask_below >> data_base) & 0xFF) as u8;
+        assert_eq!(observed, 0x00);
     }
 
-    /// OEN-data-mask shape: the oracle rejects partial drive (any
-    /// OEN != 0xFF on data pins). Validate the mask constant matches.
+    /// OEN-data-mask shape: the oracle rejects partial drive.
     #[test]
-    fn data_pin_mask_covers_bits_16_through_23() {
-        assert_eq!(GPIO_DATA_MASK, 0x00FF_0000);
-        // And the "all driven" condition extracts to 0xFF.
+    fn data_pin_mask_covers_data_pin_range() {
+        let spec = fire24a_spec();
+        let data_base = spec.data_pins[0];
+        let data_mask: u32 = 0xFFu32 << data_base;
+
+        // fire-24-a: data_base = 16 → mask = 0x00FF_0000.
+        assert_eq!(data_mask, 0xFFu32 << 16);
+
         let all_driven: u32 = 0xFFFF_FFFF;
-        let oe_data = ((all_driven >> GPIO_DATA_BASE) & 0xFF) as u8;
+        let oe_data = ((all_driven >> data_base) & 0xFF) as u8;
         assert_eq!(oe_data, 0xFF);
-        // Partial drive (bit 16 only) yields 0x01, which the loop treats
-        // as "not fully driven" and resets the stable tracker.
-        let partial: u32 = 1u32 << 16;
-        let oe_data = ((partial >> GPIO_DATA_BASE) & 0xFF) as u8;
+
+        let partial: u32 = 1u32 << data_base;
+        let oe_data = ((partial >> data_base) & 0xFF) as u8;
         assert_eq!(oe_data, 0x01);
-        assert_ne!(oe_data, 0xFF, "partial drive must differ from full drive");
     }
 
-    /// Envelope pass-through (analogous to PIO oracle test 7).
+    /// Envelope pass-through.
     #[test]
     fn apply_envelope_passes_through_in_range_latency() {
-        let case = Case::new("test", 0x1800);
+        let spec = fire24a_spec();
+        let case = Case::from_addr("test", 0x1800, &spec);
         let in_range = *CPU_ENVELOPE_CYCLES.start() + 5;
         assert!(CPU_ENVELOPE_CYCLES.contains(&in_range));
         let result = CpuCaseResult {
@@ -1023,11 +1062,11 @@ mod tests {
         assert_eq!(out.latency_cycles, Some(in_range));
     }
 
-    /// Envelope rewrite: Pass with out-of-envelope latency is
-    /// reclassified to LatencyOutOfEnvelope.
+    /// Envelope rewrite.
     #[test]
     fn apply_envelope_rewrites_out_of_range_latency() {
-        let case = Case::new("test", 0x1800);
+        let spec = fire24a_spec();
+        let case = Case::from_addr("test", 0x1800, &spec);
         let out_of_range = *CPU_ENVELOPE_CYCLES.end() + 50;
         assert!(!CPU_ENVELOPE_CYCLES.contains(&out_of_range));
         let result = CpuCaseResult {
@@ -1050,7 +1089,8 @@ mod tests {
     /// Non-Pass verdicts are never rewritten by the envelope check.
     #[test]
     fn apply_envelope_leaves_non_pass_verdicts_alone() {
-        let case = Case::new("test", 0x1800);
+        let spec = fire24a_spec();
+        let case = Case::from_addr("test", 0x1800, &spec);
 
         for verdict in [
             CpuVerdict::WrongByte {
@@ -1075,34 +1115,39 @@ mod tests {
         }
     }
 
-    /// Default cases are re-exported intact from the PIO oracle — same
-    /// 15-case catalogue, same A11=A12=1 invariant.
+    /// CPU default cases mirror the PIO default cases (same generator
+    /// — `cpu_default_cases` is a thin wrapper over `default_cases`).
     #[test]
     fn cpu_default_cases_mirror_pio_default_cases() {
-        use crate::onerom_serving_oracle::DEFAULT_CASES as PIO_DEFAULT_CASES;
-        assert_eq!(CPU_DEFAULT_CASES.len(), PIO_DEFAULT_CASES.len());
-        for (a, b) in CPU_DEFAULT_CASES.iter().zip(PIO_DEFAULT_CASES.iter()) {
+        let spec = fire24a_spec();
+        let pio = crate::onerom_serving_oracle::default_cases(&spec);
+        let cpu = cpu_default_cases(&spec);
+        assert_eq!(cpu.len(), pio.len());
+        for (a, b) in cpu.iter().zip(pio.iter()) {
             assert_eq!(a.label, b.label);
-            assert_eq!(a.addr_bits, b.addr_bits);
+            assert_eq!(a.pin_pattern, b.pin_pattern);
         }
     }
 
-    /// Shadow capture roundtrip via the test-only constructor: verify
-    /// that a byte-value inserted at the expected shadow offset is the
-    /// one the oracle looks up when a case with matching `addr_bits` is
-    /// used. Low-level plumbing check — no emulator in the loop.
+    /// Shadow capture roundtrip via the test-only constructor.
     #[test]
     fn shadow_lookup_offset_equals_stimulus_low_16() {
-        let mut shadow = empty_shadow();
-        // Case 0x1801 (walk1 A0) → stim_level has bit at ADDR_PINS[0]=pin 7 set + CS2/CS3
-        // Compute expected shadow offset = stim_level_low_16.
-        let case = Case::new("walk1 A0", 0x1801);
-        let stim = stimulus_level_pub(case.addr_bits);
-        let offset = (stim & 0xFFFF) as usize;
+        let spec = fire24a_spec();
+        let mut shadow = empty_shadow_for(&spec);
+        // walk1 A0 case (addr 0x1801).
+        let case = Case::from_addr("walk1 A0", 0x1801, &spec);
+        // The CPU's serve loop looks up shadow[stim_level & 0xFFFF];
+        // stim_level = case.pin_pattern | deasserted_high pins. Compute
+        // it the same way the oracle does.
+        let mut stim_level: u64 = 0;
+        for &p in &spec.deasserted_high_during_read {
+            stim_level |= 1u64 << p;
+        }
+        stim_level |= case.pin_pattern;
+        let offset = (stim_level & 0xFFFF) as usize;
         shadow[offset] = 0xA5;
 
-        let oracle = CpuServingOracle::new_with_shadow(shadow);
-        // The expected byte the oracle will use for this case.
+        let oracle = CpuServingOracle::new_with_shadow(spec, shadow);
         assert_eq!(oracle.shadow()[offset], 0xA5);
     }
 
@@ -1227,8 +1272,9 @@ mod tests {
     /// in a sequential CPU copy.
     #[test]
     fn find_shadow_sentinel_returns_last_nonzero_in_tail_window() {
-        let mut shadow = empty_shadow();
-        let tail_start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
+        let spec = fire24a_spec();
+        let mut shadow = empty_shadow_for(&spec);
+        let tail_start = spec.shadow_size - SENTINEL_SCAN_WINDOW;
         // Two non-zero bytes within the tail window — the higher-
         // offset one must win (scan is end-backward).
         shadow[tail_start + 10] = 0x5A;
@@ -1242,17 +1288,12 @@ mod tests {
         );
     }
 
-    /// A non-zero byte *before* the tail window does not count — the
-    /// helper is deliberately tail-biased so the tripwire fires only
-    /// once the firmware's sequential shadow copy has reached near
-    /// the end of `SHADOW_SIZE` (see the `SENTINEL_SCAN_WINDOW`
-    /// doc-comment for the rationale — low-offset sentinels are
-    /// unreliable because early SRAM state can coincidentally match).
+    /// A non-zero byte *before* the tail window does not count.
     #[test]
     fn find_shadow_sentinel_ignores_nonzero_before_tail_window() {
-        let mut shadow = empty_shadow();
-        // Place the non-zero byte one before the tail window starts.
-        let tail_start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
+        let spec = fire24a_spec();
+        let mut shadow = empty_shadow_for(&spec);
+        let tail_start = spec.shadow_size - SENTINEL_SCAN_WINDOW;
         shadow[tail_start - 1] = 0xA5;
 
         let out = find_shadow_sentinel(&shadow);
@@ -1262,33 +1303,30 @@ mod tests {
         );
     }
 
-    /// A uniformly-zero scan window yields `None` — the caller must
-    /// degrade to the bare PC check (no tripwire is possible when
-    /// every candidate byte is legitimately zero).
+    /// A uniformly-zero scan window yields `None`.
     #[test]
     fn find_shadow_sentinel_returns_none_on_all_zero_window() {
-        let shadow = empty_shadow();
+        let spec = fire24a_spec();
+        let shadow = empty_shadow_for(&spec);
         assert_eq!(find_shadow_sentinel(&shadow), None);
     }
 
     /// The very last byte of the shadow is within the tail window,
-    /// and a non-zero byte at `SHADOW_SIZE - 1` wins over any other
-    /// non-zero byte in the window — this is the ideal sentinel for
-    /// a sequential CPU copy.
+    /// and a non-zero byte at `shadow.len() - 1` wins.
     #[test]
     fn find_shadow_sentinel_picks_shadow_size_minus_one_when_set() {
-        let mut shadow = empty_shadow();
-        let tail_start = SHADOW_SIZE - SENTINEL_SCAN_WINDOW;
-        // Fill the middle of the tail window and the last byte with
-        // non-zero values; the last must win.
+        let spec = fire24a_spec();
+        let mut shadow = empty_shadow_for(&spec);
+        let len = spec.shadow_size;
+        let tail_start = len - SENTINEL_SCAN_WINDOW;
         shadow[tail_start + 100] = 0x11;
-        shadow[SHADOW_SIZE - 1] = 0x3F;
+        shadow[len - 1] = 0x3F;
 
         let out = find_shadow_sentinel(&shadow);
         assert_eq!(
             out,
-            Some(((SHADOW_SIZE - 1) as u32, 0x3F)),
-            "SHADOW_SIZE-1 must win when set"
+            Some(((len - 1) as u32, 0x3F)),
+            "shadow.len()-1 must win when set"
         );
     }
 

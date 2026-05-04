@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use picoem_harness::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
 use picoem_harness::{
     onerom_serving_oracle,
     onerom_serving_oracle_cpu::{self, CpuServingOracle, CpuVerdict},
@@ -52,8 +53,12 @@ const DEFAULT_SEABIOS: &str = concat!(
     "/fixtures/sources/seabios-256k.bin"
 );
 
-const SHADOW_SIZE: usize = onerom_serving_oracle::SHADOW_SIZE;
-const SEABIOS_SIZE: usize = 4 * SHADOW_SIZE;
+/// Hardcoded fire-24-a SeaBIOS shadow size (one ROM set = 64 KiB).
+/// The fixture-aware spec parse below gives the same value via
+/// `spec.shadow_size`; this constant is kept so the SEABIOS_SIZE
+/// computation has a `const` to multiply against.
+const FIRE24A_SHADOW_SIZE: usize = 0x1_0000;
+const SEABIOS_SIZE: usize = 4 * FIRE24A_SHADOW_SIZE;
 const NUM_ROM_SETS: u32 = 4;
 
 // 10M is generous; observed sync cycles in practice are ~25K. The
@@ -64,9 +69,10 @@ const NUM_ROM_SETS: u32 = 4;
 const BOOT_CYCLE_CAP: u64 = 10_000_000;
 const PROGRESS_INTERVAL: usize = 4096;
 
-/// Bit 13 in the GPIO_IN word is CS1; firmware tristates the data pins
-/// while it's high, so we never drive that combination.
-const CS1_BIT: u16 = 1 << 13;
+// CS1 mask (the "unservable when high" pin pattern) is read from the
+// FixtureSpec at run time — see `run_set` and `run_probe_cs1_thorough`.
+// The legacy hardcoded `1 << 13` constant is gone; for fire-24-a it
+// resolves to the same value via `spec.unservable_when_high`.
 
 struct Cli {
     fixture: PathBuf,
@@ -117,7 +123,12 @@ fn parse_cli() -> Result<Cli, String> {
 /// the requested ROM-set index via the image-select GPIOs, then run
 /// the emulator until core 0's PC is in the CPU serve loop and the
 /// shadow tripwire fires. Mirrors `onerom_cpu_speed_grade_serial_rp2350`.
-fn boot_sync(bootrom: &[u8], flash: &[u8], rom_set_index: u32) -> Result<Emulator, String> {
+fn boot_sync(
+    bootrom: &[u8],
+    flash: &[u8],
+    spec: &FixtureSpec,
+    rom_set_index: u32,
+) -> Result<Emulator, String> {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
         .build()
@@ -166,11 +177,10 @@ fn boot_sync(bootrom: &[u8], flash: &[u8], rom_set_index: u32) -> Result<Emulato
         .bus
         .memory
         .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
-    let sentinel: Option<(u32, u8)> =
-        match onerom_serving_oracle::lift_shadow_from_flash_pub(flash, live_index) {
-            Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
-            None => None,
-        };
+    let sentinel: Option<(u32, u8)> = match lift_shadow_from_flash(flash, live_index, spec) {
+        Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
+        None => None,
+    };
 
     while !onerom_serving_oracle_cpu::is_synced_cpu(&emu, sentinel) && emu.cycles() < BOOT_CYCLE_CAP
     {
@@ -235,6 +245,7 @@ fn modal_byte(bytes: &[u8]) -> u8 {
 
 fn run_set(
     flash: &[u8],
+    spec: &FixtureSpec,
     seabios: &[u8],
     rom_set_index: u32,
     pin_lo: u32,
@@ -250,28 +261,35 @@ fn run_set(
     let _ = std::io::stdout().flush();
 
     let bootrom = std::fs::read(BOOTROM_PATH).map_err(|e| format!("bootrom: {e}"))?;
-    let mut emu = boot_sync(&bootrom, flash, rom_set_index)?;
+    let mut emu = boot_sync(&bootrom, flash, spec, rom_set_index)?;
     println!("  synced at cycle {}", emu.cycles());
     let _ = std::io::stdout().flush();
 
-    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, flash);
-    let shadow = oracle.shadow();
-    let unique = shadow
+    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, spec.clone(), flash);
+    let shadow_size = spec.shadow_size;
+    // CS1 mask: the pattern bit(s) that, when high, make the chip
+    // unservable. For fire-24-a this is `1 << 13` (the legacy literal);
+    // we use the FixtureSpec field so other fixtures plug in unchanged.
+    // The cs1_mask narrowed to u16 is what the loop below tests against
+    // the 16-bit pin pattern.
+    let cs1_mask = spec.unservable_when_high as u16;
+    let unique = oracle
+        .shadow()
         .iter()
         .copied()
         .collect::<std::collections::HashSet<u8>>()
         .len();
     println!("  shadow: {} unique bytes", unique);
 
-    // Cross-check: the lifted shadow MUST match the corresponding 64 KiB
-    // chunk of seabios. If not, something went wrong with the build —
-    // bail out before running 65k useless cases.
-    let chunk_lo = (rom_set_index as usize) * SHADOW_SIZE;
-    let chunk_hi = chunk_lo + SHADOW_SIZE;
+    // Cross-check: the lifted shadow MUST match the corresponding chunk
+    // of seabios. If not, something went wrong with the build — bail
+    // out before running 65k useless cases.
+    let chunk_lo = (rom_set_index as usize) * shadow_size;
+    let chunk_hi = chunk_lo + shadow_size;
     let chunk = &seabios[chunk_lo..chunk_hi];
     let mut shadow_mismatch = 0usize;
-    for i in 0..SHADOW_SIZE {
-        if shadow[i] != chunk[i] {
+    for i in 0..shadow_size {
+        if oracle.shadow()[i] != chunk[i] {
             shadow_mismatch += 1;
         }
     }
@@ -282,18 +300,16 @@ fn run_set(
         ));
     }
 
-    // Pre-compute the set's CS1-low expected bytes so we can derive the
-    // modal byte and the unique-byte count BEFORE the sweep. The sweep
-    // is full-range over `pin_state in pin_lo..pin_hi`; CS1-low subset
-    // is everything where bit 13 is clear within that range.
-    let mut cs1_low_bytes = Vec::with_capacity((pin_hi - pin_lo) as usize);
+    // Pre-compute the set's "servable" expected bytes so we can derive
+    // the modal byte and the unique-byte count BEFORE the sweep.
+    let mut servable_bytes = Vec::with_capacity((pin_hi - pin_lo) as usize);
     for pin_state in pin_lo..pin_hi {
-        if (pin_state as u16) & CS1_BIT == 0 {
-            cs1_low_bytes.push(chunk[pin_state as usize]);
+        if (pin_state as u16) & cs1_mask == 0 {
+            servable_bytes.push(chunk[pin_state as usize]);
         }
     }
-    let set_modal = modal_byte(&cs1_low_bytes);
-    let unique_count = cs1_low_bytes
+    let set_modal = modal_byte(&servable_bytes);
+    let unique_count = servable_bytes
         .iter()
         .copied()
         .collect::<std::collections::HashSet<u8>>()
@@ -306,11 +322,11 @@ fn run_set(
     let t0 = Instant::now();
 
     for pin_state in pin_lo..pin_hi {
-        if (pin_state as u16) & CS1_BIT != 0 {
+        if (pin_state as u16) & cs1_mask != 0 {
             tally.unservable_cs1 += 1;
             continue;
         }
-        let case = onerom_serving_oracle::Case::raw_pin_state("seabios", pin_state as u16);
+        let case = onerom_serving_oracle::Case::from_raw("seabios", pin_state as u64);
         let result = oracle.run_case(&mut emu, case);
         let expected = chunk[pin_state as usize];
 
@@ -410,10 +426,11 @@ const PROBE_CS1_NUM_CASES: usize = 256;
 /// seeded random pin states with CS1=high on rom_set 1 (chunk 1 has
 /// varied non-zero content, so any silent OEN-asserts-with-zero-output
 /// firmware bug would be visible). Reports verdict distribution.
-///
-/// All-`DataPinsNotDriven` strengthens the firmware-tristates-at-CS1=high
-/// claim; any `Pass`/`WrongByte`/`NoStableByte` would surface a surprise.
-fn run_probe_cs1_thorough(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
+fn run_probe_cs1_thorough(
+    flash: &[u8],
+    spec: &FixtureSpec,
+    seabios: &[u8],
+) -> Result<(), String> {
     const ROM_SET_INDEX: u32 = 1;
 
     println!(
@@ -423,18 +440,18 @@ fn run_probe_cs1_thorough(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
     let _ = std::io::stdout().flush();
 
     let bootrom = std::fs::read(BOOTROM_PATH).map_err(|e| format!("bootrom: {e}"))?;
-    let mut emu = boot_sync(&bootrom, flash, ROM_SET_INDEX)?;
+    let mut emu = boot_sync(&bootrom, flash, spec, ROM_SET_INDEX)?;
     println!("  synced at cycle {}", emu.cycles());
 
-    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, flash);
-    // Cross-check the lifted shadow vs seabios chunk for ROM_SET_INDEX so
-    // a stray probe run on a misbuilt fixture surfaces immediately.
-    let chunk_lo = (ROM_SET_INDEX as usize) * SHADOW_SIZE;
-    let chunk = &seabios[chunk_lo..chunk_lo + SHADOW_SIZE];
-    let lifted = oracle.shadow();
+    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, spec.clone(), flash);
+    let shadow_size = spec.shadow_size;
+    let cs1_mask = spec.unservable_when_high as u16;
+    // Cross-check the lifted shadow vs seabios chunk for ROM_SET_INDEX.
+    let chunk_lo = (ROM_SET_INDEX as usize) * shadow_size;
+    let chunk = &seabios[chunk_lo..chunk_lo + shadow_size];
     let mut shadow_mismatch = 0usize;
-    for i in 0..SHADOW_SIZE {
-        if lifted[i] != chunk[i] {
+    for i in 0..shadow_size {
+        if oracle.shadow()[i] != chunk[i] {
             shadow_mismatch += 1;
         }
     }
@@ -465,8 +482,9 @@ fn run_probe_cs1_thorough(flash: &[u8], seabios: &[u8]) -> Result<(), String> {
     let mut surprises: Vec<(u16, &'static str, Option<u8>)> = Vec::new();
 
     for _ in 0..PROBE_CS1_NUM_CASES {
-        let pin_state = lcg_next(&mut state) | CS1_BIT;
-        let case = onerom_serving_oracle::Case::raw_pin_state_unmasked("probe-cs1", pin_state);
+        let pin_state = lcg_next(&mut state) | cs1_mask;
+        let case =
+            onerom_serving_oracle::Case::from_raw("probe-cs1", pin_state as u64);
         let result = oracle.run_case(&mut emu, case);
         match result.verdict {
             CpuVerdict::Pass => {
@@ -579,8 +597,17 @@ fn main() -> ExitCode {
         return ExitCode::from(3);
     }
 
+    let spec = match FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::from(3);
+        }
+    };
+    println!("fixture: {} ({}-pin)", spec.label, spec.chip_pins);
+
     if cli.probe_cs1_thorough {
-        return match run_probe_cs1_thorough(&flash, &seabios) {
+        return match run_probe_cs1_thorough(&flash, &spec, &seabios) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("--probe-cs1-thorough failed: {}", e);
@@ -602,7 +629,7 @@ fn main() -> ExitCode {
     let mut grand = SetTally::default();
     let mut had_failure = false;
     for k in sets {
-        match run_set(&flash, &seabios, k, 0, pin_hi) {
+        match run_set(&flash, &spec, &seabios, k, 0, pin_hi) {
             Ok(t) => {
                 grand.pass += t.pass;
                 grand.discriminating_pass += t.discriminating_pass;

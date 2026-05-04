@@ -67,7 +67,7 @@ mod windows_main {
         WALK_PLAN_LEN, WalkStep, build_walk_plan, first_failing_rung, shuffle_plan,
         verify_observed,
     };
-    use picoem_harness::onerom_serving_oracle;
+    use picoem_harness::onerom_fixture::FixtureSpec;
     use picoem_harness::onerom_serving_oracle_cpu;
     use rp2350_emu::threaded::{SharedState, ThreadedEmulator};
     use rp2350_emu::{Config, Emulator, EmulatorBuilder};
@@ -398,7 +398,7 @@ mod windows_main {
     /// until core 0's PC enters the serve loop range AND the shadow
     /// tripwire fires. Returns the synced emulator for
     /// `ThreadedEmulator::from_emulator`.
-    fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
+    fn boot_sync(bootrom: &[u8], flash: &[u8], spec: &FixtureSpec) -> Result<Emulator, String> {
         let mut emu = EmulatorBuilder::new(Config::default())
             .step_quantum(1)
             .build()
@@ -453,11 +453,14 @@ mod windows_main {
             .bus
             .memory
             .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
-        let sentinel: Option<(u32, u8)> =
-            match onerom_serving_oracle::lift_shadow_from_flash_pub(flash, rom_set_index_live) {
-                Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
-                None => None,
-            };
+        let sentinel: Option<(u32, u8)> = match picoem_harness::onerom_fixture::lift_shadow_from_flash(
+            flash,
+            rom_set_index_live,
+            spec,
+        ) {
+            Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
+            None => None,
+        };
 
         // Phase 2: PC + sentinel.
         let sentinel_ok = |emu: &Emulator| match sentinel {
@@ -787,7 +790,14 @@ mod windows_main {
 
         // Build the walk plan up front — fails fast if the fixture is
         // malformed.
-        let plan = match build_walk_plan(&flash) {
+        let spec = match FixtureSpec::from_flash(&flash) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to parse fixture spec: {}", e);
+                return ExitCode::from(2);
+            }
+        };
+        let plan = match build_walk_plan(&flash, &spec) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("failed to build walk plan: {}", e);
@@ -798,7 +808,7 @@ mod windows_main {
         // Boot sync serially, then promote to ThreadedEmulator. The
         // emulator builder uses a small step_quantum for the serial
         // sync phase; rebuild with the threaded step_quantum below.
-        let mut emu = match boot_sync(&bootrom, &flash) {
+        let mut emu = match boot_sync(&bootrom, &flash, &spec) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("boot-sync failed: {}", e);

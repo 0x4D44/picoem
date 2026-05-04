@@ -55,8 +55,9 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use picoem_harness::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
 use picoem_harness::{
-    onerom_serving_oracle::{self, Case, CaseResult, Verdict},
+    onerom_serving_oracle::{Case, CaseResult, Verdict},
     onerom_serving_oracle_cpu::{self, CpuCaseResult, CpuServingOracle, CpuVerdict},
     onerom_stress,
 };
@@ -119,10 +120,19 @@ fn main() -> ExitCode {
         }
     };
 
+    // Parse the FixtureSpec up front — fail fast on malformed flash.
+    let spec = match FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+
     // Up-front shadow-lift sanity check (mirrors the PIO stress binary):
     // confirm `ROM_SET_INDEX` parses out of the fixture. If None, the
     // sweep is meaningless.
-    if onerom_serving_oracle::lift_shadow_from_flash_pub(&flash, ROM_SET_INDEX).is_none() {
+    if lift_shadow_from_flash(&flash, ROM_SET_INDEX, &spec).is_none() {
         eprintln!(
             "failed to lift ROM set {} from fixture — wrong index or malformed flash",
             ROM_SET_INDEX
@@ -202,7 +212,7 @@ fn main() -> ExitCode {
         .memory
         .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
     let sentinel: Option<(u32, u8)> =
-        match onerom_serving_oracle::lift_shadow_from_flash_pub(&flash, rom_set_index_live) {
+        match lift_shadow_from_flash(&flash, rom_set_index_live, &spec) {
             Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
             None => None,
         };
@@ -240,10 +250,10 @@ fn main() -> ExitCode {
     // Build the CPU oracle. Unlike PIO, no DMA preload — CPU-mode
     // firmware populates SRAM itself, so we skip any
     // `populate_sram_from_shadow` call (would race the firmware).
-    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, &flash);
+    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, spec.clone(), &flash);
 
     // Silent sweep.
-    let cases = onerom_stress::generate_sweep_cases();
+    let cases = onerom_stress::generate_sweep_cases(&spec);
     // Wall-clock per case: measured around each run_case invocation so
     // the report can show host elapsed alongside the emulated-cycle
     // model latency. Failing cases still contribute to throughput.
@@ -341,7 +351,9 @@ fn cpu_to_pio_result(cpu: &CpuCaseResult) -> CaseResult {
         CpuVerdict::LatencyOutOfEnvelope { cycles } => Verdict::LatencyOutOfEnvelope { cycles },
     };
     CaseResult {
-        case: Case::new(cpu.case.label, cpu.case.addr_bits),
+        // Reuse the CPU case verbatim — Case is the same type on both
+        // oracles (PIO and CPU).
+        case: Case::from_raw(cpu.case.label, cpu.case.pin_pattern),
         resolved_addr: None,
         expected_byte: cpu.expected_byte,
         observed_byte: cpu.observed_byte,

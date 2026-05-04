@@ -24,8 +24,8 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
+use picoem_harness::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
 use picoem_harness::{
-    onerom_serving_oracle,
     onerom_serving_oracle_cpu::{self, CpuServingOracle, CpuVerdict},
     onerom_stress,
 };
@@ -150,7 +150,7 @@ fn parse_cli() -> Result<Cli, String> {
 /// `force_rom_set_index_via_sel_pins`, run the emulator serially until
 /// core 0's PC enters the serve-loop range AND the shadow tripwire
 /// fires. Returns the synced emulator.
-fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
+fn boot_sync(bootrom: &[u8], flash: &[u8], spec: &FixtureSpec) -> Result<Emulator, String> {
     let mut emu = EmulatorBuilder::new(Config::default())
         .step_quantum(1)
         .build()
@@ -202,7 +202,7 @@ fn boot_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
         .memory
         .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
     let sentinel: Option<(u32, u8)> =
-        match onerom_serving_oracle::lift_shadow_from_flash_pub(flash, rom_set_index_live) {
+        match lift_shadow_from_flash(flash, rom_set_index_live, spec) {
             Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
             None => None,
         };
@@ -311,7 +311,15 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut emu = match boot_sync(&bootrom, &flash) {
+    let spec = match FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse fixture spec: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut emu = match boot_sync(&bootrom, &flash, &spec) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("boot-sync failed: {}", e);
@@ -319,9 +327,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, &flash);
+    let mut oracle = CpuServingOracle::new_at_sync(&mut emu.bus, spec.clone(), &flash);
 
-    let cases = onerom_stress::generate_sweep_cases();
+    let cases = onerom_stress::generate_sweep_cases(&spec);
     let mut latencies: Vec<u32> = Vec::with_capacity(cases.len());
     let mut wedged: u32 = 0;
     let mut wrong_byte: u32 = 0;
