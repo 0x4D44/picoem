@@ -141,6 +141,56 @@ const PER_CASE_TIMEOUT: u32 = 60;
 /// for the A7 (case 9) live-sweep trace that motivated this gate.
 const MIN_FRESH_ARRIVAL_CYCLE: u64 = (DMA_READ_CYCLES as u64) + (DMA_WRITE_CYCLES as u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PioAddressShape {
+    gpio_base: u8,
+    pin_count: u8,
+}
+
+impl PioAddressShape {
+    fn from_fixture(spec: &FixtureSpec) -> Self {
+        let max_gpio = spec
+            .addr_pins
+            .iter()
+            .copied()
+            .max()
+            .expect("fixture must provide at least one address pin");
+        let gpio_base = match spec.chip_pins {
+            24 => 0,
+            32 => {
+                assert!(
+                    max_gpio >= 32,
+                    "fire-32-style fixture address pins must include the high PIO window"
+                );
+                16
+            }
+            other => panic!("unsupported OneROM chip pin count for PIO address shape: {other}"),
+        };
+
+        for &pin in &spec.addr_pins {
+            assert!(
+                pin >= gpio_base && pin < gpio_base + 32,
+                "fixture address pins must fit one RP2350 PIO GPIOBASE window: pin={pin}, base={gpio_base}"
+            );
+        }
+
+        Self {
+            gpio_base,
+            pin_count: max_gpio - gpio_base + 1,
+        }
+    }
+
+    fn expected_resolved_addr(&self, stim_level: u64) -> u32 {
+        let mask = if self.pin_count == 32 {
+            u32::MAX as u64
+        } else {
+            (1u64 << self.pin_count) - 1
+        };
+        let pio_bits = (stim_level >> self.gpio_base) & mask;
+        SHADOW_BASE | (pio_bits as u32)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -334,6 +384,7 @@ impl std::error::Error for OracleNewError {}
 /// shadow captured at sync.
 pub struct ServingOracle {
     spec: FixtureSpec,
+    addr_shape: PioAddressShape,
     rom_shadow: Box<[u8]>,
     results: Vec<CaseResult>,
     /// Tracks whether we've driven the `init` seed yet. `run_case`
@@ -380,9 +431,11 @@ impl ServingOracle {
 
         let shadow = lift_shadow_from_flash(flash, rom_set_index, &spec)
             .unwrap_or_else(|| vec![0u8; spec.shadow_size].into_boxed_slice());
+        let addr_shape = PioAddressShape::from_fixture(&spec);
 
         Self {
             spec,
+            addr_shape,
             rom_shadow: shadow,
             results: Vec::new(),
             seed_done: false,
@@ -400,8 +453,10 @@ impl ServingOracle {
             spec.shadow_size,
             "new_with_shadow: shadow length must match spec.shadow_size"
         );
+        let addr_shape = PioAddressShape::from_fixture(&spec);
         Self {
             spec,
+            addr_shape,
             rom_shadow: shadow,
             results: Vec::new(),
             seed_done: false,
@@ -486,7 +541,7 @@ impl ServingOracle {
 
         // 3. cs_assert: apply the case stimulus.
         let stim_level: u64 = self.compose_stim_level(&case);
-        let expected_pin_bits: u16 = (stim_level & 0xFFFF) as u16;
+        let expected_resolved_addr = self.addr_shape.expected_resolved_addr(stim_level);
         emu.bus
             .gpio_external_in
             .store(stim_level as u32, Ordering::Relaxed);
@@ -526,8 +581,7 @@ impl ServingOracle {
             // never produced the observed byte. See H1 in the Stage G
             // fix-wave brief (2026-04-17).
             let resolved = glue.last_pushed_read_addr();
-            let data_byte =
-                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> data_base) & 0xFF) as u8;
+            let data_byte = ((emu.bus.gpio_in.load(Ordering::Relaxed) >> data_base) & 0xFF) as u8;
             let pad_oe = ((emu.bus.pio[2].pad_oe >> data_base) & 0xFF) as u8;
 
             trace.push(Observation {
@@ -545,7 +599,7 @@ impl ServingOracle {
                 case,
                 &self.rom_shadow,
                 self.spec.shadow_size,
-                expected_pin_bits,
+                expected_resolved_addr,
                 &trace,
             ) {
                 // Leave the bus in gap-level state for the next case.
@@ -564,8 +618,13 @@ impl ServingOracle {
         // 5. Budget exhausted — run the evaluator one last time; it'll
         //    report NoResolve / NoStableByte based on where the state
         //    machine stopped.
-        let result =
-            evaluate_case_trace(case, &self.rom_shadow, self.spec.shadow_size, expected_pin_bits, &trace);
+        let result = evaluate_case_trace(
+            case,
+            &self.rom_shadow,
+            self.spec.shadow_size,
+            expected_resolved_addr,
+            &trace,
+        );
 
         emu.bus
             .gpio_external_in
@@ -660,13 +719,13 @@ impl ServingOracle {
         if ns_available {
             let _ = writeln!(
                 out,
-                " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6} {:>6}  verdict",
+                " {:>5}  {:<20} {:<18} {:<10} {:<8} {:<8} {:>6} {:>6}  verdict",
                 "idx", "label", "pattern", "resolved", "expected", "observed", "cycles", "ns"
             );
         } else {
             let _ = writeln!(
                 out,
-                " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6}  verdict",
+                " {:>5}  {:<20} {:<18} {:<10} {:<8} {:<8} {:>6}  verdict",
                 "idx", "label", "pattern", "resolved", "expected", "observed", "cycles"
             );
         }
@@ -674,7 +733,7 @@ impl ServingOracle {
         let total = self.results.len();
         for (i, r) in self.results.iter().enumerate() {
             let idx = format!("{}/{}", i + 1, total);
-            let pattern = format!("0x{:08X}", r.case.pin_pattern as u32);
+            let pattern = format!("0x{:016X}", r.case.pin_pattern);
             let resolved = r
                 .resolved_addr
                 .map(|a| format!("0x{:08X}", a))
@@ -700,13 +759,13 @@ impl ServingOracle {
                     .unwrap_or_else(|| "—".to_string());
                 let _ = writeln!(
                     out,
-                    " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6} {:>6}  {}",
+                    " {:>5}  {:<20} {:<18} {:<10} {:<8} {:<8} {:>6} {:>6}  {}",
                     idx, r.case.label, pattern, resolved, expected, observed, cycles, ns, verdict
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    " {:>5}  {:<20} {:<10} {:<10} {:<8} {:<8} {:>6}  {}",
+                    " {:>5}  {:<20} {:<18} {:<10} {:<8} {:<8} {:>6}  {}",
                     idx, r.case.label, pattern, resolved, expected, observed, cycles, verdict
                 );
             }
@@ -962,10 +1021,10 @@ fn try_evaluate_conclusive(
     case: Case,
     shadow: &[u8],
     shadow_size: usize,
-    expected_pin_bits: u16,
+    expected_resolved_addr: u32,
     trace: &[Observation],
 ) -> Option<CaseResult> {
-    let result = evaluate_case_trace(case, shadow, shadow_size, expected_pin_bits, trace);
+    let result = evaluate_case_trace(case, shadow, shadow_size, expected_resolved_addr, trace);
     match result.verdict {
         // Timeouts are only meaningful after the budget is exhausted —
         // keep ticking.
@@ -978,13 +1037,12 @@ fn try_evaluate_conclusive(
 /// machine over a synthetic `&[Observation]` sequence and returns the
 /// resulting [`CaseResult`].
 ///
-/// The `expected_pin_bits` argument is the low-16 of the case's stim
-/// level — the pin pattern PIO1 will latch and push into CH1.READ_ADDR
-/// when the stimulus reaches the DUT. The evaluator uses it to
-/// distinguish **stim-matching pushes** (the ones this case cares
-/// about) from gap-level pushes that leak through the pipeline
-/// (`resolved = 0x2000_B000`) or other background activity. Only
-/// stim-matching pushes transition `WaitPush → WaitStable`.
+/// The `expected_resolved_addr` argument is the SRAM address PIO1 should
+/// push into CH1.READ_ADDR when this case's stimulus reaches the DUT.
+/// The evaluator uses it to distinguish **stim-matching pushes** (the
+/// ones this case cares about) from gap-level pushes that leak through
+/// the pipeline or other background activity. Only stim-matching pushes
+/// transition `WaitPush → WaitStable`.
 ///
 /// This is the testable core of [`ServingOracle::run_case`]: the unit
 /// tests drive it with hand-crafted traces to exercise every verdict
@@ -993,7 +1051,7 @@ pub(crate) fn evaluate_case_trace(
     case: Case,
     shadow: &[u8],
     shadow_size: usize,
-    expected_pin_bits: u16,
+    expected_resolved_addr: u32,
     trace: &[Observation],
 ) -> CaseResult {
     let mut state = EvalState::WaitPush;
@@ -1008,9 +1066,9 @@ pub(crate) fn evaluate_case_trace(
     // window start" rule with a per-edge scan: gap pushes that slip
     // into the window during background pipeline activity now increment
     // ch1_pushes but are filtered out by the stim-pattern match below
-    // (gap-level resolved = 0x2000_B000 rarely collides with a case's
-    // stimulus low-16). Only the push whose `resolved_addr` matches
-    // this case's `expected_pin_bits` transitions to `WaitStable`.
+    // by the expected resolved-address match below. Only the push whose
+    // `resolved_addr` matches this case's expected stimulus address
+    // transitions to `WaitStable`.
     let mut prev_pushes: u32 = 0;
 
     for (i, obs) in trace.iter().enumerate() {
@@ -1020,21 +1078,15 @@ pub(crate) fn evaluate_case_trace(
                 prev_pushes = obs.ch1_pushes;
                 if new_push {
                     let resolved = obs.resolved_addr;
-                    let hi16 = (resolved >> 16) as u16;
-                    let low16 = (resolved & 0xFFFF) as u16;
 
-                    // Gap / non-stim push — scan past it. `hi16 == 0x2000` is architecturally guaranteed:
-                    // `setup_onerom.pio` PIO1 SM0 composes pushes `IN X, 16; IN PINS, 16` with `X = ROM_BASE >> 16`.
-                    if hi16 != 0x2000 || low16 != expected_pin_bits {
+                    // Gap / non-stim push — scan past it.
+                    if resolved != expected_resolved_addr {
                         continue;
                     }
 
-                    // Stim-matching push. The hi16==0x2000 check above
-                    // already guarantees in-range for shadow_size ==
-                    // 0x10000 (which spans the full u16 low-half), but
-                    // we still validate the bound explicitly so future
-                    // resizes (e.g. fire-32-a's 512 KiB shadow) can
-                    // surface out-of-range pushes.
+                    // Stim-matching push. Validate the shadow bound
+                    // explicitly so fixture-size mismatches surface as
+                    // address failures rather than indexing the shadow.
                     if !(SHADOW_BASE..SHADOW_BASE + shadow_size as u32).contains(&resolved) {
                         return CaseResult {
                             case,
@@ -1267,8 +1319,7 @@ mod tests {
     /// Read the fire-24-a SeaBIOS-CPU fixture from disk.
     fn fire24a_fixture_bytes() -> Vec<u8> {
         let p = fire24a_fixture_path();
-        std::fs::read(&p)
-            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e))
+        std::fs::read(&p).unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e))
     }
 
     /// Parse a `FixtureSpec` from the fire-24-a SeaBIOS-CPU fixture.
@@ -1291,8 +1342,8 @@ mod tests {
     /// Parse a `FixtureSpec` from the fire-32-a SeaBIOS PIO-serve fixture.
     fn fire32a_spec() -> FixtureSpec {
         let p = fire32a_fixture_path();
-        let flash = std::fs::read(&p)
-            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
+        let flash =
+            std::fs::read(&p).unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
         FixtureSpec::from_flash(&flash).expect("fire-32-a parse must succeed")
     }
 
@@ -1308,11 +1359,10 @@ mod tests {
         Case::from_addr("test", 0x1800, &spec)
     }
 
-    /// Compute the low-16 stim-pattern bits PIO1 would push for
-    /// `mk_case` under the fire-24-a fixture. Used as
-    /// `expected_pin_bits` by the evaluator in tests that synthesise
-    /// stim-matching pushes.
-    fn mk_case_pin_bits() -> u16 {
+    /// Compute the full stim level for `mk_case` under the fire-24-a
+    /// fixture. This mirrors `compose_stim_level` without requiring an
+    /// oracle instance in pure trace-evaluator tests.
+    fn mk_case_stim_level() -> u64 {
         let spec = fire24a_spec();
         // The stim composition is gate CS LOW + deasserted-high CS pins
         // HIGH + case pin_pattern ORed in. Compute it here so tests
@@ -1322,20 +1372,43 @@ mod tests {
             level |= 1u64 << p;
         }
         let case_pat = mk_case().pin_pattern;
-        let total = level | case_pat;
-        (total & 0xFFFF) as u16
+        level | case_pat
+    }
+
+    /// Compute the legacy low-16 stim-pattern bits for `mk_case`. Kept
+    /// for fire-24-a shadow indexing assertions that prove the new
+    /// resolved-address matcher preserves the old shape.
+    fn mk_case_pin_bits() -> u16 {
+        (mk_case_stim_level() & 0xFFFF) as u16
     }
 
     /// Build a `resolved_addr` that matches `mk_case()`'s stim-pattern.
-    /// Since the pin-bits (u16) occupy the low-16 of `resolved_addr`,
-    /// and the stim-pattern uniquely identifies the case, every
-    /// `resolved_addr` for `mk_case()` equals `0x2000_0000 | mk_case_pin_bits()`.
+    /// For fire-24-a, the fixture-derived address shape still resolves
+    /// to `0x2000_0000 | mk_case_pin_bits()`.
     fn mk_case_resolved() -> u32 {
-        SHADOW_BASE | (mk_case_pin_bits() as u32)
+        let spec = fire24a_spec();
+        PioAddressShape::from_fixture(&spec).expected_resolved_addr(mk_case_stim_level())
     }
 
     fn empty_shadow() -> Box<[u8]> {
         vec![0u8; fire24a_shadow_size()].into_boxed_slice()
+    }
+
+    fn trace_with_stable_byte(resolved_addr: u32, data_byte: u8) -> Vec<Observation> {
+        let mut trace = Vec::new();
+        for c in 0..15u64 {
+            let pushes = if c >= 5 { 1 } else { 0 };
+            let observed = if c >= 12 { data_byte } else { 0x00 };
+            let pad_oe = if c >= 12 { 0xFF } else { 0x00 };
+            trace.push(Observation {
+                cycle: c,
+                ch1_pushes: pushes,
+                resolved_addr,
+                data_byte: observed,
+                pio2_pad_oe_data: pad_oe,
+            });
+        }
+        trace
     }
 
     /// Single load-bearing equivalence proof for Stage 2: the new
@@ -1437,7 +1510,8 @@ mod tests {
         let case = Case::from_raw("test", 0x0800);
         let level = oracle.compose_stim_level(&case);
         assert_eq!(
-            level, 0x0800,
+            level,
+            0x0800,
             "literal `Case::from_raw` must drive `pin_pattern` verbatim — \
              expected 0x0800, got 0x{:04X} (overlay leaked: 0x{:04X})",
             level,
@@ -1580,8 +1654,194 @@ mod tests {
         // The narrow mask must NOT include the literal-path-only bits
         // (fire-24-a bits 8 + 9 are neither address pins nor CS gates
         // nor data pins; the literal path widens to capture them).
-        assert_eq!(mask & (1u64 << 8), 0, "bit 8 must not appear in the narrow mask");
-        assert_eq!(mask & (1u64 << 9), 0, "bit 9 must not appear in the narrow mask");
+        assert_eq!(
+            mask & (1u64 << 8),
+            0,
+            "bit 8 must not appear in the narrow mask"
+        );
+        assert_eq!(
+            mask & (1u64 << 9),
+            0,
+            "bit 9 must not appear in the narrow mask"
+        );
+    }
+
+    #[test]
+    fn pio_address_shape_fire24_is_base0_count16() {
+        let spec = fire24a_spec();
+        let shape = PioAddressShape::from_fixture(&spec);
+        assert_eq!(
+            shape,
+            PioAddressShape {
+                gpio_base: 0,
+                pin_count: 16,
+            }
+        );
+        assert_eq!(
+            shape.expected_resolved_addr(mk_case_stim_level()),
+            SHADOW_BASE | (mk_case_pin_bits() as u32),
+            "fire-24-a must preserve the old 0x2000_0000 | low16(stim) shape"
+        );
+    }
+
+    #[test]
+    fn pio_address_shape_fire32_is_base16_count19() {
+        let spec = fire32a_spec();
+        let shape = PioAddressShape::from_fixture(&spec);
+        assert_eq!(
+            &spec.addr_pins[..3],
+            &[34, 33, 32],
+            "fire-32-a parser must preserve the high physical A0/A1/A2 pins"
+        );
+        assert_eq!(
+            shape,
+            PioAddressShape {
+                gpio_base: 16,
+                pin_count: 19,
+            }
+        );
+    }
+
+    #[test]
+    fn pio_address_shape_expected_addr_uses_bits_above_low16() {
+        let spec = fire32a_spec();
+        let shape = PioAddressShape::from_fixture(&spec);
+        let stim_level = (1u64 << 32) | (1u64 << 33) | (1u64 << 34);
+        let expected = SHADOW_BASE | (1u32 << 16) | (1u32 << 17) | (1u32 << 18);
+
+        assert_eq!(
+            (stim_level & 0xFFFF) as u16,
+            0,
+            "test precondition: the old low-16 truncation would erase this stimulus"
+        );
+        assert_eq!(
+            shape.expected_resolved_addr(1u64 << 32),
+            SHADOW_BASE | (1u32 << 16),
+            "physical GPIO32 must become PIO-local resolved bit 16"
+        );
+        assert_eq!(
+            shape.expected_resolved_addr(1u64 << 33),
+            SHADOW_BASE | (1u32 << 17),
+            "physical GPIO33 must become PIO-local resolved bit 17"
+        );
+        assert_eq!(
+            shape.expected_resolved_addr(1u64 << 34),
+            SHADOW_BASE | (1u32 << 18),
+            "physical GPIO34 must become PIO-local resolved bit 18"
+        );
+        assert_eq!(shape.expected_resolved_addr(stim_level), expected);
+    }
+
+    #[test]
+    fn pio_address_shape_fire24_overlay_differs_for_non_literal_and_raw() {
+        let spec = fire24a_spec();
+        let shape = PioAddressShape::from_fixture(&spec);
+        let oracle = ServingOracle::new_with_shadow(spec, empty_shadow());
+
+        let non_literal = Case {
+            label: "non-literal",
+            pin_pattern: 0,
+            is_literal: false,
+        };
+        let non_literal_stim = oracle.compose_stim_level(&non_literal);
+        assert_eq!(
+            non_literal_stim, 0x9000,
+            "fire-24-a non-literal stimulus must include the CS2/CS3 deasserted-high overlay"
+        );
+        assert_eq!(
+            shape.expected_resolved_addr(non_literal_stim),
+            SHADOW_BASE | 0x9000,
+            "fire-24-a expected resolved address must include the non-literal overlay"
+        );
+
+        let raw = Case::from_raw("raw", 0);
+        let raw_stim = oracle.compose_stim_level(&raw);
+        assert_eq!(
+            raw_stim, 0,
+            "raw literal stimulus must not inherit the deasserted-high overlay"
+        );
+        assert_eq!(
+            shape.expected_resolved_addr(raw_stim),
+            SHADOW_BASE,
+            "raw literal expected address must be based on the raw pin pattern"
+        );
+    }
+
+    #[test]
+    fn evaluate_case_trace_skips_fire24_mismatched_resolved_addr() {
+        let case = mk_case();
+        let expected_resolved = mk_case_resolved();
+        let mismatched_resolved = expected_resolved ^ 0x0000_0001;
+        let shadow = empty_shadow();
+        let trace = trace_with_stable_byte(mismatched_resolved, 0x42);
+
+        let result = evaluate_case_trace(
+            case,
+            &shadow,
+            fire24a_shadow_size(),
+            expected_resolved,
+            &trace,
+        );
+
+        assert_eq!(result.verdict, Verdict::NoResolve);
+        assert!(result.resolved_addr.is_none());
+        assert!(result.observed_byte.is_none());
+    }
+
+    #[test]
+    fn evaluate_case_trace_matching_push_out_of_range_is_reported() {
+        let case = mk_case();
+        let expected_resolved = SHADOW_BASE + 0x20;
+        let shadow_size = 0x10;
+        let shadow: Box<[u8]> = vec![0u8; shadow_size].into_boxed_slice();
+        let trace = trace_with_stable_byte(expected_resolved, 0x42);
+
+        let result = evaluate_case_trace(case, &shadow, shadow_size, expected_resolved, &trace);
+
+        assert_eq!(
+            result.verdict,
+            Verdict::ResolvedAddrOutOfRange {
+                addr: expected_resolved
+            }
+        );
+        assert_eq!(result.resolved_addr, Some(expected_resolved));
+        assert!(result.expected_byte.is_none());
+        assert!(result.observed_byte.is_none());
+    }
+
+    #[test]
+    fn evaluate_case_trace_matches_fire32_resolved_addr_with_high_bits() {
+        let spec = fire32a_spec();
+        let shape = PioAddressShape::from_fixture(&spec);
+        let case = Case::from_addr("fire32 high address bits", 0b111, &spec);
+        let expected_high_pins = (1u64 << 32) | (1u64 << 33) | (1u64 << 34);
+        assert_eq!(
+            case.pin_pattern & expected_high_pins,
+            expected_high_pins,
+            "fire-32-a Case::from_addr(0b111) must set physical GPIO32/33/34"
+        );
+
+        let shadow_for_oracle: Box<[u8]> = vec![0u8; spec.shadow_size].into_boxed_slice();
+        let oracle = ServingOracle::new_with_shadow(spec.clone(), shadow_for_oracle);
+        let stim_level = oracle.compose_stim_level(&case);
+        let expected_resolved = shape.expected_resolved_addr(stim_level);
+        let expected_offset = (expected_resolved - SHADOW_BASE) as usize;
+        let mut shadow: Box<[u8]> = vec![0u8; spec.shadow_size].into_boxed_slice();
+        shadow[expected_offset] = 0x5A;
+        let trace = trace_with_stable_byte(expected_resolved, 0x5A);
+
+        assert!(
+            expected_offset >= 0x1_0000,
+            "test precondition: expected offset must require more than low-16 bits"
+        );
+
+        let result =
+            evaluate_case_trace(case, &shadow, spec.shadow_size, expected_resolved, &trace);
+
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert_eq!(result.resolved_addr, Some(expected_resolved));
+        assert_eq!(result.expected_byte, Some(0x5A));
+        assert_eq!(result.observed_byte, Some(0x5A));
     }
 
     /// 2. Happy-path PASS: push at cycle 5, stable 0x42 from cycle 12 for 3 cycles.
@@ -1607,7 +1867,7 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), resolved, &trace);
         assert_eq!(result.verdict, Verdict::Pass);
         assert_eq!(result.latency_cycles, Some(12));
         assert_eq!(result.resolved_addr, Some(resolved));
@@ -1638,7 +1898,7 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), resolved, &trace);
         assert_eq!(
             result.verdict,
             Verdict::WrongByte {
@@ -1672,7 +1932,7 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), resolved, &trace);
         assert_eq!(
             result.verdict,
             Verdict::Pass,
@@ -1693,6 +1953,7 @@ mod tests {
         let case = mk_case();
         let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
+        let expected_resolved = mk_case_resolved();
         let resolved = SHADOW_BASE + 0xB000;
         assert_ne!(
             (resolved & 0xFFFF) as u16,
@@ -1711,7 +1972,13 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
+        let result = evaluate_case_trace(
+            case,
+            &shadow,
+            fire24a_shadow_size(),
+            expected_resolved,
+            &trace,
+        );
 
         assert!(
             !matches!(result.verdict, Verdict::WrongByte { observed: 0x20, .. }),
@@ -1742,8 +2009,8 @@ mod tests {
     #[test]
     fn stability_rejects_stale_byte_with_zero_pushes_throughout() {
         let case = mk_case();
-        let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
+        let expected_resolved = mk_case_resolved();
         let resolved = SHADOW_BASE + 0xB000;
 
         let mut trace = Vec::new();
@@ -1757,7 +2024,13 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
+        let result = evaluate_case_trace(
+            case,
+            &shadow,
+            fire24a_shadow_size(),
+            expected_resolved,
+            &trace,
+        );
         assert_eq!(result.verdict, Verdict::NoResolve);
         assert!(result.observed_byte.is_none());
     }
@@ -1768,8 +2041,8 @@ mod tests {
     #[test]
     fn try_evaluate_conclusive_requires_fresh_push_edge() {
         let case = mk_case();
-        let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
+        let expected_resolved = mk_case_resolved();
         let resolved = SHADOW_BASE + 0xB000;
 
         let mut trace = Vec::new();
@@ -1783,7 +2056,14 @@ mod tests {
             });
         }
         assert!(
-            try_evaluate_conclusive(case, &shadow, fire24a_shadow_size(), pin_bits, &trace).is_none(),
+            try_evaluate_conclusive(
+                case,
+                &shadow,
+                fire24a_shadow_size(),
+                expected_resolved,
+                &trace
+            )
+            .is_none(),
             "no stim-matching push → not conclusive"
         );
     }
@@ -1795,7 +2075,6 @@ mod tests {
     #[test]
     fn stability_rejects_stale_byte_under_min_fresh_arrival_cycle() {
         let case = mk_case();
-        let pin_bits = mk_case_pin_bits();
         let shadow = empty_shadow();
         let resolved = mk_case_resolved();
 
@@ -1817,7 +2096,7 @@ mod tests {
             });
         }
 
-        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
+        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), resolved, &trace);
 
         if let Some(cycles) = result.latency_cycles {
             assert!(
@@ -1836,11 +2115,12 @@ mod tests {
         );
     }
 
-    /// 5. Push with non-0x2000 hi16 is a non-stim push and skipped.
+    /// 5. Push with a mismatched resolved address is a non-stim push
+    /// and skipped.
     #[test]
     fn verdict_non_stim_push_skipped_as_no_resolve() {
         let case = mk_case();
-        let pin_bits = mk_case_pin_bits();
+        let expected_resolved = mk_case_resolved();
         let shadow = empty_shadow();
         let non_stim_addr = 0x2100_0000u32;
 
@@ -1861,7 +2141,13 @@ mod tests {
             },
         ];
 
-        let result = evaluate_case_trace(case, &shadow, fire24a_shadow_size(), pin_bits, &trace);
+        let result = evaluate_case_trace(
+            case,
+            &shadow,
+            fire24a_shadow_size(),
+            expected_resolved,
+            &trace,
+        );
         assert_eq!(
             result.verdict,
             Verdict::NoResolve,
@@ -2081,6 +2367,29 @@ mod tests {
         assert!(
             report.contains("glue DMA + PIO model"),
             "missing emulator-bounded caveat: {}",
+            report
+        );
+    }
+
+    #[test]
+    fn format_report_preserves_wide_pin_pattern_bits() {
+        let spec = fire24a_spec();
+        let mut oracle = ServingOracle::new_with_shadow(spec, empty_shadow());
+        let case = Case::from_raw("wide", 1u64 << 34);
+
+        oracle.push_result_for_test(CaseResult {
+            case,
+            resolved_addr: None,
+            expected_byte: None,
+            observed_byte: None,
+            latency_cycles: None,
+            verdict: Verdict::NoResolve,
+        });
+
+        let report = oracle.format_report(0);
+        assert!(
+            report.contains("0x0000000400000000"),
+            "wide GPIO pin pattern must not be truncated to u32: {}",
             report
         );
     }
