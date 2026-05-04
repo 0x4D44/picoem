@@ -1277,6 +1277,25 @@ mod tests {
         FixtureSpec::from_flash(&flash).expect("fire-24-a parse must succeed")
     }
 
+    /// Path to the fire-32-a SeaBIOS PIO-serve fixture. Stage 3 — the
+    /// fire-32-a literal-mask branch (`data_pins[0] = 0 → mask = 0xFF00`)
+    /// only fires for this fixture, so the parity test below needs the
+    /// real spec.
+    fn fire32a_fixture_path() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("fixtures");
+        p.push("onerom-fire-32-a-rp2350-seabios.bin");
+        p
+    }
+
+    /// Parse a `FixtureSpec` from the fire-32-a SeaBIOS PIO-serve fixture.
+    fn fire32a_spec() -> FixtureSpec {
+        let p = fire32a_fixture_path();
+        let flash = std::fs::read(&p)
+            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
+        FixtureSpec::from_flash(&flash).expect("fire-32-a parse must succeed")
+    }
+
     /// Shadow size for the fire-24-a fixture (64 KiB).
     fn fire24a_shadow_size() -> usize {
         fire24a_spec().shadow_size
@@ -1501,6 +1520,33 @@ mod tests {
             mask, 0x0000_FFFF,
             "literal mask for fire-24-a (data pins at GPIO 16+) must be the \
              full low-16 — matches the Stage 1 baseline `0x0000_FFFF`"
+        );
+    }
+
+    /// Stage 3 sibling of the test above: fire-32-a's `data_pins[0] == 0`
+    /// flips the literal-mask branch to `0xFFFF & !0xFF == 0xFF00`.
+    /// Without this case the `data_mask` shift would only ever be tested
+    /// with the fire-24-a value 16 (which produces a value outside the
+    /// low-16 — i.e. the data-mask AND-NOT clear is a no-op there), so
+    /// the fire-32-a code path is unverified by the fire-24-a test alone.
+    #[test]
+    fn compose_ext_mask_literal_returns_wide_mask_minus_data_pins_fire32a() {
+        let spec = fire32a_spec();
+        // Sanity: fire-32-a's data pins live in the low-8, so the literal
+        // mask must clear bits 0..7 explicitly.
+        assert_eq!(spec.data_pins[0], 0);
+        assert_eq!(spec.data_pins, [0, 1, 2, 3, 4, 5, 6, 7]);
+
+        // Shadow must match `spec.shadow_size` (524 288 for fire-32-a) —
+        // the fire-24-a `empty_shadow()` helper is hard-coded to 64 KiB.
+        let shadow: Box<[u8]> = vec![0u8; spec.shadow_size].into_boxed_slice();
+        let oracle = ServingOracle::new_with_shadow(spec, shadow);
+        let case = Case::from_raw("test", 0);
+        let mask = oracle.compose_ext_mask(&case);
+        assert_eq!(
+            mask, 0x0000_FF00,
+            "literal mask for fire-32-a (data pins at GPIO 0..7) must clear \
+             bits 0..7 — leaving 0xFF00 (the high 8 of the low-16)"
         );
     }
 

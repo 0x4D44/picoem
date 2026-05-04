@@ -351,10 +351,20 @@ impl CpuServingOracle {
         // 5. Envelope post-process.
         let post = apply_envelope(raw);
 
-        // Leave the bus in gap-level state for the next case.
+        // Leave the bus in gap-level state for the next case. Mirror
+        // both halves (low + high) for symmetry with the PIO oracle —
+        // see the forward-compat block above and
+        // `ServingOracle::run_case` at `onerom_serving_oracle.rs:552-557,
+        // 570-575`. Today's CPU oracle is fire-24-a-only (`gap_level`
+        // fits in u32) so the high half is a write-of-zero, but
+        // keeping the symmetric pair here means a future fire-32-a
+        // CPU-serve oracle won't re-introduce the missing-store bug.
         emu.bus
             .gpio_external_in
             .store(gap_level as u32, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in_hi
+            .store((gap_level >> 32) as u32, Ordering::Relaxed);
 
         self.results.push(post);
         self.results.last().unwrap()

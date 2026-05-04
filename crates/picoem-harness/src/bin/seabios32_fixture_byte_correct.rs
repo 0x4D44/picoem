@@ -48,6 +48,34 @@
 //! - `--stride <N>`: step the address sweep by N (HLD §7.4 — for the
 //!   dev loop on the full sweep).
 //! - `--continue-on-fail`: don't bail on first FAIL (default: bail).
+//!
+//! # Status (2026-05-04)
+//!
+//! **HLD §6.2 acceptance NOT yet met.** This binary's structure is correct
+//! — it parses [`FixtureSpec`], sweeps the 19-bit address space, skips
+//! `unservable_when_high` patterns, and computes the expected byte per
+//! HLD §5.3. However, the PIO [`ServingOracle`] it consumes has fire-24-a-
+//! shaped assumptions that prevent fire-32-a from passing today:
+//!
+//! - The trace evaluator at `onerom_serving_oracle.rs:1028` filters
+//!   pushes by `hi16 != 0x2000`, which rejects every push whose pin bits
+//!   16/17/18 are set. fire-32-a addresses with A16/A17/A18 set therefore
+//!   report [`Verdict::NoResolve`].
+//! - `expected_pin_bits = (stim_level & 0xFFFF) as u16` at
+//!   `onerom_serving_oracle.rs:489` is too narrow to represent
+//!   fire-32-a's 19-bit pin pattern.
+//! - The PIO emulation samples `bus.gpio_in: AtomicU32` which doesn't
+//!   see GPIOs 32..47 (set by `set_gpio_external_in_hi`). Only the SIO
+//!   `GPIO_HI_IN` register sees harness stimulus on the high half.
+//!
+//! Today smoke mode reports approximately 1024 PASS / 3072 NoResolve
+//! out of 4096 servable cases. The PASS cases all hit address ranges
+//! where the oracle's existing 16-bit pipeline coincidentally suffices.
+//!
+//! Stage 4 follow-up: generalise the PIO oracle's address-decode /
+//! evaluate pipeline to handle fire-32-a's `IN X, N; IN PINS, M` shape
+//! with `N + M = 21` and high-bank `gpio_in` plumbing. Tracked in
+//! `tech_debt.md`.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -576,6 +604,18 @@ mod tests {
         assert_eq!(spec.chip_pins, 32);
         assert_eq!(spec.addr_pins.len(), 19);
         assert_eq!(spec.unservable_when_high, 1u64 << 16);
+        // Anchor the bit-16-is-A16 invariant the sweep math depends on:
+        // `make_case` builds `pin_pattern` by permuting addr bit `i` onto
+        // `spec.addr_pins[i]`, so for the unservable filter
+        // (`pin_pattern & (1<<16) != 0` ⟺ A16 set) to hold,
+        // `addr_pins[16]` must itself be GPIO16. If a future fixture
+        // reorders the address-pin map this assert flags it before the
+        // arithmetic below silently misclassifies cases.
+        assert_eq!(
+            spec.addr_pins[16], 16,
+            "fire-32-a A16 must map to GPIO16 — the unservable filter \
+             depends on `(pin_pattern & (1<<16)) != 0` reflecting A16=1"
+        );
 
         let sweep_size: u64 = 1u64 << 19;
         let mut servable: u64 = 0;

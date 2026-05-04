@@ -771,7 +771,8 @@ impl WorkerBus {
         match reg_offset {
             0x000 => core as u32,                  // CPUID
             0x004 => self.gpio_in_fresh(), // GPIO_IN — SIO+PIO from last quantum + fresh external
-            0x008 => self.gpio_hi_in_fresh(), // GPIO_HI_IN — bank-1 external stim + QSPI noise
+            // GPIO_HI_IN — bank-1 external stim only (no QSPI noise on this path; see gpio_hi_in_fresh)
+            0x008 => self.gpio_hi_in_fresh(),
             0x010 => self.shared.gpio.read_out(0), // GPIO_OUT
             0x030 => self.shared.gpio.read_oe(0), // GPIO_OE
             // FIFO
