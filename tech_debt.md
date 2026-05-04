@@ -2,63 +2,17 @@
 
 Items discovered during development that need addressing in later phases.
 
-## OneROM PIO ServingOracle is fire-24-a-shaped — fire-32-a byte-correct sweep cannot pass (2026-05-04, Stage 3)
+## OneROM PIO ServingOracle fire-32-a acceptance closed (2026-05-04, Stage 4C)
 
-**Owner:** harness team / OneROM oracle.
+**Status:** resolved. Stage 4A added RP2350 PIO `GPIOBASE` and high-bank
+sampling, Stage 4B replaced the fire-24-shaped resolved-address matcher, and
+Stage 4C fixed smoke-cap accounting in
+`crates/picoem-harness/src/bin/seabios32_fixture_byte_correct.rs`.
 
-**Severity:** medium. fire-32-a byte-correctness validation cannot run
-end-to-end. The Stage 3 binary
-`crates/picoem-harness/src/bin/seabios32_fixture_byte_correct.rs` is built
-and exercises the new wide-GPIO bus path, but smoke mode reports
-~1024 PASS / 3072 `NoResolve` out of 4096 servable cases. The PASSes are
-the addresses where the 16-bit pipeline coincidentally suffices.
-
-**Description:** the PIO `ServingOracle`
-(`crates/picoem-harness/src/onerom_serving_oracle.rs`) hardcodes a
-16-bit pin width and a `0x2000` hi16 mask in the trace evaluator,
-neither of which generalise to fire-32-a:
-
-1. **Trace evaluator hi16 filter** at `onerom_serving_oracle.rs:1028` —
-   `if hi16 != 0x2000 || low16 != expected_pin_bits { continue; }`. Any
-   fire-32-a push whose pin bits 16/17/18 are set lights up bits in the
-   resolved-address hi16, so the evaluator rejects it as a non-stim
-   push and the case ends as `NoResolve`.
-2. **`expected_pin_bits` width** at `onerom_serving_oracle.rs:489` —
-   `let expected_pin_bits: u16 = (stim_level & 0xFFFF) as u16;`. fire-32-a's
-   stim level routinely sets bits ≥ 16; truncating to u16 drops them
-   and breaks the pattern match in (1) even when the hi16 filter is
-   relaxed.
-3. **High-bank `gpio_in` plumbing** — the PIO emulation samples
-   `bus.gpio_in: AtomicU32`, which only covers GPIOs 0..31. fire-32-a
-   stimulus written via `set_gpio_external_in_hi` lands in
-   `gpio_external_in_hi` and merges into `GPIO_HI_IN` for SIO reads,
-   but the PIO sampler never sees it. The PIO IN-PINS opcode needs a
-   widened sampler so 19-bit address patterns reach the PIO state
-   machines.
-
-**Fix scope (Stage 4):**
-
-- Per-fixture PIO program shape detection. fire-24-a uses
-  `IN X, 16; IN PINS, 16` (the historic shape baked into the
-  evaluator); fire-32-a uses `IN X, N; IN PINS, M` with `N + M = 21`.
-  The `0x2000` hi16 constant is `ROM_BASE >> 16` for the 16+16 shape;
-  for fire-32-a it shifts.
-- Fixture-aware `expected_pin_bits` width (u32 or u64) plumbed through
-  `evaluate_case_trace` and `try_evaluate_conclusive`.
-- High-bank `gpio_in` plumbing for the PIO sampler so GPIOs 32..47
-  drive PIO IN-PINS observations. Likely needs a `gpio_in_hi:
-  AtomicU32` companion to the existing `gpio_in`, plus a
-  bus-side merge of `gpio_external_in_hi` into a fresh `gpio_in_hi`
-  read on every PIO step.
-
-**References:**
-
-- HLD: `wrk_docs/2026.05.04 - HLD - OneROM Serving Oracle Fixture
-  Generalization.md` §6.2 (acceptance criteria).
-- Current state: `wrk_journals/2026.05.04 - JRN - OneROM Fixture
-  Generalization Implementation.md` Stage 3.
-- Status block on the binary itself documents the same set of gaps for
-  in-tree readers.
+**Validation:** fire-32 smoke now reports `PASS=4096`, `wrong=0`,
+`no_resolve=0`, `no_stable=0`, `addr_oor=0`; the full fire-32 sweep reports
+`PASS=262144` with `262144` unservable cases skipped; fire-24 SeaBIOS
+regression remains `pass=131072`, `wrong=0`, `no_stable=0`, `not_driven=0`.
 
 ## WATCHDOG REASON modelling + reset-survival (2026-04-28, Track 4)
 

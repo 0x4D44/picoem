@@ -51,31 +51,9 @@
 //!
 //! # Status (2026-05-04)
 //!
-//! **HLD §6.2 acceptance NOT yet met.** This binary's structure is correct
-//! — it parses [`FixtureSpec`], sweeps the 19-bit address space, skips
-//! `unservable_when_high` patterns, and computes the expected byte per
-//! HLD §5.3. However, the PIO [`ServingOracle`] it consumes has fire-24-a-
-//! shaped assumptions that prevent fire-32-a from passing today:
-//!
-//! - The trace evaluator at `onerom_serving_oracle.rs:1028` filters
-//!   pushes by `hi16 != 0x2000`, which rejects every push whose pin bits
-//!   16/17/18 are set. fire-32-a addresses with A16/A17/A18 set therefore
-//!   report [`Verdict::NoResolve`].
-//! - `expected_pin_bits = (stim_level & 0xFFFF) as u16` at
-//!   `onerom_serving_oracle.rs:489` is too narrow to represent
-//!   fire-32-a's 19-bit pin pattern.
-//! - The PIO emulation samples `bus.gpio_in: AtomicU32` which doesn't
-//!   see GPIOs 32..47 (set by `set_gpio_external_in_hi`). Only the SIO
-//!   `GPIO_HI_IN` register sees harness stimulus on the high half.
-//!
-//! Today smoke mode reports approximately 1024 PASS / 3072 NoResolve
-//! out of 4096 servable cases. The PASS cases all hit address ranges
-//! where the oracle's existing 16-bit pipeline coincidentally suffices.
-//!
-//! Stage 4 follow-up: generalise the PIO oracle's address-decode /
-//! evaluate pipeline to handle fire-32-a's `IN X, N; IN PINS, M` shape
-//! with `N + M = 21` and high-bank `gpio_in` plumbing. Tracked in
-//! `tech_debt.md`.
+//! Stage 4C acceptance passed: smoke ran 4096 servable cases and the
+//! full sweep ran 262,144 servable cases with zero wrong, no-resolve,
+//! no-stable-byte, or out-of-range cases.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -112,6 +90,13 @@ const BOOT_CYCLE_CAP: u64 = 10_000_000;
 /// Print a progress line every N servable cases run.
 const PROGRESS_INTERVAL: u64 = 16384;
 
+fn should_process_next_servable_case(servable_processed: u64, smoke_cap: Option<u64>) -> bool {
+    match smoke_cap {
+        Some(cap) => servable_processed < cap,
+        None => true,
+    }
+}
+
 struct Cli {
     fixture: PathBuf,
     seabios: PathBuf,
@@ -135,9 +120,7 @@ fn parse_cli() -> Result<Cli, String> {
             "--smoke" => smoke = true,
             "--stride" => {
                 let v = args.next().ok_or("--stride needs a value")?;
-                stride = v
-                    .parse::<u64>()
-                    .map_err(|e| format!("--stride: {e}"))?;
+                stride = v.parse::<u64>().map_err(|e| format!("--stride: {e}"))?;
                 if stride == 0 {
                     return Err("--stride must be >= 1".into());
                 }
@@ -415,13 +398,10 @@ fn main() -> ExitCode {
         .len();
     println!(
         "shadow @ +0x{:05X}: {} unique bytes",
-        spec.shadow_size,
-        unique_count
+        spec.shadow_size, unique_count
     );
     if unique_count == 1 {
-        eprintln!(
-            "WARNING: shadow is uniform — oracle cannot distinguish between addresses."
-        );
+        eprintln!("WARNING: shadow is uniform — oracle cannot distinguish between addresses.");
     }
 
     // Sweep parameters.
@@ -443,7 +423,7 @@ fn main() -> ExitCode {
     let _ = std::io::stdout().flush();
 
     let mut tally = Tally::default();
-    let mut servable_seen: u64 = 0;
+    let mut servable_processed: u64 = 0;
     let mut unservable_skipped: u64 = 0;
     let mut bailed_early = false;
     let t_sweep = Instant::now();
@@ -460,12 +440,10 @@ fn main() -> ExitCode {
             continue;
         }
 
-        servable_seen += 1;
-        if let Some(cap) = smoke_cap
-            && servable_seen > cap
-        {
+        if !should_process_next_servable_case(servable_processed, smoke_cap) {
             break;
         }
+        servable_processed += 1;
 
         // Expected byte: SeaBIOS at addr_idx mod 256 KiB. A18=0 and A18=1
         // patterns map to the same byte (HLD §5.3 — the SDRR baking
@@ -534,11 +512,11 @@ fn main() -> ExitCode {
             }
         }
 
-        if servable_seen.is_multiple_of(PROGRESS_INTERVAL) {
+        if servable_processed.is_multiple_of(PROGRESS_INTERVAL) {
             let elapsed_ms = t_sweep.elapsed().as_millis();
             println!(
                 "  progress: servable={} pass={} wrong={} no_resolve={} no_stable={} addr_oor={} ({} ms)",
-                servable_seen,
+                servable_processed,
                 tally.pass,
                 tally.wrong,
                 tally.no_resolve,
@@ -556,7 +534,7 @@ fn main() -> ExitCode {
     println!();
     println!("=== sweep complete ===");
     println!("addresses-in-sweep:    {}", sweep_size);
-    println!("servable processed:    {}", servable_seen);
+    println!("servable processed:    {}", servable_processed);
     println!("unservable (skipped):  {}", unservable_skipped);
     println!("PASS:                  {}", tally.pass);
     println!("wrong:                 {}", tally.wrong);
@@ -571,14 +549,30 @@ fn main() -> ExitCode {
         );
     }
 
+    let full_stride_one_accounting_error = if !cli.smoke && cli.stride == 1 && !bailed_early {
+        let expected_count = sweep_size / 2;
+        if servable_processed != expected_count || unservable_skipped != expected_count {
+            eprintln!(
+                "INTERNAL: full sweep accounting expected servable_processed={} \
+                 and unservable_skipped={}, got servable_processed={} unservable_skipped={}",
+                expected_count, expected_count, servable_processed, unservable_skipped
+            );
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     let total_failures = tally.wrong + tally.no_resolve + tally.no_stable + tally.addr_oor;
-    if bailed_early || total_failures != 0 {
+    if bailed_early || total_failures != 0 || full_stride_one_accounting_error {
         ExitCode::FAILURE
-    } else if tally.pass != servable_seen {
+    } else if tally.pass != servable_processed {
         // Belt-and-braces: every servable case must be classified as PASS.
         eprintln!(
-            "INTERNAL: pass count {} != servable_seen {}",
-            tally.pass, servable_seen
+            "INTERNAL: pass count {} != servable_processed {}",
+            tally.pass, servable_processed
         );
         ExitCode::FAILURE
     } else {
@@ -590,6 +584,16 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use picoem_harness::onerom_fixture::FixtureSpec;
+
+    #[test]
+    fn smoke_cap_allows_exactly_requested_servable_cases() {
+        let cap = Some(2);
+
+        assert!(should_process_next_servable_case(0, cap));
+        assert!(should_process_next_servable_case(1, cap));
+        assert!(!should_process_next_servable_case(2, cap));
+        assert!(should_process_next_servable_case(2, None));
+    }
 
     /// The fire-32-a sweep produces exactly 2^18 = 262 144 servable
     /// cases (`A16 == 0`) and 2^18 = 262 144 unservable cases

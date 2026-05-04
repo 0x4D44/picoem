@@ -1,0 +1,23 @@
+{
+    "$schema": "https://images.onerom.org/configs/schema.json",
+    "version": 1,
+    "name": "seabios-32-27c020",
+    "description": "256 KiB SeaBIOS x86 BIOS served from a 32-pin 27C020 EPROM. Single ROM set, full image.",
+    "categories": [
+        "bios",
+        "x86",
+        "firmware"
+    ],
+    "rom_sets": [
+        {
+            "type": "single",
+            "roms": [
+                {
+                    "description": "SeaBIOS 256 KiB x86 BIOS",
+                    "file": "images/seabios-256k.bin",
+                    "type": "27C020"
+                }
+            ]
+        }
+    ]
+}
