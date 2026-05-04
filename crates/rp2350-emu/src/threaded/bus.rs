@@ -523,16 +523,17 @@ impl WorkerBus {
             // PIO register reads: the `PioBlock`s themselves live on
             // the PIO worker thread, so the CPU worker can only observe
             // the atomics `ThreadedPio` publishes — today that's
-            // CTRL.SM_ENABLE (0x000) and IRQ (0x030). RX FIFO pops and
-            // per-SM register reads need a read-through channel (not
-            // yet wired — Phase 4/5 scope) and return 0 for now, which
-            // matches a freshly reset block.
+            // CTRL.SM_ENABLE (0x000), IRQ (0x030), and GPIOBASE
+            // (0x168). RX FIFO pops and per-SM register reads need a
+            // read-through channel (not yet wired — Phase 4/5 scope)
+            // and return 0 for now, which matches a freshly reset block.
             0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {
                 // PIO blocks are 0x10_0000 bytes apart (0x502/0x503/0x504).
                 let block = ((base - 0x5020_0000) >> 20) as usize;
                 match offset {
                     0x000 => self.shared.pio.read_sm_enabled(block) as u32,
                     0x030 => self.shared.pio.read_irq_flags(block) as u32,
+                    0x168 => self.shared.pio.read_gpio_base(block) as u32,
                     _ => {
                         // FSTAT / FLEVEL / RXFn / DBG_* / per-SM
                         // reads need a read-through channel to the PIO
@@ -646,9 +647,10 @@ impl WorkerBus {
                 //     wire-format ints the worker passes back through
                 //     `PioBlock::write32`).
                 //   - Everything else (TXF0..TXF3, IRQ, FDEBUG,
-                //     INPUT_SYNC_BYPASS, per-SM EXECCTRL/SHIFTCTRL/
-                //     INSTR/PINCTRL) → WriteReg, which the worker
-                //     hands straight to `PioBlock::write32`.
+                //     INPUT_SYNC_BYPASS, GPIOBASE, per-SM
+                //     EXECCTRL/SHIFTCTRL/INSTR/PINCTRL) → WriteReg,
+                //     which the worker hands straight to
+                //     `PioBlock::write32`.
                 //
                 // `alias` (the 2 bits encoded in address[13:12]) is
                 // propagated on every variant — the single-threaded
@@ -741,21 +743,15 @@ impl WorkerBus {
     /// Threaded counterpart of `Bus::read_gpio_hi_in`. Stage 3A wide-GPIO
     /// support — see HLD §A.
     ///
-    /// The threaded runtime currently models bank 1 as zero (no GPIO
-    /// 32..47 internal state plumbed through `AtomicGpio`), and there
-    /// is no QSPI-noise generator on this path. Both gaps are pre-
-    /// existing scope (no consumer needed them); harness-driven
-    /// external stimulus on GPIOs 32..47 is the only signal Stage 3
-    /// requires this path to surface.
-    ///
-    /// Composition: zero base (no internal GPIO 32..47 model) + harness
-    /// overlay = `(0 & !ext_mask) | (ext_val & ext_mask)`. Out-of-mask
-    /// bits read back as zero, which is the legacy behaviour callers
-    /// already saw.
+    /// Composition mirrors `gpio_in_fresh`: start from the coordinator's
+    /// merged bank-1 state, then re-overlay fresh high-bank external
+    /// stimulus so host-driven GPIO 32..47 changes are visible between
+    /// quanta.
     #[inline]
     fn gpio_hi_in_fresh(&self) -> u32 {
+        let base = self.shared.gpio.read_in_hi();
         let (ext_val, ext_mask) = self.shared.gpio.read_external_hi();
-        ext_val & ext_mask
+        (base & !ext_mask) | (ext_val & ext_mask)
     }
 
     /// SIO (`0xD`) read32. DIV/INTERP (offsets 0x060..=0x0FC) are
@@ -769,12 +765,12 @@ impl WorkerBus {
         );
 
         match reg_offset {
-            0x000 => core as u32,                  // CPUID
+            0x000 => core as u32,          // CPUID
             0x004 => self.gpio_in_fresh(), // GPIO_IN — SIO+PIO from last quantum + fresh external
-            // GPIO_HI_IN — bank-1 external stim only (no QSPI noise on this path; see gpio_hi_in_fresh)
+            // GPIO_HI_IN — merged bank-1 state plus fresh external overlay.
             0x008 => self.gpio_hi_in_fresh(),
             0x010 => self.shared.gpio.read_out(0), // GPIO_OUT
-            0x030 => self.shared.gpio.read_oe(0), // GPIO_OE
+            0x030 => self.shared.gpio.read_oe(0),  // GPIO_OE
             // FIFO
             0x050 => self.shared.sio.fifo_st(core as usize), // FIFO_ST
             0x058 => {
@@ -2160,13 +2156,16 @@ mod tests {
         }
 
         #[test]
-        fn ahb_read_pio_enabled_and_irq_flags() {
+        fn ahb_read_pio_published_registers() {
             let shared = fresh_shared();
+            shared.pio.write_gpio_base(1, 16);
             let mut bus = WorkerBus::new(0, shared);
             // PIO0 CTRL (SM_ENABLE) — reads through ThreadedPio.
             assert_eq!(bus.read32(0x5020_0000, 0), 0);
             // PIO1 IRQ flags.
             assert_eq!(bus.read32(0x5030_0030, 0), 0);
+            // PIO1 GPIOBASE.
+            assert_eq!(bus.read32(0x5030_0168, 0), 16);
             // PIO2 CTRL.
             assert_eq!(bus.read32(0x5040_0000, 0), 0);
         }
@@ -2309,10 +2308,10 @@ mod tests {
         fn sio_read_gpio_hi_in_and_oe() {
             let shared = fresh_shared();
             let mut bus = WorkerBus::new(0, shared);
-            // GPIO_HI_IN (0x008) — internal bank-1 model is zero with
-            // no harness-driven external stim, and the QSPI-noise hook
-            // is intentionally absent on the threaded path (no consumer
-            // exercises it today). Reads as 0.
+            // GPIO_HI_IN (0x008) — merged bank-1 state is zero with no
+            // PIO/SIO output or harness-driven external stimulus. The
+            // QSPI-noise hook is intentionally absent on the threaded
+            // path.
             assert_eq!(bus.read32(0xD000_0008, 0), 0);
             // GPIO_OE.
             assert_eq!(bus.read32(0xD000_0030, 0), 0);
@@ -2330,6 +2329,21 @@ mod tests {
             // a mask covering GPIOs 32..47 (low 16 bits).
             shared.gpio.write_external_hi(0x0000_0F00, 0x0000_FFFF);
             assert_eq!(bus.read32(0xD000_0008, 0), 0x0000_0F00);
+        }
+
+        #[test]
+        fn sio_read_gpio_hi_in_preserves_internal_hi_bits() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+
+            shared.gpio.write_in_hi(1 << 2);
+            shared.gpio.write_external_hi(1 << 4, 1 << 4);
+
+            assert_eq!(
+                bus.read32(0xD000_0008, 0) & ((1 << 2) | (1 << 4)),
+                (1 << 2) | (1 << 4),
+                "GPIO_HI_IN must include merged high-bank state plus fresh external overlay"
+            );
         }
 
         #[test]

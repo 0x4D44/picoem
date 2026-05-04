@@ -207,6 +207,7 @@ impl ThreadedEmulator {
             qmi_regs,
             xip_cache_offset,
             gpio_in,
+            gpio_in_hi,
             gpio_external_in,
             gpio_external_mask,
             gpio_external_in_hi,
@@ -256,6 +257,7 @@ impl ThreadedEmulator {
             sio.gpio_out,
             sio.gpio_oe,
             gpio_in.load(Ordering::Relaxed),
+            gpio_in_hi.load(Ordering::Relaxed),
             gpio_external_in.load(Ordering::Relaxed),
             gpio_external_mask,
             gpio_external_in_hi.load(Ordering::Relaxed),
@@ -334,7 +336,11 @@ impl ThreadedEmulator {
         let threaded_pio = ThreadedPio::new();
         for (idx, block) in pio.iter().enumerate() {
             threaded_pio.write_sm_enabled(idx, block.sm_enabled_mask());
+            threaded_pio.write_gpio_base(idx, block.gpio_base());
             threaded_pio.write_pads(idx, block.pad_out, block.pad_oe);
+            let (out_lo, out_hi) = block.local_to_physical_pins(block.pad_out);
+            let (oe_lo, oe_hi) = block.local_to_physical_pins(block.pad_oe);
+            shared_gpio.write_pio_pads(idx, out_lo, oe_lo, out_hi, oe_hi);
         }
 
         let shared = SharedState {
@@ -857,10 +863,10 @@ fn pio_block_worker_body(
             apply_pio_command(&mut block, block_idx, &shared.pio, cmd);
         }
 
-        // GPIO_IN snapshot once per quantum — parity with the
+        // Physical GPIO snapshot once per quantum — parity with the
         // single-threaded `Emulator::tick_peripherals` which reads
-        // `bus.gpio_in` once and hands it to every PIO step.
-        let gpio_in = shared.gpio.read_in();
+        // the merged GPIO banks once and hands them to every PIO step.
+        let gpio_pins = shared.gpio.read_in64();
 
         // `shared.pio.read_sm_enabled` reflects the last-applied CTRL
         // write's SM_ENABLE mask (`apply_pio_command::WriteCtrl`
@@ -868,7 +874,7 @@ fn pio_block_worker_body(
         // SM in this block can make progress this quantum, so skip the
         // per-SM stepping loop entirely.
         if shared.pio.read_sm_enabled(block_idx) != 0 {
-            block.step_n(step_q, gpio_in);
+            block.step_n_with_pins(step_q, gpio_pins);
             // Reflect the block's IRQ flags back onto `ThreadedPio` so
             // CPU workers observe them through the shared atomic.
             // PIO→NVIC assertion is Phase-later scope (see function
@@ -885,6 +891,11 @@ fn pio_block_worker_body(
         shared
             .pio
             .write_pads(block_idx, block.pad_out, block.pad_oe);
+        let (out_lo, out_hi) = block.local_to_physical_pins(block.pad_out);
+        let (oe_lo, oe_hi) = block.local_to_physical_pins(block.pad_oe);
+        shared
+            .gpio
+            .write_pio_pads(block_idx, out_lo, oe_lo, out_hi, oe_hi);
 
         // Phase 4 Stage C (HLD V7 §5.1): single-barrier rendezvous
         // after phase work. Overlaps with coord phase-2 of this
@@ -915,11 +926,10 @@ fn pio_block_worker_body(
 /// post-write `sm_enabled_mask` onto `ThreadedPio::sm_enabled` so
 /// CPU-side reads of CTRL.SM_ENABLE and the `pio_block_worker_body`
 /// enable-gate check see the new state on the next quantum.
-/// `WriteReg` republishes the mask too — on the chance a generic
-/// write touches per-SM state that flips an SM's enable
-/// (belt-and-braces; today no per-SM register toggles enable, but this
+/// `WriteReg` republishes the mask and GPIOBASE too — on the chance a
+/// generic write touches state that affects CPU-side readback, this
 /// keeps the invariant local to this function regardless of future
-/// `PioBlock::write32` extensions).
+/// `PioBlock::write32` extensions.
 fn apply_pio_command(
     block: &mut PioBlock,
     block_idx: usize,
@@ -980,8 +990,10 @@ fn apply_pio_command(
             block.write32(offset as u32, val, alias as u32);
             // Conservative republish: keeps the mask coherent even if a
             // future `PioBlock::write32` extension ends up toggling
-            // `enabled` outside CTRL.
+            // `enabled` outside CTRL. GPIOBASE readback uses the same
+            // generic path, so publish it after every WriteReg too.
             shared_pio.write_sm_enabled(block_idx, block.sm_enabled_mask());
+            shared_pio.write_gpio_base(block_idx, block.gpio_base());
         }
         // Stage B.2 panic-injection hook (HLD V5 §2.2 / §4 item 5). The
         // `pio{block}` substring is load-bearing — the worker-split tests
@@ -1051,21 +1063,26 @@ fn coordinator_worker_body(
 }
 
 /// Coordinator-owned GPIO merge. Ports `Emulator::update_gpio`
-/// (`lib.rs:406-415`): start with SIO pads (`out & oe`, bank 0), fold
-/// each PIO block's `(pad_out, pad_oe)` overlay in block order, then
-/// apply the external-stimulus overlay last.
+/// (`lib.rs:406-415`): start with SIO pads (`out & oe`), fold each
+/// PIO block's physical pad overlay in block order, then apply the
+/// external-stimulus overlay last.
 fn update_gpio(shared: &SharedState) {
     let sio_out = shared.gpio.read_out(0);
     let sio_oe = shared.gpio.read_oe(0);
-    let mut merged = sio_out & sio_oe;
+    let mut merged_lo = sio_out & sio_oe;
+    let mut merged_hi = shared.gpio.read_out(1) & shared.gpio.read_oe(1);
     for block_idx in 0..3 {
-        let (pad_out, pad_oe) = shared.pio.read_pads(block_idx);
-        merged = (merged & !pad_oe) | (pad_out & pad_oe);
+        let ((pad_out_lo, pad_oe_lo), (pad_out_hi, pad_oe_hi)) =
+            shared.gpio.read_pio_pads(block_idx);
+        merged_lo = (merged_lo & !pad_oe_lo) | (pad_out_lo & pad_oe_lo);
+        merged_hi = (merged_hi & !pad_oe_hi) | (pad_out_hi & pad_oe_hi);
     }
     let (ext_val, ext_mask) = shared.gpio.read_external();
-    shared
-        .gpio
-        .write_in((merged & !ext_mask) | (ext_val & ext_mask));
+    let (ext_val_hi, ext_mask_hi) = shared.gpio.read_external_hi();
+    shared.gpio.write_in64(
+        (merged_lo & !ext_mask) | (ext_val & ext_mask),
+        (merged_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi),
+    );
 }
 
 /// Coordinator-owned peripheral tick. Phase 4 Stage A port of
@@ -1165,7 +1182,7 @@ fn tick_peripherals(shared: &SharedState, cycles: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Config;
+    use crate::{Config, EmulatorBuilder};
 
     // ----- Handoff + round-trip (stages prior) --------------------------
 
@@ -1731,10 +1748,11 @@ mod tests {
         );
     }
 
-    /// `WorkerBus::ahb_read32` exposes the two atomics `ThreadedPio`
-    /// publishes (CTRL.SM_ENABLE at 0x000 and IRQ at 0x030) so
-    /// firmware that round-trips CTRL after enabling SMs observes the
-    /// correct mask. Other offsets return 0 until read-through is wired.
+    /// `WorkerBus::ahb_read32` exposes the atomics `ThreadedPio`
+    /// publishes (CTRL.SM_ENABLE at 0x000, IRQ at 0x030, GPIOBASE at
+    /// 0x168) so firmware that round-trips these registers observes
+    /// the worker-owned state. Other offsets return 0 until read-through
+    /// is wired.
     #[test]
     fn pio_ctrl_readback_reflects_published_enable_mask() {
         use crate::core::CoreBus;
@@ -1789,6 +1807,35 @@ mod tests {
             threaded.shared.pio.read_sm_enabled(0),
             0b0001,
             "run_quanta must drain + apply the CTRL command"
+        );
+    }
+
+    #[test]
+    fn pio_gpiobase_write_via_worker_bus_drains_and_reads_back() {
+        use crate::core::CoreBus;
+
+        let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        {
+            let mut bus = WorkerBus::new(0, threaded.shared.clone());
+            bus.write32(0x5030_0168, 0xFFFF_FFFF, 0);
+            assert_eq!(
+                bus.read32(0x5030_0168, 0),
+                0,
+                "PIO write is queued until the PIO worker drains the next quantum"
+            );
+        }
+
+        threaded.run_quanta(1);
+
+        let mut bus = WorkerBus::new(0, threaded.shared.clone());
+        assert_eq!(threaded.shared.pio.read_gpio_base(1), 16);
+        assert_eq!(
+            bus.read32(0x5030_0168, 0),
+            16,
+            "threaded GPIOBASE readback must mirror the worker-owned PioBlock"
         );
     }
 
@@ -2101,7 +2148,10 @@ mod tests {
         threaded.shared.gpio.write_oe(0, 0x0000_0001);
         // PIO block 2 drives bit 4 high and bit 0 low via pad_oe
         // (higher-indexed blocks overlay lower ones per §4.2).
-        threaded.shared.pio.write_pads(2, 0x0000_0010, 0x0000_0011);
+        threaded
+            .shared
+            .gpio
+            .write_pio_pads(2, 0x0000_0010, 0x0000_0011, 0, 0);
         // External stimulus forces bit 8 high.
         threaded
             .shared
@@ -2119,9 +2169,55 @@ mod tests {
         );
     }
 
-    /// `from_emulator` must seed `ThreadedPio::pads` from each incoming
-    /// `PioBlock.pad_out` / `pad_oe`. Without the seed, coord's first
-    /// `update_gpio` reads zero and drops PIO output for one quantum.
+    #[test]
+    fn threaded_update_gpio_publishes_gpio_in_hi() {
+        let threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+
+        // PIO1 physical high-bank output drives GPIO34 high.
+        threaded.shared.gpio.write_pio_pads(1, 0, 0, 1 << 2, 1 << 2);
+        // External stimulus independently forces GPIO36 high.
+        threaded.shared.gpio.write_external_hi(1 << 4, 1 << 4);
+
+        update_gpio(&threaded.shared);
+
+        assert_eq!(
+            threaded.shared.gpio.read_in_hi() & ((1 << 2) | (1 << 4)),
+            (1 << 2) | (1 << 4),
+            "threaded update_gpio must publish PIO and external high-bank inputs"
+        );
+    }
+
+    #[test]
+    fn threaded_pio_gpiobase_16_sees_gpio_external_in_hi() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .unwrap();
+
+        // IN PINS, 19. GPIOBASE=16 maps physical GPIO34 to local pin 18.
+        emu.bus.pio[1].write32(0x048, 0x4013, 0);
+        emu.bus.pio[1].write32(0x168, 16, 0);
+        let shiftctrl = emu.bus.pio[1].read32(0x0D0) & !(1 << 18);
+        emu.bus.pio[1].write32(0x0D0, shiftctrl, 0);
+        emu.bus.pio[1].write32(0x000, 0x1, 0);
+        emu.bus.set_gpio_external_in_hi(1 << 2, 1 << 2);
+        emu.update_gpio();
+
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded.shared.atomics.set_halted(0);
+        threaded.shared.atomics.set_halted(1);
+
+        threaded.run_quanta(1);
+
+        let block = &threaded.pio_blocks.as_ref().unwrap()[1];
+        assert_eq!(block.sm[0].isr_value(), 1 << 18);
+        assert_eq!(block.sm[0].isr_shift_count(), 19);
+    }
+
+    /// `from_emulator` must seed both the legacy local pad snapshot and
+    /// the physical low/high pad snapshot from each incoming
+    /// `PioBlock.pad_out` / `pad_oe`. Without the physical seed, coord's
+    /// first `update_gpio` reads zero and drops PIO output for one quantum.
     ///
     /// Regression guard: removing the seed loop in `from_emulator` (at
     /// the `threaded_pio.write_pads(...)` call) fails this test.
@@ -2130,6 +2226,7 @@ mod tests {
         let mut emu = Emulator::new(Config::default());
         emu.bus.pio[0].pad_out = 0xAAAA_0000;
         emu.bus.pio[0].pad_oe = 0xFFFF_0000;
+        emu.bus.pio[1].write32(0x168, 16, 0);
         emu.bus.pio[1].pad_out = 0x0000_5555;
         emu.bus.pio[1].pad_oe = 0x0000_FFFF;
         emu.bus.pio[2].pad_out = 0x1234_5678;
@@ -2140,6 +2237,19 @@ mod tests {
         assert_eq!(threaded.shared.pio.read_pads(0), (0xAAAA_0000, 0xFFFF_0000));
         assert_eq!(threaded.shared.pio.read_pads(1), (0x0000_5555, 0x0000_FFFF));
         assert_eq!(threaded.shared.pio.read_pads(2), (0x1234_5678, 0x8765_4321));
+        assert_eq!(threaded.shared.pio.read_gpio_base(1), 16);
+        assert_eq!(
+            threaded.shared.gpio.read_pio_pads(0),
+            ((0xAAAA_0000, 0xFFFF_0000), (0, 0))
+        );
+        assert_eq!(
+            threaded.shared.gpio.read_pio_pads(1),
+            ((0x5555_0000, 0xFFFF_0000), (0, 0))
+        );
+        assert_eq!(
+            threaded.shared.gpio.read_pio_pads(2),
+            ((0x1234_5678, 0x8765_4321), (0, 0))
+        );
     }
 
     // ----- Per-worker timing instrumentation ----------------------------

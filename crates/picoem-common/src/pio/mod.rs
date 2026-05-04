@@ -14,6 +14,7 @@ pub struct PioBlock {
     pub(crate) irq_flags: u8,
     input_sync_bypass: u32,
     fdebug: u32,
+    gpio_base: u8,
     /// Shared pad value latch — OUT/SET/MOV PINS from any SM writes here.
     /// Reset to `u32::MAX` (weak-pullup convention, matches epio).
     pub(crate) shared_pin_values: u32,
@@ -100,6 +101,7 @@ impl PioBlock {
             irq_flags: 0,
             input_sync_bypass: 0,
             fdebug: 0,
+            gpio_base: 0,
             shared_pin_values: u32::MAX,
             shared_pin_dirs: 0,
             pad_out: 0,
@@ -127,6 +129,7 @@ impl PioBlock {
         self.irq_flags = 0;
         self.input_sync_bypass = 0;
         self.fdebug = 0;
+        self.gpio_base = 0;
         self.shared_pin_values = u32::MAX;
         self.shared_pin_dirs = 0;
         self.pad_out = 0;
@@ -160,6 +163,24 @@ impl PioBlock {
     #[inline]
     pub fn sm_enabled_mask(&self) -> u8 {
         self.sm_enabled_mask
+    }
+
+    /// PIO-local GPIO window base in the physical GPIO namespace.
+    /// RP2350 supports bases 0 and 16.
+    #[inline]
+    pub fn gpio_base(&self) -> u8 {
+        self.gpio_base
+    }
+
+    /// Map a 32-bit PIO-local pin word back to physical GPIO banks.
+    /// Returns `(gpio0_31, gpio32_47_word)`.
+    #[inline]
+    pub fn local_to_physical_pins(&self, local: u32) -> (u32, u32) {
+        match self.gpio_base {
+            0 => (local, 0),
+            16 => (local << 16, local >> 16),
+            _ => unreachable!("GPIOBASE stores only 0 or 16"),
+        }
     }
 
     /// The 8-bit PIO IRQ-flag register as a `u32` (upper bits zero).
@@ -326,9 +347,15 @@ impl PioBlock {
 
     /// Advance PIO block by one system clock.
     pub fn step(&mut self, gpio_in: u32) {
+        self.step_with_pins(gpio_in as u64);
+    }
+
+    /// Advance PIO block by one system clock with a physical GPIO sample.
+    pub fn step_with_pins(&mut self, gpio_pins: u64) {
         if self.sm_enabled_mask == 0 {
             return;
         }
+        let gpio_in = self.local_gpio_window(gpio_pins);
         for i in 0..4 {
             if self.sm[i].clock_tick() {
                 self.sm[i].execute_cycle(
@@ -351,12 +378,22 @@ impl PioBlock {
     /// pin-output merging). A bulk-advance optimisation is future work if
     /// PIO appears hot in a flamegraph.
     pub fn step_n(&mut self, n: u32, gpio_in: u32) {
+        self.step_n_with_pins(n, gpio_in as u64);
+    }
+
+    /// Advance PIO block by `n` system clocks with a physical GPIO sample.
+    pub fn step_n_with_pins(&mut self, n: u32, gpio_pins: u64) {
         if self.sm_enabled_mask == 0 {
             return;
         }
         for _ in 0..n {
-            self.step(gpio_in);
+            self.step_with_pins(gpio_pins);
         }
+    }
+
+    #[inline]
+    fn local_gpio_window(&self, gpio_pins: u64) -> u32 {
+        ((gpio_pins >> self.gpio_base) & 0xFFFF_FFFF) as u32
     }
 
     /// Merge shared pad latches + per-SM side-set into pad_out/pad_oe.
@@ -581,9 +618,11 @@ impl PioBlock {
             0x048..=0x0C4 => 0,
             // Per-SM registers (stride 0x18, SM0 at 0x0C8)
             0x0C8..=0x127 => self.read_sm_reg(offset),
-            // RXFn_PUTGET0..3 (4 SMs × 4 entries, RP2350 offsets 0x128..0x164)
-            // and GPIOBASE (0x168): unmodeled, return 0.
-            0x128..=0x168 => 0,
+            // RXFn_PUTGET0..3 (4 SMs × 4 entries, RP2350 offsets 0x128..0x164):
+            // unmodeled, return 0.
+            0x128..=0x164 => 0,
+            // GPIOBASE: RP2350 physical GPIO window base (0 or 16).
+            0x168 => self.gpio_base as u32,
             // INTR: raw interrupt status (read-only, 16 bits). RP2350 offset 0x16C.
             0x16C => self.raw_intr_rp2350(),
             // IRQ0_INTE. RP2350 offset 0x170.
@@ -730,8 +769,14 @@ impl PioBlock {
             }
             // Per-SM registers
             0x0C8..=0x127 => self.write_sm_reg(offset, val, alias),
-            // RXFn_PUTGET0..3 and GPIOBASE (0x128..0x168): unmodeled, ignore writes.
-            0x128..=0x168 => {}
+            // RXFn_PUTGET0..3: unmodeled, ignore writes.
+            0x128..=0x164 => {}
+            // GPIOBASE: alias-aware storage, with only bit 4 retained.
+            0x168 => {
+                let mut current = self.gpio_base as u32;
+                Self::apply_alias_rmw(&mut current, val, alias);
+                self.gpio_base = (current & 0x10) as u8;
+            }
             // INTR: read-only
             0x16C => {}
             // IRQ0_INTE (16-bit mask, alias-aware). RP2350 offset 0x170.
@@ -1326,6 +1371,7 @@ mod tests {
     /// default pinctrl (set_base=0, set_count=5) so SET writes land on
     /// pad bits [4:0] — letting the pad_out transition counters see
     /// bit 1 (CS) and bit 2 (SCK) directly.
+    #[cfg(feature = "pio-pad-diag")]
     fn make_pio_for_set_pins_test(high_data: u8) -> PioBlock {
         let mut pio = PioBlock::new();
         // SET PINS, high_data (opcode=111, dst=0, data=high_data)
@@ -1621,6 +1667,90 @@ mod tests {
         for _ in 0..n {
             pio.step(gpio_in);
         }
+    }
+
+    #[test]
+    fn gpiobase_resets_to_zero_and_masks_to_bit4() {
+        let mut pio = PioBlock::new();
+        assert_eq!(pio.read32(0x168), 0, "GPIOBASE reset value");
+        assert_eq!(pio.gpio_base(), 0);
+
+        pio.write32(0x168, 0xFFFF_FFFF, 0);
+        assert_eq!(pio.read32(0x168), 16, "only bit 4 is retained");
+
+        pio.write32(0x168, 0x20, 0);
+        assert_eq!(pio.read32(0x168), 0, "bit 5 alone does not select base 16");
+
+        pio.write32(0x168, 0x10, 0);
+        pio.reset();
+        assert_eq!(pio.read32(0x168), 0, "reset clears GPIOBASE");
+    }
+
+    #[test]
+    fn gpiobase_write_aliases_are_rmw_then_masked() {
+        let mut pio = PioBlock::new();
+
+        pio.write32(0x168, 0x10, 0);
+        pio.write32(0x168, 0x20, 2); // SET bit 5; bit 4 should survive the RMW.
+        assert_eq!(pio.read32(0x168), 16);
+
+        pio.write32(0x168, 0x20, 3); // CLR bit 5; bit 4 still survives.
+        assert_eq!(pio.read32(0x168), 16);
+
+        pio.write32(0x168, 0x10, 1); // XOR bit 4 off.
+        assert_eq!(pio.read32(0x168), 0);
+
+        pio.write32(0x168, 0x30, 1); // XOR sets bits 4 and 5, mask keeps bit 4.
+        assert_eq!(pio.read32(0x168), 16);
+    }
+
+    #[test]
+    fn in_pins_with_gpiobase_16_samples_physical_gpio34_as_local_18() {
+        // IN PINS, 19. With GPIOBASE=16, physical GPIO34 projects to
+        // PIO-local pin 18.
+        let mut pio = make_pio_with_program(&[0x4013]);
+        pio.write32(0x168, 16, 0);
+        pio.sm[0].shiftctrl &= !(1 << 18); // shift left, so the value is easy to read.
+
+        pio.step_with_pins(1u64 << 34);
+
+        assert_eq!(pio.sm[0].isr_value(), 1 << 18);
+        assert_eq!(pio.sm[0].isr_shift_count(), 19);
+    }
+
+    #[test]
+    fn wait_pin_with_gpiobase_16_uses_the_local_window() {
+        // WAIT 1 PIN 0, with IN_BASE=18. Physical GPIO34 should satisfy
+        // the wait after GPIOBASE projects it to local pin 18.
+        let mut pio = make_pio_with_program(&[0x20A0, 0xE021]);
+        pio.write32(0x168, 16, 0);
+        pio.sm[0].pinctrl = (pio.sm[0].pinctrl & !(0x1F << 15)) | (18 << 15);
+
+        pio.step_with_pins(0);
+        assert!(
+            pio.sm[0].stalled,
+            "WAIT should stall while physical GPIO34 is low"
+        );
+
+        pio.step_with_pins(1u64 << 34);
+        assert!(
+            !pio.sm[0].stalled,
+            "WAIT should clear when physical GPIO34 is high"
+        );
+        assert_eq!(pio.sm[0].pc, 1, "WAIT should complete and advance");
+    }
+
+    #[test]
+    fn pad_mapping_with_gpiobase_16_splits_local_bits_across_low_and_high_banks() {
+        let mut pio = PioBlock::new();
+
+        let local = (1 << 0) | (1 << 15) | (1 << 16) | (1 << 31);
+        assert_eq!(pio.local_to_physical_pins(local), (local, 0));
+
+        pio.write32(0x168, 16, 0);
+        let (lo, hi) = pio.local_to_physical_pins(local);
+        assert_eq!(lo, (1 << 16) | (1 << 31));
+        assert_eq!(hi, (1 << 0) | (1 << 15));
     }
 
     #[test]
@@ -2530,12 +2660,12 @@ mod tests {
     /// the unaligned access directly: write32 with sm_offset % 0x18
     /// landing on a reserved reg (the wildcard `_` arm) is not
     /// possible via the public range — however, read/write of the
-    /// unmodeled 0x128..=0x168 range exercises the surrounding
+    /// unmodeled 0x128..=0x164 range exercises the surrounding
     /// wildcards.
     #[test]
     fn unmodeled_intblock_range_reads_zero_and_ignores_writes() {
         let mut pio = PioBlock::new();
-        // 0x134 is inside the unmodeled `0x128..=0x168` range.
+        // 0x134 is inside the unmodeled `0x128..=0x164` range.
         assert_eq!(pio.read32(0x134), 0);
         pio.write32(0x134, 0xDEAD_BEEF, 0);
         assert_eq!(pio.read32(0x134), 0);

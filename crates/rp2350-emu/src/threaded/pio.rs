@@ -73,6 +73,7 @@ pub struct ThreadedPio {
     // three PIO workers (post-split) don't false-share.
     sm_enabled: [Aligned<AtomicU8>; PIO_BLOCKS],
     irq_flags: [Aligned<AtomicU8>; PIO_BLOCKS],
+    gpio_base: [Aligned<AtomicU8>; PIO_BLOCKS],
     dreq: [Aligned<AtomicU8>; PIO_BLOCKS],
 
     // Packed pad snapshot: high32 = pad_out, low32 = pad_oe. PIO worker
@@ -96,8 +97,8 @@ pub struct ThreadedPio {
 /// firmware-programmed state) and a general-purpose `WriteReg` arm that
 /// covers every remaining PIO register offset the single-threaded
 /// `Bus::write32` hands to `PioBlock::write32`: TXF0..TXF3, FDEBUG,
-/// IRQ, IRQ_FORCE, INPUT_SYNC_BYPASS, per-SM EXECCTRL/SHIFTCTRL/
-/// INSTR/PINCTRL.
+/// IRQ, IRQ_FORCE, INPUT_SYNC_BYPASS, GPIOBASE, per-SM EXECCTRL/
+/// SHIFTCTRL/INSTR/PINCTRL.
 ///
 /// `WriteInstrMem` and `SetClkDiv` are kept as purpose-built variants
 /// for backward compatibility with existing tests and for the slightly
@@ -134,8 +135,8 @@ pub enum PioCommand {
     WriteCtrl { block: u8, val: u32, alias: u8 },
     /// Generic register write — dispatched to `PioBlock::write32` as-is.
     /// Covers TXF0..TXF3, FDEBUG, IRQ, IRQ_FORCE, INPUT_SYNC_BYPASS,
-    /// per-SM EXECCTRL / SHIFTCTRL / INSTR / PINCTRL, and any PIO offset
-    /// the two purpose-built variants above do not route.
+    /// GPIOBASE, per-SM EXECCTRL / SHIFTCTRL / INSTR / PINCTRL, and any
+    /// PIO offset the two purpose-built variants above do not route.
     WriteReg {
         block: u8,
         offset: u16,
@@ -181,6 +182,7 @@ impl ThreadedPio {
             rx: std::array::from_fn(|_| std::array::from_fn(|_| SpscQueue::new(PIO_FIFO_DEPTH))),
             sm_enabled: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
             irq_flags: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
+            gpio_base: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
             dreq: std::array::from_fn(|_| Aligned(AtomicU8::new(0))),
             pads: std::array::from_fn(|_| Aligned(AtomicU64::new(0))),
             // Preallocate for the common setup-heavy case (INSTR_MEM 32
@@ -265,6 +267,19 @@ impl ThreadedPio {
         self.irq_flags[block].store(flags, Relaxed);
     }
 
+    /// Read the RP2350 GPIOBASE value for `block` (0 or 16).
+    pub fn read_gpio_base(&self, block: usize) -> u8 {
+        debug_assert!(block < PIO_BLOCKS);
+        self.gpio_base[block].load(Relaxed)
+    }
+
+    /// Publish the RP2350 GPIOBASE value for `block`.
+    pub fn write_gpio_base(&self, block: usize, base: u8) {
+        debug_assert!(block < PIO_BLOCKS);
+        debug_assert!(matches!(base, 0 | 16));
+        self.gpio_base[block].store(base, Relaxed);
+    }
+
     /// Clear IRQ flag bits indicated by `mask` (write-1-to-clear semantics).
     pub fn clear_irq_flags(&self, block: usize, mask: u8) {
         debug_assert!(block < PIO_BLOCKS);
@@ -347,6 +362,7 @@ impl ThreadedPio {
             }
             self.sm_enabled[block].store(0, Relaxed);
             self.irq_flags[block].store(0, Relaxed);
+            self.gpio_base[block].store(0, Relaxed);
             self.dreq[block].store(0, Relaxed);
             self.pads[block].store(0, Release);
             self.commands[block]
@@ -410,6 +426,15 @@ mod tests {
         assert_eq!(pio.read_irq_flags(1), 0x5);
         pio.clear_irq_flags(1, 0x1);
         assert_eq!(pio.read_irq_flags(1), 0x4);
+    }
+
+    #[test]
+    fn gpio_base_atomic() {
+        let pio = ThreadedPio::new();
+        pio.write_gpio_base(1, 16);
+        assert_eq!(pio.read_gpio_base(1), 16);
+        assert_eq!(pio.read_gpio_base(0), 0);
+        assert_eq!(pio.read_gpio_base(2), 0);
     }
 
     #[test]

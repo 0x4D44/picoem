@@ -6,26 +6,80 @@
 //!
 //! Most operations use `Relaxed` ordering — GPIO pins are observed
 //! asynchronously by the outside world, so no acquire/release
-//! fencing is needed. The `external` stimulus field is a packed
-//! `(val, mask)` pair that crosses between the harness writer and the
-//! coordinator's `update_gpio` reader, so it carries a multi-field
-//! invariant and uses `Acquire`/`Release` to preserve atomicity.
+//! fencing is needed. Packed external stimulus and PIO pad snapshots
+//! carry multi-field invariants across threads, so those paths use
+//! `Acquire`/`Release` to preserve atomicity.
 
 use std::sync::atomic::{
     AtomicU32, AtomicU64,
     Ordering::{Acquire, Relaxed, Release},
 };
 
+struct AtomicPadSnapshot {
+    seq: AtomicU32,
+    out: AtomicU64,
+    oe: AtomicU64,
+}
+
+impl AtomicPadSnapshot {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU32::new(0),
+            out: AtomicU64::new(0),
+            oe: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn store(&self, out_lo: u32, oe_lo: u32, out_hi: u32, oe_hi: u32) {
+        let seq = self.seq.load(Relaxed).wrapping_add(1) | 1;
+        self.seq.store(seq, Release);
+        self.out.store(pack_banks(out_lo, out_hi), Relaxed);
+        self.oe.store(pack_banks(oe_lo, oe_hi), Relaxed);
+        self.seq.store(seq.wrapping_add(1), Release);
+    }
+
+    #[inline]
+    fn load(&self) -> ((u32, u32), (u32, u32)) {
+        loop {
+            let before = self.seq.load(Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let out = self.out.load(Relaxed);
+            let oe = self.oe.load(Relaxed);
+            let after = self.seq.load(Acquire);
+            if before == after {
+                let (out_lo, out_hi) = unpack_banks(out);
+                let (oe_lo, oe_hi) = unpack_banks(oe);
+                return ((out_lo, oe_lo), (out_hi, oe_hi));
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
+#[inline]
+fn pack_banks(lo: u32, hi: u32) -> u64 {
+    (lo as u64) | ((hi as u64) << 32)
+}
+
+#[inline]
+fn unpack_banks(packed: u64) -> (u32, u32) {
+    (packed as u32, (packed >> 32) as u32)
+}
+
 /// Thread-safe GPIO output and output-enable state.
 ///
 /// Two 32-bit banks cover the full 48-pin space.  Bank 1 bits 16..31
 /// are unused on current silicon but allocated per the HLD.
 ///
-/// `in_` and `external` carry the single-threaded `Bus::gpio_in` /
-/// `Bus::gpio_external_in` / `Bus::gpio_external_mask` fields into the
-/// threaded runtime. The low half (GPIOs 0..31) lives in `in_` /
-/// `external`; the high half (GPIOs 32..47) lives in `external_hi` and
-/// is sampled by the firmware on `GPIO_HI_IN` reads (SIO offset 0x008).
+/// `in_pins` and `external` / `external_hi` carry the serial
+/// `Bus` GPIO input and harness-stimulus fields into the threaded
+/// runtime. PIO pad snapshots are published after projection into
+/// physical low/high banks so `GPIOBASE=16` never gets treated as a
+/// low-bank-only local mask by the coordinator.
 ///
 /// `external` and `external_hi` each pack `(val, mask)` as
 /// `(high32 = val, low32 = mask)` so the harness writer and coord's
@@ -35,7 +89,9 @@ use std::sync::atomic::{
 pub struct AtomicGpio {
     out: [AtomicU32; 2],
     oe: [AtomicU32; 2],
-    in_: AtomicU32,
+    /// Packed merged input state: low32 = GPIO0..31, high32 = GPIO32..47.
+    in_pins: AtomicU64,
+    pio_pads: [AtomicPadSnapshot; 3],
     /// Packed external stimulus for GPIOs 0..31: `(val << 32) | mask`.
     external: AtomicU64,
     /// Packed external stimulus for GPIOs 32..47 (low 16 bits used):
@@ -52,7 +108,8 @@ impl AtomicGpio {
         Self {
             out: [AtomicU32::new(0), AtomicU32::new(0)],
             oe: [AtomicU32::new(0), AtomicU32::new(0)],
-            in_: AtomicU32::new(0),
+            in_pins: AtomicU64::new(0),
+            pio_pads: std::array::from_fn(|_| AtomicPadSnapshot::new()),
             external: AtomicU64::new(0),
             external_hi: AtomicU64::new(0),
         }
@@ -67,27 +124,27 @@ impl AtomicGpio {
     /// Consumes the plain `u32` snapshots — callers take them out of the
     /// Bus destructure.
     ///
-    /// Only bank 0 (low 32 pins) is seeded for the OUT/OE/IN registers.
-    /// Bank 1 starts at zero, matching post-reset silicon state. The
-    /// `external_hi` companion is seeded from
-    /// `Bus::gpio_external_in_hi` / `gpio_external_mask_hi` so harness-
-    /// applied GPIO 32..47 stimulus survives the handoff.
+    /// SIO OUT/OE seed only bank 0. The merged input seed carries both
+    /// `gpio_in` and `gpio_in_hi`; PIO physical pad snapshots are seeded
+    /// separately by `ThreadedEmulator::from_emulator` after each
+    /// `PioBlock` maps its local pads through its own `GPIOBASE`.
     pub fn seed(
         gpio_out: u32,
         gpio_oe: u32,
         gpio_in: u32,
+        gpio_in_hi: u32,
         gpio_external_in: u32,
         gpio_external_mask: u32,
         gpio_external_in_hi: u32,
         gpio_external_mask_hi: u32,
     ) -> Self {
         let external = ((gpio_external_in as u64) << 32) | (gpio_external_mask as u64);
-        let external_hi =
-            ((gpio_external_in_hi as u64) << 32) | (gpio_external_mask_hi as u64);
+        let external_hi = ((gpio_external_in_hi as u64) << 32) | (gpio_external_mask_hi as u64);
         Self {
             out: [AtomicU32::new(gpio_out), AtomicU32::new(0)],
             oe: [AtomicU32::new(gpio_oe), AtomicU32::new(0)],
-            in_: AtomicU32::new(gpio_in),
+            in_pins: AtomicU64::new(pack_banks(gpio_in, gpio_in_hi)),
+            pio_pads: std::array::from_fn(|_| AtomicPadSnapshot::new()),
             external: AtomicU64::new(external),
             external_hi: AtomicU64::new(external_hi),
         }
@@ -98,14 +155,78 @@ impl AtomicGpio {
     /// Read the merged GPIO_IN value (low 32 pins).
     #[inline]
     pub fn read_in(&self) -> u32 {
-        self.in_.load(Relaxed)
+        self.in_pins.load(Relaxed) as u32
     }
 
     /// Overwrite GPIO_IN. Stage 7 wires this to the GPIO-merge step
     /// that runs at the quantum boundary (coordinator-owned).
     #[inline]
     pub fn write_in(&self, val: u32) {
-        self.in_.store(val, Relaxed);
+        let mut current = self.in_pins.load(Relaxed);
+        loop {
+            let new = (current & 0xFFFF_FFFF_0000_0000) | val as u64;
+            match self
+                .in_pins
+                .compare_exchange_weak(current, new, Release, Relaxed)
+            {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    /// Read the merged GPIO_IN value for physical GPIOs 32..47.
+    #[inline]
+    pub fn read_in_hi(&self) -> u32 {
+        (self.in_pins.load(Relaxed) >> 32) as u32
+    }
+
+    /// Overwrite GPIO_IN for physical GPIOs 32..47.
+    #[inline]
+    pub fn write_in_hi(&self, val: u32) {
+        let mut current = self.in_pins.load(Relaxed);
+        loop {
+            let new = (current & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
+            match self
+                .in_pins
+                .compare_exchange_weak(current, new, Release, Relaxed)
+            {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    /// Publish a coherent physical GPIO input snapshot.
+    #[inline]
+    pub fn write_in64(&self, lo: u32, hi: u32) {
+        self.in_pins.store(pack_banks(lo, hi), Release);
+    }
+
+    /// Read the merged physical GPIO sample used by PIO blocks.
+    #[inline]
+    pub fn read_in64(&self) -> u64 {
+        let base = self.in_pins.load(Acquire);
+        let (base_lo, base_hi) = unpack_banks(base);
+        let (ext_val, ext_mask) = self.read_external();
+        let lo = (base_lo & !ext_mask) | (ext_val & ext_mask);
+        let (ext_val_hi, ext_mask_hi) = self.read_external_hi();
+        let hi = (base_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi);
+        pack_banks(lo, hi)
+    }
+
+    /// Publish one PIO block's already-physical pad snapshot.
+    #[inline]
+    pub fn write_pio_pads(&self, block: usize, out_lo: u32, oe_lo: u32, out_hi: u32, oe_hi: u32) {
+        debug_assert!(block < 3);
+        self.pio_pads[block].store(out_lo, oe_lo, out_hi, oe_hi);
+    }
+
+    /// Read one PIO block's already-physical pad snapshot.
+    #[inline]
+    pub fn read_pio_pads(&self, block: usize) -> ((u32, u32), (u32, u32)) {
+        debug_assert!(block < 3);
+        self.pio_pads[block].load()
     }
 
     // ---- External-input stimulus (harness pin forcing) ---------------------
@@ -114,7 +235,7 @@ impl AtomicGpio {
     ///
     /// Uses `Acquire` ordering — this carries a multi-field invariant
     /// across threads (harness writer → coord's `update_gpio` reader),
-    /// unlike the Relaxed accessors on `out`/`oe`/`in_`.
+    /// unlike the Relaxed accessors on `out`/`oe`.
     #[inline]
     pub fn read_external(&self) -> (u32, u32) {
         let packed = self.external.load(Acquire);
@@ -347,5 +468,43 @@ mod tests {
         assert_eq!(gpio.read_external_hi(), (1 << 1, 0xFFFF));
         // Low half is preserved.
         assert_eq!(gpio.read_external(), (1 << 5, 0xFF));
+    }
+
+    #[test]
+    fn in_hi_and_in64_roundtrip() {
+        let gpio = AtomicGpio::seed(0, 0, 0xAAAA_5555, 0x0000_00F0, 0, 0, 0, 0);
+
+        assert_eq!(gpio.read_in(), 0xAAAA_5555);
+        assert_eq!(gpio.read_in_hi(), 0x0000_00F0);
+        assert_eq!(gpio.read_in64(), 0x0000_00F0_AAAA_5555);
+
+        gpio.write_in_hi(0x0000_1234);
+        assert_eq!(gpio.read_in64(), 0x0000_1234_AAAA_5555);
+
+        gpio.write_in64(0xCAFE_BABE, 0x0000_5678);
+        assert_eq!(gpio.read_in(), 0xCAFE_BABE);
+        assert_eq!(gpio.read_in_hi(), 0x0000_5678);
+        assert_eq!(gpio.read_in64(), 0x0000_5678_CAFE_BABE);
+
+        gpio.write_external(0x0000_0001, 0x0000_0001);
+        gpio.write_external_hi(0x0000_0002, 0x0000_0002);
+        assert_eq!(
+            gpio.read_in64() & 0x0000_0002_0000_0001,
+            0x0000_0002_0000_0001
+        );
+    }
+
+    #[test]
+    fn pio_physical_pads_roundtrip_per_block() {
+        let gpio = AtomicGpio::new();
+
+        gpio.write_pio_pads(1, 0x0001_0000, 0x0003_0000, 0x0000_0004, 0x0000_000C);
+
+        assert_eq!(gpio.read_pio_pads(0), ((0, 0), (0, 0)));
+        assert_eq!(
+            gpio.read_pio_pads(1),
+            ((0x0001_0000, 0x0003_0000), (0x0000_0004, 0x0000_000C))
+        );
+        assert_eq!(gpio.read_pio_pads(2), ((0, 0), (0, 0)));
     }
 }

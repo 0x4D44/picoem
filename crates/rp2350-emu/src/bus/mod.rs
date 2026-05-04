@@ -468,6 +468,10 @@ pub struct Bus {
     /// discipline plus x86_64's plain-`mov` emission means no ordering
     /// cost on the emulator hot path.
     pub gpio_in: AtomicU32,
+    /// Combined GPIO pin state for physical GPIOs 32..47. Low 16 bits
+    /// are used by RP2350 GPIO bank 1; upper bits stay reserved so
+    /// `GPIO_HI_IN` can keep its QSPI-noise behaviour explicit.
+    pub gpio_in_hi: AtomicU32,
     /// External-input stimulus value. Bits selected by
     /// [`Self::gpio_external_mask`] are forced to the corresponding
     /// bits of this value after `update_gpio` merges SIO/PIO outputs.
@@ -651,6 +655,7 @@ impl Bus {
             sio: Sio::new(),
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
             gpio_in: AtomicU32::new(0),
+            gpio_in_hi: AtomicU32::new(0),
             gpio_external_in: AtomicU32::new(0),
             gpio_external_mask: 0,
             gpio_external_in_hi: AtomicU32::new(0),
@@ -1354,7 +1359,7 @@ impl Bus {
     /// firmware-visible word stays at SIO offset 0x008 (the
     /// `GPIO_HI_IN` register).
     fn read_gpio_hi_in(&mut self) -> u32 {
-        let base = if self.flash_loaded {
+        let qspi_noise = if self.flash_loaded {
             // Advance simple LFSR for variation, then force bit 29 on
             // most reads. Real QSPI lines are noisy — bias toward "alive".
             let s = self.gpio_hi_noise_state;
@@ -1365,6 +1370,8 @@ impl Bus {
         } else {
             0
         };
+        let base =
+            (self.gpio_in_hi.load(Ordering::Relaxed) & 0x0000_FFFF) | (qspi_noise & 0xFFFF_0000);
         let ext_mask = self.gpio_external_mask_hi;
         let ext_val = self.gpio_external_in_hi.load(Ordering::Relaxed);
         (base & !ext_mask) | (ext_val & ext_mask)

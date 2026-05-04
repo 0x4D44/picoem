@@ -535,6 +535,7 @@ impl Emulator {
             pio.reset();
         }
         self.bus.gpio_in.store(0, Ordering::Relaxed);
+        self.bus.gpio_in_hi.store(0, Ordering::Relaxed);
         // External-input stimulus (harness-owned pin forcing) survives
         // reset only if the harness re-applies it post-reset. Clearing
         // here matches the real-silicon model: any host stimulus must
@@ -1070,7 +1071,8 @@ impl Emulator {
     /// Advance peripherals by `cycles` virtual cycles. Called once at the
     /// end of each quantum.
     fn tick_peripherals(&mut self, cycles: u32) {
-        let gpio_in = self.bus.gpio_in.load(Ordering::Relaxed);
+        let gpio_pins = (self.bus.gpio_in.load(Ordering::Relaxed) as u64)
+            | ((self.bus.gpio_in_hi.load(Ordering::Relaxed) as u64) << 32);
         let resets = self.bus.resets_state;
         // PIO0/1/2 are gated by their RESETS bits — real hardware holds
         // PIO inert while its reset line is asserted. RESET_PIO0..2 are
@@ -1079,7 +1081,7 @@ impl Emulator {
         for (i, pio) in self.bus.pio.iter_mut().enumerate() {
             let bit = crate::bus::RESET_PIO0 + i as u8;
             if (resets & (1u32 << bit)) == 0 {
-                pio.step_n(cycles, gpio_in);
+                pio.step_n_with_pins(cycles, gpio_pins);
             }
         }
         self.route_pio_irqs();
@@ -1183,33 +1185,49 @@ impl Emulator {
     /// otherwise be recomputed every tick. Mask-clear bits reflect whatever
     /// SIO/PIO produced; mask-set bits reflect `gpio_external_in`.
     pub(crate) fn update_gpio(&mut self) {
-        let mut out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        let mut out_lo = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        let mut out_hi = 0u32;
         for pio in &self.bus.pio {
-            let pio_mask = pio.pad_oe;
-            out = (out & !pio_mask) | (pio.pad_out & pio_mask);
+            let (pio_out_lo, pio_out_hi) = pio.local_to_physical_pins(pio.pad_out);
+            let (pio_oe_lo, pio_oe_hi) = pio.local_to_physical_pins(pio.pad_oe);
+            out_lo = (out_lo & !pio_oe_lo) | (pio_out_lo & pio_oe_lo);
+            out_hi = (out_hi & !pio_oe_hi) | (pio_out_hi & pio_oe_hi);
         }
         let ext_mask = self.bus.gpio_external_mask;
         let ext_val = self.bus.gpio_external_in.load(Ordering::Relaxed);
-        self.bus
-            .gpio_in
-            .store((out & !ext_mask) | (ext_val & ext_mask), Ordering::Relaxed);
+        self.bus.gpio_in.store(
+            (out_lo & !ext_mask) | (ext_val & ext_mask),
+            Ordering::Relaxed,
+        );
+
+        let ext_mask_hi = self.bus.gpio_external_mask_hi;
+        let ext_val_hi = self.bus.gpio_external_in_hi.load(Ordering::Relaxed);
+        self.bus.gpio_in_hi.store(
+            (out_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi),
+            Ordering::Relaxed,
+        );
     }
 
     /// Read a GPIO pin from the merged pin state. Debug-only: asserts
     /// the emulator has not been promoted into Threaded mode.
     pub fn gpio_read(&self, pin: u8) -> bool {
         self.assert_not_placeholder();
-        (self.bus.gpio_in.load(Ordering::Relaxed) >> pin) & 1 != 0
+        match pin {
+            0..=31 => (self.bus.gpio_in.load(Ordering::Relaxed) >> pin) & 1 != 0,
+            32..=47 => (self.bus.gpio_in_hi.load(Ordering::Relaxed) >> (pin - 32)) & 1 != 0,
+            _ => false,
+        }
     }
 
     /// Write a GPIO pin (stub for Phase 1).
     pub fn gpio_write(&mut self, _pin: u8, _value: bool) {}
 
-    /// Read all GPIO pins as a bitmask (lower 32 bits). Debug-only:
+    /// Read all GPIO pins as a physical 48-pin bitmask. Debug-only:
     /// asserts the emulator has not been promoted into Threaded mode.
     pub fn gpio_read_all(&self) -> u64 {
         self.assert_not_placeholder();
-        self.bus.gpio_in.load(Ordering::Relaxed) as u64
+        (self.bus.gpio_in.load(Ordering::Relaxed) as u64)
+            | ((self.bus.gpio_in_hi.load(Ordering::Relaxed) as u64) << 32)
     }
 
     /// Placeholder-guard message shared by the typed accessors below.

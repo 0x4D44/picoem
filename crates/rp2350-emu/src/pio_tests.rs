@@ -155,10 +155,15 @@ fn test_gpio_merge_independent_pins() {
 // Emulator produce correct GPIO waveforms with cycle-accurate timing.
 
 const PIO0_BASE: u32 = 0x5020_0000;
+const PIO1_BASE: u32 = 0x5030_0000;
 
 /// Write a PIO0 register through the emulator bus.
 fn pio_write(emu: &mut Emulator, offset: u32, val: u32) {
     emu.bus.write32(PIO0_BASE + offset, val, 0);
+}
+
+fn pio1_write(emu: &mut Emulator, offset: u32, val: u32) {
+    emu.bus.write32(PIO1_BASE + offset, val, 0);
 }
 
 /// Create an emulator configured for PIO integration tests.
@@ -181,11 +186,93 @@ fn pio_test_emulator() -> Emulator {
     emu
 }
 
+fn release_pio(emu: &mut Emulator, block: u8) {
+    emu.bus.resets_state &= !(1u32 << (crate::bus::RESET_PIO0 + block));
+}
+
 /// Load a PIO program into instruction memory via bus writes.
 fn pio_load_program(emu: &mut Emulator, program: &[u16]) {
     for (i, &insn) in program.iter().enumerate() {
         pio_write(emu, 0x048 + (i as u32) * 4, insn as u32);
     }
+}
+
+fn pio1_load_program(emu: &mut Emulator, program: &[u16]) {
+    for (i, &insn) in program.iter().enumerate() {
+        pio1_write(emu, 0x048 + (i as u32) * 4, insn as u32);
+    }
+}
+
+#[test]
+fn pio_gpiobase_16_sees_gpio_external_in_hi() {
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .step_quantum(1)
+        .build()
+        .unwrap();
+    release_pio(&mut emu, 1);
+
+    // IN PINS, 19. GPIOBASE=16 maps physical GPIO34 to local pin 18.
+    pio1_load_program(&mut emu, &[0x4013]);
+    pio1_write(&mut emu, 0x168, 16);
+    let shiftctrl = emu.bus.pio[1].read32(0x0D0) & !(1 << 18);
+    pio1_write(&mut emu, 0x0D0, shiftctrl);
+    pio1_write(&mut emu, 0x000, 0x1);
+
+    emu.bus.set_gpio_external_in_hi(1 << 2, 1 << 2);
+    emu.run(1).unwrap();
+
+    assert_eq!(emu.bus.pio[1].sm[0].isr_value(), 1 << 18);
+    assert_eq!(emu.bus.pio[1].sm[0].isr_shift_count(), 19);
+}
+
+#[test]
+fn update_gpio_maps_pio_gpiobase_16_outputs_to_gpio_in_hi() {
+    let mut emu = Emulator::new(Config::default());
+
+    emu.bus.pio[1].write32(0x168, 16, 0);
+    emu.bus.pio[1].pad_out = (1 << 0) | (1 << 18) | (1 << 19) | (1 << 31);
+    emu.bus.pio[1].pad_oe = (1 << 0) | (1 << 18) | (1 << 31);
+    // PIO2 stays at base 0; this guards against accidentally making
+    // GPIOBASE global instead of per block.
+    emu.bus.pio[2].pad_out = 1 << 3;
+    emu.bus.pio[2].pad_oe = 1 << 3;
+
+    emu.update_gpio();
+
+    let lo = emu.bus.gpio_in.load(Ordering::Relaxed);
+    let hi = emu.bus.gpio_in_hi.load(Ordering::Relaxed);
+    assert_eq!(lo & (1 << 16), 1 << 16, "PIO1 local pin 0 maps to GPIO16");
+    assert_eq!(
+        lo & (1 << 3),
+        1 << 3,
+        "PIO2 base 0 output stays in low bank"
+    );
+    assert_eq!(hi & (1 << 2), 1 << 2, "PIO1 local pin 18 maps to GPIO34");
+    assert_eq!(hi & (1 << 15), 1 << 15, "PIO1 local pin 31 maps to GPIO47");
+    assert_eq!(
+        hi & (1 << 3),
+        0,
+        "pad_out without matching pad_oe must not drive high bank"
+    );
+}
+
+#[test]
+fn gpio_external_in_hi_preserved_in_gpio_in_hi_merge() {
+    let mut emu = Emulator::new(Config::default());
+
+    emu.bus.pio[1].write32(0x168, 16, 0);
+    emu.bus.pio[1].pad_out = 0;
+    emu.bus.pio[1].pad_oe = 1 << 18; // would drive GPIO34 low.
+    emu.bus.set_gpio_external_in_hi(1 << 2, 1 << 2);
+
+    emu.update_gpio();
+
+    assert_eq!(
+        emu.bus.gpio_in_hi.load(Ordering::Relaxed) & (1 << 2),
+        1 << 2,
+        "external high-bank stimulus must overlay PIO output in gpio_in_hi"
+    );
+    assert_eq!(emu.bus.read32(0xD000_0008, 0) & (1 << 2), 1 << 2);
 }
 
 #[test]

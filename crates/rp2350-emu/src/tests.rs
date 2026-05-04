@@ -9580,9 +9580,7 @@ fn gpio_external_in_low_and_high_independent() {
 
     // Drive the low half: GPIO 5 stim-high, mask = 1 << 5.
     emu.bus.gpio_external_mask = 1 << 5;
-    emu.bus
-        .gpio_external_in
-        .store(1 << 5, Ordering::Relaxed);
+    emu.bus.gpio_external_in.store(1 << 5, Ordering::Relaxed);
 
     // Drive the high half: GPIO 33 (bit 1 of GPIO_HI_IN) stim-high.
     emu.bus.set_gpio_external_in_hi(1 << 1, 0x0000_FFFF);
@@ -9604,7 +9602,8 @@ fn gpio_external_in_low_and_high_independent() {
     // bit, no contamination from the low half's bit-5 write.
     let hi = emu.bus.read32(0xD000_0008, 0);
     assert_eq!(
-        hi, 1 << 1,
+        hi,
+        1 << 1,
         "high-half stim must surface on GPIO_HI_IN with no low-half leakage; got {hi:#010x}"
     );
     // And the low half must not have picked up bit 1 from somewhere.
