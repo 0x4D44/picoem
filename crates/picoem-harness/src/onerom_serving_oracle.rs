@@ -794,37 +794,19 @@ pub(crate) fn stimulus_level(addr_bits: u16) -> u32 {
 
 // ---------------------------------------------------------------------------
 // Flash struct parser — shadow ground truth
+//
+// Stage 1 of the OneROM Fixture Generalization (HLD: 2026.05.04) moved the
+// SDRR struct chain helpers into `onerom_fixture`. The constants and
+// `parse_rom_set_layout` / `RomSetSlot` types are re-exported from there so
+// existing call sites (`build_seabios_fixture`, the tests below) keep
+// compiling. Stage 2 collapses these re-exports.
 // ---------------------------------------------------------------------------
 
-/// Flash base address on RP2350 (XIP start). Pointers in the embedded
-/// SDRR structs are all expressed as XIP addresses; subtract this to
-/// get a byte offset into the loaded `.bin`.
-const FLASH_BASE: u32 = 0x1000_0000;
-
-/// Offset of `sdrr_info_t` within flash (per `sdrr/link/common.ld`:
-/// `flash_isr_vector` + boot block ends at `0x200`, `sdrr_info_t`
-/// follows).
-const SDRR_INFO_OFFSET: usize = 0x0200;
-
-/// Field offset of `metadata_header` pointer within `sdrr_info_t`
-/// (see `sdrr_info_t` comments in `sdrr/include/config_base.h`).
-const SDRR_INFO_METADATA_PTR_OFFSET: usize = 44;
-
-/// Field offset of `rom_sets` pointer within `onerom_metadata_header_t`.
-const METADATA_HEADER_ROM_SETS_PTR_OFFSET: usize = 24;
-
-/// Field offset of `rom_set_count` within `onerom_metadata_header_t`.
-const METADATA_HEADER_ROM_SET_COUNT_OFFSET: usize = 20;
-
-/// Stride of `sdrr_rom_set_t` in the `rom_sets` array. The struct is
-/// padded to 64 bytes (see `pad2[40]` in `config_base.h`).
-const ROM_SET_STRIDE: usize = 64;
-
-/// Field offset of `data` pointer within `sdrr_rom_set_t`.
-const ROM_SET_DATA_PTR_OFFSET: usize = 0;
-
-/// Field offset of `size` within `sdrr_rom_set_t`.
-const ROM_SET_SIZE_OFFSET: usize = 4;
+pub use crate::onerom_fixture::{
+    FLASH_BASE, METADATA_HEADER_ROM_SETS_PTR_OFFSET, METADATA_HEADER_ROM_SET_COUNT_OFFSET,
+    ROM_SET_DATA_PTR_OFFSET, ROM_SET_SIZE_OFFSET, ROM_SET_STRIDE, RomSetSlot,
+    SDRR_INFO_METADATA_PTR_OFFSET, SDRR_INFO_OFFSET, parse_rom_set_layout,
+};
 
 /// Lift the ROM-table shadow from the loaded flash bytes.
 ///
@@ -913,80 +895,10 @@ pub fn stimulus_level_raw(pin_state: u16) -> u32 {
     pin_state as u32
 }
 
-/// Layout descriptor for one ROM set in an SDRR fixture image. Pairs
-/// the byte offset within the flash where the set's data lives with
-/// the declared size (in bytes). Returned by [`parse_rom_set_layout`]
-/// as a fixture-authoring primitive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RomSetSlot {
-    /// Byte offset within the flash image of the `sdrr_rom_set_t`
-    /// descriptor itself (the 64-byte struct entry in the `rom_sets[]`
-    /// array). Useful for fixture authors that need to patch fields of
-    /// the descriptor (e.g. the `roms[]` pointer at `+0x08`).
-    pub descriptor_offset: usize,
-    /// Byte offset within the flash image of the start of this set's
-    /// pre-processed ROM data.
-    pub data_offset: usize,
-    /// Declared `size` field of the `sdrr_rom_set_t` entry, in bytes.
-    pub size: usize,
-}
-
-/// Walk the SDRR struct chain (`sdrr_info_t` → `onerom_metadata_header_t`
-/// → `sdrr_rom_set_t[]`) and return one [`RomSetSlot`] per ROM set in
-/// the fixture, in declaration order. Inverse-of-author for
-/// [`lift_shadow_from_flash`]: callers (e.g. the SeaBIOS fixture
-/// builder) can use the returned offsets to overwrite the per-set
-/// shadow bytes in a flash image without rebuilding the whole envelope.
-///
-/// Returns `None` on any parse failure (truncated image, out-of-flash
-/// pointer, etc.) — same conservative behaviour as
-/// [`lift_shadow_from_flash`].
-pub fn parse_rom_set_layout(flash: &[u8]) -> Option<Vec<RomSetSlot>> {
-    let ptr_to_off = |ptr: u32| -> Option<usize> {
-        let off = (ptr.checked_sub(FLASH_BASE)?) as usize;
-        if off >= flash.len() { None } else { Some(off) }
-    };
-    let read_u32 = |off: usize| -> Option<u32> {
-        let bytes = flash.get(off..off + 4)?;
-        Some(u32::from_le_bytes(bytes.try_into().ok()?))
-    };
-
-    let metadata_ptr = read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
-    let metadata_off = ptr_to_off(metadata_ptr)?;
-
-    let rom_set_count = *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)? as usize;
-    if rom_set_count == 0 {
-        // A zero-count fixture is malformed; the firmware would never
-        // dereference rom_sets[0]. Report it via the function's standard
-        // "None on parse failure" channel rather than returning Some(vec![]).
-        return None;
-    }
-    let rom_sets_ptr = read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
-    let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
-
-    let mut out = Vec::with_capacity(rom_set_count);
-    for k in 0..rom_set_count {
-        let set_off = rom_sets_off + k * ROM_SET_STRIDE;
-        let data_ptr = read_u32(set_off + ROM_SET_DATA_PTR_OFFSET)?;
-        let size = read_u32(set_off + ROM_SET_SIZE_OFFSET)? as usize;
-        let data_off = ptr_to_off(data_ptr)?;
-        // Bounds check: ensure the declared size fits inside the flash
-        // image. A bad size here would otherwise let the caller copy
-        // off the end.
-        if data_off
-            .checked_add(size)
-            .is_none_or(|end| end > flash.len())
-        {
-            return None;
-        }
-        out.push(RomSetSlot {
-            descriptor_offset: set_off,
-            data_offset: data_off,
-            size,
-        });
-    }
-    Some(out)
-}
+// `RomSetSlot` and `parse_rom_set_layout` were moved to `onerom_fixture`
+// during Stage 1 of the OneROM Fixture Generalization. They are
+// re-exported at the top of this module so existing call sites keep
+// compiling.
 
 /// `pub` shim over [`lift_shadow_from_flash`] for the CPU-serve oracle
 /// and its binary driver.
