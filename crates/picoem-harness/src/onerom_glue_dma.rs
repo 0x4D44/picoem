@@ -105,6 +105,7 @@ pub struct GlueDma {
     /// completion, `ch1_write_delay` starts and gates the TX push.
     ch1_read_delay: u8,
     ch1_read_addr: u32,
+    ch1_fresh_read_addr: Option<u32>,
     ch1_value: u32,
 
     ch1_write_delay: u8,
@@ -148,6 +149,7 @@ impl GlueDma {
             ch0_pending_addr: 0,
             ch1_read_delay: 0,
             ch1_read_addr: 0,
+            ch1_fresh_read_addr: None,
             ch1_value: 0,
             ch1_write_delay: 0,
             ch1_has_pending: false,
@@ -280,6 +282,7 @@ impl GlueDma {
                     self.ch0_pending_addr,
                     0,
                 );
+                self.ch1_fresh_read_addr = Some(self.ch0_pending_addr);
             }
             return;
         }
@@ -358,9 +361,20 @@ impl GlueDma {
         if !cfg.armed || self.ch1_has_pending {
             return;
         }
+        if let Some(addr) = self.ch1_fresh_read_addr.take() {
+            if addr != 0 {
+                // CH0 wrote a new READ_ADDR event. The value may equal
+                // the previous address; it is still a new DMA transfer.
+                self.ch1_read_addr = addr;
+                self.ch1_read_delay = DMA_READ_CYCLES;
+            }
+            return;
+        }
+
         let addr = read_ch_reg(bus, 1, DMA_CH_READ_ADDR);
         if addr != 0 && addr != self.ch1_read_addr {
-            // A fresh address has landed — kick off the read pipeline.
+            // Initial/non-CH0 address arm. Duplicate values are handled
+            // above through `ch1_fresh_read_addr`.
             self.ch1_read_addr = addr;
             self.ch1_read_delay = DMA_READ_CYCLES;
         }
@@ -674,6 +688,63 @@ mod tests {
             "PIO2 SM0 TX empty after chain push; FSTAT=0x{:08X}",
             fstat
         );
+    }
+
+    /// CH0 writing the same CH1.READ_ADDR value twice is still two DMA
+    /// transfer events. The fire-32-a SeaBIOS sweep hits this immediately:
+    /// the inter-case gap and address 0 stimulus both resolve to
+    /// `0x20000000` when `/CE` + `/OE` are the real select lines.
+    #[test]
+    fn glue_dma_ch0_duplicate_read_addr_writes_start_duplicate_ch1_fetches() {
+        let mut emu = new_emu();
+        let mut dma = GlueDma::new();
+        const ADDR: u32 = 0x2000_0200;
+
+        emu.bus.write8(ADDR, 0x5A, 0);
+        emu.bus.write32(
+            0x4002_0000 | (3 << 12),
+            (1 << 15) | (1 << 16) | (1 << 17),
+            0,
+        );
+
+        dma.prime_after_sync(&mut emu.bus);
+        program_channel(
+            &mut emu.bus,
+            1,
+            0x0000_0000,
+            PIO_BASES[2] + PIO_TXF0,
+            1,
+            0x0000_0001,
+        );
+        program_channel(
+            &mut emu.bus,
+            0,
+            PIO_BASES[1] + PIO_RXF0,
+            DMA_BASE + DMA_CH_STRIDE + DMA_CH_READ_ADDR,
+            1,
+            0x0000_0001,
+        );
+        dma.tick(&mut emu.bus);
+
+        for expected_pushes in [1, 2] {
+            emu.bus.pio[1].push_rx(0, ADDR);
+            let mut ticks = 0;
+            while dma.ch1_pushes() < expected_pushes && ticks < 16 {
+                dma.tick(&mut emu.bus);
+                ticks += 1;
+            }
+            assert_eq!(
+                dma.ch1_pushes(),
+                expected_pushes,
+                "duplicate READ_ADDR event did not produce push {expected_pushes}; \
+                 ticks={ticks} ch1_read_delay={} ch1_write_delay={} \
+                 ch1_has_pending={} ch1_read_addr=0x{:08X}",
+                dma.ch1_read_delay,
+                dma.ch1_write_delay,
+                dma.ch1_has_pending,
+                dma.ch1_read_addr
+            );
+        }
     }
 
     /// The channel's configured `write_addr` must be respected — prior

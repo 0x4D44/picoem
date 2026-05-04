@@ -17,10 +17,10 @@
 //! consume have been stable since v0.6.2 (the `extended` byte gates the
 //! 256-byte struct shape).
 //!
-//! `addr_pins` reflects the chip's *native* address width (read from
-//! `sdrr_pins_t.addr[]` + `addr2[]`), not the socket's wired width. A
-//! 27C010 (17 native pins) on the same fire-32-a socket would yield
-//! `addr_pins.len() == 17` even though the socket exposes 19 lines.
+//! `addr_pins` reflects the SDRR address reader shape (read from
+//! `sdrr_pins_t.addr[]` + `addr2[]`), not necessarily the chip's native
+//! address width. A 27C010 on fire-32-a still reports the 19 socket address
+//! inputs; the firmware forces unused high pins low for that chip type.
 //!
 //! Stage 1 introduced [`FixtureSpec`] + [`FixtureSpec::from_flash`] and
 //! consolidated the SDRR metadata helpers ([`parse_rom_set_layout`],
@@ -105,6 +105,21 @@ pub const ROM_SET_DATA_PTR_OFFSET: usize = 0;
 /// Field offset of `size` within `sdrr_rom_set_t`.
 pub const ROM_SET_SIZE_OFFSET: usize = 4;
 
+/// Field offset of `roms` pointer within `sdrr_rom_set_t`.
+pub const ROM_SET_ROMS_PTR_OFFSET: usize = 8;
+
+/// Field offset of `rom_type` within `sdrr_rom_info_t`.
+pub const ROM_INFO_ROM_TYPE_OFFSET: usize = 0;
+
+/// 128 KiB 32-pin EPROM. Matches OneROM's `CHIP_TYPE_27C010`.
+pub const CHIP_TYPE_27C010: u8 = 15;
+
+/// 256 KiB 32-pin EPROM. Matches OneROM's `CHIP_TYPE_27C020`.
+pub const CHIP_TYPE_27C020: u8 = 16;
+
+/// 512 KiB 32-pin EPROM. Matches OneROM's `CHIP_TYPE_27C040`.
+pub const CHIP_TYPE_27C040: u8 = 17;
+
 // ---------------------------------------------------------------------------
 // `sdrr_pins_t` field offsets within the struct (relative to its base in
 // flash). The struct is 256 bytes from v0.6.2 onward; layout pinned in
@@ -146,6 +161,13 @@ pub struct FixtureSpec {
     /// CS2-aliased-A16 reads).
     pub chip_pins: u8,
 
+    /// OneROM chip type of the first ROM in set 0.
+    ///
+    /// The 32-pin Fire fixtures need this because the same socket metadata
+    /// carries a generic `cs2` pin even when the selected 27C-series EPROM
+    /// actually gates reads with `/CE` and `/OE`.
+    pub rom_type: u8,
+
     /// GPIO pin per address line, low-to-high (A0 first). The vector
     /// length is the address width in bits — 13 for fire-24-a/27C256,
     /// 19 for fire-32-a/27C020. Built from `addr[16]` followed by
@@ -168,8 +190,8 @@ pub struct FixtureSpec {
     /// `sdrr-gen` unconditionally writes `board.pin_cs1(Chip27C080)`
     /// for 32-pin boards. **Don't drive `cs1` LOW during reads on
     /// 32-pin fixtures unless you've verified the chip type uses it.**
-    /// On fire-32-a/27C020 the actual gate is CS2 (aliased to A16);
-    /// see [`Self::unservable_when_high`].
+    /// On fire-32-a/27C010/27C020/27C040 this is not a read gate; the
+    /// actual gates are `/CE` and `/OE`.
     pub cs1: u8,
 
     /// Pins that must be driven LOW during reads to enable serving.
@@ -194,11 +216,9 @@ pub struct FixtureSpec {
     /// then `pin_pattern` ORs in, so the bit stays HIGH whether or not
     /// the address pattern would have set it.
     ///
-    /// fire-32-a in our 27C020 fixture: empty. fire-32-a has no CS3
-    /// pin, and its CS2 (P0:16) is the active-low gate aliased to A16
-    /// — captured by [`Self::unservable_when_high`] rather than driven
-    /// to a fixed deasserted level (HLD §4.1, §5.1). The gate CS is
-    /// excluded from this list to avoid double-counting.
+    /// fire-32-a 27C010/27C020/27C040 fixtures: empty. Their generated
+    /// `cs1`/`cs2` slots are socket-generic metadata; the firmware's
+    /// 27-series path uses `/CE` and `/OE`.
     pub deasserted_high_during_read: Vec<u8>,
 
     /// Pin pattern bits that, when high, make the chip un-servable
@@ -212,12 +232,11 @@ pub struct FixtureSpec {
     /// CS1=high tristates D0..D7 (the existing fire-24-a SeaBIOS
     /// path's `CS1_BIT` filter becomes this).
     ///
-    /// fire-32-a/27C020: `1 << 16` — CS2 is at GPIO16, which IS A16
-    /// in the address bus. Setting A16 high also raises CS2, which
-    /// deselects the chip (HLD §5.1). 2^18 of 2^19 patterns are
-    /// skipped.
+    /// fire-32-a/27C010/27C020/27C040: `0` — there is no address-aliased
+    /// chip-select to skip. GPIO16 is A16; `/CE` and `/OE` are separate
+    /// active-low gates.
     ///
-    /// Discriminated by `chip_pins`: 24 → CS1-gate, 32 → CS2-gate.
+    /// Discriminated by `chip_pins` plus [`Self::rom_type`].
     /// Other values are rejected at parse time (no other footprints
     /// are known today).
     pub unservable_when_high: u64,
@@ -356,6 +375,7 @@ impl FixtureSpec {
         if shadow_size == 0 {
             return Err(FixtureError::InvalidShadowSize { size: shadow_size });
         }
+        let rom_type = parse_first_rom_type(flash).ok_or(FixtureError::MissingRomSet)?;
 
         // 2. Locate sdrr_pins_t via the pointer at sdrr_info_t + 48.
         //    HLD §4.2 says "0x80FC for both fixtures" — this is wrong;
@@ -466,20 +486,20 @@ impl FixtureSpec {
             }
         }
 
-        // 8. chip_pins (offset +5) — the discriminator that picks the
-        //    unservable_when_high gate (CS1 vs CS2-aliased-A16) and the
-        //    label format. Read it before composing the CS-derived
-        //    fields below.
+        // 8. chip_pins (offset +5) — one discriminator for pin semantics
+        //    and the label format. 32-pin fixtures also need `rom_type`:
+        //    27C010/020/040 use /CE and /OE, while other 32-pin families may
+        //    interpret the generic CS slots differently.
         let chip_pins = pins[5];
 
-        // 9. Compute unservable_when_high (HLD §5.1) — discriminated by
-        //    `chip_pins`:
+        // 9. Compute unservable_when_high — discriminated by `chip_pins`
+        //    and `rom_type`:
         //
         //    - 24-pin (fire-24-a 27C-family): CS1 is the active-low
         //      gate; CS1=high tristates D0..D7. Mask = `1 << cs1`.
-        //    - 32-pin (fire-32-a 27C020): CS2 is the active-low gate
-        //      AND aliases A16 in the address bus. Setting A16 high
-        //      raises CS2 which deselects the chip. Mask = `1 << cs2`.
+        //    - 32-pin 27C010/020/040: the firmware's 27-series path uses
+        //      /CE and /OE as active-low gates; CS2/GPIO16 is A16, not a
+        //      deselect condition. Mask = 0.
         //
         //    Other footprints aren't modelled; reject explicitly so a
         //    new chip type fails loudly here rather than silently
@@ -491,15 +511,15 @@ impl FixtureSpec {
                 1u64 << cs1
             }
             32 => {
-                // Fire-32-a 27C020 on 32-pin socket: CS2 is the
-                // active-low gate and aliases A16 in the address bus
-                // (HLD §5.1).
-                if cs2 == INVALID_PIN || !addr_pins.contains(&cs2) {
+                if !matches!(
+                    rom_type,
+                    CHIP_TYPE_27C010 | CHIP_TYPE_27C020 | CHIP_TYPE_27C040
+                ) {
                     return Err(FixtureError::UnknownLayout {
-                        reason: "32-pin fixture: CS2 must be present and alias an address pin (27C020 layout)",
+                        reason: "unsupported 32-pin ROM type for fixture parser",
                     });
                 }
-                1u64 << cs2
+                0
             }
             _ => {
                 return Err(FixtureError::UnknownLayout {
@@ -522,24 +542,23 @@ impl FixtureSpec {
             asserted_low_during_read.push(oe);
         }
 
-        // 11. Compose deasserted_high_during_read = cs2/cs3 IFF they are
-        //     valid pins AND not the gate captured by
-        //     `unservable_when_high`. Per HLD §4.4 the stim composition
-        //     is order-tolerant (deasserted-high writes HIGH, then
-        //     pin_pattern ORs in — the bit stays HIGH either way), so
-        //     we DON'T filter out address-pin aliases. We only filter
-        //     out the gate CS so its semantics aren't double-counted.
+        // 11. Compose deasserted_high_during_read. 24-pin fixtures use
+        //     extra CS pins as active-low deselects. 32-pin 27C010/020/040
+        //     fixtures do not: cs2 is the socket's A16 slot and must be
+        //     left to the address pattern.
         let mut deasserted_high_during_read: Vec<u8> = Vec::with_capacity(2);
-        for &cs in &[cs2, cs3] {
-            if cs == INVALID_PIN {
-                continue;
+        if chip_pins == 24 {
+            for &cs in &[cs2, cs3] {
+                if cs == INVALID_PIN {
+                    continue;
+                }
+                // Don't include the gate CS — its semantics are captured
+                // by unservable_when_high.
+                if (1u64 << cs) & unservable_when_high != 0 {
+                    continue;
+                }
+                deasserted_high_during_read.push(cs);
             }
-            // Don't include the gate CS — its semantics are captured
-            // by unservable_when_high.
-            if (1u64 << cs) & unservable_when_high != 0 {
-                continue;
-            }
-            deasserted_high_during_read.push(cs);
         }
 
         // 12. Format the human-readable label as "{N}pin/{0xSIZE}-shadow".
@@ -552,6 +571,7 @@ impl FixtureSpec {
         Ok(FixtureSpec {
             label,
             chip_pins,
+            rom_type,
             addr_pins,
             data_pins,
             cs1,
@@ -726,6 +746,37 @@ pub fn parse_rom_set_layout(flash: &[u8]) -> Option<Vec<RomSetSlot>> {
     Some(out)
 }
 
+/// Return the OneROM chip type for ROM set 0, ROM 0.
+///
+/// This follows `sdrr_rom_set_t.roms -> sdrr_rom_info_t*[] -> sdrr_rom_info_t`
+/// and reads the first byte (`rom_type`). The parser currently only needs the
+/// first ROM because every fixture modelled here is a single-ROM set.
+fn parse_first_rom_type(flash: &[u8]) -> Option<u8> {
+    let ptr_to_off = |ptr: u32| -> Option<usize> {
+        let off = (ptr.checked_sub(FLASH_BASE)?) as usize;
+        if off >= flash.len() { None } else { Some(off) }
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        let bytes = flash.get(off..off + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+
+    let metadata_ptr = read_u32(SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET)?;
+    let metadata_off = ptr_to_off(metadata_ptr)?;
+    let rom_set_count = *flash.get(metadata_off + METADATA_HEADER_ROM_SET_COUNT_OFFSET)?;
+    if rom_set_count == 0 {
+        return None;
+    }
+
+    let rom_sets_ptr = read_u32(metadata_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET)?;
+    let rom_sets_off = ptr_to_off(rom_sets_ptr)?;
+    let roms_ptr = read_u32(rom_sets_off + ROM_SET_ROMS_PTR_OFFSET)?;
+    let roms_off = ptr_to_off(roms_ptr)?;
+    let rom_info_ptr = read_u32(roms_off)?;
+    let rom_info_off = ptr_to_off(rom_info_ptr)?;
+    flash.get(rom_info_off + ROM_INFO_ROM_TYPE_OFFSET).copied()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -754,6 +805,7 @@ mod tests {
 
         // chip_pins: 24-pin socket.
         assert_eq!(spec.chip_pins, 24);
+        assert_eq!(spec.rom_type, 2);
 
         // Address pin map: 13 entries, walking-1s order from the
         // canonical fire-24-a JSON. HLD §4.1 example values.
@@ -809,6 +861,7 @@ mod tests {
 
         // chip_pins: 32-pin socket.
         assert_eq!(spec.chip_pins, 32);
+        assert_eq!(spec.rom_type, CHIP_TYPE_27C020);
 
         // Address pin map: 19 entries (16 from addr[16] plus 3 from
         // addr2[16]). HLD §4.1 example length.
@@ -823,13 +876,11 @@ mod tests {
         // verbatim per the FixtureSpec doc-comment caveat.
         assert_eq!(spec.cs1, 13);
 
-        // Unservable mask: CS2 at GPIO16 aliases A16 in the address bus
-        // (HLD §5.1). The chip_pins=32 discriminator captures CS2
-        // exclusively — no CS1 contribution.
+        // Unservable mask: none. For 27C020, GPIO16 is A16; the firmware
+        // gates reads with the separate /CE and /OE pins.
         assert_eq!(
-            spec.unservable_when_high,
-            1u64 << 16,
-            "fire-32-a: CS2 (GPIO16, aliased to A16) is the gate — unservable_when_high = 1<<16"
+            spec.unservable_when_high, 0,
+            "fire-32-a 27C020: /CE and /OE are the gates; A16 remains addressable"
         );
 
         // ce=15, oe=14 — separate /CE and /OE pins for 27C020, both
@@ -841,12 +892,12 @@ mod tests {
             "fire-32-a: real CE (GPIO15) and OE (GPIO14) pins"
         );
 
-        // No CS3 (cs3 = 0xFF in this fixture); CS2 IS the gate captured
-        // by `unservable_when_high`, so it's excluded from this list to
-        // avoid double-counting. Result: empty.
+        // No 32-pin generic CS slots are driven high during reads; CS2 is
+        // GPIO16/A16 for this chip type and must be controlled by the
+        // address pattern.
         assert!(
             spec.deasserted_high_during_read.is_empty(),
-            "fire-32-a: CS2 is the gate (in unservable_when_high); deasserted set must be empty: {:?}",
+            "fire-32-a: generic CS slots are not read-time deselects for 27C020: {:?}",
             spec.deasserted_high_during_read
         );
 
@@ -880,6 +931,8 @@ mod tests {
         //   0x0200  sdrr_info_t        (64 bytes)
         //   0x1000  sdrr_pins_t        (256 bytes)
         //   0xC000  metadata_header    (256 bytes; rom_set_count=1, rom_sets_ptr=0xC100)
+        //   0xC0F0  roms[0] pointer    (points to 0xC0F8)
+        //   0xC0F8  sdrr_rom_info_t    (rom_type=27512)
         //   0xC100  rom_sets[0]        (64 bytes; data_ptr=0x1_0000, size=0x1_0000)
         //   0x1_0000 ROM data          (0x1_0000 bytes)
         let mut flash = vec![0u8; 0x2_0000];
@@ -931,6 +984,12 @@ mod tests {
             ..md_off + METADATA_HEADER_ROM_SETS_PTR_OFFSET + 4]
             .copy_from_slice(&rom_sets_ptr.to_le_bytes());
 
+        // roms[0] pointer array and one sdrr_rom_info_t.
+        let roms_array_off = 0xC0F0;
+        let rom_info_ptr = 0x1000_C0F8u32;
+        flash[roms_array_off..roms_array_off + 4].copy_from_slice(&rom_info_ptr.to_le_bytes());
+        flash[0xC0F8 + ROM_INFO_ROM_TYPE_OFFSET] = 13; // CHIP_TYPE_27512
+
         // rom_sets[0] at +0xC100
         let set_off = 0xC100;
         let data_ptr = 0x1001_0000u32; // → flash off 0x1_0000
@@ -939,6 +998,9 @@ mod tests {
         let set_size = 0x1_0000u32;
         flash[set_off + ROM_SET_SIZE_OFFSET..set_off + ROM_SET_SIZE_OFFSET + 4]
             .copy_from_slice(&set_size.to_le_bytes());
+        let roms_ptr = 0x1000_C0F0u32;
+        flash[set_off + ROM_SET_ROMS_PTR_OFFSET..set_off + ROM_SET_ROMS_PTR_OFFSET + 4]
+            .copy_from_slice(&roms_ptr.to_le_bytes());
 
         flash
     }
@@ -950,6 +1012,7 @@ mod tests {
         let flash = synth_fixture_flash();
         let spec = FixtureSpec::from_flash(&flash).expect("synth fixture must parse cleanly");
         assert_eq!(spec.chip_pins, 24);
+        assert_eq!(spec.rom_type, 13);
         assert_eq!(spec.cs1, 5);
         assert_eq!(spec.addr_pins, vec![9]);
         assert_eq!(spec.data_pins, [10, 11, 12, 13, 14, 15, 16, 17]);
@@ -1077,6 +1140,7 @@ mod tests {
         FixtureSpec {
             label: "synth/0x10000",
             chip_pins: 24,
+            rom_type: 13,
             addr_pins: vec![],
             data_pins: [0; 8],
             cs1: 0,

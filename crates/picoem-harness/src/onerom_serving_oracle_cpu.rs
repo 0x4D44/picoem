@@ -425,11 +425,10 @@ impl CpuServingOracle {
         for &p in &self.spec.asserted_low_during_read {
             level |= 1u64 << p;
         }
-        // Drive any address-aliased gate HIGH so the chip is deselected
-        // between cases. Symmetric with `ServingOracle::compose_gap_level`
-        // (and `compose_seed_level`); for fire-24-a this is a no-op
-        // (bit 13 = cs1 = unservable_when_high, already set above), for
-        // fire-32-a this sets bit 16 (CS2 = A16) — HLD §5.1.
+        // Drive any fixture-specific unservable gate HIGH between cases.
+        // For fire-24-a this is redundant with CS1 above; 27C-series
+        // fire-32-a fixtures keep this mask at zero because GPIO16 is A16
+        // and `/CE` + `/OE` provide the read gates.
         level |= self.spec.unservable_when_high;
         level
     }

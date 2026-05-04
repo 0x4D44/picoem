@@ -1,5 +1,5 @@
 //! Validates that the OneROM PIO-served bytes match the SeaBIOS image for
-//! every servable address in the 19-bit fire-32-a/27C020 sweep.
+//! every address in the 19-bit fire-32-a 27C-series sweep.
 //!
 //! This is the fire-32-a sibling of `seabios_fixture_byte_correct`: where
 //! that binary drives `CpuServingOracle` against the 24-pin SeaBIOS CPU-
@@ -11,22 +11,12 @@
 //!
 //! ## Sweep shape
 //!
-//! Per HLD §5.1, fire-32-a's CS2 is wired to GPIO16 — which is also A16
-//! in the address bus. CS2 active-low: any pin pattern with bit 16 set
-//! drives CS2 HIGH and the firmware tristates D0..D7 (= "unservable").
-//! That filters 2^18 of the 2^19 patterns out of the byte-correctness
-//! check. The full run therefore proves 262,144 servable pin-pattern
-//! checks, but only 131,072 unique SeaBIOS source offsets: offsets with
-//! source address bit 16 set are unservable on this fixture.
-//!
-//! Per HLD §5.3, A18 is wired in the 32-pin socket (the same socket
-//! takes 27C040), but the SDRR-baked permutation table is built so the
-//! served byte is independent of A18 — every SeaBIOS byte appears at
-//! both A18=0 and A18=1 patterns. The expected byte is therefore
-//! `seabios[(decoded_addr) % seabios.len()]`, which collapses A18. Because
-//! A16-high patterns are skipped, the redundant cross-check applies only
-//! to the A16-low source half (`0x00000..0x0FFFF` and
-//! `0x20000..0x2FFFF`).
+//! Fire-32-a's socket metadata names GPIO16 as `cs2`, but for
+//! 27C010/27C020/27C040 the OneROM runtime gates reads with the separate
+//! active-low `/CE` and `/OE` lines. GPIO16 remains A16. The full run
+//! therefore exercises all 2^19 socket address patterns; unused high
+//! socket bits collapse through the SDRR-baked permutation table, so the
+//! expected byte is `seabios[(decoded_addr) % seabios.len()]`.
 //!
 //! Per HLD §7.5, byte-correct + LatencyOOE counts as PASS — the
 //! envelope is empirical and per-fixture; an out-of-window served byte
@@ -54,12 +44,10 @@
 //!
 //! # Status (2026-05-04)
 //!
-//! Stage 4C servable-sweep acceptance passed: smoke ran 4096 servable
-//! cases and the full sweep ran 262,144 servable pin-pattern cases with
-//! zero wrong, no-resolve, no-stable-byte, or out-of-range cases. This is
-//! not a proof of full 256 KiB SeaBIOS source coverage; the full sweep
-//! covers 131,072 unique source offsets because A16-high offsets are
-//! intentionally deselected by the fixture.
+//! Stage 4C originally treated 32-pin `cs2` as an A16-aliased deselect.
+//! That was too pessimistic for 27C-series EPROMs. The current parser uses
+//! the embedded ROM type and treats 27C010/27C020/27C040 as `/CE`/`/OE`
+//! gated fixtures with full source-image coverage.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -81,9 +69,8 @@ const DEFAULT_SEABIOS: &str = concat!(
     "/fixtures/sources/seabios-256k.bin"
 );
 
-/// Required size of `seabios-256k.bin` — the HLD pins this at 256 KiB
-/// (HLD §5.2; same image used by the fire-24-a SeaBIOS path).
-const SEABIOS_SIZE: usize = 0x4_0000;
+const RUNTIME_INFO_BASE: u32 = 0x2008_0000;
+const RUNTIME_PIOROM_CONFIG_OFFSET: u32 = 60;
 
 /// Servable-case cap when `--smoke` is set (HLD §7.4).
 const SMOKE_SERVABLE_CAP: u64 = 4096;
@@ -211,6 +198,83 @@ fn expected_seabios_offset(addr_idx: u64, seabios_len: usize) -> usize {
     (addr_idx as usize) % seabios_len
 }
 
+fn validate_seabios_len(len: usize) -> Result<(), String> {
+    match len {
+        0x1_0000 | 0x2_0000 | 0x4_0000 => Ok(()),
+        _ => Err(format!(
+            "seabios image must be 64 KiB, 128 KiB, or 256 KiB; got {len} bytes"
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct RuntimePioromConfig {
+    invert_cs: [u8; 4],
+    num_cs_pins: u8,
+    cs_base_pin: u8,
+    data_base_pin: u8,
+    num_data_pins: u8,
+    addr_base_pin: u8,
+    num_addr_pins: u8,
+    addr_read_irq: u8,
+    rom_table_addr: u32,
+    contiguous_cs_pins: u8,
+    multi_rom_mode: u8,
+    cs_pin_2nd_match: u32,
+}
+
+fn runtime_piorom_config(emu: &mut Emulator) -> Option<RuntimePioromConfig> {
+    let magic = [
+        emu.bus.read8(RUNTIME_INFO_BASE, 0),
+        emu.bus.read8(RUNTIME_INFO_BASE + 1, 0),
+        emu.bus.read8(RUNTIME_INFO_BASE + 2, 0),
+        emu.bus.read8(RUNTIME_INFO_BASE + 3, 0),
+    ];
+    if magic != *b"sdrr" {
+        return None;
+    }
+    let base = RUNTIME_INFO_BASE.checked_add(RUNTIME_PIOROM_CONFIG_OFFSET)?;
+
+    let read8 = |emu: &mut Emulator, off: u32| emu.bus.read8(base + off, 0);
+    let read32 = |emu: &mut Emulator, off: u32| emu.bus.read32(base + off, 0);
+
+    Some(RuntimePioromConfig {
+        invert_cs: [read8(emu, 0), read8(emu, 1), read8(emu, 2), read8(emu, 3)],
+        num_cs_pins: read8(emu, 4),
+        cs_base_pin: read8(emu, 5),
+        data_base_pin: read8(emu, 6),
+        num_data_pins: read8(emu, 7),
+        addr_base_pin: read8(emu, 8),
+        num_addr_pins: read8(emu, 9),
+        addr_read_irq: read8(emu, 10),
+        rom_table_addr: read32(emu, 20),
+        contiguous_cs_pins: read8(emu, 40),
+        multi_rom_mode: read8(emu, 41),
+        cs_pin_2nd_match: read32(emu, 44),
+    })
+}
+
+fn pio_in_base(pinctrl: u32) -> u8 {
+    ((pinctrl >> 15) & 0x1f) as u8
+}
+
+fn pio_out_base(pinctrl: u32) -> u8 {
+    (pinctrl & 0x1f) as u8
+}
+
+fn unique_servable_offset_count(spec: &FixtureSpec, seabios_len: usize) -> usize {
+    let sweep_size: u64 = 1u64 << spec.addr_pins.len();
+    let mut offsets = std::collections::HashSet::new();
+    for addr_idx in 0..sweep_size {
+        let case = make_case(addr_idx as u32, spec);
+        if (case.pin_pattern & spec.unservable_when_high) != 0 {
+            continue;
+        }
+        offsets.insert(expected_seabios_offset(addr_idx, seabios_len));
+    }
+    offsets.len()
+}
+
 /// Decide whether a `CaseResult` counts as PASS for byte-correctness
 /// purposes.
 ///
@@ -321,12 +385,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if seabios.len() != SEABIOS_SIZE {
-        eprintln!(
-            "seabios image must be {} bytes (256 KiB); got {}",
-            SEABIOS_SIZE,
-            seabios.len()
-        );
+    if let Err(e) = validate_seabios_len(seabios.len()) {
+        eprintln!("{e}");
         return ExitCode::from(3);
     }
 
@@ -338,10 +398,11 @@ fn main() -> ExitCode {
         }
     };
     println!("fixture: {} ({}-pin)", spec.label, spec.chip_pins);
+    println!("  rom_type:                  {}", spec.rom_type);
     println!("  addr_pins:                 {:?}", spec.addr_pins);
     println!("  data_pins:                 {:?}", spec.data_pins);
     println!(
-        "  cs1:                       GPIO{}  (placeholder on 32-pin)",
+        "  cs1:                       GPIO{}  (socket-generic slot on 32-pin)",
         spec.cs1
     );
     println!(
@@ -372,7 +433,7 @@ fn main() -> ExitCode {
     }
     if spec.shadow_size != 524_288 {
         eprintln!(
-            "ERROR: fire-32-a/27C020 expects 512 KiB shadow; got {}",
+            "ERROR: fire-32-a expects 512 KiB SDRR shadow; got {}",
             spec.shadow_size
         );
         return ExitCode::from(3);
@@ -393,6 +454,59 @@ fn main() -> ExitCode {
         "synced at cycle {} ({} ms)",
         emu.cycles(),
         t_boot.elapsed().as_millis()
+    );
+    if let Some(cfg) = runtime_piorom_config(&mut emu) {
+        println!(
+            "runtime piorom_config: cs_base={} num_cs={} invert={:?} data_base={} num_data={} \
+             addr_base={} num_addr={} addr_irq={} contiguous_cs={} multi_rom={} cs_second=0x{:08x} \
+             rom_table=0x{:08x}",
+            cfg.cs_base_pin,
+            cfg.num_cs_pins,
+            cfg.invert_cs,
+            cfg.data_base_pin,
+            cfg.num_data_pins,
+            cfg.addr_base_pin,
+            cfg.num_addr_pins,
+            cfg.addr_read_irq,
+            cfg.contiguous_cs_pins,
+            cfg.multi_rom_mode,
+            cfg.cs_pin_2nd_match,
+            cfg.rom_table_addr
+        );
+    }
+    let cycle = emu.cycles();
+    let sync_report = onerom_sync::capture_snapshot(&mut emu.bus, cycle);
+    let pio1_fstat = emu.bus.read32(onerom_sync::PIO_BASES[1] + 0x004, 0);
+    let pio2_fstat = emu.bus.read32(onerom_sync::PIO_BASES[2] + 0x004, 0);
+    println!(
+        "PIO1 CTRL=0x{:08x} SM0 CLKDIV=0x{:08x} EXECCTRL=0x{:08x} SHIFTCTRL=0x{:08x} \
+         PINCTRL=0x{:08x} in_base={} out_base={} gpio_base={} ADDR={} LAST=0x{:04x} FSTAT=0x{:08x}",
+        sync_report.pio1.ctrl,
+        sync_report.pio1.sms[0].clkdiv,
+        sync_report.pio1.sms[0].execctrl,
+        sync_report.pio1.sms[0].shiftctrl,
+        sync_report.pio1.sms[0].pinctrl,
+        pio_in_base(sync_report.pio1.sms[0].pinctrl),
+        pio_out_base(sync_report.pio1.sms[0].pinctrl),
+        emu.bus.pio[1].gpio_base(),
+        sync_report.pio1.sms[0].addr,
+        sync_report.pio1.sms[0].last_insn,
+        pio1_fstat
+    );
+    println!(
+        "PIO2 CTRL=0x{:08x} SM0 CLKDIV=0x{:08x} EXECCTRL=0x{:08x} SHIFTCTRL=0x{:08x} \
+         PINCTRL=0x{:08x} in_base={} out_base={} gpio_base={} ADDR={} LAST=0x{:04x} FSTAT=0x{:08x}",
+        sync_report.pio2.ctrl,
+        sync_report.pio2.sms[0].clkdiv,
+        sync_report.pio2.sms[0].execctrl,
+        sync_report.pio2.sms[0].shiftctrl,
+        sync_report.pio2.sms[0].pinctrl,
+        pio_in_base(sync_report.pio2.sms[0].pinctrl),
+        pio_out_base(sync_report.pio2.sms[0].pinctrl),
+        emu.bus.pio[2].gpio_base(),
+        sync_report.pio2.sms[0].addr,
+        sync_report.pio2.sms[0].last_insn,
+        pio2_fstat
     );
 
     let mut glue = onerom_glue_dma::GlueDma::new();
@@ -426,6 +540,7 @@ fn main() -> ExitCode {
     }
     let sweep_size: u64 = 1u64 << n_addr;
     let smoke_cap: Option<u64> = cli.smoke.then_some(SMOKE_SERVABLE_CAP);
+    let unique_servable_offsets = unique_servable_offset_count(&spec, seabios.len());
 
     println!(
         "sweep: {} addresses (stride={}, smoke_cap={:?})",
@@ -433,7 +548,9 @@ fn main() -> ExitCode {
     );
     println!(
         "acceptance scope: servable pin-pattern byte checks; full stride=1 covers \
-         131072 unique SeaBIOS offsets (A16-low half), not the full 256 KiB image"
+         {} unique SeaBIOS offsets out of {} bytes",
+        unique_servable_offsets,
+        seabios.len()
     );
     let _ = std::io::stdout().flush();
 
@@ -447,8 +564,9 @@ fn main() -> ExitCode {
     while addr_idx < sweep_size {
         let case = make_case(addr_idx as u32, &spec);
 
-        // Skip unservable (CS2-aliased-A16-high) patterns up front —
-        // saves a per-case run_case (which is ~PER_CASE_TIMEOUT cycles).
+        // Skip patterns only when the fixture parser identifies a genuine
+        // address-aliased deselect gate. 27C010/020/040 fire-32-a fixtures
+        // have none (`unservable_when_high == 0`).
         if (case.pin_pattern & spec.unservable_when_high) != 0 {
             unservable_skipped += 1;
             addr_idx += cli.stride;
@@ -460,10 +578,9 @@ fn main() -> ExitCode {
         }
         servable_processed += 1;
 
-        // Expected byte: SeaBIOS at addr_idx mod 256 KiB. A18=0 and A18=1
-        // patterns map to the same byte, but A16-high offsets are skipped
-        // as unservable by the CS2/A16 alias. This is a servable pin-pattern
-        // check, not full 256 KiB source-offset coverage.
+        // Expected byte: SeaBIOS at addr_idx modulo the source image. Higher
+        // socket-only address bits are SDRR-table duplicates for smaller EPROM
+        // content.
         let expected = seabios[expected_seabios_offset(addr_idx, seabios.len())];
 
         let result = oracle.run_case(&mut emu, &mut glue, case);
@@ -566,12 +683,11 @@ fn main() -> ExitCode {
     }
 
     let full_stride_one_accounting_error = if !cli.smoke && cli.stride == 1 && !bailed_early {
-        let expected_count = sweep_size / 2;
-        if servable_processed != expected_count || unservable_skipped != expected_count {
+        if servable_processed + unservable_skipped != sweep_size {
             eprintln!(
-                "INTERNAL: full sweep accounting expected servable_processed={} \
-                 and unservable_skipped={}, got servable_processed={} unservable_skipped={}",
-                expected_count, expected_count, servable_processed, unservable_skipped
+                "INTERNAL: full sweep accounting expected servable_processed + \
+                 unservable_skipped = {}, got servable_processed={} unservable_skipped={}",
+                sweep_size, servable_processed, unservable_skipped
             );
             true
         } else {
@@ -611,30 +727,35 @@ mod tests {
         assert!(should_process_next_servable_case(2, None));
     }
 
-    /// The fire-32-a sweep produces exactly 2^18 = 262 144 servable
-    /// cases (`A16 == 0`) and 2^18 = 262 144 unservable cases
-    /// (`A16 == 1`, where CS2 aliases A16 and the chip is deselected).
-    /// Documents the HLD §5.1 bookkeeping and protects against an
-    /// off-by-one in `make_case` / the unservable filter.
     #[test]
-    fn fire32a_sweep_servable_unservable_split() {
+    fn seabios_len_accepts_eprom_sized_images_only() {
+        assert!(validate_seabios_len(0x1_0000).is_ok());
+        assert!(validate_seabios_len(0x2_0000).is_ok());
+        assert!(validate_seabios_len(0x4_0000).is_ok());
+        assert!(validate_seabios_len(0).is_err());
+        assert!(validate_seabios_len(0x3_0000).is_err());
+    }
+
+    /// The fire-32-a 27C020 sweep keeps GPIO16 as A16 and uses /CE + /OE
+    /// as the active-low read gates, so all 2^19 socket address patterns
+    /// are servable.
+    #[test]
+    fn fire32a_27c020_sweep_has_no_a16_unservable_split() {
         let flash = std::fs::read(DEFAULT_FIXTURE)
             .expect("fire-32-a fixture must be present at the bundled path");
         let spec = FixtureSpec::from_flash(&flash).expect("fire-32-a parse");
         assert_eq!(spec.chip_pins, 32);
+        assert_eq!(
+            spec.rom_type,
+            picoem_harness::onerom_fixture::CHIP_TYPE_27C020
+        );
         assert_eq!(spec.addr_pins.len(), 19);
-        assert_eq!(spec.unservable_when_high, 1u64 << 16);
-        // Anchor the bit-16-is-A16 invariant the sweep math depends on:
-        // `make_case` builds `pin_pattern` by permuting addr bit `i` onto
-        // `spec.addr_pins[i]`, so for the unservable filter
-        // (`pin_pattern & (1<<16) != 0` ⟺ A16 set) to hold,
-        // `addr_pins[16]` must itself be GPIO16. If a future fixture
-        // reorders the address-pin map this assert flags it before the
-        // arithmetic below silently misclassifies cases.
+        assert_eq!(spec.unservable_when_high, 0);
+        assert_eq!(spec.asserted_low_during_read, vec![15, 14]);
+        assert!(spec.deasserted_high_during_read.is_empty());
         assert_eq!(
             spec.addr_pins[16], 16,
-            "fire-32-a A16 must map to GPIO16 — the unservable filter \
-             depends on `(pin_pattern & (1<<16)) != 0` reflecting A16=1"
+            "fire-32-a A16 must map to GPIO16 and remain addressable"
         );
 
         let sweep_size: u64 = 1u64 << 19;
@@ -648,18 +769,19 @@ mod tests {
                 servable += 1;
             }
         }
-        assert_eq!(servable, 1u64 << 18, "servable count must be 2^18");
-        assert_eq!(unservable, 1u64 << 18, "unservable count must be 2^18");
+        assert_eq!(servable, sweep_size, "all 2^19 patterns must be servable");
+        assert_eq!(unservable, 0, "27C020 must not deselect on A16 high");
         assert_eq!(servable + unservable, sweep_size);
     }
 
     #[test]
-    fn fire32a_full_sweep_expected_offsets_are_a16_low_half_only() {
+    fn fire32a_full_sweep_expected_offsets_cover_whole_256k_source() {
         let flash = std::fs::read(DEFAULT_FIXTURE)
             .expect("fire-32-a fixture must be present at the bundled path");
         let spec = FixtureSpec::from_flash(&flash).expect("fire-32-a parse");
         assert_eq!(spec.addr_pins[16], 16);
 
+        let seabios_size = 0x4_0000;
         let sweep_size: u64 = 1u64 << spec.addr_pins.len();
         let mut offsets = std::collections::HashSet::new();
         for addr_idx in 0..sweep_size {
@@ -667,27 +789,27 @@ mod tests {
             if (case.pin_pattern & spec.unservable_when_high) != 0 {
                 continue;
             }
-            offsets.insert(expected_seabios_offset(addr_idx, SEABIOS_SIZE));
+            offsets.insert(expected_seabios_offset(addr_idx, seabios_size));
         }
 
         assert_eq!(
             offsets.len(),
-            0x2_0000,
-            "full fire-32-a sweep covers 131072 unique SeaBIOS offsets"
+            0x4_0000,
+            "full fire-32-a sweep covers all 262144 SeaBIOS offsets"
         );
-        assert_eq!(
-            SEABIOS_SIZE - offsets.len(),
-            0x2_0000,
-            "the other 131072 SeaBIOS offsets are unexercised"
-        );
-
-        let a16_mask = 1usize << 16;
-        for offset in 0..SEABIOS_SIZE {
-            assert_eq!(
+        for offset in 0..seabios_size {
+            assert!(
                 offsets.contains(&offset),
-                offset & a16_mask == 0,
-                "unexpected coverage for SeaBIOS offset 0x{offset:05x}"
+                "missing SeaBIOS offset 0x{offset:05x}"
             );
         }
+    }
+
+    #[test]
+    fn fire32a_128k_source_covers_whole_128k_source() {
+        let flash = std::fs::read(DEFAULT_FIXTURE)
+            .expect("fire-32-a fixture must be present at the bundled path");
+        let spec = FixtureSpec::from_flash(&flash).expect("fire-32-a parse");
+        assert_eq!(unique_servable_offset_count(&spec, 0x2_0000), 0x2_0000);
     }
 }

@@ -617,6 +617,26 @@ impl ServingOracle {
             expected_resolved_addr,
             &trace,
         );
+        if std::env::var_os("PICOEM_ONEROM_TRACE_FAIL").is_some() {
+            eprintln!(
+                "onerom trace: case={} stim=0x{:016X} expected_resolved=0x{:08X}",
+                case.label, stim_level, expected_resolved_addr
+            );
+            let mut prev_pushes = 0;
+            for obs in &trace {
+                if obs.ch1_pushes > prev_pushes {
+                    eprintln!(
+                        "  push cycle={} pushes={} resolved=0x{:08X} data=0x{:02X} oe=0x{:02X}",
+                        obs.cycle,
+                        obs.ch1_pushes,
+                        obs.resolved_addr,
+                        obs.data_byte,
+                        obs.pio2_pad_oe_data
+                    );
+                }
+                prev_pushes = obs.ch1_pushes;
+            }
+        }
 
         emu.bus
             .gpio_external_in
@@ -912,32 +932,32 @@ impl ServingOracle {
         mask
     }
 
-    /// Init seed level. Same shape as the gap level: gate CS high +
-    /// every deasserted-high CS pin high + every `unservable_when_high`
-    /// bit driven HIGH (so an address-aliased gate like fire-32-a's CS2
-    /// is actively deasserted during seed). Asserted-low pins stay LOW
-    /// — driven low during reads, so the seed leaves them in their
-    /// inactive state which is "not driven" / 0.
+    /// Init seed level. Same shape as the gap level: gate CS high plus
+    /// every deasserted-high CS pin high. Any `unservable_when_high`
+    /// bits are also driven HIGH for fixtures that still model an
+    /// address-aliased deselect gate; 27C010/27C020/27C040 fire-32-a
+    /// fixtures leave that mask at zero because `/CE` and `/OE` are the
+    /// real gates. Asserted-low pins stay LOW here — driven low during
+    /// reads, so the seed leaves them in their inactive state which is
+    /// "not driven" / 0.
     fn compose_seed_level(&self) -> u64 {
         let mut level: u64 = 1u64 << self.spec.cs1;
         for &p in &self.spec.deasserted_high_during_read {
             level |= 1u64 << p;
         }
-        // Drive any address-aliased gate HIGH so the chip is deselected
-        // during seed. fire-24-a: a no-op (bit 13 already set above —
-        // `unservable_when_high == 1 << cs1`). fire-32-a: sets bit 16
-        // (CS2 = A16) HIGH, which is the actual gate on that pin map
-        // (HLD §5.1).
+        // Drive any fixture-specific unservable gate HIGH during seed.
+        // For fire-24-a this is redundant with CS1 above; for 27C-series
+        // fire-32-a fixtures the mask is zero because A16 remains an
+        // address line.
         level |= self.spec.unservable_when_high;
         level
     }
 
     /// Gap-level: chip deselected, asserted-low pins LEFT HIGH so the
     /// chip stays fully deselected during the inter-case quiet period.
-    /// Also drives `unservable_when_high` bits HIGH so an address-
-    /// aliased gate (fire-32-a's CS2 on A16 — HLD §5.1) sees a clean
-    /// HIGH between cases. fire-24-a's gate (CS1=GPIO13) is already in
-    /// `unservable_when_high`, so the OR-in is a no-op there.
+    /// Also drives `unservable_when_high` bits HIGH for any fixture that
+    /// has an address-aliased deselect gate. 27C-series fire-32-a
+    /// fixtures do not: GPIO16 is A16 and the mask is zero.
     fn compose_gap_level(&self) -> u64 {
         let mut level: u64 = 1u64 << self.spec.cs1;
         for &p in &self.spec.deasserted_high_during_read {
