@@ -614,7 +614,7 @@ fn main() -> ExitCode {
     if spec.chip_pins != 24 {
         eprintln!(
             "ERROR: seabios_fixture_byte_correct is fire-24-a-only (chip_pins=24); \
-             got chip_pins={} from {}. A fire-32-a binary lands in Stage 3.",
+             got chip_pins={} from {}. Use seabios32_fixture_byte_correct for fire-32-a fixtures.",
             spec.chip_pins,
             cli.fixture.display(),
         );

@@ -15,15 +15,18 @@
 //! in the address bus. CS2 active-low: any pin pattern with bit 16 set
 //! drives CS2 HIGH and the firmware tristates D0..D7 (= "unservable").
 //! That filters 2^18 of the 2^19 patterns out of the byte-correctness
-//! check; 2^18 = 262 144 servable patterns, exactly matching the
-//! 256 KiB SeaBIOS image once.
+//! check. The full run therefore proves 262,144 servable pin-pattern
+//! checks, but only 131,072 unique SeaBIOS source offsets: offsets with
+//! source address bit 16 set are unservable on this fixture.
 //!
 //! Per HLD §5.3, A18 is wired in the 32-pin socket (the same socket
 //! takes 27C040), but the SDRR-baked permutation table is built so the
 //! served byte is independent of A18 — every SeaBIOS byte appears at
 //! both A18=0 and A18=1 patterns. The expected byte is therefore
-//! `seabios[(decoded_addr) % seabios.len()]`, which collapses A18 and
-//! gives a 2× redundant cross-check inside the sweep.
+//! `seabios[(decoded_addr) % seabios.len()]`, which collapses A18. Because
+//! A16-high patterns are skipped, the redundant cross-check applies only
+//! to the A16-low source half (`0x00000..0x0FFFF` and
+//! `0x20000..0x2FFFF`).
 //!
 //! Per HLD §7.5, byte-correct + LatencyOOE counts as PASS — the
 //! envelope is empirical and per-fixture; an out-of-window served byte
@@ -51,9 +54,12 @@
 //!
 //! # Status (2026-05-04)
 //!
-//! Stage 4C acceptance passed: smoke ran 4096 servable cases and the
-//! full sweep ran 262,144 servable cases with zero wrong, no-resolve,
-//! no-stable-byte, or out-of-range cases.
+//! Stage 4C servable-sweep acceptance passed: smoke ran 4096 servable
+//! cases and the full sweep ran 262,144 servable pin-pattern cases with
+//! zero wrong, no-resolve, no-stable-byte, or out-of-range cases. This is
+//! not a proof of full 256 KiB SeaBIOS source coverage; the full sweep
+//! covers 131,072 unique source offsets because A16-high offsets are
+//! intentionally deselected by the fixture.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -198,6 +204,11 @@ fn boot_to_sync(bootrom: &[u8], flash: &[u8]) -> Result<Emulator, String> {
 /// real time on a tight CPU).
 fn make_case(addr_idx: u32, spec: &FixtureSpec) -> Case {
     Case::from_addr("sweep", addr_idx, spec)
+}
+
+fn expected_seabios_offset(addr_idx: u64, seabios_len: usize) -> usize {
+    debug_assert!(seabios_len > 0);
+    (addr_idx as usize) % seabios_len
 }
 
 /// Decide whether a `CaseResult` counts as PASS for byte-correctness
@@ -420,6 +431,10 @@ fn main() -> ExitCode {
         "sweep: {} addresses (stride={}, smoke_cap={:?})",
         sweep_size, cli.stride, smoke_cap
     );
+    println!(
+        "acceptance scope: servable pin-pattern byte checks; full stride=1 covers \
+         131072 unique SeaBIOS offsets (A16-low half), not the full 256 KiB image"
+    );
     let _ = std::io::stdout().flush();
 
     let mut tally = Tally::default();
@@ -446,9 +461,10 @@ fn main() -> ExitCode {
         servable_processed += 1;
 
         // Expected byte: SeaBIOS at addr_idx mod 256 KiB. A18=0 and A18=1
-        // patterns map to the same byte (HLD §5.3 — the SDRR baking
-        // table makes A18 don't-care for 27C020 content).
-        let expected = seabios[(addr_idx as usize) % seabios.len()];
+        // patterns map to the same byte, but A16-high offsets are skipped
+        // as unservable by the CS2/A16 alias. This is a servable pin-pattern
+        // check, not full 256 KiB source-offset coverage.
+        let expected = seabios[expected_seabios_offset(addr_idx, seabios.len())];
 
         let result = oracle.run_case(&mut emu, &mut glue, case);
         let result_copy = *result;
@@ -635,5 +651,43 @@ mod tests {
         assert_eq!(servable, 1u64 << 18, "servable count must be 2^18");
         assert_eq!(unservable, 1u64 << 18, "unservable count must be 2^18");
         assert_eq!(servable + unservable, sweep_size);
+    }
+
+    #[test]
+    fn fire32a_full_sweep_expected_offsets_are_a16_low_half_only() {
+        let flash = std::fs::read(DEFAULT_FIXTURE)
+            .expect("fire-32-a fixture must be present at the bundled path");
+        let spec = FixtureSpec::from_flash(&flash).expect("fire-32-a parse");
+        assert_eq!(spec.addr_pins[16], 16);
+
+        let sweep_size: u64 = 1u64 << spec.addr_pins.len();
+        let mut offsets = std::collections::HashSet::new();
+        for addr_idx in 0..sweep_size {
+            let case = make_case(addr_idx as u32, &spec);
+            if (case.pin_pattern & spec.unservable_when_high) != 0 {
+                continue;
+            }
+            offsets.insert(expected_seabios_offset(addr_idx, SEABIOS_SIZE));
+        }
+
+        assert_eq!(
+            offsets.len(),
+            0x2_0000,
+            "full fire-32-a sweep covers 131072 unique SeaBIOS offsets"
+        );
+        assert_eq!(
+            SEABIOS_SIZE - offsets.len(),
+            0x2_0000,
+            "the other 131072 SeaBIOS offsets are unexercised"
+        );
+
+        let a16_mask = 1usize << 16;
+        for offset in 0..SEABIOS_SIZE {
+            assert_eq!(
+                offsets.contains(&offset),
+                offset & a16_mask == 0,
+                "unexpected coverage for SeaBIOS offset 0x{offset:05x}"
+            );
+        }
     }
 }

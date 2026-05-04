@@ -2,17 +2,20 @@
 
 Items discovered during development that need addressing in later phases.
 
-## OneROM PIO ServingOracle fire-32-a acceptance closed (2026-05-04, Stage 4C)
+## OneROM PIO ServingOracle fire-32-a servable sweep accepted (2026-05-04, Stage 4C)
 
-**Status:** resolved. Stage 4A added RP2350 PIO `GPIOBASE` and high-bank
-sampling, Stage 4B replaced the fire-24-shaped resolved-address matcher, and
-Stage 4C fixed smoke-cap accounting in
-`crates/picoem-harness/src/bin/seabios32_fixture_byte_correct.rs`.
+**Status:** resolved for servable pin-pattern byte correctness. Stage 4A added
+RP2350 PIO `GPIOBASE` and high-bank sampling, Stage 4B replaced the
+fire-24-shaped resolved-address matcher, and Stage 4C fixed smoke-cap
+accounting in `crates/picoem-harness/src/bin/seabios32_fixture_byte_correct.rs`.
 
 **Validation:** fire-32 smoke now reports `PASS=4096`, `wrong=0`,
 `no_resolve=0`, `no_stable=0`, `addr_oor=0`; the full fire-32 sweep reports
 `PASS=262144` with `262144` unservable cases skipped; fire-24 SeaBIOS
 regression remains `pass=131072`, `wrong=0`, `no_stable=0`, `not_driven=0`.
+Because fire-32-a CS2 aliases A16, the full fire-32 sweep covers 131,072
+unique SeaBIOS source offsets (`0x00000..0x0FFFF` and `0x20000..0x2FFFF`),
+not full 256 KiB source-offset coverage.
 
 ## WATCHDOG REASON modelling + reset-survival (2026-04-28, Track 4)
 
