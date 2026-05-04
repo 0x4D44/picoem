@@ -23,20 +23,28 @@ use std::sync::atomic::{
 ///
 /// `in_` and `external` carry the single-threaded `Bus::gpio_in` /
 /// `Bus::gpio_external_in` / `Bus::gpio_external_mask` fields into the
-/// threaded runtime. Only bank 0 (the low 32 pins) is represented
-/// today — that matches the single-threaded shape on `Bus` and keeps
-/// the seed path straight.
+/// threaded runtime. The low half (GPIOs 0..31) lives in `in_` /
+/// `external`; the high half (GPIOs 32..47) lives in `external_hi` and
+/// is sampled by the firmware on `GPIO_HI_IN` reads (SIO offset 0x008).
 ///
-/// `external` packs `(val, mask)` as `(high32 = val, low32 = mask)` so
-/// the harness writer and coord's `update_gpio` reader see an atomic
-/// pair — two independent `AtomicU32`s would allow a torn read where
-/// `val` and `mask` come from different writes.
+/// `external` and `external_hi` each pack `(val, mask)` as
+/// `(high32 = val, low32 = mask)` so the harness writer and coord's
+/// `update_gpio` reader see an atomic pair — two independent
+/// `AtomicU32`s would allow a torn read where `val` and `mask` come
+/// from different writes.
 pub struct AtomicGpio {
     out: [AtomicU32; 2],
     oe: [AtomicU32; 2],
     in_: AtomicU32,
-    /// Packed external stimulus: `(val << 32) | mask`.
+    /// Packed external stimulus for GPIOs 0..31: `(val << 32) | mask`.
     external: AtomicU64,
+    /// Packed external stimulus for GPIOs 32..47 (low 16 bits used):
+    /// `(val << 32) | mask`. Companion to `external` — bit `i` of the
+    /// `val`/`mask` halves corresponds to GPIO `32 + i`. Layered on top
+    /// of the legacy QSPI-noise model in `Bus::read_gpio_hi_in` /
+    /// `WorkerBus::sio_read32(0x008)` so the firmware sees harness-
+    /// driven bits and noise on everything else.
+    external_hi: AtomicU64,
 }
 
 impl AtomicGpio {
@@ -46,6 +54,7 @@ impl AtomicGpio {
             oe: [AtomicU32::new(0), AtomicU32::new(0)],
             in_: AtomicU32::new(0),
             external: AtomicU64::new(0),
+            external_hi: AtomicU64::new(0),
         }
     }
 
@@ -54,25 +63,33 @@ impl AtomicGpio {
     ///
     /// Phase 3 Stage 6b (LLD V7 §6/§8): `ThreadedEmulator::from_emulator`
     /// calls this to carry the live GPIO OUT/OE/IN + harness-controlled
-    /// external-stimulus state into the threaded runtime. Consumes the
-    /// plain `u32` snapshots — callers take them out of the Bus
-    /// destructure.
+    /// external-stimulus state (both halves) into the threaded runtime.
+    /// Consumes the plain `u32` snapshots — callers take them out of the
+    /// Bus destructure.
     ///
-    /// Only bank 0 (low 32 pins) is seeded. Bank 1 starts at zero,
-    /// matching post-reset silicon state.
+    /// Only bank 0 (low 32 pins) is seeded for the OUT/OE/IN registers.
+    /// Bank 1 starts at zero, matching post-reset silicon state. The
+    /// `external_hi` companion is seeded from
+    /// `Bus::gpio_external_in_hi` / `gpio_external_mask_hi` so harness-
+    /// applied GPIO 32..47 stimulus survives the handoff.
     pub fn seed(
         gpio_out: u32,
         gpio_oe: u32,
         gpio_in: u32,
         gpio_external_in: u32,
         gpio_external_mask: u32,
+        gpio_external_in_hi: u32,
+        gpio_external_mask_hi: u32,
     ) -> Self {
         let external = ((gpio_external_in as u64) << 32) | (gpio_external_mask as u64);
+        let external_hi =
+            ((gpio_external_in_hi as u64) << 32) | (gpio_external_mask_hi as u64);
         Self {
             out: [AtomicU32::new(gpio_out), AtomicU32::new(0)],
             oe: [AtomicU32::new(gpio_oe), AtomicU32::new(0)],
             in_: AtomicU32::new(gpio_in),
             external: AtomicU64::new(external),
+            external_hi: AtomicU64::new(external_hi),
         }
     }
 
@@ -114,6 +131,31 @@ impl AtomicGpio {
     pub fn write_external(&self, val: u32, mask: u32) {
         let packed = ((val as u64) << 32) | (mask as u64);
         self.external.store(packed, Release);
+    }
+
+    /// Read the high-half external-input stimulus `(val, mask)`
+    /// atomically. Bit `i` of either half corresponds to GPIO `32 + i`.
+    ///
+    /// Uses `Acquire` ordering for the same reason as
+    /// [`Self::read_external`] — the harness writer and the coord's
+    /// `GPIO_HI_IN` read path observe a coherent pair.
+    #[inline]
+    pub fn read_external_hi(&self) -> (u32, u32) {
+        let packed = self.external_hi.load(Acquire);
+        let val = (packed >> 32) as u32;
+        let mask = packed as u32;
+        (val, mask)
+    }
+
+    /// Overwrite the high-half external-input stimulus `(val, mask)`
+    /// atomically. Bit `i` of either half corresponds to GPIO `32 + i`.
+    ///
+    /// Uses `Release` ordering — pairs with `read_external_hi`'s
+    /// `Acquire` load so the coordinator sees a coherent pair.
+    #[inline]
+    pub fn write_external_hi(&self, val: u32, mask: u32) {
+        let packed = ((val as u64) << 32) | (mask as u64);
+        self.external_hi.store(packed, Release);
     }
 
     // ---- OUT (output value) ------------------------------------------------
@@ -281,5 +323,29 @@ mod tests {
 
         // Bank 0 is unaffected.
         assert_eq!(gpio.read_out(0), 1 << 25);
+    }
+
+    /// External-stim accessors round-trip independently for the low and
+    /// high halves. Stage 3A wide-GPIO bus support — see HLD §A.
+    #[test]
+    fn external_low_and_high_independent() {
+        let gpio = AtomicGpio::new();
+
+        // Low half default: zero.
+        assert_eq!(gpio.read_external(), (0, 0));
+        assert_eq!(gpio.read_external_hi(), (0, 0));
+
+        // Drive the low half: bit 5 stim-high, mask covers bits 0..7.
+        gpio.write_external(1 << 5, 0xFF);
+        assert_eq!(gpio.read_external(), (1 << 5, 0xFF));
+        // High half is untouched.
+        assert_eq!(gpio.read_external_hi(), (0, 0));
+
+        // Drive the high half: GPIO 33 (= bit 1) stim-high, mask covers
+        // GPIOs 32..47 (low 16 bits of the high-half word).
+        gpio.write_external_hi(1 << 1, 0xFFFF);
+        assert_eq!(gpio.read_external_hi(), (1 << 1, 0xFFFF));
+        // Low half is preserved.
+        assert_eq!(gpio.read_external(), (1 << 5, 0xFF));
     }
 }

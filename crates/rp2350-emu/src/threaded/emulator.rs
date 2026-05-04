@@ -209,6 +209,8 @@ impl ThreadedEmulator {
             gpio_in,
             gpio_external_in,
             gpio_external_mask,
+            gpio_external_in_hi,
+            gpio_external_mask_hi,
             flash_loaded,
             peripheral_regs,
             master_cycle,
@@ -244,17 +246,20 @@ impl ThreadedEmulator {
             xip_sram,
             flash_loaded,
         ));
-        // `gpio_in` and `gpio_external_in` are `AtomicU32` on `Bus`
-        // (Phase 2 of the OneROM CPU speed-grade oracle). The threaded
-        // `AtomicGpio` carries its own atomics, so lift the current
-        // values out at handoff with `Ordering::Relaxed` — consistent
-        // with every other reader/writer of these fields.
+        // `gpio_in` and `gpio_external_in[_hi]` are `AtomicU32` on `Bus`
+        // (Phase 2 of the OneROM CPU speed-grade oracle, plus Stage 3A
+        // wide-GPIO bus support — HLD §A). The threaded `AtomicGpio`
+        // carries its own atomics, so lift the current values out at
+        // handoff with `Ordering::Relaxed` — consistent with every
+        // other reader/writer of these fields.
         let shared_gpio = Arc::new(AtomicGpio::seed(
             sio.gpio_out,
             sio.gpio_oe,
             gpio_in.load(Ordering::Relaxed),
             gpio_external_in.load(Ordering::Relaxed),
             gpio_external_mask,
+            gpio_external_in_hi.load(Ordering::Relaxed),
+            gpio_external_mask_hi,
         ));
         let shared_sio = Arc::new(ThreadedSio::seed(&sio));
 

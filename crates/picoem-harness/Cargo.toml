@@ -1,6 +1,6 @@
 [package]
 name = "picoem-harness"
-version = "0.40.0"
+version = "0.41.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -135,6 +135,18 @@ test = false
 name = "seabios_fixture_byte_correct"
 path = "src/bin/seabios_fixture_byte_correct.rs"
 test = false
+
+# fire-32-a SeaBIOS PIO-serve byte-correctness validator. Sibling to
+# `seabios_fixture_byte_correct` — that drives `CpuServingOracle`
+# against the 24-pin CPU-serve fixture; this drives the PIO
+# `ServingOracle` against the 32-pin PIO-serve fixture. See
+# `wrk_docs/2026.05.04 - HLD - OneROM Serving Oracle Fixture
+# Generalization.md` §4.5/§4.6. Test target enabled — the in-binary
+# `fire32a_sweep_servable_unservable_split` unit test is small and
+# protects the sweep bookkeeping (HLD §6.2).
+[[bin]]
+name = "seabios32_fixture_byte_correct"
+path = "src/bin/seabios32_fixture_byte_correct.rs"
 
 [[bin]]
 name = "onerom_stress_cpu_rp2350"

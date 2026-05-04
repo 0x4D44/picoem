@@ -9525,6 +9525,117 @@ fn gpio_external_in_visible_first_cycle_after_write() {
 }
 
 // ============================================================================
+// Wide-GPIO (Stage 3A) — external_hi covers GPIOs 32..47
+// ============================================================================
+//
+// Companion atomics on `Bus`: `gpio_external_in_hi` / `gpio_external_mask_hi`.
+// Bit `i` corresponds to GPIO `32 + i`. Folded into `read_gpio_hi_in` (SIO
+// offset 0x008) so the firmware sees harness-driven bits while the legacy
+// QSPI noise model still drives unmasked bits when flash is loaded.
+//
+// See `wrk_docs/2026.05.04 - HLD - OneROM Serving Oracle Fixture
+// Generalization.md` §A — fire-32-a's address pins span GPIO 16..34, so the
+// existing low-half u32 isn't sufficient on its own.
+
+/// Driving the high half via `set_gpio_external_in_hi` surfaces on
+/// `read_gpio_hi_in` (SIO 0x008). Without flash loaded, unmasked bits read
+/// back as zero — so the test sees exactly the harness-driven pattern.
+#[test]
+fn gpio_external_in_hi_drives_read_gpio_hi_in() {
+    use crate::{Config, Emulator};
+
+    let mut emu = Emulator::new(Config::default());
+    // Don't load flash — the QSPI-noise generator is gated on
+    // `flash_loaded`, so leaving it unset keeps unmasked bits at 0 and
+    // makes the assertion exact.
+
+    // GPIOs 40..43 high (bits 8..11 of GPIO_HI_IN), mask covers GPIOs
+    // 32..47 (low 16 bits of the high-half word).
+    emu.bus.set_gpio_external_in_hi(0x0000_0F00, 0x0000_FFFF);
+
+    let val = emu.bus.read32(0xD000_0008, 0);
+    assert_eq!(
+        val, 0x0000_0F00,
+        "harness-driven GPIOs 40..43 must surface on GPIO_HI_IN; got {val:#010x}"
+    );
+}
+
+/// External-stim writes to the low half and the high half do not cross-
+/// contaminate. Independently driving each half exposes its bits on the
+/// matching firmware-visible read path (`gpio_in` for the low half,
+/// `read_gpio_hi_in` for the high half).
+#[test]
+fn gpio_external_in_low_and_high_independent() {
+    use crate::{Config, Emulator};
+
+    let mut emu = Emulator::new(Config::default());
+
+    // Bring PIO0 out of reset so its pad updates propagate (low-half
+    // path needs `update_gpio` to run via `emu.run(1)`).
+    emu.bus.write32(
+        0x4002_0000 | (3 << 12),
+        (1 << 15) | (1 << 16) | (1 << 17),
+        0,
+    );
+
+    // Drive the low half: GPIO 5 stim-high, mask = 1 << 5.
+    emu.bus.gpio_external_mask = 1 << 5;
+    emu.bus
+        .gpio_external_in
+        .store(1 << 5, Ordering::Relaxed);
+
+    // Drive the high half: GPIO 33 (bit 1 of GPIO_HI_IN) stim-high.
+    emu.bus.set_gpio_external_in_hi(1 << 1, 0x0000_FFFF);
+
+    // Trigger the merge for the low half.
+    emu.run(1).unwrap();
+
+    let lo = emu.bus.gpio_in.load(Ordering::Relaxed);
+    assert_eq!(
+        lo & (1 << 5),
+        1 << 5,
+        "low-half stim lost; gpio_in = {lo:#010x}"
+    );
+    // High-half bit 5 is well outside the high-half mask range (mask is
+    // GPIOs 32..47 only), so it must be zero in the LOW-half read.
+    // Symmetric check: low-half mask only covers bit 5 — bits 32..47 of
+    // the low-half word are nonsensical (it's u32). The cross-check we
+    // care about is that `read_gpio_hi_in` carries ONLY the high-half
+    // bit, no contamination from the low half's bit-5 write.
+    let hi = emu.bus.read32(0xD000_0008, 0);
+    assert_eq!(
+        hi, 1 << 1,
+        "high-half stim must surface on GPIO_HI_IN with no low-half leakage; got {hi:#010x}"
+    );
+    // And the low half must not have picked up bit 1 from somewhere.
+    assert_eq!(
+        lo & (1 << 1),
+        0,
+        "low-half gpio_in must not carry the high-half bit; gpio_in = {lo:#010x}"
+    );
+}
+
+/// Reset clears both external-stim halves. Mirrors the existing low-half
+/// post-reset contract and pins the high-half analogue.
+#[test]
+fn gpio_external_in_hi_cleared_by_reset() {
+    use crate::{Config, Emulator};
+
+    let mut emu = Emulator::new(Config::default());
+    emu.bus.set_gpio_external_in_hi(0x0000_AAAA, 0x0000_FFFF);
+    assert_eq!(emu.bus.gpio_external_mask_hi, 0x0000_FFFF);
+    assert_eq!(
+        emu.bus.gpio_external_in_hi.load(Ordering::Relaxed),
+        0x0000_AAAA
+    );
+
+    emu.reset();
+
+    assert_eq!(emu.bus.gpio_external_mask_hi, 0);
+    assert_eq!(emu.bus.gpio_external_in_hi.load(Ordering::Relaxed), 0);
+}
+
+// ============================================================================
 // MMIO trace hook — Phase 0b (HLD V5 §4.2.7)
 // ============================================================================
 //

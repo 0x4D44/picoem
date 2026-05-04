@@ -481,6 +481,28 @@ pub struct Bus {
     /// `gpio_in[i]`; bit `i` clear = PIO/SIO dictates. Defaults to 0
     /// (no stimulus — legacy behaviour).
     pub gpio_external_mask: u32,
+    /// External-input stimulus value for GPIOs 32..47 (the upper bank,
+    /// firmware-visible via SIO `GPIO_HI_IN` at offset 0x008). Bit `i`
+    /// of this word corresponds to GPIO `32 + i`. Bits selected by
+    /// [`Self::gpio_external_mask_hi`] are forced to the corresponding
+    /// bits of this value when the firmware reads `GPIO_HI_IN`.
+    ///
+    /// Default 0. Companion to [`Self::gpio_external_in`] — kept as a
+    /// separate field rather than widening the low half so the firmware-
+    /// visible word layout (one register per bank) stays explicit, and
+    /// so existing consumers reading the low half are not silently
+    /// affected by GPIO ≥ 32 stimulus.
+    ///
+    /// Atomic for the same reason as the low half: a measurement thread
+    /// may write new stimulus while the emulator runs.
+    pub gpio_external_in_hi: AtomicU32,
+    /// External-input stimulus mask for GPIOs 32..47. Bit `i` set = the
+    /// harness dictates the GPIO `32 + i` level (overlaying whatever
+    /// the existing bank-1 model returns); bit `i` clear = legacy
+    /// behaviour (QSPI noise via [`Self::read_gpio_hi_in`]).
+    ///
+    /// Defaults to 0. Companion to [`Self::gpio_external_mask`].
+    pub gpio_external_mask_hi: u32,
     /// Dirty-range log for per-core decode caches. Every SRAM / ROM /
     /// XIP write pushes the target halfword address(es) here; the driver
     /// (`Emulator::step` in the single-threaded path) drains this into
@@ -631,6 +653,8 @@ impl Bus {
             gpio_in: AtomicU32::new(0),
             gpio_external_in: AtomicU32::new(0),
             gpio_external_mask: 0,
+            gpio_external_in_hi: AtomicU32::new(0),
+            gpio_external_mask_hi: 0,
             // Dirty-range log for per-core decode caches. 16 entries up
             // front — STM tops out at 13 registers, FPU context push
             // spills 16 words. Matches `WorkerBus::pending_cache_invalidations`.
@@ -1289,23 +1313,61 @@ impl Bus {
         self.flash_loaded = loaded;
     }
 
-    /// Read GPIO_HI_IN (SIO offset 0x008). Returns QSPI pin state.
-    /// When flash is loaded, returns noise with bit 29 frequently set.
-    /// The bootrom's flash-detect loop reads this 21 times, extracting
-    /// bit 29 via `lsrs (gpio>>28), #2` and accumulating with `adcs`.
-    /// The threshold is 0xF1 (241); without carry the sum is 231, so we
-    /// need bit 29 set in ~11 of 21 reads.
+    /// Apply external-input stimulus to GPIOs 32..47 in one call.
+    ///
+    /// Bit `i` of `value` and `mask` corresponds to GPIO `32 + i`. Mask
+    /// bits set tell the firmware-visible `GPIO_HI_IN` read path to
+    /// substitute the matching `value` bit; mask bits clear keep the
+    /// legacy QSPI-noise behaviour.
+    ///
+    /// Companion to the low-half direct-field pattern
+    /// (`gpio_external_in.store(...)` followed by
+    /// `gpio_external_mask = ...`). Direct field access is still
+    /// supported and is what existing low-half callsites use; this
+    /// helper exists so harness code that drives both halves can do so
+    /// in one call.
+    ///
+    /// The harness's fire-32-a path drives address bits A0..A2 (GPIOs
+    /// 34, 33, 32) through this entry point. See
+    /// `wrk_docs/2026.05.04 - HLD - OneROM Serving Oracle Fixture
+    /// Generalization.md` §A for the design.
+    pub fn set_gpio_external_in_hi(&mut self, value: u32, mask: u32) {
+        self.gpio_external_mask_hi = mask;
+        self.gpio_external_in_hi.store(value, Ordering::Relaxed);
+    }
+
+    /// Read GPIO_HI_IN (SIO offset 0x008). Returns the merged state of
+    /// GPIOs 32..47 (low 16 bits) plus QSPI pin noise (bits 16..31).
+    ///
+    /// Without external stimulus the low half is zero and only the QSPI
+    /// noise generator drives the upper bits. The bootrom's flash-detect
+    /// loop reads this 21 times, extracting bit 29 via
+    /// `lsrs (gpio>>28), #2` and accumulating with `adcs`; the threshold
+    /// is 0xF1 (241), without carry the sum is 231, so bit 29 must be
+    /// set in ~11 of 21 reads.
+    ///
+    /// The harness overlays GPIOs 32..47 stimulus via
+    /// [`Self::gpio_external_in_hi`] / [`Self::gpio_external_mask_hi`] —
+    /// masked bits come from the harness, unmasked bits keep the legacy
+    /// noise behaviour. This is the GPIO 32..47 companion to
+    /// [`Emulator::update_gpio`]'s low-half external-stim overlay; the
+    /// firmware-visible word stays at SIO offset 0x008 (the
+    /// `GPIO_HI_IN` register).
     fn read_gpio_hi_in(&mut self) -> u32 {
-        if !self.flash_loaded {
-            return 0;
-        }
-        // Advance simple LFSR for variation, then force bit 29 on
-        // most reads. Real QSPI lines are noisy — bias toward "alive".
-        let s = self.gpio_hi_noise_state;
-        self.gpio_hi_noise_state = s.wrapping_mul(1103515245).wrapping_add(12345);
-        // Set bits 29-31 (QSPI data lines) to simulate flash responses.
-        // Keep bit 28 toggling for additional entropy.
-        self.gpio_hi_noise_state | 0xE000_0000
+        let base = if self.flash_loaded {
+            // Advance simple LFSR for variation, then force bit 29 on
+            // most reads. Real QSPI lines are noisy — bias toward "alive".
+            let s = self.gpio_hi_noise_state;
+            self.gpio_hi_noise_state = s.wrapping_mul(1103515245).wrapping_add(12345);
+            // Set bits 29-31 (QSPI data lines) to simulate flash responses.
+            // Keep bit 28 toggling for additional entropy.
+            self.gpio_hi_noise_state | 0xE000_0000
+        } else {
+            0
+        };
+        let ext_mask = self.gpio_external_mask_hi;
+        let ext_val = self.gpio_external_in_hi.load(Ordering::Relaxed);
+        (base & !ext_mask) | (ext_val & ext_mask)
     }
 
     /// Load flash data into XIP memory and mark flash as loaded. Sets

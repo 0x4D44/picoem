@@ -738,6 +738,26 @@ impl WorkerBus {
         (base & !ext_mask) | (ext_val & ext_mask)
     }
 
+    /// Threaded counterpart of `Bus::read_gpio_hi_in`. Stage 3A wide-GPIO
+    /// support — see HLD §A.
+    ///
+    /// The threaded runtime currently models bank 1 as zero (no GPIO
+    /// 32..47 internal state plumbed through `AtomicGpio`), and there
+    /// is no QSPI-noise generator on this path. Both gaps are pre-
+    /// existing scope (no consumer needed them); harness-driven
+    /// external stimulus on GPIOs 32..47 is the only signal Stage 3
+    /// requires this path to surface.
+    ///
+    /// Composition: zero base (no internal GPIO 32..47 model) + harness
+    /// overlay = `(0 & !ext_mask) | (ext_val & ext_mask)`. Out-of-mask
+    /// bits read back as zero, which is the legacy behaviour callers
+    /// already saw.
+    #[inline]
+    fn gpio_hi_in_fresh(&self) -> u32 {
+        let (ext_val, ext_mask) = self.shared.gpio.read_external_hi();
+        ext_val & ext_mask
+    }
+
     /// SIO (`0xD`) read32. DIV/INTERP (offsets 0x060..=0x0FC) are
     /// intercepted on `CortexM33` and never reach here.
     fn sio_read32(&mut self, addr: u32, core: u8) -> u32 {
@@ -751,7 +771,7 @@ impl WorkerBus {
         match reg_offset {
             0x000 => core as u32,                  // CPUID
             0x004 => self.gpio_in_fresh(), // GPIO_IN — SIO+PIO from last quantum + fresh external
-            0x008 => 0,                    // GPIO_HI_IN — bank 1 not modelled yet
+            0x008 => self.gpio_hi_in_fresh(), // GPIO_HI_IN — bank-1 external stim + QSPI noise
             0x010 => self.shared.gpio.read_out(0), // GPIO_OUT
             0x030 => self.shared.gpio.read_oe(0), // GPIO_OE
             // FIFO
@@ -2288,10 +2308,27 @@ mod tests {
         fn sio_read_gpio_hi_in_and_oe() {
             let shared = fresh_shared();
             let mut bus = WorkerBus::new(0, shared);
-            // GPIO_HI_IN (0x008) — bank 1 not modelled, always 0.
+            // GPIO_HI_IN (0x008) — internal bank-1 model is zero with
+            // no harness-driven external stim, and the QSPI-noise hook
+            // is intentionally absent on the threaded path (no consumer
+            // exercises it today). Reads as 0.
             assert_eq!(bus.read32(0xD000_0008, 0), 0);
             // GPIO_OE.
             assert_eq!(bus.read32(0xD000_0030, 0), 0);
+        }
+
+        /// Stage 3A wide-GPIO support: a harness-driven external_hi
+        /// overlay surfaces on `GPIO_HI_IN` reads through the threaded
+        /// path. Mirrors the single-threaded
+        /// `gpio_external_in_hi_drives_read_gpio_hi_in` test.
+        #[test]
+        fn sio_read_gpio_hi_in_overlays_external_hi() {
+            let shared = fresh_shared();
+            let mut bus = WorkerBus::new(0, shared.clone());
+            // Drive GPIOs 40..43 high (bits 8..11 of GPIO_HI_IN), with
+            // a mask covering GPIOs 32..47 (low 16 bits).
+            shared.gpio.write_external_hi(0x0000_0F00, 0x0000_FFFF);
+            assert_eq!(bus.read32(0xD000_0008, 0), 0x0000_0F00);
         }
 
         #[test]

@@ -16,4 +16,4 @@ categories = ["emulators", "embedded", "development-tools::debugging"]
 workspace = true
 
 [dependencies]
-rp2350-emu = { version = "0.1", path = "../rp2350-emu" }
+rp2350-emu = { version = "0.2", path = "../rp2350-emu" }

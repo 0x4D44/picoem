@@ -541,6 +541,8 @@ impl Emulator {
         // be re-asserted after a chip reset.
         self.bus.gpio_external_in.store(0, Ordering::Relaxed);
         self.bus.gpio_external_mask = 0;
+        self.bus.gpio_external_in_hi.store(0, Ordering::Relaxed);
+        self.bus.gpio_external_mask_hi = 0;
 
         // Drop PLL lock-arm state so a post-reset power-up re-arms the
         // counter against the freshly-zeroed master cycle. Mirrors the

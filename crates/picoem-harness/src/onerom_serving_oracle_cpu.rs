@@ -241,34 +241,48 @@ impl CpuServingOracle {
         // External-input mask covers gate CS, every deasserted-high CS
         // pin, every asserted-low pin, and all address pins. Data pins
         // are CPU-driven — never mask them.
-        // fire-32-a (Stage 3) will widen the bus to u64; today we
-        // assert that no fixture uses GPIOs >= 32 to make the Stage 3
-        // follow-up loud.
-        let ext_mask: u64 = self.compose_ext_mask();
-        debug_assert!(
-            ext_mask >> 32 == 0,
-            "ext_mask uses GPIOs >= 32; widen Bus interface for fire-32-a (Stage 3)"
-        );
+        //
+        // The mask and levels are split into low (GPIO 0..31) and high
+        // (GPIO 32..47) halves and applied to both `Bus::gpio_external_*`
+        // and `Bus::gpio_external_*_hi` (Stage 3A wide-GPIO support;
+        // HLD §A). The CPU oracle is currently fire-24-a-only — the
+        // shadow-lookup index below is `(stim_level & 0xFFFF)`, a
+        // 16-bit u16 that does not capture address bits beyond GPIO15
+        // — but the bus-write half is still kept symmetric with the PIO
+        // oracle so a future fire-32-a CPU-serve oracle drops in
+        // without re-touching this site. When `case.is_literal`, the
+        // mask widens to every low-16 bit minus the data pins so the
+        // SeaBIOS validator's raw 16-bit pin sweep drives its full
+        // pattern verbatim (matches the Stage 1 baseline `0x0000_FFFF`).
+        let ext_mask: u64 = self.compose_ext_mask(&case);
         emu.bus.gpio_external_mask = ext_mask as u32;
+        emu.bus.gpio_external_mask_hi = (ext_mask >> 32) as u32;
 
         // 1. Gap drive — gate CS + every deasserted-high + every
         //    asserted-low pin all HIGH so the chip is fully deselected.
         let gap_level: u64 = self.compose_gap_level();
-        debug_assert!(gap_level >> 32 == 0, "gap_level uses GPIOs >= 32");
         emu.bus
             .gpio_external_in
             .store(gap_level as u32, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in_hi
+            .store((gap_level >> 32) as u32, Ordering::Relaxed);
         for _ in 0..GAP_CYCLES {
             emu.run(1).expect("Serial run is infallible");
         }
 
         // 2. Apply stimulus: gate CS LOW, deasserted-high pins HIGH,
-        //    asserted-low pins LOW, case pin_pattern ORed in.
-        let stim_level: u64 = self.compose_stim_level(case.pin_pattern);
-        debug_assert!(stim_level >> 32 == 0, "stim_level uses GPIOs >= 32");
+        //    asserted-low pins LOW, case pin_pattern ORed in. When
+        //    `case.is_literal` (the SeaBIOS validator path), the
+        //    overlay is skipped so the bus carries `pin_pattern`
+        //    verbatim — see `compose_stim_level`.
+        let stim_level: u64 = self.compose_stim_level(&case);
         emu.bus
             .gpio_external_in
             .store(stim_level as u32, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in_hi
+            .store((stim_level >> 32) as u32, Ordering::Relaxed);
 
         // The CPU's serve loop looks up shadow[pins_low_16]. The pins
         // the CPU samples are the 16-bit pattern the stim applies — which
@@ -365,7 +379,22 @@ impl CpuServingOracle {
     // Stim/gap level composition (mirrors the PIO oracle).
     // ---------------------------------------------------------------------
 
-    fn compose_ext_mask(&self) -> u64 {
+    /// External-input mask. Mirrors
+    /// [`crate::onerom_serving_oracle::ServingOracle::compose_ext_mask`]
+    /// — including the `case.is_literal` short-circuit that widens the
+    /// mask to every low-16 bit minus the data pins so SeaBIOS-
+    /// validator-style raw 16-bit pin sweeps drive their declared
+    /// pattern through to the firmware verbatim. The narrow per-spec
+    /// mask only covers `addr_pins ∪ CS-gates`, which silently
+    /// truncates literal patterns whose bits fall outside that set
+    /// (e.g. fire-24-a literal sweep bits 8 + 9).
+    fn compose_ext_mask(&self, case: &Case) -> u64 {
+        if case.is_literal {
+            // Literal: drive all low-16 bits except the data pins. See
+            // the PIO-oracle sibling for fixture-by-fixture values.
+            let data_mask: u64 = 0xFFu64 << self.spec.data_pins[0];
+            return 0x0000_FFFFu64 & !data_mask;
+        }
         let mut mask: u64 = 1u64 << self.spec.cs1;
         for &p in &self.spec.deasserted_high_during_read {
             mask |= 1u64 << p;
@@ -387,16 +416,31 @@ impl CpuServingOracle {
         for &p in &self.spec.asserted_low_during_read {
             level |= 1u64 << p;
         }
+        // Drive any address-aliased gate HIGH so the chip is deselected
+        // between cases. Symmetric with `ServingOracle::compose_gap_level`
+        // (and `compose_seed_level`); for fire-24-a this is a no-op
+        // (bit 13 = cs1 = unservable_when_high, already set above), for
+        // fire-32-a this sets bit 16 (CS2 = A16) — HLD §5.1.
+        level |= self.spec.unservable_when_high;
         level
     }
 
-    fn compose_stim_level(&self, case_pattern: u64) -> u64 {
+    /// Stim-level composition. Mirrors
+    /// [`crate::onerom_serving_oracle::ServingOracle::compose_stim_level`]
+    /// — including the `case.is_literal` short-circuit that skips the
+    /// `deasserted_high_during_read` overlay so SeaBIOS-validator-style
+    /// raw 16-bit pin sweeps see their declared pattern on the bus
+    /// verbatim.
+    fn compose_stim_level(&self, case: &Case) -> u64 {
+        if case.is_literal {
+            return case.pin_pattern;
+        }
         let mut level: u64 = 0;
         for &p in &self.spec.deasserted_high_during_read {
             level |= 1u64 << p;
         }
         // Asserted-low pins stay LOW during stim. Already 0 in `level`.
-        level | case_pattern
+        level | case.pin_pattern
     }
 
     /// Format the full CPU-serve report (header, per-case table,

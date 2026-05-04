@@ -153,6 +153,18 @@ const MIN_FRESH_ARRIVAL_CYCLE: u64 = (DMA_READ_CYCLES as u64) + (DMA_WRITE_CYCLE
 /// onto the deasserted-high level. Build via [`Case::from_addr`] (which
 /// permutes a chip-internal address through `spec.addr_pins`) or
 /// [`Case::from_raw`] (which takes a literal pattern).
+///
+/// `is_literal` controls whether [`ServingOracle::compose_stim_level`]
+/// (and the CPU oracle's analogue) overlay the `deasserted_high_during_read`
+/// pins onto `pin_pattern` before driving the bus. `from_addr` cases set
+/// `is_literal = false`: the case carries address bits only, so the
+/// composer must add the chip-deselect overlay so non-driven CS pins
+/// remain HIGH. `from_raw` cases set `is_literal = true`: the caller
+/// already controls every pin (including CS levels), so the composer
+/// drives `pin_pattern` verbatim. Without this distinction the SeaBIOS
+/// fixture validator (which sweeps every 16-bit GPIO pattern as a raw
+/// case) sees its CS bits silently flipped HIGH, producing shadow
+/// lookup mismatches for any pattern whose CS bits weren't already HIGH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Case {
     pub label: &'static str,
@@ -162,13 +174,19 @@ pub struct Case {
     /// 23 → fits in u32); Stage 3 widens the bus interface so this
     /// value can flow through to the GPIO atomic without an assertion.
     pub pin_pattern: u64,
+    /// When `true`, the stim composer drives `pin_pattern` verbatim
+    /// (no `deasserted_high_during_read` overlay). When `false`, the
+    /// composer ORs the deasserted-high pins onto `pin_pattern`. See
+    /// the struct-level docstring for the rationale.
+    pub is_literal: bool,
 }
 
 impl Case {
     /// Build a case from a chip-internal address by permuting bit `i`
     /// of `addr` onto `spec.addr_pins[i]`. The resulting `pin_pattern`
     /// captures only the address bits — chip-select levels are added
-    /// later by the oracle's stim composition (HLD §4.4).
+    /// later by the oracle's stim composition (HLD §4.4). `is_literal`
+    /// is `false`, so the composer applies the deasserted-high overlay.
     pub fn from_addr(label: &'static str, addr: u32, spec: &FixtureSpec) -> Self {
         let mut pat = 0u64;
         for (bit, &gpio) in spec.addr_pins.iter().enumerate() {
@@ -179,17 +197,22 @@ impl Case {
         Case {
             label,
             pin_pattern: pat,
+            is_literal: false,
         }
     }
 
-    /// Build a case that drives `pin_pattern` directly. Caller is
-    /// responsible for the pin map; used by larger-than-default fixtures
-    /// (e.g. the 256 KiB SeaBIOS validator) that enumerate every 16-bit
-    /// GPIO pattern verbatim.
+    /// Build a case that drives `pin_pattern` directly with NO
+    /// `deasserted_high_during_read` overlay applied during stim
+    /// composition. The caller owns the entire pin map (including CS
+    /// levels). Used by larger-than-default fixtures (e.g. the 256 KiB
+    /// SeaBIOS validator) that enumerate every 16-bit GPIO pattern
+    /// verbatim and rely on the shadow lookup matching `pin_pattern`
+    /// exactly.
     pub const fn from_raw(label: &'static str, pin_pattern: u64) -> Self {
         Case {
             label,
             pin_pattern,
+            is_literal: true,
         }
     }
 }
@@ -414,24 +437,28 @@ impl ServingOracle {
         // External-input mask covers gate CS (cs1 today on fire-24-a),
         // every deasserted-high CS pin, every asserted-low pin, and all
         // address pins. Data pins are PIO-driven; never mask them.
-        // fire-32-a (Stage 3) will widen the bus to u64; today we assert
-        // that no fixture uses GPIOs >= 32 to make the Stage 3 follow-up
-        // loud.
-        let ext_mask: u64 = self.compose_ext_mask();
-        debug_assert!(
-            ext_mask >> 32 == 0,
-            "ext_mask uses GPIOs >= 32; widen Bus interface for fire-32-a (Stage 3)"
-        );
+        // fire-32-a uses GPIOs ≥ 32 (A0=GPIO34, A1=GPIO33, A2=GPIO32),
+        // so the mask is split into low (GPIO 0..31) and high (GPIO
+        // 32..47) halves and applied to both `Bus::gpio_external_*`
+        // and `Bus::gpio_external_*_hi` (Stage 3A wide-GPIO support;
+        // HLD §A). When `case.is_literal`, the mask widens to every
+        // low-16 bit minus the data pins so SeaBIOS-validator-style
+        // raw sweeps drive their full pin pattern through to the
+        // firmware (matches the Stage 1 baseline `0x0000_FFFF`).
+        let ext_mask: u64 = self.compose_ext_mask(&case);
         emu.bus.gpio_external_mask = ext_mask as u32;
+        emu.bus.gpio_external_mask_hi = (ext_mask >> 32) as u32;
 
         // 1. init seed (first call only). Drive the gate CS + every
         //    deasserted-high CS pin high.
         if !self.seed_done {
             let seed_level: u64 = self.compose_seed_level();
-            debug_assert!(seed_level >> 32 == 0, "seed_level uses GPIOs >= 32");
             emu.bus
                 .gpio_external_in
                 .store(seed_level as u32, Ordering::Relaxed);
+            emu.bus
+                .gpio_external_in_hi
+                .store((seed_level >> 32) as u32, Ordering::Relaxed);
             self.tick_cycles(emu, glue, SEED_CYCLES);
             self.seed_done = true;
         }
@@ -449,19 +476,23 @@ impl ServingOracle {
         // short fixed-duration gap is sufficient to seed CS-high before
         // stimulus.
         let gap_level: u64 = self.compose_gap_level();
-        debug_assert!(gap_level >> 32 == 0, "gap_level uses GPIOs >= 32");
         emu.bus
             .gpio_external_in
             .store(gap_level as u32, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in_hi
+            .store((gap_level >> 32) as u32, Ordering::Relaxed);
         self.tick_cycles(emu, glue, GAP_CYCLES);
 
         // 3. cs_assert: apply the case stimulus.
-        let stim_level: u64 = self.compose_stim_level(case.pin_pattern);
-        debug_assert!(stim_level >> 32 == 0, "stim_level uses GPIOs >= 32");
+        let stim_level: u64 = self.compose_stim_level(&case);
         let expected_pin_bits: u16 = (stim_level & 0xFFFF) as u16;
         emu.bus
             .gpio_external_in
             .store(stim_level as u32, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in_hi
+            .store((stim_level >> 32) as u32, Ordering::Relaxed);
 
         // Snapshot the push counter *before* stimulus-time ticks.
         // The observation loop records ch1_pushes as a delta relative
@@ -521,6 +552,9 @@ impl ServingOracle {
                 emu.bus
                     .gpio_external_in
                     .store(gap_level as u32, Ordering::Relaxed);
+                emu.bus
+                    .gpio_external_in_hi
+                    .store((gap_level >> 32) as u32, Ordering::Relaxed);
 
                 self.results.push(apply_envelope(result));
                 return self.results.last().unwrap();
@@ -536,6 +570,9 @@ impl ServingOracle {
         emu.bus
             .gpio_external_in
             .store(gap_level as u32, Ordering::Relaxed);
+        emu.bus
+            .gpio_external_in_hi
+            .store((gap_level >> 32) as u32, Ordering::Relaxed);
 
         self.results.push(apply_envelope(result));
         self.results.last().unwrap()
@@ -787,7 +824,30 @@ impl ServingOracle {
     /// Combined external-input mask covering the gate CS, every
     /// deasserted-high CS pin, every asserted-low pin, and every
     /// address pin. Data pins are PIO-driven and excluded.
-    fn compose_ext_mask(&self) -> u64 {
+    ///
+    /// When `case.is_literal` (the SeaBIOS-validator-style sweep that
+    /// drives every 16-bit GPIO pattern verbatim), the mask widens to
+    /// every low-16 bit minus the data pins: the caller owns every
+    /// non-data pin and the bus must let those bits through to the
+    /// firmware. The narrow per-spec mask only covers `addr_pins ∪
+    /// CS-gates`, which silently truncates literal patterns whose bits
+    /// fall outside that set (e.g. fire-24-a literal sweep bits 8 + 9,
+    /// which are not address pins but are not data pins either). The
+    /// truncation matches the Stage 1 baseline `0x0000_FFFF` mask used
+    /// by the legacy `seabios_fixture_byte_correct` path. Companion to
+    /// the `case.is_literal` short-circuit in `compose_stim_level`.
+    fn compose_ext_mask(&self, case: &Case) -> u64 {
+        if case.is_literal {
+            // Literal: drive all low-16 bits except the data pins (which
+            // are firmware outputs). The data-pin mask covers the 8
+            // contiguous data pins from `spec.data_pins[0]`. fire-24-a:
+            // data_pins[0] = 16 → data_mask = 0x00FF_0000, literal mask =
+            // 0xFFFF (no data pins in low-16, matches Stage 1 baseline).
+            // fire-32-a: data_pins[0] = 0 → data_mask = 0xFF, literal
+            // mask = 0xFF00 (covers high 8 of low-16).
+            let data_mask: u64 = 0xFFu64 << self.spec.data_pins[0];
+            return 0x0000_FFFFu64 & !data_mask;
+        }
         let mut mask: u64 = 1u64 << self.spec.cs1;
         for &p in &self.spec.deasserted_high_during_read {
             mask |= 1u64 << p;
@@ -802,19 +862,31 @@ impl ServingOracle {
     }
 
     /// Init seed level. Same shape as the gap level: gate CS high +
-    /// every deasserted-high CS pin high. (Asserted-low pins stay LOW
-    /// — they're driven low during reads, so the init seed leaves them
-    /// in their inactive state which is "not driven" / 0.)
+    /// every deasserted-high CS pin high + every `unservable_when_high`
+    /// bit driven HIGH (so an address-aliased gate like fire-32-a's CS2
+    /// is actively deasserted during seed). Asserted-low pins stay LOW
+    /// — driven low during reads, so the seed leaves them in their
+    /// inactive state which is "not driven" / 0.
     fn compose_seed_level(&self) -> u64 {
         let mut level: u64 = 1u64 << self.spec.cs1;
         for &p in &self.spec.deasserted_high_during_read {
             level |= 1u64 << p;
         }
+        // Drive any address-aliased gate HIGH so the chip is deselected
+        // during seed. fire-24-a: a no-op (bit 13 already set above —
+        // `unservable_when_high == 1 << cs1`). fire-32-a: sets bit 16
+        // (CS2 = A16) HIGH, which is the actual gate on that pin map
+        // (HLD §5.1).
+        level |= self.spec.unservable_when_high;
         level
     }
 
-    /// Gap-level (CS-high, addr=0, asserted-low pins LEFT high so the
-    /// chip is fully deselected during the inter-case quiet period).
+    /// Gap-level: chip deselected, asserted-low pins LEFT HIGH so the
+    /// chip stays fully deselected during the inter-case quiet period.
+    /// Also drives `unservable_when_high` bits HIGH so an address-
+    /// aliased gate (fire-32-a's CS2 on A16 — HLD §5.1) sees a clean
+    /// HIGH between cases. fire-24-a's gate (CS1=GPIO13) is already in
+    /// `unservable_when_high`, so the OR-in is a no-op there.
     fn compose_gap_level(&self) -> u64 {
         let mut level: u64 = 1u64 << self.spec.cs1;
         for &p in &self.spec.deasserted_high_during_read {
@@ -823,6 +895,8 @@ impl ServingOracle {
         for &p in &self.spec.asserted_low_during_read {
             level |= 1u64 << p;
         }
+        // See `compose_seed_level` for why we OR in unservable_when_high.
+        level |= self.spec.unservable_when_high;
         level
     }
 
@@ -832,7 +906,17 @@ impl ServingOracle {
     /// only), and the case's `pin_pattern` ORed in for the address bus.
     /// Note that the gate CS staying LOW is the desired behaviour: the
     /// stim composition does NOT set bit `cs1`.
-    fn compose_stim_level(&self, case_pattern: u64) -> u64 {
+    ///
+    /// When `case.is_literal` is `true`, the deasserted-high overlay is
+    /// skipped and `case.pin_pattern` is returned verbatim — the caller
+    /// owns every pin level. This is the SeaBIOS-validator path: it
+    /// sweeps every 16-bit GPIO pattern, so the shadow lookup
+    /// `chunk[pin_state]` only matches the served byte if the bus
+    /// actually carries `pin_state` and not `pin_state | overlay`.
+    fn compose_stim_level(&self, case: &Case) -> u64 {
+        if case.is_literal {
+            return case.pin_pattern;
+        }
         let mut level: u64 = 0;
         for &p in &self.spec.deasserted_high_during_read {
             level |= 1u64 << p;
@@ -840,7 +924,7 @@ impl ServingOracle {
         // Asserted-low pins stay LOW during stim (they're the active-
         // assertion pins for reads — driving them high would deselect
         // the chip). They're already 0 in `level`.
-        level | case_pattern
+        level | case.pin_pattern
     }
 }
 
@@ -1308,6 +1392,150 @@ mod tests {
                 label, addr_bits, new_case.pin_pattern as u32, legacy_level
             );
         }
+    }
+
+    /// Stage 2.5 fix: a `Case::from_raw` (literal) case must NOT have
+    /// the `deasserted_high_during_read` overlay applied during stim
+    /// composition. The SeaBIOS validator drives every 16-bit GPIO
+    /// pattern verbatim and asserts `observed == chunk[pin_state]`; if
+    /// the composer ORs `(1<<12) | (1<<15) = 0x9000` in for fire-24-a,
+    /// the bus carries `pin_state | 0x9000` and the shadow lookup
+    /// `chunk[pin_state]` mismatches.
+    ///
+    /// fire-24-a's `deasserted_high_during_read` is `[12, 15]` (CS2 on
+    /// GPIO12 and CS3 on GPIO15). We pick `pin_state = 0x0800` (A11=1,
+    /// no overlap with the overlay bits). With the literal short-circuit
+    /// in place, `compose_stim_level` returns exactly `0x0800` — without
+    /// it, the legacy code path would return `0x9800`.
+    #[test]
+    fn compose_stim_level_literal_pattern_skips_overlay() {
+        let spec = fire24a_spec();
+        // Sanity: the fixture really does have these overlay pins, so
+        // the test exercises a real difference.
+        assert_eq!(spec.deasserted_high_during_read, vec![12, 15]);
+
+        let oracle = ServingOracle::new_with_shadow(spec, empty_shadow());
+        let case = Case::from_raw("test", 0x0800);
+        let level = oracle.compose_stim_level(&case);
+        assert_eq!(
+            level, 0x0800,
+            "literal `Case::from_raw` must drive `pin_pattern` verbatim — \
+             expected 0x0800, got 0x{:04X} (overlay leaked: 0x{:04X})",
+            level,
+            level & !0x0800u64
+        );
+    }
+
+    /// Stage 2.5 fix: the `Case::from_addr` (non-literal) path must
+    /// continue to apply the `deasserted_high_during_read` overlay.
+    /// This guards against the literal short-circuit accidentally
+    /// firing for from_addr cases. fire-24-a's address-mode `0x1800`
+    /// (A11=1, A12=1) permutes through `addr_pins` to set bits 12 and
+    /// 15 — which happen to be exactly the deasserted-high overlay
+    /// pins, so the OR-in is a value-level no-op for this address. We
+    /// assert the result is `(1<<12) | (1<<15) = 0x9000` either way.
+    #[test]
+    fn compose_stim_level_from_addr_keeps_overlay() {
+        let spec = fire24a_spec();
+        assert_eq!(spec.deasserted_high_during_read, vec![12, 15]);
+
+        let oracle = ServingOracle::new_with_shadow(spec.clone(), empty_shadow());
+        let case = Case::from_addr("test", 0x1800, &spec);
+        // 0x1800 has A11=A12=1; under fire-24-a's addr_pins map
+        // `[7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12]` that places
+        // A11 (bit 11) → GPIO15 and A12 (bit 12) → GPIO12, giving
+        // pin_pattern = (1<<15) | (1<<12) = 0x9000.
+        assert_eq!(
+            case.pin_pattern, 0x9000,
+            "fire-24-a addr 0x1800 must permute to GPIOs 12+15"
+        );
+
+        let level = oracle.compose_stim_level(&case);
+        assert_eq!(
+            level, 0x9000,
+            "from_addr stim composition: pin_pattern (0x9000) | overlay \
+             (0x9000) = 0x9000 — the overlay must apply, even when its \
+             contribution is value-equal to the address bits"
+        );
+
+        // Stronger check: even after clearing the overlay-shared bits
+        // from `pin_pattern`, the composer still drives them HIGH via
+        // the overlay. Build a synthetic from_addr-style case with
+        // pin_pattern = 0 and confirm the overlay alone fills bits
+        // 12 + 15.
+        let bare = Case {
+            label: "bare",
+            pin_pattern: 0,
+            is_literal: false,
+        };
+        let bare_level = oracle.compose_stim_level(&bare);
+        assert_eq!(
+            bare_level, 0x9000,
+            "non-literal case with empty pin_pattern must still see the \
+             deasserted-high overlay"
+        );
+    }
+
+    /// Stage 2.5 second fix: a `Case::from_raw` (literal) case must
+    /// widen `compose_ext_mask` to every low-16 bit minus the data
+    /// pins. The narrow per-spec mask only covers `addr_pins ∪
+    /// CS-gates`, which silently truncates literal patterns whose bits
+    /// fall outside that set (e.g. fire-24-a literal sweep bits 8 + 9
+    /// — not address pins, not data pins, but still part of the
+    /// 16-bit sweep that the SeaBIOS validator drives). The Stage 1
+    /// baseline mask was `0x0000_FFFF` (data pins shadowed by
+    /// `GPIO_DATA_MASK` afterwards); this fix preserves that for
+    /// fire-24-a where data pins live above the low-16, and for
+    /// fire-32-a (data pins at GPIO 0..7) widens to `0xFF00`.
+    #[test]
+    fn compose_ext_mask_literal_returns_wide_mask_minus_data_pins() {
+        let spec = fire24a_spec();
+        // Sanity: fire-24-a's data pins live above the low-16, so the
+        // literal mask collapses to the full low-16.
+        assert_eq!(spec.data_pins[0], 16);
+
+        let oracle = ServingOracle::new_with_shadow(spec, empty_shadow());
+        let case = Case::from_raw("test", 0);
+        let mask = oracle.compose_ext_mask(&case);
+        assert_eq!(
+            mask, 0x0000_FFFF,
+            "literal mask for fire-24-a (data pins at GPIO 16+) must be the \
+             full low-16 — matches the Stage 1 baseline `0x0000_FFFF`"
+        );
+    }
+
+    /// Stage 2.5 second fix: the `Case::from_addr` (non-literal) path
+    /// must continue to return the narrow mask covering `addr_pins ∪
+    /// CS-gates`. This guards against the literal short-circuit
+    /// accidentally firing for from_addr cases.
+    #[test]
+    fn compose_ext_mask_from_addr_returns_narrow_mask() {
+        let spec = fire24a_spec();
+        let oracle = ServingOracle::new_with_shadow(spec.clone(), empty_shadow());
+        let case = Case::from_addr("test", 0, &spec);
+        let mask = oracle.compose_ext_mask(&case);
+
+        // Build the expected narrow mask from the spec: cs1 +
+        // deasserted_high + asserted_low + addr_pins.
+        let mut expected: u64 = 1u64 << spec.cs1;
+        for &p in &spec.deasserted_high_during_read {
+            expected |= 1u64 << p;
+        }
+        for &p in &spec.asserted_low_during_read {
+            expected |= 1u64 << p;
+        }
+        for &p in &spec.addr_pins {
+            expected |= 1u64 << p;
+        }
+        assert_eq!(
+            mask, expected,
+            "from_addr mask must cover addr_pins ∪ CS-gates exactly"
+        );
+        // The narrow mask must NOT include the literal-path-only bits
+        // (fire-24-a bits 8 + 9 are neither address pins nor CS gates
+        // nor data pins; the literal path widens to capture them).
+        assert_eq!(mask & (1u64 << 8), 0, "bit 8 must not appear in the narrow mask");
+        assert_eq!(mask & (1u64 << 9), 0, "bit 9 must not appear in the narrow mask");
     }
 
     /// 2. Happy-path PASS: push at cycle 5, stable 0x42 from cycle 12 for 3 cycles.

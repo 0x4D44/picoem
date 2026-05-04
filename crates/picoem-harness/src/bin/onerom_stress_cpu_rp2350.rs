@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use picoem_harness::onerom_fixture::{FixtureSpec, lift_shadow_from_flash};
 use picoem_harness::{
-    onerom_serving_oracle::{Case, CaseResult, Verdict},
+    onerom_serving_oracle::{CaseResult, Verdict},
     onerom_serving_oracle_cpu::{self, CpuCaseResult, CpuServingOracle, CpuVerdict},
     onerom_stress,
 };
@@ -352,8 +352,10 @@ fn cpu_to_pio_result(cpu: &CpuCaseResult) -> CaseResult {
     };
     CaseResult {
         // Reuse the CPU case verbatim — Case is the same type on both
-        // oracles (PIO and CPU).
-        case: Case::from_raw(cpu.case.label, cpu.case.pin_pattern),
+        // oracles (PIO and CPU). Direct copy preserves the
+        // `is_literal` flag (Stage 2.5 fix), which would be lost by a
+        // `Case::from_raw(...)` rewrap that always sets it `true`.
+        case: cpu.case,
         resolved_addr: None,
         expected_byte: cpu.expected_byte,
         observed_byte: cpu.observed_byte,

@@ -16,7 +16,7 @@ categories = ["emulators", "embedded", "command-line-utilities"]
 workspace = true
 
 [dependencies]
-rp2350-emu = { version = "0.1", path = "../rp2350-emu", features = ["threading"] }
+rp2350-emu = { version = "0.2", path = "../rp2350-emu", features = ["threading"] }
 ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"
