@@ -175,7 +175,8 @@ fn boot_sync(
     // Up-front shadow-lift sanity check: confirm the hardcoded ROM set
     // parses out of the fixture. None here is a loud early signal that
     // the fixture / ROM_SET_INDEX pair is wrong.
-    if picoem_harness::onerom_fixture::lift_shadow_from_flash(flash, ROM_SET_INDEX, spec).is_none() {
+    if picoem_harness::onerom_fixture::lift_shadow_from_flash(flash, ROM_SET_INDEX, spec).is_none()
+    {
         return Err(format!(
             "failed to lift ROM set {} from fixture — wrong index or malformed flash",
             ROM_SET_INDEX

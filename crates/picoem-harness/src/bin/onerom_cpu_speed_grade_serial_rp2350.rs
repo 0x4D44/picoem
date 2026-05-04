@@ -201,11 +201,11 @@ fn boot_sync(bootrom: &[u8], flash: &[u8], spec: &FixtureSpec) -> Result<Emulato
         .bus
         .memory
         .sram_read8(RUNTIME_INFO_SRAM_OFF + ROM_SET_INDEX_OFFSET);
-    let sentinel: Option<(u32, u8)> =
-        match lift_shadow_from_flash(flash, rom_set_index_live, spec) {
-            Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
-            None => None,
-        };
+    let sentinel: Option<(u32, u8)> = match lift_shadow_from_flash(flash, rom_set_index_live, spec)
+    {
+        Some(shadow) => onerom_serving_oracle_cpu::find_shadow_sentinel(&shadow),
+        None => None,
+    };
 
     // Phase 2: PC + sentinel.
     let sentinel_ok = |emu: &Emulator| match sentinel {

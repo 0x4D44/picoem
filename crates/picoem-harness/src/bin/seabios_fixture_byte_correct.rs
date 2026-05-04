@@ -426,11 +426,7 @@ const PROBE_CS1_NUM_CASES: usize = 256;
 /// seeded random pin states with CS1=high on rom_set 1 (chunk 1 has
 /// varied non-zero content, so any silent OEN-asserts-with-zero-output
 /// firmware bug would be visible). Reports verdict distribution.
-fn run_probe_cs1_thorough(
-    flash: &[u8],
-    spec: &FixtureSpec,
-    seabios: &[u8],
-) -> Result<(), String> {
+fn run_probe_cs1_thorough(flash: &[u8], spec: &FixtureSpec, seabios: &[u8]) -> Result<(), String> {
     const ROM_SET_INDEX: u32 = 1;
 
     println!(
@@ -483,8 +479,7 @@ fn run_probe_cs1_thorough(
 
     for _ in 0..PROBE_CS1_NUM_CASES {
         let pin_state = lcg_next(&mut state) | cs1_mask;
-        let case =
-            onerom_serving_oracle::Case::from_raw("probe-cs1", pin_state as u64);
+        let case = onerom_serving_oracle::Case::from_raw("probe-cs1", pin_state as u64);
         let result = oracle.run_case(&mut emu, case);
         match result.verdict {
             CpuVerdict::Pass => {

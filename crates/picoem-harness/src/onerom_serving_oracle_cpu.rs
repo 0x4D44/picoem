@@ -308,8 +308,7 @@ impl CpuServingOracle {
             // bus's `update_gpio` merge. Data bits are CPU-driven so
             // they reflect whatever the CPU's STRB has pushed via
             // SIO_GPIO_OUT.
-            let data_byte =
-                ((emu.bus.gpio_in.load(Ordering::Relaxed) >> data_base) & 0xFF) as u8;
+            let data_byte = ((emu.bus.gpio_in.load(Ordering::Relaxed) >> data_base) & 0xFF) as u8;
 
             if let Some(d) = observe_tick(&mut state, tick, oe_data, data_byte) {
                 decision = Some(d);
@@ -1047,8 +1046,8 @@ mod tests {
 
     fn fire24a_spec() -> FixtureSpec {
         let p = fire24a_fixture_path();
-        let flash = std::fs::read(&p)
-            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
+        let flash =
+            std::fs::read(&p).unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
         FixtureSpec::from_flash(&flash).expect("fire-24-a parse must succeed")
     }
 

@@ -51,10 +51,26 @@ binaries are produced from the OneROM source tree as the project
 evolves. See the OneROM HLD documents under `wrk_docs/` for build
 provenance.
 
+`onerom-fire-32-a-rp2350-seabios.bin` is the fire-32-a RP2350 PIO-serve
+SeaBIOS fixture used by `seabios32_fixture_byte_correct`. It was generated
+locally from the OneROM `fire-32-a` RP2350 pipeline with the JSON config
+`sources/seabios-32-27c020.json` and the source BIOS image
+`sources/seabios-256k.bin`; see
+`wrk_journals/2026.05.04 - JRN - Fire-32-a SeaBIOS Firmware Build.md` and
+`wrk_docs/2026.05.04 - HLD - OneROM Serving Oracle Fixture Generalization.md`
+for the reproduction recipe and pin-map notes.
+
+| File | Role | SHA-256 |
+|---|---|---|
+| `onerom-fire-32-a-rp2350-seabios.bin` | Generated fire-32-a PIO-serve 27C020 fixture | `3fb7cb6f85ad371a483a4bbaa6597f29a36c58de6fdac928bf4843789e266c00` |
+| `sources/seabios-32-27c020.json` | OneROM source config used to generate the fixture | `7c00bc8b559024779e6f18140cadfaa692449fd7f8c58642ef2151eefd3e3ccf` |
+| `sources/seabios-256k.bin` | Source SeaBIOS image referenced by the JSON config | `ae6f6aa973aaccc143f57aa960fb035fd9de4daee4ad0cd713322f8c259e7650` |
+
 ## SeaBIOS image (`sources/seabios-256k.bin`)
 
 `sources/seabios-256k.bin` is a 256 KiB SeaBIOS x86 BIOS binary used by
-`build_seabios_fixture` to author `onerom-fire-24-a-rp2350-seabios-cpu.bin`.
+`build_seabios_fixture` to author `onerom-fire-24-a-rp2350-seabios-cpu.bin`
+and by the fire-32-a 27C020 config above.
 SeaBIOS is open-source firmware (LGPLv3) maintained at
 https://github.com/coreboot/seabios. The byte-identical copy lives in
 mddosem at `assets/roms/bios-256k.bin`; see the journal

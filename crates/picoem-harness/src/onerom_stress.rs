@@ -495,8 +495,8 @@ mod tests {
 
     fn fire24a_spec() -> FixtureSpec {
         let p = fire24a_fixture_path();
-        let flash = std::fs::read(&p)
-            .unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
+        let flash =
+            std::fs::read(&p).unwrap_or_else(|e| panic!("read {} failed: {}", p.display(), e));
         FixtureSpec::from_flash(&flash).expect("fire-24-a parse must succeed")
     }
 

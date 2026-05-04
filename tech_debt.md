@@ -1236,18 +1236,6 @@ design for Phase 4 and documented in the relevant DMA module.
   `crates/mdrp2350/src/bus/peripherals.rs:194` warn-once
   "CLOCKS CLK_*_CTRL.ENABLE cleared; clock-gate behaviour not modelled".
 
-### `Verdict::ResolvedAddrOutOfRange` unreachable at runtime
-
-In `crates/mdpicoem-harness/src/onerom_serving_oracle.rs`, the stim-pattern
-predicate already restricts resolved addresses to `hi16 == 0x2000` before
-the `SHADOW_BASE..SHADOW_BASE + SHADOW_SIZE` bounds check runs. With
-`SHADOW_SIZE = 0x1_0000` the shadow spans the full u16 low-half, so every
-stim-matching push is architecturally in-range and the
-`Verdict::ResolvedAddrOutOfRange` arm cannot fire. The variant is kept
-intentionally as a belt-and-braces guard: if a future shrink of
-`SHADOW_SIZE` drops below `0x1_0000`, the check catches the regression
-instead of indexing past the shadow. Document-only; no code change.
-
 ### `CpuServingOracle` pin map is hardcoded (blocks CPU-mode stress on non-`test-sdrr-0` fixtures)
 
 In `crates/mdpicoem-harness/src/onerom_serving_oracle_cpu.rs`, `run_case`

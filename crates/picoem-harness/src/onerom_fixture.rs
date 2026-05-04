@@ -367,7 +367,9 @@ impl FixtureSpec {
                 .try_into()
                 .map_err(|_| FixtureError::Truncated)?,
         );
-        let pins_off = (pins_ptr.checked_sub(FLASH_BASE).ok_or(FixtureError::Truncated)?) as usize;
+        let pins_off = (pins_ptr
+            .checked_sub(FLASH_BASE)
+            .ok_or(FixtureError::Truncated)?) as usize;
         if flash.len() < pins_off + SDRR_PINS_STRUCT_SIZE {
             return Err(FixtureError::Truncated);
         }
@@ -419,9 +421,11 @@ impl FixtureSpec {
         //    where the high pins of fire-32-a live (matching the
         //    canonical generator output and `sdrr-info -d`).
         let mut addr_pins: Vec<u8> = Vec::with_capacity(32);
-        let scan = |slice_off: usize, len: usize, label: fn(usize) -> &'static str, sink: &mut Vec<u8>|
-            -> Result<bool, FixtureError>
-        {
+        let scan = |slice_off: usize,
+                    len: usize,
+                    label: fn(usize) -> &'static str,
+                    sink: &mut Vec<u8>|
+         -> Result<bool, FixtureError> {
             for ii in 0..len {
                 let pin = pins[slice_off + ii];
                 if pin == INVALID_PIN {
@@ -579,9 +583,22 @@ fn addr_field_name(ii: usize) -> &'static str {
 
 fn addr2_field_name(ii: usize) -> &'static str {
     const NAMES: [&str; 16] = [
-        "addr2[0]", "addr2[1]", "addr2[2]", "addr2[3]", "addr2[4]", "addr2[5]", "addr2[6]",
-        "addr2[7]", "addr2[8]", "addr2[9]", "addr2[10]", "addr2[11]", "addr2[12]", "addr2[13]",
-        "addr2[14]", "addr2[15]",
+        "addr2[0]",
+        "addr2[1]",
+        "addr2[2]",
+        "addr2[3]",
+        "addr2[4]",
+        "addr2[5]",
+        "addr2[6]",
+        "addr2[7]",
+        "addr2[8]",
+        "addr2[9]",
+        "addr2[10]",
+        "addr2[11]",
+        "addr2[12]",
+        "addr2[13]",
+        "addr2[14]",
+        "addr2[15]",
     ];
     NAMES[ii]
 }

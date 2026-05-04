@@ -155,17 +155,9 @@ impl PioAddressShape {
             .copied()
             .max()
             .expect("fixture must provide at least one address pin");
-        let gpio_base = match spec.chip_pins {
-            24 => 0,
-            32 => {
-                assert!(
-                    max_gpio >= 32,
-                    "fire-32-style fixture address pins must include the high PIO window"
-                );
-                16
-            }
-            other => panic!("unsupported OneROM chip pin count for PIO address shape: {other}"),
-        };
+        // Pick the RP2350 PIO GPIOBASE window from the address pins
+        // themselves, then reject layouts that cross that single window.
+        let gpio_base = if max_gpio >= 32 { 16 } else { 0 };
 
         for &pin in &spec.addr_pins {
             assert!(
@@ -1699,6 +1691,31 @@ mod tests {
                 gpio_base: 16,
                 pin_count: 19,
             }
+        );
+    }
+
+    #[test]
+    fn pio_address_shape_derives_from_addr_pins_not_chip_pins() {
+        let mut low_window = fire24a_spec();
+        low_window.chip_pins = 32;
+        assert_eq!(
+            PioAddressShape::from_fixture(&low_window),
+            PioAddressShape {
+                gpio_base: 0,
+                pin_count: 16,
+            },
+            "low physical address pins must stay in GPIOBASE 0 regardless of chip footprint"
+        );
+
+        let mut high_window = fire32a_spec();
+        high_window.chip_pins = 24;
+        assert_eq!(
+            PioAddressShape::from_fixture(&high_window),
+            PioAddressShape {
+                gpio_base: 16,
+                pin_count: 19,
+            },
+            "high physical address pins must select GPIOBASE 16 regardless of chip footprint"
         );
     }
 

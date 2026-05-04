@@ -263,7 +263,10 @@ fn main() -> ExitCode {
         }
     };
     let shadow_size = spec.shadow_size;
-    println!("template fixture: {} ({}-pin), shadow_size=0x{:X}", spec.label, spec.chip_pins, shadow_size);
+    println!(
+        "template fixture: {} ({}-pin), shadow_size=0x{:X}",
+        spec.label, spec.chip_pins, shadow_size
+    );
 
     let layout = match parse_rom_set_layout(&fixture) {
         Some(v) => v,
