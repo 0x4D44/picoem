@@ -20,11 +20,20 @@ cp -f target/release/qemu_diff_m0plus.exe "$BIN" || {
 }
 trap 'rm -f "$BIN"' EXIT
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  NOW=$(date +%s)
+  REMAINING=$(( DEADLINE - NOW ))
+  # If we have less than a minute left, don't start a new batch — a
+  # full --fuzz 50000 run takes well over an hour and would overrun
+  # the deadline by a large margin (mirrors run-test-silicon.sh).
+  if [ "$REMAINING" -lt 60 ]; then
+    echo "=== M0+ only ${REMAINING}s left, skipping last batch ===" >> "$LOG"
+    break
+  fi
   BATCH=$((BATCH+1))
   SEED="$RANDOM$RANDOM$RANDOM"
   {
     echo ""
-    echo "=== M0+ batch=$BATCH seed=$SEED start=$(date -Iseconds) ==="
+    echo "=== M0+ batch=$BATCH seed=$SEED remaining=${REMAINING}s start=$(date -Iseconds) ==="
   } >> "$LOG"
   "$BIN" \
     --fuzz 50000 --seed "$SEED" >> "$LOG" 2>&1
