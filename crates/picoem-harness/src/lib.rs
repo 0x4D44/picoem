@@ -8163,6 +8163,426 @@ mod tests {
         // Random non-subset wide encoding.
         assert!(!m0plus_admits_wide(0xF000, 0x0000));
     }
+
+    // ----------------------------------------------------------------------
+    // Stage 5 — compare_probe / compare_fpu_into residue branches.
+    //
+    // These cover the success arms (mismatch=false) of the per-register
+    // diff lines at lib.rs:5961 (R0..=R12), :5970 (SP), :5978 (LR),
+    // :5986 (PC), :5997 (xPSR), :6003 (MEM), the FPU bounds-check at
+    // :5918, the FPSCR-zero-mask early exit at :5926, and the FPU/Bus
+    // R11/R12 skip continue at :5958. Each test isolates one branch arm
+    // so the partner case (already in the file above) lights up the
+    // opposite path.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn compare_probe_skips_r11_r12_for_fpu_test() {
+        // FPU tests must skip R11/R12 in compare_probe (these are scratch
+        // for the prelude/epilogue mechanism). Differing R11/R12 with an
+        // FPU test must NOT fail — exercises the `continue` arm of
+        // `if is_fpu && (i == 11 || i == 12)` at lib.rs:5958.
+        let tc = TestCase {
+            fpu_check: vec![0],
+            ..TestCase::default()
+        };
+        let mut hw_regs = base_regs_probe();
+        let mut emu_regs = base_regs_probe();
+        // Set R11 and R12 to wildly different values — would normally fail.
+        hw_regs[11] = 0xAAAA_AAAA;
+        emu_regs[11] = 0xBBBB_BBBB;
+        hw_regs[12] = 0xCCCC_CCCC;
+        emu_regs[12] = 0xDDDD_DDDD;
+        let hw = RunState {
+            regs: hw_regs,
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0x1234_5678],
+            fpscr: 0,
+        };
+        let emu = RunState {
+            regs: emu_regs,
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0x1234_5678],
+            fpscr: 0,
+        };
+        // R11/R12 diffs must be skipped because is_fpu_test(tc) is true.
+        assert!(
+            compare_probe(&tc, &hw, &emu).is_ok(),
+            "FPU test must ignore R11/R12 diffs",
+        );
+    }
+
+    #[test]
+    fn compare_probe_fpu_match_ok() {
+        // FPU registers match — compare_fpu_into should take the false
+        // arm of the `a.fpu[i] != b.fpu[i]` check at lib.rs:5918, leaving
+        // diffs empty.
+        let tc = TestCase {
+            fpu_check: vec![0, 1, 2],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let fpu_bits = vec![0x3F80_0000, 0x4000_0000, 0x4040_0000];
+        let hw = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: fpu_bits.clone(),
+            fpscr: 0,
+        };
+        let emu = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: fpu_bits,
+            fpscr: 0,
+        };
+        assert!(compare_probe(&tc, &hw, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_probe_fpu_bounds_check_skips_short_vec() {
+        // fpu_check declares 3 entries but each RunState only stores 1
+        // value. The bounds-check arms `i < a.fpu.len() && i < b.fpu.len()`
+        // at lib.rs:5918 must skip the indices that overflow rather than
+        // panic. Result: only the in-bounds entry is compared (and matches),
+        // so the compare succeeds.
+        let tc = TestCase {
+            fpu_check: vec![0, 1, 2],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let hw = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0xDEAD_BEEF],
+            fpscr: 0,
+        };
+        let emu = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![0xDEAD_BEEF],
+            fpscr: 0,
+        };
+        assert!(compare_probe(&tc, &hw, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_probe_fpscr_zero_mask_skips() {
+        // fpscr_mask = 0 — compare_fpu_into's `if tc.fpscr_mask != 0`
+        // arm at lib.rs:5926 takes the false branch. Mismatching FPSCR
+        // bytes must NOT cause a fail.
+        let tc = TestCase {
+            fpu_check: vec![],
+            fpscr_mask: 0,
+            ..TestCase::default()
+        };
+        let hw = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0xAAAA_AAAA,
+        };
+        let emu = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0x5555_5555,
+        };
+        assert!(
+            compare_probe(&tc, &hw, &emu).is_ok(),
+            "fpscr_mask=0 must skip FPSCR diff",
+        );
+    }
+
+    #[test]
+    fn compare_probe_fpscr_match_ok() {
+        // fpscr_mask non-zero, FPSCR bits match under mask → both arms
+        // of the inner `a_masked != b_masked` at lib.rs:5929 take false.
+        let tc = TestCase {
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            ..TestCase::default()
+        };
+        // Bits outside the mask differ but masked-equal.
+        let hw = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0xC123_4567,
+        };
+        let emu = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0xC0FE_DCBA,
+        };
+        assert!(compare_probe(&tc, &hw, &emu).is_ok());
+    }
+
+    #[test]
+    fn compare_probe_fpscr_mismatch_after_mask() {
+        // FPSCR differs under mask → diff appended via compare_fpu_into.
+        let tc = TestCase {
+            fpu_check: vec![],
+            fpscr_mask: 0xF000_0000,
+            ..TestCase::default()
+        };
+        let hw = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0xF000_0000,
+        };
+        let emu = RunState {
+            regs: base_regs_probe(),
+            xpsr: 0x0100_0000,
+            mem: vec![],
+            cycles: 0,
+            fpu: vec![],
+            fpscr: 0x0000_0000,
+        };
+        let err = compare_probe(&tc, &hw, &emu).unwrap_err();
+        assert!(
+            err.contains("FPSCR"),
+            "expected FPSCR diff in err: {err}",
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Stage 5 — generate_fuzz coverage of seldom-hit RNG arms.
+    //
+    // Several inner-match arms in `generate_fuzz_alu` / `generate_fuzz_mem`
+    // are reached only by specific RNG draws. A 1000-iteration fuzz with a
+    // fixed seed is deterministic and reliably exercises each of:
+    //   * `generate_fuzz_alu`  — MUL (op=13) → MASK_NZ_ONLY arm at :4341.
+    //   * `generate_fuzz_alu`  — IT-block "taken/skipped" ternary at :4504.
+    //   * `generate_fuzz_mem`  — register-loop early-exit guards at :4540 / :4546.
+    //   * `generate_fuzz_mem`  — `is_store` branches at :4583 / :4591 / :4626 / :4716.
+    //   * `generate_fuzz_mem`  — PUSH-with-LR arm at :4748 / :4754.
+    //   * `generate_fuzz_mem`  — STM defensive `reglist8 == 0` arm at :4841.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_alu_includes_mul_with_nz_only_mask() {
+        // Run a moderately large fuzz and assert that at least one DPROC
+        // case is op=13 (MUL) with xpsr_mask = MASK_NZ_ONLY. Drives the
+        // `if op == 13 { MASK_NZ_ONLY } else { MASK_ALL_FLAGS }` branch
+        // at lib.rs:4341 to cover both arms.
+        let buckets = generate_fuzz_classes(500, 0xC0FFEE);
+        let mut saw_nz_only = false;
+        let mut saw_all_flags_dproc = false;
+        for tc in &buckets.base_alu {
+            if !tc.name.starts_with("FUZZ:DPROC:") {
+                continue;
+            }
+            if tc.xpsr_mask == MASK_NZ_ONLY {
+                saw_nz_only = true;
+            }
+            if tc.xpsr_mask == MASK_ALL_FLAGS {
+                saw_all_flags_dproc = true;
+            }
+        }
+        assert!(saw_nz_only, "no MUL with MASK_NZ_ONLY found in 500 cases");
+        assert!(
+            saw_all_flags_dproc,
+            "no non-MUL DPROC with MASK_ALL_FLAGS found",
+        );
+    }
+
+    #[test]
+    fn fuzz_alu_it_block_includes_taken_and_skipped() {
+        // The IT-block fuzz path picks a random condition + xPSR pair, and
+        // the `taken / skipped` literal at lib.rs:4504 is selected by
+        // `cond_passes(cond, xpsr_pre)`. Verify both literals appear in
+        // case names over a large enough draw — exercises the ternary's
+        // true and false arms.
+        let buckets = generate_fuzz_classes(500, 0xCAFEFEED);
+        let it_cases: Vec<&TestCase> = buckets
+            .base_alu
+            .iter()
+            .filter(|tc| tc.name.contains("FUZZ:IT:"))
+            .collect();
+        let taken = it_cases
+            .iter()
+            .filter(|tc| tc.name.ends_with("(taken)"))
+            .count();
+        let skipped = it_cases
+            .iter()
+            .filter(|tc| tc.name.ends_with("(skipped)"))
+            .count();
+        assert!(taken > 0, "no IT cases with taken in 500 alu cases");
+        assert!(skipped > 0, "no IT cases with skipped in 500 alu cases");
+    }
+
+    #[test]
+    fn fuzz_mem_includes_push_with_lr() {
+        // PUSH cases are 50% of the mem-fuzz draw; with `lr` flipped at
+        // 30% via `coin(0.3)`. Exercise both arms of `if lr { reg_pre.push(...) }`
+        // at lib.rs:4754 plus the `+ if lr { 1 } else { 0 }` arm at :4748.
+        let buckets = generate_fuzz_classes(500, 0x12345);
+        let push_cases: Vec<&TestCase> = buckets
+            .base_mem
+            .iter()
+            .filter(|tc| tc.name.starts_with("FUZZ:PUSH:"))
+            .collect();
+        let with_lr = push_cases
+            .iter()
+            .filter(|tc| tc.name.contains("lr=true"))
+            .count();
+        let without_lr = push_cases
+            .iter()
+            .filter(|tc| tc.name.contains("lr=false"))
+            .count();
+        assert!(
+            with_lr > 0,
+            "no PUSH with lr=true in 500 mem cases (push cases: {})",
+            push_cases.len(),
+        );
+        assert!(without_lr > 0, "no PUSH without lr in 500 mem cases");
+    }
+
+    #[test]
+    fn fuzz_mem_includes_pop_pc_probe_only() {
+        // POP_PC variant (probe_only) is the third arm of the PUSH/POP
+        // dispatch. Reached at the `_ =>` fallthrough at lib.rs:4799.
+        let buckets = generate_fuzz_classes(500, 0xDEAD);
+        let pop_pc = buckets
+            .base_mem
+            .iter()
+            .filter(|tc| tc.name.starts_with("FUZZ:POP_PC:") && tc.probe_only)
+            .count();
+        assert!(pop_pc > 0, "no POP_PC probe_only in 500 mem cases");
+    }
+
+    #[test]
+    fn fuzz_mem_includes_lsreg_store_and_load() {
+        // LSREG cases dispatch by `opc` ∈ 0..7. Stores: opc ∈ {0,1,2}.
+        // Loads: opc ∈ {3..6}. Drives both arms of `let is_store = matches!(opc, 0..=2)`
+        // at lib.rs:4571 plus the inner store/load match arms at :4591.
+        let buckets = generate_fuzz_classes(300, 0xBEEF);
+        let lsreg: Vec<&TestCase> = buckets
+            .base_mem
+            .iter()
+            .filter(|tc| tc.name.starts_with("FUZZ:LSREG:"))
+            .collect();
+        // Store cases have a non-empty mem_check; load cases have a non-empty
+        // mem_pre. Confirm both populations appear.
+        let store_seen = lsreg
+            .iter()
+            .filter(|tc| !tc.mem_check.is_empty())
+            .count();
+        let load_seen = lsreg
+            .iter()
+            .filter(|tc| !tc.mem_pre.is_empty())
+            .count();
+        assert!(store_seen > 0, "no LSREG stores in 300 mem cases");
+        assert!(load_seen > 0, "no LSREG loads in 300 mem cases");
+    }
+
+    #[test]
+    fn fuzz_mem_includes_lsimm_store_and_load() {
+        // LSIMM dispatch has 6 variants — 3 stores (var ∈ {0,2,4}) and 3
+        // loads (var ∈ {1,3,5}). Exercise the `is_store = matches!(variant, 0|2|4)`
+        // branch at lib.rs:4709 + the per-variant assignment arms.
+        let buckets = generate_fuzz_classes(300, 0xACAB);
+        let lsimm: Vec<&TestCase> = buckets
+            .base_mem
+            .iter()
+            .filter(|tc| tc.name.starts_with("FUZZ:LSIMM:"))
+            .collect();
+        let stores = lsimm
+            .iter()
+            .filter(|tc| !tc.mem_check.is_empty())
+            .count();
+        let loads = lsimm
+            .iter()
+            .filter(|tc| !tc.mem_pre.is_empty())
+            .count();
+        assert!(stores > 0, "no LSIMM stores in 300 mem cases");
+        assert!(loads > 0, "no LSIMM loads in 300 mem cases");
+    }
+
+    #[test]
+    fn fuzz_mem_stm_invariant_excludes_base_register() {
+        // `gen_stm` clears the base reg out of `reglist8`; if the result
+        // is zero it falls back to `1 << ((rn+1) % 8)` (lib.rs:4841). The
+        // invariant: every STM case has a non-empty register list AND the
+        // base reg is never in that list.
+        let buckets = generate_fuzz_classes(200, 0xF00D);
+        let stm = buckets
+            .base_mem
+            .iter()
+            .filter(|tc| tc.name.starts_with("FUZZ:STM:"));
+        let mut count = 0usize;
+        for tc in stm {
+            count += 1;
+            // STM Rn!, {reglist8} — encoding form 1100_0_nnn_llllllll where
+            // bits[10:8] = rn, bits[7:0] = reglist. Verify rn is not in list.
+            let rn_bits = ((tc.opcode >> 8) & 0x7) as u32;
+            let reglist = (tc.opcode & 0xFF) as u32;
+            assert_ne!(reglist, 0, "STM with empty list: {}", tc.name);
+            assert_eq!(
+                reglist & (1 << rn_bits),
+                0,
+                "STM base reg in list: {} (rn={rn_bits}, list={reglist:#04x})",
+                tc.name,
+            );
+        }
+        assert!(count > 0, "no STM cases in 200 mem cases");
+    }
+
+    // ----------------------------------------------------------------------
+    // Stage 5 — run_one_emu_multistep through is_fpu_test boundaries.
+    // is_fpu_test is also exercised inside `compare()`, but we want a
+    // direct call coverage for both the empty-pre and the empty-check arms
+    // of `!fpu_pre.is_empty() || !fpu_check.is_empty()` at lib.rs:5551.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn is_fpu_test_or_short_circuits_on_pre() {
+        // fpu_pre non-empty, fpu_check empty → the `||` short-circuits on
+        // the LHS; covers both branches of the OR.
+        let tc = TestCase {
+            fpu_pre: vec![(0, 0)],
+            fpu_check: vec![],
+            ..TestCase::default()
+        };
+        assert!(is_fpu_test(&tc));
+    }
+
+    #[test]
+    fn is_fpu_test_or_falls_through_to_check() {
+        // fpu_pre empty, fpu_check non-empty → the LHS evaluates false;
+        // the RHS makes the `||` true. Both halves of the `||` are
+        // observed across this and the previous test.
+        let tc = TestCase {
+            fpu_pre: vec![],
+            fpu_check: vec![5],
+            ..TestCase::default()
+        };
+        assert!(is_fpu_test(&tc));
+    }
 }
 
 // ============================================================================

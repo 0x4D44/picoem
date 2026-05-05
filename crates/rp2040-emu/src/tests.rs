@@ -12314,3 +12314,581 @@ mod stage3_ppb_dma_branches {
         assert_eq!(bus.irq_pending() & (1u32 << IRQ_DMA_IRQ_0), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 4 v2: residual `lib.rs` branch coverage. Targets specific arms not
+// hit by the existing `stage4_lib_residue` / `stage5_lib_residue` modules
+// per the V2 coverage delta:
+//   * EmulatorBuilder validation arms (step_quantum saturation extremes,
+//     Threaded model on supported / unsupported builds)
+//   * Emulator::run / run_quantum / step early-exit arms (single-core
+//     halted, both halted, step_quantum=1 with cycles=0)
+//   * gpio_set / gpio_get accessors across the full 0..30 valid range
+//     and out-of-range (silently ignored)
+//   * inject_panic_for_testing for each WorkerName variant
+//   * load_image error / clamp arms (oversize, ROM offset boundaries)
+// Pure append-only; does not modify any production code.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_lib_residue_v2 {
+    use crate::{
+        Config, DEFAULT_STEP_QUANTUM, Emulator, EmulatorBuilder, ExecutionModel, ROM_SIZE,
+    };
+
+    // -----------------------------------------------------------------
+    // EmulatorBuilder configuration validation arms
+    // -----------------------------------------------------------------
+
+    /// `step_quantum(0)` must clamp up to 1 (regression: prior version
+    /// `debug_assert!`ed on 0 and silently advanced 0 cycles per
+    /// `step()` in release, an infinite-loop footgun for `run()`).
+    #[test]
+    fn builder_step_quantum_zero_clamps_and_steps_forward() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(0)
+            .build()
+            .expect("Serial build infallible");
+        assert_eq!(emu.step_quantum, 1);
+        // Must make progress (>= 1 master cycle), not loop forever.
+        let advanced = emu.step().unwrap();
+        assert!(advanced >= 1, "step_quantum=1 must advance at least 1");
+    }
+
+    /// `step_quantum(1)` is the smallest legal value; the builder
+    /// preserves it verbatim and `step()` returns within bounds.
+    #[test]
+    fn builder_step_quantum_one_minimum() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial build infallible");
+        assert_eq!(emu.step_quantum, 1);
+        let advanced = emu.step().unwrap();
+        assert!(advanced <= 4, "tiny quantum bounds advance");
+    }
+
+    /// `step_quantum(u32::MAX)` is the upper end of the saturation
+    /// path — passes through unchanged because there's no upper clamp.
+    /// Confirms the builder doesn't reject maximal quanta.
+    #[test]
+    fn builder_step_quantum_u32_max_passes_through() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(u32::MAX)
+            .build()
+            .expect("Serial build infallible");
+        assert_eq!(emu.step_quantum, u32::MAX);
+    }
+
+    /// Default builder picks `DEFAULT_STEP_QUANTUM` (= 64) and a Serial
+    /// model. Pairs with `builder_step_quantum_u32_max_passes_through`.
+    #[test]
+    fn builder_default_quantum_and_serial_model() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        assert_eq!(emu.step_quantum, DEFAULT_STEP_QUANTUM);
+        assert_eq!(emu.execution_model(), ExecutionModel::Serial);
+    }
+
+    /// Builder fluent-chain ordering shouldn't matter: setting
+    /// `step_quantum` before / after `execution` yields the same result.
+    #[test]
+    fn builder_chain_ordering_invariant() {
+        let a = EmulatorBuilder::new(Config::default())
+            .step_quantum(32)
+            .execution(ExecutionModel::Serial)
+            .build()
+            .expect("Serial");
+        let b = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Serial)
+            .step_quantum(32)
+            .build()
+            .expect("Serial");
+        assert_eq!(a.step_quantum, b.step_quantum);
+        assert_eq!(a.execution_model(), b.execution_model());
+    }
+
+    /// `Threaded` must succeed on x86_64 Windows / Linux with the
+    /// `threading` feature, and return `ConfigError::ThreadingUnavailable`
+    /// otherwise. We assert one or the other based on cfg gates.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn builder_threaded_supported_platform_succeeds() {
+        let res = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build();
+        assert!(res.is_ok(), "Threaded should succeed on x86_64 Win/Linux");
+        let emu = res.unwrap();
+        assert_eq!(emu.execution_model(), ExecutionModel::Threaded);
+    }
+
+    #[cfg(not(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    #[test]
+    fn builder_threaded_unsupported_platform_errors() {
+        use crate::ConfigError;
+        let res = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build();
+        assert!(matches!(res, Err(ConfigError::ThreadingUnavailable)));
+    }
+
+    // -----------------------------------------------------------------
+    // Emulator::run / step early-exit arms
+    // -----------------------------------------------------------------
+
+    /// `run(0)` is a no-op: the loop predicate `delta < 0` is false on
+    /// the first check and we return `Ok(0)` without entering
+    /// `step_serial`. Drives the early-exit arm of `Emulator::run`.
+    #[test]
+    fn run_zero_cycles_returns_zero() {
+        let mut emu = Emulator::new(Config::default());
+        let n = emu.run(0).expect("Serial run infallible for cycles=0");
+        assert_eq!(n, 0);
+    }
+
+    /// Pre-halt one core (core 0) and step. The other (core 1) is
+    /// halted by default after `Emulator::new`, so neither core
+    /// advances and `step_serial` should still return Ok.
+    /// Drives the `if c0 == 0 && c1 == 0 { break; }` arm.
+    #[test]
+    fn step_with_both_cores_halted_returns_zero_or_advances_via_alarm() {
+        let mut emu = Emulator::new(Config::default());
+        emu.cores[0].halt();
+        emu.halt_core1();
+        // Both halted; step returns Ok regardless. The exact advance
+        // depends on whether the both-blocked alarm path fires; the
+        // contract is just that step() does not loop.
+        let _ = emu.step().expect("Serial step infallible");
+        // After step, both cores should still be halted unless an alarm
+        // fired (none scheduled in this test).
+        assert!(emu.cores[0].is_halted());
+        assert!(emu.cores[1].is_halted());
+    }
+
+    /// Run with core 0 awake (default) and core 1 halted (default
+    /// post-`Emulator::new`). Drives the single-core run path.
+    #[test]
+    fn run_with_only_core0_awake_executes() {
+        let mut emu = Emulator::new(Config::default());
+        // Default: core 0 awake, core 1 halted.
+        assert!(!emu.cores[0].is_halted());
+        assert!(emu.cores[1].is_halted());
+        let n = emu.run(64).expect("Serial");
+        assert!(n > 0, "core 0 must consume at least one cycle");
+    }
+
+    /// `step_quantum=1` makes each `run` quantum tiny; `run(2)` must
+    /// loop at least twice. Drives the `step_serial` quantum-budget
+    /// path with very small quanta.
+    #[test]
+    fn run_with_step_quantum_one_iterates() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("Serial");
+        let n = emu.run(2).expect("Serial");
+        assert!(n >= 2, "must run at least 2 cycles when budget is 2");
+    }
+
+    /// `run_quantum()` on a Serial-built emulator equals one `step()`
+    /// of `step_quantum` cycles. Already covered by integration tests
+    /// but pinned here for branch attribution on the Serial arm of
+    /// `Emulator::run_quantum`.
+    #[test]
+    fn run_quantum_serial_returns_ok() {
+        let mut emu = Emulator::new(Config::default());
+        let n = emu.run_quantum().expect("Serial run_quantum infallible");
+        assert!(n <= emu.step_quantum as u64);
+    }
+
+    /// Hit the `step()` Serial path which goes via `step_serial`.
+    /// Companion to `run_quantum_serial_returns_ok`.
+    #[test]
+    fn step_serial_path_returns_ok() {
+        let mut emu = Emulator::new(Config::default());
+        let _ = emu.step().expect("Serial step infallible");
+    }
+
+    // -----------------------------------------------------------------
+    // gpio_read / gpio_write across the full 0..30 valid range
+    // -----------------------------------------------------------------
+
+    /// Cover every valid pin (0..30) for `gpio_write(pin, true)` then
+    /// `gpio_read(pin)` — round-trip through the SIO -> update_gpio
+    /// merge. Ensures the loop doesn't skip pins and the in-range
+    /// branch is taken for each.
+    #[test]
+    fn gpio_set_then_get_all_valid_pins() {
+        for pin in 0..30u8 {
+            let mut emu = Emulator::new(Config::default());
+            emu.gpio_write(pin, true);
+            assert!(
+                emu.gpio_read(pin),
+                "pin {pin} should read high after gpio_write(true)"
+            );
+            emu.gpio_write(pin, false);
+            assert!(
+                !emu.gpio_read(pin),
+                "pin {pin} should read low after gpio_write(false)"
+            );
+        }
+    }
+
+    /// `gpio_read(N)` for N >= 30 returns false silently. Drives the
+    /// `if pin >= 30 { return false; }` early-exit arm at lib.rs:1268.
+    #[test]
+    fn gpio_read_pin_at_or_above_30_returns_false() {
+        let emu = Emulator::new(Config::default());
+        for pin in [30u8, 31, 50, 100, 200, 255] {
+            assert!(!emu.gpio_read(pin), "out-of-range pin {pin} must be false");
+        }
+    }
+
+    /// `gpio_write(N, _)` for N >= 30 is silently ignored. Drives the
+    /// early-exit arm at lib.rs:1280; afterwards, no SIO bit moves.
+    #[test]
+    fn gpio_write_pin_at_or_above_30_is_noop() {
+        let mut emu = Emulator::new(Config::default());
+        let oe_before = emu.bus.sio.gpio_oe;
+        let out_before = emu.bus.sio.gpio_out;
+        for pin in [30u8, 31, 50, 100, 200, 255] {
+            emu.gpio_write(pin, true);
+            emu.gpio_write(pin, false);
+        }
+        assert_eq!(emu.bus.sio.gpio_oe, oe_before, "OE must be untouched");
+        assert_eq!(emu.bus.sio.gpio_out, out_before, "OUT must be untouched");
+    }
+
+    /// `gpio_write(pin, false)` on a freshly-built emulator (no prior
+    /// gpio_write calls) covers the OE-set + OUT-clear arm of
+    /// `gpio_write` for every valid pin. Ensures OE is asserted even
+    /// when value=false.
+    #[test]
+    fn gpio_write_low_value_still_asserts_oe() {
+        for pin in 0..30u8 {
+            let mut emu = Emulator::new(Config::default());
+            emu.gpio_write(pin, false);
+            assert_ne!(
+                emu.bus.sio.gpio_oe & (1u32 << pin),
+                0,
+                "OE must be set even for value=false on pin {pin}"
+            );
+            assert_eq!(
+                emu.bus.sio.gpio_out & (1u32 << pin),
+                0,
+                "OUT must be clear for value=false on pin {pin}"
+            );
+        }
+    }
+
+    /// `gpio_read_all` returns the merged `bus.gpio_in`. Cover the
+    /// reachable bit pattern by toggling several pins and observing
+    /// their union.
+    #[test]
+    fn gpio_read_all_reflects_set_pins() {
+        let mut emu = Emulator::new(Config::default());
+        emu.gpio_write(0, true);
+        emu.gpio_write(7, true);
+        emu.gpio_write(15, true);
+        emu.gpio_write(29, true);
+        let mask = emu.gpio_read_all();
+        assert_ne!(mask & 1, 0);
+        assert_ne!(mask & (1 << 7), 0);
+        assert_ne!(mask & (1 << 15), 0);
+        assert_ne!(mask & (1 << 29), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // load_image error / boundary arms
+    // -----------------------------------------------------------------
+
+    /// Empty `data` is a no-op for every region. Drives the inner
+    /// loops with a zero-length slice.
+    #[test]
+    fn load_image_empty_slice_noop() {
+        let mut emu = Emulator::new(Config::default());
+        let before_rom = emu.bus.memory.rom_read32(0);
+        emu.load_image(0x0000_0000, &[]);
+        emu.load_image(0x2000_0000, &[]);
+        emu.load_image(0x4000_0000, &[]);
+        assert_eq!(emu.bus.memory.rom_read32(0), before_rom);
+    }
+
+    /// `load_image` to an address whose top nibble is unrecognised
+    /// (e.g. 0x4, 0x5, 0xE, 0xF) silently falls through the match.
+    /// Drives the `_ => {}` catch-all arm.
+    #[test]
+    fn load_image_unknown_top_nibble_drops_silently() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        for top in [0x3u32, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF] {
+            emu.load_image(top << 28, &data);
+        }
+        // ROM bytes untouched.
+        assert_eq!(emu.bus.memory.rom_read8(0), 0);
+    }
+
+    /// ROM-region overlay where the data extends past `ROM_SIZE`:
+    /// the inner copy clamps via `end = (offset + data.len()).min(ROM_SIZE)`.
+    /// Drives the clamp branch of the ROM arm at lib.rs:460.
+    #[test]
+    fn load_image_rom_overlay_clamps_at_rom_end() {
+        let mut emu = Emulator::new(Config::default());
+        // Start near the end of ROM, write more than fits — the tail
+        // must be clamped, no panic.
+        let offset = (ROM_SIZE - 4) as u32;
+        let data = vec![0x77u8; 16];
+        emu.load_image(offset, &data);
+        // Last 4 bytes of ROM should hold the first 4 of `data`.
+        assert_eq!(emu.bus.memory.rom_read8(offset), 0x77);
+        assert_eq!(emu.bus.memory.rom_read8(offset + 1), 0x77);
+        assert_eq!(emu.bus.memory.rom_read8(offset + 2), 0x77);
+        assert_eq!(emu.bus.memory.rom_read8(offset + 3), 0x77);
+    }
+
+    /// SRAM-region overlay clamps via wrapping address arithmetic in
+    /// `sram_write8`. Drives the SRAM arm with an offset deep into
+    /// the 256 KB window.
+    #[test]
+    fn load_image_sram_at_high_offset() {
+        let mut emu = Emulator::new(Config::default());
+        let data = [0xA1u8, 0xB2, 0xC3, 0xD4];
+        emu.load_image(0x2003_0000, &data);
+        assert_eq!(emu.bus.memory.sram_read8(0x0003_0000), 0xA1);
+        assert_eq!(emu.bus.memory.sram_read8(0x0003_0003), 0xD4);
+    }
+
+    /// Oversize flash via `load_flash`: a flash image far larger than
+    /// the 2 MB XIP window must be clamped by `Memory::load_flash`
+    /// without panicking. Validates the load_flash drain path.
+    #[test]
+    fn load_flash_oversize_image_clamps() {
+        let mut emu = Emulator::new(Config::default());
+        // 4 MB image — larger than the 2 MB XIP window.
+        let big = vec![0x55u8; 4 * 1024 * 1024];
+        emu.load_flash(&big);
+        // First word is 0x5555_5555 from the marker.
+        assert_eq!(emu.bus.memory.xip_read32(0), 0x5555_5555);
+        // Drain executed.
+        assert_eq!(emu.bus.pending_invalidation_regions, 0);
+    }
+
+    /// Load bootrom larger than the 16 KB ROM: silently clamped by
+    /// `Memory::load_rom`. Drives the bootrom drain path.
+    #[test]
+    fn load_bootrom_oversize_clamps() {
+        let mut emu = Emulator::new(Config::default());
+        let big = vec![0xC3u8; ROM_SIZE * 4];
+        emu.load_bootrom(&big);
+        assert_eq!(emu.bus.memory.rom_read8(0), 0xC3);
+        assert_eq!(emu.bus.memory.rom_read8(ROM_SIZE as u32 - 1), 0xC3);
+        assert_eq!(emu.bus.pending_invalidation_regions, 0);
+    }
+
+    /// Load bootrom of exactly ROM_SIZE bytes — boundary condition on
+    /// the clamp.
+    #[test]
+    fn load_bootrom_exact_size() {
+        let mut emu = Emulator::new(Config::default());
+        let mut data = vec![0u8; ROM_SIZE];
+        data[0] = 0x12;
+        data[ROM_SIZE - 1] = 0x34;
+        emu.load_bootrom(&data);
+        assert_eq!(emu.bus.memory.rom_read8(0), 0x12);
+        assert_eq!(emu.bus.memory.rom_read8(ROM_SIZE as u32 - 1), 0x34);
+    }
+
+    /// `load_bootrom` with an empty buffer is a no-op (clamp = 0).
+    #[test]
+    fn load_bootrom_empty_noop() {
+        let mut emu = Emulator::new(Config::default());
+        emu.load_bootrom(&[]);
+        assert_eq!(emu.bus.memory.rom_read8(0), 0);
+    }
+
+    /// `load_flash` with an empty buffer is a no-op.
+    #[test]
+    fn load_flash_empty_noop() {
+        let mut emu = Emulator::new(Config::default());
+        emu.load_flash(&[]);
+        // XIP buffer is sized lazily but read of word 0 returns 0.
+        assert_eq!(emu.bus.memory.xip_read32(0), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // inject_panic_for_testing — gated on testing+threading features
+    // -----------------------------------------------------------------
+
+    /// Panic injection on the Core0 worker. Drives the
+    /// `inject_panic_for_testing` setter for `WorkerName::Core0` and
+    /// the matching dispatch in `apply_pending_panic_inject`. The
+    /// panic surfaces as `EmulatorError::WorkerPanicked` and the
+    /// emulator becomes sticky-poisoned.
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn inject_panic_core0_surfaces_as_error() {
+        use crate::{EmulatorError, WorkerName};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build must succeed");
+        emu.inject_panic_for_testing(WorkerName::Core0);
+        let r = emu.run_quantum();
+        assert!(matches!(
+            r,
+            Err(EmulatorError::WorkerPanicked {
+                which: WorkerName::Core0,
+                ..
+            })
+        ));
+    }
+
+    /// Panic injection on the Core1 worker.
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn inject_panic_core1_surfaces_as_error() {
+        use crate::{EmulatorError, WorkerName};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build must succeed");
+        emu.inject_panic_for_testing(WorkerName::Core1);
+        let r = emu.run_quantum();
+        assert!(matches!(
+            r,
+            Err(EmulatorError::WorkerPanicked {
+                which: WorkerName::Core1,
+                ..
+            })
+        ));
+    }
+
+    /// Panic injection on the Coordinator worker. Different code path
+    /// in `apply_pending_panic_inject` per `WorkerName::Coord`.
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn inject_panic_coord_surfaces_as_error() {
+        use crate::{EmulatorError, WorkerName};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build must succeed");
+        emu.inject_panic_for_testing(WorkerName::Coord);
+        let r = emu.run_quantum();
+        assert!(matches!(
+            r,
+            Err(EmulatorError::WorkerPanicked {
+                which: WorkerName::Coord,
+                ..
+            })
+        ));
+    }
+
+    /// `step()` on a Threaded emulator returns
+    /// `EmulatorError::NotSupportedInThreadedMode`. Drives the
+    /// Threaded-mode arm at `Emulator::step` (lib.rs:607).
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn step_on_threaded_returns_not_supported() {
+        use crate::EmulatorError;
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build");
+        assert!(matches!(
+            emu.step(),
+            Err(EmulatorError::NotSupportedInThreadedMode)
+        ));
+    }
+
+    /// `run` on a Threaded emulator that has been sticky-poisoned by a
+    /// prior panic returns the cached `WorkerPanicked` error without
+    /// re-attempting workers (one-shot semantics).
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn threaded_post_panic_run_returns_cached_error() {
+        use crate::{EmulatorError, WorkerName};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build");
+        emu.inject_panic_for_testing(WorkerName::Core0);
+        let _ = emu.run_quantum(); // Poisons the instance.
+        // Subsequent `run()` returns the same error from the sticky
+        // cache — drives the `if let Some((which, message)) = &self.panic_info`
+        // arm in `Emulator::run` (lib.rs:945) on the cached path.
+        let r = emu.run(100);
+        assert!(matches!(
+            r,
+            Err(EmulatorError::WorkerPanicked {
+                which: WorkerName::Core0,
+                ..
+            })
+        ));
+    }
+
+    /// Same one-shot guarantee, but for `step()` after a panic. Drives
+    /// the cached-panic arm of `Emulator::step` (lib.rs:613).
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn threaded_post_panic_step_returns_cached_error() {
+        use crate::{EmulatorError, WorkerName};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build");
+        emu.inject_panic_for_testing(WorkerName::Coord);
+        let _ = emu.run_quantum(); // Poisons.
+        let r = emu.step();
+        assert!(matches!(
+            r,
+            Err(EmulatorError::WorkerPanicked {
+                which: WorkerName::Coord,
+                ..
+            })
+        ));
+    }
+}

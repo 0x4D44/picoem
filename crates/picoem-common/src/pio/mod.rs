@@ -3419,4 +3419,469 @@ mod tests {
         pio.write32(0x000, 1 << 8, 0);
         assert_eq!(pio.sm[0].clkdiv_acc, 0, "CLKDIV_RESTART zeros acc");
     }
+
+    // ====================================================================
+    // Branch-coverage top-up — drive each missed-branch class explicitly.
+    // ====================================================================
+
+    /// `step_n_with_pins` short-circuit when no SM is enabled: the loop
+    /// must not run regardless of `n`. Complements the existing
+    /// `idle_block_step_is_noop` (which uses `step_n`) by going through
+    /// the `_with_pins` variant.
+    #[test]
+    fn step_n_with_pins_short_circuits_on_idle_block() {
+        let mut pio = PioBlock::new();
+        let pad_before = pio.pad_out;
+        pio.step_n_with_pins(1000, 0xDEAD_BEEF_u64);
+        assert_eq!(pio.pad_out, pad_before, "idle block must not move pad_out");
+    }
+
+    /// `step_n_with_pins` with an enabled SM exercises the loop body
+    /// inside the inner `step_with_pins` call (the false arm of the
+    /// short-circuit guard at line 386).
+    #[test]
+    fn step_n_with_pins_runs_when_sm_enabled() {
+        let mut pio = PioBlock::new();
+        pio.instr_mem[0] = 0xE021; // SET X, 1
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 1;
+        pio.sm[0].clkdiv_frac = 0;
+        pio.step_n_with_pins(1, 0);
+        assert_eq!(pio.sm[0].x, 1, "SET X, 1 executed via step_n_with_pins");
+    }
+
+    /// `step_with_pins` unconditional path: enabled SM with a u64 GPIO
+    /// sample (the wider-than-u32 path that the bare `step` doesn't
+    /// reach). Exercises `local_gpio_window` when gpio_base=0 (default).
+    #[test]
+    fn step_with_pins_uses_u64_gpio_sample() {
+        let mut pio = PioBlock::new();
+        // WAIT 1 GPIO 5 — should stall when bit 5 is low, unstall when high.
+        pio.instr_mem[0] = 0x2085; // WAIT 1 GPIO 5
+        pio.set_sm_enabled(0, true);
+        pio.sm[0].clkdiv_int = 1;
+        pio.sm[0].clkdiv_frac = 0;
+        pio.step_with_pins(0u64);
+        assert!(pio.sm[0].stalled, "stall while pin 5 low");
+        // Pass a u64 sample that has bit 5 set.
+        pio.step_with_pins(1u64 << 5);
+        assert!(!pio.sm[0].stalled, "unstall when pin 5 set in u64 sample");
+    }
+
+    /// IRQ_FORCE write only sets bits — the alias parameter is ignored
+    /// per the production code (line 754-755). Exercise the path with
+    /// non-zero starting flags to confirm the OR-only semantics.
+    #[test]
+    fn irq_force_or_semantics_ignores_alias() {
+        let mut pio = PioBlock::new();
+        pio.irq_flags = 0x10;
+        // Plain write: OR in 0x05.
+        pio.write32(0x034, 0x05, 0);
+        assert_eq!(pio.irq_flags, 0x15, "IRQ_FORCE ORs in new bits");
+        // Repeated alias values still OR — IRQ_FORCE has no W1C/XOR/CLR.
+        pio.write32(0x034, 0x80, 1); // alias=1 (XOR), behaviour: still OR
+        assert_eq!(pio.irq_flags, 0x95);
+        pio.write32(0x034, 0x02, 2);
+        assert_eq!(pio.irq_flags, 0x97);
+        pio.write32(0x034, 0x40, 3);
+        assert_eq!(pio.irq_flags, 0xD7);
+    }
+
+    /// PUSH blocking when RX FIFO is full + autopush off: SM stalls,
+    /// PC does not advance. Existing `test_pull_blocking_stall` covers
+    /// the pull/empty-FIFO direction; this is the symmetric push path.
+    #[test]
+    fn push_block_stalls_when_rx_fifo_full() {
+        // PUSH block, no if_full: 0x8020
+        // Then SET X, 5 at slot 1 so we can verify PC didn't advance.
+        let mut pio = make_pio_with_program(&[0x8020, 0xE025]);
+        // Fill RX FIFO so PUSH cannot land.
+        for v in 0..4u32 {
+            assert!(pio.sm[0].rx_fifo.push(v));
+        }
+        assert!(pio.sm[0].rx_fifo.is_full());
+
+        step_n(&mut pio, 1, 0);
+        assert!(pio.sm[0].stalled, "PUSH stalls when RX FIFO full");
+        assert_eq!(pio.sm[0].pc, 0, "PC stays put while stalled");
+
+        // Drain one slot — push can now land on the next tick.
+        let _ = pio.sm[0].rx_fifo.pop();
+        step_n(&mut pio, 1, 0);
+        assert!(!pio.sm[0].stalled, "PUSH unstalls when room appears");
+        assert_eq!(pio.sm[0].pc, 1, "PC advanced after PUSH completed");
+    }
+
+    /// PUSH IF_FULL with full FIFO + autopush off: no-op, PC advances.
+    /// Exercises the `if_full && rx_fifo.is_full()` arm in `exec_push`.
+    #[test]
+    fn push_if_full_with_full_fifo_is_noop() {
+        // PUSH if_full (block=1, if_full=1): opcode=100, dir=0,
+        // if_full=1, block=1 = 0b100_00000_0_1_1_00000 = 0x8060
+        let mut pio = make_pio_with_program(&[0x8060]);
+        for v in 0..4u32 {
+            assert!(pio.sm[0].rx_fifo.push(v));
+        }
+        let isr_before = 0xCAFE_BABE_u32;
+        pio.sm[0].isr = isr_before;
+        pio.sm[0].isr_count = 32;
+
+        step_n(&mut pio, 1, 0);
+        // No stall: if_full no-op when FIFO full.
+        assert!(!pio.sm[0].stalled, "PUSH IF_FULL never stalls");
+        // ISR untouched: PUSH did not run.
+        assert_eq!(
+            pio.sm[0].isr, isr_before,
+            "PUSH IF_FULL skipped — ISR untouched"
+        );
+        assert_eq!(pio.sm[0].isr_count, 32);
+    }
+
+    /// PULL IF_EMPTY with empty TX FIFO copies X into OSR. Distinct
+    /// from `test_pull_noblock_empty_copies_x` (which exercises
+    /// non-blocking + non-if_empty) and from PULL block.
+    #[test]
+    fn pull_if_empty_with_empty_fifo_copies_x_to_osr() {
+        // PULL if_empty, block=1: opcode=100, dir=1, if_empty=1, block=1
+        // = 0b100_00000_1_1_1_00000 = 0x80E0
+        let mut pio = make_pio_with_program(&[0x80E0]);
+        pio.sm[0].x = 0x1234_5678;
+        // TX FIFO empty by default.
+
+        step_n(&mut pio, 1, 0);
+        assert!(!pio.sm[0].stalled, "PULL IF_EMPTY does not stall on empty");
+        assert_eq!(pio.sm[0].osr, 0x1234_5678, "OSR copied from X");
+        assert_eq!(pio.sm[0].osr_count, 0);
+    }
+
+    /// MOV OSR, ISR (source=ISR, destination=OSR, op=none). Confirms
+    /// the destination=7 arm in `exec_mov`.
+    #[test]
+    fn mov_osr_from_isr() {
+        // MOV OSR, ISR: opcode=101, dest=111(OSR), op=00, src=110(ISR)
+        // = 0b101_00000_111_00_110 = 0xA0E6
+        let mut pio = make_pio_with_program(&[0xA0E6]);
+        pio.sm[0].isr = 0xDEAD_BEEF;
+        pio.sm[0].osr = 0;
+        step_n(&mut pio, 1, 0);
+        assert_eq!(pio.sm[0].osr, 0xDEAD_BEEF, "OSR copied from ISR via MOV");
+    }
+
+    /// MOV ISR, OSR (source=OSR, destination=ISR, op=none).
+    #[test]
+    fn mov_isr_from_osr() {
+        // MOV ISR, OSR: opcode=101, dest=110(ISR), op=00, src=111(OSR)
+        // = 0b101_00000_110_00_111 = 0xA0C7
+        let mut pio = make_pio_with_program(&[0xA0C7]);
+        pio.sm[0].osr = 0xCAFE_F00D;
+        pio.sm[0].isr = 0;
+        step_n(&mut pio, 1, 0);
+        assert_eq!(pio.sm[0].isr, 0xCAFE_F00D, "ISR copied from OSR via MOV");
+    }
+
+    /// MOV with NULL source — destination receives 0. Exercises the
+    /// `source==3` (NULL) arm of `exec_mov`.
+    #[test]
+    fn mov_destination_from_null_source() {
+        // MOV X, NULL: opcode=101, dest=001(X), op=00, src=011(NULL)
+        // = 0b101_00000_001_00_011 = 0xA023
+        let mut pio = make_pio_with_program(&[0xA023]);
+        pio.sm[0].x = 0xFFFF_FFFF;
+        step_n(&mut pio, 1, 0);
+        assert_eq!(pio.sm[0].x, 0, "MOV from NULL writes 0");
+    }
+
+    /// WAIT 0 GPIO (polarity=0): stall while pin is HIGH, unstall on low.
+    /// The existing `test_wait_gpio_stall` covers polarity=1 only.
+    #[test]
+    fn wait_0_gpio_stalls_while_pin_high() {
+        // WAIT 0 GPIO 5: polarity=0, source=00(GPIO), index=00101
+        // operand = 0b0_00_00101 = 0x05
+        // insn = 0b001_00000_00000101 = 0x2005
+        let mut pio = make_pio_with_program(&[0x2005, 0xE021]);
+        // Pin 5 high → should stall.
+        step_n(&mut pio, 1, 1u32 << 5);
+        assert!(pio.sm[0].stalled, "WAIT 0 stalls while pin 5 high");
+
+        // Drop pin 5 → unstall.
+        step_n(&mut pio, 1, 0);
+        assert!(!pio.sm[0].stalled, "WAIT 0 unstalls when pin 5 low");
+    }
+
+    /// WAIT 1 IRQ source=2: stalls until the matching IRQ flag is set,
+    /// then auto-clears the flag on match. Exercises the source=2 arm
+    /// of `exec_wait`. Verifies that the flag was set before WAIT
+    /// passes through cleanly (no stall) and that the flag is cleared
+    /// post-match.
+    #[test]
+    fn wait_irq_polarity_one_auto_clears_on_match() {
+        // WAIT 1 IRQ 0 (no relative): polarity=1, source=10(IRQ), index=00000
+        // operand = 0b1_10_00000 = 0xC0
+        // insn = 0b001_00000_11000000 = 0x20C0
+        let mut pio = make_pio_with_program(&[0x20C0, 0xE021]);
+        // First exercise the stall arm: no IRQ flag set → stall.
+        step_n(&mut pio, 1, 0);
+        assert!(pio.sm[0].stalled, "WAIT IRQ stalls when flag clear");
+
+        // Reset and exercise the match arm directly: pre-set flag, then
+        // run one step. exec_wait sees flag_set=true == polarity=true,
+        // auto-clears and does NOT stall.
+        pio = make_pio_with_program(&[0x20C0, 0xE021]);
+        pio.irq_flags = 0x01;
+        step_n(&mut pio, 1, 0);
+        assert!(!pio.sm[0].stalled, "WAIT IRQ matches when flag pre-set");
+        assert_eq!(pio.irq_flags & 1, 0, "matched IRQ flag auto-cleared");
+        assert_eq!(pio.sm[0].pc, 1, "PC advanced past WAIT");
+    }
+
+    /// WAIT 1 PIN with `IN_BASE` offset > 0: confirms the PIN arm
+    /// (source=1) computes the pin index against PINCTRL.IN_BASE.
+    #[test]
+    fn wait_pin_uses_in_base_offset() {
+        // WAIT 1 PIN 0: polarity=1, source=01(PIN), index=00000
+        // operand = 0b1_01_00000 = 0xA0
+        // insn = 0b001_00000_10100000 = 0x20A0
+        let mut pio = make_pio_with_program(&[0x20A0]);
+        // IN_BASE = 7 — so PIN 0 maps to physical GPIO 7.
+        pio.sm[0].pinctrl = 7u32 << 15;
+
+        step_n(&mut pio, 1, 0);
+        assert!(pio.sm[0].stalled, "stall while GPIO 7 low");
+
+        step_n(&mut pio, 1, 1u32 << 7);
+        assert!(!pio.sm[0].stalled, "unstall when GPIO 7 high");
+    }
+
+    /// IRQ wait variant: `IRQ wait 0` sets flag 0 then stalls. While
+    /// the flag stays set, `check_stall` keeps the SM stalled
+    /// (`StallKind::IrqWait` arm at line 451-455 — true case).
+    #[test]
+    fn irq_wait_remains_stalled_while_flag_set() {
+        // IRQ set 0, wait=1: opcode=110, clear=0, wait=1, index=00000
+        // = 0b110_00000_0_0_1_00000 = 0xC020
+        let mut pio = make_pio_with_program(&[0xC020, 0xE025]);
+        pio.irq_flags = 0;
+        step_n(&mut pio, 1, 0); // executes IRQ set+wait
+        assert!(pio.sm[0].stalled, "IRQ wait stalls after setting flag");
+        assert_ne!(pio.irq_flags & 1, 0, "IRQ flag 0 set");
+
+        // Step a few more times: flag stays set → SM stays stalled
+        // (the IrqWait check_stall arm returns true).
+        let pc_before = pio.sm[0].pc;
+        for _ in 0..3 {
+            step_n(&mut pio, 1, 0);
+        }
+        assert!(pio.sm[0].stalled, "still stalled while flag set");
+        assert_eq!(pio.sm[0].pc, pc_before, "PC frozen during stall");
+    }
+
+    /// `set_sm_enabled` with an SM that's already in the desired state
+    /// should be a no-op. Complements `set_sm_enabled_no_change_is_noop`
+    /// by also asserting that pad latches stay untouched (i.e.
+    /// `merge_pin_outputs` is NOT re-run).
+    #[test]
+    fn set_sm_enabled_no_change_does_not_remerge_pads() {
+        let mut pio = PioBlock::new();
+        pio.set_sm_enabled(0, true);
+        // Force a non-default pad_out.
+        pio.shared_pin_values = 0xDEAD_BEEF;
+        pio.merge_pin_outputs_for_test();
+        let pad_after_first = pio.pad_out;
+
+        // Stage some shared_pin_values that would re-merge if we did
+        // call merge_pin_outputs. Then call set_sm_enabled with no
+        // change — pad_out must NOT pick up the new value.
+        pio.shared_pin_values = 0;
+        pio.set_sm_enabled(0, true); // no-op
+        assert_eq!(pio.pad_out, pad_after_first);
+    }
+
+    /// `pending_irqs` accessor exposes the irq_flags field. Hits an
+    /// otherwise-bare accessor.
+    #[test]
+    fn pending_irqs_reflects_current_flags() {
+        let mut pio = PioBlock::new();
+        assert_eq!(pio.pending_irqs(), 0);
+        pio.write32(0x034, 0x42, 0); // IRQ_FORCE: set bits 1,6
+        assert_eq!(pio.pending_irqs(), 0x42);
+    }
+
+    /// `gpio_base` accessor returns 0 by default, 16 after writing
+    /// 0x10 to GPIOBASE register.
+    #[test]
+    fn gpio_base_accessor_round_trips() {
+        let mut pio = PioBlock::new();
+        assert_eq!(pio.gpio_base(), 0);
+        pio.write32(0x168, 0x10, 0);
+        assert_eq!(pio.gpio_base(), 16);
+    }
+
+    /// `local_to_physical_pins` panics on impossible gpio_base values
+    /// only via `unreachable!`. Confirm the documented values 0 and 16
+    /// behave as stated.
+    #[test]
+    fn local_to_physical_pins_only_supports_0_and_16() {
+        let mut pio = PioBlock::new();
+        // base 0: identity.
+        let local = 0xDEAD_BEEFu32;
+        assert_eq!(pio.local_to_physical_pins(local), (local, 0));
+        // base 16: split.
+        pio.write32(0x168, 0x10, 0);
+        let (lo, hi) = pio.local_to_physical_pins(0x0000_FFFFu32);
+        assert_eq!(lo, 0xFFFF_0000);
+        assert_eq!(hi, 0);
+    }
+
+    /// `recompute_any_sideset` flips the cache when SIDESET_COUNT > 0
+    /// is set on any SM, and back to false when all are cleared.
+    #[test]
+    fn recompute_any_sideset_tracks_pinctrl_count() {
+        let mut pio = PioBlock::new();
+        assert!(!pio.any_sideset_programmed);
+        pio.sm[2].pinctrl = 1u32 << 29; // SIDESET_COUNT=1 on SM2
+        pio.recompute_any_sideset();
+        assert!(pio.any_sideset_programmed);
+        // Clear PINCTRL → recompute drops the flag.
+        pio.sm[2].pinctrl = 0;
+        pio.recompute_any_sideset();
+        assert!(!pio.any_sideset_programmed);
+    }
+
+    /// FDEBUG read returns the stored value. Confirms the bare-read
+    /// arm (line 596) without the alias dispatcher above.
+    #[test]
+    fn fdebug_bare_read() {
+        let mut pio = PioBlock::new();
+        pio.fdebug = 0x1234;
+        assert_eq!(pio.read32(0x008), 0x1234);
+    }
+
+    /// Per-SM CLKDIV alias=2 (SET): currents bits stay set, new bits OR
+    /// in. Distinct from the existing XOR-only test.
+    #[test]
+    fn per_sm_clkdiv_set_alias_ors_in_bits() {
+        let mut pio = PioBlock::new();
+        pio.write32(0x0C8, 0x0001_0000, 0); // CLKDIV int=1
+        pio.write32(0x0C8, 0x0002_0000, 2); // SET: int |= 2 → int=3
+        assert_eq!(pio.read32(0x0C8), 0x0003_0000);
+        pio.write32(0x0C8, 0x0001_0000, 3); // CLR: int &= !1 → int=2
+        assert_eq!(pio.read32(0x0C8), 0x0002_0000);
+    }
+
+    /// Per-SM PINCTRL alias write: confirms the `write_sm_reg` PINCTRL
+    /// arm (line 925) calls `recompute_any_sideset` after the alias.
+    #[test]
+    fn per_sm_pinctrl_alias_recomputes_sideset_cache() {
+        let mut pio = PioBlock::new();
+        assert!(!pio.any_sideset_programmed);
+        // Write SIDESET_COUNT=2 via the SET alias.
+        pio.write32(0x0DC, 2u32 << 29, 2);
+        assert!(
+            pio.any_sideset_programmed,
+            "PINCTRL SET alias must trigger recompute"
+        );
+        // Clear via CLR alias.
+        pio.write32(0x0DC, 7u32 << 29, 3);
+        assert!(
+            !pio.any_sideset_programmed,
+            "PINCTRL CLR alias must trigger recompute"
+        );
+    }
+
+    /// Per-SM EXECCTRL bit 31 is read-only (EXEC_STALLED): SET alias
+    /// of bit 31 must not poison the stored value.
+    #[test]
+    fn per_sm_execctrl_bit31_read_only_under_alias() {
+        let mut pio = PioBlock::new();
+        let before = pio.sm[0].execctrl;
+        // Plain write attempts to set bit 31 — should be masked off.
+        pio.write32(0x0CC, 0x8000_0000, 0);
+        assert_eq!(pio.sm[0].execctrl & 0x8000_0000, 0);
+        // SET alias of bit 31 must also be masked off.
+        pio.sm[0].execctrl = before;
+        pio.write32(0x0CC, 0x8000_0000, 2);
+        assert_eq!(pio.sm[0].execctrl & 0x8000_0000, 0);
+    }
+
+    /// Out-of-range SM index in `read_sm_reg`: this can't actually happen
+    /// via the public address range (0x0C8..=0x127 is exactly 4 × 0x18),
+    /// but the per-SM reserved-register branch (`reg` between SMn_INSTR
+    /// and SMn_PINCTRL) is reachable. Reads that fall on `reg=0x18` would
+    /// be out-of-range; however, the offset arithmetic ensures
+    /// `reg < 0x18`. We instead exercise reading SMn_INSTR which returns
+    /// `last_insn` — and writing it via plain alias replays the
+    /// last_insn into pending_exec.
+    #[test]
+    fn smn_instr_read_returns_last_insn() {
+        let mut pio = PioBlock::new();
+        pio.sm[0].last_insn = 0x1234;
+        assert_eq!(pio.read32(0x0D8), 0x1234, "SMn_INSTR reads last_insn");
+        // SM1 INSTR = 0x0C8 + 0x18 + 0x10 = 0x0F0
+        pio.sm[1].last_insn = 0xABCD;
+        assert_eq!(pio.read32(0x0F0), 0xABCD);
+    }
+
+    /// `tx_dreq` and `rx_dreq` for SM0..3 cover the in-range arms.
+    /// Combined with `dreq_helpers_reject_out_of_range_sm`, this ensures
+    /// every arm is exercised.
+    #[test]
+    fn tx_rx_dreq_for_each_sm_index() {
+        let mut pio = PioBlock::new();
+        for i in 0..4usize {
+            assert!(pio.tx_dreq(i), "fresh SM{i} TX has room");
+            assert!(!pio.rx_dreq(i), "fresh SM{i} RX is empty");
+        }
+        // Fill SM2 TX FIFO and push to SM3 RX FIFO.
+        for _ in 0..4 {
+            assert!(pio.sm[2].tx_fifo.push(0));
+        }
+        assert!(pio.sm[3].rx_fifo.push(0xAA));
+        assert!(!pio.tx_dreq(2), "SM2 TX full → no DREQ");
+        assert!(pio.rx_dreq(3), "SM3 RX has data → DREQ");
+    }
+
+    /// `push_rx` test-hook returns false when the FIFO is full.
+    #[test]
+    fn push_rx_returns_false_when_fifo_full() {
+        let mut pio = PioBlock::new();
+        for _ in 0..4 {
+            assert!(pio.push_rx(0, 0xAA));
+        }
+        // 5th push should fail (FIFO full).
+        assert!(!pio.push_rx(0, 0xBB), "push_rx must fail on full FIFO");
+    }
+
+    /// `pop_tx` test-hook returns None when the FIFO is empty.
+    #[test]
+    fn pop_tx_returns_none_when_fifo_empty() {
+        let mut pio = PioBlock::new();
+        assert_eq!(pio.pop_tx(0), None, "empty TX FIFO → pop_tx returns None");
+    }
+
+    /// IRQ_FORCE write: no alias dispatch — the write32 path always ORs
+    /// in `val as u8` regardless of `alias`. The alias parameter is
+    /// passed but ignored (line 754 is plain `self.irq_flags |= ...`).
+    /// Unlike IRQ at 0x030 which has full alias dispatch.
+    #[test]
+    fn irq_at_0x030_alias_dispatch_distinct_from_irq_force() {
+        let mut pio = PioBlock::new();
+        pio.irq_flags = 0xFF;
+        // IRQ at 0x030 with alias=1 (XOR) — flips bits.
+        pio.write32(0x030, 0xAA, 1);
+        assert_eq!(pio.irq_flags, 0xFF ^ 0xAA);
+        // IRQ_FORCE at 0x034 with alias=1 — still ORs.
+        pio.irq_flags = 0;
+        pio.write32(0x034, 0xAA, 1);
+        assert_eq!(pio.irq_flags, 0xAA, "IRQ_FORCE OR-only regardless of alias");
+    }
+}
+
+// Public-facing helper used by the branch-coverage tests above to drive
+// the merge path through a `pub(crate)` private fn. Kept inside `cfg(test)`
+// so we don't grow the public surface.
+#[cfg(test)]
+impl PioBlock {
+    pub(crate) fn merge_pin_outputs_for_test(&mut self) {
+        self.merge_pin_outputs();
+    }
 }

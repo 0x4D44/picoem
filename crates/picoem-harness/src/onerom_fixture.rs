@@ -1260,4 +1260,307 @@ mod tests {
             .copy_from_slice(&bad_size.to_le_bytes());
         assert!(parse_rom_set_layout(&flash).is_none());
     }
+
+    // -------------------------------------------------------------------
+    // Branch-coverage top-up: error paths in `FixtureSpec::from_flash`
+    // and the SDRR helpers that prior tests didn't reach.
+    // -------------------------------------------------------------------
+
+    /// Bad pin in cs1: forces the cs1 validation arm at line 471/472.
+    #[test]
+    fn from_flash_bad_pin_in_cs1() {
+        let mut flash = synth_fixture_flash();
+        flash[0x1000 + SDRR_PINS_CS1_OFFSET] = 99; // cs1 invalid
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::BadPin {
+                field: "cs1",
+                value: 99,
+            }) => {}
+            other => panic!("expected BadPin {{ field: cs1 }}, got {other:?}"),
+        }
+    }
+
+    /// Bad pin in optional cs2/cs3/ce/oe: each forces a different arm
+    /// of the small loop at line 483-487.
+    #[test]
+    fn from_flash_bad_pin_in_optional_cs2() {
+        let mut flash = synth_fixture_flash();
+        flash[0x1000 + SDRR_PINS_CS2_OFFSET] = 100; // cs2 invalid (not 0xFF)
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::BadPin {
+                field: "cs2",
+                value: 100,
+            }) => {}
+            other => panic!("expected BadPin {{ field: cs2 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_flash_bad_pin_in_optional_cs3() {
+        let mut flash = synth_fixture_flash();
+        flash[0x1000 + SDRR_PINS_CS3_OFFSET] = 200;
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::BadPin {
+                field: "cs3",
+                value: 200,
+            }) => {}
+            other => panic!("expected BadPin {{ field: cs3 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_flash_bad_pin_in_optional_ce() {
+        let mut flash = synth_fixture_flash();
+        flash[0x1000 + SDRR_PINS_CE_OFFSET] = 200;
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::BadPin {
+                field: "ce",
+                value: 200,
+            }) => {}
+            other => panic!("expected BadPin {{ field: ce }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_flash_bad_pin_in_optional_oe() {
+        let mut flash = synth_fixture_flash();
+        flash[0x1000 + SDRR_PINS_OE_OFFSET] = 250;
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::BadPin {
+                field: "oe",
+                value: 250,
+            }) => {}
+            other => panic!("expected BadPin {{ field: oe }}, got {other:?}"),
+        }
+    }
+
+    /// Bad pin in addr[]: forces the BadPin error inside `scan` (line 454-458).
+    #[test]
+    fn from_flash_bad_pin_in_addr() {
+        let mut flash = synth_fixture_flash();
+        // The synth flash has addr[0]=9, addr[1..]=0xFF — perturb
+        // addr[0] to a value >= MAX_USED_GPIOS.
+        flash[0x1000 + SDRR_PINS_ADDR_OFFSET] = 90;
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::BadPin {
+                field: "addr[0]",
+                value: 90,
+            }) => {}
+            other => panic!("expected BadPin {{ field: addr[0] }}, got {other:?}"),
+        }
+    }
+
+    /// Bad pin in addr2[]: forces the post-saw-full-addr scan branch
+    /// (line 466) to actually surface a BadPin error.
+    #[test]
+    fn from_flash_bad_pin_in_addr2() {
+        let mut flash = synth_fixture_flash();
+        // Fill addr[0..16] with valid pins (0..16) so saw_full_addr=true,
+        // then place a bad pin in addr2[0].
+        for ii in 0..16 {
+            flash[0x1000 + SDRR_PINS_ADDR_OFFSET + ii] = ii as u8;
+        }
+        flash[0x1000 + SDRR_PINS_ADDR2_OFFSET] = 0xAA; // bad: 0xAA != 0xFF, >= MAX
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::BadPin {
+                field: "addr2[0]",
+                value: 0xAA,
+            }) => {}
+            other => panic!("expected BadPin {{ field: addr2[0] }}, got {other:?}"),
+        }
+    }
+
+    /// addr[] runs to all 16 slots without sentinel: confirms the
+    /// `saw_full_addr` branch (line 465 true arm) is taken and addr2 is
+    /// then walked. Use a clean addr[0..16] and addr2[0]=0xFF (sentinel)
+    /// so we get a 16-pin spec, exercising the second scan path.
+    #[test]
+    fn from_flash_full_addr_then_addr2_sentinel() {
+        let mut flash = synth_fixture_flash();
+        for ii in 0..16 {
+            flash[0x1000 + SDRR_PINS_ADDR_OFFSET + ii] = ii as u8;
+        }
+        // addr2 already initialised to 0xFF in synth helper — sentinel.
+        let spec = FixtureSpec::from_flash(&flash).expect("parse must succeed");
+        assert_eq!(spec.addr_pins.len(), 16);
+    }
+
+    /// pins_ptr below FLASH_BASE forces the `checked_sub(FLASH_BASE)` =>
+    /// None branch at line 391, surfacing as Truncated.
+    #[test]
+    fn from_flash_pins_ptr_below_flash_base() {
+        let mut flash = synth_fixture_flash();
+        let bad_ptr = 0x0000_1000u32; // below FLASH_BASE
+        flash[0x230..0x234].copy_from_slice(&bad_ptr.to_le_bytes());
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::Truncated) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    /// pins_ptr resolves to an offset past EOF: forces the
+    /// `flash.len() < pins_off + SDRR_PINS_STRUCT_SIZE` arm (line 393).
+    #[test]
+    fn from_flash_pins_offset_past_eof() {
+        let mut flash = synth_fixture_flash();
+        // Point pins_ptr way past the end of the flash blob.
+        let huge_off = (flash.len() as u32 - 10) + FLASH_BASE; // pins_off near EOF
+        flash[0x230..0x234].copy_from_slice(&huge_off.to_le_bytes());
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::Truncated) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    /// rom_set[0].size == 0 surfaces as InvalidShadowSize (line 376).
+    #[test]
+    fn from_flash_invalid_zero_shadow_size() {
+        let mut flash = synth_fixture_flash();
+        // rom_sets[0] at +0xC100, ROM_SET_SIZE_OFFSET = 4.
+        flash[0xC100 + ROM_SET_SIZE_OFFSET..0xC100 + ROM_SET_SIZE_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::InvalidShadowSize { size: 0 }) => {}
+            other => panic!("expected InvalidShadowSize, got {other:?}"),
+        }
+    }
+
+    /// 32-pin chip with an unsupported rom_type (not 27C010/020/040)
+    /// hits the unsupported-32-pin-rom-type arm (line 514-521).
+    #[test]
+    fn from_flash_unsupported_32pin_rom_type() {
+        let mut flash = synth_fixture_flash();
+        // Switch to 32-pin socket.
+        flash[0x1000 + 5] = 32;
+        // The synth helper sets rom_type = 13 (CHIP_TYPE_27512), which
+        // is NOT in {27C010, 27C020, 27C040} for the 32-pin path.
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::UnknownLayout { reason }) => {
+                assert!(
+                    reason.contains("32-pin") || reason.contains("unsupported"),
+                    "reason should mention 32-pin: {reason:?}"
+                );
+            }
+            other => panic!("expected UnknownLayout for unsupported 32-pin rom_type, got {other:?}"),
+        }
+    }
+
+    /// 32-pin chip with rom_type=27C010 follows the supported path and
+    /// produces a 0 unservable mask + empty deasserted_high vec.
+    #[test]
+    fn from_flash_32pin_27c010_valid() {
+        let mut flash = synth_fixture_flash();
+        // Switch to 32-pin socket and 27C010 rom_type.
+        flash[0x1000 + 5] = 32;
+        flash[0xC0F8 + ROM_INFO_ROM_TYPE_OFFSET] = CHIP_TYPE_27C010;
+        let spec = FixtureSpec::from_flash(&flash).expect("32-pin/27C010 must parse");
+        assert_eq!(spec.chip_pins, 32);
+        assert_eq!(spec.rom_type, CHIP_TYPE_27C010);
+        assert_eq!(spec.unservable_when_high, 0);
+        assert!(spec.deasserted_high_during_read.is_empty());
+    }
+
+    /// 24-pin fixture with a non-aliased CE pin: forces the
+    /// `ce != INVALID_PIN && !cs_pins.contains(&ce)` true arm (line 538)
+    /// surfacing CE in asserted_low_during_read.
+    #[test]
+    fn from_flash_24pin_with_real_ce_pin() {
+        let mut flash = synth_fixture_flash();
+        // Synth fixture: cs1=5, cs2/cs3/ce/oe all 0xFF. Set ce=20 (a pin
+        // not aliasing any cs).
+        flash[0x1000 + SDRR_PINS_CE_OFFSET] = 20;
+        let spec = FixtureSpec::from_flash(&flash).expect("must parse");
+        assert!(
+            spec.asserted_low_during_read.contains(&20),
+            "ce=20 should appear in asserted_low_during_read: {:?}",
+            spec.asserted_low_during_read
+        );
+    }
+
+    /// 24-pin fixture with non-INVALID_PIN cs2/cs3: cs2 and cs3 should
+    /// surface in deasserted_high_during_read (line 550-561 true arm).
+    #[test]
+    fn from_flash_24pin_deasserted_high_includes_cs2_cs3() {
+        let mut flash = synth_fixture_flash();
+        // cs2=12, cs3=15 — neither aliases cs1=5 nor each other.
+        flash[0x1000 + SDRR_PINS_CS2_OFFSET] = 12;
+        flash[0x1000 + SDRR_PINS_CS3_OFFSET] = 15;
+        let spec = FixtureSpec::from_flash(&flash).expect("must parse");
+        assert_eq!(spec.deasserted_high_during_read, vec![12, 15]);
+    }
+
+    /// 24-pin fixture with a cs2 that aliases cs1 (the gate): cs2 should
+    /// be filtered out of deasserted_high_during_read (line 557 true arm).
+    #[test]
+    fn from_flash_24pin_deasserted_high_filters_gate_cs() {
+        let mut flash = synth_fixture_flash();
+        // cs1=5 (the gate); cs2=5 (alias of cs1) → must be filtered out.
+        flash[0x1000 + SDRR_PINS_CS2_OFFSET] = 5;
+        flash[0x1000 + SDRR_PINS_CS3_OFFSET] = INVALID_PIN; // explicit absent
+        let spec = FixtureSpec::from_flash(&flash).expect("must parse");
+        assert!(
+            spec.deasserted_high_during_read.is_empty(),
+            "cs2 aliasing cs1 must be filtered from deasserted_high"
+        );
+    }
+
+    /// Display impl for each FixtureError variant — touches each match
+    /// arm of the formatter at lines 308-326.
+    #[test]
+    fn fixture_error_display_impl_covers_all_variants() {
+        let variants = [
+            FixtureError::Truncated,
+            FixtureError::BadPin {
+                field: "data[0]",
+                value: 99,
+            },
+            FixtureError::UnknownLayout {
+                reason: "test reason",
+            },
+            FixtureError::MissingRomSet,
+            FixtureError::InvalidShadowSize { size: 0 },
+        ];
+        for v in &variants {
+            // Ensure each variant produces non-empty output via Display.
+            let s = format!("{v}");
+            assert!(!s.is_empty(), "Display for {v:?} must produce output");
+            assert!(s.contains("OneROM"), "every variant says OneROM: {s}");
+        }
+    }
+
+    /// `lift_shadow_from_flash` with `size < spec.shadow_size`: tail must
+    /// be zero-padded (line 685-688). Set rom_sets[0].size = 0x100 but
+    /// keep spec.shadow_size = 0x10000 — the result should be 0x100 of
+    /// real data followed by 0xFF00 zeros.
+    #[test]
+    fn lift_shadow_zero_pads_when_size_less_than_shadow_size() {
+        let mut flash = synth_flash_two_set(2);
+        // Overwrite set 0's declared size to a small value.
+        let small_size = 0x100u32;
+        flash[0xC100 + ROM_SET_SIZE_OFFSET..0xC100 + ROM_SET_SIZE_OFFSET + 4]
+            .copy_from_slice(&small_size.to_le_bytes());
+        let spec = synth_two_set_spec();
+        let s0 = lift_shadow_from_flash(&flash, 0, &spec).expect("set 0 must lift");
+        // First 0x100 bytes match the synth pattern (j as u8).
+        for i in 0..0x100 {
+            assert_eq!(s0[i], i as u8, "head bytes match");
+        }
+        // Tail is zero-padded.
+        for i in 0x100..SYNTH_TWO_SET_SHADOW_SIZE {
+            assert_eq!(s0[i], 0, "tail bytes zero-padded at idx {i}");
+        }
+    }
+
+    /// `lift_shadow_from_flash` with a data_ptr below FLASH_BASE: forces
+    /// the `ptr_to_off` checked_sub None branch.
+    #[test]
+    fn lift_shadow_rejects_data_ptr_below_flash_base() {
+        let mut flash = synth_flash_two_set(2);
+        // Patch set 0's data ptr to an XIP address below FLASH_BASE.
+        let bad = 0x0000_1000u32;
+        flash[0xC100 + ROM_SET_DATA_PTR_OFFSET..0xC100 + ROM_SET_DATA_PTR_OFFSET + 4]
+            .copy_from_slice(&bad.to_le_bytes());
+        let spec = synth_two_set_spec();
+        assert!(lift_shadow_from_flash(&flash, 0, &spec).is_none());
+    }
 }

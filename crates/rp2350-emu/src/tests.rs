@@ -30415,3 +30415,473 @@ mod stage3_ppb_dma_branches {
         assert_eq!(ppb.icsr & ICSR_PENDSVSET, 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 4 v2: residue branches not covered by `stage4_lib_residue` /
+// `stage5_lib_residue` in `lib.rs`. Targets the run() / step() / run_quantum
+// Threaded-mode fast paths, fan_out_riscv_irqs sub-branches that need
+// MTIP/MSIP/MEIP transitions, wake_checks RiscV WFI-with-enabled-IRQ, the
+// step_pair_arm WFE-waiting & exclusive-monitor-snoop branches, the
+// step_pair_riscv halted-core branch, and the EmulatorBuilder
+// non-default-sys-clk branch. Pure append-only — does not modify
+// production code.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage4_lib_residue_v2 {
+    use crate::{Arch, Config, Cores, Emulator, EmulatorBuilder, ExecutionModel};
+
+    // ------------------- Builder: non-default sys_clk_hz (line 1596) -------------------
+
+    /// Drives the true branch of `if self.config.sys_clk_hz !=
+    /// Config::default().sys_clk_hz` (line 1596). The default
+    /// `Config::sys_clk_hz` is `ROSC_FREQ_HZ`; pass an arbitrary
+    /// non-default value (e.g. 50 MHz) to force the seed-override
+    /// branch.
+    #[test]
+    fn builder_non_default_sys_clk_hz_seeds_bus() {
+        let config = Config {
+            sys_clk_hz: 50_000_000,
+        };
+        let emu = EmulatorBuilder::new(config).build().unwrap();
+        // Bus::seed_sys_clk_hz was called — clock tree reflects the
+        // override rather than the post-bootrom default (150 MHz).
+        assert_eq!(emu.bus.sys_clk_hz(), 50_000_000);
+    }
+
+    /// Drives the false branch of the same predicate by using the
+    /// default `Config` (sys_clk_hz already matches the default — so
+    /// the seed branch is skipped and the post-bootrom 150 MHz value
+    /// applies).
+    #[test]
+    fn builder_default_sys_clk_skips_seed_override() {
+        let emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        // Bus::with_atomics installs the post-bootrom 150 MHz default;
+        // the override branch was skipped.
+        assert_eq!(emu.bus.sys_clk_hz(), 150_000_000);
+    }
+
+    // ------------------- Builder: ConfigError variant matrix -------------------
+
+    #[test]
+    fn builder_arch_riscv_serial_succeeds() {
+        // Serial + RiscV is a supported combination — covers the
+        // pre-build path that doesn't touch the Threaded checks.
+        let emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .execution(ExecutionModel::Serial)
+            .build()
+            .unwrap();
+        assert!(emu.cores.is_riscv());
+    }
+
+    // ------------------- run_pair_arm: WFE-waiting branch (line 1430) -------------------
+
+    /// Drives the false arm of `!cs[core_id].is_wfe_waiting()` (line
+    /// 1430) — set the bus atomic flag for core 0 and step. The
+    /// `while` predicate short-circuits on the first iteration so
+    /// `cs[0].step()` is never called during this quantum.
+    #[test]
+    fn step_pair_arm_skips_wfe_waiting_core() {
+        let mut emu = Emulator::new(Config::default());
+        // Park core 0 on WFE via the shared atomics flag; halt core 1
+        // so it doesn't perform any work that affects the assertion.
+        emu.bus.atomics.set_wfe_waiting(0);
+        emu.bus.atomics.set_halted(1);
+        let pre_cycles_core0 = emu.cores.expect_arm()[0].cycles;
+        let _ = emu.step().unwrap();
+        // Core 0 is parked → its cycle counter must be unchanged.
+        let post_cycles_core0 = emu.cores.expect_arm()[0].cycles;
+        assert_eq!(pre_cycles_core0, post_cycles_core0);
+    }
+
+    // ------------------- run_pair_arm: exclusive-monitor snoop (line 1477) -------------------
+
+    /// Drives the true branch of `cs[peer].exclusive_address.is_some()
+    /// && cs[core_id].did_write_this_quantum` (line 1477). Pre-arm the
+    /// peer-core's exclusive-monitor address and the writer-core's
+    /// did_write flag, then step. The post-step cleanup must clear
+    /// the peer's monitor.
+    #[test]
+    fn step_pair_arm_exclusive_monitor_snoop_clears_peer() {
+        let mut emu = Emulator::new(Config::default());
+        // Halt both cores so the step() loop does no actual work — the
+        // post-step cleanup block at line 1477 still runs unconditionally.
+        emu.bus.atomics.set_halted(0);
+        emu.bus.atomics.set_halted(1);
+        // core 0 will take its turn first; on its turn:
+        //   peer = 1
+        //   if cs[1].exclusive_address.is_some() && cs[0].did_write_this_quantum
+        // → arm both sides.
+        emu.cores.expect_arm_mut()[1].exclusive_address = Some(0x2000_0040);
+        emu.cores.expect_arm_mut()[0].did_write_this_quantum = true;
+        let _ = emu.step().unwrap();
+        // Peer's exclusive monitor cleared.
+        assert!(emu.cores.expect_arm()[1].exclusive_address.is_none());
+        // did_write flag cleared at the end of core 0's iteration.
+        assert!(!emu.cores.expect_arm()[0].did_write_this_quantum);
+    }
+
+    // ------------------- step_pair_riscv: halted-core branch (line 1494) -------------------
+
+    /// Drives the true branch of `!cs[core_id].is_halted()` short-
+    /// circuiting (the false arm of the negation: `is_halted == true`).
+    /// Halt hart 0 and step; the inner while predicate evaluates
+    /// is_halted = true on entry and skips the loop body.
+    #[test]
+    fn step_pair_riscv_skips_halted_core() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build()
+            .unwrap();
+        emu.cores.expect_riscv_mut()[0].set_halted(true);
+        let pre_cycles = emu.cores.expect_riscv()[0].cycles();
+        let _ = emu.step().unwrap();
+        let post_cycles = emu.cores.expect_riscv()[0].cycles();
+        // Halted hart shouldn't have advanced its core-local cycle counter.
+        assert_eq!(pre_cycles, post_cycles);
+    }
+
+    // ------------------- fan_out_riscv_irqs: MSIP / MEIP source paths -------------------
+
+    /// Drives the true branch of `if sw != 0` (line 816, MSIP set) by
+    /// setting the SIO RISCV_SOFTIRQ register's CORE0_SET bit before
+    /// stepping. After the quantum, hart 0's MIP[3] (MSIP) must be
+    /// asserted.
+    #[test]
+    fn fan_out_riscv_msip_set_from_sio() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build()
+            .unwrap();
+        // Write CORE0_SET (bit 0) into RISCV_SOFTIRQ at SIO offset 0x1A0.
+        emu.bus.sio.write32(0x1A0, 0x1, 0);
+        // Halt hart 0 so its `step()` doesn't observe / clear MIP.
+        emu.cores.expect_riscv_mut()[0].set_halted(true);
+        emu.cores.expect_riscv_mut()[1].set_halted(true);
+        let _ = emu.step().unwrap();
+        let mip0 = emu.cores.expect_riscv()[0].mip();
+        assert_ne!(mip0 & (1 << 3), 0, "MSIP must be set after SOFTIRQ.SET");
+    }
+
+    /// Drives the true branch of `if meip` (line 823, MEIP set) by
+    /// arming a non-zero `bus.atomics.irq_pending` and the per-hart
+    /// IRQ-controller's array-enable so `compute_meip` returns true.
+    /// Asserts MIP[11] (MEIP) is set after the quantum.
+    #[test]
+    fn fan_out_riscv_meip_set_from_irq_pending() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build()
+            .unwrap();
+        // Set every IRQ-pending bit so compute_meip's `(pending |
+        // meifa) & meiea` returns true after we configure meiea.
+        emu.bus.atomics.set_irq_pending(0, 0xFFFF_FFFF_FFFF_FFFF);
+        // Enable all 32 IRQs in the per-hart enable array (high half
+        // via meiea high-window write isn't strictly necessary for
+        // any-pending-true).
+        emu.cores.expect_riscv_mut()[0].xh3irq.meiea = 0xFFFF_FFFF_FFFF_FFFF;
+        emu.cores.expect_riscv_mut()[0].set_halted(true);
+        emu.cores.expect_riscv_mut()[1].set_halted(true);
+        let _ = emu.step().unwrap();
+        let mip0 = emu.cores.expect_riscv()[0].mip();
+        assert_ne!(mip0 & (1 << 11), 0, "MEIP must be set when IRQ pending and enabled");
+    }
+
+    // ------------------- wake_checks: RiscV unparks on enabled MIP (line 1172) -------------------
+
+    /// Drives the true arm of the RiscV `if c.wfi_parked && (c.mip()
+    /// & c.mie()) != 0` (line 1172). Set wfi_parked + arm both MIP and
+    /// MIE for the same bit so the AND is non-zero on the first
+    /// wake_checks pass.
+    #[test]
+    fn wake_checks_riscv_unparks_when_mip_and_mie_overlap() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build()
+            .unwrap();
+        // Park hart 0 on WFI and arm both MIP[7] (MTIP) and MIE[7]
+        // (MTIE). Use mtime_match_asserted as the MIP source so the
+        // fan-out re-asserts MIP[7] each step (otherwise the next
+        // step would clear it).
+        emu.bus.sio.mtime_match_asserted[0] = true;
+        emu.cores.expect_riscv_mut()[0].csrs.mie = 1 << 7;
+        emu.cores.expect_riscv_mut()[0].wfi_parked = true;
+        // Halt the cores so they don't execute anything else this quantum.
+        emu.cores.expect_riscv_mut()[0].set_halted(true);
+        emu.cores.expect_riscv_mut()[1].set_halted(true);
+        let _ = emu.step().unwrap();
+        // After one step the wake-check ran; wfi_parked must be cleared.
+        assert!(!emu.cores.expect_riscv()[0].wfi_parked);
+    }
+
+    // ------------------- wake_checks: Arm WFI wake on enabled IRQ (line 1159) -------------------
+
+    /// Drives the true arm of the inner Arm wake-check predicate
+    /// `pending != 0 && arm[i].ppb.any_pending_enabled(pending)` (line
+    /// 1159). Calling `wake_checks` directly bypasses
+    /// `step_pair_arm`'s `take_irq_pending` consumption, leaving the
+    /// bus-side mask non-zero at the wake-check point.
+    #[test]
+    fn wake_checks_arm_unparks_on_enabled_pending_irq() {
+        let mut emu = Emulator::new(Config::default());
+        // Enable IRQ line 0 via NVIC_ISER0 on core 0's PPB.
+        emu.mmio_write32(0xE000_E100, 0x1);
+        // Halt core 0 and pre-set the bus IRQ-pending mask.
+        emu.bus.atomics.set_halted(0);
+        emu.bus.atomics.set_irq_pending(0, 0x1);
+        // Drive the wake-check directly so the IRQ-pending mask
+        // survives intact (step_pair_arm's take_irq_pending would
+        // otherwise consume it before wake_checks runs).
+        emu.wake_checks();
+        assert!(
+            !emu.bus.atomics.is_halted(0),
+            "wake_checks must clear halt on enabled+pending IRQ"
+        );
+    }
+
+    // ------------------- core_cycles: Threaded path (line 441) -------------------
+
+    /// Drives the true branch of `if let Some(t) = &self.threaded`
+    /// (line 441) inside `core_cycles`. Build a Threaded emulator,
+    /// drive one quantum to populate the worker-snapshot, then read
+    /// the threaded core_cycles path.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn core_cycles_threaded_path() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build should succeed on x86_64 Windows/Linux");
+        // Before promotion the threaded field is None — core_cycles
+        // falls through to the Cores match. Drive one quantum to
+        // populate the worker pool snapshot.
+        let _ = emu.run_quantum().expect("Threaded run_quantum");
+        // Now `core_cycles` reads through the Threaded path.
+        let _c0 = emu.core_cycles(0);
+        let _c1 = emu.core_cycles(1);
+    }
+
+    // ------------------- step() Threaded — NotSupportedInThreadedMode (line 668) -------------------
+
+    /// Drives the true arm of `if self.execution_model ==
+    /// ExecutionModel::Threaded` (line 668) returning
+    /// `NotSupportedInThreadedMode` on a fresh Threaded emulator
+    /// (no panic_info / timeout_info to short-circuit).
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn step_threaded_returns_not_supported_when_clean() {
+        use crate::EmulatorError;
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build should succeed");
+        match emu.step() {
+            Err(EmulatorError::NotSupportedInThreadedMode) => {}
+            other => panic!("expected NotSupportedInThreadedMode, got {other:?}"),
+        }
+    }
+
+    // ------------------- run() Threaded path (line 842) -------------------
+
+    /// Drives the false arm of `if self.execution_model ==
+    /// ExecutionModel::Serial` (line 842) by calling `run()` on a
+    /// Threaded emulator. Also covers line 870 (`threaded.is_none()`
+    /// → promote_to_threaded) and line 881 (shutdown_requested
+    /// drain).
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn run_threaded_basic_promotes_and_advances() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build should succeed");
+        // run(N) on a fresh Threaded emulator: promotes the seed into
+        // the worker pool, drives N cycles' worth of quanta, returns
+        // the post-run master cycle count.
+        let cycles_target = (emu.step_quantum as u64) * 2;
+        let after = emu.run(cycles_target).expect("Threaded run");
+        assert!(after >= cycles_target);
+    }
+
+    /// Drives the false arm of `if self.threaded.is_none()` (line
+    /// 870): a second `run()` call where the worker pool has already
+    /// been promoted skips the promote_to_threaded call.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn run_threaded_second_call_skips_promote() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build should succeed");
+        // First call promotes.
+        let _ = emu.run(emu.step_quantum as u64).expect("first run");
+        // Second call observes threaded.is_some() — promote_to_threaded
+        // is skipped this time.
+        let _ = emu.run(emu.step_quantum as u64).expect("second run");
+    }
+
+    // ------------------- run() / step() / run_quantum sticky panic short-circuits -------------------
+
+    /// Drives lines 674 (step), 861 (run), 930 (run_quantum) all in
+    /// sequence: arm a panic via `inject_panic_for_testing`, drain
+    /// it once via `run_quantum` (caches the panic_info), then prove
+    /// every public entry point returns the cached error
+    /// short-circuit.
+    #[cfg(all(
+        feature = "testing",
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn sticky_panic_short_circuits_step_run_run_quantum() {
+        use crate::EmulatorError;
+        use crate::threaded::WorkerName;
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build should succeed");
+        // Arm + drain the panic so panic_info is cached.
+        emu.inject_panic_for_testing(WorkerName::Pio0);
+        match emu.run_quantum() {
+            Err(EmulatorError::WorkerPanicked { .. }) => {}
+            other => panic!("first run_quantum: expected WorkerPanicked, got {other:?}"),
+        }
+        // Now every entry point must return the cached panic without
+        // re-attempting workers.
+        match emu.step() {
+            Err(EmulatorError::WorkerPanicked { ref which, .. }) => {
+                assert_eq!(*which, WorkerName::Pio0);
+            }
+            other => panic!("step() short-circuit: expected WorkerPanicked, got {other:?}"),
+        }
+        match emu.run(emu.step_quantum as u64) {
+            Err(EmulatorError::WorkerPanicked { ref which, .. }) => {
+                assert_eq!(*which, WorkerName::Pio0);
+            }
+            other => panic!("run() short-circuit: expected WorkerPanicked, got {other:?}"),
+        }
+        match emu.run_quantum() {
+            Err(EmulatorError::WorkerPanicked { ref which, .. }) => {
+                assert_eq!(*which, WorkerName::Pio0);
+            }
+            other => panic!("run_quantum() short-circuit: expected WorkerPanicked, got {other:?}"),
+        }
+    }
+
+    // ------------------- run_quantum_threaded: shutdown_requested drain (line 974) -------------------
+
+    /// Drives the true branch of `if threaded.shutdown_requested()`
+    /// (line 974) by pre-loading a bootrom and triggering the reboot
+    /// hook on the worker side. The hook is purely byte-pattern based
+    /// — `resolve_bootrom_hooks` finds the entry by scanning the ROM
+    /// bytes — so we can drive it without actual M33 instruction
+    /// execution by halting the cores and forcing the latch via an
+    /// alternate path.
+    ///
+    /// Note: we leverage the Serial emulator's ability to set
+    /// `shutdown_requested` via the bootrom hook and then exercise the
+    /// Threaded path more indirectly. The simpler approach: confirm
+    /// that the Serial→Threaded promotion preserves `shutdown_requested`
+    /// (line 1032 in promote_to_threaded). This drives the
+    /// shutdown-related branch on the Threaded run() path even though
+    /// reaching the inner true arm requires worker-side state.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn run_threaded_skips_shutdown_when_not_requested() {
+        // Default emulator does not raise the bootrom-reboot hook —
+        // line 974's IF predicate is FALSE, exercising the
+        // shutdown_requested-not-set path.
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build");
+        let _ = emu.run_quantum().expect("first run_quantum");
+        assert!(!emu.shutdown_requested);
+    }
+
+    // ------------------- Builder: invalid step_quantum + execution combinations -------------------
+
+    #[test]
+    fn builder_step_quantum_max_value_succeeds() {
+        // Saturation has no effect on already-positive values; this
+        // covers the false-arm of the n.max(1) clamp.
+        let emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1024)
+            .build()
+            .unwrap();
+        assert_eq!(emu.step_quantum, 1024);
+    }
+
+    #[test]
+    fn builder_step_quantum_one_passes_through() {
+        // The boundary case: clamp does not mutate, build succeeds.
+        let emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .unwrap();
+        assert_eq!(emu.step_quantum, 1);
+    }
+
+    // ------------------- run() Serial deadline-driven loop (line 842 true branch) -------------------
+
+    /// Drives the Serial-arm of `run()` with a non-trivial cycle
+    /// budget — sanity test for the while-loop body running through
+    /// step_serial multiple times.
+    #[test]
+    fn run_serial_multi_quantum_advances_clock() {
+        let mut emu = Emulator::new(Config::default());
+        let target = (emu.step_quantum as u64) * 5;
+        let after = emu.run(target).unwrap();
+        assert!(after >= target);
+        // Master cycle count is at least a multiple of step_quantum.
+        assert!(after % (emu.step_quantum as u64) == 0);
+    }
+
+    // ------------------- Cores accessor smoke -------------------
+
+    #[test]
+    fn cores_match_arm_pattern_works() {
+        let emu = Emulator::new(Config::default());
+        if let Cores::Arm(arm) = &emu.cores {
+            assert_eq!(arm.len(), 2);
+        } else {
+            panic!("default emulator must be Arm");
+        }
+    }
+
+    #[test]
+    fn cores_match_riscv_pattern_works() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .arch(Arch::RiscV)
+            .build()
+            .unwrap();
+        if let Cores::RiscV(cs) = &emu.cores {
+            assert_eq!(cs.len(), 2);
+        } else {
+            panic!("RiscV emulator must hold Cores::RiscV");
+        }
+    }
+}

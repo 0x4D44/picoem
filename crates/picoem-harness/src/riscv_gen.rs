@@ -3583,4 +3583,606 @@ mod tests {
         assert_eq!(RESERVABLE_LO, 0x2000_0000);
         assert_eq!(RESERVABLE_HI - RESERVABLE_LO, 520 * 1024);
     }
+
+    // -------------------------------------------------------------------------
+    // Stage 5 — operand-randomiser corner branches.
+    //
+    // These tests force the inner-match arms of the per-class fuzz generators
+    // that are reached only on specific RNG draws. A 200-iteration fuzz with
+    // a fixed seed is deterministic and (by inspection of the resulting
+    // case histogram) reliably exercises each branch under test.
+    // -------------------------------------------------------------------------
+
+    /// Helper: extract the destination-register field (bits[11:7]) from a 32-bit
+    /// word. Matches every R/I/U/J-type encoding used by the fuzz generators.
+    fn rd_field(w: u32) -> u8 {
+        ((w >> 7) & 0x1F) as u8
+    }
+
+    /// Helper: extract the funct3 field (bits[14:12]).
+    fn funct3_field(w: u32) -> u32 {
+        (w >> 12) & 0x7
+    }
+
+    /// Helper: extract the rs1 field (bits[19:15]).
+    fn rs1_field(w: u32) -> u8 {
+        ((w >> 15) & 0x1F) as u8
+    }
+
+    #[test]
+    fn fuzz_zicsr_includes_rd_x0_with_register_variant() {
+        // gen_fuzz_zicsr at riscv_gen.rs:1995 picks `rd` and `rs1_or_uimm5`
+        // both from `0..32`, so over a sufficient sample at least one case
+        // must have `rd == 0` (CSR-write-only) AND a non-immediate funct3
+        // (1, 2, or 3 — the rs1 register variants). This exercises the
+        // `if !matches!(funct3, 5..=7) && rs1_or_uimm5 != 0` arm at line
+        // 2006 with rd=0 — a no-op-for-rd-but-still-side-effect-on-CSR
+        // case that is architecturally distinct from rd != 0.
+        let mut rng = StdRng::seed_from_u64(0xC5C5_C5C5);
+        let cs = gen_fuzz_zicsr(&mut rng, 200);
+        let saw_rd_zero_register = cs.iter().any(|tc| {
+            let w = tc.words[0];
+            rd_field(w) == 0
+                && (1..=3).contains(&funct3_field(w))
+                && rs1_field(w) != 0
+        });
+        assert!(
+            saw_rd_zero_register,
+            "no Zicsr case with rd=x0 + register-form funct3 in 200 draws",
+        );
+    }
+
+    #[test]
+    fn fuzz_zicsr_includes_rd_x0_with_immediate_variant() {
+        // The complementary arm: rd == 0 with funct3 ∈ {5,6,7} (immediate
+        // CSR variants — csrrwi/csrrsi/csrrci). This covers the false arm
+        // of `!matches!(funct3, 5..=7)` at line 2006, where reg_pre stays
+        // empty regardless of rs1_or_uimm5.
+        let mut rng = StdRng::seed_from_u64(0xA1B2_C3D4);
+        let cs = gen_fuzz_zicsr(&mut rng, 200);
+        let saw_rd_zero_imm = cs.iter().any(|tc| {
+            let w = tc.words[0];
+            rd_field(w) == 0 && (5..=7).contains(&funct3_field(w))
+        });
+        assert!(
+            saw_rd_zero_imm,
+            "no Zicsr case with rd=x0 + immediate funct3 in 200 draws",
+        );
+    }
+
+    #[test]
+    fn fuzz_zicsr_includes_rs1_x0_with_register_variant() {
+        // The `&& rs1_or_uimm5 != 0` arm at line 2006 must also see its
+        // false branch — rs1 == x0 with a register-form funct3. The
+        // generator must NOT push rs1=0 into reg_pre (avoids the harness
+        // attempting to seed x0).
+        let mut rng = StdRng::seed_from_u64(0x5EED_FACE);
+        let cs = gen_fuzz_zicsr(&mut rng, 300);
+        let mut found_x0_reg = false;
+        for tc in &cs {
+            let w = tc.words[0];
+            if (1..=3).contains(&funct3_field(w)) && rs1_field(w) == 0 {
+                found_x0_reg = true;
+                // Invariant: reg_pre must be empty for rs1==0 (line 2006
+                // guards with `rs1_or_uimm5 != 0`).
+                assert!(
+                    tc.reg_pre.is_empty(),
+                    "Zicsr with rs1=x0 must have empty reg_pre: {}",
+                    tc.name,
+                );
+            }
+        }
+        assert!(
+            found_x0_reg,
+            "no Zicsr case with rs1=x0 + register-form funct3 in 300 draws",
+        );
+    }
+
+    #[test]
+    fn fuzz_zicsr_includes_rd_nonzero_with_register_variant() {
+        // The opposite arm: rd != 0 with a register-form funct3 (the
+        // common case — most CSR reads/writes). Both arms of the rd
+        // truthiness across the fuzz batch must be observable in case
+        // names, but the generator emits a uniform `fuzz_zicsr_{i}`
+        // name; we verify via the encoded word's rd field instead.
+        let mut rng = StdRng::seed_from_u64(0xFEED_BEEF);
+        let cs = gen_fuzz_zicsr(&mut rng, 200);
+        let saw_rd_nonzero = cs.iter().any(|tc| {
+            let w = tc.words[0];
+            rd_field(w) != 0 && (1..=3).contains(&funct3_field(w))
+        });
+        assert!(
+            saw_rd_nonzero,
+            "no Zicsr case with rd != x0 in 200 draws",
+        );
+    }
+
+    #[test]
+    fn fuzz_zicsr_reg_pre_invariants() {
+        // Cross-check: every reg_pre entry must reference rs1 (the rs1
+        // field of the encoded CSR instruction), and only one entry at
+        // most is appended. Drives the `reg_pre.push(...)` arm at line
+        // 2007 across both branches via assertion.
+        let mut rng = StdRng::seed_from_u64(0xBA5E_BAAD);
+        let cs = gen_fuzz_zicsr(&mut rng, 100);
+        for tc in &cs {
+            let w = tc.words[0];
+            let funct3 = funct3_field(w);
+            let rs1 = rs1_field(w);
+            if (1..=3).contains(&funct3) && rs1 != 0 {
+                // Register variant with a real rs1 — exactly one reg_pre.
+                assert_eq!(
+                    tc.reg_pre.len(),
+                    1,
+                    "Zicsr register variant should seed rs1: {}",
+                    tc.name,
+                );
+                assert_eq!(tc.reg_pre[0].0, rs1);
+            } else {
+                // Immediate variant or rs1==0 — no reg_pre entries.
+                assert!(
+                    tc.reg_pre.is_empty(),
+                    "Zicsr non-register-or-x0 should have empty reg_pre: {} (funct3={funct3} rs1={rs1})",
+                    tc.name,
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32i_alu — exercise both the I-type and R-type dispatch arms
+    // plus the SLLI/SRLI/SRAI shift-immediate path. The 50/30/remainder
+    // weighting at lines 1270-1295 means a small sample (20 cases) covers
+    // each arm with high probability under any non-degenerate seed.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32i_alu_dispatch_includes_i_type_and_r_type() {
+        let mut rng = StdRng::seed_from_u64(0x1A1A_2B2B);
+        let cs = gen_fuzz_rv32i_alu(&mut rng, 200);
+        let mut saw_i = false;
+        let mut saw_r = false;
+        for tc in &cs {
+            let opcode = tc.words[0] & 0x7F;
+            if opcode == OPC_OP_IMM {
+                saw_i = true;
+            } else if opcode == OPC_OP {
+                saw_r = true;
+            }
+        }
+        assert!(saw_i, "no I-type ALU draw in 200 cases");
+        assert!(saw_r, "no R-type ALU draw in 200 cases");
+    }
+
+    #[test]
+    fn fuzz_rv32i_alu_includes_shift_immediate_path() {
+        // The shift-immediate arm at line 1278 emits an I-type opcode with
+        // funct3 ∈ {1, 5}. Verify at least one such case appears.
+        let mut rng = StdRng::seed_from_u64(0x4F4F_5050);
+        let cs = gen_fuzz_rv32i_alu(&mut rng, 200);
+        let saw_shift_imm = cs.iter().any(|tc| {
+            let w = tc.words[0];
+            (w & 0x7F) == OPC_OP_IMM
+                && matches!(funct3_field(w), 1 | 5)
+        });
+        assert!(
+            saw_shift_imm,
+            "no shift-immediate (funct3 in {{1,5}}) in 200 ALU cases",
+        );
+    }
+
+    #[test]
+    fn fuzz_rv32i_alu_includes_subtract_r_type() {
+        // The R-type subtract path uses funct3=0, funct7=0x20 with a 30%
+        // sub-draw at line 1289. Over 500 cases at least one R-type SUB
+        // must appear.
+        let mut rng = StdRng::seed_from_u64(0x7000_0F0F);
+        let cs = gen_fuzz_rv32i_alu(&mut rng, 500);
+        let saw_sub = cs.iter().any(|tc| {
+            let w = tc.words[0];
+            (w & 0x7F) == OPC_OP
+                && funct3_field(w) == 0
+                && ((w >> 25) & 0x7F) == 0x20
+        });
+        assert!(saw_sub, "no R-type SUB (funct7=0x20) in 500 ALU cases");
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32i_mem — exercise both is_load arms and the rs2-collision
+    // branch at line 1352 (`if rs2 != 0 && rs2 != rs1`).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32i_mem_includes_load_and_store() {
+        let mut rng = StdRng::seed_from_u64(0xAA55_AA55);
+        let cs = gen_fuzz_rv32i_mem(&mut rng, 200);
+        let loads = cs
+            .iter()
+            .filter(|tc| tc.words[0] & 0x7F == OPC_LOAD)
+            .count();
+        let stores = cs
+            .iter()
+            .filter(|tc| tc.words[0] & 0x7F == OPC_STORE)
+            .count();
+        assert!(loads > 0, "no load cases in 200 mem draws");
+        assert!(stores > 0, "no store cases in 200 mem draws");
+    }
+
+    #[test]
+    fn fuzz_rv32i_mem_seeds_addr_regs() {
+        // Every mem case must list rs1 in addr_regs and seed it via
+        // reg_pre. Verifies both the addr_regs vector population and the
+        // first reg_pre entry's invariant.
+        let mut rng = StdRng::seed_from_u64(0xDEEF_F00D);
+        let cs = gen_fuzz_rv32i_mem(&mut rng, 50);
+        for tc in &cs {
+            let w = tc.words[0];
+            let rs1 = rs1_field(w);
+            assert!(
+                tc.addr_regs.contains(&rs1),
+                "addr_regs missing rs1: {}",
+                tc.name,
+            );
+            assert!(
+                tc.reg_pre.iter().any(|(r, _)| *r == rs1),
+                "reg_pre missing rs1 seed: {}",
+                tc.name,
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32i_misaligned — both arms of the `is_load` branch +
+    // every funct3 in the misaligned table (lines 1374-1392).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32i_misaligned_traps_match_op_kind() {
+        // Per line 1381: load → trap=4 (load-misaligned), store → trap=6.
+        let mut rng = StdRng::seed_from_u64(0xBABE_FACE);
+        let cs = gen_fuzz_rv32i_misaligned(&mut rng, 100);
+        for tc in &cs {
+            let opcode = tc.words[0] & 0x7F;
+            let trap = tc.expect_trap.expect("misaligned must trap");
+            if opcode == OPC_LOAD {
+                assert_eq!(trap, 4, "load misaligned trap = {trap}: {}", tc.name);
+            } else if opcode == OPC_STORE {
+                assert_eq!(trap, 6, "store misaligned trap = {trap}: {}", tc.name);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32i_branch — JAL (choice=1) and B-type (choice=0) arms.
+    // The choice draw is uniform over {0,1}; over 100 cases both must appear.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32i_branch_dispatch_includes_jal_and_branch() {
+        let mut rng = StdRng::seed_from_u64(0x2222_3333);
+        let cs = gen_fuzz_rv32i_branch(&mut rng, 100);
+        let mut saw_branch = false;
+        let mut saw_jal = false;
+        for tc in &cs {
+            let head = tc.words[0];
+            let opcode = head & 0x7F;
+            if opcode == OPC_BRANCH {
+                saw_branch = true;
+            } else if opcode == OPC_JAL {
+                saw_jal = true;
+            }
+        }
+        assert!(saw_branch, "no B-type in 100 branch cases");
+        assert!(saw_jal, "no JAL in 100 branch cases");
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32i_upper — both LUI and AUIPC arms (line 1486).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32i_upper_dispatch_includes_lui_and_auipc() {
+        let mut rng = StdRng::seed_from_u64(0x6677_8899);
+        let cs = gen_fuzz_rv32i_upper(&mut rng, 100);
+        let mut saw_lui = false;
+        let mut saw_auipc = false;
+        for tc in &cs {
+            let opcode = tc.words[0] & 0x7F;
+            if opcode == OPC_LUI {
+                saw_lui = true;
+            } else if opcode == OPC_AUIPC {
+                saw_auipc = true;
+            }
+        }
+        assert!(saw_lui, "no LUI in 100 upper cases");
+        assert!(saw_auipc, "no AUIPC in 100 upper cases");
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32a — `if op5 == 0b00010` (LR.W → rs2=0) at line 1544 and
+    // the SC.W seed-LR prelude at line 1557.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32a_lr_word_zeros_rs2() {
+        let mut rng = StdRng::seed_from_u64(0xAABB_CCDD);
+        let cs = gen_fuzz_rv32a(&mut rng, 200);
+        // Pull out only LR.W cases (op5 == 0b00010 → funct7's top 5 bits).
+        let lr_cases: Vec<&RiscvTestCase> = cs
+            .iter()
+            .filter(|tc| {
+                let w = tc.words[tc.words.len() - 1];
+                ((w >> 27) & 0x1F) == 0b00010
+            })
+            .collect();
+        assert!(!lr_cases.is_empty(), "no LR.W in 200 rv32a draws");
+        for tc in lr_cases {
+            // The trailing word must have rs2 == 0.
+            let w = tc.words[tc.words.len() - 1];
+            let rs2 = (w >> 20) & 0x1F;
+            assert_eq!(rs2, 0, "LR.W rs2 not zero: {}", tc.name);
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32a_sc_word_emits_lr_seed_prelude() {
+        // SC.W uses op5 = 0b00011. The generator must prefix it with an
+        // LR.W to the same address (line 1559) so the test exercises the
+        // `if op5 == 0b00011 { ... }` arm.
+        let mut rng = StdRng::seed_from_u64(0xDEAD_C0DE);
+        let cs = gen_fuzz_rv32a(&mut rng, 300);
+        let mut saw_sc = false;
+        for tc in &cs {
+            let last = tc.words[tc.words.len() - 1];
+            let op5 = (last >> 27) & 0x1F;
+            if op5 == 0b00011 {
+                saw_sc = true;
+                // Prefix word must be LR.W with the same rs1.
+                assert_eq!(tc.words.len(), 2, "SC must have LR seed: {}", tc.name);
+                let lr = tc.words[0];
+                let lr_op5 = (lr >> 27) & 0x1F;
+                assert_eq!(lr_op5, 0b00010, "SC seed not LR.W: {}", tc.name);
+                let lr_rs1 = (lr >> 15) & 0x1F;
+                let sc_rs1 = (last >> 15) & 0x1F;
+                assert_eq!(lr_rs1, sc_rs1, "LR/SC rs1 mismatch: {}", tc.name);
+            }
+        }
+        assert!(saw_sc, "no SC.W in 300 rv32a draws");
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32m — funct3 spans 0..8 inclusively. Verify the full
+    // encoding covers MUL/MULH/MULHSU/MULHU + DIV/DIVU/REM/REMU.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32m_covers_all_funct3() {
+        let mut rng = StdRng::seed_from_u64(0xEDED_FAFA);
+        let cs = gen_fuzz_rv32m(&mut rng, 200);
+        let mut seen = [false; 8];
+        for tc in &cs {
+            let w = tc.words[0];
+            let f3 = funct3_field(w) as usize;
+            seen[f3] = true;
+        }
+        for (i, hit) in seen.iter().enumerate() {
+            assert!(hit, "rv32m funct3={i} not generated in 200 draws");
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32m_handles_aliased_rs1_rs2() {
+        // The `if rs2 != rs1` guard at line 1514 must take both arms.
+        // Force the issue: with 300 draws, x1..x31 (skipping x3, x31)
+        // gives a 1/29 collision rate, so collisions are guaranteed.
+        let mut rng = StdRng::seed_from_u64(0xC1C1_D2D2);
+        let cs = gen_fuzz_rv32m(&mut rng, 300);
+        let mut saw_alias = false;
+        let mut saw_distinct = false;
+        for tc in &cs {
+            let w = tc.words[0];
+            let rs1 = rs1_field(w);
+            let rs2 = ((w >> 20) & 0x1F) as u8;
+            if rs1 == rs2 {
+                saw_alias = true;
+                // Aliased case: only one reg_pre entry (rs1 == rs2).
+                assert_eq!(
+                    tc.reg_pre.len(),
+                    1,
+                    "aliased rs1==rs2 should only seed once: {}",
+                    tc.name,
+                );
+            } else {
+                saw_distinct = true;
+                // Distinct case: two reg_pre entries.
+                assert_eq!(
+                    tc.reg_pre.len(),
+                    2,
+                    "distinct rs1/rs2 should seed both: {}",
+                    tc.name,
+                );
+            }
+        }
+        assert!(saw_alias, "no aliased rs1==rs2 case in 300 draws");
+        assert!(saw_distinct, "no distinct rs1/rs2 case in 300 draws");
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_csr_side_effect — read_back branch (funct3=0 vs funct3=1)
+    // at line 2135 plus the SAFE_VALUES rs1 seed.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_csr_side_effect_branch_funct3_split() {
+        // The branch funct3 alternates between 0 (BEQ) and 1 (BNE) based
+        // on `gen_bool(0.5)` at line 2135. Both must appear.
+        let mut rng = StdRng::seed_from_u64(0x1357_2468);
+        let cs = gen_fuzz_csr_side_effect(&mut rng, 100);
+        let mut saw_beq = false;
+        let mut saw_bne = false;
+        for tc in &cs {
+            // Each case is 3 words: csrrw, branch, NOP. Branch is words[1].
+            assert_eq!(tc.words.len(), 3);
+            let f3 = funct3_field(tc.words[1]);
+            if f3 == 0 {
+                saw_beq = true;
+            }
+            if f3 == 1 {
+                saw_bne = true;
+            }
+        }
+        assert!(saw_beq, "no BEQ branch funct3=0 in 100 cases");
+        assert!(saw_bne, "no BNE branch funct3=1 in 100 cases");
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_pmp — the `read_back` branch at line 2228 produces either
+    // `[csrrw]` (40%) or `[csrrw, csrrs]` (60%), and the rd1/rd2 collision
+    // loop at line 2232 enforces distinctness.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_pmp_includes_single_and_readback_shapes() {
+        let mut rng = StdRng::seed_from_u64(0x9999_AAAA);
+        let cs = gen_fuzz_pmp(&mut rng, 200);
+        let mut saw_single = false;
+        let mut saw_readback = false;
+        for tc in &cs {
+            match tc.words.len() {
+                1 => saw_single = true,
+                2 => {
+                    saw_readback = true;
+                    let rd1 = rd_field(tc.words[0]);
+                    let rd2 = rd_field(tc.words[1]);
+                    assert_ne!(
+                        rd1, rd2,
+                        "rd1/rd2 collision in PMP read-back: {}",
+                        tc.name,
+                    );
+                }
+                n => panic!("unexpected pmp word count {n} in {}", tc.name),
+            }
+        }
+        assert!(saw_single, "no single-write PMP case in 200 draws");
+        assert!(saw_readback, "no read-back PMP case in 200 draws");
+    }
+
+    #[test]
+    fn fuzz_pmp_reg_pre_pool_is_l_clear() {
+        // Per the comment at lines 2186-2189, every value in the pool
+        // must have bit 7, 15, 23, 31 clear (no L bits in any pmpcfg
+        // byte). The generator additionally masks `& 0x7F7F_7F7F` at
+        // line 2221 — verify the post-mask invariant.
+        let mut rng = StdRng::seed_from_u64(0x1F1F_2E2E);
+        let cs = gen_fuzz_pmp(&mut rng, 100);
+        for tc in &cs {
+            for (_, v) in &tc.reg_pre {
+                assert_eq!(
+                    v & 0x8080_8080,
+                    0,
+                    "PMP fuzz value carries an L bit: {} ({v:#010X})",
+                    tc.name,
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_rv32c — Zcmp Q2 (mix < 10), compressed-memory (mix < 35),
+    // compressed-control-flow (mix < 50), and arithmetic (else) arms at
+    // lines 1607-1638.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32c_dispatch_covers_all_four_arms() {
+        // 200 cases × 4 mix bands ⇒ each band reached with high probability.
+        let mut rng = StdRng::seed_from_u64(0x44CC_88EE);
+        let cs = gen_fuzz_rv32c(&mut rng, 200);
+        let mut saw_zcmp_trap = false;
+        let mut saw_mem = false;
+        let mut saw_branch = false;
+        let mut saw_arith = false;
+        for tc in &cs {
+            if tc.expect_trap == Some(2) {
+                // Zcmp Q2 illegal — mix < 10 arm.
+                saw_zcmp_trap = true;
+            } else if tc.name.starts_with("fuzz_rvc_mem_") {
+                saw_mem = true;
+            } else if tc.name.starts_with("fuzz_rvc_br_") {
+                saw_branch = true;
+            } else if tc.name.starts_with("fuzz_rvc_") {
+                saw_arith = true;
+            }
+        }
+        assert!(saw_zcmp_trap, "no Zcmp Q2 illegal case in 200 RVC draws");
+        assert!(saw_mem, "no compressed memory case in 200 RVC draws");
+        assert!(saw_branch, "no compressed branch case in 200 RVC draws");
+        assert!(saw_arith, "no compressed arithmetic case in 200 RVC draws");
+    }
+
+    // -------------------------------------------------------------------------
+    // gen_fuzz_zifencei — three-arm dispatch (FENCE.I alone / FENCE alone /
+    // FENCE.I + ADDI) at lines 2041-2049. Verify each arm is reached.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_zifencei_includes_each_dispatch_arm() {
+        let mut rng = StdRng::seed_from_u64(0x7777_8888);
+        let cs = gen_fuzz_zifencei(&mut rng, 200);
+        let mut saw_fence_i_alone = false;
+        let mut saw_fence_alone = false;
+        let mut saw_fence_i_addi = false;
+        for tc in &cs {
+            match tc.words.len() {
+                1 => {
+                    let f3 = funct3_field(tc.words[0]);
+                    if f3 == 1 {
+                        saw_fence_i_alone = true;
+                    } else {
+                        saw_fence_alone = true;
+                    }
+                }
+                2 => saw_fence_i_addi = true,
+                n => panic!("unexpected zifencei word count {n}"),
+            }
+        }
+        assert!(saw_fence_i_alone, "no standalone FENCE.I in 200 cases");
+        assert!(saw_fence_alone, "no standalone FENCE in 200 cases");
+        assert!(saw_fence_i_addi, "no FENCE.I + ADDI in 200 cases");
+    }
+
+    // -------------------------------------------------------------------------
+    // generate_fuzz top-level — verify the residue-into-ALU absorption
+    // rule (lines 2289-2293) produces an exact total count.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn generate_fuzz_total_count_exact() {
+        let mut rng = StdRng::seed_from_u64(0xDADA_FAFA);
+        let cases = generate_fuzz(&mut rng, 250);
+        assert_eq!(cases.len(), 250, "total count must match request");
+    }
+
+    #[test]
+    fn generate_fuzz_zero_count_is_empty() {
+        // Edge: count == 0 must produce an empty Vec.
+        let mut rng = StdRng::seed_from_u64(0x1111_2222);
+        let cases = generate_fuzz(&mut rng, 0);
+        assert!(cases.is_empty(), "zero count must be empty");
+    }
+
+    #[test]
+    fn generate_fuzz_small_count_residue_into_alu() {
+        // Each class's allocation is `(count * weight_bp / 10_000)` —
+        // for count == 1 this rounds every class to 0 except the residue.
+        // The residue (== 1) must land in the ALU bucket.
+        let mut rng = StdRng::seed_from_u64(0x3333_4444);
+        let cases = generate_fuzz(&mut rng, 1);
+        assert_eq!(cases.len(), 1);
+        assert_eq!(
+            cases[0].class,
+            RiscvClass::Rv32iAlu,
+            "single case must be the residue-allocated ALU draw",
+        );
+    }
 }
