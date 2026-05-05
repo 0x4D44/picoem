@@ -1,42 +1,53 @@
-import json, re
+import json, os, re, sys
 from collections import defaultdict
 
-with open('/tmp/cov-full.json') as f:
+# Coverage analyzer — paths are normalised to forward slashes so the patterns
+# below work on Windows too (where llvm-cov emits backslashes).
+COV_PATH = os.environ.get('COV_JSON', '/tmp/cov-full.json')
+with open(COV_PATH) as f:
     data = json.load(f)
 
 # Define the in-scope filter — exclude harness bins, hardware-oracle support libs,
 # TUI app shells, third_party, registry, rustc internals.
+# Paths use forward slashes only (we normalise input below).
 EXCLUDE_PATTERNS = [
     r'/rustc/[0-9a-f]+/',
     r'\.cargo/registry/',
     r'\.cargo/git/',
     r'/rustup/toolchains/',
-    r'mdpicoem/target/llvm-cov-target',
-    r'mdpicoem/third_party/',
-    r'mdpicoem-harness/src/bin/',
-    r'mdpicoem-harness/src/(silicon_scenarios|isr_scenarios|isr_scenarios_rp2040|dualcore_cases|cycle_cases|bank_conflict_cases|silicon_oracle|gdb_client|ieee754_ref|onerom_(stress|serving_oracle|serving_oracle_cpu|cpu_speed_grade|trace|glue_dma|snapshot_fmt|sync)|picogus_pins)\.rs',
-    r'mdrp2040app/src/(main|ui|sim|firmware|panels)',
-    r'mdrp2350app/src/(main|ui|sim|firmware|panels)',
-    r'mdpicoem/crates/[^/]+/tests/',
-    r'mdpicoem/crates/[^/]+/src/(tests|tests_narrow|tests_stage3_thumb32|pio_tests)\.rs$',
-    r'mdpicoem/crates/[^/]+/src/core_riscv/tests_(common|p1|p2|p3|p4|p5|p6)\.rs$',
+    r'/target/llvm-cov-target/',
+    r'/third_party/',
+    # New crate names (post 2026.04.14 restructure).
+    r'/picoem-harness/src/bin/',
+    r'/picoem-harness/src/(silicon_scenarios|isr_scenarios|isr_scenarios_rp2040|dualcore_cases|cycle_cases|bank_conflict_cases|silicon_oracle|gdb_client|ieee754_ref|onerom_(stress|serving_oracle|serving_oracle_cpu|cpu_speed_grade|trace|glue_dma|snapshot_fmt|sync)|picogus_pins|silicon_periph_rp2040|probe_diff_rp2040_lib|test_silicon_common)\.rs$',
+    r'/rp2040-emu-tui/src/(main|ui|sim|firmware|panels)',
+    r'/rp2350-emu-tui/src/(main|ui|sim|firmware|panels)',
+    r'/crates/[^/]+/tests/',
+    r'/crates/[^/]+/src/(tests|tests_narrow|tests_stage3_thumb32|pio_tests)\.rs$',
+    r'/crates/[^/]+/src/core_riscv/tests_(common|p1|p2|p3|p4|p5|p6)\.rs$',
 ]
 exclude_re = re.compile('|'.join(EXCLUDE_PATTERNS))
 
+# Anchor — only attribute files that live under a /crates/<name>/ folder of this repo.
+ANCHOR_RE = re.compile(r'/crates/([^/]+)/')
+
+def normalise(path):
+    return path.replace('\\', '/')
+
 def is_in_scope(path):
-    return not exclude_re.search(path) and '/mdpicoem/' in path
+    p = normalise(path)
+    if not ANCHOR_RE.search(p):
+        return False
+    return not exclude_re.search(p)
 
 def crate_for(path):
-    m = re.search(r'/mdpicoem/crates/([^/]+)/', path)
-    if not m:
-        return None
-    return m.group(1)
+    m = ANCHOR_RE.search(normalise(path))
+    return m.group(1) if m else None
 
 def file_key(path):
-    m = re.search(r'/mdpicoem/(crates/[^/]+/src/[^?]+)', path)
-    if m:
-        return m.group(1)
-    return path
+    p = normalise(path)
+    m = re.search(r'(crates/[^/]+/src/[^?]+)', p)
+    return m.group(1) if m else p
 
 per_crate = defaultdict(lambda: {'br_cov': 0, 'br_tot': 0, 'reg_cov': 0, 'reg_tot': 0, 'fn_cov': 0, 'fn_tot': 0, 'ln_cov': 0, 'ln_tot': 0})
 per_file = defaultdict(lambda: {'br_cov': 0, 'br_tot': 0, 'reg_cov': 0, 'reg_tot': 0, 'fn_cov': 0, 'fn_tot': 0, 'ln_cov': 0, 'ln_tot': 0})
