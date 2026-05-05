@@ -218,6 +218,11 @@ fn run_clippy() -> QualityResult {
     cmd.args([
         "clippy",
         "--workspace",
+        // epio-sys is intentionally outside `default-members` (needs clang +
+        // vendored submodules); it contradicts that exclusion to drag it
+        // into the harness's `--workspace` sweep.
+        "--exclude",
+        "epio-sys",
         "--lib",
         "--tests",
         "--message-format=short",
@@ -315,6 +320,10 @@ fn run_cargo_test() -> SuiteResults {
     cmd.args([
         "test",
         "--workspace",
+        // See `run_clippy` — epio-sys is excluded from `default-members`
+        // by design.
+        "--exclude",
+        "epio-sys",
         "--lib",
         "--tests",
         "--release",
