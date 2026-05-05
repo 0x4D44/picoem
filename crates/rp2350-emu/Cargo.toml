@@ -62,7 +62,7 @@ threading = []
 testing = []
 
 [dependencies]
-picoem-common = { version = "0.1", path = "../picoem-common" }
+picoem-common = { version = "0.2", path = "../picoem-common" }
 tracing = { workspace = true }
 # SHA-256 block compressor — HLD V5 §7.D.6. `compress` feature exposes
 # the padding-less `compress256` entry point, which matches the RP2350

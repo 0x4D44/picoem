@@ -14,6 +14,23 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+## [2026-05-04]
+
+Second publication round. Picks up the wide-GPIO bus work (RP2354 high-half
+GPIOs 32..47) and the PIO `GPIOBASE` high-bank sampling support.
+
+### Crates published to crates.io
+
+| Crate | Version | Change |
+|---|---|---|
+| `picoem-common` | `0.2.0` | New public PIO API: `PioBlock::gpio_base`, `local_to_physical_pins`, `step_with_pins`, `step_n_with_pins`. Existing `step` / `step_n` retained as wrappers. |
+| `picoem-devices` | `0.1.2` | README polish; no API change. |
+| `rp2350-emu` | `0.2.0` | New public API on `Bus` and `Emulator` for GPIOs 32..47 (`gpio_in_hi`, `gpio_external_in_hi`, `gpio_external_mask_hi`); `Emulator::gpio_read` extended to pin range 0..47. PIO `GPIOBASE` register honoured for SM input/output windows. Picks up `picoem-common` 0.2. |
+| `rp2040-emu` | `0.1.3` | Internal-only clippy 1.95 lint sweep; picks up `picoem-common` 0.2. No public API change. |
+| `picoem-debug` | `0.1.1` | Metadata refresh; placeholder crate. |
+| `rp2350-emu-tui` | `0.1.2` | README polish; tracks `rp2350-emu` 0.2. |
+| `rp2040-emu-tui` | `0.1.2` | README polish; tracks `rp2040-emu` 0.1. |
+
 ## [Initial public release] — 2026-05-03
 
 First publication of the picoem workspace as open source under the
