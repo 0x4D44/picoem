@@ -21,7 +21,15 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
-tracing = { version = "0.1", features = ["release_max_level_info"] }
+# Plain `tracing` here — the `release_max_level_info` cap is binary-only
+# (per tracing's own docs) because Cargo unifies features across the dep
+# graph. If a library crate enables the cap, every downstream consumer
+# inherits it and their own `debug!`/`trace!` calls get compiled out in
+# release without their consent. The cap is added on each binary-producing
+# crate (picoem-harness, rp2350-emu-tui, rp2040-emu-tui) instead; feature
+# unification still propagates it down to our libraries when they're built
+# into our binaries, so the in-workspace perf benefit is preserved.
+tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.clippy]

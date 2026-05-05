@@ -203,7 +203,7 @@ Currently instrumented: exception entry/return, HardFault escalation, bus faults
 - **Test-only `eprintln!`** inside `#[test]` — test runner captures this already.
 
 ### Zero overhead guarantee
-Library crates use `release_max_level_info`, so `trace!()` and `debug!()` compile to **nothing** in `--release`. No performance impact on the hot path. Only `info!`/`error!` survive in release, and those are on cold paths only.
+Binary crates (`picoem-harness`, `rp2350-emu-tui`, `rp2040-emu-tui`) set the `release_max_level_info` feature on `tracing`. Cargo's feature unification propagates that cap down to our libraries when they're built into those binaries, so `trace!()` and `debug!()` compile to **nothing** in `--release`. No performance impact on the hot path. Only `info!`/`error!` survive in release, and those are on cold paths only. The cap is deliberately *not* set on library crates' own dependency entries — doing so would leak through to external consumers (a `tracing` footgun the maintainers explicitly warn against).
 
 ### Runtime filtering
 All binaries initialise a `tracing-subscriber` (harness: `harness_tracing_init()`, apps: inline). Default level is `warn`. Override with `RUST_LOG`:
