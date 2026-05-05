@@ -29957,3 +29957,461 @@ mod coprocessor_branches {
         );
     }
 }
+
+// ============================================================================
+// Stage 3: branch-coverage residue for `bus/ppb.rs` and `dma.rs`.
+// ============================================================================
+//
+// Targets the small set of branches not exercised by the existing PPB and
+// DMA test modules. Each test is documented with the specific arm it
+// targets. Append-only — no production code touched.
+mod stage3_ppb_dma_branches {
+    use crate::bus::Bus;
+    use crate::bus::ppb::{ICSR_NMIPENDSET, ICSR_PENDSTSET, ICSR_PENDSVSET, Ppb};
+    use crate::dma::{DMA_BASE, Dma};
+    use crate::dreq::DREQ_FORCE;
+    use std::sync::atomic::Ordering;
+
+    // ------------------------------------------------------------------
+    // PPB — clear_active / set_irq_active out-of-range guards.
+    //
+    // `clear_active` line 645+ has two arms; the inner `word_idx <
+    // NVIC_BIT_WORDS` guard (line 649) takes its FALSE arm only when
+    // `(exc_num - 16) / 32 >= 2`, i.e. exc_num >= 80.
+    //
+    // `set_irq_active` line 716 has its FALSE arm only when `irq >=
+    // IRQ_COUNT` (52). Existing tests only call with `irq=5`/`irq=7` so
+    // the false arm is uncovered.
+    // ------------------------------------------------------------------
+
+    /// `clear_active(exc_num)` with `(exc_num - 16) / 32 >= NVIC_BIT_WORDS`
+    /// must take the inner false arm and leave `nvic_iabr` untouched.
+    #[test]
+    fn clear_active_exc_num_above_nvic_word_range_is_noop() {
+        let mut ppb = Ppb::default();
+        // Pre-load both NVIC_IABR words with sentinels.
+        ppb.nvic_iabr[0].store(0xFFFF_FFFF, Ordering::Relaxed);
+        ppb.nvic_iabr[1].store(0xFFFF_FFFF, Ordering::Relaxed);
+        // exc_num=100 → irq=84 → word_idx=2 ≥ NVIC_BIT_WORDS(=2).
+        ppb.clear_active(100);
+        assert_eq!(ppb.nvic_iabr[0].load(Ordering::Relaxed), 0xFFFF_FFFF);
+        assert_eq!(ppb.nvic_iabr[1].load(Ordering::Relaxed), 0xFFFF_FFFF);
+    }
+
+    /// `set_irq_active(irq)` for `irq >= IRQ_COUNT` must leave NVIC_IABR
+    /// untouched (no spurious bit set in the high half).
+    #[test]
+    fn set_irq_active_above_irq_count_is_noop() {
+        let mut ppb = Ppb::default();
+        // irq=60 — > IRQ_COUNT (52) but < 64, so word/bit math is fine
+        // and the only thing stopping the write is the guard.
+        ppb.set_irq_active(60);
+        // Both halves stay 0.
+        assert_eq!(ppb.nvic_iabr[0].load(Ordering::Relaxed), 0);
+        assert_eq!(ppb.nvic_iabr[1].load(Ordering::Relaxed), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // PPB — SysTick branches uncovered by existing tests.
+    //
+    // L774  delta saturation when `delta > u32::MAX`.
+    // L823  TICKINT=0 path on the loop's underflow arm (existing
+    //       `test_systick_tickint_pends_exception` covers TICKINT=1; the
+    //       FALSE arm is reached by `test_systick_single_underflow` which
+    //       writes ENABLE without TICKINT — kept here to assert the
+    //       no-pend behaviour explicitly inside this module).
+    // L833  RVR=0 break in the loop body, with CVR>0 entry (distinct
+    //       from `test_systick_cvr_zero_rvr_zero_counter_stops` which
+    //       early-exits at L798).
+    // ------------------------------------------------------------------
+
+    /// `delta > u32::MAX` saturates to `u32::MAX` rem; the resulting
+    /// systick advance must still tick correctly. Confirms the saturation
+    /// is non-fatal: with RVR=100, CVR=50, an enormous delta should
+    /// underflow many times and leave CVR at the post-reload value.
+    #[test]
+    fn systick_advance_delta_above_u32_max_saturates() {
+        let mut ppb = Ppb {
+            syst_csr: 1,    // ENABLE only (TICKINT=0)
+            syst_rvr: 100,
+            syst_cvr: 50,
+            last_systick_cycles: 0,
+            ..Ppb::default()
+        };
+        // delta = u64::MAX + 1 wraps so we just pick a value > u32::MAX.
+        ppb.systick_advance(u64::from(u32::MAX) + 1_000);
+        // COUNTFLAG must have latched at least once.
+        assert_ne!(ppb.syst_csr & (1 << 16), 0, "saturated advance must underflow");
+        // ICSR.PENDSTSET stays clear (TICKINT=0).
+        assert_eq!(ppb.icsr & (1 << 26), 0);
+        // CVR must be a valid 24-bit value.
+        assert!(ppb.syst_cvr <= 0x00FF_FFFF);
+    }
+
+    /// CVR initially > 0, RVR = 0; first underflow reloads CVR to 0 then
+    /// the L833 `if RVR == 0 { break }` arm fires. Distinct from the
+    /// CVR=0/RVR=0 case which exits at L798.
+    #[test]
+    fn systick_cvr_positive_rvr_zero_breaks_after_first_underflow() {
+        let mut ppb = Ppb {
+            syst_csr: 1 | 2,    // ENABLE + TICKINT
+            syst_rvr: 0,
+            syst_cvr: 5,
+            last_systick_cycles: 0,
+            ..Ppb::default()
+        };
+        // delta=10 — easily underflows from cvr=5.
+        ppb.systick_advance(10);
+        // After underflow with RVR=0: cvr loads to 0 and we break out.
+        assert_eq!(ppb.syst_cvr, 0, "post-underflow CVR=RVR=0");
+        // Single fire (TICKINT=1 → PENDSTSET).
+        assert_ne!(ppb.icsr & (1 << 26), 0, "single fire must pend");
+        assert_ne!(ppb.syst_csr & (1 << 16), 0);
+    }
+
+    /// Underflow with TICKINT=0 must NOT pend SysTick (regression guard
+    /// for the L823 false arm).
+    #[test]
+    fn systick_underflow_without_tickint_does_not_pend() {
+        let mut ppb = Ppb {
+            syst_csr: 1, // ENABLE only
+            syst_rvr: 10,
+            syst_cvr: 5,
+            last_systick_cycles: 0,
+            ..Ppb::default()
+        };
+        ppb.systick_advance(20);
+        // COUNTFLAG must latch but PENDSTSET must NOT.
+        assert_ne!(ppb.syst_csr & (1 << 16), 0);
+        assert_eq!(ppb.icsr & (1 << 26), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // PPB — ICSR W1S/W1C composite scenarios.
+    //
+    // The existing `bus/ppb.rs` test mod covers each ICSR bit in
+    // isolation. This batch verifies (a) NMIPENDSET stickiness (no CLR
+    // exists) and (b) PENDSTSET/PENDSTCLR composite behaviour.
+    // ------------------------------------------------------------------
+
+    /// PENDSTSET via direct PPB write, then PENDSTCLR clears it.
+    /// Mirrors the SET/CLR symmetry test for PENDSV, on the SysTick side.
+    /// Goes through `Ppb::write32` directly because PPB addresses are
+    /// served by per-core PPB instances reachable through the core's
+    /// `bus_write32` wrapper, not the bus.
+    #[test]
+    fn icsr_pendst_set_then_clr_via_ppb() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED04, ICSR_PENDSTSET);
+        assert_ne!(ppb.icsr & ICSR_PENDSTSET, 0, "PENDSTSET must latch");
+        // Now write PENDSTCLR (bit 25) — must clear PENDSTSET (bit 26).
+        ppb.write32(0xE000_ED04, 1u32 << 25);
+        assert_eq!(ppb.icsr & ICSR_PENDSTSET, 0);
+    }
+
+    /// NMIPENDSET has no architectural CLR — once latched, software
+    /// cannot clear it. Confirms writing `0` to ICSR preserves the bit.
+    #[test]
+    fn icsr_nmipendset_persists_across_zero_write() {
+        let mut ppb = Ppb {
+            icsr: ICSR_NMIPENDSET,
+            ..Ppb::default()
+        };
+        // A subsequent write of 0 must not perturb NMIPENDSET (write 0
+        // is ignored on every W1S bit).
+        ppb.write32(0xE000_ED04, 0);
+        assert_ne!(ppb.icsr & ICSR_NMIPENDSET, 0);
+        // Even writing PENDSVCLR/PENDSTCLR doesn't touch NMIPENDSET.
+        ppb.write32(0xE000_ED04, (1u32 << 25) | (1u32 << 27));
+        assert_ne!(ppb.icsr & ICSR_NMIPENDSET, 0);
+    }
+
+    /// AIRCR stores whatever firmware writes — VECTKEY checking is
+    /// performed by the reset-request side-channel, not by the field
+    /// store. Both VECTKEY=0xFA05 and a wrong key must round-trip in
+    /// storage (datasheet wise, AIRCR is a u32 register — emulator
+    /// stores it verbatim).
+    #[test]
+    fn aircr_vectkey_round_trip_does_not_filter_value() {
+        let mut ppb = Ppb::default();
+        // Correct key.
+        ppb.write32(0xE000_ED0C, 0xFA05_0000 | 0x4);
+        assert_eq!(ppb.read32(0xE000_ED0C), 0xFA05_0000 | 0x4);
+        // Wrong key.
+        ppb.write32(0xE000_ED0C, 0xDEAD_BEEF);
+        assert_eq!(ppb.read32(0xE000_ED0C), 0xDEAD_BEEF);
+    }
+
+    /// SHPR write with bits [4:0] of each byte set must mask down to
+    /// bits [7:5] only. Confirms the implementation-defined priority
+    /// width (3 bits on M33).
+    #[test]
+    fn shpr_lo_bits_are_res0_on_write() {
+        let mut ppb = Ppb::default();
+        // SHPR2 = 0xFFFFFFFF — every byte should mask to 0xE0.
+        ppb.write32(0xE000_ED1C, 0xFFFF_FFFF);
+        assert_eq!(ppb.read32(0xE000_ED1C), 0xE0E0_E0E0);
+    }
+
+    /// DEMCR.TRCENA toggles the DWT_CYCCNT live-update path. Together
+    /// with `test_cyccnt_trcena_gates_dwt` already in `bus/ppb.rs`, this
+    /// pins observability of the DEMCR.TRCENA gate using a controlled
+    /// base write at cycles=0 so the disabled-read returns exactly the
+    /// stored value.
+    #[test]
+    fn demcr_trcena_off_then_on_toggles_cyccnt_live() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_1000, 1); // CYCCNTENA
+        ppb.update_latest_cycles(0);
+        ppb.write32(0xE000_1004, 1234); // base=1234 (no offset, latest=0)
+        // TRCENA=0 → disabled-read returns the stored base.
+        assert_eq!(ppb.read_cyccnt(200), 1234);
+        // Enable TRCENA — live updates resume.
+        ppb.write32(0xE000_EDFC, 1 << 24);
+        // CYCCNT now reads (cycles as u32) + base = 200 + 1234 = 1434.
+        assert_eq!(ppb.read_cyccnt(200), 1434);
+        // Disable TRCENA again — back to the stored base.
+        ppb.write32(0xE000_EDFC, 0);
+        assert_eq!(ppb.read_cyccnt(500), 1234);
+    }
+
+    // ------------------------------------------------------------------
+    // DMA — apply_alias default arm (alias > 3) and AL3 trigger paths
+    // with non-default aliases.
+    //
+    // `apply_alias` is reachable with alias=4..7 because the bus
+    // dispatch passes the top 2 bits of the address window. The 4..7
+    // arm is uncovered by the bus path (which always passes 0..=3).
+    // Direct `Dma::write32` exercises the fallthrough branch.
+    // ------------------------------------------------------------------
+
+    /// `Dma::write32` with alias >= 4 falls through to the `_ => value`
+    /// arm of `apply_alias`. Behaviour matches alias 0 (plain write).
+    #[test]
+    fn apply_alias_above_three_falls_through_to_plain_write() {
+        let mut dma = Dma::new();
+        // Pre-set READ_ADDR via base alias.
+        dma.write32(0x00, 0xAAAA_AAAA, 0);
+        assert_eq!(dma.channel(0).read_addr, 0xAAAA_AAAA);
+        // Alias=4 — _ arm — should plain-write (overwrites).
+        dma.write32(0x00, 0xBBBB_BBBB, 4);
+        assert_eq!(dma.channel(0).read_addr, 0xBBBB_BBBB);
+        // Alias=7 — same arm.
+        dma.write32(0x00, 0xCCCC_CCCC, 7);
+        assert_eq!(dma.channel(0).read_addr, 0xCCCC_CCCC);
+    }
+
+    /// `apply_alias` default arm on a global register (TIMER0). Confirms
+    /// the `_` fallthrough works for non-channel offsets too.
+    #[test]
+    fn apply_alias_above_three_on_timer0() {
+        let mut dma = Dma::new();
+        // Base write seed.
+        dma.write32(0x440, 0x1111_2222, 0);
+        // Alias=5 → _ arm → plain write semantics.
+        dma.write32(0x440, 0x3333_4444, 5);
+        assert_eq!(dma.read32(0x440), 0x3333_4444);
+    }
+
+    // ------------------------------------------------------------------
+    // DMA — chain handler edges: chain target armed but reload=0 path,
+    // and a self-chain on a non-zero index (chain_to == ch_idx).
+    //
+    // Existing `stage3_dma_residue::chain_to_unprogrammed_target_does_
+    // not_arm` covers reload=0 on ch1. This module pins the same path
+    // on a different channel index and confirms the secondary
+    // observable (no INTR bump on the chain target).
+    // ------------------------------------------------------------------
+
+    /// Self-chain on a non-zero channel index. CHAIN_TO=N == ch_idx=N
+    /// must be treated as "no chain".
+    #[test]
+    fn self_chain_on_high_index_channel_is_noop() {
+        let mut bus = Bus::new();
+        use crate::bus::RESET_DMA;
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
+        let src: u32 = 0x2000_0500;
+        let dst: u32 = 0x2000_0600;
+        bus.write32(src, 0xFADE_F00D, 0);
+        // ch5 with CHAIN_TO=5 → self-chain.
+        // CTRL: EN=1, DATA_SIZE=2, INCR_READ=1, INCR_WRITE=1, TREQ=63,
+        // CHAIN_TO=5.
+        let ctrl = 1
+            | (2 << 2)
+            | (1 << 4)
+            | (1 << 6)
+            | ((DREQ_FORCE as u32 & 0x3F) << 17)
+            | ((5u32 & 0xF) << 13);
+        bus.write32(DMA_BASE + 5 * 0x40, src, 0);
+        bus.write32(DMA_BASE + 5 * 0x40 + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 5 * 0x40 + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 5 * 0x40 + 0x0C, ctrl, 0);
+        bus.tick_dma();
+        // ch5 completes normally; INTR bit 5 set.
+        let intr = bus.read32(DMA_BASE + 0x400, 0);
+        assert_eq!(intr & 0x20, 0x20);
+        // Re-read CTRL — BUSY clear (no self-rearm).
+        let r = bus.read32(DMA_BASE + 5 * 0x40 + 0x0C, 0);
+        assert_eq!(r & (1u32 << 26), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // DMA — CH_ABORT mid-transfer. The existing `ch_abort_clears_busy`
+    // covers a single aborted channel; this confirms the abort path
+    // works after a partial transfer (TRANS_COUNT decremented but >0).
+    // ------------------------------------------------------------------
+
+    /// Abort a channel mid-transfer (after some ticks, before completion).
+    #[test]
+    fn ch_abort_after_partial_transfer_clears_busy_immediately() {
+        let mut bus = Bus::new();
+        use crate::bus::RESET_DMA;
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
+        let src: u32 = 0x2000_0700;
+        let dst: u32 = 0x2000_0800;
+        for i in 0..10u32 {
+            bus.write32(src + i * 4, 0xAB00_0000 + i, 0);
+        }
+        // EN=1, DATA_SIZE=2, INCR_READ=1, INCR_WRITE=1, TREQ=63 (FORCE).
+        let ctrl = 1
+            | (2 << 2)
+            | (1 << 4)
+            | (1 << 6)
+            | ((DREQ_FORCE as u32 & 0x3F) << 17);
+        bus.write32(DMA_BASE, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 10, 0); // 10 transfers
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+        // Run 3 ticks (3 transfers).
+        for _ in 0..3 {
+            bus.tick_dma();
+        }
+        // Channel is still busy with 7 transfers remaining.
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_ne!(r & (1u32 << 26), 0);
+        // Abort.
+        bus.write32(DMA_BASE + 0x464, 0x1, 0);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_eq!(r & (1u32 << 26), 0);
+        // First 3 words transferred, rest didn't.
+        assert_eq!(bus.read32(dst, 0), 0xAB00_0000);
+        assert_eq!(bus.read32(dst + 4, 0), 0xAB00_0001);
+        assert_eq!(bus.read32(dst + 8, 0), 0xAB00_0002);
+        assert_eq!(bus.read32(dst + 12, 0), 0);
+    }
+
+    /// CH_ABORT mask covering an unaligned set of channels (0b1010 →
+    /// channels 1 and 3 — neither adjacent to channel 0). Verifies the
+    /// per-bit iteration in `REG_CHAN_ABORT` reaches every selected slot.
+    #[test]
+    fn ch_abort_skips_unselected_channels() {
+        let mut bus = Bus::new();
+        use crate::bus::RESET_DMA;
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
+        // Arm 4 channels with a never-asserting DREQ (UART0_TX, line 28).
+        let ctrl = 1 | (2 << 2) | (1 << 4) | (1 << 6) | ((28u32 & 0x3F) << 17);
+        for ch in 0..4u32 {
+            bus.write32(DMA_BASE + ch * 0x40, 0x2000_0900, 0);
+            bus.write32(DMA_BASE + ch * 0x40 + 0x04, 0x2000_0A00 + ch * 4, 0);
+            bus.write32(DMA_BASE + ch * 0x40 + 0x08, 100, 0);
+            bus.write32(DMA_BASE + ch * 0x40 + 0x0C, ctrl, 0);
+        }
+        // Abort 0b1010 → channels 1 and 3.
+        bus.write32(DMA_BASE + 0x464, 0b1010, 0);
+        let r0 = bus.read32(DMA_BASE + 0x0C, 0);
+        let r1 = bus.read32(DMA_BASE + 0x40 + 0x0C, 0);
+        let r2 = bus.read32(DMA_BASE + 2 * 0x40 + 0x0C, 0);
+        let r3 = bus.read32(DMA_BASE + 3 * 0x40 + 0x0C, 0);
+        assert_ne!(r0 & (1u32 << 26), 0, "ch0 must remain busy");
+        assert_eq!(r1 & (1u32 << 26), 0, "ch1 aborted");
+        assert_ne!(r2 & (1u32 << 26), 0, "ch2 must remain busy");
+        assert_eq!(r3 & (1u32 << 26), 0, "ch3 aborted");
+    }
+
+    // ------------------------------------------------------------------
+    // DMA — `trigger_channel` `trans_count == 0` early return. Existing
+    // tests cover this implicitly via the chain reload=0 path; this
+    // adds an explicit MMIO scenario: write CTRL_TRIG with EN=1 but
+    // TRANS_COUNT=0 → no arm.
+    // ------------------------------------------------------------------
+
+    /// CTRL_TRIG with TRANS_COUNT=0 must NOT arm the channel.
+    #[test]
+    fn ctrl_trig_with_zero_trans_count_does_not_arm() {
+        let mut bus = Bus::new();
+        use crate::bus::RESET_DMA;
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
+        // CTRL: EN=1, DATA_SIZE=2, TREQ=63.
+        let ctrl = 1
+            | (2 << 2)
+            | (1 << 4)
+            | (1 << 6)
+            | ((DREQ_FORCE as u32 & 0x3F) << 17);
+        bus.write32(DMA_BASE, 0x2000_0B00, 0);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0C00, 0);
+        bus.write32(DMA_BASE + 0x08, 0, 0); // count=0
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_eq!(r & (1u32 << 26), 0, "BUSY must NOT set with count=0");
+    }
+
+    /// CTRL_TRIG with EN=0 must NOT arm regardless of TRANS_COUNT.
+    /// Confirms the EN-guard in `trigger_channel`.
+    #[test]
+    fn ctrl_trig_with_en_zero_does_not_arm() {
+        let mut bus = Bus::new();
+        use crate::bus::RESET_DMA;
+        bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
+        // CTRL: EN=0, DATA_SIZE=2, TREQ=63.
+        let ctrl = (2 << 2)
+            | (1 << 4)
+            | (1 << 6)
+            | ((DREQ_FORCE as u32 & 0x3F) << 17);
+        bus.write32(DMA_BASE, 0x2000_0D00, 0);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0E00, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+        let r = bus.read32(DMA_BASE + 0x0C, 0);
+        assert_eq!(r & (1u32 << 26), 0, "EN=0: BUSY must stay clear");
+    }
+
+    // ------------------------------------------------------------------
+    // PPB — NVIC priority writes with reserved bits (M33 has 3 bits of
+    // priority [7:5]; bits [4:0] are RES0). Already covered by
+    // `test_nvic_ipr_priority_byte_masking` in the inline tests. This
+    // pin the round-trip via the bus path with an external IRQ that
+    // peeks back through `exception_priority`.
+    // ------------------------------------------------------------------
+
+    /// IPR write with all bits set → only top 3 of each byte survive.
+    /// Read back via `exception_priority` for IRQ 0..3 confirms 0xE0.
+    #[test]
+    fn nvic_ipr_priority_byte_masking_via_exception_priority() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E400, 0xFFFF_FFFF);
+        for irq in 0..4u16 {
+            assert_eq!(
+                ppb.exception_priority(16 + irq),
+                0xE0,
+                "IRQ {} must read masked priority 0xE0",
+                irq
+            );
+        }
+    }
+
+    /// Initial PENDSV pend, then PENDSV+PENDSV CLR in same write — the
+    /// combined PENDSVSET|PENDSVCLR pattern: per ARMv8-M B3.2.4, when
+    /// both are set in one store, CLR wins → not pended.
+    #[test]
+    fn icsr_pendsv_set_and_clr_combo_clr_wins() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED04, ICSR_PENDSVSET);
+        assert_ne!(ppb.icsr & ICSR_PENDSVSET, 0);
+        // Now both bits in one store — CLR wins.
+        ppb.write32(
+            0xE000_ED04,
+            ICSR_PENDSVSET | (1u32 << 27), /* PENDSVCLR */
+        );
+        assert_eq!(ppb.icsr & ICSR_PENDSVSET, 0);
+    }
+}

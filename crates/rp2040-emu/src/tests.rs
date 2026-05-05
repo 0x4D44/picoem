@@ -12060,3 +12060,257 @@ mod stage4_core_residue_v2 {
         assert_eq!(cycles, 16, "lockup still bills 16 entry cycles");
     }
 }
+
+// ============================================================================
+// Stage 3: branch-coverage residue for `dma.rs`.
+// ============================================================================
+//
+// Targets the small set of branches not exercised by existing DMA test
+// modules — notably `apply_alias`'s `_ => value` arm (reachable only via
+// direct `Dma::write32` because the bus dispatch never passes alias > 3),
+// the `chain_to >= NUM_CHANNELS` guard, and CH_ABORT mid-transfer paths.
+// Append-only — no production code touched.
+mod stage3_ppb_dma_branches {
+    use crate::bus::peripheral_dispatch::RESET_DMA;
+    use crate::bus::{Bus, DMA_BASE, RESETS_BASE};
+    use crate::dma::Dma;
+    use crate::dreq::DREQ_FORCE;
+
+    // Per-channel register offsets (mirror dma.rs constants — file-private).
+    const CH_READ_ADDR: u32 = 0x00;
+    const CH_CTRL_TRIG: u32 = 0x0C;
+    const CH_AL1_CTRL: u32 = 0x10;
+
+    // RP2040 CTRL field positions (datasheet Table 126).
+    const CTRL_EN: u32 = 1 << 0;
+    const CTRL_DATA_SIZE_SHIFT: u32 = 2;
+    const CTRL_INCR_READ: u32 = 1 << 4;
+    const CTRL_INCR_WRITE: u32 = 1 << 5;
+    const CTRL_CHAIN_TO_SHIFT: u32 = 11;
+    const CTRL_TREQ_SEL_SHIFT: u32 = 15;
+
+    const REG_INTR: u32 = 0x400;
+    const REG_INTE0: u32 = 0x404;
+    const REG_INTF0: u32 = 0x408;
+    const REG_INTS0: u32 = 0x40C;
+    const REG_TIMER0: u32 = 0x420;
+    const REG_CHAN_ABORT: u32 = 0x444;
+
+    fn release(bus: &mut Bus) {
+        bus.write32(RESETS_BASE + 0x3000, 1u32 << RESET_DMA);
+    }
+
+    fn ctrl(en: bool, ds: u32, ir: bool, iw: bool, treq: u8, chain: u32) -> u32 {
+        let mut v = 0u32;
+        if en {
+            v |= CTRL_EN;
+        }
+        v |= (ds & 0x3) << CTRL_DATA_SIZE_SHIFT;
+        if ir {
+            v |= CTRL_INCR_READ;
+        }
+        if iw {
+            v |= CTRL_INCR_WRITE;
+        }
+        v |= (treq as u32 & 0x3F) << CTRL_TREQ_SEL_SHIFT;
+        v |= (chain & 0xF) << CTRL_CHAIN_TO_SHIFT;
+        v
+    }
+
+    // ------------------------------------------------------------------
+    // `apply_alias` — `_ => value` fallthrough arm.
+    //
+    // The bus dispatch only ever passes alias 0..=3 (the top 2 bits of
+    // the address window's stride), so the `_` arm is unreachable from
+    // bus-level writes. Directly invoking `Dma::write32` with alias=4..7
+    // hits the fallthrough.
+    // ------------------------------------------------------------------
+
+    /// `Dma::write32` with alias=4 falls through to the `_ => value` arm
+    /// of `apply_alias`. Behaviour matches alias 0 (plain write).
+    #[test]
+    fn apply_alias_above_three_falls_through_to_plain_write() {
+        let mut dma = Dma::new();
+        dma.write32(CH_READ_ADDR, 0xAAAA_AAAA, 0);
+        assert_eq!(dma.channel(0).read_addr, 0xAAAA_AAAA);
+        dma.write32(CH_READ_ADDR, 0xBBBB_BBBB, 4);
+        assert_eq!(dma.channel(0).read_addr, 0xBBBB_BBBB);
+        dma.write32(CH_READ_ADDR, 0xCCCC_CCCC, 7);
+        assert_eq!(dma.channel(0).read_addr, 0xCCCC_CCCC);
+    }
+
+    /// `apply_alias` `_ => value` arm reached via a global register
+    /// (TIMER0). Confirms the fallthrough works for non-channel
+    /// offsets too.
+    #[test]
+    fn apply_alias_above_three_on_timer0() {
+        let mut dma = Dma::new();
+        dma.write32(REG_TIMER0, 0x1111_2222, 0);
+        dma.write32(REG_TIMER0, 0x3333_4444, 5);
+        assert_eq!(dma.read32(REG_TIMER0), 0x3333_4444);
+    }
+
+    /// `apply_alias` `_ => value` arm reached via INTE0 (alias=6).
+    /// Plain-write semantics confirmed via the INTE0 readback (masked
+    /// to the 12-channel mask 0xFFF).
+    #[test]
+    fn apply_alias_above_three_on_inte0() {
+        let mut dma = Dma::new();
+        dma.write32(REG_INTE0, 0x0F0, 0);
+        dma.write32(REG_INTE0, 0xF00, 6);
+        assert_eq!(dma.read32(REG_INTE0), 0xF00);
+    }
+
+    // ------------------------------------------------------------------
+    // CHAIN_TO with `chain_to >= NUM_CHANNELS` — the 4-bit field allows
+    // 12..=15 but only 0..=11 are real channels on RP2040. The
+    // `chain_to < NUM_CHANNELS` guard takes its FALSE arm in this case.
+    // ------------------------------------------------------------------
+
+    /// `CHAIN_TO=12` (out of range on RP2040) — the chain handler must
+    /// not dereference channel 12 (which doesn't exist).
+    #[test]
+    fn chain_to_twelve_is_silently_ignored() {
+        let mut bus = Bus::new();
+        release(&mut bus);
+        bus.write32(0x2000_0100, 0xC012_C012);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 12);
+        bus.write32(DMA_BASE, 0x2000_0100);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0200);
+        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c);
+        bus.tick_dma();
+        assert!(!bus.dma.channel(0).busy);
+        assert_eq!(bus.read32(0x2000_0200), 0xC012_C012);
+        // Only ch0's INTR latches.
+        let intr = bus.read32(DMA_BASE + REG_INTR);
+        assert_eq!(intr, 0x1);
+    }
+
+    /// `CHAIN_TO=15` — upper bound of the field encoding.
+    #[test]
+    fn chain_to_fifteen_is_silently_ignored() {
+        let mut bus = Bus::new();
+        release(&mut bus);
+        bus.write32(0x2000_0100, 0xC0FF);
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 15);
+        bus.write32(DMA_BASE, 0x2000_0100);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0200);
+        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c);
+        bus.tick_dma();
+        assert!(!bus.dma.channel(0).busy);
+        assert_eq!(bus.read32(0x2000_0200), 0xC0FF);
+    }
+
+    // ------------------------------------------------------------------
+    // CH_ABORT mid-transfer — partial transfer scenario, distinct from
+    // the existing `chan_abort_clears_busy` which aborts after 5 ticks
+    // with TRANS_COUNT=100.
+    // ------------------------------------------------------------------
+
+    /// Abort after 3 of 10 transfers. First 3 words land at the
+    /// destination; the rest stay 0; TRANS_COUNT decremented before
+    /// the abort.
+    #[test]
+    fn ch_abort_after_partial_transfer_clears_busy_immediately() {
+        let mut bus = Bus::new();
+        release(&mut bus);
+        let src: u32 = 0x2000_0700;
+        let dst: u32 = 0x2000_0800;
+        for i in 0..10u32 {
+            bus.write32(src + i * 4, 0xAB00_0000 + i);
+        }
+        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0);
+        bus.write32(DMA_BASE, src);
+        bus.write32(DMA_BASE + 0x04, dst);
+        bus.write32(DMA_BASE + 0x08, 10);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c);
+        for _ in 0..3 {
+            bus.tick_dma();
+        }
+        assert!(bus.dma.channel(0).busy);
+        bus.write32(DMA_BASE + REG_CHAN_ABORT, 0x1);
+        assert!(!bus.dma.channel(0).busy);
+        assert_eq!(bus.read32(dst), 0xAB00_0000);
+        assert_eq!(bus.read32(dst + 4), 0xAB00_0001);
+        assert_eq!(bus.read32(dst + 8), 0xAB00_0002);
+        assert_eq!(bus.read32(dst + 12), 0);
+    }
+
+    /// CH_ABORT mask covering an unaligned set of channels (0b1010).
+    /// Confirms the per-bit iteration in `REG_CHAN_ABORT` reaches
+    /// every selected slot.
+    #[test]
+    fn ch_abort_skips_unselected_channels() {
+        let mut bus = Bus::new();
+        release(&mut bus);
+        // UART0_TX = 20 on RP2040; unreleased UART → DREQ never
+        // asserts, channel stays busy.
+        const DREQ_UART0_TX: u8 = 20;
+        let c = ctrl(true, 2, true, true, DREQ_UART0_TX, 0);
+        for ch in 0..4u32 {
+            bus.write32(DMA_BASE + ch * 0x40, 0x2000_0900);
+            bus.write32(DMA_BASE + ch * 0x40 + 0x04, 0x2000_0A00 + ch * 4);
+            bus.write32(DMA_BASE + ch * 0x40 + 0x08, 100);
+            bus.write32(DMA_BASE + ch * 0x40 + CH_CTRL_TRIG, c);
+        }
+        bus.write32(DMA_BASE + REG_CHAN_ABORT, 0b1010);
+        assert!(bus.dma.channel(0).busy);
+        assert!(!bus.dma.channel(1).busy);
+        assert!(bus.dma.channel(2).busy);
+        assert!(!bus.dma.channel(3).busy);
+    }
+
+    // ------------------------------------------------------------------
+    // CHAIN ping-pong: ch0 → ch1 → ch0. Pins observable behaviour at
+    // the chain ring-end with a self-referential pair.
+    // ------------------------------------------------------------------
+
+    /// ch0 chains to ch1, ch1 chains back to ch0. Ch1's chain to ch0
+    /// re-arms it because trans_count_reload survives.
+    #[test]
+    fn ping_pong_chain_re_arms_originator() {
+        let mut bus = Bus::new();
+        release(&mut bus);
+        bus.write32(0x2000_0100, 0xAA01);
+        bus.write32(0x2000_0200, 0xBB02);
+        let c0 = ctrl(true, 2, false, false, DREQ_FORCE, 1);
+        bus.write32(DMA_BASE, 0x2000_0100);
+        bus.write32(DMA_BASE + 0x04, 0x2000_0300);
+        bus.write32(DMA_BASE + 0x08, 1);
+        let c1 = ctrl(true, 2, false, false, DREQ_FORCE, 0);
+        bus.write32(DMA_BASE + 0x40, 0x2000_0200);
+        bus.write32(DMA_BASE + 0x40 + 0x04, 0x2000_0400);
+        bus.write32(DMA_BASE + 0x40 + 0x08, 1);
+        bus.write32(DMA_BASE + 0x40 + CH_AL1_CTRL, c1);
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c0);
+        bus.tick_dma();
+        assert!(!bus.dma.channel(0).busy);
+        assert!(bus.dma.channel(1).busy);
+        bus.tick_dma();
+        assert!(!bus.dma.channel(1).busy);
+        assert!(bus.dma.channel(0).busy, "chain back to ch0 re-arms it");
+        bus.tick_dma();
+        assert_eq!(bus.read32(0x2000_0300), 0xAA01);
+        assert_eq!(bus.read32(0x2000_0400), 0xBB02);
+    }
+
+    // ------------------------------------------------------------------
+    // INTF0 (force) without INTE0 — `INTS0` masks to 0 even when INTF0
+    // is set. Pins the `(intr | intf0) & inte0 == 0` short-circuit.
+    // ------------------------------------------------------------------
+
+    /// INTF0 set, INTE0 clear → INTS0 reads 0; `route_irqs` does not
+    /// raise DMA_IRQ_0.
+    #[test]
+    fn intf0_without_inte0_does_not_route() {
+        let mut bus = Bus::new();
+        release(&mut bus);
+        bus.write32(DMA_BASE + REG_INTF0, 0x1);
+        assert_eq!(bus.read32(DMA_BASE + REG_INTS0), 0);
+        bus.tick_dma();
+        use crate::irq::IRQ_DMA_IRQ_0;
+        assert_eq!(bus.irq_pending() & (1u32 << IRQ_DMA_IRQ_0), 0);
+    }
+}
